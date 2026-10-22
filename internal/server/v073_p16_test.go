@@ -208,3 +208,160 @@ func TestV073P16ConfigRetrySameKid(t *testing.T) {
 		t.Fatalf("retry ns_id %q, want %q", r.Str("ns_id"), nsID)
 	}
 }
+
+// v0.73 §7.6 Result (BBD-2, BBD-3, GR-21): a retry of a local branch's
+// creation by the same principal (the same root sub and kid) with the same
+// at and patches gets 200 with the recorded entry; an omitted at counts as
+// the at recorded for the branch, and config writes to the base since the
+// creation don't matter.
+func TestV073P16BranchRetry(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t)
+	k1, k2 := newKey("k1"), newKey("k2")
+	e.mkNS("main", map[string]any{"read": "grant", "x-title": "Main", "keys": []any{k1.entry("*"), k2.entry("*")}})
+	ns := []string{"main", "b1", "b2"}
+	g1, g2 := e.grant(k1, "user:ann", ns, allVerbs), e.grant(k2, "user:ann", ns, allVerbs)
+	g1b := e.grant(k1, "user:ann", ns, []string{"branch", "read"})
+
+	at1 := e.nsHead("main", g1) // the head as the branch entry is inserted
+	r := e.branch("main", map[string]any{"name": "b1"}, g1)
+	expect(t, r, 201)
+	nsID1 := r.Str("ns_id")
+	e.create("main", "doc", map[string]any{"v": 1.0}, g1)
+	for _, body := range []map[string]any{{"name": "b1"}, {"name": "b1", "at": at1}, {"name": "b1", "patches": []any{}}} {
+		r = e.branch("main", body, g1b)
+		expect(t, r, 200)
+		if r.Str("ns_id") != nsID1 {
+			t.Fatalf("retry %v: ns_id %q, want %q", body, r.Str("ns_id"), nsID1)
+		}
+	}
+	// The same sub under another key isn't the same principal.
+	expectCode(t, e.branch("main", map[string]any{"name": "b1", "at": at1}, g2), 412, "stale")
+	expectCode(t, e.branch("main", map[string]any{"name": "b1", "at": e.nsHead("main", g1)}, g1), 412, "stale")
+
+	patches := ops(op("add", "/x-note", "b2"))
+	r = e.branch("main", map[string]any{"name": "b2", "at": at1, "patches": patches}, g1)
+	expect(t, r, 201)
+	nsID2 := r.Str("ns_id")
+	expect(t, e.patchNS("main", ops(op("replace", "/x-title", "Main 2")), g1), 201)
+	r = e.branch("main", map[string]any{"name": "b2", "at": at1, "patches": patches}, g1)
+	expect(t, r, 200)
+	if r.Str("ns_id") != nsID2 {
+		t.Fatalf("retry after a base config write: ns_id %q, want %q", r.Str("ns_id"), nsID2)
+	}
+	expectCode(t, e.branch("main", map[string]any{"name": "b2", "at": at1, "patches": ops(op("add", "/x-note", "other"))}, g1), 412, "stale")
+}
+
+// v0.73 §6.2, §7.6 (BBD-5, BBD-4, BBD-1): a taken name is 412, with no head
+// or config, before an at outside the base's chain is 422, a purged
+// branch's name included, its creator's retry too; If-Match alone is 428,
+// never a retry.
+func TestV073P16BranchTakenName(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("main", map[string]any{"read": "public"})
+	e.mkNS("other", map[string]any{"read": "public", "x-title": "Other"})
+	notInChain := e.nsHead("other")
+	expect(t, e.branch("main", map[string]any{"name": "tb"}, "alice"), 201)
+	at := e.nsHead("main")
+	taken := func(r *resp) {
+		t.Helper()
+		expectCode(t, r, 412, "stale")
+		for _, k := range []string{"head", "config"} {
+			if _, has := r.Obj()[k]; has {
+				t.Fatalf("%s in a taken name's 412: %s", k, r.Body)
+			}
+		}
+	}
+	taken(e.branch("main", map[string]any{"name": "tb", "at": notInChain}, "alice"))
+	taken(e.branch("main", map[string]any{"name": "tb", "patches": ops(op("add", "/x-a", 1.0))}, "alice"))
+	expectInvalidAt(t, e.branch("main", map[string]any{"name": "fresh", "at": notInChain}, "alice"), "/base/at")
+	// If-Match alone: 428, for the creator's exact retry too.
+	r := e.do(req{method: "POST", path: "/ns/main/branches", ifMatch: at, body: map[string]any{"name": "tb"}, author: "alice"})
+	expectCode(t, r, 428, "precondition_required")
+	// After the branch is purged, its name stays taken, for its creator too.
+	expect(t, e.patchNS("tb", ops(op("add", "/frozen", true)), ""), 201)
+	expect(t, e.do(req{method: "POST", path: "/ns/tb/purge", ifMatch: e.nsHead("tb"), author: "admin"}), 204)
+	taken(e.branch("main", map[string]any{"name": "tb"}, "alice"))
+}
+
+// v0.73 §7.6 Configuration (BBD-7, MF-14): cleanup is removed from a local
+// branch's starting document, with frozen, successor, merged, abandoned,
+// drafts and schemaReads; patches may set it.
+func TestV073P16BranchDropsCleanup(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("main", map[string]any{"read": "public", "cleanup": map[string]any{"merged": "P7D"}, "abandoned": true})
+	expect(t, e.branch("main", map[string]any{"name": "c1"}, "alice"), 201)
+	d := e.nsDoc("c1")
+	for _, k := range []string{"cleanup", "abandoned"} {
+		if _, has := d[k]; has {
+			t.Fatalf("%s inherited: %v", k, d)
+		}
+	}
+	expect(t, e.branch("main", map[string]any{"name": "c2", "patches": ops(op("add", "/cleanup", map[string]any{"merged": "P1D"}))}, "alice"), 201)
+	if c, _ := e.nsDoc("c2")["cleanup"].(map[string]any); c["merged"] != "P1D" {
+		t.Fatalf("cleanup set by patches: %v", e.nsDoc("c2"))
+	}
+}
+
+// v0.73 §7.4 Branch fields, Addendum E Levels (BBD-8, ENC-49): a branch's
+// creation that breaks a branch field is 422 invalid with errors pointing
+// at the member, before the *-key guard of its patches.
+func TestV073P16BranchFieldsBeforeGuard(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t)
+	sk, bk := newKey("sk"), newKey("bk")
+	e.mkNS("pv", map[string]any{"read": "grant", "nonce": "required", "keys": []any{sk.entry("*"), bk.entry("branch", "read")}})
+	bg := e.grant(bk, "user:brancher", []string{"pv", "nb"}, []string{"branch", "read"})
+	sg := e.grant(sk, "user:admin", []string{"pv", "nb"}, allVerbs)
+	for _, c := range []struct {
+		ptr     string
+		patches []any
+	}{
+		{"/read", ops(op("replace", "/read", "public"), op("add", "/signatures", "optional"))},
+		{"/nonce", ops(op("replace", "/nonce", "optional"))},
+		{"/keys", ops(op("remove", "/keys/0"))},
+		{"/successor", ops(op("add", "/successor", "nope"), op("add", "/signatures", "optional"))},
+		{"/base", ops(op("replace", "/base/ns", "other"), op("add", "/signatures", "optional"))},
+	} {
+		expectInvalidAt(t, e.branch("pv", map[string]any{"name": "nb", "patches": c.patches}, bg), c.ptr)
+	}
+	// Valid otherwise, the guarded member needs a * key of the base.
+	expectCode(t, e.branch("pv", map[string]any{"name": "nb", "patches": ops(op("add", "/signatures", "optional"))}, bg), 403, "forbidden")
+	expect(t, e.branch("pv", map[string]any{"name": "nb", "patches": ops(op("add", "/signatures", "optional"))}, sg), 201)
+	// A successor at creation names a branch of the base or further up.
+	expect(t, e.branch("pv", map[string]any{"name": "nb2", "patches": ops(op("add", "/successor", "nb"))}, sg), 201)
+}
+
+// v0.73 §6.2 step 4 (GB-3 for branches): a branch's creation validates its
+// document before the limits.
+func TestV073P16BranchValidationBeforeLimits(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("lb", map[string]any{"read": "grant", "limits": map[string]any{"branchesPerNamespace": 1}})
+	expect(t, e.branch("lb", map[string]any{"name": "l1"}, "alice"), 201)
+	expectLimit(t, e.branch("lb", map[string]any{"name": "l2"}, "alice"), 422, "branchesPerNamespace", 2, 1)
+	expectInvalidAt(t, e.branch("lb", map[string]any{"name": "l2", "patches": ops(op("replace", "/read", "public"))}, "alice"), "/read")
+}
+
+// v0.73 §7.6 First write (BBD-13): a first write to a read-through
+// resource whose base revision is pruned, as in a branch created at an at
+// older than the base's horizon, is 410 pruned once its precondition
+// passes.
+func TestV073P16FirstWriteBelowBaseHorizon(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, withArchive(t, t.TempDir()), withoutRetentionLoop)
+	e.mkNS("main", map[string]any{"read": "public"})
+	a0 := e.create("main", "a", map[string]any{"n": 0.0})
+	at := e.nsHead("main")
+	a1 := e.appendRev("main", "a", a0, ops(op("replace", "/n", 1.0)))
+	a2 := e.appendRev("main", "a", a1, ops(op("replace", "/n", 2.0)))
+	e.clock.Advance(time.Hour)
+	expect(t, e.prune("main", "a", map[string]any{"horizon": a2}, "admin"), 200)
+	expect(t, e.branch("main", map[string]any{"name": "late", "at": at}, "alice"), 201)
+	expectCode(t, e.write("PATCH", "late", "a", a0, ops(op("replace", "/n", 9.0))), 410, "pruned")
+	expectCode(t, e.write("DELETE", "late", "a", a0, nil), 410, "pruned")
+	// The precondition comes first.
+	expectCode(t, e.write("PATCH", "late", "a", a1, ops(op("replace", "/n", 9.0))), 412, "stale")
+}

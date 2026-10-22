@@ -148,59 +148,81 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if br.Patches == nil {
 		br.Patches = []any{}
 	}
-	// Step 2.
-	atSeq := base.headSeq.Int64
-	if br.At != "" {
-		id, err := ids.Parse(br.At)
-		if err != nil {
-			return nil, invalid("at is not in the base's chain")
-		}
-		s, ok := t.nsLogSeq(base.id, id)
-		if !ok {
-			return nil, invalid("at is not in the base's chain")
-		}
-		atSeq = s
-	}
-	atID := t.nsLogID(atSeq)
-	// Build the branch's namespace document (step 3).
-	doc := cloneDoc(bcfg.Doc)
-	for _, k := range []string{"frozen", "successor", "merged", "abandoned", "drafts", "schemaReads"} {
-		delete(doc, k) // §7.6: none of them is inherited
-	}
-	doc["base"] = map[string]any{"ns": base.name, "at": atID.String()}
-	ops, err := patch.Parse(br.Patches)
-	if err != nil {
-		return nil, patchErr(err)
-	}
-	nd, w, err := patch.Apply(doc, true, ops, patch.Options{})
-	if err != nil {
-		return nil, patchErr(err)
-	}
-	writes := patch.WritesStrings(w)
-	genesis := []any{map[string]any{"op": "add", "path": "", "value": nd}}
-	gcanon := jsonv.Canonical(genesis)
-	cfgID := ids.Revision(nil, gcanon)
+	// Step 2.5: a taken name is 412, with no head or config, before an at
+	// outside the base's chain is refused at step 4 (§6.2, §7.6), unless
+	// the request retries the branch's creation.
 	if ex := t.nsByName(br.Name); ex != nil {
-		// Idempotent retry: same principal, same at and patches, until
-		// the branch is purged; after that it is 412 too: its name stays
-		// reserved, for its creator too (§7.6, §8.5).
-		var author, gseq int64
-		var gid []byte
-		qerr := t.QueryRow(`SELECT seq, author, id FROM ns_config WHERE ns = ? AND parent_seq IS NULL`, ex.id).Scan(&gseq, &author, &gid)
-		if qerr == nil && !ex.purged && ex.base.Valid && ex.base.Int64 == base.id && ex.baseAt.Int64 == atSeq &&
-			author == t.actorID(a) && ids.FromBytes(gid) == cfgID {
-			var seq int64
-			// The base's branch entry targets the branch's config genesis.
-			t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND kind = ? AND target_seq = ?`, base.id, nsKindCode("branch"), gseq).Scan(&seq)
-			r := &WriteResult{Status: 200, Replayed: true, ConfigID: cfgID.String()}
-			if seq != 0 {
-				r.NSID = t.nsLogID(seq).String()
-			}
+		if r := t.branchRetry(base, ex, br, a); r != nil {
 			return r, nil
 		}
 		return nil, apiErr(412, "stale", "message", "the name is taken")
 	}
-	// Limits (step 4).
+	// at defaults to the base's head, the latest ns_id of its chain as
+	// the branch entry is inserted (§7.6).
+	atSeq, atOK := base.headSeq.Int64, true
+	if br.At != "" {
+		atSeq, atOK = t.branchAt(base, br.At)
+	}
+	atText := br.At
+	if atOK {
+		atText = t.nsLogID(atSeq).String()
+	}
+	// Step 3: the branch's namespace document.
+	nd, writes, gcanon, cfgID, perr := branchGenesis(bcfg.Doc, base.name, atText, br.Patches, branchDropped)
+	if perr != nil {
+		return nil, patchErr(perr)
+	}
+	// Step 4: the document, validated as §7.4 says, then the limits
+	// (§6.2). Every refusal of a branch field is 422 invalid with errors
+	// pointing at the member, before the *-key guard (§7.4, §C.2).
+	if !atOK {
+		return nil, docInvalid("/base/at", "at is not in the base's chain (§7.6)")
+	}
+	// The document starts as the base's, so the members this version
+	// defines that it holds unchanged are judged as there; any other
+	// member is refused, since a branch is a new namespace (checkMembers).
+	cfg, verr := t.e.newConfig(nd, definedMembers(bcfg.Doc), bcfg.Doc)
+	if verr != nil {
+		return nil, verr
+	}
+	if !jsonv.Equal(bcfg.Doc["retention"], cfg.Doc["retention"]) {
+		if aerr := t.e.checkArchives(cfg); aerr != nil {
+			return nil, withPointer(aerr)
+		}
+	}
+	if cfg.Base == nil || cfg.Base.NS != base.name || cfg.Base.At != atText || cfg.Base.Remote() {
+		return nil, docInvalid("/base", "/base cannot be changed (§7.4)")
+	}
+	if cfg.DraftsFor != nil && base.isBranch() && t.draftRoot(base) == "" {
+		return nil, docInvalid("/drafts", "/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
+	}
+	// Every * key of the base, and of its local bases, is kept (§7.6).
+	for b := base; ; b = t.nsByID(b.base.Int64) {
+		if err := keepsStarKeys(cfg, b, t.config(b.configSeq)); err != nil {
+			return nil, err
+		}
+		if !b.isBranch() || t.remoteShadow(b) != nil {
+			break
+		}
+	}
+	if cfg.Read == "public" && bcfg.Read != "public" {
+		return nil, docInvalid("/read", "a branch of a non-public namespace cannot be public (§7.4)")
+	}
+	if err := t.checkEncryption(nil, cfg, t.nsLevel(base)); err != nil {
+		return nil, err
+	}
+	if err := t.checkNonceBase(nil, cfg, base); err != nil {
+		return nil, err
+	}
+	if cfg.Successor != "" {
+		// A branch of base, or of a namespace further up its chain, as
+		// for a config write that sets it (§7.4).
+		bases := t.successorBases(base)
+		bases[fmt.Sprint(base.id)] = true
+		if err := t.successorOK(cfg.Successor, 0, bases); err != nil {
+			return nil, err
+		}
+	}
 	depth := 1
 	for b := base; b.isBranch(); b = t.nsByID(b.base.Int64) {
 		depth++
@@ -219,49 +241,11 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if err := checkConfigLimits(bcfg.Limits, br.Patches, jsonv.Canonical(br.Patches), true, jsonv.Canonical(nd), func() bool { return true }); err != nil {
 		return nil, err
 	}
-	// Step 5. The document starts as the base's, so the members this
-	// version defines that it holds unchanged are judged as there; any
-	// other member is refused, since a branch is a new namespace
-	// (checkMembers).
-	cfg, perr := t.e.newConfig(nd, definedMembers(bcfg.Doc), bcfg.Doc)
-	if perr != nil {
-		return nil, perr
-	}
-	if !jsonv.Equal(bcfg.Doc["retention"], cfg.Doc["retention"]) {
-		if aerr := t.e.checkArchives(cfg); aerr != nil {
-			return nil, aerr
-		}
-	}
-	if cfg.Base == nil || cfg.Base.NS != base.name || cfg.Base.At != atID.String() {
-		return nil, invalid("/base cannot be changed")
-	}
-	if cfg.DraftsFor != nil && base.isBranch() && t.draftRoot(base) == "" {
-		return nil, invalid("/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
-	}
+	// Step 6: the *-key guard, with a * key of the base (§7.6, §C.2), then
+	// the base's rules, which evaluate a branch envelope.
 	if touchesGuarded(writes) && !a.star {
 		return nil, forbidden("these patches need a grant chained to a * key of the base")
 	}
-	for b := base; ; b = t.nsByID(b.base.Int64) {
-		for kid, k := range t.config(b.configSeq).starKeys() {
-			nk, ok := findKey(cfg.Keys, kid)
-			if !ok || string(nk.Pub) != string(k.Pub) || !nk.IsStar() {
-				return nil, invalid(fmt.Sprintf("key %q of %s must be kept", kid, b.name))
-			}
-		}
-		if !b.isBranch() {
-			break
-		}
-	}
-	if cfg.Read == "public" && bcfg.Read != "public" {
-		return nil, invalid("a branch of a non-public namespace cannot be public")
-	}
-	if err := t.checkEncryption(nil, cfg, t.nsLevel(base)); err != nil {
-		return nil, err
-	}
-	if err := t.checkNonceBase(nil, cfg, base); err != nil {
-		return nil, err
-	}
-	// Step 6: the base's rules evaluate a branch envelope.
 	env := t.basicEnvelope("branch", br.Name, a)
 	env["writes"] = anyStrings(writes)
 	env["doc"] = nd
@@ -280,6 +264,93 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	t.appendNS(bn, map[string]any{"kind": "config", "target": cfgID.String()}, nil, &cseq, cseq, author)
 	// A sealed branch has its own epoch keys (§E.2.5).
 	t.sealedConfigWritten(bn, nil, cfg)
-	_, nsID := t.appendNS(base, map[string]any{"kind": "branch", "name": br.Name, "at": atID.String(), "target": cfgID.String()}, nil, &cseq, base.configSeq, author)
+	_, nsID := t.appendNS(base, map[string]any{"kind": "branch", "name": br.Name, "at": atText, "target": cfgID.String()}, nil, &cseq, base.configSeq, author)
 	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: cfgID.String()}, nil
+}
+
+// branchDropped are the members of the base's current document a local
+// branch's starting document leaves out (§7.6): none of them is
+// inherited. legacyBranchDropped is the list before v0.73, which kept
+// cleanup, so that a creation made then still retries (branchRetry).
+var (
+	branchDropped       = []string{"frozen", "successor", "merged", "abandoned", "cleanup", "drafts", "schemaReads"}
+	legacyBranchDropped = []string{"frozen", "successor", "merged", "abandoned", "drafts", "schemaReads"}
+)
+
+// branchGenesis builds a local branch's namespace document from its base's
+// document bdoc (§7.6): the members dropped removed, base: { ns, at }
+// added, then patches applied. It returns the document, the patches'
+// writes, and the canonical genesis patch set and its config id.
+func branchGenesis(bdoc map[string]any, baseName, at string, patches any, dropped []string) (doc any, writes []string, canon []byte, id ids.ID, err error) {
+	d := cloneDoc(bdoc)
+	for _, k := range dropped {
+		delete(d, k)
+	}
+	d["base"] = map[string]any{"ns": baseName, "at": at}
+	ops, err := patch.Parse(patches)
+	if err != nil {
+		return nil, nil, nil, ids.ID{}, err
+	}
+	nd, w, err := patch.Apply(d, true, ops, patch.Options{})
+	if err != nil {
+		return nil, nil, nil, ids.ID{}, err
+	}
+	canon = jsonv.Canonical([]any{map[string]any{"op": "add", "path": "", "value": nd}})
+	return nd, patch.WritesStrings(w), canon, ids.Revision(nil, canon), nil
+}
+
+// branchAt resolves a branch's at in base's chain (§7.6).
+func (t *tx) branchAt(base *nsRow, at string) (int64, bool) {
+	id, err := ids.Parse(at)
+	if err != nil {
+		return 0, false
+	}
+	return t.nsLogSeq(base.id, id)
+}
+
+// branchRetry answers an idempotent retry of the creation of ex, a taken
+// name, or nil (§7.6, §7.2): until ex is purged, a local branch of base
+// whose creation was by the same principal (the same root sub and kid),
+// with the same at, where an omitted at names the one recorded for the
+// branch and one outside the base's chain matches nothing, and the same
+// patches. The patches are judged by the genesis they give from the base's
+// document in force at the creation, so later config writes to the base
+// don't turn a retry into a 412.
+func (t *tx) branchRetry(base, ex *nsRow, br BranchRequest, a *actor) *WriteResult {
+	if ex.purged || !ex.base.Valid || ex.base.Int64 != base.id {
+		return nil
+	}
+	atSeq := ex.baseAt.Int64
+	if br.At != "" {
+		if s, ok := t.branchAt(base, br.At); !ok || s != atSeq {
+			return nil
+		}
+	}
+	var gseq int64
+	var gid []byte
+	if t.QueryRow(`SELECT seq, id FROM ns_config WHERE ns = ? AND parent_seq IS NULL`, ex.id).Scan(&gseq, &gid) != nil {
+		return nil
+	}
+	// The base's branch entry targets the branch's config genesis.
+	var seq int64
+	if t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND kind = ? AND target_seq = ?`, base.id, nsKindCode("branch"), gseq).Scan(&seq) != nil ||
+		!t.samePrincipal(seq, a, t.actorID(a)) {
+		return nil
+	}
+	bdoc := t.config(base.configSeq).Doc
+	if ex.baseConfigSeq.Valid {
+		bdoc = t.config(ex.baseConfigSeq.Int64).Doc
+	}
+	at := t.nsLogID(atSeq).String()
+	match := false
+	for _, dropped := range [][]string{branchDropped, legacyBranchDropped} {
+		if _, _, _, id, err := branchGenesis(bdoc, base.name, at, br.Patches, dropped); err == nil && id == ids.FromBytes(gid) {
+			match = true
+			break
+		}
+	}
+	if !match {
+		return nil
+	}
+	return &WriteResult{Status: 200, Replayed: true, ConfigID: ids.FromBytes(gid).String(), NSID: t.nsLogID(seq).String()}
 }
