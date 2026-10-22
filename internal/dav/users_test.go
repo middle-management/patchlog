@@ -283,15 +283,16 @@ func TestWriterSettingsRefresh(t *testing.T) {
 	}
 }
 
-// A gateway re-checks a grant at least as often as edge grants expire
-// (§H.7, §C.5.2): VerifyEvery is at most their longest lifetime.
+// A gateway re-checks a grant at least every five minutes (§H.7), more
+// often than edge grants expire (§C.5.2): VerifyEvery is at most that.
 func TestVerifyEveryBound(t *testing.T) {
 	t.Parallel()
 	c := must(client.New("http://127.0.0.1:1"))
-	if _, err := dav.New(dav.Options{Client: c, Namespaces: []string{"docs"}, Gateway: true, VerifyEvery: 16 * time.Minute}); err == nil {
-		t.Fatal("VerifyEvery of 16 minutes taken")
+	for _, d := range []time.Duration{16 * time.Minute, 15 * time.Minute} {
+		if _, err := dav.New(dav.Options{Client: c, Namespaces: []string{"docs"}, Gateway: true, VerifyEvery: d}); err == nil {
+			t.Fatalf("VerifyEvery of %v taken", d)
+		}
 	}
-	must(dav.New(dav.Options{Client: c, Namespaces: []string{"docs"}, Gateway: true, VerifyEvery: 15 * time.Minute}))
 	must(dav.New(dav.Options{Client: c, Namespaces: []string{"docs"}, Gateway: true}))
 }
 

@@ -58,7 +58,6 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/middle-management/patchlog/internal/client"
-	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
@@ -147,10 +146,10 @@ type Options struct {
 	// MaxLocks bounds one user's locks (default 256).
 	MaxLocks int
 	// VerifyEvery is how often a gateway asks the core again whether a
-	// token's grant is accepted (default 5 minutes): at least as often as
-	// edge grants expire (§H.7, §C.5.2), at most edge.MaxGrantTTL, which
-	// bounds how long a revoked grant still reaches its user's scratch
-	// files. Writers' settings (§7.4 writer) are kept for no longer.
+	// token's grant is accepted (default and at most maxVerifyEvery, five
+	// minutes: §H.7 "Re-checking"), which bounds how long a revoked grant
+	// still reaches its user's scratch files. Writers' settings (§7.4
+	// writer) are kept for no longer.
 	VerifyEvery time.Duration
 	// CatalogTTL is how long a token's read of a catalog's tree serves its
 	// requests, unless this server writes meanwhile (default 5s).
@@ -176,6 +175,11 @@ const (
 	heavyBody  = 4 << 10
 	maxHeavy   = 4
 )
+
+// maxVerifyEvery is the longest a gateway serves a grant without asking
+// the core again whether it is accepted (§H.7 "Re-checking": at least
+// every five minutes), shorter than edge grants live (edge.MaxGrantTTL).
+const maxVerifyEvery = 5 * time.Minute
 
 // maxMetas bounds the files' metadata kept by revision id (fileMeta, a
 // few dozen bytes each), so a listing reads each revision's document once
@@ -270,12 +274,12 @@ func New(opt Options) (*Server, error) {
 	def(&opt.Retries, 5)
 	defDur(&opt.ScratchIdle, time.Hour)
 	defDur(&opt.RecordIdle, 24*time.Hour)
-	defDur(&opt.VerifyEvery, 5*time.Minute)
+	defDur(&opt.VerifyEvery, maxVerifyEvery)
 	defDur(&opt.CatalogTTL, 5*time.Second)
 	defDur(&opt.MaxRetryWait, 2*time.Second)
 	defDur(&opt.TreeWait, 3*time.Second)
-	if opt.VerifyEvery > edge.MaxGrantTTL {
-		return nil, fmt.Errorf("dav: VerifyEvery %v is longer than edge grants live (%v): a gateway re-checks a grant at least as often as they expire (§H.7, §C.5.2)", opt.VerifyEvery, edge.MaxGrantTTL)
+	if opt.VerifyEvery > maxVerifyEvery {
+		return nil, fmt.Errorf("dav: VerifyEvery %v is longer than %v: a gateway re-checks a grant at least every five minutes (§H.7)", opt.VerifyEvery, maxVerifyEvery)
 	}
 	if opt.Realm == "" {
 		opt.Realm = "patchlog"
