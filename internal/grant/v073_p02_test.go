@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/rules"
 )
 
 // A grant carries roles when any block lists roles (§2.1, v0.66): a
@@ -315,10 +316,10 @@ func TestV073RulesCompiledAtDecode(t *testing.T) {
 // request-shape error before its rules are compiled (§C.8).
 func TestV073RulesPerGrantAtDecode(t *testing.T) {
 	leaf := map[string]any{"op": "test", "path": "/action", "value": "read"}
-	if n := countForms(map[string]any{"all": []any{leaf, map[string]any{"not": leaf}}}); n != 4 {
+	if n := rules.CountForms(map[string]any{"all": []any{leaf, map[string]any{"not": leaf}}}); n != 4 {
 		t.Fatalf("all/not: %d", n)
 	}
-	if n := countForms(map[string]any{"if": []any{leaf}, "then": []any{leaf, map[string]any{"any": []any{leaf}}}}); n != 5 {
+	if n := rules.CountForms(map[string]any{"if": []any{leaf}, "then": []any{leaf, map[string]any{"any": []any{leaf}}}}); n != 5 {
 		t.Fatalf("if/then/any: %d", n)
 	}
 	f := newFixture(t, nil)

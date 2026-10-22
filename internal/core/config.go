@@ -474,7 +474,10 @@ func definedMembers(doc map[string]any) map[string]any {
 // may hold them: key entries are strict (§7.4). An attrs schema is held to
 // the rules of a rule's schema (§C.4, §6.4.2), compiled as the test that
 // checks it at verification; grant.ParseKeys checks only that it is an
-// object or a boolean. An entry prev holds unchanged is kept.
+// object or a boolean. A sub is a regular expression RE2 accepts as §6.6
+// reads it (grant.SubPattern); grant.ParseKeys still compiles one RE2
+// took as written, as stored documents may hold it. An entry prev holds
+// unchanged is kept.
 func checkKeyFields(v, prev any) *memberError {
 	pa, _ := prev.([]any)
 	arr, _ := v.([]any)
@@ -495,8 +498,13 @@ func checkKeyFields(v, prev any) *memberError {
 				return badAt(pointer.Pointer{"keys", strconv.Itoa(i), f}, "is not a key field; a key entry holds only the fields of §C.4")
 			}
 		}
+		if s, ok := m["sub"].(string); ok {
+			if _, err := grant.SubPattern(s); err != nil {
+				return badAt(pointer.Pointer{"keys", strconv.Itoa(i), "sub"}, "must be a regular expression RE2 accepts, with \\uXXXX read as \\x{XXXX} (§C.4, §6.6): %v", err)
+			}
+		}
 		if a, ok := m["attrs"]; ok {
-			if _, err := rules.Compile(map[string]any{"op": "test", "path": "/attrs", "schema": a}); err != nil {
+			if _, err := rules.CompileStrict(map[string]any{"op": "test", "path": "/attrs", "schema": a}); err != nil {
 				return badAt(pointer.Pointer{"keys", strconv.Itoa(i), "attrs"}, "must be a JSON Schema held to the rules of a rule's schema (§C.4, §6.4.2): %v", err)
 			}
 		}
@@ -689,6 +697,45 @@ type configMode struct {
 	prev map[string]any
 }
 
+// ruleCompiler compiles the document's lists of rules, in rules, a role
+// or a key scope (§6.4.2): as stored for a stored document
+// (rules.CompileList), and otherwise as written now
+// (rules.CompileListStrict), except a rule the write keeps unchanged from
+// prev, anywhere in rules, roles or key scopes, which compiles as stored,
+// as a kept limit is held as stored: §6.4.2's fragment rules came after
+// it was stored (F-S3), and a write that leaves it alone, such as a
+// freeze, isn't refused for it. A rule compiled as stored still asserts
+// draft 2020-12's formats (§6.4.2), so the configuration in force, a
+// stored document's parse, evaluates a rule as its write compiled it.
+func (md configMode) ruleCompiler() func(v any) ([]*rules.Rule, error) {
+	if md.stored {
+		return rules.CompileList
+	}
+	if md.prev == nil {
+		return func(v any) ([]*rules.Rule, error) { return rules.CompileListStrict(v, nil) }
+	}
+	kept := map[string]bool{}
+	keep := func(v any) {
+		arr, _ := v.([]any)
+		for _, r := range arr {
+			kept[string(jsonv.Canonical(r))] = true
+		}
+	}
+	keep(md.prev["rules"])
+	ks, _ := md.prev["keys"].([]any)
+	for _, k := range ks {
+		km, _ := k.(map[string]any)
+		keep(km["rules"])
+	}
+	roles, _ := md.prev["roles"].(map[string]any)
+	for _, r := range roles {
+		rm, _ := r.(map[string]any)
+		keep(rm["rules"])
+	}
+	isKept := func(r any) bool { return kept[string(jsonv.Canonical(r))] }
+	return func(v any) ([]*rules.Rule, error) { return rules.CompileListStrict(v, isKept) }
+}
+
 // keptLimit reports whether a document's limits[k], x, is held as stored
 // rather than set by the write: always for a stored document, and for a
 // write when what it keeps holds the same value.
@@ -736,6 +783,7 @@ func parseConfigIn(doc any, defaults, max Limits, md configMode) (*Config, error
 		return nil, fmt.Errorf("the namespace document must be an object")
 	}
 	c := &Config{Doc: m, Read: "grant", Limits: defaults, Revoked: map[string]bool{}}
+	compileRules := md.ruleCompiler()
 	for k, v := range m {
 		switch k {
 		case "read":
@@ -745,7 +793,7 @@ func parseConfigIn(doc any, defaults, max Limits, md configMode) (*Config, error
 			}
 			c.Read = s
 		case "rules":
-			rs, err := rules.CompileList(v)
+			rs, err := compileRules(v)
 			if err != nil {
 				return nil, fmt.Errorf("/rules: %v", err)
 			}
@@ -759,7 +807,7 @@ func parseConfigIn(doc any, defaults, max Limits, md configMode) (*Config, error
 				return nil, fmt.Errorf("/keys: %v", err)
 			}
 			for _, k := range ks {
-				if _, err := rules.CompileList(anySlice(k.Rules)); err != nil {
+				if _, err := compileRules(anySlice(k.Rules)); err != nil {
 					return nil, fmt.Errorf("/keys %s rules: %v", k.Kid, err)
 				}
 				c.ruleForms += rules.CountForms(anySlice(k.Rules))
@@ -771,7 +819,7 @@ func parseConfigIn(doc any, defaults, max Limits, md configMode) (*Config, error
 				return nil, fmt.Errorf("/roles: %v", err)
 			}
 			for name, r := range rs {
-				if _, err := rules.CompileList(anySlice(r.Rules)); err != nil {
+				if _, err := compileRules(anySlice(r.Rules)); err != nil {
 					return nil, fmt.Errorf("/roles/%s rules: %v", name, err)
 				}
 				c.ruleForms += rules.CountForms(anySlice(r.Rules))
