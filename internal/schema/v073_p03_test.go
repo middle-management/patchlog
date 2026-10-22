@@ -516,3 +516,21 @@ func TestV073RefsFailClosed(t *testing.T) {
 		t.Errorf("not revision paths: %+v %+v", refs, locs)
 	}
 }
+
+// Invariant 3: a schema written now may $ref a revision stored before the
+// upgrade whose pattern RE2 took as written though the translation refuses
+// it; the revisions of a written schema's closure compile as they did
+// (§6.1), while its own patterns are read as §6.6 says.
+func TestV073WriteRefsStoredPattern(t *testing.T) {
+	p := "/r/schemas/oldpat/rev/" + rev('r')
+	s := newStore()
+	s.docs[p] = j(`{` + d073 + `,"type":"string","pattern":"^a\\x{D800}?$"}`)
+	v := NewValidator()
+	doc := j(`{` + d073 + `,"type":"object","properties":{"a":{"$ref":"` + p + `"}}}`)
+	if err := v.Validate(doc, s.load); err != nil {
+		t.Fatalf("referencing it: %v", err)
+	}
+	if err := v.Validate(j(`{`+d073+`,"properties":{"a":{"$ref":"`+p+`"},"b":{"pattern":"^a\\x{D800}?$"}}}`), s.load); !isInvalid(err) {
+		t.Errorf("its own pattern: got %v, want invalid", err)
+	}
+}

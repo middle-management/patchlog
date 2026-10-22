@@ -421,6 +421,11 @@ func (v *Validator) validateSchemaDocument(doc any, load Loader) error {
 	// document first references this schema (§6.1).
 	var loadErr error
 	c := newCompiler(v.urlLoader(load, &loadErr), V073)
+	// The revisions of its $ref closure are stored, and compile as they
+	// did (§6.1): their patterns as Legacy reads them, until each compiles
+	// under its own marker. The document's own patterns were checked under
+	// V073 above, by the meta-schema and the check.
+	c.UseRegexpEngine(Legacy.regexpEngine)
 	if err := c.AddResource(newSchemaURL, doc); err != nil {
 		return &SchemaError{Msg: err.Error()}
 	}
