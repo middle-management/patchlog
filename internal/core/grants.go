@@ -39,10 +39,10 @@ import (
 // one for a grant only its bases record. Answers sealed before v0.73 held
 // stored as an array of every SignedBlock: the answer in today's shape is
 // sealed and stored under a key of its own (grantSealKey), in the same
-// epoch, the first time it is read, and served from then on. End-to-end namespaces serve it in
-// the clear, as their logs are, but marked Private: Cache-Control private
-// instead of the immutable class (§9), since a grant shows more than a log
-// entry does.
+// epoch, the first time it is read, and served from then on. End-to-end
+// namespaces serve it in the clear, as their logs are, but marked Private:
+// Cache-Control private instead of the immutable class (§9), since a grant
+// shows more than a log entry does.
 
 // GrantDoc is the answer of GET /ns/{ns}/grants/{gid}.
 type GrantDoc struct {
