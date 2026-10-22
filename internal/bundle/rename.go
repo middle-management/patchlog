@@ -661,18 +661,23 @@ func (im *importer) scanRenames(d *bdoc, base any, baseLive bool, load schema.Lo
 // declaredRefs are the strings of the reference form at the declared
 // positions of a document (§G.4.4 Renaming), by pointer: a schema's
 // $ref (schema.RefLocations), or a document's $schema and the x-ref
-// positions of its schema (§6.5), as the source's schemas declare them.
-// id is a schema's $id, "" if it has none.
+// positions of its schema (§6.5), as the source's schemas declare them;
+// and in any document, typed or not, a top-level $successor naming
+// another namespace (successorRef). id is a schema's $id, "" if it has
+// none.
 func declaredRefs(doc any, load schema.Loader) (refs map[string]string, id string, err error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
 		return nil, "", nil
 	}
+	refs = map[string]string{}
+	if succ := successorRef(m); succ != "" {
+		refs["/$successor"] = succ
+	}
 	s, ok := m["$schema"].(string)
 	if !ok {
-		return nil, "", nil
+		return refs, "", nil
 	}
-	refs = map[string]string{}
 	if schema.IsDialect(s) {
 		for _, r := range schema.RefLocations(doc) {
 			refs[r.Pointer.String()] = r.Raw
@@ -689,6 +694,20 @@ func declaredRefs(doc any, load schema.Loader) (refs map[string]string, id strin
 		refs[r.Pointer] = r.Raw
 	}
 	return refs, "", nil
+}
+
+// successorRef is a document's top-level $successor if it names a
+// resource of another namespace, /r/{ns2}/{name2} (§8.1): a renamed import
+// rewrites it as any reference is, both in documents and as the value of
+// an add or replace at /$successor in a history line, while a bare name,
+// a resource of the namespace serving it, needs nothing (§G.4.4). "" for
+// any other.
+func successorRef(m map[string]any) string {
+	s, _ := m["$successor"].(string)
+	if !schema.Successor(s) || !strings.HasPrefix(s, "/r/") {
+		return ""
+	}
+	return s
 }
 
 // marker stands for leaf i while land looks for where it lands.

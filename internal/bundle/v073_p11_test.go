@@ -596,3 +596,64 @@ func TestV073UpstreamDiffIgnoresNonce(t *testing.T) {
 		t.Fatalf("a changed snapshot: upstream %+v", u)
 	}
 }
+
+// A renamed import rewrites a $successor naming a mapped namespace,
+// /r/{src}/…, as any reference: in history lines, the value of an add or
+// replace at /$successor, and in snapshot documents. A bare one needs
+// nothing (§8.1, §G.4.4, MF-48).
+func TestV073RenameSuccessor(t *testing.T) {
+	t.Parallel()
+	src := newDeployment(t, stagingOrigin)
+	src.ns("a", nil)
+	src.ns("b", nil)
+	src.create("b", "new", map[string]any{"t": 1.0})
+	src.create("a", "old", map[string]any{"t": 0.0})
+	src.append("a", "old", op("add", "/$successor", "/r/b/new"))
+	src.append("a", "old", op("replace", "/t", 9.0), op("replace", "/$successor", "/r/b/new"))
+	must(src.c.Delete(ctx, "a", "old", src.head("a", "old").ID))
+	src.create("a", "local", map[string]any{"t": 2.0})
+	localLast := src.append("a", "local", op("add", "/$successor", "sibling"))
+	must(src.c.Delete(ctx, "a", "local", localLast))
+	src.create("a", "live", map[string]any{"t": 3.0, "$successor": "/r/b/new"})
+
+	var full bytes.Buffer
+	_, _, err := bundle.Export(ctx, src.c, &full, bundle.ExportOptions{Select: []string{"a/old", "a/local", "b/new"}})
+	noErr(t, err)
+	dst := newDeployment(t, cmsOrigin)
+	rep := importB(t, dst, full.Bytes(), bundle.ImportOptions{NSMap: map[string]string{"b": "b2"}})
+	h := dst.head("a", "old")
+	if h.State != client.Tombstoned || h.Successor != "/r/b2/new" {
+		t.Fatalf("a/old: %+v, want a tombstone whose successor is /r/b2/new", h)
+	}
+	if d := rep.Doc("a/old"); !d.Renamed {
+		t.Fatalf("a/old not rewritten: %+v", d)
+	}
+	for _, u := range rep.Undeclared {
+		if u.Pointer == "/$successor" {
+			t.Errorf("a $successor listed as undeclared: %+v", u)
+		}
+	}
+	// Its first $successor revision names the new path too.
+	es := must(dst.c.Log(ctx, "a", "old", h.Last, ""))
+	for _, e := range es {
+		if bytes.Contains(jsonv.Canonical(must(client.ToValue(e.Patches))), []byte("/r/b/new")) {
+			t.Errorf("revision %s still names /r/b/new", e.ID)
+		}
+	}
+	// A bare successor isn't a reference: ids kept.
+	if hl := dst.head("a", "local"); hl.Last != localLast || hl.Successor != "sibling" {
+		t.Fatalf("a/local: %+v", hl)
+	}
+
+	// A snapshot document's $successor.
+	var snap bytes.Buffer
+	_, _, err = bundle.Export(ctx, src.c, &snap, bundle.ExportOptions{Select: []string{"a/live", "b/new"}, Mode: bundle.Snapshot})
+	noErr(t, err)
+	dst2 := newDeployment(t, cmsOrigin)
+	importB(t, dst2, snap.Bytes(), bundle.ImportOptions{NSMap: map[string]string{"b": "b2"}})
+	for _, ns := range []string{"a", "a-upstream"} {
+		if d := dst2.doc(ns, "live"); d["$successor"] != "/r/b2/new" {
+			t.Fatalf("%s/live: %v", ns, d)
+		}
+	}
+}

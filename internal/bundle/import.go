@@ -1606,7 +1606,7 @@ func (im *importer) snapshotOrder(ctx context.Context) ([]*bdoc, map[string][]an
 				return
 			}
 			ptr := at.String()
-			if declared[ptr] || ptr == "/$schema" {
+			if declared[ptr] || ptr == "/$schema" || (ptr == "/$successor" && schema.Successor(s)) {
 				return
 			}
 			bundled := t != nil && t.info.History == Snapshot && t.snap != nil && t.snap.Snapshot == r.Rev
@@ -1772,6 +1772,15 @@ func (im *importer) rewrite(d *bdoc, refs []annot.Ref) (any, error) {
 				doc, parsed = v, true
 				m["$schema"] = to
 				d.rep.Rewritten = append(d.rep.Rewritten, RewrittenRef{Pointer: "/$schema", From: s, To: to})
+			}
+		}
+		// Its $successor naming a renamed namespace (§8.1, §G.4.4), which
+		// is live and never a problem.
+		if s := successorRef(m); s != "" {
+			if to, _, _ := im.renamedRef(s); to != s {
+				doc, parsed = v, true
+				m["$successor"] = to
+				d.rep.Rewritten = append(d.rep.Rewritten, RewrittenRef{Pointer: "/$successor", From: s, To: to})
 			}
 		}
 	}
