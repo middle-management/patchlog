@@ -125,6 +125,9 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 		return nil, fmt.Errorf("merge: %s is an e2e namespace: rebasing it re-encrypts its changes under the successor's keys (§F.8) and needs a key-holding view (Plan.E2E)", opt.Branch)
 	}
 	old := docProtection(bdoc.Value)
+	if lv != "" {
+		old.level = lv // as served: "sealed" for a JWE document
+	}
 	keys := opt.CopyConfig
 	if keys == nil {
 		keys = []string{"read", "cleanup"}
