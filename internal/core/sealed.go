@@ -42,6 +42,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -460,20 +461,19 @@ type KeysAnswer struct {
 	Pad   bool
 }
 
-// Keys answers POST /ns/{ns}/keys. It needs a verified grant with read on
-// the namespace (with authentication disabled, anyone gets raw epoch keys).
-// A grant that reads the namespace unrestricted (§2.1: with roles, through
-// one without /resource rules that passes) gets K_e; one restricted by
-// rules on /resource or a key with readScope "resource" gets K_r for each
-// requested resource it may read; any other is 403. Epochs run from the
-// one in force at the root block's nbf (without nbf: the first, capped to
-// the last historyEpochs) to the current one, and never include an epoch
-// that started after the grant's effective exp (§E.2.3). Keys are
-// HPKE-wrapped to the root block's enc if it has one, and raw base64url
-// otherwise. At E3 any grant with read, whatever its rules, gets the
-// keyring entries wrapped to its enc (§E.3.2). A namespace that isn't
+// Keys answers POST /ns/{ns}/keys (§E.2.3). It needs a verified grant
+// with read on the namespace (with authentication disabled, anyone gets
+// raw epoch keys). At E2 a grant whose rules fix /resource (§2.1) gets
+// K_r for the names asked, by default every name it fixes, and is 403 for
+// a name it doesn't fix or may not read; any other gets K_e if it reads
+// the namespace unrestricted, and is 403 otherwise (keysScope). Epochs are
+// those of the §E.2.3 window (grantEpochsOf), narrowed to those asked.
+// Keys are HPKE-wrapped to the root block's enc if it has one, and raw
+// base64url otherwise. At E3 any grant with read, whatever its rules, gets
+// the keyring entries wrapped to its enc (§E.3.2). A namespace that isn't
 // sealed is 404 not_offered, once the read check passes: there is nothing
-// to seal (§E.2.3).
+// to seal (§E.2.3). A request answered with keys draws one token from the
+// principal's exchangeRate bucket, as /edge-grants does (§6.6).
 func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) (*KeysAnswer, error) {
 	var out []map[string]any
 	var ans *KeysAnswer
@@ -492,7 +492,6 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		if aerr != nil {
 			return aerr
 		}
-		perResource, refused := t.keysReadScope(a)
 		if cfg.level == levelE2E {
 			// The server only relays the keyring entries a key holder
 			// wrapped to the grant's enc (§E.3.2), so a grant that reads
@@ -500,13 +499,16 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			// resources: such a writer needs them, and the epoch and pad,
 			// to seal (§E.2.3, §E.3.1). Per-resource keys don't exist at
 			// E3. A grant whose rules refuse every read reads nothing.
-			if refused {
+			if _, refused := t.keysReadScope(a); refused {
 				return notFound()
 			}
 			// 410 once the read check passes, as every URL of a
 			// purged namespace (§8.5).
 			if n.purged {
 				return t.purgedNS(n)
+			}
+			if err := t.drawExchange(a); err != nil {
+				return err
 			}
 			keys, err := t.keysE2E(n, cfg, a, kr)
 			if err != nil {
@@ -515,8 +517,11 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			ans = &KeysAnswer{Keys: keys, Epoch: cfg.Epoch, Level: levelNames[cfg.level], Pad: cfg.Pad}
 			return nil
 		}
-		if refused {
-			return forbidden("epoch keys need unrestricted read on the namespace (§2.1, §E.2.3)")
+		// §E.2.3's test is part of the read check, so it comes before a
+		// purged namespace's 410 and not_offered (§8.5).
+		names, perResource, serr := t.keysScope(a, kr)
+		if serr != nil {
+			return serr
 		}
 		if n.purged {
 			return t.purgedNS(n)
@@ -524,20 +529,10 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		if cfg.level != levelSealed {
 			return apiErr(404, "not_offered", "message", "the namespace is not sealed: there are no keys, and nothing to seal (§E.2.3)")
 		}
-		epochs := t.grantEpochs(n, cfg, a)
-		if kr.Epochs != nil {
-			want := map[int]bool{}
-			for _, x := range kr.Epochs {
-				want[x] = true
-			}
-			var keep []int
-			for _, x := range epochs {
-				if want[x] {
-					keep = append(keep, x)
-				}
-			}
-			epochs = keep
+		if err := t.drawExchange(a); err != nil {
+			return err
 		}
+		epochs := selectEpochs(t.grantEpochs(n, cfg, a), kr.Epochs)
 		var enc = recipientOf(a)
 		emit := func(kid, resource string, key []byte) error {
 			if enc != nil {
@@ -554,20 +549,6 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			}
 			out = append(out, m)
 			return nil
-		}
-		var names []string
-		if perResource {
-			seen := map[string]bool{}
-			for _, r := range kr.Resources {
-				if !ValidResourceName(r) || seen[r] {
-					continue
-				}
-				seen[r] = true
-				if t.grantRules(a, "read", nil, t.basicEnvelope("read", r, a), false) == nil {
-					names = append(names, r)
-				}
-			}
-			sort.Strings(names)
 		}
 		out = []map[string]any{}
 		for _, ep := range epochs {
@@ -595,7 +576,137 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 	return ans, err
 }
 
-// keysReadScope classifies a grant for /keys (§C.5, §E.2.3). K_e only
+// drawExchange draws the one token a /keys request takes from the
+// principal's exchangeRate bucket (§E.2.3, §6.6): 429 naming exchangeRate
+// when it is empty.
+func (t *tx) drawExchange(a *actor) *Error {
+	if a == nil || a.bucketKey == "" {
+		return nil
+	}
+	return t.admit([]draw{{"e\x00" + a.bucketKey, t.e.opt.Maximums.ExchangeRate, 1, "exchangeRate"}})
+}
+
+// selectEpochs keeps the epochs of window that asked names, all of them
+// if asked is nil (§E.2.3: by default all).
+func selectEpochs(window, asked []int) []int {
+	if asked == nil {
+		return window
+	}
+	want := map[int]bool{}
+	for _, x := range asked {
+		want[x] = true
+	}
+	var keep []int
+	for _, x := range window {
+		if want[x] {
+			keep = append(keep, x)
+		}
+	}
+	return keep
+}
+
+// keysScope decides what a grant gets from /keys at E2 (§E.2.3): a grant
+// whose rules fix /resource (§2.1, fixedNames) gets K_r for the names
+// asked, by default every name its rules fix, each of which they must fix
+// and the grant may read (403 otherwise), sorted; any other grant gets K_e
+// if it reads the namespace unrestricted (§2.1), and is 403 otherwise, the
+// names asked being ignored. With authentication disabled, every request
+// gets K_e.
+func (t *tx) keysScope(a *actor, kr KeysRequest) (names []string, perResource bool, err *Error) {
+	if a == nil || a.verified == nil {
+		return nil, false, nil
+	}
+	fixed, fixes := fixedNames(a)
+	if !fixes {
+		if !t.readsUnrestricted(a) {
+			return nil, false, forbidden("epoch keys need unrestricted read on the namespace (§2.1, §E.2.3)")
+		}
+		return nil, false, nil
+	}
+	in := make(map[string]bool, len(fixed))
+	for _, n := range fixed {
+		in[n] = true
+	}
+	want := kr.Resources
+	if want == nil {
+		want = fixed
+	}
+	seen := map[string]bool{}
+	names = []string{}
+	for _, r := range want {
+		if seen[r] {
+			continue
+		}
+		seen[r] = true
+		if !in[r] {
+			return nil, false, forbidden(fmt.Sprintf("the grant's rules don't fix /resource to %q, so it gets no key of it (§2.1, §E.2.3)", r))
+		}
+		if t.grantRules(a, "read", nil, t.basicEnvelope("read", r, a), false) != nil {
+			return nil, false, forbidden(fmt.Sprintf("the grant may not read %q, so it gets no key of it (§E.2.3)", r))
+		}
+		names = append(names, r)
+	}
+	sort.Strings(names)
+	return names, true, nil
+}
+
+// readsUnrestricted reports whether a reads the namespace unrestricted
+// (§2.1): it may read, neither its key's scope nor its rules refer to
+// /resource, and, with roles, a read role without such rules passes its
+// rules against a read envelope.
+func (t *tx) readsUnrestricted(a *actor) bool {
+	roles, ok := a.unrestrictedRoles()
+	return ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), false) == nil
+}
+
+// fixedNames returns the names a's rules fix /resource to (§2.1): a rule
+// of its blocks or its key's scope, at top level or nested only in alls,
+// that tests /resource against one name, or a finite set (fixesResource),
+// each such rule narrowing the names to those all of them allow. It
+// reports false when none fixes it, the set left is empty, or a literal of
+// a fixing rule isn't a valid name (§3.6), even one the intersection
+// drops. Rules that refer to /resource otherwise don't fix it, and are
+// left to the read check per name.
+func fixedNames(a *actor) ([]string, bool) {
+	var names []string
+	fixed, bad := false, false
+	var walk func(rs []any)
+	walk = func(rs []any) {
+		for _, rv := range rs {
+			if m, ok := rv.(map[string]any); ok && len(m) == 1 {
+				if all, ok := m["all"].([]any); ok {
+					walk(all)
+					continue
+				}
+			}
+			if _, ok := grant.ResourceLiterals(rv); !ok {
+				continue
+			}
+			set, ok := fixesResource(rv)
+			if !ok {
+				bad = true
+				continue
+			}
+			if !fixed {
+				names, fixed = set, true
+				continue
+			}
+			in := make(map[string]bool, len(set))
+			for _, n := range set {
+				in[n] = true
+			}
+			names = slices.DeleteFunc(names, func(n string) bool { return !in[n] })
+		}
+	}
+	walk(a.verified.KeyRules)
+	walk(a.verified.BlockRules)
+	if bad || !fixed || len(names) == 0 {
+		return nil, false
+	}
+	return names, true
+}
+
+// keysReadScope classifies a grant for /keys at E3 (§C.5, §E.2.3). K_e only
 // through rules none of which refers to /resource. Roles are
 // alternatives: if the unrestricted ones fail, a read role that refers to
 // /resource may still pass per resource (perResource); without one, the
@@ -649,39 +760,58 @@ func (t *tx) epochStarts(table string, ns int64, max int) []epochStart {
 	return all
 }
 
-// grantEpochsOf applies the §E.2.3 epoch range of a grant to all.
+// latestNbf is the latest nbf among a's blocks (§E.2.3), nil if no block
+// has one or there is no grant.
+func latestNbf(a *actor) *time.Time {
+	if a == nil || a.grant == nil {
+		return nil
+	}
+	var nbf *time.Time
+	for _, b := range a.grant.Blocks {
+		if b.Nbf != nil && (nbf == nil || b.Nbf.After(*nbf)) {
+			nbf = b.Nbf
+		}
+	}
+	return nbf
+}
+
+// grantEpochsOf applies the §E.2.3 window to all, a namespace's epochs and
+// when each began, ascending, up to the current one: from the epoch in
+// force at the last namespace entry created at or before the latest nbf
+// among the grant's blocks, or the first where there is none (the
+// namespace wasn't sealed then); with no nbf in any block, the current
+// epoch alone; and with encryption.historyEpochs h, no more than the
+// current one and the h before it. An epoch begins with the config write,
+// a batch's config change included, that sets it, at that entry's time,
+// so the epoch in force at the last entry at or before nbf is the latest
+// that began at or before it. Epochs that began after the grant's exp are
+// not left out (v0.63). Without a grant (authentication disabled), every
+// epoch, as far as historyEpochs allows.
 func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 	if len(all) == 0 {
 		return nil
 	}
 	first := all[0].e
-	var exp *time.Time
 	if a != nil && a.grant != nil {
-		root := a.grant.Blocks[0]
-		if root.Nbf != nil {
+		nbf := latestNbf(a)
+		if nbf == nil {
+			first = cfg.Epoch
+		} else {
 			for _, x := range all {
-				if !x.created.After(*root.Nbf) {
+				if !x.created.After(*nbf) {
 					first = x.e
 				}
 			}
 		}
-		for _, b := range a.grant.Blocks {
-			if b.Exp != nil && (exp == nil || b.Exp.Before(*exp)) {
-				exp = b.Exp
-			}
-		}
 	}
-	if h := cfg.HistoryEpochs; h > 0 && cfg.Epoch-h+1 > first {
-		first = cfg.Epoch - h + 1
+	if h := cfg.HistoryEpochs; h > 0 && cfg.Epoch-h > first {
+		first = cfg.Epoch - h
 	}
 	var out []int
 	for _, x := range all {
-		// §E.2.3: a grant never receives epochs that started after its
-		// exp. One that starts exactly at exp is included.
-		if x.e < first || (exp != nil && x.created.After(*exp)) {
-			continue
+		if x.e >= first {
+			out = append(out, x.e)
 		}
-		out = append(out, x.e)
 	}
 	return out
 }

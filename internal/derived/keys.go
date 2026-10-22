@@ -24,8 +24,8 @@ type Info struct {
 	Level string // encryption.level ("" if none)
 	Epoch int    // encryption.epoch of a sealed or e2e namespace (default 1)
 	Pad   bool   // encryption.pad: sealed payloads are padded (§E.2.2)
-	// HistoryEpochs is encryption.historyEpochs: how many epochs back
-	// readers get keys for (0: all).
+	// HistoryEpochs is encryption.historyEpochs: how many epochs before
+	// the current one readers get keys for (0: all, §E.2.3).
 	HistoryEpochs int
 }
 
@@ -216,10 +216,11 @@ type ResourceKey struct {
 }
 
 // ResourceKeys derives K_r of ns/name (§E.2.1) for every epoch a reader
-// gets keys for: from the current one back encryption.historyEpochs epochs
-// (all if unset), as far as the service holds their epoch keys. It returns
-// nothing for a namespace that is neither sealed nor e2e, and an error only
-// if not even the current epoch's key is available.
+// gets keys for: the current one and, with encryption.historyEpochs h, the
+// h before it (all if unset, §E.2.3), as far as the service holds their
+// epoch keys. It returns nothing for a namespace that is neither sealed
+// nor e2e, and an error only if not even the current epoch's key is
+// available.
 func (k *Keys) ResourceKeys(ctx context.Context, ns, name string) ([]ResourceKey, error) {
 	in, err := k.Info(ctx, ns)
 	if err != nil || !in.Protected() {
@@ -227,7 +228,7 @@ func (k *Keys) ResourceKeys(ctx context.Context, ns, name string) ([]ResourceKey
 	}
 	first := 1
 	if in.HistoryEpochs > 0 {
-		first = max(1, in.Epoch-in.HistoryEpochs+1)
+		first = max(1, in.Epoch-in.HistoryEpochs)
 	}
 	var out []ResourceKey
 	for e := in.Epoch; e >= first; e-- {

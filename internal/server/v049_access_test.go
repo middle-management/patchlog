@@ -91,10 +91,13 @@ func TestV049KeysUnrestricted(t *testing.T) {
 	if r.Code != 200 || len(keys) != 1 || keys["s#1"] == nil {
 		t.Fatalf("unrestricted: %d %s", r.Code, r.Body)
 	}
-	keys, r = e.keysOf("s", map[string]any{"resources": []any{"a", "b"}}, e.grant(k, "user:x", []string{"s"}, []string{"read"}, rule("/resource", "a")))
+	keys, r = e.keysOf("s", map[string]any{"resources": []any{"a"}}, e.grant(k, "user:x", []string{"s"}, []string{"read"}, rule("/resource", "a")))
 	if r.Code != 200 || len(keys) != 1 || keys["s#1 a"] == nil {
 		t.Fatalf("fixed to a: %d %s", r.Code, r.Body)
 	}
+	// A name it doesn't fix is 403 (v0.63 §E.2.3).
+	_, r = e.keysOf("s", map[string]any{"resources": []any{"a", "b"}}, e.grant(k, "user:x", []string{"s"}, []string{"read"}, rule("/resource", "a")))
+	expectCode(t, r, 403, "forbidden")
 	// Its rules fail for the principal without referring to /resource.
 	_, r = e.keysOf("s", nil, e.grant(k, "user:x", []string{"s"}, []string{"read"}, rule("/principal/id", "user:y")))
 	expectCode(t, r, 403, "forbidden")

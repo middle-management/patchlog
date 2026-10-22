@@ -141,8 +141,10 @@ func testE2EClient(t *testing.T) {
 	if e2 != 2 {
 		t.Fatalf("epoch %d", e2)
 	}
+	// The removed reader's grant has no nbf, so it gets the current epoch
+	// only (v0.63 §E.2.3), of which it holds no entry.
 	keys := must(rc.FetchKeys(ctx, "e", nil, nil))
-	if len(keys) != 1 || keys[0].Kid != "e#1" {
+	if len(keys) != 0 {
 		t.Fatalf("removed reader keys %+v", keys)
 	}
 	n4 := must(w.AppendSealed(ctx, "e", "d", good.ID, ops(op("replace", "/n", 4))))

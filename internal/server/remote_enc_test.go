@@ -226,7 +226,10 @@ func TestRemoteBranchE2E(t *testing.T) {
 	if d := b.doc("rel", "keyring", bAdmin); len(d["keys"].([]any)) != 2 {
 		t.Fatalf("keyring %v", d)
 	}
-	readerG := b.grant(kB, "user:reader", []string{"rel"}, []string{"read"}, map[string]any{"enc": readerJWK})
+	// With an nbf before the base's first epoch, the reader gets both (a
+	// grant without nbf gets the current one only, v0.63 §E.2.3).
+	early := map[string]any{"nbf": t0.Add(-time.Hour).Format(time.RFC3339)}
+	readerG := b.grant(kB, "user:reader", []string{"rel"}, []string{"read"}, early, map[string]any{"enc": readerJWK})
 	keys, kr2 := b.keysOf("rel", nil, readerG)
 	expect(t, kr2, 200)
 	if _, ok := keys["e#1"]; !ok || len(keys) != 2 {

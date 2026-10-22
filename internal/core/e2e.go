@@ -345,20 +345,7 @@ func (t *tx) relayKeyring(out []map[string]any, seen map[string]bool, n *nsRow, 
 	}
 	seen[owner.name] = true
 	ocfg := t.config(owner.configSeq)
-	epochs := t.grantEpochsOf(t.epochStarts(`e2e_epochs`, owner.id, ocfg.Epoch), ocfg, a)
-	if kr.Epochs != nil {
-		want := map[int]bool{}
-		for _, x := range kr.Epochs {
-			want[x] = true
-		}
-		var keep []int
-		for _, x := range epochs {
-			if want[x] {
-				keep = append(keep, x)
-			}
-		}
-		epochs = keep
-	}
+	epochs := selectEpochs(t.grantEpochsOf(t.epochStarts(`e2e_epochs`, owner.id, ocfg.Epoch), ocfg, a), kr.Epochs)
 	return append(out, keyringEntries(d, enc, epochs)...)
 }
 

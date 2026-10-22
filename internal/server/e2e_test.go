@@ -437,11 +437,17 @@ func TestE2EEpochsBranchesLevels(t *testing.T) {
 	expect(t, r, 201)
 	// Epochs may only move by one.
 	expectCode(t, e.patchNS("e", ops(op("replace", "/encryption/epoch", 4.0)), f.adminG), 422, "invalid")
-	keys, _ := e.keysOf("e", nil, f.readerG)
+	// A grant gets the epochs from the one in force at its latest nbf, and
+	// the current one alone without nbf (v0.63 §E.2.3).
+	early := map[string]any{"nbf": t0.Add(-time.Hour).Format(time.RFC3339)}
+	if keys, _ := e.keysOf("e", nil, f.readerG); len(keys) != 0 {
+		t.Fatalf("removed reader without nbf %v", keys)
+	}
+	keys, _ := e.keysOf("e", nil, e.grant(f.writer, "user:reader", []string{"e"}, []string{"read"}, early, map[string]any{"enc": f.readerJWK}))
 	if _, ok := keys["e#1"]; !ok || len(keys) != 1 {
 		t.Fatalf("removed reader keys %v", keys)
 	}
-	adminEnc := e.grant(f.admin, "user:admin", []string{"e"}, []string{"read"}, map[string]any{"enc": seal.RecipientJWK(adminPriv.PublicKey())})
+	adminEnc := e.grant(f.admin, "user:admin", []string{"e"}, []string{"read"}, early, map[string]any{"enc": seal.RecipientJWK(adminPriv.PublicKey())})
 	keys, _ = e.keysOf("e", nil, adminEnc)
 	if len(keys) != 2 {
 		t.Fatalf("admin keys %v", keys)

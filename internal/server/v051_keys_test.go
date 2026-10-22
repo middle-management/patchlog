@@ -66,7 +66,9 @@ func TestKeysLimitedWriter(t *testing.T) {
 	e.mkNS("s", map[string]any{"read": "grant", "keys": []any{k.entry("*")}, "encryption": map[string]any{"level": "sealed", "pad": true}})
 	star := e.grant(k, "user:admin", []string{"s"}, []string{"read", "create", "append", "config"})
 	li := e.grant(k, "user:li", []string{"s"}, rights, only("a"))
-	keys, r := e.keysOf("s", map[string]any{"resources": []any{"a", "b"}}, li)
+	_, r := e.keysOf("s", map[string]any{"resources": []any{"a", "b"}}, li)
+	expectCode(t, r, 403, "forbidden") // b isn't fixed (v0.63 §E.2.3)
+	keys, r := e.keysOf("s", map[string]any{"resources": []any{"a"}}, li)
 	answer(r, 1, "sealed", true)
 	if len(keys) != 1 || keys["s#1 a"] != nil {
 		t.Fatalf("per-resource keys %s", r.Body)

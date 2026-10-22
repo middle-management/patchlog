@@ -207,7 +207,7 @@ func (s *Server) nsBranches(w http.ResponseWriter, r *http.Request) {
 }
 
 // nsKeys answers POST /ns/{ns}/keys (§E.2.3): { "epochs"?: [e…],
-// "resources"?: [name…] } → { "keys": [ { kid, resource?, key | suite,
+// "resources"?: [name…] } → { "keys": [ { kid, name?, from?, key |
 // wrapped } ], "epoch", "level", "pad" }, never cached. A namespace that
 // isn't sealed is 404 not_offered.
 func (s *Server) nsKeys(w http.ResponseWriter, r *http.Request) {
@@ -253,6 +253,7 @@ func (s *Server) nsKeys(w http.ResponseWriter, r *http.Request) {
 					kr.Epochs = append(kr.Epochs, int(f))
 				}
 			case "resources":
+				kr.Resources = []string{} // given, if empty: no names (§E.2.3)
 				for _, x := range arr {
 					n, ok := x.(string)
 					if !ok {
