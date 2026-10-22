@@ -15,9 +15,10 @@ import (
 // §F.6 superseded, §7.4 (v0.63): the successor may be a branch of the
 // branch's base or of a namespace further up its base chain, as after
 // retargeting a stacked branch onto its base's base (§F.4); the janitor
-// looks it up in that namespace's branches. The core refuses to name such a
-// successor until §7.4's v0.63 rule is in (RH-54), so this drives the check
-// on the branch's document as it would then read.
+// looks it up in that namespace's branches. This drives the check on the
+// branch's document as such a freeze leaves it, and on one naming a
+// successor elsewhere, which the core refuses (§7.4); the end-to-end case,
+// a rebase -switch the core accepts, is TestV073W2SupersededUpTheChain.
 func TestV073SuccessorUpTheBaseChain(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
