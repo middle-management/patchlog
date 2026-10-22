@@ -530,7 +530,7 @@ func oldCandidateSQL(fts bool, ns string, q *Query) (string, []any) {
 	if len(q.words) > 0 {
 		// v0.73: each score from its document alone (§A.4), as run
 		// computes it; the plans compared don't touch the text matches.
-		m, margs := textMatchSQL(fts, q.words)
+		m, margs := textMatchSQL(fts, ns, q.words, nil)
 		sb.WriteString(` JOIN ` + m + ` t ON t.docid = d.docid`)
 		args = append(args, margs...)
 	}

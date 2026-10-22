@@ -279,7 +279,11 @@ var createStmts = []string{
 	`CREATE INDEX IF NOT EXISTS sort_q ON "sort" (ns, path, value)`,
 }
 
-const ftsCreate = `CREATE VIRTUAL TABLE IF NOT EXISTS "text" USING fts5(ns UNINDEXED, resource UNINDEXED, schema UNINDEXED, path UNINDEXED, body, tokenize = 'unicode61 remove_diacritics 2')`
+const ftsCreate = `CREATE VIRTUAL TABLE IF NOT EXISTS "text" USING fts5(ns UNINDEXED, resource UNINDEXED, schema UNINDEXED, path UNINDEXED, body, tokenize = '` + ftsTokenizer + `')`
+
+// ftsTokenizer is the text table's tokenizer, which query words are
+// tokenized with too (Index.ftsTokens). It has never changed.
+const ftsTokenizer = "unicode61 remove_diacritics 2"
 
 // The LIKE fallback, for SQLite builds without FTS5.
 var likeCreate = []string{

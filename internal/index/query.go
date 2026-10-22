@@ -74,6 +74,9 @@ type Query struct {
 	// Mins are the ?min= values; NS is "" for a bare ns_id (the queried
 	// namespace).
 	Mins []MinRef
+	// toks are the words' tokens as the FTS5 text table has them, each
+	// word's in order (Index.ftsTokens); nil until tokenized.
+	toks [][]string
 }
 
 // RefFilter is a parsed ?ref= (§A.4). Rev and Entry are "" when the form
@@ -604,7 +607,7 @@ func (ix *Index) candidateSQL(ns string, q *Query, fs []filter, drive int) (stri
 	sb.WriteString(` FROM `)
 	switch {
 	case len(q.words) > 0:
-		m, margs := textMatchSQL(ix.fts, q.words)
+		m, margs := textMatchSQL(ix.fts, ns, q.words, q.toks)
 		sb.WriteString(m + ` t CROSS JOIN docs d`)
 		args = append(args, margs...)
 	case drive >= 0:
@@ -678,13 +681,19 @@ func (ix *Index) candidateSQL(ns string, q *Query, fs []filter, drive int) (stri
 const scoreK1 = 1.2
 
 // textMatchSQL is the subquery of the documents whose text matches every
-// word, (docid, score): with FTS5, a word's occurrences in a row are the
-// phrase instances highlight() marks (in a select of its own: LIMIT -1
-// keeps SQLite from flattening it into the aggregate, where an FTS5
-// auxiliary function can't run); with the LIKE table, the row's
-// case-folded (ASCII) occurrences of the word. A row that matched counts
-// at least one.
-func textMatchSQL(fts bool, words []string) (string, []any) {
+// word, (docid, score), the words' FTS5 tokens in toks (nil: not
+// tokenized). With FTS5, a word of one token occurs in a row as often as
+// the token, or for a prefix word a token it prefixes, does: those rows
+// and counts are the term's instances in the index (temp.text_vi,
+// Index.ftsTokens), read without tokenizing any text, so a query costs
+// what the instances of its terms do. Any other word's occurrences in a
+// row are the phrase instances highlight() marks, which tokenizes the row
+// again, so only rows of documents of ns (by docid, without reading the
+// row) are (in a select of its own: LIMIT -1 keeps SQLite from flattening
+// it into the aggregate, where an FTS5 auxiliary function can't run).
+// With the LIKE table, a row of ns's case-folded (ASCII) occurrences of
+// the word. A row that matched counts at least one.
+func textMatchSQL(fts bool, ns string, words []string, toks [][]string) (string, []any) {
 	var sb strings.Builder
 	var args []any
 	fmt.Fprintf(&sb, `(SELECT docid, sum(tf * %g / (tf + %g)) AS score FROM (SELECT docid, k, sum(c) AS tf FROM (`, scoreK1+1, scoreK1)
@@ -692,13 +701,27 @@ func textMatchSQL(fts bool, words []string) (string, []any) {
 		if i > 0 {
 			sb.WriteString(` UNION ALL `)
 		}
-		if fts {
-			fmt.Fprintf(&sb, `SELECT * FROM (SELECT rowid >> %d AS docid, %d AS k, max(1, length(highlight("text", 4, char(1), '')) - length(body)) AS c FROM "text" WHERE "text" MATCH ? LIMIT -1)`, textShift, i)
-			args = append(args, ftsPhrase(w))
-		} else {
-			fmt.Fprintf(&sb, `SELECT docid, %d AS k, max(1, (length(body) - length(replace(lower(body), lower(?), ''))) / length(?)) AS c FROM "text" WHERE body LIKE ? ESCAPE '\'`, i)
+		switch {
+		case fts && toks != nil && len(toks[i]) == 1:
+			// The token's instances: terms equal to it, or for a prefix
+			// word every term it prefixes, [t, t+"\xf5") in byte order
+			// (no UTF-8 byte is 0xf5).
+			fmt.Fprintf(&sb, `SELECT doc >> %d AS docid, %d AS k, count(*) AS c FROM temp.text_vi WHERE `, textShift, i)
+			if t := toks[i][0]; strings.HasSuffix(w, "*") {
+				sb.WriteString(`term >= ? AND term < ?`)
+				args = append(args, t, t+"\xf5")
+			} else {
+				sb.WriteString(`term = ?`)
+				args = append(args, t)
+			}
+			sb.WriteString(` GROUP BY doc`)
+		case fts:
+			fmt.Fprintf(&sb, `SELECT * FROM (SELECT rowid >> %d AS docid, %d AS k, max(1, length(highlight("text", 4, char(1), '')) - length(body)) AS c FROM "text" WHERE "text" MATCH ? AND rowid >> %d IN (SELECT docid FROM docs WHERE ns = ?) LIMIT -1)`, textShift, i, textShift)
+			args = append(args, ftsPhrase(w), ns)
+		default:
+			fmt.Fprintf(&sb, `SELECT docid, %d AS k, max(1, (length(body) - length(replace(lower(body), lower(?), ''))) / length(?)) AS c FROM "text" WHERE body LIKE ? ESCAPE '\' AND ns = ?`, i)
 			bare := strings.TrimRight(w, "*")
-			args = append(args, bare, bare, likePattern(w))
+			args = append(args, bare, bare, likePattern(w), ns)
 		}
 	}
 	fmt.Fprintf(&sb, `) GROUP BY docid, k) GROUP BY docid HAVING count(*) = %d)`, len(words))
@@ -752,8 +775,56 @@ func (ix *Index) attachRefs(ctx context.Context, tx *sql.Tx, ns string, rf *RefF
 	return rows.Err()
 }
 
+// ftsTokens tokenizes q's words as the FTS5 text table does, so that
+// textMatchSQL reads a word of one token from its instances: through a
+// TEMP FTS5 table with the same tokenizer and an fts5vocab table of it,
+// in tx's connection, which also gets temp.text_vi, the text table's
+// instances. They live in TEMP only and go with tx, rolled back.
+func (ix *Index) ftsTokens(ctx context.Context, tx *sql.Tx, q *Query) error {
+	if !ix.fts || len(q.words) == 0 || q.toks != nil {
+		return nil
+	}
+	for _, s := range []string{
+		`CREATE VIRTUAL TABLE IF NOT EXISTS temp.qtok USING fts5(w, tokenize = '` + ftsTokenizer + `')`,
+		`CREATE VIRTUAL TABLE IF NOT EXISTS temp.qtok_vi USING fts5vocab(temp, qtok, instance)`,
+		`CREATE VIRTUAL TABLE IF NOT EXISTS temp.text_vi USING fts5vocab(main, "text", instance)`,
+		`DELETE FROM temp.qtok`,
+	} {
+		if _, err := tx.ExecContext(ctx, s); err != nil {
+			return fmt.Errorf("tokenizing q: %w", err)
+		}
+	}
+	for i, w := range q.words {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO temp.qtok (rowid, w) VALUES (?, ?)`, i+1, strings.TrimRight(w, "*")); err != nil {
+			return fmt.Errorf("tokenizing q: %w", err)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT doc, term FROM temp.qtok_vi ORDER BY doc, offset`)
+	if err != nil {
+		return fmt.Errorf("tokenizing q: %w", err)
+	}
+	defer rows.Close()
+	toks := make([][]string, len(q.words))
+	for rows.Next() {
+		var i int
+		var t string
+		if err := rows.Scan(&i, &t); err != nil {
+			return err
+		}
+		toks[i-1] = append(toks[i-1], t)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	q.toks = toks
+	return nil
+}
+
 // run executes q against ns inside tx. allow filters hits (nil = all).
 func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow func(resource string) bool) (*Result, error) {
+	if err := ix.ftsTokens(ctx, tx, q); err != nil {
+		return nil, err
+	}
 	fs := q.filters()
 	drive, err := ix.driver(ctx, tx, ns, q, fs)
 	if err != nil {
