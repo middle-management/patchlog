@@ -396,7 +396,8 @@ func TestEncryptionTurnOn(t *testing.T) {
 	// New writes, and a prune whose archive is now encrypted.
 	x = append(x, e.appendRev("s", "x", x[6], ops(op("add", "/new", encMarker)), g))
 	e.clock.Advance(10 * time.Minute) // past the retry window, before the grants expire
-	expect(t, e.prune("s", "x", map[string]any{"horizon": x[4]}, g), 200)
+	// No retention rule matches x: moving its horizon needs a * key (§8.6).
+	expect(t, e.prune("s", "x", map[string]any{"horizon": x[4]}, ga), 200)
 	if b, _ := os.ReadFile(filepath.Join(dir, "s", "x", x[4]+".jsonl")); !bytes.HasPrefix(b, []byte("PLAR")) || bytes.Contains(b, []byte(encMarker)) {
 		t.Fatal("archive of an encrypted namespace is not encrypted")
 	}

@@ -264,3 +264,125 @@ func TestV073P26KeepServed(t *testing.T) {
 	expect(t, e.get("/r/kv/a/rev/"+revs[4]), 200)
 	expectCode(t, e.get("/r/kv/a/rev/"+revs[5]), 410, "pruned")
 }
+
+// v0.73 §8.6 Request (BBD-52): where no retention rule matches the
+// resource, retention keeps everything, so a prune that moves its horizon
+// needs a grant chained to a * key, archive or not. A prune that moves
+// nothing needs none, and within a matching rule prune suffices.
+func TestV073P26NoRuleNeedsStar(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t, withArchive(t, t.TempDir()), withoutRetentionLoop)
+	sk, pk := newKey("sk"), newKey("pk")
+	can := []string{"read", "create", "append", "prune"}
+	e.mkNS("nr", map[string]any{"read": "public", "keys": []any{sk.entry("*"), pk.entry(can...)}})
+	sg := e.grant(sk, "user:admin", []string{"nr"}, allVerbs)
+	pg := e.grant(pk, "user:p", []string{"nr"}, can)
+	a := e.chain("nr", "a", 5, pg)
+	e.clock.Advance(10 * time.Minute)
+
+	expectCode(t, e.prune("nr", "a", map[string]any{"horizon": a[3]}, pg), 403, "forbidden")
+	expect(t, e.get("/r/nr/a/rev/"+a[1], pg), 200)
+	// Moving nothing: the genesis, and a change to keep alone.
+	r := e.prune("nr", "a", map[string]any{"horizon": a[0]}, pg)
+	expect(t, r, 200)
+	if r.Str("horizon") != a[0] {
+		t.Fatalf("prune at the genesis %s", r.Body)
+	}
+	pruneEntry(t, e, e.prune("nr", "a", map[string]any{"horizon": a[0], "keep": []any{a[2]}}, pg), "nr", "a", a[0])
+	// The * key moves it.
+	pruneEntry(t, e, e.prune("nr", "a", map[string]any{"horizon": a[3]}, sg), "nr", "a", a[3])
+
+	// A rule selecting a: prune suffices within what it keeps.
+	expect(t, e.patchNS("nr", ops(op("add", "/retention", []any{map[string]any{"select": map[string]any{"names": []any{"a"}}, "keep": map[string]any{"revisions": 2.0}}})), sg), 201)
+	expectCode(t, e.prune("nr", "a", map[string]any{"horizon": a[4]}, pg), 403, "forbidden")
+	a5 := e.appendRev("nr", "a", a[4], ops(op("replace", "/n", 5.0)), pg)
+	a6 := e.appendRev("nr", "a", a5, ops(op("replace", "/n", 6.0)), pg)
+	_ = a6
+	e.clock.Advance(10 * time.Minute)
+	pruneEntry(t, e, e.prune("nr", "a", map[string]any{"horizon": a5}, pg), "nr", "a", a5)
+	// A resource the rule doesn't select needs a * key.
+	b := e.chain("nr", "b", 3, pg)
+	e.clock.Advance(10 * time.Minute)
+	expectCode(t, e.prune("nr", "b", map[string]any{"horizon": b[2]}, pg), 403, "forbidden")
+}
+
+// v0.73 §6.6 Cost (GB-41, BBD-55): a prune isn't exempt; it costs a token
+// from the principal, namespace and per-resource buckets, checked last in
+// step 1, so a 429 comes before a precondition's 428 (§7.2).
+func TestV073P26PruneRate(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, withoutRetentionLoop)
+	slow := func(burst float64) map[string]any { return map[string]any{"rate": 0.0001, "burst": burst} }
+	e.mkNS("pr", map[string]any{"read": "public", "limits": map[string]any{"ratePerResource": slow(2)}})
+	a0 := e.create("pr", "a", map[string]any{"n": 0.0}, "admin")
+	expect(t, e.prune("pr", "a", map[string]any{"horizon": a0}, "admin"), 200)
+	r := e.prune("pr", "a", map[string]any{"horizon": a0}, "admin")
+	expectCode(t, r, 429, "rate")
+	if r.Str("limit") != "ratePerResource" {
+		t.Fatalf("limit %s", r.Body)
+	}
+	expectCode(t, e.do(req{method: "POST", path: "/r/pr/a/prune", body: map[string]any{"horizon": a0}, ifMatch: a0, author: "admin"}), 429, "rate")
+	// Another resource has its own bucket.
+	b0 := e.create("pr", "b", map[string]any{"n": 0.0})
+	expect(t, e.prune("pr", "b", map[string]any{"horizon": b0}, "admin"), 200)
+
+	e.mkNS("pn", map[string]any{"read": "public", "limits": map[string]any{"ratePerNamespace": slow(3)}})
+	x0 := e.create("pn", "x", map[string]any{"n": 0.0})
+	y0 := e.create("pn", "y", map[string]any{"n": 0.0})
+	expect(t, e.prune("pn", "x", map[string]any{"horizon": x0}, "admin"), 200)
+	r = e.prune("pn", "y", map[string]any{"horizon": y0}, "admin")
+	expectCode(t, r, 429, "rate")
+	if r.Str("limit") != "ratePerNamespace" {
+		t.Fatalf("limit %s", r.Body)
+	}
+
+	e.mkNS("pq", map[string]any{"read": "public", "limits": map[string]any{"ratePerPrincipal": slow(2)}})
+	q0 := e.create("pq", "q", map[string]any{"n": 0.0}, "pat")
+	expect(t, e.prune("pq", "q", map[string]any{"horizon": q0}, "pat"), 200)
+	r = e.prune("pq", "q", map[string]any{"horizon": q0}, "pat")
+	expectCode(t, r, 429, "rate")
+	if r.Str("limit") != "ratePerPrincipal" {
+		t.Fatalf("limit %s", r.Body)
+	}
+}
+
+// v0.73 §7.2, §8.6, §12.1 (GB-58, BBD-45): a prune takes no precondition;
+// one sent, If-Match or If-None-Match, is 428 at step 2.5: after the verb
+// (403), the purged namespace's and resource's 410, and before the 404 of
+// an unknown resource and the horizon's 422. Nothing is pruned.
+func TestV073P26PrunePrecondition(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t, withoutRetentionLoop)
+	sk, pk := newKey("sk"), newKey("pk")
+	can := []string{"read", "create", "append", "purge", "prune"}
+	e.mkNS("pp", map[string]any{"read": "grant", "keys": []any{sk.entry("*"), pk.entry(can...)}})
+	sg := e.grant(sk, "user:admin", []string{"pp", "ppb", "ppx"}, allVerbs)
+	pg := e.grant(pk, "user:p", []string{"pp", "ppb"}, can)
+	ng := e.grant(pk, "user:n", []string{"pp"}, []string{"read", "create", "append"})
+	a := e.chain("pp", "a", 3, pg)
+	e.clock.Advance(10 * time.Minute)
+	pre := func(ns, name string, body map[string]any, bearer, ifMatch, ifNoneMatch string) *resp {
+		t.Helper()
+		return e.do(req{method: "POST", path: "/r/" + ns + "/" + name + "/prune", body: body, bearer: bearer, ifMatch: ifMatch, ifNoneMatch: ifNoneMatch})
+	}
+	h := map[string]any{"horizon": a[2]}
+
+	expectCode(t, pre("pp", "a", h, ng, a[2], ""), 403, "forbidden")
+	expectCode(t, pre("pp", "a", h, sg, a[2], ""), 428, "precondition_required")
+	expectCode(t, pre("pp", "a", h, sg, "", "*"), 428, "precondition_required")
+	expectCode(t, pre("pp", "a", map[string]any{"horizon": hashID(t, "", nil)}, sg, a[2], ""), 428, "precondition_required")
+	expectCode(t, pre("pp", "nope", h, sg, a[2], ""), 428, "precondition_required")
+	expect(t, e.get("/r/pp/a/rev/"+a[0], pg), 200)
+
+	// In a branch too.
+	expect(t, e.branch("pp", map[string]any{"name": "ppb"}, sg), 201)
+	expectCode(t, pre("ppb", "a", h, pg, a[2], ""), 428, "precondition_required")
+
+	// A purged resource, and a purged namespace: 410 first.
+	expect(t, e.purge("pp", "a", a[2], pg), 204)
+	expectCode(t, pre("pp", "a", h, pg, a[2], ""), 410, "gone")
+	e.mkNS("ppx", map[string]any{"read": "grant", "keys": []any{sk.entry("*")}})
+	x := e.create("ppx", "x", map[string]any{"n": 0.0}, sg)
+	e.purgeNSAs("ppx", sg)
+	expectCode(t, pre("ppx", "x", map[string]any{"horizon": x}, sg, x, ""), 410, "purged")
+}

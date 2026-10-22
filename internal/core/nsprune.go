@@ -7,6 +7,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // PruneRequest is POST /r/{ns}/{name}/prune (§8.6).
@@ -39,8 +40,13 @@ type PruneResult struct {
 // pruned range first when an archive destination is configured.
 //
 // The prune verb suffices when the archive exists and the horizon doesn't go
-// below what the resource's retention rule keeps; otherwise the grant must
-// be chained to a * key.
+// below what the resource's retention rule keeps, which is everything where
+// no rule matches it; otherwise the grant must be chained to a * key.
+//
+// The checks follow §6.2: the verb and the rate limits (step 1); a purged
+// namespace or resource (2.1); a precondition sent, which a prune doesn't
+// take (2.5); the horizon, keep and snapshot, and at E3 the archive (4);
+// the *-key guard and the rules (6).
 func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
 	var out *PruneResult
 	err := e.update(ctx, func(t *tx) error {
@@ -56,27 +62,43 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		if err := t.authorize(a, "prune", name); err != nil {
 			return err
 		}
-		// 410 after authorisation, like every write (§6.2).
+		// A prune isn't exempt: a token from the principal, namespace and
+		// per-resource buckets, checked last in step 1 (§6.6).
+		if err := t.rateLimit(n, cfg, a, []string{name}, 1); err != nil {
+			return err
+		}
+		// 410 after authorisation and the rate limits, like every write
+		// (§6.2 step 2.1, §8.5); then §1's 502, and a purged resource's
+		// 410 (§8.3).
 		if n.purged {
 			return t.purgedNS(n)
+		}
+		if err := t.upstreamRefusal(n, name); err != nil {
+			return err
+		}
+		v := t.resolve(n, name, nil)
+		if v.state == Purged {
+			return gone()
+		}
+		// A prune takes no precondition: one sent is 428 at step 2.5
+		// (§7.2, §8.6).
+		if pr.Precondition {
+			return apiErr(428, "precondition_required", "message", "a prune takes no precondition (§7.2, §8.6)")
 		}
 		if n.isBranch() {
 			return invalid("branches don't prune (§8.6)")
 		}
-		v := t.resolve(n, name, nil)
 		if v.state == NotFound {
 			return notFound()
 		}
-		if v.state == Purged {
-			return gone()
-		}
+		// Step 4: horizon, keep and snapshot (§6.2, §8.6).
 		hid, err := ids.Parse(pr.Horizon)
-		if err != nil {
-			return invalid("horizon must be an ancestor of the head")
+		var h *revRow
+		if err == nil {
+			h = t.findInAncestry(v.head, hid)
 		}
-		h := t.findInAncestry(v.head, hid)
 		if h == nil {
-			return invalid("horizon must be an ancestor of the head")
+			return invalid("horizon must be the head or an ancestor of it (§8.6)")
 		}
 		if len(pr.Keep) > cfg.Limits.KeepPerResource {
 			return limitErr(422, "keepPerResource", int64(len(pr.Keep)), int64(cfg.Limits.KeepPerResource), "too many kept revisions")
@@ -123,14 +145,32 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		if e2e && !hasArchive {
 			return invalid("pruning an e2e resource needs an archive destination (§8.6)")
 		}
+		eff, moves := t.effectiveHorizon(v.own, h)
+		if e2e && moves {
+			// At E3 the snapshot is the requested horizon's document, so
+			// an effective horizon that moves the horizon but isn't it is
+			// 422 naming it, and the snapshot's header is checked, both
+			// at step 4, before the *-key guard (§6.2, §8.6, §E.3.1).
+			// pruneToE2E checks them again as it writes.
+			if eff.id != hid {
+				return apiErr(422, "invalid", "message", "the horizon moves down to a protected revision (§8.6); seal the snapshot for that one", "horizon", eff.id.String())
+			}
+			if err := t.checkSealedHeader(n, cfg, pr.Snapshot, seal.SnapshotPL(n.name, name, eff.id.String()), "snapshot", false); err != nil {
+				return err
+			}
+		}
+		// Step 6: the *-key guard, then the rules (§6.2).
 		if !a.star {
 			// Applying a rule that says "archive": false, within what it
 			// keeps, needs only prune: the * key was needed to write it.
 			if !hasArchive && !noArchive {
 				return forbidden("pruning where no archive is configured needs a grant chained to a * key")
 			}
-			if rule != nil && h.seq > t.retentionBoundary(rule, v.own) {
-				return forbidden("going below what retention keeps needs a grant chained to a * key")
+			// Retention keeps everything where no rule matches the
+			// resource, so a prune that moves the horizon there goes
+			// below it (§8.6).
+			if moves && (rule == nil || eff.seq > t.retentionBoundary(rule, v.own)) {
+				return forbidden("going below what retention keeps, everything where no retention rule matches the resource, needs a grant chained to a * key (§8.6)")
 			}
 		}
 		// The envelope's doc is { horizon, keep? } as sent (§6.4.1).

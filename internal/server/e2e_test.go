@@ -376,7 +376,8 @@ func TestE2EPruneRetention(t *testing.T) {
 	expectCode(t, e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap, "keep": []any{ids[1]}}, f.writerG), 422, "invalid")
 	wrong, _ := seal.SealSnapshot(k, "e#1", "e", "p", ids[2], map[string]any{"n": 2.0})
 	expectCode(t, e.prune("e", "p", map[string]any{"horizon": h, "snapshot": wrong}, f.writerG), 422, "invalid")
-	r := e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap}, f.writerG)
+	// No retention rule matches p: moving its horizon needs a * key (§8.6).
+	r := e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap}, f.adminG)
 	expect(t, r, 200)
 	if r.Str("horizon") != h || r.Str("archive") == "" {
 		t.Fatalf("prune %s", r.Body)

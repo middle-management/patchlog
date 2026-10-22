@@ -305,7 +305,7 @@ func TestRemoteBranchE2EPruned(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.clock.Advance(10 * time.Minute)
-	expect(t, a.prune("e", "d", map[string]any{"horizon": d1, "snapshot": snap}, f.writerG), 200)
+	expect(t, a.prune("e", "d", map[string]any{"horizon": d1, "snapshot": snap}, f.adminG), 200) // no retention rule: a * key (§8.6)
 	rt := &route{url: a.srv.URL, bearer: f.readerG}
 	b := newEnv(t, withOrigin(originB), withRemote(rt), withKeyStore(newKeyStore(t)))
 	expectCode(t, b.mkRemote("rel", remoteGenesis("e", a.nsHead("e", f.readerG), e2eDoc(map[string]any{"read": "grant"}))), 410, "pruned")
