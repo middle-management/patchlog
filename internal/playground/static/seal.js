@@ -4,9 +4,11 @@
  *   - JWE compact, alg "dir", enc "A256GCM", protected header
  *     {alg, enc, kid: "{ns}#{e}", pl, zip?: "DEF"}, AAD = the base64url header (§E.2.2)
  *   - K_r = HKDF-SHA256(ikm K_e, salt "patchlog-e2", info ns ‖ 0x0A ‖ name) (§E.2.1)
- *   - HPKE base mode (RFC 9180), DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-256-GCM,
+ *   - HPKE base and auth mode (RFC 9180), DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-256-GCM,
  *     single shot, empty AAD, wire form enc ‖ ct, info "patchlog-key-v1\n" ‖ kid ‖ "\n" ‖ resource, resource "" for K_e (§E.2.3)
- *   - E3 keyring documents and recipient ids text(trunc160(sha256(canonical(jwk)))) (§E.3.2)
+ *   - RFC 7638 thumbprints of X25519 keys (§E.2.3)
+ *   - E3 keyring documents {keys: [{kid, to, from, wrapped}]}, entries in auth mode (§E.3.2), and the format
+ *     before v0.63 with recipient ids text(trunc160(sha256(canonical(jwk)))), read to migrate
  *   - revision ids trunc160(sha256(parent ‖ 0x0A ‖ canonical patches)) (§3.3)
  *   - RFC 6902 JSON Patch, for folding e2e logs client-side
  *   - a small JSON Schema subset, for flagging e2e revisions on read (§E.3.2)
@@ -163,47 +165,61 @@ function recipientJWK(xB64) { return { kty: 'OKP', crv: 'X25519', x: xB64 }; }
 async function recipientID(xB64) {
   return idText((await sha256(utf8(canonical(recipientJWK(xB64))))).slice(0, 20));
 }
+/* thumbprint is the RFC 7638 SHA-256 thumbprint of an X25519 public key as a JWK, base64url (§E.2.3): it names
+ * recipients (to) and senders (from) in keyring entries and /keys relays (internal/seal Thumbprint). */
+async function thumbprint(xB64) { return b64u(await sha256(utf8(canonical(recipientJWK(xB64))))); }
 function parseJWK(v) {
   const m = typeof v === 'string' ? JSON.parse(v) : v;
   if (!m || m.kty !== 'OKP' || m.crv !== 'X25519' || typeof m.x !== 'string' || unb64u(m.x).length !== 32) throw new Error('JWK must be {"kty":"OKP","crv":"X25519","x":…}');
   return m.x;
 }
 
-/* ---------------- HPKE (RFC 9180) base mode ---------------- */
+/* ---------------- HPKE (RFC 9180) base and auth mode ---------------- */
 const KEM_ID = 0x0020, KDF_ID = 0x0001, AEAD_ID = 0x0002;
 const i2osp2 = (n) => new Uint8Array([(n >> 8) & 255, n & 255]);
 const KEM_SUITE = concat(utf8('KEM'), i2osp2(KEM_ID));
 const HPKE_SUITE = concat(utf8('HPKE'), i2osp2(KEM_ID), i2osp2(KDF_ID), i2osp2(AEAD_ID));
 const V1 = utf8('HPKE-v1');
+const MODE_BASE = 0x00, MODE_AUTH = 0x02;
 function labeledExtract(suite, salt, label, ikm) { return hkdfExtract(salt, concat(V1, suite, utf8(label), ikm)); }
 function labeledExpand(suite, prk, label, info, len) { return hkdfExpand(prk, concat(i2osp2(len), V1, suite, utf8(label), info), len); }
 async function extractAndExpand(dhBytes, kemContext) {
   const prk = await labeledExtract(KEM_SUITE, new Uint8Array(0), 'eae_prk', dhBytes);
   return labeledExpand(KEM_SUITE, prk, 'shared_secret', kemContext, 32);
 }
-async function keySchedule(shared, info) {
+async function keySchedule(shared, info, mode) {
   const empty = new Uint8Array(0);
   const pskIDHash = await labeledExtract(HPKE_SUITE, empty, 'psk_id_hash', empty);
   const infoHash = await labeledExtract(HPKE_SUITE, empty, 'info_hash', info);
-  const ctx = concat(new Uint8Array([0]), pskIDHash, infoHash);
+  const ctx = concat(new Uint8Array([mode || MODE_BASE]), pskIDHash, infoHash);
   const secret = await labeledExtract(HPKE_SUITE, shared, 'secret', empty);
   return { key: await labeledExpand(HPKE_SUITE, secret, 'key', ctx, 32), nonce: await labeledExpand(HPKE_SUITE, secret, 'base_nonce', ctx, 12) };
 }
-/* hpkeSeal(pkR raw, info, pt) -> enc ‖ ct */
-async function hpkeSeal(pkR, info, pt) {
+/* hpkeSeal(pkR raw, info, pt[, sender identity]) -> enc ‖ ct; with sender, auth mode: AuthEncap's
+ * dh = DH(skE, pkR) ‖ DH(skS, pkR) and kem_context = enc ‖ pkR ‖ pkS (RFC 9180 §4.1, §5.1). */
+async function hpkeSeal(pkR, info, pt, sender) {
   const skE = (await subtle.generateKey({ name: 'X25519' }, true, ['deriveBits'])).privateKey;
   const enc = unb64u((await subtle.exportKey('jwk', skE)).x);
-  const shared = await extractAndExpand(await dh(skE, pkR), concat(enc, pkR));
-  const ks = await keySchedule(shared, info);
+  let dhBytes = await dh(skE, pkR), kemContext = concat(enc, pkR);
+  if (sender) {
+    dhBytes = concat(dhBytes, await dh(await importPrivate(unb64u(sender.d)), pkR));
+    kemContext = concat(kemContext, unb64u(sender.x));
+  }
+  const ks = await keySchedule(await extractAndExpand(dhBytes, kemContext), info, sender ? MODE_AUTH : MODE_BASE);
   return concat(enc, await gcmSeal(ks.key, ks.nonce, pt, new Uint8Array(0)));
 }
-async function hpkeOpen(identity, info, wrapped) {
+/* hpkeOpen(identity, info, enc ‖ ct[, sender public key raw]): with the sender's key, auth mode (AuthDecap). */
+async function hpkeOpen(identity, info, wrapped, pkS) {
   if (wrapped.length < 32 + 16) throw new Error('wrapped key too short');
   const enc = wrapped.slice(0, 32), ct = wrapped.slice(32);
   const skR = await importPrivate(unb64u(identity.d));
   const pkR = unb64u(identity.x);
-  const shared = await extractAndExpand(await dh(skR, enc), concat(enc, pkR));
-  const ks = await keySchedule(shared, info);
+  let dhBytes = await dh(skR, enc), kemContext = concat(enc, pkR);
+  if (pkS) {
+    dhBytes = concat(dhBytes, await dh(skR, pkS));
+    kemContext = concat(kemContext, pkS);
+  }
+  const ks = await keySchedule(await extractAndExpand(dhBytes, kemContext), info, pkS ? MODE_AUTH : MODE_BASE);
   return gcmOpen(ks.key, ks.nonce, ct, new Uint8Array(0));
 }
 function wrapContext(kid, resource) { return utf8(WRAP_INFO_PREFIX + kid + '\n' + (resource || '')); }
@@ -230,6 +246,22 @@ async function unwrapStoredKey(identity, kid, resource, wrapped) {
     if (k.length !== 32) throw e;
     return k;
   }
+}
+
+/* unwrapRelayedKey opens an entry of a POST /ns/{ns}/keys answer, { kid, name?, from?, wrapped } (§E.2.3): a keyring
+ * entry relayed at E3 names its sender's thumbprint in from and opens in auth mode only with that sender's public key,
+ * one of senders (x values this browser knows): anyone can wrap to a thumbprint (§E.3.2). Without from (an E2 key, or
+ * an entry of a keyring stored before v0.63 relayed as stored), base mode under either info (unwrapStoredKey). */
+async function unwrapRelayedKey(identity, entry, senders) {
+  const wrapped = unb64u(entry.wrapped), res = entry.name || entry.resource || '';
+  if (!entry.from) return unwrapStoredKey(identity, entry.kid, res, wrapped);
+  for (const x of senders || []) {
+    if ((await thumbprint(x)) !== entry.from) continue;
+    const k = await hpkeOpen(identity, wrapContext(entry.kid, res), wrapped, unb64u(x));
+    if (k.length !== 32) throw new Error('unwrapped key is not 32 bytes');
+    return k;
+  }
+  throw new Error(`the key of ${entry.kid} is from ${entry.from}, a sender this browser doesn't know`);
 }
 
 /* ---------------- kids ---------------- */
@@ -400,7 +432,52 @@ async function decryptBlob(ref, sealed) {
   return { type: s.type, data: o.data };
 }
 
-/* ---------------- keyring (§E.3.2, seal.Keyring) ---------------- */
+/* ---------------- keyring (§E.3.2, seal.KeyringV2) ---------------- */
+/* The keyring document: { "keys": [{ kid, to, from, wrapped }], "$nonce"? }, each entry the K_e of kid wrapped for the
+ * recipient whose thumbprint is to, in HPKE auth mode under the admin key whose thumbprint is from. */
+function isKeyringV2(doc) { return !!doc && typeof doc === 'object' && Array.isArray(doc.keys); }
+function parseKeyringV2(doc) {
+  const bad = (w) => { throw new Error('keyring: ' + w); };
+  if (!isKeyringV2(doc)) bad('keys must be an array');
+  for (const k of Object.keys(doc)) if (k !== 'keys' && k !== '$nonce') bad('member ' + k + ': a keyring has only keys and $nonce');
+  const seen = new Set();
+  for (const e of doc.keys) {
+    const names = e && typeof e === 'object' ? Object.keys(e).sort().join(',') : '';
+    if (names !== 'from,kid,to,wrapped' || ![e.kid, e.to, e.from, e.wrapped].every((v) => typeof v === 'string')) bad('entries are exactly kid, to, from and wrapped');
+    parseKid(e.kid);
+    if (seen.has(e.kid + '\n' + e.to)) bad('a second entry for ' + e.kid + ' and ' + e.to);
+    seen.add(e.kid + '\n' + e.to);
+  }
+  return doc;
+}
+function buildKeyringV2() { return { keys: [] }; }
+/* keyringV2Add wraps epochKey, the K_e of kidStr, for recipientX in auth mode under admin (an identity) and puts the
+ * entry, replacing the one for the same kid and recipient. */
+async function keyringV2Add(kr, admin, recipientX, kidStr, epochKey) {
+  parseKid(kidStr);
+  if (epochKey.length !== 32) throw new Error('key must be 32 bytes');
+  const to = await thumbprint(recipientX), from = await thumbprint(admin.x);
+  const w = await hpkeSeal(unb64u(recipientX), wrapContext(kidStr, ''), epochKey, admin);
+  const e = { kid: kidStr, to, from, wrapped: b64u(w) };
+  const i = kr.keys.findIndex((x) => x.kid === kidStr && x.to === to);
+  if (i >= 0) kr.keys[i] = e; else kr.keys.push(e);
+  return to;
+}
+/* keyringV2EpochKey opens the entry of kidStr for identity, from one of senders (x values). */
+async function keyringV2EpochKey(kr, identity, kidStr, senders) {
+  const to = await thumbprint(identity.x);
+  const e = kr.keys.find((x) => x.kid === kidStr && x.to === to);
+  if (!e) throw new Error(`the keyring has no key of ${kidStr} for this identity`);
+  return unwrapRelayedKey(identity, e, senders);
+}
+/* keyringV2Epochs lists the epochs of ns some entry holds a key of, ascending. */
+function keyringV2Epochs(kr, ns) {
+  const out = new Set();
+  for (const e of kr.keys) { try { const k = parseKid(e.kid); if (k.ns === ns) out.add(k.epoch); } catch (_) { /* checked on write */ } }
+  return [...out].sort((a, b) => a - b);
+}
+
+/* The format before v0.63 (seal.Keyring), which servers no longer take as the keyring: read to open and migrate. */
 function parseKeyring(doc) {
   const bad = (w) => { throw new Error('keyring: ' + w); };
   if (!doc || typeof doc !== 'object' || doc.keyring !== 1) bad('version');
@@ -658,9 +735,10 @@ async function selfTest(fx) {
 root.PLSeal = {
   SUITE, b64u, unb64u, b32, hex, unhex, utf8, equalBytes, randomBytes, newNonce, canonical, padLen,
   sha256, chainID, revisionID, tombstoneID, idBytes,
-  hkdf, resourceKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, parseJWK,
-  hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapStoredKey, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
+  hkdf, resourceKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, thumbprint, parseJWK,
+  hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapStoredKey, unwrapRelayedKey, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
   sealPatchSet, sealedJWE, sealedBlobs, BLOB_TYPE, blobType, blobID, blobIDs, sameBlobs, parseBlob, openBlob, sealBlob, encryptBlob, decryptBlob,
+  isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,
   parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,
   applyPatch, validate, selfTest,
 };
