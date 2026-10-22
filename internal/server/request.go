@@ -216,7 +216,7 @@ func signature(r *http.Request) (string, error) {
 	case len(vs) > 1:
 		return "", badInput("Signature given more than once (§C.3.1)")
 	}
-	if _, err := sig.Parse(vs[0]); err != nil {
+	if _, err := sig.ParseInput(vs[0]); err != nil {
 		return "", badInput("malformed Signature: " + err.Error() + " (§C.3.1)")
 	}
 	return vs[0], nil
@@ -484,7 +484,7 @@ func parseStep(v any, d gestureDefaults, where string) (core.Step, error) {
 				if !ok || sv == "" {
 					return core.Step{}, badInput(where + ": signature must be a string, \"<alg>:<kid>:<sig>\"")
 				}
-				if _, err := sig.Parse(sv); err != nil {
+				if _, err := sig.ParseInput(sv); err != nil {
 					return core.Step{}, badInput(fmt.Sprintf("%s: malformed signature: %v (§C.3.1)", where, err))
 				}
 				step.Signature = sv
