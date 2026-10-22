@@ -118,26 +118,27 @@ func (s *Service) serveEdgeGrants(w http.ResponseWriter, r *http.Request) {
 // issuance): with the grant in Authorization, or 1 to svcedge.MaxGrants
 // grants as { "grants": [ … ] } in an application/json body (415
 // otherwise, svcedge.Bearers), it answers 200 { prefixes, exp } and one
-// Set-Cookie per prefix. Each grant is resolved as a listing resolves its
-// reader (grantViewer): the prefix is /{catalog}/g/{gs} of its subject
-// set, lasting until that grant's exp or the cookies' TTL (15 minutes at
-// most), whichever is sooner, or /{catalog}/g/all for a reader whose
-// grants would be issued a namespace-wide edge grant on the catalog and
-// every content namespace it trusts (§C.5.2), lasting until the earliest
-// of those grants. A prefix several grants give gets one cookie, lasting
-// as long as the longest, and exp is the earliest. It answers all or
-// nothing: if any grant is over grantSize or rulesPerGrant, the request
-// is 413 limit, as the origin answers before any ns check (§C.8); if any
-// other is refused, 401 if any is 401, else 403, and 502 if a namespace
-// document can't be read; once none is, a purged catalog is 410 purged
-// with head, as its listings are (§8.5: a purged sealed catalog's read
-// check is the core's). Once nothing is refused, it draws one token from
-// the exchangeRate bucket of each distinct principal among the grants
+// Set-Cookie per prefix. Each grant is resolved as a listing resolves
+// its reader (grantViewer): the prefix is /{catalog}/g/{gs} of its
+// subject set, lasting until that grant's exp or the cookies' TTL (15
+// minutes at most), whichever is sooner, or /{catalog}/g/all for a
+// reader whose grants would be issued a namespace-wide edge grant on
+// every namespace it trusts that isn't public, the catalog included
+// (§C.5.2), lasting until the earliest of those grants. A prefix several
+// grants give gets one cookie, lasting as long as the longest, and exp
+// is the earliest. It answers all or nothing: if any grant is over
+// grantSize or rulesPerGrant, the request is 413 limit, as the origin
+// answers before any ns check (§C.8); if any other is refused, 401 if
+// any is 401, else 403, and 502 if a namespace document can't be read;
+// once none is, a purged catalog is 410 purged with head, as its
+// listings are (§8.5: a purged sealed catalog's read check is the
+// core's). Once nothing is refused, it draws one token from the
+// exchangeRate bucket of each distinct principal among the grants
 // (ExchangeRate, §6.6), shared with the instances on its database
 // (svcedge.Store), and is 429 (code "rate", limit "exchangeRate", with
 // Retry-After) while any is empty. While the core's authentication is
-// disabled (§1), it is 404 not_offered, before the body is read; it takes
-// no query parameter (400, as the core's, §7). Cookies are Secure,
+// disabled (§1), it is 404 not_offered, before the body is read; it
+// takes no query parameter (400, as the core's, §7). Cookies are Secure,
 // HttpOnly and SameSite as EdgeGrants says (None with credentialed
 // origins, -cors-credentials-origin, else Lax).
 func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {

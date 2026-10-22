@@ -59,8 +59,8 @@ import (
 // listings (§B.11.5, §C.5): POST /edge-grants exchanges a caller's grants
 // for a cookie bound to its subject set, /{catalog}/g/{gs}, or to
 // /{catalog}/g/all for a reader whose grants would be issued namespace-wide
-// edge grants on the catalog and every trusted namespace, and DELETE
-// /edge-grants?prefix=… withdraws them. They are
+// edge grants on each of the catalog and its trusted namespaces that isn't
+// public, and DELETE /edge-grants?prefix=… withdraws them. They are
 // signed with the last -edge-grant-key [KID=]FILE, a key of the service's
 // own that the origin never holds (without it, a random one per process),
 // and accepted under any, so its keys rotate as the origin's do; a plain
