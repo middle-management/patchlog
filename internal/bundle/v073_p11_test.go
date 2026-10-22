@@ -30,10 +30,11 @@ import (
 	"github.com/middle-management/patchlog/internal/sig"
 )
 
-// v0.73 bundle format (P11): canonical lines and the digest over the
-// bytes as written (§G.4.1, §I.9), sealed bundles' pl.last and padding
-// (§G.5.1.1), grant lines' stored authority block (§G.4.1, §C.3.1), and
-// limit refusals of either status (§6.6).
+// v0.73 bundles (P11): canonical lines and the digest over the bytes as
+// written (§G.4.1, §I.9), sealed bundles' pl.last and padding (§G.5.1.1),
+// grant lines' stored authority block (§G.4.1, §C.3.1), limit refusals of
+// either status (§6.6), upstream namespaces (§G.4.4), renamed $successor
+// (§8.1), target ranks (§2.1) and e2e imports (§G.5.1).
 
 // writtenBundle is a small bundle the Writer wrote: a header and two
 // snapshot lines.
