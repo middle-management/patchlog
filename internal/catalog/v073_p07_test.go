@@ -26,10 +26,14 @@ func (w *world) patchMatches(ops ...any) {
 }
 
 // placedFor reports whether token's listings show item's placement
-// (where, §B.5), as a reader of that subject set sees it.
+// (where, §B.5), as a reader of that subject set sees it. A hidden
+// placement is 404, as an item not in the catalog (§B.5, §B.11.5).
 func (w *world) placedFor(token, item string) bool {
 	w.t.Helper()
 	r, _ := w.follow("/cat/where?item="+item, token)
+	if r.status == 404 {
+		return false
+	}
 	if r.status != 200 {
 		w.t.Fatalf("where %s: %d %v", item, r.status, r.body)
 	}
