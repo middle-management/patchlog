@@ -42,7 +42,9 @@ func scopedWorld(t *testing.T) (x *svc, scope func(names ...any) string, whole s
 	must(root.CreateDoc(ctx, "cat", "lost", map[string]any{"title": "Lost", "parents": parents("nope")}))
 	must(root.CreateDoc(ctx, "sec", "derby", map[string]any{"t": 1}))
 	must(root.CreateDoc(ctx, "cat", "sec.derby", map[string]any{"parents": parents("season@a0")}))
-	x = startSvc(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:tree", []string{"sec", "cat"}, []string{"read"}))), svcOpts{now: s.Now})
+	// Readers limited to some resources read a subject set's listings,
+	// which need a RoleView (§B.11.5).
+	x = startSvc(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:tree", []string{"sec", "cat"}, []string{"read"}))), svcOpts{now: s.Now}, withScopeView)
 	x.caughtUp("cat", "sec")
 	scope = func(names ...any) string {
 		return reader.Grant(t, s.Now(), "user:bob", []string{"cat", "sec"}, []string{"read"}, map[string]any{
@@ -402,7 +404,7 @@ func TestV073BornSealed(t *testing.T) {
 	createNonced(t, w, "cat", "root", map[string]any{"title": "Root", "parents": []any{}})
 	createNonced(t, w, "cat", "plain", map[string]any{"parents": []any{}})
 	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat", "matches"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
-	x := startSvc(t, sc, svcOpts{now: s.Now})
+	x := startSvc(t, sc, svcOpts{now: s.Now}, withScopeView)
 	x.caughtUp("cat", "matches")
 	li := k.Grant(t, s.Now(), "user:li", []string{"cat"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "plain"}}}}})
 	r := x.fetch("/cat/roots", li)
@@ -496,7 +498,7 @@ func TestV073Lookup(t *testing.T) {
 	node("e1", "café", "root@a4")
 	node("dot", "a.", "root@a5")
 	node("strasse", "Straße", "root@a6")
-	x := startSvc(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:tree", []string{"files", "cat"}, []string{"read"}))), svcOpts{now: s.Now})
+	x := startSvc(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:tree", []string{"files", "cat"}, []string{"read"}))), svcOpts{now: s.Now}, withScopeView)
 	x.caughtUp("cat", "files")
 	whole := reader.Grant(t, s.Now(), "user:amy", []string{"cat", "files"}, []string{"read"})
 	lookup := func(path, tok string) resp {
@@ -609,10 +611,14 @@ func TestV073BornOfImplicitPlacement(t *testing.T) {
 	must(w.CreateDoc(ctx, "priv", "doc", self))
 	must(w.CreateDoc(ctx, "pub", "doc", self))
 	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
-	x := startSvc(t, sc, svcOpts{now: s.Now, selfPlacing: true})
+	x := startSvc(t, sc, svcOpts{now: s.Now, selfPlacing: true}, withScopeView)
 	x.caughtUp(all...)
 
-	es := entriesOf(t, x.get("/cat/children?of=root", ""))
+	// priv isn't public, so listings are a subject set's (§B.11.5): this
+	// reader's sees every node and no item of priv.
+	nodes := k.Grant(t, s.Now(), "user:n", all, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource",
+		"schema": map[string]any{"enum": []any{"root", "sec.doc", "priv.doc", "pub.doc"}}}}})
+	es := entriesOf(t, x.get("/cat/children?of=root", nodes))
 	if e := es["pub.doc"]; e["born"] != bornOf(t, w, "pub", "doc") || e["title"] != "Doc" {
 		t.Errorf("an item of a public namespace: %v", e)
 	}
@@ -631,7 +637,7 @@ func TestV073BornOfImplicitPlacement(t *testing.T) {
 	h := must(w.NSHead(ctx, "pub"))
 	must(w.PatchConfig(ctx, "pub", h.Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}}}))
 	x.caughtUp("pub")
-	if e := entriesOf(t, x.get("/cat/children?of=root", ""))["pub.doc"]; e == nil || e["head"] == nil || e["born"] != nil || e["title"] != nil {
+	if e := entriesOf(t, x.get("/cat/children?of=root", nodes))["pub.doc"]; e == nil || e["head"] == nil || e["born"] != nil || e["title"] != nil {
 		t.Errorf("an item of a namespace raised to sealed: %v", e)
 	}
 }
@@ -869,7 +875,7 @@ func TestV073ChildrenPagesSealed(t *testing.T) {
 		createNonced(t, w, "cat", n, map[string]any{"title": strings.ToUpper(n), "parents": parents(fmt.Sprintf("root@a%d", i))})
 	}
 	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
-	x := startSvc(t, sc, svcOpts{now: s.Now})
+	x := startSvc(t, sc, svcOpts{now: s.Now}, withScopeView)
 	x.caughtUp("cat")
 	names := []any{"root", "a", "b", "c"}
 	li := k.Grant(t, s.Now(), "user:li", []string{"cat"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": names}}}})

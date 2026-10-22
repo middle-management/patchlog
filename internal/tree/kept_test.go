@@ -73,7 +73,9 @@ func TestKeptListings(t *testing.T) {
 	}
 
 	// Once matches turns private, an anonymous reader isn't served what
-	// was listed while it was public: neither its URL space nor a gs says.
+	// was listed while it was public: neither its URL space nor a gs says,
+	// and with a namespace in the checkpoint that isn't public there is
+	// no anonymous listing at all (§B.11.5): 401.
 	r = x.raw("/cat/children?of=season", "")
 	loc := r.header.Get("Location")
 	if b := x.get(loc, ""); b["children"].([]any)[0].(map[string]any)["head"] == nil {
@@ -81,7 +83,7 @@ func TestKeptListings(t *testing.T) {
 	}
 	must(w.c.PatchConfig(ctx, "matches", must(w.c.NSHead(ctx, "matches")).Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
 	x.caughtUp("matches")
-	if r := x.raw(loc, ""); r.status != 302 {
+	if r := x.raw(loc, ""); r.status != 401 {
 		t.Errorf("after matches went private: %d %v", r.status, r.body)
 	}
 }

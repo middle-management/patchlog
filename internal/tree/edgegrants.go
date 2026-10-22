@@ -121,9 +121,10 @@ func (s *Service) serveEdgeGrants(w http.ResponseWriter, r *http.Request) {
 // Set-Cookie per prefix. Each grant is resolved as a listing resolves its
 // reader (grantViewer): the prefix is /{catalog}/g/{gs} of its subject
 // set, lasting until that grant's exp or the cookies' TTL (15 minutes at
-// most), whichever is sooner, or /{catalog}/g/all for a reader with
-// namespace-wide read on the catalog and every content namespace it
-// trusts, lasting until the earliest of those grants. A prefix several grants give gets one cookie, lasting
+// most), whichever is sooner, or /{catalog}/g/all for a reader whose
+// grants would be issued a namespace-wide edge grant on the catalog and
+// every content namespace it trusts (§C.5.2), lasting until the earliest
+// of those grants. A prefix several grants give gets one cookie, lasting
 // as long as the longest, and exp is the earliest. It answers all or
 // nothing: if any grant is over grantSize or rulesPerGrant, the request
 // is 413 limit, as the origin answers before any ns check (§C.8); if any
@@ -177,7 +178,7 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		purged string
 	)
 	for _, b := range bearers {
-		v, err := s.grantViewer(ctx, b)
+		v, err := s.grantViewer(ctx, b, "", true)
 		if client.IsPurged(err) {
 			// A purged sealed catalog's document is 410 (§8.5): the core
 			// makes the read check, as for a listing (serve).
@@ -271,9 +272,9 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 // edgeViewer is the viewer of a read under one of the service's edge
 // grants, cl, which covers the read's path (§B.11.5): the subject set of
 // its prefix, read as a listing for any grant resolving to it would be,
-// with no grant at all. So namespace-wide reads beyond the public
-// namespaces don't count (problems, orphans and manifests need them in a
-// subject set's URL space). Under g/all, the catalog and every trusted
+// with no grant at all. So it authorises that subject set's listings
+// only, and problems, orphans and manifests are 403 under it
+// (query.unfiltered, §B.11.5). Under g/all, the catalog and every trusted
 // content namespace are read whole, and listings are kept no longer than
 // the cookie; at an at including a namespace trusted since its issue the
 // read is 403 (serve, trustedSince). A namespace that was public at issue
@@ -312,7 +313,7 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 		}
 	}
 	s.mu.RUnlock()
-	v := &viewer{gs: gs, contentAll: map[string]bool{}, wideNS: map[string]bool{}, wideGrant: map[string]bool{}}
+	v := &viewer{cookie: true, gs: gs, catPublic: catPublic, contentAll: map[string]bool{}, wideNS: map[string]bool{}, wideGrant: map[string]bool{}}
 	// A purged namespace is read whole by every reader, as under a grant
 	// (trustList).
 	for ns := range gone {

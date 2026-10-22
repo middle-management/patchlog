@@ -20,13 +20,16 @@
 // depth 64 and deeper nodes are flagged (§B.5).
 //
 // A Hook (the catalog of §B.11) can keep more derived tables in the same
-// transactions, and a RoleView can widen what a reader may see.
+// transactions, and a RoleView filters listings by subject set (§B.11.5).
+// Without one, a tree service serves only unfiltered listings: in the
+// public URL space while everything is public, else g/all (Handler).
 //
 // Encrypted namespaces (Addendum E, package derived). Sealed (E2)
 // namespaces are followed with keys from POST /ns/{ns}/keys (the Client
 // must be built WithKeys; Recipient unwraps keys wrapped to the grant's
 // enc). An e2e (E3) catalog is followed only with a keyring Recipient key,
-// otherwise it is skipped (listings answer 503 "skipped"); an e2e content
+// otherwise it is skipped (listings answer 404, as for a catalog the
+// service doesn't serve); an e2e content
 // namespace without one is still followed for its items' heads (plaintext
 // ids), but its documents are not read, so it contributes no implicit
 // placements. GET /_status reports each namespace's state and why any is
@@ -147,7 +150,9 @@ type Options struct {
 	FollowOptions []follow.Option
 	// Hook, if set, keeps derived tables in the same transactions.
 	Hook Hook
-	// RoleView, if set, lets readers see nodes through roles (§B.11.5).
+	// RoleView, if set, lets readers see nodes through roles (§B.11.5):
+	// listings of each subject set, under /{catalog}/g/{gs}/. Without
+	// one, the service serves only g/all, and no filtered listings.
 	RoleView RoleView
 	// EdgeGrants, if set, mints and verifies the service's own edge grants
 	// (§B.11.5, §C.5; edgegrants.go): cookies for /{catalog}/g/{gs},
@@ -357,6 +362,9 @@ func (s *Service) init(ctx context.Context) error {
 		}
 	}
 	if err := s.sealed.Init(ctx); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
+	}
+	if err := s.dropWholeViews(ctx); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
 	}
 	if err := repurge.Init(ctx, s.db); err != nil {

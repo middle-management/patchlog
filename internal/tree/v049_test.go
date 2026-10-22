@@ -35,13 +35,15 @@ func privateWorld(t *testing.T, roles map[string]any) (s *clienttest.Server, adm
 	return s, admin, reader, root
 }
 
-// TestReadsUnrestrictedRoles (§C.5, B8): a grant reads the catalog and a
-// content namespace whole when one of its read roles there has no rule on
-// /resource and passes, whatever its other roles (roles are
-// alternatives): it shares a plain reader's subject set, sees every node
-// and item head, and may have unfiltered listings. One whose only read
-// roles test /resource, or whose other read role has a rule on /now that
-// fails, is filtered per node and item under a subject set of its own.
+// TestReadsUnrestrictedRoles (§C.5, B8, §B.11.5): a grant reads the
+// catalog and a content namespace whole when one of its read roles there
+// is a qualifying role (§2.1) with no rule on /resource, whatever its
+// other roles (roles are alternatives): it shares a plain reader's g/all,
+// sees every node and item head, and has unfiltered listings. One whose
+// only read roles test /resource, or whose other read role has a rule on
+// /now (which an edge grant can't be issued for, §C.5.2, whether it
+// passes now or not), doesn't read them so, and a tree service without
+// §B.11 serves it nothing (403).
 func TestReadsUnrestrictedRoles(t *testing.T) {
 	t.Parallel()
 	before := func(at string) []any {
@@ -76,7 +78,7 @@ func TestReadsUnrestrictedRoles(t *testing.T) {
 		whole     bool
 	}{
 		{"reader and writer (B8)", "user:bob", []any{"reader", "writer"}, true},
-		{"current and writer", "user:cy", []any{"current", "writer"}, true},
+		{"current and writer", "user:cy", []any{"current", "writer"}, false},
 		{"writer", "user:dee", []any{"writer"}, false},
 		{"expired and writer", "user:ed", []any{"expired", "writer"}, false},
 	} {
@@ -84,11 +86,16 @@ func TestReadsUnrestrictedRoles(t *testing.T) {
 		if loc := ptr(tok); (loc == plainLoc) != tc.whole {
 			t.Errorf("%s: %s, a plain reader's %s", tc.name, loc, plainLoc)
 		}
+		if !tc.whole {
+			if r := x.raw("/cat/children?of=top", tok); r.status != 403 {
+				t.Errorf("%s: %d %v", tc.name, r.status, r.body)
+			}
+			continue
+		}
 		b := x.get("/cat/children?of=top", tok)
 		names, hs := names(b["children"]), heads(b)
 		problems := x.raw(x.raw("/cat/problems", tok).header.Get("Location"), tok).status
-		if tc.whole && (names != "sec.a,hidden,sec.draft-1" || hs != "sec.a,sec.draft-1" || problems != 200) ||
-			!tc.whole && (names != "sec.draft-1" || hs != "sec.draft-1" || problems != 403) {
+		if names != "sec.a,hidden,sec.draft-1" || hs != "sec.a,sec.draft-1" || problems != 200 {
 			t.Errorf("%s: children %s, heads %s, problems %d", tc.name, names, hs, problems)
 		}
 	}
@@ -103,7 +110,9 @@ func TestPurgedCatalog(t *testing.T) {
 	s, admin, reader, root := privateWorld(t, map[string]any{})
 	x := startSvc(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:tree", []string{"sec", "cat"}, []string{"read"}))), svcOpts{now: s.Now})
 	x.caughtUp("cat", "sec")
-	bob := reader.Grant(t, s.Now(), "user:bob", []string{"cat"}, []string{"read"})
+	// A reader of g/all: a tree service without §B.11 serves no other
+	// (§B.11.5).
+	bob := reader.Grant(t, s.Now(), "user:bob", []string{"cat", "sec"}, []string{"read"})
 	loc := x.raw("/cat/children?of=top", bob).header.Get("Location")
 
 	must(root.PatchConfig(ctx, "cat", must(root.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))

@@ -214,8 +214,9 @@ func TestUnfilteredListings(t *testing.T) {
 			t.Errorf("%s for a namespace-wide reader: %d %v", op, r.status, r.body)
 		}
 	}
-	// Presenting g/all without the grants for it redirects to one's own.
-	if r := w.do("GET", loc, fan, nil); r.status != 302 || r.header.Get("Location") != locFan {
+	// Presenting g/all without the grants for it is 403, never redirected
+	// (§B.11.5).
+	if r := w.do("GET", loc, fan, nil); r.status != 403 || r.header.Get("Location") != "" {
 		t.Errorf("g/all for a role reader: %d %s", r.status, r.header.Get("Location"))
 	}
 }

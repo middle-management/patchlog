@@ -803,8 +803,8 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 	if locLi == loc {
 		t.Error("a user with direct entries shares the group listing")
 	}
-	// Presenting someone else's gs redirects to one's own.
-	if r := w.do("GET", locLi, fan, nil); r.status != 302 || r.header.Get("Location") != loc {
+	// Presenting someone else's gs is 403, never redirected (§B.11.5).
+	if r := w.do("GET", locLi, fan, nil); r.status != 403 || r.header.Get("Location") != "" {
 		t.Errorf("foreign gs: %d %s", r.status, r.header.Get("Location"))
 	}
 	// The embargoed folder: invisible to fan-club, visible to editors-in-chief.

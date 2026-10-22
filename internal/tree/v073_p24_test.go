@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
 	"github.com/middle-management/patchlog/internal/svcedge"
 	"github.com/middle-management/patchlog/internal/tree"
@@ -178,6 +181,238 @@ func (p *p24World) exchange(token string) (string, *http.Cookie) {
 	return ps[0].(string), r.Cookies()[0]
 }
 
+// TC-10 (§B.5 Behind): a listing while the service is behind is 503
+// behind, once the reader's grant verifies, with a message that names
+// nothing; the namespace waited for is the body's ns, only to a reader
+// with unrestricted read of the catalog.
+func TestV073BehindNamesNSToCatalogReaders(t *testing.T) {
+	t.Parallel()
+	p := newP24World(t, "grant", "grant")
+	var hold atomic.Bool
+	hold.Store(true)
+	t.Cleanup(func() { hold.Store(false) })
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+		for hold.Load() && strings.HasPrefix(req.URL.Path, "/ns/matches/") &&
+			(strings.Contains(req.URL.Path, "/log") || strings.HasSuffix(req.URL.Path, "/events") || strings.Contains(req.URL.Path, "/heads")) {
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		return base.RoundTrip(req)
+	})
+	c := p.s.Client(t, client.WithBearer(p.admin.Grant(t, p.s.Now(), "svc:tree", []string{"cat", "matches"}, []string{"read"})),
+		client.WithHTTPClient(&http.Client{Transport: rt}))
+	p.x = startSvc(t, c, svcOpts{now: p.s.Now}, withScopeView)
+	p.x.caughtUp("cat")
+	whole := p.grant("user:amy", []string{"cat", "matches"})
+	for name, tc := range map[string]struct {
+		token string
+		ns    bool
+	}{
+		"whole":        {whole, true},
+		"catalog-only": {p.grant("user:cy", []string{"cat"}), true},
+		"scoped":       {p.scoped("user:bob", "root", "season"), false},
+	} {
+		r := p.x.listingAs("/cat/children?of=root", tc.token)
+		msg, _ := r.body["message"].(string)
+		if r.status != 503 || r.body["code"] != "behind" || r.header.Get("Retry-After") == "" || r.header.Get("Cache-Control") != "no-store" ||
+			strings.Contains(msg, "matches") || (r.body["ns"] == "matches") != tc.ns || !tc.ns && r.body["ns"] != nil {
+			t.Errorf("%s: %d %v %v", name, r.status, r.body, r.header)
+		}
+	}
+	if r := p.x.raw("/cat/children?of=root", ""); r.status != 401 {
+		t.Errorf("anonymous: %d %v, the grant comes first", r.status, r.body)
+	}
+	hold.Store(false)
+	p.x.caughtUp("matches")
+	if got := names(p.x.get("/cat/children?of=root", whole)["children"]); got != "matches.derby,season" {
+		t.Errorf("caught up: %s", got)
+	}
+}
+
+// TC-11 (§B.11.5 Listing URLs): a listing whose combined checkpoint has
+// only public namespaces is served unfiltered at /{catalog}/at/{at}/…, to
+// everyone, grant or not; any other only under /{catalog}/g/{gs}/…, and a
+// request with neither a grant nor a cookie is 401: there is no anonymous
+// filtered listing.
+func TestV073PublicURLSpace(t *testing.T) {
+	t.Parallel()
+	p := newP24World(t, "public", "public").start()
+	amy := p.grant("user:amy", []string{"cat", "matches"})
+	want := "/cat/at/" + p.x.s.At() + "/children?of=root"
+	for name, tok := range map[string]string{"anonymous": "", "a grant": amy} {
+		r := p.do("GET", "/cat/children?of=root", tok, "")
+		if r.status != 302 || r.header.Get("Location") != want || r.header.Get("Cache-Control") != ccHeadPointer {
+			t.Errorf("%s: %d %v", name, r.status, r.header)
+		}
+	}
+	if r := p.do("GET", want, amy, ""); r.status != 200 || r.header.Get("Cache-Control") != ccListing || names(r.body["children"]) != "matches.derby,season" {
+		t.Errorf("the public listing to a grant: %d %v %v", r.status, r.header, r.body)
+	}
+	// A subject set's URL leads to the public one, whoever asks.
+	if r := p.do("GET", "/cat/g/all/at/"+p.x.s.At()+"/children?of=root", amy, ""); r.status != 302 || r.header.Get("Location") != want {
+		t.Errorf("g/all of an all-public checkpoint: %d %v", r.status, r.header)
+	}
+
+	// matches isn't public: no anonymous listing, though cat is public.
+	q := newP24World(t, "public", "grant").start()
+	at := q.x.s.At()
+	for _, path := range []string{"/cat/children?of=root", "/cat/at/" + at + "/children?of=root", "/cat/g/all/at/" + at + "/children?of=root", "/cat/g/all/children?of=root"} {
+		if r := q.do("GET", path, "", ""); r.status != 401 || r.header.Get("WWW-Authenticate") == "" {
+			t.Errorf("anonymous %s: %d %v", path, r.status, r.body)
+		}
+	}
+	amy = q.grant("user:amy", []string{"cat", "matches"})
+	if r := q.do("GET", "/cat/at/"+at+"/children?of=root", amy, ""); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/cat/g/all/at/") {
+		t.Errorf("a grant at the public URL: %d %v", r.status, r.header)
+	}
+}
+
+// TC-12 (§B.11.5): a grant in Authorization reads only at its own gs, or
+// at all where it qualifies, and is 403 at any other, never redirected;
+// a URL without /g/{gs} is redirected into its own, private, no-store.
+func TestV073GrantAtAnotherGS(t *testing.T) {
+	t.Parallel()
+	p := newP24World(t, "grant", "grant").start(withScopeView)
+	amy := p.grant("user:amy", []string{"cat", "matches"})
+	bob := p.scoped("user:bob", "root", "season", "matches.derby", "derby")
+	amyLoc, bobLoc := p.x.atURL("/cat/children?of=root", amy), p.x.atURL("/cat/children?of=root", bob)
+	if !strings.HasPrefix(amyLoc, "/cat/g/all/at/") || !strings.HasPrefix(bobLoc, "/cat/g/") || strings.HasPrefix(bobLoc, "/cat/g/all/") {
+		t.Fatalf("amy %s, bob %s", amyLoc, bobLoc)
+	}
+	for name, tc := range map[string]struct{ path, token string }{
+		"amy at bob's gs": {bobLoc, amy},
+		"bob at all":      {amyLoc, bob},
+	} {
+		if r := p.do("GET", tc.path, tc.token, ""); r.status != 403 || r.body["code"] != "forbidden" || r.header.Get("Location") != "" || r.header.Get("Cache-Control") != "no-store" {
+			t.Errorf("%s: %d %v %v", name, r.status, r.header, r.body)
+		}
+	}
+	if got := names(p.x.get(bobLoc, bob)["children"]); got != "matches.derby,season" {
+		t.Errorf("bob at his own gs: %s", got)
+	}
+	// amy qualifies for all, and still reads at her own subject set's gs,
+	// filtered by its roles: here none.
+	own := "/cat/g/" + grantcheck.SubjectSetID([]string{}) + "/roots"
+	if r := p.x.raw(own, amy); r.status != 302 {
+		t.Errorf("amy's own gs: %d %v", r.status, r.body)
+	} else if b := p.x.get(r.header.Get("Location"), amy); len(b["roots"].([]any)) != 0 {
+		t.Errorf("amy's subject set's roots: %v", b)
+	}
+	// Without /g/{gs}: redirected into the grant's own, by the grant.
+	r := p.do("GET", "/cat/at/"+p.x.s.At()+"/children?of=root", bob, "")
+	if r.status != 302 || r.header.Get("Location") != bobLoc || r.header.Get("Cache-Control") != "private, no-store" {
+		t.Errorf("bob at the public URL: %d %v", r.status, r.header)
+	}
+}
+
+// TC-13 (§B.11.5): the head pointer of a subject set lies under its
+// prefix, /{catalog}/g/{gs}/{op}, so its edge grant covers it, and
+// redirects to …/g/{gs}/at/{cur}/{op}; the gs must be the reader's (403
+// for a grant, 401 without a grant or a cookie covering it). A redirect a
+// grant decides is private, no-store.
+func TestV073HeadPointerUnderGS(t *testing.T) {
+	t.Parallel()
+	p := newP24World(t, "grant", "grant").start(withEdgeGrants)
+	bob := p.scoped("user:bob", "root", "season")
+	prefix, cookie := p.exchange(bob)
+	if !strings.HasPrefix(prefix, "/cat/g/") || prefix == "/cat/g/all" {
+		t.Fatalf("prefix %s", prefix)
+	}
+	want := prefix + "/at/" + p.x.s.At() + "/children?of=root"
+	r := p.do("GET", prefix+"/children?of=root", "", "", cookie)
+	if r.status != 302 || r.header.Get("Location") != want || r.header.Get("Cache-Control") != ccPrivatePtr {
+		t.Fatalf("the cookie's pointer: %d %v %v", r.status, r.header, r.body)
+	}
+	if r := p.do("GET", want, "", "", cookie); r.status != 200 || names(r.body["children"]) != "season" {
+		t.Errorf("the cookie's listing: %d %v", r.status, r.body)
+	}
+	r = p.do("GET", prefix+"/children?of=root", bob, "")
+	if r.status != 302 || r.header.Get("Location") != want || r.header.Get("Cache-Control") != "private, no-store" || r.header.Get("CDN-Cache-Control") != "no-store" {
+		t.Errorf("the grant's pointer: %d %v", r.status, r.header)
+	}
+	amy := p.grant("user:amy", []string{"cat", "matches"})
+	if r := p.do("GET", prefix+"/children?of=root", amy, ""); r.status != 403 || r.header.Get("Location") != "" {
+		t.Errorf("amy's grant at bob's pointer: %d %v", r.status, r.header)
+	}
+	if r := p.do("GET", "/cat/g/all/children?of=root", "", "", cookie); r.status != 401 {
+		t.Errorf("bob's cookie at all's pointer: %d %v", r.status, r.body)
+	}
+	if r := p.do("GET", "/cat/g/all/children?of=root", amy, ""); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/cat/g/all/at/") {
+		t.Errorf("amy at all's pointer: %d %v", r.status, r.header)
+	}
+	if r := p.do("GET", "/cat/g/zz/children?of=root", amy, ""); r.status != 404 {
+		t.Errorf("a malformed gs: %d", r.status)
+	}
+}
+
+// TC-14 (§B.11.5): a tree service without §B.11 (no RoleView) serves only
+// g/all, to readers whose grants would be issued namespace-wide edge
+// grants on the catalog and every namespace it trusts; any other grant
+// is 403, and anonymous readers only all-public checkpoints.
+func TestV073PlainTreeServesOnlyAll(t *testing.T) {
+	t.Parallel()
+	p := newP24World(t, "grant", "grant").start()
+	if r := p.do("GET", "/cat/children?of=root", "", ""); r.status != 401 {
+		t.Errorf("anonymous: %d", r.status)
+	}
+	for name, tok := range map[string]string{
+		"catalog-only": p.grant("user:cy", []string{"cat"}),
+		"scoped":       p.scoped("user:bob", "root", "season", "matches.derby", "derby"),
+	} {
+		if r := p.do("GET", "/cat/children?of=root", tok, ""); r.status != 403 || r.header.Get("Location") != "" {
+			t.Errorf("%s: %d %v", name, r.status, r.header)
+		}
+	}
+	amy := p.grant("user:amy", []string{"cat", "matches"}, map[string]any{"groups": []any{"eds"}})
+	loc := p.x.atURL("/cat/children?of=root", amy)
+	if !strings.HasPrefix(loc, "/cat/g/all/at/") || names(p.x.get(loc, amy)["children"]) != "matches.derby,season" {
+		t.Errorf("a namespace-wide reader: %s", loc)
+	}
+	gs := grantcheck.SubjectSetID([]string{"group:eds"})
+	if r := p.do("GET", "/cat/g/"+gs+"/at/"+p.x.s.At()+"/children?of=root", amy, ""); r.status != 403 {
+		t.Errorf("a subject set's URL: %d %v", r.status, r.body)
+	}
+	q := newP24World(t, "public", "public").start()
+	if got := names(q.x.get("/cat/children?of=root", "")["children"]); got != "matches.derby,season" {
+		t.Errorf("an all-public checkpoint, anonymously: %s", got)
+	}
+}
+
+// TC-15 (§B.11.5, §C.5.2): g/all is for readers whose grants would be
+// issued a namespace-wide edge grant, and a rule referring to /now, which
+// an edge can't evaluate, rules one out even while it passes. Such a
+// reader reads its subject set's listings (none, without §B.11), and its
+// unrestricted reads (§2.1), judged on each request, admit problems
+// there, kept by no shared cache.
+func TestV073AllNeedsNamespaceWide(t *testing.T) {
+	t.Parallel()
+	clock := map[string]any{"rules": []any{map[string]any{"op": "compare", "path": "/now", "lt": map[string]any{"value": "2999-01-01T00:00:00Z"}}}}
+	p := newP24World(t, "grant", "grant").start()
+	if r := p.do("GET", "/cat/children?of=root", p.grant("user:cl", []string{"cat", "matches"}, clock), ""); r.status != 403 {
+		t.Errorf("a rule on /now, without §B.11: %d %v", r.status, r.header)
+	}
+	q := newP24World(t, "grant", "grant").start(withEdgeGrants)
+	cl := q.grant("user:cl", []string{"cat", "matches"}, clock)
+	loc := q.x.atURL("/cat/children?of=root", cl)
+	if !strings.HasPrefix(loc, "/cat/g/") || strings.HasPrefix(loc, "/cat/g/all/") {
+		t.Errorf("a rule on /now: %s", loc)
+	}
+	if r := q.do("GET", q.x.atURL("/cat/problems", cl), cl, ""); r.status != 200 || r.header.Get("CDN-Cache-Control") != "no-store" ||
+		!strings.HasPrefix(r.header.Get("Cache-Control"), "private") {
+		t.Errorf("problems: %d %v", r.status, r.header)
+	}
+	if prefix, _ := q.exchange(cl); prefix == "/cat/g/all" {
+		t.Errorf("exchanged for %s", prefix)
+	}
+	if prefix, _ := q.exchange(q.grant("user:amy", []string{"cat", "matches"})); prefix != "/cat/g/all" {
+		t.Errorf("a namespace-wide reader exchanged for %s", prefix)
+	}
+}
+
 // TC-16 (§B.11.5, §6.6): the service's exchangeRate buckets are shared by
 // its instances through its database: what one instance drew, another
 // on the same database sees drawn, and the other way round.
@@ -207,8 +442,9 @@ func TestV073ExchangeRateShared(t *testing.T) {
 
 // GR-20 (§C.8, §C.6, F-C3 default): the service answers a grant over
 // grantSize or rulesPerGrant as the origin does, 413 limit naming the
-// limit, on listings and at its exchange, once decoded. The exchange's
-// body is I-JSON without noncharacters (§3.1, 400).
+// limit, on listings and at its exchange, once decoded; public reads
+// ignore any grant. The exchange's body is I-JSON without noncharacters
+// (§3.1, 400).
 func TestV073GrantOverLimits(t *testing.T) {
 	t.Parallel()
 	p := newP24World(t, "grant", "grant").start(withEdgeGrants)
@@ -232,5 +468,66 @@ func TestV073GrantOverLimits(t *testing.T) {
 	}
 	if r := p.do("POST", "/edge-grants", "", "{\"grants\":[\"a￾\"]}"); r.status != 400 || r.body["code"] != "bad_input" {
 		t.Errorf("a noncharacter: %d %v", r.status, r.body)
+	}
+	q := newP24World(t, "public", "public").start()
+	huge := q.grant("user:h", both, map[string]any{"attrs": map[string]any{"x": strings.Repeat("a", 9000)}})
+	if r := q.do("GET", "/cat/children?of=root", huge, ""); r.status != 302 {
+		t.Errorf("a public listing with a grant over grantSize: %d %v", r.status, r.body)
+	}
+}
+
+// ENC-33 (§E.2.6, §B.11.5): a sealed catalog's listing is sealed whole
+// only where the catalog isn't public and every reader the URL admits
+// reads it whole, which is g/all; a public sealed catalog's are sealed
+// per entry, in the public URL space and under g/all alike. A listing a
+// release before stored sealed whole elsewhere isn't served.
+func TestV073SealsWholeOnlyForAll(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks := must(keystore.New(keystore.Generate()))
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for ns, doc := range map[string]map[string]any{
+		"pub":  {"read": "public", "keys": []any{k.Entry("*")}},
+		"priv": {"read": "grant", "keys": []any{k.Entry("*")}},
+		"cat": {"read": "public", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"},
+			"catalog": map[string]any{"trust": []any{"pub"}}},
+		"cat2": {"read": "public", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"},
+			"catalog": map[string]any{"trust": []any{"priv"}}},
+	} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	all := []string{"cat", "cat2", "pub", "priv"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create"})), client.WithKeys(client.NewKeys(nil)))
+	for _, cat := range []string{"cat", "cat2"} {
+		createNonced(t, w, cat, "root", map[string]any{"title": "Root zq8x", "parents": []any{}})
+	}
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	perEntry := func(f fetched) bool {
+		return f.header.Get("Content-Type") == "application/json" && !strings.Contains(string(f.body), "zq8x") && strings.Contains(string(f.body), `"sealed"`)
+	}
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat", "pub")
+	f := x.fetch("/cat/roots", "")
+	if !strings.HasPrefix(f.path, "/cat/at/") || !perEntry(f) {
+		t.Fatalf("anonymous, public sealed catalog: %s %v %s", f.path, f.header, f.body)
+	}
+	y := startSvc(t, sc, svcOpts{now: s.Now, catalog: "cat2"})
+	y.caughtUp("cat2", "priv")
+	if g := y.fetch("/cat2/roots", k.Grant(t, s.Now(), "user:r", []string{"cat2", "priv"}, []string{"read"})); !strings.HasPrefix(g.path, "/cat2/g/all/") || !perEntry(g) {
+		t.Fatalf("g/all of a public sealed catalog: %s %v %s", g.path, g.header, g.body)
+	}
+	// Stored sealed whole by an earlier release: dropped at start.
+	x.stop()
+	sdb := must(sql.Open("sqlite", sqlitedsn.DSN(db, "_pragma=busy_timeout(10000)")))
+	if n := must(must(sdb.Exec(`UPDATE sealed_views SET body = 'a.b.c.d.e', json = 0`)).RowsAffected()); n == 0 {
+		t.Fatal("no stored listing")
+	}
+	sdb.Close()
+	x = startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat", "pub")
+	if again := x.fetch(f.path, ""); !perEntry(again) {
+		t.Fatalf("after a restart over a listing stored whole: %v %s", again.header, again.body)
 	}
 }
