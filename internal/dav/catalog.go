@@ -1167,12 +1167,12 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 // delete, 401 or 403, is orphaned, §H.5, as a hidden one is); those whose
 // items the request's grant can't read are neither named nor deleted.
 // The folder node is deleted as read (If-Match), and only while still
-// named and placed as the path named it, which was checked against the token's kept graph (agrees),
-// maybe older than this read: renamed or moved meanwhile, it is a 404 or
-// a 409; a child placed while it is deleted is orphaned (§H.5), as one
-// placed by another program always may be. A node with several parents
-// (a DAG) is unlinked from this folder only (unlink). The scope's scratch
-// files in it go with it.
+// named and placed as the path named it, which was checked against the
+// token's kept graph (agrees), maybe older than this read: renamed or
+// moved meanwhile, it is a 404 or a 409; a child placed while it is
+// deleted is orphaned (§H.5), as one placed by another program always
+// may be. A node with several parents (a DAG) is unlinked from this
+// folder only (unlink). The scope's scratch files in it go with it.
 func (st *reqState) deleteFolder(ctx context.Context, t target) error {
 	cg, _, err := st.writeTree(ctx, t.ns)
 	if err != nil {

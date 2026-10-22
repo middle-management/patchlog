@@ -146,10 +146,10 @@ type blobSrc struct {
 // $successor stay. A save is stored with the uploaded bytes, or refused:
 // only bytes the head already holds, as its type, write nothing, nonces
 // or not, and answer the head (§H.1 "Identity", §H.4). Where nonces apply
-// (§C.7) the blob has a Blob-Nonce and the root a fresh $nonce. A copy of a raw file whose
-// type comes out as the source's keeps its blob's id, nonce or not
-// (§7.8), and the blob is copied with Blob-From, or uploaded again where
-// the core refuses that (a source of a higher rank, §7.8).
+// (§C.7) the blob has a Blob-Nonce and the root a fresh $nonce. A copy of
+// a raw file whose type comes out as the source's keeps its blob's id,
+// nonce or not (§7.8), and the blob is copied with Blob-From, or uploaded
+// again where the core refuses that (a source of a higher rank, §7.8).
 func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte, o saveOpts) (string, bool, error) {
 	in := st.s.nsInfo(ctx, st.tk, ns)
 	if in.sealed {
@@ -221,7 +221,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 				rev = h.ID
 				return false, nil
 			}
-			if err := st.rawBase(ctx, ns, name, body, h.ID); err != nil {
+			if err := st.rawBase(ctx, ns, name, h.ID); err != nil {
 				return false, err
 			}
 			if err := upload(b); err != nil {
@@ -347,29 +347,29 @@ func (st *reqState) rawRestorePatches(ctx context.Context, in nsInfo, ns, name s
 	if last.raw.typ == b.typ && sameBytes(last.raw, body) {
 		return last.value, withNonce(in, last.value, []any{}), false, nil
 	}
-	if err := st.rawBase(ctx, ns, name, body, h.Last); err != nil {
+	if err := st.rawBase(ctx, ns, name, h.Last); err != nil {
 		return nil, nil, false, err
 	}
 	return last.value, withNonce(in, last.value, merge.Diff(refOf(last.value), refOf(b.ref))), true, nil
 }
 
-// rawBase refuses a save of raw file ns/name with body over head
-// revision headRev holding other bytes, or nil: it writes them (§H.4
+// rawBase refuses a save of raw file ns/name over head revision headRev
+// holding other bytes than the save's, or nil: it writes them (§H.4
 // "Raw files"). Raw files have no paths to merge, so their base is
 // checked, never merged from: the versions the client may hold are the
 // revision its If-Match names, else every version the principal was
 // served or wrote (candidates), and if, after any of them, someone else
 // changed the file's bytes (an entry the principal didn't write set a
-// reference member or the root, spans) or deleted or restored it,
-// writing body would overwrite theirs unseen: a 409 asking for a reload,
-// a version the client had saved unchanged included (§H.1 "Identity": a
+// reference member or the root, spans) or deleted or restored it, the
+// save would overwrite theirs unseen: a 409 asking for a reload, a
+// version the client had saved unchanged included (§H.1 "Identity": a
 // raw save is always stored with the uploaded value, so none is answered
 // as if it were). The principal's own writes since are its own to
 // replace, so its consecutive saves never conflict, whatever their
-// sizes: a version is never picked by how close its reference is to
-// body's. One that writes by a token refused a save of it that hasn't
+// sizes: a version is never picked by how close its reference is to the
+// save's. One that writes by a token refused a save of it that hasn't
 // read it since is a 409 too (refusedSave).
-func (st *reqState) rawBase(ctx context.Context, ns, name string, body []byte, headRev string) error {
+func (st *reqState) rawBase(ctx context.Context, ns, name, headRev string) error {
 	if err := st.rawBaseOf(ctx, ns, name, headRev); err != nil {
 		return err
 	}
