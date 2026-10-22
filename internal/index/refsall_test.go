@@ -106,7 +106,9 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 
 	// amy reads pa and the public namespace: a private pointer and answer.
 	amyAt, amyGs, amyLoc := idx.refsPointer(q, amy)
-	if r := idx.raw("/_refs"+q, amy); r.header.Get("Cache-Control") != "private, no-cache" || r.header.Get("Vary") != "Authorization" || !strings.HasSuffix(amyLoc, q) {
+	// A redirect that adds a private /g/{gs} is private, no-store (§A.4,
+	// v0.73).
+	if r := idx.raw("/_refs"+q, amy); r.header.Get("Cache-Control") != "private, no-store" || r.header.Get("Vary") != "Authorization" || !strings.HasSuffix(amyLoc, q) {
 		t.Errorf("pointer %s %v", amyLoc, r.header)
 	}
 	r := idx.raw(amyLoc, amy)
@@ -193,18 +195,20 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	if _, gs, loc := idx.refsPointer(q, soon); gs != anonGs || refsAllHits(idx.search(loc, soon)) != "pub/p1" {
 		t.Errorf("rules on /now: %s", loc)
 	}
-	// One read role without rules on /resource reads pb whole (§C.5),
-	// whatever the grant's other roles, so rules on /now elsewhere don't
-	// make it unreadable: such a grant shares a plain reader's answer.
+	// A qualifying role (a read role without rules on /resource or /now)
+	// gets the grant a namespace-wide edge grant (§C.5.2), whatever its
+	// other roles, so rules on /now in those don't make pb unreadable:
+	// such a grant shares a plain reader's answer. A rule on /now in a
+	// block does: no edge grant, and pb counts as unreadable (§A.4,
+	// v0.73; IX-15).
 	_, pbGs, _ := idx.refsPointer(q, issuer.Grant(t, s.Now(), "user:pbr", []string{"pb"}, []string{"read"}))
-	for name, g := range map[string]string{
-		"reader and timed": issuer.Grant(t, s.Now(), "user:r1", []string{"pb"}, nil, map[string]any{"roles": []any{"reader", "timed"}}),
-		"reader and editor, a rule on /now": issuer.Grant(t, s.Now(), "user:r2", []string{"pb"}, nil,
-			map[string]any{"roles": []any{"reader", "editor"}, "rules": []any{isNow}}),
-	} {
-		if _, gs, loc := idx.refsPointer(q, g); gs != pbGs || refsAllHits(idx.search(loc, g)) != "pb/b1 pb/b2 pub/p1" {
-			t.Errorf("%s: %s", name, loc)
-		}
+	r1 := issuer.Grant(t, s.Now(), "user:r1", []string{"pb"}, nil, map[string]any{"roles": []any{"reader", "timed"}})
+	if _, gs, loc := idx.refsPointer(q, r1); gs != pbGs || refsAllHits(idx.search(loc, r1)) != "pb/b1 pb/b2 pub/p1" {
+		t.Errorf("reader and timed: %s", loc)
+	}
+	r2 := issuer.Grant(t, s.Now(), "user:r2", []string{"pb"}, nil, map[string]any{"roles": []any{"reader", "editor"}, "rules": []any{isNow}})
+	if _, gs, loc := idx.refsPointer(q, r2); gs != anonGs || refsAllHits(idx.search(loc, r2)) != "pub/p1" {
+		t.Errorf("reader and editor, a rule on /now: %s", loc)
 	}
 
 	// A write in pb moves bob's at, not amy's.
@@ -263,20 +267,16 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	if r := idx.raw("/_refs/g/"+amyGs+"/at/"+amyAt+"?to="+x, amy); r.status != 302 || r.header.Get("Location") != amyLoc {
 		t.Errorf("not canonical: %d %s", r.status, r.header.Get("Location"))
 	}
-	// Someone else's subject set redirects to one's own, at the same at.
-	if r := idx.raw(bobLoc, amy); r.status != 302 || r.header.Get("Location") != "/_refs/g/"+amyGs+"/at/"+bobAt+q {
-		t.Errorf("foreign gs: %d %s", r.status, r.header.Get("Location"))
-	}
-	// With min, it goes into one's own straight away, without min (§A.5):
-	// to the same at if its kept answer includes min, or else to the
-	// current one.
-	for p, want := range map[string]string{
-		"/_refs/g/" + bobGs + "/at/" + amyAt + q + "&min=pa:" + a1: amyLoc,
-		bobLoc + "&min=pa:" + a1:                                   newLoc,
-	} {
-		if r := idx.raw(p, amy); r.status != 302 || r.header.Get("Location") != want {
-			t.Errorf("foreign gs, with min: %s: %d %s, want %s", p, r.status, r.header.Get("Location"), want)
+	// A grant reads only at its own subject set (§A.4, §B.11.5, v0.73):
+	// someone else's is 403, no-store, with or without min, never
+	// redirected; without a grant it is 401.
+	for _, p := range []string{bobLoc, "/_refs/g/" + bobGs + "/at/" + amyAt + q + "&min=pa:" + a1, bobLoc + "&min=pa:" + a1} {
+		if r := idx.raw(p, amy); r.status != 403 || r.body["code"] != "forbidden" || r.header.Get("Cache-Control") != "no-store" || r.header.Get("Location") != "" {
+			t.Errorf("foreign gs %s: %d %v %v", p, r.status, r.body, r.header)
 		}
+	}
+	if r := idx.raw(bobLoc, ""); r.status != 401 || r.header.Get("WWW-Authenticate") != "Bearer" || r.header.Get("Cache-Control") != "no-store" {
+		t.Errorf("foreign gs without a grant: %d %v %v", r.status, r.body, r.header)
 	}
 
 	// Pages: in namespace, then resource order; next is the after of the
@@ -610,8 +610,9 @@ func TestRefsAcrossSealed(t *testing.T) {
 		t.Errorf("after the purge: %s", got)
 	}
 
-	// A stored answer is not served once a namespace it covers turns
-	// private, though the anonymous subject set stays the same.
+	// A stored answer is dropped once a namespace it covers turns private
+	// (§A.1, §9, v0.73), and not served, though the anonymous subject set
+	// stays the same.
 	must(createNonced(w, "sec", "s2", doc))
 	idx.caughtUp("sec")
 	f = idx.fetch("/_refs?to="+url.QueryEscape(x), "")
@@ -623,8 +624,8 @@ func TestRefsAcrossSealed(t *testing.T) {
 	idx.stop()
 	idx = startSvcWith(t, ic, opts, withKey)
 	idx.caughtUp("sec")
-	if _, ok := idx.ix.SealedViews()[f.path]; !ok {
-		t.Fatal("the answer with s2 is not stored")
+	if _, ok := idx.ix.SealedViews()[f.path]; ok {
+		t.Error("the answer with s2 survived sec turning private")
 	}
 	if r := idx.raw(f.path, ""); r.status != 302 {
 		t.Errorf("after sec went private: %d %v", r.status, r.body)

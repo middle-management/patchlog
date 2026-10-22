@@ -104,24 +104,29 @@ func TestReadsUnrestrictedRoles(t *testing.T) {
 		hits      string
 	}{
 		{"reader and writer (B8)", "user:bob", []any{"reader", "writer"}, true, "a,b,draft-1"},
-		{"current and writer", "user:cy", []any{"current", "writer"}, true, "a,b,draft-1"},
 		{"writer", "user:dee", []any{"writer"}, false, "draft-1"},
-		{"expired and writer", "user:ed", []any{"expired", "writer"}, false, "draft-1"},
+		// Rules on /now in a role that lists read (current passes now,
+		// expired doesn't): no namespace-wide edge grant, and sec counts
+		// as unreadable, here as on /_refs, where it is the only
+		// namespace followed (§A.4, v0.73; IX-15).
+		{"current and writer", "user:cy", []any{"current", "writer"}, false, ""},
+		{"expired and writer", "user:ed", []any{"expired", "writer"}, false, ""},
 	} {
 		tok := issuer.Grant(t, s.Now(), tc.sub, []string{"sec"}, nil, map[string]any{"groups": []any{"editors"}, "roles": tc.roles})
+		if tc.hits == "" {
+			if r := x.raw("/sec?q=secret", tok); r.status != 403 {
+				t.Errorf("%s: %d %v", tc.name, r.status, r.body)
+			}
+			if r := x.raw("/_refs"+q, tok); r.status != 403 {
+				t.Errorf("%s: /_refs %d %v", tc.name, r.status, r.body)
+			}
+			continue
+		}
 		if gs := gsOf(tok); (gs == plainGs) != tc.whole {
 			t.Errorf("%s: gs %s, a plain reader's %s", tc.name, gs, plainGs)
 		}
 		if got := strings.Join(resources(x.search("/sec?q=secret", tok)), ","); got != tc.hits {
 			t.Errorf("%s: hits %s", tc.name, got)
-		}
-		if tc.roles[0] == "expired" {
-			// Rules on /now in its read roles: sec is unreadable, and the
-			// only namespace followed.
-			if r := x.raw("/_refs"+q, tok); r.status != 403 {
-				t.Errorf("%s: /_refs %d %v", tc.name, r.status, r.body)
-			}
-			continue
 		}
 		_, gs, loc := x.refsPointer(q, tok)
 		if (gs == plainRefs) != tc.whole || strings.ReplaceAll(refsAllHits(x.search(loc, tok)), "sec/", "") != strings.ReplaceAll(tc.hits, ",", " ") {

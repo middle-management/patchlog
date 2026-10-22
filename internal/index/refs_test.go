@@ -328,14 +328,19 @@ func TestReferenceSealed(t *testing.T) {
 	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, now: s.Now}, func(o *indexOpts) { o.Recipient = priv })
 	x.caughtUp("sec")
 
+	// sec is public: hits are sealed per entry (§E.2.6, v0.73), refs
+	// included.
 	f := x.fetch("/sec?ref="+url.QueryEscape("/r/other/thing"), "")
-	if f.header.Get("Content-Type") != seal.ContentType || strings.Contains(string(f.body), "other") {
+	if f.header.Get("Content-Type") != "application/json" || strings.Contains(string(f.body), "other") {
 		t.Fatalf("not sealed: %s %s", f.header.Get("Content-Type"), f.body)
 	}
-	pt := must(derived.OpenView(string(f.body), epochKeys(t, w, "sec"), derived.View{NS: "sec", Target: f.path}))
-	b := decodeJSON(t, pt)
-	if got := refHits(t, b); fmt.Sprint(got) != "map[a:/related/0=/r/other/thing]" {
-		t.Errorf("refs %v in %s", got, pt)
+	hits := decodeJSON(t, f.body)["hits"].([]any)
+	if len(hits) != 1 || hits[0].(map[string]any)["resource"] != "a" {
+		t.Fatalf("hits %v", hits)
+	}
+	pt := must(derived.OpenItem(hits[0].(map[string]any)["sealed"].(string), derived.ItemKey(epochKeys(t, w, "sec"), "sec", "a"), derived.View{NS: "sec", Target: f.path}, "sec", "a"))
+	if v := decodeJSON(t, pt); fmt.Sprint(v["refs"]) != "[map[path:/related/0 ref:/r/other/thing]]" {
+		t.Errorf("refs in %s", pt)
 	}
 }
 
