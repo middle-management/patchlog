@@ -425,9 +425,9 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 		return d, err
 	}
 	var live []string
-	for _, b := range deps {
-		if b.Name != "" && !b.Purged && b.Remote == nil {
-			live = append(live, b.Name)
+	for _, br := range deps {
+		if br.Name != "" && !br.Purged && br.Remote == nil {
+			live = append(live, br.Name)
 		}
 	}
 	if len(live) > 0 {

@@ -425,3 +425,21 @@ func TestV073EveryChangeMerged(t *testing.T) {
 		t.Fatalf("r9 %+v", d)
 	}
 }
+
+// §F.3 (v0.63): only batches by a root sub and kid in the base's current
+// merge.authors count, so removing an author withdraws its earlier
+// batches: a branch it merged is no longer verified as merged.
+func TestV073RemovedAuthorWithdrawsMerges(t *testing.T) {
+	t.Parallel()
+	a := newAuthEnv(t, []string{"r7"},
+		map[string]any{"merge": map[string]any{"authors": []any{map[string]any{"sub": "svc:merge", "kid": "editor"}}}})
+	a.branch(t, "matches", "r7", map[string]any{"merged": "P1D"})
+	m := a.as(a.editor, "svc:merge")
+	must(merge.Freeze(ctx, m, "r7", must(must(merge.NewPlan(ctx, m, "matches", "r7", merge.Options{})).Apply(ctx)).NSID))
+	later := func() time.Time { return a.s.Now().Add(2 * day) }
+	if d := must(janitor.New(a.janitor, janitor.Options{Now: later, DryRun: true}).Check(ctx, "matches", "r7")); d.Action != janitor.ActionWouldPurge {
+		t.Fatalf("while listed: %+v", d)
+	}
+	patchConfig(t, a.admin, "matches", op("replace", "/merge/authors", []any{map[string]any{"sub": "svc:merge", "kid": "ops"}}))
+	wantKeep(t, a.check(t, "matches", "r7", 2*day), "merged claim not verified: no batch of the branch is by a principal in the base's merge.authors (")
+}
