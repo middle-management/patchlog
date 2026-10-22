@@ -267,6 +267,24 @@ func TestV073P26KeepServed(t *testing.T) {
 	expectCode(t, e.get("/r/kv/a/rev/"+revs[5]), 410, "pruned")
 }
 
+// v0.73 §8.6 Request (BBD-48): the prune answer is { horizon } alone; the
+// archive written is linked from the pruned revisions' 410 (§7.1).
+func TestV073P26PruneAnswer(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, withArchive(t, t.TempDir()), withoutRetentionLoop)
+	e.mkNS("pa", map[string]any{"read": "public"})
+	revs := e.chain("pa", "a", 4)
+	e.clock.Advance(time.Hour)
+	r := e.prune("pa", "a", map[string]any{"horizon": revs[2]}, "admin")
+	expect(t, r, 200)
+	if len(r.Obj()) != 1 || r.Str("horizon") != revs[2] {
+		t.Fatalf("prune answer %s, want { horizon } alone", r.Body)
+	}
+	if g := e.get("/r/pa/a/rev/" + revs[0]); g.Code != 410 || g.Str("archive") == "" {
+		t.Fatalf("pruned revision %d %s", g.Code, g.Body)
+	}
+}
+
 // v0.73 §8.6 Branches don't prune (BBD-49): a prune in a branch runs its
 // checks (the verb, purged, 404 or 410 for the resource, 428, the horizon
 // in the branch's view, the rules) and moves nothing. It answers 200 with
