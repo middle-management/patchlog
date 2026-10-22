@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // p28AfterBoundary waits until the current long-poll interval has at least
@@ -297,6 +300,133 @@ func TestV073P28ResourceStreamNoEntries(t *testing.T) {
 	if st, _ := a.p28SSE("/r/p/other/events", bearerHdr(other)); st != 200 {
 		t.Fatalf("readable resource with no entries: %d", st)
 	}
+}
+
+// §7.3 (RH-33): a resource stream's purge and prune events carry as data
+// the namespace entry that records them without its id and prev, and no
+// SSE id: line, so a reconnect with Last-Event-ID resumes the resource log.
+func TestV073P28ResourcePurgePruneEvents(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("docs", map[string]any{"read": "public"})
+	h := e.create("docs", "a", map[string]any{"n": 0.0})
+	h1 := e.appendRev("docs", "a", h, ops(op("replace", "/n", 1.0)))
+	e.clock.Advance(10 * time.Minute)
+	h2 := e.appendRev("docs", "a", h1, ops(op("replace", "/n", 2.0)))
+	_, ch := e.p28SSE("/r/docs/a/events?since="+h1, nil)
+	if ev := p28Next(t, ch); ev.event != "revision" || p28ID(ev) != h2 {
+		t.Fatalf("replay %+v", ev)
+	}
+	// nsEntry is the namespace log's entry of kind for a.
+	nsEntry := func(kind string) map[string]any {
+		t.Helper()
+		lg := e.get("/ns/docs/rev/" + e.nsHead("docs") + "/log").Arr()
+		for i := len(lg) - 1; i >= 0; i-- {
+			if m := lg[i].(map[string]any); m["kind"] == kind && m["resource"] == "a" {
+				return m
+			}
+		}
+		t.Fatalf("no %s entry", kind)
+		return nil
+	}
+	check := func(ev p28Event, kind string) {
+		t.Helper()
+		if ev.event != kind || ev.id != nil {
+			t.Fatalf("%s event %+v: want no id: line", kind, ev)
+		}
+		want := nsEntry(kind)
+		if want["id"] == nil || want["prev"] == nil {
+			t.Fatalf("%s entry %v", kind, want)
+		}
+		delete(want, "id")
+		delete(want, "prev")
+		if ev.data != string(canonical(want)) {
+			t.Fatalf("%s event data %s, want %s", kind, ev.data, canonical(want))
+		}
+	}
+	expect(t, e.prune("docs", "a", map[string]any{"horizon": h2}, "admin"), 200)
+	check(p28Next(t, ch), "prune")
+	tomb := e.del("docs", "a", h2)
+	if ev := p28Next(t, ch); ev.event != "tombstone" || p28ID(ev) != tomb {
+		t.Fatalf("tombstone %+v", ev)
+	}
+	expect(t, e.purge("docs", "a", tomb, "admin"), 204)
+	check(p28Next(t, ch), "purge")
+	p28Ends(t, "after purge", ch, 5*time.Second)
+}
+
+// §7.3, §E.2.2 (RH-33, ENC-5): in a sealed namespace a resource stream's
+// purge and prune events are JWEs under the resource's K_r of the current
+// epoch, with pl { ns, name, kind } and the namespace's padding, whose
+// plaintext is the namespace entry without id and prev.
+func TestV073P28SealedResourcePurgePruneEvents(t *testing.T) {
+	t.Parallel()
+	e := newSealedEnv(t)
+	doc := sealedDoc(map[string]any{"read": "public"})
+	doc["encryption"].(map[string]any)["pad"] = true
+	e.mkNS("s", doc)
+	r1 := e.wr("s", "a", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+	r2 := e.wr("s", "a", r1, withNonce(ops(op("replace", "/v", 2.0))))
+	e.clock.Advance(10 * time.Minute)
+	r3 := e.wr("s", "a", r2, withNonce(ops(op("replace", "/v", 3.0))))
+	_, ch := e.p28SSE("/r/s/a/events?since="+r3, nil)
+	time.Sleep(50 * time.Millisecond) // the stream follows from the head
+
+	plainEntry := func(kind string) map[string]any {
+		t.Helper()
+		lg := e.plainNSLog("s", e.nsHead("s"))
+		for i := len(lg.Entries) - 1; i >= 0; i-- {
+			if m := lg.Entries[i]; m["kind"] == kind && m["resource"] == "a" {
+				out := map[string]any{}
+				for k, v := range m {
+					if k != "id" && k != "prev" {
+						out[k] = v
+					}
+				}
+				return out
+			}
+		}
+		t.Fatalf("no %s entry", kind)
+		return nil
+	}
+	check := func(ev p28Event, kind string, epoch int) {
+		t.Helper()
+		if ev.event != kind || ev.id != nil {
+			t.Fatalf("%s event %+v: want no id: line", kind, ev)
+		}
+		kid := "s#" + strconv.Itoa(epoch)
+		keys, r := e.keysOf("s", nil, "")
+		expect(t, r, 200)
+		ke := keys[kid]
+		if ke == nil {
+			t.Fatalf("no key %s in %v", kid, keys)
+		}
+		// Not a namespace range: K_e doesn't open it.
+		if _, _, err := seal.Open(ev.data, ke); err == nil {
+			t.Fatalf("%s event opens with K_e", kind)
+		}
+		pt := open(t, ev.data, resKey(t, ke, "s", "a"), kid, seal.ResourceEventPL("s", "a", kind))
+		if len(pt) != 256 {
+			t.Fatalf("%s event plaintext of %d bytes, want padded to 256", kind, len(pt))
+		}
+		want := string(jsonv.Canonical(jsonv.FromGo(plainEntry(kind))))
+		if got := strings.TrimRight(string(pt), " "); got != want {
+			t.Fatalf("%s event plaintext %s, want %s", kind, got, want)
+		}
+	}
+	expect(t, e.prune("s", "a", map[string]any{"horizon": r3}, "admin"), 200)
+	check(p28Next(t, ch), "prune", 1)
+	// Sealed under the epoch current when sent.
+	if _, err := e.e.RotateEpoch(context.Background(), "s", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	tomb := e.del("s", "a", r3)
+	if ev := p28Next(t, ch); ev.event != "tombstone" || p28ID(ev) != tomb {
+		t.Fatalf("tombstone %+v", ev)
+	}
+	expect(t, e.purge("s", "a", tomb, "admin"), 204)
+	check(p28Next(t, ch), "purge", 2)
+	p28Ends(t, "after purge", ch, 5*time.Second)
 }
 
 // §7.3, §8.5 (RH-35): a namespace stream ends after emitting its purge-ns

@@ -224,15 +224,21 @@ func (s *Server) nsLive(w http.ResponseWriter, r *http.Request) {
 // tests.
 var sseKeepAlive = 30 * time.Second
 
-// sse writes one server-sent event.
+// sse writes one server-sent event, with no id: field when id is "".
 func sse(w http.ResponseWriter, event, id string, data any) {
 	sseRaw(w, event, id, string(jsonv.Canonical(jsonv.FromGo(toModel(data)))))
 }
 
 // sseRaw writes one server-sent event whose data is one line of text (a
-// JWE in sealed namespaces, Addendum E.2).
+// JWE in sealed namespaces, Addendum E.2), with no id: field when id is
+// "": a resource stream's purge and prune events carry none (§7.3), so an
+// EventSource's Last-Event-ID stays the last revision it received.
 func sseRaw(w http.ResponseWriter, event, id, data string) {
-	fmt.Fprintf(w, "event: %s\nid: %s\ndata: %s\n\n", event, id, data)
+	if id == "" {
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+	} else {
+		fmt.Fprintf(w, "event: %s\nid: %s\ndata: %s\n\n", event, id, data)
+	}
 	flush(w)
 }
 
@@ -256,6 +262,18 @@ func sseEntry(w http.ResponseWriter, event string, lg *core.Log, i int) {
 		return
 	}
 	sse(w, event, e["id"].(string), e)
+}
+
+// sseResourceEvent writes event i of a resource stream's purge and prune
+// events lg (ResourceEvents): the namespace entry without id and prev, or
+// its JWE under the resource's K_r, with no id: field (§7.3, §E.2.2).
+func sseResourceEvent(w http.ResponseWriter, lg *core.Log, i int) {
+	d := lg.Entries[i]
+	if lg.Sealed {
+		sseRaw(w, d["kind"].(string), "", lg.EntryJWEs[i])
+		return
+	}
+	sse(w, d["kind"].(string), "", d)
 }
 
 // sseLogErr answers an event stream request whose replay failed (404, 410
@@ -410,7 +428,7 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 			sent = true
 		}
 	}
-	// nsEntries emits this resource's purge and prune entries after
+	// nsEntries emits this resource's purge and prune events after
 	// nsSince, a page per fetch; ok is false when a read failed, done
 	// is true after a purge, which ends the stream.
 	nsEntries := func() (ok, done bool) {
@@ -420,14 +438,11 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 				return false, false
 			}
 			nsSince = nl.Last
-			for i, e := range nl.Entries {
-				switch e["kind"] {
-				case "purge":
-					sseEntry(w, "purge", nl, i)
+			for i, d := range nl.Entries {
+				sseResourceEvent(w, nl, i)
+				sent = true
+				if d["kind"] == "purge" {
 					return true, true
-				case "prune":
-					sseEntry(w, "prune", nl, i)
-					sent = true
 				}
 			}
 			if !nl.More || r.Context().Err() != nil {

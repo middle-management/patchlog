@@ -116,6 +116,8 @@ func (c *Client) longPoll(ctx context.Context, path, since, cursor string) (*res
 // Event is one server-sent event.
 type Event struct {
 	Type string // the entry's kind (namespace streams) or revision/tombstone/purge/prune
+	// ID is the event's id: field, the entry's id; a resource stream's
+	// purge and prune events have none (§7.3).
 	ID   string
 	Data any // parsed data (jsonv model); decrypted in a sealed namespace
 	// JWE is the data as served in a sealed namespace (Addendum E.2).
@@ -156,7 +158,12 @@ func (c *Client) NSEvents(ctx context.Context, ns, since string, fn func(NSEntry
 	})
 }
 
-// ResourceEvents streams a resource's events after since over SSE (§7.3).
+// ResourceEvents streams a resource's events after since over SSE (§7.3):
+// revision and tombstone events, whose Data is the resource log entry and
+// ID its id, and purge and prune events, whose Data is the namespace entry
+// that records them, without id and prev, and which have no ID. A stream
+// ends after its purge event. To resume, pass the ID of the last revision
+// or tombstone event as since.
 func (c *Client) ResourceEvents(ctx context.Context, ns, name, since string, fn func(Event) error) error {
 	if err := checkRes(ns, name); err != nil {
 		return err
@@ -175,25 +182,26 @@ func (c *Client) ResourceEvents(ctx context.Context, ns, name, since string, fn 
 				return fmt.Errorf("client: event %s carries entry %s: %w", ev.ID, e.ID, seal.ErrMismatch)
 			}
 			ev.Data = e.Raw
-		default:
-			// purge and prune: a namespace entry, sealed as its range.
-			pt, err := c.open(ctx, ns, "", ev.JWE, func(h *seal.Header) (seal.PL, error) {
-				rg, _ := h.PL["range"].([]any)
-				if len(rg) != 2 {
-					return nil, seal.ErrMismatch
-				}
-				from, _ := rg[0].(string)
-				return seal.RangePL(ns, from, ev.ID), nil
-			})
+		case "purge", "prune":
+			// The namespace entry that records it, without id and prev,
+			// sealed under the resource's K_r of the current epoch with
+			// pl { ns, name, kind }: a grant for this resource alone
+			// opens it (§7.3, §E.2.2).
+			pt, err := c.open(ctx, ns, name, ev.JWE, fixedPL(seal.ResourceEventPL(ns, name, ev.Type)))
 			if err != nil {
-				return fmt.Errorf("client: event %s: %w", ev.ID, err)
+				return fmt.Errorf("client: %s event: %w", ev.Type, err)
 			}
 			v, err := jsonv.Parse(pt)
-			arr, _ := v.([]any)
-			if err != nil || len(arr) != 1 {
-				return fmt.Errorf("client: event %s: sealed data is not one entry", ev.ID)
+			m, _ := v.(map[string]any)
+			if err != nil || m == nil {
+				return fmt.Errorf("client: %s event: sealed data is not an entry", ev.Type)
 			}
-			ev.Data = arr[0]
+			if m["kind"] != ev.Type || m["resource"] != name {
+				return fmt.Errorf("client: %s event carries a %v entry of %v: %w", ev.Type, m["kind"], m["resource"], seal.ErrMismatch)
+			}
+			ev.Data = m
+		default:
+			return fmt.Errorf("client: sealed event of type %q", ev.Type)
 		}
 		return fn(ev)
 	})

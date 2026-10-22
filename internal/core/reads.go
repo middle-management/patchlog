@@ -649,10 +649,12 @@ func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit in
 
 // ResourceEvents is NamespaceEvents for the event stream of resource name
 // (§7.3), which follows the namespace log for the resource's purges and
-// prunes: only entries naming it are answered, and they need read on it
-// alone, as the resource's own URLs do (§C.5). Last and More still cover
-// the whole page. With since "" it answers no entries and Last the
-// namespace head, where the stream starts following.
+// prunes: only the entries that purge or prune it are answered, as their
+// events' data, without id and prev, and in a sealed namespace each sealed
+// under the resource's K_r (eventseal.go); they need read on it alone, as
+// the resource's own URLs do (§C.5). Last and More still cover the whole
+// page. With since "" it answers no entries and Last the namespace head,
+// where the stream starts following.
 func (e *Engine) ResourceEvents(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
 	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, name, nil)
 }
@@ -811,14 +813,13 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		// short of toSeq is a prefix of the range.
 		out.More = len(rs) > 0 && rs[len(rs)-1].seq < toSeq
 		if resource != "" {
-			var keep []raw
-			var entries []map[string]any
-			for i, m := range out.Entries {
-				if m["resource"] == resource {
-					keep, entries = append(keep, rs[i]), append(entries, m)
-				}
+			// A resource stream's purge and prune events (eventseal.go).
+			out.Entries = resourceEvents(out.Entries, resource)
+			if t.isSealedNS(n) {
+				out.Sealed = true
+				out.EntryJWEs = t.sealResourceEvents(n, resource, out.Entries)
 			}
-			rs, out.Entries = keep, entries
+			return nil
 		}
 		if t.isSealedNS(n) {
 			out.Sealed, nsRowID = true, n.id
@@ -847,7 +848,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		}
 		return nil
 	})
-	if err == nil && out != nil && out.Sealed {
+	if err == nil && out != nil && out.Sealed && resource == "" {
 		if err = e.finishSeal(ctx, nsRowID, jobs); err == nil {
 			if perEntry {
 				out.EntryJWEs = make([]string, len(jobs))
