@@ -43,6 +43,14 @@
 //     the branch (as for abandoned, below), with nothing after it in the
 //     branch. The rebase tool counts any such batch (§F.5); the janitor
 //     only these, so a successor's writers can't get unmerged work purged.
+//   - in both checks, every resource with a head, tombstone or batch entry
+//     of the branch's own up to that source.at has an entry in a batch
+//     that counts there whose source.at is at or after its last such
+//     entry, or a head in the batch's namespace (the base, or the
+//     successor) that equals or descends from the branch's revision of it
+//     as of that source.at, as after a fast-forward. Otherwise the first
+//     resource not covered is named, and a partial merge or replay doesn't
+//     get the rest purged. Resources purged in the branch are left out.
 //   - abandoned: the branch's document has "abandoned": true, set by a
 //     config write whose recorded grant chains to a current * key of the
 //     branch, inherited or its own (§F.6): the root kid of the entry's
@@ -610,18 +618,27 @@ func hasDocEntries(log []client.NSEntry, i int, e2e bool) bool {
 	return false
 }
 
-// coveredBy finds the latest batch of entries that counts for branch: one
+// coverage is what coveredBy found: best, the index in the branch's log of
+// the latest counting batch's source.at, and at, per resource, the latest
+// such index of a counting batch with an entry for it.
+type coverage struct {
+	best int
+	at   map[string]int
+}
+
+// coveredBy finds the batches of entries that count for branch: those
 // without origin whose source.ns is branch, whose source.at is in the
 // branch's chain (blog), and that trusted accepts, as written by trustedBy
 // (for the reason). It checks that the branch changed no document after
-// that source.at. disabled says the deployment runs with authentication
-// disabled (§1), for the reason too.
-func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, trusted func(client.NSEntry) (bool, error), trustedBy string, e2e, disabled bool) (bool, string, error) {
+// the latest one's source.at. disabled says the deployment runs with
+// authentication disabled (§1), for the reason too. A nil coverage comes
+// with why.
+func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, trusted func(client.NSEntry) (bool, error), trustedBy string, e2e, disabled bool) (*coverage, string, error) {
 	pos := map[string]int{}
 	for i, e := range blog {
 		pos[e.ID] = i
 	}
-	best, found := -1, false
+	cov := &coverage{best: -1, at: map[string]int{}}
 	forged, untrusted := 0, []string{}
 	for _, e := range entries {
 		if !merge.IsMergeOf(e, branch) {
@@ -629,7 +646,7 @@ func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, t
 		}
 		ok, err := trusted(e)
 		if err != nil {
-			return false, "", err
+			return nil, "", err
 		}
 		if !ok {
 			who := e.Author
@@ -650,24 +667,119 @@ func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, t
 			forged++
 			continue
 		}
-		found = true
-		if i > best {
-			best = i
+		cov.best = max(cov.best, i)
+		for _, s := range e.Entries {
+			if s.Kind != "head" && s.Kind != "tombstone" {
+				continue
+			}
+			if j, seen := cov.at[s.Resource]; !seen || i > j {
+				cov.at[s.Resource] = i
+			}
 		}
 	}
-	if !found {
+	if cov.best < 0 {
 		if len(untrusted) > 0 {
-			return false, "no batch of the branch is by " + trustedBy + " (" + strings.Join(untrusted, ", ") + ")", nil
+			return nil, "no batch of the branch is by " + trustedBy + " (" + strings.Join(untrusted, ", ") + ")", nil
 		}
 		if forged > 0 {
-			return false, "its batches' source.at is not in the branch's chain", nil
+			return nil, "its batches' source.at is not in the branch's chain", nil
 		}
-		return false, "no batch without origin has source.ns = " + branch, nil
+		return nil, "no batch without origin has source.ns = " + branch, nil
 	}
-	if hasDocEntries(blog, best, e2e) {
-		return false, "the branch changed documents after " + blog[best].ID, nil
+	if hasDocEntries(blog, cov.best, e2e) {
+		return nil, "the branch changed documents after " + blog[cov.best].ID, nil
+	}
+	return cov, "", nil
+}
+
+// closing checks §F.6's closing rule once coveredBy found cov in target's
+// log (the base's, or the successor's): every resource with a head,
+// tombstone or batch entry of the branch's own up to the latest counting
+// batch's source.at, other than its keyring at E3, has an entry in a
+// counting batch whose source.at is at or after its last such entry, or a
+// head in target that equals or descends from the branch's revision of it
+// as of that source.at, as after a fast-forward. Otherwise a partial merge
+// or replay (one leaving a resource out, or a later merge that missed a
+// resource changed again since an earlier one) would get unmerged work
+// purged. A resource purged in the branch has nothing left to lose and is
+// left out. why names the first resource not covered.
+func (b *branch) closing(ctx context.Context, target string, cov *coverage) (bool, string, error) {
+	last, rev := map[string]int{}, map[string]string{}
+	note := func(i int, e client.NSEntry) {
+		if (e.Kind == "head" || e.Kind == "tombstone") && !(b.e2e && e.Resource == client.KeyringName) {
+			last[e.Resource], rev[e.Resource] = i, e.Target
+		}
+	}
+	for i, e := range b.log[:cov.best+1] {
+		note(i, e)
+		if e.Kind == "batch" {
+			for _, s := range e.Entries {
+				note(i, s)
+			}
+		}
+	}
+	purged := map[string]bool{}
+	for _, e := range b.log {
+		if e.Kind == "purge" {
+			purged[e.Resource] = true
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(last)) {
+		if purged[name] {
+			continue
+		}
+		if i, ok := cov.at[name]; ok && i >= last[name] {
+			continue
+		}
+		ok, err := b.descends(ctx, target, name, rev[name])
+		if err != nil {
+			return false, "", err
+		}
+		if !ok {
+			return false, fmt.Sprintf("%s, changed by the branch in %s, has no entry in a batch that counts since, and %s's head for it neither equals nor descends from the branch's revision %s",
+				name, b.log[last[name]].ID, target, rev[name]), nil
+		}
 	}
 	return true, "", nil
+}
+
+// descends reports whether target's head for name equals rev or descends
+// from it (rev is in its log). A head that can't be read, or whose range
+// to rev is pruned, doesn't. At E3 ids never carry over from a branch, as
+// merges and rebases re-seal (§F.8.1), so only equality is looked for.
+func (b *branch) descends(ctx context.Context, target, name, rev string) (bool, error) {
+	h, err := b.j.c.Head(ctx, target, name)
+	if err != nil {
+		if _, api := client.AsAPIError(err); api {
+			return false, nil
+		}
+		return false, err
+	}
+	switch {
+	case h.State != client.Live && h.State != client.Tombstoned:
+		return false, nil
+	case h.ID == rev:
+		return true, nil
+	case b.e2e:
+		return false, nil
+	}
+	_, _, err = b.j.c.LogPage(ctx, target, name, h.ID, rev)
+	if err == nil {
+		return true, nil
+	}
+	if _, api := client.AsAPIError(err); api {
+		return false, nil
+	}
+	return false, err
+}
+
+// covered runs coveredBy and closing against target.
+func (b *branch) covered(ctx context.Context, target string, entries []client.NSEntry, trusted func(client.NSEntry) (bool, error), trustedBy string, disabled bool) (bool, string, error) {
+	cov, why, err := coveredBy(entries, b.ns, b.log, trusted, trustedBy, b.e2e, disabled)
+	if cov == nil || err != nil {
+		return false, why, err
+	}
+	return b.closing(ctx, target, cov)
 }
 
 func (b *branch) verifyMerged(ctx context.Context) (bool, string, error) {
@@ -693,7 +805,7 @@ func (b *branch) verifyMerged(ctx context.Context) (bool, string, error) {
 		return false, "", err
 	}
 	listed := func(e client.NSEntry) (bool, error) { return merge.EntryListed(authors, e, disabled), nil }
-	return coveredBy(entries, b.ns, b.log, listed, "a principal in the base's merge.authors", b.e2e, disabled)
+	return b.covered(ctx, b.base, entries, listed, "a principal in the base's merge.authors", disabled)
 }
 
 // sealedPurged is the reason a branch whose successor is a purged sealed
@@ -820,7 +932,7 @@ func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time
 		ok, _, err := b.starKey(ctx, e, succ)
 		return ok, err
 	}
-	return coveredBy(entries, b.ns, b.log, trusted, "a principal in the base's merge.authors or under a current * key of the branch", b.e2e, disabled)
+	return b.covered(ctx, succ, entries, trusted, "a principal in the base's merge.authors or under a current * key of the branch", disabled)
 }
 
 // verifyAbandoned checks an abandoned claim (§F.6): the config write that

@@ -370,3 +370,58 @@ func TestV073SealedSuccessorPurgedVerifiedByHand(t *testing.T) {
 	s.Clock.Advance(2 * day)
 	wantKeep(t, e.sweep(false)["r7"], "sealed successor purged: verify by hand")
 }
+
+// §F.6 closing rule (v0.67), a security fix: in the merged and superseded
+// checks, every resource the branch changed up to the counting batch's
+// source.at must have an entry in a counting batch from then on, or a head
+// in the batch's namespace that equals or descends from the branch's
+// revision. A partial merge or replay doesn't get the rest purged.
+func TestV073EveryChangeMerged(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, nil)
+	mergeOnly := func(c *client.Client, branch string, resources ...string) string {
+		t.Helper()
+		p := must(merge.NewPlan(ctx, c, "matches", branch, merge.Options{Resources: resources}))
+		return must(p.Apply(ctx)).NSID
+	}
+	doc := func(ns, name string) {
+		t.Helper()
+		must(e.c.CreateDoc(ctx, ns, name, map[string]any{"n": 1}))
+	}
+	// r7 changes derby and cup; its merge leaves cup out.
+	e.branch("matches", "r7", map[string]any{"merged": "P1D"})
+	e.edit("r7", "derby", "1-0")
+	doc("r7", "cup")
+	must(merge.Freeze(ctx, e.c, "r7", mergeOnly(e.c, "r7", "derby")))
+	// r8's first merge takes bowl; r8 changes bowl again, and a later
+	// merge takes only plate.
+	e.branch("matches", "r8", map[string]any{"merged": "P1D"})
+	doc("r8", "bowl")
+	mergeOnly(e.c, "r8", "bowl")
+	must(e.c.Append(ctx, "r8", "bowl", must(e.c.Head(ctx, "r8", "bowl")).ID, []any{op("replace", "/n", 2)}))
+	doc("r8", "plate")
+	must(merge.Freeze(ctx, e.c, "r8", mergeOnly(e.c, "r8", "plate")))
+	// r9: mug reached the base by a fast-forward from bob, who isn't in
+	// merge.authors, and the base changed it since; the merge batch that
+	// counts has only jug, but the base's mug descends from r9's.
+	e.branch("matches", "r9", map[string]any{"merged": "P1D"})
+	doc("r9", "mug")
+	doc("r9", "jug")
+	mergeOnly(e.s.Client(t, client.WithAuthor("bob")), "r9", "mug")
+	must(e.c.Append(ctx, "matches", "mug", must(e.c.Head(ctx, "matches", "mug")).ID, []any{op("replace", "/n", 3)}))
+	must(merge.Freeze(ctx, e.c, "r9", mergeOnly(e.c, "r9")))
+	// r10's replay into its successor leaves pot out.
+	e.branch("matches", "r10", map[string]any{"superseded": "P1D"})
+	doc("r10", "pan")
+	doc("r10", "pot")
+	must(merge.Rebase(ctx, e.c, merge.RebaseOptions{Branch: "r10", New: "r10-b", Switch: true, Plan: merge.Options{Resources: []string{"pan"}}}))
+
+	e.s.Clock.Advance(2 * day)
+	ds := e.sweep(false)
+	wantKeep(t, ds["r7"], "merged claim not verified: cup, changed by the branch in ")
+	wantKeep(t, ds["r8"], "merged claim not verified: bowl, changed by the branch in ")
+	wantKeep(t, ds["r10"], "superseded claim not verified: pot, changed by the branch in ")
+	if d := ds["r9"]; d.Action != janitor.ActionPurged || d.Claim != "merged" {
+		t.Fatalf("r9 %+v", d)
+	}
+}
