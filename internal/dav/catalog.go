@@ -1463,8 +1463,9 @@ func (st *reqState) accessRefused(cg *catGraph, src target) error {
 // the source's $access (mkFolder), not into itself or a folder in it,
 // and not where it carries $access or sits under a folder that does
 // (accessRefused). Onto an existing folder or file it is 403 (412 with
-// Overwrite: F, x/net/webdav's); a namespace's directory, a tree's top
-// level and a scratch directory aren't copied.
+// Overwrite: F, x/net/webdav's), and to another case of a sibling's name
+// 409 (§H.2 "Siblings"), either setting a guard (§H.6); a namespace's
+// directory, a tree's top level and a scratch directory aren't copied.
 func (st *reqState) copyFolder(ctx context.Context, t target) error {
 	src, err := st.resolve(ctx, st.path+strings.TrimPrefix(t.path, st.dst))
 	if err != nil {
@@ -1472,6 +1473,17 @@ func (st *reqState) copyFolder(ctx context.Context, t target) error {
 	}
 	if src.kind != kFolder {
 		return fail(http.StatusForbidden, "%s isn't a folder of a file tree, the only folders copied (§H.5): a namespace's directory, a tree's top level and an app's temporary folder aren't", src.path)
+	}
+	if t.path == st.dst {
+		switch t.kind {
+		case kFolder, kDoc, kRaw, kPlacement:
+			// Refused below: the DELETE that follows (rclone's) is
+			// guarded, as after a refused PUT (saveTo).
+			st.saveTo = t.path
+		}
+	}
+	if (t.kind == kFolder || t.kind == kPlacement) && t.otherCase {
+		return otherCase(t)
 	}
 	switch t.kind {
 	case kMissing:

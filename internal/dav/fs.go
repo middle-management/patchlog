@@ -356,12 +356,17 @@ func (st *reqState) replaced(ctx context.Context, t target) error {
 	return fail(http.StatusConflict, "%s held %s/%s when you opened it, and %s: it was deleted, moved or replaced since (§H.4), so your save isn't written over what is there; reload it", t.path, ns, name, now)
 }
 
-// otherCase refuses a write to t, a tree's file named by another case of
-// its name (§H.2 "Siblings"): a client whose file system tells case
-// apart (rclone, davfs2) copying README.md and readme.md would otherwise
-// write one over the other. A client that ignores case uses the name as
-// listed, or as it read the file under (spelledSo).
+// otherCase refuses a write to t, a tree's file or folder named by
+// another case of its name (§H.2 "Siblings"): a client whose file system
+// tells case apart (rclone, davfs2) copying README.md and readme.md would
+// otherwise write one over the other. A client that ignores case uses a
+// file's name as listed, or as it read the file under (spelledSo); a
+// folder's is refused whatever the request carries, a file never written
+// over a folder.
 func otherCase(t target) error {
+	if t.kind == kFolder {
+		return fail(http.StatusConflict, "%s: %q is a folder here, and names in this tree compare without case (§H.2), so %q isn't made beside it; use another name", t.path, t.title, t.base)
+	}
 	return fail(http.StatusConflict, "%s: %q is a file here, and names in this tree compare without case (§H.2), so %q isn't made beside it, nor written over it; write it as %q, or use another name", t.path, t.title, t.base, t.title)
 }
 
@@ -770,8 +775,13 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 	if flag&os.O_TRUNC != 0 {
 		// A write (PUT, the destination of a COPY, a LOCK of a new name):
 		// buffered, and committed on close. A COPY's file refused sets a
-		// guard, as a PUT's does (saveTo, §H.6).
-		if st.method == "COPY" && t.path == st.dst && t.isDoc() {
+		// guard, as a PUT's does (saveTo, §H.6); so does a PUT or COPY
+		// refused onto a tree's folder, which the DELETE that follows
+		// (rclone's) would otherwise delete.
+		switch {
+		case st.method == "COPY" && t.path == st.dst && (t.isDoc() || t.kind == kFolder):
+			st.saveTo = t.path
+		case st.method == "PUT" && t.path == st.path && t.kind == kFolder:
 			st.saveTo = t.path
 		}
 		switch {
@@ -779,6 +789,10 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 			return nil, errNotExist
 		case t.kind == kBadName:
 			return nil, st.badName(t)
+		case t.kind == kFolder && t.otherCase:
+			// Another case of a folder's name (§H.2 "Siblings"): 409,
+			// naming the folder, not the 403 or 405 of its own name.
+			return nil, otherCase(t)
 		case t.isDir() && (st.method == "COPY" || st.method == "MOVE"):
 			// A file copied or moved onto a folder (§H.5): 403, not the
 			// 405 of a PUT to one; Overwrite: F is x/net/webdav's 412.
@@ -1072,6 +1086,12 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 		}
 		return err
 	case kFolder:
+		// A folder a PUT or COPY was refused onto, or a write to another
+		// case of its name (§H.2 "Siblings"), is guarded as a file is
+		// (§H.6).
+		if err := st.afterRefusedSave(ctx, t); err != nil {
+			return err
+		}
 		return st.deleteFolder(ctx, t)
 	}
 	if !st.scratchRemove(t.path) {
@@ -1080,8 +1100,9 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 	return nil
 }
 
-// afterRefusedSave refuses a DELETE of the document's file t that follows
-// the principal's refused save of it, using up one guard (refusedSaveFor,
+// afterRefusedSave refuses a DELETE of t, a document's file or a tree's
+// folder, that follows the principal's refused save to its path, using up
+// one guard (refusedSaveFor,
 // §H.6), unless it names the revision it deletes, which passes and leaves
 // the guards. A document in a frozen namespace isn't deleted anyway: its
 // DELETE gets the core's refusal (§8.4), the guards left; whether it is
@@ -1106,8 +1127,12 @@ func (st *reqState) afterRefusedSave(ctx context.Context, t target) error {
 	if left > 0 {
 		again = fmt.Sprintf("it follows %d refused saves, each refusing one DELETE: delete it %d more times to delete it", left+1, left+1)
 	}
-	return fail(http.StatusConflict, "%s wasn't deleted: this DELETE follows a refused save of the same file (%d, moments ago), and some clients (rclone) delete a file whose upload failed; %s",
-		t.path, r.status, again)
+	what := "file"
+	if t.kind == kFolder {
+		what = "path, a folder's"
+	}
+	return fail(http.StatusConflict, "%s wasn't deleted: this DELETE follows a refused save of the same %s (%d, moments ago), and some clients (rclone) delete a file whose upload failed; %s",
+		t.path, what, r.status, again)
 }
 
 func (d *davFS) Rename(ctx context.Context, oldName, newName string) error {
@@ -1136,7 +1161,9 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		return err
 	}
 	defer st.changed()
-	if dst.kind == kPlacement && dst.otherCase && !(src.ns == dst.ns && src.node == dst.node) && !st.spelledSo(dst) {
+	if dst.otherCase && !(src.ns == dst.ns && src.node == dst.node) && (dst.kind == kFolder || dst.kind == kPlacement && !st.spelledSo(dst)) {
+		// Another case of a sibling's name, file or folder (§H.2
+		// "Siblings"): refused, setting a guard (§H.6).
 		st.onto = dst.path
 		return otherCase(dst)
 	}

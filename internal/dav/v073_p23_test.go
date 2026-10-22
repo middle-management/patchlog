@@ -777,3 +777,60 @@ func TestV073RawRestoreRefused(t *testing.T) {
 		t.Fatalf("x.txt %q", data)
 	}
 }
+
+// Files and folders in a folder share one set of names (§H.2
+// "Siblings"): a PUT, COPY or MOVE to another case of a folder's name is
+// 409, naming the folder, and sets the guard (§H.6) as one to another
+// case of a file's does, so that rclone's cleanup DELETE, which matches
+// the folder whatever its case, doesn't delete it; so does a PUT or COPY
+// refused onto the folder's own name, and a folder copied or moved to
+// another case of a sibling's name (GW-12).
+func TestV073CaseVariantOfFolderGuarded(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		method, src, dst, sibling string
+	}{
+		{"COPY", "/cat/Season/derby.json", "/cat/EMPTY", "Empty"},
+		{"MOVE", "/cat/Season/derby.json", "/cat/EMPTY", "Empty"},
+		{"PUT", "", "/cat/EMPTY", "Empty"},
+		{"COPY", "/cat/Empty", "/cat/SEASON", "Season"},
+		{"MOVE", "/cat/Empty", "/cat/SEASON", "Season"},
+	} {
+		what := c.method + " " + c.src + " to " + c.dst
+		e := treeEnv(t)
+		he, _ := e.load("cat", "empty")
+		hs, _ := e.load("cat", "season")
+		hd, _ := e.load("matches", "derby")
+		var r resp
+		if c.method == "PUT" {
+			r = e.do("PUT", c.dst, `{"n": 1}`)
+		} else {
+			r = e.do(c.method, c.src, "", "Destination", c.dst)
+		}
+		if r.status != 409 || !strings.Contains(r.body, `"`+c.sibling+`" is a folder`) {
+			t.Fatalf("%s, another case of folder %s: %d %q", what, c.sibling, r.status, r.body)
+		}
+		r = e.expect(e.do("DELETE", c.dst, ""), 409, "rclone's cleanup DELETE after the refused "+what)
+		if !strings.Contains(r.body, "refused save") {
+			t.Fatalf("DELETE after the refused %s: %s", what, r.body)
+		}
+		if now, _ := e.load("cat", "empty"); now.ID != he.ID {
+			t.Fatalf("after %s and its cleanup DELETE, folder Empty is %v", what, now.State)
+		}
+		if now, _ := e.load("cat", "season"); now.ID != hs.ID {
+			t.Fatalf("after %s and its cleanup DELETE, folder Season is %v", what, now.State)
+		}
+		e.expectLive("matches", "derby", hd, "derby after "+what)
+	}
+
+	e := treeEnv(t)
+	he, _ := e.load("cat", "empty")
+	e.expect(e.do("COPY", "/cat/Season/derby.json", "", "Destination", "/cat/Empty"), 403, "COPY of a file onto a folder")
+	e.expect(e.do("DELETE", "/cat/Empty", ""), 409, "the cleanup DELETE after the refused COPY")
+	e.expect(e.do("PUT", "/cat/Empty", "x"), 405, "PUT onto a folder")
+	e.expect(e.do("DELETE", "/cat/Empty", ""), 409, "the cleanup DELETE after the refused PUT")
+	if now, _ := e.load("cat", "empty"); now.ID != he.ID {
+		t.Fatalf("folder Empty is %v", now.State)
+	}
+	e.expect(e.do("DELETE", "/cat/Empty", ""), 204, "DELETE once the guards are used up")
+}
