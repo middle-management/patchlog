@@ -454,3 +454,65 @@ func TestV073CheckFragment(t *testing.T) {
 		t.Error("idn-email not asserted")
 	}
 }
+
+// CIS-13, invariant 3: a revision path's fragment is percent-decoded
+// before it is read, as v0.55 and the library read it (§6.1, RFC 6901
+// section 6), so a schema stored with "#%2F$defs%2Fzip" still loads, its
+// pointer is followed, and the revision it reaches is still referenced.
+func TestV073EncodedSlashFragment(t *testing.T) {
+	ref := pathAddress + "#%2F$defs%2Fzip"
+	tg, err := ParseRefTarget(ref)
+	if err != nil || tg.Ref.Path() != pathAddress || tg.Anchor != "" || tg.Pointer.String() != "/$defs/zip" {
+		t.Fatalf("ParseRefTarget = %+v, %v", tg, err)
+	}
+	if tg, err := ParseRefTarget(pathLib + "#%6Eum"); err != nil || tg.Anchor != "num" {
+		t.Fatalf("encoded name: %+v, %v", tg, err)
+	}
+	p := "/r/schemas/old/rev/" + rev('q')
+	doc := j(`{` + d073 + `,"type":"object","properties":{"zip":{"$ref":"` + ref + `"}}}`)
+	if err := CheckSchemaDocument(doc, p); err != nil {
+		t.Errorf("stored: %v", err)
+	}
+	if err := writeCheck(`{` + d073 + `,"type":"object","properties":{"zip":{"$ref":"` + ref + `"}}}`); err != nil {
+		t.Errorf("written: %v", err)
+	}
+	s := newStore()
+	s.docs[p] = doc
+	v := NewValidator()
+	if err := v.Validate(j(`{"$schema":"`+p+`","zip":"12345"}`), s.load); err != nil {
+		t.Errorf("valid: %v", err)
+	}
+	var ve *ValidationError
+	if err := v.Validate(j(`{"$schema":"`+p+`","zip":"x"}`), s.load); !errors.As(err, &ve) {
+		t.Errorf("the pointer isn't followed: %v", err)
+	}
+	if refs := Refs(doc); len(refs) != 1 || refs[0].Path() != pathAddress {
+		t.Errorf("Refs = %+v", refs)
+	}
+	if locs := RefLocations(doc); len(locs) != 1 || locs[0].Ref.Path() != pathAddress || locs[0].Raw != ref {
+		t.Errorf("RefLocations = %+v", locs)
+	}
+}
+
+// Refs and RefLocations fail closed: a $ref whose fragment a check refuses
+// still names its revision, so in_use counting, the index and bundle
+// renames never lose it (§6.1).
+func TestV073RefsFailClosed(t *testing.T) {
+	for _, frag := range []string{"#$defs/zip", "#%zz", "#a b", "#%FF"} {
+		ref := pathAddress + frag
+		if _, err := ParseRefTarget(ref); err == nil {
+			t.Fatalf("%s: parsed", frag)
+		}
+		doc := map[string]any{"$schema": Dialect2020, "items": map[string]any{"$ref": ref}}
+		if refs := Refs(doc); len(refs) != 1 || refs[0].Path() != pathAddress {
+			t.Errorf("%s: Refs = %+v", frag, refs)
+		}
+		if locs := RefLocations(doc); len(locs) != 1 || locs[0].Ref.Path() != pathAddress || locs[0].Pointer.String() != "/items/$ref" {
+			t.Errorf("%s: RefLocations = %+v", frag, locs)
+		}
+	}
+	doc := j(`{` + d073 + `,"$ref":"#/$defs/a","$defs":{"a":{"$ref":"/r/bad"}}}`)
+	if refs, locs := Refs(doc), RefLocations(doc); len(refs) != 0 || len(locs) != 0 {
+		t.Errorf("not revision paths: %+v %+v", refs, locs)
+	}
+}

@@ -296,6 +296,15 @@ func loc(p pointer.Pointer) string {
 	return p.String()
 }
 
+// refRevision returns the schema revision a $ref string names, whatever
+// its fragment says: a fragment a check would refuse never hides the
+// revision from reference counting (in_use, the index, bundle renames),
+// which fails closed.
+func refRevision(s string) (Ref, bool) {
+	docPart, _, _ := strings.Cut(s, "#")
+	return ParseRef(docPart)
+}
+
 // Refs returns the revision paths directly referenced by a schema document via
 // $ref (fragments dropped), deduplicated and sorted, for the referenced-schema index (§6.1).
 func Refs(schemaDoc any) []Ref {
@@ -308,7 +317,7 @@ func Refs(schemaDoc any) []Ref {
 			return
 		}
 		if r, ok := obj["$ref"].(string); ok {
-			if ref, _, err := SplitRef(r); err == nil && !seen[ref.Path()] {
+			if ref, ok := refRevision(r); ok && !seen[ref.Path()] {
 				seen[ref.Path()] = true
 				out = append(out, ref)
 			}
@@ -345,9 +354,10 @@ type RefAt struct {
 }
 
 // RefLocations returns every $ref at a schema position of a schema document
-// (§6.1) that names a schema revision path (same-document fragments don't
-// count), in document order with members sorted. $ref strings in const,
-// enum, default, examples or any other non-schema position are not found.
+// (§6.1) that names a schema revision path, whatever its fragment
+// (same-document fragments don't count), in document order with members
+// sorted. $ref strings in const, enum, default, examples or any other
+// non-schema position are not found.
 func RefLocations(schemaDoc any) []RefAt {
 	var out []RefAt
 	var walk func(s any, at pointer.Pointer)
@@ -356,8 +366,8 @@ func RefLocations(schemaDoc any) []RefAt {
 		if !ok {
 			return
 		}
-		if r, ok := obj["$ref"].(string); ok && !strings.HasPrefix(r, "#") {
-			if ref, _, err := SplitRef(r); err == nil {
+		if r, ok := obj["$ref"].(string); ok {
+			if ref, ok := refRevision(r); ok {
 				out = append(out, RefAt{Pointer: child(at, "$ref"), Raw: r, Ref: ref})
 			}
 		}

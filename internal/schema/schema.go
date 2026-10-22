@@ -70,13 +70,17 @@ type RefTarget struct {
 
 // ParseRefTarget parses a foreign $ref value: a schema revision path
 // optionally followed by "#" and a fragment (§6.1), written as an RFC 3986
-// URI fragment: only fragment characters and well-formed percent-encodings.
-// A fragment that is empty or starts with "/" is percent-decoded, must be
-// valid UTF-8, and is read as a JSON Pointer (RFC 6901, so "~" only as "~0"
-// or "~1"). Any other is a plain name, which compiling resolves against the
-// anchors of the revision. A malformed path or fragment is a *RefError
-// (schema_ref); a plain name outside the grammar of anchors names nothing,
-// which makes the schema invalid, a *SchemaError.
+// URI fragment: only fragment characters and well-formed percent-encodings
+// that decode to valid UTF-8. The fragment is percent-decoded before it is
+// read, as RFC 6901 section 6 reads a pointer from a fragment, as the
+// library resolves one, and as v0.55 read every fragment, so a schema it
+// stored with "#%2F$defs%2Fk" still names /$defs/k (§6.1). Decoded, one
+// that is empty or starts with "/" is a JSON Pointer (RFC 6901, so "~"
+// only as "~0" or "~1"); any other is a plain name, which compiling
+// resolves against the anchors of the revision. A malformed path or
+// fragment is a *RefError (schema_ref); a plain name outside the grammar
+// of anchors names nothing, which makes the schema invalid, a
+// *SchemaError.
 func ParseRefTarget(s string) (RefTarget, error) {
 	docPart, rawFrag, hasFrag := strings.Cut(s, "#")
 	ref, ok := ParseRef(docPart)
@@ -89,15 +93,15 @@ func ParseRefTarget(s string) (RefTarget, error) {
 	if !validURIFragment(rawFrag) {
 		return RefTarget{}, &RefError{Msg: fmt.Sprintf("$ref %q: fragment is not a valid URI fragment", s)}
 	}
-	if rawFrag != "" && rawFrag[0] != '/' {
-		if !anchorName.MatchString(rawFrag) {
-			return RefTarget{}, &SchemaError{Msg: fmt.Sprintf("$ref %q: fragment %q is neither a JSON Pointer nor a name an anchor can define", s, rawFrag)}
-		}
-		return RefTarget{Ref: ref, Anchor: rawFrag}, nil
-	}
 	dec, uerr := url.PathUnescape(rawFrag)
 	if uerr != nil || !utf8.ValidString(dec) {
 		return RefTarget{}, &RefError{Msg: fmt.Sprintf("$ref %q: fragment is not valid percent-encoded UTF-8", s)}
+	}
+	if dec != "" && dec[0] != '/' {
+		if !anchorName.MatchString(dec) {
+			return RefTarget{}, &SchemaError{Msg: fmt.Sprintf("$ref %q: fragment %q is neither a JSON Pointer nor a name an anchor can define", s, rawFrag)}
+		}
+		return RefTarget{Ref: ref, Anchor: dec}, nil
 	}
 	frag, perr := pointer.Parse(dec)
 	if perr != nil {

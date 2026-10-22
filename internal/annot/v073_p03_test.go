@@ -8,6 +8,7 @@ import (
 var (
 	pathAnchorLib  = "/r/s/anchorlib/rev/" + rev('p')
 	pathAnchorUser = "/r/s/anchoruser/rev/" + rev('q')
+	pathEncodedRef = "/r/s/encodedref/rev/" + rev('s')
 )
 
 func init() {
@@ -24,6 +25,13 @@ func init() {
 			"$schema": {"type": "string"},
 			"tag":  {"$ref": "` + pathAnchorLib + `#tag"},
 			"link": {"$ref": "` + pathAnchorLib + `#link"}
+		}
+	}`
+	store[pathEncodedRef] = `{` + d2020 + `,
+		"type": "object",
+		"properties": {
+			"$schema": {"type": "string"},
+			"link": {"$ref": "` + pathAnchorLib + `#%2F$defs%2Flink"}
 		}
 	}`
 }
@@ -80,5 +88,19 @@ func TestV073PatternTranslation(t *testing.T) {
 	refs, err := FindRefsWith(j(`{"patternProperties": {"^\\u00f1": {"x-ref": {}}}}`), "", j(`{"ña":"/r/m/x"}`), loader)
 	if err != nil || len(refs) != 1 {
 		t.Errorf("FindRefs = %+v, %v", refs, err)
+	}
+}
+
+// CIS-13, invariant 3: a revision path's fragment is percent-decoded before
+// it is read, as v0.55 read it (§6.1), so the static x-ref walk follows
+// "#%2F$defs%2Flink" to /$defs/link of a schema stored that way.
+func TestV073EncodedSlashFragment(t *testing.T) {
+	doc := j(`{"$schema":"` + pathEncodedRef + `","link":"/r/m/x/rev/` + rev('r') + `"}`)
+	refs, err := FindRefs(doc, loader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || refs[0].Pointer != "/link" || !refs[0].Pinned || refs[0].SchemaPath != pathAnchorLib+"#/$defs/link" {
+		t.Errorf("FindRefs = %+v", refs)
 	}
 }
