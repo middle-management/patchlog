@@ -1226,10 +1226,11 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			}
 		}
 		if cfg != nil && derived.InfoOf(cfg.Value).Protected() {
-			// Raised to sealed or e2e (levels only rise, §E.2.1): the values
-			// listings took from its items go, titles (§B.5) and implicit
-			// placements' born (§B.9), which Apply no longer reads (§E.2.2,
-			// §E.2.6).
+			// Sealed or e2e as of this batch, maybe raised by it (levels
+			// only rise, §E.2.1): the values listings took from its items
+			// go, titles (§B.5) and implicit placements' born (§B.9), which
+			// Apply no longer reads (§E.2.2, §E.2.6). Once gone, a later
+			// config entry (a rotation) changes nothing.
 			if _, err := tx.ExecContext(ctx, `UPDATE items SET title = NULL WHERE ns = ? AND title IS NOT NULL`, ns); err != nil {
 				return nil, err
 			}
