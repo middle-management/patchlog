@@ -26,26 +26,35 @@ func (e *AccessError) Error() string {
 	return "import: " + strings.Join(e.Problems, "; ")
 }
 
-// targetAccess is the protection of an existing namespace document, with
-// its encryption.level as served ("sealed" when the document is a JWE).
+// targetAccess is the protection of a namespace document as a target
+// (§2.1), with its encryption.level ("sealed" when served as a JWE): as
+// a source's, except that a sealed namespace whose read is public is
+// public, since anyone reads what lands there.
 func targetAccess(level string, doc map[string]any) string {
 	switch {
 	case level == "e2e":
 		return AccessE2E
-	case level == "sealed":
-		return AccessSealed
 	case doc["read"] == "public":
 		return AccessPublic
+	case level == "sealed":
+		return AccessSealed
 	}
 	return AccessPrivate
 }
 
-// docAccess is the protection a namespace document would give.
-func docAccess(doc any) string {
+// docLevel is a namespace document's encryption.level, "" for none.
+func docLevel(doc any) string {
 	m, _ := doc.(map[string]any)
 	enc, _ := m["encryption"].(map[string]any)
 	lv, _ := enc["level"].(string)
-	return targetAccess(lv, m)
+	return lv
+}
+
+// docAccess is the protection a namespace document would give as a
+// target.
+func docAccess(doc any) string {
+	m, _ := doc.(map[string]any)
+	return targetAccess(docLevel(doc), m)
 }
 
 // e2eEpochs lists the epochs the lines of an e2e namespace are sealed
@@ -102,32 +111,43 @@ func (im *importer) e2eEpochs(ns string) (lo, hi int, err error) {
 	return lo, hi, nil
 }
 
+// targetInfo is what checkAccess reads of an existing namespace.
+type targetInfo struct {
+	access string // its protection as a target (§2.1)
+	sealed bool   // at E2
+	epoch  int    // encryption.epoch, where it has encryption
+	nonce  bool   // requires nonces (§C.7)
+	// unread is why a sealed namespace's document can't be read (no
+	// keys), so neither its read nor its nonce setting is known.
+	unread error
+}
+
 // existing reads a target namespace's protection and whether it requires
-// nonces (§C.7), or reports it missing.
-func (im *importer) existing(ctx context.Context, ns string) (access string, epoch int, nonce, ok bool, err error) {
+// nonces (§C.7), or reports it missing. A sealed one's document is read
+// with the importer's keys, for its read (§2.1).
+func (im *importer) existing(ctx context.Context, ns string) (ti targetInfo, ok bool, err error) {
 	lv, err := im.c.EncryptionLevel(ctx, ns)
 	if client.IsNotFound(err) || client.IsGone(err) {
-		return "", 0, false, false, nil
+		return ti, false, nil
 	}
 	if err != nil {
-		return "", 0, false, false, err
-	}
-	if lv == "sealed" {
-		// Its document needs keys; its level is enough, and generated
-		// patch sets get a fresh $nonce there anyway.
-		return AccessSealed, 0, false, true, nil
+		return ti, false, err
 	}
 	doc, ok, err := im.namespaceDoc(ctx, ns)
-	if err != nil || !ok {
-		return "", 0, false, ok, err
+	if lv == "sealed" && errors.Is(err, client.ErrNoKeys) {
+		return targetInfo{access: AccessSealed, sealed: true, unread: err}, true, nil
 	}
+	if err != nil || !ok {
+		return ti, ok, err
+	}
+	ti = targetInfo{access: targetAccess(lv, doc), sealed: lv == "sealed", nonce: docNonce(doc)}
 	if enc, _ := doc["encryption"].(map[string]any); enc != nil {
-		epoch = 1
+		ti.epoch = 1
 		if f, ok := enc["epoch"].(float64); ok {
-			epoch = int(f)
+			ti.epoch = int(f)
 		}
 	}
-	return targetAccess(lv, doc), epoch, docNonce(doc), true, nil
+	return ti, true, nil
 }
 
 // checkAccess checks every target against its source's access level
@@ -179,10 +199,14 @@ func (im *importer) checkAccess(ctx context.Context) error {
 	for _, tns := range names {
 		tg := targets[tns]
 		src := im.h.AccessOf(tg.src)
-		have, epoch, nonce, ok, err := im.existing(ctx, tns)
+		ti, ok, err := im.existing(ctx, tns)
+		if err == nil {
+			err = ti.unread
+		}
 		if err != nil {
 			return fmt.Errorf("import: target namespace %s: %w", tns, err)
 		}
+		have, epoch, nonce, sealed := ti.access, ti.epoch, ti.nonce, ti.sealed
 		if src == AccessE2E {
 			// Ciphertext, verbatim (§G.5.1): only an e2e target of the
 			// same name can take it. No override: it can't work otherwise.
@@ -220,16 +244,23 @@ func (im *importer) checkAccess(ctx context.Context) error {
 				}
 			}
 			im.create[tns] = doc
-			have, nonce = docAccess(doc), docNonce(doc)
+			have, nonce, sealed = docAccess(doc), docNonce(doc), docLevel(doc) == "sealed"
 		}
-		im.sealedT[tns] = have == AccessSealed
-		sealedTarget[tns] = have == AccessSealed
+		im.sealedT[tns] = sealed
+		sealedTarget[tns] = sealed
 		nonces[tns] = nonce
+		// Ranks apply only between namespaces (§2.1): a bundle of this
+		// deployment's namespace back into itself isn't ranked.
+		self := im.local && tns == tg.src
 		switch {
 		case have == AccessE2E:
 			problems = append(problems, fmt.Sprintf("%s is e2e: importing plaintext into it means sealing each patch set with its keys in a client (§G.5.1), which this importer doesn't do", tns))
-		case (src == AccessPrivate || src == AccessSealed) && have == AccessPublic:
-			msg := fmt.Sprintf("%s is public, less protected than its source %s (%s): a private or sealed namespace's content goes only into a private or sealed one (§G.5.1)", tns, tg.src, src)
+		case (src == AccessPrivate || src == AccessSealed) && have == AccessPublic && !self:
+			what := "public"
+			if sealed {
+				what = "sealed with read public, which ranks public as a target (§2.1)"
+			}
+			msg := fmt.Sprintf("%s is %s, less protected than its source %s (%s): a private or sealed namespace's content goes only into a private or sealed one (§G.5.1)", tns, what, tg.src, src)
 			if !im.opt.AllowLessProtected {
 				problems = append(problems, msg+"; override explicitly to import it anyway")
 				continue
@@ -256,18 +287,18 @@ func (im *importer) checkAccess(ctx context.Context) error {
 		if _, ok := targets[u]; ok {
 			continue
 		}
-		have, _, nonce, ok, err := im.existing(ctx, u)
+		ti, ok, err := im.existing(ctx, u)
 		if err != nil {
 			return fmt.Errorf("import: upstream namespace %s: %w", u, err)
 		}
-		if ok && (have == AccessSealed || nonce) {
+		if ok && (ti.sealed || ti.nonce) {
 			im.sealedT[u] = true
 			continue
 		}
 		if ok {
-			if th, _, _, tok, err := im.existing(ctx, d.tns); err != nil {
+			if tt, tok, err := im.existing(ctx, d.tns); err != nil {
 				return fmt.Errorf("import: target namespace %s: %w", d.tns, err)
-			} else if tok && th == AccessSealed {
+			} else if tok && tt.sealed {
 				im.sealedT[u] = true
 			}
 		}

@@ -657,3 +657,56 @@ func TestV073RenameSuccessor(t *testing.T) {
 		}
 	}
 }
+
+// As a target, a sealed namespace whose read is public ranks public
+// (§2.1): the importer reads its read with its keys, and refuses a private
+// or sealed source into it at step 1 unless overridden. Ranks apply only
+// between namespaces: a bundle of a namespace back into itself isn't
+// ranked (§G.5.1, MF-52).
+func TestV073SealedPublicTargetRanksPublic(t *testing.T) {
+	t.Parallel()
+	src := newEncDeployment(t, stagingOrigin)
+	src.ns("s", map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}})
+	must(src.c.Create(ctx, "s", "a", append(client.GenesisPatches(map[string]any{"v": marker}), op("add", "/$nonce", seal.NewNonce()))))
+	var sb bytes.Buffer
+	_, _, err := bundle.Export(ctx, src.c, &sb, bundle.ExportOptions{Select: []string{"s"}, Plaintext: true})
+	noErr(t, err)
+	priv := newDeployment(t, stagingOrigin)
+	priv.ns("p", map[string]any{"read": "grant"})
+	priv.create("p", "a", map[string]any{"v": marker})
+	var pb bytes.Buffer
+	_, _, err = bundle.Export(ctx, priv.c, &pb, bundle.ExportOptions{Select: []string{"p"}, Plaintext: true})
+	noErr(t, err)
+
+	sealedPublic := map[string]any{"read": "public", "encryption": map[string]any{"level": "sealed"}}
+	dst := newEncDeployment(t, cmsOrigin)
+	dst.ns("s", sealedPublic)
+	dst.ns("p", sealedPublic)
+	importErr(t, dst, sb.Bytes(), bundle.ImportOptions{}, "s is sealed with read public, which ranks public as a target")
+	importErr(t, dst, pb.Bytes(), bundle.ImportOptions{}, "p is sealed with read public, which ranks public as a target")
+	if h := dst.head("s", "a"); h.State != client.NotFound {
+		t.Fatal("a refused import wrote")
+	}
+	rep := importB(t, dst, sb.Bytes(), bundle.ImportOptions{AllowLessProtected: true})
+	if !strings.Contains(strings.Join(rep.Notes, " "), "overrode") || dst.doc("s", "a")["v"] != marker {
+		t.Fatalf("override: %v", rep.Notes)
+	}
+	// With read grant it ranks sealed, as its source.
+	dst2 := newEncDeployment(t, cmsOrigin)
+	dst2.ns("s", map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}})
+	importB(t, dst2, sb.Bytes(), bundle.ImportOptions{})
+	// A sealed public namespace's own bundle, back into it.
+	dst.ns("own", sealedPublic)
+	must(dst.c.Create(ctx, "own", "a", append(client.GenesisPatches(map[string]any{"v": 1.0}), op("add", "/$nonce", seal.NewNonce()))))
+	var ob bytes.Buffer
+	_, osum, err := bundle.Export(ctx, dst.c, &ob, bundle.ExportOptions{Select: []string{"own"}, Plaintext: true})
+	noErr(t, err)
+	if osum.Header.Access["own"] != bundle.AccessSealed {
+		t.Fatalf("source access %v", osum.Header.Access)
+	}
+	if rep := importB(t, dst, ob.Bytes(), bundle.ImportOptions{}); rep.Doc("own/a").Class != "present" {
+		t.Fatalf("own bundle: %+v", rep.Doc("own/a"))
+	}
+	// Into another namespace of the same deployment, it is ranked.
+	importErr(t, dst, ob.Bytes(), bundle.ImportOptions{NSMap: map[string]string{"own": "p"}}, "less protected")
+}
