@@ -201,7 +201,12 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			refused = status
 		}
 	}
-	g, _ := ix.checker.Decode(bearer(r)) // nil: no usable grant
+	// nil: no usable grant. One over grantSize or rulesPerGrant is 413
+	// at the first namespace that doesn't ignore it (§C.8), before its ns
+	// check: a public one ignores it.
+	g, derr := ix.checker.Decode(bearer(r))
+	var over *grantcheck.LimitError
+	errors.As(derr, &over)
 	for _, ns := range ix.refsNamespaces() {
 		if _, ok := reached[ns]; !ok || ix.keys.Skipped(ns) != "" {
 			continue
@@ -215,6 +220,9 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 		// A private namespace the grant names verifies it (access): a
 		// refusal there is 401 if it doesn't verify, 403 once it does.
 		var ae *grant.AuthError
+		if errors.As(err, &ae) && over != nil {
+			return nil, over
+		}
 		if errors.As(err, &ae) {
 			refuse(ae.Status)
 			verified = verified || (ae.Status != 401 && g != nil && g.NamesNS(ns))
@@ -371,6 +379,9 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	}
 	rd, err := ix.refsReader(ctx, r, reached)
 	if err != nil {
+		if writeLimit(w, err) {
+			return
+		}
 		var ae *grant.AuthError
 		if errors.As(err, &ae) {
 			code := "forbidden"

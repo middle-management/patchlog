@@ -17,6 +17,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/svcedge"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -181,6 +182,20 @@ type access struct {
 	gs     string // subject-set id over marker (private only)
 }
 
+// writeLimit answers a grant over grantSize or rulesPerGrant, which the
+// checker decodes as a *grantcheck.LimitError, as the origin answers it:
+// 413, code limit, naming the limit (§C.8), as the tree and catalog
+// services do (§C.6); a public namespace's reads ignore the grant, so
+// this comes up only where one is used. It reports whether it answered.
+func writeLimit(w http.ResponseWriter, err error) bool {
+	var le *grantcheck.LimitError
+	if !errors.As(err, &le) {
+		return false
+	}
+	svcedge.Limit(le.Limit, le.Measured, le.Max).Write(w)
+	return true
+}
+
 func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*access, error) {
 	cfg, err := ix.checker.Config(ctx, ns)
 	if err != nil {
@@ -278,6 +293,9 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		}
 	}
 	if err != nil {
+		if writeLimit(w, err) {
+			return
+		}
 		var ae *grant.AuthError
 		if errors.As(err, &ae) {
 			code := "forbidden"
