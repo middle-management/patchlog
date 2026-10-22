@@ -782,10 +782,11 @@ func TestStored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.HasProof() || p.Sealed() || p.ID() != g.ID() || len(p.Blocks) != 2 {
+	// The stored form is the authority block alone (§C.8, v0.63).
+	if p.HasProof() || p.Sealed() || p.ID() != g.ID() || len(p.Blocks) != 1 {
 		t.Fatal("stored parse")
 	}
-	if strings.Join(p.RevocationIDs(), ",") != strings.Join(g.RevocationIDs(), ",") {
+	if strings.Join(p.RevocationIDs(), ",") != g.RevocationIDs()[0] {
 		t.Fatal("stored revocation ids")
 	}
 	if _, err := p.Narrow(map[string]any{"via": "x"}); err == nil {
@@ -797,10 +798,10 @@ func TestStored(t *testing.T) {
 	if _, err := ParseStored(tokenBytes(t, g.Encode())); err == nil {
 		t.Fatal("token accepted as stored form")
 	}
-	// Block signatures are still checked.
-	bad := replaceOnce(t, append([]byte(nil), s...), "svc", "svd")
-	if _, err := ParseStored(bad); err == nil {
-		t.Fatal("tampered stored form accepted")
+	// The authority block's signature is still checked, under its key.
+	bad, err := ParseStored(replaceOnce(t, append([]byte(nil), s...), "user:bob", "user:bab"))
+	if err != nil || !p.SignedBy(f.keys[0].Pub) || bad.SignedBy(f.keys[0].Pub) {
+		t.Fatal("tampered stored form verifies")
 	}
 }
 

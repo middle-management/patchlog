@@ -203,3 +203,44 @@ func TestV073RevocationByGrantID(t *testing.T) {
 		t.Fatalf("revocation ids %v", r)
 	}
 }
+
+// The stored form is the authority block alone, a SignedBlock (§C.3, §C.8,
+// v0.63). Rows stored before, whole chains without proof, still read, as
+// their authority block.
+func TestV073StoredAuthorityBlock(t *testing.T) {
+	f := newFixture(t, nil)
+	n, _ := mustMint(t, f, nil).Narrow(map[string]any{"via": "svc:x", "rules": []any{map[string]any{"op": "test", "path": "/action", "value": "read"}}})
+	s := n.Stored()
+	if string(s) != string(n.c.blocks[0].encode()) || strings.Contains(string(s), "svc:x") {
+		t.Fatal("the stored form is the authority SignedBlock")
+	}
+	for _, parse := range []func([]byte) (*Grant, error){ParseStoredBlock, ParseStored} {
+		p, err := parse(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(p.Blocks) != 1 || p.ID() != n.ID() || p.HasProof() || !p.SignedBy(f.keys[0].Pub) {
+			t.Fatal("stored authority block")
+		}
+		if sb := p.SignedBlocks(); len(sb) != 1 || string(sb[0]) != string(s) {
+			t.Fatal("signed blocks of the stored form")
+		}
+	}
+	legacy := (&container{blocks: n.c.blocks}).encode()
+	if _, err := ParseStoredBlock(legacy); err == nil {
+		t.Fatal("a whole chain parsed as one SignedBlock")
+	}
+	p, err := ParseStored(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Blocks) != 1 || p.ID() != n.ID() || string(p.Stored()) != string(s) || !p.SignedBy(f.keys[0].Pub) {
+		t.Fatal("a legacy row reads as its authority block")
+	}
+	// Neither a token nor a SignedBlock that isn't a root block is stored.
+	if _, err := ParseStored(tokenBytes(t, n.Encode())); err == nil {
+		t.Fatal("token accepted as stored form")
+	}
+	_, err = ParseStoredBlock(n.c.blocks[1].encode())
+	wantStatus(t, err, 401)
+}

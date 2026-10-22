@@ -165,10 +165,11 @@ func (g *Grant) RevocationIDs() []string {
 // id before v0.71, which Verify still honours in revoked lists (§C.4).
 func (g *Grant) rootSigID() string { return ids.Of(g.c.blocks[0].sig).String() }
 
-// Stored is the non-bearer form (§C.3): the Biscuit without its proof.
-func (g *Grant) Stored() []byte {
-	return (&container{blocks: g.c.blocks}).encode()
-}
+// Stored is the non-bearer form (§C.3, §C.8): the authority block's
+// SignedBlock (its block data, next key and signature), without the other
+// blocks or the token's proof. Its signature can still be checked under
+// the root key, but it is no longer a token. ParseStored reads it back.
+func (g *Grant) Stored() []byte { return g.c.blocks[0].encode() }
 
 // SignedBlocks are the token's protobuf SignedBlock messages in order,
 // authority first: the stored form's blocks, as GET /ns/{ns}/grants/{gid}
@@ -360,18 +361,34 @@ func Decode(token string, maxSize int) (*Grant, error) {
 // (§6.6); 0 for a grant that wasn't decoded from a bearer.
 func (g *Grant) Size() int { return g.size }
 
-// ParseStored parses the non-bearer stored form and checks its structure
-// and the chain signatures (not the root signature, which needs the
-// namespace keys). The result has no proof.
-func ParseStored(data []byte) (*Grant, error) {
-	g, err := decode(data, false)
+// ParseStoredBlock parses the stored form (§C.3, §C.8, Stored): one
+// authority SignedBlock, whose structure and grant_block it checks. Its
+// signature needs the root key (SignedBy, Verify). The result has the
+// root block only, and no proof.
+func ParseStoredBlock(data []byte) (*Grant, error) {
+	sb, err := parseSignedBlock(data)
 	if err != nil {
-		return nil, err
+		return nil, unauth("malformed stored grant: %v", err)
 	}
-	if err := g.c.verify(nil); err != nil {
-		return nil, unauth("%v", err)
+	return decodeContainer(&container{blocks: []signedBlock{sb}})
+}
+
+// ParseStored parses a stored grant: the authority SignedBlock of
+// ParseStoredBlock, or a row stored before v0.73, the whole chain as a
+// Biscuit without proof, of which it keeps the authority block, as the
+// stored form now has it (§C.8). The two can't be mistaken for each
+// other: a SignedBlock's field 1 is its block data, a Biscuit's the
+// integer rootKeyId. The result has the root block only, and no proof.
+func ParseStored(data []byte) (*Grant, error) {
+	if g, err := ParseStoredBlock(data); err == nil {
+		return g, nil
 	}
-	return g, nil
+	c, err := parseContainer(data, false)
+	if err != nil {
+		return nil, unauth("malformed stored grant: %v", err)
+	}
+	c.blocks = c.blocks[:1]
+	return decodeContainer(c)
 }
 
 func decode(data []byte, bearer bool) (*Grant, error) {
@@ -379,6 +396,11 @@ func decode(data []byte, bearer bool) (*Grant, error) {
 	if err != nil {
 		return nil, unauth("malformed grant: %v", err)
 	}
+	return decodeContainer(c)
+}
+
+// decodeContainer reads the JSON blocks of a parsed container (§C.8).
+func decodeContainer(c *container) (*Grant, error) {
 	strs, symbols, err := c.blockStrings()
 	if err != nil {
 		return nil, unauth("malformed grant: %v", err)
