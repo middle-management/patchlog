@@ -174,7 +174,8 @@ func (im *importer) checkAccess(ctx context.Context) error {
 			}
 		}
 	}
-	nonces := map[string]bool{} // targets that require nonces (nonce.go)
+	nonces := map[string]bool{}       // targets that require nonces (nonce.go)
+	sealedTarget := map[string]bool{} // targets that are, or are created, sealed
 	for _, tns := range names {
 		tg := targets[tns]
 		src := im.h.AccessOf(tg.src)
@@ -222,6 +223,7 @@ func (im *importer) checkAccess(ctx context.Context) error {
 			have, nonce = docAccess(doc), docNonce(doc)
 		}
 		im.sealedT[tns] = have == AccessSealed
+		sealedTarget[tns] = have == AccessSealed
 		nonces[tns] = nonce
 		switch {
 		case have == AccessE2E:
@@ -235,12 +237,22 @@ func (im *importer) checkAccess(ctx context.Context) error {
 			im.rep.Notes = append(im.rep.Notes, msg+"; imported anyway, as the operator overrode it")
 		}
 	}
+	// Where a snapshot document's target is sealed, the patch sets
+	// generated in its upstream namespace carry a fresh $nonce too, whatever
+	// the upstream's own level (§G.4.4): the target fast-forwards from them,
+	// and its writers add one to every patch set (§E.2.5).
+	for _, k := range im.keys {
+		if d := im.docs[k]; d.info.History == Snapshot && sealedTarget[d.tns] {
+			im.sealedT[im.upstreamNS(d.ns)] = true
+		}
+	}
 	// The upstream namespaces of the snapshot documents a partial import
 	// holds (partial.go) aren't targets, but their chains are compared as
-	// a target's are: without the $nonce a sealed or nonce-requiring one
-	// gives each patch set.
+	// a target's are: without the $nonce a sealed or nonce-requiring one,
+	// or one whose target is sealed, gives each patch set.
 	for _, k := range im.heldKeys {
-		u := im.upstreamNS(im.docs[k].ns)
+		d := im.docs[k]
+		u := im.upstreamNS(d.ns)
 		if _, ok := targets[u]; ok {
 			continue
 		}
@@ -250,6 +262,14 @@ func (im *importer) checkAccess(ctx context.Context) error {
 		}
 		if ok && (have == AccessSealed || nonce) {
 			im.sealedT[u] = true
+			continue
+		}
+		if ok {
+			if th, _, _, tok, err := im.existing(ctx, d.tns); err != nil {
+				return fmt.Errorf("import: target namespace %s: %w", d.tns, err)
+			} else if tok && th == AccessSealed {
+				im.sealedT[u] = true
+			}
 		}
 	}
 	im.requireNonces(nonces)

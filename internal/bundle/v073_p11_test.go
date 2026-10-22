@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -541,5 +542,34 @@ func TestV073UpstreamOneOrigin(t *testing.T) {
 	_, err = bundle.Import(ctx, dst.c, bundle.BytesOpener(snapshotOf(t, y, "copy")), bundle.ImportOptions{Mode: bundle.Atomic, CreateNamespaces: true})
 	if !errors.As(err, &ce) || !strings.Contains(err.Error(), "copy-upstream") || !strings.Contains(err.Error(), "written by imports from "+cmsOrigin) {
 		t.Fatalf("an import into an upstream the target's own imports wrote: %v", err)
+	}
+}
+
+// Where the target is sealed, the patch sets generated in its upstream
+// namespace carry a fresh $nonce, even where the upstream isn't sealed
+// (§G.4.4, MF-46): the target fast-forwards from them.
+func TestV073UpstreamNonceForSealedTarget(t *testing.T) {
+	t.Parallel()
+	src := newDeployment(t, stagingOrigin)
+	src.ns("p", map[string]any{"read": "grant"})
+	src.create("p", "a", map[string]any{"v": marker})
+	snap := snapshotOf(t, src, "p")
+	dst := newEncDeployment(t, cmsOrigin)
+	dst.ns("p", map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}})
+	importB(t, dst, snap, bundle.ImportOptions{})
+	if lv := must(dst.c.EncryptionLevel(ctx, "p-upstream")); lv != "" {
+		t.Fatalf("the upstream was created %q, as protected as its private source", lv)
+	}
+	up, tg := dst.head("p-upstream", "a"), dst.head("p", "a")
+	if up.ID != tg.ID {
+		t.Fatalf("upstream head %s, target head %s: the target didn't fast-forward", up.ID, tg.ID)
+	}
+	if d := dst.doc("p-upstream", "a"); d["v"] != marker || !seal.ValidNonce(fmt.Sprint(d["$nonce"])) {
+		t.Fatalf("upstream doc %v", d)
+	}
+	// Again: unchanged, nothing written.
+	rep := importB(t, dst, snap, bundle.ImportOptions{})
+	if u := rep.Doc("p/a").Upstream; u.Class != "unchanged" || len(rep.Batches) != 0 {
+		t.Fatalf("second import: upstream %s, %d batches", u.Class, len(rep.Batches))
 	}
 }
