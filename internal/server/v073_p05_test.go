@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -210,4 +211,171 @@ func TestV073ValuesNotOnStoredDocuments(t *testing.T) {
 	// A creation is held to it.
 	expectLimit(t, e.do(req{method: "PATCH", path: "/ns/e4", ifNoneMatch: "*", author: "admin", body: addRoot(e2eDoc(map[string]any{}))}),
 		422, "patchSetSize", int64(need), 200<<10)
+}
+
+// v0.73 §7.5: the server stops reading a batch body longer than four times
+// the larger of the verified principal's batchSize and the deployment
+// maximum of documentSize (413 naming batchSize, the principal's as max);
+// a body within it is read and judged at step 4.
+func TestV073BatchBodyCutOff(t *testing.T) {
+	t.Parallel()
+	l := core.DefaultLimits()
+	l.DocumentSize, l.BatchSize = 64<<10, 2048
+	m := l
+	m.BatchSize = 1 << 20
+	f := newAuthFixture(t, map[string]any{"allowances": []any{map[string]any{"sub": "user:bob", "kid": "issuer", "batchSize": 128 << 10}}},
+		func(o *core.Options) { o.Limits, o.Maximums = l, m })
+	e := f.tenv
+	eve := e.grant(f.issuer, "user:eve", []string{"sec"}, []string{"read", "create"})
+	items, size := []any{}, 0
+	for i := 0; i < 5; i++ {
+		set := addRoot(map[string]any{"s": strings.Repeat("x", 60<<10)})
+		size += len(canonical(set))
+		items = append(items, map[string]any{"resource": "r" + string(rune('a'+i)), "ifNoneMatch": "*", "steps": []any{set}})
+	}
+	body := map[string]any{"items": items}
+	// About 300 KiB: over 4 × 64 KiB for eve, whose batchSize is 2048…
+	expectLimit(t, e.do(req{method: "POST", path: "/ns/sec/batch", body: body, bearer: eve}), 413, "batchSize", -1, 2048)
+	// …and within 4 × 128 KiB for bob's allowance: read, and over his
+	// batchSize at step 4.
+	expectLimit(t, e.do(req{method: "POST", path: "/ns/sec/batch", body: body, bearer: f.issuerG}), 422, "batchSize", int64(size), 128<<10)
+}
+
+// v0.73 §6.6 Configurable limits: config writes, a batch's config change,
+// a namespace's creation and a branch's patches are held to the patch-set
+// and document limits as resource writes are, a creation counting as a
+// create, and a config write whose first operation other than test is a
+// root replace or add getting documentSize too (Whole documents).
+func TestV073ConfigWritesHeldToLimits(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	lim := map[string]any{"patchSetSize": 4096, "documentSize": 16384, "valueSize": 600, "pathSize": 100, "opsPerSet": 40, "nestingDepth": 6}
+	e.mkNS("c", map[string]any{"limits": lim})
+	pad := func(doc map[string]any, n int) map[string]any {
+		for i := 0; i < n; i++ {
+			doc[fmt.Sprintf("x-%02d", i)] = strings.Repeat("p", 590)
+		}
+		return doc
+	}
+	// A whole document within documentSize, over patchSetSize.
+	whole := ops(op("test", "/limits", lim), op("replace", "", pad(map[string]any{"limits": lim}, 12)))
+	if n := len(canonical(whole)); n <= 4096 {
+		t.Fatalf("a whole document of %d bytes", n)
+	}
+	expect(t, e.patchNS("c", whole, ""), 201)
+	// Any other patch set stays within patchSetSize…
+	var adds []map[string]any
+	for i := 0; i < 8; i++ {
+		adds = append(adds, op("add", fmt.Sprintf("/x-a%d", i), strings.Repeat("a", 590)))
+	}
+	expectLimit(t, e.patchNS("c", ops(adds...), ""), 422, "patchSetSize", int64(len(canonical(ops(adds...)))), 4096)
+	// …and opsPerSet, and the document documentSize, nestingDepth,
+	// valueSize and pathSize.
+	many := make([]map[string]any, 41)
+	for i := range many {
+		many[i] = op("add", fmt.Sprintf("/x-m%d", i), 1.0)
+	}
+	expectLimit(t, e.patchNS("c", ops(many...), ""), 422, "opsPerSet", 41, 40)
+	over := ops(op("replace", "", pad(map[string]any{"limits": lim}, 30)))
+	expectLimit(t, e.patchNS("c", over, ""), 422, "documentSize", int64(len(canonical(over))), 16384)
+	doc := pad(map[string]any{"limits": lim}, 12)
+	for i := 0; ; i++ {
+		k1, k2 := fmt.Sprintf("x-g%da", i), fmt.Sprintf("x-g%db", i)
+		doc[k1], doc[k2] = strings.Repeat("g", 590), strings.Repeat("g", 590)
+		r := e.patchNS("c", ops(op("add", "/"+k1, doc[k1]), op("add", "/"+k2, doc[k2])), "")
+		if r.Code == 201 {
+			continue
+		}
+		expectLimit(t, r, 422, "documentSize", int64(len(canonical(doc))), 16384)
+		break
+	}
+	deep := map[string]any{"a": map[string]any{"b": map[string]any{"c": map[string]any{"d": map[string]any{"e": []any{1.0}}}}}}
+	expectLimit(t, e.patchNS("c", ops(op("add", "/x-deep", deep)), ""), 422, "nestingDepth", 7, 6)
+	expectLimit(t, e.patchNS("c", ops(op("add", "/x-v", strings.Repeat("v", 600))), ""), 422, "valueSize", 602, 600)
+	expectLimit(t, e.patchNS("c", ops(op("add", "/x-"+strings.Repeat("p", 97), 1.0)), ""), 422, "pathSize", 102, 100)
+	// A batch's config change too.
+	r := e.batchReq("c", map[string]any{"config": map[string]any{"ifMatch": e.configID("c"), "patches": ops(adds...)}}, "admin")
+	expectLimit(t, r, 422, "patchSetSize", int64(len(canonical(ops(adds...)))), 4096)
+
+	// A namespace's creation counts as a create, held to the deployment's
+	// documentSize (1 MiB by default).
+	big := map[string]any{}
+	for i := 0; i < 17; i++ {
+		big[fmt.Sprintf("x-%02d", i)] = strings.Repeat("b", 63<<10)
+	}
+	r = e.do(req{method: "PATCH", path: "/ns/big", ifNoneMatch: "*", author: "admin", body: addRoot(big)})
+	expectLimit(t, r, 422, "documentSize", int64(len(canonical(addRoot(big)))), 1<<20)
+	delete(big, "x-16")
+	delete(big, "x-15")
+	expect(t, e.do(req{method: "PATCH", path: "/ns/big", ifNoneMatch: "*", author: "admin", body: addRoot(big)}), 201)
+
+	// A branch's patches and document, held to the base's limits: its
+	// patches may be as large as documentSize.
+	e.mkNS("b", map[string]any{"limits": lim})
+	at := e.nsHead("b")
+	padOps := func(n int) []any {
+		var out []map[string]any
+		for k := range pad(map[string]any{}, n) {
+			out = append(out, op("add", "/"+k, strings.Repeat("p", 590)))
+		}
+		return ops(out...)
+	}
+	if n := len(canonical(padOps(10))); n <= 4096 {
+		t.Fatalf("branch patches of %d bytes", n)
+	}
+	expect(t, e.branch("b", map[string]any{"name": "b1", "at": at, "patches": padOps(10)}, "alice"), 201)
+	r = e.branch("b", map[string]any{"name": "b2", "at": at, "patches": padOps(30)}, "alice")
+	expectCode(t, r, 422, "limit")
+	if r.Obj()["limit"] != "documentSize" {
+		t.Fatalf("branch over documentSize: %s", r.Body)
+	}
+}
+
+// v0.73 §6.6 Exceeding a limit: for a limit on the resulting document,
+// measured is left out for a grant that can't read the resource; for a
+// namespace document, for one without unrestricted read.
+func TestV073MeasuredLeftOutWithoutRead(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, map[string]any{"limits": map[string]any{"patchSetSize": 4096, "documentSize": 3000, "valueSize": 600, "pathSize": 100}})
+	e := f.tenv
+	blind := e.grant(f.issuer, "user:blind", []string{"sec"}, []string{"create", "append", "config"})
+	reader := e.grant(f.issuer, "user:reader", []string{"sec"}, []string{"read", "create", "append", "config"})
+	for _, x := range []struct {
+		g        string
+		measured bool
+	}{{blind, false}, {reader, true}} {
+		name := "r-" + map[bool]string{true: "read", false: "blind"}[x.measured]
+		head := etagOf(e.write("PATCH", "sec", name, "", addRoot(map[string]any{}), x.g))
+		var r *resp
+		for i := 0; ; i++ {
+			r = e.write("PATCH", "sec", name, head, ops(op("add", fmt.Sprintf("/k%d", i), strings.Repeat("x", 590))), x.g)
+			if r.Code != 201 {
+				break
+			}
+			head = etagOf(r)
+		}
+		for _, r := range []*resp{r, e.write("PATCH", "sec", name, head, ops(op("add", "/v", strings.Repeat("v", 600))), x.g)} {
+			expectCode(t, r, 422, "limit")
+			if _, has := r.Obj()["measured"]; has != x.measured || r.Obj()["max"] == nil {
+				t.Fatalf("%s: measured %v, want %v: %s", name, has, x.measured, r.Body)
+			}
+		}
+		// The patch set's own size is the writer's to know.
+		set := ops(op("add", "/big", map[string]any{"a": strings.Repeat("a", 590), "b": strings.Repeat("a", 590), "c": strings.Repeat("a", 590),
+			"d": strings.Repeat("a", 590), "e": strings.Repeat("a", 590), "f": strings.Repeat("a", 590), "g": strings.Repeat("a", 590)}))
+		expectLimit(t, e.write("PATCH", "sec", name, head, set, x.g), 422, "patchSetSize", int64(len(canonical(set))), 4096)
+	}
+	// The namespace document: unrestricted read decides.
+	cid := e.configID("sec", f.adminG)
+	var adds []map[string]any
+	for i := 0; i < 5; i++ {
+		adds = append(adds, op("add", fmt.Sprintf("/x-%d", i), strings.Repeat("c", 590)))
+	}
+	for g, measured := range map[string]bool{blind: false, reader: true} {
+		r := e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: g, body: ops(adds...)})
+		expectCode(t, r, 422, "limit")
+		if _, has := r.Obj()["measured"]; has != measured || r.Obj()["limit"] != "documentSize" {
+			t.Fatalf("config write: measured %v, want %v: %s", has, measured, r.Body)
+		}
+	}
 }

@@ -47,7 +47,7 @@ func TestCheckLimitsFromScratch(t *testing.T) {
 		{"append, a root remove", stepState{action: "append", raw: []any{map[string]any{"op": "remove", "path": ""}}}, false},
 	} {
 		c.s.canon = big
-		err := checkLimits(l, &itemState{steps: []*stepState{&c.s}})
+		err := checkLimits(l, &itemState{steps: []*stepState{&c.s}}, func() bool { return true })
 		if (err == nil) != c.ok {
 			t.Errorf("%s: %v", c.name, err)
 		}

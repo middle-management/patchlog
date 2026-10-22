@@ -357,10 +357,11 @@ func (t *tx) batchLimits(cfg *Config, a *actor) (items, size int) {
 
 // BatchBodyLimit authenticates a batch request and returns how many bytes
 // of body the server reads for it, and the principal's batchSize (§6.6)
-// that a refusal names: that batchSize, plus
-// room for the batch's own JSON (items, preconditions, an optional config
-// change). A larger body is refused with 413 without reading the rest,
-// which reveals nothing about any item (§7.5). The batch itself
+// that a refusal names: four times the larger of that batchSize and the
+// deployment maximum of documentSize, as for a resource PATCH, which
+// leaves room for the batch's own JSON (items, preconditions, an optional
+// config change). A larger body is refused with 413 without reading the
+// rest, which reveals nothing about any item (§7.5). The batch itself
 // authenticates again.
 func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (bound, batchSize int, err error) {
 	err = e.read(ctx, func(t *tx) error {
@@ -375,8 +376,8 @@ func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (bound, batchS
 		}
 		// No state checks here: the gate answers them in order after the
 		// body is parsed (§6.2, §7.5). This only bounds how much is read.
-		items, size := t.batchLimits(cur, a)
-		bound, batchSize = size+size/4+512*items+max(cur.Limits.PatchSetSize, cur.Limits.DocumentSize)+64<<10, size
+		_, size := t.batchLimits(cur, a)
+		bound, batchSize = 4*max(size, t.e.opt.Maximums.DocumentSize), size
 		return nil
 	})
 	return bound, batchSize, err
@@ -733,7 +734,8 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 	}
 	for _, s := range st {
-		if err := checkLimits(cfg.Limits, s); err != nil {
+		readable := func() bool { return t.canRead(n, cfg, a, s.Resource) }
+		if err := checkLimits(cfg.Limits, s, readable); err != nil {
 			fs = append(fs, itemErr{s.index, err})
 		}
 	}
@@ -1358,8 +1360,10 @@ func genesisDocCanon(step *stepState) []byte {
 	return step.canon[len(genesisPrefix) : len(step.canon)-2 : len(step.canon)-2]
 }
 
-// checkLimits is step 4 (§6.6).
-func checkLimits(l Limits, s *itemState) *Error {
+// checkLimits is step 4 (§6.6). readable reports whether the caller may
+// read the resource: a refusal of a limit on the resulting document leaves
+// measured out for one that can't (unreadableLimit).
+func checkLimits(l Limits, s *itemState, readable func() bool) *Error {
 	for _, step := range s.steps {
 		if step.del {
 			continue
@@ -1374,38 +1378,43 @@ func checkLimits(l Limits, s *itemState) *Error {
 		if ops, ok := step.raw.([]any); ok && len(ops) > l.OpsPerSet {
 			return limitErr(422, "opsPerSet", int64(len(ops)), int64(l.OpsPerSet), "too many operations")
 		}
-		if step.docCanon = genesisDocCanon(step); step.docCanon == nil {
-			step.docCanon = jsonv.Canonical(step.doc)
-		}
-		if len(step.docCanon) > l.DocumentSize {
-			return limitErr(422, "documentSize", int64(len(step.docCanon)), int64(l.DocumentSize), "document too large")
-		}
-		sh := shapeOf(l, step.docCanon)
-		if sh.depth > l.NestingDepth {
-			return limitErr(422, "nestingDepth", int64(sh.depth), int64(l.NestingDepth), "document nested too deeply")
-		}
-		if step.sealed {
-			// e2e: clients check the limits on documents (§E.3.2); the
-			// server checks blobsPerDocument on the declared list (§E.3.1).
-			if len(step.declared) > l.BlobsPerDocument {
-				return limitErr(422, "blobsPerDocument", int64(len(step.declared)), int64(l.BlobsPerDocument), fmt.Sprintf("more than %d blobs declared", l.BlobsPerDocument))
-			}
-			continue
-		}
-		if sh.bad != nil {
-			return sh.bad
-		}
-		// Without a $blob member a document has no blob references, nor
-		// any to look up (checkBlobs).
-		step.noBlobs = !sh.blobs
-		if step.noBlobs {
-			continue
-		}
-		if err := checkBlobRefs(l, step.doc); err != nil {
+		if err := unreadableLimit(checkDocument(l, step), readable); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// checkDocument is checkLimits for a step's resulting document.
+func checkDocument(l Limits, step *stepState) *Error {
+	if step.docCanon = genesisDocCanon(step); step.docCanon == nil {
+		step.docCanon = jsonv.Canonical(step.doc)
+	}
+	if len(step.docCanon) > l.DocumentSize {
+		return limitErr(422, "documentSize", int64(len(step.docCanon)), int64(l.DocumentSize), "document too large")
+	}
+	sh := shapeOf(l, step.docCanon)
+	if sh.depth > l.NestingDepth {
+		return limitErr(422, "nestingDepth", int64(sh.depth), int64(l.NestingDepth), "document nested too deeply")
+	}
+	if step.sealed {
+		// e2e: clients check the limits on documents (§E.3.2); the
+		// server checks blobsPerDocument on the declared list (§E.3.1).
+		if len(step.declared) > l.BlobsPerDocument {
+			return limitErr(422, "blobsPerDocument", int64(len(step.declared)), int64(l.BlobsPerDocument), fmt.Sprintf("more than %d blobs declared", l.BlobsPerDocument))
+		}
+		return nil
+	}
+	if sh.bad != nil {
+		return sh.bad
+	}
+	// Without a $blob member a document has no blob references, nor
+	// any to look up (checkBlobs).
+	step.noBlobs = !sh.blobs
+	if step.noBlobs {
+		return nil
+	}
+	return checkBlobRefs(l, step.doc)
 }
 
 // validateDoc is step 5: resolve $schema and validate (§6.1). It returns the

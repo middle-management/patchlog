@@ -123,12 +123,12 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 	newDoc, writes = d, patch.WritesStrings(w)
 	p.canon = jsonv.Canonical(cc.Patches)
 	p.id = ids.Revision(&curID, p.canon)
-	// Step 4.
-	if len(p.canon) > cur.Limits.PatchSetSize {
-		return nil, limitErr(422, "patchSetSize", int64(len(p.canon)), int64(cur.Limits.PatchSetSize), "patch set too large")
-	}
-	if n := len(jsonv.Canonical(newDoc)); n > cur.Limits.DocumentSize {
-		return nil, limitErr(422, "documentSize", int64(n), int64(cur.Limits.DocumentSize), "document too large")
+	// Step 4: the patch-set and document limits in force, as for a
+	// resource write (§6.6). Only a caller with unrestricted read may
+	// read the namespace document.
+	readable := func() bool { return t.readsNS(n, cur, a, false) }
+	if err := checkConfigLimits(cur.Limits, cc.Patches, p.canon, false, jsonv.Canonical(newDoc), readable); err != nil {
+		return nil, err
 	}
 	// Step 5: the built-in namespace-document schema and branch fields.
 	cfg, verr := t.validateConfig(n, cur, newDoc, writes, a)
@@ -562,6 +562,11 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	if err != nil {
 		return nil, patchErr(err)
 	}
+	// Step 4: a creation counts as a create (§6.6), held to the
+	// deployment's defaults, which no document has lowered yet.
+	if err := checkConfigLimits(t.e.opt.Limits, cc.Patches, jsonv.Canonical(cc.Patches), true, jsonv.Canonical(doc), func() bool { return true }); err != nil {
+		return nil, err
+	}
 	cfg, perr := t.e.newConfig(doc, nil, nil)
 	if perr != nil {
 		return nil, perr
@@ -716,6 +721,11 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	// their merge don't block new ones.
 	if live := t.liveBranches(base, nil); live >= bcfg.Limits.BranchesPerNamespace {
 		return nil, limitErr(422, "branchesPerNamespace", int64(live+1), int64(bcfg.Limits.BranchesPerNamespace), "too many live branches")
+	}
+	// The patches and the document, a creation counting as a create, held
+	// to the base's limits (§6.6). Step 1 needed unrestricted read.
+	if err := checkConfigLimits(bcfg.Limits, br.Patches, jsonv.Canonical(br.Patches), true, jsonv.Canonical(nd), func() bool { return true }); err != nil {
+		return nil, err
 	}
 	// Step 5. The document starts as the base's, so the members this
 	// version defines that it holds unchanged are judged as there; any
