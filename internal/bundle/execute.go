@@ -514,6 +514,14 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 		}
 		return fmt.Errorf("import: dry run of the batch into %s: %w", b.n.ns, err)
 	}
+	if ce := res.ConfigError(); ce != nil {
+		// The epoch raise (raise) failed after its step 1: a dry run reports
+		// it and judges the items against the epoch before (§7.5), so their
+		// failures would hide the cause. The submit fails with it.
+		b.rep.DryRun = "failed"
+		b.rep.Error = ce.Error()
+		return fmt.Errorf("import: dry run of the batch into %s: moving it to epoch %d: %w", b.n.ns, b.epoch, ce)
+	}
 	var failures []string
 	allDeferrable, onlyBlobs, allBlob := true, true, true
 	for i, it := range res.Items {

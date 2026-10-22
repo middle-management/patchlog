@@ -271,8 +271,11 @@ func (p *Plan) checkIDs(res *client.BatchResult) error {
 }
 
 // DryRun submits the batch with ?dry-run=1 (§7.5) and returns the per-item
-// report. A failing item is an *client.APIError with code "batch". An empty
-// plan returns (nil, nil).
+// report. A failing item is an *client.APIError with code "batch". An
+// explicit config change that fails after its step 1 is reported in a 200
+// with the items judged against the current configuration; DryRun returns
+// it as the *client.APIError Apply would fail with. An empty plan returns
+// (nil, nil).
 func (p *Plan) DryRun(ctx context.Context) (*client.BatchResult, error) {
 	if err := p.sealItems(ctx); err != nil {
 		return nil, err
@@ -295,6 +298,9 @@ func (p *Plan) DryRun(ctx context.Context) (*client.BatchResult, error) {
 	res, err := p.batchClient().Batch(ctx, p.Target, req, true)
 	if err != nil {
 		return nil, err
+	}
+	if ce := res.ConfigError(); ce != nil {
+		return res, ce
 	}
 	return res, p.checkIDs(res)
 }
