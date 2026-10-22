@@ -134,18 +134,20 @@ type blobSrc struct {
 }
 
 // commitRaw writes body as raw file ns/name (§H.1, §H.4), typed by its
-// file name and upload (fileType), and returns the revision holding it,
-// and whether that holds exactly body. A new name is created and a
-// tombstoned one restored (§8.2), the blob uploaded first. A live raw
-// file's save checks its base against the head first (rawBase): raw
-// files have no paths to merge, so any change of its bytes by someone
-// else since is a conflict (409), and only then is the blob uploaded,
-// once however often the head moves (412), and the reference's members
-// set one by one, never the root, so $schema and $successor stay. Bytes
-// the head already holds write nothing, nonces or not, nor does a version
-// the client had saved unchanged (rawBase). Where nonces
-// apply (§C.7) the blob has a Blob-Nonce and the root a fresh $nonce. A
-// copy of a raw file of the same type keeps its blob's id, nonce or not
+// file name and upload, else as the file there now is (fileType, once
+// its head is read: the type is part of the blob id), and returns the
+// revision holding it, and whether that holds exactly body. A new name
+// is created and a tombstoned one restored (§8.2), the blob uploaded
+// first. A live raw file's save checks its base against the head first
+// (rawBase): raw files have no paths to merge, so any change of its
+// bytes by someone else since is a conflict (409), and only then is the
+// blob uploaded, once however often the head moves (412), and the
+// reference's members set one by one, never the root, so $schema and
+// $successor stay. Bytes the head already holds, as its type, write
+// nothing, nonces or not, nor does a version the client had saved
+// unchanged (rawBase). Where nonces apply (§C.7) the blob has a
+// Blob-Nonce and the root a fresh $nonce. A copy of a raw file whose
+// type comes out as the source's keeps its blob's id, nonce or not
 // (§7.8), and the blob is copied with Blob-From, or uploaded again where
 // the core refuses that (a source of a higher rank, §7.8).
 func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte, o saveOpts) (string, bool, error) {
@@ -159,42 +161,32 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 	if o.fname == "" {
 		o.fname = name
 	}
-	typ := fileType(o.fname, st.ctype)
 	nonce := ""
 	if in.nonce {
 		nonce = seal.NewNonce()
 	}
-	from := st.copySrc
-	if from != nil && from.ref.typ == typ && from.ref.size == int64(len(body)) && client.BlobID(typ, from.ref.nonce, body) == from.ref.bid {
-		nonce = from.ref.nonce
-	} else {
-		from = nil
-	}
-	bid := client.BlobID(typ, nonce, body)
-	ref := refValue(bid, typ, len(body), nonce)
-	uploaded := false
-	upload := func() error {
-		if uploaded {
+	sent := map[string]bool{} // blobs uploaded or copied, by id
+	upload := func(b rawBlob) error {
+		if sent[b.bid] {
 			return nil
 		}
-		if from != nil {
-			err := st.tk.c.CopyBlob(ctx, ns, name, bid, from.ns, from.name, "")
+		if b.from != nil {
+			err := st.tk.c.CopyBlob(ctx, ns, name, b.bid, b.from.ns, b.from.name, "")
 			ae, isAPI := client.AsAPIError(err)
 			switch {
 			case err == nil:
-				uploaded = true
+				sent[b.bid] = true
 				return nil
 			case !isAPI || ae.Status != http.StatusNotFound && ae.Status != http.StatusUnprocessableEntity:
 				return err
 			}
 		}
-		if _, err := st.tk.c.UploadBlob(ctx, ns, name, typ, nonce, body); err != nil {
+		if _, err := st.tk.c.UploadBlob(ctx, ns, name, b.typ, b.nonce, body); err != nil {
 			return err
 		}
-		uploaded = true
+		sent[b.bid] = true
 		return nil
 	}
-	same := func(doc any) bool { return client.RawBlobOf(doc) == bid }
 	var rev string
 	exact := true
 	err := st.retrying(ctx, func() (bool, error) {
@@ -220,7 +212,9 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 				return false, notOffered(ns)
 			case cur.raw == nil:
 				return false, fail(http.StatusConflict, "%s/%s is a JSON document, shown as %s.json: a file of other content can't take its name (§H.2)", ns, name, name)
-			case cur.raw.typ == typ && sameBytes(cur.raw, body):
+			}
+			b := st.rawBlobOf(o.fname, cur.raw.typ, nonce, body)
+			if cur.raw.typ == b.typ && sameBytes(cur.raw, body) {
 				// It holds these bytes already: no write, but the principal
 				// has the head now.
 				st.s.remember(st.p, ns, name, record{rev: h.ID}, false)
@@ -238,10 +232,10 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 				rev, exact = h.ID, false
 				return false, nil
 			}
-			if err := upload(); err != nil {
+			if err := upload(b); err != nil {
 				return false, err
 			}
-			ps := merge.Diff(refOf(cur.value), refOf(ref))
+			ps := merge.Diff(refOf(cur.value), refOf(b.ref))
 			paths := writesOf(refOf(cur.value), ps)
 			ps = withNonce(in, cur.value, ps)
 			res, err := st.tk.c.Append(ctx, ns, name, h.ID, ps)
@@ -254,7 +248,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 				return false, err
 			}
 			rev = res.ID
-			st.wrote(ns, name, cur.value, ps, paths, res, ref, nil, same)
+			st.wrote(ns, name, cur.value, ps, paths, res, b.ref, nil, b.holds)
 			return false, nil
 		}
 		if o.pre && st.matchAny && !st.placeholder {
@@ -266,22 +260,34 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 		var res *client.WriteResult
 		var parent any = map[string]any{}
 		var ps []any
+		var b rawBlob
 		if h.State == client.NotFound {
-			if err := upload(); err != nil {
+			b = st.rawBlobOf(o.fname, "", nonce, body)
+			if err := upload(b); err != nil {
 				return false, err
 			}
-			ps = withNonce(in, ref, client.GenesisPatches(ref))
+			ps = withNonce(in, b.ref, client.GenesisPatches(b.ref))
 			res, err = st.tk.c.Create(ctx, ns, name, ps)
 		} else {
 			// What the restore writes is settled (a 409 over someone
-			// else's delete uploads nothing) before the blob goes up.
+			// else's delete uploads nothing) before the blob goes up: the
+			// file restored as it was keeps its type (fileType).
+			last, err := st.tombBase(ctx, ns, name, h)
+			if err != nil {
+				return false, err
+			}
+			had := ""
+			if last != nil && last.raw != nil {
+				had = last.raw.typ
+			}
+			b = st.rawBlobOf(o.fname, had, nonce, body)
 			var write bool
-			if parent, ps, write, err = st.rawRestorePatches(ctx, in, ns, name, h, ref, body); err != nil {
+			if parent, ps, write, err = st.rawRestorePatches(ctx, in, ns, name, h, last, b, body); err != nil {
 				return false, err
 			}
 			if !write {
 				exact = false
-			} else if err := upload(); err != nil {
+			} else if err := upload(b); err != nil {
 				return false, err
 			}
 			if res, err = st.tk.c.Restore(ctx, ns, name, h.ID, ps); err == nil {
@@ -295,29 +301,53 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 			return false, err
 		}
 		rev = res.ID
-		exact = st.wrote(ns, name, parent, ps, writesOf(parent, ps), res, ref, nil, same) && exact
+		exact = st.wrote(ns, name, parent, ps, writesOf(parent, ps), res, b.ref, nil, b.holds) && exact
 		return false, nil
 	})
 	return rev, err == nil && exact, err
 }
 
-// rawRestorePatches is the patch set writing raw file ref, uploaded as
-// body, over tombstoned ns/name, the last live document it applies to
-// (§8.2), and whether it writes ref, as tombBase says: restored moments
-// after the principal's own DELETE, a raw last document's base checked
-// (rawBase) and its reference's members set one by one, as over a live
-// one, or restored as it was where rawBase writes nothing; else, or over
-// another kind of file, a new file, the root replaced.
-func (st *reqState) rawRestorePatches(ctx context.Context, in nsInfo, ns, name string, h *client.Head, ref map[string]any, body []byte) (any, []any, bool, error) {
-	last, err := st.tombBase(ctx, ns, name, h)
-	switch {
-	case err != nil:
-		return nil, nil, false, err
-	case last == nil, last.raw == nil:
-		return map[string]any{}, withNonce(in, ref, []any{map[string]any{"op": "replace", "path": "", "value": ref}}), true, nil
+// rawBlob is the blob a raw file's save writes (rawBlobOf): body as type
+// typ under nonce, its id and its reference (§7.8), and from, a COPY's or
+// MOVE's source blob it is copied from (Blob-From), if any.
+type rawBlob struct {
+	typ, nonce, bid string
+	ref             map[string]any
+	from            *blobSrc
+}
+
+// rawBlobOf is the blob of body saved as file fname, whose file there has
+// type had ("" for none): typed by fileType, under nonce, but the blob of
+// the file a COPY or MOVE copies (copySrc), its id and its nonce kept,
+// where the type comes out as its and its bytes are body's (§7.8, §H.5).
+func (st *reqState) rawBlobOf(fname, had, nonce string, body []byte) rawBlob {
+	b := rawBlob{typ: fileType(fname, st.ctype, had, body), nonce: nonce}
+	if from := st.copySrc; from != nil && from.ref.typ == b.typ && from.ref.size == int64(len(body)) && client.BlobID(b.typ, from.ref.nonce, body) == from.ref.bid {
+		b.nonce, b.from = from.ref.nonce, from
 	}
-	write := !sameBytes(last.raw, body)
+	b.bid = client.BlobID(b.typ, b.nonce, body)
+	b.ref = refValue(b.bid, b.typ, len(body), b.nonce)
+	return b
+}
+
+// holds reports whether doc holds b's blob: the uploaded bytes, as
+// uploaded (§H.1 "Identity").
+func (b rawBlob) holds(doc any) bool { return client.RawBlobOf(doc) == b.bid }
+
+// rawRestorePatches is the patch set writing raw file b, uploaded as
+// body, over tombstoned ns/name, the last live document it applies to
+// (§8.2), and whether it writes b, as tombBase said (last): restored
+// moments after the principal's own DELETE, a raw last document's base
+// checked (rawBase) and its reference's members set one by one, as over
+// a live one, or restored as it was where rawBase writes nothing; else,
+// or over another kind of file, a new file, the root replaced.
+func (st *reqState) rawRestorePatches(ctx context.Context, in nsInfo, ns, name string, h *client.Head, last *docEntry, b rawBlob, body []byte) (any, []any, bool, error) {
+	if last == nil || last.raw == nil {
+		return map[string]any{}, withNonce(in, b.ref, []any{map[string]any{"op": "replace", "path": "", "value": b.ref}}), true, nil
+	}
+	write := last.raw.typ != b.typ || !sameBytes(last.raw, body)
 	if write {
+		var err error
 		if write, err = st.rawBase(ctx, ns, name, body, h.Last); err != nil {
 			return nil, nil, false, err
 		}
@@ -325,7 +355,7 @@ func (st *reqState) rawRestorePatches(ctx context.Context, in nsInfo, ns, name s
 	if !write {
 		return last.value, withNonce(in, last.value, []any{}), false, nil
 	}
-	return last.value, withNonce(in, last.value, merge.Diff(refOf(last.value), refOf(ref))), true, nil
+	return last.value, withNonce(in, last.value, merge.Diff(refOf(last.value), refOf(b.ref))), true, nil
 }
 
 // rawBase says whether a save of raw file ns/name with body, over head

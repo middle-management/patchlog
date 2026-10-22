@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/xml"
@@ -16,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/net/webdav"
 
@@ -487,9 +489,12 @@ func scratchInfo(name string, f *scratchFile) *fileInfo {
 	if f.dir {
 		return &fileInfo{name: name, dir: true, mode: fs.ModeDir | 0o755, mod: f.mod}
 	}
-	ct := fileType(name, f.ctype)
-	if m := mime.TypeByExtension(path.Ext(name)); ct == "application/octet-stream" && m != "" {
-		ct = m
+	ct := declaredType(name, f.ctype)
+	if ct == "" {
+		ct = octetStream
+		if m := mime.TypeByExtension(path.Ext(name)); m != "" {
+			ct = m
+		}
 	}
 	return &fileInfo{name: name, size: int64(len(f.data)), mod: f.mod, mode: 0o644, ctype: ct}
 }
@@ -1199,9 +1204,10 @@ func (st *reqState) moveFlat(ctx context.Context, src, dst target) error {
 // before src's tombstone, with If-Match on src's head (again on the new
 // head if it moved, 412). A raw file's blob is copied to the new resource
 // first with Blob-From (§7.8), or uploaded again where the new name gives
-// it another type (§H.1). A JSON file keeps a {name}.json name and a raw
-// file a raw one, and one whose root isn't an object, which can't carry
-// $successor, isn't moved (403): it can be copied, then deleted.
+// it another type, or its bytes aren't UTF-8 for its text/ type (§H.1).
+// A JSON file keeps a {name}.json name and a raw file a raw one, and one
+// whose root isn't an object, which can't carry $successor, isn't moved
+// (403): it can be copied, then deleted.
 func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 	ns := src.ns
 	in := st.s.nsInfo(ctx, st.tk, ns)
@@ -1243,7 +1249,32 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 		}
 		doc = files.Bare(doc).(map[string]any)
 		if r := e.raw; r != nil {
-			typ := fileType(dst.base, r.typ)
+			// The new name types the file, else its type does, as a copy's
+			// upload (§H.1); a text/ type only for UTF-8 bytes, which are
+			// read for it (textBlob).
+			typ := declaredType(dst.base, r.typ)
+			switch {
+			case typ == "":
+				typ = octetStream
+			case typ == r.typ && strings.HasPrefix(typ, "text/"):
+				ok, err := st.textBlob(ctx, ns, src.docName, r)
+				if err != nil {
+					return false, err
+				}
+				if !ok {
+					typ = octetStream
+				}
+			}
+			var b []byte
+			if typ != r.typ {
+				hd := headDoc{ns: ns, name: src.docName, rev: sh.ID, m: e.meta(), e: e}
+				if b, err = st.fileBytes(ctx, &hd); err != nil {
+					return false, err
+				}
+				if !textOK(typ, b) {
+					typ = octetStream
+				}
+			}
 			if typ == r.typ {
 				if !sent[r.bid] {
 					if err := st.tk.c.CopyBlob(ctx, ns, to, r.bid, ns, src.docName, ""); err != nil {
@@ -1252,11 +1283,6 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 					sent[r.bid] = true
 				}
 			} else {
-				hd := headDoc{ns: ns, name: src.docName, rev: sh.ID, m: e.meta(), e: e}
-				b, err := st.fileBytes(ctx, &hd)
-				if err != nil {
-					return false, err
-				}
 				nonce := ""
 				if in.nonce {
 					nonce = seal.NewNonce()
@@ -1311,6 +1337,32 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 		}
 		return false, nil
 	})
+}
+
+// textBlob reports whether raw file ns/name's blob r may keep a text/
+// type: its bytes are UTF-8, a leading BOM allowed (textOK), read through
+// without keeping them.
+func (st *reqState) textBlob(ctx context.Context, ns, name string, r *rawRef) (bool, error) {
+	b, err := st.tk.c.OpenBlob(ctx, ns, name, r.bid, 0)
+	if err != nil {
+		return false, err
+	}
+	defer b.Body.Close()
+	br := bufio.NewReader(io.LimitReader(b.Body, r.size))
+	if p, _ := br.Peek(3); bytes.Equal(p, []byte{0xEF, 0xBB, 0xBF}) {
+		br.Discard(3)
+	}
+	for {
+		c, n, err := br.ReadRune()
+		switch {
+		case err == io.EOF:
+			return true, nil
+		case err != nil:
+			return false, err
+		case c == utf8.RuneError && n == 1:
+			return false, nil
+		}
+	}
 }
 
 // fileBytes returns live file hd's content as its reader gets it: a JSON

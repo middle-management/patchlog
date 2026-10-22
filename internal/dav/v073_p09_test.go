@@ -2,6 +2,7 @@ package dav_test
 
 import (
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -106,4 +107,115 @@ func TestV073DeleteWeakTag(t *testing.T) {
 	head := must(e.c.Head(e.ctx, "matches", "derby")).ID
 	e.expect(e.do("DELETE", "/cat/Season/derby.json", "", "If-Match", `W/"`+head+`"`), 204, "tree DELETE W/ the head")
 	e.expectTombstoned("matches", "derby", "the item")
+}
+
+// A text/ type needs a body in UTF-8, a leading BOM allowed; any other
+// body is application/octet-stream, whatever the name or the upload says
+// (§H.1, GW-4): on a PUT, a rename that uploads again or copies, a move
+// onto a file, and a copy, which keeps the source's blob only where the
+// type comes out as the source's.
+func TestV073RawTextNeedsUTF8(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("docs")}})
+	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	bad := "\xff\xfe\x00abc"
+	typeOf := func(name string) string {
+		t.Helper()
+		ref, _ := e.rawOf("docs", name)
+		return ref["type"].(string)
+	}
+	for _, c := range []struct{ name, ctype, body, typ string }{
+		{"bin.txt", "", bad, "application/octet-stream"},
+		{"bin.md", "text/markdown", bad, "application/octet-stream"},
+		{"bom.txt", "", "\xef\xbb\xbfhello", "text/plain"},
+		{"plain.csv", "", "a,b\n", "text/csv"},
+		{"x", "text/x-foo", bad, "application/octet-stream"},
+		{"y", "text/x-foo; charset=utf-8", "héllo", "text/x-foo"},
+		{"pic.png", "", bad, "image/png"},
+	} {
+		e.expect(e.do("PUT", "/docs/"+c.name, c.body, "Content-Type", c.ctype), 201, "PUT "+c.name)
+		if got := typeOf(c.name); got != c.typ {
+			t.Fatalf("%s as %q: %s, want %s", c.name, c.ctype, got, c.typ)
+		}
+	}
+	e.expect(e.do("PUT", "/cat/notes.md", bad), 201, "PUT in a tree")
+	if _, item := e.itemOf("cat", "notes.md"); typeOf(item) != "application/octet-stream" {
+		t.Fatalf("a tree's notes.md of bytes that aren't UTF-8: %s", typeOf(item))
+	}
+
+	// Another tool's text/plain file of bytes that aren't UTF-8.
+	e.rawDoc("docs", "data", "text/plain", []byte(bad), nil)
+	e.expect(e.do("COPY", "/docs/data", "", "Destination", "/docs/copy"), 201, "COPY")
+	ref, data := e.rawOf("docs", "copy")
+	if ref["type"] != "application/octet-stream" || string(data) != bad {
+		t.Fatalf("copy %v %q", ref, data)
+	}
+	if src, _ := e.rawOf("docs", "data"); src["$blob"] == ref["$blob"] {
+		t.Fatalf("the copy kept the source's blob of another type: %v", ref)
+	}
+	e.expect(e.do("MOVE", "/docs/data", "", "Destination", "/docs/data.txt"), 201, "MOVE to a .txt name")
+	if got := typeOf("data.txt"); got != "application/octet-stream" {
+		t.Fatalf("data.txt after a rename: %s", got)
+	}
+	// From an octet stream to a .txt name, the blob stays (Blob-From).
+	e.expect(e.do("MOVE", "/docs/data.txt", "", "Destination", "/docs/data2.txt"), 201, "MOVE to another .txt name")
+	if got := typeOf("data2.txt"); got != "application/octet-stream" {
+		t.Fatalf("data2.txt after a rename: %s", got)
+	}
+	e.expect(e.do("PUT", "/docs/target.md", "# text\n"), 201, "PUT target.md")
+	e.expect(e.do("MOVE", "/docs/data2.txt", "", "Destination", "/docs/target.md"), 204, "MOVE onto target.md")
+	ref, data = e.rawOf("docs", "target.md")
+	if ref["type"] != "application/octet-stream" || string(data) != bad {
+		t.Fatalf("target.md after a move onto it %v %q", ref, data)
+	}
+}
+
+// A raw file's type is its name's, else the upload's Content-Type, else,
+// for an existing file, the type it has, and only for a new one
+// application/octet-stream (§H.1, GW-5): a re-save without a type, or
+// with one that says nothing of the bytes, keeps the file's type, as
+// does a restore after the user's own DELETE.
+func TestV073RawTypeKept(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("docs")}})
+	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	typeOf := func(name string) string {
+		t.Helper()
+		ref, _ := e.rawOf("docs", name)
+		return ref["type"].(string)
+	}
+	e.expect(e.do("PUT", "/docs/x.foo", "one", "Content-Type", "image/x-foo"), 201, "PUT x.foo")
+	for i, c := range []struct{ ctype, typ string }{
+		{"", "image/x-foo"},
+		{"application/octet-stream", "image/x-foo"},
+		{"multipart/form-data; boundary=x", "image/x-foo"},
+		{"image/x-bar", "image/x-bar"},
+		{"", "image/x-bar"},
+	} {
+		e.expect(e.do("PUT", "/docs/x.foo", "v"+strconv.Itoa(i), "Content-Type", c.ctype), 201, "re-save x.foo as "+c.ctype)
+		if got := typeOf("x.foo"); got != c.typ {
+			t.Fatalf("x.foo re-saved as %q: %s, want %s", c.ctype, got, c.typ)
+		}
+	}
+	e.expect(e.do("PUT", "/docs/n.md", "# one", "Content-Type", "image/x-foo"), 201, "PUT n.md")
+	if got := typeOf("n.md"); got != "text/markdown" {
+		t.Fatalf("n.md: %s", got)
+	}
+	e.expect(e.do("PUT", "/docs/new", "bytes"), 201, "PUT a new file without a type")
+	if got := typeOf("new"); got != "application/octet-stream" {
+		t.Fatalf("new: %s", got)
+	}
+	// Deleted, then written again: restored with its type.
+	e.expect(e.do("PUT", "/docs/y", "one", "Content-Type", "image/x-foo"), 201, "PUT y")
+	e.expect(e.do("DELETE", "/docs/y", ""), 204, "DELETE y")
+	e.expect(e.do("PUT", "/docs/y", "two"), 201, "PUT y again")
+	if got := typeOf("y"); got != "image/x-foo" {
+		t.Fatalf("y restored: %s", got)
+	}
+	// A tree's file.
+	e.expect(e.do("PUT", "/cat/pic", "one", "Content-Type", "image/x-foo"), 201, "PUT /cat/pic")
+	e.expect(e.do("PUT", "/cat/pic", "two"), 201, "re-save /cat/pic without a type")
+	if _, item := e.itemOf("cat", "pic"); typeOf(item) != "image/x-foo" {
+		t.Fatalf("a tree's pic: %s", typeOf(item))
+	}
 }
