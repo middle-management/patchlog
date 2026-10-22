@@ -593,3 +593,22 @@ func TestV073BlobTypeHeaders(t *testing.T) {
 		}
 	}
 }
+
+// §7.1, §8.3 (BBD-43): a purged resource's …/raw in a sealed namespace is
+// the document URL's 410, before not_offered; a live one's stays 404
+// not_offered.
+func TestV073RawOfPurgedSealedResource(t *testing.T) {
+	t.Parallel()
+	e := newSealedEnv(t)
+	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
+	p1 := e.wr("s", "p", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+	e.wr("s", "q", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+	expect(t, e.purge("s", "p", p1, "admin"), 204)
+	for _, path := range []string{"/r/s/p/raw", "/r/s/p/rev/" + p1 + "/raw"} {
+		r := e.get(path)
+		if r.Code != 410 || r.Str("code") == "not_offered" || r.H.Get("Cache-Control") != ccLong {
+			t.Errorf("%s: %d %s %v, want the purge's 410, long", path, r.Code, r.Body, r.H.Get("Cache-Control"))
+		}
+	}
+	expectCode(t, e.get("/r/s/q/raw"), 404, "not_offered")
+}
