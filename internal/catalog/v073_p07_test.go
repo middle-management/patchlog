@@ -2,10 +2,13 @@ package catalog_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
+	"github.com/middle-management/patchlog/internal/catalog"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // patchMatches changes the matches namespace document (a * key's config
@@ -387,4 +390,48 @@ func TestInheritedPowersV073(t *testing.T) {
 	create(a, "f", 403)
 	w.issue(a, map[string]any{"node": "matches.m", "want": toAny("move"), "to": toAny("p1")}, 403)
 	create(c, "f", 403)
+}
+
+// TestFolderRolesByNameV073 (TC-49): no widening covers folders, and a
+// folder's roles compare by name; includes apply only to an item's roles,
+// read from its own content namespace (§B.11.4 No widening). The same
+// test classifies release changes (DiffAccess, §F.9).
+func TestFolderRolesByNameV073(t *testing.T) {
+	t.Parallel()
+	cfg := map[string]any{"catalog": map[string]any{"trust": toAny("matches")}}
+	docs := func(subUnder string) map[string]any {
+		return map[string]any{
+			"root":      map[string]any{"parents": []any{}},
+			"fa":        map[string]any{"parents": parents("root"), "$access": acc("group:g", "desk")},
+			"fr":        map[string]any{"parents": parents("root"), "$access": acc("group:g", "reader")},
+			"sub":       map[string]any{"parents": parents(subUnder)},
+			"matches.i": map[string]any{"parents": parents("sub")},
+		}
+	}
+	before := tree.BuildGraph("cat", cfg, docs("fa"))
+	after := tree.BuildGraph("cat", cfg, docs("fr"))
+	incs := map[string]catalog.Includes{"matches": {"desk": {"reader"}}}
+	d := catalog.DiffAccess(before, after, incs)
+	// sub gains reader by name; matches.i's reader is included by desk.
+	if got := fmt.Sprint(d.Widens); got != "[{sub group:g reader}]" {
+		t.Errorf("widens %s", got)
+	}
+	if got := fmt.Sprint(d.Narrows); got != "[{matches.i group:g desk} {sub group:g desk}]" {
+		t.Errorf("narrows %s", got)
+	}
+	// An item moving from desk to reader alone narrows: includes apply.
+	b2, a2 := tree.BuildGraph("cat", cfg, map[string]any{
+		"root":      map[string]any{"parents": []any{}},
+		"fa":        map[string]any{"parents": parents("root"), "$access": acc("group:g", "desk")},
+		"fr":        map[string]any{"parents": parents("root"), "$access": acc("group:g", "reader")},
+		"matches.i": map[string]any{"parents": parents("fa")},
+	}), tree.BuildGraph("cat", cfg, map[string]any{
+		"root":      map[string]any{"parents": []any{}},
+		"fa":        map[string]any{"parents": parents("root"), "$access": acc("group:g", "desk")},
+		"fr":        map[string]any{"parents": parents("root"), "$access": acc("group:g", "reader")},
+		"matches.i": map[string]any{"parents": parents("fr")},
+	})
+	if d := catalog.DiffAccess(b2, a2, incs); d.Kind() != "narrows" {
+		t.Errorf("an item's move from desk to reader: %s %v", d.Kind(), d)
+	}
 }

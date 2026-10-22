@@ -1032,9 +1032,10 @@ func TestNoWideningIncludes(t *testing.T) {
 		t.Errorf("widening message: %v", r.body)
 	}
 	move("matches.i3", "f-desk", 403)
-	// A folder (empty) moves under the same rule, with includes that hold
-	// in every trusted content namespace.
-	move("sub", "f-reader", 200)
+	// A folder's roles compare by name, without includes, which apply
+	// only to an item's roles (§B.11.4 v0.66): an empty folder moving
+	// from desk to reader widens by reader.
+	move("sub", "f-reader", 403)
 	move("sub", "f-chief", 403)
 	// Without the declaration, desk → reader widens.
 	cfg = must(w.ops.NSHead(ctx, "matches")).Config

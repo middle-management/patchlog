@@ -819,7 +819,7 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 		sort.Strings(subjects)
 		for _, subj := range subjects {
 			for _, r := range after[subj] {
-				if !present(g, pl, r, frozen[subj], incs) {
+				if !present(pl, r, frozen[subj], incs) {
 					wSubj, wRol, widens = subj, r, true
 					return
 				}
@@ -1380,28 +1380,19 @@ func (s *Service) includesAt(g *tree.Graph, latest map[string]Includes) map[stri
 	return out
 }
 
-// present reports whether role r counts as present before the move at
-// node d, given the roles before (§B.11.4: it, or a role including it,
-// was present). For a placement, includes are read from its item's own
-// content namespace. A folder's roles reach whatever is, or will be,
-// placed below it, so for a folder r must be implied in every trusted
-// content namespace (a namespace declaring nothing implies nothing).
-func present(g *tree.Graph, d, r string, before []string, incs map[string]Includes) bool {
+// present reports whether role r counts as present before at node d,
+// given the roles before (§B.11.4: it, or a role that includes it, was
+// present). Includes apply only to an item's roles, read from its own
+// content namespace: for a placement {ns}.{name}, incs[ns]. A folder's
+// roles compare by name (§B.11.4 No widening).
+func present(d, r string, before []string, incs map[string]Includes) bool {
 	if contains(before, r) {
 		return true
 	}
-	if n := g.Node(d); n != nil && n.ItemNS != "" {
-		return incs[n.ItemNS].closure(before)[r]
+	if ns, _, ok := tree.SplitPlacement(d); ok {
+		return incs[ns].closure(before)[r]
 	}
-	if len(incs) == 0 {
-		return false
-	}
-	for _, inc := range incs {
-		if !inc.closure(before)[r] {
-			return false
-		}
-	}
-	return true
+	return false
 }
 
 // widens reports a subject, node and role that a move of name to tos
@@ -1431,7 +1422,7 @@ func (s *Service) widens(g *tree.Graph, name string, tos []string, incs map[stri
 		sort.Strings(subjects)
 		for _, subj := range subjects {
 			for _, r := range after[subj] {
-				if !present(g, d, r, before[subj], incs) {
+				if !present(d, r, before[subj], incs) {
 					return subj, d, r, true
 				}
 			}

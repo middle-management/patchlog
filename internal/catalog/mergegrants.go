@@ -492,7 +492,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 				b := Effective(g, d, nil)
 				for _, subj := range subjectsOf(a) {
 					for _, r := range a[subj] {
-						if !present(after, d, r, b[subj], incs) {
+						if !present(d, r, b[subj], incs) {
 							err = forbidden("moving %s would give %s the role %s on %s", name, subj, r, after.Href(d))
 							return
 						}
