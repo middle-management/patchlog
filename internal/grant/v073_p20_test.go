@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/rules"
 )
 
 // GR-2 (§3.1, §C.8): a bearer's grant_block strings are I-JSON input, so a
@@ -71,6 +72,11 @@ func TestV073P20GrantRuleFragments(t *testing.T) {
 	}
 	if r.Eval(map[string]any{"principal": map[string]any{"id": "user:é"}}) {
 		t.Error("idn-email isn't asserted: user:é passed")
+	}
+	// The server evaluates a grant's rules compiled by rules.Compile
+	// (core's compileCached, grantcheck), which asserts it too.
+	if r, err := rules.Compile(g.Blocks[0].Rules[0]); err != nil || r.Eval(map[string]any{"principal": map[string]any{"id": "user:é"}}) {
+		t.Errorf("idn-email isn't asserted as the server evaluates the rule: %v", err)
 	}
 	g, err = Decode(mustMint(t, f, rule(map[string]any{"pattern": `^user:\u00e9$`})).Encode(), 0)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/rules"
 )
 
 // CIS-21 (§6.4.2, F-S3 default): rules written in a namespace document, in
@@ -112,5 +113,42 @@ func TestV073P20KeyEntryFields(t *testing.T) {
 	}
 	if re := c.Keys[0].SubPattern; !re.MatchString("user:éva") || re.MatchString("user:eva") {
 		t.Errorf("sub %s", re)
+	}
+}
+
+// CIS-15 (§6.4.2): the configuration in force is the stored document's
+// parse, which compiles its rules as stored; they still assert draft
+// 2020-12's formats, idn-email and idn-hostname included, as the parse
+// of the write that set them does. So does a key scope's attrs schema
+// when a grant's attrs are checked against it (§C.4).
+func TestV073P20StoredRuleFormats(t *testing.T) {
+	t.Parallel()
+	doc := v073Doc(`{"rules": [{"if": [{"op": "test", "path": "/action", "value": "create"}],
+		"then": [{"op": "test", "path": "/doc/email", "schema": {"type": "string", "format": "idn-email"}},
+			{"op": "test", "path": "/doc/host", "schema": {"type": "string", "format": "idn-hostname"}}]}]}`)
+	for name, md := range map[string]configMode{"write": {}, "stored": {stored: true}, "kept": {prev: doc}} {
+		c, err := parseConfigIn(doc, DefaultLimits(), DefaultMaximums(), md)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		env := func(email, host string) map[string]any {
+			return map[string]any{"action": "create", "doc": map[string]any{"email": email, "host": host}}
+		}
+		if _, _, ok := rules.EvalList(c.Rules, env("jörg@exämple.se", "exämple.se")); !ok {
+			t.Errorf("%s: a valid document failed", name)
+		}
+		if i, path, ok := rules.EvalList(c.Rules, env("not an email", "exämple.se")); ok || i != 0 || path != "/rules/0/then/0" {
+			t.Errorf("%s: idn-email: %d %q %v", name, i, path, ok)
+		}
+		if i, path, ok := rules.EvalList(c.Rules, env("jörg@exämple.se", "-bad-.se")); ok || i != 0 || path != "/rules/0/then/1" {
+			t.Errorf("%s: idn-hostname: %d %q %v", name, i, path, ok)
+		}
+	}
+	attrs := map[string]any{"properties": map[string]any{"mail": map[string]any{"type": "string", "format": "idn-email"}}}
+	if err := validateAttrs(attrs, map[string]any{"mail": "eva@exämple.se"}); err != nil {
+		t.Errorf("attrs inside the scope: %v", err)
+	}
+	if err := validateAttrs(attrs, map[string]any{"mail": "nope"}); err == nil {
+		t.Error("attrs outside the scope were accepted")
 	}
 }

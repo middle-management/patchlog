@@ -53,26 +53,46 @@ func init() {
 	}
 }
 
+// idnFormats are the two formats of draft 2020-12 the library lacks.
+var idnFormats = []*jsonschema.Format{
+	{Name: "idn-email", Validate: validateIDNEmail},
+	{Name: "idn-hostname", Validate: validateIDNHostname},
+}
+
 // v073Formats are the formats V073 registers over the library's own: the
 // two it lacks, and the two it asserts that draft 2020-12 doesn't define,
 // which are annotations there.
-var v073Formats = []*jsonschema.Format{
-	{Name: "idn-email", Validate: validateIDNEmail},
-	{Name: "idn-hostname", Validate: validateIDNHostname},
+var v073Formats = append([]*jsonschema.Format{
 	{Name: "semver", Validate: func(any) error { return nil }},
 	{Name: "period", Validate: func(any) error { return nil }},
-}
+}, idnFormats...)
 
 // Configure sets c up to compile schemas as r says: draft 2020-12 unless a
 // schema names another, format assertions on, the formats r asserts, and
-// patterns read as §6.6 says. Rule schema fragments (§6.4.2) compile
-// under V073.
+// patterns read as §6.6 says. Rule schema fragments (§6.4.2) compile by
+// ConfigureFragment.
 func (r Rules) Configure(c *jsonschema.Compiler) {
 	c.DefaultDraft(jsonschema.Draft2020)
 	c.AssertFormat()
 	c.UseRegexpEngine(r.regexpEngine)
 	if r == V073 {
 		for _, f := range v073Formats {
+			c.RegisterFormat(f)
+		}
+	}
+}
+
+// ConfigureFragment is Configure for a rule's schema fragment, which is
+// applied with format assertions as at step 5 of §6.2 whenever it was
+// written (§6.4.2): §6.1's "compiled as that version did" is a schema
+// document's. Under Legacy, a fragment stored before, idn-email and
+// idn-hostname are asserted too, as under V073, and the library's other
+// formats as v0.55 asserted them, semver and period included. So a
+// fragment written now evaluates alike under either marker.
+func (r Rules) ConfigureFragment(c *jsonschema.Compiler) {
+	r.Configure(c)
+	if r == Legacy {
+		for _, f := range idnFormats {
 			c.RegisterFormat(f)
 		}
 	}

@@ -88,10 +88,14 @@ type node interface {
 
 // Compile validates and compiles one rule as stored: its schema fragments
 // compile as v0.55 compiled them, held to none of the rules §6.4.2 now
-// has for fragments (F-S3): the library's formats asserted and patterns
-// read as §6.6 says, a pattern RE2 took as written included
-// (schema.Legacy). Rules from stored namespace documents, and those of a
-// grant decoded under CompileStrict, compile so.
+// has for fragments (F-S3): the library's formats asserted, semver and
+// period included, and patterns read as §6.6 says, a pattern RE2 took as
+// written included (schema.Legacy). But a fragment is applied with
+// draft 2020-12's format assertions whenever it was written (§6.4.2), so
+// idn-email and idn-hostname, which v0.55 ignored, are asserted too. A
+// rule CompileStrict accepts evaluates the same compiled so, which is how
+// rules from stored namespace documents, and those of a grant decoded
+// under CompileStrict, are evaluated.
 func Compile(v any) (*Rule, error) { return compile(v, false) }
 
 // CompileStrict compiles one rule written now, in a namespace document
@@ -441,7 +445,8 @@ const schemaURL = "urn:patchlog:rule"
 // (§6.4.2). strict holds it to the rules of a fragment written now and
 // compiles it under schema.V073 (CompileStrict); otherwise it compiles
 // as stored, under schema.Legacy, as v0.55 did, but for patterns with
-// \uXXXX, which RE2 refused then.
+// \uXXXX, which RE2 refused then, and idn-email and idn-hostname, which
+// it didn't assert (schema.Rules.ConfigureFragment).
 func compileSchema(v any, strict bool) (*jsonschema.Schema, error) {
 	switch v.(type) {
 	case map[string]any, bool:
@@ -456,7 +461,7 @@ func compileSchema(v any, strict bool) (*jsonschema.Schema, error) {
 		rs = schema.V073
 	}
 	c := jsonschema.NewCompiler()
-	rs.Configure(c)
+	rs.ConfigureFragment(c)
 	c.UseLoader(refuseLoader{})
 	if err := c.AddResource(schemaURL, jsonv.Clone(v)); err != nil {
 		return nil, fmt.Errorf("invalid schema: %w", err)

@@ -702,7 +702,9 @@ type configMode struct {
 // prev, anywhere in rules, roles or key scopes, which compiles as stored,
 // as a kept limit is held as stored: §6.4.2's fragment rules came after
 // it was stored (F-S3), and a write that leaves it alone, such as a
-// freeze, isn't refused for it.
+// freeze, isn't refused for it. A rule compiled as stored still asserts
+// draft 2020-12's formats (§6.4.2), so the configuration in force, a
+// stored document's parse, evaluates a rule as its write compiled it.
 func (md configMode) ruleCompiler() func(v any) ([]*rules.Rule, error) {
 	if md.stored {
 		return rules.CompileList

@@ -1,7 +1,10 @@
 package server
 
 import (
+	"path/filepath"
 	"testing"
+
+	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
 // CIS-21, CIS-15, CIS-16 (§6.4.2, §6.6, §C.4): over HTTP, a namespace
@@ -99,4 +102,74 @@ func TestV073P20RulePathOverHTTP(t *testing.T) {
 		t.Fatalf("rule failure %s", r.Body)
 	}
 	e.create("p", "x", map[string]any{"a": 1.0, "b": 2.0})
+}
+
+// CIS-15 (§6.4.2): a rule's schema is applied with draft 2020-12's
+// format assertions, idn-email and idn-hostname included, when the rule
+// is evaluated, not only when it is written: a namespace rule, a key
+// scope's rules and a role's rules, from the configuration in force, and
+// again once the server reopens the database with its caches cold.
+func TestV073P20RuleFormatsEvaluated(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "formats.db")
+	if pgtest.Enabled() {
+		path = pgtest.NewDB(t)
+	}
+	f := newAuthFixture(t, nil, withPath(path))
+	e := f.tenv
+	onCreate := func(p, format string) map[string]any {
+		return map[string]any{"if": []any{map[string]any{"op": "test", "path": "/action", "value": "create"}},
+			"then": []any{map[string]any{"op": "test", "path": p, "schema": map[string]any{"type": "string", "format": format}}}}
+	}
+	k := newKey("hosts")
+	entry := k.entry("read", "create")
+	entry["rules"] = []any{onCreate("/doc/host", "idn-hostname")}
+	expect(t, e.patchNS("sec", ops(
+		op("add", "/rules", []any{onCreate("/doc/email", "idn-email")}),
+		op("add", "/keys/-", entry),
+		op("add", "/roles/editor/rules", []any{onCreate("/doc/site", "idn-hostname")})), f.adminG), 201)
+	kg := e.grant(k, "user:kim", []string{"sec"}, []string{"read", "create"})
+	ed := e.grant(f.issuer, "user:ed", []string{"sec"}, nil, map[string]any{"roles": []any{"editor"}})
+	check := func(e *tenv, n string) {
+		t.Helper()
+		// The namespace rule.
+		r := e.write("PATCH", "sec", "ns"+n, "", addRoot(map[string]any{"email": "not an email"}), f.issuerG)
+		expectCode(t, r, 422, "rule")
+		if r.Obj()["path"] != "/rules/0/then/0" {
+			t.Errorf("rule failure %s", r.Body)
+		}
+		e.create("sec", "ns"+n, map[string]any{"email": "jörg@exämple.se"}, f.issuerG)
+		// The key scope's rule.
+		expectCode(t, e.write("PATCH", "sec", "key"+n, "", addRoot(map[string]any{"email": "kim@exämple.se", "host": "-bad-.se"}), kg), 403, "forbidden")
+		e.create("sec", "key"+n, map[string]any{"email": "kim@exämple.se", "host": "exämple.se"}, kg)
+		// The role's rule.
+		expectCode(t, e.write("PATCH", "sec", "role"+n, "", addRoot(map[string]any{"email": "ed@exämple.se", "site": "-bad-.se"}), ed), 403, "forbidden")
+		e.create("sec", "role"+n, map[string]any{"email": "ed@exämple.se", "site": "exämple.se"}, ed)
+	}
+	check(e, "1")
+	e.close()
+	check(newAuthEnv(t, withPath(path)), "2")
+}
+
+// CIS-15 (§6.4.2, §C.4, §C.8): a grant's block rules and a key scope's
+// attrs schema assert idn-email and idn-hostname when a request is
+// judged: a block rule refuses a write it doesn't allow, and attrs
+// outside the key scope allow nothing.
+func TestV073P20GrantFormatsEvaluated(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil)
+	e := f.tenv
+	g := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read", "create"}, map[string]any{"rules": []any{
+		map[string]any{"if": []any{map[string]any{"op": "test", "path": "/action", "value": "create"}},
+			"then": []any{map[string]any{"op": "test", "path": "/doc/host",
+				"schema": map[string]any{"type": "string", "format": "idn-hostname"}}}}}})
+	expectCode(t, e.write("PATCH", "sec", "h", "", addRoot(map[string]any{"host": "-bad-.se"}), g), 403, "forbidden")
+	e.create("sec", "h", map[string]any{"host": "exämple.se"}, g)
+
+	k := newKey("mailkey")
+	entry := k.entry("read")
+	entry["attrs"] = map[string]any{"properties": map[string]any{"mail": map[string]any{"type": "string", "format": "idn-email"}}}
+	expect(t, e.patchNS("sec", ops(op("add", "/keys/-", entry)), f.adminG), 201)
+	expect(t, e.get("/r/sec/h", e.grant(k, "user:eva", []string{"sec"}, []string{"read"}, map[string]any{"attrs": map[string]any{"mail": "eva@exämple.se"}})), 302)
+	expectCode(t, e.get("/r/sec/h", e.grant(k, "user:eva", []string{"sec"}, []string{"read"}, map[string]any{"attrs": map[string]any{"mail": "nope"}})), 404, "not_found")
 }

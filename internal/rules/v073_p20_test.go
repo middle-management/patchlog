@@ -296,8 +296,10 @@ func TestV073P20SchemaFragments(t *testing.T) {
 	}
 
 	// As stored: what v0.55 accepted still compiles, and validates as it
-	// did (semver asserted by the library, idn-email not); \u patterns,
-	// which RE2 refused, now compile too.
+	// did (semver asserted by the library), but for draft 2020-12's
+	// formats, which §6.4.2 asserts whenever a fragment was written
+	// (idn-email, which v0.55 ignored); \u patterns, which RE2 refused,
+	// now compile too.
 	for _, x := range []struct {
 		schema, yes, no string
 	}{
@@ -306,7 +308,8 @@ func TestV073P20SchemaFragments(t *testing.T) {
 		{`{"properties":{"b":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"string"}}}`, `{"b":"s"}`, `{"b":1}`},
 		{`{"format":"semver"}`, `"1.2.3"`, `"one"`},
 		{`{"format":"nope","type":"string"}`, `"s"`, `1`},
-		{`{"format":"idn-email","type":"string"}`, `"not an email"`, `1`},
+		{`{"format":"idn-email","type":"string"}`, `"jörg@exämple.se"`, `"not an email"`},
+		{`{"format":"idn-hostname","properties":{"b":{"$schema":"https://json-schema.org/draft/2020-12/schema","format":"semver"}}}`, `"exämple.se"`, `"-bad-.se"`},
 		{`{"pattern":"^\\u00e9$"}`, `"é"`, `"e"`},
 		{`{"pattern":"^\\x{D800}?a$"}`, `"a"`, `"b"`},
 	} {
@@ -340,5 +343,49 @@ func TestV073P20SchemaFragments(t *testing.T) {
 	}
 	if _, err := CompileListStrict([]any{nested}, func(r any) bool { return jsonv.Equal(r, nested) }); err != nil {
 		t.Errorf("a kept nested rule: %v", err)
+	}
+}
+
+// CIS-15 (§6.4.2): a rule's schema is applied with format assertions as
+// at step 5 of §6.2, whichever way the rule compiles. A rule written now
+// is accepted by CompileStrict, but evaluated as it is compiled from
+// where it is kept: a grant's rules and a key scope's attrs through
+// Compile, a namespace document's through CompileList (its stored
+// parse). Each asserts what CompileStrict's does.
+func TestV073P20FragmentFormatsEvaluated(t *testing.T) {
+	t.Parallel()
+	for _, x := range []struct {
+		schema, yes, no string
+	}{
+		{`{"type":"string","format":"idn-email"}`, `"jörg@exämple.se"`, `"not an email"`},
+		{`{"type":"string","format":"idn-hostname"}`, `"exämple.se"`, `"-bad-.se"`},
+		{`{"properties":{"mail":{"format":"idn-email"}}}`, `{"mail":"eva@exämple.se"}`, `{"mail":"nope"}`},
+		{`{"format":"email"}`, `"a@example.se"`, `"nope"`},
+		{`{"pattern":"^\\u00e9$","format":"idn-hostname"}`, `"é"`, `"e"`},
+	} {
+		v := jsonv.MustParse([]byte(`{"op":"test","path":"/a","schema":` + x.schema + `}`))
+		strict, err := CompileStrict(v)
+		if err != nil {
+			t.Fatalf("CompileStrict(%s): %v", x.schema, err)
+		}
+		stored, err := Compile(v)
+		if err != nil {
+			t.Fatalf("Compile(%s): %v", x.schema, err)
+		}
+		list, err := CompileList([]any{v})
+		if err != nil {
+			t.Fatalf("CompileList(%s): %v", x.schema, err)
+		}
+		for name, r := range map[string]*Rule{"CompileStrict": strict, "Compile": stored, "CompileList": list[0]} {
+			if !r.Eval(env(`{"a":` + x.yes + `}`)) {
+				t.Errorf("%s(%s): %s fails", name, x.schema, x.yes)
+			}
+			if r.Eval(env(`{"a":` + x.no + `}`)) {
+				t.Errorf("%s(%s): %s passes", name, x.schema, x.no)
+			}
+			if got := r.EvalTri(env(`{"a":` + x.no + `}`)); got != False {
+				t.Errorf("%s(%s): EvalTri of %s is %v", name, x.schema, x.no, got)
+			}
+		}
 	}
 }
