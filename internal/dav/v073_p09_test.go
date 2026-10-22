@@ -3,6 +3,7 @@ package dav_test
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -277,5 +278,50 @@ func TestV073RawSaveAlwaysStored(t *testing.T) {
 		if h.State != client.Live || r.header.Get("ETag") != `"`+h.ID+`"` {
 			t.Fatalf("%s restored: %v, ETag %q, head %s", p, h.State, r.header.Get("ETag"), h.ID)
 		}
+	}
+}
+
+// A new file over a tombstoned resource whose last revision has
+// $successor (moved away) is 409 naming the new path, never made anew:
+// its file in the same namespace's directory, else /r/{ns}/{name}; so is
+// the save after a 409 for someone else's delete and its 404 reload, and
+// a move onto the old name (§H.2 "Flat view", §H.4 "The reload", GW-23).
+func TestV073NewFileOverMovedAway(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs", "other"}, nil, nil)
+	o := e.another()
+	refused := func(r resp, to string) {
+		t.Helper()
+		if !strings.Contains(r.body, to) {
+			t.Fatalf("409 naming %s: %q", to, r.body)
+		}
+	}
+	e.create("docs", "x", map[string]any{"a": "1"})
+	o.expect(o.do("MOVE", "/docs/x.json", "", "Destination", "/docs/y.json"), 201, "someone else's MOVE")
+	refused(e.expect(e.do("PUT", "/docs/x.json", `{"a": "mine"}`), 409, "PUT the old name"), "/docs/y.json")
+	e.expectTombstoned("docs", "x", "x")
+
+	e.rawDoc("docs", "n.md", "text/markdown", []byte("one"), nil)
+	e.expect(e.do("GET", "/docs/n.md", ""), 200, "GET n.md")
+	o.expect(o.do("MOVE", "/docs/n.md", "", "Destination", "/docs/m.md"), 201, "someone else's MOVE of a raw file")
+	e.expect(e.do("PUT", "/docs/n.md", "mine"), 409, "PUT over someone else's delete")
+	e.expect(e.do("GET", "/docs/n.md", ""), 404, "the reload")
+	refused(e.expect(e.do("PUT", "/docs/n.md", "mine"), 409, "PUT after the reload"), "/docs/m.md")
+	e.expectTombstoned("docs", "n.md", "n.md")
+
+	e.create("docs", "far", map[string]any{"a": "1"})
+	o.expect(o.do("MOVE", "/docs/far.json", "", "Destination", "/other/far.json"), 201, "someone else's MOVE to another namespace")
+	refused(e.expect(e.do("PUT", "/docs/far.json", `{"a": "mine"}`), 409, "PUT the old name"), "/r/other/far")
+
+	e.create("docs", "z", map[string]any{"a": "z"})
+	refused(e.expect(e.do("MOVE", "/docs/z.json", "", "Destination", "/docs/x.json"), 409, "MOVE onto the old name"), "/docs/y.json")
+	e.create("other", "q", map[string]any{"a": "q"})
+	refused(e.expect(e.do("MOVE", "/other/q.json", "", "Destination", "/docs/x.json"), 409, "MOVE from another namespace onto the old name"), "/docs/y.json")
+	e.expectTombstoned("docs", "x", "x")
+	if h, _ := e.load("docs", "z"); h.State != client.Live {
+		t.Fatalf("z %v", h.State)
+	}
+	if h, _ := e.load("other", "q"); h.State != client.Live {
+		t.Fatalf("q %v", h.State)
 	}
 }

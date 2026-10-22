@@ -169,17 +169,19 @@ func TestSaveOverOthersDelete(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/z.json", `{"a": "1", "b": "2"}`), 201, "PUT 31 s after the user's DELETE")
 	whole("z")
 
-	// Moved away (its last document has $successor): a write to the old
-	// name moments after makes it anew, without the $successor.
+	// Moved away (its last document has $successor): no write to the old
+	// name makes it anew, moments after or later (§H.2, §H.4): a 409
+	// naming the new path.
 	e.create("docs", "m", map[string]any{"a": "1"})
 	e.expect(e.do("MOVE", "/docs/m.json", "", "Destination", "/docs/n.json"), 201, "MOVE")
 	if h, _ := e.load("docs", "m"); h.Successor != "n" {
 		t.Fatalf("m's successor %q", h.Successor)
 	}
-	e.expect(e.do("PUT", "/docs/m.json", `{"a": "again"}`), 201, "PUT the old name")
-	whole("m")
-	_, doc = e.load("docs", "m")
-	sameJSON(t, doc, map[string]any{"a": "again"})
+	r = e.expect(e.do("PUT", "/docs/m.json", `{"a": "again"}`), 409, "PUT the old name")
+	if !strings.Contains(r.body, "/docs/n.json") {
+		t.Fatalf("409 %q", r.body)
+	}
+	e.expectTombstoned("docs", "m", "after the refused save")
 }
 
 // Saves of a JSON file are patch sets from the base's rendering (§H.4):
