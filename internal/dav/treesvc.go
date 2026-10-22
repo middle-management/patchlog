@@ -593,6 +593,7 @@ func (st *reqState) nodeBorn(ctx context.Context, cat, name string) time.Time {
 
 // svcAnswer is a listing page, or the tree service's error (§12).
 type svcAnswer struct {
+	At       string    `json:"at"`
 	Children []svcItem `json:"children"`
 	Next     string    `json:"next"`
 	Code     string    `json:"code"`
@@ -619,7 +620,8 @@ func (st *reqState) svcList(ctx context.Context, cat, folder string, mins []stri
 		return nil, err
 	}
 	var out []svcItem
-	for hops, pages := 0, 0; ; {
+	cursorAt := "" // the at of the position the page asked for follows
+	for hops, pages, restarts := 0, 0, 0; ; {
 		a, loc, err := st.svcGet(ctx, cat, u, len(mins) > 0)
 		switch {
 		case err != nil && len(mins) > 0 && ctx.Err() != nil && parent.Err() == nil:
@@ -632,6 +634,19 @@ func (st *reqState) svcList(ctx context.Context, cat, folder string, mins []stri
 			}
 			u = loc
 			continue
+		}
+		// A page at another at than the position it follows: that at's
+		// pages were no longer kept, the redirect led to the current at,
+		// and the tree service started the folder again there (§B.5).
+		// What was collected belongs to another listing: keep this one
+		// alone, a single snapshot, rather than show its first children
+		// twice (numbered as duplicate titles) or count them against the
+		// folder's limit.
+		if cursorAt != "" && a.At != cursorAt {
+			if restarts++; restarts > 4 {
+				return nil, fail(http.StatusBadGateway, "catalog %s's tree service started the listing of %s again more than 4 times", cat, folder)
+			}
+			out, pages = nil, 0
 		}
 		out = append(out, a.Children...)
 		if a.Next == "" {
@@ -647,7 +662,23 @@ func (st *reqState) svcList(ctx context.Context, cat, folder string, mins []stri
 		nu := *u
 		nu.RawQuery = strings.TrimPrefix(a.Next, "?")
 		u, hops = &nu, 0
+		cursorAt = positionAt(nu.Query().Get("after"))
 	}
+}
+
+// positionAt is the at of a children position "{pos}~{at}~{last}" (§B.5),
+// or "" for anything else, such as an earlier release's order key, which
+// a tree service continues at whatever at it answers at.
+func positionAt(after string) string {
+	_, rest, ok := strings.Cut(after, "~")
+	if !ok {
+		return ""
+	}
+	at, _, ok := strings.Cut(rest, "~")
+	if !ok {
+		return ""
+	}
+	return at
 }
 
 // svcGet reads one URL of catalog cat's tree service: a page, or a
