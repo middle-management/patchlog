@@ -2046,6 +2046,10 @@ type reqState struct {
 	// gone (tombBase).
 	onto string
 	gone []stagedServe
+	// moving: a live file's content is being written to the MOVE's
+	// destination (moveAcross), which a name moved away takes as a new
+	// file: a move, not a save (movedAway)
+	moving bool
 
 	lists  map[string]*listing     // by directory path
 	graphs map[string]*catGraph    // by catalog

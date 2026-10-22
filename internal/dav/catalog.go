@@ -1551,7 +1551,9 @@ func (st *reqState) moveAcross(ctx context.Context, src, dst target) error {
 		}
 	}
 	st.wroteTo = ""
+	st.moving = true
 	rev, _, err := st.commitRev(ctx, dst, b)
+	st.moving = false
 	if err != nil {
 		return err
 	}

@@ -1408,18 +1408,7 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 			item.IfNoneMatch = true
 			item.Steps = []client.Step{client.PatchStep(withNonce(in, doc, client.GenesisPatches(doc)))}
 		case client.Tombstoned:
-			// A name moved away isn't made anew (movedAway).
-			var last *docEntry
-			if th.Last != "" {
-				if last, err = st.s.doc(ctx, st.tk, ns, to, th.Last); pruned(err) {
-					last = nil
-				} else if err != nil {
-					return false, err
-				}
-			}
-			if err := movedAway(ns, to, th, last); err != nil {
-				return false, err
-			}
+			// Restored, a name moved away too: a MOVE is no save (movedAway).
 			item.IfMatch = th.ID
 			item.Steps = []client.Step{client.PatchStep(withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}))}
 		case client.Purged:

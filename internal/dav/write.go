@@ -235,8 +235,9 @@ func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name stri
 // gone) lets the write make a new file; a 409 naming where it went for
 // a file moved away, whose last revision has $successor (§8.1), which no
 // save makes anew, before or after that reload (movedAway, §H.2 "Flat
-// view", §H.4 "The reload"); else nil: a new file, but not by a token
-// refused a save of it that hasn't read it since (refusedSave).
+// view", §H.4 "The reload"), though a MOVE of a live file there does, a
+// rename back included (moving); else nil: a new file, but not by a
+// token refused a save of it that hasn't read it since (refusedSave).
 func (st *reqState) tombBase(ctx context.Context, ns, name string, h *client.Head) (*docEntry, error) {
 	last, err := st.tombLast(ctx, ns, name, h)
 	if err == nil && last == nil {
@@ -269,8 +270,10 @@ func (st *reqState) tombLast(ctx context.Context, ns, name string, h *client.Hea
 			return nil, nil
 		}
 	}
-	if err := movedAway(ns, name, h, last); err != nil {
-		return nil, err
+	if !st.moving {
+		if err := movedAway(ns, name, h, last); err != nil {
+			return nil, err
+		}
 	}
 	if !own || last == nil {
 		return nil, nil
@@ -283,7 +286,9 @@ func (st *reqState) tombLast(ctx context.Context, ns, name string, h *client.Hea
 // (§8.1): it moved, and no save makes it anew (§H.2 "Flat view", §H.4
 // "The reload", §H.6): a 409 naming where it went, as a path the user can
 // open: its file in the same namespace's directory (a raw file by its
-// name, a JSON file as {name}.json, §H.2), else /r/{ns}/{name}.
+// name, a JSON file as {name}.json, §H.2), else /r/{ns}/{name}. A MOVE
+// of a live file to the name isn't a save, and makes it anew (a rename
+// back would otherwise be refused, naming its own source).
 func movedAway(ns, name string, h *client.Head, last *docEntry) error {
 	succ := h.Successor
 	if succ == "" && last != nil {

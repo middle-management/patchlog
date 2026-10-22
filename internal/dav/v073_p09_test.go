@@ -285,7 +285,9 @@ func TestV073RawSaveAlwaysStored(t *testing.T) {
 // $successor (moved away) is 409 naming the new path, never made anew:
 // its file in the same namespace's directory, else /r/{ns}/{name}; so is
 // the save after a 409 for someone else's delete and its 404 reload, and
-// a move onto the old name (§H.2 "Flat view", §H.4 "The reload", GW-23).
+// a temporary file moved over the old name, a save too (§H.2 "Flat
+// view", §H.4 "The reload", GW-23). A MOVE of a live file there is no
+// save: a rename back makes the name anew.
 func TestV073NewFileOverMovedAway(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, []string{"docs", "other"}, nil, nil)
@@ -313,17 +315,16 @@ func TestV073NewFileOverMovedAway(t *testing.T) {
 	o.expect(o.do("MOVE", "/docs/far.json", "", "Destination", "/other/far.json"), 201, "someone else's MOVE to another namespace")
 	refused(e.expect(e.do("PUT", "/docs/far.json", `{"a": "mine"}`), 409, "PUT the old name"), "/r/other/far")
 
-	e.create("docs", "z", map[string]any{"a": "z"})
-	refused(e.expect(e.do("MOVE", "/docs/z.json", "", "Destination", "/docs/x.json"), 409, "MOVE onto the old name"), "/docs/y.json")
-	e.create("other", "q", map[string]any{"a": "q"})
-	refused(e.expect(e.do("MOVE", "/other/q.json", "", "Destination", "/docs/x.json"), 409, "MOVE from another namespace onto the old name"), "/docs/y.json")
+	e.expect(e.do("PUT", "/docs/.goutputstream-x", `{"a": "mine"}`), 201, "PUT a temporary file")
+	refused(e.expect(e.do("MOVE", "/docs/.goutputstream-x", "", "Destination", "/docs/x.json"), 409, "a temporary file moved over the old name"), "/docs/y.json")
 	e.expectTombstoned("docs", "x", "x")
-	if h, _ := e.load("docs", "z"); h.State != client.Live {
-		t.Fatalf("z %v", h.State)
-	}
-	if h, _ := e.load("other", "q"); h.State != client.Live {
-		t.Fatalf("q %v", h.State)
-	}
+
+	e.expect(e.do("MOVE", "/docs/y.json", "", "Destination", "/docs/x.json"), 201, "a rename back")
+	_, doc := e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"a": "1"})
+	e.expect(e.do("MOVE", "/other/far.json", "", "Destination", "/docs/far.json"), 201, "a move back from another namespace")
+	_, doc = e.load("docs", "far")
+	sameJSON(t, doc, map[string]any{"a": "1"})
 }
 
 // Records last a day, and a path whose records expired counts as
