@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -123,30 +124,51 @@ func etag(h string) (string, bool) {
 	return "", false
 }
 
+// precond is a write's precondition (§7.2).
 type precond struct {
 	ifMatch     string
 	ifNoneMatch bool
 }
 
+// sent reports whether the write carried a precondition.
+func (p precond) sent() bool { return p.ifMatch != "" || p.ifNoneMatch }
+
+// preconditions reads a write's If-Match and If-None-Match (§7, §7.2):
+// each, if present, once; If-Match one strong entity tag around an id in
+// text form, so never *, a weak tag, a list or a sealed ETag's "{id}.{e}";
+// If-None-Match only *; never both. Anything else, an empty value
+// included, is 400, a request-shape error answered before step 1 (§6.2).
+// Whether the write takes the precondition it carries is the core's 428.
 func preconditions(r *http.Request) (precond, error) {
 	var p precond
-	if v := r.Header.Get("If-None-Match"); v != "" {
-		if strings.TrimSpace(v) != "*" {
-			return p, badInput("If-None-Match must be *")
+	if vs := r.Header.Values("If-None-Match"); len(vs) > 0 {
+		if len(vs) > 1 || strings.TrimSpace(vs[0]) != "*" {
+			return p, badInput("If-None-Match must be * (§7.2)")
 		}
 		p.ifNoneMatch = true
 	}
-	if v := r.Header.Get("If-Match"); v != "" {
-		t, ok := etag(v)
-		if !ok {
-			return p, badInput("If-Match must be one quoted id")
+	if vs := r.Header.Values("If-Match"); len(vs) > 0 {
+		t, ok := etag(vs[0])
+		if len(vs) > 1 || !ok || !validID(t) {
+			return p, badInput(`If-Match must be one strong entity tag around an id, "{id}" (§7, §7.2)`)
 		}
 		p.ifMatch = t
 	}
 	if p.ifMatch != "" && p.ifNoneMatch {
-		return p, badInput("both If-Match and If-None-Match")
+		return p, badInput("both If-Match and If-None-Match (§7.2)")
 	}
 	return p, nil
+}
+
+// errMessage is an error's message, as a 400 carries it.
+func errMessage(err error) string {
+	var ae *core.Error
+	if errors.As(err, &ae) {
+		if m, ok := ae.Body["message"].(string); ok {
+			return m
+		}
+	}
+	return err.Error()
 }
 
 // gestures reads a write's Gesture and Undoes headers (§7.2): each, if
@@ -251,8 +273,8 @@ func parseBatch(body any) ([]core.Item, *core.ConfigChange, any, error) {
 					it.Resource, _ = v.(string)
 				case "ifMatch":
 					s, ok := v.(string)
-					if !ok {
-						return nil, nil, nil, badInput(fmt.Sprintf("item %d: ifMatch must be an id", i))
+					if !ok || !validID(s) {
+						return nil, nil, nil, badInput(fmt.Sprintf("item %d: ifMatch must be an id in text form (§7, §7.5)", i))
 					}
 					it.IfMatch = s
 				case "ifNoneMatch":
@@ -272,6 +294,11 @@ func parseBatch(body any) ([]core.Item, *core.ConfigChange, any, error) {
 					return nil, nil, nil, badInput(fmt.Sprintf("item %d: unknown member %s", i, k))
 				}
 			}
+			// Two preconditions are the batch's own 400, never an item's
+			// report (§7.5, §6.2).
+			if it.IfMatch != "" && it.IfNoneMatch {
+				return nil, nil, nil, badInput(fmt.Sprintf("item %d: both ifMatch and ifNoneMatch (§7.5)", i))
+			}
 			// The steps after the item's members, whose defaults they take.
 			for j, st := range steps {
 				step, err := parseStep(st, itemG, fmt.Sprintf("item %d, step %d", i, j))
@@ -290,7 +317,13 @@ func parseBatch(body any) ([]core.Item, *core.ConfigChange, any, error) {
 			return nil, nil, nil, badInput("config must be an object")
 		}
 		cc = &core.ConfigChange{Patches: o["patches"]}
-		cc.IfMatch, _ = o["ifMatch"].(string)
+		if v, has := o["ifMatch"]; has {
+			s, ok := v.(string)
+			if !ok || !validID(s) {
+				return nil, nil, nil, badInput("config: ifMatch must be a config id in text form (§7, §7.5)")
+			}
+			cc.IfMatch = s
+		}
 		if cc.Patches == nil {
 			return nil, nil, nil, badInput("config needs patches")
 		}

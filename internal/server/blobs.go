@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/core"
@@ -18,8 +19,7 @@ func (s *Server) blobPut(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	up := core.BlobUpload{Type: r.Header.Get("Content-Type"), Nonce: r.Header.Get("Blob-Nonce"),
-		From: r.Header.Get("Blob-From"), Body: r.Body, Length: r.ContentLength}
+	up := blobUpload(r)
 	if up.From != "" {
 		// A copy has an empty body (400 if not, in its place in the order,
 		// before any body is read): a declared length says so; only a
@@ -41,6 +41,24 @@ func (s *Server) blobPut(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("ETag", quote(bid))
 	w.Header().Set("Location", "/r/"+ns+"/"+name+"/blob/"+bid)
 	w.WriteHeader(201)
+}
+
+// blobUpload is what an upload or copy's headers say (§7.8), for the
+// core's checks in their order: Blob-Nonce as sent, repeated values joined
+// as a list would be, which is no nonce (check 4); whether a precondition,
+// which an upload doesn't take, was sent (428 at check 4); and two, or a
+// malformed one, as a request-shape error in its headers (400 at check 4).
+func blobUpload(r *http.Request) core.BlobUpload {
+	up := core.BlobUpload{Type: r.Header.Get("Content-Type"), From: r.Header.Get("Blob-From"), Body: r.Body, Length: r.ContentLength}
+	if vs := r.Header.Values("Blob-Nonce"); len(vs) > 0 {
+		up.NonceSent, up.Nonce = true, strings.Join(vs, ",")
+	}
+	if p, err := preconditions(r); err != nil {
+		up.ShapeErr = errMessage(err)
+	} else {
+		up.Precondition = p.sent()
+	}
+	return up
 }
 
 // blobRoutes are the routes that read blobs, whose every answer carries

@@ -3,6 +3,7 @@ package server
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -270,4 +271,197 @@ func TestV073LastEventIDWins(t *testing.T) {
 	other := hashID(t, "", []byte("other"))
 	expectCode(t, e.do(req{method: "GET", path: "/r/docs/a/events?since=" + r1, hdr: map[string]string{"Last-Event-ID": other}}), 404, "not_found")
 	expectCode(t, e.do(req{method: "GET", path: "/ns/docs/events?since=" + n1, hdr: map[string]string{"Last-Event-ID": other}}), 404, "not_found")
+}
+
+// §7, §7.2, §7.5 (CIS-5, GB-23): a write's precondition is one strong
+// entity tag around a text id or If-None-Match: *; If-Match: *, a weak tag,
+// a list, a sealed "{id}.{e}", a non-id, an empty value, both headers, and
+// in a batch both item preconditions or a malformed ifMatch, are the
+// request's own 400 before step 1, never a per-item report. So are a
+// malformed branch or registration at and prune horizon or keep; a
+// well-formed id that isn't in the chain stays 422.
+func TestV073PreconditionShapes(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	id := e.create("m", "a", map[string]any{"n": 1})
+	cfg := e.configID("m")
+	patch := ops(op("add", "/x", 1))
+	bad := []string{"*", `W/"` + id + `"`, `"` + id + `", "` + id + `"`, `"` + id + `.3"`, `"zzz"`, `"` + strings.ToUpper(id) + `"`, id, `""`}
+	for _, im := range bad {
+		h := map[string]string{"If-Match": im}
+		expectShape(t, "PATCH If-Match "+im, e.do(req{method: "PATCH", path: "/r/m/a", body: patch, hdr: h, author: "alice"}))
+		expectShape(t, "DELETE If-Match "+im, e.do(req{method: "DELETE", path: "/r/m/a", hdr: h, author: "alice"}))
+		expectShape(t, "config If-Match "+im, e.do(req{method: "PATCH", path: "/ns/m", body: ops(op("add", "/x-a", 1)), hdr: h, author: "alice"}))
+		expectShape(t, "purge If-Match "+im, e.do(req{method: "POST", path: "/r/m/a/purge", hdr: h, author: "alice"}))
+		expectShape(t, "prune If-Match "+im, e.do(req{method: "POST", path: "/r/m/a/prune", body: map[string]any{"horizon": id}, hdr: h, author: "alice"}))
+	}
+	for _, inm := range []string{`"` + id + `"`, "**", `W/"` + id + `"`} {
+		expectShape(t, "If-None-Match "+inm, e.do(req{method: "PATCH", path: "/r/m/b", body: addRoot(map[string]any{}), hdr: map[string]string{"If-None-Match": inm}, author: "alice"}))
+	}
+	both := map[string]string{"If-Match": `"` + id + `"`, "If-None-Match": "*"}
+	expectShape(t, "PATCH both", e.do(req{method: "PATCH", path: "/r/m/a", body: patch, hdr: both, author: "alice"}))
+	expectShape(t, "prune both", e.do(req{method: "POST", path: "/r/m/a/prune", body: map[string]any{"horizon": id}, hdr: both, author: "alice"}))
+	if e.head("m", "a") != id {
+		t.Fatal("a refused write moved the head")
+	}
+	// A config write's malformed If-Match was ignored (412); now 400, and a
+	// well-formed stale one is still 412.
+	expectCode(t, e.do(req{method: "PATCH", path: "/ns/m", ifMatch: id, body: ops(op("add", "/x-a", 1)), author: "alice"}), 412, "stale")
+	expect(t, e.do(req{method: "PATCH", path: "/ns/m", ifMatch: cfg, body: ops(op("add", "/x-a", 1)), author: "alice"}), 201)
+
+	// Batches: two item preconditions, or a malformed ifMatch, are the
+	// batch's own 400, without items.
+	item := func(m map[string]any) map[string]any {
+		m["resource"], m["steps"] = "a", []any{patch}
+		return m
+	}
+	cfgChange := func(ifMatch any) map[string]any {
+		return map[string]any{"config": map[string]any{"ifMatch": ifMatch, "patches": ops(op("add", "/x-b", 1))}}
+	}
+	for name, body := range map[string]map[string]any{
+		"both":                 {"items": []any{item(map[string]any{"ifMatch": id, "ifNoneMatch": "*"})}},
+		"uppercase":            {"items": []any{item(map[string]any{"ifMatch": strings.ToUpper(id)})}},
+		"sealed ETag":          {"items": []any{item(map[string]any{"ifMatch": id + ".1"})}},
+		"empty":                {"items": []any{item(map[string]any{"ifMatch": ""})}},
+		"quoted":               {"items": []any{item(map[string]any{"ifMatch": `"` + id + `"`})}},
+		"config ifMatch":       cfgChange("zzz"),
+		"config ifMatch not a": cfgChange(1.0),
+	} {
+		r := e.batchReq("m", body, "alice")
+		expectShape(t, "batch "+name, r)
+		if _, has := r.Obj()["items"]; has {
+			t.Errorf("batch %s: reported per item: %s", name, r.Body)
+		}
+	}
+	// Under a grant without the verbs, the shape error still wins.
+	f := newAuthFixture(t, nil)
+	ro := f.grant(f.issuer, "user:ro", []string{"sec"}, []string{"read"})
+	r := f.batchReq("sec", map[string]any{"items": []any{item(map[string]any{"ifMatch": id, "ifNoneMatch": "*"})}}, ro)
+	expectShape(t, "batch both, unauthorised", r)
+	// Before authentication for single writes.
+	expectShape(t, "PATCH weak, no grant", f.do(req{method: "PATCH", path: "/r/sec/a", body: patch, hdr: map[string]string{"If-Match": `W/"` + id + `"`}}))
+	expectShape(t, "PATCH *, no grant", f.do(req{method: "PATCH", path: "/r/nowhere/a", body: patch, hdr: map[string]string{"If-Match": "*"}}))
+	// And before a frozen namespace's 409.
+	e.mkNS("fz", map[string]any{"read": "public", "frozen": true})
+	expectShape(t, "PATCH sealed ETag, frozen", e.do(req{method: "PATCH", path: "/r/fz/a", body: patch, hdr: map[string]string{"If-Match": `"` + id + `.3"`}, author: "alice"}))
+
+	// Branch creation and remote registration: at.
+	for _, at := range []any{"zzz", strings.ToUpper(id), "", 5.0} {
+		expectShape(t, "branch at", e.do(req{method: "POST", path: "/ns/m/branches", ifNoneMatch: "*", body: map[string]any{"name": "m-b", "at": at}, author: "alice"}))
+		expectShape(t, "registration at", e.do(req{method: "POST", path: "/ns/m/branches", ifNoneMatch: "*", body: map[string]any{"remote": map[string]any{"origin": "https://other.example", "ns": "x"}, "at": at}, author: "alice"}))
+	}
+	expectCode(t, e.do(req{method: "POST", path: "/ns/m/branches", ifNoneMatch: "*", body: map[string]any{"name": "m-b", "at": id}, author: "alice"}), 422, "invalid")
+	// Prune: horizon and keep.
+	for _, body := range []map[string]any{
+		{"horizon": "zzz"}, {"horizon": strings.ToUpper(id)}, {"horizon": id, "keep": []any{"zzz"}}, {"horizon": id, "keep": []any{id, ""}},
+	} {
+		expectShape(t, "prune body", e.do(req{method: "POST", path: "/r/m/a/prune", body: body, author: "alice"}))
+	}
+	expectCode(t, e.do(req{method: "POST", path: "/r/m/a/prune", body: map[string]any{"horizon": hashID(t, "", []byte("x"))}, author: "alice"}), 422, "invalid")
+}
+
+// §7.5, §12.1 (GB-6): DELETE with If-None-Match: * is a precondition DELETE
+// doesn't take, the core's answer after authorisation (428 once the gate
+// says so), no longer a request-shape 400; it deletes nothing.
+func TestV073DeleteIfNoneMatch(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	id := e.create("m", "a", map[string]any{"n": 1})
+	for _, name := range []string{"a", "missing"} {
+		r := e.do(req{method: "DELETE", path: "/r/m/" + name, ifNoneMatch: "*", author: "alice"})
+		if r.Code == 400 || r.Code < 400 {
+			t.Errorf("DELETE %s with If-None-Match: %d %s", name, r.Code, r.Body)
+		}
+	}
+	if e.head("m", "a") != id {
+		t.Fatal("DELETE with If-None-Match deleted")
+	}
+	// Under a grant without delete it is refused at step 1 (§6.2).
+	f := newAuthFixture(t, nil)
+	ro := f.grant(f.issuer, "user:ro", []string{"sec"}, []string{"read", "create"})
+	expectCode(t, f.do(req{method: "DELETE", path: "/r/sec/a", ifNoneMatch: "*", bearer: ro}), 403, "forbidden")
+}
+
+// §7.2, §8.6, §7.8 (GB-14, GB-58, BBD-26): the request facts the core
+// judges: a prune's keep: [] told from no keep, and whether a prune or an
+// upload sent a precondition; an upload's Blob-Nonce as sent, empty or
+// repeated included. Two preconditions, or a malformed one, stay 400:
+// before step 1 for a prune, at check 4 for an upload (after 409 frozen).
+func TestV073RequestFacts(t *testing.T) {
+	t.Parallel()
+	id := hashID(t, "", []byte("x"))
+	prune := func(body string, hdr map[string]string) *http.Request {
+		r := httptest.NewRequest("POST", "/r/m/a/prune", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		for k, v := range hdr {
+			r.Header.Set(k, v)
+		}
+		return r
+	}
+	for _, c := range []struct {
+		body             string
+		hdr              map[string]string
+		keepSent, precnd bool
+		keep             int
+	}{
+		{`{"horizon":"` + id + `"}`, nil, false, false, 0},
+		{`{"horizon":"` + id + `","keep":[]}`, nil, true, false, 0},
+		{`{"horizon":"` + id + `","keep":["` + id + `"]}`, nil, true, false, 1},
+		{`{"horizon":"` + id + `"}`, map[string]string{"If-Match": `"` + id + `"`}, false, true, 0},
+		{`{"horizon":"` + id + `"}`, map[string]string{"If-None-Match": "*"}, false, true, 0},
+	} {
+		pr, err := pruneRequest(prune(c.body, c.hdr))
+		if err != nil || pr.KeepSent != c.keepSent || pr.Precondition != c.precnd || len(pr.Keep) != c.keep || pr.Horizon != id {
+			t.Errorf("%s %v: %+v %v", c.body, c.hdr, pr, err)
+		}
+	}
+	if _, err := pruneRequest(prune(`{"horizon":"`+id+`"}`, map[string]string{"If-Match": `"` + id + `"`, "If-None-Match": "*"})); err == nil {
+		t.Error("prune with both preconditions parsed")
+	}
+
+	upload := func(hdr http.Header) *http.Request {
+		r := httptest.NewRequest("PUT", "/r/m/a/blob/"+id, strings.NewReader("x"))
+		r.Header = hdr
+		return r
+	}
+	nonce := strings.Repeat("a", 26)
+	for _, c := range []struct {
+		hdr       http.Header
+		nonceSent bool
+		nonce     string
+		precnd    bool
+		shape     bool
+	}{
+		{http.Header{}, false, "", false, false},
+		{http.Header{"Blob-Nonce": {nonce}}, true, nonce, false, false},
+		{http.Header{"Blob-Nonce": {""}}, true, "", false, false},
+		{http.Header{"Blob-Nonce": {nonce, nonce}}, true, nonce + "," + nonce, false, false},
+		{http.Header{"If-None-Match": {"*"}}, false, "", true, false},
+		{http.Header{"If-Match": {`"` + id + `"`}}, false, "", true, false},
+		{http.Header{"If-Match": {`"` + id + `"`}, "If-None-Match": {"*"}}, false, "", false, true},
+		{http.Header{"If-Match": {"*"}}, false, "", false, true},
+	} {
+		up := blobUpload(upload(c.hdr))
+		if up.NonceSent != c.nonceSent || up.Nonce != c.nonce || up.Precondition != c.precnd || (up.ShapeErr != "") != c.shape {
+			t.Errorf("%v: %+v", c.hdr, up)
+		}
+	}
+
+	// Over HTTP: the upload's header errors come at check 4.
+	e := newEnv(t, withBlobTuning)
+	e.mkNS("m", map[string]any{"read": "public"})
+	e.mkNS("fz", map[string]any{"read": "public", "frozen": true})
+	data := []byte("bytes")
+	bid := blobID("text/plain", "", data)
+	both := map[string]string{"If-Match": `"` + id + `"`, "If-None-Match": "*"}
+	expectShape(t, "upload both", e.do(req{method: "PUT", path: blobPath("m", "a", bid), raw: string(data), ct: "text/plain", hdr: both, author: "alice"}))
+	expectCode(t, e.do(req{method: "PUT", path: blobPath("fz", "a", bid), raw: string(data), ct: "text/plain", hdr: both, author: "alice"}), 409, "frozen")
+	hr, _ := http.NewRequest("PUT", e.srv.URL+blobPath("m", "a", blobID("text/plain", nonce, data)), strings.NewReader(string(data)))
+	hr.Header.Set("Content-Type", "text/plain")
+	hr.Header.Set("X-Author", "alice")
+	hr.Header.Add("Blob-Nonce", nonce)
+	hr.Header.Add("Blob-Nonce", nonce)
+	expectShape(t, "repeated Blob-Nonce", sendRaw(t, hr))
 }

@@ -63,13 +63,11 @@ func (s *Server) resourceDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// If-None-Match: * is a precondition DELETE doesn't take: the core's
+	// 428, after authorisation (§7.5, §12.1), not a request-shape error.
 	p, err := preconditions(r)
 	if err != nil {
 		writeErr(w, err)
-		return
-	}
-	if p.ifNoneMatch {
-		writeErr(w, badInput("DELETE takes If-Match"))
 		return
 	}
 	g, u, err := gestures(r)
@@ -83,7 +81,7 @@ func (s *Server) resourceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := s.writeResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: sg},
-		core.Item{Resource: name, IfMatch: p.ifMatch, Steps: []core.Step{{Delete: true, Gesture: g, Undoes: u}}})
+		core.Item{Resource: name, IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Steps: []core.Step{{Delete: true, Gesture: g, Undoes: u}}})
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -126,47 +124,11 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if err := requireType(r, jsonType); err != nil {
-		writeErr(w, err)
-		return
-	}
-	body, err := readJSON(r, 1<<20, noLimit)
+	pr, err := pruneRequest(r)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	m, ok := body.(map[string]any)
-	h, _ := m["horizon"].(string)
-	if !ok || h == "" {
-		writeErr(w, badInput("body must be { horizon, keep?, snapshot? }"))
-		return
-	}
-	var keep []string
-	if k, has := m["keep"]; has {
-		arr, ok := k.([]any)
-		if !ok {
-			writeErr(w, badInput("keep must be an array of ids"))
-			return
-		}
-		for _, x := range arr {
-			s, ok := x.(string)
-			if !ok {
-				writeErr(w, badInput("keep must be an array of ids"))
-				return
-			}
-			keep = append(keep, s)
-		}
-	}
-	var snapshot string
-	if x, has := m["snapshot"]; has {
-		if snapshot, ok = x.(string); !ok || snapshot == "" {
-			writeErr(w, badInput("snapshot must be a JWE (compact serialization)"))
-			return
-		}
-	}
-	// A sealed snapshot needs no declared list (§8.6, §E.3.1): the server
-	// keeps the list of the snapshot's revision.
-	pr := core.PruneRequest{Horizon: h, Keep: keep, Snapshot: snapshot}
 	res, err := s.prune(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, pr)
 	if err != nil {
 		writeErr(w, err)
@@ -180,6 +142,59 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 		out["archive"] = res.Archive
 	}
 	writeJSON(w, 200, out)
+}
+
+// pruneRequest reads a prune's request (§8.6): its preconditions, which a
+// prune doesn't take, so one sent is the core's 428 at step 2.5 while two,
+// or a malformed one, are request-shape 400s; then a JSON body { horizon,
+// keep?, snapshot? }. horizon and every keep entry are ids in text form,
+// or 400 (§7); a well-formed id the resource lacks is the core's 422.
+// keep: [] is told from no keep (KeepSent).
+func pruneRequest(r *http.Request) (core.PruneRequest, error) {
+	var pr core.PruneRequest
+	p, err := preconditions(r)
+	if err != nil {
+		return pr, err
+	}
+	pr.Precondition = p.sent()
+	if err := requireType(r, jsonType); err != nil {
+		return pr, err
+	}
+	body, err := readJSON(r, 1<<20, noLimit)
+	if err != nil {
+		return pr, err
+	}
+	m, ok := body.(map[string]any)
+	pr.Horizon, _ = m["horizon"].(string)
+	if !ok || pr.Horizon == "" {
+		return pr, badInput("body must be { horizon, keep?, snapshot? }")
+	}
+	if !validID(pr.Horizon) {
+		return pr, badInput("horizon must be an id in text form (§7, §8.6)")
+	}
+	var k any
+	if k, pr.KeepSent = m["keep"]; pr.KeepSent {
+		arr, ok := k.([]any)
+		if !ok {
+			return pr, badInput("keep must be an array of ids")
+		}
+		pr.Keep = []string{}
+		for _, x := range arr {
+			s, ok := x.(string)
+			if !ok || !validID(s) {
+				return pr, badInput("keep must be an array of ids in text form (§7, §8.6)")
+			}
+			pr.Keep = append(pr.Keep, s)
+		}
+	}
+	// A sealed snapshot needs no declared list (§8.6, §E.3.1): the server
+	// keeps the list of the snapshot's revision.
+	if x, has := m["snapshot"]; has {
+		if pr.Snapshot, ok = x.(string); !ok || pr.Snapshot == "" {
+			return pr, badInput("snapshot must be a JWE (compact serialization)")
+		}
+	}
+	return pr, nil
 }
 
 func (s *Server) nsPatch(w http.ResponseWriter, r *http.Request) {
@@ -269,7 +284,15 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	name, _ := m["name"].(string)
-	at, _ := m["at"].(string)
+	// at, if given, is an ns_id in text form, or 400 (§7); one that isn't
+	// in the base's chain is the core's 422 (§7.6).
+	var at string
+	if v, has := m["at"]; has {
+		if at, ok = v.(string); !ok || !validID(at) {
+			writeErr(w, badInput("at must be an ns_id in text form (§7, §7.6)"))
+			return
+		}
+	}
 	res, err := s.createBranch(r.Context(), core.Request{NS: ns, Cred: creds(r)},
 		core.BranchRequest{Name: name, At: at, Patches: m["patches"], IfNoneMatch: p.ifNoneMatch})
 	if err != nil {
@@ -296,6 +319,12 @@ func (s *Server) registerRemote(w http.ResponseWriter, r *http.Request, ns strin
 	at, _ := m["at"].(string)
 	if !ok || len(rm) != 2 || origin == "" || name == "" || at == "" || len(m) != 2 {
 		writeErr(w, badInput("body must be { remote: { origin, ns }, at }"))
+		return
+	}
+	// at is the base's ns_id in text form, or 400 (§7); one that isn't in
+	// its chain is the core's 422 (§G.3).
+	if !validID(at) {
+		writeErr(w, badInput("at must be an ns_id in text form (§7, §G.3)"))
 		return
 	}
 	// The precondition is checked in the core, after authorisation (§G.3).
