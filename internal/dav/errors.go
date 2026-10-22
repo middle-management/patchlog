@@ -227,6 +227,11 @@ func (w *errWriter) WriteHeader(code int) {
 	if code == http.StatusOK || code == http.StatusPartialContent && wholeRange(w.Header().Get("Content-Range")) {
 		w.st.served()
 	}
+	if w.st.pdf && code != http.StatusOK && code != http.StatusPartialContent {
+		// Only a PDF's 200 or 206 goes without the sandbox (servePDF).
+		w.Header().Set("Content-Security-Policy", "sandbox")
+		w.Header().Del("Content-Disposition")
+	}
 	if w.st.noETag {
 		w.Header().Del("ETag")
 	}

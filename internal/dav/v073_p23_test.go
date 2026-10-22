@@ -239,3 +239,42 @@ func TestV073FilesNSReadOnlyFlat(t *testing.T) {
 		t.Fatalf("matches %q, want derby and the tree's two new items", got)
 	}
 }
+
+// A PDF (a raw file stored as exactly application/pdf) is served, whole
+// or in part, without the sandbox, which blanks browsers' PDF viewers,
+// still with nosniff, and as an attachment unless the deployment opts
+// into inline display; every other answer keeps the sandbox: an error, a
+// 304, another type, a .pdf name of other bytes (§7.8, §H.6 "Headers",
+// GW-25).
+func TestV073PDFWithoutSandbox(t *testing.T) {
+	t.Parallel()
+	pdf := "%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n"
+	for _, inline := range []bool{false, true} {
+		e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.InlinePDF = inline })
+		e.rawDoc("docs", "paper.pdf", "application/pdf", []byte(pdf), nil)
+		e.rawDoc("docs", "fake.pdf", "application/octet-stream", []byte(pdf), nil)
+		disp := "attachment"
+		if inline {
+			disp = ""
+		}
+		g := e.expect(e.do("GET", "/docs/paper.pdf", ""), 200, "GET a PDF")
+		r := e.expect(e.do("GET", "/docs/paper.pdf", "", "Range", "bytes=0-3"), 206, "GET part of a PDF")
+		hd := e.expect(e.do("HEAD", "/docs/paper.pdf", ""), 200, "HEAD a PDF")
+		for _, a := range []resp{g, r, hd} {
+			if a.header.Get("Content-Security-Policy") != "" || a.header.Get("X-Content-Type-Options") != "nosniff" || a.header.Get("Content-Disposition") != disp {
+				t.Fatalf("inline %v: a PDF's %d: %v", inline, a.status, a.header)
+			}
+		}
+		for _, a := range []resp{
+			e.expect(e.do("GET", "/docs/paper.pdf", "", "If-None-Match", g.header.Get("ETag")), 304, "a PDF's 304"),
+			e.expect(e.do("GET", "/docs/paper.pdf", "", "If-Match", `"other"`), 412, "a PDF's 412"),
+			e.expect(e.do("GET", "/docs/paper.pdf", "", "Range", "bytes=900-999"), 416, "a PDF's 416"),
+			e.expect(e.do("GET", "/docs/fake.pdf", ""), 200, "a .pdf of another type"),
+			e.expect(e.do("PROPFIND", "/docs/", "", "Depth", "1"), 207, "a listing"),
+		} {
+			if a.header.Get("Content-Security-Policy") != "sandbox" || a.header.Get("X-Content-Type-Options") != "nosniff" || a.header.Get("Content-Disposition") != "" {
+				t.Fatalf("inline %v: a %d: %v", inline, a.status, a.header)
+			}
+		}
+	}
+}

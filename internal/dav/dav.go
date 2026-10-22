@@ -89,6 +89,12 @@ type Options struct {
 	// reach the user's own writes through this server (?min=, §B.5),
 	// before the folder is listed from the node documents (default 3s).
 	TreeWait time.Duration
+	// InlinePDF serves a PDF (a raw file stored as application/pdf) for
+	// display in the browser; by default it is sent as an attachment
+	// (Content-Disposition: attachment). Either way its 200 and 206 go
+	// without the sandbox, which blanks browsers' PDF viewers, and keep
+	// nosniff (§7.8, §H.6 "Headers").
+	InlinePDF bool
 	// CaseSensitive compares the names of a tree's siblings after NFC
 	// only; by default they are compared after Unicode case folding too
 	// (§H.2 "Siblings"), as the file systems of macOS and Windows, whose
@@ -355,7 +361,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Whatever an answer holds (a file, a listing, an error repeating a
 	// name the client sent), no page of this origin, which holds the
 	// users' credentials, runs it, nor does a browser take it for another
-	// type (§H.6 "Raw bytes").
+	// type (§H.6 "Headers"); a PDF served whole or in part goes without
+	// the sandbox (pdf).
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "sandbox")
 	if r.Method == http.MethodPost {
@@ -2140,6 +2147,9 @@ type reqState struct {
 	// destination (moveAcross), which a name moved away takes as a new
 	// file: a move, not a save (movedAway)
 	moving bool
+	// pdf: the GET or HEAD serves a PDF, without the sandbox (servePDF),
+	// which any answer but its 200 or 206 puts back (errWriter)
+	pdf bool
 
 	lists  map[string]*listing     // by directory path
 	graphs map[string]*catGraph    // by catalog

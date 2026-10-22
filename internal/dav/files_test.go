@@ -83,8 +83,13 @@ func TestRawFiles(t *testing.T) {
 			t.Fatalf("%s: %v %q, ETag %s", c.name, ref, data, put.header.Get("ETag"))
 		}
 		g := e.expect(e.do("GET", "/docs/"+c.name, ""), 200, "GET "+c.name)
+		// A PDF goes without the sandbox, as an attachment (§7.8, §H.6).
+		csp, disp := "sandbox", ""
+		if c.typ == "application/pdf" {
+			csp, disp = "", "attachment"
+		}
 		if g.body != string(c.data) || g.header.Get("Content-Type") != c.typ || g.header.Get("ETag") != `"`+h.ID+`"` ||
-			g.header.Get("X-Content-Type-Options") != "nosniff" || g.header.Get("Content-Security-Policy") != "sandbox" {
+			g.header.Get("X-Content-Type-Options") != "nosniff" || g.header.Get("Content-Security-Policy") != csp || g.header.Get("Content-Disposition") != disp {
 			t.Fatalf("GET %s: %q %v", c.name, g.body, g.header)
 		}
 		l := e.propfind("/docs/")["/docs/"+c.name]

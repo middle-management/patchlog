@@ -862,6 +862,9 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		}
 	}
 	if r := hd.m.raw; r != nil {
+		if served && r.typ == pdfType {
+			st.servePDF()
+		}
 		if st.method == "COPY" && t.path == st.path {
 			// The copy's type is the source's (fileType), and its blob the
 			// source's, copied (§7.8, §H.5 "Copy").
@@ -878,6 +881,27 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		}
 	}
 	return f, nil
+}
+
+// pdfType is the stored type of a PDF (§H.1).
+const pdfType = "application/pdf"
+
+// servePDF answers a GET or HEAD of a raw file stored as exactly
+// application/pdf without the sandbox, which blanks browsers' PDF viewers
+// (§7.8, §H.6 "Headers": PDFs are excepted), and still with nosniff; as
+// an attachment (Content-Disposition), so no browser shows it in this
+// origin, unless the deployment opts into inline display (InlinePDF).
+// Only its 200 or 206 goes so: any other answer gets the sandbox back
+// (errWriter).
+func (st *reqState) servePDF() {
+	if st.resp == nil {
+		return
+	}
+	st.pdf = true
+	st.resp.Del("Content-Security-Policy")
+	if !st.s.opt.InlinePDF {
+		st.resp.Set("Content-Disposition", "attachment")
+	}
 }
 
 // ifMatchGet checks a GET's or HEAD's If-Match against revision rev of
