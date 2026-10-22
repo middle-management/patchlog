@@ -1468,7 +1468,8 @@ func (t *tx) applySteps(s *itemState) *Error {
 			if nd == nil && len(writes) == 0 && ss.action == "create" {
 				// A create that writes nothing, [] or only tests, makes no
 				// document, as before creates applied to null; one that
-				// writes null stores it (F-G3).
+				// writes null stores it (F-G3). Writes are §6.3's, so a
+				// root copy or move onto itself, which writes "", does.
 				return patchErr(&patch.Error{Index: len(ops), Message: "a create must write the document; it applies to null (§6.2 step 3)"})
 			}
 			ss.canon = s.canon(j)

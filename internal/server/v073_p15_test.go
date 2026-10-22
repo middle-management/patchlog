@@ -789,3 +789,28 @@ func TestV073P15ConfigFailureDrawsAlike(t *testing.T) {
 		}
 	}
 }
+
+// §6.2 step 3, §6.3 (F-G3): whether a create makes a document is decided
+// by its writes, as §6.3 computes them: a root copy or move onto itself
+// writes "" (move writes both from and path), so it stores the document
+// null it applied to, as an add of null does, while [] and tests alone
+// write nothing and are 422. The spec leaves a create of [] open (F-G3).
+func TestV073P15CreateRootNoOpWrites(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	for name, patches := range map[string][]any{
+		"move":   {map[string]any{"op": "move", "from": "", "path": ""}},
+		"copy":   {map[string]any{"op": "copy", "from": "", "path": ""}},
+		"add":    ops(op("add", "", nil)),
+		"tested": ops(op("test", "", nil), op("replace", "", nil)),
+	} {
+		expect(t, e.write("PATCH", "m", name, "", patches), 201)
+		g := e.get("/r/m/" + name + "/rev/" + e.head("m", name))
+		if expect(t, g, 200); string(g.Body) != "null" {
+			t.Fatalf("%s: %s", name, g.Body)
+		}
+	}
+	expectCode(t, e.write("PATCH", "m", "empty", "", []any{}), 422, "invalid")
+	expectCode(t, e.write("PATCH", "m", "test", "", ops(op("test", "", nil))), 422, "invalid")
+}
