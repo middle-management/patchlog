@@ -5,6 +5,51 @@ import (
 	"testing"
 )
 
+var (
+	pathAnchorLib  = "/r/s/anchorlib/rev/" + rev('p')
+	pathAnchorUser = "/r/s/anchoruser/rev/" + rev('q')
+)
+
+func init() {
+	store[pathAnchorLib] = `{` + d2020 + `,
+		"x-index": "root",
+		"$defs": {
+			"tag":  {"$anchor": "tag", "type": "string", "x-index": "facet"},
+			"link": {"$dynamicAnchor": "link", "type": "string", "x-ref": {"pinned": true}}
+		}
+	}`
+	store[pathAnchorUser] = `{` + d2020 + `,
+		"type": "object",
+		"properties": {
+			"$schema": {"type": "string"},
+			"tag":  {"$ref": "` + pathAnchorLib + `#tag"},
+			"link": {"$ref": "` + pathAnchorLib + `#link"}
+		}
+	}`
+}
+
+// CIS-13: a $ref's plain name resolves to the anchor of the revision it
+// names (§6.1), for annotations and the static x-ref walk alike, never to
+// the revision's root.
+func TestV073RevisionAnchor(t *testing.T) {
+	doc := j(`{"$schema":"` + pathAnchorUser + `","tag":"t","link":"/r/m/x/rev/` + rev('r') + `"}`)
+	got, err := Collect(doc, loader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := strings.Join(short(got), "\n")
+	if !strings.Contains(g, `x-index /tag="facet"`) || strings.Contains(g, `"root"`) {
+		t.Errorf("Collect:\n%s", g)
+	}
+	refs, err := FindRefs(doc, loader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || refs[0].Pointer != "/link" || !refs[0].Pinned || refs[0].SchemaPath != pathAnchorLib+"#/$defs/link" {
+		t.Errorf("FindRefs = %+v", refs)
+	}
+}
+
 // CIS-18: definitions holds subschemas, so its anchors resolve (§6.5).
 func TestV073DefinitionsAnchor(t *testing.T) {
 	root := j(`{"properties": {"a": {"$ref": "#d"}}, "definitions": {"x": {"$anchor": "d", "type": "string", "x-index": "text"}}}`)

@@ -70,6 +70,74 @@ func TestV073WrittenNestedSchema(t *testing.T) {
 	}
 }
 
+var (
+	pathLib  = "/r/schemas/lib/rev/" + rev('h')
+	pathUser = "/r/schemas/user/rev/" + rev('i')
+)
+
+func anchorStore() *store {
+	s := newStore()
+	s.docs[pathLib] = j(`{` + d073 + `,"$anchor":"top","type":"object",
+		"$defs":{"num":{"$anchor":"num","type":"number"},"node":{"$dynamicAnchor":"node","type":"string"}},
+		"definitions":{"flag":{"$anchor":"flag.v-1_x","type":"boolean"}}}`)
+	s.docs[pathUser] = j(`{` + d073 + `,"type":"object","properties":{
+		"n":{"$ref":"` + pathLib + `#num"},"s":{"$ref":"` + pathLib + `#node"},
+		"t":{"$ref":"` + pathLib + `#top"},"f":{"$ref":"` + pathLib + `#flag.v-1_x"}}}`)
+	return s
+}
+
+// CIS-13: a revision path's plain-name fragment is resolved by an $anchor
+// or $dynamicAnchor of the revision; one that names nothing makes the
+// schema invalid (§6.1).
+func TestV073RevisionAnchors(t *testing.T) {
+	v := NewValidator()
+	s := anchorStore()
+	if err := v.Validate(s.docs[pathUser], s.load); err != nil {
+		t.Fatalf("writing the schema: %v", err)
+	}
+	if err := v.Validate(j(`{"$schema":"`+pathUser+`","n":1,"s":"x","t":{},"f":true}`), s.load); err != nil {
+		t.Fatalf("valid: %v", err)
+	}
+	var ve *ValidationError
+	if err := v.Validate(j(`{"$schema":"`+pathUser+`","n":"1","s":1,"t":2,"f":0}`), s.load); !errors.As(err, &ve) {
+		t.Fatalf("got %v, want ValidationError", err)
+	}
+	got := map[string]bool{}
+	for _, d := range ve.Errors {
+		got[d.Pointer] = true
+	}
+	for _, p := range []string{"/n", "/s", "/t", "/f"} {
+		if !got[p] {
+			t.Errorf("no error at %s: %+v", p, ve.Errors)
+		}
+	}
+	for _, frag := range []string{"#nope", "#Num", "#1num", "#num%41", "#$defs/num"} {
+		doc := `{` + d073 + `,"$ref":"` + pathLib + frag + `"}`
+		if err := v.Validate(j(doc), s.load); !isSchemaErr(err) {
+			t.Errorf("%s: got %T %v, want SchemaError", frag, err, err)
+		}
+	}
+	// Names are parsed, and found, with the revision they name.
+	tg, err := ParseRefTarget(pathLib + "#num")
+	if err != nil || tg.Ref.Path() != pathLib || tg.Anchor != "num" || tg.Pointer != nil {
+		t.Fatalf("ParseRefTarget = %+v, %v", tg, err)
+	}
+	if r, p, err := SplitRef(pathLib + "#num"); err != nil || r.Path() != pathLib || p != nil {
+		t.Fatalf("SplitRef = %v, %v, %v", r, p, err)
+	}
+	if refs := Refs(s.docs[pathUser]); len(refs) != 1 || refs[0].Path() != pathLib {
+		t.Fatalf("Refs = %+v", refs)
+	}
+	if locs := RefLocations(s.docs[pathUser]); len(locs) != 4 || locs[0].Ref.Path() != pathLib || locs[0].Raw != pathLib+"#flag.v-1_x" {
+		t.Fatalf("RefLocations = %+v", locs)
+	}
+	// Not a URI fragment: schema_ref, as before.
+	var re *RefError
+	if _, err := ParseRefTarget(pathLib + "#a b"); !errors.As(err, &re) {
+		t.Errorf("unencoded space: got %v", err)
+	}
+}
+
 // CIS-15: a format draft 2020-12 doesn't define makes a written schema
 // invalid; V073 asserts exactly that set, idn-email and idn-hostname with
 // UTS 46, and Legacy keeps the library's behaviour (§6.2 step 5).

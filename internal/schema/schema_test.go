@@ -462,7 +462,8 @@ func TestRefsDropFragment(t *testing.T) {
 		"properties":{"a":{"$ref":"` + pathAddress + `#/$defs/zip"},"b":{"$ref":"` + pathAddress + `"},
 		"c":{"$ref":"` + pathPerson + `#"},"d":{"$ref":"` + pathMissing + `#nope"},"e":{"$ref":"#/$defs/x"}}}`)
 	got := Refs(doc)
-	if len(got) != 2 || got[0].Path() != pathAddress || got[1].Path() != pathPerson {
+	// A plain-name fragment names its revision too (§6.1).
+	if len(got) != 3 || got[0].Path() != pathAddress || got[1].Path() != pathMissing || got[2].Path() != pathPerson {
 		t.Fatalf("Refs = %+v", got)
 	}
 }
@@ -471,8 +472,6 @@ func TestBadRefFragments(t *testing.T) {
 	v := NewValidator()
 	s := fragStore()
 	for _, frag := range []string{
-		"#foo",              // anchor on a foreign revision
-		"#$defs/zip",        // not a pointer
 		"#/$defs/zip#x",     // second '#'
 		"#/$defs/%zz",       // bad percent-encoding
 		"#/$defs/%",         // truncated percent-encoding
@@ -500,8 +499,10 @@ func TestBadRefFragments(t *testing.T) {
 			t.Errorf("validate %q: got %v, want RefError", ref, err)
 		}
 	}
-	// Missing target: rejected at compile time as an invalid schema.
-	for _, ref := range []string{pathAddress + "#/nope", pathAddress + "#/$defs/zip/nope/deeper", pathAddress + "#/$defs/a%2520b"} {
+	// Missing target: rejected at compile time as an invalid schema, and so
+	// is a plain name no anchor defines, or none could (§6.1).
+	for _, ref := range []string{pathAddress + "#/nope", pathAddress + "#/$defs/zip/nope/deeper", pathAddress + "#/$defs/a%2520b",
+		pathAddress + "#foo", pathAddress + "#$defs/zip"} {
 		doc := j(`{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"` + ref + `"}`)
 		err := v.Validate(doc, s.load)
 		var se *SchemaError

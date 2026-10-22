@@ -146,12 +146,16 @@ func (w *markWalk) marked(base string, ptr pointer.Pointer, i int) bool {
 }
 
 // resolve resolves a $ref or $dynamicRef value against base as annot does:
-// a revision path with an optional JSON Pointer fragment, or a fragment of
-// the same document, a pointer or an anchor.
+// a revision path with an optional fragment, or a fragment of the same
+// document, a pointer or an anchor (§6.1).
 func (w *markWalk) resolve(base, ref string) (string, pointer.Pointer, bool) {
 	if !strings.HasPrefix(ref, "#") {
-		r, p, err := schema.SplitRef(ref)
-		return r.Path(), p, err == nil
+		t, err := schema.ParseRefTarget(ref)
+		if err != nil || t.Anchor == "" {
+			return t.Ref.Path(), t.Pointer, err == nil
+		}
+		p, ok := findAnchor(w.doc(t.Ref.Path()), t.Anchor, nil)
+		return t.Ref.Path(), p, ok
 	}
 	frag, err := url.PathUnescape(ref[1:])
 	if err != nil {

@@ -106,12 +106,12 @@ func TestSchemas(t *testing.T) {
 	ref3 := "/r/schemas/match3/rev/" + s3
 	e.create("docs", "coded", map[string]any{"$schema": ref3, "code": "abc"})
 	expectCode(t, e.write("PATCH", "docs", "coded2", "", addRoot(map[string]any{"$schema": ref3, "code": "abcd"})), 422, "invalid")
-	// A fragment that points at nothing makes the schema invalid; an anchor
-	// on another revision isn't an accepted form.
+	// A fragment that points at nothing makes the schema invalid, and so
+	// does a plain name no anchor of the revision defines (v0.65).
 	r = e.write("PATCH", "schemas", "frag", "", addRoot(map[string]any{"$schema": dialect, "$ref": baseRef + "#/x"}))
 	expectCode(t, r, 422, "invalid")
 	r = e.write("PATCH", "schemas", "anchor", "", addRoot(map[string]any{"$schema": dialect, "$ref": baseRef + "#name"}))
-	expectCode(t, r, 422, "schema_ref")
+	expectCode(t, r, 422, "invalid")
 	// A $ref to an unknown revision makes the schema unusable.
 	r = e.write("PATCH", "schemas", "dangling", "", addRoot(map[string]any{"$schema": dialect, "$ref": "/r/schemas/base/rev/" + unknownID}))
 	expectCode(t, r, 422, "schema_unavailable")

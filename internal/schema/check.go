@@ -250,7 +250,11 @@ func (ck checker) checkCore(obj map[string]any, at pointer.Pointer) error {
 			if ck.mode == fragment {
 				return &SchemaError{Msg: fmt.Sprintf("$ref at %s must be a same-document fragment in a rule's schema", loc(at))}
 			}
-			if _, _, err := SplitRef(s); err != nil {
+			if _, err := ParseRefTarget(s); err != nil {
+				var se *SchemaError
+				if errors.As(err, &se) {
+					return &SchemaError{Msg: fmt.Sprintf("at %s: %s", loc(at), se.Msg)}
+				}
 				return &RefError{Msg: fmt.Sprintf("at %s: %s", loc(at), strings.TrimPrefix(err.Error(), "schema_ref: "))}
 			}
 		}

@@ -42,6 +42,14 @@ func TestV073SchemaDialect(t *testing.T) {
 	e.create("docs", "e", map[string]any{"$schema": defsPath, "s": "éé"})
 	expectCode(t, e.write("PATCH", "docs", "e2", "", addRoot(map[string]any{"$schema": defsPath, "s": "e"})), 422, "invalid")
 
+	// CIS-13: a plain name into another revision resolves by its anchors.
+	lib := e.create("schemas", "lib", obj("$defs", prop("n", map[string]any{"$anchor": "n", "type": "number"})))
+	libPath := "/r/schemas/lib/rev/" + lib
+	user := e.create("schemas", "user", obj("type", "object", "properties", prop("n", map[string]any{"$ref": libPath + "#n"})))
+	userPath := "/r/schemas/user/rev/" + user
+	e.create("docs", "n", map[string]any{"$schema": userPath, "n": 1.0})
+	expectCode(t, e.write("PATCH", "docs", "n2", "", addRoot(map[string]any{"$schema": userPath, "n": "one"})), 422, "invalid")
+	expectCode(t, e.write("PATCH", "schemas", "nope", "", addRoot(obj("$ref", libPath+"#nope"))), 422, "invalid")
 	// Malformed references stay schema_ref.
-	expectCode(t, e.write("PATCH", "schemas", "space", "", addRoot(obj("$ref", defsPath+"#a b"))), 422, "schema_ref")
+	expectCode(t, e.write("PATCH", "schemas", "space", "", addRoot(obj("$ref", libPath+"#a b"))), 422, "schema_ref")
 }

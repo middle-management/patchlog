@@ -354,15 +354,18 @@ func (c *collector) lookup(l loc) (any, error) {
 }
 
 // resolveRef resolves a $ref / $dynamicRef value relative to base. A $ref to
-// another revision is a revision path optionally followed by a JSON Pointer
-// fragment (§6.1); anchors are resolved only within the same document.
+// another revision is a revision path optionally followed by a fragment: a
+// JSON Pointer, or a plain name an anchor of that revision defines (§6.1).
 func (c *collector) resolveRef(base, ref string) (loc, error) {
 	if !strings.HasPrefix(ref, "#") {
-		r, p, err := schema.SplitRef(ref)
+		t, err := schema.ParseRefTarget(ref)
 		if err != nil {
 			return loc{}, err
 		}
-		return loc{syntheticBase + r.Path(), p}, nil
+		if t.Anchor != "" {
+			return c.anchor(syntheticBase+t.Ref.Path(), t.Anchor)
+		}
+		return loc{syntheticBase + t.Ref.Path(), t.Pointer}, nil
 	}
 	target := base
 	frag, err := url.PathUnescape(ref[1:])
@@ -376,14 +379,20 @@ func (c *collector) resolveRef(base, ref string) (loc, error) {
 		}
 		return loc{target, p}, nil
 	}
+	return c.anchor(target, frag)
+}
+
+// anchor finds the subschema of the document at base URL target that an
+// $anchor or $dynamicAnchor names.
+func (c *collector) anchor(target, name string) (loc, error) {
 	d, err := c.doc(target)
 	if err != nil {
 		return loc{}, err
 	}
-	if p, ok := findAnchor(d, frag, nil); ok {
+	if p, ok := findAnchor(d, name, nil); ok {
 		return loc{target, p}, nil
 	}
-	return loc{}, &schema.SchemaError{Msg: fmt.Sprintf("anchor %q not found in %s", frag, c.label(target))}
+	return loc{}, &schema.SchemaError{Msg: fmt.Sprintf("anchor %q not found in %s", name, c.label(target))}
 }
 
 // findAnchor searches a schema document for $anchor or $dynamicAnchor name.

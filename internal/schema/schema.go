@@ -56,34 +56,63 @@ func ParseRef(s string) (Ref, bool) {
 // Path returns the revision path of r.
 func (r Ref) Path() string { return "/r/" + r.NS + "/" + r.Name + "/rev/" + r.Rev }
 
-// SplitRef parses a foreign $ref value: a schema revision path optionally
-// followed by "#" and a fragment (§6.1). The fragment must be empty or a JSON
-// Pointer (RFC 6901, so it starts with "/"), written as an RFC 3986 URI
-// fragment: only fragment characters, well-formed percent-encodings that decode
-// to valid UTF-8, and "~" only as "~0" or "~1". Anchors ("#foo") are not
-// resolved across revisions and are rejected. The returned Ref is the bare
-// revision; frag is the decoded pointer ("" for the whole revision).
-func SplitRef(s string) (ref Ref, frag pointer.Pointer, err error) {
-	docPart, rawFrag, _ := strings.Cut(s, "#")
+// anchorName is the grammar of $anchor and $dynamicAnchor, so of the
+// plain names a fragment can resolve.
+var anchorName = regexp.MustCompile(`^[A-Za-z_][-A-Za-z0-9._]*$`)
+
+// RefTarget is what a foreign $ref names (§6.1): a schema revision and, by
+// its fragment, a JSON Pointer or a plain name into it.
+type RefTarget struct {
+	Ref     Ref
+	Pointer pointer.Pointer // the decoded pointer; nil for the whole revision or a name
+	Anchor  string          // a plain name, which an $anchor or $dynamicAnchor of the revision must define; "" if none
+}
+
+// ParseRefTarget parses a foreign $ref value: a schema revision path
+// optionally followed by "#" and a fragment (§6.1), written as an RFC 3986
+// URI fragment: only fragment characters and well-formed percent-encodings.
+// A fragment that is empty or starts with "/" is percent-decoded, must be
+// valid UTF-8, and is read as a JSON Pointer (RFC 6901, so "~" only as "~0"
+// or "~1"). Any other is a plain name, which compiling resolves against the
+// anchors of the revision. A malformed path or fragment is a *RefError
+// (schema_ref); a plain name outside the grammar of anchors names nothing,
+// which makes the schema invalid, a *SchemaError.
+func ParseRefTarget(s string) (RefTarget, error) {
+	docPart, rawFrag, hasFrag := strings.Cut(s, "#")
 	ref, ok := ParseRef(docPart)
 	if !ok {
-		return Ref{}, nil, &RefError{Msg: fmt.Sprintf("$ref %q is neither a same-document fragment nor a schema revision path", s)}
+		return RefTarget{}, &RefError{Msg: fmt.Sprintf("$ref %q is neither a same-document fragment nor a schema revision path", s)}
 	}
-	if !strings.Contains(s, "#") {
-		return ref, nil, nil
+	if !hasFrag {
+		return RefTarget{Ref: ref}, nil
 	}
 	if !validURIFragment(rawFrag) {
-		return Ref{}, nil, &RefError{Msg: fmt.Sprintf("$ref %q: fragment is not a valid URI fragment", s)}
+		return RefTarget{}, &RefError{Msg: fmt.Sprintf("$ref %q: fragment is not a valid URI fragment", s)}
+	}
+	if rawFrag != "" && rawFrag[0] != '/' {
+		if !anchorName.MatchString(rawFrag) {
+			return RefTarget{}, &SchemaError{Msg: fmt.Sprintf("$ref %q: fragment %q is neither a JSON Pointer nor a name an anchor can define", s, rawFrag)}
+		}
+		return RefTarget{Ref: ref, Anchor: rawFrag}, nil
 	}
 	dec, uerr := url.PathUnescape(rawFrag)
 	if uerr != nil || !utf8.ValidString(dec) {
-		return Ref{}, nil, &RefError{Msg: fmt.Sprintf("$ref %q: fragment is not valid percent-encoded UTF-8", s)}
+		return RefTarget{}, &RefError{Msg: fmt.Sprintf("$ref %q: fragment is not valid percent-encoded UTF-8", s)}
 	}
 	frag, perr := pointer.Parse(dec)
 	if perr != nil {
-		return Ref{}, nil, &RefError{Msg: fmt.Sprintf("$ref %q: fragment of a schema revision must be a JSON Pointer", s)}
+		return RefTarget{}, &RefError{Msg: fmt.Sprintf("$ref %q: fragment of a schema revision is not a JSON Pointer", s)}
 	}
-	return ref, frag, nil
+	return RefTarget{Ref: ref, Pointer: frag}, nil
+}
+
+// SplitRef is ParseRefTarget for callers that want the revision a foreign
+// $ref names, and a pointer fragment if it has one: frag is nil for the
+// whole revision and for a plain-name fragment, whose name only
+// ParseRefTarget gives.
+func SplitRef(s string) (ref Ref, frag pointer.Pointer, err error) {
+	t, err := ParseRefTarget(s)
+	return t.Ref, t.Pointer, err
 }
 
 // validURIFragment reports whether s uses only RFC 3986 fragment characters
