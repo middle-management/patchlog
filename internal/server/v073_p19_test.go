@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -532,5 +533,63 @@ func TestV073PrincipalCatalog(t *testing.T) {
 	expect(t, e.patchNS("sec", ops(op("remove", "/catalog")), f.adminG), 201)
 	if _, has := e.principalOf("sec", f.issuerG).Obj()["catalog"]; has {
 		t.Error("a namespace without catalog has a catalog member")
+	}
+}
+
+// §7.8 Reading (BBD-20, BBD-21): a text/* blob's 200 is its type with
+// "; charset=utf-8"; an application/pdf 200 or 206 is an attachment,
+// sandboxed, unless the deployment opts into inline display, which drops
+// the sandbox and keeps nosniff. Other types are served as stored.
+func TestV073BlobTypeHeaders(t *testing.T) {
+	t.Parallel()
+	pdf := []byte("%PDF-1.7\n" + strings.Repeat("0", 64))
+	for _, inline := range []bool{false, true} {
+		var sopts []Option
+		if inline {
+			sopts = append(sopts, WithInlinePDF())
+		}
+		e := newEnvWith(t, sopts)
+		e.mkNS("m", map[string]any{"read": "public"})
+		blobs := map[string]string{}
+		doc := map[string]any{}
+		for typ, data := range map[string][]byte{"text/plain": []byte("hej"), "text/markdown": []byte("# hej"), "application/pdf": pdf, "image/png": []byte("\x89PNG")} {
+			bid := e.upload("m", "a", typ, data)
+			blobs[typ] = bid
+			doc[strings.ReplaceAll(typ, "/", "-")] = ref(bid, typ, len(data), "")
+		}
+		e.create("m", "a", doc)
+		for typ, want := range map[string]string{"text/plain": "text/plain; charset=utf-8", "text/markdown": "text/markdown; charset=utf-8", "image/png": "image/png", "application/pdf": "application/pdf"} {
+			r := e.get(blobPath("m", "a", blobs[typ]))
+			expect(t, r, 200)
+			if r.H.Get("Content-Type") != want || r.H.Get("X-Content-Type-Options") != "nosniff" {
+				t.Errorf("inline %v %s: Content-Type %q nosniff %q", inline, typ, r.H.Get("Content-Type"), r.H.Get("X-Content-Type-Options"))
+			}
+			if typ != "application/pdf" && (r.H.Get("Content-Security-Policy") != "sandbox" || r.H.Get("Content-Disposition") != "") {
+				t.Errorf("%s: %v", typ, r.H)
+			}
+		}
+		for _, rng := range []string{"", "bytes=0-3"} {
+			q := req{method: "GET", path: blobPath("m", "a", blobs["application/pdf"])}
+			want := 200
+			if rng != "" {
+				q.hdr, want = map[string]string{"Range": rng}, 206
+			}
+			r := e.do(q)
+			expect(t, r, want)
+			csp, cd := r.H.Get("Content-Security-Policy"), r.H.Get("Content-Disposition")
+			switch {
+			case !inline && (csp != "sandbox" || cd != "attachment"):
+				t.Errorf("PDF %d: CSP %q Content-Disposition %q, want sandbox and attachment", want, csp, cd)
+			case inline && (csp != "" || cd != ""):
+				t.Errorf("inline PDF %d: CSP %q Content-Disposition %q, want neither", want, csp, cd)
+			}
+			if r.H.Get("X-Content-Type-Options") != "nosniff" {
+				t.Errorf("PDF %d without nosniff", want)
+			}
+		}
+		// Errors keep the sandbox, PDFs' included.
+		if r := e.get(blobPath("m", "a", hashID(t, "", []byte("x")))); r.H.Get("Content-Security-Policy") != "sandbox" {
+			t.Errorf("404: %v", r.H)
+		}
 	}
 }

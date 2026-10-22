@@ -138,6 +138,7 @@ func serve(args []string) {
 	origin := fs.String("origin", "http://localhost:8080", "canonical origin (§G.1)")
 	dev := fs.Bool("dev", false, "disable authentication (development only); X-Author names the author")
 	pg := fs.Bool("playground", true, "serve the web playground at /playground/")
+	inlinePDF := fs.Bool("inline-pdf", false, "serve application/pdf blobs for inline display, without the sandbox that blanks Chromium's viewer, instead of with Content-Disposition: attachment (§7.8)")
 	var treeURLs multi
 	fs.Var(&treeURLs, "tree-url", "tree service (Addendum B) the playground reads through a read-only proxy at "+server.TreeProxyPrefix+", e.g. http://tree:8082; CATALOG=URL maps one catalog to its own (repeatable)")
 	indexURL := fs.String("index-url", "", "search index (Addendum A) the playground reads through a read-only proxy at "+server.IndexProxyPrefix+", e.g. http://index:8081; one index serves several namespaces")
@@ -361,7 +362,11 @@ func serve(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler(server.New(e, server.WithEdge(ev), server.WithEdgeGrants(cookies)), *pg, treeProxy, indexProxy, playground.Options{SchemaFetch: *schemaFetch, SchemaFetchHosts: splitHosts(*schemaHosts)})), ReadHeaderTimeout: 10 * time.Second}
+	sopts := []server.Option{server.WithEdge(ev), server.WithEdgeGrants(cookies)}
+	if *inlinePDF {
+		sopts = append(sopts, server.WithInlinePDF())
+	}
+	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler(server.New(e, sopts...), *pg, treeProxy, indexProxy, playground.Options{SchemaFetch: *schemaFetch, SchemaFetchHosts: splitHosts(*schemaHosts)})), ReadHeaderTimeout: 10 * time.Second}
 	ls := sdFlags.server("patchlog", srv, e.Ping)
 	sigCtx, sigs := shutdownSignals("patchlog")
 	ln, err := net.Listen("tcp", *addr)

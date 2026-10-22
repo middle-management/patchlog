@@ -26,6 +26,9 @@ type Server struct {
 	edge *edge.Verifier // nil: no verifying edge (§9)
 	// cookies issues and verifies edge grants as cookies (§C.5).
 	cookies *edge.Cookies
+	// inlinePDF serves application/pdf blobs for inline display, without
+	// the sandbox, rather than as attachments (WithInlinePDF, §7.8).
+	inlinePDF bool
 }
 
 // Option configures a Server.
@@ -37,6 +40,13 @@ type Option func(*Server)
 // response, and every one without it (or with nil), is marked no-store for
 // shared caches. Private reads are served either way.
 func WithEdge(v *edge.Verifier) Option { return func(s *Server) { s.edge = v } }
+
+// WithInlinePDF opts into inline display of blobs of type exactly
+// application/pdf (§7.8): their 200 and 206 answers go without
+// Content-Security-Policy: sandbox, which blanks Chromium's PDF viewer,
+// still with nosniff, and without Content-Disposition: attachment, which
+// they carry otherwise.
+func WithInlinePDF() Option { return func(s *Server) { s.inlinePDF = true } }
 
 // New builds the HTTP handler.
 func New(e *core.Engine, opts ...Option) *Server {

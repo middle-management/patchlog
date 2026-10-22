@@ -137,7 +137,22 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, ns, name, eta
 		// Immutable, with the resource's tags (§9); ranges are 206.
 		s.cache(w, r, ccImmutable, b.Public, resTags(ns, name)...)
 		w.Header().Set("ETag", etag)
-		w.Header().Set("Content-Type", b.Type)
+		ct := b.Type
+		if strings.HasPrefix(ct, "text/") {
+			// Stored text is UTF-8 (§3.7, §7.8).
+			ct += "; charset=utf-8"
+		}
+		w.Header().Set("Content-Type", ct)
+		if b.Type == "application/pdf" {
+			// A PDF is an attachment, still sandboxed, unless the
+			// deployment opts into inline display, which drops the
+			// sandbox that blanks Chromium's viewer (§7.8).
+			if s.inlinePDF {
+				w.Header().Del("Content-Security-Policy")
+			} else {
+				w.Header().Set("Content-Disposition", "attachment")
+			}
+		}
 		http.ServeContent(w, r, "", time.Time{}, b.Content)
 	case b.NoStore:
 		// An epoch a sealed namespace doesn't serve the blob under, yet
