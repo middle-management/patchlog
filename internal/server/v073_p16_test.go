@@ -3,6 +3,7 @@ package server
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // P16: config writes, namespace and branch creation (§6.2, §7.4, §7.6,
@@ -133,4 +134,77 @@ func TestV073P16EpochBecomingSealed(t *testing.T) {
 	expect(t, e.patchNS("er", ops(op("replace", "/encryption/epoch", 4.0)), ""), 201)
 	expectInvalidAt(t, e.patchNS("er", ops(op("replace", "/encryption/epoch", 6.0)), ""), "/encryption/epoch")
 	expectInvalidAt(t, e.patchNS("er", ops(op("replace", "/encryption", map[string]any{"level": "at-rest"})), ""), "/encryption")
+}
+
+// operatorGrantCan mints an operator grant for ns with verbs can (§C.4).
+func (e *tenv) operatorGrantCan(ns string, can ...string) string {
+	return mint(e.t, e.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{ns}, "can": strs(can), "exp": e.clock.Now().Add(time.Hour).Format(time.RFC3339)})
+}
+
+// v0.73 §7.4 Namespace writes (RH-53): a creation (If-None-Match: *) under
+// a taken name, a purged namespace's included, is 412 stale without config;
+// an If-Match that doesn't match keeps { config }.
+func TestV073P16TakenNameWithoutConfig(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	cfg := e.mkNS("tk", map[string]any{"read": "public"})
+	noConfig := func(r *resp) {
+		t.Helper()
+		expectCode(t, r, 412, "stale")
+		if _, has := r.Obj()["config"]; has {
+			t.Fatalf("config in a taken name's 412: %s", r.Body)
+		}
+	}
+	create := req{method: "PATCH", path: "/ns/tk", ifNoneMatch: "*", body: addRoot(map[string]any{"read": "public"}), author: "admin"}
+	noConfig(e.do(create))
+	r := e.do(req{method: "PATCH", path: "/ns/tk", ifMatch: hashID(t, "", []byte("x")), body: ops(op("add", "/x-a", 1.0)), author: "admin"})
+	expectCode(t, r, 412, "stale")
+	if r.Str("config") != cfg {
+		t.Fatalf("If-Match mismatch: config %q, want %q: %s", r.Str("config"), cfg, r.Body)
+	}
+	expect(t, e.patchNS("tk", ops(op("add", "/frozen", true)), ""), 201)
+	expect(t, e.do(req{method: "POST", path: "/ns/tk/purge", ifMatch: e.nsHead("tk"), author: "admin"}), 204)
+	noConfig(e.do(create))
+}
+
+// v0.73 §C.2 item 2, §C.4 (GR-22): an operator grant checks config for a
+// namespace's creation, and for the 412 of a taken name; without it 403.
+func TestV073P16OperatorGrantNeedsConfig(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t)
+	create := func(ns, bearer string) *resp {
+		return e.do(req{method: "PATCH", path: "/ns/" + ns, ifNoneMatch: "*", body: addRoot(map[string]any{"read": "public"}), bearer: bearer})
+	}
+	expectCode(t, create("og", e.operatorGrantCan("og", "read")), 403, "forbidden")
+	expectCode(t, create("og", e.operatorGrantCan("og", "purge")), 403, "forbidden")
+	expect(t, create("og", e.operatorGrantCan("og", "config")), 201)
+	expectCode(t, create("og", e.operatorGrantCan("og", "read")), 403, "forbidden")
+	expectCode(t, create("og", e.operatorGrantCan("og", "config")), 412, "stale")
+}
+
+// v0.73 §7.2, §7.4 (GR-21): a config write's idempotent retry needs the
+// same principal, the same root sub and kid; the same sub under another key
+// gets 412.
+func TestV073P16ConfigRetrySameKid(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t)
+	k1, k2 := newKey("k1"), newKey("k2")
+	e.mkNS("cr", map[string]any{"read": "grant", "keys": []any{k1.entry("*"), k2.entry("*")}})
+	g1 := e.grant(k1, "user:ann", []string{"cr"}, allVerbs)
+	g2 := e.grant(k2, "user:ann", []string{"cr"}, allVerbs)
+	g1b := e.grant(k1, "user:ann", []string{"cr"}, []string{"config", "read"})
+	parent := e.configID("cr", g1)
+	write := func(bearer string) *resp {
+		return e.do(req{method: "PATCH", path: "/ns/cr", ifMatch: parent, body: ops(op("add", "/x-a", 1.0)), bearer: bearer})
+	}
+	r := write(g1)
+	expect(t, r, 201)
+	nsID := r.Str("ns_id")
+	expectCode(t, write(g2), 412, "stale")
+	// Another grant from the same key and sub is the same principal.
+	r = write(g1b)
+	expect(t, r, 200)
+	if r.Str("ns_id") != nsID {
+		t.Fatalf("retry ns_id %q, want %q", r.Str("ns_id"), nsID)
+	}
 }

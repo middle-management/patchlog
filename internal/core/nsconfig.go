@@ -72,29 +72,27 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 	// allowed in frozen namespaces.
 	if !inBatch && p.expected != nil {
 		var seq int64
-		var author int64
-		err := t.QueryRow(`SELECT seq, author FROM ns_config WHERE ns = ? AND id = ?`, n.id, p.expected[:]).Scan(&seq, &author)
-		if err == nil && author == t.actorID(a) {
+		var nsSeq sql.NullInt64
+		if t.QueryRow(`SELECT seq FROM ns_config WHERE ns = ? AND id = ?`, n.id, p.expected[:]).Scan(&seq) == nil {
 			// The entry that wrote it: the first in force with it, a
 			// config entry or a batch with a config change (§7.4).
-			var nsSeq int64
 			t.QueryRow(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, n.id, seq).Scan(&nsSeq)
-			r := &WriteResult{Status: 200, Replayed: true, ConfigID: p.expected.String()}
-			if nsSeq != 0 {
-				r.NSID = t.nsLogID(nsSeq).String()
-				// The retry carries what was recorded, gestures included
-				// (§7.2); only a config entry has them (§7.4).
-				var gjson sql.NullString
-				if t.QueryRow(`SELECT gestures FROM ns_log WHERE seq = ? AND kind = ?`, nsSeq, nsKindCode("config")).Scan(&gjson) == nil && gjson.Valid {
-					if g, ok := jsonv.Parse([]byte(gjson.String)); ok == nil {
-						if m, ok := g.(map[string]any); ok {
-							r.Entry = &LogEntry{}
-							if s, ok := m["gesture"].(string); ok {
-								r.Entry.Gesture = s
-							}
-							if s, ok := m["undoes"].(string); ok {
-								r.Entry.Undoes = s
-							}
+		}
+		// By the same principal: the same root sub and kid (§7.2).
+		if nsSeq.Valid && t.samePrincipal(nsSeq.Int64, a, t.actorID(a)) {
+			r := &WriteResult{Status: 200, Replayed: true, ConfigID: p.expected.String(), NSID: t.nsLogID(nsSeq.Int64).String()}
+			// The retry carries what was recorded, gestures included
+			// (§7.2); only a config entry has them (§7.4).
+			var gjson sql.NullString
+			if t.QueryRow(`SELECT gestures FROM ns_log WHERE seq = ? AND kind = ?`, nsSeq.Int64, nsKindCode("config")).Scan(&gjson) == nil && gjson.Valid {
+				if g, ok := jsonv.Parse([]byte(gjson.String)); ok == nil {
+					if m, ok := g.(map[string]any); ok {
+						r.Entry = &LogEntry{}
+						if s, ok := m["gesture"].(string); ok {
+							r.Entry.Gesture = s
+						}
+						if s, ok := m["undoes"].(string); ok {
+							r.Entry.Undoes = s
 						}
 					}
 				}
@@ -105,7 +103,8 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 	}
 	switch {
 	case cc.IfNoneMatch:
-		return nil, apiErr(412, "stale", "config", curID.String())
+		// A creation under a taken name: no config (§7.4).
+		return nil, apiErr(412, "stale", "message", "the name is taken")
 	case cc.IfMatch == "":
 		return nil, apiErr(428, "precondition_required")
 	case cc.IfMatch != curID.String():
@@ -634,11 +633,12 @@ func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 		}
 		if cc.IfNoneMatch {
 			// The name is taken, also by a purged namespace, whose name
-			// stays reserved (§8.5).
+			// stays reserved (§8.5): 412 without config, as for a branch
+			// (§7.4, §7.6).
 			if err := t.authorizeTaken(n, req); err != nil {
 				return err
 			}
-			return apiErr(412, "stale", "config", t.configID(n.configSeq).String())
+			return apiErr(412, "stale", "message", "the name is taken")
 		}
 		cur := t.config(n.configSeq)
 		a, aerr := t.authenticate(n.name, n, cur, req.Cred, nil)

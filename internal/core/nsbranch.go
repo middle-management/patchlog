@@ -11,12 +11,12 @@ import (
 )
 
 // authorizeTaken authorises a create of an existing namespace, before its
-// 412: an operator grant may create namespaces (§C.4), and otherwise the
-// caller needs config on the namespace itself.
+// 412: an operator grant may create namespaces with config (§C.2 item 2,
+// §C.4), and otherwise the caller needs config on the namespace itself.
 func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
 	if keys := t.operatorKeys(); len(keys) > 0 {
-		if a, err := t.authenticate(n.name, nil, nil, req.Cred, keys); err == nil && (a.verified == nil || a.star) {
-			return nil
+		if a, err := t.authenticate(n.name, nil, nil, req.Cred, keys); err == nil {
+			return t.authorize(a, "config", "")
 		}
 	}
 	a, err := t.authenticate(n.name, n, t.config(n.configSeq), req.Cred, nil)
@@ -26,7 +26,9 @@ func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
 	return t.authorize(a, "config", "")
 }
 
-// createNamespace bootstraps a namespace with an operator key (§C.4).
+// createNamespace bootstraps a namespace with an operator grant (§C.4),
+// which checks config (§C.2 item 2) and, as the grant that creates it,
+// passes the *-key guard (§C.2).
 func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error) {
 	if !ValidNSName(req.NS) {
 		return nil, badInput("invalid namespace name")
@@ -39,8 +41,8 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	if aerr != nil {
 		return nil, aerr
 	}
-	if a.verified != nil && !a.star {
-		return nil, forbidden("creating a namespace needs a deployment operator key")
+	if err := t.authorize(a, "config", ""); err != nil {
+		return nil, err
 	}
 	ops, err := patch.Parse(cc.Patches)
 	if err != nil {
@@ -50,26 +52,28 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	if err != nil {
 		return nil, patchErr(err)
 	}
-	// Step 4: a creation counts as a create (§6.6), held to the
-	// deployment's defaults, which no document has lowered yet.
-	if err := checkConfigLimits(t.e.opt.Limits, cc.Patches, jsonv.Canonical(cc.Patches), true, jsonv.Canonical(doc), func() bool { return true }); err != nil {
-		return nil, err
-	}
+	// Step 4: the document, validated as §7.4 says, then the limits: a
+	// creation counts as a create (§6.6), held to the deployment's
+	// defaults, which no document has lowered yet.
 	cfg, perr := t.e.newConfig(doc, nil, nil)
 	if perr != nil {
 		return nil, perr
 	}
 	if aerr := t.e.checkArchives(cfg); aerr != nil {
-		return nil, aerr
+		return nil, withPointer(aerr)
 	}
 	if cfg.Base != nil {
-		return nil, invalid("branches are created with POST /ns/{base}/branches")
+		return nil, docInvalid("/base", "branches are created with POST /ns/{base}/branches")
 	}
 	if err := t.checkEncryption(nil, cfg, -1); err != nil {
 		return nil, err
 	}
 	if cfg.Successor != "" {
-		return nil, invalid("a new namespace cannot have a successor")
+		// A creation names no successor (default, F-B9).
+		return nil, docInvalid("/successor", "a new namespace cannot have a successor")
+	}
+	if err := checkConfigLimits(t.e.opt.Limits, cc.Patches, jsonv.Canonical(cc.Patches), true, jsonv.Canonical(doc), func() bool { return true }); err != nil {
+		return nil, err
 	}
 	nn, id, nsID := t.insertNamespace(req.NS, cc.Patches, doc, cfg.Frozen, t.actorID(a))
 	t.sealedConfigWritten(nn, nil, cfg)
