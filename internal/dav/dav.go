@@ -591,13 +591,13 @@ const allowed = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, CO
 // principal's saves for a DELETE that follows (refusedSaveFor): a PUT or
 // a COPY of a file (saveTo), or a MOVE onto an existing one (onto),
 // refused without writing to the core sets a guard, but for one that put
-// back the principal's own
-// DELETE (undoOwnDelete), which a DELETE after it leaves deleted as the
-// principal chose, and one a frozen namespace refused, which takes no
-// DELETE either (§8.4); a DELETE that found nothing (a refused create's
-// cleanup) uses one up. A GET finding a file gone (404) is the reload a
-// refused save over someone else's delete asked for (tombBase). It runs
-// before the answer goes out, so the client's next request finds it.
+// back the principal's own DELETE (undoOwnDelete), which a DELETE after
+// it leaves deleted as the principal chose, and one a frozen namespace
+// refused, which takes no DELETE either (§8.4); a DELETE that found
+// nothing (a refused create's cleanup) uses one up. A GET finding a file
+// gone (404) is the reload a refused save over someone else's delete
+// asked for (tombBase). It runs before the answer goes out, so the
+// client's next request finds it.
 func (st *reqState) answered(status int) {
 	now := st.s.opt.Now()
 	guardOn := ""
