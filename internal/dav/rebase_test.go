@@ -169,17 +169,19 @@ func TestSaveOverOthersDelete(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/z.json", `{"a": "1", "b": "2"}`), 201, "PUT 31 s after the user's DELETE")
 	whole("z")
 
-	// Moved away (its last document has $successor): a write to the old
-	// name moments after makes it anew, without the $successor.
+	// Moved away (its last document has $successor): no write to the old
+	// name makes it anew, moments after or later (§H.2, §H.4): a 409
+	// naming the new path.
 	e.create("docs", "m", map[string]any{"a": "1"})
 	e.expect(e.do("MOVE", "/docs/m.json", "", "Destination", "/docs/n.json"), 201, "MOVE")
 	if h, _ := e.load("docs", "m"); h.Successor != "n" {
 		t.Fatalf("m's successor %q", h.Successor)
 	}
-	e.expect(e.do("PUT", "/docs/m.json", `{"a": "again"}`), 201, "PUT the old name")
-	whole("m")
-	_, doc = e.load("docs", "m")
-	sameJSON(t, doc, map[string]any{"a": "again"})
+	r = e.expect(e.do("PUT", "/docs/m.json", `{"a": "again"}`), 409, "PUT the old name")
+	if !strings.Contains(r.body, "/docs/n.json") {
+		t.Fatalf("409 %q", r.body)
+	}
+	e.expectTombstoned("docs", "m", "after the refused save")
 }
 
 // Saves of a JSON file are patch sets from the base's rendering (§H.4):
@@ -314,8 +316,9 @@ func TestSaveRangeReadNoBase(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/x.json", edit(t, editor, `"A"`, `"Mine"`)), 201, "PUT after it: the reload")
 }
 
-// Records last a day (§H.4): after it, a save without a tag has no base,
-// and the file as written wins.
+// Records last a day (§H.4): after it they count as evicted, so a save
+// without a tag is a 409, never written over others' edits as one with
+// no base would be, and after the reload it asks for the save merges.
 func TestSaveRecordsForADay(t *testing.T) {
 	t.Parallel()
 	c := newClock()
@@ -332,9 +335,11 @@ func TestSaveRecordsForADay(t *testing.T) {
 	buf = e.expect(e.do("GET", "/docs/y.json", ""), 200, "GET").body
 	e.theirs("docs", "y", replace("/b", "theirs"))
 	c.add(25 * time.Hour)
-	e.expect(e.do("PUT", "/docs/y.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT after 25 h")
+	e.expect(e.do("PUT", "/docs/y.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 409, "PUT after 25 h")
+	buf = e.expect(e.do("GET", "/docs/y.json", ""), 200, "the reload").body
+	e.expect(e.do("PUT", "/docs/y.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT after the reload")
 	_, doc = e.load("docs", "y")
-	sameJSON(t, doc, map[string]any{"a": "mine", "b": "1"})
+	sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
 }
 
 // A write moments after the user's own DELETE restores the file rebased

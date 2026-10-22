@@ -780,17 +780,15 @@ func TestRawOwnSaves(t *testing.T) {
 	must(e.c.Append(e.ctx, "docs", "b.txt", h.ID, []any{replace("/$blob", bid), replace("/size", 6)}))
 	e.expect(e.do("GET", "/docs/b.txt", ""), 200, "GET preview")
 	e.expect(e.do("PUT", "/docs/b.txt", "mine"), 409, "PUT the editor's buffer")
-	// Saved unchanged, the editor's version writes nothing over theirs.
+	// Saved unchanged, the editor's version is a conflict too, never
+	// answered as stored (§H.1 "Identity"): nothing is written over theirs.
 	e.rawDoc("docs", "c.txt", "text/plain", []byte("one"), nil)
 	e.expect(e.do("GET", "/docs/c.txt", ""), 200, "GET")
 	h, _ = e.load("docs", "c.txt")
 	bid = must(e.c.UploadBlob(e.ctx, "docs", "c.txt", "text/plain", "", []byte("theirs")))
 	must(e.c.Append(e.ctx, "docs", "c.txt", h.ID, []any{replace("/$blob", bid), replace("/size", 6)}))
 	h, _ = e.load("docs", "c.txt")
-	r := e.expect(e.do("PUT", "/docs/c.txt", "one"), 201, "PUT the version read, unchanged")
-	if r.header.Get("ETag") != "" {
-		t.Fatalf("ETag %q for what isn't the head's content", r.header.Get("ETag"))
-	}
+	e.expect(e.do("PUT", "/docs/c.txt", "one"), 409, "PUT the version read, unchanged")
 	e.expectLive("docs", "c.txt", h, "after an unchanged save")
 	if _, data := e.rawOf("docs", "c.txt"); string(data) != "theirs" {
 		t.Fatalf("c.txt %q", data)

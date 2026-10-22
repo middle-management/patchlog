@@ -3,6 +3,7 @@ package dav
 import (
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/lru"
@@ -19,7 +20,10 @@ import (
 // apart: over RecordBytes, the user keeping the most gives way first, so
 // one user's uploads don't push out another's records. Records dropped
 // to stay within bounds are remembered as lost, so a save isn't rebased
-// on what is left of them (base). With them are the user's path records
+// on what is left of them (base), and so are those of a document
+// untouched for RecordIdle, which expired: they count as evicted (§H.4
+// "Records"), the marks kept past the sweep of an idle user's records,
+// within bounds (retireLocked). With them are the user's path records
 // and the tombstones and restores the user wrote (markOwn).
 
 // maxRecords bounds a user's records of one document. Over it, the
@@ -30,6 +34,15 @@ const maxRecords = 16
 // maxForgotten bounds the documents a user's records remember having
 // lost records of.
 const maxForgotten = 4096
+
+// maxRetired bounds the users whose records were swept for idleness
+// (sweepRecordsLocked) whose marks are kept, the least recently used
+// going first, and maxRetiredMarks the documents and the paths each of
+// them remembers (retireLocked).
+const (
+	maxRetired      = 256
+	maxRetiredMarks = 512
+)
 
 // record is one version: rev's document as served, or as the user wrote
 // it.
@@ -86,19 +99,21 @@ func (d docRecs) cost() int {
 // recStore is one user's records.
 type recStore struct {
 	docs      lru.Cache[string, docRecs] // by ns/name
-	forgotten lru.Cache[string, bool]    // documents whose records the bounds dropped
+	forgotten lru.Cache[string, bool]    // documents whose records the bounds dropped, or that expired
 	paths     lru.Cache[string, pathRec] // by path
 	own       lru.Cache[string, bool]    // by ns/name@id: the tombstones and restores the user wrote
 	used      time.Time
+	// retired: swept for idleness, its records dropped and kept as
+	// marks (retireLocked), until the user comes back
+	retired bool
 }
 
 // pathRec is the document a user last read whole or wrote under a
 // path (records are kept by document, and a path may come to name
 // another: a tree's title given to a new item, a raw x.json taking the
-// name of JSON document x), and when.
+// name of JSON document x).
 type pathRec struct {
 	ns, name string
-	at       time.Time
 }
 
 // maxPaths bounds the paths a user's path records keep.
@@ -124,6 +139,9 @@ func keepRaw(body, rendered []byte) []byte {
 // storeLocked returns p's records, made if new.
 func (s *Server) storeLocked(p *principal) *recStore {
 	rs := s.recRoots[p.id]
+	if rs != nil {
+		rs.retired = false
+	}
 	if rs == nil {
 		rs = &recStore{used: s.opt.Now()}
 		rs.docs.MaxEntries, rs.docs.MaxBytes = 1<<16, s.opt.RecordBytes
@@ -202,11 +220,10 @@ func (s *Server) ownEntry(p *principal, ns, name, id string) bool {
 	return ok
 }
 
-// recordsOf returns p's records of ns/name, without those older than
-// RecordIdle. Records the bounds dropped since the document's last reload
-// make it lost.
+// recordsOf returns p's records of ns/name. Records the bounds dropped
+// since the document's last reload make it lost, and so do records that
+// expired (expireLocked).
 func (s *Server) recordsOf(p *principal, ns, name string) docRecs {
-	cut := s.opt.Now().Add(-s.opt.RecordIdle)
 	k := recKey(ns, name)
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
@@ -216,13 +233,36 @@ func (s *Server) recordsOf(p *principal, ns, name string) docRecs {
 		_, lost := rs.forgotten.Get(k)
 		return docRecs{lost: lost}
 	}
-	out := docRecs{reload: d.reload, lost: d.lost, unread: d.unread, rs: make([]record, 0, len(d.rs))}
+	if s.expireLocked(&d) {
+		before := rs.docs.Bytes()
+		rs.docs.Put(k, d, d.cost())
+		s.recBytes += rs.docs.Bytes() - before
+	}
+	out := d
+	out.rs = slices.Clone(d.rs)
+	return out
+}
+
+// expireLocked drops d's records if they expired, the document untouched
+// (no record made) for RecordIdle, and reports whether it did: then they
+// count as evicted (§H.4 "Records"), the document lost, so a save
+// without a tag is refused (409) until the reload that refusal asks for,
+// rather than taking the head as its base and writing over what others
+// changed since the version a client may still hold. A document touched
+// within RecordIdle keeps every record, the version an editor opened
+// with them.
+func (s *Server) expireLocked(d *docRecs) bool {
+	if len(d.rs) == 0 {
+		return false
+	}
+	cut := s.opt.Now().Add(-s.opt.RecordIdle)
 	for _, r := range d.rs {
 		if !r.at.Before(cut) {
-			out.rs = append(out.rs, r)
+			return false
 		}
 	}
-	return out
+	*d = docRecs{lost: true, unread: d.unread}
+	return true
 }
 
 // remember adds r to p's records of ns/name, the newest, in place of one
@@ -247,6 +287,10 @@ func (s *Server) remember(p *principal, ns, name string, r record, reload bool) 
 			st.forgotten.Remove(k)
 		}
 	}
+	// Expired, the document is lost: this read isn't the reload, which
+	// follows a refusal (another program of the user's may hold a
+	// version that expired).
+	s.expireLocked(&old)
 	// A read after a refused save is the reload it asked for: what was
 	// recorded before the refusal goes.
 	reloaded := reload && old.reload > 0
@@ -324,31 +368,89 @@ func (s *Server) trimRecordsLocked() {
 	}
 }
 
-// sweepRecordsLocked forgets the users that recorded nothing for
-// RecordIdle, whose records have aged out.
+// sweepRecordsLocked retires the records of the users that recorded
+// nothing for RecordIdle, which have expired (retireLocked), keeping the
+// marks of at most maxRetired of them, the least recently used going
+// first.
 func (s *Server) sweepRecordsLocked(now time.Time) {
+	var retired []string
 	for root, rs := range s.recRoots {
-		if now.Sub(rs.used) > s.opt.RecordIdle {
+		if !rs.retired && now.Sub(rs.used) > s.opt.RecordIdle {
 			s.recBytes -= rs.docs.Bytes()
-			delete(s.recRoots, root)
+			rs.retireLocked()
+		}
+		if rs.retired {
+			retired = append(retired, root)
 		}
 	}
+	if len(retired) <= maxRetired {
+		return
+	}
+	slices.SortFunc(retired, func(a, b string) int { return s.recRoots[a].used.Compare(s.recRoots[b].used) })
+	for _, root := range retired[:len(retired)-maxRetired] {
+		delete(s.recRoots, root)
+	}
+}
+
+// retireLocked drops rs's records, which expired, keeping what says they
+// existed (§H.4 "a path whose records expired counts as evicted"): a
+// lost mark for each document it had records of (forgotten), so a save
+// of one without a tag is refused until a reload rather than rebased on
+// the head, as if never recorded, and its path records, which refuse a
+// save of a path that now names another document (replaced); at most
+// maxRetiredMarks of each, the most recently used. Of the entries the
+// user wrote (own), each marked document keeps the one used last: where
+// the head is the user's own DELETE, that is it, as nothing was written
+// after it, so a new file there is no save over someone else's delete
+// (tombLast), the path forgotten by that DELETE (§H.4 "Records"); the
+// rest go.
+func (rs *recStore) retireLocked() {
+	keys := rs.docs.Keys() // most recently used first
+	for i := len(keys) - 1; i >= 0; i-- {
+		rs.forgotten.Put(keys[i], true, 1)
+	}
+	rs.docs.Flush()
+	for rs.forgotten.Len() > maxRetiredMarks {
+		rs.forgotten.RemoveOldest()
+	}
+	for rs.paths.Len() > maxRetiredMarks {
+		rs.paths.RemoveOldest()
+	}
+	marked := map[string]bool{}
+	for _, k := range rs.forgotten.Keys() {
+		marked[k] = true
+	}
+	var own []string // most recently used first
+	for _, k := range rs.own.Keys() {
+		doc := k[:max(strings.LastIndexByte(k, '@'), 0)]
+		if marked[doc] {
+			own = append(own, k)
+			delete(marked, doc)
+		}
+	}
+	rs.own.Flush()
+	for i := len(own) - 1; i >= 0; i-- {
+		rs.own.Put(own[i], true, 1)
+	}
+	rs.retired = true
 }
 
 // notePath records that p read ns/name whole, or wrote it, under path.
 func (s *Server) notePath(p *principal, path, ns, name string) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
-	s.storeLocked(p).paths.Put(path, pathRec{ns: ns, name: name, at: s.opt.Now()}, 1)
+	s.storeLocked(p).paths.Put(path, pathRec{ns: ns, name: name}, 1)
 }
 
-// pathOf returns the document p last read whole or wrote under path,
-// within RecordIdle.
+// pathOf returns the document p last read whole or wrote under path, as
+// long as its path records keep it: one older than RecordIdle too, which
+// counts as evicted (§H.4 "Records"), not as never recorded, so a save
+// of a path that now names another document is refused (replaced).
 func (s *Server) pathOf(p *principal, path string) (string, string, bool) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
 	r, ok := s.storeLocked(p).paths.Get(path)
-	if !ok || s.opt.Now().Sub(r.at) > s.opt.RecordIdle {
+	if !ok {
 		return "", "", false
 	}
 	return r.ns, r.name, true
@@ -485,18 +587,38 @@ func (s *Server) reloaded(p *principal, ns, name, by string) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
 	st := s.storeLocked(p)
+	if d, ok := st.docs.Get(k); ok && d.reload > 0 {
+		s.dropLocked(st, k)
+	}
+}
+
+// forgetDoc forgets p's records of ns/name, kept or lost: the head is a
+// DELETE of p's own, written before ownDeleteUndo, which forgot the path
+// (§H.4 "Records"), and a save makes the file anew, its write then the
+// only record, not one of a document whose records were lost (expired,
+// or retired with the user's, retireLocked), which would refuse the
+// next save.
+func (s *Server) forgetDoc(p *principal, ns, name string) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	s.dropLocked(s.storeLocked(p), recKey(ns, name))
+}
+
+// dropLocked drops st's records of document k and its lost mark, but for
+// the tokens that must read it themselves (refusedSave): refused, they
+// haven't read it since.
+func (s *Server) dropLocked(st *recStore, k string) {
+	st.forgotten.Remove(k)
 	d, ok := st.docs.Get(k)
-	if !ok || d.reload == 0 {
+	if !ok {
 		return
 	}
 	before := st.docs.Bytes()
 	if len(d.unread) > 0 {
-		// Other tokens refused, which haven't found it gone.
 		st.docs.Put(k, docRecs{unread: d.unread}, docRecs{unread: d.unread}.cost())
 	} else {
 		st.docs.Remove(k)
 	}
-	st.forgotten.Remove(k)
 	s.recBytes += st.docs.Bytes() - before
 }
 

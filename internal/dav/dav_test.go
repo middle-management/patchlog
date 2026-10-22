@@ -86,7 +86,8 @@ func TestPutCreateEdit(t *testing.T) {
 	if en := e.lastEntry("docs", "new"); en.Author != "dav" {
 		t.Fatalf("author %q", en.Author)
 	}
-	if l := e.propfind("/docs/"); l["/docs/new.json"].size != strconv.Itoa(len(upload)) || l["/docs/new.json"].etag != `"`+h.ID+`"` {
+	// The writer's bytes are listed under the weak tag (§H.1).
+	if l := e.propfind("/docs/"); l["/docs/new.json"].size != strconv.Itoa(len(upload)) || l["/docs/new.json"].etag != `W/"`+h.ID+`"` {
 		t.Fatalf("listed after PUT %+v, want size %d", l["/docs/new.json"], len(upload))
 	}
 
@@ -933,7 +934,9 @@ func TestLockLifecycle(t *testing.T) {
 	if _, data := e.rawOf("docs", "m2.md"); string(data) != "move me" {
 		t.Fatalf("m2.md %q", data)
 	}
-	e.expect(e.do("PUT", "/docs/m.md", "new"), 201, "PUT to the moved file's name without a token")
+	// No lock is left on the old name (423): the PUT gets the answer for
+	// a name moved away (§H.2), which no save makes anew.
+	e.expect(e.do("PUT", "/docs/m.md", "new"), 409, "PUT to the moved file's name without a token")
 	e.expect(e.do("PUT", "/docs/m2.md", "edited"), 201, "PUT the moved file without a token")
 
 	e.expect(e.do("PUT", "/docs/c.md", "copy me"), 201, "PUT c.md")

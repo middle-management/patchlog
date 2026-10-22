@@ -1040,10 +1040,13 @@ func (st *reqState) createNode(ctx context.Context, cat, name string, doc map[st
 // ifMatch (a DELETE's If-Match, the revision a MOVE copied), an item
 // whose head isn't that revision is a 412, before anything is written,
 // or, if it changed between the check and its delete, after its
-// placement is restored as it was. The placement is deleted only as the
-// node documents read had it (If-Match), which resolveCatalog checked the
-// path against: renamed or moved since by anyone, it is a 409, not
-// deleted. A node with several parents (a DAG) is unlinked from this
+// placement is restored as it was. Without one, the item is deleted with
+// If-Match on the head read here, and one changed since that read is a
+// 409 (movedSinceRead), its placement restored as it was too: an edit
+// made meanwhile isn't tombstoned unseen (§H.5). The placement is deleted
+// only as the node documents read had it (If-Match), which resolveCatalog
+// checked the path against: renamed or moved since by anyone, it is a
+// 409, not deleted. A node with several parents (a DAG) is unlinked from this
 // folder only, while it still has the name and parent the path named
 // (unlink). A principal's DELETE is remembered a while, so its write
 // of the path restores the file (§H.6).
@@ -1068,13 +1071,20 @@ func (st *reqState) deleteFile(ctx context.Context, t target, ifMatch, successor
 	}
 	d := treeDelete{cat: t.ns, node: t.node, nodeTomb: ptomb, parent: t.parent, itemNS: t.docNS, itemName: t.docName}
 	if t.docNS == f.ns {
-		d.itemTomb, err = st.deleteItem(ctx, t.docNS, t.docName, ifMatch, successor)
+		match := ifMatch
+		if match == "" && h.State == client.Live {
+			match = h.ID
+		}
+		d.itemTomb, err = st.deleteItem(ctx, t.docNS, t.docName, match, successor)
 		var de *davError
 		switch {
 		case err == nil, errors.Is(err, errNotExist):
 		case errors.As(err, &de) && de.status == http.StatusPreconditionFailed:
 			// Changed since the check: the file stays, placed, as it is.
 			st.undelete(ctx, st.s.nsInfo(ctx, st.tk, t.ns), t.ns, t.node, ptomb, nil)
+			if ifMatch == "" {
+				return movedSinceRead(t)
+			}
 			return de
 		case errors.As(err, &de) && (de.status == http.StatusUnauthorized || de.status == http.StatusForbidden):
 			// The grant doesn't delete there (under tree-derived access the
@@ -1153,15 +1163,16 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 // folder a moment ago, or every file while the tree service catches up
 // with a namespace), and would have the folder deleted over a file it
 // orphans. Placements whose items are gone (dangling, §B.3) aren't
-// contents, and are deleted first; those whose items the request's grant
-// can't read are neither named nor deleted. The folder node is deleted as
-// read (If-Match), and only while still named and placed as the path
-// named it, which was checked against the token's kept graph (agrees),
-// maybe older than this read: renamed or moved meanwhile, it is a 404 or
-// a 409; a child placed while it is deleted is orphaned (§H.5), as one
-// placed by another program always may be. A node with several parents
-// (a DAG) is unlinked from this folder only (unlink). The scope's scratch
-// files in it go with it.
+// contents, and are deleted first where the grant may (one it can't
+// delete, 401 or 403, is orphaned, §H.5, as a hidden one is); those whose
+// items the request's grant can't read are neither named nor deleted.
+// The folder node is deleted as read (If-Match), and only while still
+// named and placed as the path named it, which was checked against the
+// token's kept graph (agrees), maybe older than this read: renamed or
+// moved meanwhile, it is a 404 or a 409; a child placed while it is
+// deleted is orphaned (§H.5), as one placed by another program always
+// may be. A node with several parents (a DAG) is unlinked from this
+// folder only (unlink). The scope's scratch files in it go with it.
 func (st *reqState) deleteFolder(ctx context.Context, t target) error {
 	cg, _, err := st.writeTree(ctx, t.ns)
 	if err != nil {
@@ -1199,7 +1210,16 @@ func (st *reqState) deleteFolder(ctx context.Context, t target) error {
 		if n.Kind == kindFolder || !st.dangling(ctx, cg, n) {
 			continue
 		}
-		if _, err := st.deleteDoc(ctx, t.ns, n.Name, ""); err != nil && !errors.Is(err, errNotExist) {
+		_, err := st.deleteDoc(ctx, t.ns, n.Name, "")
+		var de *davError
+		switch {
+		case err == nil, errors.Is(err, errNotExist):
+		case errors.As(err, &de) && (de.status == http.StatusUnauthorized || de.status == http.StatusForbidden):
+			// Not the grant's to delete: orphaned with the folder (§B.7),
+			// as a placement hidden from the caller is, never what stops
+			// the folder's delete (§H.5 "Delete a folder").
+			st.s.opt.Logf("dav: %s: dangling placement %s/%s isn't deleted, and is orphaned: %v", t.path, t.ns, n.Name, err)
+		default:
 			return err
 		}
 	}
@@ -1208,6 +1228,15 @@ func (st *reqState) deleteFolder(ctx context.Context, t target) error {
 	}
 	_, err = st.deleteDoc(ctx, t.ns, t.node, cg.heads[t.node])
 	return changedSince(t, err)
+}
+
+// movedSinceRead is the answer for a DELETE without a tag (§H.5 "Delete
+// a file") whose delete, with If-Match on the head the gateway read for
+// it, found that head moved: someone else wrote the file in between,
+// which isn't deleted unseen. A client's own If-Match that isn't the head
+// is a 412 instead.
+func movedSinceRead(t target) error {
+	return fail(http.StatusConflict, "%s was changed by someone else while it was being deleted (§H.5), so it isn't deleted; reload it", t.path)
 }
 
 // changedSince is the answer for a DELETE of node t.node of a tree that
@@ -1311,6 +1340,9 @@ func (st *reqState) moveNode(ctx context.Context, src, dst target) error {
 		}
 		if !st.stillNamed(src, e.value) {
 			return false, fail(http.StatusNotFound, "%s was renamed or moved by someone else just now; reload its folder", src.path)
+		}
+		if src.kind == kFolder && st.srcMatch != "" && h.ID != st.srcMatch {
+			return false, st.sourceMoved(src.path)
 		}
 		m, _ := e.value.(map[string]any)
 		var ps []any
@@ -1428,6 +1460,9 @@ func (st *reqState) moveOnto(ctx context.Context, src, dst target) error {
 	if err != nil {
 		return err
 	}
+	if st.srcMatch != "" && hd.rev != st.srcMatch {
+		return st.sourceMoved(src.path)
+	}
 	rev, _, err := st.commitRev(ctx, dst, b)
 	if err != nil {
 		return st.undoOwnDelete(ctx, dst, upstream(err))
@@ -1499,6 +1534,9 @@ func (st *reqState) moveAcross(ctx context.Context, src, dst target) error {
 	if err != nil {
 		return err
 	}
+	if st.srcMatch != "" && hd.rev != st.srcMatch {
+		return st.sourceMoved(src.path)
+	}
 	if src.kind != kPlacement {
 		// Its last revision takes $successor first, an append, where its
 		// root is an object (deleteItem).
@@ -1513,7 +1551,9 @@ func (st *reqState) moveAcross(ctx context.Context, src, dst target) error {
 		}
 	}
 	st.wroteTo = ""
+	st.moving = true
 	rev, _, err := st.commitRev(ctx, dst, b)
+	st.moving = false
 	if err != nil {
 		return err
 	}
