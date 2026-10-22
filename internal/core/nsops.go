@@ -181,9 +181,10 @@ func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error)
 	if err == nil {
 		// rulesPerNamespace, the document's own or the default, within the
 		// deployment's maximum, counts every rule form of rules, roles and
-		// key scopes (§12.2). It holds the writes that change what it
-		// bounds, not a document stored over it (§6.6).
-		if bound := min(cfg.Limits.RulesPerNS, e.opt.Maximums.RulesPerNS); cfg.ruleForms > bound && rulesOrBoundChanged(cfg.Doc, prev) {
+		// key scopes (§12.2). It holds a creation, a branch's included,
+		// and the writes that change what it bounds, not a document
+		// stored over it (§6.6).
+		if bound := min(cfg.Limits.RulesPerNS, e.opt.Maximums.RulesPerNS); cfg.ruleForms > bound && (base != nil || rulesOrBoundChanged(cfg.Doc, prev)) {
 			err = sizeLimit("rulesPerNamespace", cfg.ruleForms, bound, fmt.Sprintf("more than %d rule forms in rules, roles and key scopes (§12.2)", bound))
 		}
 	}

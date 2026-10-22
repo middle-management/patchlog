@@ -873,6 +873,11 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 	if err != nil {
 		return nil, nil, nil, patchErr(err)
 	}
+	// Step 4: a creation counts as a create, held to the deployment's
+	// defaults, as createNamespace's (§6.6).
+	if err := checkConfigLimits(t.e.opt.Limits, cc.Patches, jsonv.Canonical(cc.Patches), true, jsonv.Canonical(doc), func() bool { return true }); err != nil {
+		return nil, nil, nil, err
+	}
 	cfg, perr := t.e.newConfig(doc, nil, nil)
 	if perr != nil {
 		return nil, nil, nil, perr

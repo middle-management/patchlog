@@ -575,3 +575,45 @@ func TestV073EpochRotationNotHeldToValues(t *testing.T) {
 	expectLimit(t, e.patchNS("s", ops(op("replace", "/encryption/epoch", 6.0), op("add", "/limits", map[string]any{"opsPerSet": 100})), ""),
 		422, "patchSetSize", need, 64<<10)
 }
+
+// v0.73 §6.6: a namespace's own bound, a lowered rulesPerNamespace among
+// them, holds its creation, and a branch's creation is a namespace's
+// creation. A base stored over the bound still takes other writes, but its
+// rule forms don't pass into a new branch, as they don't into a new
+// namespace.
+func TestV073BranchCreationHeldToRulesPerNamespace(t *testing.T) {
+	t.Parallel()
+	e, reopen := v073Reopenable(t)
+	leaf := map[string]any{"op": "test", "path": "/action", "exists": true}
+	roles := map[string]any{"ed": map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"all": []any{leaf, leaf}}, leaf}}} // 4 rule forms
+	e.mkNS("s", map[string]any{"roles": roles})
+	e = reopen(func(o *core.Options) {
+		m := core.DefaultMaximums()
+		m.RulesPerNS = 3
+		o.Maximums = m
+	})
+	expect(t, e.patchNS("s", ops(op("add", "/x-a", 1.0)), ""), 201)
+	expectLimit(t, e.do(req{method: "PATCH", path: "/ns/n", ifNoneMatch: "*", author: "admin", body: addRoot(map[string]any{"roles": roles})}),
+		422, "rulesPerNamespace", 4, 3)
+	expectLimit(t, e.branch("s", map[string]any{"name": "sb"}, "alice"), 422, "rulesPerNamespace", 4, 3)
+	// Within it once the branch drops a rule form.
+	expect(t, e.branch("s", map[string]any{"name": "sb", "patches": ops(op("remove", "/roles/ed/rules/1"))}, "alice"), 201)
+}
+
+// v0.73 §6.6: a remote branch's creation, like any namespace's, is held to
+// the patch-set and document limits, the creation counting as a create
+// (§G.3 creates it by PATCH /ns/{ns} with If-None-Match: *).
+func TestV073RemoteBranchCreationHeldToLimits(t *testing.T) {
+	t.Parallel()
+	a, b, _ := pair(t, nil, []envOpt{func(o *core.Options) {
+		o.Limits = core.DefaultLimits()
+		o.Limits.DocumentSize = 4096
+	}})
+	a.mkNS("main", map[string]any{"read": "public"})
+	a.create("main", "d", map[string]any{"d": 1.0})
+	at := a.nsHead("main")
+	big := remoteGenesis("main", at, map[string]any{"x-note": strings.Repeat("x", 5000)})
+	expectLimit(t, b.mkRemote("rel", big), 422, "documentSize", int64(len(canonical(big))), 4096)
+	expect(t, b.get("/ns/rel"), 404)
+	expect(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 201)
+}
