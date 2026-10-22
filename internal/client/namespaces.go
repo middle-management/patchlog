@@ -125,7 +125,11 @@ type NSEntry struct {
 	// while authentication was disabled (§1, §7.4). Entries without
 	// "grant" at all have neither Grant nor GrantNull.
 	GrantNull bool
-	Created   string
+	// Via is the delegation chain of that grant, its delegatees in order
+	// (§7.4, §C.1), not hashed; nil when there are none, for entries the
+	// server writes itself, and for entries from before servers stored it.
+	Via     []string
+	Created string
 	// Forced marks a purge or purge-ns entry of a purge that overrode an
 	// in_use refusal (§3.5, §6.1); it is part of the hashed entry.
 	Forced bool
@@ -178,6 +182,9 @@ func ParseNSEntry(v any) (NSEntry, error) {
 		} else {
 			e.GrantNull = g == nil
 		}
+	}
+	if via := strList(m["via"]); len(via) > 0 {
+		e.Via = via
 	}
 	e.Remote, _ = m["remote"].(map[string]any)
 	e.Forced, _ = m["forced"].(bool)

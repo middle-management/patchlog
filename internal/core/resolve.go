@@ -570,7 +570,10 @@ type LogEntry struct {
 	Kind    string `json:"kind"`
 	Patches any    `json:"patches,omitempty"`
 	Author  string `json:"author"`
-	Created string `json:"created"`
+	// Via is the delegation chain of the grant the entry was written under
+	// (§7.1, §C.1): its delegatees in order, nil when there are none.
+	Via     []string `json:"via,omitempty"`
+	Created string   `json:"created"`
 	// Grant is the grant reference { id, sub, kid } of the grant the entry
 	// was written under (§7.1, §C.3), as namespace entries serve it
 	// (grantref.go); nil if it wasn't written under one.
@@ -592,6 +595,9 @@ func (e LogEntry) value() map[string]any {
 	}
 	if e.Kind == "rev" && e.Patches != nil {
 		m["patches"] = e.Patches
+	}
+	if len(e.Via) > 0 {
+		m["via"] = anyStrings(e.Via)
 	}
 	if e.Grant != nil {
 		m["grant"] = e.Grant
@@ -622,6 +628,7 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 			e.Patches, e.size = jsonv.MustParse(b), len(b)
 		}
 	}
+	e.Via = parseVia(r.via)
 	if r.grantID != nil {
 		e.Grant = t.grantRef(r.grantID)
 	}
@@ -630,6 +637,20 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 	}
 	e.Gesture, e.Undoes = r.gesture.String, r.undoes.String
 	return e
+}
+
+// parseVia reads a stored via column (revisions.via, ns_log.via): the
+// canonical JSON array of a grant's delegatees (writtenBy, grantVia), or
+// nil for NULL, an empty array and rows from before the column (§7.1).
+func parseVia(col sql.NullString) []string {
+	if !col.Valid || col.String == "" {
+		return nil
+	}
+	var via []string
+	if err := json.Unmarshal([]byte(col.String), &via); err != nil || len(via) == 0 {
+		return nil
+	}
+	return via
 }
 
 // logBetween returns the entries after since (exclusive; nil = from the

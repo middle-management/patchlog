@@ -696,7 +696,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			fromSeq = s
 		}
-		q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
+		q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures, via FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
 		args := []any{n.id, fromSeq, toSeq}
 		if limit > 0 {
 			q += ` LIMIT ?`
@@ -714,6 +714,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			grantID []byte
 			noAuth  sql.NullInt64
 			meta    sql.NullString
+			via     sql.NullString
 			m       map[string]any // body, parsed
 		}
 		// A page holds at most limit entries, and at most limit resource
@@ -725,7 +726,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		units := 0
 		for rows.Next() {
 			var r raw
-			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta))
+			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta, &r.via))
 			r.m = jsonv.MustParse([]byte(r.body)).(map[string]any)
 			u := 1
 			if es, ok := r.m["entries"].([]any); ok && len(es) > 1 {
@@ -756,6 +757,11 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			m["author"] = t.authorName(r.author)
 			m["created"] = formatTime(r.created)
+			if via := parseVia(r.via); via != nil {
+				// The grant's delegatees, unhashed like author (§7.4);
+				// sealed with the entry in a sealed namespace.
+				m["via"] = anyStrings(via)
+			}
 			switch {
 			case r.grantID != nil:
 				// Not part of the hashed entry, like author and created
