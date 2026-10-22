@@ -365,3 +365,20 @@ func TestV073P16FirstWriteBelowBaseHorizon(t *testing.T) {
 	// The precondition comes first.
 	expectCode(t, e.write("PATCH", "late", "a", a1, ops(op("replace", "/n", 9.0))), 412, "stale")
 }
+
+// v0.73 Addendum E Levels, §7.4 (ENC-49): a branch's creation below its
+// base's level is 422 invalid at /encryption, as a branch field, before the
+// *-key guard its patches to /encryption meet.
+func TestV073P16BranchLevelBeforeGuard(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t, withKeyStore(newKeyStore(t)), withEncTuning)
+	sk, bk := newKey("sk"), newKey("bk")
+	e.mkNS("sv", map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}, "keys": []any{sk.entry("*"), bk.entry("branch", "read")}})
+	bg := e.grant(bk, "user:brancher", []string{"sv", "lv"}, []string{"branch", "read"})
+	sg := e.grant(sk, "user:admin", []string{"sv", "lv"}, allVerbs)
+	lower := ops(op("replace", "/encryption", map[string]any{"level": "at-rest"}))
+	expectInvalidAt(t, e.branch("sv", map[string]any{"name": "lv", "patches": lower}, bg), "/encryption")
+	expectInvalidAt(t, e.branch("sv", map[string]any{"name": "lv", "patches": lower}, sg), "/encryption")
+	expectCode(t, e.branch("sv", map[string]any{"name": "lv", "patches": ops(op("add", "/encryption/pad", true))}, bg), 403, "forbidden")
+	expect(t, e.branch("sv", map[string]any{"name": "lv"}, bg), 201)
+}
