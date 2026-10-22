@@ -709,16 +709,24 @@ func TestSelfPlacing(t *testing.T) {
 	if got := names(y.get("/cat/children?of=root", "")["children"]); got != "matches.s1,news" {
 		t.Errorf("root: %s", got)
 	}
-	// Removing the explicit one brings back the implicit one.
+	// A deleted explicit placement still wins (§B.9): the implicit one
+	// stays out, however the content moves.
 	w.del(t, "cat", "matches.s1")
 	y.caughtUp("cat")
-	if got := names(y.get("/cat/children?of=news", "")["children"]); got != "matches.s1" {
+	if got := names(y.get("/cat/children?of=news", "")["children"]); got != "" {
 		t.Errorf("implicit after unplace: %s", got)
 	}
-	// Moving the implicit placement means editing the content.
 	w.replace(t, "matches", "s1", "/$parents", []any{map[string]any{"href": "/r/cat/root"}})
 	y.caughtUp("matches")
-	if got := names(y.get("/cat/children?of=root", "")["children"]); got != "matches.s1,news" {
+	if got := names(y.get("/cat/children?of=root", "")["children"]); got != "news" {
+		t.Errorf("after content move: %s", got)
+	}
+	// Moving an implicit placement means editing the content.
+	must(w.c.CreateDoc(context.Background(), "matches", "s2", map[string]any{"$parents": []any{map[string]any{"href": "/r/cat/news"}}}))
+	y.caughtUp("matches")
+	w.replace(t, "matches", "s2", "/$parents", []any{map[string]any{"href": "/r/cat/root"}})
+	y.caughtUp("matches")
+	if got := names(y.get("/cat/children?of=root", "")["children"]); got != "matches.s2,news" {
 		t.Errorf("after content move: %s", got)
 	}
 }

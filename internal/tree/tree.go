@@ -34,7 +34,7 @@
 // Handler); content namespaces contribute names, heads and structure,
 // which stay in the clear, and in a file tree the file metadata of their
 // items' heads, sealed per entry under the item's K_r for a sealed
-// namespace and left out for an e2e one (§E.2.6, §H.3, files.go).
+// namespace and absent for an e2e one (§E.2.6, §H.3, files.go).
 //
 // Stored plaintext. The database holds what the service derives from its
 // namespaces in the clear (titles, file metadata, $parents, $access, and the catalog's
@@ -55,6 +55,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -334,15 +335,14 @@ func (s *Service) init(ctx context.Context) error {
 			return fmt.Errorf("tree: schema: %w", err)
 		}
 	}
-	// A database from before item titles (§B.5), or created times and file
-	// metadata (§H.3), which backfillFiles fills in for a file tree.
-	for _, col := range []string{"title", "created", "file"} {
+	// A database from an earlier release (addedColumns).
+	for _, tc := range addedColumns {
 		var has int
-		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('items') WHERE name = ?`, col).Scan(&has); err != nil {
+		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, tc[0], tc[1]).Scan(&has); err != nil {
 			return fmt.Errorf("tree: schema: %w", err)
 		}
 		if has == 0 {
-			if _, err := s.db.ExecContext(ctx, `ALTER TABLE items ADD COLUMN `+col+` TEXT`); err != nil {
+			if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+tc[0]+` ADD COLUMN `+tc[1]+` TEXT`); err != nil {
 				return fmt.Errorf("tree: schema: %w", err)
 			}
 		}
@@ -671,14 +671,16 @@ func (s *Service) Run(ctx context.Context) error {
 	s.fmu.Lock()
 	s.runCtx = ctx
 	s.fmu.Unlock()
-	if err := s.backfillFiles(ctx); err != nil && ctx.Err() == nil {
-		// Made again beside the followers until it succeeds.
-		s.opt.Logf("tree: file metadata: %v; retrying", err)
-		s.fwg.Add(1)
-		go func() {
-			defer s.fwg.Done()
-			s.retryBackfill(ctx)
-		}()
+	for what, fill := range map[string]func(context.Context) error{"file metadata": s.backfillFiles, "nodes": s.backfillNodes} {
+		if err := fill(ctx); err != nil && ctx.Err() == nil {
+			// Made again beside the followers until it succeeds.
+			s.opt.Logf("tree: %s: %v; retrying", what, err)
+			s.fwg.Add(1)
+			go func() {
+				defer s.fwg.Done()
+				s.retryBackfill(ctx, what, fill)
+			}()
+		}
 	}
 	s.ensureFollowers()
 	<-ctx.Done()
@@ -814,6 +816,9 @@ type prep struct {
 	created string
 	file    *FileMeta
 	purged  bool
+	// born is the node's born (§B.5): of a catalog node, or of the
+	// implicit placement a content document makes.
+	born string
 }
 
 // Apply implements follow.Handler. The batch's units are coalesced and
@@ -887,7 +892,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		}
 	}
 	// File metadata (§H.3): every head of a content namespace in a file
-	// tree is read for it, with keys in a sealed one; at E3 it is left out.
+	// tree is read for it, with keys in a sealed one; at E3 it is absent.
 	filed := false
 	if !isCat && fileTree {
 		in, err := s.keys.Info(ctx, fb.NS)
@@ -916,6 +921,14 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 				}
 				if filed {
 					p.file = fileMetaOf(doc, p.created)
+				}
+				// A node's born (§B.5): a catalog node's, or that of the
+				// implicit placement a content document makes (§B.9).
+				self := !isCat && s.opt.SelfPlacing && parseSelf(s.opt.Catalog, b.NS, ch.Resource, doc.Value) != nil
+				if isCat || self {
+					if p.born, err = s.nodeBorn(ctx, fb.NS, ch.Resource, p.head, self); err != nil {
+						return err
+					}
 				}
 			case errors.Is(err, derived.ErrSkip) && !isCat:
 				// A live item whose document isn't readable content (an
@@ -1072,9 +1085,26 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	defer tx.Rollback()
 
 	if b.NS == cat {
+		if b.Replaces() {
+			// A snapshot lists every tombstone and purge again (/heads).
+			if _, err := tx.ExecContext(ctx, `DELETE FROM explicit_gone`); err != nil {
+				return nil, err
+			}
+			for name := range g.explicitGone {
+				delete(g.explicitGone, name)
+				g.refresh(name)
+				changed[name] = true
+			}
+		}
 		if b.Replaces() || co.PurgedNS {
 			for name := range g.explicit {
-				g.removeExplicit(name)
+				if co.PurgedNS && g.retireExplicit(name) {
+					if err := saveGone(ctx, tx, name, true); err != nil {
+						return nil, err
+					}
+				} else {
+					g.removeExplicit(name)
+				}
 				changed[name] = true
 			}
 		}
@@ -1114,6 +1144,12 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			changed[p.name] = true
 			if p.kind == "head" && p.doc != nil {
 				n := ParseNode(cat, p.name, p.head, p.doc)
+				n.Born = p.born
+				if g.explicitGone[p.name] {
+					if err := saveGone(ctx, tx, p.name, false); err != nil {
+						return nil, err
+					}
+				}
 				g.setExplicit(n)
 				if n.ItemNS != "" {
 					// A new placement: its item's state is in the items table.
@@ -1123,8 +1159,11 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 					}
 					g.setItem(p.name, it)
 				}
-			} else {
-				g.removeExplicit(p.name)
+			} else if g.retireExplicit(p.name) {
+				// Deleted or purged, it still wins over $parents (§B.9).
+				if err := saveGone(ctx, tx, p.name, true); err != nil {
+					return nil, err
+				}
 			}
 		}
 	} else {
@@ -1202,11 +1241,15 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			}
 			if sn != nil {
 				m, _ := p.doc.(map[string]any)
-				if _, err := tx.ExecContext(ctx, `INSERT INTO self_parents (ns, name, parents) VALUES (?, ?, ?)
-					ON CONFLICT (ns, name) DO UPDATE SET parents = excluded.parents`, ns, p.name, canonJSON(m["$parents"])); err != nil {
+				var born any
+				if p.born != "" {
+					born = p.born
+				}
+				if _, err := tx.ExecContext(ctx, `INSERT INTO self_parents (ns, name, parents, born) VALUES (?, ?, ?, ?)
+					ON CONFLICT (ns, name) DO UPDATE SET parents = excluded.parents, born = excluded.born`, ns, p.name, canonJSON(m["$parents"]), born); err != nil {
 					return nil, err
 				}
-				sn.ItemState, sn.ItemHead, sn.ItemTitle, sn.ItemFile = st, head, title, file
+				sn.ItemState, sn.ItemHead, sn.ItemTitle, sn.ItemFile, sn.Born = st, head, title, file, p.born
 				g.setSelf(sn)
 				changed[pl] = true
 			} else if g.self[pl] != nil {
@@ -1408,6 +1451,206 @@ func (s *Service) ItemState(ctx context.Context, ns, name string) (int, string, 
 func (s *Service) Seen(ctx context.Context, nsID string) bool {
 	var one int
 	return s.db.QueryRowContext(ctx, `SELECT 1 FROM seen WHERE ns_id = ? LIMIT 1`, nsID).Scan(&one) == nil
+}
+
+// nodeBorn is the born of a node (§B.5) whose document is ns/name, head
+// head (ns as followed): a catalog node's, or with self an implicit
+// placement's, which a content document makes (§B.9). The service keeps
+// it with the node, so it reads it only for a node it doesn't hold one
+// for (bornOf).
+func (s *Service) nodeBorn(ctx context.Context, ns, name, head string, self bool) (string, error) {
+	node := name
+	if self {
+		node = s.logical(ns) + "." + name
+	}
+	s.mu.RLock()
+	n := s.g.explicit[node]
+	if self {
+		n = s.g.self[node]
+	}
+	known := ""
+	if n != nil {
+		known = n.Born
+	}
+	s.mu.RUnlock()
+	if known != "" {
+		return known, nil
+	}
+	return s.bornOf(ctx, ns, name, head)
+}
+
+// bornOf is when ns/name was created (§B.5 born): the created of the first
+// revision of its chain up to head, the first its log gives, or where a
+// prune dropped it the oldest the log still has. A log that can't be read
+// for the moment (Transient) is an error, so the apply is made again;
+// otherwise, as for a resource gone since, the born is unknown ("").
+func (s *Service) bornOf(ctx context.Context, ns, name, head string) (string, error) {
+	es, _, err := s.c.LogPage(ctx, ns, name, head, "")
+	switch {
+	case err == nil:
+	case client.Transient(err):
+		return "", fmt.Errorf("tree: the log of %s/%s: %w", ns, name, err)
+	default:
+		if !client.IsGone(err) && !client.IsNotFound(err) {
+			s.opt.Logf("tree: the born of %s/%s is unknown: %v", ns, name, err)
+		}
+		return "", nil
+	}
+	if len(es) == 0 {
+		return "", nil
+	}
+	return es[0].Created, nil
+}
+
+// backfillNodes fills in, on start, what a database from an earlier
+// release lacks: born (§B.5) for every node without it, read from its
+// log, and once (meta "gone"), the deleted and purged explicit placements
+// that win over $parents (§B.9), from the catalog's /heads at its
+// checkpoint. Listings change at an unchanged combined checkpoint, so
+// every cached listing of the catalog goes (ns:{catalog}), as for the
+// drift reload fixes. It runs before the followers start, and, should it
+// fail, again beside them until it succeeds (retryBackfill), under wmu so
+// no apply commits meanwhile.
+func (s *Service) backfillNodes(ctx context.Context) error {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	cat := s.opt.Catalog
+	var marked string
+	err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'gone'`).Scan(&marked)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	fillGone := err != nil
+	type want struct {
+		node, ns, name, head string
+		self                 bool
+	}
+	var wants []want
+	s.mu.RLock()
+	cp, purged := s.cur[cat], false
+	_, purged = s.purged[cat]
+	for name, n := range s.g.explicit {
+		if n.Born == "" && n.Head != "" {
+			wants = append(wants, want{node: name, ns: s.actual(cat), name: name, head: n.Head})
+		}
+	}
+	for name, n := range s.g.self {
+		if n.Born == "" && n.ItemHead != "" {
+			wants = append(wants, want{node: name, ns: s.actual(n.ItemNS), name: n.ItemName, head: n.ItemHead, self: true})
+		}
+	}
+	s.mu.RUnlock()
+	// A database that starts empty records them as it applies the catalog.
+	var gone []string
+	if fillGone && cp != "" && !purged {
+		for after := ""; ; {
+			items, next, err := s.c.HeadsPage(ctx, s.actual(cat), cp, after)
+			if client.IsPurged(err) {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("tree: the deleted placements of %s: %w", cat, err)
+			}
+			for _, it := range items {
+				if (it.Kind == "tombstone" || it.Kind == "purge") && strings.Contains(it.Resource, ".") {
+					gone = append(gone, it.Resource)
+				}
+			}
+			if next == "" || next == after {
+				break
+			}
+			after = next
+		}
+	}
+	borns := map[string]string{}
+	for _, w := range wants {
+		b, err := s.bornOf(ctx, w.ns, w.name, w.head)
+		if err != nil {
+			return err
+		}
+		if b != "" {
+			borns[w.node] = b
+		}
+	}
+	if !fillGone && len(borns) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	g := s.g
+	changed := map[string]bool{}
+	for _, w := range wants {
+		n := g.explicit[w.node]
+		if w.self {
+			n = g.self[w.node]
+		}
+		if n == nil || n.Born != "" || borns[w.node] == "" {
+			continue
+		}
+		n.Born = borns[w.node]
+		if w.self {
+			if _, err := tx.ExecContext(ctx, `UPDATE self_parents SET born = ? WHERE ns = ? AND name = ?`, n.Born, n.ItemNS, n.ItemName); err != nil {
+				return err
+			}
+		}
+		if g.nodes[w.node] == n {
+			changed[w.node] = true
+		}
+	}
+	for _, name := range gone {
+		if g.explicit[name] != nil || g.explicitGone[name] {
+			continue
+		}
+		g.retireExplicit(name)
+		if err := saveGone(ctx, tx, name, true); err != nil {
+			return err
+		}
+		changed[name] = true
+	}
+	if fillGone {
+		if err := saveMeta(ctx, tx, "gone", "1"); err != nil {
+			return err
+		}
+	}
+	var tags []string
+	if len(changed) > 0 {
+		for name := range g.analyze() {
+			changed[name] = true
+		}
+		for name := range changed {
+			if err := s.persistNode(ctx, tx, g, name); err != nil {
+				return err
+			}
+		}
+		if s.opt.Hook != nil {
+			if err := s.opt.Hook.Update(ctx, tx, g, changed); err != nil {
+				return err
+			}
+		}
+		tags = []string{"ns:" + s.actual(cat)}
+		if err := s.sealed.Purge(ctx, tx, tags); err != nil {
+			return err
+		}
+		if err := s.repurge.Add(ctx, tx, tags); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		if rerr := s.reload(context.WithoutCancel(ctx)); rerr != nil {
+			s.opt.Logf("tree: reloading after a failed backfill: %v", rerr)
+		}
+		return err
+	}
+	if len(tags) > 0 {
+		s.kept.Purge(cat, tags)
+		s.opt.Purger.PurgeTags(tags)
+	}
+	return nil
 }
 
 // retitle reads, for the new title pointer of the catalog (§B.5), the

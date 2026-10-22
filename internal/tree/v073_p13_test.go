@@ -2,6 +2,7 @@ package tree_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"strings"
@@ -10,7 +11,9 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/keystore"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -181,5 +184,274 @@ func TestV073BehindWhileKeys(t *testing.T) {
 	}
 	if r.status != 503 || r.body["code"] != "behind" || r.header.Get("Retry-After") == "" || !strings.Contains(r.header.Get("Cache-Control"), "no-store") {
 		t.Fatalf("listing without the key: %d %v %v", r.status, r.header, r.body)
+	}
+}
+
+// ENC-35, TC-9 (§B.2, §B.5, §E.2.6): sibling order keys compare by UTF-8
+// bytes, and children pages as /_refs does: next is the query of the
+// following page, its after an opaque position that encodes no order
+// value, and a limit above the maximum is 400. The cursor of earlier
+// releases (after={order}&name=…) is still accepted.
+func TestV073ChildrenOrderAndCursor(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.folder(t, "root", "Root")
+	// By UTF-16 code units U+1F600 (a surrogate pair) sorts before U+FF01;
+	// by UTF-8 bytes after it.
+	w.folder(t, "fw", "Fullwidth", "root@a！")
+	w.folder(t, "emoji", "Emoji", "root@a\U0001F600")
+	w.folder(t, "plain", "Plain", "root@a0")
+	w.folder(t, "un", "Unordered", "root")
+	x := startSvc(t, w.c, svcOpts{})
+	x.caughtUp("cat", "matches")
+	b := x.get("/cat/children?of=root", "")
+	if got := names(b["children"]); got != "plain,fw,emoji,un" {
+		t.Errorf("children by UTF-8 bytes: %s", got)
+	}
+	var seen []string
+	next := "?limit=1&of=root"
+	for i := 0; next != ""; i++ {
+		if i > 5 {
+			t.Fatal("too many pages")
+		}
+		b = x.get("/cat/children"+next, "")
+		seen = append(seen, names(b["children"]))
+		if b["total"] != float64(4) {
+			t.Errorf("page %d total %v", i, b["total"])
+		}
+		next, _ = b["next"].(string)
+		for _, order := range []string{"a0", "a%EF%BC%81", "a%F0%9F%98%80", "unordered"} {
+			if strings.Contains(next, order) {
+				t.Errorf("next %q carries an order value or the old cursor", next)
+			}
+		}
+	}
+	if strings.Join(seen, ",") != "plain,fw,emoji,un" {
+		t.Errorf("pages: %v", seen)
+	}
+	// The old cursor, for one release.
+	if got := names(x.get("/cat/children?of=root&after=a0&name=plain", "")["children"]); got != "fw,emoji,un" {
+		t.Errorf("old cursor: %s", got)
+	}
+	if got := names(x.get("/cat/children?of=root&name=plain&unordered=1", "")["children"]); got != "un" {
+		t.Errorf("old cursor past the ordered: %s", got)
+	}
+	at := x.s.At()
+	if r := x.raw("/cat/at/"+at+"/children?limit=1001&of=root", ""); r.status != 400 {
+		t.Errorf("limit above the maximum: %d", r.status)
+	}
+	if r := x.raw("/cat/at/"+at+"/children?limit=1000&of=root", ""); r.status != 200 {
+		t.Errorf("limit at the maximum: %d", r.status)
+	}
+}
+
+// TC-50 (§B.9): an explicit placement of an item wins over $parents
+// whether it is live, deleted or purged, across a restart.
+func TestV073ExplicitPlacementWins(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	ctx := context.Background()
+	w.folder(t, "root", "Root")
+	w.folder(t, "news", "News", "root")
+	for _, n := range []string{"a", "b"} {
+		must(w.c.CreateDoc(ctx, "matches", n, map[string]any{"$parents": []any{map[string]any{"href": "/r/cat/news"}}}))
+		w.place(t, "matches."+n, "root")
+	}
+	db := t.TempDir() + "/tree.db"
+	x := startSvc(t, w.c, svcOpts{selfPlacing: true, db: db})
+	x.caughtUp("cat", "matches")
+	if got := names(x.get("/cat/children?of=root", "")["children"]); got != "matches.a,matches.b,news" {
+		t.Fatalf("explicit placements: %s", got)
+	}
+	w.del(t, "cat", "matches.a")
+	must(w.c.Purge(ctx, "cat", "matches.b", must(w.c.Head(ctx, "cat", "matches.b")).ID, false))
+	x.caughtUp("cat")
+	check := func(when string) {
+		t.Helper()
+		if got := names(x.get("/cat/children?of=news", "")["children"]); got != "" {
+			t.Errorf("%s: $parents won over a deleted or purged placement: %s", when, got)
+		}
+		if got := names(x.get("/cat/children?of=root", "")["children"]); got != "news" {
+			t.Errorf("%s: root %s", when, got)
+		}
+	}
+	check("deleted and purged")
+	x.stop()
+	x = startSvc(t, w.c, svcOpts{selfPlacing: true, db: db})
+	x.caughtUp("cat", "matches")
+	check("after a restart")
+	// A database from before the records were kept: a start fills them in
+	// from the catalog's /heads.
+	x.stop()
+	sq := must(sql.Open("sqlite", sqlitedsn.DSN(db, "")))
+	for _, q := range []string{`DELETE FROM explicit_gone`, `DELETE FROM meta WHERE k = 'gone'`} {
+		if _, err := sq.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sq.Close()
+	x = startSvc(t, w.c, svcOpts{selfPlacing: true, db: db})
+	x.caughtUp("cat", "matches")
+	waitFor(t, "the records filled in", func() bool { return names(x.get("/cat/children?of=news", "")["children"]) == "" })
+	check("filled in")
+	// Restored, the explicit placement shows.
+	th := must(w.c.Head(ctx, "cat", "matches.a"))
+	must(w.c.Append(ctx, "cat", "matches.a", th.ID, []any{map[string]any{"op": "replace", "path": "", "value": map[string]any{"parents": parents("root")}}}))
+	x.caughtUp("cat")
+	if got := names(x.get("/cat/children?of=root", "")["children"]); got != "matches.a,news" {
+		t.Errorf("restored: %s", got)
+	}
+}
+
+// DeclaredChildren is every node that names a folder in its parents,
+// valid edge or not.
+func TestV073DeclaredChildren(t *testing.T) {
+	t.Parallel()
+	g := tree.BuildGraph("cat", map[string]any{"catalog": map[string]any{"trust": []any{"matches"}}}, map[string]any{
+		"root":      map[string]any{"parents": []any{}},
+		"a":         map[string]any{"parents": []any{map[string]any{"href": "/r/cat/root"}}},
+		"matches.x": map[string]any{"parents": []any{map[string]any{"href": "/r/cat/root"}, map[string]any{"href": "/r/cat/gone"}}},
+		"matches.y": map[string]any{"parents": []any{map[string]any{"href": "/r/cat/gone"}}},
+	})
+	if got := fmt.Sprint(g.DeclaredChildren("root")); got != "[a matches.x]" {
+		t.Errorf("root: %s", got)
+	}
+	if got := fmt.Sprint(g.DeclaredChildren("gone")); got != "[matches.x matches.y]" {
+		t.Errorf("a missing folder: %s", got)
+	}
+	if got := g.DeclaredChildren("a"); got != nil {
+		t.Errorf("a: %v", got)
+	}
+}
+
+// bornOf is the created of the first revision of ns/name, from its log.
+func bornOf(t *testing.T, c *client.Client, ns, name string) string {
+	t.Helper()
+	ctx := context.Background()
+	es, _ := must2(c.LogPage(ctx, ns, name, must(c.Head(ctx, ns, name)).ID, ""))
+	return es[0].Created
+}
+
+// TC-6 (§B.5): children carries total, the number of visible children,
+// and every node carries born, the created of its document's first
+// revision, which a database from before it gets on start.
+func TestV073TotalAndBorn(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.folder(t, "root", "Root")
+	w.folder(t, "season", "Season", "root@a0")
+	w.content(t, "matches", "derby")
+	w.place(t, "matches.derby", "root@a1")
+	w.place(t, "matches.nope", "root@a2") // dangling: not listed, not counted
+	w.s.Clock.Advance(time.Hour)
+	w.replace(t, "cat", "season", "/title", "Season 2026")
+	db := t.TempDir() + "/tree.db"
+	x := startSvc(t, w.c, svcOpts{db: db})
+	x.caughtUp("cat", "matches")
+	want := map[string]string{"season": bornOf(t, w.c, "cat", "season"), "matches.derby": bornOf(t, w.c, "cat", "matches.derby")}
+	check := func(when string) {
+		t.Helper()
+		b := x.get("/cat/children?of=root&limit=1", "")
+		if b["total"] != float64(2) || names(b["children"]) != "season" {
+			t.Errorf("%s: page %v", when, b)
+		}
+		es := entriesOf(t, x.get("/cat/children?of=root", ""))
+		for name, born := range want {
+			if es[name]["born"] != born {
+				t.Errorf("%s: %s born %v, want %s", when, name, es[name]["born"], born)
+			}
+		}
+		if es["season"]["born"] == createdOf(t, w.c, "cat", "season") {
+			t.Errorf("%s: born is the head's created", when)
+		}
+		if got := x.get("/cat/roots", "")["roots"].([]any)[0].(map[string]any)["born"]; got != bornOf(t, w.c, "cat", "root") {
+			t.Errorf("%s: root born %v", when, got)
+		}
+	}
+	check("followed")
+	// A database from before born: a start fills it in.
+	x.stop()
+	sq := must(sql.Open("sqlite", sqlitedsn.DSN(db, "")))
+	if _, err := sq.Exec(`UPDATE nodes SET born = NULL`); err != nil {
+		t.Fatal(err)
+	}
+	sq.Close()
+	x = startSvc(t, w.c, svcOpts{db: db})
+	x.caughtUp("cat", "matches")
+	waitFor(t, "born filled in", func() bool {
+		return entriesOf(t, x.get("/cat/children?of=root", ""))["season"]["born"] == want["season"]
+	})
+	check("filled in")
+}
+
+// TC-6 (§B.5, §E.2.6): in a sealed catalog born is sealed per entry with
+// the title, never in the clear.
+func TestV073BornSealed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks := must(keystore.New(keystore.Generate()))
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"encryption": map[string]any{"level": "sealed"}, "catalog": map[string]any{"trust": []any{"matches"}, "mode": "dag"}}))
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "matches"))).CreateNamespace(ctx, "matches", map[string]any{"read": "public", "keys": []any{k.Entry("*")}}))
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat", "matches"}, []string{"read", "create"})), client.WithKeys(client.NewKeys(nil)))
+	createNonced(t, w, "cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	createNonced(t, w, "cat", "plain", map[string]any{"parents": []any{}})
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat", "matches"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	x := startSvc(t, sc, svcOpts{now: s.Now})
+	x.caughtUp("cat", "matches")
+	li := k.Grant(t, s.Now(), "user:li", []string{"cat"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "plain"}}}}})
+	r := x.fetch("/cat/roots", li)
+	if strings.Contains(string(r.body), "born") {
+		t.Fatalf("born in the clear: %s", r.body)
+	}
+	pr := s.Client(t, client.WithBearer(li))
+	for _, e := range decode(t, r.body)["roots"].([]any) {
+		e := e.(map[string]any)
+		name := e["name"].(string)
+		fk := must(pr.FetchKeys(ctx, "cat", nil, []string{name}))
+		kr := func(kid string) []byte {
+			if kid == fk[0].Kid {
+				return fk[0].Key
+			}
+			return nil
+		}
+		v := decode(t, must(derived.OpenItem(e["sealed"].(string), kr, derived.View{NS: "cat", Target: r.path}, "cat", name)))
+		if v["born"] != bornOf(t, w, "cat", name) || (name == "root") != (v["title"] == "Root") {
+			t.Errorf("%s sealed %v", name, v)
+		}
+	}
+}
+
+// TC-8 (§H.3): in a file tree, a placement whose file the service can't
+// give says why: pending for a head it hasn't read for it (e2e is in
+// TestFileTreeSealed).
+func TestV073FilePending(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
+	c := s.Client(t, client.WithAuthor("tester"))
+	must(c.CreateNamespace(ctx, "files", map[string]any{"read": "public"}))
+	must(c.CreateNamespace(ctx, "cat", map[string]any{"read": "public", "catalog": filesCatalog("files")}))
+	must(c.CreateDoc(ctx, "cat", "root", map[string]any{"parents": []any{}}))
+	must(c.CreateDoc(ctx, "files", "a", map[string]any{"n": 1}))
+	must(c.CreateDoc(ctx, "cat", "files.a", map[string]any{"title": "a.json", "parents": parents("root")}))
+	db := t.TempDir() + "/tree.db"
+	x := startSvc(t, c, svcOpts{db: db})
+	x.caughtUp("cat", "files")
+	if f := fileOf(entriesOf(t, x.get("/cat/children?of=root", ""))["files.a"]); f["size"] == nil {
+		t.Fatalf("file %v", f)
+	}
+	x.stop()
+	sq := must(sql.Open("sqlite", sqlitedsn.DSN(db, "")))
+	if _, err := sq.Exec(`UPDATE items SET file = NULL`); err != nil {
+		t.Fatal(err)
+	}
+	sq.Close()
+	x = startSvc(t, c, svcOpts{db: db})
+	x.caughtUp("cat", "files")
+	if f := fileOf(entriesOf(t, x.get("/cat/children?of=root", ""))["files.a"]); fmt.Sprint(f) != "map[absent:pending]" {
+		t.Errorf("a head not read for its file: %v", f)
 	}
 }

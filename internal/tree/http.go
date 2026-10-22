@@ -458,7 +458,8 @@ var ops = map[string]bool{
 // it is "file": { "sealed": JWE of { file } } under the item's own K_r,
 // kid its namespace's current epoch, pl { ns, name, view } of the item, so
 // readers given K_r by /read-grants open it, whatever the catalog's level;
-// for an e2e item it is left out. A listing holding any sealed file is
+// for an e2e item it is { "absent": "e2e" }, and { "absent": "pending" }
+// for a head not read for it yet (§H.3). A listing holding any sealed file is
 // stored and served unchanged like a sealed catalog's. While a sealed
 // namespace's key can't be had for the moment, listings are 503, no-store
 // (fileSealing). The "file": { "sealed" } form, and its nesting inside a
@@ -466,9 +467,10 @@ var ops = map[string]bool{
 // per-entry "sealed" member for values of one source (the catalog's
 // titles), and no form yet for values another namespace's resource gives.
 //
-// A sealed or e2e catalog (§E.2.5, §E.2.6; package derived). Titles are
-// the only values a listing takes from the catalog's content (names,
-// heads, hrefs, structure, order and cursors stay in the clear, and
+// A sealed or e2e catalog (§E.2.5, §E.2.6; package derived). Titles and
+// born are the only values a listing takes from the catalog's content
+// (names, heads, hrefs, structure, order and cursors, which are positions,
+// stay in the clear, and
 // content namespaces contribute nothing else but file metadata, sealed on
 // its own), so the catalog is the one source of what a listing seals
 // whole. A reader of the whole catalog gets the listing sealed as
@@ -476,9 +478,9 @@ var ops = map[string]bool{
 // application/jose, pl { ns, view } where view is the listing's request
 // target (/{catalog}[/g/{gs}]/at/{at}/{op}?{query}, the canonical form). A
 // reader whose grant restricts catalog resources (or who sees nodes only
-// through roles) gets JSON in which every node with a title carries
-// "sealed": JWE of { title } under that catalog resource's K_r, pl { ns,
-// name, view }, instead of "title". Sealed listings are produced once per
+// through roles) gets JSON in which every node with a title or born
+// carries "sealed": JWE of { title?, born? } under that catalog
+// resource's K_r, pl { ns, name, view }, in their place. Sealed listings are produced once per
 // view (a rotation moves at), stored in the database with their cache
 // tags, and served unchanged, across restarts, until a purge with one of
 // those tags or a new at retires them (derived.Cache).
@@ -839,8 +841,8 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		view = derived.View{NS: cat, Target: canon(l.at)}
 		q := &query{s: s, g: g, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
 		if perEntry {
-			q.sealTitle = func(name, title string) string {
-				jwe, err := derived.SealItem(key, view, name, map[string]any{"title": title})
+			q.sealValues = func(name string, vals map[string]any) string {
+				jwe, err := derived.SealItem(key, view, name, vals)
 				if err != nil && serr == nil {
 					serr = err
 				}
@@ -1489,9 +1491,10 @@ type query struct {
 	vals url.Values
 	tags tagSet
 	at   string
-	// sealTitle, if set, seals a catalog node's title for per-entry
-	// sealing (§E.2.6): the entry carries "sealed" instead of "title".
-	sealTitle func(name, title string) string
+	// sealValues, if set, seals the values an entry takes from the
+	// catalog's content (title, born) for per-entry sealing (§E.2.6): the
+	// entry carries "sealed" in their place.
+	sealValues func(name string, vals map[string]any) string
 	// files says how placements carry file metadata in a file tree
 	// (§H.3), sealed under view; serr records a sealing failure.
 	files *fileSealing
@@ -1499,14 +1502,25 @@ type query struct {
 	serr  *error
 }
 
+// values sets the values an entry of node name takes from the catalog's
+// content (title, born), in the clear or, for per-entry sealing, as one
+// "sealed" JWE of them (§E.2.6).
+func (q *query) values(m map[string]any, name string, vals map[string]any) {
+	switch {
+	case len(vals) == 0:
+	case q.sealValues != nil:
+		m["sealed"] = q.sealValues(name, vals)
+	default:
+		for k, v := range vals {
+			m[k] = v
+		}
+	}
+}
+
 // title sets a node's title on an entry, in the clear or sealed.
 func (q *query) title(m map[string]any, n *Node) {
-	switch {
-	case n.Title == "":
-	case q.sealTitle != nil:
-		m["sealed"] = q.sealTitle(n.Name, n.Title)
-	default:
-		m["title"] = n.Title
+	if n.Title != "" {
+		q.values(m, n.Name, map[string]any{"title": n.Title})
 	}
 }
 
@@ -1570,10 +1584,19 @@ func (q *query) node(param string) (*Node, int, string) {
 // them apart (§B.5, §B.11.5).
 const noSuchNode = "no such node"
 
+// entry is a node as listings show it. Its title and born (§B.5) are the
+// values it takes from the catalog's content, sealed per entry where the
+// listing is (values).
 func (q *query) entry(n *Node) map[string]any {
 	q.tags.node(q.g, n.Name)
 	m := map[string]any{"href": q.g.Href(n.Name), "name": n.Name, "kind": "folder"}
-	q.title(m, n)
+	vals := map[string]any{}
+	if n.Title != "" {
+		vals["title"] = n.Title
+	}
+	if n.Born != "" {
+		vals["born"] = n.Born
+	}
 	if n.Kind == KindPlacement {
 		m["kind"] = "item"
 		if it := n.Item(); it != "" {
@@ -1585,7 +1608,7 @@ func (q *query) entry(n *Node) map[string]any {
 		if q.v.item(q.g, n) && n.ItemHead != "" {
 			if n.Title == "" && n.ItemTitle != "" {
 				// The head's title (§B.5), unless the placement has its own.
-				q.title(m, &Node{Name: n.Name, Title: n.ItemTitle})
+				vals["title"] = n.ItemTitle
 			}
 			m["head"] = n.ItemHead
 			// In a release preview the head is the branch's: url reads it
@@ -1602,6 +1625,7 @@ func (q *query) entry(n *Node) map[string]any {
 			m["dangling"] = n.Dangling
 		}
 	}
+	q.values(m, n.Name, vals)
 	return m
 }
 
@@ -1615,21 +1639,29 @@ func (q *query) visibleChildren(parent string) []Child {
 	return out
 }
 
+// limitParam is a children page's limit (§A.4, as /_refs pages): the
+// default without one, 400 for one that isn't a positive integer or is
+// above maxLimit.
 func limitParam(vals url.Values) (int, bool) {
 	l := defaultLimit
 	if s := vals.Get("limit"); s != "" {
 		n, err := strconv.Atoi(s)
-		if err != nil || n < 1 {
+		if err != nil || n < 1 || n > maxLimit {
 			return 0, false
 		}
-		l = min(n, maxLimit)
+		l = n
 	}
 	return l, true
 }
 
-// children lists a folder's direct children, ordered (§B.2), paginated
-// with ?after={order}; next links add &name= (and &unordered=1 past the
-// ordered siblings) to break ties exactly.
+// children lists a folder's direct children, ordered (§B.2), with total,
+// the number of visible children, and each node's born (entry), paginated
+// as /_refs is (§A.4): at most limit, strictly after after, next the query
+// of the following page, absent on the last. after is an opaque position
+// in the listing (childCursor), never an order key, which in a sealed
+// catalog is a value of its content (§E.2.6). The cursor of earlier
+// releases, after={order} with name= and unordered=1, is still accepted
+// for one release (cursorBefore).
 func (q *query) children() (any, int, string) {
 	n, st, msg := q.node("of")
 	if n == nil {
@@ -1640,66 +1672,106 @@ func (q *query) children() (any, int, string) {
 	}
 	limit, ok := limitParam(q.vals)
 	if !ok {
-		return nil, http.StatusBadRequest, "malformed limit"
+		return nil, http.StatusBadRequest, "limit must be an integer from 1 to " + strconv.Itoa(maxLimit)
 	}
 	kids := q.visibleChildren(n.Name)
+	start := 0
 	after, hasAfter := q.vals["after"]
-	cur := Child{Node: &Node{Name: q.vals.Get("name")}}
-	hasName := q.vals.Has("name")
-	if hasAfter {
-		cur.Order, cur.HasOrder = after[0], true
+	hasName, legacy := q.vals.Has("name"), q.vals.Has("name") || q.vals.Has("unordered")
+	if hasAfter && !legacy {
+		if pos, last, ok := parseCursor(after[0]); ok {
+			start = cursorStart(kids, pos, last)
+		} else {
+			legacy = true
+		}
 	}
-	if q.vals.Get("unordered") == "1" {
-		cur.HasOrder, hasAfter = false, true
-	}
-	var page []any
-	var last *Child
-	more := false
-	for i := range kids {
-		c := kids[i]
-		if hasAfter || hasName {
-			if !cursorBefore(cur, hasName, c) {
-				continue
+	if legacy {
+		cur := Child{Node: &Node{Name: q.vals.Get("name")}}
+		if hasAfter {
+			cur.Order, cur.HasOrder = after[0], true
+		}
+		if q.vals.Get("unordered") == "1" {
+			cur.HasOrder = false
+		}
+		start = len(kids)
+		for i, c := range kids {
+			if cursorBefore(cur, hasName, c) {
+				start = i
+				break
 			}
 		}
-		if len(page) == limit {
-			more = true
-			break
-		}
+	}
+	page := []any{}
+	end := min(start+limit, len(kids))
+	for _, c := range kids[start:end] {
 		e := q.entry(c.Node)
 		if c.HasOrder {
 			e["order"] = c.Order
 		}
 		page = append(page, e)
-		last = &kids[i]
 	}
-	body := map[string]any{"at": q.at, "of": q.g.Href(n.Name), "children": nonNil(page)}
-	if more && last != nil {
+	body := map[string]any{"at": q.at, "of": q.g.Href(n.Name), "children": page, "total": len(kids)}
+	if end < len(kids) {
 		nv := url.Values{}
 		for k, v := range q.vals {
 			nv[k] = v
 		}
-		nv.Del("after")
-		nv.Del("unordered")
-		nv.Del("min")
-		if last.HasOrder {
-			nv.Set("after", last.Order)
-		} else {
-			nv.Set("unordered", "1")
+		for _, k := range []string{"after", "name", "unordered", "min"} {
+			nv.Del(k)
 		}
-		nv.Set("name", last.Node.Name)
+		nv.Set("after", childCursor(end, kids[end-1].Node.Name))
 		body["next"] = derived.CanonicalQuery(nv)
 	}
 	return body, http.StatusOK, ""
 }
 
-// cursorBefore reports whether the cursor sorts before c.
+// childCursor is the position after a page of children (§E.2.6): pos, the
+// number of visible children up to the page's end, and last, the node name
+// of the page's last child, both in the clear like the listing's
+// structure, never an order key.
+func childCursor(pos int, last string) string { return strconv.Itoa(pos) + "~" + last }
+
+// parseCursor parses a childCursor; ok is false for anything else, such as
+// the order key of an earlier release's cursor.
+func parseCursor(s string) (pos int, last string, ok bool) {
+	p, last, found := strings.Cut(s, "~")
+	if !found || p == "" || len(p) > 9 || p[0] == '0' || !client.ValidResourceName(last) {
+		return 0, "", false
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < '0' || p[i] > '9' {
+			return 0, "", false
+		}
+	}
+	pos, _ = strconv.Atoi(p)
+	return pos, last, true
+}
+
+// cursorStart is where the page after a childCursor starts in kids: at
+// pos, where last is the child before it, as it is at the at the cursor
+// was given at; else, as at another at a redirect leads to, after last
+// where it is still listed, and at pos where it isn't.
+func cursorStart(kids []Child, pos int, last string) int {
+	pos = min(pos, len(kids))
+	if pos > 0 && kids[pos-1].Node.Name == last {
+		return pos
+	}
+	for i, c := range kids {
+		if c.Node.Name == last {
+			return i + 1
+		}
+	}
+	return pos
+}
+
+// cursorBefore reports whether the cursor of an earlier release (an order
+// key with a node name, §B.2 order by UTF-8 bytes) sorts before c.
 func cursorBefore(cur Child, hasName bool, c Child) bool {
 	if cur.HasOrder != c.HasOrder {
 		return cur.HasOrder // ordered siblings come first
 	}
 	if cur.HasOrder && cur.Order != c.Order {
-		return lessUTF16(cur.Order, c.Order)
+		return cur.Order < c.Order
 	}
 	if !hasName {
 		return false
