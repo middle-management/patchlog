@@ -4,20 +4,22 @@
 //
 //   - it is frozen, and merged, superseded or abandoned, and the claim is
 //     verified (below), never trusted;
-//   - its cleanup period has passed since it was frozen: the branch
-//     document's "cleanup": { "merged": ISO duration, "superseded": ISO
-//     duration, "abandoned": ISO duration } for the verified claim,
-//     measured from the created time of the config entry that froze it;
-//   - so has the base's minimum, if the base declares one;
+//   - its cleanup period for a state it is verified as has passed: the
+//     member for that state of the branch document's own "cleanup":
+//     { "merged": ISO duration, "superseded": ISO duration, "abandoned":
+//     ISO duration }, counted from the created time of the last config
+//     write that froze it or set or changed merged, successor or
+//     abandoned. Without a member for a state it isn't purged as that
+//     state, but may be as another it is verified as;
+//   - so has the base's minimum for that state, if the base declares one;
 //   - it has no dependents that aren't purged (leaves are purged first).
 //
 // Base minimums use the same shape in the base's own namespace document:
-// "cleanup": { "merged": "P7D", "superseded": "P30D" }. A branch starts as a
-// copy of its base's document (§7.6), so the base's cleanup is also every
-// new branch's default; the janitor applies the longer of the branch's
-// period and the base's. A stacked branch's own cleanup is therefore also
-// the minimum for its branches. A branch whose claim has no period in
-// either document is never purged: cleanup is opt-in.
+// "cleanup": { "merged": "P7D", "superseded": "P30D" }. They only lengthen
+// a branch's own period: cleanup isn't copied into branches (§7.6), and a
+// branch whose own cleanup has no member for a state is never purged as
+// that state, whatever its base declares. Cleanup is opt-in, per branch.
+// A stacked branch's own cleanup is also the minimum for its branches.
 //
 // Verification (§F.6):
 //
@@ -28,21 +30,50 @@
 //     branch's log has no head, tombstone or batch entry after that
 //     source.at. Config, prune and propagated purge entries are allowed. A
 //     base without merge.authors never verifies a merged claim this way.
-//   - superseded: the successor exists, isn't purged, has the same base
-//     namespace, and its log has a batch without origin whose source.ns is
-//     the branch and whose source.at is in the branch's chain, with nothing
-//     after it in the branch. §F.6 asks for no merge.authors check here:
-//     the successor is a branch too, and its batches are the rebase.
+//   - superseded: the successor is still one §7.4 allows: it exists,
+//     isn't purged, and is a branch of the branch's base or of a namespace
+//     further up its base chain in this deployment, listed in that
+//     namespace's branches. One purged after the branch was frozen still
+//     counts, checked from its log, which the purge leaves readable, but
+//     not a sealed one, whose log the purge makes 410: that branch is
+//     kept for a manual purge. The successor's log has a batch without
+//     origin whose source.ns is the branch, whose source.at is in the
+//     branch's chain, and whose recorded grant has a root sub and kid in
+//     the base's current merge.authors or chains to a current * key of
+//     the branch (as for abandoned, below), with nothing after it in the
+//     branch. The rebase tool counts any such batch (§F.5); the janitor
+//     only these, so a successor's writers can't get unmerged work purged.
+//     A purged successor serves no grants (§8.5): the grant is then read
+//     from the successor's base, whose branch entry records its creator's,
+//     or from the branch, and if neither has it the branch is kept for a
+//     manual purge.
+//   - in both checks, every resource with a head, tombstone or batch entry
+//     of the branch's own up to that source.at has an entry in a batch
+//     that counts there whose source.at is at or after its last such
+//     entry, or a head in the batch's namespace (the base, or the
+//     successor) that equals or descends from the branch's revision of it
+//     as of that source.at, as after a fast-forward. Otherwise the first
+//     resource not covered is named, and a partial merge or replay doesn't
+//     get the rest purged. Resources purged in the branch are left out.
 //   - abandoned: the branch's document has "abandoned": true, set by a
-//     config write whose recorded grant chains to a * key of the branch,
-//     inherited or its own (§F.6): the root kid of the entry's grant (§7.4)
-//     names a key with scope "*" in the branch's document as of that
-//     write, or in a base's. An entry written while authentication was
-//     disabled records "grant": null (§1): it counts while the deployment
-//     still runs disabled, as GET / says ("auth": "disabled"), since every
-//     request then counts as holding a * key, and for no one under
-//     "grants". An entry without "grant" at all (the server's own, or one
-//     from before v0.37) counts for no one.
+//     config write whose recorded grant chains to a current * key of the
+//     branch, inherited or its own (§F.6): the root kid of the entry's
+//     grant (§7.4) names a key whose can lists "*" among the keys the
+//     branch accepts now (§C.4: its bases' current keys, then its own,
+//     less its copies of base keys the base has since dropped), the grant
+//     isn't revoked there now, and that key signed it: the stored grant
+//     (GET /ns/{ns}/grants/{gid}, §C.3.1) verifies under its pub. A kid is
+//     only a name, so a key removed, or replaced under the same kid as when
+//     a compromised key is rotated, withdraws what it set, as the grant
+//     itself stops working (§C.4). Keys are inherited from local bases
+//     only: the walk stops at a base in another deployment (base.origin),
+//     so a namespace here that shares its name lends none. An entry
+//     written while authentication was disabled records "grant": null
+//     (§1): it counts while the deployment still runs disabled, as GET /
+//     says ("auth": "disabled"), since every request then counts as
+//     holding a * key, and for no one under "grants". An entry without
+//     "grant" at all (the server's own, or one from before v0.37) counts
+//     for no one.
 //   - a branch with no head, tombstone or batch entry of its own counts as
 //     merged.
 //   - at E3, entries for the branch's keyring resource don't count in any
@@ -56,17 +87,25 @@ package janitor
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
+	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/merge"
 	"github.com/middle-management/patchlog/internal/release"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // Options configure a Janitor.
@@ -110,7 +149,10 @@ type Decision struct {
 	// "abandoned"), if any.
 	Claim  string `json:"claim,omitempty"`
 	Reason string `json:"reason"`
-	// FrozenAt and EligibleAt are set once the claim is verified.
+	// FrozenAt and EligibleAt are set once the claim is verified and has
+	// a cleanup period: FrozenAt is when the period started counting, the
+	// last config write that froze the branch or set merged, successor or
+	// abandoned (§F.6), and EligibleAt when it ends.
 	FrozenAt   time.Time `json:"frozenAt,omitzero"`
 	EligibleAt time.Time `json:"eligibleAt,omitzero"`
 	// Purge is the ns_id of the purge-ns entry the janitor wrote
@@ -320,101 +362,73 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 		return d, err
 	}
 
-	// Claims, verified. At E3 the branch's keyring is never merged, so
-	// its entries don't count as document changes (§F.6, §F.8.1).
 	enc, _ := doc.Value["encryption"].(map[string]any)
-	e2e := enc["level"] == "e2e"
-	var why []string
-	if !hasDocEntries(log, -1, e2e) {
-		d.Claim = "merged"
+	b := &branch{j: j, base: base, ns: ns, doc: doc.Value, log: log, e2e: enc["level"] == "e2e",
+		docs: map[string]nsAt{ns: {head.ID, doc.Value}}, keyCache: map[string]map[string]nsKey{}}
+	if b.cfgs, err = b.configDocs(ctx); err != nil {
+		return d, err
 	}
-	if d.Claim == "" {
-		if _, ok := doc.Value["merged"]; ok {
-			at, _ := bref["at"].(string)
-			ok, reason, err := j.verifyMerged(ctx, base, at, ns, log, e2e)
-			if err != nil {
-				return d, err
-			}
-			if ok {
-				d.Claim = "merged"
-			} else {
-				why = append(why, "merged claim not verified: "+reason)
-			}
+	frozeAt, since, err := freezeTimes(ns, b.cfgs)
+	if err != nil {
+		return d, err
+	}
+
+	// Claims, verified, in this order. The branch is purged as a verified
+	// claim whose cleanup period has passed: the first one found, or else
+	// the one whose period ends first. A claim without a period of the
+	// branch's own isn't one it is purged as (§F.6).
+	var why, noPeriod []string
+	found := "" // the first verified claim
+	var best struct {
+		claim    string
+		eligible time.Time
+	}
+	now := j.opt.Now()
+	for _, claim := range claims {
+		present, ok, reason, err := b.verify(ctx, claim, frozeAt)
+		if err != nil {
+			return d, err
+		}
+		if !present {
+			continue
+		}
+		if !ok {
+			why = append(why, claim+" claim not verified: "+reason)
+			continue
+		}
+		if found == "" {
+			found = claim
+		}
+		bdoc, err := b.current(ctx, base)
+		if err != nil {
+			return d, err
+		}
+		eligible, reason := cleanupPeriod(claim, doc.Value, bdoc, since)
+		if reason != "" {
+			noPeriod = append(noPeriod, reason)
+			continue
+		}
+		if best.claim == "" || eligible.Before(best.eligible) {
+			best.claim, best.eligible = claim, eligible
+		}
+		if !now.Before(eligible) {
+			break
 		}
 	}
-	if d.Claim == "" {
-		if s, _ := doc.Value["successor"].(string); s != "" {
-			ok, reason, err := j.verifySuperseded(ctx, base, ns, s, log, e2e)
-			if err != nil {
-				return d, err
-			}
-			if ok {
-				d.Claim = "superseded"
-			} else {
-				why = append(why, "superseded claim not verified: "+reason)
-			}
-		}
-	}
-	if d.Claim == "" {
-		if ab, _ := doc.Value["abandoned"].(bool); ab {
-			ok, reason, err := j.verifyAbandoned(ctx, ns, log)
-			if err != nil {
-				return d, err
-			}
-			if ok {
-				d.Claim = "abandoned"
-			} else {
-				why = append(why, "abandoned claim not verified: "+reason)
-			}
-		}
-	}
-	if d.Claim == "" {
+	switch {
+	case found == "":
 		if len(why) == 0 {
 			why = append(why, "frozen, but neither merged, superseded nor abandoned")
 		}
 		d.Reason = strings.Join(why, "; ")
 		return d, nil
-	}
-
-	// Cleanup periods from the freeze.
-	frozenAt, err := j.frozenSince(ctx, ns, log)
-	if err != nil {
-		return d, err
-	}
-	d.FrozenAt = frozenAt
-	bh, err := j.c.NSHead(ctx, base)
-	if err != nil {
-		return d, err
-	}
-	bdoc, err := j.c.NSDoc(ctx, base, bh.ID)
-	if err != nil {
-		return d, err
-	}
-	periods := []string{}
-	for _, v := range []map[string]any{doc.Value, bdoc.Value} {
-		cl, _ := v["cleanup"].(map[string]any)
-		if p, ok := cl[d.Claim].(string); ok {
-			periods = append(periods, p)
-		}
-	}
-	if len(periods) == 0 {
-		d.Reason = fmt.Sprintf("%s, but no cleanup period for %q is declared", d.Claim, d.Claim)
+	case best.claim == "":
+		d.Claim, d.Reason = found, strings.Join(append(noPeriod, why...), "; ")
 		return d, nil
 	}
-	eligible := frozenAt
-	for _, p := range periods {
-		t, err := AddDuration(frozenAt, p)
-		if err != nil {
-			d.Reason = "invalid cleanup period: " + err.Error()
-			return d, nil
-		}
-		if t.After(eligible) {
-			eligible = t
-		}
-	}
-	d.EligibleAt = eligible
-	if now := j.opt.Now(); now.Before(eligible) {
-		d.Reason = fmt.Sprintf("%s; cleanup period runs until %s", d.Claim, eligible.UTC().Format(time.RFC3339))
+	d.Claim, d.FrozenAt, d.EligibleAt = best.claim, since, best.eligible
+	if now.Before(best.eligible) {
+		d.Reason = fmt.Sprintf("%s; cleanup period runs until %s", d.Claim, best.eligible.UTC().Format(time.RFC3339))
 		return d, nil
 	}
 
@@ -424,9 +438,9 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 		return d, err
 	}
 	var live []string
-	for _, b := range deps {
-		if b.Name != "" && !b.Purged && b.Remote == nil {
-			live = append(live, b.Name)
+	for _, br := range deps {
+		if br.Name != "" && !br.Purged && br.Remote == nil {
+			live = append(live, br.Name)
 		}
 	}
 	if len(live) > 0 {
@@ -466,6 +480,114 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 	}
 	d.Action, d.Purge, d.Reason = ActionPurged, id, d.Claim+", verified and expired"
 	return d, nil
+}
+
+// claims are the states a branch is purged as, in the order they are
+// checked (§F.6).
+var claims = []string{"merged", "superseded", "abandoned"}
+
+// branch is one Check's view of a branch: its document and log as of its
+// head, its config writes, and the current documents of the namespaces
+// the checks read, each fetched once.
+type branch struct {
+	j    *Janitor
+	base string
+	ns   string
+	doc  map[string]any
+	log  []client.NSEntry
+	e2e  bool // at E3 the keyring is never merged (§F.6, §F.8.1)
+	cfgs []configEntry
+	docs map[string]nsAt
+	// keyCache holds keys by namespace.
+	keyCache map[string]map[string]nsKey
+	// grants holds stored grants by id (signedBy).
+	grants map[string]*grant.Grant
+}
+
+// nsAt is a namespace's head and its document there.
+type nsAt struct {
+	id  string
+	doc map[string]any
+}
+
+// head returns ns's head and its namespace document there.
+func (b *branch) head(ctx context.Context, ns string) (string, map[string]any, error) {
+	if d, ok := b.docs[ns]; ok {
+		return d.id, d.doc, nil
+	}
+	h, err := b.j.c.NSHead(ctx, ns)
+	if err != nil {
+		return "", nil, err
+	}
+	d, err := b.j.c.NSDoc(ctx, ns, h.ID)
+	if err != nil {
+		return "", nil, err
+	}
+	b.docs[ns] = nsAt{h.ID, d.Value}
+	return h.ID, d.Value, nil
+}
+
+// current returns ns's namespace document at its head.
+func (b *branch) current(ctx context.Context, ns string) (map[string]any, error) {
+	_, d, err := b.head(ctx, ns)
+	return d, err
+}
+
+// verify checks one claim (§F.6); present is false when the branch
+// doesn't make it. A branch with no head, tombstone or batch entry of its
+// own (its keyring's aside at E3) counts as merged.
+func (b *branch) verify(ctx context.Context, claim string, frozeAt time.Time) (present, ok bool, reason string, err error) {
+	switch claim {
+	case "merged":
+		if !hasDocEntries(b.log, -1, b.e2e) {
+			return true, true, "", nil
+		}
+		if _, has := b.doc["merged"]; !has {
+			return false, false, "", nil
+		}
+		ok, reason, err = b.verifyMerged(ctx)
+	case "superseded":
+		s, _ := b.doc["successor"].(string)
+		if s == "" {
+			return false, false, "", nil
+		}
+		ok, reason, err = b.verifySuperseded(ctx, s, frozeAt)
+	case "abandoned":
+		if ab, _ := b.doc["abandoned"].(bool); !ab {
+			return false, false, "", nil
+		}
+		ok, reason, err = b.verifyAbandoned(ctx)
+	}
+	return true, ok, reason, err
+}
+
+// cleanupPeriod returns when a branch verified as claim may be purged as
+// that state (§F.6): the member of its own cleanup for claim, counted from
+// since, or the base's member for claim where that is longer, as the base
+// sets only minimums. A branch whose own cleanup has no member for claim
+// isn't purged as claim, whatever its base's says (cleanup isn't copied
+// into branches, §7.6): reason says why there is no time.
+func cleanupPeriod(claim string, own, base map[string]any, since time.Time) (eligible time.Time, reason string) {
+	cl, _ := own["cleanup"].(map[string]any)
+	p, ok := cl[claim].(string)
+	if !ok {
+		return time.Time{}, fmt.Sprintf("%s, but no cleanup period for %s in the branch", claim, claim)
+	}
+	eligible, err := AddDuration(since, p)
+	if err != nil {
+		return time.Time{}, fmt.Sprintf("%s, but invalid cleanup period: %v", claim, err)
+	}
+	bcl, _ := base["cleanup"].(map[string]any)
+	if bp, ok := bcl[claim].(string); ok {
+		t, err := AddDuration(since, bp)
+		if err != nil {
+			return time.Time{}, fmt.Sprintf("%s, but invalid cleanup minimum in the base: %v", claim, err)
+		}
+		if t.After(eligible) {
+			eligible = t
+		}
+	}
+	return eligible, ""
 }
 
 // purgedSince is the decision on a sealed branch purged since it was
@@ -511,24 +633,37 @@ func hasDocEntries(log []client.NSEntry, i int, e2e bool) bool {
 	return false
 }
 
-// coveredBy finds the latest merge batch of branch in entries whose
-// source.at is in the branch's chain, and checks that the branch changed no
-// document after it. If authors is non-nil, only batches whose recorded
-// grant has a root sub and kid listed in *authors count (merge.EntryListed),
-// and those with "grant": null on their author alone while disabled: the
-// deployment says, at GET /, it runs with authentication disabled (§1).
-func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, authors *[]merge.Author, e2e, disabled bool) (bool, string) {
+// coverage is what coveredBy found: best, the index in the branch's log of
+// the latest counting batch's source.at, and at, per resource, the latest
+// such index of a counting batch with an entry for it.
+type coverage struct {
+	best int
+	at   map[string]int
+}
+
+// coveredBy finds the batches of entries that count for branch: those
+// without origin whose source.ns is branch, whose source.at is in the
+// branch's chain (blog), and that trusted accepts, as written by trustedBy
+// (for the reason; trusted may say why it refused one). It checks that the
+// branch changed no document after the latest one's source.at. disabled
+// says the deployment runs with authentication disabled (§1), for the
+// reason too. A nil coverage comes with why.
+func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, trusted func(client.NSEntry) (bool, string, error), trustedBy string, e2e, disabled bool) (*coverage, string, error) {
 	pos := map[string]int{}
 	for i, e := range blog {
 		pos[e.ID] = i
 	}
-	best, found := -1, false
+	cov := &coverage{best: -1, at: map[string]int{}}
 	forged, untrusted := 0, []string{}
 	for _, e := range entries {
 		if !merge.IsMergeOf(e, branch) {
 			continue
 		}
-		if authors != nil && !merge.EntryListed(*authors, e, disabled) {
+		ok, why, err := trusted(e)
+		if err != nil {
+			return nil, "", err
+		}
+		if !ok {
 			who := e.Author
 			switch {
 			case e.Grant != nil:
@@ -537,6 +672,9 @@ func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, a
 				who += " (written without authentication, which counts for no one under grants)"
 			case !e.GrantNull:
 				who += " (no grant recorded)"
+			}
+			if why != "" {
+				who += ": " + why
 			}
 			untrusted = append(untrusted, e.ID+" by "+who)
 			continue
@@ -547,209 +685,652 @@ func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, a
 			forged++
 			continue
 		}
-		found = true
-		if i > best {
-			best = i
+		cov.best = max(cov.best, i)
+		for _, s := range e.Entries {
+			if s.Kind != "head" && s.Kind != "tombstone" {
+				continue
+			}
+			if j, seen := cov.at[s.Resource]; !seen || i > j {
+				cov.at[s.Resource] = i
+			}
 		}
 	}
-	if !found {
+	if cov.best < 0 {
 		if len(untrusted) > 0 {
-			return false, "no merge batch is by a principal in the base's merge.authors (" + strings.Join(untrusted, ", ") + ")"
+			return nil, "no batch of the branch is by " + trustedBy + " (" + strings.Join(untrusted, ", ") + ")", nil
 		}
 		if forged > 0 {
-			return false, "its batches' source.at is not in the branch's chain"
+			return nil, "its batches' source.at is not in the branch's chain", nil
 		}
-		return false, "no batch without origin has source.ns = " + branch
+		return nil, "no batch without origin has source.ns = " + branch, nil
 	}
-	if hasDocEntries(blog, best, e2e) {
-		return false, "the branch changed documents after " + blog[best].ID
+	if hasDocEntries(blog, cov.best, e2e) {
+		return nil, "the branch changed documents after " + blog[cov.best].ID, nil
 	}
-	return true, ""
+	return cov, "", nil
 }
 
-func (j *Janitor) verifyMerged(ctx context.Context, base, at, ns string, blog []client.NSEntry, e2e bool) (bool, string, error) {
-	bh, err := j.c.NSHead(ctx, base)
+// closing checks §F.6's closing rule once coveredBy found cov in target's
+// log (the base's, or the successor's): every resource with a head,
+// tombstone or batch entry of the branch's own up to the latest counting
+// batch's source.at, other than its keyring at E3, has an entry in a
+// counting batch whose source.at is at or after its last such entry, or a
+// head in target that equals or descends from the branch's revision of it
+// as of that source.at, as after a fast-forward. Otherwise a partial merge
+// or replay (one leaving a resource out, or a later merge that missed a
+// resource changed again since an earlier one) would get unmerged work
+// purged. A resource purged in the branch has nothing left to lose and is
+// left out. why names the first resource not covered.
+func (b *branch) closing(ctx context.Context, target string, cov *coverage) (bool, string, error) {
+	last, rev := map[string]int{}, map[string]string{}
+	note := func(i int, e client.NSEntry) {
+		if (e.Kind == "head" || e.Kind == "tombstone") && !(b.e2e && e.Resource == client.KeyringName) {
+			last[e.Resource], rev[e.Resource] = i, e.Target
+		}
+	}
+	for i, e := range b.log[:cov.best+1] {
+		note(i, e)
+		if e.Kind == "batch" {
+			for _, s := range e.Entries {
+				note(i, s)
+			}
+		}
+	}
+	purged := map[string]bool{}
+	for _, e := range b.log {
+		if e.Kind == "purge" {
+			purged[e.Resource] = true
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(last)) {
+		if purged[name] {
+			continue
+		}
+		if i, ok := cov.at[name]; ok && i >= last[name] {
+			continue
+		}
+		ok, err := b.descends(ctx, target, name, rev[name])
+		if err != nil {
+			return false, "", err
+		}
+		if !ok {
+			return false, fmt.Sprintf("%s, changed by the branch in %s, has no entry in a batch that counts since, and %s's head for it neither equals nor descends from the branch's revision %s",
+				name, b.log[last[name]].ID, target, rev[name]), nil
+		}
+	}
+	return true, "", nil
+}
+
+// descends reports whether target's head for name equals rev or descends
+// from it (rev is in its log). A head that can't be read, or whose range
+// to rev is pruned, doesn't. At E3 ids never carry over from a branch, as
+// merges and rebases re-seal (§F.8.1), so only equality is looked for.
+func (b *branch) descends(ctx context.Context, target, name, rev string) (bool, error) {
+	h, err := b.j.c.Head(ctx, target, name)
+	if err != nil {
+		if _, api := client.AsAPIError(err); api {
+			return false, nil
+		}
+		return false, err
+	}
+	switch {
+	case h.State != client.Live && h.State != client.Tombstoned:
+		return false, nil
+	case h.ID == rev:
+		return true, nil
+	case b.e2e:
+		return false, nil
+	}
+	_, _, err = b.j.c.LogPage(ctx, target, name, h.ID, rev)
+	if err == nil {
+		return true, nil
+	}
+	if _, api := client.AsAPIError(err); api {
+		return false, nil
+	}
+	return false, err
+}
+
+// covered runs coveredBy and closing against target.
+func (b *branch) covered(ctx context.Context, target string, entries []client.NSEntry, trusted func(client.NSEntry) (bool, string, error), trustedBy string, disabled bool) (bool, string, error) {
+	cov, why, err := coveredBy(entries, b.ns, b.log, trusted, trustedBy, b.e2e, disabled)
+	if cov == nil || err != nil {
+		return false, why, err
+	}
+	return b.closing(ctx, target, cov)
+}
+
+func (b *branch) verifyMerged(ctx context.Context) (bool, string, error) {
+	bh, bdoc, err := b.head(ctx, b.base)
 	if err != nil {
 		return false, "", err
 	}
-	entries, err := j.c.NSLog(ctx, base, bh.ID, at)
+	bref, _ := b.doc["base"].(map[string]any)
+	at, _ := bref["at"].(string)
+	entries, err := b.j.c.NSLog(ctx, b.base, bh, at)
 	if client.IsNotFound(err) && at != "" {
-		entries, err = j.c.NSLog(ctx, base, bh.ID, "")
+		entries, err = b.j.c.NSLog(ctx, b.base, bh, "")
 	}
 	if err != nil {
 		return false, "", err
 	}
-	bdoc, err := j.c.NSDoc(ctx, base, bh.ID)
-	if err != nil {
-		return false, "", err
-	}
-	authors, declared := merge.MergeAuthors(bdoc.Value)
+	authors, declared := merge.MergeAuthors(bdoc)
 	if !declared {
-		return false, "the base " + base + " declares no merge.authors, so no merge batch can be trusted (§F.3)", nil
+		return false, "the base " + b.base + " declares no merge.authors, so no merge batch can be trusted (§F.3)", nil
 	}
-	disabled, err := j.c.AuthDisabled(ctx)
+	disabled, err := b.j.c.AuthDisabled(ctx)
 	if err != nil {
 		return false, "", err
 	}
-	ok, why := coveredBy(entries, ns, blog, &authors, e2e, disabled)
-	return ok, why, nil
+	listed := func(e client.NSEntry) (bool, string, error) { return merge.EntryListed(authors, e, disabled), "", nil }
+	return b.covered(ctx, b.base, entries, listed, "a principal in the base's merge.authors", disabled)
 }
 
-func (j *Janitor) verifySuperseded(ctx context.Context, base, ns, succ string, blog []client.NSEntry, e2e bool) (bool, string, error) {
-	sh, err := j.c.NSHead(ctx, succ)
+// sealedPurged is the reason a branch whose successor is a purged sealed
+// namespace is kept: the purge made the successor's log 410 (§8.5), so its
+// batches can't be checked, and the branch needs a manual purge.
+func sealedPurged(succ string) string {
+	return "successor " + succ + " is purged and sealed, so its log answers 410 (§8.5): sealed successor purged: verify by hand"
+}
+
+// baseChain returns the branch's bases in this deployment, its base first
+// (§7.4, §7.6); it stops at a base in another deployment.
+func (b *branch) baseChain(ctx context.Context) ([]string, error) {
+	var out []string
+	doc := b.doc
+	for i := 0; i <= maxDepth; i++ {
+		bns, _, ok := localBase(doc)
+		if !ok {
+			break
+		}
+		out = append(out, bns)
+		var err error
+		if doc, err = b.current(ctx, bns); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// verifySuperseded checks a superseded claim (§F.6):
+//
+//   - the successor is still one §7.4 allows: another namespace that
+//     exists, isn't purged, and is a branch of the branch's base or of a
+//     namespace further up its base chain in this deployment, listed as
+//     such in that namespace's branches. A successor purged after the
+//     branch was frozen (frozeAt) still counts, checked from its log,
+//     which the purge leaves readable, except a sealed one, whose log the
+//     purge makes 410: the branch is then kept for a manual purge;
+//   - its log has a batch without origin whose source.ns is the branch,
+//     whose source.at is in the branch's chain, and whose recorded grant
+//     has a root sub and kid in the base's current merge.authors or
+//     chains to a current * key of the branch (starKey, which reads the
+//     grant from the successor, or once it is purged from its base or the
+//     branch), with nothing after that source.at in the branch. One
+//     recording "grant": null counts while the deployment runs with
+//     authentication disabled (§1).
+//     The rebase tool counts any such batch as an earlier merge (§F.5),
+//     the janitor only these.
+func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time.Time) (bool, string, error) {
+	if succ == b.ns {
+		return false, "the successor is the branch itself", nil
+	}
+	sh, err := b.j.c.NSHead(ctx, succ)
 	if client.IsNotFound(err) {
 		return false, "successor " + succ + " doesn't exist", nil
 	}
 	if err != nil {
 		return false, "", err
 	}
-	sdoc, err := j.c.NSDoc(ctx, succ, sh.ID)
+	sdoc, err := b.j.c.NSDoc(ctx, succ, sh.ID)
 	if client.IsPurged(err) {
 		// A sealed successor's document, once it is purged (§8.5).
-		return false, "successor " + succ + " is purged", nil
+		return false, sealedPurged(succ), nil
 	}
 	if err != nil {
 		return false, "", err
 	}
-	sb, _ := sdoc.Value["base"].(map[string]any)
-	if sns, _ := sb["ns"].(string); sns != base {
-		return false, "successor " + succ + " has another base", nil
+	b.docs[succ] = nsAt{sh.ID, sdoc.Value}
+	sref, _ := sdoc.Value["base"].(map[string]any)
+	sbase, _ := sref["ns"].(string)
+	if _, remote := sref["origin"]; remote || sbase == "" {
+		return false, "successor " + succ + " is not a branch in this deployment (§7.4)", nil
 	}
-	brs, err := j.c.Branches(ctx, base)
+	chain, err := b.baseChain(ctx)
 	if err != nil {
 		return false, "", err
 	}
-	listed := false
-	for _, b := range brs {
-		if b.Name == succ {
-			listed = true
-			if b.Purged {
-				return false, "successor " + succ + " is purged", nil
-			}
+	if !slices.Contains(chain, sbase) {
+		return false, fmt.Sprintf("successor %s is a branch of %s, not of a namespace in the branch's base chain (%s, §7.4)", succ, sbase, strings.Join(chain, ", ")), nil
+	}
+	brs, err := b.j.c.Branches(ctx, sbase)
+	if err != nil {
+		return false, "", err
+	}
+	i := slices.IndexFunc(brs, func(br client.Branch) bool { return br.Name == succ })
+	if i < 0 {
+		return false, "successor " + succ + " is not a branch of " + sbase, nil
+	}
+	entries, err := b.j.c.NSLog(ctx, succ, sh.ID, "")
+	if client.IsPurged(err) {
+		return false, sealedPurged(succ), nil
+	}
+	if err != nil {
+		return false, "", err
+	}
+	if brs[i].Purged {
+		// Its log stays readable, the purge-ns entry its last (§8.5).
+		var purgedAt time.Time
+		if n := len(entries); n > 0 && entries[n-1].Kind == "purge-ns" {
+			purgedAt, _ = time.Parse(time.RFC3339Nano, entries[n-1].Created)
+		}
+		if purgedAt.IsZero() {
+			return false, "successor " + succ + " is purged, but its log has no purge-ns entry to date the purge by", nil
+		}
+		if !purgedAt.After(frozeAt) {
+			return false, fmt.Sprintf("successor %s was purged at %s, before the branch was frozen at %s", succ,
+				purgedAt.UTC().Format(time.RFC3339Nano), frozeAt.UTC().Format(time.RFC3339Nano)), nil
 		}
 	}
-	if !listed {
-		return false, "successor " + succ + " is not a branch of " + base, nil
-	}
-	entries, err := j.c.NSLog(ctx, succ, sh.ID, "")
+	_, bdoc, err := b.head(ctx, b.base)
 	if err != nil {
 		return false, "", err
 	}
-	// §F.6 names no merge.authors check for the successor's batch.
-	ok, why := coveredBy(entries, ns, blog, nil, e2e, false)
-	return ok, why, nil
+	authors, _ := merge.MergeAuthors(bdoc)
+	disabled, err := b.j.c.AuthDisabled(ctx)
+	if err != nil {
+		return false, "", err
+	}
+	trusted := func(e client.NSEntry) (bool, string, error) {
+		switch {
+		case merge.EntryListed(authors, e, disabled):
+			return true, "", nil
+		case e.GrantNull:
+			// Written while every request counted as holding a * key (§1).
+			return disabled, "", nil
+		case e.Grant == nil:
+			return false, "", nil
+		}
+		// The successor's base records its creator's grant, the rebase
+		// tool's, and the branch the grant of a switch (§F.5), should the
+		// successor be purged since.
+		return b.starKey(ctx, e, succ, sbase, b.ns)
+	}
+	return b.covered(ctx, succ, entries, trusted, "a principal in the base's merge.authors or under a current * key of the branch", disabled)
 }
 
 // verifyAbandoned checks an abandoned claim (§F.6): the config write that
-// set "abandoned": true was made under a grant chained to a * key of the
-// branch, inherited or its own. Only its administrators can give up
-// everyone's unmerged work.
-func (j *Janitor) verifyAbandoned(ctx context.Context, ns string, log []client.NSEntry) (bool, string, error) {
-	var setter *client.NSEntry
+// set "abandoned": true was made under a grant chained to a current * key
+// of the branch, inherited from a local base or its own (starKey): a key
+// removed since, one replaced under the same kid, whose new pub the grant
+// doesn't verify under, or one of a base in another deployment, doesn't
+// count. Only its administrators can give up everyone's unmerged work.
+func (b *branch) verifyAbandoned(ctx context.Context) (bool, string, error) {
+	var setter *configEntry
 	was := false
-	for i := range log {
-		e := log[i]
-		isConfig := e.Kind == "config" || (e.Kind == "batch" && len(e.Entries) > 0 && e.Entries[0].Kind == "config")
-		if !isConfig {
-			continue
-		}
-		d, err := j.c.NSDoc(ctx, ns, e.ID)
-		if err != nil {
-			return false, "", err
-		}
-		ab, _ := d.Value["abandoned"].(bool)
+	for i := range b.cfgs {
+		ab, _ := b.cfgs[i].doc["abandoned"].(bool)
 		if ab && !was {
-			setter = &log[i]
+			setter = &b.cfgs[i]
 		}
 		was = ab
 	}
 	if setter == nil {
 		return false, "no config write set abandoned", nil
 	}
-	if setter.Grant == nil {
-		if !setter.GrantNull {
-			return false, fmt.Sprintf("the config write %s that set it records no grant (§7.4), so its key can't be checked; set abandoned again", setter.ID), nil
+	e := setter.e
+	if e.Grant == nil {
+		if !e.GrantNull {
+			return false, fmt.Sprintf("the config write %s that set it records no grant (§7.4), so its key can't be checked; set abandoned again", e.ID), nil
 		}
 		// Written while authentication was disabled (grant: null), when
 		// every request counted as holding a * key: it counts only while
 		// the deployment still runs disabled (§1).
-		disabled, err := j.c.AuthDisabled(ctx)
+		disabled, err := b.j.c.AuthDisabled(ctx)
 		if err != nil {
 			return false, "", err
 		}
 		if disabled {
 			return true, "", nil
 		}
-		return false, fmt.Sprintf("the config write %s that set it was written while authentication was disabled (grant: null), which counts for no one now that the deployment runs with grants (§1); set abandoned again", setter.ID), nil
+		return false, fmt.Sprintf("the config write %s that set it was written while authentication was disabled (grant: null), which counts for no one now that the deployment runs with grants (§1); set abandoned again", e.ID), nil
 	}
-	d, err := j.c.NSDoc(ctx, ns, setter.ID)
+	ok, why, err := b.starKey(ctx, e, b.ns)
+	if err != nil || ok {
+		return ok, "", err
+	}
+	return false, fmt.Sprintf("the config write %s that set it was by %s, but %s", e.ID, e.Grant.Sub, why), nil
+}
+
+// nsKey is a namespace key as the janitor compares keys: its alg and pub,
+// and whether its can lists "*".
+type nsKey struct {
+	alg, pub string
+	star     bool
+}
+
+// parseKeys reads a namespace document's keys by kid. The core validates
+// them, so malformed entries are skipped.
+func parseKeys(v any) map[string]nsKey {
+	out := map[string]nsKey{}
+	arr, _ := v.([]any)
+	for _, x := range arr {
+		m, _ := x.(map[string]any)
+		kid, _ := m["kid"].(string)
+		if kid == "" {
+			continue
+		}
+		var k nsKey
+		k.alg, _ = m["alg"].(string)
+		k.pub, _ = m["pub"].(string)
+		can, _ := m["can"].([]any)
+		k.star = slices.Contains(can, any("*"))
+		out[kid] = k
+	}
+	return out
+}
+
+// localBase returns the base of a namespace document in this deployment:
+// its name and at, and false for a namespace that isn't a branch, or whose
+// base lives in another deployment (base.origin, §7.6, §G.3).
+func localBase(doc map[string]any) (ns, at string, ok bool) {
+	bref, _ := doc["base"].(map[string]any)
+	ns, _ = bref["ns"].(string)
+	at, _ = bref["at"].(string)
+	if _, remote := bref["origin"]; remote || ns == "" {
+		return "", "", false
+	}
+	return ns, at, true
+}
+
+// maxDepth bounds base chains (the deployment's branch depth is 8 by
+// default, §6.6).
+const maxDepth = 32
+
+// keys returns the keys ns accepts now, by kid, as the core does (§C.4,
+// keys follow the base): its base's, recursively, whose entries win over
+// ns's own for a shared kid, then its own, less those it copied from its
+// base at creation and the base has since removed. Only local bases count
+// (§7.6): the walk stops at a namespace whose base has origin, so a local
+// namespace that shares a remote base's name lends no keys.
+func (b *branch) keys(ctx context.Context, ns string) (map[string]nsKey, error) {
+	return b.keysAt(ctx, ns, 0)
+}
+
+func (b *branch) keysAt(ctx context.Context, ns string, depth int) (map[string]nsKey, error) {
+	if k, ok := b.keyCache[ns]; ok {
+		return k, nil
+	}
+	if depth > maxDepth {
+		return nil, fmt.Errorf("janitor: base chain of %s too deep", ns)
+	}
+	doc, err := b.current(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	out := parseKeys(doc["keys"])
+	if bns, at, ok := localBase(doc); ok {
+		baseKeys, err := b.keysAt(ctx, bns, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		copied, err := b.copiedKids(ctx, ns, bns, at)
+		if err != nil {
+			return nil, err
+		}
+		own := out
+		out = maps.Clone(baseKeys)
+		for kid, k := range own {
+			if _, inBase := baseKeys[kid]; inBase || copied[kid] {
+				continue
+			}
+			out[kid] = k
+		}
+	}
+	b.keyCache[ns] = out
+	return out, nil
+}
+
+// copiedKids returns the kids a branch copied from its base at creation:
+// those of the base's document in force at the base's branch entry for it,
+// found in the base's log after the branch's at (§7.6, §C.4).
+func (b *branch) copiedKids(ctx context.Context, ns, base, at string) (map[string]bool, error) {
+	bh, _, err := b.head(ctx, base)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := b.j.c.NSLog(ctx, base, bh, at)
+	if err != nil {
+		return nil, fmt.Errorf("janitor: log of %s, the base of %s: %w", base, ns, err)
+	}
+	for _, e := range entries {
+		if e.Kind != "branch" || e.Name != ns || e.Remote != nil {
+			continue
+		}
+		d, err := b.j.c.NSDoc(ctx, base, e.ID)
+		if err != nil {
+			return nil, err
+		}
+		out := map[string]bool{}
+		for kid := range parseKeys(d.Value["keys"]) {
+			out[kid] = true
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("janitor: no branch entry for %s in %s after %s", ns, base, at)
+}
+
+// revoked returns the revocation ids in force in ns now: its own and those
+// of its local bases (§C.4).
+func (b *branch) revoked(ctx context.Context, ns string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for i := 0; ns != "" && i <= maxDepth; i++ {
+		doc, err := b.current(ctx, ns)
+		if err != nil {
+			return nil, err
+		}
+		rv, _ := doc["revoked"].([]any)
+		for _, x := range rv {
+			if s, ok := x.(string); ok {
+				out[s] = true
+			}
+		}
+		ns, _, _ = localBase(doc)
+	}
+	return out, nil
+}
+
+// starKey reports whether a namespace entry's recorded grant chains to a
+// current * key of the branch (§F.6): the root kid the entry records
+// (§7.4) names a key whose can lists "*" among the keys the branch accepts
+// now (keys: its own or a local base's), the grant isn't revoked there
+// now, and that key signed it (signedBy). A kid is only a name, so a key
+// replaced under the same kid since the write, as when a compromised key
+// is rotated, no longer counts: the grant doesn't verify under it, just
+// as it no longer works anywhere (§C.4). For an entry written in another
+// namespace, in (a successor), the kid must also name the same key, alg
+// and pub, among those in accepts now; alt are other namespaces whose
+// entries may record the same grant, read if in no longer serves it. why
+// says what failed. An entry without a grant, such as one written while
+// authentication was disabled, is the caller's to judge.
+func (b *branch) starKey(ctx context.Context, e client.NSEntry, in string, alt ...string) (ok bool, why string, err error) {
+	if e.Grant == nil || e.Grant.Kid == "" {
+		return false, "it records no key", nil
+	}
+	kid := e.Grant.Kid
+	keys, err := b.keys(ctx, b.ns)
 	if err != nil {
 		return false, "", err
 	}
-	docs := []map[string]any{d.Value}
-	for cur, i := d.Value, 0; i < 64; i++ {
-		bref, _ := cur["base"].(map[string]any)
-		bns, _ := bref["ns"].(string)
-		if bns == "" {
-			break
-		}
-		bh, err := j.c.NSHead(ctx, bns)
-		if err != nil {
-			break // an unreadable base: its keys can't be checked
-		}
-		bd, err := j.c.NSDoc(ctx, bns, bh.ID)
-		if err != nil {
-			break
-		}
-		docs = append(docs, bd.Value)
-		cur = bd.Value
+	k, found := keys[kid]
+	switch {
+	case !found:
+		return false, fmt.Sprintf("key %q isn't one the branch accepts now (§C.4)", kid), nil
+	case !k.star:
+		return false, fmt.Sprintf("key %q isn't a * key of the branch", kid), nil
 	}
-	for _, doc := range docs {
-		keys, _ := doc["keys"].([]any)
-		for _, k := range keys {
-			km, _ := k.(map[string]any)
-			if km["kid"] != setter.Grant.Kid {
-				continue
+	rv, err := b.revoked(ctx, b.ns)
+	if err != nil {
+		return false, "", err
+	}
+	if e.Grant.ID != "" && rv[e.Grant.ID] {
+		return false, fmt.Sprintf("its grant %s is revoked in the branch (§C.4)", e.Grant.ID), nil
+	}
+	if in != b.ns {
+		ks, err := b.keys(ctx, in)
+		if err != nil {
+			return false, "", err
+		}
+		if k2, found := ks[kid]; !found || !strings.EqualFold(k2.alg, k.alg) || k2.pub != k.pub {
+			return false, fmt.Sprintf("key %q of %s isn't the branch's * key of that name", kid, in), nil
+		}
+	}
+	return b.signedBy(ctx, e, kid, k, append([]string{in}, alt...))
+}
+
+// signedBy reports whether the grant an entry records was signed by k,
+// the key kid names now (§C.3.1): the stored grant, as GET
+// /ns/{ns}/grants/{gid} serves it, has the entry's grant id and root kid,
+// and its signature chain verifies under k's pub. It is read from the
+// first namespace of from, the one the entry was written in, that serves
+// it. Where that one is a successor purged since, which answers 410 for
+// its grants (§8.5), the others may serve the same grant, as the id and
+// signature are checked whoever serves it; if none does, it can't be
+// checked, and the branch is kept for a manual purge.
+func (b *branch) signedBy(ctx context.Context, e client.NSEntry, kid string, k nsKey, from []string) (ok bool, why string, err error) {
+	gid := e.Grant.ID
+	g, ok := b.grants[gid]
+	if !ok {
+		var doc *client.GrantDoc
+		src, purged := "", false
+		for i, ns := range from {
+			doc, err = b.j.c.Grant(ctx, ns, gid)
+			if i == 0 {
+				purged = client.IsPurged(err)
 			}
-			can, _ := km["can"].([]any)
-			for _, c := range can {
-				if c == "*" {
-					return true, "", nil
+			if src = ns; !client.IsNotFound(err) && !client.IsPurged(err) {
+				break
+			}
+		}
+		switch {
+		case purged && (client.IsNotFound(err) || client.IsPurged(err)):
+			return false, fmt.Sprintf("its grant %s can't be read since %s was purged (§8.5), so its key can't be checked: verify by hand", gid, from[0]), nil
+		case client.IsNotFound(err) || client.IsPurged(err):
+			return false, fmt.Sprintf("its grant %s isn't served by %s (§C.3.1), so its key can't be checked", gid, from[0]), nil
+		case err != nil:
+			return false, "", fmt.Errorf("janitor: grant %s of %s: %w", gid, src, err)
+		}
+		if g, err = parseGrantDoc(doc); err != nil {
+			return false, fmt.Sprintf("its grant %s as %s serves it is malformed: %v", gid, src, err), nil
+		}
+		if b.grants == nil {
+			b.grants = map[string]*grant.Grant{}
+		}
+		b.grants[gid] = g
+	}
+	pub, err := base64.RawURLEncoding.Strict().DecodeString(k.pub)
+	switch {
+	case g.ID().String() != gid:
+		return false, fmt.Sprintf("the grant served as %s has id %s", gid, g.ID()), nil
+	case g.Blocks[0].Kid != kid:
+		return false, fmt.Sprintf("its grant %s names key %q, not %q", gid, g.Blocks[0].Kid, kid), nil
+	case err != nil || !strings.EqualFold(k.alg, sig.Alg) || !g.SignedBy(ed25519.PublicKey(pub)):
+		return false, fmt.Sprintf("its grant %s isn't signed by the key %q the branch accepts now: replaced since (§C.4)", gid, kid), nil
+	}
+	return true, "", nil
+}
+
+// parseGrantDoc parses a stored grant as GET /ns/{ns}/grants/{gid} serves
+// it (§C.3.1): its SignedBlocks, authority first, rebuilt into the
+// non-bearer Biscuit container (§C.8) with the authority block as field 2
+// and the others as field 3. The chain past the authority block is checked
+// here, the authority block's signature by SignedBy.
+func parseGrantDoc(doc *client.GrantDoc) (*grant.Grant, error) {
+	blocks, err := doc.Blocks()
+	if err != nil {
+		return nil, err
+	}
+	var data []byte
+	for i, raw := range blocks {
+		field := byte(3)
+		if i == 0 {
+			field = 2
+		}
+		data = append(data, field<<3|2)
+		data = binary.AppendUvarint(data, uint64(len(raw)))
+		data = append(data, raw...)
+	}
+	g, err := grant.ParseStored(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(g.Blocks) == 0 {
+		return nil, errors.New("no blocks")
+	}
+	return g, nil
+}
+
+// configEntry is one of the branch's config writes, a config entry or a
+// batch whose first item is one, with the namespace document it left in
+// force.
+type configEntry struct {
+	e   client.NSEntry
+	doc map[string]any
+}
+
+// configDocs returns the branch's config writes, oldest first, from its
+// genesis.
+func (b *branch) configDocs(ctx context.Context) ([]configEntry, error) {
+	var out []configEntry
+	for _, e := range b.log {
+		if e.Kind != "config" && (e.Kind != "batch" || len(e.Entries) == 0 || e.Entries[0].Kind != "config") {
+			continue
+		}
+		d, err := b.j.c.NSDoc(ctx, b.ns, e.ID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, configEntry{e, d.Value})
+	}
+	return out, nil
+}
+
+// freezeTimes returns, from a frozen branch's config writes, frozeAt, the
+// created time of the write that froze it (the first of the trailing
+// writes whose document is frozen), and since, that of the last write
+// that froze it or set or changed merged, successor or abandoned, from
+// which its cleanup period counts (§F.6). Other config writes, such as one
+// changing cleanup, don't restart the period.
+func freezeTimes(ns string, cfgs []configEntry) (frozeAt, since time.Time, err error) {
+	var prev map[string]any
+	fz, last := "", ""
+	for _, c := range cfgs {
+		was, _ := prev["frozen"].(bool)
+		is, _ := c.doc["frozen"].(bool)
+		switch {
+		case !is:
+			fz, last = "", ""
+		case !was:
+			fz, last = c.e.Created, c.e.Created
+		default:
+			for _, m := range []string{"merged", "successor", "abandoned"} {
+				if v, ok := c.doc[m]; ok && !reflect.DeepEqual(v, prev[m]) {
+					last = c.e.Created
 				}
 			}
 		}
+		prev = c.doc
 	}
-	return false, fmt.Sprintf("the config write %s that set it was by %s under key %q, not a * key of the branch", setter.ID, setter.Grant.Sub, setter.Grant.Kid), nil
-}
-
-// frozenSince returns the created time of the config entry that froze the
-// branch: the oldest of the trailing config changes whose document is
-// frozen.
-func (j *Janitor) frozenSince(ctx context.Context, ns string, log []client.NSEntry) (time.Time, error) {
-	var at string
-	for i := len(log) - 1; i >= 0; i-- {
-		e := log[i]
-		isConfig := e.Kind == "config" || (e.Kind == "batch" && len(e.Entries) > 0 && e.Entries[0].Kind == "config")
-		if !isConfig {
-			continue
-		}
-		d, err := j.c.NSDoc(ctx, ns, e.ID)
-		if err != nil {
-			return time.Time{}, err
-		}
-		if f, _ := d.Value["frozen"].(bool); !f {
-			break
-		}
-		at = e.Created
+	if fz == "" {
+		return time.Time{}, time.Time{}, fmt.Errorf("janitor: %s: no freezing config entry", ns)
 	}
-	if at == "" {
-		return time.Time{}, fmt.Errorf("janitor: %s: no freezing config entry", ns)
+	if frozeAt, err = time.Parse(time.RFC3339Nano, fz); err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("janitor: %s: config entry created %q: %w", ns, fz, err)
 	}
-	t, err := time.Parse(time.RFC3339Nano, at)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("janitor: %s: config entry created %q: %w", ns, at, err)
+	if since, err = time.Parse(time.RFC3339Nano, last); err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("janitor: %s: config entry created %q: %w", ns, last, err)
 	}
-	return t, nil
+	return frozeAt, since, nil
 }
 
 // Run follows the bases and their branches (follow.WithBranches) and sweeps

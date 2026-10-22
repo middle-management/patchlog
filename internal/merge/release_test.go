@@ -180,12 +180,13 @@ func (w *relWorld) annaBearer() string {
 		map[string]any{"groups": sAny("match-desk", "catalog-admins"), "exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})
 }
 
+// branch creates a branch of base as anna, with the bases' cleanup periods
+// as its own: cleanup isn't copied into branches (§7.6), and the janitor
+// purges a branch only by its own (§F.6).
 func (w *relWorld) branch(base, name string, patches ...map[string]any) {
 	w.t.Helper()
-	br := client.BranchRequest{Name: name}
-	if len(patches) > 0 {
-		br.Patches = ops(patches...)
-	}
+	cleanup := map[string]any{"merged": "PT0S", "superseded": "PT0S", "abandoned": "PT0S"}
+	br := client.BranchRequest{Name: name, Patches: ops(append([]map[string]any{op("add", "/cleanup", cleanup)}, patches...)...)}
 	must(w.anna.CreateBranch(ctx, base, br))
 }
 
