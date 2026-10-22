@@ -245,18 +245,6 @@ func parseMerge(v any) ([]MergeAuthor, error) {
 	return out, nil
 }
 
-// allowance returns the allowance of a principal, or nil. With
-// authentication disabled there is no signing key, so only sub is matched.
-func (c *Config) allowance(sub, kid string, noKeys bool) *Allowance {
-	for i := range c.Allowances {
-		a := &c.Allowances[i]
-		if a.Sub == sub && (a.Kid == kid || noKeys) {
-			return a
-		}
-	}
-	return nil
-}
-
 // allowanceAt returns the allowance that applies to a principal at now, or
 // nil: the first matching entry whose until hasn't passed, so an earlier
 // entry that has ended doesn't hide a later one (§6.6 Allowances). kid is
