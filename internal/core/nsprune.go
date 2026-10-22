@@ -37,7 +37,8 @@ type PruneResult struct {
 }
 
 // Prune prunes a resource's history below a horizon (§8.6), archiving the
-// pruned range first when an archive destination is configured.
+// pruned range first when an archive destination is configured. In a
+// branch it moves nothing (pruneInBranch).
 //
 // The prune verb suffices when the archive exists and the horizon doesn't go
 // below what the resource's retention rule keeps, which is everything where
@@ -85,9 +86,6 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		if pr.Precondition {
 			return apiErr(428, "precondition_required", "message", "a prune takes no precondition (§7.2, §8.6)")
 		}
-		if n.isBranch() {
-			return invalid("branches don't prune (§8.6)")
-		}
 		if v.state == NotFound {
 			return notFound()
 		}
@@ -112,8 +110,21 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		case e2e && pr.Snapshot == "":
 			return invalid("pruning an e2e resource needs the horizon's document as a sealed snapshot (§8.6)")
 		}
-		// Each keep id is a revision of the resource whose document is
-		// still served, whether or not the horizon moves (§8.6).
+		// The envelope's doc is { horizon, keep? } as sent (§6.4.1).
+		doc := map[string]any{"horizon": pr.Horizon}
+		if pr.KeepSent {
+			doc["keep"] = anyStrings(pr.Keep)
+		}
+		env := t.basicEnvelope("prune", name, a)
+		env["writes"], env["patches"], env["doc"] = []any{}, []any{}, doc
+		if n.isBranch() {
+			res, err := t.pruneInBranch(n, cfg, a, name, v, hid, pr, env)
+			out = res
+			return err
+		}
+		// Outside a branch, each keep id is a revision of the resource
+		// whose document is still served, whether or not the horizon
+		// moves (§8.6).
 		var keep []*revRow
 		for _, k := range pr.Keep {
 			kid, err := ids.Parse(k)
@@ -173,13 +184,6 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 				return forbidden("going below what retention keeps, everything where no retention rule matches the resource, needs a grant chained to a * key (§8.6)")
 			}
 		}
-		// The envelope's doc is { horizon, keep? } as sent (§6.4.1).
-		doc := map[string]any{"horizon": pr.Horizon}
-		if pr.KeepSent {
-			doc["keep"] = anyStrings(pr.Keep)
-		}
-		env := t.basicEnvelope("prune", name, a)
-		env["writes"], env["patches"], env["doc"] = []any{}, []any{}, doc
 		if err := t.checkRules(cfg, a, env, false); err != nil {
 			return err
 		}
@@ -197,6 +201,43 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		return nil
 	})
 	return out, err
+}
+
+// pruneInBranch finishes a prune in branch n once the checks it shares with
+// a base's have passed (§8.6 "Branches don't prune"): only the base prunes
+// the history a branch reads through, and a branch's own entries are
+// protected until it is purged. It runs the rules, moves no horizon,
+// ignores keep, which is checked only against keepPerResource, writes
+// nothing, and answers the resource's current horizon as the branch sees
+// it. No archive is needed, nor a * key, since nothing is pruned. At E3 the
+// snapshot is still checked at step 4, its kid included: it must carry the
+// branch's own epoch, never a base's (§13, F-B6).
+func (t *tx) pruneInBranch(n *nsRow, cfg *Config, a *actor, name string, v *view, hid ids.ID, pr PruneRequest, env map[string]any) (*PruneResult, error) {
+	if t.e2eContent(n, name) {
+		if err := t.checkSealedHeader(n, cfg, pr.Snapshot, seal.SnapshotPL(n.name, name, hid.String()), "snapshot", false); err != nil {
+			return nil, err
+		}
+	}
+	if err := t.checkRules(cfg, a, env, false); err != nil {
+		return nil, err
+	}
+	return &PruneResult{Horizon: t.branchHorizon(v.head)}, nil
+}
+
+// branchHorizon is a resource's horizon as a branch sees it (§8.6): that of
+// the newest segment of head's ancestry whose resource has one, a base's
+// the branch reads through, as its pruned revisions' 410 names it (§7.1);
+// otherwise the ancestry's genesis.
+func (t *tx) branchHorizon(head *revRow) string {
+	segs := t.ancestry(head)
+	for _, sg := range segs {
+		if id := t.horizonID(sg.res); id != "" {
+			return id
+		}
+	}
+	var g int64
+	t.must(t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND first = 1`, segs[len(segs)-1].res).Scan(&g))
+	return t.revID(g).String()
 }
 
 // storedKeep is own's keep set (§8.6): its revisions in the resource's

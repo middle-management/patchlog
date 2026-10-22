@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // P26: purge and prune (§6.1, §6.2, §6.6, §7.2, §8.3, §8.5, §8.6).
@@ -263,6 +265,99 @@ func TestV073P26KeepServed(t *testing.T) {
 	pruneEntry(t, e, prune(map[string]any{"horizon": revs[6], "keep": []any{revs[1], revs[4]}}), "kv", "a", revs[6])
 	expect(t, e.get("/r/kv/a/rev/"+revs[4]), 200)
 	expectCode(t, e.get("/r/kv/a/rev/"+revs[5]), 410, "pruned")
+}
+
+// v0.73 §8.6 Branches don't prune (BBD-49): a prune in a branch runs its
+// checks (the verb, purged, 404 or 410 for the resource, 428, the horizon
+// in the branch's view, the rules) and moves nothing. It answers 200 with
+// the resource's current horizon as the branch sees it, else its genesis
+// id, ignores keep, needs neither an archive nor a * key, and writes
+// nothing.
+func TestV073P26BranchPrune(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, withoutRetentionLoop)
+	e.mkNS("bp", map[string]any{"read": "public"})
+	c := e.chain("bp", "c", 4)
+	expect(t, e.branch("bp", map[string]any{"name": "bpb"}, "alice"), 201)
+	c4 := e.appendRev("bp", "c", c[3], ops(op("replace", "/n", 4.0)))
+	e.clock.Advance(time.Hour)
+	prune := func(body map[string]any) *resp { return e.prune("bpb", "c", body, "admin") }
+	check := func(r *resp, horizon string) {
+		t.Helper()
+		expect(t, r, 200)
+		if len(r.Obj()) != 1 || r.Str("horizon") != horizon {
+			t.Fatalf("branch prune %s, want horizon %s", r.Body, horizon)
+		}
+	}
+
+	// No horizon yet: the genesis. keep isn't checked, nor applied.
+	bHead, mHead := e.nsHead("bpb"), e.nsHead("bp")
+	r := prune(map[string]any{"horizon": c[3], "keep": []any{c[1], hashID(t, "", nil)}})
+	check(r, c[0])
+	noEntry(t, e, r, "bpb", bHead)
+	noEntry(t, e, r, "bp", mHead)
+	expect(t, e.get("/r/bpb/c/rev/"+c[0]), 200)
+	// c4 came after the branch point: not in the branch's view.
+	expectCode(t, prune(map[string]any{"horizon": c4}), 422, "invalid")
+	expect(t, e.prune("bpb", "nope", map[string]any{"horizon": c[3]}, "admin"), 404)
+	expectCode(t, e.do(req{method: "POST", path: "/r/bpb/c/prune", body: map[string]any{"horizon": c[3]}, ifMatch: c[3], author: "admin"}), 428, "precondition_required")
+
+	// The base prunes, protected at the branch point; the branch sees the
+	// base's horizon, under its own revisions too.
+	check(e.prune("bp", "c", map[string]any{"horizon": c4}, "admin"), c[3])
+	check(prune(map[string]any{"horizon": c[3]}), c[3])
+	b1 := e.appendRev("bpb", "c", c[3], ops(op("replace", "/n", 5.0)))
+	r = prune(map[string]any{"horizon": b1})
+	check(r, c[3])
+	noEntry(t, e, r, "bpb", e.nsHead("bpb"))
+	expect(t, e.get("/r/bpb/c/rev/"+c[3]), 200)
+
+	// The rules run, with keep in the envelope as sent.
+	noKeep := map[string]any{
+		"if":   []any{map[string]any{"op": "test", "path": "/action", "value": "prune"}},
+		"then": []any{map[string]any{"op": "test", "path": "/doc/keep", "exists": false}},
+	}
+	expect(t, e.patchNS("bpb", ops(op("add", "/rules", []any{noKeep})), ""), 201)
+	expectCode(t, prune(map[string]any{"horizon": b1, "keep": []any{}}), 422, "rule")
+	check(prune(map[string]any{"horizon": b1}), c[3])
+
+	// A purged resource is 410.
+	expect(t, e.purge("bpb", "c", b1, "admin"), 204)
+	expectCode(t, prune(map[string]any{"horizon": b1}), 410, "gone")
+}
+
+// v0.73 §8.6, §13, Encryption levels scenario 18 (BBD-49, F-B6): an E3
+// prune in a branch moves nothing, but its snapshot is still required and
+// checked, its kid included: one sealed under the base's kid is 422; no
+// archive is needed, nor a * key.
+func TestV073P26BranchPruneE3(t *testing.T) {
+	t.Parallel()
+	f := newE2E(t) // no archive destination
+	e := f.tenv
+	k := seal.NewKey()
+	d0 := etagOf(e.writeRaw("e", "d", "", sealed(t, k, "e#1", "e", "d", "", addRoot(map[string]any{"n": 0.0})), f.writerG))
+	d1 := etagOf(e.writeRaw("e", "d", d0, sealed(t, k, "e#1", "e", "d", d0, ops(op("replace", "/n", 1.0))), f.writerG))
+	expect(t, e.branch("e", map[string]any{"name": "eb"}, f.adminG), 201)
+	bg := e.grant(f.writer, "user:writer", []string{"eb"}, []string{"read", "prune"})
+	e.clock.Advance(10 * time.Minute)
+
+	expectCode(t, e.prune("eb", "d", map[string]any{"horizon": d1}, bg), 422, "invalid")
+	expectCode(t, e.prune("eb", "d", map[string]any{"horizon": d1, "snapshot": "x", "keep": []any{d0}}, bg), 422, "invalid")
+	baseKid, err := seal.SealSnapshot(k, "e#1", "e", "d", d1, map[string]any{"n": 1.0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectCode(t, e.prune("eb", "d", map[string]any{"horizon": d1, "snapshot": baseKid}, bg), 422, "invalid")
+	own, err := seal.SealSnapshot(k, "eb#1", "eb", "d", d1, map[string]any{"n": 1.0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := e.nsHead("eb", bg)
+	r := e.prune("eb", "d", map[string]any{"horizon": d1, "snapshot": own}, bg)
+	expect(t, r, 200)
+	if r.Str("horizon") != d0 || r.H.Get("X-Namespace-Revision") != "" || e.nsHead("eb", bg) != head {
+		t.Fatalf("E3 branch prune %s %v", r.Body, r.H)
+	}
 }
 
 // v0.73 §8.6 Request (BBD-52): where no retention rule matches the
