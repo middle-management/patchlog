@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -15,39 +16,41 @@ import (
 
 // Live reads: event streams (§7.3) and long-poll (§7.7).
 
-// longPoll implements §7.7 for a log fetched by fetch.
-func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header string, tags []string,
+// liveQuery reads a log URL's live and cursor (§7.7): live absent, for
+// the 302 to the immutable range, or long-poll; cursor, if given, a decimal
+// number (^[0-9]+$), else -1. Any other live, an empty one included, and
+// any other cursor, such as an empty one or +5, is 400 (§7, §12.4), before
+// authorisation.
+func liveQuery(q url.Values) (live bool, cursor int64, err error) {
+	cursor = -1
+	if q.Has("live") {
+		if q.Get("live") != "long-poll" {
+			return false, 0, badInput("live must be long-poll (§7.7)")
+		}
+		live = true
+	}
+	if q.Has("cursor") {
+		c := q.Get("cursor")
+		n, perr := strconv.ParseInt(c, 10, 64)
+		if c == "" || strings.Trim(c, "0123456789") != "" || perr != nil {
+			return false, 0, badInput("cursor must be a decimal number (§7.7)")
+		}
+		cursor = n
+	}
+	return live, cursor, nil
+}
+
+// longPoll implements §7.7 for a log fetched by fetch, with the request's
+// cursor (liveQuery), -1 without one.
+func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header string, tags []string, reqCursor int64,
 	fetch func(ctx context.Context, since string) (*core.Log, error)) {
-	q := r.URL.Query()
-	for k := range q {
-		if k != "since" && k != "live" && k != "cursor" {
-			writeErr(w, badInput("unknown query parameter "+k))
-			return
-		}
-	}
-	since := q.Get("since")
-	if q.Get("live") != "long-poll" {
-		if q.Has("live") {
-			writeErr(w, badInput("live must be long-poll"))
-			return
-		}
-		return // caller redirects
-	}
+	since := r.URL.Query().Get("since")
 	interval := s.e.LongPollInterval()
 	now := time.Now()
 	current := now.UnixNano() / int64(interval)
-	var reqCursor int64 = -1
-	if c := q.Get("cursor"); c != "" {
-		n, err := strconv.ParseInt(c, 10, 64)
-		if err != nil || n < 0 {
-			writeErr(w, badInput("invalid cursor"))
-			return
-		}
-		if n > current+int64(time.Hour/interval) {
-			writeErr(w, badInput("cursor too far ahead"))
-			return
-		}
-		reqCursor = n
+	if reqCursor > current+int64(time.Hour/interval) {
+		writeErr(w, badInput("cursor too far ahead"))
+		return
 	}
 	deadline := time.Unix(0, (current+1)*int64(interval))
 	for {
@@ -116,8 +119,13 @@ func (s *Server) resourceLive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	live, cursor, err := liveQuery(r.URL.Query())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	lim := s.e.Limits().LogPageSize
-	if r.URL.Query().Get("live") == "" {
+	if !live {
 		h, err := s.e.ResourceHead(r.Context(), ns, name, creds(r))
 		if err != nil {
 			if s.writeErrShort(w, r, err) {
@@ -150,7 +158,7 @@ func (s *Server) resourceLive(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(302)
 		return
 	}
-	s.longPoll(w, r, ns, "X-Revision", resTags(ns, name), func(ctx context.Context, since string) (*core.Log, error) {
+	s.longPoll(w, r, ns, "X-Revision", resTags(ns, name), cursor, func(ctx context.Context, since string) (*core.Log, error) {
 		return s.e.ResourceLog(ctx, ns, name, "", since, lim, creds(r))
 	})
 }
@@ -161,8 +169,13 @@ func (s *Server) nsLive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	live, cursor, err := liveQuery(r.URL.Query())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	lim := s.e.Limits().LogPageSize
-	if r.URL.Query().Get("live") == "" {
+	if !live {
 		info, err := s.e.NamespaceHead(r.Context(), ns, creds(r))
 		if err != nil {
 			writeErr(w, err)
@@ -180,7 +193,7 @@ func (s *Server) nsLive(w http.ResponseWriter, r *http.Request) {
 	// The request's read check, while it holds, stands for its later
 	// reads, which are then shared with the other waiters (core/live.go).
 	var pass *core.LivePass
-	s.longPoll(w, r, ns, "X-Namespace-Revision", []string{"ns:" + ns}, func(ctx context.Context, since string) (*core.Log, error) {
+	s.longPoll(w, r, ns, "X-Namespace-Revision", []string{"ns:" + ns}, cursor, func(ctx context.Context, since string) (*core.Log, error) {
 		lg, p, err := s.e.NamespaceLiveLog(ctx, ns, since, lim, creds(r), pass)
 		pass = p
 		return lg, err

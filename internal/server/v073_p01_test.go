@@ -550,3 +550,29 @@ func TestV073BatchGestureHeaders(t *testing.T) {
 	}
 	expectShape(t, "malformed Gesture", e.do(req{method: "POST", path: "/ns/m/batch", body: map[string]any{"items": items}, author: "alice", hdr: map[string]string{"Gesture": "nope"}}))
 }
+
+// §7.7 (RH-40): live is absent or long-poll, an empty value included
+// otherwise 400; cursor is a decimal number, so cursor= and +5 are 400;
+// both before authorisation.
+func TestV073LiveQuery(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil)
+	e := f.tenv
+	k := newKey("pub")
+	e.mkNS("pub", map[string]any{"read": "public", "keys": []any{k.entry("*")}})
+	e.create("pub", "a", map[string]any{"n": 1}, e.grant(k, "user:w", []string{"pub"}, []string{"create"}))
+	for _, ns := range []string{"pub", "sec", "nowhere"} {
+		for _, base := range []string{"/r/" + ns + "/a/log", "/ns/" + ns + "/log"} {
+			for _, q := range []string{"live=", "live=sse", "live=Long-Poll", "live=long-poll&cursor=", "live=long-poll&cursor=%2B5",
+				"live=long-poll&cursor=+5", "live=long-poll&cursor=-1", "live=long-poll&cursor=1.0", "live=long-poll&cursor=x",
+				"live=long-poll&cursor=99999999999999999999", "cursor=", "cursor=x"} {
+				expectShape(t, base+"?"+q, e.get(base+"?"+q))
+			}
+		}
+	}
+	// Without live: the 302; with it and a decimal cursor: an answer.
+	expect(t, e.get("/r/pub/a/log"), 302)
+	expect(t, e.get("/ns/pub/log?cursor=0"), 302)
+	expect(t, e.get("/r/pub/a/log?live=long-poll&cursor=007"), 200)
+	expect(t, e.get("/ns/pub/log?live=long-poll"), 200)
+}
