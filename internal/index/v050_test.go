@@ -57,8 +57,10 @@ func TestMinAlwaysRedirects(t *testing.T) {
 		rematch:                curLoc,
 		"matches:" + rematch:   curLoc,
 		"schemas:" + schemasAt: curLoc,
-		first + "&min=" + at:   loc,
-		first + "&min=" + cur:  curLoc,
+		// A bare min is given once (§A.5, v0.73): more name the
+		// namespace.
+		"matches:" + first + "&min=matches:" + at:  loc,
+		"matches:" + first + "&min=matches:" + cur: curLoc,
 	} {
 		r := s.raw(loc+"&min="+m, "")
 		if r.status != 302 || r.header.Get("Location") != want {

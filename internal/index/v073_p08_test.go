@@ -484,6 +484,12 @@ func TestV073MinLackingKeys(t *testing.T) {
 		t.Fatalf("unfollowed min: %d %v", unf.status, unf.body)
 	}
 	lack := x.raw("/pub?min=e:"+id, bob)
+	// Each body's min lists the one refused (IX-10, §A.5); the rest alike.
+	if fmt.Sprint(unf.body["min"]) != "[unfollowed:"+id+"]" || fmt.Sprint(lack.body["min"]) != "[e:"+id+"]" {
+		t.Errorf("refused mins: %v, %v", unf.body["min"], lack.body["min"])
+	}
+	delete(unf.body, "min")
+	delete(lack.body, "min")
 	if lack.status != unf.status || fmt.Sprint(lack.body) != fmt.Sprint(unf.body) || lack.header.Get("Cache-Control") != unf.header.Get("Cache-Control") {
 		t.Errorf("a min naming a namespace whose keys the service lacks: %d %v %v, unlike an unfollowed one: %d %v %v",
 			lack.status, lack.body, lack.header, unf.status, unf.body, unf.header)

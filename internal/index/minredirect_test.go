@@ -213,8 +213,10 @@ func TestPurgeNSDuringPublish(t *testing.T) {
 		if b := s.search(refs, ""); len(b["namespaces"].(map[string]any)) != 0 {
 			t.Errorf("%s: /_refs covers %v", when, b["namespaces"])
 		}
-		if r := s.raw(refs+"&min=matches:"+purged, ""); r.status != 400 {
-			t.Errorf("%s: /_refs with min of the purge: %d %v", when, r.status, r.body)
+		// A min naming a purged namespace counts as reached, without a
+		// read check (§A.5, v0.71): to the current at, without min.
+		if r := s.raw(refs+"&min=matches:"+purged, ""); r.status != 302 || strings.Contains(r.header.Get("Location"), "min=") {
+			t.Errorf("%s: /_refs with min of the purge: %d %v %s", when, r.status, r.body, r.header.Get("Location"))
 		}
 	}
 	check("before the publish")

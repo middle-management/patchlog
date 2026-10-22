@@ -43,10 +43,15 @@ import (
 // and maximum as for other queries), strictly after after, {ns}/{name}
 // compared as the pair split at its first "/"; next is the after of the
 // following page. ?min={ns}:{ns_id}, repeatable, waits as elsewhere
-// (§A.5); a min for a namespace the answer doesn't cover is 400. min always
-// redirects (§A.5): once every min is reached, on an at URL whose answer
-// is kept and includes every min, to that URL without min, otherwise to
-// the current at, in the reader's subject set either way. Redirects name the query in its canonical form (§A.5,
+// (§A.5); a min naming a purged namespace the service follows counts as
+// reached, without a read check, one naming a namespace whose keys it
+// can't fetch for now is 503 behind if the reader may see it, and one for
+// any other namespace the answer doesn't cover is 400, the body's min
+// listing every one refused (refsMins). min always redirects (§A.5): once
+// every min is reached, on an at URL whose answer is kept and includes
+// every min, to that URL without min, otherwise (and after a purged one)
+// to the current at, in the reader's subject set either way. Redirects
+// name the query in its canonical form (§A.5,
 // derived.CanonicalQuery), and an at URL in another form is redirected to
 // it.
 //
@@ -117,10 +122,17 @@ func parseRefsQuery(v url.Values) (*refsQuery, error) {
 	if err != nil {
 		return nil, err
 	}
+	var bare *MinError
 	for _, m := range q.Mins {
 		if m.NS == "" {
-			return nil, errors.New("min must be {ns}:{ns_id}")
+			if bare == nil {
+				bare = &MinError{Msg: "min must be {ns}:{ns_id}"}
+			}
+			bare.Refused = append(bare.Refused, m.String())
 		}
+	}
+	if bare != nil {
+		return nil, bare
 	}
 	rq := &refsQuery{ref: ref, mins: q.Mins, limit: q.Limit}
 	if s := v.Get("after"); s != "" {
@@ -327,7 +339,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	vals := r.URL.Query()
 	rq, err := parseRefsQuery(vals)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
+		writeQueryErr(w, err)
 		return
 	}
 	// The namespaces the answer may cover: reached and not purged as
@@ -378,13 +390,21 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		redirect(w, "/_refs/g/"+rd.gs+"/at/"+at+derived.CanonicalQuery(vals))
 		return
 	}
-	for _, m := range rq.mins {
-		if !slices.Contains(rd.nss, m.NS) {
-			w.Header().Set("Cache-Control", "no-store")
-			writeErr(w, http.StatusBadRequest, "bad_input", minElsewhere)
-			return
-		}
+	mins, purged, refused, behind, err := ix.refsMins(ctx, r, rd, rq.mins)
+	switch {
+	case err != nil:
+		ix.opt.Logf("index: access check for a min of /_refs: %v", err)
+		w.Header().Set("Cache-Control", "no-store")
+		writeErr(w, http.StatusBadGateway, "upstream", "cannot read a namespace configuration")
+		return
+	case len(refused) > 0:
+		writeMinRefused(w, refused)
+		return
+	case behind:
+		writeBehind(w, "the index cannot obtain the keys of a namespace min names yet")
+		return
 	}
+	rq.mins = mins
 	// target is the canonical URL of the answer at an at (§A.5): what
 	// redirects name, what answers are kept under, and the view a sealed
 	// hit is bound to (§E.2.6). Only it is answered 200: another form of
@@ -398,7 +418,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached min yet")
 		return
 	}
-	if at != "" {
+	if at != "" && !purged {
 		if st, _, ok := ix.refsStored(ctx, rd, target(at)); ok && ix.refsIncludes(ctx, st, rq.mins) {
 			// A kept answer, whose at already includes every min:
 			// answered there, at its canonical URL without min (§A.5).
@@ -429,6 +449,74 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		return
 	}
 	ix.writeRefs(w, r, rd, cur, st)
+}
+
+// refsMins judges the mins of a /_refs request before any is waited for
+// (§A.4 Coverage, §A.5) and returns those to wait for. A min naming a
+// namespace the answer covers stays. One naming a purged namespace the
+// service follows counts as reached, without a read check, a purge being
+// no secret (§E.4): purged reports it, and the answer then goes to the
+// current at. One naming a namespace whose keys the service can't fetch
+// for now, which the answer leaves out until it can, is behind (§12.1),
+// as a query of it is, if the reader may see it. Any other is refused:
+// refused lists every one, as given, for one 400 whose message doesn't
+// tell a namespace the reader can't see from one the service doesn't
+// follow. err is the document of a namespace the grant names that the
+// service can't read (502).
+func (ix *Index) refsMins(ctx context.Context, r *http.Request, rd *refsReader, mins []MinRef) (keep []MinRef, purged bool, refused []string, behind bool, err error) {
+	var (
+		g       *grant.Grant
+		decoded bool
+	)
+	for _, m := range mins {
+		if slices.Contains(rd.nss, m.NS) {
+			keep = append(keep, m)
+			continue
+		}
+		if !ix.known(m.NS) {
+			refused = append(refused, m.String())
+			continue
+		}
+		if ix.purgedNS(ctx, m.NS) {
+			purged = true
+			continue
+		}
+		reason, lacks := ix.keys.Skip(m.NS)
+		if reason == "" || lacks {
+			// Not reached yet, or one the reader can't see (refsReader
+			// left it out), or whose keys the service lacks.
+			refused = append(refused, m.String())
+			continue
+		}
+		if !decoded {
+			g, _ = ix.checker.Decode(bearer(r)) // nil: no usable grant
+			decoded = true
+		}
+		_, aerr := ix.refsAccess(ctx, m.NS, r, g)
+		var ae *grant.AuthError
+		switch {
+		case client.IsPurged(aerr):
+			purged = true
+		case errors.As(aerr, &ae):
+			refused = append(refused, m.String())
+		case aerr != nil:
+			return nil, false, nil, false, fmt.Errorf("%s: %w", m.NS, aerr)
+		default:
+			behind = true
+		}
+	}
+	return keep, purged, refused, behind, nil
+}
+
+// purgedNS reports whether ns, a namespace the service follows, is purged:
+// as committed, or, for a sealed one purged before the service learnt of
+// it, as its document says (410, §8.5), read with the service's own grant.
+func (ix *Index) purgedNS(ctx context.Context, ns string) bool {
+	if _, purged, err := ix.committed(ctx, ns); err == nil && purged {
+		return true
+	}
+	_, err := ix.checker.Config(ctx, ns)
+	return client.IsPurged(err)
 }
 
 // refsIncludes reports whether an answer's at includes every min: its

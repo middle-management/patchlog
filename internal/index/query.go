@@ -42,9 +42,10 @@ import (
 //	after=name          without q or sort, hits are in resource order and after is a
 //	                    resource name, a plain bound, as /_refs pages (§A.4)
 //	after=position      with q or sort, the opaque value a "next" gave
-//	min=ns_id           read-your-writes (§A.5): an ns_id of the queried namespace, or
-//	min=ns:ns_id        ns:ns_id for any namespace the service follows; repeatable, and
-//	                    every one must be reached
+//	min=ns_id           read-your-writes (§A.5): an ns_id of the queried namespace, once
+//	                    (the same value twice is one, as min is a set), or
+//	min=ns:ns_id        ns:ns_id for any namespace the service follows, repeatable; every
+//	                    one must be reached
 //
 // A fields path that no schema indexed in the namespace for a document the
 // reader may see marks with x-index, a facet or counts path none of them
@@ -90,6 +91,24 @@ func ParseRefFilter(s string) (*RefFilter, error) {
 
 // MinRef is one ?min= value (§A.5).
 type MinRef struct{ NS, ID string }
+
+// String is m as given: {ns}:{ns_id}, or a bare ns_id.
+func (m MinRef) String() string {
+	if m.NS == "" {
+		return m.ID
+	}
+	return m.NS + ":" + m.ID
+}
+
+// MinError is a 400 for mins refused (§A.5): its body's min lists them, as
+// given, so a tool drops them (Refused; malformed ones too, as the tree
+// service lists them).
+type MinError struct {
+	Msg     string
+	Refused []string
+}
+
+func (e *MinError) Error() string { return e.Msg }
 
 // ParseMin parses "{ns_id}" or "{ns}:{ns_id}" (§A.5, §B.5).
 func ParseMin(s string) (MinRef, error) {
@@ -156,12 +175,34 @@ func ParseQuery(v url.Values) (*Query, error) {
 				return nil, err
 			}
 		case "min":
+			// A set (§A.5): the same value twice is one. A bare ns_id is
+			// given once, on a query of one namespace; only {ns}:{ns_id}
+			// repeats.
+			var bad *MinError
+			seen, bare := map[MinRef]bool{}, 0
 			for _, s := range vals {
 				m, err := ParseMin(s)
 				if err != nil {
-					return nil, err
+					if bad == nil {
+						bad = &MinError{Msg: err.Error()}
+					}
+					bad.Refused = append(bad.Refused, s)
+					continue
+				}
+				if seen[m] {
+					continue
+				}
+				seen[m] = true
+				if m.NS == "" {
+					bare++
 				}
 				q.Mins = append(q.Mins, m)
+			}
+			if bad != nil {
+				return nil, bad
+			}
+			if bare > 1 {
+				return nil, fmt.Errorf("min={ns_id} given more than once; name other namespaces as min={ns}:{ns_id}")
 			}
 		case "sort":
 			// One parameter, keys comma-separated: the canonical form

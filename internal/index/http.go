@@ -38,6 +38,14 @@ var validNS = client.ValidNSName
 // doesn't tell which private namespaces exist and are indexed.
 const minElsewhere = "min names a namespace the service does not follow or the reader can't see"
 
+// strictMins reads §A.5 literally on a query of one namespace (F-I1): its
+// checkpoint covers that namespace alone, so a min naming any other is
+// 400, as one naming a namespace the current checkpoint doesn't cover. Off,
+// as until the question is answered: the v0.51 behaviour stays, and such a
+// min, naming a namespace the service follows and the reader may see, is
+// waited for and then redirected to the current checkpoint.
+const strictMins = false
+
 // Handler returns the query API (§A.4):
 //
 //	GET /{ns}?…                   302 → /{ns}/at/{checkpoint}?…            (head pointer)
@@ -245,7 +253,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	vals := r.URL.Query()
 	q, err := ParseQuery(vals)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
+		writeQueryErr(w, err)
 		return
 	}
 	a, err := ix.access(ctx, ns, r)
@@ -319,44 +327,19 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		redirect(w, base(a, ns)+"/at/"+at+derived.CanonicalQuery(vals))
 		return
 	}
-	// A min naming another namespace, which this URL's at doesn't cover,
-	// goes to the current checkpoint once reached (atIncludes judges only
-	// ns), in one hop, if the service follows it and the reader may see
-	// it; any other is 400 (§A.5), with one message either way, as in
-	// /_refs, so a min doesn't tell which private namespaces are indexed.
-	// A namespace whose keys the service lacks is one it doesn't follow
-	// (§A.4): no checkpoint will cover it.
-	lacks := func(other string) bool { _, l := ix.keys.Skip(other); return l }
-	for i, m := range q.Mins {
-		switch {
-		case m.NS == "":
-			q.Mins[i].NS = ns
-		case m.NS == ns:
-		case !ix.known(m.NS) || lacks(m.NS):
-			w.Header().Set("Cache-Control", "no-store")
-			writeErr(w, http.StatusBadRequest, "bad_input", minElsewhere)
-			return
-		default:
-			_, err := ix.access(ctx, m.NS, r)
-			if client.IsPurged(err) {
-				// A purged sealed namespace's document is 410 (§8.5):
-				// the core makes the read check, as for ns above, and a
-				// reader who passes goes to the current checkpoint, which
-				// has reached the purge.
-				_, err = ix.checker.PurgedRead(ctx, m.NS, bearer(r))
-			}
-			if err != nil {
-				var ae *grant.AuthError
-				w.Header().Set("Cache-Control", "no-store")
-				if !errors.As(err, &ae) {
-					ix.opt.Logf("index: access check for %s: %v", m.NS, err)
-					writeErr(w, http.StatusBadGateway, "upstream", "cannot read the namespace configuration")
-					return
-				}
-				writeErr(w, http.StatusBadRequest, "bad_input", minElsewhere)
-				return
-			}
-		}
+	refused, behind, err := ix.judgeMins(ctx, r, ns, q.Mins, strictMins)
+	switch {
+	case err != nil:
+		ix.opt.Logf("index: access check for a min: %v", err)
+		w.Header().Set("Cache-Control", "no-store")
+		writeErr(w, http.StatusBadGateway, "upstream", "cannot read the namespace configuration")
+		return
+	case len(refused) > 0:
+		writeMinRefused(w, refused)
+		return
+	case behind:
+		writeBehind(w, "the index cannot obtain the keys of a namespace min names yet")
+		return
 	}
 	// target is the canonical URL of this query's result at an ns_id (§A.5):
 	// what redirects name, what results are kept under, and in a sealed or
@@ -732,6 +715,57 @@ func (ix *Index) atIncludes(ctx context.Context, ns, at string, mins []MinRef, u
 	return true
 }
 
+// judgeMins judges the mins of a query of ns (a bare one names ns, and is
+// set to) before any is waited for (§A.5). A min naming another namespace,
+// which this URL's at doesn't cover, goes to the current checkpoint once
+// reached (atIncludes judges only ns), in one hop, if the service follows
+// it and the reader may see it; with strict, or naming any other, it is
+// refused. refused lists every refused min as given, so the 400 names them
+// all, with one message whatever the reason, as in /_refs, so a min
+// doesn't tell which private namespaces are indexed. A namespace whose keys
+// the service lacks is one it doesn't follow (§A.4): no checkpoint will
+// cover it. One whose keys it can't fetch for now is behind (§12.1), as a
+// query of it is, and as /_refs answers it: the reader may see it, so a
+// 400 would have its tool drop a min it can still wait for. err is a
+// namespace document the service can't read (502).
+func (ix *Index) judgeMins(ctx context.Context, r *http.Request, ns string, mins []MinRef, strict bool) (refused []string, behind bool, err error) {
+	for i, m := range mins {
+		switch {
+		case m.NS == "":
+			mins[i].NS = ns
+			continue
+		case m.NS == ns:
+			continue
+		case strict || !ix.known(m.NS):
+			refused = append(refused, m.String())
+			continue
+		}
+		reason, lacks := ix.keys.Skip(m.NS)
+		if lacks {
+			refused = append(refused, m.String())
+			continue
+		}
+		_, err := ix.access(ctx, m.NS, r)
+		if client.IsPurged(err) {
+			// A purged sealed namespace's document is 410 (§8.5): the core
+			// makes the read check, as for ns, and a reader who passes goes
+			// to the current checkpoint, which has reached the purge.
+			_, err = ix.checker.PurgedRead(ctx, m.NS, bearer(r))
+			reason = ""
+		}
+		var ae *grant.AuthError
+		switch {
+		case errors.As(err, &ae):
+			refused = append(refused, m.String())
+		case err != nil:
+			return nil, false, fmt.Errorf("%s: %w", m.NS, err)
+		case reason != "":
+			behind = true
+		}
+	}
+	return refused, behind, nil
+}
+
 // waitMins waits, within one MinWait budget, until every min is reached.
 func (ix *Index) waitMins(ctx context.Context, mins []MinRef) bool {
 	if len(mins) == 0 {
@@ -801,6 +835,29 @@ func writeBehind(w http.ResponseWriter, msg string) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Retry-After", "1")
 	writeErr(w, http.StatusServiceUnavailable, "behind", msg)
+}
+
+// writeMinRefused answers 400 for refused mins (§A.5, §12.1): no-store,
+// with every one refused, as given, in the body's min, and one message for
+// a namespace the reader can't see and one the service doesn't follow.
+func writeMinRefused(w http.ResponseWriter, refused []string) {
+	writeMinErr(w, &MinError{Msg: minElsewhere, Refused: refused})
+}
+
+func writeMinErr(w http.ResponseWriter, e *MinError) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusBadRequest, map[string]any{"code": "bad_input", "message": e.Msg, "min": e.Refused})
+}
+
+// writeQueryErr answers a query that doesn't parse: 400, listing malformed
+// mins as refused ones are.
+func writeQueryErr(w http.ResponseWriter, err error) {
+	var me *MinError
+	if errors.As(err, &me) {
+		writeMinErr(w, me)
+		return
+	}
+	writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
 }
 
 // writePurged answers 410 purged with head, the namespace's purge-ns entry,
