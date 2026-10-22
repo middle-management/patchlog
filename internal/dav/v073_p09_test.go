@@ -219,3 +219,63 @@ func TestV073RawTypeKept(t *testing.T) {
 		t.Fatalf("a tree's pic: %s", typeOf(item))
 	}
 }
+
+// A successful raw save is always stored with the uploaded bytes and
+// answered with the new revision as ETag (§H.1 "Identity", §H.4, GW-6):
+// a version the user had, saved unchanged over someone else's bytes, is
+// a 409 like any other save over them, nothing written, also where it
+// would restore the user's own DELETE; a save of the bytes the head
+// holds writes nothing and answers the head; a restore of the user's own
+// DELETE with the bytes the file had is stored and answered with its
+// revision.
+func TestV073RawSaveAlwaysStored(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs", "priv"}, nil, map[string]map[string]any{"priv": {"nonce": "required"}})
+	theirs := func(name string) {
+		t.Helper()
+		h, _ := e.load("docs", name)
+		bid := must(e.c.UploadBlob(e.ctx, "docs", name, "text/plain", "", []byte("theirs")))
+		must(e.c.Append(e.ctx, "docs", name, h.ID, []any{replace("/$blob", bid), replace("/size", 6)}))
+	}
+	e.rawDoc("docs", "c.txt", "text/plain", []byte("one"), nil)
+	e.expect(e.do("GET", "/docs/c.txt", ""), 200, "GET")
+	theirs("c.txt")
+	h, _ := e.load("docs", "c.txt")
+	e.expect(e.do("PUT", "/docs/c.txt", "one"), 409, "PUT the version read, unchanged, over theirs")
+	e.expectLive("docs", "c.txt", h, "after the refused save")
+
+	// After the user's own DELETE: the delete is undone, theirs kept.
+	e.rawDoc("docs", "e.txt", "text/plain", []byte("one"), nil)
+	e.expect(e.do("GET", "/docs/e.txt", ""), 200, "GET")
+	theirs("e.txt")
+	e.expect(e.do("DELETE", "/docs/e.txt", ""), 204, "DELETE")
+	e.expect(e.do("PUT", "/docs/e.txt", "one"), 409, "PUT the version read, unchanged, after the user's DELETE of theirs")
+	if hd, _ := e.load("docs", "e.txt"); hd.State != client.Live {
+		t.Fatalf("e.txt %v", hd.State)
+	}
+	if _, data := e.rawOf("docs", "e.txt"); string(data) != "theirs" {
+		t.Fatalf("e.txt %q", data)
+	}
+
+	for _, ns := range []string{"docs", "priv"} {
+		p := "/" + ns + "/d.txt"
+		r := e.expect(e.do("PUT", p, "same"), 201, "PUT "+p)
+		h, _ := e.load(ns, "d.txt")
+		if r.header.Get("ETag") != `"`+h.ID+`"` {
+			t.Fatalf("%s: ETag %q, head %s", p, r.header.Get("ETag"), h.ID)
+		}
+		r = e.expect(e.do("PUT", p, "same"), 201, "PUT the head's bytes again "+p)
+		if r.header.Get("ETag") != `"`+h.ID+`"` {
+			t.Fatalf("%s: a save of the head's bytes: ETag %q, head %s", p, r.header.Get("ETag"), h.ID)
+		}
+		e.expectLive(ns, "d.txt", h, "after a save of the head's bytes")
+		// Deleted by the user, then written again with the same bytes:
+		// restored as it was, which holds them.
+		e.expect(e.do("DELETE", p, ""), 204, "DELETE "+p)
+		r = e.expect(e.do("PUT", p, "same"), 201, "PUT after the DELETE "+p)
+		h, _ = e.load(ns, "d.txt")
+		if h.State != client.Live || r.header.Get("ETag") != `"`+h.ID+`"` {
+			t.Fatalf("%s restored: %v, ETag %q, head %s", p, h.State, r.header.Get("ETag"), h.ID)
+		}
+	}
+}
