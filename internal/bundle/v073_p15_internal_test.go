@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/merge"
 )
 
 // §7.2, §8.1 (GB-55): an import batch failing because the target moved
@@ -33,5 +34,26 @@ func TestV073P15TargetMoved(t *testing.T) {
 		if got := targetMoved(c.ae); got != c.want {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// §F.3, §G.4.4 (carry-over): the bundle's side is replayed onto the
+// target, as a branch's is in a merge, so a copy it makes from a path the
+// target changed since the common ancestor conflicts; a copy on the
+// target's side from a path the bundle changed doesn't.
+func TestV073P15ImportCopyFromConflicts(t *testing.T) {
+	anc := map[string]any{"title": "T", "score": "0-0"}
+	cp := func(from, path string) []client.Step {
+		return []client.Step{client.PatchStep([]any{map[string]any{"op": "copy", "from": from, "path": path}})}
+	}
+	set := func(path string, v any) []client.Step {
+		return []client.Step{client.PatchStep([]any{map[string]any{"op": "replace", "path": path, "value": v}})}
+	}
+	cs := sides(anc, true, cp("/title", "/subtitle"), set("/title", "U"), false)
+	if len(cs) != 1 || cs[0].Kind != merge.ConflictOverlap || len(cs[0].Paths) != 1 || cs[0].Paths[0] != "/title" {
+		t.Fatalf("incoming copy from a path the target changed: %+v", cs)
+	}
+	if cs := sides(anc, true, set("/score", "1-0"), cp("/score", "/half"), false); len(cs) != 0 {
+		t.Fatalf("a target copy from a path the bundle changed: %+v", cs)
 	}
 }
