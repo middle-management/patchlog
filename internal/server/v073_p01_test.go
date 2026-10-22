@@ -680,3 +680,30 @@ func TestV073PatchBodiesNameDocumentSize(t *testing.T) {
 	expectLimit(t, e.do(req{method: "PATCH", path: "/ns/c", ifNoneMatch: "*", body: addRoot(map[string]any{"x-a": pad}), author: "admin"}), 413, "documentSize", int64(bound+1), 64<<10)
 	expectLimit(t, e.branch("b", map[string]any{"name": "b1", "patches": ops(op("add", "/x-a", pad))}, "alice"), 413, "documentSize", int64(bound+1), 64<<10)
 }
+
+// §3.5, §C.3 (CIS-8, F-B4): source.origin is the RFC 6454 ASCII
+// serialisation, so a host in Unicode (its A-label is the serialisation)
+// or percent-encoded is the batch's own 400, recorded nowhere; the
+// A-label is recorded.
+func TestV073SourceOriginASCII(t *testing.T) {
+	t.Parallel()
+	for _, o := range []string{"https://bücher.example", "https://exämple.com:8443", "https://b%C3%BCcher.example", "https://xn--bcher-kva.example/ü"} {
+		if canonicalOrigin(o) {
+			t.Errorf("canonicalOrigin(%q) = true", o)
+		}
+	}
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	id := hashID(t, "", []byte("x"))
+	items := []any{map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}
+	before := e.nsHead("m")
+	for _, o := range []string{"https://bücher.example", "https://exämple.com:8443"} {
+		src := map[string]any{"origin": o, "ns": "rel", "at": id}
+		expectShape(t, o, e.batchReq("m", map[string]any{"items": items, "source": src}, "alice"))
+	}
+	if e.nsHead("m") != before {
+		t.Fatal("a refused source was recorded")
+	}
+	src := map[string]any{"origin": "https://xn--bcher-kva.example", "ns": "rel", "at": id}
+	expect(t, e.batchReq("m", map[string]any{"items": items, "source": src}, "alice"), 201)
+}
