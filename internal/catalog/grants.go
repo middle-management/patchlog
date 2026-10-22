@@ -489,7 +489,7 @@ func (s *Service) decideRead(ctx context.Context, v *grant.Verified, vis *visibi
 		e["public"] = true
 		return nil, nil
 	}
-	p, err := s.planRead(ctx, v, vis, item)
+	p, err := s.planRead(ctx, vis, item)
 	if err != nil {
 		return nil, err
 	}
@@ -1125,7 +1125,7 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 // listings use, itemRoles), so a hidden item is answered as one without a
 // placement (noRole), as Restore's read check answers it, and the grant
 // carries those roles.
-func (s *Service) planRead(ctx context.Context, v *grant.Verified, vis *visibility, item string) (_ *plan, err error) {
+func (s *Service) planRead(ctx context.Context, vis *visibility, item string) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	ns, name, ok := tree.ParseHref(item)
 	if !ok {
