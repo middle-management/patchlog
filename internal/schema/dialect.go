@@ -53,9 +53,6 @@ func init() {
 	}
 }
 
-// IsFormat reports whether f is a format draft 2020-12 defines.
-func IsFormat(f string) bool { return formats2020[f] }
-
 // v073Formats are the formats V073 registers over the library's own: the
 // two it lacks, and the two it asserts that draft 2020-12 doesn't define,
 // which are annotations there.
