@@ -273,3 +273,65 @@ func TestV073PrivateGsMarkers(t *testing.T) {
 		t.Errorf("a rule on /now, /_refs: %s", loc)
 	}
 }
+
+// TestV073ForeignGs (IX-16, §A.4, §B.11.5): a grant reads only at its own
+// gs: at another gs's at URL it is 403 forbidden, no-store, with or
+// without min, on a query and on /_refs; without a grant /_refs answers
+// 401. Only the pointer and an at URL without /g/{gs} redirect into the
+// reader's gs.
+func TestV073ForeignGs(t *testing.T) {
+	t.Parallel()
+	w := v073P22Setup(t)
+	x := w.x
+	at := x.ix.Checkpoint("pa")
+	bobGs, amyGs := x.gsOf("pb", w.bob), x.gsOf("pa", w.amy)
+	q := "?to=" + url.QueryEscape("/r/target/x")
+	_, bobRefs, bobLoc := x.refsPointer(q, w.bob)
+	for _, p := range []string{
+		"/pa/g/" + bobGs + "/at/" + at + "?limit=5",
+		"/pa/g/" + bobGs + "/at/" + at + "?limit=5&min=pa:" + at,
+		bobLoc, bobLoc + "&min=pa:" + at,
+	} {
+		r := x.raw(p, w.amy)
+		if r.status != 403 || r.body["code"] != "forbidden" || r.header.Get("Cache-Control") != "no-store" || r.header.Get("Location") != "" {
+			t.Errorf("%s: %d %v %v", p, r.status, r.body, r.header)
+		}
+	}
+	if r := x.raw(bobLoc, ""); r.status != 401 || r.body["code"] != "unauthenticated" {
+		t.Errorf("/_refs at bob's gs without a grant: %d %v", r.status, r.body)
+	}
+	// Redirected into the reader's own gs: the pointer, and an at URL
+	// without /g/{gs}.
+	own := "/pa/g/" + amyGs + "/at/" + at + "?limit=5"
+	for _, p := range []string{"/pa?limit=5", "/pa/at/" + at + "?limit=5"} {
+		if r := x.raw(p, w.amy); r.status != 302 || r.header.Get("Location") != own {
+			t.Errorf("%s: %d %s", p, r.status, r.header.Get("Location"))
+		}
+	}
+	if r := x.raw(own, w.amy); r.status != 200 {
+		t.Errorf("own gs: %d %v", r.status, r.body)
+	}
+	if _, gs, _ := x.refsPointer(q, w.amy); gs == bobRefs {
+		t.Errorf("amy shares bob's /_refs gs %s", gs)
+	}
+}
+
+// TestV073PrivatePointerNoStore (IX-17, §A.4 table): a 302 whose Location
+// adds /g/{gs} is Cache-Control: private, no-store, on a query and on
+// /_refs, as is any redirect decided by a grant; a public pointer keeps
+// the head-pointer class.
+func TestV073PrivatePointerNoStore(t *testing.T) {
+	t.Parallel()
+	w := v073P22Setup(t)
+	x := w.x
+	q := "/_refs?to=" + url.QueryEscape("/r/target/x")
+	for _, p := range []string{"/pa?limit=5", "/pa/at/" + x.ix.Checkpoint("pa") + "?limit=5", q} {
+		r := x.raw(p, w.amy)
+		if r.status != 302 || !strings.Contains(r.header.Get("Location"), "/g/") || r.header.Get("Cache-Control") != "private, no-store" {
+			t.Errorf("%s: %d %s %v", p, r.status, r.header.Get("Location"), r.header)
+		}
+	}
+	if r := x.raw("/pub?limit=5", ""); r.status != 302 || r.header.Get("Cache-Control") != "public, max-age=0, s-maxage=1, stale-while-revalidate=5" {
+		t.Errorf("public pointer: %d %v", r.status, r.header)
+	}
+}

@@ -378,11 +378,18 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 			w.Header().Set("Surrogate-Control", "no-store")
 		}
 	}
-	// Another subject set's URL space: redirected into the reader's. With
-	// min, the redirects below land there, without min (§A.5).
-	if at != "" && gs != rd.gs && len(rq.mins) == 0 {
-		setPtr()
-		redirect(w, "/_refs/g/"+rd.gs+"/at/"+at+derived.CanonicalQuery(vals))
+	// Another subject set's URL space: a grant reads only at its own gs
+	// (§A.4, §B.11.5), so it is 403 there, with or without min, never
+	// redirected; a request without one, which needs one for that gs, is
+	// 401. Only the pointer redirects into the reader's.
+	if at != "" && gs != rd.gs {
+		w.Header().Set("Cache-Control", "no-store")
+		if bearer(r) == "" {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeErr(w, http.StatusUnauthorized, "unauthenticated", "missing or unverifiable grant")
+			return
+		}
+		writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
 		return
 	}
 	mins, purged, refused, behind, err := ix.refsMins(ctx, r, rd, rq.mins)

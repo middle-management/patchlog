@@ -124,7 +124,8 @@ func TestMinAlwaysRedirectsPrivate(t *testing.T) {
 	// pointer, min goes straight to the reader's own at URL, without min.
 	for _, p := range []string{atLoc + "&min=" + wr.NSID, "/sec?limit=5&min=sec:" + wr.NSID, "/sec/at/" + at + "?limit=5&min=" + wr.NSID, "/sec?limit=5&min=" + wr.NSID} {
 		r := x.raw(p, bob)
-		if r.status != 302 || r.header.Get("Location") != atLoc || r.header.Get("Cache-Control") != "private, no-cache" {
+		// A redirect that adds /g/{gs} is private, no-store (§A.4, v0.73).
+		if r.status != 302 || r.header.Get("Location") != atLoc || r.header.Get("Cache-Control") != "private, no-store" {
 			t.Errorf("%s: %d %s %v", p, r.status, r.header.Get("Location"), r.header)
 		}
 	}

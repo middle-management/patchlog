@@ -24,7 +24,7 @@ import (
 const (
 	ccHeadPointer = "public, max-age=0, s-maxage=1, stale-while-revalidate=5"
 	ccImmutable   = "public, max-age=86400, s-maxage=31536000, immutable"
-	ccPrivatePtr  = "private, no-cache"
+	ccPrivatePtr  = "private, no-store"
 	ccPrivateImm  = "private, max-age=300"
 	cdnImmutable  = "max-age=31536000"
 )
@@ -74,9 +74,10 @@ const strictMins = false
 // whose kept result already includes every min to itself without min,
 // anything else to the current checkpoint.
 //
-// Private namespaces need Authorization: Bearer <grant>; a request without
-// the right gs is redirected to it (with min, by the redirect above, into
-// the reader's URL space).
+// Private namespaces need Authorization: Bearer <grant>, which reads only
+// under its own gs: an at URL of another gs is 403; the head pointer and
+// an at URL without /g/{gs} are redirected into the reader's (with min, by
+// the redirect above), private, no-store (§A.4, §B.11.5).
 //
 // Sealed and e2e namespaces (§E.2.5, §E.2.6; package derived). A result
 // has one source, so a reader of the whole namespace gets it sealed as one
@@ -304,8 +305,9 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			w.Header().Set("Cache-Control", ccHeadPointer)
 			w.Header().Set("Cache-Tag", "ns:"+ns)
 		} else {
-			// A pointer depends on the caller's grant: no shared cache
-			// keeps it, behind a verifying edge or not.
+			// A pointer depends on the caller's grant: no cache keeps
+			// it, behind a verifying edge or not, and one that adds
+			// /g/{gs} is private, no-store (§A.4, §B.11.5).
 			w.Header().Set("Cache-Control", ccPrivatePtr)
 			w.Header().Set("CDN-Cache-Control", "no-store")
 			w.Header().Set("Surrogate-Control", "no-store")
@@ -313,13 +315,24 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		}
 	}
 	// The reader's URL space: public, or keyed by its subject set. The
-	// head pointer /{ns} is everyone's, and redirects there below; an at
-	// URL of another space is redirected to the same at in the reader's.
-	// With min, the redirects below land there, without min (§A.5).
-	if isAt && gs != a.gs && len(q.Mins) == 0 {
-		setPtrHeaders()
-		redirect(w, base(a, ns)+"/at/"+at+derived.CanonicalQuery(vals))
-		return
+	// head pointer /{ns} is everyone's, and redirects there below. A grant
+	// reads only at its own gs (§A.4, §B.11.5): an at URL of another
+	// subject set is 403, with or without min, never redirected. An at URL
+	// without /g/{gs} of a private namespace, or one with it of a public
+	// one, which no grant decides, is redirected to the same at in the
+	// reader's space; with min, the redirects below land there, without
+	// min (§A.5).
+	if isAt && gs != a.gs {
+		if gs != "" && !a.public {
+			w.Header().Set("Cache-Control", "no-store")
+			writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
+			return
+		}
+		if len(q.Mins) == 0 {
+			setPtrHeaders()
+			redirect(w, base(a, ns)+"/at/"+at+derived.CanonicalQuery(vals))
+			return
+		}
 	}
 	refused, behind, err := ix.judgeMins(ctx, r, ns, q.Mins, strictMins)
 	switch {
