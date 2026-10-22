@@ -131,8 +131,9 @@ type Options struct {
 	// revisions they were served, the content they wrote), for every user
 	// together (default the larger of 128 MiB and 8 times MaxFileSize);
 	// over it, the user keeping the most gives way first. RecordIdle drops
-	// a document's versions untouched that long (default a day). They
-	// outlive the user's scratch files.
+	// a document's versions untouched that long (default a day), which then
+	// count as evicted (§H.4): a save without a tag is refused until a
+	// reload. They outlive the user's scratch files.
 	RecordBytes int
 	RecordIdle  time.Duration
 	// MaxPrincipals bounds the users a gateway keeps state for (§H.7), the

@@ -325,3 +325,71 @@ func TestV073NewFileOverMovedAway(t *testing.T) {
 		t.Fatalf("q %v", h.State)
 	}
 }
+
+// Records last a day, and a path whose records expired counts as
+// evicted (§H.4 "Records", GW-24): a save without a tag is then a 409
+// asking for a reload, never one with no base that writes over what
+// others changed; also once the idle user's records are swept, whose
+// marks are kept; and a path record that expired still refuses a save
+// of a path that now names another file. A document touched within the
+// day keeps every record, the version an editor opened with them.
+func TestV073ExpiredRecordsEvicted(t *testing.T) {
+	t.Parallel()
+	c := newClock()
+	e := treeEnv(t, func(_ *clienttest.Options, o *dav.Options) { o.Now = c.now })
+
+	// A document untouched for a day.
+	e.create("matches", "x", map[string]any{"a": "1", "b": "1"})
+	buf := e.expect(e.do("GET", "/matches/x.json", ""), 200, "GET x").body
+	e.theirs("matches", "x", replace("/b", "theirs"))
+	e.rawDoc("matches", "r.txt", "text/plain", []byte("one"), nil)
+	e.expect(e.do("GET", "/matches/r.txt", ""), 200, "GET r.txt")
+	h, _ := e.load("matches", "r.txt")
+	bid := must(e.c.UploadBlob(e.ctx, "matches", "r.txt", "text/plain", "", []byte("theirs")))
+	must(e.c.Append(e.ctx, "matches", "r.txt", h.ID, []any{replace("/$blob", bid), replace("/size", 6)}))
+	// A document read, then read again by another program 20 h later.
+	e.create("matches", "w", map[string]any{"a": "1", "b": "1"})
+	wbuf := e.expect(e.do("GET", "/matches/w.json", ""), 200, "GET w (the editor)").body
+	e.theirs("matches", "w", replace("/b", "theirs"))
+	// A tree's file read under its path.
+	e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET derby.json")
+
+	c.add(20 * time.Hour)
+	e.expect(e.do("GET", "/matches/w.json", ""), 200, "GET w (a preview)")
+	c.add(5 * time.Hour)
+	e.expect(e.do("PUT", "/matches/w.json", edit(t, wbuf, `"a": "1"`, `"a": "mine"`)), 201, "PUT w, touched within the day")
+	_, doc := e.load("matches", "w")
+	sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
+
+	hx, _ := e.load("matches", "x")
+	e.expect(e.do("PUT", "/matches/x.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 409, "PUT x after 25 h")
+	e.expectLive("matches", "x", hx, "x after the refusal")
+	hr, _ := e.load("matches", "r.txt")
+	e.expect(e.do("PUT", "/matches/r.txt", "mine"), 409, "PUT r.txt after 25 h")
+	e.expectLive("matches", "r.txt", hr, "r.txt after the refusal")
+	buf = e.expect(e.do("GET", "/matches/x.json", ""), 200, "the reload").body
+	e.expect(e.do("PUT", "/matches/x.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT x after the reload")
+	_, doc = e.load("matches", "x")
+	sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
+
+	// The path's file replaced by another (deleted, a new item placed
+	// under its title): the expired path record refuses the save.
+	hd, _ := e.load("cat", "matches.derby")
+	must(e.c.Delete(e.ctx, "cat", "matches.derby", hd.ID))
+	e.create("matches", "derby2", map[string]any{"title": "Derby 2"})
+	e.create("cat", "matches.derby2", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
+	h2, _ := e.load("matches", "derby2")
+	e.expect(e.do("PUT", "/cat/Season/derby.json", rendered(map[string]any{"title": "mine"})), 409, "PUT a path that names another file now")
+	e.expectLive("matches", "derby2", h2, "derby2 after the refusal")
+
+	// Swept, the idle user's records leave marks: still a 409.
+	e.create("matches", "z", map[string]any{"a": "1", "b": "1"})
+	buf = e.expect(e.do("GET", "/matches/z.json", ""), 200, "GET z").body
+	e.theirs("matches", "z", replace("/b", "theirs"))
+	c.add(25 * time.Hour)
+	e.expect(e.do("PROPFIND", "/", "", "Depth", "0"), 207, "a request after a day (sweeps)")
+	c.add(2 * time.Minute)
+	hz, _ := e.load("matches", "z")
+	e.expect(e.do("PUT", "/matches/z.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 409, "PUT z after the sweep")
+	e.expectLive("matches", "z", hz, "z after the refusal")
+}

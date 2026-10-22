@@ -310,8 +310,9 @@ func TestSaveRangeReadNoBase(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/x.json", edit(t, editor, `"A"`, `"Mine"`)), 201, "PUT after it: the reload")
 }
 
-// Records last a day (§H.4): after it, a save without a tag has no base,
-// and the file as written wins.
+// Records last a day (§H.4): after it they count as evicted, so a save
+// without a tag is a 409, never written over others' edits as one with
+// no base would be, and after the reload it asks for the save merges.
 func TestSaveRecordsForADay(t *testing.T) {
 	t.Parallel()
 	c := newClock()
@@ -328,9 +329,11 @@ func TestSaveRecordsForADay(t *testing.T) {
 	buf = e.expect(e.do("GET", "/docs/y.json", ""), 200, "GET").body
 	e.theirs("docs", "y", replace("/b", "theirs"))
 	c.add(25 * time.Hour)
-	e.expect(e.do("PUT", "/docs/y.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT after 25 h")
+	e.expect(e.do("PUT", "/docs/y.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 409, "PUT after 25 h")
+	buf = e.expect(e.do("GET", "/docs/y.json", ""), 200, "the reload").body
+	e.expect(e.do("PUT", "/docs/y.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT after the reload")
 	_, doc = e.load("docs", "y")
-	sameJSON(t, doc, map[string]any{"a": "mine", "b": "1"})
+	sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
 }
 
 // A write moments after the user's own DELETE restores the file rebased

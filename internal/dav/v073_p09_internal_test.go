@@ -1,6 +1,10 @@
 package dav
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+	"time"
+)
 
 // A raw file's type (§H.1): the name's extension, else the upload's
 // Content-Type unless it says nothing of the bytes, else the existing
@@ -33,5 +37,48 @@ func TestV073FileTypeOrder(t *testing.T) {
 		if got := fileType(c.name, c.ctype, c.had, c.body); got != c.want {
 			t.Errorf("fileType(%q, %q, %q, %q) = %q, want %q", c.name, c.ctype, c.had, c.body, got, c.want)
 		}
+	}
+}
+
+// The records of an idle user are retired past the sweep (GW-24): each
+// document they had records of stays a lost mark, and its path records
+// stay, at most maxRetiredMarks of each, for at most maxRetired users,
+// the least recently used going first.
+func TestV073RetiredRecordsBounded(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	s := &Server{opt: Options{Now: func() time.Time { return now }, RecordIdle: time.Hour, RecordBytes: 1 << 20}, recRoots: map[string]*recStore{}}
+	for i := 0; i < maxRetired+3; i++ {
+		p := s.newPrincipal(fmt.Sprintf("u%d", i))
+		for j := 0; j < 2; j++ {
+			s.remember(p, "docs", fmt.Sprintf("d%d", j), record{rev: "r"}, false)
+		}
+		s.notePath(p, "/docs/d0.json", "docs", "d0")
+		now = now.Add(time.Second)
+	}
+	big := s.newPrincipal("big")
+	for j := 0; j < maxRetiredMarks+10; j++ {
+		s.remember(big, "docs", fmt.Sprintf("d%d", j), record{rev: "r"}, false)
+		s.notePath(big, fmt.Sprintf("/docs/d%d.json", j), "docs", fmt.Sprintf("d%d", j))
+	}
+	now = now.Add(2 * time.Hour)
+	s.recMu.Lock()
+	s.sweepRecordsLocked(now)
+	n := len(s.recRoots)
+	_, oldest := s.recRoots["u0"]
+	rs := s.recRoots["big"]
+	s.recMu.Unlock()
+	if n != maxRetired || oldest {
+		t.Fatalf("%d users' records kept (u0 among them: %v), want %d", n, oldest, maxRetired)
+	}
+	if rs == nil || rs.docs.Len() != 0 || rs.forgotten.Len() != maxRetiredMarks || rs.paths.Len() != maxRetiredMarks || s.recBytes != 0 {
+		t.Fatalf("retired: %d docs, %d marks, %d paths, %d bytes", rs.docs.Len(), rs.forgotten.Len(), rs.paths.Len(), s.recBytes)
+	}
+	last := fmt.Sprintf("d%d", maxRetiredMarks+9)
+	if d := s.recordsOf(big, "docs", last); !d.lost || len(d.rs) != 0 {
+		t.Fatalf("%s after the sweep: %+v", last, d)
+	}
+	if ns, name, ok := s.pathOf(big, "/docs/"+last+".json"); !ok || ns != "docs" || name != last {
+		t.Fatalf("path record after the sweep: %q %q %v", ns, name, ok)
 	}
 }
