@@ -2,6 +2,7 @@ package seal
 
 import (
 	"bytes"
+	"crypto/hpke"
 	"errors"
 	"strings"
 	"testing"
@@ -191,6 +192,73 @@ func TestV073LegacyPLAccepted(t *testing.T) {
 	} {
 		if _, err := OpenExpect(c.jwe, k, c.kid, c.want); !errors.Is(err, ErrMismatch) {
 			t.Errorf("%s: err = %v, want ErrMismatch", name, err)
+		}
+	}
+}
+
+// ---- ENC-7: the HPKE info of wrapped keys (§E.2.3, v0.63) ----
+
+// The info is "patchlog-key-v1" 0x0A kid 0x0A name, name empty for K_e, so
+// that K_e's info ends in 0x0A; checked against crypto/hpke with the info
+// spelled out, both ways.
+func TestV073WrapInfo(t *testing.T) {
+	_, priv, err := GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk, _ := hpke.NewDHKEMPublicKey(priv.PublicKey())
+	sk, _ := hpke.NewDHKEMPrivateKey(priv)
+	k := NewKey()
+	for _, c := range []struct{ resource, info string }{
+		{"", "patchlog-key-v1\nns#3\n"},
+		{"derby", "patchlog-key-v1\nns#3\nderby"},
+	} {
+		w, err := WrapKey(priv.PublicKey(), "ns#3", c.resource, k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(w.Wrapped) != 32+KeySize+16 {
+			t.Fatalf("wrapped is %d bytes, want enc (32) and ct (48)", len(w.Wrapped))
+		}
+		if got, err := hpke.Open(sk, hpke.HKDFSHA256(), hpke.AES256GCM(), []byte(c.info), w.Wrapped); err != nil || !bytes.Equal(got, k) {
+			t.Fatalf("info %q: %v", c.info, err)
+		}
+		other, _ := hpke.Seal(pk, hpke.HKDFSHA256(), hpke.AES256GCM(), []byte(c.info), k)
+		if got, err := UnwrapKey(priv, WrappedKey{Kid: "ns#3", Resource: c.resource, Wrapped: other}); err != nil || !bytes.Equal(got, k) {
+			t.Fatalf("UnwrapKey with info %q: %v", c.info, err)
+		}
+		// The pre-v0.63 info no longer opens.
+		if _, err := hpke.Open(sk, hpke.HKDFSHA256(), hpke.AES256GCM(), legacyWrapInfo("ns#3", c.resource), w.Wrapped); err == nil {
+			t.Fatalf("resource %q: opened under the legacy info", c.resource)
+		}
+	}
+}
+
+// Keys wrapped under the pre-v0.63 info ("patchlog-keys-v1" 0x0A kid,
+// then 0x0A resource for a K_r) open with UnwrapKeyLegacy only, for
+// migrating stored keyrings.
+func TestV073UnwrapKeyLegacy(t *testing.T) {
+	_, priv, _ := GenerateRecipient()
+	pk, _ := hpke.NewDHKEMPublicKey(priv.PublicKey())
+	k := NewKey()
+	for _, c := range []struct{ resource, info string }{
+		{"", "patchlog-keys-v1\nns#3"},
+		{"derby", "patchlog-keys-v1\nns#3\nderby"},
+	} {
+		old, err := hpke.Seal(pk, hpke.HKDFSHA256(), hpke.AES256GCM(), []byte(c.info), k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := WrappedKey{Kid: "ns#3", Resource: c.resource, Wrapped: old}
+		if got, err := UnwrapKeyLegacy(priv, w); err != nil || !bytes.Equal(got, k) {
+			t.Fatalf("legacy %q: %v", c.info, err)
+		}
+		if _, err := UnwrapKey(priv, w); !errors.Is(err, ErrDecrypt) {
+			t.Fatalf("UnwrapKey opened a legacy wrap: %v", err)
+		}
+		w.Kid = "ns#4"
+		if _, err := UnwrapKeyLegacy(priv, w); !errors.Is(err, ErrDecrypt) {
+			t.Fatalf("legacy wrap under another kid: %v", err)
 		}
 	}
 }

@@ -166,23 +166,32 @@ func GenerateRecipient() (jwk map[string]any, priv *ecdh.PrivateKey, err error) 
 // AEAD AES-256-GCM 0x0002.
 const Suite = "hpke-base-0x0020-0x0001-0x0002"
 
-// WrapInfoPrefix prefixes the HPKE info string: info = prefix ‖ context.
-const WrapInfoPrefix = "patchlog-keys-v1\n"
+// WrapInfoPrefix starts the HPKE info of every wrapped key (§E.2.3):
+// info = "patchlog-key-v1" ‖ 0x0A ‖ kid ‖ 0x0A ‖ name.
+const WrapInfoPrefix = "patchlog-key-v1\n"
 
 // WrappedKey is the wire form of a key wrapped to one recipient:
 //
 //	{ "kid": "{ns}#{e}", "resource"?: name, "suite": Suite, "wrapped": base64url(enc ‖ ct) }
 //
-// The HPKE context is kid, or kid ‖ "\n" ‖ resource for a per-resource key,
-// so a wrapped key can't be presented as another epoch's or resource's.
+// The HPKE info binds kid and the resource name (wrapInfo), so a wrapped
+// key can't be presented as another epoch's or resource's.
 type WrappedKey struct {
 	Kid      string
 	Resource string // "" for an epoch key
 	Wrapped  []byte // HPKE enc ‖ ciphertext
 }
 
-func wrapContext(kid, resource string) []byte {
-	c := WrapInfoPrefix + kid
+// wrapInfo is the HPKE info of kid's key: K_r of resource, or K_e with
+// resource "", whose info then ends in 0x0A (§E.2.3).
+func wrapInfo(kid, resource string) []byte {
+	return []byte(WrapInfoPrefix + kid + "\n" + resource)
+}
+
+// legacyWrapInfo is the info keys were wrapped under before v0.63:
+// "patchlog-keys-v1" ‖ 0x0A ‖ kid, then 0x0A ‖ resource for a K_r only.
+func legacyWrapInfo(kid, resource string) []byte {
+	c := "patchlog-keys-v1\n" + kid
 	if resource != "" {
 		c += "\n" + resource
 	}
@@ -194,7 +203,8 @@ var (
 	hpkeAEAD = hpke.AES256GCM()
 )
 
-// WrapKey wraps key (K_e, or K_r when resource is non-empty) for recipient.
+// WrapKey wraps key (K_e, or K_r when resource is non-empty) for recipient
+// in HPKE base mode with an empty aad (§E.2.3).
 func WrapKey(recipient *ecdh.PublicKey, kid, resource string, key []byte) (WrappedKey, error) {
 	if len(key) != KeySize {
 		return WrappedKey{}, ErrKeySize
@@ -203,7 +213,7 @@ func WrapKey(recipient *ecdh.PublicKey, kid, resource string, key []byte) (Wrapp
 	if err != nil {
 		return WrappedKey{}, err
 	}
-	w, err := hpke.Seal(pk, hpkeKDF, hpkeAEAD, wrapContext(kid, resource), key)
+	w, err := hpke.Seal(pk, hpkeKDF, hpkeAEAD, wrapInfo(kid, resource), key)
 	if err != nil {
 		return WrappedKey{}, err
 	}
@@ -212,11 +222,23 @@ func WrapKey(recipient *ecdh.PublicKey, kid, resource string, key []byte) (Wrapp
 
 // UnwrapKey recovers the key in w with the recipient's private key.
 func UnwrapKey(priv *ecdh.PrivateKey, w WrappedKey) ([]byte, error) {
+	return unwrapBase(priv, wrapInfo(w.Kid, w.Resource), w.Wrapped)
+}
+
+// UnwrapKeyLegacy recovers a key wrapped before v0.63, under the old info
+// (legacyWrapInfo), such as an entry of a keyring stored then. Such
+// keyrings must be wrapped again (KeyringV2); this is only for reading
+// them to do so.
+func UnwrapKeyLegacy(priv *ecdh.PrivateKey, w WrappedKey) ([]byte, error) {
+	return unwrapBase(priv, legacyWrapInfo(w.Kid, w.Resource), w.Wrapped)
+}
+
+func unwrapBase(priv *ecdh.PrivateKey, info, wrapped []byte) ([]byte, error) {
 	sk, err := hpke.NewDHKEMPrivateKey(priv)
 	if err != nil {
 		return nil, err
 	}
-	k, err := hpke.Open(sk, hpkeKDF, hpkeAEAD, wrapContext(w.Kid, w.Resource), w.Wrapped)
+	k, err := hpke.Open(sk, hpkeKDF, hpkeAEAD, info, wrapped)
 	if err != nil || len(k) != KeySize {
 		return nil, ErrDecrypt
 	}
