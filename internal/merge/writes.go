@@ -34,8 +34,13 @@ type sideChange struct {
 // foldWrites folds entries (log entries or steps) onto start and computes
 // the writes of §6.4.1 under the merge array rule of §F.3: a write whose
 // last segment addresses an array element (an index, or "-") counts as a
-// write to the whole array.
-func foldWrites(start docState, steps []client.Step) (*sideChange, error) {
+// write to the whole array. countCopyFrom adds the from of every copy
+// (under the same rule): the branch side of a replay counts it, the
+// target side doesn't (§F.3, §11.3).
+//
+// A patch set on an absent resource is a create, and applies to the
+// document null (§6.2 step 3).
+func foldWrites(start docState, steps []client.Step, countCopyFrom bool) (*sideChange, error) {
 	sc := &sideChange{final: start}
 	st := &sc.final
 	for i, s := range steps {
@@ -59,34 +64,42 @@ func foldWrites(start docState, steps []client.Step) (*sideChange, error) {
 			return nil, err
 		}
 		// A patch set after a tombstone restores: it applies to the last
-		// live document (§8.2).
-		st.deleted = false
+		// live document (§8.2). One on an absent resource creates it from
+		// null.
+		if !st.exists {
+			st.doc = nil
+		}
+		st.exists, st.deleted = true, false
 		sc.revs = true
 		for j, op := range ops {
 			pre := st.doc
-			nd, ws, err := patch.Apply(st.doc, st.exists, []patch.Op{op}, patch.Options{ResourceEnvelope: true})
+			nd, ws, err := patch.Apply(st.doc, true, []patch.Op{op}, patch.Options{ResourceEnvelope: true})
 			if err != nil {
 				return nil, fmt.Errorf("merge: step %d op %d: %w", i, j, err)
 			}
-			st.doc, st.exists = nd, true
-			switch op.Op {
-			case "remove":
-				for _, w := range ws {
-					sc.writes = append(sc.writes, arrayRule(pre, w))
-				}
-			case "move":
-				if len(ws) == 2 {
-					sc.writes = append(sc.writes, arrayRule(pre, ws[0]), arrayRule(nd, ws[1]))
-				}
-			default:
-				for _, w := range ws {
-					sc.writes = append(sc.writes, arrayRule(nd, w))
-				}
+			st.doc = nd
+			// A write is judged where it addresses something: a removed
+			// element in the document before the op, an added one after it
+			// (both, for a move's from, path and the arrays they shift).
+			for _, w := range ws {
+				sc.writes = append(sc.writes, widen(pre, nd, w))
+			}
+			if countCopyFrom && op.Op == "copy" {
+				sc.writes = append(sc.writes, widen(pre, nd, op.From))
 			}
 		}
 	}
 	sc.writes = dedupe(sc.writes)
 	return sc, nil
+}
+
+// widen applies the array rule to w if its parent is an array in
+// either document.
+func widen(pre, post any, w pointer.Pointer) pointer.Pointer {
+	if a := arrayRule(pre, w); len(a) < len(w) {
+		return a
+	}
+	return arrayRule(post, w)
 }
 
 // arrayRule widens a write whose parent is an array to the whole array.
@@ -147,9 +160,21 @@ func Overlaps(a, b []pointer.Pointer) []string {
 
 // Writes computes the writes of applying patch sets (and "delete" steps)
 // to doc, under the array rule of §F.3. doc nil with exists false means an
-// absent resource (a genesis must come first).
+// absent resource, which a first patch set creates from null (§6.2).
+// These are a target side's writes; BranchWrites are a branch side's.
 func Writes(doc any, exists bool, steps []client.Step) ([]string, error) {
-	sc, err := foldWrites(docState{doc: doc, exists: exists}, steps)
+	sc, err := foldWrites(docState{doc: doc, exists: exists}, steps, false)
+	if err != nil {
+		return nil, err
+	}
+	return patch.WritesStrings(sc.writes), nil
+}
+
+// BranchWrites is Writes for the side whose entries are replayed (a
+// branch's, §F.3): the from of each copy counts too, since a replayed copy
+// takes whatever the other side left there (§F.3, §11.3).
+func BranchWrites(doc any, exists bool, steps []client.Step) ([]string, error) {
+	sc, err := foldWrites(docState{doc: doc, exists: exists}, steps, true)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +185,7 @@ func Writes(doc any, exists bool, steps []client.Step) ([]string, error) {
 // (a patch set after a tombstone restores). It returns the resulting
 // document and whether it is deleted.
 func ApplySteps(doc any, exists, deleted bool, steps []client.Step) (any, bool, error) {
-	sc, err := foldWrites(docState{doc: jsonv.Clone(doc), exists: exists, deleted: deleted}, steps)
+	sc, err := foldWrites(docState{doc: jsonv.Clone(doc), exists: exists, deleted: deleted}, steps, false)
 	if err != nil {
 		return nil, false, err
 	}

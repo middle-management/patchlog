@@ -5,6 +5,7 @@ import (
 	"crypto/ecdh"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/middle-management/patchlog/internal/client"
 )
@@ -18,8 +19,9 @@ type RebaseOptions struct {
 	New string
 	// Onto is the namespace the successor is created from; default the
 	// branch's own base. Retargeting a stacked branch onto its base's base
-	// after a fast-forward merge (§F.4) sets it; such a successor has a
-	// different base, so it can't be switched to.
+	// after a fast-forward merge (§F.4) sets it. Switch needs Onto in the
+	// branch's base chain, since only a branch of a namespace up that chain
+	// may be its successor (§7.4).
 	Onto string
 	// Switch freezes the old branch with successor: New once the first
 	// replay is clean and applied, then replays what the old branch got
@@ -29,6 +31,8 @@ type RebaseOptions struct {
 	// copied into the successor when it is created. Default: "read" and
 	// "cleanup", so a private draft stays private and keeps its cleanup
 	// policy (the successor otherwise starts as a copy of Onto's document).
+	// read is set whatever CopyConfig says: the old branch's, or "grant"
+	// where that would rank the successor below the old branch (§F.5).
 	CopyConfig []string
 	// Patches are further changes to the successor's namespace document
 	// in its creation request, after CopyConfig's: e.g. the drafts.for of a
@@ -102,7 +106,15 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 		onto = baseNS
 	}
 	if opt.Switch && onto != baseNS {
-		return nil, fmt.Errorf("merge: can't switch %s to a successor based on %s: a successor must have the same base (%s)", opt.Branch, onto, baseNS)
+		// A successor is a branch of the same base, or of a namespace
+		// further up the old branch's base chain (§7.4, §F.5).
+		chain, err := baseChain(ctx, c, baseNS)
+		if err != nil {
+			return nil, err
+		}
+		if !slicesContains(chain, onto) {
+			return nil, fmt.Errorf("merge: can't switch %s to a successor based on %s: a successor must be a branch of a namespace in its base chain (%s)", opt.Branch, onto, strings.Join(chain, " → "))
+		}
 	}
 	lv, err := c.EncryptionLevel(ctx, opt.Branch)
 	if err != nil {
@@ -112,6 +124,10 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 	if e2e && opt.Plan.E2E == nil {
 		return nil, fmt.Errorf("merge: %s is an e2e namespace: rebasing it re-encrypts its changes under the successor's keys (§F.8) and needs a key-holding view (Plan.E2E)", opt.Branch)
 	}
+	old := docProtection(bdoc.Value)
+	if lv != "" {
+		old.level = lv // as served: "sealed" for a JWE document
+	}
 	keys := opt.CopyConfig
 	if keys == nil {
 		keys = []string{"read", "cleanup"}
@@ -119,12 +135,23 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 	var patches []any
 	for _, k := range keys {
 		switch k {
-		case "base", "frozen", "successor", "merged":
+		case "base", "frozen", "successor", "merged", "read":
 			continue
 		}
 		if v, ok := bdoc.Value[k]; ok {
 			patches = append(patches, map[string]any{"op": "add", "path": "/" + k, "value": v})
 		}
+	}
+	// The successor gets the old branch's read, or "grant" where that would
+	// rank it below the old branch (§F.5, §2.1), as for a sealed branch
+	// whose read is public. It starts as a copy of Onto's document, so its
+	// level is Onto's.
+	read, err := successorRead(ctx, c, old, onto)
+	if err != nil {
+		return nil, err
+	}
+	if _, had := bdoc.Value["read"]; had || read != old.read || !ontoReads(ctx, c, onto, read) {
+		patches = append(patches, map[string]any{"op": "add", "path": "/read", "value": read})
 	}
 	patches = append(patches, opt.Patches...)
 	out := &RebaseResult{New: opt.New}
@@ -157,6 +184,16 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 		if err := successorKeyring(ctx, opt.Plan.E2E, opt.Branch, onto, opt.New); err != nil {
 			return out, err
 		}
+	}
+
+	// Created or resumed, a successor that ranks below the old branch gets
+	// no replay (§F.5).
+	succ, err := nsProtection(ctx, c, opt.New)
+	if err != nil {
+		return out, err
+	}
+	if err := checkSuccessorRank(old, succ, opt.Branch, opt.New); err != nil {
+		return out, err
 	}
 
 	// The successor's merge batches of the branch are this rebase's own
@@ -219,6 +256,53 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 	}
 	out.CatchUpResult, err = catch.Apply(ctx)
 	return out, err
+}
+
+// baseChain lists ns and the namespaces up its base chain, nearest first
+// (local bases only: a remote base ends it).
+func baseChain(ctx context.Context, c *client.Client, ns string) ([]string, error) {
+	chain := []string{ns}
+	for i := 0; i < 64; i++ {
+		h, err := c.NSHead(ctx, ns)
+		if err != nil {
+			return nil, err
+		}
+		d, err := c.NSDoc(ctx, ns, h.ID)
+		if err != nil {
+			return nil, err
+		}
+		b, _ := d.Value["base"].(map[string]any)
+		next, _ := b["ns"].(string)
+		if _, remote := b["remote"]; next == "" || remote || slicesContains(chain, next) {
+			break
+		}
+		chain = append(chain, next)
+		ns = next
+	}
+	return chain, nil
+}
+
+// successorRead is the read a successor created from onto gets (§F.5): the
+// old branch's, or "grant" where, at onto's level, that would rank it below
+// the old branch as a source.
+func successorRead(ctx context.Context, c *client.Client, old protection, onto string) (string, error) {
+	lv, err := c.EncryptionLevel(ctx, onto)
+	if err != nil {
+		return "", err
+	}
+	sr, _ := old.source()
+	if tr, _ := (protection{level: lv, read: old.read}).target(); tr < sr {
+		return "grant", nil
+	}
+	return old.read, nil
+}
+
+// ontoReads reports whether onto's current document already has read, so
+// a successor copying it needs no read patch. An unreadable document
+// doesn't.
+func ontoReads(ctx context.Context, c *client.Client, onto, read string) bool {
+	p, err := nsProtection(ctx, c, onto)
+	return err == nil && p.read == read
 }
 
 // successorKeyring gives an e2e successor its own keyring (§F.8): its
