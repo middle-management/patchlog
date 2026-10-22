@@ -552,8 +552,17 @@ func (st *reqState) readOnly(ctx context.Context) *davError {
 	}
 	for _, p := range paths {
 		ns, _, _ := strings.Cut(strings.TrimPrefix(p, "/"), "/")
-		if cat := st.ownedBy(ctx, ns); cat != "" {
+		cat, unread, err := st.ownedBy(ctx, ns)
+		switch {
+		case err != nil:
+			if de, ok := upstream(err).(*davError); ok {
+				return de
+			}
+			return fail(http.StatusBadGateway, "%s: file tree settings couldn't be read: %v", p, err)
+		case cat != "":
 			return fail(http.StatusForbidden, "%s is read-only here: file tree %s owns the items of namespace %s (its catalog.files.ns, §H.2), so they are written, moved and deleted through /%s/, not in %s's flat view", p, cat, ns, cat, ns)
+		case unread != "":
+			return fail(http.StatusForbidden, "%s is read-only here for now: file tree %s may own the items of namespace %s (its catalog.files.ns, §H.2), whose flat view isn't written then, and its settings can't be read with your grant, nor were they read with another since this server started; they are once a user whose grant reads catalog %s opens /%s/", p, unread, ns, unread, unread)
 		}
 	}
 	return nil
@@ -561,11 +570,14 @@ func (st *reqState) readOnly(ctx context.Context) *davError {
 
 // ownedBy returns the served catalog whose file tree owns flat namespace
 // ns, the one its catalog.files.ns names (§H.2), "" for none: as the
-// token reads the catalog's settings (treeConf), else as last read with
-// any grant, the server's own at start included (learn).
-func (st *reqState) ownedBy(ctx context.Context, ns string) string {
+// token reads the catalog's settings (nsInfo), else as last read with
+// any grant, the server's own at start included (learn). Where some
+// served catalog's settings are known neither way (a gateway's start
+// reads them without a grant), it fails closed: unread names that
+// catalog, which may own ns; err is a read that failed for now.
+func (st *reqState) ownedBy(ctx context.Context, ns string) (owner, unread string, err error) {
 	if !st.s.flat[ns] {
-		return ""
+		return "", "", nil
 	}
 	cats := make([]string, 0, len(st.s.cats))
 	for cat := range st.s.cats {
@@ -573,15 +585,39 @@ func (st *reqState) ownedBy(ctx context.Context, ns string) string {
 	}
 	sort.Strings(cats)
 	for _, cat := range cats {
-		c, err := st.treeConf(ctx, cat)
-		if err != nil {
-			c, _ = st.s.learned(cat)
+		in, err := st.s.nsInfoErr(ctx, st.tk, cat)
+		var files *treeFiles
+		switch {
+		case err == nil && in.files != nil:
+			files = in.files
+			st.s.learn(cat, &catConf{files: in.files, trust: in.trust, titled: in.titled})
+		case err == nil && in.readErr == nil:
+			// Not a file tree.
+			st.s.learn(cat, nil)
+			continue
+		default:
+			// Not read with this token, refused or failed for now: as
+			// read with another grant.
+			c, ok := st.s.learned(cat)
+			switch {
+			case ok:
+				files = c.files
+			case st.s.settingsRead(cat):
+				continue
+			case err != nil:
+				return "", "", err
+			default:
+				if unread == "" {
+					unread = cat
+				}
+				continue
+			}
 		}
-		if c.files != nil && c.files.ns == ns {
-			return cat
+		if files != nil && files.ns == ns {
+			return cat, "", nil
 		}
 	}
-	return ""
+	return "", unread, nil
 }
 
 // allowed are the methods served (RFC 9110 §10.2.1 Allow).

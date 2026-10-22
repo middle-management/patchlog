@@ -856,3 +856,33 @@ func TestV073FolderCopyWithScratchDir(t *testing.T) {
 	}
 	e.expect(e.do("GET", "/cat/Season2/derby.json", ""), 200, "GET the copied file")
 }
+
+// A served tree's files.ns is read-only in the flat view (§H.2 "A file
+// tree is a catalog"). Which flat namespace a tree owns is in its
+// catalog's settings; where no grant has read them yet (a gateway's
+// start reads catalogs without one), every served flat namespace may be
+// that one, and its writes are refused, saying so, until a user whose
+// grant reads the catalog opens the tree: the rule fails closed, never
+// depending on other users' history (GW-22).
+func TestV073FilesNSReadOnlyFailsClosed(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	a.docsNS(t)
+	g := a.gateway(t, "", func(o *dav.Options) { o.Namespaces = []string{"matches", "docs"} })
+	u := a.k.Grant(t, a.s.Now(), "user:u", []string{"matches", "docs"}, []string{"read", "create", "append", "delete"})
+	for _, p := range []string{"/matches/new.json", "/docs/new.json"} {
+		r := g.expect(g.doAs(u, "PUT", p, `{"n": 1}`), 403, "PUT "+p+" while the tree's settings are unknown")
+		if !strings.Contains(r.body, "read-only here for now") || !strings.Contains(r.body, "file tree cat") {
+			t.Fatalf("PUT %s: %q", p, r.body)
+		}
+	}
+	if h := must(a.w.Head(a.ctx, "matches", "new")); h.State != client.NotFound {
+		t.Fatalf("matches/new made: %v", h.State)
+	}
+	g.propfindAs(a.k.Grant(t, a.s.Now(), "user:admin", a.both, []string{"read"}), "/cat/")
+	r := g.expect(g.doAs(u, "PUT", "/matches/new.json", `{"n": 2}`), 403, "PUT in files.ns once the tree's settings are known")
+	if !strings.Contains(r.body, "file tree cat owns the items of namespace matches") {
+		t.Fatalf("PUT in files.ns: %q", r.body)
+	}
+	g.expect(g.doAs(u, "PUT", "/docs/new.json", `{"n": 3}`), 201, "PUT in a flat namespace no tree owns, once that is known")
+}
