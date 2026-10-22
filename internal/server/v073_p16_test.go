@@ -1,9 +1,13 @@
 package server
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // P16: config writes, namespace and branch creation (§6.2, §7.4, §7.6,
@@ -381,4 +385,70 @@ func TestV073P16BranchLevelBeforeGuard(t *testing.T) {
 	expectInvalidAt(t, e.branch("sv", map[string]any{"name": "lv", "patches": lower}, sg), "/encryption")
 	expectCode(t, e.branch("sv", map[string]any{"name": "lv", "patches": ops(op("add", "/encryption/pad", true))}, bg), 403, "forbidden")
 	expect(t, e.branch("sv", map[string]any{"name": "lv"}, bg), 201)
+}
+
+// v0.73 §7.4 Branch fields, §7.6, §C.4 keys follow the base: a config
+// write to a branch keeps the entries its document holds that are * keys of
+// a base; a * key a base adds after the branch was created is in no branch
+// document, so a write that leaves it out, a branch's creation from a
+// branch included, removes nothing. An entry the branch holds without *
+// stays as it is when the base makes it a * key, and can't be removed.
+func TestV073P16BranchKeepsHeldStarKeysOnly(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t)
+	k1, k2, rk := newKey("k1"), newKey("k2"), newKey("rk")
+	e.mkNS("main", map[string]any{"read": "grant", "keys": []any{k1.entry("*"), rk.entry("read")}})
+	g1 := e.grant(k1, "user:admin", []string{"main", "b", "c", "d"}, allVerbs)
+	expect(t, e.branch("main", map[string]any{"name": "b"}, g1), 201)
+	expect(t, e.patchNS("main", ops(op("add", "/keys/-", k2.entry("*")), op("replace", "/keys/1/can", []any{"*"})), g1), 201)
+	expect(t, e.patchNS("b", ops(op("add", "/x-note", "unrelated")), g1), 201)
+	expect(t, e.branch("b", map[string]any{"name": "c"}, g1), 201)
+	// The copies the branches hold stay protected.
+	for _, ns := range []string{"b", "c"} {
+		expectInvalidAt(t, e.patchNS(ns, ops(op("remove", "/keys/0")), g1), "/keys")
+		expectInvalidAt(t, e.patchNS(ns, ops(op("replace", "/keys/0/can", []any{"read"})), g1), "/keys")
+		expectInvalidAt(t, e.patchNS(ns, ops(op("remove", "/keys/1")), g1), "/keys")
+	}
+	expectInvalidAt(t, e.branch("b", map[string]any{"name": "d", "patches": ops(op("remove", "/keys/0"))}, g1), "/keys")
+}
+
+// v0.73 §E.2.1 rotation, §C.4 revocation in bases: when a base replaces its
+// * key, its sealed branches rotate with it (rotate-on-revoke), and a
+// branch's scheduled rotation still passes: neither config write needs the
+// base's new * key in the branch's document (§7.4).
+func TestV073P16BranchRotatesAfterBaseStarKeyChange(t *testing.T) {
+	t.Parallel()
+	e := newSealedAuthEnv(t, func(o *core.Options) { o.RotateOnRevoke = true })
+	k1, k2 := newKey("k1"), newKey("k2")
+	e.mkNS("s", sealedDoc(map[string]any{"read": "grant", "keys": []any{k1.entry("*")}}))
+	can := []string{"config", "read", "branch"}
+	g1, g2 := e.grant(k1, "user:admin", []string{"s", "sb"}, can), e.grant(k2, "user:admin", []string{"s", "sb"}, can)
+	expect(t, e.branch("s", map[string]any{"name": "sb"}, g1), 201)
+	latest := func(ns, bearer string) int {
+		t.Helper()
+		keys, r := e.keysOf(ns, nil, bearer)
+		if keys == nil {
+			t.Fatalf("keys of %s: %d %s", ns, r.Code, r.Body)
+		}
+		ep := 0
+		for kid := range keys {
+			if _, n, _ := seal.ParseKid(kid); n > ep {
+				ep = n
+			}
+		}
+		return ep
+	}
+	if got := latest("sb", g1); got != 1 {
+		t.Fatalf("sb starts at epoch %d", got)
+	}
+	expect(t, e.patchNS("s", ops(op("add", "/keys/-", k2.entry("*")), op("remove", "/keys/0")), g1), 201)
+	if got := latest("s", g2); got != 2 {
+		t.Fatalf("base epoch %d after revoking k1, want 2", got)
+	}
+	if got := latest("sb", g2); got != 2 {
+		t.Fatalf("branch epoch %d after its base revoked k1, want 2", got)
+	}
+	if ep, err := e.e.RotateEpoch(context.Background(), "sb", core.RotateAuthor); err != nil || ep != 3 {
+		t.Fatalf("RotateEpoch(sb): epoch %d, %v; want 3", ep, err)
+	}
 }

@@ -358,7 +358,7 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any) (*Config, *Error)
 		// at the shadow, which has none.
 		for b := n; b.isBranch() && t.remoteShadow(b) == nil; {
 			b = t.nsByID(b.base.Int64)
-			if err := keepsStarKeys(cfg, b, t.config(b.configSeq)); err != nil {
+			if err := keepsStarKeys(cur, cfg, b, t.config(b.configSeq)); err != nil {
 				return nil, err
 			}
 		}
@@ -376,13 +376,22 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any) (*Config, *Error)
 	return cfg, nil
 }
 
-// keepsStarKeys refuses a branch's namespace document that removes or
+// keepsStarKeys refuses a branch's namespace document cfg that removes or
 // changes a key entry that is a * key of b, one of its bases, whose
-// configuration in force is bcfg (§7.4, §7.6): 422 at /keys.
-func keepsStarKeys(cfg *Config, b *nsRow, bcfg *Config) *Error {
+// configuration in force is bcfg (§7.4, §7.6): 422 at /keys. The entries
+// kept are those prev, the document the write starts from, holds with the
+// base's pub: keys follow the base (§C.4), so a * key the base adds or
+// replaces after the branch was created is in no branch document, and
+// leaving it out removes nothing. An entry prev holds without * may stay
+// so after the base makes it a * key.
+func keepsStarKeys(prev, cfg *Config, b *nsRow, bcfg *Config) *Error {
 	for kid, k := range bcfg.starKeys() {
+		pk, had := findKey(prev.Keys, kid)
+		if !had || string(pk.Pub) != string(k.Pub) {
+			continue
+		}
 		nk, ok := findKey(cfg.Keys, kid)
-		if !ok || string(nk.Pub) != string(k.Pub) || !nk.IsStar() {
+		if !ok || string(nk.Pub) != string(k.Pub) || pk.IsStar() && !nk.IsStar() {
 			return docInvalid("/keys", fmt.Sprintf("key %q is a * key of base %s and must be kept unchanged (§7.4, §7.6)", kid, b.name))
 		}
 	}

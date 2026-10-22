@@ -196,9 +196,10 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if cfg.DraftsFor != nil && base.isBranch() && t.draftRoot(base) == "" {
 		return nil, docInvalid("/drafts", "/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
 	}
-	// Every * key of the base, and of its local bases, is kept (§7.6).
+	// Every * key of the base is kept (§7.6), and every * key of its local
+	// bases that the base's document holds (keepsStarKeys).
 	for b := base; ; b = t.nsByID(b.base.Int64) {
-		if err := keepsStarKeys(cfg, b, t.config(b.configSeq)); err != nil {
+		if err := keepsStarKeys(bcfg, cfg, b, t.config(b.configSeq)); err != nil {
 			return nil, err
 		}
 		if !b.isBranch() || t.remoteShadow(b) != nil {
