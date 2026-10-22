@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -453,5 +454,127 @@ func TestV073FilePending(t *testing.T) {
 	x.caughtUp("cat", "files")
 	if f := fileOf(entriesOf(t, x.get("/cat/children?of=root", ""))["files.a"]); fmt.Sprint(f) != "map[absent:pending]" {
 		t.Errorf("a head not read for its file: %v", f)
+	}
+}
+
+// TC-7 (§B.5, §H.2): lookup?path= answers the node a path of titles names,
+// from a file tree's root folder, or, where root is hidden from the
+// reader, from its roots; titles compare after NFC and simple case
+// folding, numbered and escaped display names don't resolve, and siblings
+// sharing a title answer the earliest born, then node name.
+func TestV073Lookup(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	admin, reader := clienttest.NewKey("admin"), clienttest.NewKey("reader")
+	for _, ns := range []string{"files", "cat"} {
+		doc := map[string]any{"read": "grant", "keys": []any{admin.Entry("*"), reader.Entry("read")}}
+		if ns == "cat" {
+			doc["catalog"] = filesCatalog("files")
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	w := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:w", []string{"files", "cat"}, []string{"read", "create", "append"})))
+	node := func(name, title string, ps ...string) {
+		t.Helper()
+		must(w.CreateDoc(ctx, "cat", name, map[string]any{"title": title, "parents": parents(ps...)}))
+	}
+	file := func(item, title string, ps ...string) {
+		t.Helper()
+		must(w.CreateDoc(ctx, "files", item, map[string]any{"n": 1}))
+		node("files."+item, title, ps...)
+	}
+	node("root", "Root")
+	node("docs", "Docs", "root@a0")
+	file("a", "Report.txt", "docs@a0")
+	file("z", "Notes", "root@a1")
+	s.Clock.Advance(time.Minute)
+	file("c", "notes", "root@a2") // born later than files.z, though its name sorts first
+	node("k1", "Kelvin", "root@a3")
+	node("e1", "café", "root@a4")
+	node("dot", "a.", "root@a5")
+	node("strasse", "Straße", "root@a6")
+	x := startSvc(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:tree", []string{"files", "cat"}, []string{"read"}))), svcOpts{now: s.Now})
+	x.caughtUp("cat", "files")
+	whole := reader.Grant(t, s.Now(), "user:amy", []string{"cat", "files"}, []string{"read"})
+	lookup := func(path, tok string) resp {
+		t.Helper()
+		loc := x.atURL("/cat/lookup?path="+url.QueryEscape(path), tok)
+		return x.raw(loc, tok)
+	}
+	for path, want := range map[string]string{
+		"Docs":              "docs",
+		"docs/REPORT.TXT":   "files.a",
+		"Notes":             "files.z",
+		"NOTES":             "files.z",
+		"Kelvin":            "k1", // the Kelvin sign folds with k
+		"café":             "e1", // NFD
+		"straße":            "strasse",
+		"Docs/Report.txt/x": "",
+		"Notes (2)":         "", // a numbered display name
+		"a%2E":              "", // an escaped display name
+		"STRASSE":           "", // full folding, not simple
+		"Nope":              "",
+		"Root":              "", // root is where paths start
+		"Docs//Report.txt":  "",
+	} {
+		r := lookup(path, whole)
+		got := ""
+		if n, _ := r.body["node"].(map[string]any); n != nil {
+			got, _ = n["name"].(string)
+		}
+		switch {
+		case want == "" && (r.status != 404 || r.body["code"] != "not_found"):
+			t.Errorf("%q: %d %v", path, r.status, r.body)
+		case want != "" && (r.status != 200 || got != want):
+			t.Errorf("%q: %d %v, want %s", path, r.status, r.body, want)
+		}
+	}
+	if n := lookup("Notes", whole).body["node"].(map[string]any); n["born"] != bornOf(t, w, "cat", "files.z") || n["head"] == nil {
+		t.Errorf("node %v", n)
+	}
+	// Root hidden from the reader: from its roots, filtered like children.
+	scoped := reader.Grant(t, s.Now(), "user:bob", []string{"cat", "files"}, []string{"read"}, map[string]any{
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"docs", "files.a", "a"}}}}})
+	if r := lookup("Docs/Report.txt", scoped); r.status != 200 || r.body["node"].(map[string]any)["name"] != "files.a" {
+		t.Errorf("from the reader's roots: %d %v", r.status, r.body)
+	}
+	hidden, missing := lookup("Notes", scoped), lookup("Nope", scoped)
+	if hidden.status != 404 || hidden.body["message"] != missing.body["message"] {
+		t.Errorf("hidden %d %v, missing %d %v", hidden.status, hidden.body, missing.status, missing.body)
+	}
+	if r := x.raw(x.atURL("/cat/lookup", whole), whole); r.status != 400 {
+		t.Errorf("no path: %d", r.status)
+	}
+}
+
+// TC-7 (§B.5): lookup isn't offered in a catalog without files, nor in a
+// sealed or end-to-end one: 404 not_offered.
+func TestV073LookupNotOffered(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.folder(t, "root", "Root")
+	x := startSvc(t, w.c, svcOpts{})
+	x.caughtUp("cat", "matches")
+	if r := x.raw(x.atURL("/cat/lookup?path=Root", ""), ""); r.status != 404 || r.body["code"] != "not_offered" {
+		t.Errorf("without files: %d %v", r.status, r.body)
+	}
+
+	ctx := context.Background()
+	ks := must(keystore.New(keystore.Generate()))
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "files"))).CreateNamespace(ctx, "files", map[string]any{"read": "public", "keys": []any{k.Entry("*")}}))
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"encryption": map[string]any{"level": "sealed"}, "catalog": filesCatalog("files")}))
+	sw := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat", "files"}, []string{"read", "create"})), client.WithKeys(client.NewKeys(nil)))
+	createNonced(t, sw, "cat", "root", map[string]any{"parents": []any{}})
+	createNonced(t, sw, "cat", "docs", map[string]any{"title": "Docs", "parents": parents("root")})
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat", "files"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	y := startSvc(t, sc, svcOpts{now: s.Now})
+	y.caughtUp("cat", "files")
+	tok := k.Grant(t, s.Now(), "user:r", []string{"cat"}, []string{"read"})
+	if r := y.raw(y.atURL("/cat/lookup?path=Docs", tok), tok); r.status != 404 || r.body["code"] != "not_offered" {
+		t.Errorf("sealed: %d %v", r.status, r.body)
 	}
 }

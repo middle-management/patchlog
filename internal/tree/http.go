@@ -15,6 +15,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/files"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -402,7 +403,7 @@ func ScopeDigest(v *grant.Verified) string {
 }
 
 var ops = map[string]bool{
-	"children": true, "ancestors": true, "subtree": true, "roots": true,
+	"children": true, "lookup": true, "ancestors": true, "subtree": true, "roots": true,
 	"orphans": true, "problems": true, "where": true, "manifest": true,
 }
 
@@ -417,11 +418,11 @@ var ops = map[string]bool{
 // checkpoint (§B.11.5); the form before v0.51,
 // /{catalog}/at/{at}/g/{gs}/{op}?…, is moved permanently (301) to it. op
 // is one of
-// children?of=&after=&limit=, ancestors?of=, subtree?of=&depth=, roots,
-// orphans, problems, where?item=, manifest?of=.
+// children?of=&after=&limit=, lookup?path=, ancestors?of=,
+// subtree?of=&depth=, roots, orphans, problems, where?item=, manifest?of=.
 //
-// children, ancestors, subtree, roots and where show the nodes the reader
-// may see, and only paths through visible folders, with no trace of hidden
+// children, lookup, ancestors, subtree, roots and where show the nodes the
+// reader may see, and only paths through visible folders, with no trace of hidden
 // nodes (no counts); limits, cut markers and pagination count visible
 // nodes only (§B.11.5). orphans, problems and manifest aren't filtered:
 // they answer 403 unless the reader reads the catalog and the content
@@ -756,7 +757,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		s.opt.Logf("tree: sealing a listing: %v", err)
 		WriteError(w, http.StatusInternalServerError, "internal", "sealing failed")
 	case l.status != http.StatusOK:
-		WriteError(w, l.status, codeFor(l.status), l.msg)
+		code := l.code
+		if code == "" {
+			code = codeFor(l.status)
+		}
+		WriteError(w, l.status, code, l.msg)
 	case l.at != at:
 		// The checkpoint moved since the check: the listing is kept at
 		// the new one.
@@ -793,11 +798,12 @@ func (s *Service) purgedHead(err error) string {
 }
 
 // computed is a listing computed at an at, or why there is none (status,
-// msg).
+// msg, and code where it isn't the status's, codeFor).
 type computed struct {
 	st     derived.Stored
 	at     string
 	status int
+	code   string
 	msg    string
 }
 
@@ -814,6 +820,12 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	fs, err := s.fileSealing(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if op == "lookup" && (!fs.on || info.Protected()) {
+		// Titles to look up by are a file tree's, and in the clear only
+		// outside sealed and e2e catalogs (§B.5, §H.3).
+		return &computed{at: s.At(), status: http.StatusNotFound, code: "not_offered",
+			msg: "lookup is offered only in a file tree (catalog.files) that is neither sealed nor end-to-end"}, nil
 	}
 	// A listing that seals values, the catalog's or an item's file
 	// metadata, is sealed once and then served unchanged (§E.2.6).
@@ -1528,6 +1540,8 @@ func (q *query) run(op string) (any, int, string) {
 	switch op {
 	case "children":
 		return q.children()
+	case "lookup":
+		return q.lookup()
 	case "ancestors":
 		return q.ancestors()
 	case "subtree":
@@ -1777,6 +1791,87 @@ func cursorBefore(cur Child, hasName bool, c Child) bool {
 		return false
 	}
 	return cur.Node.Name < c.Node.Name
+}
+
+// lookup answers the node a path of titles, joined with /, names (§B.5):
+// from the folder catalog.files.root of a file tree, or, where it is
+// hidden from the reader, from the reader's roots (§B.11.5), through
+// visible nodes only, as children lists them. Titles compare after NFC and
+// Unicode simple case folding (§H.2, files.TitleKey). Only a node's own
+// title counts: a name a tool shows in its place, numbered as a duplicate
+// or escaped, doesn't resolve, and the tool lists the folder. Where
+// siblings share a title the earliest born answers, then the node name. A
+// path that doesn't resolve to a visible node is 404, with one message
+// whether a node is hidden or missing. It isn't offered outside file
+// trees, nor in sealed or e2e catalogs (listing: 404 not_offered).
+func (q *query) lookup() (any, int, string) {
+	path := q.vals.Get("path")
+	if path == "" {
+		return nil, http.StatusBadRequest, "path is required"
+	}
+	var level []*Node
+	if root := q.g.Node(q.g.FilesRoot); root != nil && root.Live() && root.Kind == KindFolder && q.v.node(q.g, root) {
+		q.tags.node(q.g, root.Name)
+		level = q.childNodes(root.Name)
+	} else {
+		level = q.rootNodes()
+	}
+	segs := strings.Split(path, "/")
+	var n *Node
+	for i, seg := range segs {
+		if n = titled(level, seg); n == nil {
+			return nil, http.StatusNotFound, "no node at that path"
+		}
+		q.tags.node(q.g, n.Name)
+		if i < len(segs)-1 {
+			if n.Kind != KindFolder {
+				return nil, http.StatusNotFound, "no node at that path"
+			}
+			level = q.childNodes(n.Name)
+		}
+	}
+	return map[string]any{"at": q.at, "path": path, "node": q.entry(n)}, http.StatusOK, ""
+}
+
+// childNodes are the nodes of visibleChildren.
+func (q *query) childNodes(parent string) []*Node {
+	kids := q.visibleChildren(parent)
+	out := make([]*Node, len(kids))
+	for i, c := range kids {
+		out[i] = c.Node
+	}
+	return out
+}
+
+// titled is the node of nodes whose own title is title, compared as
+// siblings' are (§H.2, files.TitleKey): of several, the earliest born,
+// then the least node name (§B.5); nil if none.
+func titled(nodes []*Node, title string) *Node {
+	key := files.TitleKey(title, false)
+	var best *Node
+	for _, n := range nodes {
+		if n.Title == "" || files.TitleKey(n.Title, false) != key {
+			continue
+		}
+		if best == nil || bornBefore(n, best) {
+			best = n
+		}
+	}
+	return best
+}
+
+// bornBefore orders siblings that share a title (§B.5, §H.2): by born,
+// those whose born the service doesn't know last, then by node name.
+func bornBefore(a, b *Node) bool {
+	ta, ea := time.Parse(time.RFC3339Nano, a.Born)
+	tb, eb := time.Parse(time.RFC3339Nano, b.Born)
+	switch {
+	case (ea == nil) != (eb == nil):
+		return ea == nil
+	case ea == nil && !ta.Equal(tb):
+		return ta.Before(tb)
+	}
+	return a.Name < b.Name
 }
 
 func nonNil(a []any) []any {
