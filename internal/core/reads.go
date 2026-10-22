@@ -422,6 +422,14 @@ type Log struct {
 	Horizon   string
 	Archive   string // with Horizon: the archive holding the newest pruned entry, if any
 	Public    bool
+	// Purged is set on a namespace log of a purged namespace, which ends
+	// with its purge-ns entry: a namespace stream ends after it (§7.3,
+	// §8.5).
+	Purged bool
+	// Until is when the credential that admitted the read expires, zero
+	// if none bounds it (admission.go): an event stream ends there at the
+	// latest (§7.3).
+	Until time.Time
 }
 
 // ResourceLog serves /r/{ns}/{name}/rev/{id}/log?since= (§7.1). With id
@@ -441,13 +449,14 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, name); err != nil {
-			return err
+		a, aerr := t.reader(n, cred, name)
+		if aerr != nil {
+			return aerr
 		}
 		if n.purged {
 			return t.purgedRead(n)
 		}
-		out = &Log{Public: t.cachePublic(n)}
+		out = &Log{Public: t.cachePublic(n), Until: t.admittedUntil(n, cred, a)}
 		v := t.resolve(n, name, nil)
 		if v.state == Purged {
 			out.Status = 410
@@ -654,6 +663,8 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 	var nsRowID int64
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
+		var a *actor
+		var aerr *Error
 		switch {
 		case live != nil && live.shared:
 			// The waiters' passes stand for their read checks (live.go).
@@ -663,13 +674,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		case n == nil:
 			return t.absentNS(ns, cred)
 		case resource != "":
-			if _, err := t.reader(n, cred, resource); err != nil {
-				return err
+			if a, aerr = t.reader(n, cred, resource); aerr != nil {
+				return aerr
 			}
 		default:
-			a, err := t.nsReader(n, cred)
-			if err != nil {
-				return err
+			if a, aerr = t.nsReader(n, cred); aerr != nil {
+				return aerr
 			}
 			if live != nil {
 				live.decided(t, n, cred, a)
@@ -680,7 +690,10 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		if t.sealedPurged(n) {
 			return t.purgedRead(n)
 		}
-		out = &Log{Public: t.cachePublic(n)}
+		out = &Log{Public: t.cachePublic(n), Purged: n.purged}
+		if live == nil || !live.shared {
+			out.Until = t.admittedUntil(n, cred, a)
+		}
 		toSeq := n.headSeq.Int64
 		if resource != "" && since == "" {
 			out.Status, out.Last = 200, t.nsLogID(toSeq).String()

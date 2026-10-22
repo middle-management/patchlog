@@ -219,6 +219,11 @@ func (s *Server) nsLive(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// sseKeepAlive is how often an idle event stream sends a keep-alive
+// comment, after judging its read check again (§7.3). A variable for
+// tests.
+var sseKeepAlive = 30 * time.Second
+
 // sse writes one server-sent event.
 func sse(w http.ResponseWriter, event, id string, data any) {
 	sseRaw(w, event, id, string(jsonv.Canonical(jsonv.FromGo(toModel(data)))))
@@ -228,9 +233,19 @@ func sse(w http.ResponseWriter, event, id string, data any) {
 // JWE in sealed namespaces, Addendum E.2).
 func sseRaw(w http.ResponseWriter, event, id, data string) {
 	fmt.Fprintf(w, "event: %s\nid: %s\ndata: %s\n\n", event, id, data)
+	flush(w)
+}
+
+func flush(w http.ResponseWriter) {
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// sseKeepAliveComment writes the comment an idle stream sends.
+func sseKeepAliveComment(w http.ResponseWriter) {
+	fmt.Fprint(w, ": keep-alive\n\n")
+	flush(w)
 }
 
 // sseEntry writes entry i of lg: its JWE in a sealed namespace.
@@ -261,10 +276,28 @@ func startSSE(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(200)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
+	flush(w)
 }
+
+// admissionEnds returns a channel that fires when the credential an event
+// stream was admitted under expires (core.Log.Until, zero: never), by the
+// engine's clock, and a function to stop it. The stream ends there even
+// when idle (§7.3, §C.2, §C.5.3).
+func (s *Server) admissionEnds(until time.Time) (<-chan time.Time, func()) {
+	if until.IsZero() {
+		return nil, func() {}
+	}
+	t := time.NewTimer(max(until.Sub(s.e.Now()), 0))
+	return t.C, func() { t.Stop() }
+}
+
+// Event streams (§7.3) judge their read check again before each page they
+// send, as for a request made then: every page is a fetch, checked as any
+// read, and an idle stream fetches before each keep-alive comment, so a
+// grant revoked, a role withdrawn or a time rule that no longer holds ends
+// it without a write to wake it. It ends instead of sending anything when
+// a check fails, and at the latest when the credential it was admitted
+// under expires (admissionEnds).
 
 func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 	ns := r.PathValue("ns")
@@ -290,19 +323,26 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	startSSE(w)
+	expired, stop := s.admissionEnds(lg.Until)
+	defer stop()
 	for {
 		for i, e := range lg.Entries {
 			sseEntry(w, e["kind"].(string), lg, i)
 			since = e["id"].(string)
 		}
+		if lg.Purged && !lg.More {
+			// The namespace is purged and its purge-ns entry, the log's
+			// last, is sent (or was since): the stream ends (§7.3, §8.5).
+			return
+		}
+		keepAlive := false
 		if !lg.More {
 			select {
 			case <-wait:
-			case <-time.After(30 * time.Second):
-				fmt.Fprint(w, ": keep-alive\n\n")
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
+			case <-time.After(sseKeepAlive):
+				keepAlive = true
+			case <-expired:
+				return
 			case <-lifecycle.Stopping(r.Context()):
 				// The server is shutting down: end the stream; EventSource
 				// reconnects with Last-Event-ID (elsewhere).
@@ -317,6 +357,9 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 		lg, err = s.e.NamespaceEvents(r.Context(), ns, since, page, cred)
 		if err != nil || lg.Status != 200 {
 			return
+		}
+		if keepAlive && len(lg.Entries) == 0 {
+			sseKeepAliveComment(w)
 		}
 	}
 }
@@ -341,6 +384,8 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nsSince := head.Last
+	// Without since, a resource with no entries yet is an empty range:
+	// the stream starts and waits for its first (§7.3).
 	lg, err := s.e.ResourceLog(r.Context(), ns, name, "", since, page, cred)
 	if err != nil {
 		writeErr(w, err)
@@ -351,6 +396,9 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	startSSE(w)
+	expired, stop := s.admissionEnds(lg.Until)
+	defer stop()
+	sent := false // since the last wake: whether any event was sent
 	emit := func(lg *core.Log) {
 		for i, e := range lg.Entries {
 			ev := "revision"
@@ -359,6 +407,7 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			sseEntry(w, ev, lg, i)
 			since = e["id"].(string)
+			sent = true
 		}
 	}
 	// nsEntries emits this resource's purge and prune entries after
@@ -378,6 +427,7 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 					return true, true
 				case "prune":
 					sseEntry(w, "prune", nl, i)
+					sent = true
 				}
 			}
 			if !nl.More || r.Context().Err() != nil {
@@ -397,14 +447,13 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 		emit(lg)
 	}
 	for {
+		keepAlive := false
 		select {
 		case <-wait:
-		case <-time.After(30 * time.Second):
-			fmt.Fprint(w, ": keep-alive\n\n")
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-			continue
+		case <-time.After(sseKeepAlive):
+			keepAlive = true
+		case <-expired:
+			return
 		case <-lifecycle.Stopping(r.Context()):
 			// The server is shutting down: end the stream; EventSource
 			// reconnects with Last-Event-ID (elsewhere).
@@ -413,6 +462,7 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		wait = s.e.Wait(ns)
+		sent = false
 		if ok, done := nsEntries(); !ok || done {
 			return
 		}
@@ -428,6 +478,9 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 			if !lg.More || r.Context().Err() != nil {
 				break
 			}
+		}
+		if keepAlive && !sent {
+			sseKeepAliveComment(w)
 		}
 	}
 }
