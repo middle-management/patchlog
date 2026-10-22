@@ -946,6 +946,9 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 	}
 	defer st.changed()
 	if (st.method == "MOVE" || st.method == "COPY") && t.path == st.dst {
+		if err := st.srcPrecondition(ctx); err != nil {
+			return err
+		}
 		// The handler clears an existing destination before moving or
 		// copying onto it: a document or a tree's node there is written
 		// over (an edit, a rename), never deleted first.
@@ -1057,6 +1060,9 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 	if err != nil {
 		return err
 	}
+	if err := st.srcPrecondition(ctx); err != nil {
+		return err
+	}
 	defer st.changed()
 	if dst.kind == kPlacement && dst.otherCase && !(src.ns == dst.ns && src.node == dst.node) && !st.spelledSo(dst) {
 		st.onto = dst.path
@@ -1161,6 +1167,64 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 	return fail(http.StatusForbidden, "%s can't be moved to %s", src.path, dst.path)
 }
 
+// srcPrecondition checks a MOVE's precondition on its source, once,
+// before anything is written (§H.5 "On any MOVE, a client's If-Match
+// names the source"): the revision its If-Match (or If header) names
+// must be the source's head, a file's (its item's, in a tree) or a
+// folder's node's (F-H1), and If-Match: * asks that it exist; 412
+// otherwise, as for a DELETE. A scratch file has no revision. The moves
+// check it again where they read the source to write (moveOnto,
+// moveAcross, batchMove, moveNode), and a move that copies deletes the
+// source with If-Match on it (deleteSource).
+func (st *reqState) srcPrecondition(ctx context.Context) error {
+	if st.method != "MOVE" || st.srcMatch == "" && !st.srcAny || st.srcDone {
+		return st.srcErr
+	}
+	st.srcDone = true
+	st.srcErr = st.checkSource(ctx)
+	return st.srcErr
+}
+
+// checkSource is srcPrecondition's check.
+func (st *reqState) checkSource(ctx context.Context) error {
+	src, err := st.resolve(ctx, st.path)
+	if err != nil {
+		return err
+	}
+	rev, exists := "", false
+	switch src.kind {
+	case kDoc, kRaw, kPlacement:
+		hd, live, err := st.docAt(ctx, src)
+		if err != nil {
+			return err
+		}
+		rev, exists = hd.rev, live
+	case kFolder:
+		h, err := st.head(ctx, src.ns, src.node)
+		if err != nil {
+			return err
+		}
+		rev, exists = h.ID, h.State == client.Live
+	case kScratch:
+		_, exists = st.scratchGet(src.path)
+	}
+	switch {
+	case !exists && st.srcAny:
+		return fail(http.StatusPreconditionFailed, "%s doesn't exist (If-Match: *)", src.path)
+	case !exists:
+		return fail(http.StatusPreconditionFailed, "%s holds no file, so none has revision %s (If-Match names a MOVE's source, §H.5); reload it", src.path, st.srcMatch)
+	case st.srcMatch != "" && rev != st.srcMatch:
+		return st.sourceMoved(src.path)
+	}
+	return nil
+}
+
+// sourceMoved is a MOVE's 412 for a source whose head isn't the revision
+// its If-Match names (srcPrecondition).
+func (st *reqState) sourceMoved(p string) error {
+	return fail(http.StatusPreconditionFailed, "%s changed since %s (If-Match, which names a MOVE's source, §H.5); reload it", p, st.srcMatch)
+}
+
 // deletedPath reports whether t is the path of a file the principal's
 // DELETE removed within ownDeleteUndo (§H.6 "Delete, then write"): a flat
 // namespace's resource, or a tree's file in the same folder.
@@ -1222,6 +1286,9 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 		}
 		if sh.State != client.Live {
 			return false, errNotExist
+		}
+		if st.srcMatch != "" && sh.ID != st.srcMatch {
+			return false, st.sourceMoved(src.path)
 		}
 		e, err := st.s.doc(ctx, st.tk, ns, src.docName, sh.ID)
 		switch {

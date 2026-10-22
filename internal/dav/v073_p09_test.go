@@ -393,3 +393,80 @@ func TestV073ExpiredRecordsEvicted(t *testing.T) {
 	e.expect(e.do("PUT", "/matches/z.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 409, "PUT z after the sweep")
 	e.expectLive("matches", "z", hz, "z after the refusal")
 }
+
+// On any MOVE, the client's If-Match (its first value, W/ dropped), or
+// an If header's entity tag, names the source, and one that isn't its
+// head is 412 before anything is written (§H.5, GW-1): a rename in the
+// flat view or in a tree, a move to another folder, onto an existing
+// file, to another namespace, over a scratch file; a folder's names its
+// node's head (F-H1); If-Match: * asks that the source exist. It is
+// never the target's base.
+func TestV073MoveSourceIfMatch(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"matches", "other"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("matches")}})
+	e.create("matches", "derby", map[string]any{"title": "Derby"})
+	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	e.create("cat", "season", map[string]any{"title": "Season", "parents": parents("cat", "root")})
+	e.create("cat", "empty", map[string]any{"title": "Empty", "parents": parents("cat", "root")})
+	e.create("cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
+	q := func(rev string) string { return `"` + rev + `"` }
+	stale := func(ns, name string) (string, *client.Head) {
+		t.Helper()
+		old := must(e.c.Head(e.ctx, ns, name)).ID
+		e.theirs(ns, name, map[string]any{"op": "add", "path": "/theirs", "value": 1})
+		h, _ := e.load(ns, name)
+		return old, h
+	}
+	notMade := func(ns, name string) {
+		t.Helper()
+		if h, _ := e.load(ns, name); h.State != client.NotFound {
+			t.Fatalf("%s/%s made by a refused MOVE: %v", ns, name, h.State)
+		}
+	}
+
+	e.create("matches", "x", map[string]any{"a": "1"})
+	old, h := stale("matches", "x")
+	e.create("matches", "onto", map[string]any{"a": "onto"})
+	ho, _ := e.load("matches", "onto")
+	e.expect(e.do("PUT", "/matches/.x.swp", "swap"), 201, "a scratch file")
+	for _, c := range []struct{ what, dst string }{
+		{"a rename", "/matches/x2.json"},
+		{"onto an existing file", "/matches/onto.json"},
+		{"to another namespace", "/other/x.json"},
+		{"over a scratch file", "/matches/.x.swp"},
+	} {
+		for _, hdr := range [][]string{{"If-Match", q(old)}, {"If-Match", "W/" + q(old)}, {"If", "([" + q(old) + "])"}, {"If-Match", q(old) + ", " + q(h.ID)}} {
+			e.expect(e.do("MOVE", "/matches/x.json", "", append([]string{"Destination", c.dst}, hdr...)...), 412, "MOVE "+c.what+", "+hdr[0]+": "+hdr[1])
+		}
+	}
+	e.expectLive("matches", "x", h, "x after refused moves")
+	e.expectLive("matches", "onto", ho, "onto after refused moves")
+	notMade("matches", "x2")
+	notMade("other", "x")
+	if g := e.expect(e.do("GET", "/matches/.x.swp", ""), 200, "GET the scratch file"); g.body != "swap" {
+		t.Fatalf("the scratch file %q", g.body)
+	}
+	e.expect(e.do("MOVE", "/matches/nothing.json", "", "Destination", "/matches/n2.json", "If-Match", "*"), 412, "MOVE If-Match: * of nothing")
+	e.expect(e.do("MOVE", "/matches/x.json", "", "Destination", "/matches/onto.json", "If-Match", "W/"+q(h.ID)), 204, "MOVE onto a file, W/ the head")
+	e.expectTombstoned("matches", "x", "x")
+	_, doc := e.load("matches", "onto")
+	sameJSON(t, doc, map[string]any{"a": "1", "theirs": 1})
+	e.expect(e.do("MOVE", "/matches/onto.json", "", "Destination", "/matches/y.json", "If-Match", "*"), 201, "MOVE If-Match: *")
+
+	// In a tree: the item's head for a file, the node's for a folder.
+	old, h = stale("matches", "derby")
+	hn, _ := e.load("cat", "matches.derby")
+	for _, dst := range []string{"/cat/Season/renamed.json", "/cat/Empty/derby.json", "/other/derby.json"} {
+		e.expect(e.do("MOVE", "/cat/Season/derby.json", "", "Destination", dst, "If-Match", q(old)), 412, "tree MOVE to "+dst)
+	}
+	e.expectLive("cat", "matches.derby", hn, "the placement after refused moves")
+	e.expectLive("matches", "derby", h, "the item after refused moves")
+	notMade("other", "derby")
+	e.expect(e.do("MOVE", "/cat/Season/derby.json", "", "Destination", "/cat/Empty/derby.json", "If-Match", q(h.ID)), 201, "tree MOVE, the head")
+	folder := must(e.c.Head(e.ctx, "cat", "empty")).ID
+	e.expect(e.do("MOVE", "/cat/Empty", "", "Destination", "/cat/Full", "If-Match", q(hn.ID)), 412, "folder MOVE naming another revision")
+	e.expect(e.do("MOVE", "/cat/Empty", "", "Destination", "/cat/Full", "If-Match", q(folder)), 201, "folder MOVE naming its node's head")
+	if e.nodeDoc("cat", "empty")["title"] != "Full" {
+		t.Fatalf("folder %v", e.nodeDoc("cat", "empty"))
+	}
+}

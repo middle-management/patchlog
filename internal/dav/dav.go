@@ -405,6 +405,30 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Overwrite") == "" {
 			r.Header.Set("Overwrite", "T")
 		}
+		if r.Method == "MOVE" {
+			// A MOVE's If-Match (its first value), or failing that the If
+			// header's entity tag for its source, names the revision the
+			// source must be at (§H.5): never the target's base, which a
+			// move onto a file takes as a save's without one (§H.4), so it
+			// is kept apart from ifMatch (srcPrecondition). The If lists of
+			// entity tags only are taken out, as for a PUT.
+			ifTag := ifHeaderETag(r.Header.Get("If"), st.path)
+			if h := r.Header.Get("If"); h != "" {
+				if rest := splitIf(h); rest == "" {
+					r.Header.Del("If")
+				} else {
+					r.Header.Set("If", rest)
+				}
+			}
+			switch im := strings.TrimSpace(r.Header.Get("If-Match")); {
+			case im == "*":
+				st.srcAny = true
+			case im != "":
+				st.srcMatch = revOfETag(strings.TrimSpace(strings.Split(im, ",")[0]))
+			default:
+				st.srcMatch = ifTag
+			}
+		}
 		if u, err := url.Parse(r.Header.Get("Destination")); err == nil && u.Path != "" {
 			st.dst = slashClean(u.Path)
 			// A proxy that sets X-Forwarded-Host and passes its own Host
@@ -1991,6 +2015,13 @@ type reqState struct {
 	ifMatch   string      // the revision a PUT's or DELETE's If-Match or If header names
 	matchAny  bool        // If-Match: *
 	noneMatch bool        // If-None-Match: *
+	// srcMatch is the revision a MOVE's If-Match or If header names for
+	// its source, srcAny its If-Match: * (srcPrecondition, §H.5); srcDone,
+	// srcErr: checked, and the answer
+	srcMatch string
+	srcAny   bool
+	srcDone  bool
+	srcErr   error
 	// placeholder: the PUT's preconditions found an empty placeholder
 	// (scratch) at its document path, which exists for If-Match: *.
 	placeholder bool

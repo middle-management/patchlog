@@ -1341,6 +1341,9 @@ func (st *reqState) moveNode(ctx context.Context, src, dst target) error {
 		if !st.stillNamed(src, e.value) {
 			return false, fail(http.StatusNotFound, "%s was renamed or moved by someone else just now; reload its folder", src.path)
 		}
+		if src.kind == kFolder && st.srcMatch != "" && h.ID != st.srcMatch {
+			return false, st.sourceMoved(src.path)
+		}
 		m, _ := e.value.(map[string]any)
 		var ps []any
 		if cur, ok := m["title"].(string); !ok || cur != title {
@@ -1457,6 +1460,9 @@ func (st *reqState) moveOnto(ctx context.Context, src, dst target) error {
 	if err != nil {
 		return err
 	}
+	if st.srcMatch != "" && hd.rev != st.srcMatch {
+		return st.sourceMoved(src.path)
+	}
 	rev, _, err := st.commitRev(ctx, dst, b)
 	if err != nil {
 		return st.undoOwnDelete(ctx, dst, upstream(err))
@@ -1527,6 +1533,9 @@ func (st *reqState) moveAcross(ctx context.Context, src, dst target) error {
 	hd, b, err := st.copyOfFile(ctx, src)
 	if err != nil {
 		return err
+	}
+	if st.srcMatch != "" && hd.rev != st.srcMatch {
+		return st.sourceMoved(src.path)
 	}
 	if src.kind != kPlacement {
 		// Its last revision takes $successor first, an append, where its
