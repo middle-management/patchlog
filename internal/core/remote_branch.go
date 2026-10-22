@@ -1372,6 +1372,13 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 		if ValidGesture(e.Undoes) {
 			undoes = e.Undoes
 		}
+		// So is its via (§7.1): the delegatees of the grant the base's
+		// entry was written under, which the mirror's log serves as the
+		// base's does.
+		var via any
+		if len(e.Via) > 0 {
+			via = string(jsonv.Canonical(anyStrings(e.Via)))
+		}
 		var size, digest any
 		if kind == kindRev && !ch.opaque && i == len(ch.entries)-1 && t.resLevel(res) < levelAtRest {
 			// The head the chain leaves (headMeta), but not in a shadow
@@ -1380,8 +1387,8 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 			sz, sum := headMeta(canonDoc)
 			size, digest = sz, sum
 		}
-		last = t.mustInsert(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created, gesture, undoes, size, digest) VALUES (?,?,?,?,?,?,?,NULL,NULL,?,?,?,?,?,?,?) RETURNING seq`,
-			res, id[:], parentSeq, first, kind, patches, author, sig, typed, parseCreated(e.Created, t.now), gesture, undoes, size, digest)
+		last = t.mustInsert(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created, gesture, undoes, size, digest) VALUES (?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?) RETURNING seq`,
+			res, id[:], parentSeq, first, kind, patches, author, via, sig, typed, parseCreated(e.Created, t.now), gesture, undoes, size, digest)
 		parentSeq = last
 		if kind == kindTombstone {
 			state = stateTombstoned

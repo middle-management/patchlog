@@ -33,7 +33,7 @@ func (e *tenv) headItems(ns, nsID string, bearer ...string) map[string]map[strin
 	r := e.get("/ns/"+ns+"/rev/"+nsID+"/heads", bearer...)
 	expect(e.t, r, 200)
 	out := map[string]map[string]any{}
-	for _, x := range r.Obj()["items"].([]any) {
+	for _, x := range r.Obj()["heads"].([]any) {
 		m := x.(map[string]any)
 		out[m["resource"].(string)] = m
 	}
@@ -227,7 +227,7 @@ func TestHeadMetaEncrypted(t *testing.T) {
 			t.Fatalf("sealed revision %s: %v", id, r.H)
 		}
 		e.noRevMeta("/r/s/x/rev/" + id)
-		if c := e.do(req{method: "GET", path: "/r/s/x/rev/" + id, hdr: map[string]string{"If-None-Match": quote(id)}}); c.Code != 304 {
+		if c := e.do(req{method: "GET", path: "/r/s/x/rev/" + id, hdr: map[string]string{"If-None-Match": quote(id + ".1")}}); c.Code != 304 {
 			t.Fatalf("sealed If-None-Match: %d", c.Code)
 		}
 	}

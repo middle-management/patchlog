@@ -96,7 +96,7 @@ func TestRaw(t *testing.T) {
 	}
 	b := e.get(blobPath("m", "notes", bid))
 	expect(t, b, 200)
-	if string(b.Body) != string(md) || b.H.Get("Content-Type") != "text/markdown" || b.H.Get("X-Content-Type-Options") != "nosniff" || b.H.Get("Content-Security-Policy") != "sandbox" {
+	if string(b.Body) != string(md) || b.H.Get("Content-Type") != "text/markdown; charset=utf-8" || b.H.Get("X-Content-Type-Options") != "nosniff" || b.H.Get("Content-Security-Policy") != "sandbox" {
 		t.Fatalf("blob %v", b.H)
 	}
 

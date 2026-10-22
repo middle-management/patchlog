@@ -413,6 +413,10 @@ CREATE TABLE IF NOT EXISTS rotations_due (
   ns    bigint PRIMARY KEY REFERENCES namespaces,
   since bigint NOT NULL
 );
+-- The delegatees of the grant a namespace entry was written under, served
+-- unhashed (§5, §7.4; db.go, grantVia). NULL for none, for the server's
+-- own entries, and in rows from before it.
+ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS via text;
 `
 
 // openPG opens a Postgres database and creates or migrates its schema.

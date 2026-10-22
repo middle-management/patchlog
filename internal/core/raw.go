@@ -24,9 +24,10 @@ type Raw struct {
 // ResourceRaw serves a raw document's URL (§7.1): id "" for …/raw, at the
 // head, or a revision id. The order is the read check (the ordinary one:
 // a schemaReads referrer opens only revision paths, §6.1), a purged
-// namespace's 410 (§8.5), then 404 not_offered in a namespace serving it
-// that is sealed or e2e, the keyring included (the blob is sealed, or the
-// root can't be seen), and then the answers of the document URL.
+// namespace's 410 (§8.5), a purged resource's 410, the document URL's
+// (§8.3), then 404 not_offered in a namespace serving it that is sealed or
+// e2e, the keyring included (the blob is sealed, or the root can't be
+// seen), and then the answers of the document URL.
 func (e *Engine) ResourceRaw(ctx context.Context, ns, name, id string, cred Credentials) (*Raw, error) {
 	out := &Raw{}
 	err := e.read(ctx, func(t *tx) error {
@@ -41,9 +42,11 @@ func (e *Engine) ResourceRaw(ctx context.Context, ns, name, id string, cred Cred
 			return t.purgedRead(n)
 		}
 		out.Public = t.cachePublic(n)
-		if t.nsLevel(n) >= levelSealed {
+		if t.nsLevel(n) >= levelSealed && t.resolve(n, name, nil).state != Purged {
 			return rawNotOffered(out.Public)
 		}
+		// A purged resource, of any level, answers as its document URL
+		// below: 410, before not_offered (§8.3).
 		return nil
 	})
 	if err != nil {

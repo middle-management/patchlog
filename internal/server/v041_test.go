@@ -276,14 +276,14 @@ func TestV041Grants(t *testing.T) {
 	m := r.Obj()
 	dg, _ := grant.Decode(g, 0)
 	root, _ := m["root"].(map[string]any)
-	stored, _ := m["stored"].([]any)
-	if m["id"] != gid || root["sub"] != "user:alice" || root["kid"] != "issuer" || len(stored) != 1 {
+	stored, _ := m["stored"].(string) // one string since v0.73 (§C.3.1)
+	if m["id"] != gid || root["sub"] != "user:alice" || root["kid"] != "issuer" || stored == "" {
 		t.Fatalf("grant %s", r.Body)
 	}
 	if string(canonical(root)) != string(canonical(dg.Blocks[0].Raw)) {
 		t.Fatalf("root %v", root)
 	}
-	sb, err := base64.RawURLEncoding.DecodeString(stored[0].(string))
+	sb, err := base64.RawURLEncoding.DecodeString(stored)
 	if err != nil || string(sb) != string(dg.SignedBlocks()[0]) {
 		t.Fatalf("stored %v %v", stored, err)
 	}

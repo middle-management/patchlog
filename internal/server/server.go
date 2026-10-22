@@ -26,6 +26,9 @@ type Server struct {
 	edge *edge.Verifier // nil: no verifying edge (§9)
 	// cookies issues and verifies edge grants as cookies (§C.5).
 	cookies *edge.Cookies
+	// inlinePDF serves application/pdf blobs for inline display, without
+	// the sandbox, rather than as attachments (WithInlinePDF, §7.8).
+	inlinePDF bool
 }
 
 // Option configures a Server.
@@ -37,6 +40,13 @@ type Option func(*Server)
 // response, and every one without it (or with nil), is marked no-store for
 // shared caches. Private reads are served either way.
 func WithEdge(v *edge.Verifier) Option { return func(s *Server) { s.edge = v } }
+
+// WithInlinePDF opts into inline display of blobs of type exactly
+// application/pdf (§7.8): their 200 and 206 answers go without
+// Content-Security-Policy: sandbox, which blanks Chromium's PDF viewer,
+// still with nosniff, and without Content-Disposition: attachment, which
+// they carry otherwise.
+func WithInlinePDF() Option { return func(s *Server) { s.inlinePDF = true } }
 
 // New builds the HTTP handler.
 func New(e *core.Engine, opts ...Option) *Server {
@@ -270,9 +280,10 @@ func writeErr(w http.ResponseWriter, err error) {
 
 // writeErrShort answers an error that carries its own cache class (§9),
 // whose visibility the core attached: an unknown id of a known namespace,
-// short, or the 410 of a purged namespace's URL, long (§8.5). It returns
-// false if the error has none, leaving writeErr to answer it.
-func (s *Server) writeErrShort(w http.ResponseWriter, r *http.Request, err error) bool {
+// short, or the 410 of a purged namespace's URL, long (§8.5), tagged with
+// the URL's tags, ns:{ns} and for a resource URL r:{ns}/{name} (§9). It
+// returns false if the error has none, leaving writeErr to answer it.
+func (s *Server) writeErrShort(w http.ResponseWriter, r *http.Request, err error, tags ...string) bool {
 	var ae *core.Error
 	if !errors.As(err, &ae) || ae.Public == nil {
 		return false
@@ -281,7 +292,7 @@ func (s *Server) writeErrShort(w http.ResponseWriter, r *http.Request, err error
 	if ae.Status == 410 {
 		class = ccLong
 	}
-	s.cache(w, r, class, *ae.Public)
+	s.cache(w, r, class, *ae.Public, tags...)
 	writeJSON(w, ae.Status, ae.Body)
 	return true
 }
@@ -327,6 +338,34 @@ func noStore(w http.ResponseWriter) { w.Header().Set("Cache-Control", "no-store"
 
 func quote(id string) string { return `"` + id + `"` }
 
+// sealedTag is the ETag of a sealed 200 of /r/{ns}/{name}/rev/{id} or
+// /ns/{ns}/rev/{ns_id} (§7.1, §7.4, §E.2.2): "{id}.{e}", where e is the
+// epoch of the stored sealing, which its kid "{ns}#{e}" names, since the
+// same id may have been served in plaintext as "{id}" before the namespace
+// was sealed. If-None-Match is compared with it (notModified); a write's
+// precondition leaves .{e} out (§7).
+func sealedTag(id, jwe string) string {
+	if h, err := seal.ParseHeader(jwe); err == nil {
+		if i := strings.LastIndexByte(h.Kid, '#'); i >= 0 {
+			if e := h.Kid[i+1:]; e != "" && strings.Trim(e, "0123456789") == "" {
+				return quote(id + "." + e)
+			}
+		}
+	}
+	return quote(id)
+}
+
+// inmMatches tells whether an If-None-Match header names tag, compared
+// weakly as RFC 9110 §13.1.2 has it: a tag in the list, W/ or not.
+func inmMatches(inm, tag string) bool {
+	for _, t := range strings.Split(inm, ",") {
+		if strings.TrimPrefix(strings.TrimSpace(t), "W/") == tag {
+			return true
+		}
+	}
+	return false
+}
+
 func resTags(ns, name string) []string { return []string{"ns:" + ns, "r:" + ns + "/" + name} }
 
 // writeLog answers a log range (§7.1, §7.4), or a live read's error. A
@@ -343,7 +382,7 @@ func (s *Server) writeLog(w http.ResponseWriter, r *http.Request, lg *core.Log, 
 		}
 		writeLogBody(w, lg)
 	case 404:
-		s.cache(w, r, ccShort, lg.Public)
+		s.cache(w, r, ccShort, lg.Public, tags...)
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
 	default:
 		if lg.Horizon != "" {
@@ -351,7 +390,7 @@ func (s *Server) writeLog(w http.ResponseWriter, r *http.Request, lg *core.Log, 
 			writeJSON(w, 410, prunedBody(lg.Horizon, lg.Archive))
 			return
 		}
-		s.cache(w, r, ccLong, lg.Public)
+		s.cache(w, r, ccLong, lg.Public, tags...)
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	}
 }

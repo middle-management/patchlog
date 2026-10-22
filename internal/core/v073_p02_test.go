@@ -70,7 +70,7 @@ func TestV073StoredGrantIsAuthorityBlock(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(doc.Stored) != 1 || doc.Stored[0] != want || doc.ID != gid.String() {
+		if doc.Stored != want || doc.ID != gid.String() {
 			t.Fatalf("served %v", doc.Stored)
 		}
 	}

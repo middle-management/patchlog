@@ -122,7 +122,7 @@ func TestBlobUploadAndRead(t *testing.T) {
 	head := e.create("m", "a", map[string]any{"body": ref(bid, "text/plain", len(data), "")})
 	r := e.get(blobPath("m", "a", bid))
 	expect(t, r, 200)
-	if string(r.Body) != string(data) || r.H.Get("Content-Type") != "text/plain" || etagOf(r) != bid ||
+	if string(r.Body) != string(data) || r.H.Get("Content-Type") != "text/plain; charset=utf-8" || etagOf(r) != bid ||
 		r.H.Get("Accept-Ranges") != "bytes" {
 		t.Fatalf("blob answer %v %q", r.H, r.Body)
 	}

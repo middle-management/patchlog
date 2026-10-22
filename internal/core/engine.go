@@ -1145,11 +1145,12 @@ func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targ
 	body := jsonv.Canonical(entry)
 	gestures := metaColumn(meta)
 	kind := nsKindCode(entry["kind"].(string))
-	var grantID any
+	var grantID, via any
 	if g := t.grants[author]; g != nil && t.serverWrites == 0 {
 		// Encrypted if the configuration in force after the entry
 		// encrypts at rest: a namespace's first entry has none before it.
 		grantID = t.storeGrant(g, t.config(configSeq).level >= levelAtRest)
+		via = grantVia(g)
 	}
 	noAuth := t.noAuth(author)
 	rs, ts := make([]int64, len(hist)), make([]int64, len(hist))
@@ -1164,16 +1165,16 @@ func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targ
 		// One statement: the entry, the namespace's head and the heads it
 		// moves, so the log lock is held for a single round trip and the
 		// commit.
-		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures)
-				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq),
+		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures, via)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq),
 			u AS (UPDATE namespaces SET head_seq = (SELECT seq FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
 			h AS (INSERT INTO head_history (res, ns_seq, target_seq) SELECT v.res, l.seq, v.target FROM l, unnest(?::bigint[], ?::bigint[]) AS v(res, target))
 			SELECT seq FROM l`,
-			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth, gestures,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth, gestures, via,
 			id[:], configSeq, n.id, rs, ts)
 	} else {
-		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
-			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth, gestures)
+		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures, via) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth, gestures, via)
 		_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, head_id = ?, config_seq = ? WHERE ns = ?`, seq, id[:], configSeq, n.id)
 		t.must(err)
 		for _, h := range hist {
@@ -1245,7 +1246,7 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	res, targets := make([]*int64, k), make([]*int64, k)
 	grantIDs := make([][]byte, k)
 	noAuth := make([]*int64, k)
-	gestures := make([]*string, k)
+	gestures, vias := make([]*string, k), make([]*string, k)
 	var hord, hres, htarget []int64
 	for i, a := range as {
 		bodies[i] = string(jsonv.Canonical(a.entry))
@@ -1257,6 +1258,9 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 		if a.grant != nil && t.serverWrites == 0 {
 			// Each entry its own grant (§7.4): one author may write under several.
 			grantIDs[i] = t.storeGrant(a.grant, t.config(configSeq).level >= levelAtRest)
+			if v, ok := grantVia(a.grant).(string); ok {
+				vias[i] = &v
+			}
 		}
 		if t.noAuth(a.author) != nil {
 			one := int64(1)
@@ -1276,18 +1280,18 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 		prev = &out[i]
 	}
 	t.wrote()
-	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::bytea[], ?::smallint[], ?::text[])
-				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, grant_id, no_auth, gestures, ord)),
+	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::bytea[], ?::smallint[], ?::text[], ?::text[])
+				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, grant_id, no_auth, gestures, via, ord)),
 			r AS MATERIALIZED (SELECT nextval(pg_get_serial_sequence('ns_log', 'seq')) AS seq FROM generate_series(1, ?::int)),
 			s AS (SELECT seq, row_number() OVER (ORDER BY seq) AS ord FROM r),
 			c AS (SELECT v.*, s.seq, COALESCE(lag(s.seq) OVER (ORDER BY v.ord), ?::bigint) AS prev_seq FROM v JOIN s USING (ord)),
-			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures)
-				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, ?, grant_id, no_auth, gestures FROM c ORDER BY ord RETURNING seq),
+			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures, via)
+				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, ?, grant_id, no_auth, gestures, via FROM c ORDER BY ord RETURNING seq),
 			u AS (UPDATE namespaces SET head_seq = (SELECT max(seq) FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
 			h AS (INSERT INTO head_history (res, ns_seq, target_seq)
 				SELECT x.res, c.seq, x.target FROM unnest(?::bigint[], ?::bigint[], ?::bigint[]) AS x(ord, res, target) JOIN c USING (ord))
 			SELECT seq FROM c ORDER BY ord`,
-		idBytes, kinds, res, targets, bodies, authors, grantIDs, noAuth, gestures, k, prevSeq,
+		idBytes, kinds, res, targets, bodies, authors, grantIDs, noAuth, gestures, vias, k, prevSeq,
 		n.id, configSeq, t.now.UnixMilli(), idBytes[k-1], configSeq, n.id, hord, hres, htarget)
 	t.must(err)
 	var seqs []int64
@@ -1313,6 +1317,24 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	n.configSeq = configSeq
 	t.notify[n.name] = true
 	return out
+}
+
+// grantVia is ns_log.via for an entry written under g: the canonical JSON
+// array of its blocks' delegatees in order, as the verified principal's
+// via (§6.4.1, §C.1) and revisions.via (writtenBy) record them, or NULL
+// when there are none. Served unhashed with the entry (§7.4); entries the
+// server writes itself record none, nor do entries from before the column.
+func grantVia(g *grant.Grant) any {
+	var via []any
+	for _, b := range g.Blocks {
+		if b.Via != "" {
+			via = append(via, b.Via)
+		}
+	}
+	if len(via) == 0 {
+		return nil
+	}
+	return string(jsonv.Canonical(via))
 }
 
 // noAuth is ns_log.no_auth for an entry by author: 1 if it is written on

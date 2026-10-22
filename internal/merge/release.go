@@ -544,6 +544,12 @@ func (x *relCtx) branches(ctx context.Context) error {
 			continue
 		}
 		bl, err := x.c.Branches(ctx, b.Target)
+		if client.IsPurged(err) {
+			// A purged target's /branches is 410 (§7.4, §8.5), and its
+			// branches were purged before it.
+			x.conflict(RCPurged, k, br, "", br+" is purged, as is its base "+b.Target)
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("merge: branches of %s: %w", b.Target, err)
 		}

@@ -505,7 +505,7 @@ func counting(t *testing.T, strip map[string]bool, with ...func(*clienttest.Opti
 				if strip["created"] && strings.HasSuffix(r.URL.Path, "/heads") {
 					var page map[string]any
 					must(0, json.Unmarshal(body, &page))
-					for _, it := range page["items"].([]any) {
+					for _, it := range page["heads"].([]any) {
 						delete(it.(map[string]any), "created")
 					}
 					body = must(json.Marshal(page))

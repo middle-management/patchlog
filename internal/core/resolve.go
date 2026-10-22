@@ -135,13 +135,16 @@ func (t *tx) prefetchHeads(n *nsRow, names []string, asOf *int64) {
 			switch {
 			case r == nil:
 				rest = append(rest, name)
-			case r.state == statePurged || asOf == nil:
+			case asOf == nil:
 				if r.headSeq.Valid {
 					heads = append(heads, r.headSeq.Int64)
 				} else if r.state != statePurged {
 					rest = append(rest, name)
 				}
 			default:
+				// A purged row too: as of asOf it is purged only if it
+				// had an entry then, its own or, with none of its own
+				// there, one read through from the base (resolve, §8.3).
 				resIDs = append(resIDs, r.id)
 			}
 		}
@@ -173,7 +176,7 @@ func (t *tx) prefetchHeads(n *nsRow, names []string, asOf *int64) {
 			t.must(rows.Err())
 			rows.Close()
 			for _, name := range names {
-				if r := t.memo.res[resKey{n.id, name}]; r != nil && r.state != statePurged && at[r.id] == 0 {
+				if r := t.memo.res[resKey{n.id, name}]; r != nil && at[r.id] == 0 {
 					rest = append(rest, name)
 				}
 			}
@@ -297,13 +300,21 @@ type view struct {
 func (v *view) readThrough() bool { return v.own == nil || v.own.headSeq.Valid == false }
 
 // resolve returns a resource as seen from ns, now (asOf nil) or as of an
-// ns_log seq of ns.
+// ns_log seq of ns. A resource purged since asOf is purged as of asOf too,
+// with its head then, but only if it had an entry then, its own or read
+// through: one that didn't is not found, as it was then. So a branch
+// created later at an at before a purge sees the name as purged only
+// where it would read an entry for it through, and lists it with its head
+// as of at (§8.3, invariant 7); head_history rows outlive the purge.
 func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 	v := &view{ns: n, name: name}
 	r := t.resource(n.id, name)
 	v.own = r
 	if r != nil {
-		if r.state == statePurged {
+		// A remote branch's shadow mirrors a resource purged at its base
+		// before at with its head's id alone, and no history: purged as
+		// of at (insertShadow).
+		if r.state == statePurged && (asOf == nil || n.isShadow() && !t.hasHistory(r.id)) {
 			v.state, v.src = Purged, r
 			if r.headSeq.Valid {
 				v.head = t.rev(r.headSeq.Int64)
@@ -329,9 +340,12 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 		if found {
 			v.src = r
 			v.head = t.rev(headSeq)
-			if v.head.kind == kindTombstone {
+			switch {
+			case r.state == statePurged:
+				v.state = Purged
+			case v.head.kind == kindTombstone:
 				v.state = Tombstoned
-			} else {
+			default:
 				v.state = Live
 			}
 			return v
@@ -342,10 +356,26 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 		at := n.baseAt.Int64
 		bv := t.resolve(base, name, &at)
 		v.state, v.head, v.src = bv.state, bv.head, bv.src
+		if r != nil && r.state == statePurged && bv.state != NotFound {
+			// Purged in n since asOf, when n read an entry for it
+			// through: purged as of asOf too, with the head it read
+			// through then. A purge of a name n reads through records
+			// no head_history (purgeResource), and the base keeps it
+			// live, since purges never propagate upwards (§8.3).
+			v.state, v.src = Purged, r
+		}
 		return v
 	}
 	v.state = NotFound
 	return v
+}
+
+// hasHistory reports whether res has head_history rows: entries of its
+// own namespace that moved its head.
+func (t *tx) hasHistory(res int64) bool {
+	var has bool
+	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM head_history WHERE res = ?)`, res).Scan(&has))
+	return has
 }
 
 // segment is a stretch of one resource's chain: rows of res with seq ≤ max.
@@ -570,7 +600,10 @@ type LogEntry struct {
 	Kind    string `json:"kind"`
 	Patches any    `json:"patches,omitempty"`
 	Author  string `json:"author"`
-	Created string `json:"created"`
+	// Via is the delegation chain of the grant the entry was written under
+	// (§7.1, §C.1): its delegatees in order, nil when there are none.
+	Via     []string `json:"via,omitempty"`
+	Created string   `json:"created"`
 	// Grant is the grant reference { id, sub, kid } of the grant the entry
 	// was written under (§7.1, §C.3), as namespace entries serve it
 	// (grantref.go); nil if it wasn't written under one.
@@ -592,6 +625,9 @@ func (e LogEntry) value() map[string]any {
 	}
 	if e.Kind == "rev" && e.Patches != nil {
 		m["patches"] = e.Patches
+	}
+	if len(e.Via) > 0 {
+		m["via"] = anyStrings(e.Via)
 	}
 	if e.Grant != nil {
 		m["grant"] = e.Grant
@@ -622,6 +658,7 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 			e.Patches, e.size = jsonv.MustParse(b), len(b)
 		}
 	}
+	e.Via = parseVia(r.via)
 	if r.grantID != nil {
 		e.Grant = t.grantRef(r.grantID)
 	}
@@ -630,6 +667,20 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 	}
 	e.Gesture, e.Undoes = r.gesture.String, r.undoes.String
 	return e
+}
+
+// parseVia reads a stored via column (revisions.via, ns_log.via): the
+// canonical JSON array of a grant's delegatees (writtenBy, grantVia), or
+// nil for NULL, an empty array and rows from before the column (§7.1).
+func parseVia(col sql.NullString) []string {
+	if !col.Valid || col.String == "" {
+		return nil
+	}
+	var via []string
+	if err := json.Unmarshal([]byte(col.String), &via); err != nil || len(via) == 0 {
+		return nil
+	}
+	return via
 }
 
 // logBetween returns the entries after since (exclusive; nil = from the

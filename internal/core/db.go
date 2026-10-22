@@ -420,7 +420,13 @@ func migrate(db *sql.DB) error {
 		{"blob_bytes", "file", "TEXT", "", nil}, {"blob_epochs", "file", "TEXT", "", nil},
 		{"namespaces", "head_id", "BLOB", "", nil}, {"resources", "snap_revs", "INTEGER", "", nil}, {"resources", "snap_bytes", "INTEGER", "", nil},
 		{"revisions", "gesture", "TEXT", "", nil}, {"revisions", "undoes", "TEXT", "", nil}, {"ns_log", "gestures", "TEXT", "", nil},
-		{"revisions", "size", "INTEGER", "", nil}, {"revisions", "digest", "BLOB", "", nil}} {
+		{"revisions", "size", "INTEGER", "", nil}, {"revisions", "digest", "BLOB", "", nil},
+		// ns_log.via: the canonical JSON array of the delegatees of the
+		// grant a namespace entry was written under (appendNS, grantVia),
+		// served unhashed (§5, §7.4); NULL for none, for the server's own
+		// entries, and in rows from before it, which can't be recovered
+		// from the stored grants (one row per root id).
+		{"ns_log", "via", "TEXT", "", nil}} {
 		var has bool
 		if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)`, c.table, c.col).Scan(&has); err != nil {
 			return err

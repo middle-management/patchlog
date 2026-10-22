@@ -382,8 +382,8 @@ func TestRemoteBranch(t *testing.T) {
 	expect(t, b.get("/r/rel/c/rev/"+f.c1), 410)        // and its content isn't here
 	expect(t, b.get("/r/rel/late"), 404)               // created after at
 	expect(t, b.get("/r/rel/derby/rev/"+f.lateD), 404) // appended after at
-	hb := b.get("/ns/rel/rev/" + b.nsHead("rel") + "/heads").Obj()["items"]
-	ha := a.get("/ns/main/rev/" + f.at + "/heads").Obj()["items"]
+	hb := b.get("/ns/rel/rev/" + b.nsHead("rel") + "/heads").Obj()["heads"]
+	ha := a.get("/ns/main/rev/" + f.at + "/heads").Obj()["heads"]
 	if string(canonical(hb)) != string(canonical(ha)) {
 		t.Fatalf("heads differ\nA %s\nB %s", canonical(ha), canonical(hb))
 	}
@@ -447,7 +447,7 @@ func TestRemoteBranch(t *testing.T) {
 
 func headAt(t *testing.T, e *tenv, ns, at, name string) string {
 	t.Helper()
-	for _, x := range e.get("/ns/" + ns + "/rev/" + at + "/heads").Obj()["items"].([]any) {
+	for _, x := range e.get("/ns/" + ns + "/rev/" + at + "/heads").Obj()["heads"].([]any) {
 		m := x.(map[string]any)
 		if m["resource"] == name {
 			s, _ := m["target"].(string)

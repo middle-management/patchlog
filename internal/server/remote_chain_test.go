@@ -87,8 +87,8 @@ func sameRead(t *testing.T, a, b *tenv, ans, bns, name, id string, query string)
 
 func sameHeads(t *testing.T, a, b *tenv, ans, at, bns string) {
 	t.Helper()
-	ha := a.get("/ns/" + ans + "/rev/" + at + "/heads").Obj()["items"]
-	hb := b.get("/ns/" + bns + "/rev/" + b.nsHead(bns) + "/heads").Obj()["items"]
+	ha := a.get("/ns/" + ans + "/rev/" + at + "/heads").Obj()["heads"]
+	hb := b.get("/ns/" + bns + "/rev/" + b.nsHead(bns) + "/heads").Obj()["heads"]
 	if string(canonical(hb)) != string(canonical(ha)) {
 		t.Fatalf("heads differ\nA %s\nB %s", canonical(ha), canonical(hb))
 	}

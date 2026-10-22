@@ -91,7 +91,7 @@ func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := s.e.OpenBlob(r.Context(), ns, name, bid, creds(r))
 	if err != nil {
-		if s.writeErrShort(w, r, err) {
+		if s.writeErrShort(w, r, err, resTags(ns, name)...) {
 			return
 		}
 		writeErr(w, err)
@@ -120,7 +120,7 @@ func (s *Server) blobEpochGet(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := s.e.OpenSealedBlob(r.Context(), ns, name, bid, ep, creds(r))
 	if err != nil {
-		if s.writeErrShort(w, r, err) {
+		if s.writeErrShort(w, r, err, resTags(ns, name)...) {
 			return
 		}
 		writeErr(w, err)
@@ -137,7 +137,23 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, ns, name, eta
 		// Immutable, with the resource's tags (§9); ranges are 206.
 		s.cache(w, r, ccImmutable, b.Public, resTags(ns, name)...)
 		w.Header().Set("ETag", etag)
-		w.Header().Set("Content-Type", b.Type)
+		ct := b.Type
+		if strings.HasPrefix(ct, "text/") {
+			// Stored text is UTF-8 (§3.7, §7.8).
+			ct += "; charset=utf-8"
+		}
+		w.Header().Set("Content-Type", ct)
+		if b.Type == "application/pdf" {
+			// A PDF is an attachment, still sandboxed, unless the
+			// deployment opts into inline display, which drops the
+			// sandbox that blanks Chromium's viewer from a 200 or 206,
+			// and only from those (§7.8).
+			if s.inlinePDF {
+				w = &inlinePDF{ResponseWriter: w}
+			} else {
+				w.Header().Set("Content-Disposition", "attachment")
+			}
+		}
 		http.ServeContent(w, r, "", time.Time{}, b.Content)
 	case b.NoStore:
 		// An epoch a sealed namespace doesn't serve the blob under, yet
@@ -145,13 +161,40 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, ns, name, eta
 		noStore(w)
 		writeJSON(w, b.Status, map[string]any{"code": "not_found"})
 	case b.Status == 404:
-		s.cache(w, r, ccShort, b.Public)
+		s.cache(w, r, ccShort, b.Public, resTags(ns, name)...)
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
 	case b.Code == "pruned":
 		s.cache(w, r, ccPruned, b.Public, resTags(ns, name)...)
 		writeJSON(w, 410, prunedBody(b.Horizon, b.Archive))
 	case b.Status == 410:
-		s.cache(w, r, ccLong, b.Public)
+		s.cache(w, r, ccLong, b.Public, resTags(ns, name)...)
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	}
 }
+
+// inlinePDF writes an application/pdf blob's answer with WithInlinePDF:
+// it drops Content-Security-Policy: sandbox from a 200 or 206 only, as
+// http.ServeContent picks the status, so a 304 or 416 keeps it (§7.8).
+type inlinePDF struct {
+	http.ResponseWriter
+	wrote bool
+}
+
+func (w *inlinePDF) WriteHeader(code int) {
+	if !w.wrote {
+		w.wrote = true
+		if code == http.StatusOK || code == http.StatusPartialContent {
+			w.Header().Del("Content-Security-Policy")
+		}
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *inlinePDF) Write(p []byte) (int, error) {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *inlinePDF) Unwrap() http.ResponseWriter { return w.ResponseWriter }

@@ -159,7 +159,7 @@ func TestSealedOutputs(t *testing.T) {
 		for i, id := range ids {
 			sr, pr := e.get("/r/s/x/rev/"+id), e.get("/r/p/x/rev/"+id)
 			expect(t, sr, 200)
-			if !isJOSE(sr) || sr.H.Get("Cache-Control") != ccImmutable || sr.H.Get("ETag") != quote(id) || sr.H.Get("X-Revision") != id {
+			if !isJOSE(sr) || sr.H.Get("Cache-Control") != ccImmutable || sr.H.Get("ETag") != quote(id+".1") || sr.H.Get("X-Revision") != id {
 				t.Fatalf("doc headers %v", sr.H)
 			}
 			if strings.Contains(string(sr.Body), encMarker) {
@@ -174,8 +174,9 @@ func TestSealedOutputs(t *testing.T) {
 				}
 			}
 			out["doc"+id] = string(sr.Body)
-			// If-None-Match still answers 304.
-			if r := e.do(req{method: "GET", path: "/r/s/x/rev/" + id, hdr: map[string]string{"If-None-Match": quote(id)}}); r.Code != 304 {
+			// If-None-Match with the sealed tag "{id}.{e}" answers 304
+			// (§E.2.2).
+			if r := e.do(req{method: "GET", path: "/r/s/x/rev/" + id, hdr: map[string]string{"If-None-Match": quote(id + ".1")}}); r.Code != 304 {
 				t.Fatalf("304: %d", r.Code)
 			}
 		}

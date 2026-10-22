@@ -18,12 +18,33 @@ type PrincipalInfo struct {
 	// Kid are "".
 	Principal map[string]any
 	Sub, Kid  string // the root block's sub and signing key (§C.1)
+	// Key is the RFC 7638 thumbprint of the key that verified the root
+	// block (§7.4, §H.7): unlike Kid, the same key in every namespace. ""
+	// with authentication disabled, and from servers before v0.56.
+	Key string
+	// Operator is set for an operator grant (§C.4), whose Can is its
+	// blocks' verbs and Roles empty.
+	Operator bool
 	// Can are the verbs the grant's blocks allow, with roles only those an
 	// effective role lists; Roles its effective roles.
 	Can, Roles []string
 	Writer     WriterInfo
-	Config     string // the config revision in force (X-Config-Revision)
-	Raw        map[string]any
+	// Catalog is the catalog member of a catalog namespace (§7.4, §B.6,
+	// §H.2), nil for any other namespace and from servers before v0.56.
+	Catalog *CatalogInfo
+	Config  string // the config revision in force (X-Config-Revision)
+	Raw     map[string]any
+}
+
+// CatalogInfo is what /principal says of a catalog namespace's catalog
+// (§7.4): to a grant with unrestricted read of it, Trust (empty when the
+// document sets none) and Files as the document has them; to any other,
+// Files without its x- members and, in place of Trust, Trusted, whether
+// Files' ns is trusted.
+type CatalogInfo struct {
+	Trust   []string // nil for a grant without unrestricted read
+	Trusted *bool    // set only for a grant without unrestricted read
+	Files   map[string]any
 }
 
 // WriterInfo is what a writer needs from a namespace document (§7.4).
@@ -91,8 +112,20 @@ func (c *Client) NSPrincipal(ctx context.Context, ns string) (*PrincipalInfo, er
 		return nil, r.apiError()
 	}
 	obj := r.obj()
-	p := &PrincipalInfo{Kid: str(obj, "kid"), Can: strList(obj["can"]), Roles: strList(obj["roles"]),
+	p := &PrincipalInfo{Kid: str(obj, "kid"), Key: str(obj, "key"), Can: strList(obj["can"]), Roles: strList(obj["roles"]),
 		Config: r.header.Get("X-Config-Revision"), Raw: obj}
+	p.Operator, _ = obj["operator"].(bool)
+	if cm, ok := obj["catalog"].(map[string]any); ok {
+		c := &CatalogInfo{}
+		if _, has := cm["trust"]; has {
+			c.Trust = strList(cm["trust"])
+		}
+		if b, ok := cm["trusted"].(bool); ok {
+			c.Trusted = &b
+		}
+		c.Files, _ = cm["files"].(map[string]any)
+		p.Catalog = c
+	}
 	if pr, ok := obj["principal"].(map[string]any); ok {
 		p.Principal, p.Sub = pr, str(pr, "id")
 	}

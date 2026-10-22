@@ -220,8 +220,12 @@ type LogEntry struct {
 	// absent (pruned or purged).
 	HasPatches bool
 	Author     string
-	Created    string
-	Signature  string // author signature (§C.3), if served
+	// Via is the delegation chain of the grant the entry was written
+	// under, its delegatees in order (§7.1, §C.1); nil when there are
+	// none, and from servers before v0.63, which don't serve it.
+	Via       []string
+	Created   string
+	Signature string // author signature (§C.3), if served
 	// Grant is the grant the entry was written under (§7.1, §C.3), if
 	// served: its id and root sub and kid.
 	Grant *NSGrant
@@ -243,6 +247,9 @@ func parseLogEntry(v any) (LogEntry, error) {
 	}
 	if p, has := m["patches"]; has {
 		e.Patches, e.HasPatches = p, true
+	}
+	if via := strList(m["via"]); len(via) > 0 {
+		e.Via = via
 	}
 	if gm, ok := m["grant"].(map[string]any); ok {
 		e.Grant = &NSGrant{ID: str(gm, "id"), Sub: str(gm, "sub"), Kid: str(gm, "kid")}
