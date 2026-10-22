@@ -26,7 +26,8 @@ func pageSchema(related bool) map[string]any {
 		"$schema": d2020, "type": "object",
 		"properties": map[string]any{
 			"$schema": map[string]any{"type": "string"},
-			"title":   map[string]any{"type": "string", "x-index": "text"},
+			// sort too: a sort path must be marked sort (v0.73, §A.4).
+			"title":   map[string]any{"type": "string", "x-index": []any{"text", "sort"}},
 			"hero":    map[string]any{"type": "string", "x-ref": map[string]any{"pinned": true}},
 			"related": rel,
 			"trigger": map[string]any{"type": "string", "x-ref": map[string]any{"key": "/triggers"}},

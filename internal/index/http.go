@@ -662,8 +662,9 @@ func resultTags(ns string, res *Result) string {
 }
 
 // query runs q in one read transaction, at the checkpoint the database
-// holds, and returns the result with that checkpoint. Its fields are
-// checked against the schemas of the namespace's documents there.
+// holds, and returns the result with that checkpoint. Its paths are judged
+// by the schemas of the namespace's documents there that the reader may
+// see (allow, nil for all).
 func (ix *Index) query(ctx context.Context, ns string, q *Query, allow func(string) bool) (*Result, string, error) {
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -674,7 +675,7 @@ func (ix *Index) query(ctx context.Context, ns string, q *Query, allow func(stri
 	if err := tx.QueryRowContext(ctx, `SELECT ns_id FROM checkpoints WHERE origin = ? AND ns = ?`, ix.origin, ns).Scan(&at); err != nil {
 		return nil, "", err
 	}
-	if err := ix.checkFields(ctx, tx, ns, q.Fields); err != nil {
+	if err := ix.checkFields(ctx, tx, ns, q, allow); err != nil {
 		return nil, "", err
 	}
 	res, err := ix.run(ctx, tx, ns, q, allow)

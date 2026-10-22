@@ -255,3 +255,100 @@ func TestV073UnavailableSchema(t *testing.T) {
 	}
 	y.expect("/items?schema=/r/sealed/s")
 }
+
+// TestV073StaticWalk (IX-7, §A.2, §A.4): x-index values are collected by a
+// static walk, through every branch whatever the document's validity, and
+// only strings, numbers and booleans: an object at a facet path, or one
+// marked text, indexes nothing; text collects strings only.
+func TestV073StaticWalk(t *testing.T) {
+	t.Parallel()
+	w := v073Setup(t, map[string]any{
+		"a":     map[string]any{"anyOf": []any{map[string]any{"type": "string", "x-index": "facet"}, map[string]any{"type": "number"}}},
+		"obj":   map[string]any{"x-index": "facet"},
+		"notes": map[string]any{"type": "object", "x-index": "text"},
+		"t":     map[string]any{"x-index": "text"},
+		"neg":   map[string]any{"not": map[string]any{"type": "null", "x-index": "facet"}},
+		"tags":  map[string]any{"type": "array", "x-index": "facet"},
+	})
+	w.doc(t, "d1", map[string]any{"a": 5, "obj": map[string]any{"k": "v"}, "notes": map[string]any{"summary": "tense"}, "t": 42, "neg": "x",
+		"tags": []any{"p", map[string]any{"k": "v"}, 1}})
+	w.doc(t, "d2", map[string]any{"obj": nil, "t": "fortytwo"})
+	x := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"items"}})
+	x.caughtUp("items")
+	x.expect("/items?facet[/a]=5", "d1") // the failing anyOf branch still marks
+	x.expect("/items?facet[/obj]=" + url.QueryEscape(`{"k":"v"}`))
+	x.expect("/items?facet[/obj]=null")
+	x.expect("/items?q=tense")
+	x.expect("/items?q=42")
+	x.expect("/items?q=fortytwo", "d2")
+	x.expect("/items?facet[/tags]=1", "d1")
+	x.expect("/items?facet[/tags]=" + url.QueryEscape(`{"k":"v"}`))
+	if r := x.answerOf("/items?facet[/neg]=x", ""); r.status != 400 {
+		t.Errorf("a path marked only through not: %d %v", r.status, r.body)
+	}
+}
+
+// TestV073PathKinds (IX-3, §A.4): a facet[…] or counts path must be marked
+// facet, a sort path sort, by a schema indexed for a document the reader
+// may see; a fields path with any kind. Otherwise 400 naming the parameter.
+func TestV073PathKinds(t *testing.T) {
+	t.Parallel()
+	w := v073Setup(t, map[string]any{
+		"t": map[string]any{"type": "string", "x-index": "text"}, "f": map[string]any{"type": "string", "x-index": "facet"},
+		"s": map[string]any{"type": "number", "x-index": "sort"}, "fs": map[string]any{"type": "string", "x-index": []any{"facet", "sort"}},
+		"plain": map[string]any{"type": "string"},
+	})
+	w.doc(t, "a", map[string]any{"t": "x", "f": "x", "s": 1, "fs": "x", "plain": "x"})
+	x := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"items"}})
+	x.caughtUp("items")
+	for q, param := range map[string]string{
+		"facet[/plain]=x": "facet[/plain]", "facet[/s]=x": "facet[/s]", "facet[/t]=x": "facet[/t]",
+		"counts=/s": "counts", "counts=/t": "counts", "sort=/f": "sort", "sort=/t": "sort", "sort=/s,-/f": "sort",
+		"fields=/plain": "fields", "gt[/f]=1": "gt[/f]",
+	} {
+		r := x.answerOf("/items?"+q, "")
+		if msg, _ := r.body["message"].(string); r.status != 400 || r.body["code"] != "bad_input" || !strings.HasPrefix(msg, param+": ") {
+			t.Errorf("%s: %d %v", q, r.status, r.body)
+		}
+	}
+	for _, q := range []string{"facet[/f]=x", "facet[/fs]=x", "counts=/fs", "sort=/s,-/fs", "fields=/t,/f,/s", "ge[/s]=1"} {
+		if r := x.answerOf("/items?"+q, ""); r.status != 200 || len(r.body["hits"].([]any)) != 1 {
+			t.Errorf("%s: %d %v", q, r.status, r.body)
+		}
+	}
+}
+
+// TestV073PathsByVisibleDocs (IX-4, §A.4): paths are judged only by the
+// schemas of documents the reader may see.
+func TestV073PathsByVisibleDocs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	admin, issuer := clienttest.NewKey("admin"), clienttest.NewKey("issuer")
+	op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "sec")))
+	must(op.CreateNamespace(ctx, "sec", map[string]any{"read": "grant", "keys": []any{admin.Entry("*"), issuer.Entry("read")}}))
+	writer := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:root", []string{"sec"}, []string{"read", "create"})))
+	pub := must(writer.CreateDoc(ctx, "sec", "pub-schema", map[string]any{"$schema": d2020, "type": "object",
+		"properties": map[string]any{"title": map[string]any{"type": "string", "x-index": "facet"}}}))
+	secret := must(writer.CreateDoc(ctx, "sec", "salary-schema", map[string]any{"$schema": d2020, "type": "object",
+		"properties": map[string]any{"salary": map[string]any{"type": "number", "x-index": []any{"text", "facet", "sort"}}}}))
+	must(writer.CreateDoc(ctx, "sec", "pub-1", map[string]any{"$schema": "/r/sec/pub-schema/rev/" + pub.ID, "title": "x"}))
+	must(writer.CreateDoc(ctx, "sec", "secret-1", map[string]any{"$schema": "/r/sec/salary-schema/rev/" + secret.ID, "salary": 1}))
+	indexer := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"sec"}, []string{"read"})))
+	x := startSvc(t, indexer, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, now: s.Now})
+	x.caughtUp("sec")
+	whole := issuer.Grant(t, s.Now(), "user:boss", []string{"sec"}, []string{"read"})
+	limited := issuer.Grant(t, s.Now(), "user:bob", []string{"sec"}, []string{"read"},
+		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "pub-1"}}})
+	for _, q := range []string{"fields=/salary", "facet[/salary]=1", "counts=/salary", "sort=/salary"} {
+		if r := x.answerOf("/sec?"+q, limited); r.status != 400 {
+			t.Errorf("%s, limited reader: %d %v", q, r.status, r.body)
+		}
+		if r := x.answerOf("/sec?"+q, whole); r.status != 200 {
+			t.Errorf("%s, whole reader: %d %v", q, r.status, r.body)
+		}
+	}
+	if r := x.answerOf("/sec?facet[/title]=x", limited); r.status != 200 || fmt.Sprint(resources(r.body)) != "[pub-1]" {
+		t.Errorf("a path its documents' schema marks: %d %v", r.status, r.body)
+	}
+}

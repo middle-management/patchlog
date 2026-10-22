@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -19,14 +20,50 @@ import (
 // the fields can't be checked (502).
 var errSchemas = errors.New("cannot read a schema of the namespace's documents")
 
-// checkFields returns a *FieldError for the first of fields that no schema
-// of ns's documents, as of tx, marks with x-index (§A.4). The marks are read
-// from the schemas, not from the rows, so whether a query fails never
-// depends on whether a document has values at the path: the index learns a
-// document's marks only where it has values (annot.Collect walks schema and
-// document together), so here each schema is walked alone, along the path.
-func (ix *Index) checkFields(ctx context.Context, tx *sql.Tx, ns string, fields []string) error {
-	if len(fields) == 0 {
+// pathCheck is one path a query names, with the x-index kind a schema must
+// mark it with (§A.4): any kind ("") for fields, facet for facet[…] and
+// counts, sort for sort and for the range extensions, which read the sort
+// values. param names the parameter in the 400.
+type pathCheck struct{ param, path, kind string }
+
+// pathChecks lists q's paths in a fixed order: fields, facets, counts,
+// sort keys, ranges.
+func (q *Query) pathChecks() []pathCheck {
+	var out []pathCheck
+	for _, f := range q.Fields {
+		out = append(out, pathCheck{"fields", f, ""})
+	}
+	facets := make([]string, 0, len(q.Facets))
+	for p := range q.Facets {
+		facets = append(facets, p)
+	}
+	sort.Strings(facets)
+	for _, p := range facets {
+		out = append(out, pathCheck{"facet[" + p + "]", p, "facet"})
+	}
+	for _, p := range q.Counts {
+		out = append(out, pathCheck{"counts", p, "facet"})
+	}
+	for _, s := range q.Sorts {
+		out = append(out, pathCheck{"sort", s.path, "sort"})
+	}
+	for _, r := range q.Ranges {
+		out = append(out, pathCheck{r.name + "[" + r.path + "]", r.path, "sort"})
+	}
+	return out
+}
+
+// checkFields returns a *FieldError for the first path of q that no schema
+// indexed in ns for a document the reader may see, as of tx, marks with
+// the x-index kind it needs (§A.4): allow filters the documents (nil: the
+// reader reads them all). A document indexed as untyped, its schema
+// unavailable (§A.1), has no schema here. The marks are read from the
+// schemas, not from the rows, so whether a query fails never depends on
+// whether a document has values at the path: each schema is walked alone,
+// along the path.
+func (ix *Index) checkFields(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow func(string) bool) error {
+	checks := q.pathChecks()
+	if len(checks) == 0 {
 		return nil
 	}
 	var schemas []string
@@ -40,12 +77,25 @@ func (ix *Index) checkFields(ctx context.Context, tx *sql.Tx, ns string, fields 
 		if err != nil {
 			return err
 		}
-		schemas, last = append(schemas, s), s
+		last = s
+		if allow != nil {
+			// A reader of some resources (§A.4 Private namespaces): the
+			// schema counts if one of its documents is one of them.
+			seen, err := ix.schemaSeen(ctx, tx, ns, s, allow)
+			if err != nil {
+				return err
+			}
+			if !seen {
+				continue
+			}
+		}
+		schemas = append(schemas, s)
 	}
 	var transient error
 	w := &markWalk{load: ix.schemas.LoaderFor(ctx, ns, &transient), docs: map[string]any{}}
-	for _, f := range fields {
-		w.path, _ = pointer.Parse(f) // ParseQuery validated it
+	for _, c := range checks {
+		w.path, _ = pointer.Parse(c.path) // ParseQuery validated it
+		w.kind = c.kind
 		marked := false
 		for _, s := range schemas {
 			// A schema document is typed by its dialect, which marks nothing.
@@ -60,10 +110,31 @@ func (ix *Index) checkFields(ctx context.Context, tx *sql.Tx, ns string, fields 
 			return fmt.Errorf("%w: %v", errSchemas, transient)
 		}
 		if !marked {
-			return &FieldError{Path: f}
+			return &FieldError{Param: c.param, Path: c.path, Kind: c.kind}
 		}
 	}
 	return nil
+}
+
+// schemaSeen reports whether a document of ns typed by schema s is one
+// allow lets the reader see: its documents on docs_q, until the first that
+// is.
+func (ix *Index) schemaSeen(ctx context.Context, tx *sql.Tx, ns, s string, allow func(string) bool) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT resource FROM docs WHERE ns = ? AND schema = ?`, ns, s)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			return false, err
+		}
+		if allow(r) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // markWalk walks schemas statically along one field path, through the

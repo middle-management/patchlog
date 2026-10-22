@@ -36,9 +36,7 @@ import (
 //	                    before strings before booleans, missing values last in either
 //	                    direction (§A.2); default: score (with q), then resource name
 //	counts=/path        facet counts over all hits (repeatable)
-//	fields=/a,/b        also show those indexed fields in hits, "text" ones included; a path
-//	                    no schema of the namespace's documents marks with x-index is 400,
-//	                    one a hit has no values at is left out of it (§A.4, checkFields)
+//	fields=/a,/b        also show those indexed fields in hits, "text" ones included
 //	limit=n             page size, 1–100 (default 20)
 //	after=n             continue after the first n hits (from "next"); a ref query
 //	after=name          without q or sort, in resource order, pages as /_refs does
@@ -47,6 +45,13 @@ import (
 //	min=ns_id           read-your-writes (§A.5): an ns_id of the queried namespace, or
 //	min=ns:ns_id        ns:ns_id for any namespace the service follows; repeatable, and
 //	                    every one must be reached
+//
+// A fields path that no schema indexed in the namespace for a document the
+// reader may see marks with x-index, a facet or counts path none of them
+// marks facet, or a sort (or range) path none of them marks sort, is 400
+// (§A.4, checkFields). A hit carries its facet and sort values, and the
+// requested fields, each as "<path>": [values]; a path it has no values at
+// is left out of it.
 type Query struct {
 	Q      string
 	words  []string
@@ -100,6 +105,7 @@ func ParseMin(s string) (MinRef, error) {
 }
 
 type rangeFilter struct {
+	name     string // gt, ge, lt or le
 	op, path string
 	num      bool
 	f        float64
@@ -206,7 +212,7 @@ func ParseQuery(v url.Values) (*Query, error) {
 				for _, s := range vals {
 					// Strings compare as stored: as UTF-8 bytes, with
 					// no date-time normalisation (§A.2).
-					rf := rangeFilter{op: rangeOps[name], path: path}
+					rf := rangeFilter{name: name, op: rangeOps[name], path: path}
 					if f, err := strconv.ParseFloat(s, 64); err == nil {
 						rf.num, rf.f = true, f
 					} else {
@@ -669,12 +675,17 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 	return res, nil
 }
 
-// FieldError is a ?fields= path that no schema indexed in the namespace
-// marks with x-index (§A.4): 400.
-type FieldError struct{ Path string }
+// FieldError is a path of a query that no schema indexed in the namespace
+// for a document the reader may see marks with the x-index kind it needs
+// (§A.4, checkFields): 400, naming the parameter.
+type FieldError struct{ Param, Path, Kind string }
 
 func (e *FieldError) Error() string {
-	return "fields: " + e.Path + " is not a field any schema indexed in the namespace marks with x-index"
+	mark := "with x-index"
+	if e.Kind != "" {
+		mark = fmt.Sprintf("%q", e.Kind)
+	}
+	return e.Param + ": " + e.Path + " is not a path any schema indexed in the namespace for a document the reader may see marks " + mark
 }
 
 // attachSorts gives each hit its sort values as written, every value at the
