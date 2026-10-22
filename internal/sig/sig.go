@@ -55,17 +55,22 @@ type Signature struct {
 // String is the header form.
 func (s Signature) String() string { return s.Alg + ":" + s.Kid + ":" + b64.EncodeToString(s.Sig) }
 
-// Parse parses "<alg>:<kid>:<sig>". An algorithm other than Ed25519 parses
-// (it is stored unverified unless its kid is listed); the sig must be
-// unpadded base64url.
+// SigLen is the length of a signature's <sig>: 64 bytes in base64url
+// without padding (§C.3.1).
+const SigLen = 86
+
+// Parse parses "<alg>:<kid>:<sig>" (§C.3.1). An algorithm other than
+// Ed25519 parses (it is stored unverified unless its kid is listed); the
+// sig must be exactly SigLen characters of unpadded base64url, whatever
+// the alg or kid.
 func Parse(h string) (Signature, error) {
 	parts := strings.Split(h, ":")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
 		return Signature{}, errors.New(`a signature is "<alg>:<kid>:<sig>"`)
 	}
 	raw, err := b64.DecodeString(parts[2])
-	if err != nil {
-		return Signature{}, errors.New("the sig of a signature must be base64url without padding")
+	if err != nil || len(parts[2]) != SigLen {
+		return Signature{}, fmt.Errorf("the sig of a signature must be %d base64url characters without padding", SigLen)
 	}
 	return Signature{Alg: parts[0], Kid: parts[1], Sig: raw}, nil
 }

@@ -1,9 +1,24 @@
 package server
 
 import (
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 )
+
+// sendRaw sends a request built by hand, for headers req can't express
+// (repeated ones).
+func sendRaw(t *testing.T, hr *http.Request) *resp {
+	t.Helper()
+	r, err := client.Do(hr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	b, _ := io.ReadAll(r.Body)
+	return &resp{Code: r.StatusCode, H: r.Header, Body: b}
+}
 
 // expectShape checks a request-shape refusal (§6.2): 400 bad_input,
 // never cached.
@@ -55,4 +70,58 @@ func TestV073NoncharacterBodies(t *testing.T) {
 	f := newAuthFixture(t, nil)
 	r := f.do(req{method: "POST", path: "/edge-grants", raw: `{"grants":["` + strings.Repeat("A", 8) + `\ufdd0"]}`})
 	expectShape(t, "edge-grants", r)
+}
+
+// §C.3.1 (GR-37): a Signature header or step signature whose <sig> isn't
+// exactly 86 base64url characters, without padding, is 400 before step 1,
+// whatever its alg or kid; one of the right form by an unlisted kid is
+// stored unverified.
+func TestV073SignatureShape(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil)
+	e := f.tenv
+	g := e.grant(f.issuer, "user:alice", []string{"sec"}, []string{"read", "create", "append", "delete"})
+	gen := addRoot(map[string]any{"t": "x"})
+	good := strings.Repeat("A", 86)
+	for _, s := range []string{
+		"Ed25519:k1:abcd",                              // valid base64url, too short
+		"Ed25519:k1:" + strings.Repeat("A", 87),        // too long
+		"Ed25519:k1:" + strings.Repeat("A", 84) + "==", // padded
+		"Ed25519:k1:" + strings.Repeat("A", 85) + "+",  // not base64url
+		"other:k:" + strings.Repeat("A", 22),           // another alg
+		"",                                             // empty
+	} {
+		q := req{method: "PATCH", path: "/r/sec/a", ifNoneMatch: "*", body: gen, bearer: g, hdr: map[string]string{"Signature": s}}
+		expectShape(t, "PATCH "+s, e.do(q))
+		// Before authentication, and before the unknown namespace's 401.
+		q.bearer = ""
+		expectShape(t, "PATCH unauthenticated "+s, e.do(q))
+		q.path = "/r/nowhere/a"
+		expectShape(t, "PATCH unknown namespace "+s, e.do(q))
+		q = req{method: "DELETE", path: "/r/sec/a", ifMatch: hashID(t, "", nil), hdr: map[string]string{"Signature": s}}
+		expectShape(t, "DELETE "+s, e.do(q))
+		if s == "" {
+			continue
+		}
+		step := map[string]any{"patches": gen, "signature": s}
+		r := e.batchReq("sec", map[string]any{"items": []any{map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{step}}}}, g)
+		expectShape(t, "batch step "+s, r)
+		if _, has := r.Obj()["items"]; has {
+			t.Errorf("batch step %s: refused per item: %s", s, r.Body)
+		}
+	}
+	// Repeated: not one signature.
+	hr, _ := http.NewRequest("PATCH", e.srv.URL+"/r/sec/a", strings.NewReader(string(canonical(gen))))
+	hr.Header.Set("Content-Type", "application/json-patch+json")
+	hr.Header.Set("If-None-Match", "*")
+	hr.Header.Set("Authorization", "Bearer "+g)
+	hr.Header.Add("Signature", "Ed25519:k1:"+good)
+	hr.Header.Add("Signature", "Ed25519:k1:"+good)
+	expectShape(t, "repeated Signature", sendRaw(t, hr))
+	// An unlisted kid: stored unverified.
+	q := req{method: "PATCH", path: "/r/sec/a", ifNoneMatch: "*", body: gen, bearer: g, hdr: map[string]string{"Signature": "Ed25519:k1:" + good}}
+	expect(t, e.do(q), 201)
+	if le := e.lastLog("sec", "a", e.head("sec", "a", g), g); le["signature"] != "Ed25519:k1:"+good {
+		t.Fatalf("signature not stored: %v", le)
+	}
 }

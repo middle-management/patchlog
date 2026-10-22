@@ -29,13 +29,18 @@ func (s *Server) resourcePatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	sg, err := signature(r)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	bound, lim := s.patchBody(true)
 	body, err := readJSON(r, bound, lim)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	res, err := s.writeResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: r.Header.Get("Signature"), SourceCreds: sourceCreds(r)},
+	res, err := s.writeResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: sg, SourceCreds: sourceCreds(r)},
 		core.Item{Resource: name, IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Steps: []core.Step{{Patches: body, Gesture: g, Undoes: u}}})
 	if err != nil {
 		writeErr(w, err)
@@ -72,7 +77,12 @@ func (s *Server) resourceDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	res, err := s.writeResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: r.Header.Get("Signature")},
+	sg, err := signature(r)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	res, err := s.writeResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: sg},
 		core.Item{Resource: name, IfMatch: p.ifMatch, Steps: []core.Step{{Delete: true, Gesture: g, Undoes: u}}})
 	if err != nil {
 		writeErr(w, err)

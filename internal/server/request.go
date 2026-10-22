@@ -8,6 +8,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // Request shape: reading bodies, media types, preconditions, gestures,
@@ -156,6 +157,24 @@ func gestures(r *http.Request) (gesture, undoes string, err error) {
 	}
 	undoes, err = read("Undoes")
 	return gesture, undoes, err
+}
+
+// signature reads a single write's Signature header (§C.3.1): absent, or
+// once, "<alg>:<kid>:<sig>" with an 86-character base64url sig. Anything
+// else, an empty value included, is 400, a request-shape error answered
+// before step 1 (§6.2).
+func signature(r *http.Request) (string, error) {
+	vs := r.Header.Values("Signature")
+	switch {
+	case len(vs) == 0:
+		return "", nil
+	case len(vs) > 1:
+		return "", badInput("Signature given more than once (§C.3.1)")
+	}
+	if _, err := sig.Parse(vs[0]); err != nil {
+		return "", badInput("malformed Signature: " + err.Error() + " (§C.3.1)")
+	}
+	return vs[0], nil
 }
 
 // setGestures sets a write response's Gesture and Undoes headers: what the
@@ -323,11 +342,14 @@ func parseStep(v any, d gestureDefaults, where string) (core.Step, error) {
 					return core.Step{}, err
 				}
 			case "signature":
-				// The step's author signature (§7.5, §C.3.1); its form is
-				// checked with the rest of the request's shape (core).
+				// The step's author signature (§7.5, §C.3.1), in the form
+				// of the Signature header.
 				sv, ok := mv.(string)
 				if !ok || sv == "" {
 					return core.Step{}, badInput(where + ": signature must be a string, \"<alg>:<kid>:<sig>\"")
+				}
+				if _, err := sig.Parse(sv); err != nil {
+					return core.Step{}, badInput(fmt.Sprintf("%s: malformed signature: %v (§C.3.1)", where, err))
 				}
 				step.Signature = sv
 			default:
