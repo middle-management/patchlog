@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -661,5 +662,57 @@ func TestV073P17DrawRetriesDeadlock(t *testing.T) {
 	var tokens float64
 	if err := e.db.QueryRow(`SELECT tokens FROM rate_buckets WHERE key = 'a'`).Scan(&tokens); err != nil || tokens != 9 {
 		t.Fatalf("a after the draw: %v tokens, %v; want one deduction", tokens, err)
+	}
+}
+
+// merged gives one draw per bucket, in the order of the keys' bytes (as
+// rate_draw locks them): a bucket drawn on twice keeps its first draw's
+// rate and limit, with the costs added.
+func TestV073P17Merged(t *testing.T) {
+	r1, r2, r3 := Rate{1, 2}, Rate{3, 4}, Rate{5, 6}
+	got := merged([]draw{
+		{"r\x00n\x00b\x00w", r1, 1, "ratePerResource"},
+		{"p\x00w", r2, 3, "ratePerPrincipal"},
+		{"r\x00n\x00\xc3\xa9\x00w", r1, 1, "ratePerResource"},
+		{"r\x00n\x00z\x00w", r1, 1, "ratePerResource"},
+		{"r\x00n\x00b\x00w", r3, 2, "other"},
+		{"n\x00n", r3, 3, "ratePerNamespace"},
+	})
+	want := []draw{
+		{"n\x00n", r3, 3, "ratePerNamespace"},
+		{"p\x00w", r2, 3, "ratePerPrincipal"},
+		{"r\x00n\x00b\x00w", r1, 3, "ratePerResource"},
+		{"r\x00n\x00z\x00w", r1, 1, "ratePerResource"},
+		{"r\x00n\x00\xc3\xa9\x00w", r1, 1, "ratePerResource"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("merged:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+// merged takes time in proportion to a request's draws, give or take a
+// sort: a batch of n items draws on n per-resource buckets, and an atomic
+// import's batch is many thousands (§6.6 Allowances). Searching the
+// entries so far for each draw took seconds for 20000.
+func TestV073P17MergedLargeBatch(t *testing.T) {
+	const n = 50000
+	draws := []draw{{"p\x00w", Rate{1, 1}, n, "ratePerPrincipal"}, {"n\x00import", Rate{1, 1}, n, "ratePerNamespace"}}
+	for i := range n {
+		draws = append(draws, draw{fmt.Sprintf("r\x00import\x00doc-%06d\x00w", n-1-i), Rate{1, 1}, 1, "ratePerResource"})
+	}
+	// Each item draws on its resource's bucket twice.
+	draws = append(draws, draws[2:]...)
+	start := time.Now()
+	got := merged(draws)
+	if el := time.Since(start); el > 2*time.Second {
+		t.Fatalf("merged of %d draws took %v", len(draws), el)
+	}
+	if len(got) != n+2 || got[0].key != "n\x00import" || got[1].key != "p\x00w" {
+		t.Fatalf("merged: %d draws, first %q %q", len(got), got[0].key, got[1].key)
+	}
+	for i, d := range got[2:] {
+		if d.key != fmt.Sprintf("r\x00import\x00doc-%06d\x00w", i) || d.cost != 2 {
+			t.Fatalf("merged: draw %d is %q, cost %v", i+2, d.key, d.cost)
+		}
 	}
 }

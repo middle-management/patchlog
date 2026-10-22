@@ -1,13 +1,13 @@
 package core
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"log"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,18 +86,22 @@ func (s *bucketStore) close() error {
 // whatever the buckets hold with $6 (a charge): see rate_draw.
 const drawSQL = `SELECT k, t, admitted FROM rate_draw($1::bytea[], $2::float8[], $3::float8[], $4::float8[], $5::bigint, $6::boolean)`
 
-// merged is draws with one entry per bucket, in key order: the costs of a
-// bucket drawn on twice add up, as two draws on one bucket in memory do.
+// merged is draws with one entry per bucket, in key order (bytes): the
+// costs of a bucket drawn on twice add up, as two draws on one bucket in
+// memory do. A batch draws on a bucket per item, so it finds a bucket's
+// entry through a map, not by a search of the entries so far.
 func merged(draws []draw) []draw {
 	out := make([]draw, 0, len(draws))
+	at := make(map[string]int, len(draws))
 	for _, d := range draws {
-		if i := slices.IndexFunc(out, func(o draw) bool { return o.key == d.key }); i >= 0 {
+		if i, ok := at[d.key]; ok {
 			out[i].cost += d.cost
 			continue
 		}
+		at[d.key] = len(out)
 		out = append(out, d)
 	}
-	slices.SortFunc(out, func(a, b draw) int { return bytes.Compare([]byte(a.key), []byte(b.key)) })
+	slices.SortFunc(out, func(a, b draw) int { return strings.Compare(a.key, b.key) })
 	return out
 }
 
