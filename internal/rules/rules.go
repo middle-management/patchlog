@@ -87,9 +87,9 @@ type node interface {
 }
 
 // Compile validates and compiles one rule as stored: its schema fragments
-// compile as they did when stored, held to none of the rules §6.4.2 has
-// for fragments since v0.65 (F-S3): the library's formats asserted and
-// patterns read as §6.6 says, a pattern RE2 took as written included
+// compile as v0.55 compiled them, held to none of the rules §6.4.2 now
+// has for fragments (F-S3): the library's formats asserted and patterns
+// read as §6.6 says, a pattern RE2 took as written included
 // (schema.Legacy). Rules from stored namespace documents, and those of a
 // grant decoded under CompileStrict, compile so.
 func Compile(v any) (*Rule, error) { return compile(v, false) }
@@ -664,12 +664,13 @@ func compileCompare(m map[string]any) (node, error) {
 
 func (n *compareNode) eval(env map[string]any, unk blind) Tri {
 	// Each operand is missing (false whatever the other holds), known,
-	// or hidden by unk; a known one can decide alone (decides).
+	// or hidden by unk; a known one can decide alone (decides), and so
+	// can the whole envelope, an object whatever it holds.
 	unknown := false
 	get := func(p pointer.Pointer, right bool) (any, bool) {
 		if unk.hides(p, false) {
 			unknown = true
-			return nil, true
+			return nil, len(p) != 0 || !n.decides(env, right)
 		}
 		v, ok := pointer.Get(env, p)
 		return v, ok && !n.decides(v, right)

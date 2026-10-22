@@ -160,9 +160,10 @@ func parseKey(e any) (Key, error) {
 		}
 		re, err := SubPattern(s)
 		if err != nil {
-			// Stored before §6.6 read \uXXXX: RE2 took it as written,
-			// a \x{D800} included, and it keeps matching as it did.
-			// A config write refuses it (core checkKeyFields).
+			// A pattern the translation refuses but RE2 took as
+			// written, such as one with \x{D800}, may be stored from
+			// before v0.65: it keeps matching as it did. A config
+			// write refuses it (core checkKeyFields).
 			old, oerr := regexp.Compile(`^(?:` + s + `)$`)
 			if oerr != nil {
 				return k, fmt.Errorf("sub: %v", err)

@@ -158,6 +158,11 @@ func TestV073P20EvalTri(t *testing.T) {
 		{`{"op":"compare","path":"/missing","eq":{"path":"/doc/owner"}}`, False},
 		{`{"op":"compare","path":"/doc/owner","eq":{"path":"/principal/id"}}`, Unknown},
 		{`{"op":"compare","path":"/principal/id","eq":{"value":"u1"}}`, True},
+		// The whole envelope is an object, whatever it holds.
+		{`{"op":"compare","path":"/principal/id","in":{"path":""}}`, False},
+		{`{"op":"compare","path":"","lt":{"value":3}}`, False},
+		{`{"op":"compare","path":"","eq":{"path":"/principal"}}`, Unknown},
+		{`{"op":"compare","path":"/principal/groups","eq":{"path":""}}`, Unknown},
 	}
 	for i, x := range cases {
 		r := c(t, x.rule)
