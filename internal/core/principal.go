@@ -124,11 +124,10 @@ func (t *tx) principalBody(v *grant.Verified, cfg *Config) map[string]any {
 // limitsInForce are the limits of §6.6 as the server applies them in a
 // namespace whose configuration is cfg: the document's, over the
 // deployment's defaults and within its maximums, which hold alone for the
-// deployment-only limits.
+// deployment-only limits, grantSize and rulesPerGrant among them (§12.2).
 func (t *tx) limitsInForce(cfg *Config) map[string]any {
 	l, max := cfg.Limits, t.e.opt.Maximums
 	l.LogPageSize, l.LogPageBytes, l.BranchDepth, l.ExchangeRate = max.LogPageSize, max.LogPageBytes, max.BranchDepth, max.ExchangeRate
-	l.RulesPerGrant = t.rulesPerGrant(cfg)
-	l.GrantSize = min(l.GrantSize, max.GrantSize)
+	l.RulesPerGrant, l.GrantSize = max.RulesPerGrant, max.GrantSize
 	return l.Doc()
 }

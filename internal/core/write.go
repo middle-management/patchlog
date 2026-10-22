@@ -357,10 +357,11 @@ func (t *tx) batchLimits(cfg *Config, a *actor) (items, size int) {
 
 // BatchBodyLimit authenticates a batch request and returns how many bytes
 // of body the server reads for it, and the principal's batchSize (§6.6)
-// that a refusal names: that batchSize, plus
-// room for the batch's own JSON (items, preconditions, an optional config
-// change). A larger body is refused with 413 without reading the rest,
-// which reveals nothing about any item (§7.5). The batch itself
+// that a refusal names: four times the larger of that batchSize and the
+// deployment maximum of documentSize, as for a resource PATCH, which
+// leaves room for the batch's own JSON (items, preconditions, an optional
+// config change). A larger body is refused with 413 without reading the
+// rest, which reveals nothing about any item (§7.5). The batch itself
 // authenticates again.
 func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (bound, batchSize int, err error) {
 	err = e.read(ctx, func(t *tx) error {
@@ -375,8 +376,8 @@ func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (bound, batchS
 		}
 		// No state checks here: the gate answers them in order after the
 		// body is parsed (§6.2, §7.5). This only bounds how much is read.
-		items, size := t.batchLimits(cur, a)
-		bound, batchSize = size+size/4+512*items+max(cur.Limits.PatchSetSize, cur.Limits.DocumentSize)+64<<10, size
+		_, size := t.batchLimits(cur, a)
+		bound, batchSize = 4*max(size, t.e.opt.Maximums.DocumentSize), size
 		return nil
 	})
 	return bound, batchSize, err
@@ -718,7 +719,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// batch's, not an item's.
 	if isBatch {
 		if len(items) > maxItems {
-			return nil, nil, limitErr(413, "itemsPerBatch", int64(len(items)), int64(maxItems), fmt.Sprintf("more than %d items", maxItems))
+			return nil, nil, limitErr(422, "itemsPerBatch", int64(len(items)), int64(maxItems), fmt.Sprintf("more than %d items", maxItems))
 		}
 		size := 0
 		for _, s := range all {
@@ -729,11 +730,12 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			}
 		}
 		if size > maxSize {
-			return nil, nil, limitErr(413, "batchSize", int64(size), int64(maxSize), "batch too large")
+			return nil, nil, limitErr(422, "batchSize", int64(size), int64(maxSize), "batch too large")
 		}
 	}
 	for _, s := range st {
-		if err := checkLimits(cfg.Limits, s); err != nil {
+		readable := func() bool { return t.canRead(n, cfg, a, s.Resource) }
+		if err := checkLimits(cfg.Limits, s, readable); err != nil {
 			fs = append(fs, itemErr{s.index, err})
 		}
 	}
@@ -1358,8 +1360,10 @@ func genesisDocCanon(step *stepState) []byte {
 	return step.canon[len(genesisPrefix) : len(step.canon)-2 : len(step.canon)-2]
 }
 
-// checkLimits is step 4 (§6.6).
-func checkLimits(l Limits, s *itemState) *Error {
+// checkLimits is step 4 (§6.6). readable reports whether the caller may
+// read the resource: a refusal of a limit on the resulting document leaves
+// measured out for one that can't (unreadableLimit).
+func checkLimits(l Limits, s *itemState, readable func() bool) *Error {
 	for _, step := range s.steps {
 		if step.del {
 			continue
@@ -1369,43 +1373,48 @@ func checkLimits(l Limits, s *itemState) *Error {
 			maxPatch, key = l.DocumentSize, "documentSize"
 		}
 		if len(step.canon) > maxPatch {
-			return limitErr(413, key, int64(len(step.canon)), int64(maxPatch), "patch set too large")
+			return limitErr(422, key, int64(len(step.canon)), int64(maxPatch), "patch set too large")
 		}
 		if ops, ok := step.raw.([]any); ok && len(ops) > l.OpsPerSet {
 			return limitErr(422, "opsPerSet", int64(len(ops)), int64(l.OpsPerSet), "too many operations")
 		}
-		if step.docCanon = genesisDocCanon(step); step.docCanon == nil {
-			step.docCanon = jsonv.Canonical(step.doc)
-		}
-		if len(step.docCanon) > l.DocumentSize {
-			return limitErr(413, "documentSize", int64(len(step.docCanon)), int64(l.DocumentSize), "document too large")
-		}
-		sh := shapeOf(l, step.docCanon)
-		if sh.depth > l.NestingDepth {
-			return limitErr(422, "nestingDepth", int64(sh.depth), int64(l.NestingDepth), "document nested too deeply")
-		}
-		if step.sealed {
-			// e2e: clients check the limits on documents (§E.3.2); the
-			// server checks blobsPerDocument on the declared list (§E.3.1).
-			if len(step.declared) > l.BlobsPerDocument {
-				return limitErr(422, "blobsPerDocument", int64(len(step.declared)), int64(l.BlobsPerDocument), fmt.Sprintf("more than %d blobs declared", l.BlobsPerDocument))
-			}
-			continue
-		}
-		if sh.bad != nil {
-			return sh.bad
-		}
-		// Without a $blob member a document has no blob references, nor
-		// any to look up (checkBlobs).
-		step.noBlobs = !sh.blobs
-		if step.noBlobs {
-			continue
-		}
-		if err := checkBlobRefs(l, step.doc); err != nil {
+		if err := unreadableLimit(checkDocument(l, step), readable); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// checkDocument is checkLimits for a step's resulting document.
+func checkDocument(l Limits, step *stepState) *Error {
+	if step.docCanon = genesisDocCanon(step); step.docCanon == nil {
+		step.docCanon = jsonv.Canonical(step.doc)
+	}
+	if len(step.docCanon) > l.DocumentSize {
+		return limitErr(422, "documentSize", int64(len(step.docCanon)), int64(l.DocumentSize), "document too large")
+	}
+	sh := shapeOf(l, step.docCanon)
+	if sh.depth > l.NestingDepth {
+		return limitErr(422, "nestingDepth", int64(sh.depth), int64(l.NestingDepth), "document nested too deeply")
+	}
+	if step.sealed {
+		// e2e: clients check the limits on documents (§E.3.2); the
+		// server checks blobsPerDocument on the declared list (§E.3.1).
+		if len(step.declared) > l.BlobsPerDocument {
+			return limitErr(422, "blobsPerDocument", int64(len(step.declared)), int64(l.BlobsPerDocument), fmt.Sprintf("more than %d blobs declared", l.BlobsPerDocument))
+		}
+		return nil
+	}
+	if sh.bad != nil {
+		return sh.bad
+	}
+	// Without a $blob member a document has no blob references, nor
+	// any to look up (checkBlobs).
+	step.noBlobs = !sh.blobs
+	if step.noBlobs {
+		return nil
+	}
+	return checkBlobRefs(l, step.doc)
 }
 
 // validateDoc is step 5: resolve $schema and validate (§6.1). It returns the
@@ -2095,11 +2104,14 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			// The step's gestures (§7.2), as the request resolved them.
 			gesture, undoes := nullStr(it.Steps[k].Gesture), nullStr(it.Steps[k].Undoes)
 			var size, digest any
-			if k == len(it.steps)-1 && !step.del && level < levelSealed {
+			if k == len(it.steps)-1 && !step.del && level < levelAtRest {
 				// The head the write leaves (headMeta). Sealed and e2e
 				// namespaces never list them, and can't become less
 				// protected: none (e2e content has no document here
-				// anyway, §E.3).
+				// anyway, §E.3). Nor does one encrypted at rest, where
+				// a plaintext sha-256 beside the encrypted content would
+				// confirm a guess of the document (§E.1 Stored digests):
+				// its reads hash the document they serve.
 				if step.docCanon == nil {
 					step.docCanon = jsonv.Canonical(step.doc)
 				}
@@ -2235,13 +2247,16 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 // that moves a head stores them where it has the document at hand: step 7
 // here, and the chains remote branches and mirrored schemas insert
 // (insertChain). Sealed and e2e namespaces store none, as they list none
-// (e2e content has no document here, §E.3), nor do tombstones, nor rows
-// written before them or by an older instance, which are listed without
-// them until the next write. Nothing fills them in later, so a /heads page
-// never gains them once served; they only go: a purge clears them with
-// the content (its entry lists a purge, and its tags purge the cached
-// pages), and a namespace raised to sealed lists them, and created, no
-// more, and purges ns:{ns} with the raise (§9).
+// (e2e content has no document here, §E.3), nor do namespaces encrypted
+// at rest, where the digest would sit in plaintext beside the encrypted
+// content (§E.1 Stored digests), nor tombstones, nor rows written before
+// them or by an older instance, which are listed without them until the
+// next write. Nothing fills them in later, so a /heads page never gains
+// them once served; they only go: a purge clears them with the content
+// (its entry lists a purge, and its tags purge the cached pages), any
+// raise of the level clears them (encryptNamespace), and a namespace
+// raised to sealed lists them, and created, no more, and purges ns:{ns}
+// with the raise (§9).
 func headMeta(doc []byte) (int64, []byte) {
 	sum := sha256.Sum256(doc)
 	return int64(len(doc)), sum[:]

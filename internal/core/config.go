@@ -120,8 +120,6 @@ var limitFields = map[string]func(*Limits) *int{
 	"pathSize":             func(l *Limits) *int { return &l.PathSize },
 	"nestingDepth":         func(l *Limits) *int { return &l.NestingDepth },
 	"rulesPerNamespace":    func(l *Limits) *int { return &l.RulesPerNS },
-	"rulesPerGrant":        func(l *Limits) *int { return &l.RulesPerGrant },
-	"grantSize":            func(l *Limits) *int { return &l.GrantSize },
 	"itemsPerBatch":        func(l *Limits) *int { return &l.ItemsPerBatch },
 	"batchSize":            func(l *Limits) *int { return &l.BatchSize },
 	"branchesPerNamespace": func(l *Limits) *int { return &l.BranchesPerNamespace },
@@ -131,8 +129,12 @@ var limitFields = map[string]func(*Limits) *int{
 	"blobPending":          func(l *Limits) *int { return &l.BlobPending },
 }
 
-// deploymentOnlyLimits are limits of §6.6 that only a deployment sets.
-var deploymentOnlyLimits = map[string]bool{"logPageSize": true, "logPageBytes": true, "branchDepth": true, "exchangeRate": true}
+// deploymentOnlyLimits are limits of §6.6 that only a deployment sets
+// (§12.2). grantSize and rulesPerGrant were a namespace's to lower before
+// v0.63: a document stored with one still loads, its value ignored, until
+// a write changes it (parseLimits).
+var deploymentOnlyLimits = map[string]bool{"logPageSize": true, "logPageBytes": true, "branchDepth": true, "exchangeRate": true,
+	"grantSize": true, "rulesPerGrant": true}
 
 var rateFields = map[string]func(*Limits) *Rate{
 	"ratePerResource":  func(l *Limits) *Rate { return &l.RatePerResource },
@@ -188,6 +190,9 @@ type Config struct {
 	// that differs from its parent's. False for "optional", the default.
 	NonceRequired bool
 	level         int
+	// ruleForms counts the rule forms of rules, roles and key scopes,
+	// nested ones included, which rulesPerNamespace bounds (§12.2).
+	ruleForms int
 }
 
 // Allowance gives a named principal its own rate and batch limits (§6.6).
@@ -245,6 +250,26 @@ func (c *Config) allowance(sub, kid string, noKeys bool) *Allowance {
 		if a.Sub == sub && (a.Kid == kid || noKeys) {
 			return a
 		}
+	}
+	return nil
+}
+
+// allowanceAt returns the allowance that applies to a principal at now, or
+// nil: the first matching entry whose until hasn't passed, so an earlier
+// entry that has ended doesn't hide a later one (§6.6 Allowances). kid is
+// the key that signed the root block, "" while authentication is disabled,
+// when an entry matches the author's sub alone (an entry's kid is never
+// empty).
+func (c *Config) allowanceAt(now time.Time, sub, kid string) *Allowance {
+	for i := range c.Allowances {
+		a := &c.Allowances[i]
+		if a.Sub != sub || a.Kid != kid && kid != "" {
+			continue
+		}
+		if !a.Until.IsZero() && !now.Before(a.Until) {
+			continue // ended: ignored from until on
+		}
+		return a
 	}
 	return nil
 }
@@ -409,7 +434,7 @@ func checkMembers(doc, prev map[string]any) error {
 			for i, e := range arr {
 				s, _ := e.(string)
 				if _, perr := ids.Parse(s); perr != nil && !kept[s] {
-					err = badAt(pointer.Pointer{"revoked", strconv.Itoa(i)}, "must be a revocation id, the text id of a block's signature (§C.4)")
+					err = badAt(pointer.Pointer{"revoked", strconv.Itoa(i)}, "must be a revocation id: a root block's grant id, or a narrowing block's text(trunc160(sha256(signature))) (§C.4)")
 					break
 				}
 			}
@@ -455,8 +480,10 @@ func definedMembers(doc map[string]any) map[string]any {
 
 // checkKeyFields refuses fields a key entry doesn't define (§C.4), which
 // grant.ParseKeys accepts when they start with "x-", as stored documents
-// may hold them: key entries are strict (§7.4). An entry prev holds
-// unchanged is kept.
+// may hold them: key entries are strict (§7.4). An attrs schema is held to
+// the rules of a rule's schema (§C.4, §6.4.2), compiled as the test that
+// checks it at verification; grant.ParseKeys checks only that it is an
+// object or a boolean. An entry prev holds unchanged is kept.
 func checkKeyFields(v, prev any) *memberError {
 	pa, _ := prev.([]any)
 	arr, _ := v.([]any)
@@ -475,6 +502,11 @@ func checkKeyFields(v, prev any) *memberError {
 		for _, f := range sortedKeys(m) {
 			if isX(f) {
 				return badAt(pointer.Pointer{"keys", strconv.Itoa(i), f}, "is not a key field; a key entry holds only the fields of §C.4")
+			}
+		}
+		if a, ok := m["attrs"]; ok {
+			if _, err := rules.Compile(map[string]any{"op": "test", "path": "/attrs", "schema": a}); err != nil {
+				return badAt(pointer.Pointer{"keys", strconv.Itoa(i), "attrs"}, "must be a JSON Schema held to the rules of a rule's schema (§C.4, §6.4.2): %v", err)
 			}
 		}
 	}
@@ -650,12 +682,64 @@ var resNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 func ValidNSName(s string) bool       { return nsNameRe.MatchString(s) }
 func ValidResourceName(s string) bool { return resNameRe.MatchString(s) }
 
+// configMode is how parseConfig holds a namespace document to the
+// deployment's maximums (§6.6 Deployment defaults and maximums,
+// Allowances): a value above a maximum that a write sets is refused (422
+// limit), and one stored before the maximum was lowered is held to it.
+type configMode struct {
+	// stored is set for a document read back from storage (tx.config):
+	// every limit and allowance is held to the maximums, never refused,
+	// and a rule count over them is kept, so a namespace stays readable
+	// and writable after a deployment lowers a maximum.
+	stored bool
+	// prev is, for a write, the document it keeps (newConfig): a limit or
+	// an allowance entry it holds with the same value is held as a stored
+	// one is. Nil for a new namespace, whose every value is its write's.
+	prev map[string]any
+}
+
+// keptLimit reports whether a document's limits[k], x, is held as stored
+// rather than set by the write: always for a stored document, and for a
+// write when what it keeps holds the same value.
+func (md configMode) keptLimit(k string, x any) bool {
+	if md.stored {
+		return true
+	}
+	pl, _ := md.prev["limits"].(map[string]any)
+	pv, ok := pl[k]
+	return ok && jsonv.Equal(pv, x)
+}
+
+// keptAllowance is keptLimit for a member k, x, of the allowances entry
+// of a principal (sub and kid, which name one entry): kept where the
+// entry what the write keeps has for that principal holds the same value.
+func (md configMode) keptAllowance(sub, kid, k string, x any) bool {
+	if md.stored {
+		return true
+	}
+	pa, _ := md.prev["allowances"].([]any)
+	for _, p := range pa {
+		if pm, _ := p.(map[string]any); pm != nil && pm["sub"] == sub && pm["kid"] == kid {
+			pv, ok := pm[k]
+			return ok && jsonv.Equal(pv, x)
+		}
+	}
+	return false
+}
+
 // parseConfig validates a namespace document against the built-in
 // namespace-document schema and the deployment maximums: the members the
-// core reads. It also reads stored documents, so it leaves other members
-// alone; writes check them with checkMembers (§7.4).
-// defaults are the namespace defaults; max the deployment maximums.
+// core reads. Other members are left alone; writes check them with
+// checkMembers (§7.4). defaults are the namespace defaults; max the
+// deployment maximums. Every value is held to the maximums as a write's
+// (parseConfigIn).
 func parseConfig(doc any, defaults, max Limits) (*Config, error) {
+	return parseConfigIn(doc, defaults, max, configMode{})
+}
+
+// parseConfigIn is parseConfig in a mode: a stored document's, or a
+// write's with what it keeps.
+func parseConfigIn(doc any, defaults, max Limits, md configMode) (*Config, error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("the namespace document must be an object")
@@ -674,9 +758,9 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 			if err != nil {
 				return nil, fmt.Errorf("/rules: %v", err)
 			}
-			if len(rs) > max.RulesPerNS {
-				return nil, sizeLimit("rulesPerNamespace", len(rs), max.RulesPerNS, fmt.Sprintf("more than %d rules", max.RulesPerNS))
-			}
+			// rulesPerNamespace, the document's own or the deployment's
+			// maximum, holds the writes that change rules (newConfig).
+			c.ruleForms += rules.CountForms(v)
 			c.Rules = rs
 		case "keys":
 			ks, err := grant.ParseKeys(v)
@@ -687,6 +771,7 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 				if _, err := rules.CompileList(anySlice(k.Rules)); err != nil {
 					return nil, fmt.Errorf("/keys %s rules: %v", k.Kid, err)
 				}
+				c.ruleForms += rules.CountForms(anySlice(k.Rules))
 			}
 			c.Keys = ks
 		case "roles":
@@ -698,6 +783,7 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 				if _, err := rules.CompileList(anySlice(r.Rules)); err != nil {
 					return nil, fmt.Errorf("/roles/%s rules: %v", name, err)
 				}
+				c.ruleForms += rules.CountForms(anySlice(r.Rules))
 			}
 			c.Roles = rs
 		case "revoked":
@@ -713,11 +799,11 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 				c.Revoked[s] = true
 			}
 		case "limits":
-			if err := parseLimits(v, &c.Limits, max); err != nil {
+			if err := parseLimits(v, &c.Limits, max, md); err != nil {
 				return nil, err
 			}
 		case "allowances":
-			as, err := parseAllowances(v, max)
+			as, err := parseAllowances(v, max, md)
 			if err != nil {
 				return nil, err
 			}
@@ -892,12 +978,6 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 		return nil, fmt.Errorf(`/nonce: "required" is not allowed in an end-to-end namespace, whose ids are over ciphertext with a random IV already (§C.7)`)
 	}
 	if c.level == levelE2E {
-		// Sealing grows a patch set by half, and it carries the declared
-		// blob list (§6.6, Values).
-		l := c.Limits
-		if need := 3*(l.ValueSize+l.PathSize) + (1 << 10) + 36*l.BlobsPerDocument; need > l.PatchSetSize {
-			return nil, sizeLimit("patchSetSize", need, l.PatchSetSize, "an e2e namespace needs 3 × (valueSize + pathSize) + 1 KiB + 36 B × blobsPerDocument ≤ patchSetSize (§6.6)")
-		}
 		for i, r := range c.Retention {
 			if r.NoArchive {
 				return nil, fmt.Errorf(`/retention/%d/archive: "archive": false is not allowed in an e2e namespace, where pruning needs an archive (§8.6)`, i)
@@ -914,14 +994,23 @@ func anySlice(a []any) any {
 	return a
 }
 
-func parseLimits(v any, l *Limits, max Limits) error {
+// parseLimits reads a namespace document's limits over l. A value above
+// the deployment maximum, or a retry window outside the deployment's
+// range, is refused (422 limit) where the write sets it, and held to the
+// maximum or the range where it is kept as stored (configMode): a value
+// stored before the maximum was lowered (§6.6).
+func parseLimits(v any, l *Limits, max Limits, md configMode) error {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return fmt.Errorf("/limits must be an object")
 	}
 	for k, x := range m {
+		kept := md.keptLimit(k, x)
 		if deploymentOnlyLimits[k] {
-			return fmt.Errorf("/limits/%s is set by the deployment only (§6.6)", k)
+			if kept {
+				continue // stored before it was deployment only: ignored
+			}
+			return fmt.Errorf("/limits/%s is set by the deployment only (§6.6, §12.2)", k)
 		}
 		if f, ok := limitFields[k]; ok {
 			n, ok := x.(float64)
@@ -931,8 +1020,11 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				}
 				return fmt.Errorf("/limits/%s must be a non-negative integer", k)
 			}
-			if int(n) > *f(&max) {
-				return sizeLimit(k, int(n), *f(&max), fmt.Sprintf("/limits/%s exceeds the deployment maximum %d", k, *f(&max)))
+			if mx := *f(&max); int(n) > mx {
+				if !kept {
+					return sizeLimit(k, int(n), mx, fmt.Sprintf("/limits/%s exceeds the deployment maximum %d", k, mx))
+				}
+				n = float64(mx)
 			}
 			*f(l) = int(n)
 			continue
@@ -944,8 +1036,11 @@ func parseLimits(v any, l *Limits, max Limits) error {
 			if !ok || r <= 0 || b < 1 {
 				return fmt.Errorf("/limits/%s must be { rate, burst }", k)
 			}
-			if r > f(&max).Rate || b > f(&max).Burst {
-				return keyLimit(k, fmt.Sprintf("/limits/%s exceeds the deployment maximum", k))
+			if mx := *f(&max); r > mx.Rate || b > mx.Burst {
+				if !kept {
+					return keyLimit(k, fmt.Sprintf("/limits/%s exceeds the deployment maximum", k))
+				}
+				r, b = min(r, mx.Rate), min(b, mx.Burst)
 			}
 			*f(l) = Rate{r, b}
 			continue
@@ -957,7 +1052,10 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/remoteRegistration must be a positive ISO 8601 duration")
 			}
 			if d > max.RemoteRegistration {
-				return keyLimit(k, "/limits/remoteRegistration exceeds the deployment maximum")
+				if !kept {
+					return keyLimit(k, "/limits/remoteRegistration exceeds the deployment maximum")
+				}
+				d = max.RemoteRegistration
 			}
 			l.RemoteRegistration = d
 			continue
@@ -969,7 +1067,10 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/blobGrace must be a positive ISO 8601 duration")
 			}
 			if d > max.BlobGrace {
-				return keyLimit(k, "/limits/blobGrace exceeds the deployment maximum")
+				if !kept {
+					return keyLimit(k, "/limits/blobGrace exceeds the deployment maximum")
+				}
+				d = max.BlobGrace
 			}
 			l.BlobGrace = d
 			continue
@@ -981,7 +1082,15 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/retryWindow must be an ISO 8601 duration")
 			}
 			if d < max.RetryWindowMin || d > max.RetryWindow {
-				return keyLimit(k, "/limits/retryWindow is outside the deployment's range")
+				if !kept {
+					return keyLimit(k, "/limits/retryWindow is outside the deployment's range")
+				}
+				if d < max.RetryWindowMin {
+					d = max.RetryWindowMin
+				}
+				if d > max.RetryWindow {
+					d = max.RetryWindow
+				}
 			}
 			l.RetryWindow = d
 			continue
@@ -989,15 +1098,21 @@ func parseLimits(v any, l *Limits, max Limits) error {
 		return fmt.Errorf("/limits/%s is not a known limit", k)
 	}
 	// A pending blob lives at least as long as a retry may come (§6.6).
+	// Where neither is the write's, only holding them to the maximums made
+	// them cross: the grace is raised to the window.
 	if l.BlobGrace < l.RetryWindow {
-		return keyLimit("blobGrace", "/limits/blobGrace must be at least retryWindow (§6.6)")
+		written := func(k string) bool { x, ok := m[k]; return ok && !md.keptLimit(k, x) }
+		if written("blobGrace") || written("retryWindow") {
+			return keyLimit("blobGrace", "/limits/blobGrace must be at least retryWindow (§6.6)")
+		}
+		l.BlobGrace = l.RetryWindow
 	}
 	return nil
 }
 
 // sizeFields are limits in bytes. A namespace document writes them as
 // integers (§6.6); ParseSize's "64 MiB" form is for deployment flags only.
-var sizeFields = map[string]bool{"patchSetSize": true, "documentSize": true, "valueSize": true, "pathSize": true, "grantSize": true, "batchSize": true, "blobSize": true, "blobPending": true}
+var sizeFields = map[string]bool{"patchSetSize": true, "documentSize": true, "valueSize": true, "pathSize": true, "batchSize": true, "blobSize": true, "blobPending": true}
 
 var sizeRe = regexp.MustCompile(`^(\d+)\s*(B|KiB|MiB|GiB)?$`)
 
@@ -1021,7 +1136,12 @@ func ParseSize(s string) (int, error) {
 	return n, nil
 }
 
-func parseAllowances(v any, max Limits) ([]Allowance, error) {
+// parseAllowances reads a namespace document's allowances (§6.6). They
+// never exceed the deployment maximums, bucket that of ratePerNamespace
+// and the rest those of their own limits: a value the write sets above
+// one is refused (422 limit), and one kept as stored is held to it
+// (configMode).
+func parseAllowances(v any, max Limits, md configMode) ([]Allowance, error) {
 	arr, ok := v.([]any)
 	if !ok {
 		return nil, fmt.Errorf("/allowances must be an array")
@@ -1033,8 +1153,11 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 		if !ok {
 			return nil, fmt.Errorf("/allowances/%d must be an object", i)
 		}
+		sub, _ := m["sub"].(string)
+		kid, _ := m["kid"].(string)
 		a := Allowance{} // unset fields fall back to the namespace's limits
 		for k, x := range m {
+			kept := md.keptAllowance(sub, kid, k, x)
 			switch k {
 			case "sub", "kid":
 				s, ok := x.(string)
@@ -1053,6 +1176,12 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 				if !ok || len(o) != 2 || !rok || !bok || r <= 0 || b < 1 {
 					return nil, fmt.Errorf("/allowances/%d/bucket must be { rate, burst }, rate positive and burst at least 1", i)
 				}
+				if mx := max.RatePerNamespace; r > mx.Rate || b > mx.Burst {
+					if !kept {
+						return nil, keyLimit("ratePerNamespace", fmt.Sprintf("/allowances/%d/bucket exceeds the deployment maximum of ratePerNamespace (§6.6)", i))
+					}
+					r, b = min(r, mx.Rate), min(b, mx.Burst)
+				}
 				a.Rate = Rate{r, b}
 			case "itemsPerBatch":
 				n, ok := x.(float64)
@@ -1060,7 +1189,10 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, fmt.Errorf("/allowances/%d/itemsPerBatch must be a positive integer", i)
 				}
 				if int(n) > max.ItemsPerBatch {
-					return nil, sizeLimit("itemsPerBatch", int(n), max.ItemsPerBatch, fmt.Sprintf("/allowances/%d/itemsPerBatch exceeds the deployment maximum %d", i, max.ItemsPerBatch))
+					if !kept {
+						return nil, sizeLimit("itemsPerBatch", int(n), max.ItemsPerBatch, fmt.Sprintf("/allowances/%d/itemsPerBatch exceeds the deployment maximum %d", i, max.ItemsPerBatch))
+					}
+					n = float64(max.ItemsPerBatch)
 				}
 				a.ItemsPerBatch = int(n)
 			case "batchSize":
@@ -1070,7 +1202,10 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, fmt.Errorf("/allowances/%d/batchSize must be a positive integer, in bytes (§6.6)", i)
 				}
 				if n > max.BatchSize {
-					return nil, sizeLimit("batchSize", n, max.BatchSize, fmt.Sprintf("/allowances/%d/batchSize exceeds the deployment maximum %d", i, max.BatchSize))
+					if !kept {
+						return nil, sizeLimit("batchSize", n, max.BatchSize, fmt.Sprintf("/allowances/%d/batchSize exceeds the deployment maximum %d", i, max.BatchSize))
+					}
+					n = max.BatchSize
 				}
 				a.BatchSize = n
 			case "blobRate":
@@ -1081,7 +1216,10 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, fmt.Errorf("/allowances/%d/blobRate must be { rate, burst } in bytes, rate positive and burst at least 1", i)
 				}
 				if r > max.BlobRate.Rate || b > max.BlobRate.Burst {
-					return nil, keyLimit("blobRate", fmt.Sprintf("/allowances/%d/blobRate exceeds the deployment maximum", i))
+					if !kept {
+						return nil, keyLimit("blobRate", fmt.Sprintf("/allowances/%d/blobRate exceeds the deployment maximum", i))
+					}
+					r, b = min(r, max.BlobRate.Rate), min(b, max.BlobRate.Burst)
 				}
 				a.BlobRate = Rate{r, b}
 			case "blobPending":
@@ -1091,7 +1229,10 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, fmt.Errorf("/allowances/%d/blobPending must be a positive integer, in bytes (§6.6)", i)
 				}
 				if n > max.BlobPending {
-					return nil, sizeLimit("blobPending", n, max.BlobPending, fmt.Sprintf("/allowances/%d/blobPending exceeds the deployment maximum %d", i, max.BlobPending))
+					if !kept {
+						return nil, sizeLimit("blobPending", n, max.BlobPending, fmt.Sprintf("/allowances/%d/blobPending exceeds the deployment maximum %d", i, max.BlobPending))
+					}
+					n = max.BlobPending
 				}
 				a.BlobPending = n
 			case "until":
@@ -1213,6 +1354,7 @@ func (l Limits) Doc() map[string]any {
 		out[k] = rate(*f(&l))
 	}
 	out["logPageSize"], out["logPageBytes"], out["branchDepth"] = int64(l.LogPageSize), int64(l.LogPageBytes), int64(l.BranchDepth)
+	out["grantSize"], out["rulesPerGrant"] = int64(l.GrantSize), int64(l.RulesPerGrant)
 	out["exchangeRate"] = rate(l.ExchangeRate)
 	out["retryWindow"] = FormatDuration(l.RetryWindow)
 	out["remoteRegistration"] = FormatDuration(l.RemoteRegistration)
@@ -1232,3 +1374,24 @@ func (c *Config) starKeys() map[string]grant.Key {
 }
 
 func cloneDoc(m map[string]any) map[string]any { return jsonv.Clone(m).(map[string]any) }
+
+// checkValues is §6.6 Values: valueSize and pathSize keep every string
+// replaceable by one append with a test of its old value, sealed at E3
+// too, which grows a patch set by about half. A namespace's creation, a
+// branch's included, and a config write that changes limits or encryption
+// need 3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize in the
+// configuration they result in, the left side adding 36 B ×
+// blobsPerDocument at E3, for the declared blob list (§E.3.1). It is never
+// applied to a stored document, which an earlier release may have stored
+// under other defaults.
+func (c *Config) checkValues() error {
+	l := c.Limits
+	need, rule := 3*(l.ValueSize+l.PathSize)+(1<<10), "3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize"
+	if c.level == levelE2E {
+		need, rule = need+36*l.BlobsPerDocument, "3 × (valueSize + pathSize) + 1 KiB + 36 B × blobsPerDocument ≤ patchSetSize, at E3"
+	}
+	if need > l.PatchSetSize {
+		return sizeLimit("patchSetSize", need, l.PatchSetSize, fmt.Sprintf("a namespace needs %s, so that every string can be replaced by one append with a test of its old value (§6.6)", rule))
+	}
+	return nil
+}

@@ -20,7 +20,7 @@ import (
 func TestV055LimitResourceFields(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	e.mkNS("l", map[string]any{"limits": map[string]any{"documentSize": 1000, "patchSetSize": 200,
+	e.mkNS("l", map[string]any{"limits": map[string]any{"documentSize": 1000, "patchSetSize": 1500, "valueSize": 100, "pathSize": 50,
 		"nestingDepth": 3, "keepPerResource": 2}})
 
 	// A document grown past documentSize by appends within patchSetSize.
@@ -35,7 +35,7 @@ func TestV055LimitResourceFields(t *testing.T) {
 			head = etagOf(r)
 			continue
 		}
-		expectLimit(t, r, 413, "documentSize", int64(len(canonical(doc))), 1000)
+		expectLimit(t, r, 422, "documentSize", int64(len(canonical(doc))), 1000)
 		break
 	}
 
@@ -83,13 +83,20 @@ func TestV055LimitConfigFields(t *testing.T) {
 	expectLimit(t, allow("blobRate", map[string]any{"rate": 1e15, "burst": 1}), 422, "blobRate", -1, -1)
 
 	// Config patch sets and documents (§7.4 step 4).
-	e.mkNS("s", map[string]any{"limits": map[string]any{"patchSetSize": 400, "documentSize": 600}})
-	big := ops(op("add", "/x-a", strings.Repeat("a", 400)))
-	expectLimit(t, e.patchNS("s", big, ""), 413, "patchSetSize", int64(len(canonical(big))), 400)
-	expect(t, e.patchNS("s", ops(op("add", "/x-a", strings.Repeat("a", 300))), ""), 201)
-	want := map[string]any{"limits": map[string]any{"patchSetSize": 400, "documentSize": 600},
-		"x-a": strings.Repeat("a", 300), "x-b": strings.Repeat("b", 300)}
-	expectLimit(t, e.patchNS("s", ops(op("add", "/x-b", strings.Repeat("b", 300))), ""), 413, "documentSize", int64(len(canonical(want))), 600)
+	lim := map[string]any{"patchSetSize": 1500, "documentSize": 2000, "valueSize": 100, "pathSize": 50}
+	e.mkNS("s", map[string]any{"limits": lim})
+	strs := func(c string, n int) []any {
+		out := make([]any, n)
+		for i := range out {
+			out[i] = strings.Repeat(c, 98)
+		}
+		return out
+	}
+	big := ops(op("add", "/x-a", strs("a", 16)))
+	expectLimit(t, e.patchNS("s", big, ""), 422, "patchSetSize", int64(len(canonical(big))), 1500)
+	expect(t, e.patchNS("s", ops(op("add", "/x-a", strs("a", 8))), ""), 201)
+	want := map[string]any{"limits": lim, "x-a": strs("a", 8), "x-b": strs("b", 12)}
+	expectLimit(t, e.patchNS("s", ops(op("add", "/x-b", strs("b", 12))), ""), 422, "documentSize", int64(len(canonical(want))), 2000)
 }
 
 // §6.6, §C.8: rulesPerGrant and grantSize are the deployment's (deployment
@@ -109,6 +116,14 @@ func TestV055LimitGrantFields(t *testing.T) {
 	expectLimit(t, e.write("PATCH", "sec", "x", "", addRoot(map[string]any{}), g), 413, "rulesPerGrant", rpg+1, rpg)
 	g = e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "create"}, map[string]any{"rules": rules[:rpg]})
 	expect(t, e.write("PATCH", "sec", "x", "", addRoot(map[string]any{}), g), 201)
+
+	// A namespace document can't set either (§12.2).
+	tk := newKey("tk")
+	for _, k := range []string{"grantSize", "rulesPerGrant"} {
+		r := e.do(req{method: "PATCH", path: "/ns/tiny", ifNoneMatch: "*", bearer: e.operatorGrant("tiny"),
+			body: addRoot(map[string]any{"keys": []any{tk.entry("*")}, "limits": map[string]any{k: 1}})})
+		expectCode(t, r, 422, "invalid")
+	}
 
 	gs := int64(core.DefaultMaximums().GrantSize)
 	// Too long to decode: measured is a lower bound, the decoded length.
@@ -158,6 +173,7 @@ func TestV055LimitOversizedBodies(t *testing.T) {
 	t.Parallel()
 	l := core.DefaultLimits()
 	l.DocumentSize, l.PatchSetSize, l.BatchSize, l.ItemsPerBatch = 64<<10, 16<<10, 2048, 10
+	l.ValueSize, l.PathSize = 4<<10, 1<<10 // 3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize (§6.6)
 	e := newEnv(t, func(o *core.Options) { o.Limits, o.Maximums = l, l })
 	e.mkNS("b", map[string]any{})
 	at := e.nsHead("b")
@@ -168,7 +184,7 @@ func TestV055LimitOversizedBodies(t *testing.T) {
 	// is, naming documentSize (§6.6, v0.73).
 	expectLimit(t, e.patchNS("b", ops(op("add", "/x-a", pad)), ""), 413, "documentSize", int64(bound+1), 64<<10)
 	expectLimit(t, e.branch("b", map[string]any{"name": "b1", "at": at, "x-pad": pad}, "alice"), 413, "documentSize", int64(bound+1), 64<<10)
-	batchBound := 2048 + 2048/4 + 512*10 + (64 << 10) + 64<<10
+	batchBound := 4 * (64 << 10) // 4 × max(batchSize, the maximum documentSize) (§7.5)
 	r := e.do(req{method: "POST", path: "/ns/b/batch", author: "alice", body: map[string]any{"items": []any{
 		map[string]any{"resource": "r", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{"a": pad})}}}}})
 	expectLimit(t, r, 413, "batchSize", int64(batchBound+1), 2048)

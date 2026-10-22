@@ -500,6 +500,13 @@ func (e *Engine) parseConfig(doc any) (*Config, error) {
 	return parseConfig(doc, e.opt.Limits, e.opt.Maximums)
 }
 
+// parseStoredConfig parses a stored namespace document, holding its limits
+// and allowances to this deployment's maximums rather than refusing them:
+// a value stored before a maximum was lowered (§6.6).
+func (e *Engine) parseStoredConfig(doc any) (*Config, error) {
+	return parseConfigIn(doc, e.opt.Limits, e.opt.Maximums, configMode{stored: true})
+}
+
 func (e *Engine) now() time.Time { return e.opt.Now().UTC() }
 
 // Now is the engine's clock (Options.Now), for the server's edge grants.
@@ -1047,7 +1054,7 @@ func (t *tx) config(seq int64) *Config {
 	}
 	var doc string
 	t.must(t.QueryRow(`SELECT doc FROM ns_config WHERE seq = ?`, seq).Scan(&doc))
-	c, err := t.e.parseConfig(jsonv.MustParse([]byte(doc)))
+	c, err := t.e.parseStoredConfig(jsonv.MustParse([]byte(doc)))
 	if err != nil {
 		panic(fmt.Errorf("stored namespace document %d is invalid: %w", seq, err))
 	}

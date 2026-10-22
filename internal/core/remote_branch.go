@@ -873,6 +873,11 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 	if err != nil {
 		return nil, nil, nil, patchErr(err)
 	}
+	// Step 4: a creation counts as a create, held to the deployment's
+	// defaults, as createNamespace's (§6.6).
+	if err := checkConfigLimits(t.e.opt.Limits, cc.Patches, jsonv.Canonical(cc.Patches), true, jsonv.Canonical(doc), func() bool { return true }); err != nil {
+		return nil, nil, nil, err
+	}
 	cfg, perr := t.e.newConfig(doc, nil, nil)
 	if perr != nil {
 		return nil, nil, nil, perr
@@ -1221,9 +1226,10 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 			undoes = e.Undoes
 		}
 		var size, digest any
-		if kind == kindRev && !ch.opaque && i == len(ch.entries)-1 && t.resLevel(res) < levelSealed {
-			// The head the chain leaves (headMeta), but not in a sealed
-			// shadow or namespace, which never lists them.
+		if kind == kindRev && !ch.opaque && i == len(ch.entries)-1 && t.resLevel(res) < levelAtRest {
+			// The head the chain leaves (headMeta), but not in a shadow
+			// or namespace encrypted at all: a sealed one never lists
+			// them, and at rest they would sit in plaintext (§E.1).
 			sz, sum := headMeta(canonDoc)
 			size, digest = sz, sum
 		}

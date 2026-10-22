@@ -3,8 +3,10 @@ package core
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"runtime"
+	"strings"
 
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
@@ -320,6 +322,9 @@ CREATE TABLE IF NOT EXISTS remote_notices (
   created   INTEGER NOT NULL,
   UNIQUE (branch, id)
 );
+
+-- Addition: the one-time data migrations done (dataMigrations), by name.
+CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);
 `
 
 // openDB opens the database: a Postgres URL (pgschema.go), or a SQLite
@@ -426,8 +431,103 @@ func migrate(db *sql.DB) error {
 		}
 	}
 	// After the columns exist, in databases from before them too.
-	_, err := db.ExecContext(ctx, gestureIndexes)
-	return err
+	if _, err := db.ExecContext(ctx, gestureIndexes); err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := migrateData(ctx, tx, func(int) string { return "?" }); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// dataMigrations change the data a database an earlier version wrote holds,
+// each once: migrateData runs those the migrations table doesn't name, in
+// order, and records them in the same transaction. ph is the dialect's
+// placeholder for the n-th argument.
+var dataMigrations = []struct {
+	name string
+	run  func(ctx context.Context, tx *sql.Tx, ph func(n int) string) error
+}{
+	{"at-rest-digests", clearAtRestDigests},
+}
+
+func migrateData(ctx context.Context, tx *sql.Tx, ph func(n int) string) error {
+	for _, m := range dataMigrations {
+		var done bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM migrations WHERE name = `+ph(1)+`)`, m.name).Scan(&done); err != nil {
+			return err
+		}
+		if done {
+			continue
+		}
+		if err := m.run(ctx, tx, ph); err != nil {
+			return fmt.Errorf("%s: %w", m.name, err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO migrations (name) VALUES (`+ph(1)+`)`, m.name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// clearAtRestDigests drops the plaintext sizes and sha-256s of head
+// documents (headMeta) that versions before v0.73 stored for every level
+// below sealed, from the revisions of namespaces now encrypted at all and
+// of remote shadows serving such a branch (nsLevel): at rest a server
+// leaves them out (§E.1 Stored digests), and in a namespace already at
+// rest no raise (encryptNamespace) or later write clears them. The level
+// is read from each namespace's current document, stored in plaintext.
+func clearAtRestDigests(ctx context.Context, tx *sql.Tx, ph func(n int) string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT n.ns, n.name, c.doc FROM namespaces n LEFT JOIN ns_config c ON c.seq = n.config_seq`)
+	if err != nil {
+		return err
+	}
+	type nsName struct {
+		id   int64
+		name string
+	}
+	var all []nsName
+	encrypted := map[string]bool{}
+	for rows.Next() {
+		var n nsName
+		var doc sql.NullString
+		if err := rows.Scan(&n.id, &n.name, &doc); err != nil {
+			rows.Close()
+			return err
+		}
+		all = append(all, n)
+		var d struct {
+			Encryption struct {
+				Level string `json:"level"`
+			} `json:"encryption"`
+		}
+		if doc.Valid && json.Unmarshal([]byte(doc.String), &d) == nil && levelOf(d.Encryption.Level) >= levelAtRest {
+			encrypted[n.name] = true
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, n := range all {
+		name := n.name
+		if strings.HasPrefix(name, "~") {
+			// "~{branch}" or "~{branch}~{i}": the remote branch's level.
+			name, _, _ = strings.Cut(name[1:], "~")
+		}
+		if !encrypted[name] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE revisions SET size = NULL, digest = NULL WHERE digest IS NOT NULL AND res IN (SELECT res FROM resources WHERE ns = `+ph(1)+`)`, n.id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // gestureIndexes find the revisions of a gesture, and those undoing it
