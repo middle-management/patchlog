@@ -425,8 +425,9 @@ func (st *reqState) offered(ctx context.Context, ns string) (why, err error) {
 }
 
 // fileInfo is a file or directory as the handler sees it. A document's
-// ETag is its revision id; a written file's is the revision its close
-// committed, if that holds exactly what was written.
+// ETag is its revision id, weak where the bytes served are the writer's
+// own (weak); a written file's is the revision its close committed, if
+// that holds exactly what was written.
 type fileInfo struct {
 	name  string
 	size  int64
@@ -436,6 +437,10 @@ type fileInfo struct {
 	rev   string
 	ctype string
 	w     *writeFile
+	// weak: the file reads as the bytes its writer uploaded, which
+	// the revision holds exactly though its rendering differs (repr):
+	// served under W/"{id}" (§H.1 "Writer's bytes")
+	weak bool
 }
 
 func (fi *fileInfo) Name() string       { return fi.name }
@@ -453,6 +458,9 @@ func (fi *fileInfo) ETag(context.Context) (string, error) {
 	}
 	if rev == "" {
 		return "", webdav.ErrNotImplemented
+	}
+	if fi.weak {
+		return `W/"` + rev + `"`, nil
 	}
 	return `"` + rev + `"`, nil
 }
@@ -472,14 +480,15 @@ func (st *reqState) dirInfo(name string) *fileInfo {
 
 // docInfo is a live document's file (§H.3): its size and type as every
 // tool lists them (files.MetaOf), but a JSON file's size is that of the
-// bytes the principal wrote where it reads those back (repr). Its time
-// is when the head was written (modTime).
+// bytes the principal wrote where it reads those back (repr), under a
+// weak ETag (§H.1 "Writer's bytes"): everyone else reads the rendering
+// under the strong one. Its time is when the head was written (modTime).
 func (st *reqState) docInfo(name string, hd headDoc) *fileInfo {
 	fi := &fileInfo{name: name, rev: hd.rev, mode: 0o644, size: hd.m.Size, ctype: hd.m.Type,
 		mod: st.s.modTime(st.p, docKey(hd.ns, hd.name, hd.rev), hd.created, hd.m.modified)}
 	if hd.m.raw == nil {
 		if b := st.s.exactOf(st.p, hd.ns, hd.name, hd.rev); b != nil {
-			fi.size = int64(len(b))
+			fi.size, fi.weak = int64(len(b)), true
 		}
 	}
 	return fi
@@ -830,6 +839,9 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		return nil, errNotExist
 	}
 	if served {
+		if err := st.ifMatchGet(t, hd.rev); err != nil {
+			return nil, err
+		}
 		// What the client now has is a base of its next save, once a GET's
 		// body is sent (a 304 sends none). A client whose copy is suspect
 		// gets the file whatever its validators say (§H.1 "Identity").
@@ -858,6 +870,26 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		}
 	}
 	return f, nil
+}
+
+// ifMatchGet checks a GET's or HEAD's If-Match against revision rev of
+// file t, which it serves, and takes it out of the request: a gateway
+// takes a weak tag like the strong one in any If-Match (§H.1 "Writer's
+// bytes"), where http.ServeContent compares them strongly (RFC 9110
+// §13.1.1), which no weak tag passes, the writer's own W/"{id}"
+// included. One that names neither * nor rev is a 412.
+func (st *reqState) ifMatchGet(t target, rev string) error {
+	if st.hdr == nil || st.hdr.Get("If-Match") == "" {
+		return nil
+	}
+	im := st.hdr.Get("If-Match")
+	for _, tag := range strings.Split(im, ",") {
+		if tag = strings.TrimSpace(tag); tag == "*" || revOfETag(tag) == rev {
+			st.hdr.Del("If-Match")
+			return nil
+		}
+	}
+	return fail(http.StatusPreconditionFailed, "%s is at revision %s, which its If-Match doesn't name", t.path, rev)
 }
 
 // preconditions checks a PUT's If-None-Match: * (create only) and

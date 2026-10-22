@@ -86,7 +86,8 @@ func TestPutCreateEdit(t *testing.T) {
 	if en := e.lastEntry("docs", "new"); en.Author != "dav" {
 		t.Fatalf("author %q", en.Author)
 	}
-	if l := e.propfind("/docs/"); l["/docs/new.json"].size != strconv.Itoa(len(upload)) || l["/docs/new.json"].etag != `"`+h.ID+`"` {
+	// The writer's bytes are listed under the weak tag (§H.1).
+	if l := e.propfind("/docs/"); l["/docs/new.json"].size != strconv.Itoa(len(upload)) || l["/docs/new.json"].etag != `W/"`+h.ID+`"` {
 		t.Fatalf("listed after PUT %+v, want size %d", l["/docs/new.json"], len(upload))
 	}
 

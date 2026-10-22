@@ -470,3 +470,51 @@ func TestV073MoveSourceIfMatch(t *testing.T) {
 		t.Fatalf("folder %v", e.nodeDoc("cat", "empty"))
 	}
 }
+
+// Where the gateway serves a writer its own uploaded bytes, which the
+// revision holds exactly though its rendering differs, GET, HEAD and
+// PROPFIND carry W/"{id}"; everyone else reads the rendering under
+// "{id}"; the PUT's answer stays strong, and the weak tag works in any
+// If-Match, a GET's included, and as a save's base (§H.1 "Writer's
+// bytes", GW-2).
+func TestV073WriterBytesWeakETag(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	o := e.another()
+	upload := `{"b": 1,   "a": 2}`
+	r := e.expect(e.do("PUT", "/docs/w.json", upload), 201, "PUT")
+	h, _ := e.load("docs", "w")
+	strong, weak := `"`+h.ID+`"`, `W/"`+h.ID+`"`
+	if r.header.Get("ETag") != strong {
+		t.Fatalf("PUT ETag %q, want %s", r.header.Get("ETag"), strong)
+	}
+	if g := e.expect(e.do("GET", "/docs/w.json", ""), 200, "the writer's GET"); g.body != upload || g.header.Get("ETag") != weak {
+		t.Fatalf("the writer's GET: %q under %q", g.body, g.header.Get("ETag"))
+	}
+	if g := e.expect(e.do("HEAD", "/docs/w.json", ""), 200, "the writer's HEAD"); g.header.Get("ETag") != weak {
+		t.Fatalf("the writer's HEAD: %q", g.header.Get("ETag"))
+	}
+	if l := e.propfind("/docs/"); l["/docs/w.json"].etag != weak {
+		t.Fatalf("the writer's listing: %+v", l["/docs/w.json"])
+	}
+	if l := e.propfind("/docs/w.json", "0"); l["/docs/w.json"].etag != weak {
+		t.Fatalf("the writer's PROPFIND: %+v", l["/docs/w.json"])
+	}
+	if g := o.expect(o.do("GET", "/docs/w.json", ""), 200, "another user's GET"); g.body != rendered(map[string]any{"a": 2, "b": 1}) || g.header.Get("ETag") != strong {
+		t.Fatalf("another user's GET: %q under %q", g.body, g.header.Get("ETag"))
+	}
+	if l := o.propfind("/docs/"); l["/docs/w.json"].etag != strong {
+		t.Fatalf("another user's listing: %+v", l["/docs/w.json"])
+	}
+	for _, tag := range []string{strong, weak} {
+		e.expect(e.do("GET", "/docs/w.json", "", "If-None-Match", tag), 304, "the writer's GET If-None-Match "+tag)
+		e.expect(e.do("GET", "/docs/w.json", "", "If-Match", tag), 200, "the writer's GET If-Match "+tag)
+		o.expect(o.do("GET", "/docs/w.json", "", "If-Match", tag), 200, "another user's GET If-Match "+tag)
+		e.expect(e.do("HEAD", "/docs/w.json", "", "If-Match", tag), 200, "the writer's HEAD If-Match "+tag)
+	}
+	e.expect(e.do("GET", "/docs/w.json", "", "If-Match", `"1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`), 412, "GET If-Match another revision")
+	e.theirs("docs", "w", map[string]any{"op": "add", "path": "/c", "value": 3})
+	e.expect(e.do("PUT", "/docs/w.json", `{"b": 1, "a": 5}`, "If-Match", weak), 201, "PUT with the weak tag as its base")
+	_, doc := e.load("docs", "w")
+	sameJSON(t, doc, map[string]any{"a": 5, "b": 1, "c": 3})
+}
