@@ -410,18 +410,44 @@ func (ch *Checker) PurgedRead(ctx context.Context, ns, token string) (head strin
 // Decode decodes a bearer token as Verify does, without verifying it, so a
 // caller checking many namespaces can see which ones it names first. As
 // the origin does, it refuses a token over grantSize or rulesPerGrant
-// before its ns check, and one whose rules don't compile (§C.8, §6.6),
-// both as *grant.AuthError with status 401 (the origin answers the limits
-// 413).
+// before its ns check (§C.8, §6.6), as a *LimitError, and one whose rules
+// don't compile as a *grant.AuthError with status 401.
 func (ch *Checker) Decode(token string) (*grant.Grant, error) {
 	g, err := grant.DecodeLimited(token, grant.Limits{Size: ch.maxGrant, Rules: ch.maxRules})
+	var tl *grant.TooLargeError
+	var tr *grant.TooManyRulesError
 	switch {
+	case errors.As(err, &tl):
+		return nil, &LimitError{Limit: "grantSize", Measured: tl.Size, Max: tl.Max}
+	case errors.As(err, &tr):
+		return nil, &LimitError{Limit: "rulesPerGrant", Measured: tr.Count, Max: tr.Max}
 	case errors.Is(err, grant.ErrTooLarge):
-		return nil, &grant.AuthError{Status: 401, Msg: "grant too large"}
-	case errors.Is(err, grant.ErrTooManyRules):
-		return nil, &grant.AuthError{Status: 401, Msg: "too many rules in the grant's blocks"}
+		return nil, &LimitError{Limit: "grantSize", Measured: ch.maxGrant + 1, Max: ch.maxGrant}
 	}
 	return g, err
+}
+
+// LimitError is a bearer token over grantSize or rulesPerGrant (§C.8,
+// §6.6), Measured against Max. Services verify as the origin does (§C.6),
+// which answers it 413, code limit, naming the limit, so a service that
+// answers grant failures itself answers it so too (internal/tree). It
+// unwraps to the 401 *grant.AuthError that callers answering only
+// grant.AuthError give it.
+type LimitError struct {
+	Limit         string // "grantSize" or "rulesPerGrant"
+	Measured, Max int
+}
+
+func (e *LimitError) Error() string {
+	return fmt.Sprintf("grant over %s: %d, at most %d", e.Limit, e.Measured, e.Max)
+}
+
+// Unwrap is the 401 a caller answering only *grant.AuthError gives.
+func (e *LimitError) Unwrap() error {
+	if e.Limit == "rulesPerGrant" {
+		return &grant.AuthError{Status: 401, Msg: "too many rules in the grant's blocks"}
+	}
+	return &grant.AuthError{Status: 401, Msg: "grant too large"}
 }
 
 // unreadable reports a namespace document the checker can't fetch because
