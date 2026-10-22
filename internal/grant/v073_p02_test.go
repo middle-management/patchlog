@@ -1,6 +1,7 @@
 package grant
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -243,4 +244,104 @@ func TestV073StoredAuthorityBlock(t *testing.T) {
 	}
 	_, err = ParseStoredBlock(n.c.blocks[1].encode())
 	wantStatus(t, err, 401)
+}
+
+// "*" in a block's can makes the grant invalid (§C.1, v0.66), a narrowing
+// block's too.
+func TestV073StarCanInNarrowingBlock(t *testing.T) {
+	f := newFixture(t, nil)
+	n, err := mustMint(t, f, nil).NarrowUnvalidated(map[string]any{"can": []string{"*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Decode(n.Encode(), 0)
+	wantStatus(t, err, 401)
+}
+
+// Only rules at top level or nested only in all fix /resource (§2.1,
+// v0.68): a test under not, any or if never does, so a readScope key
+// refuses such a read grant (§C.4).
+func TestV073FixesResourceOnlyThroughAll(t *testing.T) {
+	is := func(name string) map[string]any {
+		return map[string]any{"op": "test", "path": "/resource", "value": name}
+	}
+	f := newFixture(t, map[string]any{"readScope": "resource"})
+	for name, rule := range map[string]any{
+		"not": map[string]any{"not": is("x")},
+		"any": map[string]any{"any": []any{is("x")}},
+		"if":  map[string]any{"if": []any{is("x")}, "then": []any{is("x")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Verify(roundtrip(t, mustMint(t, f, map[string]any{"rules": []any{rule}})), f.env())
+			wantStatus(t, err, 403)
+		})
+	}
+	v, err := Verify(roundtrip(t, mustMint(t, f, map[string]any{"rules": []any{map[string]any{"all": []any{is("x")}}}})), f.env())
+	if err != nil || !v.FixesResource() {
+		t.Fatalf("all: %v", err)
+	}
+}
+
+// A grant whose rules don't compile is invalid (§6.4.2, §6.6): Decode
+// refuses it (401), so every request that doesn't ignore the grant does,
+// not only one that evaluates the rule (v0.63, v0.65).
+func TestV073RulesCompiledAtDecode(t *testing.T) {
+	f := newFixture(t, nil)
+	for name, rule := range map[string]any{
+		"unknown op":    map[string]any{"op": "frob", "path": "/action"},
+		"no form":       map[string]any{"path": "/action"},
+		"nested":        map[string]any{"all": []any{map[string]any{"not": map[string]any{"op": "test"}}}},
+		"backreference": map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": `(a)\1`}},
+	} {
+		g := mustMint(t, f, map[string]any{"rules": []any{rule}})
+		_, err := Decode(g.Encode(), 0)
+		wantStatus(t, err, 401)
+		if !strings.Contains(err.Error(), "rules/0") {
+			t.Fatalf("%s: %v", name, err)
+		}
+		// A narrowing block's rules too.
+		n, _ := mustMint(t, f, nil).Narrow(map[string]any{"rules": []any{rule}})
+		_, err = Decode(n.Encode(), 0)
+		wantStatus(t, err, 401)
+	}
+	ok := map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": "^a"}}
+	if _, err := Decode(mustMint(t, f, map[string]any{"rules": []any{ok}}).Encode(), 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// rulesPerGrant counts every rule form of the token's blocks, nested ones
+// included (§12.2), and DecodeLimited refuses a token over it, as a
+// request-shape error before its rules are compiled (§C.8).
+func TestV073RulesPerGrantAtDecode(t *testing.T) {
+	leaf := map[string]any{"op": "test", "path": "/action", "value": "read"}
+	if n := countForms(map[string]any{"all": []any{leaf, map[string]any{"not": leaf}}}); n != 4 {
+		t.Fatalf("all/not: %d", n)
+	}
+	if n := countForms(map[string]any{"if": []any{leaf}, "then": []any{leaf, map[string]any{"any": []any{leaf}}}}); n != 5 {
+		t.Fatalf("if/then/any: %d", n)
+	}
+	f := newFixture(t, nil)
+	nested := map[string]any{"all": []any{leaf, leaf, map[string]any{"any": []any{leaf, leaf}}}} // 6 forms
+	g := mustMint(t, f, map[string]any{"rules": []any{nested}})
+	n, _ := g.Narrow(map[string]any{"rules": []any{leaf}})
+	tok := n.Encode()
+	if _, err := DecodeLimited(tok, Limits{Rules: 7}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := DecodeLimited(tok, Limits{Rules: 6})
+	var tm *TooManyRulesError
+	if !errors.As(err, &tm) || !errors.Is(err, ErrTooManyRules) || tm.Count != 7 || tm.Max != 6 {
+		t.Fatalf("want too many rules (7 of 6), got %v", err)
+	}
+	// Counted before the rules are compiled: an oversized grant whose rule
+	// doesn't compile is the limit's.
+	bad := mustMint(t, f, map[string]any{"rules": []any{leaf, map[string]any{"op": "frob"}}})
+	if _, err := DecodeLimited(bad.Encode(), Limits{Rules: 1}); !errors.Is(err, ErrTooManyRules) {
+		t.Fatalf("want too many rules, got %v", err)
+	}
+	// grantSize comes first.
+	if _, err := DecodeLimited(tok, Limits{Size: 10, Rules: 1}); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("want too large, got %v", err)
+	}
 }

@@ -108,8 +108,8 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 	gs := make([]*grant.Grant, len(bearers))
 	bad := make([]*Error, len(bearers))
 	for i, b := range bearers {
-		g, err := grant.Decode(b, e.opt.Maximums.GrantSize)
-		if e := grantTooLarge(err); e != nil {
+		g, err := grant.DecodeLimited(b, e.grantLimits())
+		if e := grantLimit(err); e != nil {
 			return nil, e
 		}
 		if err != nil {

@@ -49,6 +49,7 @@ type Checker struct {
 	ttl      time.Duration
 	now      func() time.Time
 	maxGrant int
+	maxRules int
 
 	mu     sync.Mutex
 	states map[string]*nsState
@@ -70,9 +71,14 @@ func WithClock(now func() time.Time) Option { return func(ch *Checker) { ch.now 
 // the §6.6 default).
 func WithMaxGrantSize(n int) Option { return func(ch *Checker) { ch.maxGrant = n } }
 
+// WithMaxGrantRules rejects bearer tokens whose blocks carry more than n
+// rule forms, nested ones included (default 32, the §12.2 default of
+// rulesPerGrant).
+func WithMaxGrantRules(n int) Option { return func(ch *Checker) { ch.maxRules = n } }
+
 // New returns a Checker that reads namespace documents with c.
 func New(c *client.Client, opts ...Option) *Checker {
-	ch := &Checker{c: c, ttl: 30 * time.Second, now: time.Now, maxGrant: 8 << 10,
+	ch := &Checker{c: c, ttl: 30 * time.Second, now: time.Now, maxGrant: 8 << 10, maxRules: 32,
 		states: map[string]*nsState{}, copied: map[string]map[string]grant.Key{}}
 	for _, o := range opts {
 		o(ch)
@@ -336,10 +342,7 @@ func (ch *Checker) Verify(ctx context.Context, ns, token string) (*grant.Verifie
 	if token == "" {
 		return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
 	}
-	g, err := grant.Decode(token, ch.maxGrant)
-	if errors.Is(err, grant.ErrTooLarge) {
-		return nil, &grant.AuthError{Status: 401, Msg: "grant too large"}
-	}
+	g, err := ch.Decode(token)
 	if err != nil {
 		return nil, err
 	}
@@ -393,9 +396,20 @@ func (ch *Checker) PurgedRead(ctx context.Context, ns, token string) (head strin
 }
 
 // Decode decodes a bearer token as Verify does, without verifying it, so a
-// caller checking many namespaces can see which ones it names first.
+// caller checking many namespaces can see which ones it names first. As
+// the origin does, it refuses a token over grantSize or rulesPerGrant
+// before its ns check, and one whose rules don't compile (§C.8, §6.6),
+// both as *grant.AuthError with status 401 (the origin answers the limits
+// 413).
 func (ch *Checker) Decode(token string) (*grant.Grant, error) {
-	return grant.Decode(token, ch.maxGrant)
+	g, err := grant.DecodeLimited(token, grant.Limits{Size: ch.maxGrant, Rules: ch.maxRules})
+	switch {
+	case errors.Is(err, grant.ErrTooLarge):
+		return nil, &grant.AuthError{Status: 401, Msg: "grant too large"}
+	case errors.Is(err, grant.ErrTooManyRules):
+		return nil, &grant.AuthError{Status: 401, Msg: "too many rules in the grant's blocks"}
+	}
+	return g, err
 }
 
 // unreadable reports a namespace document the checker can't fetch because
@@ -493,7 +507,7 @@ func (ch *Checker) CheckRead(ctx context.Context, ns, token, resource string) (*
 	if token != "" {
 		// A grant not naming ns is refused (§7), as the core does, unless
 		// ns is public: then it is ignored and the read is anonymous.
-		if g, derr := grant.Decode(token, ch.maxGrant); derr == nil && !g.NamesNS(ns) {
+		if g, derr := ch.Decode(token); derr == nil && !g.NamesNS(ns) {
 			if err == nil && st.cfg.Read == "public" {
 				return &Decision{Allowed: true, Public: true}, nil
 			}

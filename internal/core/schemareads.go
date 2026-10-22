@@ -73,7 +73,7 @@ func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials,
 	if cred.Bearer == "" {
 		return false
 	}
-	gr, err := grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
+	gr, err := grant.DecodeLimited(cred.Bearer, t.e.grantLimits())
 	if err != nil {
 		return false
 	}

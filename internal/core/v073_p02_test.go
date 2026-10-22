@@ -3,12 +3,17 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/binary"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
 // v073Create writes a create of name in n under cred.
@@ -92,4 +97,182 @@ func TestV073StoredGrantIsAuthorityBlock(t *testing.T) {
 	if g, err := grant.ParseStored(legacy); err != nil || g.ID() != gid {
 		t.Fatal("legacy row")
 	}
+}
+
+// v073Engine opens an engine with authentication on, as authEngine does,
+// with lim the namespace defaults and max the deployment maximums (fast
+// write rates in both), and creates namespace n with document doc plus a
+// key k (can "*"). It returns the engine, a function minting grants of k,
+// and one creating another namespace under the operator grant.
+func v073Engine(t *testing.T, lim, max Limits, doc map[string]any) (*Engine, func(root map[string]any) string, func(ns string, doc map[string]any)) {
+	t.Helper()
+	opPub, opPriv := grant.GenerateKey()
+	ops, err := grant.ParseKeys(jsonv.FromGo([]any{map[string]any{"kid": "operator", "alg": "ed25519", "pub": opPub, "can": []any{"*"}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fast := Rate{1e9, 1e9}
+	for _, l := range []*Limits{&lim, &max} {
+		l.RatePerResource, l.RatePerPrincipal, l.RatePerNamespace = fast, fast, fast
+	}
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+		Limits: lim, Maximums: max, TailInterval: authTailEvery, Purger: discardPurger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close() })
+	mint := func(priv ed25519.PrivateKey, root map[string]any) string {
+		t.Helper()
+		if _, ok := root["exp"]; !ok {
+			root["exp"] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+		}
+		g, err := grant.Mint(root, priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return g.Encode()
+	}
+	pub, priv := grant.GenerateKey()
+	key := map[string]any{"kid": "k", "alg": "ed25519", "pub": pub, "can": []any{"*"}}
+	create := func(ns string, doc map[string]any) {
+		t.Helper()
+		d := map[string]any{"keys": []any{key}}
+		for k, v := range doc {
+			d[k] = v
+		}
+		opG := mint(opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{ns}, "can": []any{"config"}})
+		if _, err := e.WriteConfig(context.Background(), Request{NS: ns, Cred: Credentials{Bearer: opG}}, ConfigChange{IfNoneMatch: true, Patches: []any{map[string]any{"op": "add", "path": "", "value": d}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	create("n", doc)
+	return e, func(root map[string]any) string { return mint(priv, root) }, create
+}
+
+// v073Limit checks err is a 413 limit refusal naming key, with measured and
+// max when max is positive.
+func v073Limit(t *testing.T, what string, err error, key string, measured, max int64) {
+	t.Helper()
+	e, ok := err.(*Error)
+	if !ok || e.Status != 413 || e.Body["code"] != "limit" || e.Body["limit"] != key {
+		t.Fatalf("%s: want 413 limit %s, got %v", what, key, err)
+	}
+	if max > 0 && (e.Body["measured"] != measured || e.Body["max"] != max) {
+		t.Fatalf("%s: measured %v max %v, want %d of %d", what, e.Body["measured"], e.Body["max"], measured, max)
+	}
+}
+
+// v073Leaf is a rule form that passes for every request.
+var v073Leaf = map[string]any{"op": "test", "path": "/action", "exists": true}
+
+// v073Rules returns rules of n forms in all: one all of n-1 leaves.
+func v073Rules(n int) []any {
+	leaves := make([]any, n-1)
+	for i := range leaves {
+		leaves[i] = v073Leaf
+	}
+	return []any{map[string]any{"all": leaves}}
+}
+
+// A grant whose rule doesn't compile is invalid: 401 on every request that
+// doesn't ignore it, /principal and edge-grant issuance included, and
+// before the ns check (§6.6, §C.2, v0.63, F-C1 default).
+func TestV073GrantRuleCompiledAtDecode(t *testing.T) {
+	e, mint, _ := v073Engine(t, DefaultLimits(), DefaultMaximums(), map[string]any{"read": "grant"})
+	ctx := context.Background()
+	writer := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"n"}, "can": []any{"create"}})}
+	if _, err := v073Create(e, writer, "a"); err != nil {
+		t.Fatal(err)
+	}
+	for name, rule := range map[string]any{
+		"unknown op": map[string]any{"op": "frob", "path": "/action"},
+		"lookahead":  map[string]any{"op": "test", "path": "/principal/id", "schema": map[string]any{"pattern": "(?=user)"}},
+	} {
+		bad := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"n"}, "can": []any{"create", "read"}, "rules": []any{rule}})}
+		if _, err := v073Create(e, bad, "b"); v073Status(err) != 401 {
+			t.Fatalf("%s: write %v", name, err)
+		}
+		if _, err := e.ResourceHead(ctx, "n", "a", bad); v073Status(err) != 401 {
+			t.Fatalf("%s: read %v", name, err)
+		}
+		if _, err := e.Principal(ctx, "n", bad); v073Status(err) != 401 {
+			t.Fatalf("%s: principal %v", name, err)
+		}
+		if _, err := e.IssueEdgeGrants(ctx, []string{bad.Bearer}); v073Status(err) != 401 {
+			t.Fatalf("%s: edge grants %v", name, err)
+		}
+		other := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"elsewhere"}, "can": []any{"create"}, "rules": []any{rule}})}
+		if _, err := v073Create(e, other, "b"); v073Status(err) != 401 {
+			t.Fatalf("%s: not naming n: %v", name, err)
+		}
+	}
+}
+
+// rulesPerGrant counts every rule form of a grant's blocks, nested ones
+// included, at the deployment's value, and is 413 before step 1 and before
+// the ns check on every request that doesn't ignore the grant (§C.8,
+// §12.2, v0.63, v0.73). Public reads ignore the grant.
+func TestV073RulesPerGrantBeforeNSCheck(t *testing.T) {
+	e, mint, create := v073Engine(t, DefaultLimits(), DefaultMaximums(), map[string]any{"read": "grant"})
+	create("pub", map[string]any{"read": "public"})
+	ctx := context.Background()
+	writer := func(ns string) Credentials {
+		return Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{ns}, "can": []any{"create"}})}
+	}
+	for _, ns := range []string{"n", "pub"} {
+		if _, err := e.WriteResource(ctx, Request{NS: ns, Cred: writer(ns)}, Item{Resource: "a", IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{}}}}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 32 forms pass; two top-level rules nesting 34 forms between them
+	// don't, though the old count, of top-level rules, saw 2.
+	at := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"n"}, "can": []any{"create", "read"}, "rules": v073Rules(32)})}
+	if _, err := v073Create(e, at, "b"); err != nil {
+		t.Fatal(err)
+	}
+	over := map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"n", "pub"}, "can": []any{"create", "read"}, "rules": append(v073Rules(18), v073Rules(18)...)}
+	tok := Credentials{Bearer: mint(over)}
+	_, err := v073Create(e, tok, "c")
+	v073Limit(t, "write", err, "rulesPerGrant", 36, 32)
+	_, err = e.ResourceHead(ctx, "n", "a", tok)
+	v073Limit(t, "private read", err, "rulesPerGrant", 36, 32)
+	_, err = e.Principal(ctx, "n", tok)
+	v073Limit(t, "principal", err, "rulesPerGrant", 36, 32)
+	_, err = e.IssueEdgeGrants(ctx, []string{tok.Bearer})
+	v073Limit(t, "edge grants", err, "rulesPerGrant", 36, 32)
+	_, err = e.ResourceHead(ctx, "nope", "a", tok)
+	v073Limit(t, "absent namespace", err, "rulesPerGrant", 36, 32)
+	over["ns"] = []any{"elsewhere"}
+	_, err = v073Create(e, Credentials{Bearer: mint(over)}, "c")
+	v073Limit(t, "not naming n", err, "rulesPerGrant", 36, 32)
+	if _, err := e.ResourceHead(ctx, "pub", "a", tok); err != nil {
+		t.Fatalf("a public read ignores the grant: %v", err)
+	}
+}
+
+// grantSize and rulesPerGrant are deployment only (§12.2, v0.63): a
+// namespace's values, here the defaults the deployment gives namespaces,
+// no longer lower them.
+func TestV073GrantLimitsDeploymentOnly(t *testing.T) {
+	lim := DefaultLimits()
+	lim.RulesPerGrant, lim.GrantSize = 2, 300
+	e, mint, _ := v073Engine(t, lim, DefaultMaximums(), map[string]any{"read": "grant"})
+	g := mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"n"}, "can": []any{"create"}, "rules": v073Rules(3),
+		"attrs": map[string]any{"pad": strings.Repeat("x", 300)}})
+	if _, err := v073Create(e, Credentials{Bearer: g}, "a"); err != nil {
+		t.Fatalf("held to the namespace's grant limits: %v", err)
+	}
+}
+
+// A grant over grantSize is 413 before the ns check, whatever namespace
+// it names (§C.8).
+func TestV073OversizeGrantNotNamingNS(t *testing.T) {
+	var clock atomic.Int64
+	e, mint, _ := authEngine(t, &clock)
+	big := mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"elsewhere"}, "can": []any{"create"},
+		"attrs": map[string]any{"pad": strings.Repeat("x", 9<<10)}})
+	_, err := v073Create(e, Credentials{Bearer: big}, "a")
+	v073Limit(t, "write", err, "grantSize", 0, 0)
+	_, err = e.ResourceHead(context.Background(), "n", "a", Credentials{Bearer: big})
+	v073Limit(t, "read", err, "grantSize", 0, 0)
 }

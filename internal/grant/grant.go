@@ -22,11 +22,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/lru"
+	"github.com/middle-management/patchlog/internal/rules"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sig"
 )
@@ -66,6 +69,25 @@ type TooLargeError struct{ Size, Max int }
 
 func (e *TooLargeError) Error() string        { return ErrTooLarge.Error() }
 func (e *TooLargeError) Is(target error) bool { return target == ErrTooLarge }
+
+// ErrTooManyRules reports a token whose blocks carry more rule forms than
+// rulesPerGrant allows (§C.8, §12.2). DecodeLimited returns it as a
+// *TooManyRulesError, which carries the counts.
+var ErrTooManyRules = errors.New("grant carries too many rules")
+
+// TooManyRulesError is ErrTooManyRules with what a limit refusal reports
+// (§6.6): Count the rule forms of the token's blocks, Max the limit.
+type TooManyRulesError struct{ Count, Max int }
+
+func (e *TooManyRulesError) Error() string        { return ErrTooManyRules.Error() }
+func (e *TooManyRulesError) Is(target error) bool { return target == ErrTooManyRules }
+
+// Limits are a deployment's bounds on a bearer token, both deployment only
+// (§12.2), which DecodeLimited checks before anything is verified, as
+// request-shape errors (§C.8): Size bounds its decoded bytes (grantSize),
+// Rules the rule forms of its blocks (rulesPerGrant). Each is ignored when
+// <= 0.
+type Limits struct{ Size, Rules int }
 
 // AuthError is an authentication (401) or authorisation (403) failure.
 type AuthError struct {
@@ -327,11 +349,23 @@ func (g *Grant) Seal() (*Grant, error) {
 
 // Decode parses a bearer token: Biscuit URL-safe base64, with or without
 // padding and the "biscuit:" prefix. It checks the structure and the JSON
-// blocks but no signature: Verify checks the chain, after the namespace
-// check of §C.2 (whose 403 comes first). maxSize bounds the decoded bytes
-// and is ignored when <= 0. Errors are ErrTooLarge or *AuthError with
-// status 401.
+// blocks, and compiles every block's rules, but checks no signature:
+// Verify checks the chain, after the namespace check of §C.2 (whose 403
+// comes first). maxSize bounds the decoded bytes and is ignored when <= 0.
+// Errors are ErrTooLarge or *AuthError with status 401.
 func Decode(token string, maxSize int) (*Grant, error) {
+	return DecodeLimited(token, Limits{Size: maxSize})
+}
+
+// DecodeLimited is Decode under both of a deployment's bounds on a bearer
+// (§C.8), in this order: grantSize before the token is decoded
+// (ErrTooLarge); a token that can't be decoded, or whose blocks break §C.1
+// or §C.8 (401); rulesPerGrant over its blocks' rule forms, those nested
+// in all, any, not, if and then included, the key scope's not (§12.2,
+// ErrTooManyRules); and last, a rule that doesn't compile (§6.4.2, §6.6:
+// the grant is invalid, 401), so an oversized grant isn't compiled.
+func DecodeLimited(token string, lim Limits) (*Grant, error) {
+	maxSize := lim.Size
 	token = strings.TrimPrefix(token, tokenPrefix)
 	if maxSize > 0 && len(token) > base64.URLEncoding.EncodedLen(maxSize) {
 		n := base64.RawURLEncoding.DecodedLen(len(strings.TrimRight(token, "=")))
@@ -351,10 +385,99 @@ func Decode(token string, maxSize int) (*Grant, error) {
 		return nil, &TooLargeError{Size: len(data), Max: maxSize}
 	}
 	g, err := decode(data, true)
-	if err == nil {
-		g.size = len(data)
+	if err != nil {
+		return nil, err
 	}
-	return g, err
+	g.size = len(data)
+	if n := g.ruleForms(); lim.Rules > 0 && n > lim.Rules {
+		return nil, &TooManyRulesError{Count: n, Max: lim.Rules}
+	}
+	if err := g.compileRules(); err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
+// ruleForms counts the rule forms of g's blocks as rulesPerGrant does
+// (§12.2): every form, those nested in all, any, not, if and then
+// included.
+func (g *Grant) ruleForms() int {
+	n := 0
+	for _, b := range g.Blocks {
+		for _, r := range b.Rules {
+			n += countForms(r)
+		}
+	}
+	return n
+}
+
+// countForms counts the rule forms of rule v: v itself and those nested in
+// its all, any, not, if and then. Any other member is not a rule.
+func countForms(v any) int {
+	n := 1
+	m, ok := v.(map[string]any)
+	if !ok {
+		return n
+	}
+	if _, isOp := m["op"]; isOp {
+		return n
+	}
+	for _, k := range []string{"all", "any", "if", "then"} {
+		if arr, ok := m[k].([]any); ok {
+			for _, x := range arr {
+				n += countForms(x)
+			}
+		}
+	}
+	if x, ok := m["not"]; ok {
+		n += countForms(x)
+	}
+	return n
+}
+
+// compileRules compiles every rule of g's blocks (§6.4.2): a grant that
+// carries one that doesn't compile, such as one of an unknown form or with
+// a pattern RE2 doesn't accept, is invalid (401, §6.6), on every request
+// that doesn't ignore it, not only those that evaluate it.
+func (g *Grant) compileRules() error {
+	for i, b := range g.Blocks {
+		for j, r := range b.Rules {
+			if _, err := compileRule(r); err != nil {
+				return unauth("block %d: rules/%d: %v", i, j, err)
+			}
+		}
+	}
+	return nil
+}
+
+// ruleCache keeps compiled rules by their canonical form, so grants
+// re-minted with the same rules, as issuers do every few minutes, don't
+// compile them again: compiling a rule's schema costs more than decoding
+// the token. It is bounded, since tokens are decoded before they verify.
+var ruleCache struct {
+	mu sync.Mutex
+	c  lru.Cache[string, *rules.Rule]
+}
+
+func compileRule(v any) (*rules.Rule, error) {
+	k := string(jsonv.Canonical(v))
+	ruleCache.mu.Lock()
+	r, ok := ruleCache.c.Get(k)
+	ruleCache.mu.Unlock()
+	if ok {
+		return r, nil
+	}
+	r, err := rules.Compile(v)
+	if err != nil {
+		return nil, err
+	}
+	ruleCache.mu.Lock()
+	if ruleCache.c.MaxEntries == 0 {
+		ruleCache.c.MaxEntries, ruleCache.c.MaxBytes = 4096, 4<<20
+	}
+	ruleCache.c.Put(k, r, len(k))
+	ruleCache.mu.Unlock()
+	return r, nil
 }
 
 // Size is a decoded bearer's length in bytes, as grantSize bounds it

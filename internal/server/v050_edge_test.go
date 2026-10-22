@@ -360,8 +360,14 @@ func TestV050EdgeGrantsFiniteSets(t *testing.T) {
 	} {
 		r := issue(sec, c.rules...)
 		if c.prefixes == "" {
-			if r.Code != 403 {
-				t.Errorf("%s: want 403: %d %s", c.name, r.Code, r.Body)
+			// A rule that doesn't compile makes the grant invalid, 401
+			// on every request (§6.6, v0.63).
+			want := 403
+			if c.name == "enum not an array" || c.name == "in a string" {
+				want = 401
+			}
+			if r.Code != want {
+				t.Errorf("%s: want %d: %d %s", c.name, want, r.Code, r.Body)
 			}
 			expectNoCookies(t, c.name, r)
 			continue

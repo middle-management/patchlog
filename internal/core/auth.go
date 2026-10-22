@@ -71,9 +71,11 @@ func (t *tx) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials
 }
 
 // decodeGrant decodes a bearer grant and checks, before anything is
-// verified or looked up, that every block carrying ns names the namespace
-// (§C.2, §7): 401 without a parseable grant, 403 when it doesn't name the
-// namespace, whether or not the namespace exists.
+// verified or looked up, the deployment's grantSize and rulesPerGrant (413,
+// §C.8), and that every block carrying ns names the namespace (§C.2, §7):
+// 401 without a parseable grant, one whose rules don't compile included
+// (§6.6), 403 when it doesn't name the namespace, whether or not the
+// namespace exists.
 func (t *tx) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error) {
 	if cred.Bearer == "" {
 		return nil, apiErr(401, "unauthenticated", "message", "missing grant")
@@ -84,8 +86,8 @@ func (t *tx) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error)
 	}
 	if g == nil {
 		var err error
-		g, err = grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
-		if e := grantTooLarge(err); e != nil {
+		g, err = grant.DecodeLimited(cred.Bearer, t.e.grantLimits())
+		if e := grantLimit(err); e != nil {
 			return nil, e
 		}
 		if err != nil {
@@ -150,24 +152,31 @@ func (c *grantCache) put(token string, g *grant.Grant) {
 	c.lru.Put(token, g, len(token))
 }
 
-// grantTooLarge is the 413 of a bearer over grantSize, which is decoded
-// before any namespace is consulted, so max is the deployment's (§6.6).
-func grantTooLarge(err error) *Error {
-	var te *grant.TooLargeError
-	if !errors.As(err, &te) {
-		return nil
-	}
-	return limitErr(413, "grantSize", int64(te.Size), int64(te.Max), "grant too large")
+// grantLimits are the deployment's bounds on a bearer, grantSize and
+// rulesPerGrant, both deployment only (§12.2), which every decode of a
+// bearer checks before anything else (§C.8).
+func (e *Engine) grantLimits() grant.Limits {
+	return grant.Limits{Size: e.opt.Maximums.GrantSize, Rules: e.opt.Maximums.RulesPerGrant}
 }
 
-// rulesPerGrant is the bound on a chain's rules in force (§6.6): the
-// namespace's, or the deployment's for an operator grant.
-func (t *tx) rulesPerGrant(cfg *Config) int {
-	if cfg == nil {
-		return t.e.opt.Maximums.RulesPerGrant
+// grantLimit is the 413 of a bearer over grantSize or rulesPerGrant (§C.8),
+// nil for any other error. Both are checked as it is decoded, before any
+// namespace is consulted, so max is the deployment's (§6.6).
+func grantLimit(err error) *Error {
+	var te *grant.TooLargeError
+	if errors.As(err, &te) {
+		return limitErr(413, "grantSize", int64(te.Size), int64(te.Max), "grant too large")
 	}
-	return min(cfg.Limits.RulesPerGrant, t.e.opt.Maximums.RulesPerGrant)
+	var tr *grant.TooManyRulesError
+	if errors.As(err, &tr) {
+		return limitErr(413, "rulesPerGrant", int64(tr.Count), int64(tr.Max), "too many rules in the grant's blocks")
+	}
+	return nil
 }
+
+// rulesPerGrant is the bound on a grant's rules (§6.6): the deployment's,
+// whatever cfg says, since the limit is deployment only (§12.2).
+func (t *tx) rulesPerGrant(*Config) int { return t.e.opt.Maximums.RulesPerGrant }
 
 func nsNotNamed(ns string) *Error {
 	return forbidden(fmt.Sprintf("the grant does not apply to namespace %q", ns))
@@ -193,17 +202,11 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 		env.Roles = cfg.Roles
 		env.CheckAt = t.checkAt(n)
 	}
+	// grantSize and rulesPerGrant were checked as the bearer was decoded,
+	// at the deployment's values (decodeGrant, §C.8).
 	v, err := grant.Verify(g, env)
 	if err != nil {
 		return nil, authErr(err)
-	}
-	if n, max := len(v.BlockRules)+len(v.KeyRules), t.rulesPerGrant(cfg); n > max {
-		return nil, limitErr(422, "rulesPerGrant", int64(n), int64(max), "too many rules in the grant chain")
-	}
-	if cfg != nil && g.Size() > cfg.Limits.GrantSize {
-		// The namespace's grantSize, below the deployment's that decoding
-		// applied (§6.6).
-		return nil, limitErr(413, "grantSize", int64(g.Size()), int64(cfg.Limits.GrantSize), "grant too large")
 	}
 	a := &actor{principal: v.Principal, verified: v, star: v.StarKey, grant: g, keyRate: v.Key.Rate}
 	a.bucketKey = v.Principal.ID + "\x00" + v.Key.Kid
