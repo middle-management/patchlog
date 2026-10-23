@@ -26,11 +26,13 @@
 //
 // Two ways to authenticate: with a fixed grant (local mode, the WebDAV
 // clients log in with a password of the server's), or as a gateway, where
-// each request's Basic password is the grant sent upstream. State (bases,
-// scratch files, locks, guards) is kept per user (§H.7): in a gateway,
-// the root sub and kid GET /ns/{ns}/principal names for a grant, so every
-// token of one person is one user; in local mode, everyone is one. What
-// may hold what one token read (scratch files, locks, dead properties) is
+// each request's Basic password is the grant sent upstream, or, over a
+// core with authentication disabled, its Basic user name the X-Author.
+// State (bases, scratch files, locks, guards) is kept per user (§H.7): in
+// a gateway, the root sub and the key (its thumbprint) GET
+// /ns/{ns}/principal names for a grant, so every token of one person is
+// one user, or the X-Author; in local mode, everyone is one. What may
+// hold what one token read (scratch files, locks, dead properties) is
 // kept apart for a token narrowed offline (scope).
 package dav
 
@@ -54,6 +56,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/net/webdav"
 	"golang.org/x/sync/semaphore"
@@ -103,7 +107,10 @@ type Options struct {
 	// clients can't hold two names that differ only in case, compare them.
 	CaseSensitive bool
 	// Gateway takes each request's Basic password as the grant sent
-	// upstream as Authorization: Bearer; the user name is ignored.
+	// upstream as Authorization: Bearer, the user name ignored; over a
+	// core with authentication disabled (GET / auth, §1), the Basic user
+	// name as the X-Author each request is sent with (§7.2), which is the
+	// user (§H.7), the password ignored.
 	Gateway bool
 	// Password is the Basic password of local mode (any user name).
 	Password string
@@ -878,7 +885,7 @@ func splitIf(h string) string {
 // accepted it (verify), and it is asked again every VerifyEvery. A grant
 // refused is refused for refusedFor without asking again.
 func (s *Server) authenticate(r *http.Request) (*token, *davError) {
-	_, pw, ok := r.BasicAuth()
+	user, pw, ok := r.BasicAuth()
 	if !ok {
 		return nil, fail(http.StatusUnauthorized, "authentication required")
 	}
@@ -889,6 +896,16 @@ func (s *Server) authenticate(r *http.Request) (*token, *davError) {
 		}
 		s.sweep()
 		return s.local, nil
+	}
+	switch off, err := s.authOff(r.Context()); {
+	case err != nil:
+		return nil, err
+	case off:
+		tk, de := s.authorToken(user)
+		if de == nil {
+			s.sweep()
+		}
+		return tk, de
 	}
 	g, err := grant.Decode(pw, 64<<10)
 	if err != nil {
@@ -976,10 +993,10 @@ type refusal struct {
 }
 
 // refusedStatus reports a refusal of verify that is the grant's answer
-// for refusedFor: 401 (no namespace accepts it), 410 and 404 (the one
-// that verified it is purged, or absent).
+// for refusedFor: 401 (no namespace accepts it), 403 (an operator grant,
+// §H.7), 410 and 404 (the one that verified it is purged, or absent).
 func refusedStatus(status int) bool {
-	return status == http.StatusUnauthorized || status == http.StatusGone || status == http.StatusNotFound
+	return status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusGone || status == http.StatusNotFound
 }
 
 // verdict is the core's acceptance of a grant (verify): the served
@@ -1003,10 +1020,14 @@ type verdict struct {
 // the grant is refused with the first of 410 and 404 that it met (§H.4
 // "Answers"), else 401.
 //
-// The namespace that accepts a grant is part of its user (userKey), so
-// the order they are asked in keeps a person one user: first prev, the
-// one that accepted this token before, then those that accepted a grant
-// of its root kid and sub, first first (kidNS), then the rest, sorted. A
+// A user is the root sub with the key that verified the root block, as
+// /principal's key thumbprint names it (§H.7, userKey), the same in every
+// namespace, so which namespace accepts a grant doesn't make its holder
+// someone else. The order they are asked in keeps them asked alike, and
+// so a person one user under a core that names no key (before v0.56),
+// where the user is the namespace, kid and sub: first prev, the one that
+// accepted this token before, then those that accepted a grant of its
+// root kid and sub, first first (kidNS), then the rest, sorted. A
 // namespace created later, or given the key later, that sorts first then
 // doesn't make the same token, or the same person's next one, someone
 // else, with none of their records, scratch files or locks. kids are
@@ -1023,15 +1044,15 @@ type verdict struct {
 // most those (and kidNS's bounds count them). The preferred namespaces
 // don't count against maxVerifyNS.
 //
-// A grant an operator key signed (§C.4) authorizes nothing this server
-// does, and is refused (401) where /principal accepts it
-// (operatorSigned): its root kid may name a namespace's key too, and
-// /principal, which verifies it against the operator keys, names that
-// kid, so it would be taken for that key's user, and reach their scratch
-// files. One the namespace's own keys verify (an operator who listed
-// its key there, §C.4) is the namespace's, as the core serves it. Where
-// the namespace doesn't exist, its 404 is the answer, as the core's to an
-// operator grant.
+// An operator grant (§C.4) authorizes nothing this server does, and is
+// never a user of a gateway: refused (403) where /principal accepts it,
+// saying operator: true (§7.4, §H.7; operatorGrant), and kept refused for
+// refusedFor. Its root kid may name a namespace's key too, and
+// /principal names that kid, so it would be taken for that key's user,
+// and reach their scratch files. One the namespace's own keys verify (an
+// operator who listed its key there, §C.4) is the namespace's, as the
+// core serves it. Where the namespace doesn't exist, its 404 is the
+// answer, as the core's to an operator grant.
 func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, prev string) (*verdict, error) {
 	var named []string
 	for _, ns := range s.namespaces() {
@@ -1070,11 +1091,11 @@ func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, p
 		ae, isAPI := client.AsAPIError(err)
 		switch {
 		case err == nil:
-			switch op, err := s.operatorSigned(ctx, c, g, ns); {
+			switch op, err := s.operatorGrant(ctx, c, g, ns, info); {
 			case err != nil:
 				return nil, err
 			case op:
-				return nil, fail(http.StatusUnauthorized, "the grant is signed by an operator key (kid %q), which authorizes creating namespaces and forced purges (§C.4), nothing this server does: log in with a grant from a key a namespace's document lists", kid)
+				return nil, fail(http.StatusForbidden, "the grant is an operator grant, signed by an operator key (kid %q; operator: true, §7.4), which authorizes creating namespaces and forced purges (§C.4), nothing this server does: operator grants are never users of a gateway (§H.7); log in with a grant from a key a namespace's document lists", kid)
 			}
 			s.mu.Lock()
 			if nss, _ := s.kidNS.Get(rk); !slices.Contains(nss, ns) {
@@ -1104,6 +1125,17 @@ func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, p
 		return nil, fail(http.StatusNotFound, "namespace %s doesn't exist (§7.4), and no other namespace your grant names here accepts it", absent)
 	}
 	return nil, fail(http.StatusUnauthorized, "the core doesn't accept the grant: %s", why)
+}
+
+// operatorGrant reports whether grant g, which namespace ns's /principal
+// accepted with info, is an operator grant (§C.4): as info says
+// (operator, §7.4), or, from a core that doesn't say (before v0.56), as
+// the deployment's operator keys tell (operatorSigned).
+func (s *Server) operatorGrant(ctx context.Context, c *client.Client, g *grant.Grant, ns string, info *client.PrincipalInfo) (bool, error) {
+	if _, said := info.Raw["operator"].(bool); said {
+		return info.Operator, nil
+	}
+	return s.operatorSigned(ctx, c, g, ns)
 }
 
 // operatorKeysFor is how long the deployment's operator keys, as read
@@ -1248,13 +1280,20 @@ func (s *Server) operatorKeys(ctx context.Context) ([]client.OperatorKey, error)
 }
 
 // userKey is who the state of a grant the core accepted (v) is kept for
-// (§H.7): the root sub and kid GET /ns/{ns}/principal named, never the
+// (§H.7 "Users"): the root sub with the key that verified the root block,
+// the RFC 7638 thumbprint GET /ns/{ns}/principal names (§7.4), never the
 // token, so every token of one person (minted again, attenuated offline)
-// is one user; with the namespace whose key verified it, since a kid
-// names a key of one namespace's document (§C.1), and the same kid in
+// is one user, whichever namespace verified it and under whatever kid;
+// two people are never merged, nor is one split; and after a key rotation
+// the person is a new user. From a core that names no key (before v0.56):
+// the root sub and kid with the namespace whose key verified it, since a
+// kid names a key of one namespace's document (§C.1), and the same kid in
 // another served namespace may be anyone's key, minting grants for the
-// same sub. verify asks the namespaces in an order that keeps it so.
+// same sub; verify asks the namespaces in an order that keeps it so.
 func userKey(v *verdict) string {
+	if v.info.Key != "" {
+		return "key\x00" + v.info.Key + "\x00" + v.info.Sub
+	}
 	return v.ns + "\x00" + v.info.Kid + "\x00" + v.info.Sub
 }
 
@@ -1265,9 +1304,15 @@ func userKey(v *verdict) string {
 // it is verified in the same order, and seen to have become someone else.
 type idUser struct{ user, vns, issuer string }
 
-// issuerKey is the key that minted the grant v the core accepted: the
-// verifying namespace and the root block's kid, userKey without the sub.
-func issuerKey(v *verdict) string { return v.ns + "\x00" + v.info.Kid }
+// issuerKey is the key that minted the grant v the core accepted, userKey
+// without the sub: its thumbprint, or from a core that names none, the
+// verifying namespace and the root block's kid.
+func issuerKey(v *verdict) string {
+	if v.info.Key != "" {
+		return "key\x00" + v.info.Key
+	}
+	return v.ns + "\x00" + v.info.Kid
+}
 
 // maxIDUsers bounds the token ids idUsers keeps, maxIDsPerUser those of
 // one user.
@@ -1500,6 +1545,7 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey,
 	}
 	s.idUsers.put(id, idUser{user: key, vns: v.ns, issuer: issuerKey(v)})
 	tk.verified, tk.vns = now, v.ns
+	p.verifiedAs(v.ns, v.info)
 	tk.keepWriter(v.ns, v.info, now)
 	s.useLocked(tk, now)
 	return tk, nil
@@ -1782,6 +1828,13 @@ type principal struct {
 	aside   map[string]time.Time  // documents' paths moved aside to a backup, and when
 	guards  map[string][]guard    // by document path: its refused saves' guards, oldest first
 	nguards int
+	// who the user is as the core records its writes (§H.7 "Users",
+	// wroteAs): its root sub and key thumbprint, or, with authentication
+	// disabled, its X-Author (author); kids, by namespace, the kids that
+	// named key there when the user's grants were verified there, or under
+	// which the catalog issued them grants there (§B.11.4)
+	sub, key, author string
+	kids             map[string]map[string]bool
 }
 
 // scope is what a principal keeps for its tokens of one narrowing
@@ -2116,7 +2169,143 @@ func (p *principal) guarded(path string, now time.Time) bool {
 
 func (s *Server) newPrincipal(id string) *principal {
 	return &principal{id: id, toks: map[*token]bool{}, scopes: map[string]*scope{}, deletes: map[string]ownDelete{},
-		trees: map[string]treeDelete{}, aside: map[string]time.Time{}, guards: map[string][]guard{}, used: s.opt.Now()}
+		trees: map[string]treeDelete{}, aside: map[string]time.Time{}, guards: map[string][]guard{}, used: s.opt.Now(),
+		kids: map[string]map[string]bool{}}
+}
+
+// maxKids bounds the kids a user's identity keeps for one namespace.
+const maxKids = 16
+
+// verifiedAs notes what GET /ns/{ns}/principal said a grant of user p's
+// is in ns (info): the user's sub and key, if not known yet (local mode's
+// one bearer, a gateway's user as verify found it), and, for one of its
+// sub and key (from a core that names no key, only as the user's
+// verifying namespace says it), the kid that named the key there
+// (wroteAs).
+func (p *principal) verifiedAs(ns string, info *client.PrincipalInfo) {
+	if info == nil || info.Sub == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.sub == "" && p.author == "" {
+		p.sub, p.key = info.Sub, info.Key
+	}
+	if info.Sub != p.sub || info.Key != p.key || p.key == "" && len(p.kids) > 0 && p.kids[ns] == nil {
+		return
+	}
+	p.addKidLocked(ns, info.Kid)
+}
+
+// issuedTo notes that a grant kid signed for the user's sub in ns, which
+// the catalog issued the user (§B.11.4): its writes there are the user's
+// (§H.7).
+func (p *principal) issuedTo(ns, sub, kid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if sub != "" && sub == p.sub {
+		p.addKidLocked(ns, kid)
+	}
+}
+
+func (p *principal) addKidLocked(ns, kid string) {
+	if kid == "" {
+		return
+	}
+	ks := p.kids[ns]
+	if ks == nil {
+		if len(p.kids) >= maxWroteNS {
+			return
+		}
+		ks = map[string]bool{}
+		p.kids[ns] = ks
+	}
+	if len(ks) < maxKids {
+		ks[kid] = true
+	}
+}
+
+// wroteAs reports whether log entry e of namespace ns was written by
+// user p as the core records its writes (§H.7 "Users"): with
+// authentication disabled, under its X-Author (author, no grant); else
+// under a grant with its sub and a kid that named its key in ns
+// (verifiedAs), or the catalog's kid there for its sub (issuedTo). A kid
+// is judged as it names the key now, which a namespace that gave the kid
+// to another key since would get wrong.
+func (p *principal) wroteAs(ns string, e client.LogEntry) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch {
+	case p.author != "":
+		return e.Grant == nil && e.Author == p.author
+	case p.sub == "" || e.Grant == nil:
+		return false
+	}
+	return e.Grant.Sub == p.sub && p.kids[ns][e.Grant.Kid]
+}
+
+// authOff reports whether the core has authentication disabled (GET /
+// auth, §1), read once.
+func (s *Server) authOff(ctx context.Context) (bool, *davError) {
+	root, err := s.anon.Root(ctx)
+	if err != nil {
+		if de, ok := upstream(err).(*davError); ok {
+			return false, de
+		}
+		return false, fail(http.StatusBadGateway, "the core's GET / couldn't be read: %v", err)
+	}
+	return root.AuthDisabled(), nil
+}
+
+// maxAuthor bounds a Basic user name taken as an X-Author.
+const maxAuthor = 256
+
+// authorToken is the token of Basic user name name, a gateway's user
+// over a core with authentication disabled (§1): its X-Author, which the
+// core records as the author of its writes (§7.2), and its user (§H.7
+// "Users"), one scope; the password is ignored, as the core takes anyone
+// for anyone then. There is no grant to verify.
+func (s *Server) authorToken(name string) (*token, *davError) {
+	name = strings.TrimSpace(name)
+	switch {
+	case name == "":
+		return nil, fail(http.StatusUnauthorized, "the core has authentication disabled (§1): log in with your name as the user name, which writes are recorded under (X-Author, §7.2)")
+	case len(name) > maxAuthor || !utf8.ValidString(name) || strings.IndexFunc(name, unicode.IsControl) >= 0:
+		return nil, fail(http.StatusUnauthorized, "the user name, your name as an author (X-Author, §7.2), is at most %d bytes of UTF-8 without control characters", maxAuthor)
+	}
+	sum := sha256.Sum256([]byte("author\x00" + name))
+	id := "author:" + hex.EncodeToString(sum[:16])
+	now := s.opt.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if tk := s.tokens[id]; tk != nil {
+		tk.verified = now
+		s.useLocked(tk, now)
+		return tk, nil
+	}
+	key := "author\x00" + name
+	p := s.principals[key]
+	if p == nil {
+		if !s.makeRoomLocked() {
+			return nil, &davError{status: http.StatusServiceUnavailable, msg: "too many users at once; try again", header: http.Header{"Retry-After": {"5"}}}
+		}
+		p = s.newPrincipal(key)
+		p.author = name
+		s.principals[key] = p
+	}
+	if !s.tokenRoomLocked(p) {
+		return nil, &davError{status: http.StatusServiceUnavailable, msg: "too many of your logins at once; try again", header: http.Header{"Retry-After": {"5"}}}
+	}
+	sc := p.scopes[""]
+	if sc == nil {
+		sc = s.newScopeLocked(p, "")
+	}
+	tk := s.newToken(id, s.opt.Client.With(client.WithBearer(""), client.WithAuthor(name)), sc, nil)
+	s.tokens[id] = tk
+	p.toks[tk] = true
+	tk.verified = now
+	s.useLocked(tk, now)
+	return tk, nil
 }
 
 // newScopeLocked makes p's scope key.

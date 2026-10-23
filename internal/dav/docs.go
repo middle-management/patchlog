@@ -262,6 +262,7 @@ func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, e
 			wa = writerAt{err: err, at: now}
 		default:
 			wa = writerOf(pi, now)
+			tk.p.verifiedAs(ns, pi)
 		}
 		tk.mu.Lock()
 		tk.writers[ns] = wa

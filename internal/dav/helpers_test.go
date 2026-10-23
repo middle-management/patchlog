@@ -114,15 +114,20 @@ func newEnv(t *testing.T, flat, catalogs []string, nsDocs map[string]map[string]
 	return e
 }
 
-// another is a second WebDAV server over e's core, as e's was set up: its
-// user isn't e's, so it reads what e's user wrote as everyone does.
+// another is a second WebDAV server over e's core, as e's was set up, but
+// writing as another X-Author: its user isn't e's (§H.7: with
+// authentication disabled, a user is an X-Author), so it reads what e's
+// user wrote as everyone does.
 func (e *env) another() *env {
 	e.t.Helper()
-	srv, err := dav.New(e.opt)
+	opt := e.opt
+	opt.Client = e.s.Client(e.t, client.WithAuthor("another"))
+	srv, err := dav.New(opt)
 	if err != nil {
 		e.t.Fatal(err)
 	}
 	o := *e
+	o.opt = opt
 	o.dav = newTestServer(e.t, srv)
 	return &o
 }
@@ -139,6 +144,12 @@ type resp struct {
 	header http.Header
 	body   string
 }
+
+// testHTTP is the tests' connection pool for requests to the WebDAV
+// servers, a clone of http.DefaultTransport: httptest.Server.Close
+// closes the default one's idle connections, which breaks a request a
+// parallel test is starting on it.
+var testHTTP = &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
 
 // do sends a WebDAV request with e's password; hdr are name, value pairs.
 func (e *env) do(method, p, body string, hdr ...string) resp {
@@ -165,7 +176,7 @@ func (e *env) doAs(pw, method, p, body string, hdr ...string) resp {
 		}
 		req.Header.Set(hdr[i], v)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := testHTTP.Do(req)
 	if err != nil {
 		e.t.Fatal(err)
 	}

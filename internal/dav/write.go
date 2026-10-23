@@ -264,7 +264,7 @@ func (st *reqState) tombBase(ctx context.Context, ns, name string, h *client.Hea
 // tombLast is tombBase but for refusedSave.
 func (st *reqState) tombLast(ctx context.Context, ns, name string, h *client.Head) (*docEntry, error) {
 	own := st.p.deletedOwn(ns, name, h.ID, st.s.opt.Now())
-	mine := own || st.s.ownEntry(st.p, ns, name, h.ID)
+	mine := own || st.ownHead(ctx, ns, name, h)
 	// A save from a version the principal had, over someone else's
 	// delete (§11.3): refused, the refusal naming where the file went if
 	// it moved, so that the reload it asks for isn't followed by another.
@@ -641,7 +641,7 @@ func (st *reqState) rebasedOn(ctx context.Context, ns, name string, v any, headR
 		return nil, false, lostBase(ns, name)
 	}
 	if len(cs) == 0 {
-		out, _ := rebase(head, mine, head, nil)
+		out, _ := rebase(head, mine, head, span{})
 		return out, true, nil
 	}
 	dist := make([]int, len(cs))
@@ -684,9 +684,9 @@ func (st *reqState) rebasedOn(ctx context.Context, ns, name string, v any, headR
 			}
 			continue
 		}
-		out, clash := rebase(cs[i].doc, mine, head, s.writes)
+		out, clash := rebase(cs[i].doc, mine, head, s)
 		if len(clash) == 0 {
-			if clash = unsafe(out, head, cs); len(clash) == 0 {
+			if clash = unsafe(out, head, cs, sp); len(clash) == 0 {
 				if amb := ambiguous(cs, dist, sp, i, mine, head, out); amb != nil {
 					st.refuse(ns, name)
 					return nil, false, fail(http.StatusConflict, "%s/%s: your save reads as an edit of more than one version you were served or wrote, which give different results at %s (an undo of a save of yours combined with a new edit, and another program's edit from the version before that save, look alike; §H.4); reload it and save again", ns, name, strings.Join(amb, ", "))
@@ -718,8 +718,8 @@ func ambiguous(cs []candidate, dist []int, sp map[string]span, i int, mine, head
 		if j == i || dist[j] == 0 || sp[c.rev].foreign || jsonv.Equal(c.doc, cs[i].doc) {
 			continue
 		}
-		o, clash := rebase(c.doc, mine, head, sp[c.rev].writes)
-		if len(clash) > 0 || len(unsafe(o, head, cs)) > 0 || jsonv.Equal(o, out) {
+		o, clash := rebase(c.doc, mine, head, sp[c.rev])
+		if len(clash) > 0 || len(unsafe(o, head, cs, sp)) > 0 || jsonv.Equal(o, out) {
 			continue
 		}
 		var at []string
@@ -743,12 +743,23 @@ func lostBase(ns, name string) error {
 
 // span is what the log says happened between a candidate base and the
 // head (§11.3): the writes of its entries (logWrites) but the principal's
-// own, and whether someone else deleted or restored the document in
-// between, a tombstone or a restore the principal didn't write, whose
-// writes are empty but which a save from before isn't merged over.
+// own, those of its own (own), and whether someone else deleted or
+// restored the document in between, a tombstone or a restore the
+// principal didn't write, whose writes are empty but which a save from
+// before isn't merged over.
 type span struct {
-	writes  []pointer.Pointer
-	foreign bool
+	writes, own []pointer.Pointer
+	foreign     bool
+}
+
+// overlapsAny reports whether q overlaps one of ps.
+func overlapsAny(q pointer.Pointer, ps []pointer.Pointer) bool {
+	for _, p := range ps {
+		if p.Overlaps(q) {
+			return true
+		}
+	}
+	return false
 }
 
 // spans returns the spans from the revisions of candidates which (of cs)
@@ -801,11 +812,12 @@ func (st *reqState) spans(ctx context.Context, ns, name, headRev string, cs []ca
 				break
 			}
 			if need[es[i].ID] {
-				out[es[i].ID] = span{writes: append([]pointer.Pointer(nil), acc.writes...), foreign: acc.foreign}
+				out[es[i].ID] = span{writes: append([]pointer.Pointer(nil), acc.writes...), own: append([]pointer.Pointer(nil), acc.own...), foreign: acc.foreign}
 			}
-			if st.s.ownEntry(st.p, ns, name, es[i].ID) || wroteRev(cs, es[i].ID) {
-				// The principal's own: what it changed is in the head
-				// (rebase's diff), and its own to change again (unsafe).
+			if st.ownLogEntry(ctx, ns, name, es[i]) || wroteRev(cs, es[i].ID) {
+				// The principal's own: what it changed is in the head,
+				// and its own to change again (rebase, unsafe).
+				acc.own = append(acc.own, ws[i]...)
 				continue
 			}
 			acc.writes = append(acc.writes, ws[i]...)
@@ -912,13 +924,14 @@ func undoes(w candidate, mine any) bool {
 // another value than head, which someone else wrote since: had the client
 // that candidate, the save would undo that write unseen, or overwrite it
 // with a change of its own without a conflict. A value the principal
-// wrote since (a later write of its own there, which head still holds) is
+// wrote since (a later write of its own there, which head still holds, or
+// one the log says only the user's own entries wrote since, sp, §H.7) is
 // its own to change again.
-func unsafe(out, head any, cs []candidate) []string {
+func unsafe(out, head any, cs []candidate, sp map[string]span) []string {
 	var bad []string
 	for _, q := range writesOf(head, merge.Diff(head, out)) {
 		for _, c := range cs {
-			if !agree(c.doc, head, q) && !ownSince(c, q, head, cs) {
+			if !agree(c.doc, head, q) && !ownSince(c, q, head, cs) && !onlyOwnSince(c, q, sp) {
 				p := q.String()
 				if p == "" {
 					p = "(the whole document)"
@@ -929,6 +942,15 @@ func unsafe(out, head any, cs []candidate) []string {
 		}
 	}
 	return bad
+}
+
+// onlyOwnSince reports whether the log from candidate c's revision to the
+// head, as spans read it (sp), holds writes of q by the user's own
+// entries only (§H.7 "Users", §H.4 "Others' writes"), and no delete or
+// restore by someone else.
+func onlyOwnSince(c candidate, q pointer.Pointer, sp map[string]span) bool {
+	s, ok := sp[c.rev]
+	return c.rev != "" && ok && !s.foreign && overlapsAny(q, s.own) && !overlapsAny(q, s.writes)
 }
 
 // ownSince reports whether the principal wrote q after c, and head still
@@ -955,15 +977,22 @@ func ownSince(c candidate, q pointer.Pointer, head any, cs []candidate) bool {
 // those writes overlap others' since base, mine must agree with head
 // there, a change both made, or a version reloaded since; otherwise the
 // clashing paths are returned and nothing is. Others' writes are what
-// differs between base and head, and logged, the writes of the log
-// entries between them (spans), which also hold a value someone changed
-// and changed back. Documents are as rebased's view shows them.
-func rebase(base, mine, head any, logged []pointer.Pointer) (any, []string) {
+// differs between base and head, and the writes of the log entries
+// between them (spans, sp.writes), which also hold a value someone
+// changed and changed back; but not a difference only the user's own
+// entries there wrote (sp.own, §H.7 "Users", §H.4 "Others' writes").
+// Documents are as rebased's view shows them.
+func rebase(base, mine, head any, sp span) (any, []string) {
 	ours := writesOf(base, merge.Diff(base, mine))
 	if len(ours) == 0 {
 		return head, nil
 	}
-	theirs := append(writesOf(base, merge.Diff(base, head)), logged...)
+	theirs := append([]pointer.Pointer(nil), sp.writes...)
+	for _, q := range writesOf(base, merge.Diff(base, head)) {
+		if !overlapsAny(q, sp.own) || overlapsAny(q, sp.writes) {
+			theirs = append(theirs, q)
+		}
+	}
 	clash := map[string]bool{}
 	for _, o := range ours {
 		for _, t := range theirs {

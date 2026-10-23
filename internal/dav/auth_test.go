@@ -226,7 +226,7 @@ func TestGatewayBounds(t *testing.T) {
 	req.SetBasicAuth("u", p)
 	done := make(chan int)
 	go func() {
-		res, err := http.DefaultClient.Do(req)
+		res, err := testHTTP.Do(req)
 		if err != nil {
 			done <- -1
 			return
@@ -518,7 +518,7 @@ func TestGatewayInflightShare(t *testing.T) {
 		req.SetBasicAuth("u", mallory)
 		go func() {
 			defer func() { done <- struct{}{} }()
-			if res, err := http.DefaultClient.Do(req); err == nil {
+			if res, err := testHTTP.Do(req); err == nil {
 				io.Copy(io.Discard, res.Body)
 				res.Body.Close()
 			}

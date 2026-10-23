@@ -1151,7 +1151,7 @@ func minRefusedPerNamespace(t *testing.T, slow bool) {
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		req := must(http.NewRequest("GET", tr.http.URL+"/cat/children?of=season&min=ghost:"+tr.s.Checkpoint("matches"), nil))
 		req.Header.Set("Authorization", "Bearer "+ann)
-		res := must(http.DefaultClient.Do(req))
+		res := must(testHTTP.Do(req))
 		res.Body.Close()
 		if res.StatusCode == http.StatusBadRequest {
 			break
