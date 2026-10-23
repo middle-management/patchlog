@@ -520,3 +520,75 @@ func TestReadGrantsKeysBehindV073(t *testing.T) {
 		t.Errorf("keys available again: %v", e)
 	}
 }
+
+// p30PurgeHeld purges ns, unsealed, while the service's follower of it is
+// held (holdRT), so the service hasn't applied the purge: its document is
+// still served (§8.5), and only the core's head of a name tells. It
+// returns the purge-ns entry.
+func (w *world) p30PurgeHeld(rt *holdRT, ns string) string {
+	w.t.Helper()
+	ctx := context.Background()
+	rt.hold.Store(true)
+	w.t.Cleanup(func() { rt.hold.Store(false) })
+	pc := w.s.Client(w.t, client.WithBearer(w.opsKey.Grant(w.t, w.s.Now(), "user:ops", []string{ns}, []string{"read", "config", "purge-ns"})))
+	must(pc.PatchConfig(ctx, ns, must(pc.NSHead(ctx, ns)).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	return must(pc.PurgeNamespace(ctx, ns, must(pc.NSHead(ctx, ns)).ID))
+}
+
+// p30HeldWorld is the default world whose service follows ns through a
+// holdRT.
+func p30HeldWorld(t *testing.T, ns string) (*world, *holdRT) {
+	w := setup(t)
+	w.seed()
+	rt := &holdRT{ns: ns, base: transport}
+	w.svcClient = w.s.Client(t, client.WithHTTPClient(&http.Client{Transport: rt}),
+		client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "svc:catalog", []string{"cat", "matches"}, []string{"read"},
+			map[string]any{"exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))
+	w.start()
+	w.caughtUp()
+	return w, rt
+}
+
+// TestCreatePurgedBeforeApplyV073 (TC-35, TC-38): a Create in a purged
+// content namespace is 410 purged with head, for every name, also before
+// the service applies the purge of an unsealed namespace, whose document
+// stays readable: the core's head of a fresh name is 410 purged at
+// namespace level, not a purged item, so it isn't the 409 "exists or
+// existed" (§B.11.4 Create, §8.5). Decided at the core's head, it carries
+// no checkpoint. A name the service saw stays 409 at its checkpoint.
+func TestCreatePurgedBeforeApplyV073(t *testing.T) {
+	t.Parallel()
+	w, rt := p30HeldWorld(t, "matches")
+	admin := w.caller("user:ada", "catalog-admins", "match-desk")
+	head := w.p30PurgeHeld(rt, "matches")
+	r := w.issue(admin, map[string]any{"item": "/r/matches/fresh", "want": toAny("create")}, 410)
+	if r.body["code"] != "purged" || r.body["head"] != head || r.body["checkpoint"] != nil {
+		t.Errorf("create of a fresh name: %v (want 410 purged, head %s, no checkpoint)", r.body, head)
+	}
+	r = w.issue(admin, map[string]any{"item": "/r/matches/derby", "want": toAny("create")}, 409)
+	if r.body["code"] != "conflict" || r.body["checkpoint"] == nil {
+		t.Errorf("create of a name the service saw: %v (want 409 at the checkpoint)", r.body)
+	}
+}
+
+// TestCreatePurgedCatalogV073 (§8.5, §B.11.4): the core's head of a name
+// in a purged catalog is 410 purged at namespace level: Create a folder
+// answers 410 purged with head, not 409 "exists or existed", and Place
+// 410 purged, not 410 gone for a purged placement. Decided at the core's
+// head, neither carries a checkpoint.
+func TestCreatePurgedCatalogV073(t *testing.T) {
+	t.Parallel()
+	w, rt := p30HeldWorld(t, "cat")
+	admin := w.caller("user:ada", "catalog-admins", "match-desk")
+	w.doc("matches", "unplaced", map[string]any{"title": "unplaced"})
+	head := w.p30PurgeHeld(rt, "cat")
+	for _, req := range []map[string]any{
+		{"node": "highlights", "want": toAny("create"), "to": []any{}},
+		{"item": "/r/matches/unplaced", "want": toAny("place"), "to": []any{}},
+	} {
+		r := w.do("POST", "/grants", admin, req)
+		if r.status != 410 || r.body["code"] != "purged" || r.body["head"] != head || r.body["checkpoint"] != nil {
+			t.Errorf("%v: %d %v (want 410 purged, head %s, no checkpoint)", req, r.status, r.body, head)
+		}
+	}
+}

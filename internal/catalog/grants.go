@@ -134,6 +134,24 @@ func purgedErr(ns, head string) error {
 	return &Error{Status: 410, Code: "purged", Msg: fmt.Sprintf("namespace %s is purged", ns), Head: head}
 }
 
+// coreHead is the core's head of ns/name, which may be ahead of the
+// checkpoint: a refusal decided from it carries none (decidedAt). Every
+// name of a namespace the core holds as purged is 410 purged, with its
+// purge-ns entry as head, rather than a purged item (client.Head.PurgedNS):
+// until the service applies the purge of a namespace whose documents stay
+// readable, an unsealed one (§8.5), contentConfig and purgedIn pass, and
+// only the core's head of a name tells (§B.11.4).
+func (s *Service) coreHead(ctx context.Context, ns, name string) (*client.Head, error) {
+	h, err := s.t.Client().Head(ctx, ns, name)
+	if err != nil {
+		return nil, upstream(err)
+	}
+	if h.PurgedNS != "" {
+		return nil, purgedErr(ns, h.PurgedNS)
+	}
+	return h, nil
+}
+
 // purgedIn is purgedErr, decided at the checkpoint g and cur reflect, for
 // a namespace the service holds as purged there, its purge-ns entry
 // ns's checkpoint (tree.Service.PurgeEntry); nil otherwise. Call it under
@@ -823,11 +841,12 @@ func (s *Service) noContentKey(ns string) error {
 // visibility.
 //
 // A create answers, in order (§B.11.4 Create): 410 purged in a purged
-// namespace (contentConfig, purgedIn); 409 for a name that exists or
+// namespace (contentConfig, purgedIn), or in one the core holds as purged
+// before the service applies it (coreHead); 409 for a name that exists or
 // existed, as the checkpoint has it, then as the core's head has it (a
-// name the service hasn't seen yet, which carries no checkpoint,
-// decidedAt); then 403 for an item without a placement in this catalog,
-// or a caller without a role kept.
+// name the service hasn't seen yet); then 403 for an item without a
+// placement in this catalog, or a caller without a role kept. Answers
+// from the core's head carry no checkpoint (decidedAt).
 //
 // Other verbs answer as Restore's list does (§B.11.4): 410 purged; 404
 // for a name that never existed; for a purged item, 403 without a role
@@ -924,12 +943,14 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		if f.state != tree.ItemUnknown {
 			return nil, conflict("%s exists or existed", item)
 		}
-		h, err := s.t.Client().Head(ctx, ns, name)
+		// The core is ahead of the checkpoint (decidedAt): a namespace it
+		// holds as purged is 410 purged (coreHead), a name it has 409.
+		h, err := s.coreHead(ctx, ns, name)
 		if err != nil {
-			return nil, upstream(err)
+			checkpoint = nil
+			return nil, err
 		}
 		if h.State != client.NotFound {
-			// The core is ahead of the checkpoint (decidedAt).
 			checkpoint = nil
 			return nil, conflict("%s exists or existed", item)
 		}
@@ -1588,13 +1609,15 @@ func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node 
 	if taken {
 		return nil, conflict("%s is taken in %s: a node has it, or a parents entry names it", name, cat)
 	}
-	h, herr := s.t.Client().Head(ctx, cat, name)
+	// The core is ahead of the checkpoint, or a node had the name, which
+	// the service doesn't keep (decidedAt); a purged catalog is 410
+	// purged (coreHead).
+	h, herr := s.coreHead(ctx, cat, name)
 	if herr != nil {
-		return nil, upstream(herr)
+		checkpoint = nil
+		return nil, herr
 	}
 	if h.State != client.NotFound {
-		// The core is ahead of the checkpoint, or a node had the name,
-		// which the service doesn't keep (decidedAt).
 		checkpoint = nil
 		return nil, conflict("%s exists or existed in %s", name, cat)
 	}
@@ -1781,14 +1804,15 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 		return nil, conflict("%s is already placed in %s; move it instead", item, cat)
 	}
 	verb := "create"
-	h, herr := s.t.Client().Head(ctx, cat, pl)
+	h, herr := s.coreHead(ctx, cat, pl)
 	// The answers below are decided from the core's head of the placement,
 	// which may be ahead of the checkpoint (decidedAt); the service's own
 	// view of it is the 409 above.
 	ahead := func(err error) error { checkpoint = nil; return err }
 	switch {
 	case herr != nil:
-		return nil, upstream(herr)
+		// A purged catalog is 410 purged (coreHead).
+		return nil, ahead(herr)
 	case h.State == client.Live:
 		return nil, ahead(conflict("%s is already placed in %s; move it instead", item, cat))
 	case h.State == client.Purged:
