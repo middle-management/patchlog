@@ -347,6 +347,21 @@ CREATE TABLE IF NOT EXISTS rotations_due (
   ns    INTEGER PRIMARY KEY REFERENCES namespaces,
   since INTEGER NOT NULL
 );
+
+-- Addition: a remote branch whose source's level, as last seen in the log
+-- it follows, is above its own (§G.5.2, remote_branch.go followLevel):
+-- level is the source's (1 at-rest, 2 sealed, 3 e2e) after the entry id;
+-- lacks, that this server can't hold it, so the source's resources answer
+-- 502 upstream (§1, upstream.go); rebase, that Levels refuse the raise,
+-- so the branch needs a rebase. No row while the branch follows.
+CREATE TABLE IF NOT EXISTS remote_levels (
+  branch  INTEGER PRIMARY KEY REFERENCES namespaces,
+  level   INTEGER NOT NULL,
+  lacks   INTEGER NOT NULL,
+  rebase  INTEGER NOT NULL,
+  id      TEXT    NOT NULL,
+  created INTEGER NOT NULL
+);
 `
 
 // openDB opens the database: a Postgres URL (pgschema.go), or a SQLite

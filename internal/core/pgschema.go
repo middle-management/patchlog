@@ -417,6 +417,17 @@ CREATE TABLE IF NOT EXISTS rotations_due (
 -- unhashed (§5, §7.4; db.go, grantVia). NULL for none, for the server's
 -- own entries, and in rows from before it.
 ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS via text;
+-- A remote branch whose source's level is above its own (§G.5.2; db.go,
+-- remote_branch.go): the source's level, whether this server lacks it
+-- (502 upstream, §1) and whether the branch needs a rebase.
+CREATE TABLE IF NOT EXISTS remote_levels (
+  branch  bigint   PRIMARY KEY REFERENCES namespaces,
+  level   smallint NOT NULL,
+  lacks   smallint NOT NULL,
+  rebase  smallint NOT NULL,
+  id      text     NOT NULL,
+  created bigint   NOT NULL
+);
 `
 
 // openPG opens a Postgres database and creates or migrates its schema.

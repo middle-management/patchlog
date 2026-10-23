@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,6 +22,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/verify"
 
 	"github.com/middle-management/patchlog/internal/telemetry"
@@ -50,14 +52,19 @@ import (
 // The rules that rely on one operator stop at the shadows: keys and
 // revocations are the branch's own, purges in the base (including those
 // that propagated to it from its bases) arrive as notices from its log, and
-// nothing on this side blocks the base (§7.6).
+// nothing on this side blocks the base (§7.6). So do raises of the base's
+// level and its read made non-public, which the branch follows (§G.5.2,
+// followConfig).
 //
 // Encryption (§G.5). A base that isn't public, or is sealed or e2e, binds
 // the branch: it must be private or sealed (a sealed branch of a sealed
 // base may be public, as for local branches), never below the base's
 // encryption level, and e2e only if the base is. That is what A's export
-// grant entrusts to B, and B enforces it at creation. The shadows follow
-// the branch's level (at rest, and for sealing and e2e).
+// grant entrusts to B, and B enforces it at creation, and by raising its
+// level when the base's rises (followLevel), or, on a server that lacks
+// the level, answering 502 upstream for what it mirrored (§1,
+// upstream.go). The shadows follow the branch's level (at rest, and for
+// sealing and e2e).
 //
 //   - E2. B fetches with keys: the endpoint's grant gets them from the
 //     base's POST /ns/{ns}/keys, unwrapped with the endpoint's Identity
@@ -1658,17 +1665,22 @@ func (t *tx) remoteBases(where string, args ...any) []*remoteBase {
 	return out
 }
 
-// RemoteNotice is a purge seen in a remote base's log (§G.3).
+// RemoteNotice is a purge seen in a remote base's log (§G.3), or a config
+// change there that raised the base's level above the branch's or made its
+// read non-public (§G.5.2).
 type RemoteNotice struct {
 	Branch   string // the remote branch
 	ID       string // the base's ns_id of the entry
-	Kind     string // purge or purge-ns
+	Kind     string // purge, purge-ns, or config
 	Resource string // purge: the resource name
-	Applied  bool   // applied locally (§8.3), or only recorded
-	Created  string
+	// Applied: applied locally (§8.3), or, for config, followed: the
+	// branch raised its level, and restricted its read, as its base did
+	// (followConfig). A config change not followed is in RemoteLevels.
+	Applied bool
+	Created string
 }
 
-// RemoteNotices lists the purge notices of a remote branch ("" = all), oldest
+// RemoteNotices lists the notices of a remote branch ("" = all), oldest
 // first.
 func (e *Engine) RemoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error) {
 	var out []RemoteNotice
@@ -1690,9 +1702,51 @@ func (e *Engine) RemoteNotices(ctx context.Context, ns string) ([]RemoteNotice, 
 	return out, err
 }
 
+// RemoteLevel is a remote branch whose base's level, as last seen in the
+// log it follows, is above its own, because it couldn't follow the raise
+// (§G.5.2, followLevel).
+type RemoteLevel struct {
+	Branch string // the remote branch
+	Level  string // the base's level: at-rest, sealed or e2e
+	// Lacks: this server can't hold that level, so every resource the base
+	// had at at, read through or written on since and not purged since,
+	// answers 502 upstream here, and in the branches reading through the
+	// remote branch (§1, upstreamRefusal).
+	Lacks bool
+	// Rebase: Levels refuse the raise, as they refuse e2e to a branch whose
+	// at is before its base's e2e raise, so the branch needs a rebase onto
+	// the base's current head (§G.5.2, §F.5).
+	Rebase  bool
+	ID      string // the base's ns_id of the entry that raised it
+	Created string
+}
+
+// RemoteLevels lists the remote branches ("" = all) whose base's level is
+// above their own.
+func (e *Engine) RemoteLevels(ctx context.Context, ns string) ([]RemoteLevel, error) {
+	var out []RemoteLevel
+	err := e.read(ctx, func(t *tx) error {
+		rows, err := t.Query(`SELECT n.name, l.level, l.lacks, l.rebase, l.id, l.created FROM remote_levels l JOIN namespaces n ON n.ns = l.branch
+			WHERE ? = '' OR n.name = ? ORDER BY n.name`, ns, ns)
+		t.must(err)
+		defer rows.Close()
+		for rows.Next() {
+			var rl RemoteLevel
+			var level int
+			var created int64
+			t.must(rows.Scan(&rl.Branch, &level, &rl.Lacks, &rl.Rebase, &rl.ID, &created))
+			rl.Level, rl.Created = levelNames[level], formatTime(created)
+			out = append(out, rl)
+		}
+		return nil
+	})
+	return out, err
+}
+
 // SyncRemotes follows every live remote branch's base once: purges in its
-// log since the last check are applied, and with Register, registrations
-// are made or renewed.
+// log since the last check are applied, and raises of its level and
+// restrictions of its read followed (§G.3, §G.5.2); with Register,
+// registrations are made or renewed.
 func (e *Engine) SyncRemotes(ctx context.Context) error {
 	var bases []*remoteBase
 	if err := e.read(ctx, func(t *tx) error {
@@ -1723,13 +1777,16 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// followRemote applies the purges in a base's log after the checkpoint
-// (§G.3: on purge or purge-ns, §8.3 applies locally to the branch's own
-// chains for that name, its own branches and its cache tags); a deployment
-// that sees a purge always applies it (§4). A sealed base's purge arrives
-// as the 410 purged of its log, whose head is the purge-ns entry (§8.5).
+// followRemote follows a base's log after the checkpoint. On purge or
+// purge-ns, §8.3 applies locally to the branch's own chains for that name,
+// its own branches and its cache tags (§G.3); a deployment that sees a
+// purge always applies it. A sealed base's purge arrives as the 410 purged
+// of its log, whose head is the purge-ns entry (§8.5). On a config entry,
+// or a batch with a config change, the base's namespace document after it
+// is read, before the write transaction, and a raise of its level, or a
+// read made non-public, is followed (followConfig, §G.5.2).
 func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
-	c, _, err := e.remoteClient(b.origin)
+	c, ep, err := e.remoteClient(b.origin)
 	if err != nil {
 		return err
 	}
@@ -1745,10 +1802,33 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 		entries, head, err = []client.NSEntry{{ID: h, Kind: "purge-ns"}}, h, nil
 	}
 	if err != nil {
+		if !noAnswer(err) {
+			// A log this deployment can't open because the base is sealed
+			// now still says that much (sealedAt): its level is followed as
+			// a raise to sealed, though nothing else of the log can be.
+			if h, herr := c.NSHead(ctx, b.ns); herr == nil && sealedAt(ctx, ep, c.BaseURL(), "/ns/"+b.ns+"/rev/"+h.ID) {
+				if ferr := e.followSealed(ctx, b, h.ID); ferr != nil {
+					return errors.Join(err, ferr)
+				}
+			}
+		}
 		return err
 	}
 	if len(entries) == 0 {
 		return nil
+	}
+	// The base's namespace document after each config change, which this
+	// deployment reads only from the base itself (§G.5.2).
+	docs := map[string]sourceDoc{}
+	for _, en := range entries {
+		if !configChanged(en) {
+			continue
+		}
+		d, err := fetchSourceDoc(ctx, c, ep, b.ns, en.ID)
+		if err != nil {
+			return err
+		}
+		docs[en.ID] = d
 	}
 	return e.update(ctx, func(t *tx) error {
 		// The branch's lock first: the checkpoint is read as of it.
@@ -1760,6 +1840,13 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 		}
 		author := t.authorID(RemoteAuthor)
 		for _, en := range entries {
+			if d, ok := docs[en.ID]; ok {
+				if !bn.purged {
+					t.followConfig(bn, en.ID, d)
+					bn = t.nsByIDLocked(bn.id, lockExclusive)
+				}
+				continue
+			}
 			var names []string
 			switch en.Kind {
 			case "purge":
@@ -1802,6 +1889,240 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 		t.must(err)
 		return nil
 	})
+}
+
+// configChanged reports whether a namespace entry changes the namespace
+// document: a config entry, or a batch with a config change (§7.4, §7.5).
+func configChanged(en client.NSEntry) bool {
+	if en.Kind == "config" {
+		return true
+	}
+	if en.Kind == "batch" {
+		for _, s := range en.Entries {
+			if s.Kind == "config" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sourceDoc is what a remote branch follows of its base's namespace
+// document after a config change (§G.5.2): its level, and its read, ""
+// where the document is sealed and this deployment can't open it.
+type sourceDoc struct {
+	level int
+	read  string
+}
+
+// fetchSourceDoc reads the base's namespace document as of nsID. One the
+// base serves sealed but this deployment can't open is at least sealed
+// (sealedAt), its read unknown.
+func fetchSourceDoc(ctx context.Context, c *client.Client, ep RemoteEndpoint, ns, nsID string) (sourceDoc, error) {
+	d, err := c.NSDoc(ctx, ns, nsID)
+	if err == nil {
+		read, _ := d.Value["read"].(string)
+		return sourceDoc{level: docLevel(d.Value), read: read}, nil
+	}
+	if !noAnswer(err) && sealedAt(ctx, ep, c.BaseURL(), "/ns/"+ns+"/rev/"+nsID) {
+		return sourceDoc{level: levelSealed}, nil
+	}
+	return sourceDoc{}, fmt.Errorf("/ns/%s/rev/%s: %w", ns, nsID, err)
+}
+
+// sealedAt reports whether the base answers path, one of its namespace
+// document URLs, sealed (§E.2.2): only a namespace at sealed or above
+// serves its documents so, so this deployment learns that much of its
+// base's level even where it can't open them.
+func sealedAt(ctx context.Context, ep RemoteEndpoint, baseURL, path string) bool {
+	hr, err := http.NewRequestWithContext(ctx, "GET", baseURL+path, nil)
+	if err != nil {
+		return false
+	}
+	if ep.Bearer != "" {
+		hr.Header.Set("Authorization", "Bearer "+ep.Bearer)
+	}
+	res, err := ep.HTTPClient.Do(hr)
+	if err != nil {
+		return false
+	}
+	defer res.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))
+	ct, _, _ := mime.ParseMediaType(res.Header.Get("Content-Type"))
+	return res.StatusCode == 200 && strings.EqualFold(ct, seal.ContentType)
+}
+
+// followSealed follows a base whose log this deployment can't open because
+// it is sealed: as a raise to sealed (followConfig), recorded at the head
+// the base names, which isn't verified. The checkpoint stays: nothing else
+// of the log is followed.
+func (e *Engine) followSealed(ctx context.Context, b *remoteBase, head string) error {
+	return e.update(ctx, func(t *tx) error {
+		bn := t.nsByIDLocked(b.branch, lockExclusive)
+		if !bn.purged {
+			t.followConfig(bn, head, sourceDoc{level: levelSealed})
+		}
+		return nil
+	})
+}
+
+// followConfig follows a config change seen at the base's entry id
+// (§G.5.2). A raise of the base's level above the branch's is followed as
+// far as Levels allow (followLevel), unless it was recorded already as one
+// the branch can't follow. A read the base made non-public restricts a
+// public branch's, its public dependents first, leaves first (SHOULD).
+// Either is recorded as a config notice, applied if the branch followed
+// all of it.
+func (t *tx) followConfig(bn *nsRow, id string, d sourceDoc) {
+	cur := t.config(bn.configSeq)
+	var recorded int
+	if err := t.QueryRow(`SELECT level FROM remote_levels WHERE branch = ?`, bn.id).Scan(&recorded); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.must(err)
+	}
+	raise := d.level > cur.level && d.level > recorded
+	restrict := d.read != "" && d.read != "public" && cur.Read == "public"
+	if !raise && !restrict {
+		return
+	}
+	applied := true
+	if raise {
+		applied = t.followLevel(bn, id, d.level)
+	}
+	if restrict {
+		applied = t.restrictRead(bn) && applied
+	}
+	_, err := t.Exec(`INSERT INTO remote_notices (branch, id, kind, resource, applied, created) VALUES (?,?,?,NULL,?,?) ON CONFLICT DO NOTHING`,
+		bn.id, id, "config", applied, t.now.UnixMilli())
+	t.must(err)
+}
+
+// followLevel follows a raise of the base's level to level, above the
+// branch's own, seen at the base's entry id (§G.5.2): the branch raises
+// its local dependents, leaves first, then itself, by config writes of
+// this deployment (RemoteAuthor, serverConfig), which seal what they read
+// through as a local raise does (insertConfig, encryptNamespace). It
+// reports whether it raised. Otherwise it records in remote_levels why it
+// couldn't:
+//
+//   - a level this server lacks: without a key store it holds none
+//     (checkEncryption), and the resources the base had at at then answer
+//     502 upstream (§1, upstreamRefusal); or a raise that failed, so they
+//     do too rather than be served below the base's level (Levels);
+//   - e2e, which Levels refuse a branch whose at is before its base's e2e
+//     raise, as the raise seen after at is: the branch needs a rebase. It
+//     keeps serving what it read through, which the base serves as at the
+//     level before its raise (Addendum E Levels, After a raise).
+func (t *tx) followLevel(bn *nsRow, id string, level int) bool {
+	lacks, rebase := false, false
+	switch {
+	case t.e.opt.KeyStore == nil:
+		lacks = true
+	case level == levelE2E:
+		rebase = true
+	default:
+		if err := t.raiseLeavesFirst(bn, level); err != nil {
+			log.Printf("remote branch %s: following its base's raise to %s: %v", bn.name, levelNames[level], err)
+			lacks, rebase = true, true
+		}
+	}
+	if !lacks && !rebase {
+		return true
+	}
+	var wasLacks, wasRebase bool
+	if err := t.QueryRow(`SELECT lacks, rebase FROM remote_levels WHERE branch = ?`, bn.id).Scan(&wasLacks, &wasRebase); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.must(err)
+	}
+	_, err := t.Exec(`DELETE FROM remote_levels WHERE branch = ?`, bn.id)
+	t.must(err)
+	_, err = t.Exec(`INSERT INTO remote_levels (branch, level, lacks, rebase, id, created) VALUES (?,?,?,?,?,?)`,
+		bn.id, level, lacks || wasLacks, rebase || wasRebase, id, t.now.UnixMilli())
+	t.must(err)
+	if lacks {
+		// Copies of its resources, at the edge and in the read cache, go:
+		// they answer 502 now (§9).
+		t.metaChanged = true
+		for _, n := range t.leavesFirst(bn) {
+			t.tags = append(t.tags, "ns:"+n.name)
+		}
+		log.Printf("remote branch %s: its base was raised to %s, which this server lacks: what it had at at answers 502 upstream (§1)", bn.name, levelNames[level])
+	} else {
+		log.Printf("remote branch %s: its base was raised to %s, which Levels refuse a branch whose at is before the raise: rebase it (§G.5.2)", bn.name, levelNames[level])
+	}
+	return false
+}
+
+// leavesFirst lists n and the branches of it that aren't purged, at any
+// depth, each after its own branches: the order levels are raised and
+// reads restricted in (§7.4).
+func (t *tx) leavesFirst(n *nsRow) []*nsRow {
+	var out []*nsRow
+	for _, b := range t.branchesOf(n) {
+		if !b.purged {
+			out = append(out, t.leavesFirst(b)...)
+		}
+	}
+	return append(out, n)
+}
+
+// raiseLeavesFirst raises bn and its dependents to level, leaves first,
+// each that is below it (§7.4, Addendum E Levels).
+func (t *tx) raiseLeavesFirst(bn *nsRow, level int) error {
+	for _, n := range t.leavesFirst(bn) {
+		n = t.nsByIDLocked(n.id, lockExclusive)
+		cur := t.config(n.configSeq)
+		if cur.level >= level {
+			continue
+		}
+		ps := []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": levelNames[level]}}}
+		if _, ok := cur.Doc["schemaReads"]; ok && level >= levelSealed {
+			// A member the new level refuses goes in the same write
+			// (§6.1, Addendum E Levels).
+			ps = append(ps, map[string]any{"op": "remove", "path": "/schemaReads"})
+		}
+		if err := t.serverConfig(n, ps); err != nil {
+			return fmt.Errorf("raising %s: %w", n.name, err)
+		}
+	}
+	return nil
+}
+
+// restrictRead makes a public remote branch, and its public dependents
+// first, leaves first, readable by grant only, as its base now is (§G.5.2
+// SHOULD, §7.4). It reports whether it did.
+func (t *tx) restrictRead(bn *nsRow) bool {
+	for _, n := range t.leavesFirst(bn) {
+		n = t.nsByIDLocked(n.id, lockExclusive)
+		if t.config(n.configSeq).Read != "public" {
+			continue
+		}
+		if err := t.serverConfig(n, []any{map[string]any{"op": "add", "path": "/read", "value": "grant"}}); err != nil {
+			log.Printf("remote branch %s: restricting the read of %s as its base's: %v", bn.name, n.name, err)
+			return false
+		}
+	}
+	return true
+}
+
+// serverConfig is a config write of this deployment's own to n, made for a
+// remote base it follows (§G.5.2): by RemoteAuthor, under no grant, and
+// checked as one under a * key is (§7.4), its entry recording no grant.
+func (t *tx) serverConfig(n *nsRow, patches []any) error {
+	cur := t.config(n.configSeq)
+	cc := &ConfigChange{IfMatch: t.configID(n.configSeq).String(), Patches: patches}
+	a := &actor{principal: grant.Principal{ID: RemoteAuthor}, star: true, bucketKey: RemoteAuthor}
+	p, err := t.planConfig(n, cur, a, cc, false)
+	if err != nil {
+		return err
+	}
+	if p.replay != nil {
+		return nil
+	}
+	author := t.authorID(RemoteAuthor)
+	t.asServer(func() {
+		seq := t.insertConfig(n, p, author)
+		t.appendNS(n, map[string]any{"kind": "config", "target": p.id.String()}, nil, &seq, seq, author)
+	})
+	return nil
 }
 
 // RegisterRemote registers a remote branch with its base, or renews its
