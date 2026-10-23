@@ -163,6 +163,8 @@ func TestV073RemoteUpstreamLevel(t *testing.T) {
 	} {
 		upstream(b.get(p), p)
 	}
+	// The namespace's listings still list them: only the resources answer.
+	expect(t, b.get("/ns/r/rev/"+b.nsHead("r")+"/heads"), 200)
 	// B's own resources, and purged ones, answer as before.
 	expect(t, b.get("/r/r/mine"), 302)
 	expect(t, b.get("/r/r/mine/rev/"+mine), 200)
@@ -182,6 +184,22 @@ func TestV073RemoteUpstreamLevel(t *testing.T) {
 	expectCode(t, r, 502, "batch")
 	if items, _ := r.Obj()["items"].([]any); len(items) != 1 || items[0].(map[string]any)["code"] != "upstream" || items[0].(map[string]any)["index"] != 1.0 {
 		t.Fatalf("batch items %s", r.Body)
+	}
+	// Step 2.1 answers the 502 and a purged resource's 410 in one pass:
+	// the first failing item in request order sets the batch's status.
+	for _, c := range []struct {
+		first, second string
+		status        int
+	}{{"gone", "y", 410}, {"y", "gone", 502}} {
+		heads := map[string]string{"gone": gone1, "y": y1}
+		r := b.do(req{method: "POST", path: "/ns/r/batch", author: "alice", body: map[string]any{"items": []any{
+			map[string]any{"resource": c.first, "ifMatch": heads[c.first], "steps": []any{ops(op("add", "/w", 1.0))}},
+			map[string]any{"resource": c.second, "ifMatch": heads[c.second], "steps": []any{ops(op("add", "/w", 1.0))}},
+		}}})
+		expectCode(t, r, c.status, "batch")
+		if items, _ := r.Obj()["items"].([]any); len(items) != 2 {
+			t.Fatalf("batch %s, %s: %s", c.first, c.second, r.Body)
+		}
 	}
 	// B's own resources take writes.
 	b.appendRev("r", "mine", mine, ops(op("add", "/w", 1.0)))
