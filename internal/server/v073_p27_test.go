@@ -185,14 +185,14 @@ func TestV073BlobBodyNotIJSON(t *testing.T) {
 
 // RH-48 (BBD-33): …/blob/{bid}/e/{e} outside sealed namespaces is 404
 // not_offered, after the resource's read check, cached as short (§7.1,
-// §9).
+// §9); a purged resource's is 410 first, as its other URLs (§8.3).
 func TestV073EpochBlobURLNotOffered(t *testing.T) {
 	t.Parallel()
 	f := newAuthFixture(t, nil, withBlobTuning)
 	e := f.tenv
 	data := []byte("plain namespace")
 	k := newKey("pk")
-	e.mkNS("open", map[string]any{"read": "public", "keys": []any{k.entry("read", "create", "append")}})
+	e.mkNS("open", map[string]any{"read": "public", "keys": []any{k.entry("read", "create", "append", "purge")}})
 	w := e.grant(k, "user:w", []string{"open"}, []string{"read", "create", "append"})
 	obid := e.upload("open", "a", "text/plain", data, w)
 	e.create("open", "a", map[string]any{"b": ref(obid, "text/plain", len(data), "")}, w)
@@ -215,6 +215,22 @@ func TestV073EpochBlobURLNotOffered(t *testing.T) {
 	if cc := r.H.Get("Cache-Control"); !strings.HasPrefix(cc, "private") {
 		t.Errorf("private namespace: Cache-Control %q", cc)
 	}
+
+	// A purged resource: 410 before not_offered, once the caller passes
+	// the read check (§8.3), as its blob URL and document URL answer.
+	purger := e.grant(k, "user:p", []string{"open"}, []string{"read", "purge"})
+	pbid := e.upload("open", "p", "text/plain", data, w)
+	ph := e.create("open", "p", map[string]any{"b": ref(pbid, "text/plain", len(data), "")}, w)
+	expect(t, e.do(req{method: "POST", path: "/r/open/p/purge", ifMatch: ph, bearer: purger}), 204)
+	for _, p := range []string{blobPath("open", "p", pbid), blobPath("open", "p", pbid) + "/e/1", "/r/open/p"} {
+		expect(t, e.get(p), 410)
+	}
+	spbid := e.upload("sec", "p", "text/plain", data, f.issuerG)
+	sh := e.create("sec", "p", map[string]any{"b": ref(spbid, "text/plain", len(data), "")}, f.issuerG)
+	expect(t, e.do(req{method: "POST", path: "/r/sec/p/purge", ifMatch: sh, bearer: f.adminG}), 204)
+	expectCode(t, e.get(blobPath("sec", "p", spbid)+"/e/1"), 401, "unauthenticated")
+	expectCode(t, e.get(blobPath("sec", "p", spbid)+"/e/1", onlyB), 404, "not_found")
+	expect(t, e.get(blobPath("sec", "p", spbid)+"/e/1", f.issuerG), 410)
 }
 
 // protectionEnv is an authenticated deployment with sealed namespaces, and

@@ -220,7 +220,8 @@ type sealedBlobJob struct {
 // blob sealed under epoch e, if n serves it under e. Other epochs are 404
 // with NoStore, or 410 pruned once pruning removed every revision of the
 // epoch that references it. Only sealed namespaces have this URL: in any
-// other it is 404 not_offered (epochNotOffered).
+// other it is 404 not_offered (epochNotOffered), but 410 for a purged
+// resource (§8.3).
 func (e *Engine) ReadSealedBlob(ctx context.Context, ns, name, bidText, epochText string, cred Credentials) (*Blob, error) {
 	b, err := e.OpenSealedBlob(ctx, ns, name, bidText, epochText, cred)
 	if err != nil {
@@ -253,6 +254,12 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 		if !t.isSealedNS(n) {
 			// Only sealed namespaces have this URL: 404 not_offered,
 			// after the resource's read check, cached as short (§7.1).
+			// A purged resource's URLs are 410 first, as its blob URL
+			// answers (§8.3: "before a not_offered as in §8.5"; raw.go).
+			if t.resolve(n, name, nil).state == Purged {
+				out.Status = 410
+				return nil
+			}
 			return epochNotOffered(out.Public)
 		}
 		bid, perr := ids.Parse(bidText)
