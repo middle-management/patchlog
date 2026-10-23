@@ -1699,8 +1699,10 @@ func (e *Engine) withRemoteSource(ctx context.Context, f func(context.Context) e
 			return err
 		}
 		if tries == 3 {
-			// The configuration kept changing under the write.
-			return apiErr(503, "unavailable", "message", "the namespace changed while its base's document was read; retry")
+			// A safety net: a write runs again with the same request, and
+			// a configuration that changed since gives it a 412 at step 2,
+			// before it needs the document again.
+			return apiErr(502, "upstream", "origin", need.origin, "message", "the base's namespace document read for this write kept being needed again")
 		}
 		h.docs[need.branch] = e.readRemoteSource(ctx, need)
 	}
