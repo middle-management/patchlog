@@ -643,10 +643,20 @@ func (st *reqState) behindDir(ctx context.Context, cat, folder string, oldest ti
 	if err != nil && errors.As(upstream(err), &de) && (de.status == http.StatusUnauthorized || de.status == http.StatusForbidden || de.status == http.StatusNotFound) {
 		if !oldest.IsZero() && st.s.opt.Now().Sub(oldest) >= limitedWait {
 			ents, err := st.svcList(ctx, cat, folder, nil)
+			roots := false
+			if c, cerr := st.treeConf(ctx, cat); errors.As(err, &de) && de.status == http.StatusNotFound && cerr == nil && folder == c.files.root {
+				// files.root hidden: its roots (serviceDir).
+				ents, err = st.svcRoots(ctx, cat, nil)
+				roots = err == nil
+			}
 			if err != nil {
 				return nil, err
 			}
-			return st.svcDir(ctx, cat, ents)
+			d, err := st.svcDir(ctx, cat, ents)
+			if d != nil {
+				d.roots = roots
+			}
+			return d, err
 		}
 		e := fail(http.StatusServiceUnavailable, "catalog %s's tree service hasn't caught up with your latest writes yet, and your grant doesn't read the catalog's nodes otherwise (%s); try again in a moment", cat, de.msg)
 		e.header = http.Header{"Retry-After": {"1"}}
