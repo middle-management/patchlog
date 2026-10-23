@@ -1796,12 +1796,18 @@ type token struct {
 	vns            string
 
 	mu      sync.Mutex
-	writers map[string]writerAt // by namespace: §7.4's writer block
-	docs    map[string]nsDocAt  // by namespace: what its document says
+	writers map[string]writerAt    // by namespace: §7.4's writer block
+	docs    map[string]nsDocAt     // by namespace: what its document says
+	issued  map[string]issuedGrant // by ns/name: grants a catalog service issued it (catgrants.go)
 }
 
+// newToken makes a token sending its requests with c, but those a
+// catalog service issued it a grant for (route).
 func (s *Server) newToken(id string, c *client.Client, sc *scope, named map[string]bool) *token {
-	return &token{id: id, c: c, p: sc.p, sc: sc, named: named, used: s.opt.Now(), writers: map[string]writerAt{}, docs: map[string]nsDocAt{}}
+	tk := &token{id: id, p: sc.p, sc: sc, named: named, used: s.opt.Now(), writers: map[string]writerAt{}, docs: map[string]nsDocAt{},
+		issued: map[string]issuedGrant{}}
+	tk.c = c.With(client.WithTransport(tk.route(s.opt.Now)))
+	return tk
 }
 
 // principal is a user as the server keeps state for them (§H.7): their

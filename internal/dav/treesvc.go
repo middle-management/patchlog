@@ -122,6 +122,7 @@ type treeShared struct {
 	mu    sync.Mutex
 	confs map[string]catConf // by catalog
 	read  map[string]bool    // by catalog: its settings were read, a file tree's or not
+	kinds map[string]svcKind // by catalog: whether its tree service is a catalog service (derived)
 }
 
 // init checks opt's tree services and, with any, watches the writes of
@@ -150,7 +151,7 @@ func (ts *treeShared) init(opt *Options) error {
 		}
 	}
 	opt.TreeServices = urls
-	ts.confs, ts.read, ts.page = map[string]catConf{}, map[string]bool{}, treePage
+	ts.confs, ts.read, ts.kinds, ts.page = map[string]catConf{}, map[string]bool{}, map[string]svcKind{}, treePage
 	if opt.TreeService == "" && len(urls) == 0 {
 		return nil
 	}
@@ -621,6 +622,7 @@ func (st *reqState) svcDir(ctx context.Context, cat string, ents []svcItem) (*tr
 			return nil, err
 		}
 		if ok {
+			te.order = e.Order
 			kids = append(kids, te)
 			if t, err := time.Parse(time.RFC3339Nano, e.Born); err == nil {
 				born[e.Name] = t
@@ -718,7 +720,8 @@ type svcItem struct {
 	Head   string   `json:"head"`
 	Self   bool     `json:"self"`
 	File   *svcFile `json:"file"`
-	Born   string   `json:"born"` // the created of the node's first revision (§B.5)
+	Born   string   `json:"born"`  // the created of the node's first revision (§B.5)
+	Order  string   `json:"order"` // its parents entry's order there (§B.2)
 }
 
 // svcFile is a placement's file metadata (§H.3).

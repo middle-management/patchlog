@@ -96,6 +96,19 @@ func jsonKind(v any) string {
 type saveOpts struct {
 	pre, fresh bool
 	fname      string
+	// blind: a fresh name created without reading its head first, which
+	// a create-only grant can't (§B.11.4 Create); its If-None-Match: *
+	// decides (saveHead)
+	blind bool
+}
+
+// saveHead is ns/name's head for a save with o: read, or, blind, taken as
+// none.
+func (st *reqState) saveHead(ctx context.Context, ns, name string, o saveOpts) (*client.Head, error) {
+	if o.blind {
+		return &client.Head{State: client.NotFound}, nil
+	}
+	return st.tk.c.Head(ctx, ns, name)
 }
 
 // taken is a fresh save's refusal of ns/name, which exists or existed.
@@ -121,7 +134,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 	var rev string
 	var exact bool
 	err := st.retrying(ctx, func() (bool, error) {
-		h, err := st.tk.c.Head(ctx, ns, name)
+		h, err := st.saveHead(ctx, ns, name, o)
 		if err != nil {
 			return false, err
 		}

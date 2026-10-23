@@ -1316,10 +1316,12 @@ func TestTreeServiceRenamedElsewhereDeletes(t *testing.T) {
 
 // A grant limited to some resources (§H.7), which doesn't read the
 // catalog's node documents (the core answers it 404 for them), keeps the
-// listing to resolve a write's path by: it edits a file it lists and
-// reads, through the tree's trust as last read with any grant; a write
-// that changes the tree's nodes (a new file or folder, a move, a delete)
-// is a 403 saying why, not the core's bare 404.
+// listing's view for names (§H.4 "Names before writes"): it edits a file
+// it lists and reads, through the tree's trust as its own /principal
+// says it; it renames and deletes a file whose placement's own document
+// it reads, checked against it, as the core lets it; a new file or folder
+// its grant can't make is the core's 403; and it deletes no folder (403,
+// saying why).
 func TestTreeServiceLimitedGrantWrites(t *testing.T) {
 	t.Parallel()
 	a := newAuthTree(t)
@@ -1335,39 +1337,39 @@ func TestTreeServiceLimitedGrantWrites(t *testing.T) {
 	if _, doc := g.load("matches", "derby"); doc.(map[string]any)["title"] != "Derby!" {
 		t.Fatalf("matches/derby %v", doc)
 	}
-	for _, c := range []struct{ method, path, body string }{
-		{"PUT", "/cat/Season/new.json", `{"x": 1}`},
-		{"MKCOL", "/cat/Season/F", ""},
-		{"MOVE", "/cat/Season/derby.json", ""},
-		{"DELETE", "/cat/Season/derby.json", ""},
-	} {
-		if r := g.expect(g.doAs(ann, c.method, c.path, c.body, "Destination", "/cat/Season/d2.json"), 403, "ann's "+c.method+" "+c.path); !strings.Contains(r.body, "node documents") {
-			t.Fatalf("%s: 403 %q", c.method, r.body)
-		}
+	g.expect(g.doAs(ann, "PUT", "/cat/Season/new.json", `{"x": 1}`), 403, "ann's PUT of a new file, whose placement her grant can't make")
+	g.expect(g.doAs(ann, "MKCOL", "/cat/Season/F", ""), 403, "ann's MKCOL, whose node her grant can't make")
+	if r := g.expect(g.doAs(ann, "DELETE", "/cat/Season", ""), 403, "ann's DELETE of a folder"); !strings.Contains(r.body, "node documents") {
+		t.Fatalf("DELETE of a folder: 403 %q", r.body)
 	}
-	if h, _ := g.load("matches", "derby"); h.State != client.Live {
-		t.Fatalf("derby is %v", h.State)
+	g.expect(g.doAs(ann, "MOVE", "/cat/Season/derby.json", "", "Destination", "/cat/Season/d2.json"), 201, "ann's rename of derby.json")
+	if doc := g.nodeDoc("cat", "matches.derby"); doc["title"] != "d2.json" {
+		t.Fatalf("derby's placement after the rename: %v", doc)
 	}
+	g.expect(g.doAs(ann, "DELETE", "/cat/Season/d2.json", ""), 204, "ann's DELETE of d2.json")
+	g.expectTombstoned("cat", "matches.derby", "derby's placement")
+	g.expectTombstoned("matches", "derby", "derby")
 }
 
 // A MOVE of a tree's file by a grant limited to some resources, which
-// can't delete it there (the node documents decide, §H.5, §H.7 "Limited
-// grants"), is refused before anything is written: onto another listed
-// file (a temporary file renamed over), the destination keeps its
-// content; to a new name in a flat namespace it can write (docs, which no
-// tree owns, §H.2), no copy is made. The source stays either way.
+// keeps the listing's view for names (§H.4, §H.7 "Limited grants") and
+// can't delete the file there (its verbs lack delete, §C.2), is refused
+// before anything is written: onto another listed file (a temporary file
+// renamed over), the destination keeps its content; to a new name in a
+// flat namespace it can write (docs, which no tree owns, §H.2), no copy
+// is made. The source stays either way.
 func TestTreeServiceLimitedGrantMoveWritesNothing(t *testing.T) {
 	t.Parallel()
 	a := newAuthTree(t)
 	w := a.docsNS(t)
 	g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.Namespaces = []string{"docs"} })
 	g.propfindAs(a.k.Grant(t, a.s.Now(), "user:admin", a.both, []string{"read"}), "/cat/")
-	ann := a.k.Grant(t, a.s.Now(), "user:ann", []string{"cat", "matches", "docs"}, []string{"read", "create", "append", "delete"}, map[string]any{"rules": []any{
+	ann := a.k.Grant(t, a.s.Now(), "user:ann", []string{"cat", "matches", "docs"}, []string{"read", "create", "append"}, map[string]any{"rules": []any{
 		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "season", "matches.derby", "derby", "matches.cup", "cup", "moved"}}}}})
 	sameStrings(t, "ann's Season", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
 	cupBefore, _ := g.load("matches", "cup")
 	for _, dst := range []string{"/cat/Season/cup.json", "/docs/moved.json"} {
-		if r := g.expect(g.doAs(ann, "MOVE", "/cat/Season/derby.json", "", "Destination", dst, "Overwrite", "T"), 403, "ann's MOVE of derby.json to "+dst); !strings.Contains(r.body, "node documents") {
+		if r := g.expect(g.doAs(ann, "MOVE", "/cat/Season/derby.json", "", "Destination", dst, "Overwrite", "T"), 403, "ann's MOVE of derby.json to "+dst); !strings.Contains(r.body, "nothing was written") {
 			t.Fatalf("MOVE to %s: 403 %q", dst, r.body)
 		}
 	}

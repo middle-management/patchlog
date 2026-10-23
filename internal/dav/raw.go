@@ -190,7 +190,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 	var rev string
 	exact := true
 	err := st.retrying(ctx, func() (bool, error) {
-		h, err := st.tk.c.Head(ctx, ns, name)
+		h, err := st.saveHead(ctx, ns, name, o)
 		if err != nil {
 			return false, err
 		}

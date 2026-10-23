@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,9 +19,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/catalog"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/dav"
+	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // preV056 is a transport that answers GET /ns/{ns}/principal as a core
@@ -409,5 +415,319 @@ func TestPlainTreeServiceRefusalV073(t *testing.T) {
 	r := g.expect(g.doAs(limited, "PROPFIND", "/cat/", "", "Depth", "1"), 403, "a limited grant through a tree service without §B.11")
 	if !strings.Contains(r.body, "node documents") || !strings.Contains(r.body, "§B.11") {
 		t.Fatalf("403 %q", r.body)
+	}
+}
+
+// derivedWorld is a file tree with tree-derived access (§B.11): catalog
+// cat, served by a catalog service, whose key catalog-01 is listed in cat
+// and in its content namespace matches as §B.11.3 lists it; users hold
+// identity grants from idp for cat only, with no verbs of their own
+// (§B.11.6), and get their rights from the catalog's grants (§H.2
+// "Access"). root has no $access, so it is hidden from them (§B.11.5);
+// Season 2026 gives match-desk desk (move, place) and li reader:
+//
+//	root
+//	└── season "Season 2026"  $access: group:match-desk desk, user:li reader
+//	    ├── matches.derby "derby.json"
+//	    └── sub "Sub"
+type derivedWorld struct {
+	ctx    context.Context
+	s      *clienttest.Server
+	ops    *client.Client // catalog-admins, straight to the core
+	idp    clienttest.Key
+	catURL string
+	svc    *catalog.Service
+	g      *env
+}
+
+func newDerivedWorld(t *testing.T) *derivedWorld {
+	t.Helper()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
+	opsKey, idp, catKey := clienttest.NewKey("ops"), clienttest.NewKey("idp"), clienttest.NewKey("catalog-01")
+	var catKeyRules, catNSRules []any
+	must(0, json.Unmarshal([]byte(`[
+        { "if":   [{ "op": "test", "path": "/action", "schema": { "enum": ["create", "restore"] } }],
+          "then": [{ "op": "test", "path": "/doc/$access", "exists": false }] },
+        { "if":   [{ "not": { "op": "test", "path": "/action", "schema": { "enum": ["create", "restore"] } } }],
+          "then": [{ "not": { "op": "writes", "overlaps": "/$access" } }] } ]`), &catKeyRules))
+	must(0, json.Unmarshal([]byte(`[
+    { "if":   [{ "any": [
+                { "all": [{ "op": "test", "path": "/action", "schema": { "enum": ["create", "restore"] } },
+                          { "op": "test", "path": "/doc/$access", "exists": true }] },
+                { "all": [{ "not": { "op": "test", "path": "/action", "schema": { "enum": ["create", "restore"] } } },
+                          { "op": "writes", "overlaps": "/$access" }] } ] }],
+      "then": [{ "op": "test", "path": "/principal/groups", "schema": { "contains": { "const": "catalog-admins" } } }] } ]`), &catNSRules))
+	catEntry := catKey.Entry("read", "create", "append", "delete", "restore")
+	catEntry["maxTtl"], catEntry["requireAt"] = "PT15M", true
+	catEntry["groups"] = map[string]any{"deny": []any{"catalog-admins", "ops"}}
+	catEntry["rules"] = catKeyRules
+	contentEntry := catKey.Entry("read", "create", "append", "restore")
+	contentEntry["maxTtl"], contentEntry["readScope"], contentEntry["requireAt"] = "PT15M", "resource", "cat"
+	contentEntry["groups"] = map[string]any{"deny": []any{"ops"}}
+	contentEntry["roles"] = map[string]any{"allow": []any{"desk", "reader"}}
+	catDoc := map[string]any{"read": "grant", "keys": []any{opsKey.Entry("*"), idp.Entry(), catEntry}, "maxLag": "PT60S",
+		"catalog": map[string]any{"trust": []any{"matches"}, "mode": "tree", "files": map[string]any{"ns": "matches", "root": "root"}},
+		"roles":   map[string]any{"desk": map[string]any{"move": true, "place": true}, "reader": map[string]any{}},
+		"rules":   catNSRules}
+	matchesDoc := map[string]any{"read": "grant", "keys": []any{opsKey.Entry("*"), idp.Entry(), contentEntry},
+		"roles": map[string]any{"desk": map[string]any{"can": []any{"read", "create", "append", "restore"}}, "reader": map[string]any{"can": []any{"read"}}},
+		// A document marked bad is refused (§6.4.2), so a create fails
+		// after its placement.
+		"rules":    []any{map[string]any{"op": "test", "path": "/doc/bad", "exists": false}},
+		"catalogs": map[string]any{"cat": map[string]any{"place": []any{"group:match-desk"}}}}
+	for ns, doc := range map[string]map[string]any{"cat": catDoc, "matches": matchesDoc} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	both := []string{"cat", "matches"}
+	ops := s.Client(t, client.WithBearer(opsKey.Grant(t, s.Now(), "user:ops", both, []string{"read", "create", "append", "delete", "restore"},
+		map[string]any{"groups": []any{"catalog-admins"}})))
+	for _, d := range []struct {
+		ns, name string
+		doc      map[string]any
+	}{
+		{"matches", "derby", map[string]any{"title": "Derby", "score": "0-0"}},
+		{"cat", "root", map[string]any{"title": "Root", "parents": []any{}}},
+		{"cat", "season", map[string]any{"title": "Season 2026", "parents": parents("cat", "root"),
+			"$access": map[string]any{"group:match-desk": []any{"desk"}, "user:li": []any{"reader"}}}},
+		{"cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")}},
+		{"cat", "sub", map[string]any{"title": "Sub", "parents": parents("cat", "season")}},
+	} {
+		must(ops.CreateDoc(ctx, d.ns, d.name, d.doc))
+	}
+	svcClient := s.Client(t, client.WithBearer(opsKey.Grant(t, s.Now(), "svc:catalog", both, []string{"read"},
+		map[string]any{"exp": s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))
+	svc := must(catalog.Open(ctx, catalog.Options{
+		Tree: tree.Options{Client: svcClient, Catalog: "cat", DB: filepath.Join(t.TempDir(), "catalog.db"), MinWait: 2 * time.Second,
+			RepurgeInterval: -1, CheckerTTL: time.Millisecond, Logf: t.Logf,
+			FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)}},
+		Key: catKey.Priv, Kid: "catalog-01"}))
+	hs := httptest.NewServer(svc.Handler())
+	rctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { svc.Run(rctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done; hs.Close(); svc.Close() })
+	w := &derivedWorld{ctx: ctx, s: s, ops: ops, idp: idp, catURL: hs.URL, svc: svc}
+	w.caughtUp(t)
+	opt := dav.Options{Client: s.Client(t), Catalogs: []string{"cat"}, Gateway: true, TreeService: hs.URL, Logf: t.Logf}
+	w.g = &env{t: t, ctx: ctx, s: s, c: ops, dav: newTestServer(t, must(dav.New(opt)))}
+	return w
+}
+
+// caughtUp waits until the catalog service reached the core's heads.
+func (w *derivedWorld) caughtUp(t *testing.T) {
+	t.Helper()
+	for _, ns := range []string{"cat", "matches"} {
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			h, err := w.ops.NSHead(w.ctx, ns)
+			if err == nil && w.svc.Tree().Checkpoint(ns) == h.ID {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the catalog service didn't catch up with %s", ns)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
+// user is an identity grant of sub for cat with groups, no verbs.
+func (w *derivedWorld) user(t *testing.T, sub string, groups ...string) string {
+	return w.idp.Grant(t, w.s.Now(), sub, []string{"cat"}, []string{}, map[string]any{"groups": toAnyT(groups)})
+}
+
+func toAnyT(ss []string) []any {
+	out := make([]any, len(ss))
+	for i, s := range ss {
+		out[i] = s
+	}
+	return out
+}
+
+// titled is the live node of cat titled title, and its document.
+func (w *derivedWorld) titled(t *testing.T, title string) (string, map[string]any) {
+	t.Helper()
+	for _, it := range must(w.ops.Heads(w.ctx, "cat", must(w.ops.NSHead(w.ctx, "cat")).ID)) {
+		if it.Kind != "head" {
+			continue
+		}
+		h, doc := w.g.load("cat", it.Resource)
+		if m, _ := doc.(map[string]any); h.State == client.Live && m["title"] == title {
+			return it.Resource, m
+		}
+	}
+	return "", nil
+}
+
+// GW-31 (§H.2 "Access", §H.4 "New files", §H.5, §B.11.4): in a tree with
+// tree-derived access, a user whose own grant only proves who they are
+// lists the tree from its roots (root hidden, §B.11.5), reads and edits a
+// file under the catalog's grants for its item, makes a new file by
+// placing it first and then creating its item under the Create grant the
+// catalog resolves from the placement, renames it under a Move grant
+// whose patch set begins with the test of /parents, and, without reading
+// the node documents, deletes no folder (403); a new file whose create
+// fails has its placement deleted again.
+func TestTreeDerivedWritesV073(t *testing.T) {
+	t.Parallel()
+	w := newDerivedWorld(t)
+	g := w.g
+	bob := w.user(t, "user:bob", "match-desk")
+	sameStrings(t, "bob's top level", names(g.propfindAs(bob, "/cat/"), "/cat/"), []string{"Season 2026/"})
+	sameStrings(t, "bob's Season 2026", names(g.propfindAs(bob, "/cat/Season%202026/"), "/cat/Season 2026/"), []string{"Sub/", "derby.json"})
+	buf := g.expect(g.doAs(bob, "GET", "/cat/Season%202026/derby.json", ""), 200, "bob's GET").body
+	g.expect(g.doAs(bob, "PUT", "/cat/Season%202026/derby.json", strings.Replace(buf, `"0-0"`, `"1-0"`, 1)), 201, "bob's edit of derby.json")
+	if _, doc := g.load("matches", "derby"); doc.(map[string]any)["score"] != "1-0" {
+		t.Fatalf("derby after bob's edit: %v", doc)
+	}
+	if e := g.lastEntry("matches", "derby"); e.Grant == nil || e.Grant.Sub != "user:bob" || e.Grant.Kid != "catalog-01" {
+		t.Fatalf("bob's edit was written under %+v, not a grant the catalog issued him", e.Grant)
+	}
+
+	// A new file: its placement first, then its item.
+	g.expect(g.doAs(bob, "PUT", "/cat/Season%202026/new.json", `{"n": 1}`), 201, "bob's new file")
+	node, doc := w.titled(t, "new.json")
+	if node == "" || !strings.HasSuffix(doc["parents"].([]any)[0].(map[string]any)["href"].(string), "/season") {
+		t.Fatalf("new.json's placement %s: %v", node, doc)
+	}
+	item := strings.TrimPrefix(node, "matches.")
+	if _, idoc := g.load("matches", item); !reflect.DeepEqual(idoc, map[string]any{"n": 1.0}) {
+		t.Fatalf("new.json's item %s: %v", item, idoc)
+	}
+	pe, ie := g.lastEntry("cat", node), g.lastEntry("matches", item)
+	if pe.Created > ie.Created || ie.Grant == nil || ie.Grant.Kid != "catalog-01" || ie.Grant.Sub != "user:bob" {
+		t.Fatalf("the placement (%s, %+v) wasn't first, or the item (%s, %+v) not under the catalog's Create grant", pe.Created, pe.Grant, ie.Created, ie.Grant)
+	}
+
+	// A rename under a Move grant: its patch set begins with the test of
+	// /parents.
+	w.caughtUp(t)
+	g.expect(g.doAs(bob, "MOVE", "/cat/Season%202026/new.json", "", "Destination", "/cat/Season%202026/renamed.json"), 201, "bob's rename")
+	if _, doc := g.load("cat", node); doc.(map[string]any)["title"] != "renamed.json" {
+		t.Fatalf("the placement after the rename: %v", doc)
+	}
+	ps, _ := g.lastEntry("cat", node).Patches.([]any)
+	if first, _ := ps[0].(map[string]any); len(ps) < 2 || first["op"] != "test" || first["path"] != "/parents" {
+		t.Fatalf("the rename's patch set %v", ps)
+	}
+
+	// A folder made under a Create a folder grant; the file moved into
+	// it under a Move grant; deleted, its placement goes under an Unplace
+	// grant, and its item stays, which the catalog's key never deletes
+	// (§B.11.3, §H.5).
+	g.expect(g.doAs(bob, "MKCOL", "/cat/Season%202026/New", ""), 201, "bob's new folder")
+	folder, fdoc := w.titled(t, "New")
+	if folder == "" || !strings.HasSuffix(fdoc["parents"].([]any)[0].(map[string]any)["href"].(string), "/season") {
+		t.Fatalf("New's node %s: %v", folder, fdoc)
+	}
+	w.caughtUp(t)
+	g.expect(g.doAs(bob, "MOVE", "/cat/Season%202026/renamed.json", "", "Destination", "/cat/Season%202026/New/renamed.json"), 201, "bob's move into New")
+	if _, doc := g.load("cat", node); !strings.HasSuffix(doc.(map[string]any)["parents"].([]any)[0].(map[string]any)["href"].(string), "/"+folder) {
+		t.Fatalf("the placement after the move: %v", doc)
+	}
+	w.caughtUp(t)
+	g.expect(g.doAs(bob, "DELETE", "/cat/Season%202026/New/renamed.json", ""), 204, "bob's DELETE of renamed.json")
+	g.expectTombstoned("cat", node, "renamed.json's placement")
+	if h, _ := g.load("matches", item); h.State != client.Live {
+		t.Fatalf("the item of renamed.json is %v", h.State)
+	}
+
+	// No folder deleted without the node documents; no new file at the
+	// top level, which is root's (hidden).
+	if r := g.expect(g.doAs(bob, "DELETE", "/cat/Season%202026/Sub", ""), 403, "bob's DELETE of a folder"); !strings.Contains(r.body, "node documents") {
+		t.Fatalf("403 %q", r.body)
+	}
+	g.expect(g.doAs(bob, "PUT", "/cat/top.json", `{"n": 1}`), 404, "bob's new file at the top level")
+
+	// A create refused after the placement: the placement goes again.
+	w.caughtUp(t)
+	r := g.expect(g.doAs(bob, "PUT", "/cat/Season%202026/bad.json", `{"bad": true}`), 422, "bob's new file the content namespace refuses")
+	if !strings.Contains(r.body, "deleted again") {
+		t.Fatalf("422 %q", r.body)
+	}
+	if node, _ := w.titled(t, "bad.json"); node != "" {
+		t.Fatalf("bad.json's placement %s is live", node)
+	}
+}
+
+// GW-28 with tree-derived access (§H.7 "Users"): a user's own entries in
+// a content namespace include those under the catalog's key there for
+// the user's sub (§B.11.4), written by another program of the user's
+// with a grant the catalog issued it.
+func TestTreeDerivedOwnEntriesV073(t *testing.T) {
+	t.Parallel()
+	w := newDerivedWorld(t)
+	g := w.g
+	bob := w.user(t, "user:bob", "match-desk")
+	buf := g.expect(g.doAs(bob, "GET", "/cat/Season%202026/derby.json", ""), 200, "bob's GET").body
+	// bob's script asks the catalog for a grant of its own, and edits the
+	// score straight at the core.
+	body := strings.NewReader(`{"item": "/r/matches/derby", "want": ["read", "append"]}`)
+	req := must(http.NewRequest("POST", w.catURL+"/grants", body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+bob)
+	res := must(testHTTP.Do(req))
+	var a struct{ Grant string }
+	must(0, json.NewDecoder(res.Body).Decode(&a))
+	res.Body.Close()
+	script := w.s.Client(t, client.WithBearer(a.Grant))
+	h, _ := g.load("matches", "derby")
+	must(script.Append(w.ctx, "matches", "derby", h.ID, []any{replace("/score", "2-0")}))
+	g.expect(g.doAs(bob, "PUT", "/cat/Season%202026/derby.json", strings.Replace(buf, `"0-0"`, `"3-0"`, 1)), 201, "bob's save from before his script's edit")
+	if _, doc := g.load("matches", "derby"); doc.(map[string]any)["score"] != "3-0" {
+		t.Fatalf("derby: %v", doc)
+	}
+}
+
+// GW-31 (§H.5, §B.11.4): a Move grant's patch set begins with the test
+// of /parents the catalog decided; where that is stale (the node moved
+// since the decision), the core refuses the test (422), and the gateway
+// answers 409, asking for a reload; nothing is written.
+func TestTreeDerivedStaleMoveV073(t *testing.T) {
+	t.Parallel()
+	w := newDerivedWorld(t)
+	// The catalog's answers pass through a proxy that makes the parents
+	// of a Move decision stale: another order than the node's.
+	rp := httputil.NewSingleHostReverseProxy(must(url.Parse(w.catURL)))
+	rp.ModifyResponse = func(r *http.Response) error {
+		if r.Request.URL.Path != "/grants" || r.StatusCode != http.StatusOK || r.Request.Header.Get("X-Want") != "move" {
+			return nil
+		}
+		var a map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&a); err != nil {
+			return err
+		}
+		r.Body.Close()
+		if ps, _ := a["parents"].([]any); len(ps) > 0 {
+			ps[0].(map[string]any)["order"] = "zz"
+		}
+		b, _ := json.Marshal(a)
+		r.Body = io.NopCloser(bytes.NewReader(b))
+		r.ContentLength = int64(len(b))
+		r.Header.Set("Content-Length", strconv.Itoa(len(b)))
+		return nil
+	}
+	front := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/grants" {
+			b, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(b), `"move"`) {
+				r.Header.Set("X-Want", "move")
+			}
+			r.Body = io.NopCloser(bytes.NewReader(b))
+			r.ContentLength = int64(len(b))
+		}
+		rp.ServeHTTP(w, r)
+	}))
+	opt := dav.Options{Client: w.s.Client(t), Catalogs: []string{"cat"}, Gateway: true, TreeService: front.URL, Logf: t.Logf}
+	g := &env{t: t, ctx: w.ctx, s: w.s, c: w.ops, dav: newTestServer(t, must(dav.New(opt)))}
+	bob := w.user(t, "user:bob", "match-desk")
+	before, _ := g.load("cat", "matches.derby")
+	r := g.expect(g.doAs(bob, "MOVE", "/cat/Season%202026/derby.json", "", "Destination", "/cat/Season%202026/d2.json"), 409, "bob's rename, the catalog's decision stale")
+	if !strings.Contains(r.body, "test of its parents failed") || !strings.Contains(r.body, "reload") {
+		t.Fatalf("409 %q", r.body)
+	}
+	if after, doc := g.load("cat", "matches.derby"); after.ID != before.ID {
+		t.Fatalf("the placement changed: %v", doc)
 	}
 }
