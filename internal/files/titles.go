@@ -11,8 +11,7 @@ import (
 // title, compared with its siblings' after NFC and, unless a tool is set
 // to be case-sensitive, after Unicode simple case folding, as NTFS
 // compares names (not full folding). The tree service's lookup (§B.5)
-// and gateways compare titles alike. (Copied from internal/dav's
-// nameKey, which is to use it.)
+// and gateways (internal/dav's nameKey) compare titles alike.
 
 // TitleKey is what titles are compared by (§H.2 "Siblings"): NFC, then,
 // unless caseSensitive, Unicode simple case folding, a character for a
