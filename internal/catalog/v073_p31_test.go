@@ -54,9 +54,9 @@ func adminDryRun(r resp, checkedAs string) bool {
 // merge is checked as the approver's own organising requests would be,
 // with no widening whoever approved. A move that widens needs
 // catalog-admins: approved by an admin, it gets no merge-key grant but an
-// admin dry run (admin: true, no grant), to go under the admin's grant;
-// approved by anyone else, it is refused (403), with "admin": true so the
-// merge service may ask again with an admin's grant (§F.8, §B.11.4).
+// admin dry run (admin: true, no grant), to go under an admin's grant;
+// approved by anyone else, it is refused (403), even with an admin's
+// grant to go under (§F.8, §B.11.4).
 func TestMergeNoWideningWhoeverApprovedV073(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -72,7 +72,7 @@ func TestMergeNoWideningWhoeverApprovedV073(t *testing.T) {
 		t.Fatalf("a widening move approved by an admin: %d %v", r.status, r.body)
 	}
 	r = w.mergeAsk(desk, "", widen)
-	if r.status != 403 || r.body["admin"] != true || !strings.Contains(mergeMsg(r), "would give group:fan-club the role desk") {
+	if r.status != 403 || !strings.Contains(mergeMsg(r), "would give group:fan-club the role desk") {
 		t.Fatalf("a widening move approved by desk: %d %v", r.status, r.body)
 	}
 	// A decision at the checkpoint: the catalog, and matches, whose
@@ -80,9 +80,7 @@ func TestMergeNoWideningWhoeverApprovedV073(t *testing.T) {
 	if cp := w.checkpointOf("matches"); !reflect.DeepEqual(r.body["checkpoint"], cp) {
 		t.Errorf("refusal checkpoint %v, now %v", r.body["checkpoint"], cp)
 	}
-	// With an admin's grant, the dry run is the admin's (F-T4).
-	r = w.mergeAsk(desk, chief, widen)
-	if !adminDryRun(r, "user:chief") || r.body["approvedBy"] != "user:anna" {
+	if r = w.mergeAsk(desk, chief, widen); r.status != 403 {
 		t.Fatalf("a widening move approved by desk, with an admin's grant: %d %v", r.status, r.body)
 	}
 	// A narrowing move needs no admin: a merge-key grant, for an admin
@@ -117,7 +115,7 @@ func TestMergeReplacingAgainstDeletedRowsV073(t *testing.T) {
 	// Under derbies fan-club would have desk; its rows (under season) had
 	// reader.
 	r := w.mergeAsk(desk, "", replace("derbies"))
-	if r.status != 403 || r.body["admin"] != true || !strings.Contains(mergeMsg(r), "re-placing matches.derby would give group:fan-club the role desk") {
+	if r.status != 403 || !strings.Contains(mergeMsg(r), "re-placing matches.derby would give group:fan-club the role desk") {
 		t.Fatalf("a widening re-place approved by desk: %d %v", r.status, r.body)
 	}
 	if r = w.mergeAsk(chief, "", replace("derbies")); !adminDryRun(r, "user:chief") {
@@ -154,7 +152,7 @@ func TestMergeWideningElsewhereV073(t *testing.T) {
 	ghost := map[string]any{"resource": "ghost", "ifNoneMatch": "*",
 		"steps": []any{client.GenesisPatches(map[string]any{"title": "Ghost", "parents": parents("derbies")})}}
 	r := w.mergeAsk(w.caller("user:anna", "match-desk"), "", ghost)
-	if r.status != 403 || r.body["admin"] != true || !strings.Contains(mergeMsg(r), "ghost") || strings.Contains(mergeMsg(r), "matches.h") {
+	if r.status != 403 || !strings.Contains(mergeMsg(r), "ghost") || strings.Contains(mergeMsg(r), "matches.h") {
 		t.Fatalf("a folder that widens a hidden node, approved by desk: %d %v", r.status, r.body)
 	}
 	if r = w.mergeAsk(w.caller("user:chief", "catalog-admins"), "", ghost); !adminDryRun(r, "user:chief") {
@@ -168,10 +166,11 @@ func TestMergeWideningElsewhereV073(t *testing.T) {
 }
 
 // TestMergeAdminDryRunAsAdminV073 (TC-47, F-T4): a batch that needs
-// catalog-admins is checked with the admin whose grant it goes under as
-// the caller, sent in Admin-Authorization, whoever approved: the place
-// list applies to that admin. Admin-Authorization must hold an admin's
-// grant, and a batch that needs none is still the approver's.
+// catalog-admins is checked as the approver's, who must be one, and as a
+// dry run with the admin whose grant it goes under as the caller, sent in
+// Admin-Authorization: the place list applies to both. Admin-
+// Authorization must hold an admin's grant, and a batch that needs none
+// is the approver's alone.
 func TestMergeAdminDryRunAsAdminV073(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -181,20 +180,31 @@ func TestMergeAdminDryRunAsAdminV073(t *testing.T) {
 	w.caughtUp()
 	desk := w.caller("user:anna", "match-desk")
 	chief := w.caller("user:chief", "catalog-admins", "match-desk")
+	dora := w.caller("user:dora", "catalog-admins", "match-desk")
 	ada := w.caller("user:ada", "catalog-admins") // not in matches' place list
 	place := map[string]any{"resource": "matches.newone", "ifNoneMatch": "*",
 		"steps": []any{client.GenesisPatches(map[string]any{"parents": parents("season"), "$access": acc("user:guest", "reader")})}}
 
-	if r := w.mergeAsk(desk, "", place); r.status != 403 || r.body["admin"] != true {
-		t.Fatalf("$access approved by desk alone: %d %v", r.status, r.body)
+	if r := w.mergeAsk(chief, "", place); !adminDryRun(r, "user:chief") {
+		t.Fatalf("$access approved by an admin: %d %v", r.status, r.body)
 	}
-	if r := w.mergeAsk(desk, ada, place); r.status != 403 || r.body["admin"] != nil || !strings.Contains(mergeMsg(r), "place") {
+	if r := w.mergeAsk(chief, dora, place); !adminDryRun(r, "user:dora") || r.body["approvedBy"] != "user:chief" {
+		t.Fatalf("$access approved by an admin, under another's grant: %d %v", r.status, r.body)
+	}
+	// The dry run is the admin's: outside the place list, refused.
+	if r := w.mergeAsk(chief, ada, place); r.status != 403 || !strings.Contains(mergeMsg(r), "place") {
 		t.Fatalf("$access under an admin outside the place list: %d %v", r.status, r.body)
 	}
-	if r := w.mergeAsk(desk, chief, place); !adminDryRun(r, "user:chief") || r.body["approvedBy"] != "user:anna" {
-		t.Fatalf("$access under an admin in the place list: %d %v", r.status, r.body)
+	// And the approver's checks still apply.
+	if r := w.mergeAsk(ada, chief, place); r.status != 403 || !strings.Contains(mergeMsg(r), "place") {
+		t.Fatalf("$access approved by an admin outside the place list: %d %v", r.status, r.body)
 	}
-	if r := w.mergeAsk(desk, w.caller("user:bob", "match-desk"), place); r.status != 403 || !strings.Contains(mergeMsg(r), "Admin-Authorization") {
+	for _, admin := range []string{"", chief} {
+		if r := w.mergeAsk(desk, admin, place); r.status != 403 || r.body["checkpoint"] == nil {
+			t.Fatalf("$access approved by desk (admin's grant %v): %d %v", admin != "", r.status, r.body)
+		}
+	}
+	if r := w.mergeAsk(chief, w.caller("user:bob", "match-desk"), place); r.status != 403 || !strings.Contains(mergeMsg(r), "Admin-Authorization") {
 		t.Fatalf("Admin-Authorization from a non-admin: %d %v", r.status, r.body)
 	}
 	// A batch that needs no admin is the approver's, with or without an
@@ -203,7 +213,7 @@ func TestMergeAdminDryRunAsAdminV073(t *testing.T) {
 	if r := w.mergeAsk(desk, chief, unplace); r.status != 200 || r.body["grant"] == nil || r.body["checkedAs"] != "user:anna" {
 		t.Fatalf("an unplace approved by desk, with an admin's grant: %d %v", r.status, r.body)
 	}
-	if r := w.mergeAsk(w.caller("user:li"), chief, unplace); r.status != 403 || r.body["admin"] != nil {
+	if r := w.mergeAsk(w.caller("user:li"), chief, unplace); r.status != 403 {
 		t.Fatalf("an unplace approved by a reader, with an admin's grant: %d %v", r.status, r.body)
 	}
 }

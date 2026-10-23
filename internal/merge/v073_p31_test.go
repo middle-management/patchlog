@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,25 +30,49 @@ func (w *relWorld) catalogKeyInMatches() {
 	must(w.ops.PatchConfig(ctx, "matches", must(w.ops.NSHead(ctx, "matches")).Config, ops(op("add", "/keys/-", e))))
 }
 
-// TestV073ReleaseAdminDryRunAsAdmin (TC-47, F-T4): a catalog batch that
-// needs catalog-admins (step 2 creates locked with its $access) is refused
-// to an approver who isn't one, with "admin": true, and the merge service
-// asks again with its AdminGrant in Admin-Authorization, so the dry run
-// is judged as the admin the batch then goes under (§F.8). The rest of the
-// release goes under the merge key, from the approver's checks.
+// adminHeaders records the Admin-Authorization headers a client sends.
+type adminHeaders struct {
+	mu  sync.Mutex
+	got []string
+}
+
+func (a *adminHeaders) RoundTrip(req *http.Request) (*http.Response, error) {
+	if h := req.Header.Get("Admin-Authorization"); h != "" {
+		a.mu.Lock()
+		a.got = append(a.got, h)
+		a.mu.Unlock()
+	}
+	return httpClient.Transport.RoundTrip(req)
+}
+
+// TestV073ReleaseAdminDryRunAsAdmin (TC-47, F-T4, scenario 44): a catalog
+// batch that needs catalog-admins (step 2 creates locked with its $access)
+// is answered as an admin dry run to an approver in catalog-admins, and
+// the merge service asks again with its AdminGrant in Admin-Authorization,
+// so the dry run is judged as the admin the batch then goes under (§F.8).
+// The rest of the release goes under the merge key. An approver who isn't
+// in catalog-admins stops the merge, whatever AdminGrant says, and so does
+// a missing AdminGrant.
 func TestV073ReleaseAdminDryRunAsAdmin(t *testing.T) {
 	t.Parallel()
 	w := newRelWorld(t)
-	w.catalogKeyInMatches()
 	w.startCatalog()
 	w.release7()
 	o := w.opts("release-7")
-	o.Granter = &merge.HTTPGranter{URLs: map[string]string{"cat-season": w.svcURL}, Bearer: w.mergeBearer(), Approver: w.bobBearer(), HTTP: httpClient}
+	rec := &adminHeaders{}
+	o.Granter = &merge.HTTPGranter{URLs: map[string]string{"cat-season": w.svcURL}, Bearer: w.mergeBearer(), Approver: w.annaBearer(),
+		HTTP: &http.Client{Transport: rec}}
+	dora := w.idp.Grant(t, w.s.Now(), "user:dora", relNS, []string{"read", "create", "append", "delete", "restore"},
+		map[string]any{"groups": sAny("match-desk", "catalog-admins"), "exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})
+	o.AdminGrant = dora
 	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, must(merge.PlanRelease(ctx, w.anna, o))))
 	must(merge.ApproveRelease(ctx, w.anna, o))
 	rp, err := merge.ApplyRelease(ctx, w.anna, o)
 	if err != nil {
-		t.Fatalf("apply with a non-admin approver and an admin's grant: %v", err)
+		t.Fatalf("apply with another admin's grant: %v", err)
+	}
+	if len(rec.got) == 0 || rec.got[0] != "Bearer "+dora {
+		t.Fatalf("Admin-Authorization sent: %q", rec.got)
 	}
 	for _, st := range rp.Steps {
 		if st.Key != "cat-season" {
@@ -55,8 +81,8 @@ func TestV073ReleaseAdminDryRunAsAdmin(t *testing.T) {
 		e := entryOf(t, w.anna, "cat-season", st.Done)
 		switch st.Step {
 		case 2:
-			if e.Grant == nil || e.Grant.Sub != "user:anna" || e.Grant.Kid != "idp" {
-				t.Errorf("the $access batch went under %+v, want the admin's", e.Grant)
+			if e.Grant == nil || e.Grant.Sub != "user:dora" || e.Grant.Kid != "idp" {
+				t.Errorf("the $access batch went under %+v, want dora's", e.Grant)
 			}
 		case 4:
 			if e.Grant == nil || e.Grant.Sub != "svc:merge" || e.Grant.Kid != "catalog-merge" {
@@ -65,25 +91,38 @@ func TestV073ReleaseAdminDryRunAsAdmin(t *testing.T) {
 		}
 	}
 
-	// Without an admin's grant, the batch that needs one stops the merge.
-	w2 := newRelWorld(t)
-	w2.catalogKeyInMatches()
-	w2.startCatalog()
-	w2.release7()
-	o2 := w2.opts("release-7")
-	o2.Granter = &merge.HTTPGranter{URLs: map[string]string{"cat-season": w2.svcURL}, Bearer: w2.mergeBearer(), Approver: w2.bobBearer(), HTTP: httpClient}
-	o2.AdminGrant = ""
-	noErr(t, merge.SaveReleasePlan(ctx, w2.anna, o2, must(merge.PlanRelease(ctx, w2.anna, o2))))
-	must(merge.ApproveRelease(ctx, w2.anna, o2))
-	if _, err := merge.ApplyRelease(ctx, w2.anna, o2); !errors.Is(err, merge.ErrAdminNeeded) {
-		t.Fatalf("apply without an admin's grant: %v", err)
+	// An approver who isn't in catalog-admins, whatever AdminGrant says,
+	// and an admin approver without an AdminGrant, stop the merge.
+	for _, c := range []struct {
+		name            string
+		bob, adminGrant bool
+	}{{"approved by bob", true, true}, {"without an admin's grant", false, false}} {
+		w2 := newRelWorld(t)
+		w2.catalogKeyInMatches()
+		w2.startCatalog()
+		w2.release7()
+		o2 := w2.opts("release-7")
+		if c.bob {
+			o2.Granter = &merge.HTTPGranter{URLs: map[string]string{"cat-season": w2.svcURL}, Bearer: w2.mergeBearer(), Approver: w2.bobBearer(), HTTP: httpClient}
+		}
+		if !c.adminGrant {
+			o2.AdminGrant = ""
+		}
+		noErr(t, merge.SaveReleasePlan(ctx, w2.anna, o2, must(merge.PlanRelease(ctx, w2.anna, o2))))
+		must(merge.ApproveRelease(ctx, w2.anna, o2))
+		_, err := merge.ApplyRelease(ctx, w2.anna, o2)
+		switch {
+		case c.bob && (err == nil || !strings.Contains(err.Error(), "403 forbidden locked: changing $access needs catalog-admins")):
+			t.Errorf("%s: %v", c.name, err)
+		case !c.bob && !errors.Is(err, merge.ErrAdminNeeded):
+			t.Errorf("%s: %v", c.name, err)
+		}
 	}
 }
 
 // TestV073HTTPGranterAdmin (TC-47, TC-45): the granter sends the admin's
 // grant in Admin-Authorization when asked to, reads the dry run's
-// checkedAs, and tells a batch that needs catalog-admins (a 403 with
-// "admin": true) and a catalog without merge grants (404 not_offered)
+// checkedAs, and tells a catalog without merge grants (404 not_offered)
 // apart from other refusals.
 func TestV073HTTPGranterAdmin(t *testing.T) {
 	t.Parallel()
@@ -109,11 +148,8 @@ func TestV073HTTPGranterAdmin(t *testing.T) {
 	if _, err := ask(answer(200, map[string]any{"grant": "g"}), ""); err != nil || gotAdmin != "" {
 		t.Fatalf("a merge grant: %v (Admin-Authorization %q)", err, gotAdmin)
 	}
-	if _, err := ask(answer(403, map[string]any{"code": "forbidden", "message": "needs catalog-admins", "admin": true}), ""); !errors.Is(err, merge.ErrAdminNeeded) {
-		t.Fatalf("a 403 marked admin: %v", err)
-	}
-	if _, err := ask(answer(403, map[string]any{"code": "forbidden", "message": "no power"}), ""); err == nil || errors.Is(err, merge.ErrAdminNeeded) {
-		t.Fatalf("a plain 403: %v", err)
+	if _, err := ask(answer(403, map[string]any{"code": "forbidden", "message": "no power"}), ""); err == nil || errors.Is(err, merge.ErrNotOffered) {
+		t.Fatalf("a 403: %v", err)
 	}
 	if _, err := ask(answer(404, map[string]any{"code": "not_offered", "message": "e2e"}), ""); !errors.Is(err, merge.ErrNotOffered) {
 		t.Fatalf("not_offered: %v", err)

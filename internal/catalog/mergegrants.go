@@ -2,7 +2,6 @@ package catalog
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"sort"
@@ -26,7 +25,7 @@ import (
 //	POST /merge-grants
 //	Authorization: Bearer <the merge service's grant for the catalog>
 //	Approver-Authorization: Bearer <the approving person's grant for the catalog>
-//	Admin-Authorization: Bearer <a catalog admin's grant, for a batch that needs one>
+//	Admin-Authorization: Bearer <the grant of the catalog admin a batch that needs one goes under>
 //	{ "batch": { "items": [ … ], "source": { "ns": "cat-season-r7", "at": "1n…" } } }
 //
 // batch is the body the merge service will POST to /ns/{catalog}/batch.
@@ -61,19 +60,20 @@ import (
 // admins), or widens (§B.11.4 No widening: some subject's roles at a node
 // that exists or existed, after the batch, aren't a subset of those
 // before; for a placement the batch places again, against its deleted
-// placement's rows, §B.11.7). It is checked as a dry run, with the admin
-// whose grant it goes under as the caller: the holder of the grant in
-// Admin-Authorization, or, without one, the approver (F-T4). It is
-// answered with "admin": true and no grant, and the merge service submits
-// it under that admin's grant, narrowed with its own via (§C.1, §F.8); the
-// catalog base lists each such admin in merge.authors. To an approver not
-// in the admin group, without Admin-Authorization, it is a 403 whose body
-// says "admin": true, so the merge service asks again with the grant of
-// the admin it would submit the batch under.
+// placement's rows, §B.11.7). Its approver must be in the admin group (a
+// 403 otherwise, as that person's own organising request would be:
+// CONFORMANCE scenario 44), and it is checked as a dry run, with the
+// admin whose grant it goes under as the caller too: the holder of the
+// grant in Admin-Authorization, or, without one, the approver (F-T4). It is
+// answered with "admin": true and no grant; the merge service asks again
+// with the admin's grant in Admin-Authorization, then submits the batch
+// under that grant, narrowed with its own via (§C.1, §F.8), and the
+// catalog base lists each such admin in merge.authors.
 //
-// The checks, per item, for the caller's subjects, as organising requests
-// answer them (§B.11.4): 404 first, then 403 (the 409s for stale
-// preconditions, and the 410 for a purged placement, are the core's):
+// The checks, per item, for the approver's subjects and, for an admin dry
+// run, the admin's, as organising requests answer them (§B.11.4): 404
+// first, then 403 (the 409s for stale preconditions, and the 410 for a
+// purged placement, are the core's):
 //
 //   - to a caller not in the admin group, an item naming a node hidden
 //     from it (§B.11.5) is 404, as a missing one; so is, to any caller, a
@@ -118,8 +118,9 @@ type MergeGrant struct {
 	Admin bool `json:"admin,omitempty"`
 	// ApprovedBy is the approver.
 	ApprovedBy string `json:"approvedBy"`
-	// CheckedAs is the caller the checks were judged for: the approver,
-	// or for an Admin batch the admin whose grant it goes under (F-T4).
+	// CheckedAs is the caller the checks were last judged for: the
+	// approver, or for an Admin batch the admin whose grant it goes under
+	// (F-T4).
 	CheckedAs string `json:"checkedAs"`
 	// Checks reports, per resource, what was checked.
 	Checks []MergeCheck `json:"checks"`
@@ -145,14 +146,6 @@ const ApproverHeader = "Approver-Authorization"
 // AdminHeader carries the grant of the catalog admin a batch that needs
 // one goes under, whose dry run it is (§F.8, F-T4).
 const AdminHeader = "Admin-Authorization"
-
-// adminNeeded is the 403 for a batch that needs the admin group, refused
-// to an approver who isn't in it and sent without Admin-Authorization:
-// its body says "admin": true (serveMergeGrants).
-type adminNeeded struct{ err *Error }
-
-func (e *adminNeeded) Error() string { return e.err.Error() }
-func (e *adminNeeded) Unwrap() error { return e.err }
 
 func (s *Service) serveMergeGrants(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
@@ -192,19 +185,11 @@ func (s *Service) serveMergeGrants(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := s.IssueMerge(r.Context(), v, av, adm, batch)
-	var an *adminNeeded
-	switch {
-	case errors.As(err, &an):
-		out := map[string]any{"code": an.err.Code, "message": an.err.Msg, "admin": true}
-		if an.err.Checkpoint != nil {
-			out["checkpoint"] = an.err.Checkpoint
-		}
-		tree.WriteJSON(w, an.err.Status, out)
-	case err != nil:
+	if err != nil {
 		writeErr(w, err)
-	default:
-		tree.WriteJSON(w, http.StatusOK, res)
+		return
 	}
+	tree.WriteJSON(w, http.StatusOK, res)
 }
 
 // verifyHeader verifies the bearer grant in an Authorization-style header
@@ -276,7 +261,7 @@ type widened struct {
 
 // IssueMerge checks a catalog merge batch, for the merge service v, the
 // approver av and, for a batch that needs the admin group, the admin adm
-// whose grant it goes under (nil: the approver), and signs one grant
+// whose grant it goes under too (nil: the approver), and signs one grant
 // covering it with the merge key, or for a batch that needs the admin
 // group answers Admin (§F.8). The checks are taken at one checkpoint, with
 // place lists and includes as of it, which the answer carries as
@@ -478,19 +463,20 @@ func (s *Service) IssueMerge(ctx context.Context, v, av, adm *grant.Verified, ba
 		// read is the namespaces whose state the decision read beyond the
 		// catalog and the items' (§B.11.4 checkpoint): the includes of
 		// placements compared for no widening, and, for a caller not in
-		// the admin group, the roles that decide visibility (o.read).
+		// the admin group, the roles that decide visibility (organising).
 		read := map[string]bool{}
-		var o *organising
+		var orgs []*organising
 		defer func() {
 			ns := append([]string(nil), nss...)
+			for _, o := range orgs {
+				for x := range o.read {
+					read[x] = true
+				}
+			}
 			for x := range read {
 				ns = append(ns, x)
 			}
-			if o != nil {
-				checkpoint = o.checkpoint(cur, ns...)
-			} else {
-				checkpoint = checkpointAt(g, cur, ns...)
-			}
+			checkpoint = checkpointAt(g, cur, ns...)
 		}()
 		incs = s.includesAt(g, incs)
 
@@ -515,156 +501,37 @@ func (s *Service) IssueMerge(ctx context.Context, v, av, adm *grant.Verified, ba
 		}
 		needsAdmin = needsAdmin || why != nil
 
-		// The caller: the approver, or for a batch that needs the admin
-		// group, the admin whose grant it goes under (F-T4).
-		caller := av
+		// The callers: the approver, whose checks every batch passes and
+		// who, for a batch that needs the admin group, must be in it (no
+		// widening whoever approved); and for such a batch the admin whose
+		// grant it goes under, whose dry run it is (F-T4), if that isn't
+		// the approver.
+		callers := []*grant.Verified{av}
 		if needsAdmin && adm != nil {
-			if caller = adm; !s.isAdmin(adm) {
+			if !s.isAdmin(adm) {
 				err = forbidden("the batch needs %s (§F.8), and the grant in %s isn't one of theirs", s.opt.AdminGroup, AdminHeader)
 				return
 			}
+			callers = append(callers, adm)
 		}
-		admin := s.isAdmin(caller)
-		checkedAs = caller.Principal.ID
-		o = s.organisingAt(g, caller, admin)
-		if err = s.mergeNotFound(o, g, after, items); err != nil {
-			return
-		}
-		if needsAdmin && !admin {
-			// No widening whoever approved (§F.8): such a batch is an
-			// admin's dry run, and this approver isn't one.
-			if why == nil {
-				why = s.wideningRefusal(o, g, wd)
+		for i, caller := range callers {
+			admin := s.isAdmin(caller)
+			o := s.organisingAt(g, caller, admin)
+			orgs = append(orgs, o)
+			if err = s.mergeNotFound(o, g, after, items); err != nil {
+				return
 			}
-			var ce *Error
-			errors.As(why, &ce)
-			err = &adminNeeded{err: ce}
-			return
-		}
-
-		// Tree powers as for organising requests (powers): admins need
-		// none; on a folder the same batch creates they are judged in the
-		// batch's result, where one without $access has, per subject, the
-		// powers held at all its parents (§B.11.2, §B.11.4 create a
-		// folder).
-		ck := s.keyAt(g, cat, catLatest)
-		pwBefore, pwAfter := powersAt(g, ck, callerOf(caller)), powersAt(after, ck, callerOf(caller))
-		power := func(folder, p string) bool {
-			if admin {
-				return true
+			if i == 0 && needsAdmin && !admin {
+				if why == nil {
+					why = s.wideningRefusal(o, g, wd)
+				}
+				err = why
+				return
 			}
-			if g.Explicit(folder) {
-				if _, changed := changes[folder]; !changed {
-					return pwBefore.has(folder, p)
-				}
-				return pwBefore.has(folder, p) || pwAfter.has(folder, p)
+			if checks, err = s.mergeChecks(o, caller, g, after, changes, items, latest, catLatest); err != nil {
+				return
 			}
-			if doc, created := changes[folder]; created && doc != nil {
-				return pwAfter.has(folder, p)
-			}
-			return false
-		}
-		// Place lists and the namespaces' trust as of the checkpoint
-		// (configAt), as for POST /grants, for the caller's subjects.
-		subs := Subjects(caller)
-		placeOK := map[string]bool{}
-		for ns, cfg := range latest {
-			placeOK[ns] = g.Trust[ns] && inPlaceList(s.configAt(g, ns, cfg).Doc, cat, subs)
-		}
-		for _, mi := range items {
-			chk := MergeCheck{Resource: mi.name, Actions: mi.actions}
-			bp, ap := parentsOf(cat, mi.before), parentsOf(cat, mi.after)
-			switch {
-			case !mi.beforeLive:
-				// Creating a folder needs move on every folder it goes
-				// into (§B.11.4 create a folder), placing place (§B.11.4
-				// place).
-				ap = parentsOf(cat, mi.made)
-				want := "move"
-				chk.Change = "create-folder"
-				switch {
-				case mi.placement():
-					chk.Change, want = "place", "place"
-					ns, _, ok := tree.SplitPlacement(mi.name)
-					if !ok || !g.Trust[ns] {
-						err = forbidden("%s: namespace %s is not trusted by catalog %s", mi.name, ns, cat)
-						return
-					}
-					if !placeOK[ns] {
-						err = forbidden("%s: namespace %s does not let you place its items in %s (catalogs.%s.place)", mi.name, ns, cat, cat)
-						return
-					}
-				case mi.tombstoned:
-					// An admin's (needsAdmin above).
-					chk.Change = "restore-folder"
-				}
-				if len(ap) == 0 && !admin {
-					err = forbidden("%s: only %s make roots", mi.name, s.opt.AdminGroup)
-					return
-				}
-				for _, p := range ap {
-					if !power(p.Name, want) {
-						err = forbidden("%s: no role of yours with %s is assigned on %s", mi.name, want, parentLabel(p))
-						return
-					}
-				}
-			case !mi.afterLive:
-				chk.Change = "delete"
-				if err = o.leaves(g.Node(mi.name), "delete"); err != nil {
-					return
-				}
-				for _, p := range bp {
-					if !power(p.Name, "move") {
-						err = forbidden("%s: no role of yours with move is assigned on %s", mi.name, parentLabel(p))
-						return
-					}
-				}
-			case !sameParents(bp, ap):
-				chk.Change = "move"
-				if err = o.leaves(g.Node(mi.name), "move"); err != nil {
-					return
-				}
-				if len(ap) == 0 && !admin {
-					err = forbidden("%s: only %s make roots", mi.name, s.opt.AdminGroup)
-					return
-				}
-				below := after.Descendants([]string{mi.name})
-				for _, p := range added(bp, ap) {
-					if below[p.Name] {
-						err = forbidden("%s can't move under %s, which is itself or below it", mi.name, p.Name)
-						return
-					}
-				}
-				for _, p := range added(ap, bp) {
-					if !power(p.Name, "move") {
-						err = forbidden("%s: no role of yours with move is assigned on %s, which the node leaves", mi.name, parentLabel(p))
-						return
-					}
-				}
-				for _, p := range added(bp, ap) {
-					if !power(p.Name, "move") {
-						err = forbidden("%s: no role of yours with move is assigned on %s", mi.name, parentLabel(p))
-						return
-					}
-				}
-			default:
-				chk.Change = "edit"
-				if mi.accessChanged() {
-					// An admin's (needsAdmin above), who needs no power.
-					chk.Change = "access"
-					break
-				}
-				if err = o.leaves(g.Node(mi.name), "edit"); err != nil {
-					return
-				}
-				for _, p := range ap {
-					if !power(p.Name, "move") {
-						err = forbidden("%s: no role of yours with move is assigned on %s", mi.name, parentLabel(p))
-						return
-					}
-				}
-			}
-			checks = append(checks, chk)
+			checkedAs = caller.Principal.ID
 		}
 	})
 	if err != nil {
@@ -835,6 +702,133 @@ func (s *Service) mergeNotFound(o *organising, g, after *tree.Graph, items []*me
 		}
 	}
 	return nil
+}
+
+// mergeChecks is the batch's 403s for caller (§B.11.4, the list in the
+// comment above IssueMerge), after its 404s (mergeNotFound), with o its
+// organising view; it reports what it checked per item. Call it under
+// View.
+func (s *Service) mergeChecks(o *organising, caller *grant.Verified, g, after *tree.Graph, changes map[string]any, items []*mergeItem,
+	latest map[string]*grantcheck.Config, catLatest *grantcheck.Config) ([]MergeCheck, error) {
+	cat := g.Catalog
+	admin := o.admin
+	var checks []MergeCheck
+	// Tree powers as for organising requests (powers): admins need
+	// none; on a folder the same batch creates they are judged in the
+	// batch's result, where one without $access has, per subject, the
+	// powers held at all its parents (§B.11.2, §B.11.4 create a
+	// folder).
+	ck := s.keyAt(g, cat, catLatest)
+	pwBefore, pwAfter := powersAt(g, ck, callerOf(caller)), powersAt(after, ck, callerOf(caller))
+	power := func(folder, p string) bool {
+		if admin {
+			return true
+		}
+		if g.Explicit(folder) {
+			if _, changed := changes[folder]; !changed {
+				return pwBefore.has(folder, p)
+			}
+			return pwBefore.has(folder, p) || pwAfter.has(folder, p)
+		}
+		if doc, created := changes[folder]; created && doc != nil {
+			return pwAfter.has(folder, p)
+		}
+		return false
+	}
+	// Place lists and the namespaces' trust as of the checkpoint
+	// (configAt), as for POST /grants, for the caller's subjects.
+	subs := Subjects(caller)
+	placeOK := map[string]bool{}
+	for ns, cfg := range latest {
+		placeOK[ns] = g.Trust[ns] && inPlaceList(s.configAt(g, ns, cfg).Doc, cat, subs)
+	}
+	for _, mi := range items {
+		chk := MergeCheck{Resource: mi.name, Actions: mi.actions}
+		bp, ap := parentsOf(cat, mi.before), parentsOf(cat, mi.after)
+		switch {
+		case !mi.beforeLive:
+			// Creating a folder needs move on every folder it goes
+			// into (§B.11.4 create a folder), placing place (§B.11.4
+			// place).
+			ap = parentsOf(cat, mi.made)
+			want := "move"
+			chk.Change = "create-folder"
+			switch {
+			case mi.placement():
+				chk.Change, want = "place", "place"
+				ns, _, ok := tree.SplitPlacement(mi.name)
+				if !ok || !g.Trust[ns] {
+					return nil, forbidden("%s: namespace %s is not trusted by catalog %s", mi.name, ns, cat)
+				}
+				if !placeOK[ns] {
+					return nil, forbidden("%s: namespace %s does not let you place its items in %s (catalogs.%s.place)", mi.name, ns, cat, cat)
+				}
+			case mi.tombstoned:
+				// An admin's (IssueMerge: it needs the admin group).
+				chk.Change = "restore-folder"
+			}
+			if len(ap) == 0 && !admin {
+				return nil, forbidden("%s: only %s make roots", mi.name, s.opt.AdminGroup)
+			}
+			for _, p := range ap {
+				if !power(p.Name, want) {
+					return nil, forbidden("%s: no role of yours with %s is assigned on %s", mi.name, want, parentLabel(p))
+				}
+			}
+		case !mi.afterLive:
+			chk.Change = "delete"
+			if err := o.leaves(g.Node(mi.name), "delete"); err != nil {
+				return nil, err
+			}
+			for _, p := range bp {
+				if !power(p.Name, "move") {
+					return nil, forbidden("%s: no role of yours with move is assigned on %s", mi.name, parentLabel(p))
+				}
+			}
+		case !sameParents(bp, ap):
+			chk.Change = "move"
+			if err := o.leaves(g.Node(mi.name), "move"); err != nil {
+				return nil, err
+			}
+			if len(ap) == 0 && !admin {
+				return nil, forbidden("%s: only %s make roots", mi.name, s.opt.AdminGroup)
+			}
+			below := after.Descendants([]string{mi.name})
+			for _, p := range added(bp, ap) {
+				if below[p.Name] {
+					return nil, forbidden("%s can't move under %s, which is itself or below it", mi.name, p.Name)
+				}
+			}
+			for _, p := range added(ap, bp) {
+				if !power(p.Name, "move") {
+					return nil, forbidden("%s: no role of yours with move is assigned on %s, which the node leaves", mi.name, parentLabel(p))
+				}
+			}
+			for _, p := range added(bp, ap) {
+				if !power(p.Name, "move") {
+					return nil, forbidden("%s: no role of yours with move is assigned on %s", mi.name, parentLabel(p))
+				}
+			}
+		default:
+			chk.Change = "edit"
+			if mi.accessChanged() {
+				// An admin's (IssueMerge: it needs the admin group), who
+				// needs no power.
+				chk.Change = "access"
+				break
+			}
+			if err := o.leaves(g.Node(mi.name), "edit"); err != nil {
+				return nil, err
+			}
+			for _, p := range ap {
+				if !power(p.Name, "move") {
+					return nil, forbidden("%s: no role of yours with move is assigned on %s", mi.name, parentLabel(p))
+				}
+			}
+		}
+		checks = append(checks, chk)
+	}
+	return checks, nil
 }
 
 // parentsOf is a node document's parents entries, once per node name (an
