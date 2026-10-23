@@ -174,12 +174,25 @@ func (s *Service) purgedAt(ns string) (err error) {
 
 // contentConfig is content namespace ns's document at the head (the grant
 // checker's copy), whose entry for the catalog's key signs a grant for its
-// items (plan.key). Every name of a namespace the service holds as purged
-// is 410 purged first, decided at the checkpoint (purgedAt); one whose
-// document the core answers 410 purged (a sealed one, §8.5) is so too,
-// from the core's head (configErr).
+// items (plan.key). Before it reads the document it answers what the
+// checkpoint alone decides, in order: 410 purged for every name of a
+// namespace the service holds as purged (purgedIn), then 403 for an item
+// of a namespace the catalog doesn't trust (untrusted), whose document the
+// service's own grant needn't read and whose names it doesn't follow
+// (itemIn), so that the answer is a refusal, not a 502 about the service's
+// grant (§B.11.4, §B.11.5). One whose document the core answers 410 purged
+// (a sealed one, §8.5) is 410 purged too, from the core's head (configErr).
 func (s *Service) contentConfig(ctx context.Context, ns string) (*grantcheck.Config, error) {
-	if err := s.purgedAt(ns); err != nil {
+	var err error
+	s.t.View(func(g *tree.Graph, cur map[string]string) {
+		if err = s.purgedIn(g, cur, ns); err != nil || g.Trust[ns] {
+			return
+		}
+		e := untrusted(ns, g.Catalog).(*Error)
+		e.Checkpoint = checkpointAt(g, cur, ns)
+		err = e
+	})
+	if err != nil {
 		return nil, err
 	}
 	cfg, err := s.t.Checker().Config(ctx, ns)
@@ -857,7 +870,8 @@ func (s *Service) noContentKey(ns string) error {
 //
 // Names are decided only in a namespace the service has a checkpoint of
 // (itemFacts.known), and the service follows only trusted ones: an item of
-// a namespace the catalog doesn't trust is 403 after the 410.
+// a namespace the catalog doesn't trust is 403 after the 410, before its
+// document is read (contentConfig).
 func (s *Service) planContent(ctx context.Context, v *grant.Verified, item string, want []string) (_ *plan, err error) {
 	for _, w := range want {
 		if !grant.IsVerb(w) {

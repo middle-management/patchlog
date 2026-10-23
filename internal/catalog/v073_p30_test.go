@@ -592,3 +592,49 @@ func TestCreatePurgedCatalogV073(t *testing.T) {
 		}
 	}
 }
+
+// TestUntrustedNamespaceItemV073 (TC-36, TC-37, TC-41, TC-43): an item of
+// a namespace the catalog doesn't trust is 403 after the 410, decided at
+// the checkpoint from the catalog's trust alone, before the service reads
+// the namespace's document, which its own grant needn't cover (the usual
+// deployment): for read, create and restore on POST /grants, and as a
+// refused /read-grants entry, not a 502 the client asks again forever
+// whose message shows the service's grant. The checkpoint names the
+// catalog alone, the one namespace the decision read (§B.11.4, §B.11.5).
+func TestUntrustedNamespaceItemV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	// A namespace that exists, lists the catalog's key and isn't trusted.
+	entry0 := w.cat.Entry("read", "create", "append", "restore")
+	entry0["roles"] = map[string]any{"allow": toAny("reader")}
+	opt := w.s.Client(t, client.WithBearer(w.s.OperatorGrant(t, "teams")))
+	must(opt.CreateNamespace(context.Background(), "teams", map[string]any{
+		"read": "grant", "keys": []any{w.opsKey.Entry("*"), entry0},
+		"roles": map[string]any{"reader": map[string]any{"can": toAny("read")}}}))
+	w.start()
+	w.caughtUp()
+	fan := w.caller("user:fred", "fan-club")
+	cp := map[string]any{"cat": w.svc.Tree().Checkpoint("cat")}
+	items := []string{"/r/nosuch/x", "/r/teams/x"}
+	rg := w.do("POST", "/read-grants", fan, map[string]any{"items": toAny(items...)})
+	for i, item := range items {
+		e := entry(rg, i)
+		msg, _ := e["message"].(string)
+		if e["status"] != 403.0 || e["code"] != "forbidden" || !strings.Contains(msg, "not trusted") || e["grant"] != nil {
+			t.Errorf("read-grants %s: %v (want status 403, not trusted)", item, e)
+		}
+	}
+	if !reflect.DeepEqual(rg.body["checkpoint"], cp) {
+		t.Errorf("read-grants checkpoint %v, want %v", rg.body["checkpoint"], cp)
+	}
+	for _, item := range items {
+		for _, verb := range []string{"read", "create", "restore"} {
+			r := w.do("POST", "/grants", fan, map[string]any{"item": item, "want": toAny(verb)})
+			msg, _ := r.body["message"].(string)
+			if r.status != 403 || r.body["code"] != "forbidden" || !strings.Contains(msg, "not trusted") || !reflect.DeepEqual(r.body["checkpoint"], cp) {
+				t.Errorf("POST /grants %s %s: %d %v (want 403 not trusted at %v)", verb, item, r.status, r.body, cp)
+			}
+		}
+	}
+}
