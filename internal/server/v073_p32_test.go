@@ -343,3 +343,84 @@ func TestV073RemoteSealedLogUnreadable(t *testing.T) {
 		t.Fatalf("502 without origin: %s", r.Body)
 	}
 }
+
+// ENC-47 (MF-40): a config write that makes a remote branch public, raises
+// it to e2e or turns off a nonce requirement is judged by its base's
+// current namespace document, read for that write: not by what the base
+// was at creation. A base that doesn't answer is 502 upstream, one B can't
+// read 422, and nothing is applied either way (§G.5.2, CONFORMANCE
+// Protection 38–40, Levels 39).
+func TestV073RemoteConfigJudgedBySource(t *testing.T) {
+	t.Parallel()
+	a, b, rt := pair(t, nil, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning})
+	a.mkNS("m", map[string]any{"read": "public"})
+	a.create("m", "x", map[string]any{"v": 1.0})
+	at := a.nsHead("m")
+	expect(t, b.mkRemote("r", remoteGenesis("m", at, map[string]any{"read": "grant", "nonce": "required"})), 201)
+	expect(t, b.mkRemote("q", remoteGenesis("m", at, map[string]any{"read": "grant"})), 201)
+
+	// A became private after creation: making r public is refused, as for
+	// a local branch, though A was public when r was created.
+	expect(t, a.patchNS("m", ops(op("replace", "/read", "grant")), ""), 201)
+	expectCode(t, b.patchNS("r", ops(op("replace", "/read", "public")), ""), 422, "invalid")
+	// A batch's config change takes the same path, its dry run included.
+	cfgChange := func(ns string, patches []any) map[string]any {
+		return map[string]any{"ifMatch": b.configID(ns), "patches": patches}
+	}
+	r := b.do(req{method: "POST", path: "/ns/r/batch", author: "admin", body: map[string]any{"items": []any{}, "config": cfgChange("r", ops(op("replace", "/read", "public")))}})
+	expectCode(t, r, 422, "invalid")
+	r = b.do(req{method: "POST", path: "/ns/r/batch?dry-run=1", author: "admin", body: map[string]any{"items": []any{}, "config": cfgChange("r", ops(op("replace", "/read", "public")))}})
+	expect(t, r, 200)
+	if rep, _ := r.Obj()["config"].(map[string]any); rep["status"] != 422.0 {
+		t.Fatalf("dry run %s", r.Body)
+	}
+
+	// A requires nonces now; r was created requiring them while A didn't:
+	// turning them off is refused by A's current document.
+	expect(t, a.patchNS("m", ops(op("add", "/nonce", "required")), ""), 201)
+	expectCode(t, b.patchNS("r", ops(op("remove", "/nonce")), ""), 422, "invalid")
+	// p, created while A requires them, requires them too (§G.3); once A no
+	// longer does, p may turn them off, whatever A was at p's creation.
+	expect(t, b.mkRemote("p", remoteGenesis("m", a.nsHead("m"), map[string]any{"read": "grant", "nonce": "required"})), 201)
+	expect(t, a.patchNS("m", ops(op("remove", "/nonce")), ""), 201)
+	expect(t, b.patchNS("p", ops(op("remove", "/nonce")), ""), 201)
+	expect(t, b.patchNS("r", ops(op("remove", "/nonce")), ""), 201)
+
+	// A raise to e2e over a base that isn't e2e is 422, as a branch field.
+	r = b.patchNS("q", ops(op("add", "/encryption", map[string]any{"level": "e2e"})), "")
+	expectCode(t, r, 422, "invalid")
+	if !strings.Contains(r.Str("message"), "base") {
+		t.Fatalf("e2e raise refused for another reason: %s", r.Body)
+	}
+
+	// A public again: q may become public.
+	expect(t, a.patchNS("m", ops(op("replace", "/read", "public")), ""), 201)
+	expect(t, b.patchNS("q", ops(op("replace", "/read", "public")), ""), 201)
+	expect(t, b.patchNS("q", ops(op("replace", "/read", "grant")), ""), 201)
+
+	// A unreachable: 502 upstream naming A, not applied.
+	cfg := b.configID("q")
+	rt.set("http://127.0.0.1:1", "")
+	r = b.patchNS("q", ops(op("replace", "/read", "public")), "")
+	expectCode(t, r, 502, "upstream")
+	if r.Str("origin") != originA || b.configID("q") != cfg {
+		t.Fatalf("unreachable base: %s, config %s → %s", r.Body, cfg, b.configID("q"))
+	}
+	// A config write the base doesn't judge needs no read of it.
+	expect(t, b.patchNS("q", ops(op("add", "/x-note", "n")), ""), 201)
+	// A answers, but B can't read its document: 422, not applied.
+	rt.set(proxyA(t, a, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == "/ns/m" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(403)
+			w.Write([]byte(`{"code":"forbidden"}`))
+			return true
+		}
+		return false
+	}, "", nil), "")
+	cfg = b.configID("q")
+	expectCode(t, b.patchNS("q", ops(op("replace", "/read", "public")), ""), 422, "invalid")
+	if b.configID("q") != cfg {
+		t.Fatal("applied")
+	}
+}

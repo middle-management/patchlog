@@ -60,9 +60,10 @@ import (
 // the branch: it must be private or sealed (a sealed branch of a sealed
 // base may be public, as for local branches), never below the base's
 // encryption level, and e2e only if the base is. That is what A's export
-// grant entrusts to B, and B enforces it at creation, and by raising its
-// level when the base's rises (followLevel), or, on a server that lacks
-// the level, answering 502 upstream for what it mirrored (§1,
+// grant entrusts to B, and B enforces it at creation, in the config writes
+// its base's current document judges (checkRemoteSource), and by raising
+// its level when the base's rises (followLevel), or, on a server that
+// lacks the level, answering 502 upstream for what it mirrored (§1,
 // upstream.go). The shadows follow the branch's level (at rest, and for
 // sealing and e2e).
 //
@@ -1637,6 +1638,166 @@ func (t *tx) purgeShadowNS(sh *nsRow) {
 	_, err = t.Exec(`UPDATE namespaces SET purged = 1 WHERE ns = ?`, sh.id)
 	t.must(err)
 	t.flushDocs = true
+}
+
+// --- config writes judged by the base's current document ---------------------
+
+// A config write that makes a remote branch public, raises it to e2e or
+// turns off a nonce requirement its base has is judged by the base's
+// current namespace document, read for that write, and refused as creation
+// is where it can't be read (§G.5.2): the shadow holds only what the base
+// was when the branch was created. The read happens outside the write
+// lock: the first run of the write finds that it needs the document
+// (remoteSourceFor) and rolls back (errNeedSource), and withRemoteSource
+// reads it from the base and runs the write again with it.
+
+// remoteSourcesKey is the context key of a write's remoteSources.
+type remoteSourcesKey struct{}
+
+// remoteSources are the base documents read for one write, by the remote
+// branch's ns.
+type remoteSources struct {
+	docs map[int64]*remoteSourceDoc
+}
+
+// remoteSourceDoc is a remote branch's base's current namespace document,
+// read for a write: doc, or err with down set where the base didn't
+// answer, or answered 5xx. withAt marks a read for a raise to e2e, which
+// also reads the base's document as of at: atE2E reports it e2e.
+type remoteSourceDoc struct {
+	origin string
+	doc    map[string]any
+	withAt bool
+	atE2E  bool
+	err    error
+	down   bool
+}
+
+// errNeedSource rolls back a write that needs the current namespace
+// document of the base of remote branch branch (remoteSourceFor).
+type errNeedSource struct {
+	branch         int64
+	origin, ns, at string
+	withAt         bool
+}
+
+func (e *errNeedSource) Error() string {
+	return "the write needs the current namespace document of " + e.origin + "/ns/" + e.ns
+}
+
+// withRemoteSource runs f, a config write or a batch with a config change,
+// with ctx carrying the base documents it needs (§G.5.2): each that a run
+// of f finds missing is read from the base, outside any transaction, and f
+// runs again.
+func (e *Engine) withRemoteSource(ctx context.Context, f func(context.Context) error) error {
+	h := &remoteSources{docs: map[int64]*remoteSourceDoc{}}
+	ctx = context.WithValue(ctx, remoteSourcesKey{}, h)
+	for tries := 0; ; tries++ {
+		err := f(ctx)
+		var need *errNeedSource
+		if !errors.As(err, &need) {
+			return err
+		}
+		if tries == 3 {
+			// The configuration kept changing under the write.
+			return apiErr(503, "unavailable", "message", "the namespace changed while its base's document was read; retry")
+		}
+		h.docs[need.branch] = e.readRemoteSource(ctx, need)
+	}
+}
+
+// readRemoteSource reads the base's current namespace document, and for a
+// raise to e2e the one as of at, as creation does (fetchRemote).
+func (e *Engine) readRemoteSource(ctx context.Context, need *errNeedSource) *remoteSourceDoc {
+	out := &remoteSourceDoc{origin: need.origin, withAt: need.withAt}
+	c, _, err := e.remoteClient(need.origin)
+	if err != nil {
+		out.err, out.down = err, true
+		return out
+	}
+	d, err := currentNSDoc(ctx, c, need.ns)
+	if err != nil {
+		out.err, out.down = err, noAnswer(err)
+		return out
+	}
+	out.doc = d.Value
+	if need.withAt && docLevel(d.Value) == levelE2E {
+		ad, err := c.NSDoc(ctx, need.ns, need.at)
+		if err != nil && noAnswer(err) {
+			out.err, out.down = err, true
+			return out
+		}
+		out.atE2E = err == nil && docLevel(ad.Value) == levelE2E
+	}
+	return out
+}
+
+// remoteSourceFor returns the current namespace document of remote branch
+// n's base as read for this write; withAt asks for the document as of at
+// too. A write that hasn't read it yet rolls back to read it
+// (errNeedSource, withRemoteSource); one run without withRemoteSource,
+// which can't, gets it as unread.
+func (t *tx) remoteSourceFor(n *nsRow, withAt bool) *remoteSourceDoc {
+	var origin, ns, at string
+	t.must(t.QueryRow(`SELECT origin, ns, at FROM remote_bases WHERE branch = ?`, n.id).Scan(&origin, &ns, &at))
+	h, _ := t.ctx.Value(remoteSourcesKey{}).(*remoteSources)
+	if h == nil {
+		return &remoteSourceDoc{origin: origin, err: errors.New("not read for this write"), down: true}
+	}
+	if d := h.docs[n.id]; d != nil && (d.withAt || !withAt) {
+		return d
+	}
+	panic(&errNeedSource{branch: n.id, origin: origin, ns: ns, at: at, withAt: withAt})
+}
+
+// checkRemoteSource is the §7.4 validation of remote branch n's namespace
+// document cfg that depends on its base (§G.5.2): a write that makes it
+// public, raises it to e2e or turns off a nonce requirement is judged by
+// the base's current namespace document as a local branch's is by its
+// base's. One this deployment can't read refuses the write as it refuses
+// creation (unknownLevel): 502 upstream, naming the base's deployment,
+// where the base didn't answer or answered 5xx, and 422 otherwise.
+// Refusals are 422 invalid with errors pointing at the member, as for the
+// other branch fields; nothing is applied.
+func (t *tx) checkRemoteSource(n *nsRow, cur, cfg *Config) *Error {
+	toE2E := cfg.level == levelE2E && cur.level < levelE2E
+	toPublic := cur.Read != "public" && cfg.Read == "public"
+	nonceOff := cur.NonceRequired && !cfg.NonceRequired
+	var ptr string
+	switch {
+	case toE2E:
+		ptr = "/encryption"
+	case toPublic:
+		ptr = "/read"
+	case nonceOff:
+		ptr = "/nonce"
+	default:
+		return nil
+	}
+	src := t.remoteSourceFor(n, toE2E)
+	if src.err != nil {
+		msg := fmt.Sprintf("this deployment can't read its base's current namespace document (%v), by which a config write that makes a remote branch public, "+
+			"raises it to e2e or turns off a nonce requirement is judged (§G.5.2); nothing was applied", src.err)
+		if src.down {
+			e := upstreamErr("%s", msg)
+			e.Body["origin"] = src.origin
+			return e
+		}
+		return docInvalid(ptr, ptr+": "+msg)
+	}
+	level := docLevel(src.doc)
+	switch {
+	case toE2E && level != levelE2E:
+		return docInvalid("/encryption", "/encryption: a branch can be e2e only if its base is, and the base's current namespace document isn't (§G.5.2, Addendum E Levels)")
+	case toE2E && !src.atE2E:
+		return docInvalid("/encryption", "/encryption: at is before the base's raise to e2e, and a branch can't be raised to e2e with an at before its base's e2e raise "+
+			"(Addendum E Levels, §G.5.2); rebase it onto the base's current head (§F.5)")
+	case toPublic && src.doc["read"] != "public":
+		return docInvalid("/read", "a branch of a non-public namespace cannot be public: the base's current namespace document isn't public (§G.5.2, §7.4)")
+	case nonceOff && src.doc["nonce"] == "required" && level != levelE2E:
+		return docInvalid("/nonce", `/nonce: a branch can't turn off the nonce requirement its base has, and the base's current namespace document requires nonces (§G.5.2, §7.6, §C.7)`)
+	}
+	return nil
 }
 
 // --- following the base, and registering with it ----------------------------

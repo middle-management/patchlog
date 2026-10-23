@@ -52,9 +52,14 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 		}
 	}
 	p.exempt = a.star || freezeOnly(writes, newDoc)
-	if !inBatch && !p.exempt {
+	// Once per request: a write that runs again, as one that reads a remote
+	// branch's base does (withRemoteSource), keeps its draw (rateDrawn).
+	if !inBatch && !p.exempt && (t.rateDrawn == nil || !*t.rateDrawn) {
 		if err := t.rateLimit(n, cur, a, nil, 1); err != nil {
 			return nil, err
+		}
+		if t.rateDrawn != nil {
+			*t.rateDrawn = true
 		}
 	}
 	// A purged namespace is 410 after authorisation and the rate limits
@@ -343,12 +348,17 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any) (*Config, *Error)
 		return nil, docInvalid("/drafts", "/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
 	}
 	baseLevel := -1
-	if n.isBranch() {
-		// A remote branch's shadow follows the branch itself; its
-		// base's level was checked when it was created.
-		if b := t.nsByID(n.base.Int64); !b.isShadow() {
-			baseLevel = t.nsLevel(b)
+	remote := t.remoteShadow(n) != nil
+	if remote {
+		// A remote branch's shadow follows the branch itself, and holds
+		// only what its base was when it was created: a write that makes
+		// it public, raises it to e2e or turns off a nonce requirement is
+		// judged by the base's current namespace document (§G.5.2).
+		if err := t.checkRemoteSource(n, cur, cfg); err != nil {
+			return nil, err
 		}
+	} else if n.isBranch() {
+		baseLevel = t.nsLevel(t.nsByID(n.base.Int64))
 	}
 	if err := t.checkEncryption(cur, cfg, baseLevel); err != nil {
 		return nil, err
@@ -362,6 +372,8 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any) (*Config, *Error)
 				return nil, err
 			}
 		}
+	}
+	if n.isBranch() && !remote {
 		base := t.nsByID(n.base.Int64)
 		if cfg.Read == "public" && t.config(base.configSeq).Read != "public" {
 			return nil, docInvalid("/read", "a branch of a non-public namespace cannot be public (§7.4)")
@@ -615,15 +627,22 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 // WriteConfig creates a namespace (IfNoneMatch) or changes its document.
 // A genesis whose base is in another deployment creates a remote branch
 // (§G.3), fetching and verifying the base before the write transaction.
+// A change to a remote branch that its base's current namespace document
+// judges reads that document outside the write lock (withRemoteSource,
+// §G.5.2).
 func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error) {
 	if cc.IfNoneMatch && remoteBaseIn(cc.Patches) {
 		return e.createRemoteBranch(ctx, req, cc)
 	}
 	var res *WriteResult
-	err := e.update(ctx, func(t *tx) error {
-		r, err := t.writeConfig(req, cc)
-		res = r
-		return err
+	drawn := false
+	err := e.withRemoteSource(ctx, func(ctx context.Context) error {
+		return e.update(ctx, func(t *tx) error {
+			t.rateDrawn = &drawn
+			r, err := t.writeConfig(req, cc)
+			res = r
+			return err
+		})
 	})
 	return res, err
 }
