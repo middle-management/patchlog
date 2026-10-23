@@ -11,6 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/schema"
 )
 
 // P34, MF-44 (§G.4.1, §7.1): with "authors": true, history lines carry the
@@ -135,5 +136,35 @@ func TestV073HistoryLinesCarryVia(t *testing.T) {
 	must(bw.Close())
 	if !bytes.Equal(buf.Bytes(), plain) {
 		t.Fatalf("rewritten without authors:\n%s\nwant\n%s", buf.Bytes(), plain)
+	}
+}
+
+// P34 (carry-over, GB-8, §6.2 step 3, §G.4.4 Renaming): a renamed import
+// replays each full-history document, to find the references to rewrite
+// and to rewrite them, and a genesis applies to the document null there as
+// at the core: a genesis that tests for null ([test "" null, add "" …])
+// replays, is rewritten, and its test op compared with the rewritten
+// document, as is a later test of a rewritten reference.
+func TestV073RenamedImportNullGenesis(t *testing.T) {
+	t.Parallel()
+	src := newDeployment(t, stagingOrigin)
+	src.ns("s-n", nil)
+	sch := src.create("s-n", "sch", map[string]any{"$schema": schema.Dialect2020, "type": "object", "properties": map[string]any{
+		"see": map[string]any{"type": "string", "x-ref": map[string]any{}}}})
+	src.create("s-n", "b", map[string]any{"title": "B"})
+	must(src.c.Create(ctx, "s-n", "a", []any{op("test", "", nil),
+		op("add", "", map[string]any{"$schema": rev("s-n", "sch", sch), "title": "A", "see": "/r/s-n/b"})}))
+	src.append("s-n", "a", op("test", "/see", "/r/s-n/b"), op("replace", "/title", "A2"))
+	b, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"s-n"}})
+	dst := newDeployment(t, cmsOrigin)
+	rep := importB(t, dst, b, bundle.ImportOptions{NSMap: map[string]string{"s-n": "c-n"}})
+	if rep.Renamed["s-n"] != "c-n" {
+		t.Fatalf("report %+v", rep)
+	}
+	if d := dst.doc("c-n", "a"); d["title"] != "A2" || d["see"] != "/r/c-n/b" {
+		t.Fatalf("c-n/a: %v", d)
+	}
+	if dst.head("c-n", "a").ID == src.head("s-n", "a").ID {
+		t.Fatal("a rewritten document kept its source ids")
 	}
 }
