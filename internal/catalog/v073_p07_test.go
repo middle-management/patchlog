@@ -290,8 +290,10 @@ func TestAdminPowersV073(t *testing.T) {
 	if r := ask(ada); r.status != 200 {
 		t.Errorf("merge approved by an admin without move: %d %v", r.status, r.body)
 	}
-	if r := ask(eve); r.status != 403 {
-		t.Errorf("merge approved by a non-admin without move: %d %v", r.status, r.body)
+	// To eve, shared is hidden, so a merge naming it is answered as an
+	// organising request naming it, as a missing node (§F.8, §B.11.5).
+	if r := ask(eve); r.status != 404 {
+		t.Errorf("merge approved by a non-admin who doesn't see the node: %d %v", r.status, r.body)
 	}
 }
 
