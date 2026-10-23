@@ -597,8 +597,8 @@ func (st *reqState) ownedBy(ctx context.Context, ns string) (owner, unread strin
 		switch {
 		case err == nil && in.files != nil:
 			files = in.files
-			st.s.learn(cat, &catConf{files: in.files, trust: in.trust, titled: in.titled})
-		case err == nil && in.readErr == nil:
+			st.s.learn(cat, &catConf{files: in.files, trust: in.trust, trustKnown: in.trustKnown, titled: in.titled})
+		case err == nil && in.notTree != "":
 			// Not a file tree.
 			st.s.learn(cat, nil)
 			continue

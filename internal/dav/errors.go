@@ -31,6 +31,10 @@ type davError struct {
 	// tooBig: a folder holds more than a tree service listing takes
 	// (svcList), refused as a listing, not as a path (resolveCatalog)
 	tooBig bool
+	// svcRefused: a tree service refused the token's grant a listing
+	// (403), as one without tree-derived access refuses every grant that
+	// doesn't read its namespaces whole (§B.11.5)
+	svcRefused bool
 }
 
 func (e *davError) Error() string {

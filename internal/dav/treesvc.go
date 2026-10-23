@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/text/unicode/norm"
+
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/files"
 	"github.com/middle-management/patchlog/internal/telemetry"
@@ -31,7 +33,11 @@ import (
 // { size, type, modified } (§H.3), which give a file's size, type and
 // time, and the entry's head its ETag: a folder lists in one request,
 // every page of it (treePage entries each, at most maxTreePages: a folder
-// larger is refused, never cut short), and no item is read for it. A
+// larger, as the first page's total says, is refused at once, never cut
+// short), and no item is read for it; each node's born orders duplicate
+// titles (§B.5, §H.2). Where files.root is hidden from the reader, the
+// top level is the tree service's roots for the reader's subject set
+// (§B.11.5, §H.3): the visible nodes whose parents are all hidden. A
 // placement whose file is sealed ({"sealed": JWE}, a sealed namespace's
 // item) isn't offered (§H.7); one without file, or without its time (an
 // end-to-end namespace's item, a head the service hasn't read yet, a row
@@ -63,7 +69,21 @@ import (
 // token for CatalogTTL, as a catalog's graph is: what one grant was shown
 // is never shown to another, which may read less (§H.7). The tree service
 // unreachable, failing, or not caught up with a namespace the catalog
-// trusts is a 502 or 503, never an empty folder.
+// trusts is a 502 or 503, never an empty folder. A tree service without
+// tree-derived access (§B.11) serves only unfiltered listings, and
+// refuses (403) a grant that doesn't read every namespace in them whole
+// (§B.11.5): the folder is listed from the node documents instead where
+// the grant reads them, else the 403 says why.
+//
+// Paths of titles that only read (GET, PROPFIND) are resolved with the
+// tree service's lookup (§B.5, §H.3), one request whatever the depth,
+// rather than a listing of each folder on the way (lookupPath); a name
+// lookup doesn't resolve (a duplicate's number, an escaped title, a node
+// shown by its node or item name) is found by listing, and so is every
+// path of a user whose writes the tree service is to wait for, and a
+// deeper one in a case-sensitive gateway, since lookup compares titles
+// after case folding. Writes resolve by listing, checked against the
+// node documents (resolveCatalog), a folder too large to list by lookup.
 
 const (
 	// treePage is the entries a listing page asks for, the tree
@@ -93,7 +113,8 @@ var (
 )
 
 // treeShared is what the server keeps of the tree service: its client,
-// and the catalogs' settings as last read with any grant (learn).
+// and the catalogs' settings as last read with any grant (learn), which
+// only tell which flat namespace a tree owns (ownedBy).
 type treeShared struct {
 	hc   *http.Client
 	page int // entries a page asks for (treePage)
@@ -148,42 +169,44 @@ func (s *Server) treeURL(cat string) string {
 	return s.opt.TreeService
 }
 
-// catConf is what listing a tree takes from its catalog's namespace
-// document (§B.6, §H.2): catalog.files, catalog.trust, and whether
-// catalog.title is set (§B.5).
+// catConf is what listing a tree takes from its catalog (§B.6, §H.2,
+// nsInfo): catalog.files, catalog.trust (where trustKnown; else files.ns
+// alone, if trusted), and whether catalog.title is set (§B.5).
 type catConf struct {
-	files  *treeFiles
-	trust  []string
-	titled bool
+	files      *treeFiles
+	trust      []string
+	trustKnown bool
+	titled     bool
+}
+
+// trusts is nsInfo.trusts for c.
+func (c catConf) trusts(ns string) bool {
+	return nsInfo{files: c.files, trust: c.trust, trustKnown: c.trustKnown}.trusts(ns)
 }
 
 // viaService reports whether catalog cat's folders are listed from its
 // tree service.
 func (s *Server) viaService(cat string, c catConf) bool { return s.treeURL(cat) != "" && !c.titled }
 
-// treeConf returns catalog cat's settings as the request's token reads
+// treeConf returns catalog cat's settings as the request's token is told
 // them (nsInfo), or why it isn't a file tree (notTree). A token whose
 // grant doesn't read the document, which takes unrestricted read (§7.4),
-// as one limited to some resources (§H.7), lists through a tree service
-// with the settings last read with any grant (learn), the server's own at
-// start included: only files.root is needed to ask for the top level, and
-// the tree service and the core check the token's grant for everything
-// listed and read.
+// as one limited to some resources, learns them from its own GET
+// /ns/{ns}/principal (§H.7 "Limited grants"): files, and of the trust
+// list only whether files.ns is trusted. Never settings read with
+// another grant: what one token is shown is never another's.
 func (st *reqState) treeConf(ctx context.Context, cat string) (catConf, error) {
 	in, err := st.s.nsInfoErr(ctx, st.tk, cat)
 	switch {
 	case err != nil:
 		return catConf{}, err
 	case in.files != nil:
-		c := catConf{files: in.files, trust: in.trust, titled: in.titled}
+		c := catConf{files: in.files, trust: in.trust, trustKnown: in.trustKnown, titled: in.titled}
 		st.s.learn(cat, &c)
 		return c, nil
-	case in.readErr == nil:
+	case in.notTree != "":
 		st.s.learn(cat, nil)
 		return catConf{}, notTree(cat, in.notTree)
-	}
-	if c, ok := st.s.learned(cat); ok && st.s.treeURL(cat) != "" {
-		return c, nil
 	}
 	return catConf{}, upstream(in.readErr)
 }
@@ -396,6 +419,8 @@ func (st *reqState) serviceDir(ctx context.Context, cat, folder string, c catCon
 		return d, nil
 	}
 	mins, oldest := st.p.ts.mins(append([]string{cat}, c.trust...), now)
+	// (A grant told only whether files.ns is trusted waits for its writes
+	// there and in the catalog.)
 	if len(mins) > 0 && st.p.ts.isSlow(cat, now) {
 		return st.behindDir(ctx, cat, folder, oldest)
 	}
@@ -413,24 +438,183 @@ func (st *reqState) serviceDir(ctx context.Context, cat, folder string, c catCon
 	case err == nil:
 		st.p.ts.reached(mins)
 	}
-	if err != nil {
-		if de := (*davError)(nil); errors.As(err, &de) && de.status == http.StatusNotFound && folder == c.files.root {
-			return nil, fail(http.StatusNotFound, "catalog %s's tree service shows no live folder node as its files.root to you, so its file tree has no top level to show (§H.2, §B.11.5)", cat)
+	roots := false
+	var de *davError
+	switch {
+	case err == nil:
+	case errors.As(err, &de) && de.status == http.StatusNotFound && folder == c.files.root:
+		// files.root is hidden from the reader: the top level is the
+		// visible nodes whose parents are all hidden, its roots
+		// (§B.11.5, §H.3).
+		ents, err = st.svcRoots(ctx, cat, mins)
+		if err == nil {
+			st.p.ts.reached(mins)
+			roots = true
+		} else if errors.As(err, &de) && de.status == http.StatusNotFound {
+			return nil, fail(http.StatusNotFound, "catalog %s's tree service shows no live folder node as its files.root to you, nor roots, so its file tree has no top level to show (§H.2, §B.11.5)", cat)
 		}
+	case errors.As(err, &de) && de.svcRefused:
+		// A tree service without tree-derived access refuses a grant that
+		// doesn't read every namespace it follows whole (§B.11.5): the
+		// node documents, where the grant reads them.
+		d, nerr := st.nodeDir(ctx, cat, folder)
+		if nerr == nil {
+			return d, nil
+		}
+		var ne *davError
+		if errors.As(upstream(nerr), &ne) && (ne.status == http.StatusUnauthorized || ne.status == http.StatusForbidden || ne.status == http.StatusNotFound) {
+			return nil, fail(http.StatusForbidden, "%s; it lists folders with tree-derived access (§B.11) only, or unfiltered to grants that read every namespace in them whole (§B.11.5), and your grant doesn't read catalog %s's node documents either (%s), which folders are listed from without it", de.msg, cat, ne.msg)
+		}
+		return nil, nerr
+	}
+	if err != nil {
 		return nil, err
 	}
 	d, err := st.svcDir(ctx, cat, ents)
 	if err != nil {
 		return nil, err
 	}
+	d.roots = roots
 	st.s.keepView(st.tk, k, tokenView{sd: svcDir{d: d, at: now, gen: gen}}, 256*(len(d.entries)+1))
 	return d, nil
 }
 
+// lookupHit is a path of titles a tree service's lookup resolved (§B.5)
+// for a token, and when (at, gen), kept as a listing is (views).
+type lookupHit struct {
+	e     treeEntry
+	exact bool
+	at    time.Time
+	gen   uint64
+}
+
+// cachedDir returns folder of catalog cat as the token's tree service
+// listing has it already, in this request or kept within CatalogTTL
+// (views), without asking; nil if it hasn't.
+func (st *reqState) cachedDir(cat, folder string) *treeDir {
+	if d := st.dirs[cat+"/"+folder]; d != nil {
+		return d
+	}
+	v, _ := st.s.view(st.tk, cat+"/"+folder)
+	return v.sd.fresh(st.s.opt.Now(), st.s.opt.CatalogTTL, st.s.gen.Load())
+}
+
+// listedPath reports whether the folders a path of titles (segs) of
+// catalog cat goes through, from root, are listed already (cachedDir),
+// so that resolving it by listing asks the tree service nothing.
+func (st *reqState) listedPath(cat, root string, segs []string) bool {
+	folder := root
+	for i, seg := range segs {
+		d := st.cachedDir(cat, folder)
+		if d == nil {
+			return false
+		}
+		if i == len(segs)-1 {
+			return true
+		}
+		e, _ := d.find(st.s, seg)
+		if e == nil || e.node.Kind != kindFolder {
+			return true
+		}
+		folder = e.node.Name
+	}
+	return true
+}
+
+// lookupPath resolves t, a path of titles (segs) of catalog cat that a
+// read names, with one lookup of the tree service (§B.5, §H.3), and says
+// whether it did: not for a user whose writes the tree service is to
+// wait for (serviceDir lists with ?min), nor a path whose folders are
+// listed already, nor, in a case-sensitive gateway, one below the top
+// level, whose folders' case lookup's answer doesn't show; and not a
+// name lookup doesn't resolve (lookupEntry), which listing finds or
+// rules out. A file it resolves has no parent folder (none is needed to
+// read it).
+func (st *reqState) lookupPath(ctx context.Context, t target, segs []string, c catConf) (target, bool, error) {
+	now := st.s.opt.Now()
+	if st.s.opt.CaseSensitive && len(segs) > 1 {
+		return t, false, nil
+	}
+	if mins, _ := st.p.ts.mins(append([]string{t.ns}, c.trust...), now); len(mins) > 0 || st.p.ts.isSlow(t.ns, now) {
+		return t, false, nil
+	}
+	if st.listedPath(t.ns, c.files.root, segs) {
+		return t, false, nil
+	}
+	e, exact, found, err := st.lookupEntry(ctx, t.ns, segs)
+	if err != nil || !found {
+		return t, false, err
+	}
+	t.node, t.title, t.listedAs, t.otherCase = e.node.Name, e.name, nodeName(e.node), !exact
+	if e.node.Kind == kindFolder {
+		t.kind = kFolder
+	} else {
+		t.kind, t.docNS, t.docName = kPlacement, e.node.ItemNS, e.node.ItemName
+	}
+	return t, true, nil
+}
+
+// lookupEntry asks catalog cat's tree service which node a path of
+// titles (segs) names (§B.5 lookup), with the token's grant, as a
+// folder's listing would show it (svcEntry), and whether segs's last is
+// its name rather than another case of it: found false where lookup
+// resolves nothing (404) or the tree service doesn't offer it, and where
+// the name it answers isn't the one a listing shows by the path's name:
+// an escaped title, or in a case-sensitive gateway another case. Kept
+// for the token as listings are (views).
+func (st *reqState) lookupEntry(ctx context.Context, cat string, segs []string) (*treeEntry, bool, bool, error) {
+	now, gen := st.s.opt.Now(), st.s.gen.Load()
+	path := strings.Join(segs, "/")
+	k := cat + "\x00lookup\x00" + path
+	if v, _ := st.s.view(st.tk, k); v.lk != nil && v.lk.gen == gen && now.Sub(v.lk.at) < st.s.opt.CatalogTTL {
+		e := v.lk.e
+		return &e, v.lk.exact, true, nil
+	}
+	u, err := url.Parse(st.s.treeURL(cat) + "/" + cat + "/lookup?" + url.Values{"path": {path}}.Encode())
+	if err != nil {
+		return nil, false, false, err
+	}
+	var a *svcAnswer
+	for hops := 0; ; hops++ {
+		if hops > 4 {
+			return nil, false, false, fail(http.StatusBadGateway, "catalog %s's tree service redirected the lookup of %s more than 4 times", cat, path)
+		}
+		var loc *url.URL
+		a, loc, err = st.svcGet(ctx, cat, u, false)
+		var de *davError
+		switch {
+		case errors.As(err, &de) && (de.status == http.StatusNotFound || de.svcRefused):
+			return nil, false, false, nil
+		case err != nil:
+			return nil, false, false, err
+		case loc != nil:
+			u = loc
+			continue
+		}
+		break
+	}
+	if a.Node == nil {
+		return nil, false, false, nil
+	}
+	e, ok, err := st.svcEntry(ctx, cat, *a.Node)
+	if err != nil || !ok || e.escaped {
+		return nil, false, false, err
+	}
+	last := segs[len(segs)-1]
+	exact := norm.NFC.String(last) == e.name
+	if !exact && st.s.opt.CaseSensitive || st.s.nameKey(last) != st.s.nameKey(e.name) {
+		return nil, false, false, nil
+	}
+	st.s.keepView(st.tk, k, tokenView{lk: &lookupHit{e: e, exact: exact, at: now, gen: gen}}, 256+len(k))
+	return &e, exact, true, nil
+}
+
 // svcDir is a folder of catalog cat as the tree service listed its
-// children ents.
+// children ents, duplicate titles in order of the born each entry carries
+// (§B.5, §H.2 "Siblings").
 func (st *reqState) svcDir(ctx context.Context, cat string, ents []svcItem) (*treeDir, error) {
 	var kids []treeEntry
+	born := map[string]time.Time{}
 	for _, e := range ents {
 		te, ok, err := st.svcEntry(ctx, cat, e)
 		if err != nil {
@@ -438,9 +622,12 @@ func (st *reqState) svcDir(ctx context.Context, cat string, ents []svcItem) (*tr
 		}
 		if ok {
 			kids = append(kids, te)
+			if t, err := time.Parse(time.RFC3339Nano, e.Born); err == nil {
+				born[e.Name] = t
+			}
 		}
 	}
-	return st.s.nameDir(kids, func(node string) time.Time { return st.nodeBorn(ctx, cat, node) }), nil
+	return st.s.nameDir(kids, func(node string) time.Time { return born[node] }), nil
 }
 
 // behindDir lists folder of catalog cat from its node documents, while
@@ -520,7 +707,8 @@ func (st *reqState) svcProbe(ctx context.Context, cat, folder string, mins []str
 	return errBehind
 }
 
-// svcItem is an entry of a children listing (§B.5, §H.3).
+// svcItem is an entry of a children listing, of roots or a lookup's node
+// (§B.5, §H.3).
 type svcItem struct {
 	Name   string   `json:"name"`
 	Kind   string   `json:"kind"`
@@ -530,6 +718,7 @@ type svcItem struct {
 	Head   string   `json:"head"`
 	Self   bool     `json:"self"`
 	File   *svcFile `json:"file"`
+	Born   string   `json:"born"` // the created of the node's first revision (§B.5)
 }
 
 // svcFile is a placement's file metadata (§H.3).
@@ -586,25 +775,14 @@ func (st *reqState) svcEntry(ctx context.Context, cat string, e svcItem) (treeEn
 	return te, !st.s.nsInfo(ctx, st.tk, ns).sealed, nil
 }
 
-// nodeBorn is when catalog node name was created, the genesis of its
-// chain, read with the token's grant; zero if unknown.
-func (st *reqState) nodeBorn(ctx context.Context, cat, name string) time.Time {
-	h, err := st.tk.c.Head(ctx, cat, name)
-	if err != nil || h.State != client.Live {
-		return time.Time{}
-	}
-	es, _, err := st.tk.c.LogPage(ctx, cat, name, h.ID, "")
-	if err != nil || len(es) == 0 || es[0].Parent != "" {
-		return time.Time{}
-	}
-	t, _ := time.Parse(time.RFC3339Nano, es[0].Created)
-	return t
-}
-
-// svcAnswer is a listing page, or the tree service's error (§12).
+// svcAnswer is a listing page (children, with total; roots; a lookup's
+// node), or the tree service's error (§12).
 type svcAnswer struct {
 	At       string    `json:"at"`
 	Children []svcItem `json:"children"`
+	Roots    []svcItem `json:"roots"`
+	Node     *svcItem  `json:"node"`
+	Total    *int      `json:"total"`
 	Next     string    `json:"next"`
 	Code     string    `json:"code"`
 	Message  string    `json:"message"`
@@ -613,11 +791,28 @@ type svcAnswer struct {
 // svcList reads the children of folder in catalog cat from its tree
 // service, every page, with the token's grant (§B.5): the head
 // pointer's redirect to the listing at the current checkpoint, then the
-// pages there. With mins, the listing includes those entries, which the
-// tree service waits for, and the whole read is bounded by TreeWait:
-// errBehind if it isn't done by then, or the tree service refuses them.
+// pages there. A folder whose total is more than the pages read take is
+// refused at once (403, tooBig). With mins, the listing includes those
+// entries, which the tree service waits for, and the whole read is
+// bounded by TreeWait: errBehind if it isn't done by then, or the tree
+// service refuses them.
 func (st *reqState) svcList(ctx context.Context, cat, folder string, mins []string) ([]svcItem, error) {
-	q := url.Values{"of": {folder}, "limit": {strconv.Itoa(st.s.ts.page)}}
+	return st.svcListing(ctx, cat, "children", url.Values{"of": {folder}, "limit": {strconv.Itoa(st.s.ts.page)}}, mins)
+}
+
+// svcRoots reads catalog cat's roots for the reader (§B.5, §B.11.5), as
+// svcList reads a folder.
+func (st *reqState) svcRoots(ctx context.Context, cat string, mins []string) ([]svcItem, error) {
+	return st.svcListing(ctx, cat, "roots", url.Values{}, mins)
+}
+
+// svcListing reads listing op of catalog cat with query q, every page
+// (svcList).
+func (st *reqState) svcListing(ctx context.Context, cat, op string, q url.Values, mins []string) ([]svcItem, error) {
+	folder := q.Get("of")
+	if folder == "" {
+		folder = "(the roots)"
+	}
 	parent := ctx
 	if len(mins) > 0 {
 		q["min"] = mins
@@ -625,9 +820,14 @@ func (st *reqState) svcList(ctx context.Context, cat, folder string, mins []stri
 		ctx, cancel = context.WithTimeout(ctx, st.s.opt.TreeWait)
 		defer cancel()
 	}
-	u, err := url.Parse(st.s.treeURL(cat) + "/" + cat + "/children?" + q.Encode())
+	u, err := url.Parse(st.s.treeURL(cat) + "/" + cat + "/" + op + "?" + q.Encode())
 	if err != nil {
 		return nil, err
+	}
+	tooBig := func() error {
+		e := fail(http.StatusForbidden, "a folder of catalog %s holds more than %d files and folders, more than this server lists in one folder: split it into folders through another tool (its files are opened, written and moved by name all the same)", cat, maxTreePages*st.s.ts.page)
+		e.tooBig = true
+		return e
 	}
 	var out []svcItem
 	cursorAt := "" // the at of the position the page asked for follows
@@ -658,14 +858,18 @@ func (st *reqState) svcList(ctx context.Context, cat, folder string, mins []stri
 			}
 			out, pages = nil, 0
 		}
+		if a.Total != nil && *a.Total > maxTreePages*st.s.ts.page {
+			// Too large to list whole, as total says (§B.5, §H.3): refused
+			// at once, not after the pages that fit.
+			return nil, tooBig()
+		}
 		out = append(out, a.Children...)
+		out = append(out, a.Roots...)
 		if a.Next == "" {
 			return out, nil
 		}
 		if pages++; pages >= maxTreePages {
-			e := fail(http.StatusForbidden, "a folder of catalog %s holds more than %d files and folders, more than this server lists in one folder: split it into folders through another tool (its files are opened, written and moved by name all the same)", cat, maxTreePages*st.s.ts.page)
-			e.tooBig = true
-			return nil, e
+			return nil, tooBig()
 		}
 		// The next page, at the checkpoint of this one (§B.5): its query
 		// is in canonical form, without min.
@@ -754,11 +958,15 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		// as the tree service's refusal, where record would name a 401
 		// the core's.
 		return nil, nil, fail(http.StatusBadGateway, "catalog %s's tree service refused this server's grant (-bearer): %s", cat, msg)
-	case res.StatusCode == http.StatusUnauthorized, res.StatusCode == http.StatusForbidden:
+	case res.StatusCode == http.StatusUnauthorized:
 		// A gateway's 401 is the user's grant refused: the challenge
 		// again, and the token verified again at its next request
 		// (record).
 		return nil, nil, fail(res.StatusCode, "catalog %s's tree service refused the listing: %s", cat, msg)
+	case res.StatusCode == http.StatusForbidden:
+		e := fail(res.StatusCode, "catalog %s's tree service refused the listing: %s", cat, msg)
+		e.svcRefused = true
+		return nil, nil, e
 	case res.StatusCode == http.StatusServiceUnavailable, res.StatusCode == http.StatusTooManyRequests:
 		e := fail(http.StatusServiceUnavailable, "catalog %s's tree service answered %d: %s", cat, res.StatusCode, msg)
 		ra := res.Header.Get("Retry-After")

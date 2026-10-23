@@ -62,6 +62,7 @@ type catGraph struct {
 type tokenView struct {
 	cg *catGraph
 	sd svcDir
+	lk *lookupHit
 }
 
 // view returns what token tk read under k (a catalog, or catalog/folder).
@@ -187,8 +188,8 @@ func notTree(cat, why string) error {
 // namespace document, read with the server's grant in local mode, or
 // without a grant in a gateway, has no usable catalog.files (§H.2).
 // Catalogs whose document can't be read so are left to the requests that
-// open them, which answer why (404). What it reads is kept for grants
-// that list through a tree service and can't read it (treeConf).
+// open them, which answer why (404). What it reads says which flat
+// namespace a tree owns (ownedBy), for tokens that can't read it.
 func (s *Server) Check(ctx context.Context) error {
 	tk := s.local
 	if tk == nil {
@@ -207,8 +208,8 @@ func (s *Server) Check(ctx context.Context) error {
 		case in.files == nil && in.notTree != "":
 			return fmt.Errorf("dav: -catalog %s: %s", cat, in.notTree)
 		case in.files != nil:
-			// For grants that can't read it (treeConf).
-			s.learn(cat, &catConf{files: in.files, trust: in.trust, titled: in.titled})
+			// Which flat namespace it owns (ownedBy).
+			s.learn(cat, &catConf{files: in.files, trust: in.trust, trustKnown: in.trustKnown, titled: in.titled})
 		}
 	}
 	return nil
@@ -298,11 +299,13 @@ func newTreeEntry(n *tree.Node, item *client.Head) treeEntry {
 }
 
 // treeDir is a folder's children as the tree shows them, by name and by
-// nameKey.
+// nameKey; roots: the top level of a tree whose files.root is hidden from
+// the reader, its roots (§B.11.5, §H.3), whose parents it can't see.
 type treeDir struct {
 	entries []treeEntry
 	byName  map[string]int
 	byKey   map[string]int
+	roots   bool
 }
 
 // find returns the child named name, or whose name has name's nameKey
@@ -555,16 +558,44 @@ func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string)
 			return e, exact, nil
 		}, nil)
 	}
+	if !st.writes() {
+		// A read: one lookup of the whole path (§B.5, §H.3), unless its
+		// folders were listed already, or it doesn't resolve so.
+		if r, ok, err := st.lookupPath(ctx, t, segs, c); err != nil || ok {
+			return r, err
+		}
+	}
 	var steps []pathStep
+	depth := 0
 	r, err := st.resolveIn(ctx, t, segs, c, func(ctx context.Context, folder, seg string, _ bool) (*treeEntry, bool, error) {
+		depth++
 		d, err := st.treeDir(ctx, t.ns, folder)
 		var de *davError
 		if errors.As(err, &de) && de.tooBig {
+			// A folder too large to list: the name by lookup (§H.3), else,
+			// one lookup doesn't resolve (a duplicate's number, an escaped
+			// title, a node shown by its name), from the node documents.
+			// Lookup doesn't wait for the user's own writes (?min): while
+			// the tree service is to reach them, the node documents decide.
+			mins, _ := st.p.ts.mins(append([]string{t.ns}, c.trust...), st.s.opt.Now())
+			waiting := len(mins) > 0
+			if !waiting {
+				e, exact, found, lerr := st.lookupEntry(ctx, t.ns, segs[:depth])
+				switch {
+				case lerr != nil:
+					return nil, false, lerr
+				case found:
+					return e, exact, nil
+				}
+			}
 			cg, _, gerr := st.tree(ctx, t.ns)
-			if gerr != nil {
+			if gerr == nil {
+				return st.nodeChild(ctx, cg, t.ns, folder, seg)
+			}
+			if _, _, dup := dupOf(seg); waiting || dup || strings.Contains(seg, "%") {
 				return nil, false, err
 			}
-			return st.nodeChild(ctx, cg, t.ns, folder, seg)
+			return nil, false, nil
 		}
 		if err != nil {
 			return nil, false, err
@@ -604,7 +635,8 @@ func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string)
 }
 
 // pathStep is one name a path's resolution looked up (resolveCatalog):
-// in folder parent, the node found (none: "") and the name it was found
+// in folder parent ("" at the top level from roots, whose parents the
+// reader can't see), the node found (none: "") and the name it was found
 // by, before duplicates were numbered (nodeName), else the name asked
 // for.
 type pathStep struct {
@@ -626,8 +658,12 @@ func (st *reqState) resolveIn(ctx context.Context, t target, segs []string, c ca
 		if err != nil {
 			return t, err
 		}
+		top := i == 0 && st.rootsTop(t.ns, folder)
 		if steps != nil {
 			s := pathStep{parent: folder, name: seg}
+			if top {
+				s.parent = ""
+			}
 			if e != nil {
 				s.node, s.name = e.node.Name, nodeName(e.node)
 			}
@@ -641,7 +677,7 @@ func (st *reqState) resolveIn(ctx context.Context, t target, segs []string, c ca
 			folder = e.node.Name
 			continue
 		}
-		t.parent = folder
+		t.parent, t.hiddenTop = folder, top
 		if e != nil {
 			t.node, t.title, t.listedAs, t.otherCase = e.node.Name, e.name, nodeName(e.node), !exact
 			if e.node.Kind == kindFolder {
@@ -662,7 +698,33 @@ func (st *reqState) resolveIn(ctx context.Context, t target, segs []string, c ca
 		return t, nil
 	}
 	t.kind, t.title = kNewNode, title
+	t.hiddenTop = len(segs) == 1 && st.rootsTop(t.ns, t.parent)
 	return t, nil
+}
+
+// rootsTop reports whether folder is the files.root of catalog cat whose
+// top level the request listed as its roots, files.root being hidden
+// from the reader (serviceDir, §B.11.5).
+func (st *reqState) rootsTop(cat, folder string) bool {
+	d := st.dirs[cat+"/"+folder]
+	return d != nil && d.roots
+}
+
+// topWrite refuses a write that changes the top level of a tree whose
+// files.root is hidden from the reader, that top level its roots
+// (hiddenTop, §B.11.5, §H.3): a new file or folder there would go into
+// files.root, which the catalog answers as a folder not in it (404,
+// §B.11.4); a node there has parents hidden from the reader, which a
+// grant would name, so only catalog-admins move, rename, unplace or
+// delete it (403, §B.11.4). A file's content is edited there as anywhere.
+func topWrite(t target) error {
+	switch {
+	case !t.hiddenTop:
+		return nil
+	case t.kind == kNewNode:
+		return fail(http.StatusNotFound, "%s can't be made: the top level of catalog %s shown to you is the folders and files you can see whose parents you can't (§B.11.5), and a new one there would go into its files.root, %s, which is hidden from you (§B.11.4)", t.path, t.ns, t.parent)
+	}
+	return fail(http.StatusForbidden, "%s is at the top level of catalog %s shown to you, whose parents you can't see (§B.11.5): only catalog-admins move, rename, unplace or delete it (§B.11.4)", t.path, t.ns)
 }
 
 // writes reports whether the request writes to the core where its paths
@@ -681,10 +743,17 @@ func (st *reqState) writes() bool {
 // in its folder, by the name it was found by (nameKey), and, where none
 // was, no node in the folder whose name compares equal to the one asked
 // for (one hidden from the token, or dangling, is the node documents'
-// to rule out).
+// to rule out). At a top level from roots (parent ""), whose parents
+// the token can't see, a node is checked for its name only.
 func (st *reqState) agrees(cg *catGraph, steps []pathStep) bool {
 	for _, s := range steps {
 		key := st.s.nameKey(s.name)
+		if s.parent == "" {
+			if n := cg.g.Node(s.node); s.node != "" && (!listed(n) || st.s.nameKey(nodeName(n)) != key) {
+				return false
+			}
+			continue
+		}
 		if s.node == "" {
 			for _, n := range cg.children(s.parent) {
 				if st.s.nameKey(nodeName(n)) == key {
@@ -798,6 +867,9 @@ func (st *reqState) mkFolder(ctx context.Context, t target) error {
 
 // makeFolder is mkFolder, returning the new folder node's name.
 func (st *reqState) makeFolder(ctx context.Context, t target) (string, error) {
+	if err := topWrite(t); err != nil {
+		return "", err
+	}
 	cg, f, err := st.writeTree(ctx, t.ns)
 	if err != nil {
 		return "", err
@@ -823,6 +895,9 @@ func (st *reqState) newFile(ctx context.Context, t target, raw bool, v any, body
 	if rev, exact, done, err := st.restoreFile(ctx, t, raw, v, body); done {
 		return rev, exact, err
 	}
+	if err := topWrite(t); err != nil {
+		return "", false, err
+	}
 	// A new file's kind is its name's and content's (§H.1), whatever the
 	// file deleted at its path was.
 	raw, v = newKind(t.title, body)
@@ -830,7 +905,11 @@ func (st *reqState) newFile(ctx context.Context, t target, raw bool, v any, body
 	if err != nil {
 		return "", false, err
 	}
-	if !slices.Contains(st.s.nsInfo(ctx, st.tk, t.ns).trust, f.ns) {
+	c, err := st.treeConf(ctx, t.ns)
+	if err != nil {
+		return "", false, err
+	}
+	if !c.trusts(f.ns) {
 		return "", false, fail(http.StatusForbidden, "catalog %s doesn't trust %s, the namespace its files.ns names for new files (§H.2, §H.4): no file is created", t.ns, f.ns)
 	}
 	if st.s.nsInfo(ctx, st.tk, f.ns).sealed {
@@ -1003,11 +1082,10 @@ func (st *reqState) writable(ctx context.Context, t target) error {
 	if st.s.cats[t.docNS] || t.docNS == t.ns {
 		return fail(http.StatusForbidden, "%s is a placement of catalog node %s/%s; its file isn't written here (folders are made, renamed, moved and deleted as directories)", t.path, t.docNS, t.docName)
 	}
-	trust := st.s.nsInfo(ctx, st.tk, t.ns).trust
-	if c, err := st.treeConf(ctx, t.ns); err == nil {
-		trust = c.trust
+	if st.s.flat[t.docNS] {
+		return nil
 	}
-	if st.s.flat[t.docNS] || slices.Contains(trust, t.docNS) {
+	if c, err := st.treeConf(ctx, t.ns); err == nil && c.trusts(t.docNS) {
 		return nil
 	}
 	return fail(http.StatusForbidden, "catalog %s doesn't trust namespace %s (§B.3), and it isn't served here (-ns): %s, a placement of %s/%s, isn't written through the catalog", t.ns, t.docNS, t.path, t.docNS, t.docName)
@@ -1066,6 +1144,9 @@ func (st *reqState) createNode(ctx context.Context, cat, name string, doc map[st
 // (unlink). A principal's DELETE is remembered a while, so its write
 // of the path restores the file (§H.6).
 func (st *reqState) deleteFile(ctx context.Context, t target, ifMatch, successor string) error {
+	if err := topWrite(t); err != nil {
+		return err
+	}
 	cg, f, err := st.writeTree(ctx, t.ns)
 	if err != nil {
 		return err
@@ -1189,6 +1270,9 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 // may be. A node with several parents (a DAG) is unlinked from this
 // folder only (unlink). The scope's scratch files in it go with it.
 func (st *reqState) deleteFolder(ctx context.Context, t target) error {
+	if err := topWrite(t); err != nil {
+		return err
+	}
 	cg, _, err := st.writeTree(ctx, t.ns)
 	if err != nil {
 		return err
@@ -1326,6 +1410,12 @@ func (st *reqState) dangling(ctx context.Context, cg *catGraph, n *tree.Node) bo
 // second parent. The scope's scratch files in a moved folder move with
 // it.
 func (st *reqState) moveNode(ctx context.Context, src, dst target) error {
+	if err := topWrite(src); err != nil {
+		return err
+	}
+	if err := topWrite(dst); err != nil && dst.kind == kNewNode {
+		return err
+	}
 	cg, _, err := st.writeTree(ctx, src.ns)
 	if err != nil {
 		return err

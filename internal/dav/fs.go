@@ -69,6 +69,10 @@ type target struct {
 	// otherCase: a kFolder or kPlacement named by another case of its
 	// name, which compares equal (nameKey) but isn't it
 	otherCase bool
+	// hiddenTop: a name at the top level of a tree whose files.root is
+	// hidden from the reader, that top level its roots (§B.11.5, §H.3;
+	// topWrite)
+	hiddenTop bool
 }
 
 func (t target) isDir() bool {
