@@ -137,14 +137,18 @@ func TestMergeReplacingAgainstDeletedRowsV073(t *testing.T) {
 // TestMergeWideningElsewhereV073 (TC-46, carry-over): no widening covers
 // every node a batch's changes reach, not only moved subtrees: a new
 // folder that a dangling parents entry already names gives that node its
-// roles. The refusal to someone who doesn't see the widened node names
-// only the batch's change, not the node (§B.11, §B.11.5).
+// roles, and deleting a node of a cycle gives the others theirs (§B.11.2:
+// a cyclic node contributes nothing). The refusal to someone who doesn't
+// see the widened node names only the batch's change, not the node
+// (§B.11, §B.11.5).
 func TestMergeWideningElsewhereV073(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.doc("matches", "h", map[string]any{"title": "h"})
 	w.doc("cat", "matches.h", map[string]any{"parents": parents("ghost")}) // dangling: no role, hidden from all
+	w.doc("cat", "c1", map[string]any{"title": "c1", "parents": parents("c2"), "$access": acc("group:match-desk", "desk")})
+	w.doc("cat", "c2", map[string]any{"title": "c2", "parents": parents("c1"), "$access": acc("group:fan-club", "desk")})
 	w.start()
 	w.caughtUp()
 	ghost := map[string]any{"resource": "ghost", "ifNoneMatch": "*",
@@ -155,6 +159,11 @@ func TestMergeWideningElsewhereV073(t *testing.T) {
 	}
 	if r = w.mergeAsk(w.caller("user:chief", "catalog-admins"), "", ghost); !adminDryRun(r, "user:chief") {
 		t.Fatalf("the same, approved by an admin: %d %v", r.status, r.body)
+	}
+	// Without c1, c2 is no longer cyclic, and its own fan-club desk counts.
+	unc := map[string]any{"resource": "c1", "ifMatch": w.catHead("c1"), "steps": []any{"delete"}}
+	if r = w.mergeAsk(w.caller("user:chief", "catalog-admins"), "", unc); !adminDryRun(r, "user:chief") {
+		t.Fatalf("deleting a node of a cycle, approved by an admin: %d %v", r.status, r.body)
 	}
 }
 

@@ -719,10 +719,11 @@ func (s *Service) IssueMerge(ctx context.Context, v, av, adm *grant.Verified, ba
 // widening, §F.8), in batch order: at a node the graph has, for every
 // subject, its roles after the batch must be a subset of those before,
 // both computed as for live items (§B.11.2), so a deleted item's
-// placement counts too. Only a changed node and the nodes below it, along
-// every edge of the graph before or after, can change: that covers moves,
-// and anything else that changes a walk up, such as a new folder a
-// dangling parents entry already names. New nodes are judged by the place
+// placement counts too. Only a node whose existence, parents or $access
+// the batch changes, and the nodes below it along every edge of the graph
+// before or after, can change: that covers moves, and anything else that
+// changes a walk up, such as a new folder a dangling parents entry already
+// names, or a deleted node that made others cyclic. New nodes are judged by the place
 // checks instead (an implicit placement collects nothing, so an explicit
 // one that replaces it is new). A placement the batch places again is
 // compared with its deleted placement's rows, none if the service holds
@@ -749,6 +750,11 @@ func (s *Service) mergeWidening(g, after *tree.Graph, items []*mergeItem, incs m
 		}
 	}
 	for _, mi := range items {
+		if mi.beforeLive && mi.afterLive && !mi.accessChanged() && sameParents(parentsOf(g.Catalog, mi.before), parentsOf(g.Catalog, mi.after)) {
+			// An edit that keeps the node's parents and $access changes
+			// no walk up (§B.11.2).
+			continue
+		}
 		below := g.Descendants([]string{mi.name})
 		for d := range after.Descendants([]string{mi.name}) {
 			below[d] = true
