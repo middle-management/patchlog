@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	plclient "github.com/middle-management/patchlog/internal/client"
@@ -119,6 +121,93 @@ func TestV073RemoteFollowsRaise(t *testing.T) {
 	}
 }
 
+// CIS-32 (ENC-46, GB-38): on a server without a key store, which lacks
+// every level, a remote branch whose base is raised to sealed after at
+// answers 502 upstream, naming the base's deployment, for every resource
+// the base had at at, read through or written on since and not purged
+// since; so does a local branch reading through it. Writes other than
+// purges get the same 502 at step 2.1, before the retry lookup; a purge
+// works, and a resource purged since is 410 (§1, §6.2, §12.1, CONFORMANCE
+// CONF-2, Levels 36, 38, 40).
+func TestV073RemoteUpstreamLevel(t *testing.T) {
+	t.Parallel()
+	a, b, _ := pair(t, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning}, []envOpt{withEncTuning})
+	a.mkNS("m", map[string]any{"read": "public"})
+	x1 := a.create("m", "x", map[string]any{"v": 1.0})
+	y1 := a.create("m", "y", map[string]any{"v": 2.0})
+	z1 := a.create("m", "z", map[string]any{"v": 3.0})
+	gone1 := a.create("m", "gone", map[string]any{"v": 4.0})
+	expect(t, b.mkRemote("r", remoteGenesis("m", a.nsHead("m"), nil)), 201)
+	// Written on since: x; B's own: mine; a local branch reading through.
+	x2 := b.appendRev("r", "x", x1, ops(op("replace", "/v", 10.0)))
+	mine := b.create("r", "mine", map[string]any{"own": true})
+	expect(t, b.branch("r", map[string]any{"name": "rx"}, "alice"), 201)
+	zx := b.appendRev("rx", "z", z1, ops(op("replace", "/v", 30.0)))
+	expect(t, b.purge("r", "gone", gone1, "admin"), 204)
+	expect(t, b.get("/r/r/y"), 302)
+
+	expect(t, a.patchNS("m", ops(op("add", "/encryption", map[string]any{"level": "sealed"})), ""), 201)
+	if err := syncRemotes(t, b); err != nil {
+		t.Fatal(err)
+	}
+	upstream := func(r *resp, what string) {
+		t.Helper()
+		if r.Code != 502 || r.Str("code") != "upstream" || r.Str("origin") != originA {
+			t.Errorf("%s: %d %s, want 502 upstream with origin", what, r.Code, r.Body)
+		}
+	}
+	for _, p := range []string{
+		"/r/r/y", "/r/r/y/rev/" + y1, "/r/r/y/rev/" + y1 + "/log",
+		"/r/r/x", "/r/r/x/rev/" + x2, "/r/r/x/rev/" + x1,
+		"/r/rx/y", "/r/rx/x/rev/" + x2, "/r/rx/z/rev/" + zx, "/r/r/z",
+	} {
+		upstream(b.get(p), p)
+	}
+	// B's own resources, and purged ones, answer as before.
+	expect(t, b.get("/r/r/mine"), 302)
+	expect(t, b.get("/r/r/mine/rev/"+mine), 200)
+	expect(t, b.get("/r/r/gone"), 410)
+	expect(t, b.get("/r/rx/gone"), 410)
+
+	// Writes: the 502 comes at step 2.1, before the retry lookup, which
+	// would otherwise answer this resent append 200.
+	upstream(b.write("PATCH", "r", "x", x1, ops(op("replace", "/v", 10.0))), "retried append")
+	upstream(b.write("PATCH", "r", "y", y1, ops(op("test", "/v", 2.0))), "probing append")
+	upstream(b.write("DELETE", "r", "y", y1, nil), "delete")
+	upstream(b.write("PATCH", "rx", "z", zx, ops(op("replace", "/v", 31.0))), "append in the local branch")
+	r := b.do(req{method: "POST", path: "/ns/r/batch", author: "alice", body: map[string]any{"items": []any{
+		map[string]any{"resource": "mine", "ifMatch": mine, "steps": []any{ops(op("add", "/w", 1.0))}},
+		map[string]any{"resource": "y", "ifMatch": y1, "steps": []any{ops(op("add", "/w", 1.0))}},
+	}}})
+	expectCode(t, r, 502, "batch")
+	if items, _ := r.Obj()["items"].([]any); len(items) != 1 || items[0].(map[string]any)["code"] != "upstream" || items[0].(map[string]any)["index"] != 1.0 {
+		t.Fatalf("batch items %s", r.Body)
+	}
+	// B's own resources take writes.
+	b.appendRev("r", "mine", mine, ops(op("add", "/w", 1.0)))
+	// A purge works, and the resource is 410 from then on.
+	expect(t, b.purge("r", "y", y1, "admin"), 204)
+	expect(t, b.get("/r/r/y"), 410)
+	expect(t, b.get("/r/rx/y"), 410)
+
+	ctx := context.Background()
+	ls, err := b.e.RemoteLevels(ctx, "r")
+	if err != nil || len(ls) != 1 || !ls[0].Lacks || ls[0].Level != "sealed" {
+		t.Fatalf("levels %+v %v", ls, err)
+	}
+	ns, _ := b.e.RemoteNotices(ctx, "r")
+	if len(ns) != 1 || ns[0].Kind != "config" || ns[0].Applied {
+		t.Fatalf("notices %+v", ns)
+	}
+	// Following again records nothing new.
+	if err := syncRemotes(t, b); err != nil {
+		t.Fatal(err)
+	}
+	if ns2, _ := b.e.RemoteNotices(ctx, "r"); len(ns2) != 1 {
+		t.Fatalf("notices after a second sync %+v", ns2)
+	}
+}
+
 // proxyA serves A through a proxy: intercept answers a request itself when
 // it returns true; rewrite, if set, rewrites the body of answers whose
 // path is rewritePath.
@@ -219,4 +308,38 @@ func TestV073RemoteE2ERaiseNeedsRebase(t *testing.T) {
 		t.Fatal("raised to e2e")
 	}
 	expect(t, b.get("/r/r/x/rev/"+x), 200)
+}
+
+// CIS-32, ENC-45: a base whose log B can't open, because A seals it now and
+// gives B no keys, is still seen to be sealed (its documents are served
+// sealed): on a server without a key store the remote branch answers 502
+// upstream, and following reports that the log can't be read.
+func TestV073RemoteSealedLogUnreadable(t *testing.T) {
+	t.Parallel()
+	a, b, rt := pair(t, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning}, nil)
+	a.mkNS("m", map[string]any{"read": "public"})
+	a.create("m", "x", map[string]any{"v": 1.0})
+	expect(t, b.mkRemote("r", remoteGenesis("m", a.nsHead("m"), nil)), 201)
+	rt.set(proxyA(t, a, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/keys") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(403)
+			w.Write([]byte(`{"code":"forbidden"}`))
+			return true
+		}
+		return false
+	}, "", nil), "")
+	expect(t, a.patchNS("m", ops(op("add", "/encryption", map[string]any{"level": "sealed"})), ""), 201)
+	if err := syncRemotes(t, b); err == nil {
+		t.Fatal("following a log B can't open succeeded")
+	}
+	ls, _ := b.e.RemoteLevels(context.Background(), "r")
+	if len(ls) != 1 || ls[0].Level != "sealed" || !ls[0].Lacks {
+		t.Fatalf("levels %+v", ls)
+	}
+	r := b.get("/r/r/x")
+	expectCode(t, r, 502, "upstream")
+	if !bytes.Contains(r.Body, []byte(originA)) {
+		t.Fatalf("502 without origin: %s", r.Body)
+	}
 }

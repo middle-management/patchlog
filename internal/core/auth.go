@@ -447,13 +447,22 @@ func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 // doesn't exist, except that public namespaces ignore it and answer as to
 // an unauthenticated request; other refusals, a key-scope failure
 // included, answer 404 rather than 403, so that neither the resource's
-// nor the namespace's existence is revealed (§7, §C.2 item 1).
+// nor the namespace's existence is revealed (§7, §C.2 item 1). Past the
+// check, a resource whose source was raised to a level this server lacks
+// answers 502 upstream (upstreamRefusal, §1).
 func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
+	var a *actor
+	var err *Error
 	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
-		return t.edgeReader(n, cred.Edge, resource)
+		a, err = t.edgeReader(n, cred.Edge, resource)
+	} else {
+		a, err = t.readerCheckURL(n, cred, func(a *actor) bool { return t.canRead(n, cfg, a, resource) }, readResource)
 	}
-	return t.readerCheckURL(n, cred, func(a *actor) bool { return t.canRead(n, cfg, a, resource) }, readResource)
+	if err == nil && resource != "" {
+		err = t.upstreamRefusal(n, resource)
+	}
+	return a, err
 }
 
 // nsReader is reader for /ns/{ns} and the URLs under it, but the gestures
