@@ -271,11 +271,13 @@ func (p *Plan) checkIDs(res *client.BatchResult) error {
 }
 
 // DryRun submits the batch with ?dry-run=1 (§7.5) and returns the per-item
-// report. A failing item is an *client.APIError with code "batch". An
-// explicit config change that fails after its step 1 is reported in a 200
-// with the items judged against the current configuration; DryRun returns
-// it as the *client.APIError Apply would fail with. An empty plan returns
-// (nil, nil).
+// report. A failing item is an *client.APIError with code "batch" listing
+// the failing items, whatever their class: the server reports them in its
+// 200 (a 412 after the target moved, say), and DryRun returns the report
+// with the error. An explicit config change that fails after its step 1 is
+// reported in a 200 with the items judged against the current
+// configuration; DryRun returns it as the *client.APIError Apply would
+// fail with. An empty plan returns (nil, nil).
 func (p *Plan) DryRun(ctx context.Context) (*client.BatchResult, error) {
 	if err := p.sealItems(ctx); err != nil {
 		return nil, err
@@ -302,7 +304,32 @@ func (p *Plan) DryRun(ctx context.Context) (*client.BatchResult, error) {
 	if ce := res.ConfigError(); ce != nil {
 		return res, ce
 	}
+	if fe := failedItems(p.Target, res); fe != nil {
+		return res, fe
+	}
 	return res, p.checkIDs(res)
+}
+
+// failedItems is a dry run's report of failing items (status 300 or more,
+// §7.5) as the *client.APIError with code "batch" that a submit answers
+// with, its status the first failing item's, or nil when every item
+// passes.
+func failedItems(target string, res *client.BatchResult) *client.APIError {
+	var failed []any
+	status := 0
+	for _, it := range res.Items {
+		if st, _ := it.Raw["status"].(float64); st >= 300 {
+			if status == 0 {
+				status = int(st)
+			}
+			failed = append(failed, it.Raw)
+		}
+	}
+	if failed == nil {
+		return nil
+	}
+	return &client.APIError{Status: status, Code: "batch", Method: "POST", Path: "/ns/" + target + "/batch",
+		Body: map[string]any{"code": "batch", "message": fmt.Sprintf("the dry run reports %d failing item(s)", len(failed)), "items": failed}}
 }
 
 // Result is the outcome of Apply.
