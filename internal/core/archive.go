@@ -76,6 +76,10 @@ type ArchiveEntry struct {
 	Author, Created  string
 	Signature        string
 	Gesture, Undoes  string // §7.2, "" if none
+	// Via is the delegation chain of the grant the entry was written
+	// under, its delegatees in order (§7.1, §C.1), nil when there are
+	// none: archives carry the authorship members (§8.6, §G.4.1).
+	Via []string
 	// Grant is the id of the grant the entry was written under (§C.3),
 	// "" if none or if no grant line carries it. Its grant line (GrantLine)
 	// comes before the first entry that names it (§8.6, §G.4.1).
@@ -215,7 +219,7 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 					return fmt.Errorf("revision %s has no patch set to archive", le.ID)
 				}
 				ae := ArchiveEntry{ID: le.ID, Parent: le.Parent, Kind: le.Kind, Patches: le.Patches,
-					Author: le.Author, Created: le.Created, Signature: le.Signature, Gesture: le.Gesture, Undoes: le.Undoes}
+					Author: le.Author, Created: le.Created, Signature: le.Signature, Gesture: le.Gesture, Undoes: le.Undoes, Via: le.Via}
 				if r.grantID != nil {
 					// The grant line comes before the first entry that names
 					// the grant (§8.6): archives carry them with the authors.

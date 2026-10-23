@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/middle-management/patchlog/internal/archive"
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -144,5 +146,56 @@ func TestV073EncryptedArchiveIsSealedBundle(t *testing.T) {
 				t.Fatalf("purged resource's archive key: %v", err)
 			}
 		})
+	}
+}
+
+// P34, MF-44 (§8.6, §G.4.1, §7.1): archives are written with authors, so
+// their history lines carry the entry's authorship members, via included:
+// a revision written under a narrowed grant names its delegatees, and one
+// written under the root grant carries none. via isn't hashed: the
+// archive verifies, ids recomputed.
+func TestV073ArchiveCarriesVia(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	f := newAuthFixture(t, nil, withArchive(t, dir), withoutRetentionLoop)
+	e := f.tenv
+	root, err := grant.Mint(map[string]any{"kid": "issuer", "sub": "user:w", "ns": []any{"sec"}, "can": []any{"read", "create", "append"},
+		"exp": e.clock.Now().Add(time.Hour).Format(time.RFC3339)}, f.issuer.priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nar, err := root.Narrow(map[string]any{"via": "svc:bot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revs := []string{e.create("sec", "a", map[string]any{"n": 0.0}, nar.Encode())}
+	revs = append(revs, e.appendRev("sec", "a", revs[0], ops(op("replace", "/n", 1.0)), root.Encode()))
+	revs = append(revs, e.appendRev("sec", "a", revs[1], ops(op("replace", "/n", 2.0)), root.Encode()))
+	e.clock.Advance(time.Hour)
+	adminG := e.grant(f.admin, "user:root", []string{"sec"}, allVerbs)
+	expect(t, e.prune("sec", "a", map[string]any{"horizon": revs[2]}, adminG), 200)
+	path := filepath.Join(dir, "sec", "a", revs[2]+".jsonl")
+	if s := verifyArchive(t, path); !s.Header.Authors || s.Lines != 3 {
+		t.Fatalf("archive: %+v", s)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vias := map[string]any{}
+	for _, l := range bytes.Split(bytes.TrimSpace(raw), []byte("\n"))[1:] {
+		var m map[string]any
+		if err := json.Unmarshal(l, &m); err != nil {
+			t.Fatal(err)
+		}
+		if id, ok := m["id"].(string); ok {
+			vias[id] = m["via"]
+		}
+	}
+	if v, _ := vias[revs[0]].([]any); len(v) != 1 || v[0] != "svc:bot" {
+		t.Fatalf("the delegated revision's line: via %v", vias[revs[0]])
+	}
+	if v, has := vias[revs[1]]; has && v != nil {
+		t.Fatalf("the root grant's revision's line: via %v", v)
 	}
 }
