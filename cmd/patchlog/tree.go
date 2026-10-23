@@ -30,7 +30,7 @@ import (
 //	              [-self-placing] [-access -key SEED -kid KID [-ttl 15m] [-admin-group catalog-admins]
 //	              [-merge-key SEED -merge-kid KID -merge-service SUB [-merge-ttl 5m]]
 //	              [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-origin-edge-grant-kid KID[,KID]]... [-exchange-rate RATE,BURST]]
-//	              [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]]
+//	              [-enc-key B64URL | -enc-key-file PATH] [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]]
 //
 // The service follows the catalog namespace and every namespace in its
 // catalog.trust. -bearer is its own grant, which needs read on all of them.
@@ -77,8 +77,10 @@ import (
 // core's.
 //
 // Encrypted namespaces (Addendum E) work as for patchlog index: -enc-key is
-// the service's X25519 private key; listings of a sealed or e2e catalog are
-// served sealed, and /_status reports what is skipped.
+// the service's X25519 private key, -keyring-sender and -trusted-sender
+// name the keyring admins it opens and trusts (§E.3.2); listings of a
+// sealed or e2e catalog are served sealed, and /_status reports what is
+// skipped.
 func treeCmd(args []string) {
 	fs := flag.NewFlagSet("tree", flag.ExitOnError)
 	api := fs.String("api", "http://localhost:8080", "base URL of the patch-log API")
@@ -104,6 +106,7 @@ func treeCmd(args []string) {
 	sse := fs.Bool("sse", false, "follow by server-sent events instead of long-poll")
 	encKey := fs.String("enc-key", "", "the service's X25519 private key (base64url), for sealed and e2e namespaces (Addendum E)")
 	encKeyFile := fs.String("enc-key-file", "", "file holding -enc-key")
+	keyring := addKeyringFlags(fs)
 	var purgeURLs multi
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
@@ -134,6 +137,11 @@ func treeCmd(args []string) {
 		copts = append(copts, client.WithAuthor(*author))
 	}
 	recipient := recipientKey("tree", *encKey, *encKeyFile)
+	kopts, err := keyring.options()
+	if err != nil {
+		log.Fatalf("tree: %v", err)
+	}
+	copts = append(copts, kopts...)
 	copts = append(copts, client.WithKeys(client.NewKeys(recipient)))
 	c, err := client.New(*api, copts...)
 	if err != nil {

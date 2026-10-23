@@ -150,7 +150,9 @@ func (k *Keys) Forget(ns string) {
 // EpochKey returns K_e of epoch epoch of ns: from POST /ns/{ns}/keys with
 // the service's grant (which must read the whole namespace: per-resource
 // keys can't seal a view), unwrapped with the recipient key if wrapped; for
-// an e2e namespace, relayed from or read in the keyring.
+// an e2e namespace, relayed from or read in the keyring, from a keyring
+// sender the service trusts to distribute keys (client.E2E.SealKey,
+// §E.3.2): it seals views and hands out K_r under it.
 func (k *Keys) EpochKey(ctx context.Context, ns string, epoch int) ([]byte, error) {
 	kid := seal.Kid(ns, epoch)
 	k.mu.Lock()
@@ -165,7 +167,7 @@ func (k *Keys) EpochKey(ctx context.Context, ns string, epoch int) ([]byte, erro
 			return nil, fmt.Errorf("%w: %s (no keyring recipient key)", client.ErrNoKeys, kid)
 		}
 		var err error
-		if key, err = k.e2e.Key(ctx, kid); err != nil {
+		if key, err = k.e2e.SealKey(ctx, kid); err != nil {
 			return nil, err
 		}
 	} else {

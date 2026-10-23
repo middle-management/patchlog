@@ -6,8 +6,9 @@ package main
 //	patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}  (cmd/patchlog/release.go)
 //	patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
 //	        [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]...
-//	        [-source-grant G]... [-json]
-//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]... [-json]
+//	        [-source-grant G]... [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
+//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]...
+//	        [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
 //	patchlog janitor -api URL -ns base1,base2 [-release LINK]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
 
 import (
@@ -34,8 +35,9 @@ const mergeUsage = `usage:
   patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}   (§F.9; see patchlog merge release)
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
           [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]...
-          [-source-grant G]... [-json]
-  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]... [-json]
+          [-source-grant G]... [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
+  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]...
+          [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
   patchlog janitor -api URL -ns base1,base2 [-release /r/{ns}/{release}]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]`
 
 // toolFlags are the connection flags shared by the Addendum F tools.
@@ -43,6 +45,7 @@ type toolFlags struct {
 	api, bearer, author *string
 	asJSON, dev         *bool
 	signKey             *string
+	keyring             *keyringFlags
 }
 
 // signKeyEnv names the environment variable that sets -sign-key.
@@ -58,6 +61,7 @@ func addToolFlags(fs *flag.FlagSet) toolFlags {
 		asJSON:  fs.Bool("json", false, "print JSON"),
 		signKey: fs.String("sign-key", os.Getenv(signKeyEnv), signKeyHelp),
 		dev:     fs.Bool("dev", false, "ignored, kept for scripts: whether the deployment runs with authentication disabled is read from GET / (§1, §7)"),
+		keyring: addKeyringFlags(fs),
 	}
 }
 
@@ -81,7 +85,11 @@ func (tf toolFlags) client() *client.Client {
 	if *tf.author != "" {
 		opts = append(opts, client.WithAuthor(*tf.author))
 	}
-	c, err := client.New(*tf.api, opts...)
+	kopts, err := tf.keyring.options()
+	if err != nil {
+		toolFatal(err)
+	}
+	c, err := client.New(*tf.api, append(opts, kopts...)...)
 	if err != nil {
 		toolFatal(err)
 	}

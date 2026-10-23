@@ -24,7 +24,7 @@ import (
 //
 //	patchlog index [-api http://localhost:8080] [-db index.db] [-addr :8081] -ns matches,docs
 //	               [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false]
-//	               [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]]
+//	               [-enc-key B64URL | -enc-key-file PATH] [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]]
 //
 // Results at /{ns}/at/{ns_id}, or /{ns}/g/{gs}/at/{ns_id} for a private
 // namespace (§A.4), are immutable and tagged idx:{ns} and r:{ns}/{name} per
@@ -39,7 +39,10 @@ import (
 // POST /ns/{ns}/keys with -bearer's grant; -enc-key is the service's X25519
 // private key (base64url scalar), which unwraps keys wrapped to the grant's
 // enc and reads e2e namespaces whose keyring names its public key (logged
-// at start). Results over them are served sealed; see /_status for skipped
+// at start). A keyring entry opens only with the public key of the admin
+// that wrapped it: -keyring-sender names them, and -trusted-sender those
+// the service trusts to distribute the keys it seals views under (§E.3.2).
+// Results over them are served sealed; see /_status for skipped
 // namespaces.
 func indexCmd(args []string) {
 	fs := flag.NewFlagSet("index", flag.ExitOnError)
@@ -57,6 +60,7 @@ func indexCmd(args []string) {
 	fetchConc := fs.Int("fetch-concurrency", 8, "how many documents the index fetches at once while applying the log, across all namespaces")
 	encKey := fs.String("enc-key", "", "the service's X25519 private key (base64url), for sealed and e2e namespaces (Addendum E)")
 	encKeyFile := fs.String("enc-key-file", "", "file holding -enc-key")
+	keyring := addKeyringFlags(fs)
 	var purgeURLs multi
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
@@ -86,6 +90,11 @@ func indexCmd(args []string) {
 		copts = append(copts, client.WithAuthor(*author))
 	}
 	recipient := recipientKey("index", *encKey, *encKeyFile)
+	kopts, err := keyring.options()
+	if err != nil {
+		log.Fatalf("index: %v", err)
+	}
+	copts = append(copts, kopts...)
 	// Keep a connection for each fetch and each namespace's long-poll, so
 	// they are reused from one page to the next.
 	copts = append(copts, client.WithKeys(client.NewKeys(recipient)), client.WithIdleConns(*fetchConc+len(nss)))
