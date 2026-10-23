@@ -1691,8 +1691,8 @@ func (e *Engine) RemoteNotices(ctx context.Context, ns string) ([]RemoteNotice, 
 }
 
 // SyncRemotes follows every live remote branch's base once: purges in its
-// log since the last check are applied (or recorded as notices, with
-// IgnorePurges), and with Register, registrations are made or renewed.
+// log since the last check are applied, and with Register, registrations
+// are made or renewed.
 func (e *Engine) SyncRemotes(ctx context.Context) error {
 	var bases []*remoteBase
 	if err := e.read(ctx, func(t *tx) error {
@@ -1725,9 +1725,9 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 
 // followRemote applies the purges in a base's log after the checkpoint
 // (§G.3: on purge or purge-ns, §8.3 applies locally to the branch's own
-// chains for that name, its own branches and its cache tags). A sealed
-// base's purge arrives as the 410 purged of its log, whose head is the
-// purge-ns entry (§8.5).
+// chains for that name, its own branches and its cache tags); a deployment
+// that sees a purge always applies it (§4). A sealed base's purge arrives
+// as the 410 purged of its log, whose head is the purge-ns entry (§8.5).
 func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	c, _, err := e.remoteClient(b.origin)
 	if err != nil {
@@ -1750,7 +1750,6 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	follow := !e.opt.Remote.IgnorePurges
 	return e.update(ctx, func(t *tx) error {
 		// The branch's lock first: the checkpoint is read as of it.
 		bn := t.nsByIDLocked(b.branch, lockExclusive)
@@ -1787,12 +1786,12 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 			if en.Kind == "purge" {
 				res = en.Resource
 			}
-			applied := follow && !bn.purged
+			// A purged branch has nothing left to purge: only recorded.
+			applied := !bn.purged
 			_, err := t.Exec(`INSERT INTO remote_notices (branch, id, kind, resource, applied, created) VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
 				bn.id, en.ID, en.Kind, res, applied, t.now.UnixMilli())
 			t.must(err)
 			if !applied {
-				log.Printf("remote branch %s: %s %v in %s/ns/%s recorded as a notice, not applied", bn.name, en.Kind, names, b.origin, b.ns)
 				continue
 			}
 			for _, name := range names {
