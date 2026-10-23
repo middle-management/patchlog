@@ -51,8 +51,9 @@
 // don't matter for the catalog's API: it is only proof of identity.
 //
 // Decisions (POST /grants, POST /read-grants, POST /merge-grants) are
-// taken at one checkpoint, which answers carry beside each grant as
-// checkpoint, { ns: ns_id }: the ns_ids of the catalog, of each named
+// taken at one checkpoint, which answers carry beside the grant, and a
+// /read-grants answer once beside all its items, as checkpoint,
+// { ns: ns_id }: the ns_ids of the catalog, of each named
 // item's namespace there, and of the content namespaces whose roles or
 // includes the decision read (§B.11.4, checkpointAt), which are all a
 // decision depends on, not the combined checkpoint of listings (§B.5).
