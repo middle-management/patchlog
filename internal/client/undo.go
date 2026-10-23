@@ -1139,7 +1139,8 @@ func fold(start undoState, log []LogEntry, flags []string, firstGesture int) ([]
 			fe.restore = st.deleted
 			st.deleted = false
 			if i < firstGesture {
-				nd, _, err := patch.Apply(st.doc, st.exists, ops, patch.Options{ResourceEnvelope: true})
+				// A create applies to the document null (§6.2 step 3).
+				nd, _, err := patch.Apply(st.doc, true, ops, patch.Options{ResourceEnvelope: true})
 				if err != nil {
 					return nil, st, fmt.Errorf("client: entry %s: %w", e.ID, err)
 				}
@@ -1148,7 +1149,7 @@ func fold(start undoState, log []LogEntry, flags []string, firstGesture int) ([]
 			}
 			for j, op := range ops {
 				pre := st.doc
-				nd, ws, err := patch.Apply(st.doc, st.exists, []patch.Op{op}, patch.Options{ResourceEnvelope: true})
+				nd, ws, err := patch.Apply(st.doc, true, []patch.Op{op}, patch.Options{ResourceEnvelope: true})
 				if err != nil {
 					return nil, st, fmt.Errorf("client: entry %s op %d: %w", e.ID, j, err)
 				}
@@ -1453,7 +1454,7 @@ func invertRevision(fe *foldedEntry, st *undoState) ([]any, *UndoConflict) {
 		ops, err := patch.Parse([]any{op})
 		if err == nil {
 			var nd any
-			nd, _, err = patch.Apply(st.doc, st.exists, ops, patch.Options{})
+			nd, _, err = patch.Apply(st.doc, true, ops, patch.Options{})
 			if err == nil {
 				st.doc = nd
 			}
@@ -1539,7 +1540,7 @@ func moveBack(fe *foldedEntry, st *undoState, paths []pointer.Pointer) ([]any, b
 	if err != nil {
 		return nil, false
 	}
-	nd, _, err := patch.Apply(st.doc, st.exists, ops, patch.Options{})
+	nd, _, err := patch.Apply(st.doc, true, ops, patch.Options{})
 	if err != nil || !same(nd, fe.pre.doc) {
 		return nil, false
 	}
@@ -1625,7 +1626,8 @@ func (c *Client) sealUndoSteps(ctx context.Context, env *undoEnv, name string, h
 		if err != nil {
 			return nil, err
 		}
-		nd, _, err := patch.Apply(st.doc, st.exists, ops, patch.Options{})
+		// A create applies to the document null (§6.2 step 3).
+		nd, _, err := patch.Apply(st.doc, true, ops, patch.Options{})
 		if err != nil {
 			return nil, fmt.Errorf("client: undo step %d of %s doesn't apply: %w", i, name, err)
 		}

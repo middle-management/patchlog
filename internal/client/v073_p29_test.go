@@ -377,3 +377,21 @@ func TestV073P29SealsOnlyUnderTrustedFrom(t *testing.T) {
 		t.Fatalf("sealing with no trust configured: %v", err)
 	}
 }
+
+// v0.73 §6.2 step 3 (wave-2 carry-over): a create applies to the document
+// null, so a genesis that tests it, which the core takes, folds in undo
+// as in the core: a gesture over such a resource is undone.
+func TestV073P29UndoOverNullGenesis(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{})
+	c := s.Client(t, client.WithAuthor("alice"))
+	must(c.CreateNamespace(ctx, "u", map[string]any{}))
+	w := must(c.Create(ctx, "u", "a", ops(op("test", "", nil), op("add", "", map[string]any{"n": 0.0}))))
+	g := client.NewGesture()
+	must(c.Append(ctx, "u", "a", w.ID, ops(op("replace", "/n", 1)), client.WithGesture(g)))
+	must(c.Undo(ctx, "u", g))
+	if d, _ := docOf(t, c, "u", "a"); d["n"] != 0.0 {
+		t.Fatalf("after the undo %v", d)
+	}
+}
