@@ -417,6 +417,10 @@ CREATE TABLE IF NOT EXISTS rotations_due (
 -- unhashed (§5, §7.4; db.go, grantVia). NULL for none, for the server's
 -- own entries, and in rows from before it.
 ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS via text;
+-- P27: the schema rules marker of a revision (db.go, schemaload.go): 1 for
+-- V073, 0 for Legacy; NULL, read as Legacy, in rows from before it and in
+-- rows a remote branch mirrors (§6.1).
+ALTER TABLE revisions ADD COLUMN IF NOT EXISTS rules smallint;
 `
 
 // openPG opens a Postgres database and creates or migrates its schema.

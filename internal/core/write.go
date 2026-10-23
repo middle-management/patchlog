@@ -248,6 +248,9 @@ type stepState struct {
 	// packed is canon compressed, if the check phase compressed it
 	// (packPlan, compress.go).
 	packed []byte
+	// legacy marks a revision written under the Legacy schema rules: a
+	// copy of a schema revision stored under them (validateStep, §6.1).
+	legacy bool
 }
 
 type itemState struct {
@@ -858,7 +861,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// earlier items (§6.1). In a branch, a path its namespace can't resolve
 	// is looked up among drafts in branches of that namespace.
 	pending := map[string]any{}
-	sc := &schemaCtx{a: a, target: n, creds: req.anyCreds()}
+	sc := &schemaCtx{a: a, target: n, creds: req.anyCreds(), source: bs}
 	pns := t.pendingNS(n)
 	t.prefetchSchemas(pinnedSchemas(st, pns))
 	for _, s := range st {
@@ -866,7 +869,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			if step.del || step.sealed {
 				continue // e2e: validation moves to clients (§E.3.2)
 			}
-			typed, err := t.validateDoc(step.doc, sc, pending)
+			typed, err := t.validateStep(step, sc, pending)
 			if err != nil {
 				fs = append(fs, itemErr{s.index, err})
 				break
@@ -1689,7 +1692,7 @@ func (t *tx) storeGrant(g *grant.Grant, encrypt bool) []byte {
 var (
 	insResources = bulkInsert("resources", "ns bigint, name text", "RETURNING res, name")
 	insRevisions = bulkInsert("revisions", "res bigint, id bytea, parent_seq bigint, first smallint, kind smallint, patches bytea, author bigint, "+
-		"via text, grant_id bytea, signature text, schema_ref text, created bigint, gesture text, undoes text, size bigint, digest bytea", "RETURNING seq, res")
+		"via text, grant_id bytea, signature text, schema_ref text, created bigint, gesture text, undoes text, size bigint, digest bytea, rules smallint", "RETURNING seq, res")
 	insRevEpochs = bulkInsert("rev_epochs", "seq bigint, epoch bigint", "")
 	insSnapshots = bulkInsert("snapshots", "seq bigint, res bigint, doc bytea", "ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc")
 	upsertHeads  = bulkInsert("heads", "res bigint, seq bigint, doc bytea", "ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc")
@@ -1869,7 +1872,7 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 				sz, sum := headMeta(step.docCanon)
 				size, digest = sz, sum
 			}
-			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, it.author, it.via, it.grantID, sig, typed, t.now.UnixMilli(), gesture, undoes, size, digest})
+			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, it.author, it.via, it.grantID, sig, typed, t.now.UnixMilli(), gesture, undoes, size, digest, step.rulesColumn()})
 			stepItems = append(stepItems, it)
 		}
 		if len(rows) == 0 {
