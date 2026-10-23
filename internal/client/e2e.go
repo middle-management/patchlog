@@ -1208,7 +1208,7 @@ func (x *E2E) paddedAt(ctx context.Context, ns, id string) (bool, error) {
 		return false, err
 	}
 	if ph == nil || ph.head != h.ID {
-		if ph, err = x.padHistory(ctx, ns, h.ID); err != nil {
+		if ph, err = x.padHistory(ctx, ns, h.ID, ph); err != nil {
 			return false, err
 		}
 		x.pads.mu.Lock()
@@ -1230,18 +1230,30 @@ func padOf(doc map[string]any) bool {
 // padHistory reads ns's log up to head and records, for every revision it
 // names, whether the namespace padded when it was written: the namespace
 // document in force at its entry, which for a batch that changes the
-// configuration is the one it produces (§E.2.2, §7.5).
-func (x *E2E) padHistory(ctx context.Context, ns, head string) (*padHistory, error) {
+// configuration is the one it produces (§E.2.2, §7.5). With prev, the
+// history as of an earlier head, it reads only the log after that head,
+// falling back to the whole log if prev's head isn't in its chain.
+func (x *E2E) padHistory(ctx context.Context, ns, head string, prev *padHistory) (*padHistory, error) {
 	d, err := x.c.NSDoc(ctx, ns, head)
 	if err != nil {
 		return nil, err
 	}
 	ph := &padHistory{head: head, now: padOf(d.Value), at: map[string]bool{}}
-	log, err := x.c.NSLog(ctx, ns, head, "")
-	if err != nil {
-		return nil, err
-	}
 	cur := false
+	var log []NSEntry
+	if prev != nil {
+		if log, err = x.c.NSLog(ctx, ns, head, prev.head); err == nil {
+			for id, p := range prev.at {
+				ph.at[id] = p
+			}
+			cur = prev.now
+		}
+	}
+	if prev == nil || err != nil {
+		if log, err = x.c.NSLog(ctx, ns, head, ""); err != nil {
+			return nil, err
+		}
+	}
 	var visit func(e NSEntry)
 	visit = func(e NSEntry) {
 		switch e.Kind {
