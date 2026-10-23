@@ -1,6 +1,8 @@
 package core
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -56,11 +58,12 @@ type ArchiveBundle struct {
 	// Entries calls yield for each entry in chain order, streaming from the
 	// database. It stops at the first error yield returns.
 	Entries func(yield func(ArchiveEntry) error) error
-	// Seal, when set, is an encrypted namespace's (Addendum E.1): the
+	// Seal, when set, is an encrypted namespace's (§8.6, Addendum E): the
 	// archiver writes the encoded bundle through the writer it returns
-	// and closes it, so the archive is stored encrypted under a key
-	// derived from the resource's data key (crypt.go). Engine.OpenArchive
-	// reads it back.
+	// and closes it, so the archive is stored as a sealed bundle
+	// (§G.5.1.1) whose only recipient is the resource's archive key
+	// (archiveseal.go), which a purge destroys. Engine.ReadArchive reads
+	// it back.
 	Seal func(w io.Writer) (io.WriteCloser, error)
 }
 
@@ -150,7 +153,7 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 	if first.parentSeq.Valid {
 		b.Requires = t.rev(first.parentSeq.Int64).id.String()
 	}
-	b.Seal = t.archiveSealer(res)
+	b.Seal = t.archiveBundleSealer(n, res)
 	// The blobs the archived documents reference (§7.8: the archive has
 	// them), each before the first entry whose document references it.
 	blobsAt := map[int64][]ids.ID{}
@@ -414,6 +417,60 @@ func (t *tx) deleteArchives(where string, args ...any) {
 		}
 		_, err := t.Exec(`DELETE FROM archives WHERE seq = ?`, s)
 		t.must(err)
+	}
+}
+
+// ReadArchive returns the bundle of an archive of ns/name read from r
+// (§8.6), as ArchiveReader's function does. It opens a read transaction,
+// so a caller inside one of its own, as a restore is, uses ArchiveReader.
+func (e *Engine) ReadArchive(ctx context.Context, ns, name string, r io.Reader) (io.Reader, error) {
+	return e.ArchiveReader(ctx, ns, name)(r)
+}
+
+// ArchiveReader returns a function that reads archives of ns/name (§8.6):
+// given an archive's bytes, it returns the bundle it holds, r's own bytes
+// for a plaintext archive and, for one written in an encrypted namespace,
+// the bundle decrypted as it is read: a sealed bundle (§G.5.1.1) opened
+// with the resource's archive key (ArchiveIdentity), or an archive in the
+// format written before v0.73 ("PLAR", crypt.go). The resource's keys are
+// read now, in a read transaction of its own, so the function needs none
+// and may run inside a write transaction (RestoreResource). An encrypted
+// archive of a purged resource is ErrArchiveKeyDestroyed.
+func (e *Engine) ArchiveReader(ctx context.Context, ns, name string) func(r io.Reader) (io.Reader, error) {
+	dek, kerr := e.archiveDEK(ctx, ns, name)
+	encrypted := func() error {
+		if errors.Is(kerr, ErrNotEncrypted) {
+			// Levels never go down (Addendum E), so no archive of this
+			// resource was written encrypted.
+			return fmt.Errorf("an encrypted archive of %s/%s, whose namespace isn't encrypted", ns, name)
+		}
+		return kerr
+	}
+	return func(r io.Reader) (io.Reader, error) {
+		br := bufio.NewReaderSize(r, 1<<16)
+		if head, _ := br.Peek(len(archiveMagic)); string(head) == archiveMagic {
+			if kerr != nil {
+				return nil, encrypted()
+			}
+			return openArchive(br, dek)
+		}
+		// The first line decides: a sealed bundle's envelope, or a plain
+		// bundle's header, passed through as it is.
+		first, err := br.ReadBytes('\n')
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		env, ok, err := seal.ParseBundleEnvelope(bytes.TrimSpace(first))
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return io.MultiReader(bytes.NewReader(first), br), nil
+		}
+		if kerr != nil {
+			return nil, encrypted()
+		}
+		return env.Open(br, archiveIdentity(dek))
 	}
 }
 
