@@ -143,7 +143,8 @@ func LoadRecipient(s string) (*ecdh.PublicKey, error) {
 // Each line is sealed once the next one starts, so the last can be marked;
 // Close seals it. Close must be called; it doesn't close the underlying
 // writer. Like a Reader it takes only canonical lines, each followed by one
-// 0x0A (§G.4.1).
+// 0x0A (§G.4.1), and it refuses a line that sealed would be longer than
+// seal.MaxBundleLine, which OpenSealed and Unseal refuse.
 type SealedWriter struct {
 	// Pad pads each line's plaintext to its §E.2.2 bucket with spaces,
 	// which readers remove (§G.5.1.1); set it before the first Write.
