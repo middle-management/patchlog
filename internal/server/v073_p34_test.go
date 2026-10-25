@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -197,6 +198,87 @@ func TestV073ArchiveCarriesVia(t *testing.T) {
 	}
 	if v, has := vias[revs[1]]; has && v != nil {
 		t.Fatalf("the root grant's revision's line: via %v", v)
+	}
+}
+
+// P34 review (CIS-34, §8.6, §E.3): an E3 resource's archive is a sealed
+// bundle to its archive key too: the server seals the ciphertext lines it
+// holds. Bundle tools open it with ArchiveIdentity, it verifies, and a
+// restore reads it.
+func TestV073E2EArchiveIsSealedBundle(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	f := newE2E(t, withArchive(t, dir))
+	e := f.tenv
+	k := seal.NewKey()
+	ids := []string{etagOf(e.writeRaw("e", "p", "", sealed(t, k, "e#1", "e", "p", "", addRoot(map[string]any{"n": 0.0})), f.writerG))}
+	for i := 1; i < 6; i++ {
+		ids = append(ids, etagOf(e.writeRaw("e", "p", ids[i-1], sealed(t, k, "e#1", "e", "p", ids[i-1], ops(op("replace", "/n", float64(i)))), f.writerG)))
+	}
+	e.clock.Advance(10 * time.Minute)
+	h := ids[3]
+	snap, err := seal.SealSnapshot(k, "e#1", "e", "p", h, map[string]any{"n": 3.0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap}, f.writerG), 200)
+	raw, err := os.ReadFile(filepath.Join(dir, "e", "p", h+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, _ := bytes.Cut(raw, []byte("\n"))
+	env, isSealed, err := seal.ParseBundleEnvelope(first)
+	if err != nil || !isSealed {
+		t.Fatalf("E3 archive: sealed %v, %v", isSealed, err)
+	}
+	id, err := e.e.ArchiveIdentity(ctx, "e", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(env.Recipients) != 1 || env.Recipients[seal.Thumbprint(id.PublicKey())] == nil {
+		t.Fatalf("recipients %v, want only %s", env.Recipients, seal.Thumbprint(id.PublicKey()))
+	}
+	pr, _, err := bundle.Unseal(bytes.NewReader(raw), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, err := bundle.Verify(pr); err != nil || !s.Header.Authors {
+		t.Fatalf("verify %+v %v", s, err)
+	}
+	// The three archived revisions, as ciphertext, and the writer's grant
+	// line.
+	pr, _, _ = bundle.Unseal(bytes.NewReader(raw), id)
+	rd, err := bundle.NewReader(pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	grants := 0
+	for {
+		l, err := rd.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case l.IsGrant():
+			grants++
+		case l.ID != "":
+			got = append(got, l.ID)
+			if p, _ := l.Patches.([]any); len(p) != 1 || p[0].(map[string]any)["op"] != "sealed" {
+				t.Fatalf("line %s: patches %v, want the sealed op", l.ID, l.Patches)
+			}
+		}
+	}
+	if strings.Join(got, ",") != strings.Join(ids[:3], ",") || grants != 1 {
+		t.Fatalf("archived %v and %d grant lines, want %v and 1", got, grants, ids[:3])
+	}
+	reps, err := archive.Restore(ctx, e.e, archive.RestoreOptions{NS: "e", Name: "p"})
+	if err != nil || len(reps) != 1 || len(reps[0].Failed) != 0 || reps[0].Restored != 3 {
+		t.Fatalf("restore %+v %v", reps, err)
 	}
 }
 
