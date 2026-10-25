@@ -28,8 +28,8 @@ import (
 // a plain bundle's are: a pruned attachment is one blob line, and one that
 // -max-blob-size allows can be longer sealed than that bound, which would
 // leave the archive, the only copy of the pruned bytes, unreadable.
-// Archives written before v0.73 are in a chunked AES-256-GCM format of their own
-// ("PLAR", crypt.go), which Engine.ReadArchive still reads.
+// Archives written before v0.73 are in a chunked AES-256-GCM format of
+// their own ("PLAR", crypt.go), which Engine.ReadArchive still reads.
 
 // archiveKeyInfo is the HKDF info of a resource's archive key.
 const archiveKeyInfo = "patchlog-archive-key-v1"
