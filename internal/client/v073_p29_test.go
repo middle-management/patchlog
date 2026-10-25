@@ -547,3 +547,55 @@ func TestV073P29LegacyKeyringNeverSeals(t *testing.T) {
 		}
 	}
 }
+
+// P29 review, Addendum E Levels, §E.3.1 (ENC-27): undo reads a resource's
+// log after its hint, and the base's ns is accepted only for entries up to
+// the branch's fork whether or not the range starts at the genesis. An
+// entry sealed under the base's key that the server splices into the
+// branch's log past the fork, before the gesture (played by the
+// transport), is flagged and folded as [], so the undo doesn't take what it
+// says into the document it writes back.
+func TestV073P29UndoRangeAfterForkFlagsBaseEntry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	v := newP29Env(t, nil)
+	w1 := must(v.x.CreateDocSealed(ctx, "e", "d", map[string]any{"n": 1.0, "x": 0.0}))
+	fork := must(v.x.AppendSealed(ctx, "e", "d", w1.ID, ops(op("replace", "/n", 2))))
+	must(v.c.CreateBranch(ctx, "e", client.BranchRequest{Name: "eb"}))
+	must(v.x.InitKeyring(ctx, "eb"))
+	p1 := must(v.x.AppendSealed(ctx, "eb", "d", fork.ID, ops(op("replace", "/n", 3))))
+	g := client.NewGesture()
+	g1 := must(v.x.AppendSealed(ctx, "eb", "d", p1.ID, ops(op("replace", "/n", 4)), client.WithGesture(g)))
+
+	// The base's key seals what the server splices in after the hint.
+	kr := p29Kr(t, must(v.x.Key(ctx, "e#1")), "e", "d")
+	forged := jsonv.MustParse(must(seal.SealPatchSet(kr, "e#1", "e", "d", p1.ID, ops(op("replace", "/x", 9)))))
+	fid := must(client.ExpectedRevision(p1.ID, forged))
+	entry := map[string]any{"id": fid, "parent": p1.ID, "kind": "rev", "patches": forged, "author": "user:z", "created": "2026-10-04T12:00:00Z"}
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+		res, err := base.RoundTrip(req)
+		if err != nil || req.Method != "GET" || req.URL.Path != "/r/eb/d/rev/"+g1.ID+"/log" || res.StatusCode != 200 {
+			return res, err
+		}
+		var arr []any
+		json.NewDecoder(res.Body).Decode(&arr)
+		res.Body.Close()
+		b, _ := json.Marshal(append([]any{entry}, arr...))
+		res.Body = io.NopCloser(bytes.NewReader(b))
+		res.ContentLength = int64(len(b))
+		res.Header.Del("Content-Length")
+		return res, nil
+	})
+	c := v.s.Client(t, client.WithBearer(v.grant), client.WithHTTPClient(&http.Client{Transport: rt}))
+	plan, err := c.PlanUndo(ctx, "eb", g, client.UndoE2E(c.E2E(v.priv)), client.UndoSince(p1.NSID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Resources) != 1 || len(plan.Conflicts) != 0 {
+		t.Fatalf("plan %+v", plan)
+	}
+	if d := plan.Resources[0].Doc.(map[string]any); d["n"] != 3.0 || d["x"] != 0.0 {
+		t.Fatalf("an entry sealed under the base past the fork is folded into what the undo writes: %v", d)
+	}
+}

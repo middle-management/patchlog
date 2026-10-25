@@ -1024,7 +1024,9 @@ func (c *Client) readResource(ctx context.Context, env *undoEnv, s *gestureSite)
 		rr.start = undoState{doc: doc, exists: true}
 	}
 	if env.level == "e2e" {
-		if rr.log, rr.flags, err = env.cfg.e2e.OpenLog(ctx, env.ns, name, log); err != nil {
+		// The range follows since, which places a branch's forks: a base's
+		// ns is accepted only up to them (chainCheck, ENC-27).
+		if rr.log, rr.flags, err = env.cfg.e2e.openLog(ctx, env.ns, name, since, log); err != nil {
 			return nil, err
 		}
 	}
