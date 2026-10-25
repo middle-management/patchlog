@@ -77,10 +77,11 @@ import (
 //
 //   - to a caller not in the admin group, an item naming a node hidden
 //     from it (§B.11.5) is 404, as a missing one; so is, to any caller, a
-//     parent the batch gives a node (a to entry) that isn't a live folder
-//     of the catalog after the batch, or, to a caller not in the admin
-//     group, one hidden from it. A new folder's name and a placement's are
-//     exempt (names are not secrets);
+//     to entry (a parent of a new node, or any parent of a moved one,
+//     those it keeps included) that isn't a live folder of the catalog
+//     after the batch, or, to a caller not in the admin group, one hidden
+//     from it. A new folder's name and a placement's are exempt (names
+//     are not secrets);
 //   - a new placement (create or restore): the item's namespace is
 //     trusted, the caller is in its catalogs.{catalog}.place list and has
 //     a role with place on every folder in its parents (§B.11.4 place);
@@ -89,8 +90,8 @@ import (
 //   - a deleted node: a role with move on every current parent (§B.11.4
 //     unplace);
 //   - changed parents (a move): a role with move on every parent left and
-//     on every parent added, none of them the node or below it (§B.11.4
-//     move);
+//     on every folder in to, the node's parents after the batch, those it
+//     keeps included, none of them the node or below it (§B.11.4 move);
 //   - any other edit (titles, order): a role with move on every current
 //     parent, as a rename is a move to them;
 //   - a caller not in the admin group makes no root (an empty parents),
@@ -667,8 +668,9 @@ func (s *Service) wideningRefusal(o *organising, g *tree.Graph, wd widened) erro
 // mergeNotFound answers the batch's 404s as organising requests answer
 // them (§B.11.4, §B.11.5): an item naming a node of the catalog that is
 // hidden from a caller not in the admin group, as a missing one, and a
-// parent the batch gives a node (a to entry) that isn't a live folder of
-// the catalog after the batch, or that, existing before, is hidden from
+// to entry (a new node's parent, or any parent of a moved node after the
+// batch, those it keeps included, as Move's to) that isn't a live folder
+// of the catalog after the batch, or that, existing before, is hidden from
 // such a caller. A folder the batch creates is the caller's own, whose
 // parents are judged in turn. A new folder's name and a placement's are
 // exempt. Call it under View.
@@ -686,7 +688,12 @@ func (s *Service) mergeNotFound(o *organising, g, after *tree.Graph, items []*me
 		case !mi.beforeLive:
 			tos = parentsOf(g.Catalog, mi.made)
 		case mi.afterLive:
-			tos = added(parentsOf(g.Catalog, mi.before), parentsOf(g.Catalog, mi.after))
+			// A move's to is every parent the node has after it, those it
+			// keeps included, as Move's to entries are each checked
+			// (targets); an edit that keeps the parents names none.
+			if bp, ap := parentsOf(g.Catalog, mi.before), parentsOf(g.Catalog, mi.after); !sameParents(bp, ap) {
+				tos = ap
+			}
 		}
 		if len(tos) > 0 && !o.admin {
 			o.readTrusted()
@@ -793,20 +800,21 @@ func (s *Service) mergeChecks(o *organising, caller *grant.Verified, g, after *t
 			if len(ap) == 0 && !admin {
 				return nil, forbidden("%s: only %s make roots", mi.name, s.opt.AdminGroup)
 			}
+			// Move on every folder in to, the node's parents after the
+			// batch, those it keeps included, and on every parent it
+			// leaves (§B.11.4 move), as planMove checks them.
 			below := after.Descendants([]string{mi.name})
-			for _, p := range added(bp, ap) {
+			for _, p := range ap {
 				if below[p.Name] {
 					return nil, forbidden("%s can't move under %s, which is itself or below it", mi.name, p.Name)
+				}
+				if !power(p.Name, "move") {
+					return nil, forbidden("%s: no role of yours with move is assigned on %s", mi.name, parentLabel(p))
 				}
 			}
 			for _, p := range added(ap, bp) {
 				if !power(p.Name, "move") {
 					return nil, forbidden("%s: no role of yours with move is assigned on %s, which the node leaves", mi.name, parentLabel(p))
-				}
-			}
-			for _, p := range added(bp, ap) {
-				if !power(p.Name, "move") {
-					return nil, forbidden("%s: no role of yours with move is assigned on %s", mi.name, parentLabel(p))
 				}
 			}
 		default:

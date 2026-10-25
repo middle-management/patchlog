@@ -358,3 +358,72 @@ func TestMergePurgedPlacementV073(t *testing.T) {
 		t.Fatalf("a purged placement: %d %v", r.status, r.body)
 	}
 }
+
+// TestMergeMoveKeptParentsV073 (review): a batch item that changes a
+// node's parents is a Move whose to is every parent it has after the
+// batch, those it keeps included (§B.11.4 move, §F.8): it needs move on
+// each, as the approver's own Move does, so adding a parent to a node in
+// a folder without move there is refused, and so is renaming such a node
+// in the same step. A kept parent that isn't a live folder, or is hidden
+// from the approver, is 404, as a to entry is.
+func TestMergeMoveKeptParentsV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	// k gives match-desk no role, so no move there.
+	w.doc("cat", "k", map[string]any{"title": "K", "parents": parents("season"), "$access": acc("group:other", "reader")})
+	w.doc("matches", "x", map[string]any{"title": "x"})
+	w.doc("cat", "matches.x", map[string]any{"parents": parents("k")})
+	w.doc("matches", "y", map[string]any{"title": "y"})
+	w.doc("cat", "matches.y", map[string]any{"parents": parents("season", "ghost")}) // ghost: dangling
+	w.doc("matches", "z", map[string]any{"title": "z"})
+	w.doc("cat", "matches.z", map[string]any{"parents": parents("derbies", "rumours")}) // rumours: hidden from desk
+	w.start()
+	w.caughtUp()
+	anna, chief := w.caller("user:anna", "match-desk"), w.caller("user:chief", "catalog-admins")
+	move := func(name string, title any, folders ...string) map[string]any {
+		ops := []any{map[string]any{"op": "replace", "path": "/parents", "value": parents(folders...)}}
+		if title != nil {
+			ops = append(ops, map[string]any{"op": "add", "path": "/title", "value": title})
+		}
+		return map[string]any{"resource": name, "ifMatch": w.catHead(name), "steps": []any{ops}}
+	}
+
+	// The approver's own Move to [k, season] is 403.
+	if r := w.do("POST", "/grants", anna, map[string]any{"node": "matches.x", "want": []any{"move"}, "to": []any{"k", "season"}}); r.status != 403 {
+		t.Fatalf("organising Move to [k, season]: %d %v", r.status, r.body)
+	}
+	for _, title := range []any{nil, "renamed"} {
+		r := w.mergeAsk(anna, "", move("matches.x", title, "k", "season"))
+		if r.status != 403 || !strings.Contains(mergeMsg(r), "move is assigned on k") {
+			t.Errorf("a move keeping k (title %v), no move at k: %d %v", title, r.status, r.body)
+		}
+	}
+	// With move at every parent, it is a merge-key grant.
+	if r := w.mergeAsk(chief, "", move("matches.x", "renamed", "k", "season")); r.status != 200 || r.body["grant"] == nil {
+		t.Errorf("the same approved by an admin: %d %v", r.status, r.body)
+	}
+
+	// A kept parent that isn't a live folder: 404, as a to entry, for an
+	// admin too.
+	for _, tok := range []string{anna, chief} {
+		if r := w.mergeAsk(tok, "", move("matches.y", nil, "derbies", "ghost")); r.status != 404 || !strings.Contains(mergeMsg(r), "ghost") {
+			t.Errorf("a move keeping dangling ghost: %d %v", r.status, r.body)
+		}
+	}
+	// A kept parent hidden from the approver: 404, as a to entry hidden
+	// from it, before the 403 for moving a node with a hidden parent.
+	if r := w.mergeAsk(anna, "", move("matches.z", nil, "season", "rumours")); r.status != 404 || r.body["checkpoint"] == nil {
+		t.Errorf("a move keeping hidden rumours: %d %v", r.status, r.body)
+	}
+	if r := w.do("POST", "/grants", anna, map[string]any{"node": "matches.z", "want": []any{"move"}, "to": []any{"season", "rumours"}}); r.status != 404 {
+		t.Errorf("organising Move keeping hidden rumours: %d %v", r.status, r.body)
+	}
+	// An edit that keeps the parents names no to: a rename still needs
+	// move at every current parent (403 at k), and isn't 404.
+	edit := map[string]any{"resource": "matches.y", "ifMatch": w.catHead("matches.y"),
+		"steps": []any{[]any{map[string]any{"op": "add", "path": "/title", "value": "y2"}}}}
+	if r := w.mergeAsk(anna, "", edit); r.status != 403 {
+		t.Errorf("a rename of a node with a dangling parent: %d %v", r.status, r.body)
+	}
+}
