@@ -1535,9 +1535,16 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 		if padMsg != "" {
 			flag(padMsg)
 		}
+		// A patch set that opened but doesn't parse or apply folds as []
+		// on its parent's document (§E.3.2): for a genesis, null (§6.2
+		// step 3), which then exists, the revision flagged. One that
+		// doesn't open isn't known to be a patch set at all.
 		ops, err := patch.Parse(plain)
 		if err != nil {
 			flag("patch set: " + err.Error())
+			if e.Parent == "" {
+				doc, exists = nil, true
+			}
 			continue
 		}
 		// A genesis applies to null (§6.2 step 3), whose document then
@@ -1545,6 +1552,9 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 		nd, _, err := patch.Apply(doc, true, ops, patch.Options{})
 		if err != nil {
 			flag("patch set doesn't apply: " + err.Error())
+			if e.Parent == "" {
+				doc, exists = nil, true
+			}
 			continue
 		}
 		msg, err = x.validate(ctx, ns, nd, true)

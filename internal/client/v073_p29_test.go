@@ -599,3 +599,37 @@ func TestV073P29UndoRangeAfterForkFlagsBaseEntry(t *testing.T) {
 		t.Fatalf("an entry sealed under the base past the fork is folded into what the undo writes: %v", d)
 	}
 }
+
+// P29 review, §E.3.2 (ENC-25), §6.2 step 3: a revision whose patch set
+// doesn't apply, or doesn't parse as one, is flagged and the fold goes on
+// from its parent's document as if it were []; for a genesis that is null.
+// A resource whose only revision is such a genesis folds to null with the
+// genesis flagged and its author named, and the next revision applies to
+// null.
+func TestV073P29FlaggedGenesisFoldsToNull(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	v := newP29Env(t, nil)
+	g := must(v.x.WithoutValidation().CreateSealed(ctx, "e", "d", ops(op("replace", "/x", 1))))
+	d, err := v.x.DocE2E(ctx, "e", "d", g.ID)
+	if err != nil {
+		t.Fatalf("a genesis that doesn't apply: %v", err)
+	}
+	if d.Value != nil || len(d.Flagged) != 1 || d.Flagged[0].ID != g.ID || d.Flagged[0].Author != "user:a" || !strings.Contains(d.Flagged[0].Message, "doesn't apply") || d.ValidID != "" {
+		t.Fatalf("fold %+v", d)
+	}
+	next := must(v.x.WithoutValidation().AppendSealed(ctx, "e", "d", g.ID, ops(op("add", "", map[string]any{"n": 1.0}))))
+	if d := must(v.x.DocE2E(ctx, "e", "d", next.ID)); len(d.Flagged) != 1 || d.ValidID != next.ID {
+		t.Fatalf("after the flagged genesis: %+v", d)
+	} else {
+		sameJSON(t, d.Value, map[string]any{"n": 1})
+	}
+
+	// One that opens but isn't a patch set.
+	kr := p29Kr(t, must(v.x.Key(ctx, "e#1")), "e", "f")
+	notOps := must(seal.SealPatchSet(kr, "e#1", "e", "f", "", map[string]any{"op": "add"}))
+	f := must(v.c.Create(ctx, "e", "f", notOps))
+	if d, err := v.x.DocE2E(ctx, "e", "f", f.ID); err != nil || d.Value != nil || len(d.Flagged) != 1 || !strings.Contains(d.Flagged[0].Message, "patch set") {
+		t.Fatalf("a genesis that isn't a patch set: %+v, %v", d, err)
+	}
+}
