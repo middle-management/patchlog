@@ -631,7 +631,9 @@ type archiveWriter struct {
 }
 
 // sealArchive returns a writer that encrypts an archive to w under a key
-// derived from dek.
+// derived from dek. Archives are sealed bundles since v0.73 (archiveseal.go);
+// nothing writes this format any more, and the tests use it to make the
+// archives from before, which openArchive still reads.
 func sealArchive(w io.Writer, dek []byte) (io.WriteCloser, error) {
 	hdr := make([]byte, archiveHdr)
 	copy(hdr, archiveMagic)
@@ -798,16 +800,6 @@ func (e *Engine) OpenArchive(ctx context.Context, ns, name string, r io.Reader) 
 		return nil, err
 	}
 	return openArchive(br, dek)
-}
-
-// archiveSealer returns the Seal function of an archive of res, or nil if
-// res is not encrypted.
-func (t *tx) archiveSealer(res int64) func(io.Writer) (io.WriteCloser, error) {
-	if t.resLevel(res) < levelAtRest {
-		return nil
-	}
-	dek := t.dek(res, true)
-	return func(w io.Writer) (io.WriteCloser, error) { return sealArchive(w, dek) }
 }
 
 // checkKeyStore runs at Open: with a key store, one stored data key must
