@@ -167,7 +167,8 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 			if eff.id != hid {
 				return apiErr(422, "invalid", "message", "the horizon moves down to a protected revision (§8.6); seal the snapshot for that one", "horizon", eff.id.String())
 			}
-			if err := t.checkSealedHeader(n, cfg, pr.Snapshot, seal.SnapshotPL(n.name, name, eff.id.String()), "snapshot", false); err != nil {
+			epoch, why := t.snapshotEpoch(n, cfg, eff)
+			if err := t.checkSealedHeader(n, pr.Snapshot, seal.SnapshotPL(n.name, name, eff.id.String()), "snapshot", epoch, why); err != nil {
 				return err
 			}
 		}
@@ -224,11 +225,13 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 // ignores keep, which is checked only against keepPerResource, writes
 // nothing, and answers the resource's current horizon as the branch sees
 // it. No archive is needed, nor a * key, since nothing is pruned. At E3 the
-// snapshot is still checked at step 4, its kid included: it must carry the
-// branch's own epoch, never a base's (§13, F-B6).
+// snapshot is still checked at step 4, its kid included: it must name the
+// branch, never a base, and the epoch snapshotEpoch gives for the horizon's
+// chain, as outside a branch (§13, F-B6, §E.3.1).
 func (t *tx) pruneInBranch(n *nsRow, cfg *Config, a *actor, name string, v *view, hid ids.ID, pr PruneRequest, env map[string]any) (*PruneResult, error) {
 	if t.e2eContent(n, name) {
-		if err := t.checkSealedHeader(n, cfg, pr.Snapshot, seal.SnapshotPL(n.name, name, hid.String()), "snapshot", false); err != nil {
+		epoch, why := t.snapshotEpoch(n, cfg, t.findInAncestry(v.head, hid))
+		if err := t.checkSealedHeader(n, pr.Snapshot, seal.SnapshotPL(n.name, name, hid.String()), "snapshot", epoch, why); err != nil {
 			return nil, err
 		}
 	}
