@@ -54,8 +54,28 @@ const BundleMediaType = "application/vnd.patchlog.sealed-bundle+jsonl"
 // bundleWrapInfo prefixes the HPKE info of a sealed bundle's content key.
 const bundleWrapInfo = "patchlog-bundle-v1\n"
 
-// maxBundleLine bounds one line of a sealed bundle (and its envelope).
-const maxBundleLine = 256 << 20
+// MaxBundleLine is the longest line of a sealed bundle, without its line
+// end, that OpenBundle and BundleEnvelope.Open read and that BundleWriter
+// writes unless told otherwise (OpenBundleMax, BundleEnvelope.OpenMax,
+// BundleWriter.MaxLine). §G.5.1.1 sets no bound: this one keeps what a
+// reader holds of one line in memory bounded when the bundle comes from
+// elsewhere. The blob line of an attachment over about 144 MiB (128 MiB
+// padded) is longer sealed; pruning archives (§8.6), which the server
+// writes and reads back itself, are written and read without a bound, as
+// plain bundles are.
+const MaxBundleLine = 256 << 20
+
+// lineBound is the bound a MaxLine-style argument stands for: 0 is
+// MaxBundleLine, a negative value is none (-1).
+func lineBound(max int) int {
+	if max == 0 {
+		return MaxBundleLine
+	}
+	if max < 0 {
+		return -1
+	}
+	return max
+}
 
 // ErrNotRecipient reports a sealed bundle that has no content key for the
 // identity given (or none was given).
@@ -89,6 +109,13 @@ type BundleWriter struct {
 	// Pad pads each line's plaintext to its §E.2.2 bucket with spaces,
 	// which readers remove (§G.5.1.1); set it before the first Write.
 	Pad bool
+	// MaxLine is the longest sealed line, without its 0x0A, the writer
+	// writes: 0 is MaxBundleLine, the bound OpenBundle reads with, and a
+	// negative value is no bound. A line whose sealed form would be longer
+	// is refused (*BundleError naming the plain bundle's line) before any
+	// of it is written, so the writer never writes a bundle that a reader
+	// with the same bound refuses. Set it before the first Write.
+	MaxLine int
 
 	w       io.Writer
 	aead    cipher.AEAD
@@ -193,6 +220,12 @@ func (s *BundleWriter) emit(pt []byte, last bool) error {
 	}
 	hdr := map[string]any{"alg": AlgDir, "enc": EncA256GCM, "pl": pl}
 	protected := b64.EncodeToString(jsonv.Canonical(hdr))
+	// The sealed line: protected ".." iv "." ciphertext "." tag, the
+	// ciphertext as long as the plaintext.
+	size := len(protected) + 2 + b64.EncodedLen(s.aead.NonceSize()) + 1 + b64.EncodedLen(len(pt)) + 1 + b64.EncodedLen(s.aead.Overhead())
+	if max := lineBound(s.MaxLine); max >= 0 && size > max {
+		return &BundleError{Line: s.n + 1, Msg: fmt.Sprintf("sealed, the line would be %d bytes, more than the %d a reader takes (§G.5.1.1)", size, max)}
+	}
 	iv := make([]byte, s.aead.NonceSize())
 	rand.Read(iv)
 	ct := s.aead.Seal(nil, iv, pt, []byte(protected))
@@ -291,8 +324,15 @@ func ParseBundleEnvelope(line []byte) (env *BundleEnvelope, ok bool, err error) 
 
 // Open unwraps the content key with identity and returns the plain bundle
 // whose sealed lines follow the envelope in br, decrypted and checked line
-// by line as they are read (§G.5.1.1).
+// by line as they are read (§G.5.1.1). A line longer than MaxBundleLine is
+// refused.
 func (env *BundleEnvelope) Open(br *bufio.Reader, identity *ecdh.PrivateKey) (io.Reader, error) {
+	return env.OpenMax(br, identity, 0)
+}
+
+// OpenMax is Open reading lines of up to maxLine bytes: 0 is
+// MaxBundleLine, a negative value is no bound.
+func (env *BundleEnvelope) OpenMax(br *bufio.Reader, identity *ecdh.PrivateKey, maxLine int) (io.Reader, error) {
 	if identity == nil {
 		return nil, fmt.Errorf("%w: it is sealed (§G.5.1.1); give the recipient's private key", ErrNotRecipient)
 	}
@@ -312,14 +352,21 @@ func (env *BundleEnvelope) Open(br *bufio.Reader, identity *ecdh.PrivateKey) (io
 	if err != nil {
 		return nil, err
 	}
-	return &bundleReader{br: br, aead: aead, id: env.ID}, nil
+	return &bundleReader{br: br, aead: aead, id: env.ID, max: lineBound(maxLine)}, nil
 }
 
 // OpenBundle decrypts a sealed bundle with identity and returns the plain
-// bundle it holds, checked line by line as it is read (§G.5.1.1).
+// bundle it holds, checked line by line as it is read (§G.5.1.1). A line
+// longer than MaxBundleLine is refused.
 func OpenBundle(r io.Reader, identity *ecdh.PrivateKey) (io.Reader, error) {
+	return OpenBundleMax(r, identity, 0)
+}
+
+// OpenBundleMax is OpenBundle reading lines, the envelope included, of up
+// to maxLine bytes: 0 is MaxBundleLine, a negative value is no bound.
+func OpenBundleMax(r io.Reader, identity *ecdh.PrivateKey, maxLine int) (io.Reader, error) {
 	br := bufio.NewReaderSize(r, 1<<16)
-	first, err := readBundleLine(br)
+	first, err := readBundleLine(br, lineBound(maxLine))
 	if err != nil {
 		if err == io.EOF {
 			return nil, &BundleError{Line: 1, Msg: "empty bundle"}
@@ -333,7 +380,7 @@ func OpenBundle(r io.Reader, identity *ecdh.PrivateKey) (io.Reader, error) {
 	if !ok {
 		return nil, &BundleError{Line: 1, Msg: "not a sealed bundle"}
 	}
-	return env.Open(br, identity)
+	return env.OpenMax(br, identity, maxLine)
 }
 
 // bundleReader decrypts a sealed bundle's lines into a plain bundle.
@@ -341,6 +388,7 @@ type bundleReader struct {
 	br   *bufio.Reader
 	aead cipher.AEAD
 	id   string
+	max  int // the longest line read, -1 for no bound
 	n    int // the next line number
 	last bool
 	out  []byte
@@ -362,7 +410,7 @@ func (r *bundleReader) Read(p []byte) (int, error) {
 // next decrypts the next line; io.EOF once the last line was read and
 // nothing follows it.
 func (r *bundleReader) next() error {
-	b, rerr := readBundleLine(r.br)
+	b, rerr := readBundleLine(r.br, r.max)
 	if rerr == io.EOF {
 		if !r.last {
 			return &BundleError{Line: r.n + 2, Msg: "sealed bundle: no line says last (truncated?)"}
@@ -444,8 +492,8 @@ func (r *bundleReader) next() error {
 }
 
 // readBundleLine reads the next non-blank line of a sealed bundle, without
-// its line end.
-func readBundleLine(br *bufio.Reader) ([]byte, error) {
+// its line end; one longer than max bytes is refused, unless max is -1.
+func readBundleLine(br *bufio.Reader, max int) ([]byte, error) {
 	for {
 		var line []byte
 		for {
@@ -457,8 +505,8 @@ func readBundleLine(br *bufio.Reader) ([]byte, error) {
 				return nil, err
 			}
 			line = append(line, chunk...)
-			if len(line) > maxBundleLine {
-				return nil, &BundleError{Msg: "sealed bundle: a line is too long"}
+			if max >= 0 && len(line) > max {
+				return nil, &BundleError{Msg: fmt.Sprintf("sealed bundle: a line is too long (more than %d bytes)", max)}
 			}
 			if !isPrefix {
 				break

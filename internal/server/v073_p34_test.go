@@ -199,3 +199,66 @@ func TestV073ArchiveCarriesVia(t *testing.T) {
 		t.Fatalf("the root grant's revision's line: via %v", v)
 	}
 }
+
+// P34 review (§8.6, §7.8, §G.5.1.1): a pruned attachment is archived as
+// one blob line, and one of 150 MiB, which -max-blob-size allows, is a
+// line longer than seal.MaxBundleLine sealed. The archive the server
+// writes is the only copy of the pruned bytes, so in an encrypted
+// namespace it is written and read back without that bound, as a plain
+// bundle archive is: a restore brings the attachment back in both.
+// Not parallel: it holds a few copies of the blob in memory.
+func TestV073LargeBlobArchiveRestores(t *testing.T) {
+	ctx := context.Background()
+	for _, level := range []string{"none", "at-rest"} {
+		t.Run(level, func(t *testing.T) {
+			dir := t.TempDir()
+			big := func(o *core.Options) {
+				withBlobTuning(o)
+				o.Limits.BlobSize, o.Maximums.BlobSize = 256<<20, 256<<20
+				o.Limits.BlobPending, o.Maximums.BlobPending = 512<<20, 512<<20
+			}
+			e := newEnv(t, big, withArchive(t, dir), withoutRetentionLoop, withKeyStore(newKeyStore(t)))
+			doc := map[string]any{"read": "public"}
+			if level != "none" {
+				doc["encryption"] = map[string]any{"level": level}
+			}
+			e.mkNS("m", doc)
+			data := bytes.Repeat([]byte("x"), 150<<20)
+			b := e.upload("m", "r", "application/octet-stream", data)
+			revs := []string{e.create("m", "r", map[string]any{"a": ref(b, "application/octet-stream", len(data), "")})}
+			revs = append(revs, e.appendRev("m", "r", revs[0], ops(op("remove", "/a"))))
+			revs = append(revs, e.appendRev("m", "r", revs[1], ops(op("add", "/n", 1.0))))
+			e.clock.Advance(time.Hour)
+			expect(t, e.prune("m", "r", map[string]any{"horizon": revs[2]}, "admin"), 200)
+			expectCode(t, e.get(blobPath("m", "r", b)), 410, "pruned")
+			// The archive's longest line, streamed: in the encrypted
+			// namespace, the sealed blob line is past seal's bound.
+			fh, err := os.Open(filepath.Join(dir, "m", "r", revs[2]+".jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			br := bufio.NewReaderSize(fh, 1<<16)
+			longest, cur := 0, 0
+			for {
+				chunk, isPrefix, err := br.ReadLine()
+				if err != nil {
+					break
+				}
+				cur += len(chunk)
+				if !isPrefix {
+					longest, cur = max(longest, cur), 0
+				}
+			}
+			fh.Close()
+			if level != "none" && longest <= seal.MaxBundleLine {
+				t.Fatalf("the sealed blob line is %d bytes, within seal's bound %d", longest, seal.MaxBundleLine)
+			}
+			// The blob line's bytes are checked against the blob's id as
+			// they are restored (§3.7).
+			reps, err := archive.Restore(ctx, e.e, archive.RestoreOptions{NS: "m", Name: "r", Log: t.Logf})
+			if err != nil || len(reps) != 1 || len(reps[0].Failed) != 0 || !reps[0].Cleared || reps[0].Blobs != 1 {
+				t.Fatalf("restore %+v %v", reps, err)
+			}
+		})
+	}
+}

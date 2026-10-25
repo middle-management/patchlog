@@ -435,7 +435,9 @@ func (e *Engine) ReadArchive(ctx context.Context, ns, name string, r io.Reader) 
 // given an archive's bytes, it returns the bundle it holds, r's own bytes
 // for a plaintext archive and, for one written in an encrypted namespace,
 // the bundle decrypted as it is read: a sealed bundle (§G.5.1.1) opened
-// with the resource's archive key (ArchiveIdentity), or an archive in the
+// with the resource's archive key (ArchiveIdentity), its lines read
+// without seal's line bound as the archiver wrote them (archiveseal.go)
+// and as a plaintext archive's are, or an archive in the
 // format written before v0.73 ("PLAR", crypt.go). The resource's keys are
 // read now, in a read transaction of its own, so the function needs none
 // and may run inside a write transaction (RestoreResource). An encrypted
@@ -474,7 +476,7 @@ func (e *Engine) ArchiveReader(ctx context.Context, ns, name string) func(r io.R
 		if kerr != nil {
 			return nil, encrypted()
 		}
-		return env.Open(br, archiveIdentity(dek))
+		return env.OpenMax(br, archiveIdentity(dek), -1)
 	}
 }
 
