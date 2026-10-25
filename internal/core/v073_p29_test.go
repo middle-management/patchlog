@@ -3,7 +3,12 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/keystore"
@@ -28,6 +33,15 @@ func p29Engine(t *testing.T) *Engine {
 	}
 	t.Cleanup(func() { e.Close() })
 	return e
+}
+
+// p29RaiseFromSealed lets e raise a sealed namespace to e2e, which the
+// server refuses until it serves what is stored before such a raise sealed
+// (raiseFromSealedOK), to test what the raise records and checks.
+func p29RaiseFromSealed(t *testing.T, e *Engine) {
+	t.Helper()
+	raiseFromSealedEngines.Store(e, struct{}{})
+	t.Cleanup(func() { raiseFromSealedEngines.Delete(e) })
 }
 
 func p29Req(ns string) Request {
@@ -100,6 +114,23 @@ func TestV073P29RaiseToE2E(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// This server can't serve what is stored before a raise from sealed as
+	// Levels requires, sealed under the last epoch before it, and would
+	// serve it in the clear (P29 review), so it refuses that raise, the
+	// new epoch given or not, and records nothing.
+	for _, enc := range []map[string]any{{"level": "e2e"}, {"level": "e2e", "epoch": 2.0}} {
+		_, err := e.WriteConfig(ctx, p29Req("s"), ConfigChange{IfMatch: cfg, Patches: []any{map[string]any{"op": "replace", "path": "/encryption", "value": enc}}})
+		st, body := p29Status(t, err)
+		errs, _ := body["errors"].([]any)
+		if st != 422 || body["code"] != "invalid" || len(errs) != 1 || errs[0].(map[string]any)["pointer"] != "/encryption" {
+			t.Fatalf("raise from sealed with %v: %d %v, want 422 invalid at /encryption", enc, st, body)
+		}
+	}
+	if raiseOf("s") != nil {
+		t.Fatal("a refused raise from sealed was recorded")
+	}
+	// What such a raise records and checks, on an engine that allows it.
+	p29RaiseFromSealed(t, e)
 	for _, enc := range []map[string]any{{"level": "e2e"}, {"level": "e2e", "epoch": 1.0}, {"level": "e2e", "epoch": 3.0}} {
 		_, err := e.WriteConfig(ctx, p29Req("s"), ConfigChange{IfMatch: cfg, Patches: []any{map[string]any{"op": "replace", "path": "/encryption", "value": enc}}})
 		st, body := p29Status(t, err)
@@ -179,3 +210,94 @@ func TestV073P29RaiseToE2E(t *testing.T) {
 }
 
 func second[A any](_ A, err error) error { return err }
+
+// v0.73 §E.3.1, Addendum E Levels (ENC-22, ENC-38): after a raise from
+// sealed, a prune snapshot whose newest content revision is from before
+// the raise is sealed under the epoch that revision is served under, not
+// the epoch in force; the server checks it (422 invalid). The raise needs
+// an engine that allows it (p29RaiseFromSealed). This was a client test
+// (internal/client) until the server refused raises from sealed.
+func TestV073P29SnapshotKidBeforeRaise(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := &p29Clock{t: time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)}
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
+		Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}, KeyStore: ks, Archiver: p29Archiver{}, Now: now.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close() })
+	p29RaiseFromSealed(t, e)
+	cfg := mkNS(t, e, "s", map[string]any{"encryption": map[string]any{"level": "sealed"}})
+	write := func(parent string, patches []any) string {
+		t.Helper()
+		w, err := e.WriteResource(ctx, p29Req("s"), Item{Resource: "d", IfMatch: parent, IfNoneMatch: parent == "", Steps: []Step{{Patches: patches}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w.Items[0].IDs[0]
+	}
+	w1 := write("", []any{p29Add("", map[string]any{"n": 1.0}), p29Add("/$nonce", seal.NewNonce())})
+	w2 := write(w1, []any{map[string]any{"op": "replace", "path": "/n", "value": 2.0}, map[string]any{"op": "replace", "path": "/$nonce", "value": seal.NewNonce()}})
+	if _, err := e.WriteConfig(ctx, p29Req("s"), ConfigChange{IfMatch: cfg, Patches: []any{map[string]any{"op": "replace", "path": "/encryption", "value": map[string]any{"level": "e2e"}}}}); err == nil {
+		t.Fatal("raise from sealed without a new epoch")
+	}
+	if _, err := e.WriteConfig(ctx, p29Req("s"), ConfigChange{IfMatch: cfg, Patches: []any{map[string]any{"op": "replace", "path": "/encryption", "value": map[string]any{"level": "e2e", "epoch": 2.0}}}}); err != nil {
+		t.Fatalf("raise from sealed with epoch 2: %v", err)
+	}
+	now.Advance(10 * time.Minute) // past what a prune protects
+	key := seal.NewKey()          // the server checks the header only
+	snap := func(kid string) string {
+		t.Helper()
+		kr, err := seal.ResourceKey(key, "s", "d")
+		if err != nil {
+			t.Fatal(err)
+		}
+		jwe, err := seal.SealSnapshot(kr, kid, "s", "d", w2, jsonv.FromGo(map[string]any{"n": 2.0}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return jwe
+	}
+	if st, body := p29Status(t, second(e.Prune(ctx, p29Req("s"), "d", PruneRequest{Horizon: w2, Snapshot: snap("s#2")}))); st != 422 || body["code"] != "invalid" || !strings.Contains(fmt.Sprint(body["message"]), "epoch 2, not 1") {
+		t.Fatalf("snapshot of pre-raise content under the epoch in force: %d %v, want 422 invalid", st, body)
+	}
+	if _, err := e.Prune(ctx, p29Req("s"), "d", PruneRequest{Horizon: w2, Snapshot: snap("s#1")}); err != nil {
+		t.Fatalf("snapshot of pre-raise content under the epoch it is served under: %v", err)
+	}
+}
+
+// p29Archiver takes every archive and keeps nothing: an e2e prune needs a
+// destination (§8.6).
+type p29Archiver struct{}
+
+func (p29Archiver) Check(string) error { return nil }
+func (p29Archiver) Write(_ context.Context, _, key string, b *ArchiveBundle) (string, error) {
+	return "mem:" + key, b.Entries(func(ArchiveEntry) error { return nil })
+}
+func (p29Archiver) Delete(context.Context, string) error { return nil }
+func (p29Archiver) Open(context.Context, string) (io.ReadCloser, error) {
+	return nil, errors.New("p29Archiver keeps nothing")
+}
+
+// p29Clock is an engine clock that moves only when told.
+type p29Clock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *p29Clock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *p29Clock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}

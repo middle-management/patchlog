@@ -190,28 +190,40 @@ func TestV073P29SnapshotKid(t *testing.T) {
 	}
 }
 
-// v0.73 Addendum E Levels (ENC-22, ENC-38): after a raise from sealed, a
-// prune snapshot whose newest content revision is from before the raise
-// is sealed under the epoch that revision is served under, not the epoch
-// in force.
-func TestV073P29SnapshotKidBeforeRaise(t *testing.T) {
+// P29 review, Addendum E Levels (Invariant): content from before a raise
+// to e2e is never served at a weaker level, so from sealed it must be
+// served sealed under the last epoch before the raise, which this server
+// doesn't do yet. A sealed namespace isn't raised to e2e (422 invalid,
+// the new epoch given or not), and its log stays a JWE; a raise from
+// at-rest goes through. What such a raise records, and the snapshot kid
+// of content from before it (ENC-22), are tested in internal/core
+// (TestV073P29RaiseToE2E, TestV073P29SnapshotKidBeforeRaise).
+func TestV073P29NoRaiseFromSealed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	v := newP29Env(t, map[string]any{"level": "sealed"})
-	w1 := must(v.c.Create(ctx, "e", "d", ops(op("add", "", map[string]any{"n": 1.0}), op("add", "/$nonce", seal.NewNonce()))))
-	w2 := must(v.c.Append(ctx, "e", "d", w1.ID, ops(op("replace", "/n", 2), op("replace", "/$nonce", seal.NewNonce()))))
+	w := must(v.c.Create(ctx, "e", "d", ops(op("add", "", map[string]any{"secret": "s3cr3t"}), op("add", "/$nonce", seal.NewNonce()))))
 	h := must(v.c.NSHead(ctx, "e"))
-	if _, err := v.c.PatchConfig(ctx, "e", h.Config, ops(op("replace", "/encryption", map[string]any{"level": "e2e"}))); err == nil {
-		t.Fatal("raise from sealed without a new epoch")
+	for _, enc := range []map[string]any{{"level": "e2e"}, {"level": "e2e", "epoch": 2}} {
+		_, err := v.c.PatchConfig(ctx, "e", h.Config, ops(op("replace", "/encryption", enc)))
+		var ae *client.APIError
+		if !errors.As(err, &ae) || ae.Status != 422 || ae.Code != "invalid" {
+			t.Fatalf("raise from sealed with %v: %v, want 422 invalid", enc, err)
+		}
 	}
-	must(v.c.PatchConfig(ctx, "e", h.Config, ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 2}))))
-	v.s.Clock.Advance(10 * time.Minute)
-	key := seal.NewKey() // the server checks the header only
-	doc := map[string]any{"n": 2.0}
-	if _, err := v.c.Prune(ctx, "e", "d", client.PruneRequest{Horizon: w2.ID, Snapshot: p29Snapshot(t, key, "e#2", "e", "d", w2.ID, doc)}); err == nil {
-		t.Fatal("snapshot of pre-raise content under the epoch in force")
+	if st, b := v.raw(t, "/r/e/d/rev/"+w.ID+"/log"); st != 200 || bytes.Contains(b, []byte("s3cr3t")) {
+		t.Fatalf("the log after the refused raise: %d %s", st, b)
 	}
-	must(v.c.Prune(ctx, "e", "d", client.PruneRequest{Horizon: w2.ID, Snapshot: p29Snapshot(t, key, "e#1", "e", "d", w2.ID, doc)}))
+	if lv := must(v.c.EncryptionLevel(ctx, "e")); lv != "sealed" {
+		t.Fatalf("level %q", lv)
+	}
+	// From at-rest the content was in the clear before, and the raise
+	// goes through.
+	must(v.s.Client(t, client.WithBearer(v.s.OperatorGrant(t, "a"))).CreateNamespace(ctx, "a",
+		map[string]any{"read": "grant", "keys": []any{v.k.Entry("*")}, "encryption": map[string]any{"level": "at-rest"}}))
+	ac := v.s.Client(t, client.WithBearer(v.k.Grant(t, v.s.Now(), "user:a", []string{"a"}, p29Verbs, nil)))
+	ah := must(ac.NSHead(ctx, "a"))
+	must(ac.PatchConfig(ctx, "a", ah.Config, ops(op("replace", "/encryption", map[string]any{"level": "e2e"}))))
 }
 
 // v0.73 §E.3.2 (ENC-25): a revision that isn't padded as its namespace
