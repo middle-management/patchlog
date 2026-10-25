@@ -538,7 +538,7 @@ func TestE2ELogPageFromSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expect(t, e.prune("e", "p", map[string]any{"horizon": revs[1], "snapshot": snap}, f.writerG), 200)
+	expect(t, e.prune("e", "p", map[string]any{"horizon": revs[1], "snapshot": snap}, f.adminG), 200) // no retention rule: a * key (§8.6)
 	r = e.get(path+"?since="+revs[1], f.readerG)
 	expect(t, r, 200)
 	arr := anyMaps(r.Arr())

@@ -9,9 +9,6 @@ import (
 	"net/url"
 	"strings"
 	"time"
-
-	"github.com/middle-management/patchlog/internal/ids"
-	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // RetentionRule is one entry of a namespace document's `retention` (§8.6):
@@ -308,26 +305,10 @@ func (t *tx) applyRetention(nsName, name string) (checked, pruned bool, err erro
 	}
 	h := t.rev(t.retentionBoundary(rule, own))
 	h = t.protect(n, cfg, own.id, h)
-	// The resource's current keep set stays: retention doesn't replace it.
-	head := t.rev(own.headSeq.Int64)
-	var keepStrs []string
-	var keep []*revRow
-	if own.keep.Valid {
-		if a, ok := jsonv.MustParse([]byte(own.keep.String)).([]any); ok {
-			for _, x := range a {
-				s, _ := x.(string)
-				id, err := ids.Parse(s)
-				if err != nil {
-					continue
-				}
-				if row := t.findInAncestry(head, id); row != nil && row.kind == kindRev {
-					keep = append(keep, row)
-					keepStrs = append(keepStrs, s)
-				}
-			}
-		}
-	}
-	res, perr := t.pruneTo(n, name, own, h, keep, keepStrs, dest, hasArchive, t.authorID(RetentionAuthor))
+	// The resource's current keep set stays: retention doesn't replace it,
+	// as a prune without keep doesn't (§8.6).
+	keep, keepStrs := t.storedKeep(own)
+	res, perr := t.pruneTo(n, name, own, h, keep, keepStrs, false, dest, hasArchive, t.authorID(RetentionAuthor))
 	if perr != nil {
 		return true, false, perr
 	}

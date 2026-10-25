@@ -285,7 +285,7 @@ func TestHeadMetaEncrypted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expect(t, f.prune("e", "p", map[string]any{"horizon": ids[1], "snapshot": snap}, f.writerG), 200)
+	expect(t, f.prune("e", "p", map[string]any{"horizon": ids[1], "snapshot": snap}, f.adminG), 200) // no retention rule: a * key (§8.6)
 	r := f.get("/r/e/p/rev/"+ids[1], f.readerG)
 	expect(t, r, 200)
 	if r.H.Get("X-E2E") != "snapshot" {

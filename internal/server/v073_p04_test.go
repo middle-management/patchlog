@@ -89,5 +89,6 @@ func TestV073P04E2EPruneSnapshotPL(t *testing.T) {
 	if hd, _ := seal.ParseHeader(snap); string(jsonv.Canonical(map[string]any(hd.PL))) != `{"id":"`+h+`","name":"p","ns":"e"}` {
 		t.Fatalf("snapshot header %s", hd.Raw)
 	}
-	expect(t, e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap}, f.writerG), 200)
+	// No retention rule matches p: moving its horizon needs a * key (§8.6).
+	expect(t, e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap}, f.adminG), 200)
 }

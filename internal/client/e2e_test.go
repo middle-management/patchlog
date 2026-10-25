@@ -117,9 +117,10 @@ func testE2EClient(t *testing.T) {
 	sameJSON(t, d.Value, want)
 
 	// Prune with a sealed snapshot: older revisions answer 410, folds start
-	// from the snapshot.
+	// from the snapshot. No retention rule matches d, so moving its horizon
+	// needs a * key: the admin prunes (§8.6).
 	s.Clock.Advance(10 * time.Minute)
-	pr := must(w.PruneE2E(ctx, "e", "d", a.ID))
+	pr := must(ad.PruneE2E(ctx, "e", "d", a.ID))
 	if pr.Horizon != a.ID || pr.NSID == "" {
 		t.Fatalf("prune %+v", pr)
 	}

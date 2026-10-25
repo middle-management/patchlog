@@ -150,14 +150,14 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// An entry only where the prune moved the horizon or changed the keep
+	// set (§7.2, §8.6).
 	if res.NSID != "" {
 		w.Header().Set("X-Namespace-Revision", res.NSID)
 	}
-	out := map[string]any{"horizon": res.Horizon}
-	if res.Archive != "" {
-		out["archive"] = res.Archive
-	}
-	writeJSON(w, 200, out)
+	// The answer is { horizon }, the effective horizon, and nothing else
+	// (§8.6): the archive is linked from the pruned revisions' 410 (§7.1).
+	writeJSON(w, 200, map[string]any{"horizon": res.Horizon})
 }
 
 // pruneRequest reads a prune's request (§8.6): its preconditions, which a

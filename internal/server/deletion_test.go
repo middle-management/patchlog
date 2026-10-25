@@ -300,7 +300,8 @@ func TestPrune(t *testing.T) {
 		t.Fatalf("restore after prune %v", d)
 	}
 
-	// Branch points are protected; branches don't prune.
+	// Branch points are protected; branches don't prune: a prune there
+	// moves nothing and answers the horizon the branch sees (§8.6).
 	c1 := e.create("main", "c", map[string]any{"c": 1.0})
 	c2 := e.appendRev("main", "c", c1, ops(op("replace", "/c", 2.0)))
 	expect(t, e.branch("main", map[string]any{"name": "br"}, "alice"), 201)
@@ -313,7 +314,9 @@ func TestPrune(t *testing.T) {
 		t.Fatalf("branch point not protected: %s", r.Body)
 	}
 	expect(t, e.get("/r/br/c/rev/"+c2), 200)
-	expect(t, e.do(req{method: "POST", path: "/r/br/c/prune", body: map[string]any{"horizon": c2}, author: "admin"}), 422)
+	if r := e.do(req{method: "POST", path: "/r/br/c/prune", body: map[string]any{"horizon": c2}, author: "admin"}); r.Code != 200 || r.Str("horizon") != c2 || r.H.Get("X-Namespace-Revision") != "" {
+		t.Fatalf("branch prune %d %s %v", r.Code, r.Body, r.H)
+	}
 
 	// Referenced schema revisions keep their documents below the horizon.
 	s1 := e.create("main", "s", map[string]any{"$schema": dialect, "type": "object"})

@@ -378,12 +378,17 @@ func TestE2EPruneRetention(t *testing.T) {
 	expectCode(t, e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap, "keep": []any{ids[1]}}, f.writerG), 422, "invalid")
 	wrong, _ := seal.SealSnapshot(k, "e#1", "e", "p", ids[2], map[string]any{"n": 2.0})
 	expectCode(t, e.prune("e", "p", map[string]any{"horizon": h, "snapshot": wrong}, f.writerG), 422, "invalid")
-	r := e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap}, f.writerG)
+	// No retention rule matches p: moving its horizon needs a * key, and
+	// the answer is { horizon } alone, the archive linked from the 410
+	// (§8.6).
+	r := e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap}, f.adminG)
 	expect(t, r, 200)
-	if r.Str("horizon") != h || r.Str("archive") == "" {
+	if r.Str("horizon") != h || len(r.Obj()) != 1 {
 		t.Fatalf("prune %s", r.Body)
 	}
-	expectCode(t, e.get("/r/e/p/rev/"+ids[1], f.readerG), 410, "pruned")
+	if g := e.get("/r/e/p/rev/"+ids[1], f.readerG); g.Code != 410 || g.Str("code") != "pruned" || g.Str("archive") == "" {
+		t.Fatalf("pruned revision %d %s", g.Code, g.Body)
+	}
 	mustEqual(t, f.fold("e", "p", ids[5], keys, f.readerG), map[string]any{"n": 5.0})
 	mustEqual(t, f.fold("e", "p", h, keys, f.readerG), map[string]any{"n": 3.0})
 	// A log from genesis crosses the horizon.
