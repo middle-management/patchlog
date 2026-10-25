@@ -60,12 +60,10 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 			// The grant may force: mayForce passed at step 1.
 			forced = true
 		}
-		if !operator {
-			env := t.basicEnvelope("purge", name, a)
-			env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
-			if err := t.checkRules(cfg, a, env, false); err != nil {
-				return err
-			}
+		env := t.basicEnvelope("purge", name, a)
+		env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
+		if err := t.purgeRules(cfg, a, env, operator && forced); err != nil {
+			return err
 		}
 		// Every log the purge appends to, in ascending key order, after
 		// every other lock (D.8).
@@ -99,10 +97,24 @@ func (t *tx) purgeReach(n *nsRow) map[int64]bool {
 	return reached
 }
 
+// purgeRules is step 6 of a purge or namespace purge (§6.2, §6.4.3): grant,
+// key and role rules (403), then namespace rules (422). overridden, a
+// purge forced past an in_use refusal under a deployment operator grant,
+// isn't judged by namespace rules ("Operator overrides"); its grant's own
+// rules still judge it. A purge forced with a * key of a branch, one the
+// operator forced that needed no forcing, and any purge while
+// authentication is disabled are judged in full.
+func (t *tx) purgeRules(cfg *Config, a *actor, env map[string]any, overridden bool) *Error {
+	if overridden {
+		return t.checkGrantRules(a, env, nil)
+	}
+	return t.checkRules(cfg, a, env, false)
+}
+
 // purger authenticates a purge (§8.3, §8.5). A forced one (§6.1) may come
 // with a grant chained to a deployment operator key instead of one of the
-// namespace's: then operator is true, and the namespace's rules don't
-// apply to it.
+// namespace's: then operator is true, and, where the purge is forced past
+// an in_use refusal, the namespace's rules don't judge it (purgeRules).
 func (t *tx) purger(n *nsRow, cfg *Config, req Request, force bool) (a *actor, operator bool, err *Error) {
 	t.reqCreds = req.anyCreds()
 	a, err = t.authenticate(n.name, n, cfg, req.Cred, nil)
@@ -263,12 +275,10 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 			// The grant may force: mayForce passed at step 1.
 			forced = true
 		}
-		if !operator {
-			env := t.basicEnvelope("purge-ns", "", a)
-			env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
-			if err := t.checkRules(cfg, a, env, false); err != nil {
-				return err
-			}
+		env := t.basicEnvelope("purge-ns", "", a)
+		env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
+		if err := t.purgeRules(cfg, a, env, operator && forced); err != nil {
+			return err
 		}
 		t.deleteArchives(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.deleteDEKs(`ns = ?`, n.id)
