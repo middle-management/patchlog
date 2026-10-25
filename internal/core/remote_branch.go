@@ -1811,7 +1811,8 @@ func (t *tx) checkRemoteSource(n *nsRow, cur, cfg *Config) *Error {
 
 // --- following the base, and registering with it ----------------------------
 
-// remoteBase is a remote_bases row.
+// remoteBase is a remote_bases row. catchUp: the follower reads the base's
+// namespace document as of the checkpoint once more (remote_catchup).
 type remoteBase struct {
 	shadow, branch int64
 	origin, ns, at string
@@ -1819,20 +1820,35 @@ type remoteBase struct {
 	regNSID        sql.NullString
 	regExpires     sql.NullInt64
 	branchName     string
+	catchUp        bool
 }
 
 func (t *tx) remoteBases(where string, args ...any) []*remoteBase {
-	rows, err := t.Query(`SELECT r.shadow, r.branch, r.origin, r.ns, r.at, r.checkpoint, r.reg_ns_id, r.reg_expires, n.name
+	rows, err := t.Query(`SELECT r.shadow, r.branch, r.origin, r.ns, r.at, r.checkpoint, r.reg_ns_id, r.reg_expires, n.name,
+		EXISTS (SELECT 1 FROM remote_catchup c WHERE c.branch = r.branch)
 		FROM remote_bases r JOIN namespaces n ON n.ns = r.branch WHERE `+where+` ORDER BY n.name`, args...)
 	t.must(err)
 	defer rows.Close()
 	var out []*remoteBase
 	for rows.Next() {
 		b := &remoteBase{}
-		t.must(rows.Scan(&b.shadow, &b.branch, &b.origin, &b.ns, &b.at, &b.checkpoint, &b.regNSID, &b.regExpires, &b.branchName))
+		t.must(rows.Scan(&b.shadow, &b.branch, &b.origin, &b.ns, &b.at, &b.checkpoint, &b.regNSID, &b.regExpires, &b.branchName, &b.catchUp))
 		out = append(out, b)
 	}
 	return out
+}
+
+// markRemoteCatchUp is the data migration that has the follower read once
+// more, as of its checkpoint, the namespace document of the base of every
+// remote branch a database from before v0.73's follower holds (§G.5.2,
+// followRemote): that follower skipped config entries but moved the
+// checkpoint past them, so a raise of the base's level, or a read made
+// non-public, seen by it was never followed, and the branch would go on
+// serving its source's content below the level its source serves it at
+// (§1, Addendum E Levels) until the base wrote another config entry.
+func markRemoteCatchUp(ctx context.Context, tx *sql.Tx, _ func(n int) string) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO remote_catchup (branch) SELECT branch FROM remote_bases`)
+	return err
 }
 
 // RemoteNotice is a purge seen in a remote base's log (§G.3), or a config
@@ -1954,7 +1970,11 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 // of its log, whose head is the purge-ns entry (§8.5). On a config entry,
 // or a batch with a config change, the base's namespace document after it
 // is read, before the write transaction, and a raise of its level, or a
-// read made non-public, is followed (followConfig, §G.5.2).
+// read made non-public, is followed (followConfig, §G.5.2). A remote
+// branch from before this follower (catchUp, markRemoteCatchUp) first
+// follows the base's document as of the checkpoint, once, whether or not
+// the log has moved since: the entries before it were followed only for
+// their purges.
 func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	c, ep, err := e.remoteClient(b.origin)
 	if err != nil {
@@ -1984,8 +2004,26 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 		}
 		return err
 	}
-	if len(entries) == 0 {
-		return nil
+	// The catch-up: the base's document as of the checkpoint. One the base
+	// answers 410 purged for is a purged base, whose purge-ns this follows:
+	// nothing is left to raise. One it answers otherwise but B can't read
+	// keeps the mark, and the log is followed without it, so its purges
+	// still apply; the error is reported after.
+	var catchUp *sourceDoc
+	var catchErr error
+	if b.catchUp {
+		d, err := fetchSourceDoc(ctx, c, ep, b.ns, b.checkpoint)
+		switch _, purged := purgedAt(err); {
+		case err == nil:
+			catchUp = &d
+		case noAnswer(err):
+			return err
+		case !purged:
+			catchErr = fmt.Errorf("reading the base's namespace document once more, as the follower before v0.73 skipped it: %w", err)
+		}
+	}
+	if len(entries) == 0 && (!b.catchUp || catchErr != nil) {
+		return catchErr
 	}
 	// The base's namespace document after each config change, which this
 	// deployment reads only from the base itself (§G.5.2).
@@ -2000,13 +2038,21 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 		}
 		docs[en.ID] = d
 	}
-	return e.update(ctx, func(t *tx) error {
+	return errors.Join(e.update(ctx, func(t *tx) error {
 		// The branch's lock first: the checkpoint is read as of it.
 		bn := t.nsByIDLocked(b.branch, lockExclusive)
 		var cp string
 		t.must(t.QueryRow(`SELECT checkpoint FROM remote_bases WHERE shadow = ?`, b.shadow).Scan(&cp))
 		if cp != b.checkpoint {
 			return nil // followed concurrently
+		}
+		if b.catchUp && catchErr == nil {
+			res, err := t.Exec(`DELETE FROM remote_catchup WHERE branch = ?`, bn.id)
+			t.must(err)
+			if k, err := res.RowsAffected(); err == nil && k > 0 && catchUp != nil && !bn.purged {
+				t.followConfig(bn, b.checkpoint, *catchUp)
+				bn = t.nsByIDLocked(bn.id, lockExclusive)
+			}
 		}
 		author := t.authorID(RemoteAuthor)
 		for _, en := range entries {
@@ -2058,7 +2104,7 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 		_, err := t.Exec(`UPDATE remote_bases SET checkpoint = ? WHERE shadow = ?`, head, b.shadow)
 		t.must(err)
 		return nil
-	})
+	}), catchErr)
 }
 
 // configChanged reports whether a namespace entry changes the namespace

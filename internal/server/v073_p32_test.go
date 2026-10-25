@@ -486,3 +486,92 @@ func TestV073RemoteConfigPurgedBase(t *testing.T) {
 	}
 	expect(t, b.patchNS("r", ops(op("add", "/x-note", "n")), ""), 201)
 }
+
+// ENC-45, CIS-32 on a database from before v0.73's follower: that follower
+// skipped config entries but moved its checkpoint past them, so a raise,
+// or a read made non-public, that A made before the upgrade is in no entry
+// the upgraded follower reads. Opening such a database has the follower
+// read A's document once more, as of the checkpoint (remote_catchup),
+// whether or not A's log has moved since: on a server without the level
+// the branch then answers 502 upstream (§1), and a public branch of a base
+// made non-public is restricted (§G.5.2). Once: a remote branch created by
+// this version isn't marked, and the mark goes with the first follow.
+func TestV073RemoteCatchUpAfterUpgrade(t *testing.T) {
+	t.Parallel()
+	path, blobs := v073DB(t), t.TempDir()
+	at := func(o *core.Options) { o.Path, o.BlobDir = path, blobs }
+	a, b, rt := pair(t, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning}, []envOpt{withEncTuning, at})
+	a.mkNS("m", map[string]any{"read": "public"})
+	x1 := a.create("m", "x", map[string]any{"v": 1.0})
+	a.mkNS("p", map[string]any{"read": "public"})
+	a.create("p", "y", map[string]any{"v": 2.0})
+	expect(t, b.mkRemote("r", remoteGenesis("m", a.nsHead("m"), nil)), 201)
+	expect(t, b.mkRemote("q", remoteGenesis("p", a.nsHead("p"), nil)), 201)
+	expect(t, b.branch("r", map[string]any{"name": "rx"}, "alice"), 201)
+	// A raises m, then writes on, so its head is no config entry; and it
+	// makes p readable by grant only.
+	expect(t, a.patchNS("m", ops(op("add", "/encryption", map[string]any{"level": "sealed"})), ""), 201)
+	a.wr("m", "later", "", withNonce(addRoot(map[string]any{"v": 3.0})))
+	expect(t, a.patchNS("p", ops(op("replace", "/read", "grant")), ""), 201)
+	b.srv.Close()
+	b.e.Close()
+
+	db, q := v073SQL(t, path)
+	count := func(table string) int {
+		t.Helper()
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := count("remote_catchup"); n != 0 {
+		t.Fatalf("remote branches created by this version marked for a catch-up: %d", n)
+	}
+	// As the follower before v0.73 left it: the checkpoint at A's head,
+	// the config entries before it unread, and the migration not run.
+	for _, c := range []struct {
+		s    string
+		args []any
+	}{
+		{`UPDATE remote_bases SET checkpoint = ? WHERE ns = ?`, []any{a.nsHead("m"), "m"}},
+		{`UPDATE remote_bases SET checkpoint = ? WHERE ns = ?`, []any{a.nsHead("p"), "p"}},
+		{`DELETE FROM migrations WHERE name = 'remote-levels-catch-up'`, nil},
+	} {
+		if _, err := db.Exec(q(c.s), c.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b = newEnv(t, withOrigin(originB), withRemote(rt), withEncTuning, at)
+	if n := count("remote_catchup"); n != 2 {
+		t.Fatalf("marked for a catch-up on upgrade: %d, want 2", n)
+	}
+	if err := syncRemotes(t, b); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/r/r/x/rev/" + x1, "/r/r/x", "/r/rx/x"} {
+		if r := b.get(p); r.Code != 502 || r.Str("code") != "upstream" || r.Str("origin") != originA {
+			t.Errorf("%s: %d %s, want 502 upstream: A is sealed and B lacks sealed", p, r.Code, r.Body)
+		}
+	}
+	ctx := context.Background()
+	if ls, err := b.e.RemoteLevels(ctx, "r"); err != nil || len(ls) != 1 || !ls[0].Lacks || ls[0].Level != "sealed" {
+		t.Fatalf("levels %+v %v", ls, err)
+	}
+	for _, ns := range []string{"q"} {
+		if doc := b.configOf(ns); doc["read"] != "grant" {
+			t.Fatalf("%s after its base's read was restricted before the upgrade: %v", ns, doc)
+		}
+	}
+	if n := count("remote_catchup"); n != 0 {
+		t.Fatalf("catch-up marks left after following: %d", n)
+	}
+	// Once: following again records nothing new.
+	before, _ := b.e.RemoteNotices(ctx, "")
+	if err := syncRemotes(t, b); err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := b.e.RemoteNotices(ctx, ""); len(after) != len(before) || len(before) != 2 {
+		t.Fatalf("notices %+v, then %+v", before, after)
+	}
+}

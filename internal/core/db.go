@@ -362,6 +362,15 @@ CREATE TABLE IF NOT EXISTS remote_levels (
   id      TEXT    NOT NULL,
   created INTEGER NOT NULL
 );
+
+-- Addition: a remote branch whose base's namespace document the follower
+-- reads once more, as of its checkpoint (§G.5.2, remote_branch.go
+-- followRemote): one created before the follower followed config entries,
+-- which moved its checkpoint past them unread, so a raise made then would
+-- never be seen. The data migration remote-levels-catch-up fills it once.
+CREATE TABLE IF NOT EXISTS remote_catchup (
+  branch INTEGER PRIMARY KEY REFERENCES namespaces
+);
 `
 
 // openDB opens the database: a Postgres URL (pgschema.go), or a SQLite
@@ -500,6 +509,10 @@ var dataMigrations = []struct {
 	// P18: purge the public edge copies of sealed and e2e namespaces with
 	// read "grant", cached publicly before v0.73 (purgeGrantCaches, RH-44).
 	{"grant-caches-private", purgeGrantCaches},
+	// P32: remote branches from before the follower followed their
+	// base's config entries read its document once (remote_catchup,
+	// markRemoteCatchUp, §G.5.2).
+	{"remote-levels-catch-up", markRemoteCatchUp},
 }
 
 func migrateData(ctx context.Context, tx *sql.Tx, ph func(n int) string) error {

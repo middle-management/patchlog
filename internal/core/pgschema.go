@@ -428,6 +428,12 @@ CREATE TABLE IF NOT EXISTS remote_levels (
   id      text     NOT NULL,
   created bigint   NOT NULL
 );
+-- A remote branch whose base's namespace document the follower reads once
+-- more, as of its checkpoint (§G.5.2; db.go, remote_branch.go): one from
+-- before the follower followed config entries.
+CREATE TABLE IF NOT EXISTS remote_catchup (
+  branch bigint PRIMARY KEY REFERENCES namespaces
+);
 `
 
 // openPG opens a Postgres database and creates or migrates its schema.
