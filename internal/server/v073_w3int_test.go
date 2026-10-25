@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -55,4 +56,27 @@ func TestV073W3PurgeOperatorRules(t *testing.T) {
 	if en := e.lastNSEntry("sch"); en["kind"] != "purge" || en["forced"] != true {
 		t.Fatalf("forced purge entry %v", en)
 	}
+}
+
+// §7.8 check 2 with §1 (P27 x P32): an upload to a resource a remote
+// branch answers 502 upstream for gets that 502, after authorisation and
+// the purged namespace's 410, as a write does at step 2.1. P27 put the
+// upstreamRefusal hook in the upload gate while P32 filled it in. A
+// resource the base didn't have at the branch's at takes uploads still.
+func TestV073W3UploadToUpstreamResource(t *testing.T) {
+	t.Parallel()
+	a, b, _ := pair(t, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning}, []envOpt{withEncTuning})
+	a.mkNS("m", map[string]any{"read": "public"})
+	a.create("m", "x", map[string]any{"v": 1.0})
+	expect(t, b.mkRemote("r", remoteGenesis("m", a.nsHead("m"), nil)), 201)
+	r, _ := b.putBlob("r", "x", "text/plain", "", []byte("before"), "admin")
+	expect(t, r, 201)
+	expect(t, a.patchNS("m", ops(op("add", "/encryption", map[string]any{"level": "sealed"})), ""), 201)
+	if err := b.e.SyncRemotes(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r, _ = b.putBlob("r", "x", "text/plain", "", []byte("after"), "admin")
+	expectCode(t, r, 502, "upstream")
+	r, _ = b.putBlob("r", "fresh", "text/plain", "", []byte("after"), "admin")
+	expect(t, r, 201)
 }
