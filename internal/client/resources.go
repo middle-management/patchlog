@@ -528,7 +528,9 @@ func (c *Client) Purge(ctx context.Context, ns, name, head string, force bool) (
 // PruneRequest is the body of POST /r/{ns}/{name}/prune (§8.6).
 type PruneRequest struct {
 	Horizon string
-	Keep    []string // replaces the resource's earlier keep set; nil = none
+	// Keep, when not nil, replaces the resource's keep set, and an empty
+	// slice clears it; nil leaves the stored set alone (§8.6).
+	Keep []string
 	// Snapshot is the horizon's document sealed by a key holder, required
 	// for resources of e2e namespaces (§8.6; see E2E.Prune).
 	Snapshot string
@@ -537,7 +539,9 @@ type PruneRequest struct {
 // PruneResult is the outcome of a prune.
 type PruneResult struct {
 	Horizon string // the effective horizon (may be lower than requested)
-	NSID    string // the prune entry, "" if the horizon did not move
+	// NSID is the prune entry, "" when the prune neither moved the
+	// horizon nor changed the keep set, or ran in a branch (§8.6).
+	NSID string
 }
 
 // Prune prunes a resource's history below a horizon (§8.6). It takes no
