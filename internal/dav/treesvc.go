@@ -155,7 +155,15 @@ func (ts *treeShared) init(opt *Options) error {
 	if opt.TreeService == "" && len(urls) == 0 {
 		return nil
 	}
-	ts.hc = &http.Client{Transport: telemetry.Transport(nil), Timeout: time.Minute,
+	// A connection pool of its own, a clone of http.DefaultTransport's
+	// settings (proxy, TLS, timeouts), keeping as many idle connections per
+	// host as requests one listing may have in flight: the default pool is
+	// shared with whatever else the process runs, and anything there that
+	// calls its CloseIdleConnections (an httptest.Server's Close, in tests)
+	// cancels this server's dials in progress.
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.MaxIdleConnsPerHost = max(base.MaxIdleConnsPerHost, 16)
+	ts.hc = &http.Client{Transport: telemetry.Transport(base), Timeout: time.Minute,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	now := opt.Now
 	opt.Client = opt.Client.With(client.WithTransport(func(next http.RoundTripper) http.RoundTripper { return watchWrites(next, now) }))
@@ -878,6 +886,11 @@ func (st *reqState) svcListing(ctx context.Context, cat, op string, q url.Values
 		}
 		out = append(out, a.Children...)
 		out = append(out, a.Roots...)
+		if len(out) > maxTreePages*st.s.ts.page {
+			// More than a folder lists, as roots, which come in one page
+			// without total, can be (§H.3).
+			return nil, tooBig()
+		}
 		if a.Next == "" {
 			return out, nil
 		}

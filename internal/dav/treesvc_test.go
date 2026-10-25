@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
-	"net/url"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -380,8 +378,7 @@ func TestTreeServiceFileMetadata(t *testing.T) {
 // listings f changes.
 func rewriting(t *testing.T, target string, f func([]map[string]any) []map[string]any) string {
 	t.Helper()
-	u := must(url.Parse(target))
-	rp := httputil.NewSingleHostReverseProxy(u)
+	rp := proxyTo(target)
 	rp.ModifyResponse = func(res *http.Response) error {
 		if res.StatusCode != 200 || !strings.HasPrefix(res.Header.Get("Content-Type"), "application/json") {
 			return nil
@@ -697,7 +694,7 @@ func TestTreeServiceDown(t *testing.T) {
 			io.WriteString(w, `{"code":"behind","message":"the tree service has not reached the catalog yet"}`)
 			return
 		}
-		httputil.NewSingleHostReverseProxy(must(url.Parse(tr.http.URL))).ServeHTTP(w, r)
+		proxyTo(tr.http.URL).ServeHTTP(w, r)
 	}))
 	ts := treeDav(e, front.URL, options(func(o *dav.Options) { o.CatalogTTL = time.Nanosecond }))
 	sameStrings(t, "Season", names(ts.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
@@ -732,7 +729,7 @@ func TestTreeServiceRefusedGrant(t *testing.T) {
 				io.WriteString(w, `{"code":"unauthorized","message":"no key verifies the grant"}`)
 				return
 			}
-			httputil.NewSingleHostReverseProxy(must(url.Parse(target))).ServeHTTP(w, r)
+			proxyTo(target).ServeHTTP(w, r)
 		}))
 		return front.URL
 	}
@@ -947,7 +944,7 @@ func TestTreeServiceOwnWritesUntilReached(t *testing.T) {
 		if r.URL.Query().Has("min") {
 			mins.Add(1)
 		}
-		httputil.NewSingleHostReverseProxy(must(url.Parse(tr.http.URL))).ServeHTTP(w, r)
+		proxyTo(tr.http.URL).ServeHTTP(w, r)
 	}))
 	clk := &testClock{t: time.Now()}
 	ts := treeDav(e, front.URL, options(func(o *dav.Options) { o.TreeWait = 300 * time.Millisecond; o.Now = clk.now }))
@@ -1132,7 +1129,7 @@ func minRefusedPerNamespace(t *testing.T, slow bool) {
 			// The first listing naming ghost answered after TreeWait.
 			time.Sleep(time.Second)
 		}
-		httputil.NewSingleHostReverseProxy(must(url.Parse(tr.http.URL))).ServeHTTP(rw, r)
+		proxyTo(tr.http.URL).ServeHTTP(rw, r)
 	}))
 	sentSince := func(n int) []string {
 		mu.Lock()
@@ -1240,7 +1237,7 @@ func TestTreeServiceMinsBounded(t *testing.T) {
 			io.WriteString(w, `{"code":"behind","message":"the tree service has not reached min yet"}`)
 			return
 		}
-		httputil.NewSingleHostReverseProxy(must(url.Parse(a.tr.http.URL))).ServeHTTP(w, r)
+		proxyTo(a.tr.http.URL).ServeHTTP(w, r)
 	}))
 	clk := &testClock{t: time.Now()}
 	g := a.gateway(t, front.URL, func(o *dav.Options) { o.TreeWait, o.Now = 300*time.Millisecond, clk.now })

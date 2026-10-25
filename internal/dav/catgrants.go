@@ -143,7 +143,8 @@ func (st *reqState) catalogPost(ctx context.Context, cat, path string, body []by
 	if len(mins) > 0 {
 		q = "?" + url.Values{"min": mins}.Encode()
 	}
-	deadline := st.s.opt.Now().Add(st.s.opt.TreeWait)
+	// Waited out in real time, as a listing's TreeWait is (svcListing).
+	deadline := time.Now().Add(st.s.opt.TreeWait)
 	for wait := 50 * time.Millisecond; ; wait = min(2*wait, time.Second) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, st.s.treeURL(cat)+path+q, bytes.NewReader(body))
 		if err != nil {
@@ -179,7 +180,7 @@ func (st *reqState) catalogPost(ctx context.Context, cat, path string, body []by
 		}
 		switch res.StatusCode {
 		case http.StatusServiceUnavailable, http.StatusTooManyRequests:
-			if st.s.opt.Now().Add(wait).Before(deadline) {
+			if time.Now().Add(wait).Before(deadline) {
 				select {
 				case <-time.After(wait):
 					continue

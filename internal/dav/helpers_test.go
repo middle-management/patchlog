@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"reflect"
 	"sort"
@@ -150,6 +151,18 @@ type resp struct {
 // closes the default one's idle connections, which breaks a request a
 // parallel test is starting on it.
 var testHTTP = &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
+
+// proxyTo is a reverse proxy to target over testHTTP's connection pool,
+// not http.DefaultTransport's, for the reason testHTTP has its own.
+func proxyTo(target string) *httputil.ReverseProxy {
+	u, err := url.Parse(target)
+	if err != nil {
+		panic(err)
+	}
+	rp := httputil.NewSingleHostReverseProxy(u)
+	rp.Transport = testHTTP.Transport
+	return rp
+}
 
 // do sends a WebDAV request with e's password; hdr are name, value pairs.
 func (e *env) do(method, p, body string, hdr ...string) resp {

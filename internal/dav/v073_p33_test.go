@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
-	"net/url"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -238,7 +236,7 @@ func treeFront(t *testing.T, target string) (string, func() []string) {
 	t.Helper()
 	var mu sync.Mutex
 	var paths []string
-	rp := httputil.NewSingleHostReverseProxy(must(url.Parse(target)))
+	rp := proxyTo(target)
 	front := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		paths = append(paths, r.URL.Path)
@@ -681,15 +679,19 @@ func TestTreeDerivedOwnEntriesV073(t *testing.T) {
 }
 
 // GW-31 (§H.5, §B.11.4): a Move grant's patch set begins with the test
-// of /parents the catalog decided; where that is stale (the node moved
+// of /parents the catalog decided. Where that is stale (the node moved
 // since the decision), the core refuses the test (422), and the gateway
-// answers 409, asking for a reload; nothing is written.
+// answers 409, asking for a reload; where the answer gives no parents,
+// so that no test leads the patch set, the core refuses the grant's rule
+// (403), and the gateway passes that on. Nothing is written either way.
 func TestTreeDerivedStaleMoveV073(t *testing.T) {
 	t.Parallel()
 	w := newDerivedWorld(t)
-	// The catalog's answers pass through a proxy that makes the parents
-	// of a Move decision stale: another order than the node's.
-	rp := httputil.NewSingleHostReverseProxy(must(url.Parse(w.catURL)))
+	// The catalog's answers to Move requests pass through a proxy that
+	// makes their parents stale (another order than the node's), or drops
+	// them, as mode says.
+	var mode atomic.Value
+	rp := proxyTo(w.catURL)
 	rp.ModifyResponse = func(r *http.Response) error {
 		if r.Request.URL.Path != "/grants" || r.StatusCode != http.StatusOK || r.Request.Header.Get("X-Want") != "move" {
 			return nil
@@ -699,8 +701,13 @@ func TestTreeDerivedStaleMoveV073(t *testing.T) {
 			return err
 		}
 		r.Body.Close()
-		if ps, _ := a["parents"].([]any); len(ps) > 0 {
-			ps[0].(map[string]any)["order"] = "zz"
+		switch mode.Load() {
+		case "stale":
+			if ps, _ := a["parents"].([]any); len(ps) > 0 {
+				ps[0].(map[string]any)["order"] = "zz"
+			}
+		case "missing":
+			delete(a, "parents")
 		}
 		b, _ := json.Marshal(a)
 		r.Body = io.NopCloser(bytes.NewReader(b))
@@ -723,11 +730,219 @@ func TestTreeDerivedStaleMoveV073(t *testing.T) {
 	g := &env{t: t, ctx: w.ctx, s: w.s, c: w.ops, dav: newTestServer(t, must(dav.New(opt)))}
 	bob := w.user(t, "user:bob", "match-desk")
 	before, _ := g.load("cat", "matches.derby")
-	r := g.expect(g.doAs(bob, "MOVE", "/cat/Season%202026/derby.json", "", "Destination", "/cat/Season%202026/d2.json"), 409, "bob's rename, the catalog's decision stale")
-	if !strings.Contains(r.body, "test of its parents failed") || !strings.Contains(r.body, "reload") {
-		t.Fatalf("409 %q", r.body)
+	for _, c := range []struct {
+		mode   string
+		status int
+		says   []string
+	}{
+		{"stale", 409, []string{"test of its parents failed", "reload"}},
+		{"missing", 403, nil},
+	} {
+		mode.Store(c.mode)
+		r := g.expect(g.doAs(bob, "MOVE", "/cat/Season%202026/derby.json", "", "Destination", "/cat/Season%202026/d2.json"), c.status, "bob's rename, the catalog's parents "+c.mode)
+		for _, s := range c.says {
+			if !strings.Contains(r.body, s) {
+				t.Fatalf("%s: %d %q", c.mode, c.status, r.body)
+			}
+		}
+		if after, doc := g.load("cat", "matches.derby"); after.ID != before.ID {
+			t.Fatalf("%s: the placement changed: %v", c.mode, doc)
+		}
 	}
-	if after, doc := g.load("cat", "matches.derby"); after.ID != before.ID {
-		t.Fatalf("the placement changed: %v", doc)
+}
+
+// GW-31 (§H.4 "New files", §H.1 raw files): in a tree with tree-derived
+// access, a new raw file is placed first, then its blob uploaded and its
+// item created, under the Create grant the catalog resolves from the
+// placement; a later save of new bytes uploads its blob and edits the
+// reference under the catalog's content grant for the item.
+func TestTreeDerivedRawFileV073(t *testing.T) {
+	t.Parallel()
+	w := newDerivedWorld(t)
+	g := w.g
+	bob := w.user(t, "user:bob", "match-desk")
+	g.expect(g.doAs(bob, "PUT", "/cat/Season%202026/note.txt", "hello\n"), 201, "bob's new raw file")
+	node, _ := w.titled(t, "note.txt")
+	if node == "" {
+		t.Fatal("note.txt has no placement")
 	}
+	item := strings.TrimPrefix(node, "matches.")
+	_, idoc := g.load("matches", item)
+	if m, _ := idoc.(map[string]any); m["$blob"] == nil || m["type"] != "text/plain" {
+		t.Fatalf("note.txt's item %s: %v", item, idoc)
+	}
+	if e := g.lastEntry("matches", item); e.Grant == nil || e.Grant.Kid != "catalog-01" || e.Grant.Sub != "user:bob" {
+		t.Fatalf("note.txt's item was created under %+v, not the catalog's Create grant", e.Grant)
+	}
+	if b := g.expect(g.doAs(bob, "GET", "/cat/Season%202026/note.txt", ""), 200, "bob's GET of note.txt").body; b != "hello\n" {
+		t.Fatalf("note.txt reads %q", b)
+	}
+	w.caughtUp(t)
+	g.expect(g.doAs(bob, "PUT", "/cat/Season%202026/note.txt", "hello again\n"), 201, "bob's save of note.txt")
+	if b := g.expect(g.doAs(bob, "GET", "/cat/Season%202026/note.txt", ""), 200, "bob's GET after the save").body; b != "hello again\n" {
+		t.Fatalf("note.txt reads %q after the save", b)
+	}
+	if _, idoc := g.load("matches", item); idoc.(map[string]any)["size"] != float64(len("hello again\n")) {
+		t.Fatalf("note.txt's item %s after the save: %v", item, idoc)
+	}
+	if e := g.lastEntry("matches", item); e.Grant == nil || e.Grant.Kid != "catalog-01" || e.Grant.Sub != "user:bob" {
+		t.Fatalf("note.txt's save was written under %+v, not a grant the catalog issued him", e.Grant)
+	}
+}
+
+// GW-19 (§H.3: "a case-sensitive gateway lists the folder instead when
+// the answer's title differs in case"): lookup compares titles after case
+// folding, so in a case-sensitive gateway a name it resolves to a title
+// of another case is looked for in the folder's listing, where it is no
+// file or folder (404), and a deeper path is resolved by listing; the
+// exact name still resolves by one lookup.
+func TestTreeServiceLookupCaseSensitiveV073(t *testing.T) {
+	t.Parallel()
+	e := treeEnv(t)
+	tr := startTree(t, e.s, "cat")
+	tr.caughtUp("cat", "matches")
+	front, take := treeFront(t, tr.http.URL)
+	ts := treeDav(e, front, options(func(o *dav.Options) { o.CaseSensitive = true }))
+	take()
+	ts.expect(ts.do("PROPFIND", "/cat/Season", "", "Depth", "0"), 207, "PROPFIND of a folder by its name")
+	if paths := take(); count(paths, "/lookup") == 0 || count(paths, "/children") != 0 {
+		t.Fatalf("a folder by its exact name asked the tree service %q", paths)
+	}
+	ts.expect(ts.do("PROPFIND", "/cat/SEASON", "", "Depth", "0"), 404, "PROPFIND of the folder by another case")
+	if paths := take(); count(paths, "/lookup") == 0 || count(paths, "/children") == 0 {
+		t.Fatalf("a folder by another case of its name, which lookup resolves, wasn't looked for by listing: %q", paths)
+	}
+	cs := treeDav(e, front, options(func(o *dav.Options) { o.CaseSensitive = true }))
+	take()
+	cs.expect(cs.do("GET", "/cat/Season/DERBY.json", ""), 404, "GET of a file by another case")
+	if paths := take(); count(paths, "/lookup") != 0 || count(paths, "/children") == 0 {
+		t.Fatalf("a deeper path in a case-sensitive gateway asked the tree service %q", paths)
+	}
+	if b := cs.expect(cs.do("GET", "/cat/Season/derby.json", ""), 200, "GET of the file by its name").body; b != rendered(map[string]any{"title": "Derby"}) {
+		t.Fatalf("derby.json reads %q", b)
+	}
+}
+
+// GW-18 (§H.2 "Siblings", §B.11.5): the top level from roots, where
+// files.root is hidden from the user, takes the duplicate rule as any
+// folder does: two visible roots titled alike are numbered in order of
+// their born, and each opens by its name.
+func TestTreeServiceRootsDuplicatesV073(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	time.Sleep(10 * time.Millisecond) // a later born than season's
+	must(a.w.CreateDoc(a.ctx, "cat", "again", map[string]any{"title": "Season", "parents": parents("cat", "root")}))
+	must(a.w.CreateDoc(a.ctx, "matches", "inner", map[string]any{"title": "Inner"}))
+	must(a.w.CreateDoc(a.ctx, "cat", "matches.inner", map[string]any{"title": "inner.json", "parents": parents("cat", "again")}))
+	a.tr.caughtUp("cat", "matches")
+	g := a.gateway(t, a.tr.http.URL)
+	li := a.limitedTo(t, "user:li", "season", "again", "matches.derby", "derby", "matches.inner", "inner")
+	sameStrings(t, "li's top level, root hidden", names(g.propfindAs(li, "/cat/"), "/cat/"), []string{"Season (2)/", "Season/"})
+	sameStrings(t, "li's Season", names(g.propfindAs(li, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+	sameStrings(t, "li's Season (2)", names(g.propfindAs(li, "/cat/Season%20(2)/"), "/cat/Season (2)/"), []string{"inner.json"})
+}
+
+// GW-31 (§H.4 "Names before writes"): a grant that can't read the node
+// documents keeps the listing's view for names, checked against the
+// node's own document where it reads it: a file renamed by another
+// program since the listing the token keeps is, by its old name, neither
+// deleted nor renamed (404), and stays as it is. (Each through a gateway
+// of its own: a refusal for a stale name has the token's listing read
+// again, where the old name is no file.)
+func TestTreeServiceLimitedGrantStaleNameV073(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	ann := a.k.Grant(t, a.s.Now(), "user:ann", a.both, []string{"read", "create", "append", "delete"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "season", "matches.derby", "derby", "matches.cup", "cup"}}}}})
+	cases := []struct {
+		node, method, path string
+		g                  *env
+	}{
+		{node: "matches.derby", method: "DELETE", path: "/cat/Season/derby.json"},
+		{node: "matches.cup", method: "MOVE", path: "/cat/Season/cup.json"},
+	}
+	for i := range cases {
+		cases[i].g = a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.CatalogTTL = time.Hour })
+		sameStrings(t, "ann's Season", names(cases[i].g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
+	}
+	heads := map[string]string{}
+	for _, c := range cases {
+		h, _ := c.g.load("cat", c.node)
+		heads[c.node] = must(a.w.Append(a.ctx, "cat", c.node, h.ID, []any{replace("/title", "renamed-"+c.method+".json")})).ID
+	}
+	for _, c := range cases {
+		r := c.g.expect(c.g.doAs(ann, c.method, c.path, "", "Destination", "/cat/Season/d2.json"), 404, "ann's "+c.method+" of "+c.path+", renamed elsewhere since her listing")
+		if !strings.Contains(r.body, "renamed or moved") {
+			t.Fatalf("%s: 404 %q", c.method, r.body)
+		}
+		if h, doc := c.g.load("cat", c.node); h.ID != heads[c.node] {
+			t.Fatalf("%s: %s changed: %v", c.method, c.node, doc)
+		}
+	}
+	for _, item := range []string{"derby", "cup"} {
+		if h, _ := a.w.Head(a.ctx, "matches", item); h.State != client.Live {
+			t.Fatalf("%s is %v", item, h.State)
+		}
+	}
+}
+
+// GW-18, GW-19 (§H.3 "A folder too large to list whole"): the top level
+// from roots, which a tree service gives in one page without total, is
+// refused at once (403) when it holds more than a folder lists, never
+// shown cut short.
+func TestTreeServiceRootsTooManyV073(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	var items []client.BatchItem
+	visible := []any{}
+	for i := 0; i < 21; i++ {
+		name := fmt.Sprintf("r%02d", i)
+		visible = append(visible, name)
+		items = append(items, client.BatchItem{Resource: name, IfNoneMatch: true,
+			Steps: []client.Step{client.PatchStep(client.GenesisPatches(map[string]any{"title": "R" + name, "parents": parents("cat", "root")}))}})
+	}
+	must(a.w.Batch(a.ctx, "cat", client.BatchRequest{Items: items}, false))
+	a.tr.caughtUp("cat", "matches")
+	srv := must(dav.New(dav.Options{Client: a.s.Client(t), Catalogs: []string{"cat"}, Gateway: true, TreeService: a.tr.http.URL, Logf: t.Logf}))
+	dav.SetTreePage(srv, 2)
+	g := &env{t: t, ctx: a.ctx, s: a.s, c: a.w, dav: newTestServer(t, srv)}
+	li := a.limitedTo(t, "user:li", visible...)
+	r := g.expect(g.doAs(li, "PROPFIND", "/cat/", "", "Depth", "1"), 403, "li's top level, 21 roots, over the bound")
+	if !strings.Contains(r.body, "more than 20") {
+		t.Fatalf("403 %q", r.body)
+	}
+	few := a.limitedTo(t, "user:li", visible[:20]...)
+	if got := names(g.propfindAs(few, "/cat/"), "/cat/"); len(got) != 20 {
+		t.Fatalf("a top level of 20 roots: %v", got)
+	}
+}
+
+// GW-18 (§H.3, §B.11.5): where files.root is hidden from a grant that
+// can't read the node documents, the top level shown once the wait for
+// the user's writes is over (limitedWait) is the roots too, as without
+// writes to wait for: the tree service here never reaches them.
+func TestTreeServiceBehindRootsV073(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	front := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("min") {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, `{"code":"behind","message":"the tree service has not reached min yet"}`)
+			return
+		}
+		proxyTo(a.tr.http.URL).ServeHTTP(w, r)
+	}))
+	clk := &testClock{t: time.Now()}
+	g := a.gateway(t, front.URL, func(o *dav.Options) { o.TreeWait, o.Now = 300*time.Millisecond, clk.now })
+	ann := a.k.Grant(t, a.s.Now(), "user:ann", a.both, []string{"read", "create", "append", "delete"})
+	narrow := a.limitedTo(t, "user:ann", "season", "matches.derby", "derby")
+	sameStrings(t, "ann's top level through her limited token, root hidden", names(g.propfindAs(narrow, "/cat/"), "/cat/"), []string{"Season/"})
+	g.expect(g.doAs(ann, "PUT", "/cat/Season/derby.json", `{"title": "Derby!"}`), 201, "ann's PUT of derby.json")
+	clk.add(10 * time.Second)
+	g.expect(g.doAs(narrow, "PROPFIND", "/cat/", "", "Depth", "1"), 503, "the limited token's top level 10 s after ann's write")
+	clk.add(time.Minute)
+	sameStrings(t, "the limited token's top level a minute after ann's write", names(g.propfindAs(narrow, "/cat/"), "/cat/"), []string{"Season/"})
+	g.expect(g.doAs(narrow, "PUT", "/cat/new.json", `{"n": 1}`), 404, "the limited token's new file at the top level")
 }

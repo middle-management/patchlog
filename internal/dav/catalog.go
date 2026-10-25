@@ -1512,7 +1512,7 @@ func (st *reqState) stillNamed(src target, doc any) bool {
 // (elsewhere a 404 may be the core hiding it, §7); or in a namespace the
 // catalog doesn't trust, which no listing shows (§B.5, §H.2).
 func (st *reqState) dangling(ctx context.Context, cg *catGraph, n *tree.Node) bool {
-	if c, err := st.treeConf(ctx, cg.cat); err == nil && !slices.Contains(c.trust, n.ItemNS) {
+	if c, err := st.treeConf(ctx, cg.cat); err == nil && !c.trusts(n.ItemNS) {
 		return true
 	}
 	if st.s.nsInfo(ctx, st.tk, n.ItemNS).sealed {
