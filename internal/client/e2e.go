@@ -1325,14 +1325,18 @@ func (x *E2E) padHistory(ctx context.Context, ns, head string, prev *padHistory)
 // flags, at the same index. One that opens but isn't padded as its
 // namespace padded keeps its patches and no flag, since folds still apply
 // it (§E.3.2); folds flag it. The ids stay those over ciphertext. Merge
-// and rebase (§F.8) read branch changes this way. A leading entry with
-// neither kind nor patch set (a horizon, as merge plans list one) is what
-// the others follow, for placing the forks of a branch's chain
-// (chainCheck).
+// and rebase (§F.8) read branch changes this way. What the entries follow
+// places the forks of a branch's chain (chainCheck): a leading entry with
+// neither kind nor patch set (a horizon, as merge plans list one), else
+// the first entry's parent ("" for a genesis).
 func (x *E2E) OpenLog(ctx context.Context, ns, name string, es []LogEntry) (out []LogEntry, flags []string, err error) {
 	since := ""
-	if len(es) > 0 && es[0].Kind == "" && !es[0].HasPatches {
+	switch {
+	case len(es) == 0:
+	case es[0].Kind == "" && !es[0].HasPatches:
 		since = es[0].ID
+	default:
+		since = es[0].Parent
 	}
 	return x.openLog(ctx, ns, name, since, es)
 }
@@ -1344,6 +1348,11 @@ func (x *E2E) openLog(ctx context.Context, ns, name, since string, es []LogEntry
 		ids[i] = e.ID
 	}
 	nsOK := x.inChainOf(ctx, ns, name, since, ids)
+	if since != "" {
+		// The range is past since: where since is a fork, so is every
+		// entry of it (as fold, which starts at since's snapshot).
+		nsOK.at(since)
+	}
 	out = make([]LogEntry, len(es))
 	flags = make([]string, len(es))
 	for i, e := range es {

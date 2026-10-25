@@ -550,53 +550,85 @@ func TestV073P29LegacyKeyringNeverSeals(t *testing.T) {
 
 // P29 review, Addendum E Levels, §E.3.1 (ENC-27): undo reads a resource's
 // log after its hint, and the base's ns is accepted only for entries up to
-// the branch's fork whether or not the range starts at the genesis. An
+// the branch's fork whether or not the range starts at the genesis, the
+// hint being the fork itself or the branch's own revision past it. An
 // entry sealed under the base's key that the server splices into the
 // branch's log past the fork, before the gesture (played by the
 // transport), is flagged and folded as [], so the undo doesn't take what it
 // says into the document it writes back.
 func TestV073P29UndoRangeAfterForkFlagsBaseEntry(t *testing.T) {
 	t.Parallel()
+	for _, hintAtFork := range []bool{false, true} {
+		ctx := context.Background()
+		v := newP29Env(t, nil)
+		w1 := must(v.x.CreateDocSealed(ctx, "e", "d", map[string]any{"n": 1.0, "x": 0.0}))
+		fork := must(v.x.AppendSealed(ctx, "e", "d", w1.ID, ops(op("replace", "/n", 2))))
+		must(v.c.CreateBranch(ctx, "e", client.BranchRequest{Name: "eb"}))
+		kw := must(v.x.InitKeyring(ctx, "eb"))
+		hint, since, want := fork, kw.NSID, 2.0
+		if !hintAtFork {
+			p1 := must(v.x.AppendSealed(ctx, "eb", "d", fork.ID, ops(op("replace", "/n", 3))))
+			hint, since, want = p1, p1.NSID, 3.0
+		}
+		g := client.NewGesture()
+		g1 := must(v.x.AppendSealed(ctx, "eb", "d", hint.ID, ops(op("replace", "/n", 4)), client.WithGesture(g)))
+
+		// The base's key seals what the server splices in after the hint.
+		kr := p29Kr(t, must(v.x.Key(ctx, "e#1")), "e", "d")
+		forged := jsonv.MustParse(must(seal.SealPatchSet(kr, "e#1", "e", "d", hint.ID, ops(op("replace", "/x", 9)))))
+		fid := must(client.ExpectedRevision(hint.ID, forged))
+		entry := map[string]any{"id": fid, "parent": hint.ID, "kind": "rev", "patches": forged, "author": "user:z", "created": "2026-10-04T12:00:00Z"}
+		base := http.DefaultTransport.(*http.Transport).Clone()
+		rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+			res, err := base.RoundTrip(req)
+			if err != nil || req.Method != "GET" || req.URL.Path != "/r/eb/d/rev/"+g1.ID+"/log" || res.StatusCode != 200 {
+				return res, err
+			}
+			var arr []any
+			json.NewDecoder(res.Body).Decode(&arr)
+			res.Body.Close()
+			b, _ := json.Marshal(append([]any{entry}, arr...))
+			res.Body = io.NopCloser(bytes.NewReader(b))
+			res.ContentLength = int64(len(b))
+			res.Header.Del("Content-Length")
+			return res, nil
+		})
+		c := v.s.Client(t, client.WithBearer(v.grant), client.WithHTTPClient(&http.Client{Transport: rt}))
+		plan, err := c.PlanUndo(ctx, "eb", g, client.UndoE2E(c.E2E(v.priv)), client.UndoSince(since))
+		if err != nil {
+			t.Fatalf("hint at the fork %v: %v", hintAtFork, err)
+		}
+		if len(plan.Resources) != 1 || len(plan.Conflicts) != 0 {
+			t.Fatalf("hint at the fork %v: plan %+v", hintAtFork, plan)
+		}
+		if d := plan.Resources[0].Doc.(map[string]any); d["n"] != want || d["x"] != 0.0 {
+			t.Fatalf("hint at the fork %v: an entry sealed under the base past the fork is folded into what the undo writes: %v", hintAtFork, d)
+		}
+	}
+}
+
+// P29 review (ENC-27): OpenLog places a branch's forks against what the
+// range follows, a leading horizon marker or else the first entry's
+// parent, so an entry sealed under the base past the fork is flagged
+// whether or not the range starts with a marker; a range from the genesis
+// still folds the base's entries up to the fork.
+func TestV073P29OpenLogPlacesForksWithoutMarker(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	v := newP29Env(t, nil)
-	w1 := must(v.x.CreateDocSealed(ctx, "e", "d", map[string]any{"n": 1.0, "x": 0.0}))
+	w1 := must(v.x.CreateDocSealed(ctx, "e", "d", map[string]any{"n": 1.0}))
 	fork := must(v.x.AppendSealed(ctx, "e", "d", w1.ID, ops(op("replace", "/n", 2))))
 	must(v.c.CreateBranch(ctx, "e", client.BranchRequest{Name: "eb"}))
-	must(v.x.InitKeyring(ctx, "eb"))
-	p1 := must(v.x.AppendSealed(ctx, "eb", "d", fork.ID, ops(op("replace", "/n", 3))))
-	g := client.NewGesture()
-	g1 := must(v.x.AppendSealed(ctx, "eb", "d", p1.ID, ops(op("replace", "/n", 4)), client.WithGesture(g)))
-
-	// The base's key seals what the server splices in after the hint.
-	kr := p29Kr(t, must(v.x.Key(ctx, "e#1")), "e", "d")
-	forged := jsonv.MustParse(must(seal.SealPatchSet(kr, "e#1", "e", "d", p1.ID, ops(op("replace", "/x", 9)))))
-	fid := must(client.ExpectedRevision(p1.ID, forged))
-	entry := map[string]any{"id": fid, "parent": p1.ID, "kind": "rev", "patches": forged, "author": "user:z", "created": "2026-10-04T12:00:00Z"}
-	base := http.DefaultTransport.(*http.Transport).Clone()
-	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
-		res, err := base.RoundTrip(req)
-		if err != nil || req.Method != "GET" || req.URL.Path != "/r/eb/d/rev/"+g1.ID+"/log" || res.StatusCode != 200 {
-			return res, err
-		}
-		var arr []any
-		json.NewDecoder(res.Body).Decode(&arr)
-		res.Body.Close()
-		b, _ := json.Marshal(append([]any{entry}, arr...))
-		res.Body = io.NopCloser(bytes.NewReader(b))
-		res.ContentLength = int64(len(b))
-		res.Header.Del("Content-Length")
-		return res, nil
-	})
-	c := v.s.Client(t, client.WithBearer(v.grant), client.WithHTTPClient(&http.Client{Transport: rt}))
-	plan, err := c.PlanUndo(ctx, "eb", g, client.UndoE2E(c.E2E(v.priv)), client.UndoSince(p1.NSID))
-	if err != nil {
-		t.Fatal(err)
+	after := must(v.x.AppendSealed(ctx, "e", "d", fork.ID, ops(op("replace", "/n", 9))))
+	spliced := v.entry(t, "e", "d", after.ID)
+	if _, flags := must2(v.x.OpenLog(ctx, "eb", "d", []client.LogEntry{{ID: fork.ID}, spliced})); flags[1] == "" {
+		t.Fatalf("after a marker for the fork: %q", flags)
 	}
-	if len(plan.Resources) != 1 || len(plan.Conflicts) != 0 {
-		t.Fatalf("plan %+v", plan)
+	if _, flags := must2(v.x.OpenLog(ctx, "eb", "d", []client.LogEntry{spliced})); flags[0] == "" {
+		t.Fatal("a range after the fork without a marker opens the base's entry past the fork without a flag")
 	}
-	if d := plan.Resources[0].Doc.(map[string]any); d["n"] != 3.0 || d["x"] != 0.0 {
-		t.Fatalf("an entry sealed under the base past the fork is folded into what the undo writes: %v", d)
+	if es, flags := must2(v.x.OpenLog(ctx, "eb", "d", must(v.c.Log(ctx, "eb", "d", fork.ID, "")))); len(es) != 2 || flags[0] != "" || flags[1] != "" {
+		t.Fatalf("read-through range from the genesis: %q", flags)
 	}
 }
 
