@@ -3,11 +3,16 @@ package catalog_test
 import (
 	"context"
 	"fmt"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/middle-management/patchlog/internal/catalog"
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // mergeAsk posts a batch of items to POST /merge-grants as the merge
@@ -138,7 +143,8 @@ func TestMergeReplacingAgainstDeletedRowsV073(t *testing.T) {
 // roles, and deleting a node of a cycle gives the others theirs (§B.11.2:
 // a cyclic node contributes nothing). The refusal to someone who doesn't
 // see the widened node names only the batch's change, not the node
-// (§B.11, §B.11.5).
+// (§B.11, §B.11.5). Such a folder is 409 after the 403s, for an admin too
+// (§B.11.4 create a folder).
 func TestMergeWideningElsewhereV073(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -155,7 +161,7 @@ func TestMergeWideningElsewhereV073(t *testing.T) {
 	if r.status != 403 || !strings.Contains(mergeMsg(r), "ghost") || strings.Contains(mergeMsg(r), "matches.h") {
 		t.Fatalf("a folder that widens a hidden node, approved by desk: %d %v", r.status, r.body)
 	}
-	if r = w.mergeAsk(w.caller("user:chief", "catalog-admins"), "", ghost); !adminDryRun(r, "user:chief") {
+	if r = w.mergeAsk(w.caller("user:chief", "catalog-admins"), "", ghost); r.status != 409 || r.body["checkpoint"] == nil {
 		t.Fatalf("the same, approved by an admin: %d %v", r.status, r.body)
 	}
 	// Without c1, c2 is no longer cyclic, and its own fan-club desk counts.
@@ -425,5 +431,237 @@ func TestMergeMoveKeptParentsV073(t *testing.T) {
 		"steps": []any{[]any{map[string]any{"op": "add", "path": "/title", "value": "y2"}}}}
 	if r := w.mergeAsk(anna, "", edit); r.status != 403 {
 		t.Errorf("a rename of a node with a dangling parent: %d %v", r.status, r.body)
+	}
+}
+
+// TestMergeNewFolderNamedByParentsEntryV073 (review): a batch creating a
+// folder whose name a parents entry already names, hidden ones included,
+// is 409, as Create a folder is (§B.11.4: names are not secrets), for an
+// admin too: the folder would adopt that node, which a dangling entry
+// gives no roles or powers (§B.11.2), so a non-admin approver gained
+// tree powers there by a merge-key grant. The 409 comes after the 404s
+// and 403s, carries the checkpoint, and names no node hidden from the
+// approver.
+func TestMergeNewFolderNamedByParentsEntryV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.doc("cat", "c", map[string]any{"title": "C", "parents": parents("season", "ghost")}) // ghost: dangling
+	w.doc("matches", "hid", map[string]any{"title": "hid"})
+	w.doc("cat", "matches.hid", map[string]any{"parents": parents("rumours", "spook")}) // hidden from desk; spook: dangling
+	w.start()
+	w.caughtUp()
+	anna, chief, li := w.caller("user:anna", "match-desk"), w.caller("user:chief", "catalog-admins"), w.caller("user:li")
+	folder := func(name string, under ...string) map[string]any {
+		return map[string]any{"resource": name, "ifNoneMatch": "*",
+			"steps": []any{client.GenesisPatches(map[string]any{"title": name, "parents": parents(under...)})}}
+	}
+
+	// The checkpoint: the catalog, and for a non-admin every trusted
+	// namespace, whose roles decide visibility.
+	for tok, cp := range map[string]map[string]any{anna: w.checkpointOf("matches"), chief: w.checkpointOf()} {
+		r := w.mergeAsk(tok, "", folder("ghost", "season"))
+		if r.status != 409 || r.body["grant"] != nil || !reflect.DeepEqual(r.body["checkpoint"], cp) {
+			t.Errorf("a folder c's parents entry names: %d %v (checkpoint %v)", r.status, r.body, cp)
+		}
+	}
+	// Hidden ones included (here, for desk, a widening first), without
+	// naming the node.
+	for _, tok := range []string{chief, anna} {
+		r := w.mergeAsk(tok, "", folder("spook", "season"))
+		if r.status != map[string]int{chief: 409, anna: 403}[tok] || strings.Contains(mergeMsg(r), "matches.hid") {
+			t.Errorf("a folder a hidden node's parents entry names: %d %v", r.status, r.body)
+		}
+	}
+	// 404s and 403s first.
+	if r := w.mergeAsk(anna, "", folder("ghost", "rumours")); r.status != 404 {
+		t.Errorf("under a folder hidden from the approver: %d %v", r.status, r.body)
+	}
+	if r := w.mergeAsk(li, "", folder("ghost", "season")); r.status != 403 {
+		t.Errorf("by an approver without move: %d %v", r.status, r.body)
+	}
+	// In batch order, after every item's checks.
+	if r := w.mergeAsk(anna, "", folder("ghost", "season"), folder("other", "rumours")); r.status != 404 {
+		t.Errorf("with a later item's 404: %d %v", r.status, r.body)
+	}
+	// A name nothing names is a merge-key grant, as before.
+	if r := w.mergeAsk(anna, "", folder("fresh", "season")); r.status != 200 || r.body["grant"] == nil {
+		t.Errorf("a folder nothing names: %d %v", r.status, r.body)
+	}
+}
+
+// TestMergePurgedAfterChecksV073 (review): a purged placement is 410, and
+// a purged folder's name 409 (one that existed, §B.11.4 create a folder),
+// where organising requests put 409: after the approver's 404s and 403s,
+// as for a Place (§B.11.4). Decided from the core's head, neither carries
+// a checkpoint.
+func TestMergePurgedAfterChecksV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.doc("cat", "oldf", map[string]any{"title": "Old", "parents": parents("season")})
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	purger := w.core(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"cat"}, []string{"purge"}))
+	for _, name := range []string{"matches.derby", "oldf"} {
+		must(w.ops.Delete(ctx, "cat", name, w.catHead(name)))
+		must(purger.Purge(ctx, "cat", name, w.catHead(name), false))
+	}
+	w.caughtUp()
+	anna, li := w.caller("user:anna", "match-desk"), w.caller("user:li")
+	place := func(to string) map[string]any {
+		return map[string]any{"resource": "matches.derby", "ifNoneMatch": "*",
+			"steps": []any{client.GenesisPatches(map[string]any{"parents": parents(to)})}}
+	}
+	// li, outside the place list and without place: 403, and 404 into
+	// rumours, hidden from li, as li's own Place.
+	for to, want := range map[string]int{"season": 403, "rumours": 404} {
+		own := w.do("POST", "/grants", li, map[string]any{"item": "/r/matches/derby", "want": []any{"place"}, "to": []any{to}})
+		if r := w.mergeAsk(li, "", place(to)); r.status != want || own.status != want {
+			t.Errorf("purged derby under %s by li: merge %d %v, own Place %d (want %d)", to, r.status, r.body, own.status, want)
+		}
+	}
+	if r := w.mergeAsk(anna, "", place("season")); r.status != 410 || r.body["code"] != "gone" || r.body["checkpoint"] != nil {
+		t.Errorf("purged derby by anna: %d %v", r.status, r.body)
+	}
+	folder := map[string]any{"resource": "oldf", "ifNoneMatch": "*",
+		"steps": []any{client.GenesisPatches(map[string]any{"title": "Old", "parents": parents("season")})}}
+	if r := w.mergeAsk(anna, "", folder); r.status != 409 || r.body["checkpoint"] != nil {
+		t.Errorf("a purged folder's name by anna: %d %v", r.status, r.body)
+	}
+	if r := w.mergeAsk(li, "", folder); r.status != 403 {
+		t.Errorf("a purged folder's name by li: %d %v", r.status, r.body)
+	}
+}
+
+// TestMergeRestoreFolderNotFoundV073 (review): folders are restored only
+// by catalog-admins, and a request naming a tombstoned folder is 404 to
+// anyone else (§B.11.4): so is a batch restoring one, approved by a
+// non-admin, with the message and checkpoint of the approver's own
+// request naming it. An admin approver gets the admin dry run.
+func TestMergeRestoreFolderNotFoundV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.doc("cat", "old", map[string]any{"title": "Old", "parents": parents("season")})
+	w.start()
+	w.caughtUp()
+	must(w.ops.Delete(context.Background(), "cat", "old", w.catHead("old")))
+	w.caughtUp()
+	anna, chief := w.caller("user:anna", "match-desk"), w.caller("user:chief", "catalog-admins", "match-desk")
+	restore := map[string]any{"resource": "old", "ifMatch": w.catHead("old"),
+		"steps": []any{[]any{map[string]any{"op": "replace", "path": "", "value": map[string]any{"title": "Old", "parents": parents("season")}}}}}
+	own := w.do("POST", "/grants", anna, map[string]any{"node": "old", "want": []any{"restore"}})
+	r := w.mergeAsk(anna, "", restore)
+	if own.status != 404 || r.status != 404 || mergeMsg(r) != mergeMsg(own) || !reflect.DeepEqual(r.body["checkpoint"], own.body["checkpoint"]) {
+		t.Errorf("a folder restore approved by desk: %d %v; own request %d %v", r.status, r.body, own.status, own.body)
+	}
+	if r := w.mergeAsk(chief, "", restore); !adminDryRun(r, "user:chief") {
+		t.Errorf("a folder restore approved by an admin: %d %v", r.status, r.body)
+	}
+}
+
+// TestMergeAdminHeaderAfterApproverV073 (review): the approver's 404s come
+// first (§B.11.4, §B.11.5): a batch that needs catalog-admins and names a
+// node hidden from a non-admin approver is 404 whatever grant is in
+// Admin-Authorization, so the answer tells nothing about the hidden node
+// nor that the batch needs admins.
+func TestMergeAdminHeaderAfterApproverV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	anna, bob, chief := w.caller("user:anna", "match-desk"), w.caller("user:bob", "match-desk"), w.caller("user:chief", "catalog-admins")
+	access := map[string]any{"resource": "rumours", "ifMatch": w.catHead("rumours"),
+		"steps": []any{[]any{map[string]any{"op": "add", "path": "/$access/group:fan-club", "value": []any{"reader"}}}}}
+	alone := w.mergeAsk(anna, "", access)
+	if alone.status != 404 {
+		t.Fatalf("hidden node, no Admin-Authorization: %d %v", alone.status, alone.body)
+	}
+	for _, adm := range []string{bob, chief} {
+		if r := w.mergeAsk(anna, adm, access); r.status != 404 || !reflect.DeepEqual(r.body, alone.body) {
+			t.Errorf("hidden node, Admin-Authorization %v: %d %v (want %v)", adm == chief, r.status, r.body, alone.body)
+		}
+	}
+}
+
+// TestE2ECatalogWithoutMergeKeyV073 (review, TC-45): a catalog service for
+// an end-to-end catalog, which issues no merge grants there, may run
+// without a merge key: a merge-grant request is still 404 not_offered
+// (§F.8, §12.1), not 403 for the missing key.
+func TestE2ECatalogWithoutMergeKeyV073(t *testing.T) {
+	t.Parallel()
+	w := setupE2ECatalog(t)
+	w.done = make(chan struct{})
+	svc, err := catalog.Open(context.Background(), catalog.Options{
+		Tree: tree.Options{Client: w.svcClient, Catalog: "cat", DB: w.db, Now: w.s.Now, CheckerTTL: time.Millisecond,
+			Logf:          func(f string, a ...any) { w.t.Logf(f, a...) },
+			FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)}},
+		Key: w.cat.Priv, Kid: "catalog-01", MergeService: "svc:merge",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.svc = svc
+	w.http = httptest.NewServer(svc.Handler())
+	ctx, cancel := context.WithCancel(context.Background())
+	w.cancel = cancel
+	go func() { svc.Run(ctx); close(w.done) }()
+	t.Cleanup(w.stop)
+	item := map[string]any{"resource": "matches.derby", "ifNoneMatch": "*",
+		"steps": []any{client.GenesisPatches(map[string]any{"parents": parents("season")})}}
+	for _, tok := range []string{w.caller("user:bob", "match-desk"), w.caller("user:ada", "catalog-admins")} {
+		if r := w.mergeAsk(tok, "", item); r.status != 404 || r.body["code"] != "not_offered" {
+			t.Errorf("merge grant in an e2e catalog, no merge key: %d %v", r.status, r.body)
+		}
+	}
+	// Not only to the merge service: the level comes before who asks.
+	body := map[string]any{"batch": map[string]any{"items": []any{item}, "source": map[string]any{"ns": "cat-r1", "at": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
+	if r := w.do("POST", "/merge-grants", w.caller("user:bob", "match-desk"), body); r.status != 404 || r.body["code"] != "not_offered" {
+		t.Errorf("merge grant in an e2e catalog, not the merge service: %d %v", r.status, r.body)
+	}
+}
+
+// TestMergeUntrustedNamespaceV073 (review): a new placement of an item in
+// a namespace the catalog doesn't trust is 403 (§B.11.4), whether or not
+// the service can read that namespace's document, as for the approver's
+// own Place: the document matters only once the namespace is trusted.
+func TestMergeUntrustedNamespaceV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	anna := w.caller("user:anna", "match-desk")
+	own := w.do("POST", "/grants", anna, map[string]any{"item": "/r/nosuch/x", "want": []any{"place"}, "to": []any{"season"}})
+	r := w.mergeAsk(anna, "", map[string]any{"resource": "nosuch.x", "ifNoneMatch": "*",
+		"steps": []any{client.GenesisPatches(map[string]any{"parents": parents("season")})}})
+	if own.status != 403 || r.status != 403 || !strings.Contains(mergeMsg(r), "not trusted") || r.body["checkpoint"] == nil {
+		t.Errorf("a placement of an untrusted, unreadable namespace's item: %d %v; own Place %d %v", r.status, r.body, own.status, own.body)
+	}
+}
+
+// TestMergePlacedAndDeletedV073 (review follow-up): an item that places a
+// node and deletes it again within the batch is checked as that Place is,
+// against its namespace's place list as of the checkpoint: one the
+// approver may make is a merge-key grant, not a 403 for a place list the
+// service never read.
+func TestMergePlacedAndDeletedV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.doc("matches", "newone", map[string]any{"title": "new"})
+	w.start()
+	w.caughtUp()
+	item := map[string]any{"resource": "matches.newone", "ifNoneMatch": "*",
+		"steps": []any{client.GenesisPatches(map[string]any{"parents": parents("season")}), "delete"}}
+	r := w.mergeAsk(w.caller("user:anna", "match-desk"), "", item)
+	if r.status != 200 || r.body["grant"] == nil {
+		t.Fatalf("placed and deleted by desk: %d %v", r.status, r.body)
+	}
+	if r := w.mergeAsk(w.caller("user:li"), "", item); r.status != 403 || !strings.Contains(mergeMsg(r), "place") {
+		t.Errorf("placed and deleted by li, outside the place list: %d %v", r.status, r.body)
 	}
 }
