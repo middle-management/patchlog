@@ -28,7 +28,8 @@ func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
 
 // createNamespace bootstraps a namespace with an operator grant (§C.4),
 // which checks config (§C.2 item 2) and, as the grant that creates it,
-// passes the *-key guard (§C.2).
+// passes the *-key guard (§C.2). At step 6 its own rules judge the
+// creation, and namespace rules don't (§6.4.3, checkCreationRules).
 func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error) {
 	if !ValidNSName(req.NS) {
 		return nil, badInput("invalid namespace name")
@@ -73,6 +74,9 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 		return nil, docInvalid("/successor", "a new namespace cannot have a successor")
 	}
 	if err := checkConfigLimits(t.e.opt.Limits, cc.Patches, jsonv.Canonical(cc.Patches), true, jsonv.Canonical(doc), func() bool { return true }); err != nil {
+		return nil, err
+	}
+	if err := t.checkCreationRules(a, cc.Patches); err != nil {
 		return nil, err
 	}
 	nn, id, nsID := t.insertNamespace(req.NS, cc.Patches, doc, cfg.Frozen, t.actorID(a))

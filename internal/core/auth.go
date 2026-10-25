@@ -582,7 +582,7 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 		return false
 	}
 	env := t.basicEnvelope("read", "", a)
-	return t.scopeRules(a, env, stepOne, false) == nil && t.roleRules(a, "read", roles, env, false, false) == nil
+	return t.scopeRules(a, env, stepOne, nil) == nil && t.roleRules(a, "read", roles, env, false, nil) == nil
 }
 
 // unrestrictedRoles reports whether a grant's rules leave every resource

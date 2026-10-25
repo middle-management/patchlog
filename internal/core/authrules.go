@@ -3,6 +3,8 @@ package core
 import (
 	"fmt"
 
+	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/rules"
 )
 
@@ -12,25 +14,28 @@ var stepOneRefs = []string{"action", "resource", "principal", "now"}
 // rules that refer solely to action, resource, principal and now are
 // evaluated.
 func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool) *Error {
-	return t.grantRulesMode(a, verb, roles, env, stepOne, false)
+	return t.grantRulesMode(a, verb, roles, env, stepOne, nil)
 }
 
-// grantRulesMode is grantRules; with blind, a rule reading writes or /doc
-// fails (sealed writes of e2e namespaces, §6.2): a key-scope or block rule
-// refuses the request, and a role with one doesn't allow it.
-func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[string]any, stepOne, blind bool) *Error {
+// grantRulesMode is grantRules with the envelope members unknown names
+// hidden, as a sealed write's writes and doc are at E3 (stepUnknown): a
+// rule whose outcome depends on them fails as a whole, a key-scope or
+// block rule refusing the request and a role with one not allowing it;
+// one that passes, or fails, whatever they hold is decided as usual
+// (§6.2, rules.EvalTri).
+func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[string]any, stepOne bool, unknown []string) *Error {
 	if a.verified == nil {
 		return nil
 	}
-	if err := t.scopeRules(a, env, stepOne, blind); err != nil {
+	if err := t.scopeRules(a, env, stepOne, unknown); err != nil {
 		return err
 	}
-	return t.roleRules(a, verb, roles, env, stepOne, blind)
+	return t.roleRules(a, verb, roles, env, stepOne, unknown)
 }
 
 // scopeRules evaluates the key-scope and block rules of a's verified
 // grant, as grantRulesMode does.
-func (t *tx) scopeRules(a *actor, env map[string]any, stepOne, blind bool) *Error {
+func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []string) *Error {
 	for _, src := range [][]any{a.verified.KeyRules, a.verified.BlockRules} {
 		for _, rv := range src {
 			r, err := compileCached(rv)
@@ -40,10 +45,10 @@ func (t *tx) scopeRules(a *actor, env map[string]any, stepOne, blind bool) *Erro
 			if stepOne && !r.OnlyRefs(stepOneRefs...) {
 				continue
 			}
-			if _, b := blindRule(r); blind && b {
-				return forbidden("a grant or key rule reads writes or /doc, which the server can't see in an e2e namespace (§6.2, §E.3.2)")
-			}
-			if !r.Eval(env) {
+			switch r.EvalTri(env, unknown...) {
+			case rules.Unknown:
+				return forbidden("the outcome of a grant or key rule depends on writes or /doc, which the server can't see for this write in an e2e namespace (§6.2, §E.3.2)")
+			case rules.False:
 				return forbidden("a grant or key rule refuses the request")
 			}
 		}
@@ -55,7 +60,7 @@ func (t *tx) scopeRules(a *actor, env map[string]any, stepOne, blind bool) *Erro
 // roles, as grantRulesMode does: roles are alternatives (§C.1.1), so the
 // rules evaluated must pass for one of roles, or with roles nil for one of
 // the effective roles that list verb.
-func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any, stepOne, blind bool) *Error {
+func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool, unknown []string) *Error {
 	if a.verified.HasRoles() {
 		if roles == nil {
 			_, roles = a.verified.Allows(verb)
@@ -72,7 +77,7 @@ func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any
 				if stepOne && !r.OnlyRefs(stepOneRefs...) {
 					continue
 				}
-				if _, b := blindRule(r); (blind && b) || !r.Eval(env) {
+				if r.EvalTri(env, unknown...) != rules.True {
 					ok = false
 					break
 				}
@@ -89,19 +94,74 @@ func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any
 	return nil
 }
 
-// checkRules is step 6 of §6.2: namespace rules, then grant, key and role
-// rules, against the full envelope.
+// checkRules is the rules of step 6 of §6.2 for one write, after the
+// *-key guard and a config write's in_use refusals, which its callers run:
+// grant, key and role rules (403), then namespace rules (422) (§6.4.3,
+// §C.2 item 4). A batch runs each half for every item before the next
+// (checkItems).
 func (t *tx) checkRules(cfg *Config, a *actor, env map[string]any, isConfig bool) *Error {
+	if err := t.checkGrantRules(a, env, nil); err != nil {
+		return err
+	}
+	return checkNSRules(cfg, a, env, isConfig, nil)
+}
+
+// checkGrantRules is step 6's grant, key and role rules, all of them,
+// against the full envelope with the write's verb (§C.2 item 4): 403. The
+// envelope members unknown names are hidden (grantRulesMode).
+func (t *tx) checkGrantRules(a *actor, env map[string]any, unknown []string) *Error {
 	verb := env["action"].(string)
 	if a.verified != nil {
 		if ok, _ := a.verified.Allows(verb); !ok {
 			return forbidden(fmt.Sprintf("the grant does not allow %s", verb))
 		}
 	}
-	if !(isConfig && a.star) {
-		if i, path, ok := rules.EvalList(cfg.Rules, env); !ok {
-			return apiErr(422, "rule", "rule", i, "path", path)
-		}
+	return t.grantRulesMode(a, verb, nil, env, false, unknown)
+}
+
+// checkCreationRules is step 6 of a namespace's creation under the
+// operator grant that creates it, a remote branch's included, once the
+// genesis has been validated (§6.2 step 4, §7.4, §G.3). That grant passes
+// the *-key guard (§C.2), a creation has no in_use refusals, and namespace
+// rules don't judge it (§6.4.3), but its own key-scope and block rules all
+// do, those that read /doc, /writes or /patches included, against the
+// config envelope of the genesis patches (§C.2 item 4, §6.4.1): 403.
+func (t *tx) checkCreationRules(a *actor, patches any) *Error {
+	if a.verified == nil {
+		return nil
 	}
-	return t.grantRules(a, verb, nil, env, false)
+	ops, err := patch.Parse(patches)
+	if err != nil {
+		return patchErr(err)
+	}
+	doc, w, err := patch.Apply(nil, false, ops, patch.Options{})
+	if err != nil {
+		return patchErr(err)
+	}
+	env := t.basicEnvelope("config", "", a)
+	env["writes"] = anyStrings(patch.WritesStrings(w))
+	env["doc"] = doc
+	env["patches"] = jsonv.MustParse(jsonv.Canonical(patches))
+	return t.checkGrantRules(a, env, nil)
+}
+
+// checkNSRules is step 6's namespace rules in cfg, the configuration in
+// force (§6.4.3): the first that fails is 422 rule, with its index and the
+// path of the failing rule form. With the envelope members unknown names
+// hidden, a rule whose outcome depends on them fails as a whole, at its
+// own path /rules/{i} (§6.2). A config write under a * key, so any while
+// authentication is disabled, isn't judged by them (§1, §6.4.3); nor is a
+// namespace's creation under the operator grant, whose step 6 runs only
+// its grant and key rules (checkCreationRules).
+func checkNSRules(cfg *Config, a *actor, env map[string]any, isConfig bool, unknown []string) *Error {
+	if isConfig && a.star {
+		return nil
+	}
+	switch i, path, v := rules.EvalTri(cfg.Rules, env, unknown...); v {
+	case rules.False:
+		return apiErr(422, "rule", "rule", i, "path", path)
+	case rules.Unknown:
+		return apiErr(422, "rule", "rule", i, "path", path, "message", blindMsg)
+	}
+	return nil
 }

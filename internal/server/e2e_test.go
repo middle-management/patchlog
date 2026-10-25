@@ -293,8 +293,10 @@ func TestE2EGateAndReads(t *testing.T) {
 		map[string]any{"resource": "b2", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}}})
 	expectCode(t, r, 422, "batch")
 
-	// Namespace rules on /doc or writes fail every sealed write; rules on
-	// /action and /principal still work; deletes are checked as usual.
+	// A namespace rule whose outcome depends on /doc or writes fails a
+	// sealed write as a whole; one that passes whatever they give, as
+	// docRule does for a create, is decided as usual (§6.2, v0.67). Rules
+	// on /action and /principal still work; deletes are checked as usual.
 	docRule := map[string]any{"if": []any{map[string]any{"op": "test", "path": "/action", "value": "append"}},
 		"then": []any{map[string]any{"op": "test", "path": "/doc/n", "exists": true}}}
 	expect(t, e.patchNS("e", ops(op("add", "/rules", []any{docRule})), f.adminG), 201)
@@ -304,7 +306,7 @@ func TestE2EGateAndReads(t *testing.T) {
 		r := e.writeRaw("e", "d", d3, raw, f.writerG)
 		expectCode(t, r, 422, "rule")
 	}
-	expectCode(t, e.writeRaw("e", "n1", "", sealed(t, f.k1, "e#1", "e", "n1", "", addRoot(map[string]any{})), f.writerG), 422, "rule")
+	expect(t, e.writeRaw("e", "n1", "", sealed(t, f.k1, "e#1", "e", "n1", "", addRoot(map[string]any{})), f.writerG), 201)
 	writesRule := map[string]any{"not": map[string]any{"op": "writes", "covers": ""}}
 	expect(t, e.patchNS("e", ops(op("replace", "/rules", []any{writesRule})), f.adminG), 201)
 	expectCode(t, e.writeRaw("e", "d", d3, sealed(t, f.k1, "e#1", "e", "d", d3, ops(op("add", "/x", 1.0))), f.writerG), 422, "rule")

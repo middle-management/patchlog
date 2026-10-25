@@ -884,30 +884,49 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		st, fs = dropFailed(st, fs, dryFails), nil
 	}
 
-	// Step 6: rules.
+	// Step 6: rules. A resource write has no *-key guard or in_use
+	// refusals: grant, key and role rules (403), then namespace rules
+	// (422), each for every step of every item before the next for any.
+	// The batch fails at the earlier with the items that failed it; a dry
+	// run drops those and runs the later for the rest (§6.2, §7.5, §C.2
+	// item 4). Each step's envelope is built once, for both.
 	readsPatches := map[string]bool{}
-	for _, s := range st {
-		for _, step := range s.steps {
-			check := t.checkRules
-			if step.sealed {
-				check = func(cfg *Config, a *actor, env map[string]any, _ bool) *Error { return t.checkRulesE2E(cfg, a, env) }
-			}
-			reads, ok := readsPatches[step.action]
-			if !ok {
-				reads = rulesRead(cfg, a, step.action, "patches")
-				readsPatches[step.action] = reads
-			}
-			if err := check(cfg, a, t.stepEnvelope(s, step, a, reads), false); err != nil {
-				fs = append(fs, itemErr{s.index, err})
-				break
-			}
+	envs := map[*stepState]map[string]any{}
+	envOf := func(s *itemState, step *stepState) map[string]any {
+		if env, ok := envs[step]; ok {
+			return env
 		}
+		reads, ok := readsPatches[step.action]
+		if !ok {
+			reads = rulesRead(cfg, a, step.action, "patches")
+			readsPatches[step.action] = reads
+		}
+		env := t.stepEnvelope(s, step, a, reads)
+		envs[step] = env
+		return env
 	}
-	if len(fs) > 0 {
-		if !dryRun {
-			return nil, nil, fail(fs)
+	for _, check := range []func(s *itemState, step *stepState) *Error{
+		func(s *itemState, step *stepState) *Error {
+			return t.checkGrantRules(a, envOf(s, step), stepUnknown(cfg, s, step))
+		},
+		func(s *itemState, step *stepState) *Error {
+			return checkNSRules(cfg, a, envOf(s, step), false, stepUnknown(cfg, s, step))
+		},
+	} {
+		for _, s := range st {
+			for _, step := range s.steps {
+				if err := check(s, step); err != nil {
+					fs = append(fs, itemErr{s.index, err})
+					break
+				}
+			}
 		}
-		st, fs = dropFailed(st, fs, dryFails), nil
+		if len(fs) > 0 {
+			if !dryRun {
+				return nil, nil, fail(fs)
+			}
+			st, fs = dropFailed(st, fs, dryFails), nil
+		}
 	}
 
 	result := &WriteResult{Status: 201}
