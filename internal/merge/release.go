@@ -243,23 +243,31 @@ func (rp *ReleasePlan) Branch(key string) *ReleaseBranch {
 
 // MergeGrantResult is a catalog service's answer for one catalog merge
 // batch (§F.8): a grant covering exactly that batch, signed with the
-// catalog's merge key for the merge service, or, for a batch that changes
-// $access, Admin: checked, to be submitted under a catalog admin's grant.
+// catalog's merge key for the merge service, or, for a batch that needs
+// catalog-admins (§B.11.3: it changes $access, restores a folder, or
+// widens), Admin: checked as a dry run with CheckedAs, the admin whose
+// grant it goes under, as the caller, to be submitted under that grant.
 type MergeGrantResult struct {
 	Grant      string
 	Admin      bool
 	ApprovedBy string
+	CheckedAs  string
 }
 
 // MergeGranter obtains a catalog service's decision on exactly one catalog
-// merge batch (§F.8).
+// merge batch (§F.8). adminGrant, if set, is the grant of the catalog
+// admin the batch would go under: for a batch that needs catalog-admins,
+// the service judges its dry run with that admin as the caller too (F-T4).
+// A catalog the service offers no merge grants for (an end-to-end one,
+// 404 not_offered) is an error wrapping ErrNotOffered.
 type MergeGranter interface {
-	MergeGrant(ctx context.Context, catalog string, batch map[string]any) (*MergeGrantResult, error)
+	MergeGrant(ctx context.Context, catalog string, batch map[string]any, adminGrant string) (*MergeGrantResult, error)
 }
 
 // HTTPGranter asks catalog services over HTTP: POST {URL}/merge-grants
-// with the merge service's grant for the catalog as Authorization and the
-// approving person's in Approver-Authorization.
+// with the merge service's grant for the catalog as Authorization, the
+// approving person's in Approver-Authorization and, when given, the
+// catalog admin's in Admin-Authorization (catalog.AdminHeader).
 type HTTPGranter struct {
 	URLs map[string]string // catalog namespace -> catalog service base URL
 	// Bearer is the merge service's own grant for the catalog: merge
@@ -275,8 +283,17 @@ type HTTPGranter struct {
 // ErrBehind is returned when a catalog service hasn't caught up yet.
 var ErrBehind = errors.New("merge: the catalog service is behind")
 
+// ErrAdminNeeded is returned when a catalog batch needs catalog-admins
+// (§B.11.3, §F.8) and no catalog admin's grant to submit it under is
+// given (ReleaseOptions.AdminGrant).
+var ErrAdminNeeded = errors.New("merge: the catalog batch needs catalog-admins")
+
+// ErrNotOffered is returned when a catalog service offers no merge grants
+// for a catalog, as for an end-to-end one (§F.8, 404 not_offered).
+var ErrNotOffered = errors.New("merge: the catalog service issues no merge grants for this catalog")
+
 // MergeGrant implements MergeGranter.
-func (h *HTTPGranter) MergeGrant(ctx context.Context, cat string, batch map[string]any) (*MergeGrantResult, error) {
+func (h *HTTPGranter) MergeGrant(ctx context.Context, cat string, batch map[string]any, adminGrant string) (*MergeGrantResult, error) {
 	u := h.URLs[cat]
 	if u == "" {
 		return nil, fmt.Errorf("merge: no catalog service for %s (give one with -catalog-service %s=URL)", cat, cat)
@@ -296,6 +313,9 @@ func (h *HTTPGranter) MergeGrant(ctx context.Context, cat string, batch map[stri
 	if h.Approver != "" {
 		req.Header.Set(catalog.ApproverHeader, "Bearer "+h.Approver)
 	}
+	if adminGrant != "" {
+		req.Header.Set(catalog.AdminHeader, "Bearer "+adminGrant)
+	}
 	if h.Author != "" {
 		req.Header.Set("X-Author", h.Author)
 	}
@@ -313,17 +333,20 @@ func (h *HTTPGranter) MergeGrant(ctx context.Context, cat string, batch map[stri
 		Grant      string `json:"grant"`
 		Admin      bool   `json:"admin"`
 		ApprovedBy string `json:"approvedBy"`
+		CheckedAs  string `json:"checkedAs"`
 		Code       string `json:"code"`
 		Message    string `json:"message"`
 	}
 	_ = json.Unmarshal(b, &out)
-	if resp.StatusCode == 503 && out.Code == "behind" {
+	switch {
+	case resp.StatusCode == 503 && out.Code == "behind":
 		return nil, fmt.Errorf("%w: %s", ErrBehind, out.Message)
-	}
-	if resp.StatusCode != 200 || (out.Grant == "" && !out.Admin) {
+	case resp.StatusCode == 404 && out.Code == "not_offered":
+		return nil, fmt.Errorf("%w (%s): %s", ErrNotOffered, cat, out.Message)
+	case resp.StatusCode != 200 || (out.Grant == "" && !out.Admin):
 		return nil, fmt.Errorf("merge: catalog service for %s refused the merge grant: %d %s %s", cat, resp.StatusCode, out.Code, out.Message)
 	}
-	return &MergeGrantResult{Grant: out.Grant, Admin: out.Admin, ApprovedBy: out.ApprovedBy}, nil
+	return &MergeGrantResult{Grant: out.Grant, Admin: out.Admin, ApprovedBy: out.ApprovedBy, CheckedAs: out.CheckedAs}, nil
 }
 
 // ReleaseOptions configure the release functions.
@@ -337,10 +360,15 @@ type ReleaseOptions struct {
 	// Granter signs catalog merge batches (needed when a branch's target
 	// is a catalog).
 	Granter MergeGranter
-	// AdminGrant is a catalog admin's grant for the catalog (the
-	// approver's), under which a catalog batch that changes $access is
-	// submitted, narrowed to exactly that batch with Via (§F.8). Via is the
-	// merge service's sub (default: Who).
+	// AdminGrant is a catalog admin's grant for the catalog (often the
+	// approver's), under which a catalog batch that needs catalog-admins
+	// (it changes $access, restores a folder, or widens) is submitted,
+	// narrowed to exactly that batch with Via (§F.8). The catalog service
+	// judges such a batch, which only an approver in catalog-admins gets
+	// through, with this admin as the caller too (F-T4); for an end-to-end
+	// catalog, which it checks no batch of, the merge service judges
+	// whether a batch needs catalog-admins itself. Via is the merge
+	// service's sub (default: Who).
 	AdminGrant string
 	Via        string
 	// Digest, if set, is the digest the approving person reviewed:
@@ -394,6 +422,7 @@ func LockName(catalogBase string) string { return "merge-lock." + catalogBase }
 
 type relCtx struct {
 	c   *client.Client
+	e2e *client.E2E // if set, catalogBase reads an end-to-end catalog's documents with it (Plan.e2eTarget)
 	opt ReleaseOptions
 	rel *release.Loaded
 	rp  *ReleasePlan
@@ -833,6 +862,19 @@ func (x *relCtx) catalogBase(ctx context.Context, target string) (map[string]any
 	docs := map[string]any{}
 	for _, hi := range heads {
 		if hi.Kind != "head" {
+			continue
+		}
+		if x.e2e != nil {
+			// An end-to-end catalog: its documents folded with the keys,
+			// its plaintext keyring no node (§E.3.2).
+			if hi.Resource == client.KeyringName {
+				continue
+			}
+			d, err := x.e2e.DocE2E(ctx, target, hi.Resource, hi.Target)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			docs[hi.Resource] = d.Value
 			continue
 		}
 		d, err := x.c.Doc(ctx, target, hi.Resource, hi.Target)
@@ -2391,7 +2433,7 @@ func runStep(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rele
 // base as it is now, with the dry run (§F.9 Several releases): its result
 // must widen nothing (new folders' own appearance aside).
 func checkNarrowing(ctx context.Context, c *client.Client, b *ReleaseBranch, p *Plan) error {
-	x := &relCtx{c: c}
+	x := &relCtx{c: c, e2e: p.e2eTarget()}
 	cfg, docs, incs, err := x.catalogBase(ctx, b.Target)
 	if err != nil {
 		return err
@@ -2427,18 +2469,38 @@ func checkNarrowing(ctx context.Context, c *client.Client, b *ReleaseBranch, p *
 
 // grantFor obtains the catalog service's decision on the plan's batch and
 // sets the client the batch is submitted with, waiting while the service
-// is behind: the merge grant it signs for the merge service, or for a
-// batch that changes $access, the catalog admin's grant (AdminGrant)
-// narrowed to exactly that batch with the merge service's via (§F.8).
+// is behind (§F.8):
+//
+//   - the merge grant the service signs for the merge service, from the
+//     approver's checks;
+//   - for a batch that needs catalog-admins (it changes $access, restores
+//     a folder, or widens), which the service answers Admin, and only to
+//     an approver in catalog-admins (CONFORMANCE scenario 44), the
+//     service's dry run asked again with AdminGrant in
+//     Admin-Authorization, so that it is judged with the admin whose grant
+//     the batch goes under as the caller too (F-T4), and then AdminGrant
+//     narrowed to exactly that batch with the merge service's via;
+//   - for an end-to-end catalog, whose batches the service doesn't check
+//     (404 not_offered), grantE2E.
 func grantFor(ctx context.Context, c *client.Client, opt ReleaseOptions, cat string, p *Plan) error {
+	if p.TargetLevel == "e2e" {
+		return grantE2E(ctx, c, opt, cat, p)
+	}
 	wait := opt.BehindWait
 	if wait == 0 {
 		wait = 30 * time.Second
 	}
 	deadline := time.Now().Add(wait)
 	pause := 20 * time.Millisecond
+	body := BatchBody(p.Batch())
 	for {
-		res, err := opt.Granter.MergeGrant(ctx, cat, BatchBody(p.Batch()))
+		res, err := opt.Granter.MergeGrant(ctx, cat, body, "")
+		if err == nil && res.Admin {
+			if opt.AdminGrant == "" {
+				return fmt.Errorf("%w (§F.8): give a catalog admin's grant to submit it under (ReleaseOptions.AdminGrant)", ErrAdminNeeded)
+			}
+			res, err = opt.Granter.MergeGrant(ctx, cat, body, opt.AdminGrant)
+		}
 		if err == nil {
 			g := res.Grant
 			if res.Admin {
@@ -2463,13 +2525,101 @@ func grantFor(ctx context.Context, c *client.Client, opt ReleaseOptions, cat str
 	}
 }
 
+// grantE2E sets the client an end-to-end catalog's batch is submitted with
+// (§F.8). The catalog service issues no merge grants and checks no batch
+// for such a catalog, so a batch that needs catalog-admins (adminChange)
+// goes under AdminGrant, narrowed to exactly that batch with the merge
+// service's via, without the service's dry run; any other is refused,
+// since no merge grant can be had for it.
+func grantE2E(ctx context.Context, c *client.Client, opt ReleaseOptions, cat string, p *Plan) error {
+	why, err := adminChange(ctx, c, cat, p)
+	if err != nil {
+		return err
+	}
+	if why == "" {
+		return fmt.Errorf("%w: %s is an end-to-end catalog, and the batch needs no catalog-admins, the only batches the merge service submits there, under a catalog admin's grant (§F.8)", ErrNotOffered, cat)
+	}
+	g, err := adminGrant(opt, cat, p)
+	if err != nil {
+		return fmt.Errorf("%s: %w", why, err)
+	}
+	p.SetBatchClient(c.With(client.WithBearer(g)))
+	return nil
+}
+
+// adminChange reports why the plan's catalog batch needs catalog-admins
+// (§B.11.3, §B.11.4, §F.8), "" if it doesn't, as the merge service judges
+// it for a catalog whose service checks no batch (an end-to-end one,
+// grantE2E), from the catalog base's documents (decrypted with the plan's
+// keys) and the batch's plaintext steps:
+//
+//   - it changes a node's $access, or creates one with $access;
+//   - it restores a node: folders are restored only by catalog admins, and
+//     the merge service holds no deleted placement's rows to judge a
+//     re-placing against (§B.11.7), so one counts as widening;
+//   - it widens: some subject gets a role at a node the base has that it
+//     didn't have before, by §B.11.4's test (catalog.DiffAccess).
+func adminChange(ctx context.Context, c *client.Client, cat string, p *Plan) (string, error) {
+	x := &relCtx{c: c, e2e: p.e2eTarget()}
+	cfg, docs, incs, err := x.catalogBase(ctx, cat)
+	if err != nil {
+		return "", err
+	}
+	before := tree.BuildGraph(cat, cfg, docs)
+	changes := map[string]any{}
+	for _, r := range p.Items() {
+		start := docState{}
+		if d, ok := docs[r.Name]; ok {
+			start = docState{doc: jsonv.Clone(d), exists: true}
+		}
+		sc, err := foldWrites(start, r.Steps, false)
+		if err != nil {
+			return "", err
+		}
+		live := sc.final.exists && !sc.final.deleted
+		if !live {
+			changes[r.Name] = nil
+			continue
+		}
+		if r.BaseState == client.Tombstoned.String() {
+			return fmt.Sprintf("restoring %s needs catalog-admins (§B.11.4, §F.8)", r.Name), nil
+		}
+		bm, _ := docs[r.Name].(map[string]any)
+		am, _ := sc.final.doc.(map[string]any)
+		_, had := bm["$access"]
+		_, has := am["$access"]
+		if had != has || has && !jsonv.Equal(jsonv.FromGo(bm["$access"]), jsonv.FromGo(am["$access"])) {
+			return fmt.Sprintf("changing the $access of %s needs catalog-admins (§B.11.3, §F.8)", r.Name), nil
+		}
+		if am == nil {
+			am = map[string]any{}
+		}
+		changes[r.Name] = am
+	}
+	for _, w := range catalog.DiffAccess(before, before.With(changes), incs).Widens {
+		if _, existed := docs[w.Node]; existed {
+			return fmt.Sprintf("the batch would give %s the role %s on %s, which needs catalog-admins (§B.11.4, §F.8)", w.Subject, w.Role, w.Node), nil
+		}
+	}
+	return "", nil
+}
+
+// e2eTarget is the plan's key-holding view if its target is end-to-end,
+// which catalogBase then reads the catalog's documents with.
+func (p *Plan) e2eTarget() *client.E2E {
+	if p.TargetLevel == "e2e" {
+		return p.opt.E2E
+	}
+	return nil
+}
+
 // adminGrant narrows a catalog admin's grant to exactly the plan's batch:
 // a block with the merge service's via, the catalog only, the batch's
 // actions, its pairs of /resource and /action, and a few minutes' life
 // (§F.8, §C.1).
 func adminGrant(opt ReleaseOptions, cat string, p *Plan) (string, error) {
 	if opt.AdminGrant == "" {
-		return "", errors.New("the catalog batch changes $access, which needs a catalog admin's grant (§F.8): give the approver's (ReleaseOptions.AdminGrant)")
+		return "", fmt.Errorf("%w, under whose grant it is submitted (§F.8): give one (ReleaseOptions.AdminGrant)", ErrAdminNeeded)
 	}
 	g, err := grant.Decode(opt.AdminGrant, 0)
 	if err != nil {
