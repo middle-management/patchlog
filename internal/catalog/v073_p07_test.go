@@ -150,14 +150,16 @@ func TestKeySubScopeV073(t *testing.T) {
 	if w.listsFolder(w.caller("fred", "fan-club"), "season") {
 		t.Error("a subject set without a user: subject passes a sub scope")
 	}
-	// /read-grants uses the same test for catalog nodes (§B.11.5).
-	rg := w.do("POST", "/read-grants", fiona, map[string]any{"items": toAny("/r/cat/season")})
-	if entry(rg, 0)["error"] == nil {
-		t.Errorf("read-grants: fiona gets season: %v", rg.body)
+	// /read-grants uses the same test for items (§B.11.5); its catalog
+	// nodes, in a catalog that is neither sealed nor end-to-end, are 400
+	// (TestReadGrantsCatalogNodesV073).
+	rg := w.do("POST", "/read-grants", fiona, map[string]any{"items": toAny("/r/matches/derby")})
+	if entry(rg, 0)["status"] != 403.0 {
+		t.Errorf("read-grants: fiona gets derby: %v", rg.body)
 	}
-	rg = w.do("POST", "/read-grants", fred, map[string]any{"items": toAny("/r/cat/season")})
-	if entry(rg, 0)["error"] != nil {
-		t.Errorf("read-grants: fred is refused season: %v", rg.body)
+	rg = w.do("POST", "/read-grants", fred, map[string]any{"items": toAny("/r/matches/derby")})
+	if entry(rg, 0)["status"] != nil {
+		t.Errorf("read-grants: fred is refused derby: %v", rg.body)
 	}
 }
 
@@ -184,8 +186,8 @@ func TestVisibilityKeyRulesV073(t *testing.T) {
 	if r, _ := w.follow("/cat/children?of=season", anna); r.status != 200 || childNames(r.body) != "matches.derby,matches.pub-a,matches.shared" {
 		t.Errorf("translator on season: %d %v", r.status, r.body)
 	}
-	if rg := w.do("POST", "/read-grants", anna, map[string]any{"items": toAny("/r/cat/season")}); entry(rg, 0)["error"] != nil {
-		t.Errorf("read-grants: the translator is refused season: %v", rg.body)
+	if rg := w.do("POST", "/read-grants", anna, map[string]any{"items": toAny("/r/matches/derby")}); entry(rg, 0)["status"] != nil {
+		t.Errorf("read-grants: the translator is refused derby: %v", rg.body)
 	}
 
 	// A role whose rule tests /principal/roles is evaluated with that

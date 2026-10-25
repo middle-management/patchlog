@@ -561,6 +561,19 @@ func (s *Service) View(fn func(g *Graph, cur map[string]string)) {
 	fn(s.g, s.cur)
 }
 
+// PurgeEntry reports whether the service holds ns as purged as of the
+// checkpoints a View's fn is given, and then ns's purge-ns entry: its
+// checkpoint for ns, since a purge-ns entry is the log's last (§8.5), so
+// the head a 410 purged names (§12.1), as a catalog service answers for
+// every name of a purged content namespace (§B.11.4). Call it from a
+// View's fn, which holds the lock it reads under.
+func (s *Service) PurgeEntry(ns string) (head string, purged bool) {
+	if _, purged = s.purged[ns]; purged {
+		head = s.cur[ns]
+	}
+	return head, purged
+}
+
 func (s *Service) state() (cur string, purged bool, changed <-chan struct{}) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

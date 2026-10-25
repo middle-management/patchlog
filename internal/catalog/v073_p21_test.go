@@ -517,9 +517,13 @@ func TestCheckpointNamesWhatWasReadV073(t *testing.T) {
 		if r := w.issue(bob, map[string]any{"node": "nf", "want": toAny("create"), "to": toAny("season")}, 200); !reflect.DeepEqual(r.body["checkpoint"], w.checkpointOf("teams", "matches")) {
 			t.Errorf("%s: create folder checkpoint %v", when, r.body["checkpoint"])
 		}
+		// A catalog folder in POST /read-grants is 400 in this catalog,
+		// neither sealed nor end-to-end, which reads only the catalog's
+		// level (§B.11.5); in a sealed one its visibility reads every
+		// trusted namespace (TestReadGrantsCatalogNodesV073).
 		rg := w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/cat/season")})
-		if e := entry(rg, 0); e == nil || !reflect.DeepEqual(e["checkpoint"], all) {
-			t.Errorf("%s: read-grants folder entry %v, want checkpoint %v", when, e, all)
+		if e := entry(rg, 0); e == nil || e["status"] != 400.0 || !reflect.DeepEqual(rg.body["checkpoint"], w.checkpointOf()) {
+			t.Errorf("%s: read-grants folder %v, want checkpoint %v", when, rg.body, w.checkpointOf())
 		}
 	}
 	check("before")
@@ -609,15 +613,21 @@ func TestHiddenAnsweredAsMissingV073(t *testing.T) {
 		same(c.what, w.issue(bob, c.req(c.hidden), 404).body, w.issue(bob, c.req(c.missing), 404).body, c.hidden, c.missing)
 	}
 
-	rg := w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/cat/rumours", "/r/cat/nosuch")})
-	hidden, missing := entry(rg, 0), entry(rg, 1)
-	if hidden == nil || missing == nil {
-		t.Fatalf("read-grants: %d %v", rg.status, rg.body)
+	// A catalog node in POST /read-grants, asked for alone, whose answer
+	// carries one checkpoint (v0.73): in this catalog, neither sealed nor
+	// end-to-end, both are 400 (§B.11.5); in a sealed one a hidden node
+	// is 404 as a missing one is (TestReadGrantsCatalogNodesV073).
+	answer := func(node string) map[string]any {
+		t.Helper()
+		rg := w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/cat/" + node)})
+		e := entry(rg, 0)
+		if e == nil {
+			t.Fatalf("read-grants: %d %v", rg.status, rg.body)
+		}
+		e["checkpoint"] = rg.body["checkpoint"]
+		return e
 	}
-	he, _ := hidden["error"].(map[string]any)
-	me, _ := missing["error"].(map[string]any)
-	he["checkpoint"], me["checkpoint"] = hidden["checkpoint"], missing["checkpoint"]
-	same("read-grants", he, me, "rumours", "nosuch")
+	same("read-grants", answer("rumours"), answer("nosuch"), "rumours", "nosuch")
 }
 
 // TestOrganisingGrantsRefuseAccessV073 (TC-29): a non-admin's Move grant

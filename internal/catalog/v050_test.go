@@ -25,9 +25,10 @@ func (w *world) checkpointOf(nss ...string) map[string]any {
 	return cp
 }
 
-// entry is the i-th entry of a POST /read-grants answer.
+// entry is the i-th entry of a POST /read-grants answer, { items,
+// checkpoint } (§B.11.4).
 func entry(r resp, i int) map[string]any {
-	gs, _ := r.body["grants"].([]any)
+	gs, _ := r.body["items"].([]any)
 	if i >= len(gs) {
 		return nil
 	}
@@ -47,11 +48,13 @@ func (w *world) listingAt(token string) string {
 	return at
 }
 
-// TestDecisionCheckpoint: answers of POST /grants and POST /read-grants
-// carry checkpoint beside each grant, { ns: ns_id } of the catalog and of
-// the item's namespace as they were decided at (v0.51), which is neither
-// listings' at (the combined checkpoint) nor the grants' own at (the
-// catalog's ns_id); refusals that are decisions carry it too (§B.11.4).
+// TestDecisionCheckpoint: answers of POST /grants carry checkpoint beside
+// the grant, { ns: ns_id } of the catalog and of the item's namespace as
+// they were decided at (v0.51), which is neither listings' at (the
+// combined checkpoint) nor the grants' own at (the catalog's ns_id);
+// refusals that are decisions carry it too. POST /read-grants carries one
+// beside its items, over every namespace any decision read (§B.11.4,
+// v0.73).
 func TestDecisionCheckpoint(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -68,38 +71,37 @@ func TestDecisionCheckpoint(t *testing.T) {
 		t.Errorf("checkpoint %v, want %v; listing at %s, grant at %v", r.body["checkpoint"], cp, at, catID)
 	}
 
-	// /read-grants: one entry per item in request order, each with the
-	// checkpoint it was decided at (a catalog folder: the catalog's and
-	// every trusted namespace's, whose roles decide its visibility); the
-	// reader may read them all iff no entry has an error.
+	// /read-grants: one entry per item in request order, with status and
+	// code for an item refused, and one checkpoint beside them, over the
+	// namespaces the decisions read (a catalog folder: every trusted
+	// namespace, whose roles decide its visibility); the reader may read
+	// them all iff no entry has a status. A catalog node is 400 in a
+	// catalog that is neither sealed nor end-to-end (§B.11.5).
 	items := toAny("/r/matches/rumour1", "/r/matches/derby", "/r/cat/season", "/r/matches/ghost")
 	rg := w.do("POST", "/read-grants", bob, map[string]any{"items": items})
-	if _, has := rg.body["checkpoint"]; rg.status != 200 || has {
-		t.Fatalf("read-grants: %d %v", rg.status, rg.body)
+	if rg.status != 200 || !reflect.DeepEqual(rg.body["checkpoint"], cp) {
+		t.Fatalf("read-grants: %d %v (checkpoint want %v)", rg.status, rg.body, cp)
 	}
-	gs := rg.body["grants"].([]any)
+	gs := rg.body["items"].([]any)
 	if len(gs) != len(items) {
 		t.Fatalf("read-grants entries: %v", gs)
 	}
-	for i, want := range []string{"error", "grant", "", "error"} {
+	for i, want := range []float64{403, 0, 400, 404} {
 		e := gs[i].(map[string]any)
 		if e["item"] != items[i] {
 			t.Errorf("entry %d is %v, want %v", i, e["item"], items[i])
 		}
-		_, hasErr := e["error"]
+		status, _ := e["status"].(float64)
 		_, hasGrant := e["grant"]
-		if hasErr != (want == "error") || hasGrant != (want == "grant") {
-			t.Errorf("entry %d: %v (want %q)", i, e, want)
-		}
-		wantCP := cp
-		if !reflect.DeepEqual(e["checkpoint"], wantCP) {
-			t.Errorf("entry %d: checkpoint %v, want %v", i, e["checkpoint"], wantCP)
+		_, hasCP := e["checkpoint"]
+		if status != want || hasGrant != (want == 0) || hasCP || e["error"] != nil {
+			t.Errorf("entry %d: %v (want status %v)", i, e, want)
 		}
 	}
-	rg = w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/matches/derby", "/r/matches/shared", "/r/cat/season")})
-	for _, x := range rg.body["grants"].([]any) {
-		if e := x.(map[string]any); e["error"] != nil {
-			t.Errorf("bob may read derby, shared and season: %v", e)
+	rg = w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/matches/derby", "/r/matches/shared")})
+	for _, x := range rg.body["items"].([]any) {
+		if e := x.(map[string]any); e["status"] != nil {
+			t.Errorf("bob may read derby and shared: %v", e)
 		}
 	}
 
@@ -112,7 +114,7 @@ func TestDecisionCheckpoint(t *testing.T) {
 		want   map[string]any // the checkpoint, if not cp
 	}{
 		{"no role", map[string]any{"item": "/r/matches/rumour1", "want": toAny("read")}, 403, true, nil},
-		{"not placed", map[string]any{"item": "/r/matches/ghost", "want": toAny("read")}, 403, true, nil},
+		{"never existed, read", map[string]any{"item": "/r/matches/ghost", "want": toAny("read")}, 404, true, nil},
 		{"taken name", map[string]any{"item": "/r/matches/derby", "want": toAny("create")}, 409, true, nil},
 		{"never existed", map[string]any{"item": "/r/matches/ghost", "want": toAny("restore")}, 404, true, nil},
 		{"live", map[string]any{"item": "/r/matches/derby", "want": toAny("restore")}, 409, true, nil},
@@ -202,14 +204,14 @@ func TestReadGrantsOneCheckpoint(t *testing.T) {
 		t.Fatalf("read-grants with a write mid-decision: %d %v after %d tries", r.status, r.body, tries.Load())
 	}
 	// Every entry is decided at the catalog checkpoint after the write,
-	// the refusal of rumour1 too.
-	for i, x := range r.body["grants"].([]any) {
+	// the refusal of rumour1 too, which the answer's checkpoint names.
+	if cp := w.checkpointOf("matches"); !reflect.DeepEqual(r.body["checkpoint"], cp) {
+		t.Errorf("checkpoint %v, now %v", r.body["checkpoint"], cp)
+	}
+	for i, x := range r.body["items"].([]any) {
 		e := x.(map[string]any)
-		if cp := w.checkpointOf("matches"); !reflect.DeepEqual(e["checkpoint"], cp) {
-			t.Errorf("%v: checkpoint %v, now %v", e["item"], e["checkpoint"], cp)
-		}
 		if i == 2 {
-			if e["error"] == nil {
+			if e["status"] != 403.0 {
 				t.Errorf("rumour1: %v", e)
 			}
 			continue
@@ -276,7 +278,7 @@ func TestDecisionsPinned(t *testing.T) {
 		t.Errorf("grant before the service reaches the change: %v (at %v)", r.body, at)
 	}
 	rg := w.do("POST", "/read-grants", fan, map[string]any{"items": toAny("/r/matches/derby")})
-	if e := entry(rg, 0); !reflect.DeepEqual(e["checkpoint"], at) || e["grant"] == nil {
+	if e := entry(rg, 0); !reflect.DeepEqual(rg.body["checkpoint"], at) || e["grant"] == nil {
 		t.Errorf("read-grants before the service reaches the change: %v (at %v)", rg.body, at)
 	}
 
@@ -291,7 +293,7 @@ func TestDecisionsPinned(t *testing.T) {
 	})
 	rumour := map[string]any{"items": toAny("/r/matches/rumour1")}
 	rg = w.do("POST", "/read-grants", fan, rumour)
-	if e := entry(rg, 0); !reflect.DeepEqual(e["checkpoint"], at) || e["error"] == nil || e["public"] != nil {
+	if e := entry(rg, 0); !reflect.DeepEqual(rg.body["checkpoint"], at) || e["status"] == nil || e["public"] != nil {
 		t.Errorf("read-grants for rumour1 before the service reaches public: %v (at %v)", rg.body, at)
 	}
 
@@ -319,15 +321,16 @@ func TestDecisionsPinned(t *testing.T) {
 		t.Errorf("refusal after the change: %v (was %v)", r.body, at)
 	}
 	rg = w.do("POST", "/read-grants", fan, rumour)
-	if e := entry(rg, 0); !reflect.DeepEqual(e["checkpoint"], w.checkpointOf("matches")) || e["public"] != true {
+	if e := entry(rg, 0); !reflect.DeepEqual(rg.body["checkpoint"], w.checkpointOf("matches")) || e["public"] != true {
 		t.Errorf("read-grants for rumour1 once matches is public: %v", rg.body)
 	}
 }
 
 // TestHeadKeyRefusal: a refusal because the catalog's key is missing from
 // the content namespace at the head is decided at the head, not at a
-// checkpoint, so it carries none, for restore as for other verbs
-// (§B.11.4).
+// checkpoint, so it carries none, for restore as for other verbs. It
+// comes after the decision's own answers, so the restore is of a deleted
+// item, which the decision grants (§B.11.4).
 func TestHeadKeyRefusal(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -340,6 +343,8 @@ func TestHeadKeyRefusal(t *testing.T) {
 	w.start()
 	w.caughtUp()
 	bob := w.caller("user:bob", "match-desk")
+	must(w.ops.Delete(ctx, "matches", "shared", must(w.ops.Head(ctx, "matches", "shared")).ID))
+	w.caughtUp()
 	rt.hold.Store(true)
 	opm := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"matches"}, []string{"config"})))
 	cfg := must(w.ops.NSHead(ctx, "matches")).Config
@@ -348,8 +353,8 @@ func TestHeadKeyRefusal(t *testing.T) {
 		c, err := w.svc.Tree().Checker().Config(ctx, "matches")
 		return err == nil && len(c.Keys) == 2
 	})
-	for _, want := range []string{"read", "restore"} {
-		r := w.issue(bob, map[string]any{"item": "/r/matches/derby", "want": toAny(want)}, 403)
+	for want, item := range map[string]string{"read": "/r/matches/derby", "restore": "/r/matches/shared"} {
+		r := w.issue(bob, map[string]any{"item": item, "want": toAny(want)}, 403)
 		if msg, _ := r.body["message"].(string); !strings.Contains(msg, "catalog's key") || r.body["checkpoint"] != nil {
 			t.Errorf("%s with the key missing at the head: %v", want, r.body)
 		}

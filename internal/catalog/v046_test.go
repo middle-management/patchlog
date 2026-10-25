@@ -38,7 +38,7 @@ func TestMinOnGrants(t *testing.T) {
 		// Read grants too, and the parameter repeats.
 		mw := must(w.ops.CreateDoc(ctx, "matches", "x"+name, map[string]any{"title": name}))
 		r = w.do("POST", "/read-grants?min=cat:"+wr.NSID+"&min=matches:"+mw.NSID, bob, map[string]any{"items": toAny("/r/matches/derby")})
-		if r.status != 200 || r.body["grants"] == nil {
+		if r.status != 200 || r.body["items"] == nil {
 			t.Fatalf("read-grants with two mins: %d %v", r.status, r.body)
 		}
 	}
@@ -147,7 +147,7 @@ func TestReadGrantsAreFixedToTheResource(t *testing.T) {
 	if r.status != 200 {
 		t.Fatalf("read-grants: %d %v", r.status, r.body)
 	}
-	tok := r.body["grants"].([]any)[0].(map[string]any)["grant"].(string)
+	tok := entry(r, 0)["grant"].(string)
 	g, err := grant.Decode(tok, 1<<20)
 	if err != nil {
 		t.Fatal(err)

@@ -44,6 +44,10 @@ type Head struct {
 	// sealed and e2e namespaces; Moved reads the document at Last there,
 	// and E2E.Moved always does.
 	Successor string
+	// PurgedNS is, for a Purged head, the purge-ns entry of a purged
+	// namespace, whose every name is 410 purged with it as head (§8.5);
+	// "" for a resource purged on its own (§8.3).
+	PurgedNS string
 }
 
 // Head reads a resource's head pointer without following the redirect.
@@ -70,7 +74,11 @@ func (c *Client) Head(ctx context.Context, ns, name string) (*Head, error) {
 			}
 			return h, nil
 		}
-		return &Head{State: Purged}, nil
+		h := &Head{State: Purged}
+		if str(m, "code") == "purged" {
+			h.PurgedNS = str(m, "head")
+		}
+		return h, nil
 	}
 	return nil, r.apiError()
 }
