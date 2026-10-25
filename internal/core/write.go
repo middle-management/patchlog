@@ -353,24 +353,32 @@ func (e *Engine) WriteResource(ctx context.Context, req Request, item Item) (*Wr
 // Batch performs an atomic batch (§7.5).
 func (e *Engine) Batch(ctx context.Context, req Request, items []Item, cfg *ConfigChange, source any, dryRun bool) (*WriteResult, error) {
 	if dryRun {
-		// A dry run writes nothing: steps 1–6 in a read transaction.
+		// A dry run writes nothing: steps 1–6 in a read transaction. A
+		// config change a remote branch's base judges reads the base's
+		// document first, as a config write does (withRemoteSource, §G.5.2).
 		var res *WriteResult
-		err := e.read(ctx, func(t *tx) error {
-			r, err := t.writeItems(req, items, cfg, source, true, true, false)
-			res = r
-			return err
+		err := e.withRemoteSource(ctx, func(ctx context.Context) error {
+			return e.read(ctx, func(t *tx) error {
+				r, err := t.writeItems(req, items, cfg, source, true, true, false)
+				res = r
+				return err
+			})
 		})
 		return res, err
 	}
 	if cfg != nil {
 		// A batch that changes the configuration is rare, and its config
 		// change reads more than the re-check covers (dependents, archive
-		// destinations): it runs its whole gate inside the write lock.
+		// destinations): it runs its whole gate inside the write lock,
+		// after reading what a remote branch's base judges it by
+		// (withRemoteSource, §G.5.2).
 		var res *WriteResult
-		err := e.update(ctx, func(t *tx) error {
-			r, err := t.writeItems(req, items, cfg, source, true, false, false)
-			res = r
-			return err
+		err := e.withRemoteSource(ctx, func(ctx context.Context) error {
+			return e.update(ctx, func(t *tx) error {
+				r, err := t.writeItems(req, items, cfg, source, true, false, false)
+				res = r
+				return err
+			})
 		})
 		return res, err
 	}

@@ -194,12 +194,12 @@ type RemoteOptions struct {
 	// Resolve maps a base's origin to the endpoint requests go to. Nil
 	// means the origin itself, telemetry.DefaultClient and no bearer grant.
 	Resolve func(origin string) (RemoteEndpoint, error)
-	// IgnorePurges records purges in a base's log as notices only
-	// (RemoteNotices) instead of applying them (§G.3 SHOULD follow).
-	IgnorePurges bool
-	// FollowInterval is how often bases' logs are followed and
-	// registrations renewed. Zero means five minutes; negative disables the
-	// background follower (SyncRemotes still works).
+	// FollowInterval is how often bases' logs are followed, their purges
+	// applied and their raises followed (§G.3, §G.5.2), and registrations
+	// renewed. Zero means five minutes; negative disables the background
+	// follower (SyncRemotes still works). Following is a SHOULD (§G.3), but
+	// a deployment that sees a purge applies it: there is no option to
+	// record purges without applying them.
 	FollowInterval time.Duration
 	// Register registers each remote branch with its base (optional in
 	// §G.3) when it is created, and renews the registration before it

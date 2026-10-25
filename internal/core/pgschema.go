@@ -432,6 +432,23 @@ CREATE TABLE IF NOT EXISTS e2e_raises (
   pad        bigint NOT NULL,
   created    bigint NOT NULL
 );
+-- A remote branch whose source's level is above its own (§G.5.2; db.go,
+-- remote_branch.go): the source's level, whether this server lacks it
+-- (502 upstream, §1) and whether the branch needs a rebase.
+CREATE TABLE IF NOT EXISTS remote_levels (
+  branch  bigint   PRIMARY KEY REFERENCES namespaces,
+  level   smallint NOT NULL,
+  lacks   smallint NOT NULL,
+  rebase  smallint NOT NULL,
+  id      text     NOT NULL,
+  created bigint   NOT NULL
+);
+-- A remote branch whose base's namespace document the follower reads once
+-- more, as of its checkpoint (§G.5.2; db.go, remote_branch.go): one from
+-- before the follower followed config entries.
+CREATE TABLE IF NOT EXISTS remote_catchup (
+  branch bigint PRIMARY KEY REFERENCES namespaces
+);
 `
 
 // openPG opens a Postgres database and creates or migrates its schema.
