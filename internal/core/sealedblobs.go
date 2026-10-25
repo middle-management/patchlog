@@ -148,6 +148,35 @@ func (t *tx) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJ
 	return nil
 }
 
+// blobKeyEpochs lists the epochs a request for blob bid of resource name
+// of sealed namespace n would be served under (§E.2.2), for the key window
+// of a copy or a batch's local source (keywindow.go): those fixed, or,
+// when none of its referencing revisions has an epoch yet, the current
+// one, under which such a request would fix the newest of them
+// (sealedBlobHead). None if no still served revision references it.
+func (t *tx) blobKeyEpochs(n *nsRow, name string, bid ids.ID) map[int]bool {
+	v := t.resolve(n, name, nil)
+	eps := t.blobEpochs(n, v.head, bid)
+	if len(eps) == 0 && v.head != nil && t.blobRevServed(v.head, bid) {
+		eps[t.config(n.configSeq).Epoch] = true
+	}
+	return eps
+}
+
+// blobRevServed reports whether a still served revision of the history
+// ending at head references bid, as newestBlobRev looks for one.
+func (t *tx) blobRevServed(head *revRow, bid ids.ID) bool {
+	where := ` WHERE b.res = ? AND b.bid = ? AND r.seq <= ? AND r.kind = 0 AND ` + servedRev
+	for _, seg := range t.ancestry(head) {
+		var ok bool
+		t.must(t.QueryRow(`SELECT EXISTS (SELECT 1`+refRevs+where+`)`, seg.res, bid[:], seg.max).Scan(&ok))
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
 // newestBlobRev prepares the sealing of the newest still served revision
 // of the history ending at head whose document references bid, or nil.
 func (t *tx) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID) *sealJob {
@@ -190,7 +219,9 @@ type sealedBlobJob struct {
 // ReadSealedBlob answers GET /r/{ns}/{name}/blob/{bid}/e/{e} (§E.2.2): the
 // blob sealed under epoch e, if n serves it under e. Other epochs are 404
 // with NoStore, or 410 pruned once pruning removed every revision of the
-// epoch that references it. Only sealed namespaces have this URL.
+// epoch that references it. Only sealed namespaces have this URL: in any
+// other it is 404 not_offered (epochNotOffered), but 410 for a purged
+// resource (§8.3).
 func (e *Engine) ReadSealedBlob(ctx context.Context, ns, name, bidText, epochText string, cred Credentials) (*Blob, error) {
 	b, err := e.OpenSealedBlob(ctx, ns, name, bidText, epochText, cred)
 	if err != nil {
@@ -220,9 +251,20 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			return t.purgedRead(n)
 		}
 		out = &Blob{Public: t.cachePublic(n)}
+		if !t.isSealedNS(n) {
+			// Only sealed namespaces have this URL: 404 not_offered,
+			// after the resource's read check, cached as short (§7.1).
+			// A purged resource's URLs are 410 first, as its blob URL
+			// answers (§8.3: "before a not_offered as in §8.5"; raw.go).
+			if t.resolve(n, name, nil).state == Purged {
+				out.Status = 410
+				return nil
+			}
+			return epochNotOffered(out.Public)
+		}
 		bid, perr := ids.Parse(bidText)
 		ep, eerr := strconv.Atoi(epochText)
-		if perr != nil || eerr != nil || ep < 1 || strconv.Itoa(ep) != epochText || !t.isSealedNS(n) {
+		if perr != nil || eerr != nil || ep < 1 || strconv.Itoa(ep) != epochText {
 			out.Status = 404
 			return nil
 		}
@@ -297,6 +339,15 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 	}
 	out.setContent(memContent(stored))
 	return out, nil
+}
+
+// epochNotOffered is …/blob/{bid}/e/{e} outside sealed namespaces (§7.1,
+// §7.8): 404 not_offered, with the short class (§9). Public is for the
+// server's cache class, as for nfNS.
+func epochNotOffered(public bool) *Error {
+	e := apiErr(404, "not_offered", "message", "epoch blob URLs are served in sealed namespaces only (§7.1, §E.2.2)")
+	e.Public = &public
+	return e
 }
 
 // storeSealedBlob stores job's sealing unless one is stored already, and

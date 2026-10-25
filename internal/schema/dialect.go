@@ -14,16 +14,17 @@ import (
 
 // Rules marks the rules a schema revision was written under, which select
 // how it compiles: "A schema stored under an earlier version is compiled
-// as that version did" (§6.1). The compiled-validator cache is keyed by
-// revision path and marker.
+// as that version did" (§6.1). Compiled validators are kept by revision
+// path with the markers they compiled under (Validator).
 type Rules uint8
 
 const (
 	// Legacy is how v0.55 compiled every schema: the library's formats
 	// asserted, semver and period included, idn-email and idn-hostname
 	// not, and other names ignored. A pattern \uXXXX translation refuses
-	// but RE2 took as written still compiles. Stored revisions load as
-	// Legacy until their markers are kept.
+	// but RE2 took as written still compiles. Revisions stored before
+	// markers were kept, and those whose marker the caller doesn't know,
+	// load as Legacy.
 	Legacy Rules = iota
 	// V073 asserts exactly the format set of draft 2020-12 (§6.2 step 5),
 	// idn-email and idn-hostname with UTS 46 processing, and reads

@@ -46,5 +46,5 @@ func (t *tx) checkSource(req Request, v any) (any, *batchSource, *Error) {
 	if !ok {
 		return nil, nil, apiErr(422, "source", "message", "source.at is not in the chain of source.ns")
 	}
-	return m, &batchSource{n: sn, atSeq: seq}, nil
+	return m, &batchSource{n: sn, atSeq: seq, creds: req.anyCreds()}, nil
 }

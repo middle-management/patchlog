@@ -216,7 +216,7 @@ func fetchErr(what string, err error) *Error {
 func schemaFetchErr(ref schema.Ref) func(string, error) *Error {
 	return func(what string, err error) *Error {
 		if ae, ok := client.AsAPIError(err); ok && (ae.Status == 404 || ae.Status == 401 || ae.Status == 403 || ae.Status == 410 && ae.Code != "pruned") {
-			return apiErr(422, "schema_unavailable", "ref", ref.Path(), "message",
+			return schemaUnavailable(ref.Path(), "message",
 				ref.Path()+" doesn't resolve in "+ref.NS+" at the base (a draft in a branch there, §6.1, purged, or unreadable); "+
 					"a remote branch mirrors schema revisions only from their own namespace (§G.3)")
 		}
