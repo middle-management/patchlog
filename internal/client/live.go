@@ -175,12 +175,20 @@ func (c *Client) NSEvents(ctx context.Context, ns, since string, fn func(NSEntry
 // that records them, without id and prev, and which have no ID. A stream
 // ends after its purge event. To resume, pass the ID of the last revision
 // or tombstone event as since.
+//
+// A server older than v0.73 sends purge and prune events with the
+// namespace entry's id as their id: and, in a sealed namespace, sealed as
+// the namespace range of that one entry under K_e; ResourceEvents opens
+// that form too, and delivers those events as a current server sends them.
 func (c *Client) ResourceEvents(ctx context.Context, ns, name, since string, fn func(Event) error) error {
 	if err := checkRes(ns, name); err != nil {
 		return err
 	}
 	return c.events(ctx, "/r/"+ns+"/"+name+"/events", since, func(ev Event) error {
 		if ev.JWE == "" {
+			if m, ok := ev.Data.(map[string]any); ok && (ev.Type == "purge" || ev.Type == "prune") {
+				ev.ID, ev.Data = "", withoutIDPrev(m)
+			}
 			return fn(ev)
 		}
 		switch ev.Type {
@@ -194,28 +202,86 @@ func (c *Client) ResourceEvents(ctx context.Context, ns, name, since string, fn 
 			}
 			ev.Data = e.Raw
 		case "purge", "prune":
-			// The namespace entry that records it, without id and prev,
-			// sealed under the resource's K_r of the current epoch with
-			// pl { ns, name, kind }: a grant for this resource alone
-			// opens it (§7.3, §E.2.2).
-			pt, err := c.open(ctx, ns, name, ev.JWE, fixedPL(seal.ResourceEventPL(ns, name, ev.Type)))
+			m, err := c.openResourceEvent(ctx, ns, name, ev)
 			if err != nil {
-				return fmt.Errorf("client: %s event: %w", ev.Type, err)
-			}
-			v, err := jsonv.Parse(pt)
-			m, _ := v.(map[string]any)
-			if err != nil || m == nil {
-				return fmt.Errorf("client: %s event: sealed data is not an entry", ev.Type)
+				return err
 			}
 			if m["kind"] != ev.Type || m["resource"] != name {
 				return fmt.Errorf("client: %s event carries a %v entry of %v: %w", ev.Type, m["kind"], m["resource"], seal.ErrMismatch)
 			}
-			ev.Data = m
+			ev.ID, ev.Data = "", withoutIDPrev(m)
 		default:
 			return fmt.Errorf("client: sealed event of type %q", ev.Type)
 		}
 		return fn(ev)
 	})
+}
+
+// openResourceEvent opens a sealed purge or prune event ev of resource name.
+func (c *Client) openResourceEvent(ctx context.Context, ns, name string, ev Event) (map[string]any, error) {
+	h, err := seal.ParseHeader(ev.JWE)
+	if err != nil {
+		return nil, fmt.Errorf("client: %s event: %w", ev.Type, err)
+	}
+	if rg, old := h.PL["range"]; old {
+		// A server older than v0.73: the namespace range (prev, id] of
+		// the one entry, under K_e, with the entry's id as the event's
+		// id:. The range pl binds both, and the entry must match them.
+		pair, _ := rg.([]any)
+		var from string
+		if len(pair) == 2 {
+			from, _ = pair[0].(string)
+		}
+		if len(pair) != 2 || ev.ID == "" {
+			return nil, fmt.Errorf("client: %s event: %w", ev.Type, seal.ErrMismatch)
+		}
+		v, err := c.openRange(ctx, ns, from, ev.ID, ev.JWE)
+		if err != nil {
+			return nil, fmt.Errorf("client: %s event %s: %w", ev.Type, ev.ID, err)
+		}
+		arr, _ := v.([]any)
+		var m map[string]any
+		if len(arr) == 1 {
+			m, _ = arr[0].(map[string]any)
+		}
+		if m == nil {
+			return nil, fmt.Errorf("client: %s event %s: sealed data is not one entry", ev.Type, ev.ID)
+		}
+		if m["id"] != ev.ID || m["prev"] != from {
+			return nil, fmt.Errorf("client: %s event %s carries entry %v after %v: %w", ev.Type, ev.ID, m["id"], m["prev"], seal.ErrMismatch)
+		}
+		return m, nil
+	}
+	// The namespace entry that records it, without id and prev, sealed
+	// under the resource's K_r of the current epoch with pl { ns, name,
+	// kind }: a grant for this resource alone opens it (§7.3, §E.2.2).
+	pt, err := c.open(ctx, ns, name, ev.JWE, fixedPL(seal.ResourceEventPL(ns, name, ev.Type)))
+	if err != nil {
+		return nil, fmt.Errorf("client: %s event: %w", ev.Type, err)
+	}
+	v, err := jsonv.Parse(pt)
+	m, _ := v.(map[string]any)
+	if err != nil || m == nil {
+		return nil, fmt.Errorf("client: %s event: sealed data is not an entry", ev.Type)
+	}
+	return m, nil
+}
+
+// withoutIDPrev is a resource stream's purge or prune event data m, the
+// namespace entry recording it, without its id and prev (§7.3).
+func withoutIDPrev(m map[string]any) map[string]any {
+	if _, ok := m["id"]; !ok {
+		if _, ok := m["prev"]; !ok {
+			return m
+		}
+	}
+	d := make(map[string]any, len(m))
+	for k, v := range m {
+		if k != "id" && k != "prev" {
+			d[k] = v
+		}
+	}
+	return d
 }
 
 func (c *Client) events(ctx context.Context, path, since string, fn func(Event) error) error {
