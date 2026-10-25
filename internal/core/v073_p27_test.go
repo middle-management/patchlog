@@ -290,11 +290,26 @@ func TestV073LegacyRevisionInV073Closure(t *testing.T) {
 	// The V073 schema's own formats are V073's.
 	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("d5", map[string]any{"$schema": spath, "e": "not an email"}))
 	expectAPI(t, err, 422, "invalid")
-	// And so for a schema whose root is only a $ref, in one batch with
-	// documents typed by both (one transaction, both markers).
-	rid := s.put("n", "r", "", map[string]any{"$schema": schema.Dialect2020, "$ref": lpath})
-	s.put("n", "d6", "", map[string]any{"$schema": "/r/n/r/rev/" + rid, "e": "not an email"})
-	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("d7", map[string]any{"$schema": "/r/n/r/rev/" + rid, "v": "not a version"}))
+	// And so for a schema whose root is only a $ref, written in one batch
+	// with documents typed by it and by the stored revision (one
+	// transaction, the root an earlier item's, both markers).
+	pendingRoot := func(title string) (map[string]any, string) {
+		doc := map[string]any{"$schema": schema.Dialect2020, "title": title, "$ref": lpath}
+		return doc, "/r/n/" + title + "/rev/" + ids.Revision(nil, genesisCanon(doc)).String()
+	}
+	rdoc, rpath := pendingRoot("r")
+	s.mustBatch("n", []Item{createItem("r", rdoc),
+		createItem("d6", map[string]any{"$schema": rpath, "e": "not an email"}),
+		createItem("d8", map[string]any{"$schema": lpath, "e": "not an email"})})
+	r2doc, r2path := pendingRoot("r2")
+	_, err = s.batch("n", []Item{createItem("r2", r2doc),
+		createItem("d7", map[string]any{"$schema": r2path, "v": "not a version"})}, false)
+	if got := itemFails(t, err); len(got) != 1 || got[1] != "invalid" {
+		t.Errorf("d7 typed by a pending V073 root that $refs the stored revision: %v, want item 1 invalid", got)
+	}
+	// Written since, it compiles the same way.
+	s.put("n", "d9", "", map[string]any{"$schema": rpath, "e": "not an email"})
+	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("d10", map[string]any{"$schema": rpath, "v": "not a version"}))
 	expectAPI(t, err, 422, "invalid")
 }
 
