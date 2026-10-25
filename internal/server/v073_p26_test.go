@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -346,8 +347,8 @@ func TestV073P26BranchPrune(t *testing.T) {
 
 // v0.73 §8.6, §13, Encryption levels scenario 18 (BBD-49, F-B6): an E3
 // prune in a branch moves nothing, but its snapshot is still required and
-// checked, its kid included: one sealed under the base's kid is 422; no
-// archive is needed, nor a * key.
+// checked, its kid included: one sealed under the base's kid is 422, its pl
+// the branch's or not; no archive is needed, nor a * key.
 func TestV073P26BranchPruneE3(t *testing.T) {
 	t.Parallel()
 	f := newE2E(t) // no archive destination
@@ -366,12 +367,22 @@ func TestV073P26BranchPruneE3(t *testing.T) {
 		t.Fatal(err)
 	}
 	expectCode(t, e.prune("eb", "d", map[string]any{"horizon": d1, "snapshot": baseKid}, bg), 422, "invalid")
+	// The base's kid with the branch's pl: only the kid is wrong.
+	baseKidOnly, err := seal.SealSnapshot(k, "e#1", "eb", "d", d1, map[string]any{"n": 1.0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := e.prune("eb", "d", map[string]any{"horizon": d1, "snapshot": baseKidOnly}, bg)
+	expectCode(t, r, 422, "invalid")
+	if !strings.Contains(r.Str("message"), "kid") || r.Obj()["pl"] != nil {
+		t.Fatalf("a snapshot under the base's kid: %s", r.Body)
+	}
 	own, err := seal.SealSnapshot(k, "eb#1", "eb", "d", d1, map[string]any{"n": 1.0})
 	if err != nil {
 		t.Fatal(err)
 	}
 	head := e.nsHead("eb", bg)
-	r := e.prune("eb", "d", map[string]any{"horizon": d1, "snapshot": own}, bg)
+	r = e.prune("eb", "d", map[string]any{"horizon": d1, "snapshot": own}, bg)
 	expect(t, r, 200)
 	if r.Str("horizon") != d0 || r.H.Get("X-Namespace-Revision") != "" || e.nsHead("eb", bg) != head {
 		t.Fatalf("E3 branch prune %s %v", r.Body, r.H)
