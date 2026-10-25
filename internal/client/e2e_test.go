@@ -99,13 +99,13 @@ func testE2EClient(t *testing.T) {
 	}
 
 	// A revision written without validation is flagged with its author and
-	// left out of the fold.
+	// still folded (§E.3.2, v0.70).
 	bad := must(w.WithoutValidation().AppendSealed(ctx, "e", "d", a.ID, ops(op("replace", "/n", "two"))))
 	d := must(rd.DocE2E(ctx, "e", "d", bad.ID))
 	if d.ValidID != a.ID || len(d.Flagged) != 1 || d.Flagged[0].ID != bad.ID || d.Flagged[0].Author != "user:writer" {
 		t.Fatalf("flagged %+v", d)
 	}
-	if n, _ := d.Value.(map[string]any)["n"].(float64); n != 2 {
+	if n, _ := d.Value.(map[string]any)["n"].(string); n != "two" {
 		t.Fatalf("value %v", d.Value)
 	}
 	good := must(w.AppendSealed(ctx, "e", "d", bad.ID, ops(op("replace", "/n", 3))))

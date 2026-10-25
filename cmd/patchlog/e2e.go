@@ -1,6 +1,6 @@
 package main
 
-// patchlog e2e migrate-keyring -api URL -ns NS -identity admin.jwk [-reader pub.jwk]... [-current-reader pub.jwk]... [-skip-unopenable] [-bearer T] [-json]
+// patchlog e2e migrate-keyring -api URL -ns NS -identity admin.jwk [-reader pub.jwk]... [-current-reader pub.jwk]... [-skip-unopenable] [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-bearer T] [-json]
 //
 // Wraps an e2e namespace's keyring stored in the format before v0.63 again
 // as the keyring document of §E.3.2 (client.E2E.MigrateKeyring): every
@@ -30,7 +30,7 @@ import (
 )
 
 const e2eUsage = `usage:
-  patchlog e2e migrate-keyring -api URL -ns NS -identity admin.jwk [-reader pub.jwk]... [-current-reader pub.jwk]... [-skip-unopenable] [-bearer T] [-author A] [-json]`
+  patchlog e2e migrate-keyring -api URL -ns NS -identity admin.jwk [-reader pub.jwk]... [-current-reader pub.jwk]... [-skip-unopenable] [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-bearer T] [-author A] [-json]`
 
 func e2eCmd(args []string) {
 	if len(args) == 0 || args[0] != "migrate-keyring" {
@@ -114,6 +114,43 @@ func migrationReaders(epochs []int, current int, all, newest []*ecdh.PublicKey) 
 		out[current] = append(out[current], newest...)
 	}
 	return out
+}
+
+// keyringFlags name the admin keys whose e2e keyring entries a tool or
+// service opens, and those it trusts to distribute keys it seals under
+// (§E.3.2): -keyring-sender and -trusted-sender, both repeatable.
+type keyringFlags struct{ senders, trusted multi }
+
+const keyringSenderHelp = "file with a keyring admin's X25519 public key (a JWK {kty, crv, x}, or base64url x): e2e keyring entries it wrapped are opened (§E.3.2), and, unless -trusted-sender is given, sealed under; repeatable"
+const trustedSenderHelp = "as -keyring-sender, and trusted to distribute keys: once any is given, this tool seals (writes, prunes, re-encrypted merges, derived views) only under keys whose keyring entry is from one of these or from its own identity, while reads still open keys from every -keyring-sender (§E.3.2); never under a key without a sender, such as one of a keyring stored before v0.63 (migrate-keyring); repeatable"
+
+// addKeyringFlags registers -keyring-sender and -trusted-sender on fs.
+func addKeyringFlags(fs *flag.FlagSet) *keyringFlags {
+	kf := &keyringFlags{}
+	fs.Var(&kf.senders, "keyring-sender", keyringSenderHelp)
+	fs.Var(&kf.trusted, "trusted-sender", trustedSenderHelp)
+	return kf
+}
+
+// options returns the client options of kf (client.WithKeyringSenders,
+// client.WithTrustedKeyringSenders).
+func (kf *keyringFlags) options() ([]client.Option, error) {
+	senders, err := readPublicKeys(kf.senders)
+	if err != nil {
+		return nil, fmt.Errorf("-keyring-sender: %w", err)
+	}
+	trusted, err := readPublicKeys(kf.trusted)
+	if err != nil {
+		return nil, fmt.Errorf("-trusted-sender: %w", err)
+	}
+	var out []client.Option
+	if len(senders) > 0 {
+		out = append(out, client.WithKeyringSenders(senders...))
+	}
+	if len(trusted) > 0 {
+		out = append(out, client.WithTrustedKeyringSenders(trusted...))
+	}
+	return out, nil
 }
 
 // readPublicKeys reads X25519 public keys from files: a JWK {kty, crv, x},

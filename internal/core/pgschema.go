@@ -421,6 +421,17 @@ ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS via text;
 -- V073, 0 for Legacy; NULL, read as Legacy, in rows from before it and in
 -- rows a remote branch mirrors (§6.1).
 ALTER TABLE revisions ADD COLUMN IF NOT EXISTS rules smallint;
+-- Raises to e2e (Addendum E Levels; db.go, e2e.go): the configuration that
+-- made a namespace end-to-end after its creation, the level before, and
+-- from sealed the last epoch and pad setting before the raise.
+CREATE TABLE IF NOT EXISTS e2e_raises (
+  ns         bigint PRIMARY KEY REFERENCES namespaces,
+  config_seq bigint NOT NULL,
+  level      bigint NOT NULL,
+  epoch      bigint NOT NULL,
+  pad        bigint NOT NULL,
+  created    bigint NOT NULL
+);
 `
 
 // openPG opens a Postgres database and creates or migrates its schema.

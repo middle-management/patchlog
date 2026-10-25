@@ -2,6 +2,7 @@ package merge
 
 import (
 	"context"
+	"crypto/ecdh"
 	"errors"
 	"fmt"
 	"sort"
@@ -25,8 +26,15 @@ type RebaseReleaseOptions struct {
 	// known; otherwise it is left out: the successors start at their
 	// bases' current heads, not at one combined checkpoint.
 	At string
-	// Plan options for the replays (Squash is ignored).
+	// Plan options for the replays (Squash is ignored). E2E release
+	// branches need Plan.E2E.
 	Plan Options
+	// SuccessorReaders are the public keys each e2e successor's keyring
+	// wraps its key for, besides those Rebase finds (RebaseOptions.
+	// SuccessorReaders): readers of the old branches that Plan.E2E
+	// doesn't know, which a switch would otherwise drop
+	// (ErrReadersDropped, §F.8.1, §E.3.2).
+	SuccessorReaders []*ecdh.PublicKey
 }
 
 // RebaseReleaseResult reports what RebaseRelease did.
@@ -110,7 +118,7 @@ func RebaseRelease(ctx context.Context, c *client.Client, opt RebaseReleaseOptio
 		sort.Slice(others, func(i, j int) bool { return others[i].(string) < others[j].(string) })
 		br := rel.Doc.Branches[k].NS
 		out.Order = append(out.Order, br)
-		res, err := Rebase(ctx, c, RebaseOptions{Branch: br, New: succ[k], Switch: true, Plan: popt,
+		res, err := Rebase(ctx, c, RebaseOptions{Branch: br, New: succ[k], Switch: true, Plan: popt, SuccessorReaders: opt.SuccessorReaders,
 			Patches: []any{map[string]any{"op": "add", "path": "/drafts", "value": map[string]any{"for": others}}},
 			Prepare: func(ctx context.Context, p *Plan) error { return squashDrafts(ctx, c, p, out.Drafts, out.Squashed, k) },
 		})
@@ -128,7 +136,7 @@ func RebaseRelease(ctx context.Context, c *client.Client, opt RebaseReleaseOptio
 	for _, k := range otherKeys {
 		br := rel.Doc.Branches[k].NS
 		out.Order = append(out.Order, br)
-		res, err := Rebase(ctx, c, RebaseOptions{Branch: br, New: succ[k], Switch: true, Plan: popt,
+		res, err := Rebase(ctx, c, RebaseOptions{Branch: br, New: succ[k], Switch: true, Plan: popt, SuccessorReaders: opt.SuccessorReaders,
 			Prepare: func(ctx context.Context, p *Plan) error { return squashDrafts(ctx, c, p, out.Drafts, out.Squashed, k) },
 		})
 		out.Rebases[k] = res
@@ -163,6 +171,13 @@ func RebaseRelease(ctx context.Context, c *client.Client, opt RebaseReleaseOptio
 
 // writesSchemas reports whether a branch wrote a schema document.
 func writesSchemas(ctx context.Context, c *client.Client, ns string) (bool, error) {
+	// An e2e branch holds no schema the gate resolves, and no drafts
+	// (§6.1, §7.4); its documents are folded client-side, not read here.
+	if lv, err := c.EncryptionLevel(ctx, ns); err != nil {
+		return false, err
+	} else if lv == "e2e" {
+		return false, nil
+	}
 	h, err := c.NSHead(ctx, ns)
 	if err != nil {
 		return false, err

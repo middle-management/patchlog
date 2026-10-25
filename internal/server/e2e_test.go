@@ -491,10 +491,11 @@ func TestE2EEpochsBranchesLevels(t *testing.T) {
 		t.Fatalf("branch log %s", r.Body)
 	}
 
-	// Levels: e2e only from the start.
+	// Levels: an existing namespace may be raised to e2e (v0.73, Addendum
+	// E Levels); a branch only over an e2e base, and never down.
 	e.mkNS("ar", atRest(map[string]any{"keys": []any{f.admin.entry("*")}}))
 	arG := e.grant(f.admin, "user:admin", []string{"ar"}, allVerbs)
-	expectCode(t, e.patchNS("ar", ops(op("replace", "/encryption", map[string]any{"level": "e2e"})), arG), 422, "invalid")
+	expect(t, e.patchNS("ar", ops(op("replace", "/encryption", map[string]any{"level": "e2e"})), arG), 201)
 	e.mkNS("pl", map[string]any{"keys": []any{f.admin.entry("*")}})
 	plG := e.grant(f.admin, "user:admin", []string{"pl"}, allVerbs)
 	expectCode(t, e.branch("pl", map[string]any{"name": "plb", "patches": ops(op("add", "/encryption", map[string]any{"level": "e2e"}))}, plG), 422, "invalid")

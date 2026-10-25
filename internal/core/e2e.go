@@ -39,6 +39,13 @@ package core
 //     e2e_epochs records when each epoch began (for POST /keys and kid
 //     checks). A key holder rotates by re-wrapping the keyring and bumping
 //     the epoch, in one batch.
+//   - Raises (Addendum E Levels). A config write, or a batch's config
+//     change, may raise a namespace to e2e from none, at-rest or sealed,
+//     starting a new epoch (from sealed, the current one plus one;
+//     checkEncryption). e2e_raises records the raising configuration and
+//     what was in force before (e2eRaiseOf). Writes from the raising
+//     entry on are sealed ops; what was stored before stays plaintext on
+//     the server.
 //   - Reads. GET /r/{ns}/{name}/rev/{id} answers 302 to
 //     /r/{ns}/{name}/rev/{id}/log?since={s} with X-E2E: fold, where s is
 //     the latest client-supplied snapshot at or before id (omitted if none).
@@ -65,6 +72,7 @@ package core
 import (
 	"crypto/ecdh"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -87,7 +95,13 @@ func (t *tx) isE2E(n *nsRow) bool { return t.nsLevel(n) == levelE2E }
 func (t *tx) e2eContent(n *nsRow, name string) bool { return name != KeyringName && t.isE2E(n) }
 
 // e2eConfigWritten records the start of an e2e namespace's epoch: its
-// creation (or a branch's), and every write that increments the epoch.
+// creation (or a branch's), a raise to e2e, and every write that
+// increments the epoch. A raise (Addendum E Levels) is recorded too, in
+// e2e_raises, with what was in force before it: from then on, the
+// raising entry's items included, writes go through the E3 gate, since
+// the configuration they are checked under is e2e (§7.5), and what was
+// stored before is served at the level before (P35). The new epoch is
+// the rotation a revocation made due, if any (§E.2.4).
 func (t *tx) e2eConfigWritten(n *nsRow, old, cfg *Config) {
 	if cfg.level != levelE2E {
 		return
@@ -97,32 +111,67 @@ func (t *tx) e2eConfigWritten(n *nsRow, old, cfg *Config) {
 	}
 	_, err := t.Exec(`INSERT INTO e2e_epochs (ns, epoch, created) VALUES (?,?,?) ON CONFLICT DO NOTHING`, n.id, cfg.Epoch, t.now.UnixMilli())
 	t.must(err)
+	if old == nil || old.level == levelE2E {
+		return
+	}
+	epoch, pad := 0, 0
+	if old.level == levelSealed {
+		epoch = old.Epoch
+		if old.Pad {
+			pad = 1
+		}
+	}
+	_, err = t.Exec(`INSERT INTO e2e_raises (ns, config_seq, level, epoch, pad, created) VALUES (?,?,?,?,?,?)`, n.id, n.configSeq, old.level, epoch, pad, t.now.UnixMilli())
+	t.must(err)
+	_, err = t.Exec(`DELETE FROM rotations_due WHERE ns = ?`, n.id)
+	t.must(err)
 }
 
-// e2eEpochOK reports whether epoch e of n may seal what is checked under
-// cfg. A sealed op of a write names the epoch in force (§E.3.1, invariant
-// 6): cfg's, which for a batch's items is the configuration its config
-// change produces (§7.5). Any other (a prune's snapshot, whose kid follows
-// its revision's chain, §8.6) names an epoch that began, at or after n's
-// first, and isn't after cfg's current one.
-func (t *tx) e2eEpochOK(n *nsRow, cfg *Config, e int, inForce bool) bool {
-	if inForce {
-		return e == cfg.Epoch
+// e2eRaise is a namespace's raise to e2e (Addendum E Levels).
+type e2eRaise struct {
+	// configSeq is the configuration that made the namespace e2e; seq
+	// and id are the namespace entry (config or batch) that wrote it,
+	// before which the raise lies in the log.
+	configSeq, seq int64
+	id             ids.ID
+	// level is the level before the raise; from sealed, epoch and pad are
+	// the last epoch and pad setting before it, which content stored
+	// before the raise keeps (§E.2.2).
+	level int
+	epoch int
+	pad   bool
+}
+
+// e2eRaiseOf returns n's raise to e2e, nil for a namespace that was e2e
+// from its creation or isn't e2e. The raising entry is the first of n's
+// log written under the raising configuration or a later one.
+func (t *tx) e2eRaiseOf(n *nsRow) *e2eRaise {
+	r := &e2eRaise{}
+	var pad int
+	err := t.QueryRow(`SELECT config_seq, level, epoch, pad FROM e2e_raises WHERE ns = ?`, n.id).Scan(&r.configSeq, &r.level, &r.epoch, &pad)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
 	}
-	var first sql.NullInt64
-	t.must(t.QueryRow(`SELECT MIN(epoch) FROM e2e_epochs WHERE ns = ?`, n.id).Scan(&first))
-	lo := cfg.Epoch
-	if first.Valid && int(first.Int64) < lo {
-		lo = int(first.Int64)
+	t.must(err)
+	r.pad = pad != 0
+	var id []byte
+	err = t.QueryRow(`SELECT seq, id FROM ns_log WHERE ns = ? AND config_seq >= ? ORDER BY config_seq, seq LIMIT 1`, n.id, r.configSeq).Scan(&r.seq, &id)
+	if errors.Is(err, sql.ErrNoRows) {
+		// The raising entry is being appended in this transaction.
+		return r
 	}
-	return e >= lo && e <= cfg.Epoch
+	t.must(err)
+	r.id = ids.FromBytes(id)
+	return r
 }
 
 // checkSealedHeader checks a JWE's protected header without a key (§E.3.1,
-// step 3): no zip (§E.2.2), kid "{ns}#{e}" for the epoch in force with
-// inForce (a write's sealed op) or else a usable epoch of n
-// (e2eEpochOK), and pl exactly want.
-func (t *tx) checkSealedHeader(n *nsRow, cfg *Config, jwe string, want seal.PL, what string, inForce bool) *Error {
+// step 3): no zip (§E.2.2), kid "{ns}#{epoch}" naming n and the given
+// epoch, and pl exactly want. A write's sealed op names the epoch in force
+// (invariant 6): cfg's, which for a batch's items is the configuration its
+// config change produces (§7.5); a prune's snapshot the one snapshotEpoch
+// gives. why says where the epoch comes from, for the refusal.
+func (t *tx) checkSealedHeader(n *nsRow, jwe string, want seal.PL, what string, epoch int, why string) *Error {
 	h, err := seal.ParseHeader(jwe)
 	if err != nil || strings.Split(jwe, ".")[1] != "" {
 		return invalid(fmt.Sprintf("the %s is not a compact JWE with alg dir and enc A256GCM", what))
@@ -134,16 +183,139 @@ func (t *tx) checkSealedHeader(n *nsRow, cfg *Config, jwe string, want seal.PL, 
 	if err != nil || kns != n.name {
 		return invalid(fmt.Sprintf("the %s's kid must be %q#{epoch}", what, n.name))
 	}
-	if !t.e2eEpochOK(n, cfg, e, inForce) {
-		if inForce {
-			return invalid(fmt.Sprintf("the %s is sealed under epoch %d, not namespace %s's epoch in force, %d (§E.3.1)", what, e, n.name, cfg.Epoch))
-		}
-		return invalid(fmt.Sprintf("the %s is sealed under epoch %d, which namespace %s doesn't have (current: %d)", what, e, n.name, cfg.Epoch))
+	if e != epoch {
+		return invalid(fmt.Sprintf("the %s is sealed under epoch %d, not %d, %s (§E.3.1)", what, e, epoch, why))
 	}
 	if !jsonv.Equal(map[string]any(h.PL), jsonv.FromGo(map[string]any(want))) {
 		return apiErr(422, "invalid", "message", fmt.Sprintf("the %s's pl must bind this write exactly", what), "pl", jsonv.FromGo(map[string]any(want)))
 	}
 	return nil
+}
+
+// snapshotEpoch is the epoch a prune's snapshot of revision h of n must be
+// sealed under (§E.3.1), and why. It is set by the newest revision in h's
+// chain, crossing foreign parents, that isn't a tombstone and whose patch
+// set isn't []:
+//
+//   - a sealed op of n's own (its kid names n): that op's epoch;
+//   - a patch set of n's from before its raise from sealed, in the clear
+//     on the server: the epoch n serves that revision under (Addendum E
+//     Levels, preRaiseEpoch);
+//   - otherwise, a base's op or content from before a raise from none or
+//     at-rest: n's epoch in force, cfg's.
+//
+// A revision below an earlier horizon has no patch set left; the snapshot
+// kept at that horizon stands for it, its epoch counting where its kid
+// names n (F-E2), as clients, which fold from that snapshot, see it too.
+func (t *tx) snapshotEpoch(n *nsRow, cfg *Config, h *revRow) (int, string) {
+	inForce := fmt.Sprintf("namespace %s's epoch in force", n.name)
+	var raise *e2eRaise
+	raised := false
+	for _, seg := range t.ancestry(h) {
+		var found *revRow
+		var snap string
+		// Newest first, a few rows at a time: no query runs while rows
+		// are open (Postgres).
+		for max := seg.max; found == nil; {
+			rows, err := t.Query(`SELECT `+revCols+` FROM revisions WHERE res = ? AND seq <= ? ORDER BY seq DESC LIMIT 16`, seg.res, max)
+			t.must(err)
+			var page []*revRow
+			for rows.Next() {
+				r, err := scanRev(rows)
+				t.must(err)
+				page = append(page, r)
+			}
+			rows.Close()
+			for _, r := range page {
+				if jwe := t.e2eSnapshot(r); jwe != "" {
+					// An earlier horizon, a tombstone one included.
+					found, snap = r, jwe
+					break
+				}
+				if r.kind == kindTombstone {
+					continue
+				}
+				if !r.patches.Valid || string(t.patchesOf(r)) != "[]" {
+					found = r
+					break
+				}
+			}
+			if len(page) < 16 {
+				break
+			}
+			max = page[len(page)-1].seq - 1
+		}
+		if found == nil {
+			continue
+		}
+		at := fmt.Sprintf("set by revision %s of its chain", found.id)
+		if snap != "" {
+			if kns, e, err := seal.ParseKid(kidOf(snap)); err == nil && kns == n.name {
+				return e, fmt.Sprintf("the epoch of the snapshot kept at horizon %s of its chain", found.id)
+			}
+			return cfg.Epoch, inForce
+		}
+		var canon []byte
+		if found.patches.Valid {
+			canon = t.patchesOf(found)
+		}
+		if jwe, _, ok := seal.SealedOp(canon); ok {
+			if kns, e, err := seal.ParseKid(kidOf(jwe)); err == nil && kns == n.name {
+				return e, at
+			}
+			return cfg.Epoch, inForce
+		}
+		// In the clear on the server: content from before a raise, n's own
+		// or a base's read through (whose levels are P36's).
+		if !raised {
+			raise, raised = t.e2eRaiseOf(n), true
+		}
+		if raise != nil && raise.level == levelSealed && t.ownRes(n, found.res) {
+			return t.preRaiseEpoch(n, found, raise), at + ", from before the raise from sealed"
+		}
+		return cfg.Epoch, inForce
+	}
+	return cfg.Epoch, inForce
+}
+
+// kidOf is the kid of a compact JWE's protected header, "" if it has none.
+func kidOf(jwe string) string {
+	h, err := seal.ParseHeader(jwe)
+	if err != nil {
+		return ""
+	}
+	return h.Kid
+}
+
+// ownRes reports whether resource row res belongs to n.
+func (t *tx) ownRes(n *nsRow, res int64) bool {
+	var ns int64
+	t.must(t.QueryRow(`SELECT ns FROM resources WHERE res = ?`, res).Scan(&ns))
+	return ns == n.id
+}
+
+// preRaiseEpoch is the epoch n serves its revision row r from before its
+// raise from sealed under (Addendum E Levels, §E.2.2): the epoch r was
+// written in (rev_epochs), else the one its first stored sealing fixed,
+// else the last epoch before the raise, which stands for the current one
+// for content from before it.
+func (t *tx) preRaiseEpoch(n *nsRow, r *revRow, raise *e2eRaise) int {
+	var e int
+	if err := t.QueryRow(`SELECT epoch FROM rev_epochs WHERE seq = ?`, r.seq).Scan(&e); err == nil {
+		return e
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		t.must(err)
+	}
+	var prefix string
+	err := t.QueryRow(`SELECT substr(jwe, 1, 4096) FROM sealed WHERE ns = ? AND rev_seq = ? AND kind IN ('doc', 'entry') ORDER BY created LIMIT 1`, n.id, r.seq).Scan(&prefix)
+	if err == nil {
+		if e, ok := jweEpoch(prefix); ok {
+			return e
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		t.must(err)
+	}
+	return raise.epoch
 }
 
 // applyStepsE2E is step 3 for a resource of an e2e namespace (§6.2): each
@@ -192,7 +364,7 @@ func (t *tx) applyStepsE2E(n *nsRow, cfg *Config, s *itemState) *Error {
 				if parentID != nil {
 					parent = parentID.String()
 				}
-				if err := t.checkSealedHeader(n, cfg, jwe, seal.PatchSetPL(n.name, s.Resource, parent), "sealed patch set", true); err != nil {
+				if err := t.checkSealedHeader(n, jwe, seal.PatchSetPL(n.name, s.Resource, parent), "sealed patch set", cfg.Epoch, fmt.Sprintf("namespace %s's epoch in force", n.name)); err != nil {
 					return err
 				}
 				var err *Error
@@ -513,7 +685,8 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	if h.id != requested {
 		return nil, apiErr(422, "invalid", "message", "the horizon moves down to a protected revision (§8.6); seal the snapshot for that one", "horizon", h.id.String())
 	}
-	if err := t.checkSealedHeader(n, cfg, snapshot, seal.SnapshotPL(n.name, name, h.id.String()), "snapshot", false); err != nil {
+	epoch, why := t.snapshotEpoch(n, cfg, h)
+	if err := t.checkSealedHeader(n, snapshot, seal.SnapshotPL(n.name, name, h.id.String()), "snapshot", epoch, why); err != nil {
 		return nil, err
 	}
 	// The snapshot needs no list (§8.6, §E.3.1): the server keeps the

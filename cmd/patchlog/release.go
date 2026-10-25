@@ -47,7 +47,7 @@ const releaseUsage = `usage:
   patchlog merge release plan|approve|apply|status -api URL [-bearer T] [-author A] [-state-ns NS]
           [-catalog-service CAT=URL]... [-merge-bearer G] [-split KEY/NODE=narrow.json]... [-accept-placement NS.NAME]...
           [-resolve KEY/NAME=file.json]... [-source-grant G]... [-digest D] [-dry-run] [-json] /r/{ns}/{release}
-  patchlog merge release rebase -api URL -suffix SUFFIX [-at ID] [-bearer T] [-author A] [-json] /r/{ns}/{release}
+  patchlog merge release rebase -api URL -suffix SUFFIX [-at ID] [-identity key.jwk]... [-reader pub.jwk]... [-bearer T] [-author A] [-json] /r/{ns}/{release}
   patchlog merge release abandon -api URL [-bearer T] [-author A] [-state-ns NS] /r/{ns}/{release}`
 
 func releaseCmd(args []string) {
@@ -70,7 +70,9 @@ func releaseCmd(args []string) {
 	at := fs.String("at", "", "rebase: the new release document's combined checkpoint (§B.5), if known")
 	digest := fs.String("digest", "", "approve: the plan digest you reviewed (plan prints it); approval fails unless planning again gives it (§F.9)")
 	mergeBearer := fs.String("merge-bearer", "", "the merge service's own grant for catalogs, sent to catalog services as Authorization (§F.8); its root sub is the via of narrowed admin grants")
-	var catSvcs, splits, accepts, resolves, srcGrants multi
+	var catSvcs, splits, accepts, resolves, srcGrants, identities, readers multi
+	fs.Var(&identities, "identity", "rebase: "+identityHelp)
+	fs.Var(&readers, "reader", "rebase, e2e: file with the X25519 public key (a JWK {kty, crv, x}, or base64url x) of a reader each successor's keyring wraps its key for, besides those of the old branch's readers the identities know (repeatable, §F.8.1)")
 	fs.Var(&catSvcs, "catalog-service", "CAT=URL: the catalog service that signs merge grants for catalog base CAT (§F.8); repeatable")
 	fs.Var(&splits, "split", "KEY/NODE=narrow.json: a catalog node that narrows and widens, merged in two halves; the file is its document after the narrowing step (§F.9); repeatable")
 	fs.Var(&accepts, "accept-placement", "NS.NAME: accept that step 3 publishes an item under this existing placement (§F.9); repeatable")
@@ -93,7 +95,12 @@ func releaseCmd(args []string) {
 			fmt.Fprintln(os.Stderr, "merge release rebase: -suffix is required")
 			os.Exit(2)
 		}
-		res, err := merge.RebaseRelease(ctx, c, merge.RebaseReleaseOptions{Release: link, Suffix: *suffix, At: *at, Plan: merge.Options{Signer: tf.signer()}})
+		succReaders, err := readPublicKeys(readers)
+		if err != nil {
+			toolFatal(err)
+		}
+		res, err := merge.RebaseRelease(ctx, c, merge.RebaseReleaseOptions{Release: link, Suffix: *suffix, At: *at, SuccessorReaders: succReaders,
+			Plan: merge.Options{E2E: e2eView(c, identities), Signer: tf.signer()}})
 		if *tf.asJSON {
 			out := map[string]any{"result": res}
 			if err != nil {
@@ -120,6 +127,10 @@ func releaseCmd(args []string) {
 			if res.Revision != "" {
 				fmt.Printf("release document %s is at %s, listing the successors\n", link, res.Revision)
 			}
+		}
+		if errors.Is(err, merge.ErrReadersDropped) {
+			fmt.Fprintf(os.Stderr, "error: %v\nname their public keys with -reader and run rebase again\n", err)
+			os.Exit(1)
 		}
 		if errors.Is(err, merge.ErrConflicts) {
 			fmt.Fprintln(os.Stderr, "stopped on conflicts: resolve them with `patchlog merge apply -base SUCCESSOR -branch OLD -resolve …`, then run rebase again")
