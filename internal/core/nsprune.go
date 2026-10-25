@@ -40,9 +40,10 @@ type PruneResult struct {
 // pruned range first when an archive destination is configured. In a
 // branch it moves nothing (pruneInBranch).
 //
-// The prune verb suffices when the archive exists and the horizon doesn't go
-// below what the resource's retention rule keeps, which is everything where
-// no rule matches it; otherwise the grant must be chained to a * key.
+// The prune verb suffices when the archive exists and neither the horizon
+// nor a change to the keep set goes below what the resource's retention
+// rule keeps, which is everything where no rule matches it; otherwise the
+// grant must be chained to a * key.
 //
 // The checks follow §6.2: the verb and the rate limits (step 1); a purged
 // namespace or resource (2.1); a precondition sent, which a prune doesn't
@@ -182,6 +183,19 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 			// below it (§8.6).
 			if moves && (rule == nil || eff.seq > t.retentionBoundary(rule, v.own)) {
 				return forbidden("going below what retention keeps, everything where no retention rule matches the resource, needs a grant chained to a * key (§8.6)")
+			}
+			// A prune that changes only the keep set drops the documents
+			// below the horizon that it no longer keeps (pruneTo), such as
+			// those an earlier * prune kept; dropping one that retention
+			// keeps goes below it as much as moving the horizon would. A
+			// prune that moves the horizon within what retention keeps
+			// drops only documents below it, and an E3 prune that moves
+			// nothing writes nothing (pruneToE2E).
+			if !e2e && !moves && pr.KeepSent && keepChanged(v.own, keepStrs) {
+				keepSeqs, preserve := t.keptBelow(n, name, v.own, eff, keep)
+				if drop := t.droppedBelow(v.own.id, eff.seq, keepSeqs, preserve); len(drop) > 0 && (rule == nil || drop[len(drop)-1] >= t.retentionBoundary(rule, v.own)) {
+					return forbidden("dropping a kept document that retention keeps, everything where no retention rule matches the resource, needs a grant chained to a * key (§8.6)")
+				}
 			}
 		}
 		if err := t.checkRules(cfg, a, env, false); err != nil {
@@ -330,6 +344,58 @@ func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 	return h
 }
 
+// keptBelow is what keeps its document below h, the effective horizon of a
+// prune of own keeping keep (§8.6): keepSeqs holds h (for a tombstone the
+// last live revision), keep, and the referenced schema revisions that still
+// have their patch sets (nil rows); preserve holds the referenced schema
+// revisions already below an earlier horizon, which keep the snapshot they
+// have.
+func (t *tx) keptBelow(n *nsRow, name string, own *resRow, h *revRow, keep []*revRow) (keepSeqs map[int64]*revRow, preserve map[int64]bool) {
+	refs := t.referencedPaths()
+	keepSeqs = map[int64]*revRow{}
+	keepSeqs[t.lastLive(h).seq] = t.lastLive(h)
+	for _, k := range keep {
+		keepSeqs[k.seq] = k
+	}
+	preserve = map[int64]bool{}
+	rows, err := t.Query(`SELECT seq, id, patches IS NOT NULL FROM revisions WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
+	t.must(err)
+	for rows.Next() {
+		var seq int64
+		var id []byte
+		var hasPatches bool
+		t.must(rows.Scan(&seq, &id, &hasPatches))
+		if refs["/r/"+n.name+"/"+name+"/rev/"+ids.FromBytes(id).String()] {
+			if hasPatches {
+				keepSeqs[seq] = nil
+			} else {
+				preserve[seq] = true
+			}
+		}
+	}
+	rows.Close()
+	return keepSeqs, preserve
+}
+
+// droppedBelow lists the stored documents of res below the horizon hseq
+// that a prune keeping keepSeqs and preserve (keptBelow) drops, in seq
+// order: intermediate snapshots (D.4) and the documents an earlier keep set
+// kept but this one doesn't, or pruned revisions would still be served.
+func (t *tx) droppedBelow(res, hseq int64, keepSeqs map[int64]*revRow, preserve map[int64]bool) []int64 {
+	rows, err := t.Query(`SELECT seq FROM snapshots WHERE res = ? AND seq < ? ORDER BY seq`, res, hseq)
+	t.must(err)
+	var drop []int64
+	for rows.Next() {
+		var seq int64
+		t.must(rows.Scan(&seq))
+		if _, kept := keepSeqs[seq]; !kept && !preserve[seq] {
+			drop = append(drop, seq)
+		}
+	}
+	rows.Close()
+	return drop
+}
+
 // pruneTo prunes own below h, which protect has already moved down, and
 // with keepSent replaces its keep set with keep (keepStrs as sent);
 // otherwise keep is the stored set, which stays. With archive set, the
@@ -345,33 +411,7 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 	if !moves && !changed {
 		return res, nil
 	}
-	// Documents that stay available: the horizon (and for a tombstone the
-	// last live document), kept revisions and referenced schemas.
-	refs := t.referencedPaths()
-	keepSeqs := map[int64]*revRow{}
-	keepSeqs[t.lastLive(h).seq] = t.lastLive(h)
-	for _, k := range keep {
-		keepSeqs[k.seq] = k
-	}
-	// Referenced schema revisions keep their documents; one already below
-	// an earlier horizon keeps the snapshot it has.
-	preserve := map[int64]bool{}
-	rrows, qerr := t.Query(`SELECT seq, id, patches IS NOT NULL FROM revisions WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
-	t.must(qerr)
-	for rrows.Next() {
-		var seq int64
-		var id []byte
-		var hasPatches bool
-		t.must(rrows.Scan(&seq, &id, &hasPatches))
-		if refs["/r/"+n.name+"/"+name+"/rev/"+ids.FromBytes(id).String()] {
-			if hasPatches {
-				keepSeqs[seq] = nil
-			} else {
-				preserve[seq] = true
-			}
-		}
-	}
-	rrows.Close()
+	keepSeqs, preserve := t.keptBelow(n, name, own, h, keep)
 	// A prune that changes only the keep set moves nothing: the documents
 	// it keeps below the horizon are those still served there, which have
 	// their snapshots, and those above it are served anyway.
@@ -424,22 +464,8 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 	// earlier ns_id lists a pruned head as it did.
 	_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
 	t.must(err)
-	// Below the horizon only the documents kept above survive:
-	// intermediate snapshots (D.4) and the documents an earlier keep set
-	// kept but this one doesn't go, or pruned revisions would still be
-	// served.
-	srows, qerr := t.Query(`SELECT seq FROM snapshots WHERE res = ? AND seq < ?`, own.id, h.seq)
-	t.must(qerr)
-	var drop []int64
-	for srows.Next() {
-		var seq int64
-		t.must(srows.Scan(&seq))
-		if _, kept := keepSeqs[seq]; !kept && !preserve[seq] {
-			drop = append(drop, seq)
-		}
-	}
-	srows.Close()
-	for _, seq := range drop {
+	// Below the horizon only the documents kept above survive.
+	for _, seq := range t.droppedBelow(own.id, h.seq, keepSeqs, preserve) {
 		_, err = t.Exec(`DELETE FROM snapshots WHERE seq = ?`, seq)
 		t.must(err)
 	}

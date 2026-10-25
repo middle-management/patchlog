@@ -381,7 +381,8 @@ func TestV073P26BranchPruneE3(t *testing.T) {
 // v0.73 §8.6 Request (BBD-52): where no retention rule matches the
 // resource, retention keeps everything, so a prune that moves its horizon
 // needs a grant chained to a * key, archive or not. A prune that moves
-// nothing needs none, and within a matching rule prune suffices.
+// nothing and drops no kept document needs none (TestV073P26KeepDropNeedsStar),
+// and within a matching rule prune suffices.
 func TestV073P26NoRuleNeedsStar(t *testing.T) {
 	t.Parallel()
 	e := newAuthEnv(t, withArchive(t, t.TempDir()), withoutRetentionLoop)
@@ -417,6 +418,89 @@ func TestV073P26NoRuleNeedsStar(t *testing.T) {
 	b := e.chain("nr", "b", 3, pg)
 	e.clock.Advance(10 * time.Minute)
 	expectCode(t, e.prune("nr", "b", map[string]any{"horizon": b[2]}, pg), 403, "forbidden")
+}
+
+// v0.73 §8.6 Request (BBD-46, BBD-52; review of P26): a prune that changes
+// only the keep set drops the documents below the horizon it no longer
+// keeps. Dropping one that retention keeps, everything where no rule
+// matches the resource, goes below what retention keeps, so it needs a
+// grant chained to a * key even though the horizon doesn't move: 403, and
+// the document stays. Dropping only documents below what a rule keeps,
+// adding to the set, or a no-change keep needs only prune.
+func TestV073P26KeepDropNeedsStar(t *testing.T) {
+	t.Parallel()
+	t.Run("rule without archive", func(t *testing.T) {
+		t.Parallel()
+		e := newAuthEnv(t, withoutRetentionLoop)
+		sk, pk := newKey("sk"), newKey("pk")
+		can := []string{"read", "create", "append", "prune"}
+		e.mkNS("kd", map[string]any{"read": "public", "keys": []any{sk.entry("*"), pk.entry(can...)}})
+		sg := e.grant(sk, "user:admin", []string{"kd"}, allVerbs)
+		pg := e.grant(pk, "user:p", []string{"kd"}, can)
+		// Retention keeps the last 5 revisions, without an archive, which
+		// prune alone may apply within what it keeps.
+		expect(t, e.patchNS("kd", ops(op("add", "/retention", []any{map[string]any{"keep": map[string]any{"revisions": 5.0}, "archive": false}})), sg), 201)
+		a := e.chain("kd", "a", 8, pg)
+		e.clock.Advance(10 * time.Minute)
+		served := func(i int) { t.Helper(); expect(t, e.get("/r/kd/a/rev/"+a[i]), 200) }
+		pruned := func(i int) { t.Helper(); expectCode(t, e.get("/r/kd/a/rev/"+a[i]), 410, "pruned") }
+		// Retention keeps a[3..7]. The * key goes past that, keeping a[1],
+		// below what retention keeps, and a[4], within it.
+		pruneEntry(t, e, e.prune("kd", "a", map[string]any{"horizon": a[6], "keep": []any{a[1], a[4]}}, sg), "kd", "a", a[6])
+		served(1)
+		served(4)
+		expectCode(t, e.prune("kd", "a", map[string]any{"horizon": a[7]}, pg), 403, "forbidden")
+		// Dropping a[4], which retention keeps, is 403 and writes nothing;
+		// with archive: false nothing would hold it afterwards.
+		head := e.nsHead("kd")
+		for _, keep := range [][]any{{}, {a[1]}, {a[1], a[7]}} {
+			r := e.prune("kd", "a", map[string]any{"horizon": a[6], "keep": keep}, pg)
+			expectCode(t, r, 403, "forbidden")
+			noEntry(t, e, r, "kd", head)
+			served(1)
+			served(4)
+		}
+		// Sending the set unchanged, or no keep, changes nothing.
+		for _, body := range []map[string]any{{"horizon": a[6], "keep": []any{a[4], a[1]}}, {"horizon": a[6]}} {
+			r := e.prune("kd", "a", body, pg)
+			expect(t, r, 200)
+			noEntry(t, e, r, "kd", head)
+		}
+		// Dropping a[1], below what retention keeps, and adding a[7] needs
+		// only prune.
+		pruneEntry(t, e, e.prune("kd", "a", map[string]any{"horizon": a[6], "keep": []any{a[4], a[7]}}, pg), "kd", "a", a[6])
+		pruned(1)
+		served(4)
+		// The * key may drop a[4].
+		pruneEntry(t, e, e.prune("kd", "a", map[string]any{"horizon": a[6], "keep": []any{}}, sg), "kd", "a", a[6])
+		pruned(4)
+	})
+	t.Run("no rule", func(t *testing.T) {
+		t.Parallel()
+		e := newAuthEnv(t, withArchive(t, t.TempDir()), withoutRetentionLoop)
+		sk, pk := newKey("sk"), newKey("pk")
+		can := []string{"read", "create", "append", "prune"}
+		e.mkNS("kn", map[string]any{"read": "public", "keys": []any{sk.entry("*"), pk.entry(can...)}})
+		sg := e.grant(sk, "user:admin", []string{"kn"}, allVerbs)
+		pg := e.grant(pk, "user:p", []string{"kn"}, can)
+		a := e.chain("kn", "a", 5, pg)
+		e.clock.Advance(10 * time.Minute)
+		pruneEntry(t, e, e.prune("kn", "a", map[string]any{"horizon": a[3], "keep": []any{a[1]}}, sg), "kn", "a", a[3])
+		expect(t, e.get("/r/kn/a/rev/"+a[1]), 200)
+		// Retention keeps everything here, a[1] included: dropping it is
+		// 403, the archive notwithstanding.
+		head := e.nsHead("kn")
+		r := e.prune("kn", "a", map[string]any{"horizon": a[3], "keep": []any{}}, pg)
+		expectCode(t, r, 403, "forbidden")
+		noEntry(t, e, r, "kn", head)
+		expect(t, e.get("/r/kn/a/rev/"+a[1]), 200)
+		// Adding to the set drops nothing.
+		pruneEntry(t, e, e.prune("kn", "a", map[string]any{"horizon": a[3], "keep": []any{a[1], a[4]}}, pg), "kn", "a", a[3])
+		expect(t, e.get("/r/kn/a/rev/"+a[1]), 200)
+		// The * key may drop it.
+		pruneEntry(t, e, e.prune("kn", "a", map[string]any{"horizon": a[3], "keep": []any{a[4]}}, sg), "kn", "a", a[3])
+		expectCode(t, e.get("/r/kn/a/rev/"+a[1]), 410, "pruned")
+	})
 }
 
 // v0.73 §6.6 Cost (GB-41, BBD-55): a prune isn't exempt; it costs a token
