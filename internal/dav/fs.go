@@ -69,6 +69,10 @@ type target struct {
 	// otherCase: a kFolder or kPlacement named by another case of its
 	// name, which compares equal (nameKey) but isn't it
 	otherCase bool
+	// hiddenTop: a name at the top level of a tree whose files.root is
+	// hidden from the reader, that top level its roots (§B.11.5, §H.3;
+	// topWrite)
+	hiddenTop bool
 }
 
 func (t target) isDir() bool {
@@ -598,8 +602,13 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 				byRes[e.node.ItemNS+"/"+e.node.ItemName] = e.name
 			}
 		}
-		// fetchHeads leaves out what it can't read, so names pair up by
-		// resource (an item is placed once per catalog, §B.2).
+		// With tree-derived access, read under grants the catalog issues
+		// (§B.11.5 /read-grants). fetchHeads leaves out what it can't
+		// read, so names pair up by resource (an item is placed once per
+		// catalog, §B.2).
+		if err := st.readGrants(ctx, t.ns, files); err != nil {
+			return nil, err
+		}
 		docs, err := st.s.fetchHeads(ctx, st.tk, files, nil, false)
 		if err != nil {
 			return nil, err
@@ -654,6 +663,11 @@ func (st *reqState) docAt(ctx context.Context, t target) (headDoc, bool, error) 
 		if hd, ok := l.docs[t.shownAs()]; !ok || !hd.listed || st.method == "PROPFIND" {
 			return hd, ok, nil
 		}
+	}
+	// With tree-derived access, under a grant the catalog issues for the
+	// item (§H.2 "Access"), to edit where the request writes it.
+	if err := st.itemAccess(ctx, t, st.writes() && (t.path == st.path || t.path == st.dst)); err != nil {
+		return headDoc{}, false, err
 	}
 	if t.kind == kPlacement && st.s.nsInfo(ctx, st.tk, t.docNS).sealed {
 		return headDoc{}, false, nil
@@ -1565,6 +1579,11 @@ func (st *reqState) fileBytes(ctx context.Context, hd *headDoc) ([]byte, error) 
 // before the content), it is held as an empty placeholder (holdEmpty).
 func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (string, bool, error) {
 	defer st.changed()
+	// With tree-derived access, a file's item is edited under a grant the
+	// catalog issues for it (§H.2 "Access").
+	if err := st.itemAccess(ctx, t, true); err != nil {
+		return "", false, err
+	}
 	if len(body) == 0 {
 		hold, err := st.holdEmpty(ctx, t)
 		if err != nil {

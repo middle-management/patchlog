@@ -50,7 +50,7 @@ func davCmd(args []string) {
 	bearerFile := fs.String("bearer-file", "", "local mode: file holding -bearer")
 	author := fs.String("author", "", "X-Author for a -dev server (local mode)")
 	passwordFile := fs.String("password-file", "", "local mode: file holding the Basic password WebDAV clients log in with (any user name); default a random one, logged at start")
-	gateway := fs.Bool("gateway", false, "gateway mode: each request's Basic password is the grant sent upstream; the user name is ignored")
+	gateway := fs.Bool("gateway", false, "gateway mode: each request's Basic password is the grant sent upstream, the user name ignored; over a core with authentication disabled, the Basic user name is the X-Author, and the user (§H.7)")
 	insecure := fs.Bool("insecure", false, "gateway mode: allow plain HTTP on an address other than loopback, so grants cross the network in the clear")
 	tlsCert := fs.String("tls-cert", "", "serve HTTPS with this certificate (PEM), with -tls-key")
 	tlsKey := fs.String("tls-key", "", "the private key of -tls-cert (PEM)")

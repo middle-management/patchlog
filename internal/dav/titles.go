@@ -10,6 +10,8 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/text/unicode/norm"
+
+	"github.com/middle-management/patchlog/internal/files"
 )
 
 // Names in a file tree (§H.2): a file's or folder's name is its node's
@@ -130,27 +132,9 @@ func pct(s string) string {
 
 // nameKey is what sibling names are compared by (§H.2 "Siblings"): NFC,
 // then, unless names are case-sensitive here, Unicode simple case
-// folding, a character for a character, as case-insensitive file systems
-// compare names (NTFS by its upcase table): full folding would make
-// "Maße" and "Masse", or "ﬁle" and "file", one name, which those file
-// systems keep apart.
-func (s *Server) nameKey(name string) string {
-	n := norm.NFC.String(name)
-	if s.opt.CaseSensitive {
-		return n
-	}
-	return norm.NFC.String(strings.Map(foldRune, n))
-}
-
-// foldRune is r's simple case folding, as a key: the least character of
-// its orbit (unicode.SimpleFold), so k, K and the Kelvin sign are one.
-func foldRune(r rune) rune {
-	least := r
-	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
-		least = min(least, f)
-	}
-	return least
-}
+// folding, as the tree service's lookup compares titles (§B.5): one
+// folding, files.TitleKey, for both.
+func (s *Server) nameKey(name string) string { return files.TitleKey(name, s.opt.CaseSensitive) }
 
 // newName is an opaque resource name for a new item or folder node
 // (§H.2): 13 random base32 characters, lowercase, without a dot.
