@@ -442,3 +442,47 @@ func TestV073RemoteConfigJudgedBySource(t *testing.T) {
 		t.Fatal("applied")
 	}
 }
+
+// ENC-47 (§G.5.2 "refused as creation is where it can't be", §G.3): where
+// the base's current namespace document can't be read because the base is
+// purged, as a sealed namespace's documents answer 410 once it is (§8.5),
+// the config write is refused as creation over that base is: 410 purged,
+// with origin, ns and head naming the purged namespace and its purge-ns
+// entry, not the 422 of a base B can't read. Nothing is applied, and a
+// write the base doesn't judge still needs no read of it.
+func TestV073RemoteConfigPurgedBase(t *testing.T) {
+	t.Parallel()
+	a, b, _ := pair(t, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning}, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning})
+	a.mkNS("m", map[string]any{"read": "grant"})
+	a.create("m", "x", map[string]any{"v": 1.0})
+	expect(t, a.patchNS("m", ops(op("add", "/encryption", map[string]any{"level": "sealed"})), ""), 201)
+	at := a.nsHead("m")
+	genesis := func() []any {
+		return remoteGenesis("m", at, map[string]any{"read": "grant", "nonce": "required", "encryption": map[string]any{"level": "sealed"}})
+	}
+	expect(t, b.mkRemote("r", genesis()), 201)
+	expect(t, a.patchNS("m", ops(op("add", "/frozen", true)), ""), 201)
+	expect(t, a.do(req{method: "POST", path: "/ns/m/purge", ifMatch: a.nsHead("m"), author: "admin"}), 204)
+	purge := a.nsHead("m")
+	// What creation answers for this base now.
+	created := b.mkRemote("r2", genesis())
+	expectCode(t, created, 410, "purged")
+
+	cfg := b.configID("r")
+	r := b.patchNS("r", ops(op("remove", "/nonce")), "")
+	expectCode(t, r, 410, "purged")
+	if r.Str("origin") != originA || r.Str("ns") != "m" || r.Str("head") != purge || r.Str("head") != created.Str("head") {
+		t.Fatalf("config write: %s; creation: %s; purge-ns %s", r.Body, created.Body, purge)
+	}
+	if b.configID("r") != cfg {
+		t.Fatal("applied")
+	}
+	// A batch's config change takes the same path.
+	r = b.do(req{method: "POST", path: "/ns/r/batch", author: "admin", body: map[string]any{"items": []any{},
+		"config": map[string]any{"ifMatch": cfg, "patches": ops(op("remove", "/nonce"))}}})
+	expectCode(t, r, 410, "purged")
+	if b.configID("r") != cfg {
+		t.Fatal("applied by the batch")
+	}
+	expect(t, b.patchNS("r", ops(op("add", "/x-note", "n")), ""), 201)
+}

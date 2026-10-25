@@ -1662,10 +1662,12 @@ type remoteSources struct {
 
 // remoteSourceDoc is a remote branch's base's current namespace document,
 // read for a write: doc, or err with down set where the base didn't
-// answer, or answered 5xx. withAt marks a read for a raise to e2e, which
-// also reads the base's document as of at: atE2E reports it e2e.
+// answer, or answered 5xx. origin and ns name the base. withAt marks a
+// read for a raise to e2e, which also reads the base's document as of at:
+// atE2E reports it e2e.
 type remoteSourceDoc struct {
 	origin string
+	ns     string
 	doc    map[string]any
 	withAt bool
 	atE2E  bool
@@ -1711,7 +1713,7 @@ func (e *Engine) withRemoteSource(ctx context.Context, f func(context.Context) e
 // readRemoteSource reads the base's current namespace document, and for a
 // raise to e2e the one as of at, as creation does (fetchRemote).
 func (e *Engine) readRemoteSource(ctx context.Context, need *errNeedSource) *remoteSourceDoc {
-	out := &remoteSourceDoc{origin: need.origin, withAt: need.withAt}
+	out := &remoteSourceDoc{origin: need.origin, ns: need.ns, withAt: need.withAt}
 	c, _, err := e.remoteClient(need.origin)
 	if err != nil {
 		out.err, out.down = err, true
@@ -1744,7 +1746,7 @@ func (t *tx) remoteSourceFor(n *nsRow, withAt bool) *remoteSourceDoc {
 	t.must(t.QueryRow(`SELECT origin, ns, at FROM remote_bases WHERE branch = ?`, n.id).Scan(&origin, &ns, &at))
 	h, _ := t.ctx.Value(remoteSourcesKey{}).(*remoteSources)
 	if h == nil {
-		return &remoteSourceDoc{origin: origin, err: errors.New("not read for this write"), down: true}
+		return &remoteSourceDoc{origin: origin, ns: ns, err: errors.New("not read for this write"), down: true}
 	}
 	if d := h.docs[n.id]; d != nil && (d.withAt || !withAt) {
 		return d
@@ -1757,8 +1759,10 @@ func (t *tx) remoteSourceFor(n *nsRow, withAt bool) *remoteSourceDoc {
 // public, raises it to e2e or turns off a nonce requirement is judged by
 // the base's current namespace document as a local branch's is by its
 // base's. One this deployment can't read refuses the write as it refuses
-// creation (unknownLevel): 502 upstream, naming the base's deployment,
-// where the base didn't answer or answered 5xx, and 422 otherwise.
+// creation (§G.3): 410 purged, naming the base, where the base answers
+// that its namespace is purged, as a sealed one's documents are once it is
+// (§8.5, purgedBase); 502 upstream, naming the base's deployment, where
+// the base didn't answer or answered 5xx; and 422 otherwise (unknownLevel).
 // Refusals are 422 invalid with errors pointing at the member, as for the
 // other branch fields; nothing is applied.
 func (t *tx) checkRemoteSource(n *nsRow, cur, cfg *Config) *Error {
@@ -1778,6 +1782,9 @@ func (t *tx) checkRemoteSource(n *nsRow, cur, cfg *Config) *Error {
 	}
 	src := t.remoteSourceFor(n, toE2E)
 	if src.err != nil {
+		if head, ok := purgedAt(src.err); ok {
+			return purgedBase(src.origin, src.ns, head)
+		}
 		msg := fmt.Sprintf("this deployment can't read its base's current namespace document (%v), by which a config write that makes a remote branch public, "+
 			"raises it to e2e or turns off a nonce requirement is judged (§G.5.2); nothing was applied", src.err)
 		if src.down {
