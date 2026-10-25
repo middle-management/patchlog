@@ -20,10 +20,11 @@ import (
 //
 // A schema document's marker selects how it is checked when written (V073:
 // write mode; Legacy: the stored mode, as v0.55 checked it) and how it
-// compiles; a document typed by $schema is validated under the marker of
-// the schema revision it names, which governs that revision's whole $ref
-// closure (schema.Validator.ValidateRules), and compiled validators are
-// cached by path and marker.
+// compiles; a document typed by $schema is validated against the revision
+// it names, each revision of whose $ref closure compiles under its own
+// marker, however it is reached (schema.Validator.ValidateMarked), and
+// compiled validators are cached by path with the markers their closure
+// compiled under.
 //
 // A revision whose document is a schema document and whose id other rows
 // already have is a content-addressed copy of them (§3.3): a fast-forward
@@ -39,7 +40,8 @@ import (
 // validateStep is step 5 for one step (§6.1, §6.2): it fixes the rules
 // marker of the revision the step writes (docRules), which step 7 stores,
 // and validates the resulting document: a schema document under that
-// marker, any other under the marker of the schema revision it names.
+// marker, any other against the schema revision it names, each revision
+// of its closure under its own marker.
 func (t *tx) validateStep(step *stepState, sc *schemaCtx, pending map[string]any) (string, *Error) {
 	rules := t.docRules(step.id, step.doc, sc)
 	step.legacy = rules == schema.Legacy
@@ -194,11 +196,16 @@ func (t *tx) validateDoc(doc any, rules schema.Rules, sc *schemaCtx, pending map
 			queue = append(queue, t.schemaRefs(r, d, sc, pending)...)
 		}
 	}
-	if typed {
-		// The schema revision's own marker governs its closure.
-		rules = t.schemaRules(typedBy, sc, pending)
+	// Each revision of the closure compiles under its own marker, wherever
+	// it is reached from: named by $schema, or through the $ref of a
+	// schema written under other rules (§6.1). Every revision was resolved
+	// above, so its marker is known (t.schemas); loading again only finds
+	// it there.
+	rulesOf := func(r schema.Ref) schema.Rules {
+		_, _ = load(r)
+		return t.schemaRules(r, sc, pending)
 	}
-	if err := t.e.validator.ValidateRules(doc, load, rules); err != nil {
+	if err := t.e.validator.ValidateMarked(doc, load, rules, rulesOf); err != nil {
 		return "", schemaErr(err, s)
 	}
 	return s, nil
@@ -320,8 +327,8 @@ type schemaKey struct {
 type schemaLoaded struct {
 	doc any
 	err error
-	// seq is the row doc was read from, whose rules marker its compile
-	// follows (schemaRules); 0 if none. rules is a row's marker, in an
+	// seq is the row doc was read from, whose rules marker doc compiles
+	// under (schemaRules); 0 if none. rules is a row's marker, in an
 	// entry by seq.
 	seq   int64
 	rules schema.Rules
@@ -535,8 +542,8 @@ func (t *tx) prefetchSchemas(refs []schema.Ref) {
 			}
 		}
 	}
-	// The heads' rules markers, which a document typed by one compiles
-	// under (schemaRules).
+	// The heads' rules markers, which each compiles under wherever it is
+	// reached from (schemaRules).
 	t.prefetchRules(heads)
 }
 

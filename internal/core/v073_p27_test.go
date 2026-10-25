@@ -259,3 +259,63 @@ func TestV073RulesMarkerMigration(t *testing.T) {
 	_, err := e.WriteResource(context.Background(), s.req("n"), createItem("d2", map[string]any{"$schema": "/r/n/s2/rev/" + s2, "e": "not an email"}))
 	expectAPI(t, err, 422, "invalid")
 }
+
+// CIS-17 (P27 review), §6.1 "A schema stored under an earlier version is
+// compiled as that version did", wherever it is reached from: a revision
+// stored before the upgrade (Legacy), reached through the $ref of a schema
+// written now (V073), compiles as it does when a document names it, not
+// under the V073 marker of the root: semver asserted (v0.55 asserted it),
+// idn-email not (v0.55 ignored it). The V073 schema's own idn-email is
+// asserted.
+func TestV073LegacyRevisionInV073Closure(t *testing.T) {
+	t.Parallel()
+	s := newSchemaEnv(t)
+	s.mkNS("n")
+	ctx := context.Background()
+	l := s.legacyRow("n", "l", map[string]any{"$schema": schema.Dialect2020, "type": "object",
+		"properties": map[string]any{"v": map[string]any{"type": "string", "format": "semver"}, "e": map[string]any{"type": "string", "format": "idn-email"}}})
+	lpath := "/r/n/l/rev/" + l
+	// Named directly: as v0.55 compiled it.
+	_, err := s.e.WriteResource(ctx, s.req("n"), createItem("d1", map[string]any{"$schema": lpath, "v": "not a version"}))
+	expectAPI(t, err, 422, "invalid")
+	s.put("n", "d2", "", map[string]any{"$schema": lpath, "e": "not an email"})
+
+	// Through the $ref of a schema written now: the same.
+	sid := s.put("n", "s", "", map[string]any{"$schema": schema.Dialect2020, "type": "object",
+		"properties": map[string]any{"old": map[string]any{"$ref": lpath}, "e": map[string]any{"type": "string", "format": "idn-email"}}})
+	spath := "/r/n/s/rev/" + sid
+	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("d3", map[string]any{"$schema": spath, "old": map[string]any{"v": "not a version"}}))
+	expectAPI(t, err, 422, "invalid")
+	s.put("n", "d4", "", map[string]any{"$schema": spath, "old": map[string]any{"e": "not an email"}})
+	// The V073 schema's own formats are V073's.
+	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("d5", map[string]any{"$schema": spath, "e": "not an email"}))
+	expectAPI(t, err, 422, "invalid")
+	// And so for a schema whose root is only a $ref, in one batch with
+	// documents typed by both (one transaction, both markers).
+	rid := s.put("n", "r", "", map[string]any{"$schema": schema.Dialect2020, "$ref": lpath})
+	s.put("n", "d6", "", map[string]any{"$schema": "/r/n/r/rev/" + rid, "e": "not an email"})
+	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("d7", map[string]any{"$schema": "/r/n/r/rev/" + rid, "v": "not a version"}))
+	expectAPI(t, err, 422, "invalid")
+}
+
+// CIS-17 regression (P27 review): a schema written now may $ref a revision
+// stored before the upgrade whose pattern RE2 took as written though
+// §6.6's translation refuses it (P03, TestV073WriteRefsStoredPattern).
+// The write of that schema is accepted, and so are the documents typed by
+// it: the stored revision's pattern compiles as it did. Compiled under the
+// root's V073 marker, every one was refused ("lone surrogate").
+func TestV073StoredPatternInV073Closure(t *testing.T) {
+	t.Parallel()
+	s := newSchemaEnv(t)
+	s.mkNS("n")
+	ctx := context.Background()
+	l := s.legacyRow("n", "oldpat", map[string]any{"$schema": schema.Dialect2020, "type": "object",
+		"properties": map[string]any{"a": map[string]any{"type": "string", "pattern": "^a\\x{D800}?$"}}})
+	lpath := "/r/n/oldpat/rev/" + l
+	s.put("n", "d1", "", map[string]any{"$schema": lpath, "a": "a"})
+	sid := s.put("n", "s", "", map[string]any{"$schema": schema.Dialect2020, "$ref": lpath})
+	spath := "/r/n/s/rev/" + sid
+	s.put("n", "d2", "", map[string]any{"$schema": spath, "a": "a"})
+	_, err := s.e.WriteResource(ctx, s.req("n"), createItem("d3", map[string]any{"$schema": spath, "a": "b"}))
+	expectAPI(t, err, 422, "invalid")
+}
