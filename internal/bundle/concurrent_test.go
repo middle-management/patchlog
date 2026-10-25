@@ -358,6 +358,23 @@ func newFastClock() *fastClock {
 	return &fastClock{t0: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC), start: time.Now()}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// runOnBatch starts clk with the first batch request through rt that
+// isn't a dry run: the importer has then judged the first batch by the
+// clock's t0.
+func runOnBatch(clk *fastClock, rt http.RoundTripper) http.RoundTripper {
+	var once sync.Once
+	return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if strings.HasPrefix(r.URL.Path, "/ns/") && strings.HasSuffix(r.URL.Path, "/batch") && r.URL.Query().Get("dry-run") != "1" {
+			once.Do(clk.run)
+		}
+		return rt.RoundTrip(r)
+	})
+}
+
 // newPausedClock is a fastClock that stays at t0 until run: setting a
 // deployment up takes real time on a loaded machine, which a running
 // clock would multiply a hundredfold into a window the test depends on.
@@ -470,16 +487,18 @@ func TestImportConcurrentAllowanceEnds(t *testing.T) {
 	}{{0.5, 100 * time.Second}, {2, 90 * time.Second}} {
 		t.Run(fmt.Sprint("rate", tc.rate), func(t *testing.T) {
 			t.Parallel()
-			// The allowance's window is a second of real time: the clock
-			// starts only once the deployment is set up.
+			// The allowance's window is a second of real time, and the
+			// importer goes by it until a minute before its until, a few
+			// tenths of a second: the clock starts only with the first
+			// batch, once the deployment is set up and the import planned
+			// and dry-run, which take real time on a loaded machine.
 			clk := newPausedClock()
 			dst := newDeployment(t, cmsOrigin, func(o *core.Options) { o.Now = clk.Now })
 			dst.ns("data", map[string]any{"read": "public", "limits": map[string]any{"itemsPerBatch": 3},
 				"allowances": []any{map[string]any{"sub": "alice", "kid": "any", "until": clk.Now().Add(tc.ends).Format(time.RFC3339),
 					"bucket": map[string]any{"rate": tc.rate, "burst": 1000}, "itemsPerBatch": 10}}})
 			log := &batchLog{rt: transport}
-			c := must(client.New(dst.url, client.WithAuthor("alice"), client.WithHTTPClient(&http.Client{Transport: log})))
-			clk.run()
+			c := must(client.New(dst.url, client.WithAuthor("alice"), client.WithHTTPClient(&http.Client{Transport: runOnBatch(clk, log)})))
 			rep, err := bundle.Import(ctx, c, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Backfill, Pace: 1, Concurrency: 8,
 				Now: clk.Now, Sleep: clk.Sleep})
 			if err != nil {

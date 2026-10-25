@@ -23,12 +23,15 @@
 //
 // # Encrypted namespaces
 //
-// In a namespace encrypted at rest (Addendum E.1) the bundle is written
-// through core.ArchiveBundle.Seal: the file is the standard bundle,
-// encrypted as a chunked AES-256-GCM stream under a key derived from the
-// resource's data key (format in internal/core/crypt.go). Restore decrypts
-// it with core.Engine.OpenArchive. Purging the resource destroys the data
-// key, so copies of the file that survive can't be read.
+// In an encrypted namespace (Addendum E) the bundle is written through
+// core.ArchiveBundle.Seal: the file is a sealed bundle (§G.5.1.1,
+// application/vnd.patchlog.sealed-bundle+jsonl) whose only recipient is the
+// resource's archive key, which the server derives from the resource's
+// data key (internal/core/archiveseal.go). Restore decrypts it with
+// core.Engine.ReadArchive, which also reads archives written before v0.73
+// in their own chunked AES-256-GCM format. Purging the resource destroys
+// the data key, and with it the archive key, so copies of the file that
+// survive can't be read.
 package archive
 
 import (
@@ -256,7 +259,7 @@ func Encode(ctx context.Context, w io.Writer, b *core.ArchiveBundle) error {
 			return bw.Line(bundle.Line{NS: g.NS, GrantLine: gl})
 		}
 		return bw.Line(bundle.Line{NS: b.NS, Resource: b.Name, ID: e.ID, Parent: e.Parent, Kind: e.Kind,
-			Patches: e.Patches, Author: e.Author, Created: e.Created, Signature: e.Signature, Gesture: e.Gesture, Undoes: e.Undoes,
+			Patches: e.Patches, Author: e.Author, Via: e.Via, Created: e.Created, Signature: e.Signature, Gesture: e.Gesture, Undoes: e.Undoes,
 			Grant: e.Grant})
 	})
 	if err != nil {
@@ -330,6 +333,9 @@ func Restore(ctx context.Context, e *core.Engine, opt RestoreOptions) ([]Resourc
 	var out []ResourceReport
 	for _, g := range groups {
 		rep := ResourceReport{NS: g.ns, Name: g.name, Archives: len(g.recs)}
+		// The resource's keys are read before its write transaction, in
+		// which the archives are read (core.Engine.ArchiveReader).
+		decrypt := e.ArchiveReader(ctx, g.ns, g.name)
 		res, err := e.RestoreResource(ctx, g.ns, g.name, func(yield func(core.ArchiveEntry) error) error {
 			rep.Failed = nil // a run again starts over
 			for _, r := range g.recs {
@@ -337,7 +343,7 @@ func Restore(ctx context.Context, e *core.Engine, opt RestoreOptions) ([]Resourc
 				if from != "" {
 					u = fileURL(filepath.Join(from, filepath.FromSlash(r.Key)))
 				}
-				if err := readArchive(ctx, e, opener, u, g.ns, g.name, yield); err != nil {
+				if err := readArchive(ctx, decrypt, opener, u, g.ns, g.name, yield); err != nil {
 					if ctx.Err() != nil {
 						return ctx.Err()
 					}
@@ -364,15 +370,15 @@ func Restore(ctx context.Context, e *core.Engine, opt RestoreOptions) ([]Resourc
 	return out, nil
 }
 
-func readArchive(ctx context.Context, e *core.Engine, o Opener, u, ns, name string, yield func(core.ArchiveEntry) error) error {
+func readArchive(ctx context.Context, decrypt func(io.Reader) (io.Reader, error), o Opener, u, ns, name string, yield func(core.ArchiveEntry) error) error {
 	rc, err := o.Open(ctx, u)
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
-	// An archive of an encrypted namespace is decrypted with the
-	// resource's data key; a purge destroyed it (Addendum E.1).
-	plain, err := e.OpenArchive(ctx, ns, name, rc)
+	// An archive of an encrypted namespace is a sealed bundle, opened with
+	// the resource's archive key; a purge destroyed it (§8.6, §E.1).
+	plain, err := decrypt(rc)
 	if err != nil {
 		return err
 	}
