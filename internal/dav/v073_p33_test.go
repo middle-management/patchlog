@@ -438,7 +438,10 @@ type derivedWorld struct {
 	g      *env
 }
 
-func newDerivedWorld(t *testing.T) *derivedWorld {
+// newDerivedWorld builds the world; idpCat are the verbs idp's key may
+// grant in cat (none: identity grants only, whose users read no node
+// document there).
+func newDerivedWorld(t *testing.T, idpCat ...string) *derivedWorld {
 	t.Helper()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
@@ -464,7 +467,7 @@ func newDerivedWorld(t *testing.T) *derivedWorld {
 	contentEntry["maxTtl"], contentEntry["readScope"], contentEntry["requireAt"] = "PT15M", "resource", "cat"
 	contentEntry["groups"] = map[string]any{"deny": []any{"ops"}}
 	contentEntry["roles"] = map[string]any{"allow": []any{"desk", "reader"}}
-	catDoc := map[string]any{"read": "grant", "keys": []any{opsKey.Entry("*"), idp.Entry(), catEntry}, "maxLag": "PT60S",
+	catDoc := map[string]any{"read": "grant", "keys": []any{opsKey.Entry("*"), idp.Entry(idpCat...), catEntry}, "maxLag": "PT60S",
 		"catalog": map[string]any{"trust": []any{"matches"}, "mode": "tree", "files": map[string]any{"ns": "matches", "root": "root"}},
 		"roles":   map[string]any{"desk": map[string]any{"move": true, "place": true}, "reader": map[string]any{}},
 		"rules":   catNSRules}
@@ -682,8 +685,10 @@ func TestTreeDerivedOwnEntriesV073(t *testing.T) {
 // of /parents the catalog decided. Where that is stale (the node moved
 // since the decision), the core refuses the test (422), and the gateway
 // answers 409, asking for a reload; where the answer gives no parents,
-// so that no test leads the patch set, the core refuses the grant's rule
-// (403), and the gateway passes that on. Nothing is written either way.
+// no test could lead the patch set, and the gateway, whose user's grant
+// doesn't read the node's document, can't check that the node is still
+// where the path names it (§H.5): it refuses (403). Nothing is written
+// either way.
 func TestTreeDerivedStaleMoveV073(t *testing.T) {
 	t.Parallel()
 	w := newDerivedWorld(t)
@@ -736,7 +741,7 @@ func TestTreeDerivedStaleMoveV073(t *testing.T) {
 		says   []string
 	}{
 		{"stale", 409, []string{"test of its parents failed", "reload"}},
-		{"missing", 403, nil},
+		{"missing", 403, []string{"doesn't say where it is now"}},
 	} {
 		mode.Store(c.mode)
 		r := g.expect(g.doAs(bob, "MOVE", "/cat/Season%202026/derby.json", "", "Destination", "/cat/Season%202026/d2.json"), c.status, "bob's rename, the catalog's parents "+c.mode)
@@ -945,4 +950,301 @@ func TestTreeServiceBehindRootsV073(t *testing.T) {
 	clk.add(time.Minute)
 	sameStrings(t, "the limited token's top level a minute after ann's write", names(g.propfindAs(narrow, "/cat/"), "/cat/"), []string{"Season/"})
 	g.expect(g.doAs(narrow, "PUT", "/cat/new.json", `{"n": 1}`), 404, "the limited token's new file at the top level")
+}
+
+// hrefsOf is the parents hrefs of a node document doc, in order.
+func hrefsOf(doc any) []string {
+	m, _ := doc.(map[string]any)
+	ps, _ := m["parents"].([]any)
+	out := []string{}
+	for _, p := range ps {
+		pm, _ := p.(map[string]any)
+		h, _ := pm["href"].(string)
+		out = append(out, h)
+	}
+	return out
+}
+
+// derivedGateway is a gateway over w's catalog service that keeps what a
+// token read for an hour, so its listings go stale as another program
+// writes, with f changing its options.
+func (w *derivedWorld) derivedGateway(t *testing.T, f ...func(*dav.Options)) *env {
+	opt := dav.Options{Client: w.s.Client(t), Catalogs: []string{"cat"}, Gateway: true, TreeService: w.catURL, Logf: t.Logf, CatalogTTL: time.Hour}
+	for _, g := range f {
+		g(&opt)
+	}
+	return &env{t: t, ctx: w.ctx, s: w.s, c: w.ops, dav: newTestServer(t, must(dav.New(opt)))}
+}
+
+// GW-31 (§H.5 "Rename or move within a tree", §B.11.4 Move): a user whose
+// grant doesn't read the node documents (an identity grant) renames or
+// moves a file by the name its listing showed, after another program moved
+// that file to another folder. The catalog decides the node's parents as
+// they are now, which don't hold the folder the path names: neither the
+// move nor the rename is made over that (404), and the file stays where
+// the other program put it, with one parent, in a "mode": "tree" catalog.
+func TestTreeDerivedMoveFromWhereItIsNotV073(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct{ what, dest string }{
+		{"move", "/cat/Season%202026/Dest/derby.json"},
+		{"rename", "/cat/Season%202026/d2.json"},
+	} {
+		t.Run(c.what, func(t *testing.T) {
+			t.Parallel()
+			w := newDerivedWorld(t)
+			g := w.derivedGateway(t)
+			must(w.ops.CreateDoc(w.ctx, "cat", "dest", map[string]any{"title": "Dest", "parents": parents("cat", "season")}))
+			w.caughtUp(t)
+			bob := w.user(t, "user:bob", "match-desk")
+			sameStrings(t, "bob's Season 2026", names(g.propfindAs(bob, "/cat/Season%202026/"), "/cat/Season 2026/"), []string{"Dest/", "Sub/", "derby.json"})
+			h, _ := g.load("cat", "matches.derby")
+			moved := must(w.ops.Append(w.ctx, "cat", "matches.derby", h.ID, []any{replace("/parents", parents("cat", "sub"))})).ID
+			w.caughtUp(t)
+			r := g.expect(g.doAs(bob, "MOVE", "/cat/Season%202026/derby.json", "", "Destination", c.dest), 404, "bob's "+c.what+" of derby.json, moved into Sub since his listing")
+			if !strings.Contains(r.body, "renamed or moved") {
+				t.Fatalf("404 %q", r.body)
+			}
+			if after, doc := g.load("cat", "matches.derby"); after.ID != moved || !reflect.DeepEqual(hrefsOf(doc), []string{"/r/cat/sub"}) {
+				t.Fatalf("the placement after bob's %s: %v", c.what, doc)
+			}
+		})
+	}
+}
+
+// GW-31 (§H.5): a Move whose append finds the node's head moved (a stale
+// If-Match) decides it all again, from where the node is now: another
+// program moved it out of the folder the path names in between, so it
+// isn't moved from there (404), rather than moved on from where the other
+// program put it, with the parents decided first carried over.
+func TestTreeDerivedMoveRetryV073(t *testing.T) {
+	t.Parallel()
+	w := newDerivedWorld(t)
+	must(w.ops.CreateDoc(w.ctx, "cat", "dest", map[string]any{"title": "Dest", "parents": parents("cat", "season")}))
+	w.caughtUp(t)
+	var once sync.Once
+	var moved string
+	g := w.derivedGateway(t, func(o *dav.Options) {
+		o.Client = o.Client.With(client.WithTransport(func(rt http.RoundTripper) http.RoundTripper {
+			return rtFunc(func(r *http.Request) (*http.Response, error) {
+				if r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/r/cat/matches.derby") {
+					// Another program moves the file into Sub just before
+					// the gateway's append, which then finds its head moved.
+					once.Do(func() {
+						h, _ := w.ops.Head(w.ctx, "cat", "matches.derby")
+						moved = must(w.ops.Append(w.ctx, "cat", "matches.derby", h.ID, []any{replace("/parents", parents("cat", "sub"))})).ID
+						w.caughtUp(t)
+					})
+				}
+				return rt.RoundTrip(r)
+			})
+		}))
+	})
+	bob := w.user(t, "user:bob", "match-desk")
+	sameStrings(t, "bob's Season 2026", names(g.propfindAs(bob, "/cat/Season%202026/"), "/cat/Season 2026/"), []string{"Dest/", "Sub/", "derby.json"})
+	g.expect(g.doAs(bob, "MOVE", "/cat/Season%202026/derby.json", "", "Destination", "/cat/Season%202026/Dest/derby.json"), 404, "bob's move of derby.json, moved into Sub as he made it")
+	if after, doc := g.load("cat", "matches.derby"); moved == "" || after.ID != moved || !reflect.DeepEqual(hrefsOf(doc), []string{"/r/cat/sub"}) {
+		t.Fatalf("the placement after bob's move (%s): %v", moved, doc)
+	}
+}
+
+// GW-31 (§H.4 "Names before writes", §H.5 "Delete a file"): in a tree
+// with tree-derived access, a grant that doesn't read the catalog's /heads
+// but reads the placement's own document has the listing's names checked
+// against it: a DELETE by a name another program renamed since the
+// listing is a 404, and the file stays, as in a tree without tree-derived
+// access (TestTreeServiceLimitedGrantStaleNameV073).
+func TestTreeDerivedDeleteStaleNameV073(t *testing.T) {
+	t.Parallel()
+	w := newDerivedWorld(t, "read")
+	g := w.derivedGateway(t)
+	ann := w.idp.Grant(t, w.s.Now(), "user:ann", []string{"cat"}, []string{"read"}, map[string]any{
+		"groups": []any{"match-desk"},
+		"rules":  []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"matches.derby"}}}}})
+	sameStrings(t, "ann's Season 2026", names(g.propfindAs(ann, "/cat/Season%202026/"), "/cat/Season 2026/"), []string{"Sub/", "derby.json"})
+	if _, err := w.s.Client(t, client.WithBearer(ann)).Head(w.ctx, "cat", "matches.derby"); err != nil {
+		t.Fatalf("ann's grant doesn't read matches.derby: %v", err)
+	}
+	h, _ := g.load("cat", "matches.derby")
+	renamed := must(w.ops.Append(w.ctx, "cat", "matches.derby", h.ID, []any{replace("/title", "renamed.json")})).ID
+	w.caughtUp(t)
+	r := g.expect(g.doAs(ann, "DELETE", "/cat/Season%202026/derby.json", ""), 404, "ann's DELETE of derby.json, renamed renamed.json since her listing")
+	if !strings.Contains(r.body, "renamed or moved") {
+		t.Fatalf("404 %q", r.body)
+	}
+	if after, doc := g.load("cat", "matches.derby"); after.State != client.Live || after.ID != renamed {
+		t.Fatalf("the placement after ann's DELETE: %v %v", after.State, doc)
+	}
+}
+
+// GW-31 (§H.5, "unlinking a node with several parents is a Move to its
+// other parents"): in a tree with tree-derived access, a user whose grant
+// doesn't read the node documents moves and deletes a file placed in two
+// folders one path at a time, from the parents the catalog decides: a
+// move from one folder keeps the other, a DELETE from one unlinks it from
+// that one only, and only a DELETE of its last path unplaces it.
+func TestTreeDerivedDAGV073(t *testing.T) {
+	t.Parallel()
+	w := newDerivedWorld(t)
+	g := w.g
+	must(w.ops.CreateDoc(w.ctx, "cat", "dest", map[string]any{"title": "Dest", "parents": parents("cat", "season")}))
+	h, _ := g.load("cat", "matches.derby")
+	must(w.ops.Append(w.ctx, "cat", "matches.derby", h.ID, []any{replace("/parents", parents("cat", "season", "sub"))}))
+	w.caughtUp(t)
+	bob := w.user(t, "user:bob", "match-desk")
+	sameStrings(t, "bob's Sub", names(g.propfindAs(bob, "/cat/Season%202026/Sub/"), "/cat/Season 2026/Sub/"), []string{"derby.json"})
+	sameStrings(t, "bob's Season 2026", names(g.propfindAs(bob, "/cat/Season%202026/"), "/cat/Season 2026/"), []string{"Dest/", "Sub/", "derby.json"})
+
+	g.expect(g.doAs(bob, "MOVE", "/cat/Season%202026/derby.json", "", "Destination", "/cat/Season%202026/Dest/derby.json"), 201, "bob's move of derby.json from Season 2026 into Dest")
+	if _, doc := g.load("cat", "matches.derby"); !sameSet(hrefsOf(doc), []string{"/r/cat/sub", "/r/cat/dest"}) {
+		t.Fatalf("the placement after the move: %v", doc)
+	}
+	w.caughtUp(t)
+	g.expect(g.doAs(bob, "DELETE", "/cat/Season%202026/Dest/derby.json", ""), 204, "bob's DELETE of Dest/derby.json, also in Sub")
+	if ph, doc := g.load("cat", "matches.derby"); ph.State != client.Live || !reflect.DeepEqual(hrefsOf(doc), []string{"/r/cat/sub"}) {
+		t.Fatalf("the placement after the DELETE from Dest: %v %v", ph.State, doc)
+	}
+	w.caughtUp(t)
+	g.expect(g.doAs(bob, "DELETE", "/cat/Season%202026/Sub/derby.json", ""), 204, "bob's DELETE of Sub/derby.json, its last path")
+	g.expectTombstoned("cat", "matches.derby", "derby.json's placement")
+	if ih, _ := g.load("matches", "derby"); ih.State != client.Live {
+		t.Fatalf("derby's item is %v", ih.State)
+	}
+}
+
+// sameSet reports whether a and b hold the same strings.
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, x := range a {
+		found := false
+		for _, y := range b {
+			found = found || x == y
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// §H.5 "Rename or move within a tree": the new parent is neither the node
+// nor a folder in it (403). A grant that doesn't read the catalog's /heads
+// (a limited grant, writeTree's nil graph) moves a folder in a tree
+// without tree-derived access, so no catalog checks the move for it: the
+// folders above the new parent, read with its grant, are. Into its own
+// child, a grandchild, or a child placed in a second folder too (a DAG,
+// whose path doesn't pass through it) is 403 and writes nothing; one whose
+// folders above the new parent the grant can't read all is left unchecked
+// and refused too; a move elsewhere is made.
+func TestTreeServiceLimitedGrantFolderIntoItselfV073(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	for _, d := range []struct {
+		name string
+		doc  map[string]any
+	}{
+		{"sub", map[string]any{"title": "Sub", "parents": parents("cat", "season")}},
+		{"deep", map[string]any{"title": "Deep", "parents": parents("cat", "sub")}},
+		{"other", map[string]any{"title": "Other", "parents": parents("cat", "root")}},
+		{"shared", map[string]any{"title": "Shared", "parents": parents("cat", "season", "other")}},
+		{"veiled", map[string]any{"title": "Veiled", "parents": parents("cat", "hidden")}},
+		{"under", map[string]any{"title": "Under", "parents": parents("cat", "veiled")}},
+	} {
+		must(a.w.CreateDoc(a.ctx, "cat", d.name, d.doc))
+	}
+	a.tr.caughtUp("cat", "matches")
+	g := a.gateway(t, a.tr.http.URL)
+	ann := a.k.Grant(t, a.s.Now(), "user:ann", a.both, []string{"read", "create", "append", "delete"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "season", "sub", "deep", "other", "shared", "under", "matches.derby", "derby"}}}}})
+	sameStrings(t, "ann's top level", names(g.propfindAs(ann, "/cat/"), "/cat/"), []string{"Other/", "Season/"})
+	sameStrings(t, "ann's Season", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"Shared/", "Sub/", "derby.json"})
+	sameStrings(t, "ann's Season/Sub", names(g.propfindAs(ann, "/cat/Season/Sub/"), "/cat/Season/Sub/"), []string{"Deep/"})
+	sameStrings(t, "ann's Other", names(g.propfindAs(ann, "/cat/Other/"), "/cat/Other/"), []string{"Shared/"})
+	before, _ := g.load("cat", "season")
+	for _, c := range []struct{ dest, what string }{
+		{"/cat/Season/Sub/Season", "into its child Sub"},
+		{"/cat/Season/Sub/Deep/Season", "into its grandchild Deep"},
+		{"/cat/Other/Shared/Season", "into Shared, its child also placed in Other"},
+	} {
+		r := g.expect(g.doAs(ann, "MOVE", "/cat/Season", "", "Destination", c.dest), 403, "ann's MOVE of Season "+c.what)
+		if !strings.Contains(r.body, "into itself or a folder in it") {
+			t.Fatalf("%s: 403 %q", c.what, r.body)
+		}
+	}
+	// bea doesn't read root either: her top level is the roots of what
+	// she reads (§B.11.5), Under among them, whose parent Veiled she
+	// can't read, nor so tell whether Sub is above it.
+	bea := a.k.Grant(t, a.s.Now(), "user:bea", a.both, []string{"read", "create", "append", "delete"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"season", "sub", "deep", "other", "shared", "under", "matches.derby", "derby"}}}}})
+	sameStrings(t, "bea's top level, root hidden", names(g.propfindAs(bea, "/cat/"), "/cat/"), []string{"Other/", "Season/", "Under/"})
+	sameStrings(t, "bea's Season", names(g.propfindAs(bea, "/cat/Season/"), "/cat/Season/"), []string{"Shared/", "Sub/", "derby.json"})
+	r := g.expect(g.doAs(bea, "MOVE", "/cat/Season/Sub", "", "Destination", "/cat/Under/Sub"), 403, "bea's MOVE of Sub into Under, below Veiled, which she can't read")
+	if !strings.Contains(r.body, "can't be checked") {
+		t.Fatalf("403 %q", r.body)
+	}
+	if after, doc := g.load("cat", "season"); after.ID != before.ID {
+		t.Fatalf("season changed: %v", doc)
+	}
+	if _, doc := g.load("cat", "sub"); !reflect.DeepEqual(hrefsOf(doc), []string{"/r/cat/season"}) {
+		t.Fatalf("sub changed: %v", doc)
+	}
+	g.expect(g.doAs(ann, "MOVE", "/cat/Season/Sub", "", "Destination", "/cat/Other/Sub"), 201, "ann's MOVE of Sub into Other")
+	if _, doc := g.load("cat", "sub"); !reflect.DeepEqual(hrefsOf(doc), []string{"/r/cat/other"}) {
+		t.Fatalf("sub after its move into Other: %v", doc)
+	}
+}
+
+// §H.5 "Delete a file": in a tree without tree-derived access, a grant
+// that doesn't read the catalog's /heads (writeTree's nil graph) deletes a
+// file placed in two folders (a DAG) from the folder its path names only,
+// from the parents in the placement's own document: the placement stays,
+// in the other folder, and so does the item the tree owns.
+func TestTreeServiceLimitedGrantDAGDeleteV073(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	h, _ := a.w.Head(a.ctx, "cat", "matches.cup")
+	must(a.w.Append(a.ctx, "cat", "matches.cup", h.ID, []any{replace("/parents", parents("cat", "season", "hidden"))}))
+	a.tr.caughtUp("cat", "matches")
+	g := a.gateway(t, a.tr.http.URL)
+	ann := a.k.Grant(t, a.s.Now(), "user:ann", a.both, []string{"read", "create", "append", "delete"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "season", "hidden", "matches.cup", "cup"}}}}})
+	sameStrings(t, "ann's Season", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"cup.json"})
+	sameStrings(t, "ann's Hidden", names(g.propfindAs(ann, "/cat/Hidden/"), "/cat/Hidden/"), []string{"cup.json"})
+	g.expect(g.doAs(ann, "DELETE", "/cat/Season/cup.json", ""), 204, "ann's DELETE of Season/cup.json, also in Hidden")
+	ph, doc := g.load("cat", "matches.cup")
+	if ih, _ := g.load("matches", "cup"); ph.State != client.Live || ih.State != client.Live || !reflect.DeepEqual(hrefsOf(doc), []string{"/r/cat/hidden"}) {
+		t.Fatalf("after the DELETE of Season/cup.json: the placement %v %v, the item %v", ph.State, doc, ih.State)
+	}
+}
+
+// §H.5 "Moves that copy ... check first that the source can be deleted":
+// where files.root is hidden from the user, a file at its top level (a
+// root of its subject set) isn't deleted by it (topWrite, 403), so a MOVE
+// of it onto an existing file is refused before anything is written: the
+// target keeps its content, and the source stays.
+func TestTreeServiceTopLevelMoveOntoFileV073(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	must(a.w.CreateDoc(a.ctx, "matches", "top", map[string]any{"title": "Top"}))
+	must(a.w.CreateDoc(a.ctx, "cat", "matches.top", map[string]any{"title": "top.json", "parents": parents("cat", "root")}))
+	a.tr.caughtUp("cat", "matches")
+	g := a.gateway(t, a.tr.http.URL)
+	ann := a.k.Grant(t, a.s.Now(), "user:ann", a.both, []string{"read", "create", "append", "delete"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"season", "matches.derby", "derby", "matches.top", "top"}}}}})
+	sameStrings(t, "ann's top level, root hidden", names(g.propfindAs(ann, "/cat/"), "/cat/"), []string{"Season/", "top.json"})
+	dh, _ := g.load("matches", "derby")
+	for _, dest := range []string{"/cat/Season/derby.json", "/cat/Season/new.json"} {
+		r := g.expect(g.doAs(ann, "MOVE", "/cat/top.json", "", "Destination", dest), 403, "ann's MOVE of top-level top.json to "+dest)
+		if !strings.Contains(r.body, "top level") {
+			t.Fatalf("403 %q", r.body)
+		}
+	}
+	if after, doc := g.load("matches", "derby"); after.ID != dh.ID {
+		t.Fatalf("derby.json was written: %v", doc)
+	}
+	if th, _ := g.load("cat", "matches.top"); th.State != client.Live {
+		t.Fatalf("top.json's placement is %v", th.State)
+	}
+	sameStrings(t, "ann's Season after the refused moves", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
 }

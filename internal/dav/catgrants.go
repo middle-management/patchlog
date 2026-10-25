@@ -15,6 +15,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // Tree-derived access (§B.11, §H.2 "Access"). A tree whose tree service
@@ -555,31 +556,49 @@ func (st *reqState) unplace(ctx context.Context, cat, node, head string) (string
 }
 
 // nodeAsNamed returns the head of node t.node, a file or folder a write
-// changes, where the user's grant reads its document, checked to still
-// have the name and parent t's path named (stillNamed, 404 otherwise,
-// §H.5); "" where it can't read it, which keeps the listing's view for
-// names (§H.4 "Names before writes").
-func (st *reqState) nodeAsNamed(ctx context.Context, t target) (string, error) {
+// changes, and its document, where the user's grant reads them, checked
+// to still have the name and parent t's path named (stillNamed, 404
+// otherwise, §H.5); no document where it can't read it (the head alone
+// where only the document is hidden from it), which keeps the listing's
+// view for names (§H.4 "Names before writes").
+func (st *reqState) nodeAsNamed(ctx context.Context, t target) (string, map[string]any, error) {
 	h, err := st.tk.c.Head(ctx, t.ns, t.node)
 	switch {
 	case hidden(err), err == nil && h.State == client.NotFound:
 		// Not the grant's to read: the core hides it (404, §7).
-		return "", nil
+		return "", nil, nil
 	case err != nil:
-		return "", err
+		return "", nil, err
 	case h.State != client.Live:
-		return "", errNotExist
+		return "", nil, errNotExist
 	}
 	e, err := st.s.doc(ctx, st.tk, t.ns, t.node, h.ID)
 	switch {
 	case hidden(err):
-		return h.ID, nil
+		return h.ID, nil, nil
 	case err != nil:
-		return "", err
+		return "", nil, err
 	case !st.stillNamed(t, e.value):
-		return "", fail(http.StatusNotFound, "%s was renamed or moved by someone else just now; reload its folder", t.path)
+		return "", nil, fail(http.StatusNotFound, "%s was renamed or moved by someone else just now; reload its folder", t.path)
 	}
-	return h.ID, nil
+	m, _ := e.value.(map[string]any)
+	if m == nil {
+		m = map[string]any{}
+	}
+	return h.ID, m, nil
+}
+
+// parentHrefs is the hrefs of a node's parents value v (§B.2), each once.
+func parentHrefs(v any) []string {
+	var out []string
+	arr, _ := v.([]any)
+	for _, x := range arr {
+		m, _ := x.(map[string]any)
+		if h, ok := m["href"].(string); ok && !slices.Contains(out, h) {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // moveIssued renames node src.node to title ("" keeps its title), or
@@ -590,39 +609,18 @@ func (st *reqState) nodeAsNamed(ctx context.Context, t target) (string, error) {
 // current ones for a rename), its patch set beginning with the test of
 // /parents against the parents the catalog decided (the answer's
 // parents), so it moves the node only from where it was judged; a stale
-// test is a 422, answered 409 (reload). Where the user's grant reads the
-// node's own document, it is checked to still have the name and parent
-// src's path named first (404 otherwise, nodeAsNamed), and its parents
-// are those asked for; else the listing's view is kept, and the parents
-// the catalog decided are asked for again where they aren't from alone.
+// test is a 422, answered 409 (reload). It is moved only from where
+// src's path put it (§H.5): where the user's grant reads the node's own
+// document, that is checked to still have the name and parent the path
+// named (404 otherwise, nodeAsNamed), and its parents are those asked
+// for; else the listing's view is kept for its name, and the parents the
+// catalog decided must still hold from (404 otherwise: moved since by
+// someone else), and are asked for again where they aren't from alone.
+// Each attempt, after a stale If-Match too, reads and decides all again.
 func (st *reqState) moveIssued(ctx context.Context, src target, title, from, to, order string) error {
 	cat := src.ns
 	in := st.s.nsInfo(ctx, st.tk, cat)
 	href := func(n string) string { return "/r/" + cat + "/" + n }
-	hrefs := func(v any) []string {
-		var out []string
-		arr, _ := v.([]any)
-		for _, x := range arr {
-			m, _ := x.(map[string]any)
-			if h, ok := m["href"].(string); ok {
-				out = append(out, h)
-			}
-		}
-		return out
-	}
-	parents := []string{href(from)}
-	var curTitle *string
-	if h, err := st.nodeAsNamed(ctx, src); err != nil {
-		return err
-	} else if h != "" {
-		if e, err := st.s.doc(ctx, st.tk, cat, src.node, h); err == nil {
-			m, _ := e.value.(map[string]any)
-			parents = hrefs(m["parents"])
-			if t, ok := m["title"].(string); ok {
-				curTitle = &t
-			}
-		}
-	}
 	// after is the node's parents after the write, ps before it: the
 	// same for a rename (to is from), from replaced by to for a move,
 	// from left out to unlink (to "").
@@ -641,21 +639,60 @@ func (st *reqState) moveIssued(ctx context.Context, src target, title, from, to,
 		}
 		return out
 	}
+	ask := func(ps []string) (*issued, error) {
+		return st.issue(ctx, cat, map[string]any{"node": src.node, "want": []any{"move"}, "to": toAny(ps)})
+	}
 	err := st.retrying(ctx, func() (bool, error) {
-		ask := func(ps []string) (*issued, error) {
-			return st.issue(ctx, cat, map[string]any{"node": src.node, "want": []any{"move"}, "to": toAny(after(ps))})
-		}
-		g, err := ask(parents)
+		_, doc, err := st.nodeAsNamed(ctx, src)
 		if err != nil {
 			return false, err
 		}
-		if decided := hrefs(g.Parents); g.Parents != nil && !sameSet(decided, parents) {
+		// parents are the node's before the write: its document's where
+		// read, else, until the catalog decides them, from alone (the
+		// listing's view).
+		parents, read := []string{href(from)}, doc != nil
+		var curTitle *string
+		if read {
+			parents = parentHrefs(doc["parents"])
+			if t, ok := doc["title"].(string); ok {
+				curTitle = &t
+			}
+		}
+		target := after(parents)
+		if len(target) == 0 && !read {
+			// An unlink whose other parents aren't known: asked for as a
+			// move to where it is, to learn them from the answer.
+			target = parents
+		}
+		g, err := ask(target)
+		if err != nil {
+			return false, err
+		}
+		decided := parentHrefs(g.Parents)
+		switch {
+		case g.Parents == nil && !read:
+			return false, fail(http.StatusForbidden, "%s isn't renamed or moved: your grant doesn't read its document, and catalog %s's answer doesn't say where it is now (§B.11.4), so that it is still where the path names it can't be checked (§H.5)", src.path, cat)
+		case g.Parents == nil:
+		case !slices.Contains(decided, href(from)) && !read:
+			// Not in the folder src's path names, as the catalog decided:
+			// moved since by someone else, whatever the listing showed.
+			return false, fail(http.StatusNotFound, "%s was renamed or moved by someone else just now; reload its folder", src.path)
+		case !slices.Contains(decided, href(from)):
+			return false, fail(http.StatusConflict, "%s was moved by someone else, and catalog %s hasn't decided its move from where it is now yet (§B.11.4); reload its folder", src.path, cat)
+		case !sameSet(decided, parents) || !sameSet(after(decided), target):
 			// Its parents, as the catalog decided them, aren't those
 			// assumed (another's of a node with several, not read): asked
 			// for again, for those.
 			parents = decided
-			if g, err = ask(parents); err != nil {
+			if target = after(parents); len(target) == 0 {
+				return false, fail(http.StatusConflict, "%s is in no other folder now, so it isn't unlinked from this one (§H.5); reload its folder", src.path)
+			}
+			if g, err = ask(target); err != nil {
 				return false, err
+			}
+			if g.Parents == nil || !sameSet(parentHrefs(g.Parents), parents) {
+				// Moved again while the catalog decided: all again.
+				return true, nil
 			}
 		}
 		if src.kind == kFolder && st.srcMatch != "" && g.Head != "" && g.Head != st.srcMatch {
@@ -723,6 +760,40 @@ func (st *reqState) moveIssued(ctx context.Context, src target, title, from, to,
 	})
 	st.changed()
 	return err
+}
+
+// catalogHrefs is those of hrefs that name a node of catalog cat.
+func catalogHrefs(cat string, hrefs []string) []string {
+	var out []string
+	for _, h := range hrefs {
+		if ns, _, ok := tree.ParseHref(h); ok && ns == cat {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// catalogParents is where catalog cat's catalog service has node t.node
+// now, for a write by a grant that doesn't read its document (§H.7
+// "Limited grants"): the parents it decides for a Move of it to its
+// folder t.parent, which a delete of it from there needs the powers of
+// too (§B.11.4), and its head as decided. A node no longer in t.parent
+// is a 404 (renamed or moved since, §H.5); one whose parents the answer
+// doesn't give (a catalog-admin's) can't be checked, and is a 403.
+func (st *reqState) catalogParents(ctx context.Context, t target) ([]string, string, error) {
+	in := "/r/" + t.ns + "/" + t.parent
+	g, err := st.issue(ctx, t.ns, map[string]any{"node": t.node, "want": []any{"move"}, "to": []any{in}})
+	if err != nil {
+		return nil, "", err
+	}
+	ps := parentHrefs(g.Parents)
+	switch {
+	case g.Parents == nil:
+		return nil, "", fail(http.StatusForbidden, "%s isn't deleted or moved: your grant doesn't read its document, and catalog %s's answer doesn't say which folders it is in now (§B.11.4), so whether it is still in this one, and in others too, which a delete from one folder leaves it in (§H.5), can't be checked", t.path, t.ns)
+	case !slices.Contains(ps, in):
+		return nil, "", fail(http.StatusNotFound, "%s was renamed or moved by someone else just now; reload its folder", t.path)
+	}
+	return ps, g.Head, nil
 }
 
 // sameSet reports whether a and b hold the same strings.
