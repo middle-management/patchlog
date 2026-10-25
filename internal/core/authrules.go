@@ -3,6 +3,8 @@ package core
 import (
 	"fmt"
 
+	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/rules"
 )
 
@@ -117,13 +119,40 @@ func (t *tx) checkGrantRules(a *actor, env map[string]any, unknown []string) *Er
 	return t.grantRulesMode(a, verb, nil, env, false, unknown)
 }
 
+// checkCreationRules is step 6 of a namespace's creation under the
+// operator grant that creates it, a remote branch's included, once the
+// genesis has been validated (§6.2 step 4, §7.4, §G.3). That grant passes
+// the *-key guard (§C.2), a creation has no in_use refusals, and namespace
+// rules don't judge it (§6.4.3), but its own key-scope and block rules all
+// do, those that read /doc, /writes or /patches included, against the
+// config envelope of the genesis patches (§C.2 item 4, §6.4.1): 403.
+func (t *tx) checkCreationRules(a *actor, patches any) *Error {
+	if a.verified == nil {
+		return nil
+	}
+	ops, err := patch.Parse(patches)
+	if err != nil {
+		return patchErr(err)
+	}
+	doc, w, err := patch.Apply(nil, false, ops, patch.Options{})
+	if err != nil {
+		return patchErr(err)
+	}
+	env := t.basicEnvelope("config", "", a)
+	env["writes"] = anyStrings(patch.WritesStrings(w))
+	env["doc"] = doc
+	env["patches"] = jsonv.MustParse(jsonv.Canonical(patches))
+	return t.checkGrantRules(a, env, nil)
+}
+
 // checkNSRules is step 6's namespace rules in cfg, the configuration in
 // force (§6.4.3): the first that fails is 422 rule, with its index and the
 // path of the failing rule form. With the envelope members unknown names
 // hidden, a rule whose outcome depends on them fails as a whole, at its
 // own path /rules/{i} (§6.2). A config write under a * key, so any while
 // authentication is disabled, isn't judged by them (§1, §6.4.3); nor is a
-// namespace's creation under the operator grant, which doesn't call this.
+// namespace's creation under the operator grant, whose step 6 runs only
+// its grant and key rules (checkCreationRules).
 func checkNSRules(cfg *Config, a *actor, env map[string]any, isConfig bool, unknown []string) *Error {
 	if isConfig && a.star {
 		return nil

@@ -364,3 +364,79 @@ func TestV073P25E3DeleteDocUnknown(t *testing.T) {
 		p25Rule(t, c.ns, err, 0, c.path)
 	}
 }
+
+// GB-1 (GR-25): a namespace's creation under the operator grant that
+// creates it skips only the namespace rules (§6.4.3, RUL-4). Step 6 still
+// runs that grant's key-scope and block rules, all of them, against the
+// config envelope of the genesis (§6.2 step 6, §C.2 item 4, HTTP-32): a
+// rule reading /doc or /writes that refuses is 403, and nothing is
+// created. The genesis is validated first (step 4), so a creation failing
+// both is 422.
+func TestV073P25OperatorCreationGrantRules(t *testing.T) {
+	ctx := context.Background()
+	opPub, opPriv := grant.GenerateKey()
+	scPub, scPriv := grant.GenerateKey()
+	// A deployment operator key whose scope adds a rule: every namespace
+	// it creates names an owner.
+	owned := map[string]any{"op": "test", "path": "/doc/x-owner", "exists": true}
+	ops, err := grant.ParseKeys(jsonv.FromGo([]any{
+		map[string]any{"kid": "operator", "alg": "ed25519", "pub": opPub, "can": []any{"*"}},
+		map[string]any{"kid": "scoped", "alg": "ed25519", "pub": scPub, "can": []any{"*"}, "rules": []any{owned}},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+		Limits: p17Fast(), Maximums: p17Fast(), TailInterval: authTailEvery, Purger: discardPurger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close() })
+	mint := func(priv []byte, kid, ns string, rules ...any) Credentials {
+		root := map[string]any{"kid": kid, "sub": "op:root", "ns": []any{ns}, "can": []any{"config"},
+			"exp": time.Now().Add(time.Hour).UTC().Format(time.RFC3339)}
+		if len(rules) > 0 {
+			root["rules"] = rules
+		}
+		g, err := grant.Mint(root, ed25519.PrivateKey(priv))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return Credentials{Bearer: g.Encode()}
+	}
+	create := func(ns string, cred Credentials, patches []any) error {
+		_, err := e.WriteConfig(ctx, Request{NS: ns, Cred: cred}, ConfigChange{IfNoneMatch: true, Patches: patches})
+		return err
+	}
+	// A namespace rule refusing every config write whose doc lacks
+	// /x-never: it doesn't judge the creation of its own namespace.
+	nsRule := map[string]any{"if": []any{p25Test("/action", "config")}, "then": []any{map[string]any{"op": "test", "path": "/doc/x-never", "exists": true}}}
+
+	// A block rule reading /doc: an operator grant narrowed to namespaces
+	// that aren't public.
+	notPublic := p25Test("/doc/read", "grant")
+	err = create("np", mint(opPriv, "operator", "np", notPublic), p25Root(map[string]any{"read": "public"}))
+	p25Refused(t, "a public namespace under a grant whose rule needs read: grant", err, 403, "forbidden")
+	if err := create("np", mint(opPriv, "operator", "np", notPublic), p25Root(map[string]any{"read": "grant", "rules": []any{nsRule}})); err != nil {
+		t.Fatalf("the name stays free, and the rule allows a private one, whatever its namespace rules say: %v", err)
+	}
+
+	// A block rule reading /writes, computed from the genesis patches.
+	oneWrite := p25Test("/writes", []any{""})
+	twoOps := []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"read": "grant"}}, map[string]any{"op": "add", "path": "/x-tag", "value": "a"}}
+	p25Refused(t, "a genesis writing /x-tag too", create("nw", mint(opPriv, "operator", "nw", oneWrite), twoOps), 403, "forbidden")
+	if err := create("nw", mint(opPriv, "operator", "nw", oneWrite), p25Root(map[string]any{"read": "grant", "x-tag": "a"})); err != nil {
+		t.Fatalf("a genesis writing only the root: %v", err)
+	}
+
+	// The operator key's own scope rule.
+	p25Refused(t, "a namespace without an owner under the scoped key", create("nk", mint(scPriv, "scoped", "nk"), p25Root(map[string]any{"read": "grant"})), 403, "forbidden")
+	if err := create("nk", mint(scPriv, "scoped", "nk"), p25Root(map[string]any{"read": "grant", "x-owner": "ops"})); err != nil {
+		t.Fatalf("a namespace with an owner under the scoped key: %v", err)
+	}
+
+	// Step 4 before step 6: a genesis that is invalid and that the rule
+	// refuses is 422.
+	err = create("ns2", mint(opPriv, "operator", "ns2", notPublic), p25Root(map[string]any{"read": "public", "successor": "np"}))
+	p25Refused(t, "an invalid genesis the rule refuses too", err, 422, "invalid")
+}

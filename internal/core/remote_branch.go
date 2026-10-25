@@ -1084,7 +1084,7 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 		if err != nil {
 			return err
 		}
-		r, err := t.insertRemoteBranch(req, cc, cfg, doc, m, t.actorID(a))
+		r, err := t.insertRemoteBranch(req, cc, cfg, doc, m, a)
 		res = r
 		return asErr(err)
 	})
@@ -1100,8 +1100,10 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 }
 
 // insertRemoteBranch inserts the shadow, the mirrored schemas and the
-// branch, all verified before the transaction opened.
-func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc map[string]any, m *remoteMirror, author int64) (*WriteResult, *Error) {
+// branch, all verified before the transaction opened. It first finishes
+// the genesis checks that need the base (§G.3, §G.5), then runs step 6
+// for a, the operator grant that creates it (checkCreationRules).
+func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc map[string]any, m *remoteMirror, a *actor) (*WriteResult, *Error) {
 	// The obligations of §G.5, which the base can't enforce.
 	if cfg.Read == "public" && m.read != "public" {
 		return nil, invalid("a branch of a non-public namespace cannot be public (§G.5): make it private (read: grant) or sealed")
@@ -1131,6 +1133,12 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 		return nil, docInvalid("/base/chain", "/base/chain names "+req.NS+": a remote branch of an e2e base can't have the name of a namespace in its base.chain, "+
 			"since read-through ciphertext keeps their names in pl.ns and kid (§G.5.2, §F.8.1)")
 	}
+	// Step 6, after the genesis is validated: the creating operator
+	// grant's own rules, as for a namespace's creation (§6.4.3, §C.2).
+	if err := t.checkCreationRules(a, cc.Patches); err != nil {
+		return nil, err
+	}
+	author := t.actorID(a)
 	// The shadows' mirrored rows follow the branch's level.
 	if t.shadowLevels == nil {
 		t.shadowLevels = map[string]int{}
