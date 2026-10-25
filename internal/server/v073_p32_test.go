@@ -575,3 +575,21 @@ func TestV073RemoteCatchUpAfterUpgrade(t *testing.T) {
 		t.Fatalf("notices %+v, then %+v", before, after)
 	}
 }
+
+// A prune is a write other than a purge, so a prune of a resource a remote
+// branch answers 502 upstream for gets that 502 at step 2.1 (§1, §6.2 step
+// 2.1, §8.6), before a branch prune's checks. P26's Prune calls
+// upstreamRefusal there; this needs P32's to answer (w3 integration).
+func TestV073RemotePruneOfUpstreamResource(t *testing.T) {
+	t.Parallel()
+	a, b, _ := pair(t, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning}, []envOpt{withEncTuning})
+	a.mkNS("m", map[string]any{"read": "public"})
+	x1 := a.create("m", "x", map[string]any{"v": 1.0})
+	expect(t, b.mkRemote("r", remoteGenesis("m", a.nsHead("m"), nil)), 201)
+	expect(t, a.patchNS("m", ops(op("add", "/encryption", map[string]any{"level": "sealed"})), ""), 201)
+	if err := b.e.SyncRemotes(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	expectCode(t, b.get("/r/r/x"), 502, "upstream")
+	expectCode(t, b.prune("r", "x", map[string]any{"horizon": x1}, "admin"), 502, "upstream")
+}
