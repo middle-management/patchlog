@@ -110,7 +110,8 @@ type Options struct {
 	// upstream as Authorization: Bearer, the user name ignored; over a
 	// core with authentication disabled (GET / auth, §1), the Basic user
 	// name as the X-Author each request is sent with (§7.2), which is the
-	// user (§H.7), the password ignored.
+	// user (§H.7), the password ignored. Which of the two is read again
+	// every VerifyEvery, and after the core refuses an X-Author (401).
 	Gateway bool
 	// Password is the Basic password of local mode (any user name).
 	Password string
@@ -165,7 +166,8 @@ type Options struct {
 	// token's grant is accepted (default and at most maxVerifyEvery, five
 	// minutes: §H.7 "Re-checking"), which bounds how long a revoked grant
 	// still reaches its user's scratch files. Writers' settings (§7.4
-	// writer) are kept for no longer.
+	// writer), and whether the core has authentication disabled, are kept
+	// for no longer.
 	VerifyEvery time.Duration
 	// CatalogTTL is how long a token's read of a catalog's tree serves its
 	// requests, unless this server writes meanwhile (default 5s).
@@ -226,6 +228,12 @@ type Server struct {
 	idUsers      idUsers                     // gateway mode: who each token was verified as last, kept past the token (admit)
 	lastSweep    time.Time
 	scratchTotal atomic.Int64 // every user's scratch bytes
+
+	authMu     sync.Mutex
+	authKnown  bool      // whether the core has authentication disabled was read (authOff)
+	authIsOff  bool      // what it said
+	authAt     time.Time // when; zero: read again at the next login
+	authFlight singleflight.Group
 
 	opMu     sync.Mutex
 	opKeys   []client.OperatorKey // the deployment's operator keys (operatorKeys), read at opAt
@@ -643,6 +651,9 @@ const allowed = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, CO
 // client's next request finds it.
 func (st *reqState) answered(status int) {
 	now := st.s.opt.Now()
+	if status == http.StatusUnauthorized && st.tk != st.s.local && strings.HasPrefix(st.tk.id, authorPrefix) {
+		st.s.authStale()
+	}
 	guardOn := ""
 	switch {
 	case st.method == "PUT", st.method == "COPY":
@@ -2251,20 +2262,69 @@ func (p *principal) wroteAs(ns string, e client.LogEntry) bool {
 }
 
 // authOff reports whether the core has authentication disabled (GET /
-// auth, §1), read once.
+// auth, §1), read again every VerifyEvery (§H.7 "Re-checking"), and at
+// the next login after the core refused an X-Author's request (401,
+// authStale): a core restarted with grants on is noticed, and one
+// restarted without them. When the answer changes, every token is
+// dropped, made again at its next request as the core now takes it. A
+// read that fails keeps the last answer, read again at the next login.
 func (s *Server) authOff(ctx context.Context) (bool, *davError) {
-	root, err := s.anon.Root(ctx)
-	if err != nil {
-		if de, ok := upstream(err).(*davError); ok {
-			return false, de
-		}
-		return false, fail(http.StatusBadGateway, "the core's GET / couldn't be read: %v", err)
+	now := s.opt.Now()
+	s.authMu.Lock()
+	known, off, fresh := s.authKnown, s.authIsOff, !s.authAt.IsZero() && now.Sub(s.authAt) < s.opt.VerifyEvery
+	s.authMu.Unlock()
+	if known && fresh {
+		return off, nil
 	}
-	return root.AuthDisabled(), nil
+	v, err, _ := s.authFlight.Do("", func() (any, error) {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		off, err := s.anon.AuthDisabled(rctx)
+		if err != nil {
+			return nil, err
+		}
+		s.authMu.Lock()
+		changed := s.authKnown && s.authIsOff != off
+		s.authKnown, s.authIsOff, s.authAt = true, off, s.opt.Now()
+		s.authMu.Unlock()
+		if changed {
+			s.opt.Logf("dav: the core now has authentication %s (GET /, §1): every login is taken again as it takes them", map[bool]string{true: "disabled", false: "enabled"}[off])
+			s.mu.Lock()
+			for _, tk := range s.tokens {
+				s.dropTokenLocked(tk)
+			}
+			s.mu.Unlock()
+		}
+		return off, nil
+	})
+	switch {
+	case err == nil:
+		return v.(bool), nil
+	case known:
+		s.opt.Logf("dav: the core's GET / couldn't be read again, so whether it has authentication disabled is taken as last read: %v", err)
+		return off, nil
+	}
+	if de, ok := upstream(err).(*davError); ok {
+		return false, de
+	}
+	return false, fail(http.StatusBadGateway, "the core's GET / couldn't be read: %v", err)
+}
+
+// authStale has authOff read GET / again at the next login: the core
+// refused a request sent with a Basic user name as its X-Author (401),
+// as one restarted with authentication on does.
+func (s *Server) authStale() {
+	s.authMu.Lock()
+	s.authAt = time.Time{}
+	s.authMu.Unlock()
 }
 
 // maxAuthor bounds a Basic user name taken as an X-Author.
 const maxAuthor = 256
+
+// authorPrefix begins the id of a token of a Basic user name taken as an
+// X-Author (authorToken), which no grant's id (a hash in hex) does.
+const authorPrefix = "author:"
 
 // authorToken is the token of Basic user name name, a gateway's user
 // over a core with authentication disabled (§1): its X-Author, which the
@@ -2280,7 +2340,7 @@ func (s *Server) authorToken(name string) (*token, *davError) {
 		return nil, fail(http.StatusUnauthorized, "the user name, your name as an author (X-Author, §7.2), is at most %d bytes of UTF-8 without control characters", maxAuthor)
 	}
 	sum := sha256.Sum256([]byte("author\x00" + name))
-	id := "author:" + hex.EncodeToString(sum[:16])
+	id := authorPrefix + hex.EncodeToString(sum[:16])
 	now := s.opt.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()

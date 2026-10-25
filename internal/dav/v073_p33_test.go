@@ -1248,3 +1248,98 @@ func TestTreeServiceTopLevelMoveOntoFileV073(t *testing.T) {
 	}
 	sameStrings(t, "ann's Season after the refused moves", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
 }
+
+// switchedCore is a front for a gateway's core that forwards to a
+// development core (authentication disabled) or, once prod is set, to a
+// core with grants, both serving namespace docs, as a deployment
+// restarted with authentication on does; k's grants are accepted there.
+type switchedCore struct {
+	url  string
+	prod atomic.Bool
+	ps   *clienttest.Server
+	k    clienttest.Key
+}
+
+func newSwitchedCore(t *testing.T) *switchedCore {
+	ctx := context.Background()
+	dev := clienttest.New(t, clienttest.Options{})
+	must(dev.Client(t, client.WithAuthor("setup")).CreateNamespace(ctx, "docs", map[string]any{"read": "public"}))
+	sc := &switchedCore{ps: clienttest.New(t, clienttest.Options{Auth: true, RealClock: true}), k: clienttest.NewKey("k")}
+	must(sc.ps.Client(t, client.WithBearer(sc.ps.OperatorGrant(t, "docs"))).CreateNamespace(ctx, "docs", map[string]any{"read": "grant", "keys": []any{sc.k.Entry("*")}}))
+	devRP, prodRP := proxyTo(dev.URL), proxyTo(sc.ps.URL)
+	sc.url = newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if sc.prod.Load() {
+			prodRP.ServeHTTP(w, r)
+			return
+		}
+		devRP.ServeHTTP(w, r)
+	})).URL
+	return sc
+}
+
+// basicAs sends method p with body to gateway url as Basic user and pw.
+func basicAs(t *testing.T, url, user, pw, method, p, body string) (int, string) {
+	t.Helper()
+	req := must(http.NewRequest(method, url+p, strings.NewReader(body)))
+	req.SetBasicAuth(user, pw)
+	res := must(testHTTP.Do(req))
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	return res.StatusCode, string(b)
+}
+
+// GW-29, §H.7 "Re-checking" (at least every VerifyEvery): a gateway reads
+// again whether its core has authentication disabled. Its core restarted
+// with grants on, a login is then verified as a grant, not taken as an
+// X-Author, and the logins taken so before are dropped: a user name with
+// a password that isn't a grant is refused. Restarted without them again,
+// the Basic user name is the X-Author again.
+func TestGatewayAuthModeRecheckedV073(t *testing.T) {
+	t.Parallel()
+	sc := newSwitchedCore(t)
+	clk := &testClock{t: time.Now()}
+	gw := newTestServer(t, must(dav.New(dav.Options{Client: must(client.New(sc.url)), Namespaces: []string{"docs"}, Gateway: true,
+		VerifyEvery: time.Minute, Now: clk.now, Logf: t.Logf}))).URL
+	if st, b := basicAs(t, gw, "ann", "x", "PUT", "/docs/a.json", `{"n": 1}`); st != 201 {
+		t.Fatalf("ann's PUT over the development core: %d %q", st, b)
+	}
+	sc.prod.Store(true)
+	clk.add(2 * time.Minute)
+	alice := sc.k.Grant(t, sc.ps.Now(), "user:alice", []string{"docs"}, []string{"read", "create", "append"})
+	if st, b := basicAs(t, gw, "alice", alice, "PUT", "/docs/b.json", `{"n": 2}`); st != 201 {
+		t.Fatalf("alice's PUT with a grant, VerifyEvery after the core turned authentication on: %d %q", st, b)
+	}
+	if log := must(sc.ps.Client(t, client.WithBearer(alice)).Log(context.Background(), "docs", "b", "", "")); log[len(log)-1].Grant == nil || log[len(log)-1].Grant.Sub != "user:alice" {
+		t.Fatalf("b was written under %+v, not alice's grant", log[len(log)-1].Grant)
+	}
+	if st, b := basicAs(t, gw, "ann", "x", "PUT", "/docs/a.json", `{"n": 3}`); st != 401 || !strings.Contains(b, "grant") {
+		t.Fatalf("ann's login taken as an X-Author before, with a password that isn't a grant: %d %q", st, b)
+	}
+	sc.prod.Store(false)
+	clk.add(2 * time.Minute)
+	if st, b := basicAs(t, gw, "ann", "x", "PUT", "/docs/c.json", `{"n": 4}`); st != 201 {
+		t.Fatalf("ann's PUT, VerifyEvery after the core turned authentication off again: %d %q", st, b)
+	}
+}
+
+// GW-29, §H.7 "Re-checking": a core that refuses a request sent with a
+// Basic user name as its X-Author (401), as one restarted with grants on
+// does, has the gateway read again at the next login whether it has
+// authentication disabled, before VerifyEvery is over.
+func TestGatewayAuthModeAfterRefusalV073(t *testing.T) {
+	t.Parallel()
+	sc := newSwitchedCore(t)
+	gw := newTestServer(t, must(dav.New(dav.Options{Client: must(client.New(sc.url)), Namespaces: []string{"docs"}, Gateway: true, Logf: t.Logf}))).URL
+	if st, b := basicAs(t, gw, "ann", "x", "PUT", "/docs/a.json", `{"n": 1}`); st != 201 {
+		t.Fatalf("ann's PUT over the development core: %d %q", st, b)
+	}
+	sc.prod.Store(true)
+	alice := sc.k.Grant(t, sc.ps.Now(), "user:alice", []string{"docs"}, []string{"read", "create", "append"})
+	// Taken as an X-Author once more, as last read: the core refuses it.
+	if st, b := basicAs(t, gw, "alice", alice, "PUT", "/docs/b.json", `{"n": 2}`); st != 401 {
+		t.Fatalf("alice's first PUT after the core turned authentication on: %d %q", st, b)
+	}
+	if st, b := basicAs(t, gw, "alice", alice, "PUT", "/docs/b.json", `{"n": 2}`); st != 201 {
+		t.Fatalf("alice's PUT with a grant after the core refused an X-Author: %d %q", st, b)
+	}
+}
