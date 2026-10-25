@@ -222,7 +222,9 @@ func TestV073E2EArchiveIsSealedBundle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expect(t, e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap}, f.writerG), 200)
+	// No retention rule matches p, so moving its horizon needs a grant
+	// chained to a * key (§8.6).
+	expect(t, e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap}, f.adminG), 200)
 	raw, err := os.ReadFile(filepath.Join(dir, "e", "p", h+".jsonl"))
 	if err != nil {
 		t.Fatal(err)
