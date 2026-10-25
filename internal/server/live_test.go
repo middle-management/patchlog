@@ -182,9 +182,14 @@ func TestLongPoll(t *testing.T) {
 		t.Fatalf("resource long-poll %s %v", r.Body, r.H)
 	}
 
-	// Nothing new: 204 at the interval boundary, same since, and a cursor.
+	// Nothing new: without a cursor, 204 at once, same since, and the
+	// current cursor.
+	start = time.Now()
 	r = e.get("/ns/docs/log?since=" + head + "&live=long-poll")
 	expect(t, r, 204)
+	if time.Since(start) > 150*time.Millisecond {
+		t.Fatal("long-poll without a cursor waited")
+	}
 	cur, err := strconv.ParseInt(r.H.Get("X-Cursor"), 10, 64)
 	if err != nil || r.H.Get("X-Namespace-Revision") != head {
 		t.Fatalf("204 headers %v", r.H)
@@ -192,7 +197,8 @@ func TestLongPoll(t *testing.T) {
 	if cc := r.H.Get("Cache-Control"); cc != "public, max-age=0, s-maxage=2" {
 		t.Fatalf("204 Cache-Control %q", cc)
 	}
-	// Echoing the cursor: the next 204 cursor is at least cursor+1.
+	// Echoing the cursor: it waits for the boundary, and the next 204
+	// cursor is at least cursor+1.
 	r = e.get("/ns/docs/log?since=" + head + "&live=long-poll&cursor=" + strconv.FormatInt(cur, 10))
 	expect(t, r, 204)
 	if c2, _ := strconv.ParseInt(r.H.Get("X-Cursor"), 10, 64); c2 < cur+1 {
@@ -204,12 +210,14 @@ func TestLongPoll(t *testing.T) {
 		t.Fatalf("resource 204 %v", r.H)
 	}
 
-	// Errors: unknown since 404, other parameters 400, far-ahead cursor 400.
+	// Errors: unknown since 404, other parameters 400, far-ahead or
+	// far-behind cursor 400.
 	expect(t, e.get("/ns/docs/log?since="+r1+"&live=long-poll"), 404)
 	expect(t, e.get("/r/docs/a/log?since="+head+"&live=long-poll"), 404)
 	expect(t, e.get("/ns/docs/log?since="+head+"&live=long-poll&limit=5"), 400)
 	expect(t, e.get("/ns/docs/log?since="+head+"&live=sse"), 400)
 	expect(t, e.get("/ns/docs/log?since="+head+"&live=long-poll&cursor="+strconv.FormatInt(cur+100000, 10)), 400)
+	expect(t, e.get("/ns/docs/log?since="+head+"&live=long-poll&cursor="+strconv.FormatInt(cur-100000, 10)), 400)
 	expect(t, e.get("/ns/docs/log?since="+head+"&live=long-poll&cursor=x"), 400)
 	// Without live: 302 to the immutable range.
 	r = e.get("/ns/docs/log?since=" + first)
@@ -235,8 +243,10 @@ func TestLongPollWakes(t *testing.T) {
 	if rem := interval - time.Duration(time.Now().UnixNano()%int64(interval)); rem < time.Second {
 		time.Sleep(rem + 10*time.Millisecond)
 	}
+	// With the current cursor: one without a cursor is answered at once.
+	cur := strconv.FormatInt(time.Now().UnixNano()/int64(interval), 10)
 	done := make(chan *resp, 1)
-	go func() { done <- e.get("/ns/docs/log?since=" + head + "&live=long-poll") }()
+	go func() { done <- e.get("/ns/docs/log?since=" + head + "&live=long-poll&cursor=" + cur) }()
 	time.Sleep(100 * time.Millisecond)
 	e.create("docs", "a", map[string]any{})
 	select {

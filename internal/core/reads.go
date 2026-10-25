@@ -422,15 +422,24 @@ type Log struct {
 	Horizon   string
 	Archive   string // with Horizon: the archive holding the newest pruned entry, if any
 	Public    bool
+	// Purged is set on a namespace log of a purged namespace, which ends
+	// with its purge-ns entry: a namespace stream ends after it (§7.3,
+	// §8.5).
+	Purged bool
+	// Until is when the credential that admitted the read expires, zero
+	// if none bounds it (admission.go): an event stream ends there at the
+	// latest (§7.3).
+	Until time.Time
 }
 
 // ResourceLog serves /r/{ns}/{name}/rev/{id}/log?since= (§7.1). With id
-// empty it serves from the current head (for long-poll and SSE). Either
-// way it answers at most limit entries after since (0: all), oldest first,
-// and sets More when the range goes on (§7.1 Paging, §7.7). A page (limit
-// > 0) also holds no more patch set bytes than logPageBytes, at E2 bytes of
-// the entries' JWEs, though always one entry; namespace logs carry no patch
-// sets.
+// empty it serves from the current head (for long-poll and SSE), and with
+// since empty too, for a resource with no entries, an empty range rather
+// than 404 (§7.3, §7.7). Either way it answers at most limit entries after
+// since (0: all), oldest first, and sets More when the range goes on (§7.1
+// Paging, §7.7). A page (limit > 0) also holds no more patch set bytes than
+// logPageBytes, at E2 bytes of the entries' JWEs, though always one entry;
+// namespace logs carry no patch sets.
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
@@ -440,20 +449,29 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, name); err != nil {
-			return err
+		a, aerr := t.reader(n, cred, name)
+		if aerr != nil {
+			return aerr
 		}
 		if n.purged {
 			return t.purgedRead(n)
 		}
-		out = &Log{Public: t.cachePublic(n)}
+		out = &Log{Public: t.cachePublic(n), Until: t.admittedUntil(n, cred, a)}
 		v := t.resolve(n, name, nil)
 		if v.state == Purged {
 			out.Status = 410
 			return nil
 		}
 		if v.head == nil {
+			// A resource with no entries: from its head and genesis (a
+			// live read with an empty since), an empty range, which an
+			// event stream or long-poll waits on, once the read check
+			// above has passed (§7.3, §7.7). Any other range of it is
+			// unknown.
 			out.Status = 404
+			if id == "" && since == "" {
+				out.Status = 200
+			}
 			return nil
 		}
 		to := v.head
@@ -631,10 +649,12 @@ func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit in
 
 // ResourceEvents is NamespaceEvents for the event stream of resource name
 // (§7.3), which follows the namespace log for the resource's purges and
-// prunes: only entries naming it are answered, and they need read on it
-// alone, as the resource's own URLs do (§C.5). Last and More still cover
-// the whole page. With since "" it answers no entries and Last the
-// namespace head, where the stream starts following.
+// prunes: only the entries that purge or prune it are answered, as their
+// events' data, without id and prev, and in a sealed namespace each sealed
+// under the resource's K_r (eventseal.go); they need read on it alone, as
+// the resource's own URLs do (§C.5). Last and More still cover the whole
+// page. With since "" it answers no entries and Last the namespace head,
+// where the stream starts following.
 func (e *Engine) ResourceEvents(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
 	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, name, nil)
 }
@@ -645,6 +665,8 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 	var nsRowID int64
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
+		var a *actor
+		var aerr *Error
 		switch {
 		case live != nil && live.shared:
 			// The waiters' passes stand for their read checks (live.go).
@@ -654,13 +676,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		case n == nil:
 			return t.absentNS(ns, cred)
 		case resource != "":
-			if _, err := t.reader(n, cred, resource); err != nil {
-				return err
+			if a, aerr = t.reader(n, cred, resource); aerr != nil {
+				return aerr
 			}
 		default:
-			a, err := t.nsReader(n, cred)
-			if err != nil {
-				return err
+			if a, aerr = t.nsReader(n, cred); aerr != nil {
+				return aerr
 			}
 			if live != nil {
 				live.decided(t, n, cred, a)
@@ -671,7 +692,10 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		if t.sealedPurged(n) {
 			return t.purgedRead(n)
 		}
-		out = &Log{Public: t.cachePublic(n)}
+		out = &Log{Public: t.cachePublic(n), Purged: n.purged}
+		if live == nil || !live.shared {
+			out.Until = t.admittedUntil(n, cred, a)
+		}
 		toSeq := n.headSeq.Int64
 		if resource != "" && since == "" {
 			out.Status, out.Last = 200, t.nsLogID(toSeq).String()
@@ -789,14 +813,13 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		// short of toSeq is a prefix of the range.
 		out.More = len(rs) > 0 && rs[len(rs)-1].seq < toSeq
 		if resource != "" {
-			var keep []raw
-			var entries []map[string]any
-			for i, m := range out.Entries {
-				if m["resource"] == resource {
-					keep, entries = append(keep, rs[i]), append(entries, m)
-				}
+			// A resource stream's purge and prune events (eventseal.go).
+			out.Entries = resourceEvents(out.Entries, resource)
+			if t.isSealedNS(n) {
+				out.Sealed = true
+				out.EntryJWEs = t.sealResourceEvents(n, resource, out.Entries)
 			}
-			rs, out.Entries = keep, entries
+			return nil
 		}
 		if t.isSealedNS(n) {
 			out.Sealed, nsRowID = true, n.id
@@ -825,7 +848,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		}
 		return nil
 	})
-	if err == nil && out != nil && out.Sealed {
+	if err == nil && out != nil && out.Sealed && resource == "" {
 		if err = e.finishSeal(ctx, nsRowID, jobs); err == nil {
 			if perEntry {
 				out.EntryJWEs = make([]string, len(jobs))

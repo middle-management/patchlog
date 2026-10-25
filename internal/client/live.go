@@ -24,7 +24,11 @@ type LongPollResult struct {
 // LongPoll waits for namespace entries after since (§7.7). Echo the
 // returned Cursor and Since in the next call. It returns at once when
 // entries exist, and otherwise at the server's interval boundary with
-// Timeout set. Errors are as for NSLog (404 since not in chain, …).
+// Timeout set; without a cursor, or with one behind the server's, at once.
+// Errors are as for NSLog (404 since not in chain, …). A cursor more than
+// an hour's worth of intervals behind or ahead of the server's, after a
+// long pause or a clock change, is 400 bad_input (IsBadInput): poll again
+// once without it, as a follower does.
 func (c *Client) LongPoll(ctx context.Context, ns, since, cursor string) (*LongPollResult, error) {
 	if err := checkNS(ns); err != nil {
 		return nil, err
@@ -65,7 +69,8 @@ type ResourceLongPollResult struct {
 	Timeout bool
 }
 
-// ResourceLongPoll waits for resource log entries after since (§7.7).
+// ResourceLongPoll waits for resource log entries after since (§7.7), as
+// LongPoll does; a resource with no entries waits as for an empty since.
 func (c *Client) ResourceLongPoll(ctx context.Context, ns, name, since, cursor string) (*ResourceLongPollResult, error) {
 	if err := checkRes(ns, name); err != nil {
 		return nil, err
@@ -92,6 +97,12 @@ func (c *Client) ResourceLongPoll(ctx context.Context, ns, name, since, cursor s
 	return res, nil
 }
 
+// IsBadInput reports a 400 bad_input: a request-shape error (§12.1), such
+// as a long-poll cursor more than an hour's worth of intervals behind or
+// ahead of the server's (§7.7), after which a follower polls again without
+// the cursor.
+func IsBadInput(err error) bool { return statusIs(err, 400, "bad_input") }
+
 func (c *Client) longPoll(ctx context.Context, path, since, cursor string) (*response, error) {
 	if err := checkOptID("since", since); err != nil {
 		return nil, err
@@ -116,6 +127,8 @@ func (c *Client) longPoll(ctx context.Context, path, since, cursor string) (*res
 // Event is one server-sent event.
 type Event struct {
 	Type string // the entry's kind (namespace streams) or revision/tombstone/purge/prune
+	// ID is the event's id: field, the entry's id; a resource stream's
+	// purge and prune events have none (§7.3).
 	ID   string
 	Data any // parsed data (jsonv model); decrypted in a sealed namespace
 	// JWE is the data as served in a sealed namespace (Addendum E.2).
@@ -156,13 +169,26 @@ func (c *Client) NSEvents(ctx context.Context, ns, since string, fn func(NSEntry
 	})
 }
 
-// ResourceEvents streams a resource's events after since over SSE (§7.3).
+// ResourceEvents streams a resource's events after since over SSE (§7.3):
+// revision and tombstone events, whose Data is the resource log entry and
+// ID its id, and purge and prune events, whose Data is the namespace entry
+// that records them, without id and prev, and which have no ID. A stream
+// ends after its purge event. To resume, pass the ID of the last revision
+// or tombstone event as since.
+//
+// A server older than v0.73 sends purge and prune events with the
+// namespace entry's id as their id: and, in a sealed namespace, sealed as
+// the namespace range of that one entry under K_e; ResourceEvents opens
+// that form too, and delivers those events as a current server sends them.
 func (c *Client) ResourceEvents(ctx context.Context, ns, name, since string, fn func(Event) error) error {
 	if err := checkRes(ns, name); err != nil {
 		return err
 	}
 	return c.events(ctx, "/r/"+ns+"/"+name+"/events", since, func(ev Event) error {
 		if ev.JWE == "" {
+			if m, ok := ev.Data.(map[string]any); ok && (ev.Type == "purge" || ev.Type == "prune") {
+				ev.ID, ev.Data = "", withoutIDPrev(m)
+			}
 			return fn(ev)
 		}
 		switch ev.Type {
@@ -175,28 +201,87 @@ func (c *Client) ResourceEvents(ctx context.Context, ns, name, since string, fn 
 				return fmt.Errorf("client: event %s carries entry %s: %w", ev.ID, e.ID, seal.ErrMismatch)
 			}
 			ev.Data = e.Raw
-		default:
-			// purge and prune: a namespace entry, sealed as its range.
-			pt, err := c.open(ctx, ns, "", ev.JWE, func(h *seal.Header) (seal.PL, error) {
-				rg, _ := h.PL["range"].([]any)
-				if len(rg) != 2 {
-					return nil, seal.ErrMismatch
-				}
-				from, _ := rg[0].(string)
-				return seal.RangePL(ns, from, ev.ID), nil
-			})
+		case "purge", "prune":
+			m, err := c.openResourceEvent(ctx, ns, name, ev)
 			if err != nil {
-				return fmt.Errorf("client: event %s: %w", ev.ID, err)
+				return err
 			}
-			v, err := jsonv.Parse(pt)
-			arr, _ := v.([]any)
-			if err != nil || len(arr) != 1 {
-				return fmt.Errorf("client: event %s: sealed data is not one entry", ev.ID)
+			if m["kind"] != ev.Type || m["resource"] != name {
+				return fmt.Errorf("client: %s event carries a %v entry of %v: %w", ev.Type, m["kind"], m["resource"], seal.ErrMismatch)
 			}
-			ev.Data = arr[0]
+			ev.ID, ev.Data = "", withoutIDPrev(m)
+		default:
+			return fmt.Errorf("client: sealed event of type %q", ev.Type)
 		}
 		return fn(ev)
 	})
+}
+
+// openResourceEvent opens a sealed purge or prune event ev of resource name.
+func (c *Client) openResourceEvent(ctx context.Context, ns, name string, ev Event) (map[string]any, error) {
+	h, err := seal.ParseHeader(ev.JWE)
+	if err != nil {
+		return nil, fmt.Errorf("client: %s event: %w", ev.Type, err)
+	}
+	if rg, old := h.PL["range"]; old {
+		// A server older than v0.73: the namespace range (prev, id] of
+		// the one entry, under K_e, with the entry's id as the event's
+		// id:. The range pl binds both, and the entry must match them.
+		pair, _ := rg.([]any)
+		var from string
+		if len(pair) == 2 {
+			from, _ = pair[0].(string)
+		}
+		if len(pair) != 2 || ev.ID == "" {
+			return nil, fmt.Errorf("client: %s event: %w", ev.Type, seal.ErrMismatch)
+		}
+		v, err := c.openRange(ctx, ns, from, ev.ID, ev.JWE)
+		if err != nil {
+			return nil, fmt.Errorf("client: %s event %s: %w", ev.Type, ev.ID, err)
+		}
+		arr, _ := v.([]any)
+		var m map[string]any
+		if len(arr) == 1 {
+			m, _ = arr[0].(map[string]any)
+		}
+		if m == nil {
+			return nil, fmt.Errorf("client: %s event %s: sealed data is not one entry", ev.Type, ev.ID)
+		}
+		if m["id"] != ev.ID || m["prev"] != from {
+			return nil, fmt.Errorf("client: %s event %s carries entry %v after %v: %w", ev.Type, ev.ID, m["id"], m["prev"], seal.ErrMismatch)
+		}
+		return m, nil
+	}
+	// The namespace entry that records it, without id and prev, sealed
+	// under the resource's K_r of the current epoch with pl { ns, name,
+	// kind }: a grant for this resource alone opens it (§7.3, §E.2.2).
+	pt, err := c.open(ctx, ns, name, ev.JWE, fixedPL(seal.ResourceEventPL(ns, name, ev.Type)))
+	if err != nil {
+		return nil, fmt.Errorf("client: %s event: %w", ev.Type, err)
+	}
+	v, err := jsonv.Parse(pt)
+	m, _ := v.(map[string]any)
+	if err != nil || m == nil {
+		return nil, fmt.Errorf("client: %s event: sealed data is not an entry", ev.Type)
+	}
+	return m, nil
+}
+
+// withoutIDPrev is a resource stream's purge or prune event data m, the
+// namespace entry recording it, without its id and prev (§7.3).
+func withoutIDPrev(m map[string]any) map[string]any {
+	if _, ok := m["id"]; !ok {
+		if _, ok := m["prev"]; !ok {
+			return m
+		}
+	}
+	d := make(map[string]any, len(m))
+	for k, v := range m {
+		if k != "id" && k != "prev" {
+			d[k] = v
+		}
+	}
+	return d
 }
 
 func (c *Client) events(ctx context.Context, path, since string, fn func(Event) error) error {

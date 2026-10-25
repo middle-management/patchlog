@@ -1568,17 +1568,20 @@ function startStream(kind) {
   (kind === 'ns' ? NS_EVENTS : RES_EVENTS).forEach((t) => es.addEventListener(t, (ev) => onStreamEvent(kind, s, t, ev)));
 }
 function onStreamEvent(kind, s, type, ev) {
-  const key = type + ':' + ev.lastEventId;
+  // A resource stream's purge and prune events carry no id (§7.3): EventSource keeps the last revision's as
+  // lastEventId, so they are told apart by their data.
+  const own = kind === 'ns' || (type !== 'purge' && type !== 'prune');
+  const key = type + ':' + (own ? ev.lastEventId : ev.data);
   if (s.seen.has(key)) return;
   s.seen.add(key);
   let data = ev.data; try { data = JSON.parse(ev.data); } catch (_) { /* leave as text */ }
-  s.entry.resBody += `event: ${type}\nid: ${ev.lastEventId}\ndata: ${ev.data}\n\n`;
+  s.entry.resBody += own ? `event: ${type}\nid: ${ev.lastEventId}\ndata: ${ev.data}\n\n` : `event: ${type}\ndata: ${ev.data}\n\n`;
   renderEntry(s.entry);
   const feed = $('feed');
   if (feed.firstChild && feed.firstChild.classList && feed.firstChild.classList.contains('muted')) feed.replaceChildren();
   const d = typeof data === 'object' && data ? data : {};
   feed.prepend(h('li', {}, h('time', {}, new Date().toLocaleTimeString([], { hour12: false })), h('span', { class: 'badge info' }, kind),
-    kindBadge(type), d.resource ? h('span', { class: 'mono' }, d.resource) : null, idEl(ev.lastEventId || d.id || ''),
+    kindBadge(type), d.resource ? h('span', { class: 'mono' }, d.resource) : null, idEl(own ? ev.lastEventId || d.id || '' : d.target || ''),
     d.author ? h('span', { class: 'muted' }, d.author) : null,
     h('button', { class: 'link small', onclick: (e) => { e.target.replaceWith(jsonPre(data)); } }, 'json')));
   while (feed.children.length > 200) feed.lastChild.remove();
