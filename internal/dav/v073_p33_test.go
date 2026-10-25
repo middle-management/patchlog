@@ -1343,3 +1343,72 @@ func TestGatewayAuthModeAfterRefusalV073(t *testing.T) {
 		t.Fatalf("alice's PUT with a grant after the core refused an X-Author: %d %q", st, b)
 	}
 }
+
+// GW-31 (§B.11.5 /read-grants, §H.3 "Where times are absent"): in a tree
+// with tree-derived access, a folder whose listing gives its files without
+// their metadata (file absent: pending, as while the catalog service hasn't
+// read an item yet) has those items read under the read grants POST
+// /read-grants issues, for a user whose own grant reads none of them: the
+// listing shows each with its size and time. The answer's list is items
+// (§B.11.4), or grants, as catalog services before v0.73 named it.
+func TestTreeDerivedReadGrantsV073(t *testing.T) {
+	t.Parallel()
+	for _, key := range []string{"items", "grants"} {
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+			w := newDerivedWorld(t)
+			var readGrants atomic.Int32
+			rp := proxyTo(w.catURL)
+			rp.ModifyResponse = func(r *http.Response) error {
+				readG := r.Request.URL.Path == "/read-grants"
+				if r.StatusCode != http.StatusOK || !readG && !strings.HasSuffix(r.Request.URL.Path, "/children") {
+					return nil
+				}
+				var page map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&page); err != nil {
+					return err
+				}
+				r.Body.Close()
+				if readG {
+					// The answer's list under key, whichever the service
+					// named it.
+					readGrants.Add(1)
+					list := page["items"]
+					if list == nil {
+						list = page["grants"]
+					}
+					delete(page, "items")
+					delete(page, "grants")
+					page[key] = list
+				}
+				children, _ := page["children"].([]any)
+				for _, c := range children {
+					if m, _ := c.(map[string]any); m["kind"] != "folder" {
+						m["file"] = map[string]any{"absent": "pending"}
+					}
+				}
+				b, _ := json.Marshal(page)
+				r.Body = io.NopCloser(bytes.NewReader(b))
+				r.ContentLength = int64(len(b))
+				r.Header.Set("Content-Length", strconv.Itoa(len(b)))
+				return nil
+			}
+			front := newTestServer(t, rp)
+			opt := dav.Options{Client: w.s.Client(t), Catalogs: []string{"cat"}, Gateway: true, TreeService: front.URL, Logf: t.Logf}
+			g := &env{t: t, ctx: w.ctx, s: w.s, c: w.ops, dav: newTestServer(t, must(dav.New(opt)))}
+			bob := w.user(t, "user:bob", "match-desk")
+			if _, err := w.s.Client(t, client.WithBearer(bob)).Head(w.ctx, "matches", "derby"); err == nil {
+				t.Fatal("bob's own grant reads matches/derby")
+			}
+			ls := g.propfindAs(bob, "/cat/Season%202026/")
+			sameStrings(t, "bob's Season 2026, files listed without metadata", names(ls, "/cat/Season 2026/"), []string{"Sub/", "derby.json"})
+			want := rendered(map[string]any{"title": "Derby", "score": "0-0"})
+			if e := ls["/cat/Season 2026/derby.json"]; e.size != strconv.Itoa(len(want)) || e.modified == "" {
+				t.Fatalf("derby.json listed as %+v, want size %d and a time", e, len(want))
+			}
+			if readGrants.Load() == 0 {
+				t.Fatal("the listing asked for no read grants")
+			}
+		})
+	}
+}

@@ -385,8 +385,9 @@ func (st *reqState) itemAccess(ctx context.Context, t target, write bool) error 
 // readGrants has the token's reads of items, files of catalog cat's
 // tree with tree-derived access that a listing shows without their file
 // metadata, go with the grants POST /read-grants issues for them
-// (§B.11.5), those it holds no read grant for yet; items it refuses are
-// left to the user's own grant.
+// (§B.11.4, §B.11.5: its answer's items, each with its grant), those it
+// holds no read grant for yet; items it refuses (an item's status and
+// code, no grant) are left to the user's own grant.
 func (st *reqState) readGrants(ctx context.Context, cat string, items []headDoc) error {
 	if len(items) == 0 {
 		return nil
@@ -408,11 +409,15 @@ func (st *reqState) readGrants(ctx context.Context, cat string, items []headDoc)
 	if err != nil {
 		return err
 	}
+	type entry struct {
+		Item  string `json:"item"`
+		Grant string `json:"grant"`
+	}
 	var a struct {
-		Items []struct {
-			Item  string `json:"item"`
-			Grant string `json:"grant"`
-		} `json:"items"`
+		Items []entry `json:"items"`
+		// Grants is the list as catalog services before v0.73 named it,
+		// whose entries are the same.
+		Grants []entry `json:"grants"`
 	}
 	if err := st.catalogPost(ctx, cat, "/read-grants", body, &a); err != nil {
 		var de *davError
@@ -420,6 +425,9 @@ func (st *reqState) readGrants(ctx context.Context, cat string, items []headDoc)
 			return nil
 		}
 		return err
+	}
+	if a.Items == nil {
+		a.Items = a.Grants
 	}
 	for _, it := range a.Items {
 		ns, name, ok := strings.Cut(strings.TrimPrefix(it.Item, "/r/"), "/")
