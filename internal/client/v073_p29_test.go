@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdh"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -393,5 +394,144 @@ func TestV073P29UndoOverNullGenesis(t *testing.T) {
 	must(c.Undo(ctx, "u", g))
 	if d, _ := docOf(t, c, "u", "a"); d["n"] != 0.0 {
 		t.Fatalf("after the undo %v", d)
+	}
+}
+
+// p29Injecting returns a transport that answers POST /ns/{ns}/keys with
+// one entry for kid that the server made itself, as entry gives it, and,
+// with hideKeyring, refuses GET of the keyring resource, as for a writer
+// limited to some resources (§C.5).
+func p29Injecting(ns string, entry map[string]any, hideKeyring bool) http.RoundTripper {
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	return roundTrip(func(req *http.Request) (*http.Response, error) {
+		h := http.Header{}
+		h.Set("Content-Type", "application/json")
+		h.Set("Cache-Control", "no-store")
+		answer := func(status int, v any) (*http.Response, error) {
+			b, _ := json.Marshal(v)
+			return &http.Response{StatusCode: status, Header: h, Body: io.NopCloser(bytes.NewReader(b)), ContentLength: int64(len(b)), Request: req}, nil
+		}
+		switch {
+		case req.Method == "POST" && req.URL.Path == "/ns/"+ns+"/keys":
+			return answer(200, map[string]any{"epoch": 1, "level": "e2e", "pad": false, "keys": []any{entry}})
+		case hideKeyring && strings.HasPrefix(req.URL.Path, "/r/"+ns+"/"+client.KeyringName):
+			return answer(403, map[string]any{"error": "forbidden", "code": "forbidden"})
+		}
+		return base.RoundTrip(req)
+	})
+}
+
+// P29 review (blocking), §E.3.2 (ENC-12): a client seals only under a key
+// whose keyring entry's from it trusts, and anyone, the server included,
+// can wrap a key to a thumbprint. A key /keys relays without a sender,
+// wrapped in base mode without from or given in the clear, is never one:
+// with the keyring readable, the writer seals under the admin's entry for
+// it instead, configured as every tool is by default (known senders only)
+// or with a trusted sender; without it, the write is ErrUntrustedKey.
+// Reads may still open such a key.
+func TestV073P29RelayedKeyWithoutFromNeverSeals(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	v := newP29Env(t, nil)
+	w0 := must(v.x.CreateDocSealed(ctx, "e", "d", map[string]any{"n": 0.0}))
+	real := must(v.x.Key(ctx, "e#1"))
+	wJWK, wPriv, _ := seal.GenerateRecipient()
+	must(v.x.AddReader(ctx, "e", wPriv.PublicKey(), false))
+	grant := v.k.Grant(t, v.s.Now(), "user:w", []string{"e"}, []string{"read", "create", "append"}, map[string]any{"enc": wJWK})
+
+	evil := seal.NewKey()
+	wrapped := must(seal.WrapKey(wPriv.PublicKey(), "e#1", "", evil))
+	entries := map[string]map[string]any{
+		"base mode without from": {"kid": "e#1", "wrapped": base64.RawURLEncoding.EncodeToString(wrapped.Wrapped)},
+		"in the clear":           {"kid": "e#1", "key": base64.RawURLEncoding.EncodeToString(evil)},
+	}
+	for what, entry := range entries {
+		views := map[string]func(c *client.Client) *client.E2E{
+			"known senders":  func(c *client.Client) *client.E2E { return c.E2E(wPriv).WithSenders(v.priv.PublicKey()) },
+			"trusted sender": func(c *client.Client) *client.E2E { return c.E2E(wPriv).WithTrusted(v.priv.PublicKey()) },
+		}
+		for how, view := range views {
+			wc := v.s.Client(t, client.WithBearer(grant), client.WithHTTPClient(&http.Client{Transport: p29Injecting("e", entry, false)}))
+			body, err := view(wc).SealPatches(ctx, "e", "d", w0.ID, ops(op("replace", "/n", 1)))
+			if err != nil {
+				t.Fatalf("%s, %s, keyring readable: %v", what, how, err)
+			}
+			if _, err := seal.OpenPatchSet(jsonv.MustParse(body), p29Kr(t, evil, "e", "d"), "e#1", "e", "d", w0.ID); err == nil {
+				t.Fatalf("%s, %s: sealed under the key the server chose", what, how)
+			}
+			if _, err := seal.OpenPatchSet(jsonv.MustParse(body), p29Kr(t, real, "e", "d"), "e#1", "e", "d", w0.ID); err != nil {
+				t.Fatalf("%s, %s: not sealed under the admin's key: %v", what, how, err)
+			}
+			// The keyring hidden, the relayed key is all there is.
+			lc := v.s.Client(t, client.WithBearer(grant), client.WithHTTPClient(&http.Client{Transport: p29Injecting("e", entry, true)}))
+			lx := view(lc)
+			if _, err := lx.SealPatches(ctx, "e", "d", w0.ID, ops(op("replace", "/n", 1))); !errors.Is(err, client.ErrUntrustedKey) {
+				t.Fatalf("%s, %s, keyring hidden: %v, want ErrUntrustedKey", what, how, err)
+			}
+			if k, err := lx.Key(ctx, "e#1"); err != nil || !bytes.Equal(k, evil) {
+				t.Fatalf("%s, %s: reads open the relayed key: %v", what, how, err)
+			}
+		}
+	}
+
+	// A key holder that read with the injected key first doesn't pass it
+	// on: AddReader wraps the admin's key for the new reader.
+	ak := v.s.Client(t, client.WithBearer(grant), client.WithHTTPClient(&http.Client{Transport: p29Injecting("e", entries["base mode without from"], false)})).
+		E2E(wPriv).WithSenders(v.priv.PublicKey())
+	if k := must(ak.Key(ctx, "e#1")); !bytes.Equal(k, evil) {
+		t.Fatal("the view reads with the relayed key first")
+	}
+	_, rPriv, _ := seal.GenerateRecipient()
+	must(ak.AddReader(ctx, "e", rPriv.PublicKey(), false))
+	kr, _ := must2(v.x.Keyring(ctx, "e"))
+	if k, err := kr.EpochKey(rPriv, "e#1", []*ecdh.PublicKey{wPriv.PublicKey()}); err != nil || !bytes.Equal(k, real) {
+		t.Fatalf("the new reader's entry: %v, admin's key %v", err, bytes.Equal(k, real))
+	}
+	if k := must(ak.Key(ctx, "e#1")); !bytes.Equal(k, real) {
+		t.Fatal("after sealing, the view still holds the relayed key")
+	}
+}
+
+// P29 review, §E.3.2 (ENC-12): a keyring stored in the format before
+// v0.63 has no from, so nothing seals under its keys, relayed or read in
+// it, whatever senders the view knows or trusts; reads still open them.
+// The error names the remedy, migrate-keyring. The stored legacy keyring
+// and its relay are played by the transport, as in TestV073E2EMigrateKeyring.
+func TestV073P29LegacyKeyringNeverSeals(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	v := newP29Env(t, nil)
+	w0 := must(v.x.CreateDocSealed(ctx, "e", "d", map[string]any{"n": 0.0}))
+	ke := must(v.x.Key(ctx, "e#1"))
+	legacy := must(seal.BuildKeyring("e", 1, ke, []*ecdh.PublicKey{v.priv.PublicKey()}))
+	body, _ := json.Marshal(legacy.Value())
+	relay := rewriteKeys(t, "e", func(m map[string]any) {
+		delete(m, "from")
+		m["wrapped"] = base64.RawURLEncoding.EncodeToString(legacyWrap(t, v.priv.PublicKey(), "e#1", ke))
+	})
+	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+		res, err := relay.RoundTrip(req)
+		if err != nil || req.Method != "GET" || !strings.HasPrefix(req.URL.Path, "/r/e/keyring/rev/") || res.StatusCode != 200 {
+			return res, err
+		}
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+		res.Body = io.NopCloser(bytes.NewReader(body))
+		res.ContentLength = int64(len(body))
+		res.Header.Del("Content-Length")
+		return res, nil
+	})
+	c := v.s.Client(t, client.WithBearer(v.grant), client.WithHTTPClient(&http.Client{Transport: rt}))
+	for how, x := range map[string]*client.E2E{
+		"own key only":   c.E2E(v.priv),
+		"trusted sender": c.E2E(v.priv).WithTrusted(v.priv.PublicKey()),
+	} {
+		_, err := x.SealPatches(ctx, "e", "d", w0.ID, ops(op("replace", "/n", 1)))
+		if !errors.Is(err, client.ErrUntrustedKey) || !strings.Contains(err.Error(), "migrate-keyring") {
+			t.Fatalf("%s: sealing under a legacy keyring's key: %v", how, err)
+		}
+		if d := must(x.DocE2E(ctx, "e", "d", w0.ID)); d.Value.(map[string]any)["n"] != 0.0 {
+			t.Fatalf("%s: reads open it: %+v", how, d)
+		}
 	}
 }

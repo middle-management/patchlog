@@ -122,7 +122,7 @@ func migrationReaders(epochs []int, current int, all, newest []*ecdh.PublicKey) 
 type keyringFlags struct{ senders, trusted multi }
 
 const keyringSenderHelp = "file with a keyring admin's X25519 public key (a JWK {kty, crv, x}, or base64url x): e2e keyring entries it wrapped are opened (§E.3.2), and, unless -trusted-sender is given, sealed under; repeatable"
-const trustedSenderHelp = "as -keyring-sender, and trusted to distribute keys: once any is given, this tool seals (writes, prunes, re-encrypted merges, derived views) only under keys whose keyring entry is from one of these or from its own identity, while reads still open keys from every -keyring-sender (§E.3.2); repeatable"
+const trustedSenderHelp = "as -keyring-sender, and trusted to distribute keys: once any is given, this tool seals (writes, prunes, re-encrypted merges, derived views) only under keys whose keyring entry is from one of these or from its own identity, while reads still open keys from every -keyring-sender (§E.3.2); never under a key without a sender, such as one of a keyring stored before v0.63 (migrate-keyring); repeatable"
 
 // addKeyringFlags registers -keyring-sender and -trusted-sender on fs.
 func addKeyringFlags(fs *flag.FlagSet) *keyringFlags {

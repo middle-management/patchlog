@@ -53,7 +53,11 @@ package client
 // WithTrustedKeyringSenders), and skips entries from any other. It seals
 // only under keys whose entry is from a sender it trusts to distribute
 // keys (SealKey): with trusted senders named, those and its own keys;
-// with none, every sender it knows. Reads open keys from any known sender.
+// with none, every sender it knows; never a key without a sender, which
+// /keys relays in base mode or in the clear, or a keyring stored before
+// v0.63 holds, since the server can wrap those itself. Where the first key
+// found isn't trusted, SealKey looks on for an entry that is. Reads open
+// keys from any known sender, and keys without one.
 // Writes seal under the current epoch, with the pad setting, both from the
 // namespace document, or, for a writer limited to some resources that
 // can't read it (§C.5), from what POST /ns/{ns}/keys names beside the keys
@@ -214,8 +218,9 @@ func WithTrustedKeyringSenders(pubs ...*ecdh.PublicKey) Option {
 
 // ErrUntrustedKey reports an epoch key the view may read with but won't
 // seal under: its keyring entry's from names a sender the view doesn't
-// trust to distribute keys, and anyone, the server included, can wrap a
-// key to a thumbprint (§E.3.2).
+// trust to distribute keys, or it has no sender at all (a keyring stored
+// before v0.63, or a key /keys relays without from), and anyone, the
+// server included, can wrap a key to a thumbprint (§E.3.2).
 var ErrUntrustedKey = errors.New("client: the key's keyring entry is from a sender this view doesn't trust to distribute keys (§E.3.2)")
 
 // knownSenders lists the keyring senders the view opens entries from: its
@@ -235,11 +240,17 @@ func (x *E2E) knownSenders() []*ecdh.PublicKey {
 // trustedFrom reports whether the view seals under a key whose keyring
 // entry names from (e2eKeys.from) as its sender: its own recipient keys
 // and keys added directly always; with trusted senders named (WithTrusted,
-// WithTrustedKeyringSenders), those; with none, every known sender, and
-// an entry without from, of a keyring stored before v0.63.
+// WithTrustedKeyringSenders), those; with none, every known sender, whose
+// public key came out of band too. A key without a sender ("") never: an
+// entry of a keyring stored before v0.63, or one /keys relays in base mode
+// or in the clear (as at E2, for an epoch before a raise to e2e), which
+// anyone, the server included, can have wrapped (§E.3.2).
 func (x *E2E) trustedFrom(from string) bool {
 	if from == fromSelf {
 		return true
+	}
+	if from == "" {
+		return false
 	}
 	for _, p := range x.recipients() {
 		if seal.Thumbprint(p.PublicKey()) == from {
@@ -248,9 +259,6 @@ func (x *E2E) trustedFrom(from string) bool {
 	}
 	trusted := append(append([]*ecdh.PublicKey(nil), x.trusted...), x.c.trusted...)
 	if len(trusted) == 0 {
-		if from == "" {
-			return true
-		}
 		trusted = x.knownSenders()
 	}
 	for _, p := range trusted {
@@ -320,20 +328,18 @@ func (x *E2E) Key(ctx context.Context, kid string) ([]byte, error) {
 }
 
 // SealKey is Key for a key the view seals under: its keyring entry must be
-// from a sender the view trusts (trustedFrom, §E.3.2), or it is
-// ErrUntrustedKey.
+// from a sender the view trusts (trustedFrom, §E.3.2). Where the key it
+// holds, or the first one found, isn't, it looks on, in both relays and in
+// the keyring, for an entry from one that is, and holds that key from then
+// on; with none, it is ErrUntrustedKey.
 func (x *E2E) SealKey(ctx context.Context, kid string) ([]byte, error) {
-	key, err := x.Key(ctx, kid)
-	if err != nil {
-		return nil, err
-	}
 	x.keys.mu.Lock()
-	from := x.keys.from[kid]
+	key, from := x.keys.m[kid], x.keys.from[kid]
 	x.keys.mu.Unlock()
-	if !x.trustedFrom(from) {
-		return nil, fmt.Errorf("%w: %s from %s", ErrUntrustedKey, kid, from)
+	if key != nil && x.trustedFrom(from) {
+		return key, nil
 	}
-	return key, nil
+	return x.findKey(ctx, kid, "", x.trustedFrom)
 }
 
 // resourceKey derives K_r of name in namespace ns from the epoch key K_e
@@ -352,6 +358,14 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	if k != nil {
 		return k, nil
 	}
+	return x.findKey(ctx, kid, via, nil)
+}
+
+// findKey fetches the epoch key of kid, from relays first, then from the
+// keyring, and holds it with its sender (addKey). With accept, it takes
+// only a key whose sender accept takes, looking past others, and is
+// ErrUntrustedKey when it finds only those; without, the first key found.
+func (x *E2E) findKey(ctx context.Context, kid, via string, accept func(from string) bool) ([]byte, error) {
 	privs := x.recipients()
 	if len(privs) == 0 {
 		return nil, fmt.Errorf("%w: %s", ErrNoKeys, kid)
@@ -359,6 +373,18 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	ns, epoch, err := seal.ParseKid(kid)
 	if err != nil {
 		return nil, err
+	}
+	// untrusted is the sender of the first key found that accept refused.
+	untrusted, refused := "", false
+	take := func(key []byte, from string) bool {
+		if accept != nil && !accept(from) {
+			if !refused {
+				untrusted, refused = from, true
+			}
+			return false
+		}
+		x.addKey(kid, key, from)
+		return true
 	}
 	// The relays first (§E.2.3): they need a read grant with enc. A
 	// fetch that failed for a reason asking again may mend (Transient),
@@ -381,6 +407,11 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 			if e.Kid != kid || e.Resource != "" {
 				continue
 			}
+			// A key in the clear, or wrapped in base mode without from,
+			// has no sender: at E3 the server relays only keyring entries
+			// (§E.3.1), and gives such keys only for epochs before a raise
+			// to e2e, as at E2 (Addendum E, Levels). Reads may open with
+			// them; nothing seals under them (trustedFrom).
 			key, from := e.Key, ""
 			if key == nil {
 				if key, err = unwrapRelayed(privs, e.Wrapped, x.knownSenders()); err != nil {
@@ -393,8 +424,9 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 				}
 				from = e.Wrapped.From
 			}
-			x.addKey(kid, key, from)
-			return key, nil
+			if take(key, from) {
+				return key, nil
+			}
 		}
 	}
 	// Then the keyring itself (a key holder may read it directly), if it
@@ -406,14 +438,14 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 		for _, priv := range privs {
 			if key, err := kr.EpochKey(priv, kid, x.knownSenders()); err == nil {
 				e, _ := kr.Entry(kid, seal.Thumbprint(priv.PublicKey()))
-				x.addKey(kid, key, e.From)
-				return key, nil
+				if take(key, e.From) {
+					return key, nil
+				}
 			}
 		}
 	case err == nil && old.NS == ns:
 		for _, priv := range privs {
-			if key, err := old.EpochKey(priv, epoch); err == nil {
-				x.addKey(kid, key, "")
+			if key, err := old.EpochKey(priv, epoch); err == nil && take(key, "") {
 				return key, nil
 			}
 		}
@@ -422,6 +454,12 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	}
 	if failed != nil {
 		return nil, fmt.Errorf("client: fetching the epoch key %s: %w", kid, failed)
+	}
+	if refused {
+		if untrusted == "" {
+			return nil, fmt.Errorf("%w: %s has no sender (a keyring stored before v0.63, which a key holder migrates with patchlog e2e migrate-keyring, or a key the server wrapped itself)", ErrUntrustedKey, kid)
+		}
+		return nil, fmt.Errorf("%w: %s from %s", ErrUntrustedKey, kid, untrusted)
 	}
 	if unwrapErr != nil {
 		return nil, unwrapErr
