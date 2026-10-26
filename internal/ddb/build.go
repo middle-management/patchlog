@@ -1,6 +1,8 @@
 package ddb
 
 import (
+	"crypto/sha256"
+
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/middle-management/patchlog/internal/ids"
@@ -21,8 +23,10 @@ type Error struct {
 
 func (e *Error) Error() string { return string(jsonv.Canonical(e.Body)) }
 
+// apiErr builds an error in the core's body shape (engine.go's apiErr):
+// {"code": …, …members}, so the server serves either backend alike.
 func apiErr(status int, code string, members ...any) *Error {
-	e := &Error{Status: status, Body: map[string]any{"status": status, "error": code}}
+	e := &Error{Status: status, Body: map[string]any{"code": code}}
 	for i := 0; i+1 < len(members); i += 2 {
 		e.Body[members[i].(string)] = members[i+1]
 	}
@@ -35,7 +39,9 @@ type writePlan struct {
 	rev     revRow
 	entry   logRow
 	newHead resRow
-	doc     string // canonical JSON of the resulting head document
+	doc     string   // canonical JSON of the resulting head document
+	docAny  any      // the document itself (the gate's rules read it, §6.4.1)
+	writes  []string // the patch set's write pointers (§6.4.1's envelope)
 
 	resExists bool // pin RES# headPos, else attribute_not_exists
 	oldHead   uint64
@@ -64,7 +70,7 @@ const (
 // document (nil when head is), m the namespace's meta, t its log tip.
 // ifMatch pins the parent's revision id ("" pins nothing). patches is the
 // decoded patch set; apply folds it into a document.
-func planWrite(ns, name string, m *nsMeta, t *tip, head *resRow, headDoc any, ifMatch string, patches any, author string, now int64, apply func(doc any, exists bool, patches any) (any, error)) (*writePlan, *Error) {
+func planWrite(ns, name string, m *nsMeta, t *tip, head *resRow, headDoc any, ifMatch string, patches any, gesture, undoes, author string, now int64, apply func(doc any, exists bool, patches any) (any, []string, error)) (*writePlan, *Error) {
 	switch {
 	case m == nil:
 		return nil, apiErr(404, "not_found", "namespace", ns)
@@ -111,10 +117,12 @@ func planWrite(ns, name string, m *nsMeta, t *tip, head *resRow, headDoc any, if
 		return nil, apiErr(412, "stale", "head", cur)
 	}
 
-	doc, err := apply(headDoc, head != nil && head.headPos > 0, patches)
+	doc, writes, err := apply(headDoc, head != nil && head.headPos > 0, patches)
 	if err != nil {
 		return nil, apiErr(422, "patch", "detail", err.Error())
 	}
+	docCanon := jsonv.Canonical(doc)
+	digest := sha256.Sum256(docCanon)
 
 	pos := uint64(1)
 	if head != nil && head.headPos > 0 {
@@ -139,6 +147,10 @@ func planWrite(ns, name string, m *nsMeta, t *tip, head *resRow, headDoc any, if
 			patches:  string(canon),
 			author:   author,
 			created:  now,
+			size:     uint64(len(docCanon)),
+			digest:   digest[:],
+			gesture:  gesture,
+			undoes:   undoes,
 		},
 		entry: logRow{
 			pos:     t.headPos + 1,
@@ -148,9 +160,14 @@ func planWrite(ns, name string, m *nsMeta, t *tip, head *resRow, headDoc any, if
 			body:    string(body),
 			author:  author,
 			created: now,
+			gesture: gesture,
+			undoes:  undoes,
+			cfgPos:  m.configPos,
 		},
-		newHead:   resRow{headPos: pos, headID: revID.String(), entryID: entryID.String(), state: "live"},
-		doc:       string(jsonv.Canonical(doc)),
+		newHead:   resRow{headPos: pos, headID: revID.String(), entryID: entryID.String(), state: "live", headCreated: now, headSize: uint64(len(docCanon)), headDigest: digest[:]},
+		doc:       string(docCanon),
+		docAny:    doc,
+		writes:    writes,
 		resExists: head != nil,
 		oldHead:   pos - 1, // the head position the RES condition pins
 		tip:       *t,
@@ -190,11 +207,12 @@ func buildWriteTx(table, ns, name string, p *writePlan) []types.TransactWriteIte
 	out[actRes] = types.TransactWriteItem{Update: &types.Update{
 		TableName:                &table,
 		Key:                      keyAV(resK),
-		UpdateExpression:         strptr("SET headPos = :h, headId = :i, #st = :live, entryId = :e"),
+		UpdateExpression:         strptr("SET headPos = :h, headId = :i, #st = :live, entryId = :e, headCreated = :c, headSize = :s, headDigest = :d"),
 		ConditionExpression:      &resCond,
 		ExpressionAttributeNames: map[string]string{"#st": "state"},
 		ExpressionAttributeValues: mergeVals(resVals, map[string]types.AttributeValue{
 			":h": avN(p.newHead.headPos), ":i": avS(p.newHead.headID), ":live": avS("live"), ":e": avS(p.entry.id),
+			":c": avI(p.newHead.headCreated), ":s": avN(p.newHead.headSize), ":d": avB(p.newHead.headDigest),
 		}),
 	}}
 	out[actDoc] = types.TransactWriteItem{Put: &types.Put{
@@ -240,7 +258,8 @@ func buildCreateTx(table, ns string, m *nsMeta, cfgID string, patchesCanon, docC
 	return []types.TransactWriteItem{
 		{Put: &types.Put{TableName: &table, Item: withKey(metaK, m.item()), ConditionExpression: &notExists}},
 		{Put: &types.Put{TableName: &table, Item: withKey(cfgK, item{
-			"pos": avN(1), "id": avS(cfgID), "patches": avS(patchesCanon), "doc": avS(docCanon), "author": avS(entry.author), "created": avI(entry.created),
+			"pos": avN(1), "id": avS(cfgID), "logPos": avN(1), "patches": avS(patchesCanon), "doc": avS(docCanon), "author": avS(entry.author), "created": avI(entry.created),
+			"G1PK": avS(g1RevID(cfgID)),
 		})}},
 		{Put: &types.Put{TableName: &table, Item: withKey(logK, entry.item())}},
 		{Put: &types.Put{TableName: &table, Item: withKey(tipK, (&tip{headPos: 1, headID: entry.id}).item())}},

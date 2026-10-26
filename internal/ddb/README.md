@@ -1,11 +1,21 @@
-# ddb — the DynamoDB spike
+# ddb — the DynamoDB store
 
-Phase 1 of docs/DYNAMODB.md §10, spiked: the key design and the
-single-resource write path against a real DynamoDB, nothing else. It is a
-standalone package, not wired into `internal/core`; it reuses the
-production id scheme (`internal/ids`), canonical JSON (`internal/jsonv`)
-and patch engine (`internal/patch`), so the bytes it hashes and folds are
-the production bytes.
+The DynamoDB backend of docs/DYNAMODB.md: the key design of §3, the
+transactions of §4, wired into `internal/core` for phase 1 of §10's path
+C (plain namespaces, `-dev`, one instance — the integration status is
+§13). It reuses the production id scheme (`internal/ids`), canonical JSON
+(`internal/jsonv`) and patch engine (`internal/patch`), so the bytes it
+hashes and folds are the production bytes.
+
+The surface, beyond the spike's writes: `CreateNamespace`, `WriteResource`
+and `WriteConfig` (both with a check hook that runs the caller's gate
+inside the retry loop, after planning — D.3's recheck shape),
+`ReadHead`, `ReadLog` (paged, id cursors, upper bounds), `ReadRevByID`
+(GSI1), `FoldResource`, `ResourceLogEntries`, `ListHeads`, `ReadConfig`,
+`ReadDocAtEntry` (the `ns_log ⨯ ns_config` join), `ReadNSInfo`,
+`KnownEntry`, `Ping`. `Open` parses the `-db` URL
+(`dynamodb://<table>?region=…&endpoint=…`); errors carry the core's
+`{"code": …}` body shape.
 
 ## What it proves
 
@@ -39,6 +49,7 @@ go test ./internal/ddb/            # the hermetic tests (keys, plans, tx shapes)
 
 docker run -d --name ddb-local -p 8000:8000 amazon/dynamodb-local
 DDB_ENDPOINT=http://localhost:8000 go test ./internal/ddb/   # + the integration tests
+DDB_ENDPOINT=http://localhost:8000 go test -run TestDDB ./internal/core/  # the engine's phase-1 surface
 DDB_ENDPOINT=http://localhost:8000 go test -run XXX -bench BenchmarkDDB -benchtime 1x ./internal/ddb/
 ```
 
@@ -52,19 +63,23 @@ which is why Postgres uses a log lock instead.
 
 ## Simplifications (all deliberate)
 
-- No grants, rules, schemas, limits, blobs, branches, tombstones, purges,
-  batches, sealed/e2e, or the S3 offload of large values. The check phase
-  is D.3's shape with those steps missing, not reimplemented.
-- `WriteResource` is PATCH-shaped (create-or-append, `ifMatch` optional);
-  PUT's `If-None-Match` create and multi-step items are unimplemented.
+- Phase 1's scope is plain namespaces: no grants, blobs, branches,
+  tombstones, purges, batches, sealed/e2e, or the S3 offload of large
+  values. What the phase doesn't cover is refused by core's seam (501),
+  not silently dropped; limits and namespace rules are the gate's,
+  evaluated in the check hook.
+- `WriteResource` is one patch-set step (create-or-append, `ifMatch`
+  optional); multi-step items and deletes are phase 2.
 - A retried `CreateNamespace` with the *same patches* answers the original
   ids (its marker covers them); with *different* patches it is 412 naming
-  the current config id — production's answer. The two answers are the
-  same information with a different status; the HTTP layer's status
-  fidelity is out of scope.
-- `kind` and `author` are stored as names, not the SQL schema's ints.
+  the current config id — production's answer.
+- `kind` and `author` are stored as names, not the SQL schema's ints;
+  revision/log/head metadata (`size`, `digest`, `created`, gestures) rides
+  as plain attributes, and LOG items denormalize `cfgPos` like
+  `ns_log.config_seq`.
 - Read-modify loops (the tip retry) are bounded by `maxWriteAttempts = 8`,
-  like the SQL backends'.
+  like the SQL backends'. Group commit (docs/DYNAMODB.md §4, §11) is
+  phase 2.
 
 ## What the spike learned (fed back into docs/DYNAMODB.md)
 

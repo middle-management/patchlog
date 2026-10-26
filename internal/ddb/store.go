@@ -21,6 +21,7 @@ type API interface {
 	BatchGetItem(ctx context.Context, in *dynamodb.BatchGetItemInput, opt ...func(*dynamodb.Options)) (*dynamodb.BatchGetItemOutput, error)
 	Query(ctx context.Context, in *dynamodb.QueryInput, opt ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
 	TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, opt ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
+	DescribeTable(ctx context.Context, in *dynamodb.DescribeTableInput, opt ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error)
 }
 
 // Store is the spike's storage backend: one DynamoDB table, the key design
@@ -48,6 +49,7 @@ type WriteResult struct {
 	Status   int    // 201 committed, 200 replayed
 	ID       string // revision id
 	NSID     string // namespace log entry id
+	Created  int64  // the entry's stored time, milliseconds
 	Replayed bool
 }
 
@@ -55,7 +57,7 @@ type WriteResult struct {
 // log entry (insertNamespace of nsops.go). patches is the decoded JSON
 // Patch set producing the namespace document.
 func (s *Store) CreateNamespace(ctx context.Context, ns, author string, patches any) (cfgID, nsID string, err error) {
-	doc, err := applyPatches(nil, false, patches)
+	doc, _, err := applyPatches(nil, false, patches)
 	if err != nil {
 		return "", "", apiErr(422, "patch", "detail", err.Error())
 	}
@@ -64,7 +66,7 @@ func (s *Store) CreateNamespace(ctx context.Context, ns, author string, patches 
 	body := jsonv.Canonical(map[string]any{"kind": "config", "target": cfg.String()})
 	entryID := ids.Hash(nil, body)
 	now := s.now().UnixMilli()
-	entry := logRow{pos: 1, id: entryID.String(), kind: "config", body: string(body), author: author, created: now}
+	entry := logRow{pos: 1, id: entryID.String(), kind: "config", body: string(body), author: author, created: now, cfgPos: 1}
 	meta := &nsMeta{configPos: 1, configID: cfg.String()}
 
 	_, err = s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
@@ -94,9 +96,30 @@ func (s *Store) CreateNamespace(ctx context.Context, ns, author string, patches 
 	return cfg.String(), entryID.String(), nil
 }
 
+// WriteState is what the check phase read, handed to WriteResource's
+// check hook: the gate's view of the namespace and resource, re-read and
+// re-checked on every attempt of the retry loop (D.3's recheck shape).
+type WriteState struct {
+	Exists    bool // the namespace exists
+	Frozen    bool
+	Purged    bool
+	ConfigID  string
+	ResExists bool
+	HeadID    string
+	HeadDoc   any    // nil when the resource has no live head
+	Action    string // "create" or "append"
+	RevID     string // the revision the write will commit
+	Doc       any    // the resulting document (§6.4.1's envelope reads it)
+	DocCanon  []byte
+	Writes    []string // the patch set's write pointers
+}
+
 // WriteResource creates or appends to a resource (D.3's check-then-commit,
 // spike subset). ifMatch pins the parent's revision id ("" pins nothing).
-func (s *Store) WriteResource(ctx context.Context, ns, name, ifMatch string, patches any, author string) (*WriteResult, error) {
+// check, when set, runs the caller's gate on every attempt, after the
+// state read and the plan and before the commit; a non-nil error vetoes
+// the write. A replayed write is answered before check runs.
+func (s *Store) WriteResource(ctx context.Context, ns, name, ifMatch string, patches any, gesture, undoes, author string, check func(*WriteState) error) (*WriteResult, error) {
 	for attempt := 0; ; attempt++ {
 		// The check phase: reads outside any serialisation (D.3 steps
 		// 1–6). One batch read — the four keys are all known from the
@@ -106,19 +129,40 @@ func (s *Store) WriteResource(ctx context.Context, ns, name, ifMatch string, pat
 			return nil, err
 		}
 
-		p, aerr := planWrite(ns, name, m, t, head, headDoc, ifMatch, patches, author, s.now().UnixMilli(), applyPatches)
+		p, aerr := planWrite(ns, name, m, t, head, headDoc, ifMatch, patches, gesture, undoes, author, s.now().UnixMilli(), applyPatches)
 		if aerr != nil {
 			return nil, aerr
 		}
 		if p.replay {
-			return &WriteResult{Status: 200, ID: p.rev.id, NSID: p.entry.id, Replayed: true}, nil
+			created, _ := s.entryCreated(ctx, ns, p.entry.id)
+			return &WriteResult{Status: 200, ID: p.rev.id, NSID: p.entry.id, Created: created, Replayed: true}, nil
+		}
+		if check != nil {
+			st := &WriteState{
+				Exists: m != nil, ResExists: head != nil && head.headPos > 0, HeadDoc: headDoc,
+				RevID: p.rev.id, Doc: p.docAny, DocCanon: []byte(p.doc), Writes: p.writes,
+			}
+			if m != nil {
+				st.Frozen, st.Purged, st.ConfigID = m.frozen, m.purged, m.configID
+			}
+			if head != nil {
+				st.HeadID = head.headID
+			}
+			if p.create {
+				st.Action = "create"
+			} else {
+				st.Action = "append"
+			}
+			if err := check(st); err != nil {
+				return nil, err
+			}
 		}
 
 		_, err = s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
 			TransactItems: buildWriteTx(s.Table, ns, name, p),
 		})
 		if err == nil {
-			return &WriteResult{Status: 201, ID: p.rev.id, NSID: p.entry.id}, nil
+			return &WriteResult{Status: 201, ID: p.rev.id, NSID: p.entry.id, Created: p.entry.created}, nil
 		}
 		res, retry, cerr := s.mapCancel(ctx, ns, name, p, err)
 		if res != nil || cerr != nil {
@@ -140,6 +184,20 @@ func (s *Store) WriteResource(ctx context.Context, ns, name, ifMatch string, pat
 		case <-time.After(time.Duration(1<<attempt) * 5 * time.Millisecond):
 		}
 	}
+}
+
+// entryCreated is a committed entry's stored time, for replayed answers
+// (the plan's own time is the retry's, not the original write's).
+func (s *Store) entryCreated(ctx context.Context, ns, entryID string) (int64, error) {
+	mk, err := s.getItem(ctx, keyNSID(ns, entryID))
+	if err != nil || mk == nil {
+		return 0, err
+	}
+	le, err := s.getItem(ctx, keyLog(ns, item(mk).n("logPos")))
+	if err != nil || le == nil {
+		return 0, err
+	}
+	return int64(item(le).n("created")), nil
 }
 
 // mapCancel classifies a cancelled write transaction: a replayed result,
@@ -169,7 +227,8 @@ func (s *Store) mapCancel(ctx context.Context, ns, name string, p *writePlan, er
 		// ambiguous failure). Answer from the marker.
 		mk, gerr := s.getItem(ctx, keyNSID(ns, p.entry.id))
 		if gerr == nil && mk != nil {
-			return &WriteResult{Status: 200, ID: item(mk).s("revId"), NSID: p.entry.id, Replayed: true}, false, nil
+			created, _ := s.entryCreated(ctx, ns, p.entry.id)
+			return &WriteResult{Status: 200, ID: item(mk).s("revId"), NSID: p.entry.id, Created: created, Replayed: true}, false, nil
 		}
 		return nil, false, apiErr(409, "conflict")
 	case failed(actRes), failed(actRev):
@@ -269,27 +328,49 @@ type LogEntry map[string]any
 // ReadLog pages the namespace log (§7.1, spike shape): entries after
 // since ("" for the start), at most limit; next is the cursor for the
 // following page ("" at the end).
-func (s *Store) ReadLog(ctx context.Context, ns, since string, limit int) (entries []LogEntry, next string, err error) {
-	var from uint64
-	if since != "" {
-		mk, err := s.getItem(ctx, keyNSID(ns, since))
+// ReadLog serves the namespace log (§7.4): entries after since ("" from
+// the start) up to and including at ("" the tip), a page of at most limit
+// (0: all). Both ids resolve through their NSID markers; one that no
+// entry has is a 404.
+func (s *Store) ReadLog(ctx context.Context, ns, at, since string, limit int) (entries []LogEntry, next string, err error) {
+	var from, to uint64
+	resolve := func(id string) (uint64, *Error) {
+		mk, err := s.getItem(ctx, keyNSID(ns, id))
 		if err != nil {
-			return nil, "", err
+			return 0, apiErr(500, "internal", "message", err.Error())
 		}
 		if mk == nil {
+			return 0, apiErr(404, "not_found", "ns_id", id)
+		}
+		return item(mk).n("logPos"), nil
+	}
+	if since != "" {
+		var perr *Error
+		if from, perr = resolve(since); perr != nil {
+			return nil, "", perr
+		}
+	}
+	if at != "" {
+		var perr *Error
+		if to, perr = resolve(at); perr != nil {
+			return nil, "", perr
+		}
+		if from > to {
 			return nil, "", apiErr(404, "not_found", "ns_id", since)
 		}
-		from = item(mk).n("logPos")
 	}
 	// SK > LOG#from matches every sort key after it, including other
 	// entities' (RES# sorts after LOG#): the loop stops at the first
 	// non-LOG# item. One extra row decides whether a page follows.
-	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
+	in := &dynamodb.QueryInput{
 		TableName:                 &s.Table,
 		KeyConditionExpression:    strptr("PK = :pk AND SK > :lo"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(nsPK(ns)), ":lo": avS("LOG#" + padPos(from))},
-		Limit:                     int32ptr(int32(limit + 1)),
-	})
+	}
+	if limit > 0 {
+		in.Limit = int32ptr(int32(limit + 1))
+	}
+	q, err := s.Client.Query(ctx, in)
 	if err != nil {
 		return nil, "", err
 	}
@@ -300,6 +381,10 @@ func (s *Store) ReadLog(ctx context.Context, ns, since string, limit int) (entri
 		if !strings.HasPrefix(sk, "LOG#") {
 			break
 		}
+		pos := i.n("pos")
+		if to > 0 && pos > to {
+			break
+		}
 		if limit > 0 && len(entries) == limit {
 			next = entries[len(entries)-1]["id"].(string)
 			break
@@ -308,8 +393,13 @@ func (s *Store) ReadLog(ctx context.Context, ns, since string, limit int) (entri
 		e, _ := body.(map[string]any)
 		e["id"] = i.s("id")
 		e["author"] = i.s("author")
-		e["created"] = time.UnixMilli(int64(i.n("created"))).UTC().Format(time.RFC3339)
-		pos := i.n("pos")
+		e["created"] = FormatTime(int64(i.n("created")))
+		if g := i.s("gesture"); g != "" {
+			e["gesture"] = g
+		}
+		if u := i.s("undoes"); u != "" {
+			e["undoes"] = u
+		}
 		idsByPos[pos] = e["id"].(string)
 		if prev := i.n("prevPos"); prev > 0 {
 			if pid, ok := idsByPos[prev]; ok {
@@ -327,9 +417,13 @@ func (s *Store) ReadLog(ctx context.Context, ns, since string, limit int) (entri
 	return entries, next, nil
 }
 
-// HeadEntry is one resource of a /heads page: its name and head id.
+// HeadEntry is one resource of a /heads page: its name, head id and the
+// /heads metadata of §7.4 (the head revision's created, size, digest).
 type HeadEntry struct {
 	Name, ID string
+	Created  int64
+	Size     uint64
+	Digest   []byte
 }
 
 // ListHeads pages a namespace's resources in byte order of name (§7.4,
@@ -344,12 +438,15 @@ func (s *Store) ListHeads(ctx context.Context, ns, after string, limit int) ([]H
 		cond = "PK = :pk AND SK > :after"
 		vals = map[string]types.AttributeValue{":pk": avS(nsPK(ns)), ":after": avS("RES#" + after)}
 	}
-	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
+	in := &dynamodb.QueryInput{
 		TableName:                 &s.Table,
 		KeyConditionExpression:    &cond,
 		ExpressionAttributeValues: vals,
-		Limit:                     int32ptr(int32(limit + 1)),
-	})
+	}
+	if limit > 0 {
+		in.Limit = int32ptr(int32(limit + 1))
+	}
+	q, err := s.Client.Query(ctx, in)
 	if err != nil {
 		return nil, "", err
 	}
@@ -364,7 +461,10 @@ func (s *Store) ListHeads(ctx context.Context, ns, after string, limit int) ([]H
 			next = out[len(out)-1].Name
 			break
 		}
-		out = append(out, HeadEntry{Name: resName(i.s("SK")), ID: i.s("headId")})
+		out = append(out, HeadEntry{
+			Name: resName(i.s("SK")), ID: i.s("headId"),
+			Created: int64(i.n("headCreated")), Size: i.n("headSize"), Digest: i.b("headDigest"),
+		})
 	}
 	return out, next, nil
 }
@@ -425,14 +525,14 @@ func (s *Store) getHeadDoc(ctx context.Context, ns, name string) (any, error) {
 
 // applyPatches folds a JSON Patch set into a document with the production
 // engine (internal/patch), so head documents are the real thing, not a
-// stub.
-func applyPatches(doc any, exists bool, patches any) (any, error) {
+// stub. The writes are the patch set's write pointers (§6.4.1's envelope).
+func applyPatches(doc any, exists bool, patches any) (any, []string, error) {
 	ops, err := patch.Parse(patches)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	out, _, err := patch.Apply(doc, exists, ops, patch.Options{})
-	return out, err
+	out, writes, err := patch.Apply(doc, exists, ops, patch.Options{ResourceEnvelope: true, ShareLast: true})
+	return out, patch.WritesStrings(writes), err
 }
 
 func boolptr(b bool) *bool    { return &b }

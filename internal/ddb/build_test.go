@@ -19,7 +19,7 @@ var (
 
 func plan(t *testing.T, head *resRow, headDoc any, ifMatch string) (*writePlan, *Error) {
 	t.Helper()
-	return planWrite("demo", "doc1", testMeta, testTip, head, headDoc, ifMatch, testPatches, "alice", 1000, applyPatches)
+	return planWrite("demo", "doc1", testMeta, testTip, head, headDoc, ifMatch, testPatches, "", "", "alice", 1000, applyPatches)
 }
 
 func TestPlanWriteGenesis(t *testing.T) {
@@ -56,7 +56,7 @@ func TestPlanWriteAppend(t *testing.T) {
 	p0, _ := plan(t, nil, nil, "")
 	head := &resRow{headPos: 1, headID: p0.rev.id, entryID: p0.entry.id, state: "live"}
 	patches := jsonv.MustParse([]byte(`[{"op":"add","path":"/b","value":2}]`))
-	p, e := planWrite("demo", "doc1", testMeta, testTip, head, map[string]any{"a": float64(1)}, p0.rev.id, patches, "alice", 1001, applyPatches)
+	p, e := planWrite("demo", "doc1", testMeta, testTip, head, map[string]any{"a": float64(1)}, p0.rev.id, patches, "", "", "alice", 1001, applyPatches)
 	if e != nil {
 		t.Fatalf("planWrite: %v", e)
 	}
@@ -77,14 +77,14 @@ func TestPlanWriteReplay(t *testing.T) {
 	doc := map[string]any{"a": float64(1)}
 	// An append pins its parent with ifMatch, commits, and moves the head.
 	patches := jsonv.MustParse([]byte(`[{"op":"add","path":"/b","value":2}]`))
-	p1, e := planWrite("demo", "doc1", testMeta, testTip, &resRow{headPos: 1, headID: p0.rev.id, state: "live"}, doc, p0.rev.id, patches, "alice", 1001, applyPatches)
+	p1, e := planWrite("demo", "doc1", testMeta, testTip, &resRow{headPos: 1, headID: p0.rev.id, state: "live"}, doc, p0.rev.id, patches, "", "", "alice", 1001, applyPatches)
 	if e != nil {
 		t.Fatalf("first append: %v", e)
 	}
 	// Its retry names the same parent; the head is now the first
 	// attempt's own revision. Replay, not 412.
 	head2 := &resRow{headPos: 2, headID: p1.rev.id, entryID: p1.entry.id, state: "live"}
-	p, e := planWrite("demo", "doc1", testMeta, testTip, head2, map[string]any{"a": float64(1), "b": float64(2)}, p0.rev.id, patches, "alice", 1002, applyPatches)
+	p, e := planWrite("demo", "doc1", testMeta, testTip, head2, map[string]any{"a": float64(1), "b": float64(2)}, p0.rev.id, patches, "", "", "alice", 1002, applyPatches)
 	if e != nil {
 		t.Fatalf("planWrite: %v", e)
 	}
@@ -96,7 +96,7 @@ func TestPlanWriteReplay(t *testing.T) {
 	}
 	// But a retry whose patches differ is not its own write: 412.
 	other := jsonv.MustParse([]byte(`[{"op":"add","path":"/c","value":3}]`))
-	if _, e := planWrite("demo", "doc1", testMeta, testTip, head2, nil, p0.rev.id, other, "alice", 1003, applyPatches); e == nil || e.Status != 412 {
+	if _, e := planWrite("demo", "doc1", testMeta, testTip, head2, nil, p0.rev.id, other, "", "", "alice", 1003, applyPatches); e == nil || e.Status != 412 {
 		t.Fatalf("moved head with different patches: %v", e)
 	}
 }
@@ -115,13 +115,13 @@ func TestPlanWriteStale(t *testing.T) {
 }
 
 func TestPlanWriteNamespaceStates(t *testing.T) {
-	if _, e := planWrite("demo", "d", nil, testTip, nil, nil, "", testPatches, "a", 0, applyPatches); e == nil || e.Status != 404 {
+	if _, e := planWrite("demo", "d", nil, testTip, nil, nil, "", testPatches, "", "", "a", 0, applyPatches); e == nil || e.Status != 404 {
 		t.Fatalf("absent namespace: %v", e)
 	}
-	if _, e := planWrite("demo", "d", &nsMeta{purged: true}, testTip, nil, nil, "", testPatches, "a", 0, applyPatches); e == nil || e.Status != 410 {
+	if _, e := planWrite("demo", "d", &nsMeta{purged: true}, testTip, nil, nil, "", testPatches, "", "", "a", 0, applyPatches); e == nil || e.Status != 410 {
 		t.Fatalf("purged namespace: %v", e)
 	}
-	if _, e := planWrite("demo", "d", &nsMeta{frozen: true}, testTip, nil, nil, "", testPatches, "a", 0, applyPatches); e == nil || e.Status != 409 {
+	if _, e := planWrite("demo", "d", &nsMeta{frozen: true}, testTip, nil, nil, "", testPatches, "", "", "a", 0, applyPatches); e == nil || e.Status != 409 {
 		t.Fatalf("frozen namespace: %v", e)
 	}
 }
@@ -175,7 +175,7 @@ func TestBuildWriteTx(t *testing.T) {
 	}
 	// The append form conditions on the old head.
 	head := &resRow{headPos: 1, headID: p.rev.id, entryID: p.entry.id, state: "live"}
-	p2, _ := planWrite("demo", "doc1", testMeta, testTip, head, map[string]any{"a": float64(1)}, "", testPatches, "alice", 1001, applyPatches)
+	p2, _ := planWrite("demo", "doc1", testMeta, testTip, head, map[string]any{"a": float64(1)}, "", testPatches, "", "", "alice", 1001, applyPatches)
 	if p2.replay {
 		t.Fatal("unexpected replay")
 	}

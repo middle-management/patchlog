@@ -52,10 +52,18 @@ func newLocalStore(t testing.TB) *Store {
 		AttributeDefinitions: []types.AttributeDefinition{
 			{AttributeName: aws.String("PK"), AttributeType: types.ScalarAttributeTypeS},
 			{AttributeName: aws.String("SK"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("G1PK"), AttributeType: types.ScalarAttributeTypeS},
 		},
 		KeySchema: []types.KeySchemaElement{
 			{AttributeName: aws.String("PK"), KeyType: types.KeyTypeHash},
 			{AttributeName: aws.String("SK"), KeyType: types.KeyTypeRange},
+		},
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
+			{
+				IndexName:  aws.String(gsiName),
+				KeySchema:  []types.KeySchemaElement{{AttributeName: aws.String("G1PK"), KeyType: types.KeyTypeHash}},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
 		},
 		BillingMode: types.BillingModePayPerRequest,
 	}); err != nil {
@@ -88,7 +96,7 @@ func mustCreateNS(t *testing.T, s *Store, ns string) (cfgID, nsID string) {
 
 func mustWrite(t *testing.T, s *Store, ns, name, ifMatch, p string) *WriteResult {
 	t.Helper()
-	res, err := s.WriteResource(context.Background(), ns, name, ifMatch, patches(p), "alice")
+	res, err := s.WriteResource(context.Background(), ns, name, ifMatch, patches(p), "", "", "alice", nil)
 	if err != nil {
 		t.Fatalf("WriteResource %s/%s: %v", ns, name, err)
 	}
@@ -101,7 +109,7 @@ func TestLocalFlow(t *testing.T) {
 	cfgID, nsID := mustCreateNS(t, s, "demo")
 
 	// The log opens with the config genesis.
-	entries, next, err := s.ReadLog(ctx, "demo", "", 10)
+	entries, next, err := s.ReadLog(ctx, "demo", "", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +136,7 @@ func TestLocalFlow(t *testing.T) {
 	}
 
 	// The log: three entries, chained by id.
-	entries, _, err = s.ReadLog(ctx, "demo", "", 10)
+	entries, _, err = s.ReadLog(ctx, "demo", "", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +154,7 @@ func TestLocalFlow(t *testing.T) {
 	var all []LogEntry
 	since := ""
 	for {
-		page, n, err := s.ReadLog(ctx, "demo", since, 1)
+		page, n, err := s.ReadLog(ctx, "demo", "", since, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -188,13 +196,13 @@ func TestLocalStaleAndReplay(t *testing.T) {
 	// Two writes pin the same parent; the first commits.
 	w2 := mustWrite(t, s, "demo", "doc1", w1.ID, `[{"op":"add","path":"/b","value":2}]`)
 	// The second, with different patches, is stale: 412 naming the head.
-	_, err := s.WriteResource(context.Background(), "demo", "doc1", w1.ID, patches(`[{"op":"add","path":"/c","value":3}]`), "alice")
+	_, err := s.WriteResource(context.Background(), "demo", "doc1", w1.ID, patches(`[{"op":"add","path":"/c","value":3}]`), "", "", "alice", nil)
 	ae, ok := err.(*Error)
 	if !ok || ae.Status != 412 || ae.Body["head"] != w2.ID {
 		t.Fatalf("stale write: %v", err)
 	}
 	// The first's retry, however, replays: its revision is the head.
-	res, err := s.WriteResource(context.Background(), "demo", "doc1", w1.ID, patches(`[{"op":"add","path":"/b","value":2}]`), "alice")
+	res, err := s.WriteResource(context.Background(), "demo", "doc1", w1.ID, patches(`[{"op":"add","path":"/b","value":2}]`), "", "", "alice", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +210,7 @@ func TestLocalStaleAndReplay(t *testing.T) {
 		t.Fatalf("replay: %+v, want %+v", res, w2)
 	}
 	// And the log did not grow.
-	entries, _, err := s.ReadLog(context.Background(), "demo", "", 10)
+	entries, _, err := s.ReadLog(context.Background(), "demo", "", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +235,7 @@ func TestLocalConcurrentNamespace(t *testing.T) {
 			defer wg.Done()
 			name := fmt.Sprintf("doc%d", i)
 			res, err := s.WriteResource(context.Background(), "demo", name, "",
-				patches(fmt.Sprintf(`[{"op":"add","path":"","value":{"w":%d}}]`, i)), "alice")
+				patches(fmt.Sprintf(`[{"op":"add","path":"","value":{"w":%d}}]`, i)), "", "", "alice", nil)
 			if err == nil {
 				ids[i] = res.NSID
 			}
@@ -241,7 +249,7 @@ func TestLocalConcurrentNamespace(t *testing.T) {
 		}
 	}
 	// Every entry committed: positions 2..writers+1, contiguous, unique ids.
-	entries, _, err := s.ReadLog(context.Background(), "demo", "", 100)
+	entries, _, err := s.ReadLog(context.Background(), "demo", "", "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +285,7 @@ func TestLocalConcurrentResource(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			res, err := s.WriteResource(context.Background(), "demo", "doc1", w1.ID,
-				patches(fmt.Sprintf(`[{"op":"add","path":"/w%d","value":true}]`, i)), "alice")
+				patches(fmt.Sprintf(`[{"op":"add","path":"/w%d","value":true}]`, i)), "", "", "alice", nil)
 			results[i], errs[i] = res, err
 		}()
 	}

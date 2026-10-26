@@ -39,6 +39,13 @@ func (it item) n(attr string) uint64 {
 	return 0
 }
 
+func (it item) b(attr string) []byte {
+	if v, ok := it[attr].(*types.AttributeValueMemberB); ok {
+		return v.Value
+	}
+	return nil
+}
+
 func (it item) has(attr string) bool { _, ok := it[attr]; return ok }
 
 // nsMeta is the #META item: the namespace's configuration state.
@@ -85,12 +92,16 @@ func scanTip(it item) *tip { return &tip{headPos: it.n("headPos"), headID: it.s(
 
 // resRow is the RES# item: a resource's head pointer and state. entryID is
 // the namespace log entry that moved the head here, so a retried write
-// (replay) can answer with its entry id without a scan.
+// (replay) can answer with its entry id without a scan. headCreated,
+// headSize and headDigest are the head revision's /heads metadata (§7.4).
 type resRow struct {
-	headPos uint64 // 0: no live revision
-	headID  string
-	entryID string
-	state   string // "live"; tombstone/purge are out of the spike's scope
+	headPos     uint64 // 0: no live revision
+	headID      string
+	entryID     string
+	state       string // "live"; tombstone/purge are out of the spike's scope
+	headCreated int64
+	headSize    uint64
+	headDigest  []byte
 }
 
 func (r *resRow) item() item {
@@ -98,10 +109,15 @@ func (r *resRow) item() item {
 }
 
 func scanRes(it item) *resRow {
-	return &resRow{headPos: it.n("headPos"), headID: it.s("headId"), entryID: it.s("entryId"), state: it.s("state")}
+	return &resRow{
+		headPos: it.n("headPos"), headID: it.s("headId"), entryID: it.s("entryId"), state: it.s("state"),
+		headCreated: int64(it.n("headCreated")), headSize: it.n("headSize"), headDigest: it.b("headDigest"),
+	}
 }
 
-// revRow is the REV# item: one revision of a resource's chain.
+// revRow is the REV# item: one revision of a resource's chain. size and
+// digest are the canonical document's length and sha-256 as of this
+// revision (headMeta, §7.1); G1PK is the GSI1 key for revision-by-id.
 type revRow struct {
 	pos      uint64
 	id       string
@@ -109,6 +125,10 @@ type revRow struct {
 	patches  string // canonical JSON of the patch set
 	author   string
 	created  int64
+	size     uint64
+	digest   []byte
+	gesture  string
+	undoes   string
 }
 
 func (r *revRow) item() item {
@@ -118,14 +138,27 @@ func (r *revRow) item() item {
 		"patches": avS(r.patches),
 		"author":  avS(r.author),
 		"created": avI(r.created),
+		"size":    avN(r.size),
+		"digest":  avB(r.digest),
+		"G1PK":    avS(g1RevID(r.id)),
 	}
 	if r.parentID != "" {
 		it["parentId"] = avS(r.parentID)
 	}
+	if r.gesture != "" {
+		it["gesture"] = avS(r.gesture)
+	}
+	if r.undoes != "" {
+		it["undoes"] = avS(r.undoes)
+	}
 	return it
 }
 
-// logRow is the LOG# item: one namespace log entry.
+// logRow is the LOG# item: one namespace log entry. gesture and undoes
+// are the unhashed gesture members (§7.4), merged into the entry when it
+// is served, like the SQL schema's gestures column. cfgPos is the
+// configuration in force at the entry, denormalized like ns_log's
+// config_seq: NamespaceRev joins on it.
 type logRow struct {
 	pos     uint64
 	id      string
@@ -134,6 +167,9 @@ type logRow struct {
 	body    string // canonical JSON of the hashed entry members (§3.5)
 	author  string
 	created int64
+	gesture string
+	undoes  string
+	cfgPos  uint64
 }
 
 func (l *logRow) item() item {
@@ -144,9 +180,16 @@ func (l *logRow) item() item {
 		"body":    avS(l.body),
 		"author":  avS(l.author),
 		"created": avI(l.created),
+		"cfgPos":  avN(l.cfgPos),
 	}
 	if l.prevPos > 0 {
 		it["prevPos"] = avN(l.prevPos)
+	}
+	if l.gesture != "" {
+		it["gesture"] = avS(l.gesture)
+	}
+	if l.undoes != "" {
+		it["undoes"] = avS(l.undoes)
 	}
 	return it
 }

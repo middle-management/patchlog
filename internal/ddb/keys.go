@@ -59,5 +59,14 @@ func keyHist(ns, name string, logPos uint64) Key {
 // UNIQUE(ns, id) in the SQL schema.
 func keyNSID(ns, entryID string) Key { return Key{"NSID#" + ns + "#" + entryID, "#"} }
 
+// gsiName is the table's one GSI (docs/DYNAMODB.md §3, GSI1): global id
+// lookups, sparse. Revision items project G1PK = REVID#<id>; ids are
+// unique per resource, not globally (genesis twins share one), so answers
+// are filtered by namespace.
+const gsiName = "GSI1"
+
+// g1RevID is a revision's GSI1 partition key.
+func g1RevID(id string) string { return "REVID#" + id }
+
 // resName is the resource name of a RES# sort key.
 func resName(sk string) string { return strings.TrimPrefix(sk, "RES#") }
