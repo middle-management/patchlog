@@ -1,0 +1,439 @@
+package ddb
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/patch"
+)
+
+// API is the DynamoDB surface the spike uses. *dynamodb.Client satisfies
+// it; tests may fake it.
+type API interface {
+	GetItem(ctx context.Context, in *dynamodb.GetItemInput, opt ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
+	BatchGetItem(ctx context.Context, in *dynamodb.BatchGetItemInput, opt ...func(*dynamodb.Options)) (*dynamodb.BatchGetItemOutput, error)
+	Query(ctx context.Context, in *dynamodb.QueryInput, opt ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
+	TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, opt ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
+}
+
+// Store is the spike's storage backend: one DynamoDB table, the key design
+// of keys.go.
+type Store struct {
+	Client API
+	Table  string
+	Now    func() time.Time // nil: time.Now
+}
+
+// maxWriteAttempts bounds the tip-conflict retry loop (the SQL backends'
+// constant of the same name).
+const maxWriteAttempts = 8
+
+func (s *Store) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
+}
+
+// WriteResult is a committed (or replayed) write, shaped after
+// internal/core's: the revision and the namespace log entry.
+type WriteResult struct {
+	Status   int    // 201 committed, 200 replayed
+	ID       string // revision id
+	NSID     string // namespace log entry id
+	Replayed bool
+}
+
+// CreateNamespace bootstraps a namespace with its config genesis and first
+// log entry (insertNamespace of nsops.go). patches is the decoded JSON
+// Patch set producing the namespace document.
+func (s *Store) CreateNamespace(ctx context.Context, ns, author string, patches any) (cfgID, nsID string, err error) {
+	doc, err := applyPatches(nil, false, patches)
+	if err != nil {
+		return "", "", apiErr(422, "patch", "detail", err.Error())
+	}
+	canon := jsonv.Canonical(patches)
+	cfg := ids.Revision(nil, canon)
+	body := jsonv.Canonical(map[string]any{"kind": "config", "target": cfg.String()})
+	entryID := ids.Hash(nil, body)
+	now := s.now().UnixMilli()
+	entry := logRow{pos: 1, id: entryID.String(), kind: "config", body: string(body), author: author, created: now}
+	meta := &nsMeta{configPos: 1, configID: cfg.String()}
+
+	_, err = s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		// buildCreateTx's action order: 0 #META, 1 CFG, 2 LOG, 3 #TIP, 4 NSID.
+		TransactItems: buildCreateTx(s.Table, ns, meta, cfg.String(), string(canon), string(jsonv.Canonical(doc)), entry),
+	})
+	if err != nil {
+		var ce *types.TransactionCanceledException
+		if errors.As(err, &ce) && len(ce.CancellationReasons) > 0 {
+			// A retried create finds its own marker (the marker's id
+			// covers the config id, so it is this very request); an
+			// existing namespace answers 412 with its config id
+			// (writeConfig's IfNoneMatch path).
+			if ce.CancellationReasons[4].Code != nil && *ce.CancellationReasons[4].Code == "ConditionalCheckFailed" {
+				return cfg.String(), entryID.String(), nil
+			}
+			if ce.CancellationReasons[0].Code != nil && *ce.CancellationReasons[0].Code == "ConditionalCheckFailed" {
+				cur, gerr := s.getMeta(ctx, ns)
+				if gerr == nil && cur != nil {
+					return "", "", apiErr(412, "stale", "config", cur.configID)
+				}
+				return "", "", apiErr(412, "stale")
+			}
+		}
+		return "", "", err
+	}
+	return cfg.String(), entryID.String(), nil
+}
+
+// WriteResource creates or appends to a resource (D.3's check-then-commit,
+// spike subset). ifMatch pins the parent's revision id ("" pins nothing).
+func (s *Store) WriteResource(ctx context.Context, ns, name, ifMatch string, patches any, author string) (*WriteResult, error) {
+	for attempt := 0; ; attempt++ {
+		// The check phase: reads outside any serialisation (D.3 steps
+		// 1–6). One batch read — the four keys are all known from the
+		// request — then one transaction: two round trips a write.
+		m, t, head, headDoc, err := s.readWriteState(ctx, ns, name)
+		if err != nil {
+			return nil, err
+		}
+
+		p, aerr := planWrite(ns, name, m, t, head, headDoc, ifMatch, patches, author, s.now().UnixMilli(), applyPatches)
+		if aerr != nil {
+			return nil, aerr
+		}
+		if p.replay {
+			return &WriteResult{Status: 200, ID: p.rev.id, NSID: p.entry.id, Replayed: true}, nil
+		}
+
+		_, err = s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: buildWriteTx(s.Table, ns, name, p),
+		})
+		if err == nil {
+			return &WriteResult{Status: 201, ID: p.rev.id, NSID: p.entry.id}, nil
+		}
+		res, retry, cerr := s.mapCancel(ctx, ns, name, p, err)
+		if res != nil || cerr != nil {
+			return res, cerr
+		}
+		if !retry {
+			return nil, err
+		}
+		if attempt+1 >= maxWriteAttempts {
+			return nil, apiErr(409, "conflict", "detail", "log tip contention")
+		}
+		// Another write appended an entry between the check and the
+		// commit: re-read the tip, recompute the entry id over it, and
+		// try again. The revision id is unaffected (its parent is the
+		// resource's head). A short backoff keeps racers off each other.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(1<<attempt) * 5 * time.Millisecond):
+		}
+	}
+}
+
+// mapCancel classifies a cancelled write transaction: a replayed result,
+// or retry (the log tip moved; the loop rebuilds the plan), or the error
+// to answer with.
+func (s *Store) mapCancel(ctx context.Context, ns, name string, p *writePlan, err error) (res *WriteResult, retry bool, retErr error) {
+	// A concurrent transaction touching the same items (the #TIP of a hot
+	// namespace, say): DynamoDB rejects it outright; the retry loop is
+	// the answer, as for a cancelled tip condition.
+	var xe *types.TransactionConflictException
+	if errors.As(err, &xe) {
+		return nil, true, nil
+	}
+	var ce *types.TransactionCanceledException
+	if !errors.As(err, &ce) {
+		// A throughput or other error that is not a conditional failure:
+		// retrying is the caller's choice; surface it raw.
+		return nil, false, err
+	}
+	reasons := ce.CancellationReasons
+	failed := func(i int) bool {
+		return i < len(reasons) && reasons[i].Code != nil && *reasons[i].Code == "ConditionalCheckFailed"
+	}
+	switch {
+	case failed(actNSID):
+		// The entry exists: this very write committed (a retry after an
+		// ambiguous failure). Answer from the marker.
+		mk, gerr := s.getItem(ctx, keyNSID(ns, p.entry.id))
+		if gerr == nil && mk != nil {
+			return &WriteResult{Status: 200, ID: item(mk).s("revId"), NSID: p.entry.id, Replayed: true}, false, nil
+		}
+		return nil, false, apiErr(409, "conflict")
+	case failed(actRes), failed(actRev):
+		// The resource's head moved since the check (D.3's conflict,
+		// isConflict): answer 412 with the current head.
+		cur, gerr := s.getRes(ctx, ns, name)
+		if gerr == nil && cur != nil {
+			return nil, false, apiErr(412, "stale", "head", cur.headID)
+		}
+		return nil, false, apiErr(412, "stale", "head", "")
+	case failed(actTip):
+		return nil, true, nil
+	default:
+		return nil, false, err
+	}
+}
+
+// readWriteState is the check phase's batch read: #META, #TIP, RES# and
+// the head document, in one request. The head document is keyed only by
+// (ns, name), so it can ride along speculatively; a resource that does not
+// exist simply has no such item.
+func (s *Store) readWriteState(ctx context.Context, ns, name string) (m *nsMeta, t *tip, head *resRow, headDoc any, err error) {
+	keys := []map[string]types.AttributeValue{
+		keyAV(keyMeta(ns)), keyAV(keyTip(ns)), keyAV(keyRes(ns, name)), keyAV(keyDocHead(ns, name)),
+	}
+	out, err := s.Client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
+		RequestItems: map[string]types.KeysAndAttributes{
+			s.Table: {Keys: keys, ConsistentRead: boolptr(true)},
+		},
+	})
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if len(out.UnprocessedKeys) > 0 {
+		return nil, nil, nil, nil, apiErr(503, "throughput", "detail", "unprocessed keys")
+	}
+	for _, it := range out.Responses[s.Table] {
+		i := item(it)
+		switch i.s("PK") + "/" + i.s("SK") {
+		case nsPK(ns) + "/#META":
+			m = scanNSMeta(i)
+		case nsPK(ns) + "/#TIP":
+			t = scanTip(i)
+		case nsPK(ns) + "/RES#" + name:
+			head = scanRes(i)
+		case nsPK(ns) + "/DOC#" + name + "#HEAD":
+			headDoc, err = jsonv.Parse([]byte(i.s("doc")))
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+		}
+	}
+	return m, t, head, headDoc, nil
+}
+
+// ReadHead serves a resource's current document and head id (GET
+// /r/{ns}/{name}, spike shape): one batch read of the resource and its
+// head document. Not a snapshot (docs/DYNAMODB.md §5), which is benign
+// here — the head document is immutable per revision.
+func (s *Store) ReadHead(ctx context.Context, ns, name string) (doc any, headID string, err error) {
+	out, err := s.Client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
+		RequestItems: map[string]types.KeysAndAttributes{
+			s.Table: {Keys: []map[string]types.AttributeValue{keyAV(keyRes(ns, name)), keyAV(keyDocHead(ns, name))}, ConsistentRead: boolptr(true)},
+		},
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	for _, it := range out.Responses[s.Table] {
+		i := item(it)
+		switch {
+		case i.s("SK") == "RES#"+name:
+			headID = i.s("headId")
+			if i.n("headPos") == 0 {
+				headID = ""
+			}
+		case i.s("SK") == "DOC#"+name+"#HEAD":
+			doc, err = jsonv.Parse([]byte(i.s("doc")))
+			if err != nil {
+				return nil, "", err
+			}
+		}
+	}
+	if headID == "" {
+		return nil, "", apiErr(404, "not_found", "namespace", ns, "resource", name)
+	}
+	if doc == nil {
+		return nil, "", apiErr(409, "conflict", "detail", "head document missing")
+	}
+	return doc, headID, nil
+}
+
+// LogEntry is a served namespace log entry (namespaceLog of reads.go):
+// the hashed body merged with id, prev, author and created.
+type LogEntry map[string]any
+
+// ReadLog pages the namespace log (§7.1, spike shape): entries after
+// since ("" for the start), at most limit; next is the cursor for the
+// following page ("" at the end).
+func (s *Store) ReadLog(ctx context.Context, ns, since string, limit int) (entries []LogEntry, next string, err error) {
+	var from uint64
+	if since != "" {
+		mk, err := s.getItem(ctx, keyNSID(ns, since))
+		if err != nil {
+			return nil, "", err
+		}
+		if mk == nil {
+			return nil, "", apiErr(404, "not_found", "ns_id", since)
+		}
+		from = item(mk).n("logPos")
+	}
+	// SK > LOG#from matches every sort key after it, including other
+	// entities' (RES# sorts after LOG#): the loop stops at the first
+	// non-LOG# item. One extra row decides whether a page follows.
+	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
+		TableName:                 &s.Table,
+		KeyConditionExpression:    strptr("PK = :pk AND SK > :lo"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(nsPK(ns)), ":lo": avS("LOG#" + padPos(from))},
+		Limit:                     int32ptr(int32(limit + 1)),
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	idsByPos := map[uint64]string{}
+	for _, it := range q.Items {
+		i := item(it)
+		sk := i.s("SK")
+		if !strings.HasPrefix(sk, "LOG#") {
+			break
+		}
+		if limit > 0 && len(entries) == limit {
+			next = entries[len(entries)-1]["id"].(string)
+			break
+		}
+		body, _ := jsonv.Parse([]byte(i.s("body")))
+		e, _ := body.(map[string]any)
+		e["id"] = i.s("id")
+		e["author"] = i.s("author")
+		e["created"] = time.UnixMilli(int64(i.n("created"))).UTC().Format(time.RFC3339)
+		pos := i.n("pos")
+		idsByPos[pos] = e["id"].(string)
+		if prev := i.n("prevPos"); prev > 0 {
+			if pid, ok := idsByPos[prev]; ok {
+				e["prev"] = pid
+			} else {
+				pv, err := s.getItem(ctx, keyLog(ns, prev))
+				if err != nil {
+					return nil, "", err
+				}
+				e["prev"] = item(pv).s("id")
+			}
+		}
+		entries = append(entries, e)
+	}
+	return entries, next, nil
+}
+
+// HeadEntry is one resource of a /heads page: its name and head id.
+type HeadEntry struct {
+	Name, ID string
+}
+
+// ListHeads pages a namespace's resources in byte order of name (§7.4,
+// spike shape). DynamoDB allows one sort-key condition per query: the
+// first page uses begins_with(RES#); later pages use SK > the cursor,
+// which can run past RES# into REV# — the loop stops at the prefix
+// boundary, as ReadLog's does.
+func (s *Store) ListHeads(ctx context.Context, ns, after string, limit int) ([]HeadEntry, string, error) {
+	cond := "PK = :pk AND begins_with(SK, :pfx)"
+	vals := map[string]types.AttributeValue{":pk": avS(nsPK(ns)), ":pfx": avS("RES#")}
+	if after != "" {
+		cond = "PK = :pk AND SK > :after"
+		vals = map[string]types.AttributeValue{":pk": avS(nsPK(ns)), ":after": avS("RES#" + after)}
+	}
+	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
+		TableName:                 &s.Table,
+		KeyConditionExpression:    &cond,
+		ExpressionAttributeValues: vals,
+		Limit:                     int32ptr(int32(limit + 1)),
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	var out []HeadEntry
+	var next string
+	for _, it := range q.Items {
+		i := item(it)
+		if !strings.HasPrefix(i.s("SK"), "RES#") {
+			break
+		}
+		if limit > 0 && len(out) == limit {
+			next = out[len(out)-1].Name
+			break
+		}
+		out = append(out, HeadEntry{Name: resName(i.s("SK")), ID: i.s("headId")})
+	}
+	return out, next, nil
+}
+
+// --- point reads ---
+
+func (s *Store) getItem(ctx context.Context, k Key) (map[string]types.AttributeValue, error) {
+	out, err := s.Client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      &s.Table,
+		Key:            keyAV(k),
+		ConsistentRead: boolptr(true),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(out.Item) == 0 {
+		return nil, nil
+	}
+	return out.Item, nil
+}
+
+func (s *Store) getMeta(ctx context.Context, ns string) (*nsMeta, error) {
+	it, err := s.getItem(ctx, keyMeta(ns))
+	if it == nil || err != nil {
+		return nil, err
+	}
+	return scanNSMeta(item(it)), nil
+}
+
+func (s *Store) getTip(ctx context.Context, ns string) (*tip, error) {
+	it, err := s.getItem(ctx, keyTip(ns))
+	if it == nil || err != nil {
+		return nil, err
+	}
+	return scanTip(item(it)), nil
+}
+
+func (s *Store) getRes(ctx context.Context, ns, name string) (*resRow, error) {
+	it, err := s.getItem(ctx, keyRes(ns, name))
+	if it == nil || err != nil {
+		return nil, err
+	}
+	return scanRes(item(it)), nil
+}
+
+func (s *Store) getHeadDoc(ctx context.Context, ns, name string) (any, error) {
+	it, err := s.getItem(ctx, keyDocHead(ns, name))
+	if err != nil {
+		return nil, err
+	}
+	if it == nil {
+		// RES said there is a head but the document is gone: the §5
+		// race, or corruption. Treat as lost race.
+		return nil, apiErr(409, "conflict", "detail", "head document missing")
+	}
+	return jsonv.Parse([]byte(item(it).s("doc")))
+}
+
+// applyPatches folds a JSON Patch set into a document with the production
+// engine (internal/patch), so head documents are the real thing, not a
+// stub.
+func applyPatches(doc any, exists bool, patches any) (any, error) {
+	ops, err := patch.Parse(patches)
+	if err != nil {
+		return nil, err
+	}
+	out, _, err := patch.Apply(doc, exists, ops, patch.Options{})
+	return out, err
+}
+
+func boolptr(b bool) *bool    { return &b }
+func int32ptr(n int32) *int32 { return &n }
