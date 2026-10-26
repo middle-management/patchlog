@@ -319,7 +319,7 @@ func (e *Engine) WriteResource(ctx context.Context, req Request, item Item) (*Wr
 // Batch performs an atomic batch (§7.5).
 func (e *Engine) Batch(ctx context.Context, req Request, items []Item, cfg *ConfigChange, source any, dryRun bool) (*WriteResult, error) {
 	if e.ddb != nil {
-		return nil, ddbUnsupported("batches")
+		return e.ddbBatch(ctx, req, items, cfg, source, dryRun)
 	}
 	if dryRun {
 		// A dry run writes nothing: steps 1–6 in a read transaction.
@@ -369,6 +369,9 @@ func (t *tx) batchLimits(cfg *Config, a *actor) (items, size int) {
 // which reveals nothing about any item (§7.5). The batch itself
 // authenticates again.
 func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (bound, batchSize int, err error) {
+	if e.ddb != nil {
+		return e.ddbBatchBodyLimit(ctx, req)
+	}
 	err = e.read(ctx, func(t *tx) error {
 		n := t.nsByName(req.NS)
 		if n == nil {

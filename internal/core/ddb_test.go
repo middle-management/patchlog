@@ -271,9 +271,7 @@ func TestDDBUnsupported(t *testing.T) {
 			t.Fatalf("%s: want 501, got %d", what, ae.Status)
 		}
 	}
-	_, err := e.Batch(ctx, Request{NS: "demo"}, []Item{{Resource: "d", Steps: []Step{{Patches: patches(t, `[]`)}}}}, nil, nil, false)
-	check("batch", err)
-	_, err = e.CreateBranch(ctx, Request{NS: "demo"}, BranchRequest{})
+	_, err := e.CreateBranch(ctx, Request{NS: "demo"}, BranchRequest{})
 	check("branch", err)
 	_, err = e.Gestures(ctx, "demo", "g1", "", Credentials{})
 	check("gestures", err)
@@ -435,4 +433,130 @@ func TestDDBDeleteRule(t *testing.T) {
 	_, err := e.WriteResource(ctx, Request{NS: "ruled"},
 		Item{Resource: "doc1", IfMatch: w.Items[0].IDs[0], Steps: []Step{{Delete: true}}})
 	assertStatus(t, err, 422, "rule")
+}
+
+func TestDDBBatch(t *testing.T) {
+	e := ddbEngine(t)
+	ctx := context.Background()
+	ddbCreateNS(t, e, "demo", `{"read":"public"}`)
+	w1 := ddbWrite(t, e, "demo", "doc1", "", `[{"op":"add","path":"","value":{"a":1}}]`)
+	w2 := ddbWrite(t, e, "demo", "doc2", "", `[{"op":"add","path":"","value":{"b":1}}]`)
+	head1, head2 := w1.Items[0].IDs[0], w2.Items[0].IDs[0]
+
+	items := []Item{
+		{Resource: "doc1", IfMatch: head1, Steps: []Step{{Patches: patches(t, `[{"op":"add","path":"/c","value":3}]`)}}},
+		{Resource: "doc2", IfMatch: head2, Steps: []Step{{Delete: true}}},
+		{Resource: "doc3", IfNoneMatch: true, Steps: []Step{{Patches: patches(t, `[{"op":"add","path":"","value":{"d":1}}]`)}}},
+	}
+	res, err := e.Batch(ctx, Request{NS: "demo"}, items, nil, nil, false)
+	if err != nil || res.Status != 201 || len(res.Items) != 3 || res.NSID == "" {
+		t.Fatalf("batch: %+v %v", res, err)
+	}
+	// Items answer in request order, one id each.
+	if res.Items[0].Resource != "doc1" || len(res.Items[0].IDs) != 1 {
+		t.Fatalf("batch items: %+v", res.Items)
+	}
+
+	h1, _ := e.ResourceHead(ctx, "demo", "doc1", Credentials{})
+	h2, _ := e.ResourceHead(ctx, "demo", "doc2", Credentials{})
+	h3, _ := e.ResourceHead(ctx, "demo", "doc3", Credentials{})
+	if h1.State != Live || h1.Head != res.Items[0].IDs[0] || h2.State != Tombstoned || h3.State != Live {
+		t.Fatalf("heads: %+v %+v %+v", h1, h2, h3)
+	}
+
+	// One batch entry in the namespace log, naming every target.
+	nl, err := e.NamespaceLog(ctx, "demo", "", "", 0, Credentials{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	le := nl.Entries[len(nl.Entries)-1]
+	if le["kind"] != "batch" || le["id"] != res.NSID {
+		t.Fatalf("batch entry: %v", le)
+	}
+	ents, _ := le["entries"].([]any)
+	if len(ents) != 3 {
+		t.Fatalf("entries: %v", le)
+	}
+
+	// Replay: the whole batch answers 200 with the same ids.
+	rep, err := e.Batch(ctx, Request{NS: "demo"}, items, nil, nil, false)
+	if err != nil || rep.Status != 200 || !rep.Replayed || rep.Items[0].IDs[0] != res.Items[0].IDs[0] {
+		t.Fatalf("replay: %+v %v", rep, err)
+	}
+
+	// A stale item: the §7.5 failure body, per item, and no commit.
+	_, err = e.Batch(ctx, Request{NS: "demo"}, []Item{
+		{Resource: "doc1", IfMatch: head1, Steps: []Step{{Patches: patches(t, `[{"op":"add","path":"/x","value":9}]`)}}},
+		{Resource: "doc3", IfMatch: res.Items[2].IDs[0], Steps: []Step{{Patches: patches(t, `[{"op":"add","path":"/e","value":5}]`)}}},
+	}, nil, nil, false)
+	ae := mustErr(t, err)
+	if ae.Status != 412 || ae.Code() != "batch" {
+		t.Fatalf("stale batch: %d %v", ae.Status, ae.Body)
+	}
+	fis, _ := ae.Body["items"].([]any)
+	if len(fis) != 1 {
+		t.Fatalf("failure items: %v", ae.Body)
+	}
+	fi, _ := fis[0].(map[string]any)
+	if fi["index"] != 0 || fi["status"] != 412 || fi["code"] != "stale" {
+		t.Fatalf("failure item: %v", fi)
+	}
+	h1b, _ := e.ResourceHead(ctx, "demo", "doc1", Credentials{})
+	if h1b.Head != res.Items[0].IDs[0] {
+		t.Fatalf("doc1 moved in a refused batch: %+v", h1b)
+	}
+
+	// A dry run answers computed ids, commits nothing.
+	dry, err := e.Batch(ctx, Request{NS: "demo"}, []Item{
+		{Resource: "doc1", IfMatch: res.Items[0].IDs[0], Steps: []Step{{Patches: patches(t, `[{"op":"add","path":"/dry","value":1}]`)}}},
+	}, nil, nil, true)
+	if err != nil || dry.Status != 200 || dry.Items[0].IDs[0] == "" {
+		t.Fatalf("dry run: %+v %v", dry, err)
+	}
+	h1c, _ := e.ResourceHead(ctx, "demo", "doc1", Credentials{})
+	if h1c.Head != res.Items[0].IDs[0] {
+		t.Fatalf("dry run committed: %+v", h1c)
+	}
+
+	// A config change rides the batch; its items are gated under the new
+	// configuration (a freeze doesn't stop its own batch).
+	cc := &ConfigChange{Patches: patches(t, `[{"op":"add","path":"/frozen","value":true}]`)}
+	rc, err := e.Batch(ctx, Request{NS: "demo"}, []Item{
+		{Resource: "doc1", IfMatch: res.Items[0].IDs[0], Steps: []Step{{Patches: patches(t, `[{"op":"add","path":"/c2","value":4}]`)}}},
+	}, cc, nil, false)
+	if err != nil || rc.ConfigID == "" {
+		t.Fatalf("config batch: %+v %v", rc, err)
+	}
+	info, err := e.NamespaceHead(ctx, "demo", Credentials{})
+	if err != nil || info.Config != rc.ConfigID {
+		t.Fatalf("config after batch: %+v %v", info, err)
+	}
+	// Frozen now: further writes are 409.
+	_, err = e.WriteResource(ctx, Request{NS: "demo"}, Item{Resource: "doc3", Steps: []Step{{Patches: patches(t, `[{"op":"add","path":"/z","value":1}]`)}}})
+	assertStatus(t, err, 409, "frozen")
+
+	// The action budget: 30 items exceed the 100-action transaction.
+	big := make([]Item, 30)
+	for i := range big {
+		big[i] = Item{Resource: fmt.Sprintf("big%d", i), Steps: []Step{{Patches: patches(t, `[{"op":"add","path":"","value":1}]`)}}}
+	}
+	_, err = e.Batch(ctx, Request{NS: "demo"}, big, nil, nil, false)
+	assertStatus(t, err, 413, "limit")
+
+	// Sources and multi-step items are still out of scope.
+	_, err = e.Batch(ctx, Request{NS: "demo"}, items[:1], nil, map[string]any{"ns": "x"}, false)
+	check501(t, "source", err)
+	_, err = e.Batch(ctx, Request{NS: "demo"}, []Item{{Resource: "doc1", Steps: []Step{
+		{Patches: patches(t, `[{"op":"add","path":"/a","value":1}]`)},
+		{Patches: patches(t, `[{"op":"add","path":"/b","value":2}]`)},
+	}}}, nil, nil, false)
+	check501(t, "multi-step", err)
+}
+
+func check501(t *testing.T, what string, err error) {
+	t.Helper()
+	ae := mustErr(t, err)
+	if ae.Status != 501 || ae.Code() != "unsupported" {
+		t.Fatalf("%s: want 501 unsupported, got %d %v", what, ae.Status, ae.Body)
+	}
 }

@@ -9,12 +9,13 @@ package core
 // cover answers 501 rather than falling through to SQL.
 //
 // Deliberate gaps, all surfaced as 501 "unsupported": grants and private
-// reads (writes require -dev), batches and multi-step items, branches,
-// purges and pruning, blobs, sealed and e2e namespaces, $schema
-// validation, nonce-required namespaces, gestures listing, SSE events,
-// author signatures, rate limiting, head snapshots (revisions fold from
-// the genesis). Tombstones and restores work (§8.1): DELETE with
-// If-Match, replay, the 410 serving paths, and the restore verb.
+// reads (writes require -dev), multi-step items, branches, purges and
+// pruning, blobs (batch sources with them), sealed and e2e namespaces,
+// $schema validation, nonce-required namespaces, gestures listing, SSE
+// events, author signatures, rate limiting, head snapshots (revisions
+// fold from the genesis). Tombstones and restores work (§8.1), and
+// batches (§7.5): single-step items, per-item failures, dry runs, an
+// optional config change, bounded by the transaction's 100 actions.
 
 import (
 	"context"
@@ -169,6 +170,13 @@ func (e *Engine) ddbGate(ns, name string, patches any, st *ddb.WriteState) *Erro
 	if perr != nil {
 		return perr
 	}
+	return ddbGateCfg(cfg, ns, name, patches, st, e.opt.Now().UnixMilli())
+}
+
+// ddbGateCfg is ddbGate with the configuration already loaded: a batch's
+// items are gated under its config change's result (§7.5), not the one
+// in force when the batch started.
+func ddbGateCfg(cfg *Config, ns, name string, patches any, st *ddb.WriteState, nowMs int64) *Error {
 	if err := ddbRefusals(cfg); err != nil {
 		return err
 	}
@@ -198,7 +206,7 @@ func (e *Engine) ddbGate(ns, name string, patches any, st *ddb.WriteState) *Erro
 	// (stepEnvelope).
 	env := map[string]any{
 		"action":    st.Action,
-		"now":       formatTime(e.opt.Now().UnixMilli()),
+		"now":       formatTime(nowMs),
 		"principal": nil,
 		"writes":    stringsToAny(st.Writes),
 		"doc":       doc,
@@ -426,6 +434,189 @@ func applyConfigPatches(doc any, exists bool, patches any) (any, *Error) {
 		return nil, patchErr(err)
 	}
 	return out, nil
+}
+
+// ddbBatch is an atomic batch (§7.5), phase-2 subset: single-step items,
+// no sources, an optional config change, per-item failures collected as
+// §7.5's failure list. The budget is the transaction's 100 actions
+// (batch.go), which lowers ItemsPerBatch's reach.
+func (e *Engine) ddbBatch(ctx context.Context, req Request, items []Item, cc *ConfigChange, source any, dryRun bool) (*WriteResult, error) {
+	if source != nil {
+		return nil, ddbUnsupported("batch sources")
+	}
+	if req.Signature != "" {
+		return nil, ddbUnsupported("author signatures")
+	}
+	if len(items) == 0 && cc == nil {
+		return nil, badInput("empty batch")
+	}
+	seen := map[string]bool{}
+	for i, it := range items {
+		if !ValidResourceName(it.Resource) {
+			return nil, badInput(fmt.Sprintf("item %d: invalid resource name", i))
+		}
+		if seen[it.Resource] {
+			return nil, badInput(fmt.Sprintf("item %d: resource %q appears twice", i, it.Resource))
+		}
+		seen[it.Resource] = true
+		if len(it.Steps) == 0 {
+			return nil, badInput(fmt.Sprintf("item %d: no steps", i))
+		}
+		if len(it.Steps) != 1 {
+			return nil, ddbUnsupported("multi-step items")
+		}
+		if it.Steps[0].Signature != "" {
+			return nil, ddbUnsupported("author signatures")
+		}
+		if it.Resource == KeyringName {
+			return nil, ddbUnsupported("e2e keyrings")
+		}
+	}
+	if err := checkGestures(items); err != nil {
+		return nil, err
+	}
+	if cc != nil && cc.IfNoneMatch {
+		return nil, badInput("a batch's config change takes If-Match, not If-None-Match")
+	}
+
+	// The batch limits come from the configuration in force (§6.6, §7.5):
+	// the items count, the action budget, the patch-set bytes total.
+	info, err := e.ddb.store.ReadNSInfo(ctx, req.NS)
+	if err != nil {
+		return nil, ddbAsErr(err)
+	}
+	if !info.Exists {
+		return nil, apiErr(404, "not_found", "namespace", req.NS)
+	}
+	if info.Purged {
+		return nil, apiErr(410, "purged", "namespace", req.NS)
+	}
+	cfg, perr := e.ddbConfig(ctx, req.NS, info.ConfigID)
+	if perr != nil {
+		return nil, perr
+	}
+	if len(items) > cfg.Limits.ItemsPerBatch {
+		return nil, limitErr(413, "itemsPerBatch", int64(len(items)), int64(cfg.Limits.ItemsPerBatch), fmt.Sprintf("more than %d items", cfg.Limits.ItemsPerBatch))
+	}
+	ddbItems := make([]ddb.BatchItem, len(items))
+	size := 0
+	for i, it := range items {
+		st := it.Steps[0]
+		ddbItems[i] = ddb.BatchItem{
+			Name: it.Resource, IfMatch: it.IfMatch, IfNoneMatch: it.IfNoneMatch,
+			Delete: st.Delete, Patches: st.Patches, Gesture: st.Gesture, Undoes: st.Undoes,
+		}
+		if !st.Delete {
+			size += len(jsonv.Canonical(st.Patches))
+		}
+	}
+	if acts := ddb.BatchActions(ddbItems, cc != nil); acts > 100 {
+		return nil, limitErr(413, "itemsPerBatch", int64(acts), 100, "the batch's transaction exceeds 100 actions")
+	}
+	if size > cfg.Limits.BatchSize {
+		return nil, limitErr(413, "batchSize", int64(size), int64(cfg.Limits.BatchSize), "batch too large")
+	}
+
+	// A batch's items are gated under its config change's result (§7.5):
+	// the change's hook compiles it and hands it to the item hook.
+	author := ddbAuthor(req.Cred)
+	var gateCfg *Config
+	var ccPatches any
+	var applyCfg func(doc any, exists bool, patches any) (any, error)
+	var checkCfg func(*ddb.ConfigState) error
+	if cc != nil {
+		ccPatches = cc.Patches
+		applyCfg = func(doc any, exists bool, patches any) (any, error) {
+			d, perr := applyConfigPatches(doc, exists, patches)
+			if perr != nil {
+				return nil, perr
+			}
+			return d, nil
+		}
+		checkCfg = func(st *ddb.ConfigState) error {
+			if st.Purged {
+				return apiErr(410, "purged", "namespace", req.NS)
+			}
+			if cc.IfMatch != "" && cc.IfMatch != st.ConfigID {
+				return apiErr(412, "stale", "config", st.ConfigID)
+			}
+			ncfg, perr := e.newConfig(st.Doc, nil, nil)
+			if perr != nil {
+				return perr
+			}
+			if err := ddbRefusals(ncfg); err != nil {
+				return err
+			}
+			st.NewFrozen = ncfg.Frozen
+			gateCfg = ncfg
+			return nil
+		}
+	}
+	check := func(name string, st *ddb.WriteState) error {
+		g := gateCfg
+		if g == nil {
+			var perr *Error
+			g, perr = e.ddbConfig(ctx, req.NS, st.ConfigID)
+			if perr != nil {
+				return perr
+			}
+		}
+		var patches any
+		for i := range items {
+			if items[i].Resource == name {
+				patches = items[i].Steps[0].Patches
+				break
+			}
+		}
+		if perr := ddbGateCfg(g, req.NS, name, patches, st, e.opt.Now().UnixMilli()); perr != nil {
+			return perr
+		}
+		return nil
+	}
+
+	res, err := e.ddb.store.WriteBatch(ctx, req.NS, author, ddbItems, ccPatches, applyCfg, checkCfg, check, dryRun)
+	if err != nil {
+		var bf *ddb.BatchFailure
+		if errors.As(err, &bf) {
+			fails := make([]itemErr, len(bf.Items))
+			for i, f := range bf.Items {
+				fails[i] = itemErr{f.Index, ddbAsErr(f.Err)}
+			}
+			return nil, batchError(fails)
+		}
+		return nil, ddbAsErr(err)
+	}
+	if !res.Replayed && !dryRun {
+		if cc != nil && res.ConfigID != info.ConfigID {
+			e.ddbForgetConfig(req.NS)
+		}
+		e.ddbCommitted(req.NS, "ns:"+req.NS)
+	}
+	out := &WriteResult{Status: res.Status, NSID: res.NSID, Replayed: res.Replayed, ConfigID: res.ConfigID}
+	for _, it := range items {
+		out.Items = append(out.Items, ItemResult{Resource: it.Resource, IDs: []string{res.IDs[it.Resource]}})
+	}
+	return out, nil
+}
+
+// ddbBatchBodyLimit is BatchBodyLimit's bound for a ddb namespace: the
+// same formula over the configuration's batch limits (no allowances in
+// dev mode).
+func (e *Engine) ddbBatchBodyLimit(ctx context.Context, req Request) (bound, batchSize int, err error) {
+	info, err := e.ddb.store.ReadNSInfo(ctx, req.NS)
+	if err != nil {
+		return 0, 0, ddbAsErr(err)
+	}
+	if !info.Exists {
+		return 0, 0, apiErr(404, "not_found", "namespace", req.NS)
+	}
+	cfg, perr := e.ddbConfig(ctx, req.NS, info.ConfigID)
+	if perr != nil {
+		return 0, 0, perr
+	}
+	items, size := cfg.Limits.ItemsPerBatch, cfg.Limits.BatchSize
+	bound = size + size/4 + 512*items + max(cfg.Limits.PatchSetSize, cfg.Limits.DocumentSize) + 64<<10
+	return bound, size, nil
 }
 
 // --- reads ---
