@@ -202,6 +202,9 @@ func (e *Engine) ReadSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 // OpenSealedBlob is ReadSealedBlob with the bytes in Content, read from
 // their file if stored in one.
 func (e *Engine) OpenSealedBlob(ctx context.Context, ns, name, bidText, epochText string, cred Credentials) (*Blob, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("blobs")
+	}
 	return readAgain(func() (*Blob, error) { return e.openSealedBlob(ctx, ns, name, bidText, epochText, cred, true) })
 }
 

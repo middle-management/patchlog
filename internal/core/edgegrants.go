@@ -99,6 +99,9 @@ func (e *Engine) EdgeGrantsOffered() error {
 // exchanged, as they would follow "Bearer " (§C.5.2). None is 401; the
 // server keeps their number within MaxEdgeGrants.
 func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGrants, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("edge grants")
+	}
 	if err := e.EdgeGrantsOffered(); err != nil {
 		return nil, err
 	}

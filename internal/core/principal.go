@@ -28,6 +28,9 @@ type PrincipalAnswer struct {
 // authentication disabled (§1) there is no grant: principal and kid are
 // left out, as from envelopes (§6.4.1), and every verb is allowed.
 func (e *Engine) Principal(ctx context.Context, ns string, cred Credentials) (*PrincipalAnswer, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("principal lookup (grants)")
+	}
 	cred.Edge = nil
 	var ans *PrincipalAnswer
 	err := e.read(ctx, func(t *tx) error {

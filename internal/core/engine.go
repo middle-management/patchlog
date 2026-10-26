@@ -35,6 +35,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -220,8 +221,11 @@ func (logPurger) PurgeTags(tags []string) { log.Printf("cdn purge %v", tags) }
 
 // Engine is the patch-log service.
 type Engine struct {
-	db        *sql.DB
-	pg        bool // Postgres (Addendum D.8), not SQLite
+	db *sql.DB
+	pg bool // Postgres (Addendum D.8), not SQLite
+	// ddb, when set, is the DynamoDB backend (docs/DYNAMODB.md): db is
+	// nil and the phase-1 serving methods delegate (ddb.go).
+	ddb       *ddbBackend
 	opt       Options
 	mu        sync.Mutex // serialises write transactions
 	blobs     blobStore
@@ -366,6 +370,9 @@ func Open(opt Options) (*Engine, error) {
 	if err := checkStoreCompression(&opt); err != nil {
 		return nil, err
 	}
+	if ddb.IsURL(opt.Path) {
+		return openDDB(opt)
+	}
 	db, pg, err := openDB(opt.Path)
 	if err != nil {
 		return nil, err
@@ -460,6 +467,9 @@ func Open(opt Options) (*Engine, error) {
 func (e *Engine) Close() error {
 	e.closeOnce.Do(func() { close(e.stop) })
 	e.bg.Wait()
+	if e.ddb != nil {
+		return nil
+	}
 	e.resign()
 	e.stmts.close()
 	err := e.db.Close()
@@ -468,7 +478,12 @@ func (e *Engine) Close() error {
 }
 
 // Ping checks that the database is reachable (the /_ready check).
-func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) }
+func (e *Engine) Ping(ctx context.Context) error {
+	if e.ddb != nil {
+		return e.ddb.store.Ping(ctx)
+	}
+	return e.db.PingContext(ctx)
+}
 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in

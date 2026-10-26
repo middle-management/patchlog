@@ -481,6 +481,9 @@ type RestoreResult struct {
 // entries is called inside the write transaction: once, or again if
 // Postgres rolls the transaction back to run it again (pglock.go).
 func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries func(yield func(ArchiveEntry) error) error) (*RestoreResult, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("restores")
+	}
 	out := &RestoreResult{}
 	err := e.update(ctx, func(t *tx) error {
 		*out = RestoreResult{}

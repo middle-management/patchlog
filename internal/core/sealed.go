@@ -475,6 +475,9 @@ type KeysAnswer struct {
 // sealed is 404 not_offered, once the read check passes: there is nothing
 // to seal (§E.2.3).
 func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) (*KeysAnswer, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("sealed namespaces")
+	}
 	var out []map[string]any
 	var ans *KeysAnswer
 	err := e.read(ctx, func(t *tx) error {

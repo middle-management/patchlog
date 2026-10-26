@@ -920,6 +920,9 @@ func (t *tx) copySource(target *nsRow, req Request, ns, name string, bid ids.ID)
 // UploadBlob uploads or copies a blob (§7.8). It answers 201 (nil error)
 // whether or not the bytes were stored already.
 func (e *Engine) UploadBlob(ctx context.Context, req Request, name, bidText string, up BlobUpload) error {
+	if e.ddb != nil {
+		return ddbUnsupported("blobs")
+	}
 	bid, perr := ids.Parse(bidText)
 	if perr != nil {
 		return badInput("malformed blob id")
@@ -1153,6 +1156,9 @@ func (e *Engine) ReadBlob(ctx context.Context, ns, name, bidText string, cred Cr
 // OpenBlob is ReadBlob with the bytes in Content, read from their file
 // where they are stored as is (ranges then read only what they need).
 func (e *Engine) OpenBlob(ctx context.Context, ns, name, bidText string, cred Credentials) (*Blob, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("blobs")
+	}
 	return readAgain(func() (*Blob, error) { return e.openBlob(ctx, ns, name, bidText, cred) })
 }
 
@@ -1229,6 +1235,9 @@ type BlobStats struct {
 
 // BlobStats counts the rows of blob storage, and sizes their files.
 func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("blobs")
+	}
 	s := &BlobStats{Dir: e.blobs.root()}
 	var files []string
 	err := e.read(ctx, func(t *tx) error {

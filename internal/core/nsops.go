@@ -427,6 +427,9 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 // A genesis whose base is in another deployment creates a remote branch
 // (§G.3), fetching and verifying the base before the write transaction.
 func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error) {
+	if e.ddb != nil {
+		return e.ddbWriteConfig(ctx, req, cc)
+	}
 	if cc.IfNoneMatch && remoteBaseIn(cc.Patches) {
 		return e.createRemoteBranch(ctx, req, cc)
 	}
@@ -570,6 +573,9 @@ type BranchRequest struct {
 
 // CreateBranch creates a branch of a local base.
 func (e *Engine) CreateBranch(ctx context.Context, req Request, br BranchRequest) (*WriteResult, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("branches")
+	}
 	var res *WriteResult
 	err := e.update(ctx, func(t *tx) error {
 		r, err := t.createBranch(req, br)
@@ -748,6 +754,9 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 
 // Purge purges a resource (§8.3). It returns the purge entry's ns_id.
 func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error) {
+	if e.ddb != nil {
+		return "", ddbUnsupported("purges")
+	}
 	var out string
 	err := e.update(ctx, func(t *tx) error {
 		n := t.nsForWrite(req.NS)
@@ -941,6 +950,9 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids
 // operator key, or, for a branch, to a * key of the branch. The purge-ns
 // entry then says forced: true (§3.5). Dependents can't be forced.
 func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error) {
+	if e.ddb != nil {
+		return "", ddbUnsupported("purges")
+	}
 	var out string
 	err := e.update(ctx, func(t *tx) error {
 		n := t.nsForWrite(req.NS)
@@ -1058,6 +1070,9 @@ type PruneResult struct {
 // below what the resource's retention rule keeps; otherwise the grant must
 // be chained to a * key.
 func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("pruning")
+	}
 	var out *PruneResult
 	err := e.update(ctx, func(t *tx) error {
 		n := t.nsForWrite(req.NS)

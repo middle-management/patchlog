@@ -56,6 +56,9 @@ type GrantDoc struct {
 
 // Grant serves a grant recorded in ns (§C.3.1).
 func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*GrantDoc, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("grants")
+	}
 	var out *GrantDoc
 	var job *sealJob
 	var nsRowID int64

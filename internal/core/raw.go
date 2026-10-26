@@ -28,6 +28,9 @@ type Raw struct {
 // that is sealed or e2e, the keyring included (the blob is sealed, or the
 // root can't be seen), and then the answers of the document URL.
 func (e *Engine) ResourceRaw(ctx context.Context, ns, name, id string, cred Credentials) (*Raw, error) {
+	if e.ddb != nil {
+		return e.ddbResourceRaw(ctx, ns, name, id, cred)
+	}
 	out := &Raw{}
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)

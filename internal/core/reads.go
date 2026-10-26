@@ -153,6 +153,9 @@ type Head struct {
 
 // ResourceHead resolves the head pointer.
 func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credentials) (*Head, error) {
+	if e.ddb != nil {
+		return e.ddbResourceHead(ctx, ns, name, cred)
+	}
 	if h, ok := e.rc.head(ns, name); ok {
 		return &h, nil
 	}
@@ -262,6 +265,9 @@ type Rev struct {
 
 // ResourceRev serves the document at a revision.
 func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
+	if e.ddb != nil {
+		return e.ddbResourceRev(ctx, ns, name, id, cred)
+	}
 	if c := e.rc.rev(ns, name, id); c != nil {
 		return c.answer(true), nil
 	}
@@ -432,6 +438,9 @@ type Log struct {
 // the entries' JWEs, though always one entry; namespace logs carry no patch
 // sets.
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
+	if e.ddb != nil {
+		return e.ddbResourceLog(ctx, ns, name, id, since, limit, cred)
+	}
 	var out *Log
 	var jobs []*sealJob
 	var nsRowID int64
@@ -546,6 +555,9 @@ type NSInfo struct {
 
 // NamespaceHead returns the namespace head and config ids.
 func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials) (*NSInfo, error) {
+	if e.ddb != nil {
+		return e.ddbNamespaceHead(ctx, ns, cred)
+	}
 	var out *NSInfo
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
@@ -569,6 +581,9 @@ func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials)
 // NamespaceRev returns the namespace document in force at an ns_id; in a
 // purged sealed namespace it is 410 purged at any (§8.5).
 func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credentials) (*NSInfo, error) {
+	if e.ddb != nil {
+		return e.ddbNamespaceRev(ctx, ns, nsID, cred)
+	}
 	var out *NSInfo
 	var job *sealJob
 	var nsRowID int64
@@ -618,6 +633,9 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 // namespace the answer is one JWE for the page actually served, pl.range
 // [since, Last] (§E.2.2), and once it is purged, 410 purged (§8.5).
 func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials) (*Log, error) {
+	if e.ddb != nil {
+		return e.ddbNamespaceLog(ctx, ns, nsID, since, limit, cred)
+	}
 	return e.namespaceLog(ctx, ns, nsID, since, limit, cred, false, "", nil)
 }
 
@@ -626,6 +644,9 @@ func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit
 // sealed namespace each entry is sealed on its own, as the range (prev, id]
 // (EntryJWEs).
 func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit int, cred Credentials) (*Log, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("event streams")
+	}
 	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, "", nil)
 }
 
@@ -636,6 +657,9 @@ func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit in
 // the whole page. With since "" it answers no entries and Last the
 // namespace head, where the stream starts following.
 func (e *Engine) ResourceEvents(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("event streams")
+	}
 	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, name, nil)
 }
 
@@ -852,6 +876,9 @@ type HeadsPage struct {
 // (a byte-order bound, not necessarily a name), a page of at most the log
 // page size (§7.4).
 func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cred Credentials) (*HeadsPage, error) {
+	if e.ddb != nil {
+		return e.ddbNamespaceHeads(ctx, ns, nsID, after, cred)
+	}
 	var out *HeadsPage
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
@@ -913,6 +940,9 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 
 // Branches lists a namespace's direct branches (§7.4).
 func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]map[string]any, bool, error) {
+	if e.ddb != nil {
+		return nil, false, ddbUnsupported("branches")
+	}
 	var out []map[string]any
 	var public bool
 	err := e.read(ctx, func(t *tx) error {
