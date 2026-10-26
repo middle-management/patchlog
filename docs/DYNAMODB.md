@@ -486,12 +486,15 @@ What landed, beyond the spike:
   DELETE's tombstone step — §8.1 works end to end: the deterministic
   tombstone id, replay, restore as §6.2's verb, the 410 serving paths
   with `Last` and `$successor`), `WriteConfig` (creates and changes),
-  `ResourceHead/Raw/Rev/Log`, `NamespaceHead/Rev/Log/Heads`,
-  `NamespaceLiveLog`, `Wait`, `Ping`, `Close`. Everything else the
-  server can reach answers **501 "unsupported"** rather than falling
-  through to SQL: batches and multi-step items, branches, purges and
-  pruning, blobs, sealed/e2e, grants (`Grant`, `Principal`, `Keys`,
-  `IssueEdgeGrants`), gestures listing, event streams, author signatures.
+  `Batch` (§7.5: single-step items, per-item failure lists, dry runs, an
+  optional config change gating the items under its result, the
+  100-action budget lowering ItemsPerBatch to ~24), `ResourceHead/Raw/
+  Rev/Log`, `NamespaceHead/Rev/Log/Heads`, `NamespaceLiveLog`, `Wait`,
+  `Ping`, `Close`. Everything else the server can reach answers **501
+  "unsupported"** rather than falling through to SQL: multi-step items,
+  branches, purges and pruning, blobs (batch sources with them),
+  sealed/e2e, grants (`Grant`, `Principal`, `Keys`, `IssueEdgeGrants`),
+  gestures listing, event streams, author signatures.
 - **The thin gate (§6.2 subset).** The store's check hook runs *after*
   planning, inside the retry loop, so limits (step 2) and namespace rules
   (step 6, against the §6.4.1 envelope — `doc` always, `patches` when a
