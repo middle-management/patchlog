@@ -12,6 +12,7 @@ package ddb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -435,5 +436,143 @@ func TestLocalDeleteRestore(t *testing.T) {
 	_, canon, err = s.FoldResource(ctx, "demo", "doc1", 2)
 	if err != nil || string(canon) != `{"a":1,"b":2}` {
 		t.Fatalf("fold at the deleted rev: %s %v", canon, err)
+	}
+}
+
+// TestLocalBatch exercises WriteBatch (§7.5): mixed items in one
+// transaction, the batch entry, replay, per-item failures, the config
+// change, and the dry run.
+func TestLocalBatch(t *testing.T) {
+	s := newLocalStore(t)
+	ctx := context.Background()
+	mustCreateNS(t, s, "demo")
+	w1 := mustWrite(t, s, "demo", "doc1", "", `[{"op":"add","path":"","value":{"a":1}}]`)
+	w2 := mustWrite(t, s, "demo", "doc2", "", `[{"op":"add","path":"","value":{"b":1}}]`)
+
+	items := []BatchItem{
+		{Name: "doc1", IfMatch: w1.ID, Patches: patches(`[{"op":"add","path":"/c","value":3}]`)},
+		{Name: "doc2", IfMatch: w2.ID, Delete: true},
+		{Name: "doc3", IfNoneMatch: true, Patches: patches(`[{"op":"add","path":"","value":{"d":1}}]`)},
+	}
+	res, err := s.WriteBatch(ctx, "demo", "alice", items, nil, nil, nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != 201 || res.NSID == "" || len(res.IDs) != 3 {
+		t.Fatalf("batch: %+v", res)
+	}
+
+	// The state: doc1 appended, doc2 tombstoned, doc3 created.
+	h1, _ := s.ReadHead(ctx, "demo", "doc1")
+	h2, _ := s.ReadHead(ctx, "demo", "doc2")
+	h3, _ := s.ReadHead(ctx, "demo", "doc3")
+	if h1 == nil || !h1.Live || h1.ID != res.IDs["doc1"] {
+		t.Fatalf("doc1: %+v", h1)
+	}
+	if h2 == nil || h2.Live || h2.LastID != w2.ID {
+		t.Fatalf("doc2: %+v", h2)
+	}
+	if h3 == nil || !h3.Live || h3.ID != res.IDs["doc3"] {
+		t.Fatalf("doc3: %+v", h3)
+	}
+
+	// One batch entry, kind "batch", naming every target.
+	log, _, err := s.ReadLog(ctx, "demo", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	le := log[len(log)-1]
+	if le["kind"] != "batch" || le["id"] != res.NSID {
+		t.Fatalf("batch entry: %v", le)
+	}
+	ents, _ := le["entries"].([]any)
+	if len(ents) != 3 {
+		t.Fatalf("batch entry's entries: %v", le["entries"])
+	}
+
+	// A replay answers the same ids (every item's id is computable from
+	// the request: the creates' and the appends' via their parents, the
+	// delete's via its head).
+	rep, err := s.WriteBatch(ctx, "demo", "alice", items, nil, nil, nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Status != 200 || !rep.Replayed || rep.NSID != res.NSID || rep.IDs["doc1"] != res.IDs["doc1"] || rep.IDs["doc3"] != res.IDs["doc3"] {
+		t.Fatalf("replay: %+v", rep)
+	}
+
+	// A stale item fails the batch, per item (§7.5), and nothing
+	// commits: doc1 keeps its head.
+	stale := []BatchItem{
+		{Name: "doc1", IfMatch: w1.ID, Patches: patches(`[{"op":"add","path":"/x","value":9}]`)},
+		{Name: "doc3", IfMatch: h3.ID, Patches: patches(`[{"op":"add","path":"/e","value":5}]`)},
+	}
+	_, err = s.WriteBatch(ctx, "demo", "alice", stale, nil, nil, nil, nil, false)
+	var bf *BatchFailure
+	if !errors.As(err, &bf) || len(bf.Items) != 1 || bf.Items[0].Index != 0 || bf.Items[0].Err.Status != 412 {
+		t.Fatalf("stale batch: %v", err)
+	}
+	h1b, _ := s.ReadHead(ctx, "demo", "doc1")
+	if h1b.ID != h1.ID {
+		t.Fatalf("doc1 moved in a refused batch: %+v", h1b)
+	}
+
+	// The gate's failures collect across items.
+	gate := []BatchItem{
+		{Name: "doc1", IfMatch: h1.ID, Patches: patches(`[{"op":"add","path":"/bad","value":1}]`)},
+		{Name: "doc3", IfMatch: h3.ID, Patches: patches(`[{"op":"add","path":"/bad","value":2}]`)},
+	}
+	check := func(name string, st *WriteState) error {
+		if name == "doc1" {
+			return apiErr(422, "rule", "rule", 0)
+		}
+		return nil
+	}
+	_, err = s.WriteBatch(ctx, "demo", "alice", gate, nil, nil, nil, check, false)
+	if !errors.As(err, &bf) || len(bf.Items) != 1 || bf.Items[0].Err.Body["code"] != "rule" {
+		t.Fatalf("gate: %v", err)
+	}
+
+	// A dry run answers the computed ids and commits nothing.
+	dry, err := s.WriteBatch(ctx, "demo", "alice", gate, nil, nil, nil, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dry.Status != 200 || dry.IDs["doc1"] == "" || dry.IDs["doc3"] == "" {
+		t.Fatalf("dry run: %+v", dry)
+	}
+	h1c, _ := s.ReadHead(ctx, "demo", "doc1")
+	if h1c.ID != h1.ID {
+		t.Fatalf("dry run committed: %+v", h1c)
+	}
+
+	// A config change rides the batch: the entry names it first, the
+	// configuration moves, and the change's condition guards the batch.
+	cc := patches(`[{"op":"add","path":"/frozen","value":true}]`)
+	rc, err := s.WriteBatch(ctx, "demo", "alice",
+		[]BatchItem{{Name: "doc1", IfMatch: h1.ID, Patches: patches(`[{"op":"add","path":"/c2","value":4}]`)}},
+		cc,
+		func(doc any, exists bool, p any) (any, error) {
+			out, _, err := applyPatches(doc, exists, p)
+			return out, err
+		},
+		func(st *ConfigState) error { st.NewFrozen = true; return nil },
+		nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc.ConfigID == "" || rc.ConfigID == res.ConfigID {
+		t.Fatalf("config batch: %+v", rc)
+	}
+	info, err := s.ReadNSInfo(ctx, "demo")
+	if err != nil || !info.Frozen || info.ConfigID != rc.ConfigID {
+		t.Fatalf("ns after config batch: %+v %v", info, err)
+	}
+	log, _, _ = s.ReadLog(ctx, "demo", "", "", 0)
+	le = log[len(log)-1]
+	ents, _ = le["entries"].([]any)
+	first, _ := ents[0].(map[string]any)
+	if le["kind"] != "batch" || first["kind"] != "config" || first["target"] != rc.ConfigID {
+		t.Fatalf("config batch entry: %v", le)
 	}
 }

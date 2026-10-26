@@ -10,16 +10,18 @@ hashes and folds are the production bytes.
 The surface, beyond the spike's writes: `CreateNamespace`, `WriteResource`
 (restores included: a write on a tombstone root-replaces, its parent the
 tombstone id), `DeleteResource` (§8.1's tombstones: the deterministic
-`ids.Tombstone` id, replay, the last-live markers for `Head.Last`), and
-`WriteConfig` — the three writes with a check hook that runs the caller's
-gate inside the retry loop, after planning (D.3's recheck shape);
-`ReadHead`, `ReadLog` (paged, id cursors, upper bounds), `ReadRevByID`
-(GSI1), `FoldResource` (crossing tombstones: the document dies, the
-restore root-replaces), `ResourceLogEntries`, `ListHeads`, `ReadConfig`,
-`ReadDocAtEntry` (the `ns_log ⨯ ns_config` join), `ReadNSInfo`,
-`KnownEntry`, `Ping`. `Open` parses the `-db` URL
-(`dynamodb://<table>?region=…&endpoint=…`); errors carry the core's
-`{"code": …}` body shape.
+`ids.Tombstone` id, replay, the last-live markers for `Head.Last`),
+`WriteConfig`, and `WriteBatch` (§7.5: mixed items in one transaction
+under the 100-action budget, per-item failure collection, dry runs, an
+optional config change, replay by request-computed entry body) — the
+writes with a check hook that runs the caller's gate inside the retry
+loop, after planning (D.3's recheck shape); `ReadHead`, `ReadLog`
+(paged, id cursors, upper bounds), `ReadRevByID` (GSI1), `FoldResource`
+(crossing tombstones: the document dies, the restore root-replaces),
+`ResourceLogEntries`, `ListHeads`, `ReadConfig`, `ReadDocAtEntry` (the
+`ns_log ⨯ ns_config` join), `ReadNSInfo`, `KnownEntry`, `Ping`. `Open`
+parses the `-db` URL (`dynamodb://<table>?region=…&endpoint=…`); errors
+carry the core's `{"code": …}` body shape.
 
 ## What it proves
 
@@ -68,11 +70,14 @@ which is why Postgres uses a log lock instead.
 ## Simplifications (all deliberate)
 
 - The scope is plain namespaces: no grants, blobs, branches, purges,
-  batches, sealed/e2e, or the S3 offload of large values. What the scope
-  doesn't cover is refused by core's seam (501), not silently dropped;
-  limits and namespace rules are the gate's, evaluated in the check hook.
-- `WriteResource` is one patch-set step (create-or-append, `ifMatch`
-  optional); multi-step items are phase 2's batch work.
+  sealed/e2e, or the S3 offload of large values. What the scope doesn't
+  cover is refused by core's seam (501), not silently dropped; limits
+  and namespace rules are the gate's, evaluated in the check hook.
+- Items are one patch-set step each (create-or-append, `ifMatch`
+  optional, or a delete); multi-step items stay 501. A batch is bounded
+  by the 100-action transaction budget (`BatchActions`), which lowers
+  the reach of `ItemsPerBatch` to ~24 — docs/DYNAMODB.md §10's lowered
+  maximum.
 - A retried `CreateNamespace` with the *same patches* answers the original
   ids (its marker covers them); with *different* patches it is 412 naming
   the current config id — production's answer.
