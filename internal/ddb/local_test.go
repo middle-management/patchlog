@@ -24,6 +24,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/middle-management/patchlog/internal/ids"
+
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
@@ -124,15 +126,15 @@ func TestLocalFlow(t *testing.T) {
 	w1 := mustWrite(t, s, "demo", "doc1", "", `[{"op":"add","path":"","value":{"a":1}}]`)
 	w2 := mustWrite(t, s, "demo", "doc1", w1.ID, `[{"op":"add","path":"/b","value":2}]`)
 
-	doc, head, err := s.ReadHead(ctx, "demo", "doc1")
+	head, err := s.ReadHead(ctx, "demo", "doc1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if head != w2.ID {
-		t.Fatalf("head %q, want %q", head, w2.ID)
+	if head == nil || head.ID != w2.ID {
+		t.Fatalf("head %+v, want %q", head, w2.ID)
 	}
-	if string(jsonv.Canonical(doc)) != `{"a":1,"b":2}` {
-		t.Fatalf("document %s", jsonv.Canonical(doc))
+	if string(jsonv.Canonical(head.Doc)) != `{"a":1,"b":2}` {
+		t.Fatalf("document %s", jsonv.Canonical(head.Doc))
 	}
 
 	// The log: three entries, chained by id.
@@ -329,5 +331,109 @@ func TestLocalListHeads(t *testing.T) {
 	}
 	if len(page) != 2 || page[0].Name != "b" || page[1].Name != "c" || next != "" {
 		t.Fatalf("page 2: %v next %q", page, next)
+	}
+}
+
+// TestLocalDeleteRestore exercises the tombstone path end to end (§7.2,
+// §8.1): DELETE, replay, the 410s, and a restore whose chain the fold
+// crosses correctly.
+func TestLocalDeleteRestore(t *testing.T) {
+	s := newLocalStore(t)
+	ctx := context.Background()
+	mustCreateNS(t, s, "demo")
+	w1 := mustWrite(t, s, "demo", "doc1", "", `[{"op":"add","path":"","value":{"a":1}}]`)
+	w2 := mustWrite(t, s, "demo", "doc1", w1.ID, `[{"op":"add","path":"/b","value":2}]`)
+
+	// DELETE without If-Match is 428; with a stale one, 412 naming the
+	// head.
+	if _, err := s.DeleteResource(ctx, "demo", "doc1", "", "", "", "alice", nil); err == nil || err.(*Error).Status != 428 {
+		t.Fatalf("no If-Match: %v", err)
+	}
+	if _, err := s.DeleteResource(ctx, "demo", "doc1", w1.ID, "", "", "alice", nil); err == nil || err.(*Error).Status != 412 || err.(*Error).Body["head"] != w2.ID {
+		t.Fatalf("stale: %v", err)
+	}
+
+	// DELETE: 201, the head is the tombstone, the document is gone.
+	d, err := s.DeleteResource(ctx, "demo", "doc1", w2.ID, "gaaaaaaaaaaaaaaaaaaaaaaaaa", "", "alice", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Status != 201 || d.NSID == "" {
+		t.Fatalf("delete: %+v", d)
+	}
+	parent, _ := ids.Parse(w2.ID)
+	tid := ids.Tombstone(parent).String()
+	if d.ID != tid {
+		t.Fatalf("tombstone id %q, want %q", d.ID, tid)
+	}
+	head, err := s.ReadHead(ctx, "demo", "doc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head == nil || head.Live || head.ID != tid || head.LastID != w2.ID || head.Doc != nil {
+		t.Fatalf("head after delete: %+v", head)
+	}
+
+	// A retried DELETE replays; a DELETE of another parent is 410; a
+	// write pinning the old head is 412.
+	d2, err := s.DeleteResource(ctx, "demo", "doc1", w2.ID, "", "", "alice", nil)
+	if err != nil || d2.Status != 200 || !d2.Replayed || d2.ID != tid || d2.NSID != d.NSID {
+		t.Fatalf("replay: %+v %v", d2, err)
+	}
+	if _, err := s.DeleteResource(ctx, "demo", "doc1", w1.ID, "", "", "alice", nil); err == nil || err.(*Error).Status != 410 {
+		t.Fatalf("double delete: %v", err)
+	}
+	if _, err := s.WriteResource(ctx, "demo", "doc1", w2.ID, patches(`[{"op":"add","path":"/c","value":3}]`), "", "", "alice", nil); err == nil || err.(*Error).Status != 412 {
+		t.Fatalf("append at the deleted head: %v", err)
+	}
+
+	// The revision read of the tombstone ids as one (GSI1); the resource
+	// log serves the tombstone with no patches.
+	rev, err := s.ReadRevByID(ctx, "demo", tid)
+	if err != nil || rev == nil || rev.Kind != "tombstone" || rev.Pos != 3 {
+		t.Fatalf("tombstone rev: %+v %v", rev, err)
+	}
+	entries, err := s.ResourceLogEntries(ctx, "demo", "doc1", 0, 0)
+	if err != nil || len(entries) != 3 || entries[2].Kind != "tombstone" || entries[2].Patches != nil || entries[2].Gesture == "" {
+		t.Fatalf("resource log: %+v %v", entries, err)
+	}
+
+	// /heads: kind tombstone, no metadata.
+	heads, _, err := s.ListHeads(ctx, "demo", "", 10)
+	if err != nil || len(heads) != 1 || !heads[0].Tombstoned || heads[0].ID != tid || heads[0].Created != 0 {
+		t.Fatalf("heads: %+v %v", heads, err)
+	}
+
+	// The namespace log's entry is the tombstone's.
+	log, _, err := s.ReadLog(ctx, "demo", d.NSID, "", 0)
+	if err != nil || len(log) != 4 {
+		t.Fatalf("ns log: %v %v", log, err)
+	}
+	if le := log[len(log)-1]; le["id"] != d.NSID || le["kind"] != "tombstone" || le["target"] != tid || le["resource"] != "doc1" || le["gesture"] == "" {
+		t.Fatalf("tombstone entry: %v", le)
+	}
+
+	// Restore: the parent is the tombstone id, the fold across the chain
+	// boundary is the restored document only.
+	w3, err := s.WriteResource(ctx, "demo", "doc1", tid, patches(`[{"op":"add","path":"","value":{"z":1}}]`), "", "", "alice", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w3.Status != 201 {
+		t.Fatalf("restore: %+v", w3)
+	}
+	doc, canon, err := s.FoldResource(ctx, "demo", "doc1", 0)
+	if err != nil || string(canon) != `{"z":1}` {
+		t.Fatalf("fold after restore: %s %v", canon, err)
+	}
+	_ = doc
+	head, err = s.ReadHead(ctx, "demo", "doc1")
+	if err != nil || head == nil || !head.Live || head.ID != w3.ID || head.LastID != "" {
+		t.Fatalf("head after restore: %+v %v", head, err)
+	}
+	// The fold at the deleted revision is still the old document.
+	_, canon, err = s.FoldResource(ctx, "demo", "doc1", 2)
+	if err != nil || string(canon) != `{"a":1,"b":2}` {
+		t.Fatalf("fold at the deleted rev: %s %v", canon, err)
 	}
 }

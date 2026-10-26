@@ -47,6 +47,8 @@ type writePlan struct {
 	oldHead   uint64
 	tip       tip  // pin #TIP (headPos, headID)
 	create    bool // the write creates the resource
+	restore   bool // the write restores a tombstoned resource
+	del       bool // the write is a tombstone
 	replay    bool // the write is already committed: store nothing
 }
 
@@ -117,7 +119,11 @@ func planWrite(ns, name string, m *nsMeta, t *tip, head *resRow, headDoc any, if
 		return nil, apiErr(412, "stale", "head", cur)
 	}
 
-	doc, writes, err := apply(headDoc, head != nil && head.headPos > 0, patches)
+	// The document the patches fold into: none for a create, and none for
+	// a restore either — a tombstone deleted it, so the write root-replaces
+	// like a create (§6.2's restore verb).
+	restore := head != nil && head.state == "tombstoned"
+	doc, writes, err := apply(headDoc, head != nil && head.headPos > 0 && !restore, patches)
 	if err != nil {
 		return nil, apiErr(422, "patch", "detail", err.Error())
 	}
@@ -172,8 +178,78 @@ func planWrite(ns, name string, m *nsMeta, t *tip, head *resRow, headDoc any, if
 		oldHead:   pos - 1, // the head position the RES condition pins
 		tip:       *t,
 		create:    head == nil || head.headPos == 0,
+		restore:   restore,
 	}, nil
 }
+
+// planDelete turns a DELETE's reads into a tombstone plan (§7.2, §8.1).
+// The tombstone id covers only the deleted head (ids.Tombstone), so a
+// retried DELETE recomputes it and replays.
+func planDelete(ns, name string, m *nsMeta, t *tip, head *resRow, ifMatch, gesture, undoes, author string, now int64) (*writePlan, *Error) {
+	switch {
+	case m == nil:
+		return nil, apiErr(404, "not_found", "namespace", ns)
+	case m.purged:
+		return nil, apiErr(410, "purged", "namespace", ns)
+	case m.frozen:
+		return nil, apiErr(409, "frozen", "namespace", ns)
+	}
+	if ifMatch == "" {
+		return nil, apiErr(428, "precondition_required")
+	}
+	parent, err := ids.Parse(ifMatch)
+	if err != nil {
+		return nil, apiErr(400, "bad_input", "detail", "malformed If-Match")
+	}
+	tid := ids.Tombstone(parent)
+	if head == nil || head.headPos == 0 {
+		return nil, gone()
+	}
+	if head.state == "tombstoned" {
+		if head.headID == tid.String() {
+			// This very delete committed: replay.
+			return &writePlan{replay: true, rev: revRow{id: head.headID}, entry: logRow{id: head.entryID}}, nil
+		}
+		return nil, gone() // a delete of a tombstoned resource is 410
+	}
+	if head.headID != ifMatch {
+		return nil, apiErr(412, "stale", "head", head.headID)
+	}
+
+	body := jsonv.Canonical(map[string]any{"resource": name, "kind": "tombstone", "target": tid.String()})
+	var tipID *ids.ID
+	if t.headID != "" {
+		p, err := ids.Parse(t.headID)
+		if err != nil {
+			return nil, apiErr(500, "stored_tip", "namespace", ns)
+		}
+		tipID = &p
+	}
+	entryID := ids.Hash(tipID, body)
+	pos := head.headPos + 1
+	return &writePlan{
+		rev: revRow{
+			pos: pos, id: tid.String(), kind: "tombstone", parentID: ifMatch,
+			author: author, created: now, gesture: gesture, undoes: undoes,
+		},
+		entry: logRow{
+			pos: t.headPos + 1, id: entryID.String(), prevPos: t.headPos,
+			kind: "tombstone", body: string(body), author: author, created: now,
+			gesture: gesture, undoes: undoes, cfgPos: m.configPos,
+		},
+		newHead: resRow{
+			headPos: pos, headID: tid.String(), entryID: entryID.String(), state: "tombstoned",
+			lastID: head.headID, lastPos: head.headPos,
+		},
+		resExists: true,
+		oldHead:   head.headPos,
+		tip:       *t,
+		del:       true,
+	}, nil
+}
+
+// gone is DELETE's answer for an absent or tombstoned resource (write.go's).
+func gone() *Error { return apiErr(410, "gone") }
 
 func parentString(p *ids.ID) string {
 	if p == nil {
@@ -204,10 +280,15 @@ func buildWriteTx(table, ns, name string, p *writePlan) []types.TransactWriteIte
 		// UNIQUE(res, parent_seq): one child per parent.
 		ConditionExpression: strptr("attribute_not_exists(PK)"),
 	}}
+	resUpdate := "SET headPos = :h, headId = :i, #st = :live, entryId = :e, headCreated = :c, headSize = :s, headDigest = :d"
+	if p.restore {
+		// A tombstone's lastId/lastPos don't survive the restore.
+		resUpdate += " REMOVE lastId, lastPos"
+	}
 	out[actRes] = types.TransactWriteItem{Update: &types.Update{
 		TableName:                &table,
 		Key:                      keyAV(resK),
-		UpdateExpression:         strptr("SET headPos = :h, headId = :i, #st = :live, entryId = :e, headCreated = :c, headSize = :s, headDigest = :d"),
+		UpdateExpression:         strptr(resUpdate),
 		ConditionExpression:      &resCond,
 		ExpressionAttributeNames: map[string]string{"#st": "state"},
 		ExpressionAttributeValues: mergeVals(resVals, map[string]types.AttributeValue{
@@ -244,6 +325,74 @@ func buildWriteTx(table, ns, name string, p *writePlan) []types.TransactWriteIte
 		TableName: &table,
 		Item:      withKey(nsidK, item{"ns": avS(ns), "logPos": avN(p.entry.pos), "revId": avS(p.rev.id)}),
 		// UNIQUE(ns, id): the idempotent-retry marker.
+		ConditionExpression: strptr("attribute_not_exists(PK)"),
+	}}
+	return out
+}
+
+// Action indexes of a delete's transaction (buildDeleteTx).
+const (
+	delActRev = iota
+	delActRes
+	delActDoc
+	delActLog
+	delActTip
+	delActNSID
+	delNumActs
+)
+
+// buildDeleteTx is a tombstone's transaction: the tombstone chain row, the
+// head move to it (pinning the checked head), the live document's removal,
+// the log entry, the tip move and the entry marker — the write's seven
+// actions minus the document upserts, plus the deletion.
+func buildDeleteTx(table, ns, name string, p *writePlan) []types.TransactWriteItem {
+	resK, revK := keyRes(ns, name), keyRev(ns, name, p.rev.pos)
+	docK, logK, tipK := keyDocHead(ns, name), keyLog(ns, p.entry.pos), keyTip(ns)
+	nsidK := keyNSID(ns, p.entry.id)
+
+	out := make([]types.TransactWriteItem, delNumActs)
+	out[delActRev] = types.TransactWriteItem{Put: &types.Put{
+		TableName:           &table,
+		Item:                withKey(revK, p.rev.item()),
+		ConditionExpression: strptr("attribute_not_exists(PK)"),
+	}}
+	out[delActRes] = types.TransactWriteItem{Update: &types.Update{
+		TableName: &table,
+		Key:       keyAV(resK),
+		// The /heads metadata dies with the document; the last live
+		// revision is what Head.Last answers (§8.1).
+		UpdateExpression: strptr("SET headPos = :h, headId = :i, #st = :tomb, entryId = :e, lastId = :l, lastPos = :lp REMOVE headCreated, headSize, headDigest"),
+		// The head is still the revision the check phase read.
+		ConditionExpression:      strptr("headPos = :old AND headId = :oldi"),
+		ExpressionAttributeNames: map[string]string{"#st": "state"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":h": avN(p.newHead.headPos), ":i": avS(p.newHead.headID), ":tomb": avS("tombstoned"), ":e": avS(p.entry.id),
+			":l": avS(p.newHead.lastID), ":lp": avN(p.newHead.lastPos),
+			":old": avN(p.oldHead), ":oldi": avS(p.rev.parentID),
+		},
+	}}
+	out[delActDoc] = types.TransactWriteItem{Delete: &types.Delete{
+		TableName: &table,
+		Key:       keyAV(docK),
+	}}
+	out[delActLog] = types.TransactWriteItem{Put: &types.Put{
+		TableName:           &table,
+		Item:                withKey(logK, p.entry.item()),
+		ConditionExpression: strptr("attribute_not_exists(PK)"),
+	}}
+	out[delActTip] = types.TransactWriteItem{Update: &types.Update{
+		TableName:           &table,
+		Key:                 keyAV(tipK),
+		UpdateExpression:    strptr("SET headPos = :new, headId = :newi"),
+		ConditionExpression: strptr("headPos = :h AND headId = :i"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":new": avN(p.entry.pos), ":newi": avS(p.entry.id),
+			":h": avN(p.tip.headPos), ":i": avS(p.tip.headID),
+		},
+	}}
+	out[delActNSID] = types.TransactWriteItem{Put: &types.Put{
+		TableName:           &table,
+		Item:                withKey(nsidK, item{"ns": avS(ns), "logPos": avN(p.entry.pos), "revId": avS(p.rev.id)}),
 		ConditionExpression: strptr("attribute_not_exists(PK)"),
 	}}
 	return out

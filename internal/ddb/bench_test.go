@@ -144,7 +144,7 @@ func BenchmarkDDB(b *testing.B) {
 			b.Fatal(err)
 		}
 		bench(b, 8, 3*time.Second, func(i int) error {
-			_, _, err := s.ReadHead(ctx, "ns0", "doc")
+			_, err := s.ReadHead(ctx, "ns0", "doc")
 			return err
 		})
 	})

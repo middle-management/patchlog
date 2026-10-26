@@ -15,10 +15,11 @@ import (
 // folds, resource logs, namespace info.
 
 // RevInfo is a revision found by id (GSI1): where it lives and what the
-// serving paths need of it.
+// serving paths need of it. Kind "tombstone" answers 410s (§8.1).
 type RevInfo struct {
 	Name     string
 	Pos      uint64
+	Kind     string // "": a revision; "tombstone"
 	ParentID string
 	Patches  string
 	Author   string
@@ -46,6 +47,7 @@ func (s *Store) ReadRevByID(ctx context.Context, ns, id string) (*RevInfo, error
 		return &RevInfo{
 			Name:     resNameFromRev(i.s("SK")),
 			Pos:      i.n("pos"),
+			Kind:     i.s("kind"),
 			ParentID: i.s("parentId"),
 			Patches:  i.s("patches"),
 			Author:   i.s("author"),
@@ -71,12 +73,12 @@ func resNameFromRev(sk string) string {
 // set with the production engine. One ordered query; the §5 audit turns a
 // gap into an error, never a partial document.
 func (s *Store) FoldResource(ctx context.Context, ns, name string, toPos uint64) (doc any, canon []byte, err error) {
-	doc, err = s.walkChain(ctx, ns, name, toPos, func(d any, patches string) (any, error) {
+	doc, err = s.walkChain(ctx, ns, name, toPos, func(d any, exists bool, patches string) (any, error) {
 		p, err := jsonv.Parse([]byte(patches))
 		if err != nil {
 			return nil, err
 		}
-		out, _, err := applyPatches(d, d != nil, p)
+		out, _, err := applyPatches(d, exists, p)
 		return out, err
 	})
 	if err != nil {
@@ -86,8 +88,9 @@ func (s *Store) FoldResource(ctx context.Context, ns, name string, toPos uint64)
 }
 
 // walkChain applies each revision's patches in order, from genesis to
-// toPos (0: all).
-func (s *Store) walkChain(ctx context.Context, ns, name string, toPos uint64, apply func(doc any, patches string) (any, error)) (any, error) {
+// toPos (0: all). exists tracks whether the document exists — a JSON null
+// document exists, a tombstoned one does not.
+func (s *Store) walkChain(ctx context.Context, ns, name string, toPos uint64, apply func(doc any, exists bool, patches string) (any, error)) (any, error) {
 	hi := "REV#" + name + "#" + padPos(toPos)
 	if toPos == 0 {
 		hi = "REV#" + name + "#" + padPos(999999999999)
@@ -101,6 +104,7 @@ func (s *Store) walkChain(ctx context.Context, ns, name string, toPos uint64, ap
 		return nil, err
 	}
 	var doc any
+	exists := false
 	var last uint64
 	for _, it := range q.Items {
 		i := item(it)
@@ -111,19 +115,28 @@ func (s *Store) walkChain(ctx context.Context, ns, name string, toPos uint64, ap
 			return nil, apiErr(409, "conflict", "detail", "gap in the revision chain")
 		}
 		last = pos
-		doc, err = apply(doc, i.s("patches"))
+		if i.s("kind") == "tombstone" {
+			// The chain crosses a delete: the document dies with it, and
+			// the next revision (a restore) root-replaces from nothing.
+			doc, exists = nil, false
+			continue
+		}
+		doc, err = apply(doc, exists, i.s("patches"))
 		if err != nil {
 			return nil, err
 		}
+		exists = true
 	}
 	return doc, nil
 }
 
-// ResLogEntry is one entry of a resource's log (§7.1): a revision, served
-// with its parent and metadata.
+// ResLogEntry is one entry of a resource's log (§7.1): a revision or a
+// tombstone, served with its parent and metadata. Kind is "head" or
+// "tombstone"; a tombstone has no Patches.
 type ResLogEntry struct {
 	Pos      uint64
 	ID       string
+	Kind     string
 	ParentID string
 	Patches  any
 	Author   string
@@ -159,17 +172,22 @@ func (s *Store) ResourceLogEntries(ctx context.Context, ns, name string, from ui
 		if limit > 0 && len(out) == limit {
 			break
 		}
-		patches, _ := jsonv.Parse([]byte(i.s("patches")))
-		out = append(out, ResLogEntry{
+		re := ResLogEntry{
 			Pos:      i.n("pos"),
 			ID:       i.s("id"),
+			Kind:     "head",
 			ParentID: i.s("parentId"),
-			Patches:  patches,
 			Author:   i.s("author"),
 			Created:  int64(i.n("created")),
 			Gesture:  i.s("gesture"),
 			Undoes:   i.s("undoes"),
-		})
+		}
+		if i.s("kind") == "tombstone" {
+			re.Kind = "tombstone"
+		} else {
+			re.Patches, _ = jsonv.Parse([]byte(i.s("patches")))
+		}
+		out = append(out, re)
 	}
 	return out, nil
 }

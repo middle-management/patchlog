@@ -148,9 +148,12 @@ func (s *Store) WriteResource(ctx context.Context, ns, name, ifMatch string, pat
 			if head != nil {
 				st.HeadID = head.headID
 			}
-			if p.create {
+			switch {
+			case p.create:
 				st.Action = "create"
-			} else {
+			case p.restore:
+				st.Action = "restore"
+			default:
 				st.Action = "append"
 			}
 			if err := check(st); err != nil {
@@ -233,13 +236,113 @@ func (s *Store) mapCancel(ctx context.Context, ns, name string, p *writePlan, er
 		return nil, false, apiErr(409, "conflict")
 	case failed(actRes), failed(actRev):
 		// The resource's head moved since the check (D.3's conflict,
-		// isConflict): answer 412 with the current head.
+		// isConflict): answer 412 with the current head — unless it moved
+		// to this very write (a duplicate committed first): a replay.
 		cur, gerr := s.getRes(ctx, ns, name)
 		if gerr == nil && cur != nil {
+			if cur.headID == p.rev.id {
+				created, _ := s.entryCreated(ctx, ns, cur.entryID)
+				return &WriteResult{Status: 200, ID: p.rev.id, NSID: cur.entryID, Created: created, Replayed: true}, false, nil
+			}
 			return nil, false, apiErr(412, "stale", "head", cur.headID)
 		}
 		return nil, false, apiErr(412, "stale", "head", "")
 	case failed(actTip):
+		return nil, true, nil
+	default:
+		return nil, false, err
+	}
+}
+
+// DeleteResource tombstones a resource (§7.2's DELETE, §8.1): the
+// tombstone chain row, the head move, the log entry and the markers of a
+// write, in one transaction pinned on the checked head. ifMatch names the
+// deleted head (required, 428 otherwise). check runs the caller's gate per
+// attempt, as WriteResource's does; its state's Doc is the last live
+// document (§6.4.1's delete envelope).
+func (s *Store) DeleteResource(ctx context.Context, ns, name, ifMatch string, gesture, undoes, author string, check func(*WriteState) error) (*WriteResult, error) {
+	for attempt := 0; ; attempt++ {
+		m, t, head, headDoc, err := s.readWriteState(ctx, ns, name)
+		if err != nil {
+			return nil, err
+		}
+		p, aerr := planDelete(ns, name, m, t, head, ifMatch, gesture, undoes, author, s.now().UnixMilli())
+		if aerr != nil {
+			return nil, aerr
+		}
+		if p.replay {
+			created, _ := s.entryCreated(ctx, ns, p.entry.id)
+			return &WriteResult{Status: 200, ID: p.rev.id, NSID: p.entry.id, Created: created, Replayed: true}, nil
+		}
+		if check != nil {
+			st := &WriteState{
+				Exists: true, ResExists: true, HeadID: head.headID, HeadDoc: headDoc,
+				Action: "delete", RevID: p.rev.id, Doc: headDoc, DocCanon: nil, Writes: []string{},
+			}
+			st.Frozen, st.Purged, st.ConfigID = m.frozen, m.purged, m.configID
+			if err := check(st); err != nil {
+				return nil, err
+			}
+		}
+
+		_, err = s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: buildDeleteTx(s.Table, ns, name, p),
+		})
+		if err == nil {
+			return &WriteResult{Status: 201, ID: p.rev.id, NSID: p.entry.id, Created: p.entry.created}, nil
+		}
+		res, retry, cerr := s.mapDeleteCancel(ctx, ns, name, p, err)
+		if res != nil || cerr != nil {
+			return res, cerr
+		}
+		if !retry {
+			return nil, err
+		}
+		if attempt+1 >= maxWriteAttempts {
+			return nil, apiErr(409, "conflict", "detail", "log tip contention")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(1<<attempt) * 5 * time.Millisecond):
+		}
+	}
+}
+
+// mapDeleteCancel classifies a cancelled delete transaction, as mapCancel
+// does a write's: a replayed result, a conflict (the head moved: 412, or
+// 410 if the winner deleted first), or retry (the tip moved).
+func (s *Store) mapDeleteCancel(ctx context.Context, ns, name string, p *writePlan, err error) (res *WriteResult, retry bool, retErr error) {
+	var xe *types.TransactionConflictException
+	if errors.As(err, &xe) {
+		return nil, true, nil
+	}
+	var ce *types.TransactionCanceledException
+	if !errors.As(err, &ce) {
+		return nil, false, err
+	}
+	reasons := ce.CancellationReasons
+	failed := func(i int) bool {
+		return i < len(reasons) && reasons[i].Code != nil && *reasons[i].Code == "ConditionalCheckFailed"
+	}
+	switch {
+	case failed(delActNSID):
+		return nil, false, apiErr(409, "conflict") // the marker without us: ambiguous
+	case failed(delActRes), failed(delActRev):
+		cur, gerr := s.getRes(ctx, ns, name)
+		if gerr == nil && cur != nil {
+			if cur.state == "tombstoned" {
+				if cur.headID == p.rev.id {
+					// The winner was this very delete: a replay.
+					created, _ := s.entryCreated(ctx, ns, cur.entryID)
+					return &WriteResult{Status: 200, ID: p.rev.id, NSID: cur.entryID, Created: created, Replayed: true}, false, nil
+				}
+				return nil, false, gone()
+			}
+			return nil, false, apiErr(412, "stale", "head", cur.headID)
+		}
+		return nil, false, gone()
+	case failed(delActTip):
 		return nil, true, nil
 	default:
 		return nil, false, err
@@ -284,41 +387,51 @@ func (s *Store) readWriteState(ctx context.Context, ns, name string) (m *nsMeta,
 	return m, t, head, headDoc, nil
 }
 
-// ReadHead serves a resource's current document and head id (GET
-// /r/{ns}/{name}, spike shape): one batch read of the resource and its
-// head document. Not a snapshot (docs/DYNAMODB.md §5), which is benign
-// here — the head document is immutable per revision.
-func (s *Store) ReadHead(ctx context.Context, ns, name string) (doc any, headID string, err error) {
+// HeadInfo is a resource's head answer: the document and id of a live
+// head, or a tombstone's id and last live revision (§8.1).
+type HeadInfo struct {
+	Doc     any // nil for a tombstone (its document is gone)
+	ID      string
+	Live    bool
+	LastID  string
+	LastPos uint64
+}
+
+// ReadHead serves a resource's head (GET /r/{ns}/{name}): one batch read
+// of the resource and its head document; nil when the resource is absent.
+// Not a snapshot (docs/DYNAMODB.md §5), which is benign here — the head
+// document is immutable per revision.
+func (s *Store) ReadHead(ctx context.Context, ns, name string) (*HeadInfo, error) {
 	out, err := s.Client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
 		RequestItems: map[string]types.KeysAndAttributes{
 			s.Table: {Keys: []map[string]types.AttributeValue{keyAV(keyRes(ns, name)), keyAV(keyDocHead(ns, name))}, ConsistentRead: boolptr(true)},
 		},
 	})
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
+	var res *resRow
+	var doc any
 	for _, it := range out.Responses[s.Table] {
 		i := item(it)
 		switch {
 		case i.s("SK") == "RES#"+name:
-			headID = i.s("headId")
-			if i.n("headPos") == 0 {
-				headID = ""
-			}
+			res = scanRes(i)
 		case i.s("SK") == "DOC#"+name+"#HEAD":
 			doc, err = jsonv.Parse([]byte(i.s("doc")))
 			if err != nil {
-				return nil, "", err
+				return nil, err
 			}
 		}
 	}
-	if headID == "" {
-		return nil, "", apiErr(404, "not_found", "namespace", ns, "resource", name)
+	if res == nil || res.headPos == 0 {
+		return nil, nil // absent
 	}
-	if doc == nil {
-		return nil, "", apiErr(409, "conflict", "detail", "head document missing")
+	h := &HeadInfo{Doc: doc, ID: res.headID, Live: res.state != "tombstoned", LastID: res.lastID, LastPos: res.lastPos}
+	if h.Live && doc == nil {
+		return nil, apiErr(409, "conflict", "detail", "head document missing")
 	}
-	return doc, headID, nil
+	return h, nil
 }
 
 // LogEntry is a served namespace log entry (namespaceLog of reads.go):
@@ -417,13 +530,15 @@ func (s *Store) ReadLog(ctx context.Context, ns, at, since string, limit int) (e
 	return entries, next, nil
 }
 
-// HeadEntry is one resource of a /heads page: its name, head id and the
-// /heads metadata of §7.4 (the head revision's created, size, digest).
+// HeadEntry is one resource of a /heads page: its name, head id (a live
+// revision or a tombstone id) and, for a live head, the /heads metadata
+// of §7.4 (the head revision's created, size, digest).
 type HeadEntry struct {
-	Name, ID string
-	Created  int64
-	Size     uint64
-	Digest   []byte
+	Name, ID   string
+	Tombstoned bool
+	Created    int64
+	Size       uint64
+	Digest     []byte
 }
 
 // ListHeads pages a namespace's resources in byte order of name (§7.4,
@@ -462,7 +577,7 @@ func (s *Store) ListHeads(ctx context.Context, ns, after string, limit int) ([]H
 			break
 		}
 		out = append(out, HeadEntry{
-			Name: resName(i.s("SK")), ID: i.s("headId"),
+			Name: resName(i.s("SK")), ID: i.s("headId"), Tombstoned: i.s("state") == "tombstoned",
 			Created: int64(i.n("headCreated")), Size: i.n("headSize"), Digest: i.b("headDigest"),
 		})
 	}

@@ -93,15 +93,19 @@ func scanTip(it item) *tip { return &tip{headPos: it.n("headPos"), headID: it.s(
 // resRow is the RES# item: a resource's head pointer and state. entryID is
 // the namespace log entry that moved the head here, so a retried write
 // (replay) can answer with its entry id without a scan. headCreated,
-// headSize and headDigest are the head revision's /heads metadata (§7.4).
+// headSize and headDigest are the head revision's /heads metadata (§7.4),
+// absent on a tombstone. lastId/lastPos are a tombstone's last live
+// revision (Head.Last's answer, §8.1).
 type resRow struct {
 	headPos     uint64 // 0: no live revision
-	headID      string
+	headID      string // head revision or tombstone id
 	entryID     string
-	state       string // "live"; tombstone/purge are out of the spike's scope
+	state       string // "live" or "tombstoned"
 	headCreated int64
 	headSize    uint64
 	headDigest  []byte
+	lastID      string
+	lastPos     uint64
 }
 
 func (r *resRow) item() item {
@@ -112,15 +116,19 @@ func scanRes(it item) *resRow {
 	return &resRow{
 		headPos: it.n("headPos"), headID: it.s("headId"), entryID: it.s("entryId"), state: it.s("state"),
 		headCreated: int64(it.n("headCreated")), headSize: it.n("headSize"), headDigest: it.b("headDigest"),
+		lastID: it.s("lastId"), lastPos: it.n("lastPos"),
 	}
 }
 
-// revRow is the REV# item: one revision of a resource's chain. size and
-// digest are the canonical document's length and sha-256 as of this
-// revision (headMeta, §7.1); G1PK is the GSI1 key for revision-by-id.
+// revRow is the REV# item: one row of a resource's chain. kind is "rev"
+// ("" alike) or "tombstone"; a tombstone carries neither patches nor
+// document metadata. size and digest are the canonical document's length
+// and sha-256 as of this revision (headMeta, §7.1); G1PK is the GSI1 key
+// for revision-by-id.
 type revRow struct {
 	pos      uint64
 	id       string
+	kind     string // "": a revision; "tombstone"
 	parentID string // "": genesis
 	patches  string // canonical JSON of the patch set
 	author   string
@@ -135,12 +143,17 @@ func (r *revRow) item() item {
 	it := item{
 		"pos":     avN(r.pos),
 		"id":      avS(r.id),
-		"patches": avS(r.patches),
 		"author":  avS(r.author),
 		"created": avI(r.created),
-		"size":    avN(r.size),
-		"digest":  avB(r.digest),
 		"G1PK":    avS(g1RevID(r.id)),
+	}
+	if r.kind != "" {
+		it["kind"] = avS(r.kind)
+	}
+	if r.kind != "tombstone" {
+		it["patches"] = avS(r.patches)
+		it["size"] = avN(r.size)
+		it["digest"] = avB(r.digest)
 	}
 	if r.parentID != "" {
 		it["parentId"] = avS(r.parentID)

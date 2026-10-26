@@ -1,6 +1,7 @@
 package ddb
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -201,4 +202,102 @@ func TestBuildWriteTx(t *testing.T) {
 			t.Errorf("action %d has no table name", i)
 		}
 	}
+}
+
+func TestPlanDelete(t *testing.T) {
+	p0, _ := plan(t, nil, nil, "")
+	head := &resRow{headPos: 1, headID: p0.rev.id, entryID: p0.entry.id, state: "live"}
+
+	// No If-Match: 428; a stale one: 412 naming the head; an absent
+	// resource and a second, different delete: 410.
+	if _, e := planDelete("demo", "doc1", testMeta, testTip, head, "", "", "", "alice", 2000); e == nil || e.Status != 428 {
+		t.Fatalf("no If-Match: %v", e)
+	}
+	if _, e := planDelete("demo", "doc1", testMeta, testTip, nil, p0.rev.id, "", "", "alice", 2000); e == nil || e.Status != 410 {
+		t.Fatalf("absent: %v", e)
+	}
+	other := ids.Of([]byte("other")).String()
+	if _, e := planDelete("demo", "doc1", testMeta, testTip, head, other, "", "", "alice", 2000); e == nil || e.Status != 412 || e.Body["head"] != p0.rev.id {
+		t.Fatalf("stale: %v", e)
+	}
+
+	p, e := planDelete("demo", "doc1", testMeta, testTip, head, p0.rev.id, "g", "", "alice", 2000)
+	if e != nil {
+		t.Fatalf("planDelete: %v", e)
+	}
+	// The tombstone id is ids.Tombstone over the deleted head (§3.3), so a
+	// retried DELETE recomputes it; the parent is the deleted head.
+	parent, _ := ids.Parse(p0.rev.id)
+	wantTid := ids.Tombstone(parent)
+	if p.rev.id != wantTid.String() || p.rev.kind != "tombstone" || p.rev.parentID != p0.rev.id {
+		t.Fatalf("tombstone %+v, want id %q parent %q", p.rev, wantTid, p0.rev.id)
+	}
+	if !p.del || p.newHead.state != "tombstoned" || p.newHead.lastID != p0.rev.id || p.newHead.lastPos != 1 {
+		t.Fatalf("plan %+v", p)
+	}
+	wantBody := `{"kind":"tombstone","resource":"doc1","target":"` + wantTid.String() + `"}`
+	if p.entry.body != wantBody || p.entry.kind != "tombstone" {
+		t.Fatalf("entry %+v, want body %q", p.entry, wantBody)
+	}
+	// Its transaction: six actions, the head pinned on the deleted
+	// revision, the document deleted.
+	tx := buildDeleteTx("tbl", "demo", "doc1", p)
+	if len(tx) != delNumActs {
+		t.Fatalf("%d actions, want %d", len(tx), delNumActs)
+	}
+	if tx[delActDoc].Delete == nil {
+		t.Fatalf("action %d is not the document's delete", delActDoc)
+	}
+	res := tx[delActRes].Update
+	if *res.ConditionExpression != "headPos = :old AND headId = :oldi" {
+		t.Fatalf("RES condition %q", *res.ConditionExpression)
+	}
+
+	// A retried DELETE of the result replays; a delete of a different
+	// parent is 410 (doubleDelete, §7.5).
+	tomb := &resRow{headPos: 2, headID: p.rev.id, entryID: p.entry.id, state: "tombstoned", lastID: p0.rev.id, lastPos: 1}
+	rp, e := planDelete("demo", "doc1", testMeta, testTip, tomb, p0.rev.id, "", "", "alice", 2001)
+	if e != nil || !rp.replay || rp.entry.id != p.entry.id {
+		t.Fatalf("replay %+v %v", rp, e)
+	}
+	if _, e := planDelete("demo", "doc1", testMeta, testTip, tomb, other, "", "", "alice", 2001); e == nil || e.Status != 410 {
+		t.Fatalf("double delete: %v", e)
+	}
+}
+
+func TestPlanWriteRestore(t *testing.T) {
+	p0, _ := plan(t, nil, nil, "")
+	tid := ids.Tombstone(mustParse(p0.rev.id)).String()
+	tomb := &resRow{headPos: 2, headID: tid, entryID: "e", state: "tombstoned", lastID: p0.rev.id, lastPos: 1}
+
+	// A write on a tombstone restores (§6.2): the parent is the tombstone
+	// id, the patches root-replace from nothing, and the RES update clears
+	// the last-revision markers.
+	p, e := planWrite("demo", "doc1", testMeta, testTip, tomb, nil, "", testPatches, "", "", "alice", 3000, applyPatches)
+	if e != nil {
+		t.Fatalf("planWrite: %v", e)
+	}
+	if !p.restore || p.create || p.rev.parentID != tid || p.rev.pos != 3 {
+		t.Fatalf("restore plan %+v", p)
+	}
+	if p.doc != `{"a":1}` {
+		t.Fatalf("restored document %q", p.doc)
+	}
+	tx := buildWriteTx("tbl", "demo", "doc1", p)
+	if u := *tx[actRes].Update.UpdateExpression; !strings.HasSuffix(u, "REMOVE lastId, lastPos") {
+		t.Fatalf("RES update %q", u)
+	}
+	// Its revision id differs from the pre-delete genesis's, whose parent
+	// was nil: chains don't alias across a tombstone.
+	if p.rev.id == p0.rev.id {
+		t.Fatalf("restore aliases the genesis id %q", p.rev.id)
+	}
+}
+
+func mustParse(s string) ids.ID {
+	id, err := ids.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return id
 }
