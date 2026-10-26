@@ -285,8 +285,6 @@ func TestDDBUnsupported(t *testing.T) {
 	check("purge", err)
 	_, err = e.NamespaceEvents(ctx, "demo", "", 0, Credentials{})
 	check("events", err)
-	_, err = e.WriteResource(ctx, Request{NS: "demo"}, Item{Resource: "d", Steps: []Step{{Delete: true}}})
-	check("delete", err)
 
 	// Encrypted namespaces are refused at creation.
 	_, err = e.WriteConfig(ctx, Request{NS: "enc"}, ConfigChange{IfNoneMatch: true, Patches: patches(t, `[{"op":"add","path":"","value":{"encryption":{"level":"sealed"}}}]`)})
@@ -319,4 +317,122 @@ func assertStatus(t *testing.T, err error, status int, code string) {
 	if ae.Status != status || ae.Code() != code {
 		t.Fatalf("want %d %s, got %d %v", status, code, ae.Status, ae.Body)
 	}
+}
+
+func TestDDBTombstoneRestore(t *testing.T) {
+	e := ddbEngine(t)
+	ctx := context.Background()
+	ddbCreateNS(t, e, "demo", `{"read":"public"}`)
+
+	w1 := ddbWrite(t, e, "demo", "doc1", "", `[{"op":"add","path":"","value":{"n":1,"$successor":"doc2"}}]`)
+	w2 := ddbWrite(t, e, "demo", "doc1", w1.Items[0].IDs[0], `[{"op":"add","path":"/m","value":2}]`)
+	head2 := w2.Items[0].IDs[0]
+
+	// The preconditions: 428 without If-Match, 412 with a stale one.
+	_, err := e.WriteResource(ctx, Request{NS: "demo"}, Item{Resource: "doc1", Steps: []Step{{Delete: true}}})
+	assertStatus(t, err, 428, "precondition_required")
+	_, err = e.WriteResource(ctx, Request{NS: "demo"}, Item{Resource: "doc1", IfMatch: w1.Items[0].IDs[0], Steps: []Step{{Delete: true}}})
+	assertStatus(t, err, 412, "stale")
+
+	// DELETE: the head is a tombstone, with Last and the document's
+	// $successor (§8.1).
+	del, err := e.WriteResource(ctx, Request{NS: "demo"},
+		Item{Resource: "doc1", IfMatch: head2, Steps: []Step{{Delete: true, Gesture: "gaaaaaaaaaaaaaaaaaaaaaaaaa"}}})
+	if err != nil || del.Status != 201 || del.Entry.Kind != "tombstone" {
+		t.Fatalf("delete: %+v %v", del, err)
+	}
+	tid := del.Items[0].IDs[0]
+	head, err := e.ResourceHead(ctx, "demo", "doc1", Credentials{})
+	if err != nil || head.State != Tombstoned || head.Head != tid || head.Last != head2 || head.Successor != "doc2" {
+		t.Fatalf("tombstoned head: %+v %v", head, err)
+	}
+
+	// Reads: raw and the head rev are 410 "tombstone"; the last live
+	// revision still reads; the tombstone id itself is 410.
+	rev, err := e.ResourceRev(ctx, "demo", "doc1", "", Credentials{})
+	if err != nil || rev.Status != 410 || rev.Code != "tombstone" {
+		t.Fatalf("rev at tombstoned head: %+v %v", rev, err)
+	}
+	rev, err = e.ResourceRev(ctx, "demo", "doc1", tid, Credentials{})
+	if err != nil || rev.Status != 410 || rev.Code != "tombstone" {
+		t.Fatalf("rev at tombstone: %+v %v", rev, err)
+	}
+	rev, err = e.ResourceRev(ctx, "demo", "doc1", head2, Credentials{})
+	if err != nil || rev.Status != 200 || string(rev.Doc) != `{"$successor":"doc2","m":2,"n":1}` {
+		t.Fatalf("rev at last live: %+v %v", rev, err)
+	}
+
+	// Logs: the resource log serves the tombstone (no patches), the
+	// namespace log its entry, /heads the kind.
+	rl, err := e.ResourceLog(ctx, "demo", "doc1", "", "", 0, Credentials{})
+	if err != nil || len(rl.Entries) != 3 {
+		t.Fatalf("resource log: %+v %v", rl, err)
+	}
+	te := rl.Entries[2]
+	if te["kind"] != "tombstone" || te["id"] != tid || te["parent"] != head2 || te["gesture"] != "gaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("tombstone entry: %v", te)
+	}
+	if _, has := te["patches"]; has {
+		t.Fatalf("a tombstone serves no patches: %v", te)
+	}
+	nl, err := e.NamespaceLog(ctx, "demo", "", "", 0, Credentials{})
+	if err != nil || nl.Entries[len(nl.Entries)-1]["kind"] != "tombstone" {
+		t.Fatalf("ns log: %+v %v", nl, err)
+	}
+	heads, err := e.NamespaceHeads(ctx, "demo", "", "", Credentials{})
+	if err != nil || len(heads.Items) != 1 {
+		t.Fatalf("heads: %+v %v", heads, err)
+	}
+	item := heads.Items[0]
+	if item["kind"] != "tombstone" || item["target"] != tid {
+		t.Fatalf("heads item: %v", item)
+	}
+	if _, has := item["digest"]; has {
+		t.Fatalf("a tombstone lists no digest: %v", item)
+	}
+
+	// Replay and double delete; a PUT create is 412 on a tombstone.
+	rep, err := e.WriteResource(ctx, Request{NS: "demo"},
+		Item{Resource: "doc1", IfMatch: head2, Steps: []Step{{Delete: true}}})
+	if err != nil || rep.Status != 200 || !rep.Replayed || rep.Items[0].IDs[0] != tid {
+		t.Fatalf("replay: %+v %v", rep, err)
+	}
+	_, err = e.WriteResource(ctx, Request{NS: "demo"},
+		Item{Resource: "doc1", IfMatch: w1.Items[0].IDs[0], Steps: []Step{{Delete: true}}})
+	assertStatus(t, err, 410, "gone")
+	_, err = e.WriteResource(ctx, Request{NS: "demo"},
+		Item{Resource: "doc1", IfNoneMatch: true, Steps: []Step{{Patches: patches(t, `[{"op":"add","path":"","value":{}}]`)}}})
+	assertStatus(t, err, 412, "stale")
+
+	// Restore (§6.2's verb): the parent is the tombstone, the document
+	// root-replaces, the fold crosses the chain boundary.
+	rst := ddbWrite(t, e, "demo", "doc1", tid, `[{"op":"add","path":"","value":{"fresh":true}}]`)
+	head, err = e.ResourceHead(ctx, "demo", "doc1", Credentials{})
+	if err != nil || head.State != Live || head.Head != rst.Items[0].IDs[0] || head.Last != "" {
+		t.Fatalf("restored head: %+v %v", head, err)
+	}
+	rev, err = e.ResourceRev(ctx, "demo", "doc1", rst.Items[0].IDs[0], Credentials{})
+	if err != nil || string(rev.Doc) != `{"fresh":true}` {
+		t.Fatalf("restored rev: %+v %v", rev, err)
+	}
+	rl, err = e.ResourceLog(ctx, "demo", "doc1", "", "", 0, Credentials{})
+	if err != nil || len(rl.Entries) != 4 || rl.Entries[3]["parent"] != tid {
+		t.Fatalf("log after restore: %+v %v", rl, err)
+	}
+	heads, err = e.NamespaceHeads(ctx, "demo", "", "", Credentials{})
+	if err != nil || heads.Items[0]["kind"] != "head" || heads.Items[0]["digest"] == "" {
+		t.Fatalf("heads after restore: %+v %v", heads, err)
+	}
+}
+
+func TestDDBDeleteRule(t *testing.T) {
+	e := ddbEngine(t)
+	ctx := context.Background()
+	// A rule reading the delete envelope: refuse deletes of documents
+	// with a "locked" member (§6.4.1's doc on deletes).
+	ddbCreateNS(t, e, "ruled", `{"read":"public","rules":[{"if":[{"op":"test","path":"/action","value":"delete"},{"op":"test","path":"/doc/locked","exists":true}],"then":[{"op":"test","path":"/action","value":"restore"}]}]}`)
+	w := ddbWrite(t, e, "ruled", "doc1", "", `[{"op":"add","path":"","value":{"locked":true}}]`)
+	_, err := e.WriteResource(ctx, Request{NS: "ruled"},
+		Item{Resource: "doc1", IfMatch: w.Items[0].IDs[0], Steps: []Step{{Delete: true}}})
+	assertStatus(t, err, 422, "rule")
 }

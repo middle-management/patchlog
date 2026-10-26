@@ -9,11 +9,12 @@ package core
 // cover answers 501 rather than falling through to SQL.
 //
 // Deliberate gaps, all surfaced as 501 "unsupported": grants and private
-// reads (writes require -dev), batches and multi-step items, tombstones
-// and restores, branches, purges and pruning, blobs, sealed and e2e
-// namespaces, $schema validation, nonce-required namespaces, gestures
-// listing, SSE events, author signatures, rate limiting, head snapshots
-// (revisions fold from the genesis).
+// reads (writes require -dev), batches and multi-step items, branches,
+// purges and pruning, blobs, sealed and e2e namespaces, $schema
+// validation, nonce-required namespaces, gestures listing, SSE events,
+// author signatures, rate limiting, head snapshots (revisions fold from
+// the genesis). Tombstones and restores work (§8.1): DELETE with
+// If-Match, replay, the 410 serving paths, and the restore verb.
 
 import (
 	"context"
@@ -171,15 +172,25 @@ func (e *Engine) ddbGate(ns, name string, patches any, st *ddb.WriteState) *Erro
 	if err := ddbRefusals(cfg); err != nil {
 		return err
 	}
-	if d, ok := st.Doc.(map[string]any); ok {
-		if _, typed := d["$schema"]; typed {
-			return ddbUnsupported("$schema validation")
-		}
-	}
 
-	canon := jsonv.Canonical(patches)
-	if err := ddbCheckLimits(cfg.Limits, patches, canon, st.DocCanon); err != nil {
-		return err
+	// The envelope's document and patches: a write's result and its patch
+	// set; a delete's last live document and none (stepEnvelope, §6.4.1).
+	// The $schema refusal and the limits are a write's; a delete writes
+	// no document.
+	doc := st.Doc
+	var canon []byte
+	if st.Action == "delete" {
+		doc = st.HeadDoc
+	} else {
+		if d, ok := st.Doc.(map[string]any); ok {
+			if _, typed := d["$schema"]; typed {
+				return ddbUnsupported("$schema validation")
+			}
+		}
+		canon = jsonv.Canonical(patches)
+		if err := ddbCheckLimits(cfg.Limits, patches, canon, st.DocCanon); err != nil {
+			return err
+		}
 	}
 
 	// Step 6, namespace rules: the §6.4.1 envelope, with patches only
@@ -190,15 +201,19 @@ func (e *Engine) ddbGate(ns, name string, patches any, st *ddb.WriteState) *Erro
 		"now":       formatTime(e.opt.Now().UnixMilli()),
 		"principal": nil,
 		"writes":    stringsToAny(st.Writes),
-		"doc":       st.Doc,
+		"doc":       doc,
 	}
 	if name != "" {
 		env["resource"] = name
 	}
-	for _, r := range cfg.Rules {
-		if refs := r.Refs(); refs["patches"] || refs["*"] {
-			env["patches"] = jsonv.MustParse(canon)
-			break
+	if st.Action == "delete" {
+		env["patches"] = []any{}
+	} else {
+		for _, r := range cfg.Rules {
+			if refs := r.Refs(); refs["patches"] || refs["*"] {
+				env["patches"] = jsonv.MustParse(canon)
+				break
+			}
 		}
 	}
 	if i, path, ok := rules.EvalList(cfg.Rules, env); !ok {
@@ -266,9 +281,6 @@ func (e *Engine) ddbWriteResource(ctx context.Context, req Request, item Item) (
 		return nil, ddbUnsupported("multi-step items")
 	}
 	step := item.Steps[0]
-	if step.Delete {
-		return nil, ddbUnsupported("tombstones (phase 2)")
-	}
 	if step.Signature != "" {
 		return nil, ddbUnsupported("author signatures")
 	}
@@ -276,6 +288,9 @@ func (e *Engine) ddbWriteResource(ctx context.Context, req Request, item Item) (
 		return nil, err
 	}
 	author := ddbAuthor(req.Cred)
+	if step.Delete {
+		return e.ddbDelete(ctx, req, item, step, author)
+	}
 	res, err := e.ddb.store.WriteResource(ctx, req.NS, item.Resource, item.IfMatch, step.Patches, step.Gesture, step.Undoes, author,
 		func(st *ddb.WriteState) error {
 			if item.IfNoneMatch && st.ResExists {
@@ -299,6 +314,36 @@ func (e *Engine) ddbWriteResource(ctx context.Context, req Request, item Item) (
 		Items:    []ItemResult{{Resource: item.Resource, IDs: []string{res.ID}}},
 		Entry: &LogEntry{
 			ID: res.NSID, Kind: "head", Author: author,
+			Created: formatTime(res.Created),
+			Gesture: step.Gesture, Undoes: step.Undoes,
+		},
+	}, nil
+}
+
+// ddbDelete is a tombstone write (§7.2's DELETE): the store pins the
+// checked head, the gate sees the delete envelope (§6.4.1: the last live
+// document, no patches).
+func (e *Engine) ddbDelete(ctx context.Context, req Request, item Item, step Step, author string) (*WriteResult, error) {
+	res, err := e.ddb.store.DeleteResource(ctx, req.NS, item.Resource, item.IfMatch, step.Gesture, step.Undoes, author,
+		func(st *ddb.WriteState) error {
+			if perr := e.ddbGate(req.NS, item.Resource, nil, st); perr != nil {
+				return perr
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, ddbAsErr(err)
+	}
+	if !res.Replayed {
+		e.ddbCommitted(req.NS, "r:"+req.NS+"/"+item.Resource, "heads:"+req.NS)
+	}
+	return &WriteResult{
+		Status:   res.Status,
+		NSID:     res.NSID,
+		Replayed: res.Replayed,
+		Items:    []ItemResult{{Resource: item.Resource, IDs: []string{res.ID}}},
+		Entry: &LogEntry{
+			ID: res.NSID, Kind: "tombstone", Author: author,
 			Created: formatTime(res.Created),
 			Gesture: step.Gesture, Undoes: step.Undoes,
 		},
@@ -413,15 +458,27 @@ func (e *Engine) ddbResourceHead(ctx context.Context, ns, name string, cred Cred
 	if err != nil {
 		return nil, err
 	}
-	_, headID, derr := e.ddb.store.ReadHead(ctx, ns, name)
+	head, derr := e.ddb.store.ReadHead(ctx, ns, name)
 	if derr != nil {
-		var de *ddb.Error
-		if errors.As(derr, &de) && de.Status == 404 {
-			return &Head{State: NotFound, Public: public}, nil
-		}
 		return nil, ddbAsErr(derr)
 	}
-	return &Head{State: Live, Head: headID, Public: public}, nil
+	if head == nil {
+		return &Head{State: NotFound, Public: public}, nil
+	}
+	if !head.Live {
+		h := &Head{State: Tombstoned, Head: head.ID, Last: head.LastID, Public: public}
+		// Successor is the last live document's well-formed top-level
+		// $successor (§8.1, §6.5), as the SQL path serves it.
+		if doc, _, err := e.ddb.store.FoldResource(ctx, ns, name, head.LastPos); err == nil {
+			if m, ok := doc.(map[string]any); ok {
+				if s, ok := m["$successor"]; ok && schema.Successor(s) {
+					h.Successor, _ = s.(string)
+				}
+			}
+		}
+		return h, nil
+	}
+	return &Head{State: Live, Head: head.ID, Public: public}, nil
 }
 
 func (e *Engine) ddbResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
@@ -430,15 +487,17 @@ func (e *Engine) ddbResourceRev(ctx context.Context, ns, name, id string, cred C
 		return nil, err
 	}
 	if id == "" {
-		_, h, herr := e.ddb.store.ReadHead(ctx, ns, name)
+		head, herr := e.ddb.store.ReadHead(ctx, ns, name)
 		if herr != nil {
-			var de *ddb.Error
-			if errors.As(herr, &de) && de.Status == 404 {
-				return &Rev{Status: 404, Public: public}, nil
-			}
 			return nil, ddbAsErr(herr)
 		}
-		id = h
+		if head == nil {
+			return &Rev{Status: 404, Public: public}, nil
+		}
+		if !head.Live {
+			return &Rev{Status: 410, Code: "tombstone", Public: public}, nil
+		}
+		id = head.ID
 	}
 	rev, derr := e.ddb.store.ReadRevByID(ctx, ns, id)
 	if derr != nil {
@@ -446,6 +505,9 @@ func (e *Engine) ddbResourceRev(ctx context.Context, ns, name, id string, cred C
 	}
 	if rev == nil || rev.Name != name {
 		return &Rev{Status: 404, Public: public}, nil
+	}
+	if rev.Kind == "tombstone" {
+		return &Rev{Status: 410, Code: "tombstone", Public: public}, nil
 	}
 	_, canon, derr := e.ddb.store.FoldResource(ctx, ns, name, rev.Pos)
 	if derr != nil {
@@ -480,12 +542,12 @@ func (e *Engine) ddbResourceLog(ctx context.Context, ns, name, id, since string,
 	// The upper bound: the id's position, or the head's for "".
 	var toPos uint64
 	if id == "" {
-		if _, _, err := e.ddb.store.ReadHead(ctx, ns, name); err != nil {
-			var de *ddb.Error
-			if errors.As(err, &de) && de.Status == 404 {
-				return &Log{Status: 404, Public: public}, nil
-			}
-			return nil, ddbAsErr(err)
+		head, derr := e.ddb.store.ReadHead(ctx, ns, name)
+		if derr != nil {
+			return nil, ddbAsErr(derr)
+		}
+		if head == nil {
+			return &Log{Status: 404, Public: public}, nil
 		}
 	} else {
 		pos, err := e.ddb.store.RevPos(ctx, ns, name, id)
@@ -521,9 +583,12 @@ func (e *Engine) ddbResourceLog(ctx context.Context, ns, name, id, since string,
 			break
 		}
 		e := map[string]any{
-			"id": re.ID, "kind": "head", "patches": re.Patches,
+			"id": re.ID, "kind": re.Kind,
 			"author": re.Author, "created": formatTime(re.Created),
 			"grant": nil,
+		}
+		if re.Kind != "tombstone" {
+			e["patches"] = re.Patches
 		}
 		if re.ParentID != "" {
 			e["parent"] = re.ParentID
@@ -610,8 +675,12 @@ func (e *Engine) ddbNamespaceHeads(ctx context.Context, ns, nsID, after string, 
 	}
 	out.Next = next
 	for _, h := range page {
-		item := map[string]any{"resource": h.Name, "kind": "head", "target": h.ID}
-		if h.Created != 0 {
+		kind := "head"
+		if h.Tombstoned {
+			kind = "tombstone"
+		}
+		item := map[string]any{"resource": h.Name, "kind": kind, "target": h.ID}
+		if !h.Tombstoned && h.Created != 0 {
 			item["created"] = formatTime(h.Created)
 			item["size"] = float64(h.Size)
 			item["digest"] = ReprDigest(h.Digest)
