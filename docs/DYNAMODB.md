@@ -464,3 +464,60 @@ large patch sets and documents (§3).
 - ~~One sort-key condition per query for paged listings~~ — answered by
   the spike: first page `begins_with`, later pages `SK > cursor` stopping
   at the prefix boundary.
+
+## 13. Status: phase 1 integrated
+
+Phase 1 of §10's path C is implemented and wired in, behind the `-db`
+URL scheme:
+
+```sh
+patchlog -dev -db 'dynamodb://patchlog?region=eu-west-1'          # AWS
+patchlog -dev -db 'dynamodb://spike?region=us-east-1&endpoint=http://localhost:8000'
+```
+
+The table is pre-created (PAY_PER_REQUEST is fine) with the key schema of
+§3 and GSI1 (`G1PK`, project ALL); phase 1 does not create it for you.
+
+What landed, beyond the spike:
+
+- **`internal/core/ddb.go`, the seam.** `core.Open` branches on
+  `ddb.IsURL(opt.Path)`; the Engine keeps a `*ddbBackend` and every
+  phase-1 method delegates: `WriteResource` (single patch-set step),
+  `WriteConfig` (creates and changes), `ResourceHead/Raw/Rev/Log`,
+  `NamespaceHead/Rev/Log/Heads`, `NamespaceLiveLog`, `Wait`, `Ping`,
+  `Close`. Everything else the server can reach answers **501
+  "unsupported"** rather than falling through to SQL: batches and
+  multi-step items, tombstones/restores, branches, purges and pruning,
+  blobs, sealed/e2e, grants (`Grant`, `Principal`, `Keys`,
+  `IssueEdgeGrants`), gestures listing, event streams, author signatures.
+- **The thin gate (§6.2 subset).** The store's check hook runs *after*
+  planning, inside the retry loop, so limits (step 2) and namespace rules
+  (step 6, against the §6.4.1 envelope — `doc` always, `patches` when a
+  rule reads them, `principal: null` in `-dev`) evaluate the document the
+  transaction will actually commit, re-done on every attempt (D.3's
+  recheck shape). Refused configurations (`encryption`, `nonce:
+  required`, `base`, `successor`, `$schema` documents) are 501 at
+  create/change/write time, as §10 prescribes ("refuse at Open or at
+  namespace-config time").
+- **Reads as items.** Revision-by-id is GSI1; `…/rev/{id}` folds from the
+  genesis (snapshots are a later phase); `…/rev/{nsID}` joins the entry's
+  denormalized `cfgPos` (the `ns_log.config_seq` of the SQL schema);
+  `/heads` serves `created`/`size`/`digest` off the RES item's head
+  metadata; log entries serve `grant: null` in `-dev`, with gestures
+  merged in unhashed (§7.4).
+- **Errors in the core's body shape** (`{"code": …}`), so the HTTP layer
+  serves either backend alike.
+
+Requirements and limits, by design: `-dev` (writes need authentication
+disabled; reads of non-`public` namespaces are 501), one instance (no
+stream invalidation — §6 is phase 3), no background loops (retention,
+sweeps, rotation, remote follow don't start). Group commit (§4) remains
+phase 2: the optimistic `#TIP` retry of §11 stands, lowered concurrency
+expectations with it.
+
+Tests: `internal/core/ddb_test.go` runs the phase-1 surface end to end
+against DynamoDB Local (flow, the gate's 404/409/412/413/422 answers,
+the 501s, the `-dev` requirement), gated on `DDB_ENDPOINT` like
+`internal/ddb`'s; CI runs them against a `dynamodb-local` service
+container. The full suite passes with and without the endpoint — the SQL
+backends are untouched when `e.ddb` is nil.

@@ -11,6 +11,15 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      # DynamoDB Local, for internal/ddb's and internal/core's
+      # DDB_ENDPOINT-gated integration tests (docs/DYNAMODB.md).
+      dynamodb:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8000:8000
+    env:
+      DDB_ENDPOINT: http://localhost:8000
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
