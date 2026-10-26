@@ -482,13 +482,15 @@ What landed, beyond the spike:
 
 - **`internal/core/ddb.go`, the seam.** `core.Open` branches on
   `ddb.IsURL(opt.Path)`; the Engine keeps a `*ddbBackend` and every
-  phase-1 method delegates: `WriteResource` (single patch-set step),
-  `WriteConfig` (creates and changes), `ResourceHead/Raw/Rev/Log`,
-  `NamespaceHead/Rev/Log/Heads`, `NamespaceLiveLog`, `Wait`, `Ping`,
-  `Close`. Everything else the server can reach answers **501
-  "unsupported"** rather than falling through to SQL: batches and
-  multi-step items, tombstones/restores, branches, purges and pruning,
-  blobs, sealed/e2e, grants (`Grant`, `Principal`, `Keys`,
+  phase-1 method delegates: `WriteResource` (single patch-set step, and
+  DELETE's tombstone step — §8.1 works end to end: the deterministic
+  tombstone id, replay, restore as §6.2's verb, the 410 serving paths
+  with `Last` and `$successor`), `WriteConfig` (creates and changes),
+  `ResourceHead/Raw/Rev/Log`, `NamespaceHead/Rev/Log/Heads`,
+  `NamespaceLiveLog`, `Wait`, `Ping`, `Close`. Everything else the
+  server can reach answers **501 "unsupported"** rather than falling
+  through to SQL: batches and multi-step items, branches, purges and
+  pruning, blobs, sealed/e2e, grants (`Grant`, `Principal`, `Keys`,
   `IssueEdgeGrants`), gestures listing, event streams, author signatures.
 - **The thin gate (§6.2 subset).** The store's check hook runs *after*
   planning, inside the retry loop, so limits (step 2) and namespace rules
