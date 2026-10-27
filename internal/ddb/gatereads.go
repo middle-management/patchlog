@@ -236,7 +236,7 @@ func (s *Store) docBelow(ctx context.Context, ns, name string, res *resRow, pos 
 			from = k
 		}
 	}
-	if p, err := s.newestPruned(ctx, ns, name, from, pos); err != nil || p > 0 {
+	if p, err := s.newestPruned(ctx, ns, name, from, pos, res.horizonPos); err != nil || p > 0 {
 		if err == nil {
 			err = &PrunedError{NS: ns, Name: name, Pos: p}
 		}

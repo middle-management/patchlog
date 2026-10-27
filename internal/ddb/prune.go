@@ -233,19 +233,21 @@ func (s *Store) PrunedBelow(ctx context.Context, ns, name string, from, to uint6
 	if err != nil || res == nil || res.horizonPos == 0 {
 		return 0, err
 	}
-	return s.newestPruned(ctx, ns, name, from, min(to, res.horizonPos-1))
+	return s.newestPruned(ctx, ns, name, from, min(to, res.horizonPos), res.horizonPos)
 }
 
-// newestPruned is the newest revision of name in (from, to], all below
-// the horizon, whose patch set is gone (PrunedBelow).
-func (s *Store) newestPruned(ctx context.Context, ns, name string, from, to uint64) (uint64, error) {
+// newestPruned is the newest revision of name in (from, to], none above
+// the horizon, whose patch set is gone (PrunedBelow): the horizon's own
+// only if it has none (a remote branch's shadow mirrors a pruned base's
+// horizon without one, §G.3), as SQL's prunedIn looks up to it.
+func (s *Store) newestPruned(ctx context.Context, ns, name string, from, to, horizon uint64) (uint64, error) {
 	unfinished, err := s.pruning(ctx, ns, name)
 	if err != nil {
 		return 0, err
 	}
 	var pos uint64
 	err = s.newestFirst(ctx, ns, name, from, to, func(i item) bool {
-		if i.s("kind") != "tombstone" && (unfinished || !i.has("patches")) {
+		if i.s("kind") != "tombstone" && (unfinished && i.n("pos") < horizon || !i.has("patches")) {
 			pos = i.n("pos")
 			return false
 		}

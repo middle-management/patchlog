@@ -850,7 +850,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 
 // checkRemoteGenesis authenticates the operator grant and checks the
 // genesis of a remote branch (§C.4, §G.3).
-func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[string]any, *actor, *Error) {
+func (t *gate) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[string]any, *actor, *Error) {
 	if !ValidNSName(req.NS) {
 		return nil, nil, nil, badInput("invalid namespace name")
 	}
@@ -948,36 +948,9 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 // insertRemoteBranch inserts the shadow, the mirrored schemas and the
 // branch, all verified before the transaction opened.
 func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc map[string]any, m *remoteMirror, author int64) (*WriteResult, *Error) {
-	// The obligations of §G.5, which the base can't enforce.
-	if cfg.Read == "public" && m.read != "public" {
-		return nil, invalid("a branch of a non-public namespace cannot be public (§G.5): make it private (read: grant) or sealed")
-	}
-	if cfg.level < m.level {
-		return nil, invalid(fmt.Sprintf("/encryption: a branch cannot have a lower encryption level than its base, which is %s (§G.5)", levelNames[m.level]))
-	}
-	if cfg.level == levelE2E && m.level != levelE2E {
-		return nil, invalid("/encryption: a branch can be e2e only if its base is")
-	}
-	if m.levels[0].nonce && !cfg.NonceRequired {
-		return nil, invalid(`/nonce: the base requires nonces, so a remote branch of it must be created with "nonce": "required" too, or merging it back would fail (§C.7, §G.3)`)
-	}
-	// base.chain records the namespaces followed while verifying (§G.3):
-	// readers of an e2e branch accept read-through ciphertext bound to any
-	// of them. A genesis may give it, and must then give it right;
-	// otherwise it is added, and the genesis becomes one add of the whole
-	// document, as stored.
-	chain := make([]any, len(m.levels))
-	for i, lv := range m.levels {
-		chain[i] = lv.ns
-	}
-	if cfg.Base.Chain != nil {
-		if !jsonv.Equal(anyStrings(cfg.Base.Chain), chain) {
-			return nil, invalid(fmt.Sprintf("/base/chain must be %v: the base's namespace and its bases as of at", chain))
-		}
-	} else {
-		doc = jsonv.Clone(doc).(map[string]any)
-		doc["base"].(map[string]any)["chain"] = chain
-		cc.Patches = []any{map[string]any{"op": "add", "path": "", "value": doc}}
+	cc, doc, oerr := remoteObligations(cfg, doc, cc, m)
+	if oerr != nil {
+		return nil, oerr
 	}
 	// The shadows' mirrored rows follow the branch's level.
 	if t.shadowLevels == nil {
@@ -1005,6 +978,43 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 		shadow.id, bid, m.base.Origin, m.base.NS, m.base.At, m.base.At)
 	t.must(err)
 	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: cfgID.String()}, nil
+}
+
+// remoteObligations checks a remote branch's genesis against what its
+// verified base binds it to (§G.5, §C.7), which the base can't enforce,
+// and records base.chain in it: the genesis and document as stored.
+func remoteObligations(cfg *Config, doc map[string]any, cc ConfigChange, m *remoteMirror) (ConfigChange, map[string]any, *Error) {
+	if cfg.Read == "public" && m.read != "public" {
+		return cc, nil, invalid("a branch of a non-public namespace cannot be public (§G.5): make it private (read: grant) or sealed")
+	}
+	if cfg.level < m.level {
+		return cc, nil, invalid(fmt.Sprintf("/encryption: a branch cannot have a lower encryption level than its base, which is %s (§G.5)", levelNames[m.level]))
+	}
+	if cfg.level == levelE2E && m.level != levelE2E {
+		return cc, nil, invalid("/encryption: a branch can be e2e only if its base is")
+	}
+	if m.levels[0].nonce && !cfg.NonceRequired {
+		return cc, nil, invalid(`/nonce: the base requires nonces, so a remote branch of it must be created with "nonce": "required" too, or merging it back would fail (§C.7, §G.3)`)
+	}
+	// base.chain records the namespaces followed while verifying (§G.3):
+	// readers of an e2e branch accept read-through ciphertext bound to any
+	// of them. A genesis may give it, and must then give it right;
+	// otherwise it is added, and the genesis becomes one add of the whole
+	// document, as stored.
+	chain := make([]any, len(m.levels))
+	for i, lv := range m.levels {
+		chain[i] = lv.ns
+	}
+	if cfg.Base.Chain != nil {
+		if !jsonv.Equal(anyStrings(cfg.Base.Chain), chain) {
+			return cc, nil, invalid(fmt.Sprintf("/base/chain must be %v: the base's namespace and its bases as of at", chain))
+		}
+	} else {
+		doc = jsonv.Clone(doc).(map[string]any)
+		doc["base"].(map[string]any)["chain"] = chain
+		cc.Patches = []any{map[string]any{"op": "add", "path": "", "value": doc}}
+	}
+	return cc, doc, nil
 }
 
 // insertShadows mirrors every level of the base's chain into a shadow of

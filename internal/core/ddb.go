@@ -191,8 +191,6 @@ func ddbRefusals(cfg *Config) *Error {
 	switch {
 	case cfg.Encryption != "":
 		return ddbUnsupported("encrypted namespaces")
-	case cfg.Base != nil && cfg.Base.Origin != "":
-		return ddbUnsupported("remote branches")
 	}
 	return nil
 }

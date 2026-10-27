@@ -293,10 +293,19 @@ func (r *ddbReads) branchesOf(n *nsRow) []*nsRow {
 }
 
 // baseIdentity names a branch's base: its name, which a deployment never
-// reuses (remote bases aren't built here).
+// reuses, or a remote base's origin and name.
 func (r *ddbReads) baseIdentity(n *nsRow) string {
 	if !n.isBranch() {
 		return ""
+	}
+	if b := r.nsByID(n.base.Int64); b.isShadow() {
+		// A remote base: its origin and name, as its #REMOTE item
+		// records them.
+		rb, err := r.s.RemoteBaseOf(r.ctx, n.name)
+		r.must(err)
+		if rb != nil {
+			return rb.Origin + " " + rb.NS
+		}
 	}
 	return r.nsName(n.base.Int64)
 }

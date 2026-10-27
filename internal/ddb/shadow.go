@@ -1,0 +1,340 @@
+package ddb
+
+// Remote branches (§G.3), the branch side. A remote branch is a local
+// branch of a hidden shadow namespace, "~" + its name, which mirrors the
+// base's chain up to at with identical ids; a base that is itself a
+// branch gets a shadow per level, each a branch of the next (core's
+// remote_branch.go). Reads are a local branch's.
+//
+// A shadow's content is unbounded, so it can't be one transaction: it is
+// imported first (ImportShadow, batched puts into a partition nobody reads
+// yet — no branch reads through it), each import stamping its #META with
+// a token, and the remote branch is then created in one transaction
+// (CreateRemoteBranch) that checks every shadow's token: an import that
+// raced it and overwrote a shadow makes it fail. An import first deletes
+// whatever an earlier, failed one left. The branch's #REMOTE item records
+// its base (origin, ns, at) and how far its log was followed (checkpoint,
+// remote.go's following).
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"sort"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/jsonv"
+)
+
+// ShadowImport is one shadow's mirrored content.
+type ShadowImport struct {
+	Name string
+	// Base is the shadow below, "" for the bottom one, at BaseAt in it.
+	Base   string
+	BaseAt uint64
+	// The shadow's configuration genesis: its id, patch set and document.
+	CfgID, CfgPatches, CfgDoc string
+	Author                    string // the genesis's
+	Created                   int64
+	Log                       []ShadowEntry
+	Res                       []ShadowRes
+}
+
+// ShadowEntry is a mirrored namespace log entry: its id, kind and hashed
+// body as verified.
+type ShadowEntry struct {
+	ID, Kind, Body, Author string
+	Created                int64
+}
+
+// ShadowRes is a mirrored resource: its chain from position 1, or for a
+// resource purged at the base only its head.
+type ShadowRes struct {
+	Name   string
+	Purged bool
+	Revs   []ShadowRev
+	// ParentNS and ParentPos are the first revision's foreign parent in
+	// the shadow below.
+	ParentNS  string
+	ParentPos uint64
+	// EntryIdx is the log entry (index into Log) that set the head.
+	EntryIdx int
+	// HeadDoc is the last live document, at LastLivePos (0: in the
+	// parent's chain; "" none).
+	HeadDoc     string
+	LastLivePos uint64
+	// HorizonPos is the base's pruning horizon (0: none), whose document
+	// is HorizonDoc.
+	HorizonPos uint64
+	HorizonDoc string
+	Attach     []ShadowBlob
+}
+
+// ShadowRev is a mirrored revision or tombstone. Patches is "" for a
+// horizon or a tombstone.
+type ShadowRev struct {
+	ID, ParentID, Kind, Patches, Author string
+	Created                             int64
+	Signature, Gesture, Undoes          string
+	SchemaRef                           string
+	Size                                uint64
+	Digest                              []byte
+}
+
+// ShadowBlob is an attachment of a mirrored resource, its bytes stored
+// already (PutBytes), first referenced at RefPos.
+type ShadowBlob struct {
+	Bid, Type, Nonce string
+	Size             int64
+	Hash             []byte
+	RefPos           uint64
+}
+
+// ImportShadow writes a shadow's content, after deleting whatever an
+// earlier import of it left, and returns its token.
+func (s *Store) ImportShadow(ctx context.Context, im *ShadowImport) (string, error) {
+	if err := s.deletePartition(ctx, im.Name); err != nil {
+		return "", err
+	}
+	tok := make([]byte, 16)
+	rand.Read(tok)
+	token := hex.EncodeToString(tok)
+	ns := im.Name
+	var puts []map[string]types.AttributeValue
+	put := func(k Key, it item) { puts = append(puts, withKey(k, it)) }
+
+	meta := &nsMeta{configPos: 1, configID: im.CfgID}
+	if im.Base != "" {
+		meta.base, meta.baseAt, meta.baseCfgPos = im.Base, im.BaseAt, 1
+	}
+	mi := meta.item()
+	mi["importToken"] = avS(token)
+	put(keyMeta(ns), mi)
+	put(keyCfg(ns, 1), item{
+		"pos": avN(1), "id": avS(im.CfgID), "logPos": avN(1), "patches": avS(im.CfgPatches), "doc": avS(im.CfgDoc),
+		"author": avS(im.Author), "created": avI(im.Created), "G1PK": avS(g1RevID(im.CfgID)),
+	})
+	for i, e := range im.Log {
+		l := logRow{pos: uint64(i + 1), id: e.ID, kind: e.Kind, body: e.Body, author: e.Author, created: e.Created, cfgPos: 1}
+		if i > 0 {
+			l.prevPos = uint64(i)
+		}
+		put(keyLog(ns, l.pos), l.item())
+		put(keyNSID(ns, e.ID), item{"ns": avS(ns), "logPos": avN(l.pos)})
+	}
+	if n := len(im.Log); n > 0 {
+		put(keyTip(ns), (&tip{headPos: uint64(n), headID: im.Log[n-1].ID}).item())
+	}
+	for _, r := range im.Res {
+		s.shadowRes(ns, im, &r, put)
+	}
+	put(keyNSList(ns), item{})
+	return token, s.putAll(ctx, puts)
+}
+
+func (s *Store) shadowRes(ns string, im *ShadowImport, r *ShadowRes, put func(Key, item)) {
+	entryID, entryPos := "", uint64(0)
+	if r.EntryIdx >= 0 && r.EntryIdx < len(im.Log) {
+		entryID, entryPos = im.Log[r.EntryIdx].ID, uint64(r.EntryIdx+1)
+	}
+	head := uint64(len(r.Revs))
+	last := r.Revs[head-1]
+	for i, v := range r.Revs {
+		pos := uint64(i + 1)
+		rr := revRow{pos: pos, id: v.ID, kind: v.Kind, parentID: v.ParentID, patches: v.Patches, author: v.Author, created: v.Created,
+			size: v.Size, digest: v.Digest, gesture: v.Gesture, undoes: v.Undoes, schemaRef: v.SchemaRef, signature: v.Signature}
+		if pos == 1 && r.ParentNS != "" {
+			rr.parentNS, rr.parentPos = r.ParentNS, r.ParentPos
+		}
+		if pos == head {
+			rr.logPos = entryPos
+		}
+		it := rr.item()
+		if v.Kind != "tombstone" && v.Patches == "" {
+			delete(it, "patches") // the horizon, or purged at the base
+		}
+		if r.Purged {
+			delete(it, "size")
+			delete(it, "digest")
+		}
+		put(keyRev(ns, r.Name, pos), it)
+	}
+	res := item{"headPos": avN(head), "headId": avS(last.ID), "entryId": avS(entryID)}
+	switch {
+	case r.Purged:
+		res["state"] = avS("purged")
+	case last.Kind == "tombstone":
+		res["state"] = avS("tombstoned")
+		if r.LastLivePos > 0 {
+			res["lastPos"], res["lastId"] = avN(r.LastLivePos), avS(r.Revs[r.LastLivePos-1].ID)
+		}
+	default:
+		res["state"] = avS("live")
+		res["headCreated"], res["headSize"], res["headDigest"] = avI(last.Created), avN(last.Size), avB(last.Digest)
+		if entryPos > 0 {
+			put(keyHist(ns, r.Name, entryPos), item{"revPos": avN(head)})
+		}
+	}
+	if r.HorizonPos > 0 {
+		res["horizonPos"], res["horizonId"], res["horizonBase"] = avN(r.HorizonPos), avS(r.Revs[r.HorizonPos-1].ID), avN(r.HorizonPos)
+		res["keep"], res["kept"] = avS("[]"), avNs([]uint64{r.HorizonPos})
+		put(keySnap(ns, r.Name, r.HorizonPos), item{"pos": avN(r.HorizonPos), "doc": avS(r.HorizonDoc)})
+	}
+	put(keyRes(ns, r.Name), res)
+	if r.HeadDoc != "" {
+		put(keyDocHead(ns, r.Name), item{"revPos": avN(r.LastLivePos), "doc": avS(r.HeadDoc)})
+	}
+	for _, b := range r.Attach {
+		row := &BlobRow{Name: r.Name, Bid: b.Bid, Type: b.Type, Nonce: b.Nonce, Size: b.Size, Hash: b.Hash, Created: im.Created, RefPos: b.RefPos}
+		put(keyBlob(ns, r.Name, b.Bid), row.item())
+	}
+}
+
+// putAll writes items in batches, retrying what DynamoDB leaves
+// unprocessed.
+func (s *Store) putAll(ctx context.Context, items []map[string]types.AttributeValue) error {
+	for len(items) > 0 {
+		n := min(25, len(items))
+		reqs := make([]types.WriteRequest, n)
+		for i, it := range items[:n] {
+			reqs[i] = types.WriteRequest{PutRequest: &types.PutRequest{Item: it}}
+		}
+		items = items[n:]
+		for attempt := 0; len(reqs) > 0; attempt++ {
+			out, err := s.Client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{RequestItems: map[string][]types.WriteRequest{s.Table: reqs}})
+			if err != nil {
+				return err
+			}
+			reqs = out.UnprocessedItems[s.Table]
+			if len(reqs) > 0 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(time.Duration(1<<min(attempt, 6)) * 10 * time.Millisecond):
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// deletePartition deletes every item of ns's partition, and its entry in
+// the namespace list.
+func (s *Store) deletePartition(ctx context.Context, ns string) error {
+	var keys []Key
+	in := &dynamodb.QueryInput{
+		TableName:                 &s.Table,
+		KeyConditionExpression:    strptr("PK = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(nsPK(ns))},
+		ProjectionExpression:      strptr("PK, SK"),
+		ConsistentRead:            boolptr(true),
+	}
+	for {
+		q, err := s.Client.Query(ctx, in)
+		if err != nil {
+			return err
+		}
+		for _, it := range q.Items {
+			keys = append(keys, Key{item(it).s("PK"), item(it).s("SK")})
+		}
+		if len(q.LastEvaluatedKey) == 0 {
+			break
+		}
+		in.ExclusiveStartKey = q.LastEvaluatedKey
+	}
+	for _, k := range keys {
+		if err := s.deleteKey(ctx, k); err != nil {
+			return err
+		}
+	}
+	return s.deleteKey(ctx, keyNSList(ns))
+}
+
+// RemoteBranchCreate is a remote branch's creation: its configuration
+// genesis, as a namespace's, as a branch of Shadow at AtPos, whose
+// shadows' imports (by name, their tokens) it checks, and its base.
+type RemoteBranchCreate struct {
+	NS, Author         string
+	Grant              string
+	NoAuth             bool
+	Patches, Doc       string // canonical
+	Frozen             bool
+	Shadow             string
+	AtPos              uint64
+	Tokens             map[string]string
+	Origin, BaseNS, At string
+}
+
+// CreateRemoteBranch creates a remote branch over its imported shadows;
+// 412 if the name is taken, ErrStale if a shadow isn't the import the
+// caller made.
+func (s *Store) CreateRemoteBranch(ctx context.Context, c *RemoteBranchCreate) (cfgID, nsID string, err error) {
+	cfg := ids.Revision(nil, []byte(c.Patches))
+	body := jsonv.Canonical(map[string]any{"kind": "config", "target": cfg.String()})
+	entryID := ids.Hash(nil, body)
+	now := s.now().UnixMilli()
+	entry := logRow{pos: 1, id: entryID.String(), kind: "config", body: string(body), author: c.Author, created: now, cfgPos: 1,
+		grantID: c.Grant, noAuth: c.NoAuth}
+	meta := &nsMeta{frozen: c.Frozen, configPos: 1, configID: cfg.String(), base: c.Shadow, baseAt: c.AtPos, baseCfgPos: 1}
+	acts := buildCreateTx(s.Table, c.NS, meta, cfg.String(), c.Patches, c.Doc, entry)
+	acts = append(acts, deployFirst(s.Table, now),
+		types.TransactWriteItem{Put: &types.Put{TableName: &s.Table, Item: withKey(keyNSList(c.NS), item{})}},
+		types.TransactWriteItem{Put: &types.Put{TableName: &s.Table, Item: withKey(keyRemote(c.NS), item{
+			"shadow": avS(c.Shadow), "origin": avS(c.Origin), "ns": avS(c.BaseNS), "at": avS(c.At), "checkpoint": avS(c.At),
+		})}},
+	)
+	names := make([]string, 0, len(c.Tokens))
+	for name := range c.Tokens {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		acts = append(acts, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+			TableName: &s.Table, Key: keyAV(keyMeta(name)),
+			ConditionExpression:       strptr("importToken = :t"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":t": avS(c.Tokens[name])},
+		}})
+	}
+	if c.Grant != "" {
+		acts = append(acts, grantMark(s.Table, c.NS, c.Grant, 1))
+	}
+	_, err = s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: acts})
+	var ce *types.TransactionCanceledException
+	if errors.As(err, &ce) {
+		if r := ce.CancellationReasons; len(r) > 0 && r[0].Code != nil && *r[0].Code == "ConditionalCheckFailed" {
+			return "", "", apiErr(412, "stale")
+		}
+		return "", "", ErrStale
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return cfg.String(), entryID.String(), nil
+}
+
+func keyRemote(ns string) Key { return Key{nsPK(ns), "#REMOTE"} }
+
+// RemoteBase is a remote branch's base as its #REMOTE item records it.
+type RemoteBase struct {
+	Branch, Shadow string
+	Origin, NS, At string
+	Checkpoint     string
+	RegNSID        string // the registration's latest entry at the base, "" for none
+	RegExpires     int64
+}
+
+// RemoteBaseOf reads branch's base; nil if it isn't a remote branch.
+func (s *Store) RemoteBaseOf(ctx context.Context, branch string) (*RemoteBase, error) {
+	it, err := s.getItem(ctx, keyRemote(branch))
+	if it == nil || err != nil {
+		return nil, err
+	}
+	i := item(it)
+	return &RemoteBase{Branch: branch, Shadow: i.s("shadow"), Origin: i.s("origin"), NS: i.s("ns"), At: i.s("at"),
+		Checkpoint: i.s("checkpoint"), RegNSID: i.s("regNsId"), RegExpires: int64(i.n("regExpires"))}, nil
+}

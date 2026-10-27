@@ -24,6 +24,7 @@ type API interface {
 	DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInput, opt ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error)
 	Scan(ctx context.Context, in *dynamodb.ScanInput, opt ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error)
 	PutItem(ctx context.Context, in *dynamodb.PutItemInput, opt ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
+	BatchWriteItem(ctx context.Context, in *dynamodb.BatchWriteItemInput, opt ...func(*dynamodb.Options)) (*dynamodb.BatchWriteItemOutput, error)
 	TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, opt ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
 	DescribeTable(ctx context.Context, in *dynamodb.DescribeTableInput, opt ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error)
 }

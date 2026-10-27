@@ -240,7 +240,7 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 	e := b.e
 	if cc.IfNoneMatch {
 		if remoteBaseIn(cc.Patches) {
-			return nil, ddbUnsupported("remote branches")
+			return b.createRemoteBranch(ctx, req, cc)
 		}
 		return b.createNamespace(ctx, req, cc)
 	}
