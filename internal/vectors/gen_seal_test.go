@@ -273,7 +273,7 @@ func TestVectorSealedPayloads(t *testing.T) {
 			t.Fatalf("%s: OpenExpect: %v", c.name, err)
 		}
 		h, _ := seal.ParseHeader(jwe)
-		if seal.IsPadded(h, got) != c.pad && c.pad {
+		if c.pad && !seal.IsPadded(h, got) {
 			t.Fatalf("%s: not padded", c.name)
 		}
 		parts := strings.Split(jwe, ".")

@@ -91,7 +91,7 @@
       "code": "bad_input"
     },
     {
-      "name": "U+01FFFE raw",
+      "name": "U+1FFFE raw",
       "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
       "input": "\"🿾\"",
       "input_hex": "22f09fbfbe22",
@@ -102,7 +102,7 @@
       "code": "bad_input"
     },
     {
-      "name": "U+01FFFE escaped",
+      "name": "U+1FFFE escaped",
       "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
       "input": "\"\\ud83f\\udffe\"",
       "input_hex": "225c75643833665c756466666522",

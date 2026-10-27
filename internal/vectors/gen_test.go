@@ -22,8 +22,8 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -270,7 +270,7 @@ func TestVectorNoncharacters(t *testing.T) {
 			if serr != nil {
 				t.Fatalf("U+%04X %s: jsonv.Parse: %v", r, form, serr)
 			}
-			v := obj{{Key: "name", Value: "U+" + strings.ToUpper(hex.EncodeToString(runeBytes(r))) + " " + form},
+			v := obj{{Key: "name", Value: fmt.Sprintf("U+%04X %s", r, form)},
 				{Key: "fn", Value: "jsonv.ParseInput; server: PUT /r/{ns}/{name}"},
 				{Key: "input", Value: lit}, {Key: "input_hex", Value: golden.Hex([]byte(lit))}}
 			if perr != nil {
@@ -317,14 +317,6 @@ func escape(r rune) string {
 func hex4(r rune) string {
 	const digits = "0123456789abcdef"
 	return string([]byte{digits[r>>12&15], digits[r>>8&15], digits[r>>4&15], digits[r&15]})
-}
-
-// runeBytes is r's code point as big-endian bytes, at least two.
-func runeBytes(r rune) []byte {
-	if r > 0xFFFF {
-		return []byte{byte(r >> 16), byte(r >> 8), byte(r)}
-	}
-	return []byte{byte(r >> 8), byte(r)}
 }
 
 // ---- 11. /principal key (§7.4; RH-22) ----
