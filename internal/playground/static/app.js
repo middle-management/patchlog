@@ -1959,11 +1959,25 @@ async function foldLog(ns, name, id, since, arr) {
   let doc, exists = false, prev = '';
   const cfg = ((await nsInfo(ns)).doc || {}).encryption || {};
   if (since) {
-    const r = await api('GET', `/r/${ns}/${name}/rev/${since}`, { auto: true, label: 'prune snapshot' });
-    if ((r.status !== 200 && r.status !== 410) || r.hdr('X-E2E') !== 'snapshot') bad(`/rev/${since} does not serve the snapshot the fold starts from (HTTP ${r.status})`);
-    const d = await openSnapshot(ns, name, since, r);
-    doc = d.value; exists = true; prev = since; out.validID = since;
-    out.entries.push({ id: since, kind: 'snapshot', _sealed: d.kid, _note: 'the prune snapshot the fold starts from, served as /rev/' + since, _doc: doc });
+    const r = await api('GET', `/r/${ns}/${name}/rev/${since}`, { auto: true, label: 'fold start' });
+    if (r.status === 200 && !r.hdr('X-E2E')) {
+      // A revision from before a raise to e2e, served as at the level before (Addendum E Levels): in
+      // the clear, or sealed as at E2 under K_r of its epoch, kid and pl naming this namespace or the
+      // base a branch reads it through (F-E1: the fold starts at the last one before the raise).
+      let d = { value: r.json, kid: '' };
+      if (r.jose) {
+        const kns = Z.parseKid(Z.parseJWE(r.text.trim()).header.kid).ns;
+        if (!(await nsChainOK(ns, kns))) bad(`/rev/${since} is sealed under ${kns}, not this namespace or a base`);
+        d = await openSealed(kns, r.text.trim(), name, { ns: kns, name, id: since, kind: 'doc' });
+      } else if (r.json === null) bad(`/rev/${since} serves no document`);
+      doc = d.value; exists = true; prev = since; out.validID = since;
+      out.entries.push({ id: since, kind: 'pre-raise', _sealed: d.kid, _note: 'the document from before the raise to e2e the fold starts from, served as /rev/' + since, _doc: doc });
+    } else {
+      if ((r.status !== 200 && r.status !== 410) || r.hdr('X-E2E') !== 'snapshot') bad(`/rev/${since} does not serve the snapshot the fold starts from (HTTP ${r.status})`);
+      const d = await openSnapshot(ns, name, since, r);
+      doc = d.value; exists = true; prev = since; out.validID = since;
+      out.entries.push({ id: since, kind: 'snapshot', _sealed: d.kid, _note: 'the prune snapshot the fold starts from, served as /rev/' + since, _doc: doc });
+    }
   }
   for (let i = 0; i < arr.length; i++) {
     const e = Object.assign({}, arr[i]);
