@@ -474,8 +474,17 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 	}
 	t.flushDocs = true
 	// Sealed copies of what was pruned go too, wherever they are served
-	// (a branch reads through); kept documents keep their bytes.
-	t.deletePrunedSealed(own.id, h.seq, keepSeqs)
+	// (a branch reads through); kept documents keep their bytes, the
+	// preserved schema revisions' included, which are still served and so
+	// keep the sealing stored once (§E.2.2).
+	keptDocs := make(map[int64]*revRow, len(keepSeqs)+len(preserve))
+	for seq, row := range keepSeqs {
+		keptDocs[seq] = row
+	}
+	for seq := range preserve {
+		keptDocs[seq] = nil
+	}
+	t.deletePrunedSealed(own.id, h.seq, keptDocs)
 	if moves {
 		_, err = t.Exec(`UPDATE resources SET horizon_seq = ? WHERE res = ?`, h.seq, own.id)
 		t.must(err)

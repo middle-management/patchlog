@@ -539,21 +539,14 @@ func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 			return docInvalid("/encryption", "/encryption: a branch can be e2e only if its base is")
 		}
 	}
-	// Content from before a raise to e2e is never served at a weaker level
-	// (Addendum E Levels, Invariant). From sealed it is served sealed under
-	// the last epoch before the raise, which this server doesn't do yet: it
-	// would serve it as at e2e, in the clear. So a sealed namespace isn't
-	// raised (as no namespace was before v0.73); from none or at-rest the
-	// content was plaintext before, and stays so.
-	if cur != nil && toE2E && cur.level == levelSealed && !raiseFromSealedOK(t.e) {
-		return docInvalid("/encryption", "/encryption: this server can't raise a sealed namespace to e2e yet: it would serve what is stored before the raise in the clear, which must stay sealed (Addendum E Levels)")
-	}
 	// A raise to e2e (Addendum E Levels, Changing it) starts a new epoch.
 	// From sealed it must be the current one plus one: the origin holds
 	// the earlier epochs' keys, so they mustn't seal anything written end
 	// to end. From none or at-rest, which have no epoch keys, any epoch
 	// from 1 serves (F-E1); an absent one is 1. What was stored before the
-	// raise keeps its level (e2eConfigWritten records the raise).
+	// raise keeps its level: e2eConfigWritten records the raise, and it is
+	// served as at the level before, from sealed sealed under the last
+	// epoch before the raise (preraise.go).
 	if cur != nil && toE2E && cur.level == levelSealed && cfg.Epoch != cur.Epoch+1 {
 		return docInvalid("/encryption/epoch", fmt.Sprintf("/encryption/epoch must be %d: a raise from sealed to e2e starts a new epoch, since the origin holds the keys of epoch %d and before (Addendum E Levels)", cur.Epoch+1, cur.Epoch))
 	}
@@ -564,20 +557,6 @@ func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 		return docInvalid("/encryption/epoch", fmt.Sprintf("/encryption/epoch can only stay at %d or be incremented to %d", cur.Epoch, cur.Epoch+1))
 	}
 	return nil
-}
-
-// raiseFromSealedEngines holds the engines on which a sealed namespace may
-// be raised to e2e (raiseFromSealedOK). Only this package's tests add one,
-// to exercise what a raise from sealed records and checks (e2eConfigWritten,
-// prune snapshot kids) before content from before such a raise is served
-// sealed; that serving lifts the refusal for every engine.
-var raiseFromSealedEngines sync.Map // *Engine -> struct{}
-
-// raiseFromSealedOK reports whether e raises a sealed namespace to e2e
-// (checkEncryption).
-func raiseFromSealedOK(e *Engine) bool {
-	_, ok := raiseFromSealedEngines.Load(e)
-	return ok
 }
 
 // lowerDependents lists the unpurged branches of n below level: raising n

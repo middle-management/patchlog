@@ -87,6 +87,7 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -790,6 +791,10 @@ type E2EDoc struct {
 	// Plain is set when the server served the document itself (the
 	// keyring, or a namespace that isn't e2e).
 	Plain bool
+	// PreRaise is set when ID is a revision from before a raise to e2e,
+	// whose document the server serves as at the level before: in the
+	// clear, or sealed as at E2 (Addendum E Levels).
+	PreRaise bool
 
 	// log is the range folded, after since, whose snapshot's kid is
 	// sinceKid (PruneE2E's snapshot epoch, §E.3.1).
@@ -845,6 +850,14 @@ func (x *E2E) DocE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) 
 			return nil, err
 		}
 		return &E2EDoc{ID: id, Value: doc, ValidID: id, since: id, sinceKid: kid}, nil
+	case r.status == 200 && name != KeyringName && x.isE2E(ctx, ns):
+		// A revision from before a raise to e2e, served as at the level
+		// before (Addendum E Levels).
+		doc, kid, err := x.openPreRaise(ctx, ns, name, id, r, x.inChainOf(ctx, ns, name, id, nil))
+		if err != nil {
+			return nil, err
+		}
+		return &E2EDoc{ID: id, Value: doc, ValidID: id, PreRaise: true, since: id, sinceKid: kid}, nil
 	case r.status == 200:
 		d, err := x.c.Doc(ctx, ns, name, id)
 		if err != nil {
@@ -877,7 +890,9 @@ func (x *E2E) DocE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) 
 
 // foldLog fetches the log a fold reads, the range after since up to id,
 // following its pages (§7.1). The range never holds since's snapshot: fold
-// fetches that from /rev/{since}.
+// fetches that from /rev/{since}. A page from before a raise from sealed
+// to e2e is an array of entries sealed as at E2 (Addendum E Levels), which
+// it opens (openPreRaiseEntry).
 func (x *E2E) foldLog(ctx context.Context, ns, name, id, since string) ([]any, error) {
 	if err := checkOptID("since", since); err != nil {
 		return nil, err
@@ -888,6 +903,15 @@ func (x *E2E) foldLog(ctx context.Context, ns, name, id, since string) ([]any, e
 			page, ok := r.value().([]any)
 			if !ok {
 				return "", fmt.Errorf("client: %s: log is not an array", r.path)
+			}
+			for i, v := range page {
+				if jwe, ok := v.(string); ok {
+					e, err := x.openPreRaiseEntry(ctx, ns, name, jwe)
+					if err != nil {
+						return "", err
+					}
+					page[i] = e
+				}
 			}
 			arr = append(arr, page...)
 			m, _ := arrAt(page, len(page)-1).(map[string]any)
@@ -1289,7 +1313,7 @@ func (x *E2E) padHistory(ctx context.Context, ns, head string, prev *padHistory)
 	cur := false
 	var log []NSEntry
 	if prev != nil {
-		if log, err = x.c.NSLog(ctx, ns, head, prev.head); err == nil {
+		if log, err = x.nsLogE2E(ctx, ns, head, prev.head); err == nil {
 			for id, p := range prev.at {
 				ph.at[id] = p
 			}
@@ -1297,7 +1321,7 @@ func (x *E2E) padHistory(ctx context.Context, ns, head string, prev *padHistory)
 		}
 	}
 	if prev == nil || err != nil {
-		if log, err = x.c.NSLog(ctx, ns, head, ""); err != nil {
+		if log, err = x.nsLogE2E(ctx, ns, head, ""); err != nil {
 			return nil, err
 		}
 	}
@@ -1324,6 +1348,40 @@ func (x *E2E) padHistory(ctx context.Context, ns, head string, prev *padHistory)
 		visit(e)
 	}
 	return ph, nil
+}
+
+// nsLogE2E is Client.NSLog for padHistory: the namespace log of ns after
+// since up to nsID, following its pages (§7.1), but for the pages from
+// before a raise from sealed to e2e, served sealed as at E2 (Addendum E
+// Levels), which are skipped unread. No page spans the raise, and those
+// pages name no revision written end to end, whose padding alone a fold
+// judges; the raising entry, the first after them, sets the padding from
+// then on.
+func (x *E2E) nsLogE2E(ctx context.Context, ns, nsID, since string) ([]NSEntry, error) {
+	all := []NSEntry{}
+	for {
+		next, err := x.c.logPage(ctx, "/ns/"+ns+"/rev/"+nsID+"/log", since, nsID, func(r *response, end string) (string, error) {
+			if isJOSE(r) {
+				return end, nil
+			}
+			es, err := parseNSLog(r.value(), r.path)
+			if err != nil {
+				return "", err
+			}
+			all = append(all, es...)
+			if len(es) == 0 {
+				return "", nil
+			}
+			return es[len(es)-1].ID, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if next == "" {
+			return all, nil
+		}
+		since = next
+	}
 }
 
 // OpenLog opens the revisions of es, log entries of ns/name as Client.Log
@@ -1409,21 +1467,209 @@ func (x *E2E) ValidateIn(ctx context.Context, target string, doc any) (string, e
 	return x.validate(ctx, target, doc, false)
 }
 
-// snapshot fetches the sealed snapshot of the pruning horizon h of ns/name
-// from /rev/{h}, where it is served instead of being a log entry (§7.1
-// Paging, §8.6), and opens it.
-func (x *E2E) snapshot(ctx context.Context, ns, name, h string, nsOK *chainCheck) (any, string, error) {
-	r, err := x.c.do(ctx, "GET", "/r/"+ns+"/"+name+"/rev/"+h, nil, nil)
+// foldStart fetches the document a fold starts from at since, from
+// /rev/{since}, where it is served instead of being a log entry (§7.1
+// Paging, §8.6): a pruning horizon's sealed snapshot (openSnapshot), or the
+// resource's last revision from before a raise to e2e, served as at the
+// level before (openPreRaise), where the server's fold redirect starts
+// the range written end to end (F-E1, Addendum E Levels). It returns the
+// document and the kid sealing it ("" for one in the clear).
+func (x *E2E) foldStart(ctx context.Context, ns, name, since string, nsOK *chainCheck) (any, string, error) {
+	r, err := x.c.do(ctx, "GET", "/r/"+ns+"/"+name+"/rev/"+since, nil, nil)
 	if err != nil {
 		return nil, "", err
+	}
+	if r.status == 200 && r.header.Get("X-E2E") == "" {
+		return x.openPreRaise(ctx, ns, name, since, r, nsOK)
 	}
 	if (r.status != 200 && r.status != 410) || r.header.Get("X-E2E") != "snapshot" {
 		if r.status >= 400 {
 			return nil, "", r.apiError()
 		}
-		return nil, "", fmt.Errorf("client: e2e log of %s/%s: /rev/%s doesn't serve the snapshot the fold starts from (status %d): %w", ns, name, h, r.status, seal.ErrMismatch)
+		return nil, "", fmt.Errorf("client: e2e log of %s/%s: /rev/%s doesn't serve the document the fold starts from (status %d): %w", ns, name, since, r.status, seal.ErrMismatch)
 	}
-	return x.openSnapshot(ctx, ns, name, h, r, nsOK)
+	return x.openSnapshot(ctx, ns, name, since, r, nsOK)
+}
+
+// isE2E reports whether ns's namespace document says it is e2e. One this
+// reader can't read is taken as not.
+func (x *E2E) isE2E(ctx context.Context, ns string) bool {
+	_, err := x.config(ctx, ns)
+	return err == nil
+}
+
+// openPreRaise opens the document of revision id of ns/name that r, the
+// 200 of /rev/{id}, serves as at the level before a raise to e2e (Addendum
+// E Levels): in the clear after a raise from none or at-rest, or as a JWE
+// sealed as at E2 after a raise from sealed, under K_r = HKDF(K_e, kns,
+// name) of its kid's epoch, kns being ns or the base a branch reads it
+// through (whose ns it keeps), with pl {kns, name, id, kind "doc"}. The
+// keys of epochs before the raise come from /keys as at E2. It returns the
+// document and the kid ("" for one in the clear).
+func (x *E2E) openPreRaise(ctx context.Context, ns, name, id string, r *response, nsOK *chainCheck) (any, string, error) {
+	bad := func(format string, args ...any) error {
+		return fmt.Errorf("client: e2e document %s/%s@%s from before the raise: %s: %w", ns, name, id, fmt.Sprintf(format, args...), seal.ErrMismatch)
+	}
+	if !isJOSE(r) {
+		v, err := jsonv.Parse(r.body)
+		if err != nil {
+			return nil, "", bad("%v", err)
+		}
+		return v, "", nil
+	}
+	jwe := strings.TrimSpace(string(r.body))
+	hd, err := seal.ParseHeader(jwe)
+	if err != nil {
+		return nil, "", bad("%v", err)
+	}
+	kns, _, err := seal.ParseKid(hd.Kid)
+	if err != nil {
+		return nil, "", bad("kid: %v", err)
+	}
+	if ok, err := nsOK.ok(kns); err != nil {
+		return nil, "", err
+	} else if !ok {
+		return nil, "", bad("sealed under %s", hd.Kid)
+	}
+	key, err := x.keyVia(ctx, hd.Kid, ns)
+	if err != nil {
+		return nil, "", err
+	}
+	kr, err := resourceKey(key, kns, name)
+	if err != nil {
+		return nil, "", err
+	}
+	pt, err := seal.OpenExpect(jwe, kr, hd.Kid, seal.ResourcePL(kns, name, id, seal.KindDoc))
+	if err != nil {
+		return nil, "", fmt.Errorf("client: e2e document %s/%s@%s from before the raise: %w", ns, name, id, err)
+	}
+	v, err := jsonv.Parse(pt)
+	if err != nil {
+		return nil, "", bad("%v", err)
+	}
+	return v, hd.Kid, nil
+}
+
+// Log is Client.Log for a resource of an e2e namespace (§7.1): the log
+// range of ns/name after since up to id (its head when ""), following its
+// pages, with the pages from before a raise from sealed to e2e, entries
+// sealed as at E2 (Addendum E Levels), opened with this view's keys
+// (openPreRaiseEntry), the base's ns accepted for content a branch reads
+// through. Entries written end to end keep their sealed patch sets, which
+// OpenLog opens.
+func (x *E2E) Log(ctx context.Context, ns, name, id, since string) ([]LogEntry, error) {
+	if err := checkRes(ns, name); err != nil {
+		return nil, err
+	}
+	if err := checkOptID("since", since); err != nil {
+		return nil, err
+	}
+	if id == "" {
+		h, err := x.c.Head(ctx, ns, name)
+		if err != nil {
+			return nil, err
+		}
+		switch h.State {
+		case NotFound:
+			return nil, &APIError{Status: 404, Code: "not_found", Method: "GET", Path: "/r/" + ns + "/" + name}
+		case Purged:
+			return nil, &APIError{Status: 410, Code: "gone", Method: "GET", Path: "/r/" + ns + "/" + name}
+		}
+		id = h.ID
+	}
+	if err := checkID("revision", id); err != nil {
+		return nil, err
+	}
+	all := []LogEntry{}
+	for cur := since; ; {
+		next, err := x.c.logPage(ctx, "/r/"+ns+"/"+name+"/rev/"+id+"/log", cur, id, func(r *response, end string) (string, error) {
+			arr, ok := r.value().([]any)
+			if !ok {
+				return "", fmt.Errorf("client: %s: log is not an array", r.path)
+			}
+			prev := cur
+			for i, v := range arr {
+				if jwe, ok := v.(string); ok {
+					var err error
+					if v, err = x.openPreRaiseEntry(ctx, ns, name, jwe); err != nil {
+						return "", err
+					}
+				}
+				e, err := parseLogEntry(v)
+				if err != nil {
+					return "", err
+				}
+				if (i > 0 || cur != "") && e.Parent != prev {
+					return "", fmt.Errorf("client: log of %s/%s does not chain at %s: %w", ns, name, e.ID, seal.ErrMismatch)
+				}
+				prev = e.ID
+				all = append(all, e)
+			}
+			if len(arr) == 0 {
+				return "", nil
+			}
+			return prev, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if next == "" {
+			return all, nil
+		}
+		cur = next
+	}
+}
+
+// openPreRaiseEntry opens a resource log entry of ns/name from before a
+// raise from sealed to e2e, sealed as at E2 (Addendum E Levels): under
+// K_r of its kid's epoch, kns being ns or one of its bases, with pl {kns,
+// name, id, kind} of kind rev or tombstone, which the entry must match.
+func (x *E2E) openPreRaiseEntry(ctx context.Context, ns, name, jwe string) (any, error) {
+	bad := func(format string, args ...any) error {
+		return fmt.Errorf("client: e2e log of %s/%s: an entry from before the raise: %s: %w", ns, name, fmt.Sprintf(format, args...), seal.ErrMismatch)
+	}
+	hd, err := seal.ParseHeader(jwe)
+	if err != nil {
+		return nil, bad("%v", err)
+	}
+	kns, _, err := seal.ParseKid(hd.Kid)
+	if err != nil {
+		return nil, bad("kid: %v", err)
+	}
+	if kns != ns {
+		depth, _, err := x.chain(ctx, ns)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := depth[kns]; !ok {
+			return nil, bad("sealed under %s", hd.Kid)
+		}
+	}
+	eid, _ := hd.PL["id"].(string)
+	kind, _ := hd.PL["kind"].(string)
+	if kind != seal.KindRev && kind != seal.KindTombstone {
+		return nil, bad("pl kind %q", kind)
+	}
+	key, err := x.keyVia(ctx, hd.Kid, ns)
+	if err != nil {
+		return nil, err
+	}
+	kr, err := resourceKey(key, kns, name)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := seal.OpenExpect(jwe, kr, hd.Kid, seal.ResourcePL(kns, name, eid, kind))
+	if err != nil {
+		return nil, fmt.Errorf("client: e2e log of %s/%s: an entry from before the raise: %w", ns, name, err)
+	}
+	v, err := jsonv.Parse(pt)
+	if err != nil {
+		return nil, bad("%v", err)
+	}
+	if m, _ := v.(map[string]any); str(m, "id") != eid || str(m, "kind") != kind {
+		return nil, bad("entry %s doesn't match its binding", eid)
+	}
+	return v, nil
 }
 
 // openSnapshot opens the sealed snapshot of h that r, the answer of
@@ -1500,7 +1746,7 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 	}
 	if since != "" {
 		var err error
-		if doc, out.sinceKid, err = x.snapshot(ctx, ns, name, since, nsOK); err != nil {
+		if doc, out.sinceKid, err = x.foldStart(ctx, ns, name, since, nsOK); err != nil {
 			return nil, err
 		}
 		nsOK.at(since)
@@ -1660,6 +1906,19 @@ func (x *E2E) validate(ctx context.Context, target string, doc any, stored bool)
 			return d, nil
 		}
 		r, err := x.c.ResolveSchema(ctx, ref, ResolveOptions{Drafts: drafts, For: target})
+		if errors.Is(err, ErrNoKeys) {
+			// A revision of an e2e namespace from before its raise from
+			// sealed, served sealed as at E2 under keys this view holds
+			// (Addendum E Levels, openPreRaise); no marker is sent with
+			// it, so it compiles as legacy, as for any server that sends
+			// none. The server compiles it under its row's marker (v0.73
+			// for one written by this version), which a sealed answer has
+			// no channel for: the two can differ on formats (one from
+			// before a raise from none or at-rest carries the marker).
+			if d, derr := x.DocE2E(ctx, ref.NS, ref.Name, ref.Rev); derr == nil && d.PreRaise {
+				r, err = &ResolvedSchema{Doc: &Doc{ID: ref.Rev, Value: d.Value, Rules: schema.Legacy}, NS: ref.NS}, nil
+			}
+		}
 		if err != nil {
 			if IsNotFound(err) || IsGone(err) || IsAuth(err) {
 				return nil, schema.ErrUnavailable
