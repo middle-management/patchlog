@@ -421,7 +421,9 @@ type exchanged struct {
 // grantSize or rulesPerGrant is 413 limit (§C.8); any other refusal is
 // 401 if any is 401, else 403, and 502 if a namespace document can't be
 // read; once none is, a purged namespace a grant names and verifies in is
-// 410 purged with head (§8.5). More than maxPrefixes prefixes is 400.
+// 410 purged, with ns and head naming the first in the order the grants
+// and their root blocks list them (§8.5, exchangeGrant). More than
+// maxPrefixes prefixes is 400.
 // Once nothing is refused, it draws one token from the exchangeRate
 // bucket of each distinct principal among the grants (ExchangeRate,
 // §6.6), shared with the instances on its database (svcedge.Store), and
@@ -467,10 +469,10 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		limit  *grantcheck.LimitError
 		denied *grant.AuthError
 		upErr  error
-		purged string
+		purged *purgedNS
 	)
 	for _, b := range bearers {
-		ex, head, err := ix.exchangeGrant(ctx, b, reached, now)
+		ex, pn, err := ix.exchangeGrant(ctx, b, reached, now)
 		var le *grantcheck.LimitError
 		var ae *grant.AuthError
 		switch {
@@ -484,9 +486,9 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 			}
 		case err != nil:
 			upErr = err
-		case head != "":
-			if purged == "" {
-				purged = head
+		case pn != nil:
+			if purged == nil {
+				purged = pn
 			}
 		default:
 			exs = append(exs, ex)
@@ -508,8 +510,9 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		ix.opt.Logf("index: exchange: %v", upErr)
 		writeErr(w, http.StatusBadGateway, "upstream", "cannot read a namespace configuration")
 		return
-	case purged != "":
-		writePurged(w, purged)
+	case purged != nil:
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "namespace purged", "ns": purged.ns, "head": purged.head})
 		return
 	}
 	var issues []svcedge.Issue
@@ -564,58 +567,93 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	svcedge.Mint(w, ix.opt.EdgeGrants, now, issues)
 }
 
+// purgedNS is a purged namespace an exchange refuses, and the head of its
+// purge, its purge-ns entry's ns_id (§8.5).
+type purgedNS struct{ ns, head string }
+
 // exchangeGrant is what token gives at an exchange (issueEdgeGrants): for
 // every namespace the service follows that the grant names, and whose
 // keys the service doesn't lack, the read check of a query of it
 // (Index.access): a private one gives /{ns}/g/{gs} of the reader's marker
 // there, and the markers of those reached and not skipped give
 // /_refs/g/{gs} over them, as refsReader computes it. A public namespace
-// needs no edge grant. head is the purge-ns entry of a purged namespace
-// the grant names and passes the read check of (§8.5). A grant that gives
-// no edge grant at all, naming no private namespace the service follows,
-// is 403.
-func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[string]string, now time.Time) (ex *exchanged, head string, err error) {
+// needs no edge grant. A grant whose rules fix /resource (§2.1) and pass
+// for none of the names they fix reads nothing there, and is 403, as at
+// the core's issuance. The namespaces are taken in the order the grant's
+// root block names them (§C.5.2), and the refusal is the first of the
+// lowest rank among them: 401, then 403, then any other, then a purged
+// namespace the grant passes the read check of, the service's own purged
+// state (Index.committed, as its queries answer) or the core's 410 of a
+// sealed one's document (§8.5), which pn names. A grant that gives no edge
+// grant at all, naming no private namespace the service follows, is 403.
+func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[string]string, now time.Time) (ex *exchanged, pn *purgedNS, err error) {
 	g, err := ix.checker.Decode(token)
 	if err != nil {
 		var le *grantcheck.LimitError
 		var ae *grant.AuthError
 		if errors.As(err, &le) || errors.As(err, &ae) {
-			return nil, "", err
+			return nil, nil, err
 		}
-		return nil, "", &grant.AuthError{Status: 401, Msg: "the grant can't be decoded"}
+		return nil, nil, &grant.AuthError{Status: 401, Msg: "the grant can't be decoded"}
 	}
 	ex = &exchanged{subjects: map[string][]string{}, filters: map[string]*readFilter{}}
 	var (
 		markers []string
 		refsExp time.Time
+		refused error
 	)
-	for _, ns := range ix.refsNamespaces() {
-		if !g.NamesNS(ns) {
-			continue
+	refuse := func(err error) {
+		if refused == nil || refusalRank(err) < refusalRank(refused) {
+			refused = err
+		}
+	}
+	for _, ns := range namedInOrder(g, ix.refsNamespaces()) {
+		if refused != nil && refusalRank(refused) == 0 {
+			break // 401 ranks first: nothing after it changes the answer
 		}
 		if _, lacks := ix.keys.Skip(ns); lacks {
 			continue // one the service doesn't follow (§A.4)
 		}
+		head, purged, err := ix.committed(ctx, ns)
+		if err != nil {
+			refuse(err)
+			continue
+		}
 		cfg, err := ix.checker.Config(ctx, ns)
 		if client.IsPurged(err) {
 			if head, err = ix.checker.PurgedRead(ctx, ns, token); err != nil {
-				return nil, "", err
+				refuse(err)
+			} else {
+				refuse(&purgedNS{ns: ns, head: head})
 			}
 			continue
 		}
 		if err != nil {
-			return nil, "", err
+			refuse(err)
+			continue
 		}
-		if cfg.Read == "public" {
+		if cfg.Read == "public" && !purged {
 			continue
 		}
 		v, err := ix.checker.Verify(ctx, ns, token)
 		if err != nil {
-			return nil, "", err
+			refuse(err)
+			continue
 		}
-		a, err := ix.grantAccess(ns, v)
-		if err != nil {
-			return nil, "", err
+		var a *access
+		if cfg.Read != "public" {
+			if a, err = ix.grantAccess(ns, v); err == nil && a.filter != nil && !readsFixed(v, a.allow) {
+				err = &grant.AuthError{Status: 403, Msg: "the grant's rules pass for none of the names they fix /resource to in " + ns + " (§C.5.2)"}
+			}
+			if err != nil {
+				refuse(err)
+				continue
+			}
+		}
+		if purged {
+			// Its queries answer 410 once the read check passes (§8.5).
+			refuse(&purgedNS{ns: ns, head: head})
+			continue
 		}
 		exp := ix.opt.EdgeGrants.Lifetime(now, grantExp(v))
 		if ex.bucket == "" {
@@ -637,8 +675,11 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			}
 		}
 	}
-	if head != "" {
-		return nil, head, nil
+	if p, ok := refused.(*purgedNS); ok {
+		return nil, p, nil
+	}
+	if refused != nil {
+		return nil, nil, refused
 	}
 	if len(markers) > 0 {
 		gs := grantcheck.SubjectSetID(markers)
@@ -647,9 +688,97 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		ex.subjects[gs] = markers
 	}
 	if len(ex.issues) == 0 {
-		return nil, "", &grant.AuthError{Status: 403, Msg: "the grant reads no private namespace this service follows"}
+		return nil, nil, &grant.AuthError{Status: 403, Msg: "the grant reads no private namespace this service follows"}
 	}
-	return ex, "", nil
+	return ex, nil, nil
+}
+
+func (p *purgedNS) Error() string { return p.ns + " was purged" }
+
+// refusalRank orders an exchange's refusals (§C.5.2, All or nothing): 401,
+// then 403, then any other (a namespace document the service can't read,
+// 502), and a purged namespace last, answered only when every refusal is.
+func refusalRank(err error) int {
+	var ae *grant.AuthError
+	var pn *purgedNS
+	switch {
+	case errors.As(err, &ae) && ae.Status == http.StatusUnauthorized:
+		return 0
+	case errors.As(err, &ae):
+		return 1
+	case errors.As(err, &pn):
+		return 3
+	}
+	return 2
+}
+
+// namedInOrder is those of followed that g names, in the order g's root
+// block lists them (§C.5.2); one it reaches only through "*" comes where
+// "*" is.
+func namedInOrder(g *grant.Grant, followed []string) []string {
+	var root []string
+	if len(g.Blocks) > 0 {
+		root = g.Blocks[0].NS
+	}
+	pos := func(ns string) int {
+		if i := slices.Index(root, ns); i >= 0 {
+			return i
+		}
+		if i := slices.Index(root, "*"); i >= 0 {
+			return i
+		}
+		return len(root)
+	}
+	var out []string
+	for _, ns := range followed {
+		if g.NamesNS(ns) {
+			out = append(out, ns)
+		}
+	}
+	slices.SortStableFunc(out, func(a, b string) int { return pos(a) - pos(b) })
+	return out
+}
+
+// readsFixed reports whether a grant whose rules fix /resource (§2.1)
+// may read some name they fix, by allow, its read check per resource; a
+// grant whose rules fix none is left to that check per resource. Names
+// are fixed as the core's issuance fixes them: by each rule of its blocks
+// and key scope, at top level or inside all, that tests /resource against
+// one literal or a finite set (grant.ResourceLiterals), the names all of
+// them allow (§C.5.2: the rules must pass with /resource set to the names
+// it fixes).
+func readsFixed(v *grant.Verified, allow func(string) bool) bool {
+	var names []string
+	fixed := false
+	var walk func(rs []any)
+	walk = func(rs []any) {
+		for _, rv := range rs {
+			if m, ok := rv.(map[string]any); ok && len(m) == 1 {
+				if all, ok := m["all"].([]any); ok {
+					walk(all)
+					continue
+				}
+			}
+			lits, ok := grant.ResourceLiterals(rv)
+			if !ok {
+				continue
+			}
+			var set []string
+			for _, l := range lits {
+				if name, ok := l.(string); ok && !slices.Contains(set, name) {
+					set = append(set, name)
+				}
+			}
+			if !fixed {
+				names, fixed = set, true
+				continue
+			}
+			names = slices.DeleteFunc(names, func(n string) bool { return !slices.Contains(set, n) })
+		}
+	}
+	walk(v.KeyRules)
+	walk(v.BlockRules)
+	return !fixed || slices.ContainsFunc(names, allow)
 }
 
 // grantExp is the earliest exp among v's blocks, the zero time for none.

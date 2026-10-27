@@ -542,3 +542,96 @@ func TestV073P37BranchWithoutKeys(t *testing.T) {
 		t.Errorf("a later batch of it: %v, checkpoint %q", err, x.ix.Checkpoint("e"))
 	}
 }
+
+// p37CoreExchange is the core's POST /edge-grants for token, and its body.
+func p37CoreExchange(t *testing.T, s *clienttest.Server, token string) (int, map[string]any) {
+	t.Helper()
+	req := must(http.NewRequest("POST", s.URL+"/edge-grants", nil))
+	req.Header.Set("Authorization", "Bearer "+token)
+	r := must(http.DefaultClient.Do(req))
+	defer r.Body.Close()
+	var b map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&b)
+	return r.StatusCode, b
+}
+
+// TestV073P37ExchangePurged (IX-18, §C.5.2 refusals and All or nothing,
+// §8.5): an exchange naming a purged namespace the grant verifies in is
+// 410 purged, with ns and head naming the first refused one in the order
+// the grant's root block lists them, as the core answers it. The index
+// decides by its own purged state, as its queries do, so an unsealed
+// namespace it has purged, whose document the core still serves, is 410
+// too and gives no cookie.
+func TestV073P37ExchangePurged(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	op := w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "user:root", []string{"pa", "pb"}, []string{"read", "config", "purge-ns"})))
+	heads := map[string]string{}
+	purge := func(ns string) {
+		cfg := must(op.NSHead(ctx, ns)).Config
+		must(op.PatchConfig(ctx, ns, cfg, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+		heads[ns] = must(op.PurgeNamespace(ctx, ns, must(op.NSHead(ctx, ns)).ID))
+	}
+	applied := func(ns, token string) {
+		waitFor(t, "the index to apply the purge of "+ns, func() bool {
+			w.x.ix.ExpireGrantChecks() // the test clock stands still: CheckerTTL never passes
+			return w.x.raw("/"+ns+"?limit=5", token).status == 410
+		})
+	}
+	purge("pb")
+	amy := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"pa", "pb"}, []string{"read"})
+	if st, b := p37CoreExchange(t, w.s, amy); st != 410 || b["ns"] != "pb" || b["head"] != heads["pb"] {
+		t.Fatalf("core exchange: %d %v", st, b)
+	}
+	applied("pb", amy)
+	r := p37Do(t, w.x, "POST", "/edge-grants", amy, "", nil, "")
+	if r.status != 410 || r.body["code"] != "purged" || r.body["head"] != heads["pb"] || r.body["ns"] != "pb" || len(r.cookies) != 0 {
+		t.Errorf("index exchange naming a purged namespace: %d %v (%d cookies)", r.status, r.body, len(r.cookies))
+	}
+
+	// Both purged: the first the root block names.
+	purge("pa")
+	applied("pa", amy)
+	for _, order := range [][]string{{"pa", "pb"}, {"pb", "pa"}} {
+		g := w.issuer.Grant(t, w.s.Now(), "user:amy", order, []string{"read"})
+		if st, b := p37CoreExchange(t, w.s, g); st != 410 || b["ns"] != order[0] {
+			t.Fatalf("core exchange for %v: %d %v", order, st, b)
+		}
+		if r := p37Do(t, w.x, "POST", "/edge-grants", g, "", nil, ""); r.status != 410 || r.body["ns"] != order[0] || r.body["head"] != heads[order[0]] {
+			t.Errorf("index exchange for %v: %d %v", order, r.status, r.body)
+		}
+	}
+}
+
+// TestV073P37ExchangeFixedNames (IX-18, §C.5.2 refusals): "the rules of
+// the grant's blocks or key scope don't pass now against a read envelope
+// for its principal, with /resource set to each name it fixes" is 403. A
+// grant whose rules fix /resource to no name at all, or to names none of
+// its rules pass for, reads nothing: 403 at the core and at the index,
+// with no cookie and no subject set recorded. One that passes for a name
+// it fixes gets its scope marker's cookies.
+func TestV073P37ExchangeFixedNames(t *testing.T) {
+	t.Parallel()
+	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	test := func(v string) map[string]any { return map[string]any{"op": "test", "path": "/resource", "value": v} }
+	for _, c := range []struct {
+		name  string
+		rules []any
+		want  int
+	}{
+		{"none left", []any{test("a"), test("b")}, 403},
+		{"none passing", []any{map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": []any{"a", "b"}}},
+			map[string]any{"op": "test", "path": "/principal/sub", "value": "user:other"}}, 403},
+		{"one passing", []any{map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": []any{"a", "b"}}}}, 200},
+	} {
+		g := w.issuer.Grant(t, w.s.Now(), "user:fay", []string{"pa"}, []string{"read"}, map[string]any{"rules": c.rules})
+		if st, _ := p37CoreExchange(t, w.s, g); st != c.want {
+			t.Fatalf("%s: core exchange: %d, want %d", c.name, st, c.want)
+		}
+		r := p37Do(t, w.x, "POST", "/edge-grants", g, "", nil, "")
+		if r.status != c.want || (c.want == 403) != (len(r.cookies) == 0) {
+			t.Errorf("%s: index exchange: %d %v (%d cookies), want %d", c.name, r.status, r.body, len(r.cookies), c.want)
+		}
+	}
+}
