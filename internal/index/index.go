@@ -9,7 +9,10 @@
 //	seen(ns, ns_id)                        every ns_id applied, for ?min= (§A.5)
 //	ns_state(ns, purged)                   purge-ns marks the namespace gone
 //	ns_conf(ns, public, level)             the read mode and level last applied (narrowed)
-//	docs(docid, ns, resource, head, schema) one row per live resource (untyped too, see UntypedListing)
+//	docs(docid, ns, resource, head, schema, epoch) one row per live resource (untyped too, see
+//	                                      UntypedListing); epoch, in a sealed or e2e namespace, the
+//	                                      epoch its head is served under (derived.EpochOf), NULL or 0
+//	                                      where not known
 //	text  fts5(ns, resource, schema, path, body)  rowid = docid<<20 | n, so a resource's rows are a rowid range
 //	facet(ns, resource, schema, path, value, raw)  value: the string form (§A.2), raw: canonical JSON
 //	sort (ns, resource, schema, path, value, raw)  value: the least value (sortColumn), raw: all, a JSON array
@@ -34,8 +37,9 @@
 // Without keys a namespace is skipped: not followed, and reported with the
 // reason at GET /_status. One whose keys the service lacks is answered 404
 // as one it doesn't follow (§A.4); one whose keys it can't fetch for now,
-// 503 behind. Results over a sealed or e2e namespace are sealed under its
-// current epoch key (§E.2.5): see Handler.
+// 503 behind. Results over a sealed or e2e namespace are sealed under the
+// epochs their documents' heads are served under (§E.2.6, docs.epoch): see
+// Handler.
 //
 // Stored plaintext. Full-text, facet and sort queries need the indexed
 // values in the clear, so the database holds plaintext derived from
@@ -297,7 +301,7 @@ var createStmts = []string{
 	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
 	`CREATE TABLE IF NOT EXISTS ns_state (ns TEXT PRIMARY KEY, purged INTEGER NOT NULL DEFAULT 0)`,
 	`CREATE TABLE IF NOT EXISTS ns_conf (ns TEXT PRIMARY KEY, public INTEGER NOT NULL, level TEXT NOT NULL)`,
-	`CREATE TABLE IF NOT EXISTS docs (docid INTEGER PRIMARY KEY, ns TEXT NOT NULL, resource TEXT NOT NULL, head TEXT NOT NULL, schema TEXT, UNIQUE (ns, resource))`,
+	`CREATE TABLE IF NOT EXISTS docs (docid INTEGER PRIMARY KEY, ns TEXT NOT NULL, resource TEXT NOT NULL, head TEXT NOT NULL, schema TEXT, epoch INTEGER, UNIQUE (ns, resource))`,
 	`CREATE TABLE IF NOT EXISTS facet (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value TEXT NOT NULL, raw TEXT NOT NULL, PRIMARY KEY (ns, resource, path, value))`,
 	`CREATE TABLE IF NOT EXISTS "sort" (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value, raw TEXT, PRIMARY KEY (ns, resource, path))`,
 	`CREATE TABLE IF NOT EXISTS refs (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, ref TEXT NOT NULL, target_ns TEXT NOT NULL, target TEXT NOT NULL, rev TEXT, entry TEXT, PRIMARY KEY (ns, resource, path))`,
@@ -369,6 +373,33 @@ func (ix *Index) initSchema(ctx context.Context) error {
 			ix.opt.Logf("index: the database predates the static x-index walk and sort order of v0.73 (§A.2); rebuilding it from the logs")
 			ix.opt.Rebuild = true
 		}
+		// Before docs.epoch, the rows of sealed and e2e namespaces don't
+		// say which epoch each head is served under, which their hits are
+		// sealed under (§E.2.6): replay those namespaces, as a rebuild.
+		// Without one, the column is added below.
+		var noEpoch, protected int
+		if docs > 0 && !ix.opt.Rebuild {
+			if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('docs') WHERE name = 'epoch'`).Scan(&noEpoch); err != nil {
+				return err
+			}
+			var conf int
+			if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ns_conf'`).Scan(&conf); err != nil {
+				return err
+			}
+			switch {
+			case noEpoch > 0:
+			case conf == 0:
+				protected = 1 // levels not recorded: any may be sealed
+			default:
+				if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM ns_conf WHERE level IN (?, ?)`, derived.LevelSealed, derived.LevelE2E).Scan(&protected); err != nil {
+					return err
+				}
+			}
+			if noEpoch == 0 && protected > 0 {
+				ix.opt.Logf("index: the database predates the epochs hits of sealed and e2e namespaces are sealed under (§E.2.6); rebuilding it from the logs")
+				ix.opt.Rebuild = true
+			}
+		}
 	}
 	if ix.opt.Rebuild {
 		for _, s := range dropStmts {
@@ -382,6 +413,15 @@ func (ix *Index) initSchema(ctx context.Context) error {
 	}
 	for _, s := range createStmts {
 		if _, err := ix.db.ExecContext(ctx, s); err != nil {
+			return fmt.Errorf("index: schema: %w", err)
+		}
+	}
+	var hasEpoch int
+	if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('docs') WHERE name = 'epoch'`).Scan(&hasEpoch); err != nil {
+		return err
+	}
+	if hasEpoch == 0 {
+		if _, err := ix.db.ExecContext(ctx, `ALTER TABLE docs ADD COLUMN epoch INTEGER`); err != nil {
 			return fmt.Errorf("index: schema: %w", err)
 		}
 	}
@@ -613,6 +653,7 @@ type prepared struct {
 	resource string
 	remove   bool
 	head     string
+	epoch    int    // the epoch head is served under, 0 if not known or not sealed (derived.EpochOf)
 	schema   string // "" = untyped
 	typed    bool
 	rows     *docRows
@@ -862,7 +903,7 @@ func (ix *Index) prepare(ctx context.Context, ns, id string, p *prepared) error 
 		}
 		return err
 	}
-	p.head = doc.ID
+	p.head, p.epoch = doc.ID, derived.EpochOf(ns, doc.Kid)
 	p.schema, p.typed, p.rows, err = ix.extract(ctx, ns, p.resource, doc.Value)
 	return err
 }
@@ -916,15 +957,18 @@ func (ix *Index) write(ctx context.Context, tx *sql.Tx, ns string, p prepared) e
 		}
 		return err
 	}
-	var schemaCol any
+	var schemaCol, epochCol any
 	if p.schema != "" {
 		schemaCol = p.schema
 	}
+	if p.epoch > 0 {
+		epochCol = p.epoch
+	}
 	if found {
-		_, err = tx.ExecContext(ctx, `UPDATE docs SET head = ?, schema = ? WHERE docid = ?`, p.head, schemaCol, docid)
+		_, err = tx.ExecContext(ctx, `UPDATE docs SET head = ?, schema = ?, epoch = ? WHERE docid = ?`, p.head, schemaCol, epochCol, docid)
 	} else {
 		var res sql.Result
-		res, err = tx.ExecContext(ctx, `INSERT INTO docs (ns, resource, head, schema) VALUES (?, ?, ?, ?)`, ns, p.resource, p.head, schemaCol)
+		res, err = tx.ExecContext(ctx, `INSERT INTO docs (ns, resource, head, schema, epoch) VALUES (?, ?, ?, ?, ?)`, ns, p.resource, p.head, schemaCol, epochCol)
 		if err == nil {
 			docid, err = res.LastInsertId()
 		}

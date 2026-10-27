@@ -214,6 +214,39 @@ func (k *Keys) Current(ctx context.Context, ns string) (Info, Key, error) {
 	return in, Key{NS: ns, Epoch: in.Epoch, K: key, Pad: in.Pad}, err
 }
 
+// KeyAt returns the Key that seals views derived from revisions of ns
+// served under epoch (§E.2.6): that epoch's key K_e, with ns's padding as
+// it is now (padding follows the source namespace, §E.2.6); epoch 0, not
+// known, is the epoch current now (Current).
+func (k *Keys) KeyAt(ctx context.Context, ns string, epoch int) (Key, error) {
+	in, err := k.Info(ctx, ns)
+	if err != nil {
+		return Key{}, err
+	}
+	if epoch <= 0 {
+		epoch = in.Epoch
+	}
+	key, err := k.EpochKey(ctx, ns, epoch)
+	return Key{NS: ns, Epoch: epoch, K: key, Pad: in.Pad}, err
+}
+
+// EpochOf is the epoch of kid, "{ns}#{e}", the kid of a sealed document
+// or op as served (client.Doc.Kid): the epoch the revision is served
+// under, which views derived from it are sealed under (§E.2.2, §E.2.6).
+// It is 0, not known, for a kid that doesn't parse, for "" (a document
+// served in the clear, or by a server from before the kid was kept) and
+// for one naming another namespace than ns: a base's, for content a
+// branch reads through, whose epochs aren't ns's. Views take the epoch
+// current when they are sealed for those (Keys.KeyAt), as a prune
+// snapshot of such a revision takes the epoch in force (§E.3.1).
+func EpochOf(ns, kid string) int {
+	kns, e, err := seal.ParseKid(kid)
+	if err != nil || kns != ns || e < 1 {
+		return 0
+	}
+	return e
+}
+
 // ResourceKey is a per-resource key K_r of one epoch.
 type ResourceKey struct {
 	Kid      string // "{ns}#{e}"
@@ -391,6 +424,9 @@ func (k *Keys) Status(nss []string) []Status {
 // with the keyring recipient key: revisions flagged by the fold (§E.3.2)
 // are logged by the caller through flagged and left out. It returns
 // ErrSkip for the keyring and for an e2e namespace the service can't read.
+// The document's Kid names the epoch the revision is served under
+// (EpochOf): at E2 the kid of the sealed document fetched, at E3 that of
+// the sealed op it comes from (client.E2EDoc.Kid).
 func (k *Keys) FetchDoc(ctx context.Context, ns, name, id string, flagged func(client.Flag)) (*client.Doc, error) {
 	in, err := k.Info(ctx, ns)
 	if err != nil {
@@ -422,5 +458,7 @@ func (k *Keys) FetchDoc(ctx context.Context, ns, name, id string, flagged func(c
 			flagged(f)
 		}
 	}
-	return &client.Doc{ID: d.ID, Value: d.Value}, nil
+	// The kid of the sealed op the document comes from: the epoch views
+	// derived from it are sealed under (§E.2.6).
+	return &client.Doc{ID: d.ID, Value: d.Value, Kid: d.Kid()}, nil
 }

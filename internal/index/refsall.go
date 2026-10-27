@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -71,8 +72,9 @@ import (
 // left out, as one the reader can't see.
 //
 // Hits from sealed and e2e namespaces carry ns, resource, id and url in the
-// clear and the rest as "sealed": a JWE under the resource's K_r, pl { ns,
-// name, view }, view being the at URL (§E.2.6 per-entry sealing). An answer
+// clear and the rest as "sealed": a JWE under the resource's K_r of the
+// epoch its document's head is served under (docs.epoch), pl { ns, name,
+// view }, view being the at URL (§E.2.6 per-entry sealing). An answer
 // with sealed hits is also stored (derived.Cache) while its at is current,
 // so it is sealed once.
 //
@@ -740,18 +742,35 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		}
 		withHits, i = append(withHits, ns), j
 	}
+	if err := attachEpochs(ctx, tx, hits); err != nil {
+		return derived.Stored{}, "", false, err
+	}
 	tx.Rollback()
-	// The keys that seal hits of sealed and e2e namespaces.
-	keys := map[string]derived.Key{}
+	// Hits of sealed and e2e namespaces are sealed under the epoch their
+	// document's head is served under (§E.2.6, docs.epoch), the current
+	// one where that isn't known; its key can't be had for now: behind.
+	protected := map[string]bool{}
 	for _, ns := range withHits {
-		info, key, err := ix.keys.Current(ctx, ns)
+		info, _, err := ix.keys.Current(ctx, ns)
 		if err != nil {
 			ix.opt.Logf("index: keys of %s: %v", ns, err)
 			return derived.Stored{}, "", false, errRefsKeys
 		}
-		if info.Protected() {
-			keys[ns] = key
+		protected[ns] = info.Protected()
+	}
+	keys := map[string]derived.Key{}
+	keyAt := func(ns string, epoch int) (derived.Key, error) {
+		k := ns + "#" + strconv.Itoa(epoch)
+		if key, ok := keys[k]; ok {
+			return key, nil
 		}
+		key, err := ix.keys.KeyAt(ctx, ns, epoch)
+		if err != nil {
+			ix.opt.Logf("index: key of %s epoch %d: %v", ns, epoch, err)
+			return key, errRefsKeys
+		}
+		keys[k] = key
+		return key, nil
 	}
 
 	tags := make([]string, 0, len(nss)+len(hits))
@@ -777,9 +796,13 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		if h.Self {
 			m["self"] = true
 		}
-		if key, ok := keys[ns]; ok {
+		if protected[ns] {
 			// Per-entry sealing (§E.2.6): what the document gave, under
-			// its resource's key.
+			// its resource's key of the epoch it is served under.
+			key, err := keyAt(ns, h.epoch)
+			if err != nil {
+				return derived.Stored{}, "", false, err
+			}
 			jwe, err := derived.SealItem(key, derived.View{NS: ns, Target: view}, h.Resource, m)
 			if err != nil {
 				return derived.Stored{}, "", false, fmt.Errorf("sealing a hit: %w", err)
@@ -802,6 +825,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 	}
 	st := derived.Stored{Body: b, JSON: true, Tags: strings.Join(tags, ",")}
 	if len(keys) > 0 {
+		// Some hit is sealed: it is bound to its URL.
 		// Sealed once (§E.2.6): stored while at is current, as sealed
 		// results of one namespace are.
 		scope := "/_refs/g/" + rd.gs
