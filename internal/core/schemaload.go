@@ -432,19 +432,14 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, int64, error) {
 }
 
 // preRaiseSchema reports whether revision ref of n, an e2e namespace that
-// isn't a branch, is one the server can read: written before n's raise
-// from none or at-rest, so stored in the clear, which resolves as in any
-// namespace (§6.1, Addendum E Levels). One from before a raise from sealed
-// takes the keys of the epoch it is served under (§6.1 Read permission),
-// which serving pre-raise content sealed brings (P35); until then it
-// doesn't resolve, as content written at e2e doesn't.
+// isn't a branch, is one the server can read: written before n's raise,
+// so stored in the clear, which resolves as in any namespace (§6.1,
+// Addendum E Levels). Only revisions written while n was e2e don't. One
+// from before a raise from sealed also takes the keys of the epoch it is
+// served under (§6.1 Read permission, schemaKeysOpen).
 func (t *tx) preRaiseSchema(n *nsRow, ref schema.Ref) bool {
-	raise := t.e2eRaiseOf(n)
-	if raise == nil || raise.level == levelSealed {
-		return false
-	}
 	row := t.schemaRevRow(n, ref)
-	return row != nil && row.seq <= t.preRaiseHead(raise, row.res)
+	return row != nil && t.preRaiseOf(n, row) != nil
 }
 
 // schemaReadable reports whether the writer of sc may read resource name
@@ -463,9 +458,15 @@ func (t *tx) schemaReadable(n *nsRow, name string, sc *schemaCtx) bool {
 // namespace, public or not, the namespace written included (§6.1 Read
 // permission, §2.1 Protection): §E.2.3's keys for the epoch the revision
 // is served under, to the request's own grant or one in
-// Source-Authorization (keywindow.go). Other namespaces need none here
+// Source-Authorization (keywindow.go). So does a revision of an e2e
+// namespace from before its raise from sealed, under the epoch it is
+// served under there, with the keys /keys gives for it as at E2 (Addendum
+// E Levels, preRaiseKeysOpen). Other namespaces need none here
 // (schemaReads is refused in sealed ones, §6.1).
 func (t *tx) schemaKeysOpen(n *nsRow, name string, row *revRow, sc *schemaCtx) bool {
+	if p := t.preRaiseOf(n, row); p != nil && p.sealed() {
+		return t.preRaiseKeysOpen(n, p, name, map[int]bool{t.preRaiseEpoch(p.m, row, p.raise): true}, sc.creds)
+	}
 	if !t.isSealedNS(n) {
 		return true
 	}

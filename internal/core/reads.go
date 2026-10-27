@@ -273,7 +273,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		return c.answer(true), nil
 	}
 	g := e.rc.load(ns)
-	public, cached, plain := false, false, false
+	public, cached, plain, preRaised := false, false, false, false
 	var out *Rev
 	var job *sealJob
 	var nsRowID int64
@@ -331,6 +331,19 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			out.Created = time.UnixMilli(row.created)
 		}
 		e2e := t.e2eContent(n, name)
+		// Content from before an e2e raise is served as at the level
+		// before, in the clear or sealed, its prune snapshot included
+		// (Addendum E Levels, §7.1 Paging, preraise.go).
+		pre := t.preRaiseOf(n, row)
+		if pre != nil {
+			e2e, preRaised = false, true
+			if pre.sealed() && row.kind != kindTombstone {
+				if j := (&sealJob{kind: sealDoc, key: name + "/" + row.id.String()}); t.stored(pre.m, j) {
+					out.Status, out.JWE = 200, j.jwe
+					return nil
+				}
+			}
+		}
 		if e2e {
 			// A prune's sealed snapshot is served as /rev/{H}, never as a
 			// log entry (§7.1 Paging, §8.6). It stays stored after an
@@ -362,10 +375,18 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 				out.Horizon, out.Archive = t.horizonID(row.res), t.archiveURL(row.res, row.seq)
 				return nil
 			}
-			out.Status, out.Fold, out.FoldSince = 302, true, t.e2eFoldSince(row)
+			out.Status, out.Fold, out.FoldSince = 302, true, t.preRaiseFoldSince(n, row)
 			return nil
 		}
 		b, err := t.docBytesAt(row)
+		if err != nil && pre != nil {
+			// An E3 prune at a horizon from before the raise left no
+			// document to serve as before; its snapshot stands for it.
+			if jwe := t.e2eSnapshot(row); jwe != "" {
+				out.Status, out.Snapshot, out.JWE = 200, true, jwe
+				return nil
+			}
+		}
 		if err != nil {
 			var pe *prunedError
 			if errors.As(err, &pe) {
@@ -384,9 +405,14 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			// The digest the write stored of these bytes (headMeta).
 			out.Digest = row.digest
 		}
-		if t.isSealedNS(n) {
+		switch {
+		case t.isSealedNS(n):
 			nsRowID = n.id
 			job = t.resJob(n, name, row, sealDoc, func() []byte { return b })
+		case pre != nil && pre.sealed():
+			// Stored under the raised namespace, as it serves it.
+			nsRowID = pre.m.id
+			job = t.preRaiseResJob(pre, name, row, sealDoc, func() []byte { return b })
 		}
 		return nil
 	})
@@ -394,11 +420,12 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
 			out.Doc, out.JWE, out.Digest = nil, job.jwe, nil
 		}
-	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot {
+	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot && !preRaised {
 		// A plain document (sealed ones have a job, e2e content no
 		// document, and an e2e keyring is kept without its created time
 		// and digest): immutable, and the same for every reader. Hashed
-		// here unless the write stored its digest.
+		// here unless the write stored its digest. Content from before an
+		// e2e raise isn't kept: reads of e2e content skip the cache.
 		d := revDoc{doc: out.Doc, meta: plain, rules: out.SchemaRules}
 		if plain {
 			d.created = out.Created.UnixMilli()
@@ -510,13 +537,33 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if limit > 0 {
 			maxBytes = e.opt.Maximums.LogPageBytes
 		}
+		// No page spans an e2e raise: one that would ends with the last
+		// revision from before it, and a page from before it is served
+		// as at the level before (§7.1 Paging, Addendum E Levels).
+		var pre *preRaise
+		cut := false
+		if t.isE2E(n) {
+			if b := t.preRaiseRange(n, to, sinceID); b != nil {
+				to, cut = b, true
+			}
+			pre = t.preRaiseOf(n, to)
+		}
 		// At E2 each entry is served as its own JWE, stored or sealed now,
 		// and a page is bounded by their lengths (logBetween).
 		sealed := t.isSealedNS(n)
 		var served func(LogEntry) int
-		if sealed {
+		switch {
+		case sealed:
 			served = func(le LogEntry) int {
 				j := t.resJob(n, name, le.row, sealEntry, func() []byte { return jsonv.Canonical(le.value()) })
+				t.must(j.sealNow())
+				jobs = append(jobs, j)
+				return len(j.jwe)
+			}
+		case pre != nil && pre.sealed():
+			sealed = true
+			served = func(le LogEntry) int {
+				j := t.preRaiseResJob(pre, name, le.row, sealEntry, func() []byte { return jsonv.Canonical(le.value()) })
 				t.must(j.sealNow())
 				jobs = append(jobs, j)
 				return len(j.jwe)
@@ -536,7 +583,7 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 			}
 			return nil
 		}
-		out.Status, out.More = 200, more
+		out.Status, out.More = 200, more || cut
 		// An e2e range whose since is a pruning horizon holds only the
 		// entries after it: the horizon's sealed snapshot is served as
 		// /rev/{H} (ResourceRev), never as a log entry (§7.1 Paging).
@@ -548,6 +595,9 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if sealed {
 			jobs = jobs[:len(entries)]
 			out.Sealed, nsRowID = true, n.id
+			if pre != nil {
+				nsRowID = pre.m.id
+			}
 		}
 		return nil
 	})
@@ -625,9 +675,18 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 		t.must(t.QueryRow(`SELECT l.config_seq, c.doc FROM ns_log l JOIN ns_config c ON c.seq = l.config_seq WHERE l.seq = ?`, seq).Scan(&cseq, &doc))
 		out = &NSInfo{Head: nsID, Config: t.configID(cseq).String(), Doc: []byte(doc),
 			Public: t.cachePublic(n)}
-		if t.isSealedNS(n) {
+		switch raise := t.nsPreRaise(n, seq); {
+		case t.isSealedNS(n):
 			nsRowID = n.id
 			job = t.configJob(n, seq, nsID, []byte(doc))
+		case raise != nil && raise.level == levelSealed:
+			// From before a raise from sealed: sealed as before (Addendum
+			// E Levels), which a purge, destroying the epoch keys, ends.
+			if n.purged {
+				return t.purgedRead(n)
+			}
+			nsRowID = n.id
+			job = t.preRaiseConfigJob(n, raise, seq, nsID, []byte(doc))
 		}
 		return nil
 	})
@@ -736,6 +795,14 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			q += ` LIMIT ?`
 			args = append(args, limit)
 		}
+		// No page spans an e2e raise (§7.1 Paging, Addendum E Levels): a
+		// page that starts before the raising entry ends before it.
+		var raise *e2eRaise
+		if t.isE2E(n) {
+			if r := t.e2eRaiseOf(n); r != nil && r.seq != 0 {
+				raise = r
+			}
+		}
 		rows, err := t.Query(q, args...)
 		t.must(err)
 		type raw struct {
@@ -761,6 +828,9 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		for rows.Next() {
 			var r raw
 			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta, &r.via))
+			if raise != nil && len(rs) > 0 && rs[0].seq < raise.seq && r.seq >= raise.seq {
+				break
+			}
 			r.m = jsonv.MustParse([]byte(r.body)).(map[string]any)
 			u := 1
 			if es, ok := r.m["entries"].([]any); ok && len(es) > 1 {
@@ -773,6 +843,16 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			rs = append(rs, r)
 		}
 		rows.Close()
+		// A page from before a raise from sealed is sealed as before,
+		// under the last epoch and pad setting before the raise; a purge,
+		// destroying the epoch keys, ends it, as in a sealed namespace.
+		var preSealed *e2eRaise
+		if raise != nil && raise.level == levelSealed && (len(rs) > 0 && rs[0].seq < raise.seq || len(rs) == 0 && toSeq < raise.seq) {
+			if n.purged {
+				return t.purgedRead(n)
+			}
+			preSealed = raise
+		}
 		out.Status = 200
 		out.Last = since
 		// An entry's prev is the row before it in the page, but for the
@@ -825,19 +905,29 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		if resource != "" {
 			// A resource stream's purge and prune events (eventseal.go).
 			out.Entries = resourceEvents(out.Entries, resource)
-			if t.isSealedNS(n) {
+			switch {
+			case t.isSealedNS(n):
 				out.Sealed = true
 				out.EntryJWEs = t.sealResourceEvents(n, resource, out.Entries)
+			case preSealed != nil:
+				out.Sealed = true
+				out.EntryJWEs = t.preRaiseResourceEvents(n, preSealed, resource, out.Entries)
 			}
 			return nil
 		}
-		if t.isSealedNS(n) {
+		rangeJob := func(since string, toSeq int64, toID string, plain func() []byte) *sealJob {
+			if preSealed != nil {
+				return t.preRaiseRangeJob(n, preSealed, since, toID, plain)
+			}
+			return t.rangeJob(n, since, toSeq, toID, plain)
+		}
+		if t.isSealedNS(n) || preSealed != nil {
 			out.Sealed, nsRowID = true, n.id
 			if perEntry {
 				for i, r := range rs {
 					m := out.Entries[i]
 					prev, _ := m["prev"].(string)
-					jobs = append(jobs, t.rangeJob(n, prev, r.seq, m["id"].(string), func() []byte { return jsonv.Canonical([]any{m}) }))
+					jobs = append(jobs, rangeJob(prev, r.seq, m["id"].(string), func() []byte { return jsonv.Canonical([]any{m}) }))
 				}
 			} else if len(rs) > 0 || nsID != "" {
 				// A range, even an empty one, is sealed as a whole, with
@@ -853,7 +943,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 				if len(rs) > 0 {
 					to, toID = rs[len(rs)-1].seq, out.Last
 				}
-				jobs = append(jobs, t.rangeJob(n, since, to, toID, func() []byte { return jsonv.Canonical(entries) }))
+				jobs = append(jobs, rangeJob(since, to, toID, func() []byte { return jsonv.Canonical(entries) }))
 			}
 		}
 		return nil
