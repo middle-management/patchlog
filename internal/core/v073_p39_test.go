@@ -152,3 +152,65 @@ func TestV073P39DrawBlockedByWaitsForTheDraw(t *testing.T) {
 		t.Fatalf("the draw: %v", err)
 	}
 }
+
+// FL-3: a draw Postgres rolls back for a deadlock pauses before it runs
+// again (drawPause), so the statement that survived the deadlock, woken,
+// takes the row it waited for first: run again at once, the draw locked
+// that row again first now and then and closed the same cycle, up to
+// every attempt (TestV073P17DrawRetriesDeadlock failed so about once in
+// 60 runs). Here rate_draw fails its second call as a deadlock's victim,
+// and records when each call starts (setval, which no rollback undoes),
+// on one connection, warmed by the first call.
+func TestV073P39DrawPausesAfterDeadlock(t *testing.T) {
+	if !pgtest.Enabled() {
+		t.Skip("Postgres only")
+	}
+	var clock atomic.Int64
+	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+	e := p17RateEngine(t, pgtest.FreshDB(t), t.TempDir(), &clock, p17Fast(), false)
+	s := e.rate.store
+	s.db.SetMaxOpenConns(1)
+	for _, q := range []string{
+		`ALTER FUNCTION rate_draw(bytea[], float8[], float8[], float8[], bigint, boolean) RENAME TO p39_rate_draw`,
+		`CREATE SEQUENCE p39_draws`,
+		`CREATE SEQUENCE p39_at MINVALUE 0`,
+		`CREATE SEQUENCE p39_retry_at MINVALUE 0`,
+		`CREATE FUNCTION rate_draw(ks bytea[], rs float8[], bs float8[], cs float8[], now_us bigint, forced boolean)
+		RETURNS TABLE (k bytea, t float8, admitted boolean) LANGUAGE plpgsql AS $$
+		DECLARE
+		  n bigint := nextval('p39_draws');
+		  at bigint := (extract(epoch FROM clock_timestamp()) * 1e6)::bigint;
+		BEGIN
+		  IF n = 2 THEN
+		    PERFORM setval('p39_at', at);
+		    RAISE EXCEPTION 'injected deadlock' USING ERRCODE = '40P01';
+		  END IF;
+		  IF n = 3 THEN
+		    PERFORM setval('p39_retry_at', at);
+		  END IF;
+		  RETURN QUERY SELECT * FROM p39_rate_draw(ks, rs, bs, cs, now_us, forced);
+		END $$`,
+	} {
+		if _, err := e.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := Rate{1, 10}
+	now := time.UnixMilli(clock.Load())
+	for i, k := range []string{"a", "b"} {
+		_, _, ok, err := s.admit(context.Background(), now, []draw{{k, r, 1, "x"}})
+		if err != nil || !ok {
+			t.Fatalf("draw %d: %v, %v", i, ok, err)
+		}
+	}
+	if n := s.retried.Load(); n != 1 {
+		t.Fatalf("%d draws ran again, want 1", n)
+	}
+	var calls, at, retryAt int64
+	if err := e.db.QueryRow(`SELECT (SELECT last_value FROM p39_draws), (SELECT last_value FROM p39_at), (SELECT last_value FROM p39_retry_at)`).Scan(&calls, &at, &retryAt); err != nil || calls != 3 {
+		t.Fatalf("rate_draw ran %d times (%v), want 3", calls, err)
+	}
+	if gap := time.Duration(retryAt-at) * time.Microsecond; gap < deadlockPause/2 {
+		t.Fatalf("the draw ran again %v after its deadlock, want a pause of at least %v", gap, deadlockPause/2)
+	}
+}

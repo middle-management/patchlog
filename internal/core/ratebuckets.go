@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"log"
+	"math/rand/v2"
 	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -56,6 +58,9 @@ type bucketStore struct {
 	sweeping bool
 	closed   bool
 	wg       sync.WaitGroup
+	// retried counts the draws Postgres rolled back for a deadlock that
+	// ran again (tests).
+	retried atomic.Int64
 }
 
 // openBucketStore opens the bucket pool on the Postgres database url.
@@ -144,6 +149,11 @@ func (s *bucketStore) charge(ctx context.Context, now time.Time, d draw) error {
 // package's does; an operator's might): rate_draw is one statement, so a
 // draw rolled back deducted nothing. It returns the buckets' tokens
 // before any deduction, by key, and whether it deducted.
+//
+// After a deadlock it pauses first (drawPause): the statement that
+// survived waits for a row the draw held, and a draw run again at once
+// could lock that row again before the survivor, woken, takes it, and
+// close the same cycle, as often as it runs.
 func (s *bucketStore) draw(ctx context.Context, now time.Time, draws []draw, force bool) (map[string]float64, bool, error) {
 	ds := merged(draws)
 	keys := make([][]byte, len(ds))
@@ -154,12 +164,18 @@ func (s *bucketStore) draw(ctx context.Context, now time.Time, draws []draw, for
 		keys[i], rates[i], bursts[i], costs[i] = []byte(d.key), d.rate.Rate, d.rate.Burst, d.cost
 	}
 	var err error
-	for range 3 {
+	for attempt := 1; attempt <= drawAttempts; attempt++ {
 		var tokens map[string]float64
 		var ok bool
 		tokens, ok, err = s.drawOnce(ctx, now, keys, rates, bursts, costs, force)
 		switch {
 		case deadlocked(err):
+			if attempt < drawAttempts {
+				if err := drawPause(ctx, attempt); err != nil {
+					return nil, false, err
+				}
+				s.retried.Add(1)
+			}
 			continue
 		case err != nil:
 			return nil, false, err
@@ -173,6 +189,31 @@ func (s *bucketStore) draw(ctx context.Context, now time.Time, draws []draw, for
 		err = errBucketsVanish
 	}
 	return nil, false, err
+}
+
+// drawAttempts bounds how often draw runs drawSQL.
+const drawAttempts = 3
+
+// deadlockPause is the pause before a draw rolled back for a deadlock
+// runs again the first time, doubled the next (drawPause): long enough
+// for the woken survivor to be scheduled and lock its row, while such
+// deadlocks stay rare.
+const deadlockPause = 10 * time.Millisecond
+
+// drawPause waits attempt times deadlockPause, give or take half (so
+// draws rolled back together don't run again together), or until ctx is
+// done.
+func drawPause(ctx context.Context, attempt int) error {
+	d := time.Duration(attempt) * deadlockPause
+	d += time.Duration(rand.Int64N(int64(d))) - d/2
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // drawOnce runs drawSQL once.
