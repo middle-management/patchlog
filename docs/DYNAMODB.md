@@ -640,8 +640,9 @@ becomes its own Go module, which a build links in to serve
 `dynamodb://`. Until then the work keeps to the shape that move needs:
 
 - AWS-specific code lives only in `internal/ddb`, `internal/s3blobs`
-  (which doesn't import core: it satisfies `core.BlobStore` with standard
-  library types, and `internal/blobstores` opens it from a URL) and core's
+  (which, like `internal/fsblobs`, doesn't import core: it satisfies
+  `core.BlobStore` with standard library types, and `internal/blobstores`
+  opens either from a URL) and core's
   adapter files (`ddb.go`, `ddbreads.go`, `ddbwrite.go`); the rest of core
   depends on the gate and its read interface, never on the store.
 - The move takes the adapter files into the module, so core exports what

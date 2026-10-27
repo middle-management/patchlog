@@ -67,6 +67,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/fsblobs"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schema"
@@ -1289,8 +1290,8 @@ func (e *Engine) newBlobStats() *BlobStats {
 	s := &BlobStats{}
 	if e.blobs != nil {
 		s.Store = e.blobs.String()
-		if f, ok := e.blobs.(*fileStore); ok {
-			s.Dir = f.dir
+		if f, ok := e.blobs.(*fsblobs.Store); ok {
+			s.Dir = f.Dir
 		}
 	}
 	return s

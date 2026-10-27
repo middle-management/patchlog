@@ -49,7 +49,7 @@ type Store struct {
 // Open connects to the bucket an s3:// URL names:
 //
 //	s3://patchlog-blobs/prod?region=eu-west-1
-//	s3://blobs?region=us-east-1&endpoint=http://localhost:9000   (MinIO)
+//	s3://blobs?region=us-east-1&endpoint=http://localhost:8333   (SeaweedFS)
 //
 // Credentials come from the default AWS chain (environment, shared config,
 // instance profile). endpoint is an S3-compatible service's URL; with one,

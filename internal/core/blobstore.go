@@ -10,7 +10,7 @@ package core
 //   - no store (Engine.blobs nil): in the row (data). The default for
 //     ":memory:" and for Postgres (DynamoDB: inline in the BYTES# item).
 //   - a BlobStore: in a file of the store, named by the row (file); data is
-//     empty (blob_bytes) or NULL (blob_epochs). fileStore keeps files under
+//     empty (blob_bytes) or NULL (blob_epochs). internal/fsblobs keeps files under
 //     a directory, the default for a SQLite file at "<db path>.blobs";
 //     internal/s3blobs keeps them as objects of an S3 bucket
 //     (Options.BlobStore, opened from -blob-store by internal/blobstores).
@@ -29,7 +29,7 @@ package core
 // row and, once committed, its file, while a concurrent upload of the same
 // bytes inserts a new row naming a new file.
 //
-// Writes. A file is stored durably (BlobStore.Put: for fileStore a
+// Writes. A file is stored durably (BlobStore.Put: for fsblobs a
 // temporary file in its directory, synced, renamed into place and its
 // directory synced; for S3 one PutObject) before the row naming it is
 // inserted; a transaction that rolls back deletes the files it wrote (an
@@ -64,11 +64,11 @@ import (
 	"io"
 	"io/fs"
 	"log"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/fsblobs"
 )
 
 // orphanGrace is how old an unnamed stored object must be before the sweep
@@ -80,7 +80,7 @@ const orphanGrace = time.Hour
 var errBytesGone = errors.New("blob file deleted since the read began")
 
 // BlobStore keeps the bytes of blob_bytes and blob_epochs rows outside the
-// database (Options.BlobStore): a directory (NewFileBlobStore, file://
+// database (Options.BlobStore): a directory (internal/fsblobs, file://
 // URLs, -blob-dir), or an object store such as S3 (internal/s3blobs). Its
 // methods use only the standard library's types, so a store needn't import
 // this package. Names are slash-separated paths chosen by the engine, each
@@ -100,133 +100,6 @@ type BlobStore interface {
 	// String describes the store, for logs and BlobStats: a directory or a
 	// URL.
 	String() string
-}
-
-// fileStore keeps bytes in files under dir.
-type fileStore struct{ dir string }
-
-// NewFileBlobStore returns the store keeping blob bytes in files under dir,
-// creating it if need be (-blob-dir, file:// URLs).
-func NewFileBlobStore(dir string) (BlobStore, error) {
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(abs, 0o700); err != nil {
-		return nil, fmt.Errorf("blob directory: %w", err)
-	}
-	return &fileStore{dir: abs}, nil
-}
-
-func (s *fileStore) String() string { return s.dir }
-
-func (s *fileStore) path(name string) string { return filepath.Join(s.dir, filepath.FromSlash(name)) }
-
-// Put writes a temporary file in the name's directory, syncs it, renames
-// it into place and syncs the directory: a crash leaves the whole file or
-// none (and at worst a temporary file, for the sweep).
-func (s *fileStore) Put(_ context.Context, name string, data []byte) error {
-	full := s.path(name)
-	dir := filepath.Dir(full)
-	created, err := s.mkdirs(dir)
-	if err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(dir, tmpPrefix+"*")
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(data)
-	if err == nil {
-		err = f.Sync()
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = os.Rename(f.Name(), full)
-	}
-	if err != nil {
-		os.Remove(f.Name())
-		return err
-	}
-	// The new entry, and those of directories just created, survive a crash.
-	for _, d := range append([]string{dir}, created...) {
-		if err := syncDir(d); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// tmpPrefix starts the names of a fileStore's temporary files.
-const tmpPrefix = ".tmp-"
-
-// mkdirs creates dir and its missing parents under s.dir, and returns the
-// parents whose entries changed (to sync).
-func (s *fileStore) mkdirs(dir string) ([]string, error) {
-	if _, err := os.Stat(dir); err == nil {
-		return nil, nil
-	}
-	var missing []string
-	for d := dir; d != s.dir && d != filepath.Dir(d); d = filepath.Dir(d) {
-		if _, err := os.Stat(d); err == nil {
-			break
-		}
-		missing = append(missing, d)
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
-	}
-	var parents []string
-	for _, d := range missing {
-		parents = append(parents, filepath.Dir(d))
-	}
-	return parents, nil
-}
-
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
-
-func (s *fileStore) Open(_ context.Context, name string) (io.ReadSeekCloser, error) {
-	return os.Open(s.path(name))
-}
-
-func (s *fileStore) Remove(_ context.Context, name string) error {
-	err := os.Remove(s.path(name))
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	return err
-}
-
-func (s *fileStore) List(ctx context.Context, fn func(name string, size int64, modified time.Time) error) error {
-	return filepath.WalkDir(s.dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		if d.IsDir() {
-			return ctx.Err()
-		}
-		info, err := d.Info()
-		if err != nil || !info.Mode().IsRegular() {
-			return nil
-		}
-		rel, err := filepath.Rel(s.dir, p)
-		if err != nil {
-			return nil
-		}
-		return fn(filepath.ToSlash(rel), info.Size(), info.ModTime())
-	})
 }
 
 // openBlobStore picks the engine's blob store: Options.BlobStore, else a
@@ -251,7 +124,11 @@ func openBlobStore(opt Options, pg bool) (BlobStore, error) {
 		}
 		dir = opt.Path + ".blobs"
 	}
-	return NewFileBlobStore(dir)
+	s, err := fsblobs.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // BlobStore is the engine's blob store; nil when blob bytes are kept in
@@ -400,7 +277,7 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 			return nil
 		}
 		parts := strings.Split(name, "/")
-		if strings.HasPrefix(parts[len(parts)-1], tmpPrefix) {
+		if strings.HasPrefix(parts[len(parts)-1], fsblobs.TempPrefix) {
 			temps = append(temps, name)
 			return nil
 		}

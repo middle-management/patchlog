@@ -143,12 +143,12 @@ type Options struct {
 	// on the leader. Zero means ten minutes; negative disables it.
 	BlobSweepInterval time.Duration
 	// BlobStore is where blob bytes are stored (blobstore.go): a directory
-	// (NewFileBlobStore) or an object store such as S3 (internal/s3blobs,
+	// (internal/fsblobs) or an object store such as S3 (internal/s3blobs,
 	// internal/blobstores opens either from a URL). Instances sharing a
 	// database must share the store too.
 	BlobStore BlobStore
 	// BlobDir is the directory blob bytes are stored in, short for a
-	// BlobStore of NewFileBlobStore(BlobDir). With neither, it is
+	// BlobStore of fsblobs.Open(BlobDir). With neither, it is
 	// "<Path>.blobs" for a SQLite file, and the database itself for
 	// ":memory:" and Postgres (DynamoDB: the items, at most
 	// ddb.MaxInlineBytes each).

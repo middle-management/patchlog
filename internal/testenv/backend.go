@@ -137,8 +137,8 @@ func newTable(t testing.TB) string {
 // test ends. The bucket is created if missing, and credentials come from
 // the AWS chain:
 //
-//	AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio12345 \
-//	PATCHLOG_TEST_BLOBS='s3://patchlog-test?region=us-east-1&endpoint=http://localhost:9000' \
+//	AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+//	PATCHLOG_TEST_BLOBS='s3://patchlog-test?region=us-east-1&endpoint=http://localhost:8333' \
 //	    go test ./...
 const BlobsEnv = "PATCHLOG_TEST_BLOBS"
 

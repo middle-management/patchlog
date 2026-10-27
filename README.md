@@ -818,7 +818,7 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   same against a `postgres:16` service container. `PATCHLOG_TEST_BLOBS=s3://bucket?region=…&endpoint=…`
   (with `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) moves the API suites' blob bytes to S3,
   a prefix per test, on any backend (`internal/testenv`); `make test-s3` runs them against
-  MinIO in Docker.
+  SeaweedFS in Docker (which, without an identity configuration, accepts any credentials).
 
 ### Blob storage
 
@@ -828,13 +828,13 @@ DynamoDB, the `BYTES#` items) stay in the database and decide which bytes exist
 (`internal/core/blobstore.go`). Every database backend takes every store.
 
 - **Where.** `-blob-store URL` (or `PATCHLOG_BLOB_STORE`):
-  - `file:///var/lib/patchlog/blobs`: files under a directory. `-blob-dir DIR` (or
-    `PATCHLOG_BLOB_DIR`) is short for it.
+  - `file:///var/lib/patchlog/blobs`: files under a directory (`internal/fsblobs`).
+    `-blob-dir DIR` (or `PATCHLOG_BLOB_DIR`) is short for it.
   - `s3://bucket/prefix?region=eu-west-1`: objects under a prefix of an S3 bucket
     (`internal/s3blobs`). Credentials come from the AWS chain (environment, shared config,
     instance or task role); the role needs `s3:PutObject`, `s3:GetObject`,
     `s3:DeleteObject` and `s3:ListBucket` on the prefix. `endpoint=http://host:9000` points
-    at an S3-compatible service (MinIO, SeaweedFS, …), addressing buckets in the path
+    at an S3-compatible service (SeaweedFS, Ceph RGW, Garage, …), addressing buckets in the path
     (`path-style=false` turns that off).
 
   With neither, bytes go to `<db>.blobs` next to a SQLite file; `:memory:` and Postgres keep

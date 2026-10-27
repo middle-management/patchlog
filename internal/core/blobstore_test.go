@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/middle-management/patchlog/internal/fsblobs"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/pgtest"
 )
@@ -334,4 +335,4 @@ func TestPGBlobFilesShared(t *testing.T) {
 }
 
 // blobRoot is the directory of the engine's file store.
-func blobRoot(e *Engine) string { return e.blobs.(*fileStore).dir }
+func blobRoot(e *Engine) string { return e.blobs.(*fsblobs.Store).Dir }
