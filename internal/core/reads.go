@@ -260,7 +260,8 @@ type Rev struct {
 	Digest  []byte
 	// SchemaRules is, for a 200 whose Doc is a schema document served in
 	// the clear (the namespace serving the read is neither sealed nor
-	// e2e), the rules marker its revision row was stored with
+	// e2e, or the revision is from before a raise to e2e from none or
+	// at-rest), the rules marker its revision row was stored with
 	// (schema.Rules.String, schemaload.go), sent as schema.RulesHeader so
 	// clients and remote mirrors compile it as this server does (§6.1).
 	// "" otherwise.
@@ -398,7 +399,9 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			return nil
 		}
 		out.Status, out.Doc = 200, b
-		if plain {
+		if plain || pre != nil && !pre.sealed() {
+			// In the clear, from before a raise from none or at-rest too:
+			// a key holder compiles it as the server resolves it (CIS-24).
 			out.SchemaRules = t.schemaRulesHeader(row, b)
 		}
 		if plain && row.size.Valid && row.size.Int64 == int64(len(b)) && len(row.digest) == sha256.Size {

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -104,4 +105,22 @@ func TestV073P35ValidatesAgainstPreRaiseSchema(t *testing.T) {
 	if _, err := v.x.AppendSealed(ctx, "e", "good", good, ops(op("replace", "/n", "x"))); err == nil || !strings.Contains(err.Error(), "doesn't validate") {
 		t.Fatalf("an invalid document written: %v", err)
 	}
+}
+
+// v0.73 §6.1, Addendum E Levels (CIS-24, w3x F6): a schema revision from
+// before a raise from at-rest, served at E3 in the clear, carries its
+// rules marker, so the E3 writer validates under the rules the server
+// resolves it with: written now, it asserts idn-email, which legacy rules
+// don't.
+func TestV073P35ValidatesUnderPreRaiseSchemaRules(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	v := newP29Env(t, map[string]any{"level": "at-rest"})
+	s1 := must(v.c.CreateDoc(ctx, "e", "m", map[string]any{"$schema": schema.Dialect2020, "type": "object",
+		"properties": map[string]any{"e": map[string]any{"type": "string", "format": "idn-email"}}})).ID
+	v.p35Raise(t, map[string]any{"level": "e2e", "epoch": 1.0})
+	if w, err := v.x.CreateDocSealed(ctx, "e", "bad", map[string]any{"$schema": "/r/e/m/rev/" + s1, "e": "not an email"}); err == nil || !strings.Contains(err.Error(), "doesn't validate") {
+		t.Fatalf("the E3 writer sealed %v (%v), a document its schema from before the raise (v0.73 rules, idn-email asserted) refuses", w, err)
+	}
+	must(v.x.CreateDocSealed(ctx, "e", "ok", map[string]any{"$schema": "/r/e/m/rev/" + s1, "e": "a@b.example"}))
 }

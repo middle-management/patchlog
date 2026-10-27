@@ -8,6 +8,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -304,7 +305,8 @@ func TestV073P35PreRaiseBlobs(t *testing.T) {
 // v0.73 §C.3.1, Addendum E Levels (ENC-40, GR-33): in a namespace raised
 // from sealed, a grant first recorded before the raise stays sealed as at
 // E2 (pl {ns, grant}, the epoch of the entry recording it); one recorded
-// after it is served in the clear, privately.
+// after it is served in the clear. Both are private, no-store at the
+// edge (§9).
 func TestV073P35PreRaiseGrants(t *testing.T) {
 	t.Parallel()
 	e := newSealedAuthEnv(t)
@@ -322,7 +324,7 @@ func TestV073P35PreRaiseGrants(t *testing.T) {
 	gid1, gid2 := grantIDOf(t, g1), grantIDOf(t, g2)
 	a := e.get("/ns/s/grants/"+gid1, adminG)
 	expect(t, a, 200)
-	if !isJOSE(a) || strings.HasPrefix(a.H.Get("Cache-Control"), "private") && strings.Contains(a.H.Get("Cache-Control"), "no-store") {
+	if !isJOSE(a) || !strings.HasPrefix(a.H.Get("Cache-Control"), "private") || a.H.Get("CDN-Cache-Control") != "no-store" {
 		t.Fatalf("grant from before the raise %v %s", a.H, a.Body)
 	}
 	m := jsonv.MustParse(open(t, a.String(), keys["s#1"], "s#1", seal.GrantPL("s", gid1))).(map[string]any)
@@ -331,7 +333,7 @@ func TestV073P35PreRaiseGrants(t *testing.T) {
 	}
 	b := e.get("/ns/s/grants/"+gid2, adminG)
 	expect(t, b, 200)
-	if isJOSE(b) || b.Obj()["id"] != gid2 || !strings.HasPrefix(b.H.Get("Cache-Control"), "private") {
+	if isJOSE(b) || b.Obj()["id"] != gid2 || !strings.HasPrefix(b.H.Get("Cache-Control"), "private") || b.H.Get("CDN-Cache-Control") != "no-store" {
 		t.Fatalf("grant after the raise %v %s", b.H, b.Body)
 	}
 	// A branch serves its base's grant from before the raise as the base
@@ -397,4 +399,58 @@ func TestV073P35PreRaiseKeyWindows(t *testing.T) {
 		"items": []any{map[string]any{"resource": "d", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{"p": ref(pid, "text/plain", len(plain), "")})}}}}
 	expectCode(t, e.batchReq("docs", body, late), 422, "batch")
 	expect(t, e.batchReq("docs", body, early), 201)
+}
+
+// v0.73 §9 ("/ns/{ns}/grants/{gid} (private at E3, §C.3.1)"), §C.3.1: a
+// grant from before a raise from sealed, served sealed, is still an E3
+// grant answer, private and no-store at the edge, in a public namespace
+// too, whose sealed answers otherwise take the immutable class.
+func TestV073P35PreRaiseGrantPrivatePublic(t *testing.T) {
+	t.Parallel()
+	e := newSealedAuthEnv(t)
+	admin, writer := newKey("admin"), newKey("writer")
+	e.mkNS("s", sealedDoc(map[string]any{"read": "public", "keys": []any{admin.entry("*"), writer.entry("read", "create", "append")}}))
+	adminG := e.grant(admin, "user:admin", []string{"s"}, allVerbs)
+	g1 := e.grant(writer, "user:w1", []string{"s"}, []string{"read", "create", "append"})
+	e.wr("s", "d", "", withNonce(addRoot(map[string]any{"v": 1.0})), g1)
+	expect(t, e.patchNS("s", ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 2.0})), adminG), 201)
+
+	a := e.get("/ns/s/grants/"+grantIDOf(t, g1), adminG)
+	expect(t, a, 200)
+	if !isJOSE(a) {
+		t.Fatalf("grant from before the raise not sealed: %v", a.H)
+	}
+	if cc := a.H.Get("Cache-Control"); !strings.HasPrefix(cc, "private") || a.H.Get("CDN-Cache-Control") != "no-store" || a.H.Get("Surrogate-Control") != "no-store" {
+		t.Fatalf("E3 grant answer from before the raise cached as %q (CDN %q), not private/no-store", cc, a.H.Get("CDN-Cache-Control"))
+	}
+}
+
+// v0.73 §6.1, Addendum E Levels (CIS-24): a schema revision from before a
+// raise from none is served at E3 in the clear, as at the level before,
+// with the rules marker its row was stored with, as the server compiles
+// it when it resolves it: an E3 client without the marker compiles it as
+// legacy (idn-email unasserted where the server asserts it).
+func TestV073P35PreRaiseSchemaRulesMarker(t *testing.T) {
+	t.Parallel()
+	e := newSealedEnv(t)
+	e.mkNS("p", map[string]any{"read": "public"})
+	s1 := e.wr("p", "m", "", addRoot(map[string]any{"$schema": dialect, "properties": map[string]any{"m": map[string]any{"format": "idn-email"}}}))
+	before := e.get("/r/p/m/rev/" + s1)
+	expect(t, before, 200)
+	if before.H.Get(schema.RulesHeader) != "v0.73" {
+		t.Fatalf("marker before the raise %q", before.H.Get(schema.RulesHeader))
+	}
+	e.p35Raise("p", map[string]any{"level": "e2e", "epoch": 1.0})
+	after := e.get("/r/p/m/rev/" + s1)
+	expect(t, after, 200)
+	if isJOSE(after) || after.H.Get("X-E2E") != "" {
+		t.Fatalf("revision from before the raise %v", after.H)
+	}
+	if got := after.H.Get(schema.RulesHeader); got != "v0.73" {
+		t.Fatalf("schema revision from before a raise from none served at E3 with marker %q, want v0.73", got)
+	}
+	// Created and digest follow the level now in force (§E.3.1).
+	if after.H.Get("Last-Modified") != "" || after.H.Get("Repr-Digest") != "" {
+		t.Fatalf("revision from before the raise at E3 %v", after.H)
+	}
 }

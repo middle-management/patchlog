@@ -1910,7 +1910,11 @@ func (x *E2E) validate(ctx context.Context, target string, doc any, stored bool)
 			// A revision of an e2e namespace from before its raise from
 			// sealed, served sealed as at E2 under keys this view holds
 			// (Addendum E Levels, openPreRaise); no marker is sent with
-			// it, so it compiles as legacy.
+			// it, so it compiles as legacy, as for any server that sends
+			// none. The server compiles it under its row's marker (v0.73
+			// for one written by this version), which a sealed answer has
+			// no channel for: the two can differ on formats (one from
+			// before a raise from none or at-rest carries the marker).
 			if d, derr := x.DocE2E(ctx, ref.NS, ref.Name, ref.Rev); derr == nil && d.PreRaise {
 				r, err = &ResolvedSchema{Doc: &Doc{ID: ref.Rev, Value: d.Value, Rules: schema.Legacy}, NS: ref.NS}, nil
 			}

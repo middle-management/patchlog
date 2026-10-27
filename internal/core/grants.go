@@ -97,17 +97,17 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 				return jsonv.Canonical(map[string]any{"id": out.ID, "root": out.Root, "stored": out.Stored})
 			})
 		case levelE2E:
-			// One first recorded before a raise from sealed stays sealed,
-			// as the namespace that recorded it serves it (Addendum E
-			// Levels, preRaiseGrant).
+			// Private and no-store for shared caches in either form
+			// (§C.3.1, §9). One first recorded before a raise from sealed
+			// stays sealed, as the namespace that recorded it serves it
+			// (Addendum E Levels, preRaiseGrant).
+			out.Private = true
 			if m, raise, seq := t.preRaiseGrant(n, id); m != nil {
 				nsRowID = m.id
 				job = t.preRaiseGrantJob(m, raise, id, seq, func() []byte {
 					return jsonv.Canonical(map[string]any{"id": out.ID, "root": out.Root, "stored": out.Stored})
 				})
-				break
 			}
-			out.Private = true
 		}
 		return nil
 	})
