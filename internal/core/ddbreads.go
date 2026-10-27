@@ -33,7 +33,7 @@ import (
 type ddbReads struct {
 	e   *Engine
 	b   *ddbBackend
-	s   *ddb.Store
+	s   ddb.Store
 	ctx context.Context
 
 	next    int64

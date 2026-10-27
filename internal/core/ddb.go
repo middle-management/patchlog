@@ -32,7 +32,7 @@ import (
 // engine keeps of it.
 type ddbBackend struct {
 	e     *Engine
-	store *ddb.Store
+	store ddb.Store
 	cfgMu sync.Mutex
 	// byID are the configurations the gate's reads parsed, by namespace
 	// and id (ddbReads.config): a configuration never changes.
@@ -83,22 +83,30 @@ func openDDB(opt Options) (*Engine, error) {
 	if opt.BeforeWriteLock != nil || opt.BeforeCommit != nil {
 		return nil, fmt.Errorf("core: the SQL write path's hooks (BeforeWriteLock, BeforeCommit): %w (DynamoDB)", ErrUnsupported)
 	}
-	store, err := ddb.Open(context.Background(), opt.Path)
+	b := &ddbBackend{byID: map[string]*Config{}}
+	store, err := ddb.Open(context.Background(), opt.Path, ddb.Options{
+		// Group commit (docs/DYNAMODB.md §4): resource writes queue per
+		// namespace; GroupCommitWait doesn't apply — a group forms from
+		// the writes queued while the one before it commits.
+		GroupCommit: opt.GroupCommit,
+		// The engine's clock stamps what the store writes (created
+		// times), as the SQL write path's opt.Now does: Last-Modified and
+		// /heads' created are the revision's own time on the instance's
+		// clock (§7.1).
+		Now: opt.Now,
+		// What core encrypted at rest, opened for the store's own folds.
+		OpenValue: func(ctx context.Context, ns, name, kind, key, raw string) (string, error) {
+			return b.openValue(ctx, ns, name, kind, key, raw)
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
-	// Group commit (docs/DYNAMODB.md §4): resource writes queue per
-	// namespace; GroupCommitWait doesn't apply — a group forms from the
-	// writes queued while the one before it commits.
-	store.GroupCommit = opt.GroupCommit
-	// The engine's clock stamps what the store writes (created times),
-	// as the SQL write path's opt.Now does: Last-Modified and /heads'
-	// created are the revision's own time on the instance's clock (§7.1).
-	store.Now = opt.Now
+	b.store = store
 	// The deployment's batch maximum, lowered to what one transaction
 	// holds (docs/DYNAMODB.md §10): namespaces learn it from their limits,
 	// and a batch over it is §6.6's 413 itemsPerBatch, not the action cap.
-	opt.Maximums.ItemsPerBatch = min(opt.Maximums.ItemsPerBatch, ddb.MaxBatchItems)
+	opt.Maximums.ItemsPerBatch = min(opt.Maximums.ItemsPerBatch, store.MaxBatchItems())
 	opt.Limits.ItemsPerBatch = min(opt.Limits.ItemsPerBatch, opt.Maximums.ItemsPerBatch)
 	// Blob bytes go to files under -blob-dir (one instance), or else into
 	// their items, which bounds blobSize by an item's size.
@@ -131,9 +139,8 @@ func openDDB(opt Options) (*Engine, error) {
 	if e.opt.Remote.RenewBefore == 0 {
 		e.opt.Remote.RenewBefore = 7 * 24 * time.Hour
 	}
-	b := &ddbBackend{e: e, store: store, byID: map[string]*Config{}}
+	b.e = e
 	e.be = b
-	store.Open = b.openValue
 	if err := b.checkKeyStore(context.Background()); err != nil {
 		return nil, err
 	}

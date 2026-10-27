@@ -12,7 +12,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     services:
-      # DynamoDB Local, for internal/ddb's and internal/core's
+      # DynamoDB Local, for internal/ddbstore's and internal/core's
       # DDB_ENDPOINT-gated integration tests (docs/DYNAMODB.md).
       dynamodb:
         image: amazon/dynamodb-local:latest

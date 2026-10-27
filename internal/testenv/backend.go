@@ -49,7 +49,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/core"
-	"github.com/middle-management/patchlog/internal/ddb"
+	"github.com/middle-management/patchlog/internal/ddbstore"
 	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
@@ -120,10 +120,10 @@ func newTable(t testing.TB) string {
 	url := fmt.Sprintf("dynamodb://test-%d-%d?region=us-east-1&endpoint=%s", time.Now().UnixNano(), tables.Add(1), ep)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := ddb.CreateTable(ctx, url); err != nil {
+	if err := ddbstore.CreateTable(ctx, url); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ddb.DeleteTable(context.Background(), url) })
+	t.Cleanup(func() { ddbstore.DeleteTable(context.Background(), url) })
 	return url
 }
 

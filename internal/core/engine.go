@@ -135,7 +135,7 @@ type Options struct {
 	// and batches of one namespace one transaction appends and commits at
 	// once (group commit, D.8; groupcommit.go); on DynamoDB, of its
 	// resource writes, further bounded by the transaction's 100 actions
-	// (internal/ddb/group.go). Zero means 32; 1 or less turns group
+	// (internal/ddbstore/group.go). Zero means 32; 1 or less turns group
 	// commit off, so every write commits on its own.
 	GroupCommit int
 	// GroupCommitWait is at most how long a group waits for writes of its

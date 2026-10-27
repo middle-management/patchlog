@@ -30,6 +30,9 @@ import (
 	"github.com/middle-management/patchlog/internal/cdnpurge"
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/cors"
+	// The DynamoDB store, for -db dynamodb:// URLs (docs/DYNAMODB.md):
+	// it registers itself with core's backend (internal/ddb).
+	_ "github.com/middle-management/patchlog/internal/ddbstore"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
