@@ -3882,6 +3882,10 @@ in its own transaction, and records them per namespace (in `mmmigrate_applied`, 
 `TestMigrations` (`internal/dbmigrate`) fails if one changed. A rebuild (`-rebuild`) empties the
 tables it replays and leaves the schema as it is.
 
+Rows the code expects to exist (seeds) are SQL as well, in `migrations/seed/<dialect>.sql` (the
+core's `cache_gen` row on Postgres): they run after the migrations on every start, so they must be
+safe to run again (`INSERT … ON CONFLICT DO NOTHING`).
+
 To change a schema, write the change in the `current.sql` of each dialect's directory (plain SQL, safe to run twice, since tests apply it after every edit), test it
 (`go test ./...`, and `make test-pg` for the core), and commit it with
 `make migration DESC="what it changes"`, which commits every `current.sql` holding SQL and needs

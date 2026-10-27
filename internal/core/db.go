@@ -83,16 +83,9 @@ func openPG(url string) (*sql.DB, error) {
 	n := 4 * runtime.GOMAXPROCS(0)
 	db.SetMaxOpenConns(n)
 	db.SetMaxIdleConns(n)
-	ctx := context.Background()
-	if err := dbmigrate.Migrate(ctx, db, migrations, "patchlog"); err != nil {
+	if err := dbmigrate.Migrate(context.Background(), db, migrations, "patchlog"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
-	}
-	// cache_gen's one row (tailer.go), on every open: a database emptied
-	// of rows keeps its schema, and the migrations don't run again.
-	if _, err := db.ExecContext(ctx, `INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING`); err != nil {
-		db.Close()
-		return nil, err
 	}
 	return db, nil
 }

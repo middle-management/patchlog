@@ -1,7 +1,7 @@
 -- Migration: baseline schema
--- Created: 2026-10-27T08:51:51Z
--- Checksum: 40fa62f117d3b36d0d329ea7152c02af1b6fa00836a3f9c400c700f2385d83da
--- Chain: 2d7674250adf336d545274355fb0bd4e6045df4333213368929cb076519ae3bf
+-- Created: 2026-10-27T08:53:38Z
+-- Checksum: 8415be186debe29da0ce6b698bcddfcb87d9494e5cd2a896701da6dd72daffa4
+-- Chain: 9ee2995812fc129124bbd7885151e1a3d6411553f3ac79c41919bace3c9774b7
 --
 -- IMPORTANT: Do not modify this file after commit. The checksum above
 -- tracks the integrity of this migration. Any changes will be detected
@@ -291,7 +291,7 @@ CREATE TABLE IF NOT EXISTS remote_notices (
 );
 
 -- Incremented by commits that change what reads may return; read by the
--- tailer (tailer.go). Its one row is inserted on every open (openPG).
+-- tailer (tailer.go). Its one row is the seed's (migrations/seed).
 CREATE TABLE IF NOT EXISTS cache_gen (id smallint PRIMARY KEY CHECK (id = 1), gen bigint NOT NULL);
 -- Large values (patch sets, documents, namespace entries' bodies, blob
 -- bytes) are compressed with lz4 where the server has it (PostgreSQL 14

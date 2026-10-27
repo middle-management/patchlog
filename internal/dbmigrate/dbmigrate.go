@@ -6,11 +6,18 @@
 // so several packages' tables share a database (the tree service's holds
 // the tree's, the catalog's, the sealed-view cache's and the repurge
 // queue's) with independent histories.
+//
+// Seeds, rows the code expects to exist, are SQL too: migrations/seed/
+// <dialect>.sql, run after the migrations on every start, so they must be
+// safe to run again (INSERT … ON CONFLICT DO NOTHING). Running them every
+// time restores them in a database emptied of rows but not of its schema
+// (the Postgres test pool).
 package dbmigrate
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io/fs"
 	"testing"
@@ -29,7 +36,8 @@ import (
 // (mmmigrate_applied on SQLite, the mmmigrate schema on Postgres, under an
 // advisory lock so instances starting together don't race). Tests also
 // apply current.sql, so a migration being written is tested before it is
-// committed.
+// committed. Then the dialect's seed, if fsys has one, runs in a
+// transaction.
 func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, namespace string) error {
 	var dialect mmmigrate.Dialect
 	var name string
@@ -50,6 +58,24 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, namespace string) erro
 	}
 	if err := mmmigrate.RunMigrations(ctx, db, dialect, sub, testing.Testing(), mmmigrate.WithNamespace(namespace)); err != nil {
 		return fmt.Errorf("migrating %s: %w", namespace, err)
+	}
+	seed, err := fs.ReadFile(fsys, "migrations/seed/"+name+".sql")
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("seeding %s: %w", namespace, err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("seeding %s: %w", namespace, err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, string(seed)); err != nil {
+		return fmt.Errorf("seeding %s: %w", namespace, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("seeding %s: %w", namespace, err)
 	}
 	return nil
 }

@@ -36,8 +36,9 @@ func TestMigrations(t *testing.T) {
 	}
 }
 
-// Migrate runs the directory of db's dialect, and refuses a database
-// whose dialect has none rather than run another's SQL on it.
+// Migrate runs the directory of db's dialect and then its seed, and
+// refuses a database whose dialect has none rather than run another's SQL
+// on it.
 func TestMigrateDialect(t *testing.T) {
 	ctx := context.Background()
 	db, err := sql.Open("sqlite", ":memory:")
@@ -47,11 +48,23 @@ func TestMigrateDialect(t *testing.T) {
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	fsys := fstest.MapFS{
-		"migrations/sqlite/001_a.sql":   {Data: []byte(`CREATE TABLE a (x INTEGER);`)},
+		"migrations/sqlite/001_a.sql":   {Data: []byte(`CREATE TABLE a (x INTEGER PRIMARY KEY);`)},
 		"migrations/postgres/001_b.sql": {Data: []byte(`CREATE TABLE b (x bigint);`)},
+		"migrations/seed/sqlite.sql":    {Data: []byte(`INSERT INTO a (x) VALUES (1) ON CONFLICT DO NOTHING;`)},
+	}
+	// Twice: the seed runs every time, and once emptied, puts its row back.
+	if err := Migrate(ctx, db, fsys, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM a`); err != nil {
+		t.Fatal(err)
 	}
 	if err := Migrate(ctx, db, fsys, "test"); err != nil {
 		t.Fatal(err)
+	}
+	var seeded int
+	if err := db.QueryRow(`SELECT count(*) FROM a`).Scan(&seeded); err != nil || seeded != 1 {
+		t.Fatalf("seeded rows %d (%v), want 1", seeded, err)
 	}
 	var tables []string
 	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('a', 'b')`)
