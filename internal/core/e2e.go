@@ -191,9 +191,16 @@ func (t *tx) preRaiseHead(raise *e2eRaise, res int64) int64 {
 // step 3): no zip (§E.2.2), kid "{ns}#{epoch}" naming n and the given
 // epoch, and pl exactly want. A write's sealed op names the epoch in force
 // (invariant 6): cfg's, which for a batch's items is the configuration its
-// config change produces (§7.5); a prune's snapshot the one snapshotEpoch
-// gives. why says where the epoch comes from, for the refusal.
+// config change produces (§7.5). why says where the epoch comes from, for
+// the refusal.
 func (t *tx) checkSealedHeader(n *nsRow, jwe string, want seal.PL, what string, epoch int, why string) *Error {
+	return t.checkSealedKid(jwe, want, what, n.name, epoch, why)
+}
+
+// checkSealedKid is checkSealedHeader with the namespace the kid must name,
+// kns: n's own, or for a prune's snapshot of a base's content from before
+// its raise from sealed, that base (checkSnapshot).
+func (t *tx) checkSealedKid(jwe string, want seal.PL, what, kns string, epoch int, why string) *Error {
 	h, err := seal.ParseHeader(jwe)
 	if err != nil || strings.Split(jwe, ".")[1] != "" {
 		return invalid(fmt.Sprintf("the %s is not a compact JWE with alg dir and enc A256GCM", what))
@@ -201,9 +208,9 @@ func (t *tx) checkSealedHeader(n *nsRow, jwe string, want seal.PL, what string, 
 	if h.Zip != "" {
 		return invalid(fmt.Sprintf("the %s's protected header has zip: sealed payloads are never compressed (§E.2.2)", what))
 	}
-	kns, e, err := seal.ParseKid(h.Kid)
-	if err != nil || kns != n.name {
-		return invalid(fmt.Sprintf("the %s's kid must be %q#{epoch}", what, n.name))
+	ns, e, err := seal.ParseKid(h.Kid)
+	if err != nil || ns != kns {
+		return invalid(fmt.Sprintf("the %s's kid must be %q#{epoch}", what, kns))
 	}
 	if e != epoch {
 		return invalid(fmt.Sprintf("the %s is sealed under epoch %d, not %d, %s (§E.3.1)", what, e, epoch, why))
@@ -214,25 +221,54 @@ func (t *tx) checkSealedHeader(n *nsRow, jwe string, want seal.PL, what string, 
 	return nil
 }
 
-// snapshotEpoch is the epoch a prune's snapshot of revision h of n must be
-// sealed under (§E.3.1), and why. It is set by the newest revision in h's
-// chain, crossing foreign parents, that isn't a tombstone and whose patch
-// set isn't []:
+// checkSnapshot checks the header of snapshot, a prune's sealed snapshot of
+// revision h of resource name of n (§8.6, §E.3.1): pl {ns, name, id}
+// naming n, the resource and h, and the kid snapshotKid gives.
+func (t *tx) checkSnapshot(n *nsRow, cfg *Config, name string, h *revRow, snapshot string) *Error {
+	kns, epoch, why := t.snapshotKid(n, cfg, h)
+	return t.checkSealedKid(snapshot, seal.SnapshotPL(n.name, name, h.id.String()), "snapshot", kns, epoch, why)
+}
+
+// snapshotKid is the kid a prune's snapshot of revision h of n must be
+// sealed under (§E.3.1), as the namespace it names and the epoch, and why.
+// It is set by the newest revision in h's chain, crossing foreign parents,
+// that isn't a tombstone and whose patch set isn't []:
 //
 //   - a sealed op of n's own (its kid names n): that op's epoch;
-//   - a patch set of n's from before its raise from sealed, in the clear
-//     on the server: the epoch n serves that revision under (Addendum E
-//     Levels, preRaiseEpoch);
+//   - a patch set from before a raise from sealed, in the clear on the
+//     server: the epoch that revision is served under (Addendum E Levels,
+//     preRaiseEpoch). For n's own, an epoch of n's; for a base's content
+//     that a branch reads through, one of that base's, which the branch
+//     serves it under as the base does, so the kid names the base
+//     (kidName): an epoch of the branch's own would open, to readers of
+//     its later epochs, what Levels keep under the epoch before the raise;
 //   - otherwise, a base's op or content from before a raise from none or
 //     at-rest: n's epoch in force, cfg's.
 //
 // A revision below an earlier horizon has no patch set left; the snapshot
-// kept at that horizon stands for it, its epoch counting where its kid
-// names n (F-E2), as clients, which fold from that snapshot, see it too.
-func (t *tx) snapshotEpoch(n *nsRow, cfg *Config, h *revRow) (int, string) {
+// kept at that horizon stands for it, its kid counting where it names n,
+// or the base whose horizon it is with an epoch from before that base's
+// raise from sealed (F-E2), as clients, which fold from that snapshot, see
+// it too.
+func (t *tx) snapshotKid(n *nsRow, cfg *Config, h *revRow) (string, int, string) {
 	inForce := fmt.Sprintf("namespace %s's epoch in force", n.name)
-	var raise *e2eRaise
-	raised := false
+	// The raise from sealed of the namespace owning a resource row, if any.
+	owners := map[int64]*nsRow{}
+	raises := map[int64]*e2eRaise{}
+	ownerOf := func(res int64) (*nsRow, *e2eRaise) {
+		if o, ok := owners[res]; ok {
+			return o, raises[res]
+		}
+		var ns int64
+		t.must(t.QueryRow(`SELECT ns FROM resources WHERE res = ?`, res).Scan(&ns))
+		o := t.nsByID(ns)
+		r := t.e2eRaiseOf(o)
+		if r != nil && r.level != levelSealed {
+			r = nil
+		}
+		owners[res], raises[res] = o, r
+		return o, r
+	}
 	for _, seg := range t.ancestry(h) {
 		var found *revRow
 		var snap string
@@ -272,10 +308,14 @@ func (t *tx) snapshotEpoch(n *nsRow, cfg *Config, h *revRow) (int, string) {
 		}
 		at := fmt.Sprintf("set by revision %s of its chain", found.id)
 		if snap != "" {
-			if kns, e, err := seal.ParseKid(kidOf(snap)); err == nil && kns == n.name {
-				return e, fmt.Sprintf("the epoch of the snapshot kept at horizon %s of its chain", found.id)
+			kns, e, err := seal.ParseKid(kidOf(snap))
+			if err == nil && kns == n.name {
+				return n.name, e, fmt.Sprintf("the epoch of the snapshot kept at horizon %s of its chain", found.id)
 			}
-			return cfg.Epoch, inForce
+			if o, r := ownerOf(found.res); err == nil && o.id != n.id && r != nil && kns == t.kidName(o) && e <= r.epoch {
+				return kns, e, fmt.Sprintf("the epoch of the snapshot kept at horizon %s of its chain, from before %s's raise from sealed", found.id, o.name)
+			}
+			return n.name, cfg.Epoch, inForce
 		}
 		var canon []byte
 		if found.patches.Valid {
@@ -283,21 +323,19 @@ func (t *tx) snapshotEpoch(n *nsRow, cfg *Config, h *revRow) (int, string) {
 		}
 		if jwe, _, ok := seal.SealedOp(canon); ok {
 			if kns, e, err := seal.ParseKid(kidOf(jwe)); err == nil && kns == n.name {
-				return e, at
+				return n.name, e, at
 			}
-			return cfg.Epoch, inForce
+			return n.name, cfg.Epoch, inForce
 		}
 		// In the clear on the server: content from before a raise, n's own
-		// or a base's read through (whose levels are P36's).
-		if !raised {
-			raise, raised = t.e2eRaiseOf(n), true
+		// or a base's read through.
+		if o, r := ownerOf(found.res); r != nil {
+			kns := t.kidName(o)
+			return kns, t.preRaiseEpoch(o, found, r), fmt.Sprintf("%s, from before %s's raise from sealed, served under %s's epoch", at, o.name, kns)
 		}
-		if raise != nil && raise.level == levelSealed && t.ownRes(n, found.res) {
-			return t.preRaiseEpoch(n, found, raise), at + ", from before the raise from sealed"
-		}
-		return cfg.Epoch, inForce
+		return n.name, cfg.Epoch, inForce
 	}
-	return cfg.Epoch, inForce
+	return n.name, cfg.Epoch, inForce
 }
 
 // kidOf is the kid of a compact JWE's protected header, "" if it has none.
@@ -872,8 +910,7 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	if h.id != requested {
 		return nil, apiErr(422, "invalid", "message", "the horizon moves down to a protected revision (§8.6); seal the snapshot for that one", "horizon", h.id.String())
 	}
-	epoch, why := t.snapshotEpoch(n, cfg, h)
-	if err := t.checkSealedHeader(n, snapshot, seal.SnapshotPL(n.name, name, h.id.String()), "snapshot", epoch, why); err != nil {
+	if err := t.checkSnapshot(n, cfg, name, h, snapshot); err != nil {
 		return nil, err
 	}
 	// The snapshot needs no list (§8.6, §E.3.1): the server keeps the
@@ -881,6 +918,19 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	// (for a tombstone, the last live one's, whose runs a tombstone
 	// doesn't close).
 	kept := t.declaredAt(h)
+	// A horizon whose document is from before a raise to e2e, in the clear
+	// on the server (Addendum E Levels, §8.6): /rev/{h} is served as before
+	// the raise, so the document is kept, as a prune outside E3 keeps it,
+	// and so are its stored sealings after a raise from sealed, which fixed
+	// the epoch it is served under (§E.2.2). A document that folds over a
+	// sealed op isn't the server's to keep.
+	keepDocs := map[int64]*revRow{}
+	var keptDoc []byte
+	if ll := t.lastLive(h); ll.res == own.id && t.e2eRaiseOf(n) != nil {
+		if doc, err := t.docBytesAt(ll); err == nil {
+			keepDocs[ll.seq], keptDoc = ll, doc
+		}
+	}
 	from := own.horizonSeq.Int64
 	if !cur.Valid {
 		t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ?`, own.id).Scan(&from))
@@ -903,6 +953,18 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	t.must(err)
 	_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res = ? AND seq < ?`, own.id, h.seq)
 	t.must(err)
+	for seq, row := range keepDocs {
+		_, err = t.Exec(`INSERT INTO snapshots (seq, res, doc) VALUES (?,?,?) ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc`, seq, own.id, t.putDoc("snapshots", own.id, row.seq, keptDoc))
+		t.must(err)
+	}
+	// Below the horizon, the documents and sealings of pre-raise content
+	// go but the kept one's (pruneTo).
+	for _, seq := range t.droppedBelow(own.id, h.seq, keepDocs, nil) {
+		_, err = t.Exec(`DELETE FROM snapshots WHERE seq = ?`, seq)
+		t.must(err)
+	}
+	t.flushDocs = true
+	t.deletePrunedSealed(own.id, h.seq, keepDocs)
 	_, err = t.Exec(`UPDATE resources SET horizon_seq = ?, keep = '[]' WHERE res = ?`, h.seq, own.id)
 	t.must(err)
 	target := h.seq

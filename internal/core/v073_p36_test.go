@@ -291,3 +291,110 @@ func TestV073P36PreRaiseKeys(t *testing.T) {
 		t.Fatal("a branch's pre-raise K_r isn't derived with the base's namespace")
 	}
 }
+
+// v0.73 §8.6, §E.3.1, Addendum E Levels, After a raise (ENC-51, ENC-22;
+// CONFORMANCE Levels scenarios 23 and 37): after a raise from sealed, an
+// E3 prune whose horizon's document is from before the raise keeps that
+// document, which /rev/{H} goes on serving as before the raise, and its
+// stored sealing, which fixed the epoch it is served under; the documents
+// and sealings of what it prunes below go. In a branch reading that
+// content through, a prune's snapshot is sealed under the epoch the base
+// serves the revision under, so its kid names the base, never the
+// branch's own later epoch.
+func TestV073P36PreRaiseHorizon(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := &p29Clock{t: p36T0}
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
+		Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}, KeyStore: ks, Archiver: p29Archiver{}, Now: now.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close() })
+	p29RaiseFromSealed(t, e)
+	cfg := mkNS(t, e, "s", map[string]any{"encryption": map[string]any{"level": "sealed"}})
+	ids := []string{""}
+	for i := 1; i <= 3; i++ {
+		patches := []any{map[string]any{"op": "replace", "path": "/n", "value": float64(i)}, map[string]any{"op": "replace", "path": "/$nonce", "value": seal.NewNonce()}}
+		if i == 1 {
+			patches = []any{p29Add("", map[string]any{"n": 1.0}), p29Add("/$nonce", seal.NewNonce())}
+		}
+		w, err := e.WriteResource(ctx, p29Req("s"), Item{Resource: "d", IfMatch: ids[i-1], IfNoneMatch: i == 1, Steps: []Step{{Patches: patches}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, w.Items[0].IDs[0])
+	}
+	w1, w2 := ids[1], ids[2]
+	// Read while sealed: each document gets its stored sealing (§E.2.2).
+	for _, id := range ids[1:] {
+		if _, err := e.ResourceRev(ctx, "s", "d", id, who.Cred); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.WriteConfig(ctx, p29Req("s"), ConfigChange{IfMatch: cfg, Patches: []any{map[string]any{"op": "replace", "path": "/encryption", "value": map[string]any{"level": "e2e", "epoch": 2.0}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p36Branch(e, "s", "z", ""); err != nil {
+		t.Fatal(err)
+	}
+	now.Advance(10 * time.Minute) // past what a prune protects
+	key := seal.NewKey()          // the server checks the header only
+	snap := func(kid, ns string) string {
+		t.Helper()
+		kns, _, _ := seal.ParseKid(kid)
+		kr, err := seal.ResourceKey(key, kns, "d")
+		if err != nil {
+			t.Fatal(err)
+		}
+		jwe, err := seal.SealSnapshot(kr, kid, ns, "d", w2, jsonv.FromGo(map[string]any{"n": 2.0}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return jwe
+	}
+
+	// The branch's snapshot of the base's pre-raise content names the base.
+	for _, kid := range []string{"z#2", "s#2"} {
+		if st, body := p29Status(t, second(e.Prune(ctx, p29Req("z"), "d", PruneRequest{Horizon: w2, Snapshot: snap(kid, "z")}))); st != 422 || body["code"] != "invalid" {
+			t.Fatalf("branch snapshot of the base's pre-raise content under %s: %d %v, want 422 invalid", kid, st, body)
+		}
+	}
+	if _, err := e.Prune(ctx, p29Req("z"), "d", PruneRequest{Horizon: w2, Snapshot: snap("s#1", "z")}); err != nil {
+		t.Fatalf("branch snapshot under the base's epoch it is served under: %v", err)
+	}
+
+	// The base's prune at w2 keeps w2's document and stored sealing.
+	if _, err := e.Prune(ctx, p29Req("s"), "d", PruneRequest{Horizon: w2, Snapshot: snap("s#1", "s")}); err != nil {
+		t.Fatalf("prune at a pre-raise horizon: %v", err)
+	}
+	var doc []byte
+	sealedOf := map[string]int{}
+	if err := e.read(ctx, func(t *tx) error {
+		n := t.nsByName("s")
+		var err error
+		row := t.findInAncestry(t.resolve(n, "d", nil).head, mustID(w2))
+		if doc, err = t.docBytesAt(row); err != nil {
+			return err
+		}
+		for _, id := range []string{w1, w2} {
+			r := t.findInAncestry(t.resolve(n, "d", nil).head, mustID(id))
+			var c int
+			t.must(t.QueryRow(`SELECT COUNT(*) FROM sealed WHERE ns = ? AND rev_seq = ? AND kind = 'doc'`, n.id, r.seq).Scan(&c))
+			sealedOf[id] = c
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("the horizon's document after the prune: %v", err)
+	}
+	if v, _ := jsonv.MustParse(doc).(map[string]any); v["n"] != 2.0 {
+		t.Fatalf("the horizon's document %s", doc)
+	}
+	if sealedOf[w2] != 1 || sealedOf[w1] != 0 {
+		t.Fatalf("stored sealings after the prune: %v, want the horizon's kept and the pruned one's gone", sealedOf)
+	}
+}
