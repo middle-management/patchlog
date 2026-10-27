@@ -30,6 +30,11 @@ type Store struct {
 	Client API
 	Table  string
 	Now    func() time.Time // nil: time.Now
+	// GroupCommit is at most how many checked writes of a namespace one
+	// transaction appends (group.go); ≤ 1 commits each write on its own.
+	GroupCommit int
+
+	g groups
 }
 
 // maxWriteAttempts bounds the tip-conflict retry loop (the SQL backends'
@@ -161,18 +166,12 @@ func (s *Store) WriteResource(ctx context.Context, ns, name, ifMatch string, pat
 			}
 		}
 
-		_, err = s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-			TransactItems: buildWriteTx(s.Table, ns, name, p),
-		})
-		if err == nil {
-			return &WriteResult{Status: 201, ID: p.rev.id, NSID: p.entry.id, Created: p.entry.created}, nil
-		}
-		res, retry, cerr := s.mapCancel(ctx, ns, name, p, err)
-		if res != nil || cerr != nil {
-			return res, cerr
+		res, retry, err := s.commitWrite(ctx, ns, name, p)
+		if res != nil || err != nil {
+			return res, err
 		}
 		if !retry {
-			return nil, err
+			return nil, apiErr(409, "conflict")
 		}
 		if attempt+1 >= maxWriteAttempts {
 			return nil, apiErr(409, "conflict", "detail", "log tip contention")
@@ -187,6 +186,44 @@ func (s *Store) WriteResource(ctx context.Context, ns, name, ifMatch string, pat
 		case <-time.After(time.Duration(1<<attempt) * 5 * time.Millisecond):
 		}
 	}
+}
+
+// commitWrite commits a checked write: in its namespace's group (group.go)
+// when grouping, else as its own transaction. retry asks the caller's loop
+// to read, plan and check it again.
+func (s *Store) commitWrite(ctx context.Context, ns, name string, p *writePlan) (*WriteResult, bool, error) {
+	if s.grouping() {
+		return s.commitGrouped(ctx, ns, name, p)
+	}
+	_, err := s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: buildWriteTx(s.Table, ns, name, p),
+	})
+	if err == nil {
+		return &WriteResult{Status: 201, ID: p.rev.id, NSID: p.entry.id, Created: p.entry.created}, false, nil
+	}
+	res, retry, cerr := s.mapCancel(ctx, ns, name, p, err)
+	if res == nil && cerr == nil && !retry {
+		cerr = err
+	}
+	return res, retry, cerr
+}
+
+// commitDelete is commitWrite for a tombstone.
+func (s *Store) commitDelete(ctx context.Context, ns, name string, p *writePlan) (*WriteResult, bool, error) {
+	if s.grouping() {
+		return s.commitGrouped(ctx, ns, name, p)
+	}
+	_, err := s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: buildDeleteTx(s.Table, ns, name, p),
+	})
+	if err == nil {
+		return &WriteResult{Status: 201, ID: p.rev.id, NSID: p.entry.id, Created: p.entry.created}, false, nil
+	}
+	res, retry, cerr := s.mapDeleteCancel(ctx, ns, name, p, err)
+	if res == nil && cerr == nil && !retry {
+		cerr = err
+	}
+	return res, retry, cerr
 }
 
 // entryCreated is a committed entry's stored time, for replayed answers
@@ -235,23 +272,27 @@ func (s *Store) mapCancel(ctx context.Context, ns, name string, p *writePlan, er
 		}
 		return nil, false, apiErr(409, "conflict")
 	case failed(actRes), failed(actRev):
-		// The resource's head moved since the check (D.3's conflict,
-		// isConflict): answer 412 with the current head — unless it moved
-		// to this very write (a duplicate committed first): a replay.
-		cur, gerr := s.getRes(ctx, ns, name)
-		if gerr == nil && cur != nil {
-			if cur.headID == p.rev.id {
-				created, _ := s.entryCreated(ctx, ns, cur.entryID)
-				return &WriteResult{Status: 200, ID: p.rev.id, NSID: cur.entryID, Created: created, Replayed: true}, false, nil
-			}
-			return nil, false, apiErr(412, "stale", "head", cur.headID)
-		}
-		return nil, false, apiErr(412, "stale", "head", "")
+		return s.writeConflict(ctx, ns, name, p)
 	case failed(actTip):
 		return nil, true, nil
 	default:
 		return nil, false, err
 	}
+}
+
+// writeConflict answers a write whose resource's head moved since the
+// check (D.3's conflict, isConflict): 412 with the current head — unless
+// it moved to this very write (a duplicate committed first): a replay.
+func (s *Store) writeConflict(ctx context.Context, ns, name string, p *writePlan) (*WriteResult, bool, error) {
+	cur, gerr := s.getRes(ctx, ns, name)
+	if gerr == nil && cur != nil {
+		if cur.headID == p.rev.id {
+			created, _ := s.entryCreated(ctx, ns, cur.entryID)
+			return &WriteResult{Status: 200, ID: p.rev.id, NSID: cur.entryID, Created: created, Replayed: true}, false, nil
+		}
+		return nil, false, apiErr(412, "stale", "head", cur.headID)
+	}
+	return nil, false, apiErr(412, "stale", "head", "")
 }
 
 // DeleteResource tombstones a resource (§7.2's DELETE, §8.1): the
@@ -285,18 +326,12 @@ func (s *Store) DeleteResource(ctx context.Context, ns, name, ifMatch string, ge
 			}
 		}
 
-		_, err = s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-			TransactItems: buildDeleteTx(s.Table, ns, name, p),
-		})
-		if err == nil {
-			return &WriteResult{Status: 201, ID: p.rev.id, NSID: p.entry.id, Created: p.entry.created}, nil
-		}
-		res, retry, cerr := s.mapDeleteCancel(ctx, ns, name, p, err)
-		if res != nil || cerr != nil {
-			return res, cerr
+		res, retry, err := s.commitDelete(ctx, ns, name, p)
+		if res != nil || err != nil {
+			return res, err
 		}
 		if !retry {
-			return nil, err
+			return nil, apiErr(409, "conflict")
 		}
 		if attempt+1 >= maxWriteAttempts {
 			return nil, apiErr(409, "conflict", "detail", "log tip contention")
@@ -329,24 +364,30 @@ func (s *Store) mapDeleteCancel(ctx context.Context, ns, name string, p *writePl
 	case failed(delActNSID):
 		return nil, false, apiErr(409, "conflict") // the marker without us: ambiguous
 	case failed(delActRes), failed(delActRev):
-		cur, gerr := s.getRes(ctx, ns, name)
-		if gerr == nil && cur != nil {
-			if cur.state == "tombstoned" {
-				if cur.headID == p.rev.id {
-					// The winner was this very delete: a replay.
-					created, _ := s.entryCreated(ctx, ns, cur.entryID)
-					return &WriteResult{Status: 200, ID: p.rev.id, NSID: cur.entryID, Created: created, Replayed: true}, false, nil
-				}
-				return nil, false, gone()
-			}
-			return nil, false, apiErr(412, "stale", "head", cur.headID)
-		}
-		return nil, false, gone()
+		return s.deleteConflict(ctx, ns, name, p)
 	case failed(delActTip):
 		return nil, true, nil
 	default:
 		return nil, false, err
 	}
+}
+
+// deleteConflict answers a delete whose resource's head moved since the
+// check: 412 with the new head, 410 if the winner deleted it — or a
+// replay, if the winner was this very delete.
+func (s *Store) deleteConflict(ctx context.Context, ns, name string, p *writePlan) (*WriteResult, bool, error) {
+	cur, gerr := s.getRes(ctx, ns, name)
+	if gerr == nil && cur != nil {
+		if cur.state == "tombstoned" {
+			if cur.headID == p.rev.id {
+				created, _ := s.entryCreated(ctx, ns, cur.entryID)
+				return &WriteResult{Status: 200, ID: p.rev.id, NSID: cur.entryID, Created: created, Replayed: true}, false, nil
+			}
+			return nil, false, gone()
+		}
+		return nil, false, apiErr(412, "stale", "head", cur.headID)
+	}
+	return nil, false, gone()
 }
 
 // readWriteState is the check phase's batch read: #META, #TIP, RES# and

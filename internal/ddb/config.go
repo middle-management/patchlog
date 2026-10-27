@@ -46,7 +46,12 @@ type ConfigResult struct {
 // resulting state (after apply, so it sees the new document) and vetoes
 // with a non-nil error. Both run per attempt.
 func (s *Store) WriteConfig(ctx context.Context, ns, author string, patches any, apply func(doc any, exists bool, patches any) (any, error), check func(*ConfigState) error) (*ConfigResult, error) {
+	// Each attempt holds the namespace's commit lock, as a batch's does.
+	var held func()
+	defer func() { release(held) }()
 	for attempt := 0; ; attempt++ {
+		release(held)
+		held = s.serialize(ns)
 		m, cfgDoc, err := s.readConfigState(ctx, ns)
 		if err != nil {
 			return nil, err

@@ -226,9 +226,16 @@ func TestLocalStaleAndReplay(t *testing.T) {
 // namespace serialize on the #TIP condition and retry, so entries commit
 // in chain order with no gaps.
 func TestLocalConcurrentNamespace(t *testing.T) {
+	t.Run("alone", func(t *testing.T) { testConcurrentNamespace(t, 1, 8) })
+	t.Run("grouped", func(t *testing.T) { testConcurrentNamespace(t, 32, 48) })
+}
+
+// testConcurrentNamespace races writers of distinct resources of one
+// namespace, each write committed alone (group 1) or grouped (group.go).
+func testConcurrentNamespace(t *testing.T, group, writers int) {
 	s := newLocalStore(t)
+	s.GroupCommit = group
 	mustCreateNS(t, s, "demo")
-	const writers = 8
 	var wg sync.WaitGroup
 	errs := make([]error, writers)
 	ids := make([]string, writers)
@@ -271,12 +278,25 @@ func TestLocalConcurrentNamespace(t *testing.T) {
 		}
 		seen[prev] = true
 	}
+	if group > 1 {
+		groups, appended := s.GroupStats()
+		if appended != int64(writers) || groups >= appended {
+			t.Fatalf("%d groups appended %d writes; want %d writes in fewer groups", groups, appended, writers)
+		}
+		t.Logf("%d writes in %d groups", appended, groups)
+	}
 }
 
 // Two writers of one resource race; exactly one wins each round and the
 // other's 412 names the winner's head (D.3's conflict).
 func TestLocalConcurrentResource(t *testing.T) {
+	t.Run("alone", func(t *testing.T) { testConcurrentResource(t, 1) })
+	t.Run("grouped", func(t *testing.T) { testConcurrentResource(t, 32) })
+}
+
+func testConcurrentResource(t *testing.T, group int) {
 	s := newLocalStore(t)
+	s.GroupCommit = group
 	mustCreateNS(t, s, "demo")
 	w1 := mustWrite(t, s, "demo", "doc1", "", `[{"op":"add","path":"","value":{"a":1}}]`)
 	const racers = 6

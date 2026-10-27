@@ -95,7 +95,14 @@ func (s *Store) WriteBatch(ctx context.Context, ns, author string, items []Batch
 	if acts := BatchActions(items, ccPatches != nil); acts > maxTxActions {
 		return nil, apiErr(413, "limit", "key", "itemsPerBatch", "measured", acts, "max", maxTxActions)
 	}
+	// Each attempt holds the namespace's commit lock from its reads
+	// through its commit, so the group worker doesn't move the tip under
+	// it (group.go).
+	var held func()
+	defer func() { release(held) }()
 	for attempt := 0; ; attempt++ {
+		release(held)
+		held = s.serialize(ns)
 		m, t, heads, docs, cfgDoc, err := s.readBatchState(ctx, ns, items, ccPatches != nil)
 		if err != nil {
 			return nil, err
@@ -254,6 +261,8 @@ func (s *Store) WriteBatch(ctx context.Context, ns, author string, items []Batch
 		if attempt+1 >= maxWriteAttempts {
 			return nil, apiErr(409, "conflict", "detail", "log tip contention")
 		}
+		release(held)
+		held = nil
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()

@@ -21,7 +21,11 @@ loop, after planning (D.3's recheck shape); `ReadHead`, `ReadLog`
 `ResourceLogEntries`, `ListHeads`, `ReadConfig`, `ReadDocAtEntry` (the
 `ns_log ⨯ ns_config` join), `ReadNSInfo`, `KnownEntry`, `Ping`. `Open`
 parses the `-db` URL (`dynamodb://<table>?region=…&endpoint=…`); errors
-carry the core's `{"code": …}` body shape.
+carry the core's `{"code": …}` body shape. With `GroupCommit` > 1,
+checked resource writes and deletes of one namespace commit in groups
+(`group.go`, docs/DYNAMODB.md §4): one transaction re-chains several
+writes' entries over the tip, pinned on the configuration they were
+checked under.
 
 ## What it proves
 
@@ -65,7 +69,8 @@ in docs/DYNAMODB.md §11; the headline: a write is two round trips (one
 batch read + one transaction), p50 ~4 ms locally, and concurrent writers
 of one namespace need the group commit of §4 — optimistic retry on the
 hot `#TIP` item degenerates (167/s at 8 writers down to 82/s at 32),
-which is why Postgres uses a log lock instead.
+which is why Postgres uses a log lock instead. `group.go` is that group
+commit: the `-grouped` benchmarks keep rising with writers instead.
 
 ## Simplifications (all deliberate)
 
@@ -86,8 +91,12 @@ which is why Postgres uses a log lock instead.
   as plain attributes, and LOG items denormalize `cfgPos` like
   `ns_log.config_seq`.
 - Read-modify loops (the tip retry) are bounded by `maxWriteAttempts = 8`,
-  like the SQL backends'. Group commit (docs/DYNAMODB.md §4, §11) is
-  phase 2.
+  like the SQL backends'.
+- Group commit queues resource writes and deletes only. Batches and
+  config writes keep the optimistic tip condition, holding the
+  namespace's commit lock on this instance from their reads to their
+  commit so the group worker can't starve them; across instances (phase
+  3) they and the workers race on `#TIP` and retry.
 
 ## What the spike learned (fed back into docs/DYNAMODB.md)
 

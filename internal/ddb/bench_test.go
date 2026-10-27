@@ -113,6 +113,20 @@ func BenchmarkDDB(b *testing.B) {
 		})
 	})
 
+	for _, w := range []int{8, 32} {
+		b.Run(fmt.Sprintf("write-%dw-1ns-grouped", w), func(b *testing.B) {
+			s := benchStores(b, 1)[0]
+			s.GroupCommit = 32
+			bench(b, w, 3*time.Second, func(i int) error {
+				_, err := s.WriteResource(ctx, "ns0", fmt.Sprintf("doc%d", i), "", benchCreate(i), "", "", "bench", nil)
+				return err
+			})
+			if g, n := s.GroupStats(); g > 0 {
+				b.ReportMetric(float64(n)/float64(g), "writes/group")
+			}
+		})
+	}
+
 	b.Run("write-32w-64ns", func(b *testing.B) {
 		s := benchStores(b, 64)[0]
 		bench(b, 32, 3*time.Second, func(i int) error {
