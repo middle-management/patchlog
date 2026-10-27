@@ -205,7 +205,6 @@ func TestV073P36PreRaiseKeys(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	e := p36NewEnv(t)
-	p29RaiseFromSealed(t, e.Engine)
 	e.create(t, "s", map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}})
 	e.advance(time.Hour)
 	e.config(t, "s", p29Add("/encryption/epoch", 2.0)) // epoch 2 from t0+1h
@@ -315,7 +314,6 @@ func TestV073P36PreRaiseHorizon(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { e.Close() })
-	p29RaiseFromSealed(t, e)
 	cfg := mkNS(t, e, "s", map[string]any{"encryption": map[string]any{"level": "sealed"}})
 	ids := []string{""}
 	for i := 1; i <= 3; i++ {
