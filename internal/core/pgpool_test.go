@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
 // The pool parameters of a Postgres URL are read and removed, the rest of
@@ -33,5 +35,26 @@ func TestParsePGPool(t *testing.T) {
 		if err != nil || out != c.out || pool != c.pool {
 			t.Errorf("%s: %q %+v %v, want %q %+v", c.in, out, pool, err, c.out, c.pool)
 		}
+	}
+}
+
+// An engine's two pools on Postgres take the URL's cap: pgtest's 8, a
+// quarter of it for the buckets.
+func TestPGPoolCap(t *testing.T) {
+	url := pgtest.NewDB(t)
+	e, err := Open(Options{Path: url, BlobDir: t.TempDir(), AuthDisabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if got, want := e.db.Stats().MaxOpenConnections, min(8, mainConns()); got != want {
+		t.Errorf("main pool: %d connections, want pgtest's cap, %d", got, want)
+	}
+	if got, want := e.rate.store.db.Stats().MaxOpenConnections, min(2, bucketConns()); got != want {
+		t.Errorf("bucket pool: %d connections, want %d", got, want)
+	}
+	bad := strings.Replace(url, "pool_max_conns=8", "pool_max_conns=1", 1)
+	if _, err := Open(Options{Path: bad, BlobDir: t.TempDir(), AuthDisabled: true}); err == nil || !strings.Contains(err.Error(), "pool_max_conns") {
+		t.Errorf("pool_max_conns=1: %v, want refused", err)
 	}
 }

@@ -707,7 +707,7 @@ func TestV073LegacySealedGrantConverted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dsn := path
+	dsn := pgtest.DSN(path)
 	if driver == "sqlite" {
 		dsn = sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)")
 	}

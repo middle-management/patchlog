@@ -494,7 +494,7 @@ func v073SQL(t *testing.T, path string) (db *sql.DB, q func(string) string) {
 	driver, dsn := "sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)")
 	q = func(s string) string { return s }
 	if strings.HasPrefix(path, "postgres") {
-		driver, dsn = "pgx", path
+		driver, dsn = "pgx", pgtest.DSN(path)
 		q = func(s string) string {
 			var b strings.Builder
 			n := 0

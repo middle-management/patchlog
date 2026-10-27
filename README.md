@@ -833,8 +833,9 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   `-db tree.db`) store derived state they rebuild from the core's API; only the core runs on
   Postgres.
 - **Tests.** `PATCHLOG_TEST_PG=postgres://postgres@localhost:5432/postgres make test-pg` runs
-  the storage-dependent tests with a fresh database per test (`internal/pgtest`); CI does the
-  same against a `postgres:16` service container.
+  the storage-dependent tests with a fresh database per test (`internal/pgtest`), whose URL
+  bounds the engines' pools (`pool_max_conns=8&pool_max_conn_idle_time=1s`) so a run fits a
+  stock server's 100 connections; CI does the same against a `postgres:16` service container.
 
 ### Blob storage
 
