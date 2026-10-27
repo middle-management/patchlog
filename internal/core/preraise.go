@@ -351,3 +351,151 @@ func (t *tx) preRaiseKeysOpen(n *nsRow, p *preRaise, name string, epochs map[int
 	}
 	return false
 }
+
+// --- blobs ----------------------------------------------------------------
+
+// preRaiseBlob reports whether e2e namespace n serves blob bid, in the
+// history of resource name ending at head, as a blob from before a raise
+// from sealed (§E.2.2, §7.1, Addendum E Levels): one a revision of that
+// history from before the raise references, served or not. It keeps its
+// epoch URLs, under those revisions' epochs only, and is never served in
+// the clear; it returns the raise, nil for any other blob.
+func (t *tx) preRaiseBlob(n *nsRow, head *revRow, bid ids.ID) *preRaise {
+	if head == nil || !t.isE2E(n) {
+		return nil
+	}
+	for _, seg := range t.ancestry(head) {
+		m := t.resOwner(n, seg.res)
+		if m == nil || m.isShadow() {
+			return nil
+		}
+		raise := t.e2eRaiseOf(m)
+		if raise == nil {
+			continue // written end to end (preRaiseBoundary)
+		}
+		if raise.level != levelSealed {
+			return nil
+		}
+		h := min(t.preRaiseHead(raise, seg.res), seg.max)
+		var ok bool
+		t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM blob_refs WHERE res = ? AND bid = ? AND from_seq <= ?)`, seg.res, bid[:], h).Scan(&ok))
+		if !ok {
+			return nil
+		}
+		return &preRaise{m: m, raise: raise}
+	}
+	return nil
+}
+
+// preRaiseSegment returns the segment of head's history holding p's
+// content from before the raise, capped at its last revision from before
+// it, and false if there is none.
+func (t *tx) preRaiseSegment(p *preRaise, head *revRow) (segment, bool) {
+	for _, seg := range t.ancestry(head) {
+		var ns int64
+		t.must(t.QueryRow(`SELECT ns FROM resources WHERE res = ?`, seg.res).Scan(&ns))
+		if ns != p.m.id {
+			continue
+		}
+		h := min(t.preRaiseHead(p.raise, seg.res), seg.max)
+		return segment{res: seg.res, max: h}, h > 0
+	}
+	return segment{}, false
+}
+
+// preRaiseBlobEpochs is blobEpochs for a blob from before p's raise from
+// sealed: the epochs under which the still served revisions from before
+// the raise that reference it are served (preRaiseEpoch), those written
+// sealed by their rev_epochs, the others by their stored sealing (§E.2.2).
+func (t *tx) preRaiseBlobEpochs(p *preRaise, head *revRow, bid ids.ID) map[int]bool {
+	out := map[int]bool{}
+	seg, ok := t.preRaiseSegment(p, head)
+	if !ok {
+		return out
+	}
+	where := ` WHERE b.res = ? AND b.bid = ? AND r.seq <= ? AND r.kind = 0 AND ` + servedRev
+	rows, err := t.Query(`SELECT DISTINCT e.epoch`+refRevs+` JOIN rev_epochs e ON e.seq = r.seq`+where, seg.res, bid[:], seg.max)
+	t.must(err)
+	for rows.Next() {
+		var e int
+		t.must(rows.Scan(&e))
+		out[e] = true
+	}
+	rows.Close()
+	rows, err = t.Query(`SELECT substr(s.jwe, 1, 4096)`+refRevs+` JOIN sealed s ON s.ns = ? AND s.rev_seq = r.seq AND s.kind IN ('doc', 'entry')`+where+
+		` AND NOT EXISTS (SELECT 1 FROM rev_epochs e WHERE e.seq = r.seq)`, p.m.id, seg.res, bid[:], seg.max)
+	t.must(err)
+	for rows.Next() {
+		var prefix string
+		t.must(rows.Scan(&prefix))
+		if e, ok := jweEpoch(prefix); ok {
+			out[e] = true
+		}
+	}
+	rows.Close()
+	return out
+}
+
+// preRaiseBlobRev returns the newest still served revision from before p's
+// raise in head's history whose document references bid, or nil.
+func (t *tx) preRaiseBlobRev(p *preRaise, head *revRow, bid ids.ID) *revRow {
+	seg, ok := t.preRaiseSegment(p, head)
+	if !ok {
+		return nil
+	}
+	where := ` WHERE b.res = ? AND b.bid = ? AND r.seq <= ? AND r.kind = 0 AND ` + servedRev
+	var seq int64
+	err := t.QueryRow(`SELECT r.seq`+refRevs+where+` ORDER BY r.seq DESC LIMIT 1`, seg.res, bid[:], seg.max).Scan(&seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	t.must(err)
+	return t.rev(seq)
+}
+
+// preRaiseBlobHead is sealedBlobHead for a blob from before p's raise from
+// sealed, served by e2e namespace n: 302 to the latest epoch it is served
+// under; where none of its referencing revisions has one yet, the sealing
+// of the newest of them under the epoch it is served under, which fixes
+// it once stored (under p.m); without any, 404 (no-store). Never the
+// plaintext.
+func (t *tx) preRaiseBlobHead(p *preRaise, name string, head *revRow, bid ids.ID, out *Blob) *sealJob {
+	if e := latestEpoch(t.preRaiseBlobEpochs(p, head, bid)); e > 0 {
+		out.Status, out.Epoch = 302, e
+		return nil
+	}
+	if r := t.preRaiseBlobRev(p, head, bid); r != nil {
+		if b, err := t.docBytesAt(r); err == nil {
+			return t.preRaiseResJob(p, name, r, sealDoc, func() []byte { return b })
+		}
+	}
+	out.Status, out.NoStore = 404, true
+	return nil
+}
+
+// preRaiseBlobKeyEpochs is blobKeyEpochs for a blob from before p's raise
+// from sealed: the epochs a request for it would be served under, those
+// fixed, or, where none is, the one a request would fix by sealing its
+// newest referencing revision (preRaiseBlobHead).
+func (t *tx) preRaiseBlobKeyEpochs(p *preRaise, head *revRow, bid ids.ID) map[int]bool {
+	eps := t.preRaiseBlobEpochs(p, head, bid)
+	if len(eps) == 0 {
+		if r := t.preRaiseBlobRev(p, head, bid); r != nil {
+			eps[t.preRaiseEpoch(p.m, r, p.raise)] = true
+		}
+	}
+	return eps
+}
+
+// preRaiseBlobOpens reports whether creds get keys opening blob bid of
+// resource name of e2e namespace n where it is a blob from before a raise
+// from sealed, as a copy or a batch's local source from n needs (§2.1
+// Protection, §7.8): true for any other blob, which n serves as uploaded.
+func (t *tx) preRaiseBlobOpens(n *nsRow, name string, bid ids.ID, creds []Credentials) bool {
+	head := t.resolve(n, name, nil).head
+	p := t.preRaiseBlob(n, head, bid)
+	if p == nil {
+		return true
+	}
+	return t.preRaiseKeysOpen(n, p, name, t.preRaiseBlobKeyEpochs(p, head, bid), creds)
+}

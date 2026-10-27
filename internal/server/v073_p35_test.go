@@ -238,6 +238,69 @@ func TestV073P35RaiseFromNoneServesClear(t *testing.T) {
 	}
 }
 
+// v0.73 Addendum E Levels (ENC-41), §7.1, §E.2.2 Epochs (RH-48): blobs
+// referenced by revisions from before a raise from sealed keep their epoch
+// URLs, under those revisions' epochs only, and …/blob/{bid} redirects to
+// them, a blob none of whose revisions has an epoch yet fixing the newest
+// under the epoch it is served under; they are never served in the clear.
+// Other blobs at E3 are served as uploaded, their epoch URLs 404
+// not_offered, and so after a raise from none.
+func TestV073P35PreRaiseBlobs(t *testing.T) {
+	t.Parallel()
+	e := newSealedEnv(t, withoutBlobSweep)
+	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
+	data := []byte("pre-raise blob " + encMarker)
+	n1 := seal.NewNonce()
+	_, b1 := e.putBlob("s", "d", "text/plain", n1, data)
+	r1 := e.wr("s", "d", "", withNonce(addRoot(map[string]any{"b": ref(b1, "text/plain", len(data), n1)})))
+	expect(t, e.get(blobPath("s", "d", b1)), 302) // fixes epoch 1 at E2
+	data2 := []byte("second blob " + encMarker)
+	n2 := seal.NewNonce()
+	_, b2 := e.putBlob("s", "d", "text/plain", n2, data2)
+	r2 := e.wr("s", "d", r1, withNonce(ops(op("add", "/c", ref(b2, "text/plain", len(data2), n2)))))
+	keys, _ := e.keysOf("s", nil, "")
+	e.p35Raise("s", map[string]any{"level": "e2e", "epoch": 2.0})
+
+	for _, b := range []struct{ bid, data string }{{b1, string(data)}, {b2, string(data2)}} {
+		g := e.get(blobPath("s", "d", b.bid))
+		if g.Code != 302 || g.H.Get("Location") != blobPath("s", "d", b.bid)+"/e/1" || strings.Contains(g.String(), encMarker) {
+			t.Fatalf("blob from before the raise: %d %v %s", g.Code, g.H, g.Body)
+		}
+		s := e.get(blobPath("s", "d", b.bid) + "/e/1")
+		expect(t, s, 200)
+		if s.H.Get("Content-Type") != core.SealedBlobType || etagOf(s) != b.bid+".1" {
+			t.Fatalf("sealed blob %v", s.H)
+		}
+		if got := openSealedBlob(t, s.Body, resKey(t, keys["s#1"], "s", "d"), "s#1", seal.BlobPL("s", "d", b.bid)); string(got) != b.data {
+			t.Fatalf("opened %q", got)
+		}
+		g = e.get(blobPath("s", "d", b.bid) + "/e/2")
+		if g.Code != 404 || g.H.Get("Cache-Control") != "no-store" {
+			t.Fatalf("epoch after the raise: %d %v", g.Code, g.H)
+		}
+	}
+	// A blob written end to end: as uploaded, without epoch URLs.
+	ref3 := e.uploadE2E("s", "d", []byte("e2e blob"), "alice")
+	b3 := ref3["$blob"].(string)
+	expectOK(t, e.writeAs("s", "d", r2, p35Sealed(t, seal.NewKey(), "s#2", "s", "d", r2, ops(op("add", "/e", ref3)), b3), "alice"))
+	g := e.get(blobPath("s", "d", b3))
+	if g.Code != 200 || g.H.Get("Content-Type") != core.SealedBlobType {
+		t.Fatalf("blob written end to end %d %v", g.Code, g.H)
+	}
+	expectCode(t, e.get(blobPath("s", "d", b3)+"/e/1"), 404, "not_offered")
+
+	// After a raise from none, blobs are as at the level before.
+	e.mkNS("p", map[string]any{"read": "public"})
+	_, pb := e.putBlob("p", "d", "text/plain", "", data)
+	e.wr("p", "d", "", addRoot(map[string]any{"b": ref(pb, "text/plain", len(data), "")}))
+	e.p35Raise("p", map[string]any{"level": "e2e", "epoch": 1.0})
+	g = e.get(blobPath("p", "d", pb))
+	if g.Code != 200 || g.String() != string(data) {
+		t.Fatalf("blob from before a raise from none %d %v", g.Code, g.H)
+	}
+	expectCode(t, e.get(blobPath("p", "d", pb)+"/e/1"), 404, "not_offered")
+}
+
 // v0.73 §C.3.1, Addendum E Levels (ENC-40, GR-33): in a namespace raised
 // from sealed, a grant first recorded before the raise stays sealed as at
 // E2 (pl {ns, grant}, the epoch of the entry recording it); one recorded
@@ -322,4 +385,16 @@ func TestV073P35PreRaiseKeyWindows(t *testing.T) {
 	// One written at e2e doesn't resolve.
 	s2 := etagOf(expectOK(t, e.do(req{method: "PATCH", path: "/r/sch/m", ifMatch: s1, raw: p35Sealed(t, seal.NewKey(), "sch#3", "sch", "m", s1, ops(op("add", "/title", "t"))), hasRaw: true, bearer: early})))
 	expectCode(t, e.write("PATCH", "docs", "z", "", addRoot(map[string]any{"$schema": "/r/sch/m/rev/" + s2, "score": "1-0"}), early), 422, "schema_unavailable")
+
+	// BBD-29: a copy of a blob from before the raise.
+	from := blobPath("sch", "d", bid)
+	expectCode(t, e.copyBlob("e3", "x", bid, from, "", late), 404, "not_found")
+	expect(t, e.copyBlob("e3", "x", bid, from, "", early), 201)
+
+	// BBD-30: a batch's local source makes it available only so.
+	at := e.nsHead("sch", early)
+	body := map[string]any{"source": map[string]any{"ns": "sch", "at": at},
+		"items": []any{map[string]any{"resource": "d", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{"p": ref(pid, "text/plain", len(plain), "")})}}}}
+	expectCode(t, e.batchReq("docs", body, late), 422, "batch")
+	expect(t, e.batchReq("docs", body, early), 201)
 }
