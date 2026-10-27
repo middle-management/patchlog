@@ -258,11 +258,13 @@ func (ix *Index) Origin() string { return ix.origin }
 //go:embed migrations
 var migrations embed.FS
 
-// resetStmts empty what a rebuild replays (cdn_repurge stays). text, made
-// by initSchema rather than a migration, is dropped, so a rebuild decides
+// resetStmts empty what a rebuild replays (cdn_repurge stays), in one
+// transaction. checkpoints_bootstrap too: a snapshot left part-way would
+// otherwise be resumed, not replayed from its first page. text, made by
+// initSchema rather than a migration, is dropped, so a rebuild decides
 // between FTS5 and the LIKE fallback again.
 var resetStmts = []string{
-	`DELETE FROM checkpoints`, `DELETE FROM seen`, `DELETE FROM ns_state`,
+	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM ns_state`,
 	`DELETE FROM docs`, `DROP TABLE IF EXISTS "text"`, `DELETE FROM facet`, `DELETE FROM "sort"`, `DELETE FROM refs`,
 	derived.CacheResetStmts[0], derived.CacheResetStmts[1],
 }
@@ -273,6 +275,21 @@ const ftsCreate = `CREATE VIRTUAL TABLE IF NOT EXISTS "text" USING fts5(ns UNIND
 var likeCreate = []string{
 	`CREATE TABLE IF NOT EXISTS "text" (docid INTEGER NOT NULL, ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, body TEXT NOT NULL)`,
 	`CREATE INDEX IF NOT EXISTS text_doc ON "text" (docid)`,
+}
+
+// reset runs resetStmts.
+func (ix *Index) reset(ctx context.Context) error {
+	tx, err := ix.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range resetStmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (ix *Index) initSchema(ctx context.Context) error {
@@ -286,10 +303,8 @@ func (ix *Index) initSchema(ctx context.Context) error {
 		return fmt.Errorf("index: schema: %w", err)
 	}
 	if ix.opt.Rebuild {
-		for _, s := range resetStmts {
-			if _, err := ix.db.ExecContext(ctx, s); err != nil {
-				return fmt.Errorf("index: rebuild: %w", err)
-			}
+		if err := ix.reset(ctx); err != nil {
+			return fmt.Errorf("index: rebuild: %w", err)
 		}
 	}
 	// An existing text table decides the mode; otherwise try FTS5.

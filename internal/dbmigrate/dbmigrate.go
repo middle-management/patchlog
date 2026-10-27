@@ -31,7 +31,11 @@ import (
 
 // Migrate applies the migrations in fsys's directory migrations/<dialect>
 // to db, under namespace, the dialect being db's driver's: sqlite
-// (modernc.org/sqlite) or postgres (pgx). The committed migrations run in
+// (modernc.org/sqlite) or postgres (pgx). On Postgres the namespace is
+// scoped by the schema the tables go to (current_schema(), from the
+// search_path): mmmigrate records every schema's migrations in its own
+// schema mmmigrate, so deployments in different schemas of one database
+// would otherwise share one history. The committed migrations run in
 // order, each in its own transaction, recorded in mmmigrate's tables
 // (mmmigrate_applied on SQLite, the mmmigrate schema on Postgres, under an
 // advisory lock so instances starting together don't race). Tests also
@@ -55,6 +59,16 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, namespace string) erro
 	}
 	if err != nil {
 		return fmt.Errorf("migrating %s: no %s migrations: %w", namespace, name, err)
+	}
+	if name == "postgres" {
+		var schema sql.NullString
+		if err := db.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+			return fmt.Errorf("migrating %s: %w", namespace, err)
+		}
+		if !schema.Valid {
+			return fmt.Errorf("migrating %s: no schema in the search_path exists", namespace)
+		}
+		namespace += "@" + schema.String
 	}
 	if err := mmmigrate.RunMigrations(ctx, db, dialect, sub, testing.Testing(), mmmigrate.WithNamespace(namespace)); err != nil {
 		return fmt.Errorf("migrating %s: %w", namespace, err)

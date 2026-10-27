@@ -3,6 +3,7 @@ package dbmigrate
 import (
 	"context"
 	"database/sql"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,21 +11,26 @@ import (
 	"testing/fstest"
 
 	"github.com/middle-management/mmmigrate/source"
+
+	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
-// Every package's committed migrations are unchanged since they were
+// Every package's committed migrations (every directory under a
+// migrations directory but seed) are unchanged since they were
 // committed (their checksums and chain hold), and, in CI, current.sql holds
 // nothing left to commit: a migration tests apply but deployments wouldn't.
 func TestMigrations(t *testing.T) {
-	dirs, err := filepath.Glob("../*/migrations/*/current.sql")
+	dirs, err := filepath.Glob("../*/migrations/*")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(dirs) == 0 {
 		t.Fatal("no migrations found")
 	}
-	for _, f := range dirs {
-		dir := filepath.Dir(f)
+	for _, dir := range dirs {
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() || filepath.Base(dir) == "seed" {
+			continue
+		}
 		if err := source.ValidateChain(dir); err != nil {
 			t.Errorf("%s: %v", dir, err)
 		}
@@ -83,5 +89,47 @@ func TestMigrateDialect(t *testing.T) {
 	pgOnly := fstest.MapFS{"migrations/postgres/001_b.sql": {Data: []byte(`CREATE TABLE b (x bigint);`)}}
 	if err := Migrate(ctx, db, pgOnly, "other"); err == nil || !strings.Contains(err.Error(), "no sqlite migrations") {
 		t.Fatalf("postgres-only migrations on SQLite: %v", err)
+	}
+}
+
+// On Postgres, deployments in different schemas of one database (by
+// search_path) each get their migrations, though mmmigrate keeps every
+// schema's records in its own schema mmmigrate.
+func TestMigratePostgresSchemas(t *testing.T) {
+	if !pgtest.Enabled() {
+		t.Skip("Postgres only (" + pgtest.Env + ")")
+	}
+	ctx := context.Background()
+	base := pgtest.FreshDB(t)
+	admin, err := sql.Open("pgx", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	if _, err := admin.Exec(`CREATE SCHEMA a; CREATE SCHEMA b`); err != nil {
+		t.Fatal(err)
+	}
+	fsys := fstest.MapFS{"migrations/postgres/001_t.sql": {Data: []byte(`CREATE TABLE t (x bigint);`)}}
+	for _, schema := range []string{"a", "b"} {
+		u, err := url.Parse(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := u.Query()
+		q.Set("search_path", schema)
+		u.RawQuery = q.Encode()
+		db, err := sql.Open("pgx", u.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = Migrate(ctx, db, fsys, "test")
+		db.Close()
+		if err != nil {
+			t.Fatalf("%s: %v", schema, err)
+		}
+	}
+	var n int
+	if err := admin.QueryRow(`SELECT count(*) FROM information_schema.tables WHERE table_name = 't' AND table_schema IN ('a', 'b')`).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("tables t in a and b: %d (%v), want 2", n, err)
 	}
 }

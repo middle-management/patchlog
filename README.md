@@ -646,7 +646,10 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
 - **Schema.** Created on first start, and migrated by later versions, under an advisory lock (see
   [Schema migrations](#schema-migrations)), in whatever schema the URL's user defaults to (add
   `search_path=…` to the URL for another); the record of applied migrations is kept in a schema
-  `mmmigrate`, so the user needs `CREATE` on the database the first time. It
+  `mmmigrate`, per schema (namespace `patchlog@<schema>`), so several deployments can share a
+  database in schemas of their own. The user needs `CREATE` on the database on every start:
+  mmmigrate runs `CREATE SCHEMA IF NOT EXISTS mmmigrate` each time, which Postgres checks the
+  privilege for even when the schema exists. It
   mirrors the SQLite layout (`internal/core/migrations`, the types in `internal/core/dialect.go`): bigint identity keys, 20-byte
   `bytea` ids, canonical JSON in `text` (never `jsonb`, which would change the bytes ids are
   computed over), integer millisecond timestamps. Patch sets, head and intermediate snapshots
@@ -3866,7 +3869,7 @@ owns the tables, in its `migrations` directory, one subdirectory per dialect it 
 
 | Directory | Namespace | Database |
 |-----------|-----------|----------|
-| `internal/core/migrations/sqlite`, `…/postgres` | `patchlog` | the core's |
+| `internal/core/migrations/sqlite`, `…/postgres` | `patchlog` (`patchlog@<schema>` on Postgres) | the core's |
 | `internal/tree/migrations/sqlite` | `tree` | the tree service's |
 | `internal/catalog/migrations/sqlite` | `catalog` | the tree service's, as a catalog |
 | `internal/index/migrations/sqlite` | `index` | the search index's (but its `text` table, FTS5 or a plain table depending on the SQLite build) |

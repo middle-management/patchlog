@@ -15,8 +15,8 @@ import (
 )
 
 // migrations holds the schema, one directory per dialect, applied under
-// the namespace "patchlog" (package dbmigrate), which keeps it apart in a
-// Postgres database shared with others.
+// the namespace "patchlog" (package dbmigrate; on Postgres, per schema),
+// which keeps it apart in a database shared with others.
 //
 //go:embed migrations
 var migrations embed.FS

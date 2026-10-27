@@ -49,11 +49,28 @@ import (
 var migrations embed.FS
 
 // resetStmts empty what a rebuild replays (cdn_repurge and edge_subjects
-// stay, and so do a hook's tables, which its Rebuild recomputes).
+// stay, and so do a hook's tables, which its Rebuild recomputes), in one
+// transaction. checkpoints_bootstrap too: a snapshot left part-way would
+// otherwise be resumed, not replayed from its first page.
 var resetStmts = []string{
-	`DELETE FROM checkpoints`, `DELETE FROM seen`, `DELETE FROM meta`,
+	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM meta`,
 	`DELETE FROM nodes`, `DELETE FROM edges`, `DELETE FROM items`,
 	`DELETE FROM self_parents`, derived.CacheResetStmts[0], derived.CacheResetStmts[1],
+}
+
+// reset runs resetStmts.
+func reset(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range resetStmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func canonJSON(v any) string {

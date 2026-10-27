@@ -12,8 +12,9 @@ every start with checks for what each older version lacked. The schemas themselv
   first (the core's, the tree service's and the index's alike). A database v0.22.0 created or
   migrated is adopted as it is.
 - **Migrations are recorded in new tables:** `mmmigrate_applied` and `mmmigrate_current` on
-  SQLite, the schema `mmmigrate` on Postgres, whose database user needs `CREATE` on the database
-  for the first start.
+  SQLite, the schema `mmmigrate` on Postgres (per schema the core's tables are in, so deployments
+  in different schemas of one database stay apart). On Postgres the database user needs `CREATE`
+  on the database on every start, not only the first.
 - **A rebuild of the tree service or the index empties its tables** rather than dropping and
   recreating them; it replays from the beginning as before.
 

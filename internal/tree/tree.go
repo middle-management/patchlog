@@ -330,10 +330,8 @@ func (s *Service) init(ctx context.Context) error {
 		return fmt.Errorf("tree: schema: %w", err)
 	}
 	if s.opt.Rebuild {
-		for _, q := range resetStmts {
-			if _, err := s.db.ExecContext(ctx, q); err != nil {
-				return fmt.Errorf("tree: rebuild: %w", err)
-			}
+		if err := reset(ctx, s.db); err != nil {
+			return fmt.Errorf("tree: rebuild: %w", err)
 		}
 	}
 	if s.opt.Hook != nil {
