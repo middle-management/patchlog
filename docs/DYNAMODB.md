@@ -543,9 +543,35 @@ disabled; reads of non-`public` namespaces are 501), one instance (no
 stream invalidation — §6 is phase 3), no background loops (retention,
 sweeps, rotation, remote follow don't start).
 
-Tests: `internal/core/ddb_test.go` runs the phase-1 surface end to end
-against DynamoDB Local (flow, the gate's 404/409/412/413/422 answers,
-the 501s, the `-dev` requirement), gated on `DDB_ENDPOINT` like
-`internal/ddb`'s; CI runs them against a `dynamodb-local` service
-container. The full suite passes with and without the endpoint — the SQL
+Tests: the API-level suites are backend-agnostic. Every test server —
+the server package's HTTP harness, and `clienttest`'s, which the client,
+bundle, dav, tree, merge and other service suites start — takes its
+database from `internal/testenv`, so
+
+```sh
+PATCHLOG_TEST_BACKEND=dynamodb DDB_ENDPOINT=http://localhost:8000 go test ./...
+```
+
+runs them on DynamoDB Local, a fresh table each, as `PATCHLOG_TEST_PG`
+runs them on Postgres; CI's `dynamodb` job does. What the backend hasn't
+built skips without per-test annotations: `core.Open` refusing an option
+with `core.ErrUnsupported` (authentication, encryption at rest, blobs,
+archives, the SQL write path's hooks), or a `501 {"code":"unsupported"}`
+answer on the test's own goroutine. Tests that run and answer
+differently are its **known divergences**,
+`internal/testenv/known_dynamodb.txt`, each with the failure seen,
+skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
+backend's to-do list. At the time of writing, of the suites' 1,009
+top-level tests: 277 pass on DynamoDB, 579 skip as unsupported (232 for
+authentication, 114 encryption at rest, 67 `$schema`, 67 branches, 32
+blobs, …) and 153 skip as known divergences. The list has 156 entries
+(a few name tests that now skip earlier as unsupported): 40 where the
+backend answers differently (rate limits, `If-Match` on appends, retries
+answered 412, creates without a root replace, namespace limits…) and 116
+that meet an unsupported feature inside a service (mostly the dav
+gateway's principal lookup), where no skip can reach.
+
+`internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
+transactions, races and group commit; the engine seam) stay gated on
+`DDB_ENDPOINT`, and the full suite passes with and without it — the SQL
 backends are untouched when `e.ddb` is nil.

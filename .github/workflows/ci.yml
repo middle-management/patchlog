@@ -42,6 +42,27 @@ jobs:
           go-version-file: go.mod
       - run: go test -race ./internal/core ./internal/server ./internal/merge ./internal/index ./internal/tree
 
+  # The API-level suites again, on DynamoDB (docs/DYNAMODB.md): every test
+  # server (the server package's harness, clienttest) gets a fresh table
+  # (internal/testenv). What the backend hasn't built skips; its known
+  # divergences (internal/testenv/known_dynamodb.txt) skip until fixed.
+  dynamodb:
+    runs-on: ubuntu-latest
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8000:8000
+    env:
+      PATCHLOG_TEST_BACKEND: dynamodb
+      DDB_ENDPOINT: http://localhost:8000
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+
   # Every package's tests again, on Postgres (Addendum D.8): each test that
   # opens a store gets a fresh database (internal/pgtest), including the
   # services' tests through clienttest.
