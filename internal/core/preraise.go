@@ -19,7 +19,11 @@ package core
 // reads through from before the raise is the raised base's, and the
 // branch serves it as the base does (§E.2.2 "Branches of a raised base"),
 // the same stored bytes, kid and pl naming the base. A remote branch's
-// shadows follow their source (remote_branch.go).
+// shadow of a source raised before at records the raise where the
+// source's log has it, holds the source's keys of the epochs before it
+// (insertShadow, MF-37) and the epoch each mirrored entry was served
+// under (rev_epochs), so the branch serves that content as the source
+// does, kid and pl naming the source (kidName), never the shadow.
 //
 // Epochs. A revision from before a raise from sealed is sealed under the
 // epoch it was written in (rev_epochs), else the one its first stored
@@ -83,9 +87,11 @@ func (t *tx) preRaiseOf(n *nsRow, r *revRow) *preRaise {
 		return nil
 	}
 	m := t.resOwner(n, r.res)
-	if m == nil || m.isShadow() {
+	if m == nil {
 		return nil
 	}
+	// A remote branch's shadow of a source raised before at has the raise
+	// too, where the source's log has it (insertShadow, MF-37).
 	raise := t.e2eRaiseOf(m)
 	if raise == nil || r.seq > t.preRaiseHead(raise, r.res) {
 		return nil
@@ -103,11 +109,15 @@ func (t *tx) preRaiseBoundary(n *nsRow, to *revRow) *revRow {
 	}
 	for _, seg := range t.ancestry(to) {
 		m := t.resOwner(n, seg.res)
-		if m == nil || m.isShadow() {
+		if m == nil {
 			return nil
 		}
 		raise := t.e2eRaiseOf(m)
 		if raise == nil {
+			if m.isShadow() {
+				// A shadow of a source with no raise before at.
+				return nil
+			}
 			// A namespace e2e from its creation (a branch of the raised
 			// base): written end to end, the base's segment may not be.
 			continue
@@ -184,9 +194,12 @@ func (t *tx) preRaiseResJob(p *preRaise, name string, row *revRow, kind string, 
 		}
 	}
 	e := t.preRaiseEpoch(m, row, p.raise)
-	kr, err := seal.ResourceKey(t.epochKey(m.id, e), m.name, name)
+	// Named as the base serves it: a remote branch's shadow by its
+	// source's name (kidName), whose keys it holds (MF-37).
+	kns := t.kidName(m)
+	kr, err := seal.ResourceKey(t.epochKey(m.id, e), kns, name)
 	t.must(err)
-	j.kid, j.k, j.pl, j.plain = seal.Kid(m.name, e), kr, seal.ResourcePL(m.name, name, row.id.String(), plKind), plain()
+	j.kid, j.k, j.pl, j.plain = seal.Kid(kns, e), kr, seal.ResourcePL(kns, name, row.id.String(), plKind), plain()
 	j.pad = p.raise.pad
 	return j
 }
@@ -366,11 +379,14 @@ func (t *tx) preRaiseBlob(n *nsRow, head *revRow, bid ids.ID) *preRaise {
 	}
 	for _, seg := range t.ancestry(head) {
 		m := t.resOwner(n, seg.res)
-		if m == nil || m.isShadow() {
+		if m == nil {
 			return nil
 		}
 		raise := t.e2eRaiseOf(m)
 		if raise == nil {
+			if m.isShadow() {
+				return nil
+			}
 			continue // written end to end (preRaiseBoundary)
 		}
 		if raise.level != levelSealed {

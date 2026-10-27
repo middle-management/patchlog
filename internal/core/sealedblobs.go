@@ -330,14 +330,17 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			out.setContent(memContent(data))
 			return nil
 		}
-		k, err := seal.ResourceKey(t.epochKey(sm.id, ep), sm.name, name)
+		// A remote branch's shadow seals under its source's name
+		// (kidName), as the source serves the blob (MF-37).
+		kns := t.kidName(sm)
+		k, err := seal.ResourceKey(t.epochKey(sm.id, ep), kns, name)
 		t.must(err)
 		pad := t.config(n.configSeq).Pad
 		if pre != nil {
 			pad = pre.raise.pad
 		}
-		job = &sealedBlobJob{ns: sm.id, serving: n.id, preRaise: pre != nil, name: name, bid: bid, epoch: ep, key: k, kid: seal.Kid(sm.name, ep),
-			pl: seal.BlobPL(sm.name, name, bid.String()), plain: t.readBytes(ans.row.owner, ans.row.hash), pad: pad}
+		job = &sealedBlobJob{ns: sm.id, serving: n.id, preRaise: pre != nil, name: name, bid: bid, epoch: ep, key: k, kid: seal.Kid(kns, ep),
+			pl: seal.BlobPL(kns, name, bid.String()), plain: t.readBytes(ans.row.owner, ans.row.hash), pad: pad}
 		return nil
 	})
 	if err != nil {
