@@ -165,7 +165,7 @@ GSIs (both on the one table):
 - **GSI2** `G2PK`+`G2SK` — sparse lookups, some time-ordered: pending blobs
   (`PEND#`, SK `created`) and repurge jobs (`REPURGE#`, SK `due`) for the
   sweeps; gesture and undoes lookups (`GEST#<g>`, `UND#<g>`; the §7.4 partial
-  indexes).
+  indexes). Phase 1 builds gestures without it: marker items (§13).
 
 Why this shape for the SQL reader:
 
@@ -582,7 +582,7 @@ What landed, beyond the spike:
   backend lacks is its `lacks` 501, asked by the Engine method before
   anything else; everything the server can reach so answers 501 rather
   than falling through to SQL:
-  remote branches, sealed/e2e, gestures listing,
+  remote branches, sealed/e2e,
   author signatures (which the gate would verify but the commit doesn't
   store), rotation. Refused
   configurations (`encryption`, `nonce: required`, `signatures:
@@ -692,6 +692,20 @@ What landed, beyond the spike:
   with its snapshots, and the attachments pruning ended come back from
   the blob lines. Intermediate snapshots (D.4) aren't rebuilt: they
   aren't built here at all.
+- **Gestures listing** (§7.4). `Gestures` is the gate's code over two
+  reads, `gestureRows` and `writingEntry` (the entry that wrote a
+  revision: on the table, the REV item's `logPos`). Each step written
+  with a gesture or undoing one gets a marker per id,
+  `GEST#<g>#<name>#<pos12>#<created13>` with its item's index in the
+  commit, written before the commit like schema references' markers (a
+  batch's steps would outgrow the 100 actions). A listing reads the
+  gesture's markers, confirms each against the revision at its position
+  (id, created time, gesture — a failed or rechecked commit's marker
+  names another or none), and orders them by the entry that wrote them,
+  then item and step: the commit order SQL's revision seqs give, which
+  only the commit knows. So a page costs the gesture's markers — a
+  user's few saves; GSI2 (§3) is the answer if gestures grow large.
+  Purges remove the markers of what they purge.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the
@@ -738,14 +752,14 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,319 top-level tests (pure unit tests included): 1,074 pass on
-DynamoDB and 245 skip — 209 as unsupported (115 encryption at rest,
-38 remote branches, 22 nonce-required namespaces, 17 gestures listing,
-9 author signatures, 6 the SQL write path's hooks, 2 sealed), 36 on
-their own conditions (Postgres-only tests).
+1,319 top-level tests (pure unit tests included): 1,089 pass on
+DynamoDB and 230 skip — 194 as unsupported (116 encryption at rest,
+39 remote branches, 22 nonce-required namespaces, 9 author
+signatures, 6 the SQL write path's hooks, 2 sealed), 36 on their own
+conditions (Postgres-only tests).
 The known list is empty: no test answers differently from the SQL
 backends. A test that skips partway has asserted everything before
-its skip, so the phase-1 surface is covered beyond the 1,074.
+its skip, so the phase-1 surface is covered beyond the 1,089.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on

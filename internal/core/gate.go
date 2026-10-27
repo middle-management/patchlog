@@ -92,6 +92,8 @@ type resourceReads interface {
 	firstRevSince(res, cutoff int64) (int64, bool)
 	nthNewestRev(res int64, k int) (int64, bool)
 	headAtEntry(res, at int64) (int64, bool)
+	gestureRows(n *nsRow, gesture string, after *gestureRow, limit int) []gestureRow
+	writingEntry(res, seq int64) (int64, bool)
 	ancestry(head *revRow) []segment
 	locate(segs []segment, id ids.ID) (int, *revRow)
 	docBytesAt(r *revRow) ([]byte, error)

@@ -137,6 +137,15 @@ func (s *Store) PurgeContent(ctx context.Context, ns, name string) (hashes [][]b
 	}); err != nil {
 		return nil, err
 	}
+	// Its gestures' markers: the listing leaves purged resources out.
+	if err := s.eachItem(ctx, ns, "GEST#", func(i item) error {
+		if name != "" && i.s("name") != name {
+			return nil
+		}
+		return s.deleteKey(ctx, Key{i.s("PK"), i.s("SK")})
+	}); err != nil {
+		return nil, err
+	}
 	if err := s.eachItem(ctx, ns, prunes, func(i item) error {
 		if name != "" && i.s("name") != name {
 			return nil

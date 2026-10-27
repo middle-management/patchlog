@@ -79,6 +79,10 @@ func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, 
 		if err := b.schemaRefs(ctx, c); err != nil {
 			return nil, err
 		}
+		// Gestures' markers, as schema references' (ddb.GestureMarks).
+		if err := b.store.PutGestureMarks(ctx, c.NS, ddb.GestureMarks(c)); err != nil {
+			return nil, ddbAsErr(err)
+		}
 		c.NoAuth = p.a.noAuth
 		var tags []string
 		if p.cplan != nil {

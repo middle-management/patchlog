@@ -1162,3 +1162,61 @@ func (r *ddbReads) firstEntryCreated() (int64, bool) {
 
 // archiveSealer: nothing is encrypted at rest here.
 func (r *ddbReads) archiveSealer(res int64) func(io.Writer) (io.WriteCloser, error) { return nil }
+
+// --- gestures ---
+
+// gestureRows: the revisions the gesture's markers confirm, in the order
+// they were written (ddb.Store.GestureRevs), after the cursor's.
+func (r *ddbReads) gestureRows(n *nsRow, gesture string, after *gestureRow, limit int) []gestureRow {
+	ns := r.nsName(n.id)
+	gs, err := r.s.GestureRevs(r.ctx, ns, gesture)
+	r.must(err)
+	start := 0
+	if after != nil {
+		k := r.revs[after.seq].key
+		start = len(gs)
+		for i, g := range gs {
+			if g.Name == k.name && g.Rev.Pos == k.pos {
+				start = i + 1
+				break
+			}
+		}
+		if start == len(gs) {
+			// A revision the gesture doesn't list: after those its entry
+			// wrote before it.
+			ri, err := r.s.RevAt(r.ctx, k.ns, k.name, k.pos)
+			r.must(err)
+			start = sort.Search(len(gs), func(i int) bool { return ri != nil && gs[i].Rev.LogPos > ri.LogPos })
+		}
+	}
+	purged := map[string]bool{}
+	var out []gestureRow
+	for _, g := range gs[start:] {
+		if len(out) >= limit {
+			break
+		}
+		p, ok := purged[g.Name]
+		if !ok {
+			p = r.purgedRes(r.resHandle(ns, g.Name))
+			purged[g.Name] = p
+		}
+		if p {
+			continue
+		}
+		row := r.revRowOf(ns, g.Rev)
+		out = append(out, gestureRow{name: g.Name, res: row.res, seq: row.seq, id: row.id, kind: row.kind,
+			gesture: row.gesture, undoes: row.undoes, author: row.author, created: row.created})
+	}
+	return out
+}
+
+// writingEntry: the revision records the entry that committed it.
+func (r *ddbReads) writingEntry(res, seq int64) (int64, bool) {
+	ref := r.revs[seq]
+	ri, err := r.s.RevAt(r.ctx, ref.key.ns, ref.key.name, ref.key.pos)
+	r.must(err)
+	if ri == nil || ri.LogPos == 0 {
+		return 0, false
+	}
+	return r.logHandle(ref.key.ns, ri.LogPos), true
+}
