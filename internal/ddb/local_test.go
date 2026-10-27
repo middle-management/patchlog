@@ -134,25 +134,30 @@ func mustWrite(t testing.TB, s *Store, ns, name, ifMatch, p string) *written {
 // want entries, and returns its ids.
 func checkChain(t testing.TB, s *Store, ns string, want int) map[string]bool {
 	t.Helper()
-	entries, _, err := s.ReadLog(context.Background(), ns, "", "", 0)
+	ctx := context.Background()
+	n, err := s.Namespace(ctx, ns)
 	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []*EntryRow
+	if err := s.EntriesBetween(ctx, ns, 0, n.TipPos, 0, func(e *EntryRow) bool {
+		entries = append(entries, e)
+		return true
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if len(entries) != want {
 		t.Fatalf("%d entries, want %d", len(entries), want)
 	}
 	seen := map[string]bool{}
-	prev := entries[0]["id"].(string)
-	seen[prev] = true
-	for i, e := range entries[1:] {
-		if e["prev"] != prev {
-			t.Fatalf("entry %d prev %v, want %s: a gap in the chain", i+2, e["prev"], prev)
+	for i, e := range entries {
+		if e.Pos != uint64(i+1) || e.PrevPos != uint64(i) {
+			t.Fatalf("entry %d at %d after %d: a gap in the chain", i+1, e.Pos, e.PrevPos)
 		}
-		prev = e["id"].(string)
-		if seen[prev] {
-			t.Fatalf("duplicate entry id %s", prev)
+		if seen[e.ID] {
+			t.Fatalf("duplicate entry id %s", e.ID)
 		}
-		seen[prev] = true
+		seen[e.ID] = true
 	}
 	return seen
 }
@@ -267,6 +272,39 @@ func TestLocalConfigPinned(t *testing.T) {
 		}
 		if _, err := s.Commit(context.Background(), c); !errors.Is(err, ErrStale) {
 			t.Fatalf("group %d: commit under the old configuration: %v, want ErrStale", group, err)
+		}
+	}
+}
+
+// A commit pinning another namespace's configuration (a schema's, which
+// decides whether the writer may read it) is stale once that moves; one
+// pinning the configuration in force commits.
+func TestLocalPinnedElsewhere(t *testing.T) {
+	for _, group := range []int{1, 32} {
+		s := newLocalStore(t)
+		s.GroupCommit = group
+		mustCreateNS(t, s, "demo")
+		mustCreateNS(t, s, "schemas")
+		ctx := context.Background()
+		sn, _ := s.Namespace(ctx, "schemas")
+		pin := NSPin{NS: "schemas", CfgPos: sn.ConfigPos, CfgID: sn.ConfigID}
+		ok := testCommit(t, s, "demo", "a", "", `[{"op":"add","path":"","value":{}}]`)
+		ok.Pins = []NSPin{pin}
+		if _, err := s.Commit(ctx, ok); err != nil {
+			t.Fatalf("group %d: %v", group, err)
+		}
+		next := ids.Of([]byte("next")).String()
+		if _, err := s.Commit(ctx, &Commit{
+			NS: "schemas", Author: "alice", Created: time.Now().UnixMilli(), CfgPos: sn.ConfigPos, CfgID: sn.ConfigID,
+			Config: &CommitConfig{ID: next, Patches: `[]`, Doc: `{"read":"grant"}`},
+			Entry:  map[string]any{"kind": "config", "target": next}, Kind: "config",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		stale := testCommit(t, s, "demo", "b", "", `[{"op":"add","path":"","value":{}}]`)
+		stale.Pins = []NSPin{pin}
+		if _, err := s.Commit(ctx, stale); !errors.Is(err, ErrStale) {
+			t.Fatalf("group %d: commit pinning the old configuration: %v, want ErrStale", group, err)
 		}
 	}
 }

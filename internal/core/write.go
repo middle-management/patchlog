@@ -306,21 +306,16 @@ func batchError(fails []itemErr) *Error {
 // WriteResource performs a single-resource write: create, append, restore
 // (PATCH) or delete.
 func (e *Engine) WriteResource(ctx context.Context, req Request, item Item) (*WriteResult, error) {
-	if e.ddb != nil {
-		return e.ddbWriteItems(ctx, req, []Item{item}, nil, nil, false, false)
-	}
-	res, err := e.writeOptimistic(ctx, req, []Item{item}, nil, false)
-	if err != nil {
-		return nil, err
-	}
-	return res, nil
+	return e.be.writeItems(ctx, req, []Item{item}, nil, nil, false, false)
 }
 
 // Batch performs an atomic batch (§7.5).
 func (e *Engine) Batch(ctx context.Context, req Request, items []Item, cfg *ConfigChange, source any, dryRun bool) (*WriteResult, error) {
-	if e.ddb != nil {
-		return e.ddbWriteItems(ctx, req, items, cfg, source, true, dryRun)
-	}
+	return e.be.writeItems(ctx, req, items, cfg, source, true, dryRun)
+}
+
+// sqlBatch is Batch on SQL.
+func (e *Engine) sqlBatch(ctx context.Context, req Request, items []Item, cfg *ConfigChange, source any, dryRun bool) (*WriteResult, error) {
 	if dryRun {
 		// A dry run writes nothing: steps 1–6 in a read transaction.
 		var res *WriteResult

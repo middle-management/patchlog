@@ -243,17 +243,13 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 	// The candidates, listed before the rows are read: a file older than
 	// the grace whose row isn't visible yet would need a transaction that
 	// old.
-	type group struct {
-		table string // blob_bytes or blob_epochs
-		key   int64  // owner or ns
-	}
-	cands := map[group][]string{}
+	cands := map[fileGroup][]string{}
 	err := e.blobs.List(ctx, func(name string, _ int64, modified time.Time) error {
 		if !modified.Before(cutoff) {
 			return nil
 		}
 		parts := strings.Split(name, "/")
-		var g group
+		var g fileGroup
 		var err error
 		switch {
 		case len(parts) == 3:
@@ -273,47 +269,8 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	var orphans []string
-	if e.ddb != nil {
-		// The BYTES items name the files (ddbPutBytes).
-		_, _, bytes, err := e.ddb.store.ScanBlobs(ctx)
-		if err != nil {
-			return 0, ddbAsErr(err)
-		}
-		named := map[string]bool{}
-		for _, b := range bytes {
-			named[b.File] = true
-		}
-		for _, files := range cands {
-			for _, f := range files {
-				if !named[f] {
-					orphans = append(orphans, f)
-				}
-			}
-		}
-	} else if err := e.read(ctx, func(t *tx) error {
-		for g, files := range cands {
-			col := "owner"
-			if g.table == "blob_epochs" {
-				col = "ns"
-			}
-			named := map[string]bool{}
-			rows, err := t.Query(`SELECT file FROM `+g.table+` WHERE `+col+` = ? AND file IS NOT NULL`, g.key)
-			t.must(err)
-			for rows.Next() {
-				var f string
-				t.must(rows.Scan(&f))
-				named[f] = true
-			}
-			rows.Close()
-			for _, f := range files {
-				if !named[f] {
-					orphans = append(orphans, f)
-				}
-			}
-		}
-		return nil
-	}); err != nil {
+	orphans, err := e.be.orphanFiles(ctx, cands)
+	if err != nil {
 		return 0, err
 	}
 	n := 0
@@ -335,4 +292,40 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// fileGroup is a blob file's place in the store's layout: the table whose
+// rows name it and their owner or namespace (bytesFile, epochFile).
+type fileGroup struct {
+	table string // blob_bytes or blob_epochs
+	key   int64  // owner or ns
+}
+
+// sqlOrphanFiles are the candidates no row names (SweepBlobFiles, on SQL).
+func (e *Engine) sqlOrphanFiles(ctx context.Context, cands map[fileGroup][]string) ([]string, error) {
+	var orphans []string
+	err := e.read(ctx, func(t *tx) error {
+		for g, files := range cands {
+			col := "owner"
+			if g.table == "blob_epochs" {
+				col = "ns"
+			}
+			named := map[string]bool{}
+			rows, err := t.Query(`SELECT file FROM `+g.table+` WHERE `+col+` = ? AND file IS NOT NULL`, g.key)
+			t.must(err)
+			for rows.Next() {
+				var f string
+				t.must(rows.Scan(&f))
+				named[f] = true
+			}
+			rows.Close()
+			for _, f := range files {
+				if !named[f] {
+					orphans = append(orphans, f)
+				}
+			}
+		}
+		return nil
+	})
+	return orphans, err
 }

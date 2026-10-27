@@ -35,7 +35,6 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
-	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -232,9 +231,9 @@ func (logPurger) PurgeTags(tags []string) { log.Printf("cdn purge %v", tags) }
 type Engine struct {
 	db *sql.DB
 	pg bool // Postgres (Addendum D.8), not SQLite
-	// ddb, when set, is the DynamoDB backend (docs/DYNAMODB.md): db is
-	// nil and the phase-1 serving methods delegate (ddb.go).
-	ddb       *ddbBackend
+	// be is the storage (backend.go): sqlBackend over db, or another
+	// backend, db then nil.
+	be        backend
 	opt       Options
 	mu        sync.Mutex // serialises write transactions
 	blobs     BlobStore  // nil: in the database
@@ -379,8 +378,10 @@ func Open(opt Options) (*Engine, error) {
 	if err := checkStoreCompression(&opt); err != nil {
 		return nil, err
 	}
-	if ddb.IsURL(opt.Path) {
-		return openDDB(opt)
+	for _, r := range backends {
+		if r.handles(opt.Path) {
+			return r.open(opt)
+		}
 	}
 	db, pg, err := openDB(opt.Path)
 	if err != nil {
@@ -408,6 +409,7 @@ func Open(opt Options) (*Engine, error) {
 		stop:       make(chan struct{}),
 		started:    opt.Now().UTC(),
 	}
+	e.be = sqlBackend{e}
 	e.rc.maxBytes = opt.ReadCacheBytes
 	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
 	if err := e.checkKeyStore(); err != nil {
@@ -475,9 +477,11 @@ func Open(opt Options) (*Engine, error) {
 func (e *Engine) Close() error {
 	e.closeOnce.Do(func() { close(e.stop) })
 	e.bg.Wait()
-	if e.ddb != nil {
-		return nil
-	}
+	return e.be.close()
+}
+
+// sqlClose closes the database (Close, on SQL).
+func (e *Engine) sqlClose() error {
 	e.resign()
 	e.stmts.close()
 	err := e.db.Close()
@@ -487,10 +491,7 @@ func (e *Engine) Close() error {
 
 // Ping checks that the database is reachable (the /_ready check).
 func (e *Engine) Ping(ctx context.Context) error {
-	if e.ddb != nil {
-		return e.ddb.store.Ping(ctx)
-	}
-	return e.db.PingContext(ctx)
+	return e.be.ping(ctx)
 }
 
 // SpecVersion is the version of the Patch Log specification this
@@ -885,7 +886,7 @@ func (e *Engine) invalidate(inv invalidation, seen bool) {
 	}
 }
 
-func (t *tx) must(err error) {
+func (t *gate) must(err error) {
 	if err != nil {
 		panic(err)
 	}

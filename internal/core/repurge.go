@@ -42,8 +42,8 @@ func (t *tx) queueRepurge() {
 // it sent. Each is sent, then its row deleted, one at a time; in a leader's
 // job (repurgeLoop) it checks before each that the leader lock is held.
 func (e *Engine) Repurge(ctx context.Context) (int, error) {
-	if e.ddb != nil {
-		return 0, ddbUnsupported("repurge jobs")
+	if err := e.be.lacks("repurge jobs"); err != nil {
+		return 0, err
 	}
 	n := 0
 	for {

@@ -498,9 +498,8 @@ What landed, beyond the spike:
   carry (it only hands them back). What the backend doesn't store reads
   as empty where nothing of the kind can exist (branches, draft copies,
   schema uses, horizons), and as **501 "unsupported"** where a request
-  needs a feature it lacks (sealed/e2e keys, `$schema` namespaces,
-  archives, reads at an earlier entry, blob references across a
-  history) — so those refusals
+  needs a feature it lacks (sealed/e2e keys, archives, reads at an
+  earlier entry, blob references across a history) — so those refusals
   are the reads', not hand-written checks. `gate_test.go` guards the
   embedding that makes this work on SQL (a read missing on `*tx` would
   compile and recurse).
@@ -551,26 +550,61 @@ What landed, beyond the spike:
   scan, `SweepBlobFiles` removes orphaned objects of the store (an S3
   listing or a directory walk). Not yet: `blob_refs`'s
   reference intervals, so blobs don't cross branches or batch sources.
-- **`internal/core/ddb.go`, the seam.** `core.Open` branches on
-  `ddb.IsURL(opt.Path)`; the Engine keeps a `*ddbBackend` and the write
-  methods (`WriteResource`, `Batch`, `WriteConfig`) and the reads
-  (`ResourceHead/Raw/Rev/Log`, `NamespaceHead/Rev/Log/Heads`,
-  `NamespaceLiveLog`, `Namespace/ResourceEvents`, `Wait`, `Ping`,
-  `Close`) delegate, or run on the gate (`gateRead`). Everything else
-  the server can reach answers 501 rather than falling through to SQL:
+  Where blob bytes live is configurable for every database backend
+  (`core.BlobStore`, whose `Open` returns an `io.ReadSeekCloser`):
+  `internal/fsblobs` and `internal/s3blobs`, and DynamoDB's inline bytes
+  stay as the third option, as above.
+- **`$schema` validation and `schemaReads`** (§6.1). The gate resolves
+  schema revisions through the table's reads as on SQL (`schemaNS`,
+  `resolve`, the revision's ancestry). What a concurrent change could
+  take away is read access to another namespace's schema, its
+  configuration: the commit pins each schema namespace's `#META`
+  (`Commit.Pins`, one check per namespace a group shares; group commit
+  only groups commits whose pins agree), as SQL's recheck compares its
+  row. REV items record `schemaRef`; `SREF#<ref>#<name>` markers, written
+  before the commit (a batch of typed items would outgrow the 100
+  actions), index the resources pinning each schema, and a referrer read
+  confirms against the last live revision's `schemaRef`, as SQL's
+  `refersIn` does with `revisions.schema_ref`. `#NAMESPACES`, written by
+  each creation, lists the namespaces for `schemaReads.for` prefixes;
+  `copyRows` (a revision's copies, for `$ref` closures) is GSI1. The
+  referrer logic (`schemaReadsRev`, `refersIn`, `closureReaches`,
+  `openRefers`) is gate logic now, over the reads `nsNames`,
+  `pinnedRefs`, `pinningNames`, `schemaRefOf`.
+- **The backend interface** (`internal/core/backend.go`). The Engine
+  holds its storage as a `backend`: the gate's reads (`gateRead`), the
+  commits of writes, config writes and uploads, the blob sweeps and
+  statistics, ping, close, and `lacks(feature)`. `sqlBackend` implements
+  it with the existing transactions; `ddbBackend` (`ddb.go`) with the
+  table, registering itself for `dynamodb://` paths (`registerBackend`),
+  so core proper names neither the store nor its package. `checkReads`
+  is grouped by what it reads (namespaces, configurations, the log,
+  resources, grants, blobs, schemas, branches, sealed). A feature the
+  backend lacks is its `lacks` 501, asked by the Engine method before
+  anything else; everything the server can reach so answers 501 rather
+  than falling through to SQL:
   branches, purges and pruning, sealed/e2e, gestures listing,
   author signatures (which the gate would verify but the commit doesn't
   store), remote branches, retention, sweeps, rotation. Refused
   configurations (`encryption`, `nonce: required`, `signatures:
   required`, `base`, `successor`) are 501 at create and change time, as
   §10 prescribes ("refuse at Open or at namespace-config time").
-- **Reads as items.** Revision-by-id is GSI1; `…/rev/{id}` folds from the
-  genesis (snapshots are a later phase); `…/rev/{nsID}` joins the entry's
-  denormalized `cfgPos` (the `ns_log.config_seq` of the SQL schema);
-  `/heads` serves `created`/`size`/`digest` off the RES item's head
-  metadata, and at an earlier entry from the history rows; log entries
-  serve their grant's reference (or `null`, written with authentication
-  disabled), with gestures merged in unhashed (§7.4).
+- **One read path.** The serving reads (`ResourceHead/Raw/Rev/Log`,
+  `NamespaceHead/Rev/Log/Heads`, the events and the long-poll) are the
+  SQL path's own code on the gate, as the writes' checks are, over a few
+  more reads: `nsLogRows` and `revsBetween` (a log's or a resource's
+  range, visited so a page stops where its bytes say), `entryConfig`,
+  `resState`, `prunedIn`, and the sealed/e2e ones, which DynamoDB
+  answers 501. On the table: revisions fold from the genesis (snapshots
+  are a later phase), `…/rev/{nsID}` joins the entry's denormalized
+  `cfgPos`, a head as of an earlier entry comes from the history rows
+  (`HeadAt`). DynamoDB's log and revision handles keep their positions'
+  order within a namespace or resource, since the reads compare them as
+  SQL's seqs. DynamoDB commits bracket the read cache as SQL commits do
+  (`ddbBackend.commit`), so the shared reads may cache on both. This replaced
+  the seam's hand-written reads, ~400 lines whose answers had drifted
+  (a log page didn't count a batch entry as its items, raw documents
+  went unrecognised).
 - **Errors in the core's body shape** (`{"code": …}`), so the HTTP layer
   serves either backend alike.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
@@ -591,9 +625,9 @@ and Postgres; then DynamoDB's reads and commit replaced the seam's own
 copy of the checks (`ddbGate`, `ddbDraw`, the store's write planning),
 which is where nearly every divergence the API suites found had come
 from. Features now arrive as data: authentication was storing grants and
-answering their reads, blobs storing their items and answering theirs
-(above); `$schema` is answering `schemaNS`, branches `resolve` at an
-earlier entry and `ancestry` across foreign parents.
+answering their reads, blobs and schema references storing their items
+and answering theirs (above); branches will be `resolve` at an earlier
+entry and `ancestry` across foreign parents.
 
 Requirements and limits, by design: one instance (no stream
 invalidation — §6 is phase 3), no background loops (retention, sweeps,
@@ -618,15 +652,15 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,329 top-level tests (pure unit tests included): 872 pass on DynamoDB
-and 457 skip — 420 as unsupported (115 encryption at rest, 104
-branches, 87 `$schema`, 46 purges, …), 36 on their own conditions, and
-1 on the known list, which holds two tests (one a subtest) meeting
+1,331 top-level tests (pure unit tests included): 907 pass on DynamoDB
+and 421 skip — 384 as unsupported (118 branches, 115 encryption at rest,
+79 purges, 20 nonce-required, …), 36 on their own conditions, and 1 on
+the known list, which holds three tests (two by a subtest) meeting
 purges where no skip can reach: inside a service, or on a test's own
 goroutines. No test answers differently from the SQL
 backends: the list's divergences section is empty. A test that skips
 partway has asserted everything before its skip, so the phase-1 surface
-is covered beyond the 872.
+is covered beyond the 907.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on
@@ -642,14 +676,16 @@ becomes its own Go module, which a build links in to serve
 - AWS-specific code lives only in `internal/ddb`, `internal/s3blobs`
   (which, like `internal/fsblobs`, doesn't import core: it satisfies
   `core.BlobStore` with standard library types, and `internal/blobstores`
-  opens either from a URL) and core's
-  adapter files (`ddb.go`, `ddbreads.go`, `ddbwrite.go`); the rest of core
-  depends on the gate and its read interface, never on the store.
+  opens either from a URL) and core's adapter files (`ddb.go`,
+  `ddbreads.go`, `ddbwrite.go`, `ddbblobs.go`); the rest of core depends
+  on the `backend` interface and the gate's `checkReads`, and refers to
+  neither the adapter nor `internal/ddb` nor any blob store (done:
+  `registerBackend` replaced Open's branch, `backend` the Engine's
+  dispatches).
 - The move takes the adapter files into the module, so core exports what
-  they use: `checkReads` (and the row types it returns, or narrower
-  ones), the gate's entry points (`checkItems`, `planConfig`,
-  `planCreate`, the readers), the write plan, and the error shape.
-- `core.Open`'s branch on the URL becomes a registry (a backend
-  registers its scheme), and the Engine's `e.ddb != nil` dispatches (43
-  today) a backend interface, which the SQL path implements as now.
+  they use: `backend`, `registerBackend` and `checkReads` (with the row
+  types it returns, or narrower ones), the gate's entry points
+  (`checkItems`, `planConfig`, `planCreate`, `gateBlob`, the readers),
+  the write plan, the read cache's bracket (`rc.begin`, `invalidate`),
+  and the error shape.
 

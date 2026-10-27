@@ -428,8 +428,8 @@ type ArchiveRecord struct {
 // Archives lists the archives of unpurged resources, optionally only of one
 // namespace or one resource, in chain order per resource.
 func (e *Engine) Archives(ctx context.Context, ns, name string) ([]ArchiveRecord, error) {
-	if e.ddb != nil {
-		return nil, ddbUnsupported("archives")
+	if err := e.be.lacks("archives"); err != nil {
+		return nil, err
 	}
 	var out []ArchiveRecord
 	err := e.read(ctx, func(t *tx) error {
@@ -484,8 +484,8 @@ type RestoreResult struct {
 // entries is called inside the write transaction: once, or again if
 // Postgres rolls the transaction back to run it again (pglock.go).
 func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries func(yield func(ArchiveEntry) error) error) (*RestoreResult, error) {
-	if e.ddb != nil {
-		return nil, ddbUnsupported("restores")
+	if err := e.be.lacks("restores"); err != nil {
+		return nil, err
 	}
 	out := &RestoreResult{}
 	err := e.update(ctx, func(t *tx) error {

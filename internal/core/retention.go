@@ -219,8 +219,8 @@ type RetentionReport struct {
 // (§8.6). It runs as the server itself, not under a grant: the rules were
 // set with a * key. Each resource is pruned in its own transaction.
 func (e *Engine) ApplyRetention(ctx context.Context) (*RetentionReport, error) {
-	if e.ddb != nil {
-		return nil, ddbUnsupported("pruning")
+	if err := e.be.lacks("pruning"); err != nil {
+		return nil, err
 	}
 	type target struct{ ns, name string }
 	var targets []target

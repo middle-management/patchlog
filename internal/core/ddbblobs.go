@@ -17,9 +17,10 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
-func (e *Engine) ddbUploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error {
+func (b *ddbBackend) uploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error {
+	e := b.e
 	var g *blobGate
-	if err := e.ddbGateRead(ctx, func(t *gate) error {
+	if err := b.gateRead(ctx, func(t *gate) error {
 		gg, err := t.gateBlob(req, name, bid, &up, true)
 		g = gg
 		return asErr(err)
@@ -36,12 +37,12 @@ func (e *Engine) ddbUploadBlob(ctx context.Context, req Request, name string, bi
 	} else {
 		h := sha256.Sum256(data)
 		hash = h[:]
-		if err := e.ddbPutBytes(ctx, hash, data); err != nil {
+		if err := b.putBytes(ctx, hash, data); err != nil {
 			return err
 		}
 	}
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
-		r := newDDBReads(e, ctx)
+		r := newDDBReads(b, ctx)
 		t := &gate{checkReads: r, checkState: &checkState{e: e, now: e.now(), write: true}}
 		type checked struct {
 			g   *blobGate
@@ -66,7 +67,7 @@ func (e *Engine) ddbUploadBlob(ctx context.Context, req Request, name string, bi
 			return err
 		}
 		ns := r.nsName(g.n.id)
-		err := e.ddb.store.PutPending(ctx, ns, r.cfgs[g.n.configSeq].pos, r.cfgRow(g.n.configSeq).ID, r.uploaderVer, &ddb.BlobRow{
+		err := b.store.PutPending(ctx, ns, r.cfgs[g.n.configSeq].pos, r.cfgRow(g.n.configSeq).ID, r.uploaderVer, &ddb.BlobRow{
 			Name: name, Bid: bid.String(), Type: g.typ, Nonce: g.nonce, Size: size, Hash: hash,
 			Created: t.now.UnixMilli(), Uploader: g.uploader,
 		})
@@ -81,19 +82,20 @@ func (e *Engine) ddbUploadBlob(ctx context.Context, req Request, name string, bi
 	return apiErr(409, "conflict", "detail", "the namespace's configuration kept moving")
 }
 
-// ddbPutBytes stores blob bytes: in a file of the blob store when there
+// putBytes stores blob bytes: in a file of the blob store when there
 // is one (whose name the BYTES item records), else in the item.
-func (e *Engine) ddbPutBytes(ctx context.Context, hash, data []byte) error {
+func (b *ddbBackend) putBytes(ctx context.Context, hash, data []byte) error {
+	e := b.e
 	now := e.now().UnixMilli()
 	if e.blobs == nil {
-		_, err := e.ddb.store.PutBytes(ctx, hash, data, "", now)
+		_, err := b.store.PutBytes(ctx, hash, data, "", now)
 		return asErrOrNil(err)
 	}
 	name, err := e.putBlob(ctx, bytesFile(0, hash), data)
 	if err != nil {
 		return err
 	}
-	existed, err := e.ddb.store.PutBytes(ctx, hash, data, name, now)
+	existed, err := b.store.PutBytes(ctx, hash, data, name, now)
 	if existed || err != nil {
 		e.removeFiles([]string{name})
 	}
@@ -112,9 +114,10 @@ func asErrOrNil(err error) error {
 // after the bytes, in a request of its own.
 const bytesGrace = 10 * time.Minute
 
-// ddbBlobStats is BlobStats over a scan of the table.
-func (e *Engine) ddbBlobStats(ctx context.Context) (*BlobStats, error) {
-	blobs, _, bytes, err := e.ddb.store.ScanBlobs(ctx)
+// blobStats is BlobStats over a scan of the table.
+func (b *ddbBackend) blobStats(ctx context.Context) (*BlobStats, error) {
+	e := b.e
+	blobs, _, bytes, err := b.store.ScanBlobs(ctx)
 	if err != nil {
 		return nil, ddbAsErr(err)
 	}
@@ -136,11 +139,12 @@ func (e *Engine) ddbBlobStats(ctx context.Context) (*BlobStats, error) {
 	return s, nil
 }
 
-// ddbSweepBlobs is SweepBlobs: the pending entries past their
+// sweepBlobs is SweepBlobs: the pending entries past their
 // namespace's blobGrace, then the bytes nothing names any more (gcBytes
 // of the SQL path, which collects them as the last row naming them goes).
-func (e *Engine) ddbSweepBlobs(ctx context.Context) (int, error) {
-	blobs, nss, bytes, err := e.ddb.store.ScanBlobs(ctx)
+func (b *ddbBackend) sweepBlobs(ctx context.Context) (int, error) {
+	e := b.e
+	blobs, nss, bytes, err := b.store.ScanBlobs(ctx)
 	if err != nil {
 		return 0, ddbAsErr(err)
 	}
@@ -150,7 +154,7 @@ func (e *Engine) ddbSweepBlobs(ctx context.Context) (int, error) {
 			return c, nil
 		}
 		var c int64
-		err := e.ddbGateRead(ctx, func(t *gate) error {
+		err := b.gateRead(ctx, func(t *gate) error {
 			if n := t.nsByName(ns); n != nil {
 				c = t.blobCutoff(t.config(n.configSeq))
 			}
@@ -161,14 +165,14 @@ func (e *Engine) ddbSweepBlobs(ctx context.Context) (int, error) {
 	}
 	named := map[string]bool{}
 	swept := 0
-	for i, b := range blobs {
-		if !b.Attachment {
+	for i, bl := range blobs {
+		if !bl.Attachment {
 			c, err := cutoff(nss[i])
 			if err != nil {
 				return swept, err
 			}
-			if b.Created < c {
-				ok, err := e.ddb.store.DeletePending(ctx, nss[i], b, c)
+			if bl.Created < c {
+				ok, err := b.store.DeletePending(ctx, nss[i], bl, c)
 				if err != nil {
 					return swept, ddbAsErr(err)
 				}
@@ -178,20 +182,20 @@ func (e *Engine) ddbSweepBlobs(ctx context.Context) (int, error) {
 				}
 			}
 		}
-		named[string(b.Hash)] = true
+		named[string(bl.Hash)] = true
 	}
 	touched := e.now().Add(-bytesGrace).UnixMilli()
 	var files []string
-	for _, b := range bytes {
-		if named[string(b.Hash)] {
+	for _, by := range bytes {
+		if named[string(by.Hash)] {
 			continue
 		}
-		ok, err := e.ddb.store.DeleteBytes(ctx, b.Hash, touched)
+		ok, err := b.store.DeleteBytes(ctx, by.Hash, touched)
 		if err != nil {
 			return swept, ddbAsErr(err)
 		}
-		if ok && b.File != "" {
-			files = append(files, b.File)
+		if ok && by.File != "" {
+			files = append(files, by.File)
 		}
 	}
 	e.removeFiles(files)

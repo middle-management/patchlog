@@ -68,6 +68,10 @@ type svcOpts struct {
 	edge        *edge.Verifier
 }
 
+// checkerTTL is how long the services startSvc starts cache namespace
+// documents for grant checks (tree.Options.CheckerTTL).
+const checkerTTL = time.Millisecond
+
 func startSvc(t *testing.T, core *client.Client, o svcOpts, mods ...func(*tree.Options)) *svc {
 	t.Helper()
 	if o.catalog == "" {
@@ -79,7 +83,7 @@ func startSvc(t *testing.T, core *client.Client, o svcOpts, mods ...func(*tree.O
 	s := &svc{t: t, core: core, done: make(chan struct{})}
 	opt := tree.Options{
 		Client: core, Catalog: o.catalog, DB: o.db, SelfPlacing: o.selfPlacing, Purger: s, Now: o.now, Edge: o.edge,
-		CheckerTTL: time.Millisecond, MinWait: 30 * time.Second,
+		CheckerTTL: checkerTTL, MinWait: 30 * time.Second,
 		// Second purges are queued but not sent unless a test turns the
 		// loop on (repurge_test.go): the purges tests count are first ones.
 		RepurgeInterval: -1,

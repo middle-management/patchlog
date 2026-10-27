@@ -18,12 +18,15 @@ what core/ddbreads.go answers the gate with; `PutGrant` stores a write's
 grant, `FirstEntryTime` dates the operator keys (§C.4); blobs.go's
 `Attachment`, `Pending`, `PendingOf`, `UploaderVersion`, `Bytes` are the
 blob reads, `PutBytes` and `PutPending` an upload's writes, `ScanBlobs`,
-`DeletePending`, `DeleteBytes` the sweep's.
-Serving reads: `ReadHead`, `ReadLog` (paged, id cursors, upper bounds),
-`ReadRevByID` (GSI1), `FoldResource` (crossing tombstones: the restore
-applies to the last live document), `ResourceLog`, `ListHeads`,
-`HeadsAt`, `ReadConfig`, `ReadDocAtEntry` (the `ns_log ⨯ ns_config`
-join), `ReadNSInfo`, `KnownEntry`, `Ping`. `Open` parses the `-db` URL
+`DeletePending`, `DeleteBytes` the sweep's; schemas.go's `SchemaRefs`,
+`Namespaces` and `RevsByID` answer schemaReads' referrer checks, from
+`PutSchemaRefs`' markers, the `#NAMESPACES` registry `CreateNamespace`
+writes, and GSI1.
+Serving reads are core's, through the same reads: `EntriesBetween` and
+`RevsBetween` (a log's or a chain's range), `HeadAt` (a head as of an
+entry, from the history rows), `ListHeads`, `FoldResource` (crossing
+tombstones: the restore applies to the last live document), `Ping`.
+`Open` parses the `-db` URL
 (`dynamodb://<table>?region=…&endpoint=…`); `CreateTable` makes the
 table; errors carry the core's `{"code": …}` body shape. With
 `GroupCommit` > 1, commits without a config change commit in groups per

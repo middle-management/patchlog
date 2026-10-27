@@ -68,8 +68,8 @@ func (t *tx) registration(ns int64, origin, name string) *regRow {
 // envelope whose doc is { remote, at }, and appends a remote branch entry
 // (§3.5).
 func (e *Engine) RegisterRemoteBranch(ctx context.Context, req Request, rr RemoteRegistration) (*RegistrationResult, error) {
-	if e.ddb != nil {
-		return nil, ddbUnsupported("remote branches")
+	if err := e.be.lacks("remote branches"); err != nil {
+		return nil, err
 	}
 	var out *RegistrationResult
 	err := e.update(ctx, func(t *tx) error {

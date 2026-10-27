@@ -80,7 +80,8 @@ func (s *Store) CreateNamespace(ctx context.Context, c *Create) (cfgID, nsID str
 	// buildCreateTx's action order: 0 #META, 1 CFG, 2 LOG, 3 #TIP, 4 NSID;
 	// then the deployment's first entry time and the grant's marker.
 	acts := buildCreateTx(s.Table, ns, meta, cfg.String(), string(canon), string(jsonv.Canonical(doc)), entry)
-	acts = append(acts, deployFirst(s.Table, now))
+	acts = append(acts, deployFirst(s.Table, now),
+		types.TransactWriteItem{Put: &types.Put{TableName: &s.Table, Item: withKey(keyNSList(ns), item{})}})
 	if c.Grant != "" {
 		acts = append(acts, grantMark(s.Table, ns, c.Grant, 1))
 	}
@@ -108,173 +109,12 @@ func (s *Store) CreateNamespace(ctx context.Context, c *Create) (cfgID, nsID str
 	return cfg.String(), entryID.String(), nil
 }
 
-// HeadInfo is a resource's head answer: the document and id of a live
-// head, or a tombstone's id and last live revision (§8.1).
-type HeadInfo struct {
-	Doc     any // nil for a tombstone (its document is gone)
-	ID      string
-	Live    bool
-	LastID  string
-	LastPos uint64
-}
-
-// ReadHead serves a resource's head (GET /r/{ns}/{name}): one batch read
-// of the resource and its head document; nil when the resource is absent.
-// Not a snapshot (docs/DYNAMODB.md §5), which is benign here — the head
-// document is immutable per revision.
-func (s *Store) ReadHead(ctx context.Context, ns, name string) (*HeadInfo, error) {
-	out, err := s.Client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
-		RequestItems: map[string]types.KeysAndAttributes{
-			s.Table: {Keys: []map[string]types.AttributeValue{keyAV(keyRes(ns, name)), keyAV(keyDocHead(ns, name))}, ConsistentRead: boolptr(true)},
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	var res *resRow
-	var doc any
-	for _, it := range out.Responses[s.Table] {
-		i := item(it)
-		switch {
-		case i.s("SK") == "RES#"+name:
-			res = scanRes(i)
-		case i.s("SK") == "DOC#"+name+"#HEAD":
-			doc, err = jsonv.Parse([]byte(i.s("doc")))
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-	if res == nil || res.headPos == 0 {
-		return nil, nil // absent
-	}
-	h := &HeadInfo{Doc: doc, ID: res.headID, Live: res.state != "tombstoned", LastID: res.lastID, LastPos: res.lastPos}
-	if !h.Live {
-		// A tombstone keeps the last live document (a restore applies
-		// to it), but the head serves none (§8.1).
-		h.Doc = nil
-	}
-	if h.Live && doc == nil {
-		return nil, apiErr(409, "conflict", "detail", "head document missing")
-	}
-	return h, nil
-}
-
-// LogEntry is a served namespace log entry (namespaceLog of reads.go):
-// the hashed body merged with id, prev, author and created. Its "grant"
-// is a GrantID the caller resolves to the grant reference, nil for an
-// entry written while authentication was disabled, absent for none.
-type LogEntry map[string]any
-
-// GrantID is a grant's id in text form (§C.3).
-type GrantID string
-
-// ReadLog pages the namespace log (§7.1, spike shape): entries after
-// since ("" for the start), at most limit; next is the cursor for the
-// following page ("" at the end).
-// ReadLog serves the namespace log (§7.4): entries after since ("" from
-// the start) up to and including at ("" the tip), a page of at most limit
-// (0: all). Both ids resolve through their NSID markers; one that no
-// entry has is a 404.
-func (s *Store) ReadLog(ctx context.Context, ns, at, since string, limit int) (entries []LogEntry, next string, err error) {
-	var from, to uint64
-	resolve := func(id string) (uint64, *Error) {
-		mk, err := s.getItem(ctx, keyNSID(ns, id))
-		if err != nil {
-			return 0, apiErr(500, "internal", "message", err.Error())
-		}
-		if mk == nil {
-			return 0, apiErr(404, "not_found", "ns_id", id)
-		}
-		return item(mk).n("logPos"), nil
-	}
-	if since != "" {
-		var perr *Error
-		if from, perr = resolve(since); perr != nil {
-			return nil, "", perr
-		}
-	}
-	if at != "" {
-		var perr *Error
-		if to, perr = resolve(at); perr != nil {
-			return nil, "", perr
-		}
-		if from > to {
-			return nil, "", apiErr(404, "not_found", "ns_id", since)
-		}
-	}
-	// SK > LOG#from matches every sort key after it, including other
-	// entities' (RES# sorts after LOG#): the loop stops at the first
-	// non-LOG# item. One extra row decides whether a page follows.
-	in := &dynamodb.QueryInput{
-		TableName:                 &s.Table,
-		KeyConditionExpression:    strptr("PK = :pk AND SK > :lo"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(nsPK(ns)), ":lo": avS("LOG#" + padPos(from))},
-	}
-	if limit > 0 {
-		in.Limit = int32ptr(int32(limit + 1))
-	}
-	q, err := s.Client.Query(ctx, in)
-	if err != nil {
-		return nil, "", err
-	}
-	idsByPos := map[uint64]string{}
-	for _, it := range q.Items {
-		i := item(it)
-		sk := i.s("SK")
-		if !strings.HasPrefix(sk, "LOG#") {
-			break
-		}
-		pos := i.n("pos")
-		if to > 0 && pos > to {
-			break
-		}
-		if limit > 0 && len(entries) == limit {
-			next = entries[len(entries)-1]["id"].(string)
-			break
-		}
-		body, _ := jsonv.Parse([]byte(i.s("body")))
-		e, _ := body.(map[string]any)
-		e["id"] = i.s("id")
-		e["author"] = i.s("author")
-		e["created"] = FormatTime(int64(i.n("created")))
-		if g := i.s("gesture"); g != "" {
-			e["gesture"] = g
-		}
-		if u := i.s("undoes"); u != "" {
-			e["undoes"] = u
-		}
-		if gs := i.s("gestures"); gs != "" {
-			e["gestures"], _ = jsonv.Parse([]byte(gs))
-		}
-		switch {
-		case i.s("grantId") != "":
-			e["grant"] = GrantID(i.s("grantId"))
-		case i.n("noAuth") != 0:
-			e["grant"] = nil
-		}
-		idsByPos[pos] = e["id"].(string)
-		if prev := i.n("prevPos"); prev > 0 {
-			if pid, ok := idsByPos[prev]; ok {
-				e["prev"] = pid
-			} else {
-				pv, err := s.getItem(ctx, keyLog(ns, prev))
-				if err != nil {
-					return nil, "", err
-				}
-				e["prev"] = item(pv).s("id")
-			}
-		}
-		entries = append(entries, e)
-	}
-	return entries, next, nil
-}
-
 // HeadEntry is one resource of a /heads page: its name, head id (a live
 // revision or a tombstone id) and, for a live head, the /heads metadata
 // of §7.4 (the head revision's created, size, digest).
 type HeadEntry struct {
 	Name, ID   string
+	Pos        uint64 // the head's revision position
 	Tombstoned bool
 	Created    int64
 	Size       uint64
@@ -383,19 +223,20 @@ func int32ptr(n int32) *int32 { return &n }
 // scanRevInfo reads a REV# item (a revision or a tombstone) as served.
 func scanRevInfo(i item) RevInfo {
 	return RevInfo{
-		Name:     resNameFromRev(i.s("SK")),
-		ID:       i.s("id"),
-		Pos:      i.n("pos"),
-		Kind:     i.s("kind"),
-		ParentID: i.s("parentId"),
-		Patches:  i.s("patches"),
-		Author:   i.s("author"),
-		Created:  int64(i.n("created")),
-		Size:     i.n("size"),
-		Digest:   i.b("digest"),
-		Gesture:  i.s("gesture"),
-		Undoes:   i.s("undoes"),
-		LogPos:   i.n("logPos"),
-		GrantID:  i.s("grantId"),
+		Name:      resNameFromRev(i.s("SK")),
+		ID:        i.s("id"),
+		Pos:       i.n("pos"),
+		Kind:      i.s("kind"),
+		ParentID:  i.s("parentId"),
+		Patches:   i.s("patches"),
+		Author:    i.s("author"),
+		Created:   int64(i.n("created")),
+		Size:      i.n("size"),
+		Digest:    i.b("digest"),
+		Gesture:   i.s("gesture"),
+		Undoes:    i.s("undoes"),
+		LogPos:    i.n("logPos"),
+		GrantID:   i.s("grantId"),
+		SchemaRef: i.s("schemaRef"),
 	}
 }

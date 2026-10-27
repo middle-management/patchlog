@@ -163,6 +163,7 @@ func (s *Store) DocAt(ctx context.Context, ns, name string, pos uint64) ([]byte,
 // EntryRow is one namespace log entry as stored.
 type EntryRow struct {
 	Pos      uint64
+	PrevPos  uint64 // 0: the first entry
 	ID       string
 	Kind     string
 	Body     string
@@ -182,12 +183,70 @@ func (s *Store) EntryAt(ctx context.Context, ns string, pos uint64) (*EntryRow, 
 	if err != nil || it == nil {
 		return nil, err
 	}
-	i := item(it)
+	return scanEntry(item(it)), nil
+}
+
+func scanEntry(i item) *EntryRow {
 	return &EntryRow{
-		Pos: i.n("pos"), ID: i.s("id"), Kind: i.s("kind"), Body: i.s("body"), Author: i.s("author"),
+		Pos: i.n("pos"), PrevPos: i.n("prevPos"), ID: i.s("id"), Kind: i.s("kind"), Body: i.s("body"), Author: i.s("author"),
 		Created: int64(i.n("created")), Gesture: i.s("gesture"), Undoes: i.s("undoes"), Gestures: i.s("gestures"),
 		CfgPos: i.n("cfgPos"), GrantID: i.s("grantId"), NoAuth: i.n("noAuth") != 0,
-	}, nil
+	}
+}
+
+// EntriesBetween visits ns's log entries after position from up to and
+// including position to, in chain order, at most limit of them (0: all),
+// while visit returns true.
+func (s *Store) EntriesBetween(ctx context.Context, ns string, from, to uint64, limit int, visit func(*EntryRow) bool) error {
+	return s.rangeOf(ctx, ns, "LOG#", from, to, limit, func(i item) bool { return visit(scanEntry(i)) })
+}
+
+// RevsBetween visits name's revisions after position from up to and
+// including position to, oldest first, at most limit of them (0: all),
+// while visit returns true.
+func (s *Store) RevsBetween(ctx context.Context, ns, name string, from, to uint64, limit int, visit func(*RevInfo) bool) error {
+	return s.rangeOf(ctx, ns, "REV#"+name+"#", from, to, limit, func(i item) bool {
+		ri := scanRevInfo(i)
+		return visit(&ri)
+	})
+}
+
+// rangeOf visits the items prefix+pos of ns's partition for positions in
+// (from, to], in order, at most limit (0: all), while visit returns true.
+func (s *Store) rangeOf(ctx context.Context, ns, prefix string, from, to uint64, limit int, visit func(item) bool) error {
+	if to <= from {
+		return nil
+	}
+	in := &dynamodb.QueryInput{
+		TableName:              &s.Table,
+		KeyConditionExpression: strptr("PK = :pk AND SK BETWEEN :lo AND :hi"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": avS(nsPK(ns)), ":lo": avS(prefix + padPos(from+1)), ":hi": avS(prefix + padPos(to)),
+		},
+		ConsistentRead: boolptr(true),
+	}
+	if limit > 0 {
+		in.Limit = int32ptr(int32(min(limit, 1000)))
+	}
+	n := 0
+	for {
+		q, err := s.Client.Query(ctx, in)
+		if err != nil {
+			return err
+		}
+		for _, it := range q.Items {
+			if !visit(item(it)) {
+				return nil
+			}
+			if n++; limit > 0 && n >= limit {
+				return nil
+			}
+		}
+		if len(q.LastEvaluatedKey) == 0 {
+			return nil
+		}
+		in.ExclusiveStartKey = q.LastEvaluatedKey
+	}
 }
 
 // EntryPos resolves ns's entry id to its position (the NSID marker,

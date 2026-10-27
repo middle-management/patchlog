@@ -650,7 +650,7 @@ func (t *gate) logEntry(r *revRow) LogEntry {
 // oldest first and only as far as the page goes, and the pruning check
 // looks only below horizons (prunedIn). Walking the parent links from to
 // instead read the whole rest of the range for every page.
-func (t *tx) logBetween(to *revRow, since *ids.ID, limit, maxBytes int, served func(LogEntry) int) (entries []LogEntry, more bool, err error) {
+func (t *gate) logBetween(to *revRow, since *ids.ID, limit, maxBytes int, served func(LogEntry) int) (entries []LogEntry, more bool, err error) {
 	segs := t.ancestry(to)
 	// The range is (lo, max] of the oldest segment it reaches, segs[k],
 	// and the whole of the newer ones. Ids and parent links survive
@@ -690,22 +690,15 @@ func (t *tx) logBetween(to *revRow, since *ids.ID, limit, maxBytes int, served f
 		if i == k {
 			from = lo
 		}
-		q := `SELECT ` + revCols + ` FROM revisions WHERE res = ? AND seq > ? AND seq <= ? ORDER BY seq`
-		args := []any{segs[i].res, from, segs[i].max}
+		n := 0
 		if limit > 0 {
-			q += ` LIMIT ?`
-			args = append(args, limit-len(rows))
+			n = limit - len(rows)
 		}
-		rs, err := t.Query(q, args...)
-		t.must(err)
-		for !full() && rs.Next() {
-			r, err := scanRev(rs)
-			t.must(err)
+		t.revsBetween(segs[i].res, from, segs[i].max, n, func(r *revRow) bool {
 			rows = append(rows, r)
 			scanned += servedAtLeast(r)
-		}
-		t.must(rs.Err())
-		rs.Close()
+			return !full()
+		})
 	}
 	// Each entry's parent is the row before it (a segment's first row's,
 	// the last of the older segment), so its id is known. The schema keeps
@@ -815,4 +808,27 @@ func (t *gate) lastLive(r *revRow) *revRow {
 		r = t.rev(r.parentSeq.Int64)
 	}
 	return r
+}
+
+// revsBetween visits res's revisions after seq from (0: from the first)
+// up to and including seq max, oldest first, at most limit of them (0:
+// all), while visit returns true.
+func (t *tx) revsBetween(res, from, max int64, limit int, visit func(*revRow) bool) {
+	q := `SELECT ` + revCols + ` FROM revisions WHERE res = ? AND seq > ? AND seq <= ? ORDER BY seq`
+	args := []any{res, from, max}
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rs, err := t.Query(q, args...)
+	t.must(err)
+	defer rs.Close()
+	for rs.Next() {
+		r, err := scanRev(rs)
+		t.must(err)
+		if !visit(r) {
+			return
+		}
+	}
+	t.must(rs.Err())
 }

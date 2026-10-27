@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -27,6 +28,7 @@ import (
 // grants, $schema namespaces, archives, reads at an earlier entry).
 type ddbReads struct {
 	e   *Engine
+	b   *ddbBackend
 	s   *ddb.Store
 	ctx context.Context
 
@@ -43,10 +45,15 @@ type ddbReads struct {
 	authorN map[string]int64
 	logs    map[int64]ddbPosKey
 	logAt   map[ddbPosKey]int64
+	logKeys map[string]int64 // each namespace's high bits of its log handles
 	// resRows are the resources read, by handle: the commit pins them.
 	resRows map[int64]*ddb.ResRow
 	// uploaderVer is the version pendingUsed read: the upload pins it.
 	uploaderVer uint64
+	// schemaNSs are the schema namespaces read, with their configuration.
+	schemaNSs map[string]int64
+	// schemaRefs are the revisions' schema paths read, by handle.
+	schemaRefs map[int64]string
 }
 
 type ddbNS struct {
@@ -76,16 +83,16 @@ type ddbRevRef struct {
 	row *revRow // nil until read
 }
 
-func newDDBReads(e *Engine, ctx context.Context) *ddbReads {
+func newDDBReads(b *ddbBackend, ctx context.Context) *ddbReads {
 	return &ddbReads{
-		e: e, s: e.ddb.store, ctx: ctx,
+		b: b, e: b.e, s: b.store, ctx: ctx,
 		nss: map[int64]*ddbNS{}, nsNamed: map[string]int64{},
 		cfgs: map[int64]ddbCfgRef{}, cfgAt: map[ddbPosKey]int64{},
 		revs: map[int64]*ddbRevRef{}, revAt: map[ddbRevKey]int64{},
 		res: map[int64]ddbResRef{}, resAt: map[ddbResRef]int64{},
 		authors: map[int64]string{}, authorN: map[string]int64{},
-		logs: map[int64]ddbPosKey{}, logAt: map[ddbPosKey]int64{},
-		resRows: map[int64]*ddb.ResRow{},
+		logs: map[int64]ddbPosKey{}, logAt: map[ddbPosKey]int64{}, logKeys: map[string]int64{},
+		resRows: map[int64]*ddb.ResRow{}, schemaRefs: map[int64]string{},
 	}
 }
 
@@ -112,12 +119,24 @@ func (r *ddbReads) cfgHandle(ns string, pos uint64) int64 {
 	return h
 }
 
+// posBits is how many low bits of a log or revision handle hold its
+// position: positions are below 10^12 (posDigits), under 2^40.
+const posBits = 40
+
+// logHandle is entry pos of ns's log as the gate's seq: ordered as the
+// positions are within a namespace, as SQL's seqs are (the reads compare
+// them: a range (from, to], since past the head).
 func (r *ddbReads) logHandle(ns string, pos uint64) int64 {
 	k := ddbPosKey{ns, pos}
 	if h, ok := r.logAt[k]; ok {
 		return h
 	}
-	h := r.handle()
+	key, ok := r.logKeys[ns]
+	if !ok {
+		key = r.handle()
+		r.logKeys[ns] = key
+	}
+	h := key<<posBits | int64(pos)
 	r.logAt[k], r.logs[h] = h, k
 	return h
 }
@@ -132,12 +151,14 @@ func (r *ddbReads) resHandle(ns, name string) int64 {
 	return h
 }
 
+// revHandle is revision pos of name in ns as the gate's seq: ordered as
+// the positions are within the resource (logHandle).
 func (r *ddbReads) revHandle(ns, name string, pos uint64) int64 {
 	k := ddbRevKey{ns, name, pos}
 	if h, ok := r.revAt[k]; ok {
 		return h
 	}
-	h := r.handle()
+	h := r.resHandle(ns, name)<<posBits | int64(pos)
 	r.revAt[k], r.revs[h] = h, &ddbRevRef{key: k}
 	return h
 }
@@ -178,6 +199,9 @@ func (r *ddbReads) revRowOf(ns string, ri *ddb.RevInfo) *revRow {
 	}
 	if ri.Undoes != "" {
 		row.undoes.String, row.undoes.Valid = ri.Undoes, true
+	}
+	if ri.SchemaRef != "" {
+		r.schemaRefs[h] = ri.SchemaRef
 	}
 	if ri.GrantID != "" {
 		gid, err := ids.Parse(ri.GrantID)
@@ -231,11 +255,37 @@ func (r *ddbReads) nsByID(id int64) *nsRow {
 	}
 	return r.nsRowOf(id)
 }
-func (r *ddbReads) nsRowUnlocked(id int64) *nsRow          { return r.nsByID(id) }
-func (r *ddbReads) lockNS(ns int64, mode lockMode)         {}
-func (r *ddbReads) branchesOf(n *nsRow) []*nsRow           { return nil }
-func (r *ddbReads) baseIdentity(n *nsRow) string           { panic(ddbUnsupported("branches")) }
-func (r *ddbReads) schemaNS(name string) *nsRow            { panic(ddbUnsupported("$schema validation")) }
+func (r *ddbReads) nsRowUnlocked(id int64) *nsRow  { return r.nsByID(id) }
+func (r *ddbReads) lockNS(ns int64, mode lockMode) {}
+func (r *ddbReads) branchesOf(n *nsRow) []*nsRow   { return nil }
+func (r *ddbReads) baseIdentity(n *nsRow) string   { panic(ddbUnsupported("branches")) }
+
+// schemaNS is nsByName for a schema path's namespace; the commit pins its
+// configuration (schemaPins), as SQL's recheck compares its row.
+func (r *ddbReads) schemaNS(name string) *nsRow {
+	n := r.nsByName(name)
+	if n != nil {
+		if r.schemaNSs == nil {
+			r.schemaNSs = map[string]int64{}
+		}
+		r.schemaNSs[name] = n.configSeq
+	}
+	return n
+}
+
+// schemaPins are the configurations of the schema namespaces read, but
+// own's (which the commit pins anyway).
+func (r *ddbReads) schemaPins(own string) []ddb.NSPin {
+	var out []ddb.NSPin
+	for _, name := range sortedKeys(r.schemaNSs) {
+		if name == own {
+			continue
+		}
+		seq := r.schemaNSs[name]
+		out = append(out, ddb.NSPin{NS: name, CfgPos: r.cfgs[seq].pos, CfgID: r.cfgRow(seq).ID})
+	}
+	return out
+}
 func (r *ddbReads) prefetchResources(int64, []string)      {}
 func (r *ddbReads) prefetchHeads(*nsRow, []string, *int64) {}
 func (r *ddbReads) prefetchSchemas([]schema.Ref)           {}
@@ -266,7 +316,7 @@ func (r *ddbReads) config(seq int64) *Config {
 	ref := r.cfgs[seq]
 	c := r.cfgRow(seq)
 	key := ref.ns + "\x00" + c.ID
-	b := r.e.ddb
+	b := r.b
 	b.cfgMu.Lock()
 	cfg, ok := b.byID[key]
 	b.cfgMu.Unlock()
@@ -363,11 +413,28 @@ func (r *ddbReads) batchEntry(n *nsRow, seq, author int64) (ids.ID, string, bool
 // --- resources and revisions ---
 
 func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
-	if asOf != nil {
-		panic(ddbUnsupported("reads as of an earlier entry"))
-	}
 	ns := r.nsName(n.id)
 	v := &view{ns: n, name: name}
+	if asOf != nil {
+		// The head as of a log entry: the history rows (ddb.Store.HeadAt),
+		// as SQL's head_history.
+		h, err := r.s.HeadAt(r.ctx, ns, name, r.logs[*asOf].pos)
+		r.must(err)
+		rh := r.resHandle(ns, name)
+		v.own = &resRow{id: rh, name: name}
+		if h == nil {
+			v.state = NotFound
+			return v
+		}
+		v.src = v.own
+		v.head = r.rev(r.revHandle(ns, name, h.Pos))
+		if v.head.kind == kindTombstone {
+			v.state = Tombstoned
+		} else {
+			v.state = Live
+		}
+		return v
+	}
 	rr, err := r.s.Resource(r.ctx, ns, name)
 	r.must(err)
 	rh := r.resHandle(ns, name)
@@ -466,7 +533,31 @@ func (r *ddbReads) namesAfter(n *nsRow, after string, k int) []string {
 	return out
 }
 
-func (r *ddbReads) copyRows(id ids.ID, name string) []copyRow { return nil }
+// copyRows: the revisions with id named name in every namespace (GSI1).
+func (r *ddbReads) copyRows(id ids.ID, name string) []copyRow {
+	cs, err := r.s.RevsByID(r.ctx, id.String(), name)
+	r.must(err)
+	sort.Slice(cs, func(i, j int) bool {
+		if cs[i].NS != cs[j].NS {
+			return cs[i].NS < cs[j].NS
+		}
+		return cs[i].Pos < cs[j].Pos
+	})
+	var out []copyRow
+	for _, c := range cs {
+		if c.Kind == "tombstone" {
+			continue
+		}
+		n := r.nsByName(c.NS)
+		if n == nil {
+			continue
+		}
+		ri := c.RevInfo
+		row := r.revRowOf(c.NS, &ri)
+		out = append(out, copyRow{seq: row.seq, ns: n.id, res: row.res, state: stateLive})
+	}
+	return out
+}
 
 // --- authors ---
 
@@ -521,10 +612,11 @@ func (r *ddbReads) nextEntryCreated(ns, seq int64) (int64, bool) {
 	return le.Created, true
 }
 
-// ddbGateRead is gateRead on DynamoDB: f on a gate over the table's
+// gateRead runs f on a gate over the table's
 // reads, what they panic with returned as errors (ddbCheck).
-func (e *Engine) ddbGateRead(ctx context.Context, f func(t *gate) error) error {
-	g := &gate{checkReads: newDDBReads(e, ctx), checkState: &checkState{e: e, now: e.now()}}
+func (b *ddbBackend) gateRead(ctx context.Context, f func(t *gate) error) error {
+	e := b.e
+	g := &gate{checkReads: newDDBReads(b, ctx), checkState: &checkState{e: e, now: e.now()}}
 	err, perr := ddbCheck(func() error { return f(g) })
 	if perr != nil {
 		return perr
@@ -632,3 +724,122 @@ func (r *ddbReads) pendingUsed(n *nsRow, uploader string, cutoff, res int64, bid
 func (r *ddbReads) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJob {
 	panic(ddbUnsupported("sealed namespaces"))
 }
+
+// --- schema references ---
+
+func (r *ddbReads) noLocks() func() { return func() {} }
+
+func (r *ddbReads) nsNames() []string {
+	names, err := r.s.Namespaces(r.ctx)
+	r.must(err)
+	return names
+}
+
+func (r *ddbReads) pinnedRefs(l *nsRow) []string {
+	pins, err := r.s.SchemaRefs(r.ctx, r.nsName(l.id), "")
+	r.must(err)
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range pins {
+		if !seen[p.Ref] {
+			seen[p.Ref] = true
+			out = append(out, p.Ref)
+		}
+	}
+	return out
+}
+
+func (r *ddbReads) pinningNames(l *nsRow, ref string) []string {
+	pins, err := r.s.SchemaRefs(r.ctx, r.nsName(l.id), ref)
+	r.must(err)
+	var out []string
+	for _, p := range pins {
+		out = append(out, p.Name)
+	}
+	return out
+}
+
+func (r *ddbReads) schemaRefOf(seq int64) (string, bool) {
+	r.rev(seq)
+	ref, ok := r.schemaRefs[seq]
+	return ref, ok
+}
+
+// --- serving reads ---
+
+func (r *ddbReads) knowRevID(seq int64, id ids.ID) {}
+
+// prunedIn: nothing is pruned or purged on this backend.
+func (r *ddbReads) prunedIn(segs []segment, lo int64) error { return nil }
+
+func (r *ddbReads) revsBetween(res, from, max int64, limit int, visit func(*revRow) bool) {
+	k := r.res[res]
+	var fromPos uint64
+	if from != 0 {
+		fromPos = r.revs[from].key.pos
+	}
+	r.must(r.s.RevsBetween(r.ctx, k.ns, k.name, fromPos, r.revs[max].key.pos, limit, func(ri *ddb.RevInfo) bool {
+		return visit(r.revRowOf(k.ns, ri))
+	}))
+}
+
+func (r *ddbReads) nsLogRows(n *nsRow, from, to int64, limit int, visit func(nsLogRow) bool) {
+	ns := r.nsName(n.id)
+	var fromPos uint64
+	if from != 0 {
+		fromPos = r.logs[from].pos
+	}
+	r.must(r.s.EntriesBetween(r.ctx, ns, fromPos, r.logs[to].pos, limit, func(le *ddb.EntryRow) bool {
+		id, err := ids.Parse(le.ID)
+		r.must(err)
+		row := nsLogRow{seq: r.logHandle(ns, le.Pos), id: id[:], body: le.Body, author: r.authorHandle(le.Author), created: le.Created}
+		if le.PrevPos > 0 {
+			p := r.logHandle(ns, le.PrevPos)
+			row.prev = &p
+		}
+		if le.GrantID != "" {
+			gid, err := ids.Parse(le.GrantID)
+			r.must(err)
+			row.grantID = gid[:]
+		}
+		if le.NoAuth {
+			row.noAuth.Int64, row.noAuth.Valid = 1, true
+		}
+		// The members ns_log.gestures holds (gestureMeta, batchGestures).
+		var meta map[string]any
+		switch {
+		case le.Gestures != "":
+			meta = map[string]any{"gestures": jsonv.MustParse([]byte(le.Gestures))}
+		case le.Gesture != "" || le.Undoes != "":
+			meta = gestureMeta(le.Gesture, le.Undoes)
+		}
+		if meta != nil {
+			row.meta.String, row.meta.Valid = string(jsonv.Canonical(meta)), true
+		}
+		return visit(row)
+	}))
+}
+
+// resState: no purges here, so every resource is live.
+func (r *ddbReads) resState(res int64) int { return stateLive }
+
+func (r *ddbReads) entryConfig(seq int64) (int64, string) {
+	k := r.logs[seq]
+	le := r.entry(seq)
+	if le == nil {
+		panic(fmt.Errorf("ddb: entry %d missing", seq))
+	}
+	h := r.cfgHandle(k.ns, le.CfgPos)
+	return h, string(jsonv.Canonical(r.cfgRow(h).Doc))
+}
+
+func (r *ddbReads) resJob(n *nsRow, name string, row *revRow, kind string, plain func() []byte) *sealJob {
+	panic(ddbUnsupported("sealed namespaces"))
+}
+func (r *ddbReads) stored(n *nsRow, j *sealJob) bool   { panic(ddbUnsupported("sealed namespaces")) }
+func (r *ddbReads) entryEpoch(n *nsRow, seq int64) int { panic(ddbUnsupported("sealed namespaces")) }
+func (r *ddbReads) epochKey(ns int64, epoch int) []byte {
+	panic(ddbUnsupported("sealed namespaces"))
+}
+func (r *ddbReads) e2eSnapshot(row *revRow) string  { panic(ddbUnsupported("e2e namespaces")) }
+func (r *ddbReads) e2eFoldSince(row *revRow) string { panic(ddbUnsupported("e2e namespaces")) }

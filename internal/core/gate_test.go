@@ -20,7 +20,7 @@ func TestCheckReadsDeclaredOnTx(t *testing.T) {
 		t.Fatal(err)
 	}
 	onTx := map[string]bool{}
-	var reads []string
+	ifaces := map[string]*ast.InterfaceType{}
 	for _, f := range pkgs["core"].Files {
 		for _, d := range f.Decls {
 			switch d := d.(type) {
@@ -35,22 +35,33 @@ func TestCheckReadsDeclaredOnTx(t *testing.T) {
 				}
 			case *ast.GenDecl:
 				for _, sp := range d.Specs {
-					ts, ok := sp.(*ast.TypeSpec)
-					if !ok || ts.Name.Name != "checkReads" {
-						continue
-					}
-					for _, m := range ts.Type.(*ast.InterfaceType).Methods.List {
-						for _, n := range m.Names {
-							reads = append(reads, n.Name)
+					if ts, ok := sp.(*ast.TypeSpec); ok {
+						if it, ok := ts.Type.(*ast.InterfaceType); ok {
+							ifaces[ts.Name.Name] = it
 						}
 					}
 				}
 			}
 		}
 	}
-	if len(reads) == 0 {
-		t.Fatal("checkReads not found")
+	// checkReads' methods, its embedded interfaces' included.
+	var reads []string
+	var collect func(name string)
+	collect = func(name string) {
+		it, ok := ifaces[name]
+		if !ok {
+			t.Fatalf("interface %s not found", name)
+		}
+		for _, m := range it.Methods.List {
+			if len(m.Names) == 0 {
+				collect(m.Type.(*ast.Ident).Name)
+			}
+			for _, n := range m.Names {
+				reads = append(reads, n.Name)
+			}
+		}
 	}
+	collect("checkReads")
 	for _, r := range reads {
 		if !onTx[r] {
 			t.Errorf("checkReads.%s is not declared on *tx: it would recurse through the gate", r)

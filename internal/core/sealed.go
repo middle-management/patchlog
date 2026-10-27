@@ -353,7 +353,7 @@ func (t *tx) resJob(n *nsRow, name string, row *revRow, kind string, plain func(
 }
 
 // configJob prepares the sealing of n's namespace document at ns_log seq.
-func (t *tx) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
+func (t *gate) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
 	j := &sealJob{kind: sealConfig, key: nsID}
 	if t.stored(n, j) {
 		return j
@@ -366,7 +366,7 @@ func (t *tx) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
 
 // rangeJob prepares the sealing of n's namespace log range (since, to],
 // where to is ns_log seq toSeq with id toID.
-func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain func() []byte) *sealJob {
+func (t *gate) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain func() []byte) *sealJob {
 	j := &sealJob{kind: sealRange, key: since + ":" + toID}
 	if t.stored(n, j) {
 		return j
@@ -475,8 +475,8 @@ type KeysAnswer struct {
 // sealed is 404 not_offered, once the read check passes: there is nothing
 // to seal (§E.2.3).
 func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) (*KeysAnswer, error) {
-	if e.ddb != nil {
-		return nil, ddbUnsupported("sealed namespaces")
+	if err := e.be.lacks("sealed namespaces"); err != nil {
+		return nil, err
 	}
 	var out []map[string]any
 	var ans *KeysAnswer
@@ -696,8 +696,8 @@ func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 // retention's): a new epoch key is created and content written from then on
 // is sealed under it. It returns the new epoch.
 func (e *Engine) RotateEpoch(ctx context.Context, ns, author string) (int, error) {
-	if e.ddb != nil {
-		return 0, ddbUnsupported("sealed namespaces")
+	if err := e.be.lacks("sealed namespaces"); err != nil {
+		return 0, err
 	}
 	var epoch int
 	err := e.update(ctx, func(t *tx) error {
@@ -759,8 +759,8 @@ func (e *Engine) rotateAfterRevoke(names []string) {
 // RotateDue rotates every sealed, unpurged, unfrozen namespace whose current
 // epoch started at least maxAge ago, and returns their names.
 func (e *Engine) RotateDue(ctx context.Context, maxAge time.Duration) ([]string, error) {
-	if e.ddb != nil {
-		return nil, ddbUnsupported("sealed namespaces")
+	if err := e.be.lacks("sealed namespaces"); err != nil {
+		return nil, err
 	}
 	var due []string
 	err := e.read(ctx, func(t *tx) error {
