@@ -1,0 +1,79 @@
+{
+  "section": "§E.2.3, §E.3.2",
+  "about": "keys wrapped to a reader's X25519 key with HPKE (RFC 9180): base mode for /keys, auth mode under the admin's key for keyring entries; info \"patchlog-key-v1\" LF kid LF name, wrapped = enc ‖ ct; the ephemeral key is fixed so the wrap reproduces",
+  "keys": [
+    {
+      "name": "recipient, seq(0x20)",
+      "fn": "seal.RecipientJWK, seal.Thumbprint",
+      "private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "jwk": "{\"crv\":\"X25519\",\"kty\":\"OKP\",\"x\":\"NYBy1jZYgNGu6jKa35EhODhR7SGijjt16WXQ0s0WYlQ\"}",
+      "thumbprint": "5_RYhfysTyU1BDBnv9LSpAGNHJ_A1_UesBCKoRG370E"
+    },
+    {
+      "name": "sender (admin), seq(0x40)",
+      "fn": "seal.RecipientJWK, seal.Thumbprint",
+      "private": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "jwk": "{\"crv\":\"X25519\",\"kty\":\"OKP\",\"x\":\"eaYx7t4b-cmPEgMs3q3Q56B5OY_HhriMyEbsia-FpRo\"}",
+      "thumbprint": "YKbZ9qRn_duml9RTz_7p5FNztMst4VCEVI2fzJCu4TE"
+    },
+    {
+      "name": "ephemeral, seq(0x60)",
+      "fn": "seal.RecipientJWK, seal.Thumbprint",
+      "private": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+      "jwk": "{\"crv\":\"X25519\",\"kty\":\"OKP\",\"x\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8\"}",
+      "thumbprint": "LiYg-5ySVLOUBN0khvkqlhjDXIjBOPo7X1XBi-3Gmxk"
+    }
+  ],
+  "vectors": [
+    {
+      "name": "K_e, base mode",
+      "fn": "seal.WrapKeyWithEphemeral (opened by seal.UnwrapKey)",
+      "mode": "base",
+      "suite": "DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM",
+      "recipient_private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "ephemeral_private": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+      "kid": "demo#3",
+      "resource": "",
+      "info": "patchlog-key-v1\ndemo#3\n",
+      "aad": "",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "enc": "675dd574ed7789310b3d2e7681f3790b466c773b1521fecf36577958371ea52f",
+      "ct": "13386e84aa77fad0af82e2a04ab738043314aabaf00288d5a7b19d2e51a286199487aff2c4b39fdd308fff2138fce511",
+      "entry": "{\"kid\":\"demo#3\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8TOG6Eqnf60K-C4qBKtzgEMxSquvACiNWnsZ0uUaKGGZSHr_LEs5_dMI__ITj85RE\"}"
+    },
+    {
+      "name": "K_r, base mode",
+      "fn": "seal.WrapKeyWithEphemeral (opened by seal.UnwrapKey)",
+      "mode": "base",
+      "suite": "DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM",
+      "recipient_private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "ephemeral_private": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+      "kid": "demo#3",
+      "resource": "derby",
+      "info": "patchlog-key-v1\ndemo#3\nderby",
+      "aad": "",
+      "key": "37a2b615272e7bdec36b97f35176a206caa2dbbef43d89b81aa5a4ee874a5c25",
+      "enc": "675dd574ed7789310b3d2e7681f3790b466c773b1521fecf36577958371ea52f",
+      "ct": "44df8b2081f0cd07201259e95859d355b4eb54fb127b63baa5008415035156c0e6edbdc1ce1e3e7f2b8d1a12bef36044",
+      "entry": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9E34sggfDNByASWelYWdNVtOtU-xJ7Y7qlAIQVA1FWwObtvcHOHj5_K40aEr7zYEQ\"}"
+    },
+    {
+      "name": "K_e, auth mode (keyring entry)",
+      "fn": "seal.WrapKeyAuthWithEphemeral, seal.KeyringV2.Value (opened by seal.KeyringEntry.Open)",
+      "mode": "auth",
+      "suite": "DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-256-GCM",
+      "recipient_private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "sender_private": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "ephemeral_private": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+      "kid": "demo#3",
+      "info": "patchlog-key-v1\ndemo#3\n",
+      "aad": "",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "enc": "675dd574ed7789310b3d2e7681f3790b466c773b1521fecf36577958371ea52f",
+      "ct": "43cec1d61c3e0101e1b5c9ff5d87ffbf3b88c348d886ee56d4ac596b3d896a5e9d2f5ed1c215a94f4c9ac0b9a63d854c",
+      "keyring": "{\"keys\":[{\"from\":\"YKbZ9qRn_duml9RTz_7p5FNztMst4VCEVI2fzJCu4TE\",\"kid\":\"demo#3\",\"to\":\"5_RYhfysTyU1BDBnv9LSpAGNHJ_A1_UesBCKoRG370E\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9DzsHWHD4BAeG1yf9dh_-_O4jDSNiG7lbUrFlrPYlqXp0vXtHCFalPTJrAuaY9hUw\"}]}",
+      "relayed by /keys": "{\"from\":\"YKbZ9qRn_duml9RTz_7p5FNztMst4VCEVI2fzJCu4TE\",\"kid\":\"demo#3\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9DzsHWHD4BAeG1yf9dh_-_O4jDSNiG7lbUrFlrPYlqXp0vXtHCFalPTJrAuaY9hUw\"}",
+      "opens under another sender": false
+    }
+  ]
+}

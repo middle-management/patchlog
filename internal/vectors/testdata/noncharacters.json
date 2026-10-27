@@ -1,0 +1,204 @@
+{
+  "section": "§3.1",
+  "about": "noncharacters in a request body, raw and as \\u escapes: 400; other code points next to them are accepted, and the revision id is over the canonical form",
+  "vectors": [
+    {
+      "name": "U+FDD0 raw",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"﷐\"",
+      "input_hex": "22efb79022",
+      "input verdict": "400",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"﷐\"}}]",
+      "verdict": "refused",
+      "status": 400,
+      "code": "bad_input"
+    },
+    {
+      "name": "U+FDD0 escaped",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"\\ufdd0\"",
+      "input_hex": "225c756664643022",
+      "input verdict": "400",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"\\ufdd0\"}}]",
+      "verdict": "refused",
+      "status": 400,
+      "code": "bad_input"
+    },
+    {
+      "name": "U+FDEF raw",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"﷯\"",
+      "input_hex": "22efb7af22",
+      "input verdict": "400",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"﷯\"}}]",
+      "verdict": "refused",
+      "status": 400,
+      "code": "bad_input"
+    },
+    {
+      "name": "U+FDEF escaped",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"\\ufdef\"",
+      "input_hex": "225c756664656622",
+      "input verdict": "400",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"\\ufdef\"}}]",
+      "verdict": "refused",
+      "status": 400,
+      "code": "bad_input"
+    },
+    {
+      "name": "U+FFFE raw",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"￾\"",
+      "input_hex": "22efbfbe22",
+      "input verdict": "400",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"￾\"}}]",
+      "verdict": "refused",
+      "status": 400,
+      "code": "bad_input"
+    },
+    {
+      "name": "U+FFFE escaped",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"\\ufffe\"",
+      "input_hex": "225c756666666522",
+      "input verdict": "400",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"\\ufffe\"}}]",
+      "verdict": "refused",
+      "status": 400,
+      "code": "bad_input"
+    },
+    {
+      "name": "U+FFFF raw",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"￿\"",
+      "input_hex": "22efbfbf22",
+      "input verdict": "400",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"￿\"}}]",
+      "verdict": "refused",
+      "status": 400,
+      "code": "bad_input"
+    },
+    {
+      "name": "U+FFFF escaped",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"\\uffff\"",
+      "input_hex": "225c756666666622",
+      "input verdict": "400",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"\\uffff\"}}]",
+      "verdict": "refused",
+      "status": 400,
+      "code": "bad_input"
+    },
+    {
+      "name": "U+01FFFE raw",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"🿾\"",
+      "input_hex": "22f09fbfbe22",
+      "input verdict": "400",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"🿾\"}}]",
+      "verdict": "refused",
+      "status": 400,
+      "code": "bad_input"
+    },
+    {
+      "name": "U+01FFFE escaped",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"\\ud83f\\udffe\"",
+      "input_hex": "225c75643833665c756466666522",
+      "input verdict": "400",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"\\ud83f\\udffe\"}}]",
+      "verdict": "refused",
+      "status": 400,
+      "code": "bad_input"
+    },
+    {
+      "name": "U+10FFFF raw",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"􏿿\"",
+      "input_hex": "22f48fbfbf22",
+      "input verdict": "400",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"􏿿\"}}]",
+      "verdict": "refused",
+      "status": 400,
+      "code": "bad_input"
+    },
+    {
+      "name": "U+10FFFF escaped",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"\\udbff\\udfff\"",
+      "input_hex": "225c75646266665c756466666622",
+      "input verdict": "400",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"\\udbff\\udfff\"}}]",
+      "verdict": "refused",
+      "status": 400,
+      "code": "bad_input"
+    },
+    {
+      "name": "U+FDCF raw",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"﷏\"",
+      "input_hex": "22efb78f22",
+      "input verdict": "accept",
+      "canonical_hex": "22efb78f22",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"﷏\"}}]",
+      "verdict": "accepted",
+      "revision": "1sxrx3wwzxwyahs7khilka36c6selzwrb"
+    },
+    {
+      "name": "U+FDCF escaped",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"\\ufdcf\"",
+      "input_hex": "225c756664636622",
+      "input verdict": "accept",
+      "canonical_hex": "22efb78f22",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"\\ufdcf\"}}]",
+      "verdict": "accepted",
+      "revision": "1sxrx3wwzxwyahs7khilka36c6selzwrb"
+    },
+    {
+      "name": "U+FDF0 raw",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"ﷰ\"",
+      "input_hex": "22efb7b022",
+      "input verdict": "accept",
+      "canonical_hex": "22efb7b022",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"ﷰ\"}}]",
+      "verdict": "accepted",
+      "revision": "1jkaabmuivygpelkeuncgmiatzunwp5zw"
+    },
+    {
+      "name": "U+FDF0 escaped",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"\\ufdf0\"",
+      "input_hex": "225c756664663022",
+      "input verdict": "accept",
+      "canonical_hex": "22efb7b022",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"\\ufdf0\"}}]",
+      "verdict": "accepted",
+      "revision": "1jkaabmuivygpelkeuncgmiatzunwp5zw"
+    },
+    {
+      "name": "U+FFFD raw",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"�\"",
+      "input_hex": "22efbfbd22",
+      "input verdict": "accept",
+      "canonical_hex": "22efbfbd22",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"�\"}}]",
+      "verdict": "accepted",
+      "revision": "137ielgcxtgdymhcykw5flzgaml4d6kbx"
+    },
+    {
+      "name": "U+FFFD escaped",
+      "fn": "jsonv.ParseInput; server: PUT /r/{ns}/{name}",
+      "input": "\"\\ufffd\"",
+      "input_hex": "225c756666666422",
+      "input verdict": "accept",
+      "canonical_hex": "22efbfbd22",
+      "body": "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"t\":\"\\ufffd\"}}]",
+      "verdict": "accepted",
+      "revision": "137ielgcxtgdymhcykw5flzgaml4d6kbx"
+    }
+  ]
+}

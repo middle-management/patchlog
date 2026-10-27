@@ -1,0 +1,228 @@
+{
+  "section": "§6.6",
+  "about": "RE2 patterns with \\uXXXX escapes: their RE2 form, what they match, and how a deployment answers a schema, a namespace document and a grant carrying them",
+  "vectors": [
+    {
+      "name": "BMP escape",
+      "fn": "pattern.Translate, pattern.Compile",
+      "pattern": "^\\u00e9$",
+      "re2": "^\\x{00E9}$",
+      "matches": [
+        {
+          "string": "é",
+          "matches": true
+        },
+        {
+          "string": "e",
+          "matches": false
+        },
+        {
+          "string": "\\u00e9",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "surrogate pair",
+      "fn": "pattern.Translate, pattern.Compile",
+      "pattern": "^\\ud83d\\ude00$",
+      "re2": "^\\x{1F600}$",
+      "matches": [
+        {
+          "string": "😀",
+          "matches": true
+        },
+        {
+          "string": "?",
+          "matches": false
+        },
+        {
+          "string": "\\ud83d\\ude00",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "escaped backslash",
+      "fn": "pattern.Translate, pattern.Compile",
+      "pattern": "^\\\\u0041$",
+      "re2": "^\\\\u0041$",
+      "matches": [
+        {
+          "string": "\\u0041",
+          "matches": true
+        },
+        {
+          "string": "A",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "in a class",
+      "fn": "pattern.Translate, pattern.Compile",
+      "pattern": "^[\\u00e0-\\u00ff]+$",
+      "re2": "^[\\x{00E0}-\\x{00FF}]+$",
+      "matches": [
+        {
+          "string": "àéÿ",
+          "matches": true
+        },
+        {
+          "string": "a",
+          "matches": false
+        }
+      ]
+    },
+    {
+      "name": "lone high surrogate",
+      "fn": "pattern.Translate, pattern.Compile",
+      "pattern": "\\ud800",
+      "verdict": "refused"
+    },
+    {
+      "name": "lone low surrogate",
+      "fn": "pattern.Translate, pattern.Compile",
+      "pattern": "\\udc00",
+      "verdict": "refused"
+    },
+    {
+      "name": "lone surrogate as \\x{…}",
+      "fn": "pattern.Translate, pattern.Compile",
+      "pattern": "\\x{D800}",
+      "verdict": "refused"
+    },
+    {
+      "name": "high surrogate before a non-surrogate",
+      "fn": "pattern.Translate, pattern.Compile",
+      "pattern": "\\ud83d\\u0041",
+      "verdict": "refused"
+    },
+    {
+      "name": "schema, BMP escape",
+      "fn": "server: PUT /r/{ns}/{name} (core: schema compile, §6.1, §6.6)",
+      "schema": "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"properties\":{\"t\":{\"pattern\":\"^\\\\u00e9$\",\"type\":\"string\"}},\"type\":\"object\"}",
+      "verdict": "accepted",
+      "documents": [
+        {
+          "t": "é",
+          "verdict": "accepted"
+        },
+        {
+          "t": "e",
+          "verdict": "refused",
+          "status": 422,
+          "code": "invalid"
+        }
+      ]
+    },
+    {
+      "name": "schema, surrogate pair",
+      "fn": "server: PUT /r/{ns}/{name} (core: schema compile, §6.1, §6.6)",
+      "schema": "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"properties\":{\"t\":{\"pattern\":\"^\\\\ud83d\\\\ude00$\",\"type\":\"string\"}},\"type\":\"object\"}",
+      "verdict": "accepted",
+      "documents": [
+        {
+          "t": "😀",
+          "verdict": "accepted"
+        },
+        {
+          "t": "x",
+          "verdict": "refused",
+          "status": 422,
+          "code": "invalid"
+        }
+      ]
+    },
+    {
+      "name": "schema, escaped backslash",
+      "fn": "server: PUT /r/{ns}/{name} (core: schema compile, §6.1, §6.6)",
+      "schema": "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"properties\":{\"t\":{\"pattern\":\"^\\\\\\\\u0041$\",\"type\":\"string\"}},\"type\":\"object\"}",
+      "verdict": "accepted",
+      "documents": [
+        {
+          "t": "\\u0041",
+          "verdict": "accepted"
+        },
+        {
+          "t": "A",
+          "verdict": "refused",
+          "status": 422,
+          "code": "invalid"
+        }
+      ]
+    },
+    {
+      "name": "schema, lone surrogate",
+      "fn": "server: PUT /r/{ns}/{name} (core: schema compile, §6.1, §6.6)",
+      "schema": "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"properties\":{\"t\":{\"pattern\":\"^\\\\ud800$\",\"type\":\"string\"}},\"type\":\"object\"}",
+      "verdict": "refused",
+      "status": 422,
+      "code": "invalid"
+    },
+    {
+      "name": "key sub, BMP escape",
+      "fn": "server: PUT /ns/{ns} (core: namespace document, grant.ParseKeys)",
+      "sub": "user:\\u0062ob",
+      "verdict": "accepted",
+      "grants": [
+        {
+          "grant sub": "user:bob",
+          "request": "GET /ns/re2-keys-a/principal",
+          "verdict": "accepted"
+        },
+        {
+          "grant sub": "user:eve",
+          "request": "GET /ns/re2-keys-a/principal",
+          "verdict": "refused",
+          "status": 403,
+          "code": "forbidden"
+        }
+      ]
+    },
+    {
+      "name": "key sub, lone surrogate",
+      "fn": "server: PUT /ns/{ns} (core: namespace document, grant.ParseKeys)",
+      "sub": "user:\\ud800",
+      "verdict": "refused",
+      "status": 422,
+      "code": "invalid"
+    },
+    {
+      "name": "grant rule, BMP escape",
+      "fn": "server: PUT /r/{ns}/{name} (grant.DecodeLimited, rules.CompileStrict)",
+      "rule": "{\"op\":\"test\",\"path\":\"/resource\",\"schema\":{\"pattern\":\"^\\\\u0064erby$\",\"type\":\"string\"}}",
+      "writes": [
+        {
+          "request": "PUT /r/re2/derby",
+          "verdict": "accepted"
+        },
+        {
+          "request": "PUT /r/re2/cup",
+          "verdict": "refused",
+          "status": 403,
+          "code": "forbidden"
+        }
+      ]
+    },
+    {
+      "name": "grant rule, lone surrogate",
+      "fn": "server: PUT /r/{ns}/{name} (grant.DecodeLimited, rules.CompileStrict)",
+      "rule": "{\"op\":\"test\",\"path\":\"/resource\",\"schema\":{\"pattern\":\"^\\\\udfff$\",\"type\":\"string\"}}",
+      "writes": [
+        {
+          "request": "PUT /r/re2/derby",
+          "verdict": "refused",
+          "status": 401,
+          "code": "unauthenticated"
+        },
+        {
+          "request": "PUT /r/re2/cup",
+          "verdict": "refused",
+          "status": 401,
+          "code": "unauthenticated"
+        }
+      ]
+    }
+  ]
+}
