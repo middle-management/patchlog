@@ -8,13 +8,13 @@ package core
 // core's own code on the gate.
 //
 // Deliberate gaps, all surfaced as 501 "unsupported" (lacks, or a read
-// that panics with it): remote branches, sealed and e2e namespaces,
-// intermediate snapshots (revisions fold from the genesis, or from a
-// pruning horizon). Grants, edge grants, blobs, $schema validation and
-// schemaReads, purges, pruning, retention and archives, gestures listing,
-// author signatures, nonce-required namespaces, local branches and their
-// drafts and merges, tombstones and restores, multi-step items and
-// batches (§7.5, bounded by the transaction's 100 actions) work.
+// that panics with it): sealed and e2e namespaces, intermediate
+// snapshots (revisions fold from the genesis, or from a pruning horizon).
+// Grants, edge grants, blobs, $schema validation and schemaReads, purges,
+// pruning, retention and archives, gestures listing, author signatures,
+// nonce-required namespaces, local and remote branches and their drafts
+// and merges, tombstones and restores, multi-step items and batches
+// (§7.5, bounded by the transaction's 100 actions) work.
 
 import (
 	"context"
@@ -124,6 +124,11 @@ func openDDB(opt Options) (*Engine, error) {
 	}
 	e.rc.maxBytes = opt.ReadCacheBytes
 	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
+	// Registrations are renewed within a week of expiring, as on SQL
+	// (SyncRemotes).
+	if e.opt.Remote.RenewBefore == 0 {
+		e.opt.Remote.RenewBefore = 7 * 24 * time.Hour
+	}
 	e.be = &ddbBackend{e: e, store: store, byID: map[string]*Config{}}
 	return e, nil
 }

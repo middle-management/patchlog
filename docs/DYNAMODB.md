@@ -140,9 +140,10 @@ NS#<ns>                     E2E#<n>                             e2e epoch regist
 NS#<ns>                     E2ESNAP#<name>#<pos12>              e2e sealed snapshot (JWE)
 NS#<ns>                     BLOBEPOCH#<name>#<bid>#<n>          sealed blob form per epoch (pointer)
 NS#<ns>                     ARCH#<name>#<from12>#<to12>         pruning archive record (§8.6): key, url, created, bids
-NS#<ns>                     REMOTE#<origin>#<branch>            registered remote branch (source side)
-NS#<shadow>                 #FOLLOW                             remote base follow state (branch side)
-NS#<shadow>                 NOTICE#<nsId>                       purge notice
+NS#<ns>                     REG#<origin>#<branch>               registered remote branch (source side): atPos, nsPos, prevPos, expires
+NS#<branch>                 #REMOTE                             remote base (branch side): shadow, origin, ns, at, checkpoint, registration
+NS#<branch>                 NOTICE#<nsId>                       purge notice: kind, resource, applied, created, seq
+#REMOTES                    <branch>                            the remote branches (SyncRemotes)
 GRANT#<id32>                #                                   grant: blocks, rootSub, rootKid
 DEK#<ns>#<name|0>           #                                   data key (wrapped, keystore, created)
 BLOB#<owner>#<hash64>       #                                   blob bytes pointer: S3 key (or inline ≤ ~350 KB)
@@ -497,8 +498,8 @@ What landed, beyond the spike:
   them with its queries; `internal/core/ddbreads.go` implements them over
   the table, with per-check handles for the int64 ids the gate's rows
   carry (it only hands them back). What the backend doesn't store reads
-  as empty where nothing of the kind can exist (remote registrations),
-  and as **501 "unsupported"** where a request needs a
+  as empty where nothing of the kind can exist, and as **501
+  "unsupported"** where a request needs a
   feature it lacks (sealed/e2e keys) — so those refusals
   are the reads', not hand-written checks. `gate_test.go` guards the
   embedding that makes this work on SQL (a read missing on `*tx` would
@@ -582,8 +583,8 @@ What landed, beyond the spike:
   backend lacks is its `lacks` 501, asked by the Engine method before
   anything else; everything the server can reach so answers 501 rather
   than falling through to SQL:
-  remote branches, sealed/e2e, rotation. Refused
-  configurations (`encryption`, `base`, `successor`) are 501 at create and change time, as
+  sealed/e2e, rotation. Refused configurations (`encryption`,
+  `successor`) are 501 at create and change time, as
   §10 prescribes ("refuse at Open or at namespace-config time").
 - **One read path.** The serving reads (`ResourceHead/Raw/Rev/Log`,
   `NamespaceHead/Rev/Log/Heads`, the events and the long-poll) are the
@@ -715,6 +716,26 @@ What landed, beyond the spike:
   namespace's configuration its check read (`configPins`: a base its
   branches', a branch its base's, the schema namespaces'), so the second
   of two such changes is stale and checked again.
+- **Remote branches** (§G.3), plain ones. The source side:
+  `planRegistration` (split out of SQL's `registerRemote`) decides, and
+  the registration is a `REG#` item written with its "branch" entry,
+  conditioned on the latest entry the checks read; `/branches` and
+  pruning's protection read them. The branch side: a remote branch is
+  a local branch of shadow namespaces, as on SQL, and reads are a local
+  branch's. Creating one checks the genesis and the base's obligations
+  as SQL does (`checkRemoteGenesis`, `remoteObligations`), fetches and
+  verifies the base (`fetchRemote`, shared), mirrors the schema closure
+  by ordinary commits (steps keep their own authors and times), imports
+  each level's shadow with batched puts — unbounded, so not one
+  transaction; each import stamps the shadow's `#META` with a token —
+  and creates the branch in one transaction that checks the tokens and
+  records its base (`#REMOTE`, listed under `#REMOTES`). Following
+  (`SyncRemotes`) records notices and applies the base's purges as the
+  server's entries, to the branch, its branches and the shadows' copies;
+  a branch's own purge removes the shadows' copies too (`finishPurge`).
+  The storage side of following, registering and notices is the
+  backend's (`remoteBases`, `followed`, `registered`, `remoteNotices`).
+  Sealed and e2e bases need encryption, which phase 1 refuses.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the
@@ -740,7 +761,7 @@ entry and `ancestry` across foreign parents.
 Requirements and limits, by design: one instance (no stream
 invalidation — §6 is phase 3), no background loops (retention, sweeps,
 second CDN purges, rotation, remote follow don't start; `ApplyRetention`,
-`SweepBlobs` and `Repurge` work when called).
+`SweepBlobs`, `Repurge` and `SyncRemotes` work when called).
 
 Tests: the API-level suites are backend-agnostic. Every test server —
 the server package's HTTP harness, and `clienttest`'s, which the client,
@@ -761,13 +782,13 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,319 top-level tests (pure unit tests included): 1,118 pass on
-DynamoDB and 201 skip — 165 as unsupported (116 encryption at rest,
-41 remote branches, 6 the SQL write path's hooks, 2 sealed), 36 on
-their own conditions (Postgres-only tests).
+1,319 top-level tests (pure unit tests included): 1,158 pass on
+DynamoDB and 161 skip — 125 as unsupported (116 encryption at rest,
+6 the SQL write path's hooks, 3 sealed), 36 on their own conditions
+(Postgres-only tests).
 The known list is empty: no test answers differently from the SQL
 backends. A test that skips partway has asserted everything before
-its skip, so the phase-1 surface is covered beyond the 1,118.
+its skip, so the phase-1 surface is covered beyond the 1,158.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on

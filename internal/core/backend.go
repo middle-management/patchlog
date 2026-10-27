@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
@@ -45,6 +46,15 @@ type backend interface {
 	// registerRemote is a remote branch's registration with this, its
 	// base's deployment (RegisterRemoteBranch, §G.3).
 	registerRemote(ctx context.Context, req Request, rr RemoteRegistration) (*RegistrationResult, error)
+
+	// remoteBases lists remote branches' bases, by branch name ("" all);
+	// followed records what following one found (notices, purges, the
+	// checkpoint), registered its registration at the base; remoteNotices
+	// lists the notices (§G.3).
+	remoteBases(ctx context.Context, name string) ([]*remoteBase, error)
+	followed(ctx context.Context, b *remoteBase, entries []client.NSEntry, head string, follow bool) error
+	registered(ctx context.Context, b *remoteBase, nsID string, expires time.Time) error
+	remoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error)
 
 	// archives lists the archives of unpurged resources (Archives);
 	// restore puts archived patch sets back (RestoreResource, §D.4).
@@ -135,6 +145,22 @@ func (b sqlBackend) uploadBlob(ctx context.Context, req Request, name string, bi
 
 func (b sqlBackend) registerRemote(ctx context.Context, req Request, rr RemoteRegistration) (*RegistrationResult, error) {
 	return b.e.sqlRegisterRemote(ctx, req, rr)
+}
+
+func (b sqlBackend) remoteBases(ctx context.Context, name string) ([]*remoteBase, error) {
+	return b.e.sqlRemoteBases(ctx, name)
+}
+
+func (b sqlBackend) followed(ctx context.Context, rb *remoteBase, entries []client.NSEntry, head string, follow bool) error {
+	return b.e.sqlFollowed(ctx, rb, entries, head, follow)
+}
+
+func (b sqlBackend) registered(ctx context.Context, rb *remoteBase, nsID string, expires time.Time) error {
+	return b.e.sqlRegistered(ctx, rb, nsID, expires)
+}
+
+func (b sqlBackend) remoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error) {
+	return b.e.sqlRemoteNotices(ctx, ns)
 }
 
 func (b sqlBackend) archives(ctx context.Context, ns, name string) ([]ArchiveRecord, error) {

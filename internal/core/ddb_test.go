@@ -129,8 +129,8 @@ func TestDDBUnsupported(t *testing.T) {
 			t.Fatalf("%s: want 501, got %d", what, ae.Status)
 		}
 	}
-	_, err := e.RemoteNotices(ctx, "demo")
-	check("remote branches", err)
+	_, err := e.Keys(ctx, "demo", Credentials{}, KeysRequest{})
+	check("sealed namespaces", err)
 
 	// Encrypted namespaces are refused at creation: Open refuses a key
 	// store, so as on SQL without one, 422.

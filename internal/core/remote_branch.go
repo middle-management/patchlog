@@ -1427,26 +1427,32 @@ func (t *tx) purgeShadowNS(sh *nsRow) {
 
 // remoteBase is a remote_bases row.
 type remoteBase struct {
-	shadow, branch int64
+	shadow, branch int64 // SQL's rows
 	origin, ns, at string
 	checkpoint     string
 	regNSID        sql.NullString
 	regExpires     sql.NullInt64
 	branchName     string
+	purged         bool // the branch is
 }
 
-func (t *tx) remoteBases(where string, args ...any) []*remoteBase {
-	rows, err := t.Query(`SELECT r.shadow, r.branch, r.origin, r.ns, r.at, r.checkpoint, r.reg_ns_id, r.reg_expires, n.name
-		FROM remote_bases r JOIN namespaces n ON n.ns = r.branch WHERE `+where+` ORDER BY n.name`, args...)
-	t.must(err)
-	defer rows.Close()
+// sqlRemoteBases lists the remote branches' bases, by branch name, or the
+// one of branch name.
+func (e *Engine) sqlRemoteBases(ctx context.Context, name string) ([]*remoteBase, error) {
 	var out []*remoteBase
-	for rows.Next() {
-		b := &remoteBase{}
-		t.must(rows.Scan(&b.shadow, &b.branch, &b.origin, &b.ns, &b.at, &b.checkpoint, &b.regNSID, &b.regExpires, &b.branchName))
-		out = append(out, b)
-	}
-	return out
+	err := e.read(ctx, func(t *tx) error {
+		rows, err := t.Query(`SELECT r.shadow, r.branch, r.origin, r.ns, r.at, r.checkpoint, r.reg_ns_id, r.reg_expires, n.name, n.purged
+		FROM remote_bases r JOIN namespaces n ON n.ns = r.branch WHERE ? = '' OR n.name = ? ORDER BY n.name`, name, name)
+		t.must(err)
+		defer rows.Close()
+		for rows.Next() {
+			b := &remoteBase{}
+			t.must(rows.Scan(&b.shadow, &b.branch, &b.origin, &b.ns, &b.at, &b.checkpoint, &b.regNSID, &b.regExpires, &b.branchName, &b.purged))
+			out = append(out, b)
+		}
+		return nil
+	})
+	return out, err
 }
 
 // RemoteNotice is a purge seen in a remote base's log (§G.3).
@@ -1462,9 +1468,11 @@ type RemoteNotice struct {
 // RemoteNotices lists the purge notices of a remote branch ("" = all), oldest
 // first.
 func (e *Engine) RemoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error) {
-	if err := e.be.lacks("remote branches"); err != nil {
-		return nil, err
-	}
+	return e.be.remoteNotices(ctx, ns)
+}
+
+// sqlRemoteNotices is RemoteNotices on SQL.
+func (e *Engine) sqlRemoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error) {
 	var out []RemoteNotice
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT n.name, x.id, x.kind, x.resource, x.applied, x.created FROM remote_notices x JOIN namespaces n ON n.ns = x.branch
@@ -1488,18 +1496,15 @@ func (e *Engine) RemoteNotices(ctx context.Context, ns string) ([]RemoteNotice, 
 // log since the last check are applied (or recorded as notices, with
 // IgnorePurges), and with Register, registrations are made or renewed.
 func (e *Engine) SyncRemotes(ctx context.Context) error {
-	if err := e.be.lacks("remote branches"); err != nil {
-		return err
-	}
-	var bases []*remoteBase
-	if err := e.read(ctx, func(t *tx) error {
-		bases = t.remoteBases(`n.purged = 0`)
-		return nil
-	}); err != nil {
+	bases, err := e.be.remoteBases(ctx, "")
+	if err != nil {
 		return err
 	}
 	var errs []error
 	for _, b := range bases {
+		if b.purged {
+			continue
+		}
 		if err := e.jobStep(ctx); err != nil {
 			errs = append(errs, err)
 			break
@@ -1547,7 +1552,13 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	follow := !e.opt.Remote.IgnorePurges
+	return e.be.followed(ctx, b, entries, head, !e.opt.Remote.IgnorePurges)
+}
+
+// sqlFollowed records what following a base found (followRemote): each
+// purge in entries as a notice, applied unless follow is off, and head as
+// the new checkpoint.
+func (e *Engine) sqlFollowed(ctx context.Context, b *remoteBase, entries []client.NSEntry, head string, follow bool) error {
 	return e.update(ctx, func(t *tx) error {
 		// The branch's lock first: the checkpoint is read as of it.
 		bn := t.nsByIDLocked(b.branch, lockExclusive)
@@ -1606,20 +1617,14 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 // registration (§G.3). It needs unrestricted read and export at the base,
 // through the endpoint's bearer grant.
 func (e *Engine) RegisterRemote(ctx context.Context, ns string) error {
-	if err := e.be.lacks("remote branches"); err != nil {
+	bs, err := e.be.remoteBases(ctx, ns)
+	if err != nil {
 		return err
 	}
-	var b *remoteBase
-	if err := e.read(ctx, func(t *tx) error {
-		bs := t.remoteBases(`n.name = ?`, ns)
-		if len(bs) == 0 {
-			return notFound()
-		}
-		b = bs[0]
-		return nil
-	}); err != nil {
-		return err
+	if len(bs) == 0 {
+		return notFound()
 	}
+	b := bs[0]
 	if !ValidRemoteOrigin(e.opt.Origin) {
 		return fmt.Errorf("this deployment's origin %q is not an https origin (or http on a loopback host)", e.opt.Origin)
 	}
@@ -1647,8 +1652,13 @@ func (e *Engine) RegisterRemote(ctx context.Context, ns string) error {
 	if nsID == "" || perr != nil {
 		return fmt.Errorf("unexpected registration response %v", res)
 	}
+	return e.be.registered(ctx, b, nsID, expT)
+}
+
+// sqlRegistered records a branch's registration with its base.
+func (e *Engine) sqlRegistered(ctx context.Context, b *remoteBase, nsID string, expires time.Time) error {
 	return e.update(ctx, func(t *tx) error {
-		_, err := t.Exec(`UPDATE remote_bases SET reg_ns_id = ?, reg_expires = ? WHERE shadow = ?`, nsID, expT.UnixMilli(), b.shadow)
+		_, err := t.Exec(`UPDATE remote_bases SET reg_ns_id = ?, reg_expires = ? WHERE shadow = ?`, nsID, expires.UnixMilli(), b.shadow)
 		t.must(err)
 		return nil
 	})

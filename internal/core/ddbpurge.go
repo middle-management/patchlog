@@ -128,6 +128,10 @@ func (b *ddbBackend) finishPurge(ctx context.Context, ns, name string) error {
 	if err := b.deleteArchives(ctx, ns, name); err != nil {
 		return err
 	}
+	// A remote branch's mirrored copy goes too, in every shadow (§G.3).
+	if err := b.purgeShadows(ctx, ns, name); err != nil {
+		return err
+	}
 	hashes, err := b.store.PurgeContent(ctx, ns, name)
 	var files []string
 	if err == nil {

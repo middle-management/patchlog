@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -558,4 +559,185 @@ func (b *ddbBackend) requireNonces(ctx context.Context, ns string, a *actor, gid
 		return asErrOrNil(err)
 	}
 	return apiErr(409, "conflict", "detail", "a schema namespace kept moving")
+}
+
+// --- following the base, and registering with it ---
+
+func (b *ddbBackend) remoteBases(ctx context.Context, name string) ([]*remoteBase, error) {
+	var rbs []*ddb.RemoteBase
+	if name == "" {
+		var err error
+		if rbs, err = b.store.RemoteBases(ctx); err != nil {
+			return nil, ddbAsErr(err)
+		}
+	} else {
+		rb, err := b.store.RemoteBaseOf(ctx, name)
+		if err != nil {
+			return nil, ddbAsErr(err)
+		}
+		if rb != nil {
+			rbs = append(rbs, rb)
+		}
+	}
+	out := make([]*remoteBase, 0, len(rbs))
+	for _, rb := range rbs {
+		n, err := b.store.Namespace(ctx, rb.Branch)
+		if err != nil {
+			return nil, ddbAsErr(err)
+		}
+		x := &remoteBase{origin: rb.Origin, ns: rb.NS, at: rb.At, checkpoint: rb.Checkpoint, branchName: rb.Branch, purged: n == nil || n.Purged}
+		if rb.RegNSID != "" {
+			x.regNSID = sql.NullString{String: rb.RegNSID, Valid: true}
+			x.regExpires = sql.NullInt64{Int64: rb.RegExpires, Valid: true}
+		}
+		out = append(out, x)
+	}
+	return out, nil
+}
+
+// followed is sqlFollowed on DynamoDB: each purge's notice, the purge
+// applied to the branch as one in it would be (propagatePurge: its own
+// entry, its branches', and the shadows' copies), then the checkpoint,
+// moved from the one read — a follow that finds it moved does nothing.
+func (b *ddbBackend) followed(ctx context.Context, rb *remoteBase, entries []client.NSEntry, head string, follow bool) error {
+	cur, err := b.store.RemoteBaseOf(ctx, rb.branchName)
+	if err != nil {
+		return ddbAsErr(err)
+	}
+	if cur == nil || cur.Checkpoint != rb.checkpoint {
+		return nil // followed concurrently
+	}
+	bn, err := b.store.Namespace(ctx, rb.branchName)
+	if err != nil {
+		return ddbAsErr(err)
+	}
+	now := b.e.now().UnixMilli()
+	for i, en := range entries {
+		var names []string
+		switch en.Kind {
+		case "purge":
+			names = []string{en.Resource}
+		case "purge-ns":
+			// Every name the base had, including those it read through
+			// from its own bases.
+			set := map[string]bool{}
+			for _, sh := range b.shadowsOf(ctx, rb.branchName) {
+				ns, err := b.store.ResourceNamesOf(ctx, sh)
+				if err != nil {
+					return ddbAsErr(err)
+				}
+				for _, n := range ns {
+					set[n] = true
+				}
+			}
+			names = sortedKeys(set)
+		default:
+			continue
+		}
+		res := ""
+		if en.Kind == "purge" {
+			res = en.Resource
+		}
+		applied := follow && bn != nil && !bn.Purged
+		if err := b.store.PutNotice(ctx, rb.branchName, ddb.Notice{ID: en.ID, Kind: en.Kind, Resource: res, Applied: applied,
+			Created: now, Seq: uint64(now)*1000 + uint64(i)}); err != nil {
+			return ddbAsErr(err)
+		}
+		if !applied {
+			log.Printf("remote branch %s: %s %v in %s/ns/%s recorded as a notice, not applied", rb.branchName, en.Kind, names, rb.origin, rb.ns)
+			continue
+		}
+		for _, name := range names {
+			if err := b.purgeAsServer(ctx, rb.branchName, name, RemoteAuthor); err != nil {
+				return err
+			}
+		}
+	}
+	if err := b.store.SetCheckpoint(ctx, rb.branchName, rb.checkpoint, head); err != nil && !errors.Is(err, ddb.ErrStale) {
+		return ddbAsErr(err)
+	}
+	return nil
+}
+
+// purgeAsServer purges name in ns and every branch of it as the server
+// (purgeResource of nsops.go): entries recording no grant, the shadows'
+// copies with them.
+func (b *ddbBackend) purgeAsServer(ctx context.Context, ns, name, author string) error {
+	for _, br := range append([]string{ns}, b.branchNames(ctx, ns)...) {
+		if err := b.propagatePurge(ctx, br, name, author, false); err != nil {
+			return err
+		}
+		if err := b.purgeShadows(ctx, br, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// shadowsOf lists the shadows a remote branch reads through, its base's
+// first; none for another namespace.
+func (b *ddbBackend) shadowsOf(ctx context.Context, branch string) []string {
+	rb, err := b.store.RemoteBaseOf(ctx, branch)
+	if err != nil || rb == nil {
+		return nil
+	}
+	var out []string
+	for sh := rb.Shadow; sh != ""; {
+		out = append(out, sh)
+		n, err := b.store.Namespace(ctx, sh)
+		if err != nil || n == nil || n.Base == "" || n.Base[0] != '~' {
+			break
+		}
+		sh = n.Base
+	}
+	return out
+}
+
+// purgeShadows removes name's mirrored copy ("" for every name) from
+// every shadow of ns, if ns is a remote branch: the copy never outlives
+// the branch's purge (purgeShadow of remote_branch.go).
+func (b *ddbBackend) purgeShadows(ctx context.Context, ns, name string) error {
+	for _, sh := range b.shadowsOf(ctx, ns) {
+		hashes, err := b.store.PurgeShadow(ctx, sh, name)
+		if err != nil {
+			return ddbAsErr(err)
+		}
+		files, err := b.store.CollectBytes(ctx, hashes)
+		b.e.removeFiles(files)
+		if err != nil {
+			return ddbAsErr(err)
+		}
+	}
+	return nil
+}
+
+func (b *ddbBackend) registered(ctx context.Context, rb *remoteBase, nsID string, expires time.Time) error {
+	return asErrOrNil(b.store.SetRegistration(ctx, rb.branchName, nsID, expires.UnixMilli()))
+}
+
+func (b *ddbBackend) remoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error) {
+	bases, err := b.remoteBases(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	type seqd struct {
+		n   RemoteNotice
+		seq uint64
+	}
+	var all []seqd
+	for _, rb := range bases {
+		ns, err := b.store.Notices(ctx, rb.branchName)
+		if err != nil {
+			return nil, ddbAsErr(err)
+		}
+		for _, n := range ns {
+			all = append(all, seqd{RemoteNotice{Branch: rb.branchName, ID: n.ID, Kind: n.Kind, Resource: n.Resource, Applied: n.Applied, Created: formatTime(n.Created)}, n.Seq})
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool { return all[i].seq < all[j].seq })
+	out := make([]RemoteNotice, len(all))
+	for i, x := range all {
+		out[i] = x.n
+	}
+	return out, nil
 }

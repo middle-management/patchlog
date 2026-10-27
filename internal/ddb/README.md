@@ -35,7 +35,11 @@ and `DocAt` answers a `*PrunedError` below a horizon. Archives
 `RestoreAttachment` are a purge's and a restore's writes. Gestures
 (gestures.go): `GestureMarks` and `PutGestureMarks` index a commit's
 gestured steps before it; `GestureRevs` lists a gesture's confirmed
-revisions in commit order.
+revisions in commit order. Remote branches: remote.go's `REG#`
+registrations (`Commit.Registration`, `RegistrationOf`,
+`Registrations`); shadow.go's `ImportShadow`, `CreateRemoteBranch`,
+`RemoteBaseOf`, `RemoteBases`, `SetCheckpoint`, `SetRegistration`,
+`PutNotice`, `Notices` and `PurgeShadow`.
 Serving reads are core's, through the same reads: `EntriesBetween` and
 `RevsBetween` (a log's or a chain's range), `HeadAt` (a head as of an
 entry, from the history rows), `ListHeads`, `FoldResource` (crossing

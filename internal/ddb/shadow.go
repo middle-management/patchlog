@@ -284,6 +284,7 @@ func (s *Store) CreateRemoteBranch(ctx context.Context, c *RemoteBranchCreate) (
 	acts := buildCreateTx(s.Table, c.NS, meta, cfg.String(), c.Patches, c.Doc, entry)
 	acts = append(acts, deployFirst(s.Table, now),
 		types.TransactWriteItem{Put: &types.Put{TableName: &s.Table, Item: withKey(keyNSList(c.NS), item{})}},
+		types.TransactWriteItem{Put: &types.Put{TableName: &s.Table, Item: withKey(keyRemoteList(c.NS), item{})}},
 		types.TransactWriteItem{Put: &types.Put{TableName: &s.Table, Item: withKey(keyRemote(c.NS), item{
 			"shadow": avS(c.Shadow), "origin": avS(c.Origin), "ns": avS(c.BaseNS), "at": avS(c.At), "checkpoint": avS(c.At),
 		})}},
@@ -337,4 +338,151 @@ func (s *Store) RemoteBaseOf(ctx context.Context, branch string) (*RemoteBase, e
 	i := item(it)
 	return &RemoteBase{Branch: branch, Shadow: i.s("shadow"), Origin: i.s("origin"), NS: i.s("ns"), At: i.s("at"),
 		Checkpoint: i.s("checkpoint"), RegNSID: i.s("regNsId"), RegExpires: int64(i.n("regExpires"))}, nil
+}
+
+// keyRemoteList lists the remote branches, one item each (RemoteBases).
+func keyRemoteList(ns string) Key { return Key{"#REMOTES", ns} }
+
+// RemoteBases lists every remote branch's base, by branch name.
+func (s *Store) RemoteBases(ctx context.Context) ([]*RemoteBase, error) {
+	in := &dynamodb.QueryInput{
+		TableName:                 &s.Table,
+		KeyConditionExpression:    strptr("PK = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS("#REMOTES")},
+		ConsistentRead:            boolptr(true),
+	}
+	var out []*RemoteBase
+	for {
+		q, err := s.Client.Query(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		for _, it := range q.Items {
+			rb, err := s.RemoteBaseOf(ctx, item(it).s("SK"))
+			if err != nil {
+				return nil, err
+			}
+			if rb != nil {
+				out = append(out, rb)
+			}
+		}
+		if len(q.LastEvaluatedKey) == 0 {
+			return out, nil
+		}
+		in.ExclusiveStartKey = q.LastEvaluatedKey
+	}
+}
+
+// SetCheckpoint moves branch's checkpoint from old to cp; ErrStale if
+// another follow moved it first.
+func (s *Store) SetCheckpoint(ctx context.Context, branch, old, cp string) error {
+	_, err := s.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &s.Table, Key: keyAV(keyRemote(branch)),
+		UpdateExpression:          strptr("SET checkpoint = :n"),
+		ConditionExpression:       strptr("checkpoint = :o"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":n": avS(cp), ":o": avS(old)},
+	})
+	var cf *types.ConditionalCheckFailedException
+	if errors.As(err, &cf) {
+		return ErrStale
+	}
+	return err
+}
+
+// SetRegistration records branch's registration at its base: the
+// registration's latest entry there and when it expires.
+func (s *Store) SetRegistration(ctx context.Context, branch, nsID string, expires int64) error {
+	_, err := s.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &s.Table, Key: keyAV(keyRemote(branch)),
+		UpdateExpression:          strptr("SET regNsId = :i, regExpires = :e"),
+		ConditionExpression:       strptr("attribute_exists(PK)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":i": avS(nsID), ":e": avI(expires)},
+	})
+	return err
+}
+
+// Notice is a purge seen in a remote base's log (§G.3), recorded in the
+// branch's partition, once per entry id. Seq orders them as recorded.
+type Notice struct {
+	ID, Kind, Resource string
+	Applied            bool
+	Created            int64
+	Seq                uint64
+}
+
+// PutNotice records a notice, unless one of its id is recorded already.
+func (s *Store) PutNotice(ctx context.Context, branch string, n Notice) error {
+	applied := "0"
+	if n.Applied {
+		applied = "1"
+	}
+	_, err := s.Client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: &s.Table,
+		Item: withKey(Key{nsPK(branch), "NOTICE#" + n.ID}, item{
+			"id": avS(n.ID), "kind": avS(n.Kind), "resource": avS(n.Resource), "applied": avS(applied), "created": avI(n.Created), "seq": avN(n.Seq),
+		}),
+		ConditionExpression: strptr("attribute_not_exists(PK)"),
+	})
+	var cf *types.ConditionalCheckFailedException
+	if errors.As(err, &cf) {
+		return nil
+	}
+	return err
+}
+
+// Notices lists branch's notices in the order they were recorded.
+func (s *Store) Notices(ctx context.Context, branch string) ([]Notice, error) {
+	var out []Notice
+	err := s.eachItem(ctx, branch, "NOTICE#", func(i item) error {
+		out = append(out, Notice{ID: i.s("id"), Kind: i.s("kind"), Resource: i.s("resource"), Applied: i.s("applied") == "1",
+			Created: int64(i.n("created")), Seq: i.n("seq")})
+		return nil
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	return out, err
+}
+
+// PurgeShadow removes name's content from a shadow, without an entry (its
+// chain mirrors the base's), or, for name "", all of the shadow's
+// (core's purgeShadow and purgeShadowNS). It returns the hashes of the
+// bytes its attachments named, for the caller to collect.
+func (s *Store) PurgeShadow(ctx context.Context, shadow, name string) ([][]byte, error) {
+	if name == "" {
+		if _, err := s.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName: &s.Table, Key: keyAV(keyMeta(shadow)),
+			UpdateExpression:          strptr("SET purged = :one"),
+			ConditionExpression:       strptr("attribute_exists(PK)"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":one": avS("1")},
+		}); err != nil {
+			var cf *types.ConditionalCheckFailedException
+			if errors.As(err, &cf) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return s.PurgeContent(ctx, shadow, "")
+	}
+	_, err := s.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &s.Table, Key: keyAV(keyRes(shadow, name)),
+		UpdateExpression:          strptr("SET #st = :pg REMOVE headCreated, headSize, headDigest, keep, kept, horizonPos, horizonId, horizonBase"),
+		ConditionExpression:       strptr("attribute_exists(PK)"),
+		ExpressionAttributeNames:  map[string]string{"#st": "state"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":pg": avS("purged")},
+	})
+	var cf *types.ConditionalCheckFailedException
+	if errors.As(err, &cf) {
+		return nil, nil // nothing of it here
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := s.deleteKey(ctx, keyDocHead(shadow, name)); err != nil {
+		return nil, err
+	}
+	return s.PurgeContent(ctx, shadow, name)
+}
+
+// ResourceNamesOf lists every resource name of ns, purged ones included.
+func (s *Store) ResourceNamesOf(ctx context.Context, ns string) ([]string, error) {
+	return s.resourceNames(ctx, ns)
 }
