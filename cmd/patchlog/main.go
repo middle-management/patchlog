@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
+//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-store URL|-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
@@ -103,7 +103,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-schema-fetch [-schema-fetch-hosts H,H]] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
+  patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-store URL|-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-schema-fetch [-schema-fetch-hosts H,H]] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
                  [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
   patchlog version
@@ -122,7 +122,7 @@ func usage() {
   patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode history|snapshot] [-o file.jsonl] [-bearer T]
   patchlog import -api URL -ns TARGET -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T]
   patchlog bundle verify -i file.jsonl
-  patchlog archive restore -db patchlog.db [-blob-dir DIR] [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]
+  patchlog archive restore -db patchlog.db [-blob-store URL|-blob-dir DIR] [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]
   patchlog schema import -api URL -ns NS [-bearer T] [-author A] [-name NAME] [-dry-run] [-json] URL|FILE...
   patchlog health [-timeout 2s] [URL]   (exit 0 if URL, default http://localhost:8080/_health, answers 200)
 
@@ -134,7 +134,7 @@ func serve(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", ":8080", "listen address")
 	db := fs.String("db", envOr("PATCHLOG_DB", "patchlog.db"), "SQLite database path, or a Postgres URL (postgres://user:pass@host/db, Addendum D.8); default $PATCHLOG_DB, else patchlog.db")
-	blobDir := fs.String("blob-dir", envOr("PATCHLOG_BLOB_DIR", ""), "directory blob bytes are stored in; default $PATCHLOG_BLOB_DIR, else <db>.blobs next to a SQLite file. On Postgres every instance must share it (a shared volume); without one, bytes are stored in the database")
+	blobs := addBlobFlags(fs)
 	origin := fs.String("origin", "http://localhost:8080", "canonical origin (§G.1)")
 	dev := fs.Bool("dev", false, "disable authentication (development only); X-Author names the author")
 	pg := fs.Bool("playground", true, "serve the web playground at /playground/")
@@ -340,9 +340,12 @@ func serve(args []string) {
 			log.Fatal(err)
 		}
 	}
-	opt := core.Options{Path: *db, BlobDir: *blobDir, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys, OperatorKeyHistory: history, JWKSURI: *jwksURI,
+	opt := core.Options{Path: *db, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys, OperatorKeyHistory: history, JWKSURI: *jwksURI,
 		Limits: limits, Maximums: max, GrantCacheEntries: *grantCache, DocCacheBytes: cacheBytes[0], ReadCacheBytes: cacheBytes[1], Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks,
 		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke, GroupCommit: *groupCommit, GroupCommitWait: *groupWait, StoreCompression: *storeCompression}
+	if err := blobs.apply(&opt); err != nil {
+		log.Fatal(err)
+	}
 	if opt.GroupCommit < 1 {
 		opt.GroupCommit = 1 // off
 	}

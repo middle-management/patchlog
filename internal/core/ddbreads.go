@@ -602,7 +602,7 @@ func (r *ddbReads) openBytes(owner int64, hash []byte) blobContent {
 	if file == "" {
 		return memContent(data)
 	}
-	f, err := r.e.blobs.open(file)
+	f, err := r.e.openStored(r.ctx, file)
 	r.must(err)
 	return fileContent(f)
 }

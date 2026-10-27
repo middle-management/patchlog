@@ -43,7 +43,7 @@ and serves immutable, CDN-cacheable revisions.
 | Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces (`GET /ns/{ns}/principal` tells one that asks) | §C.7, §7.4 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge (a sealed namespace's documents, log, long-polls and events then answer `410 purged` with `head`, which followers, services, the janitor and remote branches take as the purge) | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
-| Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, `nosniff` and `Content-Security-Policy: sandbox` on every blob response, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in files under `-blob-dir`, encrypted per resource at rest; sealed and e2e specifics to come) |
+| Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, `nosniff` and `Content-Security-Policy: sandbox` on every blob response, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in a directory or an S3 bucket, `-blob-store`, encrypted per resource at rest; sealed and e2e specifics to come) |
 | Cache-Control classes and cache tags | §9 | ✅ (tag purges over HTTP with `-purge-url`, default: log; a local Varnish CDN in the compose stack; private content cached at the edge only for reads a verifying edge vouches for, with `-edge-secret`) |
 | Grants (Biscuit v3, §C.8), narrowing, sealing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
 | Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices, bases that are branches, sealed and e2e bases | §G.3, §G.5.2 | ✅ (mirrored up front) |
@@ -73,8 +73,7 @@ and serves immutable, CDN-cacheable revisions.
   remote branches of a base that is itself a remote branch (§G.3). Bundles (§G.4) are implemented
   as `patchlog export/import`; merging a remote branch back is a bundle or merge-tool task.
 - **Archives other than `file://`** (§8.6), e.g. object storage.
-- **Blob gaps** (§7.8): bytes live in files on a local or shared filesystem (`-blob-dir`, see
-  [Blob storage](#blob-storage)), not in object storage (D.2, D.8); importing a private or
+- **Blob gaps** (§7.8): importing a private or
   sealed source into an e2e target, which re-encrypts each blob and rewrites its references to
   the new ids (a MAY of §G.5.1, for a client holding the target's keys), isn't implemented; no
   resumable uploads. Ranges of sealed blobs are served over the sealed bytes (§E.2.2), so a
@@ -658,10 +657,11 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   rest (Addendum E.1) a purge also destroys the data keys, which makes those leftovers
   unreadable: use it where purges must be final. Blob files are deleted, not erased (see
   [Blob storage](#blob-storage)).
-- **Blob files** need `-blob-dir` (or `PATCHLOG_BLOB_DIR`), a directory every instance mounts
-  (a shared volume, NFS, …). Without it the core logs so at startup and keeps blob bytes in
-  the database (`bytea`), as before; mixing is possible (rows say where their bytes are), but
-  an instance without the directory can't serve bytes stored in files.
+- **Blob files** need a blob store every instance shares: `-blob-store s3://…` (an S3
+  bucket), or `-blob-dir` on a volume every instance mounts (a shared volume, NFS, …); see
+  [Blob storage](#blob-storage). Without one the core logs so at startup and keeps blob bytes
+  in the database (`bytea`), as before; mixing is possible (rows say where their bytes are),
+  but an instance without the store can't serve bytes stored in it.
 - **Several instances** can share the database (rolling deploys, horizontal scaling). Writes
   take transaction-scoped advisory locks per namespace, `pg_advisory_xact_lock(0x504c, ns)`,
   in ascending order. Writes that change a namespace's configuration or state (config writes,
@@ -815,39 +815,58 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   Postgres.
 - **Tests.** `PATCHLOG_TEST_PG=postgres://postgres@localhost:5432/postgres make test-pg` runs
   the storage-dependent tests with a fresh database per test (`internal/pgtest`); CI does the
-  same against a `postgres:16` service container.
+  same against a `postgres:16` service container. `PATCHLOG_TEST_BLOBS=s3://bucket?region=…&endpoint=…`
+  (with `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) moves the API suites' blob bytes to S3,
+  a prefix per test, on any backend (`internal/testenv`); `make test-s3` runs them against
+  MinIO in Docker.
 
 ### Blob storage
 
-Blob bytes (§7.8) are files under the blob directory; their rows in `blob_bytes` (and stored
-sealings' rows in `blob_epochs`, §E.2.2) stay in the database and decide which bytes exist
-(`internal/core/blobstore.go`).
+Blob bytes (§7.8) are objects of a blob store — files under a directory, or objects of an S3
+bucket; their rows in `blob_bytes` (and stored sealings' rows in `blob_epochs`, §E.2.2; on
+DynamoDB, the `BYTES#` items) stay in the database and decide which bytes exist
+(`internal/core/blobstore.go`). Every database backend takes every store.
 
-- **Where.** `-blob-dir DIR` (or `PATCHLOG_BLOB_DIR`); by default `<db>.blobs` next to a SQLite
-  file. `:memory:` keeps bytes in the database, and so does Postgres unless `-blob-dir` is given
-  (see above). `patchlog archive restore` takes the same flag. A directory belongs to one
-  database: the sweep deletes whatever that database doesn't name.
+- **Where.** `-blob-store URL` (or `PATCHLOG_BLOB_STORE`):
+  - `file:///var/lib/patchlog/blobs`: files under a directory. `-blob-dir DIR` (or
+    `PATCHLOG_BLOB_DIR`) is short for it.
+  - `s3://bucket/prefix?region=eu-west-1`: objects under a prefix of an S3 bucket
+    (`internal/s3blobs`). Credentials come from the AWS chain (environment, shared config,
+    instance or task role); the role needs `s3:PutObject`, `s3:GetObject`,
+    `s3:DeleteObject` and `s3:ListBucket` on the prefix. `endpoint=http://host:9000` points
+    at an S3-compatible service (MinIO, SeaweedFS, …), addressing buckets in the path
+    (`path-style=false` turns that off).
+
+  With neither, bytes go to `<db>.blobs` next to a SQLite file; `:memory:` and Postgres keep
+  them in the database, and DynamoDB in its items, at most 350 KiB each (which then caps
+  `blobSize`). Instances sharing a database share its store: an S3 bucket, or a directory
+  on a shared volume. `patchlog archive restore` takes the same flags. A store (a directory,
+  a bucket prefix) belongs to one database: the sweep deletes whatever that database doesn't
+  name.
 - **Layout.** `{owner}/{hh}/{sha256}.{random}`: owner `0` for plaintext shared by every resource
   that names the same bytes, else the resource row whose data key encrypts them (encryption at
   rest), `hh` the hash's first two hex digits. Sealings are `e/{ns}/{hh}/{bid}.{epoch}.{random}`.
   The random suffix makes each stored copy its own file, so deleting a collected one never
   races a new upload of the same bytes on another instance.
-- **Writes** go to a temporary file in the target directory, are synced, renamed into place
-  and the directory synced, before the transaction inserting the row commits; a transaction
-  that rolls back deletes what it wrote. **Deletes** (the grace sweep, pruning, purges, a lost
-  race for a sealing) happen after the deleting transaction commits. A crash in between
-  leaves only orphan files: on the leader, the blob sweep (every ten minutes) also deletes
-  files older than an hour that no row names, and stray temporary files.
-- **Reads** of plaintext are served from the file, ranges reading only what they ask for;
-  bytes encrypted at rest are decrypted whole, sealings are served from their file.
+- **Writes** are stored before the transaction inserting the row commits: in a directory, to
+  a temporary file that is synced, renamed into place and the directory synced; in S3, by
+  one `PutObject`. A transaction that rolls back deletes what it wrote. **Deletes** (the
+  grace sweep, pruning, purges, a lost race for a sealing) happen after the deleting
+  transaction commits. A crash in between leaves only orphans: on the leader, the blob sweep
+  (every ten minutes) also deletes files older than an hour that no row names, and stray
+  temporary files, from a walk of the directory or a listing of the bucket prefix.
+- **Reads** of plaintext are served from the stored object, ranges reading only what they
+  ask for (on S3, a ranged `GET`); bytes encrypted at rest are decrypted whole, sealings are
+  served from their object.
 - **Purges.** With encryption at rest a purge destroys the resource's data key, so its files
   are unreadable even before they are deleted. Plaintext files are deleted once the purge
   commits, but deleting a file is not erasing it: its blocks stay on disk (and in snapshots and
   backups) until overwritten, as with Postgres tuples before `VACUUM`. Use encryption at rest
   where purges must be final.
-- **Backups** take the database and the directory together: one filesystem snapshot, or the
-  database first and then the directory. Files the restored database doesn't name are swept;
-  a blob collected between the two copies answers `500` after a restore.
+- **Backups** take the database and the store together: one filesystem snapshot, or the
+  database first and then the directory (or bucket: versioning keeps deleted objects for a
+  restore to find). Files the restored database doesn't name are swept; a blob collected
+  between the two copies answers `500` after a restore.
 - **Databases from before blob files** need nothing: their rows keep the bytes in the table
   (`file` is NULL) and are served, copied and collected from there; new bytes go to files. To
   move old bytes out, re-upload them, or leave them until they are collected.

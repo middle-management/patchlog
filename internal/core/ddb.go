@@ -88,11 +88,12 @@ func openDDB(opt Options) (*Engine, error) {
 	// and a batch over it is §6.6's 413 itemsPerBatch, not the action cap.
 	opt.Maximums.ItemsPerBatch = min(opt.Maximums.ItemsPerBatch, ddb.MaxBatchItems)
 	opt.Limits.ItemsPerBatch = min(opt.Limits.ItemsPerBatch, opt.Maximums.ItemsPerBatch)
-	// Blob bytes go to files under -blob-dir (one instance: phase 1), or
-	// else into their items, which bounds blobSize by an item's size.
-	var blobs blobStore = tableStore{}
-	if opt.BlobDir != "" {
-		if blobs, err = openBlobStore(opt.BlobDir, "", false); err != nil {
+	// Blob bytes go to the blob store (S3 for several instances; a
+	// directory for one), or else into their items, which bounds blobSize
+	// by an item's size.
+	var blobs BlobStore
+	if opt.BlobStore != nil || opt.BlobDir != "" {
+		if blobs, err = openBlobStore(opt, false); err != nil {
 			return nil, err
 		}
 	} else {

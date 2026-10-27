@@ -85,11 +85,11 @@ func (e *Engine) ddbUploadBlob(ctx context.Context, req Request, name string, bi
 // is one (whose name the BYTES item records), else in the item.
 func (e *Engine) ddbPutBytes(ctx context.Context, hash, data []byte) error {
 	now := e.now().UnixMilli()
-	if e.blobs.root() == "" {
+	if e.blobs == nil {
 		_, err := e.ddb.store.PutBytes(ctx, hash, data, "", now)
 		return asErrOrNil(err)
 	}
-	name, err := e.blobs.put(bytesFile(0, hash), data)
+	name, err := e.putBlob(ctx, bytesFile(0, hash), data)
 	if err != nil {
 		return err
 	}
@@ -118,7 +118,8 @@ func (e *Engine) ddbBlobStats(ctx context.Context) (*BlobStats, error) {
 	if err != nil {
 		return nil, ddbAsErr(err)
 	}
-	s := &BlobStats{Dir: e.blobs.root(), Bytes: len(bytes)}
+	s := e.newBlobStats()
+	s.Bytes = len(bytes)
 	for _, b := range blobs {
 		if b.Attachment {
 			s.Attached++

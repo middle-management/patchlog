@@ -102,9 +102,10 @@ func newEnvWith(t *testing.T, sopts []Option, opts ...envOpt) *tenv {
 	switch {
 	case o.BlobDir == tableBlobs:
 		o.BlobDir = ""
-	case o.BlobDir == "" && (o.Path == ":memory:" || strings.HasPrefix(o.Path, "postgres") || strings.HasPrefix(o.Path, "dynamodb:")):
-		// Blob bytes in files, as a SQLite file has them by default.
-		o.BlobDir = t.TempDir()
+	case o.BlobDir == "" && o.BlobStore == nil && (o.Path == ":memory:" || strings.HasPrefix(o.Path, "postgres") || strings.HasPrefix(o.Path, "dynamodb:")):
+		// Blob bytes in files, as a SQLite file has them by default: in a
+		// temporary directory, or in S3 (testenv.BlobsEnv).
+		testenv.Blobs(t, &o)
 	}
 	e, err := core.Open(o)
 	if err != nil {

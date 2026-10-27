@@ -86,8 +86,8 @@ client-sealed snapshots (E.3).
 
 **Blobs (§7.8).** Attachments per `(res, bid)`; pending uploads per
 `(res, bid, uploader)`, swept by age; reference intervals per revision range;
-bytes keyed by `(owner, hash)` — already offloaded to files under `-blob-dir`
-via the `blobStore` interface; sealed forms per epoch.
+bytes keyed by `(owner, hash)` — already offloaded to a blob store (a
+directory or an S3 bucket, `core.BlobStore`); sealed forms per epoch.
 
 **Background jobs.** Second CDN purges due at a time (`cdn_repurge`);
 retention (§8.6); blob sweep; epoch rotation.
@@ -312,10 +312,10 @@ Their Postgres-only freshness source is the subject of §6.
 Addendum E is application-level and untouched: DEKs, epoch keys, sealed JWEs
 and e2e ciphertext are items keyed as in §3; `KeyStore` stays the wrapping
 abstraction (an AWS deployment would add a KMS adapter — the noted "KMS
-adapters to come" — but that is orthogonal). Blob bytes go to S3 behind the
-existing `blobStore` interface, which already assumes an external byte store;
-`s3://` archives (§8.6, "archives other than file://") land naturally in the
-same bucket setup.
+adapters to come" — but that is orthogonal). Blob bytes go to S3 behind
+`core.BlobStore` (`-blob-store s3://…`, `internal/s3blobs`), which every
+backend shares; `s3://` archives (§8.6, "archives other than file://") land
+naturally in the same bucket setup.
 
 ## 8. Cost and throughput notes
 
@@ -531,10 +531,14 @@ What landed, beyond the spike:
   `storedGrant` became gate logic.
 - **Blobs** (§7.8), with §3's items: attachments (`BLOB#<name>#<bid>`)
   and pending entries (`PEND#<name>#<bid>#<uploader>`) in the
-  namespace's partition, bytes in `BYTES#<sha256>` — inline up to 350 KiB
-  (`MaxInlineBytes`, which then lowers the deployment's `blobSize`), or a
-  file under `-blob-dir` (one instance; S3 behind the same `blobStore`
-  is the multi-instance answer, §7). An upload runs the SQL path's
+  namespace's partition, bytes in `BYTES#<sha256>` — the name of an
+  object of the blob store (`-blob-store`: `s3://…` for several
+  instances, §7; `file://…` or `-blob-dir` for one), or, without a blob
+  store, inline up to 350 KiB (`MaxInlineBytes`, which then lowers the
+  deployment's `blobSize`). Inline stays as the third option, as the
+  database itself is for Postgres without a store: development, tests and
+  deployments whose blobs are small; it needs no bucket, and moving to one
+  later needs nothing (items say where their bytes are). An upload runs the SQL path's
   `gateBlob` over the table's reads, stores the bytes, then writes its
   pending entry conditioned on the configuration and on the uploader's
   version item (`UPL#`), which orders concurrent uploads against
@@ -544,7 +548,8 @@ What landed, beyond the spike:
   gate. `SweepBlobs` deletes expired pending entries and the bytes
   nothing names (by a scan; bytes touched in the last 10 minutes stay,
   for an upload between its two writes), `BlobStats` counts by the same
-  scan, `SweepBlobFiles` removes orphaned files. Not yet: `blob_refs`'s
+  scan, `SweepBlobFiles` removes orphaned objects of the store (an S3
+  listing or a directory walk). Not yet: `blob_refs`'s
   reference intervals, so blobs don't cross branches or batch sources.
 - **`internal/core/ddb.go`, the seam.** `core.Open` branches on
   `ddb.IsURL(opt.Path)`; the Engine keeps a `*ddbBackend` and the write
@@ -634,8 +639,10 @@ The goal is a core that doesn't import the AWS SDK: the DynamoDB backend
 becomes its own Go module, which a build links in to serve
 `dynamodb://`. Until then the work keeps to the shape that move needs:
 
-- AWS-specific code lives only in `internal/ddb` and core's adapter
-  files (`ddb.go`, `ddbreads.go`, `ddbwrite.go`); the rest of core
+- AWS-specific code lives only in `internal/ddb`, `internal/s3blobs`
+  (which doesn't import core: it satisfies `core.BlobStore` with standard
+  library types, and `internal/blobstores` opens it from a URL) and core's
+  adapter files (`ddb.go`, `ddbreads.go`, `ddbwrite.go`); the rest of core
   depends on the gate and its read interface, never on the store.
 - The move takes the adapter files into the module, so core exports what
   they use: `checkReads` (and the row types it returns, or narrower

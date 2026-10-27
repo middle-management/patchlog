@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"io/fs"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,31 +13,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // Blob bytes in files (core/blobstore.go). Like every server test, these
 // run on SQLite and, with PATCHLOG_TEST_PG, on Postgres, with blob files in
-// a temporary directory.
+// a temporary directory, or with PATCHLOG_TEST_BLOBS in S3.
 
-// blobFiles lists the files of the engine's blob directory under prefix,
-// relative to it.
+// blobFiles lists the files of the engine's blob store under prefix.
 func (e *tenv) blobFiles(prefix string) []string {
 	e.t.Helper()
-	dir := e.blobStats().Dir
-	if dir == "" {
-		e.t.Fatal("no blob directory")
+	s := e.e.BlobStore()
+	if s == nil {
+		e.t.Fatal("no blob store")
 	}
 	var out []string
-	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		rel, _ := filepath.Rel(dir, p)
-		rel = filepath.ToSlash(rel)
-		if strings.HasPrefix(rel, prefix) {
-			out = append(out, rel)
+	err := s.List(context.Background(), func(name string, _ int64, _ time.Time) error {
+		if strings.HasPrefix(name, prefix) {
+			out = append(out, name)
 		}
 		return nil
 	})
@@ -46,6 +41,16 @@ func (e *tenv) blobFiles(prefix string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// readBlobFile reads a file of the engine's blob store.
+func (e *tenv) readBlobFile(name string) ([]byte, error) {
+	f, err := e.e.BlobStore().Open(context.Background(), name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
 }
 
 func (e *tenv) expectFiles(prefix string, n int, what string) []string {
@@ -70,7 +75,7 @@ func TestBlobFilesLifecycle(t *testing.T) {
 	if !strings.HasPrefix(files[0], "0/") {
 		t.Fatalf("plaintext bytes in %s, want owner 0", files[0])
 	}
-	if b, err := os.ReadFile(filepath.Join(e.blobStats().Dir, files[0])); err != nil || !bytes.Equal(b, data) {
+	if b, err := e.readBlobFile(files[0]); err != nil || !bytes.Equal(b, data) {
 		t.Fatalf("file content %q %v", b, err)
 	}
 	head := e.create("f", "a", map[string]any{"b": ref(bid, "text/plain", len(data), "")})
@@ -121,7 +126,7 @@ func TestBlobFilesAtRest(t *testing.T) {
 		if strings.HasPrefix(f, "0/") {
 			t.Fatalf("encrypted bytes in %s", f)
 		}
-		b, err := os.ReadFile(filepath.Join(e.blobStats().Dir, f))
+		b, err := e.readBlobFile(f)
 		if err != nil || bytes.Contains(b, []byte(encMarker)) {
 			t.Fatalf("%s holds plaintext (%v)", f, err)
 		}
@@ -162,7 +167,7 @@ func TestBlobFilesSealed(t *testing.T) {
 		}
 	}
 	sealed := e.expectFiles("e/", 1, "one stored sealing")
-	if b, err := os.ReadFile(filepath.Join(e.blobStats().Dir, sealed[0])); err != nil || string(b) != bodies[0] {
+	if b, err := e.readBlobFile(sealed[0]); err != nil || string(b) != bodies[0] {
 		t.Fatalf("sealing file differs (%v)", err)
 	}
 	rr := e.do(req{method: "GET", path: loc, hdr: map[string]string{"Range": "bytes=0-3"}})
@@ -175,44 +180,34 @@ func TestBlobFilesSealed(t *testing.T) {
 }
 
 // The orphan sweep deletes old files no row names and old temporary files,
-// and nothing else.
+// and nothing else. "Old" is past BlobOrphanGrace, shortened here: the
+// files are stored, then those meant to look fresh once it has passed.
 func TestBlobFilesOrphanSweep(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, withBlobTuning)
+	const grace = 2 * time.Second
+	e := newEnv(t, withBlobTuning, func(o *core.Options) { o.BlobOrphanGrace = grace })
 	e.mkNS("o", map[string]any{"read": "public"})
 	data := []byte("named")
 	bid := e.upload("o", "a", "text/plain", data)
 	e.create("o", "a", map[string]any{"b": ref(bid, "text/plain", len(data), "")})
 	named := e.expectFiles("", 1, "the attached blob")[0]
-	dir := e.blobStats().Dir
+	store := e.e.BlobStore()
 	h := strings.Repeat("ab", 32)
-	write := func(rel string, age time.Duration) {
-		p := filepath.Join(dir, filepath.FromSlash(rel))
-		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		old := time.Now().Add(-age)
-		if err := os.Chtimes(p, old, old); err != nil {
-			t.Fatal(err)
+	write := func(names ...string) {
+		for _, name := range names {
+			if err := store.Put(context.Background(), name, []byte("x")); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
-	old, fresh := 2*time.Hour, time.Minute
-	write("0/ab/"+h+".0011223344556677", old)              // orphan bytes
-	write("7/ab/"+h+".0011223344556677", old)              // orphan bytes of a resource
-	write("e/1/ab/"+strings.Repeat("ab", 20)+".1.00", old) // orphan sealing
-	write("0/ab/.tmp-123", old)                            // an interrupted write
-	write("0/ab/"+h+".8899aabbccddeeff", fresh)            // a write yet to commit
-	write("0/ab/.tmp-456", fresh)
-	write("notes.txt", old) // not the store's
-	write("0/README", old)
-	p := filepath.Join(dir, filepath.FromSlash(named))
-	ago := time.Now().Add(-old)
-	if err := os.Chtimes(p, ago, ago); err != nil {
-		t.Fatal(err)
-	}
+	write("0/ab/"+h+".0011223344556677", // orphan bytes
+		"7/ab/"+h+".0011223344556677",              // orphan bytes of a resource
+		"e/1/ab/"+strings.Repeat("ab", 20)+".1.00", // orphan sealing
+		"0/ab/.tmp-123",         // an interrupted write
+		"notes.txt", "0/README") // not the store's
+	time.Sleep(grace + time.Second)      // object stores keep whole seconds
+	write("0/ab/"+h+".8899aabbccddeeff", // a write yet to commit
+		"0/ab/.tmp-456")
 	n, err := e.e.SweepBlobFiles(context.Background())
 	if err != nil || n != 4 {
 		t.Fatalf("swept %d %v", n, err)
@@ -274,7 +269,7 @@ func TestBlobTableStore(t *testing.T) {
 	data := []byte("in the table")
 	bid := e.upload("t", "a", "text/plain", data)
 	head := e.create("t", "a", map[string]any{"b": ref(bid, "text/plain", len(data), "")})
-	if s := e.blobStats(); s.Dir != "" || s.Bytes != 1 || s.Files != 0 || s.Size != int64(len(data)) {
+	if s := e.blobStats(); s.Store != "" || s.Bytes != 1 || s.Files != 0 || s.Size != int64(len(data)) {
 		t.Fatalf("stats %+v", s)
 	}
 	r := e.do(req{method: "GET", path: blobPath("t", "a", bid), hdr: map[string]string{"Range": "bytes=3-5"}})

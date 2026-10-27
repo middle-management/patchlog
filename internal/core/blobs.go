@@ -62,7 +62,6 @@ import (
 	"io"
 	"log"
 	"mime"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -1153,8 +1152,8 @@ type blobContent struct {
 	c io.Closer
 }
 
-func fileContent(f *os.File) blobContent { return blobContent{r: f, c: f} }
-func memContent(b []byte) blobContent    { return blobContent{r: bytes.NewReader(b)} }
+func fileContent(f io.ReadSeekCloser) blobContent { return blobContent{r: f, c: f} }
+func memContent(b []byte) blobContent             { return blobContent{r: bytes.NewReader(b)} }
 
 // readAgain runs open again once if it failed because a file it read was
 // deleted after its snapshot (errBytesGone): the second read sees the
@@ -1250,8 +1249,10 @@ type BlobStats struct {
 	Encrypted int // of them, encrypted under a resource's data key
 	Files     int // of them, in files (blobstore.go); the rest in the table
 	Size      int64
-	// Dir is the blob directory, "" if bytes are stored in the database.
-	Dir string
+	// Store describes the blob store (BlobStore.String), "" if bytes are
+	// stored in the database; Dir is the directory of a file store.
+	Store string
+	Dir   string
 }
 
 // BlobStats counts the rows of blob storage, and sizes their files.
@@ -1259,7 +1260,7 @@ func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) {
 	if e.ddb != nil {
 		return e.ddbBlobStats(ctx)
 	}
-	s := &BlobStats{Dir: e.blobs.root()}
+	s := e.newBlobStats()
 	var files []string
 	err := e.read(ctx, func(t *tx) error {
 		t.must(t.QueryRow(`SELECT COUNT(*) FROM blobs WHERE pruned = 0`).Scan(&s.Attached))
@@ -1278,15 +1279,39 @@ func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) {
 		return nil
 	})
 	s.Files = len(files)
-	for _, f := range files {
-		if fh, err := e.blobs.open(f); err == nil {
-			if info, err := fh.Stat(); err == nil {
-				s.Size += info.Size()
-			}
-			fh.Close()
-		}
+	if err == nil {
+		err = e.sizeFiles(ctx, s, files)
 	}
 	return s, err
+}
+
+func (e *Engine) newBlobStats() *BlobStats {
+	s := &BlobStats{}
+	if e.blobs != nil {
+		s.Store = e.blobs.String()
+		if f, ok := e.blobs.(*fileStore); ok {
+			s.Dir = f.dir
+		}
+	}
+	return s
+}
+
+// sizeFiles adds the sizes of files to s.Size, from a listing of the store.
+func (e *Engine) sizeFiles(ctx context.Context, s *BlobStats, files []string) error {
+	if len(files) == 0 {
+		return nil
+	}
+	sizes := map[string]int64{}
+	if err := e.blobs.List(ctx, func(name string, size int64, _ time.Time) error {
+		sizes[name] = size
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, f := range files {
+		s.Size += sizes[f]
+	}
+	return nil
 }
 
 // --- the grace sweep -------------------------------------------------------------

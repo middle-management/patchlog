@@ -7,16 +7,18 @@ package core
 // the Postgres row locks between them are as before. What a blob store
 // changes is where a row's bytes are:
 //
-//   - tableStore: in the row (data). The default for ":memory:" and for
-//     Postgres without Options.BlobDir.
-//   - fileStore: in a file under a directory, named by the row (file); data
-//     is empty (blob_bytes) or NULL (blob_epochs). The default for a SQLite
-//     file, at "<db path>.blobs".
+//   - no store (Engine.blobs nil): in the row (data). The default for
+//     ":memory:" and for Postgres (DynamoDB: inline in the BYTES# item).
+//   - a BlobStore: in a file of the store, named by the row (file); data is
+//     empty (blob_bytes) or NULL (blob_epochs). fileStore keeps files under
+//     a directory, the default for a SQLite file at "<db path>.blobs";
+//     internal/s3blobs keeps them as objects of an S3 bucket
+//     (Options.BlobStore, opened from -blob-store by internal/blobstores).
 //
 // Rows whose file is NULL keep their bytes in data whichever store the
 // engine has, so a database written before files (or by an instance
-// without a directory) keeps working: nothing is migrated, and such rows
-// go the usual way when collected.
+// without a store) keeps working: nothing is migrated, and such rows go
+// the usual way when collected.
 //
 // Layout. Bytes go to {owner}/{hh}/{sha256 hex}.{random} (owner 0 for the
 // shared plaintext, else the resource whose data key encrypts them, hh the
@@ -27,8 +29,9 @@ package core
 // row and, once committed, its file, while a concurrent upload of the same
 // bytes inserts a new row naming a new file.
 //
-// Writes. A file is written to a temporary file in its directory, synced,
-// renamed into place and its directory synced, before the row naming it is
+// Writes. A file is stored durably (BlobStore.Put: for fileStore a
+// temporary file in its directory, synced, renamed into place and its
+// directory synced; for S3 one PutObject) before the row naming it is
 // inserted; a transaction that rolls back deletes the files it wrote (an
 // ambiguous commit failure leaves them to the sweep). So a committed row
 // always names a complete file, and a crash leaves at most orphan files.
@@ -36,18 +39,21 @@ package core
 // Deletes. A transaction that deletes a row naming a file (gcBytes,
 // purges, prunes) deletes the file after it commits (updateOnce). A crash
 // in between leaves an orphan. Readers whose snapshot predates that commit
-// may find the file gone: they read again (errBytesGone). Deleting is not
+// may find the file gone: they read again (errBytesGone). An open file
+// stays readable once deleted; an S3 object being served streams from the
+// GET that opened it, but a range read after its deletion fails. Deleting is not
 // erasing: a purge's plaintext stays in free blocks (unlike SQLite's
 // secure_delete pages); encryption at rest makes it unreadable instead.
 //
-// The sweep. On the leader, SweepBlobFiles deletes files older than
-// orphanGrace that no row names (and temporary files that old), which only
+// The sweep. On the leader, SweepBlobFiles lists the store and deletes
+// files older than orphanGrace that no row names (and temporary files that
+// old), which only
 // a crash, an ambiguous commit or a lost race leaves. No transaction lasts
 // that long, so a file whose row is yet to commit is never swept.
 //
-// Several instances on Postgres share one directory (a shared volume),
-// and a directory belongs to one database: the sweep deletes whatever that
-// database doesn't name.
+// Several instances share one store (a bucket, or a directory on a shared
+// volume), and a store belongs to one database: the sweep deletes whatever
+// that database doesn't name.
 
 import (
 	"context"
@@ -65,56 +71,70 @@ import (
 	"time"
 )
 
-// orphanGrace is how old an unnamed file must be before the sweep deletes it.
+// orphanGrace is how old an unnamed stored object must be before the sweep
+// deletes it (Options.BlobOrphanGrace).
 const orphanGrace = time.Hour
 
 // errBytesGone reports that a row's file was deleted after the reading
 // transaction's snapshot: a later read sees the row gone too.
 var errBytesGone = errors.New("blob file deleted since the read began")
 
-// blobStore keeps the bytes of blob_bytes and blob_epochs rows.
-type blobStore interface {
-	// put stores data durably under a new name starting with prefix and
-	// returns the name for the row, or "" if the row keeps data itself.
-	put(prefix string, data []byte) (string, error)
-	// open opens a stored name.
-	open(name string) (*os.File, error)
-	// remove deletes a stored name; a missing one is no error.
-	remove(name string) error
-	// root is the directory of a file store, or "".
-	root() string
-}
-
-// tableStore keeps bytes in their rows.
-type tableStore struct{}
-
-func (tableStore) put(string, []byte) (string, error) { return "", nil }
-func (tableStore) remove(string) error                { return nil }
-func (tableStore) root() string                       { return "" }
-func (tableStore) open(name string) (*os.File, error) {
-	return nil, fmt.Errorf("blob file %s: the bytes are stored in files, and no blob directory is configured", name)
+// BlobStore keeps the bytes of blob_bytes and blob_epochs rows outside the
+// database (Options.BlobStore): a directory (NewFileBlobStore, file://
+// URLs, -blob-dir), or an object store such as S3 (internal/s3blobs). Its
+// methods use only the standard library's types, so a store needn't import
+// this package. Names are slash-separated paths chosen by the engine, each
+// stored once and never rewritten.
+type BlobStore interface {
+	// Put stores data durably under name: once it returns, Open finds it.
+	Put(ctx context.Context, name string, data []byte) error
+	// Open opens a stored name for reading; a missing one is an error
+	// matching fs.ErrNotExist. Bytes stored under a name never change, so
+	// a reader may read them lazily (ranges read only what they need).
+	Open(ctx context.Context, name string) (io.ReadSeekCloser, error)
+	// Remove deletes a stored name; a missing one is no error.
+	Remove(ctx context.Context, name string) error
+	// List calls fn for every name stored, with its size and when it was
+	// stored, in no particular order: the orphan sweep and BlobStats.
+	List(ctx context.Context, fn func(name string, size int64, modified time.Time) error) error
+	// String describes the store, for logs and BlobStats: a directory or a
+	// URL.
+	String() string
 }
 
 // fileStore keeps bytes in files under dir.
 type fileStore struct{ dir string }
 
-func (s *fileStore) root() string { return s.dir }
+// NewFileBlobStore returns the store keeping blob bytes in files under dir,
+// creating it if need be (-blob-dir, file:// URLs).
+func NewFileBlobStore(dir string) (BlobStore, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(abs, 0o700); err != nil {
+		return nil, fmt.Errorf("blob directory: %w", err)
+	}
+	return &fileStore{dir: abs}, nil
+}
+
+func (s *fileStore) String() string { return s.dir }
 
 func (s *fileStore) path(name string) string { return filepath.Join(s.dir, filepath.FromSlash(name)) }
 
-func (s *fileStore) put(prefix string, data []byte) (string, error) {
-	var suffix [8]byte
-	rand.Read(suffix[:])
-	name := prefix + "." + hex.EncodeToString(suffix[:])
+// Put writes a temporary file in the name's directory, syncs it, renames
+// it into place and syncs the directory: a crash leaves the whole file or
+// none (and at worst a temporary file, for the sweep).
+func (s *fileStore) Put(_ context.Context, name string, data []byte) error {
 	full := s.path(name)
 	dir := filepath.Dir(full)
 	created, err := s.mkdirs(dir)
 	if err != nil {
-		return "", err
+		return err
 	}
-	f, err := os.CreateTemp(dir, ".tmp-*")
+	f, err := os.CreateTemp(dir, tmpPrefix+"*")
 	if err != nil {
-		return "", err
+		return err
 	}
 	_, err = f.Write(data)
 	if err == nil {
@@ -128,16 +148,19 @@ func (s *fileStore) put(prefix string, data []byte) (string, error) {
 	}
 	if err != nil {
 		os.Remove(f.Name())
-		return "", err
+		return err
 	}
 	// The new entry, and those of directories just created, survive a crash.
 	for _, d := range append([]string{dir}, created...) {
 		if err := syncDir(d); err != nil {
-			return "", err
+			return err
 		}
 	}
-	return name, nil
+	return nil
 }
+
+// tmpPrefix starts the names of a fileStore's temporary files.
+const tmpPrefix = ".tmp-"
 
 // mkdirs creates dir and its missing parents under s.dir, and returns the
 // parents whose entries changed (to sync).
@@ -171,9 +194,11 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 
-func (s *fileStore) open(name string) (*os.File, error) { return os.Open(s.path(name)) }
+func (s *fileStore) Open(_ context.Context, name string) (io.ReadSeekCloser, error) {
+	return os.Open(s.path(name))
+}
 
-func (s *fileStore) remove(name string) error {
+func (s *fileStore) Remove(_ context.Context, name string) error {
 	err := os.Remove(s.path(name))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -181,35 +206,65 @@ func (s *fileStore) remove(name string) error {
 	return err
 }
 
-// openBlobStore picks the engine's blob store (Options.BlobDir).
-func openBlobStore(dir, path string, pg bool) (blobStore, error) {
+func (s *fileStore) List(ctx context.Context, fn func(name string, size int64, modified time.Time) error) error {
+	return filepath.WalkDir(s.dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return ctx.Err()
+		}
+		info, err := d.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(s.dir, p)
+		if err != nil {
+			return nil
+		}
+		return fn(filepath.ToSlash(rel), info.Size(), info.ModTime())
+	})
+}
+
+// openBlobStore picks the engine's blob store: Options.BlobStore, else a
+// directory (Options.BlobDir, by default "<db path>.blobs" next to a
+// SQLite file), else nil, the bytes then kept in their rows (":memory:",
+// and Postgres without either).
+func openBlobStore(opt Options, pg bool) (BlobStore, error) {
+	switch {
+	case opt.BlobStore != nil && opt.BlobDir != "":
+		return nil, errors.New("core: give BlobStore or BlobDir, not both")
+	case opt.BlobStore != nil:
+		return opt.BlobStore, nil
+	}
+	dir := opt.BlobDir
 	if dir == "" {
 		switch {
 		case pg:
-			log.Print("blob bytes are stored in the database: give -blob-dir (a directory every instance shares) to store them in files")
-			return tableStore{}, nil
-		case path == ":memory:":
-			return tableStore{}, nil
+			log.Print("blob bytes are stored in the database: give -blob-store (an s3:// bucket, or a file:// directory every instance shares) to store them outside it")
+			return nil, nil
+		case opt.Path == ":memory:":
+			return nil, nil
 		}
-		dir = path + ".blobs"
+		dir = opt.Path + ".blobs"
 	}
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(abs, 0o700); err != nil {
-		return nil, fmt.Errorf("blob directory: %w", err)
-	}
-	return &fileStore{dir: abs}, nil
+	return NewFileBlobStore(dir)
 }
+
+// BlobStore is the engine's blob store; nil when blob bytes are kept in
+// the database.
+func (e *Engine) BlobStore() BlobStore { return e.blobs }
 
 // --- in transactions -----------------------------------------------------------
 
 // storeFile stores data for a row about to be inserted and returns the
-// file name it records, or "" if the row keeps data (tableStore). The file
-// is deleted again if the transaction rolls back.
+// file name it records, or "" if the row keeps data (no blob store). The
+// file is deleted again if the transaction rolls back.
 func (t *tx) storeFile(prefix string, data []byte) string {
-	name, err := t.e.blobs.put(prefix, data)
+	name, err := t.e.putBlob(t.context(), prefix, data)
 	if err != nil {
 		panic(fmt.Errorf("storing blob bytes: %w", err))
 	}
@@ -217,6 +272,22 @@ func (t *tx) storeFile(prefix string, data []byte) string {
 		t.newFiles = append(t.newFiles, name)
 	}
 	return name
+}
+
+// putBlob stores data under a new name starting with prefix and returns
+// the name, or "" without a blob store. The random suffix makes every
+// stored copy its own file (see the top of the file).
+func (e *Engine) putBlob(ctx context.Context, prefix string, data []byte) (string, error) {
+	if e.blobs == nil {
+		return "", nil
+	}
+	var suffix [8]byte
+	rand.Read(suffix[:])
+	name := prefix + "." + hex.EncodeToString(suffix[:])
+	if err := e.blobs.Put(ctx, name, data); err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 // dropFile deletes a file once the transaction that deleted the row naming
@@ -250,21 +321,40 @@ func (t *tx) readFile(name string) []byte {
 
 // openFile opens a file a row names, or panics with errBytesGone if it is
 // gone (deleted after this transaction's snapshot).
-func (t *tx) openFile(name string) *os.File {
-	f, err := t.e.blobs.open(name)
-	if errors.Is(err, fs.ErrNotExist) {
-		panic(fmt.Errorf("%w: %s", errBytesGone, name))
-	}
+func (t *tx) openFile(name string) io.ReadSeekCloser {
+	f, err := t.e.openStored(t.context(), name)
 	t.must(err)
 	return f
 }
 
+// openStored opens a file a row names; errBytesGone if it is gone.
+func (e *Engine) openStored(ctx context.Context, name string) (io.ReadSeekCloser, error) {
+	if e.blobs == nil {
+		return nil, fmt.Errorf("blob file %s: the bytes are stored outside the database, and no blob store is configured", name)
+	}
+	f, err := e.blobs.Open(ctx, name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("%w: %s", errBytesGone, name)
+	}
+	return f, err
+}
+
+// removeTimeout bounds deleting one file of the blob store: deletes run
+// after the transaction that dropped the row committed, whatever became of
+// its request (the sweep retries what fails).
+const removeTimeout = time.Minute
+
 // removeFiles deletes files, logging failures (the sweep retries them).
 func (e *Engine) removeFiles(names []string) {
+	if e.blobs == nil {
+		return
+	}
 	for _, n := range names {
-		if err := e.blobs.remove(n); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), removeTimeout)
+		if err := e.blobs.Remove(ctx, n); err != nil {
 			log.Printf("blob store: %v", err)
 		}
+		cancel()
 	}
 }
 
@@ -283,16 +373,19 @@ func epochFile(ns int64, bid []byte, e int) string {
 
 // --- the orphan sweep ------------------------------------------------------------
 
-// SweepBlobFiles deletes the files in the blob directory that no row names
-// and that are older than an hour, and temporary files that old: what a
-// crash, an ambiguous commit or a lost race leaves (blobstore.go). It
-// returns how many it deleted.
+// SweepBlobFiles deletes the files of the blob store that no row names
+// and that are older than the grace (an hour), and temporary files that
+// old: what a crash, an ambiguous commit or a lost race leaves
+// (blobstore.go). It returns how many it deleted.
 func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
-	dir := e.blobs.root()
-	if dir == "" {
+	if e.blobs == nil {
 		return 0, nil
 	}
-	cutoff := time.Now().Add(-orphanGrace)
+	grace := e.opt.BlobOrphanGrace
+	if grace <= 0 {
+		grace = orphanGrace
+	}
+	cutoff := time.Now().Add(-grace)
 	// The candidates, listed before the rows are read: a file older than
 	// the grace whose row isn't visible yet would need a transaction that
 	// old.
@@ -302,31 +395,17 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 	}
 	cands := map[group][]string{}
 	var temps []string
-	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		if d.IsDir() {
-			return ctx.Err()
-		}
-		info, err := d.Info()
-		if err != nil || !info.Mode().IsRegular() || !info.ModTime().Before(cutoff) {
+	err := e.blobs.List(ctx, func(name string, _ int64, modified time.Time) error {
+		if !modified.Before(cutoff) {
 			return nil
 		}
-		rel, err := filepath.Rel(dir, p)
-		if err != nil {
+		parts := strings.Split(name, "/")
+		if strings.HasPrefix(parts[len(parts)-1], tmpPrefix) {
+			temps = append(temps, name)
 			return nil
 		}
-		rel = filepath.ToSlash(rel)
-		if strings.HasPrefix(d.Name(), ".tmp-") {
-			temps = append(temps, rel)
-			return nil
-		}
-		parts := strings.Split(rel, "/")
 		var g group
+		var err error
 		switch {
 		case len(parts) == 3:
 			g.table = "blob_bytes"
@@ -338,7 +417,7 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 			return nil // not ours
 		}
 		if err == nil {
-			cands[g] = append(cands[g], rel)
+			cands[g] = append(cands[g], name)
 		}
 		return nil
 	})
@@ -394,7 +473,7 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	for _, f := range orphans {
-		if err := e.blobs.remove(f); err != nil {
+		if err := e.blobs.Remove(ctx, f); err != nil {
 			log.Printf("blob sweep: %v", err)
 			continue
 		}

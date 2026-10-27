@@ -1,6 +1,6 @@
 # Common tasks. `make up` starts the whole stack in Docker; `make dev` runs
 # just the core server natively.
-.PHONY: help build test test-pg vet fmt check dev up up-pg down logs seed cdn-check cdn-restart clean fixture
+.PHONY: help build test test-pg test-s3 vet fmt check dev up up-pg down logs seed cdn-check cdn-restart clean fixture
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-12s %s\n", $$1, $$2}'
@@ -16,6 +16,13 @@ PG_PACKAGES = ./internal/...
 test-pg: ## run the tests on Postgres (PATCHLOG_TEST_PG=postgres://user@host:port/postgres; a fresh database per test)
 	@test -n "$$PATCHLOG_TEST_PG" || (echo "set PATCHLOG_TEST_PG to a Postgres URL whose user may create databases"; exit 1)
 	go test $(PG_PACKAGES)
+
+S3_TEST_URL = s3://patchlog-test?region=us-east-1&endpoint=http://localhost:9000
+
+test-s3: ## run the tests with blob bytes in S3: MinIO in Docker on :9000 (PATCHLOG_TEST_BLOBS; combines with PATCHLOG_TEST_PG or PATCHLOG_TEST_BACKEND)
+	docker start patchlog-minio >/dev/null 2>&1 || docker run -d --name patchlog-minio -p 9000:9000 -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio12345 minio/minio server /data
+	until curl -sf http://localhost:9000/minio/health/live >/dev/null; do sleep 1; done
+	AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio12345 PATCHLOG_TEST_BLOBS='$(S3_TEST_URL)' go test ./...
 
 vet: ## go vet
 	go vet ./...
