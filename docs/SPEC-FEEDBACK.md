@@ -1,666 +1,782 @@
 # Reference-implementation notes for the spec writer
 
-`docs/SPEC.md` mirrors the canonical specification, now at **v0.55**. This file collects what
+`docs/SPEC.md` mirrors the canonical specification, now at **v0.73**. This file collects what
 the reference does that the text doesn't yet describe.
 
 ## Open
 
-From implementing v0.51 and v0.52. Each gives what the reference chose.
+From implementing v0.73, the whole upgrade from v0.55 (branch `spec-v073`). Each gives what the
+text leaves open or says twice, what the reference chose, and where it does so.
 
-1. **The prefix cap and the rate draw** (§C.5). "Once nothing is refused, the request draws
-   one token", but the text doesn't say whether the `400` for more than 100 distinct prefixes
-   counts as a refusal. The reference treats it as one and draws nothing. *Propose:* say so, or
-   rank the cap after the draw.
-2. **Undoing a genesis** (§11.2). "Impossible when the gesture's oldest entry lies at or before
-   the oldest log entry it can read" makes a document's genesis impossible to undo even when
-   nothing is pruned, since a log read from genesis has the genesis as its oldest entry. The
-   reference exempts a log read from genesis. A gesture lying wholly below one named document's
-   horizon but visible in another is undone in the other only, since resource logs carry no
-   markers. *Propose:* "…at or before the oldest entry it can read after a pruning horizon",
-   and say whether such a partial undo is acceptable.
-3. **`/keys` for limited writers at E3** (§E.2.3, §E.3.2). That `/keys` relays a limited
-   grant's own keyring entries, wrapped to its `enc`, without a read of the `keyring` resource,
-   is only implied by "a writer limited to some resources needs [them] to seal". The reference
-   does so. *Propose:* say it outright.
-4. **What a catalog decision depends on** (§B.11.4). "The catalog's and the item's own
-   namespace's entries, which are all it depends on", but a folder move's no-widening check
-   reads `includes` from every trusted content namespace, and a folder's visibility needs a role
-   in some trusted content namespace. Following the text, those decisions carry only the
-   catalog's entry, so a cached one isn't invalidated by a `/roles` or `includes` change
-   elsewhere. *Question:* should `checkpoint` name every namespace a decision read?
-5. **`min` on a namespace whose items the reader can't see** (§A.5). Only a namespace the URL's
-   `at` doesn't cover is `400`. In tree listings every followed namespace is covered, so for a
-   content namespace whose items the reader can't see, `302` versus `503` reveals whether an
-   `ns_id` is in its chain. The reference judges it normally. *Question:* intended?
-6. **Subject-set cookies** (§B.11.5, §C.5). A cookie for `/{catalog}/g/{gs}` can't carry the
-   subjects (the default format allows only `kid`, `p` and `exp`), so a service needs state
-   mapping `gs` to subjects. The reference keeps it; `problems`, `orphans` and manifests, which
-   need namespace-wide `read`, stay `403` under such a cookie. *Propose:* say so, or let a
-   service's format carry more.
-7. **`g/all` and trust changes** (§B.11.5). "`403` at an `at` that includes a namespace it
-   didn't check at issuance" needs the issue time, which the cookie doesn't carry. The reference
-   records issues in memory, and otherwise takes `exp` less 15 minutes, so with a shared key only
-   full-length cookies read a newly trusted namespace for 15 minutes; such listings are
-   `no-store` at the edge meanwhile. A namespace turning private under a live `g/all` cookie is
-   left to the revocation latency. *Question:* should a service's cookie carry an issue time?
-8. **`exchangeRate` at a service** (§6.6, §C.5). The bucket is the origin's; the reference's
-   catalog service keeps one too, per process, so a principal draws on each instance's.
-   *Question:* should services have it, and must it be shared across instances?
-9. **A purged sealed namespace and `min`** (§8.5, §A.5). A service can't judge a `min` against
-   a purged sealed namespace's log, which is `410`; the reference redirects to the current
-   checkpoint. Its read check for such a namespace goes through the gestures listing, the one
-   URL that still answers a limited reader. *Propose:* say how a service checks read on a
-   purged sealed namespace.
-10. **Restores and creates in a purged namespace** (§B.11.4, §8.5). §B.11.4 lists "a name
-    that never existed is `404`, and a purged item `410`" without saying which wins in a purged
-    namespace. Neither the core, which answers `410 purged` for every name there (§8.5), nor a
-    service started after the purge can tell a name that never existed from a purged one, so the
-    reference answers `410` for any name of a purged namespace. A create grant there is still
-    `409` "exists or existed", as §B.11.4 states, though the core would refuse the write with
-    `410`. *Propose:* say that any name of a purged namespace is `410`, for restores and creates.
-11. **The `documentSize` default** (§6.6). Every write re-serialises, checks and validates the
-    whole document, so a small append costs the document's size: measured at 1M documents and
-    5M revisions, an append's p50 is 7 ms at 16 KiB, 15 ms at 1 MiB and 25 ms at 3.5 MiB
-    (docs/CAPACITY.md), and every revision of a large document weighs on caches sized in
-    documents. The reference defaults `documentSize` to 1 MiB and keeps 4 MiB as the deployment
-    maximum a namespace may set (`serve -document-size`, `-max-document-size`). *Propose:* a
-    1 MiB default, and say that a namespace may raise a limit up to the deployment maximum where
-    the deployment's maximum exceeds the default (§6.6 now reads as defaults namespaces lower).
-12. **Log pages of batch entries** (§6.6, §7.1). The log page size counts entries, and a batch
-    entry carries its items, so a page of 1,000 batch entries of 1,000 items holds a million. The
-    reference also bounds a namespace page by resource entries, a batch counting as its items: a
-    page ends before an entry that would take it past the page size, and always holds one entry,
-    so a batch larger than a page is a page of its own. *Propose:* say the page size bounds
-    resource entries too, or that a page may be shorter for that reason.
+The most consequential for other implementations, in the encryption and key areas, come first.
 
-From implementing v0.53 and v0.54.
+1. **The `encryption.epoch` default** (§12.3, §E.2.1). The table gives `epoch` "an integer ≥ 0
+   (default 0)", but v0.55 gave no default and implementations sealed from epoch 1, so existing
+   namespaces' epoch keys are `#1`, and those kids are bound into stored and cached ciphertext.
+   Reading an absent epoch as 0 would renumber them, and a later rotation to 1 would reuse a key a
+   revoked reader may hold. The reference reads an absent epoch as 1 and refuses an explicit 0 at
+   `sealed` and `e2e` (`internal/core/config.go`, "Epochs count from 1"), so a raise from none or
+   at-rest starts at 1 at least; its derived services, Go client and playground read 0 as absent.
+   *Propose:* "default 1", or require `epoch` at `sealed` and `e2e`.
+2. **Which pre-raise keys `/keys` gives after a raise from `sealed`** (Levels, §E.2.3, §2.1).
+   "`/keys` gives the keys of epochs before the raise as at E2", with "the last epoch and `pad`
+   setting before the raise in place of the current ones", but "as at E2" can be read over all the
+   namespace's epochs, where a grant without `nbf` gets only the (post-raise) current epoch and so
+   no pre-raise key at all. The reference applies the §E.2.3 window to the epochs before the raise,
+   with the last of them and the namespace document just before the raise standing for the current
+   ones: a grant without `nbf` gets the last pre-raise epoch, earlier ones need an `nbf`, and that
+   document's `historyEpochs` caps them. Its own key checks for moving pre-raise content (schema
+   resolution, blob copies, a batch's local `source`) use the same window, so the two can't disagree
+   (`internal/core/e2e.go` `preRaiseWindow`, `withPreRaise`, `internal/core/preraise.go`
+   `preRaiseKeysOpen`). A branch's base keys from before the base's raise aren't narrowed by
+   `epochs`, like its base keyring entries (`baseEpochs`). *Question:* is that the intended window?
+3. **Pre-raise keys for grants without `enc`** (§E.2.3, Levels). At E3, `/keys` for a grant whose
+   root block has no `enc` is unspecified; the reference answers `422` (`invalid`), pre-raise keys
+   included (`internal/core/e2e.go` `keysE2E`), although "as at E2" could mean the raw `key` form E2
+   gives such a grant. *Question:* `422`, or the E2 form for pre-raise epochs?
+4. **Where an E3 fold starts across a raise** (Levels, §E.3.1, §7.1). Not stated. The reference's
+   fold redirect for a revision written end to end starts at the later of the latest prune snapshot
+   and the chain's last revision from before the raise (its last live one where that is a
+   tombstone), and `/rev` serves that start document at the level before the raise, so a fold range
+   never holds plaintext or E2-sealed entries (`internal/core/preraise.go` `preRaiseFoldSince`; the
+   client's `internal/client/e2e.go` `foldStart`). *Propose:* say so.
+5. **The prune of a horizon from before a raise** (§7.1, §8.6, Levels). §7.1 serves `/rev/{H}` "as
+   before" where `H` is from before a raise to `e2e`, but after an E3 prune the server keeps no
+   plain document there. The reference serves the stored E3 snapshot when it can compute none
+   (`internal/core/preraise.go`). *Propose:* say that the snapshot is served then.
+6. **A branch's snapshot of a base's pre-raise content** (§E.3.1, Levels). "The epoch that revision
+   is served under" makes the kid name the base (`{base}#{e}`), but the text doesn't say which
+   `pl.ns`, or which namespace's `K_r`, such a snapshot uses. The reference takes `pl.ns` the branch
+   and `K_r` derived with the base's namespace, as the kid gives it; its client fetches that key
+   from `/keys` as at E2 (no sender, since the server held that content before the raise)
+   (`internal/core/e2e.go` `checkSnapshot`, `internal/client/e2e.go` `snapshotKid`). A client whose
+   fold starts at a base's E3 snapshot sealed under a pre-raise epoch still seals under the current
+   epoch where the base kept no plain document. *Propose:* state both namespaces.
+7. **What counts as a blob from before a raise from `sealed`** (Levels, §7.8). Undefined. The
+   reference takes a blob referenced by any pre-raise revision of the resource's chain, served or
+   not; such a blob is never served in the clear, and with no served pre-raise revision referencing
+   it is `404` `no-store`, even where a revision written end to end declares it too
+   (`internal/core/preraise.go`). *Propose:* define it.
+8. **"They also open a public base's namespace log and documents from before the raise"** (Levels,
+   branches of a raised base). "They" can be the branch's `/keys` answer or its readers. The
+   reference reads it as `/keys` giving `K_e` of the base's pre-raise epochs (`internal/core/e2e.go`
+   `baseEpochs`). *Propose:* name the subject.
+9. **Remote branches of a raised source** (§G.5.2, Levels). How a remote branch serves its source's
+   pre-raise content isn't said. The reference serves shadows that recorded a raise as pre-raise
+   content, sealed under the source's epochs with `kid`, `pl` and `K_r` naming the source
+   (`internal/core/e2e.go` `kidName`). It doesn't record each mirrored entry's own epoch, so it
+   falls back to the source's last pre-raise epoch for them (`preRaiseEpoch`). *Question:* should a
+   mirror keep each entry's epoch, and should the text say how such content is served?
+10. **"Raise its level as far as Levels allow"** (§G.5.2, ENC-45). A remote branch's `at` is always
+    before a raise it later sees, so a raise to `e2e` is always refused there, and a literal reading
+    raises to `sealed` in every case. The reference raises to the level the source had just before
+    the raise: a missed `sealed` raise is followed, and a raise from none or at-rest straight to
+    `e2e` leaves the branch as it is, marked for rebase (`internal/core/remote_branch.go`,
+    `Engine.RemoteLevels`). With a key store every level counts as offered, so a source's raise to
+    `e2e` leads to a rebase, never a `502` (F-E9: does a server that offers `e2e` only at creation
+    "lack" the raise?). *Propose:* say which level, and what "lacks a level" means.
+11. **Remote branches that can't see a raise** (§G.5.2, §1). A follower that can't open its source's
+    log (the source is now sealed and gives it no keys) can't "see the raise in the log it follows";
+    the reference infers at least `sealed` from the source serving its documents as JWEs. Where its
+    own raise fails for another reason, it records the level as lacking (its resources answer `502`)
+    and marks a rebase. For a base deeper in `base.chain`, whose log it doesn't follow, it reads the
+    current document at every sync and keeps the last epoch it saw when that read fails, without
+    failing closed (`internal/core/remote_branch.go`, `internal/core/upstream.go`). *Question:* are
+    the inference and the fallback required, allowed or out of scope, and should a deeper base that
+    can't be read fail closed?
+12. **"Epoch start times … never from a mirror"** (§G.5.2). B can't tell A's origin from a mirror
+    that publishes A's origin in `GET /`; the reference trusts the configured endpoint whose root
+    reports the origin (`internal/core/remote_branch.go`). *Question:* what check is meant?
+13. **A remote branch's `/heads` after its base was raised past this server** (§1, §G.3). Only
+    resource URLs answer `502`; `/ns/{ns}/rev/{id}/heads` keeps working at the branch's own level,
+    so `size`, `digest` and `created` of heads the base now hides can still show
+    (`internal/core/remote_branch.go`). *Question:* should those listings answer `502` too, or drop
+    the fields once the base is sealed?
+14. **Derived views across epochs** (§E.2.6, §E.2.3). Whole-response sealing needs every value from
+    one epoch and aggregates are served only sealed whole, so after any rotation `counts` over
+    documents written before and after it are `400` for every reader until all are rewritten, which
+    may never happen. A service whose grant has no `nbf` gets keys from the current epoch only and,
+    after a restart, can't seal views over older revisions under the epoch they're served under
+    (`503`); the reference's services take pre-raise epoch keys without a sender, only for an epoch
+    older than the current one their keyring names no key of, and otherwise need an `nbf` that
+    reaches back (`internal/derived/keys.go` `preRaiseKey`; `internal/index/query.go`). *Question:*
+    should aggregates take the newest epoch among their sources, and should §E.2.6 say services need
+    an `nbf`, or let them have the epochs their sources are served under?
+15. **One derived entry, several revisions** (§E.2.6). An entry has one `kid`, but may carry values
+    of different revisions (a tree node's title from its head, `born` from its first revision); the
+    reference uses the head's epoch. At E3, "the epoch the revision is served under" isn't defined
+    for content a branch reads through from a base, or for a document with no op of its own since a
+    snapshot; the reference takes the sealed op's epoch where its kid names the namespace itself,
+    else the snapshot's kid, else the current epoch (`internal/tree/files.go`,
+    `internal/derived/keys.go`). Where an older epoch's key can never be had, the entry is shown by
+    name only and stored so, rather than `503`. *Propose:* say which epoch, and allow or forbid the
+    name-only entry.
+16. **Rules markers of sealed schema revisions** (§6.1, Levels, §G.3). A schema revision read in the
+    clear carries `X-Schema-Rules: v0.73 | legacy` from the reference
+    (`internal/server/resource_reads.go`, `internal/schema/dialect.go` `RulesHeader`); a remote
+    branch's mirror reads it with a `HEAD` per revision and stores it
+    (`internal/core/remote_branch.go` `fetchRules`); no header means legacy. Sealed and end-to-end
+    namespaces send none, so an E3 client compiles a sealed schema revision (one from before a raise
+    from `sealed` included) as legacy while the core compiles it under its row's marker, and `idn-*`
+    versus `semver`/`period` can differ. A header beside a JWE would show that the document is a
+    schema and roughly when it was written. *Question:* should the marker be part of the protocol (a
+    `/rev` header, a log-entry member, or inside the sealed payload or `pl`), and what does a mirror
+    of a sealed source store?
+17. **Which keyring checks remain** (§E.3.2, §E.2.3, F-E4). The reference's gate refuses a keyring
+    whose `kid` isn't `{ns}#{e}` naming this namespace, whose epoch is after `encryption.epoch`,
+    whose `to` or `from` isn't a 43-character thumbprint, or whose `wrapped` isn't 80 bytes; a
+    `$nonce` may be any string (`internal/seal/keyring2.go` `ParseKeyringV2`). So a raise to `e2e`
+    shares a batch with the keyring line, or comes before it. *Propose:* list the checks.
+18. **Keyring senders and recipients are thumbprints** (§E.3.2, §F.8.1). An auth-mode entry opens
+    only with the sender's public key, but the keyring names senders and recipients by thumbprint.
+    Readers need the admin's key out of band, and the reference adds configuration for it
+    (`internal/client/e2e.go` `WithSenders`, and `-keyring-sender` in `cmd/patchlog`), trusting its
+    own keys and configured ones by default. Tools can't wrap for a reader known only by thumbprint
+    (rotations, successor keyrings), so the reference wraps for readers it knows and, on a rebase
+    with `Switch`, refuses rather than drop one (`internal/merge/rebase.go`). Auth mode
+    authenticates an entry only to its recipient, so the recipient set isn't authenticated as a set:
+    tools take readers from the caller, never from stored `to` members. *Propose:* a public-key
+    member, or say all of this, including that a rebase must not reduce the readers.
+19. **The keyring format change** (§E.3.2, §G.5.1). There is no transition from the pre-v0.63
+    keyring (old shape, base mode, 160-bit recipient ids, old HPKE `info`). The server can't rewrite
+    it; the reference relays an old keyring as stored, refuses writing that format, and blocks E3
+    writes and derived views over it until a key holder runs `patchlog e2e migrate-keyring`
+    (`cmd/patchlog/e2e.go`, `internal/client/e2e.go`). A holder that can't open every epoch can
+    migrate only by leaving epochs out (`-skip-unopenable`). Bundles carry keyring lines verbatim
+    and the gate checks each as the v0.63 document, so a namespace whose keyring was ever stored in
+    the old format can't be bundled or restored, even after migration (`internal/bundle/access.go`).
+    *Question:* may a keyring lack epochs the namespace had, may readers fall back to earlier
+    keyring revisions, and may imports accept the old format for revisions that aren't the head?
+20. **Legacy forms and "stored once, served forever"** (§C.3.1, §E.2.2, §G.4.1, F-C8). This round
+    changed the stored grant shape, the `pl` kinds (`config`, `snapshot`), dropped zip, moved E3 to
+    `K_r` and reshaped `/keys` entries. The reference's readers accept each legacy form
+    (`internal/seal/keys.go` `ParseWrappedKey` reads `resource` and `suite`; `internal/seal/jwe.go`
+    reads `DEF`), the E3 gate refuses old forms on new writes, grant answers sealed before keep the
+    old array (new ones are sealed once under a new key), and bundle grant lines carry only the
+    authority block. *Question:* MUST or MAY readers accept the legacy forms, and may a sealed
+    answer be re-sealed on a format change?
+21. **Values of another resource and order** (§E.2.6, F-E5, F-E6). Is the JWE plaintext the value
+    itself, or `{ member: value }`? The reference seals `{ "file": value }`
+    (`internal/tree/files.go`). Is "order" the result order or the `order` keys of `parents`
+    entries? The reference reads it as the result order: `children` cursors are positions and never
+    encode an order key (`internal/tree/http.go` `childPage`). If keys were meant, `order` members
+    would need sealing.
+22. **Folds of revisions that don't open** (§E.3.1, F-E7). The fold covers patch sets that don't
+    apply, not decryption, `pl` or `kid` failures. The reference flags those too and folds them as
+    `[]` (`internal/client/e2e.go` `fold`). A merge can't replay a fold's `[]`, so such a revision
+    stays a conflict for a person. *Propose:* say so.
+23. **Ranges sealed under "the current epoch"** (§E.2.2, F-E8). The reference seals a namespace
+    range, long-poll answer or event under the epoch current when sealed, keeps a stored range's
+    bytes and seals an evicted one again under the epoch current then (`internal/core/sealed.go`
+    `rangeJob`), so a reader without `nbf` can't read an older stored range. *Propose:* "current
+    when sealed", and say what such a reader gets.
+24. **The snapshot kid below an earlier horizon** (§E.3.1, F-E2). Where only a snapshot is left of
+    the newest content revision, the reference lets that snapshot's kid count where it names the
+    namespace (`internal/client/e2e.go` `snapshotEpoch`). *Propose:* say so.
+25. **`historyEpochs: 0`** (§12.3, §E.2.3). "An integer ≥ 0, no cap without it"; the reference takes
+    0 as the current epoch only (`internal/core/sealed.go` `grantEpochsOf`). For a branch's base
+    epochs it applies no `historyEpochs`. *Propose:* confirm both.
+26. **`/keys` details** (§E.2.3). An explicit `"resources": []` asks for no names (only an absent
+    member gets the default); a token is drawn only for requests answered with keys (`403`, `404`,
+    `410` and `not_offered` draw none, as refused `/edge-grants` don't); with authentication
+    disabled every epoch is given; and v0.55's "never epochs that started after `exp`" is gone, so
+    the reference gives them (`internal/core/sealed.go`, `internal/core/e2e.go`). *Question:* each
+    as intended?
+27. **Replayed items with undeclarable blobs** (§F.3, F-E12). Only kept heads at E3 with blobs a
+    `sealed` op can't declare are exempt; the reference keeps such a head unmerged and offers it
+    again (`internal/merge/plan.go`, `internal/merge/blobs.go` `undeclarableBlob`). Replayed or
+    re-sealed items whose document still references such blobs fail sealing. *Question:* exempt them
+    too?
+28. **HPKE auth mode** (§E.3.2, §E.2.3). Go's standard library offers base mode only, so the
+    reference hand-writes RFC 9180 `mode_auth` (`internal/seal/hpke.go`), checked against RFC 9180
+    A.1.3 and the CFRG vectors for X25519 with AES-256-GCM, which RFC 9180's appendix lacks. §E.2.3
+    never says single-shot. *Propose:* cite RFC 9180 §6.1's single-shot Seal and Open, or consider a
+    signed base-mode wrap.
+29. **Fork discovery without base reads** (§E.3.1, ENC-27). Finding where a branch's chain forks
+    needs the base's `/heads`; readers without that read, and remote bases, can only use the depth
+    rule, which the reference falls back to (`internal/client/e2e.go`). *Propose:* allow the
+    fallback.
+30. **Encrypted archives** (§8.6, §G.5.1.1). How the per-resource key is made and kept is open; the
+    reference derives an X25519 key from the resource data key (HKDF-SHA256, no salt, info
+    `patchlog-archive-key-v1`) with no export command (`internal/core/archiveseal.go`
+    `archiveIdentity`). It pads archive lines when the namespace pads, and at E3 seals archives as
+    sealed bundles too, so their patch sets are encrypted twice. *Question:* is an export path
+    expected, are archive lines padded, and is double encryption at E3 intended?
+31. **The key-window check stores no sealing** (§2.1, §E.2.2). For content not yet sealed, the check
+    uses the epoch a read would fix now but stores no sealing, so the next read may fix a newer one
+    after a rotation (`internal/core/keywindow.go`). *Question:* acceptable, or must the check store
+    it?
 
-13. **Moving a schema** (§6.5, §8.1). Only a fresh `$nonce` is exempt from a schema document's
-    keyword check, so a schema with `$successor` is refused as an unknown keyword, and a schema
-    resource can't be moved as §8.1 describes. The reference leaves it so. *Propose:* exempt a
-    well-formed `$successor` there too, or say schemas aren't moved.
-14. **`If-Modified-Since` where no `Last-Modified` is sent** (§7.1). The reference ignores it at
-    E2 and E3 (RFC 9110 §13.1.3): a `304` there would let a reader probe for the created time the
-    spec hides. *Propose:* say it applies only where `Last-Modified` is sent.
-15. **The reason given for E3** (§7.4, §E.4). "`created` is hidden in the sealed log" isn't so at
-    E3, whose resource and namespace logs serve `created` in the clear (§E.3.1, §F.8.1); the rule
-    holds there for the other reason (exact lengths defeat padding). *Propose:* give that reason
-    for E3.
-16. **`/raw`'s caching and read check** (§7.1). "As the document URL it stands for" leaves the
-    error answers open: the reference caches the `302`, the not-raw `404 not_found` and `404
-    not_offered` with the URL's class (head pointer or immutable) and the tag `r:{ns}/{name}`, and
-    uses the ordinary read check for both raw URLs (a `schemaReads` referrer opens revision paths
-    only). *Propose:* say both.
-17. **`logPageBytes` at E2** (§7.1, §E.2.2). Counting plaintext patch sets leaks exact sizes through
-    where pages end (`X-Log-Next`, the long-poll `X-Revision`) in padded namespaces. The reference
-    counts each entry's JWE as served (the stored one, or one sealed for the page), and stops its
-    scan early on stored plaintext, a lower bound unless a JWE is compressed, which a padded one
-    never is. *Propose:* say "as served" means the sealed bytes at E2.
-18. **Moves across bundles, renames and deployments** (§G.3, §G.4). A deleted resource's snapshot
-    line has no document (§G.4.3) and an upstream import appends only a tombstone, so `$successor`
-    travels in history bundles only (the v0.54 change log says it travels with them); a renamed
-    import (§G.4.4) doesn't rewrite a cross-namespace `/r/{ns2}/{name2}` and the closure (§G.4.2)
-    doesn't follow it; through a remote branch (§G.3) it resolves on the branch's deployment, not
-    the base's. *Propose:* say which of these a successor survives.
-19. **Moves by catalog-limited editors** (§B.11.4, §8.1). Their grants fix one name, so the
-    one-batch move (create the new resource, append to and delete the old) takes two requests or a
-    grant fixed to both names.
-20. **`gone` in §12** doesn't repeat §8.1's "outside sealed and end-to-end namespaces" for
-    `successor`; the reference follows §8.1.
-21. **Which writes count as whole documents** (§6.6). Worth saying that a root `replace` or `add`
-    followed by further operations still counts (the reference allows it), and a root `copy`,
-    `move` or `remove` doesn't.
-22. **Blob headers** (§7.8). Chromium's PDF viewer shows a PDF served with
-    `Content-Security-Policy: sandbox` as a blank page (Atlassian documents it for Jira 8.16+ and
-    exempts `application/pdf`), so raw PDFs don't display inline. The reference also sends both
-    headers on the request-shape `400`s answered before routing, whose body echoes a parameter's
-    name. *Propose:* state the PDF cost or allow an exemption (e.g. as an attachment), and say
-    "every response to a blob URL".
-23. **Trusting a `410`'s successor** (§8.1, §11). A conforming server names none in sealed or
-    end-to-end namespaces, so one there comes from the server (at E3 outside the trust boundary)
-    or a cache. The reference's E3 client reads `$successor` from the verified document at `last`
-    and ignores a `410`'s. *Propose:* say so in §11, and that sealed-namespace clients that don't
-    trust caches do the same before following one automatically.
-24. **Stored digests at rest** (§E.1, §7.4). A server that stores `/heads` `size` and `digest`
-    keeps a plaintext sha-256 of each head's document beside its encrypted content, as ids hash
-    patch sets (§C.7): a dump or backup, even one from before a purge, confirms a guess of a
-    document without a `$nonce`. The reference documents it; it also purges cached `/heads` pages
-    on a resource purge (a `heads:{ns}` tag), beyond §8.3. *Propose:* say this in §E.1, or
-    suggest computing digests at read time at rest.
+From implementing v0.73: requests and the gate (§1, §3, §6, §7).
 
-From implementing v0.55, in the core and the tree service.
-
-25. **`/principal` and operator grants** (§7.4, §C.4). §7.4 shows `/principal` to "any grant that
-    verifies", operator grants included, but §C.4 makes "Any other request under one" `401`. The
-    reference answers `200`, with `can` the operator grant's block verbs and `roles` `[]`. A gateway
-    keys users by root `sub` and `kid` (§H.7), and `kid`s are free-form, so an operator grant whose
-    `kid` equals a namespace key's passed for that key's user, scratch files included, though every
-    core request under it is `401`; the answer doesn't say which kind of key verified it. The
-    reference's gateway reads the operator key history (`jwks_uri`, §C.4, no grant needed; kept five
-    minutes, the last read used if a read fails) and refuses a grant whose root `kid` is in it and
-    whose chain verifies under that key, unless the namespace lists the same key under that `kid`:
-    the core tries the namespace's keys first, so that grant is the namespace's. It tells by reading
-    the namespace head with the grant (`401` means no namespace key verifies it) or, in a public
-    namespace, whose reads ignore a grant, by checking the document's key; while no history has been
-    read, it asks this of every grant. Only a `200` JWK Set counts as a read: a `404` (a proxy that
-    doesn't route `/.well-known`), or a `200` body without a `keys` array (`{}`, a JSON error page),
-    had read as no operator keys, which let every operator grant through. *Propose:* list
-    `/principal` among §C.4's exceptions, and say what `can` and `roles` mean there; either add
-    `"operator": true` to the answer, or say in §H.7 that a gateway tells the keys apart by the
-    history; say whether a grant signed by an operator key that a namespace document also lists
-    under the same `kid` is a namespace grant; and say that a `jwks_uri` answer without a `keys`
-    array is a failed read, not an empty history.
-26. **`/principal` without authentication** (§1, §7.4). Not specified. The reference answers `200`
-    without `principal` and `kid`, with `can` every verb, `roles` `[]` and `writer` as usual, and
-    `404` for an absent namespace. *Propose:* say so.
-27. **`writer.nonce` in sealed namespaces** (§7.4, §E.2.5). The reference says `"required"` at E2,
-    where §E.2.5 requires a fresh `$nonce` in every patch set, `"optional"` at E3, and elsewhere the
-    document's setting. *Propose:* say "required where nonces are required or the namespace is
-    sealed".
-28. **What `writer.limits` holds** (§6.6, §7.4). The reference lists every key of §6.6, the
-    deployment-only ones at the deployment's values, and applies neither allowances nor the
-    key-scope `rate`. It holds a namespace to its own `rulesPerGrant` and `grantSize`, and to its
-    own `rulesPerNamespace` on a creation or a config write that changes `/rules` or
-    `/limits/rulesPerNamespace`, even a write that lowers a count still over the bound; other
-    writes, freezes included, still pass a document an earlier release stored over it. *Propose:*
-    say whether allowances apply, and whether a namespace's own bound holds every config write or
-    only those that change the rules or the bound.
-29. **`catalog.files`'s shape** (§7.4, §H.2). The reference takes `root` as a folder name (a
-    resource name without a dot), doesn't require `ns` to be in `trust` (the gateway checks it,
-    §H.4), allows `x-` members inside `files`, and checks `folder` and `placement` as schema
-    revision paths only. *Propose:* say "`root` is a node name", and confirm the `x-` members under
-    §7.4's rule.
-30. **The sealed form of `file`** (§H.3, §E.2.6). §E.2.6's per-entry `"sealed"` holds values of the
-    entry's own resource, such as a sealed catalog's title under the placement's `K_r`; a value
-    derived from another namespace's resource needs a member of its own. The reference uses `"file":
-    { "sealed": JWE }`, the plaintext `{ "file": { … } }` under the item's `K_r`, with `kid` the
-    item namespace's current epoch and `pl { ns, name, view }` naming the item, padded as that
-    namespace pads. §E.2.6 allows whole-response sealing only when every sealed value comes from one
-    namespace, so for a sealed catalog read whole the reference still seals the response under the
-    catalog's `K_e` and nests `file` sealed per entry, and marks the form provisional. While a
-    sealed content namespace's epoch key can't be fetched it answers `503`, not a listing without
-    `file`, which "stored once, served forever" would keep; stored listings are keyed by URL and
-    reader shape, as kept ones are. *Propose:* define a per-member sealed form for values of another
-    source and allow or forbid the nesting, and say that a stored view is per URL and reader shape.
-31. **`modified` where `created` is unknown, which placements get `file`, and why one lacks it**
-    (§H.3). The reference leaves `modified` out and still gives `size` and `type`, and adds `file`
-    to the placements of every trusted namespace, implicit ones included, not only `files.ns`'s. A
-    placement without `file` is either an end-to-end item or a head the service hasn't read yet, and
-    a tool has to read the namespace document to tell them apart: the reference's gateway leaves out
-    a placement in a sealed or end-to-end namespace that has none, and reads the item from the core
-    for any other entry without `file` or `modified`. *Propose:* say "`modified`, the head's
-    `created`, where known", whether `file` is limited to placements of `files.ns`, and give a
-    reason where `file` is absent, e.g. `"file": { "absent": "e2e" }`.
-32. **Limit refusals for bounds that aren't §6.6 keys** (§6.6, §12, §C.5.2). Prune and `/keys`
-    bodies over 1 MiB are `400 bad_input`. A resource `PATCH` body over 4× the larger of
-    `patchSetSize` and `documentSize` names `documentSize`, with the deployment maximum. A `POST
-    /edge-grants` body over room for 50 grants of `grantSize` is `400 bad_input` with no sizes,
-    following §12's row ("an edge-grant exchange over its limits") and §C.5.2's `400` for more than
-    50 grants; one grant over `grantSize` is `413` once decoded. Where reading stopped, `measured`
-    counts body bytes, not canonical ones. *Propose:* list the oversized body in §C.5.2's table with
-    the 50-grant row.
-33. **The E3 inequality** (§6.6 Values). A config write that fails `3 × (valueSize + pathSize) + 1
-    KiB ≤ patchSetSize` is `422`, but the text names no `limit` for it. The reference names
-    `patchSetSize`, with `measured` the left side as §6.6 defines it for E3 and `max` the
-    `patchSetSize`. *Propose:* say so.
-34. **`429` bucket names** (§6.6). `limit` is `"allowance"` or `"allowance.blobRate"` for an
-    allowance's buckets, which aren't §6.6 keys. *Propose:* name them.
-35. **`measured` for the other limits** (§6.6). `pathSize` and `valueSize`: the first value found
-    too long, quotes included. `branchesPerNamespace`: the live branches including the new one.
-    `blobPending`: pending bytes plus this blob, counting at least 4 KiB each. A blob without
-    `Content-Length`: `blobSize` + 1. Durations and rates: `limit` alone. *Propose:* say "first
-    found" for the first, and the others as chosen.
-36. **`readScope` at verification** (§C.2, §C.4, §C.6). The reference applies a key's `readScope:
-    "resource"` in grant verification, which the core and the services that verify grants locally
-    (§C.6: tree, catalog, index) share. A read grant from such a key that doesn't fix `/resource` is
-    a key-scope `403` on every request, writes included, and `404` on a read of a private namespace
-    at the origin; services treat it as reading nothing. Before, services counted it as reading per
-    resource, and every name passed. *Propose:* confirm in §C.2 that the `403` holds on every
-    request, and say in §C.6 that services apply key scopes, `readScope` included, as the origin
-    does.
-37. **`/principal` and rate limits** (§6.6, §7.4). The reference draws no token for it. *Propose:*
-    say so.
-38. **`measured` shows a document's size to a writer without `read`** (§6.6, §E.2.2). For
-    `documentSize`, `nestingDepth`, `valueSize` and `pathSize`, `measured` describes the resulting
-    document. A writer with `append` but not `read` can send k root copies (`{ "op": "copy", "from":
-    "", "path": "/a" }`) and recover the document's exact canonical size, 2^k·S plus a constant,
-    from one `413`. That holds at E2 too, where `/heads` omits `size` because an exact length
-    defeats padding. Probing with `test` operations, or bisecting the old refusal, already gave it,
-    so this is faster, not new. *Propose:* say whether `measured` for a limit on the resulting
-    document is left out, or rounded to the padding bucket at E2, for a grant that doesn't allow
-    `read` of the resource. The reference follows the current text and gives it.
-
-From implementing v0.55, in the WebDAV gateway (Addendum H), tried with rclone, davfs2, vim and sed.
-
-39. **JSON saves with several candidate bases** (§H.4). Without a tag, the base is the record with
-    the fewest differing paths, and the save conflicts if "the closest records disagree". Taking the
-    closest silently dropped a value the user had set back to an older one (an undo of their own
-    save, together with a new edit). The reference makes a save `409`, naming the paths, when any
-    two of the user's versions, taken as the base, would apply it differently, even if each is safe.
-    The cost: a user whose client sends no `If-Match` and who adds a field, saves, then removes it
-    while editing something else gets one `409` and reloads. *Propose:* say the check runs over all
-    the user's versions, not the closest.
-40. **A revert of someone else's change after a reload** (§H.4). A user reloads after someone else
-    changed `/a`, then sets `/a` back and saves with no tag. The reference merges the save and keeps
-    the other value, so the revert isn't applied and the next read shows it. The data is the same as
-    for a stale editor buffer saved after a preview pane read the newer revision, which the other
-    base would overwrite, so the gateway can't tell the two apart and takes the safe one. *Propose:*
-    say that, without a tag, a save that sets back a value someone else changed is merged, and that
-    only the client's `ETag` settles it.
-41. **Raw saves against every version the user had** (§H.4). Without a tag, "the record with the
-    fewest paths differing" has no paths to count in a raw file, and picking one by size gave false
-    `409`s on a user's own consecutive saves whenever a size equalled an older version's. The
-    reference checks a raw save against every version the user had (the `If-Match` revision, else
-    every version served to them or written by them), and conflicts only if someone else changed the
-    bytes, or deleted or restored the file, after any of them; the user's own writes are remembered
-    as theirs. A user who reloaded early gets one `409` before the next save passes, which keeps the
-    stale-buffer protection of 40. *Propose:* say this for raw files.
-42. **Records per path** (§H.4). The text keeps records per user and file, but clients save to
-    paths, and a path can come to name another file between a read and a save (a rename, an expired
-    tree listing). A save without a tag then found no records and took the head as its base. The
-    reference keeps the document last read whole or written under each path with the records: a save
-    without a tag at a path that now names another document, or none, is `409`, and a `GET` of the
-    path is the reload; the user's own `DELETE` or `MOVE` forgets the path. A save whose `If-Match`
-    names a revision where no file is (a new name in a tree, a flat name that never existed) is
-    `412`, not a create; a flat name someone deleted since stays `409`, as the table has it.
-    *Propose:* say records are per path, and that a base on a path with no file is `412`.
-43. **What counts as others' writes** (§11.3, §H.4). The reference takes the paths that differ
-    between the documents at base and head together with the writes of the log entries between them,
-    so a value changed and changed back is a conflict, and leaves out the user's own entries. It is
-    stricter than §11.3's `theirs`, never looser. Its `409` for a pruned base covers a base it
-    recorded, and a pruned range between base and head, not only one named by `If-Match`. *Propose:*
-    say whether the user's own entries count, and that a pruned base includes recorded bases and
-    ranges.
-44. **Reloading a deleted file** (§H.4). After a `409` because someone else deleted the file, the
-    reload the text asks for is a `GET` that finds it gone (`404`), and the text doesn't say what
-    that reload is worth. In the reference the `409` lasts until that `GET`, after which a save
-    makes the file anew, with a root `replace` that drops any `$successor`. *Propose:* say that the
-    `404` is the reload, and whether the next save may recreate the file.
-45. **Scratch names missing from the list** (§H.6). Real clients use more names than the list has:
-    JetBrains' `*___jb_old___`, which pairs with the listed `*___jb_tmp___` (its safe save moves the
-    original aside under it, a move that is `403` without it); LibreOffice's `.~lock.NAME#`, which
-    in a tree otherwise creates and deletes a real file at each open; vim's `.swx`, `.swo` and the
-    like (`403` in the flat view; vim warns but saves); `sed -i`'s `sedXXXXXX`, which in the flat
-    view is neither a resource name nor listed, so `sed -i` fails there; macOS's `Icon\r`, a custom
-    folder icon whose CR (`Cc`) makes it an invalid title; and the system folders `.Trashes`,
-    `.Trash`, `.Trash-{uid}`, `.Spotlight-V100`, `.fseventsd` and `.DocumentRevisions-V100`, besides
-    `.TemporaryItems`. The names a file manager gives a copy made beside a file contain a space, so
-    no resource has one; in the flat view the reference takes them as scratch only as `COPY`
-    destinations, and a plain `PUT` of one is `403`. It first took every dot folder as scratch, and
-    what was put in one never reached the core; now only listed folders are scratch, and any other
-    is a real folder in a tree. *Propose:* add the names, and say that a folder is scratch only if
-    listed.
-46. **The move-aside window and restores** (§H.5, §H.6). §H.5 accepts vim's create-only `PUT`
-    "within a few seconds", with the head as its base. davfs2 uploads 10 s after the file is closed,
-    so the reference uses 30 s, as for delete-then-write, and takes the base as for any untagged
-    save (the user's records, else the head): with the head as base, edits others made after vim
-    opened the file are overwritten. A restore whose patch set is over `opsPerSet` or `patchSetSize`
-    is written as a whole-document `replace` when its base is the last live document. *Propose:* say
-    30 s and the base in §H.5, and the `replace` for restores in §H.6.
-47. **Guards and deliberate deletes** (§H.6). A refused `PUT` makes that user's `DELETE` of the path
-    `409`, once, for 10 s, and a guard "ends only by time". The reference lets a `DELETE` that
-    carries `If-Match` pass, since a client that sends one means it, but leaves the guard, so
-    rclone's cleanup `DELETE` in the same 10 s is refused once even after the user's own. *Propose:*
-    say whether an `If-Match` `DELETE` passes, and whether it ends the guard.
-48. **Case folding** (§H.2). The reference first folded with full Unicode case folding (`ß` as `ss`,
-    `ﬁ` as `fi`), merging names that Windows (NTFS, simple uppercase mapping) and Linux keep apart;
-    it now uses simple folding. It folds by default (`-case-sensitive` turns it off). "Tools refuse
-    to create a name a sibling has", but a `PUT` onto a sibling's name under another case edited the
-    sibling, so Linux rclone and davfs2, which copy `a.txt` and `A.txt` as two files, wrote one over
-    the other. Now a `PUT`, `COPY` or `MOVE` to a name that matches a sibling only under another
-    case is `409` naming the sibling, and sets a guard, unless the request carries a tag or the user
-    read or wrote that file under this spelling. `MKCOL` under another case is `405` (the folders
-    merge, nothing is lost), and a folder in the middle of a path matches whatever the case.
-    *Propose:* say "simple" folding, and that a case variant is refused with those exceptions.
-49. **Names a gateway receives** (§H.2). Titles are NFC, but clients such as macOS's send NFD: the
-    reference converts it to NFC rather than refusing. It refuses a trailing space or dot on create
-    and rename for every client, since it can't tell a Windows one, and shows an existing one
-    escaped. An escaped title (`a/b.txt` shown as `a%2Fb.txt`) never takes a real title's name, and
-    a numbered duplicate stays within 255 bytes. *Propose:* say NFD is converted, that the trailing
-    rule holds for every client, and how escapes and duplicate numbers meet real titles and the
-    length limit.
-50. **Folders with children the user can't see** (§H.5, §B.11.5). The text deletes a folder only if
-    it has no visible children, which lets a folder be deleted while placements of items the user
-    can't read stay in it. The reference neither names nor deletes them, so they become orphans
-    (§B.7). *Question:* intended, or should such a folder be `409` without naming them?
-51. **A partial move** (§H.5). If the source's delete fails after the copy, the client gets the
-    error and the copy stays; there is no rollback. The reference deletes the source only with
-    `If-Match` naming the revision it copied (in a tree it checks the item's head before the
-    placement goes), so a source that changed since is `409` and stays. A grant that may write the
-    target but not delete the source turned a `MOVE` into a copy: one limited to some resources,
-    whose deletes in a tree are `403`, moving one listed file onto another overwrote the target and
-    then failed, leaving both. The reference now checks that a source in a tree can be deleted
-    before it writes anything; a flat source whose grant lacks `delete` can still be copied before
-    the core refuses the delete. *Propose:* say that the delete names the copied revision, that a
-    failed delete leaves the copy, that a changed source is `409`, and that a `MOVE` checks the
-    source can be deleted before writing the target, so a refused `MOVE` changes nothing.
-52. **Locks and dead properties** (§H.6, §H.8). `PROPPATCH` is "refused, or kept in the gateway";
-    the reference first answered `200` and kept nothing, which is neither. It keeps values per user
-    in memory (1 MiB per user, dropping the least recently set path's rather than refusing), moves
-    them with a `MOVE` and drops them with a `DELETE`. Locks follow the same events: a `DELETE`
-    drops the user's locks on the path and below (RFC 4918 §9.6.1), and a `MOVE` or `COPY` sent with
-    the source's lock token isn't `412` for want of a lock on the destination. *Propose:* say that
-    accepted properties are kept per user and follow the file, and that locks follow `DELETE` and
-    `MOVE`.
-53. **First-seen times** (§H.3, §H.7). §H.3 has a gateway without keys show "the time it first saw
-    the revision, kept across restarts" in sealed and end-to-end namespaces, but §H.7 has it not
-    offer them, so a keyless gateway never meets the case. The reference keeps the times it records
-    in memory only. *Propose:* drop the clause, or say which gateway shows these namespaces without
-    keys.
-54. **Empty files and new names** (§H.1, §H.6). Tools create empty files (`touch`, `.gitkeep`,
-    `__init__.py`) and `LOCK` a name before writing it. The reference makes or truncates a 0-byte
-    raw file for an empty body (over a JSON file it is `400`), and keeps an in-memory placeholder
-    only for a `LOCK` of a new name or a new `.json` name; it first answered `201` for an empty body
-    and kept nothing, so no one else saw the file. *Propose:* say an empty body is a 0-byte raw
-    file, and what a new empty `.json` name is (raw by §H.1, since an empty body isn't I-JSON, yet a
-    placeholder until it is filled).
-55. **A file's type on re-save** (§H.1). The reference works a raw file's type out again from the
-    name and the upload at every save, as the text reads, so a file whose extension isn't in the
-    table, saved by a client that sends no `Content-Type`, becomes `application/octet-stream` though
-    it was stored with another type. *Propose:* say that an existing file keeps its type unless the
-    extension is in the table or the upload names one.
-56. **Headers on a gateway's other answers** (§H.6, and 22). §H.6 asks for `nosniff` and `sandbox`
-    on raw bytes. The reference sends them on every answer, JSON and scratch files and error bodies
-    too, which repeat names the client sent, and answers `POST` to a file with `405` and `Allow`: a
-    `POST` had served the bytes without them. *Propose:* say "every response", as 22 does for blob
-    URLs.
-57. **Who owns `files.ns`, and its flat view** (§H.2, §H.5). A gateway deletes the item "where the
-    tree owns `files.ns`", but it can't see other catalogs to know whether any trusts the namespace.
-    The reference takes the tree to own it when the item is in `files.ns`. Serving that namespace as
-    a writable flat folder beside the tree breaks the tree: a rename there is a copy and a delete
-    (§H.2), so an ordinary file-manager rename or delete tombstones the item and leaves its
-    placement dangling, and tree services don't follow `$successor`. The reference's compose stack
-    served it so; it now serves only the tree over it. *Propose:* say how ownership is known, or
-    that "owns" means the item is in `files.ns`; and that a gateway doesn't serve a tree-owned
-    `files.ns` as a writable flat folder.
-58. **New files: the dry run before the upload** (§H.4). §H.4 lists the upload of a raw file's blob
-    first. The reference dry-runs the placement before the upload, so a refused placement uploads
-    nothing. *Propose:* say that order.
-
-From the second round on v0.55, in the WebDAV gateway and the tree service it lists through.
-
-59. **Which namespace names a user** (§H.7, §C.1, §7.4). "Keyed by the root `sub` and `kid` (from
-    `GET /ns/{ns}/principal`)" is neither unique nor stable. A `kid` names a key in one namespace's
-    document, so `(sub, kid)` is unique only within a namespace, and a gateway serving several, one
-    of them controlled by another party, would merge different people into one user. The reference
-    keys users by the namespace that verified the grant as well. A grant that names several then has
-    several candidates, and the answer changes over time: a namespace created, or given the key,
-    later and sorting first made the same token, or the person's re-minted one, someone else, which
-    dropped their scratch files and records, and a save without a tag then reverted another user's
-    edit. The reference asks the namespace that accepted the token before, then the one that first
-    accepted a grant of its root `kid` (it keeps every served namespace that has, and never drops
-    the first), then the rest sorted. A token now verified as someone else must itself read again
-    each document its old user had, so its next save without a tag is `409`; marking those documents
-    lost for the whole new user had refused the new user's other tokens too. Who each token was
-    verified as is kept past the token, bounded per user: narrowing is offline and free, and each
-    narrowing is a new token the core accepts, so a table bounded only overall let one user push out
-    everyone's entries and hide later switches. A token narrowed to drop the namespace that verified
-    the person's other tokens is another user. Asking several namespaces, a `401` is also all a
-    gateway learns of an absent one (only an operator grant gets the `404`, §7.4), which it can't
-    tell from a revoked grant. *Propose:* say that a user is the namespace, `sub` and `kid`, with
-    the namespace that first verified the `kid` where a grant names several, and that a token
-    narrowed away from it is another user; or return something stable for the key (a thumbprint) or
-    the user in `/principal`. Say too that a token re-verified as another user reloads what it had
-    open, that token alone, and that what a gateway keeps past a token is bounded per user.
-60. **What a user's tokens share** (§H.6, §H.7). §H.6 serves scratch files "only to that user", and
-    §H.7 keys all gateway state by user, but a user's tokens aren't equally able: one narrowed by
-    `ns`, `can`, rules or `via` may read less than the one that wrote a swap file, or than the one
-    whose move aside (§H.5) copied a document into the scratch store. "Keyed by the root `sub` and
-    `kid`" covers re-minted tokens, not narrowed ones. The reference found a token that had dropped
-    a namespace reading the user's scratch files in it, and one narrowed by resource rules or `via`
-    reading backups of documents the core refused it. It keeps what holds content (scratch files,
-    locks with their owner, dead properties) per user and scope, and serves it only to a token whose
-    grant names the namespace. The scope is a digest of the root block's rights (all but `kid`,
-    `sub`, `nbf`, `exp`, `at`, `enc` and `signers`) and of the narrowing blocks without `nbf` and
-    `exp`, with `ns`, `can`, `roles` and `groups` taken as sets, so tokens an issuer mints for a
-    person share one in whatever order it lists them. It first left the root block out, so a token
-    issued with fewer rights, such as one limited to some resources, shared the scratch files of the
-    person's fuller one. A scope holding content is never dropped for room (a new scope is `503`
-    with `Retry-After`), and narrowed tokens' scopes are pooled per chain, the first narrowing they
-    descend from, 8 to a chain, so a delegate that narrows its token over and over fills only its
-    own chain. What holds none (guards, a user's own deletes, move-aside flags, records, the writes
-    a listing waits for) stays per user, and what was read (documents, catalog graphs, tree
-    listings, writer blocks) per token. *Propose:* say that scratch content is never served to a
-    token narrower than the one that wrote it, nor outside the namespaces its grant names, and that
-    caches of what was read are per token; say whether a root block with fewer rights, such as one
-    limited to some resources, is still "the same person" as a re-minted token, and that rights
-    compare as sets. Narrowed tokens' scratch files could be pooled per delegation chain.
-61. **Re-checking grants and the writer block** (§H.7, §7.4, §C.5). §H.7 has a gateway re-check a
-    grant "at least as often as edge grants expire (§C.5)", but a deployment may set that lifetime
-    below the 15-minute cap and a gateway can't learn it. `/principal` is `no-store`, and nothing
-    says how long a writer may rely on its writer block, or what becomes of a user's state when
-    one of their tokens is refused while others are still accepted. The reference re-checks a
-    grant every five minutes by default (a longer setting than the cap is refused), relies on a
-    writer block for 30 seconds or that interval if shorter, and refreshes it on `409 frozen`,
-    `422 nonce` or a limit refusal. A refused token leaves the user's state, and the others are
-    re-checked at their next request. *Propose:* state a maximum, such as five minutes, or expose
-    the lifetime in `/principal` or the deployment document; and say the rest.
-62. **Limited grants and the tree's settings** (§H.7, §7.4, §B.5). §H.7 says a grant limited to some
-    resources "learns what it needs to write from `GET /ns/{ns}/principal`", but the writer object
-    doesn't carry `catalog.files` (`ns`, `root`, `folder`, `placement`) or `catalog.trust`, which
-    live in the namespace document, which needs unrestricted read, and the tree service's listings
-    don't either. Such a grant can list a tree, but can't find `files.root`, say where a new file
-    is created (§H.4) or which namespaces the catalog trusts. The reference's gateway uses the
-    settings as last read with any grant, its own at start included: the one thing read with one
-    grant and used for another, settings and not content, with the core and the tree service still
-    checking every grant. A limited grant meets `404` for the tree until another has opened it,
-    and can't write in it. *Propose:* add `catalog.files` and `trust` to `/principal`'s writer
-    object, or give the tree service an endpoint for them.
-63. **`catalog.title` and untitled placements** (§B.5, §H.2). A listing entry's `title` is the
-    placement's own or, where the catalog sets `catalog.title`, the item's, but §H.2 shows a
-    placement without a `title` by its item's name, and entries don't say which they carry. The
-    reference lists a catalog that sets `catalog.title` from its node documents, not through the
-    tree service. *Propose:* a separate member (e.g. `itemTitle`), or say that `catalog.title` is
-    ignored, or refused, in a file tree.
-64. **Numbering duplicates from a listing** (§H.2, §B.5). "In order of the nodes' creation in the
-    catalog's log" can't be done from a `children` listing, whose entries carry no creation time or
-    sequence, so a tool reads each duplicate node's head and first log page from the core (two
-    requests each) every time the folder is listed. *Propose:* the tree service gives each node's
-    genesis `created` or a sequence, or numbers duplicates itself (see §H.9's question on flagging
-    collisions).
-65. **Untrusted placements** (§H.2, §H.3, §B.6). The tree service marks placements of namespaces the
-    catalog doesn't trust dangling and leaves them out, but §H.2 and §H.3 don't say whether a
-    gateway that builds folders from node documents must too, and the two sources can disagree.
-    The reference leaves them out of both when a tree service is configured, so the fallback lists
-    a folder as the service does, and lists them without one. *Propose:* say that a gateway leaves
-    out placements of namespaces the catalog doesn't trust.
-66. **A tree service that is behind** (§B.5, §H.3, §10). Nothing says what a listing answers while
-    the service has the catalog but not a content namespace it trusts (a fresh database, a rebuild,
-    a namespace trusted lately). The reference answered `200` with every placement dangling, so
-    folders listed empty, which a sync tool mirrors as every file deleted and a gateway took for
-    folders it could delete. Listings are now `503 behind` with `Retry-After`, naming the namespace,
-    until the service has caught up with the catalog and each trusted namespace: until its follower
-    reaches the head it read when catch-up started. It first took the first checkpoint, one log page
-    in, as caught up, so a large namespace's folders listed with files missing. Writes during
-    catch-up don't move that head, so a busy namespace is caught up too, and a restart on the same
-    database doesn't wait again. A trusted namespace it can't follow as configured isn't waited for,
-    or every listing would stay `503`: one purged, one skipped for keys it can't have (Addendum E),
-    one the core refuses it (`401`, `403`) or doesn't have (`404`); its placements dangle (§B.7)
-    until the core serves it the namespace's head. A key fetch that failed for the moment (a
-    transport error, `5xx` or `429`) is still waited for: taken as unfollowable, it let listings go
-    on with that namespace's placements dangling. A catalog that trusts a large new namespace is
-    `503` until the service catches up. The gateway passes the `503` on and deletes no folder
-    meanwhile. *Propose:* say that a tree service answers `503` with `Retry-After` until it has
-    caught up with every namespace it follows, caught up meaning the head read when catch-up
-    started, not the first checkpoint (§10); and tell a trusted namespace that can't be followed as
-    configured, which isn't waited for, from a temporary key-fetch failure, which is.
-67. **Read-your-writes in a file tool** (§B.5, §A.5). §B.5 has a client add `?min={ns}:{ns_id}` from
-    its write's `X-Namespace-Revision`, but not how a file tool keys mins to its writes or how long
-    it keeps sending them. The reference notes every entry a write produced, the catalog's and a
-    content namespace's alike, and sends them as `?min` for the catalog and the namespaces it trusts
-    until a listing that carried them returns `200`, for ten minutes at most. It first dropped them
-    after 30 seconds, and a service lagging longer brought back a renamed file's old name and
-    dropped its new file, so a sync client deleted the one and uploaded the other again. The tree
-    service answers `400` for a `min` naming a namespace it doesn't follow, one it can't follow
-    included, but not which `min` it refused, so the gateway then asks with each namespace's mins
-    separately, drops those refused or reached, and keeps the rest; it had dropped them all after
-    one listing from the node documents. There is no way to ask whether a listing already includes a
-    `min` without waiting for it, so the gateway waits a few seconds and then lists from the node
-    documents; and since a `min` naming a namespace the reader can't see is `400` (§A.5; compare 5),
-    a write-only grant can't wait for its own writes. *Propose:* say that a tool keeps each `min`
-    until a listing that carried it returns, and how a grant without `read` waits; and let a `400`
-    name the `min` refused, so a client needn't ask per namespace.
-68. **Writes against a lagging listing** (§H.3, §H.5). §H.3 lists a tree through the tree service,
-    which lags the core and doesn't wait for other users' writes through the same gateway, and
-    says nothing of writes taking names from it. Resolving a path to what its folder listed, a
-    short lag was enough for a `DELETE` or `MOVE` of a name another user had just changed to
-    delete or re-parent that file, for a folder `DELETE` to take its emptiness from the listing
-    and orphan a file just put in it, and for a `PUT` to make a second file of a sibling's name.
-    The reference checks what the listing named against the node documents before every write:
-    each node still in its folder by that name, and no node by a name the listing lacked. Where
-    they disagree it reads the graph again, and then resolves the path from the node documents, as
-    without a tree service: the stale `DELETE` is `404`, the `PUT` an edit of the renamed file, a
-    `MKCOL` of an existing folder `405`. A `PUT` onto a name only a sibling hidden from the token
-    has makes the new file, so its existence isn't revealed. Against changes the graph doesn't
-    show either (another program's), a delete carries `If-Match` on the head it read (`409`), a
-    move checks the node's document still has the name and parent the path named (`404`), and a
-    folder's emptiness comes from the node documents, never the listing. A grant that can't read
-    them keeps the listing. *Propose:* say that writes resolve, or check, names against the node
-    documents, and take a folder's emptiness only from them.
-69. **Large folders and titled paths** (§B.5, §H.3). §B.5 pages `children` with no total and no
-    advice on how far to page or what to answer for an over-large folder; truncating is dangerous
-    for sync clients, since `rclone sync` deletes what it doesn't see. The reference lists up to
-    10 pages of 1,000 and answers `403` for a folder beyond that, never a cut-short one; a path in
-    or below it finds its name in the node documents, reading only the items whose names match (it
-    had refused every path there, `GET` and `PUT` included). And "a folder is then listed in one
-    request" holds for a listing, but a path of titles still takes one `children` listing per
-    folder on it. *Propose:* say what a tool answers for a folder it won't list whole, give
-    `children` a total, and add a lookup by title path to the tree service, filtered like
-    `children`, which would make a `GET` one request.
-70. **Refusals from the tree service** (§H.4, §B.5). §H.4's table has nothing for the tree
-    service's `401`, `403` or `503`, and where a gateway uses its own grant (local mode) it can't
-    tell the user's grant being refused from its own. The reference answers `502` for a service it
-    can't reach, `503` with the service's `Retry-After` for its `503` and `429`, and `410` for a
-    purge, and passes `401` and `403` through, the token being checked again at its next request
-    as after a core `401`. In local mode a tree-service `401` is `502` naming the service, since
-    it would be taken for the core refusing the gateway's grant. *Propose:* add the rows: a
-    refusal from the tree service is answered as the core's would be, except that one the user
-    can't fix names the service.
-71. **The gateway's own `413`s** (§H.4, §6.6). §H.4 answers a limit exceeded "with the limit and the
-    sizes the core gave", which says nothing of a bound the gateway has itself: its upload buffer,
-    a file-size flag, or a namespace limit it checks before sending (`blobSize` before an upload;
-    `opsPerSet` or `patchSetSize` for a save merged with others' edits). The reference reads
-    `limit`, `measured` and `max` from the core's `413`, or `422` with `code: "limit"`, and answers
-    in one shape, such as `too large: documentSize 1048577 > 1048576 (§6.6): document too large`;
-    a limit without sizes (a duration, a rate) is named alone, and a `413` naming no limit keeps
-    the core's text. Its own bounds take the shape: `too large: blobSize 9 > 8 (§6.6, §7.8)`
-    before any upload, and a flag's bound (`-max-file-size`, `-max-raw-size`) is named by the
-    flag, the bytes read when it was passed being a lower bound, as in 32. *Propose:* say that a
-    gateway names its own bounds in the same shape, with a key of its own.
-
-From two more rounds on v0.55, in the same gateway.
-
-72. **Whose read is the reload** (§H.4). "`409` until the user reloads it" doesn't say whose read
-    counts when several programs share a login, as every program does in local mode. When any read
-    by the user counted, a preview pane's read after an editor's `409` let the editor's retry, a
-    save without a base, overwrite others' edits; and a refused retry that re-armed the user's
-    reload made the next read by any program drop records another program still had open, whose
-    save then overwrote too. The reference asks the refused token itself to read the file in full (its
-    conditional `GET` is answered `200`, not `304`), and a refusal re-arms nothing for the user's
-    other tokens. Programs sharing one grant still can't be told apart. *Propose:* "`409` until the
-    reload that `409` asks for", a full read by the token refused, and say that programs sharing one
-    grant count as one.
-
-From a review of v0.55 as a whole (specification-level proposals; no divergence in the
-reference, which follows the current text in each case). Two companion drafts came out of
-the same review: `docs/TESTVECTORS.md` (the §13 test-vector addendum, with vectors
-computed by the reference) and `docs/CONFORMANCE.md` (a requirement index).
-
-73. **What `GET /`'s `spec` means** (§7). The version is published and compared
-    component-wise, but no section says what a client, a federation peer or a tool should
-    *do* with it: which differences are breaking, whether a peer may refuse on version,
-    and how it relates to the member-tolerance rules (§7.4) that make skew safe. As
-    written it is advertisement that every consumer will invent semantics for.
-    *Propose:* either downgrade it to informational ("carries no conformance meaning;
-    behaviour is discovered per feature"), or define it: a consumer MUST NOT refuse on
-    the version alone (as §7.4 already says for namespace documents), and a deployment
-    increments the version when it changes anything §1's Conformance section makes
-    byte-exact or gate-visible. The reference treats it as informational.
-74. **Edge-grant cookies are host-only** (§C.5.2, §C.5.3). The attributes listed are
-    `Secure`, `HttpOnly`, `SameSite`, `Path`, and a `__Secure-` name, but nothing says
-    the cookie is set **without a `Domain` attribute**. With `Domain`, the `__Secure-`
-    prefix is rejected, so a conforming minter can't set one by accident; stating
-    "host-only" anyway closes the subdomain question for service formats that don't use
-    the prefix, and for edges reading cookies they didn't mint. *Propose:* say "no
-    `Domain` attribute: the cookie is host-only".
-75. **The release merge lock** (§F.9). "A lock resource per catalog base … taking it is
-    an append with `If-Match` that sets the holder when there is none, and releasing it
-    is an append that clears it" is the whole protocol, inside a parenthetical: the
-    document shape, what a holder is, what a stale holder means (a crashed merge
-    service), and whether the lock is advisory (a second service appends with
-    `If-Match` on the same head and wins the race) are left to each deployment, so two
-    merge-service implementations can't share a release namespace. *Propose:* promote it
-    to a short subsection fixing the document shape (`{ "holder": <sub of the merge
-    service>, "plan": <plan digest> }`, empty object when free), that the lock is
-    advisory and claimed by compare-and-append, and how a stale lock is taken over (the
-    resuming service names the stored plan's digest; anything else needs a person).
-76. **`after` and `X-Log-Next`** (§7.1, §7.4). Log ranges page with `X-Log-Next`
-    (implicit `since` continuation), `/heads` pages with `after` + `next`, and the
-    gestures listing uses `X-Log-Next` carrying a composite `{resource}/{id}` that the
-    client passes back as `?after=` — so `after` has two grammars and `X-Log-Next` two
-    meanings. *Propose:* one mechanism: keep `after` as the request parameter everywhere
-    (a plain bound in byte order of name for `/heads`; `{resource}/{id}` for gestures;
-    not needed for log ranges, whose `since` already continues), and keep `X-Log-Next`
-    purely as the response header naming the value to continue from. Rename the gestures
-    continuation so `?after=` never takes a composite form on one endpoint and a plain
-    name on another.
-77. **`compare … "in"` with a scalar right side** (§6.4.2). The grammar allows
-    `"in": { "value": … }` and `"in": { "path": … }`, and "in is true when the left value
-    equals an element of the right-hand array"; a right side that isn't an array isn't
-    covered by "operands of different or unsupported types", since `in` has no stated
-    operand types. The reference treats a non-array right side as false. *Propose:* say
+32. **Resent stored content** (§3.1, §3.4, §F.3, §G.4.4, F-R0). Noncharacters are refused and
+    `Signature` is strict for every request body, and merges, rebases, imports and mirrors resend
+    stored patch sets and signatures; content or signatures stored under v0.55 (a noncharacter, an
+    unlisted `kid`, a short signature) are `400` on resend. The reference checks every request alike
+    (`internal/server/request.go` `jsonv.ParseInput`, `sig.ParseInput`). *Question:* is resent
+    stored content exempt, and should tools drop such signatures?
+33. **Where request-shape errors go** (§7, §6.2, F-R0b). For reads, is the `400` for a malformed id
+    required, or only allowed, before the `401`, `403` or `404` that hides a namespace? Where does
+    an error found late go (inside batch items, in a quoted `If-Match` list)? The reference answers
+    it as the request's own `400`, before authentication and before any step-2 check, never per
+    item, and treats an empty `If-Match`, `If-None-Match` or `Signature` value as present and
+    malformed (`internal/server/request.go`). It also answers a malformed `at`, `horizon` or `keep`
+    `400`, though §7.6 and §8.6 phrase their refusals as `422`. *Propose:* say so.
+34. **Gestures `?after=`** (§7, §7.4, F-R1). Malformed: `400` (§7) or `404` (§7.4)? The reference
+    answers `404` for a malformed `after`, one naming no entry, or one of a resource the reader
+    can't see (`internal/core/gestures.go`). Can an `after` naming an entry of a purged resource
+    resolve?
+35. **`cursor` without `live`** (§7.7, F-R2). The reference checks its grammar (`400` unless
+    decimal, leading zeros accepted) and otherwise ignores it on the `302` path
+    (`internal/server/live.go` `liveQuery`). *Question:* `400`, and are leading zeros allowed?
+36. **An upload's header errors** (§7.8). §7.8 puts an upload's header shape errors at check 4, so
+    the reference answers a `Signature`, `X-Author` or precondition shape error on a blob `PUT`
+    there (`internal/core/blobs.go` `ShapeErr`). For a copy, "come where Copying says" names only
+    the body and `Blob-From` errors; the reference puts the others with them, after checks 1–3.
+    Check 4's answers are unordered; the reference answers `400` (type or nonce), then `428`, then
+    `415` at E3. *Propose:* list them under Copying and order check 4.
+37. **Blob headers on uploads, ranges and PDFs** (§7.8, §H.6, F-R3). The reference counts `PUT
+    …/blob/{bid}` as a blob URL for `nosniff` and the sandbox, and sends `Content-Disposition:
+    attachment` with a PDF's `200`, `206` and `HEAD`; a deployment that opts in to inline PDFs drops
+    the sandbox and the attachment header, and every other answer (`304`, `412`, `416`, errors)
+    keeps the sandbox (`internal/server/blobs.go`). The gateway does the same. *Propose:* confirm
+    `206`, and that §H.6's exception follows §7.8.
+38. **`source` members** (§3.5, §C.3, F-S5). The reference requires every `source.ids` member to
+    name a resource of the batch's items with a text-form id, answers a non-canonical
+    `source.origin` `400` rather than normalising it, and accepts only `http` and `https` with an
+    ASCII host (`internal/server/request.go`, `internal/sig/sig.go` `CanonicalOrigin`). §C.3 names
+    no schemes. *Propose:* say so.
+39. **Order within an item at step 2.5** (§6.2, F-G1). The reference checks a repeated `"delete"`
+    first, then a stale `ifMatch`, the `ifNoneMatch`-with-delete `428` and the missing-precondition
+    `428`; all depend only on the request (`internal/core/write.go`). *Propose:* state an order.
+40. **The dry-run `config` report** (§7.5, F-G2). On success a batch's `config` is an id, in a dry
+    run a report, so clients switch on the JSON type. The reference answers `{ "status": 201,
+    "config": id }`, `{ "status": 200, "config": id }` for a retry, or `{ "status", "code", … }` for
+    a failure after the change's step 1 (`internal/core/write.go` `ConfigReport`). *Propose:* state
+    the shape.
+41. **A create applies to null** (§6.2, §6.3, F-G3). Is a `null` document valid, at E3 too, and what
+    does a create of `[]` do? The reference decides by §6.3's writes: `[]` and `[test "" null]`
+    write nothing and are `422` (`invalid`); `add "" null`, `replace "" null`, and a root `move` or
+    `copy` onto `""` store `null` (`internal/core/write.go`). *Question:* by writes, by the result,
+    or let `[]` create `null`?
+42. **What a batch draws when its config change fails after step 1** (§6.6, §7.5, F-G4). The
+    reference draws, for a submit and a dry run alike, once the items pass step 1: a token per item,
+    and one for the change unless a `*` key made it; the freeze exemption isn't applied, since a
+    failed change's kind isn't known (`internal/core/write.go`). Drawing nothing would let dry runs
+    with a failing change judge items for free. *Propose:* say which.
+43. **Date-times in `compare`** (§6.4.2, F-G5). RFC 3339 §5.6 allows lowercase `t` and `z`; the
+    reference treats them, a leap second and a space for `T` as an unsupported type, and reads
+    `-00:00` as `Z` (`internal/rules/rules.go` `parseDateTime`). *Propose:* say so.
+44. **"Outcome depends on" at E3** (§6.2, F-G6). The reference uses strong Kleene logic
+    (`internal/rules/rules.go` `EvalTri`), so `any: [test /doc/x exists, not test /doc/x exists]`
+    comes out unknown; it treats `writes` as unknown for every sealed step, a `[]` restore included,
+    and as known (`[]`) for a delete (`internal/core/e2erules.go`). *Propose:* state the precision,
+    and whether a `[]` restore's writes are known.
+45. **Step-6 grant-rule refusals in a dry run** (§7.5, F-G7). "If any item fails authorisation, only
+    those items are reported" should say steps 1 and 2.2, as the dry-run text does. The reference
+    reports a step-6 grant-rule `403` per item in the dry run's `200`
+    (`internal/core/authrules.go`).
+46. **Limits in force at a creation** (§6.6, F-L2). Neither which limits apply to a namespace's
+    creation or a branch's, nor which are "the patch-set and document limits", is said. The
+    reference uses the deployment defaults for a creation and the base's for a branch, and applies
+    `patchSetSize`, `opsPerSet`, `documentSize`, `nestingDepth`, `valueSize` and `pathSize`, not
+    `blobsPerDocument` (`internal/core/nsbranch.go`, `internal/core/nsconfig.go`). *Propose:* say
     so.
-78. **Rate-bucket deduction is atomic** (§6.6). "A request is admitted while every bucket
-    it draws on holds at least one token, and its cost is then deducted" doesn't say the
-    check-and-deduct is one atomic operation. With several origin instances sharing a
-    database, non-atomic buckets let every instance admit the same token, multiplying the
-    configured rates by the instance count. The reference deducts transactionally with
-    the write's admission. *Propose:* "the check and the deduction are atomic with each
-    other (and with the write for the buckets it draws on), across every instance sharing
-    the store".
-79. **Long-poll cursor bounds** (§7.7). "A cursor more than one hour's worth of intervals
-    ahead of the server's is `400`, so cursors can't mint unlimited cache keys" bounds
-    the future only. A cursor far in the *past* also mints fresh cache keys (one per
-    request, each waiting a full interval). The cost is bounded by the client doing the
-    waiting, so it matters less, but the reference answers such a request immediately
-    with `204` and a corrected cursor rather than `400`, since a past cursor is what a
-    client holds after a partition. *Propose:* say what a past cursor gets.
+47. **The Values inequality** (§6.6). It applies to every namespace, not only E3, so a namespace can
+    never set `patchSetSize` ≤ 1 KiB, and a deployment whose defaults break it creates no
+    namespaces; nothing says whether a deployment checks its own defaults. "A config write that
+    changes `limits` or `encryption`", read literally, refuses the rotation §E.2.1 requires in a
+    namespace whose stored limits fail it; the reference exempts a write whose only change to
+    `encryption` is `epoch` (`internal/core/config.go`). *Propose:* "changes `limits` or
+    `encryption` other than its `epoch`", and confirm the universal reading.
+48. **Stored values a deployment has since bounded** (§6.6, §12.2). Whether a config write that
+    keeps a value unchanged "sets" it isn't said; the reference holds unchanged limits, and
+    unchanged allowance members per `sub` and `kid`, as stored. Namespace documents stored before
+    v0.63 that set `grantSize` or `rulesPerGrant`, now deployment only, load, and their values are
+    ignored until a write changes them (`internal/core/config.go`). *Propose:* say both.
+49. **An allowance bucket above the maximum** (§6.6, F-L3). Which `limit` does it name? The
+    reference names `ratePerNamespace`. The text's own example bucket (burst 20000) exceeds the
+    default `ratePerNamespace` maximum (burst 1000); the reference has `-max-rate-per-namespace` to
+    raise it, and clamps larger stored buckets (`cmd/patchlog/main.go`). *Propose:* name the limit,
+    and fix the example or the default.
+50. **Atomic deduction** (§6.6). "The check and the deduction are one atomic step … and with the
+    write where there is one" pushes implementations to hold bucket rows locked until the write
+    commits. A deduction must survive a refusal after admission anyway, so one committed first can't
+    be told apart; the reference commits the draw first (`internal/core/ratebuckets.go`). It charges
+    one token per item, even for two items on one resource. *Propose:* "a write it admits never
+    commits without its deduction", and say how items on one resource count.
+51. **A verified grant without `read`** (§7, §C.2). The answer on `/ns/{ns}` URLs of a private
+    namespace, and at `POST /ns/{ns}/keys` of a public one, isn't stated; the reference answers
+    `404` in both (`internal/core/auth.go`, `internal/core/sealed.go`). *Propose:* say so.
+52. **Unknown resources on purge and prune** (§6.2, §8.3, §8.6). The `404` isn't placed; the
+    reference answers it after the `428`, which depends only on the request
+    (`internal/core/nspurge.go`, `internal/core/nsprune.go`).
 
-80. **Making the normative load visible** (§1, reading convention). Under the
-    convention, every statement of what a server answers is a requirement, so at the
-    text's current length every sentence is load-bearing and two readers will extract
-    different requirement sets. The companion drafts mitigate this from outside
-    (`docs/CONFORMANCE.md` restates, `docs/TESTVECTORS.md` pins); the text itself could,
-    over a few versions:
-    1. End each section with a **Requirements** block: short imperative statements with
-       stable ids (§6.2's gate order already works this way, and is the spec's most
-       reliably implemented part). Requirement diffs between versions become checkable,
-       where v0.53's "no change in behaviour" had to be taken on trust.
-    2. Mark rationale as rationale (an italic *Rationale:* note after each block), so
-       the justification passages — worth keeping, they stop implementers re-deriving
-       wrong designs — stop being mined for requirements.
-    3. Extract inline protocols into subsections of their own: the merge lock (75), the
-       cookie name derivation (§C.5.3), the paging continuation grammar (76), the `pl`
-       claims per payload kind (§E.2.2, now spread over four bullets). Each is a small
-       format or state machine that wants a grammar block and negative cases.
-    4. Lint the defined terms: use each §2.1 term only in its defined sense, and never
-       paraphrase the concept ("the rule for other namespaces" in §7.5, "judged
-       structurally" in §6.1). A paraphrase reads as a second, subtly different rule;
-       notes 1–72 accreted from the reference having to pick one.
-    5. Move the fast-changing edges into **registries**: §12 is one for errors; limits
-       (§6.6), namespace-document members (§7.4), verbs, entry kinds, query parameters,
-       cache tags and `x-*` keywords want the same. Additions become visibly additive,
-       and "did a version change behaviour?" becomes a registry diff.
-    Then §1's convention can narrow to: normative = requirement blocks + registries +
-    the byte-exact definitions (with vectors); the rest is explanation. *Propose:* take
-    it in that order, §6–§8 first (most gate-visible, already list-shaped), registries
-    in the same pass, term lint once and then in CI; don't split the file (cross-
-    references are already the text's main cost) and don't cut the rationale.
-81. **`spec` on `GET /` and the versioned edges** (see 73). If the version stays
-    informational, the registries of 80.5 give deployments a better lever: a peer or
-    tool learns what a deployment offers from the endpoints themselves (`404
-    not_offered`) and from `/principal`, not from a number. *Question:* is that the
-    intended discovery path for newer features, and should §7 say so?
+From implementing v0.73: schemas (§6.1, §6.4).
+
+53. **"A schema stored under an earlier version is compiled as that version did"** (§6.1, F-S1).
+    "Version" is undefined (the spec's, or a release's). The reference stores a marker per revision
+    (`v0.73` or `legacy`, `revisions.rules`), compiles each revision of a closure under its own
+    (`internal/schema/marked.go`), and judges imports from another deployment by today's rules
+    (§G.4.4), so a v0.55 bundle whose schema uses a format outside the 2020-12 set is refused;
+    rebases and non-fast-forward replays give schema documents new ids, so they are new content too.
+    Remote mirrors keep the source's marker (16). *Question:* should bundles carry a marker, or
+    imported schema documents count as stored, and is the replay rule intended?
+54. **Stored rule fragments and namespace documents** (§6.4.2, F-S3). Nothing says rule fragments
+    and namespace documents stored earlier compile as stored. The reference compiles stored ones
+    leniently and keeps unchanged rules as stored, but treats an imported or replayed namespace
+    genesis as a creation, held to today's fragment rules (`internal/core/config.go`). A rule's
+    schema now asserts the 2020-12 formats, so a stored `idn-email` rule refuses what v0.55 let
+    through, while stored fragments keep v0.55's extra `semver` and `period`
+    (`internal/rules/rules.go`). Which §6.6 limits apply to a fragment beyond its document's
+    `documentSize` and `pathSize` isn't said either. *Propose:* a stored-fragment clause.
+55. **IDNA profile** (§6.1 formats, F-S2). "UTS 46/RFC 5890" picks no profile. The reference uses
+    the lookup profile (`internal/schema/dialect.go` `idna.MapForLookup`), which accepts uppercase
+    ASCII and other mapped input that the registration profile refuses. *Question:* which, and what
+    does an implementation without IDNA do?
+56. **RE2 translation edges** (§6.1, F-S4). The text doesn't cover an escaped backslash before `u`
+    (`\\u0041`, left as is), ECMAScript's `\u{…}` (left for RE2 to refuse), RE2's `\Q…\E` (its text
+    left untranslated), or a lone surrogate written `\x{D800}`, which RE2 accepts and the reference
+    refuses (`internal/pattern/pattern.go` `Translate`). Key `sub`s and rule patterns stored under
+    v0.55 with `\x{D800}` still compile and are refused only when a write sets them. *Propose:* say
+    each, and whether the stored leniency is acceptable.
+57. **Fragments and plain names** (§6.1). "A fragment that is empty or starts with `/` is
+    percent-decoded" doesn't say whether "starts with" applies before or after decoding; the
+    reference decodes first (RFC 6901 §6), so `#%2F$defs%2Fk` is a pointer and `#%6Eum` the name
+    `num`. A plain name outside the `$anchor` grammar (`#$defs/zip`, `#1a`) names nothing and is
+    `422` `invalid`, not `schema_ref`; the dialect meta-schema runs first, so some refusals carry an
+    `errors` list rather than a `message` (`internal/schema/check.go`). *Propose:* say which code
+    and shape.
+
+From implementing v0.73: reads, streams and logs (§7.1–§7.7).
+
+58. **The end of a purged namespace's stream** (§7.3, §10, F-R4). A sealed namespace's stream can't
+    end "after its purge-ns event", since its events answer `410` once the keys are destroyed. An
+    unsealed one "ends … at once when `since` names that entry", which a client can't tell from a
+    restart, so a follower reconnects with backoff for ever; a long-poll follower there
+    gets `204`s. The reference's follower asks `/heads` (`410` at any revision) with an `after` past
+    every name (`internal/follow/follow.go`). *Propose:* answer such a `since` `410 purged`, or end
+    the stream with a comment naming the purge.
+59. **Read checks in streams** (§7.3, F-R5, F-R12). "Before each event": the reference judges once
+    per page, which is one fetch, and before each keep-alive comment. It ends a stream at the
+    earliest `exp` among a narrowed grant's blocks, at a cookie's own `exp`, and doesn't end a
+    public namespace's stream at a carried grant's `exp`, since a reconnect would be admitted anyway
+    (`internal/server/live.go`). *Propose:* say per page is enough, and the rest.
+60. **Sealed resource events** (§7.3, §E.2.2, F-R6). Purge and prune events carry no id in `pl` and
+    no `id:` line, so a recorded one could be replayed into the same stream; and whether they are
+    stored once isn't said. The reference seals them as served, under the epoch current then, with
+    `pl {ns, name, kind}`, and stores none (`internal/core/eventseal.go`). *Propose:* bind the
+    entry's `target` in `pl`, and say they aren't stored.
+61. **`/principal`'s `catalog`** (§7.4, F-R7). "A catalog namespace" is read as one whose document
+    has `catalog`, and `trusted` is `false` where `catalog.files` is absent
+    (`internal/core/principal.go`). An operator grant gets the restricted catalog view only outside
+    public namespaces, since a public namespace's catalog needs no grant. *Propose:* say so.
+62. **`via` on older entries** (§7.1, §7.4, F-R8). It can't be recovered for namespace entries
+    written before servers stored it, since grants are stored once per root id without narrowing
+    blocks. *Propose:* "absent on entries written before v0.73", as for `grant` before v0.37.
+63. **`/heads` at an older revision** (§7.4, §8.3). "Its latest head, tombstone or purge entry" as
+    of that revision lists a resource live then and purged later as `head`. The reference lists it
+    as `purge` with its head as of that revision, §8.3's rule for late branches, and leaves out
+    resources with no entry then (`internal/core/reads.go`). A branch's own purge of a name it read
+    through is taken to hold at every earlier `ns_id` where it read an entry for it. *Propose:* one
+    rule for both.
+64. **`ETag` of an E2-sealed revision served at E3** (§E.2.2, §7.1). A revision sealed by the server
+    before a raise to `e2e` gets `"{id}.{e}"`, as §7.1 gives a sealed revision;
+    fold redirects and client-sealed snapshots keep `"{id}"` (`internal/server/resource_reads.go`).
+    *Propose:* confirm.
+65. **Changes missing from the change log.** v0.60's "sealed namespaces use the public long-poll
+    rules" was superseded by v0.63 without a note (F-R9); `/maxLag` joined the `*`-key list without
+    one (F-R10); and §H.2's change to excluding only bidi controls among `Cf` has none (F-H10).
+
+From implementing v0.73: namespaces, branches and prunes (§7.4, §7.6, §8).
+
+66. **Branch prunes** (§8.6, F-B6). "Its genesis id where it has none": the reference answers the
+    ancestry's genesis, and as the horizon the newest ancestry segment's that has one, which can lie
+    above the branch's `at`. It still applies `keepPerResource` and E3's `keep` refusal in a branch,
+    without checking ids against the history; compares `keep` as a set; requires a `*` key only for
+    prunes that move the horizon, but the no-archive `403` for every prune without one, no-ops
+    included; and binds a branch snapshot's `pl` to the requested horizon
+    (`internal/core/nsprune.go`). The plaintext `keyring` resource's prune and snapshot aren't
+    covered. *Propose:* say each.
+67. **Extra members in answers** (§7.4, §B.11.4, §B.11.5, F-B8). The reference keeps `archive` in
+    the prune answer, `ns`, `can` and `exp` in `POST /grants`, and `message` (and `head` on `410`)
+    in `/read-grants` items. *Question:* allowed?
+68. **`successor` at a namespace's creation** (§7.4, F-B9). The reference refuses any `successor` in
+    a namespace's creation, and judges a branch creation that sets one against the new branch's base
+    chain (`internal/core/nsconfig.go` `checkSuccessor`). *Propose:* say so.
+69. **Late branches** (§8.3, F-B10). Say explicitly that only names with an entry as of `at` are
+    listed as purged; the reference does so.
+70. **Branch creation order** (§7.6, F-B11). The reference answers a taken name (`412`, step 2.5)
+    before an `at` outside the base's chain (`422` `invalid` at `/base/at`, step 4), and a creation
+    retry sent with no precondition `428`, never a retry (`internal/core/nsbranch.go`). *Propose:*
+    confirm, and name the pointer.
+71. **What precedes the `*`-key guard** (§7.4, F-B12). The reference counts as namespace-document
+    validation: members and shapes, `rulesPerNamespace` and the Values bound, retention archive
+    destinations, an immutable `/base`, drafts, the level rules and epoch steps, a base's `*` keys
+    kept, a public branch of a non-public base, the base's nonce requirement and `successor`;
+    unfreezing against `branchesPerNamespace` is a limit after the patch-set and document limits
+    (`internal/core/nsconfig.go`). *Propose:* list them.
+72. **A base's `*` keys after it changes them** (§7.4). Which branch entries "a `*` key in one of
+    its bases" protects once a base changes its keys isn't said. The reference protects only entries
+    the branch's document holds with the base's `pub`; a `*` key the base adds later is in no branch
+    document, and an entry the branch holds without `*` that the base later makes a `*` key may stay
+    so but can't be removed (`internal/core/nsconfig.go`). A creation retry compares `at` and
+    patches by the genesis they produce, so across v0.73's dropping of `cleanup` from a branch's
+    starting document a retry without patches can't be told from one whose patches set it.
+    *Propose:* say so.
+
+From implementing v0.73: grants (Addendum C).
+
+73. **Refusal order of a grant before the `ns` check** (§C.8, §6.2, F-C1). The reference checks
+    `grantSize` (`413`), then decoding and §C.1/§C.8 (`401`), then `rulesPerGrant` (`413`), then
+    rule compilation (`401`), then the `ns` check (`403`) (`internal/grant/grant.go`
+    `DecodeLimited`). A token that can't be parsed can't have its rules counted. *Propose:* state
+    it.
+74. **Key-scope rules and `rulesPerGrant`** (§12.2, F-C2). "Per grant chain" doesn't say whether a
+    key's scope rules count; the reference counts only the token's blocks
+    (`internal/grant/grant.go`).
+75. **Limits at services** (§C.6, §C.8, F-C3). The index and tree service now answer an oversize
+    grant or one over `rulesPerGrant` `413` `limit`, as the origin does
+    (`internal/grantcheck/grantcheck.go` `LimitError`). *Propose:* say services apply both.
+76. **`POST /edge-grants` refusal order** (§C.5.2, F-C4). The reference answers a body with
+    `Authorization` `400`, then a body that isn't `application/json` `415`, then no grant at all
+    `401` (`internal/server/edgegrants.go` `edgeGrantBearers`). *Propose:* state it.
+77. **`"*"` in `ns`** (§C.4, F-C5). The reference answers a non-operator grant naming `"*"` `401` on
+    every request (`internal/grant/verify.go`), and an operator grant at `/edge-grants` `401`.
+    *Propose:* confirm.
+78. **Narrowing roles over a root without roles** (§C.1, F-C6). The reference leaves no effective
+    roles, so no verb. *Propose:* confirm.
+79. **Revocation ids from before v0.71** (§C.4, F-C7). A namespace whose `revoked` lists an old
+    root-signature id would silently un-revoke; the reference still honours that id for block 0
+    (`internal/grant/verify.go`, `internal/grant/grant.go` `rootSigID`). *Propose:* allow it, or
+    name a migration.
+80. **`requireAt` in a branch, and without `maxTtl`** (§C.4, F-C9). The reference judges a base
+    key's `requireAt` in the branch's own chain (`internal/core/auth.go` `checkAt`). With issuance
+    fixed by `nbf`, a grant from a `requireAt` key without `maxTtl` and with no `nbf` now fails
+    (`403`); the text says such keys SHOULD set `maxTtl`. *Propose:* state both.
+81. **"There is no Authorization"** (§C.5.3). An empty `Authorization` header line is treated as
+    present by `edge.Check` and as absent by the origin's pre-checks (`internal/edge/edge.go`).
+    *Propose:* "carries no Authorization header field".
+82. **Qualifying roles and fixed names** (§2.1). Role rules are checked for every fixed name, block
+    and key rules once with the first name; that is sound only while they refer to `/resource`
+    solely as fixing rules, which the reference enforces (`internal/grant/resource.go`). *Propose:*
+    say so.
+83. **The same principal without a recorded grant** (§7.2). How an entry with no recorded grant
+    matches once authentication is on isn't said; the reference matches on `author`, registrations
+    included (`internal/core/remote_branch.go`). *Propose:* say so.
+
+From implementing v0.73: index (Addendum A).
+
+84. **`min` naming another namespace on a single-namespace query** (§A.5, F-I1). The reference keeps
+    v0.51's wait-and-redirect (`internal/index/http.go`, `strictMins` false). For a `min` naming a
+    purged namespace there it still makes the read check, a temporarily skipped namespace's `min` is
+    `503 behind`, and malformed `min`s are listed in the `400`'s `min` before the read check, with
+    the refused well-formed ones added for a reader it admits. *Question:* strictly `400`, and the
+    rest?
+85. **Comma lists** (§A.4, F-I2). `counts`, `fields` and `sort` are each one comma-separated value
+    in the reference, so a JSON Pointer token containing a comma can't be named. *Propose:* say so,
+    or an escape.
+86. **"Lacks keys" and "can't yet fetch keys"** (§A.4, F-I3). The reference's lack of keys is
+    `client.ErrNoKeys`, an `e2e` namespace without a recipient key, any `4xx` from `/keys` and a key
+    it can't unwrap; network errors, `5xx` and `429` are "not yet"; the `404` precedes the grant
+    check (`internal/derived/keys.go`). A `401` from `/keys` lacks keys, while a `401` for a schema
+    revision stays transient. *Propose:* one rule for "the service's own grant failed".
+87. **Scores** (§A.4, F-I4). Say "from documents of `{ns}` the reader may see" for every namespace,
+    public ones included. The reference counts FTS5 token instances (prefixes included) and phrase
+    instances; implementations that tokenize differently score differently
+    (`internal/index/query.go`).
+88. **`x-index` collection** (§A.4, F-I5). The reference indexes nothing under an object marked
+    `text`, gives invalid documents rows, doesn't full-text index numbers and booleans, and follows
+    `dependentSchemas` only for members present, where §A.4 says marks are judged "whatever the data"
+    (`internal/index/extract.go`, `internal/index/fields.go`). *Propose:* confirm.
+89. **Why a resource purge purges `idx:{ns}`** (§A.1, F-I7). Give the reason (positional cursors,
+    counts, corpus-dependent scores), and note that under a stream of purges, such as a retention
+    sweep, "one redirect suffices" no longer holds.
+90. **Index cookies** (§A.4, §B.11.5, F-I8). A `reads:{ns}:scope:{digest}` marker can only be
+    authorised from a cookie if the service keeps what the digest covers; the reference stores the
+    rules and the `/principal` values they read per marker until the last cookie expires
+    (`internal/index/edgegrants.go`). Head pointers under the prefix (`/{ns}/g/{gs}?…`,
+    `/_refs/g/{gs}?…`) follow only from §B.11.5 and aren't in §A.4's table. A namespace named `r` or
+    `ns` can't get a cookie, its prefix lying under the core's; the reference leaves it out of
+    exchanges. *Propose:* say each.
+91. **Repeated `min`s** (§A.5, F-I9). The reference treats identical repeats as one, and two
+    different bare `min`s as a refused-`min` `400` listing both.
+92. **Reference extensions in §A.4.** The `gt`/`ge`/`lt`/`le` range filters aren't in the text; the
+    reference requires a `sort` mark for their paths, compares strings by bytes and uses each
+    document's least value. `schema=` with a trailing slash, a namespace-only path or a `/rev` path
+    matches nothing. A facet path holding `"1"` and `1` shares one row, and a hit shows one of them
+    (`internal/index/query.go`). *Propose:* specify or drop the filters, and say the rest.
+93. **A grant naming no private namespace a service follows** (§B.11.5, §C.5.2). At another `gs`'s
+    `/_refs` URL the reference answers `401` (nothing verified), while an exchange answers `403`
+    (`internal/index/http.go`, `internal/index/edgegrants.go`). §C.5.2's "rules … don't pass now …
+    with `/resource` set to each name it fixes" doesn't say whether one failing name refuses the
+    grant; at a service that accepts non-fixing `/resource` rules the index refuses only when no
+    fixed name passes. *Propose:* say each.
+94. **Stored sealed results and purges** (§E.2.6, §A.1). Dropping stored sealed results on a raise
+    or on turning private means a later read at an old `at` is redirected, not served the stored
+    bytes (`internal/index/index.go` `dropWholePublic`). *Propose:* a sentence beside "stored once,
+    served forever".
+
+From implementing v0.73: tree and catalog services (Addendum B).
+
+95. **`g/all` and purged namespaces** (§B.11.5, F-T1). A purged namespace can't be exchanged
+    (`410`); should it be exempt from, or dropped from, the combined checkpoint? The reference also
+    judges `g/all` against every trusted namespace, not only those in the checkpoint, since it
+    records when each became trusted, so a trusted namespace whose document it can't read withholds
+    `g/all` cookies from everyone (`internal/tree/edgegrants.go`).
+96. **One checkpoint per `/read-grants` answer** (§B.11.5, F-T3). Refusals from state it doesn't pin
+    can't be marked uncached; the reference adds no mark. A catalog node answered `400` adds no
+    trusted namespace to the checkpoint (`internal/catalog/grants.go`). *Propose:* a per-item
+    marker.
+97. **Merge dry runs as the admin** (§F.8, §B.11.4, F-T4). The reference takes the admin's grant
+    from `Admin-Authorization`, with the approver as the default, and requires the approver in
+    `catalog-admins` for a widening merge, as scenario 44 says (`internal/catalog/mergegrants.go`).
+    *Propose:* name the header and say the approver must be an admin.
+98. **The place list and catalog-admins** (§B.11.4, F-T5). Does it apply to them (scenario 4)? The
+    reference applies it to admins too (`internal/catalog/grants.go` `planPlace`).
+99. **Plain tree services** (§B.11.5, §B.5, F-T6). Serving only `g/all`, they refuse limited grants
+    `403`, which costs a gateway its filtered listings, and a preview, which has no §B.11, now
+    refuses a viewer who can't read every branch (`internal/tree/http.go`). *Question:* intended?
+100. **Uniform refusals** (§B.11.4, §B.11.5, F-T7). Require refusal messages that don't tell hidden,
+     unplaced and never-existed names apart; a widening `403` still shows that some node below would
+     widen, which the reference's generic message can't hide (`internal/catalog/mergegrants.go`).
+101. **Cyclic nodes** (§B.11.5, F-T8) are hidden only by inference (scenario 8); the reference
+     counts only walkable parents (live folders off any cycle), so a node whose parents all dangle
+     stays an orphan (`internal/tree/graph.go`). *Propose:* state it.
+102. **Tree powers and subjects** (§B.11.2). "When that subject's role has it at every one of them":
+     the reference requires the same `(subject, role)` pair at every `parents` entry. `group:{g}`
+     makes a group named `group:x` the subject `group:group:x`, while plain services keep prefixed
+     groups. `POST /grants` matches a key's `sub` scope against the raw root `sub`, while listings
+     and organising requests use the caller's listing subject set, which fails every `sub` scope
+     without a `user:` subject. A key rule on `/action` or `/resource` hides every folder
+     (`internal/catalog/catalog.go`, `internal/grantcheck/grantcheck.go`). *Propose:* say each.
+103. **Deleted placements' rows** (§B.11.7). The reference drops them on purge (§8.3), keeps them
+     whatever becomes of the item, and compares a re-place with no rows (placements deleted before
+     an upgrade, or created and deleted between two applies) so only admins can re-place, with no
+     checkpoint; an item deleted after its placement has empty frozen rows, so only admins restore
+     it (`internal/catalog/catalog.go`). *Propose:* say so.
+104. **Organising requests** (§B.11.4, §B.11.8). A missing `to` is `400` (only `to: []` asks for a
+     root); a folder restore is `{node, want: ["restore"]}` or `{item, want: ["restore"]}`, `404`
+     for a node that isn't untombstoned, `409` for a live one; a Move grant's `exp` runs from the
+     service's decision, so an overtaken decision can be used for about 2 × `maxLag`; a refusal that
+     stops before reading a content namespace names only the catalog in `checkpoint`; once every
+     trusted namespace is purged only admins can reorganise (`internal/catalog/grants.go`).
+     *Propose:* say each.
+105. **Item answers** (§B.11.4, §B.11.5). The reference answers every item of an untrusted namespace
+     `403` (the service can't tell a purge there) and `410 purged` first only for trusted ones;
+     reads the Restore read check as one role counting both now and in the frozen rows; judges
+     "counts for read" in `POST /grants` without evaluating rules, while `/read-grants` does, so
+     they can differ; gives a public `e2e` item `public: true`; reads "accepted `$parents`" as
+     implicit placements the graph keeps; and places the `403` for the catalog's key missing at the
+     head after the decision's own answers (`internal/catalog/grants.go`). *Propose:* say each.
+106. **Catalog merges** (§F.8, §B.11.4). An end-to-end catalog's step-2 batch that needs no
+     `catalog-admins` (narrowing moves, unplacing) can't get a merge grant, so the reference's merge
+     service refuses it and such a release can't proceed. A catalog service without a merge key
+     answers `403`, not `404 not_offered`. A folder restore, and creating a folder a `parents` entry
+     names (`409`, even for admins), aren't in §F.8's list (`internal/catalog/mergegrants.go`). §F.8
+     doesn't say how a merge grant expresses its pairs; one alternative per item hits the default
+     `rulesPerGrant` at 11 items, so the reference groups by action. *Question:* each.
+107. **Listings** (§B.5, §A.4). `children`'s `next` is the following page's query in the reference
+     (both forms accepted), not the bare `after` of `/_refs`. `born` is left out where the first
+     revision's entry is pruned, and for implicit placements of sealed items; for other implicit
+     placements it is the content document's first revision. `lookup` resolves only a node's own
+     title, starts from the reader's roots where `root` is missing, is `404` for an empty segment
+     and `400` without `path`, and answers `{at, path, node}`. `absent` has no reason for keys a
+     service can never have (it says `pending`) and is in the clear. A cursor that reaches an `at`
+     no longer kept restarts the folder, so children may repeat. v0.55's bare `after` is accepted
+     for one release (`internal/tree/http.go`, `internal/tree/files.go`). *Propose:* say each.
+108. **Service edge grants** (§B.11.5, §C.5.2). The `413` for a grant over the limits isn't placed
+     in the all-or-nothing rule; the reference answers it first. "Its own `gs`" is read as its
+     subject set's, so a grant qualifying for `all` reads its subject-set URLs too, filtered;
+     subject-set listings of a public catalog still need a grant that verifies for it; and the
+     `exchangeRate` bucket is keyed by the first content namespace that verifies a grant the catalog
+     doesn't (`internal/svcedge/svcedge.go`). *Propose:* say each.
+109. **Parents in organising answers** (§B.11.4, §H.5). No request returns a node's current parents
+     without asking for a grant, so a gateway asks for a Move grant to read them; Unplace answers
+     give only `head`, and Move answers leave `parents` out for admins
+     (`internal/dav/catgrants.go`). *Propose:* `parents` in those answers too.
+
+From implementing v0.73: merges, releases, imports and remote branches (Addenda F and G).
+
+110. **The plan digest** (§F.9, F-F1). The reference leaves `gesture`, `undoes` and signatures out;
+     a fresh `$nonce` op is an `add` or `replace` at exactly `/$nonce` with a value of the fresh
+     form, and a root op's fresh top-level `$nonce` is dropped from its value; a second half's
+     precondition is `{"batch": i, "item": j}`, indexed over the batches actually submitted, items
+     in each batch by resource name (`internal/merge/plan.go`). The digest is agreed for a plan, so
+     the item order decides the indices. A plan approved under the old digest resumes from its
+     stored step digests. If one half of a split node changes nothing, its step has no item to name.
+     *Propose:* show the form, fix the order, say each resolution set changes the node, and give a
+     migration sentence.
+111. **The merge lock** (§F.9, F-F2). The reference treats `{}` aside from `$nonce`, and an earlier
+     `{"release": null}`, as free. Taking it sets `holder`, then `plan` in a second append, so a
+     crash between them leaves a lock no service can release; the reference stores the plan first
+     and lets the take set both when it can (`internal/merge/release.go`). *Propose:* say the take
+     may set `plan`.
+112. **The closing rule** (§F.6, F-F3). "An entry in a batch that counts there" doesn't say which
+     batch; the reference requires a counting batch whose `source.at` is at or after the resource's
+     last own entry, or a target head that equals or descends from the branch's revision as of
+     `source.at`, and skips resources purged in the branch, which can never be merged
+     (`internal/janitor/janitor.go`). *Propose:* that wording.
+113. **Superseded and abandoned branches** (§F.6, F-F4). "Inherited" should say local bases only.
+     For superseded, the reference requires the recorded `kid` to be a current `*` key of the old
+     branch that the successor knows as the same key, treats a revoked root grant as not chaining,
+     uses the old branch's base's `merge.authors`, compares a purge's `created` with the config
+     write that began the current frozen run, restarts a period on a changed value but not on a
+     removal, and, where several claims verify, purges as the first of merged, superseded, abandoned
+     whose period has passed. A successor's grants are `410` after its purge, so the reference falls
+     back to the old branch and keeps it for a manual purge otherwise
+     (`internal/janitor/janitor.go`). *Propose:* say each.
+114. **Merging details** (§F.3, §F.5, §6.4.1). The reference copies blobs before its dry run (the
+     copies are pending and expire). An insertion into a nested array widens to the outer array, so
+     it conflicts with edits to every other row; a `move` of an element onto itself writes the
+     array. A sealed successor's `read` can't be seen without keys, so a rebase without them refuses
+     rather than apply the rank rule (`internal/merge/writes.go`, `internal/merge/ranks.go`).
+     *Question:* each intended?
+115. **Remote branch creation** (§G.3, §G.5.2, F-F5). Verification failures stay `502 upstream`, not
+     `422`; other `4xx`, `408` and `429` included, are `422`; a key B can't unwrap, or a body that
+     doesn't parse or decrypt, is `502`. The raise "before at" is found from A's current document,
+     since documents aren't covered by ids. A mirror ranking below its source is refused even if
+     nothing would be written, a frozen one only where history would be written; mirror refusals go
+     purged, rank, then per resource, frozen, `e2e`; `410` from a mirror carries `ns`. An operator
+     grant's `ns` covers the branch only, and its rules judge only the branch's genesis, not the
+     mirrors' (`internal/core/remote_branch.go`). *Propose:* say each, and that creation is judged
+     against the source's current document.
+116. **The registration retry** (§G.3, F-F6) is bounded by expiry only, with no `retryWindow`.
+     *Propose:* confirm.
+117. **End-to-end imports** (§G.4.4, §G.5.1, F-F7). The reference batches per epoch, in epoch order,
+     with the bump between batches, so an atomic import is atomic per epoch; a source keyring that
+     skips an epoch is crossed with a standalone config write. "Below the bundle's lowest" refuses
+     an incremental bundle whose keyring starts at a rotation for a target one epoch behind; "above
+     that of a line it lacks" is read as sealed lines only (`internal/bundle/import.go`). *Propose:*
+     say so, and "the epoch before the bundle's lowest keyring line".
+118. **Upstream imports** (§G.4.4). "The imports that wrote it" is read as batch entries whose
+     `source` has `bundle`. The reference also nonces an existing upstream that doesn't require
+     nonces when its target does, keeps the snapshot's `$nonce` in a non-sealed upstream's genesis,
+     and needs read keys for a sealed target to rank it, refusing at step 1 otherwise. The `[]`
+     restore exception for an incremental first line is judged from the target
+     (`internal/bundle/import.go`). *Propose:* "or its target requires nonces", and the rest.
+119. **The mirror genesis** (§G.3, F-F8) is exactly `{ "read": "grant" }` followed by the nonce
+     config write; such a mirror has no keys, so until keys are added only an operator grant reaches
+     it and readers of a private remote branch can't fetch its `$schema` targets. A schema namespace
+     that is `e2e` at A ranks above any mirror, `422 invalid`, where `schema_unavailable` would tell
+     more. *Propose:* say so.
+120. **The sealed bundle framing** (§G.5.1.1, F-F9). The reference reads the decrypted lines
+     strictly, but skips a blank line between JWE lines and accepts an envelope line that isn't
+     canonical (`internal/seal/bundle.go`); it still reads `last` beside `pl`, as written before
+     v0.73, and doesn't check that a line is padded to its bucket. Bundle ids, `K_b`, ephemeral keys
+     and IVs are random, so sealed-bundle vectors are decrypt vectors. *Question:* must the envelope
+     be canonical, may a JWE line be followed by anything but one LF, must readers refuse a
+     top-level `last`, and should Addendum I take those values as inputs?
+121. **`via` in history lines** (§G.4.1). The reference writes §7.1's form, only with `authors`, and
+     its importer doesn't carry `via` into steps (`internal/bundle/format.go`). *Propose:* say so.
+
+From implementing v0.73: gateways (Addendum H).
+
+122. **What a folder `MOVE`'s `If-Match` names** (§H.5, F-H1). The reference takes the folder node's
+     head, a tag clients can learn only from the catalog (`internal/dav/dav.go`).
+123. **Weak tags** (§H.1, F-H2). The `PUT` answer is strong and the writer's next `GET` is
+     `W/"{id}"`, so davfs2 refetches once; the reference compares `If-Match` on `GET` and `HEAD`
+     with `W/` dropped, not strongly as RFC 9110 says (`internal/dav/dav.go`). *Question:* which?
+124. **Records that expire** (§H.4, F-H3). "A path whose records expired counts as evicted": the
+     reference expires per document (all records older than a day), bounds the marks, and treats a
+     new file over the user's own delete as never recorded (`internal/dav/records.go`). *Propose:*
+     say so.
+125. **Saves and precondition corners** (§H.4, §H.5, F-H4). Editors that autosave an unchanged
+     buffer after someone else's change now get `409`; intended? "No save recreates" a moved-away
+     file is applied to saves only, so a `MOVE` back to the old name is allowed. The delete's
+     `If-Match` is applied in the flat view too. An atomic save that sends `If-Match` is `412`, the
+     scratch file having no revision. A malformed tag on a missing file is `412`, a stale
+     well-formed one on `DELETE` `404`. The no-op compares bytes under the head's nonce, the
+     conflict check counts any reference write by another (`internal/dav/write.go`). *Propose:* say
+     each.
+126. **A gateway with its own grant** (§H.3, §H.7, F-H5). Does "doesn't serve tree-derived trees"
+     cover a single-bearer gateway? The reference has no narrowing mode: its local mode is one
+     bearer for one user, its other mode passes each user's grant through. *Propose:* "holds its own
+     grant and narrows it per user".
+127. **COPY or MOVE onto an existing file** (§H.5, F-H7). Does the source's type or the target's
+     win? In the reference the destination name's extension types the file, else the source's type
+     does; the target's existing type isn't kept (`internal/dav/fs.go`, `internal/dav/files.go`
+     `declaredType`).
+128. **An operator grant at an absent namespace** (§H.7, F-H8): `404` before the `403`? The
+     reference answers `404`, as the core does to an operator grant there (`internal/dav/dav.go`
+     `verify`).
+129. **The top level from `roots`** (§H.2, F-H9). The duplicate rule applies there; a new top-level
+     write is `404`, and a top-level node's rename, move or delete `403`
+     (`internal/dav/catalog.go`). *Propose:* a row in §H.4's table.
+130. **A moved-away file where successors aren't trusted** (§H.4, F-H11). What does the `409` name
+     in a sealed namespace? The reference makes no moved-away refusal there
+     (`internal/dav/write.go`).
+131. **Telling tree-derived access** (§H.2, §H.7, §B.12, F-H12). Nothing tells a gateway a tree has
+     it. The reference probes `POST /grants` on the tree service (`404` or `405` means plain), and
+     takes `$access` on a folder or an ancestor as the sign for refusing folder `COPY` and
+     cross-tree folder `MOVE` (`403`), found part way rather than over the whole subtree first
+     (`internal/dav/treesvc.go`, `internal/dav/catalog.go`). Delete-then-write restores under it
+     would need a Place and a Restore grant, so the reference makes a new file. *Propose:* a marker
+     such as `catalog.access: "tree"`, and say whether such copies may be refused.
+132. **Folder copies and flat namespaces** (§H.2, §H.5). A copied folder is a fresh node as `MKCOL`
+     makes it (no `x-` members, description or `$schema` of the source). A gateway without a grant
+     of its own can't learn `files.ns` of a non-public catalog, so the reference keeps every served
+     flat namespace read-only until some user's grant reads the catalog; untrusted placements count
+     as dangling, so a folder `DELETE` deletes them first (`internal/dav/catalog.go`). *Propose:*
+     say which tree owns a flat namespace (in it or in `/principal`), and the rest.
+133. **Guards and case variants** (§H.2, §H.6). A refused `PUT` or `COPY` onto a folder sets a
+     guard, a refused `MOVE` onto one doesn't; a case variant of a folder's name is refused whatever
+     the request carries; `sed`'s six letters or digits are ASCII (`internal/dav/scratch.go`).
+     *Propose:* say each.
+134. **Which key a `kid` named** (§H.7). "A kid that named its key when written" needs namespace-
+     document history; the reference judges kids as they name keys now, which is wrong after a `kid`
+     is reused (`internal/dav/dav.go`). *Propose:* the entry's grant carries the key's thumbprint,
+     or accept the current mapping.
+
+## Settled in v0.56 to v0.73
+
+All 81 notes that were open at v0.55: v0.56 took up notes 1–79 and the companion drafts (73–81 in
+part), v0.57 and v0.58 took up note 80's structure (Requirements blocks, §12's registries). The
+reference now follows the text in each; where it
+had done otherwise, as follows:
+- **Undo** (1, 2): the prefix cap draws no token; a log read from genesis doesn't make an undo
+  impossible, and partial undos are said (§C.5, §11.2).
+- **Limits** (11, 12, 21, 28, 32–35, 37, 38): `documentSize` defaults to 1 MiB, with a deployment
+  default and maximum per limit (`serve -document-size`, `-max-document-size`); log pages count
+  batch items; whole-document writes may go on after the root op; bodies without a limit of their
+  own are `400` above 1 MiB; `measured` is defined per limit and left out of document limits for a
+  grant that can't read the resource, which the reference had given; `/principal` draws no token
+  (§6.6, §7.4).
+- **`/principal`** (25–28): `key`, `operator` and `catalog` members, `writer.nonce` for sealed
+  namespaces, unauthenticated answers, and operator key histories without `keys` as failed reads
+  (§7.4, §C.4).
+- **HTTP** (14–17, 73, 76, 79, 81): `spec` is informational and discovery is per feature;
+  `If-Modified-Since` only where `Last-Modified` is sent; `/raw`'s caching and read check; paging
+  continuations; a past long-poll cursor is answered at once and one more than an hour behind is
+  `400`, where the reference had waited for the boundary (§7, §7.1, §7.7).
+- **Moves** (13, 18–20, 23): schemas may carry `$successor`; where successors survive bundles,
+  renames and remote branches is stated; a `410`'s successor isn't trusted in sealed namespaces
+  (§8.1, §11, §G).
+- **Blobs** (22): headers on every response to a blob URL; a PDF may go without the sandbox, served
+  as an attachment, which the reference does by default with an inline opt-in (§7.8, §H.6).
+- **Access** (3, 36, 74, 78): `/keys` at E3 relays a limited grant's own keyring entries;
+  `readScope` failures are `403` on every request and services verify as the origin does; cookies
+  are host-only; bucket checks are atomic across instances, which the reference now does in Postgres
+  too (§6.6, §C.2, §C.5, §C.6, §E.2.3).
+- **Encryption** (15, 17, 24, 30): the E3 reason for omitting times and sizes; log pages count
+  sealed bytes at E2; stored digests at rest (§E.1); values of another resource sealed per member in
+  derived views (§E.2.6; Open 21 asks the plaintext's shape).
+- **Services** (4–10, 66, 67): `checkpoint` names every namespace a decision read; `min` refusals
+  name the refused `min`s and purged namespaces redirect; read-your-writes guidance; every name in a
+  purged namespace is `410`; `gs` cookies and `g/all` issue times; `exchangeRate` at services,
+  shared across instances in the reference; tree services answer `503 behind` until caught up (§A.5,
+  §B.5, §B.11).
+- **Files** (29, 31, 39–72): Addendum H as the reference's gateway had found it, with users keyed by
+  key thumbprint and `sub`, content per scope, re-checks at least every five minutes, names checked
+  against node documents before writes, records per path, raw saves, empty files, types kept on
+  re-save, the extended scratch names, case variants, NFD, moves that copy, locks and dead
+  properties, tree-service refusals, gateway `413`s, and listings with `total`, `lookup`, `behind`
+  and `file.absent` (§H, §B.5).
+- **Releases** (75): the merge lock has a defined shape and takeover rule (§F.9; Open 111 asks about
+  taking it).
+- **Rules** (77): `compare … in` with a non-array right side is false (§6.4.2).
+- **Structure** (80): Requirements blocks restate the prose, which governs, and §12 holds the
+  registries; CONFORMANCE.md holds the checklist.
 
 ## Settled in v0.55
 
