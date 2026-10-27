@@ -52,11 +52,11 @@ func p36Keys(t *testing.T, r *resp, unwrap func(seal.WrappedKey) ([]byte, error)
 // reader's latest nbf; none without nbf).
 //
 // A here is a sealed namespace whose last config entry this test's proxy
-// serves as the e2e document of a raise from sealed (epoch 3), since this
-// server raises a sealed namespace to e2e only once it serves what is
-// stored before such a raise sealed (P35); B reads A's documents only
-// from A, so what B does is that of a branch of a raised source, whose
-// pre-raise content A serves sealed as before the raise.
+// serves as the e2e document of a raise from sealed (epoch 3); B reads
+// A's documents only from A, so what B does is that of a branch of a
+// raised source, whose pre-raise content A serves sealed as before the
+// raise. TestV073W4IntRemoteBranchOfRaisedSource makes that raise at A
+// for real, now that servers make it (P35).
 func TestV073P36RemotePreRaiseKeys(t *testing.T) {
 	t.Parallel()
 	a := newEnv(t, withOrigin(originA), withKeyStore(newKeyStore(t)), withEncTuning)
@@ -209,10 +209,8 @@ func TestV073P36RemoteBaseEpochNow(t *testing.T) {
 // dependents are raised first.
 //
 // A raises m to sealed, then makes an entry this test's proxy serves as
-// the e2e document of a raise from sealed (this server raises a sealed
-// namespace to e2e only once it serves what is stored before such a raise
-// sealed, P35). B's follower, as the one before v0.73 left it, has its
-// checkpoint at that entry.
+// the e2e document of a raise from sealed. B's follower, as the one before
+// v0.73 left it, has its checkpoint at that entry.
 func TestV073P36RemoteE2ERaiseAsFarAsLevelsAllow(t *testing.T) {
 	t.Parallel()
 	path, blobs := v073DB(t), t.TempDir()
