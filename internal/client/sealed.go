@@ -43,6 +43,9 @@ type Keys struct {
 	epoch     map[string][]byte // kid -> K_e
 	res       map[string][]byte // kid "\n" resource -> K_r
 	noFetch   bool
+	// bases caches, per server and e2e namespace, the namespaces of its
+	// base chain (readThrough); nil for a namespace that isn't e2e.
+	bases map[string]map[string]bool
 }
 
 // NewKeys returns an empty key cache. recipient, if not nil, unwraps keys
@@ -101,15 +104,17 @@ func (k *Keys) cached(kid, resource string) []byte {
 }
 
 // key returns the key opening content of resource ("" for namespace
-// content) sealed under kid, fetching it if needed.
-func (k *Keys) key(ctx context.Context, c *Client, kid, resource string) ([]byte, error) {
+// content) sealed under kid, fetching it if needed from via's /keys: the
+// namespace read, which for a base's content it reads through gives the
+// base's keys (Addendum E Levels).
+func (k *Keys) key(ctx context.Context, c *Client, kid, resource, via string) ([]byte, error) {
 	if b := k.cached(kid, resource); b != nil {
 		return b, nil
 	}
 	if k.noFetch {
 		return nil, ErrNoKeys
 	}
-	ns, epoch, err := seal.ParseKid(kid)
+	_, epoch, err := seal.ParseKid(kid)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +122,7 @@ func (k *Keys) key(ctx context.Context, c *Client, kid, resource string) ([]byte
 	if resource != "" {
 		res = []string{resource}
 	}
-	got, err := c.FetchKeys(ctx, ns, []int{epoch}, res)
+	got, err := c.FetchKeys(ctx, via, []int{epoch}, res)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +270,11 @@ func isJOSE(r *response) bool {
 
 // open decrypts a JWE of namespace ns. want returns the pl it must carry,
 // given its (unauthenticated) header; resource names the resource whose key
-// opens it ("" for namespace content).
+// opens it ("" for namespace content). Its kid must name ns, or, for a
+// resource document or log entry an e2e namespace reads through from a
+// base, that base (readThrough), whose ns its pl then carries too, as
+// Levels have readers accept for content from before the base's raise to
+// e2e, which the branch serves as the base does (Addendum E Levels, §E.2.2).
 func (c *Client) open(ctx context.Context, ns, resource, jwe string, want func(h *seal.Header) (seal.PL, error)) ([]byte, error) {
 	if c.keys == nil {
 		return nil, ErrNoKeys
@@ -278,18 +287,104 @@ func (c *Client) open(ctx context.Context, ns, resource, jwe string, want func(h
 	if err != nil {
 		return nil, fmt.Errorf("client: sealed content: %w", err)
 	}
-	if kns != ns {
-		return nil, fmt.Errorf("client: sealed content of %s is sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
-	}
 	pl, err := want(h)
 	if err != nil {
 		return nil, err
 	}
-	key, err := c.keys.key(ctx, c, h.Kid, resource)
+	if kns != ns {
+		kind, _ := pl["kind"].(string)
+		content := resource != "" && (kind == seal.KindDoc || kind == seal.KindRev || kind == seal.KindTombstone)
+		if !content || !c.readThrough(ctx, ns, kns) {
+			return nil, fmt.Errorf("client: sealed content of %s is sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
+		}
+		pl = withNS(pl, kns)
+	}
+	key, err := c.keys.key(ctx, c, h.Kid, resource, ns)
 	if err != nil {
 		return nil, err
 	}
 	return seal.OpenExpect(jwe, key, h.Kid, pl)
+}
+
+// withNS is pl with its ns replaced by ns.
+func withNS(pl seal.PL, ns string) seal.PL {
+	out := make(seal.PL, len(pl))
+	for k, v := range pl {
+		out[k] = v
+	}
+	out["ns"] = ns
+	return out
+}
+
+// readThrough reports whether kns is a base of ns that ns, an e2e
+// namespace, reads content through from (Addendum E Levels, Branches of a
+// raised base): its base, that base's own bases as far as their documents
+// are readable, or for a remote branch the namespaces of its base.chain
+// (§G.3). Only e2e namespaces serve a base's sealing so; a sealed branch
+// seals what it reads through under its own keys (§E.2.5). Namespace
+// documents stay plaintext at E3, so a branch's base chain reads from them.
+func (c *Client) readThrough(ctx context.Context, ns, kns string) bool {
+	key := c.BaseURL() + " " + ns
+	k := c.keys
+	k.mu.Lock()
+	bases, ok := k.bases[key]
+	k.mu.Unlock()
+	if !ok {
+		bases = c.readThroughBases(ctx, ns)
+		k.mu.Lock()
+		if k.bases == nil {
+			k.bases = map[string]map[string]bool{}
+		}
+		k.bases[key] = bases
+		k.mu.Unlock()
+	}
+	return bases[kns]
+}
+
+// readThroughBases lists the bases ns reads through, nil if ns isn't an e2e
+// branch or its document can't be read (readThrough).
+func (c *Client) readThroughBases(ctx context.Context, ns string) map[string]bool {
+	var out map[string]bool
+	for cur, e2e := ns, true; cur != "" && !out[cur]; {
+		h, err := c.NSHead(ctx, cur)
+		if err != nil {
+			return out
+		}
+		r, err := c.do(ctx, "GET", "/ns/"+cur+"/rev/"+h.ID, nil, nil)
+		if err != nil || r.status != 200 || isJOSE(r) {
+			return out
+		}
+		doc, _ := r.value().(map[string]any)
+		if e2e {
+			// ns itself must be end-to-end.
+			enc, _ := doc["encryption"].(map[string]any)
+			if lv, _ := enc["level"].(string); lv != "e2e" {
+				return nil
+			}
+			e2e = false
+		}
+		b, _ := doc["base"].(map[string]any)
+		next, _ := b["ns"].(string)
+		if next == "" {
+			return out
+		}
+		if out == nil {
+			out = map[string]bool{}
+		}
+		if _, remote := b["origin"]; remote {
+			out[next] = true
+			chain, _ := b["chain"].([]any)
+			for _, x := range chain {
+				if s, ok := x.(string); ok && ValidNSName(s) {
+					out[s] = true
+				}
+			}
+			return out
+		}
+		out[next] = true
+		cur = next
+	}
+	return out
 }
 
 func fixedPL(pl seal.PL) func(*seal.Header) (seal.PL, error) {
