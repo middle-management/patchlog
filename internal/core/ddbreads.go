@@ -55,6 +55,9 @@ type ddbReads struct {
 	schemaNSs map[string]int64
 	// schemaRefs are the revisions' schema paths read, by handle.
 	schemaRefs map[int64]string
+	// copies are the resources copyRows answered with: a purge's commit
+	// pins them (Commit.Copies).
+	copies []ddb.ResourceRef
 }
 
 type ddbNS struct {
@@ -184,8 +187,12 @@ func (r *ddbReads) revRowOf(ns string, ri *ddb.RevInfo) *revRow {
 	id, err := ids.Parse(ri.ID)
 	r.must(err)
 	row.id = id
-	if ri.Pos > 1 {
+	switch {
+	case ri.Pos > 1:
 		row.parentSeq.Int64, row.parentSeq.Valid = r.revHandle(ns, ri.Name, ri.Pos-1), true
+	case ri.ParentNS != "":
+		// A foreign parent: the base's revision it continues (§7.6).
+		row.parentSeq.Int64, row.parentSeq.Valid = r.revHandle(ri.ParentNS, ri.Name, ri.ParentPos), true
 	}
 	if ri.Kind == "tombstone" {
 		row.kind = kindTombstone
@@ -235,6 +242,15 @@ func (r *ddbReads) nsRowOf(h int64) *nsRow {
 	if n.row.TipPos > 0 {
 		out.headSeq.Int64, out.headSeq.Valid = r.logHandle(n.name, n.row.TipPos), true
 	}
+	if b := n.row.Base; b != "" {
+		// A branch (§7.6): its base, the entry it branched at, the base's
+		// configuration then.
+		if base := r.nsByName(b); base != nil {
+			out.base.Int64, out.base.Valid = base.id, true
+			out.baseAt.Int64, out.baseAt.Valid = r.logHandle(b, n.row.BaseAt), true
+			out.baseConfigSeq.Int64, out.baseConfigSeq.Valid = r.cfgHandle(b, n.row.BaseCfgPos), true
+		}
+	}
 	return out
 }
 
@@ -258,8 +274,26 @@ func (r *ddbReads) nsByID(id int64) *nsRow {
 }
 func (r *ddbReads) nsRowUnlocked(id int64) *nsRow  { return r.nsByID(id) }
 func (r *ddbReads) lockNS(ns int64, mode lockMode) {}
-func (r *ddbReads) branchesOf(n *nsRow) []*nsRow   { return nil }
-func (r *ddbReads) baseIdentity(n *nsRow) string   { panic(ddbUnsupported("branches")) }
+func (r *ddbReads) branchesOf(n *nsRow) []*nsRow {
+	bs, err := r.s.Branches(r.ctx, r.nsName(n.id))
+	r.must(err)
+	var out []*nsRow
+	for _, b := range bs {
+		if bn := r.nsByName(b.Name); bn != nil {
+			out = append(out, bn)
+		}
+	}
+	return out
+}
+
+// baseIdentity names a branch's base: its name, which a deployment never
+// reuses (remote bases aren't built here).
+func (r *ddbReads) baseIdentity(n *nsRow) string {
+	if !n.isBranch() {
+		return ""
+	}
+	return r.nsName(n.base.Int64)
+}
 
 // schemaNS is nsByName for a schema path's namespace; the commit pins its
 // configuration (schemaPins), as SQL's recheck compares its row.
@@ -420,9 +454,8 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 		// No entries: a handle still, for the resource's pending blobs
 		// (an upload precedes the create that references it), as the
 		// SQL schema's resource row without a head (ensureResource).
-		v.state = NotFound
 		v.own = &resRow{id: rh, name: name}
-		return v
+		return r.readThrough(n, v)
 	}
 	r.resRows[rh] = rr
 	own := &resRow{id: rh, name: name, state: stateLive}
@@ -433,7 +466,11 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 		// Purged at every entry, with its head (§8.3).
 		own.state = statePurged
 		v.state = Purged
-		v.head = r.rev(r.revHandle(ns, name, headPos))
+		hns := ns
+		if rr.HeadNS != "" {
+			hns = rr.HeadNS // purged as read through from a base
+		}
+		v.head = r.rev(r.revHandle(hns, name, headPos))
 		return v
 	case asOf != nil:
 		// The head as of a log entry: the history rows (ddb.Store.HeadAt),
@@ -441,8 +478,8 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 		h, err := r.s.HeadAt(r.ctx, ns, name, r.logs[*asOf].pos)
 		r.must(err)
 		if h == nil {
-			v.state, v.src = NotFound, nil
-			return v
+			v.src = nil
+			return r.readThrough(n, v)
 		}
 		headPos = h.Pos
 	}
@@ -500,10 +537,19 @@ func (r *ddbReads) docBytesAt(row *revRow) ([]byte, error) {
 	return r.s.DocAt(r.ctx, ref.key.ns, ref.key.name, ref.key.pos)
 }
 
-// A resource's chain is one segment: there are no foreign parents
-// without branches (§7.6).
+// ancestry: a resource's chain, then its first revision's foreign
+// parent's, and so on (§7.6).
 func (r *ddbReads) ancestry(head *revRow) []segment {
-	return []segment{{res: head.res, max: head.seq}}
+	segs := []segment{{res: head.res, max: head.seq}}
+	for {
+		k := r.res[segs[len(segs)-1].res]
+		first, err := r.s.RevAt(r.ctx, k.ns, k.name, 1)
+		r.must(err)
+		if first == nil || first.ParentNS == "" {
+			return segs
+		}
+		segs = append(segs, segment{res: r.resHandle(first.ParentNS, k.name), max: r.revHandle(first.ParentNS, k.name, first.ParentPos)})
+	}
 }
 
 func (r *ddbReads) locate(segs []segment, id ids.ID) (int, *revRow) {
@@ -520,14 +566,25 @@ func (r *ddbReads) locate(segs []segment, id ids.ID) (int, *revRow) {
 
 func (r *ddbReads) horizonID(res int64) string { return "" }
 
+// namesAfter: n's own names and its bases' (read-through), the k
+// smallest of their union (namesAfter of reads.go).
 func (r *ddbReads) namesAfter(n *nsRow, after string, k int) []string {
-	heads, _, err := r.s.ListHeads(r.ctx, r.nsName(n.id), after, k)
-	r.must(err)
-	out := make([]string, len(heads))
-	for i, h := range heads {
-		out[i] = h.Name
+	names := map[string]bool{}
+	for m := n; ; m = r.nsByID(m.base.Int64) {
+		heads, _, err := r.s.ListHeads(r.ctx, r.nsName(m.id), after, k)
+		r.must(err)
+		for _, h := range heads {
+			names[h.Name] = true
+		}
+		if !m.isBranch() {
+			break
+		}
 	}
-	return out
+	sorted := sortedKeys(names)
+	if len(sorted) > k {
+		sorted = sorted[:k]
+	}
+	return sorted
 }
 
 // copyRows: the revisions with id named name in every namespace (GSI1).
@@ -551,7 +608,14 @@ func (r *ddbReads) copyRows(id ids.ID, name string) []copyRow {
 		}
 		ri := c.RevInfo
 		row := r.revRowOf(c.NS, &ri)
-		out = append(out, copyRow{seq: row.seq, ns: n.id, res: row.res, state: stateLive})
+		state := stateLive
+		if r.purgedRes(row.res) {
+			state = statePurged
+		}
+		if state != statePurged {
+			r.copies = append(r.copies, ddb.ResourceRef{NS: c.NS, Name: name})
+		}
+		out = append(out, copyRow{seq: row.seq, ns: n.id, res: row.res, state: state})
 	}
 	return out
 }
@@ -565,8 +629,16 @@ func (r *ddbReads) authorName(id int64) string { return r.authors[id] }
 // --- what this backend doesn't store ---
 
 func (r *ddbReads) archiveURL(res, seq int64) string { panic(ddbUnsupported("archives")) }
+
+// referencedUpTo: every blob a document of res references is attached to
+// res, at the first revision that referenced it (refPos), and pruning,
+// which ends attachments, isn't built here: a document up to max
+// references bid exactly when the attachment's first is at or before.
 func (r *ddbReads) referencedUpTo(res, max int64, bid ids.ID) bool {
-	panic(ddbUnsupported("blob references in a history (branches, batch sources)"))
+	k := r.res[res]
+	b, err := r.s.Attachment(r.ctx, k.ns, k.name, bid.String())
+	r.must(err)
+	return b != nil && b.RefPos > 0 && b.RefPos <= r.revs[max].key.pos
 }
 func (r *ddbReads) declaredAt(row *revRow) []ids.ID   { panic(ddbUnsupported("e2e namespaces")) }
 func (r *ddbReads) dek(res int64, create bool) []byte { panic(ddbUnsupported("encryption at rest")) }
@@ -588,12 +660,23 @@ func (r *ddbReads) grantRow(id []byte) ([]byte, *grantRoot, bool) {
 	return g.Blocks, &grantRoot{sub: g.Sub, kid: g.Kid}, true
 }
 
-// recordsGrant: no bases on this backend (ddbRefusals), so the
-// namespace's own marker.
+// recordsGrant: an entry of n, or of its bases up to the entry each
+// branched at (recordsGrant of grants.go), by their markers.
 func (r *ddbReads) recordsGrant(n *nsRow, id ids.ID) bool {
-	ok, err := r.s.RecordsGrant(r.ctx, r.nsName(n.id), id.String())
-	r.must(err)
-	return ok
+	var upTo uint64 // n's own entries: all of them
+	for cur := n; cur != nil; {
+		ok, err := r.s.RecordsGrant(r.ctx, r.nsName(cur.id), id.String(), upTo)
+		r.must(err)
+		if ok {
+			return true
+		}
+		if !cur.isBranch() {
+			return false
+		}
+		upTo = r.logs[cur.baseAt.Int64].pos
+		cur = r.nsByID(cur.base.Int64)
+	}
+	return false
 }
 
 func (r *ddbReads) nextEntryCreated(ns, seq int64) (int64, bool) {
@@ -876,5 +959,56 @@ func (r *ddbReads) allNamespaces() []*nsRow {
 	return out
 }
 
-// schemaPinsIn: only branches ask (schemaUses), and there are none here.
-func (r *ddbReads) schemaPinsIn(n *nsRow) []schemaUse { return nil }
+// schemaPinsIn: n's schema reference markers, of its unpurged resources.
+func (r *ddbReads) schemaPinsIn(n *nsRow) []schemaUse {
+	ns := r.nsName(n.id)
+	pins, err := r.s.SchemaRefs(r.ctx, ns, "")
+	r.must(err)
+	var out []schemaUse
+	for _, p := range pins {
+		if !r.purgedRes(r.resHandle(ns, p.Name)) {
+			out = append(out, schemaUse{name: p.Name, ref: p.Ref})
+		}
+	}
+	return out
+}
+
+// --- branches ---
+
+func (r *ddbReads) configGenesis(n *nsRow) (int64, int64, ids.ID, bool) {
+	ns := r.nsName(n.id)
+	h := r.cfgHandle(ns, 1)
+	c := r.cfgRow(h)
+	id, err := ids.Parse(c.ID)
+	r.must(err)
+	return h, r.authorHandle(c.Author), id, true
+}
+
+// branchEntry: the base lists its branches with the entry that created
+// each (BRANCH#).
+func (r *ddbReads) branchEntry(base *nsRow, gseq int64) (int64, bool) {
+	bname := r.nsName(base.id)
+	b, err := r.s.Branch(r.ctx, bname, r.cfgs[gseq].ns)
+	r.must(err)
+	if b == nil {
+		return 0, false
+	}
+	return r.logHandle(bname, b.EntryPos), true
+}
+
+// liveRegistrations: no remote branches here.
+func (r *ddbReads) liveRegistrations(n *nsRow) []map[string]any { return nil }
+
+// readThrough completes the view of a resource n has no head of: in a
+// branch, the base's as of the entry it branched at (resolve of
+// resolve.go); NotFound elsewhere.
+func (r *ddbReads) readThrough(n *nsRow, v *view) *view {
+	if !n.isBranch() {
+		v.state = NotFound
+		return v
+	}
+	at := n.baseAt.Int64
+	bv := r.resolve(r.nsByID(n.base.Int64), v.name, &at)
+	v.state, v.head, v.src = bv.state, bv.head, bv.src
+	return v
+}

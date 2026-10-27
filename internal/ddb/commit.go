@@ -77,6 +77,12 @@ type Commit struct {
 	// Repurge queues the second CDN purge of the tags the commit purges
 	// (repurge.go), in its transaction.
 	Repurge *Repurge
+	// Branch creates a branch of NS at the commit's entry (branch.go).
+	Branch *CommitBranch
+	// Copies are resources of other namespaces whose copies of a schema
+	// revision a purge's in_use check relied on (§6.1): it is stale if
+	// one is purged meanwhile, as SQL's locks order the two.
+	Copies []ResourceRef
 	// Pins are the configurations of other namespaces the checks relied
 	// on (the schemas' namespaces: whether the writer may read them): a
 	// pin that moved makes the commit stale, as its own configuration's.
@@ -84,10 +90,14 @@ type Commit struct {
 }
 
 // CommitPurge is a resource purge: of name, whose head the checks read.
+// HeadNS names the base whose revision that head is, when the namespace
+// read the resource through (§7.6): the purge then creates its own item,
+// purged, on that head.
 type CommitPurge struct {
 	Name    string
 	HeadPos uint64
 	HeadID  string
+	HeadNS  string
 }
 
 // metaCond is a commit's condition on a namespace's #META: the
@@ -97,6 +107,9 @@ const metaCond = "configPos = :cp AND configId = :ci AND purged = :np"
 func metaVals(pos uint64, id string) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{":cp": avN(pos), ":ci": avS(id), ":np": avS("0")}
 }
+
+// ResourceRef names a resource of a namespace.
+type ResourceRef struct{ NS, Name string }
 
 // NSPin is a namespace's configuration as a check read it.
 type NSPin struct {
@@ -124,6 +137,11 @@ type CommitItem struct {
 	LastID         string
 	LastPos        uint64
 	Steps          []CommitStep
+	// ParentNS and ParentPos are the foreign parent of a first write to a
+	// resource read through from a base (§7.6): its first revision
+	// continues that one.
+	ParentNS  string
+	ParentPos uint64
 	// Attach are the blobs the item's documents reference that aren't
 	// attached to its resource yet, EndPending the pending entries of
 	// the blobs they reference (blobs.go).
@@ -218,6 +236,13 @@ func (c *Commit) actions() int {
 	}
 	if c.Repurge != nil {
 		n++ // the queued second purge
+	}
+	n += len(c.Copies)
+	if c.Branch != nil {
+		n += branchActions
+		if c.Grant != "" {
+			n++ // the branch's grant marker
+		}
 	}
 	switch {
 	case c.Purge != nil:
@@ -393,7 +418,9 @@ func touchesMeta(cs []*Commit) bool {
 
 // alone reports whether c commits on its own, outside group commit: one
 // that updates #META or purges.
-func (c *Commit) alone() bool { return c.Config != nil || c.PurgeNS || c.Purge != nil }
+func (c *Commit) alone() bool {
+	return c.Config != nil || c.PurgeNS || c.Purge != nil || c.Branch != nil
+}
 
 // commitActs are one commit's actions, in this order — the layout
 // classifyCancel reads: a config change's META update and CFG put; each
@@ -430,6 +457,15 @@ func (s *Store) commitActs(c *Commit, entry logRow) []types.TransactWriteItem {
 	}
 	out = append(out, s.purgeActs(c)...)
 	out = append(out, s.repurgeAct(c, entry)...)
+	for _, cp := range c.Copies {
+		out = append(out, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+			TableName: table, Key: keyAV(keyRes(cp.NS, cp.Name)),
+			ConditionExpression:       strptr("attribute_not_exists(#st) OR #st <> :pg"),
+			ExpressionAttributeNames:  map[string]string{"#st": "state"},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":pg": avS("purged")},
+		}})
+	}
+	out = append(out, s.branchActs(c, entry)...)
 	marker := item{"ns": avS(ns), "logPos": avN(entry.pos)}
 	if len(c.Items) == 1 && c.Kind != "batch" {
 		marker["revId"] = avS(c.Items[0].Steps[len(c.Items[0].Steps)-1].ID)
@@ -459,6 +495,9 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 		st := &it.Steps[i]
 		pos++
 		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos, grantID: c.Grant, schemaRef: st.SchemaRef}
+		if pos == 1 {
+			r.parentNS, r.parentPos = it.ParentNS, it.ParentPos
+		}
 		if st.Tombstone {
 			r.kind = "tombstone"
 		} else {

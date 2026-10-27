@@ -32,6 +32,9 @@ type backend interface {
 	// the purge entry's ns_id.
 	purge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error)
 	purgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error)
+	// createBranch is a branch's creation (§7.6): the gate's planBranch,
+	// then the backend's commit.
+	createBranch(ctx context.Context, req Request, br BranchRequest) (*WriteResult, error)
 	// uploadBlob is an upload or copy of blob bid to name (§7.8).
 	uploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error
 
@@ -99,6 +102,10 @@ func (b sqlBackend) purge(ctx context.Context, req Request, name, ifMatch string
 
 func (b sqlBackend) purgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error) {
 	return b.e.sqlPurgeNamespace(ctx, req, ifMatch, force)
+}
+
+func (b sqlBackend) createBranch(ctx context.Context, req Request, br BranchRequest) (*WriteResult, error) {
+	return b.e.sqlCreateBranch(ctx, req, br)
 }
 
 func (b sqlBackend) uploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error {

@@ -30,6 +30,20 @@ func keyPurging(ns, name string) Key { return Key{nsPK(ns), "PURGING#" + name} }
 func (s *Store) purgeActs(c *Commit) []types.TransactWriteItem {
 	table, ns := &s.Table, c.NS
 	switch {
+	case c.Purge != nil && c.Purge.HeadNS != "":
+		p := c.Purge
+		return []types.TransactWriteItem{
+			{Put: &types.Put{
+				TableName: table, Item: withKey(keyRes(ns, p.Name), item{
+					"headPos": avN(p.HeadPos), "headId": avS(p.HeadID), "headNs": avS(p.HeadNS), "state": avS("purged"),
+				}),
+				ConditionExpression: strptr("attribute_not_exists(PK)"),
+			}},
+			// There is no head document here (it is the base's); the
+			// delete keeps a purge's three actions.
+			{Delete: &types.Delete{TableName: table, Key: keyAV(keyDocHead(ns, p.Name))}},
+			{Put: &types.Put{TableName: table, Item: withKey(keyPurging(ns, p.Name), item{"name": avS(p.Name)})}},
+		}
 	case c.Purge != nil:
 		p := c.Purge
 		return []types.TransactWriteItem{

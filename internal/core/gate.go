@@ -122,6 +122,9 @@ type schemaReads interface {
 // branchReads are branches, their bases and draft copies (§7.6).
 type branchReads interface {
 	branchesOf(n *nsRow) []*nsRow
+	configGenesis(n *nsRow) (seq, author int64, id ids.ID, ok bool)
+	branchEntry(base *nsRow, gseq int64) (int64, bool)
+	liveRegistrations(n *nsRow) []map[string]any
 	baseIdentity(n *nsRow) string
 	copyRows(id ids.ID, name string) []copyRow
 }

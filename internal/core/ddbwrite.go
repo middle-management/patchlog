@@ -127,7 +127,12 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 	}
 	for _, s := range p.st {
 		it := ddb.CommitItem{Name: s.Resource}
-		if h := s.view.head; h != nil {
+		if h := s.view.head; h != nil && r.revs[h.seq].key.ns != ns {
+			// Read through from a base (§7.6): the resource's own chain
+			// starts here, its first revision continuing the base's.
+			k := r.revs[h.seq].key
+			it.ParentNS, it.ParentPos = k.ns, k.pos
+		} else if h != nil {
 			it.HeadPos, it.HeadID = r.revs[h.seq].key.pos, h.id.String()
 			if h.kind == kindTombstone {
 				it.HeadTombstoned = true
@@ -239,7 +244,7 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 	e := b.e
 	if cc.IfNoneMatch {
 		if remoteBaseIn(cc.Patches) {
-			return nil, ddbUnsupported("branches")
+			return nil, ddbUnsupported("remote branches")
 		}
 		return b.createNamespace(ctx, req, cc)
 	}

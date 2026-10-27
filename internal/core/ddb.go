@@ -1,20 +1,20 @@
 package core
 
 // The DynamoDB backend (docs/DYNAMODB.md), phase 1 of §10's path C:
-// plain namespaces, one instance. ddbBackend implements the Engine's
+// plain namespaces and local branches, one instance. ddbBackend implements the Engine's
 // backend (backend.go) for -db dynamodb:// URLs (registerBackend): the
 // gate's reads over the table (ddbreads.go), the commits of what the gate
 // decided (ddbwrite.go, ddbblobs.go). Reads and the write checks are
 // core's own code on the gate.
 //
 // Deliberate gaps, all surfaced as 501 "unsupported" (lacks, or a read
-// that panics with it): branches, pruning, batch sources whose
-// documents reference blobs, sealed and e2e namespaces,
-// nonce-required namespaces, gestures listing, author signatures, head
-// snapshots (revisions fold from the genesis). Grants, edge grants,
-// blobs, $schema validation and schemaReads, purges, tombstones and
-// restores, multi-step items and batches (§7.5, bounded by the
-// transaction's 100 actions) work.
+// that panics with it): remote branches, pruning, sealed and e2e
+// namespaces, nonce-required namespaces, gestures listing, author
+// signatures, head snapshots (revisions fold from the genesis). Grants,
+// edge grants, blobs, $schema validation and schemaReads, purges, local
+// branches and their drafts and merges, tombstones and restores,
+// multi-step items and batches (§7.5, bounded by the transaction's 100
+// actions) work.
 
 import (
 	"context"
@@ -197,10 +197,8 @@ func ddbRefusals(cfg *Config) *Error {
 		return ddbUnsupported("encrypted namespaces")
 	case cfg.NonceRequired:
 		return ddbUnsupported("nonce-required namespaces")
-	case cfg.Base != nil:
-		return ddbUnsupported("branches")
-	case cfg.Successor != "":
-		return ddbUnsupported("namespace successors")
+	case cfg.Base != nil && cfg.Base.Origin != "":
+		return ddbUnsupported("remote branches")
 	case cfg.SignaturesRequired:
 		// Writes can't carry signatures on this backend, so a
 		// namespace requiring them would take unsigned ones (§C.3.1).
@@ -219,6 +217,10 @@ func (b *ddbBackend) commit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResu
 	// purgeResource's).
 	purges := c.Purge != nil || c.PurgeNS
 	inv := invalidation{nss: []string{c.NS}, meta: c.Config != nil || purges, flushDocs: purges}
+	if c.Branch != nil {
+		// A namespace that now exists.
+		inv.nss, inv.meta = append(inv.nss, c.Branch.Name), true
+	}
 	e.rc.begin(inv)
 	defer e.invalidate(inv, false)
 	return b.store.Commit(ctx, c)

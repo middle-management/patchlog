@@ -496,10 +496,9 @@ What landed, beyond the spike:
   them with its queries; `internal/core/ddbreads.go` implements them over
   the table, with per-check handles for the int64 ids the gate's rows
   carry (it only hands them back). What the backend doesn't store reads
-  as empty where nothing of the kind can exist (branches, draft copies,
-  schema uses, horizons), and as **501 "unsupported"** where a request
-  needs a feature it lacks (sealed/e2e keys, archives, reads at an
-  earlier entry, blob references across a history) — so those refusals
+  as empty where nothing of the kind can exist (remote registrations,
+  horizons), and as **501 "unsupported"** where a request needs a
+  feature it lacks (sealed/e2e keys, archives) — so those refusals
   are the reads', not hand-written checks. `gate_test.go` guards the
   embedding that makes this work on SQL (a read missing on `*tx` would
   compile and recurse).
@@ -543,8 +542,11 @@ What landed, beyond the spike:
   gate. `SweepBlobs` deletes expired pending entries and the bytes
   nothing names (by a scan; bytes touched in the last 10 minutes stay,
   for an upload between its two writes), `BlobStats` counts by the same
-  scan, `SweepBlobFiles` removes orphaned files. Not yet: `blob_refs`'s
-  reference intervals, so blobs don't cross branches or batch sources.
+  scan, `SweepBlobFiles` removes orphaned files. `blob_refs`' question —
+  does a document of a chain up to a revision reference a blob — is the
+  attachment's: every referenced blob is attached at the first revision
+  that referenced it (`refPos`), and nothing ends an attachment here
+  (pruning isn't built), so blobs cross branches and batch sources too.
   Where blob bytes live is to become configurable for every database
   backend — a filesystem and an S3 store to begin with, behind
   `blobStore` (whose `open` must then return a reader, not an
@@ -579,7 +581,7 @@ What landed, beyond the spike:
   backend lacks is its `lacks` 501, asked by the Engine method before
   anything else; everything the server can reach so answers 501 rather
   than falling through to SQL:
-  branches, pruning, sealed/e2e, gestures listing,
+  remote branches, pruning, sealed/e2e, gestures listing,
   author signatures (which the gate would verify but the commit doesn't
   store), remote branches, retention, sweeps, rotation. Refused
   configurations (`encryption`, `nonce: required`, `signatures:
@@ -603,6 +605,32 @@ What landed, beyond the spike:
   went unrecognised).
 - **Errors in the core's body shape** (`{"code": …}`), so the HTTP layer
   serves either backend alike.
+- **Branches** (§7.6). A branch's `#META` names its base, the position
+  of the entry it branched at and the base's configuration then; the
+  base lists its branches (`BRANCH#<name>`, with the entry that created
+  each). Creating one is a commit to the base (`Commit.Branch`): the
+  "branch" entry, chained on the base's tip and pinned on its
+  configuration, and in the same transaction the branch's `#META`,
+  configuration genesis and first entry, as a namespace creation writes
+  them. The checks are the gate's `planBranch`, split out of SQL's
+  `createBranch` (with the replay reads `configGenesis` and
+  `branchEntry`). Reading through is `resolve`'s: a name the branch has
+  no head of resolves in the base as of the branch's entry (`HeadAt`),
+  and the listings merge the bases' names. A branch's first write to a
+  resource it reads through starts its own chain, whose first revision
+  names its foreign parent (`parentNs`, `parentPos`): `ancestry` follows
+  it, and folds start from that parent's document. Purges propagate:
+  every branch the purge reaches records its own entry, its chain purged
+  if it has one, else an item of its own purged on the base's head
+  (`headNs`), as SQL inserts its row — after the base's purge commits,
+  not in its transaction, while reads answer 410 throughout from the
+  base. Grants a branch serves are its own and its bases' up to where
+  each branched (`recordsGrant`). Drafts (§6.1) and merges (batch
+  sources) are the gate's code over these reads; `schemaUses` counts a
+  branch's every typed revision from the schema references, and a purge
+  pins the copies its `in_use` check relied on (`Commit.Copies`), so two
+  purges can't each remove one of the last two. Remote branches (§G.3)
+  aren't built.
 - **Purges** (§8.3, §8.5). The gate's `planPurge` and `planPurgeNS`
   (split out of SQL's `Purge` and `PurgeNamespace`, which run them in
   their transactions) decide; the commit carries what must be atomic: a
@@ -666,14 +694,13 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,332 top-level tests (pure unit tests included): 959 pass on DynamoDB
-and 373 skip — 337 as unsupported (144 branches, 115 encryption at
-rest, 20 nonce-required, 15 pruning, 14 gestures listing, …) and 36 on
-their own conditions. The known list is empty: no test answers
-differently from the SQL backends, and none meets an unsupported
-feature where no skip can reach. A test that skips partway has asserted
-everything before its skip, so the phase-1 surface is covered beyond
-the 959.
+1,332 top-level tests (pure unit tests included): 1,061 pass on
+DynamoDB and 271 skip — 234 as unsupported (115 encryption at rest, 35
+remote branches, 22 nonce-required, 20 pruning, 16 gestures listing,
+…), 36 on their own conditions, and one on the known list, which calls
+pruning (retention) on its own. No test answers differently from the
+SQL backends. A test that skips partway has asserted everything before
+its skip, so the phase-1 surface is covered beyond the 1,061.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on
