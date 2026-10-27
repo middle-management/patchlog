@@ -891,12 +891,9 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 
 // Branches lists a namespace's direct branches (§7.4).
 func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]map[string]any, bool, error) {
-	if err := e.be.lacks("branches"); err != nil {
-		return nil, false, err
-	}
 	var out []map[string]any
 	var public bool
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)

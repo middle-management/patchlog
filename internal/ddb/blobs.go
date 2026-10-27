@@ -147,7 +147,9 @@ func (s *Store) UploaderVersion(ctx context.Context, ns, uploader string) (uint6
 // PutPending writes (or renews: uploading again restarts the grace time)
 // a pending entry of ns, conditioned on the configuration the upload was
 // checked under and on the uploader's version (ver) its pending total
-// was read at: ErrStale when either moved.
+// was read at, and on its bytes being stored (a purge collects the bytes
+// nothing names, which these may be until the entry is written):
+// ErrStale when any of them moved.
 func (s *Store) PutPending(ctx context.Context, ns string, cfgPos uint64, cfgID string, ver uint64, p *BlobRow) error {
 	cond, vals := "ver = :old", map[string]types.AttributeValue{":old": avN(ver), ":new": avN(ver + 1)}
 	if ver == 0 {
@@ -162,10 +164,13 @@ func (s *Store) PutPending(ctx context.Context, ns string, cfgPos uint64, cfgID 
 		{ConditionCheck: &types.ConditionCheck{
 			TableName:                 &s.Table,
 			Key:                       keyAV(keyMeta(ns)),
-			ConditionExpression:       strptr("configPos = :cp AND configId = :ci"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{":cp": avN(cfgPos), ":ci": avS(cfgID)},
+			ConditionExpression:       strptr(metaCond),
+			ExpressionAttributeValues: metaVals(cfgPos, cfgID),
 		}},
 		{Put: &types.Put{TableName: &s.Table, Item: withKey(keyPending(ns, p.Name, p.Bid, p.Uploader), p.item())}},
+		{ConditionCheck: &types.ConditionCheck{
+			TableName: &s.Table, Key: keyAV(keyBytes(p.Hash)), ConditionExpression: strptr("attribute_exists(PK)"),
+		}},
 	}})
 	var ce *types.TransactionCanceledException
 	if errors.As(err, &ce) {
@@ -314,4 +319,40 @@ func (s *Store) DeleteBytes(ctx context.Context, hash []byte, cutoff int64) (boo
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// CollectBytes deletes the bytes among hashes that no attachment or
+// pending entry names any more (gcBytes of core's SQL path), and returns
+// the files of those it deleted, for the caller to remove. Whether any
+// item names them is a scan: purges are rare.
+func (s *Store) CollectBytes(ctx context.Context, hashes [][]byte) (files []string, err error) {
+	if len(hashes) == 0 {
+		return nil, nil
+	}
+	blobs, _, bytes, err := s.ScanBlobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	named := map[string]bool{}
+	for _, b := range blobs {
+		named[string(b.Hash)] = true
+	}
+	stored := map[string]*BytesRow{}
+	for _, b := range bytes {
+		stored[string(b.Hash)] = b
+	}
+	for _, h := range hashes {
+		b, ok := stored[string(h)]
+		if !ok || named[string(h)] {
+			continue
+		}
+		delete(stored, string(h))
+		if err := s.deleteKey(ctx, keyBytes(h)); err != nil {
+			return files, err
+		}
+		if b.File != "" {
+			files = append(files, b.File)
+		}
+	}
+	return files, nil
 }

@@ -80,6 +80,13 @@ func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, 
 			return nil, err
 		}
 		c.NoAuth = p.a.noAuth
+		var tags []string
+		if p.cplan != nil {
+			if old := r.config(p.n.configSeq); old.cachePublic() && !p.cplan.cfg.cachePublic() {
+				tags = append(tags, "ns:"+req.NS)
+			}
+		}
+		c.Repurge = b.repurgeOf(g.now, tags)
 		cres, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
 			continue
@@ -89,12 +96,8 @@ func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, 
 		}
 		res := p.result
 		res.NSID = cres.NSID
-		var tags []string
 		if p.cplan != nil {
 			res.ConfigID = p.cplan.id.String()
-			if old := r.config(p.n.configSeq); old.cachePublic() && !p.cplan.cfg.cachePublic() {
-				tags = append(tags, "ns:"+req.NS)
-			}
 		}
 		if !p.isBatch {
 			res.Entry = ddbStepEntry(c, &c.Items[0], len(c.Items[0].Steps)-1)
@@ -124,7 +127,12 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 	}
 	for _, s := range p.st {
 		it := ddb.CommitItem{Name: s.Resource}
-		if h := s.view.head; h != nil {
+		if h := s.view.head; h != nil && r.revs[h.seq].key.ns != ns {
+			// Read through from a base (§7.6): the resource's own chain
+			// starts here, its first revision continuing the base's.
+			k := r.revs[h.seq].key
+			it.ParentNS, it.ParentPos = k.ns, k.pos
+		} else if h != nil {
 			it.HeadPos, it.HeadID = r.revs[h.seq].key.pos, h.id.String()
 			if h.kind == kindTombstone {
 				it.HeadTombstoned = true
@@ -236,7 +244,7 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 	e := b.e
 	if cc.IfNoneMatch {
 		if remoteBaseIn(cc.Patches) {
-			return nil, ddbUnsupported("branches")
+			return nil, ddbUnsupported("remote branches")
 		}
 		return b.createNamespace(ctx, req, cc)
 	}
@@ -292,17 +300,18 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 			Entry:  map[string]any{"kind": "config", "target": p.id.String()}, Kind: "config",
 			Gesture: cc.Gesture, Undoes: cc.Undoes,
 		}
+		var tags []string
+		if out.cur.cachePublic() && !p.cfg.cachePublic() {
+			// Public copies at the edge must go (§9, insertConfig).
+			tags = append(tags, "ns:"+req.NS)
+		}
+		c.Repurge = b.repurgeOf(g.now, tags)
 		cres, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
 			continue
 		}
 		if err != nil {
 			return nil, ddbAsErr(err)
-		}
-		var tags []string
-		if out.cur.cachePublic() && !p.cfg.cachePublic() {
-			// Public copies at the edge must go (§9, insertConfig).
-			tags = append(tags, "ns:"+req.NS)
 		}
 		b.committed(req.NS, tags...)
 		return &WriteResult{Status: 201, NSID: cres.NSID, ConfigID: p.id.String(), Entry: &LogEntry{Gesture: cc.Gesture, Undoes: cc.Undoes}}, nil

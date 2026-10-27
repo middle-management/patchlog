@@ -65,7 +65,7 @@ func TestBuildCommitCreate(t *testing.T) {
 		{"LOG#" + padPos(8), "attribute_not_exists(PK)"},
 		{"#", "attribute_not_exists(PK)"}, // the marker
 		{"#TIP", "headPos = :h AND headId = :i"},
-		{"#META", "configPos = :cp AND configId = :ci"},
+		{"#META", metaCond},
 	}
 	if len(acts) != len(want) || len(acts) != c.actions()+txShared {
 		t.Fatalf("%d actions, want %d (counted %d)", len(acts), len(want), c.actions()+txShared)
@@ -105,7 +105,7 @@ func TestBuildCommitDelete(t *testing.T) {
 		t.Fatalf("%d actions (counted %d)", len(acts), c.actions()+txShared)
 	}
 	res := acts[1].Update
-	if sk(acts[1]) != "RES#doc1" || cond(acts[1]) != "headPos = :old AND headId = :oldi" ||
+	if sk(acts[1]) != "RES#doc1" || cond(acts[1]) != "headPos = :old AND headId = :oldi AND #st <> :pg" ||
 		res.ExpressionAttributeValues[":l"].(*types.AttributeValueMemberS).Value != live ||
 		res.ExpressionAttributeValues[":lp"].(*types.AttributeValueMemberN).Value != "3" {
 		t.Fatalf("head update %s %q %v", sk(acts[1]), cond(acts[1]), res.ExpressionAttributeValues)
@@ -155,7 +155,7 @@ func TestBuildCommitConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(acts) != c.actions()+1 || sk(acts[0]) != "#META" || cond(acts[0]) != "configPos = :old AND configId = :oldi" || sk(acts[1]) != "CFG#"+padPos(5) {
+	if len(acts) != c.actions()+1 || sk(acts[0]) != "#META" || cond(acts[0]) != "configPos = :old AND configId = :oldi AND purged = :np" || sk(acts[1]) != "CFG#"+padPos(5) {
 		t.Fatalf("config change: %d actions, %s %q, %s", len(acts), sk(acts[0]), cond(acts[0]), sk(acts[1]))
 	}
 	if sk(acts[len(acts)-1]) != "#TIP" {

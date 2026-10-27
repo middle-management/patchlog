@@ -129,16 +129,10 @@ func TestDDBUnsupported(t *testing.T) {
 			t.Fatalf("%s: want 501, got %d", what, ae.Status)
 		}
 	}
-	_, err := e.CreateBranch(ctx, Request{NS: "demo"}, BranchRequest{})
-	check("branch", err)
-	_, err = e.Gestures(ctx, "demo", "g1", "", Credentials{})
+	_, err := e.Gestures(ctx, "demo", "g1", "", Credentials{})
 	check("gestures", err)
-	_, _, err = e.Branches(ctx, "demo", Credentials{})
-	check("branches", err)
 	_, err = e.Prune(ctx, Request{NS: "demo"}, "d", PruneRequest{})
 	check("prune", err)
-	_, err = e.Purge(ctx, Request{NS: "demo"}, "d", "", false)
-	check("purge", err)
 
 	// Encrypted namespaces are refused at creation: Open refuses a key
 	// store, so as on SQL without one, 422.

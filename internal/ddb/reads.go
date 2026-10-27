@@ -32,6 +32,9 @@ type RevInfo struct {
 	LogPos    uint64 // the namespace entry that committed it (0: unknown)
 	GrantID   string // the grant it was written under, "" for none
 	SchemaRef string
+	// ParentNS and ParentPos are a first revision's foreign parent.
+	ParentNS  string
+	ParentPos uint64
 }
 
 // resNameFromRev is the resource name of a REV# sort key.
@@ -48,7 +51,7 @@ func resNameFromRev(sk string) string {
 // document exists. A fold ending at a tombstone has no document; one
 // crossing it applies the restore's patches to the last live document, as
 // the write did (§6.2's restore verb, applySteps of write.go).
-func (s *Store) walkChain(ctx context.Context, ns, name string, toPos uint64, apply func(doc any, exists bool, patches string) (any, error)) (any, error) {
+func (s *Store) walkChain(ctx context.Context, ns, name string, toPos uint64, start any, apply func(doc any, exists bool, patches string) (any, error)) (any, error) {
 	hi := "REV#" + name + "#" + padPos(toPos)
 	if toPos == 0 {
 		hi = "REV#" + name + "#" + padPos(999999999999)
@@ -61,8 +64,8 @@ func (s *Store) walkChain(ctx context.Context, ns, name string, toPos uint64, ap
 	if err != nil {
 		return nil, err
 	}
-	var doc any
-	exists, dead := false, false
+	doc := start
+	exists, dead := start != nil, false
 	var last uint64
 	for _, it := range q.Items {
 		i := item(it)
@@ -142,7 +145,13 @@ func FormatTime(ms int64) string {
 // set with the production engine. One ordered query; the §5 audit turns a
 // gap into an error, never a partial document.
 func (s *Store) FoldResource(ctx context.Context, ns, name string, toPos uint64) (doc any, canon []byte, err error) {
-	doc, err = s.walkChain(ctx, ns, name, toPos, func(d any, exists bool, patches string) (any, error) {
+	return s.foldFrom(ctx, ns, name, toPos, nil)
+}
+
+// foldFrom is FoldResource for a chain whose first revision continues a
+// foreign parent's document, start (nil for a genesis).
+func (s *Store) foldFrom(ctx context.Context, ns, name string, toPos uint64, start any) (doc any, canon []byte, err error) {
+	doc, err = s.walkChain(ctx, ns, name, toPos, start, func(d any, exists bool, patches string) (any, error) {
 		p, err := jsonv.Parse([]byte(patches))
 		if err != nil {
 			return nil, err

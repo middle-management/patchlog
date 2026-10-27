@@ -53,6 +53,10 @@ type nsMeta struct {
 	frozen, purged bool
 	configPos      uint64
 	configID       string
+	// A branch's base (§7.6): its name, the position of the entry it
+	// branched at, and the base's configuration then.
+	base               string
+	baseAt, baseCfgPos uint64
 }
 
 func (m *nsMeta) item() item {
@@ -63,12 +67,16 @@ func (m *nsMeta) item() item {
 	if m.purged {
 		pu = "1"
 	}
-	return item{
+	it := item{
 		"frozen":    avS(fr),
 		"purged":    avS(pu),
 		"configPos": avN(m.configPos),
 		"configId":  avS(m.configID),
 	}
+	if m.base != "" {
+		it["base"], it["baseAt"], it["baseCfgPos"] = avS(m.base), avN(m.baseAt), avN(m.baseCfgPos)
+	}
+	return it
 }
 
 func scanNSMeta(it item) *nsMeta {
@@ -77,6 +85,7 @@ func scanNSMeta(it item) *nsMeta {
 		purged:    it.s("purged") == "1",
 		configPos: it.n("configPos"),
 		configID:  it.s("configId"),
+		base:      it.s("base"), baseAt: it.n("baseAt"), baseCfgPos: it.n("baseCfgPos"),
 	}
 }
 
@@ -99,6 +108,7 @@ func scanTip(it item) *tip { return &tip{headPos: it.n("headPos"), headID: it.s(
 type resRow struct {
 	headPos     uint64 // 0: no live revision
 	headID      string // head revision or tombstone id
+	headNS      string // a purged read-through resource's: the base's
 	entryID     string
 	state       string // "live" or "tombstoned"
 	headCreated int64
@@ -110,7 +120,7 @@ type resRow struct {
 
 func scanRes(it item) *resRow {
 	return &resRow{
-		headPos: it.n("headPos"), headID: it.s("headId"), entryID: it.s("entryId"), state: it.s("state"),
+		headPos: it.n("headPos"), headID: it.s("headId"), headNS: it.s("headNs"), entryID: it.s("entryId"), state: it.s("state"),
 		headCreated: int64(it.n("headCreated")), headSize: it.n("headSize"), headDigest: it.b("headDigest"),
 		lastID: it.s("lastId"), lastPos: it.n("lastPos"),
 	}
@@ -136,6 +146,11 @@ type revRow struct {
 	logPos    uint64 // the namespace entry that committed it: the retry lookup's answer
 	grantID   string // the grant it was written under, "" for none
 	schemaRef string // the schema revision path it was typed by
+	// parentNS and parentPos name a first revision's foreign parent: a
+	// revision of the same name in the base it was read through from
+	// (§7.6).
+	parentNS  string
+	parentPos uint64
 }
 
 func (r *revRow) item() item {
@@ -171,6 +186,9 @@ func (r *revRow) item() item {
 	}
 	if r.schemaRef != "" {
 		it["schemaRef"] = avS(r.schemaRef)
+	}
+	if r.parentNS != "" {
+		it["parentNs"], it["parentPos"] = avS(r.parentNS), avN(r.parentPos)
 	}
 	return it
 }

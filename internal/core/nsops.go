@@ -609,9 +609,11 @@ type BranchRequest struct {
 
 // CreateBranch creates a branch of a local base.
 func (e *Engine) CreateBranch(ctx context.Context, req Request, br BranchRequest) (*WriteResult, error) {
-	if err := e.be.lacks("branches"); err != nil {
-		return nil, err
-	}
+	return e.be.createBranch(ctx, req, br)
+}
+
+// sqlCreateBranch is CreateBranch on SQL.
+func (e *Engine) sqlCreateBranch(ctx context.Context, req Request, br BranchRequest) (*WriteResult, error) {
 	var res *WriteResult
 	err := e.update(ctx, func(t *tx) error {
 		r, err := t.createBranch(req, br)
@@ -622,37 +624,75 @@ func (e *Engine) CreateBranch(ctx context.Context, req Request, br BranchRequest
 }
 
 func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) {
+	p, replay, err := t.planBranch(req, br)
+	if err != nil || replay != nil {
+		return replay, err
+	}
+	base, a, nd, gcanon, cfgID, atSeq, atID, cfg := p.base, p.a, p.doc, p.canon, p.cfgID, p.atSeq, p.atID, p.cfg
+	// Step 7.
+	author := t.actorID(a)
+	bid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?) RETURNING ns`, p.name, base.id, atSeq, base.configSeq)
+	cseq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?) RETURNING seq`,
+		bid, cfgID[:], string(gcanon), string(jsonv.Canonical(nd)), author, t.now.UnixMilli())
+	bn := t.nsByIDLocked(bid, lockExclusive)
+	// Both logs, in ascending key order, after every other lock (D.8).
+	t.lockLogs(base.id, bid)
+	t.appendNS(bn, map[string]any{"kind": "config", "target": cfgID.String()}, nil, &cseq, cseq, author)
+	// A sealed branch has its own epoch keys (§E.2.5).
+	t.sealedConfigWritten(bn, nil, cfg)
+	_, nsID := t.appendNS(base, map[string]any{"kind": "branch", "name": p.name, "at": atID.String(), "target": cfgID.String()}, nil, &cseq, base.configSeq, author)
+	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: cfgID.String()}, nil
+}
+
+// branchPlan is a branch the gate allowed (§7.6): its base, the entry it
+// branches at, its namespace document as a genesis patch set.
+type branchPlan struct {
+	name   string
+	base   *nsRow
+	a      *actor
+	atSeq  int64
+	atID   ids.ID
+	doc    any
+	canon  []byte // the genesis patch set, canonical
+	cfgID  ids.ID
+	cfg    *Config
+	writes []string
+}
+
+// planBranch checks a branch's creation (§7.6, §6.2 steps 1–6), or
+// answers an idempotent retry of one (replay).
+func (t *gate) planBranch(req Request, br BranchRequest) (p *branchPlan, replay *WriteResult, perr *Error) {
 	base := t.nsForWrite(req.NS)
 	if base == nil {
-		return nil, t.absentNS(req.NS, req.Cred)
+		return nil, nil, t.absentNS(req.NS, req.Cred)
 	}
 	bcfg := t.config(base.configSeq)
 	a, aerr := t.authenticate(base.name, base, bcfg, req.Cred, nil)
 	if aerr != nil {
-		return nil, aerr
+		return nil, nil, aerr
 	}
 	// Step 1.
 	if !ValidNSName(br.Name) {
-		return nil, badInput("invalid branch name")
+		return nil, nil, badInput("invalid branch name")
 	}
 	if err := t.authorize(a, "branch", br.Name); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !t.readsNS(base, bcfg, a, true) {
-		return nil, forbidden("branching needs unrestricted read on the base (§2.1)")
+		return nil, nil, forbidden("branching needs unrestricted read on the base (§2.1)")
 	}
 	if err := t.rateLimit(base, bcfg, a, nil, 1); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// 410 after authorisation and the rate limits, like every write to a
 	// purged namespace (§6.2, §8.5).
 	if base.purged {
-		return nil, t.purgedNS(base)
+		return nil, nil, t.purgedNS(base)
 	}
 	// Step 2: the precondition. A branch requires If-None-Match: * (§7.6);
 	// 428 comes after authorisation (§6.2).
 	if !br.IfNoneMatch {
-		return nil, apiErr(428, "precondition_required")
+		return nil, nil, apiErr(428, "precondition_required")
 	}
 	if br.Patches == nil {
 		br.Patches = []any{}
@@ -662,11 +702,11 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if br.At != "" {
 		id, err := ids.Parse(br.At)
 		if err != nil {
-			return nil, invalid("at is not in the base's chain")
+			return nil, nil, invalid("at is not in the base's chain")
 		}
 		s, ok := t.nsLogSeq(base.id, id)
 		if !ok {
-			return nil, invalid("at is not in the base's chain")
+			return nil, nil, invalid("at is not in the base's chain")
 		}
 		atSeq = s
 	}
@@ -679,11 +719,11 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	doc["base"] = map[string]any{"ns": base.name, "at": atID.String()}
 	ops, err := patch.Parse(br.Patches)
 	if err != nil {
-		return nil, patchErr(err)
+		return nil, nil, patchErr(err)
 	}
 	nd, w, err := patch.Apply(doc, true, ops, patch.Options{})
 	if err != nil {
-		return nil, patchErr(err)
+		return nil, nil, patchErr(err)
 	}
 	writes := patch.WritesStrings(w)
 	genesis := []any{map[string]any{"op": "add", "path": "", "value": nd}}
@@ -693,21 +733,17 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 		// Idempotent retry: same principal, same at and patches, until
 		// the branch is purged; after that it is 412 too: its name stays
 		// reserved, for its creator too (§7.6, §8.5).
-		var author, gseq int64
-		var gid []byte
-		qerr := t.QueryRow(`SELECT seq, author, id FROM ns_config WHERE ns = ? AND parent_seq IS NULL`, ex.id).Scan(&gseq, &author, &gid)
-		if qerr == nil && !ex.purged && ex.base.Valid && ex.base.Int64 == base.id && ex.baseAt.Int64 == atSeq &&
-			author == t.actorID(a) && ids.FromBytes(gid) == cfgID {
-			var seq int64
-			// The base's branch entry targets the branch's config genesis.
-			t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND kind = ? AND target_seq = ?`, base.id, nsKindCode("branch"), gseq).Scan(&seq)
+		gseq, author, gid, ok := t.configGenesis(ex)
+		if ok && !ex.purged && ex.base.Valid && ex.base.Int64 == base.id && ex.baseAt.Int64 == atSeq &&
+			author == t.actorID(a) && gid == cfgID {
 			r := &WriteResult{Status: 200, Replayed: true, ConfigID: cfgID.String()}
-			if seq != 0 {
+			// The base's branch entry targets the branch's config genesis.
+			if seq, ok := t.branchEntry(base, gseq); ok {
 				r.NSID = t.nsLogID(seq).String()
 			}
-			return r, nil
+			return nil, r, nil
 		}
-		return nil, apiErr(412, "stale", "message", "the name is taken")
+		return nil, nil, apiErr(412, "stale", "message", "the name is taken")
 	}
 	// Limits (step 4).
 	depth := 1
@@ -715,13 +751,13 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 		depth++
 	}
 	if depth > t.e.opt.Maximums.BranchDepth {
-		return nil, limitErr(422, "branchDepth", int64(depth), int64(t.e.opt.Maximums.BranchDepth), "branch depth exceeded")
+		return nil, nil, limitErr(422, "branchDepth", int64(depth), int64(t.e.opt.Maximums.BranchDepth), "branch depth exceeded")
 	}
 	// Live branches only (§6.6): merged or superseded branches are frozen,
 	// not live (§F.6), and don't count, so branches kept for review after
 	// their merge don't block new ones.
 	if live := t.liveBranches(base, nil); live >= bcfg.Limits.BranchesPerNamespace {
-		return nil, limitErr(422, "branchesPerNamespace", int64(live+1), int64(bcfg.Limits.BranchesPerNamespace), "too many live branches")
+		return nil, nil, limitErr(422, "branchesPerNamespace", int64(live+1), int64(bcfg.Limits.BranchesPerNamespace), "too many live branches")
 	}
 	// Step 5. The document starts as the base's, so the members this
 	// version defines that it holds unchanged are judged as there; any
@@ -729,27 +765,27 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	// (checkMembers).
 	cfg, perr := t.e.newConfig(nd, definedMembers(bcfg.Doc), bcfg.Doc)
 	if perr != nil {
-		return nil, perr
+		return nil, nil, perr
 	}
 	if !jsonv.Equal(bcfg.Doc["retention"], cfg.Doc["retention"]) {
 		if aerr := t.e.checkArchives(cfg); aerr != nil {
-			return nil, aerr
+			return nil, nil, aerr
 		}
 	}
 	if cfg.Base == nil || cfg.Base.NS != base.name || cfg.Base.At != atID.String() {
-		return nil, invalid("/base cannot be changed")
+		return nil, nil, invalid("/base cannot be changed")
 	}
 	if cfg.DraftsFor != nil && base.isBranch() && t.draftRoot(base) == "" {
-		return nil, invalid("/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
+		return nil, nil, invalid("/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
 	}
 	if touchesGuarded(writes) && !a.star {
-		return nil, forbidden("these patches need a grant chained to a * key of the base")
+		return nil, nil, forbidden("these patches need a grant chained to a * key of the base")
 	}
 	for b := base; ; b = t.nsByID(b.base.Int64) {
 		for kid, k := range t.config(b.configSeq).starKeys() {
 			nk, ok := findKey(cfg.Keys, kid)
 			if !ok || string(nk.Pub) != string(k.Pub) || !nk.IsStar() {
-				return nil, invalid(fmt.Sprintf("key %q of %s must be kept", kid, b.name))
+				return nil, nil, invalid(fmt.Sprintf("key %q of %s must be kept", kid, b.name))
 			}
 		}
 		if !b.isBranch() {
@@ -757,13 +793,13 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 		}
 	}
 	if cfg.Read == "public" && bcfg.Read != "public" {
-		return nil, invalid("a branch of a non-public namespace cannot be public")
+		return nil, nil, invalid("a branch of a non-public namespace cannot be public")
 	}
 	if err := t.checkEncryption(nil, cfg, t.nsLevel(base)); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := t.checkNonceBase(nil, cfg, base); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Step 6: the base's rules evaluate a branch envelope.
 	env := t.basicEnvelope("branch", br.Name, a)
@@ -771,97 +807,107 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	env["doc"] = nd
 	env["patches"] = jsonv.MustParse(jsonv.Canonical(br.Patches))
 	if err := t.checkRules(bcfg, a, env, false); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	// Step 7.
-	author := t.actorID(a)
-	bid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?) RETURNING ns`, br.Name, base.id, atSeq, base.configSeq)
-	cseq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?) RETURNING seq`,
-		bid, cfgID[:], string(gcanon), string(jsonv.Canonical(nd)), author, t.now.UnixMilli())
-	bn := t.nsByIDLocked(bid, lockExclusive)
-	// Both logs, in ascending key order, after every other lock (D.8).
-	t.lockLogs(base.id, bid)
-	t.appendNS(bn, map[string]any{"kind": "config", "target": cfgID.String()}, nil, &cseq, cseq, author)
-	// A sealed branch has its own epoch keys (§E.2.5).
-	t.sealedConfigWritten(bn, nil, cfg)
-	_, nsID := t.appendNS(base, map[string]any{"kind": "branch", "name": br.Name, "at": atID.String(), "target": cfgID.String()}, nil, &cseq, base.configSeq, author)
-	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: cfgID.String()}, nil
+	return &branchPlan{name: br.Name, base: base, a: a, atSeq: atSeq, atID: atID, doc: nd, canon: gcanon, cfgID: cfgID, cfg: cfg, writes: writes}, nil, nil
 }
 
 // Purge purges a resource (§8.3). It returns the purge entry's ns_id.
 func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error) {
-	if err := e.be.lacks("purges"); err != nil {
-		return "", err
-	}
+	return e.be.purge(ctx, req, name, ifMatch, force)
+}
+
+// sqlPurge is Purge on SQL.
+func (e *Engine) sqlPurge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error) {
 	var out string
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsForWrite(req.NS)
-		if n == nil {
-			return t.absentNSOp(req.NS, req.Cred, force)
-		}
-		cfg := t.config(n.configSeq)
-		a, operator, aerr := t.purger(n, cfg, req, force)
-		if aerr != nil {
-			return aerr
-		}
-		if err := t.authorize(a, "purge", name); err != nil {
+		p, err := t.planPurge(req, name, ifMatch, force)
+		if err != nil {
 			return err
-		}
-		// 410 after authorisation, like every write (§6.2).
-		if n.purged {
-			return t.purgedNS(n)
-		}
-		if ifMatch == "" {
-			return apiErr(428, "precondition_required")
-		}
-		v := t.resolve(n, name, nil)
-		switch v.state {
-		case NotFound:
-			return notFound()
-		case Purged:
-			return gone()
-		}
-		if ifMatch != v.head.id.String() {
-			return apiErr(412, "stale", "head", v.head.id.String())
-		}
-		// The purge reaches n and every branch it propagates to (§8.3),
-		// each locked exclusively before it is read.
-		reached := t.purgeReach(n)
-		gone := func(ns *nsRow, res string) bool { return res == name && reached[ns.id] }
-		forced := false
-		if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
-			if !force {
-				return t.inUse(broken, "the purge would remove the last available copy of a referenced schema revision (§6.1)")
-			}
-			if err := t.mayForce(n, a, operator); err != nil {
-				return err
-			}
-			forced = true
-		}
-		if !operator {
-			env := t.basicEnvelope("purge", name, a)
-			env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
-			if err := t.checkRules(cfg, a, env, false); err != nil {
-				return err
-			}
 		}
 		// Every log the purge appends to, in ascending key order, after
 		// every other lock (D.8).
-		logs := make([]int64, 0, len(reached))
-		for id := range reached {
+		logs := make([]int64, 0, len(p.reached))
+		for id := range p.reached {
 			logs = append(logs, id)
 		}
 		t.lockLogs(logs...)
-		out = t.purgeResource(n, name, t.actorID(a), forced).String()
+		out = t.purgeResource(p.n, name, t.actorID(p.a), p.forced).String()
 		return nil
 	})
 	return out, err
 }
 
+// purgePlan is a purge the gate allowed (§8.3, §8.5): of a resource, the
+// head it purges and every namespace it reaches.
+type purgePlan struct {
+	n       *nsRow
+	a       *actor
+	forced  bool
+	head    *revRow
+	reached map[int64]bool
+}
+
+// planPurge checks a resource purge (§8.3, §6.2): authentication, the
+// verb, the precondition on the head, schema copies (§6.1), the rules.
+func (t *gate) planPurge(req Request, name, ifMatch string, force bool) (*purgePlan, *Error) {
+	n := t.nsForWrite(req.NS)
+	if n == nil {
+		return nil, t.absentNSOp(req.NS, req.Cred, force)
+	}
+	cfg := t.config(n.configSeq)
+	a, operator, aerr := t.purger(n, cfg, req, force)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if err := t.authorize(a, "purge", name); err != nil {
+		return nil, err
+	}
+	// 410 after authorisation, like every write (§6.2).
+	if n.purged {
+		return nil, t.purgedNS(n)
+	}
+	if ifMatch == "" {
+		return nil, apiErr(428, "precondition_required")
+	}
+	v := t.resolve(n, name, nil)
+	switch v.state {
+	case NotFound:
+		return nil, notFound()
+	case Purged:
+		return nil, gone()
+	}
+	if ifMatch != v.head.id.String() {
+		return nil, apiErr(412, "stale", "head", v.head.id.String())
+	}
+	// The purge reaches n and every branch it propagates to (§8.3),
+	// each locked exclusively before it is read.
+	reached := t.purgeReach(n)
+	gone := func(ns *nsRow, res string) bool { return res == name && reached[ns.id] }
+	forced := false
+	if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
+		if !force {
+			return nil, t.inUse(broken, "the purge would remove the last available copy of a referenced schema revision (§6.1)")
+		}
+		if err := t.mayForce(n, a, operator); err != nil {
+			return nil, err
+		}
+		forced = true
+	}
+	if !operator {
+		env := t.basicEnvelope("purge", name, a)
+		env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
+		if err := t.checkRules(cfg, a, env, false); err != nil {
+			return nil, err
+		}
+	}
+	return &purgePlan{n: n, a: a, forced: forced, head: v.head, reached: reached}, nil
+}
+
 // purgeReach locks n and every unpurged branch a resource purge in n
 // propagates to (§8.3) exclusively, in the order purgeResource does, and
 // returns their ids.
-func (t *tx) purgeReach(n *nsRow) map[int64]bool {
+func (t *gate) purgeReach(n *nsRow) map[int64]bool {
 	reached := map[int64]bool{n.id: true}
 	var walk func(x *nsRow)
 	walk = func(x *nsRow) {
@@ -881,7 +927,7 @@ func (t *tx) purgeReach(n *nsRow) map[int64]bool {
 // with a grant chained to a deployment operator key instead of one of the
 // namespace's: then operator is true, and the namespace's rules don't
 // apply to it.
-func (t *tx) purger(n *nsRow, cfg *Config, req Request, force bool) (a *actor, operator bool, err *Error) {
+func (t *gate) purger(n *nsRow, cfg *Config, req Request, force bool) (a *actor, operator bool, err *Error) {
 	t.reqCreds = req.anyCreds()
 	a, err = t.authenticate(n.name, n, cfg, req.Cred, nil)
 	if err == nil || !force || len(t.operatorKeys()) == 0 {
@@ -898,7 +944,7 @@ func (t *tx) purger(n *nsRow, cfg *Config, req Request, force bool) (a *actor, o
 // a purge of a branch or of a resource in one, to a * key of that branch,
 // inherited or its own. A * key of a namespace that isn't a branch
 // doesn't force. With authentication disabled everyone is the operator.
-func (t *tx) mayForce(n *nsRow, a *actor, operator bool) *Error {
+func (t *gate) mayForce(n *nsRow, a *actor, operator bool) *Error {
 	if operator || t.e.opt.AuthDisabled || (n.isBranch() && a.star) {
 		return nil
 	}
@@ -986,64 +1032,78 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids
 // operator key, or, for a branch, to a * key of the branch. The purge-ns
 // entry then says forced: true (§3.5). Dependents can't be forced.
 func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error) {
-	if err := e.be.lacks("purges"); err != nil {
-		return "", err
+	return e.be.purgeNamespace(ctx, req, ifMatch, force)
+}
+
+// planPurgeNS checks a namespace purge (§8.5): authentication, the verb,
+// the precondition on the log's head, frozen, no dependents, schema
+// copies (§6.1), the rules.
+func (t *gate) planPurgeNS(req Request, ifMatch string, force bool) (*purgePlan, *Error) {
+	n := t.nsForWrite(req.NS)
+	if n == nil {
+		return nil, t.absentNSOp(req.NS, req.Cred, force)
 	}
+	cfg := t.config(n.configSeq)
+	a, operator, aerr := t.purger(n, cfg, req, force)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if err := t.authorize(a, "purge-ns", ""); err != nil {
+		return nil, err
+	}
+	// 410 after authorisation, like every write (§6.2).
+	if n.purged {
+		return nil, t.purgedNS(n)
+	}
+	if ifMatch == "" {
+		return nil, apiErr(428, "precondition_required")
+	}
+	head := t.nsLogID(n.headSeq.Int64)
+	if ifMatch != head.String() {
+		return nil, apiErr(412, "stale", "head", head.String())
+	}
+	if !cfg.Frozen {
+		return nil, apiErr(409, "not_frozen")
+	}
+	var deps []string
+	for _, b := range t.branchesOf(n) {
+		if !b.purged {
+			deps = append(deps, b.name)
+		}
+	}
+	if len(deps) > 0 {
+		return nil, apiErr(409, "in_use", "dependents", anyStrings(deps))
+	}
+	gone := func(ns *nsRow, _ string) bool { return ns.id == n.id }
+	forced := false
+	if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
+		if !force {
+			return nil, t.inUse(broken, "the namespace holds the last available copy of a schema revision referenced from another namespace (§6.1)")
+		}
+		if err := t.mayForce(n, a, operator); err != nil {
+			return nil, err
+		}
+		forced = true
+	}
+	if !operator {
+		env := t.basicEnvelope("purge-ns", "", a)
+		env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
+		if err := t.checkRules(cfg, a, env, false); err != nil {
+			return nil, err
+		}
+	}
+	return &purgePlan{n: n, a: a, forced: forced}, nil
+}
+
+// sqlPurgeNamespace is PurgeNamespace on SQL.
+func (e *Engine) sqlPurgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error) {
 	var out string
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsForWrite(req.NS)
-		if n == nil {
-			return t.absentNSOp(req.NS, req.Cred, force)
+		p, perr := t.planPurgeNS(req, ifMatch, force)
+		if perr != nil {
+			return perr
 		}
-		cfg := t.config(n.configSeq)
-		a, operator, aerr := t.purger(n, cfg, req, force)
-		if aerr != nil {
-			return aerr
-		}
-		if err := t.authorize(a, "purge-ns", ""); err != nil {
-			return err
-		}
-		// 410 after authorisation, like every write (§6.2).
-		if n.purged {
-			return t.purgedNS(n)
-		}
-		if ifMatch == "" {
-			return apiErr(428, "precondition_required")
-		}
-		head := t.nsLogID(n.headSeq.Int64)
-		if ifMatch != head.String() {
-			return apiErr(412, "stale", "head", head.String())
-		}
-		if !cfg.Frozen {
-			return apiErr(409, "not_frozen")
-		}
-		var deps []string
-		for _, b := range t.branchesOf(n) {
-			if !b.purged {
-				deps = append(deps, b.name)
-			}
-		}
-		if len(deps) > 0 {
-			return apiErr(409, "in_use", "dependents", anyStrings(deps))
-		}
-		gone := func(ns *nsRow, _ string) bool { return ns.id == n.id }
-		forced := false
-		if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
-			if !force {
-				return t.inUse(broken, "the namespace holds the last available copy of a schema revision referenced from another namespace (§6.1)")
-			}
-			if err := t.mayForce(n, a, operator); err != nil {
-				return err
-			}
-			forced = true
-		}
-		if !operator {
-			env := t.basicEnvelope("purge-ns", "", a)
-			env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
-			if err := t.checkRules(cfg, a, env, false); err != nil {
-				return err
-			}
-		}
+		n, a, forced := p.n, p.a, p.forced
 		t.deleteArchives(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.deleteDEKs(`ns = ?`, n.id)
 		// Sealed bytes and epoch keys go too (§E.2, §8.5).
@@ -1371,4 +1431,23 @@ func (t *tx) allBranchesOf(n *nsRow) []*nsRow {
 		}
 	}
 	return out
+}
+
+// configGenesis is n's first configuration: its seq, author and id.
+func (t *tx) configGenesis(n *nsRow) (seq, author int64, id ids.ID, ok bool) {
+	var gid []byte
+	if err := t.QueryRow(`SELECT seq, author, id FROM ns_config WHERE ns = ? AND parent_seq IS NULL`, n.id).Scan(&seq, &author, &gid); err != nil {
+		return 0, 0, ids.ID{}, false
+	}
+	return seq, author, ids.FromBytes(gid), true
+}
+
+// branchEntry is base's entry that created the branch whose config
+// genesis is gseq.
+func (t *tx) branchEntry(base *nsRow, gseq int64) (int64, bool) {
+	var seq int64
+	if err := t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND kind = ? AND target_seq = ?`, base.id, nsKindCode("branch"), gseq).Scan(&seq); err != nil {
+		return 0, false
+	}
+	return seq, true
 }

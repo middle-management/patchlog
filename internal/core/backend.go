@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/ids"
 )
@@ -26,6 +27,14 @@ type backend interface {
 	writeItems(ctx context.Context, req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun bool) (*WriteResult, error)
 	// writeConfig is a namespace's creation or config change.
 	writeConfig(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error)
+	// purge and purgeNamespace are §8.3's and §8.5's purges: the gate's
+	// planPurge or planPurgeNS, then the backend's commit. They return
+	// the purge entry's ns_id.
+	purge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error)
+	purgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error)
+	// createBranch is a branch's creation (§7.6): the gate's planBranch,
+	// then the backend's commit.
+	createBranch(ctx context.Context, req Request, br BranchRequest) (*WriteResult, error)
 	// uploadBlob is an upload or copy of blob bid to name (§7.8).
 	uploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error
 
@@ -39,6 +48,11 @@ type backend interface {
 	// firstEntryTime is the created time (milliseconds) of the
 	// deployment's first namespace entry; ok is false for none yet.
 	firstEntryTime(ctx context.Context) (ms int64, ok bool, err error)
+
+	// dueRepurges lists queued second CDN purges due at now (repurge.go),
+	// a batch; doneRepurge dequeues one sent.
+	dueRepurges(ctx context.Context, now time.Time) ([]dueRepurge, error)
+	doneRepurge(ctx context.Context, key any) error
 
 	ping(ctx context.Context) error
 	close() error
@@ -82,6 +96,18 @@ func (b sqlBackend) writeConfig(ctx context.Context, req Request, cc ConfigChang
 	return b.e.sqlWriteConfig(ctx, req, cc)
 }
 
+func (b sqlBackend) purge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error) {
+	return b.e.sqlPurge(ctx, req, name, ifMatch, force)
+}
+
+func (b sqlBackend) purgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error) {
+	return b.e.sqlPurgeNamespace(ctx, req, ifMatch, force)
+}
+
+func (b sqlBackend) createBranch(ctx context.Context, req Request, br BranchRequest) (*WriteResult, error) {
+	return b.e.sqlCreateBranch(ctx, req, br)
+}
+
 func (b sqlBackend) uploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error {
 	return b.e.sqlUploadBlob(ctx, req, name, bid, up)
 }
@@ -102,6 +128,14 @@ func (b sqlBackend) firstEntryTime(ctx context.Context) (int64, bool, error) {
 		return t.QueryRow(`SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms)
 	})
 	return ms.Int64, ms.Valid, err
+}
+
+func (b sqlBackend) dueRepurges(ctx context.Context, now time.Time) ([]dueRepurge, error) {
+	return b.e.sqlDueRepurges(ctx, now)
+}
+
+func (b sqlBackend) doneRepurge(ctx context.Context, key any) error {
+	return b.e.sqlDoneRepurge(ctx, key)
 }
 
 func (b sqlBackend) ping(ctx context.Context) error { return b.e.db.PingContext(ctx) }

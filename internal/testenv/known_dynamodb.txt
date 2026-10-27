@@ -7,6 +7,4 @@
 # Divergences: the backend answers differently from the spec.
 
 # Unsupported features met where the harness cannot skip.
-tree/TestHopsUnderWrites unsupported, met inside a service (501): purges
-server/TestBlobPurgeRacesUpload unsupported, met outside the harness (501): purges, from the test's own goroutines
-index/TestHopsUnderWrites unsupported, met inside a service (501): purges
+server/TestV049PurgedSkipped unsupported, met outside the harness (501): pruning, by the test's own retention call

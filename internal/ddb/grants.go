@@ -42,10 +42,14 @@ func (s *Store) Grant(ctx context.Context, gid string) (*StoredGrant, error) {
 	return &StoredGrant{Blocks: i.b("blocks"), Sub: i.s("rootSub"), Kid: i.s("rootKid")}, nil
 }
 
-// RecordsGrant reports whether an entry of ns records grant gid.
-func (s *Store) RecordsGrant(ctx context.Context, ns, gid string) (bool, error) {
+// RecordsGrant reports whether an entry of ns at or before position upTo
+// (0: any) records grant gid: its marker keeps the first that does.
+func (s *Store) RecordsGrant(ctx context.Context, ns, gid string, upTo uint64) (bool, error) {
 	it, err := s.getItem(ctx, keyNSGrant(ns, gid))
-	return it != nil, err
+	if it == nil || err != nil {
+		return false, err
+	}
+	return upTo == 0 || item(it).n("firstPos") <= upTo, nil
 }
 
 // FirstEntryTime is the created time (milliseconds) of the deployment's

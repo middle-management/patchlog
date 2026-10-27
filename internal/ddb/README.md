@@ -87,13 +87,18 @@ commit: the `-grouped` benchmarks keep rising with writers instead.
 
 ## Simplifications (all deliberate)
 
-- The scope is plain namespaces: no branches, purges, sealed/e2e, or the
-  S3 offload of large values. Blobs (blobs.go) keep attachments and
+- The scope is plain namespaces and local branches: no remote branches,
+  sealed/e2e, or the S3 offload of large values. Purges (purge.go) commit their flags at once
+  and their content after (`PurgeContent`, finished by the sweep from
+  `PURGING#` markers when interrupted); second CDN purges queue in the
+  commit (repurge.go). Blobs (blobs.go) keep attachments and
   pending entries as items of the namespace's partition and their bytes
   in `BYTES#<sha256>` items, inline (≤ `MaxInlineBytes`, which bounds
-  `blobSize` without a blob directory) or as a file of `-blob-dir`; no
-  reference intervals yet, so blobs don't cross branches or batch
-  sources. Grants are stored (grants.go): each
+  `blobSize` without a blob directory) or as a file of `-blob-dir`; an
+  attachment's `refPos` answers whether a chain references a blob up to
+  a revision. Branches (branch.go) are a commit to the base that creates
+  the branch in the same transaction; a branch's #META names its base,
+  and a first revision its foreign parent. Grants are stored (grants.go): each
   once, before the commits that record it, outside their transactions (a
   group's commits may share one); a namespace marker per grant, written
   once per transaction, answers GET /ns/{ns}/grants/{gid}; LOG and REV

@@ -45,6 +45,7 @@ type nsReads interface {
 	nsForWrite(name string) *nsRow
 	nsRowUnlocked(id int64) *nsRow
 	nsNames() []string
+	allNamespaces() []*nsRow
 	nsLevel(n *nsRow) int
 	lockNS(ns int64, mode lockMode)
 	noLocks() func()
@@ -115,12 +116,15 @@ type schemaReads interface {
 	pinnedRefs(l *nsRow) []string
 	pinningNames(l *nsRow, ref string) []string
 	schemaRefOf(seq int64) (string, bool)
-	schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map[int64]*nsRow
+	schemaPinsIn(n *nsRow) []schemaUse
 }
 
 // branchReads are branches, their bases and draft copies (§7.6).
 type branchReads interface {
 	branchesOf(n *nsRow) []*nsRow
+	configGenesis(n *nsRow) (seq, author int64, id ids.ID, ok bool)
+	branchEntry(base *nsRow, gseq int64) (int64, bool)
+	liveRegistrations(n *nsRow) []map[string]any
 	baseIdentity(n *nsRow) string
 	copyRows(id ids.ID, name string) []copyRow
 }

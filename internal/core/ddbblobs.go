@@ -33,7 +33,7 @@ func (b *ddbBackend) uploadBlob(ctx context.Context, req Request, name string, b
 	}
 	var hash []byte
 	if g.src != nil {
-		hash = g.src.hash // stored already: bytes are never collected here
+		hash = g.src.hash // stored already: the source's attachment names them
 	} else {
 		h := sha256.Sum256(data)
 		hash = h[:]
@@ -42,6 +42,13 @@ func (b *ddbBackend) uploadBlob(ctx context.Context, req Request, name string, b
 		}
 	}
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
+		if attempt > 0 && g.src == nil {
+			// A purge may have collected the bytes since (PutPending's
+			// condition on them): stored again.
+			if err := b.putBytes(ctx, hash, data); err != nil {
+				return err
+			}
+		}
 		r := newDDBReads(b, ctx)
 		t := &gate{checkReads: r, checkState: &checkState{e: e, now: e.now(), write: true}}
 		type checked struct {
@@ -144,6 +151,17 @@ func (b *ddbBackend) blobStats(ctx context.Context) (*BlobStats, error) {
 // of the SQL path, which collects them as the last row naming them goes).
 func (b *ddbBackend) sweepBlobs(ctx context.Context) (int, error) {
 	e := b.e
+	// Purges whose content is still to go first (ddbpurge.go): their
+	// attachments and pending entries then name no bytes.
+	pnss, pnames, err := b.store.Purging(ctx)
+	if err != nil {
+		return 0, ddbAsErr(err)
+	}
+	for i := range pnss {
+		if _, err := b.store.PurgeContent(ctx, pnss[i], pnames[i]); err != nil {
+			return 0, ddbAsErr(err)
+		}
+	}
 	blobs, nss, bytes, err := b.store.ScanBlobs(ctx)
 	if err != nil {
 		return 0, ddbAsErr(err)

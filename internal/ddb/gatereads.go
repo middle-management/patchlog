@@ -18,10 +18,14 @@ import (
 // NSRow is a namespace's meta and log tip.
 type NSRow struct {
 	Frozen, Purged bool
-	ConfigPos      uint64
-	ConfigID       string
-	TipPos         uint64
-	TipID          string
+	// A branch's base, the position it branched at in the base's log, and
+	// the base's configuration then (§7.6); "" for none.
+	Base               string
+	BaseAt, BaseCfgPos uint64
+	ConfigPos          uint64
+	ConfigID           string
+	TipPos             uint64
+	TipID              string
 }
 
 // Namespace reads ns's meta and tip; nil when it doesn't exist.
@@ -43,7 +47,8 @@ func (s *Store) Namespace(ctx context.Context, ns string) (*NSRow, error) {
 		switch i := item(it); i.s("SK") {
 		case "#META":
 			m := scanNSMeta(i)
-			r = &NSRow{Frozen: m.frozen, Purged: m.purged, ConfigPos: m.configPos, ConfigID: m.configID}
+			r = &NSRow{Frozen: m.frozen, Purged: m.purged, ConfigPos: m.configPos, ConfigID: m.configID,
+				Base: m.base, BaseAt: m.baseAt, BaseCfgPos: m.baseCfgPos}
 		case "#TIP":
 			t = scanTip(i)
 		}
@@ -106,7 +111,9 @@ func (s *Store) ConfigByID(ctx context.Context, ns, id string) (*ConfigRow, erro
 type ResRow struct {
 	HeadPos    uint64
 	HeadID     string
+	HeadNS     string // a purged read-through resource's head's namespace
 	Tombstoned bool
+	Purged     bool
 	EntryID    string
 	LastID     string
 	LastPos    uint64
@@ -118,7 +125,7 @@ func (s *Store) Resource(ctx context.Context, ns, name string) (*ResRow, error) 
 	if err != nil || r == nil || r.headPos == 0 {
 		return nil, err
 	}
-	return &ResRow{HeadPos: r.headPos, HeadID: r.headID, Tombstoned: r.state == "tombstoned", EntryID: r.entryID, LastID: r.lastID, LastPos: r.lastPos}, nil
+	return &ResRow{HeadPos: r.headPos, HeadID: r.headID, HeadNS: r.headNS, Tombstoned: r.state == "tombstoned", Purged: r.state == "purged", EntryID: r.entryID, LastID: r.lastID, LastPos: r.lastPos}, nil
 }
 
 // RevAt reads resource name's chain at pos; nil when there is none.
@@ -153,10 +160,32 @@ func (s *Store) DocAt(ctx context.Context, ns, name string, pos uint64) ([]byte,
 	if err != nil {
 		return nil, err
 	}
+	first := r
+	if pos != 1 {
+		if first, err = s.RevAt(ctx, ns, name, 1); err != nil {
+			return nil, err
+		}
+	}
 	if r != nil && r.Kind == "tombstone" {
+		if pos == 1 && r.ParentNS != "" {
+			// A tombstone on a revision read through from the base.
+			return s.DocAt(ctx, r.ParentNS, name, r.ParentPos)
+		}
 		pos-- // the chain is linear: the tombstone's parent
 	}
-	_, canon, err := s.FoldResource(ctx, ns, name, pos)
+	// A chain whose first revision continues a foreign parent (§7.6)
+	// folds from that parent's document.
+	var start any
+	if first != nil && first.ParentNS != "" {
+		b, err := s.DocAt(ctx, first.ParentNS, name, first.ParentPos)
+		if err != nil {
+			return nil, err
+		}
+		if start, err = jsonv.Parse(b); err != nil {
+			return nil, err
+		}
+	}
+	_, canon, err := s.foldFrom(ctx, ns, name, pos, start)
 	return canon, err
 }
 

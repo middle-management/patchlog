@@ -1,7 +1,6 @@
 package core
 
 import (
-	"database/sql"
 	"fmt"
 	"regexp"
 	"sort"
@@ -377,22 +376,13 @@ func (t *gate) satisfyingCopies(ref schema.Ref, m *nsRow, over map[int64]*Config
 // branch also of every revision it wrote, and the $ref closure of those,
 // resolved as the referencing namespace would. exclude skips referencing
 // resources.
-func (t *tx) schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map[int64]*nsRow {
+func (t *gate) schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map[int64]*nsRow {
 	// Nothing read here is locked (on Postgres, pglock.go): a write that
 	// makes a schema referenced holds the lock of the namespace it resolved
 	// it in shared, and purges hold that lock exclusively, or take it
 	// shared before relying on a copy (brokenReferences).
-	t.noLock++
-	defer func() { t.noLock-- }()
-	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
-	t.must(err)
-	var all []*nsRow
-	for rows.Next() {
-		n, err := scanNS(rows)
-		t.must(err)
-		all = append(all, n)
-	}
-	rows.Close()
+	defer t.noLocks()()
+	all := t.allNamespaces()
 	uses := map[string]map[int64]*nsRow{}
 	copies := map[string][]copyRow{}
 	docs := map[string]any{}
@@ -411,29 +401,14 @@ func (t *tx) schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map
 			if h.state == Purged || h.row == nil || exclude(n, h.name) {
 				continue
 			}
-			var ref sql.NullString
-			ll := t.lastLive(h.row)
-			t.must(t.QueryRow(`SELECT schema_ref FROM revisions WHERE seq = ?`, ll.seq).Scan(&ref))
-			if ref.Valid {
-				add(ref.String)
+			if ref, ok := t.schemaRefOf(t.lastLive(h.row).seq); ok {
+				add(ref)
 			}
 		}
 		if n.isBranch() {
 			// Every revision a branch wrote: a merge replays and validates
 			// every step (§7.5).
-			rr, err := t.Query(`SELECT DISTINCT s.name, r.schema_ref FROM revisions r JOIN resources s ON s.res = r.res
-				WHERE s.ns = ? AND s.state <> ? AND r.schema_ref IS NOT NULL`, n.id, statePurged)
-			t.must(err)
-			type use struct{ name, ref string }
-			var us []use
-			for rr.Next() {
-				var u use
-				t.must(rr.Scan(&u.name, &u.ref))
-				us = append(us, u)
-			}
-			t.must(rr.Err())
-			rr.Close()
-			for _, u := range us {
+			for _, u := range t.schemaPinsIn(n) {
 				if !exclude(n, u.name) {
 					add(u.ref)
 				}
@@ -576,4 +551,39 @@ func (t *gate) inUse(broken []*nsRow, msg string) *Error {
 		}
 	}
 	return apiErr(409, "in_use", "message", msg, "referencing", anyStrings(names))
+}
+
+// allNamespaces lists the unpurged namespaces, but the shadows (~).
+func (t *tx) allNamespaces() []*nsRow {
+	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
+	t.must(err)
+	defer rows.Close()
+	var all []*nsRow
+	for rows.Next() {
+		n, err := scanNS(rows)
+		t.must(err)
+		all = append(all, n)
+	}
+	t.must(rows.Err())
+	return all
+}
+
+// schemaUse is a resource a revision of which was typed by ref.
+type schemaUse struct{ name, ref string }
+
+// schemaPinsIn lists the (resource, schema) pairs of n's unpurged
+// resources' revisions typed by a schema, each once.
+func (t *tx) schemaPinsIn(n *nsRow) []schemaUse {
+	rr, err := t.Query(`SELECT DISTINCT s.name, r.schema_ref FROM revisions r JOIN resources s ON s.res = r.res
+		WHERE s.ns = ? AND s.state <> ? AND r.schema_ref IS NOT NULL`, n.id, statePurged)
+	t.must(err)
+	defer rr.Close()
+	var us []schemaUse
+	for rr.Next() {
+		var u schemaUse
+		t.must(rr.Scan(&u.name, &u.ref))
+		us = append(us, u)
+	}
+	t.must(rr.Err())
+	return us
 }

@@ -309,6 +309,54 @@ func TestLocalPinnedElsewhere(t *testing.T) {
 	}
 }
 
+// A purge commits the resource's purged state on the head it read, and a
+// write checked against that head before is stale; its content goes
+// after (PurgeContent), and a namespace purge refuses every later write.
+func TestLocalPurge(t *testing.T) {
+	s := newLocalStore(t)
+	ctx := context.Background()
+	mustCreateNS(t, s, "p")
+	w := mustWrite(t, s, "p", "a", "", `[{"op":"add","path":"","value":{"v":1}}]`)
+	late := testCommit(t, s, "p", "a", w.ID, `[{"op":"add","path":"/w","value":2}]`)
+	n, _ := s.Namespace(ctx, "p")
+	purge := func(c *Commit) error {
+		c.NS, c.Author, c.Created, c.CfgPos, c.CfgID = "p", "alice", time.Now().UnixMilli(), n.ConfigPos, n.ConfigID
+		_, err := s.Commit(ctx, c)
+		return err
+	}
+	if err := purge(&Commit{Purge: &CommitPurge{Name: "a", HeadPos: 1, HeadID: w.ID},
+		Entry: map[string]any{"resource": "a", "kind": "purge", "target": w.ID}, Kind: "purge"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Commit(ctx, late); !errors.Is(err, ErrStale) {
+		t.Fatalf("write checked before the purge: %v, want ErrStale", err)
+	}
+	if r, err := s.Resource(ctx, "p", "a"); err != nil || r == nil || !r.Purged {
+		t.Fatalf("resource after the purge: %+v %v", r, err)
+	}
+	if _, err := s.PurgeContent(ctx, "p", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if ri, err := s.RevAt(ctx, "p", "a", 1); err != nil || ri.Patches != "" {
+		t.Fatalf("revision after the content went: %+v %v", ri, err)
+	}
+	nss, _, err := s.Purging(ctx)
+	if err != nil || len(nss) != 0 {
+		t.Fatalf("purges left: %v %v", nss, err)
+	}
+
+	b := testCommit(t, s, "p", "b", "", `[{"op":"add","path":"","value":{}}]`)
+	if err := purge(&Commit{PurgeNS: true, Entry: map[string]any{"kind": "purge-ns"}, Kind: "purge-ns"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Commit(ctx, b); !errors.Is(err, ErrStale) {
+		t.Fatalf("write to a purged namespace: %v, want ErrStale", err)
+	}
+	if nr, _ := s.Namespace(ctx, "p"); nr == nil || !nr.Purged {
+		t.Fatalf("namespace after its purge: %+v", nr)
+	}
+}
+
 // Grouped commits race config changes and deletes, and two stores on one
 // table stand in for two instances, so groups lose the tip to other
 // writers and re-chain: every commit lands, or is stale and committed
