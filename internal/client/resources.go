@@ -270,6 +270,10 @@ type LogEntry struct {
 	// (§7.1, §7.2), "" if none; not hashed.
 	Gesture, Undoes string
 	Raw             map[string]any // the entry as served
+	// Kid is the kid of the JWE a sealed namespace served the entry as
+	// (§E.2.2), "" for an entry served in the clear: "{ns}#{e}", the
+	// epoch the server serves that revision under.
+	Kid string
 }
 
 func parseLogEntry(v any) (LogEntry, error) {

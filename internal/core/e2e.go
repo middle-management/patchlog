@@ -313,7 +313,7 @@ func (t *tx) snapshotKid(n *nsRow, cfg *Config, h *revRow) (string, int, string)
 				return n.name, e, fmt.Sprintf("the epoch of the snapshot kept at horizon %s of its chain", found.id)
 			}
 			if o, r := ownerOf(found.res); err == nil && o.id != n.id && r != nil && kns == t.kidName(o) && e <= r.epoch {
-				return kns, e, fmt.Sprintf("the epoch of the snapshot kept at horizon %s of its chain, from before %s's raise from sealed", found.id, o.name)
+				return kns, e, fmt.Sprintf("the epoch of the snapshot kept at horizon %s of its chain, from before %s's raise from sealed", found.id, kns)
 			}
 			return n.name, cfg.Epoch, inForce
 		}
@@ -331,7 +331,9 @@ func (t *tx) snapshotKid(n *nsRow, cfg *Config, h *revRow) (string, int, string)
 		// or a base's read through.
 		if o, r := ownerOf(found.res); r != nil {
 			kns := t.kidName(o)
-			return kns, t.preRaiseEpoch(o, found, r), fmt.Sprintf("%s, from before %s's raise from sealed, served under %s's epoch", at, o.name, kns)
+			// Named as the kid names it: a remote branch's shadow isn't a
+			// namespace clients can address.
+			return kns, t.preRaiseEpoch(o, found, r), fmt.Sprintf("%s, from before %s's raise from sealed, served under its epoch", at, kns)
 		}
 		return n.name, cfg.Epoch, inForce
 	}
@@ -356,9 +358,10 @@ func (t *tx) ownRes(n *nsRow, res int64) bool {
 
 // preRaiseEpoch is the epoch n serves its revision row r from before its
 // raise from sealed under (Addendum E Levels, §E.2.2): the epoch r was
-// written in (rev_epochs), else the one its first stored sealing fixed,
-// else the last epoch before the raise, which stands for the current one
-// for content from before it.
+// written in (rev_epochs; for a remote branch's shadow, the epoch its
+// source served the mirrored entry under, insertChain), else the one its
+// first stored sealing fixed, else the last epoch before the raise, which
+// stands for the current one for content from before it.
 func (t *tx) preRaiseEpoch(n *nsRow, r *revRow, raise *e2eRaise) int {
 	var e int
 	if err := t.QueryRow(`SELECT epoch FROM rev_epochs WHERE seq = ?`, r.seq).Scan(&e); err == nil {

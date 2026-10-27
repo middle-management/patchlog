@@ -266,3 +266,166 @@ func TestV073P36RemoteE2ERaiseAsFarAsLevelsAllow(t *testing.T) {
 		t.Fatalf("levels %+v %v, want e2e marked for a rebase", ls, err)
 	}
 }
+
+// v0.73 §E.2.3 (ENC-18, remote half): a branch's /keys relays its bases'
+// keyring entries "where no block has nbf, from the epoch that base has in
+// force now, so none once it has moved past its epoch at at". For a remote
+// branch of a branch (base.chain ["eb", "e"]), e is a base of rel too: the
+// follower reads e's epoch now from e's current document at the origin, so
+// once e has rotated B relays e#1 no more, as A doesn't for eb.
+func TestV073P36RemoteChainBaseEpochNow(t *testing.T) {
+	t.Parallel()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning)
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("e", e2eDoc(map[string]any{"keys": []any{kA.entry("*")}}))
+	g := a.grant(kA, "user:admin", []string{"e", "eb"}, allVerbs)
+	readerJWK, readerPriv, _ := seal.GenerateRecipient()
+	ke, kb := seal.NewKey(), seal.NewKey()
+	kre, _ := seal.BuildKeyringV2(readerPriv, "e", 1, ke, []*ecdh.PublicKey{readerPriv.PublicKey()})
+	krHead := a.create("e", "keyring", kre.Value(), g)
+	expect(t, a.branch("e", map[string]any{"name": "eb"}, g), 201)
+	krb, _ := seal.BuildKeyringV2(readerPriv, "eb", 1, kb, []*ecdh.PublicKey{readerPriv.PublicKey()})
+	a.appendRev("eb", "keyring", krHead, ops(op("replace", "", krb.Value())), g)
+	at := a.nsHead("eb", g)
+
+	var bPriv ed25519.PrivateKey
+	rt := &route{url: a.srv.URL, bearer: a.grant(kA, "svc:b", []string{"e", "eb"}, []string{"read"})}
+	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt), withKeyStore(newKeyStore(t)), withEncTuning)
+	b.opPriv = bPriv
+	kB := newKey("badmin")
+	doc := e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}})
+	doc["base"] = map[string]any{"origin": originA, "ns": "eb", "at": at, "chain": []any{"eb", "e"}}
+	expect(t, b.mkRemote("rel", addRoot(doc)), 201)
+	readerB := b.grant(kB, "user:reader", []string{"rel"}, []string{"read"}, map[string]any{"enc": readerJWK})
+	readerA := a.grant(kA, "user:reader", []string{"eb"}, []string{"read"}, map[string]any{"enc": readerJWK})
+	kidsB := func() string { _, r := b.keysOf("rel", nil, readerB); return kidsOf(t, r) }
+	kidsA := func() string { _, r := a.keysOf("eb", nil, readerA); return kidsOf(t, r) }
+	if got := kidsB(); got != "e#1,eb#1" && got != "eb#1,e#1" {
+		t.Fatalf("before e rotates: B relays %q", got)
+	}
+
+	// e, a base of eb (and so of rel), rotates to epoch 2.
+	expect(t, a.do(req{method: "PATCH", path: "/ns/e", ifMatch: a.configID("e", g), body: ops(op("add", "/encryption/epoch", 2.0)), bearer: g}), 201)
+	// eb writes something so B has something to follow.
+	expect(t, a.do(req{method: "PATCH", path: "/ns/eb", ifMatch: a.configID("eb", g), body: ops(op("add", "/x-touch", true)), bearer: g}), 201)
+	if err := syncRemotes(t, b); err != nil {
+		t.Fatal(err)
+	}
+	if got := kidsA(); got != "eb#1" {
+		t.Fatalf("A for eb after e rotated: %q, want eb#1 alone", got)
+	}
+	if got := kidsB(); got != "eb#1" {
+		t.Errorf("B for rel after e (in base.chain) rotated: %q, want eb#1 alone, as A answers for eb", got)
+	}
+}
+
+// v0.73 §E.3.1 (ENC-22/ENC-51, MF-37): a prune snapshot's kid, for content
+// from before a raise from sealed, is "the epoch that revision is served
+// under", and Levels have a branch serve what it reads through from before
+// the raise "as the base serves it". A serves x2, written in epoch 1, under
+// m#1; B mirrors the epoch each sealed entry was served under, so its
+// remote branch takes a snapshot of x2 under m#1, not the last epoch before
+// the raise, and names the source, not its internal shadow, when it
+// refuses one.
+func TestV073P36RemotePreRaiseSnapshotEpoch(t *testing.T) {
+	t.Parallel()
+	a := newEnv(t, withOrigin(originA), withKeyStore(newKeyStore(t)), withEncTuning)
+	a.mkNS("m", sealedDoc(map[string]any{"read": "grant"}))
+	x1 := a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+	x2 := a.wr("m", "x", x1, withNonce(ops(op("replace", "/v", 2.0)))) // epoch 1
+	a.clock.Advance(time.Hour)
+	expect(t, a.patchNS("m", ops(op("add", "/encryption/epoch", 2.0)), ""), 201)
+	a.clock.Advance(time.Hour)
+	expect(t, a.patchNS("m", ops(op("add", "/x-raise", true)), ""), 201)
+	raised := a.nsHead("m")
+	raisedDoc, _ := json.Marshal(map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e", "epoch": 3.0}})
+	// A serves x2 under the epoch it was written in.
+	g := a.get("/r/m/x/rev/" + x2)
+	if g.Code != 200 || !isJOSE(g) {
+		t.Fatalf("A's x2: %d %s", g.Code, g.Body)
+	}
+	h, err := seal.ParseHeader(string(g.Body))
+	if err != nil || h.Kid != "m#1" {
+		t.Fatalf("A serves x2 under %q (%v), want m#1", h.Kid, err)
+	}
+
+	var bPriv ed25519.PrivateKey
+	rt := &route{}
+	rt.set(proxyA(t, a, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/ns/m/rev/"+raised {
+			return false
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(raisedDoc)
+		return true
+	}, "", nil), "")
+	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt), withKeyStore(newKeyStore(t)), withEncTuning)
+	b.opPriv = bPriv
+	b.clock.Advance(3 * time.Hour)
+	kB := newKey("badmin")
+	expect(t, b.mkRemote("r", remoteGenesis("m", raised, e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}}))), 201)
+	prune := func(kid string) *resp {
+		jwe, err := seal.SealSnapshot(seal.NewKey(), kid, "r", "x", x2, map[string]any{"v": 2.0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b.prune("r", "x", map[string]any{"horizon": x2, "snapshot": jwe}, b.grant(kB, "user:admin", []string{"r"}, allVerbs))
+	}
+	r := prune("m#2")
+	expect(t, r, 422)
+	if bytes.Contains(r.Body, []byte("~r")) || !bytes.Contains(r.Body, []byte("before m's raise")) {
+		t.Errorf("B's refusal of a snapshot under m#2 names %s, want the source m, not the shadow", r.Body)
+	}
+	if r := prune("m#1"); r.Code != 200 {
+		t.Errorf("B's snapshot of x2 under m#1, the epoch A serves it under: %d %s, want 200", r.Code, r.Body)
+	}
+}
+
+// v0.73 §8.5, §E.2.4 (MF-37): a namespace purge destroys its epoch keys,
+// and a remote branch's purge destroys the keys of its source's epochs
+// from before a raise from sealed that its shadows hold (storeEpochKey).
+func TestV073P36PurgedRemoteDropsPreRaiseKeys(t *testing.T) {
+	t.Parallel()
+	a := newEnv(t, withOrigin(originA), withKeyStore(newKeyStore(t)), withEncTuning)
+	a.mkNS("m", sealedDoc(map[string]any{"read": "grant"}))
+	x1 := a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+	_ = x1
+	a.clock.Advance(time.Hour)
+	expect(t, a.patchNS("m", ops(op("add", "/x-raise", true)), ""), 201)
+	raised := a.nsHead("m")
+	raisedDoc, _ := json.Marshal(map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e", "epoch": 2.0}})
+	rt := &route{}
+	rt.set(proxyA(t, a, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/ns/m/rev/"+raised {
+			return false
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(raisedDoc)
+		return true
+	}, "", nil), "")
+	path, blobs := v073DB(t), t.TempDir()
+	var bPriv ed25519.PrivateKey
+	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt), withKeyStore(newKeyStore(t)), withEncTuning,
+		func(o *core.Options) { o.Path, o.BlobDir = path, blobs })
+	b.opPriv = bPriv
+	b.clock.Advance(3 * time.Hour)
+	kB := newKey("badmin")
+	expect(t, b.mkRemote("r", remoteGenesis("m", raised, e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}}))), 201)
+	db, q := v073SQL(t, path)
+	count := func() int {
+		var n int
+		if err := db.QueryRow(q(`SELECT COUNT(*) FROM epoch_keys WHERE ns IN (SELECT ns FROM namespaces WHERE name LIKE ?)`), "~r%").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := count(); n == 0 {
+		t.Fatal("the shadow holds no pre-raise key: the scenario didn't happen")
+	}
+	b.purgeNSAs("r", b.grant(kB, "user:admin", []string{"r"}, allVerbs))
+	if n := count(); n != 0 {
+		t.Errorf("after the remote branch's purge, its shadows still hold %d of A's epoch keys", n)
+	}
+}

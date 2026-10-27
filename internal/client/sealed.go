@@ -470,6 +470,7 @@ func (c *Client) openEntry(ctx context.Context, ns, name, jwe string) (LogEntry,
 	if e.ID != h.PL["id"] || e.Kind != h.PL["kind"] {
 		return LogEntry{}, fmt.Errorf("client: sealed log entry %s does not match its binding: %w", e.ID, seal.ErrMismatch)
 	}
+	e.Kid = h.Kid
 	return e, nil
 }
 
