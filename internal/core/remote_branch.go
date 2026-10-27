@@ -2273,6 +2273,7 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	// The base's namespace document after each config change, which this
 	// deployment reads only from the base itself (§G.5.2).
 	docs := map[string]sourceDoc{}
+	e2eSeen := catchUp != nil && catchUp.level == levelE2E
 	for _, en := range entries {
 		if !configChanged(en) {
 			continue
@@ -2282,6 +2283,39 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 			return err
 		}
 		docs[en.ID] = d
+		e2eSeen = e2eSeen || d.level == levelE2E
+	}
+	// A raise to e2e is followed as far as Levels allow (followLevel): to
+	// the level the base had before it, once, while the branch is below
+	// e2e and hasn't recorded it.
+	if e2eSeen {
+		var below bool
+		if err := e.read(ctx, func(t *tx) error {
+			bn := t.nsByID(b.branch)
+			var recorded int
+			if err := t.QueryRow(`SELECT level FROM remote_levels WHERE branch = ?`, bn.id).Scan(&recorded); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				t.must(err)
+			}
+			below = t.config(bn.configSeq).level < levelE2E && recorded < levelE2E
+			return nil
+		}); err != nil {
+			return err
+		}
+		if below {
+			pre, err := preRaiseLevel(ctx, c, ep, b)
+			if err != nil && noAnswer(err) {
+				return err
+			}
+			for id, d := range docs {
+				if d.level == levelE2E {
+					d.pre = pre
+					docs[id] = d
+				}
+			}
+			if catchUp != nil && catchUp.level == levelE2E {
+				catchUp.pre = pre
+			}
+		}
 	}
 	return errors.Join(e.update(ctx, func(t *tx) error {
 		// The branch's lock first: the checkpoint is read as of it.
@@ -2302,6 +2336,7 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 		author := t.authorID(RemoteAuthor)
 		for _, en := range entries {
 			if d, ok := docs[en.ID]; ok {
+				t.followEpoch(b.shadow, d, en.Created)
 				if !bn.purged {
 					t.followConfig(bn, en.ID, d)
 					bn = t.nsByIDLocked(bn.id, lockExclusive)
@@ -2370,10 +2405,14 @@ func configChanged(en client.NSEntry) bool {
 
 // sourceDoc is what a remote branch follows of its base's namespace
 // document after a config change (§G.5.2): its level, and its read, ""
-// where the document is sealed and this deployment can't open it.
+// where the document is sealed and this deployment can't open it. At e2e,
+// epoch is its encryption.epoch, and pre the level the base had before its
+// raise to e2e, where the follower read it (preRaiseLevel).
 type sourceDoc struct {
 	level int
 	read  string
+	epoch int
+	pre   int
 }
 
 // fetchSourceDoc reads the base's namespace document as of nsID. One the
@@ -2383,12 +2422,64 @@ func fetchSourceDoc(ctx context.Context, c *client.Client, ep RemoteEndpoint, ns
 	d, err := c.NSDoc(ctx, ns, nsID)
 	if err == nil {
 		read, _ := d.Value["read"].(string)
-		return sourceDoc{level: docLevel(d.Value), read: read}, nil
+		sd := sourceDoc{level: docLevel(d.Value), read: read}
+		if enc, ok := d.Value["encryption"].(map[string]any); ok {
+			if f, ok := enc["epoch"].(float64); ok {
+				sd.epoch = int(f)
+			}
+		}
+		return sd, nil
 	}
 	if !noAnswer(err) && sealedAt(ctx, ep, c.BaseURL(), "/ns/"+ns+"/rev/"+nsID) {
 		return sourceDoc{level: levelSealed}, nil
 	}
 	return sourceDoc{}, fmt.Errorf("/ns/%s/rev/%s: %w", ns, nsID, err)
+}
+
+// preRaiseLevel is the level b's base had before its raise to e2e, from
+// its namespace documents from the branch's at on: the branch was created
+// below e2e, so the raise lies after at (Addendum E Levels). This
+// deployment reads them only from the base itself (§G.5.2).
+func preRaiseLevel(ctx context.Context, c *client.Client, ep RemoteEndpoint, b *remoteBase) (int, error) {
+	d, err := fetchSourceDoc(ctx, c, ep, b.ns, b.at)
+	if err != nil {
+		return levelNone, err
+	}
+	level := d.level
+	entries, _, err := verify.Namespace(ctx, c, b.ns, b.at)
+	if err != nil {
+		return levelNone, err
+	}
+	for _, en := range entries {
+		if !configChanged(en) {
+			continue
+		}
+		d, err := fetchSourceDoc(ctx, c, ep, b.ns, en.ID)
+		if err != nil {
+			return levelNone, err
+		}
+		if d.level == levelE2E {
+			break
+		}
+		level = d.level
+	}
+	return level, nil
+}
+
+// followEpoch records an epoch of an e2e base seen at a config change in
+// the shadow mirroring it, sh, with the entry's created time: the shadow's
+// document stays the base's as of at, and a branch's /keys relays the
+// base's keyring entries by the epoch the base has in force now (epochNow,
+// §E.2.3), so none once it has moved past its epoch at at.
+func (t *tx) followEpoch(sh int64, d sourceDoc, created string) {
+	if d.level != levelE2E || d.epoch < 1 {
+		return
+	}
+	if t.config(t.nsByID(sh).configSeq).level != levelE2E {
+		return
+	}
+	_, err := t.Exec(`INSERT INTO e2e_epochs (ns, epoch, created) VALUES (?,?,?) ON CONFLICT DO NOTHING`, sh, d.epoch, parseCreated(created, t.now))
+	t.must(err)
 }
 
 // sealedAt reports whether the base answers path, one of its namespace
@@ -2447,7 +2538,7 @@ func (t *tx) followConfig(bn *nsRow, id string, d sourceDoc) {
 	}
 	applied := true
 	if raise {
-		applied = t.followLevel(bn, id, d.level)
+		applied = t.followLevel(bn, id, d.level, d.pre)
 	}
 	if restrict {
 		applied = t.restrictRead(bn) && applied
@@ -2471,15 +2562,23 @@ func (t *tx) followConfig(bn *nsRow, id string, d sourceDoc) {
 //     do too rather than be served below the base's level (Levels);
 //   - e2e, which Levels refuse a branch whose at is before its base's e2e
 //     raise, as the raise seen after at is: the branch needs a rebase. It
-//     keeps serving what it read through, which the base serves as at the
-//     level before its raise (Addendum E Levels, After a raise).
-func (t *tx) followLevel(bn *nsRow, id string, level int) bool {
+//     follows as far as Levels allow: to pre, the level the base had
+//     before the raise, at which the base goes on serving what the branch
+//     reads through (Addendum E Levels, After a raise), where the branch
+//     missed it, as a follower that skipped config entries did.
+func (t *tx) followLevel(bn *nsRow, id string, level, pre int) bool {
 	lacks, rebase := false, false
 	switch {
 	case t.e.opt.KeyStore == nil:
 		lacks = true
 	case level == levelE2E:
 		rebase = true
+		if pre > t.config(bn.configSeq).level {
+			if err := t.raiseLeavesFirst(bn, pre); err != nil {
+				log.Printf("remote branch %s: following its base's level before its raise to e2e, %s: %v", bn.name, levelNames[pre], err)
+				lacks = true
+			}
+		}
 	default:
 		if err := t.raiseLeavesFirst(bn, level); err != nil {
 			log.Printf("remote branch %s: following its base's raise to %s: %v", bn.name, levelNames[level], err)
