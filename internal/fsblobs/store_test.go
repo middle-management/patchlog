@@ -13,8 +13,8 @@ import (
 	"time"
 )
 
-// Put, Open with seeks, List (temporary files included), Remove; a
-// missing name is fs.ErrNotExist.
+// Put, Open with seeks, List (without temporary files), Remove; a missing
+// name is fs.ErrNotExist; SweepLeftovers deletes old temporary files.
 func TestStore(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -28,7 +28,14 @@ func TestStore(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(s.Dir, "0", "ab", TempPrefix+"1"), []byte("x"), 0o600); err != nil {
+	old, fresh := filepath.Join(s.Dir, "0", "ab", tmpPrefix+"1"), filepath.Join(s.Dir, "0", "ab", tmpPrefix+"2")
+	for _, p := range []string{old, fresh} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(old, past, past); err != nil {
 		t.Fatal(err)
 	}
 	var names []string
@@ -42,8 +49,17 @@ func TestStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	sort.Strings(names)
-	if strings.Join(names, " ") != "0/ab/.tmp-1 0/ab/x.1 e/1/ab/y.1.2" {
+	if strings.Join(names, " ") != "0/ab/x.1 e/1/ab/y.1.2" {
 		t.Fatalf("listed %v", names)
+	}
+	if n, err := s.SweepLeftovers(ctx, time.Now().Add(-time.Hour)); err != nil || n != 1 {
+		t.Fatalf("swept %d leftovers, %v", n, err)
+	}
+	if _, err := os.Stat(old); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("old temporary file: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("fresh temporary file: %v", err)
 	}
 	f, err := s.Open(ctx, "0/ab/x.1")
 	if err != nil {

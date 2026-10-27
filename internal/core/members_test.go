@@ -239,7 +239,7 @@ func TestShadowEncryption(t *testing.T) {
 // that changes such a member must give it an "x-" name (§7.4).
 func TestStoredMembersAfterUpgrade(t *testing.T) {
 	t.Parallel()
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
 	if err != nil {
 		t.Fatal(err)
 	}

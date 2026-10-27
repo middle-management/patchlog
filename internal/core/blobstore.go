@@ -7,13 +7,14 @@ package core
 // the Postgres row locks between them are as before. What a blob store
 // changes is where a row's bytes are:
 //
-//   - no store (Engine.blobs nil): in the row (data). The default for
-//     ":memory:" and for Postgres (DynamoDB: inline in the BYTES# item).
+//   - no store (Options.BlobStore nil): in the row (data). On DynamoDB,
+//     inline in the BYTES# item.
 //   - a BlobStore: in a file of the store, named by the row (file); data is
-//     empty (blob_bytes) or NULL (blob_epochs). internal/fsblobs keeps files under
-//     a directory, the default for a SQLite file at "<db path>.blobs";
-//     internal/s3blobs keeps them as objects of an S3 bucket
-//     (Options.BlobStore, opened from -blob-store by internal/blobstores).
+//     empty (blob_bytes) or NULL (blob_epochs). internal/fsblobs keeps files
+//     under a directory, internal/s3blobs objects of an S3 bucket. The
+//     engine knows neither: internal/blobstores opens them from
+//     -blob-store and -blob-dir, and defaults to "<db path>.blobs" next to
+//     a SQLite file.
 //
 // Rows whose file is NULL keep their bytes in data whichever store the
 // engine has, so a database written before files (or by an instance
@@ -46,8 +47,8 @@ package core
 // secure_delete pages); encryption at rest makes it unreadable instead.
 //
 // The sweep. On the leader, SweepBlobFiles lists the store and deletes
-// files older than orphanGrace that no row names (and temporary files that
-// old), which only
+// files older than orphanGrace that no row names (and has a store clean
+// its own leftovers that old, blobLeftovers), which only
 // a crash, an ambiguous commit or a lost race leaves. No transaction lasts
 // that long, so a file whose row is yet to commit is never swept.
 //
@@ -67,8 +68,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/middle-management/patchlog/internal/fsblobs"
 )
 
 // orphanGrace is how old an unnamed stored object must be before the sweep
@@ -102,33 +101,11 @@ type BlobStore interface {
 	String() string
 }
 
-// openBlobStore picks the engine's blob store: Options.BlobStore, else a
-// directory (Options.BlobDir, by default "<db path>.blobs" next to a
-// SQLite file), else nil, the bytes then kept in their rows (":memory:",
-// and Postgres without either).
-func openBlobStore(opt Options, pg bool) (BlobStore, error) {
-	switch {
-	case opt.BlobStore != nil && opt.BlobDir != "":
-		return nil, errors.New("core: give BlobStore or BlobDir, not both")
-	case opt.BlobStore != nil:
-		return opt.BlobStore, nil
-	}
-	dir := opt.BlobDir
-	if dir == "" {
-		switch {
-		case pg:
-			log.Print("blob bytes are stored in the database: give -blob-store (an s3:// bucket, or a file:// directory every instance shares) to store them outside it")
-			return nil, nil
-		case opt.Path == ":memory:":
-			return nil, nil
-		}
-		dir = opt.Path + ".blobs"
-	}
-	s, err := fsblobs.Open(dir)
-	if err != nil {
-		return nil, err
-	}
-	return s, nil
+// blobLeftovers is a store that leaves debris of its own, as fsblobs
+// leaves the temporary file of a write a crash interrupted: the orphan
+// sweep has it delete what is older than the grace.
+type blobLeftovers interface {
+	SweepLeftovers(ctx context.Context, before time.Time) (int, error)
 }
 
 // BlobStore is the engine's blob store; nil when blob bytes are kept in
@@ -251,9 +228,9 @@ func epochFile(ns int64, bid []byte, e int) string {
 // --- the orphan sweep ------------------------------------------------------------
 
 // SweepBlobFiles deletes the files of the blob store that no row names
-// and that are older than the grace (an hour), and temporary files that
-// old: what a crash, an ambiguous commit or a lost race leaves
-// (blobstore.go). It returns how many it deleted.
+// and that are older than the grace (an hour), and the store's own
+// leftovers that old (blobLeftovers): what a crash, an ambiguous commit or
+// a lost race leaves (blobstore.go). It returns how many it deleted.
 func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 	if e.blobs == nil {
 		return 0, nil
@@ -271,16 +248,11 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 		key   int64  // owner or ns
 	}
 	cands := map[group][]string{}
-	var temps []string
 	err := e.blobs.List(ctx, func(name string, _ int64, modified time.Time) error {
 		if !modified.Before(cutoff) {
 			return nil
 		}
 		parts := strings.Split(name, "/")
-		if strings.HasPrefix(parts[len(parts)-1], fsblobs.TempPrefix) {
-			temps = append(temps, name)
-			return nil
-		}
 		var g group
 		var err error
 		switch {
@@ -344,7 +316,6 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 	}); err != nil {
 		return 0, err
 	}
-	orphans = append(orphans, temps...)
 	n := 0
 	if err := e.jobStep(ctx); err != nil {
 		return 0, err
@@ -355,6 +326,13 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 			continue
 		}
 		n++
+	}
+	if l, ok := e.blobs.(blobLeftovers); ok {
+		m, err := l.SweepLeftovers(ctx, cutoff)
+		n += m
+		if err != nil {
+			return n, err
+		}
 	}
 	return n, nil
 }

@@ -91,12 +91,8 @@ func openDDB(opt Options) (*Engine, error) {
 	// Blob bytes go to the blob store (S3 for several instances; a
 	// directory for one), or else into their items, which bounds blobSize
 	// by an item's size.
-	var blobs BlobStore
-	if opt.BlobStore != nil || opt.BlobDir != "" {
-		if blobs, err = openBlobStore(opt, false); err != nil {
-			return nil, err
-		}
-	} else {
+	blobs := opt.BlobStore
+	if blobs == nil {
 		opt.Maximums.BlobSize = min(opt.Maximums.BlobSize, ddb.MaxInlineBytes)
 		opt.Limits.BlobSize = min(opt.Limits.BlobSize, opt.Maximums.BlobSize)
 	}

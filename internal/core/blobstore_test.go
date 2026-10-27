@@ -22,7 +22,7 @@ import (
 
 func openBlobEngine(t *testing.T) *Engine {
 	t.Helper()
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1,
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1,
 		BlobSweepInterval: -1, Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
@@ -336,3 +336,16 @@ func TestPGBlobFilesShared(t *testing.T) {
 
 // blobRoot is the directory of the engine's file store.
 func blobRoot(e *Engine) string { return e.blobs.(*fsblobs.Store).Dir }
+
+// fileBlobs is a blob store in a temporary directory of the test's.
+func fileBlobs(tb testing.TB) BlobStore { return dirBlobs(tb, tb.TempDir()) }
+
+// dirBlobs is a blob store in dir.
+func dirBlobs(tb testing.TB, dir string) BlobStore {
+	tb.Helper()
+	s, err := fsblobs.Open(dir)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return s
+}

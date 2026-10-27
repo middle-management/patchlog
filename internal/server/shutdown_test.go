@@ -55,7 +55,7 @@ func newShutdownEnv(t *testing.T, lopt lifecycle.Options) *sdEnv {
 		BeforeCommit: hook.run, LongPollInterval: 10 * time.Minute}
 	withFileDB(t)(&o)
 	if pgtest.Enabled() {
-		o.BlobDir = t.TempDir()
+		o.BlobStore = testenv.FileBlobs(t)
 	}
 	e, err := core.Open(o)
 	if err != nil {

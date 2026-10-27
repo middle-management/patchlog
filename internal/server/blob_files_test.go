@@ -179,9 +179,10 @@ func TestBlobFilesSealed(t *testing.T) {
 	expect(t, e.get(loc), 410)
 }
 
-// The orphan sweep deletes old files no row names and old temporary files,
-// and nothing else. "Old" is past BlobOrphanGrace, shortened here: the
-// files are stored, then those meant to look fresh once it has passed.
+// The orphan sweep deletes old files no row names, and nothing else (a
+// store's own leftovers, as fsblobs' temporary files, are its package's to
+// test). "Old" is past BlobOrphanGrace, shortened here: the files are
+// stored, then those meant to look fresh once it has passed.
 func TestBlobFilesOrphanSweep(t *testing.T) {
 	t.Parallel()
 	const grace = 2 * time.Second
@@ -203,17 +204,15 @@ func TestBlobFilesOrphanSweep(t *testing.T) {
 	write("0/ab/"+h+".0011223344556677", // orphan bytes
 		"7/ab/"+h+".0011223344556677",              // orphan bytes of a resource
 		"e/1/ab/"+strings.Repeat("ab", 20)+".1.00", // orphan sealing
-		"0/ab/.tmp-123",         // an interrupted write
 		"notes.txt", "0/README") // not the store's
-	time.Sleep(grace + time.Second)      // object stores keep whole seconds
-	write("0/ab/"+h+".8899aabbccddeeff", // a write yet to commit
-		"0/ab/.tmp-456")
+	time.Sleep(grace + time.Second)          // object stores keep whole seconds
+	write("0/ab/" + h + ".8899aabbccddeeff") // a write yet to commit
 	n, err := e.e.SweepBlobFiles(context.Background())
-	if err != nil || n != 4 {
+	if err != nil || n != 3 {
 		t.Fatalf("swept %d %v", n, err)
 	}
 	got := e.blobFiles("")
-	want := []string{"0/README", "0/ab/.tmp-456", "0/ab/" + h + ".8899aabbccddeeff", named, "notes.txt"}
+	want := []string{"0/README", "0/ab/" + h + ".8899aabbccddeeff", named, "notes.txt"}
 	sort.Strings(want)
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("left %v, want %v", got, want)
@@ -232,8 +231,8 @@ func TestBlobFilesLegacyRows(t *testing.T) {
 	bid := e.upload("l", "a", "text/plain", data)
 	head := e.create("l", "a", map[string]any{"b": ref(bid, "text/plain", len(data), "")})
 	file := e.expectFiles("", 1, "the upload")[0]
-	if e.blobStats().Dir != path+".blobs" {
-		t.Fatalf("blob directory %s, want next to the database", e.blobStats().Dir)
+	if e.blobStats().Store != path+".blobs" {
+		t.Fatalf("blob directory %s, want next to the database", e.blobStats().Store)
 	}
 	// As an earlier version stored it.
 	db, err := sql.Open("sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)"))

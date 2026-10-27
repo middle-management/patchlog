@@ -143,16 +143,13 @@ type Options struct {
 	// on the leader. Zero means ten minutes; negative disables it.
 	BlobSweepInterval time.Duration
 	// BlobStore is where blob bytes are stored (blobstore.go): a directory
-	// (internal/fsblobs) or an object store such as S3 (internal/s3blobs,
-	// internal/blobstores opens either from a URL). Instances sharing a
-	// database must share the store too.
+	// (internal/fsblobs) or an object store such as S3 (internal/s3blobs);
+	// internal/blobstores opens either from -blob-store or -blob-dir, and
+	// picks the default (a directory next to a SQLite file). Nil keeps
+	// the bytes in the database (DynamoDB: in the items, at most
+	// ddb.MaxInlineBytes each). Instances sharing a database must share
+	// the store too.
 	BlobStore BlobStore
-	// BlobDir is the directory blob bytes are stored in, short for a
-	// BlobStore of fsblobs.Open(BlobDir). With neither, it is
-	// "<Path>.blobs" for a SQLite file, and the database itself for
-	// ":memory:" and Postgres (DynamoDB: the items, at most
-	// ddb.MaxInlineBytes each).
-	BlobDir string
 	// BlobOrphanGrace is how old a file of the blob store must be before
 	// the orphan sweep deletes it when no row names it (SweepBlobFiles).
 	// Zero means an hour; it must exceed the longest transaction.
@@ -389,10 +386,9 @@ func Open(opt Options) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	blobs, err := openBlobStore(opt, pg)
-	if err != nil {
-		db.Close()
-		return nil, err
+	blobs := opt.BlobStore
+	if blobs == nil && pg {
+		log.Print("blob bytes are stored in the database: give -blob-store (an s3:// bucket, or a file:// directory every instance shares) to store them outside it")
 	}
 	if opt.RetentionInterval == 0 {
 		opt.RetentionInterval = time.Hour

@@ -16,7 +16,7 @@ func TestPGColumnCompression(t *testing.T) {
 	t.Parallel()
 	path := pgtest.FreshDB(t)
 	open := func() *Engine {
-		e, err := Open(Options{Path: path, BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+		e, err := Open(Options{Path: path, BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 			Purger: discardPurger{}})
 		if err != nil {
 			t.Fatal(err)

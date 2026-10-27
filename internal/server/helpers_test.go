@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base32"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/blobstores"
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -74,12 +76,12 @@ func withFileDB(t *testing.T) envOpt {
 	return func(o *core.Options) { o.Path = testenv.NewDB(t) }
 }
 
-// tableBlobs, as BlobDir, keeps blob bytes in the database
-// (":memory:" and Postgres without a blob directory) instead of the
-// temporary directory tests use by default.
-const tableBlobs = "\x00table"
+// tableBlobs, as BlobStore, keeps blob bytes in the database (as
+// ":memory:" and Postgres without a store do) instead of the store tests
+// use by default. Its methods are never called.
+var tableBlobs core.BlobStore = &struct{ core.BlobStore }{}
 
-func withTableBlobs(o *core.Options) { o.BlobDir = tableBlobs }
+func withTableBlobs(o *core.Options) { o.BlobStore = tableBlobs }
 
 func newEnv(t *testing.T, opts ...envOpt) *tenv {
 	t.Helper()
@@ -100,9 +102,16 @@ func newEnvWith(t *testing.T, sopts []Option, opts ...envOpt) *tenv {
 	}
 	testenv.StoreCompression(&o)
 	switch {
-	case o.BlobDir == tableBlobs:
-		o.BlobDir = ""
-	case o.BlobDir == "" && o.BlobStore == nil && (o.Path == ":memory:" || strings.HasPrefix(o.Path, "postgres") || strings.HasPrefix(o.Path, "dynamodb:")):
+	case o.BlobStore == tableBlobs:
+		o.BlobStore = nil
+	case o.BlobStore == nil && core.IsSQLiteFile(o.Path):
+		// As a deployment has it: "<db>.blobs" next to the file.
+		s, err := blobstores.ForDB(context.Background(), "", "", o.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.BlobStore = s
+	case o.BlobStore == nil:
 		// Blob bytes in files, as a SQLite file has them by default: in a
 		// temporary directory, or in S3 (testenv.BlobsEnv).
 		testenv.Blobs(t, &o)

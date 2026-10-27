@@ -53,6 +53,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/ddb"
+	"github.com/middle-management/patchlog/internal/fsblobs"
 	"github.com/middle-management/patchlog/internal/pgtest"
 	"github.com/middle-management/patchlog/internal/s3blobs"
 )
@@ -149,12 +150,22 @@ var (
 	s3Seq   atomic.Int64
 )
 
+// FileBlobs is a blob store in a temporary directory of the test's.
+func FileBlobs(t testing.TB) core.BlobStore {
+	t.Helper()
+	s, err := fsblobs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 // Blobs sets the blob store of an engine a harness starts (BlobsEnv).
 func Blobs(t testing.TB, o *core.Options) {
 	t.Helper()
 	url := os.Getenv(BlobsEnv)
 	if url == "" {
-		o.BlobDir = t.TempDir()
+		o.BlobStore = FileBlobs(t)
 		return
 	}
 	s3Once.Do(func() {

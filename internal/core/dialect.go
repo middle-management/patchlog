@@ -10,6 +10,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 // The storage dialect: SQLite (the default, Addendum D.2) or Postgres
@@ -27,6 +29,13 @@ import (
 //   - array arguments, which SQLite reads as JSON (inArray);
 //   - constraint violations (isConflict);
 //   - transactions and write serialisation (engine.go).
+
+// IsSQLiteFile reports whether a database path names a SQLite file: not
+// ":memory:", a Postgres URL or a DynamoDB table (blob stores default to a
+// directory next to such a file, internal/blobstores).
+func IsSQLiteFile(path string) bool {
+	return path != ":memory:" && !isPostgresURL(path) && !ddb.IsURL(path)
+}
 
 // isPostgresURL reports whether a database path names a Postgres database.
 func isPostgresURL(path string) bool {

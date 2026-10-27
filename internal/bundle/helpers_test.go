@@ -46,7 +46,7 @@ type deployment struct {
 
 func newDeployment(t testing.TB, origin string, opts ...func(*core.Options)) *deployment {
 	t.Helper()
-	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: origin, AuthDisabled: true, Purger: nopPurger{}}
+	o := core.Options{Path: pgtest.DB(t), BlobStore: testenv.FileBlobs(t), Origin: origin, AuthDisabled: true, Purger: nopPurger{}}
 	for _, f := range opts {
 		f(&o)
 	}

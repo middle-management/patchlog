@@ -20,19 +20,16 @@ func addBlobFlags(fs *flag.FlagSet) blobFlags {
 	}
 }
 
-// apply sets the engine's blob store.
+// apply sets the engine's blob store, opt.Path being set
+// (blobstores.ForDB).
 func (f blobFlags) apply(opt *core.Options) error {
-	switch {
-	case *f.store != "" && *f.dir != "":
+	if *f.store != "" && *f.dir != "" {
 		return fmt.Errorf("give -blob-store or -blob-dir ($PATCHLOG_BLOB_STORE or $PATCHLOG_BLOB_DIR), not both")
-	case *f.store != "":
-		s, err := blobstores.Open(context.Background(), *f.store)
-		if err != nil {
-			return fmt.Errorf("-blob-store: %w", err)
-		}
-		opt.BlobStore = s
-	default:
-		opt.BlobDir = *f.dir
 	}
+	s, err := blobstores.ForDB(context.Background(), *f.store, *f.dir, opt.Path)
+	if err != nil {
+		return fmt.Errorf("-blob-store/-blob-dir: %w", err)
+	}
+	opt.BlobStore = s
 	return nil
 }

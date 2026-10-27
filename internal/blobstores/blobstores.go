@@ -4,8 +4,10 @@
 //	file:///var/lib/patchlog/blobs                  a directory (internal/fsblobs, as -blob-dir)
 //	s3://bucket/prefix?region=…&endpoint=…          an S3 bucket (internal/s3blobs)
 //
-// It is the one place that knows every kind, so the engine needn't import
-// a store's dependencies (the AWS SDK for S3).
+// and picks a deployment's store (ForDB): -blob-store, -blob-dir, or by
+// default a directory next to a SQLite file. It is the one place that
+// knows every kind, so the engine imports none of them, nor their
+// dependencies (the AWS SDK for S3).
 package blobstores
 
 import (
@@ -18,6 +20,29 @@ import (
 	"github.com/middle-management/patchlog/internal/fsblobs"
 	"github.com/middle-management/patchlog/internal/s3blobs"
 )
+
+// ForDB picks a deployment's store from -blob-store (url) and -blob-dir
+// (dir), at most one given: the store the URL names, else the directory,
+// else "<db>.blobs" next to a SQLite file database. For ":memory:",
+// Postgres and DynamoDB without either it is nil: the bytes stay in the
+// database.
+func ForDB(ctx context.Context, url, dir, db string) (core.BlobStore, error) {
+	switch {
+	case url != "" && dir != "":
+		return nil, fmt.Errorf("blob store: give a URL or a directory, not both")
+	case url != "":
+		return Open(ctx, url)
+	case dir == "" && core.IsSQLiteFile(db):
+		dir = db + ".blobs"
+	case dir == "":
+		return nil, nil
+	}
+	s, err := fsblobs.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
 
 // Open opens the store a URL names.
 func Open(ctx context.Context, rawurl string) (core.BlobStore, error) {

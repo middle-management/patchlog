@@ -67,7 +67,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/middle-management/patchlog/internal/fsblobs"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schema"
@@ -1250,10 +1249,9 @@ type BlobStats struct {
 	Encrypted int // of them, encrypted under a resource's data key
 	Files     int // of them, in files (blobstore.go); the rest in the table
 	Size      int64
-	// Store describes the blob store (BlobStore.String), "" if bytes are
-	// stored in the database; Dir is the directory of a file store.
+	// Store describes the blob store (BlobStore.String: a file store's
+	// directory, an S3 URL), "" if bytes are stored in the database.
 	Store string
-	Dir   string
 }
 
 // BlobStats counts the rows of blob storage, and sizes their files.
@@ -1290,9 +1288,6 @@ func (e *Engine) newBlobStats() *BlobStats {
 	s := &BlobStats{}
 	if e.blobs != nil {
 		s.Store = e.blobs.String()
-		if f, ok := e.blobs.(*fsblobs.Store); ok {
-			s.Dir = f.Dir
-		}
 	}
 	return s
 }

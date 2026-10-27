@@ -11,11 +11,12 @@ import (
 
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/telemetry"
+	"github.com/middle-management/patchlog/internal/testenv"
 )
 
 // benchCachedRead measures a cached revision read through h(New(e)).
 func benchCachedRead(b *testing.B, wrap func(http.Handler) http.Handler) {
-	e, err := core.Open(core.Options{Path: ":memory:", BlobDir: b.TempDir(), Origin: "https://cms.example", AuthDisabled: true, Purger: nopPurger{}})
+	e, err := core.Open(core.Options{Path: ":memory:", BlobStore: testenv.FileBlobs(b), Origin: "https://cms.example", AuthDisabled: true, Purger: nopPurger{}})
 	if err != nil {
 		b.Fatal(err)
 	}

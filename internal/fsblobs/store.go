@@ -6,7 +6,8 @@
 // Each name is a file at that relative path. A write goes to a temporary
 // file in its directory, is synced, renamed into place and the directory
 // synced: a crash leaves the whole file or none (and at worst a temporary
-// file, for the engine's sweep).
+// file, which SweepLeftovers deletes once the engine's orphan sweep calls
+// it).
 //
 // Like s3blobs, it satisfies core.BlobStore through standard library
 // types, without importing the engine.
@@ -20,6 +21,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -52,7 +54,7 @@ func (s *Store) Put(_ context.Context, name string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(dir, TempPrefix+"*")
+	f, err := os.CreateTemp(dir, tmpPrefix+"*")
 	if err != nil {
 		return err
 	}
@@ -79,10 +81,8 @@ func (s *Store) Put(_ context.Context, name string, data []byte) error {
 	return nil
 }
 
-// TempPrefix starts the names of temporary files: List reports them too,
-// and the engine's orphan sweep deletes old ones (a write a crash
-// interrupted).
-const TempPrefix = ".tmp-"
+// tmpPrefix starts the names of temporary files.
+const tmpPrefix = ".tmp-"
 
 // mkdirs creates dir and its missing parents under s.Dir, and returns the
 // parents whose entries changed (to sync).
@@ -128,7 +128,38 @@ func (s *Store) Remove(_ context.Context, name string) error {
 	return err
 }
 
+// List lists the stored names; temporary files aren't stored names
+// (SweepLeftovers deletes them).
 func (s *Store) List(ctx context.Context, fn func(name string, size int64, modified time.Time) error) error {
+	return s.walk(ctx, func(name string, temp bool, info fs.FileInfo) error {
+		if temp {
+			return nil
+		}
+		return fn(name, info.Size(), info.ModTime())
+	})
+}
+
+// SweepLeftovers deletes the temporary files of writes a crash interrupted
+// that were last modified before before; the engine's orphan sweep calls
+// it with its grace, which outlasts any write.
+func (s *Store) SweepLeftovers(ctx context.Context, before time.Time) (int, error) {
+	n := 0
+	err := s.walk(ctx, func(name string, temp bool, info fs.FileInfo) error {
+		if !temp || !info.ModTime().Before(before) {
+			return nil
+		}
+		if err := os.Remove(s.path(name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		n++
+		return nil
+	})
+	return n, err
+}
+
+// walk calls fn for every regular file under the directory, by name,
+// telling temporary files apart.
+func (s *Store) walk(ctx context.Context, fn func(name string, temp bool, info fs.FileInfo) error) error {
 	return filepath.WalkDir(s.Dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
@@ -147,6 +178,6 @@ func (s *Store) List(ctx context.Context, fn func(name string, size int64, modif
 		if err != nil {
 			return nil
 		}
-		return fn(filepath.ToSlash(rel), info.Size(), info.ModTime())
+		return fn(filepath.ToSlash(rel), strings.HasPrefix(d.Name(), tmpPrefix), info)
 	})
 }
