@@ -63,6 +63,10 @@ func openDDB(opt Options) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Group commit (docs/DYNAMODB.md §4): resource writes queue per
+	// namespace; GroupCommitWait doesn't apply — a group forms from the
+	// writes queued while the one before it commits.
+	store.GroupCommit = opt.GroupCommit
 	e := &Engine{
 		opt:        opt,
 		validator:  schema.NewValidator(),
