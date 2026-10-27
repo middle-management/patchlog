@@ -80,7 +80,18 @@ func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, 
 		if c.Seal, err = b.sealer(ctx, c.NS, lvl, names); err != nil {
 			return nil, asErrOrNil(err)
 		}
-		c.Encrypting = p.cplan != nil && r.config(p.n.configSeq).level < levelAtRest && lvl >= levelAtRest
+		old := r.config(p.n.configSeq)
+		c.Encrypting = p.cplan != nil && old.level < levelAtRest && lvl >= levelAtRest
+		cfg := old
+		if p.cplan != nil {
+			cfg = p.cplan.cfg
+			if c.EpochKey, err = b.beginsEpoch(ctx, c.NS, old, cfg); err != nil {
+				return nil, asErrOrNil(err)
+			}
+		}
+		if cfg.level == levelSealed {
+			c.Epoch = cfg.Epoch // the epoch its revisions are sealed under (rev_epochs)
+		}
 		if err := b.schemaRefs(ctx, c); err != nil {
 			return nil, err
 		}
@@ -91,7 +102,7 @@ func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, 
 		c.NoAuth = p.a.noAuth
 		var tags []string
 		if p.cplan != nil {
-			if old := r.config(p.n.configSeq); old.cachePublic() && !p.cplan.cfg.cachePublic() {
+			if old := r.config(p.n.configSeq); purgesNS(old, p.cplan.cfg) {
 				tags = append(tags, "ns:"+req.NS)
 			}
 		}
@@ -115,6 +126,9 @@ func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, 
 		b.committed(req.NS, tags...)
 		if c.Encrypting {
 			b.encrypted(ctx, req.NS)
+		}
+		if p.cplan != nil && b.revokes(old, cfg) {
+			e.rotateAfterRevoke([]string{req.NS})
 		}
 		return res, nil
 	}
@@ -330,8 +344,11 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 			Pins:       r.configPins(req.NS),
 			Encrypting: out.cur.level < levelAtRest && p.cfg.level >= levelAtRest,
 		}
+		if c.EpochKey, err = b.beginsEpoch(ctx, req.NS, out.cur, p.cfg); err != nil {
+			return nil, asErrOrNil(err)
+		}
 		var tags []string
-		if out.cur.cachePublic() && !p.cfg.cachePublic() {
+		if purgesNS(out.cur, p.cfg) {
 			// Public copies at the edge must go (§9, insertConfig).
 			tags = append(tags, "ns:"+req.NS)
 		}
@@ -346,6 +363,9 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 		b.committed(req.NS, tags...)
 		if c.Encrypting {
 			b.encrypted(ctx, req.NS)
+		}
+		if b.revokes(out.cur, p.cfg) {
+			e.rotateAfterRevoke([]string{req.NS})
 		}
 		return &WriteResult{Status: 201, NSID: cres.NSID, ConfigID: p.id.String(), Entry: &LogEntry{Gesture: cc.Gesture, Undoes: cc.Undoes}}, nil
 	}
@@ -390,6 +410,12 @@ func (b *ddbBackend) createNamespace(ctx context.Context, req Request, cc Config
 	if err != nil {
 		return nil, err
 	}
+	var ek *ddb.EpochKey
+	if out.cfg != nil {
+		if ek, err = b.beginsEpoch(ctx, req.NS, nil, out.cfg); err != nil {
+			return nil, asErrOrNil(err)
+		}
+	}
 	sctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
 	// A namespace that now exists changes what reads of it answer.
@@ -397,7 +423,7 @@ func (b *ddbBackend) createNamespace(ctx context.Context, req Request, cc Config
 	e.rc.begin(inv)
 	cfgID, nsID, err := b.store.CreateNamespace(sctx, &ddb.Create{
 		NS: req.NS, Author: out.a.id(), Patches: cc.Patches,
-		Grant: grantID, NoAuth: out.a.noAuth,
+		Grant: grantID, NoAuth: out.a.noAuth, EpochKey: ek,
 	})
 	e.invalidate(inv, false)
 	if err != nil {
@@ -485,4 +511,12 @@ func (b *ddbBackend) storeGrant(ctx context.Context, a *actor, sealed bool) (str
 // atRest reports whether n is encrypted at rest, as the check read it.
 func (r *ddbReads) atRest(n *nsRow) (bool, error) {
 	return ddbCheck(func() bool { return r.nsLevel(n) >= levelAtRest })
+}
+
+// purgesNS reports a config change that purges the namespace's tag at the
+// edge (insertConfig of nsops.go): public copies that must go, and on a
+// raise to sealed, whatever the read setting, the /heads pages and
+// revisions with metadata the level now hides.
+func purgesNS(old, cfg *Config) bool {
+	return old.cachePublic() && !cfg.cachePublic() || old.level < levelSealed && cfg.level >= levelSealed
 }

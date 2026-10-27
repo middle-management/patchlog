@@ -190,6 +190,11 @@ func (s *Store) PruneContent(ctx context.Context, ns, name string) (ok bool, err
 			return false, err
 		}
 	}
+	// Sealed copies of what was pruned go too (core's deletePrunedSealed);
+	// kept documents keep theirs.
+	if err := s.deletePrunedSealed(ctx, ns, name, horizon, kept); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 

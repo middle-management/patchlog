@@ -136,6 +136,9 @@ func openDDB(opt Options) (*Engine, error) {
 	if err := b.checkKeyStore(context.Background()); err != nil {
 		return nil, err
 	}
+	if err := b.checkEpochKeys(context.Background()); err != nil {
+		return nil, err
+	}
 	return e, nil
 }
 
@@ -200,8 +203,6 @@ func ddbAsErr(err error) *Error {
 // creates and changes.
 func ddbRefusals(cfg *Config) *Error {
 	switch {
-	case cfg.level == levelSealed:
-		return ddbUnsupported("sealed namespaces")
 	case cfg.level == levelE2E:
 		return ddbUnsupported("e2e namespaces")
 	}

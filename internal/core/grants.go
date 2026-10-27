@@ -58,7 +58,7 @@ type GrantDoc struct {
 func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*GrantDoc, error) {
 	var out *GrantDoc
 	var job *sealJob
-	var nsRowID int64
+	var nsRowName string
 	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -85,7 +85,7 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 		}
 		switch t.nsLevel(n) {
 		case levelSealed:
-			nsRowID = n.id
+			nsRowName = n.name
 			job = t.grantJob(n, id, func() []byte {
 				stored := make([]any, len(out.Stored))
 				for i, s := range out.Stored {
@@ -99,7 +99,7 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 		return nil
 	})
 	if err == nil && job != nil {
-		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
+		if err = e.finishSeal(ctx, nsRowName, []*sealJob{job}); err == nil {
 			out.JWE = job.jwe
 		}
 	}

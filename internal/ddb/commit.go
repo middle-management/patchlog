@@ -90,6 +90,11 @@ type Commit struct {
 	// revision a purge's in_use check relied on (§6.1): it is stale if
 	// one is purged meanwhile, as SQL's locks order the two.
 	Copies []ResourceRef
+	// EpochKey is the key of the epoch a sealed config change begins
+	// (sealed.go), written with it; Epoch is the epoch the items'
+	// revisions are written in, 0 outside a sealed namespace.
+	EpochKey *EpochKey
+	Epoch    int
 	// Encrypting marks a config change that raises the namespace to
 	// encryption at rest: its plaintext content is encrypted after the
 	// commit (EncryptContent), the #ENCRYPTING marker naming the work
@@ -266,10 +271,16 @@ func (c *Commit) actions() int {
 	if c.Encrypting {
 		n++
 	}
+	if c.EpochKey != nil {
+		n++
+	}
 	if c.Branch != nil {
 		n += branchActions
 		if c.Grant != "" {
 			n++ // the branch's grant marker
+		}
+		if c.Branch.EpochKey != nil {
+			n++
 		}
 	}
 	switch {
@@ -449,7 +460,7 @@ func touchesMeta(cs []*Commit) bool {
 // alone reports whether c commits on its own, outside group commit: one
 // that updates #META, purges, prunes or branches.
 func (c *Commit) alone() bool {
-	return c.Config != nil || c.PurgeNS || c.Purge != nil || c.Branch != nil || c.Prune != nil || c.Registration != nil
+	return c.Config != nil || c.PurgeNS || c.Purge != nil || c.Branch != nil || c.Prune != nil || c.Registration != nil || c.EpochKey != nil
 }
 
 // commitActs are one commit's actions, in this order — the layout
@@ -501,6 +512,9 @@ func (s *Store) commitActs(c *Commit, entry logRow) []types.TransactWriteItem {
 	if c.Encrypting {
 		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyEncrypting(ns), item{"ns": avS(ns)})}})
 	}
+	if c.EpochKey != nil {
+		out = append(out, epochKeyAct(s.Table, ns, c.EpochKey, c.Created))
+	}
 	marker := item{"ns": avS(ns), "logPos": avN(entry.pos)}
 	if len(c.Items) == 1 && c.Kind != "batch" {
 		marker["revId"] = avS(c.Items[0].Steps[len(c.Items[0].Steps)-1].ID)
@@ -529,7 +543,7 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 	for i := range it.Steps {
 		st := &it.Steps[i]
 		pos++
-		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos, grantID: c.Grant, schemaRef: st.SchemaRef, signature: st.Signature}
+		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos, grantID: c.Grant, schemaRef: st.SchemaRef, signature: st.Signature, epoch: c.Epoch}
 		if pos == 1 {
 			r.parentNS, r.parentPos = it.ParentNS, it.ParentPos
 		}

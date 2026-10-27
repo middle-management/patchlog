@@ -33,6 +33,7 @@ type RevInfo struct {
 	GrantID   string // the grant it was written under, "" for none
 	SchemaRef string
 	Signature string // the author signature (§C.3.1)
+	Epoch     int    // the epoch it was written in (sealed namespaces)
 	// ParentNS and ParentPos are a first revision's foreign parent.
 	ParentNS  string
 	ParentPos uint64

@@ -65,6 +65,8 @@ type Create struct {
 	// Grant and NoAuth are Commit's.
 	Grant  string
 	NoAuth bool
+	// EpochKey is a sealed namespace's first epoch key (sealed.go).
+	EpochKey *EpochKey
 }
 
 // CreateNamespace bootstraps a namespace with its config genesis and first
@@ -90,6 +92,9 @@ func (s *Store) CreateNamespace(ctx context.Context, c *Create) (cfgID, nsID str
 	acts := buildCreateTx(s.Table, ns, meta, cfg.String(), string(canon), string(jsonv.Canonical(doc)), entry)
 	acts = append(acts, deployFirst(s.Table, now),
 		types.TransactWriteItem{Put: &types.Put{TableName: &s.Table, Item: withKey(keyNSList(ns), item{})}})
+	if c.EpochKey != nil {
+		acts = append(acts, epochKeyAct(s.Table, ns, c.EpochKey, now))
+	}
 	if c.Grant != "" {
 		acts = append(acts, grantMark(s.Table, ns, c.Grant, 1))
 	}
@@ -247,6 +252,7 @@ func scanRevInfo(i item) RevInfo {
 		GrantID:   i.s("grantId"),
 		SchemaRef: i.s("schemaRef"),
 		Signature: i.s("signature"),
+		Epoch:     int(i.n("epoch")),
 		ParentNS:  i.s("parentNs"), ParentPos: i.n("parentPos"),
 		Pruned: i.s("kind") != "tombstone" && !i.has("patches"),
 	}

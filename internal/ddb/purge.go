@@ -137,6 +137,16 @@ func (s *Store) PurgeContent(ctx context.Context, ns, name string) (hashes [][]b
 	}); err != nil {
 		return nil, err
 	}
+	// Its sealed values (§E.2.2), a namespace's epoch keys too: whatever
+	// survives of its sealings can no longer be opened (§8.5).
+	if err := s.DeleteSealed(ctx, ns, name); err != nil {
+		return nil, err
+	}
+	if name == "" {
+		if err := s.DeleteEpochKeys(ctx, ns); err != nil {
+			return nil, err
+		}
+	}
 	// Its gestures' markers: the listing leaves purged resources out.
 	if err := s.eachItem(ctx, ns, "GEST#", func(i item) error {
 		if name != "" && i.s("name") != name {

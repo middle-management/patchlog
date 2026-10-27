@@ -56,6 +56,12 @@ type backend interface {
 	registered(ctx context.Context, b *remoteBase, nsID string, expires time.Time) error
 	remoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error)
 
+	// rotateEpoch is RotateEpoch's config change (§E.2.1).
+	rotateEpoch(ctx context.Context, ns, author string) (int, error)
+	// storeSealed stores sealed values of namespace ns the first time
+	// they are served, the first one stored winning (finishSeal, §E.2.2).
+	storeSealed(ctx context.Context, ns string, jobs []*sealJob) error
+
 	// archiveDEK is the data key an encrypted archive of ns/name is
 	// sealed with (OpenArchive).
 	archiveDEK(ctx context.Context, ns, name string) ([]byte, error)
@@ -165,6 +171,14 @@ func (b sqlBackend) registered(ctx context.Context, rb *remoteBase, nsID string,
 
 func (b sqlBackend) remoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error) {
 	return b.e.sqlRemoteNotices(ctx, ns)
+}
+
+func (b sqlBackend) rotateEpoch(ctx context.Context, ns, author string) (int, error) {
+	return b.e.sqlRotateEpoch(ctx, ns, author)
+}
+
+func (b sqlBackend) storeSealed(ctx context.Context, ns string, jobs []*sealJob) error {
+	return b.e.sqlStoreSealed(ctx, ns, jobs)
 }
 
 func (b sqlBackend) archiveDEK(ctx context.Context, ns, name string) ([]byte, error) {

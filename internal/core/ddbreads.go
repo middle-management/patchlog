@@ -747,9 +747,6 @@ func (r *ddbReads) dek(res int64, create bool) []byte {
 func (r *ddbReads) e2eEpochOK(n *nsRow, cfg *Config, e int) bool {
 	panic(ddbUnsupported("sealed namespaces"))
 }
-func (r *ddbReads) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
-	panic(ddbUnsupported("sealed namespaces"))
-}
 
 // --- grants ---
 
@@ -1082,14 +1079,6 @@ func (r *ddbReads) entryConfig(seq int64) (int64, string) {
 	return h, string(jsonv.Canonical(r.cfgRow(h).Doc))
 }
 
-func (r *ddbReads) resJob(n *nsRow, name string, row *revRow, kind string, plain func() []byte) *sealJob {
-	panic(ddbUnsupported("sealed namespaces"))
-}
-func (r *ddbReads) stored(n *nsRow, j *sealJob) bool   { panic(ddbUnsupported("sealed namespaces")) }
-func (r *ddbReads) entryEpoch(n *nsRow, seq int64) int { panic(ddbUnsupported("sealed namespaces")) }
-func (r *ddbReads) epochKey(ns int64, epoch int) []byte {
-	panic(ddbUnsupported("sealed namespaces"))
-}
 func (r *ddbReads) e2eSnapshot(row *revRow) string  { panic(ddbUnsupported("e2e namespaces")) }
 func (r *ddbReads) e2eFoldSince(row *revRow) string { panic(ddbUnsupported("e2e namespaces")) }
 

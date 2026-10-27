@@ -60,6 +60,9 @@ func (b *ddbBackend) createBranch(ctx context.Context, req Request, br BranchReq
 				CfgID: p.cfgID.String(), Patches: string(p.canon), Doc: string(jsonv.Canonical(p.doc)), Frozen: p.cfg.Frozen,
 			},
 		}
+		if c.Branch.EpochKey, err = b.beginsEpoch(ctx, p.name, nil, p.cfg); err != nil {
+			return nil, asErrOrNil(err)
+		}
 		cres, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
 			continue

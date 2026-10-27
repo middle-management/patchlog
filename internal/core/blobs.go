@@ -1188,7 +1188,7 @@ func (e *Engine) OpenBlob(ctx context.Context, ns, name, bidText string, cred Cr
 func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Credentials) (*Blob, error) {
 	var out *Blob
 	var job *sealJob
-	var nsID int64
+	var nsName string
 	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -1217,7 +1217,7 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 		if t.isSealedNS(n) {
 			// Sealed namespaces never serve the plaintext: 302 to the blob
 			// sealed under an epoch (§E.2.2, sealedblobs.go).
-			job, nsID = t.sealedBlobHead(n, name, bid, out), n.id
+			job, nsName = t.sealedBlobHead(n, name, bid, out), n.name
 			return nil
 		}
 		out.Type = ans.row.typ
@@ -1231,7 +1231,7 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 	if job != nil {
 		// No referencing revision had an epoch yet: the newest is sealed
 		// under the current one first, which fixes its epoch (§E.2.2).
-		if err := e.finishSeal(ctx, nsID, []*sealJob{job}); err != nil {
+		if err := e.finishSeal(ctx, nsName, []*sealJob{job}); err != nil {
 			return nil, err
 		}
 		if ep, ok := jweEpoch(job.jwe); ok {

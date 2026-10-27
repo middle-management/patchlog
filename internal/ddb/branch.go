@@ -29,6 +29,8 @@ type CommitBranch struct {
 	// CfgID, Patches and Doc are its configuration genesis.
 	CfgID, Patches, Doc string
 	Frozen              bool
+	// EpochKey is a sealed branch's first epoch key (sealed.go).
+	EpochKey *EpochKey
 }
 
 // branchActions counts a branch's actions beyond the base's commit: its
@@ -59,6 +61,9 @@ func (s *Store) branchActs(c *Commit, entry logRow) []types.TransactWriteItem {
 	)
 	if c.Grant != "" {
 		out = append(out, grantMark(s.Table, b.Name, c.Grant, 1))
+	}
+	if b.EpochKey != nil {
+		out = append(out, epochKeyAct(s.Table, b.Name, b.EpochKey, c.Created))
 	}
 	return out
 }
