@@ -112,19 +112,29 @@ func (b *ddbBackend) purgeWith(ctx context.Context, req Request, name string, pl
 	return "", apiErr(409, "conflict", "detail", "the purge's state kept moving")
 }
 
-// purgedContent deletes a committed purge's content, then the bytes
-// nothing names any more, as SQL's purge does in its transaction
-// (purgeBlobs). What fails here is left to the sweep (sweepBlobs).
+// purgedContent finishes a committed purge (finishPurge); what fails
+// here is left to the sweep (sweepBlobs).
 func (b *ddbBackend) purgedContent(ctx context.Context, ns, name string) {
+	if err := b.finishPurge(ctx, ns, name); err != nil {
+		log.Printf("ddb: purge of %s/%s committed, its content left to the sweep: %v", ns, name, err)
+	}
+}
+
+// finishPurge deletes a committed purge's archives and content, then the
+// bytes nothing names any more, as SQL's purge does in its transaction
+// (deleteArchives, purgeBlobs). The archives go first: the content's
+// deletion takes the marker that names the purge to finish.
+func (b *ddbBackend) finishPurge(ctx context.Context, ns, name string) error {
+	if err := b.deleteArchives(ctx, ns, name); err != nil {
+		return err
+	}
 	hashes, err := b.store.PurgeContent(ctx, ns, name)
 	var files []string
 	if err == nil {
 		files, err = b.store.CollectBytes(ctx, hashes)
 	}
 	b.e.removeFiles(files)
-	if err != nil {
-		log.Printf("ddb: purge of %s/%s committed, its content left to the sweep: %v", ns, name, err)
-	}
+	return err
 }
 
 // branchNames lists the unpurged branches of ns, and theirs, depth first.

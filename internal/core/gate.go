@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"database/sql"
+	"io"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
@@ -35,6 +36,7 @@ type checkReads interface {
 	schemaReads
 	branchReads
 	sealedReads
+	archiveReads
 }
 
 // nsReads are namespace rows and their locks.
@@ -149,6 +151,17 @@ type sealedReads interface {
 	sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJob
 	e2eSnapshot(row *revRow) string
 	e2eFoldSince(row *revRow) string
+}
+
+// archiveReads are what an archive's building reads beyond the chain
+// (§8.6): the blobs its documents reference, where its grants were first
+// recorded and with which keys, and how it is sealed.
+type archiveReads interface {
+	archivedBlobs(res, fromSeq, lastSeq int64) map[int64][]ids.ID
+	grantFirstEntry(n *nsRow, gid ids.ID, bound sql.NullInt64) (cfg, created int64, ok bool)
+	configAtTime(n *nsRow, created int64) (int64, bool)
+	firstEntryCreated() (int64, bool)
+	archiveSealer(res int64) func(io.Writer) (io.WriteCloser, error)
 }
 
 // checkState is the gate's state in one transaction, shared with the

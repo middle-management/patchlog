@@ -739,13 +739,13 @@ var ErrArchiveKeyDestroyed = errors.New("the archive is encrypted and its data k
 // an encrypted namespace. An encrypted archive of a purged resource is
 // ErrArchiveKeyDestroyed.
 func (e *Engine) OpenArchive(ctx context.Context, ns, name string, r io.Reader) (io.Reader, error) {
-	if err := e.be.lacks("archives"); err != nil {
-		return nil, err
-	}
 	br := bufio.NewReaderSize(r, 1<<16)
 	head, _ := br.Peek(len(archiveMagic))
 	if string(head) != archiveMagic {
 		return br, nil
+	}
+	if err := e.be.lacks("encryption at rest"); err != nil {
+		return nil, err
 	}
 	var dek []byte
 	err := e.read(ctx, func(t *tx) error {

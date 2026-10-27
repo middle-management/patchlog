@@ -8,12 +8,12 @@ package core
 // core's own code on the gate.
 //
 // Deliberate gaps, all surfaced as 501 "unsupported" (lacks, or a read
-// that panics with it): remote branches, archives, sealed and e2e
+// that panics with it): remote branches, sealed and e2e
 // namespaces, nonce-required namespaces, gestures listing, author
 // signatures, intermediate snapshots (revisions fold from the genesis,
 // or from a pruning horizon). Grants, edge grants, blobs, $schema
-// validation and schemaReads, purges, pruning and retention without
-// archives, local branches and their drafts and merges, tombstones and
+// validation and schemaReads, purges, pruning, retention and archives,
+// local branches and their drafts and merges, tombstones and
 // restores, multi-step items and batches (§7.5, bounded by the
 // transaction's 100 actions) work.
 
@@ -77,12 +77,8 @@ func openDDB(opt Options) (*Engine, error) {
 	if opt.KeyStore != nil {
 		return nil, fmt.Errorf("core: encryption at rest: %w (DynamoDB, docs/DYNAMODB.md phase 1)", ErrUnsupported)
 	}
-	// What it would otherwise ignore: an archive no retention loop writes,
-	// and the SQL write path's test hooks, which it never reaches — a
-	// caller waiting on one would wait for good.
-	if opt.Archiver != nil {
-		return nil, fmt.Errorf("core: archives: %w (DynamoDB, docs/DYNAMODB.md phase 2)", ErrUnsupported)
-	}
+	// What it would otherwise ignore: the SQL write path's test hooks,
+	// which it never reaches — a caller waiting on one would wait for good.
 	if opt.BeforeWriteLock != nil || opt.BeforeCommit != nil {
 		return nil, fmt.Errorf("core: the SQL write path's hooks (BeforeWriteLock, BeforeCommit): %w (DynamoDB)", ErrUnsupported)
 	}

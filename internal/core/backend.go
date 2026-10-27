@@ -42,6 +42,11 @@ type backend interface {
 	// uploadBlob is an upload or copy of blob bid to name (§7.8).
 	uploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error
 
+	// archives lists the archives of unpurged resources (Archives);
+	// restore puts archived patch sets back (RestoreResource, §D.4).
+	archives(ctx context.Context, ns, name string) ([]ArchiveRecord, error)
+	restore(ctx context.Context, ns, name string, entries func(yield func(ArchiveEntry) error) error) (*RestoreResult, error)
+
 	// blobStats counts what blob storage holds; sweepBlobs deletes the
 	// pending entries past their grace and the bytes nothing names;
 	// orphanFiles are the blob files of cands no row or item names.
@@ -122,6 +127,14 @@ func (b sqlBackend) createBranch(ctx context.Context, req Request, br BranchRequ
 
 func (b sqlBackend) uploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error {
 	return b.e.sqlUploadBlob(ctx, req, name, bid, up)
+}
+
+func (b sqlBackend) archives(ctx context.Context, ns, name string) ([]ArchiveRecord, error) {
+	return b.e.sqlArchives(ctx, ns, name)
+}
+
+func (b sqlBackend) restore(ctx context.Context, ns, name string, entries func(yield func(ArchiveEntry) error) error) (*RestoreResult, error) {
+	return b.e.sqlRestore(ctx, ns, name, entries)
 }
 
 func (b sqlBackend) blobStats(ctx context.Context) (*BlobStats, error) {

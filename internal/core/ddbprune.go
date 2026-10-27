@@ -9,8 +9,8 @@ package core
 // patch sets below it, the snapshots an earlier prune kept that this one
 // doesn't, and the attachments no servable document references go right
 // after it (finishPrune), or, if the instance stopped first, with the
-// next blob sweep. Archives aren't built here: a prune that would write
-// one answers 501, and e2e namespaces can't be created.
+// next blob sweep. A prune that archives writes its archive first
+// (ddbarchive.go); e2e namespaces can't be created here.
 
 import (
 	"context"
@@ -45,8 +45,6 @@ func (b *ddbBackend) prune(ctx context.Context, req Request, name string, pr Pru
 			return nil, out.err
 		case out.p.e2e:
 			return nil, ddbUnsupported("e2e namespaces")
-		case out.p.hasArchive:
-			return nil, ddbUnsupported("archives")
 		}
 		gid, err := b.storeGrant(ctx, out.p.a)
 		if err != nil {
@@ -81,8 +79,6 @@ func (b *ddbBackend) retain(ctx context.Context, ns, name string) (checked, prun
 			return false, false, perr
 		case out.p == nil || out.err != nil:
 			return out.checked, false, out.err
-		case out.p.hasArchive:
-			return true, false, ddbUnsupported("archives")
 		}
 		res, err := b.pruneTo(ctx, r, g, out.p, RetentionAuthor, "", false)
 		if errors.Is(err, ddb.ErrStale) {
@@ -163,6 +159,14 @@ func (b *ddbBackend) pruneTo(ctx context.Context, r *ddbReads, g *gate, p *prune
 	if perr != nil {
 		return nil, perr
 	}
+	// Archive before anything is dropped (§8.6).
+	var arch *ddb.ArchiveRow
+	if p.hasArchive {
+		var err error
+		if arch, err = b.writeArchive(ctx, r, g, p); err != nil {
+			return nil, err
+		}
+	}
 	if err := b.store.PutSnapshots(ctx, ns, name, pl.docs); err != nil {
 		return nil, ddbAsErr(err)
 	}
@@ -178,7 +182,7 @@ func (b *ddbBackend) pruneTo(ctx context.Context, r *ddbReads, g *gate, p *prune
 		Prune: &ddb.CommitPrune{
 			Name: name, HeadPos: rr.HeadPos, HeadID: rr.HeadID, OldHorizon: oldHorizon,
 			HorizonPos: hk.pos, HorizonID: h.id.String(), Base: pl.base,
-			Keep: string(jsonv.Canonical(anyStrings(p.keepStrs))), Kept: kept,
+			Keep: string(jsonv.Canonical(anyStrings(p.keepStrs))), Kept: kept, Archive: arch,
 		},
 	}
 	cres, err := b.commit(ctx, c)
@@ -191,7 +195,11 @@ func (b *ddbBackend) pruneTo(ctx context.Context, r *ddbReads, g *gate, p *prune
 	if err := b.finishPrune(ctx, ns, name); err != nil {
 		log.Printf("ddb: prune of %s/%s committed, its content left to the sweep: %v", ns, name, err)
 	}
-	return &PruneResult{Horizon: h.id.String(), NSID: cres.NSID}, nil
+	res := &PruneResult{Horizon: h.id.String(), NSID: cres.NSID}
+	if arch != nil {
+		res.Archive = arch.URL
+	}
+	return res, nil
 }
 
 // finishPrune drops what a committed prune of name in ns left
@@ -224,7 +232,7 @@ func (b *ddbBackend) endAttachments(ctx context.Context, ns, name string) error 
 	if err != nil || rr == nil || rr.Purged {
 		return err
 	}
-	atts, err := b.store.Attachments(ctx, ns, name)
+	atts, err := b.store.Attachments(ctx, ns, name, false)
 	if err != nil || len(atts) == 0 {
 		return err
 	}

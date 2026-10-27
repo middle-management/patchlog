@@ -253,7 +253,7 @@ func (c *Commit) actions() int {
 	case c.PurgeNS:
 		n += 2 // the META update, the PURGING marker
 	case c.Prune != nil:
-		n += pruneActions
+		n += c.Prune.actions()
 	}
 	for _, it := range c.Items {
 		n += len(it.Steps) + 1 + it.attachActions() // the revisions, the head, attachments

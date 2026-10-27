@@ -1,9 +1,13 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"slices"
 	"sort"
 	"strings"
 
@@ -654,9 +658,12 @@ func (r *ddbReads) authorName(id int64) string { return r.authors[id] }
 
 // --- what this backend doesn't store ---
 
-// archiveURL: nothing is archived on this backend (a prune that would
-// archive is refused, ddbprune.go).
-func (r *ddbReads) archiveURL(res, seq int64) string { return "" }
+func (r *ddbReads) archiveURL(res, seq int64) string {
+	k := r.res[res]
+	u, err := r.s.ArchiveFor(r.ctx, k.ns, k.name, r.revs[seq].key.pos)
+	r.must(err)
+	return u
+}
 
 // referencedUpTo: every blob a document of res references is attached to
 // res, at the first revision that referenced it (refPos): a document up
@@ -793,7 +800,12 @@ func (r *ddbReads) pendingBlob(res int64, bid ids.ID, uploader string, cutoff in
 }
 
 // blobArchive: no archives on this backend.
-func (r *ddbReads) blobArchive(res int64, bid ids.ID) string { return "" }
+func (r *ddbReads) blobArchive(res int64, bid ids.ID) string {
+	k := r.res[res]
+	u, err := r.s.BlobArchive(r.ctx, k.ns, k.name, bid.String())
+	r.must(err)
+	return u
+}
 
 func (r *ddbReads) openBytes(owner int64, hash []byte) blobContent {
 	data, file, ok, err := r.s.Bytes(r.ctx, hash)
@@ -1093,3 +1105,60 @@ func (r *ddbReads) retainedNames(n *nsRow) []string {
 	r.must(err)
 	return names
 }
+
+// --- archives ---
+
+// archivedBlobs: the documents of the range, folded (ddb.Store.EachDocIn),
+// stand in for blob_refs.
+func (r *ddbReads) archivedBlobs(res, fromSeq, lastSeq int64) map[int64][]ids.ID {
+	k := r.res[res]
+	out := map[int64][]ids.ID{}
+	seen := map[ids.ID]bool{}
+	r.must(r.s.EachDocIn(r.ctx, k.ns, k.name, r.revs[fromSeq].key.pos, r.revs[lastSeq].key.pos, func(pos uint64, doc any) error {
+		for _, ref := range blobRefsOf(doc) {
+			if !seen[ref.bid] {
+				seen[ref.bid] = true
+				h := r.revHandle(k.ns, k.name, pos)
+				out[h] = append(out[h], ref.bid)
+			}
+		}
+		return nil
+	}))
+	for h := range out {
+		slices.SortFunc(out[h], func(a, b ids.ID) int { return bytes.Compare(a[:], b[:]) })
+	}
+	return out
+}
+
+// grantFirstEntry: the namespace's grant marker keeps the first entry
+// recording it.
+func (r *ddbReads) grantFirstEntry(n *nsRow, gid ids.ID, bound sql.NullInt64) (cfg, created int64, ok bool) {
+	ns := r.nsName(n.id)
+	pos, err := r.s.GrantFirstPos(r.ctx, ns, gid.String())
+	r.must(err)
+	if pos == 0 || bound.Valid && pos > r.logs[bound.Int64].pos {
+		return 0, 0, false
+	}
+	le, err := r.s.EntryAt(r.ctx, ns, pos)
+	r.must(err)
+	if le == nil {
+		return 0, 0, false
+	}
+	return r.cfgHandle(ns, le.CfgPos), le.Created, true
+}
+
+func (r *ddbReads) configAtTime(n *nsRow, created int64) (int64, bool) {
+	ns := r.nsName(n.id)
+	pos, err := r.s.ConfigAtTime(r.ctx, ns, created)
+	r.must(err)
+	return r.cfgHandle(ns, pos), pos > 0
+}
+
+func (r *ddbReads) firstEntryCreated() (int64, bool) {
+	ms, ok, err := r.s.FirstEntryTime(r.ctx)
+	r.must(err)
+	return ms, ok
+}
+
+// archiveSealer: nothing is encrypted at rest here.
+func (r *ddbReads) archiveSealer(res int64) func(io.Writer) (io.WriteCloser, error) { return nil }

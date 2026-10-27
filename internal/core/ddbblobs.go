@@ -159,7 +159,7 @@ func (b *ddbBackend) sweepBlobs(ctx context.Context) (int, error) {
 		return 0, ddbAsErr(err)
 	}
 	for i := range pnss {
-		if _, err := b.store.PurgeContent(ctx, pnss[i], pnames[i]); err != nil {
+		if err := b.finishPurge(ctx, pnss[i], pnames[i]); err != nil {
 			return 0, ddbAsErr(err)
 		}
 	}

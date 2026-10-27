@@ -27,7 +27,12 @@ the commit, `PruneContent`, `EachDoc`, `EachSnapshot`, `Attachments`,
 `EndAttachment` and `DonePruning` finish it, `Pruning` lists the
 unfinished for the sweep; `PrunedBelow`, `FirstRevSince`,
 `NthNewestRev` and `RetainedNames` are the retention and paging reads,
-and `DocAt` answers a `*PrunedError` below a horizon.
+and `DocAt` answers a `*PrunedError` below a horizon. Archives
+(archives.go): `CommitPrune.Archive` records one in the prune's commit;
+`Archives`, `ArchiveFor`, `BlobArchive`, `GrantFirstPos`,
+`ConfigAtTime` and `EachDocIn` are what building and naming them read;
+`DeleteArchive`, `RestorePatches`, `PatchesMissing`, `ClearHorizon` and
+`RestoreAttachment` are a purge's and a restore's writes.
 Serving reads are core's, through the same reads: `EntriesBetween` and
 `RevsBetween` (a log's or a chain's range), `HeadAt` (a head as of an
 entry, from the history rows), `ListHeads`, `FoldResource` (crossing

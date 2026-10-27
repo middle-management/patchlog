@@ -185,7 +185,7 @@ func (s *Store) DocAt(ctx context.Context, ns, name string, pos uint64) ([]byte,
 			}
 		}
 		if pos < res.horizonPos {
-			return nil, &PrunedError{NS: ns, Name: name, Pos: pos}
+			return s.docBelow(ctx, ns, name, res, pos)
 		}
 		base, ok, err := s.snapshot(ctx, ns, name, res.horizonBase)
 		if err != nil {
@@ -222,6 +222,42 @@ func (s *Store) DocAt(ctx context.Context, ns, name string, pos uint64) ([]byte,
 		exists = true
 	}
 	_, canon, err := s.foldFrom(ctx, ns, name, 0, pos, start, exists)
+	return canon, err
+}
+
+// docBelow is the document at pos below res's horizon that isn't kept:
+// pruned, unless a restore put back every patch set from the genesis or
+// the nearest kept snapshot below it up to it (archives.go) — and its
+// prune is finished (newestPruned).
+func (s *Store) docBelow(ctx context.Context, ns, name string, res *resRow, pos uint64) ([]byte, error) {
+	var from uint64
+	for _, k := range res.kept {
+		if k < pos && k > from {
+			from = k
+		}
+	}
+	if p, err := s.newestPruned(ctx, ns, name, from, pos); err != nil || p > 0 {
+		if err == nil {
+			err = &PrunedError{NS: ns, Name: name, Pos: p}
+		}
+		return nil, err
+	}
+	var start any
+	var exists bool
+	if from > 0 {
+		b, ok, err := s.snapshot(ctx, ns, name, from)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, &PrunedError{NS: ns, Name: name, Pos: pos}
+		}
+		if start, err = jsonv.Parse(b); err != nil {
+			return nil, err
+		}
+		exists = true
+	}
+	_, canon, err := s.foldFrom(ctx, ns, name, from, pos, start, exists)
 	return canon, err
 }
 

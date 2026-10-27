@@ -54,7 +54,7 @@ func resNameFromRev(sk string) string {
 // tombstone has no document; one crossing it applies the restore's
 // patches to the last live document, as the write did (§6.2's restore
 // verb, applySteps of write.go).
-func (s *Store) walkChain(ctx context.Context, ns, name string, fromPos, toPos uint64, start any, exists bool, apply func(doc any, exists bool, patches string) (any, error)) (any, error) {
+func (s *Store) walkChain(ctx context.Context, ns, name string, fromPos, toPos uint64, start any, exists bool, apply func(pos uint64, doc any, exists bool, patches string) (any, error)) (any, error) {
 	if toPos == 0 {
 		toPos = 999999999999
 	}
@@ -77,7 +77,7 @@ func (s *Store) walkChain(ctx context.Context, ns, name string, fromPos, toPos u
 			return false
 		}
 		last = pos
-		doc, ferr = apply(doc, exists, i.s("patches"))
+		doc, ferr = apply(pos, doc, exists, i.s("patches"))
 		exists, dead = true, false
 		return ferr == nil
 	})
@@ -152,7 +152,7 @@ func (s *Store) FoldResource(ctx context.Context, ns, name string, toPos uint64)
 // is a document): a foreign parent's document for a chain that continues
 // one, or a pruned chain's horizon's.
 func (s *Store) foldFrom(ctx context.Context, ns, name string, fromPos, toPos uint64, start any, exists bool) (doc any, canon []byte, err error) {
-	doc, err = s.walkChain(ctx, ns, name, fromPos, toPos, start, exists, func(d any, exists bool, patches string) (any, error) {
+	doc, err = s.walkChain(ctx, ns, name, fromPos, toPos, start, exists, func(_ uint64, d any, exists bool, patches string) (any, error) {
 		p, err := jsonv.Parse([]byte(patches))
 		if err != nil {
 			return nil, err

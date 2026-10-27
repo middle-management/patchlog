@@ -66,10 +66,10 @@ type CommitPrune struct {
 	// below the horizon whose snapshots stay, Base among them.
 	Keep string
 	Kept []uint64
+	// Archive records the archive the prune wrote of the range below the
+	// horizon, nil for none (archives.go).
+	Archive *ArchiveRow
 }
-
-// pruneActions are a prune's actions: the RES update, the marker.
-const pruneActions = 2
 
 // pruneActs are a prune's actions in its commit's transaction.
 func (s *Store) pruneActs(c *Commit) []types.TransactWriteItem {
@@ -89,7 +89,7 @@ func (s *Store) pruneActs(c *Commit) []types.TransactWriteItem {
 		cond += "horizonPos = :oh"
 		vals[":oh"] = avN(p.OldHorizon)
 	}
-	return []types.TransactWriteItem{
+	acts := []types.TransactWriteItem{
 		{Update: &types.Update{
 			TableName: table, Key: keyAV(keyRes(c.NS, p.Name)),
 			UpdateExpression:          strptr("SET horizonPos = :hp, horizonId = :hi, horizonBase = :hb, keep = :k, kept = :kp"),
@@ -101,6 +101,19 @@ func (s *Store) pruneActs(c *Commit) []types.TransactWriteItem {
 			"name": avS(p.Name), "horizonPos": avN(p.HorizonPos), "kept": avNs(p.Kept),
 		})}},
 	}
+	if a := p.Archive; a != nil {
+		acts = append(acts, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyArch(c.NS, p.Name, a.FromPos, a.ToPos), a.item(p.Name))}})
+	}
+	return acts
+}
+
+// actions counts a prune's actions: the RES update, the marker, and its
+// archive's record.
+func (p *CommitPrune) actions() int {
+	if p.Archive != nil {
+		return 3
+	}
+	return 2
 }
 
 // PutSnapshots writes the documents a prune of name keeps, by position,
@@ -210,23 +223,41 @@ func (s *Store) Pruning(ctx context.Context) (nss, names []string, err error) {
 }
 
 // PrunedBelow is the newest revision (not tombstone) of name after
-// position from and below the horizon, up to position to: a log range
-// (from, to] that holds one is pruned (core's prunedIn). 0: none.
+// position from and below the horizon, up to position to, whose patch set
+// is gone: a log range (from, to] that holds one is pruned (core's
+// prunedIn). 0: none. Until its prune is finished (its marker), every one
+// below the horizon is gone, stripped or not; after, those a restore put
+// back (archives.go) are served again.
 func (s *Store) PrunedBelow(ctx context.Context, ns, name string, from, to uint64) (uint64, error) {
 	res, err := s.getRes(ctx, ns, name)
 	if err != nil || res == nil || res.horizonPos == 0 {
 		return 0, err
 	}
-	to = min(to, res.horizonPos-1)
+	return s.newestPruned(ctx, ns, name, from, min(to, res.horizonPos-1))
+}
+
+// newestPruned is the newest revision of name in (from, to], all below
+// the horizon, whose patch set is gone (PrunedBelow).
+func (s *Store) newestPruned(ctx context.Context, ns, name string, from, to uint64) (uint64, error) {
+	unfinished, err := s.pruning(ctx, ns, name)
+	if err != nil {
+		return 0, err
+	}
 	var pos uint64
 	err = s.newestFirst(ctx, ns, name, from, to, func(i item) bool {
-		if i.s("kind") != "tombstone" {
+		if i.s("kind") != "tombstone" && (unfinished || !i.has("patches")) {
 			pos = i.n("pos")
 			return false
 		}
 		return true
 	})
 	return pos, err
+}
+
+// pruning reports whether a prune of name is unfinished.
+func (s *Store) pruning(ctx context.Context, ns, name string) (bool, error) {
+	it, err := s.getItem(ctx, keyPruning(ns, name))
+	return it != nil, err
 }
 
 // FirstRevSince is the first of name's revisions created at or after
@@ -337,7 +368,7 @@ func (s *Store) EachDoc(ctx context.Context, ns, name string, headPos uint64, vi
 			return err
 		}
 	}
-	_, err = s.walkChain(ctx, ns, name, from, headPos, start, exists, func(d any, exists bool, patches string) (any, error) {
+	_, err = s.walkChain(ctx, ns, name, from, headPos, start, exists, func(_ uint64, d any, exists bool, patches string) (any, error) {
 		p, err := jsonv.Parse([]byte(patches))
 		if err != nil {
 			return nil, err
@@ -365,11 +396,12 @@ func (s *Store) EachSnapshot(ctx context.Context, ns, name string, visit func(do
 	})
 }
 
-// Attachments lists name's attachments in ns that pruning hasn't ended.
-func (s *Store) Attachments(ctx context.Context, ns, name string) ([]*BlobRow, error) {
+// Attachments lists name's attachments in ns: those pruning ended, or
+// those it hasn't.
+func (s *Store) Attachments(ctx context.Context, ns, name string, pruned bool) ([]*BlobRow, error) {
 	var out []*BlobRow
 	err := s.eachItem(ctx, ns, "BLOB#"+name+"#", func(i item) error {
-		if b := scanBlob(i); b.Name == name && !b.Pruned {
+		if b := scanBlob(i); b.Name == name && b.Pruned == pruned {
 			out = append(out, b)
 		}
 		return nil

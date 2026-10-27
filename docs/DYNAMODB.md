@@ -139,7 +139,7 @@ NS#<ns>                     SEALED#<kind>#<key>                 sealed response 
 NS#<ns>                     E2E#<n>                             e2e epoch registry row
 NS#<ns>                     E2ESNAP#<name>#<pos12>              e2e sealed snapshot (JWE)
 NS#<ns>                     BLOBEPOCH#<name>#<bid>#<n>          sealed blob form per epoch (pointer)
-NS#<ns>                     ARCH#<name>#<fromPos12>             pruning archive record (§8.6)
+NS#<ns>                     ARCH#<name>#<from12>#<to12>         pruning archive record (§8.6): key, url, created, bids
 NS#<ns>                     REMOTE#<origin>#<branch>            registered remote branch (source side)
 NS#<shadow>                 #FOLLOW                             remote base follow state (branch side)
 NS#<shadow>                 NOTICE#<nsId>                       purge notice
@@ -499,7 +499,7 @@ What landed, beyond the spike:
   carry (it only hands them back). What the backend doesn't store reads
   as empty where nothing of the kind can exist (remote registrations),
   and as **501 "unsupported"** where a request needs a
-  feature it lacks (sealed/e2e keys, archives) — so those refusals
+  feature it lacks (sealed/e2e keys) — so those refusals
   are the reads', not hand-written checks. `gate_test.go` guards the
   embedding that makes this work on SQL (a read missing on `*tx` would
   compile and recurse).
@@ -582,7 +582,7 @@ What landed, beyond the spike:
   backend lacks is its `lacks` 501, asked by the Engine method before
   anything else; everything the server can reach so answers 501 rather
   than falling through to SQL:
-  remote branches, archives, sealed/e2e, gestures listing,
+  remote branches, sealed/e2e, gestures listing,
   author signatures (which the gate would verify but the commit doesn't
   store), rotation. Refused
   configurations (`encryption`, `nonce: required`, `signatures:
@@ -650,7 +650,7 @@ What landed, beyond the spike:
   references. Second CDN purges (D.8) are queued by the commit that
   purges the tags (`#REPURGE`, `Commit.Repurge`) and sent by `Repurge`,
   whose queue is the backend's (`dueRepurges`, `doneRepurge`).
-- **Pruning and retention** (§8.6), without archives. The gate's
+- **Pruning and retention** (§8.6). The gate's
   `planPrune` and `planRetention` (split out of SQL's `Prune` and
   `applyRetention`, with `protect` and the retention boundary over the
   reads `firstRev`, `firstRevSince`, `nthNewestRev`, `headAtEntry`)
@@ -663,8 +663,10 @@ What landed, beyond the spike:
   positions below it whose snapshots are served), pinned on the head and
   the old horizon, with the prune entry and a `PRUNING#` marker. Reads go
   by the horizon from then on: a document below it is a kept snapshot or
-  410 pruned, a log range reaching
-  below it is pruned (`PrunedBelow`), and the meta generation moves so
+  410 pruned, a log range reaching below it is pruned (`PrunedBelow`) —
+  until the prune is finished, every revision below it; after, those
+  whose patch sets are gone, so a partial restore serves what it put
+  back, as on SQL — and the meta generation moves so
   the read cache drops revisions it held. After the commit the patch sets
   below the horizon go and the snapshots no longer kept
   (`PruneContent`), then the attachments no servable document
@@ -672,9 +674,24 @@ What landed, beyond the spike:
   were read up to) and their bytes are collected — the fold from the
   horizon to the head stands in for `blob_refs`; an interrupted prune is
   finished by the blob sweep from its marker. A purge removes snapshots
-  and markers with the rest. A prune that would write an archive (an
-  operator `Archiver`, a rule's `archive`) answers 501; `"archive":
-  false` rules and `*`-chained prunes work.
+  and markers with the rest.
+- **Archives** (§8.6, §D.4). Building one is the gate's
+  `archiveBundle` (split out of SQL's `writeArchive`, with
+  `archiveGrant` and `operatorKeysAt`), over the reads `archivedBlobs`
+  — on the table, the archived range's documents folded, standing in
+  for `blob_refs` — `grantFirstEntry` (the grant marker's first
+  position), `configAtTime`, `firstEntryCreated` and `archiveSealer`
+  (none: nothing is encrypted at rest here). A prune writes its archive
+  before anything else and records it in its commit (`ARCH#` items with
+  the range, URL and the blobs its blob lines carry), which a pruned
+  revision's or blob's 410 names (`archiveURL`, `blobArchive`). A purge
+  deletes the archives, then their records, before its content (the
+  marker keeps it resumable). `Archives` and `RestoreResource` are
+  backend methods: a restore puts each verified patch set back on its
+  revision; once none is missing below the horizon the horizon goes,
+  with its snapshots, and the attachments pruning ended come back from
+  the blob lines. Intermediate snapshots (D.4) aren't rebuilt: they
+  aren't built here at all.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the
@@ -714,20 +731,21 @@ PATCHLOG_TEST_BACKEND=dynamodb DDB_ENDPOINT=http://localhost:8000 go test ./...
 runs them on DynamoDB Local, a fresh table each, as `PATCHLOG_TEST_PG`
 runs them on Postgres; CI's `dynamodb` job does. What the backend hasn't
 built skips without per-test annotations: `core.Open` refusing an option
-with `core.ErrUnsupported` (encryption at rest, archives, the SQL write
-path's hooks), or a `501 {"code":"unsupported"}`
+with `core.ErrUnsupported` (encryption at rest, the SQL write path's
+hooks), or a `501 {"code":"unsupported"}`
 answer on the test's own goroutine. Tests that run and answer
 differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,318 top-level tests (pure unit tests included): 1,063 pass on
-DynamoDB and 255 skip — most as unsupported (115 encryption at rest,
-then remote branches, nonce-required namespaces, gestures listing and
-10 archives), the rest on their own conditions (Postgres-only tests).
+1,319 top-level tests (pure unit tests included): 1,074 pass on
+DynamoDB and 245 skip — 209 as unsupported (115 encryption at rest,
+38 remote branches, 22 nonce-required namespaces, 17 gestures listing,
+9 author signatures, 6 the SQL write path's hooks, 2 sealed), 36 on
+their own conditions (Postgres-only tests).
 The known list is empty: no test answers differently from the SQL
 backends. A test that skips partway has asserted everything before
-its skip, so the phase-1 surface is covered beyond the 1,063.
+its skip, so the phase-1 surface is covered beyond the 1,074.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on
