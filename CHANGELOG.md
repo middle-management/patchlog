@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Implements spec **v0.73** (in progress: wave 3 of 4). v0.56 folds in the reference's notes
+Implements spec **v0.73**, the whole upgrade from v0.55. v0.56 folds in the reference's notes
 1–79; v0.57–v0.64 restructure the text (Requirements blocks, §12 as registries, the checklist
 moved to CONFORMANCE.md, about 15% shorter) and answer the cases §1–§13 and the addenda left
 open; v0.65–v0.73 answer four cold sweeps and the closing sweep, and state each security
@@ -16,11 +16,12 @@ paths, allowances and shared rate buckets, `/keys` and the e2e keyring document,
 and `/principal`, rule evaluation, organising grants, index access, gateway moves and tree
 access; the third brings the step-6 rule order, purges and prunes, schema protection, live
 reads, E3 client rules and raises to e2e, catalog item answers and merges, remote branches
-following their base's level, gateway users and tree-derived writes, and encrypted archives.
-Serving content from before a raise to e2e, keys and branches after a raise, the services'
-derived epochs and the new test vectors follow in wave 4. `GET /` already answers
-`"spec": "0.73"`. Where the spec leaves a question open, the reference implements the default
-the plan states.
+following their base's level, gateway users and tree-derived writes, and encrypted archives; the
+fourth brings serving what came before a raise to e2e (a raise from `sealed` included), keys and
+branches after a raise, the index's own edge grants, derived values sealed under the epoch their
+source is served under, the proposed Addendum I additions, and fixes to flaky Postgres tests.
+`GET /` answers `"spec": "0.73"`. Where the spec leaves a question open, the reference
+implements the default the plan states.
 
 **Changes to check before upgrading:**
 - **Development tools need `-author`** (§7.2). With authentication disabled, a write without
@@ -526,7 +527,20 @@ the plan states.
     `limit: "exchangeRate"`); refused requests, an E3 one without `enc` included, draw none.
   - **E3 branches:** `/keys` relays the branch's own keyring and each local base's keyring as of
     `at`, even after the branch wrote its own, for the base's epochs up to `at` (without `nbf`:
-    the base's current epoch, while it is still its epoch at `at`).
+    the base's current epoch, while it is still its epoch at `at`). A remote branch relays its
+    source's keyring entries by the same rule, the request's `epochs` no longer narrowing them; a
+    grant without `nbf` gets none once the source, or a deeper base of its `base.chain`, has moved
+    past its epoch at `at`, which the follower learns from the source's log and each chain base's
+    current document at every sync (§E.2.3, §G.5.2).
+  - **After a raise from `sealed`** (Levels, §E.2.3): `/keys` at E3 gives the keys of the epochs
+    before the raise as at E2, wrapped to the grant's `enc` in base mode, without `from`: `K_e` to
+    a grant that reads the namespace unrestricted, `K_r` of the names it fixes and may read to one
+    whose rules fix names, for the epochs of the grant's `nbf` window over all the namespace's
+    epochs (so none without `nbf`); what E2 would refuse with `403` is left out instead. A
+    branch's `/keys` gives its base's pre-raise keys, `kid` and `K_r` naming the base, for the
+    base epochs §E.2.3 selects, which the request's `epochs` don't narrow. Readers open content
+    with them; nothing new is sealed under them (no sender, §E.3.2) but a prune snapshot of
+    content from before the raise, which the server held with its keys anyway.
   - **E3 gate** (§E.3.1): a sealed op or prune snapshot with `zip` in its header is `422
     invalid`; a write's sealed op must name the epoch in force, for batch items the one the
     batch's config change produces (`422 invalid`); a declared blob with a nonce is `422 blob`.
@@ -542,16 +556,57 @@ the plan states.
     until a new epoch begins (any new epoch, an operator's config write included, clears it),
     instead of being only logged when it failed.
 - **End-to-end namespaces** (Addendum E Levels, §E.3.1, §E.3.2):
-  - **Raising to e2e:** an existing namespace may be raised to `e2e` from none or at-rest (a `*`
-    key; the epoch must be at least 1, F-E1 default). The server records the raise point (new
-    table `e2e_raises`) and an `e2e_epochs` row, and writes from the raising entry on go through
-    the E3 gate. A raise from `sealed` is still `422 invalid` at `/encryption`: what is stored
-    before it must stay sealed under the last epoch before the raise, which wave 4 serves. What
-    was stored before a raise from none or at-rest stays usable: a schema revision written before
-    it still resolves for documents elsewhere that pin it (only one written at e2e is
-    `schema_unavailable`, §6.1), and `patchlog archive restore` checks each archived patch set by
-    the level it was written at, so the plaintext history of a resource pruned before the raise,
-    or archived by an E3 prune after it, comes back and clears the horizon (it was skipped).
+  - **Raising to e2e:** an existing namespace may be raised to `e2e` from none, at-rest or
+    `sealed` (a `*` key; the epoch must be at least 1, F-E1 default, and from `sealed` the current
+    one + 1, as for any rotation). The server records the raise point (new table `e2e_raises`) and
+    an `e2e_epochs` row, writes from the raising entry on go through the E3 gate, and any raise
+    into `sealed` or `e2e`, `sealed` to `e2e` included, purges `ns:{ns}` (§9). What was stored
+    before the raise stays usable: a schema revision written before it still resolves for
+    documents elsewhere that pin it (only one written at e2e is `schema_unavailable`, §6.1), and
+    `patchlog archive restore` checks each archived patch set by the level it was written at, so
+    the history of a resource pruned before the raise, or archived by an E3 prune after it,
+    comes back, is served as at the level before like the rest of it, and clears the horizon (it
+    was skipped).
+  - **Serving what came before a raise** (Addendum E Levels, After a raise; §7.1 Paging): the
+    revisions, resource log entries, namespace documents and log ranges from before a raise are
+    served as at the level before. After a raise from none or at-rest they stay in the clear, and
+    `/rev/{id}` of a revision from before the raise serves its document instead of the fold
+    redirect (without `Last-Modified` or `Repr-Digest`; a schema revision keeps `X-Schema-Rules`,
+    so E3 clients validate under the rules the server resolves it with). After a raise from
+    `sealed` they are served sealed as §E.2.2 says, each revision under the epoch it is served
+    under (the one it was written in, else the last before the raise) with the `pad` setting
+    before the raise, events and resource purge/prune events too, and a sealing stored at E2
+    keeps its bytes; a purged raised namespace answers `410 purged` for them. No log page spans
+    the raise: a namespace log page ends before the raising entry, a resource log page before the
+    first revision written with or after it, and a page still holds one entry.
+  - **Grants** first recorded before a raise from `sealed` stay sealed (`pl { ns, grant }`);
+    later ones are served in the clear. Both forms are `Cache-Control: private` with
+    `CDN-Cache-Control`/`Surrogate-Control: no-store`, in public namespaces too (§C.3.1, §9).
+  - **Blobs** referenced by revisions from before a raise from `sealed` keep their `/e/{e}` URLs
+    under those revisions' epochs only, `…/blob/{bid}` redirects to them with `302`, and they are
+    never served in the clear; other blobs at E3 answer `/e/{e}` with `404 not_offered` (§7.1,
+    §E.2.2). A schema revision from before a raise from `sealed` resolves (§6.1), and such blobs
+    are copied or made available through a batch's local `source` (§2.1, §7.8), only with keys
+    that open it under the epoch it is served under, as `/keys` gives them as at E2.
+  - **Folds across the raise** (F-E1 default): the fold redirect of a revision written end to end
+    starts at the latest prune snapshot or, if later, the resource's last revision from before
+    the raise (its last live one before a tombstone). The Go client and the playground fold from
+    that document, opening sealed pre-raise documents and entries with the keys of their epoch
+    (`E2EDoc.PreRaise`, `E2E.Log`), and merge plans read e2e logs through the key holder's view,
+    so a merge plans across a raise from `sealed` (MF-5).
+  - **Branches of a raised base** (Levels, §7.4): creating a branch with an `at` before its base's
+    `e2e` raise is `422` (`invalid`, `errors` at `/base/at`). A branch serves what it reads
+    through from before the raise as the base serves it, the same bytes, `kid` and `pl` naming
+    the base, and readers of an e2e branch accept the base's `ns` there for documents, log entries
+    and blobs; they ask the branch's `/keys` first and then the `kid`'s namespace (§F.8.1), and a
+    transient failure while reading the branch's base chain is reported as itself and isn't
+    remembered. A prune snapshot of a base's pre-raise content in a branch is sealed under the
+    epoch the base serves it under: `kid` and `K_r` name the base, `pl` the branch, as the server
+    checks and `E2E.PruneE2E` seals it, with the key `/keys` gives as at E2 (§E.3.1).
+  - **E3 prunes and restores after a raise** (§8.6, §E.3.1): a horizon whose document is from
+    before the raise keeps that document and its stored sealing, and the sealings of pre-raise
+    content pruned below it are deleted; a restore with `[]` may keep a pre-raise document's plain
+    blob list (it was `422 blob`); other later writes still declare only sealed blobs.
   - **Trusted senders (breaking for keyrings stored before v0.63):** writers, prunes,
     `AddReader`, re-encrypted merges and services' derived views seal only under an epoch key
     whose keyring entry comes from a sender they trust, never under one without a sender: a key
@@ -839,6 +894,26 @@ the plan states.
     namespace's results are JSON with each hit sealed per entry under `K_r`, and `counts` there is
     `400`. Opening the index drops results stored sealed whole at a public URL before v0.73,
     which were served until the namespace's checkpoint moved.
+- **Derived values and epochs** (index and tree services, §E.2.6, §E.2.2):
+  - Values derived from sealed and e2e namespaces are sealed under the epoch their source revision
+    is served under (the `kid` of the sealed document at E2, of the sealed op at E3, of the
+    document served sealed as at E2 for content from before a raise from `sealed`), not the epoch
+    current when the view is sealed. A result or listing is sealed whole only when every value
+    comes from one epoch, otherwise per entry, and index `counts` over several epochs are `400`;
+    a file tree's file metadata (`{ "sealed": JWE }` of `{ "file": … }`) is sealed under the epoch
+    of its item's head.
+  - **Services need older keys:** to seal views over revisions from before a rotation after a
+    restart, the service's grant needs an `nbf` reaching back before those epochs (§E.2.3). Without
+    one the index answers `503 behind`, and the tree service shows the nodes served under an epoch
+    it can never get by name only, with no `sealed` values; a key it can't fetch for the moment is
+    `503 behind`, only for listings that show such nodes, and is fetched outside the graph lock.
+  - **Upgrade:** an index database that follows a sealed or e2e namespace is rebuilt once, to
+    record each document's epoch. A tree database reads in, on start, the epoch each node head
+    and each sealed item's file metadata is served under; heads it can never read keep sealing
+    under the current epoch, as before.
+  - A rotation that leaves the service out of the new epoch's readers (§E.2.4) skips the
+    namespace, as a raise whose keys it lacks does: the follower stops and queries are `404`. The
+    index applies the same check to branches it follows with their base (`-branches`).
 - **WebDAV gateway** (§H.1, §H.4, §H.5, §H.7): a `MOVE`'s `If-Match` names its source (`412`
   when stale, before anything is written; for a folder, the folder node's head, F-H1 default);
   the writer's own uploaded bytes are served under `W/"{id}"` (F-H2); a raw save is always
@@ -981,10 +1056,23 @@ the plan states.
     branches, leaves first, then the branch itself, by config writes of its own (author
     `system:remote`, no grant), sealing what the branch reads through as a local raise does and
     removing `schemaReads` at `sealed`. A raise to `e2e`, which Levels refuse a branch whose `at`
-    is before the base's raise, is recorded and the branch marked for a rebase. A base whose
+    is before the base's raise, is recorded and the branch marked for a rebase; where the branch
+    missed the base's raise to `sealed` before it (the follower before v0.73 skipped config
+    entries), it first raises, local dependents first, to the level the base had just before the
+    raise to `e2e`, read only from the base. A base whose
     `read` stops being public makes a public remote branch, and its public branches first,
     `read: "grant"`. These show as `config` notices in `RemoteNotices`; what couldn't be followed
     is in the new `Engine.RemoteLevels` (table `remote_levels`).
+  - **Remote branches of a source raised from `sealed` to `e2e` before `at`** (§G.3, §G.5.2,
+    MF-37) can be created where creation answered `502`: the deployment mirrors the history from
+    before the raise, fetches the keys of the epochs before it from the source's `POST
+    /ns/{ns}/keys` with the endpoint's grant (which needs `enc` and an `nbf` reaching back before
+    them) and their start times only from the source's own log, records the epoch each mirrored
+    entry is served under, and gives those keys as at E2, named for the source. It serves what it
+    mirrored from before the raise as the source does: sealed under that epoch, `kid` and `pl`
+    naming the source, never in the clear. A prune snapshot in the branch of such content is
+    checked against that epoch, and the refusal names the source, not the internal shadow.
+    Purging the branch destroys the source's keys it held (§8.5, §E.2.4).
   - **`502 upstream`** (§1, §6.2, §7.8): on a server without a key store, which offers no
     encryption level, a remote branch whose base is raised to any level answers `502 upstream`,
     with `origin`, for every resource the base had at `at`, read through or written on since,
@@ -1062,7 +1150,7 @@ the plan states.
   **`patchlog dav -inline-pdf`**.
 - The tree service's head pointer `GET /{catalog}/g/{gs}/{op}` under an edge grant's prefix.
 - **`internal/svcedge`**: a service's own edge grants (exchange, withdrawal, cookies, `gs`
-  subjects, shared buckets), used by the tree service and, in wave 4, the index's cookies.
+  subjects, shared buckets), used by the tree service and the index.
 - Client: `LogEntry.Via`, `NSEntry.Via`, `PrincipalInfo.Key`, `Operator` and
   `Catalog`, `BatchResult.ConfigReport` and `ConfigError()` (a dry run's report for its config
   change; `BatchResult.Config` is set only on a submit), `E2E.WithSenders`,
@@ -1094,6 +1182,41 @@ the plan states.
   `sig.ParseInput`, `bundle.StoredAuthority`, `merge.BranchWrites`, `merge.PlanObject`,
   `merge.ReadLock`, and `core.PruneRequest.{KeepSent,Precondition}` and
   `core.BlobUpload.{NonceSent,Precondition,ShapeErr}` for the waves that follow.
+
+- **The index's own edge grants** (§A.4, §B.11.5, §C.5): `POST /edge-grants` on the index
+  exchanges grants for cookies minted under the index's own key, for `/{ns}/g/{gs}` of each
+  private namespace it follows and `/_refs/g/{gs}` of the reader's subject set, following the
+  core's issuance (`application/json`, `415`, all or nothing: the first refusal in the order of
+  the grants' root blocks, `401`, then `403`, then others, then `410 purged` with `ns` and `head`,
+  the index's own purged namespaces included; `403` for a grant whose rules fix `/resource` to
+  names no read check passes for; `413 limit`; at most 100 prefixes; `429` from `exchangeRate`
+  buckets shared by the instances on one `-db`), and `DELETE /edge-grants` withdraws them. A GET
+  carrying only such a cookie is authorised from it, a reader limited to some resources getting
+  hits filtered as under its grant (the index keeps the rules and principal behind each scope
+  marker until its last cookie expires), and gets edge lifetimes behind a verifying edge; a
+  request needing `/g/{gs}` with neither a grant nor a cookie is `401`. The head pointers
+  `/{ns}/g/{gs}?…` and `/_refs/g/{gs}?to=…` are served under the prefix. **`patchlog index`**
+  gains `-edge-grant-key [KID=]FILE` (without one, cookies are minted under a random key of the
+  process), `-edge-grant-kid` (default `index`), `-origin-edge-grant-kid` and `-exchange-rate
+  RATE,BURST`.
+- **Proposed Addendum I additions** (I.11 and the spec writer's list, CIS-38), computed through
+  production code and kept in `internal/vectors/testdata/*.json`, each naming the function that
+  produced it; the tests check the stored files byte for byte and the verdicts on their own, and
+  `go test ./internal/vectors/ ./internal/grant/ ./internal/merge/ ./internal/core/ -run Vector
+  -update` rewrites them. They cover RE2 `\uXXXX` in patterns, schemas, key `sub` and grant rules
+  (§6.6); keys wrapped in HPKE base mode (`K_e`, `K_r`) and auth mode with RFC 7638 thumbprints,
+  and `/keys` entries, as full decrypt vectors (§E.2.3, §E.3.2); sealed payloads for every `pl`,
+  with the plaintexts a server seals (§E.2.2, §E.3.1); sealed blobs with E2 and E3 headers;
+  sealed bundles and the rules they break (§G.5.1.1); the plan digest (§F.9); Biscuit grant
+  tokens failing each §C.8 rule, strict Ed25519 included, and revocation ids (§C.8, §C.4); file
+  renderings (§H.1); noncharacters (§3.1); `/principal`'s `key` (§7.4); a history line with
+  `via` (§G.4.1); the archive key (§8.6, informative) and sealed resource purge/prune events
+  (§7.3). Randomness is fixed with the reference's test hooks; sealed bundles, which have none,
+  are decrypt vectors written under a fixed seed. Cases the spec leaves open (a blank line
+  between sealed bundle lines, a non-canonical envelope, a top-level `last`, RE2 `\x{D800}`) are
+  marked informative. No behaviour changes.
+- Client: `E2EDoc.PreRaise` and `Kid()`, `E2E.Log`, `Doc.Kid`, `LogEntry.Kid`; derived:
+  `Cache.Drop`, `Keys.KeyAt`, `EpochOf`; index: `Options.EdgeGrants`, `Options.ExchangeRate`.
 
 **Fixes:**
 - **Creating a namespace or a remote branch under the operator grant runs that grant's own
@@ -1146,6 +1269,22 @@ the plan states.
   `patternProperties` patterns are read as the core validates them (§6.5, §6.6).
 - **Playground**: the catalog tab and namespace views open namespace documents sealed with
   `kind: "doc"`, and the search tab's `404` for a namespace the index lacks keys for says so.
+- **Prunes keep the stored sealing of preserved schema revisions** (pinned revisions already below
+  an earlier horizon), which a later prune deleted, so the next read sealed them again with other
+  bytes (§E.2.2, §8.6).
+- **Catalog service:** a merge batch over a catalog the core holds as purged answers `410 purged`
+  with the `purge-ns` entry as `head`, even before the service has applied the purge (§8.5,
+  §B.11.4); it was `403`.
+- **Postgres:** a rate-limit draw (§6.6) rolled back for a deadlock pauses about 10 ms, then 20 ms,
+  with jitter, before running again; retrying at once could lose the rows to the statement that
+  survived the deadlock and close the same cycle on every attempt, failing the request. Such
+  deadlocks need a statement that locks bucket rows out of key order, such as an operator's.
+- **Tests:** `TestPGGroupCommitCancelBlockedGroup`, `TestPGGroupCommitCancelOneOfGroup`,
+  `TestPGGroupCommitLostRaceLeavesLoserOut` and `TestV073P17DrawRetriesDeadlock` (Postgres) wait for
+  the state they test instead of any lock wait or a fixed sleep (a rate draw's wait for a bucket
+  row looked like the group's), a failure in the group-commit helpers no longer panics and ends
+  the whole `internal/core` run, and the index's restart test reads the reopened checkpoint
+  before following.
 
 ## v0.22.0
 
