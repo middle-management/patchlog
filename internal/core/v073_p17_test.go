@@ -371,76 +371,126 @@ func TestV073P17RetryAfterLongestWait(t *testing.T) {
 // after admission keeps its deduction for both (§6.6 Cost, D.8).
 // LocalRateBuckets keeps a bucket per instance.
 func TestV073P17SharedBucketsAcrossInstances(t *testing.T) {
-	const burst = 5
 	for _, local := range []bool{false, true} {
-		var clock atomic.Int64
-		clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
-		lim := p17Fast()
-		lim.RatePerPrincipal = Rate{0.001, burst}
-		url, dir := pgtest.NewDB(t), t.TempDir()
-		a := p17RateEngine(t, url, dir, &clock, lim, local)
-		b := p17RateEngine(t, url, dir, &clock, lim, local)
-		mkNS(t, a, "n", map[string]any{})
+		// A subtest each, so the first's instances are closed, and their
+		// connections freed, before the second's open.
+		t.Run(fmt.Sprintf("local=%v", local), func(t *testing.T) { p17SharedBuckets(t, local) })
+	}
+}
 
-		// Concurrent writes of one principal through both instances.
-		var admitted, limited atomic.Int64
-		var wg sync.WaitGroup
-		for i := range 4 * burst {
-			e := a
-			if i%2 == 1 {
-				e = b
-			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_, err := v073CreateIn(e, "n", Credentials{Author: "w"}, fmt.Sprintf("r%d", i))
-				switch status(err) {
-				case 0:
-					admitted.Add(1)
-				case 429:
-					limited.Add(1)
-				default:
-					t.Errorf("write %d: %v", i, err)
-				}
-			}()
-		}
-		wg.Wait()
-		want := int64(burst)
-		if local {
-			want = 2 * burst
-		}
-		if admitted.Load() != want || limited.Load() != 4*burst-want {
-			t.Fatalf("local %v: %d admitted, %d limited, want %d admitted", local, admitted.Load(), limited.Load(), want)
-		}
+func p17SharedBuckets(t *testing.T, local bool) {
+	const burst = 5
+	var clock atomic.Int64
+	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+	lim := p17Fast()
+	lim.RatePerPrincipal = Rate{0.001, burst}
+	url, dir := pgtest.NewDB(t), t.TempDir()
+	a := p17RateEngine(t, url, dir, &clock, lim, local)
+	b := p17RateEngine(t, url, dir, &clock, lim, local)
+	mkNS(t, a, "n", map[string]any{})
 
-		// A create refused after admission (412, the name is taken) keeps
-		// its deduction, which the other instance sees.
-		x := Credentials{Author: "x"}
-		for i := range burst - 1 {
-			e := a
-			if i > 0 {
-				e = b
+	// Concurrent writes of one principal through both instances.
+	var admitted, limited atomic.Int64
+	var wg sync.WaitGroup
+	for i := range 4 * burst {
+		e := a
+		if i%2 == 1 {
+			e = b
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := v073CreateIn(e, "n", Credentials{Author: "w"}, fmt.Sprintf("r%d", i))
+			switch {
+			case err == nil:
+				admitted.Add(1)
+			case status(err) == 429:
+				limited.Add(1)
+			default:
+				t.Errorf("write %d: %v", i, err)
 			}
-			// Each create differs, so none is a retry of the first (§7.2).
-			it := Item{Resource: "x", IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"i": float64(i)}}}}}}
-			if _, err := e.WriteResource(context.Background(), Request{NS: "n", Cred: x}, it); i > 0 && status(err) != 412 || i == 0 && err != nil {
-				t.Fatalf("local %v: create %d of x: %v", local, i, err)
-			}
+		}()
+	}
+	wg.Wait()
+	want := int64(burst)
+	if local {
+		want = 2 * burst
+	}
+	if admitted.Load() != want || limited.Load() != 4*burst-want {
+		t.Fatalf("local %v: %d admitted, %d limited, want %d admitted", local, admitted.Load(), limited.Load(), want)
+	}
+
+	// A create refused after admission (412, the name is taken) keeps
+	// its deduction, which the other instance sees.
+	x := Credentials{Author: "x"}
+	for i := range burst - 1 {
+		e := a
+		if i > 0 {
+			e = b
 		}
-		_, errA := v073CreateIn(a, "n", x, "x2")
-		_, errB := v073CreateIn(b, "n", x, "x3")
-		if local {
-			if errA != nil || errB != nil {
-				t.Fatalf("local buckets: %v, %v", errA, errB)
-			}
-			continue
+		// Each create differs, so none is a retry of the first (§7.2).
+		it := Item{Resource: "x", IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"i": float64(i)}}}}}}
+		if _, err := e.WriteResource(context.Background(), Request{NS: "n", Cred: x}, it); i > 0 && status(err) != 412 || i == 0 && err != nil {
+			t.Fatalf("local %v: create %d of x: %v", local, i, err)
 		}
-		if errA != nil {
-			t.Fatalf("the last token: %v", errA)
+	}
+	_, errA := v073CreateIn(a, "n", x, "x2")
+	_, errB := v073CreateIn(b, "n", x, "x3")
+	if local {
+		if errA != nil || errB != nil {
+			t.Fatalf("local buckets: %v, %v", errA, errB)
 		}
-		if status(errB) != 429 {
-			t.Fatalf("after the burst, refusals included: %v", errB)
+		return
+	}
+	if errA != nil {
+		t.Fatalf("the last token: %v", errA)
+	}
+	if status(errB) != 429 {
+		t.Fatalf("after the burst, refusals included: %v", errB)
+	}
+}
+
+// A draw that fails (the store unreachable, out of connections) refuses
+// the write: a rate limit never fails open (§6.6). The write is answered
+// as any other store failure, an internal error, and leaves nothing
+// behind, so the same create succeeds once the store draws again.
+func TestV073P17DrawFailureRefuses(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+	url := pgtest.NewDB(t)
+	e := p17RateEngine(t, url, t.TempDir(), &clock, p17Fast(), false)
+	mkNS(t, e, "n", map[string]any{})
+	s := e.rate.store
+	if s == nil {
+		t.Fatal("no bucket store on Postgres")
+	}
+	// Every draw fails from here on.
+	s.db.Close()
+	w := Credentials{Author: "w"}
+	for i := range 3 {
+		res, err := v073CreateIn(e, "n", w, "r")
+		if err == nil || status(err) != 0 {
+			t.Fatalf("write %d with the draw failing: %+v, %v; want an internal error", i, res, err)
 		}
+		if !strings.Contains(err.Error(), "database is closed") {
+			t.Fatalf("write %d: %v, want the draw's error", i, err)
+		}
+	}
+	// A batch and its dry run draw too (§6.6 Dry runs).
+	it := Item{Resource: "r", IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{}}}}}}
+	for _, dry := range []bool{true, false} {
+		if res, err := e.Batch(context.Background(), Request{NS: "n", Cred: w}, []Item{it}, nil, nil, dry); err == nil || status(err) != 0 {
+			t.Fatalf("batch (dry run %v) with the draw failing: %+v, %v; want an internal error", dry, res, err)
+		}
+	}
+
+	fresh, err := openBucketStore(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.rate.store = fresh
+	if _, err := v073CreateIn(e, "n", w, "r"); err != nil {
+		t.Fatalf("the create once the store draws again: %v", err)
 	}
 }
 
