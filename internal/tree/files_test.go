@@ -396,6 +396,10 @@ func TestFileTreeShape(t *testing.T) {
 			<-x.done
 			h := must(w.NSHead(ctx, "pub"))
 			must(w.PatchConfig(ctx, "pub", h.Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
+			// With no follower to Observe the change, the service learns of it
+			// when its cached document of pub expires: the read before the
+			// stop may have refreshed it moments ago.
+			time.Sleep(checkerTTL)
 			r = x.raw(loc, "")
 			e := entriesOf(t, r.body)["pub.plan"]
 			if r.status != 200 || e == nil {
