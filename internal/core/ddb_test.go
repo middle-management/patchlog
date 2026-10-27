@@ -7,18 +7,14 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
@@ -30,41 +26,13 @@ func ddbEngine(t *testing.T) *Engine {
 	if endpoint == "" {
 		t.Skip("DDB_ENDPOINT not set: skipping DynamoDB Local integration test")
 	}
-	ctx := context.Background()
-	table := fmt.Sprintf("coretest-%d", time.Now().UnixNano())
-	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion("us-east-1"),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("local", "local", "")),
-		config.WithResponseChecksumValidation(aws.ResponseChecksumValidationUnset))
-	if err != nil {
+	url := fmt.Sprintf("dynamodb://coretest-%d?region=us-east-1&endpoint=%s", time.Now().UnixNano(), endpoint)
+	if err := ddb.CreateTable(context.Background(), url); err != nil {
 		t.Fatal(err)
 	}
-	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(endpoint) })
-	if _, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
-		TableName: aws.String(table),
-		AttributeDefinitions: []types.AttributeDefinition{
-			{AttributeName: aws.String("PK"), AttributeType: types.ScalarAttributeTypeS},
-			{AttributeName: aws.String("SK"), AttributeType: types.ScalarAttributeTypeS},
-			{AttributeName: aws.String("G1PK"), AttributeType: types.ScalarAttributeTypeS},
-		},
-		KeySchema: []types.KeySchemaElement{
-			{AttributeName: aws.String("PK"), KeyType: types.KeyTypeHash},
-			{AttributeName: aws.String("SK"), KeyType: types.KeyTypeRange},
-		},
-		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{{
-			IndexName:  aws.String("GSI1"),
-			KeySchema:  []types.KeySchemaElement{{AttributeName: aws.String("G1PK"), KeyType: types.KeyTypeHash}},
-			Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
-		}},
-		BillingMode: types.BillingModePayPerRequest,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		client.DeleteTable(context.Background(), &dynamodb.DeleteTableInput{TableName: aws.String(table)})
-	})
+	t.Cleanup(func() { ddb.DeleteTable(context.Background(), url) })
 	e, err := Open(Options{
-		Path:         fmt.Sprintf("dynamodb://%s?region=us-east-1&endpoint=%s", table, endpoint),
+		Path:         url,
 		AuthDisabled: true,
 	})
 	if err != nil {
@@ -295,7 +263,7 @@ func TestDDBOpenRequiresDev(t *testing.T) {
 		t.Skip("DDB_ENDPOINT not set: skipping DynamoDB Local integration test")
 	}
 	_, err := Open(Options{Path: "dynamodb://whatever?region=us-east-1&endpoint=" + endpoint})
-	if err == nil || !strings.Contains(err.Error(), "-dev") {
+	if !errors.Is(err, ErrUnsupported) || !strings.Contains(err.Error(), "-dev") {
 		t.Fatalf("want the -dev requirement, got %v", err)
 	}
 }

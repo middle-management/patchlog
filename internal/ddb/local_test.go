@@ -19,12 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-
 	"github.com/middle-management/patchlog/internal/ids"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -37,53 +31,16 @@ func newLocalStore(t testing.TB) *Store {
 		t.Skip("DDB_ENDPOINT not set: skipping DynamoDB Local integration test")
 	}
 	ctx := context.Background()
-	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion("us-east-1"),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("local", "local", "")),
-		// DynamoDB Local's responses trip the SDK's checksum validation.
-		config.WithResponseChecksumValidation(aws.ResponseChecksumValidationUnset),
-	)
+	url := fmt.Sprintf("dynamodb://spike-%d?region=us-east-1&endpoint=%s", time.Now().UnixNano(), endpoint)
+	if err := CreateTable(ctx, url); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { DeleteTable(context.Background(), url) })
+	s, err := Open(ctx, url)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
-		o.BaseEndpoint = aws.String(endpoint)
-	})
-	table := fmt.Sprintf("spike-%d", time.Now().UnixNano())
-	if _, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
-		TableName: aws.String(table),
-		AttributeDefinitions: []types.AttributeDefinition{
-			{AttributeName: aws.String("PK"), AttributeType: types.ScalarAttributeTypeS},
-			{AttributeName: aws.String("SK"), AttributeType: types.ScalarAttributeTypeS},
-			{AttributeName: aws.String("G1PK"), AttributeType: types.ScalarAttributeTypeS},
-		},
-		KeySchema: []types.KeySchemaElement{
-			{AttributeName: aws.String("PK"), KeyType: types.KeyTypeHash},
-			{AttributeName: aws.String("SK"), KeyType: types.KeyTypeRange},
-		},
-		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
-			{
-				IndexName:  aws.String(gsiName),
-				KeySchema:  []types.KeySchemaElement{{AttributeName: aws.String("G1PK"), KeyType: types.KeyTypeHash}},
-				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
-			},
-		},
-		BillingMode: types.BillingModePayPerRequest,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		client.DeleteTable(context.Background(), &dynamodb.DeleteTableInput{TableName: aws.String(table)})
-	})
-	for range 50 {
-		out, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)})
-		if err == nil && out.Table.TableStatus == types.TableStatusActive {
-			return &Store{Client: client, Table: table}
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatal("table did not become ACTIVE")
-	return nil
+	return s
 }
 
 func patches(v string) any { return jsonv.MustParse([]byte(v)) }

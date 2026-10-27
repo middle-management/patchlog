@@ -45,19 +45,34 @@ type ddbCfgEntry struct {
 	cfg *Config
 }
 
+// ErrUnsupported wraps Open's refusal of an option the backend the path
+// names doesn't implement (on DynamoDB: encryption at rest, blob storage,
+// authentication — docs/DYNAMODB.md §13). Test harnesses skip on it; a
+// deployment fixes its flags.
+var ErrUnsupported = errors.New("not implemented on this backend")
+
 // openDDB builds the engine on a DynamoDB table (Open's branch for
 // dynamodb:// paths, after option normalization). The background loops of
 // the SQL backends (tailer, retention, sweeps, repurge, rotation, remote
 // follow) don't start: their features are phase 2+.
 func openDDB(opt Options) (*Engine, error) {
 	if opt.KeyStore != nil {
-		return nil, fmt.Errorf("core: encryption at rest is not implemented on the DynamoDB backend (docs/DYNAMODB.md phase 1)")
+		return nil, fmt.Errorf("core: encryption at rest: %w (DynamoDB, docs/DYNAMODB.md phase 1)", ErrUnsupported)
 	}
 	if opt.BlobDir != "" {
-		return nil, fmt.Errorf("core: blob storage is not implemented on the DynamoDB backend (docs/DYNAMODB.md phase 1)")
+		return nil, fmt.Errorf("core: blob storage: %w (DynamoDB, docs/DYNAMODB.md phase 1)", ErrUnsupported)
 	}
 	if !opt.AuthDisabled {
-		return nil, fmt.Errorf("core: the DynamoDB backend writes in -dev mode only (docs/DYNAMODB.md phase 1); run with -dev")
+		return nil, fmt.Errorf("core: authentication: %w (DynamoDB writes in -dev mode only, docs/DYNAMODB.md phase 1); run with -dev", ErrUnsupported)
+	}
+	// What it would otherwise ignore: an archive no retention loop writes,
+	// and the SQL write path's test hooks, which it never reaches — a
+	// caller waiting on one would wait for good.
+	if opt.Archiver != nil {
+		return nil, fmt.Errorf("core: archives: %w (DynamoDB, docs/DYNAMODB.md phase 2)", ErrUnsupported)
+	}
+	if opt.BeforeWriteLock != nil || opt.BeforeCommit != nil {
+		return nil, fmt.Errorf("core: the SQL write path's hooks (BeforeWriteLock, BeforeCommit): %w (DynamoDB)", ErrUnsupported)
 	}
 	store, err := ddb.Open(context.Background(), opt.Path)
 	if err != nil {
