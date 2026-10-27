@@ -59,10 +59,14 @@ type Parent struct {
 // Node is a folder or placement (explicit, from the catalog namespace), or
 // an implicit placement from a content document's $parents (§B.9).
 type Node struct {
-	Name      string
-	Kind      int
-	Self      bool   // implicit placement (§B.9)
-	Head      string // the catalog revision of the node's document ("" for implicit)
+	Name string
+	Kind int
+	Self bool   // implicit placement (§B.9)
+	Head string // the catalog revision of the node's document ("" for implicit)
+	// Epoch is the epoch Head is served under in a sealed or e2e catalog
+	// (derived.EpochOf), which the node's entries are sealed under
+	// (§E.2.6); 0 where not known, or for an implicit placement.
+	Epoch     int
 	Title     string
 	Parents   []Parent
 	Access    map[string][]string // $access subject -> role names (without "inherit")

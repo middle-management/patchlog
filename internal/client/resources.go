@@ -154,6 +154,10 @@ type Doc struct {
 	// (schema.Validator.ValidateMarked).
 	Rules      schema.Rules
 	RulesKnown bool
+	// Kid is the kid of the sealed document as served, "{ns}#{e}" naming
+	// the epoch the revision is served under (§E.2.2), "" for a document
+	// served in the clear.
+	Kid string
 }
 
 // Doc fetches the document at revision id (immutable). A tombstone id, a
@@ -173,16 +177,20 @@ func (c *Client) Doc(ctx context.Context, ns, name, id string) (*Doc, error) {
 		return nil, r.apiError()
 	}
 	body := r.body
+	kid := ""
 	if isJOSE(r) {
 		if body, err = c.open(ctx, ns, name, string(r.body), fixedPL(seal.ResourcePL(ns, name, id, seal.KindDoc))); err != nil {
 			return nil, fmt.Errorf("client: document %s/%s@%s: %w", ns, name, id, err)
+		}
+		if h, err := seal.ParseHeader(string(r.body)); err == nil {
+			kid = h.Kid
 		}
 	}
 	v, err := jsonv.Parse(body)
 	if err != nil {
 		return nil, fmt.Errorf("client: document %s/%s@%s: %w", ns, name, id, err)
 	}
-	d := &Doc{ID: id, Raw: body, Value: v}
+	d := &Doc{ID: id, Raw: body, Value: v, Kid: kid}
 	if t, err := http.ParseTime(r.header.Get("Last-Modified")); err == nil {
 		d.Modified = t
 	}

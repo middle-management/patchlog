@@ -329,9 +329,13 @@ func (s *Service) IssueMerge(ctx context.Context, v, av, adm *grant.Verified, ba
 		mi := &mergeItem{name: name}
 		ifMatch, _ := it["ifMatch"].(string)
 		inm, _ := it["ifNoneMatch"].(string)
-		h, err := c.Head(ctx, cat, name)
+		// Every name of a catalog the core holds as purged is 410 purged
+		// with its purge-ns entry, as in organising requests (coreHead):
+		// before the service applies the purge of an unsealed catalog,
+		// only the core's head of a name tells (§8.5, §B.11.4).
+		h, err := s.coreHead(ctx, cat, name)
 		if err != nil {
-			return nil, upstream(err)
+			return nil, err
 		}
 		switch {
 		case inm == "*":

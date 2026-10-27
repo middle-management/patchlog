@@ -21,12 +21,15 @@ import (
 //	                                 when the service applied ns's purge (Unix nanoseconds; "1"
 //	                                 from earlier releases); "caught:{ns}" the head its first
 //	                                 catch-up with ns reached (behind)
-//	nodes(href, name, kind, item, item_head, title, state, …, born)
+//	nodes(href, name, kind, item, item_head, title, state, …, born, epoch)
 //	                                 one row per node (explicit, or implicit from $parents);
 //	                                 raw parents/$access kept to rebuild the graph on start;
 //	                                 born, the created of the first revision of the node's
 //	                                 document (§B.5), '' where it can't be known, NULL where
-//	                                 it isn't read yet (bornVal)
+//	                                 it isn't read yet (bornVal); epoch, the epoch head is
+//	                                 served under in a sealed or e2e catalog (§E.2.6), which
+//	                                 meta "epochs" marks pending for rows from before it
+//	                                 (backfillEpochs, as for items.file's epoch)
 //	edges(child, pos, parent, ord, state)
 //	                                 one row per declared parents entry (hrefs), with its state
 //	items(ns, name, state, head, title, created, file)
@@ -56,7 +59,7 @@ var createStmts = []string{
 		item TEXT, item_head TEXT, title TEXT, state INTEGER NOT NULL DEFAULT 0,
 		self INTEGER NOT NULL DEFAULT 0, head TEXT, parents TEXT, access TEXT,
 		dangling TEXT, cyclic INTEGER NOT NULL DEFAULT 0, deep INTEGER NOT NULL DEFAULT 0, depth INTEGER NOT NULL DEFAULT -1,
-		item_state INTEGER NOT NULL DEFAULT 0)`,
+		item_state INTEGER NOT NULL DEFAULT 0, epoch INTEGER)`,
 	`CREATE TABLE IF NOT EXISTS edges (child TEXT NOT NULL, pos INTEGER NOT NULL, parent TEXT NOT NULL, ord TEXT,
 		state INTEGER NOT NULL, PRIMARY KEY (child, pos))`,
 	`CREATE INDEX IF NOT EXISTS edges_by_parent ON edges (parent, ord, child)`,
@@ -76,9 +79,12 @@ var dropStmts = []string{
 // addedColumns are columns later releases added to tables of earlier
 // ones (init adds them where missing): item titles (§B.5), created times
 // and file metadata (§H.3, which backfillFiles fills in for a file tree),
-// and born (§B.5, which backfillNodes fills in).
+// born (§B.5, which backfillNodes fills in), and the epoch a node's
+// head is served under (§E.2.6), which backfillEpochs fills in for rows
+// written before it (meta "epochs").
 var addedColumns = [][2]string{
 	{"items", "title"}, {"items", "created"}, {"items", "file"}, {"nodes", "born"}, {"self_parents", "born"},
+	{"nodes", "epoch"},
 }
 
 func canonJSON(v any) string {
@@ -138,10 +144,14 @@ func (s *Service) persistNode(ctx context.Context, tx *sql.Tx, g *Graph, name st
 			access = canonJSON(n.rawAccess)
 		}
 	}
+	var epoch any
+	if n.Epoch > 0 {
+		epoch = n.Epoch
+	}
 	_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO nodes (href, name, kind, item, item_head, title, state, self, head, parents, access,
-		dangling, cyclic, deep, depth, item_state, born) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		dangling, cyclic, deep, depth, item_state, born, epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		href, name, n.Kind, item, itemHead, title, n.State, b2i(n.Self), head, parents, access,
-		dangling, b2i(n.Cyclic), b2i(n.Deep), n.Depth, n.ItemState, born)
+		dangling, b2i(n.Cyclic), b2i(n.Deep), n.Depth, n.ItemState, born, epoch)
 	if err != nil {
 		return err
 	}
@@ -212,7 +222,7 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 	if err := crows.Err(); err != nil {
 		return nil, err
 	}
-	rows, err := q.QueryContext(ctx, `SELECT name, self, head, title, parents, access, state, dangling, cyclic, deep, item_state, item_head, born FROM nodes`)
+	rows, err := q.QueryContext(ctx, `SELECT name, self, head, title, parents, access, state, dangling, cyclic, deep, item_state, item_head, born, epoch FROM nodes`)
 	if err != nil {
 		return nil, err
 	}
@@ -225,12 +235,13 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 		dangling                sql.NullString
 		cyclic, deep, itemState int
 		itemHead, born          sql.NullString
+		epoch                   sql.NullInt64
 	}
 	var all []rowT
 	for rows.Next() {
 		var r rowT
 		var self int
-		if err := rows.Scan(&r.name, &self, &r.head, &r.title, &r.parents, &r.access, &r.state, &r.dangling, &r.cyclic, &r.deep, &r.itemState, &r.itemHead, &r.born); err != nil {
+		if err := rows.Scan(&r.name, &self, &r.head, &r.title, &r.parents, &r.access, &r.state, &r.dangling, &r.cyclic, &r.deep, &r.itemState, &r.itemHead, &r.born, &r.epoch); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -259,6 +270,7 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 		}
 		n := ParseNode(g.Catalog, r.name, r.head.String, doc)
 		n.Born, n.BornUnknown = bornCol(r.born)
+		n.Epoch = int(r.epoch.Int64)
 		g.setExplicit(n)
 	}
 	// Deleted and purged explicit placements, before the implicit ones

@@ -539,18 +539,24 @@ func TestFileTreeSealingKeys(t *testing.T) {
 	createNonced(t, w, "files", "notes", map[string]any{"n": 1})
 	must(w.CreateDoc(ctx, "cat", "files.notes", map[string]any{"parents": parents("root")}))
 	ft := &flaky{prefix: "/ns/files/keys"}
-	sc := s.Client(t, client.WithHTTPClient(&http.Client{Transport: ft}), client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"})),
+	// The service's grant reaches back before the new epoch (nbf), so it
+	// gets epoch 1's key too, which the item's file metadata is sealed
+	// under (§E.2.3, §E.2.6), after a restart included.
+	sc := s.Client(t, client.WithHTTPClient(&http.Client{Transport: ft}), client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"},
+		map[string]any{"nbf": s.Now().Add(-24 * time.Hour).Format(time.RFC3339)})),
 		client.WithKeys(client.NewKeys(nil)))
 	var mu sync.Mutex
 	var logs []string
-	x := startSvc(t, sc, svcOpts{now: s.Now}, func(o *tree.Options) {
+	opts := svcOpts{now: s.Now, db: filepath.Join(t.TempDir(), "tree.db")}
+	logTo := func(o *tree.Options) {
 		o.Logf = func(f string, a ...any) {
 			mu.Lock()
 			logs = append(logs, fmt.Sprintf(f, a...))
 			mu.Unlock()
 			t.Logf(f, a...)
 		}
-	})
+	}
+	x := startSvc(t, sc, opts, logTo)
 	x.caughtUp("cat", "files", "secret")
 	reader := k.Grant(t, s.Now(), "user:r", all, []string{"read"})
 	sealedFile := func() string {
@@ -562,10 +568,15 @@ func TestFileTreeSealingKeys(t *testing.T) {
 		t.Fatal("no sealed file")
 	}
 
-	// A new epoch, whose key the service can't get for now when it lists.
+	// A new epoch, whose key the service can't get for now when it lists:
+	// it fetches the key as it applies the change (derived.Keys.Recheck),
+	// so a service restarted since, whose key fetches fail, holds none.
 	must(w.PatchConfig(ctx, "files", must(w.NSHead(ctx, "files")).Config, []any{map[string]any{"op": "add", "path": "/encryption/epoch", "value": 2}}))
 	x.caughtUp("files")
+	x.stop()
 	ft.fail.Store(1 << 20)
+	x = startSvc(t, sc, opts, logTo)
+	x.caughtUp("cat", "files", "secret")
 	r := x.raw("/cat/children?of=root", reader)
 	if loc := r.header.Get("Location"); r.status == 302 {
 		r = x.raw(loc, reader)
@@ -578,7 +589,9 @@ func TestFileTreeSealingKeys(t *testing.T) {
 	if jwe == "" {
 		t.Fatal("no sealed file once the key is had")
 	}
-	if kid, _ := jwtHeader(t, jwe)["kid"].(string); kid != "files#2" {
+	// Under the epoch the item's head is served under, written before
+	// the new epoch (§E.2.6 values of another resource, ENC-34).
+	if kid, _ := jwtHeader(t, jwe)["kid"].(string); kid != "files#1" {
 		t.Fatalf("sealed under %q", kid)
 	}
 	mu.Lock()

@@ -363,6 +363,12 @@ func (s *Service) init(ctx context.Context) error {
 			if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+tc[0]+` ADD COLUMN `+tc[1]+` TEXT`); err != nil {
 				return fmt.Errorf("tree: schema: %w", err)
 			}
+			if tc == [2]string{"nodes", "epoch"} {
+				// The epochs of its heads are read in (backfillEpochs).
+				if _, err := s.db.ExecContext(ctx, `INSERT INTO meta (k, v) VALUES ('epochs', 'pending') ON CONFLICT (k) DO NOTHING`); err != nil {
+					return fmt.Errorf("tree: schema: %w", err)
+				}
+			}
 		}
 	}
 	if err := s.sealed.Init(ctx); err != nil {
@@ -715,14 +721,18 @@ func (s *Service) Run(ctx context.Context) error {
 		}()
 	}
 	// Born and deleted explicit placements, one log or page per node of a
-	// database from before them, are read beside the followers, which
-	// don't wait for them.
+	// database from before them, and the epochs heads are served under,
+	// are read beside the followers, which don't wait for them.
 	s.fwg.Add(1)
 	go func() {
 		defer s.fwg.Done()
 		if err := s.backfillNodes(ctx); err != nil && ctx.Err() == nil {
 			s.opt.Logf("tree: nodes: %v; retrying", err)
 			s.retryBackfill(ctx, "nodes", s.backfillNodes)
+		}
+		if err := s.backfillEpochs(ctx); err != nil && ctx.Err() == nil {
+			s.opt.Logf("tree: epochs: %v; retrying", err)
+			s.retryBackfill(ctx, "epochs", s.backfillEpochs)
 		}
 	}()
 	s.ensureFollowers()
@@ -898,6 +908,7 @@ type prep struct {
 	name  string
 	kind  string // head, tombstone or purge
 	head  string
+	epoch int // the epoch head is served under (derived.EpochOf), 0 if not known
 	doc   any
 	title string // the item's title at the catalog's pointer (§B.5)
 	// created is the head's created as the log gives it, file its file
@@ -1030,12 +1041,12 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 					// entry's created isn't its (follow.FetchDoc).
 					p.created = ""
 				}
-				p.head, p.doc = doc.ID, doc.Value
+				p.head, p.doc, p.epoch = doc.ID, doc.Value, derived.EpochOf(fb.NS, doc.Kid)
 				if titled {
 					p.title = titleAt(doc.Value, tptr)
 				}
 				if filed {
-					p.file = fileMetaOf(doc, p.created)
+					p.file = fileMetaOf(doc, p.created, fb.NS)
 				}
 				// A node's born (§B.5): a catalog node's, or that of the
 				// implicit placement a content document makes (§B.9).
@@ -1277,7 +1288,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			changed[p.name] = true
 			if p.kind == "head" && p.doc != nil {
 				n := ParseNode(cat, p.name, p.head, p.doc)
-				n.Born, n.BornUnknown = p.born, p.bornUnknown
+				n.Born, n.BornUnknown, n.Epoch = p.born, p.bornUnknown, p.epoch
 				if g.explicitGone[p.name] {
 					if err := saveGone(ctx, tx, p.name, false); err != nil {
 						return nil, err

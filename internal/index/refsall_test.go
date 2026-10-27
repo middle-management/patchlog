@@ -343,10 +343,15 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 			t.Errorf("%s: %d", p, r.status)
 		}
 	}
-	for _, p := range []string{"/_refs/x", "/_refs/at/" + amyAt + q, "/_refs/g/" + amyGs + q, "/_refs/g/zzz/at/" + amyAt + q, "/_refs/at/" + amyAt + "/g/zzz" + q} {
+	for _, p := range []string{"/_refs/x", "/_refs/at/" + amyAt + q, "/_refs/g/zzz/at/" + amyAt + q, "/_refs/at/" + amyAt + "/g/zzz" + q} {
 		if r := idx.raw(p, amy); r.status != 404 {
 			t.Errorf("%s: %d", p, r.status)
 		}
+	}
+	// The head pointer under the subject set's prefix, which its edge
+	// grants cover (§B.11.5), redirects to its current at.
+	if r := idx.raw("/_refs/g/"+amyGs+q, amy); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/_refs/g/"+amyGs+"/at/") {
+		t.Errorf("pointer under the prefix: %d %s", r.status, r.header.Get("Location"))
 	}
 	// The form before v0.51 is moved to the subject set first (§A.4).
 	if r := idx.raw("/_refs/at/"+amyAt+"/g/"+amyGs+q, ""); r.status != 301 || r.header.Get("Location") != amyLoc {

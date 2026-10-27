@@ -55,6 +55,9 @@ const strictMins = false
 //	GET /{ns}/g/{gs}/at/{ns_id}?… private namespaces: as above, keyed by the
 //	                              reader's subject set gs (§A.4, §B.11.5), the
 //	                              subject set before the checkpoint
+//	GET /{ns}/g/{gs}?…            the head pointer under the subject set's
+//	                              prefix, which its edge grants cover
+//	POST, DELETE /edge-grants     the service's own edge grants (edgegrants.go)
 //
 // The forms before v0.51, /g/{gs}/{ns}?… and /g/{gs}/{ns}/at/{ns_id}?…,
 // are moved permanently (301) to /{ns}?… and /{ns}/g/{gs}/at/{ns_id}?….
@@ -79,20 +82,26 @@ const strictMins = false
 // Private namespaces need Authorization: Bearer <grant>, which reads only
 // under its own gs: an at URL of another gs is 403; the head pointer and
 // an at URL without /g/{gs} are redirected into the reader's (with min, by
-// the redirect above), private, no-store (§A.4, §B.11.5).
+// the redirect above), private, no-store (§A.4, §B.11.5). A request
+// without Authorization may carry instead an edge grant the service
+// minted for the gs of its URL (Options.EdgeGrants), and is read as that
+// subject set; one with neither is 401.
 //
-// Sealed and e2e namespaces (§E.2.5, §E.2.6; package derived). A result
+// Sealed and e2e namespaces (§E.2.5, §E.2.6; package derived). Every
+// value is sealed under the epoch the revision it derives from is served
+// under (docs.epoch; the current one where that isn't known). A result
 // has one source, so in a private namespace a reader of it whole (marker
-// reads:{ns}) gets it sealed as one JWE under the namespace's current
-// epoch key, Content-Type application/jose, pl { ns, view } where view is
-// the result's request target (/{ns}/g/{gs}/at/{ns_id}?{query}, the
+// reads:{ns}) gets it sealed as one JWE under that epoch's key, when
+// every hit (and, with counts, every hit counted) comes from one epoch,
+// Content-Type application/jose, pl { ns, view } where view is the
+// result's request target (/{ns}/g/{gs}/at/{ns_id}?{query}, the
 // canonical form). A public namespace's results, which every reader gets,
-// and those of a reader whose grant restricts resources, who may hold
-// only per-resource keys, are JSON { at, ns, hits, next? } in which each
-// hit keeps resource, id and url in the clear and carries its score,
-// schema and facets as "sealed": JWE under its resource's K_r, pl { ns,
-// name, view }; counts, which aggregate over resources, are refused (400)
-// there.
+// those of a reader whose grant restricts resources, who may hold only
+// per-resource keys, and those mixing epochs are JSON { at, ns, hits,
+// next? } in which each hit keeps resource, id and url in the clear and
+// carries its score, schema and facets as "sealed": JWE under its
+// resource's K_r of its epoch, pl { ns, name, view }; counts, which
+// aggregate over resources, are refused (400) there.
 // Sealed results are produced once per view (so per epoch: a rotation
 // moves the checkpoint), stored in the database with their cache tags, and
 // served unchanged, across restarts, until a purge with one of those tags
@@ -112,6 +121,12 @@ func (ix *Index) Handler() http.Handler {
 }
 
 func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/edge-grants" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		// The index's own edge grants (edgegrants.go); a GET is a query
+		// of a namespace of that name, as any other.
+		ix.serveEdgeGrants(w, r)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		writeErr(w, http.StatusMethodNotAllowed, "bad_input", "method not allowed")
@@ -134,6 +149,12 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(segs) == 3 && segs[1] == "at":
 		ns, at, isAt = segs[0], segs[2], true
 		telemetry.SetRoute(r, "/{ns}/at/{at}")
+	case len(segs) == 3 && segs[1] == "g":
+		// The head pointer under a subject set's prefix, which its edge
+		// grants cover (§B.11.5). No subject set is "g", so the form
+		// before v0.51 below, /g/{gs}/{ns}, never matches here.
+		ns, gs = segs[0], segs[2]
+		telemetry.SetRoute(r, "/{ns}/g/{gs}")
 	case len(segs) == 5 && segs[1] == "g" && segs[3] == "at":
 		ns, gs, at, isAt = segs[0], segs[2], segs[4], true
 		telemetry.SetRoute(r, "/{ns}/g/{gs}/at/{at}")
@@ -176,10 +197,18 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 // access is the outcome of the read check for one request.
 type access struct {
 	public bool
-	v      *grant.Verified
-	all    bool   // reads every resource: no per-resource filtering
-	marker string // what the reader's answers depend on (private only, §A.4)
-	gs     string // subject-set id over marker (private only)
+	v      *grant.Verified // nil under an edge grant (cookie)
+	all    bool            // reads every resource: no per-resource filtering
+	marker string          // what the reader's answers depend on (private only, §A.4)
+	gs     string          // subject-set id over marker (private only)
+	// allow is the per-resource read check of a reader that isn't all:
+	// the grant's, or under an edge grant the filter its marker stands
+	// for (readFilter).
+	allow func(resource string) bool
+	// filter is what a scope marker stands for, which an edge grant
+	// minted for it authorises from (readFilter).
+	filter *readFilter
+	cookie bool // read under one of the service's edge grants
 }
 
 // writeLimit answers a grant over grantSize or rulesPerGrant, which the
@@ -206,12 +235,23 @@ func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*acces
 	}
 	token := bearer(r)
 	if token == "" {
+		// One of the service's edge grants for this namespace's subject
+		// set, on a request without Authorization (edgegrants.go).
+		if a, ok, err := ix.cookieAccess(ctx, ns, r); ok || err != nil {
+			return a, err
+		}
 		return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
 	}
 	v, err := ix.checker.Verify(ctx, ns, token)
 	if err != nil {
 		return nil, err
 	}
+	return ix.grantAccess(ns, v)
+}
+
+// grantAccess is access to private namespace ns for v, a grant verified
+// there.
+func (ix *Index) grantAccess(ns string, v *grant.Verified) (*access, error) {
 	if ok, _ := v.Allows("read"); !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
 	}
@@ -236,7 +276,8 @@ func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*acces
 	if !ix.checker.ReadsPerResource(v) {
 		return nil, &grant.AuthError{Status: 403, Msg: "a grant or key rule refuses the read"}
 	}
-	return marked(&access{v: v, marker: "reads:" + ns + ":scope:" + digest}), nil
+	return marked(&access{v: v, marker: "reads:" + ns + ":scope:" + digest, filter: filterOf(v),
+		allow: func(resource string) bool { return ix.checker.AllowsRead(v, resource) }}), nil
 }
 
 // marked sets a's gs, the subject set of its marker alone.
@@ -287,7 +328,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// A purged sealed namespace's document is 410 too (§8.5): the
 		// core makes the read check before answering it, as below.
 		var head string
-		if head, err = ix.checker.PurgedRead(ctx, ns, bearer(r)); err == nil {
+		if head, err = ix.purgedRead(ctx, ns, r, err); err == nil {
 			writePurged(w, head)
 			return
 		}
@@ -360,6 +401,12 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	// one, which no grant decides, is redirected to the same at in the
 	// reader's space; with min, the redirects below land there, without
 	// min (§A.5).
+	if !isAt && gs != "" && gs != a.gs && !a.public {
+		// The head pointer under another subject set's prefix (§B.11.5).
+		w.Header().Set("Cache-Control", "no-store")
+		writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
+		return
+	}
 	if isAt && gs != a.gs {
 		if gs != "" && !a.public {
 			w.Header().Set("Cache-Control", "no-store")
@@ -455,11 +502,11 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// computed, the at URL says why.
 		to := cur
 		if _, _, ok := ix.kept.Get(target(cur)); !ok {
-			if info, key, err := ix.keys.Current(ctx, ns); err == nil {
+			if info, _, err := ix.keys.Current(ctx, ns); err == nil {
 				var fe *FieldError
-				if _, got, err := ix.answer(ctx, a, ns, vals, q, info, key); err == nil {
+				if _, got, err := ix.answer(ctx, a, ns, vals, q, info); err == nil {
 					to = got
-				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) {
+				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) {
 					ix.opt.Logf("index: query %s: %v", r.URL, err)
 				}
 			}
@@ -474,7 +521,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		return
 	}
 
-	info, key, err := ix.keys.Current(ctx, ns)
+	info, _, err := ix.keys.Current(ctx, ns)
 	if err != nil {
 		// The key that seals results can't be had: behind (§12.1), no
 		// code of its own.
@@ -490,14 +537,17 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			return
 		}
 	}
-	st, got, err := ix.answer(ctx, a, ns, vals, q, info, key)
+	st, got, err := ix.answer(ctx, a, ns, vals, q, info)
 	var fe *FieldError
 	switch {
 	case errors.As(err, &fe):
 		writeErr(w, http.StatusBadRequest, "bad_input", fe.Error())
 		return
-	case errors.Is(err, errCounts):
+	case errors.Is(err, errCounts) || errors.Is(err, errEpochCounts):
 		writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
+		return
+	case errors.Is(err, errEpochKey):
+		writeBehind(w, err.Error()) // §12.1: no code of its own
 		return
 	case errors.Is(err, errSchemas):
 		ix.opt.Logf("index: query %s: %v", r.URL, err)
@@ -523,26 +573,82 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 // over resources, so they have no entry of their own.
 var errCounts = errors.New("counts over a sealed namespace are served only sealed whole, to a grant that reads the whole private namespace")
 
+// errEpochCounts refuses counts over documents served under several
+// epochs (400, §E.2.6): a result is sealed whole only when every value in
+// it derives from revisions served under one epoch, and counts are served
+// only sealed whole.
+var errEpochCounts = errors.New("counts over documents served under several epochs can't be sealed whole under one epoch's key, and are served only sealed whole (§E.2.6)")
+
+// errEpochKey is a key of an epoch a hit's document is served under, which
+// seals it (§E.2.6), that the service can't obtain for now: 503 behind.
+var errEpochKey = errors.New("the index cannot obtain the key of an epoch a hit is served under")
+
 // answer runs q at the current checkpoint in one read transaction, builds
 // its result, sealed in a sealed or e2e namespace, keeps it (and stores a
 // sealed one), and returns the result kept with the checkpoint it is at.
-func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Values, q *Query, info derived.Info, key derived.Key) (derived.Stored, string, error) {
-	// A result is sealed whole only when its source isn't public and every
-	// reader its URL admits reads it whole, under reads:{ns} (§E.2.6
-	// Whole-response sealing); a public sealed namespace's results, which
-	// anyone reads, and a limited reader's, are sealed per entry.
+//
+// Each sealed value is sealed under the epoch the revision it derives
+// from is served under (§E.2.6; derived.EpochOf, docs.epoch), the epoch
+// current now where that isn't known: a hit under that epoch's K_r of its
+// resource. A result is sealed whole only when its source isn't public,
+// every reader its URL admits reads it whole, under reads:{ns}, and every
+// value derives from revisions served under one epoch, under that
+// epoch's K_e (§E.2.6 Whole-response sealing); otherwise it is sealed per
+// entry, and counts, which have no entry, are 400.
+func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Values, q *Query, info derived.Info) (derived.Stored, string, error) {
+	// A public sealed namespace's results, which anyone reads, and a
+	// limited reader's, are sealed per entry whatever their epochs.
 	perEntry := info.Protected() && (a.public || !a.all)
 	if perEntry && len(q.Counts) > 0 {
 		return derived.Stored{}, "", errCounts
 	}
+	keys := map[int]derived.Key{}
+	keyAt := func(epoch int) (derived.Key, error) {
+		if epoch <= 0 {
+			epoch = info.Epoch
+		}
+		if k, ok := keys[epoch]; ok {
+			return k, nil
+		}
+		k, err := ix.keys.KeyAt(ctx, ns, epoch)
+		if err != nil {
+			ix.opt.Logf("index: key of %s epoch %d: %v", ns, epoch, err)
+			return k, fmt.Errorf("%w (%s#%d)", errEpochKey, ns, epoch)
+		}
+		keys[epoch] = k
+		return k, nil
+	}
 	var allow func(string) bool
 	if !a.all {
-		allow = func(resource string) bool { return ix.checker.AllowsRead(a.v, resource) }
+		allow = a.allow
 	}
 	gen := ix.kept.Generation(ns)
+	q.epochs = info.Protected()
 	res, at, err := ix.query(ctx, ns, q, allow)
 	if err != nil {
 		return derived.Stored{}, "", err
+	}
+	// The one epoch every value derives from, for a result sealed whole.
+	whole := 0
+	if info.Protected() && !perEntry {
+		epochs := map[int]bool{}
+		for _, e := range res.Epochs {
+			if e <= 0 {
+				e = info.Epoch
+			}
+			epochs[e] = true
+		}
+		switch {
+		case len(epochs) > 1 && len(q.Counts) > 0:
+			return derived.Stored{}, "", errEpochCounts
+		case len(epochs) > 1:
+			perEntry = true
+		default:
+			whole = info.Epoch
+			for e := range epochs {
+				whole = e
+			}
+		}
 	}
 	view := derived.View{NS: ns, Target: base(a, ns) + "/at/" + at + derived.CanonicalQuery(vals, "min")}
 	body := map[string]any{"at": at, "ns": ns}
@@ -582,6 +688,10 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 					values[k] = v
 				}
 			}
+			key, err := keyAt(h.epoch)
+			if err != nil {
+				return derived.Stored{}, "", err
+			}
 			jwe, err := derived.SealItem(key, view, h.Resource, values)
 			if err != nil {
 				return derived.Stored{}, "", fmt.Errorf("sealing a hit: %w", err)
@@ -604,8 +714,14 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	}
 	st := derived.Stored{JSON: true, Tags: resultTags(ns, res)}
 	if info.Protected() && !perEntry {
-		var jwe string
-		jwe, err = derived.SealView(key, view, body)
+		key, err := keyAt(whole)
+		if err != nil {
+			return derived.Stored{}, "", err
+		}
+		jwe, err := derived.SealView(key, view, body)
+		if err != nil {
+			return derived.Stored{}, "", fmt.Errorf("encoding a result: %w", err)
+		}
 		st.Body, st.JSON = []byte(jwe), false
 	} else {
 		st.Body, err = derived.Marshal(body)

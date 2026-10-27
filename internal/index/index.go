@@ -9,7 +9,10 @@
 //	seen(ns, ns_id)                        every ns_id applied, for ?min= (§A.5)
 //	ns_state(ns, purged)                   purge-ns marks the namespace gone
 //	ns_conf(ns, public, level)             the read mode and level last applied (narrowed)
-//	docs(docid, ns, resource, head, schema) one row per live resource (untyped too, see UntypedListing)
+//	docs(docid, ns, resource, head, schema, epoch) one row per live resource (untyped too, see
+//	                                      UntypedListing); epoch, in a sealed or e2e namespace, the
+//	                                      epoch its head is served under (derived.EpochOf), NULL or 0
+//	                                      where not known
 //	text  fts5(ns, resource, schema, path, body)  rowid = docid<<20 | n, so a resource's rows are a rowid range
 //	facet(ns, resource, schema, path, value, raw)  value: the string form (§A.2), raw: canonical JSON
 //	sort (ns, resource, schema, path, value, raw)  value: the least value (sortColumn), raw: all, a JSON array
@@ -17,6 +20,10 @@
 //	                                      path is the full instance pointer, indices included
 //	sealed_views, sealed_view_tags   sealed results of sealed/e2e namespaces (derived.Cache)
 //	cdn_repurge(id, tags, due)       second CDN purges (package repurge), kept by a rebuild
+//	edge_subjects, edge_buckets      the markers of each subject set the service minted edge
+//	                                 grants for, until the last of them expires, and its
+//	                                 exchangeRate buckets (svcedge.Store, edgegrants.go)
+//	edge_filters(marker, filter, exp) what each scope marker of those stands for (readFilter)
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
@@ -30,8 +37,9 @@
 // Without keys a namespace is skipped: not followed, and reported with the
 // reason at GET /_status. One whose keys the service lacks is answered 404
 // as one it doesn't follow (§A.4); one whose keys it can't fetch for now,
-// 503 behind. Results over a sealed or e2e namespace are sealed under its
-// current epoch key (§E.2.5): see Handler.
+// 503 behind. Results over a sealed or e2e namespace are sealed under the
+// epochs their documents' heads are served under (§E.2.6, docs.epoch): see
+// Handler.
 //
 // Stored plaintext. Full-text, facet and sort queries need the indexed
 // values in the clear, so the database holds plaintext derived from
@@ -52,6 +60,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,6 +76,7 @@ import (
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/repurge"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
+	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // Purger purges the index service's own cache tags (§A.1: a purge "also
@@ -122,6 +132,19 @@ type Options struct {
 	// results, and all of them when nil, are no-store for shared caches.
 	// They are served either way.
 	Edge *edge.Verifier
+	// EdgeGrants, if set, mints and verifies the service's own edge
+	// grants (§A.4, §B.11.5, §C.5; edgegrants.go): cookies for
+	// /{ns}/g/{gs} and /_refs/g/{gs}, under a key and kid of the
+	// service's own, never the origin's. Open sets its Vouches to those
+	// prefixes. Without it, POST and DELETE /edge-grants are 404
+	// not_offered.
+	EdgeGrants *edge.Cookies
+	// ExchangeRate is the exchangeRate bucket each principal draws one
+	// token from per exchange at POST /edge-grants (§C.5.2, §6.6; default
+	// svcedge.DefaultExchangeRate). It is a deployment's limit, so the
+	// service has its own buckets, shared by every instance on its
+	// database DB (§B.11.5, svcedge.Store).
+	ExchangeRate svcedge.Rate
 	// Now is the clock for grant checks, kept results and the due times
 	// of second purges (default time.Now).
 	Now func() time.Time
@@ -160,6 +183,10 @@ type Index struct {
 	sealed  *derived.Cache // sealed results
 	kept    *kept.Store    // results kept past their checkpoint
 	repurge *repurge.Queue // second CDN purges
+	edge    *svcedge.Store // the service's edge grants (EdgeGrants)
+
+	fmu     sync.Mutex
+	filters map[string]keptFilter // scope marker -> what it stands for (edge_filters)
 
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers
@@ -240,6 +267,10 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := ix.initEdge(ctx, db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("index: edge grants: %w", err)
+	}
 	ix.repurge.Start()
 	return ix, nil
 }
@@ -270,7 +301,7 @@ var createStmts = []string{
 	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
 	`CREATE TABLE IF NOT EXISTS ns_state (ns TEXT PRIMARY KEY, purged INTEGER NOT NULL DEFAULT 0)`,
 	`CREATE TABLE IF NOT EXISTS ns_conf (ns TEXT PRIMARY KEY, public INTEGER NOT NULL, level TEXT NOT NULL)`,
-	`CREATE TABLE IF NOT EXISTS docs (docid INTEGER PRIMARY KEY, ns TEXT NOT NULL, resource TEXT NOT NULL, head TEXT NOT NULL, schema TEXT, UNIQUE (ns, resource))`,
+	`CREATE TABLE IF NOT EXISTS docs (docid INTEGER PRIMARY KEY, ns TEXT NOT NULL, resource TEXT NOT NULL, head TEXT NOT NULL, schema TEXT, epoch INTEGER, UNIQUE (ns, resource))`,
 	`CREATE TABLE IF NOT EXISTS facet (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value TEXT NOT NULL, raw TEXT NOT NULL, PRIMARY KEY (ns, resource, path, value))`,
 	`CREATE TABLE IF NOT EXISTS "sort" (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value, raw TEXT, PRIMARY KEY (ns, resource, path))`,
 	`CREATE TABLE IF NOT EXISTS refs (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, ref TEXT NOT NULL, target_ns TEXT NOT NULL, target TEXT NOT NULL, rev TEXT, entry TEXT, PRIMARY KEY (ns, resource, path))`,
@@ -342,6 +373,33 @@ func (ix *Index) initSchema(ctx context.Context) error {
 			ix.opt.Logf("index: the database predates the static x-index walk and sort order of v0.73 (§A.2); rebuilding it from the logs")
 			ix.opt.Rebuild = true
 		}
+		// Before docs.epoch, the rows of sealed and e2e namespaces don't
+		// say which epoch each head is served under, which their hits are
+		// sealed under (§E.2.6): replay those namespaces, as a rebuild.
+		// Without one, the column is added below.
+		var noEpoch, protected int
+		if docs > 0 && !ix.opt.Rebuild {
+			if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('docs') WHERE name = 'epoch'`).Scan(&noEpoch); err != nil {
+				return err
+			}
+			var conf int
+			if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ns_conf'`).Scan(&conf); err != nil {
+				return err
+			}
+			switch {
+			case noEpoch > 0:
+			case conf == 0:
+				protected = 1 // levels not recorded: any may be sealed
+			default:
+				if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM ns_conf WHERE level IN (?, ?)`, derived.LevelSealed, derived.LevelE2E).Scan(&protected); err != nil {
+					return err
+				}
+			}
+			if noEpoch == 0 && protected > 0 {
+				ix.opt.Logf("index: the database predates the epochs hits of sealed and e2e namespaces are sealed under (§E.2.6); rebuilding it from the logs")
+				ix.opt.Rebuild = true
+			}
+		}
 	}
 	if ix.opt.Rebuild {
 		for _, s := range dropStmts {
@@ -358,13 +416,22 @@ func (ix *Index) initSchema(ctx context.Context) error {
 			return fmt.Errorf("index: schema: %w", err)
 		}
 	}
+	var hasEpoch int
+	if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('docs') WHERE name = 'epoch'`).Scan(&hasEpoch); err != nil {
+		return err
+	}
+	if hasEpoch == 0 {
+		if _, err := ix.db.ExecContext(ctx, `ALTER TABLE docs ADD COLUMN epoch INTEGER`); err != nil {
+			return fmt.Errorf("index: schema: %w", err)
+		}
+	}
 	if _, err := ix.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, indexFormat)); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
 	if err := ix.sealed.Init(ctx); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
-	if err := dropWholePublic(ctx, ix.db); err != nil {
+	if err := ix.dropWholePublic(ctx); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
 	if err := repurge.Init(ctx, ix.db); err != nil {
@@ -396,11 +463,8 @@ func (ix *Index) initSchema(ctx context.Context) error {
 	return nil
 }
 
-// wholePublic selects the stored results sealed whole (json = 0) at a
-// public URL, /{ns}/at/…, where the view's scope is its namespace (answer).
-const wholePublic = `SELECT view FROM sealed_views WHERE json = 0 AND substr(view, 1, length(scope) + 5) = '/' || scope || '/at/'`
-
-// dropWholePublic drops stored results sealed whole at a public URL. Before
+// dropWholePublic drops stored results sealed whole at a public URL,
+// /{ns}/at/…, where the view's scope is its namespace (answer). Before
 // v0.73 a public sealed or e2e namespace's results were stored as one JWE
 // under K_e at the URLs they are sealed per entry at now, with counts
 // (ENC-33, §E.2.6: whole-response sealing only for a source that isn't
@@ -410,19 +474,10 @@ const wholePublic = `SELECT view FROM sealed_views WHERE json = 0 AND substr(vie
 // older format is rebuilt anyway (indexFormat); this covers one written
 // since. No URL of the shapes of v0.73 matches: a public URL's results are
 // JSON, and a whole JWE's URL has /g/{gs}.
-func dropWholePublic(ctx context.Context, db *sql.DB) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM sealed_view_tags WHERE view IN (`+wholePublic+`)`); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM sealed_views WHERE view IN (`+wholePublic+`)`); err != nil {
-		return err
-	}
-	return tx.Commit()
+func (ix *Index) dropWholePublic(ctx context.Context) error {
+	return ix.sealed.Drop(ctx, func(view, scope string, json bool) bool {
+		return !json && strings.HasPrefix(view, "/"+scope+"/at/")
+	})
 }
 
 func (ix *Index) loadState(ctx context.Context) error {
@@ -598,6 +653,7 @@ type prepared struct {
 	resource string
 	remove   bool
 	head     string
+	epoch    int    // the epoch head is served under, 0 if not known or not sealed (derived.EpochOf)
 	schema   string // "" = untyped
 	typed    bool
 	rows     *docRows
@@ -616,16 +672,31 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 			config = true
 		}
 	}
-	if config && ix.followsRoot(b.NS) {
+	root := ix.followsRoot(b.NS)
+	if _, lacks := ix.keys.Skip(b.NS); lacks && !root {
+		// A branch followed with its base whose keys the service lacks
+		// since a config change of it (below): not consumed, its queries
+		// 404. Its batches aren't applied: once the keys come, a restart
+		// resumes at the first.
+		return nil
+	}
+	if config {
 		// A raise (to e2e from none or at-rest, Addendum E Levels) or an
-		// epoch whose keys the service lacks as configured: skipped as
-		// when its follower starts (queries are 404, §A.4, §E.2.6), and
-		// not followed, so nothing is consumed that can't be read or
-		// sealed. The batch isn't applied: once the keys come, a restart
-		// resumes at it.
-		if reason, lacks := ix.keys.Recheck(ctx, b.NS, false); lacks && ix.stopRun(b.NS) {
+		// epoch (a rotation, §E.2.4) whose keys the service lacks as
+		// configured: skipped as when its follower starts (queries are
+		// 404, §A.4, §E.2.6), and not followed, so nothing is consumed
+		// that can't be read or sealed. The batch isn't applied: once the
+		// keys come, a restart resumes at it. A branch followed with its
+		// base (-branches) has no follower of its own to stop: its batches
+		// are left unapplied from here on (above).
+		reason, lacks := ix.keys.Recheck(ctx, b.NS, false)
+		switch {
+		case lacks && root && ix.stopRun(b.NS):
 			ix.opt.Logf("index: skipping %s: %s", b.NS, reason)
 			return fmt.Errorf("index: %s skipped: %s", b.NS, reason)
+		case lacks && !root:
+			ix.opt.Logf("index: skipping branch %s: %s", b.NS, reason)
+			return nil
 		}
 	}
 	// Fetch FetchConcurrency documents at a time (one GET each), counting
@@ -847,7 +918,7 @@ func (ix *Index) prepare(ctx context.Context, ns, id string, p *prepared) error 
 		}
 		return err
 	}
-	p.head = doc.ID
+	p.head, p.epoch = doc.ID, derived.EpochOf(ns, doc.Kid)
 	p.schema, p.typed, p.rows, err = ix.extract(ctx, ns, p.resource, doc.Value)
 	return err
 }
@@ -901,15 +972,18 @@ func (ix *Index) write(ctx context.Context, tx *sql.Tx, ns string, p prepared) e
 		}
 		return err
 	}
-	var schemaCol any
+	var schemaCol, epochCol any
 	if p.schema != "" {
 		schemaCol = p.schema
 	}
+	if p.epoch > 0 {
+		epochCol = p.epoch
+	}
 	if found {
-		_, err = tx.ExecContext(ctx, `UPDATE docs SET head = ?, schema = ? WHERE docid = ?`, p.head, schemaCol, docid)
+		_, err = tx.ExecContext(ctx, `UPDATE docs SET head = ?, schema = ?, epoch = ? WHERE docid = ?`, p.head, schemaCol, epochCol, docid)
 	} else {
 		var res sql.Result
-		res, err = tx.ExecContext(ctx, `INSERT INTO docs (ns, resource, head, schema) VALUES (?, ?, ?, ?)`, ns, p.resource, p.head, schemaCol)
+		res, err = tx.ExecContext(ctx, `INSERT INTO docs (ns, resource, head, schema, epoch) VALUES (?, ?, ?, ?, ?)`, ns, p.resource, p.head, schemaCol, epochCol)
 		if err == nil {
 			docid, err = res.LastInsertId()
 		}

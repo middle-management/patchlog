@@ -77,6 +77,10 @@ type Query struct {
 	// toks are the words' tokens as the FTS5 text table has them, each
 	// word's in order (Index.ftsTokens); nil until tokenized.
 	toks [][]string
+	// epochs asks run for the epochs of the documents the result's
+	// values come from (Result.Epochs, Hit.epoch), which a sealed or e2e
+	// namespace's results are sealed under (§E.2.6).
+	epochs bool
 }
 
 // RefFilter is a parsed ?ref= (§A.4). Rev and Entry are "" when the form
@@ -420,6 +424,9 @@ type Hit struct {
 	Refs     []RefHit         // with ?ref=: the matching references (§A.4)
 	Self     bool             // with ?ref=: the document references itself
 	docid    int64
+	// epoch is the epoch the document's head is served under, in a
+	// sealed or e2e namespace (docs.epoch), 0 where not known.
+	epoch int
 }
 
 // RefHit is one reference of a hit: where it sits and the string as written.
@@ -435,6 +442,11 @@ type Result struct {
 	// Counts is path → string form of a facet value (§A.2) → the hits that
 	// have it, over every hit, not only the page (§A.4).
 	Counts map[string]map[string]int
+	// Epochs are, when the query asks for them, the distinct epochs
+	// (docs.epoch, 0 where not known) of the documents the result's
+	// values come from: the page's hits, and with counts every hit
+	// counted (§E.2.6 whole-response sealing).
+	Epochs []int
 }
 
 // filter is the ?ref= filter, a ?facet= path or a range: a condition on
@@ -836,7 +848,8 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 		return nil, err
 	}
 	res := &Result{}
-	var all []string // allowed resources, when counting
+	var all []string   // allowed resources, when counting
+	var allIDs []int64 // and their docids, for their epochs
 	n := 0
 	for rows.Next() {
 		var h Hit
@@ -849,6 +862,9 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 		}
 		if len(q.Counts) > 0 {
 			all = append(all, h.Resource)
+			if q.epochs {
+				allIDs = append(allIDs, h.docid)
+			}
 		}
 		n++
 		switch {
@@ -883,7 +899,71 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 			return nil, err
 		}
 	}
+	if !q.epochs {
+		return res, nil
+	}
+	if err := attachEpochs(ctx, tx, res.Hits); err != nil {
+		return nil, err
+	}
+	epochs := map[int]bool{}
+	for _, h := range res.Hits {
+		epochs[h.epoch] = true
+	}
+	if len(q.Counts) > 0 {
+		ids, _ := json.Marshal(allIDs)
+		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT coalesce(d.epoch, 0) FROM json_each(?) j CROSS JOIN docs d WHERE d.docid = j.value`, string(ids))
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var e int
+			if err := rows.Scan(&e); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			epochs[e] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	for e := range epochs {
+		res.Epochs = append(res.Epochs, e)
+	}
+	slices.Sort(res.Epochs)
 	return res, nil
+}
+
+// attachEpochs gives each hit the epoch its document's head is served
+// under (docs.epoch).
+func attachEpochs(ctx context.Context, tx *sql.Tx, hits []Hit) error {
+	if len(hits) == 0 {
+		return nil
+	}
+	idx := map[int64]int{}
+	ph := make([]string, len(hits))
+	args := make([]any, len(hits))
+	for i, h := range hits {
+		idx[h.docid] = i
+		ph[i], args[i] = "?", h.docid
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT docid, coalesce(epoch, 0) FROM docs WHERE docid IN (`+strings.Join(ph, ",")+`)`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var e int
+		if err := rows.Scan(&id, &e); err != nil {
+			return err
+		}
+		if i, ok := idx[id]; ok {
+			hits[i].epoch = e
+		}
+	}
+	return rows.Err()
 }
 
 // FieldError is a path of a query that no schema indexed in the namespace

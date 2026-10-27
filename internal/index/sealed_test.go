@@ -206,14 +206,16 @@ func TestSealedNamespace(t *testing.T) {
 		t.Fatalf("status %v", st.body)
 	}
 
-	// A rotation moves the checkpoint: results are sealed under the new epoch.
+	// A rotation moves the checkpoint, and the result is sealed again
+	// there, under the epoch its hits' revisions are served under: still
+	// sec#1, as they were written before it (§E.2.6, ENC-32).
 	must(s.Engine.RotateEpoch(ctx, "sec", "system:rotate"))
 	x.caughtUp("sec")
 	f2 := x.fetch("/sec?q=secret", rd)
-	if h := must(seal.ParseHeader(string(f2.body))); h.Kid != "sec#2" {
+	if h := must(seal.ParseHeader(string(f2.body))); h.Kid != "sec#1" || f2.path == f.path {
 		t.Fatalf("after rotation kid %s", h.Kid)
 	}
-	if got := strings.Join(resources(decodeJSON(t, must(derived.OpenView(string(f2.body), epochKeys(t, w, "sec"), derived.View{NS: "sec", Target: f2.path})))), ","); got != "a,b" {
+	if got := strings.Join(resources(decodeJSON(t, must(derived.OpenView(string(f2.body), keys, derived.View{NS: "sec", Target: f2.path})))), ","); got != "a,b" {
 		t.Fatalf("after rotation %s", got)
 	}
 	// Kept, the result at the previous checkpoint is still served there,
@@ -243,7 +245,7 @@ func TestSealedNamespace(t *testing.T) {
 		}
 	}
 	f3 := x.fetch("/sec?q=secret", rd)
-	if got := strings.Join(resources(decodeJSON(t, must(derived.OpenView(string(f3.body), epochKeys(t, w, "sec"), derived.View{NS: "sec", Target: f3.path})))), ","); got != "b" {
+	if got := strings.Join(resources(decodeJSON(t, must(derived.OpenView(string(f3.body), keys, derived.View{NS: "sec", Target: f3.path})))), ","); got != "b" {
 		t.Fatalf("after purge %s", got)
 	}
 }

@@ -559,10 +559,14 @@ func testCheckpointSurvivesRestart(t *testing.T) {
 	h := must(w.c.Head(ctx, "matches", "cup"))
 	must(w.c.Append(ctx, "matches", "cup", h.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": "Cup replay"}}))
 
-	s2 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true})
-	if s2.ix.Checkpoint("matches") != cp {
-		t.Fatalf("checkpoint after reopen %q, want %q", s2.ix.Checkpoint("matches"), cp)
+	// Reopened without following first: a running follower may apply the
+	// append before the checkpoint is read.
+	s1 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true, noRun: true})
+	if s1.ix.Checkpoint("matches") != cp {
+		t.Fatalf("checkpoint after reopen %q, want %q", s1.ix.Checkpoint("matches"), cp)
 	}
+	s1.stop()
+	s2 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true})
 	bs := s2.appliedUpTo(s2.caughtUp("matches"))
 	if bs[0].From != cp {
 		t.Fatalf("first batch after restart from %q, want %q", bs[0].From, cp)
