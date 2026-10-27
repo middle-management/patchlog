@@ -1075,7 +1075,6 @@ func (r *ddbReads) branchEntry(base *nsRow, gseq int64) (int64, bool) {
 	return r.logHandle(bname, b.EntryPos), true
 }
 
-
 // readThrough completes the view of a resource n has no head of: in a
 // branch, the base's as of the entry it branched at (resolve of
 // resolve.go); NotFound elsewhere.
@@ -1124,7 +1123,6 @@ func (r *ddbReads) headAtEntry(res, at int64) (int64, bool) {
 	}
 	return r.revHandle(k.ns, k.name, h.Pos), true
 }
-
 
 func (r *ddbReads) retainedNames(n *nsRow) []string {
 	names, err := r.s.RetainedNames(r.ctx, r.nsName(n.id))
