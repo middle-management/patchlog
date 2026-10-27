@@ -538,7 +538,10 @@ type RestoreResult struct {
 // its patch set back. Once no revision below the horizon lacks its patch
 // set, horizon_seq and keep are cleared. Documents kept at the old horizon
 // stay as snapshots, and intermediate snapshots are rebuilt over the
-// restored range so no fold grows past the D.4 bound. Purged resources are
+// restored range so no fold grows past the D.4 bound (in an e2e namespace,
+// over what was written before its raise; E3 content has no documents).
+// Each entry is checked by the level its revision was written at, not
+// the namespace's current one. Purged resources are
 // skipped. Once the horizon is cleared, the attachments that pruning ended
 // get their bytes back from the archives' blob lines (§7.8, §G.4.1).
 // entries is called inside the write transaction: once, or again if
@@ -559,7 +562,18 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 		if own == nil {
 			return notFound()
 		}
+		// Each entry is checked by the level its revision was written at:
+		// at E3 one sealed op (or [] for a restore), but what an e2e
+		// namespace stored before its raise is plaintext (Addendum E
+		// Levels), archived plain by a prune before the raise or in the
+		// sealed bundle of an E3 prune after it (§8.6).
 		e2e := t.e2eContent(n, name)
+		var plainUpTo int64 // own revisions up to this seq are pre-raise plaintext
+		if e2e {
+			if r := t.e2eRaiseOf(n); r != nil {
+				plainUpTo = t.preRaiseHead(r, own.id)
+			}
+		}
 		blobs := map[ids.ID]*ArchiveBlob{}
 		err := entries(func(en ArchiveEntry) error {
 			if en.Blob != nil {
@@ -599,7 +613,7 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 				out.Skipped++
 				return nil
 			}
-			if e2e {
+			if e2e && row.seq > plainUpTo {
 				// Opaque at E3: one sealed op, as it was written.
 				if _, ok := seal.SealedJWE(canon); !ok && string(canon) != "[]" {
 					out.Skipped++
@@ -631,10 +645,15 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 		if missing {
 			return nil
 		}
-		if !e2e {
-			if err := t.rebuildSnapshots(own.id, own.horizonSeq.Int64); err != nil {
-				return err
-			}
+		// Intermediate snapshots over the plaintext range: the whole
+		// chain below the horizon, or at E3 what was written before the
+		// raise (E3 content has no documents).
+		upTo := own.horizonSeq.Int64
+		if e2e {
+			upTo = min(upTo, plainUpTo+1)
+		}
+		if err := t.rebuildSnapshots(own.id, upTo); err != nil {
+			return err
 		}
 		_, err = t.Exec(`UPDATE resources SET horizon_seq = NULL, keep = NULL WHERE res = ?`, own.id)
 		t.must(err)

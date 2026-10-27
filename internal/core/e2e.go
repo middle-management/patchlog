@@ -165,6 +165,27 @@ func (t *tx) e2eRaiseOf(n *nsRow) *e2eRaise {
 	return r
 }
 
+// preRaiseHead is the seq of resource row res's head as of the entry
+// before raise: res's revisions up to it were written before the raise
+// and are stored in the clear, those after it from the raising entry on
+// (Addendum E Levels). 0 when res had no revision then.
+func (t *tx) preRaiseHead(raise *e2eRaise, res int64) int64 {
+	if raise.seq == 0 {
+		// The raising entry is being appended in this transaction: every
+		// stored revision is from before it.
+		var max sql.NullInt64
+		t.must(t.QueryRow(`SELECT MAX(seq) FROM revisions WHERE res = ?`, res).Scan(&max))
+		return max.Int64
+	}
+	var head int64
+	err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq < ? ORDER BY ns_seq DESC LIMIT 1`, res, raise.seq).Scan(&head)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0
+	}
+	t.must(err)
+	return head
+}
+
 // checkSealedHeader checks a JWE's protected header without a key (§E.3.1,
 // step 3): no zip (§E.2.2), kid "{ns}#{epoch}" naming n and the given
 // epoch, and pl exactly want. A write's sealed op names the epoch in force
