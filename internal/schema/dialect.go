@@ -14,16 +14,17 @@ import (
 
 // Rules marks the rules a schema revision was written under, which select
 // how it compiles: "A schema stored under an earlier version is compiled
-// as that version did" (§6.1). The compiled-validator cache is keyed by
-// revision path and marker.
+// as that version did" (§6.1). Compiled validators are kept by revision
+// path with the markers they compiled under (Validator).
 type Rules uint8
 
 const (
 	// Legacy is how v0.55 compiled every schema: the library's formats
 	// asserted, semver and period included, idn-email and idn-hostname
 	// not, and other names ignored. A pattern \uXXXX translation refuses
-	// but RE2 took as written still compiles. Stored revisions load as
-	// Legacy until their markers are kept.
+	// but RE2 took as written still compiles. Revisions stored before
+	// markers were kept, and those whose marker the caller doesn't know,
+	// load as Legacy.
 	Legacy Rules = iota
 	// V073 asserts exactly the format set of draft 2020-12 (§6.2 step 5),
 	// idn-email and idn-hostname with UTS 46 processing, and reads
@@ -36,6 +37,23 @@ func (r Rules) String() string {
 		return "v0.73"
 	}
 	return "legacy"
+}
+
+// RulesHeader is the response header a revision read of a schema
+// document served in the clear carries, naming its marker (Rules.String):
+// an addition, so a client or another deployment compiles the revision as
+// its server does (§6.1). A server that sends none compiles it as Legacy.
+const RulesHeader = "X-Schema-Rules"
+
+// ParseRules reads a marker as Rules.String writes it.
+func ParseRules(s string) (Rules, bool) {
+	switch s {
+	case "v0.73":
+		return V073, true
+	case "legacy":
+		return Legacy, true
+	}
+	return Legacy, false
 }
 
 // formats2020 is the format set draft 2020-12 defines. A schema written
@@ -53,26 +71,46 @@ func init() {
 	}
 }
 
+// idnFormats are the two formats of draft 2020-12 the library lacks.
+var idnFormats = []*jsonschema.Format{
+	{Name: "idn-email", Validate: validateIDNEmail},
+	{Name: "idn-hostname", Validate: validateIDNHostname},
+}
+
 // v073Formats are the formats V073 registers over the library's own: the
 // two it lacks, and the two it asserts that draft 2020-12 doesn't define,
 // which are annotations there.
-var v073Formats = []*jsonschema.Format{
-	{Name: "idn-email", Validate: validateIDNEmail},
-	{Name: "idn-hostname", Validate: validateIDNHostname},
+var v073Formats = append([]*jsonschema.Format{
 	{Name: "semver", Validate: func(any) error { return nil }},
 	{Name: "period", Validate: func(any) error { return nil }},
-}
+}, idnFormats...)
 
 // Configure sets c up to compile schemas as r says: draft 2020-12 unless a
 // schema names another, format assertions on, the formats r asserts, and
-// patterns read as §6.6 says. Rule schema fragments (§6.4.2) compile
-// under V073.
+// patterns read as §6.6 says. Rule schema fragments (§6.4.2) compile by
+// ConfigureFragment.
 func (r Rules) Configure(c *jsonschema.Compiler) {
 	c.DefaultDraft(jsonschema.Draft2020)
 	c.AssertFormat()
 	c.UseRegexpEngine(r.regexpEngine)
 	if r == V073 {
 		for _, f := range v073Formats {
+			c.RegisterFormat(f)
+		}
+	}
+}
+
+// ConfigureFragment is Configure for a rule's schema fragment, which is
+// applied with format assertions as at step 5 of §6.2 whenever it was
+// written (§6.4.2): §6.1's "compiled as that version did" is a schema
+// document's. Under Legacy, a fragment stored before, idn-email and
+// idn-hostname are asserted too, as under V073, and the library's other
+// formats as v0.55 asserted them, semver and period included. So a
+// fragment written now evaluates alike under either marker.
+func (r Rules) ConfigureFragment(c *jsonschema.Compiler) {
+	r.Configure(c)
+	if r == Legacy {
+		for _, f := range idnFormats {
 			c.RegisterFormat(f)
 		}
 	}

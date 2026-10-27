@@ -2,7 +2,6 @@ package server
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -22,7 +21,7 @@ func (s *Server) nsGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	g, err := s.e.Grant(r.Context(), ns, r.PathValue("gid"), creds(r))
 	if err != nil {
-		if s.writeErrShort(w, r, err) {
+		if s.writeErrShort(w, r, err, "ns:"+ns) {
 			return
 		}
 		writeErr(w, err)
@@ -74,16 +73,22 @@ func (s *Server) nsRev(w http.ResponseWriter, r *http.Request) {
 	}
 	info, err := s.e.NamespaceRev(r.Context(), ns, id, creds(r))
 	if err != nil {
-		if s.writeErrShort(w, r, err) {
+		if s.writeErrShort(w, r, err, "ns:"+ns) {
 			return
 		}
 		writeErr(w, err)
 		return
 	}
 	s.cache(w, r, ccImmutable, info.Public, "ns:"+ns)
-	w.Header().Set("ETag", quote(id))
+	// A sealed document's tag names the epoch in force at ns_id (§7.4,
+	// §E.2.2).
+	tag := quote(id)
+	if info.JWE != "" {
+		tag = sealedTag(id, info.JWE)
+	}
+	w.Header().Set("ETag", tag)
 	w.Header().Set("X-Config-Revision", info.Config)
-	if inm := r.Header.Get("If-None-Match"); inm != "" && strings.Contains(inm, quote(id)) {
+	if inm := r.Header.Get("If-None-Match"); inm != "" && inmMatches(inm, tag) {
 		w.WriteHeader(304)
 		return
 	}
@@ -107,7 +112,7 @@ func (s *Server) nsRevLog(w http.ResponseWriter, r *http.Request) {
 	lg, err := s.e.NamespaceLog(r.Context(), ns, id, r.URL.Query().Get("since"), s.e.Limits().LogPageSize, creds(r))
 	if err != nil {
 		// A purged sealed namespace's 410 is long, as any purge (§8.5, §9).
-		if s.writeErrShort(w, r, err) {
+		if s.writeErrShort(w, r, err, "ns:"+ns) {
 			return
 		}
 		writeErr(w, err)
@@ -172,7 +177,7 @@ func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
 	}
 	page, err := s.e.NamespaceHeads(r.Context(), ns, id, r.URL.Query().Get("after"), creds(r))
 	if err != nil {
-		if s.writeErrShort(w, r, err) {
+		if s.writeErrShort(w, r, err, "ns:"+ns) {
 			return
 		}
 		writeErr(w, err)
@@ -184,7 +189,7 @@ func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
 	// already served survives a purge; this tag, the reference's own,
 	// clears the copies its edge holds.
 	s.cache(w, r, ccImmutable, page.Public, "ns:"+ns, "heads:"+ns)
-	out := map[string]any{"items": page.Items}
+	out := map[string]any{"heads": page.Items}
 	if page.Next != "" {
 		out["next"] = page.Next
 	}
@@ -199,6 +204,10 @@ func (s *Server) nsBranches(w http.ResponseWriter, r *http.Request) {
 	}
 	list, public, err := s.e.Branches(r.Context(), ns, creds(r))
 	if err != nil {
+		// Once the namespace is purged, 410 purged, long (§7.4, §8.5).
+		if s.writeErrShort(w, r, err, "ns:"+ns) {
+			return
+		}
 		writeErr(w, err)
 		return
 	}
@@ -207,7 +216,7 @@ func (s *Server) nsBranches(w http.ResponseWriter, r *http.Request) {
 }
 
 // nsKeys answers POST /ns/{ns}/keys (§E.2.3): { "epochs"?: [e…],
-// "resources"?: [name…] } → { "keys": [ { kid, resource?, key | suite,
+// "resources"?: [name…] } → { "keys": [ { kid, name?, from?, key |
 // wrapped } ], "epoch", "level", "pad" }, never cached. A namespace that
 // isn't sealed is 404 not_offered.
 func (s *Server) nsKeys(w http.ResponseWriter, r *http.Request) {
@@ -253,6 +262,7 @@ func (s *Server) nsKeys(w http.ResponseWriter, r *http.Request) {
 					kr.Epochs = append(kr.Epochs, int(f))
 				}
 			case "resources":
+				kr.Resources = []string{} // given, if empty: no names (§E.2.3)
 				for _, x := range arr {
 					n, ok := x.(string)
 					if !ok {

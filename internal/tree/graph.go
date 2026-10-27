@@ -59,10 +59,14 @@ type Parent struct {
 // Node is a folder or placement (explicit, from the catalog namespace), or
 // an implicit placement from a content document's $parents (§B.9).
 type Node struct {
-	Name      string
-	Kind      int
-	Self      bool   // implicit placement (§B.9)
-	Head      string // the catalog revision of the node's document ("" for implicit)
+	Name string
+	Kind int
+	Self bool   // implicit placement (§B.9)
+	Head string // the catalog revision of the node's document ("" for implicit)
+	// Epoch is the epoch Head is served under in a sealed or e2e catalog
+	// (derived.EpochOf), which the node's entries are sealed under
+	// (§E.2.6); 0 where not known, or for an implicit placement.
+	Epoch     int
 	Title     string
 	Parents   []Parent
 	Access    map[string][]string // $access subject -> role names (without "inherit")
@@ -139,6 +143,11 @@ func (n *Node) Item() string {
 // Live reports whether the node takes part in traversals: a folder, or a
 // placement whose item is live in a trusted namespace.
 func (n *Node) Live() bool { return n.State == StateLive && !n.Cyclic }
+
+// RawParents is an explicit node's parents member as its document has it
+// (nil if absent), which a Move grant's test of /parents names (§B.11.4).
+// Callers must not change it.
+func (n *Node) RawParents() any { return n.rawParents }
 
 // Graph is the in-memory view of one catalog as of the recorded
 // checkpoints. It is read under the service's lock (Service.View).

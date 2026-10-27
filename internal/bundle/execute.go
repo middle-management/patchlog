@@ -514,11 +514,21 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 		}
 		return fmt.Errorf("import: dry run of the batch into %s: %w", b.n.ns, err)
 	}
+	if ce := res.ConfigError(); ce != nil {
+		// The epoch raise (raise) failed after its step 1: a dry run reports
+		// it and judges the items against the epoch before (§7.5), so their
+		// failures would hide the cause. The submit fails with it.
+		b.rep.DryRun = "failed"
+		b.rep.Error = ce.Error()
+		return fmt.Errorf("import: dry run of the batch into %s: moving it to epoch %d: %w", b.n.ns, b.epoch, ce)
+	}
 	var failures []string
 	allDeferrable, onlyBlobs, allBlob := true, true, true
 	for i, it := range res.Items {
+		// 201 for an item that would pass, 200 for each item of a batch a
+		// submit would answer as a retry (§7.5); 200 alone before v0.67.
 		st, _ := it.Raw["status"].(float64)
-		if st != 200 {
+		if st != 201 && st != 200 {
 			code, _ := it.Raw["code"].(string)
 			msg, _ := it.Raw["message"].(string)
 			failures = append(failures, fmt.Sprintf("%s: %v %s %s", it.Resource, st, code, msg))
@@ -803,6 +813,33 @@ func (im *importer) submitAll(ctx context.Context, run *runner, lims map[*node]l
 	return nil
 }
 
+// targetMoved reports a batch failure caused by the target moving after
+// it was classified: a 412 or a 410 whose items each failed for that, with
+// a 412, or with a 410 gone naming the tombstone that is now the head,
+// which a create or an older-head append meets on a resource deleted
+// meanwhile, where a create used to get a 412 (§7.2, §8.1). The batch has
+// the status of its first such item in request order and lists them all
+// (§7.5), so either may come first. A 412 without items is the epoch
+// raise's stale config change, answered as that config write (§7.5). A
+// purged resource's 410 (no head, step 2.1) or a purged namespace's isn't.
+func targetMoved(ae *client.APIError) bool {
+	if ae.Status != 412 && ae.Status != 410 {
+		return false
+	}
+	items := ae.Items()
+	if len(items) == 0 {
+		return ae.Status == 412
+	}
+	for _, it := range items {
+		st, _ := it["status"].(float64)
+		head, _ := it["head"].(string)
+		if st != 412 && (st != 410 || it["code"] != "gone" || head == "") {
+			return false
+		}
+	}
+	return true
+}
+
 // submitBatch submits a node's batch i, dry-run first if it updates, and
 // checks the ids it produced. A concurrent batch's requests wait at its
 // namespace's gate (admit); any other batch paces after each (pace).
@@ -833,7 +870,7 @@ func (im *importer) submitBatch(ctx context.Context, n *node, i int, l limits) e
 			switch {
 			case batchOverLimits(err) && im.opt.Mode == Atomic:
 				return &TooLargeError{NS: n.ns, Items: len(b.parts), Size: b.size, Err: err}
-			case ae.Status == 412:
+			case targetMoved(ae):
 				return fmt.Errorf("import: the target moved while importing into %s (%w); import again: classification by ancestry picks up what is left", n.ns, err)
 			}
 			// The failing items, as a dry run lists them.

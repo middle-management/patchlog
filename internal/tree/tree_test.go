@@ -735,6 +735,10 @@ func TestSelfPlacing(t *testing.T) {
 	}
 }
 
+// TestPrivateCatalog (§B.11.5): a private catalog's listings need a grant
+// (401 without one), and a tree service without §B.11 serves only g/all,
+// to readers whose grants would be issued namespace-wide edge grants on
+// the catalog and every namespace it trusts (403 otherwise).
 func TestPrivateCatalog(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -764,11 +768,31 @@ func TestPrivateCatalog(t *testing.T) {
 	if r := x.raw("/cat/children?of=top", reader.Grant(t, s.Now(), "user:x", []string{"sec"}, []string{"read"})); r.status != 403 {
 		t.Errorf("grant for another namespace: %d", r.status)
 	}
-	// Whole-catalog reader without content read: structure, no heads.
-	catOnly := reader.Grant(t, s.Now(), "user:bob", []string{"cat"}, []string{"read"}, map[string]any{"groups": []any{"eds"}})
-	r := x.raw("/cat/children?of=top", catOnly)
+	// A tree service without §B.11 serves only g/all (§B.11.5): a reader
+	// of the catalog alone, or of some of its resources or sec's, is 403,
+	// as there are no filtered listings without a RoleView.
+	groups := map[string]any{"groups": []any{"eds"}}
+	catOnly := reader.Grant(t, s.Now(), "user:bob", []string{"cat"}, []string{"read"}, groups)
+	resRule := func(names ...any) map[string]any {
+		return map[string]any{"groups": []any{"eds"}, "rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": names}}}}
+	}
+	for name, g := range map[string]string{
+		"catalog-only": catOnly,
+		"scoped":       reader.Grant(t, s.Now(), "user:bob", []string{"cat"}, []string{"read"}, resRule("top", "sec.a")),
+		"partial":      reader.Grant(t, s.Now(), "user:bob", []string{"cat", "sec"}, []string{"read"}, resRule("top", "sec.a", "a")),
+	} {
+		for _, op := range []string{"children?of=top", "problems", "manifest?of=top"} {
+			if r := x.raw("/cat/"+op, g); r.status != 403 || r.header.Get("Location") != "" {
+				t.Errorf("%s for a %s reader: %d %v", op, name, r.status, r.body)
+			}
+		}
+	}
+	// A reader of both whole reads g/all, and its pointer is decided by
+	// the grant: private, no-store (§B.11.5).
+	both := reader.Grant(t, s.Now(), "user:bob", []string{"cat", "sec"}, []string{"read"}, groups)
+	r := x.raw("/cat/children?of=top", both)
 	loc := r.header.Get("Location")
-	if r.status != 302 || !strings.HasPrefix(loc, "/cat/g/") || r.header.Get("Cache-Control") != "private, no-cache" {
+	if r.status != 302 || !strings.HasPrefix(loc, "/cat/g/all/") || r.header.Get("Cache-Control") != "private, no-store" {
 		t.Fatalf("pointer: %d %v", r.status, r.header)
 	}
 	// The subject set comes before the checkpoint (§B.11.5, v0.51); the
@@ -784,72 +808,22 @@ func TestPrivateCatalog(t *testing.T) {
 			}
 		}
 	}
-	b := x.get("/cat/children?of=top", catOnly)
-	if names(b["children"]) != "sec.a,hidden" || b["children"].([]any)[0].(map[string]any)["head"] != nil {
-		t.Errorf("catalog-only reader: %v", b)
-	}
-	// With content read, heads are shown, under another subject set.
-	both := reader.Grant(t, s.Now(), "user:bob", []string{"cat", "sec"}, []string{"read"}, map[string]any{"groups": []any{"eds"}})
-	b = x.get("/cat/children?of=top", both)
-	if b["children"].([]any)[0].(map[string]any)["head"] == nil {
-		t.Errorf("content reader sees no head: %v", b)
-	}
-	if r2 := x.raw("/cat/children?of=top", both); r2.header.Get("Location") == loc {
-		t.Error("readers with different content access share a subject set")
+	b := x.get("/cat/children?of=top", both)
+	if names(b["children"]) != "sec.a,hidden" || b["children"].([]any)[0].(map[string]any)["head"] == nil ||
+		!strings.HasPrefix(b["children"].([]any)[0].(map[string]any)["url"].(string), clienttest.Origin+"/r/sec/a/rev/") {
+		t.Errorf("a reader of both: %v", b)
 	}
 	// A second user with the same access shares the URL (and caches).
-	amy := reader.Grant(t, s.Now(), "user:amy", []string{"cat"}, []string{"read"}, map[string]any{"groups": []any{"eds"}})
+	amy := reader.Grant(t, s.Now(), "user:amy", []string{"cat", "sec"}, []string{"read"}, groups)
 	if r2 := x.raw("/cat/children?of=top", amy); r2.header.Get("Location") != loc {
 		t.Errorf("amy: %s vs %s", r2.header.Get("Location"), loc)
 	}
-	// A resource-scoped reader sees only the nodes it may read.
-	scoped := reader.Grant(t, s.Now(), "user:bob", []string{"cat"}, []string{"read"}, map[string]any{"groups": []any{"eds"},
-		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"top", "sec.a"}}}}})
-	if got := names(x.get("/cat/children?of=top", scoped)["children"]); got != "sec.a" {
-		t.Errorf("scoped reader: %s", got)
-	}
-	if r := x.raw(x.raw("/cat/children?of=hidden", scoped).header.Get("Location"), scoped); r.status != 404 {
-		t.Errorf("scoped reader on a hidden folder: %d", r.status)
-	}
-	// A reader whose grant covers the content namespace only in part gets
-	// the heads (and urls) of the items it may read (§B.5, §B.11.5), under
-	// a subject set of its own scope.
-	resRule := func(names ...any) map[string]any {
-		return map[string]any{"groups": []any{"eds"}, "rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": names}}}}
-	}
-	partial := reader.Grant(t, s.Now(), "user:bob", []string{"cat", "sec"}, []string{"read"}, resRule("top", "sec.a", "a"))
-	b = x.get("/cat/children?of=top", partial)
-	if e := b["children"].([]any); len(e) != 1 || e[0].(map[string]any)["head"] == nil ||
-		!strings.HasPrefix(e[0].(map[string]any)["url"].(string), clienttest.Origin+"/r/sec/a/rev/"+e[0].(map[string]any)["head"].(string)) {
-		t.Errorf("partial content reader sees no head or url: %v", b)
-	}
-	other := reader.Grant(t, s.Now(), "user:bob", []string{"cat", "sec"}, []string{"read"}, resRule("top", "sec.a", "b"))
-	b = x.get("/cat/children?of=top", other)
-	if e := b["children"].([]any); len(e) != 1 || e[0].(map[string]any)["head"] != nil || e[0].(map[string]any)["url"] != nil {
-		t.Errorf("reader of other items sees the head: %v", b)
-	}
-	if x.raw("/cat/children?of=top", partial).header.Get("Location") == x.raw("/cat/children?of=top", other).header.Get("Location") {
-		t.Error("readers with different content scopes share a subject set")
-	}
-	// problems, orphans and manifests aren't filtered: they need
-	// namespace-wide read on the catalog and the content namespaces they
-	// cover (§B.11.5).
+	// problems, orphans and manifests aren't filtered: g/all has them.
 	for _, op := range []string{"problems", "orphans", "manifest?of=top"} {
-		for name, g := range map[string]string{"scoped": scoped, "catalog-only": catOnly} {
-			if r := x.raw(x.raw("/cat/"+op, g).header.Get("Location"), g); r.status != 403 {
-				t.Errorf("%s for a %s reader: %d %v", op, name, r.status, r.body)
-			}
-		}
 		x.get("/cat/"+op, both)
 	}
-	// Paths through hidden folders are left out without a count.
 	if b := x.get("/cat/ancestors?of=hidden", both); pathsOf(b["paths"]) != "top" {
 		t.Errorf("ancestors for a whole reader: %v", b)
-	}
-	scoped2 := reader.Grant(t, s.Now(), "user:bob", []string{"cat"}, []string{"read"}, map[string]any{"groups": []any{"eds"},
-		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"hidden"}}}}})
-	if b := x.get("/cat/ancestors?of=hidden", scoped2); pathsOf(b["paths"]) != "" || b["hidden"] != nil || b["incomplete"] != nil {
-		t.Errorf("ancestors through a hidden folder: %v", b)
 	}
 }
 

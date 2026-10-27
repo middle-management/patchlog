@@ -125,23 +125,33 @@ func refOf(doc any) any {
 
 // scratchName reports the names of editors' and systems' own files, kept
 // by the gateway as scratch files (§H.6): .DS_Store, ._*, Thumbs.db, ~$*,
-// *.swp, 4913, *~, #*#, *___jb_tmp___ and .goutputstream-*; *___jb_old___,
-// where JetBrains' safe write moves the original aside before moving its
-// *___jb_tmp___ in; and "Icon\r", where macOS keeps a folder's custom
-// icon, a name no title can be (a CR), which a Finder copy of such a folder
-// writes. A name a real file has is that file's, whatever it looks like
-// (resolveFlat).
+// .~lock.*# (LibreOffice's lock files), *.swp, *.swo and *.swx (vim's
+// swap files), 4913, *~, #*#, *___jb_tmp___ and .goutputstream-*;
+// *___jb_old___, where JetBrains' safe write moves the original aside
+// before moving its *___jb_tmp___ in; sed followed by six letters or
+// digits, the temporary file sed -i writes beside the file it edits; and
+// "Icon\r", where macOS keeps a folder's custom icon, a name no title can
+// be (a CR), which a Finder copy of such a folder writes. A name a real
+// file has is that file's, whatever it looks like (resolveFlat,
+// resolveIn): an existing name always wins over a pattern.
 func scratchName(base string) bool {
 	switch {
 	case base == ".DS_Store", base == "Thumbs.db", base == "4913", base == "Icon\r",
 		strings.HasPrefix(base, "._"), strings.HasPrefix(base, "~$"), strings.HasPrefix(base, ".goutputstream-"),
-		strings.HasSuffix(base, ".swp"), strings.HasSuffix(base, "~"),
+		len(base) > len(".~lock.") && strings.HasPrefix(base, ".~lock.") && strings.HasSuffix(base, "#"),
+		strings.HasSuffix(base, ".swp"), strings.HasSuffix(base, ".swo"), strings.HasSuffix(base, ".swx"),
+		strings.HasSuffix(base, "~"),
 		len(base) > 1 && base[0] == '#' && base[len(base)-1] == '#',
-		strings.HasSuffix(base, "___jb_tmp___"), strings.HasSuffix(base, "___jb_old___"):
+		strings.HasSuffix(base, "___jb_tmp___"), strings.HasSuffix(base, "___jb_old___"),
+		sedTemp.MatchString(base):
 		return true
 	}
 	return false
 }
+
+// sedTemp is the name of sed -i's temporary file (§H.6): sed and six
+// letters or digits, as mkstemp draws them.
+var sedTemp = regexp.MustCompile(`^sed[A-Za-z0-9]{6}$`)
 
 // dupName is the name a file whose name another has is shown by (§H.2
 // "Siblings"): name (2).ext, name (3).ext, …, the number before the

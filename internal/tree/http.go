@@ -3,8 +3,10 @@ package tree
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
@@ -23,6 +25,7 @@ import (
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/svcedge"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -91,23 +94,29 @@ const AllSubjects = "all"
 
 // viewer is the outcome of the read check for one request.
 type viewer struct {
-	anon       bool // no grant: the public URL space
-	gs         string
+	// anon marks the public URL space, /{catalog}/at/{at}/…: every
+	// namespace in the listings' combined checkpoint is public
+	// (publicViewer), and any grant is ignored.
+	anon bool
+	// byGrant marks a viewer of the grant in Authorization: a redirect it
+	// decides is kept by no cache (§B.11.5). cookie marks one of the
+	// service's own edge grants (edgeViewer).
+	byGrant, cookie bool
+	gs              string
+	// catPublic says the catalog is public: its listings are never sealed
+	// whole (sealsWhole, §E.2.6).
+	catPublic  bool
 	catAll     bool
-	catRead    func(name string) bool
 	contentAll map[string]bool
-	// contentRead, per content namespace the reader's grant reads only in
-	// part (rules on /resource), decides which items' heads it may see.
-	// Its scope is part of the subject set (no RoleView).
-	contentRead map[string]func(name string) bool
-	vis         Visibility
+	vis        Visibility
 	// exp, if set, is the earliest expiry of the grants an unfiltered
 	// listing was admitted with: it isn't kept past it (§B.11.5).
 	exp time.Time
 	// In a subject set's URL space (RoleView), the namespace-wide reads
 	// the reader has besides: wideCat for the catalog, wideNS per content
 	// namespace (public ones included, §B.11.5), and wideExp the earliest
-	// expiry of the grants behind them. problems, orphans and manifests
+	// expiry of the grants behind them. They are unrestricted reads
+	// (§2.1), judged on this request. problems, orphans and manifests
 	// need only those of the namespaces they cover. An answer admitted
 	// through such a grant (not public namespaces alone) depends on more
 	// than the subject set: priv marks it, and it is kept by no shared
@@ -148,6 +157,18 @@ func (v *viewer) wide(nss []string) bool {
 	return true
 }
 
+// readsCatalog reports whether the reader reads the catalog unrestricted
+// (§2.1), as everyone reads a public one: only such a reader learns which
+// namespace a service that is behind waits for (§B.5).
+func (v *viewer) readsCatalog() bool { return v.catAll || v.wideCat }
+
+// sealsWhole reports whether a listing of a sealed or e2e catalog is sealed
+// whole for the viewer, as one JWE under the catalog's epoch key: only
+// where the catalog isn't public and every reader its URL admits reads it
+// whole, which is g/all (§E.2.6, §B.11.5). Anywhere else, the public URL
+// space and a subject set's, each entry is sealed under its own K_r.
+func (v *viewer) sealsWhole() bool { return !v.catPublic && v.gs == AllSubjects }
+
 // shape is what a listing at a URL depends on besides the URL: what the
 // reader reads whole. A public namespace that turns private moves neither
 // the anonymous URL space nor a gs, so a kept listing is served only to
@@ -162,62 +183,41 @@ func (v *viewer) shape() string {
 }
 
 func (v *viewer) node(g *Graph, n *Node) bool {
-	return v.catAll || (v.catRead != nil && v.catRead(n.Name)) || (v.vis != nil && v.vis.Node(g, n))
+	return v.catAll || (v.vis != nil && v.vis.Node(g, n))
 }
 
 func (v *viewer) item(g *Graph, n *Node) bool {
 	if n.ItemNS == "" || n.State != StateLive {
 		return false
 	}
-	if v.contentAll[n.ItemNS] || (v.vis != nil && v.vis.Item(g, n)) {
-		return true
-	}
-	rd := v.contentRead[n.ItemNS]
-	return rd != nil && rd(n.ItemName)
+	return v.contentAll[n.ItemNS] || (v.vis != nil && v.vis.Item(g, n))
 }
 
 // Bearer returns the request's bearer token.
-func Bearer(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
-		return strings.TrimSpace(h[7:])
-	}
-	return ""
-}
+func Bearer(r *http.Request) string { return svcedge.Bearer(r) }
 
-// viewer resolves the reader (§B.10: services that list content enforce
-// read permissions for every node and item they list):
+// viewer resolves the reader of a listing at a URL whose subject set is
+// want ("" for none) (§B.10: services that list content enforce read
+// permissions for every node and item they list; §B.11.5):
 //
-//   - catalog structure: everyone if the catalog is public, otherwise a
-//     grant for the catalog namespace that reads the whole namespace
-//     (unrestricted, §2.1: one read role without rules on /resource is
-//     enough, roles being alternatives), or (filtered per node) one whose
-//     rules restrict /resource;
-//   - items' heads: public content namespaces, or content namespaces the
-//     same grant reads as a whole;
-//   - with a RoleView (the catalog), listings are filtered by the reader's
-//     subject set alone (§B.11.5): what its roles make visible, under
-//     /g/{gs}/ with gs over the subjects. A reader whose grants read the
-//     catalog and every trusted content namespace as a whole (or that are
-//     public, or purged: trustList) gets unfiltered listings instead,
-//     under /g/all/, shared by
-//     every such reader, and kept no longer than the earliest of those
-//     grants. Namespace-wide reads of only some of them don't count: the
-//     listing is then the subject set's.
-//
-// Anonymous readers of a public catalog use the public URL space; without
-// a RoleView, a reader with a grant is routed under /g/{gs}/, where gs
-// keys everything its listings depend on: its groups and markers for how
-// much of the catalog and which content namespaces it reads as a whole.
-//
-// A GET or HEAD without Authorization that carries an edge grant the
-// service minted, covering its path, is read as that grant's subject set
-// (edgeViewer, §B.11.5).
-func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) {
+//   - while the catalog and every namespace in the listings' combined
+//     checkpoint are public, everyone reads unfiltered listings in the
+//     public URL space, /{catalog}/at/{at}/…, any grant ignored, as on the
+//     core's public reads (publicViewer);
+//   - otherwise a GET or HEAD without Authorization that carries an edge
+//     grant the service minted, covering its path, is read as that
+//     grant's subject set (edgeViewer);
+//   - and otherwise the grant in Authorization decides (grantViewer),
+//     and a request with neither is 401: there is no anonymous filtered
+//     mode.
+func (s *Service) viewer(ctx context.Context, r *http.Request, want string) (*viewer, error) {
+	if v, err := s.publicViewer(ctx); err != nil || v != nil {
+		return v, err
+	}
 	if cl := s.edgeClaims(r); cl != nil {
 		return s.edgeViewer(ctx, cl)
 	}
-	return s.grantViewer(ctx, Bearer(r))
+	return s.grantViewer(ctx, Bearer(r), want, false)
 }
 
 // edgeClaims is the edge grant the service minted that a GET or HEAD
@@ -229,8 +229,84 @@ func (s *Service) edgeClaims(r *http.Request) *edge.Claims {
 	return s.opt.EdgeGrants.FromRequest(r, s.opt.Now())
 }
 
-// grantViewer is the viewer of a reader presenting token ("" for none).
-func (s *Service) grantViewer(ctx context.Context, token string) (*viewer, error) {
+// publicViewer is the viewer of every reader while the catalog and every
+// content namespace in the listings' combined checkpoint (§B.5) are
+// public: those listings are served unfiltered at /{catalog}/at/{at}/…,
+// to everyone, grant or not, while they stay public (§B.11.5). It is nil
+// while any isn't, and a namespace whose document can't be read counts as
+// not public. A purged namespace counts as public, every reader reading
+// it whole (trustList); a trusted one the service holds no checkpoint of,
+// since it can't follow it (§B.5), isn't in the checkpoint and shows
+// nothing in listings.
+func (s *Service) publicViewer(ctx context.Context) (*viewer, error) {
+	cfg, err := s.checker.Config(ctx, s.actual(s.opt.Catalog))
+	if err != nil || cfg.Read != "public" {
+		return nil, err
+	}
+	trust, gone := s.trustList()
+	listed := s.listed()
+	v := &viewer{anon: true, catPublic: true, catAll: true, contentAll: map[string]bool{}}
+	for _, ns := range trust {
+		if gone[ns] {
+			v.contentAll[ns] = true
+			continue
+		}
+		if c, err := s.checker.Config(ctx, s.actual(ns)); err == nil && c.Read == "public" {
+			v.contentAll[ns] = true
+		} else if listed[ns] {
+			return nil, nil
+		}
+	}
+	return v, nil
+}
+
+// listed reports, for each content namespace the catalog trusts, whether
+// the service holds a checkpoint of it, which puts it in the listings'
+// combined checkpoint (§B.5, CombinedAt). One it can't follow (refused,
+// absent, without keys it can have) has none, and shows nothing in
+// listings: its placements dangle.
+func (s *Service) listed() map[string]bool {
+	listed := map[string]bool{}
+	s.View(func(g *Graph, cur map[string]string) {
+		for ns := range g.Trust {
+			listed[ns] = cur[ns] != ""
+		}
+	})
+	return listed
+}
+
+// grantViewer is the viewer of a reader presenting token ("" for none)
+// where the listings aren't all public (publicViewer), at a URL whose
+// subject set is want ("" for none, as for the exchange):
+//
+//   - without a grant it is 401: a listing that isn't all public needs
+//     /g/{gs}, and a grant or a cookie the service verifies (§B.11.5);
+//   - a reader whose grant would be issued a namespace-wide edge grant
+//     (§C.5.2, grantcheck.NamespaceWide) on every namespace in the
+//     combined checkpoint that isn't public, the catalog included, those
+//     purged (trustList) aside, reads unfiltered listings under /g/all/,
+//     shared by every such reader and kept no longer than the earliest of
+//     those grants (§B.11.5), unless want names another subject set. A
+//     public catalog needs no grant: one that doesn't verify for it still
+//     qualifies through the content namespaces alone, drawing from the
+//     exchangeRate bucket of its principal there. For an edge grant
+//     (forCookie), which covers every later at, every namespace the
+//     catalog trusts counts, those the service doesn't follow too: a
+//     g/all cookie is refused at an at including one trusted since its
+//     issue (trustedSince), and the service knows when each became
+//     trusted, not when it came into the checkpoint;
+//   - with a RoleView (a catalog service), any other reader whose grant
+//     verifies for the catalog reads the listings of its subject set
+//     under /g/{gs}/, filtered by what its roles make visible (§B.11.5),
+//     and so does a reader of g/all at its subject set's URLs. One whose
+//     grant doesn't is refused as the catalog refuses it. Unrestricted
+//     reads (§2.1) of namespaces add problems, orphans and manifests that
+//     cover only those (query.unfiltered);
+//   - a tree service without §B.11 (no RoleView) serves only g/all, and
+//     any other reader is 403 (§B.11.5).
+//
+// A request at a want other than the viewer's gs is 403 (serve).
+func (s *Service) grantViewer(ctx context.Context, token, want string, forCookie bool) (*viewer, error) {
 	// In a release preview every check is on the branch read in place of
 	// a namespace: a viewer sees only branches it can read (§B.5).
 	cat := s.actual(s.opt.Catalog)
@@ -238,114 +314,103 @@ func (s *Service) grantViewer(ctx context.Context, token string) (*viewer, error
 	if err != nil {
 		return nil, err
 	}
+	if token == "" {
+		return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
+	}
 	catPublic := cfg.Read == "public"
 	trust, gone := s.trustList()
-	v := &viewer{contentAll: map[string]bool{}, contentRead: map[string]func(string) bool{}}
-	if token == "" {
-		if !catPublic {
-			return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
-		}
-		v.anon, v.catAll = true, true
-		for _, ns := range trust {
-			if gone[ns] {
-				v.contentAll[ns] = true
-				continue
-			}
-			if c, err := s.checker.Config(ctx, s.actual(ns)); err == nil && c.Read == "public" {
-				v.contentAll[ns] = true
-			}
-		}
-		return v, nil
-	}
-	vg, err := s.checker.Verify(ctx, cat, token)
-	if err != nil {
-		return nil, err
-	}
-	v.bucket = vg.Principal.ID + "\x00" + vg.Key.Kid
-	exp := grantExp(vg, time.Time{})
-	v.idExp = exp
-	var markers []string
-	readsCat, _ := vg.Allows("read")
+	listed := s.listed()
+	// The grant verified for the catalog, nil where a public catalog
+	// refuses it (catErr): g/all needs none there (§B.11.5). A grant over
+	// grantSize or rulesPerGrant is 413 wherever it is presented, before
+	// any ns check (§C.8).
+	vg, catErr := s.checker.Verify(ctx, cat, token)
+	var le *grantcheck.LimitError
+	var ae *grant.AuthError
 	switch {
-	case catPublic:
-		v.catAll = true
-	case s.checker.ReadsUnrestricted(vg):
-		v.catAll = true
-		markers = append(markers, "catalog:all")
-	case readsCat:
-		v.catRead = func(name string) bool { return s.checker.AllowsRead(vg, name) }
-		markers = append(markers, "catalog:scope:"+ScopeDigest(vg))
+	case catErr == nil:
+	case catPublic && !errors.As(catErr, &le) && errors.As(catErr, &ae):
+		vg = nil
+	default:
+		return nil, catErr
 	}
+	var exp time.Time
+	v := &viewer{byGrant: true, catPublic: catPublic, contentAll: map[string]bool{}}
+	if vg != nil {
+		exp = grantExp(vg, exp)
+		v.bucket, v.idExp = vg.Principal.ID+"\x00"+vg.Key.Kid, exp
+	}
+	// What the grant reads namespace-wide, "" the catalog, a public or
+	// purged namespace counting as read so by everyone: unrestricted
+	// (§2.1), as problems, orphans and manifests need, judged on this
+	// request; and as a namespace-wide edge grant would be issued
+	// (§C.5.2), as g/all needs, since its listings serve every such
+	// reader (§B.11.5).
+	public := map[string]bool{"": catPublic}
+	unres := map[string]bool{"": catPublic || (vg != nil && s.checker.ReadsUnrestricted(vg))}
+	wide := map[string]bool{}
+	all := catPublic || (vg != nil && s.checker.NamespaceWide(vg))
 	for _, ns := range trust {
 		if gone[ns] {
-			v.contentAll[ns] = true
+			public[ns], unres[ns], wide[ns] = true, true, true
 			continue
 		}
 		real := s.actual(ns)
 		c, err := s.checker.Config(ctx, real)
-		if err != nil {
-			continue
+		switch {
+		case err != nil:
+		case c.Read == "public":
+			public[ns], unres[ns], wide[ns] = true, true, true
+		default:
+			if cv, err := s.checker.Verify(ctx, real, token); err == nil {
+				unres[ns], wide[ns] = s.checker.ReadsUnrestricted(cv), s.checker.NamespaceWide(cv)
+				exp = grantExp(cv, exp)
+				if v.bucket == "" {
+					// Its principal and kid there, as the core keys write
+					// buckets (§C.5, §6.6).
+					v.bucket = cv.Principal.ID + "\x00" + cv.Key.Kid
+				}
+			}
 		}
-		if c.Read == "public" {
-			v.contentAll[ns] = true
-			continue
-		}
-		cv, err := s.checker.Verify(ctx, real, token)
-		if err != nil {
-			continue
-		}
-		if ok, _ := cv.Allows("read"); ok && s.checker.ReadsUnrestricted(cv) {
-			v.contentAll[ns] = true
-			markers = append(markers, "reads:"+real)
-			exp = grantExp(cv, exp)
-		} else if ok {
-			// A grant that reads only some resources (§B.11.5): the items
-			// it may read carry their heads, as they would for a reader of
-			// the whole namespace. Readers share listings only with
-			// identical scopes.
-			v.contentRead[ns] = func(name string) bool { return s.checker.AllowsRead(cv, name) }
-			markers = append(markers, "reads:"+real+":scope:"+ScopeDigest(cv))
-			exp = grantExp(cv, exp)
+		if forCookie || listed[ns] {
+			all = all && wide[ns]
 		}
 	}
-	if s.opt.RoleView != nil {
-		v.contentRead = nil // the subject set alone decides (vis)
-		v.wideCat, v.wideNS, v.wideGrant, v.wideExp = v.catAll, map[string]bool{}, map[string]bool{}, exp
-		if v.catAll && !catPublic {
-			v.wideGrant[""] = true
+	if v.bucket == "" {
+		// Verified for no namespace at all.
+		return nil, catErr
+	}
+	if all && (want == "" || want == AllSubjects || s.opt.RoleView == nil) {
+		// Unfiltered (§B.11.5).
+		v.gs, v.catAll, v.exp = AllSubjects, true, exp
+		for _, ns := range trust {
+			v.contentAll[ns] = wide[ns]
 		}
-		for ns := range v.contentAll {
-			v.wideNS[ns] = true
-		}
-		if v.wide(trust) {
-			// Unfiltered (§B.11.5): namespace-wide read on the catalog and
-			// on every content namespace it trusts.
-			v.catRead, v.gs, v.exp = nil, AllSubjects, exp
-			return v, nil
-		}
-		// Filtered by the subject set alone (§B.11.5).
-		v.catAll, v.catRead = catPublic, nil
-		for ns := range v.contentAll {
-			if gone[ns] {
-				continue
-			}
-			if c, err := s.checker.Config(ctx, s.actual(ns)); err != nil || c.Read != "public" {
-				delete(v.contentAll, ns)
-				v.wideGrant[ns] = true
-			}
-		}
-		v.subjects, v.vis, err = s.opt.RoleView.Resolve(ctx, vg)
-		if err != nil {
-			return nil, err
-		}
-		v.gs = grantcheck.SubjectSetID(v.subjects)
 		return v, nil
 	}
-	if !v.catAll && v.catRead == nil {
-		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow reading the catalog"}
+	if s.opt.RoleView == nil {
+		return nil, &grant.AuthError{Status: 403, Msg: "this tree service serves only unfiltered listings, /" + s.opt.Catalog +
+			"/g/all/… (§B.11.5): they need a grant that would be issued namespace-wide edge grants on every namespace in them that isn't public"}
 	}
-	subjects := grantcheck.SubjectSet(vg, false)
-	v.gs = grantcheck.SubjectSetID(append(subjects, markers...))
+	if vg == nil {
+		// A subject set is resolved from the grant verified for the
+		// catalog (RoleView).
+		return nil, catErr
+	}
+	// Filtered by the subject set alone (§B.11.5).
+	v.catAll = catPublic
+	v.wideCat, v.wideNS, v.wideGrant, v.wideExp = unres[""], map[string]bool{}, map[string]bool{}, exp
+	v.wideGrant[""] = unres[""] && !catPublic
+	for _, ns := range trust {
+		v.contentAll[ns] = public[ns]
+		v.wideNS[ns] = unres[ns]
+		v.wideGrant[ns] = unres[ns] && !public[ns]
+	}
+	v.subjects, v.vis, err = s.opt.RoleView.Resolve(ctx, vg)
+	if err != nil {
+		return nil, err
+	}
+	v.gs = grantcheck.SubjectSetID(v.subjects)
 	return v, nil
 }
 
@@ -390,48 +455,46 @@ func grantExp(v *grant.Verified, exp time.Time) time.Time {
 	return exp
 }
 
-// ScopeDigest digests everything a resource-restricted read decision of a
-// grant depends on, so readers share listings only with identical scopes.
-func ScopeDigest(v *grant.Verified) string {
-	roles := map[string]any{}
-	for _, role := range v.EffectiveRoles {
-		roles[role] = v.RoleRules(role)
-	}
-	x := map[string]any{
-		"principal": v.Principal.Envelope(), "key": v.Key.Kid, "readScope": v.Key.ReadScopeResource,
-		"keyRules": v.KeyRules, "blockRules": v.BlockRules, "roles": roles,
-	}
-	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo(x)))
-	return ids.FromBytes(sum[:ids.Size]).String()
-}
-
 var ops = map[string]bool{
 	"children": true, "lookup": true, "ancestors": true, "subtree": true, "roots": true,
 	"orphans": true, "problems": true, "where": true, "manifest": true,
 }
 
-// Handler returns the query API (§B.5):
+// Handler returns the query API (§B.5, §B.11.5):
 //
 //	GET /{catalog}/{op}?…                   302 → /{catalog}[/g/{gs}]/at/{at}/{op}?…  (head pointer)
-//	GET /{catalog}/at/{at}/{op}?…            200, public readers                     (immutable)
-//	GET /{catalog}/g/{gs}/at/{at}/{op}?…     200, readers with a grant, keyed by subject set (§B.11.5)
+//	GET /{catalog}/g/{gs}/{op}?…            302 → /{catalog}/g/{gs}/at/{at}/{op}?…   (head pointer)
+//	GET /{catalog}/at/{at}/{op}?…            200, everyone, while all is public       (immutable)
+//	GET /{catalog}/g/{gs}/at/{at}/{op}?…     200, readers of that subject set or all  (§B.11.5)
 //
 // at is the combined checkpoint (CombinedAt). The subject set comes before
 // it, so one edge grant for the prefix /{catalog}/g/{gs} covers every
-// checkpoint (§B.11.5); the form before v0.51,
-// /{catalog}/at/{at}/g/{gs}/{op}?…, is moved permanently (301) to it. op
-// is one of
+// checkpoint and the head pointer under it (§B.11.5); the form before
+// v0.51, /{catalog}/at/{at}/g/{gs}/{op}?…, is moved permanently (301) to
+// it. op is one of
 // children?of=&after=&limit=, lookup?path=, ancestors?of=,
 // subtree?of=&depth=, roots, orphans, problems, where?item=, manifest?of=.
+//
+// URL spaces (§B.11.5, viewer). While the catalog and every namespace in
+// the combined checkpoint are public, listings are served unfiltered in
+// the public URL space to everyone, any grant ignored, and a URL under
+// /g/{gs} redirects there. Otherwise every listing is a subject set's:
+// a request without a grant or an edge grant the service verifies is
+// 401; a grant in Authorization reads only at its own gs, or at all where
+// it qualifies (grantViewer), and is 403 at any other, never redirected;
+// a URL without /g/{gs} redirects into the grant's, private, no-store. A
+// tree service without §B.11 (no RoleView) serves only g/all.
 //
 // children, lookup, ancestors, subtree, roots and where show the nodes the
 // reader may see, and only paths through visible folders, with no trace of hidden
 // nodes (no counts); limits, cut markers and pagination count visible
 // nodes only (§B.11.5). orphans, problems and manifest aren't filtered:
 // they answer 403 unless the reader reads the catalog and the content
-// namespaces they cover as a whole. A catalog service's readers with such
-// grants on the catalog and every trusted namespace are served unfiltered
-// listings under /g/all/ (§B.11.5, viewer).
+// namespaces they cover unrestricted (§2.1), and under an edge grant for
+// a subject set other than all. Readers whose grants would be issued
+// namespace-wide edge grants on every namespace in the combined
+// checkpoint that isn't public are served unfiltered listings under
+// /g/all/ (§B.11.5, viewer).
 //
 // Every listing computed, including the one a redirect names, is kept for
 // a while (package kept), under its URL and what the reader reads whole
@@ -462,16 +525,16 @@ var ops = map[string]bool{
 // type, modified } of that head, in the clear for items of a namespace
 // that is neither sealed nor e2e. For an item of a sealed (E2) namespace
 // it is "file": { "sealed": JWE of { file } } under the item's own K_r,
-// kid its namespace's current epoch, pl { ns, name, view } of the item, so
+// kid the epoch the item's head is served under (§E.2.6 values of another
+// resource; FileMeta.Epoch), pl { ns, name, view } of the item, so
 // readers given K_r by /read-grants open it, whatever the catalog's level;
 // for an e2e item it is { "absent": "e2e" }, and { "absent": "pending" }
 // for a head not read for it yet (§H.3). A listing holding any sealed file is
 // stored and served unchanged like a sealed catalog's. While a sealed
 // namespace's key can't be had for the moment, listings are 503, no-store
-// (fileSealing). The "file": { "sealed" } form, and its nesting inside a
-// sealed catalog's whole-listing JWE below, are provisional: §E.2.6 has a
-// per-entry "sealed" member for values of one source (the catalog's
-// titles), and no form yet for values another namespace's resource gives.
+// (fileSealing). The "file": { "sealed" } form nests inside a sealed
+// catalog's whole-listing JWE below (§E.2.6 values of another resource);
+// its plaintext is { "file": value }, as F-E5's default keeps it.
 //
 // A sealed or e2e catalog (§E.2.5, §E.2.6; package derived). Titles and
 // born are the only values a listing takes from the catalog's content
@@ -479,14 +542,18 @@ var ops = map[string]bool{
 // stay in the clear, and
 // content namespaces contribute nothing else but file metadata, sealed on
 // its own), so the catalog is the one source of what a listing seals
-// whole. A reader of the whole catalog gets the listing sealed as
-// one JWE under the catalog's current epoch key, Content-Type
-// application/jose, pl { ns, view } where view is the listing's request
-// target (/{catalog}[/g/{gs}]/at/{at}/{op}?{query}, the canonical form). A
-// reader whose grant restricts catalog resources (or who sees nodes only
-// through roles) gets JSON in which every node with a title or born
-// carries "sealed": JWE of { title?, born? } under that catalog
-// resource's K_r, pl { ns, name, view }, in their place. Sealed listings are produced once per
+// whole. Each node's values are sealed under the epoch its head is
+// served under (Node.Epoch; the current one where that isn't known),
+// title and born alike. A g/all listing of a catalog that isn't public,
+// which every reader its URL admits reads whole, whose nodes' values all
+// come from one epoch, is sealed as one JWE under that epoch's key,
+// Content-Type application/jose, pl { ns, view } where view is the
+// listing's request target (/{catalog}/g/all/at/{at}/{op}?{query}, the
+// canonical form). Any other (a public catalog's, a subject set's, whose
+// readers see nodes only through roles, or one mixing epochs) is JSON in
+// which every node with a title or born carries "sealed": JWE of {
+// title?, born? } under that catalog resource's K_r of its epoch, pl {
+// ns, name, view }, in their place (§E.2.6, viewer.sealsWhole). Sealed listings are produced once per
 // view (a rotation moves at), stored in the database with their cache
 // tags, and served unchanged, across restarts, until a purge with one of
 // those tags or a new at retires them (derived.Cache).
@@ -523,6 +590,10 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		op = segs[1]
 	case len(segs) == 4 && segs[0] == cat && segs[1] == "at":
 		at, op, isAt = segs[2], segs[3], true
+	case len(segs) == 4 && segs[0] == cat && segs[1] == "g":
+		// The head pointer under the subject set's prefix, which its edge
+		// grant covers (§B.11.5).
+		gs, op = segs[2], segs[3]
 	case len(segs) == 6 && segs[0] == cat && segs[1] == "g" && segs[3] == "at":
 		gs, at, op, isAt = segs[2], segs[4], segs[5], true
 	case len(segs) == 6 && segs[0] == cat && segs[1] == "at" && segs[3] == "g" && oldForm(segs[2], segs[4], segs[5]):
@@ -540,8 +611,10 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// The listing is one of a fixed set: it stays in the route.
 	switch {
-	case gs != "":
+	case gs != "" && isAt:
 		telemetry.SetRoute(r, "/{catalog}/g/{gs}/at/{at}/"+op)
+	case gs != "":
+		telemetry.SetRoute(r, "/{catalog}/g/{gs}/"+op)
 	case isAt:
 		telemetry.SetRoute(r, "/{catalog}/at/{at}/"+op)
 	default:
@@ -562,8 +635,16 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	s.serve(w, r, op, at, gs, isAt)
 }
 
-// WriteAuthError writes a grant failure (401/403) or an upstream error.
+// WriteAuthError writes a grant failure (401/403) or an upstream error. A
+// grant over grantSize or rulesPerGrant is 413, code limit, naming the
+// limit, as the origin answers it (§C.8): services verify as the origin
+// does (§C.6).
 func WriteAuthError(w http.ResponseWriter, err error, logf func(string, ...any)) {
+	var le *grantcheck.LimitError
+	if errors.As(err, &le) {
+		svcedge.Limit(le.Limit, le.Measured, le.Max).Write(w)
+		return
+	}
 	var ae *grant.AuthError
 	if errors.As(err, &ae) {
 		code := "forbidden"
@@ -582,12 +663,16 @@ func WriteAuthError(w http.ResponseWriter, err error, logf func(string, ...any))
 func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs string, isAt bool) {
 	ctx := r.Context()
 	cat := s.opt.Catalog
-	if reason := s.keys.Skipped(cat); reason != "" {
-		w.Header().Set("Retry-After", "60")
-		WriteError(w, http.StatusServiceUnavailable, "skipped", "the service does not consume the catalog: "+reason)
+	// A catalog whose keys the service lacks as configured is one it
+	// doesn't serve: 404 alike, before the read check, as the index
+	// answers a namespace it doesn't follow (§A.4, §E.2.6). One whose keys
+	// it can't fetch for now is behind (below).
+	skipped, lacksKeys := s.keys.Skip(cat)
+	if lacksKeys {
+		WriteError(w, http.StatusNotFound, "not_found", "the tree service does not serve this catalog")
 		return
 	}
-	v, err := s.viewer(ctx, r)
+	v, err := s.viewer(ctx, r, gs)
 	if client.IsPurged(err) {
 		// A purged sealed catalog's document is 410 too (§8.5): the core
 		// makes the read check before answering it, as below. An edge
@@ -614,6 +699,18 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	}
 	if err != nil {
 		WriteAuthError(w, err, s.opt.Logf)
+		return
+	}
+	if !v.anon && gs != "" && gs != v.gs {
+		// A grant reads only at its own subject set, or at all where it
+		// qualifies (grantViewer), and is 403 at any other, never
+		// redirected (§B.11.5). An edge grant covers its own prefix only.
+		msg := "the grant reads only at /" + cat + "/g/" + v.gs + "/… (§B.11.5)"
+		if s.opt.RoleView == nil {
+			msg = "this tree service serves only unfiltered listings, /" + cat + "/g/all/… (§B.11.5)"
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		WriteError(w, http.StatusForbidden, "forbidden", msg)
 		return
 	}
 	vals := r.URL.Query()
@@ -645,18 +742,23 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 	setPtr := func() {
-		// An anonymous reader's redirect out of a subject set's URL space
-		// is no shared cache's either: there, the edge serves what it
-		// holds to readers with that subject set's edge grant (§B.11.5).
-		if v.anon && gs == "" {
+		switch {
+		case v.anon && gs == "":
 			w.Header().Set("Cache-Control", ccHeadPointer)
 			w.Header().Set("Cache-Tag", "ns:"+cat)
-		} else {
-			// A pointer depends on the caller's grant: no shared cache
-			// keeps it, behind a verifying edge or not.
+		case v.byGrant:
+			// Decided by the grant in Authorization: no cache keeps it,
+			// the browser's included (§B.11.5).
+			w.Header().Set("Cache-Control", "private, no-store")
+			edge.NoStore(w.Header())
+			w.Header().Add("Vary", "Authorization")
+		default:
+			// Under a subject set's edge grant, or out of a subject set's
+			// URL space into the public one: no shared cache keeps it,
+			// since the edge serves what it holds under /g/{gs} to every
+			// reader with that subject set's edge grant (§B.11.5).
 			w.Header().Set("Cache-Control", ccPrivatePtr)
-			w.Header().Set("CDN-Cache-Control", "no-store")
-			w.Header().Set("Surrogate-Control", "no-store")
+			edge.NoStore(w.Header())
 			w.Header().Add("Vary", "Authorization")
 		}
 	}
@@ -664,14 +766,23 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		a.write(w)
 		return
 	}
-	if ns := s.behind(); ns != "" {
-		msg := "the tree service has not reached the catalog yet"
-		if ns != cat {
-			msg = "the tree service has not reached namespace " + ns + ", which the catalog trusts, yet"
+	waits, retry := s.behind(), "1"
+	if skipped != "" {
+		// Keys it can't fetch yet are a view it hasn't caught up with
+		// (§12.1 behind, §E.2.6).
+		waits, retry = cat, "60"
+	}
+	if waits != "" {
+		// Once the reader's grant verifies (§B.5), with the namespace
+		// waited for only to a reader with unrestricted read of the
+		// catalog.
+		body := map[string]any{"code": "behind", "message": "the tree service hasn't caught up with what its listings show yet"}
+		if v.readsCatalog() {
+			body["ns"] = waits
 		}
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Retry-After", "1")
-		WriteError(w, http.StatusServiceUnavailable, "behind", msg)
+		w.Header().Set("Retry-After", retry)
+		WriteJSON(w, http.StatusServiceUnavailable, body)
 		return
 	}
 	// canon is the canonical URL of this listing at an at (§A.5): what
@@ -692,7 +803,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 	v.noEdge = s.edgeHold(v, at, cur)
-	own := isAt && gs == v.gs && !(v.anon && gs != "")
+	own := isAt && gs == v.gs
 	mins := len(vals["min"]) > 0
 	canonical := r.URL.RequestURI() == canon(at)
 	if own && mins && at != cur && s.atIncludes(ctx, at, vals["min"], keyOf(at), keep) {
@@ -758,6 +869,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "5")
 		WriteError(w, http.StatusServiceUnavailable, "behind", "the service cannot obtain the key that seals the file metadata of a trusted namespace yet")
+	case errors.Is(err, errCatalogKeys):
+		s.opt.Logf("tree: %v", err)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusServiceUnavailable, "behind", "the service cannot obtain the key of an epoch a catalog node is served under yet")
 	case err != nil:
 		s.opt.Logf("tree: sealing a listing: %v", err)
 		WriteError(w, http.StatusInternalServerError, "internal", "sealing failed")
@@ -850,33 +966,105 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		view derived.View
 		serr error
 	)
-	perEntry := info.Protected() && !v.catAll
-	var cps map[string]string
-	var more []keptPage
-	s.View(func(g *Graph, curMap map[string]string) {
-		l.at, nss = CombinedAt(g, curMap)
-		cps = checkpointsOf(g, curMap)
-		view = derived.View{NS: cat, Target: canon(l.at)}
-		q := &query{s: s, g: g, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
-		if perEntry {
-			q.sealValues = func(name string, vals map[string]any) string {
-				jwe, err := derived.SealItem(key, q.view, name, vals)
-				if err != nil && serr == nil {
-					serr = err
+	// Each node's values are sealed under the epoch its head is served
+	// under (Node.Epoch; §E.2.6), the current one where that isn't known.
+	// The keys of older epochs are read, outside the graph's lock, only
+	// once a listing shows a node they seal, and the listing computed
+	// again with them. An epoch whose key the service can't have
+	// (lastingKeyErr) leaves the values of the nodes served under it out,
+	// shown by name only, as for a reader without it (§E.2.6).
+	keys := map[int]derived.Key{key.Epoch: key}
+	lacking := map[int]bool{}
+	var (
+		perEntry bool
+		whole    int
+		cps      map[string]string
+		more     []keptPage
+	)
+	for {
+		// Sealed whole only where every reader the URL admits reads the
+		// catalog whole and it isn't public, and every value derives from
+		// revisions served under one epoch whose key the service has, else
+		// per entry (§E.2.6).
+		perEntry = info.Protected() && !v.sealsWhole()
+		whole = key.Epoch
+		missing := map[int]bool{}
+		s.View(func(g *Graph, curMap map[string]string) {
+			l.at, nss = CombinedAt(g, curMap)
+			cps = checkpointsOf(g, curMap)
+			view = derived.View{NS: cat, Target: canon(l.at)}
+			epochOf := func(name string) int {
+				if n := g.Node(name); n != nil && n.Epoch > 0 {
+					return n.Epoch
 				}
-				return jwe
+				return key.Epoch
+			}
+			run := func() map[int]bool {
+				more, serr = nil, nil
+				epochs := map[int]bool{}
+				q := &query{s: s, g: g, cur: curMap, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
+				switch {
+				case perEntry:
+					q.sealValues = func(name string, vals map[string]any) string {
+						e := epochOf(name)
+						k, ok := keys[e]
+						if !ok {
+							if !lacking[e] {
+								missing[e] = true
+							}
+							return ""
+						}
+						jwe, err := derived.SealItem(k, q.view, name, vals)
+						if err != nil && serr == nil {
+							serr = err
+						}
+						return jwe
+					}
+				case info.Protected():
+					q.noteValues = func(name string) { epochs[epochOf(name)] = true }
+				}
+				if op == "children" && keep {
+					// The following pages are kept with this one, each at
+					// its own URL: the same at with the query their next
+					// gives.
+					path, _, _ := strings.Cut(view.Target, "?")
+					q.pages = &more
+					q.pageView = func(query string) derived.View { return derived.View{NS: cat, Target: path + query} }
+				}
+				body, l.status, l.msg = q.run(op)
+				tags = q.tags
+				return epochs
+			}
+			epochs := run()
+			if l.status != http.StatusOK || !info.Protected() || perEntry {
+				return
+			}
+			for e := range epochs {
+				whole = e
+			}
+			if _, ok := keys[whole]; len(epochs) > 1 || lacking[whole] || !ok {
+				// Values of several epochs, or of one whose key the
+				// service lacks: per entry after all.
+				perEntry = true
+				run()
+			}
+		})
+		if l.status != http.StatusOK || len(missing) == 0 {
+			break
+		}
+		for e := range missing {
+			k, err := s.keys.KeyAt(ctx, cat, e)
+			switch {
+			case err != nil && lastingKeyErr(err):
+				s.opt.Logf("tree: values of catalog nodes served under %s#%d left out: %v", cat, e, err)
+				lacking[e] = true
+			case err != nil:
+				return nil, fmt.Errorf("%w %s#%d: %w", errCatalogKeys, cat, e, err)
+			default:
+				keys[e] = k
 			}
 		}
-		if op == "children" && keep {
-			// The following pages are kept with this one, each at its own
-			// URL: the same at with the query their next gives.
-			path, _, _ := strings.Cut(view.Target, "?")
-			q.pages = &more
-			q.pageView = func(query string) derived.View { return derived.View{NS: cat, Target: path + query} }
-		}
-		body, l.status, l.msg = q.run(op)
-		tags = q.tags
-	})
+	}
 	if l.status != http.StatusOK {
 		return l, nil
 	}
@@ -886,7 +1074,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		var err error
 		if info.Protected() && !perEntry {
 			var jwe string
-			jwe, err = derived.SealView(key, view, body)
+			jwe, err = derived.SealView(keys[whole], view, body)
 			st.Body, st.JSON = []byte(jwe), false
 		} else {
 			st.Body, err = derived.Marshal(body)
@@ -940,6 +1128,36 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	s.recordAt(l.at, cps)
 	return l, nil
 }
+
+// dropWholeViews drops the listings stored sealed whole (derived.Cache)
+// anywhere but under /{catalog}/g/all/, and there too while the catalog
+// is public. Releases before v0.73 sealed a listing whole for every
+// reader of the whole catalog, in the public URL space, a subject set's
+// and g/all of a public catalog too, and a stored listing is served
+// unchanged under the same URL and shape; now only g/all's of a catalog
+// that isn't public are (viewer.sealsWhole, §E.2.6). The catalog's
+// document as of its checkpoint (meta "config"), the one listings are
+// served at, says whether it is; without one it counts as public, which
+// costs only sealing them again. Called at Open, before the cache is
+// used.
+func (s *Service) dropWholeViews(ctx context.Context) error {
+	var doc string
+	if err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'config'`).Scan(&doc); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	m, _ := parseJSON(doc).(map[string]any)
+	public := m == nil || m["read"] == "public"
+	all := "/" + s.opt.Catalog + "/g/" + AllSubjects + "/"
+	return s.sealed.Drop(ctx, func(view, _ string, json bool) bool {
+		return !json && (public || !strings.HasPrefix(view, all))
+	})
+}
+
+// errCatalogKeys is a key of an epoch a catalog node's head is served
+// under, which seals its entries in a listing that shows it (§E.2.6),
+// that the service can't obtain for now: the listing is 503 behind, as
+// for the catalog's current key.
+var errCatalogKeys = errors.New("the key of an epoch a catalog node is served under")
 
 // listingKey is what a listing at url is stored and kept under for reader
 // v: the URL and the reader's shape, since a namespace that turns private
@@ -1548,10 +1766,17 @@ type query struct {
 	vals url.Values
 	tags tagSet
 	at   string
+	// cur is each namespace's checkpoint, as View gives it: those with
+	// one are in the combined checkpoint (CombinedAt).
+	cur map[string]string
 	// sealValues, if set, seals the values an entry takes from the
 	// catalog's content (title, born) for per-entry sealing (§E.2.6): the
-	// entry carries "sealed" in their place.
+	// entry carries "sealed" in their place, or nothing where it returns
+	// "". noteValues, if set, is told
+	// of each entry whose values are given in the clear, for a listing
+	// sealed whole (the epochs they derive from).
 	sealValues func(name string, vals map[string]any) string
+	noteValues func(name string)
 	// files says how placements carry file metadata in a file tree
 	// (§H.3), sealed under view; serr records a sealing failure.
 	files *fileSealing
@@ -1571,8 +1796,14 @@ func (q *query) values(m map[string]any, name string, vals map[string]any) {
 	switch {
 	case len(vals) == 0:
 	case q.sealValues != nil:
-		m["sealed"] = q.sealValues(name, vals)
+		// None where the service lacks the key: by name only.
+		if jwe := q.sealValues(name, vals); jwe != "" {
+			m["sealed"] = jwe
+		}
 	default:
+		if q.noteValues != nil {
+			q.noteValues(name)
+		}
 		for k, v := range vals {
 			m[k] = v
 		}
@@ -2241,11 +2472,17 @@ func (q *query) parentsJSON(n *Node) []any {
 	return out
 }
 
-// trusted is every content namespace the catalog trusts, sorted.
-func (q *query) trusted() []string {
+// checkpointed is every content namespace the catalog trusts that is in
+// the combined checkpoint, sorted: what problems and orphans cover
+// (§B.11.5). One the service can't follow has no checkpoint, and shows
+// nothing in listings, as the URL spaces and g/all are judged without it
+// (Service.listed).
+func (q *query) checkpointed() []string {
 	out := make([]string, 0, len(q.g.Trust))
 	for ns := range q.g.Trust {
-		out = append(out, ns)
+		if q.cur[ns] != "" {
+			out = append(out, ns)
+		}
 	}
 	sort.Strings(out)
 	return out
@@ -2256,11 +2493,17 @@ func (q *query) trusted() []string {
 // filtered, and need namespace-wide read on the catalog and on the content
 // namespaces they cover (§B.11.5).
 //
-// In a subject set's URL space the reader's namespace-wide grants count
-// too, those of the namespaces covered only (a public namespace counts as
-// read namespace-wide); an answer that needed such a grant is marked
-// private (viewer.priv).
+// In a subject set's URL space the reader's unrestricted reads (§2.1)
+// count too, those of the namespaces covered only (a public namespace
+// counts as read unrestricted); an answer that needed such a grant is
+// marked private (viewer.priv). Under an edge grant for a subject set
+// other than all, they are 403 (§B.11.5).
 func (q *query) unfiltered(nss []string) (int, string) {
+	if q.v.cookie && q.v.gs != AllSubjects {
+		// A gs cookie other than all authorises listings of its subject
+		// set only (§B.11.5).
+		return http.StatusForbidden, "this listing isn't filtered: an edge grant for a subject set doesn't authorise it (§B.11.5)"
+	}
 	if q.v.wide(nss) {
 		return http.StatusOK, ""
 	}
@@ -2281,7 +2524,7 @@ func (q *query) unfiltered(nss []string) (int, string) {
 // orphans lists nodes whose every parent is gone, dangling, not a folder
 // or in a cycle (§B.5, §B.7: children of a deleted folder). Unfiltered.
 func (q *query) orphans() (any, int, string) {
-	if st, msg := q.unfiltered(q.trusted()); st != http.StatusOK {
+	if st, msg := q.unfiltered(q.checkpointed()); st != http.StatusOK {
 		return nil, st, msg
 	}
 	out := []any{}
@@ -2300,7 +2543,7 @@ func (q *query) orphans() (any, int, string) {
 // problems reports cycles, dangling items, dangling parents and nodes
 // deeper than MaxDepth (§B.3, §B.5). Unfiltered.
 func (q *query) problems() (any, int, string) {
-	if st, msg := q.unfiltered(q.trusted()); st != http.StatusOK {
+	if st, msg := q.unfiltered(q.checkpointed()); st != http.StatusOK {
 		return nil, st, msg
 	}
 	g := q.g

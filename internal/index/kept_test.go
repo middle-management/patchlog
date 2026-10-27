@@ -31,8 +31,8 @@ func hops(base, path string, max int) (int, int, string, error) {
 }
 
 // TestKeptAt (B9): a result stays answerable at its at after the checkpoint
-// moves on, showing what it showed there, until a purge of a resource it
-// shows, or of any with counts, or kept.For, drops it; its at is then
+// moves on, showing what it showed there, until a purge of any resource of
+// its namespace (§A.1, v0.73), or kept.For, drops it; its at is then
 // redirected to the current one.
 func TestKeptAt(t *testing.T) {
 	t.Parallel()
@@ -71,21 +71,31 @@ func TestKeptAt(t *testing.T) {
 		t.Errorf("not kept: %d %s", r.status, r.header.Get("Location"))
 	}
 
-	// A purge drops the kept results that show the resource, and those with
-	// counts.
+	// A purge drops the namespace's kept results, those that don't show
+	// the resource too (§A.1, v0.73).
 	must(w.c.Purge(ctx, "matches", "derby", derby.ID, false))
 	s.caughtUp("matches")
-	for q, want := range map[string]int{"?q=derby": 302, "?q=cup&counts=/status": 302, "?q=cup": 200} {
-		if r := s.raw(locs[q], ""); r.status != want {
-			t.Errorf("%s after the purge: %d, want %d", q, r.status, want)
+	for q := range locs {
+		if r := s.raw(locs[q], ""); r.status != 302 {
+			t.Errorf("%s after the purge: %d, want 302", q, r.status)
 		}
 	}
 
+	// A result kept since stays answerable as the checkpoint moves on, and
 	// kept.For later, nothing is kept.
+	cup := s.raw("/matches?q=cup", "").header.Get("Location")
+	if r := s.raw(cup, ""); r.status != 200 {
+		t.Fatalf("?q=cup after the purge: %d", r.status)
+	}
+	w.doc(t, "final", w.match, map[string]any{"title": "Cup final, again"})
+	s.caughtUp("matches")
+	if r := s.raw(cup, ""); r.status != 200 {
+		t.Errorf("kept ?q=cup: %d", r.status)
+	}
 	mu.Lock()
 	now = now.Add(2 * time.Minute)
 	mu.Unlock()
-	if r := s.raw(locs["?q=cup"], ""); r.status != 302 {
+	if r := s.raw(cup, ""); r.status != 302 {
 		t.Errorf("after kept.For: %d", r.status)
 	}
 }
@@ -93,8 +103,10 @@ func TestKeptAt(t *testing.T) {
 // TestHopsUnderWrites (B9): under a steady write rate, a query from the head
 // pointer is answered at the at it is redirected to, however often the
 // checkpoint moves meanwhile: one redirect, never a chase (§A.4). So too
-// under a stream of purges (as a §8.6 retention sweep makes) of resources
-// the result doesn't show.
+// under a stream of purges (as a §8.6 retention sweep makes) in another
+// namespace the service follows. A purge in the queried namespace drops
+// its kept results (§A.1, v0.73), so there a redirect named just before
+// one can cost another.
 func TestHopsUnderWrites(t *testing.T) {
 	t.Parallel()
 	t.Run("writes", func(t *testing.T) {
@@ -116,19 +128,27 @@ func TestHopsUnderWrites(t *testing.T) {
 	})
 	t.Run("purges", func(t *testing.T) {
 		t.Parallel()
+		ctx := context.Background()
 		w := setup(t)
-		s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}})
+		must(w.c.CreateNamespace(ctx, "sweep", map[string]any{"read": "public"}))
+		s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "sweep"}})
 		w.doc(t, "derby", w.match, map[string]any{"title": "The Derby", "status": "done"})
 		ids := make([]string, 300)
 		for i := range ids {
 			w.s.Clock.Advance(time.Second)
-			ids[i] = w.doc(t, fmt.Sprintf("m%d", i), w.match, map[string]any{"title": "Match", "status": "planned"}).ID
+			ids[i] = must(w.c.CreateDoc(ctx, "sweep", fmt.Sprintf("m%d", i), map[string]any{"title": "Match"})).ID
 		}
 		s.caughtUp("matches")
-		// Up to 200 purges a second, each of a document neither query shows.
+		s.caughtUp("sweep")
+		// Up to 200 purges a second in sweep, and a write in matches every
+		// fifth tick, so its checkpoint moves.
 		hopsUnder(t, s, 8, []string{"?q=derby", "?facet[/status]=done"}, 5*time.Millisecond, len(ids), func(ctx context.Context, i int) error {
 			w.s.Clock.Advance(time.Second)
-			_, err := w.c.Purge(ctx, "matches", fmt.Sprintf("m%d", i), ids[i], false)
+			if i%5 == 0 {
+				_, err := w.c.CreateDoc(ctx, "matches", fmt.Sprintf("m%d", i), map[string]any{"$schema": w.match, "title": "Match", "status": "planned"})
+				return err
+			}
+			_, err := w.c.Purge(ctx, "sweep", fmt.Sprintf("m%d", i), ids[i], false)
 			return err
 		})
 	})

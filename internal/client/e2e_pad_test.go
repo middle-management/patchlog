@@ -26,7 +26,9 @@ func patchSetPadded(t *testing.T, c *client.Client, x *client.E2E, ns, name, id 
 		}
 		h := must(seal.ParseHeader(jwe))
 		kns, _, _ := seal.ParseKid(h.Kid)
-		_, padded, err := seal.OpenPatchSetPadded(le.Patches, must(x.Key(ctx, h.Kid)), h.Kid, kns, name, le.Parent)
+		// Under the resource's K_r (§E.3.1, v0.65).
+		kr := must(seal.ResourceKey(must(x.Key(ctx, h.Kid)), kns, name))
+		_, padded, err := seal.OpenPatchSetPadded(le.Patches, kr, h.Kid, kns, name, le.Parent)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -70,7 +72,8 @@ func TestE2EPadding(t *testing.T) {
 	if len(d.Flagged) != 1 || d.Flagged[0].ID != bad.ID || !strings.Contains(d.Flagged[0].Message, "padded") || d.ValidID != p1.ID {
 		t.Fatalf("fold %+v", d)
 	}
-	sameJSON(t, d.Value, map[string]any{"n": 1})
+	// Flagged but still folded (§E.3.2, v0.70).
+	sameJSON(t, d.Value, map[string]any{"n": 2})
 
 	// A branch copies pad; its merge back is re-encrypted and padded.
 	must(c.CreateBranch(ctx, "e", client.BranchRequest{Name: "eb"}))

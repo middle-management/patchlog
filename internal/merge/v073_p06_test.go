@@ -217,15 +217,15 @@ func TestV073RebaseSwitchUpTheChain(t *testing.T) {
 	if res == nil || !res.Created || res.FirstResult == nil {
 		t.Fatalf("rebase onto the base's base: %+v, %v", res, err)
 	}
-	// The switch is the server's to accept (§7.4): until it accepts a
-	// successor up the chain it is a 422 there, never the tool's refusal.
-	if err != nil {
-		t.Logf("switch: %v", err)
-		if ae, ok := client.AsAPIError(err); !ok || ae.Status != 422 || res.Switched {
-			t.Fatalf("switch: %v", err)
-		}
-	} else if !res.Switched {
-		t.Fatalf("not switched: %+v", res)
+	// The switch is the server's to accept (§7.4), and the core accepts a
+	// successor up the chain since v0.73 (wave 2): the old branch is
+	// frozen naming it.
+	if err != nil || !res.Switched {
+		t.Fatalf("switch: %+v, %v", res, err)
+	}
+	doc := nsDoc(t, e.c, "b2")
+	if f, _ := doc["frozen"].(bool); !f || doc["successor"] != "b2-b" {
+		t.Fatalf("old branch after the switch: %v", doc)
 	}
 }
 

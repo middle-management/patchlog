@@ -2,7 +2,6 @@ package index
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,9 +15,9 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
-	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/svcedge"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -26,7 +25,7 @@ import (
 const (
 	ccHeadPointer = "public, max-age=0, s-maxage=1, stale-while-revalidate=5"
 	ccImmutable   = "public, max-age=86400, s-maxage=31536000, immutable"
-	ccPrivatePtr  = "private, no-cache"
+	ccPrivatePtr  = "private, no-store"
 	ccPrivateImm  = "private, max-age=300"
 	cdnImmutable  = "max-age=31536000"
 )
@@ -38,6 +37,14 @@ var validNS = client.ValidNSName
 // doesn't tell which private namespaces exist and are indexed.
 const minElsewhere = "min names a namespace the service does not follow or the reader can't see"
 
+// strictMins reads §A.5 literally on a query of one namespace (F-I1): its
+// checkpoint covers that namespace alone, so a min naming any other is
+// 400, as one naming a namespace the current checkpoint doesn't cover. Off,
+// as until the question is answered: the v0.51 behaviour stays, and such a
+// min, naming a namespace the service follows and the reader may see, is
+// waited for and then redirected to the current checkpoint.
+const strictMins = false
+
 // Handler returns the query API (§A.4):
 //
 //	GET /{ns}?…                   302 → /{ns}/at/{checkpoint}?…            (head pointer)
@@ -48,6 +55,9 @@ const minElsewhere = "min names a namespace the service does not follow or the r
 //	GET /{ns}/g/{gs}/at/{ns_id}?… private namespaces: as above, keyed by the
 //	                              reader's subject set gs (§A.4, §B.11.5), the
 //	                              subject set before the checkpoint
+//	GET /{ns}/g/{gs}?…            the head pointer under the subject set's
+//	                              prefix, which its edge grants cover
+//	POST, DELETE /edge-grants     the service's own edge grants (edgegrants.go)
 //
 // The forms before v0.51, /g/{gs}/{ns}?… and /g/{gs}/{ns}/at/{ns_id}?…,
 // are moved permanently (301) to /{ns}?… and /{ns}/g/{gs}/at/{ns_id}?….
@@ -58,8 +68,9 @@ const minElsewhere = "min names a namespace the service does not follow or the r
 // answered 200 while its result for the query is kept; otherwise it is one
 // "the service no longer keeps results for" and is redirected
 // (head-pointer class) to the current one (§A.4). A result served at an
-// ns_id never changes while it is served, and a purge removes it from
-// caches, and from the kept results, through its r: tags.
+// ns_id never changes while it is served, and any purge in its namespace
+// removes it from caches, and from the kept results, through its idx:{ns}
+// tag (§A.1).
 //
 // Redirects name the query in its canonical form (§A.5,
 // derived.CanonicalQuery), and an at URL is answered 200 only in that form
@@ -68,20 +79,29 @@ const minElsewhere = "min names a namespace the service does not follow or the r
 // whose kept result already includes every min to itself without min,
 // anything else to the current checkpoint.
 //
-// Private namespaces need Authorization: Bearer <grant>; a request without
-// the right gs is redirected to it (with min, by the redirect above, into
-// the reader's URL space).
+// Private namespaces need Authorization: Bearer <grant>, which reads only
+// under its own gs: an at URL of another gs is 403; the head pointer and
+// an at URL without /g/{gs} are redirected into the reader's (with min, by
+// the redirect above), private, no-store (§A.4, §B.11.5). A request
+// without Authorization may carry instead an edge grant the service
+// minted for the gs of its URL (Options.EdgeGrants), and is read as that
+// subject set; one with neither is 401.
 //
-// Sealed and e2e namespaces (§E.2.5, §E.2.6; package derived). A result
-// has one source, so a reader of the whole namespace gets it sealed as one
-// JWE under the namespace's current epoch key, Content-Type
-// application/jose, pl { ns, view } where view is the result's request
-// target (/{ns}[/g/{gs}]/at/{ns_id}?{query}, the canonical form). A reader
-// whose grant restricts resources may hold only per-resource keys, so it
-// gets JSON { at, ns, hits, next? } in which each hit keeps resource, id
-// and url in the clear and carries its score, schema and facets as
-// "sealed": JWE under its resource's K_r, pl { ns, name, view }; counts,
-// which aggregate over resources, are refused (400) for such readers.
+// Sealed and e2e namespaces (§E.2.5, §E.2.6; package derived). Every
+// value is sealed under the epoch the revision it derives from is served
+// under (docs.epoch; the current one where that isn't known). A result
+// has one source, so in a private namespace a reader of it whole (marker
+// reads:{ns}) gets it sealed as one JWE under that epoch's key, when
+// every hit (and, with counts, every hit counted) comes from one epoch,
+// Content-Type application/jose, pl { ns, view } where view is the
+// result's request target (/{ns}/g/{gs}/at/{ns_id}?{query}, the
+// canonical form). A public namespace's results, which every reader gets,
+// those of a reader whose grant restricts resources, who may hold only
+// per-resource keys, and those mixing epochs are JSON { at, ns, hits,
+// next? } in which each hit keeps resource, id and url in the clear and
+// carries its score, schema and facets as "sealed": JWE under its
+// resource's K_r of its epoch, pl { ns, name, view }; counts, which
+// aggregate over resources, are refused (400) there.
 // Sealed results are produced once per view (so per epoch: a rotation
 // moves the checkpoint), stored in the database with their cache tags, and
 // served unchanged, across restarts, until a purge with one of those tags
@@ -101,6 +121,12 @@ func (ix *Index) Handler() http.Handler {
 }
 
 func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/edge-grants" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		// The index's own edge grants (edgegrants.go); a GET is a query
+		// of a namespace of that name, as any other.
+		ix.serveEdgeGrants(w, r)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		writeErr(w, http.StatusMethodNotAllowed, "bad_input", "method not allowed")
@@ -123,6 +149,12 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(segs) == 3 && segs[1] == "at":
 		ns, at, isAt = segs[0], segs[2], true
 		telemetry.SetRoute(r, "/{ns}/at/{at}")
+	case len(segs) == 3 && segs[1] == "g":
+		// The head pointer under a subject set's prefix, which its edge
+		// grants cover (§B.11.5). No subject set is "g", so the form
+		// before v0.51 below, /g/{gs}/{ns}, never matches here.
+		ns, gs = segs[0], segs[2]
+		telemetry.SetRoute(r, "/{ns}/g/{gs}")
 	case len(segs) == 5 && segs[1] == "g" && segs[3] == "at":
 		ns, gs, at, isAt = segs[0], segs[2], segs[4], true
 		telemetry.SetRoute(r, "/{ns}/g/{gs}/at/{at}")
@@ -165,9 +197,32 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 // access is the outcome of the read check for one request.
 type access struct {
 	public bool
-	v      *grant.Verified
-	all    bool   // reads every resource: no per-resource filtering
-	gs     string // subject-set id (private only)
+	v      *grant.Verified // nil under an edge grant (cookie)
+	all    bool            // reads every resource: no per-resource filtering
+	marker string          // what the reader's answers depend on (private only, §A.4)
+	gs     string          // subject-set id over marker (private only)
+	// allow is the per-resource read check of a reader that isn't all:
+	// the grant's, or under an edge grant the filter its marker stands
+	// for (readFilter).
+	allow func(resource string) bool
+	// filter is what a scope marker stands for, which an edge grant
+	// minted for it authorises from (readFilter).
+	filter *readFilter
+	cookie bool // read under one of the service's edge grants
+}
+
+// writeLimit answers a grant over grantSize or rulesPerGrant, which the
+// checker decodes as a *grantcheck.LimitError, as the origin answers it:
+// 413, code limit, naming the limit (§C.8), as the tree and catalog
+// services do (§C.6); a public namespace's reads ignore the grant, so
+// this comes up only where one is used. It reports whether it answered.
+func writeLimit(w http.ResponseWriter, err error) bool {
+	var le *grantcheck.LimitError
+	if !errors.As(err, &le) {
+		return false
+	}
+	svcedge.Limit(le.Limit, le.Measured, le.Max).Write(w)
+	return true
 }
 
 func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*access, error) {
@@ -180,48 +235,55 @@ func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*acces
 	}
 	token := bearer(r)
 	if token == "" {
+		// One of the service's edge grants for this namespace's subject
+		// set, on a request without Authorization (edgegrants.go).
+		if a, ok, err := ix.cookieAccess(ctx, ns, r); ok || err != nil {
+			return a, err
+		}
 		return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
 	}
 	v, err := ix.checker.Verify(ctx, ns, token)
 	if err != nil {
 		return nil, err
 	}
+	return ix.grantAccess(ns, v)
+}
+
+// grantAccess is access to private namespace ns for v, a grant verified
+// there.
+func (ix *Index) grantAccess(ns string, v *grant.Verified) (*access, error) {
 	if ok, _ := v.Allows("read"); !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
 	}
-	// A grant that reads the namespace unrestricted (§2.1) reads every
-	// resource; one whose reads can't differ between resources and that
-	// doesn't reads none.
-	a := &access{v: v, all: ix.checker.ReadsUnrestricted(v)}
-	if !a.all && !ix.checker.ReadsPerResource(v) {
+	// Results are keyed by a subject set over the reader's marker (§A.4,
+	// as /_refs computes it, §B.11.5): reads:{ns} for a grant that would
+	// be issued a namespace-wide edge grant (§C.5.2), which reads every
+	// resource, so all such readers share results whatever their subjects;
+	// reads:{ns}:scope:{digest} for one that reads only what its rules
+	// allow, digest covering those rules and the /principal values they
+	// refer to (readsScope), so readers limited alike share them. Where
+	// those rules refer to /now the namespace counts as unreadable: a
+	// result at an at can't change with the clock.
+	if ix.checker.NamespaceWide(v) {
+		return marked(&access{v: v, all: true, marker: "reads:" + ns}), nil
+	}
+	digest, ok := readsScope(v)
+	if !ok {
+		return nil, &grant.AuthError{Status: 403, Msg: "a rule limiting the grant's reads refers to /now"}
+	}
+	// One whose reads can't differ between resources, and that doesn't
+	// read the namespace whole now, reads none of it.
+	if !ix.checker.ReadsPerResource(v) {
 		return nil, &grant.AuthError{Status: 403, Msg: "a grant or key rule refuses the read"}
 	}
-	// §B.11.5: results are keyed by the reader's subject set. Readers of the
-	// whole namespace see the same hits, so their key is just their groups
-	// (users share caches with their groups). A reader whose grant restricts
-	// resources sees a filtered list that depends on the grant itself, so
-	// its key also carries the subject and a digest of everything the
-	// filter reads (principal and rules); it shares only with identical
-	// grants.
-	subjects := grantcheck.SubjectSet(v, !a.all)
-	if !a.all {
-		subjects = append(subjects, "scope:"+scopeDigest(v))
-	}
-	a.gs = grantcheck.SubjectSetID(subjects)
-	return a, nil
+	return marked(&access{v: v, marker: "reads:" + ns + ":scope:" + digest, filter: filterOf(v),
+		allow: func(resource string) bool { return ix.checker.AllowsRead(v, resource) }}), nil
 }
 
-func scopeDigest(v *grant.Verified) string {
-	roles := map[string]any{}
-	for _, role := range v.EffectiveRoles {
-		roles[role] = v.RoleRules(role)
-	}
-	x := map[string]any{
-		"principal": v.Principal.Envelope(), "key": v.Key.Kid, "readScope": v.Key.ReadScopeResource,
-		"keyRules": v.KeyRules, "blockRules": v.BlockRules, "roles": roles,
-	}
-	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo(x)))
-	return ids.FromBytes(sum[:ids.Size]).String()
+// marked sets a's gs, the subject set of its marker alone.
+func marked(a *access) *access {
+	a.gs = grantcheck.SubjectSetID([]string{a.marker})
+	return a
 }
 
 func bearer(r *http.Request) string {
@@ -244,21 +306,37 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	ctx := r.Context()
 	vals := r.URL.Query()
 	q, err := ParseQuery(vals)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
+	var bad *MinError
+	if err != nil && !errors.As(err, &bad) {
+		writeQueryErr(w, err)
 		return
 	}
 	a, err := ix.access(ctx, ns, r)
+	if bad != nil {
+		// Malformed mins are 400 whoever asks, as before the read check;
+		// to a reader who passes it, the 400 lists every other min refused
+		// too, so that one 400 names every min refused (§A.5).
+		if err == nil {
+			if refused, _, err := ix.judgeMins(ctx, r, ns, q.Mins, strictMins); err == nil {
+				bad = bad.With(vals["min"], refused, minElsewhere)
+			}
+		}
+		writeMinErr(w, bad)
+		return
+	}
 	if client.IsPurged(err) {
 		// A purged sealed namespace's document is 410 too (§8.5): the
 		// core makes the read check before answering it, as below.
 		var head string
-		if head, err = ix.checker.PurgedRead(ctx, ns, bearer(r)); err == nil {
+		if head, err = ix.purgedRead(ctx, ns, r, err); err == nil {
 			writePurged(w, head)
 			return
 		}
 	}
 	if err != nil {
+		if writeLimit(w, err) {
+			return
+		}
 		var ae *grant.AuthError
 		if errors.As(err, &ae) {
 			code := "forbidden"
@@ -292,8 +370,12 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		return
 	}
 	// Keys the service fails to fetch for now (lacking them is the 404
-	// above): behind, as before its first checkpoint (§A.4, §12.1).
-	if reason, _ := ix.keys.Skip(ns); reason != "" {
+	// above, which a config change the follower delivered meanwhile may
+	// have made so): behind, as before its first checkpoint (§A.4, §12.1).
+	if reason, lacks := ix.keys.Skip(ns); lacks {
+		writeErr(w, http.StatusNotFound, "not_found", "namespace not indexed")
+		return
+	} else if reason != "" {
 		writeBehind(w, "the index cannot obtain the keys of the namespace yet")
 		return
 	}
@@ -302,8 +384,9 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			w.Header().Set("Cache-Control", ccHeadPointer)
 			w.Header().Set("Cache-Tag", "ns:"+ns)
 		} else {
-			// A pointer depends on the caller's grant: no shared cache
-			// keeps it, behind a verifying edge or not.
+			// A pointer depends on the caller's grant: no cache keeps
+			// it, behind a verifying edge or not, and one that adds
+			// /g/{gs} is private, no-store (§A.4, §B.11.5).
 			w.Header().Set("Cache-Control", ccPrivatePtr)
 			w.Header().Set("CDN-Cache-Control", "no-store")
 			w.Header().Set("Surrogate-Control", "no-store")
@@ -311,52 +394,44 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		}
 	}
 	// The reader's URL space: public, or keyed by its subject set. The
-	// head pointer /{ns} is everyone's, and redirects there below; an at
-	// URL of another space is redirected to the same at in the reader's.
-	// With min, the redirects below land there, without min (§A.5).
-	if isAt && gs != a.gs && len(q.Mins) == 0 {
-		setPtrHeaders()
-		redirect(w, base(a, ns)+"/at/"+at+derived.CanonicalQuery(vals))
+	// head pointer /{ns} is everyone's, and redirects there below. A grant
+	// reads only at its own gs (§A.4, §B.11.5): an at URL of another
+	// subject set is 403, with or without min, never redirected. An at URL
+	// without /g/{gs} of a private namespace, or one with it of a public
+	// one, which no grant decides, is redirected to the same at in the
+	// reader's space; with min, the redirects below land there, without
+	// min (§A.5).
+	if !isAt && gs != "" && gs != a.gs && !a.public {
+		// The head pointer under another subject set's prefix (§B.11.5).
+		w.Header().Set("Cache-Control", "no-store")
+		writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
 		return
 	}
-	// A min naming another namespace, which this URL's at doesn't cover,
-	// goes to the current checkpoint once reached (atIncludes judges only
-	// ns), in one hop, if the service follows it and the reader may see
-	// it; any other is 400 (§A.5), with one message either way, as in
-	// /_refs, so a min doesn't tell which private namespaces are indexed.
-	// A namespace whose keys the service lacks is one it doesn't follow
-	// (§A.4): no checkpoint will cover it.
-	lacks := func(other string) bool { _, l := ix.keys.Skip(other); return l }
-	for i, m := range q.Mins {
-		switch {
-		case m.NS == "":
-			q.Mins[i].NS = ns
-		case m.NS == ns:
-		case !ix.known(m.NS) || lacks(m.NS):
+	if isAt && gs != a.gs {
+		if gs != "" && !a.public {
 			w.Header().Set("Cache-Control", "no-store")
-			writeErr(w, http.StatusBadRequest, "bad_input", minElsewhere)
+			writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
 			return
-		default:
-			_, err := ix.access(ctx, m.NS, r)
-			if client.IsPurged(err) {
-				// A purged sealed namespace's document is 410 (§8.5):
-				// the core makes the read check, as for ns above, and a
-				// reader who passes goes to the current checkpoint, which
-				// has reached the purge.
-				_, err = ix.checker.PurgedRead(ctx, m.NS, bearer(r))
-			}
-			if err != nil {
-				var ae *grant.AuthError
-				w.Header().Set("Cache-Control", "no-store")
-				if !errors.As(err, &ae) {
-					ix.opt.Logf("index: access check for %s: %v", m.NS, err)
-					writeErr(w, http.StatusBadGateway, "upstream", "cannot read the namespace configuration")
-					return
-				}
-				writeErr(w, http.StatusBadRequest, "bad_input", minElsewhere)
-				return
-			}
 		}
+		if len(q.Mins) == 0 {
+			setPtrHeaders()
+			redirect(w, base(a, ns)+"/at/"+at+derived.CanonicalQuery(vals))
+			return
+		}
+	}
+	refused, behind, err := ix.judgeMins(ctx, r, ns, q.Mins, strictMins)
+	switch {
+	case err != nil:
+		ix.opt.Logf("index: access check for a min: %v", err)
+		w.Header().Set("Cache-Control", "no-store")
+		writeErr(w, http.StatusBadGateway, "upstream", "cannot read the namespace configuration")
+		return
+	case len(refused) > 0:
+		writeMinRefused(w, refused)
+		return
+	case behind:
+		writeBehind(w, "the index cannot obtain the keys of a namespace min names yet")
+		return
 	}
 	// target is the canonical URL of this query's result at an ns_id (§A.5):
 	// what redirects name, what results are kept under, and in a sealed or
@@ -427,11 +502,11 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// computed, the at URL says why.
 		to := cur
 		if _, _, ok := ix.kept.Get(target(cur)); !ok {
-			if info, key, err := ix.keys.Current(ctx, ns); err == nil {
+			if info, _, err := ix.keys.Current(ctx, ns); err == nil {
 				var fe *FieldError
-				if _, got, err := ix.answer(ctx, a, ns, vals, q, info, key); err == nil {
+				if _, got, err := ix.answer(ctx, a, ns, vals, q, info); err == nil {
 					to = got
-				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) {
+				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) {
 					ix.opt.Logf("index: query %s: %v", r.URL, err)
 				}
 			}
@@ -446,7 +521,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		return
 	}
 
-	info, key, err := ix.keys.Current(ctx, ns)
+	info, _, err := ix.keys.Current(ctx, ns)
 	if err != nil {
 		// The key that seals results can't be had: behind (§12.1), no
 		// code of its own.
@@ -462,14 +537,17 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			return
 		}
 	}
-	st, got, err := ix.answer(ctx, a, ns, vals, q, info, key)
+	st, got, err := ix.answer(ctx, a, ns, vals, q, info)
 	var fe *FieldError
 	switch {
 	case errors.As(err, &fe):
 		writeErr(w, http.StatusBadRequest, "bad_input", fe.Error())
 		return
-	case errors.Is(err, errCounts):
+	case errors.Is(err, errCounts) || errors.Is(err, errEpochCounts):
 		writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
+		return
+	case errors.Is(err, errEpochKey):
+		writeBehind(w, err.Error()) // §12.1: no code of its own
 		return
 	case errors.Is(err, errSchemas):
 		ix.opt.Logf("index: query %s: %v", r.URL, err)
@@ -490,26 +568,87 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	ix.writeStored(w, r, a, at, st)
 }
 
-// errCounts refuses counts over a sealed namespace to a reader whose grant
-// restricts resources (400): counts aggregate over resources, and such a
-// reader may hold only per-resource keys.
-var errCounts = errors.New("counts over a sealed namespace need a grant that reads the whole namespace")
+// errCounts refuses counts over a sealed namespace to a reader whose
+// results are sealed per entry (400, §E.2.6 Aggregates): counts aggregate
+// over resources, so they have no entry of their own.
+var errCounts = errors.New("counts over a sealed namespace are served only sealed whole, to a grant that reads the whole private namespace")
+
+// errEpochCounts refuses counts over documents served under several
+// epochs (400, §E.2.6): a result is sealed whole only when every value in
+// it derives from revisions served under one epoch, and counts are served
+// only sealed whole.
+var errEpochCounts = errors.New("counts over documents served under several epochs can't be sealed whole under one epoch's key, and are served only sealed whole (§E.2.6)")
+
+// errEpochKey is a key of an epoch a hit's document is served under, which
+// seals it (§E.2.6), that the service can't obtain for now: 503 behind.
+var errEpochKey = errors.New("the index cannot obtain the key of an epoch a hit is served under")
 
 // answer runs q at the current checkpoint in one read transaction, builds
 // its result, sealed in a sealed or e2e namespace, keeps it (and stores a
 // sealed one), and returns the result kept with the checkpoint it is at.
-func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Values, q *Query, info derived.Info, key derived.Key) (derived.Stored, string, error) {
-	if info.Protected() && !a.all && len(q.Counts) > 0 {
+//
+// Each sealed value is sealed under the epoch the revision it derives
+// from is served under (§E.2.6; derived.EpochOf, docs.epoch), the epoch
+// current now where that isn't known: a hit under that epoch's K_r of its
+// resource. A result is sealed whole only when its source isn't public,
+// every reader its URL admits reads it whole, under reads:{ns}, and every
+// value derives from revisions served under one epoch, under that
+// epoch's K_e (§E.2.6 Whole-response sealing); otherwise it is sealed per
+// entry, and counts, which have no entry, are 400.
+func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Values, q *Query, info derived.Info) (derived.Stored, string, error) {
+	// A public sealed namespace's results, which anyone reads, and a
+	// limited reader's, are sealed per entry whatever their epochs.
+	perEntry := info.Protected() && (a.public || !a.all)
+	if perEntry && len(q.Counts) > 0 {
 		return derived.Stored{}, "", errCounts
+	}
+	keys := map[int]derived.Key{}
+	keyAt := func(epoch int) (derived.Key, error) {
+		if epoch <= 0 {
+			epoch = info.Epoch
+		}
+		if k, ok := keys[epoch]; ok {
+			return k, nil
+		}
+		k, err := ix.keys.KeyAt(ctx, ns, epoch)
+		if err != nil {
+			ix.opt.Logf("index: key of %s epoch %d: %v", ns, epoch, err)
+			return k, fmt.Errorf("%w (%s#%d)", errEpochKey, ns, epoch)
+		}
+		keys[epoch] = k
+		return k, nil
 	}
 	var allow func(string) bool
 	if !a.all {
-		allow = func(resource string) bool { return ix.checker.AllowsRead(a.v, resource) }
+		allow = a.allow
 	}
 	gen := ix.kept.Generation(ns)
+	q.epochs = info.Protected()
 	res, at, err := ix.query(ctx, ns, q, allow)
 	if err != nil {
 		return derived.Stored{}, "", err
+	}
+	// The one epoch every value derives from, for a result sealed whole.
+	whole := 0
+	if info.Protected() && !perEntry {
+		epochs := map[int]bool{}
+		for _, e := range res.Epochs {
+			if e <= 0 {
+				e = info.Epoch
+			}
+			epochs[e] = true
+		}
+		switch {
+		case len(epochs) > 1 && len(q.Counts) > 0:
+			return derived.Stored{}, "", errEpochCounts
+		case len(epochs) > 1:
+			perEntry = true
+		default:
+			whole = info.Epoch
+			for e := range epochs {
+				whole = e
+			}
+		}
 	}
 	view := derived.View{NS: ns, Target: base(a, ns) + "/at/" + at + derived.CanonicalQuery(vals, "min")}
 	body := map[string]any{"at": at, "ns": ns}
@@ -540,7 +679,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		if h.Self {
 			m["self"] = true
 		}
-		if info.Protected() && !a.all {
+		if perEntry {
 			// Per-entry sealing: what the document gave (score, schema,
 			// facets) under its resource's key; names, ids and URLs stay.
 			values := map[string]any{}
@@ -548,6 +687,10 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 				if k != "resource" && k != "id" && k != "url" {
 					values[k] = v
 				}
+			}
+			key, err := keyAt(h.epoch)
+			if err != nil {
+				return derived.Stored{}, "", err
 			}
 			jwe, err := derived.SealItem(key, view, h.Resource, values)
 			if err != nil {
@@ -570,9 +713,15 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		body["counts"] = res.Counts
 	}
 	st := derived.Stored{JSON: true, Tags: resultTags(ns, res)}
-	if info.Protected() && a.all {
-		var jwe string
-		jwe, err = derived.SealView(key, view, body)
+	if info.Protected() && !perEntry {
+		key, err := keyAt(whole)
+		if err != nil {
+			return derived.Stored{}, "", err
+		}
+		jwe, err := derived.SealView(key, view, body)
+		if err != nil {
+			return derived.Stored{}, "", fmt.Errorf("encoding a result: %w", err)
+		}
 		st.Body, st.JSON = []byte(jwe), false
 	} else {
 		st.Body, err = derived.Marshal(body)
@@ -645,17 +794,11 @@ func (ix *Index) serveStatus(w http.ResponseWriter) {
 
 // resultTags is a result's Cache-Tag.
 func resultTags(ns string, res *Result) string {
-	// §A.4: idx:{ns} for the namespace, r:{ns}/{name} for every resource
-	// the result shows, so a purge of any of them removes it from caches
-	// (Apply purges these). Facet counts aggregate values of hits beyond
-	// the page too, so a result with counts also carries a counts tag
-	// that every resource purge in the namespace clears.
+	// §A.4: idx:{ns} for the namespace, which every purge in it purges
+	// (Apply), and r:{ns}/{name} for every resource the result shows.
 	tags := []string{"idx:" + ns}
 	for _, h := range res.Hits {
 		tags = append(tags, "r:"+ns+"/"+h.Resource)
-	}
-	if res.Counts != nil {
-		tags = append(tags, countsTag(ns))
 	}
 	return strings.Join(tags, ",")
 }
@@ -695,10 +838,6 @@ func (ix *Index) committed(ctx context.Context, ns string) (string, bool, error)
 	return id, purged, err
 }
 
-// countsTag tags results with facet counts, which can reflect any resource
-// of the namespace.
-func countsTag(ns string) string { return "idx:" + ns + ":counts" }
-
 // atIncludes reports whether the kept result of ns at an older at, which
 // url names, already includes every min (§A.5 "min always redirects"),
 // once waitMins has waited for them: each names ns (a min of another
@@ -730,6 +869,57 @@ func (ix *Index) atIncludes(ctx context.Context, ns, at string, mins []MinRef, u
 		}
 	}
 	return true
+}
+
+// judgeMins judges the mins of a query of ns (a bare one names ns, and is
+// set to) before any is waited for (§A.5). A min naming another namespace,
+// which this URL's at doesn't cover, goes to the current checkpoint once
+// reached (atIncludes judges only ns), in one hop, if the service follows
+// it and the reader may see it; with strict, or naming any other, it is
+// refused. refused lists every refused min as given, so the 400 names them
+// all, with one message whatever the reason, as in /_refs, so a min
+// doesn't tell which private namespaces are indexed. A namespace whose keys
+// the service lacks is one it doesn't follow (§A.4): no checkpoint will
+// cover it. One whose keys it can't fetch for now is behind (§12.1), as a
+// query of it is, and as /_refs answers it: the reader may see it, so a
+// 400 would have its tool drop a min it can still wait for. err is a
+// namespace document the service can't read (502).
+func (ix *Index) judgeMins(ctx context.Context, r *http.Request, ns string, mins []MinRef, strict bool) (refused []string, behind bool, err error) {
+	for i, m := range mins {
+		switch {
+		case m.NS == "":
+			mins[i].NS = ns
+			continue
+		case m.NS == ns:
+			continue
+		case strict || !ix.known(m.NS):
+			refused = append(refused, m.String())
+			continue
+		}
+		reason, lacks := ix.keys.Skip(m.NS)
+		if lacks {
+			refused = append(refused, m.String())
+			continue
+		}
+		_, err := ix.access(ctx, m.NS, r)
+		if client.IsPurged(err) {
+			// A purged sealed namespace's document is 410 (§8.5): the core
+			// makes the read check, as for ns, and a reader who passes goes
+			// to the current checkpoint, which has reached the purge.
+			_, err = ix.checker.PurgedRead(ctx, m.NS, bearer(r))
+			reason = ""
+		}
+		var ae *grant.AuthError
+		switch {
+		case errors.As(err, &ae):
+			refused = append(refused, m.String())
+		case err != nil:
+			return nil, false, fmt.Errorf("%s: %w", m.NS, err)
+		case reason != "":
+			behind = true
+		}
+	}
+	return refused, behind, nil
 }
 
 // waitMins waits, within one MinWait budget, until every min is reached.
@@ -801,6 +991,29 @@ func writeBehind(w http.ResponseWriter, msg string) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Retry-After", "1")
 	writeErr(w, http.StatusServiceUnavailable, "behind", msg)
+}
+
+// writeMinRefused answers 400 for refused mins (§A.5, §12.1): no-store,
+// with every one refused, as given, in the body's min, and one message for
+// a namespace the reader can't see and one the service doesn't follow.
+func writeMinRefused(w http.ResponseWriter, refused []string) {
+	writeMinErr(w, &MinError{Msg: minElsewhere, Refused: refused})
+}
+
+func writeMinErr(w http.ResponseWriter, e *MinError) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusBadRequest, map[string]any{"code": "bad_input", "message": e.Msg, "min": e.Refused})
+}
+
+// writeQueryErr answers a query that doesn't parse: 400, listing malformed
+// mins as refused ones are.
+func writeQueryErr(w http.ResponseWriter, err error) {
+	var me *MinError
+	if errors.As(err, &me) {
+		writeMinErr(w, me)
+		return
+	}
+	writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
 }
 
 // writePurged answers 410 purged with head, the namespace's purge-ns entry,

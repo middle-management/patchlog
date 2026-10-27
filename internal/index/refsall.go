@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,17 +44,22 @@ import (
 // and maximum as for other queries), strictly after after, {ns}/{name}
 // compared as the pair split at its first "/"; next is the after of the
 // following page. ?min={ns}:{ns_id}, repeatable, waits as elsewhere
-// (§A.5); a min for a namespace the answer doesn't cover is 400. min always
-// redirects (§A.5): once every min is reached, on an at URL whose answer
-// is kept and includes every min, to that URL without min, otherwise to
-// the current at, in the reader's subject set either way. Redirects name the query in its canonical form (§A.5,
+// (§A.5); a min naming a purged namespace the service follows counts as
+// reached, without a read check, one naming a namespace whose keys it
+// can't fetch for now is 503 behind if the reader may see it, and one for
+// any other namespace the answer doesn't cover is 400, the body's min
+// listing every one refused (refsMins). min always redirects (§A.5): once
+// every min is reached, on an at URL whose answer is kept and includes
+// every min, to that URL without min, otherwise (and after a purged one)
+// to the current at, in the reader's subject set either way. Redirects
+// name the query in its canonical form (§A.5,
 // derived.CanonicalQuery), and an at URL in another form is redirected to
 // it.
 //
 // gs is computed as for subject sets (§B.11.5), over markers of what the
-// answer depends on: for every private namespace the reader reads
-// unrestricted (§2.1), reads:{ns}, or for a grant that reads only some of
-// its resources (whose hits are filtered per resource)
+// answer depends on (Index.access): for every private namespace where the
+// reader's grant would be issued a namespace-wide edge grant (§C.5.2),
+// reads:{ns}, or where it reads otherwise (its hits filtered per resource)
 // reads:{ns}:scope:{digest}, digest covering the rules its reads there are
 // judged by and the /principal values they refer to (readsScope); a
 // namespace where those rules refer to /now counts as unreadable. A
@@ -66,8 +72,9 @@ import (
 // left out, as one the reader can't see.
 //
 // Hits from sealed and e2e namespaces carry ns, resource, id and url in the
-// clear and the rest as "sealed": a JWE under the resource's K_r, pl { ns,
-// name, view }, view being the at URL (§E.2.6 per-entry sealing). An answer
+// clear and the rest as "sealed": a JWE under the resource's K_r of the
+// epoch its document's head is served under (docs.epoch), pl { ns, name,
+// view }, view being the at URL (§E.2.6 per-entry sealing). An answer
 // with sealed hits is also stored (derived.Cache) while its at is current,
 // so it is sealed once.
 //
@@ -92,13 +99,26 @@ type refsQuery struct {
 	afterNS, afterName string // after, split at its first "/"
 }
 
+// parseRefsQuery parses a /_refs query. Mins it refuses as given, every
+// bare one (no namespace is the queried one here) and malformed ones, are
+// a *MinError returned with the query, its other mins in mins, as
+// ParseQuery returns them.
 func parseRefsQuery(v url.Values) (*refsQuery, error) {
 	pv := url.Values{}
+	var bare []string
 	for k, vals := range v {
 		switch k {
 		case "to", "after":
-		case "min", "limit":
+		case "limit":
 			pv[k] = vals
+		case "min":
+			for _, s := range vals {
+				if strings.Contains(s, ":") {
+					pv[k] = append(pv[k], s)
+				} else {
+					bare = append(bare, s)
+				}
+			}
 		default:
 			return nil, fmt.Errorf("unknown parameter %q", k)
 		}
@@ -114,20 +134,20 @@ func parseRefsQuery(v url.Values) (*refsQuery, error) {
 		return nil, fmt.Errorf("to: %v", err)
 	}
 	q, err := ParseQuery(pv)
-	if err != nil {
+	var bad *MinError
+	if err != nil && !errors.As(err, &bad) {
 		return nil, err
 	}
-	for _, m := range q.Mins {
-		if m.NS == "" {
-			return nil, errors.New("min must be {ns}:{ns_id}")
-		}
-	}
+	bad = bad.With(v["min"], bare, "min must be {ns}:{ns_id}")
 	rq := &refsQuery{ref: ref, mins: q.Mins, limit: q.Limit}
 	if s := v.Get("after"); s != "" {
 		var ok bool
 		if rq.afterNS, rq.afterName, ok = strings.Cut(s, "/"); !ok {
 			return nil, errors.New("after must be {ns}/{name}")
 		}
+	}
+	if bad != nil {
+		return rq, bad
 	}
 	return rq, nil
 }
@@ -138,6 +158,11 @@ type refsReader struct {
 	public bool                         // reads no private namespace: the answer is public
 	nss    []string                     // the namespaces asked, sorted
 	allow  map[string]func(string) bool // namespaces it reads only in part
+	// unverified: the request carries no grant the service verified in a
+	// private namespace it names (§B.11.5): none, one that doesn't decode,
+	// or one refused 401 wherever it was checked (malformed, badly signed,
+	// revoked, expired or not yet valid, §C.2, §12.1).
+	unverified bool
 }
 
 // refsNamespaces lists the namespaces the index serves (known), sorted.
@@ -164,19 +189,33 @@ func (ix *Index) refsNamespaces() []string {
 // ones out) and not skipped: a namespace the reader may not read is left
 // out, and if that leaves none, the answer is a refusal that names none of
 // them (one the reader can't see is like one the service doesn't follow):
-// 401 if any refusal is, else 403.
+// 401 if any refusal is, else 403. Otherwise it notes whether the grant
+// verified (unverified), which decides the refusal at another gs's URL.
 func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[string]string) (*refsReader, error) {
+	if bearer(r) == "" {
+		// One of the service's edge grants for /_refs/g/{gs}, on a
+		// request without Authorization (edgegrants.go).
+		if rd, ok, err := ix.refsCookieReader(ctx, r, reached); ok || err != nil {
+			return rd, err
+		}
+	}
 	rd := &refsReader{public: true, allow: map[string]func(string) bool{}}
 	var (
-		markers []string
-		refused int
+		markers  []string
+		refused  int
+		verified bool
 	)
 	refuse := func(status int) {
 		if refused != 401 {
 			refused = status
 		}
 	}
-	g, _ := ix.checker.Decode(bearer(r)) // nil: no usable grant
+	// nil: no usable grant. One over grantSize or rulesPerGrant is 413
+	// at the first namespace that doesn't ignore it (§C.8), before its ns
+	// check: a public one ignores it.
+	g, derr := ix.checker.Decode(bearer(r))
+	var over *grantcheck.LimitError
+	errors.As(derr, &over)
 	for _, ns := range ix.refsNamespaces() {
 		if _, ok := reached[ns]; !ok || ix.keys.Skipped(ns) != "" {
 			continue
@@ -187,26 +226,28 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			// its document is 410 (§8.5), and it is left out as above.
 			continue
 		}
+		// A private namespace the grant names verifies it (access): a
+		// refusal there is 401 if it doesn't verify, 403 once it does.
 		var ae *grant.AuthError
+		if errors.As(err, &ae) && over != nil {
+			return nil, over
+		}
 		if errors.As(err, &ae) {
 			refuse(ae.Status)
+			verified = verified || (ae.Status != 401 && g != nil && g.NamesNS(ns))
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
 		if !a.public {
-			marker := "reads:" + ns
+			verified = true
+			// access marks it (§A.4), and refuses a namespace whose
+			// read rules refer to /now.
 			if !a.all {
-				digest, ok := readsScope(a.v)
-				if !ok {
-					refuse(403)
-					continue
-				}
-				marker += ":scope:" + digest
-				rd.allow[ns] = func(name string) bool { return ix.checker.AllowsRead(a.v, name) }
+				rd.allow[ns] = a.allow
 			}
-			rd.public, markers = false, append(markers, marker)
+			rd.public, markers = false, append(markers, a.marker)
 		}
 		rd.nss = append(rd.nss, ns)
 	}
@@ -218,6 +259,7 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant reads no namespace the service follows"}
 	}
 	rd.gs = grantcheck.SubjectSetID(markers)
+	rd.unverified = !verified
 	return rd, nil
 }
 
@@ -319,6 +361,15 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 			writeErr(w, http.StatusNotFound, "not_found", "malformed subject set")
 			return
 		}
+	case len(segs) == 3 && segs[1] == "g":
+		// The head pointer under a subject set's prefix, which its edge
+		// grants cover (§B.11.5).
+		gs = segs[2]
+		telemetry.SetRoute(r, "/_refs/g/{gs}")
+		if _, err := ids.Parse(gs); err != nil {
+			writeErr(w, http.StatusNotFound, "not_found", "malformed subject set")
+			return
+		}
 	default:
 		writeErr(w, http.StatusNotFound, "not_found", "not found")
 		return
@@ -326,8 +377,13 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	ctx := r.Context()
 	vals := r.URL.Query()
 	rq, err := parseRefsQuery(vals)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
+	var bad *MinError
+	switch {
+	case errors.As(err, &bad):
+		ix.refsBadMins(w, r, rq, bad)
+		return
+	case err != nil:
+		writeQueryErr(w, err)
 		return
 	}
 	// The namespaces the answer may cover: reached and not purged as
@@ -341,6 +397,9 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	}
 	rd, err := ix.refsReader(ctx, r, reached)
 	if err != nil {
+		if writeLimit(w, err) {
+			return
+		}
 		var ae *grant.AuthError
 		if errors.As(err, &ae) {
 			code := "forbidden"
@@ -371,20 +430,36 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 			w.Header().Set("Surrogate-Control", "no-store")
 		}
 	}
-	// Another subject set's URL space: redirected into the reader's. With
-	// min, the redirects below land there, without min (§A.5).
-	if at != "" && gs != rd.gs && len(rq.mins) == 0 {
-		setPtr()
-		redirect(w, "/_refs/g/"+rd.gs+"/at/"+at+derived.CanonicalQuery(vals))
-		return
-	}
-	for _, m := range rq.mins {
-		if !slices.Contains(rd.nss, m.NS) {
-			w.Header().Set("Cache-Control", "no-store")
-			writeErr(w, http.StatusBadRequest, "bad_input", minElsewhere)
+	// Another subject set's URL space: a grant reads only at its own gs
+	// (§A.4, §B.11.5), so it is 403 there, with or without min, never
+	// redirected; a request without one the service verifies, which needs
+	// one for that gs, is 401, as a query of one namespace answers it
+	// (§B.11.5, §12.1). Only the pointer redirects into the reader's.
+	if gs != "" && gs != rd.gs {
+		w.Header().Set("Cache-Control", "no-store")
+		if rd.unverified {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeErr(w, http.StatusUnauthorized, "unauthenticated", "missing or unverifiable grant")
 			return
 		}
+		writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
+		return
 	}
+	mins, purged, refused, behind, err := ix.refsMins(ctx, r, rd, rq.mins)
+	switch {
+	case err != nil:
+		ix.opt.Logf("index: access check for a min of /_refs: %v", err)
+		w.Header().Set("Cache-Control", "no-store")
+		writeErr(w, http.StatusBadGateway, "upstream", "cannot read a namespace configuration")
+		return
+	case len(refused) > 0:
+		writeMinRefused(w, refused)
+		return
+	case behind:
+		writeBehind(w, "the index cannot obtain the keys of a namespace min names yet")
+		return
+	}
+	rq.mins = mins
 	// target is the canonical URL of the answer at an at (§A.5): what
 	// redirects name, what answers are kept under, and the view a sealed
 	// hit is bound to (§E.2.6). Only it is answered 200: another form of
@@ -398,7 +473,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached min yet")
 		return
 	}
-	if at != "" {
+	if at != "" && !purged {
 		if st, _, ok := ix.refsStored(ctx, rd, target(at)); ok && ix.refsIncludes(ctx, st, rq.mins) {
 			// A kept answer, whose at already includes every min:
 			// answered there, at its canonical URL without min (§A.5).
@@ -429,6 +504,90 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		return
 	}
 	ix.writeRefs(w, r, rd, cur, st)
+}
+
+// refsBadMins answers a /_refs request with mins refused as given (bad,
+// from parseRefsQuery): 400 whoever asks, as before the read check, listing
+// for a reader that check admits every other min refused too (refsMins),
+// so that one 400 names every min refused (§A.5).
+func (ix *Index) refsBadMins(w http.ResponseWriter, r *http.Request, rq *refsQuery, bad *MinError) {
+	ctx := r.Context()
+	if reached, err := ix.refsCheckpoints(ctx, ix.db, ix.refsNamespaces()); err == nil {
+		if rd, err := ix.refsReader(ctx, r, reached); err == nil {
+			if _, _, refused, _, err := ix.refsMins(ctx, r, rd, rq.mins); err == nil {
+				bad = bad.With(r.URL.Query()["min"], refused, minElsewhere)
+			}
+		}
+	}
+	writeMinErr(w, bad)
+}
+
+// refsMins judges the mins of a /_refs request before any is waited for
+// (§A.4 Coverage, §A.5) and returns those to wait for. A min naming a
+// namespace the answer covers stays. One naming a purged namespace the
+// service follows counts as reached, without a read check, a purge being
+// no secret (§E.4): purged reports it, and the answer then goes to the
+// current at. One naming a namespace whose keys the service can't fetch
+// for now, which the answer leaves out until it can, is behind (§12.1),
+// as a query of it is, if the reader may see it. Any other is refused:
+// refused lists every one, as given, for one 400 whose message doesn't
+// tell a namespace the reader can't see from one the service doesn't
+// follow. err is the document of a namespace the grant names that the
+// service can't read (502).
+func (ix *Index) refsMins(ctx context.Context, r *http.Request, rd *refsReader, mins []MinRef) (keep []MinRef, purged bool, refused []string, behind bool, err error) {
+	var (
+		g       *grant.Grant
+		decoded bool
+	)
+	for _, m := range mins {
+		if slices.Contains(rd.nss, m.NS) {
+			keep = append(keep, m)
+			continue
+		}
+		if !ix.known(m.NS) {
+			refused = append(refused, m.String())
+			continue
+		}
+		if ix.purgedNS(ctx, m.NS) {
+			purged = true
+			continue
+		}
+		reason, lacks := ix.keys.Skip(m.NS)
+		if reason == "" || lacks {
+			// Not reached yet, or one the reader can't see (refsReader
+			// left it out), or whose keys the service lacks.
+			refused = append(refused, m.String())
+			continue
+		}
+		if !decoded {
+			g, _ = ix.checker.Decode(bearer(r)) // nil: no usable grant
+			decoded = true
+		}
+		_, aerr := ix.refsAccess(ctx, m.NS, r, g)
+		var ae *grant.AuthError
+		switch {
+		case client.IsPurged(aerr):
+			purged = true
+		case errors.As(aerr, &ae):
+			refused = append(refused, m.String())
+		case aerr != nil:
+			return nil, false, nil, false, fmt.Errorf("%s: %w", m.NS, aerr)
+		default:
+			behind = true
+		}
+	}
+	return keep, purged, refused, behind, nil
+}
+
+// purgedNS reports whether ns, a namespace the service follows, is purged:
+// as committed, or, for a sealed one purged before the service learnt of
+// it, as its document says (410, §8.5), read with the service's own grant.
+func (ix *Index) purgedNS(ctx context.Context, ns string) bool {
+	if _, purged, err := ix.committed(ctx, ns); err == nil && purged {
+		return true
+	}
+	_, err := ix.checker.Config(ctx, ns)
+	return client.IsPurged(err)
 }
 
 // refsIncludes reports whether an answer's at includes every min: its
@@ -583,18 +742,35 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		}
 		withHits, i = append(withHits, ns), j
 	}
+	if err := attachEpochs(ctx, tx, hits); err != nil {
+		return derived.Stored{}, "", false, err
+	}
 	tx.Rollback()
-	// The keys that seal hits of sealed and e2e namespaces.
-	keys := map[string]derived.Key{}
+	// Hits of sealed and e2e namespaces are sealed under the epoch their
+	// document's head is served under (§E.2.6, docs.epoch), the current
+	// one where that isn't known; its key can't be had for now: behind.
+	protected := map[string]bool{}
 	for _, ns := range withHits {
-		info, key, err := ix.keys.Current(ctx, ns)
+		info, _, err := ix.keys.Current(ctx, ns)
 		if err != nil {
 			ix.opt.Logf("index: keys of %s: %v", ns, err)
 			return derived.Stored{}, "", false, errRefsKeys
 		}
-		if info.Protected() {
-			keys[ns] = key
+		protected[ns] = info.Protected()
+	}
+	keys := map[string]derived.Key{}
+	keyAt := func(ns string, epoch int) (derived.Key, error) {
+		k := ns + "#" + strconv.Itoa(epoch)
+		if key, ok := keys[k]; ok {
+			return key, nil
 		}
+		key, err := ix.keys.KeyAt(ctx, ns, epoch)
+		if err != nil {
+			ix.opt.Logf("index: key of %s epoch %d: %v", ns, epoch, err)
+			return key, errRefsKeys
+		}
+		keys[k] = key
+		return key, nil
 	}
 
 	tags := make([]string, 0, len(nss)+len(hits))
@@ -620,9 +796,13 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		if h.Self {
 			m["self"] = true
 		}
-		if key, ok := keys[ns]; ok {
+		if protected[ns] {
 			// Per-entry sealing (§E.2.6): what the document gave, under
-			// its resource's key.
+			// its resource's key of the epoch it is served under.
+			key, err := keyAt(ns, h.epoch)
+			if err != nil {
+				return derived.Stored{}, "", false, err
+			}
 			jwe, err := derived.SealItem(key, derived.View{NS: ns, Target: view}, h.Resource, m)
 			if err != nil {
 				return derived.Stored{}, "", false, fmt.Errorf("sealing a hit: %w", err)
@@ -645,6 +825,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 	}
 	st := derived.Stored{Body: b, JSON: true, Tags: strings.Join(tags, ",")}
 	if len(keys) > 0 {
+		// Some hit is sealed: it is bound to its URL.
 		// Sealed once (§E.2.6): stored while at is current, as sealed
 		// results of one namespace are.
 		scope := "/_refs/g/" + rd.gs
@@ -704,14 +885,20 @@ func (ix *Index) writeRefs(w http.ResponseWriter, r *http.Request, rd *refsReade
 
 // refsPurged drops the answers a purge of tags in ns removes, once its
 // apply has committed: kept ones, and stored sealed ones put since the
-// apply's own purge of them (answers carry no counts tag, and results
-// with counts computed since are current).
-func (ix *Index) refsPurged(ctx context.Context, ns string, tags []string) {
+// apply's own purge of them. Those go by the tags only a result read
+// before the commit carries: r:{ns}/{name} of a resource purged, and, if
+// the namespace is purged (purgedNS), idx:{ns}, which no answer read since
+// covers. A result of ns read since carries idx:{ns} and is current:
+// dropped, a stored sealed one would be sealed again, unlike what it
+// served (§E.2.6).
+func (ix *Index) refsPurged(ctx context.Context, ns string, tags []string, purgedNS bool) {
 	if len(tags) == 0 {
 		return
 	}
 	ix.refs.Purge(refsScope, tags)
-	tags = slices.DeleteFunc(slices.Clone(tags), func(t string) bool { return t == countsTag(ns) })
+	if !purgedNS {
+		tags = slices.DeleteFunc(slices.Clone(tags), func(t string) bool { return t == "idx:"+ns })
+	}
 	if err := ix.sealed.Purge(ctx, ix.db, tags); err != nil {
 		ix.opt.Logf("index: purging sealed results of /_refs: %v", err)
 	}

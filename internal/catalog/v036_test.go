@@ -153,16 +153,12 @@ func TestListingVisibility(t *testing.T) {
 	if r.status != 200 || childNames(r.body) != "matches.derby3,matches.x1" {
 		t.Errorf("timed after its rule went: %d %v", r.status, r.body)
 	}
-	// /read-grants uses the same test for catalog nodes.
+	// /read-grants uses the same test for catalog nodes of a sealed or
+	// end-to-end catalog (TestReadGrantsCatalogNodesV073); this one is
+	// neither, so its nodes are 400, visible or not (§B.11.5).
 	rg := w.do("POST", "/read-grants", ti, map[string]any{"items": toAny("/r/cat/extra", "/r/cat/season")})
-	gs := rg.body["grants"].([]any)
-	if gs[0].(map[string]any)["error"] != nil || gs[1].(map[string]any)["error"] == nil {
-		t.Errorf("read-grants for catalog nodes: %v", gs)
-	}
-	rg = w.do("POST", "/read-grants", anna, map[string]any{"items": toAny("/r/cat/season", "/r/cat/extra")})
-	gs = rg.body["grants"].([]any)
-	if gs[0].(map[string]any)["error"] != nil || gs[1].(map[string]any)["error"] == nil {
-		t.Errorf("read-grants: the translator's folders: %v", rg.body)
+	if entry(rg, 0)["status"] != 400.0 || entry(rg, 1)["status"] != 400.0 {
+		t.Errorf("read-grants for catalog nodes: %v", rg.body)
 	}
 }
 
@@ -214,8 +210,9 @@ func TestUnfilteredListings(t *testing.T) {
 			t.Errorf("%s for a namespace-wide reader: %d %v", op, r.status, r.body)
 		}
 	}
-	// Presenting g/all without the grants for it redirects to one's own.
-	if r := w.do("GET", loc, fan, nil); r.status != 302 || r.header.Get("Location") != locFan {
+	// Presenting g/all without the grants for it is 403, never redirected
+	// (§B.11.5).
+	if r := w.do("GET", loc, fan, nil); r.status != 403 || r.header.Get("Location") != "" {
 		t.Errorf("g/all for a role reader: %d %s", r.status, r.header.Get("Location"))
 	}
 }

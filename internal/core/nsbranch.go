@@ -11,12 +11,12 @@ import (
 )
 
 // authorizeTaken authorises a create of an existing namespace, before its
-// 412: an operator grant may create namespaces (§C.4), and otherwise the
-// caller needs config on the namespace itself.
+// 412: an operator grant may create namespaces with config (§C.2 item 2,
+// §C.4), and otherwise the caller needs config on the namespace itself.
 func (t *gate) authorizeTaken(n *nsRow, req Request) *Error {
 	if keys := t.operatorKeys(); len(keys) > 0 {
-		if a, err := t.authenticate(n.name, nil, nil, req.Cred, keys); err == nil && (a.verified == nil || a.star) {
-			return nil
+		if a, err := t.authenticate(n.name, nil, nil, req.Cred, keys); err == nil {
+			return t.authorize(a, "config", "")
 		}
 	}
 	a, err := t.authenticate(n.name, n, t.config(n.configSeq), req.Cred, nil)
@@ -26,7 +26,10 @@ func (t *gate) authorizeTaken(n *nsRow, req Request) *Error {
 	return t.authorize(a, "config", "")
 }
 
-// createNamespace bootstraps a namespace with an operator key (§C.4).
+// createNamespace bootstraps a namespace with an operator grant (§C.4),
+// which checks config (§C.2 item 2) and, as the grant that creates it,
+// passes the *-key guard (§C.2). At step 6 its own rules judge the
+// creation, and namespace rules don't (§6.4.3, checkCreationRules).
 func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error) {
 	a, doc, cfg, err := t.planCreate(req, cc)
 	if err != nil {
@@ -38,8 +41,8 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 }
 
 // planCreate checks a namespace's creation: the name, an operator's
-// credentials, the document. It returns the creating actor and the
-// namespace's document and configuration.
+// credentials, the document, the creating grant's rules. It returns the
+// creating actor and the namespace's document and configuration.
 func (t *gate) planCreate(req Request, cc ConfigChange) (*actor, any, *Config, *Error) {
 	if !ValidNSName(req.NS) {
 		return nil, nil, nil, badInput("invalid namespace name")
@@ -52,8 +55,8 @@ func (t *gate) planCreate(req Request, cc ConfigChange) (*actor, any, *Config, *
 	if aerr != nil {
 		return nil, nil, nil, aerr
 	}
-	if a.verified != nil && !a.star {
-		return nil, nil, nil, forbidden("creating a namespace needs a deployment operator key")
+	if err := t.authorize(a, "config", ""); err != nil {
+		return nil, nil, nil, err
 	}
 	ops, err := patch.Parse(cc.Patches)
 	if err != nil {
@@ -63,26 +66,31 @@ func (t *gate) planCreate(req Request, cc ConfigChange) (*actor, any, *Config, *
 	if err != nil {
 		return nil, nil, nil, patchErr(err)
 	}
-	// Step 4: a creation counts as a create (§6.6), held to the
-	// deployment's defaults, which no document has lowered yet.
-	if err := checkConfigLimits(t.e.opt.Limits, cc.Patches, jsonv.Canonical(cc.Patches), true, jsonv.Canonical(doc), func() bool { return true }); err != nil {
-		return nil, nil, nil, err
-	}
+	// Step 4: the document, validated as §7.4 says, then the limits: a
+	// creation counts as a create (§6.6), held to the deployment's
+	// defaults, which no document has lowered yet.
 	cfg, perr := t.e.newConfig(doc, nil, nil)
 	if perr != nil {
 		return nil, nil, nil, perr
 	}
 	if aerr := t.e.checkArchives(cfg); aerr != nil {
-		return nil, nil, nil, aerr
+		return nil, nil, nil, withPointer(aerr)
 	}
 	if cfg.Base != nil {
-		return nil, nil, nil, invalid("branches are created with POST /ns/{base}/branches")
+		return nil, nil, nil, docInvalid("/base", "branches are created with POST /ns/{base}/branches")
 	}
 	if err := t.checkEncryption(nil, cfg, -1); err != nil {
 		return nil, nil, nil, err
 	}
 	if cfg.Successor != "" {
-		return nil, nil, nil, invalid("a new namespace cannot have a successor")
+		// A creation names no successor (default, F-B9).
+		return nil, nil, nil, docInvalid("/successor", "a new namespace cannot have a successor")
+	}
+	if err := checkConfigLimits(t.e.opt.Limits, cc.Patches, jsonv.Canonical(cc.Patches), true, jsonv.Canonical(doc), func() bool { return true }); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := t.checkCreationRules(a, cc.Patches); err != nil {
+		return nil, nil, nil, err
 	}
 	return a, doc, cfg, nil
 }
@@ -129,7 +137,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if err != nil || replay != nil {
 		return replay, err
 	}
-	base, a, nd, gcanon, cfgID, atSeq, atID, cfg := p.base, p.a, p.doc, p.canon, p.cfgID, p.atSeq, p.atID, p.cfg
+	base, a, nd, gcanon, cfgID, atSeq, cfg := p.base, p.a, p.doc, p.canon, p.cfgID, p.atSeq, p.cfg
 	// Step 7.
 	author := t.actorID(a)
 	bid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?) RETURNING ns`, p.name, base.id, atSeq, base.configSeq)
@@ -141,7 +149,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	t.appendNS(bn, map[string]any{"kind": "config", "target": cfgID.String()}, nil, &cseq, cseq, author)
 	// A sealed branch has its own epoch keys (§E.2.5).
 	t.sealedConfigWritten(bn, nil, cfg)
-	_, nsID := t.appendNS(base, map[string]any{"kind": "branch", "name": p.name, "at": atID.String(), "target": cfgID.String()}, nil, &cseq, base.configSeq, author)
+	_, nsID := t.appendNS(base, map[string]any{"kind": "branch", "name": p.name, "at": p.atID.String(), "target": cfgID.String()}, nil, &cseq, base.configSeq, author)
 	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: cfgID.String()}, nil
 }
 
@@ -198,55 +206,86 @@ func (t *gate) planBranch(req Request, br BranchRequest) (p *branchPlan, replay 
 	if br.Patches == nil {
 		br.Patches = []any{}
 	}
-	// Step 2.
-	atSeq := base.headSeq.Int64
-	if br.At != "" {
-		id, err := ids.Parse(br.At)
-		if err != nil {
-			return nil, nil, invalid("at is not in the base's chain")
-		}
-		s, ok := t.nsLogSeq(base.id, id)
-		if !ok {
-			return nil, nil, invalid("at is not in the base's chain")
-		}
-		atSeq = s
-	}
-	atID := t.nsLogID(atSeq)
-	// Build the branch's namespace document (step 3).
-	doc := cloneDoc(bcfg.Doc)
-	for _, k := range []string{"frozen", "successor", "merged", "abandoned", "drafts", "schemaReads"} {
-		delete(doc, k) // §7.6: none of them is inherited
-	}
-	doc["base"] = map[string]any{"ns": base.name, "at": atID.String()}
-	ops, err := patch.Parse(br.Patches)
-	if err != nil {
-		return nil, nil, patchErr(err)
-	}
-	nd, w, err := patch.Apply(doc, true, ops, patch.Options{})
-	if err != nil {
-		return nil, nil, patchErr(err)
-	}
-	writes := patch.WritesStrings(w)
-	genesis := []any{map[string]any{"op": "add", "path": "", "value": nd}}
-	gcanon := jsonv.Canonical(genesis)
-	cfgID := ids.Revision(nil, gcanon)
+	// Step 2.5: a taken name is 412, with no head or config, before an at
+	// outside the base's chain is refused at step 4 (§6.2, §7.6), unless
+	// the request retries the branch's creation.
 	if ex := t.nsByName(br.Name); ex != nil {
-		// Idempotent retry: same principal, same at and patches, until
-		// the branch is purged; after that it is 412 too: its name stays
-		// reserved, for its creator too (§7.6, §8.5).
-		gseq, author, gid, ok := t.configGenesis(ex)
-		if ok && !ex.purged && ex.base.Valid && ex.base.Int64 == base.id && ex.baseAt.Int64 == atSeq &&
-			author == t.actorID(a) && gid == cfgID {
-			r := &WriteResult{Status: 200, Replayed: true, ConfigID: cfgID.String()}
-			// The base's branch entry targets the branch's config genesis.
-			if seq, ok := t.branchEntry(base, gseq); ok {
-				r.NSID = t.nsLogID(seq).String()
-			}
+		if r := t.branchRetry(base, ex, br, a); r != nil {
 			return nil, r, nil
 		}
 		return nil, nil, apiErr(412, "stale", "message", "the name is taken")
 	}
-	// Limits (step 4).
+	// at defaults to the base's head, the latest ns_id of its chain as
+	// the branch entry is inserted (§7.6).
+	atSeq, atOK := base.headSeq.Int64, true
+	if br.At != "" {
+		atSeq, atOK = t.branchAt(base, br.At)
+	}
+	atText := br.At
+	if atOK {
+		atText = t.nsLogID(atSeq).String()
+	}
+	// Step 3: the branch's namespace document.
+	nd, writes, gcanon, cfgID, gerr := branchGenesis(bcfg.Doc, base.name, atText, br.Patches, branchDropped)
+	if gerr != nil {
+		return nil, nil, patchErr(gerr)
+	}
+	// Step 4: the document, validated as §7.4 says, then the limits
+	// (§6.2). Every refusal of a branch field is 422 invalid with errors
+	// pointing at the member, before the *-key guard (§7.4, §C.2).
+	if !atOK {
+		return nil, nil, docInvalid("/base/at", "at is not in the base's chain (§7.6)")
+	}
+	if r := t.raiseAfter(base, atSeq); r != nil {
+		return nil, nil, docInvalid("/base/at", fmt.Sprintf("at is before %s's raise to e2e: a branch of a raised base can't be created with an at before its e2e raise, "+
+			"since the epoch key in force there also opens what it sealed after it (Addendum E Levels); create it at the raise or later, such as the base's head", r.name))
+	}
+	// The document starts as the base's, so the members this version
+	// defines that it holds unchanged are judged as there; any other
+	// member is refused, since a branch is a new namespace (checkMembers).
+	cfg, verr := t.e.newConfig(nd, definedMembers(bcfg.Doc), bcfg.Doc)
+	if verr != nil {
+		return nil, nil, verr
+	}
+	if !jsonv.Equal(bcfg.Doc["retention"], cfg.Doc["retention"]) {
+		if aerr := t.e.checkArchives(cfg); aerr != nil {
+			return nil, nil, withPointer(aerr)
+		}
+	}
+	if cfg.Base == nil || cfg.Base.NS != base.name || cfg.Base.At != atText || cfg.Base.Remote() {
+		return nil, nil, docInvalid("/base", "/base cannot be changed (§7.4)")
+	}
+	if cfg.DraftsFor != nil && base.isBranch() && t.draftRoot(base) == "" {
+		return nil, nil, docInvalid("/drafts", "/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
+	}
+	// Every * key of the base is kept (§7.6), and every * key of its local
+	// bases that the base's document holds (keepsStarKeys).
+	for b := base; ; b = t.nsByID(b.base.Int64) {
+		if err := keepsStarKeys(bcfg, cfg, b, t.config(b.configSeq)); err != nil {
+			return nil, nil, err
+		}
+		if !b.isBranch() || t.remoteShadow(b) != nil {
+			break
+		}
+	}
+	if cfg.Read == "public" && bcfg.Read != "public" {
+		return nil, nil, docInvalid("/read", "a branch of a non-public namespace cannot be public (§7.4)")
+	}
+	if err := t.checkEncryption(nil, cfg, t.nsLevel(base)); err != nil {
+		return nil, nil, err
+	}
+	if err := t.checkNonceBase(nil, cfg, base); err != nil {
+		return nil, nil, err
+	}
+	if cfg.Successor != "" {
+		// A branch of base, or of a namespace further up its chain, as
+		// for a config write that sets it (§7.4).
+		bases := t.successorBases(base)
+		bases[fmt.Sprint(base.id)] = true
+		if err := t.successorOK(cfg.Successor, 0, bases); err != nil {
+			return nil, nil, err
+		}
+	}
 	depth := 1
 	for b := base; b.isBranch(); b = t.nsByID(b.base.Int64) {
 		depth++
@@ -265,49 +304,11 @@ func (t *gate) planBranch(req Request, br BranchRequest) (p *branchPlan, replay 
 	if err := checkConfigLimits(bcfg.Limits, br.Patches, jsonv.Canonical(br.Patches), true, jsonv.Canonical(nd), func() bool { return true }); err != nil {
 		return nil, nil, err
 	}
-	// Step 5. The document starts as the base's, so the members this
-	// version defines that it holds unchanged are judged as there; any
-	// other member is refused, since a branch is a new namespace
-	// (checkMembers).
-	cfg, perr := t.e.newConfig(nd, definedMembers(bcfg.Doc), bcfg.Doc)
-	if perr != nil {
-		return nil, nil, perr
-	}
-	if !jsonv.Equal(bcfg.Doc["retention"], cfg.Doc["retention"]) {
-		if aerr := t.e.checkArchives(cfg); aerr != nil {
-			return nil, nil, aerr
-		}
-	}
-	if cfg.Base == nil || cfg.Base.NS != base.name || cfg.Base.At != atID.String() {
-		return nil, nil, invalid("/base cannot be changed")
-	}
-	if cfg.DraftsFor != nil && base.isBranch() && t.draftRoot(base) == "" {
-		return nil, nil, invalid("/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
-	}
+	// Step 6: the *-key guard, with a * key of the base (§7.6, §C.2), then
+	// the base's rules, which evaluate a branch envelope.
 	if touchesGuarded(writes) && !a.star {
 		return nil, nil, forbidden("these patches need a grant chained to a * key of the base")
 	}
-	for b := base; ; b = t.nsByID(b.base.Int64) {
-		for kid, k := range t.config(b.configSeq).starKeys() {
-			nk, ok := findKey(cfg.Keys, kid)
-			if !ok || string(nk.Pub) != string(k.Pub) || !nk.IsStar() {
-				return nil, nil, invalid(fmt.Sprintf("key %q of %s must be kept", kid, b.name))
-			}
-		}
-		if !b.isBranch() {
-			break
-		}
-	}
-	if cfg.Read == "public" && bcfg.Read != "public" {
-		return nil, nil, invalid("a branch of a non-public namespace cannot be public")
-	}
-	if err := t.checkEncryption(nil, cfg, t.nsLevel(base)); err != nil {
-		return nil, nil, err
-	}
-	if err := t.checkNonceBase(nil, cfg, base); err != nil {
-		return nil, nil, err
-	}
-	// Step 6: the base's rules evaluate a branch envelope.
 	env := t.basicEnvelope("branch", br.Name, a)
 	env["writes"] = anyStrings(writes)
 	env["doc"] = nd
@@ -315,5 +316,107 @@ func (t *gate) planBranch(req Request, br BranchRequest) (p *branchPlan, replay 
 	if err := t.checkRules(bcfg, a, env, false); err != nil {
 		return nil, nil, err
 	}
-	return &branchPlan{name: br.Name, base: base, a: a, atSeq: atSeq, atID: atID, doc: nd, canon: gcanon, cfgID: cfgID, cfg: cfg, writes: writes}, nil, nil
+	return &branchPlan{name: br.Name, base: base, a: a, atSeq: atSeq, atID: t.nsLogID(atSeq), doc: nd, canon: gcanon, cfgID: cfgID, cfg: cfg, writes: writes}, nil, nil
+}
+
+// branchDropped are the members of the base's current document a local
+// branch's starting document leaves out (§7.6): none of them is
+// inherited. legacyBranchDropped is the list before v0.73, which kept
+// cleanup, so that a creation made then still retries (branchRetry).
+var (
+	branchDropped       = []string{"frozen", "successor", "merged", "abandoned", "cleanup", "drafts", "schemaReads"}
+	legacyBranchDropped = []string{"frozen", "successor", "merged", "abandoned", "drafts", "schemaReads"}
+)
+
+// branchGenesis builds a local branch's namespace document from its base's
+// document bdoc (§7.6): the members dropped removed, base: { ns, at }
+// added, then patches applied. It returns the document, the patches'
+// writes, and the canonical genesis patch set and its config id.
+func branchGenesis(bdoc map[string]any, baseName, at string, patches any, dropped []string) (doc any, writes []string, canon []byte, id ids.ID, err error) {
+	d := cloneDoc(bdoc)
+	for _, k := range dropped {
+		delete(d, k)
+	}
+	d["base"] = map[string]any{"ns": baseName, "at": at}
+	ops, err := patch.Parse(patches)
+	if err != nil {
+		return nil, nil, nil, ids.ID{}, err
+	}
+	nd, w, err := patch.Apply(d, true, ops, patch.Options{})
+	if err != nil {
+		return nil, nil, nil, ids.ID{}, err
+	}
+	canon = jsonv.Canonical([]any{map[string]any{"op": "add", "path": "", "value": nd}})
+	return nd, patch.WritesStrings(w), canon, ids.Revision(nil, canon), nil
+}
+
+// raiseAfter returns base if its raise to e2e lies after at, the entry of
+// base's own log a branch would fork at, and nil otherwise (Addendum E
+// Levels, Branches of a raised base). A raise lies before the entry that
+// made the namespace e2e (e2eRaiseOf), so at may be that entry or any later
+// one. Bases further up need no check: base's own entries all follow its
+// creation, which was held to the same rule.
+func (t *gate) raiseAfter(base *nsRow, at int64) *nsRow {
+	if r := t.e2eRaiseOf(base); r != nil && r.seq != 0 && at < r.seq {
+		return base
+	}
+	return nil
+}
+
+// branchAt resolves a branch's at in base's chain (§7.6).
+func (t *gate) branchAt(base *nsRow, at string) (int64, bool) {
+	id, err := ids.Parse(at)
+	if err != nil {
+		return 0, false
+	}
+	return t.nsLogSeq(base.id, id)
+}
+
+// branchRetry answers an idempotent retry of the creation of ex, a taken
+// name, or nil (§7.6, §7.2): until ex is purged, a local branch of base
+// whose creation was by the same principal (the same root sub and kid),
+// with the same at, where an omitted at names the one recorded for the
+// branch and one outside the base's chain matches nothing, and the same
+// patches. The patches are judged by the genesis they give from the base's
+// document in force at the creation, so later config writes to the base
+// don't turn a retry into a 412. A creation made before v0.73 kept the
+// base's cleanup (legacyBranchDropped), and nothing stored tells it from
+// one whose patches set cleanup to the base's value, so patches match if
+// either list gives the genesis: like ops that change nothing, a retry
+// whose patches differ only that way gets the branch its principal made.
+func (t *gate) branchRetry(base, ex *nsRow, br BranchRequest, a *actor) *WriteResult {
+	if ex.purged || !ex.base.Valid || ex.base.Int64 != base.id {
+		return nil
+	}
+	atSeq := ex.baseAt.Int64
+	if br.At != "" {
+		if s, ok := t.branchAt(base, br.At); !ok || s != atSeq {
+			return nil
+		}
+	}
+	gseq, _, gid, ok := t.configGenesis(ex)
+	if !ok {
+		return nil
+	}
+	// The base's branch entry targets the branch's config genesis.
+	seq, ok := t.branchEntry(base, gseq)
+	if !ok || !t.samePrincipal(seq, a, t.actorID(a)) {
+		return nil
+	}
+	bdoc := t.config(base.configSeq).Doc
+	if ex.baseConfigSeq.Valid {
+		bdoc = t.config(ex.baseConfigSeq.Int64).Doc
+	}
+	at := t.nsLogID(atSeq).String()
+	match := false
+	for _, dropped := range [][]string{branchDropped, legacyBranchDropped} {
+		if _, _, _, id, err := branchGenesis(bdoc, base.name, at, br.Patches, dropped); err == nil && id == gid {
+			match = true
+			break
+		}
+	}
+	if !match {
+		return nil
+	}
+	return &WriteResult{Status: 200, Replayed: true, ConfigID: gid.String(), NSID: t.nsLogID(seq).String()}
 }

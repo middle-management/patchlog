@@ -55,7 +55,10 @@ func TestListingsWaitForTrusted(t *testing.T) {
 	for r.status == http.StatusFound {
 		r = x.raw(r.header.Get("Location"), "")
 	}
-	if r.status != http.StatusServiceUnavailable || r.body["code"] != "behind" || !strings.Contains(r.body["message"].(string), "matches") || r.header.Get("Retry-After") == "" {
+	// The namespace waited for is named as ns to a reader with
+	// unrestricted read of the catalog, as everyone has of a public one
+	// (§B.5, TC-10).
+	if r.status != http.StatusServiceUnavailable || r.body["code"] != "behind" || r.body["ns"] != "matches" || r.header.Get("Retry-After") == "" {
 		t.Fatalf("a listing before matches has a checkpoint: %d %v %v", r.status, r.header, r.body)
 	}
 	hold.Store(false)
@@ -78,9 +81,15 @@ func TestListingsWaitForTrusted(t *testing.T) {
 // listing follows the pointer's redirect and returns the answer.
 func (s *svc) listing(path string) resp {
 	s.t.Helper()
-	r := s.raw(path, "")
+	return s.listingAs(path, "")
+}
+
+// listingAs is listing for the bearer of token ("" for none).
+func (s *svc) listingAs(path, token string) resp {
+	s.t.Helper()
+	r := s.raw(path, token)
 	for r.status == http.StatusFound {
-		r = s.raw(r.header.Get("Location"), "")
+		r = s.raw(r.header.Get("Location"), token)
 	}
 	return r
 }
@@ -132,7 +141,7 @@ func TestListingsWaitForCatchUp(t *testing.T) {
 	waitFor(t, "matches' second page asked for", held.Load)
 	waitFor(t, "matches' first page applied", func() bool { return x.s.Checkpoint("matches") != "" })
 	if r := x.listing("/cat/children?of=season"); r.status != http.StatusServiceUnavailable || r.body["code"] != "behind" ||
-		!strings.Contains(r.body["message"].(string), "matches") {
+		r.body["ns"] != "matches" {
 		t.Fatalf("a listing while matches is caught up to its first page only: %d %v", r.status, r.body)
 	}
 	hold.Store(false)
@@ -203,7 +212,7 @@ func TestListingsWaitForFollowable(t *testing.T) {
 	w.place(t, "late.x", "season@a2")
 	x.caughtUp("cat")
 	waitFor(t, "the follower to catch up with late", seen.Load)
-	if r := x.listing("/cat/children?of=season"); r.status != http.StatusServiceUnavailable || !strings.Contains(r.body["message"].(string), "late") {
+	if r := x.listing("/cat/children?of=season"); r.status != http.StatusServiceUnavailable || r.body["ns"] != "late" {
 		t.Fatalf("a listing while late is caught up with: %d %v", r.status, r.body)
 	}
 	hold.Store(false)
@@ -231,6 +240,10 @@ func TestListingsSkipKeyless(t *testing.T) {
 		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
 	}
 	all := []string{"cat", "pub", "vault"}
+	// A reader whose grant would be issued namespace-wide edge grants
+	// on every namespace: the catalog's content isn't all public, so its
+	// listings are g/all's (§B.11.5).
+	rd := k.Grant(t, s.Now(), "user:r", all, []string{"read"})
 	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "append", "config"})))
 	must(wr.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
 	must(wr.CreateDoc(ctx, "pub", "plan", map[string]any{"title": "plan"}))
@@ -245,13 +258,13 @@ func TestListingsSkipKeyless(t *testing.T) {
 	x.caughtUp("cat", "pub")
 	var r resp
 	waitFor(t, "a listing with vault skipped", func() bool {
-		r = x.listing("/cat/children?of=root")
+		r = x.listingAs("/cat/children?of=root", rd)
 		return r.status == http.StatusOK
 	})
 	if got := names(r.body["children"]); got != "pub.plan" {
 		t.Fatalf("root with vault skipped: %s", got)
 	}
-	if r := x.raw("/cat/children?of=root&min=vault:"+x.s.Checkpoint("pub"), ""); r.status != http.StatusBadRequest {
+	if r := x.raw("/cat/children?of=root&min=vault:"+x.s.Checkpoint("pub"), rd); r.status != http.StatusBadRequest {
 		t.Fatalf("a min naming vault, skipped for its keys: %d %v", r.status, r.body)
 	}
 }
@@ -330,6 +343,10 @@ func TestListingsTransientKeyError(t *testing.T) {
 		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
 	}
 	all := []string{"cat", "pub", "vault"}
+	// A reader whose grant would be issued namespace-wide edge grants
+	// on every namespace: the catalog's content isn't all public, so its
+	// listings are g/all's (§B.11.5).
+	rd := k.Grant(t, s.Now(), "user:r", all, []string{"read"})
 	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "append", "config"})), client.WithKeys(client.NewKeys(nil)))
 	must(wr.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
 	must(wr.CreateDoc(ctx, "pub", "plan", map[string]any{"title": "plan"}))
@@ -362,13 +379,13 @@ func TestListingsTransientKeyError(t *testing.T) {
 	x.caughtUp("cat", "pub")
 	waitFor(t, "vault's epoch key asked for", failed.Load)
 	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-		if r := x.listing("/cat/children?of=root"); r.status != http.StatusServiceUnavailable {
+		if r := x.listingAs("/cat/children?of=root", rd); r.status != http.StatusServiceUnavailable {
 			t.Fatalf("a listing while vault's epoch key can't be fetched for the moment: %d %s, want 503 behind", r.status, names(r.body["children"]))
 		}
 	}
 	failing.Store(false)
 	x.caughtUp("vault")
-	if got := names(x.listing("/cat/children?of=root").body["children"]); got != "pub.plan,vault.v" {
+	if got := names(x.listingAs("/cat/children?of=root", rd).body["children"]); got != "pub.plan,vault.v" {
 		t.Fatalf("once vault's key came: %s", got)
 	}
 }
@@ -402,6 +419,10 @@ func TestListingsTransientKeyErrorE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	all := []string{"cat", "pub", "secret"}
+	// A reader whose grant would be issued namespace-wide edge grants
+	// on every namespace: the catalog's content isn't all public, so its
+	// listings are g/all's (§B.11.5).
+	rd := k.Grant(t, s.Now(), "user:r", all, []string{"read"})
 	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "append", "config"}, map[string]any{"enc": wJWK})),
 		client.WithKeys(client.NewKeys(wPriv)))
 	x2 := wr.E2E(wPriv)
@@ -424,19 +445,19 @@ func TestListingsTransientKeyErrorE2E(t *testing.T) {
 		return base.RoundTrip(req)
 	})
 	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"}, map[string]any{"enc": svcJWK})),
-		client.WithKeys(client.NewKeys(svcPriv)), client.WithHTTPClient(&http.Client{Transport: rt}))
+		client.WithKeys(client.NewKeys(svcPriv)), client.WithHTTPClient(&http.Client{Transport: rt}), client.WithKeyringSenders(wPriv.PublicKey()))
 	x := startSvc(t, sc, svcOpts{now: s.Now}, func(o *tree.Options) { o.Recipient = svcPriv })
 	t.Cleanup(func() { failing.Store(false) })
 	x.caughtUp("cat", "pub")
 	waitFor(t, "secret's epoch key asked for", failed.Load)
 	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-		if r := x.listing("/cat/children?of=root"); r.status != http.StatusServiceUnavailable {
+		if r := x.listingAs("/cat/children?of=root", rd); r.status != http.StatusServiceUnavailable {
 			t.Fatalf("a listing while secret's epoch key can't be fetched for the moment: %d %s, want 503 behind", r.status, names(r.body["children"]))
 		}
 	}
 	failing.Store(false)
 	x.caughtUp("secret")
-	if got := names(x.listing("/cat/children?of=root").body["children"]); got != "pub.plan,secret.s1" {
+	if got := names(x.listingAs("/cat/children?of=root", rd).body["children"]); got != "pub.plan,secret.s1" {
 		t.Fatalf("once secret's key came: %s", got)
 	}
 }

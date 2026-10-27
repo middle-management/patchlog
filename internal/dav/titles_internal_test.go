@@ -7,15 +7,16 @@ import (
 )
 
 // Titles (§H.2): Unicode, 1 to 255 bytes of UTF-8, not . or .., without
-// /, \, NUL, Cc, Cf, Zl and Zp, and here without a trailing space or dot.
+// /, \, NUL, Cc, Zl, Zp and the bidirectional controls (other Cf
+// characters are allowed), and here without a trailing space or dot.
 func TestTitleRules(t *testing.T) {
 	t.Parallel()
-	for _, ok := range []string{"Report.json", "Match report 2026.md", "日本語", ".hidden", "a", "x copy.md", "untitled folder", strings.Repeat("é", 127)} {
+	for _, ok := range []string{"Report.json", "Match report 2026.md", "日本語", ".hidden", "a", "x copy.md", "untitled folder", strings.Repeat("é", 127), "zero\u200bwidth"} {
 		if why := titleWhy(ok); why != "" {
 			t.Errorf("titleWhy(%q) = %q", ok, why)
 		}
 	}
-	for _, bad := range []string{"", ".", "..", "a/b", "a\\b", "a\x00b", "tab\there", "zero​width", "line ", "para ", "end.", "end ",
+	for _, bad := range []string{"", ".", "..", "a/b", "a\\b", "a\x00b", "tab\there", "rtl\u202eoverride", "line ", "para ", "end.", "end ",
 		strings.Repeat("x", 256), "\xff.md"} {
 		if titleWhy(bad) == "" {
 			t.Errorf("titleWhy(%q) takes it", bad)

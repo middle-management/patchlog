@@ -528,20 +528,11 @@ func oldCandidateSQL(fts bool, ns string, q *Query) (string, []any) {
 	}
 	sb.WriteString(` FROM docs d`)
 	if len(q.words) > 0 {
-		sb.WriteString(` JOIN (SELECT docid, sum(s) AS score FROM (`)
-		for i, w := range q.words {
-			if i > 0 {
-				sb.WriteString(` UNION ALL `)
-			}
-			if fts {
-				fmt.Fprintf(&sb, `SELECT rowid >> %d AS docid, %d AS k, -rank AS s FROM "text" WHERE "text" MATCH ?`, textShift, i)
-				args = append(args, ftsPhrase(w))
-			} else {
-				fmt.Fprintf(&sb, `SELECT docid, %d AS k, 1.0 AS s FROM "text" WHERE body LIKE ? ESCAPE '\'`, i)
-				args = append(args, likePattern(w))
-			}
-		}
-		fmt.Fprintf(&sb, `) GROUP BY docid HAVING count(DISTINCT k) = %d) t ON t.docid = d.docid`, len(q.words))
+		// v0.73: each score from its document alone (§A.4), as run
+		// computes it; the plans compared don't touch the text matches.
+		m, margs := textMatchSQL(fts, ns, q.words, nil)
+		sb.WriteString(` JOIN ` + m + ` t ON t.docid = d.docid`)
+		args = append(args, margs...)
 	}
 	for i, s := range q.Sorts {
 		fmt.Fprintf(&sb, ` LEFT JOIN "sort" s%d ON s%d.ns = d.ns AND s%d.resource = d.resource AND s%d.path = ?`, i, i, i, i)

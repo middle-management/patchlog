@@ -488,14 +488,14 @@ func (r *ddbReads) configEntryGestures(seq int64) (string, bool) {
 	return "", false
 }
 
-func (r *ddbReads) batchEntry(n *nsRow, seq, author int64) (ids.ID, string, bool) {
+func (r *ddbReads) batchEntry(n *nsRow, seq, author int64) (ids.ID, string, []byte, bool) {
 	le := r.entry(seq)
 	if le == nil || le.Kind != "batch" || le.Author != r.authors[author] {
-		return ids.ID{}, "", false
+		return ids.ID{}, "", nil, false
 	}
 	id, err := ids.Parse(le.ID)
 	r.must(err)
-	return id, le.Body, true
+	return id, le.Body, r.entryGrantID(seq), true
 }
 
 // --- resources and revisions ---
@@ -812,11 +812,16 @@ func ddbCheck[T any](f func() T) (out T, err error) {
 		}
 		var ce *Error
 		var de *ddb.Error
+		var need *errNeedSource
 		switch v := p.(type) {
 		case *Error:
 			err = v
 		case error:
-			if errors.As(v, &ce) {
+			if errors.As(v, &need) {
+				// The write runs again with the base's document
+				// (withRemoteSource).
+				err = need
+			} else if errors.As(v, &ce) {
 				err = ce
 			} else if errors.As(v, &de) {
 				err = ddbAsErr(de)
@@ -1229,18 +1234,6 @@ func (r *ddbReads) firstEntryCreated() (int64, bool) {
 	ms, ok, err := r.s.FirstEntryTime(r.ctx)
 	r.must(err)
 	return ms, ok
-}
-
-// archiveSealer: nothing is encrypted at rest here.
-// archiveSealer: an archive of a resource encrypted at rest is sealed
-// with a key derived from its data key (archiveSealer of crypt.go).
-func (r *ddbReads) archiveSealer(res int64) func(io.Writer) (io.WriteCloser, error) {
-	rf := r.res[res]
-	if n := r.nsByName(rf.ns); n == nil || r.nsLevel(n) < levelAtRest {
-		return nil
-	}
-	dek := r.dek(res, true)
-	return func(w io.Writer) (io.WriteCloser, error) { return sealArchive(w, dek) }
 }
 
 // --- gestures ---

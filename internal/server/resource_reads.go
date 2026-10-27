@@ -3,10 +3,10 @@ package server
 import (
 	"errors"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -20,7 +20,7 @@ func (s *Server) resourceHead(w http.ResponseWriter, r *http.Request) {
 	}
 	h, err := s.e.ResourceHead(r.Context(), ns, name, creds(r))
 	if err != nil {
-		if s.writeErrShort(w, r, err) {
+		if s.writeErrShort(w, r, err, resTags(ns, name)...) {
 			return
 		}
 		writeErr(w, err)
@@ -38,14 +38,15 @@ func (s *Server) resourceHead(w http.ResponseWriter, r *http.Request) {
 
 // headGone answers a head pointer that isn't live (§7.1): never existed
 // (short), purged (long), or tombstoned, with successor where the engine
-// read one (§8.1: a moved resource, outside sealed and e2e namespaces).
+// read one (§8.1: a moved resource, outside sealed and e2e namespaces);
+// each with the resource's tags (§9).
 func (s *Server) headGone(w http.ResponseWriter, r *http.Request, ns, name string, h *core.Head) {
 	switch h.State {
 	case core.NotFound:
-		s.cache(w, r, ccShort, h.Public)
+		s.cache(w, r, ccShort, h.Public, resTags(ns, name)...)
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
 	case core.Purged:
-		s.cache(w, r, ccLong, h.Public)
+		s.cache(w, r, ccLong, h.Public, resTags(ns, name)...)
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	case core.Tombstoned:
 		s.cache(w, r, ccHead, h.Public, resTags(ns, name)...)
@@ -85,7 +86,7 @@ func (s *Server) resourceRaw(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 404, ae.Body)
 			return
 		}
-		if s.writeErrShort(w, r, err) {
+		if s.writeErrShort(w, r, err, resTags(ns, name)...) {
 			return
 		}
 		writeErr(w, err)
@@ -127,7 +128,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 	}
 	rev, err := s.e.ResourceRev(r.Context(), ns, name, id, creds(r))
 	if err != nil {
-		if s.writeErrShort(w, r, err) {
+		if s.writeErrShort(w, r, err, resTags(ns, name)...) {
 			return
 		}
 		writeErr(w, err)
@@ -160,7 +161,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", quote(id))
 		w.Header().Set("X-Revision", id)
 		w.Header().Set("X-E2E", "snapshot")
-		if s.notModified(r, id, rev) {
+		if s.notModified(r, quote(id), rev) {
 			w.WriteHeader(304)
 			return
 		}
@@ -180,9 +181,21 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		} else {
 			s.cache(w, r, ccImmutable, rev.Public, resTags(ns, name)...)
 		}
-		w.Header().Set("ETag", quote(id))
+		// A sealed document's tag names its epoch (§E.2.2); an e2e
+		// snapshot's (above) and a head pointer's don't.
+		tag := quote(id)
+		if rev.JWE != "" {
+			tag = sealedTag(id, rev.JWE)
+		}
+		w.Header().Set("ETag", tag)
 		w.Header().Set("X-Revision", id)
-		if s.notModified(r, id, rev) {
+		if rev.SchemaRules != "" {
+			// The rules marker of a schema revision (§6.1), immutable as
+			// the revision is: a client or a remote mirror compiles it as
+			// this server does.
+			w.Header().Set(schema.RulesHeader, rev.SchemaRules)
+		}
+		if s.notModified(r, tag, rev) {
 			w.WriteHeader(304)
 			return
 		}
@@ -203,11 +216,11 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 
 // revGone answers a revision URL without a document (§7.1): an unknown
 // id (short), a pruned revision, a tombstone id (immutable) or a purge
-// (long).
+// (long), each with the resource's tags (§9).
 func (s *Server) revGone(w http.ResponseWriter, r *http.Request, ns, name, id string, rev *core.Rev) {
 	switch {
 	case rev.Status == 404:
-		s.cache(w, r, ccShort, rev.Public)
+		s.cache(w, r, ccShort, rev.Public, resTags(ns, name)...)
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
 	case rev.Code == "pruned":
 		s.cache(w, r, ccPruned, rev.Public, resTags(ns, name)...)
@@ -219,7 +232,7 @@ func (s *Server) revGone(w http.ResponseWriter, r *http.Request, ns, name, id st
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	default:
 		// A purge is "long".
-		s.cache(w, r, ccLong, rev.Public)
+		s.cache(w, r, ccLong, rev.Public, resTags(ns, name)...)
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	}
 }
@@ -254,14 +267,15 @@ func (s *Server) lastModified(rev *core.Rev) (time.Time, bool) {
 }
 
 // notModified tells whether a revision's answer is a 304: If-None-Match
-// names its id (an immutable ETag), or, without If-None-Match, a 200's
-// Last-Modified is no later than If-Modified-Since (§7.1, RFC 9110
-// §13.1.3, §13.2.2). Either is exact: a revision never changes. Where no
-// Last-Modified is sent (sealed and e2e namespaces) If-Modified-Since is
-// ignored, so 304s can't be probed for the created time the level hides.
-func (s *Server) notModified(r *http.Request, id string, rev *core.Rev) bool {
+// names its tag (an immutable ETag, "{id}.{e}" when sealed), or, without
+// If-None-Match, a 200's Last-Modified is no later than If-Modified-Since
+// (§7.1, RFC 9110 §13.1.3, §13.2.2). Either is exact: a revision never
+// changes. Where no Last-Modified is sent (sealed and e2e namespaces)
+// If-Modified-Since is ignored, so 304s can't be probed for the created
+// time the level hides.
+func (s *Server) notModified(r *http.Request, tag string, rev *core.Rev) bool {
 	if inm := r.Header.Get("If-None-Match"); inm != "" {
-		return strings.Contains(inm, quote(id))
+		return inmMatches(inm, tag)
 	}
 	ims := r.Header.Values("If-Modified-Since")
 	if rev.Status != 200 || len(ims) != 1 {
@@ -280,7 +294,7 @@ func (s *Server) resourceRevLog(w http.ResponseWriter, r *http.Request) {
 	}
 	lg, err := s.e.ResourceLog(r.Context(), ns, name, id, r.URL.Query().Get("since"), s.e.Limits().LogPageSize, creds(r))
 	if err != nil {
-		if s.writeErrShort(w, r, err) {
+		if s.writeErrShort(w, r, err, resTags(ns, name)...) {
 			return
 		}
 		writeErr(w, err)

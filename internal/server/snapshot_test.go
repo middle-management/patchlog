@@ -69,9 +69,10 @@ func TestSnapshots(t *testing.T) {
 			expectCode(t, d, 410, "pruned")
 		}
 	}
-	// A later prune's keep replaces the earlier one.
+	// A later prune's keep replaces the earlier one, and [] clears it
+	// (§8.6; one without keep would leave it).
 	r = e.do(req{method: "POST", path: "/r/main/a/prune", author: "admin",
-		body: map[string]any{"horizon": revs[9]}})
+		body: map[string]any{"horizon": revs[9], "keep": []any{}}})
 	expect(t, r, 200)
 	e.e.FlushCaches()
 	expectCode(t, e.get("/r/main/a/rev/"+revs[1]), 410, "pruned")

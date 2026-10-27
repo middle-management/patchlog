@@ -96,7 +96,7 @@ func TestRaw(t *testing.T) {
 	}
 	b := e.get(blobPath("m", "notes", bid))
 	expect(t, b, 200)
-	if string(b.Body) != string(md) || b.H.Get("Content-Type") != "text/markdown" || b.H.Get("X-Content-Type-Options") != "nosniff" || b.H.Get("Content-Security-Policy") != "sandbox" {
+	if string(b.Body) != string(md) || b.H.Get("Content-Type") != "text/markdown; charset=utf-8" || b.H.Get("X-Content-Type-Options") != "nosniff" || b.H.Get("Content-Security-Policy") != "sandbox" {
 		t.Fatalf("blob %v", b.H)
 	}
 
@@ -204,8 +204,9 @@ func TestRawNotOffered(t *testing.T) {
 	}
 	expectCode(t, e.get("/r/s/a/raw"), 401, "unauthenticated")
 	expectCode(t, e.get("/r/p/b/raw", one), 404, "not_found")
-	// Sealed namespaces use the public classes (§9).
-	for path, class := range map[string]string{"/r/s/a/raw": ccHead, "/r/s/a/rev/" + heads["s"] + "/raw": ccImmutable} {
+	// Sealed namespaces are cached by read mode: s is read "grant", so
+	// private (v0.63 §E.2.5, §9).
+	for path, class := range map[string]string{"/r/s/a/raw": "private, max-age=0", "/r/s/a/rev/" + heads["s"] + "/raw": "private, max-age=300"} {
 		r := e.get(path, one)
 		expectCode(t, r, 404, "not_offered")
 		if r.H.Get("Cache-Control") != class || r.H.Get("Cache-Tag") != "ns:s,r:s/a" {
@@ -222,7 +223,7 @@ func TestRawNotOffered(t *testing.T) {
 	// e2e: content and keyring alike.
 	f := newE2E(t)
 	readerPub, _ := seal.ParseRecipientJWK(f.readerJWK)
-	kr, err := seal.BuildKeyring("e", 1, seal.NewKey(), []*ecdh.PublicKey{readerPub})
+	kr, err := seal.BuildKeyringV2(f.readerPriv, "e", 1, seal.NewKey(), []*ecdh.PublicKey{readerPub})
 	if err != nil {
 		t.Fatal(err)
 	}

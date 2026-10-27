@@ -38,7 +38,7 @@ func TestMinOnGrants(t *testing.T) {
 		// Read grants too, and the parameter repeats.
 		mw := must(w.ops.CreateDoc(ctx, "matches", "x"+name, map[string]any{"title": name}))
 		r = w.do("POST", "/read-grants?min=cat:"+wr.NSID+"&min=matches:"+mw.NSID, bob, map[string]any{"items": toAny("/r/matches/derby")})
-		if r.status != 200 || r.body["grants"] == nil {
+		if r.status != 200 || r.body["items"] == nil {
 			t.Fatalf("read-grants with two mins: %d %v", r.status, r.body)
 		}
 	}
@@ -92,7 +92,8 @@ func TestInheritPowers(t *testing.T) {
 	w.doc("cat", "desks", map[string]any{"title": "Desks", "parents": parents("root"), "$access": acc("group:match-desk", "desk")})
 	w.doc("cat", "plain", map[string]any{"title": "Plain", "parents": parents("desks")})
 	w.doc("cat", "inh", map[string]any{"title": "Inherits", "parents": parents("desks"), "$access": acc("inheritPowers", true)})
-	w.doc("cat", "cut", map[string]any{"title": "Cut off", "parents": parents("desks"), "$access": acc("inherit", false, "inheritPowers", true)})
+	w.doc("cat", "cut", map[string]any{"title": "Cut off", "parents": parents("desks"),
+		"$access": acc("inherit", false, "inheritPowers", true, "group:match-desk", "reader")})
 	w.doc("cat", "deep", map[string]any{"title": "Deep", "parents": parents("inh")})
 	w.doc("matches", "pw", map[string]any{"title": "pw"})
 	w.start()
@@ -110,7 +111,9 @@ func TestInheritPowers(t *testing.T) {
 	place("deep", 200)
 	// inheritPowers brings them down to that folder.
 	place("inh", 200)
-	// inherit: false stops the walk up, so nothing is collected.
+	// inherit: false stops the walk up, so nothing is collected but cut's
+	// own reader, which keeps it visible (§B.11.4: a hidden folder is 404)
+	// and has no power.
 	place("cut", 403)
 	// Folders can be created under it, by the same power.
 	w.issue(bob, map[string]any{"node": "newf", "want": toAny("create"), "to": toAny("inh")}, 200)
@@ -119,7 +122,7 @@ func TestInheritPowers(t *testing.T) {
 	// Moves: still bounded by no widening. Out of inh (move there comes by
 	// inheritPowers) into derbies (fan-club: desk) would widen.
 	anna := w.caller("user:anna", "translators")
-	w.issue(anna, map[string]any{"item": "/r/matches/pw", "want": toAny("place"), "to": toAny("inh")}, 403)
+	w.issue(anna, map[string]any{"item": "/r/matches/pw", "want": toAny("place"), "to": toAny("inh")}, 404) // inh is hidden from anna
 	g := w.grantFor(bob, map[string]any{"item": "/r/matches/pw", "want": toAny("place"), "to": toAny("inh")})
 	must(w.core(g).CreateDoc(context.Background(), "cat", "matches.pw", map[string]any{"parents": parents("inh")}))
 	w.caughtUp()
@@ -144,7 +147,7 @@ func TestReadGrantsAreFixedToTheResource(t *testing.T) {
 	if r.status != 200 {
 		t.Fatalf("read-grants: %d %v", r.status, r.body)
 	}
-	tok := r.body["grants"].([]any)[0].(map[string]any)["grant"].(string)
+	tok := entry(r, 0)["grant"].(string)
 	g, err := grant.Decode(tok, 1<<20)
 	if err != nil {
 		t.Fatal(err)

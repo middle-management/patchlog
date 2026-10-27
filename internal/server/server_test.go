@@ -373,9 +373,10 @@ func TestWrites(t *testing.T) {
 	// Append on a tombstoned resource with the old head: 410.
 	r = e.write("PATCH", "docs", "a", id2, ops(op("replace", "/n", 3.0)))
 	expectCode(t, r, 410, "gone")
-	// Create on a tombstoned resource: 412 {head: tombstone}.
+	// Create on a tombstoned resource: 410 gone {head: tombstone}, never
+	// 412 (§7.2, §8.1).
 	r = e.write("PATCH", "docs", "a", "", addRoot(map[string]any{}))
-	expectCode(t, r, 412, "stale")
+	expectCode(t, r, 410, "gone")
 	if r.Str("head") != tomb {
 		t.Fatalf("create on tombstone: %s", r.Body)
 	}

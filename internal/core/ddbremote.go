@@ -672,7 +672,16 @@ func (b *ddbBackend) remoteBases(ctx context.Context, name string) ([]*remoteBas
 // applied to the branch as one in it would be (propagatePurge: its own
 // entry, its branches', and the shadows' copies), then the checkpoint,
 // moved from the one read — a follow that finds it moved does nothing.
-func (b *ddbBackend) followed(ctx context.Context, rb *remoteBase, entries []client.NSEntry, head string, follow bool) error {
+//
+// The base's config changes (docs) and the catch-up aren't followed here
+// yet: levels and epochs a base raises to stay as at creation.
+func (b *ddbBackend) followed(ctx context.Context, rb *remoteBase, entries []client.NSEntry, head string, docs map[string]sourceDoc, catchUp *sourceDoc, catchErr error) error {
+	return errors.Join(b.followPurges(ctx, rb, entries, head), catchErr)
+}
+
+// followPurges records and applies the purges of entries, then moves the
+// checkpoint to head.
+func (b *ddbBackend) followPurges(ctx context.Context, rb *remoteBase, entries []client.NSEntry, head string) error {
 	cur, err := b.store.RemoteBaseOf(ctx, rb.branchName)
 	if err != nil {
 		return ddbAsErr(err)
@@ -711,7 +720,7 @@ func (b *ddbBackend) followed(ctx context.Context, rb *remoteBase, entries []cli
 		if en.Kind == "purge" {
 			res = en.Resource
 		}
-		applied := follow && bn != nil && !bn.Purged
+		applied := bn != nil && !bn.Purged
 		if err := b.store.PutNotice(ctx, rb.branchName, ddb.Notice{ID: en.ID, Kind: en.Kind, Resource: res, Applied: applied,
 			Created: now, Seq: uint64(now)*1000 + uint64(i)}); err != nil {
 			return ddbAsErr(err)

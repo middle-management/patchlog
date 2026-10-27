@@ -1220,7 +1220,9 @@ func toPointers(ss []string) []pointer.Pointer {
 
 // sides compares two sides' steps since a common ancestor (§F.3): the
 // overlapping writes under the array rule, and the delete-versus-change
-// cases.
+// cases. The incoming side is the one replayed onto the target, as a
+// branch's is in a merge, so its writes count the from of each copy too
+// (§F.3, §G.4.4).
 func sides(anc any, ancExists bool, incoming, own []client.Step, ownDeleted bool) []merge.Conflict {
 	var out []merge.Conflict
 	// merge.Writes reads the values the ops write, and an upstream
@@ -1229,7 +1231,7 @@ func sides(anc any, ancExists bool, incoming, own []client.Step, ownDeleted bool
 	if err != nil {
 		return []merge.Conflict{conflict(merge.ConflictUnreadable, fmt.Sprintf("writes could not be computed: %v", err))}
 	}
-	iw, err1 := merge.Writes(anc, ancExists, incoming)
+	iw, err1 := merge.BranchWrites(anc, ancExists, incoming)
 	ow, err2 := merge.Writes(anc, ancExists, own)
 	if err1 != nil || err2 != nil {
 		return []merge.Conflict{conflict(merge.ConflictUnreadable, fmt.Sprintf("writes could not be computed: %v", errors.Join(err1, err2)))}

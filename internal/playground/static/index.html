@@ -420,7 +420,7 @@
 
     <div class="card">
       <header><h2>Keys held</h2><button id="keysClear" class="tiny">Clear</button></header>
-      <div class="scroll"><table id="keysTbl"><thead><tr><th>kid</th><th>resource</th><th>from</th></tr></thead><tbody></tbody></table></div>
+      <div class="scroll"><table id="keysTbl"><thead><tr><th>kid</th><th>name</th><th>from</th></tr></thead><tbody></tbody></table></div>
       <div class="row"><label for="keysNs">Fetch</label><input id="keysNs" class="mono" placeholder="namespace" spellcheck="false"></div>
       <div class="row"><input id="keysEpochs" class="mono" placeholder="epochs, e.g. 1,2 (optional)" spellcheck="false"><input id="keysRes" class="mono" placeholder="resources (optional)" spellcheck="false"></div>
       <div class="row"><button id="keysFetch">POST /ns/{ns}/keys</button></div>
@@ -435,9 +435,10 @@
         <button id="krAdd" title="Wrap the current epoch key for the reader below">Add reader</button>
         <label class="check"><input type="checkbox" id="krHistory"> with older epochs</label>
         <button id="krRotate" class="danger" title="A new epoch key for the checked recipients only, with encryption.epoch + 1, in one batch">Rotate epoch</button>
+        <button id="krKnow" class="tiny" title="Remember the key below: keyring entries it wrapped open here, and it can be kept in a rotation">Remember key</button>
       </div>
       <textarea id="krReader" class="code" rows="2" spellcheck="false" placeholder='reader public key: {"kty":"OKP","crv":"X25519","x":&hellip;} or just x'></textarea>
-      <p class="note">The <code>keyring</code> resource holds each epoch key wrapped per recipient; the server only relays it (&sect;E.3.2). Rotating leaves out unchecked recipients (revocation) and needs a grant chained to a <code>*</code> key.</p>
+      <p class="note">The <code>keyring</code> resource holds each epoch key wrapped per recipient (<code>to</code>) in HPKE auth mode under the admin key that wrapped it (<code>from</code>), both by thumbprint; the server only relays it (&sect;E.3.2). An entry opens only with its sender's public key: this identity's, or one remembered here. Rotating leaves out unchecked recipients (revocation) and needs a grant chained to a <code>*</code> key.</p>
     </div>
 
     <div class="card">

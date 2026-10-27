@@ -27,6 +27,20 @@ const ddbAttempts = 8
 
 // writeItems is a resource write or a batch on DynamoDB.
 func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun bool) (res *WriteResult, err error) {
+	if cc != nil {
+		// A config change a remote branch's base judges reads the base's
+		// document first (withRemoteSource, §G.5.2).
+		err = b.e.withRemoteSource(ctx, func(ctx context.Context) error {
+			var werr error
+			res, werr = b.writeItems1(ctx, req, items, cc, source, isBatch, dryRun)
+			return werr
+		})
+		return res, err
+	}
+	return b.writeItems1(ctx, req, items, cc, source, isBatch, dryRun)
+}
+
+func (b *ddbBackend) writeItems1(ctx context.Context, req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun bool) (res *WriteResult, err error) {
 	e := b.e
 	ctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
@@ -52,6 +66,11 @@ func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, 
 			return out.res, nil
 		}
 		p := out.p
+		if p.cplan != nil {
+			if err := ddbRaiseRefused(r.config(p.n.configSeq), p.cplan.cfg); err != nil {
+				return nil, err
+			}
+		}
 		c, cerr := ddbCheck(func() *ddb.Commit { return r.commitOf(g, p) })
 		if cerr != nil {
 			return nil, cerr
@@ -290,6 +309,18 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 		}
 		return b.createNamespace(ctx, req, cc)
 	}
+	// A change a remote branch's base judges reads the base's document
+	// first (withRemoteSource, §G.5.2).
+	err = e.withRemoteSource(ctx, func(ctx context.Context) error {
+		var werr error
+		res, werr = b.writeConfig1(ctx, req, cc)
+		return werr
+	})
+	return res, err
+}
+
+func (b *ddbBackend) writeConfig1(ctx context.Context, req Request, cc ConfigChange) (res *WriteResult, err error) {
+	e := b.e
 	ctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
@@ -328,6 +359,9 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 			return out.p.replay, nil
 		}
 		n, p := out.n, out.p
+		if err := ddbRaiseRefused(out.cur, p.cfg); err != nil {
+			return nil, err
+		}
 		gid, err := b.storeGrant(ctx, out.a, max(out.cur.level, p.cfg.level) >= levelAtRest)
 		if err != nil {
 			return nil, err

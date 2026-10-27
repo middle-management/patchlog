@@ -58,7 +58,7 @@ func TestNonceRequired(t *testing.T) {
 	r := e.do(req{method: "POST", path: "/ns/n/batch?dry-run=1", body: body, author: "alice"})
 	expect(t, r, 200)
 	rep := r.Obj()["items"].([]any)
-	if a, b, c := rep[0].(map[string]any), rep[1].(map[string]any), rep[2].(map[string]any); a["status"] != 200.0 || b["code"] != "nonce" || c["code"] != "nonce" {
+	if a, b, c := rep[0].(map[string]any), rep[1].(map[string]any), rep[2].(map[string]any); a["status"] != 201.0 || b["code"] != "nonce" || c["code"] != "nonce" {
 		t.Fatalf("dry run %s", r.Body)
 	}
 	r = e.batchReq("n", body, "alice")
@@ -135,8 +135,12 @@ func TestNonceRequiredGuarded(t *testing.T) {
 	expect(t, e.patchNS("g", ops(op("add", "/nonce", "required")), sg), 201)
 	expectCode(t, e.branch("g", map[string]any{"name": "gb", "patches": ops(op("replace", "/nonce", "required"))}, cg), 403, "forbidden")
 	expect(t, e.branch("g", map[string]any{"name": "gb"}, cg), 201)
-	expectCode(t, e.patchNS("gb", ops(op("replace", "/nonce", "optional")), cg), 403, "forbidden")
+	// Turning off the base's requirement is a branch field, refused (422)
+	// before the *-key guard, whoever writes it (§7.4, §C.2); a guarded
+	// write that is otherwise valid needs a * key of the base.
+	expectNonceKept(t, e.patchNS("gb", ops(op("replace", "/nonce", "optional")), cg))
 	expectNonceKept(t, e.patchNS("gb", ops(op("replace", "/nonce", "optional")), sg))
+	expectCode(t, e.patchNS("gb", ops(op("add", "/signatures", "optional")), cg), 403, "forbidden")
 }
 
 // §G.3: a remote branch of a base that requires nonces must be created

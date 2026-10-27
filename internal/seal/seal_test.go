@@ -321,7 +321,7 @@ func TestHPKEWrap(t *testing.T) {
 	}
 	kr, _ := ResourceKey(ke, "ns", "derby")
 	wr, _ := WrapKey(pub, "ns#3", "derby", kr)
-	if v := wr.Value(); v["resource"] != "derby" {
+	if v := wr.Value(); v["name"] != "derby" {
 		t.Fatal(v)
 	}
 	if got, err := UnwrapKey(priv, wr); err != nil || !bytes.Equal(got, kr) {

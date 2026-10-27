@@ -51,9 +51,11 @@
 // don't matter for the catalog's API: it is only proof of identity.
 //
 // Decisions (POST /grants, POST /read-grants, POST /merge-grants) are
-// taken at one checkpoint, which answers carry beside each grant as
-// checkpoint, { ns: ns_id }: the ns_ids of the catalog and of each named
-// item's namespace there (§B.11.4, checkpointAt), which are all a
+// taken at one checkpoint, which answers carry beside the grant, and a
+// /read-grants answer once beside all its items, as checkpoint,
+// { ns: ns_id }: the ns_ids of the catalog, of each named
+// item's namespace there, and of the content namespaces whose roles or
+// includes the decision read (§B.11.4, checkpointAt), which are all a
 // decision depends on, not the combined checkpoint of listings (§B.5).
 // So do refusals that are decisions (403, 404, 409, 410), so a client that
 // caches decisions keys them by it; the grants' own at stays the
@@ -82,6 +84,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"database/sql"
+	"embed"
 	"errors"
 	"fmt"
 	"net/http"
@@ -91,6 +94,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/pointer"
@@ -244,44 +248,26 @@ func (s *Service) Handler() http.Handler {
 
 // --- storage (tree.Hook) ------------------------------------------------------
 
-// Init creates the tables of §B.11.7. The spec's nodes(node, inherit) is
-// access_nodes here (the tree service has its own nodes table), and
-// effective is kept for every node (folders too, for listing visibility),
-// keyed by the node's href. Rows with tombstoned = 1 are a deleted item's,
-// frozen as they were when its tombstone was seen, and rows with
-// tombstoned = 2 a deleted placement's, kept as they were when its
-// catalog tombstone was seen (§B.11.7). A row with an empty subject and
-// role (keptMarker) records a deletion kept without rows.
+// Init creates or migrates the tables of §B.11.7 (migrations/), applied
+// under the namespace "catalog" (package dbmigrate). The spec's
+// nodes(node, inherit) is access_nodes here (the tree service has its own
+// nodes table), and effective is kept for every node (folders too, for
+// listing visibility), keyed by the node's href. Rows with tombstoned = 1
+// are a deleted item's, frozen as they were when its tombstone was seen,
+// and rows with tombstoned = 2 a deleted placement's, kept as they were
+// when its catalog tombstone was seen (§B.11.7). A row with an empty
+// subject and role (keptMarker) records a deletion kept without rows.
 func (s *Service) Init(ctx context.Context, db *sql.DB) error {
-	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS access_nodes (node TEXT PRIMARY KEY, inherit INTEGER NOT NULL DEFAULT 1)`,
-		`CREATE TABLE IF NOT EXISTS acl (node TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY (node, subject, role)) WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS effective (node TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL,
-			tombstoned INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (node, subject, role)) WITHOUT ROWID`,
-		`CREATE INDEX IF NOT EXISTS effective_by_subject ON effective (subject, node)`,
-	} {
-		if _, err := db.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("catalog: schema: %w", err)
-		}
-	}
-	// A database from before tombstoned rows: the rows of placements whose
-	// item is tombstoned become its frozen rows.
-	var has int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('effective') WHERE name = 'tombstoned'`).Scan(&has); err != nil {
+	if err := dbmigrate.Migrate(ctx, db, migrations, "catalog"); err != nil {
 		return fmt.Errorf("catalog: schema: %w", err)
-	}
-	if has == 0 {
-		for _, q := range []string{
-			`ALTER TABLE effective ADD COLUMN tombstoned INTEGER NOT NULL DEFAULT 0`,
-			fmt.Sprintf(`UPDATE effective SET tombstoned = 1 WHERE node IN (SELECT href FROM nodes WHERE item_state = %d)`, tree.ItemTombstoned),
-		} {
-			if _, err := db.ExecContext(ctx, q); err != nil {
-				return fmt.Errorf("catalog: schema: %w", err)
-			}
-		}
 	}
 	return nil
 }
+
+// migrations holds the catalog's tables in the tree service's database.
+//
+//go:embed migrations
+var migrations embed.FS
 
 // Rebuild recomputes acl and effective from the graph. Frozen rows of
 // deleted items, and the rows of deleted placements, can't be derived
@@ -881,16 +867,20 @@ func (s *Service) frozenRolesFor(name string, subs map[string]bool) map[string]b
 // (§B.11.5, §B.11.7). There is nothing to recompute: visibility is decided
 // per request from effective and those documents.
 func (s *Service) Resolve(ctx context.Context, v *grant.Verified) ([]string, tree.Visibility, error) {
-	keyed := groupSubjects(v.Principal.Groups)
-	if user := UserSubject(v.Principal.ID); user != "" {
-		with := false
-		s.t.View(func(g *tree.Graph, _ map[string]string) { with = s.users[user] || s.subScoped(g) })
-		if with {
-			keyed = append(keyed, user)
-			sort.Strings(keyed)
-		}
-	}
+	var keyed []string
+	s.t.View(func(g *tree.Graph, _ map[string]string) { keyed = s.keyedAt(g, v) })
 	return keyed, s.ForSubjects(keyed), nil
+}
+
+// keyedAt is the subject set Resolve keys v's listings by, as of the
+// checkpoint g reflects. Call it under View.
+func (s *Service) keyedAt(g *tree.Graph, v *grant.Verified) []string {
+	keyed := groupSubjects(v.Principal.Groups)
+	if user := UserSubject(v.Principal.ID); user != "" && (s.users[user] || s.subScoped(g)) {
+		keyed = append(keyed, user)
+		sort.Strings(keyed)
+	}
+	return keyed
 }
 
 // subScoped reports whether the catalog's key has a sub scope in some
@@ -1140,6 +1130,23 @@ func (v *visibility) Node(g *tree.Graph, n *tree.Node) bool {
 		return false
 	}
 	return v.counts(v.roles(g, n.ItemNS), eff, n.ItemName, true)
+}
+
+// Organising is Node as organising requests judge a node (§B.11.4,
+// §B.11.5): a dangling placement is judged as if its item were live,
+// from the roles at it computed from the graph as a live item's are
+// (Effective; a deleted item's frozen rows aren't its roles at the node),
+// through its item's content namespace, which must still be trusted. A
+// cyclic or implicit node stays hidden: it collects nothing (§B.5
+// Cycles, §B.9).
+func (v *visibility) Organising(g *tree.Graph, n *tree.Node) bool {
+	switch {
+	case n == nil || n.Self || n.Cyclic:
+		return false
+	case n.Kind == tree.KindFolder || n.Live():
+		return v.Node(g, n)
+	}
+	return v.counts(v.roles(g, n.ItemNS), Effective(g, n.Name, nil), n.ItemName, true)
 }
 
 // counts reports whether a role of eff (a node's roles per subject)

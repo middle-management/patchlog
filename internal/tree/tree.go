@@ -20,13 +20,16 @@
 // depth 64 and deeper nodes are flagged (§B.5).
 //
 // A Hook (the catalog of §B.11) can keep more derived tables in the same
-// transactions, and a RoleView can widen what a reader may see.
+// transactions, and a RoleView filters listings by subject set (§B.11.5).
+// Without one, a tree service serves only unfiltered listings: in the
+// public URL space while everything is public, else g/all (Handler).
 //
 // Encrypted namespaces (Addendum E, package derived). Sealed (E2)
 // namespaces are followed with keys from POST /ns/{ns}/keys (the Client
 // must be built WithKeys; Recipient unwraps keys wrapped to the grant's
 // enc). An e2e (E3) catalog is followed only with a keyring Recipient key,
-// otherwise it is skipped (listings answer 503 "skipped"); an e2e content
+// otherwise it is skipped (listings answer 404, as for a catalog the
+// service doesn't serve); an e2e content
 // namespace without one is still followed for its items' heads (plaintext
 // ids), but its documents are not read, so it contributes no implicit
 // placements. GET /_status reports each namespace's state and why any is
@@ -62,6 +65,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
@@ -70,6 +74,7 @@ import (
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/repurge"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
+	"github.com/middle-management/patchlog/internal/svcedge"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -146,7 +151,9 @@ type Options struct {
 	FollowOptions []follow.Option
 	// Hook, if set, keeps derived tables in the same transactions.
 	Hook Hook
-	// RoleView, if set, lets readers see nodes through roles (§B.11.5).
+	// RoleView, if set, lets readers see nodes through roles (§B.11.5):
+	// listings of each subject set, under /{catalog}/g/{gs}/. Without
+	// one, the service serves only g/all, and no filtered listings.
 	RoleView RoleView
 	// EdgeGrants, if set, mints and verifies the service's own edge grants
 	// (§B.11.5, §C.5; edgegrants.go): cookies for /{catalog}/g/{gs},
@@ -164,7 +171,8 @@ type Options struct {
 	// ExchangeRate is the exchangeRate bucket each principal draws one
 	// token from per exchange at POST /edge-grants (§C.5, §6.6; default
 	// DefaultExchangeRate). It is a deployment's limit, so the service
-	// has its own, per process.
+	// has its own buckets, shared by every instance on its database DB
+	// (§B.11.5, svcedge.Store).
 	ExchangeRate Rate
 	// Branches makes the service a release preview (§B.5, §F.9): it maps
 	// a namespace (the catalog, or a content namespace it trusts) to the
@@ -223,10 +231,12 @@ type Service struct {
 	// kept with EdgeGrants only (edgegrants.go).
 	trusted map[string]time.Time
 
+	// edge keeps the subjects behind each gs the service minted edge
+	// grants for, and the exchangeRate buckets, shared with the instances
+	// on its database (edgegrants.go).
+	edge      *svcedge.Store
 	emu       sync.Mutex
-	edgeSubs  map[string]edgeSubjects // gs → its subjects, for its edge grants
-	allIssued map[int64]time.Time     // exp → the first issue of a g/all edge grant expiring then
-	exchanges exchangeBuckets         // exchangeRate, per principal
+	allIssued map[int64]time.Time // exp → the first issue of a g/all edge grant expiring then
 
 	// siblings are the services of the other catalogs behind the same
 	// Multi, set before it serves (awaitMins).
@@ -236,6 +246,10 @@ type Service struct {
 	runCtx  context.Context
 	running map[string]context.CancelFunc
 	fwg     sync.WaitGroup
+	// runs stops the running follower of a followed namespace, by the
+	// name it follows (runFollower), which Apply does once a config
+	// change leaves the service without its keys (derived.Keys.Recheck).
+	runs map[string]context.CancelFunc
 }
 
 // Open opens (creating) the database, reads the core's origin and loads
@@ -321,38 +335,26 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 }
 
 func (s *Service) init(ctx context.Context) error {
-	if s.opt.Rebuild {
-		for _, q := range dropStmts {
-			if _, err := s.db.ExecContext(ctx, q); err != nil {
-				return fmt.Errorf("tree: rebuild: %w", err)
-			}
-		}
+	if err := dbmigrate.Migrate(ctx, s.db, migrations, "tree"); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
 	}
-	if err := s.cps.Init(ctx); err != nil {
-		return err
-	}
-	for _, q := range createStmts {
-		if _, err := s.db.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("tree: schema: %w", err)
-		}
-	}
-	// A database from an earlier release (addedColumns).
-	for _, tc := range addedColumns {
-		var has int
-		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, tc[0], tc[1]).Scan(&has); err != nil {
-			return fmt.Errorf("tree: schema: %w", err)
-		}
-		if has == 0 {
-			if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+tc[0]+` ADD COLUMN `+tc[1]+` TEXT`); err != nil {
-				return fmt.Errorf("tree: schema: %w", err)
-			}
-		}
+	var err error
+	if s.edge, err = svcedge.NewStore(ctx, s.db); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
 	}
 	if err := s.sealed.Init(ctx); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
 	}
+	if err := s.dropWholeViews(ctx); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
+	}
 	if err := repurge.Init(ctx, s.db); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
+	}
+	if s.opt.Rebuild {
+		if err := reset(ctx, s.db); err != nil {
+			return fmt.Errorf("tree: rebuild: %w", err)
+		}
 	}
 	if s.opt.Hook != nil {
 		if err := s.opt.Hook.Init(ctx, s.db); err != nil {
@@ -545,6 +547,19 @@ func (s *Service) View(fn func(g *Graph, cur map[string]string)) {
 	fn(s.g, s.cur)
 }
 
+// PurgeEntry reports whether the service holds ns as purged as of the
+// checkpoints a View's fn is given, and then ns's purge-ns entry: its
+// checkpoint for ns, since a purge-ns entry is the log's last (§8.5), so
+// the head a 410 purged names (§12.1), as a catalog service answers for
+// every name of a purged content namespace (§B.11.4). Call it from a
+// View's fn, which holds the lock it reads under.
+func (s *Service) PurgeEntry(ns string) (head string, purged bool) {
+	if _, purged = s.purged[ns]; purged {
+		head = s.cur[ns]
+	}
+	return head, purged
+}
+
 func (s *Service) state() (cur string, purged bool, changed <-chan struct{}) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -682,14 +697,18 @@ func (s *Service) Run(ctx context.Context) error {
 		}()
 	}
 	// Born and deleted explicit placements, one log or page per node of a
-	// database from before them, are read beside the followers, which
-	// don't wait for them.
+	// database from before them, and the epochs heads are served under,
+	// are read beside the followers, which don't wait for them.
 	s.fwg.Add(1)
 	go func() {
 		defer s.fwg.Done()
 		if err := s.backfillNodes(ctx); err != nil && ctx.Err() == nil {
 			s.opt.Logf("tree: nodes: %v; retrying", err)
 			s.retryBackfill(ctx, "nodes", s.backfillNodes)
+		}
+		if err := s.backfillEpochs(ctx); err != nil && ctx.Err() == nil {
+			s.opt.Logf("tree: epochs: %v; retrying", err)
+			s.retryBackfill(ctx, "epochs", s.backfillEpochs)
 		}
 	}()
 	s.ensureFollowers()
@@ -783,12 +802,18 @@ func (s *Service) follow(ctx context.Context, ns string) {
 				return
 			}
 			err = fmt.Errorf("skipped: %s", reason)
-		} else if ns != s.opt.Catalog && s.opt.RoleView != nil {
-			if err = s.ensureContent(ctx, ns); err == nil {
-				err = follow.New(s.c, real, s.cps, s, opts...).Run(ctx)
-			}
 		} else {
-			err = follow.New(s.c, real, s.cps, s, opts...).Run(ctx)
+			if ns == s.opt.Catalog || s.opt.RoleView == nil {
+				err = s.runFollower(ctx, real, opts)
+			} else if err = s.ensureContent(ctx, ns); err == nil {
+				err = s.runFollower(ctx, real, opts)
+			}
+			if _, lacks := s.keys.Skip(real); lacks && ctx.Err() == nil {
+				// Apply stopped it: a config change (a raise to e2e, an
+				// epoch) left the service without its keys. Decided as
+				// when it starts, at once.
+				continue
+			}
 		}
 		if ctx.Err() != nil {
 			return
@@ -814,11 +839,52 @@ func (s *Service) follow(ctx context.Context, ns string) {
 	}
 }
 
+// runFollower runs a follower of real until it ends, or until Apply stops
+// it (stopRun).
+func (s *Service) runFollower(ctx context.Context, real string, opts []follow.Option) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s.fmu.Lock()
+	if s.runs == nil {
+		s.runs = map[string]context.CancelFunc{}
+	}
+	s.runs[real] = cancel
+	s.fmu.Unlock()
+	defer func() {
+		s.fmu.Lock()
+		delete(s.runs, real)
+		s.fmu.Unlock()
+	}()
+	return follow.New(s.c, real, s.cps, s, opts...).Run(ctx)
+}
+
+// hasRun reports whether real has a running follower of its own
+// (runFollower).
+func (s *Service) hasRun(real string) bool {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+	_, ok := s.runs[real]
+	return ok
+}
+
+// stopRun stops the running follower of real, reporting whether it had
+// one.
+func (s *Service) stopRun(real string) bool {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+	cancel, ok := s.runs[real]
+	if ok {
+		cancel()
+	}
+	return ok
+}
+
 // prep is one coalesced change with its fetched content.
 type prep struct {
 	name  string
 	kind  string // head, tombstone or purge
 	head  string
+	epoch int // the epoch head is served under (derived.EpochOf), 0 if not known
 	doc   any
 	title string // the item's title at the catalog's pointer (§B.5)
 	// created is the head's created as the log gives it, file its file
@@ -860,6 +926,18 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		if u.Config != nil {
 			cfg = u.Config
 			s.keys.Observe(fb.NS, u.Config.Value)
+		}
+	}
+	if cfg != nil && s.hasRun(fb.NS) {
+		// A raise (to e2e from none or at-rest, Addendum E Levels) or an
+		// epoch whose keys the service lacks as configured: skipped as
+		// when its follower starts (the catalog's listings are 404,
+		// §E.2.6; a content namespace is still followed for heads), and
+		// not followed. The batch isn't applied: once the keys come, a
+		// restart resumes at it.
+		if reason, lacks := s.keys.Recheck(ctx, fb.NS, !isCat); lacks && s.stopRun(fb.NS) {
+			s.opt.Logf("tree: skipping %s: %s", fb.NS, reason)
+			return fmt.Errorf("tree: %s skipped: %s", fb.NS, reason)
 		}
 	}
 	// A content namespace's document as of the new checkpoint, which a
@@ -939,12 +1017,12 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 					// entry's created isn't its (follow.FetchDoc).
 					p.created = ""
 				}
-				p.head, p.doc = doc.ID, doc.Value
+				p.head, p.doc, p.epoch = doc.ID, doc.Value, derived.EpochOf(fb.NS, doc.Kid)
 				if titled {
 					p.title = titleAt(doc.Value, tptr)
 				}
 				if filed {
-					p.file = fileMetaOf(doc, p.created)
+					p.file = fileMetaOf(doc, p.created, fb.NS)
 				}
 				// A node's born (§B.5): a catalog node's, or that of the
 				// implicit placement a content document makes (§B.9).
@@ -1186,7 +1264,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			changed[p.name] = true
 			if p.kind == "head" && p.doc != nil {
 				n := ParseNode(cat, p.name, p.head, p.doc)
-				n.Born, n.BornUnknown = p.born, p.bornUnknown
+				n.Born, n.BornUnknown, n.Epoch = p.born, p.bornUnknown, p.epoch
 				if g.explicitGone[p.name] {
 					if err := saveGone(ctx, tx, p.name, false); err != nil {
 						return nil, err

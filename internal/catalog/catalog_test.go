@@ -571,8 +571,10 @@ func TestPlaceMoveUnplace(t *testing.T) {
 	// Place: in the content namespace's place list, and place on the folder.
 	w.doc("matches", "newone", map[string]any{"title": "new"})
 	w.issue(anna, map[string]any{"item": "/r/matches/newone", "want": toAny("place"), "to": toAny("season")}, 403)
-	w.issue(bob, map[string]any{"item": "/r/matches/newone", "want": toAny("place"), "to": toAny("rumours")}, 403)
-	w.issue(bob, map[string]any{"item": "/r/matches/newone", "want": toAny("place"), "to": toAny("matches.derby")}, 422)
+	// rumours is hidden from bob, and a placement is no folder: both are
+	// answered as a folder not in the catalog (§B.11.4, §B.11.5).
+	w.issue(bob, map[string]any{"item": "/r/matches/newone", "want": toAny("place"), "to": toAny("rumours")}, 404)
+	w.issue(bob, map[string]any{"item": "/r/matches/newone", "want": toAny("place"), "to": toAny("matches.derby")}, 404)
 	w.issue(bob, map[string]any{"item": "/r/matches/derby", "want": toAny("place"), "to": toAny("season")}, 409)
 	g := w.grantFor(bob, map[string]any{"item": "/r/matches/newone", "want": toAny("place"), "to": toAny("/r/cat/season")})
 	bc := w.core(g)
@@ -595,12 +597,17 @@ func TestPlaceMoveUnplace(t *testing.T) {
 	// Move: move on every parent left and every target; no widening.
 	w.doc("cat", "deskonly", map[string]any{"title": "Desk only", "parents": parents("root"), "$access": acc("group:match-desk", "desk")})
 	w.caughtUp()
-	w.issue(bob, map[string]any{"node": "matches.newone", "want": toAny("move"), "to": toAny("rumours")}, 403) // no move on rumours
-	w.issue(anna, map[string]any{"node": "matches.newone", "want": toAny("move"), "to": toAny("deskonly")}, 403)
+	w.issue(bob, map[string]any{"node": "matches.newone", "want": toAny("move"), "to": toAny("rumours")}, 404)   // rumours is hidden from bob
+	w.issue(anna, map[string]any{"node": "matches.newone", "want": toAny("move"), "to": toAny("deskonly")}, 404) // and deskonly from anna
+	w.issue(anna, map[string]any{"node": "matches.newone", "want": toAny("move"), "to": toAny("season")}, 403)   // no move on season
 	// season -> deskonly narrows everyone (only match-desk keeps desk).
-	g = w.grantFor(bob, map[string]any{"node": "matches.newone", "want": toAny("move"), "to": toAny("deskonly")})
+	// bob isn't an admin: the write begins with a test of the parents
+	// the answer gives (§B.11.4 Move).
+	mb := w.issue(bob, map[string]any{"node": "matches.newone", "want": toAny("move"), "to": toAny("deskonly")}, 200).body
 	h := must(w.ops.Head(ctx, "cat", "matches.newone"))
-	must(w.core(g).Append(ctx, "cat", "matches.newone", h.ID, []any{map[string]any{"op": "replace", "path": "/parents", "value": parents("deskonly")}}))
+	must(w.core(mb["grant"].(string)).Append(ctx, "cat", "matches.newone", h.ID, []any{
+		map[string]any{"op": "test", "path": "/parents", "value": mb["parents"]},
+		map[string]any{"op": "replace", "path": "/parents", "value": parents("deskonly")}}))
 	w.caughtUp()
 	w.issue(anna, map[string]any{"item": "/r/matches/newone", "want": toAny("read")}, 403)
 	// derbies gives fan-club desk: widening, refused.
@@ -618,22 +625,25 @@ func TestPlaceMoveUnplace(t *testing.T) {
 	if _, err := ac.Append(ctx, "cat", "matches.newone", h.ID, []any{map[string]any{"op": "replace", "path": "/parents", "value": parents("season")}}); !isStatus(err, 403) {
 		t.Errorf("move to another target: %v", err)
 	}
+	// A Move grant may also change the node's other members (§B.11.4
+	// Move, v0.66).
 	if _, err := ac.Append(ctx, "cat", "matches.newone", h.ID, []any{
 		map[string]any{"op": "replace", "path": "/parents", "value": parents("derbies")},
-		map[string]any{"op": "add", "path": "/title", "value": "x"}}); !isStatus(err, 403) {
-		t.Errorf("move writing outside /parents: %v", err)
-	}
-	if _, err := ac.Append(ctx, "cat", "matches.newone", h.ID, []any{map[string]any{"op": "replace", "path": "/parents", "value": parents("derbies")}}); err != nil {
+		map[string]any{"op": "add", "path": "/title", "value": "x"}}); err != nil {
 		t.Fatalf("move: %v", err)
 	}
 	w.caughtUp()
 	w.issue(w.caller("user:fred", "fan-club"), map[string]any{"item": "/r/matches/newone", "want": toAny("append")}, 200)
-	// A folder can't move under its own descendant.
-	w.issue(admin, map[string]any{"node": "season", "want": toAny("move"), "to": toAny("rumours")}, 409)
+	// A folder can't move under its own descendant, an admin's neither
+	// (§B.11.4 Move, v0.67).
+	w.issue(admin, map[string]any{"node": "season", "want": toAny("move"), "to": toAny("rumours")}, 403)
 
-	// Unplace: move on every current parent.
-	w.issue(anna, map[string]any{"node": "matches.newone", "want": toAny("delete")}, 403)
-	w.issue(bob, map[string]any{"node": "season", "want": toAny("delete")}, 422)
+	// Unplace: move on every current parent. Under derbies, newone is
+	// hidden from anna: 404 (§B.11.5).
+	w.issue(anna, map[string]any{"node": "matches.newone", "want": toAny("delete")}, 404)
+	// A folder is deleted as a placement is unplaced (§B.11.4); bob can't:
+	// season's parent root is hidden from him.
+	w.issue(bob, map[string]any{"node": "season", "want": toAny("delete")}, 403)
 	g = w.grantFor(bob, map[string]any{"node": "/r/cat/matches.newone", "want": toAny("delete")})
 	h = must(w.ops.Head(ctx, "cat", "matches.newone"))
 	if _, err := w.core(g).Delete(ctx, "cat", "matches.derby", must(w.ops.Head(ctx, "cat", "matches.derby")).ID); !isStatus(err, 403) {
@@ -680,8 +690,9 @@ func TestCreateFlow(t *testing.T) {
 	g := w.grantFor(bob, map[string]any{"item": "/r/matches/final", "want": toAny("place"), "to": toAny("season")})
 	must(w.core(g).CreateDoc(ctx, "cat", "matches.final", map[string]any{"parents": parents("season")}))
 	w.caughtUp()
-	// A dangling placement grants nothing but create.
-	w.issue(bob, map[string]any{"item": "/r/matches/final", "want": toAny("read")}, 403)
+	// A dangling placement grants nothing but create: a read of a name
+	// that never existed is 404 (§B.11.4).
+	w.issue(bob, map[string]any{"item": "/r/matches/final", "want": toAny("read")}, 404)
 	w.issue(bob, map[string]any{"item": "/r/matches/final", "want": toAny("create", "append")}, 400)
 	// Roles without create (translator) get nothing.
 	w.issue(anna, map[string]any{"item": "/r/matches/final", "want": toAny("create")}, 403)
@@ -803,8 +814,8 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 	if locLi == loc {
 		t.Error("a user with direct entries shares the group listing")
 	}
-	// Presenting someone else's gs redirects to one's own.
-	if r := w.do("GET", locLi, fan, nil); r.status != 302 || r.header.Get("Location") != loc {
+	// Presenting someone else's gs is 403, never redirected (§B.11.5).
+	if r := w.do("GET", locLi, fan, nil); r.status != 403 || r.header.Get("Location") != "" {
 		t.Errorf("foreign gs: %d %s", r.status, r.header.Get("Location"))
 	}
 	// The embargoed folder: invisible to fan-club, visible to editors-in-chief.
@@ -834,14 +845,15 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 		t.Errorf("guest paths: %v", b)
 	}
 
-	// Read grants: one per item, fixed to it, no-store.
+	// Read grants: one per item, fixed to it, no-store; a name that never
+	// existed is 404 (§B.11.4, §B.11.5).
 	r := w.do("POST", "/read-grants", fan, map[string]any{"items": toAny("/r/matches/derby", "/r/matches/rumour1", "/r/matches/nope")})
 	if r.status != 200 || r.header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("read-grants: %d %v", r.status, r.header)
 	}
-	gs := r.body["grants"].([]any)
+	gs := r.body["items"].([]any)
 	g0, g1, g2 := gs[0].(map[string]any), gs[1].(map[string]any), gs[2].(map[string]any)
-	if g0["grant"] == nil || g1["error"].(map[string]any)["status"] != 403.0 || g2["error"] == nil {
+	if g0["grant"] == nil || g1["status"] != 403.0 || g2["status"] != 404.0 {
 		t.Fatalf("read-grants: %v", gs)
 	}
 	rc := w.core(g0["grant"].(string))
@@ -1024,9 +1036,11 @@ func TestNoWideningIncludes(t *testing.T) {
 	}
 	apply := func(node, to string) {
 		t.Helper()
-		g := w.grantFor(mover, map[string]any{"node": node, "want": toAny("move"), "to": toAny(to)})
+		b := w.issue(mover, map[string]any{"node": node, "want": toAny("move"), "to": toAny(to)}, 200).body
 		h := must(w.ops.Head(ctx, "cat", node))
-		must(w.core(g).Append(ctx, "cat", node, h.ID, []any{map[string]any{"op": "replace", "path": "/parents", "value": parents(to)}}))
+		must(w.core(b["grant"].(string)).Append(ctx, "cat", node, h.ID, []any{
+			map[string]any{"op": "test", "path": "/parents", "value": b["parents"]},
+			map[string]any{"op": "replace", "path": "/parents", "value": parents(to)}}))
 		w.caughtUp()
 	}
 	// desk → reader narrows; reader → desk widens.

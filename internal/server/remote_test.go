@@ -382,8 +382,8 @@ func TestRemoteBranch(t *testing.T) {
 	expect(t, b.get("/r/rel/c/rev/"+f.c1), 410)        // and its content isn't here
 	expect(t, b.get("/r/rel/late"), 404)               // created after at
 	expect(t, b.get("/r/rel/derby/rev/"+f.lateD), 404) // appended after at
-	hb := b.get("/ns/rel/rev/" + b.nsHead("rel") + "/heads").Obj()["items"]
-	ha := a.get("/ns/main/rev/" + f.at + "/heads").Obj()["items"]
+	hb := b.get("/ns/rel/rev/" + b.nsHead("rel") + "/heads").Obj()["heads"]
+	ha := a.get("/ns/main/rev/" + f.at + "/heads").Obj()["heads"]
 	if string(canonical(hb)) != string(canonical(ha)) {
 		t.Fatalf("heads differ\nA %s\nB %s", canonical(ha), canonical(hb))
 	}
@@ -447,7 +447,7 @@ func TestRemoteBranch(t *testing.T) {
 
 func headAt(t *testing.T, e *tenv, ns, at, name string) string {
 	t.Helper()
-	for _, x := range e.get("/ns/" + ns + "/rev/" + at + "/heads").Obj()["items"].([]any) {
+	for _, x := range e.get("/ns/" + ns + "/rev/" + at + "/heads").Obj()["heads"].([]any) {
 		m := x.(map[string]any)
 		if m["resource"] == name {
 			s, _ := m["target"].(string)
@@ -673,26 +673,29 @@ func TestRemotePurgeFollowed(t *testing.T) {
 	expect(t, b.get("/r/rel/mine"), 302)
 }
 
-// With IgnorePurges, A's purges are recorded as notices only.
+// A deployment that doesn't follow its bases' logs (no SyncRemotes, as
+// with -remote-follow-interval 0) sees no purge; one that follows applies
+// every purge it sees, and never records one only as a notice (§4, §G.3).
 func TestRemotePurgeNotFollowed(t *testing.T) {
 	t.Parallel()
-	a, b, _ := pair(t, nil, nil, func(o *core.RemoteOptions) { o.IgnorePurges = true })
+	a, b, _ := pair(t, nil, nil)
 	f := populateA(t, a)
 	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
 	expect(t, a.purge("main", "derby", f.lateD, "admin"), 204)
 	ctx := context.Background()
+	if b.head("rel", "derby") != f.d2 {
+		t.Fatal("purge applied without following")
+	}
+	if ns, _ := b.e.RemoteNotices(ctx, ""); len(ns) != 0 {
+		t.Fatalf("notices without following %+v", ns)
+	}
 	if err := b.e.SyncRemotes(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if b.head("rel", "derby") != f.d2 {
-		t.Fatal("purge applied")
-	}
 	ns, _ := b.e.RemoteNotices(ctx, "")
-	if len(ns) != 1 || ns[0].Applied || ns[0].Branch != "rel" || ns[0].Resource != "derby" {
+	if len(ns) != 1 || !ns[0].Applied || ns[0].Branch != "rel" || ns[0].Resource != "derby" {
 		t.Fatalf("notices %+v", ns)
 	}
-	// The operator follows it with an ordinary purge.
-	expect(t, b.purge("rel", "derby", f.d2, "op"), 204)
 	expect(t, b.get("/r/rel/derby/rev/"+f.d1), 410)
 }
 

@@ -231,35 +231,6 @@ func TestReferenceQueries(t *testing.T) {
 	}
 }
 
-// An index database written before v0.44 has no refs table: opening it
-// replays the logs instead of serving an index that never saw a reference.
-func TestReferenceUpgrade(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
-	c := s.Client(t, client.WithAuthor("admin"))
-	for _, ns := range []string{"schemas", "pages"} {
-		must(c.CreateNamespace(ctx, ns, map[string]any{"read": "public"}))
-	}
-	sch := must(c.CreateDoc(ctx, "schemas", "page", pageSchema(true)))
-	must(c.CreateDoc(ctx, "pages", "a", map[string]any{"$schema": "/r/schemas/page/rev/" + sch.ID, "related": []any{"/r/pages/b"}}))
-	db := filepath.Join(t.TempDir(), "i.db")
-	x := startSvc(t, c, svcOpts{db: db, ns: []string{"pages"}})
-	x.caughtUp("pages")
-	x.stop()
-	// Simulate the old database.
-	{
-		o := startSvc(t, c, svcOpts{db: db, ns: []string{"pages"}, noRun: true})
-		if _, err := o.ix.DropRefsForTest(); err != nil {
-			t.Fatal(err)
-		}
-		o.stop()
-	}
-	y := startSvc(t, c, svcOpts{db: db, ns: []string{"pages"}})
-	y.caughtUp("pages")
-	y.expect("/pages?ref=%2Fr%2Fpages%2Fb", "a")
-}
-
 // Private namespaces: reference queries follow the catalog-listing rules,
 // are routed under the reader's subject set, keep the encoded query, and
 // show only what the reader may read.
@@ -328,14 +299,19 @@ func TestReferenceSealed(t *testing.T) {
 	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, now: s.Now}, func(o *indexOpts) { o.Recipient = priv })
 	x.caughtUp("sec")
 
+	// sec is public: hits are sealed per entry (§E.2.6, v0.73), refs
+	// included.
 	f := x.fetch("/sec?ref="+url.QueryEscape("/r/other/thing"), "")
-	if f.header.Get("Content-Type") != seal.ContentType || strings.Contains(string(f.body), "other") {
+	if f.header.Get("Content-Type") != "application/json" || strings.Contains(string(f.body), "other") {
 		t.Fatalf("not sealed: %s %s", f.header.Get("Content-Type"), f.body)
 	}
-	pt := must(derived.OpenView(string(f.body), epochKeys(t, w, "sec"), derived.View{NS: "sec", Target: f.path}))
-	b := decodeJSON(t, pt)
-	if got := refHits(t, b); fmt.Sprint(got) != "map[a:/related/0=/r/other/thing]" {
-		t.Errorf("refs %v in %s", got, pt)
+	hits := decodeJSON(t, f.body)["hits"].([]any)
+	if len(hits) != 1 || hits[0].(map[string]any)["resource"] != "a" {
+		t.Fatalf("hits %v", hits)
+	}
+	pt := must(derived.OpenItem(hits[0].(map[string]any)["sealed"].(string), derived.ItemKey(epochKeys(t, w, "sec"), "sec", "a"), derived.View{NS: "sec", Target: f.path}, "sec", "a"))
+	if v := decodeJSON(t, pt); fmt.Sprint(v["refs"]) != "[map[path:/related/0 ref:/r/other/thing]]" {
+		t.Errorf("refs in %s", pt)
 	}
 }
 

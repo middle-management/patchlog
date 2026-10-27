@@ -21,6 +21,7 @@ import (
 	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"github.com/santhosh-tekuri/jsonschema/v6/kind"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 )
@@ -238,11 +239,14 @@ var printer = message.NewPrinter(language.English)
 // They were unbounded, so a deployment whose schemas get new revisions
 // kept every revision it ever validated against until restart.
 //
-// A schema compiles under the Rules marker of the revision a document's
-// $schema names (§6.1), so compiled schemas are kept by path and marker.
+// A schema compiles under Rules markers (§6.1): every revision of its
+// closure under one (ValidateRules), kept by path and marker, or each
+// under its own (ValidateMarked), kept by path with the markers its
+// closure compiled under.
 type Validator struct {
 	mu       sync.Mutex
 	compiled lru.Cache[compiledKey, *jsonschema.Schema] // revision path and marker -> compiled root
+	marked   lru.Cache[string, markedSchema]            // revision path -> compiled root, each revision under its marker
 	docs     lru.Cache[string, any]                     // revision path -> checked schema document
 	meta     *jsonschema.Schema                         // draft 2020-12 meta-schema, for schemas written now
 }
@@ -265,6 +269,7 @@ const (
 func NewValidator() *Validator {
 	return &Validator{
 		compiled: lru.Cache[compiledKey, *jsonschema.Schema]{MaxEntries: maxCompiledSchemas},
+		marked:   lru.Cache[string, markedSchema]{MaxEntries: maxCompiledSchemas},
 		docs:     lru.Cache[string, any]{MaxEntries: maxSchemaDocs},
 		meta:     metaSchema(V073),
 	}
@@ -377,9 +382,10 @@ func Instance(doc any) any {
 // Validate implements §6.2 step 5 for a document written now. A document
 // that is a schema (a dialect $schema) is checked as one written now:
 // in write mode (CheckSchemaDocument), under V073. A schema revision a
-// document names compiles under Legacy, as every stored revision does
-// until revisions keep their markers. Re-validating content stored
-// under an earlier version takes ValidateRules.
+// document names compiles under Legacy, as a revision whose marker the
+// caller doesn't know does; a caller that knows each revision's marker
+// validates by ValidateMarked. Re-validating content stored under an
+// earlier version takes ValidateRules.
 func (v *Validator) Validate(doc any, load Loader) error {
 	if IsSchemaDoc(doc) {
 		return v.ValidateRules(doc, load, V073)
@@ -393,9 +399,16 @@ func (v *Validator) Validate(doc any, load Loader) error {
 // mode, as v0.55 did at write, and compiles it under Legacy, so
 // re-validating a schema revision stored (or copied from one stored)
 // before the upgrade gives the answer its write got. For any other
-// document, it is the marker of the schema revision its $schema names,
-// which governs that revision's whole $ref closure.
+// document, every revision of the $ref closure of the schema its $schema
+// names compiles under rules; a caller that knows each revision's own
+// marker validates by ValidateMarked.
 func (v *Validator) ValidateRules(doc any, load Loader, rules Rules) error {
+	return v.validate(doc, load, rules, nil)
+}
+
+// validate is ValidateRules, or ValidateMarked when rulesOf, the marker of
+// each schema revision, is given.
+func (v *Validator) validate(doc any, load Loader, rules Rules, rulesOf func(Ref) Rules) error {
 	obj, ok := doc.(map[string]any)
 	if !ok {
 		return nil
@@ -415,7 +428,13 @@ func (v *Validator) ValidateRules(doc any, load Loader, rules Rules) error {
 	if !ok {
 		return &RefError{Msg: fmt.Sprintf("$schema %q is neither a schema revision path nor a supported dialect", s)}
 	}
-	sch, err := v.compile(ref, load, rules)
+	var sch *jsonschema.Schema
+	var err error
+	if rulesOf != nil {
+		sch, err = v.compileMarked(ref, load, rulesOf)
+	} else {
+		sch, err = v.compile(ref, load, rules)
+	}
 	if err != nil {
 		return err
 	}
@@ -446,9 +465,9 @@ func (v *Validator) validateSchemaDocument(doc any, load Loader, rules Rules) er
 	var loadErr error
 	c := newCompiler(v.urlLoader(load, &loadErr), rules)
 	// The revisions of its $ref closure are stored, and compile as they
-	// did (§6.1): their patterns as Legacy reads them, until each compiles
-	// under its own marker. The document's own patterns were checked under
-	// rules above, by the meta-schema and the check.
+	// did (§6.1): their patterns as Legacy reads them, which is how each
+	// marker reads its own (marked.go). The document's own patterns were
+	// checked under rules above, by the meta-schema and the check.
 	c.UseRegexpEngine(Legacy.regexpEngine)
 	if err := c.AddResource(newSchemaURL, doc); err != nil {
 		return &SchemaError{Msg: err.Error()}
@@ -584,9 +603,17 @@ func toValidationError(err error) error {
 	var walk func(e *jsonschema.ValidationError)
 	walk = func(e *jsonschema.ValidationError) {
 		if len(e.Causes) == 0 {
+			k := e.ErrorKind
+			if f, ok := k.(*kind.Format); ok && f.Want != writtenFormat(f.Want) {
+				// A format renamed for its revision's marker (marked.go)
+				// is named as the schema writes it.
+				w := *f
+				w.Want = writtenFormat(f.Want)
+				k = &w
+			}
 			d := Detail{
 				Pointer: pointer.Pointer(e.InstanceLocation).String(),
-				Message: e.ErrorKind.LocalizedString(printer),
+				Message: k.LocalizedString(printer),
 			}
 			if !seen[d] {
 				seen[d] = true

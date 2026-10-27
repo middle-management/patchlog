@@ -1,0 +1,31 @@
+{
+  "section": "§G.4.1, §7.1",
+  "about": "history lines carry via, the delegatees of the grant a revision was written under, only with \"authors\": true; it isn't hashed into the id",
+  "vectors": [
+    {
+      "name": "history line with via, authors true",
+      "fn": "bundle.Writer (read by bundle.NewReader)",
+      "bundle": "{\"at\":{\"matches\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\"},\"authors\":true,\"bundle\":1,\"created\":\"2026-10-04T12:00:00Z\",\"docs\":{\"matches/derby\":{\"head\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"history\":\"full\"}},\"origin\":\"https://staging.example\"}\n{\"author\":\"user:anna\",\"created\":\"2026-10-04T12:00:00Z\",\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"ns\":\"matches\",\"parent\":\"\",\"patches\":[{\"op\":\"add\",\"path\":\"\",\"value\":{\"title\":\"Hello\",\"views\":0}}],\"resource\":\"derby\",\"via\":[\"svc:merge\",\"svc:import\"]}\n",
+      "verdict": "accept",
+      "digest": "1joyd6dww7ncoh3esg34kzh24x4tapdqk"
+    },
+    {
+      "name": "the same line in a bundle without authors",
+      "fn": "bundle.Writer (read by bundle.NewReader)",
+      "bundle": "{\"at\":{\"matches\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\"},\"authors\":false,\"bundle\":1,\"created\":\"2026-10-04T12:00:00Z\",\"docs\":{\"matches/derby\":{\"head\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"history\":\"full\"}},\"origin\":\"https://staging.example\"}\n{\"author\":\"user:anna\",\"created\":\"2026-10-04T12:00:00Z\",\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"ns\":\"matches\",\"parent\":\"\",\"patches\":[{\"op\":\"add\",\"path\":\"\",\"value\":{\"title\":\"Hello\",\"views\":0}}],\"resource\":\"derby\",\"via\":[\"svc:merge\",\"svc:import\"]}\n",
+      "verdict": "reject"
+    },
+    {
+      "name": "via empty",
+      "fn": "bundle.Writer (read by bundle.NewReader)",
+      "bundle": "{\"at\":{\"matches\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\"},\"authors\":true,\"bundle\":1,\"created\":\"2026-10-04T12:00:00Z\",\"docs\":{\"matches/derby\":{\"head\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"history\":\"full\"}},\"origin\":\"https://staging.example\"}\n{\"author\":\"user:anna\",\"created\":\"2026-10-04T12:00:00Z\",\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"ns\":\"matches\",\"parent\":\"\",\"patches\":[{\"op\":\"add\",\"path\":\"\",\"value\":{\"title\":\"Hello\",\"views\":0}}],\"resource\":\"derby\",\"via\":[]}\n",
+      "verdict": "reject"
+    },
+    {
+      "name": "via with an empty delegatee",
+      "fn": "bundle.Writer (read by bundle.NewReader)",
+      "bundle": "{\"at\":{\"matches\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\"},\"authors\":true,\"bundle\":1,\"created\":\"2026-10-04T12:00:00Z\",\"docs\":{\"matches/derby\":{\"head\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"history\":\"full\"}},\"origin\":\"https://staging.example\"}\n{\"author\":\"user:anna\",\"created\":\"2026-10-04T12:00:00Z\",\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"ns\":\"matches\",\"parent\":\"\",\"patches\":[{\"op\":\"add\",\"path\":\"\",\"value\":{\"title\":\"Hello\",\"views\":0}}],\"resource\":\"derby\",\"via\":[\"svc:merge\",\"\"]}\n",
+      "verdict": "reject"
+    }
+  ]
+}

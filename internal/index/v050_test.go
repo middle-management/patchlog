@@ -57,8 +57,10 @@ func TestMinAlwaysRedirects(t *testing.T) {
 		rematch:                curLoc,
 		"matches:" + rematch:   curLoc,
 		"schemas:" + schemasAt: curLoc,
-		first + "&min=" + at:   loc,
-		first + "&min=" + cur:  curLoc,
+		// A bare min is given once (§A.5, v0.73): more name the
+		// namespace.
+		"matches:" + first + "&min=matches:" + at:  loc,
+		"matches:" + first + "&min=matches:" + cur: curLoc,
 	} {
 		r := s.raw(loc+"&min="+m, "")
 		if r.status != 302 || r.header.Get("Location") != want {
@@ -122,7 +124,8 @@ func TestMinAlwaysRedirectsPrivate(t *testing.T) {
 	// pointer, min goes straight to the reader's own at URL, without min.
 	for _, p := range []string{atLoc + "&min=" + wr.NSID, "/sec?limit=5&min=sec:" + wr.NSID, "/sec/at/" + at + "?limit=5&min=" + wr.NSID, "/sec?limit=5&min=" + wr.NSID} {
 		r := x.raw(p, bob)
-		if r.status != 302 || r.header.Get("Location") != atLoc || r.header.Get("Cache-Control") != "private, no-cache" {
+		// A redirect that adds /g/{gs} is private, no-store (§A.4, v0.73).
+		if r.status != 302 || r.header.Get("Location") != atLoc || r.header.Get("Cache-Control") != "private, no-store" {
 			t.Errorf("%s: %d %s %v", p, r.status, r.header.Get("Location"), r.header)
 		}
 	}

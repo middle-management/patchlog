@@ -150,14 +150,14 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// An entry only where the prune moved the horizon or changed the keep
+	// set (§7.2, §8.6).
 	if res.NSID != "" {
 		w.Header().Set("X-Namespace-Revision", res.NSID)
 	}
-	out := map[string]any{"horizon": res.Horizon}
-	if res.Archive != "" {
-		out["archive"] = res.Archive
-	}
-	writeJSON(w, 200, out)
+	// The answer is { horizon }, the effective horizon, and nothing else
+	// (§8.6): the archive is linked from the pruned revisions' 410 (§7.1).
+	writeJSON(w, 200, map[string]any{"horizon": res.Horizon})
 }
 
 // pruneRequest reads a prune's request (§8.6): its preconditions, which a
@@ -422,18 +422,29 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if res.NSID != "" {
-		w.Header().Set("X-Namespace-Revision", res.NSID)
-	}
 	report := make([]any, len(res.Items))
 	for i, it := range res.Items {
 		report[i] = it.Value()
 	}
 	out := map[string]any{"items": report}
+	if dry {
+		// { items, config? }: the report for every item and for the
+		// config change; a dry run writes no entry, so no ns_id and no
+		// revision headers (§7.2, §7.5).
+		if res.ConfigReport != nil {
+			out["config"] = res.ConfigReport
+		}
+		writeJSON(w, res.Status, out)
+		return
+	}
+	// A submit, or its retry: the batch entry, and with a config change
+	// its id, as the body's config and X-Config-Revision (§7.5).
 	if res.NSID != "" {
+		w.Header().Set("X-Namespace-Revision", res.NSID)
 		out["ns_id"] = res.NSID
 	}
 	if res.ConfigID != "" {
+		w.Header().Set("X-Config-Revision", res.ConfigID)
 		out["config"] = res.ConfigID
 	}
 	writeJSON(w, res.Status, out)

@@ -24,13 +24,17 @@
 //     "{ns}/{name}" for a live dependency (checked by name in the target)
 //     or "{ns}/{name}/rev/{id}" for a pinned one (checked by id).
 //   - History lines always carry "parent" ("" for genesis). "author",
-//     "created", "signature", "gesture" and "undoes" appear only with
-//     "authors": true; a line that carries them in a bundle without authors
-//     is rejected, and gesture and undoes must be gesture ids (§7.2). An
-//     import carries them into its batch steps (§7.5), like a merge
-//     (§F.3), wherever it writes the bundle's own revisions. An import
-//     never re-sends a carried signature: a step's signature is the
-//     importer's own (§C.3.1), and the originals stay in the bundle.
+//     "via", "created", "signature", "gesture" and "undoes" appear only
+//     with "authors": true, as the §7.1 entry has them (via, the grant's
+//     delegatees in order, only when there are any); a line that carries
+//     them in a bundle without authors is rejected, and gesture and undoes
+//     must be gesture ids (§7.2). None of them is hashed: ids and
+//     signatures don't cover them (§3.3, §C.3). An import carries author,
+//     gesture and undoes into its batch steps (§7.5), like a merge (§F.3),
+//     wherever it writes the bundle's own revisions; via, like the grant,
+//     is the importer's own. An import never re-sends a carried signature:
+//     a step's signature is the importer's own (§C.3.1), and the originals
+//     stay in the bundle.
 //   - Grant lines (§G.4.1, §C.3.1): with "authors": true a bundle carries
 //     one line { "ns", "grant", "root", "stored", "key"?: { "kid", "alg",
 //     "pub" } } per grant its history lines reference, before the first
@@ -212,6 +216,10 @@ type Line struct {
 	// are "" if the revision had none (§7.2).
 	Author, Created, Signature string
 	Gesture, Undoes            string
+	// Via is the delegation chain of the grant the revision was written
+	// under, its delegatees in order (§7.1, §C.1): nil when there are none.
+	// Only with Header.Authors; not hashed.
+	Via []string
 	// Grant is the id of the grant the revision was written under (§C.3),
 	// only with Header.Authors, "" if none is carried. A grant line for it
 	// (same ns) comes earlier in the bundle.
@@ -338,12 +346,13 @@ func (l *Line) Key() string { return Key(l.NS, l.Resource) }
 // LogEntry returns a history line as a resource log entry.
 func (l *Line) LogEntry() client.LogEntry {
 	return client.LogEntry{ID: l.ID, Parent: l.Parent, Kind: l.Kind, Patches: l.Patches,
-		HasPatches: l.Kind == "rev" && l.Patches != nil, Author: l.Author, Created: l.Created, Signature: l.Signature,
+		HasPatches: l.Kind == "rev" && l.Patches != nil, Author: l.Author, Via: l.Via, Created: l.Created, Signature: l.Signature,
 		Gesture: l.Gesture, Undoes: l.Undoes}
 }
 
 // HistoryLine converts a verified log entry of ns/name into a line. The
-// attribution fields are kept only if authors is set.
+// attribution fields, via included, are kept only if authors is set
+// (§G.4.1).
 func HistoryLine(ns, name string, e client.LogEntry, authors bool) Line {
 	l := Line{NS: ns, Resource: name, ID: e.ID, Parent: e.Parent, Kind: e.Kind}
 	if e.Kind == "rev" {
@@ -352,6 +361,9 @@ func HistoryLine(ns, name string, e client.LogEntry, authors bool) Line {
 	if authors {
 		l.Author, l.Created, l.Signature = e.Author, e.Created, e.Signature
 		l.Gesture, l.Undoes = e.Gesture, e.Undoes
+		if len(e.Via) > 0 {
+			l.Via = append([]string(nil), e.Via...)
+		}
 	}
 	return l
 }
@@ -389,6 +401,13 @@ func (l *Line) value() map[string]any {
 		if v != "" {
 			m[k] = v
 		}
+	}
+	if len(l.Via) > 0 {
+		via := make([]any, len(l.Via))
+		for i, d := range l.Via {
+			via[i] = d
+		}
+		m["via"] = via
 	}
 	if !l.Written.IsZero() {
 		m["written"] = l.Written.value()
@@ -700,7 +719,7 @@ func parseLine(v any, authors bool) (*Line, error) {
 	for k := range m {
 		switch k {
 		case "ns", "resource", "id", "parent", "kind", "patches":
-		case "author", "created", "signature", "gesture", "undoes", "grant", "written":
+		case "author", "via", "created", "signature", "gesture", "undoes", "grant", "written":
 			if !authors {
 				return nil, fmt.Errorf("history line carries %q in a bundle without authors", k)
 			}
@@ -718,6 +737,22 @@ func parseLine(v any, authors bool) (*Line, error) {
 		l.Grant, _ = g.(string)
 		if !validID(l.Grant) {
 			return nil, fmt.Errorf("history line: grant must be a grant id")
+		}
+	}
+	if v, has := m["via"]; has {
+		// As §7.1 serves it: the delegatees in order, absent when there
+		// are none, each a non-empty string as a narrowing block's via is
+		// (§C.1).
+		arr, ok := v.([]any)
+		if !ok || len(arr) == 0 {
+			return nil, fmt.Errorf("history line: via must be a non-empty array of delegatees, absent when there are none")
+		}
+		for _, x := range arr {
+			d, ok := x.(string)
+			if !ok || d == "" {
+				return nil, fmt.Errorf("history line: via must list delegatees, each a non-empty string")
+			}
+			l.Via = append(l.Via, d)
 		}
 	}
 	if w, has := m["written"]; has {
@@ -1334,7 +1369,7 @@ func (w *Writer) Line(l Line) error {
 	}
 	if !w.h.Authors {
 		l.Author, l.Created, l.Signature, l.Gesture, l.Undoes, l.Grant = "", "", "", "", "", ""
-		l.Written = NSRef{}
+		l.Via, l.Written = nil, NSRef{}
 	}
 	if l.IsGrant() {
 		if err := w.c.line(&l); err != nil {

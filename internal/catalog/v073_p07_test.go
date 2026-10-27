@@ -150,14 +150,16 @@ func TestKeySubScopeV073(t *testing.T) {
 	if w.listsFolder(w.caller("fred", "fan-club"), "season") {
 		t.Error("a subject set without a user: subject passes a sub scope")
 	}
-	// /read-grants uses the same test for catalog nodes (§B.11.5).
-	rg := w.do("POST", "/read-grants", fiona, map[string]any{"items": toAny("/r/cat/season")})
-	if entry(rg, 0)["error"] == nil {
-		t.Errorf("read-grants: fiona gets season: %v", rg.body)
+	// /read-grants uses the same test for items (§B.11.5); its catalog
+	// nodes, in a catalog that is neither sealed nor end-to-end, are 400
+	// (TestReadGrantsCatalogNodesV073).
+	rg := w.do("POST", "/read-grants", fiona, map[string]any{"items": toAny("/r/matches/derby")})
+	if entry(rg, 0)["status"] != 403.0 {
+		t.Errorf("read-grants: fiona gets derby: %v", rg.body)
 	}
-	rg = w.do("POST", "/read-grants", fred, map[string]any{"items": toAny("/r/cat/season")})
-	if entry(rg, 0)["error"] != nil {
-		t.Errorf("read-grants: fred is refused season: %v", rg.body)
+	rg = w.do("POST", "/read-grants", fred, map[string]any{"items": toAny("/r/matches/derby")})
+	if entry(rg, 0)["status"] != nil {
+		t.Errorf("read-grants: fred is refused derby: %v", rg.body)
 	}
 }
 
@@ -184,8 +186,8 @@ func TestVisibilityKeyRulesV073(t *testing.T) {
 	if r, _ := w.follow("/cat/children?of=season", anna); r.status != 200 || childNames(r.body) != "matches.derby,matches.pub-a,matches.shared" {
 		t.Errorf("translator on season: %d %v", r.status, r.body)
 	}
-	if rg := w.do("POST", "/read-grants", anna, map[string]any{"items": toAny("/r/cat/season")}); entry(rg, 0)["error"] != nil {
-		t.Errorf("read-grants: the translator is refused season: %v", rg.body)
+	if rg := w.do("POST", "/read-grants", anna, map[string]any{"items": toAny("/r/matches/derby")}); entry(rg, 0)["status"] != nil {
+		t.Errorf("read-grants: the translator is refused derby: %v", rg.body)
 	}
 
 	// A role whose rule tests /principal/roles is evaluated with that
@@ -274,10 +276,11 @@ func TestAdminPowersV073(t *testing.T) {
 	// So do the 409s.
 	w.issue(ada, map[string]any{"item": "/r/matches/derby", "want": toAny("place"), "to": toAny("season")}, 409)
 	w.issue(ada, map[string]any{"node": "season", "want": toAny("create"), "to": toAny("root")}, 409)
-	// A non-admin with the same roles has no power on season.
+	// A non-admin with the same roles has no power on season, which is
+	// hidden from her, as shared is: 404 (§B.11.4, §B.11.5).
 	eve := w.caller("user:eve", "editors-in-chief")
-	w.issue(eve, map[string]any{"item": "/r/matches/newone", "want": toAny("place"), "to": toAny("season")}, 403)
-	w.issue(eve, map[string]any{"node": "matches.shared", "want": toAny("delete")}, 403)
+	w.issue(eve, map[string]any{"item": "/r/matches/newone", "want": toAny("place"), "to": toAny("season")}, 404)
+	w.issue(eve, map[string]any{"node": "matches.shared", "want": toAny("delete")}, 404)
 
 	// Merge checks (§F.8): an admin approver needs no power either.
 	head := func(name string) string { return must(w.ops.Head(context.Background(), "cat", name)).ID }
@@ -289,8 +292,10 @@ func TestAdminPowersV073(t *testing.T) {
 	if r := ask(ada); r.status != 200 {
 		t.Errorf("merge approved by an admin without move: %d %v", r.status, r.body)
 	}
-	if r := ask(eve); r.status != 403 {
-		t.Errorf("merge approved by a non-admin without move: %d %v", r.status, r.body)
+	// To eve, shared is hidden, so a merge naming it is answered as an
+	// organising request naming it, as a missing node (§F.8, §B.11.5).
+	if r := ask(eve); r.status != 404 {
+		t.Errorf("merge approved by a non-admin who doesn't see the node: %d %v", r.status, r.body)
 	}
 }
 
@@ -306,12 +311,14 @@ func TestBrokenParentsGiveNoPowerV073(t *testing.T) {
 	desk := func(extra ...any) map[string]any {
 		return acc(append([]any{"group:match-desk", "desk"}, extra...)...)
 	}
-	// c1 and c2 are a cycle; tomb will be deleted; opsf's role comes
-	// through group:ops, which the catalog's key denies (§B.11.3).
+	// c1 and c2 are a cycle; tomb will be deleted; opsf's desk comes
+	// through group:ops, which the catalog's key denies (§B.11.3), and its
+	// reader, which keeps it visible to user:o (§B.11.4: a hidden folder
+	// is 404), through user:o.
 	w.doc("cat", "c1", map[string]any{"title": "c1", "parents": parents("c2"), "$access": desk()})
 	w.doc("cat", "c2", map[string]any{"title": "c2", "parents": parents("c1"), "$access": desk()})
 	w.doc("cat", "tomb", map[string]any{"title": "tomb", "parents": parents("root"), "$access": desk()})
-	w.doc("cat", "opsf", map[string]any{"title": "opsf", "parents": parents("root"), "$access": acc("group:ops", "desk")})
+	w.doc("cat", "opsf", map[string]any{"title": "opsf", "parents": parents("root"), "$access": acc("group:ops", "desk", "user:o", "reader")})
 	for _, n := range []string{"p1", "p2", "p3", "p4"} {
 		w.doc("matches", n, map[string]any{"title": n})
 	}

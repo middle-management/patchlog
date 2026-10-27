@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"database/sql"
-	"io"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
@@ -69,7 +68,7 @@ type logReads interface {
 	nsLogSeq(ns int64, id ids.ID) (int64, bool)
 	nsLogRows(n *nsRow, from, to int64, limit int, visit func(nsLogRow) bool)
 	nextEntryCreated(ns, seq int64) (int64, bool)
-	batchEntry(n *nsRow, seq, author int64) (ids.ID, string, bool)
+	batchEntry(n *nsRow, seq, author int64) (ids.ID, string, []byte, bool)
 	entriesTo(row *revRow) []int64
 	actorID(a *actor) int64
 	authorName(id int64) string
@@ -138,6 +137,36 @@ type branchReads interface {
 	registration(n *nsRow, origin, name string) *regRow
 	entryBy(seq int64) (author, created int64)
 	entryGrantID(seq int64) []byte
+	rotationDue(n *nsRow) bool
+	// Levels (Addendum E): a raise from sealed to e2e, remote branches'
+	// names and levels.
+	kidName(b *nsRow) string
+	successorBases(n *nsRow) map[string]bool
+	recordedLevel(bn *nsRow) int
+	preRaiseBlob(n *nsRow, head *revRow, bid ids.ID) *preRaise
+	preRaiseBlobEpochs(p *preRaise, head *revRow, bid ids.ID) map[int]bool
+	preRaiseGrant(n *nsRow, id ids.ID) (*nsRow, *e2eRaise, int64)
+	e2eRaiseOf(n *nsRow) *e2eRaise
+	preRaiseBlobRev(p *preRaise, head *revRow, bid ids.ID) *revRow
+	preRaiseConfig(raise *e2eRaise) *Config
+	preRaiseEntryEpoch(n *nsRow, raise *e2eRaise, seq int64) int
+	preRaiseEpoch(n *nsRow, r *revRow, raise *e2eRaise) int
+	preRaiseHead(raise *e2eRaise, res int64) int64
+	snapshotKid(n *nsRow, cfg *Config, h *revRow) (string, int, string)
+	epochNow(b *nsRow) int
+	hasEpochKey(ns int64, epoch int) bool
+	revEpoch(n *nsRow, r *revRow) int
+	lostRemote(n *nsRow) (branch *nsRow, origin string, ok bool)
+	remoteSourceFor(n *nsRow, withAt bool) *remoteSourceDoc
+	resLevel(res int64) int
+	resOwner(n *nsRow, res int64) *nsRow
+	blobRevServed(head *revRow, bid ids.ID) bool
+	docRules(id ids.ID, doc any, sc *schemaCtx) schema.Rules
+	rowRules(seq int64) schema.Rules
+	genesisSeq(res int64) int64
+	revsBelow(res, seq int64) bool
+	liveRevsBelow(res, seq int64) []revBelow
+	snapshotsBelow(res, seq int64) []int64
 	baseIdentity(n *nsRow) string
 	copyRows(id ids.ID, name string) []copyRow
 }
@@ -148,7 +177,6 @@ type sealedReads interface {
 	dek(res int64, create bool) []byte
 	epochKey(ns int64, epoch int) []byte
 	entryEpoch(n *nsRow, seq int64) int
-	e2eEpochOK(n *nsRow, cfg *Config, e int) bool
 	declaredAt(row *revRow) []ids.ID
 	stored(n *nsRow, j *sealJob) bool
 	resJob(n *nsRow, name string, row *revRow, kind string, plain func() []byte) *sealJob
@@ -169,7 +197,6 @@ type archiveReads interface {
 	grantFirstEntry(n *nsRow, gid ids.ID, bound sql.NullInt64) (cfg, created int64, ok bool)
 	configAtTime(n *nsRow, created int64) (int64, bool)
 	firstEntryCreated() (int64, bool)
-	archiveSealer(res int64) func(io.Writer) (io.WriteCloser, error)
 }
 
 // checkState is the gate's state in one transaction, shared with the
@@ -178,6 +205,9 @@ type checkState struct {
 	e     *Engine
 	now   time.Time
 	write bool
+	// opCtx is the operation's context, for what the checks call outside
+	// the store (the shared rate buckets); nil: context.Background().
+	opCtx context.Context
 	// reqCreds are the request's grant and those of Source-Authorization,
 	// for an in_use answer's referencing list (§6.1, the rule for other
 	// namespaces of §7.5).
@@ -208,7 +238,7 @@ type gate struct {
 
 // newTx starts a transaction's state: its gate reads through it.
 func newTx(sqlTx *sql.Tx, ctx context.Context, e *Engine, write bool) *tx {
-	t := &tx{Tx: sqlTx, ctx: ctx, checkState: &checkState{e: e, now: e.now(), write: write}}
+	t := &tx{Tx: sqlTx, ctx: ctx, checkState: &checkState{e: e, now: e.now(), write: write, opCtx: ctx}}
 	t.gate = &gate{checkReads: t, checkState: t.checkState}
 	return t
 }

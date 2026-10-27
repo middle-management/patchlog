@@ -52,9 +52,14 @@ func (t *gate) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inB
 		}
 	}
 	p.exempt = a.star || freezeOnly(writes, newDoc)
-	if !inBatch && !p.exempt {
+	// Once per request: a write that runs again, as one that reads a remote
+	// branch's base does (withRemoteSource), keeps its draw (rateDrawn).
+	if !inBatch && !p.exempt && (t.rateDrawn == nil || !*t.rateDrawn) {
 		if err := t.rateLimit(n, cur, a, nil, 1); err != nil {
 			return nil, err
+		}
+		if t.rateDrawn != nil {
+			*t.rateDrawn = true
 		}
 	}
 	// A purged namespace is 410 after authorisation and the rate limits
@@ -71,26 +76,26 @@ func (t *gate) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inB
 	// Step 2: idempotent retry, then the precondition. Config writes are
 	// allowed in frozen namespaces.
 	if !inBatch && p.expected != nil {
-		seq, author, ok := t.configByID(n, *p.expected)
-		if ok && author == t.actorID(a) {
+		var nsSeq int64
+		if seq, _, ok := t.configByID(n, *p.expected); ok {
 			// The entry that wrote it: the first in force with it, a
 			// config entry or a batch with a config change (§7.4).
-			nsSeq, _ := t.firstEntryOfConfig(n, seq)
-			r := &WriteResult{Status: 200, Replayed: true, ConfigID: p.expected.String()}
-			if nsSeq != 0 {
-				r.NSID = t.nsLogID(nsSeq).String()
-				// The retry carries what was recorded, gestures included
-				// (§7.2); only a config entry has them (§7.4).
-				if gjson, ok := t.configEntryGestures(nsSeq); ok {
-					if g, ok := jsonv.Parse([]byte(gjson)); ok == nil {
-						if m, ok := g.(map[string]any); ok {
-							r.Entry = &LogEntry{}
-							if s, ok := m["gesture"].(string); ok {
-								r.Entry.Gesture = s
-							}
-							if s, ok := m["undoes"].(string); ok {
-								r.Entry.Undoes = s
-							}
+			nsSeq, _ = t.firstEntryOfConfig(n, seq)
+		}
+		// By the same principal: the same root sub and kid (§7.2).
+		if nsSeq != 0 && t.samePrincipal(nsSeq, a, t.actorID(a)) {
+			r := &WriteResult{Status: 200, Replayed: true, ConfigID: p.expected.String(), NSID: t.nsLogID(nsSeq).String()}
+			// The retry carries what was recorded, gestures included
+			// (§7.2); only a config entry has them (§7.4).
+			if gjson, ok := t.configEntryGestures(nsSeq); ok {
+				if g, err := jsonv.Parse([]byte(gjson)); err == nil {
+					if m, ok := g.(map[string]any); ok {
+						r.Entry = &LogEntry{}
+						if s, ok := m["gesture"].(string); ok {
+							r.Entry.Gesture = s
+						}
+						if s, ok := m["undoes"].(string); ok {
+							r.Entry.Undoes = s
 						}
 					}
 				}
@@ -101,7 +106,8 @@ func (t *gate) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inB
 	}
 	switch {
 	case cc.IfNoneMatch:
-		return nil, apiErr(412, "stale", "config", curID.String())
+		// A creation under a taken name: no config (§7.4).
+		return nil, apiErr(412, "stale", "message", "the name is taken")
 	case cc.IfMatch == "":
 		return nil, apiErr(428, "precondition_required")
 	case cc.IfMatch != curID.String():
@@ -118,20 +124,31 @@ func (t *gate) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inB
 	newDoc, writes = d, patch.WritesStrings(w)
 	p.canon = jsonv.Canonical(cc.Patches)
 	p.id = ids.Revision(&curID, p.canon)
-	// Step 4: the patch-set and document limits in force, as for a
-	// resource write (§6.6). Only a caller with unrestricted read may
-	// read the namespace document.
+	// Step 4: the namespace document the write produces, validated as
+	// §7.4 says, then the limits (§6.2): the patch-set and document limits
+	// in force, as for a resource write, and an unfrozen branch against
+	// its base's branchesPerNamespace (§6.6). Only a caller with
+	// unrestricted read may read the namespace document.
+	cfg, verr := t.validateConfig(n, cur, newDoc)
+	if verr != nil {
+		return nil, verr
+	}
 	readable := func() bool { return t.readsNS(n, cur, a, false) }
 	if err := checkConfigLimits(cur.Limits, cc.Patches, p.canon, false, jsonv.Canonical(newDoc), readable); err != nil {
 		return nil, err
 	}
-	// Step 5: the built-in namespace-document schema and branch fields.
-	cfg, verr := t.validateConfig(n, cur, newDoc, writes, a)
-	if verr != nil {
-		return nil, verr
+	if err := t.unfreezeLimit(n, cur, cfg); err != nil {
+		return nil, err
 	}
 	p.cfg, p.doc = cfg, newDoc.(map[string]any)
-	// Step 6.
+	// Step 6: the *-key guard, then the in_use refusals, then the rules
+	// (§6.2, §C.2).
+	if (touchesGuarded(writes) || (cur.Read != "public" && cfg.Read == "public")) && !a.star {
+		return nil, forbidden("this change needs a grant chained to a * key")
+	}
+	if err := t.configInUse(n, cur, cfg); err != nil {
+		return nil, err
+	}
 	env := t.basicEnvelope("config", "", a)
 	env["writes"] = anyStrings(writes)
 	env["doc"] = newDoc
@@ -334,37 +351,172 @@ func messagePointer(msg string) string {
 	return msg
 }
 
-// validateConfig is step 5 for a config write.
-func (t *gate) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, a *actor) (*Config, *Error) {
+// validateConfig validates the namespace document a config write produces
+// as §7.4 says, at step 4 before the limits (§6.2): its members, then the
+// branch fields and the level rules (Addendum E, Levels). Every refusal is
+// 422, invalid with errors pointing at the member, or a limit of newConfig,
+// so it comes before the *-key guard (§7.4, §C.2).
+func (t *gate) validateConfig(n *nsRow, cur *Config, newDoc any) (*Config, *Error) {
 	cfg, err := t.e.newConfig(newDoc, cur.Doc, nil)
 	if err != nil {
 		return nil, err
 	}
 	if !jsonv.Equal(cur.Doc["retention"], cfg.Doc["retention"]) {
 		if aerr := t.e.checkArchives(cfg); aerr != nil {
-			return nil, aerr
+			return nil, withPointer(aerr)
 		}
-	}
-	if (touchesGuarded(writes) || (cur.Read != "public" && cfg.Read == "public")) && !a.star {
-		return nil, forbidden("this change needs a grant chained to a * key")
 	}
 	if !jsonv.Equal(cur.Doc["base"], cfg.Doc["base"]) {
-		return nil, invalid("/base cannot change")
+		return nil, docInvalid("/base", "/base cannot change (§7.4)")
 	}
 	if cfg.DraftsFor != nil && t.draftRoot(n) == "" {
-		return nil, invalid("/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
+		return nil, docInvalid("/drafts", "/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
 	}
 	baseLevel := -1
-	if n.isBranch() {
-		// A remote branch's shadow follows the branch itself; its
-		// base's level was checked when it was created.
-		if b := t.nsByID(n.base.Int64); !b.isShadow() {
-			baseLevel = t.nsLevel(b)
+	remote := t.remoteShadow(n) != nil
+	if remote {
+		// A remote branch's shadow follows the branch itself, and holds
+		// only what its base was when it was created: a write that makes
+		// it public, raises it to e2e or turns off a nonce requirement is
+		// judged by the base's current namespace document (§G.5.2).
+		if err := t.checkRemoteSource(n, cur, cfg); err != nil {
+			return nil, err
 		}
+	} else if n.isBranch() {
+		baseLevel = t.nsLevel(t.nsByID(n.base.Int64))
 	}
 	if err := t.checkEncryption(cur, cfg, baseLevel); err != nil {
 		return nil, err
 	}
+	if n.isBranch() {
+		// A remote base's keys don't reach across (§7.6): the loop stops
+		// at the shadow, which has none.
+		for b := n; b.isBranch() && t.remoteShadow(b) == nil; {
+			b = t.nsByID(b.base.Int64)
+			if err := keepsStarKeys(cur, cfg, b, t.config(b.configSeq)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if n.isBranch() && !remote {
+		base := t.nsByID(n.base.Int64)
+		if cfg.Read == "public" && t.config(base.configSeq).Read != "public" {
+			return nil, docInvalid("/read", "a branch of a non-public namespace cannot be public (§7.4)")
+		}
+		if err := t.checkNonceBase(cur, cfg, base); err != nil {
+			return nil, err
+		}
+	}
+	if err := t.checkSuccessor(n, cur, cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// keepsStarKeys refuses a branch's namespace document cfg that removes or
+// changes a key entry that is a * key of b, one of its bases, whose
+// configuration in force is bcfg (§7.4, §7.6): 422 at /keys. The entries
+// kept are those prev, the document the write starts from, holds with the
+// base's pub: keys follow the base (§C.4), so a * key the base adds or
+// replaces after the branch was created is in no branch document, and
+// leaving it out removes nothing. An entry prev holds without * may stay
+// so after the base makes it a * key.
+func keepsStarKeys(prev, cfg *Config, b *nsRow, bcfg *Config) *Error {
+	for kid, k := range bcfg.starKeys() {
+		pk, had := findKey(prev.Keys, kid)
+		if !had || string(pk.Pub) != string(k.Pub) {
+			continue
+		}
+		nk, ok := findKey(cfg.Keys, kid)
+		if !ok || string(nk.Pub) != string(k.Pub) || pk.IsStar() && !nk.IsStar() {
+			return docInvalid("/keys", fmt.Sprintf("key %q is a * key of base %s and must be kept unchanged (§7.4, §7.6)", kid, b.name))
+		}
+	}
+	return nil
+}
+
+// checkSuccessor is the successor rule of §7.4 for a config write to n:
+// only a write that sets or changes successor is checked (successorOK),
+// so a successor purged since it was named blocks no other write.
+func (t *gate) checkSuccessor(n *nsRow, cur, cfg *Config) *Error {
+	if cfg.Successor == "" || cfg.Successor == cur.Successor {
+		return nil
+	}
+	var bases map[string]bool
+	if n.isBranch() {
+		bases = t.successorBases(n)
+	}
+	return t.successorOK(cfg.Successor, n.id, bases)
+}
+
+// successorOK checks a successor that a write sets or changes (§7.4): it
+// must name another namespace than self (0 for one being created) that
+// exists and isn't purged; for a branch, whose successorBases are bases, a
+// branch of the same base or of a namespace further up its base chain,
+// whose at may differ, as after a rebase (§F.4, §F.5); for a namespace
+// that isn't a branch (bases nil), another namespace that isn't a branch.
+func (t *gate) successorOK(name string, self int64, bases map[string]bool) *Error {
+	s := t.nsByName(name)
+	switch {
+	case s == nil || s.isShadow():
+		return docInvalid("/successor", "successor must name a namespace that exists (§7.4)")
+	case s.id == self:
+		return docInvalid("/successor", "successor must name another namespace (§7.4)")
+	case s.purged:
+		return docInvalid("/successor", "successor must name a namespace that isn't purged (§7.4)")
+	case bases == nil && s.isBranch():
+		return docInvalid("/successor", "the successor of a namespace that isn't a branch must not be a branch (§7.4)")
+	case bases != nil && (!s.isBranch() || !bases[t.baseIdentity(s)]):
+		return docInvalid("/successor", "the successor of a branch must be a branch of the same base or of a namespace further up its base chain (§7.4)")
+	}
+	return nil
+}
+
+// successorBases are the baseIdentity values a branch's successor may
+// have (§7.4): n's base and every namespace further up its base chain. A
+// remote base in the chain contributes itself and its own bases as the
+// branch's base.chain names them, by origin and name, and ends the walk.
+func (t *tx) successorBases(n *nsRow) map[string]bool {
+	out := map[string]bool{}
+	for b := n; b.isBranch(); {
+		if sh := t.remoteShadow(b); sh != nil {
+			var origin, ns string
+			t.must(t.QueryRow(`SELECT origin, ns FROM remote_bases WHERE shadow = ?`, sh.id).Scan(&origin, &ns))
+			out[origin+" "+ns] = true
+			if ref := t.config(b.configSeq).Base; ref != nil {
+				for _, c := range ref.Chain {
+					out[origin+" "+c] = true
+				}
+			}
+			break
+		}
+		b = t.nsByID(b.base.Int64)
+		out[fmt.Sprint(b.id)] = true
+	}
+	return out
+}
+
+// unfreezeLimit refuses unfreezing a local branch whose base already has
+// branchesPerNamespace live branches: unfreezing makes the branch live
+// again, which counts against its base's limit as creating one does
+// (§6.6, §8.4).
+func (t *gate) unfreezeLimit(n *nsRow, cur, cfg *Config) *Error {
+	if !n.isBranch() || !cur.Frozen || cfg.Frozen {
+		return nil
+	}
+	base := t.nsByID(n.base.Int64)
+	if base.isShadow() {
+		return nil
+	}
+	if live, max := t.liveBranches(base, n), t.config(base.configSeq).Limits.BranchesPerNamespace; live >= max {
+		return limitErr(422, "branchesPerNamespace", int64(live+1), int64(max), "too many live branches: the base already has branchesPerNamespace live branches (§6.6, §8.4)")
+	}
+	return nil
+}
+
+// configInUse is a config write's in_use refusals (409), at step 6 after
+// the *-key guard (§6.2, §6.1, §7.4).
+func (t *gate) configInUse(n *nsRow, cur, cfg *Config) *Error {
 	if cfg.level >= levelSealed && cur.level < levelSealed {
 		// A remote branch becoming sealed seals its read-through content
 		// under its own keys (§E.2.5). Registered remote branches of n are
@@ -378,65 +530,42 @@ func (t *gate) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string
 			}
 		}
 		if len(deps) > 0 {
-			return nil, apiErr(409, "in_use", "dependents", anyStrings(deps), "message", "a namespace with public dependents cannot become sealed")
+			return apiErr(409, "in_use", "dependents", anyStrings(deps), "message", "a namespace with public dependents cannot become sealed")
 		}
 	}
 	if cfg.level > cur.level {
 		if deps := t.lowerDependents(n, cfg.level); len(deps) > 0 {
-			return nil, apiErr(409, "in_use", "dependents", anyStrings(deps), "message", "raise the encryption level of these branches first")
+			return apiErr(409, "in_use", "dependents", anyStrings(deps), "message", "raise the encryption level of these branches first")
 		}
 	}
 	if err := t.checkNonceDependents(n, cur, cfg); err != nil {
-		return nil, err
-	}
-	if n.isBranch() {
-		// A remote base's keys don't reach across (§7.6): the loop stops
-		// at the shadow, which has none.
-		for b := n; b.isBranch() && t.remoteShadow(b) == nil; {
-			b = t.nsByID(b.base.Int64)
-			for kid, k := range t.config(b.configSeq).starKeys() {
-				nk, ok := findKey(cfg.Keys, kid)
-				if !ok || string(nk.Pub) != string(k.Pub) || !nk.IsStar() {
-					return nil, invalid(fmt.Sprintf("key %q is a * key of base %s and cannot be removed or changed", kid, b.name))
-				}
-			}
-		}
-		base := t.nsByID(n.base.Int64)
-		if cfg.Read == "public" && t.config(base.configSeq).Read != "public" {
-			return nil, invalid("a branch of a non-public namespace cannot be public")
-		}
-		if err := t.checkNonceBase(cur, cfg, base); err != nil {
-			return nil, err
-		}
-		if cur.Frozen && !cfg.Frozen && !base.isShadow() {
-			// Unfreezing makes the branch live again, which counts against
-			// its base's branchesPerNamespace as creating one does (§6.6,
-			// §8.4).
-			if live, max := t.liveBranches(base, n), t.config(base.configSeq).Limits.BranchesPerNamespace; live >= max {
-				return nil, limitErr(422, "branchesPerNamespace", int64(live+1), int64(max), "too many live branches: the base already has branchesPerNamespace live branches (§6.6, §8.4)")
-			}
-		}
-	}
-	if cfg.Successor != "" {
-		s := t.nsByName(cfg.Successor)
-		if s == nil || s.isShadow() || t.baseIdentity(s) != t.baseIdentity(n) {
-			return nil, invalid("successor must be an existing namespace with the same base")
-		}
+		return err
 	}
 	if cur.Read == "public" && cfg.Read != "public" {
 		deps := t.publicDependents(n)
 		if len(deps) > 0 {
-			return nil, apiErr(409, "in_use", "dependents", anyStrings(deps))
+			return apiErr(409, "in_use", "dependents", anyStrings(deps))
 		}
 	}
 	if n.isBranch() && (!sameStrings(cur.DraftsFor, cfg.DraftsFor) || cfg.level == levelE2E && cur.level != levelE2E) {
 		// Narrowing drafts.for, or raising a branch to e2e, may leave a
 		// reference to its drafts without a copy (§6.1, §7.4).
 		if broken := t.brokenReferences(refChange{cfg: map[int64]*Config{n.id: cfg}}); len(broken) > 0 {
-			return nil, t.inUse(broken, "the change would leave references to this branch's draft schema revisions without a copy (§6.1)")
+			return t.inUse(broken, "the change would leave references to this branch's draft schema revisions without a copy (§6.1)")
 		}
 	}
-	return cfg, nil
+	return nil
+}
+
+// withPointer gives a 422 invalid that has only a message the errors
+// member §7.4 asks for, its pointer the one the message starts with
+// (messagePointer).
+func withPointer(err *Error) *Error {
+	if err == nil || err.Status != 422 || err.Body["code"] != "invalid" || err.Body["errors"] != nil {
+		return err
+	}
+	msg, _ := err.Body["message"].(string)
+	return docInvalid(messagePointer(msg), msg)
 }
 
 func (t *gate) publicDependents(n *nsRow) []string {
@@ -525,15 +654,18 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 	// A sealed namespace's epoch key starts with the config write that
 	// begins its epoch (§E.2.1).
 	t.sealedConfigWritten(n, old, p.cfg)
-	if old.cachePublic() && !p.cfg.cachePublic() || old.level < levelSealed && p.cfg.level >= levelSealed {
+	if old.cachePublic() && !p.cfg.cachePublic() || raised && p.cfg.level >= levelSealed {
 		// Public copies at the edge must go (§9); every response of the
 		// namespace carries ns:{ns}. Its branches can't be public now
 		// (planConfig refuses while they are, sealed pairs aside, which
-		// keep serving ciphertext under their own tags). So must, on a
-		// raise to sealed, whatever the read setting, the /heads pages
+		// keep serving ciphertext under their own tags). So must, on any
+		// raise to sealed or e2e, sealed to e2e included, whatever the
+		// read setting (Addendum E Levels, Changing it): the /heads pages
 		// listing created, size and digest and the revisions sent with
 		// Last-Modified and Repr-Digest (§7.1, §7.4), which the level now
-		// hides. A level is never lowered, and e2e only at creation.
+		// hides, and at e2e the namespace documents, log ranges and
+		// grants it now serves in the clear or, from before the raise,
+		// sealed as before (preraise.go). A level is never lowered.
 		t.tags = append(t.tags, "ns:"+n.name)
 	}
 	return seq
@@ -542,6 +674,9 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 // WriteConfig creates a namespace (IfNoneMatch) or changes its document.
 // A genesis whose base is in another deployment creates a remote branch
 // (§G.3), fetching and verifying the base before the write transaction.
+// A change to a remote branch that its base's current namespace document
+// judges reads that document outside the write lock (withRemoteSource,
+// §G.5.2).
 func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error) {
 	return e.be.writeConfig(ctx, req, cc)
 }
@@ -552,10 +687,14 @@ func (e *Engine) sqlWriteConfig(ctx context.Context, req Request, cc ConfigChang
 		return e.createRemoteBranch(ctx, req, cc)
 	}
 	var res *WriteResult
-	err := e.update(ctx, func(t *tx) error {
-		r, err := t.writeConfig(req, cc)
-		res = r
-		return err
+	drawn := false
+	err := e.withRemoteSource(ctx, func(ctx context.Context) error {
+		return e.update(ctx, func(t *tx) error {
+			t.rateDrawn = &drawn
+			r, err := t.writeConfig(req, cc)
+			res = r
+			return err
+		})
 	})
 	return res, err
 }
@@ -574,11 +713,12 @@ func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 		}
 		if cc.IfNoneMatch {
 			// The name is taken, also by a purged namespace, whose name
-			// stays reserved (§8.5).
+			// stays reserved (§8.5): 412 without config, as for a branch
+			// (§7.4, §7.6).
 			if err := t.authorizeTaken(n, req); err != nil {
 				return err
 			}
-			return apiErr(412, "stale", "config", t.configID(n.configSeq).String())
+			return apiErr(412, "stale", "message", "the name is taken")
 		}
 		cur := t.config(n.configSeq)
 		a, aerr := t.authenticate(n.name, n, cur, req.Cred, nil)

@@ -400,46 +400,22 @@ func DecodeLimited(token string, lim Limits) (*Grant, error) {
 }
 
 // ruleForms counts the rule forms of g's blocks as rulesPerGrant does
-// (§12.2): every form, those nested in all, any, not, if and then
-// included.
+// (§12.2, rules.CountForms): every form, those nested in all, any, not,
+// if and then included.
 func (g *Grant) ruleForms() int {
 	n := 0
 	for _, b := range g.Blocks {
-		for _, r := range b.Rules {
-			n += countForms(r)
-		}
+		n += rules.CountForms(b.Rules)
 	}
 	return n
 }
 
-// countForms counts the rule forms of rule v: v itself and those nested in
-// its all, any, not, if and then. Any other member is not a rule.
-func countForms(v any) int {
-	n := 1
-	m, ok := v.(map[string]any)
-	if !ok {
-		return n
-	}
-	if _, isOp := m["op"]; isOp {
-		return n
-	}
-	for _, k := range []string{"all", "any", "if", "then"} {
-		if arr, ok := m[k].([]any); ok {
-			for _, x := range arr {
-				n += countForms(x)
-			}
-		}
-	}
-	if x, ok := m["not"]; ok {
-		n += countForms(x)
-	}
-	return n
-}
-
-// compileRules compiles every rule of g's blocks (§6.4.2): a grant that
-// carries one that doesn't compile, such as one of an unknown form or with
-// a pattern RE2 doesn't accept, is invalid (401, §6.6), on every request
-// that doesn't ignore it, not only those that evaluate it.
+// compileRules compiles every rule of g's blocks as written now
+// (rules.CompileStrict, §6.4.2): a grant that carries one that doesn't
+// compile, such as one of an unknown form, with a pattern RE2 doesn't
+// accept (§6.6), or with a schema fragment that breaks §6.4.2's rules for
+// fragments, is invalid (401), on every request that doesn't ignore it,
+// not only those that evaluate it.
 func (g *Grant) compileRules() error {
 	for i, b := range g.Blocks {
 		for j, r := range b.Rules {
@@ -468,7 +444,7 @@ func compileRule(v any) (*rules.Rule, error) {
 	if ok {
 		return r, nil
 	}
-	r, err := rules.Compile(v)
+	r, err := rules.CompileStrict(v)
 	if err != nil {
 		return nil, err
 	}
@@ -520,18 +496,29 @@ func decode(data []byte, bearer bool) (*Grant, error) {
 	if err != nil {
 		return nil, unauth("malformed grant: %v", err)
 	}
-	return decodeContainer(c)
+	return decodeContainerIn(c, bearer)
 }
 
-// decodeContainer reads the JSON blocks of a parsed container (§C.8).
-func decodeContainer(c *container) (*Grant, error) {
+// decodeContainer reads the JSON blocks of a parsed stored container
+// (§C.8): decodeContainerIn as stored.
+func decodeContainer(c *container) (*Grant, error) { return decodeContainerIn(c, false) }
+
+// decodeContainerIn reads the JSON blocks of a parsed container (§C.8). A
+// bearer's grant_block strings are input, I-JSON without noncharacters
+// (§3.1, jsonv.ParseInput), so one holding a noncharacter is invalid
+// (401); a stored grant's are read as they were stored (jsonv.Parse).
+func decodeContainerIn(c *container, bearer bool) (*Grant, error) {
 	strs, symbols, err := c.blockStrings()
 	if err != nil {
 		return nil, unauth("malformed grant: %v", err)
 	}
+	parse := jsonv.Parse
+	if bearer {
+		parse = jsonv.ParseInput
+	}
 	g := &Grant{c: c, symbols: symbols}
 	for i, s := range strs {
-		v, err := jsonv.Parse([]byte(s))
+		v, err := parse([]byte(s))
 		if err != nil {
 			return nil, unauth("block %d is not I-JSON: %v", i, err)
 		}

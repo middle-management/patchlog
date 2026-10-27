@@ -66,7 +66,9 @@ func TestKeysLimitedWriter(t *testing.T) {
 	e.mkNS("s", map[string]any{"read": "grant", "keys": []any{k.entry("*")}, "encryption": map[string]any{"level": "sealed", "pad": true}})
 	star := e.grant(k, "user:admin", []string{"s"}, []string{"read", "create", "append", "config"})
 	li := e.grant(k, "user:li", []string{"s"}, rights, only("a"))
-	keys, r := e.keysOf("s", map[string]any{"resources": []any{"a", "b"}}, li)
+	_, r := e.keysOf("s", map[string]any{"resources": []any{"a", "b"}}, li)
+	expectCode(t, r, 403, "forbidden") // b isn't fixed (v0.63 §E.2.3)
+	keys, r := e.keysOf("s", map[string]any{"resources": []any{"a"}}, li)
 	answer(r, 1, "sealed", true)
 	if len(keys) != 1 || keys["s#1 a"] != nil {
 		t.Fatalf("per-resource keys %s", r.Body)
@@ -99,7 +101,8 @@ func TestKeysLimitedWriter(t *testing.T) {
 	// is 422, and one whose rules refuse every read 404.
 	e.mkNS("x", map[string]any{"read": "grant", "keys": []any{k.entry("*")}, "encryption": map[string]any{"level": "e2e", "pad": true}})
 	k1 := seal.NewKey()
-	kr, err := seal.BuildKeyring("x", 1, k1, []*ecdh.PublicKey{pub})
+	_, admin, _ := seal.GenerateRecipient()
+	kr, err := seal.BuildKeyringV2(admin, "x", 1, k1, []*ecdh.PublicKey{pub})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,10 +116,10 @@ func TestKeysLimitedWriter(t *testing.T) {
 	if len(keys) != 1 {
 		t.Fatalf("e2e keys %s", r.Body)
 	}
-	if w, err = seal.ParseWrappedKey(r.Obj()["keys"].([]any)[0]); err != nil || w.Kid != "x#1" {
+	if w, err = seal.ParseWrappedKey(r.Obj()["keys"].([]any)[0]); err != nil || w.Kid != "x#1" || w.From != seal.Thumbprint(admin.PublicKey()) {
 		t.Fatalf("wrapped %v %v", w, err)
 	}
-	if got, err := seal.UnwrapKey(priv, w); err != nil || string(got) != string(k1) {
+	if got, err := seal.UnwrapKeyAuth(priv, admin.PublicKey(), w); err != nil || string(got) != string(k1) {
 		t.Fatalf("unwrap %v", err)
 	}
 	keys, r = e.keysOf("x", map[string]any{"epochs": []any{}}, li)

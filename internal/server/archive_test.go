@@ -86,8 +86,10 @@ func TestArchivePruneAndRestore(t *testing.T) {
 	expect(t, r, 200)
 	p1 := filepath.Join(dir, "main", "a", revs[3]+".jsonl")
 	url1 := archive.URL(p1)
-	if r.Str("archive") != url1 || r.Str("horizon") != revs[3] {
-		t.Fatalf("prune answer %s, want archive %s", r.Body, url1)
+	// The answer is { horizon } alone (§8.6): the archive is linked from
+	// the pruned revisions' 410, below.
+	if len(r.Obj()) != 1 || r.Str("horizon") != revs[3] {
+		t.Fatalf("prune answer %s", r.Body)
 	}
 	s := verifyArchive(t, p1)
 	h := s.Header

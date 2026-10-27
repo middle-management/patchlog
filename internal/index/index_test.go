@@ -2,6 +2,7 @@ package index_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/index"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 func must[T any](v T, err error) T {
@@ -390,9 +392,11 @@ func testTypedQueries(t *testing.T, noFTS bool) {
 	if got := tagSet(r); !got["idx:matches"] || !got["r:matches/cup"] || !got["r:matches/final"] || got["r:matches/derby"] || got["ns:matches"] || len(got) != 3 {
 		t.Errorf("at tags: %v", r.header.Get("Cache-Tag"))
 	}
-	// A result with facet counts also carries the counts tag.
+	// A result with facet counts is tagged so too: every purge in the
+	// namespace purges idx:{ns} (§A.1, v0.73), so it needs no tag of its
+	// own.
 	r = s.raw(s.raw("/matches?counts=/tags&q=zlatan", "").header.Get("Location"), "")
-	if got := tagSet(r); !got["idx:matches:counts"] || !got["r:matches/derby"] {
+	if got := tagSet(r); !got["idx:matches"] || !got["r:matches/derby"] || len(got) != 2 {
 		t.Errorf("counts tags: %v", r.header.Get("Cache-Tag"))
 	}
 	// Bad input.
@@ -471,7 +475,8 @@ func testUpdatesTombstonePurge(t *testing.T) {
 	s.mu.Lock()
 	purges := fmt.Sprint(s.purges)
 	s.mu.Unlock()
-	if purges != "[[r:matches/final idx:matches:counts]]" {
+	// A resource purge purges idx:{ns} (§A.1, v0.73).
+	if purges != "[[r:matches/final idx:matches]]" {
 		t.Errorf("purges %s", purges)
 	}
 }
@@ -556,10 +561,14 @@ func testCheckpointSurvivesRestart(t *testing.T) {
 	h := must(w.c.Head(ctx, "matches", "cup"))
 	must(w.c.Append(ctx, "matches", "cup", h.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": "Cup replay"}}))
 
-	s2 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true})
-	if s2.ix.Checkpoint("matches") != cp {
-		t.Fatalf("checkpoint after reopen %q, want %q", s2.ix.Checkpoint("matches"), cp)
+	// Reopened without following first: a running follower may apply the
+	// append before the checkpoint is read.
+	s1 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true, noRun: true})
+	if s1.ix.Checkpoint("matches") != cp {
+		t.Fatalf("checkpoint after reopen %q, want %q", s1.ix.Checkpoint("matches"), cp)
 	}
+	s1.stop()
+	s2 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true})
 	bs := s2.appliedUpTo(s2.caughtUp("matches"))
 	if bs[0].From != cp {
 		t.Fatalf("first batch after restart from %q, want %q", bs[0].From, cp)
@@ -584,12 +593,34 @@ func testRebuild(t *testing.T) {
 	s := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true})
 	s.caughtUp("matches")
 	s.stop()
+	// A snapshot left part-way: a rebuild replays from its first page
+	// rather than resume it after the names the rebuild emptied.
+	exec := func(q string) int {
+		t.Helper()
+		sq, err := sql.Open("sqlite", sqlitedsn.DSN(db, ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sq.Close()
+		r, err := sq.Exec(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, _ := r.RowsAffected()
+		return int(n)
+	}
+	if exec(`INSERT INTO checkpoints_bootstrap (origin, ns, at_id, after_name) SELECT origin, ns, ns_id, 'm' FROM checkpoints`) == 0 {
+		t.Fatal("no checkpoint to leave a snapshot at")
+	}
 
 	s2 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true, rebuild: true, noRun: true})
 	if s2.ix.Checkpoint("matches") != "" {
 		t.Fatal("rebuild kept the checkpoint")
 	}
 	s2.stop()
+	if n := exec(`DELETE FROM checkpoints_bootstrap`); n != 0 {
+		t.Fatalf("rebuild kept %d snapshot positions", n)
+	}
 	s3 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true, rebuild: true})
 	if bs := s3.appliedUpTo(s3.caughtUp("matches")); bs[0].From != "" {
 		t.Fatal("rebuild did not replay from the beginning")

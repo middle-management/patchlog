@@ -56,13 +56,15 @@ func fetchBlobs(ctx context.Context, c *client.Client, ns, name string, ch *remo
 	if ch.blobs == nil {
 		ch.blobs = map[ids.ID]*remoteBlob{}
 	}
-	if ch.opaque {
+	if ch.opaque && ch.plain == 0 {
 		return fetchDeclared(ctx, c, ns, name, ch, mapErr)
 	}
 	refs := map[ids.ID]blobRef{}
 	var order []ids.ID
-	err := ch.fold(func(_ int, e client.LogEntry, doc any) error {
-		if e.Kind != "rev" {
+	err := ch.fold(func(i int, e client.LogEntry, doc any) error {
+		// An opaque chain's documents are those from before its raise to
+		// e2e (plainPrefix), whose blobs keep their references.
+		if e.Kind != "rev" || ch.opaque && i >= ch.plain {
 			return nil
 		}
 		for _, r := range blobRefsOf(doc) {
@@ -94,6 +96,9 @@ func fetchBlobs(ctx context.Context, c *client.Client, ns, name string, ch *remo
 			return unverified("%s doesn't match the reference's type or size", what)
 		}
 		ch.blobs[bid] = &remoteBlob{typ: typ, nonce: r.nonce, data: b.Data}
+	}
+	if ch.opaque {
+		return fetchDeclared(ctx, c, ns, name, ch, mapErr)
 	}
 	return nil
 }
@@ -139,30 +144,40 @@ func blobFetchErr(what string, err error, mapErr func(string, error) *Error) *Er
 // resulting document references as the server knows them (§E.3.1): a
 // revision's declared list, for a restore with [] the last live
 // document's, and nil for a tombstone.
+//
+// Entries from before a raise to e2e (remoteChain.plain) are in the clear:
+// their lists are the references their documents hold.
 func (c *remoteChain) declaredLists() ([][]ids.ID, error) {
 	out := make([][]ids.ID, len(c.entries))
 	var last []ids.ID
-	for i, e := range c.entries {
+	err := c.fold(func(i int, e client.LogEntry, doc any) error {
 		if e.Kind != "rev" {
-			continue
+			return nil
 		}
 		if !e.HasPatches {
-			return nil, fmt.Errorf("revision %s has no patch set", e.ID)
+			return fmt.Errorf("revision %s has no patch set", e.ID)
 		}
-		if string(jsonv.Canonical(e.Patches)) != "[]" {
+		switch {
+		case i < c.plain:
+			last = nil
+			for _, r := range blobRefsOf(doc) {
+				last = append(last, r.bid)
+			}
+		case string(jsonv.Canonical(e.Patches)) != "[]":
 			_, list, ok := seal.SealedOp(e.Patches)
 			if !ok {
-				return nil, fmt.Errorf("revision %s is not one sealed op (§E.3.1)", e.ID)
+				return fmt.Errorf("revision %s is not one sealed op (§E.3.1)", e.ID)
 			}
 			ds, derr := parseDeclared(list)
 			if derr != nil {
-				return nil, fmt.Errorf("revision %s: malformed declared blob list (§E.3.1)", e.ID)
+				return fmt.Errorf("revision %s: malformed declared blob list (§E.3.1)", e.ID)
 			}
 			last = ds
 		}
 		out[i] = last
-	}
-	return out, nil
+		return nil
+	})
+	return out, err
 }
 
 // attachMirrored records the blobs that doc, the document of mirrored

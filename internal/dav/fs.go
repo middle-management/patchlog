@@ -69,6 +69,10 @@ type target struct {
 	// otherCase: a kFolder or kPlacement named by another case of its
 	// name, which compares equal (nameKey) but isn't it
 	otherCase bool
+	// hiddenTop: a name at the top level of a tree whose files.root is
+	// hidden from the reader, that top level its roots (§B.11.5, §H.3;
+	// topWrite)
+	hiddenTop bool
 }
 
 func (t target) isDir() bool {
@@ -356,12 +360,17 @@ func (st *reqState) replaced(ctx context.Context, t target) error {
 	return fail(http.StatusConflict, "%s held %s/%s when you opened it, and %s: it was deleted, moved or replaced since (§H.4), so your save isn't written over what is there; reload it", t.path, ns, name, now)
 }
 
-// otherCase refuses a write to t, a tree's file named by another case of
-// its name (§H.2 "Siblings"): a client whose file system tells case
-// apart (rclone, davfs2) copying README.md and readme.md would otherwise
-// write one over the other. A client that ignores case uses the name as
-// listed, or as it read the file under (spelledSo).
+// otherCase refuses a write to t, a tree's file or folder named by
+// another case of its name (§H.2 "Siblings"): a client whose file system
+// tells case apart (rclone, davfs2) copying README.md and readme.md would
+// otherwise write one over the other. A client that ignores case uses a
+// file's name as listed, or as it read the file under (spelledSo); a
+// folder's is refused whatever the request carries, a file never written
+// over a folder.
 func otherCase(t target) error {
+	if t.kind == kFolder {
+		return fail(http.StatusConflict, "%s: %q is a folder here, and names in this tree compare without case (§H.2), so %q isn't made beside it; use another name", t.path, t.title, t.base)
+	}
 	return fail(http.StatusConflict, "%s: %q is a file here, and names in this tree compare without case (§H.2), so %q isn't made beside it, nor written over it; write it as %q, or use another name", t.path, t.title, t.base, t.title)
 }
 
@@ -593,8 +602,13 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 				byRes[e.node.ItemNS+"/"+e.node.ItemName] = e.name
 			}
 		}
-		// fetchHeads leaves out what it can't read, so names pair up by
-		// resource (an item is placed once per catalog, §B.2).
+		// With tree-derived access, read under grants the catalog issues
+		// (§B.11.5 /read-grants). fetchHeads leaves out what it can't
+		// read, so names pair up by resource (an item is placed once per
+		// catalog, §B.2).
+		if err := st.readGrants(ctx, t.ns, files); err != nil {
+			return nil, err
+		}
 		docs, err := st.s.fetchHeads(ctx, st.tk, files, nil, false)
 		if err != nil {
 			return nil, err
@@ -649,6 +663,11 @@ func (st *reqState) docAt(ctx context.Context, t target) (headDoc, bool, error) 
 		if hd, ok := l.docs[t.shownAs()]; !ok || !hd.listed || st.method == "PROPFIND" {
 			return hd, ok, nil
 		}
+	}
+	// With tree-derived access, under a grant the catalog issues for the
+	// item (§H.2 "Access"), to edit where the request writes it.
+	if err := st.itemAccess(ctx, t, st.writes() && (t.path == st.path || t.path == st.dst)); err != nil {
+		return headDoc{}, false, err
 	}
 	if t.kind == kPlacement && st.s.nsInfo(ctx, st.tk, t.docNS).sealed {
 		return headDoc{}, false, nil
@@ -769,12 +788,29 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 	}
 	if flag&os.O_TRUNC != 0 {
 		// A write (PUT, the destination of a COPY, a LOCK of a new name):
-		// buffered, and committed on close.
+		// buffered, and committed on close. A COPY's file refused sets a
+		// guard, as a PUT's does (saveTo, §H.6); so does a PUT or COPY
+		// refused onto a tree's folder, which the DELETE that follows
+		// (rclone's) would otherwise delete.
+		switch {
+		case st.method == "COPY" && t.path == st.dst && (t.isDoc() || t.kind == kFolder):
+			st.saveTo = t.path
+		case st.method == "PUT" && t.path == st.path && t.kind == kFolder:
+			st.saveTo = t.path
+		}
 		switch {
 		case t.kind == kMissing:
 			return nil, errNotExist
 		case t.kind == kBadName:
 			return nil, st.badName(t)
+		case t.kind == kFolder && t.otherCase:
+			// Another case of a folder's name (§H.2 "Siblings"): 409,
+			// naming the folder, not the 403 or 405 of its own name.
+			return nil, otherCase(t)
+		case t.isDir() && (st.method == "COPY" || st.method == "MOVE"):
+			// A file copied or moved onto a folder (§H.5): 403, not the
+			// 405 of a PUT to one; Overwrite: F is x/net/webdav's 412.
+			return nil, fail(http.StatusForbidden, "%s is a folder: a file copied or moved there doesn't replace it (§H.5)", t.path)
 		case t.isDir():
 			return nil, fail(http.StatusMethodNotAllowed, "%s is a directory", t.path)
 		case t.kind == kPlacement && t.otherCase && !st.spelledSo(t):
@@ -853,8 +889,17 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 			st.hdr.Del("If-Modified-Since")
 		}
 	}
+	copied := st.method == "COPY" && (t.path == st.path || strings.HasPrefix(t.path, st.path+"/"))
+	if copied {
+		// The file a COPY copies next, itself or one in the folder it
+		// copies (copyFolder): none of the last one's type or blob.
+		st.ctype, st.copySrc = "", nil
+	}
 	if r := hd.m.raw; r != nil {
-		if st.method == "COPY" && t.path == st.path {
+		if served && r.typ == pdfType {
+			st.servePDF()
+		}
+		if copied {
 			// The copy's type is the source's (fileType), and its blob the
 			// source's, copied (§7.8, §H.5 "Copy").
 			st.ctype = r.typ
@@ -870,6 +915,27 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		}
 	}
 	return f, nil
+}
+
+// pdfType is the stored type of a PDF (§H.1).
+const pdfType = "application/pdf"
+
+// servePDF answers a GET or HEAD of a raw file stored as exactly
+// application/pdf without the sandbox, which blanks browsers' PDF viewers
+// (§7.8, §H.6 "Headers": PDFs are excepted), and still with nosniff; as
+// an attachment (Content-Disposition), so no browser shows it in this
+// origin, unless the deployment opts into inline display (InlinePDF).
+// Only its 200 or 206 goes so: any other answer gets the sandbox back
+// (errWriter).
+func (st *reqState) servePDF() {
+	if st.resp == nil {
+		return
+	}
+	st.pdf = true
+	st.resp.Del("Content-Security-Policy")
+	if !st.s.opt.InlinePDF {
+		st.resp.Set("Content-Disposition", "attachment")
+	}
 }
 
 // ifMatchGet checks a GET's or HEAD's If-Match against revision rev of
@@ -932,12 +998,14 @@ func (d *davFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error 
 }
 
 func (st *reqState) mkdir(ctx context.Context, name string) error {
-	if st.method == "COPY" {
-		return fail(http.StatusForbidden, "folders aren't copied; move them, or make one and move what goes in it")
-	}
 	t, err := st.resolve(ctx, name)
 	if err != nil {
 		return err
+	}
+	if st.method == "COPY" {
+		// x/net/webdav makes the copy of a folder before copying what is
+		// in it, one by one.
+		return st.copyFolder(ctx, t)
 	}
 	switch t.kind {
 	case kMissing:
@@ -1032,6 +1100,12 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 		}
 		return err
 	case kFolder:
+		// A folder a PUT or COPY was refused onto, or a write to another
+		// case of its name (§H.2 "Siblings"), is guarded as a file is
+		// (§H.6).
+		if err := st.afterRefusedSave(ctx, t); err != nil {
+			return err
+		}
 		return st.deleteFolder(ctx, t)
 	}
 	if !st.scratchRemove(t.path) {
@@ -1040,8 +1114,9 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 	return nil
 }
 
-// afterRefusedSave refuses a DELETE of the document's file t that follows
-// the principal's refused save of it, using up one guard (refusedSaveFor,
+// afterRefusedSave refuses a DELETE of t, a document's file or a tree's
+// folder, that follows the principal's refused save to its path, using up
+// one guard (refusedSaveFor,
 // §H.6), unless it names the revision it deletes, which passes and leaves
 // the guards. A document in a frozen namespace isn't deleted anyway: its
 // DELETE gets the core's refusal (§8.4), the guards left; whether it is
@@ -1066,8 +1141,12 @@ func (st *reqState) afterRefusedSave(ctx context.Context, t target) error {
 	if left > 0 {
 		again = fmt.Sprintf("it follows %d refused saves, each refusing one DELETE: delete it %d more times to delete it", left+1, left+1)
 	}
-	return fail(http.StatusConflict, "%s wasn't deleted: this DELETE follows a refused save of the same file (%d, moments ago), and some clients (rclone) delete a file whose upload failed; %s",
-		t.path, r.status, again)
+	what := "file"
+	if t.kind == kFolder {
+		what = "path, a folder's"
+	}
+	return fail(http.StatusConflict, "%s wasn't deleted: this DELETE follows a refused save of the same %s (%d, moments ago), and some clients (rclone) delete a file whose upload failed; %s",
+		t.path, what, r.status, again)
 }
 
 func (d *davFS) Rename(ctx context.Context, oldName, newName string) error {
@@ -1096,7 +1175,9 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		return err
 	}
 	defer st.changed()
-	if dst.kind == kPlacement && dst.otherCase && !(src.ns == dst.ns && src.node == dst.node) && !st.spelledSo(dst) {
+	if dst.otherCase && !(src.ns == dst.ns && src.node == dst.node) && (dst.kind == kFolder || dst.kind == kPlacement && !st.spelledSo(dst)) {
+		// Another case of a sibling's name, file or folder (§H.2
+		// "Siblings"): refused, setting a guard (§H.6).
 		st.onto = dst.path
 		return otherCase(dst)
 	}
@@ -1420,7 +1501,10 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 		res, err := st.tk.c.Batch(ctx, ns, client.BatchRequest{Items: []client.BatchItem{item, {Resource: src.docName, IfMatch: sh.ID,
 			Steps: []client.Step{client.PatchStep(succ), client.DeleteStep()}}}}, false)
 		err = batchErr(err)
-		if client.IsStale(err) {
+		if client.IsStale(err) || goneSince(err) {
+			// A head moved since it was read: the new name made (412),
+			// or tombstoned (412, or 410 gone from v0.73, §7.2), or the
+			// source deleted (410). Read again.
 			return true, nil
 		}
 		if err != nil {
@@ -1495,6 +1579,11 @@ func (st *reqState) fileBytes(ctx context.Context, hd *headDoc) ([]byte, error) 
 // before the content), it is held as an empty placeholder (holdEmpty).
 func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (string, bool, error) {
 	defer st.changed()
+	// With tree-derived access, a file's item is edited under a grant the
+	// catalog issues for it (§H.2 "Access").
+	if err := st.itemAccess(ctx, t, true); err != nil {
+		return "", false, err
+	}
 	if len(body) == 0 {
 		hold, err := st.holdEmpty(ctx, t)
 		if err != nil {

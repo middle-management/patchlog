@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
@@ -58,11 +59,12 @@ type ArchiveBundle struct {
 	// Entries calls yield for each entry in chain order, streaming from the
 	// database. It stops at the first error yield returns.
 	Entries func(yield func(ArchiveEntry) error) error
-	// Seal, when set, is an encrypted namespace's (Addendum E.1): the
+	// Seal, when set, is an encrypted namespace's (§8.6, Addendum E): the
 	// archiver writes the encoded bundle through the writer it returns
-	// and closes it, so the archive is stored encrypted under a key
-	// derived from the resource's data key (crypt.go). Engine.OpenArchive
-	// reads it back.
+	// and closes it, so the archive is stored as a sealed bundle
+	// (§G.5.1.1) whose only recipient is the resource's archive key
+	// (archiveseal.go), which a purge destroys. Engine.ReadArchive reads
+	// it back.
 	Seal func(w io.Writer) (io.WriteCloser, error)
 }
 
@@ -75,6 +77,10 @@ type ArchiveEntry struct {
 	Author, Created  string
 	Signature        string
 	Gesture, Undoes  string // §7.2, "" if none
+	// Via is the delegation chain of the grant the entry was written
+	// under, its delegatees in order (§7.1, §C.1), nil when there are
+	// none: archives carry the authorship members (§8.6, §G.4.1).
+	Via []string
 	// Grant is the id of the grant the entry was written under (§C.3),
 	// "" if none or if no grant line carries it. Its grant line (GrantLine)
 	// comes before the first entry that names it (§8.6, §G.4.1).
@@ -180,7 +186,7 @@ func (t *gate) archiveBundle(n *nsRow, name string, res int64, fromSeq int64, h 
 	if first.parentSeq.Valid {
 		b.Requires = t.rev(first.parentSeq.Int64).id.String()
 	}
-	b.Seal = t.archiveSealer(res)
+	b.Seal = t.archiveBundleSealer(n, res)
 	// The blobs the archived documents reference (§7.8: the archive has
 	// them), each before the first entry whose document references it.
 	blobsAt := t.archivedBlobs(res, fromSeq, lastSeq)
@@ -223,7 +229,7 @@ func (t *gate) archiveBundle(n *nsRow, name string, res int64, fromSeq int64, h 
 			return fmt.Errorf("revision %s has no patch set to archive", le.ID)
 		}
 		ae := ArchiveEntry{ID: le.ID, Parent: le.Parent, Kind: le.Kind, Patches: le.Patches,
-			Author: le.Author, Created: le.Created, Signature: le.Signature, Gesture: le.Gesture, Undoes: le.Undoes}
+			Author: le.Author, Created: le.Created, Signature: le.Signature, Gesture: le.Gesture, Undoes: le.Undoes, Via: le.Via}
 		if r.grantID != nil {
 			// The grant line comes before the first entry that names
 			// the grant (§8.6): archives carry them with the authors.
@@ -487,6 +493,62 @@ func (t *tx) deleteArchives(where string, args ...any) {
 	}
 }
 
+// ReadArchive returns the bundle of an archive of ns/name read from r
+// (§8.6), as ArchiveReader's function does. It opens a read transaction,
+// so a caller inside one of its own, as a restore is, uses ArchiveReader.
+func (e *Engine) ReadArchive(ctx context.Context, ns, name string, r io.Reader) (io.Reader, error) {
+	return e.ArchiveReader(ctx, ns, name)(r)
+}
+
+// ArchiveReader returns a function that reads archives of ns/name (§8.6):
+// given an archive's bytes, it returns the bundle it holds, r's own bytes
+// for a plaintext archive and, for one written in an encrypted namespace,
+// the bundle decrypted as it is read: a sealed bundle (§G.5.1.1) opened
+// with the resource's archive key (ArchiveIdentity), its lines read
+// without seal's line bound as the archiver wrote them (archiveseal.go)
+// and as a plaintext archive's are, or an archive in the
+// format written before v0.73 ("PLAR", crypt.go). The resource's keys are
+// read now, in a read transaction of its own, so the function needs none
+// and may run inside a write transaction (RestoreResource). An encrypted
+// archive of a purged resource is ErrArchiveKeyDestroyed.
+func (e *Engine) ArchiveReader(ctx context.Context, ns, name string) func(r io.Reader) (io.Reader, error) {
+	dek, kerr := e.archiveDEK(ctx, ns, name)
+	encrypted := func() error {
+		if errors.Is(kerr, ErrNotEncrypted) {
+			// Levels never go down (Addendum E), so no archive of this
+			// resource was written encrypted.
+			return fmt.Errorf("an encrypted archive of %s/%s, whose namespace isn't encrypted", ns, name)
+		}
+		return kerr
+	}
+	return func(r io.Reader) (io.Reader, error) {
+		br := bufio.NewReaderSize(r, 1<<16)
+		if head, _ := br.Peek(len(archiveMagic)); string(head) == archiveMagic {
+			if kerr != nil {
+				return nil, encrypted()
+			}
+			return openArchive(br, dek)
+		}
+		// The first line decides: a sealed bundle's envelope, or a plain
+		// bundle's header, passed through as it is.
+		first, err := br.ReadBytes('\n')
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		env, ok, err := seal.ParseBundleEnvelope(bytes.TrimSpace(first))
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return io.MultiReader(bytes.NewReader(first), br), nil
+		}
+		if kerr != nil {
+			return nil, encrypted()
+		}
+		return env.OpenMax(br, archiveIdentity(dek), -1)
+	}
+}
+
 // ArchiveRecord is an archive of an unpurged resource.
 type ArchiveRecord struct {
 	NS, Name string
@@ -550,7 +612,10 @@ type RestoreResult struct {
 // its patch set back. Once no revision below the horizon lacks its patch
 // set, horizon_seq and keep are cleared. Documents kept at the old horizon
 // stay as snapshots, and intermediate snapshots are rebuilt over the
-// restored range so no fold grows past the D.4 bound. Purged resources are
+// restored range so no fold grows past the D.4 bound (in an e2e namespace,
+// over what was written before its raise; E3 content has no documents).
+// Each entry is checked by the level its revision was written at, not
+// the namespace's current one. Purged resources are
 // skipped. Once the horizon is cleared, the attachments that pruning ended
 // get their bytes back from the archives' blob lines (§7.8, §G.4.1).
 // entries is called inside the write transaction: once, or again if
@@ -576,7 +641,18 @@ func (e *Engine) sqlRestore(ctx context.Context, ns, name string, entries func(y
 		if own == nil {
 			return notFound()
 		}
+		// Each entry is checked by the level its revision was written at:
+		// at E3 one sealed op (or [] for a restore), but what an e2e
+		// namespace stored before its raise is plaintext (Addendum E
+		// Levels), archived plain by a prune before the raise or in the
+		// sealed bundle of an E3 prune after it (§8.6).
 		e2e := t.e2eContent(n, name)
+		var plainUpTo int64 // own revisions up to this seq are pre-raise plaintext
+		if e2e {
+			if r := t.e2eRaiseOf(n); r != nil {
+				plainUpTo = t.preRaiseHead(r, own.id)
+			}
+		}
 		blobs := map[ids.ID]*ArchiveBlob{}
 		err := entries(func(en ArchiveEntry) error {
 			if en.Blob != nil {
@@ -616,7 +692,7 @@ func (e *Engine) sqlRestore(ctx context.Context, ns, name string, entries func(y
 				out.Skipped++
 				return nil
 			}
-			if e2e {
+			if e2e && row.seq > plainUpTo {
 				// Opaque at E3: one sealed op, as it was written.
 				if _, ok := seal.SealedJWE(canon); !ok && string(canon) != "[]" {
 					out.Skipped++
@@ -648,10 +724,15 @@ func (e *Engine) sqlRestore(ctx context.Context, ns, name string, entries func(y
 		if missing {
 			return nil
 		}
-		if !e2e {
-			if err := t.rebuildSnapshots(own.id, own.horizonSeq.Int64); err != nil {
-				return err
-			}
+		// Intermediate snapshots over the plaintext range: the whole
+		// chain below the horizon, or at E3 what was written before the
+		// raise (E3 content has no documents).
+		upTo := own.horizonSeq.Int64
+		if e2e {
+			upTo = min(upTo, plainUpTo+1)
+		}
+		if err := t.rebuildSnapshots(own.id, upTo); err != nil {
+			return err
 		}
 		_, err = t.Exec(`UPDATE resources SET horizon_seq = NULL, keep = NULL WHERE res = ?`, own.id)
 		t.must(err)
@@ -709,8 +790,7 @@ func (t *tx) clearPrunedEpochs(n *nsRow, name string) {
 // reached since the previous one. Existing snapshots (kept documents) stay
 // and count as snapshots.
 func (t *tx) rebuildSnapshots(res, upTo int64) error {
-	var doc any
-	exists := false
+	var doc any // the genesis applies to the document null (§6.2 step 3)
 	var count, size int
 	after := int64(0)
 	for {
@@ -742,11 +822,10 @@ func (t *tx) rebuildSnapshots(res, upTo int64) error {
 			if err != nil {
 				return err
 			}
-			doc, _, err = patch.Apply(doc, exists, ops, patch.Options{})
+			doc, _, err = patch.Apply(doc, true, ops, patch.Options{})
 			if err != nil {
 				return err
 			}
-			exists = true
 			count++
 			size += len(canon)
 			var has bool

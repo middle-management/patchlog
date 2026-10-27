@@ -8,6 +8,8 @@
 //     mode, and in auth mode for the E3 keyring resource (§E.2.3, §E.3.2).
 //   - E3 sealed patch sets and prune snapshots (§E.3.1, §8.6).
 //   - E1 storage encryption: row AEAD and a chunked streaming file format.
+//   - Sealed bundles (§G.5.1.1), line by line to X25519 recipients: bundle
+//     tools' and the pruning archives of encrypted namespaces (§8.6).
 //   - `$nonce` helpers (§C.7, §E.2.5).
 //
 // Only the Go standard library is used.

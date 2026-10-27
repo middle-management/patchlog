@@ -18,17 +18,6 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
-// e2eEpochOK: as SQL's, the namespace's first epoch from its items.
-func (r *ddbReads) e2eEpochOK(n *nsRow, cfg *Config, e int) bool {
-	ks, err := r.s.EpochKeys(r.ctx, r.nsName(n.id))
-	r.must(err)
-	lo := cfg.Epoch
-	if len(ks) > 0 && ks[0].Epoch < lo {
-		lo = ks[0].Epoch
-	}
-	return e >= lo && e <= cfg.Epoch
-}
-
 // declaredAt: the declared list of row, or for a tombstone that of the
 // last live revision before it (§E.3.1).
 func (r *ddbReads) declaredAt(row *revRow) []ids.ID {

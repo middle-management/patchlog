@@ -4,8 +4,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/sig"
@@ -658,10 +660,13 @@ func TestV073LiveQuery(t *testing.T) {
 			}
 		}
 	}
-	// Without live: the 302; with it and a decimal cursor: an answer.
+	// Without live: the 302; with it and a decimal cursor: an answer. The
+	// cursor, leading zeros and all, is the current one: one more than an
+	// hour's worth of intervals behind is 400 (§7.7, RH-39).
 	expect(t, e.get("/r/pub/a/log"), 302)
 	expect(t, e.get("/ns/pub/log?cursor=0"), 302)
-	expect(t, e.get("/r/pub/a/log?live=long-poll&cursor=007"), 200)
+	cur := strconv.FormatInt(time.Now().UnixNano()/int64(e.e.LongPollInterval()), 10)
+	expect(t, e.get("/r/pub/a/log?live=long-poll&cursor=00"+cur), 200)
 	expect(t, e.get("/ns/pub/log?live=long-poll"), 200)
 }
 

@@ -1,7 +1,6 @@
 package bundle_test
 
 import (
-	"crypto/ecdh"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -390,8 +389,7 @@ func TestHeadsListingE2E(t *testing.T) {
 	src := newEncDeployment(t, stagingOrigin)
 	src.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
 	k := seal.NewKey()
-	kr, err := seal.BuildKeyring("e", 1, k, []*ecdh.PublicKey{identity(t).PublicKey()})
-	noErr(t, err)
+	kr := keyringOf(t, "e", 1, k)
 	src.create("e", "keyring", kr.Value())
 	write := func(d *deployment, name string, patches []any) string {
 		parent := ""

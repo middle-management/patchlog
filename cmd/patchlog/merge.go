@@ -6,8 +6,9 @@ package main
 //	patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}  (cmd/patchlog/release.go)
 //	patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
 //	        [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]...
-//	        [-source-grant G]... [-json]
-//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]... [-json]
+//	        [-source-grant G]... [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
+//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]...
+//	        [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
 //	patchlog janitor -api URL -ns base1,base2 [-release LINK]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
 
 import (
@@ -34,8 +35,9 @@ const mergeUsage = `usage:
   patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}   (§F.9; see patchlog merge release)
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
           [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]...
-          [-source-grant G]... [-json]
-  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]... [-json]
+          [-source-grant G]... [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
+  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]...
+          [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
   patchlog janitor -api URL -ns base1,base2 [-release /r/{ns}/{release}]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]`
 
 // toolFlags are the connection flags shared by the Addendum F tools.
@@ -43,6 +45,7 @@ type toolFlags struct {
 	api, bearer, author *string
 	asJSON, dev         *bool
 	signKey             *string
+	keyring             *keyringFlags
 }
 
 // signKeyEnv names the environment variable that sets -sign-key.
@@ -58,6 +61,7 @@ func addToolFlags(fs *flag.FlagSet) toolFlags {
 		asJSON:  fs.Bool("json", false, "print JSON"),
 		signKey: fs.String("sign-key", os.Getenv(signKeyEnv), signKeyHelp),
 		dev:     fs.Bool("dev", false, "ignored, kept for scripts: whether the deployment runs with authentication disabled is read from GET / (§1, §7)"),
+		keyring: addKeyringFlags(fs),
 	}
 }
 
@@ -81,7 +85,11 @@ func (tf toolFlags) client() *client.Client {
 	if *tf.author != "" {
 		opts = append(opts, client.WithAuthor(*tf.author))
 	}
-	c, err := client.New(*tf.api, opts...)
+	kopts, err := tf.keyring.options()
+	if err != nil {
+		toolFatal(err)
+	}
+	c, err := client.New(*tf.api, append(opts, kopts...)...)
 	if err != nil {
 		toolFatal(err)
 	}
@@ -504,16 +512,22 @@ func rebaseCmd(args []string) {
 	newName := fs.String("new", "", "name of the successor branch (resumes if it exists)")
 	onto := fs.String("onto", "", "namespace to create the successor from (default: the branch's base)")
 	sw := fs.Bool("switch", false, "freeze the old branch with successor: NEW, then replay what it got meanwhile")
-	var identities multi
+	var identities, readers multi
 	fs.Var(&identities, "identity", identityHelp)
+	fs.Var(&readers, "reader", "e2e: file with the X25519 public key (a JWK {kty, crv, x}, or base64url x) of a reader the successor's keyring wraps its key for, besides those of the old branch's readers the identities know (repeatable, §F.8.1)")
 	fs.Parse(args)
 	if *branch == "" || *newName == "" {
 		fmt.Fprintln(os.Stderr, "rebase: -branch and -new are required")
 		os.Exit(2)
 	}
+	succReaders, err := readPublicKeys(readers)
+	if err != nil {
+		toolFatal(err)
+	}
 	ctx := context.Background()
 	c := tf.client()
-	res, err := merge.Rebase(ctx, c, merge.RebaseOptions{Branch: *branch, New: *newName, Onto: *onto, Switch: *sw, Plan: merge.Options{E2E: e2eView(c, identities), Signer: tf.signer()}})
+	res, err := merge.Rebase(ctx, c, merge.RebaseOptions{Branch: *branch, New: *newName, Onto: *onto, Switch: *sw, SuccessorReaders: succReaders,
+		Plan: merge.Options{E2E: e2eView(c, identities), Signer: tf.signer()}})
 	if *tf.asJSON {
 		out := map[string]any{"result": res}
 		if err != nil {
@@ -546,6 +560,13 @@ func rebaseCmd(args []string) {
 		if res.CatchUpResult != nil && !res.CatchUpResult.Noop {
 			fmt.Printf("caught up as batch %s\n", res.CatchUpResult.NSID)
 		}
+		if len(res.DroppedReaders) > 0 && err == nil {
+			fmt.Printf("%s's keyring holds no key for these readers of %s: %s\n", res.New, *branch, strings.Join(res.DroppedReaders, ", "))
+		}
+	}
+	if errors.Is(err, merge.ErrReadersDropped) {
+		fmt.Fprintf(os.Stderr, "error: %v\nname their public keys with -reader and run rebase again\n", err)
+		os.Exit(1)
 	}
 	if errors.Is(err, merge.ErrConflicts) {
 		fmt.Fprintf(os.Stderr, "stopped on conflicts: resolve them with `patchlog merge apply -base %s -branch %s -resolve …`, then run rebase again\n", *newName, *branch)

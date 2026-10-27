@@ -1,11 +1,13 @@
 package dav
 
 import (
+	"context"
 	"net/http"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/pointer"
 )
@@ -218,6 +220,64 @@ func (s *Server) ownEntry(p *principal, ns, name, id string) bool {
 	defer s.recMu.Unlock()
 	_, ok := s.storeLocked(p).own.Get(ns + "/" + name + "@" + id)
 	return ok
+}
+
+// ownLogEntry reports whether log entry e of ns/name is the user's own
+// (§H.7 "Users", §H.4 "Others' writes"): one this server recorded the
+// user writing (markOwn), whichever of its tokens wrote it, or one the
+// core recorded as the user's (wroteAs), written through another program
+// or gateway with the same grant's sub and key, or, with authentication
+// disabled, the same X-Author.
+func (st *reqState) ownLogEntry(ctx context.Context, ns, name string, e client.LogEntry) bool {
+	if st.s.ownEntry(st.p, ns, name, e.ID) {
+		return true
+	}
+	st.knowUser(ctx, ns)
+	return st.p.wroteAs(ns, e)
+}
+
+// knowUser makes sure the user's identity is known for ns (wroteAs): the
+// kid its grant is verified under there, which GET /ns/{ns}/principal
+// says (nsInfo), and in local mode over a core with authentication
+// disabled, the server's X-Author.
+func (st *reqState) knowUser(ctx context.Context, ns string) {
+	st.p.mu.Lock()
+	unknown := st.p.sub == "" && st.p.author == ""
+	st.p.mu.Unlock()
+	if unknown && st.tk == st.s.local {
+		if root, err := st.tk.c.Root(ctx); err == nil && root.AuthDisabled() {
+			if author, _, err := st.tk.c.Principal(ctx); err == nil {
+				st.p.mu.Lock()
+				if st.p.sub == "" && st.p.author == "" {
+					st.p.author = author
+				}
+				st.p.mu.Unlock()
+				return
+			}
+		}
+	}
+	st.s.nsInfo(ctx, st.tk, ns)
+}
+
+// ownHead reports whether head h of ns/name, a tombstone, is the user's
+// own (ownLogEntry), reading its log entry where this server didn't
+// record it writing it; one that can't be read counts as someone else's.
+func (st *reqState) ownHead(ctx context.Context, ns, name string, h *client.Head) bool {
+	if st.s.ownEntry(st.p, ns, name, h.ID) {
+		return true
+	}
+	st.knowUser(ctx, ns)
+	st.p.mu.Lock()
+	known := st.p.sub != "" || st.p.author != ""
+	st.p.mu.Unlock()
+	if !known {
+		return false
+	}
+	es, err := st.tk.c.Log(ctx, ns, name, h.ID, h.Last)
+	if err != nil || len(es) == 0 || es[len(es)-1].ID != h.ID {
+		return false
+	}
+	return st.p.wroteAs(ns, es[len(es)-1])
 }
 
 // recordsOf returns p's records of ns/name. Records the bounds dropped

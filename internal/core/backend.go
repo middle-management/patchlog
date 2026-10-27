@@ -52,12 +52,14 @@ type backend interface {
 	// checkpoint), registered its registration at the base; remoteNotices
 	// lists the notices (§G.3).
 	remoteBases(ctx context.Context, name string) ([]*remoteBase, error)
-	followed(ctx context.Context, b *remoteBase, entries []client.NSEntry, head string, follow bool) error
+	followed(ctx context.Context, b *remoteBase, entries []client.NSEntry, head string, docs map[string]sourceDoc, catchUp *sourceDoc, catchErr error) error
 	registered(ctx context.Context, b *remoteBase, nsID string, expires time.Time) error
 	remoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error)
 
-	// rotateEpoch is RotateEpoch's config change (§E.2.1).
-	rotateEpoch(ctx context.Context, ns, author string) (int, error)
+	// rotateEpoch is RotateEpoch's config change (§E.2.1); with ifDue,
+	// only while ns has a rotation due after a revocation. rotated
+	// reports whether it rotated.
+	rotateEpoch(ctx context.Context, ns, author string, ifDue bool) (epoch int, rotated bool, err error)
 	// storeSealedBlob stores a blob's sealing under an epoch unless one
 	// is stored, and returns the stored bytes; nil if the blob is no
 	// longer served under it (§E.2.2).
@@ -165,8 +167,8 @@ func (b sqlBackend) remoteBases(ctx context.Context, name string) ([]*remoteBase
 	return b.e.sqlRemoteBases(ctx, name)
 }
 
-func (b sqlBackend) followed(ctx context.Context, rb *remoteBase, entries []client.NSEntry, head string, follow bool) error {
-	return b.e.sqlFollowed(ctx, rb, entries, head, follow)
+func (b sqlBackend) followed(ctx context.Context, rb *remoteBase, entries []client.NSEntry, head string, docs map[string]sourceDoc, catchUp *sourceDoc, catchErr error) error {
+	return b.e.sqlFollowed(ctx, rb, entries, head, docs, catchUp, catchErr)
 }
 
 func (b sqlBackend) registered(ctx context.Context, rb *remoteBase, nsID string, expires time.Time) error {
@@ -177,8 +179,8 @@ func (b sqlBackend) remoteNotices(ctx context.Context, ns string) ([]RemoteNotic
 	return b.e.sqlRemoteNotices(ctx, ns)
 }
 
-func (b sqlBackend) rotateEpoch(ctx context.Context, ns, author string) (int, error) {
-	return b.e.sqlRotateEpoch(ctx, ns, author)
+func (b sqlBackend) rotateEpoch(ctx context.Context, ns, author string, ifDue bool) (int, bool, error) {
+	return b.e.sqlRotateEpoch(ctx, ns, author, ifDue)
 }
 
 func (b sqlBackend) storeSealedBlob(ctx context.Context, job *sealedBlobJob, sealed []byte) ([]byte, error) {

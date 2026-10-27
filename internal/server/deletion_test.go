@@ -190,10 +190,12 @@ func TestPurgeNamespace(t *testing.T) {
 	expect(t, e.do(req{method: "PATCH", path: "/ns/old", ifNoneMatch: "*", body: addRoot(map[string]any{}), author: "admin"}), 412)
 	expect(t, e.branch("old", map[string]any{"name": "oldc"}, "alice"), 410)
 	expect(t, nspurge("old"), 410)
-	// The listing reports the purged branch.
-	bl := e.get("/ns/old/branches").Arr()
-	if len(bl) != 1 || bl[0].(map[string]any)["purged"] != true {
-		t.Fatalf("branches of purged %v", bl)
+	// Its branch listing, which listed the purged branch oldb before
+	// v0.60, is 410 purged, long (§7.4, §8.5).
+	bl := e.get("/ns/old/branches")
+	expectCode(t, bl, 410, "purged")
+	if bl.Str("head") != e.nsHead("old") || bl.H.Get("Cache-Control") != ccLong {
+		t.Fatalf("branches of purged %d %s %v", bl.Code, bl.Body, bl.H)
 	}
 }
 
@@ -298,7 +300,8 @@ func TestPrune(t *testing.T) {
 		t.Fatalf("restore after prune %v", d)
 	}
 
-	// Branch points are protected; branches don't prune.
+	// Branch points are protected; branches don't prune: a prune there
+	// moves nothing and answers the horizon the branch sees (§8.6).
 	c1 := e.create("main", "c", map[string]any{"c": 1.0})
 	c2 := e.appendRev("main", "c", c1, ops(op("replace", "/c", 2.0)))
 	expect(t, e.branch("main", map[string]any{"name": "br"}, "alice"), 201)
@@ -311,7 +314,9 @@ func TestPrune(t *testing.T) {
 		t.Fatalf("branch point not protected: %s", r.Body)
 	}
 	expect(t, e.get("/r/br/c/rev/"+c2), 200)
-	expect(t, e.do(req{method: "POST", path: "/r/br/c/prune", body: map[string]any{"horizon": c2}, author: "admin"}), 422)
+	if r := e.do(req{method: "POST", path: "/r/br/c/prune", body: map[string]any{"horizon": c2}, author: "admin"}); r.Code != 200 || r.Str("horizon") != c2 || r.H.Get("X-Namespace-Revision") != "" {
+		t.Fatalf("branch prune %d %s %v", r.Code, r.Body, r.H)
+	}
 
 	// Referenced schema revisions keep their documents below the horizon.
 	s1 := e.create("main", "s", map[string]any{"$schema": dialect, "type": "object"})

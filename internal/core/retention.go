@@ -10,9 +10,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/middle-management/patchlog/internal/ids"
-	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // RetentionRule is one entry of a namespace document's `retention` (§8.6):
@@ -308,25 +305,9 @@ func (t *gate) planRetention(nsName, name string) (p *prunePlan, checked bool, e
 	}
 	h := t.rev(t.retentionBoundary(rule, own))
 	h = t.protect(n, cfg, own.id, h)
-	// The resource's current keep set stays: retention doesn't replace it.
-	head := t.rev(own.headSeq.Int64)
-	var keepStrs []string
-	var keep []*revRow
-	if own.keep.Valid {
-		if a, ok := jsonv.MustParse([]byte(own.keep.String)).([]any); ok {
-			for _, x := range a {
-				s, _ := x.(string)
-				id, err := ids.Parse(s)
-				if err != nil {
-					continue
-				}
-				if row := t.findInAncestry(head, id); row != nil && row.kind == kindRev {
-					keep = append(keep, row)
-					keepStrs = append(keepStrs, s)
-				}
-			}
-		}
-	}
+	// The resource's current keep set stays: retention doesn't replace it,
+	// as a prune without keep doesn't (§8.6).
+	keep, keepStrs := t.storedKeep(own)
 	return &prunePlan{n: n, cfg: cfg, own: own, h: h, keep: keep, keepStrs: keepStrs, dest: dest, hasArchive: hasArchive}, true, nil
 }
 
@@ -335,7 +316,7 @@ func (t *tx) applyRetention(nsName, name string) (checked, pruned bool, err erro
 	if p == nil || err != nil {
 		return checked, false, err
 	}
-	res, perr := t.pruneTo(p.n, name, p.own, p.h, p.keep, p.keepStrs, p.dest, p.hasArchive, t.authorID(RetentionAuthor))
+	res, perr := t.pruneTo(p.n, name, p.own, p.h, p.keep, p.keepStrs, false, p.dest, p.hasArchive, t.authorID(RetentionAuthor))
 	if perr != nil {
 		return true, false, perr
 	}

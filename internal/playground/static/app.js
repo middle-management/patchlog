@@ -287,9 +287,20 @@ function newEntry(o) {
   return e;
 }
 
+/* With authentication disabled (serve -dev), a write names its author in X-Author and one without it is 400
+ * (§7.2): until the author box is filled, requests without a bearer send DEV_AUTHOR, the name the server gave
+ * such writes before it required the header. authDisabled is what GET / reported (initConn). */
+const DEV_AUTHOR = 'anonymous';
+let authDisabled = false;
+function devAuthor() {
+  const a = $('author').value.trim();
+  if (a) return a;
+  return authDisabled && !$('bearer').value.trim() ? DEV_AUTHOR : '';
+}
+
 function authHeaders() {
   const hd = {};
-  const a = $('author').value.trim();
+  const a = devAuthor();
   if (a) hd['X-Author'] = a;
   const b = $('bearer').value.trim();
   if (b) hd['Authorization'] = /^bearer\s/i.test(b) ? b : 'Bearer ' + b;
@@ -349,8 +360,9 @@ function wrap(e) {
   };
 }
 /* etagID is the id an ETag carries, unquoted: the server's are strong, but a proxy that compresses responses
- * makes them weak (W/"…"), around the same id, which would otherwise end up in URLs and preconditions. */
-function etagID(v) { return v ? v.trim().replace(/^W\//, '').replace(/^"|"$/g, '') : ''; }
+ * makes them weak (W/"…"), around the same id, which would otherwise end up in URLs and preconditions. A sealed
+ * document's tag adds .{e}, its sealing's epoch (§E.2.2), which ids never contain and preconditions leave out. */
+function etagID(v) { return v ? v.trim().replace(/^W\//, '').replace(/^"|"$/g, '').replace(/\.\d+$/, '') : ''; }
 
 /* purgedHead is the head a 410 purged names, the purge-ns entry's ns_id (§8.5), '' for any other answer. A purged
  * sealed namespace's documents and log are 410 purged too, and GET /ns/{ns} redirects to one, so this is how the page
@@ -368,6 +380,8 @@ function initConn() {
   api('GET', '/', { label: 'connect' }).then((r) => {
     // GET / (§7): { spec, auth: "grants" | "disabled", origin }.
     const j = r.ok && r.json;
+    authDisabled = !!(j && j.auth === 'disabled');
+    if (authDisabled) $('author').placeholder = `${DEV_AUTHOR} until set  (X-Author, serve -dev)`;
     $('origin').textContent = j && j.origin ? 'origin ' + j.origin + (j.auth === 'disabled' ? ' \u00b7 authentication disabled (development)' : '') : (r.neterr ? 'server unreachable' : 'HTTP ' + r.status);
   });
 }
@@ -453,7 +467,7 @@ async function refreshNS() {
   ]);
   if (ns !== S.ns) return;
   if (lg.status === 200) { const v = await nsLogRead(ns, lg); if (ns !== S.ns) return; S.nsLog = v; }
-  if (hd.status === 200 && hd.json) { S.heads = hd.json.items || []; S.headsNext = hd.json.next || ''; }
+  if (hd.status === 200 && hd.json) { S.heads = headsOf(hd.json); S.headsNext = hd.json.next || ''; }
   if (br.status === 200 && Array.isArray(br.json)) S.branches = br.json; else S.branches = [];
   renderNsAll();
   updateLiveUrls();
@@ -576,10 +590,14 @@ function renderBranches() {
     h('td', {}, b.name ? h('button', { class: 'tiny', onclick: () => asUser(() => selectNS(b.name)) }, 'open') : ''))));
 }
 
+// A /heads page's entries: { heads, next? } (§7.4), or { items } from a
+// server before v0.65.
+function headsOf(page) { return page.heads || page.items || []; }
+
 async function headsMore() {
   if (!S.headsNext || !S.nsHead) return;
   const r = await api('GET', `/ns/${S.ns}/rev/${S.nsHead}/heads?after=${encodeURIComponent(S.headsNext)}`, { auto: true });
-  if (r.status === 200 && r.json) { S.heads = S.heads.concat(r.json.items || []); S.headsNext = r.json.next || ''; renderHeads(); }
+  if (r.status === 200 && r.json) { S.heads = S.heads.concat(headsOf(r.json)); S.headsNext = r.json.next || ''; renderHeads(); }
 }
 
 /* namespace actions */
@@ -1323,9 +1341,20 @@ function undoImpossible(r) {
   return '';
 }
 
-/* undoRun undoes gesture g: plans, stops on conflicts, writes one batch with a fresh Gesture and Undoes: g, and on
- * 412 plans again (3 retries). It returns { ok, plan, gesture, attempts, ns_id }, { conflicts }, { impossible },
- * { refused } or { nothing }. */
+/* undoHeadMoved tells whether a failed undo batch means a head moved since the plan, so it plans again (§11.2 Guard): a
+ * 412, or a 410 gone naming a head, the tombstone of a resource deleted meanwhile (§7.2), as client.Undo does. */
+function undoHeadMoved(r) {
+  const j = r.json || {};
+  if (r.status === 412) return true;
+  if (r.status !== 410) return false;
+  if (j.code === 'gone') return !!j.head;
+  const it = (j.items || []).find((x) => x && x.status === 410);
+  return !!it && it.code === 'gone' && !!it.head;
+}
+
+/* undoRun undoes gesture g: plans, stops on conflicts, writes one batch with a fresh Gesture and Undoes: g, and when a
+ * head moved meanwhile (undoHeadMoved) plans again (3 retries), so a delete meanwhile is reported as a conflict. It
+ * returns { ok, plan, gesture, attempts, ns_id }, { conflicts }, { impossible }, { refused } or { nothing }. */
 async function undoRun(ns, g, o = {}) {
   const gesture = o.gesture || Z.newNonce();
   let plan = null;
@@ -1340,12 +1369,12 @@ async function undoRun(ns, g, o = {}) {
     if (!plan.items.length) return { nothing: true, plan };
     const r = await api('POST', `/ns/${ns}/batch`, { body: { gesture, undoes: g, items: plan.items }, label: 'undo' });
     if (r.status === 201 || r.status === 200) return { ok: true, plan, gesture, attempts: attempt, ns_id: r.hdr('X-Namespace-Revision') || (r.json || {}).ns_id };
-    if (r.status === 412) continue;
+    if (undoHeadMoved(r)) continue;
     const why = undoImpossible(r);
     if (why) return { impossible: why, message: httpFail(r).message, plan };
     throw httpFail(r);
   }
-  throw new Error('the heads kept moving (412 four times)');
+  throw new Error('the heads kept moving (412 or 410 four times)');
 }
 
 /* undoLatest finds the latest undo of gesture g (by author, if given): redo undoes it (§11.2 Redo). A grant that can't
@@ -1372,7 +1401,7 @@ async function undoLatest(ns, g, author, resources) {
 }
 
 /* ---- the Undo / redo card ---- */
-function undoAuthor() { return $('undoAuthor').value.trim() || $('author').value.trim(); }
+function undoAuthor() { return $('undoAuthor').value.trim() || devAuthor(); }
 
 function undoRefresh() {
   U.stack = S.ns && S.nsHead && undoAuthor() ? undoStackFrom(S.nsLog, undoAuthor()) : null;
@@ -1539,23 +1568,39 @@ function startStream(kind) {
   (kind === 'ns' ? NS_EVENTS : RES_EVENTS).forEach((t) => es.addEventListener(t, (ev) => onStreamEvent(kind, s, t, ev)));
 }
 function onStreamEvent(kind, s, type, ev) {
-  const key = type + ':' + ev.lastEventId;
+  // A resource stream's purge and prune events carry no id (§7.3): EventSource keeps the last revision's as
+  // lastEventId, so they are told apart by their data.
+  const own = kind === 'ns' || (type !== 'purge' && type !== 'prune');
+  const key = type + ':' + (own ? ev.lastEventId : ev.data);
   if (s.seen.has(key)) return;
   s.seen.add(key);
   let data = ev.data; try { data = JSON.parse(ev.data); } catch (_) { /* leave as text */ }
-  s.entry.resBody += `event: ${type}\nid: ${ev.lastEventId}\ndata: ${ev.data}\n\n`;
+  s.entry.resBody += own ? `event: ${type}\nid: ${ev.lastEventId}\ndata: ${ev.data}\n\n` : `event: ${type}\ndata: ${ev.data}\n\n`;
   renderEntry(s.entry);
   const feed = $('feed');
   if (feed.firstChild && feed.firstChild.classList && feed.firstChild.classList.contains('muted')) feed.replaceChildren();
   const d = typeof data === 'object' && data ? data : {};
   feed.prepend(h('li', {}, h('time', {}, new Date().toLocaleTimeString([], { hour12: false })), h('span', { class: 'badge info' }, kind),
-    kindBadge(type), d.resource ? h('span', { class: 'mono' }, d.resource) : null, idEl(ev.lastEventId || d.id || ''),
+    kindBadge(type), d.resource ? h('span', { class: 'mono' }, d.resource) : null, idEl(own ? ev.lastEventId || d.id || '' : d.target || ''),
     d.author ? h('span', { class: 'muted' }, d.author) : null,
     h('button', { class: 'link small', onclick: (e) => { e.target.replaceWith(jsonPre(data)); } }, 'json')));
   while (feed.children.length > 200) feed.lastChild.remove();
   $('feedCount').textContent = feed.children.length + ' shown';
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(async () => { await refreshNS(); if (S.res) await refreshRes(); }, 250);
+  // A namespace stream ends after its purge-ns entry, and the server ends every reconnect at once (§7.3): left open,
+  // the EventSource would reconnect every few seconds for as long as the page stays open.
+  if (kind === 'ns' && type === 'purge-ns') endStream(kind, s, 'ended (namespace purged)');
+}
+/* endStream closes stream s of kind for good, as the server ended it, saying why. */
+function endStream(kind, s, why) {
+  s.es.close();
+  if (streams[kind] !== s) return;
+  streams[kind] = null;
+  $(kind === 'ns' ? 'liveNs' : 'liveRes').checked = false;
+  s.entry.statusText = 'closed'; s.entry.resBody = (s.entry.resBody || '') + `\n(${why})`; renderEntry(s.entry);
+  setStreamState(kind, why, 'warn');
+  updateLiveUrls();
 }
 function restartStreams(only) {
   for (const kind of ['ns', 'res']) {
@@ -1582,6 +1627,15 @@ function saveIdentity(v) {
   renderIdentity(); renderKeyring();
 }
 
+/* knownKeys lists the X25519 public keys (x) this browser knows: its identity's and those it remembered (rememberKey),
+ * the keyring senders whose entries it opens (§E.3.2) and the recipients it can wrap for again. */
+function knownKeys() { return [...(ID ? [ID.x] : []), ...store.get('pl.knownKeys', [])]; }
+function rememberKey(x) {
+  if (!x || (ID && x === ID.x)) return;
+  const list = store.get('pl.knownKeys', []);
+  if (!list.includes(x)) { list.push(x); store.set('pl.knownKeys', list); }
+}
+
 function keyFrom(kid, resource, from) { KEYS.from.set(kid + '\n' + (resource || ''), from); renderKeysHeld(); }
 function holdEpoch(kid, key, from) { KEYS.epoch.set(kid, key); keyFrom(kid, '', from); }
 function holdRes(kid, resource, key, from) { KEYS.res.set(kid + '\n' + resource, key); keyFrom(kid, resource, from); }
@@ -1597,23 +1651,26 @@ async function nsInfo(ns) {
   return info;
 }
 
-/* takeKeys stores the entries of a POST /ns/{ns}/keys answer: raw keys, or keys wrapped to the grant's enc. An e2e
- * relay passes on keyring entries as stored, wrapped under the info of v0.63 or, stored before, the one of that time;
- * an entry that opens under neither is skipped (anyone can wrap to a thumbprint, §E.3.2), leaving the keyring. */
+/* takeKeys stores the entries of a POST /ns/{ns}/keys answer, { kid, name?, from?, wrapped } or { kid, name?, key }
+ * (§E.2.3; servers before v0.63 said resource for name): raw keys, or keys wrapped to the grant's enc. An e2e relay
+ * passes on keyring entries with their from, which open only with a sender this browser knows (knownKeys), and those
+ * of a keyring stored before v0.63 as stored; an entry that doesn't open is skipped (anyone can wrap to a thumbprint,
+ * §E.3.2), leaving the keyring. */
 async function takeKeys(arr) {
   let n = 0;
   for (const e of arr || []) {
     if (!e || typeof e.kid !== 'string') continue;
+    const res = e.name || e.resource || '';
     let key, from = 'POST /keys (raw)';
     if (typeof e.key === 'string') key = Z.unb64u(e.key);
     else if (typeof e.wrapped === 'string') {
       if (e.suite && e.suite !== Z.SUITE) continue;
       if (!ID) throw new Error('the keys are wrapped to the grant\'s enc: import that identity in the Keys tab');
-      try { key = await Z.unwrapStoredKey(ID, e.kid, e.resource || '', Z.unb64u(e.wrapped)); } catch (_) { continue; }
+      try { key = await Z.unwrapRelayedKey(ID, e, e.from ? knownKeys() : []); } catch (_) { continue; }
       from = 'POST /keys (HPKE-wrapped)';
     } else continue;
     if (key.length !== 32) continue;
-    if (e.resource) holdRes(e.kid, e.resource, key, from); else holdEpoch(e.kid, key, from);
+    if (res) holdRes(e.kid, res, key, from); else holdEpoch(e.kid, key, from);
     n++;
   }
   return n;
@@ -1624,8 +1681,9 @@ async function keyringKey(ns, epoch) {
   if (!ID) throw new Error('no identity: generate or import one in the Keys tab');
   const r = await api('GET', `/r/${ns}/keyring`, { auto: true, label: 'keyring' });
   if (r.status !== 200 || !r.json) throw new Error(`no keyring in ${ns} (GET answered ${r.status})`);
-  const kr = Z.parseKeyring(r.json);
-  const key = await Z.keyringEpochKey(kr, ID, epoch);
+  const key = Z.isKeyringV2(r.json)
+    ? await Z.keyringV2EpochKey(Z.parseKeyringV2(r.json), ID, Z.kid(ns, epoch), knownKeys())
+    : await Z.keyringEpochKey(Z.parseKeyring(r.json), ID, epoch);
   holdEpoch(Z.kid(ns, epoch), key, 'keyring (HPKE-wrapped)');
   return key;
 }
@@ -1885,7 +1943,12 @@ async function openSnapshot(ns, name, h, r) {
   const kns = Z.parseKid(hdr.kid).ns;
   if (!(await nsChainOK(ns, kns))) throw new Error(`e2e snapshot of ${ns}/${name} at ${h}: sealed under ${hdr.kid}`);
   // pl { ns, name, id } (§E.3.1); snapshots stored before v0.63 also carry kind "snapshot".
-  return openSealed(kns, jwe, '', (hd) => (hd.pl && hd.pl.kind === 'snapshot' ? { ns: kns, name, id: h, kind: 'snapshot' } : { ns: kns, name, id: h }));
+  // Under the resource's K_r (§E.3.1, v0.65), or K_e, which sealed snapshots before.
+  const want = (hd) => (hd.pl && hd.pl.kind === 'snapshot' ? { ns: kns, name, id: h, kind: 'snapshot' } : { ns: kns, name, id: h });
+  try { return await openSealed(kns, jwe, name, want); } catch (err) {
+    if (err.checks) throw err;
+    return openSealed(kns, jwe, '', want);
+  }
 }
 
 /* foldLog verifies and folds an e2e log answer that ends at id and starts after since. A fold from a pruning
@@ -1896,11 +1959,25 @@ async function foldLog(ns, name, id, since, arr) {
   let doc, exists = false, prev = '';
   const cfg = ((await nsInfo(ns)).doc || {}).encryption || {};
   if (since) {
-    const r = await api('GET', `/r/${ns}/${name}/rev/${since}`, { auto: true, label: 'prune snapshot' });
-    if ((r.status !== 200 && r.status !== 410) || r.hdr('X-E2E') !== 'snapshot') bad(`/rev/${since} does not serve the snapshot the fold starts from (HTTP ${r.status})`);
-    const d = await openSnapshot(ns, name, since, r);
-    doc = d.value; exists = true; prev = since; out.validID = since;
-    out.entries.push({ id: since, kind: 'snapshot', _sealed: d.kid, _note: 'the prune snapshot the fold starts from, served as /rev/' + since, _doc: doc });
+    const r = await api('GET', `/r/${ns}/${name}/rev/${since}`, { auto: true, label: 'fold start' });
+    if (r.status === 200 && !r.hdr('X-E2E')) {
+      // A revision from before a raise to e2e, served as at the level before (Addendum E Levels): in
+      // the clear, or sealed as at E2 under K_r of its epoch, kid and pl naming this namespace or the
+      // base a branch reads it through (F-E1: the fold starts at the last one before the raise).
+      let d = { value: r.json, kid: '' };
+      if (r.jose) {
+        const kns = Z.parseKid(Z.parseJWE(r.text.trim()).header.kid).ns;
+        if (!(await nsChainOK(ns, kns))) bad(`/rev/${since} is sealed under ${kns}, not this namespace or a base`);
+        d = await openSealed(kns, r.text.trim(), name, { ns: kns, name, id: since, kind: 'doc' });
+      } else if (r.json === null) bad(`/rev/${since} serves no document`);
+      doc = d.value; exists = true; prev = since; out.validID = since;
+      out.entries.push({ id: since, kind: 'pre-raise', _sealed: d.kid, _note: 'the document from before the raise to e2e the fold starts from, served as /rev/' + since, _doc: doc });
+    } else {
+      if ((r.status !== 200 && r.status !== 410) || r.hdr('X-E2E') !== 'snapshot') bad(`/rev/${since} does not serve the snapshot the fold starts from (HTTP ${r.status})`);
+      const d = await openSnapshot(ns, name, since, r);
+      doc = d.value; exists = true; prev = since; out.validID = since;
+      out.entries.push({ id: since, kind: 'snapshot', _sealed: d.kid, _note: 'the prune snapshot the fold starts from, served as /rev/' + since, _doc: doc });
+    }
   }
   for (let i = 0; i < arr.length; i++) {
     const e = Object.assign({}, arr[i]);
@@ -1924,22 +2001,27 @@ async function foldLog(ns, name, id, since, arr) {
     try { hdr = Z.parseJWE(jwe).header; kns = Z.parseKid(hdr.kid).ns; } catch (err) { flag('sealed patch set: ' + err.message); continue; }
     if (!(await nsChainOK(ns, kns))) { flag('sealed under another namespace\'s key ' + hdr.kid); continue; }
     e._sealed = hdr.kid;
-    const key = await contentKey(hdr.kid, '');
+    // Under the resource's K_r (§E.3.1, v0.65), or K_e, which sealed E3 patch sets before.
     let o;
-    try { o = await Z.openJWE(jwe, key); } catch (err) { flag('sealed patch set: ' + err.message); continue; }
+    try { o = await Z.openJWE(jwe, await contentKey(hdr.kid, name)); } catch (_) {
+      try { o = await Z.openJWE(jwe, await contentKey(hdr.kid, '')); } catch (err) { flag('sealed patch set: ' + err.message); continue; }
+    }
     const diff = Z.plDiff(hdr.pl, { ns: kns, name, parent: e.parent || '' });
     if (diff.length) { flag('sealed patch set bound to another ' + diff.join(', ')); continue; }
     let plain;
     try { plain = JSON.parse(o.text); } catch (err) { flag('patch set: ' + err.message); continue; }
     e._plain = plain;
     if (cfg.pad && o.plaintext.length !== paddedLength(Z.utf8(o.text.replace(/ +$/, '')).length)) e._note = 'not padded to its size bucket (the namespace has pad; it may predate it)';
+    // One that doesn't apply is flagged and folded as []; one that doesn't validate or declares the wrong
+    // blobs is flagged and still folded (§E.3.2, client.E2E fold).
     let res;
     try { res = Z.applyPatch(doc, exists, plain); } catch (err) { flag('patch set does not apply: ' + err.message); continue; }
     const v = await validateDoc(res.doc);
-    if (v.errors.length) { flag('the document does not validate against its $schema: ' + v.errors.map((x) => (x.pointer || '(root)') + ' ' + x.message).join('; ')); continue; }
+    if (v.errors.length) flag('the document does not validate against its $schema: ' + v.errors.map((x) => (x.pointer || '(root)') + ' ' + x.message).join('; '));
     if (v.note) e._note = (e._note ? e._note + '; ' : '') + v.note;
-    if (!Z.sameBlobs(Z.sealedBlobs(e.patches), Z.blobIDs(res.doc))) { flag('the declared blob list does not match the blobs the document references (\u00a7E.3.1)'); continue; }
-    doc = res.doc; exists = res.exists; out.validID = e.id; e._doc = doc;
+    if (!Z.sameBlobs(Z.sealedBlobs(e.patches), Z.blobIDs(res.doc))) flag('the declared blob list does not match the blobs the document references (\u00a7E.3.1)');
+    doc = res.doc; exists = res.exists; e._doc = doc;
+    if (!e._flag) out.validID = e.id;
   }
   if (prev !== id) bad(`the log ends at ${prev}, not ${id}`);
   if (!exists) bad('no valid revision');
@@ -1952,7 +2034,7 @@ function foldSummary(f) {
   return h('div', { class: 'seal-box' + (f.flagged.length ? ' bad' : '') },
     h('div', { class: 'state-line' }, h('span', { class: 'badge tomb' }, 'E3'), h('span', {}, `folded ${revs} sealed revision(s)` + (f.since ? ' from a prune snapshot' : '') + ' in this browser'),
       f.flagged.length ? h('span', { class: 'badge err' }, `${f.flagged.length} flagged`) : h('span', { class: 'badge ok' }, 'all valid')),
-    f.validID && f.validID !== f.id ? h('div', { class: 'note' }, 'The document is that of the last valid revision ', idEl(f.validID), '.') : null,
+    f.validID && f.validID !== f.id ? h('div', { class: 'note' }, 'The last revision folded without a flag is ', idEl(f.validID), '; flagged ones that applied are in the document.') : null,
     f.flagged.length ? h('ul', { class: 'checks' }, ...f.flagged.map((x) => h('li', { class: 'bad' }, '✗ ', idEl(x.id), ` ${x.author || ''}: ${x.message}`))) : null);
 }
 
@@ -2013,7 +2095,7 @@ async function writeSealed(kind, patchText) {
     const info = await nsInfo(ns);
     const enc = (info.doc && info.doc.encryption) || {};
     const kid = Z.kid(ns, enc.epoch || 1);
-    const key = await contentKey(kid, '');
+    const key = await contentKey(kid, res); // the resource's K_r (§E.3.1)
     const blobs = Z.blobIDs(result); // declared in plaintext on the sealed op (§E.3.1)
     const body = Z.canonical(await Z.sealPatchSet(key, kid, ns, res, parent, patches, !!enc.pad, blobs));
     const expect = await Z.revisionID(parent, JSON.parse(body));
@@ -2249,10 +2331,10 @@ function renderIdentity() {
   box.className = '';
   const jwk = Z.recipientJWK(ID.x);
   const rid = h('span', { class: 'muted' }, '…');
-  Z.recipientID(ID.x).then((v) => { rid.replaceWith(idEl(v)); });
+  Z.thumbprint(ID.x).then((v) => { rid.replaceWith(h('span', { class: 'mono small' }, v)); });
   const block = { kid: '<key id>', sub: 'user:you', ns: [S.ns || 'ns'], can: ['read'], exp: '2026-12-31T00:00:00Z', enc: jwk };
   box.replaceChildren(
-    h('dl', { class: 'kv' }, h('dt', {}, 'public key'), h('dd', { class: 'mono' }, ID.x), h('dt', {}, 'recipient id'), h('dd', {}, rid)),
+    h('dl', { class: 'kv' }, h('dt', {}, 'public key'), h('dd', { class: 'mono' }, ID.x), h('dt', {}, 'thumbprint'), h('dd', {}, rid)),
     h('div', { class: 'row' }, h('button', { class: 'tiny', onclick: () => copy(JSON.stringify(jwk), 'public JWK') }, 'Copy public JWK'),
       h('button', { class: 'tiny', onclick: () => { $('krReader').value = JSON.stringify(jwk); toast('Reader field set'); } }, 'Use as reader below')),
     jsonPre(jwk),
@@ -2298,14 +2380,28 @@ async function importIdentity() {
 }
 
 /* ---- E3 keyring administration (client.E2E InitKeyring / AddReader / RotateEpoch) ---- */
-const KR = { ns: '', doc: null, head: '', status: 0 };
+/* The keyring document (§E.3.2): entries wrapped in HPKE auth mode under this identity, the admin key their from
+ * names. A keyring stored in the format before v0.63 is shown, but servers refuse writing it: a key holder wraps it
+ * again (patchlog e2e migrate-keyring). */
+const KR = { ns: '', doc: null, legacy: null, head: '', status: 0 };
 async function loadKeyring() {
-  KR.ns = S.ns; KR.doc = null; KR.head = ''; KR.status = 0;
+  KR.ns = S.ns; KR.doc = null; KR.legacy = null; KR.head = ''; KR.status = 0; KR.err = '';
   if (!S.ns || S.nsLevel !== 'e2e') return renderKeyring();
   const r = await api('GET', `/r/${S.ns}/keyring`, { auto: true, label: 'keyring' });
   KR.status = r.status;
-  if (r.status === 200) { try { KR.doc = Z.parseKeyring(r.json); KR.head = r.hdr('X-Revision') || r.etag(); } catch (err) { KR.err = err.message; } }
+  if (r.status === 200) {
+    try {
+      if (Z.isKeyringV2(r.json)) KR.doc = Z.parseKeyringV2(r.json); else KR.legacy = Z.parseKeyring(r.json);
+      KR.head = r.hdr('X-Revision') || r.etag();
+    } catch (err) { KR.err = err.message; }
+  }
   renderKeyring();
+}
+/* knownByThumbprint maps the thumbprints of knownKeys to their x. */
+async function knownByThumbprint() {
+  const m = new Map();
+  for (const x of knownKeys()) m.set(await Z.thumbprint(x), x);
+  return m;
 }
 async function renderKeyring() {
   const box = $('krStatus');
@@ -2315,76 +2411,100 @@ async function renderKeyring() {
   if (!S.ns || lvl !== 'e2e') { box.className = 'muted'; box.textContent = S.ns ? `${S.ns} is not an e2e namespace (encryption.level ${lvl || 'none'}).` : 'Select an e2e namespace above.'; return; }
   const epoch = ((S.nsDoc || {}).encryption || {}).epoch || 1;
   box.className = '';
+  if (KR.legacy) {
+    box.replaceChildren(h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'badge warn' }, 'keyring format before v0.63'), h('span', { class: 'muted' }, `current epoch ${KR.legacy.current}`)),
+      h('p', { class: 'note' }, 'Servers no longer take this format as the keyring (§E.3.2): a key holder wraps it again with patchlog e2e migrate-keyring. Its entries still open here.'));
+    return;
+  }
   if (!KR.doc) {
     box.replaceChildren(h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'badge warn' }, KR.status === 404 ? 'no keyring yet' : 'keyring not readable (' + KR.status + ')'), h('span', { class: 'muted' }, 'encryption.epoch ' + epoch)),
       h('p', { class: 'note' }, 'Init keyring creates it with a fresh key for epoch ' + epoch + ', wrapped for this identity.'));
     return;
   }
-  const mine = ID ? await Z.recipientID(ID.x) : '';
-  const rows = Object.entries(KR.doc.recipients).map(([rid, jwk]) => {
-    const eps = Object.keys(KR.doc.epochs).filter((e) => KR.doc.epochs[e][rid]).sort((a, b) => a - b);
-    return h('tr', {}, h('td', {}, h('input', { type: 'checkbox', class: 'kr-keep', 'data-x': jwk.x, checked: eps.includes(String(KR.doc.current)) || rid === mine, title: 'keep in a rotation' })),
-      h('td', {}, idEl(rid), rid === mine ? h('span', { class: 'badge ok' }, 'this identity') : null), h('td', { class: 'mono small' }, eps.join(', ')));
+  const mine = ID ? await Z.thumbprint(ID.x) : '';
+  const known = await knownByThumbprint();
+  const eps = Z.keyringV2Epochs(KR.doc, S.ns), cur = eps.length ? eps[eps.length - 1] : 0;
+  const byTo = new Map();
+  for (const e of KR.doc.keys) { if (!byTo.has(e.to)) byTo.set(e.to, []); byTo.get(e.to).push(e); }
+  const rows = [...byTo.entries()].map(([to, es]) => {
+    const x = known.get(to);
+    const has = es.map((e) => { try { return Z.parseKid(e.kid).epoch; } catch (_) { return -1; } }).sort((a, b) => a - b);
+    return h('tr', {}, h('td', {}, h('input', { type: 'checkbox', class: 'kr-keep', 'data-x': x || '', disabled: !x, checked: !!x && (has.includes(cur) || to === mine), title: x ? 'keep in a rotation' : 'its public key is unknown here: remember it to keep it' })),
+      h('td', { class: 'mono small' }, to, to === mine ? h('span', { class: 'badge ok' }, 'this identity') : null),
+      h('td', { class: 'mono small' }, [...new Set(es.map((e) => e.from))].map((f) => f === mine ? 'this identity' : known.has(f) ? 'known' : f).join(', ')),
+      h('td', { class: 'mono small' }, has.join(', ')));
   });
   box.replaceChildren(
-    h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'muted' }, 'keyring head'), idEl(KR.head), h('span', { class: 'muted' }, `current epoch ${KR.doc.current} · encryption.epoch ${epoch}`),
-      KR.doc.current !== epoch ? h('span', { class: 'badge warn' }, 'epoch mismatch') : null,
-      mine && KR.doc.epochs[String(epoch)] && KR.doc.epochs[String(epoch)][mine] ? h('span', { class: 'badge ok' }, 'this identity can read and write') : h('span', { class: 'badge err' }, 'this identity holds no current key')),
-    h('div', { class: 'scroll' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'keep'), h('th', {}, 'recipient'), h('th', {}, 'epochs'))), h('tbody', {}, ...rows))));
+    h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'muted' }, 'keyring head'), idEl(KR.head), h('span', { class: 'muted' }, `current epoch ${cur} · encryption.epoch ${epoch}`),
+      cur !== epoch ? h('span', { class: 'badge warn' }, 'epoch mismatch') : null,
+      mine && KR.doc.keys.some((e) => e.kid === Z.kid(S.ns, epoch) && e.to === mine) ? h('span', { class: 'badge ok' }, 'this identity can read and write') : h('span', { class: 'badge err' }, 'this identity holds no current key')),
+    h('div', { class: 'scroll' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'keep'), h('th', {}, 'recipient (to)'), h('th', {}, 'from'), h('th', {}, 'epochs'))), h('tbody', {}, ...rows))));
 }
 function readerX() {
   const t = $('krReader').value.trim();
   if (!t) return '';
   return t.startsWith('{') ? Z.parseJWK(t) : Z.parseJWK({ kty: 'OKP', crv: 'X25519', x: t });
 }
+function krKnow() {
+  try {
+    const x = readerX();
+    if (!x) return toast('Paste the key\'s public key');
+    rememberKey(x); toast('Key remembered: its keyring entries open here, and it can be kept in a rotation'); renderKeyring();
+  } catch (err) { toast(err.message); }
+}
+function krLegacyRefused() { if (KR.legacy) { toast('The keyring is in the format before v0.63: wrap it again (patchlog e2e migrate-keyring)'); return true; } return false; }
 async function krInit() {
   if (!ID) return toast('Generate or import an identity first');
   try {
     const epoch = ((S.nsDoc || {}).encryption || {}).epoch || 1;
-    const key = Z.randomBytes(32);
-    const kr = Z.buildKeyring(S.ns, epoch);
-    await Z.keyringAdd(kr, ID.x, epoch, key);
+    const key = Z.randomBytes(32), kidStr = Z.kid(S.ns, epoch);
+    const kr = Z.buildKeyringV2();
+    await Z.keyringV2Add(kr, ID, ID.x, kidStr, key);
     const other = readerX();
-    if (other) await Z.keyringAdd(kr, other, epoch, key);
+    if (other) { await Z.keyringV2Add(kr, ID, other, kidStr, key); rememberKey(other); }
     let r;
-    if (KR.doc && KR.doc.ns === S.ns) return toast('The namespace already has a keyring');
-    if (KR.doc) r = await api('PATCH', `/r/${S.ns}/keyring`, { ct: PJ, headers: { 'If-Match': quoteId(KR.head) }, body: [{ op: 'replace', path: '', value: kr }], label: 'keyring' });
+    if (KR.doc && Z.keyringV2Epochs(KR.doc, S.ns).length || KR.legacy && KR.legacy.ns === S.ns) return toast('The namespace already has a keyring');
+    if (KR.doc || KR.legacy) r = await api('PATCH', `/r/${S.ns}/keyring`, { ct: PJ, headers: { 'If-Match': quoteId(KR.head) }, body: [{ op: 'replace', path: '', value: kr }], label: 'keyring' });
     else r = await api('PATCH', `/r/${S.ns}/keyring`, { ct: PJ, headers: { 'If-None-Match': '*' }, body: [{ op: 'add', path: '', value: kr }], label: 'keyring' });
-    if (r.ok) { holdEpoch(Z.kid(S.ns, epoch), key, 'generated here (Init keyring)'); toast('Keyring created'); await refreshNS(); await loadKeyring(); }
+    if (r.ok) { holdEpoch(kidStr, key, 'generated here (Init keyring)'); toast('Keyring created'); await refreshNS(); await loadKeyring(); }
   } catch (err) { toast(err.message); }
 }
 async function krAdd() {
   try {
+    if (!ID) return toast('Generate or import an identity first');
     const x = readerX();
     if (!x) return toast('Paste the reader\'s public key');
     await loadKeyring();
+    if (krLegacyRefused()) return;
     if (!KR.doc) return toast('No keyring');
     const kr = JSON.parse(JSON.stringify(KR.doc));
-    for (const e of Object.keys(kr.epochs).map(Number)) {
-      if (e !== kr.current && !$('krHistory').checked) continue;
+    const eps = Z.keyringV2Epochs(kr, S.ns), cur = eps[eps.length - 1];
+    if (cur === undefined) return toast('The keyring holds no key of ' + S.ns);
+    for (const e of eps) {
+      if (e !== cur && !$('krHistory').checked) continue;
       let key;
-      try { key = await contentKey(Z.kid(S.ns, e), ''); } catch (err) { if (e === kr.current) throw err; continue; }
-      await Z.keyringAdd(kr, x, e, key);
+      try { key = await contentKey(Z.kid(S.ns, e), ''); } catch (err) { if (e === cur) throw err; continue; }
+      await Z.keyringV2Add(kr, ID, x, Z.kid(S.ns, e), key);
     }
     const r = await api('PATCH', `/r/${S.ns}/keyring`, { ct: PJ, headers: { 'If-Match': quoteId(KR.head) }, body: [{ op: 'replace', path: '', value: kr }], label: 'keyring' });
-    if (r.ok) { toast('Reader added'); await loadKeyring(); }
+    if (r.ok) { rememberKey(x); toast('Reader added'); await loadKeyring(); }
   } catch (err) { toast(err.message); }
 }
 async function krRotate() {
   try {
     if (!ID) return toast('Generate or import an identity first');
     await loadKeyring();
+    if (krLegacyRefused()) return;
     if (!KR.doc) return toast('No keyring');
     const epoch = ((S.nsDoc || {}).encryption || {}).epoch || 1;
-    if (KR.doc.current !== epoch) return toast(`The keyring is at epoch ${KR.doc.current} but encryption.epoch is ${epoch}`);
-    const keep = new Set([...document.querySelectorAll('.kr-keep')].filter((c) => c.checked).map((c) => c.dataset.x));
+    const eps = Z.keyringV2Epochs(KR.doc, S.ns), cur = eps[eps.length - 1];
+    if (cur !== epoch) return toast(`The keyring is at epoch ${cur} but encryption.epoch is ${epoch}`);
+    const keep = new Set([...document.querySelectorAll('.kr-keep')].filter((c) => c.checked && c.dataset.x).map((c) => c.dataset.x));
     keep.add(ID.x);
     if (!confirm(`Rotate ${S.ns} to epoch ${epoch + 1} for ${keep.size} recipient(s)? Recipients left out cannot read anything written afterwards.`)) return;
     const kr = JSON.parse(JSON.stringify(KR.doc));
-    const e = kr.current + 1, key = Z.randomBytes(32);
-    kr.epochs[String(e)] = {};
-    for (const x of keep) await Z.keyringAdd(kr, x, e, key);
-    kr.current = e;
+    const e = cur + 1, key = Z.randomBytes(32);
+    for (const x of keep) await Z.keyringV2Add(kr, ID, x, Z.kid(S.ns, e), key);
     const r = await api('POST', `/ns/${S.ns}/batch`, { label: 'rotate', body: {
       config: { ifMatch: S.config, patches: [{ op: 'add', path: '/encryption/epoch', value: e }] },
       items: [{ resource: 'keyring', ifMatch: KR.head, steps: [[{ op: 'replace', path: '', value: kr }]] }] } });
@@ -2448,7 +2568,7 @@ async function allHeads(ns, head) {
   for (let page = 0; page < 20; page++) {
     const r = await api('GET', `/ns/${ns}/rev/${head}/heads` + (after ? `?after=${encodeURIComponent(after)}` : ''), { auto: true, label: 'catalog' });
     if (r.status !== 200 || !r.json) break;
-    items = items.concat(r.json.items || []);
+    items = items.concat(headsOf(r.json));
     if (!r.json.next) break;
     after = r.json.next;
   }
@@ -3987,6 +4107,7 @@ function init() {
   $('krInit').onclick = krInit;
   $('krAdd').onclick = krAdd;
   $('krRotate').onclick = krRotate;
+  $('krKnow').onclick = krKnow;
   $('jweOpen').onclick = decryptPasted;
   $('selfTest').onclick = runSelfTest;
   $('resendSealed').onclick = sendSealed;

@@ -9,7 +9,9 @@
 // document (its root a blob reference, §7.8) as its resource name, any
 // other as {name}.json; a catalog (Addendum B) with catalog.files is a
 // file tree (§H.2), its folder nodes as directories and its placements as
-// files holding their items, each named by its node's title.
+// files holding their items, each named by its node's title. The tree
+// owns the items of its catalog.files.ns: served flat too, that
+// namespace is read-only there (readOnly).
 //
 // A raw file reads as its blob's bytes, typed by its name (§H.1); a JSON
 // file as its rendering, the document's canonical JSON (§3.1) laid out,
@@ -24,11 +26,13 @@
 //
 // Two ways to authenticate: with a fixed grant (local mode, the WebDAV
 // clients log in with a password of the server's), or as a gateway, where
-// each request's Basic password is the grant sent upstream. State (bases,
-// scratch files, locks, guards) is kept per user (§H.7): in a gateway,
-// the root sub and kid GET /ns/{ns}/principal names for a grant, so every
-// token of one person is one user; in local mode, everyone is one. What
-// may hold what one token read (scratch files, locks, dead properties) is
+// each request's Basic password is the grant sent upstream, or, over a
+// core with authentication disabled, its Basic user name the X-Author.
+// State (bases, scratch files, locks, guards) is kept per user (§H.7): in
+// a gateway, the root sub and the key (its thumbprint) GET
+// /ns/{ns}/principal names for a grant, so every token of one person is
+// one user, or the X-Author; in local mode, everyone is one. What may
+// hold what one token read (scratch files, locks, dead properties) is
 // kept apart for a token narrowed offline (scope).
 package dav
 
@@ -52,6 +56,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/net/webdav"
 	"golang.org/x/sync/semaphore"
@@ -89,13 +95,23 @@ type Options struct {
 	// reach the user's own writes through this server (?min=, §B.5),
 	// before the folder is listed from the node documents (default 3s).
 	TreeWait time.Duration
+	// InlinePDF serves a PDF (a raw file stored as application/pdf) for
+	// display in the browser; by default it is sent as an attachment
+	// (Content-Disposition: attachment). Either way its 200 and 206 go
+	// without the sandbox, which blanks browsers' PDF viewers, and keep
+	// nosniff (§7.8, §H.6 "Headers").
+	InlinePDF bool
 	// CaseSensitive compares the names of a tree's siblings after NFC
 	// only; by default they are compared after Unicode case folding too
 	// (§H.2 "Siblings"), as the file systems of macOS and Windows, whose
 	// clients can't hold two names that differ only in case, compare them.
 	CaseSensitive bool
 	// Gateway takes each request's Basic password as the grant sent
-	// upstream as Authorization: Bearer; the user name is ignored.
+	// upstream as Authorization: Bearer, the user name ignored; over a
+	// core with authentication disabled (GET / auth, §1), the Basic user
+	// name as the X-Author each request is sent with (§7.2), which is the
+	// user (§H.7), the password ignored. Which of the two is read again
+	// every VerifyEvery, and after the core refuses an X-Author (401).
 	Gateway bool
 	// Password is the Basic password of local mode (any user name).
 	Password string
@@ -150,7 +166,8 @@ type Options struct {
 	// token's grant is accepted (default and at most maxVerifyEvery, five
 	// minutes: §H.7 "Re-checking"), which bounds how long a revoked grant
 	// still reaches its user's scratch files. Writers' settings (§7.4
-	// writer) are kept for no longer.
+	// writer), and whether the core has authentication disabled, are kept
+	// for no longer.
 	VerifyEvery time.Duration
 	// CatalogTTL is how long a token's read of a catalog's tree serves its
 	// requests, unless this server writes meanwhile (default 5s).
@@ -211,6 +228,12 @@ type Server struct {
 	idUsers      idUsers                     // gateway mode: who each token was verified as last, kept past the token (admit)
 	lastSweep    time.Time
 	scratchTotal atomic.Int64 // every user's scratch bytes
+
+	authMu     sync.Mutex
+	authKnown  bool      // whether the core has authentication disabled was read (authOff)
+	authIsOff  bool      // what it said
+	authAt     time.Time // when; zero: read again at the next login
+	authFlight singleflight.Group
 
 	opMu     sync.Mutex
 	opKeys   []client.OperatorKey // the deployment's operator keys (operatorKeys), read at opAt
@@ -355,7 +378,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Whatever an answer holds (a file, a listing, an error repeating a
 	// name the client sent), no page of this origin, which holds the
 	// users' credentials, runs it, nor does a browser take it for another
-	// type (§H.6 "Raw bytes").
+	// type (§H.6 "Headers"); a PDF served whole or in part goes without
+	// the sandbox (pdf).
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "sandbox")
 	if r.Method == http.MethodPost {
@@ -485,6 +509,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			st.noneMatch = r.Header.Get("If-None-Match") == "*" && !aside
 		}
 	}
+	if de := st.readOnly(r.Context()); de != nil {
+		http.Error(w, de.msg, de.status)
+		return
+	}
 	switch {
 	case r.Body != nil && r.Method == "PUT":
 		r.Body = &bodyReader{ReadCloser: r.Body, st: st}
@@ -520,24 +548,115 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.ServeHTTP(&errWriter{ResponseWriter: w, st: st, realm: s.realm()}, r.WithContext(context.WithValue(r.Context(), stateKey{}, st)))
 }
 
+// readOnly refuses (403) a request that would write in the flat view of
+// a namespace a served file tree owns (§H.2 "A file tree is a catalog":
+// the tree owns the items in its files.ns, and a gateway doesn't also
+// serve files.ns as a writable flat folder): a PUT, DELETE, MKCOL or
+// LOCK there, a MOVE out of it or into it, a COPY into it. It is shown
+// read-only, its files read and copied out as anywhere; its items are
+// written through the tree.
+func (st *reqState) readOnly(ctx context.Context) *davError {
+	var paths []string
+	switch st.method {
+	case "PUT", "DELETE", "MKCOL", "LOCK":
+		paths = []string{st.path}
+	case "MOVE":
+		paths = []string{st.path, st.dst}
+	case "COPY":
+		paths = []string{st.dst}
+	}
+	for _, p := range paths {
+		ns, _, _ := strings.Cut(strings.TrimPrefix(p, "/"), "/")
+		cat, unread, err := st.ownedBy(ctx, ns)
+		switch {
+		case err != nil:
+			if de, ok := upstream(err).(*davError); ok {
+				return de
+			}
+			return fail(http.StatusBadGateway, "%s: file tree settings couldn't be read: %v", p, err)
+		case cat != "":
+			return fail(http.StatusForbidden, "%s is read-only here: file tree %s owns the items of namespace %s (its catalog.files.ns, §H.2), so they are written, moved and deleted through /%s/, not in %s's flat view", p, cat, ns, cat, ns)
+		case unread != "":
+			return fail(http.StatusForbidden, "%s is read-only here for now: file tree %s may own the items of namespace %s (its catalog.files.ns, §H.2), whose flat view isn't written then, and its settings can't be read with your grant, nor were they read with another since this server started; they are once a user whose grant reads catalog %s opens /%s/", p, unread, ns, unread, unread)
+		}
+	}
+	return nil
+}
+
+// ownedBy returns the served catalog whose file tree owns flat namespace
+// ns, the one its catalog.files.ns names (§H.2), "" for none: as the
+// token reads the catalog's settings (nsInfo), else as last read with
+// any grant, the server's own at start included (learn). Where some
+// served catalog's settings are known neither way (a gateway's start
+// reads them without a grant), it fails closed: unread names that
+// catalog, which may own ns; err is a read that failed for now.
+func (st *reqState) ownedBy(ctx context.Context, ns string) (owner, unread string, err error) {
+	if !st.s.flat[ns] {
+		return "", "", nil
+	}
+	cats := make([]string, 0, len(st.s.cats))
+	for cat := range st.s.cats {
+		cats = append(cats, cat)
+	}
+	sort.Strings(cats)
+	for _, cat := range cats {
+		in, err := st.s.nsInfoErr(ctx, st.tk, cat)
+		var files *treeFiles
+		switch {
+		case err == nil && in.files != nil:
+			files = in.files
+			st.s.learn(cat, &catConf{files: in.files, trust: in.trust, trustKnown: in.trustKnown, titled: in.titled})
+		case err == nil && in.notTree != "":
+			// Not a file tree.
+			st.s.learn(cat, nil)
+			continue
+		default:
+			// Not read with this token, refused or failed for now: as
+			// read with another grant.
+			c, ok := st.s.learned(cat)
+			switch {
+			case ok:
+				files = c.files
+			case st.s.settingsRead(cat):
+				continue
+			case err != nil:
+				return "", "", err
+			default:
+				if unread == "" {
+					unread = cat
+				}
+				continue
+			}
+		}
+		if files != nil && files.ns == ns {
+			return cat, "", nil
+		}
+	}
+	return "", unread, nil
+}
+
 // allowed are the methods served (RFC 9110 §10.2.1 Allow).
 const allowed = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK"
 
 // answered keeps what the request's answer, status, says of the
-// principal's saves for a DELETE that follows (refusedSaveFor): a PUT of
-// a file, or a MOVE onto an existing one (onto), refused without writing
-// to the core sets a guard, but for one that put back the principal's own
-// DELETE (undoOwnDelete), which a DELETE after it leaves deleted as the
-// principal chose, and one a frozen namespace refused, which takes no
-// DELETE either (§8.4); a DELETE that found nothing (a refused create's
-// cleanup) uses one up. A GET finding a file gone (404) is the reload a
-// refused save over someone else's delete asked for (tombBase). It runs
-// before the answer goes out, so the client's next request finds it.
+// principal's saves for a DELETE that follows (refusedSaveFor): a PUT or
+// a COPY of a file (saveTo), or a MOVE onto an existing one (onto),
+// refused without writing to the core sets a guard, but for one that put
+// back the principal's own DELETE (undoOwnDelete), which a DELETE after
+// it leaves deleted as the principal chose, and one a frozen namespace
+// refused, which takes no DELETE either (§8.4); a DELETE that found
+// nothing (a refused create's cleanup) uses one up. A GET finding a file
+// gone (404) is the reload a refused save over someone else's delete
+// asked for (tombBase). It runs before the answer goes out, so the
+// client's next request finds it.
 func (st *reqState) answered(status int) {
 	now := st.s.opt.Now()
+	if status == http.StatusUnauthorized && st.tk != st.s.local && strings.HasPrefix(st.tk.id, authorPrefix) {
+		st.s.authStale()
+	}
 	guardOn := ""
 	switch {
-	case st.method == "PUT":
+	case st.method == "PUT", st.method == "COPY":
 		guardOn = st.saveTo
 	case st.method == "MOVE":
 		guardOn = st.onto
@@ -777,7 +896,7 @@ func splitIf(h string) string {
 // accepted it (verify), and it is asked again every VerifyEvery. A grant
 // refused is refused for refusedFor without asking again.
 func (s *Server) authenticate(r *http.Request) (*token, *davError) {
-	_, pw, ok := r.BasicAuth()
+	user, pw, ok := r.BasicAuth()
 	if !ok {
 		return nil, fail(http.StatusUnauthorized, "authentication required")
 	}
@@ -788,6 +907,16 @@ func (s *Server) authenticate(r *http.Request) (*token, *davError) {
 		}
 		s.sweep()
 		return s.local, nil
+	}
+	switch off, err := s.authOff(r.Context()); {
+	case err != nil:
+		return nil, err
+	case off:
+		tk, de := s.authorToken(user)
+		if de == nil {
+			s.sweep()
+		}
+		return tk, de
 	}
 	g, err := grant.Decode(pw, 64<<10)
 	if err != nil {
@@ -875,10 +1004,10 @@ type refusal struct {
 }
 
 // refusedStatus reports a refusal of verify that is the grant's answer
-// for refusedFor: 401 (no namespace accepts it), 410 and 404 (the one
-// that verified it is purged, or absent).
+// for refusedFor: 401 (no namespace accepts it), 403 (an operator grant,
+// §H.7), 410 and 404 (the one that verified it is purged, or absent).
 func refusedStatus(status int) bool {
-	return status == http.StatusUnauthorized || status == http.StatusGone || status == http.StatusNotFound
+	return status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusGone || status == http.StatusNotFound
 }
 
 // verdict is the core's acceptance of a grant (verify): the served
@@ -902,10 +1031,14 @@ type verdict struct {
 // the grant is refused with the first of 410 and 404 that it met (§H.4
 // "Answers"), else 401.
 //
-// The namespace that accepts a grant is part of its user (userKey), so
-// the order they are asked in keeps a person one user: first prev, the
-// one that accepted this token before, then those that accepted a grant
-// of its root kid and sub, first first (kidNS), then the rest, sorted. A
+// A user is the root sub with the key that verified the root block, as
+// /principal's key thumbprint names it (§H.7, userKey), the same in every
+// namespace, so which namespace accepts a grant doesn't make its holder
+// someone else. The order they are asked in keeps them asked alike, and
+// so a person one user under a core that names no key (before v0.56),
+// where the user is the namespace, kid and sub: first prev, the one that
+// accepted this token before, then those that accepted a grant of its
+// root kid and sub, first first (kidNS), then the rest, sorted. A
 // namespace created later, or given the key later, that sorts first then
 // doesn't make the same token, or the same person's next one, someone
 // else, with none of their records, scratch files or locks. kids are
@@ -922,15 +1055,15 @@ type verdict struct {
 // most those (and kidNS's bounds count them). The preferred namespaces
 // don't count against maxVerifyNS.
 //
-// A grant an operator key signed (§C.4) authorizes nothing this server
-// does, and is refused (401) where /principal accepts it
-// (operatorSigned): its root kid may name a namespace's key too, and
-// /principal, which verifies it against the operator keys, names that
-// kid, so it would be taken for that key's user, and reach their scratch
-// files. One the namespace's own keys verify (an operator who listed
-// its key there, §C.4) is the namespace's, as the core serves it. Where
-// the namespace doesn't exist, its 404 is the answer, as the core's to an
-// operator grant.
+// An operator grant (§C.4) authorizes nothing this server does, and is
+// never a user of a gateway: refused (403) where /principal accepts it,
+// saying operator: true (§7.4, §H.7; operatorGrant), and kept refused for
+// refusedFor. Its root kid may name a namespace's key too, and
+// /principal names that kid, so it would be taken for that key's user,
+// and reach their scratch files. One the namespace's own keys verify (an
+// operator who listed its key there, §C.4) is the namespace's, as the
+// core serves it. Where the namespace doesn't exist, its 404 is the
+// answer, as the core's to an operator grant.
 func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, prev string) (*verdict, error) {
 	var named []string
 	for _, ns := range s.namespaces() {
@@ -969,11 +1102,11 @@ func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, p
 		ae, isAPI := client.AsAPIError(err)
 		switch {
 		case err == nil:
-			switch op, err := s.operatorSigned(ctx, c, g, ns); {
+			switch op, err := s.operatorGrant(ctx, c, g, ns, info); {
 			case err != nil:
 				return nil, err
 			case op:
-				return nil, fail(http.StatusUnauthorized, "the grant is signed by an operator key (kid %q), which authorizes creating namespaces and forced purges (§C.4), nothing this server does: log in with a grant from a key a namespace's document lists", kid)
+				return nil, fail(http.StatusForbidden, "the grant is an operator grant, signed by an operator key (kid %q; operator: true, §7.4), which authorizes creating namespaces and forced purges (§C.4), nothing this server does: operator grants are never users of a gateway (§H.7); log in with a grant from a key a namespace's document lists", kid)
 			}
 			s.mu.Lock()
 			if nss, _ := s.kidNS.Get(rk); !slices.Contains(nss, ns) {
@@ -1003,6 +1136,17 @@ func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, p
 		return nil, fail(http.StatusNotFound, "namespace %s doesn't exist (§7.4), and no other namespace your grant names here accepts it", absent)
 	}
 	return nil, fail(http.StatusUnauthorized, "the core doesn't accept the grant: %s", why)
+}
+
+// operatorGrant reports whether grant g, which namespace ns's /principal
+// accepted with info, is an operator grant (§C.4): as info says
+// (operator, §7.4), or, from a core that doesn't say (before v0.56), as
+// the deployment's operator keys tell (operatorSigned).
+func (s *Server) operatorGrant(ctx context.Context, c *client.Client, g *grant.Grant, ns string, info *client.PrincipalInfo) (bool, error) {
+	if _, said := info.Raw["operator"].(bool); said {
+		return info.Operator, nil
+	}
+	return s.operatorSigned(ctx, c, g, ns)
 }
 
 // operatorKeysFor is how long the deployment's operator keys, as read
@@ -1147,13 +1291,20 @@ func (s *Server) operatorKeys(ctx context.Context) ([]client.OperatorKey, error)
 }
 
 // userKey is who the state of a grant the core accepted (v) is kept for
-// (§H.7): the root sub and kid GET /ns/{ns}/principal named, never the
+// (§H.7 "Users"): the root sub with the key that verified the root block,
+// the RFC 7638 thumbprint GET /ns/{ns}/principal names (§7.4), never the
 // token, so every token of one person (minted again, attenuated offline)
-// is one user; with the namespace whose key verified it, since a kid
-// names a key of one namespace's document (§C.1), and the same kid in
+// is one user, whichever namespace verified it and under whatever kid;
+// two people are never merged, nor is one split; and after a key rotation
+// the person is a new user. From a core that names no key (before v0.56):
+// the root sub and kid with the namespace whose key verified it, since a
+// kid names a key of one namespace's document (§C.1), and the same kid in
 // another served namespace may be anyone's key, minting grants for the
-// same sub. verify asks the namespaces in an order that keeps it so.
+// same sub; verify asks the namespaces in an order that keeps it so.
 func userKey(v *verdict) string {
+	if v.info.Key != "" {
+		return "key\x00" + v.info.Key + "\x00" + v.info.Sub
+	}
 	return v.ns + "\x00" + v.info.Kid + "\x00" + v.info.Sub
 }
 
@@ -1164,9 +1315,15 @@ func userKey(v *verdict) string {
 // it is verified in the same order, and seen to have become someone else.
 type idUser struct{ user, vns, issuer string }
 
-// issuerKey is the key that minted the grant v the core accepted: the
-// verifying namespace and the root block's kid, userKey without the sub.
-func issuerKey(v *verdict) string { return v.ns + "\x00" + v.info.Kid }
+// issuerKey is the key that minted the grant v the core accepted, userKey
+// without the sub: its thumbprint, or from a core that names none, the
+// verifying namespace and the root block's kid.
+func issuerKey(v *verdict) string {
+	if v.info.Key != "" {
+		return "key\x00" + v.info.Key
+	}
+	return v.ns + "\x00" + v.info.Kid
+}
 
 // maxIDUsers bounds the token ids idUsers keeps, maxIDsPerUser those of
 // one user.
@@ -1399,6 +1556,7 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey,
 	}
 	s.idUsers.put(id, idUser{user: key, vns: v.ns, issuer: issuerKey(v)})
 	tk.verified, tk.vns = now, v.ns
+	p.verifiedAs(v.ns, v.info)
 	tk.keepWriter(v.ns, v.info, now)
 	s.useLocked(tk, now)
 	return tk, nil
@@ -1649,12 +1807,18 @@ type token struct {
 	vns            string
 
 	mu      sync.Mutex
-	writers map[string]writerAt // by namespace: §7.4's writer block
-	docs    map[string]nsDocAt  // by namespace: what its document says
+	writers map[string]writerAt    // by namespace: §7.4's writer block
+	docs    map[string]nsDocAt     // by namespace: what its document says
+	issued  map[string]issuedGrant // by ns/name: grants a catalog service issued it (catgrants.go)
 }
 
+// newToken makes a token sending its requests with c, but those a
+// catalog service issued it a grant for (route).
 func (s *Server) newToken(id string, c *client.Client, sc *scope, named map[string]bool) *token {
-	return &token{id: id, c: c, p: sc.p, sc: sc, named: named, used: s.opt.Now(), writers: map[string]writerAt{}, docs: map[string]nsDocAt{}}
+	tk := &token{id: id, p: sc.p, sc: sc, named: named, used: s.opt.Now(), writers: map[string]writerAt{}, docs: map[string]nsDocAt{},
+		issued: map[string]issuedGrant{}}
+	tk.c = c.With(client.WithTransport(tk.route(s.opt.Now)))
+	return tk
 }
 
 // principal is a user as the server keeps state for them (§H.7): their
@@ -1681,6 +1845,13 @@ type principal struct {
 	aside   map[string]time.Time  // documents' paths moved aside to a backup, and when
 	guards  map[string][]guard    // by document path: its refused saves' guards, oldest first
 	nguards int
+	// who the user is as the core records its writes (§H.7 "Users",
+	// wroteAs): its root sub and key thumbprint, or, with authentication
+	// disabled, its X-Author (author); kids, by namespace, the kids that
+	// named key there when the user's grants were verified there, or under
+	// which the catalog issued them grants there (§B.11.4)
+	sub, key, author string
+	kids             map[string]map[string]bool
 }
 
 // scope is what a principal keeps for its tokens of one narrowing
@@ -1907,8 +2078,9 @@ func (p *principal) forgetTreeDelete(path string) {
 	delete(p.trees, path)
 }
 
-// A refused save of a file (a PUT, or a MOVE onto an existing file,
-// answered 4xx or 5xx without writing to the core) sets a guard (§H.6):
+// A refused save of a file (a PUT, a COPY of a file, or a MOVE onto an
+// existing file, answered 4xx or 5xx without writing to the core; a case
+// variant refused, §H.2, among them) sets a guard (§H.6):
 // the principal's DELETE of the same path within refusedSaveFor is a 409,
 // once per refusal, and two refusals never share one. rclone deletes a
 // file whose upload failed, a second after the failure
@@ -1921,7 +2093,7 @@ func (p *principal) forgetTreeDelete(path string) {
 // deliberate and passes, the guards left as they are, as does one in a
 // frozen namespace, which the core refuses anyway (§8.4); one that finds
 // nothing (a refused create's cleanup) uses one up. A refused plain MOVE
-// (to a new name) or COPY sets none, nor does a write whose refusal undid
+// (to a new name) sets none, nor does a write whose refusal undid
 // the principal's own DELETE (undoOwnDelete), whose cleanup DELETE then
 // leaves the file deleted as the principal chose, nor a refusal of a
 // frozen namespace's.
@@ -2014,7 +2186,192 @@ func (p *principal) guarded(path string, now time.Time) bool {
 
 func (s *Server) newPrincipal(id string) *principal {
 	return &principal{id: id, toks: map[*token]bool{}, scopes: map[string]*scope{}, deletes: map[string]ownDelete{},
-		trees: map[string]treeDelete{}, aside: map[string]time.Time{}, guards: map[string][]guard{}, used: s.opt.Now()}
+		trees: map[string]treeDelete{}, aside: map[string]time.Time{}, guards: map[string][]guard{}, used: s.opt.Now(),
+		kids: map[string]map[string]bool{}}
+}
+
+// maxKids bounds the kids a user's identity keeps for one namespace.
+const maxKids = 16
+
+// verifiedAs notes what GET /ns/{ns}/principal said a grant of user p's
+// is in ns (info): the user's sub and key, if not known yet (local mode's
+// one bearer, a gateway's user as verify found it), and, for one of its
+// sub and key (from a core that names no key, only as the user's
+// verifying namespace says it), the kid that named the key there
+// (wroteAs).
+func (p *principal) verifiedAs(ns string, info *client.PrincipalInfo) {
+	if info == nil || info.Sub == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.sub == "" && p.author == "" {
+		p.sub, p.key = info.Sub, info.Key
+	}
+	if info.Sub != p.sub || info.Key != p.key || p.key == "" && len(p.kids) > 0 && p.kids[ns] == nil {
+		return
+	}
+	p.addKidLocked(ns, info.Kid)
+}
+
+// issuedTo notes that a grant kid signed for the user's sub in ns, which
+// the catalog issued the user (§B.11.4): its writes there are the user's
+// (§H.7).
+func (p *principal) issuedTo(ns, sub, kid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if sub != "" && sub == p.sub {
+		p.addKidLocked(ns, kid)
+	}
+}
+
+func (p *principal) addKidLocked(ns, kid string) {
+	if kid == "" {
+		return
+	}
+	ks := p.kids[ns]
+	if ks == nil {
+		if len(p.kids) >= maxWroteNS {
+			return
+		}
+		ks = map[string]bool{}
+		p.kids[ns] = ks
+	}
+	if len(ks) < maxKids {
+		ks[kid] = true
+	}
+}
+
+// wroteAs reports whether log entry e of namespace ns was written by
+// user p as the core records its writes (§H.7 "Users"): with
+// authentication disabled, under its X-Author (author, no grant); else
+// under a grant with its sub and a kid that named its key in ns
+// (verifiedAs), or the catalog's kid there for its sub (issuedTo). A kid
+// is judged as it names the key now, which a namespace that gave the kid
+// to another key since would get wrong.
+func (p *principal) wroteAs(ns string, e client.LogEntry) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch {
+	case p.author != "":
+		return e.Grant == nil && e.Author == p.author
+	case p.sub == "" || e.Grant == nil:
+		return false
+	}
+	return e.Grant.Sub == p.sub && p.kids[ns][e.Grant.Kid]
+}
+
+// authOff reports whether the core has authentication disabled (GET /
+// auth, §1), read again every VerifyEvery (§H.7 "Re-checking"), and at
+// the next login after the core refused an X-Author's request (401,
+// authStale): a core restarted with grants on is noticed, and one
+// restarted without them. When the answer changes, every token is
+// dropped, made again at its next request as the core now takes it. A
+// read that fails keeps the last answer, read again at the next login.
+func (s *Server) authOff(ctx context.Context) (bool, *davError) {
+	now := s.opt.Now()
+	s.authMu.Lock()
+	known, off, fresh := s.authKnown, s.authIsOff, !s.authAt.IsZero() && now.Sub(s.authAt) < s.opt.VerifyEvery
+	s.authMu.Unlock()
+	if known && fresh {
+		return off, nil
+	}
+	v, err, _ := s.authFlight.Do("", func() (any, error) {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		off, err := s.anon.AuthDisabled(rctx)
+		if err != nil {
+			return nil, err
+		}
+		s.authMu.Lock()
+		changed := s.authKnown && s.authIsOff != off
+		s.authKnown, s.authIsOff, s.authAt = true, off, s.opt.Now()
+		s.authMu.Unlock()
+		if changed {
+			s.opt.Logf("dav: the core now has authentication %s (GET /, §1): every login is taken again as it takes them", map[bool]string{true: "disabled", false: "enabled"}[off])
+			s.mu.Lock()
+			for _, tk := range s.tokens {
+				s.dropTokenLocked(tk)
+			}
+			s.mu.Unlock()
+		}
+		return off, nil
+	})
+	switch {
+	case err == nil:
+		return v.(bool), nil
+	case known:
+		s.opt.Logf("dav: the core's GET / couldn't be read again, so whether it has authentication disabled is taken as last read: %v", err)
+		return off, nil
+	}
+	if de, ok := upstream(err).(*davError); ok {
+		return false, de
+	}
+	return false, fail(http.StatusBadGateway, "the core's GET / couldn't be read: %v", err)
+}
+
+// authStale has authOff read GET / again at the next login: the core
+// refused a request sent with a Basic user name as its X-Author (401),
+// as one restarted with authentication on does.
+func (s *Server) authStale() {
+	s.authMu.Lock()
+	s.authAt = time.Time{}
+	s.authMu.Unlock()
+}
+
+// maxAuthor bounds a Basic user name taken as an X-Author.
+const maxAuthor = 256
+
+// authorPrefix begins the id of a token of a Basic user name taken as an
+// X-Author (authorToken), which no grant's id (a hash in hex) does.
+const authorPrefix = "author:"
+
+// authorToken is the token of Basic user name name, a gateway's user
+// over a core with authentication disabled (§1): its X-Author, which the
+// core records as the author of its writes (§7.2), and its user (§H.7
+// "Users"), one scope; the password is ignored, as the core takes anyone
+// for anyone then. There is no grant to verify.
+func (s *Server) authorToken(name string) (*token, *davError) {
+	name = strings.TrimSpace(name)
+	switch {
+	case name == "":
+		return nil, fail(http.StatusUnauthorized, "the core has authentication disabled (§1): log in with your name as the user name, which writes are recorded under (X-Author, §7.2)")
+	case len(name) > maxAuthor || !utf8.ValidString(name) || strings.IndexFunc(name, unicode.IsControl) >= 0:
+		return nil, fail(http.StatusUnauthorized, "the user name, your name as an author (X-Author, §7.2), is at most %d bytes of UTF-8 without control characters", maxAuthor)
+	}
+	sum := sha256.Sum256([]byte("author\x00" + name))
+	id := authorPrefix + hex.EncodeToString(sum[:16])
+	now := s.opt.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if tk := s.tokens[id]; tk != nil {
+		tk.verified = now
+		s.useLocked(tk, now)
+		return tk, nil
+	}
+	key := "author\x00" + name
+	p := s.principals[key]
+	if p == nil {
+		if !s.makeRoomLocked() {
+			return nil, &davError{status: http.StatusServiceUnavailable, msg: "too many users at once; try again", header: http.Header{"Retry-After": {"5"}}}
+		}
+		p = s.newPrincipal(key)
+		p.author = name
+		s.principals[key] = p
+	}
+	if !s.tokenRoomLocked(p) {
+		return nil, &davError{status: http.StatusServiceUnavailable, msg: "too many of your logins at once; try again", header: http.Header{"Retry-After": {"5"}}}
+	}
+	sc := p.scopes[""]
+	if sc == nil {
+		sc = s.newScopeLocked(p, "")
+	}
+	tk := s.newToken(id, s.opt.Client.With(client.WithBearer(""), client.WithAuthor(name)), sc, nil)
+	s.tokens[id] = tk
+	p.toks[tk] = true
+	tk.verified = now
+	s.useLocked(tk, now)
+	return tk, nil
 }
 
 // newScopeLocked makes p's scope key.
@@ -2064,8 +2421,9 @@ type reqState struct {
 	noETag      bool     // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
 	serve       *stagedServe
 	// saveTo is the document path a PUT writes, once resolved (or one in
-	// a tree that couldn't be read), and saveDoc whether it is a flat
-	// namespace's document; committed: the request wrote to the core (a
+	// a tree that couldn't be read), or a COPY's file (open), and saveDoc
+	// whether a PUT's is a flat namespace's document; committed: the
+	// request wrote to the core (a
 	// revision, a catalog node), not counting a restore of the
 	// principal's own DELETE as it was (undoOwnDelete), which undeleted
 	// says it did.
@@ -2082,6 +2440,9 @@ type reqState struct {
 	// destination (moveAcross), which a name moved away takes as a new
 	// file: a move, not a save (movedAway)
 	moving bool
+	// pdf: the GET or HEAD serves a PDF, without the sandbox (servePDF),
+	// which any answer but its 200 or 206 puts back (errWriter)
+	pdf bool
 
 	lists  map[string]*listing     // by directory path
 	graphs map[string]*catGraph    // by catalog

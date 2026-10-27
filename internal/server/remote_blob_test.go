@@ -171,7 +171,7 @@ func TestRemoteBranchE2EBlobs(t *testing.T) {
 	adminG := a.grant(kA, "user:admin", []string{"e"}, allVerbs)
 	_, readerPriv, _ := seal.GenerateRecipient()
 	k := seal.NewKey()
-	kr, _ := seal.BuildKeyring("e", 1, k, []*ecdh.PublicKey{readerPriv.PublicKey()})
+	kr, _ := seal.BuildKeyringV2(readerPriv, "e", 1, k, []*ecdh.PublicKey{readerPriv.PublicKey()})
 	a.create("e", "keyring", kr.Value(), adminG)
 	upload := func(name, text string) ([]byte, string) {
 		sealedBytes, r, err := plclient.EncryptBlob("image/png", []byte(text+" "+encMarker), false)

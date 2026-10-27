@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
+//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
@@ -96,6 +96,8 @@ func main() {
 		schemaCmd(os.Args[2:])
 	case "health":
 		healthCmd(os.Args[2:])
+	case "e2e":
+		e2eCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -104,7 +106,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-schema-fetch [-schema-fetch-hosts H,H]] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
-                 [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
+                 [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-follow-interval 5m] [-remote-register]
                  [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
   patchlog version
   patchlog keygen
@@ -117,7 +119,7 @@ func usage() {
   patchlog dav -api URL -ns NS[,NS…] [-catalog NS[,NS…] [-tree-url [CATALOG=]URL]...] [-addr 127.0.0.1:8090] [-bearer GRANT | -bearer-file FILE] [-author A] [-password-file FILE]
                [-gateway [-insecure]] [-tls-cert FILE -tls-key FILE]   (WebDAV, a prototype)
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A] [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
-  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-json]
+  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-identity key.jwk]... [-reader pub.jwk]... [-bearer T] [-author A] [-json]
   patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
   patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode history|snapshot] [-o file.jsonl] [-bearer T]
   patchlog import -api URL -ns TARGET -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T]
@@ -125,6 +127,7 @@ func usage() {
   patchlog archive restore -db patchlog.db [-blob-dir DIR] [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]
   patchlog schema import -api URL -ns NS [-bearer T] [-author A] [-name NAME] [-dry-run] [-json] URL|FILE...
   patchlog health [-timeout 2s] [URL]   (exit 0 if URL, default http://localhost:8080/_health, answers 200)
+  patchlog e2e migrate-keyring -api URL -ns NS -identity admin.jwk [-reader pub.jwk]... [-current-reader pub.jwk]... [-bearer T]
 
 serve, index, tree and dav also take -shutdown-timeout 30s and -shutdown-delay 0 (graceful shutdown) and answer /_health and /_ready.`)
 	os.Exit(2)
@@ -138,6 +141,7 @@ func serve(args []string) {
 	origin := fs.String("origin", "http://localhost:8080", "canonical origin (§G.1)")
 	dev := fs.Bool("dev", false, "disable authentication (development only); X-Author names the author")
 	pg := fs.Bool("playground", true, "serve the web playground at /playground/")
+	inlinePDF := fs.Bool("inline-pdf", false, "serve application/pdf blobs for inline display, without the sandbox that blanks Chromium's viewer, instead of with Content-Disposition: attachment (§7.8)")
 	var treeURLs multi
 	fs.Var(&treeURLs, "tree-url", "tree service (Addendum B) the playground reads through a read-only proxy at "+server.TreeProxyPrefix+", e.g. http://tree:8082; CATALOG=URL maps one catalog to its own (repeatable)")
 	indexURL := fs.String("index-url", "", "search index (Addendum A) the playground reads through a read-only proxy at "+server.IndexProxyPrefix+", e.g. http://index:8081; one index serves several namespaces")
@@ -171,8 +175,7 @@ func serve(args []string) {
 	fs.Var(&remoteURLs, "remote-url", "ORIGIN=URL: reach the deployment at ORIGIN through URL instead (repeatable)")
 	var remoteIDs multi
 	fs.Var(&remoteIDs, "remote-identity", "ORIGIN=FILE: X25519 private key (JWK) unwrapping the keys of sealed bases at ORIGIN, named by the -remote-bearer grant's enc (repeatable, §G.5.2)")
-	ignorePurges := fs.Bool("remote-ignore-purges", false, "record purges in remote bases' logs as notices instead of applying them (§G.3)")
-	remoteFollow := fs.Duration("remote-follow-interval", 5*time.Minute, "how often remote bases' logs are followed (0 disables)")
+	remoteFollow := fs.Duration("remote-follow-interval", 5*time.Minute, "how often remote bases' logs are followed: their purges applied and their raises of level followed (§G.3, §G.5.2); 0 disables following")
 	remoteRegister := fs.Bool("remote-register", false, "register remote branches with their bases and renew the registrations (§G.3)")
 	masterKey := fs.String("master-key", "", "file holding the 32-byte master key of encryption at rest (Addendum E.1); mode 0600")
 	masterKeyCreate := fs.Bool("master-key-create", false, "create the -master-key file with a new random key if it doesn't exist")
@@ -180,6 +183,7 @@ func serve(args []string) {
 	rotateOnRevoke := fs.Bool("rotate-on-revoke", false, "rotate a sealed namespace's epoch right after a config write that revokes a grant or removes or changes a key (§E.2.4)")
 	groupCommit := fs.Int("group-commit", 32, "Postgres and DynamoDB: at most this many concurrent resource writes (and, on Postgres, batches) of one namespace committed in one transaction (group commit, D.8); 1 or less commits every write on its own")
 	groupWait := fs.Duration("group-commit-wait", 200*time.Microsecond, "Postgres: at most how long a group waits for writes of its namespace still being checked (0: no wait)")
+	localRate := fs.Bool("local-rate-buckets", false, "Postgres: keep the rate-limit buckets (§6.6) in this instance's memory rather than in the database, saving a round trip per write; only for a deployment of one instance, since instances sharing a database must share their buckets")
 	storeCompression := fs.String("store-compression", "off", "zstd: store the patch sets of namespaces without encryption, from 1 KiB, compressed (SQLite only). A format change: earlier versions can't read a database once it holds compressed patch sets, and turning it off again doesn't decompress them")
 	var purgeURLs multi
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
@@ -207,7 +211,7 @@ func serve(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	remote.IgnorePurges, remote.Register, remote.FollowInterval = *ignorePurges, *remoteRegister, *remoteFollow
+	remote.Register, remote.FollowInterval = *remoteRegister, *remoteFollow
 	if remote.FollowInterval == 0 {
 		remote.FollowInterval = -1
 	}
@@ -346,7 +350,7 @@ func serve(args []string) {
 	}
 	opt := core.Options{Path: *db, BlobDir: *blobDir, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys, OperatorKeyHistory: history, JWKSURI: *jwksURI,
 		Limits: limits, Maximums: max, GrantCacheEntries: *grantCache, DocCacheBytes: cacheBytes[0], ReadCacheBytes: cacheBytes[1], Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks,
-		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke, GroupCommit: *groupCommit, GroupCommitWait: *groupWait, StoreCompression: *storeCompression}
+		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke, GroupCommit: *groupCommit, GroupCommitWait: *groupWait, LocalRateBuckets: *localRate, StoreCompression: *storeCompression}
 	if opt.GroupCommit < 1 {
 		opt.GroupCommit = 1 // off
 	}
@@ -361,7 +365,11 @@ func serve(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler(server.New(e, server.WithEdge(ev), server.WithEdgeGrants(cookies)), *pg, treeProxy, indexProxy, playground.Options{SchemaFetch: *schemaFetch, SchemaFetchHosts: splitHosts(*schemaHosts)})), ReadHeaderTimeout: 10 * time.Second}
+	sopts := []server.Option{server.WithEdge(ev), server.WithEdgeGrants(cookies)}
+	if *inlinePDF {
+		sopts = append(sopts, server.WithInlinePDF())
+	}
+	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler(server.New(e, sopts...), *pg, treeProxy, indexProxy, playground.Options{SchemaFetch: *schemaFetch, SchemaFetchHosts: splitHosts(*schemaHosts)})), ReadHeaderTimeout: 10 * time.Second}
 	ls := sdFlags.server("patchlog", srv, e.Ping)
 	sigCtx, sigs := shutdownSignals("patchlog")
 	ln, err := net.Listen("tcp", *addr)

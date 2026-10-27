@@ -3,6 +3,7 @@ package client_test
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/hpke"
 	"encoding/base64"
 	"encoding/json"
@@ -15,31 +16,56 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// legacyRewrap wraps every entry of kr again under the HPKE info keyrings
-// were stored with before v0.63 ("patchlog-keys-v1" LF kid), as a keyring
-// written by v0.22.0 is.
-func legacyRewrap(t *testing.T, kr *seal.Keyring, keys map[int][]byte) {
+// legacyWrap wraps key, the K_e of kid, for pub under the HPKE info
+// keyrings were stored with before v0.63 ("patchlog-keys-v1" LF kid), as
+// a keyring written by v0.22.0 holds it.
+func legacyWrap(t *testing.T, pub *ecdh.PublicKey, kid string, key []byte) []byte {
 	t.Helper()
-	for e, entries := range kr.Epochs {
-		for rid := range entries {
-			pk, err := hpke.NewDHKEMPublicKey(kr.Recipients[rid])
-			if err != nil {
-				t.Fatal(err)
-			}
-			w, err := hpke.Seal(pk, hpke.HKDFSHA256(), hpke.AES256GCM(), []byte("patchlog-keys-v1\n"+seal.Kid(kr.NS, e)), keys[e])
-			if err != nil {
-				t.Fatal(err)
-			}
-			entries[rid] = w
-		}
+	pk, err := hpke.NewDHKEMPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
 	}
+	w, err := hpke.Seal(pk, hpke.HKDFSHA256(), hpke.AES256GCM(), []byte("patchlog-keys-v1\n"+kid), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// rewriteKeys returns a transport that passes the keys of every 200 answer
+// of POST /ns/{ns}/keys through edit.
+func rewriteKeys(t *testing.T, ns string, edit func(m map[string]any)) http.RoundTripper {
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	return roundTrip(func(req *http.Request) (*http.Response, error) {
+		res, err := base.RoundTrip(req)
+		if err != nil || req.URL.Path != "/ns/"+ns+"/keys" || res.StatusCode != 200 {
+			return res, err
+		}
+		b, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		var a map[string]any
+		if err := json.Unmarshal(b, &a); err != nil {
+			t.Errorf("keys answer: %v", err)
+		}
+		for _, x := range a["keys"].([]any) {
+			edit(x.(map[string]any))
+		}
+		b, _ = json.Marshal(a)
+		res.Body = io.NopCloser(bytes.NewReader(b))
+		res.ContentLength = int64(len(b))
+		res.Header.Del("Content-Length")
+		return res, nil
+	})
 }
 
 // W1X: a keyring stored before v0.63 holds keys wrapped under the old
-// info. /keys relays its entries as stored (§E.2.3, §E.3.2), so a reader
-// whose grant carries enc opens them as Keyring.EpochKey opens the keyring
-// itself, under the old info when the current one fails; and a relayed
-// entry it can't open is no reason to stop before the keyring.
+// info, and /keys relays its entries as stored, without from (§E.2.3,
+// §E.3.2), so a reader whose grant carries enc opens them as
+// Keyring.EpochKey opens such a keyring, under the old info when the
+// current one fails; and a relayed entry it can't open is no reason to
+// stop before the keyring. Since v0.63 servers refuse to have such a
+// keyring written (P18), so the relay of a stored one is played by the
+// transport; MigrateKeyring wraps such keyrings again (v073_p18_test.go).
 func TestW1XRelayedLegacyKeyringEntries(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -53,20 +79,23 @@ func TestW1XRelayedLegacyKeyringEntries(t *testing.T) {
 	ax := admin.E2E(aPriv)
 	must(ax.InitKeyring(ctx, "secret", rPriv.PublicKey()))
 	must(ax.CreateDocSealed(ctx, "secret", "p", map[string]any{"n": 1.0}))
-	kr, head, err := ax.Keyring(ctx, "secret")
+	kr, _, err := ax.Keyring(ctx, "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ke, err := ax.Key(ctx, seal.Kid("secret", kr.Current))
+	kid := seal.Kid("secret", kr.Current("secret"))
+	ke, err := ax.Key(ctx, kid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacyRewrap(t, kr, map[int][]byte{kr.Current: ke})
-	must(admin.Append(ctx, "secret", client.KeyringName, head, []any{map[string]any{"op": "replace", "path": "", "value": kr.Value()}}))
 	readerGrant := k.Grant(t, s.Now(), "user:r", []string{"secret"}, []string{"read"}, map[string]any{"enc": rJWK})
 
-	// The relayed entry, under the old info.
-	rd := s.Client(t, client.WithBearer(readerGrant))
+	// The relayed entry of a stored legacy keyring, under the old info.
+	legacy := rewriteKeys(t, "secret", func(m map[string]any) {
+		delete(m, "from")
+		m["wrapped"] = base64.RawURLEncoding.EncodeToString(legacyWrap(t, rPriv.PublicKey(), kid, ke))
+	})
+	rd := s.Client(t, client.WithBearer(readerGrant), client.WithHTTPClient(&http.Client{Transport: legacy}))
 	if _, d, err := rd.E2E(rPriv).LoadE2E(ctx, "secret", "p"); err != nil {
 		t.Fatalf("relayed entry of a keyring stored before v0.63: %v", err)
 	} else if d.Value.(map[string]any)["n"] != 1.0 {
@@ -74,47 +103,16 @@ func TestW1XRelayedLegacyKeyringEntries(t *testing.T) {
 	}
 
 	// A relayed entry that opens under neither info: the keyring, which
-	// this reader may read, still gives the key.
-	base := http.DefaultTransport.(*http.Transport).Clone()
-	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
-		res, err := base.RoundTrip(req)
-		if err != nil || req.URL.Path != "/ns/secret/keys" || res.StatusCode != 200 {
-			return res, err
-		}
-		b, _ := io.ReadAll(res.Body)
-		res.Body.Close()
-		var a map[string]any
-		if err := json.Unmarshal(b, &a); err != nil {
-			t.Errorf("keys answer: %v", err)
-		}
-		for _, x := range a["keys"].([]any) {
-			m := x.(map[string]any)
-			w, _ := base64.RawURLEncoding.DecodeString(m["wrapped"].(string))
-			w[len(w)-1] ^= 1
-			m["wrapped"] = base64.RawURLEncoding.EncodeToString(w)
-		}
-		b, _ = json.Marshal(a)
-		res.Body = io.NopCloser(bytes.NewReader(b))
-		res.ContentLength = int64(len(b))
-		res.Header.Del("Content-Length")
-		return res, nil
+	// this reader may read, still gives the key, from an admin it knows.
+	broken := rewriteKeys(t, "secret", func(m map[string]any) {
+		w, _ := base64.RawURLEncoding.DecodeString(m["wrapped"].(string))
+		w[len(w)-1] ^= 1
+		m["wrapped"] = base64.RawURLEncoding.EncodeToString(w)
 	})
-	bad := s.Client(t, client.WithBearer(readerGrant), client.WithHTTPClient(&http.Client{Transport: rt}))
-	if _, d, err := bad.E2E(rPriv).LoadE2E(ctx, "secret", "p"); err != nil {
+	bad := s.Client(t, client.WithBearer(readerGrant), client.WithHTTPClient(&http.Client{Transport: broken}))
+	if _, d, err := bad.E2E(rPriv).WithSenders(aPriv.PublicKey()).LoadE2E(ctx, "secret", "p"); err != nil {
 		t.Fatalf("relayed entry that doesn't open, keyring readable: %v", err)
 	} else if d.Value.(map[string]any)["n"] != 1.0 {
 		t.Fatalf("p %v", d.Value)
-	}
-
-	// The re-wrap the CHANGELOG names until the server takes the §E.3.2
-	// document: AddReader with history, per reader, wraps that reader's
-	// entries under the current info.
-	must(admin.E2E(aPriv).AddReader(ctx, "secret", rPriv.PublicKey(), true))
-	got := must(rd.FetchKeys(ctx, "secret", []int{kr.Current}, nil))
-	if len(got) != 1 {
-		t.Fatalf("relayed %v", got)
-	}
-	if k, err := seal.UnwrapKey(rPriv, got[0].Wrapped); err != nil || !bytes.Equal(k, ke) {
-		t.Fatalf("after AddReader, the relayed entry under the current info: %v", err)
 	}
 }

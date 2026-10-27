@@ -4,8 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
-	"net/url"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -69,8 +67,7 @@ func TestW1XTreePagesRestartShowPhantomDuplicates(t *testing.T) {
 	// In front of it: the first time the gateway follows a next (a page
 	// after the first), someone writes to the catalog elsewhere and more
 	// than a minute passes before the request arrives.
-	bu, _ := url.Parse(back.URL)
-	proxy := httputil.NewSingleHostReverseProxy(bu)
+	proxy := proxyTo(back.URL)
 	var moved atomic.Bool
 	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/children") && r.URL.Query().Get("after") != "" && moved.CompareAndSwap(false, true) {
