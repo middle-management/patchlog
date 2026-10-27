@@ -29,7 +29,7 @@ type configPlan struct {
 }
 
 // planConfig runs steps 1–6 of a config write on an existing namespace.
-func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBatch bool) (*configPlan, error) {
+func (t *gate) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBatch bool) (*configPlan, error) {
 	// Step 1.
 	if err := t.authorize(a, "config", ""); err != nil {
 		return nil, err
@@ -72,22 +72,18 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 	// Step 2: idempotent retry, then the precondition. Config writes are
 	// allowed in frozen namespaces.
 	if !inBatch && p.expected != nil {
-		var seq int64
-		var author int64
-		err := t.QueryRow(`SELECT seq, author FROM ns_config WHERE ns = ? AND id = ?`, n.id, p.expected[:]).Scan(&seq, &author)
-		if err == nil && author == t.actorID(a) {
+		seq, author, ok := t.configByID(n, *p.expected)
+		if ok && author == t.actorID(a) {
 			// The entry that wrote it: the first in force with it, a
 			// config entry or a batch with a config change (§7.4).
-			var nsSeq int64
-			t.QueryRow(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, n.id, seq).Scan(&nsSeq)
+			nsSeq, _ := t.firstEntryOfConfig(n, seq)
 			r := &WriteResult{Status: 200, Replayed: true, ConfigID: p.expected.String()}
 			if nsSeq != 0 {
 				r.NSID = t.nsLogID(nsSeq).String()
 				// The retry carries what was recorded, gestures included
 				// (§7.2); only a config entry has them (§7.4).
-				var gjson sql.NullString
-				if t.QueryRow(`SELECT gestures FROM ns_log WHERE seq = ? AND kind = ?`, nsSeq, nsKindCode("config")).Scan(&gjson) == nil && gjson.Valid {
-					if g, ok := jsonv.Parse([]byte(gjson.String)); ok == nil {
+				if gjson, ok := t.configEntryGestures(nsSeq); ok {
+					if g, ok := jsonv.Parse([]byte(gjson)); ok == nil {
 						if m, ok := g.(map[string]any); ok {
 							r.Entry = &LogEntry{}
 							if s, ok := m["gesture"].(string); ok {
@@ -145,6 +141,33 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 		return nil, err
 	}
 	return p, nil
+}
+
+// configByID is n's configuration id: its seq and author (the config
+// retry lookup's read).
+func (t *tx) configByID(n *nsRow, id ids.ID) (seq, author int64, ok bool) {
+	err := t.QueryRow(`SELECT seq, author FROM ns_config WHERE ns = ? AND id = ?`, n.id, id[:]).Scan(&seq, &author)
+	return seq, author, err == nil
+}
+
+// firstEntryOfConfig is n's first entry with configuration seq in force:
+// the config entry, or the batch with a config change, that wrote it.
+func (t *tx) firstEntryOfConfig(n *nsRow, seq int64) (int64, bool) {
+	var s int64
+	if t.QueryRow(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, n.id, seq).Scan(&s) == nil && s != 0 {
+		return s, true
+	}
+	return 0, false
+}
+
+// configEntryGestures are config entry seq's gesture members as stored,
+// if it is a config entry and has them.
+func (t *tx) configEntryGestures(seq int64) (string, bool) {
+	var g sql.NullString
+	if t.QueryRow(`SELECT gestures FROM ns_log WHERE seq = ? AND kind = ?`, seq, nsKindCode("config")).Scan(&g) == nil && g.Valid {
+		return g.String, true
+	}
+	return "", false
 }
 
 func anyStrings(xs []string) []any {

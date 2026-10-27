@@ -26,19 +26,26 @@ import (
 // their revisions, configurations, blobs, keys, branches and schemas, the
 // retry lookup and a config change's plan.
 type checkReads interface {
+	actorID(a *actor) int64
 	ancestry(head *revRow) []segment
 	archiveURL(res, seq int64) string
 	attachedBlob(res int64, bid ids.ID) *blobRow
 	authorName(id int64) string
 	baseIdentity(n *nsRow) string
+	batchEntry(n *nsRow, seq, author int64) (ids.ID, string, bool)
 	branchesOf(n *nsRow) []*nsRow
 	checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error
 	config(seq int64) *Config
+	configByID(n *nsRow, id ids.ID) (seq, author int64, ok bool)
+	configEntryGestures(seq int64) (string, bool)
+	configID(seq int64) ids.ID
 	copyRows(id ids.ID, name string) []copyRow
 	declaredAt(row *revRow) []ids.ID
 	dek(res int64, create bool) []byte
 	docBytesAt(r *revRow) ([]byte, error)
+	entriesTo(row *revRow) []int64
 	e2eEpochOK(n *nsRow, cfg *Config, e int) bool
+	firstEntryOfConfig(n *nsRow, seq int64) (int64, bool)
 	grantRef(id []byte) map[string]any
 	horizonID(res int64) string
 	locate(segs []segment, id ids.ID) (int, *revRow)
@@ -53,14 +60,13 @@ type checkReads interface {
 	nsLogSeq(ns int64, id ids.ID) (int64, bool)
 	nsRowUnlocked(id int64) *nsRow
 	pendingBlob(res int64, bid ids.ID, uploader string, cutoff int64) *blobRow
-	planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBatch bool) (*configPlan, error)
 	prefetchHeads(n *nsRow, names []string, asOf *int64)
 	prefetchResources(ns int64, names []string)
 	prefetchSchemas(refs []schema.Ref)
 	referencedUpTo(res, max int64, bid ids.ID) bool
-	replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch bool) *WriteResult
 	resolve(n *nsRow, name string, asOf *int64) *view
 	rev(seq int64) *revRow
+	revByID(n *nsRow, name string, id ids.ID) *revRow
 	revID(seq int64) ids.ID
 	schemaNS(name string) *nsRow
 	schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map[int64]*nsRow

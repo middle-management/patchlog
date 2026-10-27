@@ -1064,8 +1064,10 @@ func (t *gate) purgedItems(n *nsRow, st []*itemState) []itemErr {
 
 // replay implements the idempotent-retry lookup (§7.2, §7.5). Callers
 // answer a purged resource first (purgedItems): the lookup doesn't apply
-// to one.
-func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch bool) *WriteResult {
+// to one. The rules are the gate's; finding the recorded revisions and
+// entries is the store's (revByID, entriesTo, batchEntry,
+// firstEntryWithConfig).
+func (t *gate) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch bool) *WriteResult {
 	author := t.actorID(a)
 	if !isBatch {
 		if len(st) != 1 {
@@ -1076,25 +1078,19 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		if !ok {
 			return nil
 		}
-		own := t.resource(n.id, s.Resource)
-		if own == nil {
-			return nil
-		}
 		last := want[len(want)-1]
-		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, last[:]))
-		if err != nil || row.author != author {
+		row := t.revByID(n, s.Resource, last)
+		if row == nil || row.author != author {
 			return nil
 		}
 		if s.cands != nil && !contains(s.cands, t.entryVerb(row)) {
 			return nil // recorded with a verb this request may not use
 		}
-		var nsSeq int64
-		t.QueryRow(`SELECT ns_seq FROM head_history WHERE res = ? AND target_seq = ?`, own.id, row.seq).Scan(&nsSeq)
 		le := t.logEntry(row)
 		r := &WriteResult{Status: 200, Replayed: true, Entry: &le,
 			Items: []ItemResult{{Resource: s.Resource, IDs: []string{last.String()}}}}
-		if nsSeq != 0 {
-			r.NSID = t.nsLogID(nsSeq).String()
+		if seqs := t.entriesTo(row); len(seqs) > 0 && seqs[0] != 0 {
+			r.NSID = t.nsLogID(seqs[0]).String()
 		}
 		return r
 	}
@@ -1130,54 +1126,37 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 	// which made each batch slower as the log grew.
 	var cands []int64
 	if len(st) > 0 {
-		own := t.resource(n.id, st[0].Resource)
-		if own == nil {
-			return nil
-		}
 		target, err := ids.Parse(items[0].IDs[len(items[0].IDs)-1])
 		if err != nil {
 			return nil
 		}
-		var rseq int64
-		if t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND id = ?`, own.id, target[:]).Scan(&rseq) != nil {
+		row := t.revByID(n, st[0].Resource, target)
+		if row == nil {
 			return nil
 		}
-		rows, err := t.Query(`SELECT ns_seq FROM head_history WHERE res = ? AND target_seq = ?`, own.id, rseq)
-		t.must(err)
-		for rows.Next() {
-			var s int64
-			t.must(rows.Scan(&s))
-			cands = append(cands, s)
-		}
-		// Closed before querying again: a Postgres connection runs one
-		// query at a time.
-		rows.Close()
+		cands = t.entriesTo(row)
 	} else if cp != nil {
-		var cseq, s int64
-		if t.QueryRow(`SELECT seq FROM ns_config WHERE ns = ? AND id = ?`, n.id, cp.expected[:]).Scan(&cseq) != nil {
-			return nil
-		}
-		if t.QueryRow(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, n.id, cseq).Scan(&s) == nil && s != 0 {
-			cands = append(cands, s)
+		if seq, ok := t.firstEntryWithConfig(n, *cp.expected); ok {
+			cands = append(cands, seq)
 		}
 	}
-	var match []byte
+	var match ids.ID
+	found := false
 	for _, seq := range cands {
-		var id []byte
-		var body string
-		if t.QueryRow(`SELECT id, body FROM ns_log WHERE seq = ? AND ns = ? AND kind = ? AND author = ?`, seq, n.id, nsKindCode("batch"), author).Scan(&id, &body) != nil {
+		id, body, ok := t.batchEntry(n, seq, author)
+		if !ok {
 			continue
 		}
 		b := jsonv.MustParse([]byte(body)).(map[string]any)
 		if string(jsonv.Canonical(b["entries"])) == want {
-			match = id
+			match, found = id, true
 			break
 		}
 	}
-	if match == nil || !t.candidateVerbsMatch(n, st) {
+	if !found || !t.candidateVerbsMatch(n, st) {
 		return nil
 	}
-	r := &WriteResult{Status: 200, Replayed: true, NSID: ids.FromBytes(match).String(), Items: items}
+	r := &WriteResult{Status: 200, Replayed: true, NSID: match.String(), Items: items}
 	if cp != nil {
 		r.ConfigID = cp.expected.String()
 	}
@@ -1186,22 +1165,71 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 
 // candidateVerbsMatch reports whether every item with candidate verbs
 // recorded its first entry with one of them (§7.5 idempotent retry).
-func (t *tx) candidateVerbsMatch(n *nsRow, st []*itemState) bool {
+func (t *gate) candidateVerbsMatch(n *nsRow, st []*itemState) bool {
 	for _, s := range st {
 		if s.cands == nil {
 			continue
 		}
 		want, ok := expectedIDs(s)
-		own := t.resource(n.id, s.Resource)
-		if !ok || own == nil {
+		if !ok {
 			return false
 		}
-		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, want[0][:]))
-		if err != nil || !contains(s.cands, t.entryVerb(row)) {
+		row := t.revByID(n, s.Resource, want[0])
+		if row == nil || !contains(s.cands, t.entryVerb(row)) {
 			return false
 		}
 	}
 	return true
+}
+
+// revByID is resource name's revision id, nil when the resource or the
+// revision isn't there (the retry lookup's read).
+func (t *tx) revByID(n *nsRow, name string, id ids.ID) *revRow {
+	own := t.resource(n.id, name)
+	if own == nil {
+		return nil
+	}
+	row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, id[:]))
+	if err != nil {
+		return nil
+	}
+	return row
+}
+
+// entriesTo are the namespace entries that moved row's resource to row
+// (head_history).
+func (t *tx) entriesTo(row *revRow) []int64 {
+	rows, err := t.Query(`SELECT ns_seq FROM head_history WHERE res = ? AND target_seq = ?`, row.res, row.seq)
+	t.must(err)
+	var out []int64
+	for rows.Next() {
+		var s int64
+		t.must(rows.Scan(&s))
+		out = append(out, s)
+	}
+	// Closed before querying again: a Postgres connection runs one query
+	// at a time.
+	rows.Close()
+	return out
+}
+
+// batchEntry is n's entry seq if it is a batch by author: its id and body.
+func (t *tx) batchEntry(n *nsRow, seq, author int64) (ids.ID, string, bool) {
+	var id []byte
+	var body string
+	if t.QueryRow(`SELECT id, body FROM ns_log WHERE seq = ? AND ns = ? AND kind = ? AND author = ?`, seq, n.id, nsKindCode("batch"), author).Scan(&id, &body) != nil {
+		return ids.ID{}, "", false
+	}
+	return ids.FromBytes(id), body, true
+}
+
+// firstEntryWithConfig is n's first entry with configuration id in force.
+func (t *gate) firstEntryWithConfig(n *nsRow, id ids.ID) (int64, bool) {
+	cseq, _, ok := t.configByID(n, id)
+	if !ok {
+		return 0, false
+	}
+	return t.firstEntryOfConfig(n, cseq)
 }
 
 // precondition is step 2 for one item (§7.2, §7.6 first writes).
