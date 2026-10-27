@@ -410,10 +410,7 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	if !below {
 		return &PruneResult{Horizon: h.id.String()}, nil
 	}
-	if h.id != requested {
-		return nil, apiErr(422, "invalid", "message", "the horizon moves down to a protected revision (§8.6); seal the snapshot for that one", "horizon", h.id.String())
-	}
-	if err := t.checkSealedHeader(n, cfg, snapshot, seal.SnapshotPL(n.name, name, h.id.String()), "snapshot"); err != nil {
+	if err := t.checkE2EPrune(n, cfg, name, h, requested, snapshot); err != nil {
 		return nil, err
 	}
 	// The snapshot needs no list (§8.6, §E.3.1): the server keeps the
@@ -449,6 +446,16 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	_, nsID := t.appendNS(n, map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, &own.id, &target, n.configSeq, author)
 	res.NSID = nsID.String()
 	return res, nil
+}
+
+// checkE2EPrune checks an e2e prune that prunes something (§8.6): h,
+// the horizon after protect, must be the requested one, since snapshot
+// is sealed for it.
+func (t *gate) checkE2EPrune(n *nsRow, cfg *Config, name string, h *revRow, requested ids.ID, snapshot string) *Error {
+	if h.id != requested {
+		return apiErr(422, "invalid", "message", "the horizon moves down to a protected revision (§8.6); seal the snapshot for that one", "horizon", h.id.String())
+	}
+	return t.checkSealedHeader(n, cfg, snapshot, seal.SnapshotPL(n.name, name, h.id.String()), "snapshot")
 }
 
 // pruneBlobsE2E ends the attachments of res that neither kept, the

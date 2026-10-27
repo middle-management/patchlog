@@ -213,8 +213,10 @@ func (r *revRow) item() item {
 	}
 	if r.kind != "tombstone" {
 		it["patches"] = avS(r.patches)
-		it["size"] = avN(r.size)
-		it["digest"] = avB(r.digest)
+		if len(r.digest) > 0 { // none for mirrored e2e content
+			it["size"] = avN(r.size)
+			it["digest"] = avB(r.digest)
+		}
 	}
 	if r.parentID != "" {
 		it["parentId"] = avS(r.parentID)

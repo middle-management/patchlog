@@ -52,11 +52,6 @@ func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, 
 			return out.res, nil
 		}
 		p := out.p
-		if p.cplan != nil {
-			if err := ddbRefusals(p.cplan.cfg); err != nil {
-				return nil, err
-			}
-		}
 		c, cerr := ddbCheck(func() *ddb.Commit { return r.commitOf(g, p) })
 		if cerr != nil {
 			return nil, cerr
@@ -333,9 +328,6 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 			return out.p.replay, nil
 		}
 		n, p := out.n, out.p
-		if err := ddbRefusals(p.cfg); err != nil {
-			return nil, err
-		}
 		gid, err := b.storeGrant(ctx, out.a, max(out.cur.level, p.cfg.level) >= levelAtRest)
 		if err != nil {
 			return nil, err
@@ -397,9 +389,6 @@ func (b *ddbBackend) createNamespace(ctx context.Context, req Request, cc Config
 			return planned{err: apiErr(412, "stale", "config", g.configID(n.configSeq).String())}
 		}
 		a, _, cfg, err := g.planCreate(req, cc)
-		if err == nil {
-			err = ddbRefusals(cfg)
-		}
 		if err == nil {
 			err = checkConfigGestures(&cc)
 		}

@@ -44,14 +44,17 @@ func (b *ddbBackend) prune(ctx context.Context, req Request, name string, pr Pru
 			return nil, perr
 		case out.err != nil:
 			return nil, out.err
-		case out.p.e2e:
-			return nil, ddbUnsupported("e2e namespaces")
 		}
 		gid, err := b.storeGrant(ctx, out.p.a, out.p.cfg.level >= levelAtRest)
 		if err != nil {
 			return nil, err
 		}
-		res, err := b.pruneTo(ctx, r, g, out.p, out.p.a.id(), gid, out.p.a.noAuth)
+		var res *PruneResult
+		if out.p.e2e {
+			res, err = b.pruneE2E(ctx, r, g, out.p, pr.Snapshot, out.p.a.id(), gid, out.p.a.noAuth)
+		} else {
+			res, err = b.pruneTo(ctx, r, g, out.p, out.p.a.id(), gid, out.p.a.noAuth)
+		}
 		if errors.Is(err, ddb.ErrStale) {
 			continue
 		}
@@ -259,6 +262,17 @@ func (b *ddbBackend) endAttachments(ctx context.Context, ns, name string) error 
 	if err != nil || len(atts) == 0 {
 		return err
 	}
+	lvl, err := b.nsLevelOf(ctx, ns)
+	if err != nil {
+		return err
+	}
+	if lvl == levelE2E && name != KeyringName {
+		live, err := b.e2eLiveBlobs(ctx, ns, name, rr)
+		if err != nil {
+			return err
+		}
+		return b.endUnreferenced(ctx, ns, name, rr, atts, live)
+	}
 	live := map[ids.ID]bool{}
 	refs := func(doc any) error {
 		for _, ref := range blobRefsOf(doc) {
@@ -272,6 +286,12 @@ func (b *ddbBackend) endAttachments(ctx context.Context, ns, name string) error 
 	if err := b.store.EachDoc(ctx, ns, name, rr.HeadPos, refs); err != nil {
 		return err
 	}
+	return b.endUnreferenced(ctx, ns, name, rr, atts, live)
+}
+
+// endUnreferenced ends the attachments atts of name that live doesn't
+// name, with their sealings, and collects their bytes.
+func (b *ddbBackend) endUnreferenced(ctx context.Context, ns, name string, rr *ddb.ResRow, atts []*ddb.BlobRow, live map[ids.ID]bool) error {
 	var hashes [][]byte
 	for _, a := range atts {
 		bid, err := ids.Parse(a.Bid)

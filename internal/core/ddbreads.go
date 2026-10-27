@@ -510,11 +510,11 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 		// No entries: a handle still, for the resource's pending blobs
 		// (an upload precedes the create that references it), as the
 		// SQL schema's resource row without a head (ensureResource).
-		v.own = &resRow{id: rh, name: name}
+		v.own = &resRow{id: rh, ns: n.id, name: name}
 		return r.readThrough(n, v)
 	}
 	r.resRows[rh] = rr
-	own := &resRow{id: rh, name: name, state: stateLive}
+	own := &resRow{id: rh, ns: n.id, name: name, state: stateLive}
 	v.own, v.src = own, own
 	headPos := rr.HeadPos
 	switch {
@@ -1181,6 +1181,9 @@ func (r *ddbReads) retainedNames(n *nsRow) []string {
 // stand in for blob_refs.
 func (r *ddbReads) archivedBlobs(res, fromSeq, lastSeq int64) map[int64][]ids.ID {
 	k := r.res[res]
+	if n := r.nsByName(k.ns); n != nil && k.name != KeyringName && r.nsLevel(n) == levelE2E {
+		return r.archivedDeclared(k, fromSeq, lastSeq)
+	}
 	out := map[int64][]ids.ID{}
 	seen := map[ids.ID]bool{}
 	r.must(r.s.EachDocIn(r.ctx, k.ns, k.name, r.revs[fromSeq].key.pos, r.revs[lastSeq].key.pos, func(pos uint64, doc any) error {

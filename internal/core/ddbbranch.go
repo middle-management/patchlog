@@ -28,9 +28,6 @@ func (b *ddbBackend) createBranch(ctx context.Context, req Request, br BranchReq
 		}
 		out, perr := ddbCheck(func() planned {
 			p, replay, err := g.planBranch(req, br)
-			if err == nil && p != nil {
-				err = ddbRefusals(p.cfg)
-			}
 			return planned{p, replay, err}
 		})
 		switch {

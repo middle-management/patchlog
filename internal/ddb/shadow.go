@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -43,6 +44,9 @@ type ShadowImport struct {
 	Created                   int64
 	Log                       []ShadowEntry
 	Res                       []ShadowRes
+	// Epochs are an e2e level's epochs with when each began, keyless
+	// (§E.3.2): the keyring relay's.
+	Epochs []EpochKey
 }
 
 // ShadowEntry is a mirrored namespace log entry: its id, kind and hashed
@@ -84,6 +88,8 @@ type ShadowRev struct {
 	SchemaRef                           string
 	Size                                uint64
 	Digest                              []byte
+	// Declared are an e2e revision's declared blobs (§E.3.1).
+	Declared []string
 }
 
 // ShadowBlob is an attachment of a mirrored resource, its bytes stored
@@ -137,6 +143,9 @@ func (s *Store) ImportShadow(ctx context.Context, im *ShadowImport) (string, err
 	for _, r := range im.Res {
 		s.shadowRes(ns, im, &r, put)
 	}
+	for _, k := range im.Epochs {
+		put(keyEpochKey(ns, k.Epoch), k.item(k.Created))
+	}
 	put(keyNSList(ns), item{})
 	return token, s.putAll(ctx, puts)
 }
@@ -151,7 +160,7 @@ func (s *Store) shadowRes(ns string, im *ShadowImport, r *ShadowRes, put func(Ke
 	for i, v := range r.Revs {
 		pos := uint64(i + 1)
 		rr := revRow{pos: pos, id: v.ID, kind: v.Kind, parentID: v.ParentID, patches: v.Patches, author: v.Author, created: v.Created,
-			size: v.Size, digest: v.Digest, gesture: v.Gesture, undoes: v.Undoes, schemaRef: v.SchemaRef, signature: v.Signature}
+			size: v.Size, digest: v.Digest, gesture: v.Gesture, undoes: v.Undoes, schemaRef: v.SchemaRef, signature: v.Signature, declared: strings.Join(v.Declared, ",")}
 		if pos == 1 && r.ParentNS != "" {
 			rr.parentNS, rr.parentPos = r.ParentNS, r.ParentPos
 		}
@@ -179,7 +188,10 @@ func (s *Store) shadowRes(ns string, im *ShadowImport, r *ShadowRes, put func(Ke
 		}
 	default:
 		res["state"] = avS("live")
-		res["headCreated"], res["headSize"], res["headDigest"] = avI(last.Created), avN(last.Size), avB(last.Digest)
+		res["headCreated"] = avI(last.Created)
+		if len(last.Digest) > 0 { // none for e2e content
+			res["headSize"], res["headDigest"] = avN(last.Size), avB(last.Digest)
+		}
 		if entryPos > 0 {
 			put(keyHist(ns, r.Name, entryPos), item{"revPos": avN(head)})
 		}

@@ -166,9 +166,6 @@ func (b *ddbBackend) createRemoteBranch(ctx context.Context, req Request, cc Con
 	if taken {
 		return b.createNamespace(ctx, req, cc) // 412 for a taken name
 	}
-	if err := ddbRefusals(cfg); err != nil {
-		return nil, err
-	}
 	m, ferr := e.fetchRemote(ctx, cfg.Base)
 	if ferr != nil {
 		return nil, ferr
@@ -184,9 +181,6 @@ func (b *ddbBackend) createRemoteBranch(ctx context.Context, req Request, cc Con
 		cc, doc, err = remoteObligations(c, d, cc, m)
 		return asErr(err)
 	}); err != nil {
-		return nil, err
-	}
-	if err := ddbRefusals(cfg); err != nil {
 		return nil, err
 	}
 	gid, err := b.storeGrant(ctx, a, cfg.level >= levelAtRest)
@@ -258,10 +252,11 @@ type shadowHead struct {
 // Its rows follow the branch's level: encrypted at rest, under the
 // shadow's own data keys, at level at-rest or above.
 func (b *ddbBackend) shadowImport(ctx context.Context, name, read string, lv *remoteLevel, base string, baseAt uint64, heads map[*remoteRes]shadowHead, now time.Time, level int) (*ddb.ShadowImport, error) {
-	if lv.enc != nil {
-		return nil, ddbUnsupported("e2e namespaces")
-	}
 	cdoc := map[string]any{"read": read}
+	if lv.enc != nil {
+		// An e2e level: its epochs, for the keyring relay (§E.3.2).
+		cdoc["encryption"] = lv.enc
+	}
 	if lv.nonce {
 		// The branch can't turn it off (checkNonceBase).
 		cdoc["nonce"] = "required"
@@ -271,6 +266,9 @@ func (b *ddbBackend) shadowImport(ctx context.Context, name, read string, lv *re
 		Name: name, Base: base, BaseAt: baseAt,
 		CfgID: ids.Revision(nil, gcanon).String(), CfgPatches: string(gcanon), CfgDoc: string(jsonv.Canonical(cdoc)),
 		Author: RemoteAuthor, Created: now.UnixMilli(),
+	}
+	for _, x := range lv.epochs {
+		im.Epochs = append(im.Epochs, ddb.EpochKey{Epoch: x.e, Created: x.created.UnixMilli()})
 	}
 	for i, en := range lv.log {
 		hf, err := verify.HashedForm(en)
@@ -342,6 +340,27 @@ func (b *ddbBackend) shadowChain(ctx context.Context, shadow string, rr *remoteR
 		sr.ParentNS, sr.ParentPos = h.ns, h.pos
 	}
 	attached := map[ids.ID]bool{}
+	attach := func(bid ids.ID, pos uint64) error {
+		bl := ch.blobs[bid]
+		if bl == nil || attached[bid] {
+			return nil
+		}
+		attached[bid] = true
+		h := sha256.Sum256(bl.data)
+		key, err := b.putOwnedBytes(ctx, owner, h[:], bl.data)
+		if err != nil {
+			return err
+		}
+		sr.Attach = append(sr.Attach, ddb.ShadowBlob{Bid: bid.String(), Type: bl.typ, Nonce: bl.nonce, Size: int64(len(bl.data)), Hash: key, Owner: owner, RefPos: pos})
+		return nil
+	}
+	var declared [][]ids.ID
+	if ch.opaque {
+		var err error
+		if declared, err = ch.declaredLists(); err != nil {
+			return nil, err
+		}
+	}
 	var lastDoc []byte
 	err := ch.fold(func(i int, e client.LogEntry, doc any) error {
 		if i < rr.from {
@@ -359,13 +378,27 @@ func (b *ddbBackend) shadowChain(ctx context.Context, shadow string, rr *remoteR
 		if ValidGesture(e.Undoes) {
 			v.Undoes = e.Undoes
 		}
-		canon := jsonv.Canonical(doc)
-		lastDoc = canon
 		if e.Kind == "tombstone" {
 			v.Kind = "tombstone"
 			sr.Revs = append(sr.Revs, v)
 			return nil
 		}
+		if ch.opaque {
+			// e2e content has no documents here (§E.3): its patch sets
+			// and declared blobs (insertChain).
+			v.Patches = seal("rev", e.ID, string(jsonv.Canonical(e.Patches)))
+			for _, bid := range declared[i] {
+				v.Declared = append(v.Declared, bid.String())
+				if err := attach(bid, pos); err != nil {
+					return err
+				}
+			}
+			sr.Revs = append(sr.Revs, v)
+			sr.LastLivePos = pos
+			return nil
+		}
+		canon := jsonv.Canonical(doc)
+		lastDoc = canon
 		if e.HasPatches {
 			v.Patches = seal("rev", e.ID, string(jsonv.Canonical(e.Patches)))
 		} else {
@@ -384,24 +417,18 @@ func (b *ddbBackend) shadowChain(ctx context.Context, shadow string, rr *remoteR
 		// The blobs it references, fetched from the base: attached at
 		// the first revision that does (attachMirrored).
 		for _, ref := range blobRefsOf(doc) {
-			bl := ch.blobs[ref.bid]
-			if bl == nil || attached[ref.bid] {
-				continue
-			}
-			attached[ref.bid] = true
-			h := sha256.Sum256(bl.data)
-			key, err := b.putOwnedBytes(ctx, owner, h[:], bl.data)
-			if err != nil {
+			if err := attach(ref.bid, pos); err != nil {
 				return err
 			}
-			sr.Attach = append(sr.Attach, ddb.ShadowBlob{Bid: ref.bid.String(), Type: bl.typ, Nonce: bl.nonce, Size: int64(len(bl.data)), Hash: key, Owner: owner, RefPos: pos})
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	sr.HeadDoc = seal("head", strconv.FormatUint(sr.LastLivePos, 10), string(lastDoc))
+	if !ch.opaque {
+		sr.HeadDoc = seal("head", strconv.FormatUint(sr.LastLivePos, 10), string(lastDoc))
+	}
 	return sr, nil
 }
 
