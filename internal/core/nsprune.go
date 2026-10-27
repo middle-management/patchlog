@@ -7,7 +7,6 @@ import (
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
-	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // PruneRequest is POST /r/{ns}/{name}/prune (§8.6).
@@ -167,8 +166,7 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 			if eff.id != hid {
 				return apiErr(422, "invalid", "message", "the horizon moves down to a protected revision (§8.6); seal the snapshot for that one", "horizon", eff.id.String())
 			}
-			epoch, why := t.snapshotEpoch(n, cfg, eff)
-			if err := t.checkSealedHeader(n, pr.Snapshot, seal.SnapshotPL(n.name, name, eff.id.String()), "snapshot", epoch, why); err != nil {
+			if err := t.checkSnapshot(n, cfg, name, eff, pr.Snapshot); err != nil {
 				return err
 			}
 		}
@@ -226,12 +224,12 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 // nothing, and answers the resource's current horizon as the branch sees
 // it. No archive is needed, nor a * key, since nothing is pruned. At E3 the
 // snapshot is still checked at step 4, its kid included: it must name the
-// branch, never a base, and the epoch snapshotEpoch gives for the horizon's
-// chain, as outside a branch (§13, F-B6, §E.3.1).
+// branch and the epoch snapshotKid gives for the horizon's chain, as outside
+// a branch, but for a base's content from before that base's raise from
+// sealed, which names the base (§13, F-B6, §E.3.1).
 func (t *tx) pruneInBranch(n *nsRow, cfg *Config, a *actor, name string, v *view, hid ids.ID, pr PruneRequest, env map[string]any) (*PruneResult, error) {
 	if t.e2eContent(n, name) {
-		epoch, why := t.snapshotEpoch(n, cfg, t.findInAncestry(v.head, hid))
-		if err := t.checkSealedHeader(n, pr.Snapshot, seal.SnapshotPL(n.name, name, hid.String()), "snapshot", epoch, why); err != nil {
+		if err := t.checkSnapshot(n, cfg, name, t.findInAncestry(v.head, hid), pr.Snapshot); err != nil {
 			return nil, err
 		}
 	}
