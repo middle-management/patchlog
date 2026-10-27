@@ -1325,6 +1325,15 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 // via (§6.4.1, §C.1) and revisions.via (writtenBy) record them, or NULL
 // when there are none. Served unhashed with the entry (§7.4); entries the
 // server writes itself record none, nor do entries from before the column.
+// viaOf is grantVia of a's grant as the store records it: "" for none.
+func viaOf(a *actor) string {
+	if a == nil || a.grant == nil {
+		return ""
+	}
+	v, _ := grantVia(a.grant).(string)
+	return v
+}
+
 func grantVia(g *grant.Grant) any {
 	var via []any
 	for _, b := range g.Blocks {

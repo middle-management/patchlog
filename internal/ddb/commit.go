@@ -71,6 +71,9 @@ type Commit struct {
 	// while authentication was disabled: its entry serves "grant": null.
 	Grant  string
 	NoAuth bool
+	// Via is the grant's delegatees (§6.4.1, §C.1), canonical JSON, ""
+	// for none: recorded on the entry and the revisions it writes.
+	Via string
 	// Purge is a resource purge (§8.3), PurgeNS the namespace's (§8.5):
 	// what they commit at once (purgeActs); the bulk of the content goes
 	// after the commit (PurgeContent).
@@ -193,6 +196,10 @@ type CommitStep struct {
 	Created int64
 	// Declared are an e2e step's declared blobs (§E.3.1).
 	Declared []string
+	// Via is a mirrored step's own delegation chain (with Author).
+	Via string
+	// Legacy marks a revision under the schema rules before v0.73.
+	Legacy bool
 }
 
 // CommitResult is a committed write's entry.
@@ -380,7 +387,7 @@ func (s *Store) buildCommits(ns string, cs []*Commit, t tip) ([]types.TransactWr
 			pos: prev.headPos + 1, id: ids.Hash(prevID, body).String(), prevPos: prev.headPos,
 			kind: c.Kind, body: string(body), author: c.Author, created: c.Created,
 			gesture: c.Gesture, undoes: c.Undoes, cfgPos: c.CfgPos,
-			grantID: c.Grant, noAuth: c.NoAuth,
+			grantID: c.Grant, noAuth: c.NoAuth, via: c.Via,
 		}
 		if c.Gestures != nil {
 			entry.gestures = string(jsonv.Canonical(c.Gestures))
@@ -549,12 +556,13 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 	for i := range it.Steps {
 		st := &it.Steps[i]
 		pos++
-		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos, grantID: c.Grant, schemaRef: st.SchemaRef, signature: st.Signature, epoch: c.Epoch, declared: strings.Join(st.Declared, ",")}
+		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos, grantID: c.Grant, schemaRef: st.SchemaRef, signature: st.Signature, epoch: c.Epoch, declared: strings.Join(st.Declared, ","), via: c.Via, legacy: st.Legacy}
 		if pos == 1 {
 			r.parentNS, r.parentPos = it.ParentNS, it.ParentPos
 		}
 		if st.Author != "" {
-			r.author, r.created = st.Author, st.Created
+			// A mirrored step: its own author, under no grant of this write.
+			r.author, r.created, r.via = st.Author, st.Created, st.Via
 		}
 		if st.Tombstone {
 			r.kind = "tombstone"

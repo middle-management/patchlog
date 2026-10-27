@@ -54,6 +54,7 @@ type ShadowImport struct {
 type ShadowEntry struct {
 	ID, Kind, Body, Author string
 	Created                int64
+	Via                    string // canonical JSON, "" for none
 }
 
 // ShadowRes is a mirrored resource: its chain from position 1, or for a
@@ -90,6 +91,10 @@ type ShadowRev struct {
 	Digest                              []byte
 	// Declared are an e2e revision's declared blobs (§E.3.1).
 	Declared []string
+	// Via is the base's entry's delegation chain, canonical JSON.
+	Via string
+	// Legacy: the base serves it under the schema rules before v0.73.
+	Legacy bool
 }
 
 // ShadowBlob is an attachment of a mirrored resource, its bytes stored
@@ -130,7 +135,7 @@ func (s *Store) ImportShadow(ctx context.Context, im *ShadowImport) (string, err
 		"author": avS(im.Author), "created": avI(im.Created), "G1PK": avS(g1RevID(im.CfgID)),
 	})
 	for i, e := range im.Log {
-		l := logRow{pos: uint64(i + 1), id: e.ID, kind: e.Kind, body: e.Body, author: e.Author, created: e.Created, cfgPos: 1}
+		l := logRow{pos: uint64(i + 1), id: e.ID, kind: e.Kind, body: e.Body, author: e.Author, created: e.Created, cfgPos: 1, via: e.Via}
 		if i > 0 {
 			l.prevPos = uint64(i)
 		}
@@ -160,7 +165,7 @@ func (s *Store) shadowRes(ns string, im *ShadowImport, r *ShadowRes, put func(Ke
 	for i, v := range r.Revs {
 		pos := uint64(i + 1)
 		rr := revRow{pos: pos, id: v.ID, kind: v.Kind, parentID: v.ParentID, patches: v.Patches, author: v.Author, created: v.Created,
-			size: v.Size, digest: v.Digest, gesture: v.Gesture, undoes: v.Undoes, schemaRef: v.SchemaRef, signature: v.Signature, declared: strings.Join(v.Declared, ",")}
+			size: v.Size, digest: v.Digest, gesture: v.Gesture, undoes: v.Undoes, schemaRef: v.SchemaRef, signature: v.Signature, declared: strings.Join(v.Declared, ","), via: v.Via, legacy: v.Legacy}
 		if pos == 1 && r.ParentNS != "" {
 			rr.parentNS, rr.parentPos = r.ParentNS, r.ParentPos
 		}
@@ -278,6 +283,7 @@ type RemoteBranchCreate struct {
 	NS, Author         string
 	Grant              string
 	NoAuth             bool
+	Via                string
 	Patches, Doc       string // canonical
 	Frozen             bool
 	Shadow             string
@@ -295,7 +301,7 @@ func (s *Store) CreateRemoteBranch(ctx context.Context, c *RemoteBranchCreate) (
 	entryID := ids.Hash(nil, body)
 	now := s.now().UnixMilli()
 	entry := logRow{pos: 1, id: entryID.String(), kind: "config", body: string(body), author: c.Author, created: now, cfgPos: 1,
-		grantID: c.Grant, noAuth: c.NoAuth}
+		grantID: c.Grant, noAuth: c.NoAuth, via: c.Via}
 	meta := &nsMeta{frozen: c.Frozen, configPos: 1, configID: cfg.String(), base: c.Shadow, baseAt: c.AtPos, baseCfgPos: 1}
 	acts := buildCreateTx(s.Table, c.NS, meta, cfg.String(), c.Patches, c.Doc, entry)
 	acts = append(acts, deployFirst(s.Table, now),

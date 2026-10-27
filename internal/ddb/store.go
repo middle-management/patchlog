@@ -62,9 +62,10 @@ type Create struct {
 	NS, Author      string
 	Patches         any
 	Gesture, Undoes string
-	// Grant and NoAuth are Commit's.
+	// Grant, NoAuth and Via are Commit's.
 	Grant  string
 	NoAuth bool
+	Via    string
 	// EpochKey is a sealed namespace's first epoch key (sealed.go).
 	EpochKey *EpochKey
 }
@@ -84,7 +85,7 @@ func (s *Store) CreateNamespace(ctx context.Context, c *Create) (cfgID, nsID str
 	entryID := ids.Hash(nil, body)
 	now := s.now().UnixMilli()
 	entry := logRow{pos: 1, id: entryID.String(), kind: "config", body: string(body), author: author, created: now, cfgPos: 1,
-		grantID: c.Grant, noAuth: c.NoAuth, gesture: c.Gesture, undoes: c.Undoes}
+		grantID: c.Grant, noAuth: c.NoAuth, gesture: c.Gesture, undoes: c.Undoes, via: c.Via}
 	meta := &nsMeta{configPos: 1, configID: cfg.String()}
 
 	// buildCreateTx's action order: 0 #META, 1 CFG, 2 LOG, 3 #TIP, 4 NSID;
@@ -252,6 +253,8 @@ func scanRevInfo(i item) RevInfo {
 		GrantID:   i.s("grantId"),
 		SchemaRef: i.s("schemaRef"),
 		Signature: i.s("signature"),
+		Via:       i.s("via"),
+		Legacy:    i.n("legacy") != 0,
 		Epoch:     int(i.n("epoch")),
 		Declared:  splitList(i.s("declared")),
 		ParentNS:  i.s("parentNs"), ParentPos: i.n("parentPos"),

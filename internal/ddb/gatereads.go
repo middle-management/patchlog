@@ -278,6 +278,7 @@ type EntryRow struct {
 	CfgPos   uint64
 	GrantID  string
 	NoAuth   bool
+	Via      string // canonical JSON, "" for none
 }
 
 // EntryAt reads ns's log entry at pos; nil when there is none.
@@ -293,7 +294,7 @@ func scanEntry(i item) *EntryRow {
 	return &EntryRow{
 		Pos: i.n("pos"), PrevPos: i.n("prevPos"), ID: i.s("id"), Kind: i.s("kind"), Body: i.s("body"), Author: i.s("author"),
 		Created: int64(i.n("created")), Gesture: i.s("gesture"), Undoes: i.s("undoes"), Gestures: i.s("gestures"),
-		CfgPos: i.n("cfgPos"), GrantID: i.s("grantId"), NoAuth: i.n("noAuth") != 0,
+		CfgPos: i.n("cfgPos"), GrantID: i.s("grantId"), NoAuth: i.n("noAuth") != 0, Via: i.s("via"),
 	}
 }
 

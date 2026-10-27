@@ -48,7 +48,7 @@ func (b *ddbBackend) createBranch(ctx context.Context, req Request, br BranchReq
 			return nil, err
 		}
 		c := &ddb.Commit{
-			NS: req.NS, Author: p.a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: p.a.noAuth,
+			NS: req.NS, Author: p.a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: p.a.noAuth, Via: viaOf(p.a),
 			CfgPos: r.cfgs[p.base.configSeq].pos, CfgID: r.cfgRow(p.base.configSeq).ID,
 			Entry: map[string]any{"kind": "branch", "name": p.name, "at": p.atID.String(), "target": p.cfgID.String()},
 			Kind:  "branch",

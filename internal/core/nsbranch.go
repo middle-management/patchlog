@@ -281,7 +281,7 @@ func (t *gate) planBranch(req Request, br BranchRequest) (p *branchPlan, replay 
 		// A branch of base, or of a namespace further up its chain, as
 		// for a config write that sets it (§7.4).
 		bases := t.successorBases(base)
-		bases[fmt.Sprint(base.id)] = true
+		bases[t.localIdentity(base)] = true
 		if err := t.successorOK(cfg.Successor, 0, bases); err != nil {
 			return nil, nil, err
 		}

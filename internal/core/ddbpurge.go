@@ -60,7 +60,7 @@ func (b *ddbBackend) purgeWith(ctx context.Context, req Request, name string, pl
 			return "", err
 		}
 		c := &ddb.Commit{
-			NS: req.NS, Author: p.a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: p.a.noAuth,
+			NS: req.NS, Author: p.a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: p.a.noAuth, Via: viaOf(p.a),
 			CfgPos: r.cfgs[p.n.configSeq].pos, CfgID: r.cfgRow(p.n.configSeq).ID,
 		}
 		var tags []string

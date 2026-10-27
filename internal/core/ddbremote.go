@@ -23,6 +23,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/verify"
 )
 
@@ -65,7 +66,7 @@ func (b *ddbBackend) registerRemote(ctx context.Context, req Request, rr RemoteR
 			reg.PrevPos = r.logs[p.row.nsSeq].pos
 		}
 		c := &ddb.Commit{
-			NS: req.NS, Author: p.a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: p.a.noAuth,
+			NS: req.NS, Author: p.a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: p.a.noAuth, Via: viaOf(p.a),
 			CfgPos: r.cfgs[p.n.configSeq].pos, CfgID: r.cfgRow(p.n.configSeq).ID,
 			Entry: p.entry, Kind: "branch", Registration: reg,
 		}
@@ -190,6 +191,11 @@ func (b *ddbBackend) createRemoteBranch(ctx context.Context, req Request, cc Con
 		if err := remoteObligations(req.NS, c, m); err != nil {
 			return err
 		}
+		// Step 6, after the genesis is validated: the creating operator
+		// grant's own rules (insertRemoteBranch).
+		if err := t.checkCreationRules(ac, cc.Patches); err != nil {
+			return err
+		}
 		return nil
 	}); err != nil {
 		return nil, err
@@ -228,7 +234,7 @@ func (b *ddbBackend) createRemoteBranch(ctx context.Context, req Request, cc Con
 	e.rc.begin(inv)
 	defer e.invalidate(inv, false)
 	cfgID, nsID, err := b.store.CreateRemoteBranch(ctx, &ddb.RemoteBranchCreate{
-		NS: req.NS, Author: a.id(), Grant: gid, NoAuth: a.noAuth,
+		NS: req.NS, Author: a.id(), Grant: gid, NoAuth: a.noAuth, Via: viaOf(a),
 		Patches: string(jsonv.Canonical(cc.Patches)), Doc: string(jsonv.Canonical(doc)), Frozen: cfg.Frozen,
 		Shadow: below, AtPos: belowAt, Tokens: tokens,
 		Origin: m.base.Origin, BaseNS: m.base.NS, At: m.base.At,
@@ -263,6 +269,11 @@ type shadowHead struct {
 // Its rows follow the branch's level: encrypted at rest, under the
 // shadow's own data keys, at level at-rest or above.
 func (b *ddbBackend) shadowImport(ctx context.Context, name, read string, lv *remoteLevel, base string, baseAt uint64, heads map[*remoteRes]shadowHead, now time.Time, level int) (*ddb.ShadowImport, error) {
+	if lv.raise >= 0 {
+		// A level raised to e2e before at mirrors its pre-raise history
+		// and keys (Addendum E Levels), which isn't built here.
+		return nil, ddbUnsupported("mirroring a base raised to e2e")
+	}
 	cdoc := map[string]any{"read": read}
 	if lv.enc != nil {
 		// An e2e level: its epochs, for the keyring relay (§E.3.2).
@@ -299,7 +310,7 @@ func (b *ddbBackend) shadowImport(ctx context.Context, name, read string, lv *re
 		if en.Author != "" {
 			author = en.Author
 		}
-		im.Log = append(im.Log, ddb.ShadowEntry{ID: en.ID, Kind: en.Kind, Body: string(body), Author: author, Created: parseCreated(en.Created, now)})
+		im.Log = append(im.Log, ddb.ShadowEntry{ID: en.ID, Kind: en.Kind, Body: string(body), Author: author, Created: parseCreated(en.Created, now), Via: viaJSON(en.Via)})
 	}
 	for _, rr := range lv.res {
 		if rr.chain == nil {
@@ -378,7 +389,8 @@ func (b *ddbBackend) shadowChain(ctx context.Context, shadow string, rr *remoteR
 			return nil
 		}
 		pos := uint64(len(sr.Revs) + 1)
-		v := ddb.ShadowRev{ID: e.ID, ParentID: e.Parent, Author: RemoteAuthor, Created: parseCreated(e.Created, now), Signature: e.Signature}
+		v := ddb.ShadowRev{ID: e.ID, ParentID: e.Parent, Author: RemoteAuthor, Created: parseCreated(e.Created, now), Signature: e.Signature, Via: viaJSON(e.Via),
+			Legacy: mirroredLegacy(ch, e.ID)}
 		if e.Author != "" {
 			v.Author = e.Author
 		}
@@ -462,10 +474,34 @@ func (b *ddbBackend) mirrorSchemas(ctx context.Context, m *remoteMirror, branch 
 		if err != nil {
 			return ddbAsErr(err)
 		}
-		if nsName == branch || row != nil && (row.Base != "" || row.Purged) {
-			return conflict(byNS[nsName][0], "the schema namespace here is a branch or purged")
+		if nsName == branch || row != nil && row.Base != "" {
+			return conflict(byNS[nsName][0], "the schema namespace here is a branch")
+		}
+		if row != nil && row.Purged {
+			// It refuses the history as any write to it (§8.5).
+			var e *Error
+			if err := b.gateRead(ctx, func(t *gate) error {
+				e = t.purgedNS(t.nsByName(nsName))
+				return nil
+			}); err != nil {
+				return err
+			}
+			e.Body["ns"] = nsName
+			e.Body["message"] = "the schema namespace " + nsName + " here is purged, so the schemas can't be mirrored into it (§G.3, §8.5)"
+			return e
 		}
 		src := m.schemaSources[nsName]
+		if row != nil {
+			// A mirror never ranks below its source (§2.1, §G.3).
+			cur, err := b.configOf(ctx, nsName)
+			if err != nil {
+				return err
+			}
+			if targetRank(cur) < src.rank {
+				return invalid(fmt.Sprintf("the schema namespace %s here is less protected than its source at the base (§2.1): "+
+					"a remote branch's schema mirror never ranks below its source (§G.3)", nsName))
+			}
+		}
 		created := row == nil
 		if created {
 			// By its source's protection (§2.1, mirrorSchemas of
@@ -475,7 +511,7 @@ func (b *ddbBackend) mirrorSchemas(ctx context.Context, m *remoteMirror, branch 
 				read = "public"
 			}
 			doc := map[string]any{"read": read}
-			if _, _, err := b.store.CreateNamespace(ctx, &ddb.Create{NS: nsName, Author: a.id(), Grant: gid, NoAuth: a.noAuth,
+			if _, _, err := b.store.CreateNamespace(ctx, &ddb.Create{NS: nsName, Author: a.id(), Grant: gid, NoAuth: a.noAuth, Via: viaOf(a),
 				Patches: []any{map[string]any{"op": "add", "path": "", "value": doc}}}); err != nil {
 				return ddbAsErr(err)
 			}
@@ -499,7 +535,7 @@ func (b *ddbBackend) mirrorInto(ctx context.Context, ns string, schemas []*remot
 		if err != nil || n == nil {
 			return ddbAsErr(err)
 		}
-		c := &ddb.Commit{NS: ns, Author: a.id(), Created: b.e.now().UnixMilli(), Grant: gid, NoAuth: a.noAuth,
+		c := &ddb.Commit{NS: ns, Author: a.id(), Created: b.e.now().UnixMilli(), Grant: gid, NoAuth: a.noAuth, Via: viaOf(a),
 			CfgPos: n.ConfigPos, CfgID: n.ConfigID, Kind: "batch"}
 		level, err := b.nsLevelOf(ctx, ns)
 		if err != nil {
@@ -514,10 +550,22 @@ func (b *ddbBackend) mirrorInto(ctx context.Context, ns string, schemas []*remot
 			from := 0
 			it := ddb.CommitItem{Name: s.name}
 			if own != nil {
-				if own.Purged {
-					return conflict(s, "the resource here is purged")
-				}
 				i, ok := s.chain.index[own.HeadID]
+				if !ok {
+					ri, err := b.store.ReadRevOf(ctx, ns, s.name, s.chain.last().ID)
+					if err != nil {
+						return ddbAsErr(err)
+					}
+					if ri == nil {
+						return conflict(s, "the resource here holds a different history")
+					}
+				}
+				if own.Purged {
+					// One that holds the base's history refuses it as any
+					// write to it does (410 gone, §7.2, §8.3).
+					return gone("path", "/r/"+s.ns+"/"+s.name+"/rev/"+s.chain.last().ID,
+						"message", "the resource here is purged, so its schema history can't be mirrored into it (§G.3, §8.3)")
+				}
 				switch {
 				case ok && i == len(s.chain.entries)-1:
 					continue // same head
@@ -525,16 +573,7 @@ func (b *ddbBackend) mirrorInto(ctx context.Context, ns string, schemas []*remot
 					from = i + 1 // a prefix: extend it
 					it.HeadPos, it.HeadID, it.HeadTombstoned, it.LastID, it.LastPos = own.HeadPos, own.HeadID, own.Tombstoned, own.LastID, own.LastPos
 				default:
-					// Already containing the base's chain, or another
-					// history.
-					ri, err := b.store.ReadRevOf(ctx, ns, s.name, s.chain.last().ID)
-					if err != nil {
-						return ddbAsErr(err)
-					}
-					if ri != nil {
-						continue
-					}
-					return conflict(s, "the resource here holds a different history")
+					continue // already contains the base's chain
 				}
 			}
 			err = s.chain.fold(func(i int, e client.LogEntry, doc any) error {
@@ -544,7 +583,8 @@ func (b *ddbBackend) mirrorInto(ctx context.Context, ns string, schemas []*remot
 				if e.Kind != "tombstone" && !e.HasPatches {
 					return ddbUnsupported("mirroring a schema the base pruned")
 				}
-				st := ddb.CommitStep{ID: e.ID, ParentID: e.Parent, Tombstone: e.Kind == "tombstone", Signature: e.Signature,
+				st := ddb.CommitStep{ID: e.ID, ParentID: e.Parent, Tombstone: e.Kind == "tombstone", Signature: e.Signature, Via: viaJSON(e.Via),
+					Legacy: e.Kind != "tombstone" && mirroredLegacy(s.chain, e.ID),
 					Author: RemoteAuthor, Created: parseCreated(e.Created, b.e.now())}
 				if e.Author != "" {
 					st.Author = e.Author
@@ -576,6 +616,24 @@ func (b *ddbBackend) mirrorInto(ctx context.Context, ns string, schemas []*remot
 		}
 		if len(c.Items) == 0 {
 			return nil
+		}
+		// Where history would be written: a frozen namespace refuses it as
+		// any write to it (§8.4), and an e2e one, since only a key holder
+		// seals content into e2e (§2.1, §E.3.1).
+		cur, err := b.configOf(ctx, ns)
+		if err != nil {
+			return err
+		}
+		if cur.Frozen {
+			e := apiErr(409, "frozen", "message", "the schema namespace "+ns+" here is frozen, so the schemas can't be mirrored into it (§G.3, §8.4)")
+			if cur.Successor != "" {
+				e.Body["successor"] = cur.Successor
+			}
+			return e
+		}
+		if cur.level == levelE2E {
+			return invalid("the schema namespace " + ns + " here is end-to-end, so the schemas can't be mirrored into it: " +
+				"only a key holder seals content into e2e (§2.1, §G.3)")
 		}
 		c.Entry = map[string]any{"kind": "batch", "entries": entries}
 		names := make([]string, len(c.Items))
@@ -621,7 +679,7 @@ func (b *ddbBackend) requireNonces(ctx context.Context, ns string, a *actor, gid
 			return perr
 		}
 		p := out.p
-		c := &ddb.Commit{NS: ns, Author: a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: a.noAuth,
+		c := &ddb.Commit{NS: ns, Author: a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: a.noAuth, Via: viaOf(a),
 			CfgPos: r.cfgs[out.n.configSeq].pos, CfgID: r.cfgRow(out.n.configSeq).ID,
 			Config: &ddb.CommitConfig{ID: p.id.String(), Patches: string(p.canon), Doc: string(jsonv.Canonical(p.doc)), Frozen: p.cfg.Frozen},
 			Entry:  map[string]any{"kind": "config", "target": p.id.String()}, Kind: "config"}
@@ -676,7 +734,37 @@ func (b *ddbBackend) remoteBases(ctx context.Context, name string) ([]*remoteBas
 // The base's config changes (docs) and the catch-up aren't followed here
 // yet: levels and epochs a base raises to stay as at creation.
 func (b *ddbBackend) followed(ctx context.Context, rb *remoteBase, entries []client.NSEntry, head string, docs map[string]sourceDoc, catchUp *sourceDoc, catchErr error) error {
-	return errors.Join(b.followPurges(ctx, rb, entries, head), catchErr)
+	// The epochs the base's config changes began, in the shadow mirroring
+	// it, at the entries' times (followEpoch).
+	var errs []error
+	for _, en := range entries {
+		if d, ok := docs[en.ID]; ok {
+			errs = append(errs, b.followEpoch(ctx, shadowName(rb.branchName), d, parseCreated(en.Created, b.e.now())))
+		}
+	}
+	return errors.Join(append(errs, b.followPurges(ctx, rb, entries, head), catchErr)...)
+}
+
+// followEpochs: each shadow's epoch, begun now.
+func (b *ddbBackend) followEpochs(ctx context.Context, docs map[string]sourceDoc) error {
+	var errs []error
+	for name, d := range docs {
+		errs = append(errs, b.followEpoch(ctx, name, d, b.e.now().UnixMilli()))
+	}
+	return errors.Join(errs...)
+}
+
+// followEpoch records epoch d.epoch of an e2e base in shadow sh, begun at
+// created, unless recorded (followEpoch of remote_branch.go): a keyless
+// EPOCHKEY item, as the shadow's own epochs are.
+func (b *ddbBackend) followEpoch(ctx context.Context, sh string, d sourceDoc, created int64) error {
+	if d.level != levelE2E || d.epoch < 1 {
+		return nil
+	}
+	if lvl, err := b.nsLevelOf(ctx, sh); err != nil || lvl != levelE2E {
+		return err
+	}
+	return asErrOrNil(b.store.PutEpochStart(ctx, sh, d.epoch, created))
 }
 
 // followPurges records and applies the purges of entries, then moves the
@@ -826,4 +914,35 @@ func (b *ddbBackend) remoteNotices(ctx context.Context, ns string) ([]RemoteNoti
 		out[i] = x.n
 	}
 	return out, nil
+}
+
+// viaJSON is a mirrored entry's delegation chain as the store records it
+// (insertChain): canonical JSON, "" for none.
+func viaJSON(via []string) string {
+	if len(via) == 0 {
+		return ""
+	}
+	return string(jsonv.Canonical(anyStrings(via)))
+}
+
+// mirroredLegacy reports whether a mirrored revision is under the schema
+// rules before v0.73: unless the base serves it as v0.73's (fetchRules),
+// as insertChain records a missing marker.
+func mirroredLegacy(ch *remoteChain, id string) bool {
+	r, ok := ch.rules[id]
+	return !ok || r != schema.V073
+}
+
+// configOf is ns's configuration in force.
+func (b *ddbBackend) configOf(ctx context.Context, ns string) (*Config, error) {
+	var cfg *Config
+	err := b.gateRead(ctx, func(t *gate) error {
+		n := t.nsByName(ns)
+		if n == nil {
+			return notFound()
+		}
+		cfg = t.config(n.configSeq)
+		return nil
+	})
+	return cfg, err
 }

@@ -96,7 +96,7 @@ func (b *ddbBackend) pruneE2E(ctx context.Context, r *ddbReads, g *gate, p *prun
 	}
 	rr := r.resItem(own.id)
 	c := &ddb.Commit{
-		NS: ns, Author: author, Created: g.now.UnixMilli(), Grant: grant, NoAuth: noAuth,
+		NS: ns, Author: author, Created: g.now.UnixMilli(), Grant: grant, NoAuth: noAuth, Via: viaOf(p.a),
 		CfgPos: r.cfgs[p.n.configSeq].pos, CfgID: r.cfgRow(p.n.configSeq).ID,
 		Entry: map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, Kind: "prune",
 		Prune: &ddb.CommitPrune{

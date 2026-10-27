@@ -114,6 +114,10 @@ func (t *tx) baseIdentity(n *nsRow) string {
 	return fmt.Sprint(n.base.Int64)
 }
 
+// localIdentity is local namespace n's baseIdentity as a base of its
+// branches.
+func (t *tx) localIdentity(n *nsRow) string { return fmt.Sprint(n.id) }
+
 // remoteBaseIn reports whether a genesis patch set produces a document whose
 // base names an origin.
 func remoteBaseIn(patches any) bool {
@@ -2179,6 +2183,9 @@ type RemoteLevel struct {
 // RemoteLevels lists the remote branches ("" = all) whose base's level is
 // above their own.
 func (e *Engine) RemoteLevels(ctx context.Context, ns string) ([]RemoteLevel, error) {
+	if err := e.be.lacks("following a remote base's level"); err != nil {
+		return nil, err
+	}
 	var out []RemoteLevel
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT n.name, l.level, l.lacks, l.rebase, l.id, l.created FROM remote_levels l JOIN namespaces n ON n.ns = l.branch
@@ -2265,25 +2272,25 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 // its log can't be followed; the error is reported.
 func (e *Engine) followChainEpochs(ctx context.Context, c *client.Client, ep RemoteEndpoint, b *remoteBase) error {
 	type level struct {
-		shadow int64
+		shadow string
 		ns     string
 	}
 	var levels []level
-	if err := e.read(ctx, func(t *tx) error {
-		bn := t.nsByID(b.branch)
+	if err := e.gateRead(ctx, func(t *gate) error {
+		bn := t.nsByName(b.branchName)
 		if bn == nil || bn.purged {
 			return nil
 		}
 		for i, sh := range t.remoteShadows(bn) {
 			if i > 0 && t.config(sh.configSeq).level == levelE2E {
-				levels = append(levels, level{sh.id, t.kidName(sh)})
+				levels = append(levels, level{sh.name, t.kidName(sh)})
 			}
 		}
 		return nil
 	}); err != nil || len(levels) == 0 {
 		return err
 	}
-	docs := map[int64]sourceDoc{}
+	docs := map[string]sourceDoc{}
 	var errs []error
 	for _, lv := range levels {
 		h, err := c.NSHead(ctx, lv.ns)
@@ -2299,14 +2306,24 @@ func (e *Engine) followChainEpochs(ctx context.Context, c *client.Client, ep Rem
 		docs[lv.shadow] = d
 	}
 	if len(docs) > 0 {
-		errs = append(errs, e.update(ctx, func(t *tx) error {
-			for sh, d := range docs {
-				t.followEpoch(sh, d, "")
-			}
-			return nil
-		}))
+		errs = append(errs, e.be.followEpochs(ctx, docs))
 	}
 	return errors.Join(errs...)
+}
+
+// sqlFollowEpochs records the epochs in force at the bases of a chain's
+// levels, in the shadows mirroring them, by shadow name (followEpoch).
+func (e *Engine) sqlFollowEpochs(ctx context.Context, docs map[string]sourceDoc) error {
+	return e.update(ctx, func(t *tx) error {
+		for name, d := range docs {
+			// A shadow, which nsByName never names.
+			var sh int64
+			if t.QueryRow(`SELECT ns FROM namespaces WHERE name = ?`, name).Scan(&sh) == nil {
+				t.followEpoch(sh, d, "")
+			}
+		}
+		return nil
+	})
 }
 
 // followLog follows the base's log after the checkpoint (followRemote).
@@ -2609,6 +2626,9 @@ func sealedAt(ctx context.Context, ep RemoteEndpoint, baseURL, path string) bool
 // the base names, which isn't verified. The checkpoint stays: nothing else
 // of the log is followed.
 func (e *Engine) followSealed(ctx context.Context, b *remoteBase, head string) error {
+	if e.be.lacks("following a remote base's level") != nil {
+		return nil // the backend follows purges only
+	}
 	return e.update(ctx, func(t *tx) error {
 		bn := t.nsByIDLocked(b.branch, lockExclusive)
 		if !bn.purged {

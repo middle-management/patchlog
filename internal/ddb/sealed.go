@@ -170,3 +170,19 @@ func (s *Store) deletePrunedSealed(ctx context.Context, ns, name string, horizon
 		return s.deleteKey(ctx, Key{i.s("PK"), i.s("SK")})
 	})
 }
+
+// PutEpochStart records that epoch of ns began at created, unless it is
+// recorded: a keyless EPOCHKEY item, an e2e epoch's (a remote branch's
+// shadow following its base's epochs).
+func (s *Store) PutEpochStart(ctx context.Context, ns string, epoch int, created int64) error {
+	k := &EpochKey{Epoch: epoch}
+	_, err := s.Client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: &s.Table, Item: withKey(keyEpochKey(ns, epoch), k.item(created)),
+		ConditionExpression: strptr("attribute_not_exists(PK)"),
+	})
+	var cf *types.ConditionalCheckFailedException
+	if errors.As(err, &cf) {
+		return nil
+	}
+	return err
+}

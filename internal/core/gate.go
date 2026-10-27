@@ -168,6 +168,7 @@ type branchReads interface {
 	liveRevsBelow(res, seq int64) []revBelow
 	snapshotsBelow(res, seq int64) []int64
 	baseIdentity(n *nsRow) string
+	localIdentity(n *nsRow) string
 	copyRows(id ids.ID, name string) []copyRow
 }
 

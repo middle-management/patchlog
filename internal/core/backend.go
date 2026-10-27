@@ -54,6 +54,9 @@ type backend interface {
 	remoteBases(ctx context.Context, name string) ([]*remoteBase, error)
 	followed(ctx context.Context, b *remoteBase, entries []client.NSEntry, head string, docs map[string]sourceDoc, catchUp *sourceDoc, catchErr error) error
 	registered(ctx context.Context, b *remoteBase, nsID string, expires time.Time) error
+	// followEpochs records the epochs the bases of a chain's levels have
+	// in force now, in their shadows, by shadow name (followChainEpochs).
+	followEpochs(ctx context.Context, docs map[string]sourceDoc) error
 	remoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error)
 
 	// rotateEpoch is RotateEpoch's config change (§E.2.1); with ifDue,
@@ -161,6 +164,10 @@ func (b sqlBackend) uploadBlob(ctx context.Context, req Request, name string, bi
 
 func (b sqlBackend) registerRemote(ctx context.Context, req Request, rr RemoteRegistration) (*RegistrationResult, error) {
 	return b.e.sqlRegisterRemote(ctx, req, rr)
+}
+
+func (b sqlBackend) followEpochs(ctx context.Context, docs map[string]sourceDoc) error {
+	return b.e.sqlFollowEpochs(ctx, docs)
 }
 
 func (b sqlBackend) remoteBases(ctx context.Context, name string) ([]*remoteBase, error) {

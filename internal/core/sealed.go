@@ -982,6 +982,9 @@ func (e *Engine) rotateAfterRevoke(names []string) {
 // RotationsDue lists the namespaces whose rotation after a revocation is
 // due: recorded with the revocation, and no new epoch begun since.
 func (e *Engine) RotationsDue(ctx context.Context) ([]string, error) {
+	if e.be.lacks("recording due rotations") != nil {
+		return nil, nil // none recorded: a rotation after a revocation isn't retried
+	}
 	var out []string
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT n.name FROM rotations_due d JOIN namespaces n ON n.ns = d.ns ORDER BY n.name`)

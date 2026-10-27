@@ -79,6 +79,7 @@ func (b *ddbBackend) writeItems1(ctx context.Context, req Request, items []Item,
 		if p.cplan != nil {
 			lvl = max(lvl, p.cplan.cfg.level)
 		}
+		c.Via = viaOf(p.a)
 		if c.Grant, err = b.storeGrant(ctx, p.a, lvl >= levelAtRest); err != nil {
 			return nil, err
 		}
@@ -196,7 +197,7 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 				}
 				slices.Sort(cs.Declared)
 			default:
-				cs.Patches = string(step.canon)
+				cs.Patches, cs.Legacy = string(step.canon), step.legacy
 				if step.docCanon != nil {
 					cs.Doc = string(step.docCanon)
 				} else {
@@ -367,7 +368,7 @@ func (b *ddbBackend) writeConfig1(ctx context.Context, req Request, cc ConfigCha
 			return nil, err
 		}
 		c := &ddb.Commit{
-			NS: req.NS, Author: out.a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: out.a.noAuth,
+			NS: req.NS, Author: out.a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: out.a.noAuth, Via: viaOf(out.a),
 			CfgPos: r.cfgs[n.configSeq].pos, CfgID: r.cfgRow(n.configSeq).ID,
 			Config: &ddb.CommitConfig{ID: p.id.String(), Patches: string(p.canon), Doc: string(jsonv.Canonical(p.doc)), Frozen: p.cfg.Frozen},
 			Entry:  map[string]any{"kind": "config", "target": p.id.String()}, Kind: "config",
@@ -451,7 +452,7 @@ func (b *ddbBackend) createNamespace(ctx context.Context, req Request, cc Config
 	e.rc.begin(inv)
 	cfgID, nsID, err := b.store.CreateNamespace(sctx, &ddb.Create{
 		NS: req.NS, Author: out.a.id(), Patches: cc.Patches,
-		Grant: grantID, NoAuth: out.a.noAuth, EpochKey: ek,
+		Grant: grantID, NoAuth: out.a.noAuth, Via: viaOf(out.a), EpochKey: ek,
 	})
 	e.invalidate(inv, false)
 	if err != nil {

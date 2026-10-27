@@ -225,6 +225,9 @@ func (r *ddbReads) revRowOf(ns string, ri *ddb.RevInfo) *revRow {
 		r.must(err)
 		row.grantID = gid[:]
 	}
+	if ri.Via != "" {
+		row.via.String, row.via.Valid = ri.Via, true
+	}
 	ref.row = row
 	return row
 }
@@ -294,6 +297,9 @@ func (r *ddbReads) branchesOf(n *nsRow) []*nsRow {
 	}
 	return out
 }
+
+// localIdentity: a local base's name (baseIdentity).
+func (r *ddbReads) localIdentity(n *nsRow) string { return n.name }
 
 // baseIdentity names a branch's base: its name, which a deployment never
 // reuses, or a remote base's origin and name.
@@ -1038,6 +1044,9 @@ func (r *ddbReads) nsLogRows(n *nsRow, from, to int64, limit int, visit func(nsL
 		}
 		if le.NoAuth {
 			row.noAuth.Int64, row.noAuth.Valid = 1, true
+		}
+		if le.Via != "" {
+			row.via.String, row.via.Valid = le.Via, true
 		}
 		// The members ns_log.gestures holds (gestureMeta, batchGestures).
 		var meta map[string]any

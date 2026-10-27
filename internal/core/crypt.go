@@ -763,7 +763,8 @@ func (e *Engine) OpenArchive(ctx context.Context, ns, name string, r io.Reader) 
 }
 
 // sqlArchiveDEK is the data key an archive of ns/name is sealed with:
-// ErrArchiveKeyDestroyed once the resource is purged.
+// ErrArchiveKeyDestroyed once the resource is purged, ErrNotEncrypted
+// outside encrypted namespaces.
 func (e *Engine) sqlArchiveDEK(ctx context.Context, ns, name string) ([]byte, error) {
 	var dek []byte
 	err := e.read(ctx, func(t *tx) error {
@@ -774,6 +775,9 @@ func (e *Engine) sqlArchiveDEK(ctx context.Context, ns, name string) ([]byte, er
 		own := t.resource(n.id, name)
 		if n.purged || own == nil || own.state == statePurged {
 			return ErrArchiveKeyDestroyed
+		}
+		if t.resLevel(own.id) < levelAtRest {
+			return ErrNotEncrypted
 		}
 		if t.e.opt.KeyStore == nil {
 			return errNoKeyStore

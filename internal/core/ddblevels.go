@@ -109,7 +109,7 @@ func (r *ddbReads) successorBases(n *nsRow) map[string]bool {
 			break
 		}
 		b = r.nsByID(b.base.Int64)
-		out[fmt.Sprint(b.id)] = true
+		out[b.name] = true
 	}
 	return out
 }
@@ -240,10 +240,58 @@ func (r *ddbReads) blobRevServed(head *revRow, bid ids.ID) bool {
 	return false
 }
 
-// --- schema rules: every revision here is written under v0.73's ---
+// --- schema rules markers (schemaload.go) ---
 
-func (r *ddbReads) docRules(id ids.ID, doc any, sc *schemaCtx) schema.Rules { return schema.V073 }
-func (r *ddbReads) rowRules(seq int64) schema.Rules                         { return schema.V073 }
+// docRules: as SQL's, the marker a copy inherits from the rows of id in
+// the namespaces the write may copy from (copiesIn): Legacy if any is.
+func (r *ddbReads) docRules(id ids.ID, doc any, sc *schemaCtx) schema.Rules {
+	if !schema.IsSchemaDoc(doc) {
+		return schema.V073
+	}
+	if rules, ok := sc.copied[id]; ok {
+		return rules
+	}
+	from := map[string]bool{}
+	add := func(n *nsRow) {
+		for x := n; x != nil; {
+			from[x.name] = true
+			if !x.isBranch() {
+				return
+			}
+			x = r.nsByID(x.base.Int64)
+		}
+	}
+	if sc.target != nil {
+		add(sc.target)
+	}
+	if sc.source != nil && sc.source.n != nil {
+		add(sc.source.n)
+	}
+	rows, err := r.s.RevsWithID(r.ctx, id.String())
+	r.must(err)
+	rules := schema.V073
+	for _, x := range rows {
+		if from[x.NS] && x.Rev.Kind != "tombstone" && x.Rev.Legacy {
+			rules = schema.Legacy
+		}
+	}
+	if sc.copied == nil {
+		sc.copied = map[ids.ID]schema.Rules{}
+	}
+	sc.copied[id] = rules
+	return rules
+}
+
+// rowRules: the revision's marker, its REV item's legacy flag.
+func (r *ddbReads) rowRules(seq int64) schema.Rules {
+	k := r.revs[seq].key
+	ri, err := r.s.RevAt(r.ctx, k.ns, k.name, k.pos)
+	r.must(err)
+	if ri != nil && ri.Legacy {
+		return schema.Legacy
+	}
+	return schema.V073
+}
 
 // --- pruning ---
 
