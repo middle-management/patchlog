@@ -465,7 +465,10 @@ func parseDeclared(list []string) ([]ids.ID, *Error) {
 
 // checkDeclared is step 4 for a sealed step (§6.2, §E.3.1): every blob of
 // its declared list is available to the item's resource, and is a sealed
-// blob, the only type an e2e reference has.
+// blob, the only type an e2e reference has. A restore with [] keeps the
+// last live document's list as it is (keepsList), which may hold plain
+// blobs a document from before a raise to e2e references: only later
+// writes declare sealed blobs alone (Addendum E Levels, Later writes).
 func (t *tx) checkDeclared(n *nsRow, s *itemState, step *stepState, list []ids.ID, uploader string, cutoff int64, bs *batchSource) *Error {
 	step.blobs = map[ids.ID]*blobRow{}
 	for i, bid := range list {
@@ -473,6 +476,10 @@ func (t *tx) checkDeclared(n *nsRow, s *itemState, step *stepState, list []ids.I
 		src := t.availableBlob(n, s, uploader, cutoff, bid, bs)
 		if src == nil {
 			return blobErr(ptr, "the declared blob is not available to this resource (§7.8, §E.3.1)")
+		}
+		if step.keepsList {
+			step.blobs[bid] = src
+			continue
 		}
 		if src.typ != SealedBlobType {
 			return blobErr(ptr, "the declared blob is not a sealed blob (§E.3.1)")

@@ -398,3 +398,49 @@ func TestV073P36PreRaiseHorizon(t *testing.T) {
 		t.Fatalf("stored sealings after the prune: %v, want the horizon's kept and the pruned one's gone", sealedOf)
 	}
 }
+
+// v0.73 Addendum E Levels, Later writes, §E.3.1 (ENC-51; CONFORMANCE
+// Levels scenario 8): after a raise to e2e, a write's sealed op declares
+// only sealed blobs, so an append keeping a plaintext blob from before
+// the raise is 422 blob; a restore with [] keeps the last live document's
+// list, the plain blob included.
+func TestV073P36LaterWritesDeclareSealedBlobs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	e := p29Engine(t)
+	cfg := mkNS(t, e, "p", map[string]any{})
+	data := []byte("a plain blob from before the raise")
+	bid := uploadBlob(t, e, "p", "d", data)
+	ref := map[string]any{"$blob": bid, "type": "text/plain", "size": float64(len(data))}
+	w, err := e.WriteResource(ctx, p29Req("p"), Item{Resource: "d", IfNoneMatch: true, Steps: []Step{{Patches: []any{p29Add("", map[string]any{"f": ref})}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d1 := w.Items[0].IDs[0]
+	if _, err := e.WriteConfig(ctx, p29Req("p"), ConfigChange{IfMatch: cfg, Patches: []any{p29Add("/encryption", map[string]any{"level": "e2e"})}}); err != nil {
+		t.Fatal(err)
+	}
+	sealed := p29Sealed(t, seal.NewKey(), "p#1", "p", "d", d1, []any{p29Add("/g", 1.0)})
+	sealed[0].(map[string]any)["blobs"] = []any{bid}
+	st, body := p29Status(t, second(e.WriteResource(ctx, p29Req("p"), Item{Resource: "d", IfMatch: d1, Steps: []Step{{Patches: sealed}}})))
+	if st != 422 || body["code"] != "blob" {
+		t.Fatalf("an append declaring a plain pre-raise blob: %d %v, want 422 blob", st, body)
+	}
+	w, err = e.WriteResource(ctx, p29Req("p"), Item{Resource: "d", IfMatch: d1, Steps: []Step{{Delete: true}, {Patches: []any{}}}})
+	if err != nil {
+		t.Fatalf("delete and restore with []: %v", err)
+	}
+	restored := w.Items[0].IDs[1]
+	var kept []string
+	if err := e.read(ctx, func(t *tx) error {
+		for _, b := range t.declaredAt(t.findInAncestry(t.resolve(t.nsByName("p"), "d", nil).head, mustID(restored))) {
+			kept = append(kept, b.String())
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(kept) != 1 || kept[0] != bid {
+		t.Fatalf("the restore's list %v, want the plain blob %s", kept, bid)
+	}
+}
