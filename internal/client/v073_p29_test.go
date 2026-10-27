@@ -190,32 +190,33 @@ func TestV073P29SnapshotKid(t *testing.T) {
 	}
 }
 
-// P29 review, Addendum E Levels (Invariant): content from before a raise
-// to e2e is never served at a weaker level, so from sealed it must be
-// served sealed under the last epoch before the raise, which this server
-// doesn't do yet. A sealed namespace isn't raised to e2e (422 invalid,
-// the new epoch given or not), and its log stays a JWE; a raise from
-// at-rest goes through. What such a raise records, and the snapshot kid
-// of content from before it (ENC-22), are tested in internal/core
-// (TestV073P29RaiseToE2E, TestV073P29SnapshotKidBeforeRaise).
-func TestV073P29NoRaiseFromSealed(t *testing.T) {
+// P29 review, P35, Addendum E Levels (Invariant, After a raise): content
+// from before a raise to e2e is never served at a weaker level, so from
+// sealed it is served sealed under the last epoch before the raise. A
+// raise from sealed needs the new epoch (422 invalid without it); after
+// it, the log and the revision from before stay JWEs, never the plaintext.
+// A raise from at-rest goes through too. What such a raise records, and
+// the snapshot kid of content from before it (ENC-22), are tested in
+// internal/core (TestV073P29RaiseToE2E, TestV073P29SnapshotKidBeforeRaise).
+func TestV073P29RaiseFromSealedStaysSealed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	v := newP29Env(t, map[string]any{"level": "sealed"})
 	w := must(v.c.Create(ctx, "e", "d", ops(op("add", "", map[string]any{"secret": "s3cr3t"}), op("add", "/$nonce", seal.NewNonce()))))
 	h := must(v.c.NSHead(ctx, "e"))
-	for _, enc := range []map[string]any{{"level": "e2e"}, {"level": "e2e", "epoch": 2}} {
-		_, err := v.c.PatchConfig(ctx, "e", h.Config, ops(op("replace", "/encryption", enc)))
-		var ae *client.APIError
-		if !errors.As(err, &ae) || ae.Status != 422 || ae.Code != "invalid" {
-			t.Fatalf("raise from sealed with %v: %v, want 422 invalid", enc, err)
-		}
+	_, err := v.c.PatchConfig(ctx, "e", h.Config, ops(op("replace", "/encryption", map[string]any{"level": "e2e"})))
+	var ae *client.APIError
+	if !errors.As(err, &ae) || ae.Status != 422 || ae.Code != "invalid" {
+		t.Fatalf("raise from sealed without a new epoch: %v, want 422 invalid", err)
 	}
-	if st, b := v.raw(t, "/r/e/d/rev/"+w.ID+"/log"); st != 200 || bytes.Contains(b, []byte("s3cr3t")) {
-		t.Fatalf("the log after the refused raise: %d %s", st, b)
-	}
-	if lv := must(v.c.EncryptionLevel(ctx, "e")); lv != "sealed" {
+	must(v.c.PatchConfig(ctx, "e", h.Config, ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 2}))))
+	if lv := must(v.c.EncryptionLevel(ctx, "e")); lv != "e2e" {
 		t.Fatalf("level %q", lv)
+	}
+	for _, path := range []string{"/r/e/d/rev/" + w.ID + "/log", "/r/e/d/rev/" + w.ID} {
+		if st, b := v.raw(t, path); st != 200 || bytes.Contains(b, []byte("s3cr3t")) {
+			t.Fatalf("%s after the raise: %d %s", path, st, b)
+		}
 	}
 	// From at-rest the content was in the clear before, and the raise
 	// goes through.
