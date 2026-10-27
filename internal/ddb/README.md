@@ -7,49 +7,42 @@ C (plain namespaces, `-dev`, one instance — the integration status is
 (`internal/jsonv`) and patch engine (`internal/patch`), so the bytes it
 hashes and folds are the production bytes.
 
-The surface, beyond the spike's writes: `CreateNamespace`, `WriteResource`
-(an explicit precondition, `Pre`, as §7.2's; restores included: a write
-naming the tombstone applies to the last live document, which the
-tombstone keeps), `DeleteResource` (§8.1's tombstones: the deterministic
-`ids.Tombstone` id, replay, the last-live markers for `Head.Last`),
-`WriteConfig`, and `WriteBatch` (§7.5: mixed items in one transaction
-under the 100-action budget, per-item failure collection, dry runs, an
-optional config change, replay by request-computed entry body) — the
-writes with a check hook that runs the caller's gate inside the retry
-loop, after planning (D.3's recheck shape); `ReadHead`, `ReadLog`
-(paged, id cursors, upper bounds), `ReadRevByID` (GSI1), `FoldResource`
-(crossing tombstones: the restore applies to the last live document),
-`ResourceLog`, `ListHeads`, `HeadsAt`, `ReadConfig`, `ReadDocAtEntry` (the
-`ns_log ⨯ ns_config` join), `ReadNSInfo`, `KnownEntry`, `Ping`. `Open`
-parses the `-db` URL (`dynamodb://<table>?region=…&endpoint=…`); errors
-carry the core's `{"code": …}` body shape. With `GroupCommit` > 1,
-checked resource writes and deletes of one namespace commit in groups
-(`group.go`, docs/DYNAMODB.md §4): one transaction re-chains several
-writes' entries over the tip, pinned on the configuration they were
-checked under.
+The surface. Writes: `Commit` (commit.go) commits what core's write gate
+decided — a write's or batch's items, each step a revision or tombstone
+on the head the checks read (multi-step items included), an optional
+config change, the namespace entry — conditioned on those heads and the
+configuration in force, `ErrStale` when they moved; `CreateNamespace`
+is its own transaction. The gate's reads (gatereads.go: `Namespace`,
+`ConfigAt`, `ConfigByID`, `Resource`, `RevAt`, `ReadRevOf`, `DocAt`,
+`EntryAt`, `EntryPos`) are what core/ddbreads.go answers the gate with.
+Serving reads: `ReadHead`, `ReadLog` (paged, id cursors, upper bounds),
+`ReadRevByID` (GSI1), `FoldResource` (crossing tombstones: the restore
+applies to the last live document), `ResourceLog`, `ListHeads`,
+`HeadsAt`, `ReadConfig`, `ReadDocAtEntry` (the `ns_log ⨯ ns_config`
+join), `ReadNSInfo`, `KnownEntry`, `Ping`. `Open` parses the `-db` URL
+(`dynamodb://<table>?region=…&endpoint=…`); `CreateTable` makes the
+table; errors carry the core's `{"code": …}` body shape. With
+`GroupCommit` > 1, commits without a config change commit in groups per
+namespace (`group.go`, docs/DYNAMODB.md §4).
 
 ## What it proves
 
 - **The transaction design (§4).** A single-resource write commits as
-  seven actions of one `TransactWriteItems`: put the revision (condition:
+  eight actions of one `TransactWriteItems`: put the revision (condition:
   the parent has no child yet), update the resource's head (condition: the
-  head is what the check phase read), upsert the head document and the
-  history row, put the log entry, move the log tip (condition: it is what
-  the check phase read — the log lock's replacement), put the entry's
-  idempotency marker (condition: it does not exist).
+  head is what the checks read), upsert the head document and the history
+  row, put the log entry, put the entry's marker (condition: it does not
+  exist), move the log tip (condition: it is what the commit chained over
+  — the log lock's replacement), and check `#META` (the configuration
+  the checks ran under). commit_test.go pins the layout;
   `TestLocalConcurrentNamespace` hammers one namespace with concurrent
-  writers: the log commits in chain order with no gaps.
-  `TestLocalConcurrentResource` races one resource: exactly one writer
-  wins, the rest get the 412 with the winner's head — D.3's conflict path.
-- **Idempotent replay.** A retried write recomputes its first attempt's
-  revision id from the request (`Pre.expectedID`: the id covers the
-  precondition's parent, not whatever the head has become), finds that
-  revision by this author anywhere in the resource's history, and answers
-  with its own entry — the revision records the entry that committed it
-  (`logPos`), since the entry's id chains over a tip that has moved on.
-  Only a write its precondition refuses can be a retry, so a passing
-  write costs no extra read. `TestPlanWriteReplay`; end to end, the API
-  suites (`TestIdempotentRetry` and the rest, below).
+  commits (the log commits in chain order with no gaps);
+  `TestLocalConcurrentResource` races one resource (exactly one commit
+  wins, the rest are `ErrStale`, which core answers by checking them
+  again — D.3); `TestLocalConfigPinned` proves the configuration pin.
+- **Idempotent replay** is core's gate's (the retry lookup), over this
+  store's reads: a revision records the entry that committed it
+  (`logPos`), so a retry finds its entry wherever the head has gone.
 - **The key design (§3).** Byte-ordered `/heads` (`begins_with(RES#)`),
   log paging with id cursors (the marker resolves a served id back to its
   position — `UNIQUE(ns, id)`), chain order by zero-padded positions.
@@ -59,7 +52,7 @@ checked under.
 ## Running
 
 ```sh
-go test ./internal/ddb/            # the hermetic tests (keys, plans, tx shapes)
+go test ./internal/ddb/            # the hermetic tests (keys, commit layouts)
 
 docker run -d --name ddb-local -p 8000:8000 amazon/dynamodb-local
 DDB_ENDPOINT=http://localhost:8000 go test ./internal/ddb/   # + the integration tests
@@ -89,13 +82,11 @@ commit: the `-grouped` benchmarks keep rising with writers instead.
 
 - The scope is plain namespaces: no grants, blobs, branches, purges,
   sealed/e2e, or the S3 offload of large values. What the scope doesn't
-  cover is refused by core's seam (501), not silently dropped; limits
-  and namespace rules are the gate's, evaluated in the check hook.
-- Items are one patch-set step each (create-or-append, `ifMatch`
-  optional, or a delete); multi-step items stay 501. A batch is bounded
-  by the 100-action transaction budget (`BatchActions`), which lowers
-  the reach of `ItemsPerBatch` to ~24 — docs/DYNAMODB.md §10's lowered
-  maximum.
+  cover is refused (501) by core's reads or seam, not silently dropped.
+- A commit is bounded by the 100-action transaction budget, which lowers
+  the deployment's `ItemsPerBatch` to `MaxBatchItems` (23) —
+  docs/DYNAMODB.md §10's lowered maximum; multi-step items draw it down
+  by a revision a step.
 - A retried `CreateNamespace` with the *same patches* answers the original
   ids (its marker covers them); with *different* patches it is 412 naming
   the current config id — production's answer.
@@ -103,13 +94,13 @@ commit: the `-grouped` benchmarks keep rising with writers instead.
   revision/log/head metadata (`size`, `digest`, `created`, gestures) rides
   as plain attributes, and LOG items denormalize `cfgPos` like
   `ns_log.config_seq`.
-- Read-modify loops (the tip retry) are bounded by `maxWriteAttempts = 8`,
-  like the SQL backends'.
-- Group commit queues resource writes and deletes only. Batches and
-  config writes keep the optimistic tip condition, holding the
-  namespace's commit lock on this instance from their reads to their
-  commit so the group worker can't starve them; across instances (phase
-  3) they and the workers race on `#TIP` and retry.
+- A commit re-chains over a moving tip at most `maxWriteAttempts = 8`
+  times, and core checks a stale write again at most 8 times, like the
+  SQL backends' bounds.
+- Group commit queues commits without a config change. A config change
+  commits on its own under the namespace's commit lock, which the group
+  worker holds through each group; across instances (phase 3) they race
+  on `#TIP` and re-chain.
 
 ## What the spike learned (fed back into docs/DYNAMODB.md)
 
@@ -129,7 +120,7 @@ commit: the `-grouped` benchmarks keep rising with writers instead.
    The first version of the tip move `SET` the old values back (the
    condition pinned them correctly), so the tip never advanced and every
    later write collided on the same `LOG#` item. Caught by the
-   concurrency test; `TestBuildWriteTx` now pins the written values.
+   concurrency test; `TestBuildCommitCreate` now pins the written values.
 4. **Replay needs the request's parent, not the stored head.** Computing
    the revision id over the current head can never replay: the retry's id
    covers the id in the request's precondition (`If-Match`), which is the

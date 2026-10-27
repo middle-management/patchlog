@@ -307,7 +307,7 @@ func batchError(fails []itemErr) *Error {
 // (PATCH) or delete.
 func (e *Engine) WriteResource(ctx context.Context, req Request, item Item) (*WriteResult, error) {
 	if e.ddb != nil {
-		return e.ddbWriteResource(ctx, req, item)
+		return e.ddbWriteItems(ctx, req, []Item{item}, nil, nil, false, false)
 	}
 	res, err := e.writeOptimistic(ctx, req, []Item{item}, nil, false)
 	if err != nil {
@@ -319,7 +319,7 @@ func (e *Engine) WriteResource(ctx context.Context, req Request, item Item) (*Wr
 // Batch performs an atomic batch (§7.5).
 func (e *Engine) Batch(ctx context.Context, req Request, items []Item, cfg *ConfigChange, source any, dryRun bool) (*WriteResult, error) {
 	if e.ddb != nil {
-		return e.ddbBatch(ctx, req, items, cfg, source, dryRun)
+		return e.ddbWriteItems(ctx, req, items, cfg, source, true, dryRun)
 	}
 	if dryRun {
 		// A dry run writes nothing: steps 1–6 in a read transaction.

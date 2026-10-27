@@ -16,10 +16,7 @@ func TestLocalHeadsAt(t *testing.T) {
 	_, nsID := mustCreateNS(t, s, "h")
 	a1 := mustWrite(t, s, "h", "a", "", `[{"op":"add","path":"","value":{"v":1}}]`)
 	b1 := mustWrite(t, s, "h", "b", "", `[{"op":"add","path":"","value":{}}]`)
-	d, err := s.DeleteResource(ctx, "h", "a", Pre{IfMatch: a1.ID}, "", "", "alice", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	d := mustWrite(t, s, "h", "a", a1.ID, "")
 	c1 := mustWrite(t, s, "h", "c", "", `[{"op":"add","path":"","value":{}}]`)
 	a2 := mustWrite(t, s, "h", "a", d.ID, `[{"op":"add","path":"","value":{"v":2}}]`)
 

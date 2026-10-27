@@ -116,7 +116,6 @@ dav/TestVimOnDavfs2 unsupported, met inside a service (501): principal lookup (g
 dav/TestWriterSettingsRefresh unsupported, met inside a service (501): principal lookup (grants)
 follow/TestFollowSSE unsupported, met inside a service (501): event streams
 follow/TestPagedFlows unsupported, met inside a service (501): event streams
-playground/TestSchemaImportPlanFiles unsupported, met inside a service (501): $schema validation
 server/TestEventsPaged unsupported, met inside a service (501): event streams
 server/TestNamespaceEvents unsupported, met inside a service (501): event streams
 server/TestResourceEvents unsupported, met inside a service (501): event streams

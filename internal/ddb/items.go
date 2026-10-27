@@ -108,10 +108,6 @@ type resRow struct {
 	lastPos     uint64
 }
 
-func (r *resRow) item() item {
-	return item{"headPos": avN(r.headPos), "headId": avS(r.headID), "entryId": avS(r.entryID), "state": avS(r.state)}
-}
-
 func scanRes(it item) *resRow {
 	return &resRow{
 		headPos: it.n("headPos"), headID: it.s("headId"), entryID: it.s("entryId"), state: it.s("state"),

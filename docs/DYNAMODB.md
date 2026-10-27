@@ -488,79 +488,74 @@ The table is pre-created (PAY_PER_REQUEST is fine) with the key schema of
 
 What landed, beyond the spike:
 
+- **One gate for both stores.** Writes on DynamoDB run the SQL path's
+  own gate (`internal/core/gate.go`): `checkItems` and `planConfig` — §6.2's
+  steps 1–6, authentication and authorisation, rate limits, the retry
+  lookup, preconditions, applying the patches, limits, schemas, rules —
+  over `checkReads`, the gate's reads. The SQL transaction implements
+  them with its queries; `internal/core/ddbreads.go` implements them over
+  the table, with per-check handles for the int64 ids the gate's rows
+  carry (it only hands them back). What the backend doesn't store reads
+  as empty where nothing of the kind can exist (branches, draft copies,
+  schema uses, horizons), and as **501 "unsupported"** where a request
+  needs a feature it lacks (blobs, sealed/e2e keys, grants, `$schema`
+  namespaces, archives, reads at an earlier entry) — so those refusals
+  are the reads', not hand-written checks. `gate_test.go` guards the
+  embedding that makes this work on SQL (a read missing on `*tx` would
+  compile and recurse).
+- **The store commits the gate's decision** (`internal/ddb/commit.go`):
+  `ddb.Commit` — the items' steps on the heads the checks read (so
+  multi-step items work), an optional config change, the namespace entry
+  — as one `TransactWriteItems`, conditioned on every item's head and on
+  the configuration the checks ran under (`#META`: rules, limits and the
+  frozen flag are the configuration's). If either moved, the commit is
+  `ErrStale` and core checks the write again from the start (D.3's
+  recheck, `ddbwrite.go`); a moved tip, which no check reads, the store
+  re-reads and re-chains over itself. Namespace creation is the store's
+  own transaction (`CreateNamespace`), its document checked as
+  `createNamespace` checks it.
 - **`internal/core/ddb.go`, the seam.** `core.Open` branches on
-  `ddb.IsURL(opt.Path)`; the Engine keeps a `*ddbBackend` and every
-  phase-1 method delegates: `WriteResource` (single patch-set step, and
-  DELETE's tombstone step — §8.1 works end to end: the deterministic
-  tombstone id, replay, restore as §6.2's verb, the 410 serving paths
-  with `Last` and `$successor`), `WriteConfig` (creates and changes),
-  `Batch` (§7.5: single-step items, per-item failure lists, dry runs, an
-  optional config change gating the items under its result, the
-  100-action budget lowering ItemsPerBatch to ~24), `ResourceHead/Raw/
-  Rev/Log`, `NamespaceHead/Rev/Log/Heads`, `NamespaceLiveLog`, `Wait`,
-  `Ping`, `Close`. Everything else the server can reach answers **501
-  "unsupported"** rather than falling through to SQL: multi-step items,
-  branches, purges and pruning, blobs (batch sources with them),
-  sealed/e2e, grants (`Grant`, `Principal`, `Keys`, `IssueEdgeGrants`),
-  gestures listing, event streams, author signatures.
-- **The thin gate (§6.2 subset).** The store's check hook runs *after*
-  planning, inside the retry loop, so limits (step 2) and namespace rules
-  (step 6, against the §6.4.1 envelope — `doc` always, `patches` when a
-  rule reads them, `principal: null` in `-dev`) evaluate the document the
-  transaction will actually commit, re-done on every attempt (D.3's
-  recheck shape). Refused configurations (`encryption`, `nonce:
-  required`, `base`, `successor`, `$schema` documents) are 501 at
-  create/change/write time, as §10 prescribes ("refuse at Open or at
-  namespace-config time").
+  `ddb.IsURL(opt.Path)`; the Engine keeps a `*ddbBackend` and the write
+  methods (`WriteResource`, `Batch`, `WriteConfig`) and the reads
+  (`ResourceHead/Raw/Rev/Log`, `NamespaceHead/Rev/Log/Heads`,
+  `NamespaceLiveLog`, `Wait`, `Ping`, `Close`) delegate. Everything else
+  the server can reach answers 501 rather than falling through to SQL:
+  branches, purges and pruning, blobs, sealed/e2e, grants (`Grant`,
+  `Principal`, `Keys`, `IssueEdgeGrants`), gestures listing, event
+  streams, author signatures (which the gate would verify but the commit
+  doesn't store), remote branches, retention, sweeps, rotation. Refused
+  configurations (`encryption`, `nonce: required`, `signatures:
+  required`, `base`, `successor`) are 501 at create and change time, as
+  §10 prescribes ("refuse at Open or at namespace-config time").
 - **Reads as items.** Revision-by-id is GSI1; `…/rev/{id}` folds from the
   genesis (snapshots are a later phase); `…/rev/{nsID}` joins the entry's
   denormalized `cfgPos` (the `ns_log.config_seq` of the SQL schema);
   `/heads` serves `created`/`size`/`digest` off the RES item's head
-  metadata; log entries serve `grant: null` in `-dev`, with gestures
-  merged in unhashed (§7.4).
+  metadata, and at an earlier entry from the history rows; log entries
+  serve `grant: null` in `-dev`, with gestures merged in unhashed (§7.4).
 - **Errors in the core's body shape** (`{"code": …}`), so the HTTP layer
   serves either backend alike.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
-  `-group-commit` (default 32) as on Postgres: each resource write or
-  delete runs its check phase alone, then queues; a worker per namespace
-  takes the queued writes that fit one transaction (distinct resources,
-  one configuration, ≤ 100 actions: six a write, four a delete, two
-  shared, so ≤ 16 writes) and re-chains their entries over the tip at
+  `-group-commit` (default 32) as on Postgres: each write is checked on
+  its own, then its commit queues; a worker per namespace takes the
+  queued commits that fit one transaction (distinct resources, one
+  configuration, ≤ 100 actions) and chains their entries over the tip at
   consecutive positions — an entry's id covers the one before it, not
-  anything the write's gate read. The transaction pins every write's head
-  as ungrouped, moves `#TIP` once, and carries a `ConditionCheck` that
-  `#META`'s `configPos` is still the one the writes were checked under,
-  so a write's gate holds at commit though the tip it read moved on. A
-  write whose head moved is answered alone (412, or its replay); a moved
-  tip (another instance) is re-read and the group re-chained; a changed
-  configuration or an unknown outcome sends each write back round its own
-  loop. Batches and config writes don't queue: they hold a per-namespace
-  commit lock, shared with the worker, from their reads to their commit.
-  §11 has the measurements.
+  anything a check read. The transaction pins every commit's heads as
+  alone, moves `#TIP` once and checks `#META` once. A commit whose head
+  or configuration moved is `ErrStale` and checked again; a moved tip
+  (another instance) is re-read and the group re-chained. Config changes
+  don't queue: they take a per-namespace commit lock the worker holds
+  through each group. §11 has the measurements.
 
-**Next: one gate for both stores.** Nearly every divergence the API
-suites found (below) came from the seam re-implementing §6.2's checks
-(`ddbGate`, `ddbDraw`, the batch checks), and every fix reused core's
-own functions. The remaining features — authentication, `$schema`,
-branches, blobs — live in that gate too, so the plan is to run the SQL
-path's gate on DynamoDB instead of growing the copy:
-
-1. *Done:* the gate is extracted behind a read interface
-   (`internal/core/gate.go`). `checkItems` and the logic it reaches (82
-   methods, authentication, rate limits, preconditions, limits, schemas,
-   rules, blobs, sealed/e2e checks) run on a `gate`, whose state is
-   `checkState` and whose storage is `checkReads`: 38 reads (namespaces
-   and the locks a write takes, resources and revisions, configurations,
-   blobs, keys, branches, schemas, the retry lookup, a config change's
-   plan). The SQL transaction implements them unchanged; behaviour is
-   unchanged on SQLite, Postgres and DynamoDB.
-2. DynamoDB implements `checkReads` for the subset it stores, and the
-   seam's own gate goes; the store keeps "read state" and "commit this
-   plan". The reads are SQL-shaped today (int64 row ids, `nsRow`,
-   `revRow`, `lockNS`, prefetches): DynamoDB answers them with its
-   positions as ids and no-op locks, or the interface narrows as it goes.
-3. Features then arrive as data: authentication is storing grants and
-   keys and answering their reads.
+The gate's extraction came first, behind no behaviour change on SQLite
+and Postgres; then DynamoDB's reads and commit replaced the seam's own
+copy of the checks (`ddbGate`, `ddbDraw`, the store's write planning),
+which is where nearly every divergence the API suites found had come
+from. Features now arrive as data: authentication is storing grants and
+keys and answering their reads (`checkAt`, `grantRef`), `$schema` is
+answering `schemaNS`, branches `resolve` at an earlier entry and
+`ancestry` across foreign parents, blobs their four reads.
 
 Requirements and limits, by design: `-dev` (writes need authentication
 disabled; reads of non-`public` namespaces are 501), one instance (no
@@ -586,14 +581,14 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the suites' 1,009
-top-level tests: 298 pass on DynamoDB and 711 skip — 597 as unsupported
-(232 for authentication, 114 encryption at rest, 69 branches, 68
+top-level tests: 306 pass on DynamoDB and 703 skip — 589 as unsupported
+(232 for authentication, 114 encryption at rest, 72 branches, 65
 `$schema`, 34 blobs, …), and 114 meeting an unsupported feature inside a
 service (mostly the dav gateway's principal lookup), where no skip can
 reach. No test answers differently from the SQL backends: the list's
 divergences section is empty. A test that skips partway has asserted
 everything before its skip, so the phase-1 surface is covered beyond the
-298.
+306.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on
