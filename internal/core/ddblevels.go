@@ -125,12 +125,6 @@ func (r *ddbReads) remoteShadow(n *nsRow) *nsRow {
 	return nil
 }
 
-// recordedLevel: following a base's raise to e2e isn't built here.
-func (r *ddbReads) recordedLevel(bn *nsRow) int { return levelNone }
-
-// lostRemote: no remote level is recorded as lacking here.
-func (r *ddbReads) lostRemote(n *nsRow) (*nsRow, string, bool) { return nil, "", false }
-
 // remoteSourceFor: as SQL's, over the write's context (withRemoteSource).
 func (r *ddbReads) remoteSourceFor(n *nsRow, withAt bool) *remoteSourceDoc {
 	rb, err := r.s.RemoteBaseOf(r.ctx, n.name)

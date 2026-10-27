@@ -7,8 +7,8 @@ package core
 // decided (ddbwrite.go, ddbblobs.go). Reads and the write checks are
 // core's own code on the gate.
 //
-// Deliberate gaps, surfaced as 501 "unsupported" (lacks, or a read that
-// panics with it): the SQL write path's hooks, and mirroring a schema
+// Deliberate gaps, surfaced as 501 "unsupported" (ddbUnsupported, or a
+// read that panics with it): the SQL write path's hooks, and mirroring a schema
 // revision the remote base pruned. Intermediate snapshots aren't built
 // (revisions fold from the genesis, or from a pruning horizon). Grants,
 // edge grants, blobs, $schema validation and schemaReads, purges,
@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -179,9 +180,6 @@ func (b *ddbBackend) ping(ctx context.Context) error { return b.store.Ping(ctx) 
 func (b *ddbBackend) close() error                   { return nil }
 func (b *ddbBackend) dbSystem() string               { return "aws.dynamodb" }
 
-// lacks: the features phase 1 doesn't build answer 501 (ddbUnsupported).
-func (b *ddbBackend) lacks(feature string) *Error { return ddbUnsupported(feature) }
-
 // ddbUnsupported answers for an Engine method the phase doesn't cover.
 func ddbUnsupported(what string) *Error {
 	return apiErr(501, "unsupported", "message", what+" is not implemented on the DynamoDB backend (docs/DYNAMODB.md phase 1)")
@@ -197,6 +195,11 @@ func ddbAsErr(err error) *Error {
 	var ce *Error
 	if errors.As(err, &ce) {
 		return ce
+	}
+	if strings.Contains(err.Error(), "Item size has exceeded the maximum allowed size") {
+		// Values over DynamoDB's 400 KB item limit go to S3 in the
+		// design (docs/DYNAMODB.md §3), which isn't built.
+		return ddbUnsupported("a value larger than DynamoDB's 400 KB item")
 	}
 	return apiErr(500, "internal", "message", err.Error())
 }

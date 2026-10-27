@@ -2,6 +2,7 @@ package ddb
 
 import (
 	"context"
+	"errors"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -236,4 +237,25 @@ func (s *Store) batchGet(ctx context.Context, keys []Key) (map[Key]item, error) 
 		}
 	}
 	return out, nil
+}
+
+// errStopEach ends an eachItem walk early.
+var errStopEach = errors.New("stop")
+
+// HasHistory reports whether name has HIST# items: writes recorded in its
+// own chain (resolve.go's hasHistory over head_history).
+func (s *Store) HasHistory(ctx context.Context, ns, name string) (bool, error) {
+	found := false
+	err := s.eachItem(ctx, ns, "HIST#"+name+"#", func(i item) error {
+		sk := i.s("SK")
+		if len(sk) > posDigits && sk[:len(sk)-posDigits-1] == "HIST#"+name {
+			found = true
+			return errStopEach
+		}
+		return nil
+	})
+	if err == errStopEach {
+		err = nil
+	}
+	return found, err
 }

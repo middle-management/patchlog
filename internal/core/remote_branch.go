@@ -2183,9 +2183,11 @@ type RemoteLevel struct {
 // RemoteLevels lists the remote branches ("" = all) whose base's level is
 // above their own.
 func (e *Engine) RemoteLevels(ctx context.Context, ns string) ([]RemoteLevel, error) {
-	if err := e.be.lacks("following a remote base's level"); err != nil {
-		return nil, err
-	}
+	return e.be.remoteLevels(ctx, ns)
+}
+
+// sqlRemoteLevels is RemoteLevels on SQL.
+func (e *Engine) sqlRemoteLevels(ctx context.Context, ns string) ([]RemoteLevel, error) {
 	var out []RemoteLevel
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT n.name, l.level, l.lacks, l.rebase, l.id, l.created FROM remote_levels l JOIN namespaces n ON n.ns = l.branch
@@ -2626,9 +2628,11 @@ func sealedAt(ctx context.Context, ep RemoteEndpoint, baseURL, path string) bool
 // the base names, which isn't verified. The checkpoint stays: nothing else
 // of the log is followed.
 func (e *Engine) followSealed(ctx context.Context, b *remoteBase, head string) error {
-	if e.be.lacks("following a remote base's level") != nil {
-		return nil // the backend follows purges only
-	}
+	return e.be.followSealed(ctx, b, head)
+}
+
+// sqlFollowSealed is followSealed on SQL.
+func (e *Engine) sqlFollowSealed(ctx context.Context, b *remoteBase, head string) error {
 	return e.update(ctx, func(t *tx) error {
 		bn := t.nsByIDLocked(b.branch, lockExclusive)
 		if !bn.purged {

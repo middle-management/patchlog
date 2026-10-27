@@ -168,7 +168,8 @@ func (s *Store) foldFrom(ctx context.Context, ns, name string, fromPos, toPos ui
 		if err != nil {
 			return nil, err
 		}
-		out, _, err := applyPatches(d, exists, p)
+		// A genesis applies to the document null, as its create did (§6.2 step 3).
+		out, _, err := applyPatches(d, true, p)
 		return out, err
 	})
 	if err != nil {

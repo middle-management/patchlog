@@ -523,10 +523,20 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 	own := &resRow{id: rh, ns: n.id, name: name, state: stateLive}
 	v.own, v.src = own, own
 	headPos := rr.HeadPos
-	switch {
-	case rr.Purged:
-		// Purged at every entry, with its head (§8.3).
+	if rr.Purged {
 		own.state = statePurged
+	}
+	purgedNow := rr.Purged && asOf == nil
+	if rr.Purged && !purgedNow && n.isShadow() {
+		// A shadow mirrors a resource purged at its base before at with
+		// its head's id alone, and no history: purged as of at too.
+		has, err := r.s.HasHistory(r.ctx, ns, name)
+		r.must(err)
+		purgedNow = !has
+	}
+	switch {
+	case purgedNow:
+		// Purged, with its head (§8.3).
 		v.state = Purged
 		hns := ns
 		if rr.HeadNS != "" {
@@ -536,12 +546,24 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 		return v
 	case asOf != nil:
 		// The head as of a log entry: the history rows (ddb.Store.HeadAt),
-		// as SQL's head_history.
-		h, err := r.s.HeadAt(r.ctx, ns, name, r.logs[*asOf].pos)
-		r.must(err)
+		// as SQL's head_history. A purge of a name read through records
+		// none.
+		var h *ddb.HeadEntry
+		if !rr.Purged || rr.HeadNS == "" {
+			var err error
+			h, err = r.s.HeadAt(r.ctx, ns, name, r.logs[*asOf].pos)
+			r.must(err)
+		}
 		if h == nil {
 			v.src = nil
-			return r.readThrough(n, v)
+			r.readThrough(n, v)
+			if rr.Purged && v.state != NotFound {
+				// Purged in n since asOf, when n read an entry for it
+				// through: purged as of asOf too, with the head it read
+				// through then (resolve.go).
+				v.state, v.src = Purged, own
+			}
+			return v
 		}
 		headPos = h.Pos
 	}
@@ -549,10 +571,15 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 	own.headSeq.Int64, own.headSeq.Valid = hh, true
 	if rr.HorizonPos > 0 {
 		own.horizonSeq.Int64, own.horizonSeq.Valid = r.revHandle(ns, name, rr.HorizonPos), true
+	}
+	if rr.HorizonPos > 0 || rr.Keep != "" {
+		// A keep set may be set with no horizon yet (§8.6).
 		own.keep.String, own.keep.Valid = rr.Keep, true
 	}
 	v.head = r.rev(r.revHandle(ns, name, headPos))
-	if v.head.kind == kindTombstone {
+	if rr.Purged {
+		v.state = Purged
+	} else if v.head.kind == kindTombstone {
 		v.state = Tombstoned
 	} else {
 		v.state = Live

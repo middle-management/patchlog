@@ -99,6 +99,10 @@ type Commit struct {
 	// revisions are written in, 0 outside a sealed namespace.
 	EpochKey *EpochKey
 	Epoch    int
+	// RotationsDue are the namespaces a revocation committed with this
+	// one reaches, each to rotate its epoch (rotations.go); a commit
+	// with an EpochKey clears its own.
+	RotationsDue []string
 	// Encrypting marks a config change that raises the namespace to
 	// encryption at rest: its plaintext content is encrypted after the
 	// commit (EncryptContent), the #ENCRYPTING marker naming the work
@@ -287,6 +291,7 @@ func (c *Commit) actions() int {
 	if c.EpochKey != nil {
 		n++
 	}
+	n += c.rotDueActions()
 	if c.Branch != nil {
 		n += branchActions
 		if c.Grant != "" {
@@ -473,7 +478,7 @@ func touchesMeta(cs []*Commit) bool {
 // alone reports whether c commits on its own, outside group commit: one
 // that updates #META, purges, prunes or branches.
 func (c *Commit) alone() bool {
-	return c.Config != nil || c.PurgeNS || c.Purge != nil || c.Branch != nil || c.Prune != nil || c.Registration != nil || c.EpochKey != nil
+	return c.Config != nil || c.PurgeNS || c.Purge != nil || c.Branch != nil || c.Prune != nil || c.Registration != nil || c.EpochKey != nil || len(c.RotationsDue) > 0
 }
 
 // commitActs are one commit's actions, in this order — the layout
@@ -528,6 +533,7 @@ func (s *Store) commitActs(c *Commit, entry logRow) []types.TransactWriteItem {
 	if c.EpochKey != nil {
 		out = append(out, epochKeyAct(s.Table, ns, c.EpochKey, c.Created))
 	}
+	out = append(out, s.rotDueActs(c)...)
 	marker := item{"ns": avS(ns), "logPos": avN(entry.pos)}
 	if len(c.Items) == 1 && c.Kind != "batch" {
 		marker["revId"] = avS(c.Items[0].Steps[len(c.Items[0].Steps)-1].ID)

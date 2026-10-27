@@ -14,10 +14,8 @@ import (
 // run over. The SQL databases (sqlBackend) and DynamoDB (ddbBackend,
 // ddb.go) implement it; core proper doesn't know which one it has.
 //
-// A backend that lacks a feature says so (lacks), and the Engine method
-// answers its 501 before doing anything; a read it can't answer panics
-// with that 501 from inside the gate (ddbUnsupported), which gateRead
-// returns.
+// A read a backend can't answer panics with a 501 from inside the gate
+// (ddbUnsupported), which gateRead returns.
 type backend interface {
 	// gateRead runs f on a gate over the backend's reads, one snapshot
 	// where the backend has them.
@@ -58,11 +56,20 @@ type backend interface {
 	// in force now, in their shadows, by shadow name (followChainEpochs).
 	followEpochs(ctx context.Context, docs map[string]sourceDoc) error
 	remoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error)
+	remoteLevels(ctx context.Context, ns string) ([]RemoteLevel, error)
+	// followSealed follows a base whose log can't be opened because it is
+	// sealed, as a raise to sealed (followSealed of remote_branch.go).
+	followSealed(ctx context.Context, b *remoteBase, head string) error
 
 	// rotateEpoch is RotateEpoch's config change (§E.2.1); with ifDue,
 	// only while ns has a rotation due after a revocation. rotated
 	// reports whether it rotated.
 	rotateEpoch(ctx context.Context, ns, author string, ifDue bool) (epoch int, rotated bool, err error)
+	// rotationsDue lists the namespaces with a rotation due, by name
+	// (RotationsDue); dropRotation drops ns's if nothing is left to
+	// rotate (purged, or no longer sealed), reporting whether it did.
+	rotationsDue(ctx context.Context) ([]string, error)
+	dropRotation(ctx context.Context, ns string) (bool, error)
 	// storeSealedBlob stores a blob's sealing under an epoch unless one
 	// is stored, and returns the stored bytes; nil if the blob is no
 	// longer served under it (§E.2.2).
@@ -100,9 +107,6 @@ type backend interface {
 	close() error
 	// dbSystem names the database for telemetry (db.system).
 	dbSystem() string
-	// lacks answers a feature the backend doesn't implement: 501
-	// "unsupported", or nil.
-	lacks(feature string) *Error
 }
 
 // backends are the storages other than SQL, by the -db paths they handle
@@ -186,8 +190,24 @@ func (b sqlBackend) remoteNotices(ctx context.Context, ns string) ([]RemoteNotic
 	return b.e.sqlRemoteNotices(ctx, ns)
 }
 
+func (b sqlBackend) remoteLevels(ctx context.Context, ns string) ([]RemoteLevel, error) {
+	return b.e.sqlRemoteLevels(ctx, ns)
+}
+
+func (b sqlBackend) followSealed(ctx context.Context, rb *remoteBase, head string) error {
+	return b.e.sqlFollowSealed(ctx, rb, head)
+}
+
 func (b sqlBackend) rotateEpoch(ctx context.Context, ns, author string, ifDue bool) (int, bool, error) {
 	return b.e.sqlRotateEpoch(ctx, ns, author, ifDue)
+}
+
+func (b sqlBackend) rotationsDue(ctx context.Context) ([]string, error) {
+	return b.e.sqlRotationsDue(ctx)
+}
+
+func (b sqlBackend) dropRotation(ctx context.Context, ns string) (bool, error) {
+	return b.e.sqlDropRotation(ctx, ns)
 }
 
 func (b sqlBackend) storeSealedBlob(ctx context.Context, job *sealedBlobJob, sealed []byte) ([]byte, error) {
@@ -245,5 +265,3 @@ func (b sqlBackend) dbSystem() string {
 	}
 	return "sqlite"
 }
-
-func (b sqlBackend) lacks(string) *Error { return nil }

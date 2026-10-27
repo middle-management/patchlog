@@ -575,17 +575,20 @@ What landed, beyond the spike:
 - **The backend interface** (`internal/core/backend.go`). The Engine
   holds its storage as a `backend`: the gate's reads (`gateRead`), the
   commits of writes, config writes and uploads, the blob sweeps and
-  statistics, ping, close, and `lacks(feature)`. `sqlBackend` implements
+  statistics, ping and close. `sqlBackend` implements
   it with the existing transactions; `ddbBackend` (`ddb.go`) with the
   table, registering itself for `dynamodb://` paths (`registerBackend`),
   so core proper names neither the store nor its package. `checkReads`
   is grouped by what it reads (namespaces, configurations, the log,
-  resources, grants, blobs, schemas, branches, sealed). A feature the
-  backend lacks is its `lacks` 501, asked by the Engine method before
-  anything else; everything the server can reach so answers 501 rather
-  than falling through to SQL. What remains refused is the SQL write
-  path's hooks (at Open) and mirroring a schema revision a remote base
-  pruned.
+  resources, grants, blobs, schemas, branches, sealed). A read the
+  backend can't answer panics with a 501 from inside the gate, so
+  everything the server can reach answers 501 rather than falling
+  through to SQL. What remains refused is the SQL write path's hooks (at
+  Open), mirroring a schema revision a remote base pruned, raising a
+  namespace from sealed to e2e (Addendum E Levels: `ddbRaiseRefused`,
+  so no namespace on the table has a raise and the pre-raise reads
+  answer 501), and a value larger than DynamoDB's 400 KB item, which
+  the design moves to S3 (§3) and the store doesn't yet.
 - **One read path.** The serving reads (`ResourceHead/Raw/Rev/Log`,
   `NamespaceHead/Rev/Log/Heads`, the events and the long-poll) are the
   SQL path's own code on the gate, as the writes' checks are, over a few
@@ -768,8 +771,8 @@ What landed, beyond the spike:
   sealings.
 - **E2E namespaces** (§E.3). The gate's checks (sealed ops, kids,
   declared blobs, the keyring, blind rules) and the keys relay are the
-  SQL path's, over the reads `e2eEpochOK`, `declaredAt`, `e2eSnapshot`
-  and `e2eFoldSince`. An epoch's start is an `EPOCHKEY#` item without
+  SQL path's, over the reads `declaredAt`, `e2eSnapshot` and
+  `e2eFoldSince`. An epoch's start is an `EPOCHKEY#` item without
   a key, written by the commit that begins it, as a sealed one's. An
   e2e revision keeps its sealed patch set and its declared blobs (REV
   `declared`, standing in for `blob_refs`), and its resource no head
@@ -777,6 +780,18 @@ What landed, beyond the spike:
   `pruneToE2E`) archives first and records the client-sealed snapshot
   (`E2ESNAP#`) in its commit; the patch sets below, earlier snapshots
   and the attachments no declared list keeps go after it.
+- **Due rotations and remote levels** (§E.2.4, §G.5.2). A config
+  change that revokes access under `-rotate-on-revoke` records a
+  rotation due for the namespace and the sealed branches it reaches in
+  its own transaction (`Commit.RotationsDue`, `#ROTDUE` items); a commit
+  beginning an epoch clears its namespace's, and `RetryRotations`
+  retries the rest. Following a remote base's config changes raises a
+  remote branch's level and restricts its read as SQL's `followConfig`
+  does, by config writes of the server's own (`serverConfig`,
+  `writeConfigAs`), one namespace at a time, leaves first; a raise it
+  can't follow is a `#REMLEVEL` item (`RemoteLevels`), and one this
+  server lacks a key store for makes what the branch read through
+  answer 502 upstream (`lostRemote`).
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the

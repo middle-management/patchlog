@@ -88,7 +88,9 @@ func (s *Store) pruneActs(c *Commit) []types.TransactWriteItem {
 		":hp": avN(p.HorizonPos), ":hi": avS(p.HorizonID), ":hb": avN(p.Base), ":k": avS(p.Keep), ":kp": avNs(p.Kept),
 	}
 	if p.OldHorizon == 0 {
-		cond += "attribute_not_exists(horizonPos)"
+		// None yet, or 0 after a change of the keep set alone.
+		cond += "(attribute_not_exists(horizonPos) OR horizonPos = :zero)"
+		vals[":zero"] = avN(0)
 	} else {
 		cond += "horizonPos = :oh"
 		vals[":oh"] = avN(p.OldHorizon)
@@ -396,7 +398,8 @@ func (s *Store) EachDoc(ctx context.Context, ns, name string, headPos uint64, vi
 		if err != nil {
 			return nil, err
 		}
-		out, _, err := applyPatches(d, exists, p)
+		// A genesis applies to the document null, as its create did (§6.2 step 3).
+		out, _, err := applyPatches(d, true, p)
 		if err != nil {
 			return nil, err
 		}

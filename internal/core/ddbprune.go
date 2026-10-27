@@ -17,7 +17,6 @@ import (
 	"errors"
 	"log"
 	"strconv"
-	"strings"
 
 	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -44,6 +43,8 @@ func (b *ddbBackend) prune(ctx context.Context, req Request, name string, pr Pru
 			return nil, perr
 		case out.err != nil:
 			return nil, out.err
+		case out.p.branch != nil:
+			return out.p.branch, nil // a branch prunes nothing (§8.6)
 		}
 		gid, err := b.storeGrant(ctx, out.p.a, out.p.cfg.level >= levelAtRest)
 		if err != nil {
@@ -107,56 +108,59 @@ type prunePlanned struct {
 // pruneTo prunes p.own below p.h (pruneTo of nsops.go), as author under
 // grant: ddb.ErrStale if what it pinned moved.
 func (b *ddbBackend) pruneTo(ctx context.Context, r *ddbReads, g *gate, p *prunePlan, author, grant string, noAuth bool) (*PruneResult, error) {
-	own, h := p.own, p.h
-	if own.horizonSeq.Valid && h.seq <= own.horizonSeq.Int64 {
-		return &PruneResult{Horizon: r.horizonID(own.id)}, nil
+	own := p.own
+	type planned struct {
+		h        *revRow
+		moves    bool
+		keepSeqs map[int64]*revRow
+		preserve map[int64]bool
+	}
+	pp, perr := ddbCheck(func() planned {
+		h, moves := g.effectiveHorizon(own, p.h)
+		ks, pres := g.keptBelow(p.n, p.own.name, own, h, p.keep)
+		return planned{h, moves, ks, pres}
+	})
+	if perr != nil {
+		return nil, perr
+	}
+	h, moves := pp.h, pp.moves
+	// A prune that moves the horizon or changes the keep set writes; one
+	// that changes nothing doesn't (§8.6).
+	changed := p.keepSent && keepChanged(own, p.keepStrs)
+	if !moves && !changed {
+		return &PruneResult{Horizon: h.id.String()}, nil
 	}
 	hk := r.revs[h.seq].key
 	ns, name := hk.ns, hk.name
-	// A horizon with nothing below it (a first entry) prunes nothing,
-	// and a prune that changes nothing writes nothing (§8.6).
-	if hk.pos <= 1 {
-		return &PruneResult{Horizon: h.id.String()}, nil
-	}
 	var oldHorizon uint64
 	if own.horizonSeq.Valid {
 		oldHorizon = r.revs[own.horizonSeq.Int64].key.pos
 	}
+	horizonPos, horizonID := hk.pos, h.id.String()
+	if !moves && oldHorizon == 0 {
+		horizonPos, horizonID = 0, "" // only the keep set changes
+	}
 	pl, perr := ddbCheck(func() *prunePlanned {
 		pl := &prunePlanned{docs: map[uint64][]byte{}}
-		rows := map[uint64]*revRow{}
-		base := g.lastLive(h)
-		pl.base = r.revs[base.seq].key.pos
-		rows[pl.base] = base
-		for _, k := range p.keep {
-			rows[r.revs[k.seq].key.pos] = k
+		pl.base = r.revs[g.lastLive(h).seq].key.pos
+		for seq := range pp.preserve {
+			pl.preserve = append(pl.preserve, r.revs[seq].key.pos)
 		}
-		// Referenced schema revisions keep their documents; one already
-		// below an earlier horizon keeps the snapshot it has.
-		prefix := "/r/" + p.n.name + "/" + name + "/rev/"
-		for path := range g.referencedPaths() {
-			id, err := ids.Parse(strings.TrimPrefix(path, prefix))
-			if !strings.HasPrefix(path, prefix) || err != nil {
+		for seq, row := range pp.keepSeqs {
+			if !moves {
+				// The documents it keeps below the horizon are those
+				// still served there, which have their snapshots.
+				pl.preserve = append(pl.preserve, r.revs[seq].key.pos)
 				continue
 			}
-			row := r.revByID(p.n, name, id)
-			if row == nil || row.kind != kindRev {
-				continue
+			if row == nil {
+				row = r.rev(seq)
 			}
-			switch pos := r.revs[row.seq].key.pos; {
-			case pos >= hk.pos:
-			case pos < oldHorizon:
-				pl.preserve = append(pl.preserve, pos)
-			default:
-				rows[pos] = row
-			}
-		}
-		for pos, row := range rows {
 			doc, err := g.docBytesAt(row)
 			if err != nil {
 				panic(invalid("a kept revision was already pruned"))
 			}
-			pl.docs[pos] = doc
+			pl.docs[r.revs[seq].key.pos] = doc
 		}
 		return pl
 	})
@@ -165,7 +169,7 @@ func (b *ddbBackend) pruneTo(ctx context.Context, r *ddbReads, g *gate, p *prune
 	}
 	// Archive before anything is dropped (§8.6).
 	var arch *ddb.ArchiveRow
-	if p.hasArchive {
+	if moves && p.hasArchive {
 		var err error
 		if arch, err = b.writeArchive(ctx, r, g, p); err != nil {
 			return nil, err
@@ -196,14 +200,22 @@ func (b *ddbBackend) pruneTo(ctx context.Context, r *ddbReads, g *gate, p *prune
 		}
 	}
 	rr := r.resItem(own.id)
+	keepJSON := rr.Keep
+	if keepJSON == "" {
+		keepJSON = "[]"
+	}
+	if p.keepSent {
+		// keep replaces the keep set, and [] clears it (§8.6).
+		keepJSON = string(jsonv.Canonical(anyStrings(p.keepStrs)))
+	}
 	c := &ddb.Commit{
 		NS: ns, Author: author, Created: g.now.UnixMilli(), Grant: grant, NoAuth: noAuth, Via: viaOf(p.a),
 		CfgPos: r.cfgs[p.n.configSeq].pos, CfgID: r.cfgRow(p.n.configSeq).ID,
 		Entry: map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, Kind: "prune",
 		Prune: &ddb.CommitPrune{
 			Name: name, HeadPos: rr.HeadPos, HeadID: rr.HeadID, OldHorizon: oldHorizon,
-			HorizonPos: hk.pos, HorizonID: h.id.String(), Base: pl.base,
-			Keep: string(jsonv.Canonical(anyStrings(p.keepStrs))), Kept: kept, Archive: arch,
+			HorizonPos: horizonPos, HorizonID: horizonID, Base: pl.base,
+			Keep: keepJSON, Kept: kept, Archive: arch,
 		},
 	}
 	cres, err := b.commit(ctx, c)
