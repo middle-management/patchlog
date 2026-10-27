@@ -617,8 +617,29 @@ func TestV073P17SweepDuringDryRun(t *testing.T) {
 	}
 }
 
+// p17DrawBlockedBy waits until a rate_draw statement on e's database
+// waits for a lock that the session pid holds (pg_blocking_pids).
+func p17DrawBlockedBy(t *testing.T, e *Engine, pid int) {
+	t.Helper()
+	within(t, 10*time.Second, "the draw waits for the lock", func() bool {
+		var n int
+		e.db.QueryRow(`SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()
+			AND wait_event_type = 'Lock' AND query LIKE '%rate_draw(%' AND $1 = ANY (pg_blocking_pids(pid))`, pid).Scan(&n)
+		return n > 0
+	})
+}
+
 // A draw Postgres rolls back for a deadlock (with a statement that locks
 // bucket rows out of key order) deducted nothing, and runs again.
+//
+// The other statement asks for a only once the draw waits for b, which it
+// holds (p17DrawBlockedBy): rate_draw locks a draw's rows in key order, so
+// the draw holds a then, and waits first. Postgres rolls back the session
+// that checks for the deadlock first, each deadlock_timeout after it began
+// to wait: the other session checks only after 10 s, so the draw, checking
+// after the server's 1 s, is the one, however the two are scheduled (with
+// the same timeout, the other statement, waiting a few milliseconds less,
+// was rolled back about once in 25 runs).
 func TestV073P17DrawRetriesDeadlock(t *testing.T) {
 	if !pgtest.Enabled() {
 		t.Skip("Postgres only")
@@ -636,7 +657,14 @@ func TestV073P17DrawRetriesDeadlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
+	if _, err := tx.Exec(`SET LOCAL deadlock_timeout = '10s'`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := tx.Exec(`SELECT 1 FROM rate_buckets WHERE key = 'b' FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	if err := tx.QueryRow(`SELECT pg_backend_pid()`).Scan(&pid); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
@@ -648,9 +676,9 @@ func TestV073P17DrawRetriesDeadlock(t *testing.T) {
 		}
 		done <- err
 	}()
-	time.Sleep(200 * time.Millisecond)
-	// Waiting for a closes the cycle. The draw, waiting longer, finds the
-	// deadlock first, and Postgres rolls it back.
+	p17DrawBlockedBy(t, e, pid)
+	// Waiting for a closes the cycle. The draw finds the deadlock first,
+	// and Postgres rolls it back.
 	if _, err := tx.Exec(`SELECT 1 FROM rate_buckets WHERE key = 'a' FOR UPDATE`); err != nil {
 		t.Fatalf("the other statement was the deadlock's victim: %v", err)
 	}

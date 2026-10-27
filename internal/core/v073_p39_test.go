@@ -2,10 +2,13 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
@@ -96,4 +99,56 @@ func TestV073P39HoldCheckedAfterItsTest(t *testing.T) {
 	})
 	// One write of the two arrives, after the test that held them ended.
 	e.opt.BeforeWriteLock()
+}
+
+// FL-3: p17DrawBlockedBy returns only once the draw holds its first row
+// and waits for the second, however late the draw starts (here later than
+// the fixed 200 ms TestV073P17DrawRetriesDeadlock slept), so the deadlock
+// that test provokes is the one it means: the draw waits first.
+func TestV073P39DrawBlockedByWaitsForTheDraw(t *testing.T) {
+	if !pgtest.Enabled() {
+		t.Skip("Postgres only")
+	}
+	var clock atomic.Int64
+	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+	e := p17RateEngine(t, pgtest.NewDB(t), t.TempDir(), &clock, p17Fast(), false)
+	s := e.rate.store
+	now := time.UnixMilli(clock.Load())
+	r := Rate{1, 10}
+	p17FullBuckets(t, e, now, r, "a", "b")
+	ctx := context.Background()
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`SELECT 1 FROM rate_buckets WHERE key = 'b' FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	if err := tx.QueryRow(`SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_, _, ok, err := s.admit(ctx, now, []draw{{"a", r, 1, "x"}, {"b", r, 1, "x"}})
+		if err == nil && !ok {
+			err = fmt.Errorf("refused")
+		}
+		done <- err
+	}()
+	p17DrawBlockedBy(t, e, pid)
+	// The draw holds a.
+	_, err = e.db.Exec(`SELECT 1 FROM rate_buckets WHERE key = 'a' FOR UPDATE NOWAIT`)
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) || pe.Code != "55P03" {
+		t.Fatalf("locking a while the draw waits for b: %v, want lock_not_available", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("the draw: %v", err)
+	}
 }
