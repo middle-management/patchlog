@@ -33,11 +33,11 @@
       "key": "K_r",
       "kid": "demo#3",
       "iv": "c0c1c2c3c4c5c6c7c8c9cacb",
-      "plaintext": "{\"author\":\"user:bob\",\"created\":\"2026-10-04T12:00:00Z\",\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"parent\":\"\",\"patches\":[{\"op\":\"add\",\"path\":\"\",\"value\":{\"title\":\"Hello\",\"views\":0}}]}",
-      "padded_length": 191,
+      "plaintext": "{\"author\":\"user:bob\",\"created\":\"2026-10-04T12:00:00Z\",\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"patches\":[{\"op\":\"add\",\"path\":\"\",\"value\":{\"title\":\"Hello\",\"views\":0}}]}",
+      "padded_length": 179,
       "protected": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"name\":\"derby\",\"ns\":\"demo\"}}",
-      "tag": "CuZxMecpopDGlbR6kxR-qQ",
-      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiaWQiOiIxbDJnaTJoaG0zdnQ3MmxzMm91ZnFwa3Fwc2g2dXZtbGwiLCJraW5kIjoicmV2IiwibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.k52_TNJoKtTgS-F18LbSvzC1Wzjpp2eMwwcxR9zeeocp7wTUg2d8tmhTnhTJQIzPSDZ3W-xm2LmRpjtraleuGCCKInvWfZnuJUp7xHMsnjZxC1PNLfoNiupXmPm46N5Fmt4oJ-M2Q_1gg2RRLVQdBCwXvyfkItoce5AnhhQnD6wmcAKWkhgKkcuFd7NJMjW7QT63-Glxr4W4hM7xqDHHoYs7STM4xesLibtgNP41e5THHd_4T2kGdUv8Hw50UWY.CuZxMecpopDGlbR6kxR-qQ"
+      "tag": "US8EmowxlnmTz1n0fhFnfA",
+      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiaWQiOiIxbDJnaTJoaG0zdnQ3MmxzMm91ZnFwa3Fwc2g2dXZtbGwiLCJraW5kIjoicmV2IiwibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.k52_TNJoKtTgS-F18LbSvzC1Wzjpp2eMwwcxR9zeeocp7wTUg2d8tmhTnhTJQIzPSDZ3W-xm2LmRpjtraleuGCCKInvWfZnuJUp7xHMsnjZxC1PNLfoNiupXmPm46N5Fmt4oJ-M2Q_1gg2RRLVQdAioRrnb8OqNLe4820E1tC7tgaHXPwBYO29OdNPUBMm_4XSqmsnEwr9P90tT15n6Ay9QsByhznaUYwuQ1D7ljJ4aYbIA.US8EmowxlnmTz1n0fhFnfA"
     },
     {
       "name": "resource log entry (tombstone)",
@@ -45,11 +45,11 @@
       "key": "K_r",
       "kid": "demo#3",
       "iv": "c0c1c2c3c4c5c6c7c8c9cacb",
-      "plaintext": "{\"id\":\"1idx6u2b3z42obqmwsgmlzvrfuutks2bq\",\"kind\":\"tombstone\",\"parent\":\"1sywh54kpo3c4ezn2znktvl3avge4zl5d\"}",
-      "padded_length": 106,
+      "plaintext": "{\"author\":\"user:bob\",\"created\":\"2026-10-04T12:10:00Z\",\"id\":\"1idx6u2b3z42obqmwsgmlzvrfuutks2bq\",\"kind\":\"tombstone\",\"parent\":\"1sywh54kpo3c4ezn2znktvl3avge4zl5d\"}",
+      "padded_length": 159,
       "protected": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"id\":\"1idx6u2b3z42obqmwsgmlzvrfuutks2bq\",\"kind\":\"tombstone\",\"name\":\"derby\",\"ns\":\"demo\"}}",
-      "tag": "dWOokZK2P2bLBHZBpQaV8A",
-      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiaWQiOiIxaWR4NnUyYjN6NDJvYnFtd3NnbWx6dnJmdXV0a3MyYnEiLCJraW5kIjoidG9tYnN0b25lIiwibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.k523XYQ6Z5erFbs29uHCtijuC3Wn9GmJ1QEoTsKKMsNuqkKJ3WQu6npL6E6SFNjdSCQzbqMoiaSa6mRrdxnsHjvdJGeZdM2rYQFg33R3gCBvSFuIOPMLjuVPnuGipsEGh9Ajd7tgVOsniA.dWOokZK2P2bLBHZBpQaV8A"
+      "tag": "Mx4ePpabgWT1uSYFUBcQMQ",
+      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiaWQiOiIxaWR4NnUyYjN6NDJvYnFtd3NnbWx6dnJmdXV0a3MyYnEiLCJraW5kIjoidG9tYnN0b25lIiwibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.k52_TNJoKtTgS-F18LbSvzC1Wzjpp2eMwwcxR9zeeocp7wTUg2d8tmhTnhTJQI3PSDZ3W-xm2LmRpjtralL4B3_NeHGINNuofRpm2jYwjD1sAU7OO_wQyPRSx_el6N5Fmt4oJ-M2Q_tqmCQOe0sSE2tV6XW_cp1eLcJ80EY8E6hsf22GwBhJ0MXCbLkfanfyRSmvoyo96sKg3NSloGbf.Mx4ePpabgWT1uSYFUBcQMQ"
     },
     {
       "name": "resource purge event",

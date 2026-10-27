@@ -1234,7 +1234,9 @@ implements the default the plan states.
   (§7.3). Randomness is fixed with the reference's test hooks; sealed bundles, which have none,
   are decrypt vectors written under a fixed seed. Cases the spec leaves open (a blank line
   between sealed bundle lines, a non-canonical envelope, a top-level `last`, RE2 `\x{D800}`) are
-  marked informative. No behaviour changes.
+  marked informative. No behaviour changes. The sealed resource log entry rows seal the entry
+  as the core serves it: author and created on a tombstone's too, and no `parent` member on a
+  genesis revision's (§7.1, §E.2.2); a test checks both against a sealed deployment's log.
 - Client: `E2EDoc.PreRaise` and `Kid()`, `E2E.Log`, `Doc.Kid`, `LogEntry.Kid`; derived:
   `Cache.Drop`, `Keys.KeyAt`, `EpochOf`; index: `Options.EdgeGrants`, `Options.ExchangeRate`.
 

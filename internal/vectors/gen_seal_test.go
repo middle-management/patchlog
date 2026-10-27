@@ -250,7 +250,12 @@ func TestVectorSealedPayloads(t *testing.T) {
 	}
 	kid := seal.Kid("demo", 3)
 	doc := []byte(`{"title":"Hello","views":0}`)
-	entry := []byte(`{"author":"user:bob","created":"2026-10-04T12:00:00Z","id":"` + idG + `","kind":"rev","parent":"","patches":` + patches1 + `}`)
+	// A genesis revision's entry, as the core seals it (LogEntry.value):
+	// no parent member, since it has none.
+	entry := []byte(`{"author":"user:bob","created":"2026-10-04T12:00:00Z","id":"` + idG + `","kind":"rev","patches":` + patches1 + `}`)
+	// A tombstone's entry, as the core seals it (LogEntry.value): author
+	// and created beside id, kind and parent, as for a revision.
+	tombstone := []byte(`{"author":"user:bob","created":"2026-10-04T12:10:00Z","id":"` + idT + `","kind":"tombstone","parent":"` + idC + `"}`)
 	// Each plaintext is what the reference seals for that row. A range is
 	// sealed as the entries GET /ns/{ns}/log serves, with id, prev, author
 	// and created beside the hashed entry (§7.4, core rangeJob).
@@ -308,7 +313,7 @@ func TestVectorSealedPayloads(t *testing.T) {
 		{"/rev/{id} document", "K_r", kr, seal.ResourcePL("demo", "derby", idG, seal.KindDoc), doc, false},
 		{"/rev/{id} document, padded", "K_r", kr, seal.ResourcePL("demo", "derby", idG, seal.KindDoc), doc, true},
 		{"resource log entry (rev)", "K_r", kr, seal.ResourcePL("demo", "derby", idG, seal.KindRev), entry, false},
-		{"resource log entry (tombstone)", "K_r", kr, seal.ResourcePL("demo", "derby", idT, seal.KindTombstone), []byte(`{"id":"` + idT + `","kind":"tombstone","parent":"` + idC + `"}`), false},
+		{"resource log entry (tombstone)", "K_r", kr, seal.ResourcePL("demo", "derby", idT, seal.KindTombstone), tombstone, false},
 		{"resource purge event", "K_r", kr, seal.ResourceEventPL("demo", "derby", seal.KindPurge), purgeEvent, false},
 		{"namespace document", "K_e", epochKey, seal.NamespaceDocPL("demo", nsID1), []byte(`{"encryption":{"epoch":3,"level":"sealed"},"read":"public"}`), false},
 		{"namespace log range", "K_e", epochKey, seal.RangePL("demo", nsID1, nsID2), rangeEntries, false},

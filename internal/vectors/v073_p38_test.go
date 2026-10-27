@@ -33,14 +33,18 @@ func loadVectors(t *testing.T, name string) storedVectors {
 
 // TestSealedPlaintextsServed: the grant row seals GET /ns/{ns}/grants/{gid}'s
 // answer { id, root, stored } (§C.3.1), the range row the entries §7.4
-// serves, with id, prev, author and created, and the purge event row the
-// namespace entry without id and prev (§7.3).
+// serves, with id, prev, author and created, the purge event row the
+// namespace entry without id and prev (§7.3), and the resource log entry
+// rows the entries §7.1 serves, author and created included (core
+// LogEntry.value).
 func TestSealedPlaintextsServed(t *testing.T) {
 	t.Parallel()
 	want := map[string][]string{
-		"grant":                {"id", "root", "stored"},
-		"namespace log range":  {"author", "created", "id", "kind", "prev", "resource", "target"},
-		"resource purge event": {"created", "kind", "resource", "target"},
+		"grant":                          {"id", "root", "stored"},
+		"namespace log range":            {"author", "created", "id", "kind", "prev", "resource", "target"},
+		"resource purge event":           {"created", "kind", "resource", "target"},
+		"resource log entry (rev)":       {"author", "created", "id", "kind", "patches"},
+		"resource log entry (tombstone)": {"author", "created", "id", "kind", "parent"},
 	}
 	seen := 0
 	for _, v := range loadVectors(t, "sealed").Vectors {
