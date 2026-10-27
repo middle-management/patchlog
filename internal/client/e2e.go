@@ -1550,6 +1550,76 @@ func (x *E2E) openPreRaise(ctx context.Context, ns, name, id string, r *response
 	return v, hd.Kid, nil
 }
 
+// Log is Client.Log for a resource of an e2e namespace (§7.1): the log
+// range of ns/name after since up to id (its head when ""), following its
+// pages, with the pages from before a raise from sealed to e2e, entries
+// sealed as at E2 (Addendum E Levels), opened with this view's keys
+// (openPreRaiseEntry), the base's ns accepted for content a branch reads
+// through. Entries written end to end keep their sealed patch sets, which
+// OpenLog opens.
+func (x *E2E) Log(ctx context.Context, ns, name, id, since string) ([]LogEntry, error) {
+	if err := checkRes(ns, name); err != nil {
+		return nil, err
+	}
+	if err := checkOptID("since", since); err != nil {
+		return nil, err
+	}
+	if id == "" {
+		h, err := x.c.Head(ctx, ns, name)
+		if err != nil {
+			return nil, err
+		}
+		switch h.State {
+		case NotFound:
+			return nil, &APIError{Status: 404, Code: "not_found", Method: "GET", Path: "/r/" + ns + "/" + name}
+		case Purged:
+			return nil, &APIError{Status: 410, Code: "gone", Method: "GET", Path: "/r/" + ns + "/" + name}
+		}
+		id = h.ID
+	}
+	if err := checkID("revision", id); err != nil {
+		return nil, err
+	}
+	all := []LogEntry{}
+	for cur := since; ; {
+		next, err := x.c.logPage(ctx, "/r/"+ns+"/"+name+"/rev/"+id+"/log", cur, id, func(r *response, end string) (string, error) {
+			arr, ok := r.value().([]any)
+			if !ok {
+				return "", fmt.Errorf("client: %s: log is not an array", r.path)
+			}
+			prev := cur
+			for i, v := range arr {
+				if jwe, ok := v.(string); ok {
+					var err error
+					if v, err = x.openPreRaiseEntry(ctx, ns, name, jwe); err != nil {
+						return "", err
+					}
+				}
+				e, err := parseLogEntry(v)
+				if err != nil {
+					return "", err
+				}
+				if (i > 0 || cur != "") && e.Parent != prev {
+					return "", fmt.Errorf("client: log of %s/%s does not chain at %s: %w", ns, name, e.ID, seal.ErrMismatch)
+				}
+				prev = e.ID
+				all = append(all, e)
+			}
+			if len(arr) == 0 {
+				return "", nil
+			}
+			return prev, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if next == "" {
+			return all, nil
+		}
+		cur = next
+	}
+}
+
 // openPreRaiseEntry opens a resource log entry of ns/name from before a
 // raise from sealed to e2e, sealed as at E2 (Addendum E Levels): under
 // K_r of its kid's epoch, kns being ns or one of its bases, with pl {kns,

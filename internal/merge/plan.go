@@ -680,14 +680,20 @@ func (p *Plan) ancestry(ctx context.Context, ns, name, head string) (ancestry, e
 	if a, ok := p.logs[key]; ok {
 		return a, nil
 	}
-	es, err := p.c.Log(ctx, ns, name, head, "")
+	// An e2e namespace's log is read by the key-holding view, which opens
+	// the pages from before a raise from sealed (Addendum E Levels).
+	readLog := p.c.Log
+	if p.level(ns) == "e2e" {
+		readLog = p.opt.E2E.Log
+	}
+	es, err := readLog(ctx, ns, name, head, "")
 	var a ancestry
 	switch {
 	case err == nil:
 		a = ancestry{entries: es}
 	case client.IsPruned(err) && client.Horizon(err) != "":
 		hz := client.Horizon(err)
-		es, err = p.c.Log(ctx, ns, name, head, hz)
+		es, err = readLog(ctx, ns, name, head, hz)
 		if err != nil {
 			return ancestry{}, err
 		}
