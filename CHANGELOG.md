@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.23.0
 
 Implements spec **v0.73**, the whole upgrade from v0.55. v0.56 folds in the reference's notes
 1–79; v0.57–v0.64 restructure the text (Requirements blocks, §12 as registries, the checklist
