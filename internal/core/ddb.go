@@ -73,9 +73,6 @@ var ErrUnsupported = errors.New("not implemented on this backend")
 // the SQL backends (tailer, retention, sweeps, repurge, rotation, remote
 // follow) don't start: their features are phase 2+.
 func openDDB(opt Options) (*Engine, error) {
-	if opt.KeyStore != nil {
-		return nil, fmt.Errorf("core: encryption at rest: %w (DynamoDB, docs/DYNAMODB.md phase 1)", ErrUnsupported)
-	}
 	// What it would otherwise ignore: the SQL write path's test hooks,
 	// which it never reaches — a caller waiting on one would wait for good.
 	if opt.BeforeWriteLock != nil || opt.BeforeCommit != nil {
