@@ -807,20 +807,19 @@ PATCHLOG_TEST_BACKEND=dynamodb DDB_ENDPOINT=http://localhost:8000 go test ./...
 runs them on DynamoDB Local, a fresh table each, as `PATCHLOG_TEST_PG`
 runs them on Postgres; CI's `dynamodb` job does. What the backend hasn't
 built skips without per-test annotations: `core.Open` refusing an option
-with `core.ErrUnsupported` (encryption at rest, the SQL write path's
-hooks), or a `501 {"code":"unsupported"}`
+with `core.ErrUnsupported` (the SQL write path's hooks), or a `501 {"code":"unsupported"}`
 answer on the test's own goroutine. Tests that run and answer
 differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,319 top-level tests (pure unit tests included): 1,158 pass on
-DynamoDB and 161 skip — 125 as unsupported (116 encryption at rest,
-6 the SQL write path's hooks, 3 sealed), 36 on their own conditions
-(Postgres-only tests).
+1,320 top-level tests (pure unit tests included): 1,239 pass on
+DynamoDB and 81 skip — 37 as unsupported (33 e2e namespaces, 4 the SQL
+write path's hooks), the rest on their own conditions (Postgres-only
+tests, mostly).
 The known list is empty: no test answers differently from the SQL
 backends. A test that skips partway has asserted everything before
-its skip, so the phase-1 surface is covered beyond the 1,158.
+its skip, so the phase-1 surface is covered beyond the 1,239.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on
