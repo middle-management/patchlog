@@ -18,6 +18,7 @@ import (
 	"testing/cryptotest"
 
 	"github.com/middle-management/patchlog/internal/bundle"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -178,7 +179,9 @@ func TestVectorWrappedKeys(t *testing.T) {
 	kre, _ := seal.WrapKeyWithEphemeral(eph, recipient.PublicKey(), kid, "derby", kr)
 	auth, _ := seal.WrapKeyAuthWithEphemeral(eph, sender, recipient.PublicKey(), kid, "", epochKey)
 	auth.From = seal.Thumbprint(sender.PublicKey())
-	wrapped := b64u.EncodeToString(ke.Wrapped)
+	// The entries that name derby carry K_r's wrap, whose info ends in
+	// that name; the others K_e's.
+	wrapped, wrappedR := b64u.EncodeToString(ke.Wrapped), b64u.EncodeToString(kre.Wrapped)
 	var vs []any
 	for _, c := range []struct {
 		name string
@@ -202,9 +205,9 @@ func TestVectorWrappedKeys(t *testing.T) {
 			{Key: "entry", Value: string(entry)}, {Key: "verdict", Value: "accept"}, {Key: "key", Value: golden.Hex(c.key)}})
 	}
 	for _, c := range []struct{ name, entry string }{
-		{"before v0.63: resource and suite", `{"kid":"` + kid + `","resource":"derby","suite":"` + seal.Suite + `","wrapped":"` + wrapped + `"}`},
-		{"name and resource agreeing", `{"kid":"` + kid + `","name":"derby","resource":"derby","wrapped":"` + wrapped + `"}`},
-		{"name and resource differing", `{"kid":"` + kid + `","name":"derby","resource":"cup","wrapped":"` + wrapped + `"}`},
+		{"before v0.63: resource and suite", `{"kid":"` + kid + `","resource":"derby","suite":"` + seal.Suite + `","wrapped":"` + wrappedR + `"}`},
+		{"name and resource agreeing", `{"kid":"` + kid + `","name":"derby","resource":"derby","wrapped":"` + wrappedR + `"}`},
+		{"name and resource differing", `{"kid":"` + kid + `","name":"derby","resource":"cup","wrapped":"` + wrappedR + `"}`},
 		{"another suite", `{"kid":"` + kid + `","suite":"hpke-base-0x0020-0x0001-0x0001","wrapped":"` + wrapped + `"}`},
 		{"from not a thumbprint", `{"from":"admin","kid":"` + kid + `","wrapped":"` + wrapped + `"}`},
 		{"no wrapped", `{"kid":"` + kid + `"}`},
@@ -215,7 +218,14 @@ func TestVectorWrappedKeys(t *testing.T) {
 		if err != nil {
 			v = append(v, golden.Member{Key: "verdict", Value: "reject"})
 		} else {
-			v = append(v, golden.Member{Key: "verdict", Value: "accept"}, golden.Member{Key: "read as", Value: string(jsonv.Canonical(w.Value()))})
+			// An entry read is a decrypt vector like the others: it opens
+			// to K_r under the name it is read with.
+			got, err := seal.UnwrapRelayed(recipient, w, nil)
+			if err != nil || !bytes.Equal(got, kr) {
+				t.Fatalf("%s: read as %s, opens to %x, %v", c.name, jsonv.Canonical(w.Value()), got, err)
+			}
+			v = append(v, golden.Member{Key: "verdict", Value: "accept"}, golden.Member{Key: "read as", Value: string(jsonv.Canonical(w.Value()))},
+				golden.Member{Key: "key", Value: golden.Hex(got)})
 		}
 		vs = append(vs, v)
 	}
@@ -241,6 +251,52 @@ func TestVectorSealedPayloads(t *testing.T) {
 	kid := seal.Kid("demo", 3)
 	doc := []byte(`{"title":"Hello","views":0}`)
 	entry := []byte(`{"author":"user:bob","created":"2026-10-04T12:00:00Z","id":"` + idG + `","kind":"rev","parent":"","patches":` + patches1 + `}`)
+	// Each plaintext is what the reference seals for that row. A range is
+	// sealed as the entries GET /ns/{ns}/log serves, with id, prev, author
+	// and created beside the hashed entry (§7.4, core rangeJob).
+	served := jsonv.MustParse([]byte(entry2)).(map[string]any)
+	served["id"], served["prev"], served["author"], served["created"] = nsID2, nsID1, "user:bob", "2026-10-04T12:05:00Z"
+	if prev, err := ids.Parse(nsID1); err != nil || ids.Hash(&prev, []byte(entry2)).String() != nsID2 {
+		t.Fatalf("the range's entry doesn't hash to %s", nsID2)
+	}
+	rangeEntries := jsonv.Canonical([]any{served})
+	// A grant is sealed as GET /ns/{ns}/grants/{gid} answers it, { id, root,
+	// stored } (§C.3.1, core Engine.Grant), stored that of I.4's root block
+	// in the token biscuit.json fixes (internal/grant), whose next key is
+	// fixed too.
+	var bf struct {
+		Vectors []struct {
+			Name  string `json:"name"`
+			Token string `json:"token"`
+		} `json:"vectors"`
+	}
+	if !golden.Load(t, "biscuit", &bf) || len(bf.Vectors) == 0 {
+		t.Fatal("testdata/biscuit.json is missing (go test ./internal/grant -run TestVectorBiscuit -update writes it)")
+	}
+	g, err := grant.Decode(bf.Vectors[0].Token, 0)
+	if err != nil || g.ID().String() != i4GrantID || string(jsonv.Canonical(g.Blocks[0].Raw)) != i4Root {
+		t.Fatalf("biscuit.json's first token isn't I.4's root block: %v", err)
+	}
+	grantAnswer := jsonv.Canonical(map[string]any{"id": i4GrantID, "root": jsonv.MustParse([]byte(i4Root)), "stored": b64u.EncodeToString(g.Stored())})
+	// A resource purge event is the namespace entry without id and prev
+	// (§7.3), as core resourceEvents gives it in resourceevents.json.
+	var rf struct {
+		Vectors []struct {
+			Name string `json:"name"`
+			Data string `json:"data"`
+		} `json:"vectors"`
+	}
+	var purgeEvent []byte
+	if golden.Load(t, "resourceevents", &rf) {
+		for _, v := range rf.Vectors {
+			if v.Name == "purge event" {
+				purgeEvent = []byte(v.Data)
+			}
+		}
+	}
+	if purgeEvent == nil {
+		t.Fatal("testdata/resourceevents.json has no purge event (go test ./internal/core -run TestVectorResourceEvents -update writes it)")
+	}
 	var vs []any
 	for _, c := range []struct {
 		name, keyName string
@@ -253,10 +309,10 @@ func TestVectorSealedPayloads(t *testing.T) {
 		{"/rev/{id} document, padded", "K_r", kr, seal.ResourcePL("demo", "derby", idG, seal.KindDoc), doc, true},
 		{"resource log entry (rev)", "K_r", kr, seal.ResourcePL("demo", "derby", idG, seal.KindRev), entry, false},
 		{"resource log entry (tombstone)", "K_r", kr, seal.ResourcePL("demo", "derby", idT, seal.KindTombstone), []byte(`{"id":"` + idT + `","kind":"tombstone","parent":"` + idC + `"}`), false},
-		{"resource purge event", "K_r", kr, seal.ResourceEventPL("demo", "derby", seal.KindPurge), []byte(`{"kind":"purge","resource":"derby"}`), false},
+		{"resource purge event", "K_r", kr, seal.ResourceEventPL("demo", "derby", seal.KindPurge), purgeEvent, false},
 		{"namespace document", "K_e", epochKey, seal.NamespaceDocPL("demo", nsID1), []byte(`{"encryption":{"epoch":3,"level":"sealed"},"read":"public"}`), false},
-		{"namespace log range", "K_e", epochKey, seal.RangePL("demo", nsID1, nsID2), []byte(`[` + entry2 + `]`), false},
-		{"grant", "K_e", epochKey, seal.GrantPL("demo", i4GrantID), []byte(`{"root":` + i4Root + `}`), false},
+		{"namespace log range", "K_e", epochKey, seal.RangePL("demo", nsID1, nsID2), rangeEntries, false},
+		{"grant", "K_e", epochKey, seal.GrantPL("demo", i4GrantID), grantAnswer, false},
 		{"E3 patch set", "K_r", kr, seal.PatchSetPL("demo", "derby", ""), []byte(patches1), false},
 		{"E3 prune snapshot", "K_r", kr, seal.SnapshotPL("demo", "derby", idC), []byte(`{"title":"Hello","views":1}`), false},
 	} {
@@ -375,9 +431,9 @@ var storedBundles = []string{"sealed bundle", "sealed bundle, padded lines", "an
 
 // TestVectorSealedBundles: a sealed bundle of the two-line plain bundle,
 // and one with padded lines, as seal.NewBundleWriter writes them; what
-// seal.OpenBundle and the bundle Reader make of each; and the cases a
-// reader must reject (§G.5.1.1, §G.4.1), built from the first bundle's
-// own lines or sealed again under its content key. The bundles are written
+// seal.OpenBundle and the bundle Reader make of each; the cases a reader
+// must reject (§G.5.1.1, §G.4.1), and three the spec leaves open, built
+// from the first bundle's own lines or sealed again under its content key. The bundles are written
 // under a fixed seed of crypto/rand, and -update writes them; otherwise
 // the stored ones are checked, since how the standard library draws its
 // randomness may change between Go versions.
@@ -466,26 +522,43 @@ func TestVectorSealedBundles(t *testing.T) {
 	}
 	otherLines := strings.SplitAfter(string(src["another sealed bundle"]), "\n")
 
+	// Each case a reader must reject names the rule of §G.5.1.1 (or of
+	// §G.4.1, which the decrypted bundle is checked by) that it breaks,
+	// and why is a fragment of the reference's error, checked here only:
+	// error text isn't vector content. The informative cases are ones the
+	// spec leaves open; the file records what the reference does, and the
+	// test asserts nothing of them.
+	const (
+		inOrder   = "line numbers are 0, 1, 2… in order (§G.5.1.1)"
+		saysLast  = "a line says last (§G.5.1.1)"
+		decrypts  = "every line decrypts under K_b (§G.5.1.1)"
+		canonical = "the decrypted bundle is checked as in §G.4.1: every line is canonical JSON"
+	)
 	vs := []any{}
 	for _, c := range []struct {
 		name, sealed string
-		stored       bool // the bundle is stored, not computed
+		stored       bool   // the bundle is stored, not computed
+		rule, why    string // the rule a rejected case breaks; a fragment of the reference's error
+		informative  string // the spec leaves the verdict open
 	}{
-		{"sealed bundle", string(base), true},
-		{"sealed bundle, padded lines", string(src["sealed bundle, padded lines"]), true},
-		{"another sealed bundle", string(src["another sealed bundle"]), true},
-		{"lines out of order", lines[0] + lines[2] + lines[1], false},
-		{"last line missing (truncated)", lines[0] + lines[1], false},
-		{"a line after the last", lines[0] + lines[1] + lines[2] + lines[2], false},
-		{"a line of another bundle", lines[0] + lines[1] + otherLines[2], false},
-		{"pl.line wrong", lines[0] + lines[1] + line(pl(2, true), entry), false},
-		{"pl.bundle another id", lines[0] + lines[1] + line(pl(1, true, "bundle", "AAAAAAAAAAAAAAAAAAAAAA"), entry), false},
-		{"no line says last", lines[0] + lines[1] + line(pl(1, false), entry), false},
-		{"plaintext line not canonical", lines[0] + lines[1] + line(pl(1, true), strings.Replace(entry, `"views":0`, `"views":0.0`, 1)), false},
-		{"plaintext line blank", lines[0] + lines[1] + line(pl(1, false), "") + line(pl(2, true), entry), false},
-		{"last beside pl (before v0.73)", lines[0] + line(pl(0, false), header) + line(pl(1, false, "top-last", ""), entry), false},
-		{"a blank line between sealed lines", lines[0] + lines[1] + "\n" + lines[2], false},
-		{"envelope not canonical", strings.Replace(lines[0], `{"id":`, `{ "id":`, 1) + lines[1] + lines[2], false},
+		{name: "sealed bundle", sealed: string(base), stored: true},
+		{name: "sealed bundle, padded lines", sealed: string(src["sealed bundle, padded lines"]), stored: true},
+		{name: "another sealed bundle", sealed: string(src["another sealed bundle"]), stored: true},
+		{name: "lines out of order", sealed: lines[0] + lines[2] + lines[1], rule: inOrder, why: "out of order"},
+		{name: "last line missing (truncated)", sealed: lines[0] + lines[1], rule: saysLast, why: "no line says last"},
+		{name: "a line after the last", sealed: lines[0] + lines[1] + lines[2] + lines[2], rule: "no line follows the last (§G.5.1.1)", why: "follows the last"},
+		{name: "a line of another bundle", sealed: lines[0] + lines[1] + otherLines[2], rule: decrypts, why: "fails to decrypt"},
+		{name: "pl.line wrong", sealed: lines[0] + lines[1] + line(pl(2, true), entry), rule: inOrder, why: "out of order"},
+		{name: "pl.bundle another id", sealed: lines[0] + lines[1] + line(pl(1, true, "bundle", "AAAAAAAAAAAAAAAAAAAAAA"), entry), rule: "pl.bundle is the envelope's id (§G.5.1.1)", why: "pl.bundle"},
+		{name: "no line says last", sealed: lines[0] + lines[1] + line(pl(1, false), entry), rule: saysLast, why: "no line says last"},
+		{name: "plaintext line not canonical", sealed: lines[0] + lines[1] + line(pl(1, true), strings.Replace(entry, `"views":0`, `"views":0.0`, 1)), rule: canonical, why: "not canonical"},
+		{name: "plaintext line blank", sealed: lines[0] + lines[1] + line(pl(1, false), "") + line(pl(2, true), entry), rule: canonical, why: "blank line"},
+		{name: "last beside pl (before v0.73)", sealed: lines[0] + line(pl(0, false), header) + line(pl(1, false, "top-last", ""), entry),
+			informative: "the reference still reads last beside pl, as written before v0.73; §G.5.1.1 doesn't say whether a reader must"},
+		{name: "a blank line between sealed lines", sealed: lines[0] + lines[1] + "\n" + lines[2],
+			informative: "the reference skips a blank line; open question: may a JWE line be followed by anything but one LF?"},
+		{name: "envelope not canonical", sealed: strings.Replace(lines[0], `{"id":`, `{ "id":`, 1) + lines[1] + lines[2],
+			informative: "the reference accepts it; open question: must the envelope line be canonical?"},
 	} {
 		v := obj{{Key: "name", Value: c.name}}
 		if c.stored {
@@ -494,35 +567,37 @@ func TestVectorSealedBundles(t *testing.T) {
 			v = append(v, golden.Member{Key: "fn", Value: "built from the sealed bundle's lines (opened by seal.OpenBundle, read by bundle.NewReader)"})
 		}
 		v = append(v, golden.Member{Key: "sealed", Value: c.sealed})
+		switch {
+		case c.rule != "":
+			v = append(v, golden.Member{Key: "rule", Value: c.rule})
+		case c.informative != "":
+			v = append(v, golden.Member{Key: "informative", Value: c.informative})
+		}
 		plain, digest, err := openSealed([]byte(c.sealed), recipient)
 		if err != nil {
-			v = append(v, golden.Member{Key: "verdict", Value: "reject"}, golden.Member{Key: "because", Value: err.Error()})
+			v = append(v, golden.Member{Key: "verdict", Value: "reject"})
 		} else {
 			v = append(v, golden.Member{Key: "verdict", Value: "accept"}, golden.Member{Key: "plain", Value: plain}, golden.Member{Key: "digest", Value: digest})
 		}
+		// What §G.5.1.1 requires, whatever the stored file says: the
+		// writer's bundles open, and each case breaking a rule is
+		// rejected for that rule.
+		switch {
+		case c.stored && err != nil:
+			t.Errorf("%s: rejected: %v", c.name, err)
+		case c.rule != "" && err == nil:
+			t.Errorf("%s: accepted, though it breaks %q", c.name, c.rule)
+		case c.rule != "" && !strings.Contains(err.Error(), c.why):
+			t.Errorf("%s: rejected for another reason than %q: %v", c.name, c.rule, err)
+		}
 		vs = append(vs, v)
-	}
-	// What §G.5.1.1 requires of these, whatever the stored file says.
-	for _, v := range vs {
-		o := v.(obj)
-		name, verdict := o[0].Value.(string), ""
-		for _, m := range o {
-			if m.Key == "verdict" {
-				verdict = m.Value.(string)
-			}
-		}
-		accept := slices.Contains(storedBundles, name) || name == "last beside pl (before v0.73)" ||
-			name == "a blank line between sealed lines" || name == "envelope not canonical"
-		if (verdict == "accept") != accept {
-			t.Errorf("%s: %s", name, verdict)
-		}
 	}
 	if d := ids.Of([]byte(plainBundle)).String(); !strings.Contains(string(golden.Encode(t, vs[0])), d) {
 		t.Errorf("the sealed bundle's digest isn't the plain bundle's, %s", d)
 	}
 	golden.Check(t, "sealedbundle", obj{
 		{Key: "section", Value: "§G.5.1.1"},
-		{Key: "about", Value: "sealed bundles to the recipient seq(0x20) (keywrap.json): the envelope line, then each bundle line as a JWE under K_b with pl {bundle, line, last?}; the digest is the plain bundle's (§G.4.1). The stored bundles were drawn under a fixed seed and are decrypt vectors; the rejection cases reuse their envelope and lines, or seal a line under the same K_b with the IV seq(0xc0)[:12]"},
+		{Key: "about", Value: "sealed bundles to the recipient seq(0x20) (keywrap.json): the envelope line, then each bundle line as a JWE under K_b with pl {bundle, line, last?}; the digest is the plain bundle's (§G.4.1). The stored bundles were drawn under a fixed seed and are decrypt vectors; the rejection cases reuse their envelope and lines, or seal a line under the same K_b with the IV seq(0xc0)[:12]; each rejected case names the rule it breaks, and the informative ones, which the spec leaves open, give the reference's verdict only"},
 		{Key: "recipient_private", Value: golden.Hex(recipient.Bytes())},
 		{Key: "K_b", Value: golden.Hex(kb)},
 		{Key: "vectors", Value: vs},

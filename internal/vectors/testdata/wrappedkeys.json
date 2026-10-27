@@ -26,21 +26,23 @@
     {
       "name": "before v0.63: resource and suite",
       "fn": "seal.ParseWrappedKey",
-      "entry": "{\"kid\":\"demo#3\",\"resource\":\"derby\",\"suite\":\"hpke-base-0x0020-0x0001-0x0002\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8TOG6Eqnf60K-C4qBKtzgEMxSquvACiNWnsZ0uUaKGGZSHr_LEs5_dMI__ITj85RE\"}",
+      "entry": "{\"kid\":\"demo#3\",\"resource\":\"derby\",\"suite\":\"hpke-base-0x0020-0x0001-0x0002\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9E34sggfDNByASWelYWdNVtOtU-xJ7Y7qlAIQVA1FWwObtvcHOHj5_K40aEr7zYEQ\"}",
       "verdict": "accept",
-      "read as": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8TOG6Eqnf60K-C4qBKtzgEMxSquvACiNWnsZ0uUaKGGZSHr_LEs5_dMI__ITj85RE\"}"
+      "read as": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9E34sggfDNByASWelYWdNVtOtU-xJ7Y7qlAIQVA1FWwObtvcHOHj5_K40aEr7zYEQ\"}",
+      "key": "37a2b615272e7bdec36b97f35176a206caa2dbbef43d89b81aa5a4ee874a5c25"
     },
     {
       "name": "name and resource agreeing",
       "fn": "seal.ParseWrappedKey",
-      "entry": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"resource\":\"derby\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8TOG6Eqnf60K-C4qBKtzgEMxSquvACiNWnsZ0uUaKGGZSHr_LEs5_dMI__ITj85RE\"}",
+      "entry": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"resource\":\"derby\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9E34sggfDNByASWelYWdNVtOtU-xJ7Y7qlAIQVA1FWwObtvcHOHj5_K40aEr7zYEQ\"}",
       "verdict": "accept",
-      "read as": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8TOG6Eqnf60K-C4qBKtzgEMxSquvACiNWnsZ0uUaKGGZSHr_LEs5_dMI__ITj85RE\"}"
+      "read as": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9E34sggfDNByASWelYWdNVtOtU-xJ7Y7qlAIQVA1FWwObtvcHOHj5_K40aEr7zYEQ\"}",
+      "key": "37a2b615272e7bdec36b97f35176a206caa2dbbef43d89b81aa5a4ee874a5c25"
     },
     {
       "name": "name and resource differing",
       "fn": "seal.ParseWrappedKey",
-      "entry": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"resource\":\"cup\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8TOG6Eqnf60K-C4qBKtzgEMxSquvACiNWnsZ0uUaKGGZSHr_LEs5_dMI__ITj85RE\"}",
+      "entry": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"resource\":\"cup\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9E34sggfDNByASWelYWdNVtOtU-xJ7Y7qlAIQVA1FWwObtvcHOHj5_K40aEr7zYEQ\"}",
       "verdict": "reject"
     },
     {

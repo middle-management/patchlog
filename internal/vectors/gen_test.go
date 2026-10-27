@@ -108,17 +108,24 @@ func TestVectorRE2Escapes(t *testing.T) {
 	for _, c := range []struct {
 		name, re string
 		in       []string
+		// informative: a verdict that is the reference's choice, not
+		// one §6.6 states.
+		informative string
 	}{
-		{"BMP escape", esc(`^%u00e9$`), []string{"é", "e", esc(`%u00e9`)}},
-		{"surrogate pair", esc(`^%ud83d%ude00$`), []string{"😀", "?", esc(`%ud83d%ude00`)}},
-		{"escaped backslash", esc(`^\\u0041$`), []string{esc(`%u0041`), "A"}},
-		{"in a class", esc(`^[%u00e0-%u00ff]+$`), []string{"àéÿ", "a"}},
-		{"lone high surrogate", esc(`%ud800`), nil},
-		{"lone low surrogate", esc(`%udc00`), nil},
-		{"lone surrogate as \\x{…}", `\x{D800}`, nil},
-		{"high surrogate before a non-surrogate", esc(`%ud83d%u0041`), nil},
+		{name: "BMP escape", re: esc(`^%u00e9$`), in: []string{"é", "e", esc(`%u00e9`)}},
+		{name: "surrogate pair", re: esc(`^%ud83d%ude00$`), in: []string{"😀", "?", esc(`%ud83d%ude00`)}},
+		{name: "escaped backslash", re: esc(`^\\u0041$`), in: []string{esc(`%u0041`), "A"}},
+		{name: "in a class", re: esc(`^[%u00e0-%u00ff]+$`), in: []string{"àéÿ", "a"}},
+		{name: "lone high surrogate", re: esc(`%ud800`)},
+		{name: "lone low surrogate", re: esc(`%udc00`)},
+		{name: "lone surrogate as \\x{…}", re: `\x{D800}`,
+			informative: "the reference's choice: RE2 syntax accepts \\x{D800}, and §6.6 makes only a lone surrogate written as \\u refused"},
+		{name: "high surrogate before a non-surrogate", re: esc(`%ud83d%u0041`)},
 	} {
 		v := obj{{Key: "name", Value: c.name}, {Key: "fn", Value: "pattern.Translate, pattern.Compile"}, {Key: "pattern", Value: c.re}}
+		if c.informative != "" {
+			v = append(v, golden.Member{Key: "informative", Value: c.informative})
+		}
 		tr, err := pattern.Translate(c.re)
 		if c.in == nil {
 			if err == nil {
@@ -290,6 +297,13 @@ func TestVectorNoncharacters(t *testing.T) {
 			}
 			if (perr == nil) != (err == nil) {
 				t.Errorf("U+%04X %s: ParseInput %v, deployment %v", r, form, perr, err)
+			}
+			// §3.1's verdict, whatever the stored file says: refused (400)
+			// iff r is a noncharacter.
+			if nonchar := r >= 0xFDD0 && r <= 0xFDEF || r&0xFFFE == 0xFFFE; nonchar != (perr != nil) {
+				t.Errorf("U+%04X %s: ParseInput %v, want refused %v", r, form, perr, nonchar)
+			} else if ae := (*client.APIError)(nil); nonchar && !(errors.As(err, &ae) && ae.Status == 400) {
+				t.Errorf("U+%04X %s: deployment %v, want 400", r, form, err)
 			}
 			vs = append(vs, v)
 		}

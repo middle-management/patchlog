@@ -90,6 +90,7 @@
       "name": "lone surrogate as \\x{…}",
       "fn": "pattern.Translate, pattern.Compile",
       "pattern": "\\x{D800}",
+      "informative": "the reference's choice: RE2 syntax accepts \\x{D800}, and §6.6 makes only a lone surrogate written as \\u refused",
       "verdict": "refused"
     },
     {
