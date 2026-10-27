@@ -63,6 +63,52 @@ jobs:
           go-version-file: go.mod
       - run: go test ./...
 
+  # Every package's tests again with blob bytes in S3 (internal/s3blobs), on
+  # each backend: SeaweedFS's S3 gateway, a prefix of one bucket per test
+  # (internal/testenv, PATCHLOG_TEST_BLOBS). SeaweedFS needs a command,
+  # which service containers can't take, so a step starts it; without an
+  # identity configuration it accepts any credentials.
+  s3:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sqlite, postgres, dynamodb]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+      dynamodb:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8000:8000
+    env:
+      PATCHLOG_TEST_BACKEND: ${{ matrix.backend }}
+      PATCHLOG_TEST_PG: ${{ matrix.backend == 'postgres' && 'postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable' || '' }}
+      DDB_ENDPOINT: ${{ matrix.backend == 'dynamodb' && 'http://localhost:8000' || '' }}
+      PATCHLOG_TEST_BLOBS: s3://patchlog-test?region=us-east-1&endpoint=http://localhost:8333
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: start SeaweedFS
+        run: |
+          docker run -d --name seaweedfs -p 8333:8333 chrislusf/seaweedfs server -s3 -dir=/data
+          for i in $(seq 60); do curl -s -o /dev/null http://localhost:8333/ && exit 0; sleep 1; done
+          docker logs seaweedfs; exit 1
+      - run: go test ./...
+
   # Every package's tests again, on Postgres (Addendum D.8): each test that
   # opens a store gets a fresh database (internal/pgtest), including the
   # services' tests through clienttest.
