@@ -126,7 +126,7 @@ NS#<ns>                     LOG#<pos12>                         ns_log entry: id
 NS#<ns>                     RES#<name>                          resource: headPos, headId, state, horizonPos/Id/Base, keep, kept, snapRevs/Bytes
 NS#<ns>                     REV#<name>#<pos12>                  revision: id, parent (pos | {ns,name,pos} foreign), kind, first,
                                                                 patches|patchesRef, author, created, grantId, schemaRef,
-                                                                gesture?, undoes?, size?, digest?, epoch?
+                                                                gesture?, undoes?, signature?, size?, digest?, epoch?
 NS#<ns>                     DOC#<name>#HEAD                     head snapshot: revPos, doc|docRef
 NS#<ns>                     SNAP#<name>#<pos12>                 kept snapshot below a horizon (§8.6); intermediate (D.4) not built
 NS#<ns>                     PRUNING#<name>                      a prune whose content is still to go: horizonPos, kept positions
@@ -582,11 +582,9 @@ What landed, beyond the spike:
   backend lacks is its `lacks` 501, asked by the Engine method before
   anything else; everything the server can reach so answers 501 rather
   than falling through to SQL:
-  remote branches, sealed/e2e,
-  author signatures (which the gate would verify but the commit doesn't
-  store), rotation. Refused
-  configurations (`encryption`, `nonce: required`, `signatures:
-  required`, `base`, `successor`) are 501 at create and change time, as
+  remote branches, sealed/e2e, rotation. Refused
+  configurations (`encryption`, `nonce: required`, `base`,
+  `successor`) are 501 at create and change time, as
   §10 prescribes ("refuse at Open or at namespace-config time").
 - **One read path.** The serving reads (`ResourceHead/Raw/Rev/Log`,
   `NamespaceHead/Rev/Log/Heads`, the events and the long-poll) are the
@@ -706,6 +704,11 @@ What landed, beyond the spike:
   only the commit knows. So a page costs the gesture's markers — a
   user's few saves; GSI2 (§3) is the answer if gestures grow large.
   Purges remove the markers of what they purge.
+- **Author signatures** (§C.3.1). The gate's checks verify them as on
+  SQL (`checkSignatureShapes`, `checkSignatures`); the commit stores
+  each step's on its REV item (`signature`), which serving, archives
+  and the write's own answer return. `"signatures": "required"`
+  namespaces are created and changed as on SQL.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the
@@ -752,14 +755,14 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,319 top-level tests (pure unit tests included): 1,089 pass on
-DynamoDB and 230 skip — 194 as unsupported (116 encryption at rest,
-39 remote branches, 22 nonce-required namespaces, 9 author
-signatures, 6 the SQL write path's hooks, 2 sealed), 36 on their own
-conditions (Postgres-only tests).
+1,319 top-level tests (pure unit tests included): 1,098 pass on
+DynamoDB and 221 skip — 185 as unsupported (116 encryption at rest,
+39 remote branches, 22 nonce-required namespaces, 6 the SQL write
+path's hooks, 2 sealed), 36 on their own conditions (Postgres-only
+tests).
 The known list is empty: no test answers differently from the SQL
 backends. A test that skips partway has asserted everything before
-its skip, so the phase-1 surface is covered beyond the 1,089.
+its skip, so the phase-1 surface is covered beyond the 1,098.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on

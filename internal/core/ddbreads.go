@@ -211,6 +211,9 @@ func (r *ddbReads) revRowOf(ns string, ri *ddb.RevInfo) *revRow {
 	if ri.Undoes != "" {
 		row.undoes.String, row.undoes.Valid = ri.Undoes, true
 	}
+	if ri.Signature != "" {
+		row.signature.String, row.signature.Valid = ri.Signature, true
+	}
 	if ri.SchemaRef != "" {
 		r.schemaRefs[h] = ri.SchemaRef
 	}

@@ -26,18 +26,9 @@ const ddbAttempts = 8
 // writeItems is a resource write or a batch on DynamoDB.
 func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun bool) (res *WriteResult, err error) {
 	e := b.e
-	if req.Signature != "" {
-		return nil, ddbUnsupported("author signatures")
-	}
 	for _, it := range items {
 		if it.Resource == KeyringName {
 			return nil, ddbUnsupported("e2e keyrings")
-		}
-		for _, st := range it.Steps {
-			if st.Signature != "" {
-				// The gate would verify one, but the commit stores none.
-				return nil, ddbUnsupported("author signatures")
-			}
 		}
 	}
 	ctx, span := e.dbSpan(ctx, "core.db.update")
@@ -146,7 +137,7 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 			}
 		}
 		for j, step := range s.steps {
-			cs := ddb.CommitStep{ID: step.id.String(), Tombstone: step.del, Gesture: s.Steps[j].Gesture, Undoes: s.Steps[j].Undoes}
+			cs := ddb.CommitStep{ID: step.id.String(), Tombstone: step.del, Gesture: s.Steps[j].Gesture, Undoes: s.Steps[j].Undoes, Signature: s.Steps[j].Signature}
 			if !step.del {
 				cs.SchemaRef = step.typed
 			}
@@ -232,7 +223,7 @@ func (r *ddbReads) attachOf(s *itemState) ([]ddb.BlobAttach, []ddb.BlobPending) 
 // answers it (logEntry of resolve.go), less its grant (grantRefOf).
 func ddbStepEntry(c *ddb.Commit, it *ddb.CommitItem, j int) *LogEntry {
 	st := it.Steps[j]
-	le := &LogEntry{ID: st.ID, Parent: st.ParentID, Kind: "rev", Author: c.Author, Created: formatTime(c.Created), Gesture: st.Gesture, Undoes: st.Undoes}
+	le := &LogEntry{ID: st.ID, Parent: st.ParentID, Kind: "rev", Author: c.Author, Created: formatTime(c.Created), Gesture: st.Gesture, Undoes: st.Undoes, Signature: st.Signature}
 	if st.Tombstone {
 		le.Kind = "tombstone"
 	} else {

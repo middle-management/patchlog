@@ -163,6 +163,9 @@ type CommitStep struct {
 	Gesture   string
 	Undoes    string
 	SchemaRef string // the schema revision path the document was typed by
+	// Signature is the step's author signature (§C.3.1), "" for none:
+	// unhashed, stored and served with the revision.
+	Signature string
 }
 
 // CommitResult is a committed write's entry.
@@ -500,7 +503,7 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 	for i := range it.Steps {
 		st := &it.Steps[i]
 		pos++
-		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos, grantID: c.Grant, schemaRef: st.SchemaRef}
+		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos, grantID: c.Grant, schemaRef: st.SchemaRef, signature: st.Signature}
 		if pos == 1 {
 			r.parentNS, r.parentPos = it.ParentNS, it.ParentPos
 		}

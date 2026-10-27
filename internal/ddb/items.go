@@ -188,6 +188,7 @@ type revRow struct {
 	logPos    uint64 // the namespace entry that committed it: the retry lookup's answer
 	grantID   string // the grant it was written under, "" for none
 	schemaRef string // the schema revision path it was typed by
+	signature string // the author signature (§C.3.1), "" for none
 	// parentNS and parentPos name a first revision's foreign parent: a
 	// revision of the same name in the base it was read through from
 	// (§7.6).
@@ -228,6 +229,9 @@ func (r *revRow) item() item {
 	}
 	if r.schemaRef != "" {
 		it["schemaRef"] = avS(r.schemaRef)
+	}
+	if r.signature != "" {
+		it["signature"] = avS(r.signature)
 	}
 	if r.parentNS != "" {
 		it["parentNs"], it["parentPos"] = avS(r.parentNS), avN(r.parentPos)

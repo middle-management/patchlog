@@ -238,6 +238,7 @@ func scanRevInfo(i item) RevInfo {
 		LogPos:    i.n("logPos"),
 		GrantID:   i.s("grantId"),
 		SchemaRef: i.s("schemaRef"),
+		Signature: i.s("signature"),
 		ParentNS:  i.s("parentNs"), ParentPos: i.n("parentPos"),
 		Pruned: i.s("kind") != "tombstone" && !i.has("patches"),
 	}

@@ -9,10 +9,10 @@ package core
 //
 // Deliberate gaps, all surfaced as 501 "unsupported" (lacks, or a read
 // that panics with it): remote branches, sealed and e2e
-// namespaces, nonce-required namespaces, author signatures,
-// intermediate snapshots (revisions fold from the genesis, or from a
+// namespaces, nonce-required namespaces, intermediate snapshots (revisions fold from the genesis, or from a
 // pruning horizon). Grants, edge grants, blobs, $schema validation and
 // schemaReads, purges, pruning, retention and archives, gestures listing,
+// author signatures,
 // local branches and their drafts and merges, tombstones and
 // restores, multi-step items and batches (§7.5, bounded by the
 // transaction's 100 actions) work.
@@ -196,10 +196,6 @@ func ddbRefusals(cfg *Config) *Error {
 		return ddbUnsupported("nonce-required namespaces")
 	case cfg.Base != nil && cfg.Base.Origin != "":
 		return ddbUnsupported("remote branches")
-	case cfg.SignaturesRequired:
-		// Writes can't carry signatures on this backend, so a
-		// namespace requiring them would take unsigned ones (§C.3.1).
-		return ddbUnsupported("author signatures")
 	}
 	return nil
 }

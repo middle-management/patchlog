@@ -32,6 +32,7 @@ type RevInfo struct {
 	LogPos    uint64 // the namespace entry that committed it (0: unknown)
 	GrantID   string // the grant it was written under, "" for none
 	SchemaRef string
+	Signature string // the author signature (§C.3.1)
 	// ParentNS and ParentPos are a first revision's foreign parent.
 	ParentNS  string
 	ParentPos uint64
