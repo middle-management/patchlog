@@ -202,10 +202,6 @@ func ddbAsErr(err error) *Error {
 // ddbRefusals are the configuration features phase 1 refuses, shared by
 // creates and changes.
 func ddbRefusals(cfg *Config) *Error {
-	switch {
-	case cfg.level == levelE2E:
-		return ddbUnsupported("e2e namespaces")
-	}
 	return nil
 }
 

@@ -253,6 +253,7 @@ func scanRevInfo(i item) RevInfo {
 		SchemaRef: i.s("schemaRef"),
 		Signature: i.s("signature"),
 		Epoch:     int(i.n("epoch")),
+		Declared:  splitList(i.s("declared")),
 		ParentNS:  i.s("parentNs"), ParentPos: i.n("parentPos"),
 		Pruned: i.s("kind") != "tombstone" && !i.has("patches"),
 	}
@@ -267,4 +268,12 @@ func (s *Store) open(ctx context.Context, ns, name, kind, key, raw string) (stri
 		return raw, nil
 	}
 	return s.Open(ctx, ns, name, kind, key, raw)
+}
+
+// splitList splits a comma-separated list; nil for "".
+func splitList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
 }

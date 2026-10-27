@@ -28,11 +28,6 @@ const ddbAttempts = 8
 // writeItems is a resource write or a batch on DynamoDB.
 func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun bool) (res *WriteResult, err error) {
 	e := b.e
-	for _, it := range items {
-		if it.Resource == KeyringName {
-			return nil, ddbUnsupported("e2e keyrings")
-		}
-	}
 	ctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
 	drawn := false
@@ -153,7 +148,9 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 		entries = append(entries, map[string]any{"kind": "config", "target": cp.id.String()})
 	}
 	for _, s := range p.st {
-		it := ddb.CommitItem{Name: s.Resource}
+		// e2e content has no documents here (§E.3): its steps keep their
+		// sealed patch sets and declared blobs.
+		it := ddb.CommitItem{Name: s.Resource, E2E: g.e2eContent(p.n, s.Resource)}
 		if h := s.view.head; h != nil && r.revs[h.seq].key.ns != ns {
 			// Read through from a base (§7.6): the resource's own chain
 			// starts here, its first revision continuing the base's.
@@ -176,7 +173,15 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 			if step.parentID != nil {
 				cs.ParentID = step.parentID.String()
 			}
-			if !step.del {
+			switch {
+			case step.del:
+			case it.E2E:
+				cs.Patches = string(step.canon)
+				for bid := range step.blobs {
+					cs.Declared = append(cs.Declared, bid.String())
+				}
+				slices.Sort(cs.Declared)
+			default:
 				cs.Patches = string(step.canon)
 				if step.docCanon != nil {
 					cs.Doc = string(step.docCanon)

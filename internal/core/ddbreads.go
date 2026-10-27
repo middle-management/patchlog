@@ -730,7 +730,6 @@ func (r *ddbReads) referencedUpTo(res, max int64, bid ids.ID) bool {
 	r.must(err)
 	return b != nil && b.RefPos > 0 && b.RefPos <= r.revs[max].key.pos
 }
-func (r *ddbReads) declaredAt(row *revRow) []ids.ID { panic(ddbUnsupported("e2e namespaces")) }
 
 // dek: the grants key for grantsDEK, else the resource's.
 func (r *ddbReads) dek(res int64, create bool) []byte {
@@ -744,9 +743,6 @@ func (r *ddbReads) dek(res int64, create bool) []byte {
 	}
 	r.must(err)
 	return k
-}
-func (r *ddbReads) e2eEpochOK(n *nsRow, cfg *Config, e int) bool {
-	panic(ddbUnsupported("sealed namespaces"))
 }
 
 // --- grants ---
@@ -1076,8 +1072,6 @@ func (r *ddbReads) entryConfig(seq int64) (int64, string) {
 	return h, string(jsonv.Canonical(r.cfgRow(h).Doc))
 }
 
-func (r *ddbReads) e2eSnapshot(row *revRow) string  { panic(ddbUnsupported("e2e namespaces")) }
-func (r *ddbReads) e2eFoldSince(row *revRow) string { panic(ddbUnsupported("e2e namespaces")) }
 
 func (r *ddbReads) allNamespaces() []*nsRow {
 	var out []*nsRow

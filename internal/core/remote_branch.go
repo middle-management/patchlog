@@ -1142,7 +1142,7 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 // remoteShadows returns the shadows a remote branch reads through, its
 // base's first, then its bases'; nil if n isn't a remote branch. All of
 // them are the remote side (§7.6).
-func (t *tx) remoteShadows(n *nsRow) []*nsRow {
+func (t *gate) remoteShadows(n *nsRow) []*nsRow {
 	var out []*nsRow
 	for s := t.remoteShadow(n); s != nil; {
 		out = append(out, s)

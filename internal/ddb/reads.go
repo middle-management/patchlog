@@ -34,6 +34,9 @@ type RevInfo struct {
 	SchemaRef string
 	Signature string // the author signature (§C.3.1)
 	Epoch     int    // the epoch it was written in (sealed namespaces)
+	// Declared are the blobs an e2e revision's document references, as
+	// its sealed op declared them (§E.3.1).
+	Declared []string
 	// ParentNS and ParentPos are a first revision's foreign parent.
 	ParentNS  string
 	ParentPos uint64

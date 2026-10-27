@@ -332,7 +332,7 @@ func (t *tx) e2eSnapshot(row *revRow) string {
 // keyring's entries wrapped to the grant's enc, for the epochs the grant
 // may have (the §E.2.3 range). The keyring is read as n sees it, so a
 // branch without its own relays its base's.
-func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error) {
+func (t *gate) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error) {
 	enc := recipientOf(a)
 	if enc == nil {
 		return nil, invalid("e2e namespaces relay only wrapped keys: the grant's root block needs enc, an X25519 public key (§E.2.3, §E.3.2)")
@@ -352,7 +352,7 @@ func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[str
 
 // relayKeyring appends to out the entries for rid of the keyring as n sees
 // it, unless one of the same namespace was relayed already.
-func (t *tx) relayKeyring(out []map[string]any, seen map[string]bool, n *nsRow, a *actor, kr KeysRequest, rid string) []map[string]any {
+func (t *gate) relayKeyring(out []map[string]any, seen map[string]bool, n *nsRow, a *actor, kr KeysRequest, rid string) []map[string]any {
 	v := t.resolve(n, KeyringName, nil)
 	if v.state != Live || v.head == nil {
 		return out

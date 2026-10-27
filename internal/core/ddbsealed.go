@@ -58,9 +58,15 @@ func (b *ddbBackend) epochKeyFor(ctx context.Context, ns string, epoch int) ([]b
 // beginsEpoch is the key of the epoch a namespace document cfg of ns
 // begins (sealedConfigWritten of sealed.go), old being the one before
 // (nil for a new namespace): nil if it begins none.
+//
+// An e2e namespace's epoch has no key here (§E.3): its item records only
+// when the epoch began (e2eConfigWritten of e2e.go).
 func (b *ddbBackend) beginsEpoch(ctx context.Context, ns string, old, cfg *Config) (*ddb.EpochKey, error) {
-	if cfg.level != levelSealed || old != nil && old.level == levelSealed && old.Epoch == cfg.Epoch {
+	if cfg.level != levelSealed && cfg.level != levelE2E || old != nil && old.level == cfg.level && old.Epoch == cfg.Epoch {
 		return nil, nil
+	}
+	if cfg.level == levelE2E {
+		return &ddb.EpochKey{Epoch: cfg.Epoch}, nil
 	}
 	ks := b.e.opt.KeyStore
 	if ks == nil {
@@ -176,10 +182,8 @@ func (r *ddbReads) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
 }
 
 // epochStarts: n's epoch keys, which record when each epoch began.
+// An e2e namespace's (e2e_epochs) are the same items, without keys.
 func (r *ddbReads) epochStarts(table string, ns int64, max int) []epochStart {
-	if table != `epoch_keys` {
-		panic(ddbUnsupported("e2e namespaces"))
-	}
 	ks, err := r.s.EpochKeys(r.ctx, r.nsName(ns))
 	r.must(err)
 	var out []epochStart
@@ -191,9 +195,6 @@ func (r *ddbReads) epochStarts(table string, ns int64, max int) []epochStart {
 	return out
 }
 
-func (r *ddbReads) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error) {
-	panic(ddbUnsupported("e2e namespaces"))
-}
 
 // --- writes ---
 

@@ -190,6 +190,9 @@ type revRow struct {
 	schemaRef string // the schema revision path it was typed by
 	signature string // the author signature (§C.3.1), "" for none
 	epoch     int    // the epoch it was written in, sealed namespaces only
+	// declared lists the blobs an e2e revision's document references,
+	// as its sealed op declared them (§E.3.1), comma-separated.
+	declared string
 	// parentNS and parentPos name a first revision's foreign parent: a
 	// revision of the same name in the base it was read through from
 	// (§7.6).
@@ -236,6 +239,9 @@ func (r *revRow) item() item {
 	}
 	if r.epoch > 0 {
 		it["epoch"] = avN(uint64(r.epoch))
+	}
+	if r.declared != "" {
+		it["declared"] = avS(r.declared)
 	}
 	if r.parentNS != "" {
 		it["parentNs"], it["parentPos"] = avS(r.parentNS), avN(r.parentPos)
