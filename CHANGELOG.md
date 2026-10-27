@@ -298,28 +298,34 @@ the plan states.
     `cmd/capacity`: about +1.2 ms per write for one writer, and about 25% lower peak throughput
     for 32 writers on one namespace (a hot bucket's row lock).
 - **Schemas written now follow v0.73's dialect** (§6.1, §6.2 step 5, §6.5, §6.6): `$id` in any
-  subschema, root included, and `$schema` in any subschema but the root are `422 invalid`
-  (`$id` was `schema_ref`); a `format` draft 2020-12 doesn't define is `422 invalid`, and
-  `semver` and `period` are no longer asserted for such schemas; `idn-email` and
-  `idn-hostname` are checked by UTS 46 processing; `definitions` is accepted as `$defs` is.
-  Regular expressions (`pattern`, `patternProperties`, `format: regex`) read `\uXXXX` as a code
-  point, join surrogate pairs and refuse lone surrogates. Schemas stored before the upgrade keep
-  compiling and validating as they did (§6.1, invariant 3), also inside a new schema's `$ref`
-  closure, and E3 clients re-validate stored schema revisions in a fold under those rules. A
-  revision reached by any `$ref` whose path is a revision path counts as referenced, whatever
-  its fragment, for `in_use` purges, the index's reference rows and bundle renames. **Each
-  revision now records the schema rules it was written under** (the database migration adds
-  `revisions.rules`; revision ids are unchanged): revisions stored before, and those remote
-  branches mirror, count as written under the earlier rules; a schema revision whose id rows of
-  the namespace written, its local bases or a batch's local source already have (a fast-forward
-  merge, a same-deployment import, a branch's replay) is a copy of them and keeps their marker,
-  so core merges, imports and replays of stored schema documents are no longer refused by
-  today's write rules; and a document is validated under the rules of the schema revision it
-  names, each revision of its `$ref` closure compiled under its own marker, so schemas written
-  now assert `idn-email` and `idn-hostname` while a revision stored before, reached directly or
-  through a new schema's `$ref`, keeps its `semver` and `period` assertions and its patterns as
-  RE2 took them. Documents from another deployment, namespace documents included, are judged by
-  today's rules (§G.4.4; F-S3 default).
+  subschema, root included, and `$schema` in any subschema but the root are `422 invalid` (`$id`
+  was `schema_ref`); a `format` draft 2020-12 doesn't define is `422 invalid`, and `semver` and
+  `period` are no longer asserted for such schemas; `idn-email` and `idn-hostname` are checked by
+  UTS 46 processing; `definitions` is accepted as `$defs` is. Regular expressions (`pattern`,
+  `patternProperties`, `format: regex`) read `\uXXXX` as a code point, join surrogate pairs and
+  refuse lone surrogates. Schemas stored before the upgrade keep compiling and validating as they
+  did (§6.1, invariant 3), also inside a new schema's `$ref` closure. A revision reached by any
+  `$ref` whose path is a revision path counts as referenced, whatever its fragment, for `in_use`
+  purges, the index's reference rows and bundle renames. **Each revision now records the schema
+  rules it was written under** (the database migration adds `revisions.rules`; revision ids are
+  unchanged): revisions stored before count as written under the earlier rules; a schema revision
+  whose id rows of the namespace written, its local bases or a batch's local source already have
+  (a fast-forward merge, a same-deployment import, a branch's replay) is a copy of them and keeps
+  their marker, so core merges, imports and replays of stored schema documents are no longer
+  refused by today's write rules; and a document is validated under the rules of the schema
+  revision it names, each revision of its `$ref` closure compiled under its own marker, so schemas
+  written now assert `idn-email` and `idn-hostname` while a revision stored before, reached
+  directly or through a new schema's `$ref`, keeps its `semver` and `period` assertions and its
+  patterns as RE2 took them. Documents from another deployment, namespace documents included, are
+  judged by today's rules (§G.4.4; F-S3 default). **A schema revision read in the clear carries
+  its marker** in a new response header, `X-Schema-Rules: v0.73` or `legacy` (an addition; sealed
+  and e2e namespaces send none, and a server that sends none compiles every schema as `legacy`;
+  `client.Doc.Rules`, `client.SchemaRules`). A remote branch's schema mirror keeps the marker its
+  base serves each revision with, so a revision compiles alike on both (a base that sends none is
+  mirrored as `legacy`, as before; F-S1). E3 clients validate a typed document, when sealing it
+  and when a fold re-validates it, under each closure revision's served marker, as the core
+  validates it; they used to apply the earlier rules to every revision, so `idn-email` and
+  `idn-hostname` were never asserted at E3.
 - **Blob uploads, copies and schema references** (§2.1, §6.1, §7.1, §7.8, §E.2.3, §12.1):
   - An upload or copy (`PUT …/blob/{bid}`) that sends `If-Match` or `If-None-Match` is `428
     precondition_required` at check 4, after authorisation, rate limits, purges, a frozen
@@ -443,11 +449,11 @@ the plan states.
     with no entries starts and waits for its first entry; an unknown non-empty `since` stays
     `404`, a purged resource `410`. A namespace stream ends after its `purge-ns` event, and one
     whose `since` or `Last-Event-ID` names that entry sends the headers and ends; a follower
-    restarted at that entry ends with `ErrPurged` (it used to reconnect or poll forever). A
-    stream judges its read check again before each page and each keep-alive comment, ending
-    without sending anything when the check fails (a resource stream sent keep-alives without
-    one), and ends at the latest when the grant (its earliest block `exp`) or edge cookie it was
-    admitted under expires, even when idle.
+    restarted at that entry ends with `ErrPurged` (it used to reconnect or poll forever), and the
+    playground's live namespace stream closes on that event. A stream judges its read check again
+    before each page and each keep-alive comment, ending without sending anything when the check
+    fails (a resource stream sent keep-alives without one), and ends at the latest when the grant
+    (its earliest block `exp`) or edge cookie it was admitted under expires, even when idle.
   - **Breaking:** a resource stream's `purge` and `prune` events carry, as data, the namespace
     entry that records them without its `id` and `prev`, and have no SSE `id:` line, so an
     EventSource's `Last-Event-ID` stays the last revision and a reconnect no longer gets `404`;
@@ -540,7 +546,12 @@ the plan states.
     key; the epoch must be at least 1, F-E1 default). The server records the raise point (new
     table `e2e_raises`) and an `e2e_epochs` row, and writes from the raising entry on go through
     the E3 gate. A raise from `sealed` is still `422 invalid` at `/encryption`: what is stored
-    before it must stay sealed under the last epoch before the raise, which wave 4 serves.
+    before it must stay sealed under the last epoch before the raise, which wave 4 serves. What
+    was stored before a raise from none or at-rest stays usable: a schema revision written before
+    it still resolves for documents elsewhere that pin it (only one written at e2e is
+    `schema_unavailable`, §6.1), and `patchlog archive restore` checks each archived patch set by
+    the level it was written at, so the plaintext history of a resource pruned before the raise,
+    or archived by an E3 prune after it, comes back and clears the horizon (it was skipped).
   - **Trusted senders (breaking for keyrings stored before v0.63):** writers, prunes,
     `AddReader`, re-encrypted merges and services' derived views seal only under an epoch key
     whose keyring entry comes from a sender they trust, never under one without a sender: a key
@@ -757,7 +768,10 @@ the plan states.
   - A `503 behind` has a generic message, and its `ns` member names the awaited namespace only to
     readers with unrestricted read of the catalog. A catalog whose keys the service lacks is
     `404 not_found`, and one whose keys it can't fetch yet `503 behind`; the code `skipped` is
-    gone.
+    gone. A followed namespace raised meanwhile to a level whose keys a service lacks as
+    configured (to e2e without `-enc-key`) is skipped and unfollowed when the raise is applied,
+    in the index and the tree service alike, so its queries are `404` at once, as after a
+    restart, instead of `503 behind` forever.
   - A sealed catalog's listing is sealed whole only for `g/all` of a catalog that isn't public,
     per entry otherwise; whole listings earlier releases stored elsewhere are dropped at start.
   - `exchangeRate` buckets are shared by every instance on one `-db`, with an atomic
@@ -877,7 +891,10 @@ the plan states.
     are `403` (was `401`), as `/principal`'s `operator` says, and the refusal is cached. In
     `-gateway` mode over a core with authentication disabled, the Basic user name is the
     `X-Author` of the user's requests and keys the user; whether authentication is disabled is
-    read again every `VerifyEvery`, and after the core refuses an `X-Author`.
+    read again every `VerifyEvery`, and after the core refuses an `X-Author`. Over such a core no
+    tree is tree-derived (below), since a user has no grant a catalog service could issue
+    against: files are read and written as the user's `X-Author`, in local mode too (`-author`),
+    as through a plain tree service (they were `401`, or `502` in local mode).
   - A user's own entries (§H.4 "Others' writes") also include log entries under the user's sub
     and a kid naming their key, or the catalog's key in a tree with tree-derived access, and,
     with authentication disabled, entries with the user's `X-Author`.

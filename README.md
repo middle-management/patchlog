@@ -1849,7 +1849,10 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   into; a frozen one refuses the history with `409 frozen`, a purged one with `410 purged`, and
   a path holding the base's history purged with `410 gone`. A path whose chain neither contains
   A's nor is a prefix of it, or a branch, is `409 name_conflict`; a prefix is extended. A schema
-  namespace answering `401`/`403` at A is `422 schema_unavailable`.
+  namespace answering `401`/`403` at A is `422 schema_unavailable`. Each mirrored schema revision
+  keeps the rules marker A serves it with (`X-Schema-Rules`, read with a `HEAD` of the revision),
+  so B validates with it as A does (F-S1); one A sends no marker for, as a server from before
+  markers or a sealed namespace, is mirrored as `legacy`.
 - **Required nonces (§C.7).** A branch of a base whose current namespace document requires
   nonces when the branch is created must be created with `"nonce": "required"` (`422`
   otherwise), or merging it back would fail. A remote branch isn't a dependent at A, so A may
@@ -2099,9 +2102,11 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   is created, for a branch of an e2e base (which must be e2e), or by raising an existing
   namespace from none or at-rest (a `*` key, `encryption.epoch` at least 1; v0.73): the server
   records the raise point (`e2e_raises`) and an `e2e_epochs` row, writes from the raising entry
-  on go through the E3 gate, and what was written before stays as it was stored. A raise from
-  sealed is `422` until the server serves what came before it sealed under the last epoch before
-  the raise (wave 4). Levels are never lowered.
+  on go through the E3 gate, and what was written before stays as it was stored: a schema
+  revision from before the raise still resolves for the documents that pin it, and an archive
+  of that history restores whether a prune wrote it before the raise or an E3 prune after it. A
+  raise from sealed is `422` until the server serves what came before it sealed under the last
+  epoch before the raise (wave 4). Levels are never lowered.
 - **Writes.** A create, append or restore carries exactly `[{"op":"sealed","value":"<JWE>"}]`
   (or `[]` for a restore), else `422 invalid`. The JWE (`seal.SealPatchSet`: `alg dir`, `enc
   A256GCM`) binds `kid: "{ns}#{e}"` and `pl: { ns, name, parent }` (`parent` `""` for genesis, the
@@ -2127,7 +2132,7 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   checked as usual.
 - **No documents on the server.** No head documents, intermediate snapshots or document cache
   for e2e content; the `$schema` index (§6.1 `in_use`, prune protection) sees nothing, and a
-  `$schema` into an e2e namespace is `schema_unavailable`.
+  `$schema` naming a revision written while its namespace was e2e is `schema_unavailable`.
 - **Reads.** `GET /r/{ns}/{name}` redirects as usual. `GET /r/{ns}/{name}/rev/{id}` (other
   than a pruning horizon, below) answers `302` with `X-E2E: fold`, `ETag`/`X-Revision` and `Location:
   /r/{ns}/{name}/rev/{id}/log?since={s}`, where `s` is the latest client-supplied snapshot at or
@@ -2275,8 +2280,9 @@ every namespace it trusts (started with a fresh database, rebuilt, or trusting o
 the head each one's follower read when it started, not just a first log page, rather than show
 every placement of a namespace not yet followed as missing; once caught up, a restart on the
 same database doesn't wait again. One it can't follow (purged, skipped for its keys as
-configured, refused or absent at the core) isn't waited for until the core serves it again, and a
-`?min=` naming it is `400`; one whose epoch key can't be fetched for the moment (the core
+configured, also when it is raised to such a level while followed, refused or absent at the
+core) isn't waited for until the core serves it again, and a `?min=` naming it is `400`; one
+whose epoch key can't be fetched for the moment (the core
 unreachable, a `5xx`, a `429`), sealed or end-to-end (its relay's keys and its keyring both),
 is skipped but still waited for. A namespace the catalog stops
 trusting loses its catch-up, also one its follower reports after that (once stopped, also after
@@ -3328,7 +3334,9 @@ only.
   read (`404` when stale); it deletes no folder (`403`), moves a folder only after reading the
   folders above the destination (`403` when it can't), and unlinks one path of a file placed in
   several folders from that folder only, from the node's document or the catalog's answer
-  (`403` when neither can be read).
+  (`403` when neither can be read). Over a core with authentication disabled no tree is
+  tree-derived: every request there counts as holding a `*` key (§1), so files are read and
+  written as the user's `X-Author`, as through a plain tree service.
 - **Read-your-writes** through a tree service, which lags the core. After a user's write through
   this server (a new file or folder, a rename, a move, a delete, an edit, wherever it is made, with
   any of their tokens), that user's listings of a tree carry `?min={ns}:{ns_id}` for each namespace
@@ -4043,8 +4051,9 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
 - **Additions to the D.2 layout**: `namespaces.head_seq/config_seq/base_config_seq`,
   `ns_log.body` (the canonical entry exactly as hashed) and `ns_log.config_seq`,
   `ns_config.doc`, `revisions.signature/schema_ref`, `revisions.rules` (the schema rules a
-  revision was written under, v0.73), `revisions.size/digest` (a head's
-  document, for `/heads`, about 40 bytes a row: see
+  revision was written under, v0.73, served with a schema revision read in the clear as
+  `X-Schema-Rules: v0.73` or `legacy`, so E3 clients and remote mirrors compile it alike),
+  `revisions.size/digest` (a head's document, for `/heads`, about 40 bytes a row: see
   [Files and sync clients](#files-and-sync-clients-71-74-78-81)),
   `resources.keep`, `heads.seq`, `deks`
   (wrapped data keys of encryption at rest, Addendum E.1), `epoch_keys`, `rev_epochs` and
