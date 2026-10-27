@@ -152,6 +152,15 @@ type e2eSchemas struct {
 	m      map[string]any  // schema revision path -> document, in its own namespace
 	drafts map[string]any  // schema revision path -> document drafted in a branch (§6.1)
 	branch map[string]bool // namespace -> is a branch
+	// rules and draftRules are the markers the server served m's and
+	// drafts' revisions with (Doc.Rules): each compiles under its own, as
+	// the core compiles it (§6.1).
+	rules, draftRules map[string]schema.Rules
+}
+
+func newE2ESchemas() *e2eSchemas {
+	return &e2eSchemas{v: schema.NewValidator(), m: map[string]any{}, drafts: map[string]any{}, branch: map[string]bool{},
+		rules: map[string]schema.Rules{}, draftRules: map[string]schema.Rules{}}
 }
 
 // E2E returns an e2e view of c. recipient is the private key whose public
@@ -160,7 +169,7 @@ type e2eSchemas struct {
 func (c *Client) E2E(recipient *ecdh.PrivateKey) *E2E {
 	return &E2E{c: c, recipient: recipient,
 		keys:    &e2eKeys{m: map[string][]byte{}, from: map[string]string{}},
-		schemas: &e2eSchemas{v: schema.NewValidator(), m: map[string]any{}, drafts: map[string]any{}, branch: map[string]bool{}},
+		schemas: newE2ESchemas(),
 		pads:    &e2ePads{m: map[string]*padHistory{}},
 		forks:   &e2eForks{m: map[string][]string{}}}
 }
@@ -1607,10 +1616,13 @@ func (e *errSchemaLoad) Unwrap() error { return e.err }
 
 // validate checks doc against its $schema (§6.1 forms), fetching schemas
 // through the client. It returns a message for an invalid document, or an
-// error when a schema couldn't be fetched. stored is for a revision a fold
-// re-validates, which is held to the rules it was written under (§6.1):
-// Legacy, until revisions keep their markers, so a schema document an
-// earlier version accepted still folds.
+// error when a schema couldn't be fetched. A typed document validates
+// against the revision it names, each revision of whose $ref closure
+// compiles under the marker its server serves it with (Doc.Rules: Legacy
+// where it sends none), as the core validates it (§6.1). stored is for a
+// revision a fold re-validates, which is held to the rules it was written
+// under: a schema document there is checked as stored (Legacy), since its
+// own marker isn't known, so one an earlier version accepted still folds.
 func (x *E2E) validate(ctx context.Context, target string, doc any, stored bool) (string, error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
@@ -1656,12 +1668,24 @@ func (x *E2E) validate(ctx context.Context, target string, doc any, stored bool)
 		}
 		x.schemas.mu.Lock()
 		if r.NS == ref.NS {
-			x.schemas.m[ref.Path()] = r.Doc.Value
+			x.schemas.m[ref.Path()], x.schemas.rules[ref.Path()] = r.Doc.Value, r.Doc.Rules
 		} else {
-			x.schemas.drafts[ref.Path()] = r.Doc.Value
+			x.schemas.drafts[ref.Path()], x.schemas.draftRules[ref.Path()] = r.Doc.Value, r.Doc.Rules
 		}
 		x.schemas.mu.Unlock()
 		return r.Doc.Value, nil
+	}
+	// The marker of a revision load returned, which it fetched first.
+	rulesOf := func(ref schema.Ref) schema.Rules {
+		x.schemas.mu.Lock()
+		defer x.schemas.mu.Unlock()
+		if r, ok := x.schemas.rules[ref.Path()]; ok {
+			return r
+		}
+		if r, ok := x.schemas.draftRules[ref.Path()]; ok && drafts {
+			return r
+		}
+		return schema.Legacy
 	}
 	// The validator keeps compiled schemas, so whether each revision of the
 	// closure resolves for this target is checked first.
@@ -1688,12 +1712,11 @@ func (x *E2E) validate(ctx context.Context, target string, doc any, stored bool)
 			}
 		}
 	}
-	var err error
+	rules := schema.V073 // a schema document written now
 	if stored {
-		err = x.schemas.v.ValidateRules(doc, load, schema.Legacy)
-	} else {
-		err = x.schemas.v.Validate(doc, load)
+		rules = schema.Legacy
 	}
+	err := x.schemas.v.ValidateMarked(doc, load, rules, rulesOf)
 	if err == nil {
 		return "", nil
 	}
