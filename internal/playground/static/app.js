@@ -1588,6 +1588,19 @@ function onStreamEvent(kind, s, type, ev) {
   $('feedCount').textContent = feed.children.length + ' shown';
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(async () => { await refreshNS(); if (S.res) await refreshRes(); }, 250);
+  // A namespace stream ends after its purge-ns entry, and the server ends every reconnect at once (§7.3): left open,
+  // the EventSource would reconnect every few seconds for as long as the page stays open.
+  if (kind === 'ns' && type === 'purge-ns') endStream(kind, s, 'ended (namespace purged)');
+}
+/* endStream closes stream s of kind for good, as the server ended it, saying why. */
+function endStream(kind, s, why) {
+  s.es.close();
+  if (streams[kind] !== s) return;
+  streams[kind] = null;
+  $(kind === 'ns' ? 'liveNs' : 'liveRes').checked = false;
+  s.entry.statusText = 'closed'; s.entry.resBody = (s.entry.resBody || '') + `\n(${why})`; renderEntry(s.entry);
+  setStreamState(kind, why, 'warn');
+  updateLiveUrls();
 }
 function restartStreams(only) {
   for (const kind of ['ns', 'res']) {
