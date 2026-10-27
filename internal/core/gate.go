@@ -26,76 +26,119 @@ import (
 // their revisions, configurations, blobs, keys, branches and schemas, the
 // retry lookup and a config change's plan.
 type checkReads interface {
-	actorID(a *actor) int64
-	ancestry(head *revRow) []segment
-	archiveURL(res, seq int64) string
-	attachedBlob(res int64, bid ids.ID) *blobRow
-	blobArchive(res int64, bid ids.ID) string
-	sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJob
-	openBytes(owner int64, hash []byte) blobContent
-	pendingUsed(n *nsRow, uploader string, cutoff, res int64, bid ids.ID) int64
-	authorName(id int64) string
-	baseIdentity(n *nsRow) string
-	batchEntry(n *nsRow, seq, author int64) (ids.ID, string, bool)
-	branchesOf(n *nsRow) []*nsRow
-	nextEntryCreated(ns, seq int64) (int64, bool)
-	config(seq int64) *Config
-	configByID(n *nsRow, id ids.ID) (seq, author int64, ok bool)
-	configEntryGestures(seq int64) (string, bool)
-	configID(seq int64) ids.ID
-	copyRows(id ids.ID, name string) []copyRow
-	declaredAt(row *revRow) []ids.ID
-	dek(res int64, create bool) []byte
-	docBytesAt(r *revRow) ([]byte, error)
-	entriesTo(row *revRow) []int64
-	e2eEpochOK(n *nsRow, cfg *Config, e int) bool
-	firstEntryOfConfig(n *nsRow, seq int64) (int64, bool)
-	grantRow(id []byte) (blocks []byte, root *grantRoot, ok bool)
-	recordsGrant(n *nsRow, id ids.ID) bool
-	grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob
-	horizonID(res int64) string
-	locate(segs []segment, id ids.ID) (int, *revRow)
-	lockNS(ns int64, mode lockMode)
-	namesAfter(n *nsRow, after string, k int) []string
-	nsByID(id int64) *nsRow
+	nsReads
+	configReads
+	logReads
+	resourceReads
+	grantReads
+	blobReads
+	schemaReads
+	branchReads
+	sealedReads
+}
+
+// nsReads are namespace rows and their locks.
+type nsReads interface {
 	nsByName(name string) *nsRow
+	nsByID(id int64) *nsRow
 	nsForResources(name string) *nsRow
 	nsForWrite(name string) *nsRow
+	nsRowUnlocked(id int64) *nsRow
+	nsNames() []string
 	nsLevel(n *nsRow) int
+	lockNS(ns int64, mode lockMode)
+	noLocks() func()
+}
+
+// configReads are a namespace's configurations.
+type configReads interface {
+	config(seq int64) *Config
+	configID(seq int64) ids.ID
+	configByID(n *nsRow, id ids.ID) (seq, author int64, ok bool)
+	configEntryGestures(seq int64) (string, bool)
+	firstEntryOfConfig(n *nsRow, seq int64) (int64, bool)
+	entryConfig(seq int64) (cseq int64, doc string)
+}
+
+// logReads are the namespace log and its authors.
+type logReads interface {
 	nsLogID(seq int64) ids.ID
 	nsLogSeq(ns int64, id ids.ID) (int64, bool)
-	nsRowUnlocked(id int64) *nsRow
-	pendingBlob(res int64, bid ids.ID, uploader string, cutoff int64) *blobRow
-	prefetchHeads(n *nsRow, names []string, asOf *int64)
-	prefetchResources(ns int64, names []string)
-	prefetchSchemas(refs []schema.Ref)
-	referencedUpTo(res, max int64, bid ids.ID) bool
-	resolve(n *nsRow, name string, asOf *int64) *view
-	rev(seq int64) *revRow
-	revByID(n *nsRow, name string, id ids.ID) *revRow
-	revID(seq int64) ids.ID
-	schemaNS(name string) *nsRow
-
-	// Serving reads (reads.go, resolve.go).
-	knowRevID(seq int64, id ids.ID)
-	prunedIn(segs []segment, lo int64) error
-	revsBetween(res, from, max int64, limit int, visit func(*revRow) bool)
 	nsLogRows(n *nsRow, from, to int64, limit int, visit func(nsLogRow) bool)
+	nextEntryCreated(ns, seq int64) (int64, bool)
+	batchEntry(n *nsRow, seq, author int64) (ids.ID, string, bool)
+	entriesTo(row *revRow) []int64
+	actorID(a *actor) int64
+	authorName(id int64) string
+}
+
+// resourceReads are resources, their chains and documents.
+type resourceReads interface {
+	resolve(n *nsRow, name string, asOf *int64) *view
 	resState(res int64) int
-	entryConfig(seq int64) (cseq int64, doc string)
-	// Sealed and e2e serving (sealed.go, e2e.go).
-	resJob(n *nsRow, name string, row *revRow, kind string, plain func() []byte) *sealJob
-	stored(n *nsRow, j *sealJob) bool
-	entryEpoch(n *nsRow, seq int64) int
-	epochKey(ns int64, epoch int) []byte
-	e2eSnapshot(row *revRow) string
-	e2eFoldSince(row *revRow) string
-	nsNames() []string
-	noLocks() func()
+	namesAfter(n *nsRow, after string, k int) []string
+	prefetchResources(ns int64, names []string)
+	prefetchHeads(n *nsRow, names []string, asOf *int64)
+	rev(seq int64) *revRow
+	revID(seq int64) ids.ID
+	knowRevID(seq int64, id ids.ID)
+	revByID(n *nsRow, name string, id ids.ID) *revRow
+	revsBetween(res, from, max int64, limit int, visit func(*revRow) bool)
+	ancestry(head *revRow) []segment
+	locate(segs []segment, id ids.ID) (int, *revRow)
+	docBytesAt(r *revRow) ([]byte, error)
+	prunedIn(segs []segment, lo int64) error
+	horizonID(res int64) string
+	archiveURL(res, seq int64) string
+}
+
+// grantReads are stored grants and the entries recording them.
+type grantReads interface {
+	grantRow(id []byte) (blocks []byte, root *grantRoot, ok bool)
+	recordsGrant(n *nsRow, id ids.ID) bool
+}
+
+// blobReads are attachments, pending entries and their bytes (§7.8).
+type blobReads interface {
+	attachedBlob(res int64, bid ids.ID) *blobRow
+	pendingBlob(res int64, bid ids.ID, uploader string, cutoff int64) *blobRow
+	pendingUsed(n *nsRow, uploader string, cutoff, res int64, bid ids.ID) int64
+	referencedUpTo(res, max int64, bid ids.ID) bool
+	blobArchive(res int64, bid ids.ID) string
+	openBytes(owner int64, hash []byte) blobContent
+}
+
+// schemaReads are schema namespaces and the references to schemas (§6.1).
+type schemaReads interface {
+	schemaNS(name string) *nsRow
+	prefetchSchemas(refs []schema.Ref)
 	pinnedRefs(l *nsRow) []string
 	pinningNames(l *nsRow, ref string) []string
 	schemaRefOf(seq int64) (string, bool)
 	schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map[int64]*nsRow
+}
+
+// branchReads are branches, their bases and draft copies (§7.6).
+type branchReads interface {
+	branchesOf(n *nsRow) []*nsRow
+	baseIdentity(n *nsRow) string
+	copyRows(id ids.ID, name string) []copyRow
+}
+
+// sealedReads are encryption at rest, sealed and e2e namespaces' keys and
+// sealings (Addendum E).
+type sealedReads interface {
+	dek(res int64, create bool) []byte
+	epochKey(ns int64, epoch int) []byte
+	entryEpoch(n *nsRow, seq int64) int
+	e2eEpochOK(n *nsRow, cfg *Config, e int) bool
+	declaredAt(row *revRow) []ids.ID
+	stored(n *nsRow, j *sealJob) bool
+	resJob(n *nsRow, name string, row *revRow, kind string, plain func() []byte) *sealJob
+	grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob
+	sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJob
+	e2eSnapshot(row *revRow) string
+	e2eFoldSince(row *revRow) string
 }
 
 // checkState is the gate's state in one transaction, shared with the
@@ -141,13 +184,9 @@ func newTx(sqlTx *sql.Tx, ctx context.Context, e *Engine, write bool) *tx {
 
 var _ checkReads = (*tx)(nil)
 
-// gateRead runs f on a gate over the store's reads, outside any write:
-// the read transaction's gate on SQL, DynamoDB's reads otherwise
-// (ddbGateRead). An Engine method whose body needs only the gate's logic
-// and reads runs on every backend this way.
+// gateRead runs f on a gate over the backend's reads, outside any write
+// (backend.gateRead). An Engine method whose body needs only the gate's
+// logic and reads runs on every backend this way.
 func (e *Engine) gateRead(ctx context.Context, f func(t *gate) error) error {
-	if e.ddb != nil {
-		return e.ddbGateRead(ctx, f)
-	}
-	return e.read(ctx, func(t *tx) error { return f(t.gate) })
+	return e.be.gateRead(ctx, f)
 }

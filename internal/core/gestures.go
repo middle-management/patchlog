@@ -50,8 +50,8 @@ type GesturePage struct {
 // or undoing it, after since (?after=; "" for the first page, else the Next of the
 // previous page), oldest first (§7.4).
 func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred Credentials) (*GesturePage, error) {
-	if e.ddb != nil {
-		return nil, ddbUnsupported("gestures listing")
+	if err := e.be.lacks("gestures listing"); err != nil {
+		return nil, err
 	}
 	if !ValidGesture(gesture) {
 		return nil, badInput("a gesture id is 26 base32 characters")

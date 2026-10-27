@@ -1,19 +1,18 @@
 package core
 
 // The DynamoDB backend (docs/DYNAMODB.md), phase 1 of §10's path C:
-// plain namespaces, one instance. The seam: Open keeps a *ddbBackend on
-// the Engine when -db is a dynamodb:// URL, and each Engine method of the
-// phase-1 serving set delegates when it is set — writes through the gate
-// of §6.2 over the table's reads (ddbwrite.go, ddbreads.go), reads mapped
-// onto the store's items, authorised by the same gate. What the phase
-// doesn't cover answers 501 rather than falling through to SQL.
+// plain namespaces, one instance. ddbBackend implements the Engine's
+// backend (backend.go) for -db dynamodb:// URLs (registerBackend): the
+// gate's reads over the table (ddbreads.go), the commits of what the gate
+// decided (ddbwrite.go, ddbblobs.go). Reads and the write checks are
+// core's own code on the gate.
 //
-// Deliberate gaps, all surfaced as 501 "unsupported": branches, purges
-// and pruning, batch sources whose documents reference blobs, sealed and
-// e2e namespaces, nonce-required namespaces, gestures listing, author
-// signatures, head snapshots (revisions fold from the genesis). Grants,
-// edge grants, blobs, $schema validation and schemaReads, tombstones and
-// restores,
+// Deliberate gaps, all surfaced as 501 "unsupported" (lacks, or a read
+// that panics with it): branches, purges and pruning, batch sources
+// whose documents reference blobs, sealed and e2e namespaces,
+// nonce-required namespaces, gestures listing, author signatures, head
+// snapshots (revisions fold from the genesis). Grants, edge grants,
+// blobs, $schema validation and schemaReads, tombstones and restores,
 // multi-step items and batches (§7.5, bounded by the transaction's 100
 // actions) work.
 
@@ -30,12 +29,13 @@ import (
 // ddbBackend is the Engine's DynamoDB state: the store and what the
 // engine keeps of it.
 type ddbBackend struct {
+	e     *Engine
 	store *ddb.Store
 	cfgMu sync.Mutex
 	// byID are the configurations the gate's reads parsed, by namespace
 	// and id (ddbReads.config): a configuration never changes.
 	byID map[string]*Config
-	// refsMarked are the schema references marked (ddbSchemaRefs).
+	// refsMarked are the schema references marked (schemaRefs).
 	refsMarked markedSet
 }
 
@@ -127,9 +127,47 @@ func openDDB(opt Options) (*Engine, error) {
 	}
 	e.rc.maxBytes = opt.ReadCacheBytes
 	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
-	e.ddb = &ddbBackend{store: store, byID: map[string]*Config{}}
+	e.be = &ddbBackend{e: e, store: store, byID: map[string]*Config{}}
 	return e, nil
 }
+
+func init() {
+	registerBackend(ddb.IsURL, openDDB)
+}
+
+var _ backend = (*ddbBackend)(nil)
+
+func (b *ddbBackend) orphanFiles(ctx context.Context, cands map[fileGroup][]string) ([]string, error) {
+	// The BYTES items name the files (putBytes).
+	_, _, bytes, err := b.store.ScanBlobs(ctx)
+	if err != nil {
+		return nil, ddbAsErr(err)
+	}
+	named := map[string]bool{}
+	for _, by := range bytes {
+		named[by.File] = true
+	}
+	var orphans []string
+	for _, files := range cands {
+		for _, f := range files {
+			if !named[f] {
+				orphans = append(orphans, f)
+			}
+		}
+	}
+	return orphans, nil
+}
+
+func (b *ddbBackend) firstEntryTime(ctx context.Context) (int64, bool, error) {
+	return b.store.FirstEntryTime(ctx)
+}
+
+func (b *ddbBackend) ping(ctx context.Context) error { return b.store.Ping(ctx) }
+func (b *ddbBackend) close() error                   { return nil }
+func (b *ddbBackend) dbSystem() string               { return "aws.dynamodb" }
+
+// lacks: the features phase 1 doesn't build answer 501 (ddbUnsupported).
+func (b *ddbBackend) lacks(feature string) *Error { return ddbUnsupported(feature) }
 
 // ddbUnsupported answers for an Engine method the phase doesn't cover.
 func ddbUnsupported(what string) *Error {
@@ -170,22 +208,24 @@ func ddbRefusals(cfg *Config) *Error {
 	return nil
 }
 
-// ddbCommit commits c, bracketed for the read cache as a SQL commit is
+// commit commits c, bracketed for the read cache as a SQL commit is
 // (commit of engine.go): its generations move before and after, so a read
 // that overlapped it doesn't store what it read, and the namespace's live
 // readers wake. A config change may change what any read answers (meta).
-func (e *Engine) ddbCommit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResult, error) {
+func (b *ddbBackend) commit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResult, error) {
+	e := b.e
 	inv := invalidation{nss: []string{c.NS}, meta: c.Config != nil}
 	e.rc.begin(inv)
 	defer e.invalidate(inv, false)
-	return e.ddb.store.Commit(ctx, c)
+	return b.store.Commit(ctx, c)
 }
 
-// ddbCommitted is the post-commit of a write: purge the cache tags the
+// committed is the post-commit of a write: purge the cache tags the
 // write's transaction would have collected on SQL (t.tags: none for
 // resource writes; ns:{ns} when a config change ends public caching,
 // insertConfig).
-func (e *Engine) ddbCommitted(ns string, tags ...string) {
+func (b *ddbBackend) committed(ns string, tags ...string) {
+	e := b.e
 	if len(tags) > 0 {
 		e.opt.Purger.PurgeTags(tags)
 	}

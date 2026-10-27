@@ -1,0 +1,117 @@
+package core
+
+import (
+	"context"
+	"database/sql"
+
+	"github.com/middle-management/patchlog/internal/ids"
+)
+
+// backend is an Engine's storage: what core asks of it beyond the gate's
+// reads (checkReads, gate.go), which every read and every write's checks
+// run over. The SQL databases (sqlBackend) and DynamoDB (ddbBackend,
+// ddb.go) implement it; core proper doesn't know which one it has.
+//
+// A backend that lacks a feature says so (lacks), and the Engine method
+// answers its 501 before doing anything; a read it can't answer panics
+// with that 501 from inside the gate (ddbUnsupported), which gateRead
+// returns.
+type backend interface {
+	// gateRead runs f on a gate over the backend's reads, one snapshot
+	// where the backend has them.
+	gateRead(ctx context.Context, f func(t *gate) error) error
+
+	// writeItems is a resource write or a batch (WriteResource, Batch):
+	// the gate's checks, then the backend's commit of their plan.
+	writeItems(ctx context.Context, req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun bool) (*WriteResult, error)
+	// writeConfig is a namespace's creation or config change.
+	writeConfig(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error)
+	// uploadBlob is an upload or copy of blob bid to name (§7.8).
+	uploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error
+
+	// blobStats counts what blob storage holds; sweepBlobs deletes the
+	// pending entries past their grace and the bytes nothing names;
+	// orphanFiles are the blob files of cands no row or item names.
+	blobStats(ctx context.Context) (*BlobStats, error)
+	sweepBlobs(ctx context.Context) (int, error)
+	orphanFiles(ctx context.Context, cands map[fileGroup][]string) ([]string, error)
+
+	// firstEntryTime is the created time (milliseconds) of the
+	// deployment's first namespace entry; ok is false for none yet.
+	firstEntryTime(ctx context.Context) (ms int64, ok bool, err error)
+
+	ping(ctx context.Context) error
+	close() error
+	// dbSystem names the database for telemetry (db.system).
+	dbSystem() string
+	// lacks answers a feature the backend doesn't implement: 501
+	// "unsupported", or nil.
+	lacks(feature string) *Error
+}
+
+// backends are the storages other than SQL, by the -db paths they handle
+// (registerBackend); Open tries them before opening a SQL database.
+var backends []registeredBackend
+
+type registeredBackend struct {
+	handles func(path string) bool
+	open    func(Options) (*Engine, error)
+}
+
+// registerBackend adds a storage Open uses for the paths handles accepts:
+// open builds an Engine over it, with e.be set.
+func registerBackend(handles func(path string) bool, open func(Options) (*Engine, error)) {
+	backends = append(backends, registeredBackend{handles, open})
+}
+
+// sqlBackend is SQLite and Postgres: the Engine's own transactions.
+type sqlBackend struct{ e *Engine }
+
+func (b sqlBackend) gateRead(ctx context.Context, f func(t *gate) error) error {
+	return b.e.read(ctx, func(t *tx) error { return f(t.gate) })
+}
+
+func (b sqlBackend) writeItems(ctx context.Context, req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun bool) (*WriteResult, error) {
+	if !isBatch {
+		return b.e.writeOptimistic(ctx, req, items, nil, false)
+	}
+	return b.e.sqlBatch(ctx, req, items, cc, source, dryRun)
+}
+
+func (b sqlBackend) writeConfig(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error) {
+	return b.e.sqlWriteConfig(ctx, req, cc)
+}
+
+func (b sqlBackend) uploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error {
+	return b.e.sqlUploadBlob(ctx, req, name, bid, up)
+}
+
+func (b sqlBackend) blobStats(ctx context.Context) (*BlobStats, error) {
+	return b.e.sqlBlobStats(ctx)
+}
+
+func (b sqlBackend) sweepBlobs(ctx context.Context) (int, error) { return b.e.sqlSweepBlobs(ctx) }
+
+func (b sqlBackend) orphanFiles(ctx context.Context, cands map[fileGroup][]string) ([]string, error) {
+	return b.e.sqlOrphanFiles(ctx, cands)
+}
+
+func (b sqlBackend) firstEntryTime(ctx context.Context) (int64, bool, error) {
+	var ms sql.NullInt64
+	err := b.e.read(ctx, func(t *tx) error {
+		return t.QueryRow(`SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms)
+	})
+	return ms.Int64, ms.Valid, err
+}
+
+func (b sqlBackend) ping(ctx context.Context) error { return b.e.db.PingContext(ctx) }
+func (b sqlBackend) close() error                   { return b.e.sqlClose() }
+
+func (b sqlBackend) dbSystem() string {
+	if b.e.pg {
+		return "postgresql"
+	}
+	return "sqlite"
+}
+
+func (b sqlBackend) lacks(string) *Error { return nil }

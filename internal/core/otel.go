@@ -53,14 +53,7 @@ func (e *Engine) dbSpan(ctx context.Context, name string) (context.Context, trac
 	if in == nil || !trace.SpanContextFromContext(ctx).IsValid() {
 		return ctx, nil
 	}
-	sys := "sqlite"
-	switch {
-	case e.pg:
-		sys = "postgresql"
-	case e.ddb != nil:
-		sys = "aws.dynamodb"
-	}
-	return in.tracer.Start(ctx, name, trace.WithSpanKind(trace.SpanKindInternal), trace.WithAttributes(attrDBSystem.String(sys)))
+	return in.tracer.Start(ctx, name, trace.WithSpanKind(trace.SpanKindInternal), trace.WithAttributes(attrDBSystem.String(e.be.dbSystem())))
 }
 
 // endDBSpan ends span with err: engine errors (*Error: refusals such as

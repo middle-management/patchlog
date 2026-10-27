@@ -932,9 +932,11 @@ func (e *Engine) UploadBlob(ctx context.Context, req Request, name, bidText stri
 	if perr != nil {
 		return badInput("malformed blob id")
 	}
-	if e.ddb != nil {
-		return e.ddbUploadBlob(ctx, req, name, bid, up)
-	}
+	return e.be.uploadBlob(ctx, req, name, bid, up)
+}
+
+// sqlUploadBlob is UploadBlob on SQL.
+func (e *Engine) sqlUploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error {
 	// The checks that need no body, outside the write lock; the rate-limit
 	// tokens are drawn here, once.
 	var g *blobGate
@@ -1255,10 +1257,10 @@ type BlobStats struct {
 }
 
 // BlobStats counts the rows of blob storage, and sizes their files.
-func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) {
-	if e.ddb != nil {
-		return e.ddbBlobStats(ctx)
-	}
+func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) { return e.be.blobStats(ctx) }
+
+// sqlBlobStats is BlobStats on SQL.
+func (e *Engine) sqlBlobStats(ctx context.Context) (*BlobStats, error) {
 	s := &BlobStats{Dir: e.blobs.root()}
 	var files []string
 	err := e.read(ctx, func(t *tx) error {
@@ -1295,10 +1297,10 @@ func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) {
 // blobGrace, and the bytes nothing names any more (§7.8, D.2). Each
 // namespace is swept in its own write transaction. It returns how many
 // entries it deleted.
-func (e *Engine) SweepBlobs(ctx context.Context) (int, error) {
-	if e.ddb != nil {
-		return e.ddbSweepBlobs(ctx)
-	}
+func (e *Engine) SweepBlobs(ctx context.Context) (int, error) { return e.be.sweepBlobs(ctx) }
+
+// sqlSweepBlobs is SweepBlobs on SQL.
+func (e *Engine) sqlSweepBlobs(ctx context.Context) (int, error) {
 	var nss []int64
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT DISTINCT r.ns FROM blob_pending p JOIN resources r ON r.res = p.res ORDER BY r.ns`)

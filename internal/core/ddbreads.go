@@ -28,6 +28,7 @@ import (
 // grants, $schema namespaces, archives, reads at an earlier entry).
 type ddbReads struct {
 	e   *Engine
+	b   *ddbBackend
 	s   *ddb.Store
 	ctx context.Context
 
@@ -82,9 +83,9 @@ type ddbRevRef struct {
 	row *revRow // nil until read
 }
 
-func newDDBReads(e *Engine, ctx context.Context) *ddbReads {
+func newDDBReads(b *ddbBackend, ctx context.Context) *ddbReads {
 	return &ddbReads{
-		e: e, s: e.ddb.store, ctx: ctx,
+		b: b, e: b.e, s: b.store, ctx: ctx,
 		nss: map[int64]*ddbNS{}, nsNamed: map[string]int64{},
 		cfgs: map[int64]ddbCfgRef{}, cfgAt: map[ddbPosKey]int64{},
 		revs: map[int64]*ddbRevRef{}, revAt: map[ddbRevKey]int64{},
@@ -315,7 +316,7 @@ func (r *ddbReads) config(seq int64) *Config {
 	ref := r.cfgs[seq]
 	c := r.cfgRow(seq)
 	key := ref.ns + "\x00" + c.ID
-	b := r.e.ddb
+	b := r.b
 	b.cfgMu.Lock()
 	cfg, ok := b.byID[key]
 	b.cfgMu.Unlock()
@@ -611,10 +612,11 @@ func (r *ddbReads) nextEntryCreated(ns, seq int64) (int64, bool) {
 	return le.Created, true
 }
 
-// ddbGateRead is gateRead on DynamoDB: f on a gate over the table's
+// gateRead runs f on a gate over the table's
 // reads, what they panic with returned as errors (ddbCheck).
-func (e *Engine) ddbGateRead(ctx context.Context, f func(t *gate) error) error {
-	g := &gate{checkReads: newDDBReads(e, ctx), checkState: &checkState{e: e, now: e.now()}}
+func (b *ddbBackend) gateRead(ctx context.Context, f func(t *gate) error) error {
+	e := b.e
+	g := &gate{checkReads: newDDBReads(b, ctx), checkState: &checkState{e: e, now: e.now()}}
 	err, perr := ddbCheck(func() error { return f(g) })
 	if perr != nil {
 		return perr

@@ -567,12 +567,18 @@ What landed, beyond the spike:
   referrer logic (`schemaReadsRev`, `refersIn`, `closureReaches`,
   `openRefers`) is gate logic now, over the reads `nsNames`,
   `pinnedRefs`, `pinningNames`, `schemaRefOf`.
-- **`internal/core/ddb.go`, the seam.** `core.Open` branches on
-  `ddb.IsURL(opt.Path)`; the Engine keeps a `*ddbBackend`, the write
-  methods (`WriteResource`, `Batch`, `WriteConfig`, `UploadBlob`)
-  delegate to the gate's DynamoDB commit, and the reads run on the gate
-  (`gateRead`) for both backends. Everything else
-  the server can reach answers 501 rather than falling through to SQL:
+- **The backend interface** (`internal/core/backend.go`). The Engine
+  holds its storage as a `backend`: the gate's reads (`gateRead`), the
+  commits of writes, config writes and uploads, the blob sweeps and
+  statistics, ping, close, and `lacks(feature)`. `sqlBackend` implements
+  it with the existing transactions; `ddbBackend` (`ddb.go`) with the
+  table, registering itself for `dynamodb://` paths (`registerBackend`),
+  so core proper names neither the store nor its package. `checkReads`
+  is grouped by what it reads (namespaces, configurations, the log,
+  resources, grants, blobs, schemas, branches, sealed). A feature the
+  backend lacks is its `lacks` 501, asked by the Engine method before
+  anything else; everything the server can reach so answers 501 rather
+  than falling through to SQL:
   branches, purges and pruning, sealed/e2e, gestures listing,
   author signatures (which the gate would verify but the commit doesn't
   store), remote branches, retention, sweeps, rotation. Refused
@@ -591,7 +597,7 @@ What landed, beyond the spike:
   (`HeadAt`). DynamoDB's log and revision handles keep their positions'
   order within a namespace or resource, since the reads compare them as
   SQL's seqs. DynamoDB commits bracket the read cache as SQL commits do
-  (`ddbCommit`), so the shared reads may cache on both. This replaced
+  (`ddbBackend.commit`), so the shared reads may cache on both. This replaced
   the seam's hand-written reads, ~400 lines whose answers had drifted
   (a log page didn't count a batch entry as its items, raw documents
   went unrecognised).
@@ -664,13 +670,15 @@ becomes its own Go module, which a build links in to serve
 `dynamodb://`. Until then the work keeps to the shape that move needs:
 
 - AWS-specific code lives only in `internal/ddb` and core's adapter
-  files (`ddb.go`, `ddbreads.go`, `ddbwrite.go`); the rest of core
-  depends on the gate and its read interface, never on the store.
+  files (`ddb.go`, `ddbreads.go`, `ddbwrite.go`, `ddbblobs.go`); the
+  rest of core depends on the `backend` interface and the gate's
+  `checkReads`, and refers to neither the adapter nor `internal/ddb`
+  (done: `registerBackend` replaced Open's branch, `backend` the
+  Engine's dispatches).
 - The move takes the adapter files into the module, so core exports what
-  they use: `checkReads` (and the row types it returns, or narrower
-  ones), the gate's entry points (`checkItems`, `planConfig`,
-  `planCreate`, the readers), the write plan, and the error shape.
-- `core.Open`'s branch on the URL becomes a registry (a backend
-  registers its scheme), and the Engine's `e.ddb != nil` dispatches (31
-  today) a backend interface, which the SQL path implements as now.
+  they use: `backend`, `registerBackend` and `checkReads` (with the row
+  types it returns, or narrower ones), the gate's entry points
+  (`checkItems`, `planConfig`, `planCreate`, `gateBlob`, the readers),
+  the write plan, the read cache's bracket (`rc.begin`, `invalidate`),
+  and the error shape.
 
