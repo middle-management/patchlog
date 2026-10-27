@@ -182,6 +182,10 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if !atOK {
 		return nil, docInvalid("/base/at", "at is not in the base's chain (§7.6)")
 	}
+	if r := t.raiseAfter(base, atSeq); r != nil {
+		return nil, docInvalid("/base/at", fmt.Sprintf("at is before %s's raise to e2e: a branch of a raised base can't be created with an at before its e2e raise, "+
+			"since the epoch key in force there also opens what it sealed after it (Addendum E Levels); create it at the raise or later, such as the base's head", r.name))
+	}
 	// The document starts as the base's, so the members this version
 	// defines that it holds unchanged are judged as there; any other
 	// member is refused, since a branch is a new namespace (checkMembers).
@@ -302,6 +306,19 @@ func branchGenesis(bdoc map[string]any, baseName, at string, patches any, droppe
 	}
 	canon = jsonv.Canonical([]any{map[string]any{"op": "add", "path": "", "value": nd}})
 	return nd, patch.WritesStrings(w), canon, ids.Revision(nil, canon), nil
+}
+
+// raiseAfter returns base if its raise to e2e lies after at, the entry of
+// base's own log a branch would fork at, and nil otherwise (Addendum E
+// Levels, Branches of a raised base). A raise lies before the entry that
+// made the namespace e2e (e2eRaiseOf), so at may be that entry or any later
+// one. Bases further up need no check: base's own entries all follow its
+// creation, which was held to the same rule.
+func (t *tx) raiseAfter(base *nsRow, at int64) *nsRow {
+	if r := t.e2eRaiseOf(base); r != nil && r.seq != 0 && at < r.seq {
+		return base
+	}
+	return nil
 }
 
 // branchAt resolves a branch's at in base's chain (§7.6).
