@@ -157,7 +157,7 @@ func TestV073P37ListingOlderKeys(t *testing.T) {
 	}
 	opts := svcOpts{now: s.Now, db: filepath.Join(t.TempDir(), "tree.db")}
 	x := startSvc(t, svc(), opts)
-	x.caughtUp("cat")
+	x.caughtUp("cat", "c")
 	must(s.Engine.RotateEpoch(ctx, "cat", "system:rotate"))
 	for _, e := range must(w.FetchKeys(ctx, "cat", nil, nil)) {
 		keys[e.Kid] = e.Key
@@ -166,7 +166,7 @@ func TestV073P37ListingOlderKeys(t *testing.T) {
 	createNonced(t, w, "cat", "new", map[string]any{"title": "New", "parents": parents("root")})
 	createNonced(t, w, "cat", "kid", map[string]any{"title": "Kid", "parents": parents("new")})
 	full := k.Grant(t, s.Now(), "user:r", all, []string{"read"})
-	x.caughtUp("cat")
+	x.caughtUp("cat", "c")
 	x.fetch("/cat/children?of=root", full) // with cat#1 held from before the rotation
 
 	// After a restart the service holds no key of epoch 1, and can't
@@ -174,7 +174,7 @@ func TestV073P37ListingOlderKeys(t *testing.T) {
 	x.stop()
 	x = startSvc(t, svc(), opts)
 	createNonced(t, w, "cat", "later", map[string]any{"parents": parents("new")})
-	x.caughtUp("cat")
+	x.caughtUp("cat", "c")
 	f := x.fetch("/cat/children?of=new", full)
 	if h, err := seal.ParseHeader(string(f.body)); err != nil || h.Kid != "cat#2" {
 		t.Fatalf("children of new: %v %v", h, err)
@@ -199,7 +199,7 @@ func TestV073P37ListingOlderKeys(t *testing.T) {
 	sc2 := s.Client(t, client.WithHTTPClient(&http.Client{Transport: ft}), client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"},
 		map[string]any{"nbf": s.Now().Add(-24 * time.Hour).Format(time.RFC3339)})), client.WithKeys(client.NewKeys(nil)))
 	y := startSvc(t, sc2, svcOpts{now: s.Now, db: filepath.Join(t.TempDir(), "tree.db")})
-	y.caughtUp("cat")
+	y.caughtUp("cat", "c")
 	y.fetch("/cat/children?of=new", full)
 	ft.fail.Store(1 << 20)
 	r := y.raw("/cat/children?of=root", full)
