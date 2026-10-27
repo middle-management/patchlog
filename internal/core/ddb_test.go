@@ -13,8 +13,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
 	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/keystore"
 )
 
 // ddbEngine opens an engine on a fresh table of DynamoDB Local, in -dev
@@ -119,24 +123,9 @@ func TestDDBUnsupported(t *testing.T) {
 	ctx := context.Background()
 	ddbCreateNS(t, e, "demo", `{"read":"public"}`)
 
-	check := func(what string, err error) {
-		t.Helper()
-		var ae *Error
-		if err == nil || !strings.Contains(err.Error(), "unsupported") {
-			t.Fatalf("%s: want 501 unsupported, got %v", what, err)
-		}
-		if ae = mustErr(t, err); ae.Status != 501 {
-			t.Fatalf("%s: want 501, got %d", what, ae.Status)
-		}
-	}
-	_, err := e.Gestures(ctx, "demo", "g1", "", Credentials{})
-	check("gestures", err)
-	_, err = e.Prune(ctx, Request{NS: "demo"}, "d", PruneRequest{})
-	check("prune", err)
-
-	// Encrypted namespaces are refused at creation: Open refuses a key
-	// store, so as on SQL without one, 422.
-	_, err = e.WriteConfig(ctx, Request{NS: "enc"}, ConfigChange{IfNoneMatch: true, Patches: patches(t, `[{"op":"add","path":"","value":{"encryption":{"level":"sealed"}}}]`)})
+	// Without a key store, encrypted namespaces are refused at creation,
+	// as on SQL: 422. With one, e2e namespaces are 501 (TestDDBAtRest).
+	_, err := e.WriteConfig(ctx, Request{NS: "enc"}, ConfigChange{IfNoneMatch: true, Patches: patches(t, `[{"op":"add","path":"","value":{"encryption":{"level":"sealed"}}}]`)})
 	assertStatus(t, err, 422, "invalid")
 }
 
@@ -167,4 +156,105 @@ func TestDDBDeleteRule(t *testing.T) {
 	_, err := e.WriteResource(ctx, Request{NS: "ruled"},
 		Item{Resource: "doc1", IfMatch: w.Items[0].IDs[0], Steps: []Step{{Delete: true}}})
 	assertStatus(t, err, 422, "rule")
+}
+
+// §E.1 on DynamoDB: what an encrypted namespace stores — patch sets, head
+// documents, a namespace raised to at-rest after its content was written —
+// holds no plaintext, and reads it back.
+func TestDDBAtRest(t *testing.T) {
+	endpoint := os.Getenv("DDB_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("DDB_ENDPOINT not set: skipping DynamoDB Local integration test")
+	}
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := fmt.Sprintf("dynamodb://coretest-%d?region=us-east-1&endpoint=%s", time.Now().UnixNano(), endpoint)
+	if err := ddb.CreateTable(context.Background(), url); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ddb.DeleteTable(context.Background(), url) })
+	e, err := Open(Options{Path: url, AuthDisabled: true, KeyStore: ks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close() })
+	ctx := context.Background()
+	_, err = e.WriteConfig(ctx, Request{NS: "e2e"}, ConfigChange{IfNoneMatch: true, Patches: patches(t, `[{"op":"add","path":"","value":{"encryption":{"level":"e2e"}}}]`)})
+	if ae, ok := err.(*Error); !ok || ae.Status != 501 || !strings.Contains(err.Error(), "unsupported") {
+		t.Fatalf("e2e namespace: want 501 unsupported, got %v", err)
+	}
+	const marker = "plaintext-marker-1234"
+	write := func(ns, name, ifMatch, p string) string {
+		t.Helper()
+		res, err := e.WriteResource(ctx, Request{NS: ns}, Item{Resource: name, IfMatch: ifMatch, IfNoneMatch: ifMatch == "", Steps: []Step{{Patches: patches(t, p)}}})
+		if err != nil {
+			t.Fatalf("write %s/%s: %v", ns, name, err)
+		}
+		return res.Entry.ID
+	}
+	ddbCreateNS(t, e, "enc", `{"read":"public","encryption":{"level":"at-rest"}}`)
+	h := write("enc", "a", "", `[{"op":"add","path":"","value":{"m":"`+marker+`"}}]`)
+	write("enc", "a", h, `[{"op":"add","path":"/n","value":1}]`)
+	ddbCreateNS(t, e, "later", `{"read":"public"}`)
+	write("later", "b", "", `[{"op":"add","path":"","value":{"m":"`+marker+`"}}]`)
+	cur, err := e.WriteConfig(ctx, Request{NS: "later"}, ConfigChange{IfMatch: configOf(t, e, "later"),
+		Patches: patches(t, `[{"op":"add","path":"/encryption","value":{"level":"at-rest"}}]`)})
+	if err != nil || cur.Status != 201 {
+		t.Fatalf("raising later: %+v %v", cur, err)
+	}
+	be := e.be.(*ddbBackend)
+	for _, ns := range []string{"enc", "later"} {
+		n := 0
+		out, qerr := be.store.Client.Query(ctx, &dynamodb.QueryInput{
+			TableName:                 &be.store.Table,
+			KeyConditionExpression:    strptrT("PK = :pk"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberS{Value: "NS#" + ns}},
+		})
+		if qerr != nil {
+			t.Fatal(qerr)
+		}
+		for _, it := range out.Items {
+			for attr, v := range it {
+				if s, ok := v.(*types.AttributeValueMemberS); ok && strings.Contains(s.Value, marker) {
+					t.Errorf("%s: %s of %v holds plaintext", ns, attr, it["SK"])
+				}
+				n++
+			}
+		}
+		if n == 0 {
+			t.Fatalf("%s: nothing stored", ns)
+		}
+	}
+	e.FlushCaches()
+	for _, rn := range [][3]string{{"enc", "a", h}, {"later", "b", ""}} {
+		id := rn[2]
+		if id == "" {
+			hd, err := e.ResourceHead(ctx, rn[0], rn[1], Credentials{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			id = hd.Head
+		}
+		rev, err := e.ResourceRev(ctx, rn[0], rn[1], id, Credentials{})
+		if err != nil || rev.Status != 200 || !strings.Contains(string(rev.Doc), marker) {
+			t.Fatalf("%s/%s reads %+v %v", rn[0], rn[1], rev, err)
+		}
+	}
+}
+
+func strptrT(s string) *string { return &s }
+
+func configOf(t *testing.T, e *Engine, ns string) string {
+	t.Helper()
+	var id string
+	if err := e.gateRead(context.Background(), func(g *gate) error {
+		n := g.nsByName(ns)
+		id = g.configID(n.configSeq).String()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return id
 }

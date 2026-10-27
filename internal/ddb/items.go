@@ -48,6 +48,27 @@ func (it item) b(attr string) []byte {
 
 func (it item) has(attr string) bool { _, ok := it[attr]; return ok }
 
+// ns reads a list of numbers.
+func (it item) ns(attr string) []uint64 {
+	l, ok := it[attr].(*types.AttributeValueMemberL)
+	if !ok {
+		return nil
+	}
+	out := make([]uint64, 0, len(l.Value))
+	for _, v := range l.Value {
+		out = append(out, item{"n": v}.n("n"))
+	}
+	return out
+}
+
+func avNs(ns []uint64) types.AttributeValue {
+	l := make([]types.AttributeValue, len(ns))
+	for i, n := range ns {
+		l[i] = avN(n)
+	}
+	return &types.AttributeValueMemberL{Value: l}
+}
+
 // nsMeta is the #META item: the namespace's configuration state.
 type nsMeta struct {
 	frozen, purged bool
@@ -116,6 +137,16 @@ type resRow struct {
 	headDigest  []byte
 	lastID      string
 	lastPos     uint64
+	// The pruning horizon (prune.go): its position and id, the position
+	// of its last live revision (whose document the fold above it starts
+	// from), and the keep set as served (canonical JSON). 0: none.
+	horizonPos, horizonBase uint64
+	horizonID               string
+	keep                    string
+	// kept are the positions below the horizon whose snapshots are
+	// served: a snapshot of any other there is one PruneContent hasn't
+	// deleted yet.
+	kept []uint64
 }
 
 func scanRes(it item) *resRow {
@@ -123,7 +154,18 @@ func scanRes(it item) *resRow {
 		headPos: it.n("headPos"), headID: it.s("headId"), headNS: it.s("headNs"), entryID: it.s("entryId"), state: it.s("state"),
 		headCreated: int64(it.n("headCreated")), headSize: it.n("headSize"), headDigest: it.b("headDigest"),
 		lastID: it.s("lastId"), lastPos: it.n("lastPos"),
+		horizonPos: it.n("horizonPos"), horizonBase: it.n("horizonBase"), horizonID: it.s("horizonId"), keep: it.s("keep"),
+		kept: it.ns("kept"),
 	}
+}
+
+func (r *resRow) keeps(pos uint64) bool {
+	for _, k := range r.kept {
+		if k == pos {
+			return true
+		}
+	}
+	return false
 }
 
 // revRow is the REV# item: one row of a resource's chain. kind is "rev"
@@ -146,6 +188,8 @@ type revRow struct {
 	logPos    uint64 // the namespace entry that committed it: the retry lookup's answer
 	grantID   string // the grant it was written under, "" for none
 	schemaRef string // the schema revision path it was typed by
+	signature string // the author signature (§C.3.1), "" for none
+	epoch     int    // the epoch it was written in, sealed namespaces only
 	// parentNS and parentPos name a first revision's foreign parent: a
 	// revision of the same name in the base it was read through from
 	// (§7.6).
@@ -186,6 +230,12 @@ func (r *revRow) item() item {
 	}
 	if r.schemaRef != "" {
 		it["schemaRef"] = avS(r.schemaRef)
+	}
+	if r.signature != "" {
+		it["signature"] = avS(r.signature)
+	}
+	if r.epoch > 0 {
+		it["epoch"] = avN(uint64(r.epoch))
 	}
 	if r.parentNS != "" {
 		it["parentNs"], it["parentPos"] = avS(r.parentNS), avN(r.parentPos)

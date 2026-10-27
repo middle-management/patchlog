@@ -39,6 +39,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"errors"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -176,7 +177,7 @@ func (t *tx) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID) *sea
 
 // sealedBlobJob is the sealing of a blob under one epoch, to store.
 type sealedBlobJob struct {
-	ns    int64
+	ns    string // the serving namespace's name
 	name  string
 	bid   ids.ID
 	epoch int
@@ -202,16 +203,13 @@ func (e *Engine) ReadSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 // OpenSealedBlob is ReadSealedBlob with the bytes in Content, read from
 // their file if stored in one.
 func (e *Engine) OpenSealedBlob(ctx context.Context, ns, name, bidText, epochText string, cred Credentials) (*Blob, error) {
-	if err := e.be.lacks("blobs"); err != nil {
-		return nil, err
-	}
 	return readAgain(func() (*Blob, error) { return e.openSealedBlob(ctx, ns, name, bidText, epochText, cred, true) })
 }
 
 func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochText string, cred Credentials, again bool) (*Blob, error) {
 	var out *Blob
 	var job *sealedBlobJob
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -238,18 +236,9 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			return nil
 		}
 		v := t.resolve(n, name, nil)
-		var data []byte
-		var file sql.NullString
-		var row bool
-		err := t.QueryRow(`SELECT data, file FROM blob_epochs WHERE ns = ? AND name = ? AND bid = ? AND epoch = ?`, n.id, name, bid[:], ep).Scan(&data, &file)
-		switch {
-		case err == nil:
-			row = true
-		case !errors.Is(err, sql.ErrNoRows):
-			t.must(err)
-		}
+		data, file, row := t.blobEpochRow(n, name, bid, ep)
 		if !t.blobEpochs(n, v.head, bid)[ep] {
-			if row && data == nil && !file.Valid {
+			if row && data == nil && file == "" {
 				// Recorded when pruning removed every revision of that
 				// epoch referencing it: 410 (§E.2.2). Anything else not
 				// served, such as a branch's sealing of a base's blob the
@@ -263,8 +252,8 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 		}
 		out.Type = SealedBlobType
 		switch {
-		case file.Valid:
-			out.setContent(fileContent(t.openFile(file.String)))
+		case file != "":
+			out.setContent(fileContent(t.openBlobFile(file)))
 			return nil
 		case data != nil:
 			out.setContent(memContent(data))
@@ -272,8 +261,8 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 		}
 		k, err := seal.ResourceKey(t.epochKey(n.id, ep), n.name, name)
 		t.must(err)
-		job = &sealedBlobJob{ns: n.id, name: name, bid: bid, epoch: ep, key: k, kid: seal.Kid(n.name, ep),
-			pl: seal.BlobPL(n.name, name, bid.String()), plain: t.readBytes(ans.row.owner, ans.row.hash), pad: t.config(n.configSeq).Pad}
+		job = &sealedBlobJob{ns: n.name, name: name, bid: bid, epoch: ep, key: k, kid: seal.Kid(n.name, ep),
+			pl: seal.BlobPL(n.name, name, bid.String()), plain: t.blobBytes(ans.row), pad: t.config(n.configSeq).Pad}
 		return nil
 	})
 	if err != nil {
@@ -287,7 +276,7 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 	if err != nil {
 		return nil, err
 	}
-	stored, err := e.storeSealedBlob(ctx, job, sealed)
+	stored, err := e.be.storeSealedBlob(ctx, job, sealed)
 	if err != nil {
 		return nil, err
 	}
@@ -306,12 +295,15 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 // returns the stored bytes: the first stored wins (§E.2.2). It returns nil
 // if the blob is no longer served under the epoch (a purge or a prune
 // committed since the read).
-func (e *Engine) storeSealedBlob(ctx context.Context, job *sealedBlobJob, sealed []byte) ([]byte, error) {
+func (e *Engine) sqlStoreSealedBlob(ctx context.Context, job *sealedBlobJob, sealed []byte) ([]byte, error) {
 	var out []byte
 	err := e.update(ctx, func(t *tx) error {
 		// Shared: purges and prunes, which delete or mark these rows,
 		// lock exclusively.
-		n := t.nsByIDLocked(job.ns, lockShared)
+		n := t.nsByName(job.ns)
+		if n != nil {
+			n = t.nsByIDLocked(n.id, lockShared)
+		}
 		if n == nil || n.purged || t.servableBlob(n, job.name, job.bid).status != 200 {
 			return nil
 		}
@@ -319,17 +311,17 @@ func (e *Engine) storeSealedBlob(ctx context.Context, job *sealedBlobJob, sealed
 			return nil
 		}
 		var data, file any = sealed, nil
-		mine := t.storeFile(epochFile(job.ns, job.bid[:], job.epoch), sealed)
+		mine := t.storeFile(epochFile(n.id, job.bid[:], job.epoch), sealed)
 		if mine != "" {
 			data, file = nil, mine
 		}
 		_, err := t.Exec(`INSERT INTO blob_epochs (ns, name, bid, epoch, data, file, created) VALUES (?,?,?,?,?,?,?)
 			ON CONFLICT (ns, name, bid, epoch) DO UPDATE SET data = excluded.data, file = excluded.file, created = excluded.created
 			WHERE blob_epochs.data IS NULL AND blob_epochs.file IS NULL`,
-			job.ns, job.name, job.bid[:], job.epoch, data, file, t.now.UnixMilli())
+			n.id, job.name, job.bid[:], job.epoch, data, file, t.now.UnixMilli())
 		t.must(err)
 		var stored sql.NullString
-		t.must(t.QueryRow(`SELECT data, file FROM blob_epochs WHERE ns = ? AND name = ? AND bid = ? AND epoch = ?`, job.ns, job.name, job.bid[:], job.epoch).Scan(&out, &stored))
+		t.must(t.QueryRow(`SELECT data, file FROM blob_epochs WHERE ns = ? AND name = ? AND bid = ? AND epoch = ?`, n.id, job.name, job.bid[:], job.epoch).Scan(&out, &stored))
 		switch {
 		case stored.String == mine && mine != "":
 			out = sealed
@@ -342,6 +334,36 @@ func (e *Engine) storeSealedBlob(ctx context.Context, job *sealedBlobJob, sealed
 		return nil
 	})
 	return out, err
+}
+
+// blobEpochRow reads the stored sealing of bid of n's name under epoch
+// ep: its bytes or the file holding them; with ok and neither, the marker
+// of an epoch pruning removed (pruneBlobEpochs).
+func (t *tx) blobEpochRow(n *nsRow, name string, bid ids.ID, ep int) (data []byte, file string, ok bool) {
+	var f sql.NullString
+	err := t.QueryRow(`SELECT data, file FROM blob_epochs WHERE ns = ? AND name = ? AND bid = ? AND epoch = ?`, n.id, name, bid[:], ep).Scan(&data, &f)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, "", false
+	}
+	t.must(err)
+	return data, f.String, true
+}
+
+// openBlobFile opens a file a row names, or panics with errBytesGone if
+// it is gone (deleted after this read began).
+func (t *gate) openBlobFile(name string) io.ReadSeekCloser {
+	f, err := t.e.openStored(t.context(), name)
+	t.must(err)
+	return f
+}
+
+// context is the context of the reads the gate runs over, for the blob
+// store's requests.
+func (t *gate) context() context.Context {
+	if c, ok := t.checkReads.(interface{ context() context.Context }); ok {
+		return c.context()
+	}
+	return context.Background()
 }
 
 // deleteBlobEpochs deletes the stored sealings of blobs matching where, a

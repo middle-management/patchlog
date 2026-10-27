@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"database/sql"
+	"io"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
@@ -35,6 +36,7 @@ type checkReads interface {
 	schemaReads
 	branchReads
 	sealedReads
+	archiveReads
 }
 
 // nsReads are namespace rows and their locks.
@@ -78,6 +80,7 @@ type resourceReads interface {
 	resolve(n *nsRow, name string, asOf *int64) *view
 	resState(res int64) int
 	namesAfter(n *nsRow, after string, k int) []string
+	retainedNames(n *nsRow) []string
 	prefetchResources(ns int64, names []string)
 	prefetchHeads(n *nsRow, names []string, asOf *int64)
 	rev(seq int64) *revRow
@@ -85,6 +88,12 @@ type resourceReads interface {
 	knowRevID(seq int64, id ids.ID)
 	revByID(n *nsRow, name string, id ids.ID) *revRow
 	revsBetween(res, from, max int64, limit int, visit func(*revRow) bool)
+	firstRev(res int64) int64
+	firstRevSince(res, cutoff int64) (int64, bool)
+	nthNewestRev(res int64, k int) (int64, bool)
+	headAtEntry(res, at int64) (int64, bool)
+	gestureRows(n *nsRow, gesture string, after *gestureRow, limit int) []gestureRow
+	writingEntry(res, seq int64) (int64, bool)
 	ancestry(head *revRow) []segment
 	locate(segs []segment, id ids.ID) (int, *revRow)
 	docBytesAt(r *revRow) ([]byte, error)
@@ -125,6 +134,9 @@ type branchReads interface {
 	configGenesis(n *nsRow) (seq, author int64, id ids.ID, ok bool)
 	branchEntry(base *nsRow, gseq int64) (int64, bool)
 	liveRegistrations(n *nsRow) []map[string]any
+	registeredAts(n *nsRow) []int64
+	registration(n *nsRow, origin, name string) *regRow
+	entryBy(seq int64) (author, created int64)
 	baseIdentity(n *nsRow) string
 	copyRows(id ids.ID, name string) []copyRow
 }
@@ -141,8 +153,23 @@ type sealedReads interface {
 	resJob(n *nsRow, name string, row *revRow, kind string, plain func() []byte) *sealJob
 	grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob
 	sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJob
+	blobEpochs(n *nsRow, head *revRow, bid ids.ID) map[int]bool
+	blobEpochRow(n *nsRow, name string, bid ids.ID, ep int) (data []byte, file string, ok bool)
+	epochStarts(table string, ns int64, max int) []epochStart
+	keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error)
 	e2eSnapshot(row *revRow) string
 	e2eFoldSince(row *revRow) string
+}
+
+// archiveReads are what an archive's building reads beyond the chain
+// (§8.6): the blobs its documents reference, where its grants were first
+// recorded and with which keys, and how it is sealed.
+type archiveReads interface {
+	archivedBlobs(res, fromSeq, lastSeq int64) map[int64][]ids.ID
+	grantFirstEntry(n *nsRow, gid ids.ID, bound sql.NullInt64) (cfg, created int64, ok bool)
+	configAtTime(n *nsRow, created int64) (int64, bool)
+	firstEntryCreated() (int64, bool)
+	archiveSealer(res int64) func(io.Writer) (io.WriteCloser, error)
 }
 
 // checkState is the gate's state in one transaction, shared with the

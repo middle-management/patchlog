@@ -269,7 +269,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 	public, cached, plain := false, false, false
 	var out *Rev
 	var job *sealJob
-	var nsRowID int64
+	var nsRowName string
 	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -373,13 +373,13 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			out.Digest = row.digest
 		}
 		if t.isSealedNS(n) {
-			nsRowID = n.id
+			nsRowName = n.name
 			job = t.resJob(n, name, row, sealDoc, func() []byte { return b })
 		}
 		return nil
 	})
 	if err == nil && job != nil {
-		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
+		if err = e.finishSeal(ctx, nsRowName, []*sealJob{job}); err == nil {
 			out.Doc, out.JWE, out.Digest = nil, job.jwe, nil
 		}
 	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot {
@@ -432,7 +432,7 @@ type Log struct {
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
-	var nsRowID int64
+	var nsRowName string
 	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -517,12 +517,12 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		}
 		if sealed {
 			jobs = jobs[:len(entries)]
-			out.Sealed, nsRowID = true, n.id
+			out.Sealed, nsRowName = true, n.name
 		}
 		return nil
 	})
 	if err == nil && out != nil && out.Sealed {
-		if err = e.finishSeal(ctx, nsRowID, jobs); err == nil {
+		if err = e.finishSeal(ctx, nsRowName, jobs); err == nil {
 			out.EntryJWEs = make([]string, len(jobs))
 			for i, j := range jobs {
 				out.EntryJWEs[i] = j.jwe
@@ -569,7 +569,7 @@ func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials)
 func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credentials) (*NSInfo, error) {
 	var out *NSInfo
 	var job *sealJob
-	var nsRowID int64
+	var nsRowName string
 	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -594,13 +594,13 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 		out = &NSInfo{Head: nsID, Config: t.configID(cseq).String(), Doc: []byte(doc),
 			Public: t.cachePublic(n)}
 		if t.isSealedNS(n) {
-			nsRowID = n.id
+			nsRowName = n.name
 			job = t.configJob(n, seq, nsID, []byte(doc))
 		}
 		return nil
 	})
 	if err == nil && job != nil {
-		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
+		if err = e.finishSeal(ctx, nsRowName, []*sealJob{job}); err == nil {
 			out.Doc, out.JWE = nil, job.jwe
 		}
 	}
@@ -638,7 +638,7 @@ func (e *Engine) ResourceEvents(ctx context.Context, ns, name, since string, lim
 func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials, perEntry bool, resource string, live *liveRead) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
-	var nsRowID int64
+	var nsRowName string
 	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		switch {
@@ -771,7 +771,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			rs, out.Entries = keep, entries
 		}
 		if t.isSealedNS(n) {
-			out.Sealed, nsRowID = true, n.id
+			out.Sealed, nsRowName = true, n.name
 			if perEntry {
 				for i, r := range rs {
 					m := out.Entries[i]
@@ -798,7 +798,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		return nil
 	})
 	if err == nil && out != nil && out.Sealed {
-		if err = e.finishSeal(ctx, nsRowID, jobs); err == nil {
+		if err = e.finishSeal(ctx, nsRowName, jobs); err == nil {
 			if perEntry {
 				out.EntryJWEs = make([]string, len(jobs))
 				for i, j := range jobs {

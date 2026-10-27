@@ -51,7 +51,11 @@ func (b *ddbBackend) purgeWith(ctx context.Context, req Request, name string, pl
 			return "", out.err
 		}
 		p := out.p
-		gid, err := b.storeGrant(ctx, p.a)
+		sealed, serr := r.atRest(p.n)
+		if serr != nil {
+			return "", serr
+		}
+		gid, err := b.storeGrant(ctx, p.a, sealed)
 		if err != nil {
 			return "", err
 		}
@@ -112,19 +116,45 @@ func (b *ddbBackend) purgeWith(ctx context.Context, req Request, name string, pl
 	return "", apiErr(409, "conflict", "detail", "the purge's state kept moving")
 }
 
-// purgedContent deletes a committed purge's content, then the bytes
-// nothing names any more, as SQL's purge does in its transaction
-// (purgeBlobs). What fails here is left to the sweep (sweepBlobs).
+// purgedContent finishes a committed purge (finishPurge); what fails
+// here is left to the sweep (sweepBlobs).
 func (b *ddbBackend) purgedContent(ctx context.Context, ns, name string) {
+	if err := b.finishPurge(ctx, ns, name); err != nil {
+		log.Printf("ddb: purge of %s/%s committed, its content left to the sweep: %v", ns, name, err)
+	}
+}
+
+// finishPurge deletes a committed purge's archives and content, then the
+// bytes nothing names any more, as SQL's purge does in its transaction
+// (deleteArchives, purgeBlobs). The archives go first: the content's
+// deletion takes the marker that names the purge to finish.
+func (b *ddbBackend) finishPurge(ctx context.Context, ns, name string) error {
+	if err := b.deleteArchives(ctx, ns, name); err != nil {
+		return err
+	}
+	// Destroying the data keys makes whatever survives of the content,
+	// and of its archives, unreadable (§8.3, §E.1).
+	if err := b.store.DeleteDEKs(ctx, ns, name); err != nil {
+		return ddbAsErr(err)
+	}
+	b.keys.flush()
+	// Its blobs' stored sealings (§E.2.2).
+	sealings, err := b.store.DeleteBlobEpochs(ctx, ns, name, "")
+	b.e.removeFiles(sealings)
+	if err != nil {
+		return ddbAsErr(err)
+	}
+	// A remote branch's mirrored copy goes too, in every shadow (§G.3).
+	if err := b.purgeShadows(ctx, ns, name); err != nil {
+		return err
+	}
 	hashes, err := b.store.PurgeContent(ctx, ns, name)
 	var files []string
 	if err == nil {
 		files, err = b.store.CollectBytes(ctx, hashes)
 	}
 	b.e.removeFiles(files)
-	if err != nil {
-		log.Printf("ddb: purge of %s/%s committed, its content left to the sweep: %v", ns, name, err)
-	}
+	return err
 }
 
 // branchNames lists the unpurged branches of ns, and theirs, depth first.

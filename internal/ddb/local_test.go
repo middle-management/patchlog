@@ -450,3 +450,104 @@ func TestLocalGroupMixed(t *testing.T) {
 	gb, wb := b.GroupStats()
 	t.Logf("a: %d commits in %d groups; b: %d in %d", wa, ga, wb, gb)
 }
+
+// A prune's reads go by the horizon from its commit on, before
+// PruneContent has stripped anything: below it only a kept position's
+// snapshot is served, above it folds start from the horizon's. Then
+// PruneContent strips the patch sets and drops the snapshots no longer
+// kept, idempotently, and the marker stays for DonePruning.
+func TestLocalPruneHorizon(t *testing.T) {
+	s := newLocalStore(t)
+	ctx := context.Background()
+	mustCreateNS(t, s, "p")
+	var revs []*written
+	prev := ""
+	for i := 0; i < 6; i++ {
+		p := fmt.Sprintf(`[{"op":"add","path":"/n","value":%d}]`, i)
+		if i == 0 {
+			p = `[{"op":"add","path":"","value":{"n":0}}]`
+		}
+		w, err := write(t, s, "p", "doc", prev, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		revs, prev = append(revs, w), w.ID
+	}
+	docAt := func(pos uint64) (string, error) {
+		b, err := s.DocAt(ctx, "p", "doc", pos)
+		return string(b), err
+	}
+	prune := func(horizon uint64, old uint64, kept []uint64, docs map[uint64][]byte) {
+		t.Helper()
+		if err := s.PutSnapshots(ctx, "p", "doc", docs); err != nil {
+			t.Fatal(err)
+		}
+		res, _ := s.Resource(ctx, "p", "doc")
+		n, _ := s.Namespace(ctx, "p")
+		c := &Commit{
+			NS: "p", Author: "alice", Created: time.Now().UnixMilli(), CfgPos: n.ConfigPos, CfgID: n.ConfigID,
+			Entry: map[string]any{"resource": "doc", "kind": "prune", "target": revs[horizon-1].ID}, Kind: "prune",
+			Prune: &CommitPrune{Name: "doc", HeadPos: res.HeadPos, HeadID: res.HeadID, OldHorizon: old,
+				HorizonPos: horizon, HorizonID: revs[horizon-1].ID, Base: horizon, Keep: "[]", Kept: kept},
+		}
+		if _, err := s.Commit(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Horizon at 4, keeping 2.
+	prune(4, 0, []uint64{2, 4}, map[uint64][]byte{2: []byte(`{"n":1}`), 4: []byte(`{"n":3}`)})
+	var pe *PrunedError
+	if _, err := docAt(1); !errors.As(err, &pe) || pe.Pos != 1 {
+		t.Fatalf("below the horizon: %v", err)
+	}
+	if d, err := docAt(2); err != nil || d != `{"n":1}` {
+		t.Fatalf("kept: %s %v", d, err)
+	}
+	if d, err := docAt(5); err != nil || d != `{"n":4}` {
+		t.Fatalf("above the horizon: %s %v", d, err)
+	}
+	if pos, err := s.PrunedBelow(ctx, "p", "doc", 0, 6); err != nil || pos != 3 {
+		t.Fatalf("PrunedBelow: %d %v", pos, err)
+	}
+	// A stale commit (the horizon moved) is refused.
+	res, _ := s.Resource(ctx, "p", "doc")
+	n, _ := s.Namespace(ctx, "p")
+	_, err := s.Commit(ctx, &Commit{NS: "p", Author: "alice", Created: time.Now().UnixMilli(), CfgPos: n.ConfigPos, CfgID: n.ConfigID,
+		Entry: map[string]any{"resource": "doc", "kind": "prune", "target": revs[4].ID}, Kind: "prune",
+		Prune: &CommitPrune{Name: "doc", HeadPos: res.HeadPos, HeadID: res.HeadID, HorizonPos: 5, HorizonID: revs[4].ID, Base: 5, Keep: "[]"}})
+	if !errors.Is(err, ErrStale) {
+		t.Fatalf("prune on a moved horizon: %v", err)
+	}
+	// A later prune keeps nothing below 5: 2's snapshot is no longer
+	// served, even before PruneContent deletes it.
+	prune(5, 4, []uint64{5}, map[uint64][]byte{5: []byte(`{"n":4}`)})
+	if _, err := docAt(2); !errors.As(err, &pe) {
+		t.Fatalf("no longer kept: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if ok, err := s.PruneContent(ctx, "p", "doc"); err != nil || !ok {
+			t.Fatalf("PruneContent: %v %v", ok, err)
+		}
+	}
+	for pos := uint64(1); pos <= 6; pos++ {
+		r, _ := s.RevAt(ctx, "p", "doc", pos)
+		if r.Pruned != (pos < 5) {
+			t.Fatalf("rev %d pruned = %v", pos, r.Pruned)
+		}
+	}
+	if _, ok, _ := s.snapshot(ctx, "p", "doc", 2); ok {
+		t.Fatal("2's snapshot survived")
+	}
+	if d, err := docAt(6); err != nil || d != `{"n":5}` {
+		t.Fatalf("head: %s %v", d, err)
+	}
+	if nss, _, _ := s.Pruning(ctx); len(nss) != 1 {
+		t.Fatalf("markers %v", nss)
+	}
+	if err := s.DonePruning(ctx, "p", "doc"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.PruneContent(ctx, "p", "doc"); err != nil || ok {
+		t.Fatalf("PruneContent after done: %v %v", ok, err)
+	}
+}

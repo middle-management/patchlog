@@ -1,9 +1,13 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"slices"
 	"sort"
 	"strings"
 
@@ -24,9 +28,8 @@ import (
 // configSeq, revRow.seq and res, author ids, entry seqs): here they are
 // handles, minted per check, onto the table's keys. What the backend
 // doesn't store reads as empty where nothing of the kind can exist
-// (branches, draft copies, schema uses, pruning horizons), and as 501
-// where a request needs a feature it lacks (blobs, sealed and e2e keys,
-// grants, $schema namespaces, archives, reads at an earlier entry).
+// (remote registrations, archives), and as 501 where a request needs a
+// feature it lacks (sealed and e2e keys).
 type ddbReads struct {
 	e   *Engine
 	b   *ddbBackend
@@ -55,6 +58,7 @@ type ddbReads struct {
 	schemaNSs map[string]int64
 	// schemaRefs are the revisions' schema paths read, by handle.
 	schemaRefs map[int64]string
+	blobRefs   map[segment]map[ids.ID][]uint64 // blobRefPositions
 	// copies are the resources copyRows answered with: a purge's commit
 	// pins them (Commit.Copies).
 	copies []ddb.ResourceRef
@@ -198,7 +202,9 @@ func (r *ddbReads) revRowOf(ns string, ri *ddb.RevInfo) *revRow {
 		row.kind = kindTombstone
 	} else {
 		row.kind = kindRev
-		row.patches.String, row.patches.Valid = ri.Patches, true
+		patches, err := r.b.openValue(r.ctx, ns, ri.Name, "rev", ri.ID, ri.Patches)
+		r.must(err)
+		row.patches.String, row.patches.Valid = patches, !ri.Pruned
 		row.size.Int64, row.size.Valid = int64(ri.Size), true
 		row.digest = ri.Digest
 	}
@@ -207,6 +213,9 @@ func (r *ddbReads) revRowOf(ns string, ri *ddb.RevInfo) *revRow {
 	}
 	if ri.Undoes != "" {
 		row.undoes.String, row.undoes.Valid = ri.Undoes, true
+	}
+	if ri.Signature != "" {
+		row.signature.String, row.signature.Valid = ri.Signature, true
 	}
 	if ri.SchemaRef != "" {
 		r.schemaRefs[h] = ri.SchemaRef
@@ -287,10 +296,19 @@ func (r *ddbReads) branchesOf(n *nsRow) []*nsRow {
 }
 
 // baseIdentity names a branch's base: its name, which a deployment never
-// reuses (remote bases aren't built here).
+// reuses, or a remote base's origin and name.
 func (r *ddbReads) baseIdentity(n *nsRow) string {
 	if !n.isBranch() {
 		return ""
+	}
+	if b := r.nsByID(n.base.Int64); b.isShadow() {
+		// A remote base: its origin and name, as its #REMOTE item
+		// records them.
+		rb, err := r.s.RemoteBaseOf(r.ctx, n.name)
+		r.must(err)
+		if rb != nil {
+			return rb.Origin + " " + rb.NS
+		}
 	}
 	return r.nsName(n.base.Int64)
 }
@@ -306,6 +324,33 @@ func (r *ddbReads) schemaNS(name string) *nsRow {
 		r.schemaNSs[name] = n.configSeq
 	}
 	return n
+}
+
+// configPins are what a config change's commit pins: the schema
+// namespaces' configurations and every other namespace's the check read
+// — a base its branches' and a branch its base's, whose nonce
+// requirements (§C.7) and the like it was checked against, as SQL's locks
+// order the two changes. A purged one is left out: nothing changes it.
+func (r *ddbReads) configPins(own string) []ddb.NSPin {
+	out := r.schemaPins(own)
+	seen := map[string]bool{own: true}
+	for _, p := range out {
+		seen[p.NS] = true
+	}
+	hs := make([]int64, 0, len(r.nss))
+	for h := range r.nss {
+		hs = append(hs, h)
+	}
+	sort.Slice(hs, func(i, j int) bool { return r.nss[hs[i]].name < r.nss[hs[j]].name })
+	for _, h := range hs {
+		n := r.nss[h]
+		if seen[n.name] || n.row == nil || n.row.Purged {
+			continue
+		}
+		seen[n.name] = true
+		out = append(out, ddb.NSPin{NS: n.name, CfgPos: n.row.ConfigPos, CfgID: n.row.ConfigID})
+	}
+	return out
 }
 
 // schemaPins are the configurations of the schema namespaces read, but
@@ -325,7 +370,18 @@ func (r *ddbReads) prefetchResources(int64, []string)      {}
 func (r *ddbReads) prefetchHeads(*nsRow, []string, *int64) {}
 func (r *ddbReads) prefetchSchemas([]schema.Ref)           {}
 
-func (r *ddbReads) nsLevel(n *nsRow) int { return r.config(n.configSeq).level }
+// nsLevel: a remote branch's shadow follows its branch (nsLevel of
+// crypt.go).
+func (r *ddbReads) nsLevel(n *nsRow) int {
+	if n.isShadow() {
+		branch, _, _ := strings.Cut(n.name[1:], "~")
+		if b := r.nsByName(branch); b != nil {
+			return r.config(b.configSeq).level
+		}
+		return levelNone
+	}
+	return r.config(n.configSeq).level
+}
 
 // --- configurations ---
 
@@ -485,6 +541,10 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 	}
 	hh := r.revHandle(ns, name, rr.HeadPos)
 	own.headSeq.Int64, own.headSeq.Valid = hh, true
+	if rr.HorizonPos > 0 {
+		own.horizonSeq.Int64, own.horizonSeq.Valid = r.revHandle(ns, name, rr.HorizonPos), true
+		own.keep.String, own.keep.Valid = rr.Keep, true
+	}
 	v.head = r.rev(r.revHandle(ns, name, headPos))
 	if v.head.kind == kindTombstone {
 		v.state = Tombstoned
@@ -534,7 +594,12 @@ func (r *ddbReads) entriesTo(row *revRow) []int64 {
 
 func (r *ddbReads) docBytesAt(row *revRow) ([]byte, error) {
 	ref := r.revs[row.seq]
-	return r.s.DocAt(r.ctx, ref.key.ns, ref.key.name, ref.key.pos)
+	b, err := r.s.DocAt(r.ctx, ref.key.ns, ref.key.name, ref.key.pos)
+	var pe *ddb.PrunedError
+	if errors.As(err, &pe) {
+		return nil, &prunedError{res: r.resHandle(pe.NS, pe.Name), seq: r.revHandle(pe.NS, pe.Name, pe.Pos)}
+	}
+	return b, err
 }
 
 // ancestry: a resource's chain, then its first revision's foreign
@@ -564,7 +629,25 @@ func (r *ddbReads) locate(segs []segment, id ids.ID) (int, *revRow) {
 	return -1, nil
 }
 
-func (r *ddbReads) horizonID(res int64) string { return "" }
+func (r *ddbReads) horizonID(res int64) string {
+	if rr := r.resItem(res); rr != nil {
+		return rr.HorizonID
+	}
+	return ""
+}
+
+// resItem is resource handle res's item, read once per check.
+func (r *ddbReads) resItem(res int64) *ddb.ResRow {
+	rr, ok := r.resRows[res]
+	if !ok {
+		k := r.res[res]
+		var err error
+		rr, err = r.s.Resource(r.ctx, k.ns, k.name)
+		r.must(err)
+		r.resRows[res] = rr
+	}
+	return rr
+}
 
 // namesAfter: n's own names and its bases' (read-through), the k
 // smallest of their union (namesAfter of reads.go).
@@ -628,24 +711,41 @@ func (r *ddbReads) authorName(id int64) string { return r.authors[id] }
 
 // --- what this backend doesn't store ---
 
-func (r *ddbReads) archiveURL(res, seq int64) string { panic(ddbUnsupported("archives")) }
+func (r *ddbReads) archiveURL(res, seq int64) string {
+	k := r.res[res]
+	u, err := r.s.ArchiveFor(r.ctx, k.ns, k.name, r.revs[seq].key.pos)
+	r.must(err)
+	return u
+}
 
 // referencedUpTo: every blob a document of res references is attached to
-// res, at the first revision that referenced it (refPos), and pruning,
-// which ends attachments, isn't built here: a document up to max
-// references bid exactly when the attachment's first is at or before.
+// res, at the first revision that referenced it (refPos): a document up
+// to max references bid when the attachment's first is at or before. A
+// pruned attachment keeps its refPos; below the horizon nothing is
+// served, and a document above it that references the blob kept it
+// attached (ddbprune.go).
 func (r *ddbReads) referencedUpTo(res, max int64, bid ids.ID) bool {
 	k := r.res[res]
 	b, err := r.s.Attachment(r.ctx, k.ns, k.name, bid.String())
 	r.must(err)
 	return b != nil && b.RefPos > 0 && b.RefPos <= r.revs[max].key.pos
 }
-func (r *ddbReads) declaredAt(row *revRow) []ids.ID   { panic(ddbUnsupported("e2e namespaces")) }
-func (r *ddbReads) dek(res int64, create bool) []byte { panic(ddbUnsupported("encryption at rest")) }
-func (r *ddbReads) e2eEpochOK(n *nsRow, cfg *Config, e int) bool {
-	panic(ddbUnsupported("sealed namespaces"))
+func (r *ddbReads) declaredAt(row *revRow) []ids.ID { panic(ddbUnsupported("e2e namespaces")) }
+
+// dek: the grants key for grantsDEK, else the resource's.
+func (r *ddbReads) dek(res int64, create bool) []byte {
+	var k []byte
+	var err error
+	if res == grantsDEK {
+		k, err = r.b.dekFor(r.ctx, "", "", create)
+	} else {
+		rf := r.res[res]
+		k, err = r.b.dekFor(r.ctx, rf.ns, rf.name, create)
+	}
+	r.must(err)
+	return k
 }
-func (r *ddbReads) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
+func (r *ddbReads) e2eEpochOK(n *nsRow, cfg *Config, e int) bool {
 	panic(ddbUnsupported("sealed namespaces"))
 }
 
@@ -737,9 +837,26 @@ func ddbCheck[T any](f func() T) (out T, err error) {
 // --- blobs ---
 
 // ddbBlobRow is a store row as the gate's, of resource handle res.
-func ddbBlobRow(res int64, b *ddb.BlobRow) *blobRow {
+// blobRowOf is a store row as the gate's, of resource handle res: its
+// owner the handle of the resource whose key encrypts its bytes, 0 for
+// plaintext ones (openBytes).
+func (r *ddbReads) blobRowOf(res int64, b *ddb.BlobRow) *blobRow {
 	bid, _ := ids.Parse(b.Bid)
-	return &blobRow{res: res, bid: bid, typ: b.Type, nonce: b.Nonce, size: b.Size, hash: b.Hash, pending: !b.Attachment}
+	out := &blobRow{res: res, bid: bid, typ: b.Type, nonce: b.Nonce, size: b.Size, hash: b.Hash, pending: !b.Attachment, pruned: b.Pruned}
+	if b.Owner != "" {
+		ns, name, _ := strings.Cut(b.Owner, "\x00")
+		out.owner = r.resHandle(ns, name)
+	}
+	return out
+}
+
+// ownerName is the owner of a blob row's bytes as the store names it.
+func (r *ddbReads) ownerName(owner int64) string {
+	if owner == 0 {
+		return ""
+	}
+	k := r.res[owner]
+	return ownerOf(k.ns, k.name)
 }
 
 func (r *ddbReads) attachedBlob(res int64, bid ids.ID) *blobRow {
@@ -749,7 +866,7 @@ func (r *ddbReads) attachedBlob(res int64, bid ids.ID) *blobRow {
 	if b == nil {
 		return nil
 	}
-	return ddbBlobRow(res, b)
+	return r.blobRowOf(res, b)
 }
 
 func (r *ddbReads) pendingBlob(res int64, bid ids.ID, uploader string, cutoff int64) *blobRow {
@@ -759,17 +876,37 @@ func (r *ddbReads) pendingBlob(res int64, bid ids.ID, uploader string, cutoff in
 	if b == nil || b.Created < cutoff {
 		return nil
 	}
-	return ddbBlobRow(res, b)
+	return r.blobRowOf(res, b)
 }
 
 // blobArchive: no archives on this backend.
-func (r *ddbReads) blobArchive(res int64, bid ids.ID) string { return "" }
+func (r *ddbReads) blobArchive(res int64, bid ids.ID) string {
+	k := r.res[res]
+	u, err := r.s.BlobArchive(r.ctx, k.ns, k.name, bid.String())
+	r.must(err)
+	return u
+}
+
+func (r *ddbReads) context() context.Context { return r.ctx }
 
 func (r *ddbReads) openBytes(owner int64, hash []byte) blobContent {
 	data, file, ok, err := r.s.Bytes(r.ctx, hash)
 	r.must(err)
 	if !ok {
 		panic(fmt.Errorf("blob bytes %x are missing", hash))
+	}
+	if owner != 0 {
+		// Encrypted under their owner's key: opened whole.
+		if file != "" {
+			f, err := r.e.openStored(r.ctx, file)
+			r.must(err)
+			data, err = io.ReadAll(f)
+			f.Close()
+			r.must(err)
+		}
+		plain, err := r.b.openOwned(r.ctx, r.ownerName(owner), hash, data)
+		r.must(err)
+		return memContent(plain)
 	}
 	if file == "" {
 		return memContent(data)
@@ -799,10 +936,6 @@ func (r *ddbReads) pendingUsed(n *nsRow, uploader string, cutoff, res int64, bid
 		used += max(p.Size, pendingMin)
 	}
 	return used
-}
-
-func (r *ddbReads) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJob {
-	panic(ddbUnsupported("sealed namespaces"))
 }
 
 // --- schema references ---
@@ -849,12 +982,26 @@ func (r *ddbReads) schemaRefOf(seq int64) (string, bool) {
 
 func (r *ddbReads) knowRevID(seq int64, id ids.ID) {}
 
-// prunedIn: nothing is pruned on this backend; a purged resource's range
-// is (prunedIn of resolve.go).
+// prunedIn: a purged resource's range is purged; one reaching below a
+// horizon is pruned at its newest revision there (ddb.Store.PrunedBelow;
+// prunedIn of resolve.go).
 func (r *ddbReads) prunedIn(segs []segment, lo int64) error {
-	for _, s := range segs {
-		if r.purgedRes(s.res) {
+	for i, sg := range segs {
+		if r.purgedRes(sg.res) {
 			return purgedError{}
+		}
+		if rr := r.resItem(sg.res); rr == nil || rr.HorizonPos == 0 {
+			continue
+		}
+		var from uint64
+		if i == len(segs)-1 && lo != 0 {
+			from = r.revs[lo].key.pos
+		}
+		k := r.res[sg.res]
+		pos, err := r.s.PrunedBelow(r.ctx, k.ns, k.name, from, r.revs[sg.max].key.pos)
+		r.must(err)
+		if pos > 0 {
+			return &prunedError{res: sg.res, seq: r.revHandle(k.ns, k.name, pos)}
 		}
 	}
 	return nil
@@ -917,14 +1064,7 @@ func (r *ddbReads) resState(res int64) int {
 
 // purgedRes reports whether resource handle res is purged.
 func (r *ddbReads) purgedRes(res int64) bool {
-	rr, ok := r.resRows[res]
-	if !ok {
-		k := r.res[res]
-		var err error
-		rr, err = r.s.Resource(r.ctx, k.ns, k.name)
-		r.must(err)
-		r.resRows[res] = rr
-	}
+	rr := r.resItem(res)
 	return rr != nil && rr.Purged
 }
 
@@ -938,14 +1078,6 @@ func (r *ddbReads) entryConfig(seq int64) (int64, string) {
 	return h, string(jsonv.Canonical(r.cfgRow(h).Doc))
 }
 
-func (r *ddbReads) resJob(n *nsRow, name string, row *revRow, kind string, plain func() []byte) *sealJob {
-	panic(ddbUnsupported("sealed namespaces"))
-}
-func (r *ddbReads) stored(n *nsRow, j *sealJob) bool   { panic(ddbUnsupported("sealed namespaces")) }
-func (r *ddbReads) entryEpoch(n *nsRow, seq int64) int { panic(ddbUnsupported("sealed namespaces")) }
-func (r *ddbReads) epochKey(ns int64, epoch int) []byte {
-	panic(ddbUnsupported("sealed namespaces"))
-}
 func (r *ddbReads) e2eSnapshot(row *revRow) string  { panic(ddbUnsupported("e2e namespaces")) }
 func (r *ddbReads) e2eFoldSince(row *revRow) string { panic(ddbUnsupported("e2e namespaces")) }
 
@@ -996,9 +1128,6 @@ func (r *ddbReads) branchEntry(base *nsRow, gseq int64) (int64, bool) {
 	return r.logHandle(bname, b.EntryPos), true
 }
 
-// liveRegistrations: no remote branches here.
-func (r *ddbReads) liveRegistrations(n *nsRow) []map[string]any { return nil }
-
 // readThrough completes the view of a resource n has no head of: in a
 // branch, the base's as of the entry it branched at (resolve of
 // resolve.go); NotFound elsewhere.
@@ -1011,4 +1140,169 @@ func (r *ddbReads) readThrough(n *nsRow, v *view) *view {
 	bv := r.resolve(r.nsByID(n.base.Int64), v.name, &at)
 	v.state, v.head, v.src = bv.state, bv.head, bv.src
 	return v
+}
+
+// --- pruning ---
+
+// --- pruning ---
+
+func (r *ddbReads) firstRev(res int64) int64 {
+	k := r.res[res]
+	return r.revHandle(k.ns, k.name, 1)
+}
+
+func (r *ddbReads) firstRevSince(res, cutoff int64) (int64, bool) {
+	k := r.res[res]
+	pos, err := r.s.FirstRevSince(r.ctx, k.ns, k.name, cutoff)
+	r.must(err)
+	return r.revHandle(k.ns, k.name, pos), pos > 0
+}
+
+func (r *ddbReads) nthNewestRev(res int64, n int) (int64, bool) {
+	k := r.res[res]
+	pos, err := r.s.NthNewestRev(r.ctx, k.ns, k.name, n)
+	r.must(err)
+	return r.revHandle(k.ns, k.name, pos), pos > 0
+}
+
+// headAtEntry: the history rows (ddb.Store.HeadAt), as resolve at an
+// earlier entry reads them.
+func (r *ddbReads) headAtEntry(res, at int64) (int64, bool) {
+	k := r.res[res]
+	h, err := r.s.HeadAt(r.ctx, k.ns, k.name, r.logs[at].pos)
+	r.must(err)
+	if h == nil {
+		return 0, false
+	}
+	return r.revHandle(k.ns, k.name, h.Pos), true
+}
+
+func (r *ddbReads) retainedNames(n *nsRow) []string {
+	names, err := r.s.RetainedNames(r.ctx, r.nsName(n.id))
+	r.must(err)
+	return names
+}
+
+// --- archives ---
+
+// archivedBlobs: the documents of the range, folded (ddb.Store.EachDocIn),
+// stand in for blob_refs.
+func (r *ddbReads) archivedBlobs(res, fromSeq, lastSeq int64) map[int64][]ids.ID {
+	k := r.res[res]
+	out := map[int64][]ids.ID{}
+	seen := map[ids.ID]bool{}
+	r.must(r.s.EachDocIn(r.ctx, k.ns, k.name, r.revs[fromSeq].key.pos, r.revs[lastSeq].key.pos, func(pos uint64, doc any) error {
+		for _, ref := range blobRefsOf(doc) {
+			if !seen[ref.bid] {
+				seen[ref.bid] = true
+				h := r.revHandle(k.ns, k.name, pos)
+				out[h] = append(out[h], ref.bid)
+			}
+		}
+		return nil
+	}))
+	for h := range out {
+		slices.SortFunc(out[h], func(a, b ids.ID) int { return bytes.Compare(a[:], b[:]) })
+	}
+	return out
+}
+
+// grantFirstEntry: the namespace's grant marker keeps the first entry
+// recording it.
+func (r *ddbReads) grantFirstEntry(n *nsRow, gid ids.ID, bound sql.NullInt64) (cfg, created int64, ok bool) {
+	ns := r.nsName(n.id)
+	pos, err := r.s.GrantFirstPos(r.ctx, ns, gid.String())
+	r.must(err)
+	if pos == 0 || bound.Valid && pos > r.logs[bound.Int64].pos {
+		return 0, 0, false
+	}
+	le, err := r.s.EntryAt(r.ctx, ns, pos)
+	r.must(err)
+	if le == nil {
+		return 0, 0, false
+	}
+	return r.cfgHandle(ns, le.CfgPos), le.Created, true
+}
+
+func (r *ddbReads) configAtTime(n *nsRow, created int64) (int64, bool) {
+	ns := r.nsName(n.id)
+	pos, err := r.s.ConfigAtTime(r.ctx, ns, created)
+	r.must(err)
+	return r.cfgHandle(ns, pos), pos > 0
+}
+
+func (r *ddbReads) firstEntryCreated() (int64, bool) {
+	ms, ok, err := r.s.FirstEntryTime(r.ctx)
+	r.must(err)
+	return ms, ok
+}
+
+// archiveSealer: nothing is encrypted at rest here.
+// archiveSealer: an archive of a resource encrypted at rest is sealed
+// with a key derived from its data key (archiveSealer of crypt.go).
+func (r *ddbReads) archiveSealer(res int64) func(io.Writer) (io.WriteCloser, error) {
+	rf := r.res[res]
+	if n := r.nsByName(rf.ns); n == nil || r.nsLevel(n) < levelAtRest {
+		return nil
+	}
+	dek := r.dek(res, true)
+	return func(w io.Writer) (io.WriteCloser, error) { return sealArchive(w, dek) }
+}
+
+// --- gestures ---
+
+// gestureRows: the revisions the gesture's markers confirm, in the order
+// they were written (ddb.Store.GestureRevs), after the cursor's.
+func (r *ddbReads) gestureRows(n *nsRow, gesture string, after *gestureRow, limit int) []gestureRow {
+	ns := r.nsName(n.id)
+	gs, err := r.s.GestureRevs(r.ctx, ns, gesture)
+	r.must(err)
+	start := 0
+	if after != nil {
+		k := r.revs[after.seq].key
+		start = len(gs)
+		for i, g := range gs {
+			if g.Name == k.name && g.Rev.Pos == k.pos {
+				start = i + 1
+				break
+			}
+		}
+		if start == len(gs) {
+			// A revision the gesture doesn't list: after those its entry
+			// wrote before it.
+			ri, err := r.s.RevAt(r.ctx, k.ns, k.name, k.pos)
+			r.must(err)
+			start = sort.Search(len(gs), func(i int) bool { return ri != nil && gs[i].Rev.LogPos > ri.LogPos })
+		}
+	}
+	purged := map[string]bool{}
+	var out []gestureRow
+	for _, g := range gs[start:] {
+		if len(out) >= limit {
+			break
+		}
+		p, ok := purged[g.Name]
+		if !ok {
+			p = r.purgedRes(r.resHandle(ns, g.Name))
+			purged[g.Name] = p
+		}
+		if p {
+			continue
+		}
+		row := r.revRowOf(ns, g.Rev)
+		out = append(out, gestureRow{name: g.Name, res: row.res, seq: row.seq, id: row.id, kind: row.kind,
+			gesture: row.gesture, undoes: row.undoes, author: row.author, created: row.created})
+	}
+	return out
+}
+
+// writingEntry: the revision records the entry that committed it.
+func (r *ddbReads) writingEntry(res, seq int64) (int64, bool) {
+	ref := r.revs[seq]
+	ri, err := r.s.RevAt(r.ctx, ref.key.ns, ref.key.name, ref.key.pos)
+	r.must(err)
+	if ri == nil || ri.LogPos == 0 {
+		return 0, false
+	}
+	return r.logHandle(ref.key.ns, ri.LogPos), true
 }

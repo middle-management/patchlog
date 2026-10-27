@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -62,7 +63,7 @@ func (c *Config) retentionRule(name string) *RetentionRule {
 }
 
 // retentionIndex is the index of a rule of cfg.Retention.
-func (t *tx) retentionIndex(cfg *Config, r *RetentionRule) int {
+func (t *gate) retentionIndex(cfg *Config, r *RetentionRule) int {
 	for i := range cfg.Retention {
 		if &cfg.Retention[i] == r {
 			return i
@@ -181,28 +182,41 @@ func (e *Engine) checkArchives(cfg *Config) *Error {
 // retentionBoundary is the seq of the oldest entry the rule keeps for res:
 // entries at or after it stay. keep keeps whichever is longer, the last
 // revisions or everything newer than age (§8.6); the head always stays.
-func (t *tx) retentionBoundary(r *RetentionRule, res *resRow) int64 {
+func (t *gate) retentionBoundary(r *RetentionRule, res *resRow) int64 {
 	head := res.headSeq.Int64
 	b := head
 	if r.KeepRevisions > 0 {
-		var seq int64
-		err := t.QueryRow(`SELECT seq FROM revisions WHERE res = ? ORDER BY seq DESC LIMIT 1 OFFSET ?`, res.id, r.KeepRevisions-1).Scan(&seq)
-		if errors.Is(err, sql.ErrNoRows) {
+		seq, ok := t.nthNewestRev(res.id, r.KeepRevisions)
+		if !ok {
 			// Fewer entries than that: everything stays.
-			t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ?`, res.id).Scan(&seq))
-		} else {
-			t.must(err)
+			seq = t.firstRev(res.id)
 		}
 		b = min(b, seq)
 	}
 	if r.KeepAge > 0 {
-		var seq sql.NullInt64
-		t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ? AND created >= ?`, res.id, t.now.Add(-r.KeepAge).UnixMilli()).Scan(&seq))
-		if seq.Valid {
-			b = min(b, seq.Int64)
+		if seq, ok := t.firstRevSince(res.id, t.now.Add(-r.KeepAge).UnixMilli()); ok {
+			b = min(b, seq)
 		}
 	}
 	return b
+}
+
+// nthNewestRev is res's k-th newest revision (k ≥ 1).
+func (t *tx) nthNewestRev(res int64, k int) (int64, bool) {
+	var seq int64
+	err := t.QueryRow(`SELECT seq FROM revisions WHERE res = ? ORDER BY seq DESC LIMIT 1 OFFSET ?`, res, k-1).Scan(&seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false
+	}
+	t.must(err)
+	return seq, true
+}
+
+// firstRev is res's first revision.
+func (t *tx) firstRev(res int64) int64 {
+	var seq int64
+	t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ?`, res).Scan(&seq))
+	return seq
 }
 
 // RetentionAuthor is the author recorded for prunes by the retention applier.
@@ -219,35 +233,20 @@ type RetentionReport struct {
 // (§8.6). It runs as the server itself, not under a grant: the rules were
 // set with a * key. Each resource is pruned in its own transaction.
 func (e *Engine) ApplyRetention(ctx context.Context) (*RetentionReport, error) {
-	if err := e.be.lacks("pruning"); err != nil {
-		return nil, err
-	}
 	type target struct{ ns, name string }
 	var targets []target
-	err := e.read(ctx, func(t *tx) error {
-		rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND base IS NULL AND name NOT LIKE '~%' ORDER BY name`)
-		t.must(err)
-		var all []*nsRow
-		for rows.Next() {
-			n, err := scanNS(rows)
-			t.must(err)
-			all = append(all, n)
-		}
-		rows.Close()
+	err := e.gateRead(ctx, func(t *gate) error {
+		all := t.allNamespaces()
+		sort.Slice(all, func(i, j int) bool { return all[i].name < all[j].name })
 		for _, n := range all {
 			// At E3 the server can't compute the snapshot a prune needs:
 			// a key-holding janitor applies retention (§8.6).
-			if c := t.config(n.configSeq); len(c.Retention) == 0 || c.level == levelE2E {
+			if c := t.config(n.configSeq); n.isBranch() || len(c.Retention) == 0 || c.level == levelE2E {
 				continue
 			}
-			rs, err := t.Query(`SELECT name FROM resources WHERE ns = ? AND state != ? AND head_seq IS NOT NULL ORDER BY name`, n.id, statePurged)
-			t.must(err)
-			for rs.Next() {
-				var name string
-				t.must(rs.Scan(&name))
+			for _, name := range t.retainedNames(n) {
 				targets = append(targets, target{n.name, name})
 			}
-			rs.Close()
 		}
 		return nil
 	})
@@ -259,12 +258,7 @@ func (e *Engine) ApplyRetention(ctx context.Context) (*RetentionReport, error) {
 		if err := e.jobStep(ctx); err != nil {
 			return rep, err
 		}
-		var checked, pruned bool
-		err := e.update(ctx, func(t *tx) error {
-			c, p, err := t.applyRetention(tg.ns, tg.name)
-			checked, pruned = c, p
-			return err
-		})
+		checked, pruned, err := e.be.retain(ctx, tg.ns, tg.name)
 		if checked {
 			rep.Checked++
 		}
@@ -278,19 +272,22 @@ func (e *Engine) ApplyRetention(ctx context.Context) (*RetentionReport, error) {
 	return rep, nil
 }
 
-func (t *tx) applyRetention(nsName, name string) (checked, pruned bool, err error) {
+// planRetention decides what retention prunes of name in nsName (§8.6):
+// nil if nothing; checked if a rule selected it.
+func (t *gate) planRetention(nsName, name string) (p *prunePlan, checked bool, err error) {
 	n := t.nsForWrite(nsName)
 	if n == nil || n.purged || n.isBranch() || n.isShadow() {
-		return false, false, nil
+		return nil, false, nil
 	}
 	cfg := t.config(n.configSeq)
 	rule := cfg.retentionRule(name)
 	if rule == nil || cfg.level == levelE2E {
-		return false, false, nil
+		return nil, false, nil
 	}
-	own := t.resource(n.id, name)
-	if own == nil || own.state == statePurged || !own.headSeq.Valid {
-		return false, false, nil
+	v := t.resolve(n, name, nil)
+	own := v.own
+	if own == nil || v.state == Purged || !own.headSeq.Valid {
+		return nil, false, nil
 	}
 	// A rule without archive uses the operator's destination; with none,
 	// it applies only if it says "archive": false (§8.6).
@@ -299,14 +296,14 @@ func (t *tx) applyRetention(nsName, name string) (checked, pruned bool, err erro
 	if !rule.NoArchive {
 		dest, hasArchive = t.archiveDest(rule)
 		if rule.Archive != "" && !hasArchive {
-			return true, false, fmt.Errorf("archive destination %q is not allowed by this deployment; not pruning", rule.Archive)
+			return nil, true, fmt.Errorf("archive destination %q is not allowed by this deployment; not pruning", rule.Archive)
 		}
 		if !hasArchive {
 			key := fmt.Sprintf("%s\x00%d\x00%d", n.name, n.configSeq, t.retentionIndex(cfg, rule))
 			if _, logged := t.e.retentionSkipped.LoadOrStore(key, true); !logged {
 				log.Printf("retention: %s: a rule without archive applies only with an operator archive destination or \"archive\": false; skipping it (§8.6)", n.name)
 			}
-			return false, false, nil
+			return nil, false, nil
 		}
 	}
 	h := t.rev(t.retentionBoundary(rule, own))
@@ -330,7 +327,15 @@ func (t *tx) applyRetention(nsName, name string) (checked, pruned bool, err erro
 			}
 		}
 	}
-	res, perr := t.pruneTo(n, name, own, h, keep, keepStrs, dest, hasArchive, t.authorID(RetentionAuthor))
+	return &prunePlan{n: n, cfg: cfg, own: own, h: h, keep: keep, keepStrs: keepStrs, dest: dest, hasArchive: hasArchive}, true, nil
+}
+
+func (t *tx) applyRetention(nsName, name string) (checked, pruned bool, err error) {
+	p, checked, err := t.planRetention(nsName, name)
+	if p == nil || err != nil {
+		return checked, false, err
+	}
+	res, perr := t.pruneTo(p.n, name, p.own, p.h, p.keep, p.keepStrs, p.dest, p.hasArchive, t.authorID(RetentionAuthor))
 	if perr != nil {
 		return true, false, perr
 	}
@@ -373,4 +378,29 @@ func (e *Engine) retentionLoop(interval time.Duration) {
 			}
 		}
 	}
+}
+
+// sqlRetain applies retention to name in ns (ApplyRetention, on SQL).
+func (e *Engine) sqlRetain(ctx context.Context, ns, name string) (checked, pruned bool, err error) {
+	err = e.update(ctx, func(t *tx) error {
+		c, p, err := t.applyRetention(ns, name)
+		checked, pruned = c, p
+		return err
+	})
+	return checked, pruned, err
+}
+
+// resourceNames lists n's own unpurged resources with a head, by name.
+func (t *tx) retainedNames(n *nsRow) []string {
+	rs, err := t.Query(`SELECT name FROM resources WHERE ns = ? AND state != ? AND head_seq IS NOT NULL ORDER BY name`, n.id, statePurged)
+	t.must(err)
+	defer rs.Close()
+	var out []string
+	for rs.Next() {
+		var name string
+		t.must(rs.Scan(&name))
+		out = append(out, name)
+	}
+	t.must(rs.Err())
+	return out
 }

@@ -21,7 +21,25 @@ blob reads, `PutBytes` and `PutPending` an upload's writes, `ScanBlobs`,
 `DeletePending`, `DeleteBytes` the sweep's; schemas.go's `SchemaRefs`,
 `Namespaces` and `RevsByID` answer schemaReads' referrer checks, from
 `PutSchemaRefs`' markers, the `#NAMESPACES` registry `CreateNamespace`
-writes, and GSI1.
+writes, and GSI1. Pruning (prune.go): `Commit.Prune` moves a
+resource's horizon, `PutSnapshots` writes the documents it keeps before
+the commit, `PruneContent`, `EachDoc`, `EachSnapshot`, `Attachments`,
+`EndAttachment` and `DonePruning` finish it, `Pruning` lists the
+unfinished for the sweep; `PrunedBelow`, `FirstRevSince`,
+`NthNewestRev` and `RetainedNames` are the retention and paging reads,
+and `DocAt` answers a `*PrunedError` below a horizon. Archives
+(archives.go): `CommitPrune.Archive` records one in the prune's commit;
+`Archives`, `ArchiveFor`, `BlobArchive`, `GrantFirstPos`,
+`ConfigAtTime` and `EachDocIn` are what building and naming them read;
+`DeleteArchive`, `RestorePatches`, `PatchesMissing`, `ClearHorizon` and
+`RestoreAttachment` are a purge's and a restore's writes. Gestures
+(gestures.go): `GestureMarks` and `PutGestureMarks` index a commit's
+gestured steps before it; `GestureRevs` lists a gesture's confirmed
+revisions in commit order. Remote branches: remote.go's `REG#`
+registrations (`Commit.Registration`, `RegistrationOf`,
+`Registrations`); shadow.go's `ImportShadow`, `CreateRemoteBranch`,
+`RemoteBaseOf`, `RemoteBases`, `SetCheckpoint`, `SetRegistration`,
+`PutNotice`, `Notices` and `PurgeShadow`.
 Serving reads are core's, through the same reads: `EntriesBetween` and
 `RevsBetween` (a log's or a chain's range), `HeadAt` (a head as of an
 entry, from the history rows), `ListHeads`, `FoldResource` (crossing
@@ -87,8 +105,10 @@ commit: the `-grouped` benchmarks keep rising with writers instead.
 
 ## Simplifications (all deliberate)
 
-- The scope is plain namespaces and local branches: no remote branches,
-  sealed/e2e, or the S3 offload of large values. Purges (purge.go) commit their flags at once
+- The scope is plain, at-rest and sealed namespaces, local and remote
+  branches: no e2e, or the S3 offload of large values. The store holds
+  no keys: core seals what it writes and opens what the store folds
+  (crypt.go, sealed.go, blobepochs.go). Purges (purge.go) commit their flags at once
   and their content after (`PurgeContent`, finished by the sweep from
   `PURGING#` markers when interrupted); second CDN purges queue in the
   commit (repurge.go). Blobs (blobs.go) keep attachments and

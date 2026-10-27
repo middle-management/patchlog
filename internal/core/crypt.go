@@ -739,14 +739,21 @@ var ErrArchiveKeyDestroyed = errors.New("the archive is encrypted and its data k
 // an encrypted namespace. An encrypted archive of a purged resource is
 // ErrArchiveKeyDestroyed.
 func (e *Engine) OpenArchive(ctx context.Context, ns, name string, r io.Reader) (io.Reader, error) {
-	if err := e.be.lacks("archives"); err != nil {
-		return nil, err
-	}
 	br := bufio.NewReaderSize(r, 1<<16)
 	head, _ := br.Peek(len(archiveMagic))
 	if string(head) != archiveMagic {
 		return br, nil
 	}
+	dek, err := e.be.archiveDEK(ctx, ns, name)
+	if err != nil {
+		return nil, err
+	}
+	return openArchive(br, dek)
+}
+
+// sqlArchiveDEK is the data key an archive of ns/name is sealed with:
+// ErrArchiveKeyDestroyed once the resource is purged.
+func (e *Engine) sqlArchiveDEK(ctx context.Context, ns, name string) ([]byte, error) {
 	var dek []byte
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
@@ -767,10 +774,7 @@ func (e *Engine) OpenArchive(ctx context.Context, ns, name string, r io.Reader) 
 		dek = k
 		return err
 	})
-	if err != nil {
-		return nil, err
-	}
-	return openArchive(br, dek)
+	return dek, err
 }
 
 // archiveSealer returns the Seal function of an archive of res, or nil if

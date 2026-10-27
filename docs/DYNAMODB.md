@@ -123,27 +123,31 @@ NS#<ns>                     #TIP                                namespace log ti
 NS#<ns>                     CFG#<pos12>                         config chain entry: id, parentPos, patches, doc|docRef, firstLogPos
 NS#<ns>                     LOG#<pos12>                         ns_log entry: id, prevPos, kind, res?, body|bodyRef, cfgPos,
                                                                 author, created, grantId, noAuth, gestures
-NS#<ns>                     RES#<name>                          resource: headPos, headId, state, horizonPos, keep, snapRevs/Bytes
+NS#<ns>                     RES#<name>                          resource: headPos, headId, state, horizonPos/Id/Base, keep, kept, snapRevs/Bytes
 NS#<ns>                     REV#<name>#<pos12>                  revision: id, parent (pos | {ns,name,pos} foreign), kind, first,
                                                                 patches|patchesRef, author, created, grantId, schemaRef,
-                                                                gesture?, undoes?, size?, digest?, epoch?
+                                                                gesture?, undoes?, signature?, size?, digest?, epoch?
 NS#<ns>                     DOC#<name>#HEAD                     head snapshot: revPos, doc|docRef
-NS#<ns>                     DOC#<name>#SNAP#<pos12>             intermediate / kept snapshot (D.4, §8.6)
+NS#<ns>                     SNAP#<name>#<pos12>                 kept snapshot below a horizon (§8.6); intermediate (D.4) not built
+NS#<ns>                     PRUNING#<name>                      a prune whose content is still to go: horizonPos, kept positions
 NS#<ns>                     HIST#<name>#<logPos12>              head_history row: revPos
 NS#<ns>                     BLOB#<name>#<bid>                   blob attachment: type, nonce, size, hash, owner, refPos, pruned
 NS#<ns>                     BREF#<name>#<bid>#<fromPos12>       blob reference interval: toPos?
 NS#<ns>                     PEND#<bid>#<uploader>               pending blob upload (GSI2 on created for the sweep)
-NS#<ns>                     EPOCH#<n>                           sealed epoch key (wrapped)
-NS#<ns>                     SEALED#<kind>#<key>                 sealed response (JWE)
+NS#<ns>                     DEK#<name>                          resource data key (wrapped, keystore), at rest and sealed
+NS#<ns>                     #ENCRYPTING                         an encryption of existing content still to finish
+NS#<ns>                     EPOCHKEY#<n12>                      sealed epoch key (encrypted under the namespace's key), created
+NS#<ns>                     SEALED#<kind>#<key>                 sealed response (JWE), first stored wins; name, revPos
 NS#<ns>                     E2E#<n>                             e2e epoch registry row
 NS#<ns>                     E2ESNAP#<name>#<pos12>              e2e sealed snapshot (JWE)
-NS#<ns>                     BLOBEPOCH#<name>#<bid>#<n>          sealed blob form per epoch (pointer)
-NS#<ns>                     ARCH#<name>#<fromPos12>             pruning archive record (§8.6)
-NS#<ns>                     REMOTE#<origin>#<branch>            registered remote branch (source side)
-NS#<shadow>                 #FOLLOW                             remote base follow state (branch side)
-NS#<shadow>                 NOTICE#<nsId>                       purge notice
+NS#<ns>                     BLOBEPOCH#<name>#<bid>#<n12>        sealed blob form per epoch: data | file (e/…), neither = 410 pruned
+NS#<ns>                     ARCH#<name>#<from12>#<to12>         pruning archive record (§8.6): key, url, created, bids
+NS#<ns>                     REG#<origin>#<branch>               registered remote branch (source side): atPos, nsPos, prevPos, expires
+NS#<branch>                 #REMOTE                             remote base (branch side): shadow, origin, ns, at, checkpoint, registration
+NS#<branch>                 NOTICE#<nsId>                       purge notice: kind, resource, applied, created, seq
+#REMOTES                    <branch>                            the remote branches (SyncRemotes)
 GRANT#<id32>                #                                   grant: blocks, rootSub, rootKid
-DEK#<ns>#<name|0>           #                                   data key (wrapped, keystore, created)
+#DEPLOY                     DEK                                 the deployment's grants key (wrapped)
 BLOB#<owner>#<hash64>       #                                   blob bytes pointer: S3 key (or inline ≤ ~350 KB)
 BUCKET#<hash>               #                                   shared rate bucket (multi-instance)
 JOB#REPURGE#<logId>         #                                    second CDN purge: tags, due (GSI2 on due)
@@ -164,7 +168,7 @@ GSIs (both on the one table):
 - **GSI2** `G2PK`+`G2SK` — sparse lookups, some time-ordered: pending blobs
   (`PEND#`, SK `created`) and repurge jobs (`REPURGE#`, SK `due`) for the
   sweeps; gesture and undoes lookups (`GEST#<g>`, `UND#<g>`; the §7.4 partial
-  indexes).
+  indexes). Phase 1 builds gestures without it: marker items (§13).
 
 Why this shape for the SQL reader:
 
@@ -496,9 +500,9 @@ What landed, beyond the spike:
   them with its queries; `internal/core/ddbreads.go` implements them over
   the table, with per-check handles for the int64 ids the gate's rows
   carry (it only hands them back). What the backend doesn't store reads
-  as empty where nothing of the kind can exist (remote registrations,
-  horizons), and as **501 "unsupported"** where a request needs a
-  feature it lacks (sealed/e2e keys, archives) — so those refusals
+  as empty where nothing of the kind can exist, and as **501
+  "unsupported"** where a request needs a
+  feature it lacks (e2e keys) — so those refusals
   are the reads', not hand-written checks. `gate_test.go` guards the
   embedding that makes this work on SQL (a read missing on `*tx` would
   compile and recurse).
@@ -550,8 +554,8 @@ What landed, beyond the spike:
   listing or a directory walk). `blob_refs`' question — does a document
   of a chain up to a revision reference a blob — is the attachment's:
   every referenced blob is attached at the first revision that
-  referenced it (`refPos`), and nothing ends an attachment here (pruning
-  isn't built), so blobs cross branches and batch sources too.
+  referenced it (`refPos`), and only pruning ends one (marking it
+  `pruned`, below), so blobs cross branches and batch sources too.
   Where blob bytes live is configurable for every database backend
   (`core.BlobStore`, whose `Open` returns an `io.ReadSeekCloser`):
   `internal/fsblobs` and `internal/s3blobs`, and DynamoDB's inline bytes
@@ -585,19 +589,16 @@ What landed, beyond the spike:
   backend lacks is its `lacks` 501, asked by the Engine method before
   anything else; everything the server can reach so answers 501 rather
   than falling through to SQL:
-  remote branches, pruning, sealed/e2e, gestures listing,
-  author signatures (which the gate would verify but the commit doesn't
-  store), remote branches, retention, sweeps, rotation. Refused
-  configurations (`encryption`, `nonce: required`, `signatures:
-  required`, `base`, `successor`) are 501 at create and change time, as
+  e2e. Refused configurations (`"encryption": {"level": "e2e"}`,
+  `successor`) are 501 at create and change time, as
   §10 prescribes ("refuse at Open or at namespace-config time").
 - **One read path.** The serving reads (`ResourceHead/Raw/Rev/Log`,
   `NamespaceHead/Rev/Log/Heads`, the events and the long-poll) are the
   SQL path's own code on the gate, as the writes' checks are, over a few
   more reads: `nsLogRows` and `revsBetween` (a log's or a resource's
   range, visited so a page stops where its bytes say), `entryConfig`,
-  `resState`, `prunedIn`, and the sealed/e2e ones, which DynamoDB
-  answers 501. On the table: revisions fold from the genesis (snapshots
+  `resState`, `prunedIn`, and the sealed ones (below); the e2e ones
+  DynamoDB answers 501. On the table: revisions fold from the genesis (snapshots
   are a later phase), `…/rev/{nsID}` joins the entry's denormalized
   `cfgPos`, a head as of an earlier entry comes from the history rows
   (`HeadAt`). DynamoDB's log and revision handles keep their positions'
@@ -653,6 +654,124 @@ What landed, beyond the spike:
   references. Second CDN purges (D.8) are queued by the commit that
   purges the tags (`#REPURGE`, `Commit.Repurge`) and sent by `Repurge`,
   whose queue is the backend's (`dueRepurges`, `doneRepurge`).
+- **Pruning and retention** (§8.6). The gate's
+  `planPrune` and `planRetention` (split out of SQL's `Prune` and
+  `applyRetention`, with `protect` and the retention boundary over the
+  reads `firstRev`, `firstRevSince`, `nthNewestRev`, `headAtEntry`)
+  decide; the documents that stay below the horizon — its last live
+  one, the keep set's, referenced schema revisions' — are `SNAP#` items
+  written just before the commit (one left by a failed commit is a
+  document its revision still has). The commit moves the RES item's
+  horizon (`horizonPos`, `horizonId`, `horizonBase`, the last live
+  revision a fold above it starts from, `keep`, and `kept`, the
+  positions below it whose snapshots are served), pinned on the head and
+  the old horizon, with the prune entry and a `PRUNING#` marker. Reads go
+  by the horizon from then on: a document below it is a kept snapshot or
+  410 pruned, a log range reaching below it is pruned (`PrunedBelow`) —
+  until the prune is finished, every revision below it; after, those
+  whose patch sets are gone, so a partial restore serves what it put
+  back, as on SQL — and the meta generation moves so
+  the read cache drops revisions it held. After the commit the patch sets
+  below the horizon go and the snapshots no longer kept
+  (`PruneContent`), then the attachments no servable document
+  references end (`EndAttachment`, conditioned on the head the documents
+  were read up to) and their bytes are collected — the fold from the
+  horizon to the head stands in for `blob_refs`; an interrupted prune is
+  finished by the blob sweep from its marker. A purge removes snapshots
+  and markers with the rest.
+- **Archives** (§8.6, §D.4). Building one is the gate's
+  `archiveBundle` (split out of SQL's `writeArchive`, with
+  `archiveGrant` and `operatorKeysAt`), over the reads `archivedBlobs`
+  — on the table, the archived range's documents folded, standing in
+  for `blob_refs` — `grantFirstEntry` (the grant marker's first
+  position), `configAtTime`, `firstEntryCreated` and `archiveSealer`
+  (the resource's data key, at rest). A prune writes its archive
+  before anything else and records it in its commit (`ARCH#` items with
+  the range, URL and the blobs its blob lines carry), which a pruned
+  revision's or blob's 410 names (`archiveURL`, `blobArchive`). A purge
+  deletes the archives, then their records, before its content (the
+  marker keeps it resumable). `Archives` and `RestoreResource` are
+  backend methods: a restore puts each verified patch set back on its
+  revision; once none is missing below the horizon the horizon goes,
+  with its snapshots, and the attachments pruning ended come back from
+  the blob lines. Intermediate snapshots (D.4) aren't rebuilt: they
+  aren't built here at all.
+- **Gestures listing** (§7.4). `Gestures` is the gate's code over two
+  reads, `gestureRows` and `writingEntry` (the entry that wrote a
+  revision: on the table, the REV item's `logPos`). Each step written
+  with a gesture or undoing one gets a marker per id,
+  `GEST#<g>#<name>#<pos12>#<created13>` with its item's index in the
+  commit, written before the commit like schema references' markers (a
+  batch's steps would outgrow the 100 actions). A listing reads the
+  gesture's markers, confirms each against the revision at its position
+  (id, created time, gesture — a failed or rechecked commit's marker
+  names another or none), and orders them by the entry that wrote them,
+  then item and step: the commit order SQL's revision seqs give, which
+  only the commit knows. So a page costs the gesture's markers — a
+  user's few saves; GSI2 (§3) is the answer if gestures grow large.
+  Purges remove the markers of what they purge.
+- **Author signatures** (§C.3.1). The gate's checks verify them as on
+  SQL (`checkSignatureShapes`, `checkSignatures`); the commit stores
+  each step's on its REV item (`signature`), which serving, archives
+  and the write's own answer return. `"signatures": "required"`
+  namespaces are created and changed as on SQL.
+- **Nonce-required namespaces** (§C.7). The checks are the gate's
+  (`checkRequiredNonces`, `checkNonceBase`, `checkNonceDependents`). What
+  SQL's locks order — a base starting to require nonces while a branch
+  stops — a config change's commit pins instead: every other
+  namespace's configuration its check read (`configPins`: a base its
+  branches', a branch its base's, the schema namespaces'), so the second
+  of two such changes is stale and checked again.
+- **Remote branches** (§G.3), plain ones. The source side:
+  `planRegistration` (split out of SQL's `registerRemote`) decides, and
+  the registration is a `REG#` item written with its "branch" entry,
+  conditioned on the latest entry the checks read; `/branches` and
+  pruning's protection read them. The branch side: a remote branch is
+  a local branch of shadow namespaces, as on SQL, and reads are a local
+  branch's. Creating one checks the genesis and the base's obligations
+  as SQL does (`checkRemoteGenesis`, `remoteObligations`), fetches and
+  verifies the base (`fetchRemote`, shared), mirrors the schema closure
+  by ordinary commits (steps keep their own authors and times), imports
+  each level's shadow with batched puts — unbounded, so not one
+  transaction; each import stamps the shadow's `#META` with a token —
+  and creates the branch in one transaction that checks the tokens and
+  records its base (`#REMOTE`, listed under `#REMOTES`). Following
+  (`SyncRemotes`) records notices and applies the base's purges as the
+  server's entries, to the branch, its branches and the shadows' copies;
+  a branch's own purge removes the shadows' copies too (`finishPurge`).
+  The storage side of following, registering and notices is the
+  backend's (`remoteBases`, `followed`, `registered`, `remoteNotices`).
+  Sealed bases are mirrored sealed (each shadow's content under its
+  own data keys); e2e bases are 501.
+- **Encryption at rest** (§E.1). `core.Open` takes a `KeyStore` and
+  checks it against the keys the table holds. The store holds no keys:
+  core encrypts what it writes (`Commit.Seal`: patch sets, head and
+  kept documents, as `ddb.Sealed` values under the resource's data key
+  with an AAD naming the kind, namespace, resource and key) and opens
+  what the store folds (the `Store.Open` hook). Data keys are `DEK#`
+  items, created put-if-absent before the commit that first needs one;
+  grants are encrypted under the deployment's `#DEPLOY` key. Blob bytes
+  are encrypted under their owner's key and stored by a hash of owner
+  and content (`ownedHash`), in files under `r/`. Raising a namespace
+  to at-rest encrypts its existing content after the config commit,
+  under an `#ENCRYPTING` marker that keeps it resumable; a purge
+  deletes the data keys first (cryptographic purge, §8.3).
+- **Sealed namespaces** (§E.2). The sealing is the SQL path's own
+  (`finishSeal`, `resJob`, `grantJob`, `Keys`), over the reads
+  `epochKey`, `entryEpoch`, `stored`, `revEpoch` and `epochStarts`. An
+  epoch's key (`EPOCHKEY#`) is written in the commit that begins the
+  epoch — the create, the config change raising the level, a rotation
+  (`RotateEpoch`, `RotateDue`, rotation on revoke) — and each revision
+  records the epoch it was written in (`epoch` on REV). Sealed values
+  are produced on first read and stored put-if-absent (`SEALED#`), the
+  first stored winning; pruning and purges delete them. Blobs
+  (§E.2.2): the epochs a blob is served under are derived from the
+  revisions referencing it — a segment's served documents folded once
+  per check, standing in for `blob_refs` — and a sealing is a
+  `BLOBEPOCH#` item, inline or a file under `e/`, stored put-if-absent
+  on first read. A prune marks the epochs it stops serving (410), a
+  restore clears the marks, an ended attachment or purge deletes the
+  sealings. e2e namespaces (§E.3) are 501.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the
@@ -677,7 +796,8 @@ entry and `ancestry` across foreign parents.
 
 Requirements and limits, by design: one instance (no stream
 invalidation — §6 is phase 3), no background loops (retention, sweeps,
-rotation, remote follow don't start).
+second CDN purges, rotation, remote follow don't start; `ApplyRetention`,
+`SweepBlobs`, `Repurge` and `SyncRemotes` work when called).
 
 Tests: the API-level suites are backend-agnostic. Every test server —
 the server package's HTTP harness, and `clienttest`'s, which the client,
@@ -691,20 +811,19 @@ PATCHLOG_TEST_BACKEND=dynamodb DDB_ENDPOINT=http://localhost:8000 go test ./...
 runs them on DynamoDB Local, a fresh table each, as `PATCHLOG_TEST_PG`
 runs them on Postgres; CI's `dynamodb` job does. What the backend hasn't
 built skips without per-test annotations: `core.Open` refusing an option
-with `core.ErrUnsupported` (encryption at rest, archives, the SQL write
-path's hooks), or a `501 {"code":"unsupported"}`
+with `core.ErrUnsupported` (the SQL write path's hooks), or a `501 {"code":"unsupported"}`
 answer on the test's own goroutine. Tests that run and answer
 differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,332 top-level tests (pure unit tests included): 1,061 pass on
-DynamoDB and 271 skip — 234 as unsupported (115 encryption at rest, 35
-remote branches, 22 nonce-required, 20 pruning, 16 gestures listing,
-…), 36 on their own conditions, and one on the known list, which calls
-pruning (retention) on its own. No test answers differently from the
-SQL backends. A test that skips partway has asserted everything before
-its skip, so the phase-1 surface is covered beyond the 1,061.
+1,320 top-level tests (pure unit tests included): 1,239 pass on
+DynamoDB and 81 skip — 37 as unsupported (33 e2e namespaces, 4 the SQL
+write path's hooks), the rest on their own conditions (Postgres-only
+tests, mostly).
+The known list is empty: no test answers differently from the SQL
+backends. A test that skips partway has asserted everything before
+its skip, so the phase-1 surface is covered beyond the 1,239.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on

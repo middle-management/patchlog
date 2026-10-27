@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
@@ -32,11 +33,47 @@ type backend interface {
 	// the purge entry's ns_id.
 	purge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error)
 	purgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error)
+	// prune is §8.6's prune: the gate's planPrune, then the backend's
+	// commit; retain applies retention to one resource (ApplyRetention).
+	prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error)
+	retain(ctx context.Context, ns, name string) (checked, pruned bool, err error)
 	// createBranch is a branch's creation (§7.6): the gate's planBranch,
 	// then the backend's commit.
 	createBranch(ctx context.Context, req Request, br BranchRequest) (*WriteResult, error)
 	// uploadBlob is an upload or copy of blob bid to name (§7.8).
 	uploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error
+
+	// registerRemote is a remote branch's registration with this, its
+	// base's deployment (RegisterRemoteBranch, §G.3).
+	registerRemote(ctx context.Context, req Request, rr RemoteRegistration) (*RegistrationResult, error)
+
+	// remoteBases lists remote branches' bases, by branch name ("" all);
+	// followed records what following one found (notices, purges, the
+	// checkpoint), registered its registration at the base; remoteNotices
+	// lists the notices (§G.3).
+	remoteBases(ctx context.Context, name string) ([]*remoteBase, error)
+	followed(ctx context.Context, b *remoteBase, entries []client.NSEntry, head string, follow bool) error
+	registered(ctx context.Context, b *remoteBase, nsID string, expires time.Time) error
+	remoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error)
+
+	// rotateEpoch is RotateEpoch's config change (§E.2.1).
+	rotateEpoch(ctx context.Context, ns, author string) (int, error)
+	// storeSealedBlob stores a blob's sealing under an epoch unless one
+	// is stored, and returns the stored bytes; nil if the blob is no
+	// longer served under it (§E.2.2).
+	storeSealedBlob(ctx context.Context, job *sealedBlobJob, sealed []byte) ([]byte, error)
+	// storeSealed stores sealed values of namespace ns the first time
+	// they are served, the first one stored winning (finishSeal, §E.2.2).
+	storeSealed(ctx context.Context, ns string, jobs []*sealJob) error
+
+	// archiveDEK is the data key an encrypted archive of ns/name is
+	// sealed with (OpenArchive).
+	archiveDEK(ctx context.Context, ns, name string) ([]byte, error)
+
+	// archives lists the archives of unpurged resources (Archives);
+	// restore puts archived patch sets back (RestoreResource, §D.4).
+	archives(ctx context.Context, ns, name string) ([]ArchiveRecord, error)
+	restore(ctx context.Context, ns, name string, entries func(yield func(ArchiveEntry) error) error) (*RestoreResult, error)
 
 	// blobStats counts what blob storage holds; sweepBlobs deletes the
 	// pending entries past their grace and the bytes nothing names;
@@ -104,12 +141,64 @@ func (b sqlBackend) purgeNamespace(ctx context.Context, req Request, ifMatch str
 	return b.e.sqlPurgeNamespace(ctx, req, ifMatch, force)
 }
 
+func (b sqlBackend) prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
+	return b.e.sqlPrune(ctx, req, name, pr)
+}
+
+func (b sqlBackend) retain(ctx context.Context, ns, name string) (bool, bool, error) {
+	return b.e.sqlRetain(ctx, ns, name)
+}
+
 func (b sqlBackend) createBranch(ctx context.Context, req Request, br BranchRequest) (*WriteResult, error) {
 	return b.e.sqlCreateBranch(ctx, req, br)
 }
 
 func (b sqlBackend) uploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error {
 	return b.e.sqlUploadBlob(ctx, req, name, bid, up)
+}
+
+func (b sqlBackend) registerRemote(ctx context.Context, req Request, rr RemoteRegistration) (*RegistrationResult, error) {
+	return b.e.sqlRegisterRemote(ctx, req, rr)
+}
+
+func (b sqlBackend) remoteBases(ctx context.Context, name string) ([]*remoteBase, error) {
+	return b.e.sqlRemoteBases(ctx, name)
+}
+
+func (b sqlBackend) followed(ctx context.Context, rb *remoteBase, entries []client.NSEntry, head string, follow bool) error {
+	return b.e.sqlFollowed(ctx, rb, entries, head, follow)
+}
+
+func (b sqlBackend) registered(ctx context.Context, rb *remoteBase, nsID string, expires time.Time) error {
+	return b.e.sqlRegistered(ctx, rb, nsID, expires)
+}
+
+func (b sqlBackend) remoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error) {
+	return b.e.sqlRemoteNotices(ctx, ns)
+}
+
+func (b sqlBackend) rotateEpoch(ctx context.Context, ns, author string) (int, error) {
+	return b.e.sqlRotateEpoch(ctx, ns, author)
+}
+
+func (b sqlBackend) storeSealedBlob(ctx context.Context, job *sealedBlobJob, sealed []byte) ([]byte, error) {
+	return b.e.sqlStoreSealedBlob(ctx, job, sealed)
+}
+
+func (b sqlBackend) storeSealed(ctx context.Context, ns string, jobs []*sealJob) error {
+	return b.e.sqlStoreSealed(ctx, ns, jobs)
+}
+
+func (b sqlBackend) archiveDEK(ctx context.Context, ns, name string) ([]byte, error) {
+	return b.e.sqlArchiveDEK(ctx, ns, name)
+}
+
+func (b sqlBackend) archives(ctx context.Context, ns, name string) ([]ArchiveRecord, error) {
+	return b.e.sqlArchives(ctx, ns, name)
+}
+
+func (b sqlBackend) restore(ctx context.Context, ns, name string, entries func(yield func(ArchiveEntry) error) error) (*RestoreResult, error) {
+	return b.e.sqlRestore(ctx, ns, name, entries)
 }
 
 func (b sqlBackend) blobStats(ctx context.Context) (*BlobStats, error) {

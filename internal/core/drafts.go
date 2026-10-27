@@ -449,7 +449,7 @@ func (t *gate) schemaUses(exclude func(ns *nsRow, res string) bool) map[string]m
 }
 
 // referencedPaths is the set of referenced schema revision paths (§6.1).
-func (t *tx) referencedPaths() map[string]bool {
+func (t *gate) referencedPaths() map[string]bool {
 	out := map[string]bool{}
 	for p := range t.schemaUses(func(*nsRow, string) bool { return false }) {
 		out[p] = true

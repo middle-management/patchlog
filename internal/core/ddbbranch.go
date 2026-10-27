@@ -42,7 +42,11 @@ func (b *ddbBackend) createBranch(ctx context.Context, req Request, br BranchReq
 			return out.replay, nil
 		}
 		p := out.p
-		gid, err := b.storeGrant(ctx, p.a)
+		sealed, serr := r.atRest(p.base)
+		if serr != nil {
+			return nil, serr
+		}
+		gid, err := b.storeGrant(ctx, p.a, sealed)
 		if err != nil {
 			return nil, err
 		}
@@ -55,6 +59,9 @@ func (b *ddbBackend) createBranch(ctx context.Context, req Request, br BranchReq
 				Name: p.name, AtPos: r.logs[p.atSeq].pos,
 				CfgID: p.cfgID.String(), Patches: string(p.canon), Doc: string(jsonv.Canonical(p.doc)), Frozen: p.cfg.Frozen,
 			},
+		}
+		if c.Branch.EpochKey, err = b.beginsEpoch(ctx, p.name, nil, p.cfg); err != nil {
+			return nil, asErrOrNil(err)
 		}
 		cres, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {

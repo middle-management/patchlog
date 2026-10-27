@@ -8,13 +8,13 @@ package core
 // core's own code on the gate.
 //
 // Deliberate gaps, all surfaced as 501 "unsupported" (lacks, or a read
-// that panics with it): remote branches, pruning, sealed and e2e
-// namespaces, nonce-required namespaces, gestures listing, author
-// signatures, head snapshots (revisions fold from the genesis). Grants,
-// edge grants, blobs, $schema validation and schemaReads, purges, local
-// branches and their drafts and merges, tombstones and restores,
-// multi-step items and batches (§7.5, bounded by the transaction's 100
-// actions) work.
+// that panics with it): sealed and e2e namespaces, intermediate
+// snapshots (revisions fold from the genesis, or from a pruning horizon).
+// Grants, edge grants, blobs, $schema validation and schemaReads, purges,
+// pruning, retention and archives, gestures listing, author signatures,
+// nonce-required namespaces, local and remote branches and their drafts
+// and merges, tombstones and restores, multi-step items and batches
+// (§7.5, bounded by the transaction's 100 actions) work.
 
 import (
 	"context"
@@ -38,6 +38,10 @@ type ddbBackend struct {
 	byID map[string]*Config
 	// refsMarked are the schema references marked (schemaRefs).
 	refsMarked markedSet
+	// keys are the data keys unwrapped (ddbcrypt.go); grantsSealed the
+	// grants stored encrypted.
+	keys         ddbKeys
+	grantsSealed markedSet
 }
 
 // markedSet is a bounded set of keys: when full it starts over (a key
@@ -73,15 +77,8 @@ var ErrUnsupported = errors.New("not implemented on this backend")
 // the SQL backends (tailer, retention, sweeps, repurge, rotation, remote
 // follow) don't start: their features are phase 2+.
 func openDDB(opt Options) (*Engine, error) {
-	if opt.KeyStore != nil {
-		return nil, fmt.Errorf("core: encryption at rest: %w (DynamoDB, docs/DYNAMODB.md phase 1)", ErrUnsupported)
-	}
-	// What it would otherwise ignore: an archive no retention loop writes,
-	// and the SQL write path's test hooks, which it never reaches — a
-	// caller waiting on one would wait for good.
-	if opt.Archiver != nil {
-		return nil, fmt.Errorf("core: archives: %w (DynamoDB, docs/DYNAMODB.md phase 2)", ErrUnsupported)
-	}
+	// What it would otherwise ignore: the SQL write path's test hooks,
+	// which it never reaches — a caller waiting on one would wait for good.
 	if opt.BeforeWriteLock != nil || opt.BeforeCommit != nil {
 		return nil, fmt.Errorf("core: the SQL write path's hooks (BeforeWriteLock, BeforeCommit): %w (DynamoDB)", ErrUnsupported)
 	}
@@ -125,7 +122,20 @@ func openDDB(opt Options) (*Engine, error) {
 	}
 	e.rc.maxBytes = opt.ReadCacheBytes
 	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
-	e.be = &ddbBackend{e: e, store: store, byID: map[string]*Config{}}
+	// Registrations are renewed within a week of expiring, as on SQL
+	// (SyncRemotes).
+	if e.opt.Remote.RenewBefore == 0 {
+		e.opt.Remote.RenewBefore = 7 * 24 * time.Hour
+	}
+	b := &ddbBackend{e: e, store: store, byID: map[string]*Config{}}
+	e.be = b
+	store.Open = b.openValue
+	if err := b.checkKeyStore(context.Background()); err != nil {
+		return nil, err
+	}
+	if err := b.checkEpochKeys(context.Background()); err != nil {
+		return nil, err
+	}
 	return e, nil
 }
 
@@ -190,16 +200,8 @@ func ddbAsErr(err error) *Error {
 // creates and changes.
 func ddbRefusals(cfg *Config) *Error {
 	switch {
-	case cfg.Encryption != "":
-		return ddbUnsupported("encrypted namespaces")
-	case cfg.NonceRequired:
-		return ddbUnsupported("nonce-required namespaces")
-	case cfg.Base != nil && cfg.Base.Origin != "":
-		return ddbUnsupported("remote branches")
-	case cfg.SignaturesRequired:
-		// Writes can't carry signatures on this backend, so a
-		// namespace requiring them would take unsigned ones (§C.3.1).
-		return ddbUnsupported("author signatures")
+	case cfg.level == levelE2E:
+		return ddbUnsupported("e2e namespaces")
 	}
 	return nil
 }
@@ -212,8 +214,11 @@ func (b *ddbBackend) commit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResu
 	e := b.e
 	// A purge takes content away from every cached answer (flushDocs, as
 	// purgeResource's).
-	purges := c.Purge != nil || c.PurgeNS
-	inv := invalidation{nss: []string{c.NS}, meta: c.Config != nil || purges, flushDocs: purges}
+	// So does a prune, from the documents below its horizon, which
+	// cached answers to revision reads hold until the meta generation
+	// moves (the SQL invalidation's: meta with every flush).
+	flush := c.Purge != nil || c.PurgeNS || c.Prune != nil
+	inv := invalidation{nss: []string{c.NS}, meta: c.Config != nil || flush, flushDocs: flush}
 	if c.Branch != nil {
 		// A namespace that now exists.
 		inv.nss, inv.meta = append(inv.nss, c.Branch.Name), true

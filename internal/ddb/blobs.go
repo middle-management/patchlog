@@ -15,11 +15,13 @@ package ddb
 //   - BYTES#<sha256 hex>: the bytes, inline (at most MaxInlineBytes) or
 //     the name of the file of the engine's blob store that holds them.
 //     Written before the item that names them, outside its transaction,
-//     like grants. Plaintext only: there is no encryption at rest here.
+//     like grants. Encrypted bytes are core's, under their owner's data
+//     key and a hash of owner and content (BlobRow.Owner).
 //
 // The sweep (core's SweepBlobs) deletes expired pending entries and the
-// bytes no item names any more, by a scan. Not yet: reference intervals
-// (blob_refs: branches, pruning and archives read them).
+// bytes no item names any more, by a scan. An attachment pruning ended
+// (pruned, prune.go) names none. Not yet: reference intervals (blob_refs:
+// archives read them).
 
 import (
 	"context"
@@ -64,6 +66,12 @@ type BlobRow struct {
 	Uploader   string // a pending entry's
 	RefPos     uint64 // an attachment's first referencing revision
 	Attachment bool
+	// Pruned is an attachment pruning ended (§7.8): no document kept
+	// references it, and it names its bytes no more.
+	Pruned bool
+	// Owner is the resource ("ns\x00name") whose data key encrypts the
+	// bytes Hash names, "" for plaintext ones (core's ddbcrypt.go).
+	Owner string
 }
 
 func (b *BlobRow) item() item {
@@ -77,6 +85,9 @@ func (b *BlobRow) item() item {
 	if b.RefPos > 0 {
 		it["refPos"] = avN(b.RefPos)
 	}
+	if b.Owner != "" {
+		it["owner"] = avS(b.Owner)
+	}
 	return it
 }
 
@@ -84,8 +95,33 @@ func scanBlob(i item) *BlobRow {
 	return &BlobRow{
 		Name: i.s("name"), Bid: i.s("bid"), Type: i.s("type"), Nonce: i.s("nonce"), Size: int64(i.n("size")),
 		Hash: i.b("hash"), Created: int64(i.n("created")), Uploader: i.s("uploader"), RefPos: i.n("refPos"),
-		Attachment: strings.HasPrefix(i.s("SK"), "BLOB#"),
+		Attachment: strings.HasPrefix(i.s("SK"), "BLOB#"), Pruned: i.n("pruned") != 0, Owner: i.s("owner"),
 	}
+}
+
+// EndAttachment marks name's attachment of bid in ns pruned, if name's
+// head is still the one at headPos the caller read every document up to
+// (core's ending of attachments after a prune): a write since may
+// reference it. ErrStale if it moved.
+func (s *Store) EndAttachment(ctx context.Context, ns, name, bid string, headPos uint64, headID string) error {
+	_, err := s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{
+		{ConditionCheck: &types.ConditionCheck{
+			TableName: &s.Table, Key: keyAV(keyRes(ns, name)),
+			ConditionExpression:       strptr("headPos = :h AND headId = :i"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":h": avN(headPos), ":i": avS(headID)},
+		}},
+		{Update: &types.Update{
+			TableName: &s.Table, Key: keyAV(keyBlob(ns, name, bid)),
+			UpdateExpression:          strptr("SET pruned = :one"),
+			ConditionExpression:       strptr("attribute_exists(PK)"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":one": avN(1)},
+		}},
+	}})
+	var ce *types.TransactionCanceledException
+	if errors.As(err, &ce) {
+		return ErrStale
+	}
+	return err
 }
 
 // Attachment reads name's attachment of bid in ns; nil when there is none.
@@ -223,6 +259,7 @@ type BlobAttach struct {
 	Bid, Type, Nonce string
 	Size             int64
 	Hash             []byte
+	Owner            string // whose data key encrypts the bytes (BlobRow)
 	Step             int
 }
 
@@ -236,7 +273,7 @@ type BlobPending struct{ Bid, Uploader string }
 func (s *Store) attachActs(c *Commit, it *CommitItem) []types.TransactWriteItem {
 	var out []types.TransactWriteItem
 	for _, a := range it.Attach {
-		b := &BlobRow{Name: it.Name, Bid: a.Bid, Type: a.Type, Nonce: a.Nonce, Size: a.Size, Hash: a.Hash,
+		b := &BlobRow{Name: it.Name, Bid: a.Bid, Type: a.Type, Nonce: a.Nonce, Size: a.Size, Hash: a.Hash, Owner: a.Owner,
 			Created: c.Created, RefPos: it.HeadPos + uint64(a.Step) + 1}
 		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: &s.Table, Item: withKey(keyBlob(c.NS, it.Name, a.Bid), b.item())}})
 	}
@@ -335,7 +372,9 @@ func (s *Store) CollectBytes(ctx context.Context, hashes [][]byte) (files []stri
 	}
 	named := map[string]bool{}
 	for _, b := range blobs {
-		named[string(b.Hash)] = true
+		if !b.Pruned {
+			named[string(b.Hash)] = true
+		}
 	}
 	stored := map[string]*BytesRow{}
 	for _, b := range bytes {

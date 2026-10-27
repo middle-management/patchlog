@@ -9,6 +9,7 @@ package ddb
 
 import (
 	"context"
+	"errors"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -23,12 +24,23 @@ type StoredGrant struct {
 // PutGrant stores grant gid. It is written before the commits that record
 // it, outside their transactions (a group's commits may share a grant):
 // one whose commit then fails is never served, since no entry names it.
-// Grant ids are content hashes, so rewriting one is harmless.
-func (s *Store) PutGrant(ctx context.Context, gid string, g StoredGrant) error {
-	_, err := s.Client.PutItem(ctx, &dynamodb.PutItemInput{
+// Grant ids are content hashes, so rewriting one is harmless — but for
+// its encryption: blocks encrypted at rest (sealed) replace what is
+// stored, plaintext ones are only stored if nothing is, so a grant used
+// in an encrypted namespace stays encrypted.
+func (s *Store) PutGrant(ctx context.Context, gid string, g StoredGrant, sealed bool) error {
+	in := &dynamodb.PutItemInput{
 		TableName: &s.Table,
 		Item:      withKey(keyGrant(gid), item{"blocks": avB(g.Blocks), "rootSub": avS(g.Sub), "rootKid": avS(g.Kid)}),
-	})
+	}
+	if !sealed {
+		in.ConditionExpression = strptr("attribute_not_exists(PK)")
+	}
+	_, err := s.Client.PutItem(ctx, in)
+	var cf *types.ConditionalCheckFailedException
+	if errors.As(err, &cf) {
+		return nil
+	}
 	return err
 }
 

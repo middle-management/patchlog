@@ -553,7 +553,7 @@ func (t *gate) nsReader(n *nsRow, cred Credentials) (*actor, *Error) {
 // anyReader is reader for a request that answers any reader of the
 // namespace, filtered to what it may read (the gestures listing, §7.4):
 // a grant with read, whatever its rules say about resources.
-func (t *tx) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
+func (t *gate) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
 		return t.edgeReader(n, cred.Edge, "")

@@ -7,4 +7,3 @@
 # Divergences: the backend answers differently from the spec.
 
 # Unsupported features met where the harness cannot skip.
-server/TestV049PurgedSkipped unsupported, met outside the harness (501): pruning, by the test's own retention call

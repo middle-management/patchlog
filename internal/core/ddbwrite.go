@@ -3,7 +3,9 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"io"
 	"slices"
 
 	"github.com/middle-management/patchlog/internal/ddb"
@@ -26,18 +28,9 @@ const ddbAttempts = 8
 // writeItems is a resource write or a batch on DynamoDB.
 func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun bool) (res *WriteResult, err error) {
 	e := b.e
-	if req.Signature != "" {
-		return nil, ddbUnsupported("author signatures")
-	}
 	for _, it := range items {
 		if it.Resource == KeyringName {
 			return nil, ddbUnsupported("e2e keyrings")
-		}
-		for _, st := range it.Steps {
-			if st.Signature != "" {
-				// The gate would verify one, but the commit stores none.
-				return nil, ddbUnsupported("author signatures")
-			}
 		}
 	}
 	ctx, span := e.dbSpan(ctx, "core.db.update")
@@ -73,16 +66,43 @@ func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, 
 		if cerr != nil {
 			return nil, cerr
 		}
-		if c.Grant, err = b.storeGrant(ctx, p.a); err != nil {
+		lvl := r.config(p.n.configSeq).level
+		if p.cplan != nil {
+			lvl = max(lvl, p.cplan.cfg.level)
+		}
+		if c.Grant, err = b.storeGrant(ctx, p.a, lvl >= levelAtRest); err != nil {
 			return nil, err
+		}
+		names := make([]string, len(c.Items))
+		for i, it := range c.Items {
+			names[i] = it.Name
+		}
+		if c.Seal, err = b.sealer(ctx, c.NS, lvl, names); err != nil {
+			return nil, asErrOrNil(err)
+		}
+		old := r.config(p.n.configSeq)
+		c.Encrypting = p.cplan != nil && old.level < levelAtRest && lvl >= levelAtRest
+		cfg := old
+		if p.cplan != nil {
+			cfg = p.cplan.cfg
+			if c.EpochKey, err = b.beginsEpoch(ctx, c.NS, old, cfg); err != nil {
+				return nil, asErrOrNil(err)
+			}
+		}
+		if cfg.level == levelSealed {
+			c.Epoch = cfg.Epoch // the epoch its revisions are sealed under (rev_epochs)
 		}
 		if err := b.schemaRefs(ctx, c); err != nil {
 			return nil, err
 		}
+		// Gestures' markers, as schema references' (ddb.GestureMarks).
+		if err := b.store.PutGestureMarks(ctx, c.NS, ddb.GestureMarks(c)); err != nil {
+			return nil, ddbAsErr(err)
+		}
 		c.NoAuth = p.a.noAuth
 		var tags []string
 		if p.cplan != nil {
-			if old := r.config(p.n.configSeq); old.cachePublic() && !p.cplan.cfg.cachePublic() {
+			if old := r.config(p.n.configSeq); purgesNS(old, p.cplan.cfg) {
 				tags = append(tags, "ns:"+req.NS)
 			}
 		}
@@ -104,6 +124,12 @@ func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, 
 			res.Entry.Grant = grantRefOf(p.a.grant)
 		}
 		b.committed(req.NS, tags...)
+		if c.Encrypting {
+			b.encrypted(ctx, req.NS)
+		}
+		if p.cplan != nil && b.revokes(old, cfg) {
+			e.rotateAfterRevoke([]string{req.NS})
+		}
 		return res, nil
 	}
 	return nil, apiErr(409, "conflict", "detail", "the write's state kept moving")
@@ -122,6 +148,7 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 	}
 	var entries []any
 	if cp := p.cplan; cp != nil {
+		c.Pins = r.configPins(ns)
 		c.Config = &ddb.CommitConfig{ID: cp.id.String(), Patches: string(cp.canon), Doc: string(jsonv.Canonical(cp.doc)), Frozen: cp.cfg.Frozen}
 		entries = append(entries, map[string]any{"kind": "config", "target": cp.id.String()})
 	}
@@ -142,7 +169,7 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 			}
 		}
 		for j, step := range s.steps {
-			cs := ddb.CommitStep{ID: step.id.String(), Tombstone: step.del, Gesture: s.Steps[j].Gesture, Undoes: s.Steps[j].Undoes}
+			cs := ddb.CommitStep{ID: step.id.String(), Tombstone: step.del, Gesture: s.Steps[j].Gesture, Undoes: s.Steps[j].Undoes, Signature: s.Steps[j].Signature}
 			if !step.del {
 				cs.SchemaRef = step.typed
 			}
@@ -207,7 +234,22 @@ func (r *ddbReads) attachOf(s *itemState) ([]ddb.BlobAttach, []ddb.BlobPending) 
 			if !src.pending && src.res == own {
 				continue // attached already
 			}
-			out = append(out, ddb.BlobAttach{Bid: bid.String(), Type: src.typ, Nonce: src.nonce, Size: src.size, Hash: src.hash, Step: j})
+			a := ddb.BlobAttach{Bid: bid.String(), Type: src.typ, Nonce: src.nonce, Size: src.size, Hash: src.hash, Step: j}
+			// An encrypted resource keeps its own copy of another's
+			// bytes, under its key (attachBlob of blobs.go).
+			a.Owner = ownerFor(r.nsLevel(s.view.ns), r.res[own].ns, r.res[own].name)
+			if r.ownerName(src.owner) != a.Owner {
+				c := r.openBytes(src.owner, src.hash)
+				plain, err := io.ReadAll(c.r)
+				if c.c != nil {
+					c.c.Close()
+				}
+				r.must(err)
+				h := sha256.Sum256(plain)
+				a.Hash, err = r.b.putOwnedBytes(r.ctx, a.Owner, h[:], plain)
+				r.must(err)
+			}
+			out = append(out, a)
 		}
 	}
 	if len(refs) == 0 {
@@ -228,7 +270,7 @@ func (r *ddbReads) attachOf(s *itemState) ([]ddb.BlobAttach, []ddb.BlobPending) 
 // answers it (logEntry of resolve.go), less its grant (grantRefOf).
 func ddbStepEntry(c *ddb.Commit, it *ddb.CommitItem, j int) *LogEntry {
 	st := it.Steps[j]
-	le := &LogEntry{ID: st.ID, Parent: st.ParentID, Kind: "rev", Author: c.Author, Created: formatTime(c.Created), Gesture: st.Gesture, Undoes: st.Undoes}
+	le := &LogEntry{ID: st.ID, Parent: st.ParentID, Kind: "rev", Author: c.Author, Created: formatTime(c.Created), Gesture: st.Gesture, Undoes: st.Undoes, Signature: st.Signature}
 	if st.Tombstone {
 		le.Kind = "tombstone"
 	} else {
@@ -244,7 +286,7 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 	e := b.e
 	if cc.IfNoneMatch {
 		if remoteBaseIn(cc.Patches) {
-			return nil, ddbUnsupported("remote branches")
+			return b.createRemoteBranch(ctx, req, cc)
 		}
 		return b.createNamespace(ctx, req, cc)
 	}
@@ -289,7 +331,7 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 		if err := ddbRefusals(p.cfg); err != nil {
 			return nil, err
 		}
-		gid, err := b.storeGrant(ctx, out.a)
+		gid, err := b.storeGrant(ctx, out.a, max(out.cur.level, p.cfg.level) >= levelAtRest)
 		if err != nil {
 			return nil, err
 		}
@@ -299,9 +341,14 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 			Config: &ddb.CommitConfig{ID: p.id.String(), Patches: string(p.canon), Doc: string(jsonv.Canonical(p.doc)), Frozen: p.cfg.Frozen},
 			Entry:  map[string]any{"kind": "config", "target": p.id.String()}, Kind: "config",
 			Gesture: cc.Gesture, Undoes: cc.Undoes,
+			Pins:       r.configPins(req.NS),
+			Encrypting: out.cur.level < levelAtRest && p.cfg.level >= levelAtRest,
+		}
+		if c.EpochKey, err = b.beginsEpoch(ctx, req.NS, out.cur, p.cfg); err != nil {
+			return nil, asErrOrNil(err)
 		}
 		var tags []string
-		if out.cur.cachePublic() && !p.cfg.cachePublic() {
+		if purgesNS(out.cur, p.cfg) {
 			// Public copies at the edge must go (§9, insertConfig).
 			tags = append(tags, "ns:"+req.NS)
 		}
@@ -314,6 +361,12 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 			return nil, ddbAsErr(err)
 		}
 		b.committed(req.NS, tags...)
+		if c.Encrypting {
+			b.encrypted(ctx, req.NS)
+		}
+		if b.revokes(out.cur, p.cfg) {
+			e.rotateAfterRevoke([]string{req.NS})
+		}
 		return &WriteResult{Status: 201, NSID: cres.NSID, ConfigID: p.id.String(), Entry: &LogEntry{Gesture: cc.Gesture, Undoes: cc.Undoes}}, nil
 	}
 	return nil, apiErr(409, "conflict", "detail", "the namespace's configuration kept moving")
@@ -327,6 +380,7 @@ func (b *ddbBackend) createNamespace(ctx context.Context, req Request, cc Config
 	g := &gate{checkReads: newDDBReads(b, ctx), checkState: &checkState{e: e, now: e.now(), write: true}}
 	type planned struct {
 		a   *actor
+		cfg *Config
 		err *Error
 	}
 	out, perr := ddbCheck(func() planned {
@@ -344,7 +398,7 @@ func (b *ddbBackend) createNamespace(ctx context.Context, req Request, cc Config
 		if err == nil {
 			err = checkConfigGestures(&cc)
 		}
-		return planned{a, err}
+		return planned{a, cfg, err}
 	})
 	switch {
 	case perr != nil:
@@ -352,9 +406,15 @@ func (b *ddbBackend) createNamespace(ctx context.Context, req Request, cc Config
 	case out.err != nil:
 		return nil, out.err
 	}
-	grantID, err := b.storeGrant(ctx, out.a)
+	grantID, err := b.storeGrant(ctx, out.a, out.cfg != nil && out.cfg.level >= levelAtRest)
 	if err != nil {
 		return nil, err
+	}
+	var ek *ddb.EpochKey
+	if out.cfg != nil {
+		if ek, err = b.beginsEpoch(ctx, req.NS, nil, out.cfg); err != nil {
+			return nil, asErrOrNil(err)
+		}
 	}
 	sctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
@@ -363,7 +423,7 @@ func (b *ddbBackend) createNamespace(ctx context.Context, req Request, cc Config
 	e.rc.begin(inv)
 	cfgID, nsID, err := b.store.CreateNamespace(sctx, &ddb.Create{
 		NS: req.NS, Author: out.a.id(), Patches: cc.Patches,
-		Grant: grantID, NoAuth: out.a.noAuth,
+		Grant: grantID, NoAuth: out.a.noAuth, EpochKey: ek,
 	})
 	e.invalidate(inv, false)
 	if err != nil {
@@ -413,23 +473,50 @@ func grantRefOf(g *grant.Grant) map[string]any {
 // write.go), before its commit (ddb.Store.PutGrant), and returns its id:
 // "" for none. A grant whose root the engine has cached (grantRoots,
 // which holds stored grants only) is stored already.
-func (b *ddbBackend) storeGrant(ctx context.Context, a *actor) (string, error) {
+//
+// With sealed (the entry's namespace is encrypted at rest), the blocks
+// are encrypted with the grants key (storeGrantBlocks of crypt.go), once
+// per grant and engine, replacing a plaintext form stored earlier.
+func (b *ddbBackend) storeGrant(ctx context.Context, a *actor, sealed bool) (string, error) {
 	e := b.e
 	if a == nil || a.grant == nil {
 		return "", nil
 	}
 	id := a.grant.ID()
 	gid := id.String()
-	if _, ok := e.grantRoots.get(id); ok {
+	if _, ok := e.grantRoots.get(id); ok && (!sealed || b.grantsSealed.has(gid)) {
 		return gid, nil
 	}
 	sg := ddb.StoredGrant{Blocks: a.grant.Stored()}
 	if len(a.grant.Blocks) > 0 {
 		sg.Sub, sg.Kid = a.grant.Blocks[0].Sub, a.grant.Blocks[0].Kid
 	}
-	if err := b.store.PutGrant(ctx, gid, sg); err != nil {
+	if sealed {
+		dek, err := b.dekFor(ctx, "", "", true)
+		if err != nil {
+			return "", asErrOrNil(err)
+		}
+		sg.Blocks = sealRow(dek, grantAAD(id[:]), sg.Blocks)
+	}
+	if err := b.store.PutGrant(ctx, gid, sg, sealed); err != nil {
 		return "", ddbAsErr(err)
 	}
 	e.grantRoots.put(id, grantRoot{sub: sg.Sub, kid: sg.Kid})
+	if sealed {
+		b.grantsSealed.add(gid)
+	}
 	return gid, nil
+}
+
+// atRest reports whether n is encrypted at rest, as the check read it.
+func (r *ddbReads) atRest(n *nsRow) (bool, error) {
+	return ddbCheck(func() bool { return r.nsLevel(n) >= levelAtRest })
+}
+
+// purgesNS reports a config change that purges the namespace's tag at the
+// edge (insertConfig of nsops.go): public copies that must go, and on a
+// raise to sealed, whatever the read setting, the /heads pages and
+// revisions with metadata the level now hides.
+func purgesNS(old, cfg *Config) bool {
+	return old.cachePublic() && !cfg.cachePublic() || old.level < levelSealed && cfg.level >= levelSealed
 }

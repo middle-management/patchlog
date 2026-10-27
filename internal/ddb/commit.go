@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -74,15 +75,34 @@ type Commit struct {
 	// after the commit (PurgeContent).
 	Purge   *CommitPurge
 	PurgeNS bool
+	// Prune moves a resource's pruning horizon (§8.6, prune.go); the
+	// patch sets below it go after the commit (PruneContent).
+	Prune *CommitPrune
 	// Repurge queues the second CDN purge of the tags the commit purges
 	// (repurge.go), in its transaction.
 	Repurge *Repurge
 	// Branch creates a branch of NS at the commit's entry (branch.go).
 	Branch *CommitBranch
+	// Registration records a remote branch's registration with the
+	// commit's entry (remote.go).
+	Registration *CommitRegistration
 	// Copies are resources of other namespaces whose copies of a schema
 	// revision a purge's in_use check relied on (§6.1): it is stale if
 	// one is purged meanwhile, as SQL's locks order the two.
 	Copies []ResourceRef
+	// EpochKey is the key of the epoch a sealed config change begins
+	// (sealed.go), written with it; Epoch is the epoch the items'
+	// revisions are written in, 0 outside a sealed namespace.
+	EpochKey *EpochKey
+	Epoch    int
+	// Encrypting marks a config change that raises the namespace to
+	// encryption at rest: its plaintext content is encrypted after the
+	// commit (EncryptContent), the #ENCRYPTING marker naming the work
+	// until it is done.
+	Encrypting bool
+	// Seal, when set, encrypts the items' patch sets and head documents
+	// at rest (Store.Open): of name, a kind and its key, the plaintext.
+	Seal func(name, kind, key, plain string) string
 	// Pins are the configurations of other namespaces the checks relied
 	// on (the schemas' namespaces: whether the writer may read them): a
 	// pin that moved makes the commit stale, as its own configuration's.
@@ -160,6 +180,13 @@ type CommitStep struct {
 	Gesture   string
 	Undoes    string
 	SchemaRef string // the schema revision path the document was typed by
+	// Signature is the step's author signature (§C.3.1), "" for none:
+	// unhashed, stored and served with the revision.
+	Signature string
+	// Author and Created, when set, are a mirrored step's own (a remote
+	// branch's schema closure, §G.3), not the commit's.
+	Author  string
+	Created int64
 }
 
 // CommitResult is a committed write's entry.
@@ -238,10 +265,22 @@ func (c *Commit) actions() int {
 		n++ // the queued second purge
 	}
 	n += len(c.Copies)
+	if c.Registration != nil {
+		n++
+	}
+	if c.Encrypting {
+		n++
+	}
+	if c.EpochKey != nil {
+		n++
+	}
 	if c.Branch != nil {
 		n += branchActions
 		if c.Grant != "" {
 			n++ // the branch's grant marker
+		}
+		if c.Branch.EpochKey != nil {
+			n++
 		}
 	}
 	switch {
@@ -249,6 +288,8 @@ func (c *Commit) actions() int {
 		n += 3 // the RES update, the document's delete, the PURGING marker
 	case c.PurgeNS:
 		n += 2 // the META update, the PURGING marker
+	case c.Prune != nil:
+		n += c.Prune.actions()
 	}
 	for _, it := range c.Items {
 		n += len(it.Steps) + 1 + it.attachActions() // the revisions, the head, attachments
@@ -417,9 +458,9 @@ func touchesMeta(cs []*Commit) bool {
 }
 
 // alone reports whether c commits on its own, outside group commit: one
-// that updates #META or purges.
+// that updates #META, purges, prunes or branches.
 func (c *Commit) alone() bool {
-	return c.Config != nil || c.PurgeNS || c.Purge != nil || c.Branch != nil
+	return c.Config != nil || c.PurgeNS || c.Purge != nil || c.Branch != nil || c.Prune != nil || c.Registration != nil || c.EpochKey != nil
 }
 
 // commitActs are one commit's actions, in this order — the layout
@@ -456,6 +497,7 @@ func (s *Store) commitActs(c *Commit, entry logRow) []types.TransactWriteItem {
 		out = append(out, s.itemActs(c, &c.Items[i], entry)...)
 	}
 	out = append(out, s.purgeActs(c)...)
+	out = append(out, s.pruneActs(c)...)
 	out = append(out, s.repurgeAct(c, entry)...)
 	for _, cp := range c.Copies {
 		out = append(out, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
@@ -466,6 +508,13 @@ func (s *Store) commitActs(c *Commit, entry logRow) []types.TransactWriteItem {
 		}})
 	}
 	out = append(out, s.branchActs(c, entry)...)
+	out = append(out, s.registrationActs(c, entry)...)
+	if c.Encrypting {
+		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyEncrypting(ns), item{"ns": avS(ns)})}})
+	}
+	if c.EpochKey != nil {
+		out = append(out, epochKeyAct(s.Table, ns, c.EpochKey, c.Created))
+	}
 	marker := item{"ns": avS(ns), "logPos": avN(entry.pos)}
 	if len(c.Items) == 1 && c.Kind != "batch" {
 		marker["revId"] = avS(c.Items[0].Steps[len(c.Items[0].Steps)-1].ID)
@@ -494,15 +543,18 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 	for i := range it.Steps {
 		st := &it.Steps[i]
 		pos++
-		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos, grantID: c.Grant, schemaRef: st.SchemaRef}
+		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos, grantID: c.Grant, schemaRef: st.SchemaRef, signature: st.Signature, epoch: c.Epoch}
 		if pos == 1 {
 			r.parentNS, r.parentPos = it.ParentNS, it.ParentPos
+		}
+		if st.Author != "" {
+			r.author, r.created = st.Author, st.Created
 		}
 		if st.Tombstone {
 			r.kind = "tombstone"
 		} else {
 			digest := sha256.Sum256([]byte(st.Doc))
-			r.patches, r.size, r.digest = st.Patches, uint64(len(st.Doc)), digest[:]
+			r.patches, r.size, r.digest = c.seal(it.Name, "rev", st.ID, st.Patches), uint64(len(st.Doc)), digest[:]
 		}
 		out = append(out, types.TransactWriteItem{Put: &types.Put{
 			TableName: table, Item: withKey(keyRev(ns, it.Name, pos), r.item()),
@@ -541,7 +593,7 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 		ExpressionAttributeValues: vals,
 	}})
 	if live := it.lastLive(); live != nil {
-		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyDocHead(ns, it.Name), item{"revPos": avN(lastPos), "doc": avS(live.Doc)})}})
+		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyDocHead(ns, it.Name), item{"revPos": avN(lastPos), "doc": avS(c.seal(it.Name, "head", strconv.FormatUint(lastPos, 10), live.Doc))})}})
 	}
 	if final.kind != "tombstone" {
 		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyHist(ns, it.Name, entry.pos), item{"revPos": avN(final.pos)})}})
@@ -611,4 +663,12 @@ func classifyCancel(err error, cs []*Commit, n int) (stale []bool, tipMoved bool
 		off += k
 	}
 	return stale, tipMoved, nil
+}
+
+// seal is Seal, for a commit that has one.
+func (c *Commit) seal(name, kind, key, plain string) string {
+	if c.Seal == nil {
+		return plain
+	}
+	return c.Seal(name, kind, key, plain)
 }
