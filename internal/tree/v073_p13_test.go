@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -174,15 +175,22 @@ func TestV073BehindWhileKeys(t *testing.T) {
 	ft := &flaky{prefix: "/ns/files/keys"}
 	sc := s.Client(t, client.WithHTTPClient(&http.Client{Transport: ft}), client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"})),
 		client.WithKeys(client.NewKeys(nil)))
-	x := startSvc(t, sc, svcOpts{now: s.Now})
+	opts := svcOpts{now: s.Now, db: filepath.Join(t.TempDir(), "tree.db")}
+	x := startSvc(t, sc, opts)
 	x.caughtUp("cat", "files")
 	reader := k.Grant(t, s.Now(), "user:r", all, []string{"read"})
 	x.fetch("/cat/children?of=root", reader)
 
 	must(w.PatchConfig(ctx, "files", must(w.NSHead(ctx, "files")).Config, []any{map[string]any{"op": "add", "path": "/encryption/epoch", "value": 2}}))
 	x.caughtUp("files")
+	// The service fetches the new epoch's key as it applies the change
+	// (derived.Keys.Recheck): one restarted since, whose key fetches fail
+	// for now, holds none.
+	x.stop()
 	ft.fail.Store(1 << 20)
 	defer ft.fail.Store(0)
+	x = startSvc(t, sc, opts)
+	x.caughtUp("cat", "files")
 	r := x.raw("/cat/children?of=root", reader)
 	if loc := r.header.Get("Location"); r.status == 302 {
 		r = x.raw(loc, reader)
