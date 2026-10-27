@@ -184,6 +184,14 @@ func (b *ddbBackend) pruneTo(ctx context.Context, r *ddbReads, g *gate, p *prune
 	for pos := range pl.docs {
 		kept = append(kept, pos)
 	}
+	var epochs map[ids.ID]map[int]bool
+	if p.cfg.level == levelSealed {
+		// The epochs each blob is served under, before (§E.2.2).
+		var err error
+		if epochs, err = b.blobEpochsOf(ctx, ns, name); err != nil {
+			return nil, err
+		}
+	}
 	rr := r.resItem(own.id)
 	c := &ddb.Commit{
 		NS: ns, Author: author, Created: g.now.UnixMilli(), Grant: grant, NoAuth: noAuth,
@@ -204,6 +212,11 @@ func (b *ddbBackend) pruneTo(ctx context.Context, r *ddbReads, g *gate, p *prune
 	}
 	if err := b.finishPrune(ctx, ns, name); err != nil {
 		log.Printf("ddb: prune of %s/%s committed, its content left to the sweep: %v", ns, name, err)
+	}
+	if epochs != nil {
+		if err := b.pruneBlobEpochs(ctx, ns, name, epochs); err != nil {
+			log.Printf("ddb: prune of %s/%s committed, its blobs' pruned epochs not marked: %v", ns, name, err)
+		}
 	}
 	res := &PruneResult{Horizon: h.id.String(), NSID: cres.NSID}
 	if arch != nil {
@@ -253,7 +266,7 @@ func (b *ddbBackend) endAttachments(ctx context.Context, ns, name string) error 
 		}
 		return nil
 	}
-	if err := b.store.EachSnapshot(ctx, ns, name, refs); err != nil {
+	if err := b.store.EachSnapshot(ctx, ns, name, func(_ uint64, doc any) error { return refs(doc) }); err != nil {
 		return err
 	}
 	if err := b.store.EachDoc(ctx, ns, name, rr.HeadPos, refs); err != nil {
@@ -269,6 +282,12 @@ func (b *ddbBackend) endAttachments(ctx context.Context, ns, name string) error 
 			return err
 		}
 		hashes = append(hashes, a.Hash)
+		// Its sealings go with it (pruneBlobEpochs of sealedblobs.go).
+		sealings, err := b.store.DeleteBlobEpochs(ctx, ns, name, a.Bid)
+		b.e.removeFiles(sealings)
+		if err != nil {
+			return err
+		}
 	}
 	files, err := b.store.CollectBytes(ctx, hashes)
 	b.e.removeFiles(files)

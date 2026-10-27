@@ -158,7 +158,9 @@ func (s *Store) EachDocIn(ctx context.Context, ns, name string, from, to uint64,
 	var start any
 	var exists bool
 	walkFrom := uint64(0)
-	if from > 1 {
+	// The first read as DocAt does: a branch's first revision applies
+	// to its parent's document.
+	if from >= 1 {
 		r, err := s.RevAt(ctx, ns, name, from)
 		if err != nil {
 			return err

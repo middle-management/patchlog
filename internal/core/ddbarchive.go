@@ -238,8 +238,13 @@ func (b *ddbBackend) restore(ctx context.Context, ns, name string, entries func(
 	defer e.invalidate(inv, false)
 	if rr.HorizonPos == 0 {
 		// Cleared before: every document is stored.
-		out.Blobs, err = b.restoreBlobs(ctx, ns, name, ownerFor(level, ns, name), blobs)
-		return out, err
+		if out.Blobs, err = b.restoreBlobs(ctx, ns, name, ownerFor(level, ns, name), blobs); err != nil {
+			return nil, err
+		}
+		if err := b.store.ClearBlobEpochMarkers(ctx, ns, name); err != nil {
+			return nil, ddbAsErr(err)
+		}
+		return out, nil
 	}
 	missing, err := b.store.PatchesMissing(ctx, ns, name, rr.HorizonPos)
 	if err != nil || missing {
@@ -250,6 +255,10 @@ func (b *ddbBackend) restore(ctx context.Context, ns, name string, entries func(
 	}
 	if out.Blobs, err = b.restoreBlobs(ctx, ns, name, ownerFor(level, ns, name), blobs); err != nil {
 		return nil, err
+	}
+	// The pruned epochs' revisions are served again (clearPrunedEpochs).
+	if err := b.store.ClearBlobEpochMarkers(ctx, ns, name); err != nil {
+		return nil, ddbAsErr(err)
 	}
 	b.committed(ns, "r:"+ns+"/"+name)
 	out.Cleared = true

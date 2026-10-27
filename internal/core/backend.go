@@ -58,6 +58,10 @@ type backend interface {
 
 	// rotateEpoch is RotateEpoch's config change (§E.2.1).
 	rotateEpoch(ctx context.Context, ns, author string) (int, error)
+	// storeSealedBlob stores a blob's sealing under an epoch unless one
+	// is stored, and returns the stored bytes; nil if the blob is no
+	// longer served under it (§E.2.2).
+	storeSealedBlob(ctx context.Context, job *sealedBlobJob, sealed []byte) ([]byte, error)
 	// storeSealed stores sealed values of namespace ns the first time
 	// they are served, the first one stored winning (finishSeal, §E.2.2).
 	storeSealed(ctx context.Context, ns string, jobs []*sealJob) error
@@ -175,6 +179,10 @@ func (b sqlBackend) remoteNotices(ctx context.Context, ns string) ([]RemoteNotic
 
 func (b sqlBackend) rotateEpoch(ctx context.Context, ns, author string) (int, error) {
 	return b.e.sqlRotateEpoch(ctx, ns, author)
+}
+
+func (b sqlBackend) storeSealedBlob(ctx context.Context, job *sealedBlobJob, sealed []byte) ([]byte, error) {
+	return b.e.sqlStoreSealedBlob(ctx, job, sealed)
 }
 
 func (b sqlBackend) storeSealed(ctx context.Context, ns string, jobs []*sealJob) error {

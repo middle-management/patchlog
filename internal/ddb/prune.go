@@ -391,8 +391,8 @@ func (s *Store) EachDoc(ctx context.Context, ns, name string, headPos uint64, vi
 	return err
 }
 
-// EachSnapshot visits name's kept documents.
-func (s *Store) EachSnapshot(ctx context.Context, ns, name string, visit func(doc any) error) error {
+// EachSnapshot visits name's kept documents, with their positions.
+func (s *Store) EachSnapshot(ctx context.Context, ns, name string, visit func(pos uint64, doc any) error) error {
 	return s.eachItem(ctx, ns, "SNAP#"+name+"#", func(i item) error {
 		if resNameFromRev(i.s("SK")) != "SNAP#"+name {
 			return nil // another resource whose name extends this one
@@ -405,7 +405,7 @@ func (s *Store) EachSnapshot(ctx context.Context, ns, name string, visit func(do
 		if err != nil {
 			return err
 		}
-		return visit(doc)
+		return visit(i.n("pos"), doc)
 	})
 }
 

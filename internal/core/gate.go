@@ -153,6 +153,8 @@ type sealedReads interface {
 	resJob(n *nsRow, name string, row *revRow, kind string, plain func() []byte) *sealJob
 	grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob
 	sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJob
+	blobEpochs(n *nsRow, head *revRow, bid ids.ID) map[int]bool
+	blobEpochRow(n *nsRow, name string, bid ids.ID, ep int) (data []byte, file string, ok bool)
 	epochStarts(table string, ns int64, max int) []epochStart
 	keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error)
 	e2eSnapshot(row *revRow) string

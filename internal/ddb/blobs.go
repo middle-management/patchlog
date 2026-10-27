@@ -15,7 +15,8 @@ package ddb
 //   - BYTES#<sha256 hex>: the bytes, inline (at most MaxInlineBytes) or
 //     the name of the file of the engine's blob store that holds them.
 //     Written before the item that names them, outside its transaction,
-//     like grants. Plaintext only: there is no encryption at rest here.
+//     like grants. Encrypted bytes are core's, under their owner's data
+//     key and a hash of owner and content (BlobRow.Owner).
 //
 // The sweep (core's SweepBlobs) deletes expired pending entries and the
 // bytes no item names any more, by a scan. An attachment pruning ended

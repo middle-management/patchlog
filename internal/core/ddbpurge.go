@@ -138,6 +138,12 @@ func (b *ddbBackend) finishPurge(ctx context.Context, ns, name string) error {
 		return ddbAsErr(err)
 	}
 	b.keys.flush()
+	// Its blobs' stored sealings (§E.2.2).
+	sealings, err := b.store.DeleteBlobEpochs(ctx, ns, name, "")
+	b.e.removeFiles(sealings)
+	if err != nil {
+		return ddbAsErr(err)
+	}
 	// A remote branch's mirrored copy goes too, in every shadow (§G.3).
 	if err := b.purgeShadows(ctx, ns, name); err != nil {
 		return err

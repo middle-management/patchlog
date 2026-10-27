@@ -58,6 +58,7 @@ type ddbReads struct {
 	schemaNSs map[string]int64
 	// schemaRefs are the revisions' schema paths read, by handle.
 	schemaRefs map[int64]string
+	blobRefs   map[segment]map[ids.ID][]uint64 // blobRefPositions
 	// copies are the resources copyRows answered with: a purge's commit
 	// pins them (Commit.Copies).
 	copies []ddb.ResourceRef
@@ -933,10 +934,6 @@ func (r *ddbReads) pendingUsed(n *nsRow, uploader string, cutoff, res int64, bid
 		used += max(p.Size, pendingMin)
 	}
 	return used
-}
-
-func (r *ddbReads) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJob {
-	panic(ddbUnsupported("sealed namespaces"))
 }
 
 // --- schema references ---

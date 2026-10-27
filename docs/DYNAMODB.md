@@ -134,18 +134,20 @@ NS#<ns>                     HIST#<name>#<logPos12>              head_history row
 NS#<ns>                     BLOB#<name>#<bid>                   blob attachment: type, nonce, size, hash, owner, refPos, pruned
 NS#<ns>                     BREF#<name>#<bid>#<fromPos12>       blob reference interval: toPos?
 NS#<ns>                     PEND#<bid>#<uploader>               pending blob upload (GSI2 on created for the sweep)
-NS#<ns>                     EPOCH#<n>                           sealed epoch key (wrapped)
-NS#<ns>                     SEALED#<kind>#<key>                 sealed response (JWE)
+NS#<ns>                     DEK#<name>                          resource data key (wrapped, keystore), at rest and sealed
+NS#<ns>                     #ENCRYPTING                         an encryption of existing content still to finish
+NS#<ns>                     EPOCHKEY#<n12>                      sealed epoch key (encrypted under the namespace's key), created
+NS#<ns>                     SEALED#<kind>#<key>                 sealed response (JWE), first stored wins; name, revPos
 NS#<ns>                     E2E#<n>                             e2e epoch registry row
 NS#<ns>                     E2ESNAP#<name>#<pos12>              e2e sealed snapshot (JWE)
-NS#<ns>                     BLOBEPOCH#<name>#<bid>#<n>          sealed blob form per epoch (pointer)
+NS#<ns>                     BLOBEPOCH#<name>#<bid>#<n12>        sealed blob form per epoch: data | file (e/…), neither = 410 pruned
 NS#<ns>                     ARCH#<name>#<from12>#<to12>         pruning archive record (§8.6): key, url, created, bids
 NS#<ns>                     REG#<origin>#<branch>               registered remote branch (source side): atPos, nsPos, prevPos, expires
 NS#<branch>                 #REMOTE                             remote base (branch side): shadow, origin, ns, at, checkpoint, registration
 NS#<branch>                 NOTICE#<nsId>                       purge notice: kind, resource, applied, created, seq
 #REMOTES                    <branch>                            the remote branches (SyncRemotes)
 GRANT#<id32>                #                                   grant: blocks, rootSub, rootKid
-DEK#<ns>#<name|0>           #                                   data key (wrapped, keystore, created)
+#DEPLOY                     DEK                                 the deployment's grants key (wrapped)
 BLOB#<owner>#<hash64>       #                                   blob bytes pointer: S3 key (or inline ≤ ~350 KB)
 BUCKET#<hash>               #                                   shared rate bucket (multi-instance)
 JOB#REPURGE#<logId>         #                                    second CDN purge: tags, due (GSI2 on due)
@@ -500,7 +502,7 @@ What landed, beyond the spike:
   carry (it only hands them back). What the backend doesn't store reads
   as empty where nothing of the kind can exist, and as **501
   "unsupported"** where a request needs a
-  feature it lacks (sealed/e2e keys) — so those refusals
+  feature it lacks (e2e keys) — so those refusals
   are the reads', not hand-written checks. `gate_test.go` guards the
   embedding that makes this work on SQL (a read missing on `*tx` would
   compile and recurse).
@@ -583,7 +585,7 @@ What landed, beyond the spike:
   backend lacks is its `lacks` 501, asked by the Engine method before
   anything else; everything the server can reach so answers 501 rather
   than falling through to SQL:
-  sealed/e2e, rotation. Refused configurations (`encryption`,
+  e2e. Refused configurations (`"encryption": {"level": "e2e"}`,
   `successor`) are 501 at create and change time, as
   §10 prescribes ("refuse at Open or at namespace-config time").
 - **One read path.** The serving reads (`ResourceHead/Raw/Rev/Log`,
@@ -591,8 +593,8 @@ What landed, beyond the spike:
   SQL path's own code on the gate, as the writes' checks are, over a few
   more reads: `nsLogRows` and `revsBetween` (a log's or a resource's
   range, visited so a page stops where its bytes say), `entryConfig`,
-  `resState`, `prunedIn`, and the sealed/e2e ones, which DynamoDB
-  answers 501. On the table: revisions fold from the genesis (snapshots
+  `resState`, `prunedIn`, and the sealed ones (below); the e2e ones
+  DynamoDB answers 501. On the table: revisions fold from the genesis (snapshots
   are a later phase), `…/rev/{nsID}` joins the entry's denormalized
   `cfgPos`, a head as of an earlier entry comes from the history rows
   (`HeadAt`). DynamoDB's log and revision handles keep their positions'
@@ -679,7 +681,7 @@ What landed, beyond the spike:
   — on the table, the archived range's documents folded, standing in
   for `blob_refs` — `grantFirstEntry` (the grant marker's first
   position), `configAtTime`, `firstEntryCreated` and `archiveSealer`
-  (none: nothing is encrypted at rest here). A prune writes its archive
+  (the resource's data key, at rest). A prune writes its archive
   before anything else and records it in its commit (`ARCH#` items with
   the range, URL and the blobs its blob lines carry), which a pruned
   revision's or blob's 410 names (`archiveURL`, `blobArchive`). A purge
@@ -735,7 +737,37 @@ What landed, beyond the spike:
   a branch's own purge removes the shadows' copies too (`finishPurge`).
   The storage side of following, registering and notices is the
   backend's (`remoteBases`, `followed`, `registered`, `remoteNotices`).
-  Sealed and e2e bases need encryption, which phase 1 refuses.
+  Sealed bases are mirrored sealed (each shadow's content under its
+  own data keys); e2e bases are 501.
+- **Encryption at rest** (§E.1). `core.Open` takes a `KeyStore` and
+  checks it against the keys the table holds. The store holds no keys:
+  core encrypts what it writes (`Commit.Seal`: patch sets, head and
+  kept documents, as `ddb.Sealed` values under the resource's data key
+  with an AAD naming the kind, namespace, resource and key) and opens
+  what the store folds (the `Store.Open` hook). Data keys are `DEK#`
+  items, created put-if-absent before the commit that first needs one;
+  grants are encrypted under the deployment's `#DEPLOY` key. Blob bytes
+  are encrypted under their owner's key and stored by a hash of owner
+  and content (`ownedHash`), in files under `r/`. Raising a namespace
+  to at-rest encrypts its existing content after the config commit,
+  under an `#ENCRYPTING` marker that keeps it resumable; a purge
+  deletes the data keys first (cryptographic purge, §8.3).
+- **Sealed namespaces** (§E.2). The sealing is the SQL path's own
+  (`finishSeal`, `resJob`, `grantJob`, `Keys`), over the reads
+  `epochKey`, `entryEpoch`, `stored`, `revEpoch` and `epochStarts`. An
+  epoch's key (`EPOCHKEY#`) is written in the commit that begins the
+  epoch — the create, the config change raising the level, a rotation
+  (`RotateEpoch`, `RotateDue`, rotation on revoke) — and each revision
+  records the epoch it was written in (`epoch` on REV). Sealed values
+  are produced on first read and stored put-if-absent (`SEALED#`), the
+  first stored winning; pruning and purges delete them. Blobs
+  (§E.2.2): the epochs a blob is served under are derived from the
+  revisions referencing it — a segment's served documents folded once
+  per check, standing in for `blob_refs` — and a sealing is a
+  `BLOBEPOCH#` item, inline or a file under `e/`, stored put-if-absent
+  on first read. A prune marks the epochs it stops serving (410), a
+  restore clears the marks, an ended attachment or purge deletes the
+  sealings. e2e namespaces (§E.3) are 501.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the
