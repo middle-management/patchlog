@@ -7,8 +7,6 @@
 # Divergences: the backend answers differently from the spec.
 client/TestGestures panics: PATCH /r/g/a: 422 patch
 client/TestLimitRefusal batch limit "opsPerSet" 3 2 true true: patchlog: POST /ns/l/batch: 422 limit: too many operations
-client/TestLogPageBytes 1 pages
-client/TestLogPages testing.tRunner.func1.2({0x156d120, 0x3e7645cb1bc0})
 client/TestRateLimitRetryAfter rate limit: <nil>
 client/TestResourceLifecycle create &{Status:201 ID:<id> NSID:<id> Entry:0x3e76425551e0 Gesture: Undoes:} want <id>
 client/TestUndoMultiResourceKeepsOthers scan plan &{NS:u Gesture:yc6nnfbe5bcpw42bek2a7fw22i Author:alice Source:log Level: Resources:[{Resource:a Head:<id> State:live Entries:[<id> <id>] Wri
@@ -20,14 +18,11 @@ server/TestBlobDryRunCarriesOn status 422, want 200: {"code":"rule","path":"/doc
 server/TestBlobReferencesWellFormed map[hero:map[$blob:<id> size:1843302 type:image/jpeg]]: 201 {"author":"alice","created":…,"id":"<id>","kind":"head"}
 server/TestBranches status 422, want 201: {"code":"patch","detail":"patch op 0: no document"}
 server/TestCanonicalStorage write response {"author":"alice","created":…,"id":"<id>","kind":"head"}
-server/TestConcurrentWritersStress r2: verify: entry 0 (<id>): unknown entry kind "head"
 server/TestCreatesFromScratch no create
-server/TestHeadMetaPlain /r/n/a/rev/<id>: Repr-Digest "sha-256=:w0f03/AtVkBe/JfinfB4cB/2zzjuvrKK0IvqM8FV/Nw=:" Last-Modified "Sun, 04 Oct 2026 13:00:00 GMT", want "sha-256=:w0
-server/TestHeadsSkipsNamesAbsentAtAt heads at at: a,b,c,d,e,f,g,h,i,j,k,l,m,z,zz,zzz
+server/TestHeadMetaPlain status 422, want 201: {"code":"patch","detail":"patch op 0 (/restored): the document does not exist"}
 server/TestIdempotentRetry status 412, want 200: {"code":"stale","head":"<id>"}
 server/TestIdsVerifiable status 422, want 201: {"code":"patch","detail":"patch op 0: no document"}
-server/TestLogPaging 1 resource pages
-server/TestNamespace status 200, want 404:
+server/TestNamespace status 412, want 200: {"code":"stale","config":"<id>"}
 server/TestPurgeOnPublicToPrivate unrelated config write purged: [[ns:docs]]
 server/TestRateLimits status 201, want 429: {"author":"alice","created":…,"id":"<id>","kind":"head"}
 server/TestRemoteRegistration Post "http://127.0.0.1:44685/ns/main/branches": EOF

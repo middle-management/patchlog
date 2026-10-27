@@ -110,11 +110,14 @@ func TestDDBFlow(t *testing.T) {
 	if err != nil || rl.Status != 200 || len(rl.Entries) != 2 {
 		t.Fatalf("resource log: %+v %v", rl, err)
 	}
-	if rl.Entries[1]["id"] != rev2 || rl.Entries[1]["parent"] != rev1 || rl.Entries[1]["kind"] != "head" {
+	if rl.Entries[1]["id"] != rev2 || rl.Entries[1]["parent"] != rev1 || rl.Entries[1]["kind"] != "rev" {
 		t.Fatalf("resource log entries: %v", rl.Entries)
 	}
-	if g, ok := rl.Entries[1]["grant"]; !ok || g != nil {
-		t.Fatalf("dev entries serve grant null: %v", rl.Entries[1])
+	// Resource entries carry a grant only when written under one
+	// (LogEntry.value); "grant": null is the namespace entries' mark of
+	// dev mode (no_auth).
+	if _, ok := rl.Entries[1]["grant"]; ok {
+		t.Fatalf("dev resource entries serve no grant: %v", rl.Entries[1])
 	}
 	rl, err = e.ResourceLog(ctx, "demo", "doc1", "", rev1, 0, Credentials{})
 	if err != nil || len(rl.Entries) != 1 || rl.Entries[0]["id"] != rev2 {
@@ -345,7 +348,7 @@ func TestDDBTombstoneRestore(t *testing.T) {
 	if err != nil || nl.Entries[len(nl.Entries)-1]["kind"] != "tombstone" {
 		t.Fatalf("ns log: %+v %v", nl, err)
 	}
-	heads, err := e.NamespaceHeads(ctx, "demo", "", "", Credentials{})
+	heads, err := e.NamespaceHeads(ctx, "demo", ddbTip(t, e, "demo"), "", Credentials{})
 	if err != nil || len(heads.Items) != 1 {
 		t.Fatalf("heads: %+v %v", heads, err)
 	}
@@ -385,7 +388,7 @@ func TestDDBTombstoneRestore(t *testing.T) {
 	if err != nil || len(rl.Entries) != 4 || rl.Entries[3]["parent"] != tid {
 		t.Fatalf("log after restore: %+v %v", rl, err)
 	}
-	heads, err = e.NamespaceHeads(ctx, "demo", "", "", Credentials{})
+	heads, err = e.NamespaceHeads(ctx, "demo", ddbTip(t, e, "demo"), "", Credentials{})
 	if err != nil || heads.Items[0]["kind"] != "head" || heads.Items[0]["digest"] == "" {
 		t.Fatalf("heads after restore: %+v %v", heads, err)
 	}
@@ -527,4 +530,15 @@ func check501(t *testing.T, what string, err error) {
 	if ae.Status != 501 || ae.Code() != "unsupported" {
 		t.Fatalf("%s: want 501 unsupported, got %d %v", what, ae.Status, ae.Body)
 	}
+}
+
+// ddbTip is a namespace's log tip, the ns_id /heads lists at (an unknown
+// or empty one is 404, as on SQL).
+func ddbTip(t *testing.T, e *Engine, ns string) string {
+	t.Helper()
+	info, err := e.NamespaceHead(context.Background(), ns, Credentials{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Head
 }
