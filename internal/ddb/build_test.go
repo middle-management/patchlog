@@ -18,9 +18,11 @@ var (
 	testTip     = &tip{headPos: 1, headID: ids.Of([]byte("entry1")).String()}
 )
 
+// plan plans testPatches on doc1: a create ("", If-None-Match) or an
+// append to ifMatch.
 func plan(t *testing.T, head *resRow, headDoc any, ifMatch string) (*writePlan, *Error) {
 	t.Helper()
-	return planWrite("demo", "doc1", testMeta, testTip, head, headDoc, ifMatch, testPatches, "", "", "alice", 1000, applyPatches)
+	return planWrite("demo", "doc1", testMeta, testTip, head, headDoc, Pre{IfMatch: ifMatch, IfNoneMatch: ifMatch == ""}, testPatches, "", "", "alice", 1000, applyPatches)
 }
 
 func TestPlanWriteGenesis(t *testing.T) {
@@ -57,7 +59,7 @@ func TestPlanWriteAppend(t *testing.T) {
 	p0, _ := plan(t, nil, nil, "")
 	head := &resRow{headPos: 1, headID: p0.rev.id, entryID: p0.entry.id, state: "live"}
 	patches := jsonv.MustParse([]byte(`[{"op":"add","path":"/b","value":2}]`))
-	p, e := planWrite("demo", "doc1", testMeta, testTip, head, map[string]any{"a": float64(1)}, p0.rev.id, patches, "", "", "alice", 1001, applyPatches)
+	p, e := planWrite("demo", "doc1", testMeta, testTip, head, map[string]any{"a": float64(1)}, Pre{IfMatch: p0.rev.id}, patches, "", "", "alice", 1001, applyPatches)
 	if e != nil {
 		t.Fatalf("planWrite: %v", e)
 	}
@@ -73,32 +75,79 @@ func TestPlanWriteAppend(t *testing.T) {
 	}
 }
 
+// A retried append names the same parent as its first attempt, which
+// has since become the head's parent: step 2 refuses it (412), and the
+// id the request computes (Pre.expectedID) is the committed revision's —
+// what the store's retry lookup finds (Store.replay).
 func TestPlanWriteReplay(t *testing.T) {
 	p0, _ := plan(t, nil, nil, "")
 	doc := map[string]any{"a": float64(1)}
-	// An append pins its parent with ifMatch, commits, and moves the head.
 	patches := jsonv.MustParse([]byte(`[{"op":"add","path":"/b","value":2}]`))
-	p1, e := planWrite("demo", "doc1", testMeta, testTip, &resRow{headPos: 1, headID: p0.rev.id, state: "live"}, doc, p0.rev.id, patches, "", "", "alice", 1001, applyPatches)
+	pre := Pre{IfMatch: p0.rev.id}
+	p1, e := planWrite("demo", "doc1", testMeta, testTip, &resRow{headPos: 1, headID: p0.rev.id, state: "live"}, doc, pre, patches, "", "", "alice", 1001, applyPatches)
 	if e != nil {
 		t.Fatalf("first append: %v", e)
 	}
-	// Its retry names the same parent; the head is now the first
-	// attempt's own revision. Replay, not 412.
 	head2 := &resRow{headPos: 2, headID: p1.rev.id, entryID: p1.entry.id, state: "live"}
-	p, e := planWrite("demo", "doc1", testMeta, testTip, head2, map[string]any{"a": float64(1), "b": float64(2)}, p0.rev.id, patches, "", "", "alice", 1002, applyPatches)
-	if e != nil {
-		t.Fatalf("planWrite: %v", e)
+	if _, e := planWrite("demo", "doc1", testMeta, testTip, head2, nil, pre, patches, "", "", "alice", 1002, applyPatches); e == nil || e.Status != 412 || e.Body["head"] != p1.rev.id {
+		t.Fatalf("retry at step 2: %v", e)
 	}
-	if !p.replay {
-		t.Fatal("a retried write did not replay")
+	if id, ok := pre.expectedID(false, patches); !ok || id != p1.rev.id {
+		t.Fatalf("expected id %q %v, want the committed %q", id, ok, p1.rev.id)
 	}
-	if p.rev.id != p1.rev.id || p.entry.id != p1.entry.id {
-		t.Fatalf("replay answers rev %q entry %q, want the committed %q %q", p.rev.id, p.entry.id, p1.rev.id, p1.entry.id)
+	// A create's is over no parent; a delete's the tombstone of its
+	// If-Match; without a precondition there is none.
+	if id, _ := (Pre{IfNoneMatch: true}).expectedID(false, testPatches); id != p0.rev.id {
+		t.Fatalf("create's expected id %q, want %q", id, p0.rev.id)
 	}
-	// But a retry whose patches differ is not its own write: 412.
-	other := jsonv.MustParse([]byte(`[{"op":"add","path":"/c","value":3}]`))
-	if _, e := planWrite("demo", "doc1", testMeta, testTip, head2, nil, p0.rev.id, other, "", "", "alice", 1003, applyPatches); e == nil || e.Status != 412 {
-		t.Fatalf("moved head with different patches: %v", e)
+	if id, _ := pre.expectedID(true, nil); id != ids.Tombstone(mustParse(p0.rev.id)).String() {
+		t.Fatalf("delete's expected id %q", id)
+	}
+	if _, ok := (Pre{}).expectedID(false, patches); ok {
+		t.Fatal("expected id without a precondition")
+	}
+}
+
+// §7.2's preconditions (precondition of write.go): 428 without one, 400
+// with both, 412 naming the head (null when absent), 410 naming the
+// tombstone for an If-Match on a deleted resource that isn't its
+// tombstone.
+func TestPlanWritePreconditions(t *testing.T) {
+	p0, _ := plan(t, nil, nil, "")
+	live := &resRow{headPos: 1, headID: p0.rev.id, state: "live"}
+	tid := ids.Tombstone(mustParse(p0.rev.id)).String()
+	tomb := &resRow{headPos: 2, headID: tid, state: "tombstoned", lastID: p0.rev.id, lastPos: 1}
+	other := ids.Of([]byte("other")).String()
+	for _, c := range []struct {
+		name   string
+		head   *resRow
+		pre    Pre
+		status int
+		member any
+	}{
+		{"none", live, Pre{}, 428, nil},
+		{"both", live, Pre{IfMatch: p0.rev.id, IfNoneMatch: true}, 400, nil},
+		{"create on live", live, Pre{IfNoneMatch: true}, 412, p0.rev.id},
+		{"create on tombstone", tomb, Pre{IfNoneMatch: true}, 412, tid},
+		{"append to absent", nil, Pre{IfMatch: other}, 412, nil},
+		{"append stale", live, Pre{IfMatch: other}, 412, p0.rev.id},
+		{"restore stale", tomb, Pre{IfMatch: other}, 410, tid},
+	} {
+		_, e := planWrite("demo", "doc1", testMeta, testTip, c.head, nil, c.pre, testPatches, "", "", "alice", 1000, applyPatches)
+		if e == nil || e.Status != c.status {
+			t.Errorf("%s: %v, want %d", c.name, e, c.status)
+			continue
+		}
+		switch c.status {
+		case 412:
+			if e.Body["head"] != c.member {
+				t.Errorf("%s: head %v, want %v", c.name, e.Body["head"], c.member)
+			}
+		case 410:
+			if e.Body["tombstone"] != c.member {
+				t.Errorf("%s: tombstone %v, want %v", c.name, e.Body["tombstone"], c.member)
+			}
+		}
 	}
 }
 
@@ -116,13 +165,13 @@ func TestPlanWriteStale(t *testing.T) {
 }
 
 func TestPlanWriteNamespaceStates(t *testing.T) {
-	if _, e := planWrite("demo", "d", nil, testTip, nil, nil, "", testPatches, "", "", "a", 0, applyPatches); e == nil || e.Status != 404 {
+	if _, e := planWrite("demo", "d", nil, testTip, nil, nil, Pre{IfNoneMatch: true}, testPatches, "", "", "a", 0, applyPatches); e == nil || e.Status != 404 {
 		t.Fatalf("absent namespace: %v", e)
 	}
-	if _, e := planWrite("demo", "d", &nsMeta{purged: true}, testTip, nil, nil, "", testPatches, "", "", "a", 0, applyPatches); e == nil || e.Status != 410 {
+	if _, e := planWrite("demo", "d", &nsMeta{purged: true}, testTip, nil, nil, Pre{IfNoneMatch: true}, testPatches, "", "", "a", 0, applyPatches); e == nil || e.Status != 410 {
 		t.Fatalf("purged namespace: %v", e)
 	}
-	if _, e := planWrite("demo", "d", &nsMeta{frozen: true}, testTip, nil, nil, "", testPatches, "", "", "a", 0, applyPatches); e == nil || e.Status != 409 {
+	if _, e := planWrite("demo", "d", &nsMeta{frozen: true}, testTip, nil, nil, Pre{IfNoneMatch: true}, testPatches, "", "", "a", 0, applyPatches); e == nil || e.Status != 409 {
 		t.Fatalf("frozen namespace: %v", e)
 	}
 }
@@ -176,9 +225,9 @@ func TestBuildWriteTx(t *testing.T) {
 	}
 	// The append form conditions on the old head.
 	head := &resRow{headPos: 1, headID: p.rev.id, entryID: p.entry.id, state: "live"}
-	p2, _ := planWrite("demo", "doc1", testMeta, testTip, head, map[string]any{"a": float64(1)}, "", testPatches, "", "", "alice", 1001, applyPatches)
-	if p2.replay {
-		t.Fatal("unexpected replay")
+	p2, e := planWrite("demo", "doc1", testMeta, testTip, head, map[string]any{"a": float64(1)}, Pre{IfMatch: p.rev.id}, jsonv.MustParse([]byte(`[{"op":"add","path":"/b","value":2}]`)), "", "", "alice", 1001, applyPatches)
+	if e != nil {
+		t.Fatalf("append: %v", e)
 	}
 	acts2 := buildWriteTx("tbl", "demo", "doc1", p2)
 	if got := *acts2[actRes].Update.ConditionExpression; got != "headPos = :old" {
@@ -208,20 +257,20 @@ func TestPlanDelete(t *testing.T) {
 	p0, _ := plan(t, nil, nil, "")
 	head := &resRow{headPos: 1, headID: p0.rev.id, entryID: p0.entry.id, state: "live"}
 
-	// No If-Match: 428; a stale one: 412 naming the head; an absent
-	// resource and a second, different delete: 410.
-	if _, e := planDelete("demo", "doc1", testMeta, testTip, head, "", "", "", "alice", 2000); e == nil || e.Status != 428 {
+	// No If-Match: 428; a stale one: 412 naming the head, null for an
+	// absent resource (precondition of write.go).
+	if _, e := planDelete("demo", "doc1", testMeta, testTip, head, Pre{}, "", "", "alice", 2000); e == nil || e.Status != 428 {
 		t.Fatalf("no If-Match: %v", e)
 	}
-	if _, e := planDelete("demo", "doc1", testMeta, testTip, nil, p0.rev.id, "", "", "alice", 2000); e == nil || e.Status != 410 {
+	if _, e := planDelete("demo", "doc1", testMeta, testTip, nil, Pre{IfMatch: p0.rev.id}, "", "", "alice", 2000); e == nil || e.Status != 412 || e.Body["head"] != nil {
 		t.Fatalf("absent: %v", e)
 	}
 	other := ids.Of([]byte("other")).String()
-	if _, e := planDelete("demo", "doc1", testMeta, testTip, head, other, "", "", "alice", 2000); e == nil || e.Status != 412 || e.Body["head"] != p0.rev.id {
+	if _, e := planDelete("demo", "doc1", testMeta, testTip, head, Pre{IfMatch: other}, "", "", "alice", 2000); e == nil || e.Status != 412 || e.Body["head"] != p0.rev.id {
 		t.Fatalf("stale: %v", e)
 	}
 
-	p, e := planDelete("demo", "doc1", testMeta, testTip, head, p0.rev.id, "g", "", "alice", 2000)
+	p, e := planDelete("demo", "doc1", testMeta, testTip, head, Pre{IfMatch: p0.rev.id}, "g", "", "alice", 2000)
 	if e != nil {
 		t.Fatalf("planDelete: %v", e)
 	}
@@ -239,29 +288,30 @@ func TestPlanDelete(t *testing.T) {
 	if p.entry.body != wantBody || p.entry.kind != "tombstone" {
 		t.Fatalf("entry %+v, want body %q", p.entry, wantBody)
 	}
-	// Its transaction: six actions, the head pinned on the deleted
-	// revision, the document deleted.
+	// Its transaction: five actions, the head pinned on the deleted
+	// revision; the document stays, the last live one (a restore's base).
 	tx := buildDeleteTx("tbl", "demo", "doc1", p)
 	if len(tx) != delNumActs {
 		t.Fatalf("%d actions, want %d", len(tx), delNumActs)
 	}
-	if tx[delActDoc].Delete == nil {
-		t.Fatalf("action %d is not the document's delete", delActDoc)
+	for i, a := range tx {
+		if a.Delete != nil {
+			t.Fatalf("action %d deletes an item", i)
+		}
 	}
 	res := tx[delActRes].Update
 	if *res.ConditionExpression != "headPos = :old AND headId = :oldi" {
 		t.Fatalf("RES condition %q", *res.ConditionExpression)
 	}
 
-	// A retried DELETE of the result replays; a delete of a different
-	// parent is 410 (doubleDelete, §7.5).
+	// A DELETE of a tombstoned resource is 410 naming the tombstone, its
+	// own retry included: the store's retry lookup answers that one
+	// (Store.replay, by the tombstone id the request computes).
 	tomb := &resRow{headPos: 2, headID: p.rev.id, entryID: p.entry.id, state: "tombstoned", lastID: p0.rev.id, lastPos: 1}
-	rp, e := planDelete("demo", "doc1", testMeta, testTip, tomb, p0.rev.id, "", "", "alice", 2001)
-	if e != nil || !rp.replay || rp.entry.id != p.entry.id {
-		t.Fatalf("replay %+v %v", rp, e)
-	}
-	if _, e := planDelete("demo", "doc1", testMeta, testTip, tomb, other, "", "", "alice", 2001); e == nil || e.Status != 410 {
-		t.Fatalf("double delete: %v", e)
+	for _, im := range []string{p0.rev.id, other} {
+		if _, e := planDelete("demo", "doc1", testMeta, testTip, tomb, Pre{IfMatch: im}, "", "", "alice", 2001); e == nil || e.Status != 410 || e.Body["tombstone"] != p.rev.id {
+			t.Fatalf("delete of a tombstone (If-Match %s): %v", im, e)
+		}
 	}
 }
 
@@ -270,10 +320,12 @@ func TestPlanWriteRestore(t *testing.T) {
 	tid := ids.Tombstone(mustParse(p0.rev.id)).String()
 	tomb := &resRow{headPos: 2, headID: tid, entryID: "e", state: "tombstoned", lastID: p0.rev.id, lastPos: 1}
 
-	// A write on a tombstone restores (§6.2): the parent is the tombstone
-	// id, the patches root-replace from nothing, and the RES update clears
+	// A write naming the tombstone restores (§6.2): the parent is the
+	// tombstone id, the patches apply to the last live document (an
+	// empty patch set restores it unchanged), and the RES update clears
 	// the last-revision markers.
-	p, e := planWrite("demo", "doc1", testMeta, testTip, tomb, nil, "", testPatches, "", "", "alice", 3000, applyPatches)
+	last := map[string]any{"a": float64(1)}
+	p, e := planWrite("demo", "doc1", testMeta, testTip, tomb, last, Pre{IfMatch: tid}, []any{}, "", "", "alice", 3000, applyPatches)
 	if e != nil {
 		t.Fatalf("planWrite: %v", e)
 	}

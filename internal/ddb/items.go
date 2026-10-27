@@ -137,6 +137,7 @@ type revRow struct {
 	digest   []byte
 	gesture  string
 	undoes   string
+	logPos   uint64 // the namespace entry that committed it: the retry lookup's answer
 }
 
 func (r *revRow) item() item {
@@ -164,6 +165,9 @@ func (r *revRow) item() item {
 	if r.undoes != "" {
 		it["undoes"] = avS(r.undoes)
 	}
+	if r.logPos > 0 {
+		it["logPos"] = avN(r.logPos)
+	}
 	return it
 }
 
@@ -182,7 +186,12 @@ type logRow struct {
 	created int64
 	gesture string
 	undoes  string
-	cfgPos  uint64
+	// gestures is a batch entry's "gestures" member (batchGestures of
+	// write.go): canonical JSON mapping each resource to its steps'
+	// { gesture?, undoes? }, "" when no step has one. Unhashed, merged in
+	// when served, like gesture and undoes.
+	gestures string
+	cfgPos   uint64
 }
 
 func (l *logRow) item() item {
@@ -203,6 +212,9 @@ func (l *logRow) item() item {
 	}
 	if l.undoes != "" {
 		it["undoes"] = avS(l.undoes)
+	}
+	if l.gestures != "" {
+		it["gestures"] = avS(l.gestures)
 	}
 	return it
 }

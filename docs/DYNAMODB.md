@@ -524,7 +524,7 @@ What landed, beyond the spike:
   `-group-commit` (default 32) as on Postgres: each resource write or
   delete runs its check phase alone, then queues; a worker per namespace
   takes the queued writes that fit one transaction (distinct resources,
-  one configuration, ≤ 100 actions: six a write, five a delete, two
+  one configuration, ≤ 100 actions: six a write, four a delete, two
   shared, so ≤ 16 writes) and re-chains their entries over the tip at
   consecutive positions — an entry's id covers the one before it, not
   anything the write's gate read. The transaction pins every write's head

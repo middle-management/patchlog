@@ -14,7 +14,7 @@ import (
 
 func member(t *testing.T, name string, cfgPos uint64) *groupMember {
 	t.Helper()
-	p, e := planWrite("demo", name, &nsMeta{configPos: cfgPos, configID: testMeta.configID}, testTip, nil, nil, "", testPatches, "", "", "alice", 1000, applyPatches)
+	p, e := planWrite("demo", name, &nsMeta{configPos: cfgPos, configID: testMeta.configID}, testTip, nil, nil, Pre{IfNoneMatch: true}, testPatches, "", "", "alice", 1000, applyPatches)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -138,7 +138,7 @@ func TestLocalGroupMixed(t *testing.T) {
 		wg.Add(3)
 		go func() {
 			defer wg.Done()
-			res, err := s.WriteResource(ctx, "demo", fmt.Sprintf("new%d", i), "",
+			res, err := s.WriteResource(ctx, "demo", fmt.Sprintf("new%d", i), Pre{IfNoneMatch: true},
 				patches(fmt.Sprintf(`[{"op":"add","path":"","value":{"n":%d}}]`, i)), "", "", "alice", nil)
 			if err == nil {
 				record(res.NSID, nil)
@@ -152,9 +152,9 @@ func TestLocalGroupMixed(t *testing.T) {
 			var res *WriteResult
 			var err error
 			if i%2 == 0 {
-				res, err = s.DeleteResource(ctx, "demo", name, pre[i].ID, "", "", "alice", nil)
+				res, err = s.DeleteResource(ctx, "demo", name, Pre{IfMatch: pre[i].ID}, "", "", "alice", nil)
 			} else {
-				res, err = s.WriteResource(ctx, "demo", name, pre[i].ID, patches(`[{"op":"add","path":"/v","value":1}]`), "", "", "alice", nil)
+				res, err = s.WriteResource(ctx, "demo", name, Pre{IfMatch: pre[i].ID}, patches(`[{"op":"add","path":"/v","value":1}]`), "", "", "alice", nil)
 			}
 			if err == nil {
 				record(res.NSID, nil)
@@ -166,12 +166,25 @@ func TestLocalGroupMixed(t *testing.T) {
 			defer wg.Done()
 			if i%4 == 0 {
 				// A config change: the queued writes planned under the
-				// old configuration are checked again.
-				res, err := s.WriteConfig(ctx, "demo", "alice", patches(fmt.Sprintf(`[{"op":"add","path":"/k%d","value":true}]`, i)),
-					func(doc any, exists bool, p any) (any, error) {
-						out, _, err := applyPatches(doc, exists, p)
-						return out, err
-					}, nil)
+				// old configuration are checked again. Config writers
+				// race each other on If-Match, and retry on a 412 as a
+				// client would.
+				var res *ConfigResult
+				var err error
+				for {
+					var cfg string
+					if _, cfg, err = s.ReadConfig(ctx, "demo"); err != nil {
+						break
+					}
+					res, err = s.WriteConfig(ctx, "demo", "alice", cfg, patches(fmt.Sprintf(`[{"op":"add","path":"/k%d","value":true}]`, i)), "", "",
+						func(doc any, exists bool, p any) (any, error) {
+							out, _, err := applyPatches(doc, exists, p)
+							return out, err
+						}, nil)
+					if e, ok := err.(*Error); !ok || e.Status != 412 {
+						break
+					}
+				}
 				if err == nil {
 					record(res.NSID, nil)
 				} else {
@@ -247,7 +260,7 @@ func TestLocalGroupTwoInstances(t *testing.T) {
 			if i%2 == 1 {
 				s = b
 			}
-			res, err := s.WriteResource(ctx, "demo", fmt.Sprintf("doc%d", i), "",
+			res, err := s.WriteResource(ctx, "demo", fmt.Sprintf("doc%d", i), Pre{IfNoneMatch: true},
 				patches(fmt.Sprintf(`[{"op":"add","path":"","value":{"n":%d}}]`, i)), "", "", "alice", nil)
 			if err == nil {
 				nsids[i] = res.NSID

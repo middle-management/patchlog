@@ -56,7 +56,7 @@ func mustCreateNS(t *testing.T, s *Store, ns string) (cfgID, nsID string) {
 
 func mustWrite(t *testing.T, s *Store, ns, name, ifMatch, p string) *WriteResult {
 	t.Helper()
-	res, err := s.WriteResource(context.Background(), ns, name, ifMatch, patches(p), "", "", "alice", nil)
+	res, err := s.WriteResource(context.Background(), ns, name, Pre{IfMatch: ifMatch, IfNoneMatch: ifMatch == ""}, patches(p), "", "", "alice", nil)
 	if err != nil {
 		t.Fatalf("WriteResource %s/%s: %v", ns, name, err)
 	}
@@ -156,13 +156,13 @@ func TestLocalStaleAndReplay(t *testing.T) {
 	// Two writes pin the same parent; the first commits.
 	w2 := mustWrite(t, s, "demo", "doc1", w1.ID, `[{"op":"add","path":"/b","value":2}]`)
 	// The second, with different patches, is stale: 412 naming the head.
-	_, err := s.WriteResource(context.Background(), "demo", "doc1", w1.ID, patches(`[{"op":"add","path":"/c","value":3}]`), "", "", "alice", nil)
+	_, err := s.WriteResource(context.Background(), "demo", "doc1", Pre{IfMatch: w1.ID}, patches(`[{"op":"add","path":"/c","value":3}]`), "", "", "alice", nil)
 	ae, ok := err.(*Error)
 	if !ok || ae.Status != 412 || ae.Body["head"] != w2.ID {
 		t.Fatalf("stale write: %v", err)
 	}
 	// The first's retry, however, replays: its revision is the head.
-	res, err := s.WriteResource(context.Background(), "demo", "doc1", w1.ID, patches(`[{"op":"add","path":"/b","value":2}]`), "", "", "alice", nil)
+	res, err := s.WriteResource(context.Background(), "demo", "doc1", Pre{IfMatch: w1.ID}, patches(`[{"op":"add","path":"/b","value":2}]`), "", "", "alice", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func testConcurrentNamespace(t *testing.T, group, writers int) {
 		go func() {
 			defer wg.Done()
 			name := fmt.Sprintf("doc%d", i)
-			res, err := s.WriteResource(context.Background(), "demo", name, "",
+			res, err := s.WriteResource(context.Background(), "demo", name, Pre{IfNoneMatch: true},
 				patches(fmt.Sprintf(`[{"op":"add","path":"","value":{"w":%d}}]`, i)), "", "", "alice", nil)
 			if err == nil {
 				ids[i] = res.NSID
@@ -264,7 +264,7 @@ func testConcurrentResource(t *testing.T, group int) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, err := s.WriteResource(context.Background(), "demo", "doc1", w1.ID,
+			res, err := s.WriteResource(context.Background(), "demo", "doc1", Pre{IfMatch: w1.ID},
 				patches(fmt.Sprintf(`[{"op":"add","path":"/w%d","value":true}]`, i)), "", "", "alice", nil)
 			results[i], errs[i] = res, err
 		}()
@@ -324,15 +324,15 @@ func TestLocalDeleteRestore(t *testing.T) {
 
 	// DELETE without If-Match is 428; with a stale one, 412 naming the
 	// head.
-	if _, err := s.DeleteResource(ctx, "demo", "doc1", "", "", "", "alice", nil); err == nil || err.(*Error).Status != 428 {
+	if _, err := s.DeleteResource(ctx, "demo", "doc1", Pre{}, "", "", "alice", nil); err == nil || err.(*Error).Status != 428 {
 		t.Fatalf("no If-Match: %v", err)
 	}
-	if _, err := s.DeleteResource(ctx, "demo", "doc1", w1.ID, "", "", "alice", nil); err == nil || err.(*Error).Status != 412 || err.(*Error).Body["head"] != w2.ID {
+	if _, err := s.DeleteResource(ctx, "demo", "doc1", Pre{IfMatch: w1.ID}, "", "", "alice", nil); err == nil || err.(*Error).Status != 412 || err.(*Error).Body["head"] != w2.ID {
 		t.Fatalf("stale: %v", err)
 	}
 
 	// DELETE: 201, the head is the tombstone, the document is gone.
-	d, err := s.DeleteResource(ctx, "demo", "doc1", w2.ID, "gaaaaaaaaaaaaaaaaaaaaaaaaa", "", "alice", nil)
+	d, err := s.DeleteResource(ctx, "demo", "doc1", Pre{IfMatch: w2.ID}, "gaaaaaaaaaaaaaaaaaaaaaaaaa", "", "alice", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,16 +352,16 @@ func TestLocalDeleteRestore(t *testing.T) {
 		t.Fatalf("head after delete: %+v", head)
 	}
 
-	// A retried DELETE replays; a DELETE of another parent is 410; a
-	// write pinning the old head is 412.
-	d2, err := s.DeleteResource(ctx, "demo", "doc1", w2.ID, "", "", "alice", nil)
+	// A retried DELETE replays; a DELETE of another parent is 410, and so
+	// is a write pinning the deleted head (naming the tombstone).
+	d2, err := s.DeleteResource(ctx, "demo", "doc1", Pre{IfMatch: w2.ID}, "", "", "alice", nil)
 	if err != nil || d2.Status != 200 || !d2.Replayed || d2.ID != tid || d2.NSID != d.NSID {
 		t.Fatalf("replay: %+v %v", d2, err)
 	}
-	if _, err := s.DeleteResource(ctx, "demo", "doc1", w1.ID, "", "", "alice", nil); err == nil || err.(*Error).Status != 410 {
+	if _, err := s.DeleteResource(ctx, "demo", "doc1", Pre{IfMatch: w1.ID}, "", "", "alice", nil); err == nil || err.(*Error).Status != 410 {
 		t.Fatalf("double delete: %v", err)
 	}
-	if _, err := s.WriteResource(ctx, "demo", "doc1", w2.ID, patches(`[{"op":"add","path":"/c","value":3}]`), "", "", "alice", nil); err == nil || err.(*Error).Status != 412 {
+	if _, err := s.WriteResource(ctx, "demo", "doc1", Pre{IfMatch: w2.ID}, patches(`[{"op":"add","path":"/c","value":3}]`), "", "", "alice", nil); err == nil || err.(*Error).Status != 410 || err.(*Error).Body["tombstone"] != tid {
 		t.Fatalf("append at the deleted head: %v", err)
 	}
 
@@ -391,9 +391,10 @@ func TestLocalDeleteRestore(t *testing.T) {
 		t.Fatalf("tombstone entry: %v", le)
 	}
 
-	// Restore: the parent is the tombstone id, the fold across the chain
-	// boundary is the restored document only.
-	w3, err := s.WriteResource(ctx, "demo", "doc1", tid, patches(`[{"op":"add","path":"","value":{"z":1}}]`), "", "", "alice", nil)
+	// Restore: the parent is the tombstone id, and the patches apply to
+	// the last live document, in the write and in the fold across the
+	// chain boundary.
+	w3, err := s.WriteResource(ctx, "demo", "doc1", Pre{IfMatch: tid}, patches(`[{"op":"add","path":"/z","value":1}]`), "", "", "alice", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,7 +402,7 @@ func TestLocalDeleteRestore(t *testing.T) {
 		t.Fatalf("restore: %+v", w3)
 	}
 	doc, canon, err := s.FoldResource(ctx, "demo", "doc1", 0)
-	if err != nil || string(canon) != `{"z":1}` {
+	if err != nil || string(canon) != `{"a":1,"b":2,"z":1}` {
 		t.Fatalf("fold after restore: %s %v", canon, err)
 	}
 	_ = doc
@@ -486,7 +487,7 @@ func TestLocalBatch(t *testing.T) {
 	}
 	_, err = s.WriteBatch(ctx, "demo", "alice", stale, nil, nil, nil, nil, false)
 	var bf *BatchFailure
-	if !errors.As(err, &bf) || len(bf.Items) != 1 || bf.Items[0].Index != 0 || bf.Items[0].Err.Status != 412 {
+	if !errors.As(err, &bf) || len(bf.Items) != 1 || bf.Items[0].Index != 0 || bf.Items[0].Err.(*Error).Status != 412 {
 		t.Fatalf("stale batch: %v", err)
 	}
 	h1b, _ := s.ReadHead(ctx, "demo", "doc1")
@@ -506,7 +507,7 @@ func TestLocalBatch(t *testing.T) {
 		return nil
 	}
 	_, err = s.WriteBatch(ctx, "demo", "alice", gate, nil, nil, nil, check, false)
-	if !errors.As(err, &bf) || len(bf.Items) != 1 || bf.Items[0].Err.Body["code"] != "rule" {
+	if !errors.As(err, &bf) || len(bf.Items) != 1 || bf.Items[0].Err.(*Error).Body["code"] != "rule" {
 		t.Fatalf("gate: %v", err)
 	}
 

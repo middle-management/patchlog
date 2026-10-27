@@ -209,14 +209,25 @@ func ddbGateCfg(cfg *Config, ns, name string, patches any, st *ddb.WriteState, n
 	if st.Action == "delete" {
 		doc = st.HeadDoc
 	} else {
+		// Step 4, the SQL path's own checkLimits on a one-step item:
+		// sizes (a create, or an append that replaces the whole
+		// document, against documentSize: fromScratch), counts, depth
+		// and well-formed $blob references. A document that references
+		// blobs then needs them resolved (checkBlobs), which this
+		// backend can't do.
+		canon = jsonv.Canonical(patches)
+		step := &stepState{raw: patches, canon: canon, action: st.Action, doc: st.Doc}
+		if err := checkLimits(cfg.Limits, &itemState{steps: []*stepState{step}}); err != nil {
+			return err
+		}
+		if !step.noBlobs {
+			return ddbUnsupported("blobs")
+		}
+		// Step 5.
 		if d, ok := st.Doc.(map[string]any); ok {
 			if _, typed := d["$schema"]; typed {
 				return ddbUnsupported("$schema validation")
 			}
-		}
-		canon = jsonv.Canonical(patches)
-		if err := ddbCheckLimits(cfg.Limits, patches, canon, st.DocCanon); err != nil {
-			return err
 		}
 	}
 
@@ -245,26 +256,6 @@ func ddbGateCfg(cfg *Config, ns, name string, patches any, st *ddb.WriteState, n
 	}
 	if i, path, ok := rules.EvalList(cfg.Rules, env); !ok {
 		return apiErr(422, "rule", "rule", i, "path", path)
-	}
-	return nil
-}
-
-// ddbCheckLimits is checkLimits for one patch-set step (write.go's, minus
-// blobs and e2e).
-func ddbCheckLimits(l Limits, patches any, canon, docCanon []byte) *Error {
-	if len(canon) > l.PatchSetSize {
-		return limitErr(413, "patchSetSize", int64(len(canon)), int64(l.PatchSetSize), "patch set too large")
-	}
-	if ops, ok := patches.([]any); ok && len(ops) > l.OpsPerSet {
-		return limitErr(422, "opsPerSet", int64(len(ops)), int64(l.OpsPerSet), "too many operations")
-	}
-	if len(docCanon) > l.DocumentSize {
-		return limitErr(413, "documentSize", int64(len(docCanon)), int64(l.DocumentSize), "document too large")
-	}
-	if sh := shapeOf(l, docCanon); sh.depth > l.NestingDepth {
-		return limitErr(422, "nestingDepth", int64(sh.depth), int64(l.NestingDepth), "document nested too deeply")
-	} else if sh.bad != nil {
-		return sh.bad
 	}
 	return nil
 }
@@ -318,11 +309,8 @@ func (e *Engine) ddbWriteResource(ctx context.Context, req Request, item Item) (
 	if step.Delete {
 		return e.ddbDelete(ctx, req, item, step, author)
 	}
-	res, err := e.ddb.store.WriteResource(ctx, req.NS, item.Resource, item.IfMatch, step.Patches, step.Gesture, step.Undoes, author,
+	res, err := e.ddb.store.WriteResource(ctx, req.NS, item.Resource, ddb.Pre{IfMatch: item.IfMatch, IfNoneMatch: item.IfNoneMatch}, step.Patches, step.Gesture, step.Undoes, author,
 		func(st *ddb.WriteState) error {
-			if item.IfNoneMatch && st.ResExists {
-				return apiErr(412, "stale", "head", st.HeadID)
-			}
 			if perr := e.ddbGate(req.NS, item.Resource, step.Patches, st); perr != nil {
 				return perr
 			}
@@ -339,19 +327,29 @@ func (e *Engine) ddbWriteResource(ctx context.Context, req Request, item Item) (
 		NSID:     res.NSID,
 		Replayed: res.Replayed,
 		Items:    []ItemResult{{Resource: item.Resource, IDs: []string{res.ID}}},
-		Entry: &LogEntry{
-			ID: res.NSID, Kind: "head", Author: author,
-			Created: formatTime(res.Created),
-			Gesture: step.Gesture, Undoes: step.Undoes,
-		},
+		Entry:    ddbRevEntry(res.Rev),
 	}, nil
+}
+
+// ddbRevEntry is a revision's resource log entry as a write answers it,
+// committed or replayed (logEntry of resolve.go): its id and parent, its
+// canonical patches (none for a tombstone), author, time and gestures, as
+// recorded. -dev writes carry no grant.
+func ddbRevEntry(r ddb.RevInfo) *LogEntry {
+	le := &LogEntry{ID: r.ID, Parent: r.ParentID, Kind: "rev", Author: r.Author, Created: formatTime(r.Created), Gesture: r.Gesture, Undoes: r.Undoes}
+	if r.Kind == "tombstone" {
+		le.Kind = "tombstone"
+	} else if r.Patches != "" {
+		le.Patches, le.size = jsonv.MustParse([]byte(r.Patches)), len(r.Patches)
+	}
+	return le
 }
 
 // ddbDelete is a tombstone write (§7.2's DELETE): the store pins the
 // checked head, the gate sees the delete envelope (§6.4.1: the last live
 // document, no patches).
 func (e *Engine) ddbDelete(ctx context.Context, req Request, item Item, step Step, author string) (*WriteResult, error) {
-	res, err := e.ddb.store.DeleteResource(ctx, req.NS, item.Resource, item.IfMatch, step.Gesture, step.Undoes, author,
+	res, err := e.ddb.store.DeleteResource(ctx, req.NS, item.Resource, ddb.Pre{IfMatch: item.IfMatch, IfNoneMatch: item.IfNoneMatch}, step.Gesture, step.Undoes, author,
 		func(st *ddb.WriteState) error {
 			if perr := e.ddbGate(req.NS, item.Resource, nil, st); perr != nil {
 				return perr
@@ -369,16 +367,15 @@ func (e *Engine) ddbDelete(ctx context.Context, req Request, item Item, step Ste
 		NSID:     res.NSID,
 		Replayed: res.Replayed,
 		Items:    []ItemResult{{Resource: item.Resource, IDs: []string{res.ID}}},
-		Entry: &LogEntry{
-			ID: res.NSID, Kind: "tombstone", Author: author,
-			Created: formatTime(res.Created),
-			Gesture: step.Gesture, Undoes: step.Undoes,
-		},
+		Entry:    ddbRevEntry(res.Rev),
 	}, nil
 }
 
 func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error) {
 	author := ddbAuthor(req.Cred)
+	if err := checkConfigGestures(&cc); err != nil {
+		return nil, err
+	}
 	if cc.IfNoneMatch {
 		// PUT /ns/{ns}: create (insertNamespace).
 		if !ValidNSName(req.NS) {
@@ -403,7 +400,10 @@ func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChang
 		return &WriteResult{Status: 201, NSID: nsID, ConfigID: cfgID, Entry: &LogEntry{Gesture: cc.Gesture, Undoes: cc.Undoes}}, nil
 	}
 
-	res, err := e.ddb.store.WriteConfig(ctx, req.NS, author, cc.Patches,
+	if cc.IfMatch == "" {
+		return nil, apiErr(428, "precondition_required")
+	}
+	res, err := e.ddb.store.WriteConfig(ctx, req.NS, author, cc.IfMatch, cc.Patches, cc.Gesture, cc.Undoes,
 		func(doc any, exists bool, patches any) (any, error) {
 			doc, perr := applyConfigPatches(doc, exists, patches)
 			if perr != nil {
@@ -412,13 +412,22 @@ func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChang
 			return doc, nil
 		},
 		func(st *ddb.ConfigState) error {
-			if st.Purged {
-				return apiErr(410, "purged", "namespace", req.NS)
+			// Steps 4 and 5 of planConfig (nsops.go): the current
+			// configuration's limits on the change, then the new
+			// document's schema against what it keeps. Rules don't
+			// apply: the -dev principal is a * key (§6.6, checkRules).
+			cur, perr := e.ddbConfig(ctx, req.NS, st.ConfigID)
+			if perr != nil {
+				return perr
 			}
-			if cc.IfMatch != "" && cc.IfMatch != st.ConfigID {
-				return apiErr(412, "stale", "config", st.ConfigID)
+			if canon := jsonv.Canonical(cc.Patches); len(canon) > cur.Limits.PatchSetSize {
+				return limitErr(413, "patchSetSize", int64(len(canon)), int64(cur.Limits.PatchSetSize), "patch set too large")
 			}
-			cfg, perr := e.newConfig(st.Doc, nil, nil)
+			if n := len(jsonv.Canonical(st.Doc)); n > cur.Limits.DocumentSize {
+				return limitErr(413, "documentSize", int64(n), int64(cur.Limits.DocumentSize), "document too large")
+			}
+			prev, _ := st.Cur.(map[string]any)
+			cfg, perr := e.newConfig(st.Doc, prev, nil)
 			if perr != nil {
 				return perr
 			}
@@ -437,8 +446,13 @@ func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChang
 		e.ddbForgetConfig(req.NS)
 		e.ddbCommitted(req.NS, "ns:"+req.NS)
 	}
-	return &WriteResult{Status: 201, NSID: res.NSID, ConfigID: res.ConfigID, Replayed: res.Replayed,
-		Entry: &LogEntry{ID: res.NSID, Kind: "config", Author: author, Created: formatTime(res.Created), Gesture: cc.Gesture, Undoes: cc.Undoes}}, nil
+	status, gesture, undoes := 201, cc.Gesture, cc.Undoes
+	if res.Replayed {
+		// A retry answers what was recorded, gestures included (§7.2).
+		status, gesture, undoes = 200, res.Gesture, res.Undoes
+	}
+	return &WriteResult{Status: status, NSID: res.NSID, ConfigID: res.ConfigID, Replayed: res.Replayed,
+		Entry: &LogEntry{ID: res.NSID, Kind: "config", Author: author, Created: formatTime(res.Created), Gesture: gesture, Undoes: undoes}}, nil
 }
 
 // applyConfigPatches folds config patches into a namespace document, as

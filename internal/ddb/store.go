@@ -49,13 +49,89 @@ func (s *Store) now() time.Time {
 }
 
 // WriteResult is a committed (or replayed) write, shaped after
-// internal/core's: the revision and the namespace log entry.
+// internal/core's: the revision, its resource log entry (Rev, which the
+// write's answer carries, logEntry of resolve.go) and the namespace log
+// entry. A replay answers them as the first attempt recorded them.
 type WriteResult struct {
 	Status   int    // 201 committed, 200 replayed
 	ID       string // revision id
 	NSID     string // namespace log entry id
 	Created  int64  // the entry's stored time, milliseconds
 	Replayed bool
+	Rev      RevInfo
+}
+
+// committed is a plan's answer once its transaction commits.
+func committed(p *writePlan) *WriteResult {
+	return &WriteResult{Status: 201, ID: p.rev.id, NSID: p.entry.id, Created: p.entry.created, Rev: p.rev.info(p.entry.pos)}
+}
+
+// replayed answers a plan whose write turned out committed already (a
+// duplicate won the race, or an ambiguous failure had committed): the
+// revision is the plan's, the entry the one stored.
+func (s *Store) replayed(ctx context.Context, ns string, p *writePlan, entryID string) *WriteResult {
+	created, _ := s.entryCreated(ctx, ns, entryID)
+	return &WriteResult{Status: 200, ID: p.rev.id, NSID: entryID, Created: created, Replayed: true, Rev: p.rev.info(0)}
+}
+
+// replay is the idempotent-retry lookup (§7.2, replay of write.go): the
+// revision the request computes (Pre.expectedID), if this author committed
+// it to this resource, at the head or anywhere before it, answered as its
+// first attempt was. Nil when there is no such write.
+func (s *Store) replay(ctx context.Context, ns, name string, head *resRow, pre Pre, del bool, patches any, author string) (*WriteResult, error) {
+	want, ok := pre.expectedID(del, patches)
+	if !ok || head == nil || head.headPos == 0 {
+		return nil, nil
+	}
+	rev, err := s.revOf(ctx, ns, name, head, want)
+	if err != nil || rev == nil || rev.Author != author {
+		return nil, err
+	}
+	res := &WriteResult{Status: 200, ID: want, Replayed: true, Rev: *rev, Created: rev.Created}
+	if rev.LogPos > 0 {
+		le, err := s.getItem(ctx, keyLog(ns, rev.LogPos))
+		if err != nil {
+			return nil, err
+		}
+		if le != nil {
+			res.NSID, res.Created = item(le).s("id"), int64(item(le).n("created"))
+		}
+	} else if head.headID == want {
+		res.NSID = head.entryID
+	}
+	return res, nil
+}
+
+// revOf finds resource name's revision id: the head's by its key, else
+// through GSI1 (revisions_by_id), filtered to the resource.
+func (s *Store) revOf(ctx context.Context, ns, name string, head *resRow, id string) (*RevInfo, error) {
+	if head.headID == id {
+		it, err := s.getItem(ctx, keyRev(ns, name, head.headPos))
+		if err != nil || it == nil {
+			return nil, err
+		}
+		r := scanRevInfo(item(it))
+		return &r, nil
+	}
+	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              &s.Table,
+		IndexName:              strptr(gsiName),
+		KeyConditionExpression: strptr("G1PK = :g"),
+		FilterExpression:       strptr("PK = :pk AND begins_with(SK, :sk)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":g": avS(g1RevID(id)), ":pk": avS(nsPK(ns)), ":sk": avS("REV#" + name + "#"),
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, it := range q.Items {
+		r := scanRevInfo(item(it))
+		if r.Name == name {
+			return &r, nil
+		}
+	}
+	return nil, nil
 }
 
 // CreateNamespace bootstraps a namespace with its config genesis and first
@@ -64,7 +140,7 @@ type WriteResult struct {
 func (s *Store) CreateNamespace(ctx context.Context, ns, author string, patches any) (cfgID, nsID string, err error) {
 	doc, _, err := applyPatches(nil, false, patches)
 	if err != nil {
-		return "", "", apiErr(422, "patch", "detail", err.Error())
+		return "", "", patchErr(err)
 	}
 	canon := jsonv.Canonical(patches)
 	cfg := ids.Revision(nil, canon)
@@ -119,12 +195,12 @@ type WriteState struct {
 	Writes    []string // the patch set's write pointers
 }
 
-// WriteResource creates or appends to a resource (D.3's check-then-commit,
-// spike subset). ifMatch pins the parent's revision id ("" pins nothing).
-// check, when set, runs the caller's gate on every attempt, after the
-// state read and the plan and before the commit; a non-nil error vetoes
-// the write. A replayed write is answered before check runs.
-func (s *Store) WriteResource(ctx context.Context, ns, name, ifMatch string, patches any, gesture, undoes, author string, check func(*WriteState) error) (*WriteResult, error) {
+// WriteResource creates, appends to or restores a resource (D.3's
+// check-then-commit). pre is the request's precondition (§7.2). check,
+// when set, runs the caller's gate on every attempt, after the state read
+// and the plan and before the commit; a non-nil error vetoes the write. A
+// replayed write is answered before check runs.
+func (s *Store) WriteResource(ctx context.Context, ns, name string, pre Pre, patches any, gesture, undoes, author string, check func(*WriteState) error) (*WriteResult, error) {
 	for attempt := 0; ; attempt++ {
 		// The check phase: reads outside any serialisation (D.3 steps
 		// 1–6). One batch read — the four keys are all known from the
@@ -134,13 +210,20 @@ func (s *Store) WriteResource(ctx context.Context, ns, name, ifMatch string, pat
 			return nil, err
 		}
 
-		p, aerr := planWrite(ns, name, m, t, head, headDoc, ifMatch, patches, gesture, undoes, author, s.now().UnixMilli(), applyPatches)
-		if aerr != nil {
-			return nil, aerr
+		if err := nsState(ns, m); err != nil {
+			return nil, err
 		}
-		if p.replay {
-			created, _ := s.entryCreated(ctx, ns, p.entry.id)
-			return &WriteResult{Status: 200, ID: p.rev.id, NSID: p.entry.id, Created: created, Replayed: true}, nil
+		p, aerr := planWrite(ns, name, m, t, head, headDoc, pre, patches, gesture, undoes, author, s.now().UnixMilli(), applyPatches)
+		if aerr != nil {
+			// A write refused at step 2 may be its own retry (§7.2):
+			// the lookup comes first, as on the SQL path. Only a
+			// refused write can be one — a write whose precondition
+			// passes names the head as parent, and its revision would
+			// be the head's child — so a passing write costs no read.
+			if res, err := s.replay(ctx, ns, name, head, pre, false, patches, author); res != nil || err != nil {
+				return res, err
+			}
+			return nil, aerr
 		}
 		if check != nil {
 			st := &WriteState{
@@ -199,7 +282,7 @@ func (s *Store) commitWrite(ctx context.Context, ns, name string, p *writePlan) 
 		TransactItems: buildWriteTx(s.Table, ns, name, p),
 	})
 	if err == nil {
-		return &WriteResult{Status: 201, ID: p.rev.id, NSID: p.entry.id, Created: p.entry.created}, false, nil
+		return committed(p), false, nil
 	}
 	res, retry, cerr := s.mapCancel(ctx, ns, name, p, err)
 	if res == nil && cerr == nil && !retry {
@@ -217,7 +300,7 @@ func (s *Store) commitDelete(ctx context.Context, ns, name string, p *writePlan)
 		TransactItems: buildDeleteTx(s.Table, ns, name, p),
 	})
 	if err == nil {
-		return &WriteResult{Status: 201, ID: p.rev.id, NSID: p.entry.id, Created: p.entry.created}, false, nil
+		return committed(p), false, nil
 	}
 	res, retry, cerr := s.mapDeleteCancel(ctx, ns, name, p, err)
 	if res == nil && cerr == nil && !retry {
@@ -267,8 +350,7 @@ func (s *Store) mapCancel(ctx context.Context, ns, name string, p *writePlan, er
 		// ambiguous failure). Answer from the marker.
 		mk, gerr := s.getItem(ctx, keyNSID(ns, p.entry.id))
 		if gerr == nil && mk != nil {
-			created, _ := s.entryCreated(ctx, ns, p.entry.id)
-			return &WriteResult{Status: 200, ID: item(mk).s("revId"), NSID: p.entry.id, Created: created, Replayed: true}, false, nil
+			return s.replayed(ctx, ns, p, p.entry.id), false, nil
 		}
 		return nil, false, apiErr(409, "conflict")
 	case failed(actRes), failed(actRev):
@@ -287,12 +369,11 @@ func (s *Store) writeConflict(ctx context.Context, ns, name string, p *writePlan
 	cur, gerr := s.getRes(ctx, ns, name)
 	if gerr == nil && cur != nil {
 		if cur.headID == p.rev.id {
-			created, _ := s.entryCreated(ctx, ns, cur.entryID)
-			return &WriteResult{Status: 200, ID: p.rev.id, NSID: cur.entryID, Created: created, Replayed: true}, false, nil
+			return s.replayed(ctx, ns, p, cur.entryID), false, nil
 		}
 		return nil, false, apiErr(412, "stale", "head", cur.headID)
 	}
-	return nil, false, apiErr(412, "stale", "head", "")
+	return nil, false, stale(nil)
 }
 
 // DeleteResource tombstones a resource (§7.2's DELETE, §8.1): the
@@ -301,19 +382,21 @@ func (s *Store) writeConflict(ctx context.Context, ns, name string, p *writePlan
 // deleted head (required, 428 otherwise). check runs the caller's gate per
 // attempt, as WriteResource's does; its state's Doc is the last live
 // document (§6.4.1's delete envelope).
-func (s *Store) DeleteResource(ctx context.Context, ns, name, ifMatch string, gesture, undoes, author string, check func(*WriteState) error) (*WriteResult, error) {
+func (s *Store) DeleteResource(ctx context.Context, ns, name string, pre Pre, gesture, undoes, author string, check func(*WriteState) error) (*WriteResult, error) {
 	for attempt := 0; ; attempt++ {
 		m, t, head, headDoc, err := s.readWriteState(ctx, ns, name)
 		if err != nil {
 			return nil, err
 		}
-		p, aerr := planDelete(ns, name, m, t, head, ifMatch, gesture, undoes, author, s.now().UnixMilli())
-		if aerr != nil {
-			return nil, aerr
+		if err := nsState(ns, m); err != nil {
+			return nil, err
 		}
-		if p.replay {
-			created, _ := s.entryCreated(ctx, ns, p.entry.id)
-			return &WriteResult{Status: 200, ID: p.rev.id, NSID: p.entry.id, Created: created, Replayed: true}, nil
+		p, aerr := planDelete(ns, name, m, t, head, pre, gesture, undoes, author, s.now().UnixMilli())
+		if aerr != nil {
+			if res, err := s.replay(ctx, ns, name, head, pre, true, nil, author); res != nil || err != nil {
+				return res, err
+			}
+			return nil, aerr
 		}
 		if check != nil {
 			st := &WriteState{
@@ -380,8 +463,7 @@ func (s *Store) deleteConflict(ctx context.Context, ns, name string, p *writePla
 	if gerr == nil && cur != nil {
 		if cur.state == "tombstoned" {
 			if cur.headID == p.rev.id {
-				created, _ := s.entryCreated(ctx, ns, cur.entryID)
-				return &WriteResult{Status: 200, ID: p.rev.id, NSID: cur.entryID, Created: created, Replayed: true}, false, nil
+				return s.replayed(ctx, ns, p, cur.entryID), false, nil
 			}
 			return nil, false, gone()
 		}
@@ -469,6 +551,11 @@ func (s *Store) ReadHead(ctx context.Context, ns, name string) (*HeadInfo, error
 		return nil, nil // absent
 	}
 	h := &HeadInfo{Doc: doc, ID: res.headID, Live: res.state != "tombstoned", LastID: res.lastID, LastPos: res.lastPos}
+	if !h.Live {
+		// A tombstone keeps the last live document (a restore applies
+		// to it), but the head serves none (§8.1).
+		h.Doc = nil
+	}
 	if h.Live && doc == nil {
 		return nil, apiErr(409, "conflict", "detail", "head document missing")
 	}
@@ -553,6 +640,9 @@ func (s *Store) ReadLog(ctx context.Context, ns, at, since string, limit int) (e
 		}
 		if u := i.s("undoes"); u != "" {
 			e["undoes"] = u
+		}
+		if gs := i.s("gestures"); gs != "" {
+			e["gestures"], _ = jsonv.Parse([]byte(gs))
 		}
 		idsByPos[pos] = e["id"].(string)
 		if prev := i.n("prevPos"); prev > 0 {
@@ -693,3 +783,30 @@ func applyPatches(doc any, exists bool, patches any) (any, []string, error) {
 
 func boolptr(b bool) *bool    { return &b }
 func int32ptr(n int32) *int32 { return &n }
+
+// scanRevInfo reads a REV# item (a revision or a tombstone) as served.
+func scanRevInfo(i item) RevInfo {
+	return RevInfo{
+		Name:     resNameFromRev(i.s("SK")),
+		ID:       i.s("id"),
+		Pos:      i.n("pos"),
+		Kind:     i.s("kind"),
+		ParentID: i.s("parentId"),
+		Patches:  i.s("patches"),
+		Author:   i.s("author"),
+		Created:  int64(i.n("created")),
+		Size:     i.n("size"),
+		Digest:   i.b("digest"),
+		Gesture:  i.s("gesture"),
+		Undoes:   i.s("undoes"),
+		LogPos:   i.n("logPos"),
+	}
+}
+
+// info is a planned revision as served (scanRevInfo's shape).
+func (r *revRow) info(logPos uint64) RevInfo {
+	return RevInfo{
+		ID: r.id, Pos: r.pos, Kind: r.kind, ParentID: r.parentID, Patches: r.patches, Author: r.author,
+		Created: r.created, Size: r.size, Digest: r.digest, Gesture: r.gesture, Undoes: r.undoes, LogPos: logPos,
+	}
+}

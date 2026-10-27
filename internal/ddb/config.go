@@ -23,16 +23,20 @@ type ConfigState struct {
 	Frozen    bool
 	Purged    bool
 	ConfigID  string
+	Cur       any // the current namespace document, the change's base
 	Doc       any // the new namespace document (nil when absent)
 	NewFrozen bool
 }
 
-// ConfigResult is a committed (or replayed) config change.
+// ConfigResult is a committed (or replayed) config change. A replay
+// carries the gestures its entry recorded (§7.2).
 type ConfigResult struct {
 	ConfigID string
 	NSID     string
 	Created  int64 // the entry's stored time, milliseconds
 	Replayed bool
+	Gesture  string
+	Undoes   string
 }
 
 // WriteConfig appends a configuration revision: the config chain's child
@@ -45,7 +49,13 @@ type ConfigResult struct {
 // WriteResource's check. checkConfig runs the caller's gate on the
 // resulting state (after apply, so it sees the new document) and vetoes
 // with a non-nil error. Both run per attempt.
-func (s *Store) WriteConfig(ctx context.Context, ns, author string, patches any, apply func(doc any, exists bool, patches any) (any, error), check func(*ConfigState) error) (*ConfigResult, error) {
+//
+// ifMatch is the request's precondition (§7.2, planConfig of nsops.go):
+// required (428); one naming another configuration is first looked up as
+// the change's own retry — the configuration it computes, written by this
+// author — and otherwise 412 naming the current one. Both come before
+// apply, as steps 2 and 3 are ordered.
+func (s *Store) WriteConfig(ctx context.Context, ns, author, ifMatch string, patches any, gesture, undoes string, apply func(doc any, exists bool, patches any) (any, error), check func(*ConfigState) error) (*ConfigResult, error) {
 	// Each attempt holds the namespace's commit lock, as a batch's does.
 	var held func()
 	defer func() { release(held) }()
@@ -63,8 +73,20 @@ func (s *Store) WriteConfig(ctx context.Context, ns, author string, patches any,
 		if m == nil {
 			return nil, apiErr(404, "not_found", "namespace", ns)
 		}
+		if m.purged {
+			return nil, apiErr(410, "purged", "namespace", ns)
+		}
+		if ifMatch == "" {
+			return nil, apiErr(428, "precondition_required")
+		}
+		if ifMatch != m.configID {
+			if res, err := s.replayConfig(ctx, ns, ifMatch, patches, author); res != nil || err != nil {
+				return res, err
+			}
+			return nil, apiErr(412, "stale", "config", m.configID)
+		}
 
-		st := &ConfigState{Exists: true, Frozen: m.frozen, Purged: m.purged, ConfigID: m.configID, Doc: cfgDoc, NewFrozen: m.frozen}
+		st := &ConfigState{Exists: true, Frozen: m.frozen, Purged: m.purged, ConfigID: m.configID, Cur: cfgDoc, Doc: cfgDoc, NewFrozen: m.frozen}
 		doc, err := apply(cfgDoc, true, patches)
 		if err != nil {
 			return nil, err
@@ -85,17 +107,6 @@ func (s *Store) WriteConfig(ctx context.Context, ns, author string, patches any,
 		canon := jsonv.Canonical(patches)
 		cfgID := ids.Revision(&parent, canon)
 
-		// Idempotent replay: this change is already the configuration.
-		// The CFG item names its log entry, so the answer carries it.
-		if cfgID.String() == m.configID {
-			entryID, err := s.configEntryID(ctx, ns, m.configPos)
-			if err != nil {
-				return nil, err
-			}
-			created, _ := s.entryCreated(ctx, ns, entryID)
-			return &ConfigResult{ConfigID: m.configID, NSID: entryID, Created: created, Replayed: true}, nil
-		}
-
 		var tipID *ids.ID
 		if t.headID != "" {
 			p, err := ids.Parse(t.headID)
@@ -108,7 +119,7 @@ func (s *Store) WriteConfig(ctx context.Context, ns, author string, patches any,
 		body := jsonv.Canonical(map[string]any{"kind": "config", "target": cfgID.String()})
 		entryID := ids.Hash(tipID, body)
 		newPos := m.configPos + 1
-		entry := logRow{pos: t.headPos + 1, id: entryID.String(), prevPos: t.headPos, kind: "config", body: string(body), author: author, created: now, cfgPos: newPos}
+		entry := logRow{pos: t.headPos + 1, id: entryID.String(), prevPos: t.headPos, kind: "config", body: string(body), author: author, created: now, cfgPos: newPos, gesture: gesture, undoes: undoes}
 
 		frozen := "0"
 		if st.NewFrozen {
@@ -178,25 +189,48 @@ func (s *Store) WriteConfig(ctx context.Context, ns, author string, patches any,
 	}
 }
 
-// configEntryID is the id of the log entry that appended the
-// configuration at pos (CFG items carry their entry's position).
-func (s *Store) configEntryID(ctx context.Context, ns string, pos uint64) (string, error) {
-	it, err := s.getItem(ctx, keyCfg(ns, pos))
+// replayConfig is a config change's retry lookup (planConfig of
+// nsops.go): the configuration the request computes over its If-Match, if
+// this author wrote it to the namespace, answered with the entry that put
+// it in force and that entry's gestures; nil when there is none.
+func (s *Store) replayConfig(ctx context.Context, ns, ifMatch string, patches any, author string) (*ConfigResult, error) {
+	parent, err := ids.Parse(ifMatch)
 	if err != nil {
-		return "", err
+		return nil, nil
 	}
-	if it == nil {
-		return "", apiErr(500, "stored_config", "namespace", ns)
-	}
-	lp := item(it).n("logPos")
-	if lp == 0 {
-		return "", nil // a genesis written before logPos: no entry to name
-	}
-	le, err := s.getItem(ctx, keyLog(ns, lp))
+	want := ids.Revision(&parent, jsonv.Canonical(patches)).String()
+	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              &s.Table,
+		IndexName:              strptr(gsiName),
+		KeyConditionExpression: strptr("G1PK = :g"),
+		FilterExpression:       strptr("PK = :pk AND begins_with(SK, :sk)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":g": avS(g1RevID(want)), ":pk": avS(nsPK(ns)), ":sk": avS("CFG#"),
+		},
+	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return item(le).s("id"), nil
+	for _, it := range q.Items {
+		c := item(it)
+		if c.s("author") != author {
+			continue
+		}
+		res := &ConfigResult{ConfigID: want, Replayed: true}
+		if lp := c.n("logPos"); lp > 0 {
+			le, err := s.getItem(ctx, keyLog(ns, lp))
+			if err != nil {
+				return nil, err
+			}
+			if le != nil {
+				l := item(le)
+				res.NSID, res.Created = l.s("id"), int64(l.n("created"))
+				res.Gesture, res.Undoes = l.s("gesture"), l.s("undoes")
+			}
+		}
+		return res, nil
+	}
+	return nil, nil
 }
 
 // readConfigState reads the namespace's meta and current configuration

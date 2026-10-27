@@ -18,6 +18,7 @@ import (
 // serving paths need of it. Kind "tombstone" answers 410s (§8.1).
 type RevInfo struct {
 	Name     string
+	ID       string
 	Pos      uint64
 	Kind     string // "": a revision; "tombstone"
 	ParentID string
@@ -26,6 +27,9 @@ type RevInfo struct {
 	Created  int64
 	Size     uint64
 	Digest   []byte
+	Gesture  string
+	Undoes   string
+	LogPos   uint64 // the namespace entry that committed it (0: unknown)
 }
 
 // ReadRevByID finds a revision of a namespace by its id (the revisions_by_id
@@ -89,7 +93,9 @@ func (s *Store) FoldResource(ctx context.Context, ns, name string, toPos uint64)
 
 // walkChain applies each revision's patches in order, from genesis to
 // toPos (0: all). exists tracks whether the document exists — a JSON null
-// document exists, a tombstoned one does not.
+// document exists. A fold ending at a tombstone has no document; one
+// crossing it applies the restore's patches to the last live document, as
+// the write did (§6.2's restore verb, applySteps of write.go).
 func (s *Store) walkChain(ctx context.Context, ns, name string, toPos uint64, apply func(doc any, exists bool, patches string) (any, error)) (any, error) {
 	hi := "REV#" + name + "#" + padPos(toPos)
 	if toPos == 0 {
@@ -104,7 +110,7 @@ func (s *Store) walkChain(ctx context.Context, ns, name string, toPos uint64, ap
 		return nil, err
 	}
 	var doc any
-	exists := false
+	exists, dead := false, false
 	var last uint64
 	for _, it := range q.Items {
 		i := item(it)
@@ -116,16 +122,17 @@ func (s *Store) walkChain(ctx context.Context, ns, name string, toPos uint64, ap
 		}
 		last = pos
 		if i.s("kind") == "tombstone" {
-			// The chain crosses a delete: the document dies with it, and
-			// the next revision (a restore) root-replaces from nothing.
-			doc, exists = nil, false
+			dead = true
 			continue
 		}
 		doc, err = apply(doc, exists, i.s("patches"))
 		if err != nil {
 			return nil, err
 		}
-		exists = true
+		exists, dead = true, false
+	}
+	if dead {
+		return nil, nil
 	}
 	return doc, nil
 }

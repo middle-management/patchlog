@@ -2,11 +2,13 @@ package ddb
 
 import (
 	"crypto/sha256"
+	"errors"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/patch"
 )
 
 // The pure half of the write path (docs/DYNAMODB.md §4): from the state
@@ -49,7 +51,6 @@ type writePlan struct {
 	create    bool // the write creates the resource
 	restore   bool // the write restores a tombstoned resource
 	del       bool // the write is a tombstone
-	replay    bool // the write is already committed: store nothing
 }
 
 // Action indexes in the transaction buildWriteTx returns: cancellation
@@ -65,67 +66,126 @@ const (
 	numActs
 )
 
-// planWrite turns the check phase's reads into a write plan (D.3 steps
-// 1–6, spike subset: no grants, rules, schemas, limits or blobs).
-//
-// head is the resource's current row (nil: absent), headDoc its current
-// document (nil when head is), m the namespace's meta, t its log tip.
-// ifMatch pins the parent's revision id ("" pins nothing). patches is the
-// decoded patch set; apply folds it into a document.
-func planWrite(ns, name string, m *nsMeta, t *tip, head *resRow, headDoc any, ifMatch string, patches any, gesture, undoes, author string, now int64, apply func(doc any, exists bool, patches any) (any, []string, error)) (*writePlan, *Error) {
+// Pre is a write's precondition (§7.2): If-Match names the parent
+// revision (or tombstone, for a restore), If-None-Match makes it a
+// create. A write needs one of them.
+type Pre struct {
+	IfMatch     string
+	IfNoneMatch bool
+}
+
+// expectedID is the revision id a write's first step commits, computed
+// from the request alone (expectedIDs of write.go): it covers the parent
+// the precondition names, not whatever the head has become since, so a
+// retried write finds its first attempt's revision. ok is false without
+// a precondition, where the parent isn't the request's to name.
+func (pre Pre) expectedID(del bool, patches any) (id string, ok bool) {
+	var parent *ids.ID
+	switch {
+	case pre.IfMatch != "":
+		p, err := ids.Parse(pre.IfMatch)
+		if err != nil {
+			return "", false
+		}
+		parent = &p
+	case pre.IfNoneMatch:
+	default:
+		return "", false
+	}
+	if del {
+		if parent == nil {
+			return "", false
+		}
+		return ids.Tombstone(*parent).String(), true
+	}
+	return ids.Revision(parent, jsonv.Canonical(patches)).String(), true
+}
+
+// stale is the 412 naming the current head (null when there is none).
+func stale(head *resRow) *Error {
+	if head != nil && head.headPos > 0 {
+		return apiErr(412, "stale", "head", head.headID)
+	}
+	return apiErr(412, "stale", "head", nil)
+}
+
+// precondition is step 2's precondition for one item (precondition of
+// write.go): the parent the write applies to, or the refusal. A delete
+// of a tombstone, or an If-Match naming another head when the resource
+// is tombstoned, is 410 naming the tombstone.
+func precondition(head *resRow, pre Pre, del bool) (*ids.ID, *Error) {
+	live := head != nil && head.headPos > 0 && head.state != "tombstoned"
+	tomb := head != nil && head.headPos > 0 && head.state == "tombstoned"
+	switch {
+	case pre.IfNoneMatch && pre.IfMatch != "":
+		return nil, apiErr(400, "bad_input", "message", "both If-Match and If-None-Match")
+	case pre.IfNoneMatch:
+		if live || tomb {
+			return nil, stale(head)
+		}
+		return nil, nil
+	case pre.IfMatch != "":
+		want, err := ids.Parse(pre.IfMatch)
+		if err != nil {
+			return nil, apiErr(400, "bad_input", "message", "malformed If-Match")
+		}
+		switch {
+		case !live && !tomb:
+			return nil, stale(head)
+		case tomb && (want.String() != head.headID || del):
+			return nil, gone("tombstone", head.headID)
+		case live && want.String() != head.headID:
+			return nil, stale(head)
+		}
+		return &want, nil
+	default:
+		return nil, apiErr(428, "precondition_required")
+	}
+}
+
+// nsState is the namespace's refusals before a write's precondition
+// (§6.2): absent 404, purged 410. Frozen (409) comes after the retry
+// lookup, so a retry in a namespace frozen since is still answered.
+func nsState(ns string, m *nsMeta) *Error {
 	switch {
 	case m == nil:
-		return nil, apiErr(404, "not_found", "namespace", ns)
+		return apiErr(404, "not_found", "namespace", ns)
 	case m.purged:
-		return nil, apiErr(410, "purged", "namespace", ns)
-	case m.frozen:
-		return nil, apiErr(409, "frozen", "namespace", ns)
+		return apiErr(410, "purged", "namespace", ns)
 	}
+	return nil
+}
 
-	// The parent the request names: ifMatch, else the current head (a
-	// create names nothing). The write's revision id covers this parent,
-	// so a retried write recomputes the id of its first attempt even
-	// after the head moved on — which is what makes replay detectable.
-	var parentID *ids.ID
-	if ifMatch != "" {
-		p, err := ids.Parse(ifMatch)
-		if err != nil {
-			return nil, apiErr(400, "bad_input", "detail", "malformed If-Match")
-		}
-		parentID = &p
-	} else if head != nil && head.headPos > 0 {
-		p, err := ids.Parse(head.headID)
-		if err != nil {
-			return nil, apiErr(500, "stored_head", "namespace", ns, "resource", name)
-		}
-		parentID = &p
+// frozen is the 409 of a frozen namespace.
+func frozen(ns string) *Error { return apiErr(409, "frozen", "namespace", ns) }
+
+// planWrite turns the check phase's reads into a write plan (D.3 steps
+// 2–3, the store's part: the precondition, the patches applied, the
+// ids). The retry lookup is the caller's (Store.replay), before it: a
+// write that doesn't pass here may still be a committed write's retry.
+//
+// head is the resource's current row (nil: absent), headDoc its current
+// document — for a tombstone, the last live one, which a restore's
+// patches apply to (§6.2's restore verb). m is the namespace's meta, t
+// its log tip. apply folds the patches into a document.
+func planWrite(ns, name string, m *nsMeta, t *tip, head *resRow, headDoc any, pre Pre, patches any, gesture, undoes, author string, now int64, apply func(doc any, exists bool, patches any) (any, []string, error)) (*writePlan, *Error) {
+	if err := nsState(ns, m); err != nil {
+		return nil, err
 	}
+	if m.frozen {
+		return nil, frozen(ns)
+	}
+	parentID, perr := precondition(head, pre, false)
+	if perr != nil {
+		return nil, perr
+	}
+	restore := parentID != nil && head.state == "tombstoned"
 
 	canon := jsonv.Canonical(patches)
 	revID := ids.Revision(parentID, canon)
-
-	// Idempotent replay: the write's revision is already the head — the
-	// first attempt committed (recheck.go's replay, spike shape). The
-	// entry id the answer needs is on the RES item (entryId), since the
-	// entry's own id chains over a tip that has moved past it.
-	if head != nil && head.headID == revID.String() {
-		return &writePlan{replay: true, rev: revRow{id: head.headID}, entry: logRow{id: head.entryID}}, nil
-	}
-	if ifMatch != "" && (head == nil || head.headPos == 0 || head.headID != ifMatch) {
-		cur := ""
-		if head != nil {
-			cur = head.headID
-		}
-		return nil, apiErr(412, "stale", "head", cur)
-	}
-
-	// The document the patches fold into: none for a create, and none for
-	// a restore either — a tombstone deleted it, so the write root-replaces
-	// like a create (§6.2's restore verb).
-	restore := head != nil && head.state == "tombstoned"
-	doc, writes, err := apply(headDoc, head != nil && head.headPos > 0 && !restore, patches)
+	doc, writes, err := apply(headDoc, parentID != nil, patches)
 	if err != nil {
-		return nil, apiErr(422, "patch", "detail", err.Error())
+		return nil, patchErr(err)
 	}
 	docCanon := jsonv.Canonical(doc)
 	digest := sha256.Sum256(docCanon)
@@ -177,44 +237,32 @@ func planWrite(ns, name string, m *nsMeta, t *tip, head *resRow, headDoc any, if
 		resExists: head != nil,
 		oldHead:   pos - 1, // the head position the RES condition pins
 		tip:       *t,
-		create:    head == nil || head.headPos == 0,
+		create:    parentID == nil,
 		restore:   restore,
 	}, nil
 }
 
 // planDelete turns a DELETE's reads into a tombstone plan (§7.2, §8.1).
 // The tombstone id covers only the deleted head (ids.Tombstone), so a
-// retried DELETE recomputes it and replays.
-func planDelete(ns, name string, m *nsMeta, t *tip, head *resRow, ifMatch, gesture, undoes, author string, now int64) (*writePlan, *Error) {
-	switch {
-	case m == nil:
-		return nil, apiErr(404, "not_found", "namespace", ns)
-	case m.purged:
-		return nil, apiErr(410, "purged", "namespace", ns)
-	case m.frozen:
-		return nil, apiErr(409, "frozen", "namespace", ns)
+// retried DELETE recomputes it, and the caller's retry lookup finds it.
+func planDelete(ns, name string, m *nsMeta, t *tip, head *resRow, pre Pre, gesture, undoes, author string, now int64) (*writePlan, *Error) {
+	if err := nsState(ns, m); err != nil {
+		return nil, err
 	}
-	if ifMatch == "" {
+	if m.frozen {
+		return nil, frozen(ns)
+	}
+	if pre.IfMatch == "" && !pre.IfNoneMatch {
 		return nil, apiErr(428, "precondition_required")
 	}
-	parent, err := ids.Parse(ifMatch)
-	if err != nil {
-		return nil, apiErr(400, "bad_input", "detail", "malformed If-Match")
+	parent, perr := precondition(head, pre, true)
+	if perr != nil {
+		return nil, perr
 	}
-	tid := ids.Tombstone(parent)
-	if head == nil || head.headPos == 0 {
-		return nil, gone()
+	if parent == nil {
+		return nil, gone() // a delete of nothing (If-None-Match)
 	}
-	if head.state == "tombstoned" {
-		if head.headID == tid.String() {
-			// This very delete committed: replay.
-			return &writePlan{replay: true, rev: revRow{id: head.headID}, entry: logRow{id: head.entryID}}, nil
-		}
-		return nil, gone() // a delete of a tombstoned resource is 410
-	}
-	if head.headID != ifMatch {
-		return nil, apiErr(412, "stale", "head", head.headID)
-	}
+	tid := ids.Tombstone(*parent)
 
 	body := jsonv.Canonical(map[string]any{"resource": name, "kind": "tombstone", "target": tid.String()})
 	var tipID *ids.ID
@@ -229,7 +277,7 @@ func planDelete(ns, name string, m *nsMeta, t *tip, head *resRow, ifMatch, gestu
 	pos := head.headPos + 1
 	return &writePlan{
 		rev: revRow{
-			pos: pos, id: tid.String(), kind: "tombstone", parentID: ifMatch,
+			pos: pos, id: tid.String(), kind: "tombstone", parentID: head.headID,
 			author: author, created: now, gesture: gesture, undoes: undoes,
 		},
 		entry: logRow{
@@ -248,8 +296,18 @@ func planDelete(ns, name string, m *nsMeta, t *tip, head *resRow, ifMatch, gestu
 	}, nil
 }
 
-// gone is DELETE's answer for an absent or tombstoned resource (write.go's).
-func gone() *Error { return apiErr(410, "gone") }
+// patchErr is a patch set that doesn't apply (patchErr of write.go): 422
+// invalid, naming the operation and pointer that failed.
+func patchErr(err error) *Error {
+	var pe *patch.Error
+	if errors.As(err, &pe) {
+		return apiErr(422, "invalid", "message", pe.Message, "index", pe.Index, "pointer", pe.Pointer)
+	}
+	return apiErr(422, "invalid", "message", err.Error())
+}
+
+// gone is the answer for an absent or tombstoned resource (write.go's).
+func gone(members ...any) *Error { return apiErr(410, "gone", members...) }
 
 func parentString(p *ids.ID) string {
 	if p == nil {
@@ -274,9 +332,11 @@ func buildWriteTx(table, ns, name string, p *writePlan) []types.TransactWriteIte
 	}
 
 	out := make([]types.TransactWriteItem, numActs)
+	rev := p.rev
+	rev.logPos = p.entry.pos
 	out[actRev] = types.TransactWriteItem{Put: &types.Put{
 		TableName: &table,
-		Item:      withKey(revK, p.rev.item()),
+		Item:      withKey(revK, rev.item()),
 		// UNIQUE(res, parent_seq): one child per parent.
 		ConditionExpression: strptr("attribute_not_exists(PK)"),
 	}}
@@ -334,7 +394,6 @@ func buildWriteTx(table, ns, name string, p *writePlan) []types.TransactWriteIte
 const (
 	delActRev = iota
 	delActRes
-	delActDoc
 	delActLog
 	delActTip
 	delActNSID
@@ -342,18 +401,22 @@ const (
 )
 
 // buildDeleteTx is a tombstone's transaction: the tombstone chain row, the
-// head move to it (pinning the checked head), the live document's removal,
-// the log entry, the tip move and the entry marker — the write's seven
-// actions minus the document upserts, plus the deletion.
+// head move to it (pinning the checked head), the log entry, the tip move
+// and the entry marker — the write's seven actions minus the document
+// upserts. The head document stays: it is the last live document, which
+// Head.Last serves and a restore's patches apply to; reads of a
+// tombstoned head don't serve it (ReadHead).
 func buildDeleteTx(table, ns, name string, p *writePlan) []types.TransactWriteItem {
 	resK, revK := keyRes(ns, name), keyRev(ns, name, p.rev.pos)
-	docK, logK, tipK := keyDocHead(ns, name), keyLog(ns, p.entry.pos), keyTip(ns)
+	logK, tipK := keyLog(ns, p.entry.pos), keyTip(ns)
 	nsidK := keyNSID(ns, p.entry.id)
 
+	rev := p.rev
+	rev.logPos = p.entry.pos
 	out := make([]types.TransactWriteItem, delNumActs)
 	out[delActRev] = types.TransactWriteItem{Put: &types.Put{
 		TableName:           &table,
-		Item:                withKey(revK, p.rev.item()),
+		Item:                withKey(revK, rev.item()),
 		ConditionExpression: strptr("attribute_not_exists(PK)"),
 	}}
 	out[delActRes] = types.TransactWriteItem{Update: &types.Update{
@@ -370,10 +433,6 @@ func buildDeleteTx(table, ns, name string, p *writePlan) []types.TransactWriteIt
 			":l": avS(p.newHead.lastID), ":lp": avN(p.newHead.lastPos),
 			":old": avN(p.oldHead), ":oldi": avS(p.rev.parentID),
 		},
-	}}
-	out[delActDoc] = types.TransactWriteItem{Delete: &types.Delete{
-		TableName: &table,
-		Key:       keyAV(docK),
 	}}
 	out[delActLog] = types.TransactWriteItem{Put: &types.Put{
 		TableName:           &table,

@@ -92,7 +92,7 @@ func BenchmarkDDB(b *testing.B) {
 	b.Run("write-1w-1ns", func(b *testing.B) {
 		s := benchStores(b, 1)[0]
 		bench(b, 1, 3*time.Second, func(i int) error {
-			_, err := s.WriteResource(ctx, "ns0", fmt.Sprintf("doc%d", i), "", benchCreate(i), "", "", "bench", nil)
+			_, err := s.WriteResource(ctx, "ns0", fmt.Sprintf("doc%d", i), Pre{IfNoneMatch: true}, benchCreate(i), "", "", "bench", nil)
 			return err
 		})
 	})
@@ -100,7 +100,7 @@ func BenchmarkDDB(b *testing.B) {
 	b.Run("write-8w-1ns", func(b *testing.B) {
 		s := benchStores(b, 1)[0]
 		bench(b, 8, 3*time.Second, func(i int) error {
-			_, err := s.WriteResource(ctx, "ns0", fmt.Sprintf("doc%d", i), "", benchCreate(i), "", "", "bench", nil)
+			_, err := s.WriteResource(ctx, "ns0", fmt.Sprintf("doc%d", i), Pre{IfNoneMatch: true}, benchCreate(i), "", "", "bench", nil)
 			return err
 		})
 	})
@@ -108,7 +108,7 @@ func BenchmarkDDB(b *testing.B) {
 	b.Run("write-32w-1ns", func(b *testing.B) {
 		s := benchStores(b, 1)[0]
 		bench(b, 32, 3*time.Second, func(i int) error {
-			_, err := s.WriteResource(ctx, "ns0", fmt.Sprintf("doc%d", i), "", benchCreate(i), "", "", "bench", nil)
+			_, err := s.WriteResource(ctx, "ns0", fmt.Sprintf("doc%d", i), Pre{IfNoneMatch: true}, benchCreate(i), "", "", "bench", nil)
 			return err
 		})
 	})
@@ -118,7 +118,7 @@ func BenchmarkDDB(b *testing.B) {
 			s := benchStores(b, 1)[0]
 			s.GroupCommit = 32
 			bench(b, w, 3*time.Second, func(i int) error {
-				_, err := s.WriteResource(ctx, "ns0", fmt.Sprintf("doc%d", i), "", benchCreate(i), "", "", "bench", nil)
+				_, err := s.WriteResource(ctx, "ns0", fmt.Sprintf("doc%d", i), Pre{IfNoneMatch: true}, benchCreate(i), "", "", "bench", nil)
 				return err
 			})
 			if g, n := s.GroupStats(); g > 0 {
@@ -131,19 +131,19 @@ func BenchmarkDDB(b *testing.B) {
 		s := benchStores(b, 64)[0]
 		bench(b, 32, 3*time.Second, func(i int) error {
 			ns := fmt.Sprintf("ns%d", i%64)
-			_, err := s.WriteResource(ctx, ns, fmt.Sprintf("doc%d", i), "", benchCreate(i), "", "", "bench", nil)
+			_, err := s.WriteResource(ctx, ns, fmt.Sprintf("doc%d", i), Pre{IfNoneMatch: true}, benchCreate(i), "", "", "bench", nil)
 			return err
 		})
 	})
 
 	b.Run("append-1w-1doc", func(b *testing.B) {
 		s := benchStores(b, 1)[0]
-		if _, err := s.WriteResource(ctx, "ns0", "doc", "", patches(`[{"op":"add","path":"","value":{"n":0}}]`), "", "", "bench", nil); err != nil {
+		if _, err := s.WriteResource(ctx, "ns0", "doc", Pre{IfNoneMatch: true}, patches(`[{"op":"add","path":"","value":{"n":0}}]`), "", "", "bench", nil); err != nil {
 			b.Fatal(err)
 		}
 		var head string
 		bench(b, 1, 3*time.Second, func(i int) error {
-			res, err := s.WriteResource(ctx, "ns0", "doc", head, patches(benchPatch), "", "", "bench", nil)
+			res, err := s.WriteResource(ctx, "ns0", "doc", Pre{IfMatch: head}, patches(benchPatch), "", "", "bench", nil)
 			if err != nil {
 				return err
 			}
@@ -154,7 +154,7 @@ func BenchmarkDDB(b *testing.B) {
 
 	b.Run("read-head-8w", func(b *testing.B) {
 		s := benchStores(b, 1)[0]
-		if _, err := s.WriteResource(ctx, "ns0", "doc", "", patches(`[{"op":"add","path":"","value":{"n":0}}]`), "", "", "bench", nil); err != nil {
+		if _, err := s.WriteResource(ctx, "ns0", "doc", Pre{IfNoneMatch: true}, patches(`[{"op":"add","path":"","value":{"n":0}}]`), "", "", "bench", nil); err != nil {
 			b.Fatal(err)
 		}
 		bench(b, 8, 3*time.Second, func(i int) error {
@@ -166,7 +166,7 @@ func BenchmarkDDB(b *testing.B) {
 	b.Run("log-page-1w", func(b *testing.B) {
 		s := benchStores(b, 1)[0]
 		for i := range 200 {
-			if _, err := s.WriteResource(ctx, "ns0", fmt.Sprintf("doc%d", i), "", benchCreate(i), "", "", "bench", nil); err != nil {
+			if _, err := s.WriteResource(ctx, "ns0", fmt.Sprintf("doc%d", i), Pre{IfNoneMatch: true}, benchCreate(i), "", "", "bench", nil); err != nil {
 				b.Fatal(err)
 			}
 		}

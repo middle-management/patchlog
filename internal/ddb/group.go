@@ -15,7 +15,7 @@ package ddb
 //     optimistic tip condition, as does every write when GroupCommit ≤ 1.
 //   - A worker per namespace with a queue takes the queued writes that
 //     fit one transaction: at most GroupCommit of them, within the 100
-//     actions (six a write, five a delete, two shared) and a byte budget
+//     actions (six a write, four a delete, two shared) and a byte budget
 //     under the 4 MB transaction cap, of resources no earlier write of
 //     the group writes, planned under the same configuration as the
 //     group's first. The others stay queued, in order, for the next group.
@@ -285,7 +285,7 @@ func (s *Store) commitGroup(ns string, group []*groupMember, known *tip) *tip {
 		if err == nil {
 			last := live[len(live)-1].p.entry
 			for _, w := range live {
-				w.res = &WriteResult{Status: 201, ID: w.p.rev.id, NSID: w.p.entry.id, Created: w.p.entry.created}
+				w.res = committed(w.p)
 			}
 			s.g.committed.Add(1)
 			s.g.appended.Add(int64(len(live)))

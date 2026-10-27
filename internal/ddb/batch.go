@@ -7,8 +7,8 @@ package ddb
 //
 // The budget is DynamoDB's 100 actions per transaction: three shared
 // (entry, tip, marker), two for an optional config change, four per
-// patch-set item (revision, head, document, history) and three per
-// delete (tombstone, head, the document's removal).
+// patch-set item (revision, head, document, history) and two per
+// delete (tombstone, head: the last live document stays).
 
 import (
 	"context"
@@ -35,6 +35,9 @@ type BatchItem struct {
 	Undoes      string
 }
 
+// Pre is the item's precondition.
+func (it BatchItem) Pre() Pre { return Pre{IfMatch: it.IfMatch, IfNoneMatch: it.IfNoneMatch} }
+
 // BatchResult is a committed (or replayed, or dry-run) batch.
 type BatchResult struct {
 	Status   int // 201 committed, 200 replayed or dry run
@@ -55,7 +58,7 @@ type BatchFailure struct {
 // BatchItemError is one item's refusal, by batch index.
 type BatchItemError struct {
 	Index int
-	Err   *Error
+	Err   error // the store's *Error, or the caller's gate's own
 }
 
 func (e *BatchFailure) Error() string { return "ddb: batch refused per item" }
@@ -65,7 +68,7 @@ func (e *BatchFailure) Error() string { return "ddb: batch refused per item" }
 const maxTxActions = 100
 
 // BatchActions counts a batch's transaction actions: three shared, two
-// for a config change, four per write, three per delete.
+// for a config change, four per write, two per delete.
 func BatchActions(items []BatchItem, withConfig bool) int {
 	n := 3
 	if withConfig {
@@ -73,7 +76,7 @@ func BatchActions(items []BatchItem, withConfig bool) int {
 	}
 	for _, it := range items {
 		if it.Delete {
-			n += 3
+			n += 2
 		} else {
 			n += 4
 		}
@@ -147,6 +150,15 @@ func (s *Store) WriteBatch(ctx context.Context, ns, author string, items []Batch
 
 		// Every item's plan, and every item's gate: the failures collect
 		// (§7.5); the transaction is never built with a refused item.
+		// A frozen namespace refuses the batch's items, after the retry
+		// lookup (§6.2 step 2) — the configuration in force decides, not
+		// the batch's own change.
+		if m.frozen && len(items) > 0 {
+			if res, err := s.replayBatch(ctx, ns, items, ccPatches != nil, cfgID, heads[0], author); res != nil || err != nil {
+				return res, err
+			}
+			return nil, frozen(ns)
+		}
 		now := s.now().UnixMilli()
 		plans := make([]*writePlan, len(items))
 		var fails []BatchItemError
@@ -155,23 +167,12 @@ func (s *Store) WriteBatch(ctx context.Context, ns, author string, items []Batch
 			var p *writePlan
 			var perr *Error
 			if it.Delete {
-				p, perr = planDelete(ns, it.Name, m, t, head, it.IfMatch, it.Gesture, it.Undoes, author, now)
+				p, perr = planDelete(ns, it.Name, m, t, head, it.Pre(), it.Gesture, it.Undoes, author, now)
 			} else {
-				p, perr = planWrite(ns, it.Name, m, t, head, doc, it.IfMatch, it.Patches, it.Gesture, it.Undoes, author, now, applyPatches)
+				p, perr = planWrite(ns, it.Name, m, t, head, doc, it.Pre(), it.Patches, it.Gesture, it.Undoes, author, now, applyPatches)
 			}
 			if perr != nil {
 				fails = append(fails, BatchItemError{i, perr})
-				continue
-			}
-			if p.replay {
-				// Item 0's head is its target: the whole batch may be a
-				// retry (§7.5's expectedIDs lookup).
-				if i == 0 {
-					if res, _ := s.replayBatch(ctx, ns, items, ccPatches != nil, cfgID, head); res != nil {
-						return res, nil
-					}
-				}
-				fails = append(fails, BatchItemError{i, apiErr(412, "stale", "head", head.headID)})
 				continue
 			}
 			plans[i] = p
@@ -196,19 +197,17 @@ func (s *Store) WriteBatch(ctx context.Context, ns, author string, items []Batch
 			default:
 				st.Action = "append"
 			}
-			if it.IfNoneMatch && st.ResExists {
-				fails = append(fails, BatchItemError{i, apiErr(412, "stale", "head", st.HeadID)})
-				continue
-			}
 			if err := check(it.Name, st); err != nil {
-				pe, ok := err.(*Error)
-				if !ok {
-					return nil, err
-				}
-				fails = append(fails, BatchItemError{i, pe})
+				// The gate's refusal is the item's (§7.5's failure
+				// list), whatever its error type: the caller's own.
+				fails = append(fails, BatchItemError{i, err})
 			}
 		}
 		if len(fails) > 0 {
+			// Items refused at step 2 may be the batch's own retry.
+			if res, err := s.replayBatch(ctx, ns, items, ccPatches != nil, cfgID, heads[0], author); res != nil || err != nil {
+				return res, err
+			}
 			return nil, &BatchFailure{Items: fails}
 		}
 
@@ -237,7 +236,7 @@ func (s *Store) WriteBatch(ctx context.Context, ns, author string, items []Batch
 			tipID = &p
 		}
 		entryID := ids.Hash(tipID, body)
-		entry := logRow{pos: t.headPos + 1, id: entryID.String(), prevPos: t.headPos, kind: "batch", body: string(body), author: author, created: now, cfgPos: cfgPos}
+		entry := logRow{pos: t.headPos + 1, id: entryID.String(), prevPos: t.headPos, kind: "batch", body: string(body), author: author, created: now, cfgPos: cfgPos, gestures: batchGestures(items)}
 
 		res := &BatchResult{Status: 201, NSID: entry.id, Created: now, IDs: idsByName, ConfigID: cfgID}
 		if dryRun {
@@ -271,25 +270,42 @@ func (s *Store) WriteBatch(ctx context.Context, ns, author string, items []Batch
 	}
 }
 
-// replayBatch answers for a retried batch: item 0's head is the batch's
-// target for it, and the entry that moved it there is this batch's,
-// known by comparing the stored entry's body with the one this request
-// computes (§7.5's expectedIDs lookup — the ids are content hashes, so
-// the request determines them, and the entry's id itself chained over a
-// tip that has moved on).
-//
-// The lookup needs every item's target computable from the request: a
-// write's id covers its precondition's parent (or nil for a create), a
-// tombstone's its deleted head. An append without If-Match makes it
-// uncomputable; the lookup then finds nothing.
-func (s *Store) replayBatch(ctx context.Context, ns string, items []BatchItem, withConfig bool, cfgID string, head0 *resRow) (*BatchResult, error) {
-	mk, err := s.getItem(ctx, keyNSID(ns, head0.entryID))
-	if err != nil || mk == nil {
-		return nil, err
+// batchGestures is a batch entry's gestures member (batchGestures of
+// write.go): each resource's steps' { gesture?, undoes? }, {} for one with
+// neither; "" when no item has one, so a batch without gestures serves no
+// member.
+func batchGestures(items []BatchItem) string {
+	has := false
+	out := map[string]any{}
+	for _, it := range items {
+		g := map[string]any{}
+		if it.Gesture != "" {
+			g["gesture"] = it.Gesture
+		}
+		if it.Undoes != "" {
+			g["undoes"] = it.Undoes
+		}
+		has = has || len(g) > 0
+		out[it.Name] = []any{g}
 	}
-	le, err := s.getItem(ctx, keyLog(ns, item(mk).n("logPos")))
-	if err != nil || le == nil {
-		return nil, err
+	if !has {
+		return ""
+	}
+	return string(jsonv.Canonical(out))
+}
+
+// replayBatch answers for a retried batch (§7.5's retry lookup, replay of
+// write.go): the batch, if it was written, is an entry by this author that
+// moved item 0's resource to the target the request computes for it — the
+// ids are content hashes, so the request determines every item's, and the
+// entry's body with them. The revision records that entry (logPos), so one
+// lookup finds it, wherever the head has gone since.
+//
+// The lookup needs every item's target computable from the request: an
+// item without a precondition makes it uncomputable, and finds nothing.
+func (s *Store) replayBatch(ctx context.Context, ns string, items []BatchItem, withConfig bool, cfgID string, head0 *resRow, author string) (*BatchResult, error) {
+	if len(items) == 0 || head0 == nil || head0.headPos == 0 {
+		return nil, nil
 	}
 	entries := make([]any, 0, len(items)+1)
 	if withConfig {
@@ -297,39 +313,28 @@ func (s *Store) replayBatch(ctx context.Context, ns string, items []BatchItem, w
 	}
 	idsByName := make(map[string]string, len(items))
 	for _, it := range items {
-		var id ids.ID
-		if it.Delete {
-			if it.IfMatch == "" {
-				return nil, nil
-			}
-			parent, err := ids.Parse(it.IfMatch)
-			if err != nil {
-				return nil, nil
-			}
-			id = ids.Tombstone(parent)
-		} else {
-			var parent *ids.ID
-			if it.IfMatch != "" {
-				p, err := ids.Parse(it.IfMatch)
-				if err != nil {
-					return nil, nil
-				}
-				parent = &p
-			} else if !it.IfNoneMatch {
-				return nil, nil // an append without a parent: uncomputable
-			}
-			id = ids.Revision(parent, jsonv.Canonical(it.Patches))
+		id, ok := it.Pre().expectedID(it.Delete, it.Patches)
+		if !ok {
+			return nil, nil
 		}
 		kind := "head"
 		if it.Delete {
 			kind = "tombstone"
 		}
-		entries = append(entries, map[string]any{"resource": it.Name, "kind": kind, "target": id.String()})
-		idsByName[it.Name] = id.String()
+		entries = append(entries, map[string]any{"resource": it.Name, "kind": kind, "target": id})
+		idsByName[it.Name] = id
+	}
+	rev, err := s.revOf(ctx, ns, items[0].Name, head0, idsByName[items[0].Name])
+	if err != nil || rev == nil || rev.LogPos == 0 {
+		return nil, err
+	}
+	le, err := s.getItem(ctx, keyLog(ns, rev.LogPos))
+	if err != nil || le == nil {
+		return nil, err
 	}
 	want := string(jsonv.Canonical(map[string]any{"kind": "batch", "entries": entries}))
 	stored := item(le)
-	if stored.s("kind") != "batch" || stored.s("body") != want {
+	if stored.s("kind") != "batch" || stored.s("body") != want || stored.s("author") != author {
 		return nil, nil
 	}
 	return &BatchResult{
@@ -398,7 +403,7 @@ func (s *Store) readBatchState(ctx context.Context, ns string, items []BatchItem
 }
 
 // buildBatchTx assembles the batch's transaction: the config change's
-// actions first, then each item's (a write's four, a delete's three),
+// actions first, then each item's (a write's four, a delete's two),
 // then the shared three.
 func (s *Store) buildBatchTx(ns string, items []BatchItem, plans []*writePlan, entry logRow, oldTip tip, m *nsMeta, configActs bool, cfgID string, cfgDoc any, newFrozen bool) []types.TransactWriteItem {
 	var out []types.TransactWriteItem
@@ -447,15 +452,17 @@ func (s *Store) buildBatchTx(ns string, items []BatchItem, plans []*writePlan, e
 }
 
 // batchItemActs is one item's actions of a batch's transaction: the
-// write's revision, head and documents, or the delete's tombstone, head
-// and removal — buildWriteTx/buildDeleteTx's per-item parts, keyed by
+// write's revision, head and documents, or the delete's tombstone and head
+// — buildWriteTx/buildDeleteTx's per-item parts, keyed by
 // the shared entry's position.
 func batchItemActs(table, ns, name string, p *writePlan, entry logRow) []types.TransactWriteItem {
 	revK, resK := keyRev(ns, name, p.rev.pos), keyRes(ns, name)
 	docK, histK := keyDocHead(ns, name), keyHist(ns, name, entry.pos)
+	rr := p.rev
+	rr.logPos = entry.pos
 	rev := types.TransactWriteItem{Put: &types.Put{
 		TableName:           &table,
-		Item:                withKey(revK, p.rev.item()),
+		Item:                withKey(revK, rr.item()),
 		ConditionExpression: strptr("attribute_not_exists(PK)"),
 	}}
 	if p.del {
@@ -472,7 +479,6 @@ func batchItemActs(table, ns, name string, p *writePlan, entry logRow) []types.T
 					":old": avN(p.oldHead), ":oldi": avS(p.rev.parentID),
 				},
 			}},
-			{Delete: &types.Delete{TableName: &table, Key: keyAV(docK)}},
 		}
 	}
 	resCond := "attribute_not_exists(PK)"
@@ -535,7 +541,7 @@ func (s *Store) mapBatchCancel(ctx context.Context, ns string, items []BatchItem
 		return nil, true, nil
 	}
 	// Otherwise an item's or the config's action. Layout: the config's
-	// two lead, then each item's four (write) or three (delete).
+	// two lead, then each item's four (write) or two (delete).
 	itemAt := map[int]int{}
 	i := 0
 	if configActs {
@@ -544,7 +550,7 @@ func (s *Store) mapBatchCancel(ctx context.Context, ns string, items []BatchItem
 	for j, it := range items {
 		n := 4
 		if it.Delete {
-			n = 3
+			n = 2
 		}
 		for k := 0; k < n; k++ {
 			itemAt[i+k] = j
