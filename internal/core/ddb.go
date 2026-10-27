@@ -19,6 +19,7 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -82,6 +83,10 @@ func openDDB(opt Options) (*Engine, error) {
 	// namespace; GroupCommitWait doesn't apply — a group forms from the
 	// writes queued while the one before it commits.
 	store.GroupCommit = opt.GroupCommit
+	// The engine's clock stamps what the store writes (created times),
+	// as the SQL write path's opt.Now does: Last-Modified and /heads'
+	// created are the revision's own time on the instance's clock (§7.1).
+	store.Now = opt.Now
 	e := &Engine{
 		opt:        opt,
 		validator:  schema.NewValidator(),
@@ -723,11 +728,13 @@ func (e *Engine) ddbResourceRev(ctx context.Context, ns, name, id string, cred C
 		}
 		id = head.ID
 	}
-	rev, derr := e.ddb.store.ReadRevByID(ctx, ns, id)
+	// The resource's own chain (findInAncestry): a genesis twin's id
+	// names a revision of each.
+	rev, derr := e.ddb.store.ReadRevOf(ctx, ns, name, id)
 	if derr != nil {
 		return nil, ddbAsErr(derr)
 	}
-	if rev == nil || rev.Name != name {
+	if rev == nil {
 		return &Rev{Status: 404, Public: public}, nil
 	}
 	if rev.Kind == "tombstone" {
@@ -762,68 +769,57 @@ func (e *Engine) ddbResourceLog(ctx context.Context, ns, name, id, since string,
 	if err != nil {
 		return nil, err
 	}
-	out := &Log{Status: 200, Public: public, Last: since}
-	// The upper bound: the id's position, or the head's for "".
-	var toPos uint64
-	if id == "" {
-		head, derr := e.ddb.store.ReadHead(ctx, ns, name)
-		if derr != nil {
-			return nil, ddbAsErr(derr)
-		}
-		if head == nil {
-			return &Log{Status: 404, Public: public}, nil
-		}
-	} else {
-		pos, err := e.ddb.store.RevPos(ctx, ns, name, id)
-		if err != nil {
-			return nil, ddbAsErr(err)
-		}
-		if pos == 0 {
-			return &Log{Status: 404, Public: public}, nil
-		}
-		toPos = pos
-	}
-	var fromPos uint64
-	if since != "" {
-		pos, err := e.ddb.store.RevPos(ctx, ns, name, since)
-		if err != nil {
-			return nil, ddbAsErr(err)
-		}
-		if pos == 0 || (toPos > 0 && pos > toPos) {
-			return &Log{Status: 404, Public: public}, nil
-		}
-		fromPos = pos
-	}
-	entries, derr := e.ddb.store.ResourceLogEntries(ctx, ns, name, fromPos, limit)
+	// The range (since, to] of ResourceLog (§7.1): to is the id's
+	// position, or the head's for ""; since, when given, a revision of the
+	// chain at or below it. The chain is linear, so every revision of it
+	// is an ancestor of the head; anything else is 404, as is an absent
+	// resource.
+	headPos, derr := e.ddb.store.HeadPos(ctx, ns, name)
 	if derr != nil {
 		return nil, ddbAsErr(derr)
 	}
-	for i, re := range entries {
-		if toPos > 0 && re.Pos > toPos {
-			break
+	if headPos == 0 {
+		return &Log{Status: 404, Public: public}, nil
+	}
+	toPos := headPos
+	if id != "" {
+		if toPos, derr = e.ddb.store.RevPos(ctx, ns, name, id); derr != nil {
+			return nil, ddbAsErr(derr)
 		}
-		if limit > 0 && i == limit {
-			out.More = true
-			break
+		if toPos == 0 || toPos > headPos {
+			return &Log{Status: 404, Public: public}, nil
 		}
-		e := map[string]any{
-			"id": re.ID, "kind": re.Kind,
-			"author": re.Author, "created": formatTime(re.Created),
-			"grant": nil,
+	}
+	var fromPos uint64
+	if since != "" {
+		if fromPos, derr = e.ddb.store.RevPos(ctx, ns, name, since); derr != nil {
+			return nil, ddbAsErr(derr)
 		}
-		if re.Kind != "tombstone" {
-			e["patches"] = re.Patches
+		if fromPos == 0 || fromPos > toPos {
+			return &Log{Status: 404, Public: public}, nil
 		}
-		if re.ParentID != "" {
-			e["parent"] = re.ParentID
+	}
+	// A page (limit > 0) is also bounded by logPageBytes of patch sets,
+	// though it always holds one entry (logBetween).
+	maxBytes := 0
+	if limit > 0 {
+		maxBytes = e.opt.Maximums.LogPageBytes
+	}
+	entries, more, derr := e.ddb.store.ResourceLog(ctx, ns, name, fromPos, toPos, limit, maxBytes)
+	if derr != nil {
+		return nil, ddbAsErr(derr)
+	}
+	out := &Log{Status: 200, Public: public, Last: since, More: more}
+	for _, re := range entries {
+		// LogEntry.value's shape: dev-mode writes carry no grant, so
+		// resource entries serve none (only namespace entries mark
+		// no_auth with "grant": null).
+		le := LogEntry{
+			ID: re.ID, Parent: re.ParentID, Kind: re.Kind, Patches: re.Patches,
+			Author: re.Author, Created: formatTime(re.Created),
+			Gesture: re.Gesture, Undoes: re.Undoes,
 		}
-		if re.Gesture != "" {
-			e["gesture"] = re.Gesture
-		}
-		if re.Undoes != "" {
-			e["undoes"] = re.Undoes
-		}
-		out.Entries = append(out.Entries, e)
+		out.Entries = append(out.Entries, le.value())
 		out.Last = re.ID
 	}
 	return out, nil
@@ -861,15 +857,17 @@ func (e *Engine) ddbNamespaceHead(ctx context.Context, ns string, cred Credentia
 }
 
 func (e *Engine) ddbNamespaceRev(ctx context.Context, ns, id string, cred Credentials) (*NSInfo, error) {
-	info, public, err := e.ddbNS(ctx, ns)
+	_, public, err := e.ddbNS(ctx, ns)
 	if err != nil {
 		return nil, err
 	}
 	doc, cfgID, derr := e.ddb.store.ReadDocAtEntry(ctx, ns, id)
 	if derr != nil {
+		// An id that is no entry of the log: the 404 of NamespaceRev,
+		// not a document (nfNS).
 		var de *ddb.Error
 		if errors.As(derr, &de) && de.Status == 404 {
-			return &NSInfo{Head: info.HeadID, Public: public}, nil
+			return nil, nfNS(public)
 		}
 		return nil, ddbAsErr(derr)
 	}
@@ -881,31 +879,33 @@ func (e *Engine) ddbNamespaceHeads(ctx context.Context, ns, nsID, after string, 
 	if err != nil {
 		return nil, err
 	}
-	out := &HeadsPage{Items: []map[string]any{}, Public: public}
-	// At any revision, once its resources are gone (§8.5): the id must be
-	// an entry of the log. "" is the tip.
-	if nsID != "" {
-		ok, err := e.ddb.store.KnownEntry(ctx, ns, nsID)
-		if err != nil {
-			return nil, ddbAsErr(err)
-		}
-		if !ok {
-			return out, nil
-		}
+	// The heads as of the entry nsID (§7.4): names created after it are
+	// skipped, heads moved since are the ones it saw (HeadsAt). An id
+	// that is no entry of the log is 404 (nfNS), "" included.
+	if nsID == "" {
+		return nil, nfNS(public)
 	}
-	page, next, derr := e.ddb.store.ListHeads(ctx, ns, after, e.opt.Maximums.LogPageSize)
+	page, next, found, derr := e.ddb.store.HeadsAt(ctx, ns, nsID, after, e.opt.Maximums.LogPageSize)
 	if derr != nil {
 		return nil, ddbAsErr(derr)
 	}
-	out.Next = next
+	if !found {
+		return nil, nfNS(public)
+	}
+	out := &HeadsPage{Items: []map[string]any{}, Public: public, Next: next}
 	for _, h := range page {
 		kind := "head"
 		if h.Tombstoned {
 			kind = "tombstone"
 		}
 		item := map[string]any{"resource": h.Name, "kind": kind, "target": h.ID}
-		if !h.Tombstoned && h.Created != 0 {
+		// created, the target's created time as log entries give it, a
+		// tombstone's too; size and digest, a live head's document's
+		// (NamespaceHeads; plain namespaces only in phase 1).
+		if h.Created != 0 {
 			item["created"] = formatTime(h.Created)
+		}
+		if !h.Tombstoned && len(h.Digest) == sha256.Size {
 			item["size"] = float64(h.Size)
 			item["digest"] = ReprDigest(h.Digest)
 		}

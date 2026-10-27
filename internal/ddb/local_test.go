@@ -371,8 +371,8 @@ func TestLocalDeleteRestore(t *testing.T) {
 	if err != nil || rev == nil || rev.Kind != "tombstone" || rev.Pos != 3 {
 		t.Fatalf("tombstone rev: %+v %v", rev, err)
 	}
-	entries, err := s.ResourceLogEntries(ctx, "demo", "doc1", 0, 0)
-	if err != nil || len(entries) != 3 || entries[2].Kind != "tombstone" || entries[2].Patches != nil || entries[2].Gesture == "" {
+	entries, more, err := s.ResourceLog(ctx, "demo", "doc1", 0, 3, 0, 0)
+	if err != nil || more || len(entries) != 3 || entries[0].Kind != "rev" || entries[2].Kind != "tombstone" || entries[2].Patches != nil || entries[2].Gesture == "" {
 		t.Fatalf("resource log: %+v %v", entries, err)
 	}
 
