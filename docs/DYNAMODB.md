@@ -562,14 +562,14 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the suites' 1,009
-top-level tests: 277 pass on DynamoDB, 579 skip as unsupported (232 for
-authentication, 114 encryption at rest, 67 `$schema`, 67 branches, 32
-blobs, …) and 153 skip as known divergences. The list has 156 entries
-(a few name tests that now skip earlier as unsupported): 40 where the
-backend answers differently (rate limits, `If-Match` on appends, retries
-answered 412, creates without a root replace, namespace limits…) and 116
-that meet an unsupported feature inside a service (mostly the dav
-gateway's principal lookup), where no skip can reach.
+top-level tests: 298 pass on DynamoDB and 711 skip — 597 as unsupported
+(232 for authentication, 114 encryption at rest, 69 branches, 68
+`$schema`, 34 blobs, …), and 114 meeting an unsupported feature inside a
+service (mostly the dav gateway's principal lookup), where no skip can
+reach. No test answers differently from the SQL backends: the list's
+divergences section is empty. A test that skips partway has asserted
+everything before its skip, so the phase-1 surface is covered beyond the
+298.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on

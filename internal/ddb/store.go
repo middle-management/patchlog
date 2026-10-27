@@ -103,7 +103,7 @@ func (s *Store) replay(ctx context.Context, ns, name string, head *resRow, pre P
 }
 
 // revOf finds resource name's revision id: the head's by its key, else
-// through GSI1 (revisions_by_id), filtered to the resource.
+// through GSI1 (ReadRevOf).
 func (s *Store) revOf(ctx context.Context, ns, name string, head *resRow, id string) (*RevInfo, error) {
 	if head.headID == id {
 		it, err := s.getItem(ctx, keyRev(ns, name, head.headPos))
@@ -113,25 +113,7 @@ func (s *Store) revOf(ctx context.Context, ns, name string, head *resRow, id str
 		r := scanRevInfo(item(it))
 		return &r, nil
 	}
-	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
-		TableName:              &s.Table,
-		IndexName:              strptr(gsiName),
-		KeyConditionExpression: strptr("G1PK = :g"),
-		FilterExpression:       strptr("PK = :pk AND begins_with(SK, :sk)"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":g": avS(g1RevID(id)), ":pk": avS(nsPK(ns)), ":sk": avS("REV#" + name + "#"),
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	for _, it := range q.Items {
-		r := scanRevInfo(item(it))
-		if r.Name == name {
-			return &r, nil
-		}
-	}
-	return nil, nil
+	return s.ReadRevOf(ctx, ns, name, id)
 }
 
 // CreateNamespace bootstraps a namespace with its config genesis and first

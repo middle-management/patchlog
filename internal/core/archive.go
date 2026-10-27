@@ -428,6 +428,9 @@ type ArchiveRecord struct {
 // Archives lists the archives of unpurged resources, optionally only of one
 // namespace or one resource, in chain order per resource.
 func (e *Engine) Archives(ctx context.Context, ns, name string) ([]ArchiveRecord, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("archives")
+	}
 	var out []ArchiveRecord
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT n.name, r.name, a.key, a.url, a.from_seq, a.to_seq, a.created

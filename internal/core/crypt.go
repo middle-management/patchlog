@@ -739,6 +739,9 @@ var ErrArchiveKeyDestroyed = errors.New("the archive is encrypted and its data k
 // an encrypted namespace. An encrypted archive of a purged resource is
 // ErrArchiveKeyDestroyed.
 func (e *Engine) OpenArchive(ctx context.Context, ns, name string, r io.Reader) (io.Reader, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("archives")
+	}
 	br := bufio.NewReaderSize(r, 1<<16)
 	head, _ := br.Peek(len(archiveMagic))
 	if string(head) != archiveMagic {

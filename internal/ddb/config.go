@@ -199,36 +199,44 @@ func (s *Store) replayConfig(ctx context.Context, ns, ifMatch string, patches an
 		return nil, nil
 	}
 	want := ids.Revision(&parent, jsonv.Canonical(patches)).String()
+	c, err := s.cfgByID(ctx, ns, want, author)
+	if err != nil || c == nil {
+		return nil, err
+	}
+	res := &ConfigResult{ConfigID: want, Replayed: true}
+	if lp := c.n("logPos"); lp > 0 {
+		le, err := s.getItem(ctx, keyLog(ns, lp))
+		if err != nil {
+			return nil, err
+		}
+		if le != nil {
+			l := item(le)
+			res.NSID, res.Created = l.s("id"), int64(l.n("created"))
+			res.Gesture, res.Undoes = l.s("gesture"), l.s("undoes")
+		}
+	}
+	return res, nil
+}
+
+// cfgByID is the CFG item of configuration id in ns that author wrote
+// (ns_config by id, GSI1), nil when there is none.
+func (s *Store) cfgByID(ctx context.Context, ns, id, author string) (item, error) {
 	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
 		TableName:              &s.Table,
 		IndexName:              strptr(gsiName),
 		KeyConditionExpression: strptr("G1PK = :g"),
 		FilterExpression:       strptr("PK = :pk AND begins_with(SK, :sk)"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":g": avS(g1RevID(want)), ":pk": avS(nsPK(ns)), ":sk": avS("CFG#"),
+			":g": avS(g1RevID(id)), ":pk": avS(nsPK(ns)), ":sk": avS("CFG#"),
 		},
 	})
 	if err != nil {
 		return nil, err
 	}
 	for _, it := range q.Items {
-		c := item(it)
-		if c.s("author") != author {
-			continue
+		if c := item(it); c.s("author") == author {
+			return c, nil
 		}
-		res := &ConfigResult{ConfigID: want, Replayed: true}
-		if lp := c.n("logPos"); lp > 0 {
-			le, err := s.getItem(ctx, keyLog(ns, lp))
-			if err != nil {
-				return nil, err
-			}
-			if le != nil {
-				l := item(le)
-				res.NSID, res.Created = l.s("id"), int64(l.n("created"))
-				res.Gesture, res.Undoes = l.s("gesture"), l.s("undoes")
-			}
-		}
-		return res, nil
 	}
 	return nil, nil
 }

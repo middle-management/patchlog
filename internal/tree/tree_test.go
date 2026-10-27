@@ -851,7 +851,17 @@ func TestManyTag(t *testing.T) {
 		items = append(items, client.BatchItem{Resource: fmt.Sprintf("f%03d", i), IfNoneMatch: true,
 			Steps: []client.Step{client.PatchStep(client.GenesisPatches(map[string]any{"title": "x", "parents": parents("root")}))}})
 	}
-	must(w.c.Batch(context.Background(), "cat", client.BatchRequest{Items: items}, false))
+	// In batches of 20: the listing doesn't depend on how they were
+	// written, and every backend's itemsPerBatch holds 20 (DynamoDB's
+	// is lowered to what one transaction fits). Each batch draws a token
+	// per item (§6.6): the clock moves on between them, as a client
+	// waiting out Retry-After would.
+	for len(items) > 0 {
+		n := min(20, len(items))
+		must(w.c.Batch(context.Background(), "cat", client.BatchRequest{Items: items[:n]}, false))
+		items = items[n:]
+		w.s.Clock.Advance(time.Hour)
+	}
 	x := startSvc(t, w.c, svcOpts{})
 	x.caughtUp("cat", "matches")
 	r := x.raw("/cat/at/"+x.s.At()+"/children?limit=1000&of=root", "")

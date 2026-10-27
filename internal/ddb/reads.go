@@ -262,17 +262,8 @@ func (s *Store) ReadRevOf(ctx context.Context, ns, name, id string) (*RevInfo, e
 			if resNameFromRev(i.s("SK")) != name {
 				continue // a name of which this one is a prefix
 			}
-			return &RevInfo{
-				Name:     name,
-				Pos:      i.n("pos"),
-				Kind:     i.s("kind"),
-				ParentID: i.s("parentId"),
-				Patches:  i.s("patches"),
-				Author:   i.s("author"),
-				Created:  int64(i.n("created")),
-				Size:     i.n("size"),
-				Digest:   i.b("digest"),
-			}, nil
+			r := scanRevInfo(i)
+			return &r, nil
 		}
 		if q.LastEvaluatedKey == nil {
 			return nil, nil

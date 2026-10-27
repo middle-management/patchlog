@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/ddb"
+	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/rules"
@@ -87,6 +88,11 @@ func openDDB(opt Options) (*Engine, error) {
 	// as the SQL write path's opt.Now does: Last-Modified and /heads'
 	// created are the revision's own time on the instance's clock (§7.1).
 	store.Now = opt.Now
+	// The deployment's batch maximum, lowered to what one transaction
+	// holds (docs/DYNAMODB.md §10): namespaces learn it from their limits,
+	// and a batch over it is §6.6's 413 itemsPerBatch, not the action cap.
+	opt.Maximums.ItemsPerBatch = min(opt.Maximums.ItemsPerBatch, ddb.MaxBatchItems)
+	opt.Limits.ItemsPerBatch = min(opt.Limits.ItemsPerBatch, opt.Maximums.ItemsPerBatch)
 	e := &Engine{
 		opt:        opt,
 		validator:  schema.NewValidator(),
@@ -170,6 +176,10 @@ func ddbRefusals(cfg *Config) *Error {
 		return ddbUnsupported("branches")
 	case cfg.Successor != "":
 		return ddbUnsupported("namespace successors")
+	case cfg.SignaturesRequired:
+		// Writes can't carry signatures on this backend, so a
+		// namespace requiring them would take unsigned ones (§C.3.1).
+		return ddbUnsupported("author signatures")
 	}
 	return nil
 }
@@ -188,7 +198,7 @@ func (e *Engine) ddbGate(ns, name string, patches any, st *ddb.WriteState) *Erro
 		return apiErr(410, "purged", "namespace", ns)
 	}
 	if st.Frozen {
-		return apiErr(409, "frozen", "namespace", ns)
+		return apiErr(409, "frozen")
 	}
 	cfg, perr := e.ddbConfig(context.Background(), ns, st.ConfigID)
 	if perr != nil {
@@ -281,9 +291,72 @@ func ddbAuthor(cred Credentials) string {
 	return "anonymous"
 }
 
+// ddbDraw is a write's rate-limit draw (rateLimit of auth.go) for the
+// -dev principal (devActor), allowances included: one draw a request,
+// whichever comes first of the gate (a write that reaches it) and the
+// store's answer before it (a replay, or a step-2 refusal). On the SQL
+// path the draw precedes both (§6.6, §6.2 step 1), so they draw too, and
+// an empty bucket answers 429 instead.
+type ddbDraw struct {
+	e     *Engine
+	ns    string
+	cred  Credentials
+	names []string
+	items int
+	done  bool
+}
+
+func (d *ddbDraw) take(cfg *Config) *Error {
+	if d.done || d.items == 0 {
+		return nil
+	}
+	d.done = true
+	a, now := devActor(d.cred), d.e.opt.Now()
+	return d.e.admit(now, writeDraws(d.ns, cfg.Limits, principalDraw(d.ns, cfg, a, float64(d.items), now), a.bucketKey, d.names, d.items))
+}
+
+// late draws for an answer the store gave before the gate ran, once the
+// namespace is known to exist: what SQL refuses before step 1 (absent,
+// malformed) draws nothing.
+func (d *ddbDraw) late(ctx context.Context, err error) *Error {
+	if d.done {
+		return nil
+	}
+	if err != nil {
+		if ae := ddbAsErr(err); ae.Status == 404 || ae.Status == 400 || ae.Status >= 500 {
+			return nil
+		}
+	}
+	info, ierr := d.e.ddb.store.ReadNSInfo(ctx, d.ns)
+	if ierr != nil || !info.Exists {
+		return nil
+	}
+	cfg, perr := d.e.ddbConfig(ctx, d.ns, info.ConfigID)
+	if perr != nil {
+		return nil
+	}
+	return d.take(cfg)
+}
+
+// gate draws, then runs ddbGate.
+func (d *ddbDraw) gate(ctx context.Context, name string, patches any, st *ddb.WriteState) *Error {
+	if st.Exists && st.ConfigID != "" {
+		cfg, perr := d.e.ddbConfig(ctx, d.ns, st.ConfigID)
+		if perr != nil {
+			return perr
+		}
+		if err := d.take(cfg); err != nil {
+			return err
+		}
+	}
+	return d.e.ddbGate(d.ns, name, patches, st)
+}
+
 // ddbCommitted is the post-commit of a write: wake the namespace's live
-// readers and purge its cache tags (appendNS's notify + the write path's
-// purges; the read cache holds no ddb entries in phase 1).
+// readers and purge the cache tags the write's transaction would have
+// collected on SQL (t.tags: none for resource writes; ns:{ns} when a
+// config change ends public caching, insertConfig). The read cache holds
+// no ddb entries in phase 1.
 func (e *Engine) ddbCommitted(ns string, tags ...string) {
 	e.hub.publish(ns)
 	if len(tags) > 0 {
@@ -314,18 +387,24 @@ func (e *Engine) ddbWriteResource(ctx context.Context, req Request, item Item) (
 	if step.Delete {
 		return e.ddbDelete(ctx, req, item, step, author)
 	}
-	res, err := e.ddb.store.WriteResource(ctx, req.NS, item.Resource, ddb.Pre{IfMatch: item.IfMatch, IfNoneMatch: item.IfNoneMatch}, step.Patches, step.Gesture, step.Undoes, author,
+	rd := &ddbDraw{e: e, ns: req.NS, cred: req.Cred, names: []string{item.Resource}, items: 1}
+	sctx, span := e.dbSpan(ctx, "core.db.update")
+	res, err := e.ddb.store.WriteResource(sctx, req.NS, item.Resource, ddb.Pre{IfMatch: item.IfMatch, IfNoneMatch: item.IfNoneMatch}, step.Patches, step.Gesture, step.Undoes, author,
 		func(st *ddb.WriteState) error {
-			if perr := e.ddbGate(req.NS, item.Resource, step.Patches, st); perr != nil {
+			if perr := rd.gate(ctx, item.Resource, step.Patches, st); perr != nil {
 				return perr
 			}
 			return nil
 		})
+	endDBSpan(span, err)
+	if perr := rd.late(ctx, err); perr != nil {
+		return nil, perr
+	}
 	if err != nil {
 		return nil, ddbAsErr(err)
 	}
 	if !res.Replayed {
-		e.ddbCommitted(req.NS, "r:"+req.NS+"/"+item.Resource, "heads:"+req.NS)
+		e.ddbCommitted(req.NS)
 	}
 	return &WriteResult{
 		Status:   res.Status,
@@ -354,18 +433,24 @@ func ddbRevEntry(r ddb.RevInfo) *LogEntry {
 // checked head, the gate sees the delete envelope (§6.4.1: the last live
 // document, no patches).
 func (e *Engine) ddbDelete(ctx context.Context, req Request, item Item, step Step, author string) (*WriteResult, error) {
-	res, err := e.ddb.store.DeleteResource(ctx, req.NS, item.Resource, ddb.Pre{IfMatch: item.IfMatch, IfNoneMatch: item.IfNoneMatch}, step.Gesture, step.Undoes, author,
+	rd := &ddbDraw{e: e, ns: req.NS, cred: req.Cred, names: []string{item.Resource}, items: 1}
+	sctx, span := e.dbSpan(ctx, "core.db.update")
+	res, err := e.ddb.store.DeleteResource(sctx, req.NS, item.Resource, ddb.Pre{IfMatch: item.IfMatch, IfNoneMatch: item.IfNoneMatch}, step.Gesture, step.Undoes, author,
 		func(st *ddb.WriteState) error {
-			if perr := e.ddbGate(req.NS, item.Resource, nil, st); perr != nil {
+			if perr := rd.gate(ctx, item.Resource, nil, st); perr != nil {
 				return perr
 			}
 			return nil
 		})
+	endDBSpan(span, err)
+	if perr := rd.late(ctx, err); perr != nil {
+		return nil, perr
+	}
 	if err != nil {
 		return nil, ddbAsErr(err)
 	}
 	if !res.Replayed {
-		e.ddbCommitted(req.NS, "r:"+req.NS+"/"+item.Resource, "heads:"+req.NS)
+		e.ddbCommitted(req.NS)
 	}
 	return &WriteResult{
 		Status:   res.Status,
@@ -397,7 +482,9 @@ func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChang
 		if err := ddbRefusals(cfg); err != nil {
 			return nil, err
 		}
-		cfgID, nsID, err := e.ddb.store.CreateNamespace(ctx, req.NS, author, cc.Patches)
+		sctx, span := e.dbSpan(ctx, "core.db.update")
+		cfgID, nsID, err := e.ddb.store.CreateNamespace(sctx, req.NS, author, cc.Patches)
+		endDBSpan(span, err)
 		if err != nil {
 			return nil, ddbAsErr(err)
 		}
@@ -408,7 +495,11 @@ func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChang
 	if cc.IfMatch == "" {
 		return nil, apiErr(428, "precondition_required")
 	}
-	res, err := e.ddb.store.WriteConfig(ctx, req.NS, author, cc.IfMatch, cc.Patches, cc.Gesture, cc.Undoes,
+	// Public copies at the edge must go when the change ends public
+	// caching (§9, insertConfig): ns:{ns} is on every response.
+	var endsPublic bool
+	sctx, span := e.dbSpan(ctx, "core.db.update")
+	res, err := e.ddb.store.WriteConfig(sctx, req.NS, author, cc.IfMatch, cc.Patches, cc.Gesture, cc.Undoes,
 		func(doc any, exists bool, patches any) (any, error) {
 			doc, perr := applyConfigPatches(doc, exists, patches)
 			if perr != nil {
@@ -436,12 +527,14 @@ func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChang
 			if perr != nil {
 				return perr
 			}
+			endsPublic = cur.cachePublic() && !cfg.cachePublic()
 			if err := ddbRefusals(cfg); err != nil {
 				return err
 			}
 			st.NewFrozen = cfg.Frozen
 			return nil
 		})
+	endDBSpan(span, err)
 	if err != nil {
 		return nil, ddbAsErr(err)
 	}
@@ -449,7 +542,11 @@ func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChang
 		// The new document replaces the cache and wakes readers;
 		// insertConfig's CDN tag, simplified (single instance).
 		e.ddbForgetConfig(req.NS)
-		e.ddbCommitted(req.NS, "ns:"+req.NS)
+		var tags []string
+		if endsPublic {
+			tags = append(tags, "ns:"+req.NS)
+		}
+		e.ddbCommitted(req.NS, tags...)
 	}
 	status, gesture, undoes := 201, cc.Gesture, cc.Undoes
 	if res.Replayed {
@@ -526,12 +623,22 @@ func (e *Engine) ddbBatch(ctx context.Context, req Request, items []Item, cc *Co
 	if !info.Exists {
 		return nil, apiErr(404, "not_found", "namespace", req.NS)
 	}
-	if info.Purged {
-		return nil, apiErr(410, "purged", "namespace", req.NS)
-	}
 	cfg, perr := e.ddbConfig(ctx, req.NS, info.ConfigID)
 	if perr != nil {
 		return nil, perr
+	}
+	// A token per item (§6.6), the config change exempt (the -dev
+	// principal is a * key), drawn after step 1 as on the SQL path:
+	// before the purged answer, the retry lookup and the limits.
+	names := make([]string, len(items))
+	for i, it := range items {
+		names[i] = it.Resource
+	}
+	if perr := (&ddbDraw{e: e, ns: req.NS, cred: req.Cred, names: names, items: len(items)}).take(cfg); perr != nil {
+		return nil, perr
+	}
+	if info.Purged {
+		return nil, apiErr(410, "purged", "namespace", req.NS)
 	}
 	if len(items) > cfg.Limits.ItemsPerBatch {
 		return nil, limitErr(413, "itemsPerBatch", int64(len(items)), int64(cfg.Limits.ItemsPerBatch), fmt.Sprintf("more than %d items", cfg.Limits.ItemsPerBatch))
@@ -572,13 +679,17 @@ func (e *Engine) ddbBatch(ctx context.Context, req Request, items []Item, cc *Co
 			return d, nil
 		}
 		checkCfg = func(st *ddb.ConfigState) error {
-			if st.Purged {
-				return apiErr(410, "purged", "namespace", req.NS)
+			// As a config write's (ddbWriteConfig): the limits of the
+			// configuration in force, the new document against what it
+			// keeps.
+			if canon := jsonv.Canonical(cc.Patches); len(canon) > cfg.Limits.PatchSetSize {
+				return limitErr(413, "patchSetSize", int64(len(canon)), int64(cfg.Limits.PatchSetSize), "patch set too large")
 			}
-			if cc.IfMatch != "" && cc.IfMatch != st.ConfigID {
-				return apiErr(412, "stale", "config", st.ConfigID)
+			if n := len(jsonv.Canonical(st.Doc)); n > cfg.Limits.DocumentSize {
+				return limitErr(413, "documentSize", int64(n), int64(cfg.Limits.DocumentSize), "document too large")
 			}
-			ncfg, perr := e.newConfig(st.Doc, nil, nil)
+			prev, _ := st.Cur.(map[string]any)
+			ncfg, perr := e.newConfig(st.Doc, prev, nil)
 			if perr != nil {
 				return perr
 			}
@@ -612,23 +723,66 @@ func (e *Engine) ddbBatch(ctx context.Context, req Request, items []Item, cc *Co
 		return nil
 	}
 
-	res, err := e.ddb.store.WriteBatch(ctx, req.NS, author, ddbItems, ccPatches, applyCfg, checkCfg, check, dryRun)
-	if err != nil {
-		var bf *ddb.BatchFailure
-		if errors.As(err, &bf) {
-			fails := make([]itemErr, len(bf.Items))
-			for i, f := range bf.Items {
-				fails[i] = itemErr{f.Index, ddbAsErr(f.Err)}
-			}
-			return nil, batchError(fails)
-		}
+	ccIfMatch := ""
+	if cc != nil {
+		ccIfMatch = cc.IfMatch
+	}
+	sctx, span := e.dbSpan(ctx, "core.db.update")
+	res, err := e.ddb.store.WriteBatch(sctx, req.NS, author, ddbItems, ccIfMatch, ccPatches, applyCfg, checkCfg, check, dryRun)
+	endDBSpan(span, err)
+	var fails []ddb.BatchItemError
+	var bf *ddb.BatchFailure
+	switch {
+	case errors.As(err, &bf):
+		fails = bf.Items
+	case err != nil:
 		return nil, ddbAsErr(err)
+	default:
+		fails = res.Fails
+	}
+	// An item refused for a feature this backend lacks refuses the
+	// batch with it: the feature, not the item, is what's missing.
+	for _, f := range fails {
+		if fe := ddbAsErr(f.Err); fe.Status == 501 {
+			return nil, fe
+		}
+	}
+	if bf != nil {
+		ifs := make([]itemErr, len(fails))
+		for i, f := range fails {
+			ifs[i] = itemErr{f.Index, ddbAsErr(f.Err)}
+		}
+		return nil, batchError(ifs)
+	}
+	if dryRun {
+		// Every item reported (dryRunReport): the refused with the
+		// status and code they failed with, the rest with their ids.
+		failed := map[int]*Error{}
+		for _, f := range fails {
+			failed[f.Index] = ddbAsErr(f.Err)
+		}
+		var passed []*itemState
+		for i, it := range items {
+			if _, ok := failed[i]; ok {
+				continue
+			}
+			id, perr := ids.Parse(res.IDs[it.Resource])
+			if perr != nil {
+				continue
+			}
+			passed = append(passed, &itemState{index: i, steps: []*stepState{{id: id}}})
+		}
+		return &WriteResult{Status: 200, ConfigID: res.ConfigID, Items: dryRunReport(items, passed, failed, nil)}, nil
 	}
 	if !res.Replayed && !dryRun {
+		var tags []string
 		if cc != nil && res.ConfigID != info.ConfigID {
 			e.ddbForgetConfig(req.NS)
+			if gateCfg != nil && cfg.cachePublic() && !gateCfg.cachePublic() {
+				tags = append(tags, "ns:"+req.NS)
+			}
 		}
-		e.ddbCommitted(req.NS, "ns:"+req.NS)
+		e.ddbCommitted(req.NS, tags...)
 	}
 	out := &WriteResult{Status: res.Status, NSID: res.NSID, Replayed: res.Replayed, ConfigID: res.ConfigID}
 	for _, it := range items {

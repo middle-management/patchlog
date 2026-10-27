@@ -38,8 +38,10 @@ type BatchItem struct {
 // Pre is the item's precondition.
 func (it BatchItem) Pre() Pre { return Pre{IfMatch: it.IfMatch, IfNoneMatch: it.IfNoneMatch} }
 
-// BatchResult is a committed (or replayed, or dry-run) batch.
+// BatchResult is a committed (or replayed, or dry-run) batch. A dry run
+// reports its refused items in Fails, and IDs holds the others' (§7.5).
 type BatchResult struct {
+	Fails    []BatchItemError
 	Status   int // 201 committed, 200 replayed or dry run
 	NSID     string
 	Created  int64
@@ -66,6 +68,11 @@ func (e *BatchFailure) Error() string { return "ddb: batch refused per item" }
 // maxTxActions is DynamoDB's transaction action cap; a batch's actions
 // must fit (docs/DYNAMODB.md §10's lowered ItemsPerBatch).
 const maxTxActions = 100
+
+// MaxBatchItems is the most items a batch is sure to fit in one
+// transaction, a config change's actions included and every item a write
+// (the costlier kind): docs/DYNAMODB.md §10's lowered ItemsPerBatch.
+const MaxBatchItems = (maxTxActions - 3 - 2) / 4
 
 // BatchActions counts a batch's transaction actions: three shared, two
 // for a config change, four per write, two per delete.
@@ -94,7 +101,11 @@ func BatchActions(items []BatchItem, withConfig bool) int {
 // change's, as WriteConfig's. A *BatchFailure collects every item's
 // refusal; a plan error that isn't an item's (the namespace's state, the
 // action budget) aborts directly.
-func (s *Store) WriteBatch(ctx context.Context, ns, author string, items []BatchItem, ccPatches any, applyCfg func(doc any, exists bool, patches any) (any, error), checkCfg func(*ConfigState) error, check func(name string, st *WriteState) error, dryRun bool) (*BatchResult, error) {
+//
+// ccIfMatch is the config change's precondition (required, 428): one
+// naming another configuration is first looked up as the batch's own
+// retry (§7.5, over the configuration it computes), else 412.
+func (s *Store) WriteBatch(ctx context.Context, ns, author string, items []BatchItem, ccIfMatch string, ccPatches any, applyCfg func(doc any, exists bool, patches any) (any, error), checkCfg func(*ConfigState) error, check func(name string, st *WriteState) error, dryRun bool) (*BatchResult, error) {
 	if acts := BatchActions(items, ccPatches != nil); acts > maxTxActions {
 		return nil, apiErr(413, "limit", "key", "itemsPerBatch", "measured", acts, "max", maxTxActions)
 	}
@@ -125,11 +136,27 @@ func (s *Store) WriteBatch(ctx context.Context, ns, author string, items []Batch
 		newFrozen := m.frozen
 		configActs := false
 		if ccPatches != nil {
+			if ccIfMatch == "" {
+				return nil, apiErr(428, "precondition_required")
+			}
+			if ccIfMatch != m.configID {
+				if parent, err := ids.Parse(ccIfMatch); err == nil {
+					want := ids.Revision(&parent, jsonv.Canonical(ccPatches)).String()
+					var head0 *resRow
+					if len(items) > 0 {
+						head0 = heads[0]
+					}
+					if res, err := s.replayBatch(ctx, ns, items, true, want, head0, author); res != nil || err != nil {
+						return res, err
+					}
+				}
+				return nil, apiErr(412, "stale", "config", m.configID)
+			}
 			doc, err := applyCfg(cfgDoc, true, ccPatches)
 			if err != nil {
 				return nil, err
 			}
-			st := &ConfigState{Exists: true, Frozen: m.frozen, Purged: m.purged, ConfigID: m.configID, Doc: doc, NewFrozen: m.frozen}
+			st := &ConfigState{Exists: true, Frozen: m.frozen, Purged: m.purged, ConfigID: m.configID, Cur: cfgDoc, Doc: doc, NewFrozen: m.frozen}
 			if checkCfg != nil {
 				if err := checkCfg(st); err != nil {
 					return nil, err
@@ -157,7 +184,7 @@ func (s *Store) WriteBatch(ctx context.Context, ns, author string, items []Batch
 			if res, err := s.replayBatch(ctx, ns, items, ccPatches != nil, cfgID, heads[0], author); res != nil || err != nil {
 				return res, err
 			}
-			return nil, frozen(ns)
+			return nil, frozen()
 		}
 		now := s.now().UnixMilli()
 		plans := make([]*writePlan, len(items))
@@ -208,7 +235,18 @@ func (s *Store) WriteBatch(ctx context.Context, ns, author string, items []Batch
 			if res, err := s.replayBatch(ctx, ns, items, ccPatches != nil, cfgID, heads[0], author); res != nil || err != nil {
 				return res, err
 			}
-			return nil, &BatchFailure{Items: fails}
+			if !dryRun {
+				return nil, &BatchFailure{Items: fails}
+			}
+			// A dry run reports every item: the refused with their
+			// errors, the others with their ids (§7.5).
+			idsByName := map[string]string{}
+			for i, p := range plans {
+				if p != nil {
+					idsByName[items[i].Name] = p.rev.id
+				}
+			}
+			return &BatchResult{Status: 200, IDs: idsByName, ConfigID: cfgID, Fails: fails}, nil
 		}
 
 		// The batch entry (planEntry of write.go): the config target
@@ -304,7 +342,10 @@ func batchGestures(items []BatchItem) string {
 // The lookup needs every item's target computable from the request: an
 // item without a precondition makes it uncomputable, and finds nothing.
 func (s *Store) replayBatch(ctx context.Context, ns string, items []BatchItem, withConfig bool, cfgID string, head0 *resRow, author string) (*BatchResult, error) {
-	if len(items) == 0 || head0 == nil || head0.headPos == 0 {
+	if len(items) > 0 && (head0 == nil || head0.headPos == 0) {
+		return nil, nil
+	}
+	if len(items) == 0 && !withConfig {
 		return nil, nil
 	}
 	entries := make([]any, 0, len(items)+1)
@@ -324,11 +365,27 @@ func (s *Store) replayBatch(ctx context.Context, ns string, items []BatchItem, w
 		entries = append(entries, map[string]any{"resource": it.Name, "kind": kind, "target": id})
 		idsByName[it.Name] = id
 	}
-	rev, err := s.revOf(ctx, ns, items[0].Name, head0, idsByName[items[0].Name])
-	if err != nil || rev == nil || rev.LogPos == 0 {
-		return nil, err
+	// The entry: the one that committed item 0's target, or, for a batch
+	// of only a config change, the one that put its configuration in
+	// force (both recorded as logPos).
+	var logPos uint64
+	if len(items) > 0 {
+		rev, err := s.revOf(ctx, ns, items[0].Name, head0, idsByName[items[0].Name])
+		if err != nil || rev == nil {
+			return nil, err
+		}
+		logPos = rev.LogPos
+	} else {
+		c, err := s.cfgByID(ctx, ns, cfgID, author)
+		if err != nil || c == nil {
+			return nil, err
+		}
+		logPos = c.n("logPos")
 	}
-	le, err := s.getItem(ctx, keyLog(ns, rev.LogPos))
+	if logPos == 0 {
+		return nil, nil
+	}
+	le, err := s.getItem(ctx, keyLog(ns, logPos))
 	if err != nil || le == nil {
 		return nil, err
 	}

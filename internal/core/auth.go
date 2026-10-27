@@ -52,11 +52,7 @@ func (a *actor) envelope() any {
 // namespace creation with operator keys (then n and cfg may be nil).
 func (t *tx) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials, keysOverride []grant.Key) (*actor, *Error) {
 	if t.e.opt.AuthDisabled {
-		name := cred.Author
-		if name == "" {
-			name = "anonymous"
-		}
-		return &actor{principal: grant.Principal{ID: name}, star: true, bucketKey: name, noAuth: true}, nil
+		return devActor(cred), nil
 	}
 	g, err := t.decodeGrant(nsName, cred)
 	if err != nil {
@@ -751,16 +747,19 @@ func (t *tx) rateLimit(n *nsRow, cfg *Config, a *actor, resources []string, item
 
 // writeDraws are the draws of a write (rateLimit).
 func (t *tx) writeDraws(n *nsRow, cfg *Config, a *actor, resources []string, items int) []draw {
-	l := cfg.Limits
-	// An allowance's own bucket replaces the principal and namespace
-	// buckets; per-resource buckets still apply (§6.6).
-	d := t.principalDraw(n, cfg, a, float64(items))
+	return writeDraws(n.name, cfg.Limits, principalDraw(n.name, cfg, a, float64(items), t.now), a.bucketKey, resources, items)
+}
+
+// writeDraws are a write's draws given its principal's (principalDraw):
+// an allowance's own bucket replaces the principal and namespace buckets;
+// per-resource buckets still apply (§6.6).
+func writeDraws(ns string, l Limits, d draw, bucketKey string, resources []string, items int) []draw {
 	draws := []draw{d}
 	if d.name != "allowance" {
-		draws = append(draws, draw{"n\x00" + n.name, l.RatePerNamespace, float64(items), "ratePerNamespace"})
+		draws = append(draws, draw{"n\x00" + ns, l.RatePerNamespace, float64(items), "ratePerNamespace"})
 	}
 	for _, r := range resources {
-		draws = append(draws, draw{"r\x00" + n.name + "\x00" + r + "\x00" + a.bucketKey, l.RatePerResource, 1, "ratePerResource"})
+		draws = append(draws, draw{"r\x00" + ns + "\x00" + r + "\x00" + bucketKey, l.RatePerResource, 1, "ratePerResource"})
 	}
 	return draws
 }
@@ -768,9 +767,9 @@ func (t *tx) writeDraws(n *nsRow, cfg *Config, a *actor, resources []string, ite
 // principalDraw is the draw of cost tokens from the principal's bucket in
 // n, lowered to its key's rate, or from its allowance's bucket if that
 // has a rate (§6.6).
-func (t *tx) principalDraw(n *nsRow, cfg *Config, a *actor, cost float64) draw {
-	if al := t.allowanceOf(cfg, a); al != nil && al.Rate.Rate > 0 {
-		return draw{"a\x00" + n.name + "\x00" + al.Sub + "\x00" + al.Kid, al.Rate, cost, "allowance"}
+func principalDraw(ns string, cfg *Config, a *actor, cost float64, now time.Time) draw {
+	if al := allowanceOf(cfg, a, now); al != nil && al.Rate.Rate > 0 {
+		return draw{"a\x00" + ns + "\x00" + al.Sub + "\x00" + al.Kid, al.Rate, cost, "allowance"}
 	}
 	pr := cfg.Limits.RatePerPrincipal
 	if a.keyRate != nil && a.keyRate.Rate < pr.Rate {
@@ -792,8 +791,11 @@ func (t *tx) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
 // rounded up, and in the body retryAfter, the wait in seconds as a decimal
 // (rounded up to the millisecond), which a client under a fast allowance
 // waits by instead.
-func (t *tx) admit(draws []draw) *Error {
-	wait, hit, ok := t.e.rate.admit(t.now, draws)
+func (t *tx) admit(draws []draw) *Error { return t.e.admit(t.now, draws) }
+
+// admit is tx.admit at now, for a backend without transactions (ddb.go).
+func (e *Engine) admit(now time.Time, draws []draw) *Error {
+	wait, hit, ok := e.rate.admit(now, draws)
 	if !ok {
 		secs := int(math.Ceil(wait.Seconds()))
 		if secs < 1 {
@@ -822,16 +824,29 @@ func (rl *rateLimiter) charge(now time.Time, d draw) {
 }
 
 // allowanceOf returns the actor's allowance in a configuration, if any.
-func (t *tx) allowanceOf(cfg *Config, a *actor) *Allowance {
+func (t *tx) allowanceOf(cfg *Config, a *actor) *Allowance { return allowanceOf(cfg, a, t.now) }
+
+// allowanceOf is tx.allowanceOf at now.
+func allowanceOf(cfg *Config, a *actor, now time.Time) *Allowance {
 	kid := ""
 	if a.verified != nil {
 		kid = a.verified.Key.Kid
 	}
 	al := cfg.allowance(a.principal.ID, kid, a.verified == nil)
-	if al != nil && !al.Until.IsZero() && !t.now.Before(al.Until) {
+	if al != nil && !al.Until.IsZero() && !now.Before(al.Until) {
 		return nil // ended: ignored from `until` on (§6.6)
 	}
 	return al
+}
+
+// devActor is the principal of a request with authentication disabled
+// (-dev): the X-Author name, a * key, bucketed by name.
+func devActor(cred Credentials) *actor {
+	name := cred.Author
+	if name == "" {
+		name = "anonymous"
+	}
+	return &actor{principal: grant.Principal{ID: name}, star: true, bucketKey: name, noAuth: true}
 }
 
 // guardedPaths need a grant chained to a * key (§7.4).

@@ -156,8 +156,8 @@ func nsState(ns string, m *nsMeta) *Error {
 	return nil
 }
 
-// frozen is the 409 of a frozen namespace.
-func frozen(ns string) *Error { return apiErr(409, "frozen", "namespace", ns) }
+// frozen is the 409 of a frozen namespace: the code alone (checkItems).
+func frozen() *Error { return apiErr(409, "frozen") }
 
 // planWrite turns the check phase's reads into a write plan (D.3 steps
 // 2–3, the store's part: the precondition, the patches applied, the
@@ -173,7 +173,7 @@ func planWrite(ns, name string, m *nsMeta, t *tip, head *resRow, headDoc any, pr
 		return nil, err
 	}
 	if m.frozen {
-		return nil, frozen(ns)
+		return nil, frozen()
 	}
 	parentID, perr := precondition(head, pre, false)
 	if perr != nil {
@@ -250,7 +250,7 @@ func planDelete(ns, name string, m *nsMeta, t *tip, head *resRow, pre Pre, gestu
 		return nil, err
 	}
 	if m.frozen {
-		return nil, frozen(ns)
+		return nil, frozen()
 	}
 	if pre.IfMatch == "" && !pre.IfNoneMatch {
 		return nil, apiErr(428, "precondition_required")

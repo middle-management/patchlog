@@ -5,43 +5,9 @@
 # deleting its line. PATCHLOG_TEST_KNOWN=run runs them.
 
 # Divergences: the backend answers differently from the spec.
-client/TestGestures panics: PATCH /r/g/a: 422 patch
-client/TestLimitRefusal batch limit "opsPerSet" 3 2 true true: patchlog: POST /ns/l/batch: 422 limit: too many operations
-client/TestRateLimitRetryAfter rate limit: <nil>
-client/TestResourceLifecycle create &{Status:201 ID:<id> NSID:<id> Entry:0x3e76425551e0 Gesture: Undoes:} want <id>
-client/TestUndoMultiResourceKeepsOthers scan plan &{NS:u Gesture:yc6nnfbe5bcpw42bek2a7fw22i Author:alice Source:log Level: Resources:[{Resource:a Head:<id> State:live Entries:[<id> <id>] Wri
-client/TestUndoRequiredNonces panics: PATCH /r/rn/res: 422 patch
-follow/TestSnapshotResumeStartsAgain timed out waiting for snapshot
-server/TestBatchConfigAndSchemas code "rule", want "batch": {"code":"rule","path":"/doc/ok","rule":0}
-server/TestBatchDryRunNewPrincipal status 412, want 200: {"code":"batch","items":[{"code":"stale","head":"","index":0,"status":412},{"code":"patch","detail":"patch op 0 (/x): the docume
-server/TestBlobDryRunCarriesOn status 422, want 200: {"code":"rule","path":"/doc/forbidden","rule":0}
-server/TestBlobReferencesWellFormed map[hero:map[$blob:<id> size:1843302 type:image/jpeg]]: 201 {"author":"alice","created":…,"id":"<id>","kind":"head"}
-server/TestBranches status 422, want 201: {"code":"patch","detail":"patch op 0: no document"}
-server/TestCanonicalStorage write response {"author":"alice","created":…,"id":"<id>","kind":"head"}
-server/TestCreatesFromScratch no create
-server/TestHeadMetaPlain status 422, want 201: {"code":"patch","detail":"patch op 0 (/restored): the document does not exist"}
-server/TestIdempotentRetry status 412, want 200: {"code":"stale","head":"<id>"}
-server/TestIdsVerifiable status 422, want 201: {"code":"patch","detail":"patch op 0: no document"}
-server/TestNamespace status 412, want 200: {"code":"stale","config":"<id>"}
-server/TestPurgeOnPublicToPrivate unrelated config write purged: [[ns:docs]]
-server/TestRateLimits status 201, want 429: {"author":"alice","created":…,"id":"<id>","kind":"head"}
-server/TestRemoteRegistration Post "http://127.0.0.1:44685/ns/main/branches": EOF
-server/TestReviewGesturesOnConfigWrite entry map[author:admin created:2026-10-27T06:56:43.053Z grant:<nil> id:<id> kind:config prev:<id> target:<id>]
-server/TestReviewRetryAfterStaleConfigDraws status 412, want 200: {"code":"stale","config":"<id>"}
-server/TestSnapshots status 422, want 201: {"code":"patch","detail":"patch op 0: no document"}
-server/TestTelemetry no transaction span in the write's trace: [core.WriteResource PATCH /r/{ns}/{name} (server)]
-server/TestV037NamespacePatchResponse status 412, want 200: {"code":"stale","config":"<id>"}
-server/TestV037RetryOnPurged status 412, want 200: {"code":"stale","head":"<id>"}
-server/TestV039GestureWrites retry map[Gesture:cccccccccccccccccccccccccc]: map[Cache-Control:[no-store] Content-Length:[149] Content-Type:[application/json] Date:[Tue, 27 Oct 202
-server/TestV042RateBeforeSignature status 201, want 422: {"author":"alice","created":…,"id":"<id>","kind":"head"}
-server/TestV047RateLimits status 201, want 429: {"author":"alice","created":…,"id":"<id>","kind":"head"}
-server/TestV055LimitConfigFields status 201, want 413: {"config":"<id>","ns_id":"<id>"}
-server/TestWholeDocumentAppends status 413, want 201: {"code":"limit","limit":"patchSetSize","max":1024,"measured":4106,"message":"patch set too large"}
-server/TestWrites status 201, want 428: {"author":"alice","created":…,"id":"<id>","kind":"head"}
-tree/TestListingsWaitForCatchUp once caught up: matches.m1
-tree/TestManyTag panics: POST /ns/cat/batch: 413 limit: the batch's transaction exceeds 100 actions
 
 # Unsupported features met where the harness cannot skip.
+server/TestTelemetry unsupported, met outside the harness (501): event streams, through the test's own traced client
 dav/TestAsideWindow unsupported, met inside a service (501): principal lookup (grants)
 dav/TestBodyLimits unsupported, met inside a service (501): principal lookup (grants)
 dav/TestCopyMoveLock unsupported, met inside a service (501): principal lookup (grants)

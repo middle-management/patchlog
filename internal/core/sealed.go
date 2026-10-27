@@ -696,6 +696,9 @@ func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 // retention's): a new epoch key is created and content written from then on
 // is sealed under it. It returns the new epoch.
 func (e *Engine) RotateEpoch(ctx context.Context, ns, author string) (int, error) {
+	if e.ddb != nil {
+		return 0, ddbUnsupported("sealed namespaces")
+	}
 	var epoch int
 	err := e.update(ctx, func(t *tx) error {
 		n := t.nsForWrite(ns)
@@ -756,6 +759,9 @@ func (e *Engine) rotateAfterRevoke(names []string) {
 // RotateDue rotates every sealed, unpurged, unfrozen namespace whose current
 // epoch started at least maxAge ago, and returns their names.
 func (e *Engine) RotateDue(ctx context.Context, maxAge time.Duration) ([]string, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("sealed namespaces")
+	}
 	var due []string
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%' ORDER BY name`)

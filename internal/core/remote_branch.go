@@ -1452,6 +1452,9 @@ type RemoteNotice struct {
 // RemoteNotices lists the purge notices of a remote branch ("" = all), oldest
 // first.
 func (e *Engine) RemoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error) {
+	if e.ddb != nil {
+		return nil, ddbUnsupported("remote branches")
+	}
 	var out []RemoteNotice
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT n.name, x.id, x.kind, x.resource, x.applied, x.created FROM remote_notices x JOIN namespaces n ON n.ns = x.branch
@@ -1475,6 +1478,9 @@ func (e *Engine) RemoteNotices(ctx context.Context, ns string) ([]RemoteNotice, 
 // log since the last check are applied (or recorded as notices, with
 // IgnorePurges), and with Register, registrations are made or renewed.
 func (e *Engine) SyncRemotes(ctx context.Context) error {
+	if e.ddb != nil {
+		return ddbUnsupported("remote branches")
+	}
 	var bases []*remoteBase
 	if err := e.read(ctx, func(t *tx) error {
 		bases = t.remoteBases(`n.purged = 0`)
@@ -1590,6 +1596,9 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 // registration (§G.3). It needs unrestricted read and export at the base,
 // through the endpoint's bearer grant.
 func (e *Engine) RegisterRemote(ctx context.Context, ns string) error {
+	if e.ddb != nil {
+		return ddbUnsupported("remote branches")
+	}
 	var b *remoteBase
 	if err := e.read(ctx, func(t *tx) error {
 		bs := t.remoteBases(`n.name = ?`, ns)

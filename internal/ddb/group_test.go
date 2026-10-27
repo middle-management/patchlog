@@ -195,7 +195,7 @@ func TestLocalGroupMixed(t *testing.T) {
 			res, err := s.WriteBatch(ctx, "demo", "alice", []BatchItem{
 				{Name: fmt.Sprintf("bat%da", i), IfNoneMatch: true, Patches: patches(`[{"op":"add","path":"","value":{}}]`)},
 				{Name: fmt.Sprintf("bat%db", i), IfNoneMatch: true, Patches: patches(`[{"op":"add","path":"","value":{}}]`)},
-			}, nil, nil, nil, nil, false)
+			}, "", nil, nil, nil, nil, false)
 			if err == nil {
 				record(res.NSID, nil)
 			} else {

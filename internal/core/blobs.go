@@ -1275,6 +1275,9 @@ func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) {
 // namespace is swept in its own write transaction. It returns how many
 // entries it deleted.
 func (e *Engine) SweepBlobs(ctx context.Context) (int, error) {
+	if e.ddb != nil {
+		return 0, ddbUnsupported("blobs")
+	}
 	var nss []int64
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT DISTINCT r.ns FROM blob_pending p JOIN resources r ON r.res = p.res ORDER BY r.ns`)

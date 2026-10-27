@@ -288,6 +288,9 @@ func epochFile(ns int64, bid []byte, e int) string {
 // crash, an ambiguous commit or a lost race leaves (blobstore.go). It
 // returns how many it deleted.
 func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
+	if e.ddb != nil {
+		return 0, ddbUnsupported("blobs")
+	}
 	dir := e.blobs.root()
 	if dir == "" {
 		return 0, nil

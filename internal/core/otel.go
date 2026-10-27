@@ -54,8 +54,11 @@ func (e *Engine) dbSpan(ctx context.Context, name string) (context.Context, trac
 		return ctx, nil
 	}
 	sys := "sqlite"
-	if e.pg {
+	switch {
+	case e.pg:
 		sys = "postgresql"
+	case e.ddb != nil:
+		sys = "aws.dynamodb"
 	}
 	return in.tracer.Start(ctx, name, trace.WithSpanKind(trace.SpanKindInternal), trace.WithAttributes(attrDBSystem.String(sys)))
 }

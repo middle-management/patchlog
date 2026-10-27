@@ -8,8 +8,9 @@ C (plain namespaces, `-dev`, one instance — the integration status is
 hashes and folds are the production bytes.
 
 The surface, beyond the spike's writes: `CreateNamespace`, `WriteResource`
-(restores included: a write on a tombstone root-replaces, its parent the
-tombstone id), `DeleteResource` (§8.1's tombstones: the deterministic
+(an explicit precondition, `Pre`, as §7.2's; restores included: a write
+naming the tombstone applies to the last live document, which the
+tombstone keeps), `DeleteResource` (§8.1's tombstones: the deterministic
 `ids.Tombstone` id, replay, the last-live markers for `Head.Last`),
 `WriteConfig`, and `WriteBatch` (§7.5: mixed items in one transaction
 under the 100-action budget, per-item failure collection, dry runs, an
@@ -17,8 +18,8 @@ optional config change, replay by request-computed entry body) — the
 writes with a check hook that runs the caller's gate inside the retry
 loop, after planning (D.3's recheck shape); `ReadHead`, `ReadLog`
 (paged, id cursors, upper bounds), `ReadRevByID` (GSI1), `FoldResource`
-(crossing tombstones: the document dies, the restore root-replaces),
-`ResourceLogEntries`, `ListHeads`, `ReadConfig`, `ReadDocAtEntry` (the
+(crossing tombstones: the restore applies to the last live document),
+`ResourceLog`, `ListHeads`, `HeadsAt`, `ReadConfig`, `ReadDocAtEntry` (the
 `ns_log ⨯ ns_config` join), `ReadNSInfo`, `KnownEntry`, `Ping`. `Open`
 parses the `-db` URL (`dynamodb://<table>?region=…&endpoint=…`); errors
 carry the core's `{"code": …}` body shape. With `GroupCommit` > 1,
@@ -41,11 +42,14 @@ checked under.
   `TestLocalConcurrentResource` races one resource: exactly one writer
   wins, the rest get the 412 with the winner's head — D.3's conflict path.
 - **Idempotent replay.** A retried write recomputes its first attempt's
-  revision id (the id covers the precondition's parent, not whatever the
-  head has become), finds it already the head, and answers with the
-  original entry id — read from the resource item, since the entry's own
-  id chains over a tip that has moved past it. `TestPlanWriteReplay`,
-  `TestLocalStaleAndReplay`.
+  revision id from the request (`Pre.expectedID`: the id covers the
+  precondition's parent, not whatever the head has become), finds that
+  revision by this author anywhere in the resource's history, and answers
+  with its own entry — the revision records the entry that committed it
+  (`logPos`), since the entry's id chains over a tip that has moved on.
+  Only a write its precondition refuses can be a retry, so a passing
+  write costs no extra read. `TestPlanWriteReplay`; end to end, the API
+  suites (`TestIdempotentRetry` and the rest, below).
 - **The key design (§3).** Byte-ordered `/heads` (`begins_with(RES#)`),
   log paging with id cursors (the marker resolves a served id back to its
   position — `UNIQUE(ns, id)`), chain order by zero-padded positions.
@@ -59,10 +63,18 @@ go test ./internal/ddb/            # the hermetic tests (keys, plans, tx shapes)
 
 docker run -d --name ddb-local -p 8000:8000 amazon/dynamodb-local
 DDB_ENDPOINT=http://localhost:8000 go test ./internal/ddb/   # + the integration tests
-DDB_ENDPOINT=http://localhost:8000 go test -run TestDDB ./internal/core/  # the engine's phase-1 surface
+DDB_ENDPOINT=http://localhost:8000 go test -run TestDDB ./internal/core/  # what the API suites can't reach
 DDB_ENDPOINT=http://localhost:8000 go test -run XXX -bench BenchmarkDDB -benchtime 1x ./internal/ddb/
 PATCHLOG_TEST_BACKEND=dynamodb DDB_ENDPOINT=http://localhost:8000 go test ./...   # the API suites on DynamoDB (internal/testenv)
 ```
+
+The behaviour the spec defines is tested through the API, on every
+backend alike: the server package's and the services' suites run on
+DynamoDB with `PATCHLOG_TEST_BACKEND=dynamodb` (docs/DYNAMODB.md §13).
+This package's own integration tests are what HTTP can't observe — the
+transaction races, group commit, the store's history lookups — and
+`internal/core`'s `TestDDB*` cover the few seam answers no API test that
+runs on this backend reaches (frozen, the delete envelope, the 501s).
 
 The integration tests skip without `DDB_ENDPOINT`. Each creates its own
 table and deletes it on cleanup. Benchmark numbers and their reading are
