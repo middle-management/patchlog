@@ -151,3 +151,31 @@ func TestW3XRemoteMirrorLegacyMarker(t *testing.T) {
 		})
 	}
 }
+
+// W3X (P27 x P29; §6.1 "Purged or unknown references", Read permission;
+// Addendum E Levels): a schema revision written before its namespace was
+// raised from none to e2e is stored in the clear and stays readable to the
+// server, so documents elsewhere that pin it keep validating; only a
+// revision written while the namespace is e2e is schema_unavailable.
+func TestW3XRaisedSchemaNamespaceStillResolves(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, withKeyStore(newKeyStore(t)))
+	e.mkNS("sch", map[string]any{"read": "public"})
+	s := e.create("sch", "m", matchSchema())
+	e.mkNS("docs", map[string]any{"read": "public"})
+	d := e.create("docs", "d", map[string]any{"$schema": "/r/sch/m/rev/" + s, "score": "1-0"})
+	expect(t, e.patchNS("sch", ops(op("add", "/encryption", map[string]any{"level": "e2e", "epoch": 1.0})), ""), 201)
+	if w := e.write("PATCH", "docs", "d", d, ops(op("replace", "/score", "2-0"))); w.Code != 201 {
+		t.Fatalf("a document typed by a pre-raise schema revision after its namespace became e2e: %d %s", w.Code, w.Body)
+	}
+	// Still validated against it.
+	expectCode(t, e.write("PATCH", "docs", "x", "", addRoot(map[string]any{"$schema": "/r/sch/m/rev/" + s, "score": 3.0})), 422, "invalid")
+	// A revision written at e2e, which the server can't read, doesn't
+	// resolve.
+	k := seal.NewKey()
+	r := e.writeAs("sch", "m", s, sealed(t, k, "sch#1", "sch", "m", s, ops(op("replace", "/title", "sealed"))), "alice")
+	expect(t, r, 201)
+	after := etagOf(r)
+	w := e.write("PATCH", "docs", "y", "", addRoot(map[string]any{"$schema": "/r/sch/m/rev/" + after, "score": "1-0"}))
+	expectCode(t, w, 422, "schema_unavailable")
+}

@@ -402,8 +402,9 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, int64, error) {
 		}
 		return nil, 0, schema.ErrUnavailable
 	}
-	if t.e2eContent(n, ref.Name) {
-		// The server can't read schemas in an e2e namespace (§E.3.2).
+	if t.e2eContent(n, ref.Name) && !t.preRaiseSchema(n, ref) {
+		// The server can't read a revision written while its namespace
+		// was e2e (§6.1, §E.3.2).
 		return nil, 0, schema.ErrUnavailable
 	}
 	// A namespace that opens its schemas with schemaReads lets writes to a
@@ -428,6 +429,22 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, int64, error) {
 		return nil, 0, schema.ErrForbidden
 	}
 	return d, row.seq, nil
+}
+
+// preRaiseSchema reports whether revision ref of n, an e2e namespace that
+// isn't a branch, is one the server can read: written before n's raise
+// from none or at-rest, so stored in the clear, which resolves as in any
+// namespace (§6.1, Addendum E Levels). One from before a raise from sealed
+// takes the keys of the epoch it is served under (§6.1 Read permission),
+// which serving pre-raise content sealed brings (P35); until then it
+// doesn't resolve, as content written at e2e doesn't.
+func (t *tx) preRaiseSchema(n *nsRow, ref schema.Ref) bool {
+	raise := t.e2eRaiseOf(n)
+	if raise == nil || raise.level == levelSealed {
+		return false
+	}
+	row := t.schemaRevRow(n, ref)
+	return row != nil && row.seq <= t.preRaiseHead(raise, row.res)
 }
 
 // schemaReadable reports whether the writer of sc may read resource name
@@ -557,7 +574,8 @@ func (t *tx) prefetchSchemas(refs []schema.Ref) {
 	for _, name := range nsNames {
 		n := t.schemaNS(name) // as loadSchemaIn reads it (writeDeps)
 		// loadSchemaIn reads no resource of a namespace that is unknown,
-		// purged, a branch or e2e.
+		// purged or a branch, and of an e2e one only revisions from
+		// before its raise, read without the prefetch.
 		if n == nil || n.purged || n.isBranch() || t.isE2E(n) {
 			continue
 		}
