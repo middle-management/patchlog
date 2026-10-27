@@ -2,6 +2,7 @@ package tree_test
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"path/filepath"
 	"testing"
@@ -216,5 +217,78 @@ func TestV073P37ListingOlderKeys(t *testing.T) {
 		t.Errorf("old once its key is had: %v", es["old"])
 	} else if _, err := derived.OpenItem(jwe, derived.ItemKey(keyOf, "cat", "old"), derived.View{NS: "cat", Target: f.path}, "cat", "old"); err != nil {
 		t.Errorf("old: %v", err)
+	}
+}
+
+// TestV073P37EpochsBackfilled (ENC-32, ENC-34, §E.2.6): a database from
+// before nodes.epoch and the epoch of items' file metadata has its heads'
+// epochs read in on start (backfillEpochs), so its listings seal each
+// node's values, and each item's file metadata, under the epoch the head
+// is served under rather than the one current when they are sealed.
+func TestV073P37EpochsBackfilled(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for ns, doc := range map[string]map[string]any{
+		"files": {"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}},
+		"cat": {"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"},
+			"catalog": filesCatalog("files")},
+	} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	all := []string{"cat", "files"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	createNonced(t, w, "cat", "root", map[string]any{"parents": []any{}})
+	createNonced(t, w, "cat", "old", map[string]any{"title": "Old", "parents": parents("root")})
+	createNonced(t, w, "cat", "sub", map[string]any{"title": "Sub", "parents": parents("old")})
+	createNonced(t, w, "files", "notes", map[string]any{"n": 1})
+	createNonced(t, w, "cat", "files.notes", map[string]any{"parents": parents("old")})
+	keys := map[string][]byte{}
+	addKeys := func() {
+		for _, ns := range all {
+			for _, e := range must(w.FetchKeys(ctx, ns, nil, nil)) {
+				keys[e.Kid] = e.Key
+			}
+		}
+	}
+	addKeys()
+	must(s.Engine.RotateEpoch(ctx, "cat", "system:rotate"))
+	must(s.Engine.RotateEpoch(ctx, "files", "system:rotate"))
+	addKeys()
+	createNonced(t, w, "cat", "new", map[string]any{"title": "New", "parents": parents("root")})
+
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"},
+		map[string]any{"nbf": s.Now().Add(-24 * time.Hour).Format(time.RFC3339)})), client.WithKeys(client.NewKeys(nil)))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat", "files")
+	x.stop()
+	// As an earlier release left it: no nodes.epoch, no epoch in items.file.
+	sq := must(sql.Open("sqlite", db))
+	for _, q := range []string{`ALTER TABLE nodes DROP COLUMN epoch`, `UPDATE items SET file = json_remove(file, '$.epoch') WHERE file IS NOT NULL`,
+		`DELETE FROM sealed_views`} {
+		if _, err := sq.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sq.Close()
+
+	x = startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat", "files")
+	full := k.Grant(t, s.Now(), "user:r", all, []string{"read"})
+	// Only epoch-1 values: sealed whole under cat#1, the file metadata
+	// inside under files#1.
+	waitFor(t, "the epochs to be read in", func() bool {
+		f := x.fetch("/cat/children?of=old", full)
+		h, err := seal.ParseHeader(string(f.body))
+		return err == nil && h.Kid == "cat#1"
+	})
+	keyOf := func(kid string) []byte { return keys[kid] }
+	f := x.fetch("/cat/children?of=old", full)
+	body := must(derived.OpenView(string(f.body), keyOf, derived.View{NS: "cat", Target: f.path}))
+	jwe, _ := fileOf(entriesOf(t, decode(t, body))["files.notes"])["sealed"].(string)
+	if jwe == "" || must(seal.ParseHeader(jwe)).Kid != "files#1" {
+		t.Errorf("file metadata of notes sealed %q, want kid files#1", jwe)
 	}
 }

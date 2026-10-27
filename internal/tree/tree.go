@@ -363,6 +363,12 @@ func (s *Service) init(ctx context.Context) error {
 			if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+tc[0]+` ADD COLUMN `+tc[1]+` TEXT`); err != nil {
 				return fmt.Errorf("tree: schema: %w", err)
 			}
+			if tc == [2]string{"nodes", "epoch"} {
+				// The epochs of its heads are read in (backfillEpochs).
+				if _, err := s.db.ExecContext(ctx, `INSERT INTO meta (k, v) VALUES ('epochs', 'pending') ON CONFLICT (k) DO NOTHING`); err != nil {
+					return fmt.Errorf("tree: schema: %w", err)
+				}
+			}
 		}
 	}
 	if err := s.sealed.Init(ctx); err != nil {
@@ -715,14 +721,18 @@ func (s *Service) Run(ctx context.Context) error {
 		}()
 	}
 	// Born and deleted explicit placements, one log or page per node of a
-	// database from before them, are read beside the followers, which
-	// don't wait for them.
+	// database from before them, and the epochs heads are served under,
+	// are read beside the followers, which don't wait for them.
 	s.fwg.Add(1)
 	go func() {
 		defer s.fwg.Done()
 		if err := s.backfillNodes(ctx); err != nil && ctx.Err() == nil {
 			s.opt.Logf("tree: nodes: %v; retrying", err)
 			s.retryBackfill(ctx, "nodes", s.backfillNodes)
+		}
+		if err := s.backfillEpochs(ctx); err != nil && ctx.Err() == nil {
+			s.opt.Logf("tree: epochs: %v; retrying", err)
+			s.retryBackfill(ctx, "epochs", s.backfillEpochs)
 		}
 	}()
 	s.ensureFollowers()

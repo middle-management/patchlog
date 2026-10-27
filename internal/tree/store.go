@@ -27,7 +27,9 @@ import (
 //	                                 born, the created of the first revision of the node's
 //	                                 document (§B.5), '' where it can't be known, NULL where
 //	                                 it isn't read yet (bornVal); epoch, the epoch head is
-//	                                 served under in a sealed or e2e catalog (§E.2.6)
+//	                                 served under in a sealed or e2e catalog (§E.2.6), which
+//	                                 meta "epochs" marks pending for rows from before it
+//	                                 (backfillEpochs, as for items.file's epoch)
 //	edges(child, pos, parent, ord, state)
 //	                                 one row per declared parents entry (hrefs), with its state
 //	items(ns, name, state, head, title, created, file)
@@ -78,7 +80,8 @@ var dropStmts = []string{
 // ones (init adds them where missing): item titles (§B.5), created times
 // and file metadata (§H.3, which backfillFiles fills in for a file tree),
 // born (§B.5, which backfillNodes fills in), and the epoch a node's
-// head is served under (§E.2.6), not known for rows written before it.
+// head is served under (§E.2.6), which backfillEpochs fills in for rows
+// written before it (meta "epochs").
 var addedColumns = [][2]string{
 	{"items", "title"}, {"items", "created"}, {"items", "file"}, {"nodes", "born"}, {"self_parents", "born"},
 	{"nodes", "epoch"},

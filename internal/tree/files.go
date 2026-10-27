@@ -13,6 +13,7 @@ import (
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/files"
 	"github.com/middle-management/patchlog/internal/follow"
+	"golang.org/x/sync/errgroup"
 )
 
 // File trees (Addendum H). A catalog whose catalog.files names the
@@ -46,7 +47,8 @@ type FileMeta struct {
 	// Epoch is the epoch the head is served under in a sealed namespace
 	// (derived.EpochOf), which a listing seals the metadata under
 	// (§E.2.6 values of another resource); 0 where not known, as for rows
-	// stored before it was kept, which take the epoch current then.
+	// stored before it was kept until backfillEpochs reads it in, which
+	// take the epoch current then.
 	Epoch int
 }
 
@@ -479,4 +481,186 @@ func (q *query) file(n *Node) any {
 		return nil
 	}
 	return map[string]any{"sealed": jwe}
+}
+
+// backfillEpochs fills in, for a database from before the epochs were
+// kept (meta "epochs", which init records as it adds nodes.epoch), the
+// epoch each head is served under (§E.2.6), read from the heads as an
+// apply reads them (bornReads at a time): that of each explicit node of
+// a sealed or e2e catalog (Node.Epoch), and that of each item's file
+// metadata in a sealed namespace (FileMeta.Epoch). Until then, and for a
+// head the service can't read for good (lastingKeyErr, gone or not
+// content), listings seal those values under the current epoch, as
+// earlier releases did; any other failure is returned, and the fill made
+// again (retryBackfill). Listings change at an unchanged combined
+// checkpoint, so the catalog's cached listings go, as backfillFiles does.
+func (s *Service) backfillEpochs(ctx context.Context) error {
+	var pending string
+	err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'epochs'`).Scan(&pending)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	cat := s.opt.Catalog
+	type want struct {
+		node, ns, name, head string // node for a catalog node; ns logical for an item
+		file                 *FileMeta
+	}
+	var wants []want
+	s.mu.RLock()
+	catNS := s.actual(cat)
+	_, catPurged := s.purged[cat]
+	for name, n := range s.g.explicit {
+		if n.Epoch == 0 && n.Head != "" {
+			wants = append(wants, want{node: name, ns: catNS, name: name, head: n.Head})
+		}
+	}
+	s.mu.RUnlock()
+	if len(wants) > 0 {
+		in, err := s.keys.Info(ctx, catNS)
+		switch {
+		case catPurged || err != nil && lastingKeyErr(err):
+			wants = nil
+		case err != nil:
+			return fmt.Errorf("tree: the encryption of %s: %w", catNS, err)
+		case !in.Protected():
+			wants = nil
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT ns, name, head, file FROM items WHERE file IS NOT NULL AND head IS NOT NULL`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var w want
+		var file string
+		if err := rows.Scan(&w.ns, &w.name, &w.head, &file); err != nil {
+			rows.Close()
+			return err
+		}
+		if w.file = decodeFile(file); w.file != nil && w.file.Epoch == 0 {
+			wants = append(wants, w)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	sealed := map[string]bool{} // items' namespaces, by logical name
+	for _, w := range wants {
+		if _, seen := sealed[w.ns]; w.file == nil || seen {
+			continue
+		}
+		in, err := s.keys.Info(ctx, s.actual(w.ns))
+		switch {
+		case err != nil && lastingKeyErr(err):
+		case err != nil:
+			return fmt.Errorf("tree: the encryption of %s: %w", s.actual(w.ns), err)
+		}
+		sealed[w.ns] = err == nil && in.Level == derived.LevelSealed
+	}
+	epochs := make([]int, len(wants)) // 0 where it stays unknown
+	eg, ectx := errgroup.WithContext(ctx)
+	eg.SetLimit(bornReads)
+	for i, w := range wants {
+		ns := w.ns
+		if w.file != nil {
+			if !sealed[w.ns] {
+				continue
+			}
+			ns = s.actual(w.ns)
+		}
+		eg.Go(func() error {
+			doc, err := s.keys.FetchDoc(ectx, ns, w.name, w.head, nil)
+			switch {
+			case err == nil:
+				epochs[i] = derived.EpochOf(ns, doc.Kid)
+			case lastingKeyErr(err) || errors.Is(err, follow.ErrNotLive) || errors.Is(err, derived.ErrSkip):
+				s.opt.Logf("tree: the epoch of %s/%s@%s stays unknown: %v", ns, w.name, w.head, err)
+			default:
+				return fmt.Errorf("tree: the epoch of %s/%s@%s: %w", ns, w.name, w.head, err)
+			}
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return err
+	}
+
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	g := s.g
+	changed := false
+	for i, w := range wants {
+		e := epochs[i]
+		if e <= 0 {
+			continue
+		}
+		if w.file == nil {
+			// A head changed since was read with its epoch.
+			if n := g.explicit[w.node]; n != nil && n.Head == w.head && n.Epoch == 0 {
+				n.Epoch, changed = e, true
+				if g.nodes[w.node] == n {
+					if _, err := tx.ExecContext(ctx, `UPDATE nodes SET epoch = ? WHERE name = ?`, e, w.node); err != nil {
+						return err
+					}
+				}
+			}
+			continue
+		}
+		m := *w.file
+		m.Epoch = e
+		res, err := tx.ExecContext(ctx, `UPDATE items SET file = ? WHERE ns = ? AND name = ? AND head = ?`, m.encode(), w.ns, w.name, w.head)
+		if err != nil {
+			return err
+		}
+		if k, _ := res.RowsAffected(); k == 0 {
+			continue
+		}
+		changed = true
+		node := w.ns + "." + w.name
+		for _, n := range []*Node{g.explicit[node], g.self[node]} {
+			if n != nil && n.ItemHead == w.head && n.ItemFile != nil {
+				f := *n.ItemFile
+				f.Epoch = e
+				n.ItemFile = &f
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k = 'epochs'`); err != nil {
+		return err
+	}
+	var tags []string
+	if changed {
+		tags = []string{"ns:" + catNS}
+		if err := s.sealed.Purge(ctx, tx, tags); err != nil {
+			return err
+		}
+		if err := s.repurge.Add(ctx, tx, tags); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		if rerr := s.reload(context.WithoutCancel(ctx)); rerr != nil {
+			s.opt.Logf("tree: reloading after a failed backfill: %v", rerr)
+		}
+		return err
+	}
+	if len(tags) > 0 {
+		s.kept.Purge(cat, tags)
+		s.opt.Purger.PurgeTags(tags)
+	}
+	return nil
 }
