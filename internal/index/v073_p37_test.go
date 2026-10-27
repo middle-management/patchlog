@@ -18,6 +18,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
 	"github.com/middle-management/patchlog/internal/svcedge"
@@ -473,4 +474,71 @@ func pageSchemaWith(props map[string]any) map[string]any {
 		p[k] = v
 	}
 	return map[string]any{"$schema": d2020, "type": "object", "properties": p}
+}
+
+// TestV073P37RotationWithoutKeys (wave-3 carry-over, §A.4, §E.2.4,
+// §E.2.6): a rotation that leaves the service out of the new epoch's
+// readers skips the namespace as a raise whose keys it lacks does: the
+// follower stops before applying it, and queries are 404 as of one the
+// service doesn't follow, rather than 503 behind until a key that never
+// comes.
+func TestV073P37RotationWithoutKeys(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	admin := clienttest.NewKey("admin")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "e"))).CreateNamespace(ctx, "e", map[string]any{"read": "public", "keys": []any{admin.Entry("*")},
+		"encryption": map[string]any{"level": "e2e"}}))
+	adminJWK, adminPriv, _ := seal.GenerateRecipient()
+	idxJWK, idxPriv, _ := seal.GenerateRecipient()
+	ac := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:admin", []string{"e"}, []string{"read", "create", "append", "config"}, map[string]any{"enc": adminJWK})))
+	ad := ac.E2E(adminPriv)
+	must(ad.InitKeyring(ctx, "e", idxPriv.PublicKey()))
+	must(ad.CreateDocSealed(ctx, "e", "a", map[string]any{"title": "zq a"}))
+	ic := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"e"}, []string{"read"}, map[string]any{"enc": idxJWK})),
+		client.WithKeyringSenders(adminPriv.PublicKey()))
+	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"e"}, untyped: true, now: s.Now}, func(o *indexOpts) { o.Recipient = idxPriv })
+	x.caughtUp("e")
+	before := x.ix.Checkpoint("e")
+	if r := x.raw("/e", ""); r.status != 302 {
+		t.Fatalf("before the rotation: %d %v", r.status, r.body)
+	}
+	// The indexer is no reader of epoch 2.
+	must(ad.RotateEpoch(ctx, "e"))
+	waitFor(t, "the namespace to be skipped", func() bool { return x.raw("/e", "").status == 404 })
+	if cp := x.ix.Checkpoint("e"); cp != before {
+		t.Errorf("checkpoint moved to %s past the rotation it can't read", cp)
+	}
+}
+
+// TestV073P37BranchWithoutKeys (wave-3 carry-over, §A.4, §E.2.6): a
+// namespace followed with a root's follower (a branch, with -branches)
+// is re-checked on its config changes too: once one leaves the service
+// without its keys, its batches aren't applied, and so its checkpoint
+// doesn't move past what it can't read or seal, though it has no
+// follower of its own to stop.
+func TestV073P37BranchWithoutKeys(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	c := s.Client(t, client.WithAuthor("admin"))
+	must(c.CreateNamespace(ctx, "matches", map[string]any{"read": "public"}))
+	must(c.CreateNamespace(ctx, "e", map[string]any{"read": "public", "encryption": map[string]any{"level": "e2e"}}))
+	x := startSvc(t, c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, untyped: true, noRun: true})
+	origin := must(c.Origin(ctx))
+	h := must(c.NSHead(ctx, "e"))
+	entries := must(c.NSLog(ctx, "e", h.ID, ""))
+	doc := must(c.NSDoc(ctx, "e", h.ID))
+	b := &follow.Batch{Origin: origin, NS: "e", Units: []follow.Unit{{Entry: entries[0], Config: doc}}, NewCheckpoint: h.ID}
+	// The index has no keyring recipient key: e2e is unreadable to it.
+	if err := x.ix.Apply(ctx, b); err != nil {
+		t.Fatalf("a branch's batch the service can't read: %v", err)
+	}
+	if cp := x.ix.Checkpoint("e"); cp != "" {
+		t.Fatalf("checkpoint %s past a config change the service lacks keys for", cp)
+	}
+	b2 := &follow.Batch{Origin: origin, NS: "e", Units: []follow.Unit{{Entry: entries[0]}}, NewCheckpoint: h.ID}
+	if err := x.ix.Apply(ctx, b2); err != nil || x.ix.Checkpoint("e") != "" {
+		t.Errorf("a later batch of it: %v, checkpoint %q", err, x.ix.Checkpoint("e"))
+	}
 }

@@ -672,16 +672,31 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 			config = true
 		}
 	}
-	if config && ix.followsRoot(b.NS) {
+	root := ix.followsRoot(b.NS)
+	if _, lacks := ix.keys.Skip(b.NS); lacks && !root {
+		// A branch followed with its base whose keys the service lacks
+		// since a config change of it (below): not consumed, its queries
+		// 404. Its batches aren't applied: once the keys come, a restart
+		// resumes at the first.
+		return nil
+	}
+	if config {
 		// A raise (to e2e from none or at-rest, Addendum E Levels) or an
-		// epoch whose keys the service lacks as configured: skipped as
-		// when its follower starts (queries are 404, §A.4, §E.2.6), and
-		// not followed, so nothing is consumed that can't be read or
-		// sealed. The batch isn't applied: once the keys come, a restart
-		// resumes at it.
-		if reason, lacks := ix.keys.Recheck(ctx, b.NS, false); lacks && ix.stopRun(b.NS) {
+		// epoch (a rotation, §E.2.4) whose keys the service lacks as
+		// configured: skipped as when its follower starts (queries are
+		// 404, §A.4, §E.2.6), and not followed, so nothing is consumed
+		// that can't be read or sealed. The batch isn't applied: once the
+		// keys come, a restart resumes at it. A branch followed with its
+		// base (-branches) has no follower of its own to stop: its batches
+		// are left unapplied from here on (above).
+		reason, lacks := ix.keys.Recheck(ctx, b.NS, false)
+		switch {
+		case lacks && root && ix.stopRun(b.NS):
 			ix.opt.Logf("index: skipping %s: %s", b.NS, reason)
 			return fmt.Errorf("index: %s skipped: %s", b.NS, reason)
+		case lacks && !root:
+			ix.opt.Logf("index: skipping branch %s: %s", b.NS, reason)
+			return nil
 		}
 	}
 	// Fetch FetchConcurrency documents at a time (one GET each), counting

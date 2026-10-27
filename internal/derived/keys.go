@@ -76,8 +76,8 @@ type Keys struct {
 	epoch   map[string][]byte // kid → K_e
 	reasons map[string]string // ns → why it is skipped or partly read
 	skipped map[string]bool
-	lacks   map[string]bool   // ns → skipped for want of keys, not for now (Check)
-	checked map[string]string // ns → the level its last Check judged (Recheck)
+	lacks   map[string]bool // ns → skipped for want of keys, not for now (Check)
+	checked map[string]Info // ns → the level and epoch its last Check judged (Recheck)
 }
 
 // NewKeys returns a tracker reading with c. recipient is the service's
@@ -86,7 +86,7 @@ type Keys struct {
 // key). It may be nil.
 func NewKeys(c *client.Client, recipient *ecdh.PrivateKey) *Keys {
 	k := &Keys{c: c, info: map[string]Info{}, epoch: map[string][]byte{}, reasons: map[string]string{}, skipped: map[string]bool{}, lacks: map[string]bool{},
-		checked: map[string]string{}}
+		checked: map[string]Info{}}
 	if recipient != nil {
 		k.e2e = c.E2E(recipient).WithoutValidation()
 	}
@@ -304,7 +304,7 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 	in, err := k.Info(ctx, ns)
 	if err == nil {
 		k.mu.Lock()
-		k.checked[ns] = in.Level
+		k.checked[ns] = in
 		k.mu.Unlock()
 	}
 	switch {
@@ -339,21 +339,22 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 }
 
 // Recheck is Check for a namespace being followed, after its follower
-// delivered a config change (Observe) that changed its level since it was
-// last checked: a raise (to sealed, or to e2e from none or at-rest,
-// Addendum E Levels) whose keys the service lacks as configured skips it
-// as Check does when the follower starts, so its queries answer 404 as
-// after a restart (§A.4, §E.2.6), and lacks tells the caller to stop
-// following it. A failure asking again may mend leaves it consumed: its
-// queries answer 503 behind until the key is had, as before the change.
-// A config change that keeps the level (an epoch rotation included) is
-// left to the queries, which fetch the keys they need.
+// delivered a config change (Observe) that changed its level or its epoch
+// since it was last checked: a raise (to sealed, or to e2e from none or
+// at-rest, Addendum E Levels), or a rotation (§E.2.4: at E3, one that
+// leaves the service out of the new epoch's readers), whose keys the
+// service lacks as configured skips it as Check does when the follower
+// starts, so its queries answer 404 as after a restart (§A.4, §E.2.6),
+// and lacks tells the caller to stop following it. A failure asking again
+// may mend leaves it consumed: its queries answer 503 behind until the
+// key is had, as before the change. A config change that keeps the level
+// and the epoch needs no keys of its own.
 func (k *Keys) Recheck(ctx context.Context, ns string, allowPartial bool) (reason string, lacks bool) {
 	k.mu.Lock()
 	in, known := k.info[ns]
 	was, checked := k.checked[ns]
 	k.mu.Unlock()
-	if known && checked && in.Level == was {
+	if known && checked && in.Level == was.Level && (!in.Protected() || in.Epoch == was.Epoch) {
 		return "", false
 	}
 	reason, _, retry := k.Check(ctx, ns, allowPartial)
