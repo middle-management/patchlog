@@ -1067,17 +1067,12 @@ func (s *Service) dropWholeViews(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'config'`).Scan(&doc); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	p := "/" + s.opt.Catalog + "/g/" + AllSubjects + "/"
-	where, args := `json = 0 AND substr(view, 1, ?) <> ?`, []any{len(p), p}
-	if m, _ := parseJSON(doc).(map[string]any); m == nil || m["read"] == "public" {
-		where, args = `json = 0`, nil
-	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM sealed_view_tags WHERE view IN
-		(SELECT view FROM sealed_views WHERE `+where+`)`, args...); err != nil {
-		return err
-	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM sealed_views WHERE `+where, args...)
-	return err
+	m, _ := parseJSON(doc).(map[string]any)
+	public := m == nil || m["read"] == "public"
+	all := "/" + s.opt.Catalog + "/g/" + AllSubjects + "/"
+	return s.sealed.Drop(ctx, func(view, _ string, json bool) bool {
+		return !json && (public || !strings.HasPrefix(view, all))
+	})
 }
 
 // listingKey is what a listing at url is stored and kept under for reader

@@ -52,6 +52,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -364,7 +365,7 @@ func (ix *Index) initSchema(ctx context.Context) error {
 	if err := ix.sealed.Init(ctx); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
-	if err := dropWholePublic(ctx, ix.db); err != nil {
+	if err := ix.dropWholePublic(ctx); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
 	if err := repurge.Init(ctx, ix.db); err != nil {
@@ -396,11 +397,8 @@ func (ix *Index) initSchema(ctx context.Context) error {
 	return nil
 }
 
-// wholePublic selects the stored results sealed whole (json = 0) at a
-// public URL, /{ns}/at/…, where the view's scope is its namespace (answer).
-const wholePublic = `SELECT view FROM sealed_views WHERE json = 0 AND substr(view, 1, length(scope) + 5) = '/' || scope || '/at/'`
-
-// dropWholePublic drops stored results sealed whole at a public URL. Before
+// dropWholePublic drops stored results sealed whole at a public URL,
+// /{ns}/at/…, where the view's scope is its namespace (answer). Before
 // v0.73 a public sealed or e2e namespace's results were stored as one JWE
 // under K_e at the URLs they are sealed per entry at now, with counts
 // (ENC-33, §E.2.6: whole-response sealing only for a source that isn't
@@ -410,19 +408,10 @@ const wholePublic = `SELECT view FROM sealed_views WHERE json = 0 AND substr(vie
 // older format is rebuilt anyway (indexFormat); this covers one written
 // since. No URL of the shapes of v0.73 matches: a public URL's results are
 // JSON, and a whole JWE's URL has /g/{gs}.
-func dropWholePublic(ctx context.Context, db *sql.DB) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM sealed_view_tags WHERE view IN (`+wholePublic+`)`); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM sealed_views WHERE view IN (`+wholePublic+`)`); err != nil {
-		return err
-	}
-	return tx.Commit()
+func (ix *Index) dropWholePublic(ctx context.Context) error {
+	return ix.sealed.Drop(ctx, func(view, scope string, json bool) bool {
+		return !json && strings.HasPrefix(view, "/"+scope+"/at/")
+	})
 }
 
 func (ix *Index) loadState(ctx context.Context) error {
