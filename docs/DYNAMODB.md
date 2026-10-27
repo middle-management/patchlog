@@ -583,8 +583,7 @@ What landed, beyond the spike:
   anything else; everything the server can reach so answers 501 rather
   than falling through to SQL:
   remote branches, sealed/e2e, rotation. Refused
-  configurations (`encryption`, `nonce: required`, `base`,
-  `successor`) are 501 at create and change time, as
+  configurations (`encryption`, `base`, `successor`) are 501 at create and change time, as
   §10 prescribes ("refuse at Open or at namespace-config time").
 - **One read path.** The serving reads (`ResourceHead/Raw/Rev/Log`,
   `NamespaceHead/Rev/Log/Heads`, the events and the long-poll) are the
@@ -709,6 +708,13 @@ What landed, beyond the spike:
   each step's on its REV item (`signature`), which serving, archives
   and the write's own answer return. `"signatures": "required"`
   namespaces are created and changed as on SQL.
+- **Nonce-required namespaces** (§C.7). The checks are the gate's
+  (`checkRequiredNonces`, `checkNonceBase`, `checkNonceDependents`). What
+  SQL's locks order — a base starting to require nonces while a branch
+  stops — a config change's commit pins instead: every other
+  namespace's configuration its check read (`configPins`: a base its
+  branches', a branch its base's, the schema namespaces'), so the second
+  of two such changes is stale and checked again.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the
@@ -755,14 +761,13 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,319 top-level tests (pure unit tests included): 1,098 pass on
-DynamoDB and 221 skip — 185 as unsupported (116 encryption at rest,
-39 remote branches, 22 nonce-required namespaces, 6 the SQL write
-path's hooks, 2 sealed), 36 on their own conditions (Postgres-only
-tests).
+1,319 top-level tests (pure unit tests included): 1,118 pass on
+DynamoDB and 201 skip — 165 as unsupported (116 encryption at rest,
+41 remote branches, 6 the SQL write path's hooks, 2 sealed), 36 on
+their own conditions (Postgres-only tests).
 The known list is empty: no test answers differently from the SQL
 backends. A test that skips partway has asserted everything before
-its skip, so the phase-1 surface is covered beyond the 1,098.
+its skip, so the phase-1 surface is covered beyond the 1,118.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on

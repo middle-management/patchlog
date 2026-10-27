@@ -8,14 +8,13 @@ package core
 // core's own code on the gate.
 //
 // Deliberate gaps, all surfaced as 501 "unsupported" (lacks, or a read
-// that panics with it): remote branches, sealed and e2e
-// namespaces, nonce-required namespaces, intermediate snapshots (revisions fold from the genesis, or from a
+// that panics with it): remote branches, sealed and e2e namespaces,
+// intermediate snapshots (revisions fold from the genesis, or from a
 // pruning horizon). Grants, edge grants, blobs, $schema validation and
 // schemaReads, purges, pruning, retention and archives, gestures listing,
-// author signatures,
-// local branches and their drafts and merges, tombstones and
-// restores, multi-step items and batches (§7.5, bounded by the
-// transaction's 100 actions) work.
+// author signatures, nonce-required namespaces, local branches and their
+// drafts and merges, tombstones and restores, multi-step items and
+// batches (§7.5, bounded by the transaction's 100 actions) work.
 
 import (
 	"context"
@@ -192,8 +191,6 @@ func ddbRefusals(cfg *Config) *Error {
 	switch {
 	case cfg.Encryption != "":
 		return ddbUnsupported("encrypted namespaces")
-	case cfg.NonceRequired:
-		return ddbUnsupported("nonce-required namespaces")
 	case cfg.Base != nil && cfg.Base.Origin != "":
 		return ddbUnsupported("remote branches")
 	}

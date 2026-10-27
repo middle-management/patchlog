@@ -314,6 +314,33 @@ func (r *ddbReads) schemaNS(name string) *nsRow {
 	return n
 }
 
+// configPins are what a config change's commit pins: the schema
+// namespaces' configurations and every other namespace's the check read
+// — a base its branches' and a branch its base's, whose nonce
+// requirements (§C.7) and the like it was checked against, as SQL's locks
+// order the two changes. A purged one is left out: nothing changes it.
+func (r *ddbReads) configPins(own string) []ddb.NSPin {
+	out := r.schemaPins(own)
+	seen := map[string]bool{own: true}
+	for _, p := range out {
+		seen[p.NS] = true
+	}
+	hs := make([]int64, 0, len(r.nss))
+	for h := range r.nss {
+		hs = append(hs, h)
+	}
+	sort.Slice(hs, func(i, j int) bool { return r.nss[hs[i]].name < r.nss[hs[j]].name })
+	for _, h := range hs {
+		n := r.nss[h]
+		if seen[n.name] || n.row == nil || n.row.Purged {
+			continue
+		}
+		seen[n.name] = true
+		out = append(out, ddb.NSPin{NS: n.name, CfgPos: n.row.ConfigPos, CfgID: n.row.ConfigID})
+	}
+	return out
+}
+
 // schemaPins are the configurations of the schema namespaces read, but
 // own's (which the commit pins anyway).
 func (r *ddbReads) schemaPins(own string) []ddb.NSPin {

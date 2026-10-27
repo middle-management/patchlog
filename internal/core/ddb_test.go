@@ -129,8 +129,8 @@ func TestDDBUnsupported(t *testing.T) {
 			t.Fatalf("%s: want 501, got %d", what, ae.Status)
 		}
 	}
-	_, err := e.WriteConfig(ctx, Request{NS: "nr"}, ConfigChange{IfNoneMatch: true, Patches: patches(t, `[{"op":"add","path":"","value":{"nonce":"required"}}]`)})
-	check("nonce-required namespaces", err)
+	_, err := e.RemoteNotices(ctx, "demo")
+	check("remote branches", err)
 
 	// Encrypted namespaces are refused at creation: Open refuses a key
 	// store, so as on SQL without one, 422.

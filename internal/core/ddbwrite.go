@@ -117,6 +117,7 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 	}
 	var entries []any
 	if cp := p.cplan; cp != nil {
+		c.Pins = r.configPins(ns)
 		c.Config = &ddb.CommitConfig{ID: cp.id.String(), Patches: string(cp.canon), Doc: string(jsonv.Canonical(cp.doc)), Frozen: cp.cfg.Frozen}
 		entries = append(entries, map[string]any{"kind": "config", "target": cp.id.String()})
 	}
@@ -294,6 +295,7 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 			Config: &ddb.CommitConfig{ID: p.id.String(), Patches: string(p.canon), Doc: string(jsonv.Canonical(p.doc)), Frozen: p.cfg.Frozen},
 			Entry:  map[string]any{"kind": "config", "target": p.id.String()}, Kind: "config",
 			Gesture: cc.Gesture, Undoes: cc.Undoes,
+			Pins: r.configPins(req.NS),
 		}
 		var tags []string
 		if out.cur.cachePublic() && !p.cfg.cachePublic() {
