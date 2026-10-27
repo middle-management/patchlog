@@ -1,0 +1,40 @@
+{
+  "section": "§7.3, §E.2.2",
+  "about": "a resource stream's purge and prune events for derby from a namespace log page: the entry without id and prev; sealed under K_r of the current epoch (K_e = 00 01 … 1f, ns demo, epoch 3) with pl {ns, name, kind} and the IV seq(0xc0)[:12], and no SSE id",
+  "namespace page": "[{\"created\":\"2026-10-04T12:00:00Z\",\"id\":\"1vmctae4vewju6nvxi374rkrkmyzpdrif\",\"kind\":\"head\",\"prev\":\"\",\"resource\":\"derby\",\"target\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\"},{\"created\":\"2026-10-04T12:05:00Z\",\"id\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\",\"kind\":\"prune\",\"prev\":\"1vmctae4vewju6nvxi374rkrkmyzpdrif\",\"resource\":\"derby\",\"target\":\"1sywh54kpo3c4ezn2znktvl3avge4zl5d\"},{\"created\":\"2026-10-04T12:06:00Z\",\"id\":\"1vwnfnoyshruyx4lul4a25rtctooiph5v\",\"kind\":\"purge\",\"prev\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\",\"resource\":\"cup\",\"target\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\"},{\"created\":\"2026-10-04T12:07:00Z\",\"id\":\"17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm\",\"kind\":\"purge\",\"prev\":\"1vwnfnoyshruyx4lul4a25rtctooiph5v\",\"resource\":\"derby\",\"target\":\"1idx6u2b3z42obqmwsgmlzvrfuutks2bq\"}]",
+  "K_r": "37a2b615272e7bdec36b97f35176a206caa2dbbef43d89b81aa5a4ee874a5c25",
+  "vectors": [
+    {
+      "name": "prune event",
+      "fn": "core resourceEvents; seal.ResourceKey, seal.ResourceEventPL, seal.SealWithIV",
+      "data": "{\"created\":\"2026-10-04T12:05:00Z\",\"kind\":\"prune\",\"resource\":\"derby\",\"target\":\"1sywh54kpo3c4ezn2znktvl3avge4zl5d\"}",
+      "padded_length": 113,
+      "protected": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"kind\":\"prune\",\"name\":\"derby\",\"ns\":\"demo\"}}",
+      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsia2luZCI6InBydW5lIiwibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.k529S8NhMcOmU_kiseOSs3_rCTf1sVDPlFx1F4LMcP858xSJxzgouWJFuleOFNndXiQ1ZL0lj6KW4SNzeV_5DSvBaD-ZOo7odR1jlXth2iN5DFCJaeIV06xCwfCupMAdn9wyNa0_APlikHIHYxEYVDQ.XB3QcSAFdjEWWZc79n5K5g"
+    },
+    {
+      "name": "prune event, padded",
+      "fn": "core resourceEvents; seal.ResourceKey, seal.ResourceEventPL, seal.SealWithIV",
+      "data": "{\"created\":\"2026-10-04T12:05:00Z\",\"kind\":\"prune\",\"resource\":\"derby\",\"target\":\"1sywh54kpo3c4ezn2znktvl3avge4zl5d\"}",
+      "padded_length": 256,
+      "protected": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"kind\":\"prune\",\"name\":\"derby\",\"ns\":\"demo\"}}",
+      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsia2luZCI6InBydW5lIiwibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.k529S8NhMcOmU_kiseOSs3_rCTf1sVDPlFx1F4LMcP858xSJxzgouWJFuleOFNndXiQ1ZL0lj6KW4SNzeV_5DSvBaD-ZOo7odR1jlXth2iN5DFCJaeIV06xCwfCupMAdn9wyNa0_APlikHIHYxEYVDRZ6yX-INgQecBm0ldvSv8kannNkFdak9GHNvcNMDm5EX_jsGtrrYe0hpiw5GSCo5FgS2dxkadOi6FiXLt5N9vFEd2uBixRJknmD1MpLDvrwUD5jQR9H8xRH19q9Ju5-1uxeY_iqSs-5tk_3gHfoHayFJXBjyYai2gxmBGHYkq-WotGcek2eL3YYO0eweuUwA.ZtvK9hRUadMoyjxUPs6l_Q"
+    },
+    {
+      "name": "purge event",
+      "fn": "core resourceEvents; seal.ResourceKey, seal.ResourceEventPL, seal.SealWithIV",
+      "data": "{\"created\":\"2026-10-04T12:07:00Z\",\"kind\":\"purge\",\"resource\":\"derby\",\"target\":\"1idx6u2b3z42obqmwsgmlzvrfuutks2bq\"}",
+      "padded_length": 113,
+      "protected": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"kind\":\"purge\",\"name\":\"derby\",\"ns\":\"demo\"}}",
+      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsia2luZCI6InB1cmdlIiwibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.k529S8NhMcOmU_kiseOSs3_rCTf1sVDPlFx1FYLMcP858xSJxzgouWJFulCJHdndXiQ1ZL0lj6KW4SNzeV_5DSvBaD-ZOo7odR1jlXth2jlkAw7Jb-tWxqsTmvelp4UUltoqObd-B_pwgS0OPUYNVDQ.V-UikC3Idzx834AYJSKvBw"
+    },
+    {
+      "name": "purge event, padded",
+      "fn": "core resourceEvents; seal.ResourceKey, seal.ResourceEventPL, seal.SealWithIV",
+      "data": "{\"created\":\"2026-10-04T12:07:00Z\",\"kind\":\"purge\",\"resource\":\"derby\",\"target\":\"1idx6u2b3z42obqmwsgmlzvrfuutks2bq\"}",
+      "padded_length": 256,
+      "protected": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"kind\":\"purge\",\"name\":\"derby\",\"ns\":\"demo\"}}",
+      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsia2luZCI6InB1cmdlIiwibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.k529S8NhMcOmU_kiseOSs3_rCTf1sVDPlFx1FYLMcP858xSJxzgouWJFulCJHdndXiQ1ZL0lj6KW4SNzeV_5DSvBaD-ZOo7odR1jlXth2jlkAw7Jb-tWxqsTmvelp4UUltoqObd-B_pwgS0OPUYNVDRZ6yX-INgQecBm0ldvSv8kannNkFdak9GHNvcNMDm5EX_jsGtrrYe0hpiw5GSCo5FgS2dxkadOi6FiXLt5N9vFEd2uBixRJknmD1MpLDvrwUD5jQR9H8xRH19q9Ju5-1uxeY_iqSs-5tk_3gHfoHayFJXBjyYai2gxmBGHYkq-WotGcek2eL3YYO0eweuUwA.PATvcO9PpGNDgfVP_L-AKA"
+    }
+  ]
+}

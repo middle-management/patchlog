@@ -1,0 +1,14 @@
+{
+  "section": "§7.4",
+  "about": "/principal's key: the RFC 7638 SHA-256 thumbprint of the root block's verifying key",
+  "vectors": [
+    {
+      "name": "Ed25519 key, seed seq(0xa0)",
+      "fn": "server: GET /ns/{ns}/principal (core keyThumbprint)",
+      "seed": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "pub": "T9CZzNR9eJPf6ewkQU7LDZtUICMqrTDZHEZb4zy-ZcQ",
+      "jwk": "{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"T9CZzNR9eJPf6ewkQU7LDZtUICMqrTDZHEZb4zy-ZcQ\"}",
+      "key": "7c_8cf3VPZjtkqQSzpjXvbhEeMBVVWow5j-JOgj_uu8"
+    }
+  ]
+}

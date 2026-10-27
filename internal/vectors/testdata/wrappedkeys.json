@@ -1,0 +1,73 @@
+{
+  "section": "§E.2.3",
+  "about": "/keys entries {kid, name?, from?, wrapped}: name for a K_r, from for a keyring entry relayed at E3; keys and wraps as in keywrap.json",
+  "vectors": [
+    {
+      "name": "K_e (E2, base mode)",
+      "fn": "seal.WrappedKey.MarshalJSON (read by seal.ParseWrappedKey, opened by seal.UnwrapRelayed)",
+      "entry": "{\"kid\":\"demo#3\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8TOG6Eqnf60K-C4qBKtzgEMxSquvACiNWnsZ0uUaKGGZSHr_LEs5_dMI__ITj85RE\"}",
+      "verdict": "accept",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "name": "K_r (E2, a grant that fixes /resource)",
+      "fn": "seal.WrappedKey.MarshalJSON (read by seal.ParseWrappedKey, opened by seal.UnwrapRelayed)",
+      "entry": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9E34sggfDNByASWelYWdNVtOtU-xJ7Y7qlAIQVA1FWwObtvcHOHj5_K40aEr7zYEQ\"}",
+      "verdict": "accept",
+      "key": "37a2b615272e7bdec36b97f35176a206caa2dbbef43d89b81aa5a4ee874a5c25"
+    },
+    {
+      "name": "keyring entry relayed (E3, auth mode)",
+      "fn": "seal.WrappedKey.MarshalJSON (read by seal.ParseWrappedKey, opened by seal.UnwrapRelayed)",
+      "entry": "{\"from\":\"YKbZ9qRn_duml9RTz_7p5FNztMst4VCEVI2fzJCu4TE\",\"kid\":\"demo#3\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9DzsHWHD4BAeG1yf9dh_-_O4jDSNiG7lbUrFlrPYlqXp0vXtHCFalPTJrAuaY9hUw\"}",
+      "verdict": "accept",
+      "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "name": "before v0.63: resource and suite",
+      "fn": "seal.ParseWrappedKey",
+      "entry": "{\"kid\":\"demo#3\",\"resource\":\"derby\",\"suite\":\"hpke-base-0x0020-0x0001-0x0002\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9E34sggfDNByASWelYWdNVtOtU-xJ7Y7qlAIQVA1FWwObtvcHOHj5_K40aEr7zYEQ\"}",
+      "verdict": "accept",
+      "read as": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9E34sggfDNByASWelYWdNVtOtU-xJ7Y7qlAIQVA1FWwObtvcHOHj5_K40aEr7zYEQ\"}",
+      "key": "37a2b615272e7bdec36b97f35176a206caa2dbbef43d89b81aa5a4ee874a5c25"
+    },
+    {
+      "name": "name and resource agreeing",
+      "fn": "seal.ParseWrappedKey",
+      "entry": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"resource\":\"derby\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9E34sggfDNByASWelYWdNVtOtU-xJ7Y7qlAIQVA1FWwObtvcHOHj5_K40aEr7zYEQ\"}",
+      "verdict": "accept",
+      "read as": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9E34sggfDNByASWelYWdNVtOtU-xJ7Y7qlAIQVA1FWwObtvcHOHj5_K40aEr7zYEQ\"}",
+      "key": "37a2b615272e7bdec36b97f35176a206caa2dbbef43d89b81aa5a4ee874a5c25"
+    },
+    {
+      "name": "name and resource differing",
+      "fn": "seal.ParseWrappedKey",
+      "entry": "{\"kid\":\"demo#3\",\"name\":\"derby\",\"resource\":\"cup\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS9E34sggfDNByASWelYWdNVtOtU-xJ7Y7qlAIQVA1FWwObtvcHOHj5_K40aEr7zYEQ\"}",
+      "verdict": "reject"
+    },
+    {
+      "name": "another suite",
+      "fn": "seal.ParseWrappedKey",
+      "entry": "{\"kid\":\"demo#3\",\"suite\":\"hpke-base-0x0020-0x0001-0x0001\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8TOG6Eqnf60K-C4qBKtzgEMxSquvACiNWnsZ0uUaKGGZSHr_LEs5_dMI__ITj85RE\"}",
+      "verdict": "reject"
+    },
+    {
+      "name": "from not a thumbprint",
+      "fn": "seal.ParseWrappedKey",
+      "entry": "{\"from\":\"admin\",\"kid\":\"demo#3\",\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8TOG6Eqnf60K-C4qBKtzgEMxSquvACiNWnsZ0uUaKGGZSHr_LEs5_dMI__ITj85RE\"}",
+      "verdict": "reject"
+    },
+    {
+      "name": "no wrapped",
+      "fn": "seal.ParseWrappedKey",
+      "entry": "{\"kid\":\"demo#3\"}",
+      "verdict": "reject"
+    },
+    {
+      "name": "no kid",
+      "fn": "seal.ParseWrappedKey",
+      "entry": "{\"wrapped\":\"Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8TOG6Eqnf60K-C4qBKtzgEMxSquvACiNWnsZ0uUaKGGZSHr_LEs5_dMI__ITj85RE\"}",
+      "verdict": "reject"
+    }
+  ]
+}

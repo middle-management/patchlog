@@ -1,0 +1,189 @@
+{
+  "section": "§C.8, §C.4",
+  "about": "grants as Biscuit v3 tokens (URL-safe base64): one fact grant_block(<canonical JSON>) per block, Ed25519 throughout, signature payload version 1. Root key: the Ed25519 key with seed 00 01 … 1f; block i's next key has seed n, n+1, … n+31 with n = 0x40 + 0x20·i. Each refused token is the valid one with one rule broken, signed as a writer would, so only that rule fails",
+  "root public key": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+  "vectors": [
+    {
+      "name": "valid: root block and one narrowing block",
+      "rule": "§C.8",
+      "token": "EpcCCqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAWgaUHLoFLrXYHs2MaIetUEXWGK0SK3h0v5xBRUsBNE2qQ14tB8LGmoIYtimpZPta1sYSQLSXob_gozBFMAKwBCgBGp8BCjMKI3siY2FuIjpbInJlYWQiXSwidmlhIjoic3ZjOnJlYWRlciJ9GAMiCgoICIAIEgMYgggSJAgAEiAXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk_1RpA8F--Z-0pJdeRlyhAqVvLMmB_GniPzob9JmjQ7YO0D3Q2C3CKHXITLKHBjp3DfkQNccX2F8XKmGJl-6o7fmuICSgBIiIKIGBhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5_",
+      "fn": "grant.DecodeLimited, grant.Grant.SignedBy, RevocationIDs, ID, Stored",
+      "verdict": "accept",
+      "blocks": [
+        "{\"can\":[\"read\",\"append\"],\"exp\":\"2026-10-05T00:00:00Z\",\"groups\":[\"match-desk\"],\"kid\":\"ops-2026\",\"ns\":[\"matches\"],\"rules\":[],\"sub\":\"user:bob\"}",
+        "{\"can\":[\"read\"],\"via\":\"svc:reader\"}"
+      ],
+      "signatures": [
+        "5a06941cba052eb5d81ecd8c6887ad5045d618ad122b7874bf9c41454b01344daa435e2d07c2c69a8218b629a964fb5ad6c61240b497a1bfe0a330453002b004",
+        "f05fbe67ed2925d791972840a95bcb32607f1a788fce86fd2668d0ed83b40f74360b708a1d72132ca1c18e9dc37e440d71c5f617c5ca986265fbaa3b7e6b8809"
+      ],
+      "grant id": "15swdvi5nbnlkv76v7y6k77h52atov6ru",
+      "revocation ids": [
+        "15swdvi5nbnlkv76v7y6k77h52atov6ru",
+        "1chpmwycvsbh7sqmzckzhe7hk6obtra72"
+      ],
+      "stored": "0aaa010a0b6772616e745f626c6f636b0a8c017b2263616e223a5b2272656164222c22617070656e64225d2c22657870223a22323032362d31302d30355430303a30303a30305a222c2267726f757073223a5b226d617463682d6465736b225d2c226b6964223a226f70732d32303236222c226e73223a5b226d617463686573225d2c2272756c6573223a5b5d2c22737562223a22757365723a626f62227d1803220a0a0808800812031881081224080012202543b92ff1095511476adc8369db6ddc933665a11978dda1404ee1066ca9559d1a405a06941cba052eb5d81ecd8c6887ad5045d618ad122b7874bf9c41454b01344daa435e2d07c2c69a8218b629a964fb5ad6c61240b497a1bfe0a330453002b0042801"
+    },
+    {
+      "name": "valid: the same token sealed",
+      "rule": "§C.8 Sealed tokens",
+      "token": "EpcCCqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAWgaUHLoFLrXYHs2MaIetUEXWGK0SK3h0v5xBRUsBNE2qQ14tB8LGmoIYtimpZPta1sYSQLSXob_gozBFMAKwBCgBGp8BCjMKI3siY2FuIjpbInJlYWQiXSwidmlhIjoic3ZjOnJlYWRlciJ9GAMiCgoICIAIEgMYgggSJAgAEiAXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk_1RpA8F--Z-0pJdeRlyhAqVvLMmB_GniPzob9JmjQ7YO0D3Q2C3CKHXITLKHBjp3DfkQNccX2F8XKmGJl-6o7fmuICSgBIkISQGjdz9cXlQ79tWF4p6pV-zkdNNokCBrpbdaxCCepCjUCVfx1Rz9v6k40pDs5BmP5eHxqYpPq_mzvBvSW4Cs0BQ0=",
+      "fn": "grant.DecodeLimited, grant.Grant.SignedBy, RevocationIDs, ID, Stored",
+      "verdict": "accept",
+      "blocks": [
+        "{\"can\":[\"read\",\"append\"],\"exp\":\"2026-10-05T00:00:00Z\",\"groups\":[\"match-desk\"],\"kid\":\"ops-2026\",\"ns\":[\"matches\"],\"rules\":[],\"sub\":\"user:bob\"}",
+        "{\"can\":[\"read\"],\"via\":\"svc:reader\"}"
+      ],
+      "signatures": [
+        "5a06941cba052eb5d81ecd8c6887ad5045d618ad122b7874bf9c41454b01344daa435e2d07c2c69a8218b629a964fb5ad6c61240b497a1bfe0a330453002b004",
+        "f05fbe67ed2925d791972840a95bcb32607f1a788fce86fd2668d0ed83b40f74360b708a1d72132ca1c18e9dc37e440d71c5f617c5ca986265fbaa3b7e6b8809"
+      ],
+      "grant id": "15swdvi5nbnlkv76v7y6k77h52atov6ru",
+      "revocation ids": [
+        "15swdvi5nbnlkv76v7y6k77h52atov6ru",
+        "1chpmwycvsbh7sqmzckzhe7hk6obtra72"
+      ],
+      "stored": "0aaa010a0b6772616e745f626c6f636b0a8c017b2263616e223a5b2272656164222c22617070656e64225d2c22657870223a22323032362d31302d30355430303a30303a30305a222c2267726f757073223a5b226d617463682d6465736b225d2c226b6964223a226f70732d32303236222c226e73223a5b226d617463686573225d2c2272756c6573223a5b5d2c22737562223a22757365723a626f62227d1803220a0a0808800812031881081224080012202543b92ff1095511476adc8369db6ddc933665a11978dda1404ee1066ca9559d1a405a06941cba052eb5d81ecd8c6887ad5045d618ad122b7874bf9c41454b01344daa435e2d07c2c69a8218b629a964fb5ad6c61240b497a1bfe0a330453002b0042801"
+    },
+    {
+      "name": "a second fact",
+      "rule": "one block, one fact",
+      "token": "EqMCCrYBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAL4ONNFc8whio6ygOTp_Pl1-oWx6rsnjTQlHAugT5yspIkK3bpEGhLRvzP4T18n0nX5wY--ZB3F0QbaPzXE3_CygBIiIKIEBBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "a block without a fact",
+      "rule": "one block, one fact",
+      "token": "EosCCp4BCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAhV6R8WZFASvFMibcFxcG6WKP4edGF47NT5qGddKm0wZyBf5o_Seu8NBOSNFsZj1xWgjKxOX7ofPx07GnaT5yAygBIiIKIEBBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "a rule",
+      "rule": "no rules",
+      "token": "Eq0CCsABCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgqFAoICIAIEgMYgQgSCAiACBIDGIEIEiQIABIgJUO5L_EJVRFHatyDadtt3JM2ZaEZeN2hQE7hBmypVZ0aQL4L6rCoITl1Yqgjx5xD-miHLvRM0isDJtH0SRqE7JmsH1mzbZLQ_vJsiN9wF3tYnVrXodIt9f6iUatU5AnmqQwoASIiCiBAQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eXw==",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "a check",
+      "rule": "no checks",
+      "token": "Eq8CCsIBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgyFgoUCggIgAgSAxiBCBIICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAXyqQKfGom6y9_AqnZD50wUMfiOydVW3aAR6uCisRO1m58DzKW8JMDxFiDXqGS4Tn2iqMH7Qm9D7j6w51-PmUACgBIiIKIEBBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "a scope",
+      "rule": "no scopes",
+      "token": "EpsCCq4BCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQg6AggAEiQIABIgJUO5L_EJVRFHatyDadtt3JM2ZaEZeN2hQE7hBmypVZ0aQOWzBgTXGRhVLkCyLCWHIh5RyBmd5YmSYKYgbdcK1FBm7yOh7fbfaGoXcE7sVXSqp9eH_H-ZF6du6YvWt3SR6gIoASIiCiBAQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eXw==",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "a public key",
+      "rule": "no public keys",
+      "token": "Er0CCtABCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQhCJAgAEiAXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk_1RIkCAASICVDuS_xCVURR2rcg2nbbdyTNmWhGXjdoUBO4QZsqVWdGkAmFMmAC4NWJs0HMbErQDuDYYa7Jx1LXbykvZ0iXTnChwnfrhfCO0EN_2XA7yKHsSRzSn_vh4cmrM-norvs6eQFKAEiIgogQEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "a context",
+      "rule": "only an empty context (biscuit-go writes one)",
+      "token": "EpwCCq8BEgNjdHgKC2dyYW50X2Jsb2NrCowBeyJjYW4iOlsicmVhZCIsImFwcGVuZCJdLCJleHAiOiIyMDI2LTEwLTA1VDAwOjAwOjAwWiIsImdyb3VwcyI6WyJtYXRjaC1kZXNrIl0sImtpZCI6Im9wcy0yMDI2IiwibnMiOlsibWF0Y2hlcyJdLCJydWxlcyI6W10sInN1YiI6InVzZXI6Ym9iIn0YAyIKCggIgAgSAxiBCBIkCAASICVDuS_xCVURR2rcg2nbbdyTNmWhGXjdoUBO4QZsqVWdGkDolAJeGl3_xqJ3S2jQzvHTQOmVtsyyhkD7TerZTPGd1sLPl1G4QBNm9hE1-l1YMBGkHsxHca5qqD6LA2jgL44PKAEiIgogQEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "an unused symbol",
+      "rule": "nothing outside the one fact",
+      "token": "Ep4CCrEBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgKBXNwYXJlEiQIABIgJUO5L_EJVRFHatyDadtt3JM2ZaEZeN2hQE7hBmypVZ0aQKCXYUWtKd-K-V2HLEorf0mv8QzotMUFqoUe19OmEF6mDINhduwGHXf3pahdIRNn1qXddxuPJt3skf0uY8zlJAQoASIiCiBAQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eXw==",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "grant_block not canonical (members reordered)",
+      "rule": "the string equals its canonical form",
+      "token": "EpcCCqoBCgtncmFudF9ibG9jawqMAXsic3ViIjoidXNlcjpib2IiLCJjYW4iOlsicmVhZCIsImFwcGVuZCJdLCJleHAiOiIyMDI2LTEwLTA1VDAwOjAwOjAwWiIsImdyb3VwcyI6WyJtYXRjaC1kZXNrIl0sImtpZCI6Im9wcy0yMDI2IiwibnMiOlsibWF0Y2hlcyJdLCJydWxlcyI6W119GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAcl6tmCuIQr0Sf8VOrjwrXfu5dML1lbYTZoGYFt3bUFjx0_Ubf-ngNMynTpbJNv_NnyFEnJuWdAsksz79PWAgBSgBIiIKIEBBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "grant_block not canonical (whitespace)",
+      "rule": "the string equals its canonical form",
+      "token": "EpgCCqsBCgtncmFudF9ibG9jawqNAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCAic3ViIjoidXNlcjpib2IifRgDIgoKCAiACBIDGIEIEiQIABIgJUO5L_EJVRFHatyDadtt3JM2ZaEZeN2hQE7hBmypVZ0aQElJ154ielwax1TYvZIJdOGrQdLEOsI9hGgA2mlQyNcPybKpbWOYP8sEoFECaO1aA43-FFSbOPm6LVgfkgg44wgoASIiCiBAQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eXw==",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "grant_block with a noncharacter (U+FFFE, raw)",
+      "rule": "I-JSON input without noncharacters (§3.1)",
+      "token": "EpoCCq0BCgtncmFudF9ibG9jawqPAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYu-_viJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpA4BMQ3HY60xonGTYpby6-UjmFUcOBxboH4Tg41paaoFZj6noMVkFGsSzDH91dbIDa_sFY_2_lJoLxVfQJjF5DASgBIiIKIEBBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "grant_block with a noncharacter (U+FFFE, escaped)",
+      "rule": "I-JSON input without noncharacters (§3.1)",
+      "token": "Ep0CCrABCgtncmFudF9ibG9jawqSAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYlx1ZmZmZSJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAlTRlJZIqxzD0rPSI3uT4fKlwmHInz007nIrgumIYCh1ZIuqGEhyEpQwcP9vvBSiIj6-AaxYNtqXac1QKMq6ICigBIiIKIEBBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "\"*\" in can",
+      "rule": "\"*\" only in a key's can (§C.1, §C.4)",
+      "token": "EosCCp4BCgtncmFudF9ibG9jawqAAXsiY2FuIjpbIioiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAZ0WcbuWYtd8wlYpX7OZ_ZrBeYfFhjjJpkF84S93xZL3zo1X4qS7eu3yjSZTlAhjOh6kIcTVE0ne-LVTFS1JDDSgBIiIKIEBBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "grant_block not I-JSON (a duplicate member)",
+      "rule": "I-JSON",
+      "token": "EqgCCrsBCgtncmFudF9ibG9jawqdAXsic3ViIjoidXNlcjpldmUiLCJjYW4iOlsicmVhZCIsImFwcGVuZCJdLCJleHAiOiIyMDI2LTEwLTA1VDAwOjAwOjAwWiIsImdyb3VwcyI6WyJtYXRjaC1kZXNrIl0sImtpZCI6Im9wcy0yMDI2IiwibnMiOlsibWF0Y2hlcyJdLCJydWxlcyI6W10sInN1YiI6InVzZXI6Ym9iIn0YAyIKCggIgAgSAxiBCBIkCAASICVDuS_xCVURR2rcg2nbbdyTNmWhGXjdoUBO4QZsqVWdGkB_cDLx3o95pUhICuIela7vqPZ_Dg2Pe8O70pdIoAZec7FBjl2g0lEiSPGpepStAKAgEjmIDHkYGGT2Ck6NHOUIKAEiIgogQEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "a narrowing block with a root member",
+      "rule": "§C.1 narrowing blocks",
+      "token": "EpcCCqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAWgaUHLoFLrXYHs2MaIetUEXWGK0SK3h0v5xBRUsBNE2qQ14tB8LGmoIYtimpZPta1sYSQLSXob_gozBFMAKwBCgBGo4BCiIKEnsic3ViIjoidXNlcjpldmUifRgDIgoKCAiACBIDGIIIEiQIABIgF0VTtFbd38aQjsqxwQH-arIeK6oGF3lbfUOmNIKZP9UaQA4nsuSthoDl8VQebp179njIGrssH0gm7wgbXFUWcW_Azvp5zNAO4cOAhIliMo3CCO6F9U5j_w2uoPty7jaNPQQoASIiCiBgYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-fw==",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "a third-party block",
+      "rule": "no third-party blocks",
+      "token": "EpcCCqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAWgaUHLoFLrXYHs2MaIetUEXWGK0SK3h0v5xBRUsBNE2qQ14tB8LGmoIYtimpZPta1sYSQLSXob_gozBFMAKwBCgBGokCCjMKI3siY2FuIjpbInJlYWQiXSwidmlhIjoic3ZjOnJlYWRlciJ9GAMiCgoICIAIEgMYgggSJAgAEiAXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk_1RpA8F--Z-0pJdeRlyhAqVvLMmB_GniPzob9JmjQ7YO0D3Q2C3CKHXITLKHBjp3DfkQNccX2F8XKmGJl-6o7fmuICSgBImgKQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAgAEiAXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk_1SIiCiBgYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-fw==",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "a next key that isn't Ed25519 (P-256)",
+      "rule": "every key Ed25519",
+      "token": "EpgCCqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJQgBEiECt549fc-j8RGB9G8kevVsBnsO9TJQ_BjpvoLCPm-DP-4aQJj90xpAUt4-OimBxxWdpn2xGaBbLN_pzlp6AG9W0esCfDBClHCoQ66oWxRDwXPYCDXzm8KRM9TzbjNGMqfYLg8oASIiCiBQUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ubw==",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "a narrowing block whose next key isn't Ed25519 (P-256)",
+      "rule": "every key Ed25519",
+      "token": "EpcCCqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAWgaUHLoFLrXYHs2MaIetUEXWGK0SK3h0v5xBRUsBNE2qQ14tB8LGmoIYtimpZPta1sYSQLSXob_gozBFMAKwBCgBGqABCjMKI3siY2FuIjpbInJlYWQiXSwidmlhIjoic3ZjOnJlYWRlciJ9GAMiCgoICIAIEgMYgggSJQgBEiECt549fc-j8RGB9G8kevVsBnsO9TJQ_BjpvoLCPm-DP-4aQKwPmGXyBjebYTxa2Nbm1-lRf6Eplx96w4iwynJ2W5WGQ_gwtUjRqCj7jqko8XaI1mbEzJztpqz1qO0rMnvDDwgoASIiCiBQUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ubw==",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "the authority block signed by another key",
+      "rule": "the signature chain",
+      "token": "EpcCCqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAr-B5WFzKnuUv4Mt6y1IP_pUOgi_Hl8VyTp0R0HQxFUXPpjY51ii9OKKel6Hdw9NDdAwO9cgOFzVzS82s1ry-AigBIiIKIEBBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f",
+      "fn": "grant.DecodeLimited, grant.Grant.SignedBy",
+      "verdict": "401"
+    },
+    {
+      "name": "a signature with S + L (non-canonical S)",
+      "rule": "Ed25519 verified strictly, S < L",
+      "token": "EpcCCqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAWgaUHLoFLrXYHs2MaIetUEXWGK0SK3h0v5xBRUsBNE2XF1SKISXZ8li1rcyHXtpv1sYSQLSXob_gozBFMAKwFCgBIiIKIEBBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f",
+      "fn": "grant.DecodeLimited, grant.Grant.SignedBy",
+      "verdict": "401"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "section": "§8.6, §G.5.1.1, §E.1",
+  "about": "a resource's archive key in an encrypted namespace: the X25519 private key d = HKDF-SHA256(secret = the resource's data key, salt = none, info = \"patchlog-archive-key-v1\"), 32 bytes; its archives are sealed bundles whose one recipient's kid is its thumbprint. The derivation is the reference's choice (§8.6 leaves the key to the deployment), shown for implementations that read the reference's archives",
+  "vectors": [
+    {
+      "name": "DEK seq(0x00)",
+      "fn": "core archiveIdentity",
+      "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "info": "patchlog-archive-key-v1",
+      "private": "f23d427d8a3a3d39ea68ee7e101f04f931b175972605d2fd22d9262a7979f109",
+      "jwk": "{\"crv\":\"X25519\",\"kty\":\"OKP\",\"x\":\"CSGJM7p3ggcSaGuwyckE8rUJCsP-01t0PkGurAM8LlQ\"}",
+      "kid": "im_d7GrwWBLzFVLpj7w4J6XIO_NA9mekuA717dd-XZA"
+    },
+    {
+      "name": "DEK seq(0x10)",
+      "fn": "core archiveIdentity",
+      "dek": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+      "info": "patchlog-archive-key-v1",
+      "private": "3f56fa90c3eace74874b27219e3234845fffec6a563ad4b32413d7d0ee150f55",
+      "jwk": "{\"crv\":\"X25519\",\"kty\":\"OKP\",\"x\":\"qp2-Zlb9uf35Ah_V9hZOFxIamFhVflZ12VWYEuVuV2E\"}",
+      "kid": "YtSei7Xk639kUVFuEeyuxuaJ44CISRw5AB1cLgxuKHA"
+    }
+  ]
+}
