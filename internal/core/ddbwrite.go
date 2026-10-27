@@ -75,6 +75,9 @@ func (e *Engine) ddbWriteItems(ctx context.Context, req Request, items []Item, c
 		if c.Grant, err = e.ddbStoreGrant(ctx, p.a); err != nil {
 			return nil, err
 		}
+		if err := e.ddbSchemaRefs(ctx, c); err != nil {
+			return nil, err
+		}
 		c.NoAuth = p.a.noAuth
 		cres, err := e.ddb.store.Commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
@@ -112,6 +115,7 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 	c := &ddb.Commit{
 		NS: ns, Author: p.a.id(), Created: g.now.UnixMilli(),
 		CfgPos: cfgRef.pos, CfgID: r.cfgRow(p.n.configSeq).ID,
+		Pins: r.schemaPins(ns),
 	}
 	var entries []any
 	if cp := p.cplan; cp != nil {
@@ -131,6 +135,9 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 		}
 		for j, step := range s.steps {
 			cs := ddb.CommitStep{ID: step.id.String(), Tombstone: step.del, Gesture: s.Steps[j].Gesture, Undoes: s.Steps[j].Undoes}
+			if !step.del {
+				cs.SchemaRef = step.typed
+			}
 			if step.parentID != nil {
 				cs.ParentID = step.parentID.String()
 			}
@@ -350,6 +357,34 @@ func (e *Engine) ddbCreateNamespace(ctx context.Context, req Request, cc ConfigC
 	}
 	e.ddbCommitted(req.NS)
 	return &WriteResult{Status: 201, NSID: nsID, ConfigID: cfgID, Entry: &LogEntry{Gesture: cc.Gesture, Undoes: cc.Undoes}}, nil
+}
+
+// ddbSchemaRefs marks the schema references a commit's revisions make
+// (ddb.Store.PutSchemaRefs), before it: refersIn finds the resources
+// pinning a schema by them. Each is marked once per engine (ddbRefsMarked).
+func (e *Engine) ddbSchemaRefs(ctx context.Context, c *ddb.Commit) error {
+	var pins []ddb.SchemaPin
+	for _, it := range c.Items {
+		for _, st := range it.Steps {
+			if st.SchemaRef == "" {
+				continue
+			}
+			k := c.NS + "\x00" + st.SchemaRef + "\x00" + it.Name
+			if !e.ddb.refsMarked.has(k) {
+				pins = append(pins, ddb.SchemaPin{Ref: st.SchemaRef, Name: it.Name})
+			}
+		}
+	}
+	if len(pins) == 0 {
+		return nil
+	}
+	if err := e.ddb.store.PutSchemaRefs(ctx, c.NS, pins); err != nil {
+		return ddbAsErr(err)
+	}
+	for _, p := range pins {
+		e.ddb.refsMarked.add(c.NS + "\x00" + p.Ref + "\x00" + p.Name)
+	}
+	return nil
 }
 
 // grantRefOf is the grant reference an entry written under g serves

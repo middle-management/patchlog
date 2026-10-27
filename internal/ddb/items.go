@@ -122,19 +122,20 @@ func scanRes(it item) *resRow {
 // and sha-256 as of this revision (headMeta, §7.1); G1PK is the GSI1 key
 // for revision-by-id.
 type revRow struct {
-	pos      uint64
-	id       string
-	kind     string // "": a revision; "tombstone"
-	parentID string // "": genesis
-	patches  string // canonical JSON of the patch set
-	author   string
-	created  int64
-	size     uint64
-	digest   []byte
-	gesture  string
-	undoes   string
-	logPos   uint64 // the namespace entry that committed it: the retry lookup's answer
-	grantID  string // the grant it was written under, "" for none
+	pos       uint64
+	id        string
+	kind      string // "": a revision; "tombstone"
+	parentID  string // "": genesis
+	patches   string // canonical JSON of the patch set
+	author    string
+	created   int64
+	size      uint64
+	digest    []byte
+	gesture   string
+	undoes    string
+	logPos    uint64 // the namespace entry that committed it: the retry lookup's answer
+	grantID   string // the grant it was written under, "" for none
+	schemaRef string // the schema revision path it was typed by
 }
 
 func (r *revRow) item() item {
@@ -167,6 +168,9 @@ func (r *revRow) item() item {
 	}
 	if r.grantID != "" {
 		it["grantId"] = avS(r.grantID)
+	}
+	if r.schemaRef != "" {
+		it["schemaRef"] = avS(r.schemaRef)
 	}
 	return it
 }

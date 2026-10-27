@@ -17,20 +17,21 @@ import (
 // RevInfo is a revision found by id (GSI1): where it lives and what the
 // serving paths need of it. Kind "tombstone" answers 410s (§8.1).
 type RevInfo struct {
-	Name     string
-	ID       string
-	Pos      uint64
-	Kind     string // "": a revision; "tombstone"
-	ParentID string
-	Patches  string
-	Author   string
-	Created  int64
-	Size     uint64
-	Digest   []byte
-	Gesture  string
-	Undoes   string
-	LogPos   uint64 // the namespace entry that committed it (0: unknown)
-	GrantID  string // the grant it was written under, "" for none
+	Name      string
+	ID        string
+	Pos       uint64
+	Kind      string // "": a revision; "tombstone"
+	ParentID  string
+	Patches   string
+	Author    string
+	Created   int64
+	Size      uint64
+	Digest    []byte
+	Gesture   string
+	Undoes    string
+	LogPos    uint64 // the namespace entry that committed it (0: unknown)
+	GrantID   string // the grant it was written under, "" for none
+	SchemaRef string
 }
 
 // ReadRevByID finds a revision of a namespace by its id (the revisions_by_id

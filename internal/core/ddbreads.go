@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -47,6 +48,10 @@ type ddbReads struct {
 	resRows map[int64]*ddb.ResRow
 	// uploaderVer is the version pendingUsed read: the upload pins it.
 	uploaderVer uint64
+	// schemaNSs are the schema namespaces read, with their configuration.
+	schemaNSs map[string]int64
+	// schemaRefs are the revisions' schema paths read, by handle.
+	schemaRefs map[int64]string
 }
 
 type ddbNS struct {
@@ -85,7 +90,7 @@ func newDDBReads(e *Engine, ctx context.Context) *ddbReads {
 		res: map[int64]ddbResRef{}, resAt: map[ddbResRef]int64{},
 		authors: map[int64]string{}, authorN: map[string]int64{},
 		logs: map[int64]ddbPosKey{}, logAt: map[ddbPosKey]int64{},
-		resRows: map[int64]*ddb.ResRow{},
+		resRows: map[int64]*ddb.ResRow{}, schemaRefs: map[int64]string{},
 	}
 }
 
@@ -179,6 +184,9 @@ func (r *ddbReads) revRowOf(ns string, ri *ddb.RevInfo) *revRow {
 	if ri.Undoes != "" {
 		row.undoes.String, row.undoes.Valid = ri.Undoes, true
 	}
+	if ri.SchemaRef != "" {
+		r.schemaRefs[h] = ri.SchemaRef
+	}
 	if ri.GrantID != "" {
 		gid, err := ids.Parse(ri.GrantID)
 		r.must(err)
@@ -231,11 +239,37 @@ func (r *ddbReads) nsByID(id int64) *nsRow {
 	}
 	return r.nsRowOf(id)
 }
-func (r *ddbReads) nsRowUnlocked(id int64) *nsRow          { return r.nsByID(id) }
-func (r *ddbReads) lockNS(ns int64, mode lockMode)         {}
-func (r *ddbReads) branchesOf(n *nsRow) []*nsRow           { return nil }
-func (r *ddbReads) baseIdentity(n *nsRow) string           { panic(ddbUnsupported("branches")) }
-func (r *ddbReads) schemaNS(name string) *nsRow            { panic(ddbUnsupported("$schema validation")) }
+func (r *ddbReads) nsRowUnlocked(id int64) *nsRow  { return r.nsByID(id) }
+func (r *ddbReads) lockNS(ns int64, mode lockMode) {}
+func (r *ddbReads) branchesOf(n *nsRow) []*nsRow   { return nil }
+func (r *ddbReads) baseIdentity(n *nsRow) string   { panic(ddbUnsupported("branches")) }
+
+// schemaNS is nsByName for a schema path's namespace; the commit pins its
+// configuration (schemaPins), as SQL's recheck compares its row.
+func (r *ddbReads) schemaNS(name string) *nsRow {
+	n := r.nsByName(name)
+	if n != nil {
+		if r.schemaNSs == nil {
+			r.schemaNSs = map[string]int64{}
+		}
+		r.schemaNSs[name] = n.configSeq
+	}
+	return n
+}
+
+// schemaPins are the configurations of the schema namespaces read, but
+// own's (which the commit pins anyway).
+func (r *ddbReads) schemaPins(own string) []ddb.NSPin {
+	var out []ddb.NSPin
+	for _, name := range sortedKeys(r.schemaNSs) {
+		if name == own {
+			continue
+		}
+		seq := r.schemaNSs[name]
+		out = append(out, ddb.NSPin{NS: name, CfgPos: r.cfgs[seq].pos, CfgID: r.cfgRow(seq).ID})
+	}
+	return out
+}
 func (r *ddbReads) prefetchResources(int64, []string)      {}
 func (r *ddbReads) prefetchHeads(*nsRow, []string, *int64) {}
 func (r *ddbReads) prefetchSchemas([]schema.Ref)           {}
@@ -466,7 +500,31 @@ func (r *ddbReads) namesAfter(n *nsRow, after string, k int) []string {
 	return out
 }
 
-func (r *ddbReads) copyRows(id ids.ID, name string) []copyRow { return nil }
+// copyRows: the revisions with id named name in every namespace (GSI1).
+func (r *ddbReads) copyRows(id ids.ID, name string) []copyRow {
+	cs, err := r.s.RevsByID(r.ctx, id.String(), name)
+	r.must(err)
+	sort.Slice(cs, func(i, j int) bool {
+		if cs[i].NS != cs[j].NS {
+			return cs[i].NS < cs[j].NS
+		}
+		return cs[i].Pos < cs[j].Pos
+	})
+	var out []copyRow
+	for _, c := range cs {
+		if c.Kind == "tombstone" {
+			continue
+		}
+		n := r.nsByName(c.NS)
+		if n == nil {
+			continue
+		}
+		ri := c.RevInfo
+		row := r.revRowOf(c.NS, &ri)
+		out = append(out, copyRow{seq: row.seq, ns: n.id, res: row.res, state: stateLive})
+	}
+	return out
+}
 
 // --- authors ---
 
@@ -631,4 +689,44 @@ func (r *ddbReads) pendingUsed(n *nsRow, uploader string, cutoff, res int64, bid
 
 func (r *ddbReads) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJob {
 	panic(ddbUnsupported("sealed namespaces"))
+}
+
+// --- schema references ---
+
+func (r *ddbReads) noLocks() func() { return func() {} }
+
+func (r *ddbReads) nsNames() []string {
+	names, err := r.s.Namespaces(r.ctx)
+	r.must(err)
+	return names
+}
+
+func (r *ddbReads) pinnedRefs(l *nsRow) []string {
+	pins, err := r.s.SchemaRefs(r.ctx, r.nsName(l.id), "")
+	r.must(err)
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range pins {
+		if !seen[p.Ref] {
+			seen[p.Ref] = true
+			out = append(out, p.Ref)
+		}
+	}
+	return out
+}
+
+func (r *ddbReads) pinningNames(l *nsRow, ref string) []string {
+	pins, err := r.s.SchemaRefs(r.ctx, r.nsName(l.id), ref)
+	r.must(err)
+	var out []string
+	for _, p := range pins {
+		out = append(out, p.Name)
+	}
+	return out
+}
+
+func (r *ddbReads) schemaRefOf(seq int64) (string, bool) {
+	r.rev(seq)
+	ref, ok := r.schemaRefs[seq]
+	return ref, ok
 }

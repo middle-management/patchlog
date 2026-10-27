@@ -10,9 +10,10 @@ package core
 //
 // Deliberate gaps, all surfaced as 501 "unsupported": branches, purges
 // and pruning, batch sources whose documents reference blobs, sealed and
-// e2e namespaces, $schema validation, nonce-required namespaces, gestures
-// listing, author signatures, head snapshots (revisions fold from the
-// genesis). Grants, edge grants, blobs, tombstones and restores,
+// e2e namespaces, nonce-required namespaces, gestures listing, author
+// signatures, head snapshots (revisions fold from the genesis). Grants,
+// edge grants, blobs, $schema validation and schemaReads, tombstones and
+// restores,
 // multi-step items and batches (§7.5, bounded by the transaction's 100
 // actions) work.
 
@@ -41,6 +42,30 @@ type ddbBackend struct {
 	// byID are the configurations the gate's reads parsed, by namespace
 	// and id (ddbReads.config): a configuration never changes.
 	byID map[string]*Config
+	// refsMarked are the schema references marked (ddbSchemaRefs).
+	refsMarked markedSet
+}
+
+// markedSet is a bounded set of keys: when full it starts over (a key
+// forgotten is only written again).
+type markedSet struct {
+	mu sync.Mutex
+	m  map[string]bool
+}
+
+func (s *markedSet) has(k string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m[k]
+}
+
+func (s *markedSet) add(k string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.m == nil || len(s.m) >= 4096 {
+		s.m = map[string]bool{}
+	}
+	s.m[k] = true
 }
 
 type ddbCfgEntry struct {
@@ -240,7 +265,16 @@ func (e *Engine) ddbGrantRef(ctx context.Context, gid string) (map[string]any, *
 // resource ""), as the SQL reads do; it answers whether the namespace is
 // public.
 func (e *Engine) ddbNS(ctx context.Context, ns string, cred Credentials, resource string) (*ddb.NSInfo, bool, *Error) {
-	var public bool
+	info, public, _, err := e.ddbNSRev(ctx, ns, cred, resource, "")
+	return info, public, err
+}
+
+// ddbNSRev is ddbNS for a revision read (rev, a revision id): a reader
+// refused may still read a schema revision the namespace opens with
+// schemaReads to a referrer (schemaReadsRev, ResourceRev).
+func (e *Engine) ddbNSRev(ctx context.Context, ns string, cred Credentials, resource, rev string) (*ddb.NSInfo, bool, bool, *Error) {
+	var public, referrer bool
+	g := e.rc.load(ns)
 	if err := e.ddbGateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -252,22 +286,27 @@ func (e *Engine) ddbNS(ctx context.Context, ns string, cred Credentials, resourc
 		} else {
 			_, err = t.nsReader(n, cred)
 		}
+		if err != nil && rev != "" {
+			if rid, perr := ids.Parse(rev); perr == nil && t.schemaReadsRev(n, resource, rid, cred, g) {
+				err, referrer = nil, true
+			}
+		}
 		public = t.config(n.configSeq).Read == "public"
 		return asErr(err)
 	}); err != nil {
-		return nil, false, ddbAsErr(err)
+		return nil, false, false, ddbAsErr(err)
 	}
 	info, err := e.ddb.store.ReadNSInfo(ctx, ns)
 	if err != nil {
-		return nil, false, ddbAsErr(err)
+		return nil, false, false, ddbAsErr(err)
 	}
 	if !info.Exists {
-		return nil, false, apiErr(404, "not_found", "namespace", ns)
+		return nil, false, false, apiErr(404, "not_found", "namespace", ns)
 	}
 	if info.Purged {
-		return nil, false, apiErr(410, "purged", "namespace", ns)
+		return nil, false, false, apiErr(410, "purged", "namespace", ns)
 	}
-	return info, public, nil
+	return info, public, referrer, nil
 }
 
 func (e *Engine) ddbResourceHead(ctx context.Context, ns, name string, cred Credentials) (*Head, error) {
@@ -299,7 +338,7 @@ func (e *Engine) ddbResourceHead(ctx context.Context, ns, name string, cred Cred
 }
 
 func (e *Engine) ddbResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
-	_, public, err := e.ddbNS(ctx, ns, cred, name)
+	_, public, referrer, err := e.ddbNSRev(ctx, ns, cred, name, id)
 	if err != nil {
 		return nil, err
 	}
@@ -332,24 +371,7 @@ func (e *Engine) ddbResourceRev(ctx context.Context, ns, name, id string, cred C
 	if derr != nil {
 		return nil, ddbAsErr(derr)
 	}
-	return &Rev{Status: 200, Doc: canon, Public: public, Created: time.UnixMilli(rev.Created).UTC(), Digest: rev.Digest}, nil
-}
-
-func (e *Engine) ddbResourceRaw(ctx context.Context, ns, name, id string, cred Credentials) (*Raw, error) {
-	head, err := e.ddbResourceHead(ctx, ns, name, cred)
-	if err != nil {
-		return nil, err
-	}
-	out := &Raw{Head: head, Public: head.Public}
-	if head.State != Live {
-		return out, nil
-	}
-	rev, err := e.ddbResourceRev(ctx, ns, name, id, cred)
-	if err != nil {
-		return nil, err
-	}
-	out.Rev = rev
-	return out, nil
+	return &Rev{Status: 200, Doc: canon, Public: public, Referrer: referrer, Created: time.UnixMilli(rev.Created).UTC(), Digest: rev.Digest}, nil
 }
 
 func (e *Engine) ddbResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {

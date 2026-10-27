@@ -498,9 +498,8 @@ What landed, beyond the spike:
   carry (it only hands them back). What the backend doesn't store reads
   as empty where nothing of the kind can exist (branches, draft copies,
   schema uses, horizons), and as **501 "unsupported"** where a request
-  needs a feature it lacks (sealed/e2e keys, `$schema` namespaces,
-  archives, reads at an earlier entry, blob references across a
-  history) — so those refusals
+  needs a feature it lacks (sealed/e2e keys, archives, reads at an
+  earlier entry, blob references across a history) — so those refusals
   are the reads', not hand-written checks. `gate_test.go` guards the
   embedding that makes this work on SQL (a read missing on `*tx` would
   compile and recurse).
@@ -546,6 +545,28 @@ What landed, beyond the spike:
   for an upload between its two writes), `BlobStats` counts by the same
   scan, `SweepBlobFiles` removes orphaned files. Not yet: `blob_refs`'s
   reference intervals, so blobs don't cross branches or batch sources.
+  Where blob bytes live is to become configurable for every database
+  backend — a filesystem and an S3 store to begin with, behind
+  `blobStore` (whose `open` must then return a reader, not an
+  `*os.File`) — which settles whether DynamoDB's inline bytes stay as a
+  third option.
+- **`$schema` validation and `schemaReads`** (§6.1). The gate resolves
+  schema revisions through the table's reads as on SQL (`schemaNS`,
+  `resolve`, the revision's ancestry). What a concurrent change could
+  take away is read access to another namespace's schema, its
+  configuration: the commit pins each schema namespace's `#META`
+  (`Commit.Pins`, one check per namespace a group shares; group commit
+  only groups commits whose pins agree), as SQL's recheck compares its
+  row. REV items record `schemaRef`; `SREF#<ref>#<name>` markers, written
+  before the commit (a batch of typed items would outgrow the 100
+  actions), index the resources pinning each schema, and a referrer read
+  confirms against the last live revision's `schemaRef`, as SQL's
+  `refersIn` does with `revisions.schema_ref`. `#NAMESPACES`, written by
+  each creation, lists the namespaces for `schemaReads.for` prefixes;
+  `copyRows` (a revision's copies, for `$ref` closures) is GSI1. The
+  referrer logic (`schemaReadsRev`, `refersIn`, `closureReaches`,
+  `openRefers`) is gate logic now, over the reads `nsNames`,
+  `pinnedRefs`, `pinningNames`, `schemaRefOf`.
 - **`internal/core/ddb.go`, the seam.** `core.Open` branches on
   `ddb.IsURL(opt.Path)`; the Engine keeps a `*ddbBackend` and the write
   methods (`WriteResource`, `Batch`, `WriteConfig`) and the reads
@@ -586,9 +607,9 @@ and Postgres; then DynamoDB's reads and commit replaced the seam's own
 copy of the checks (`ddbGate`, `ddbDraw`, the store's write planning),
 which is where nearly every divergence the API suites found had come
 from. Features now arrive as data: authentication was storing grants and
-answering their reads, blobs storing their items and answering theirs
-(above); `$schema` is answering `schemaNS`, branches `resolve` at an
-earlier entry and `ancestry` across foreign parents.
+answering their reads, blobs and schema references storing their items
+and answering theirs (above); branches will be `resolve` at an earlier
+entry and `ancestry` across foreign parents.
 
 Requirements and limits, by design: one instance (no stream
 invalidation — §6 is phase 3), no background loops (retention, sweeps,
@@ -613,15 +634,15 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,329 top-level tests (pure unit tests included): 872 pass on DynamoDB
-and 457 skip — 420 as unsupported (115 encryption at rest, 104
-branches, 87 `$schema`, 46 purges, …), 36 on their own conditions, and
-1 on the known list, which holds two tests (one a subtest) meeting
+1,331 top-level tests (pure unit tests included): 906 pass on DynamoDB
+and 422 skip — 385 as unsupported (118 branches, 115 encryption at rest,
+80 purges, 20 nonce-required, …), 36 on their own conditions, and 1 on
+the known list, which holds three tests (two by a subtest) meeting
 purges where no skip can reach: inside a service, or on a test's own
 goroutines. No test answers differently from the SQL
 backends: the list's divergences section is empty. A test that skips
 partway has asserted everything before its skip, so the phase-1 surface
-is covered beyond the 872.
+is covered beyond the 906.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on

@@ -80,7 +80,8 @@ func (s *Store) CreateNamespace(ctx context.Context, c *Create) (cfgID, nsID str
 	// buildCreateTx's action order: 0 #META, 1 CFG, 2 LOG, 3 #TIP, 4 NSID;
 	// then the deployment's first entry time and the grant's marker.
 	acts := buildCreateTx(s.Table, ns, meta, cfg.String(), string(canon), string(jsonv.Canonical(doc)), entry)
-	acts = append(acts, deployFirst(s.Table, now))
+	acts = append(acts, deployFirst(s.Table, now),
+		types.TransactWriteItem{Put: &types.Put{TableName: &s.Table, Item: withKey(keyNSList(ns), item{})}})
 	if c.Grant != "" {
 		acts = append(acts, grantMark(s.Table, ns, c.Grant, 1))
 	}
@@ -383,19 +384,20 @@ func int32ptr(n int32) *int32 { return &n }
 // scanRevInfo reads a REV# item (a revision or a tombstone) as served.
 func scanRevInfo(i item) RevInfo {
 	return RevInfo{
-		Name:     resNameFromRev(i.s("SK")),
-		ID:       i.s("id"),
-		Pos:      i.n("pos"),
-		Kind:     i.s("kind"),
-		ParentID: i.s("parentId"),
-		Patches:  i.s("patches"),
-		Author:   i.s("author"),
-		Created:  int64(i.n("created")),
-		Size:     i.n("size"),
-		Digest:   i.b("digest"),
-		Gesture:  i.s("gesture"),
-		Undoes:   i.s("undoes"),
-		LogPos:   i.n("logPos"),
-		GrantID:  i.s("grantId"),
+		Name:      resNameFromRev(i.s("SK")),
+		ID:        i.s("id"),
+		Pos:       i.n("pos"),
+		Kind:      i.s("kind"),
+		ParentID:  i.s("parentId"),
+		Patches:   i.s("patches"),
+		Author:    i.s("author"),
+		Created:   int64(i.n("created")),
+		Size:      i.n("size"),
+		Digest:    i.b("digest"),
+		Gesture:   i.s("gesture"),
+		Undoes:    i.s("undoes"),
+		LogPos:    i.n("logPos"),
+		GrantID:   i.s("grantId"),
+		SchemaRef: i.s("schemaRef"),
 	}
 }

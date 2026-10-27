@@ -75,6 +75,11 @@ type checkReads interface {
 	revByID(n *nsRow, name string, id ids.ID) *revRow
 	revID(seq int64) ids.ID
 	schemaNS(name string) *nsRow
+	nsNames() []string
+	noLocks() func()
+	pinnedRefs(l *nsRow) []string
+	pinningNames(l *nsRow, ref string) []string
+	schemaRefOf(seq int64) (string, bool)
 	schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map[int64]*nsRow
 }
 

@@ -18,7 +18,10 @@ what core/ddbreads.go answers the gate with; `PutGrant` stores a write's
 grant, `FirstEntryTime` dates the operator keys (§C.4); blobs.go's
 `Attachment`, `Pending`, `PendingOf`, `UploaderVersion`, `Bytes` are the
 blob reads, `PutBytes` and `PutPending` an upload's writes, `ScanBlobs`,
-`DeletePending`, `DeleteBytes` the sweep's.
+`DeletePending`, `DeleteBytes` the sweep's; schemas.go's `SchemaRefs`,
+`Namespaces` and `RevsByID` answer schemaReads' referrer checks, from
+`PutSchemaRefs`' markers, the `#NAMESPACES` registry `CreateNamespace`
+writes, and GSI1.
 Serving reads: `ReadHead`, `ReadLog` (paged, id cursors, upper bounds),
 `ReadRevByID` (GSI1), `FoldResource` (crossing tombstones: the restore
 applies to the last live document), `ResourceLog`, `ListHeads`,

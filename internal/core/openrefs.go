@@ -44,7 +44,7 @@ const (
 // openRefers reports whether a referrer in a namespace n's schemaReads
 // lists that is open to everyone opens path, to every request (§6.1). g
 // holds the read cache's counters, loaded before the transaction began.
-func (t *tx) openRefers(n *nsRow, cfg *Config, path string, g gens, closures map[string]bool) bool {
+func (t *gate) openRefers(n *nsRow, cfg *Config, path string, g gens, closures map[string]bool) bool {
 	if m, ok := t.e.rc.refsFor(g, path); ok && t.headsHold(m.heads) {
 		return m.ok
 	}
@@ -63,7 +63,7 @@ func (t *tx) openRefers(n *nsRow, cfg *Config, path string, g gens, closures map
 }
 
 // headsHold reports whether the namespaces' log heads are still those.
-func (t *tx) headsHold(heads []nsHead) bool {
+func (t *gate) headsHold(heads []nsHead) bool {
 	for _, h := range heads {
 		if t.nsByID(h.ns).headSeq.Int64 != h.seq {
 			return false

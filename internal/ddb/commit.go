@@ -69,6 +69,17 @@ type Commit struct {
 	// while authentication was disabled: its entry serves "grant": null.
 	Grant  string
 	NoAuth bool
+	// Pins are the configurations of other namespaces the checks relied
+	// on (the schemas' namespaces: whether the writer may read them): a
+	// pin that moved makes the commit stale, as its own configuration's.
+	Pins []NSPin
+}
+
+// NSPin is a namespace's configuration as a check read it.
+type NSPin struct {
+	NS     string
+	CfgPos uint64
+	CfgID  string
 }
 
 // CommitConfig is a config change: the configuration it makes.
@@ -107,6 +118,7 @@ type CommitStep struct {
 	Doc       string
 	Gesture   string
 	Undoes    string
+	SchemaRef string // the schema revision path the document was typed by
 }
 
 // CommitResult is a committed write's entry.
@@ -197,10 +209,27 @@ func (c *Commit) actions() int {
 // grant's namespace marker, which a transaction writes once however many
 // of its commits record the grant (grantMarks).
 func (c *Commit) txActions() int {
+	n := c.actions() + len(c.Pins)
 	if c.Grant != "" {
-		return c.actions() + 1
+		n++
 	}
-	return c.actions()
+	return n
+}
+
+// groupPins are cs's pins, one per namespace (a transaction can't touch
+// an item twice; take groups only commits whose pins agree), in order.
+func groupPins(cs []*Commit) []NSPin {
+	var out []NSPin
+	seen := map[string]bool{}
+	for _, c := range cs {
+		for _, p := range c.Pins {
+			if !seen[p.NS] {
+				seen[p.NS] = true
+				out = append(out, p)
+			}
+		}
+	}
+	return out
 }
 
 // lastLive is the item's last revision step, nil if all are tombstones.
@@ -260,6 +289,14 @@ func (s *Store) buildCommits(ns string, cs []*Commit, t tip) ([]types.TransactWr
 		prev = tip{headPos: entry.pos, headID: entry.id}
 	}
 	out = append(out, s.grantMarks(ns, cs, res)...)
+	for _, p := range groupPins(cs) {
+		out = append(out, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+			TableName:                 &s.Table,
+			Key:                       keyAV(keyMeta(p.NS)),
+			ConditionExpression:       strptr("configPos = :cp AND configId = :ci"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":cp": avN(p.CfgPos), ":ci": avS(p.CfgID)},
+		}})
+	}
 	out = append(out, types.TransactWriteItem{Update: &types.Update{
 		TableName:        &s.Table,
 		Key:              keyAV(keyTip(ns)),
@@ -382,7 +419,7 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 	for i := range it.Steps {
 		st := &it.Steps[i]
 		pos++
-		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos, grantID: c.Grant}
+		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos, grantID: c.Grant, schemaRef: st.SchemaRef}
 		if st.Tombstone {
 			r.kind = "tombstone"
 		} else {
@@ -463,6 +500,21 @@ func classifyCancel(err error, cs []*Commit, n int) (stale []bool, tipMoved bool
 		}
 	}
 	tipMoved = failed(tipAt)
+	// The pins just before the tip move: one that failed makes every
+	// commit pinning its namespace stale.
+	pins := groupPins(cs)
+	for i, p := range pins {
+		if !failed(tipAt - len(pins) + i) {
+			continue
+		}
+		for j, c := range cs {
+			for _, cp := range c.Pins {
+				if cp.NS == p.NS {
+					stale[j] = true
+				}
+			}
+		}
+	}
 	off := 0
 	for i, c := range cs {
 		k := c.actions()

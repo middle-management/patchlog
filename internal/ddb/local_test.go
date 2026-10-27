@@ -271,6 +271,39 @@ func TestLocalConfigPinned(t *testing.T) {
 	}
 }
 
+// A commit pinning another namespace's configuration (a schema's, which
+// decides whether the writer may read it) is stale once that moves; one
+// pinning the configuration in force commits.
+func TestLocalPinnedElsewhere(t *testing.T) {
+	for _, group := range []int{1, 32} {
+		s := newLocalStore(t)
+		s.GroupCommit = group
+		mustCreateNS(t, s, "demo")
+		mustCreateNS(t, s, "schemas")
+		ctx := context.Background()
+		sn, _ := s.Namespace(ctx, "schemas")
+		pin := NSPin{NS: "schemas", CfgPos: sn.ConfigPos, CfgID: sn.ConfigID}
+		ok := testCommit(t, s, "demo", "a", "", `[{"op":"add","path":"","value":{}}]`)
+		ok.Pins = []NSPin{pin}
+		if _, err := s.Commit(ctx, ok); err != nil {
+			t.Fatalf("group %d: %v", group, err)
+		}
+		next := ids.Of([]byte("next")).String()
+		if _, err := s.Commit(ctx, &Commit{
+			NS: "schemas", Author: "alice", Created: time.Now().UnixMilli(), CfgPos: sn.ConfigPos, CfgID: sn.ConfigID,
+			Config: &CommitConfig{ID: next, Patches: `[]`, Doc: `{"read":"grant"}`},
+			Entry:  map[string]any{"kind": "config", "target": next}, Kind: "config",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		stale := testCommit(t, s, "demo", "b", "", `[{"op":"add","path":"","value":{}}]`)
+		stale.Pins = []NSPin{pin}
+		if _, err := s.Commit(ctx, stale); !errors.Is(err, ErrStale) {
+			t.Fatalf("group %d: commit pinning the old configuration: %v, want ErrStale", group, err)
+		}
+	}
+}
+
 // Grouped commits race config changes and deletes, and two stores on one
 // table stand in for two instances, so groups lose the tip to other
 // writers and re-chain: every commit lands, or is stale and committed

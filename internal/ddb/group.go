@@ -207,14 +207,22 @@ func (q *nsQueue) take(limit int) []*groupMember {
 	for _, n := range first.names() {
 		names[n] = true
 	}
+	pins := map[string]NSPin{}
+	for _, p := range first.c.Pins {
+		pins[p.NS] = p
+	}
 	rest := q.queue[:0:0]
 	for _, w := range q.queue[1:] {
 		fits := len(group) < limit && w.c.CfgPos == first.c.CfgPos &&
-			acts+w.c.txActions() <= maxTxActions && size+w.c.bytes() <= groupBytes
+			acts+w.c.txActions() <= maxTxActions && size+w.c.bytes() <= groupBytes &&
+			pinsAgree(pins, w.c.Pins)
 		for _, n := range w.names() {
 			fits = fits && !names[n]
 		}
 		if fits {
+			for _, p := range w.c.Pins {
+				pins[p.NS] = p
+			}
 			group = append(group, w)
 			acts, size = acts+w.c.txActions(), size+w.c.bytes()
 			for _, n := range w.names() {
@@ -308,4 +316,15 @@ func (s *Store) commitGroup(ns string, group []*groupMember, known *tip) *tip {
 		}
 	}
 	return nil
+}
+
+// pinsAgree reports whether a commit's pins agree with a group's: the
+// group checks each namespace's configuration once.
+func pinsAgree(group map[string]NSPin, pins []NSPin) bool {
+	for _, p := range pins {
+		if g, ok := group[p.NS]; ok && g != p {
+			return false
+		}
+	}
+	return true
 }
