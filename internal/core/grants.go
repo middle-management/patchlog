@@ -16,8 +16,10 @@ import (
 // Reading stored grants (§C.3.1): GET /ns/{ns}/grants/{gid} answers
 // { id, root, stored } for a grant recorded by an entry of the namespace
 // or, in a local branch, of its bases up to their at, recursively. stored
-// is the non-bearer form (§C.8) as the token's protobuf SignedBlocks in
-// order, authority first, each in base64url without padding.
+// is the non-bearer form (§C.8) of the first token recorded with that id:
+// its authority block, one protobuf SignedBlock in base64url without
+// padding, never a narrowing block. Rows stored before v0.73 hold the
+// whole chain, of which storedGrant keeps the authority block.
 //
 // "Recorded by an entry" is read from the namespace log: every entry
 // written on a request stores its grant's id (ns_log.grant_id, grantref.go),
@@ -34,16 +36,24 @@ import (
 // under the epoch key, with pl { ns, grant: gid } (§E.2.2): sealed once,
 // stored in the sealed table and served identically forever. The epoch is
 // the one sealing the namespace's first entry recording it, or the current
-// one for a grant only its bases record. End-to-end namespaces serve it in
-// the clear, as their logs are, but marked Private: Cache-Control private
-// instead of the immutable class (§9), since a grant shows more than a log
-// entry does.
+// one for a grant only its bases record. Answers sealed before v0.73 held
+// stored as an array of every SignedBlock: the answer in today's shape is
+// sealed and stored under a key of its own (grantSealKey), in the same
+// epoch, the first time it is read, and served from then on. End-to-end
+// namespaces serve it in the clear, as their logs are, but marked Private:
+// Cache-Control private instead of the immutable class (§9), since a grant
+// shows more than a log entry does; but one first recorded before a raise
+// from sealed stays sealed as before, under the epoch of the entry that
+// first recorded it and the pad setting before the raise, and a branch of
+// the raised namespace serves it as the raised namespace does (Addendum E
+// Levels, preraise.go).
 
 // GrantDoc is the answer of GET /ns/{ns}/grants/{gid}.
 type GrantDoc struct {
-	ID     string         `json:"id"`
-	Root   map[string]any `json:"root"`
-	Stored []string       `json:"stored"`
+	ID   string         `json:"id"`
+	Root map[string]any `json:"root"`
+	// Stored is the authority SignedBlock in base64url without padding.
+	Stored string `json:"stored"`
 	// Public: the namespace uses the public cache classes.
 	Public bool `json:"-"`
 	// Private: an end-to-end namespace's grant, served with
@@ -79,22 +89,25 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 		if !ok {
 			return nfNS(public)
 		}
-		out = &GrantDoc{ID: id.String(), Root: g.Blocks[0].Raw, Public: public}
-		for _, b := range g.SignedBlocks() {
-			out.Stored = append(out.Stored, base64.RawURLEncoding.EncodeToString(b))
-		}
+		out = &GrantDoc{ID: id.String(), Root: g.Blocks[0].Raw, Stored: base64.RawURLEncoding.EncodeToString(g.Stored()), Public: public}
 		switch t.nsLevel(n) {
 		case levelSealed:
 			nsRowID = n.id
 			job = t.grantJob(n, id, func() []byte {
-				stored := make([]any, len(out.Stored))
-				for i, s := range out.Stored {
-					stored[i] = s
-				}
-				return jsonv.Canonical(map[string]any{"id": out.ID, "root": out.Root, "stored": stored})
+				return jsonv.Canonical(map[string]any{"id": out.ID, "root": out.Root, "stored": out.Stored})
 			})
 		case levelE2E:
+			// Private and no-store for shared caches in either form
+			// (§C.3.1, §9). One first recorded before a raise from sealed
+			// stays sealed, as the namespace that recorded it serves it
+			// (Addendum E Levels, preRaiseGrant).
 			out.Private = true
+			if m, raise, seq := t.preRaiseGrant(n, id); m != nil {
+				nsRowID = m.id
+				job = t.preRaiseGrantJob(m, raise, id, seq, func() []byte {
+					return jsonv.Canonical(map[string]any{"id": out.ID, "root": out.Root, "stored": out.Stored})
+				})
+			}
 		}
 		return nil
 	})
@@ -106,9 +119,15 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 	return out, err
 }
 
+// grantSealKey is the sealed table's key of grant id's sealed answer in
+// the shape of v0.73, stored as one string (§C.3.1). The key the id alone
+// names holds an answer sealed before, with stored an array, which is no
+// longer served.
+func grantSealKey(id ids.ID) string { return id.String() + "/v0.73" }
+
 // grantJob prepares the sealing of grant id as n serves it (§E.2.2).
 func (t *tx) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
-	j := &sealJob{kind: sealGrant, key: id.String()}
+	j := &sealJob{kind: sealGrant, key: grantSealKey(id)}
 	if t.stored(n, j) {
 		return j
 	}
@@ -121,6 +140,20 @@ func (t *tx) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
 	}
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.GrantPL(n.name, id.String()), plain()
 	j.pad = t.config(n.configSeq).Pad
+	return j
+}
+
+// preRaiseGrantJob is grantJob for grant id, first recorded by m's entry
+// seq before m's raise from sealed: sealed under that entry's epoch, as
+// at E2, padded as m padded before the raise (Addendum E Levels).
+func (t *tx) preRaiseGrantJob(m *nsRow, raise *e2eRaise, id ids.ID, seq int64, plain func() []byte) *sealJob {
+	j := &sealJob{kind: sealGrant, key: grantSealKey(id)}
+	if t.stored(m, j) {
+		return j
+	}
+	e := t.preRaiseEntryEpoch(m, raise, seq)
+	j.kid, j.k, j.pl, j.plain = seal.Kid(m.name, e), t.epochKey(m.id, e), seal.GrantPL(m.name, id.String()), plain()
+	j.pad = raise.pad
 	return j
 }
 

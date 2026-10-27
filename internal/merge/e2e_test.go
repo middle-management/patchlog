@@ -142,7 +142,7 @@ func TestE2EMergeReencrypts(t *testing.T) {
 		}
 	}
 	kr, _ := must2(e.x.Keyring(ctx, "m"))
-	if kr.NS != "m" {
+	if kr.Current("m") == 0 || kr.Current("r7") != 0 {
 		t.Fatalf("keyring merged: %+v", kr)
 	}
 
@@ -316,7 +316,7 @@ func TestE2ERebase(t *testing.T) {
 		t.Fatalf("rebase %+v", res)
 	}
 	kr, _ := must2(e.x.Keyring(ctx, "r7b"))
-	if kr.NS != "r7b" {
+	if kr.Current("r7b") == 0 {
 		t.Fatalf("successor keyring %+v", kr)
 	}
 	sameDoc(t, e.doc("r7b", "derby"), map[string]any{"title": "Derby", "score": "1-0"})

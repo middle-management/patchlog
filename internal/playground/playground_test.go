@@ -239,7 +239,9 @@ func generateFixture(t *testing.T) *fixture {
 	}
 	f.JWE = fxJWE{Key: f.ResourceKey.Key, Kid: kid, PL: pl, Plaintext: pt, JWE: j}
 	big := `{"text":"` + strings.Repeat("patch log ", 300) + `"}`
-	jz, err := seal.Seal(ke, kid, seal.NamespaceDocPL("fx", id1), []byte(big))
+	// Seal never compresses (§E.2.2); seal.js still opens bytes sealed with
+	// zip before v0.65, so the fixture carries such a JWE, built by hand.
+	jz, err := legacyZipJWE(ke, kid, seal.NamespaceDocPL("fx", id1), []byte(big))
 	if err != nil || !strings.Contains(string(mustHeader(t, jz).Raw), `"zip":"DEF"`) {
 		t.Fatalf("zip JWE: %v", err)
 	}

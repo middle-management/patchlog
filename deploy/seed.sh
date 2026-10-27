@@ -254,7 +254,7 @@ if [ -n "$drivecfg" ]; then
        "properties":{"href":{"type":"string","pattern":"^/r/drive/[a-z0-9][a-z0-9_-]{0,127}$"},"order":{"type":"string","pattern":"^[0-9A-Za-z]{1,64}$"}}}}}]},
     {"if":[{"op":"test","path":"/action","value":"create"}],"then":[{"op":"test","path":"/doc/parents","schema":{"minItems":1}}]},
     {"if":[{"op":"test","path":"/action","schema":{"enum":["create","append","restore"]}},{"op":"test","path":"/doc/title","exists":true}],
-     "then":[{"op":"test","path":"/doc/title","schema":{"type":"string","minLength":1,"pattern":"^[^/\\\\\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]+$","not":{"enum":[".",".."]}}}]}]}]'
+     "then":[{"op":"test","path":"/doc/title","schema":{"type":"string","minLength":1,"pattern":"^[^/\\\\\\p{Cc}\\p{Zl}\\p{Zp}\\u202A-\\u202E\\u2066-\\u2069]+$","not":{"enum":[".",".."]}}}]}]}]'
 fi
 
 # Encryption demos (Addendum E; the server needs -master-key). "private" is

@@ -369,7 +369,7 @@ func testHeadsByteOrder(t *testing.T, opts ...envOpt) {
 			}
 			r := e.get(p)
 			expect(t, r, 200)
-			items := r.Obj()["items"].([]any)
+			items := r.Obj()["heads"].([]any)
 			if len(items) > 2 {
 				t.Fatalf("a page of %d", len(items))
 			}
@@ -395,15 +395,15 @@ func testHeadsByteOrder(t *testing.T, opts ...envOpt) {
 	}
 	// after needn't be a resource name: it is a byte-order bound.
 	r := e.get("/ns/rel/rev/" + e.nsHead("rel") + "/heads?after=a-")
-	if items := r.Obj()["items"].([]any); items[0].(map[string]any)["resource"] != "a-b" {
+	if items := r.Obj()["heads"].([]any); items[0].(map[string]any)["resource"] != "a-b" {
 		t.Fatalf("after=a- %s", r.Body)
 	}
 	r = e.get("/ns/rel/rev/" + e.nsHead("rel") + "/heads?after=a_")
-	if items := r.Obj()["items"].([]any); items[0].(map[string]any)["resource"] != "a_a" {
+	if items := r.Obj()["heads"].([]any); items[0].(map[string]any)["resource"] != "a_a" {
 		t.Fatalf("after=a_ %s", r.Body)
 	}
 	// Kinds: the branch's tombstone, its own head over a read-through one.
-	for _, x := range e.get("/ns/rel/rev/" + e.nsHead("rel") + "/heads?after=ab").Obj()["items"].([]any) {
+	for _, x := range e.get("/ns/rel/rev/" + e.nsHead("rel") + "/heads?after=ab").Obj()["heads"].([]any) {
 		m := x.(map[string]any)
 		if m["resource"] == "z9" && m["kind"] != "tombstone" {
 			t.Fatalf("z9 %v", m)
@@ -538,7 +538,7 @@ func TestE2ELogPageFromSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expect(t, e.prune("e", "p", map[string]any{"horizon": revs[1], "snapshot": snap}, f.writerG), 200)
+	expect(t, e.prune("e", "p", map[string]any{"horizon": revs[1], "snapshot": snap}, f.adminG), 200) // no retention rule: a * key (§8.6)
 	r = e.get(path+"?since="+revs[1], f.readerG)
 	expect(t, r, 200)
 	arr := anyMaps(r.Arr())
@@ -610,7 +610,7 @@ func TestHeadsSkipsNamesAbsentAtAt(t *testing.T) {
 		}
 		r := e.get(p)
 		expect(t, r, 200)
-		for _, x := range r.Obj()["items"].([]any) {
+		for _, x := range r.Obj()["heads"].([]any) {
 			names = append(names, x.(map[string]any)["resource"].(string))
 		}
 		if after = r.Str("next"); after == "" {

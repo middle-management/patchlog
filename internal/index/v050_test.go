@@ -57,8 +57,10 @@ func TestMinAlwaysRedirects(t *testing.T) {
 		rematch:                curLoc,
 		"matches:" + rematch:   curLoc,
 		"schemas:" + schemasAt: curLoc,
-		first + "&min=" + at:   loc,
-		first + "&min=" + cur:  curLoc,
+		// A bare min is given once (§A.5, v0.73): more name the
+		// namespace.
+		"matches:" + first + "&min=matches:" + at:  loc,
+		"matches:" + first + "&min=matches:" + cur: curLoc,
 	} {
 		r := s.raw(loc+"&min="+m, "")
 		if r.status != 302 || r.header.Get("Location") != want {
@@ -122,7 +124,8 @@ func TestMinAlwaysRedirectsPrivate(t *testing.T) {
 	// pointer, min goes straight to the reader's own at URL, without min.
 	for _, p := range []string{atLoc + "&min=" + wr.NSID, "/sec?limit=5&min=sec:" + wr.NSID, "/sec/at/" + at + "?limit=5&min=" + wr.NSID, "/sec?limit=5&min=" + wr.NSID} {
 		r := x.raw(p, bob)
-		if r.status != 302 || r.header.Get("Location") != atLoc || r.header.Get("Cache-Control") != "private, no-cache" {
+		// A redirect that adds /g/{gs} is private, no-store (§A.4, v0.73).
+		if r.status != 302 || r.header.Get("Location") != atLoc || r.header.Get("Cache-Control") != "private, no-store" {
 			t.Errorf("%s: %d %s %v", p, r.status, r.header.Get("Location"), r.header)
 		}
 	}
@@ -194,7 +197,7 @@ func TestMinJudgedAfterWait(t *testing.T) {
 // TestCanonicalURLs (§A.5): redirects name the query in one form, names
 // and then values sorted bytewise and everything but ALPHA, DIGIT and
 // -._~ percent-encoded in uppercase hex; an at URL in any other form is
-// redirected to it, and next URLs are built in it, so they answer at once.
+// redirected to it, and a page after next, in it, answers at once.
 // A multi-key sort is one parameter with comma-separated keys: a repeated
 // sort is 400, since the canonical form sorts repeated values.
 func TestCanonicalURLs(t *testing.T) {
@@ -212,7 +215,9 @@ func TestCanonicalURLs(t *testing.T) {
 		{"space as +", "?q=the+derby", "?q=the%20derby"},
 		{"lowercase hex", "?q=the%2bderby", "?q=the%2Bderby"},
 		{"slashes in the clear", "?schema=" + w.match, "?schema=" + schema},
-		{"values out of order", "?counts=/status&counts=/live", "?counts=%2Flive&counts=%2Fstatus"},
+		// v0.73: counts is one value, no longer repeatable (§A.4); facet
+		// values are.
+		{"values out of order", "?facet[/status]=planned&facet[/status]=done", "?facet%5B%2Fstatus%5D=done&facet%5B%2Fstatus%5D=planned"},
 		{"empty query", "?", ""},
 	} {
 		r := s.raw(base+c.query, "")
@@ -229,16 +234,18 @@ func TestCanonicalURLs(t *testing.T) {
 		}
 	}
 
-	// next is canonical: it answers without a redirect.
+	// next is the after of the following page (v0.73, §A.4), whose
+	// canonical URL answers without a redirect.
 	b := s.search("/matches?schema="+schema+"&limit=1", "")
 	for range 3 {
 		next, _ := b["next"].(string)
 		if next == "" {
 			break
 		}
-		r := s.raw(next, "")
+		u := base + "?after=" + url.QueryEscape(next) + "&limit=1&schema=" + schema
+		r := s.raw(u, "")
 		if r.status != 200 {
-			t.Fatalf("next %s: %d %s", next, r.status, r.header.Get("Location"))
+			t.Fatalf("next %s: %d %s", u, r.status, r.header.Get("Location"))
 		}
 		b = r.body
 	}

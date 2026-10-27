@@ -164,9 +164,12 @@ services:
       seed:
         condition: service_completed_successfully
 
+  # The branch janitor (§F.6) for demo's branches. Its purges are writes:
+  # by X-Author janitor, since the -dev core refuses a write without one
+  # (§7.2).
   janitor:
     <<: *patchlog
-    command: [janitor, -api=http://patchlog:8080, -ns=demo]
+    command: [janitor, -api=http://patchlog:8080, -ns=demo, -author=janitor]
     depends_on:
       seed:
         condition: service_completed_successfully

@@ -283,15 +283,16 @@ func TestWriterSettingsRefresh(t *testing.T) {
 	}
 }
 
-// A gateway re-checks a grant at least as often as edge grants expire
-// (§H.7, §C.5.2): VerifyEvery is at most their longest lifetime.
+// A gateway re-checks a grant at least every five minutes (§H.7), more
+// often than edge grants expire (§C.5.2): VerifyEvery is at most that.
 func TestVerifyEveryBound(t *testing.T) {
 	t.Parallel()
 	c := must(client.New("http://127.0.0.1:1"))
-	if _, err := dav.New(dav.Options{Client: c, Namespaces: []string{"docs"}, Gateway: true, VerifyEvery: 16 * time.Minute}); err == nil {
-		t.Fatal("VerifyEvery of 16 minutes taken")
+	for _, d := range []time.Duration{16 * time.Minute, 15 * time.Minute} {
+		if _, err := dav.New(dav.Options{Client: c, Namespaces: []string{"docs"}, Gateway: true, VerifyEvery: d}); err == nil {
+			t.Fatalf("VerifyEvery of %v taken", d)
+		}
 	}
-	must(dav.New(dav.Options{Client: c, Namespaces: []string{"docs"}, Gateway: true, VerifyEvery: 15 * time.Minute}))
 	must(dav.New(dav.Options{Client: c, Namespaces: []string{"docs"}, Gateway: true}))
 }
 
@@ -368,7 +369,9 @@ func TestGatewayNarrowedScratch(t *testing.T) {
 // would then take the head as its base and revert another's edit
 // (§H.4). A token verified again as someone else, the namespace that
 // accepted it refusing it now, has its saves without a base refused until
-// it reloads.
+// it reloads: under a core that names no key in /principal (before
+// v0.56), where the user is the verifying namespace, kid and sub; one
+// that names it keeps the key's user (TestGatewayUserIsKeyV073).
 func TestGatewayStableUser(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
@@ -409,7 +412,7 @@ func TestGatewayStableUser(t *testing.T) {
 	e, k = authEnv(t, true, func(o *dav.Options) {
 		o.Namespaces = []string{"alpha", "docs"}
 		o.Now, o.VerifyEvery = clock, time.Minute
-	})
+	}, preKey)
 	op = e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
 	must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
 	alice = k.Grant(t, e.s.Now(), "user:alice", []string{"alpha", "docs"}, writer)
@@ -428,9 +431,10 @@ func TestGatewayStableUser(t *testing.T) {
 }
 
 // A grant an operator key signed (§C.4) authorizes nothing a gateway
-// does: refused (401), though GET /ns/{ns}/principal accepts it, and
-// never taken for the user of a namespace key that carries its kid, whose
-// scratch files it would read.
+// does, and operator grants are never users of a gateway: refused (403,
+// §H.7), though GET /ns/{ns}/principal accepts it, saying operator: true,
+// and never taken for the user of a namespace key that carries its kid,
+// whose scratch files it would read.
 func TestGatewayOperatorGrant(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -453,9 +457,9 @@ func TestGatewayOperatorGrant(t *testing.T) {
 		t.Fatalf("/principal refused the operator grant: %v", err)
 	}
 	for _, req := range []struct{ method, path string }{{"GET", "/docs/.notes.md.swp"}, {"PROPFIND", "/docs/"}} {
-		r := e.expect(e.doAs(opAlice, req.method, req.path, "", "Depth", "1"), 401, "the operator grant's "+req.method)
+		r := e.expect(e.doAs(opAlice, req.method, req.path, "", "Depth", "1"), 403, "the operator grant's "+req.method)
 		if !strings.Contains(r.body, "operator key") {
-			t.Fatalf("401 %q", r.body)
+			t.Fatalf("403 %q", r.body)
 		}
 	}
 	if r := e.expect(e.doAs(alice, "GET", "/docs/.notes.md.swp", ""), 200, "alice's own GET"); r.body != "alice's unsaved draft" {
@@ -564,7 +568,7 @@ func TestGatewaySwitchAfterSweep(t *testing.T) {
 	e, k := authEnv(t, true, func(o *dav.Options) {
 		o.Namespaces = []string{"alpha", "docs"}
 		o.Now, o.VerifyEvery = clk.now, time.Minute
-	})
+	}, preKey)
 	writer := []string{"read", "create", "append", "restore", "delete", "config"}
 	op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
 	must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
@@ -598,7 +602,7 @@ func TestGatewayLoseRecordsKnown(t *testing.T) {
 	e, k := authEnv(t, true, func(o *dav.Options) {
 		o.Namespaces = []string{"alpha", "docs"}
 		o.Now, o.VerifyEvery = clk.now, time.Minute
-	})
+	}, preKey)
 	writer := []string{"read", "create", "append", "restore", "delete", "config"}
 	op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
 	must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
@@ -710,12 +714,15 @@ func TestGatewayDeadPropsPerUser(t *testing.T) {
 }
 
 // opKeysFront is a core behind a proxy that rewrites the root document's
-// jwks_uri to keys, a key set host the test controls.
+// jwks_uri to keys, a key set host the test controls. Its /principal
+// says nothing of operator, as before v0.56, so the gateway tells
+// operator grants by the deployment's operator keys.
 func opKeysFront(t *testing.T, s *clienttest.Server, keys http.Handler) string {
 	t.Helper()
 	jwks := newTestServer(t, keys)
 	rp := httputil.NewSingleHostReverseProxy(must(url.Parse(s.URL)))
 	rp.Transport = s.HTTP.Client().Transport
+	rp.Transport = preV056("operator")(rp.Transport)
 	rp.ModifyResponse = func(r *http.Response) error {
 		if r.Request.URL.Path != "/" || r.StatusCode != 200 {
 			return nil
@@ -815,7 +822,8 @@ func TestGatewayOperatorKeysRefresh(t *testing.T) {
 // the core that doesn't route /.well-known) is a failed read, not "no
 // operator keys": with none read, the core is asked whether a namespace's
 // own keys verify each grant, so alice's grant (docs' key, whose kid is
-// the operator key's) is served, and an operator grant for her sub isn't.
+// the operator key's) is served, and an operator grant for her sub isn't
+// (403, §H.7), where /principal doesn't say operator (before v0.56).
 func TestGatewayOperatorKeys404(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -832,21 +840,21 @@ func TestGatewayOperatorKeys404(t *testing.T) {
 		}
 		rp.ServeHTTP(w, r)
 	}))
-	srv := must(dav.New(dav.Options{Client: must(client.New(front.URL)), Namespaces: []string{"docs"}, Gateway: true, Logf: t.Logf}))
+	srv := must(dav.New(dav.Options{Client: must(client.New(front.URL, client.WithTransport(preV056("operator")))), Namespaces: []string{"docs"}, Gateway: true, Logf: t.Logf}))
 	e := &env{t: t, ctx: ctx, s: s, dav: newTestServer(t, srv)}
 	alice := k.Grant(t, s.Now(), "user:alice", []string{"docs"}, []string{"read", "create", "append"})
 	e.expect(e.doAs(alice, "PUT", "/docs/.notes.md.swp", "alice's unsaved draft"), 201, "alice's swap file")
 	opAlice := clienttest.Mint(t, s.OperatorKey, map[string]any{"kid": "operator", "sub": "user:alice", "ns": []any{"docs"},
 		"can": []any{"read"}, "exp": s.Now().Add(time.Hour).Format(time.RFC3339)})
-	e.expect(e.doAs(opAlice, "GET", "/docs/.notes.md.swp", ""), 401, "the operator grant, the key set answered 404")
+	e.expect(e.doAs(opAlice, "GET", "/docs/.notes.md.swp", ""), 403, "the operator grant, the key set answered 404")
 }
 
 // An operator who lists its own key in a namespace document under the
 // same kid (§C.4) mints grants the core serves as that namespace's (it
 // verifies namespace keys first): the gateway serves them too. In a
-// public namespace, whose reads ignore a grant, the document says which
-// key signed it: an operator grant there whose kid a different key of the
-// namespace carries is refused.
+// public namespace, whose reads ignore a grant, /principal still says
+// which key signed it: an operator grant there whose kid a different key
+// of the namespace carries is refused (403, §H.7).
 func TestGatewayOperatorKeyInNamespace(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -870,8 +878,8 @@ func TestGatewayOperatorKeyInNamespace(t *testing.T) {
 	}
 	for _, ns := range []string{"other", "pub2"} {
 		tok := opKey.Grant(t, s.Now(), "user:ops", []string{ns}, []string{"read"})
-		if r := e.expect(e.doAs(tok, "PROPFIND", "/"+ns+"/", "", "Depth", "1"), 401, "an operator grant in "+ns+", whose key named operator is another"); !strings.Contains(r.body, "operator key") {
-			t.Fatalf("401 %q", r.body)
+		if r := e.expect(e.doAs(tok, "PROPFIND", "/"+ns+"/", "", "Depth", "1"), 403, "an operator grant in "+ns+", whose key named operator is another"); !strings.Contains(r.body, "operator key") {
+			t.Fatalf("403 %q", r.body)
 		}
 	}
 }
@@ -1054,7 +1062,7 @@ func TestGatewaySwitchOthersSave(t *testing.T) {
 			e, k := authEnv(t, true, func(o *dav.Options) {
 				o.Namespaces = []string{"alpha", "docs"}
 				o.Now, o.VerifyEvery = clk.now, time.Minute
-			})
+			}, preKey)
 			writer := []string{"read", "create", "append", "restore", "delete", "config"}
 			op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
 			must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
@@ -1092,7 +1100,7 @@ func TestGatewaySwitchRefusedRoom(t *testing.T) {
 	e, k := authEnv(t, true, func(o *dav.Options) {
 		o.Namespaces = []string{"alpha", "docs"}
 		o.Now, o.VerifyEvery = clk.now, time.Minute
-	})
+	}, preKey)
 	writer := []string{"read", "create", "append", "restore", "delete", "config"}
 	op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
 	must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
@@ -1137,7 +1145,7 @@ func TestGatewaySwitchMarkPushedOut(t *testing.T) {
 			e, k := authEnv(t, true, func(o *dav.Options) {
 				o.Namespaces = []string{"alpha", "docs"}
 				o.Now, o.VerifyEvery = clk.now, time.Minute
-			})
+			}, preKey)
 			writer := []string{"read", "create", "append", "restore", "delete", "config"}
 			op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
 			must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
@@ -1234,7 +1242,7 @@ func TestGatewayIDUsersFlood(t *testing.T) {
 	t.Parallel()
 	clk := &testClock{t: time.Now()}
 	e, k := authEnv(t, true)
-	srv := must(dav.New(dav.Options{Client: e.s.Client(t), Namespaces: []string{"alpha", "docs"}, Gateway: true,
+	srv := must(dav.New(dav.Options{Client: e.s.Client(t, client.WithTransport(preV056("key"))), Namespaces: []string{"alpha", "docs"}, Gateway: true,
 		Now: clk.now, VerifyEvery: time.Minute, Logf: t.Logf}))
 	const all, perUser = 256, 16
 	dav.SetIDUsers(srv, all, perUser)
@@ -1296,7 +1304,7 @@ func TestGatewayIDUsersFloodManySubs(t *testing.T) {
 		t.Run(flood, func(t *testing.T) {
 			clk := &testClock{t: time.Now()}
 			e, k := authEnv(t, true)
-			srv := must(dav.New(dav.Options{Client: e.s.Client(t), Namespaces: []string{"alpha", "docs", "mal"}, Gateway: true,
+			srv := must(dav.New(dav.Options{Client: e.s.Client(t, client.WithTransport(preV056("key"))), Namespaces: []string{"alpha", "docs", "mal"}, Gateway: true,
 				Now: clk.now, VerifyEvery: time.Minute, Logf: t.Logf}))
 			const all, perUser, per = 256, 16, 8
 			dav.SetIDUsers(srv, all, perUser)
@@ -1371,7 +1379,8 @@ func TestGatewayIDUsersFloodManySubs(t *testing.T) {
 // Set (`{}`, a proxy's JSON error page for an unrouted /.well-known) is a
 // failed read, as a 404 is (TestGatewayOperatorKeys404), not an empty
 // set: an operator grant for alice's sub, whose kid docs' key carries,
-// isn't taken for alice and doesn't read her swap file.
+// isn't taken for alice and doesn't read her swap file (403, §H.7), where
+// /principal doesn't say operator (before v0.56).
 func TestGatewayOperatorKeysNotASet(t *testing.T) {
 	t.Parallel()
 	for _, body := range []string{`{"error":"no route"}`, `{}`} {
@@ -1391,13 +1400,13 @@ func TestGatewayOperatorKeysNotASet(t *testing.T) {
 				}
 				rp.ServeHTTP(w, r)
 			}))
-			srv := must(dav.New(dav.Options{Client: must(client.New(front.URL)), Namespaces: []string{"docs"}, Gateway: true, Logf: t.Logf}))
+			srv := must(dav.New(dav.Options{Client: must(client.New(front.URL, client.WithTransport(preV056("operator")))), Namespaces: []string{"docs"}, Gateway: true, Logf: t.Logf}))
 			e := &env{t: t, ctx: ctx, s: s, dav: newTestServer(t, srv)}
 			alice := k.Grant(t, s.Now(), "user:alice", []string{"docs"}, []string{"read", "create", "append"})
 			e.expect(e.doAs(alice, "PUT", "/docs/.notes.md.swp", "alice's unsaved draft"), 201, "alice's swap file")
 			opAlice := clienttest.Mint(t, s.OperatorKey, map[string]any{"kid": "operator", "sub": "user:alice", "ns": []any{"docs"},
 				"can": []any{"read"}, "exp": s.Now().Add(time.Hour).Format(time.RFC3339)})
-			e.expect(e.doAs(opAlice, "GET", "/docs/.notes.md.swp", ""), 401, "the operator grant, the key set answered 200 "+body)
+			e.expect(e.doAs(opAlice, "GET", "/docs/.notes.md.swp", ""), 403, "the operator grant, the key set answered 200 "+body)
 		})
 	}
 }

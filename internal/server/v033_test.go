@@ -241,12 +241,12 @@ func TestDraftSchemasRemoteBranch(t *testing.T) {
 	t1 := a.create("schemas-r7", "team", teamSchema())
 	expect(t, a.branch("main", map[string]any{"name": "main-r7"}, "admin"), 201)
 	expect(t, a.typed("main-r7", "m1", "/r/schemas/team/rev/"+t1), 201)
-	r := b.mkRemote("rel", remoteGenesis("main-r7", a.nsHead("main-r7"), nil))
+	r := b.mkRemote("rel", remoteGenesisChain([]string{"main-r7", "main"}, a.nsHead("main-r7"), nil))
 	expectCode(t, r, 422, "schema_unavailable")
 	expect(t, b.get("/ns/rel"), 404)
 	// Once the schema is in its namespace, the branch can be mirrored.
 	expect(t, a.batchReq("schemas", map[string]any{"items": []any{map[string]any{"resource": "team", "ifNoneMatch": "*", "steps": []any{addRoot(teamSchema())}}}}, "admin"), 201)
-	expect(t, b.mkRemote("rel", remoteGenesis("main-r7", a.nsHead("main-r7"), nil)), 201)
+	expect(t, b.mkRemote("rel", remoteGenesisChain([]string{"main-r7", "main"}, a.nsHead("main-r7"), nil)), 201)
 }
 
 // doMulti sends a JSON PATCH with a header repeated once per value.

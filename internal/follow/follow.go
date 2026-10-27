@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"time"
 
@@ -234,7 +235,8 @@ func New(c *client.Client, ns string, cp Checkpoint, h Handler, opts ...Option) 
 
 // ErrPurged is returned by Run when the followed namespace was purged
 // (after its purge-ns unit was applied, from the log or in place of a
-// /heads listing or of a sealed namespace's log).
+// /heads listing or of a sealed namespace's log, or at once when the
+// checkpoint is that unit already).
 var ErrPurged = errors.New("follow: namespace purged")
 
 // Run follows until ctx is done (returning ctx.Err()), the namespace is
@@ -314,6 +316,12 @@ func (n *nsFollower) run(ctx context.Context) error {
 // discoverBranches starts followers for the namespace's current branches.
 func (n *nsFollower) discoverBranches(ctx context.Context) error {
 	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.Branches(ctx, n.ns) })
+	if client.IsPurged(err) {
+		// A purged namespace's /branches is 410 (§7.4, §8.5); it had no
+		// live branches left to purge it (§2.1), and its log still ends
+		// in the purge-ns entry its follower delivers.
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -514,6 +522,11 @@ func (n *nsFollower) catchUp(ctx context.Context) error {
 	}
 	head := v.(*client.NSHead)
 	n.f.catchUp(n.ns, head.ID, false)
+	if n.cur != "" && n.cur == head.ID {
+		if err := n.purgedAtHead(ctx, head.ID); err != nil {
+			return err
+		}
+	}
 	for n.cur != head.ID {
 		type page struct {
 			entries []client.NSEntry
@@ -545,6 +558,35 @@ func (n *nsFollower) catchUp(ctx context.Context) error {
 	return nil
 }
 
+// lastName sorts after every resource name (§3.6): a /heads page after it
+// is empty.
+var lastName = strings.Repeat("z", 128)
+
+// purgedAtHead checks, for a checkpoint at the head, whether the namespace
+// is purged: whether the checkpoint is the purge-ns entry where an earlier
+// run stopped (ErrPurged). Nothing follows that entry, so a stream from it
+// ends at once and a long-poll from it times out, at every reconnect
+// (§7.3, §7.7). /heads is 410 purged at any revision of a purged namespace
+// (§8.5), and a page of it after the last possible name is empty
+// otherwise, which costs a live namespace's follower one small request
+// when it starts. Once purged, it ends with ErrPurged (deliverPurged
+// delivers nothing at the head). Any other error is left to following.
+func (n *nsFollower) purgedAtHead(ctx context.Context, head string) error {
+	_, err := n.f.retryValue(ctx, n.ns, func() (any, error) {
+		_, _, err := n.f.c.HeadsPage(ctx, n.ns, head, lastName)
+		return nil, err
+	})
+	switch {
+	case client.IsPurged(err):
+		return n.deliverPurged(ctx, err)
+	case ctx.Err() != nil:
+		return ctx.Err()
+	case err != nil:
+		n.f.report(n.ns, fmt.Errorf("follow: checking for a purge at %s: %w", head, err))
+	}
+	return nil
+}
+
 func (n *nsFollower) followLongPoll(ctx context.Context) error {
 	cursor := ""
 	backoff := n.f.newBackoff()
@@ -561,6 +603,13 @@ func (n *nsFollower) followLongPoll(ctx context.Context) error {
 				// Purged since: a sealed namespace's long-poll is 410
 				// rather than its purge-ns entry (§8.5).
 				return n.deliverPurged(ctx, err)
+			}
+			if cursor != "" && client.IsBadInput(err) {
+				// A cursor too far behind the server's (a long pause, a
+				// clock change) is 400: poll again without it (§7.7).
+				// Without a cursor, a 400 is the follower's to report.
+				cursor = ""
+				continue
 			}
 			if !client.Retryable(err) {
 				return err
@@ -592,7 +641,7 @@ func (n *nsFollower) followSSE(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if errors.Is(err, errStop) || errors.Is(err, ErrPurged) {
+		if errors.Is(err, ErrPurged) {
 			return ErrPurged
 		}
 		if client.IsPurged(err) {
@@ -613,8 +662,6 @@ func (n *nsFollower) followSSE(ctx context.Context) error {
 		}
 	}
 }
-
-var errStop = errors.New("follow: stop")
 
 // deliver splits entries into units and applies them in groups.
 func (n *nsFollower) deliver(ctx context.Context, entries []client.NSEntry) error {
@@ -661,9 +708,6 @@ func (n *nsFollower) deliver(ctx context.Context, entries []client.NSEntry) erro
 	}
 	if purged {
 		n.f.state(State{NS: n.ns, Purged: true})
-		if n.f.opt.sse {
-			return errStop
-		}
 		return ErrPurged
 	}
 	return nil

@@ -17,9 +17,10 @@ import (
 // TestVisibilityRulesV038: a role with rules counts for an item's
 // visibility if its rules pass as a read of the item evaluates them (no
 // writes, doc or patches), unless they refer to /now or to /principal
-// other than /principal/groups; roles count only through subjects the
-// catalog's key may assert (§B.11.5); grants are issued only through them
-// too (§B.11.4 Resolve).
+// other than /principal/groups and /principal/roles, and for a folder's
+// if moreover they don't refer to /resource (v0.67); roles count only
+// through subjects the catalog's key may assert (§B.11.5); grants are
+// issued only through them too (§B.11.4 Resolve).
 func TestVisibilityRulesV038(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -59,6 +60,10 @@ func TestVisibilityRulesV038(t *testing.T) {
 	placed := func(token, item string) bool {
 		t.Helper()
 		r, _ := w.follow("/cat/where?item="+item, token)
+		if r.status == 404 {
+			// Hidden, or not in the catalog (§B.5, §B.11.5).
+			return false
+		}
 		if r.status != 200 {
 			t.Fatalf("where %s: %d %v", item, r.status, r.body)
 		}
@@ -81,9 +86,11 @@ func TestVisibilityRulesV038(t *testing.T) {
 		if got := placed(tok, "/r/matches/x3"); got != c.want {
 			t.Errorf("group %s sees x3: %v, want %v", c.group, got, c.want)
 		}
-		// A folder is visible only through a role without rules.
-		if r, _ := w.follow("/cat/children?of=rx", tok); r.status != 404 {
-			t.Errorf("group %s lists rx: %d", c.group, r.status)
+		// None of these rules refers to /resource but the whole
+		// envelope's, so the folder is visible exactly when the item is
+		// (§B.11.5 v0.67).
+		if r, _ := w.follow("/cat/children?of=rx", tok); (r.status == 200) != c.want {
+			t.Errorf("group %s lists rx: %d, want visible %v", c.group, r.status, c.want)
 		}
 	}
 	// The spec's translator (writes within /i18n) sees what it may read.
@@ -96,7 +103,7 @@ func TestVisibilityRulesV038(t *testing.T) {
 	opsCaller := w.caller("user:o", "ops")
 	w.issue(opsCaller, map[string]any{"item": "/r/matches/x3", "want": toAny("read")}, 403)
 	rg := w.do("POST", "/read-grants", opsCaller, map[string]any{"items": toAny("/r/matches/x3")})
-	if e := rg.body["grants"].([]any)[0].(map[string]any)["error"]; e == nil {
+	if e := entry(rg, 0)["status"]; e != 403.0 {
 		t.Errorf("read-grants through an unassertable group: %v", rg.body)
 	}
 	// The same role through an assertable subject does.
@@ -223,9 +230,10 @@ func TestRestoreV038(t *testing.T) {
 	// Never existed: 404, for anyone, placed or not.
 	restore(nobody, "/r/matches/final", 404)
 	restore(nobody, "/r/matches/ghost", 404)
-	// Live: 403 without read, 403 without restore, then 409.
+	// Live: 403 without read, then 409, before the role kept is judged
+	// (§B.11.4 Restore, scenario 12).
 	restore(nobody, "/r/matches/derby", 403)
-	restore(fan, "/r/matches/derby", 403)
+	restore(fan, "/r/matches/derby", 409)
 	restore(bob, "/r/matches/derby", 409)
 
 	// Deleted, then unplaced: no placement, 403.
@@ -235,7 +243,9 @@ func TestRestoreV038(t *testing.T) {
 	restore(nobody, "/r/matches/again", 403)
 	must(w.ops.Delete(ctx, "cat", "matches.again", must(w.ops.Head(ctx, "cat", "matches.again")).ID))
 	w.caughtUp()
-	if r := restore(bob, "/r/matches/again", 403); !strings.Contains(r.body["message"].(string), "not placed") {
+	// Without a placement it has no role there that counts for read, and
+	// is answered as a caller without a role kept (§B.11.4).
+	if r := restore(bob, "/r/matches/again", 403); r.body["message"] != "no role of yours allows restore on /r/matches/again" {
 		t.Errorf("unplaced: %v", r.body)
 	}
 	// Placed again (the placement restored, under derbies): the frozen rows
@@ -263,11 +273,15 @@ func TestRestoreV038(t *testing.T) {
 		t.Errorf("restore grant: %v", b)
 	}
 
-	// Purged: 410, before anything about the caller.
+	// Purged: 410 to a caller with a role that counts for read at its
+	// placement, as for a live item, 403 to anyone else, as the core
+	// answers a caller who doesn't pass the read check (§B.11.4 Restore,
+	// §8.3, scenario 42).
 	purger := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"matches"}, []string{"read", "purge"})))
 	must(purger.Purge(ctx, "matches", "again", must(w.ops.Head(ctx, "matches", "again")).ID, false))
 	w.caughtUp()
-	restore(nobody, "/r/matches/again", 410)
+	restore(nobody, "/r/matches/again", 403)
+	restore(bob, "/r/matches/again", 410)
 }
 
 // TestMoveDeletedPlacement: a move of a deleted item's placement is

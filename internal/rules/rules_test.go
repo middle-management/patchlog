@@ -164,15 +164,15 @@ func TestSpecExamples(t *testing.T) {
 		path string
 	}{
 		{`{"action":"create","writes":[""],"doc":{"$schema":"/r/schemas/match/rev/1"}}`, -1, ""},
-		{`{"action":"create","writes":[""],"doc":{"$schema":"/x"}}`, 0, "/doc/$schema"},
-		{`{"action":"create","writes":[""],"doc":{}}`, 0, "/doc/$schema"},
+		{`{"action":"create","writes":[""],"doc":{"$schema":"/x"}}`, 0, "/rules/0/then/0"},
+		{`{"action":"create","writes":[""],"doc":{}}`, 0, "/rules/0/then/0"},
 		{`{"action":"append","writes":["/title"],"doc":{"$schema":"/r/schemas/match/rev/2"}}`, -1, ""},
 		{`{"action":"append","writes":["/$schema"],"doc":{"$schema":"/r/schemas/match/rev/2"}}`, -1, ""},
 		{`{"action":"delete","writes":[],"doc":null,"principal":{"groups":["ops"]}}`, -1, ""},
-		{`{"action":"delete","writes":[],"doc":null,"principal":{"groups":["dev"]}}`, 2, "/principal/groups"},
-		{`{"action":"purge","writes":[],"doc":null}`, 2, "/principal/groups"},
+		{`{"action":"delete","writes":[],"doc":null,"principal":{"groups":["dev"]}}`, 2, "/rules/2/then/0"},
+		{`{"action":"purge","writes":[],"doc":null}`, 2, "/rules/2/then/0"},
 		{`{"action":"config","writes":[],"doc":{}}`, -1, ""},
-		{`{"action":"append","writes":[""],"doc":{"$schema":"/r/schemas/match/rev/2"}}`, 3, ""},
+		{`{"action":"append","writes":[""],"doc":{"$schema":"/r/schemas/match/rev/2"}}`, 3, "/rules/3/then/0"},
 		{`{"action":"restore","writes":["/a"],"doc":{"$schema":"/r/schemas/match/rev/2"}}`, -1, ""},
 	}
 	for i, x := range cases {
@@ -284,7 +284,6 @@ func TestCompileErrors(t *testing.T) {
 		`{"op":"compare","path":"/a","eq":{"path":"b"}}`,
 		`{"op":"compare","path":"/a","eq":1}`,
 		`{"op":"compare","path":"/a","eq":{"value":1,"x":1}}`,
-		`{"op":"compare","path":"/a","in":{"value":3}}`,
 		`{"op":"compare","path":"/a","zz":{"value":3}}`,
 		`{"all":{}}`, `{"all":[1]}`, `{"all":[],"any":[]}`,
 		`{"any":[{"op":"x"}]}`,
@@ -328,12 +327,14 @@ func TestFailPath(t *testing.T) {
 	 {"op":"writes","within":["/ok"]},
 	 {"any":[{"op":"test","path":"/q","exists":true}]}]`)))
 	e := env(`{"a":1,"b":2,"writes":["/z"]}`)
-	want := []string{"/a", "/b", "/z", "/z", ""}
+	// §6.4.3: the failing rule form, descending only through an all or a
+	// then; any, not, test, writes and compare stop at themselves.
+	want := []string{"", "/all/1", "", "", ""}
 	for i, r := range rs {
 		if r.Eval(e) {
 			t.Fatalf("rule %d should fail", i)
 		}
-		if got := r.n.failPath(e); got != want[i] {
+		if got := r.n.failPath(e, nil); got != want[i] {
 			t.Errorf("rule %d failPath %q want %q", i, got, want[i])
 		}
 	}

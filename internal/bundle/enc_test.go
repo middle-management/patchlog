@@ -393,11 +393,11 @@ func testBundleE2E(t *testing.T) {
 	src.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
 	reader := identity(t)
 	k1, k2 := seal.NewKey(), seal.NewKey()
-	kr, err := seal.BuildKeyring("e", 1, k1, []*ecdh.PublicKey{reader.PublicKey()})
+	kr, err := seal.BuildKeyringV2(reader, "e", 1, k1, []*ecdh.PublicKey{reader.PublicKey()})
 	noErr(t, err)
 	krHead := src.create("e", "keyring", kr.Value())
 	d0 := e2eWrite(t, src, k1, "e#1", "e", "d", "", client.GenesisPatches(map[string]any{"v": marker}))
-	_, err = kr.Rotate(k2, []*ecdh.PublicKey{reader.PublicKey()})
+	err = kr.Add(reader, reader.PublicKey(), "e#2", k2)
 	noErr(t, err)
 	h := must(src.c.NSHead(ctx, "e"))
 	_, err = src.c.Batch(ctx, "e", client.BatchRequest{Config: &client.BatchConfig{IfMatch: h.Config, Patches: ops(op("add", "/encryption/epoch", 2.0))},
@@ -535,7 +535,8 @@ func TestSealedBundleCLI(t *testing.T) {
 	if code := run("import", "-api", dst.url, "-ns", "priv", "-i", out, "-identity", idPath, "-atomic"); code != 1 || !strings.Contains(se.String(), "less protected") {
 		t.Fatalf("import into a public target: %d %s", code, se.String())
 	}
-	if code := run("import", "-api", dst.url, "-ns", "priv", "-i", out, "-identity", idPath, "-atomic", "-allow-less-protected"); code != 0 {
+	// A development server needs X-Author on writes (§7.2).
+	if code := run("import", "-api", dst.url, "-ns", "priv", "-i", out, "-identity", idPath, "-atomic", "-allow-less-protected", "-author", "importer"); code != 0 {
 		t.Fatalf("import: %s", se.String())
 	}
 	if d := dst.doc("priv", "a"); d["v"] != marker {

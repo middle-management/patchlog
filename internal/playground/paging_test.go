@@ -437,7 +437,11 @@ async function api(method, path, o) {
     jose: /^application\/jose\b/i.test(res.headers.get('Content-Type') || ''), hdr: (k) => res.headers.get(k) };
 }
 async function nsInfo(ns) { return { doc: { encryption: { level: 'e2e' } } }; }
-async function contentKey(kid, resource) { if (resource || !input.keys[kid]) throw new Error('no key for ' + kid); return Z.unb64u(input.keys[kid]); }
+async function contentKey(kid, resource) {
+  if (!input.keys[kid]) throw new Error('no key for ' + kid);
+  const ke = Z.unb64u(input.keys[kid]);
+  return resource ? Z.resourceKey(ke, Z.parseKid(kid).ns, resource) : ke; // K_r for E3 patch sets (§E.3.1), as app.js
+}
 async function validateDoc(doc) { return { errors: [] }; }
 const paddedLength = (n) => Z.padLen(n);
 FUNCTIONS

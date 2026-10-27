@@ -86,7 +86,8 @@ func TestPutCreateEdit(t *testing.T) {
 	if en := e.lastEntry("docs", "new"); en.Author != "dav" {
 		t.Fatalf("author %q", en.Author)
 	}
-	if l := e.propfind("/docs/"); l["/docs/new.json"].size != strconv.Itoa(len(upload)) || l["/docs/new.json"].etag != `"`+h.ID+`"` {
+	// The writer's bytes are listed under the weak tag (§H.1).
+	if l := e.propfind("/docs/"); l["/docs/new.json"].size != strconv.Itoa(len(upload)) || l["/docs/new.json"].etag != `W/"`+h.ID+`"` {
 		t.Fatalf("listed after PUT %+v, want size %d", l["/docs/new.json"], len(upload))
 	}
 
@@ -454,7 +455,8 @@ func TestNonceRequired(t *testing.T) {
 func TestLimits(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, []string{"small", "slow", "tiny"}, nil, map[string]map[string]any{
-		"small": {"limits": map[string]any{"patchSetSize": 1024}},
+		// 3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize (§6.6 Values).
+		"small": {"limits": map[string]any{"patchSetSize": 2048, "valueSize": 300, "pathSize": 40}},
 		"slow":  {"limits": map[string]any{"ratePerResource": map[string]any{"rate": 0.001, "burst": 1.0}}},
 		"tiny":  {"limits": map[string]any{"documentSize": 2048}},
 	})
@@ -463,7 +465,12 @@ func TestLimits(t *testing.T) {
 	// A patch set over patchSetSize from the head is written as a root
 	// replace, which may be as large as documentSize (§H.4, §6.6), where
 	// it was a 413 before Addendum H (TestOversizeSave has more).
-	e.expect(e.do("PUT", "/small/x.json", `{"v": 1, "big": "`+strings.Repeat("x", 2000)+`"}`), 201, "PUT over patchSetSize, from the head")
+	bigV := make([]any, 8) // over patchSetSize, in strings within valueSize
+	for i := range bigV {
+		bigV[i] = strings.Repeat("x", 290)
+	}
+	big := rendered(bigV)
+	e.expect(e.do("PUT", "/small/x.json", `{"v": 1, "big": `+big+`}`), 201, "PUT over patchSetSize, from the head")
 	if p := e.lastEntry("small", "x").Patches.([]any); len(p) != 1 || p[0].(map[string]any)["path"] != "" {
 		t.Fatalf("not a root replace: %v", p)
 	}
@@ -473,8 +480,8 @@ func TestLimits(t *testing.T) {
 	e.create("small", "y", map[string]any{"v": 1, "w": 1})
 	e.do("GET", "/small/y.json", "")
 	e.theirs("small", "y", replace("/w", 2))
-	r := e.expect(e.do("PUT", "/small/y.json", `{"v": 1, "w": 1, "big": "`+strings.Repeat("x", 2000)+`"}`), 413, "PUT over patchSetSize, merged")
-	if !strings.HasPrefix(r.body, "too large: patchSetSize 2039 > 1024 (§6.6): patch set too large") || !strings.Contains(r.body, "merged") {
+	r := e.expect(e.do("PUT", "/small/y.json", `{"v": 1, "w": 1, "big": `+big+`}`), 413, "PUT over patchSetSize, merged")
+	if !strings.HasPrefix(r.body, "too large: patchSetSize ") || !strings.Contains(r.body, " > 2048 (§6.6): patch set too large") || !strings.Contains(r.body, "merged") {
 		t.Fatalf("413 text %q", r.body)
 	}
 	// The core's refusals give their limit and sizes (§12): a create, its
@@ -597,29 +604,30 @@ func TestSealed(t *testing.T) {
 // within the hour; in a flat namespace's directory every name but a
 // resource name (§H.2), and every name a resource has is a file's; at the
 // root, a .json name. (In a file tree such names are titles, TestTreeNewFiles.)
-// Editors' and the system's own names stay scratch files (§H.6).
+// Editors' and the system's own names stay scratch files (§H.6). (In docs:
+// matches, the tree's files.ns, is read-only in the flat view, §H.2.)
 func TestRefusedNames(t *testing.T) {
 	t.Parallel()
-	e := treeEnv(t)
-	e.create("matches", "x", map[string]any{"a": "1"})
-	for _, p := range []string{"/matches/Report.json", "/matches/Notes.JSON", "/matches/y copy.json", "/matches/Untitled", "/matches/My%20notes.md", "/matches/.x.json.tmp",
+	e := treeDocsEnv(t)
+	e.create("docs", "x", map[string]any{"a": "1"})
+	for _, p := range []string{"/docs/Report.json", "/docs/Notes.JSON", "/docs/y copy.json", "/docs/Untitled", "/docs/My%20notes.md", "/docs/.x.json.tmp",
 		"/Report.json"} {
 		r := e.expect(e.do("PUT", p, `{"a": "2"}`), 403, "PUT "+p)
 		if !strings.Contains(r.body, "names no") {
 			t.Fatalf("PUT %s: %q", p, r.body)
 		}
 	}
-	e.expect(e.do("PUT", "/matches/.goutputstream-x", `{"a": "3"}`), 201, "temporary file")
-	e.expect(e.do("MOVE", "/matches/.goutputstream-x", "", "Destination", "/matches/Report.json"), 403, "MOVE to a refused name")
+	e.expect(e.do("PUT", "/docs/.goutputstream-x", `{"a": "3"}`), 201, "temporary file")
+	e.expect(e.do("MOVE", "/docs/.goutputstream-x", "", "Destination", "/docs/Report.json"), 403, "MOVE to a refused name")
 	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
-	e.expect(e.do("LOCK", "/matches/Report.json", lock), 403, "LOCK of a refused name")
-	for _, p := range []string{"/matches/x.json~", "/matches/._x.json", "/matches/.x.json.swp", "/matches/4913", "/matches/x.json___jb_tmp___",
-		"/matches/x.json___jb_old___", "/matches/~$x.json", "/matches/%23x.json%23", "/matches/.DS_Store", "/matches/Thumbs.db"} {
+	e.expect(e.do("LOCK", "/docs/Report.json", lock), 403, "LOCK of a refused name")
+	for _, p := range []string{"/docs/x.json~", "/docs/._x.json", "/docs/.x.json.swp", "/docs/4913", "/docs/x.json___jb_tmp___",
+		"/docs/x.json___jb_old___", "/docs/~$x.json", "/docs/%23x.json%23", "/docs/.DS_Store", "/docs/Thumbs.db"} {
 		e.expect(e.do("PUT", p, "scratch"), 201, "PUT "+p)
 	}
-	sameStrings(t, "listing", names(e.propfind("/matches/"), "/matches/"), []string{"#x.json#", ".DS_Store", "._x.json", ".goutputstream-x", ".x.json.swp", "4913",
-		"Thumbs.db", "derby.json", "x.json", "x.json___jb_old___", "x.json___jb_tmp___", "x.json~", "~$x.json"})
-	if heads := must(e.c.Heads(e.ctx, "matches", must(e.c.NSHead(e.ctx, "matches")).ID)); len(heads) != 2 {
+	sameStrings(t, "listing", names(e.propfind("/docs/"), "/docs/"), []string{"#x.json#", ".DS_Store", "._x.json", ".goutputstream-x", ".x.json.swp", "4913",
+		"Thumbs.db", "x.json", "x.json___jb_old___", "x.json___jb_tmp___", "x.json~", "~$x.json"})
+	if heads := must(e.c.Heads(e.ctx, "docs", must(e.c.NSHead(e.ctx, "docs")).ID)); len(heads) != 1 {
 		t.Fatalf("scratch files reached the core: %+v", heads)
 	}
 }
@@ -789,14 +797,14 @@ func TestVimOnDavfs2(t *testing.T) {
 // and holds files at once.
 func TestFoldersWhereNoFolderCanBe(t *testing.T) {
 	t.Parallel()
-	e := treeEnv(t)
-	for _, p := range []string{"/matches/untitled folder", "/matches/archive", "/untitled folder", "/New folder"} {
+	e := treeDocsEnv(t)
+	for _, p := range []string{"/docs/untitled folder", "/docs/archive", "/untitled folder", "/New folder"} {
 		e.expect(e.do("MKCOL", p, ""), 403, "MKCOL "+p)
 	}
-	e.expect(e.do("MKCOL", "/matches/.hidden", ""), 403, "MKCOL a dot folder")
-	e.expect(e.do("MKCOL", "/matches/.TemporaryItems", ""), 201, "MKCOL an app's folder")
-	e.expect(e.do("MOVE", "/matches/.TemporaryItems", "", "Destination", "/matches/archive"), 403, "MOVE it to a person's name")
-	e.expect(e.do("PUT", "/matches/.TemporaryItems/q3.json", `{"draft": true}`), 201, "PUT in an app's folder")
+	e.expect(e.do("MKCOL", "/docs/.hidden", ""), 403, "MKCOL a dot folder")
+	e.expect(e.do("MKCOL", "/docs/.TemporaryItems", ""), 201, "MKCOL an app's folder")
+	e.expect(e.do("MOVE", "/docs/.TemporaryItems", "", "Destination", "/docs/archive"), 403, "MOVE it to a person's name")
+	e.expect(e.do("PUT", "/docs/.TemporaryItems/q3.json", `{"draft": true}`), 201, "PUT in an app's folder")
 	e.expect(e.do("MKCOL", "/cat/untitled folder", ""), 201, "New Folder in a tree")
 	e.expect(e.do("PUT", "/cat/untitled folder/Report.json", `{"draft": true}`), 201, "PUT a file in it")
 	e.expect(e.do("MOVE", "/cat/untitled folder", "", "Destination", "/cat/Draft Ideas"), 201, "MOVE it to a person's name")
@@ -816,19 +824,19 @@ func TestFoldersWhereNoFolderCanBe(t *testing.T) {
 // gives are refused. In a tree the copy is a file, renamed by a title.
 func TestDuplicateThenRename(t *testing.T) {
 	t.Parallel()
-	e := treeEnv(t)
-	e.create("matches", "template", map[string]any{"a": "1"})
+	e := treeDocsEnv(t)
+	e.create("docs", "template", map[string]any{"a": "1"})
 	for i, n := range []string{"template copy.json", "template copy 2.json", "template - Copy.json", "template - Copy (2).json", "Copy of template.json",
 		"template (1).json", "template 2.json", "template (copy).json", "template (another copy).json", "template (3rd copy).json"} {
-		p := "/matches/" + url.PathEscape(n)
-		e.expect(e.do("COPY", "/matches/template.json", "", "Destination", p), 201, "COPY to "+n)
-		dst := "/matches/new" + strconv.Itoa(i) + ".json"
+		p := "/docs/" + url.PathEscape(n)
+		e.expect(e.do("COPY", "/docs/template.json", "", "Destination", p), 201, "COPY to "+n)
+		dst := "/docs/new" + strconv.Itoa(i) + ".json"
 		e.expect(e.do("MOVE", p, "", "Destination", dst), 201, "MOVE "+n)
-		_, doc := e.load("matches", "new"+strconv.Itoa(i))
+		_, doc := e.load("docs", "new"+strconv.Itoa(i))
 		sameJSON(t, doc, map[string]any{"a": "1"})
 	}
 	for _, n := range []string{"Template copy.json", "other copy.json", "season 2026.json"} {
-		e.expect(e.do("PUT", "/matches/"+url.PathEscape(n), `{}`), 403, "PUT "+n)
+		e.expect(e.do("PUT", "/docs/"+url.PathEscape(n), `{}`), 403, "PUT "+n)
 	}
 	e.expect(e.do("COPY", "/cat/Season/derby.json", "", "Destination", "/cat/Season/derby%20copy.json"), 201, "Duplicate a file in a tree")
 	e.expect(e.do("MOVE", "/cat/Season/derby%20copy.json", "", "Destination", "/cat/Season/derby2.json"), 201, "rename it")
@@ -844,13 +852,14 @@ func TestMkcolExisting(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
 	var logged []string
-	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("docs")}}, func(_ *clienttest.Options, o *dav.Options) {
+	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("files", "docs")}}, func(_ *clienttest.Options, o *dav.Options) {
 		o.Logf = func(format string, args ...any) {
 			mu.Lock()
 			logged = append(logged, fmt.Sprintf(format, args...))
 			mu.Unlock()
 		}
 	})
+	must(e.c.CreateNamespace(e.ctx, "files", map[string]any{"read": "public"}))
 	e.create("docs", "x", map[string]any{"v": 1})
 	e.create("cat", "root", map[string]any{"parents": []any{}})
 	e.create("cat", "sub", map[string]any{"title": "Sub", "parents": parents("cat", "root")})
@@ -927,7 +936,9 @@ func TestLockLifecycle(t *testing.T) {
 	if _, data := e.rawOf("docs", "m2.md"); string(data) != "move me" {
 		t.Fatalf("m2.md %q", data)
 	}
-	e.expect(e.do("PUT", "/docs/m.md", "new"), 201, "PUT to the moved file's name without a token")
+	// No lock is left on the old name (423): the PUT gets the answer for
+	// a name moved away (§H.2), which no save makes anew.
+	e.expect(e.do("PUT", "/docs/m.md", "new"), 409, "PUT to the moved file's name without a token")
 	e.expect(e.do("PUT", "/docs/m2.md", "edited"), 201, "PUT the moved file without a token")
 
 	e.expect(e.do("PUT", "/docs/c.md", "copy me"), 201, "PUT c.md")

@@ -6,11 +6,15 @@
 //   - the root signature by a key of the namespace document at its head;
 //   - in a branch, keys follow the base (§C.4): a key the branch copied from
 //     its base is accepted only while the base's current document still has
-//     it with the same pub, recursively;
-//   - revocations of the namespace and, for a branch, of every base;
-//   - the order of §C.2: a grant not naming the namespace is 403 before
-//     anything else; no usable grant (malformed, unknown key, bad
-//     signature, revoked, expired, not yet valid) is 401;
+//     it with the same pub, recursively, through local bases only: a remote
+//     branch's keys and revocations are its own (§10, §G.3);
+//   - revocations of the namespace and, for a branch, of every local base;
+//   - the order of §C.2 and §C.8: a token that can't be decoded, whose
+//     rules don't compile, or over grantSize or rulesPerGrant is 401
+//     first (the origin answers the limits 413); then a grant not naming
+//     the namespace is 403 before anything else; no usable grant (unknown
+//     key, bad signature, revoked, expired, not yet valid, "*" outside an
+//     operator grant) is 401;
 //   - key scopes, including attrs (validated with internal/rules as the
 //     core does), requireAt/maxLag (checked against the named chain,
 //     relative to the grant's issuance, default maxLag 60 seconds) and
@@ -49,6 +53,7 @@ type Checker struct {
 	ttl      time.Duration
 	now      func() time.Time
 	maxGrant int
+	maxRules int
 
 	mu     sync.Mutex
 	states map[string]*nsState
@@ -70,9 +75,14 @@ func WithClock(now func() time.Time) Option { return func(ch *Checker) { ch.now 
 // the §6.6 default).
 func WithMaxGrantSize(n int) Option { return func(ch *Checker) { ch.maxGrant = n } }
 
+// WithMaxGrantRules rejects bearer tokens whose blocks carry more than n
+// rule forms, nested ones included (default 32, the §12.2 default of
+// rulesPerGrant).
+func WithMaxGrantRules(n int) Option { return func(ch *Checker) { ch.maxRules = n } }
+
 // New returns a Checker that reads namespace documents with c.
 func New(c *client.Client, opts ...Option) *Checker {
-	ch := &Checker{c: c, ttl: 30 * time.Second, now: time.Now, maxGrant: 8 << 10,
+	ch := &Checker{c: c, ttl: 30 * time.Second, now: time.Now, maxGrant: 8 << 10, maxRules: 32,
 		states: map[string]*nsState{}, copied: map[string]map[string]grant.Key{}}
 	for _, o := range opts {
 		o(ch)
@@ -89,9 +99,12 @@ type Config struct {
 	Roles   grant.Roles
 	Revoked map[string]bool
 	MaxLag  *time.Duration
-	Base    string // the base namespace of a branch, "" otherwise
-	BaseAt  string
-	Doc     map[string]any
+	// Base is the base namespace of a local branch, "" otherwise: a
+	// remote branch's base is in another deployment, and contributes no
+	// keys or revocations (§C.4, §10, §G.3).
+	Base   string
+	BaseAt string
+	Doc    map[string]any
 }
 
 // ParseConfig extracts the grant-relevant fields of a namespace document.
@@ -120,8 +133,13 @@ func ParseConfig(ns, head string, doc map[string]any) (*Config, error) {
 		}
 	}
 	if b, ok := doc["base"].(map[string]any); ok {
-		cfg.Base, _ = b["ns"].(string)
-		cfg.BaseAt, _ = b["at"].(string)
+		// A base with an origin is a remote branch's, in another
+		// deployment: a namespace of the same name here is unrelated,
+		// so it is never loaded for its keys (§10, §G.3).
+		if _, remote := b["origin"]; !remote {
+			cfg.Base, _ = b["ns"].(string)
+			cfg.BaseAt, _ = b["at"].(string)
+		}
 	}
 	return cfg, nil
 }
@@ -336,10 +354,7 @@ func (ch *Checker) Verify(ctx context.Context, ns, token string) (*grant.Verifie
 	if token == "" {
 		return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
 	}
-	g, err := grant.Decode(token, ch.maxGrant)
-	if errors.Is(err, grant.ErrTooLarge) {
-		return nil, &grant.AuthError{Status: 401, Msg: "grant too large"}
-	}
+	g, err := ch.Decode(token)
 	if err != nil {
 		return nil, err
 	}
@@ -393,9 +408,46 @@ func (ch *Checker) PurgedRead(ctx context.Context, ns, token string) (head strin
 }
 
 // Decode decodes a bearer token as Verify does, without verifying it, so a
-// caller checking many namespaces can see which ones it names first.
+// caller checking many namespaces can see which ones it names first. As
+// the origin does, it refuses a token over grantSize or rulesPerGrant
+// before its ns check (§C.8, §6.6), as a *LimitError, and one whose rules
+// don't compile as a *grant.AuthError with status 401.
 func (ch *Checker) Decode(token string) (*grant.Grant, error) {
-	return grant.Decode(token, ch.maxGrant)
+	g, err := grant.DecodeLimited(token, grant.Limits{Size: ch.maxGrant, Rules: ch.maxRules})
+	var tl *grant.TooLargeError
+	var tr *grant.TooManyRulesError
+	switch {
+	case errors.As(err, &tl):
+		return nil, &LimitError{Limit: "grantSize", Measured: tl.Size, Max: tl.Max}
+	case errors.As(err, &tr):
+		return nil, &LimitError{Limit: "rulesPerGrant", Measured: tr.Count, Max: tr.Max}
+	case errors.Is(err, grant.ErrTooLarge):
+		return nil, &LimitError{Limit: "grantSize", Measured: ch.maxGrant + 1, Max: ch.maxGrant}
+	}
+	return g, err
+}
+
+// LimitError is a bearer token over grantSize or rulesPerGrant (§C.8,
+// §6.6), Measured against Max. Services verify as the origin does (§C.6),
+// which answers it 413, code limit, naming the limit, so a service that
+// answers grant failures itself answers it so too (internal/tree). It
+// unwraps to the 401 *grant.AuthError that callers answering only
+// grant.AuthError give it.
+type LimitError struct {
+	Limit         string // "grantSize" or "rulesPerGrant"
+	Measured, Max int
+}
+
+func (e *LimitError) Error() string {
+	return fmt.Sprintf("grant over %s: %d, at most %d", e.Limit, e.Measured, e.Max)
+}
+
+// Unwrap is the 401 a caller answering only *grant.AuthError gives.
+func (e *LimitError) Unwrap() error {
+	if e.Limit == "rulesPerGrant" {
+		return &grant.AuthError{Status: 401, Msg: "too many rules in the grant's blocks"}
+	}
+	return &grant.AuthError{Status: 401, Msg: "grant too large"}
 }
 
 // unreadable reports a namespace document the checker can't fetch because
@@ -493,7 +545,7 @@ func (ch *Checker) CheckRead(ctx context.Context, ns, token, resource string) (*
 	if token != "" {
 		// A grant not naming ns is refused (§7), as the core does, unless
 		// ns is public: then it is ignored and the read is anonymous.
-		if g, derr := grant.Decode(token, ch.maxGrant); derr == nil && !g.NamesNS(ns) {
+		if g, derr := ch.Decode(token); derr == nil && !g.NamesNS(ns) {
 			if err == nil && st.cfg.Read == "public" {
 				return &Decision{Allowed: true, Public: true}, nil
 			}
@@ -648,13 +700,54 @@ func (ch *Checker) ReadsUnrestricted(v *grant.Verified) bool {
 // passWhole reports whether rules rs pass against env without referring to
 // /resource (or the whole envelope).
 func (ch *Checker) passWhole(rs []any, env map[string]any) bool {
+	return ch.passWholeRefs(rs, env, "resource")
+}
+
+// passWholeRefs reports whether rules rs pass against env without
+// referring to any of refs or to the whole envelope.
+func (ch *Checker) passWholeRefs(rs []any, env map[string]any, refs ...string) bool {
 	for _, rv := range rs {
 		r, err := ch.compile(rv)
-		if err != nil || r.Refs()["resource"] || r.Refs()["*"] || !r.Eval(env) {
+		if err != nil || r.Refs()["*"] || !r.Eval(env) {
 			return false
+		}
+		for _, ref := range refs {
+			if r.Refs()[ref] {
+				return false
+			}
 		}
 	}
 	return true
+}
+
+// NamespaceWide reports whether a verified grant would be issued a
+// namespace-wide edge grant in its namespace (§C.5.2), as far as its rules
+// decide: it reads the namespace unrestricted (§2.1), no rule of its
+// blocks or key scope refers to /now or the whole envelope, they pass now
+// against a read envelope, and, if it carries roles, it has a qualifying
+// role (§2.1): one listing read whose rules refer to neither /resource
+// nor /now, and pass now. It is ReadsUnrestricted less the rules an edge
+// can't evaluate: a reader whose access depends on the clock is decided
+// on each request, never by a namespace-wide view such as g/all (§B.11.5).
+// Whether the namespace exists, is purged or public is the caller's.
+func (ch *Checker) NamespaceWide(v *grant.Verified) bool {
+	ok, roles := v.Allows("read")
+	if !ok || v.Key.ReadScopeResource {
+		return false
+	}
+	env := ReadEnvelope(v, "", ch.now())
+	if !ch.passWholeRefs(v.KeyRules, env, "resource", "now") || !ch.passWholeRefs(v.BlockRules, env, "resource", "now") {
+		return false
+	}
+	if !v.HasRoles() {
+		return true
+	}
+	for _, role := range roles {
+		if ch.passWholeRefs(v.RoleRules(role), env, "resource", "now") {
+			return true
+		}
+	}
+	return false
 }
 
 func (ch *Checker) compile(v any) (*rules.Rule, error) {

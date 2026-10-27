@@ -40,6 +40,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // Options configure an Engine.
@@ -47,7 +48,9 @@ type Options struct {
 	// Path of the SQLite database, or ":memory:", or a Postgres URL
 	// (postgres://…, Addendum D.8).
 	Path string
-	// Origin is the deployment's canonical origin (§G.1), e.g. https://cms.example.
+	// Origin is the deployment's canonical origin (§G.1), e.g. https://cms.example:
+	// scheme://host[:port] in lowercase ASCII without a default port
+	// (sig.CanonicalOrigin); Open refuses any other non-empty value.
 	Origin string
 	// AuthDisabled accepts every request (development only). The author is
 	// taken from X-Author.
@@ -135,6 +138,12 @@ type Options struct {
 	// namespace still in their check phase (zero means 200µs; negative,
 	// no wait). Writes that find no group of their namespace never wait.
 	GroupCommitWait time.Duration
+	// LocalRateBuckets keeps the rate-limit buckets of §6.6 in this
+	// instance's memory on Postgres too, as on SQLite, instead of in the
+	// database (ratebuckets.go): only for a deployment of one instance,
+	// since instances sharing a database must share their buckets (§6.6
+	// Cost).
+	LocalRateBuckets bool
 	// BlobSweepInterval is how often pending blobs past blobGrace are
 	// deleted (§7.8, SweepBlobs), and orphan blob files (SweepBlobFiles),
 	// on the leader. Zero means ten minutes; negative disables it.
@@ -185,12 +194,12 @@ type RemoteOptions struct {
 	// Resolve maps a base's origin to the endpoint requests go to. Nil
 	// means the origin itself, telemetry.DefaultClient and no bearer grant.
 	Resolve func(origin string) (RemoteEndpoint, error)
-	// IgnorePurges records purges in a base's log as notices only
-	// (RemoteNotices) instead of applying them (§G.3 SHOULD follow).
-	IgnorePurges bool
-	// FollowInterval is how often bases' logs are followed and
-	// registrations renewed. Zero means five minutes; negative disables the
-	// background follower (SyncRemotes still works).
+	// FollowInterval is how often bases' logs are followed, their purges
+	// applied and their raises followed (§G.3, §G.5.2), and registrations
+	// renewed. Zero means five minutes; negative disables the background
+	// follower (SyncRemotes still works). Following is a SHOULD (§G.3), but
+	// a deployment that sees a purge applies it: there is no option to
+	// record purges without applying them.
 	FollowInterval time.Duration
 	// Register registers each remote branch with its base (optional in
 	// §G.3) when it is created, and renews the registration before it
@@ -293,6 +302,13 @@ var testOptions func(*Options)
 func Open(opt Options) (*Engine, error) {
 	if testOptions != nil {
 		testOptions(&opt)
+	}
+	// GET / publishes the origin, and signing inputs, batch sources and
+	// bundle headers carry it, all in the canonical form (§7, §3.5, §C.3,
+	// §G.4.1): a deployment that started with another couldn't have its
+	// bundles imported or its signatures verified elsewhere.
+	if opt.Origin != "" && !sig.CanonicalOrigin(opt.Origin) {
+		return nil, fmt.Errorf("core: origin %q is not a canonical origin (§C.3): scheme://host[:port] in lowercase ASCII, an IDN host as its A-label, without a default port, path or trailing slash", opt.Origin)
 	}
 	if opt.Limits == (Limits{}) {
 		opt.Limits = DefaultLimits()
@@ -404,12 +420,20 @@ func Open(opt Options) (*Engine, error) {
 		db.Close()
 		return nil, err
 	}
+	if pg && !opt.LocalRateBuckets {
+		// The buckets of every instance on the database (ratebuckets.go).
+		if e.rate.store, err = openBucketStore(opt.Path); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	if pg {
 		if e.opt.TailInterval <= 0 {
 			e.opt.TailInterval = 100 * time.Millisecond
 		}
 		s, err := e.tailStart(context.Background())
 		if err != nil {
+			e.rate.close()
 			db.Close()
 			return nil, fmt.Errorf("starting the tailer: %w", err)
 		}
@@ -439,6 +463,10 @@ func Open(opt Options) (*Engine, error) {
 		e.bg.Add(1)
 		go e.rotateLoop(opt.RotateEpochs)
 	}
+	if opt.RotateOnRevoke {
+		e.bg.Add(1)
+		go e.rotateRetryLoop()
+	}
 	if e.opt.RepurgeDelay == 0 {
 		e.opt.RepurgeDelay = 3*e.opt.TailInterval + 2*time.Minute
 	}
@@ -464,6 +492,7 @@ func (e *Engine) Close() error {
 	e.stmts.close()
 	err := e.db.Close()
 	e.comp.close()
+	e.rate.close()
 	return err
 }
 
@@ -473,7 +502,7 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.55"
+const SpecVersion = "0.73"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a
@@ -498,6 +527,13 @@ func (e *Engine) Limits() Limits { return e.opt.Maximums }
 // parseConfig parses a namespace document with this deployment's limits.
 func (e *Engine) parseConfig(doc any) (*Config, error) {
 	return parseConfig(doc, e.opt.Limits, e.opt.Maximums)
+}
+
+// parseStoredConfig parses a stored namespace document, holding its limits
+// and allowances to this deployment's maximums rather than refusing them:
+// a value stored before a maximum was lowered (§6.6).
+func (e *Engine) parseStoredConfig(doc any) (*Config, error) {
+	return parseConfigIn(doc, e.opt.Limits, e.opt.Maximums, configMode{stored: true})
 }
 
 func (e *Engine) now() time.Time { return e.opt.Now().UTC() }
@@ -1047,7 +1083,7 @@ func (t *tx) config(seq int64) *Config {
 	}
 	var doc string
 	t.must(t.QueryRow(`SELECT doc FROM ns_config WHERE seq = ?`, seq).Scan(&doc))
-	c, err := t.e.parseConfig(jsonv.MustParse([]byte(doc)))
+	c, err := t.e.parseStoredConfig(jsonv.MustParse([]byte(doc)))
 	if err != nil {
 		panic(fmt.Errorf("stored namespace document %d is invalid: %w", seq, err))
 	}
@@ -1109,11 +1145,12 @@ func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targ
 	body := jsonv.Canonical(entry)
 	gestures := metaColumn(meta)
 	kind := nsKindCode(entry["kind"].(string))
-	var grantID any
+	var grantID, via any
 	if g := t.grants[author]; g != nil && t.serverWrites == 0 {
 		// Encrypted if the configuration in force after the entry
 		// encrypts at rest: a namespace's first entry has none before it.
 		grantID = t.storeGrant(g, t.config(configSeq).level >= levelAtRest)
+		via = grantVia(g)
 	}
 	noAuth := t.noAuth(author)
 	rs, ts := make([]int64, len(hist)), make([]int64, len(hist))
@@ -1128,16 +1165,16 @@ func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targ
 		// One statement: the entry, the namespace's head and the heads it
 		// moves, so the log lock is held for a single round trip and the
 		// commit.
-		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures)
-				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq),
+		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures, via)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq),
 			u AS (UPDATE namespaces SET head_seq = (SELECT seq FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
 			h AS (INSERT INTO head_history (res, ns_seq, target_seq) SELECT v.res, l.seq, v.target FROM l, unnest(?::bigint[], ?::bigint[]) AS v(res, target))
 			SELECT seq FROM l`,
-			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth, gestures,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth, gestures, via,
 			id[:], configSeq, n.id, rs, ts)
 	} else {
-		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
-			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth, gestures)
+		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures, via) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth, gestures, via)
 		_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, head_id = ?, config_seq = ? WHERE ns = ?`, seq, id[:], configSeq, n.id)
 		t.must(err)
 		for _, h := range hist {
@@ -1209,7 +1246,7 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	res, targets := make([]*int64, k), make([]*int64, k)
 	grantIDs := make([][]byte, k)
 	noAuth := make([]*int64, k)
-	gestures := make([]*string, k)
+	gestures, vias := make([]*string, k), make([]*string, k)
 	var hord, hres, htarget []int64
 	for i, a := range as {
 		bodies[i] = string(jsonv.Canonical(a.entry))
@@ -1221,6 +1258,9 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 		if a.grant != nil && t.serverWrites == 0 {
 			// Each entry its own grant (§7.4): one author may write under several.
 			grantIDs[i] = t.storeGrant(a.grant, t.config(configSeq).level >= levelAtRest)
+			if v, ok := grantVia(a.grant).(string); ok {
+				vias[i] = &v
+			}
 		}
 		if t.noAuth(a.author) != nil {
 			one := int64(1)
@@ -1240,18 +1280,18 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 		prev = &out[i]
 	}
 	t.wrote()
-	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::bytea[], ?::smallint[], ?::text[])
-				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, grant_id, no_auth, gestures, ord)),
+	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::bytea[], ?::smallint[], ?::text[], ?::text[])
+				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, grant_id, no_auth, gestures, via, ord)),
 			r AS MATERIALIZED (SELECT nextval(pg_get_serial_sequence('ns_log', 'seq')) AS seq FROM generate_series(1, ?::int)),
 			s AS (SELECT seq, row_number() OVER (ORDER BY seq) AS ord FROM r),
 			c AS (SELECT v.*, s.seq, COALESCE(lag(s.seq) OVER (ORDER BY v.ord), ?::bigint) AS prev_seq FROM v JOIN s USING (ord)),
-			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures)
-				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, ?, grant_id, no_auth, gestures FROM c ORDER BY ord RETURNING seq),
+			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures, via)
+				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, ?, grant_id, no_auth, gestures, via FROM c ORDER BY ord RETURNING seq),
 			u AS (UPDATE namespaces SET head_seq = (SELECT max(seq) FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
 			h AS (INSERT INTO head_history (res, ns_seq, target_seq)
 				SELECT x.res, c.seq, x.target FROM unnest(?::bigint[], ?::bigint[], ?::bigint[]) AS x(ord, res, target) JOIN c USING (ord))
 			SELECT seq FROM c ORDER BY ord`,
-		idBytes, kinds, res, targets, bodies, authors, grantIDs, noAuth, gestures, k, prevSeq,
+		idBytes, kinds, res, targets, bodies, authors, grantIDs, noAuth, gestures, vias, k, prevSeq,
 		n.id, configSeq, t.now.UnixMilli(), idBytes[k-1], configSeq, n.id, hord, hres, htarget)
 	t.must(err)
 	var seqs []int64
@@ -1277,6 +1317,24 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	n.configSeq = configSeq
 	t.notify[n.name] = true
 	return out
+}
+
+// grantVia is ns_log.via for an entry written under g: the canonical JSON
+// array of its blocks' delegatees in order, as the verified principal's
+// via (§6.4.1, §C.1) and revisions.via (writtenBy) record them, or NULL
+// when there are none. Served unhashed with the entry (§7.4); entries the
+// server writes itself record none, nor do entries from before the column.
+func grantVia(g *grant.Grant) any {
+	var via []any
+	for _, b := range g.Blocks {
+		if b.Via != "" {
+			via = append(via, b.Via)
+		}
+	}
+	if len(via) == 0 {
+		return nil
+	}
+	return string(jsonv.Canonical(via))
 }
 
 // noAuth is ns_log.no_auth for an entry by author: 1 if it is written on

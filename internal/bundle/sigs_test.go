@@ -6,7 +6,6 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -38,25 +37,11 @@ func signerKey(t *testing.T, kid string, seed byte) sig.Key {
 	return k
 }
 
-// storedBlocks splits the stored container of a grant (§C.3.1) into its
-// SignedBlocks in base64url, authority first: field 2 is the authority
-// block, field 3 the others.
+// storedBlocks is the stored form of a grant (§C.3.1, §C.8) as the
+// server serves it: its authority SignedBlock in base64url.
 func storedBlocks(t *testing.T, g *grant.Grant) []string {
 	t.Helper()
-	data := g.Stored()
-	var out []string
-	for len(data) > 0 {
-		tag, n := binary.Uvarint(data)
-		data = data[n:]
-		l, n := binary.Uvarint(data)
-		data = data[n:]
-		if tag&7 != 2 {
-			t.Fatalf("unexpected wire type in the stored grant")
-		}
-		out = append(out, b64u.EncodeToString(data[:l]))
-		data = data[l:]
-	}
-	return out
+	return splitStored(g.Stored())
 }
 
 // mint mints a root grant signed by issuer, listing signers.
@@ -91,7 +76,7 @@ func keyEntryOf(k clienttest.Key) bundle.KeyEntry {
 func grantLine(t *testing.T, ns string, g *grant.Grant, key bundle.KeyEntry) bundle.Line {
 	t.Helper()
 	root := jsonv.MustParse(jsonv.Canonical(g.Blocks[0].Raw)).(map[string]any)
-	return bundle.Line{NS: ns, GrantLine: &bundle.GrantLine{ID: g.ID().String(), Root: root, Stored: storedBlocks(t, g), Key: key}}
+	return bundle.Line{NS: ns, GrantLine: &bundle.GrantLine{ID: g.ID().String(), Root: root, Stored: storedBlocks(t, g)[0], Key: key}}
 }
 
 const srcOrigin = "https://src.example"
@@ -407,18 +392,9 @@ func grantsHandler(grants map[string]*grant.Grant, grantFor func(author string) 
 	}
 }
 
-func splitStored(data []byte) []string {
-	var out []string
-	for len(data) > 0 {
-		_, n := binary.Uvarint(data)
-		data = data[n:]
-		l, n := binary.Uvarint(data)
-		data = data[n:]
-		out = append(out, b64u.EncodeToString(data[:l]))
-		data = data[l:]
-	}
-	return out
-}
+// splitStored is the served form of a stored grant: since v0.73 the
+// authority SignedBlock alone (§C.8).
+func splitStored(data []byte) []string { return []string{b64u.EncodeToString(data)} }
 
 func jwk(k clienttest.Key, from, until string) map[string]any {
 	pl := map[string]any{"from": from}

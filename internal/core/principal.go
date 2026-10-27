@@ -2,13 +2,20 @@ package core
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"slices"
 	"sort"
+	"strings"
 
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // PrincipalAnswer is the answer of GET /ns/{ns}/principal (§7.4): Body is
-// { principal, kid, can, roles, writer }, Config the X-Config-Revision.
+// { principal, kid, key, operator, can, roles, writer, catalog? }, Config
+// the X-Config-Revision.
 type PrincipalAnswer struct {
 	Body   map[string]any
 	Config string
@@ -36,25 +43,41 @@ func (e *Engine) Principal(ctx context.Context, ns string, cred Credentials) (*P
 			return t.absentNSOp(ns, cred, true)
 		}
 		cfg := t.config(n.configSeq)
-		var v *grant.Verified
+		var a *actor
 		if !t.e.opt.AuthDisabled {
 			g, err := t.decodeGrant(n.name, cred)
 			if err != nil {
 				return err
 			}
-			a, err := t.verifyGrant(g, n.name, n, cfg, nil)
+			a, err = t.verifyGrant(g, n.name, n, cfg, nil)
 			if err != nil {
 				if a, err = t.operatorPrincipal(g, n, cfg, err); err != nil {
 					return err
 				}
 			}
 			t.e.bearers.put(cred.Bearer, g)
-			v = a.verified
 		}
 		if n.purged {
 			return t.purgedNS(n)
 		}
-		ans = &PrincipalAnswer{Body: t.principalBody(v, cfg), Config: t.configID(n.configSeq).String()}
+		var v *grant.Verified
+		if a != nil {
+			v = a.verified
+		}
+		body := t.principalBody(v, cfg)
+		// A catalog namespace's catalog member (§7.4, §B.6, §H.2), whole
+		// to a grant with unrestricted read, a public namespace's or one
+		// while authentication is disabled included (readsNS). An
+		// operator grant reads nothing but what needs no grant: any other
+		// read under one is 401, whatever its blocks allow (§C.4).
+		whole := t.readsNS(n, cfg, a, false)
+		if v != nil && v.Operator && cfg.Read != "public" {
+			whole = false
+		}
+		if c := principalCatalog(cfg.Doc, whole); c != nil {
+			body["catalog"] = c
+		}
+		ans = &PrincipalAnswer{Body: body, Config: t.configID(n.configSeq).String()}
 		return nil
 	})
 	return ans, err
@@ -82,13 +105,17 @@ func (t *tx) operatorPrincipal(g *grant.Grant, n *nsRow, cfg *Config, nerr *Erro
 // authentication disabled) under the configuration cfg.
 func (t *tx) principalBody(v *grant.Verified, cfg *Config) map[string]any {
 	can, roles := []any{}, []any{}
-	out := map[string]any{}
+	// operator: verified by a deployment operator key (§C.4), whose can is
+	// its blocks' verbs and roles []; false while authentication is
+	// disabled, which has no principal, kid or key.
+	out := map[string]any{"operator": v != nil && v.Operator}
 	if v == nil {
 		for _, verb := range grant.Verbs {
 			can = append(can, verb)
 		}
 	} else {
 		out["principal"], out["kid"] = v.Principal.Envelope(), v.Key.Kid
+		out["key"] = keyThumbprint(v.Key.Pub)
 		// The verbs its blocks allow, and with roles only those an
 		// effective role lists (§C.2 item 2).
 		for _, verb := range grant.Verbs {
@@ -121,14 +148,65 @@ func (t *tx) principalBody(v *grant.Verified, cfg *Config) map[string]any {
 	return out
 }
 
+// keyThumbprint is /principal's key (§7.4, §H.7): the RFC 7638 SHA-256
+// thumbprint, base64url without padding, of an Ed25519 verifying key as
+// the JWK {"crv":"Ed25519","kty":"OKP","x":<pub>}, its required members in
+// lexicographic order. An operator key's published JWK (JWKS) has the same
+// required members, so a key means the same in every namespace, unlike
+// its kid.
+func keyThumbprint(pub ed25519.PublicKey) string {
+	jwk := map[string]any{"crv": "Ed25519", "kty": "OKP", "x": base64.RawURLEncoding.EncodeToString(pub)}
+	sum := sha256.Sum256(jsonv.Canonical(jwk))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// principalCatalog is /principal's catalog member for a namespace whose
+// document has catalog (§7.4, §B.6, §H.2), nil for any other: trust ([]
+// when absent) and files, if set. A grant without unrestricted read of
+// the catalog (whole) gets files without its x- members, and in place of
+// trust only trusted, whether files.ns is one of the trusted namespaces:
+// false without files, which names no namespace.
+func principalCatalog(doc map[string]any, whole bool) map[string]any {
+	c, ok := doc["catalog"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	trust := []any{}
+	if tr, ok := c["trust"].([]any); ok {
+		trust = jsonv.Clone(tr).([]any)
+	}
+	files, hasFiles := c["files"].(map[string]any)
+	out := map[string]any{}
+	if whole {
+		out["trust"] = trust
+		if hasFiles {
+			out["files"] = jsonv.Clone(files)
+		}
+		return out
+	}
+	trusted := false
+	if hasFiles {
+		f := map[string]any{}
+		for k, v := range files {
+			if !strings.HasPrefix(k, "x-") {
+				f[k] = jsonv.Clone(v)
+			}
+		}
+		out["files"] = f
+		ns, _ := files["ns"].(string)
+		trusted = ns != "" && slices.Contains(trust, any(ns))
+	}
+	out["trusted"] = trusted
+	return out
+}
+
 // limitsInForce are the limits of §6.6 as the server applies them in a
 // namespace whose configuration is cfg: the document's, over the
 // deployment's defaults and within its maximums, which hold alone for the
-// deployment-only limits.
+// deployment-only limits, grantSize and rulesPerGrant among them (§12.2).
 func (t *tx) limitsInForce(cfg *Config) map[string]any {
 	l, max := cfg.Limits, t.e.opt.Maximums
 	l.LogPageSize, l.LogPageBytes, l.BranchDepth, l.ExchangeRate = max.LogPageSize, max.LogPageBytes, max.BranchDepth, max.ExchangeRate
-	l.RulesPerGrant = t.rulesPerGrant(cfg)
-	l.GrantSize = min(l.GrantSize, max.GrantSize)
+	l.RulesPerGrant, l.GrantSize = max.RulesPerGrant, max.GrantSize
 	return l.Doc()
 }

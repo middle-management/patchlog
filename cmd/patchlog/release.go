@@ -12,9 +12,15 @@ package main
 // fast-forward, catalog changes that narrow access, content, catalog
 // changes that widen it), each classified again with a dry run right
 // before it is submitted, and resumes a merge that stopped. status shows
-// the stored plan. rebase creates a successor of every branch (§F.5) and
-// writes a new revision of the release document listing them. abandon
-// freezes every branch with abandoned: true (needs a * key, §F.6).
+// the stored plan and the catalog bases' merge locks, which live in the
+// release document's namespace: { holder, plan } while held, {} while
+// free (§F.9). A lock another plan holds, or one an earlier version wrote
+// ({ "release" }), is released by a person: append {} to it. The one
+// exception is a merge an earlier version stopped part-way: apply resumes
+// it from its stored plan, taking over the lock that version took for it.
+// rebase creates a successor of every branch (§F.5) and writes a new
+// revision of the release document listing them. abandon freezes every
+// branch with abandoned: true (needs a * key, §F.6).
 //
 // Catalog batches (§F.8): -merge-bearer is the merge service's own grant
 // for the catalog (merge grants are issued only to it); -bearer, the
@@ -41,7 +47,7 @@ const releaseUsage = `usage:
   patchlog merge release plan|approve|apply|status -api URL [-bearer T] [-author A] [-state-ns NS]
           [-catalog-service CAT=URL]... [-merge-bearer G] [-split KEY/NODE=narrow.json]... [-accept-placement NS.NAME]...
           [-resolve KEY/NAME=file.json]... [-source-grant G]... [-digest D] [-dry-run] [-json] /r/{ns}/{release}
-  patchlog merge release rebase -api URL -suffix SUFFIX [-at ID] [-bearer T] [-author A] [-json] /r/{ns}/{release}
+  patchlog merge release rebase -api URL -suffix SUFFIX [-at ID] [-identity key.jwk]... [-reader pub.jwk]... [-bearer T] [-author A] [-json] /r/{ns}/{release}
   patchlog merge release abandon -api URL [-bearer T] [-author A] [-state-ns NS] /r/{ns}/{release}`
 
 func releaseCmd(args []string) {
@@ -58,13 +64,15 @@ func releaseCmd(args []string) {
 	}
 	fs := flag.NewFlagSet("merge release "+sub, flag.ExitOnError)
 	tf := addToolFlags(fs)
-	stateNS := fs.String("state-ns", "", "namespace of the stored plan and the catalog locks (default: the release document's)")
+	stateNS := fs.String("state-ns", "", "namespace of the stored plan (default: the release document's); the catalog bases' merge locks are always in the release document's namespace (§F.9)")
 	dry := fs.Bool("dry-run", false, "plan: report only, store nothing")
 	suffix := fs.String("suffix", "", "rebase: successor names are each branch's name plus this suffix")
 	at := fs.String("at", "", "rebase: the new release document's combined checkpoint (§B.5), if known")
 	digest := fs.String("digest", "", "approve: the plan digest you reviewed (plan prints it); approval fails unless planning again gives it (§F.9)")
 	mergeBearer := fs.String("merge-bearer", "", "the merge service's own grant for catalogs, sent to catalog services as Authorization (§F.8); its root sub is the via of narrowed admin grants")
-	var catSvcs, splits, accepts, resolves, srcGrants multi
+	var catSvcs, splits, accepts, resolves, srcGrants, identities, readers multi
+	fs.Var(&identities, "identity", "rebase: "+identityHelp)
+	fs.Var(&readers, "reader", "rebase, e2e: file with the X25519 public key (a JWK {kty, crv, x}, or base64url x) of a reader each successor's keyring wraps its key for, besides those of the old branch's readers the identities know (repeatable, §F.8.1)")
 	fs.Var(&catSvcs, "catalog-service", "CAT=URL: the catalog service that signs merge grants for catalog base CAT (§F.8); repeatable")
 	fs.Var(&splits, "split", "KEY/NODE=narrow.json: a catalog node that narrows and widens, merged in two halves; the file is its document after the narrowing step (§F.9); repeatable")
 	fs.Var(&accepts, "accept-placement", "NS.NAME: accept that step 3 publishes an item under this existing placement (§F.9); repeatable")
@@ -87,7 +95,12 @@ func releaseCmd(args []string) {
 			fmt.Fprintln(os.Stderr, "merge release rebase: -suffix is required")
 			os.Exit(2)
 		}
-		res, err := merge.RebaseRelease(ctx, c, merge.RebaseReleaseOptions{Release: link, Suffix: *suffix, At: *at, Plan: merge.Options{Signer: tf.signer()}})
+		succReaders, err := readPublicKeys(readers)
+		if err != nil {
+			toolFatal(err)
+		}
+		res, err := merge.RebaseRelease(ctx, c, merge.RebaseReleaseOptions{Release: link, Suffix: *suffix, At: *at, SuccessorReaders: succReaders,
+			Plan: merge.Options{E2E: e2eView(c, identities), Signer: tf.signer()}})
 		if *tf.asJSON {
 			out := map[string]any{"result": res}
 			if err != nil {
@@ -114,6 +127,10 @@ func releaseCmd(args []string) {
 			if res.Revision != "" {
 				fmt.Printf("release document %s is at %s, listing the successors\n", link, res.Revision)
 			}
+		}
+		if errors.Is(err, merge.ErrReadersDropped) {
+			fmt.Fprintf(os.Stderr, "error: %v\nname their public keys with -reader and run rebase again\n", err)
+			os.Exit(1)
 		}
 		if errors.Is(err, merge.ErrConflicts) {
 			fmt.Fprintln(os.Stderr, "stopped on conflicts: resolve them with `patchlog merge apply -base SUCCESSOR -branch OLD -resolve …`, then run rebase again")
@@ -199,12 +216,22 @@ func releaseCmd(args []string) {
 	}
 
 	var rp *merge.ReleasePlan
+	var locks []*merge.Lock
 	var err error
 	switch sub {
 	case "status":
 		rp, err = merge.LoadReleasePlan(ctx, c, opt)
 		if err == nil && rp == nil {
 			err = errors.New("no stored plan for this release")
+		}
+		for _, b := range planBranches(rp) {
+			if !b.Catalog || err != nil {
+				continue
+			}
+			var l *merge.Lock
+			if l, err = merge.ReadLock(ctx, c, opt, b.Target); err == nil {
+				locks = append(locks, l)
+			}
 		}
 	case "plan":
 		var old *merge.ReleasePlan
@@ -233,12 +260,16 @@ func releaseCmd(args []string) {
 	}
 	if *tf.asJSON {
 		out := map[string]any{"plan": rp}
+		if locks != nil {
+			out["locks"] = locks
+		}
 		if err != nil {
 			out["error"] = err.Error()
 		}
 		printJSON(out)
 	} else if rp != nil {
 		printReleasePlan(rp)
+		printLocks(rp, locks)
 	}
 	if err != nil {
 		if !*tf.asJSON {
@@ -248,6 +279,36 @@ func releaseCmd(args []string) {
 	}
 	if sub == "plan" && !rp.Clean() {
 		os.Exit(1)
+	}
+}
+
+func planBranches(rp *merge.ReleasePlan) []*merge.ReleaseBranch {
+	if rp == nil {
+		return nil
+	}
+	return rp.Branches
+}
+
+// printLocks shows the catalog bases' merge locks (§F.9).
+func printLocks(rp *merge.ReleasePlan, locks []*merge.Lock) {
+	for _, l := range locks {
+		where := l.NS + "/" + l.Name
+		switch {
+		case l.Free():
+			fmt.Printf("  lock %s: free\n", where)
+		case l.Legacy != "" && l.Legacy == rp.Release && rp.Format == 0 && rp.State == merge.ReleaseMerging:
+			fmt.Printf("  lock %s: held by an earlier version's merge of this release, stopped part-way; apply resumes it and takes the lock over\n", where)
+		case l.Legacy != "":
+			fmt.Printf("  lock %s: held by an earlier version's merge of %s; a person releases it (append {})\n", where, l.Legacy)
+		case l.Plan == rp.Digest:
+			fmt.Printf("  lock %s: held by %s for this plan\n", where, l.Holder)
+		default:
+			plan := l.Plan
+			if plan == "" {
+				plan = "(none)"
+			}
+			fmt.Printf("  lock %s: held by %s for plan %s\n", where, l.Holder, plan)
+		}
 	}
 }
 

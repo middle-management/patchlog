@@ -1,0 +1,391 @@
+package rules
+
+import (
+	"testing"
+
+	"github.com/middle-management/patchlog/internal/jsonv"
+)
+
+// GB-9 (§6.4.3): a failing namespace rule's path points at the failing rule
+// form in the namespace document: /rules/{i}, descending only through the
+// first failing member of an all (/all/{k}) or a then (/then/{k}); any,
+// not, test, writes and compare stop at themselves.
+func TestV073P20RuleFormPath(t *testing.T) {
+	t.Parallel()
+	pass := `{"op":"test","path":"/a","exists":true}`
+	fail := `{"op":"test","path":"/a","exists":false}`
+	rs, err := CompileList(jsonv.MustParse([]byte(`[
+	 ` + pass + `,
+	 {"all":[` + pass + `,{"if":[` + pass + `],"then":[` + pass + `,` + fail + `]}]},
+	 {"all":[` + fail + `,` + fail + `]},
+	 {"any":[` + fail + `,{"all":[` + fail + `]}]},
+	 {"not":{"all":[` + pass + `]}},
+	 {"if":[` + pass + `],"then":[{"not":` + pass + `},` + fail + `]},
+	 {"op":"writes","within":["/ok"]},
+	 {"op":"compare","path":"/a","eq":{"value":2}},
+	 ` + fail + `]`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := env(`{"a":1,"writes":["/z"]}`)
+	want := []string{"", "/rules/1/all/1/then/1", "/rules/2/all/0", "/rules/3", "/rules/4",
+		"/rules/5/then/0", "/rules/6", "/rules/7", "/rules/8"}
+	for i := 1; i < len(rs); i++ {
+		idx, path, ok := EvalList(rs[i:], e)
+		if ok || idx != 0 || path != want[i] {
+			t.Errorf("rule %d: EvalList = (%d, %q, %v), want (0, %q, false)", i, idx, path, ok, want[i])
+		}
+		// A rule CompileList compiled keeps its index when evaluated
+		// alone, as step 6 of a sealed write does rule by rule.
+		if _, path, _ := EvalList([]*Rule{rs[i]}, e); path != want[i] {
+			t.Errorf("rule %d alone: path %q, want %q", i, path, want[i])
+		}
+	}
+	if idx, path, ok := EvalList(rs, e); idx != 1 || path != want[1] || ok {
+		t.Errorf("EvalList = (%d, %q, %v)", idx, path, ok)
+	}
+	// Rules compiled one by one are numbered by their place in the list.
+	lone := []*Rule{c(t, pass), c(t, `{"all":[`+fail+`]}`)}
+	if idx, path, _ := EvalList(lone, e); idx != 1 || path != "/rules/1/all/0" {
+		t.Errorf("Compile'd rules: (%d, %q)", idx, path)
+	}
+}
+
+// GB-10 (§6.4.2): in is false when the right-hand side isn't an array,
+// a literal or a path alike; the rule is valid.
+func TestV073P20CompareInNotArray(t *testing.T) {
+	t.Parallel()
+	run(t, []tc{
+		{`{"op":"compare","path":"/a","in":{"path":"/b"}}`, `{"a":"x","b":"x"}`, false},
+		{`{"op":"compare","path":"/a","in":{"path":"/b"}}`, `{"a":{"x":1},"b":{"x":1}}`, false},
+		{`{"op":"compare","path":"/a","in":{"path":"/b"}}`, `{"a":null,"b":null}`, false},
+		{`{"op":"compare","path":"/a","in":{"value":"x"}}`, `{"a":"x"}`, false},
+		{`{"op":"compare","path":"/a","in":{"path":"/b"}}`, `{"a":"x","b":["y","x"]}`, true},
+	})
+}
+
+// GB-11 (§6.4.2): lt, le, gt and ge compare RFC 3339 date-times as
+// instants at the full precision of their fractional seconds; a leap
+// second is of an unsupported type, so is a lowercase t or z (F-G5).
+func TestV073P20CompareDateTimes(t *testing.T) {
+	t.Parallel()
+	cmp := func(op, a, b string) string {
+		return `{"op":"compare","path":"/a","` + op + `":{"value":"` + b + `"}}`
+	}
+	a := func(s string) string { return `{"a":"` + s + `"}` }
+	run(t, []tc{
+		// Beyond nanoseconds.
+		{cmp("lt", "", "2026-01-01T00:00:00.0000000002Z"), a("2026-01-01T00:00:00.0000000001Z"), true},
+		{cmp("gt", "", "2026-01-01T00:00:00.0000000002Z"), a("2026-01-01T00:00:00.0000000001Z"), false},
+		{cmp("lt", "", "2026-01-01T00:00:00.000000000000000000000000000002Z"), a("2026-01-01T00:00:00.000000000000000000000000000001Z"), true},
+		{cmp("lt", "", "2026-01-01T00:00:00.12Z"), a("2026-01-01T00:00:00.119999999999999999Z"), true},
+		// Trailing zeros and an absent fraction are the same instant.
+		{cmp("le", "", "2026-01-01T00:00:00Z"), a("2026-01-01T00:00:00.000000000000Z"), true},
+		{cmp("ge", "", "2026-01-01T00:00:00Z"), a("2026-01-01T00:00:00.000000000000Z"), true},
+		{cmp("lt", "", "2026-01-01T00:00:00.5Z"), a("2026-01-01T00:00:00.50000000000Z"), false},
+		// Offsets name the same instant in UTC, across a day and a year.
+		{cmp("le", "", "2026-01-01T11:00:00Z"), a("2026-01-01T12:00:00+01:00"), true},
+		{cmp("ge", "", "2026-01-01T11:00:00Z"), a("2026-01-01T12:00:00+01:00"), true},
+		{cmp("lt", "", "2026-01-01T00:30:00+01:00"), a("2025-12-31T23:59:59.999999999999-00:01"), false},
+		{cmp("gt", "", "2026-01-01T00:00:00Z"), a("2025-12-31T23:30:00.000000000001-00:30"), true},
+		{cmp("lt", "", "2024-02-29T00:00:00Z"), a("2024-02-28T23:59:59Z"), true},
+		// A leap second is unsupported, on either side.
+		{cmp("lt", "", "2017-01-01T00:00:00Z"), a("2016-12-31T23:59:60Z"), false},
+		{cmp("ge", "", "2017-01-01T00:00:00Z"), a("2016-12-31T23:59:60Z"), false},
+		{cmp("gt", "", "2016-12-31T23:59:60Z"), a("2017-01-01T00:00:00Z"), false},
+		{cmp("le", "", "2016-12-31T23:59:60Z"), a("2017-01-01T00:00:00Z"), false},
+		// Lowercase t and z, and a space, are unsupported (F-G5).
+		{cmp("lt", "", "2026-01-02T00:00:00Z"), a("2026-01-01t00:00:00Z"), false},
+		{cmp("lt", "", "2026-01-02T00:00:00Z"), a("2026-01-01T00:00:00z"), false},
+		{cmp("lt", "", "2026-01-02T00:00:00Z"), a("2026-01-01 00:00:00Z"), false},
+		// Not date-times: dates that don't exist, missing parts.
+		{cmp("lt", "", "2026-03-01T00:00:00Z"), a("2026-02-29T00:00:00Z"), false},
+		{cmp("lt", "", "2026-03-01T00:00:00Z"), a("2026-02-30T00:00:00Z"), false},
+		{cmp("lt", "", "2026-03-01T00:00:00Z"), a("2026-02-01T24:00:00Z"), false},
+		{cmp("lt", "", "2026-03-01T00:00:00Z"), a("2026-02-01T00:00:00."), false},
+		{cmp("lt", "", "2026-03-01T00:00:00Z"), a("2026-02-01T00:00:00"), false},
+		{cmp("lt", "", "2026-03-01T00:00:00Z"), a("2026-02-01T00:00:00+0100"), false},
+		{cmp("lt", "", "2026-03-01T00:00:00Z"), a("2026-02-01T00:00:00+24:00"), false},
+		{cmp("lt", "", "2026-03-01T00:00:00Z"), a("2026-02-01"), false},
+		{cmp("lt", "", "2026-03-01T00:00:00Z"), a("+2026-02-01T00:00:00Z"), false},
+	})
+}
+
+// GB-15 (§6.2 End-to-end namespaces): EvalTri leaves writes predicates and
+// /writes and /doc paths unknown, and combines all, any, not and if in
+// Kleene logic, so only a rule whose outcome depends on them is Unknown.
+func TestV073P20EvalTri(t *testing.T) {
+	t.Parallel()
+	create := `{"action":"create","resource":"r","principal":{"id":"u1","groups":["ops"]},"now":"2026-01-01T00:00:00Z","writes":[],"doc":null,"patches":[]}`
+	cases := []struct {
+		rule string
+		want Tri
+	}{
+		{`{"if":[{"op":"test","path":"/action","value":"delete"}],"then":[{"op":"test","path":"/doc/x","exists":true}]}`, True},
+		{`{"if":[{"op":"test","path":"/action","value":"create"}],"then":[{"op":"test","path":"/doc/x","exists":true}]}`, Unknown},
+		{`{"op":"test","path":"/doc/x","exists":true}`, Unknown},
+		{`{"op":"test","path":"/doc/x","exists":false}`, Unknown},
+		{`{"op":"test","path":"/doc","value":null}`, Unknown},
+		{`{"op":"test","path":"/writes/0","exists":false}`, Unknown},
+		// The members themselves are there whatever they hold.
+		{`{"op":"test","path":"/doc","exists":true}`, True},
+		{`{"op":"test","path":"/writes","exists":false}`, False},
+		{`{"op":"test","path":"","exists":true}`, True},
+		{`{"op":"test","path":"","schema":{"type":"object"}}`, Unknown},
+		{`{"op":"writes","within":["/a"]}`, Unknown},
+		{`{"op":"writes","covers":""}`, Unknown},
+		{`{"any":[{"op":"test","path":"/action","value":"create"},{"op":"writes","within":["/a"]}]}`, True},
+		{`{"any":[{"op":"test","path":"/action","value":"append"},{"op":"writes","within":["/a"]}]}`, Unknown},
+		{`{"all":[{"op":"test","path":"/principal/id","value":"u1"},{"op":"writes","within":["/a"]}]}`, Unknown},
+		{`{"all":[{"op":"test","path":"/principal/id","value":"u2"},{"op":"writes","within":["/a"]}]}`, False},
+		{`{"all":[{"op":"writes","within":["/a"]},{"op":"test","path":"/principal/id","value":"u2"}]}`, False},
+		{`{"not":{"op":"writes","overlaps":"/owner"}}`, Unknown},
+		{`{"not":{"op":"test","path":"/action","value":"create"}}`, False},
+		{`{"if":[{"op":"writes","overlaps":"/a"}],"then":[{"op":"test","path":"/principal/groups","schema":{"contains":{"const":"ops"}}}]}`, True},
+		{`{"if":[{"op":"writes","overlaps":"/a"}],"then":[{"op":"test","path":"/principal/groups","schema":{"contains":{"const":"dev"}}}]}`, Unknown},
+		{`{"if":[{"op":"test","path":"/action","value":"create"}],"then":[{"op":"writes","within":["/a"]},{"op":"test","path":"/resource","value":"s"}]}`, False},
+		{`{"if":[],"then":[]}`, True},
+		// A compare is decided by a known operand that makes it false
+		// whatever the other holds, and is otherwise unknown.
+		{`{"op":"compare","path":"/doc/region","in":{"value":"se"}}`, False},
+		{`{"op":"compare","path":"/doc/region","in":{"path":"/resource"}}`, False},
+		{`{"op":"compare","path":"/doc/region","in":{"path":"/principal/groups"}}`, Unknown},
+		{`{"op":"compare","path":"/doc/n","lt":{"value":true}}`, False},
+		{`{"op":"compare","path":"/doc/n","lt":{"value":"tomorrow"}}`, False},
+		{`{"op":"compare","path":"/doc/n","lt":{"value":3}}`, Unknown},
+		{`{"op":"compare","path":"/now","lt":{"path":"/doc/lockAt"}}`, Unknown},
+		{`{"op":"compare","path":"/principal","lt":{"path":"/doc/lockAt"}}`, False},
+		{`{"op":"compare","path":"/missing","eq":{"path":"/doc/owner"}}`, False},
+		{`{"op":"compare","path":"/doc/owner","eq":{"path":"/principal/id"}}`, Unknown},
+		{`{"op":"compare","path":"/principal/id","eq":{"value":"u1"}}`, True},
+		// The whole envelope is an object, whatever it holds.
+		{`{"op":"compare","path":"/principal/id","in":{"path":""}}`, False},
+		{`{"op":"compare","path":"","lt":{"value":3}}`, False},
+		{`{"op":"compare","path":"","eq":{"path":"/principal"}}`, Unknown},
+		{`{"op":"compare","path":"/principal/groups","eq":{"path":""}}`, Unknown},
+	}
+	for i, x := range cases {
+		r := c(t, x.rule)
+		if got := r.EvalTri(env(create), "writes", "doc"); got != x.want {
+			t.Errorf("case %d: %s = %v, want %v", i, x.rule, got, x.want)
+		}
+	}
+	// A delete's writes are known ([]); only its doc is hidden.
+	del := env(`{"action":"delete","resource":"r","writes":[],"doc":null}`)
+	if got := c(t, `{"op":"writes","within":["/a"]}`).EvalTri(del, "doc"); got != True {
+		t.Errorf("writes within on a delete with doc hidden: %v", got)
+	}
+	if got := c(t, `{"op":"test","path":"/doc/x","exists":false}`).EvalTri(del, "doc"); got != Unknown {
+		t.Errorf("a /doc test on a delete with doc hidden: %v", got)
+	}
+
+	// The list form: the first rule that isn't True, the failing form's
+	// path for False, the rule's own for Unknown (it fails as a whole).
+	rs, err := CompileList(jsonv.MustParse([]byte(`[
+	  {"if":[{"op":"test","path":"/action","value":"delete"}],"then":[{"op":"test","path":"/doc/x","exists":true}]},
+	  {"all":[{"op":"writes","within":["/a"]},{"if":[{"op":"test","path":"/action","value":"create"}],"then":[{"op":"test","path":"/resource","value":"s"}]}]},
+	  {"op":"test","path":"/doc/x","exists":true}]`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i, path, v := EvalTri(rs, env(create), "writes", "doc"); i != 1 || path != "/rules/1/all/1/then/0" || v != False {
+		t.Errorf("EvalTri = (%d, %q, %v), want (1, /rules/1/all/1/then/0, false)", i, path, v)
+	}
+	if i, path, v := EvalTri(rs[2:], env(create), "writes", "doc"); i != 0 || path != "/rules/2" || v != Unknown {
+		t.Errorf("EvalTri unknown = (%d, %q, %v), want (0, /rules/2, unknown)", i, path, v)
+	}
+	if i, path, v := EvalTri(rs[:1], env(create), "writes", "doc"); i != -1 || path != "" || v != True {
+		t.Errorf("EvalTri pass = (%d, %q, %v)", i, path, v)
+	}
+}
+
+// With nothing unknown, EvalTri is Eval, and EvalTri's list form is
+// EvalList.
+func TestV073P20EvalTriKnown(t *testing.T) {
+	t.Parallel()
+	e := env(`{"action":"append","principal":{"id":"u1","roles":["desk"],"attrs":{"regions":["se"]}},"now":"2026-01-01T00:00:00Z","writes":["/x"],"doc":{"owner":"u1","region":"se","lockAt":"2025-01-01T00:00:00Z"}}`)
+	for _, s := range []string{ownership, `{"op":"writes","within":["/x"]}`, `{"not":{"op":"writes","covers":""}}`,
+		`{"any":[{"op":"test","path":"/doc/owner","value":"u2"}]}`, `{"if":[],"then":[{"op":"test","path":"/doc","exists":false}]}`} {
+		r := c(t, s)
+		if got, want := r.EvalTri(e), tri(r.Eval(e)); got != want {
+			t.Errorf("%s: EvalTri %v, Eval %v", s, got, want)
+		}
+	}
+	rs, _ := CompileList(jsonv.MustParse([]byte(examples)))
+	for _, s := range []string{
+		`{"action":"create","writes":[""],"doc":{}}`,
+		`{"action":"delete","writes":[],"doc":null,"principal":{"groups":["dev"]}}`,
+		`{"action":"append","writes":[""],"doc":{"$schema":"/r/schemas/match/rev/2"}}`,
+		`{"action":"append","writes":["/title"],"doc":{"$schema":"/r/schemas/match/rev/2"}}`,
+	} {
+		i, p, ok := EvalList(rs, env(s))
+		j, q, v := EvalTri(rs, env(s))
+		if i != j || p != q || tri(ok) != v {
+			t.Errorf("%s: EvalList (%d, %q, %v), EvalTri (%d, %q, %v)", s, i, p, ok, j, q, v)
+		}
+	}
+}
+
+// CIS-21 (§6.4.2): a schema fragment written now is held to §6.1's $id
+// ban, §6.5 and §6.6 as a schema document is, with no $schema in any
+// subschema and same-document $ref and $dynamicRef only; CIS-15: asserted
+// with draft 2020-12's format set, and no other format; CIS-16: patterns
+// are RE2 with \uXXXX read as \x{XXXX}. A fragment stored before compiles
+// as it did (Compile).
+func TestV073P20SchemaFragments(t *testing.T) {
+	t.Parallel()
+	rule := func(schema string) any {
+		return jsonv.MustParse([]byte(`{"op":"test","path":"/a","schema":` + schema + `}`))
+	}
+	for _, s := range []string{
+		`{"$id":"x"}`,
+		`{"$id":"/r/schemas/s/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		`{"$schema":"https://json-schema.org/draft/2020-12/schema"}`,
+		`{"properties":{"a":{"$schema":"https://json-schema.org/draft/2020-12/schema"}}}`,
+		`{"foo":1}`,
+		`{"items":{"bar":{}}}`,
+		`{"format":"nope"}`,
+		`{"format":"semver"}`,
+		`{"format":"period"}`,
+		`{"dependencies":{}}`,
+		`{"$recursiveRef":"#"}`,
+		`{"$recursiveAnchor":true}`,
+		`{"$ref":"/r/schemas/s/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		`{"$ref":"https://example.com/s.json"}`,
+		`{"$dynamicRef":"other#x"}`,
+		`{"$ref":"#/$defs/missing"}`,
+		`{"pattern":"\\ud800"}`,
+		`{"pattern":"\\x{DC00}"}`,
+		`{"patternProperties":{"\\udfff":{}}}`,
+		`{"pattern":"(?=a)"}`,
+	} {
+		if _, err := CompileStrict(rule(s)); err == nil {
+			t.Errorf("CompileStrict accepted %s", s)
+		}
+		if _, err := CompileListStrict([]any{rule(s)}, nil); err == nil {
+			t.Errorf("CompileListStrict accepted %s", s)
+		}
+	}
+	// Accepted, and as §6.6 and the format set say.
+	for _, x := range []struct {
+		schema, yes, no string
+	}{
+		{`{"pattern":"^\\u00e9$"}`, `"é"`, `"e"`},
+		{`{"pattern":"^[\\u00e0-\\u00ff]+$"}`, `"éà"`, `"ea"`},
+		{`{"pattern":"^\\ud83d\\ude00$"}`, `"😀"`, `"x"`},
+		{`{"patternProperties":{"^\\u00e9$":{"type":"number"}}}`, `{"é":1}`, `{"é":"x"}`},
+		{`{"pattern":"^\\\\u0041$"}`, `"\\u0041"`, `"A"`},
+		{`{"format":"idn-email"}`, `"jörg@exämple.se"`, `"not an email"`},
+		{`{"format":"idn-hostname"}`, `"exämple.se"`, `"-bad-.se"`},
+		{`{"format":"date-time"}`, `"2026-01-01T00:00:00Z"`, `"tomorrow"`},
+		{`{"definitions":{"n":{"type":"integer"}},"$ref":"#/definitions/n"}`, `3`, `"3"`},
+		{`{"$defs":{"n":{"$anchor":"num","type":"integer"}},"$ref":"#num"}`, `3`, `"3"`},
+		{`{"x-index":{"text":true},"type":"string"}`, `"s"`, `1`},
+	} {
+		r, err := CompileStrict(rule(x.schema))
+		if err != nil {
+			t.Errorf("CompileStrict(%s): %v", x.schema, err)
+			continue
+		}
+		if !r.Eval(env(`{"a":` + x.yes + `}`)) {
+			t.Errorf("%s: %s fails", x.schema, x.yes)
+		}
+		if r.Eval(env(`{"a":` + x.no + `}`)) {
+			t.Errorf("%s: %s passes", x.schema, x.no)
+		}
+	}
+
+	// As stored: what v0.55 accepted still compiles, and validates as it
+	// did (semver asserted by the library), but for draft 2020-12's
+	// formats, which §6.4.2 asserts whenever a fragment was written
+	// (idn-email, which v0.55 ignored); \u patterns, which RE2 refused,
+	// now compile too.
+	for _, x := range []struct {
+		schema, yes, no string
+	}{
+		{`{"$id":"x","type":"string"}`, `"s"`, `1`},
+		{`{"foo":1,"type":"string"}`, `"s"`, `1`},
+		{`{"properties":{"b":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"string"}}}`, `{"b":"s"}`, `{"b":1}`},
+		{`{"format":"semver"}`, `"1.2.3"`, `"one"`},
+		{`{"format":"nope","type":"string"}`, `"s"`, `1`},
+		{`{"format":"idn-email","type":"string"}`, `"jörg@exämple.se"`, `"not an email"`},
+		{`{"format":"idn-hostname","properties":{"b":{"$schema":"https://json-schema.org/draft/2020-12/schema","format":"semver"}}}`, `"exämple.se"`, `"-bad-.se"`},
+		{`{"pattern":"^\\u00e9$"}`, `"é"`, `"e"`},
+		{`{"pattern":"^\\x{D800}?a$"}`, `"a"`, `"b"`},
+	} {
+		r, err := Compile(rule(x.schema))
+		if err != nil {
+			t.Errorf("Compile(%s): %v", x.schema, err)
+			continue
+		}
+		if !r.Eval(env(`{"a":`+x.yes+`}`)) || r.Eval(env(`{"a":`+x.no+`}`)) {
+			t.Errorf("as stored %s: %s should pass and %s fail", x.schema, x.yes, x.no)
+		}
+		rs, err := CompileList([]any{rule(x.schema)})
+		if err != nil || len(rs) != 1 {
+			t.Errorf("CompileList(%s): %v", x.schema, err)
+		}
+	}
+	// A rule kept unchanged from a stored document compiles as stored;
+	// any other in the list is held to the fragment rules.
+	old := rule(`{"format":"semver"}`)
+	kept := func(r any) bool { return jsonv.Equal(r, old) }
+	if _, err := CompileListStrict([]any{rule(`{"type":"string"}`), old}, kept); err != nil {
+		t.Errorf("a kept rule: %v", err)
+	}
+	if _, err := CompileListStrict([]any{old, rule(`{"format":"period"}`)}, kept); err == nil {
+		t.Error("a new rule beside a kept one was accepted")
+	}
+	// Nested forms are held too, and a kept rule is kept whole.
+	nested := jsonv.MustParse([]byte(`{"if":[{"op":"test","path":"/action","value":"create"}],"then":[{"not":{"op":"test","path":"/doc","schema":{"$id":"x"}}}]}`))
+	if _, err := CompileStrict(nested); err == nil {
+		t.Error("a nested fragment escaped the rules")
+	}
+	if _, err := CompileListStrict([]any{nested}, func(r any) bool { return jsonv.Equal(r, nested) }); err != nil {
+		t.Errorf("a kept nested rule: %v", err)
+	}
+}
+
+// CIS-15 (§6.4.2): a rule's schema is applied with format assertions as
+// at step 5 of §6.2, whichever way the rule compiles. A rule written now
+// is accepted by CompileStrict, but evaluated as it is compiled from
+// where it is kept: a grant's rules and a key scope's attrs through
+// Compile, a namespace document's through CompileList (its stored
+// parse). Each asserts what CompileStrict's does.
+func TestV073P20FragmentFormatsEvaluated(t *testing.T) {
+	t.Parallel()
+	for _, x := range []struct {
+		schema, yes, no string
+	}{
+		{`{"type":"string","format":"idn-email"}`, `"jörg@exämple.se"`, `"not an email"`},
+		{`{"type":"string","format":"idn-hostname"}`, `"exämple.se"`, `"-bad-.se"`},
+		{`{"properties":{"mail":{"format":"idn-email"}}}`, `{"mail":"eva@exämple.se"}`, `{"mail":"nope"}`},
+		{`{"format":"email"}`, `"a@example.se"`, `"nope"`},
+		{`{"pattern":"^\\u00e9$","format":"idn-hostname"}`, `"é"`, `"e"`},
+	} {
+		v := jsonv.MustParse([]byte(`{"op":"test","path":"/a","schema":` + x.schema + `}`))
+		strict, err := CompileStrict(v)
+		if err != nil {
+			t.Fatalf("CompileStrict(%s): %v", x.schema, err)
+		}
+		stored, err := Compile(v)
+		if err != nil {
+			t.Fatalf("Compile(%s): %v", x.schema, err)
+		}
+		list, err := CompileList([]any{v})
+		if err != nil {
+			t.Fatalf("CompileList(%s): %v", x.schema, err)
+		}
+		for name, r := range map[string]*Rule{"CompileStrict": strict, "Compile": stored, "CompileList": list[0]} {
+			if !r.Eval(env(`{"a":` + x.yes + `}`)) {
+				t.Errorf("%s(%s): %s fails", name, x.schema, x.yes)
+			}
+			if r.Eval(env(`{"a":` + x.no + `}`)) {
+				t.Errorf("%s(%s): %s passes", name, x.schema, x.no)
+			}
+			if got := r.EvalTri(env(`{"a":` + x.no + `}`)); got != False {
+				t.Errorf("%s(%s): EvalTri of %s is %v", name, x.schema, x.no, got)
+			}
+		}
+	}
+}

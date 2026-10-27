@@ -122,7 +122,7 @@ func TestBlobUploadAndRead(t *testing.T) {
 	head := e.create("m", "a", map[string]any{"body": ref(bid, "text/plain", len(data), "")})
 	r := e.get(blobPath("m", "a", bid))
 	expect(t, r, 200)
-	if string(r.Body) != string(data) || r.H.Get("Content-Type") != "text/plain" || etagOf(r) != bid ||
+	if string(r.Body) != string(data) || r.H.Get("Content-Type") != "text/plain; charset=utf-8" || etagOf(r) != bid ||
 		r.H.Get("Accept-Ranges") != "bytes" {
 		t.Fatalf("blob answer %v %q", r.H, r.Body)
 	}
@@ -872,7 +872,7 @@ func TestBlobDryRun(t *testing.T) {
 	expect(t, r, 200)
 	items := r.Obj()["items"].([]any)
 	ok, bad := items[0].(map[string]any), items[1].(map[string]any)
-	if ok["status"] != 200.0 || bad["status"] != 422.0 || bad["code"] != "blob" {
+	if ok["status"] != 201.0 || bad["status"] != 422.0 || bad["code"] != "blob" {
 		t.Fatalf("report %s", r.Body)
 	}
 	if s := e.blobStats(); s.Attached != 0 || s.Pending != 1 {

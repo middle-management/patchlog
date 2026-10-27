@@ -30,10 +30,10 @@ func TestNamespace(t *testing.T) {
 	}
 	expect(t, e.get("/ns/docs/rev/"+hashID(t, "", []byte("x"))), 404)
 
-	// Creating an existing namespace: 412 {config}.
-	r = e.do(req{method: "PATCH", path: "/ns/docs", ifNoneMatch: "*", body: addRoot(map[string]any{})})
+	// Creating an existing namespace: 412 without config (v0.71 §7.4).
+	r = e.do(req{method: "PATCH", path: "/ns/docs", ifNoneMatch: "*", body: addRoot(map[string]any{}), author: "admin"})
 	expectCode(t, r, 412, "stale")
-	if r.Str("config") != cfg0 {
+	if _, has := r.Obj()["config"]; has {
 		t.Fatalf("412 body %s", r.Body)
 	}
 	// Document writes don't move the config id, so If-Match stays valid.
@@ -65,8 +65,8 @@ func TestNamespace(t *testing.T) {
 		t.Fatalf("412 %s", r.Body)
 	}
 	// 428 and 415.
-	expectCode(t, e.do(req{method: "PATCH", path: "/ns/docs", body: patches}), 428, "precondition_required")
-	expect(t, e.do(req{method: "PATCH", path: "/ns/docs", ct: "application/json", ifMatch: cfg1, body: patches}), 415)
+	expectCode(t, e.do(req{method: "PATCH", path: "/ns/docs", body: patches, author: "alice"}), 428, "precondition_required")
+	expect(t, e.do(req{method: "PATCH", path: "/ns/docs", ct: "application/json", ifMatch: cfg1, body: patches, author: "alice"}), 415)
 	// Validation against the built-in namespace-document schema.
 	expect(t, e.patchNS("docs", ops(op("replace", "/read", "everyone")), ""), 422)
 	expect(t, e.patchNS("docs", ops(op("add", "/rules", "nope")), ""), 422)
@@ -109,7 +109,7 @@ func TestNamespace(t *testing.T) {
 	e.create("docs", "c", map[string]any{})
 	r = e.get("/ns/docs/rev/" + e.nsHead("docs") + "/heads")
 	expect(t, r, 200)
-	items := r.Obj()["items"].([]any)
+	items := r.Obj()["heads"].([]any)
 	got := []string{}
 	for _, x := range items {
 		m := x.(map[string]any)
@@ -119,11 +119,11 @@ func TestNamespace(t *testing.T) {
 		t.Fatalf("heads %v", got)
 	}
 	r = e.get("/ns/docs/rev/" + head + "/heads")
-	if len(r.Obj()["items"].([]any)) != 0 {
+	if len(r.Obj()["heads"].([]any)) != 0 {
 		t.Fatalf("heads at genesis %s", r.Body)
 	}
 	r = e.get("/ns/docs/rev/" + e.nsHead("docs") + "/heads?after=a")
-	if n := len(r.Obj()["items"].([]any)); n != 2 {
+	if n := len(r.Obj()["heads"].([]any)); n != 2 {
 		t.Fatalf("heads after=a %s", r.Body)
 	}
 }
@@ -161,10 +161,11 @@ func TestBatch(t *testing.T) {
 	if nsid == "" || r.H.Get("X-Namespace-Revision") != nsid || nsid != e.nsHead("m") {
 		t.Fatalf("batch ns id %s %v", r.Body, r.H)
 	}
-	// The dry-run report adds index and status; the ids are the submit's.
+	// The dry-run report adds index and status, 201 for an item that
+	// would pass (§7.5); the ids are the submit's.
 	for i, it := range r.Obj()["items"].([]any) {
 		d := dry.([]any)[i].(map[string]any)
-		if d["index"] != float64(i) || d["status"] != 200.0 || string(canonical(d["ids"])) != string(canonical(it.(map[string]any)["ids"])) {
+		if d["index"] != float64(i) || d["status"] != 201.0 || string(canonical(d["ids"])) != string(canonical(it.(map[string]any)["ids"])) {
 			t.Fatalf("dry run %v differs from %v", d, it)
 		}
 	}
@@ -267,7 +268,7 @@ func TestBatch(t *testing.T) {
 	r = e.do(req{method: "POST", path: "/ns/m/batch", author: "alice", body: map[string]any{"items": []any{
 		map[string]any{"resource": "y1", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}},
 		map[string]any{"resource": "y2", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}}})
-	expectLimit(t, r, 413, "itemsPerBatch", 2, 1)
+	expectLimit(t, r, 422, "itemsPerBatch", 2, 1)
 }
 
 // §7.5: config change in a batch, items against the new configuration,
@@ -418,7 +419,7 @@ func TestBatchDryRunNewPrincipal(t *testing.T) {
 	}
 	a, b, c := rep[0].(map[string]any), rep[1].(map[string]any), rep[2].(map[string]any)
 	if a["index"] != 0.0 || a["status"] != 412.0 || a["code"] != "stale" || b["status"] != 422.0 || b["code"] != "invalid" ||
-		c["status"] != 200.0 || c["ids"].([]any)[0] != hashID(t, "", canonical(addRoot(map[string]any{}))) {
+		c["status"] != 201.0 || c["ids"].([]any)[0] != hashID(t, "", canonical(addRoot(map[string]any{}))) {
 		t.Fatalf("report %s", r.Body)
 	}
 	// Authorisation failures still answer as a submit would (§6.2).

@@ -143,10 +143,29 @@ func RecipientJWK(pub *ecdh.PublicKey) map[string]any {
 	return map[string]any{"kty": "OKP", "crv": "X25519", "x": b64.EncodeToString(pub.Bytes())}
 }
 
-// RecipientID is the stable id of a recipient public key:
+// RecipientID is the id that named a recipient public key before v0.63:
 // text(trunc160(sha256(canonical({kty, crv, x})))), a 33-character id.
+//
+// Deprecated: the spec names keys by Thumbprint (§E.2.3, §E.3.2), in
+// keyring entries and /keys relays alike. RecipientID remains only to read
+// keyrings stored in the format before v0.63 (Keyring) and migrate them.
 func RecipientID(pub *ecdh.PublicKey) string {
 	return ids.Of(jsonv.Canonical(RecipientJWK(pub))).String()
+}
+
+// Thumbprint is the RFC 7638 SHA-256 thumbprint of pub as a JWK, base64url
+// without padding (43 characters): it names a recipient or sender in
+// keyring entries (to, from) and /keys relays (§E.2.3, §E.3.2).
+func Thumbprint(pub *ecdh.PublicKey) string {
+	return jwkThumbprint(RecipientJWK(pub))
+}
+
+// jwkThumbprint hashes the canonical JSON of a JWK's required members,
+// which is RFC 7638's input (§3): members in lexicographic order, no
+// whitespace, which for an OKP key are crv, kty and x.
+func jwkThumbprint(required map[string]any) string {
+	s := sha256.Sum256(jsonv.Canonical(required))
+	return b64.EncodeToString(s[:])
 }
 
 // GenerateRecipient makes a new X25519 key pair and returns its public JWK
@@ -163,26 +182,41 @@ func GenerateRecipient() (jwk map[string]any, priv *ecdh.PrivateKey, err error) 
 
 // Suite names the HPKE ciphersuite of wrapped keys: base mode,
 // KEM DHKEM(X25519, HKDF-SHA256) 0x0020, KDF HKDF-SHA256 0x0001,
-// AEAD AES-256-GCM 0x0002.
+// AEAD AES-256-GCM 0x0002. /keys entries don't carry it since v0.63
+// (§E.2.3); ParseWrappedKey still accepts it, and sealed bundles name it.
 const Suite = "hpke-base-0x0020-0x0001-0x0002"
 
-// WrapInfoPrefix prefixes the HPKE info string: info = prefix ‖ context.
-const WrapInfoPrefix = "patchlog-keys-v1\n"
+// WrapInfoPrefix starts the HPKE info of every wrapped key (§E.2.3):
+// info = "patchlog-key-v1" ‖ 0x0A ‖ kid ‖ 0x0A ‖ name.
+const WrapInfoPrefix = "patchlog-key-v1\n"
 
-// WrappedKey is the wire form of a key wrapped to one recipient:
+// WrappedKey is the wire form of a key wrapped to one recipient, an entry
+// of a /keys answer (§E.2.3):
 //
-//	{ "kid": "{ns}#{e}", "resource"?: name, "suite": Suite, "wrapped": base64url(enc ‖ ct) }
+//	{ "kid": "{ns}#{e}", "name"?: resource, "from"?: thumbprint, "wrapped": base64url(enc ‖ ct) }
 //
-// The HPKE context is kid, or kid ‖ "\n" ‖ resource for a per-resource key,
-// so a wrapped key can't be presented as another epoch's or resource's.
+// name is set for a per-resource key K_r, and from for a keyring entry
+// relayed at E3 (§E.3.2), wrapped in HPKE auth mode under the admin key
+// whose thumbprint it is (UnwrapKeyAuth). The HPKE info binds kid and the
+// resource name (wrapInfo), so a wrapped key can't be presented as another
+// epoch's or resource's.
 type WrappedKey struct {
 	Kid      string
-	Resource string // "" for an epoch key
+	Resource string // the wire's name: "" for an epoch key
+	From     string // thumbprint of the sender of a keyring entry, "" otherwise
 	Wrapped  []byte // HPKE enc ‖ ciphertext
 }
 
-func wrapContext(kid, resource string) []byte {
-	c := WrapInfoPrefix + kid
+// wrapInfo is the HPKE info of kid's key: K_r of resource, or K_e with
+// resource "", whose info then ends in 0x0A (§E.2.3).
+func wrapInfo(kid, resource string) []byte {
+	return []byte(WrapInfoPrefix + kid + "\n" + resource)
+}
+
+// legacyWrapInfo is the info keys were wrapped under before v0.63:
+// "patchlog-keys-v1" ‖ 0x0A ‖ kid, then 0x0A ‖ resource for a K_r only.
+func legacyWrapInfo(kid, resource string) []byte {
+	c := "patchlog-keys-v1\n" + kid
 	if resource != "" {
 		c += "\n" + resource
 	}
@@ -194,7 +228,8 @@ var (
 	hpkeAEAD = hpke.AES256GCM()
 )
 
-// WrapKey wraps key (K_e, or K_r when resource is non-empty) for recipient.
+// WrapKey wraps key (K_e, or K_r when resource is non-empty) for recipient
+// in HPKE base mode with an empty aad (§E.2.3).
 func WrapKey(recipient *ecdh.PublicKey, kid, resource string, key []byte) (WrappedKey, error) {
 	if len(key) != KeySize {
 		return WrappedKey{}, ErrKeySize
@@ -203,7 +238,7 @@ func WrapKey(recipient *ecdh.PublicKey, kid, resource string, key []byte) (Wrapp
 	if err != nil {
 		return WrappedKey{}, err
 	}
-	w, err := hpke.Seal(pk, hpkeKDF, hpkeAEAD, wrapContext(kid, resource), key)
+	w, err := hpke.Seal(pk, hpkeKDF, hpkeAEAD, wrapInfo(kid, resource), key)
 	if err != nil {
 		return WrappedKey{}, err
 	}
@@ -212,22 +247,38 @@ func WrapKey(recipient *ecdh.PublicKey, kid, resource string, key []byte) (Wrapp
 
 // UnwrapKey recovers the key in w with the recipient's private key.
 func UnwrapKey(priv *ecdh.PrivateKey, w WrappedKey) ([]byte, error) {
+	return unwrapBase(priv, wrapInfo(w.Kid, w.Resource), w.Wrapped)
+}
+
+// UnwrapKeyLegacy recovers a key wrapped before v0.63, under the old info
+// (legacyWrapInfo), such as an entry of a keyring stored then. Such
+// keyrings must be wrapped again (KeyringV2); this is only for reading
+// them to do so.
+func UnwrapKeyLegacy(priv *ecdh.PrivateKey, w WrappedKey) ([]byte, error) {
+	return unwrapBase(priv, legacyWrapInfo(w.Kid, w.Resource), w.Wrapped)
+}
+
+func unwrapBase(priv *ecdh.PrivateKey, info, wrapped []byte) ([]byte, error) {
 	sk, err := hpke.NewDHKEMPrivateKey(priv)
 	if err != nil {
 		return nil, err
 	}
-	k, err := hpke.Open(sk, hpkeKDF, hpkeAEAD, wrapContext(w.Kid, w.Resource), w.Wrapped)
+	k, err := hpke.Open(sk, hpkeKDF, hpkeAEAD, info, wrapped)
 	if err != nil || len(k) != KeySize {
 		return nil, ErrDecrypt
 	}
 	return k, nil
 }
 
-// Value returns the JSON model value of w.
+// Value returns the JSON model value of w (§E.2.3): kid, wrapped, and
+// name and from where set.
 func (w WrappedKey) Value() map[string]any {
-	m := map[string]any{"kid": w.Kid, "suite": Suite, "wrapped": b64.EncodeToString(w.Wrapped)}
+	m := map[string]any{"kid": w.Kid, "wrapped": b64.EncodeToString(w.Wrapped)}
 	if w.Resource != "" {
-		m["resource"] = w.Resource
+		m["name"] = w.Resource
+	}
+	if w.From != "" {
+		m["from"] = w.From
 	}
 	return m
 }
@@ -235,8 +286,11 @@ func (w WrappedKey) Value() map[string]any {
 // MarshalJSON returns canonical JSON of Value.
 func (w WrappedKey) MarshalJSON() ([]byte, error) { return jsonv.Canonical(w.Value()), nil }
 
-// ParseWrappedKey parses the model value (or JSON text) of a WrappedKey. A
-// missing suite means Suite; any other suite is rejected.
+// ParseWrappedKey parses the model value (or JSON text) of a WrappedKey. It
+// also accepts the form before v0.63, which named a K_r's resource
+// `resource` and carried `suite`: a suite other than Suite is rejected, as
+// is a `resource` beside a `name` that differs. A from must be a
+// thumbprint (ValidThumbprint). Other members are ignored.
 func ParseWrappedKey(v any) (WrappedKey, error) {
 	if b, ok := v.([]byte); ok {
 		p, err := jsonv.Parse(b)
@@ -251,9 +305,20 @@ func ParseWrappedKey(v any) (WrappedKey, error) {
 	}
 	var w WrappedKey
 	w.Kid, _ = m["kid"].(string)
-	if r, ok := m["resource"]; ok {
-		if w.Resource, ok = r.(string); !ok || w.Resource == "" {
-			return WrappedKey{}, fmt.Errorf("%w: wrapped key resource", ErrFormat)
+	for _, member := range []string{"name", "resource"} {
+		r, ok := m[member]
+		if !ok {
+			continue
+		}
+		s, ok := r.(string)
+		if !ok || s == "" || w.Resource != "" && w.Resource != s {
+			return WrappedKey{}, fmt.Errorf("%w: wrapped key %s", ErrFormat, member)
+		}
+		w.Resource = s
+	}
+	if f, ok := m["from"]; ok {
+		if w.From, ok = f.(string); !ok || !ValidThumbprint(w.From) {
+			return WrappedKey{}, fmt.Errorf("%w: wrapped key from must be a thumbprint", ErrFormat)
 		}
 	}
 	if s, ok := m["suite"]; ok && s != Suite {

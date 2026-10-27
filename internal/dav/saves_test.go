@@ -652,8 +652,9 @@ func TestSavePreconditionsPlaceholder(t *testing.T) {
 func TestSaveDeleteThenWriteFails(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{
-		"cat": {"catalog": treeCatalog("docs")},
+		"cat": {"catalog": treeCatalog("files")},
 	}, func(_ *clienttest.Options, o *dav.Options) { o.MaxFileSize = 1024 })
+	must(e.c.CreateNamespace(e.ctx, "files", map[string]any{"read": "public"}))
 	for i, c := range []struct {
 		what   string
 		status int
@@ -684,17 +685,17 @@ func TestSaveDeleteThenWriteFails(t *testing.T) {
 			t.Fatalf("%s: restored with %+v", c.what, en)
 		}
 	}
-	e.create("docs", "p", map[string]any{"v": 1})
+	e.create("files", "p", map[string]any{"v": 1})
 	e.create("cat", "root", map[string]any{"parents": []any{}})
-	e.create("cat", "docs.p", map[string]any{"title": "p.json", "parents": parents("cat", "root")})
+	e.create("cat", "files.p", map[string]any{"title": "p.json", "parents": parents("cat", "root")})
 	e.expect(e.do("DELETE", "/cat/p.json", ""), 204, "DELETE a tree's file")
-	e.expectTombstoned("docs", "p", "the item")
+	e.expectTombstoned("files", "p", "the item")
 	r := e.expect(e.do("PUT", "/cat/p.json", `{"v": 2`), 400, "PUT of a body that isn't JSON to its path")
 	if !strings.Contains(r.body, "restored as it was") {
 		t.Fatalf("400 %q", r.body)
 	}
-	sameJSON(t, e.parentsOf("docs.p"), parents("cat", "root"))
-	_, doc := e.load("docs", "p")
+	sameJSON(t, e.parentsOf("files.p"), parents("cat", "root"))
+	_, doc := e.load("files", "p")
 	sameJSON(t, doc, map[string]any{"v": 1})
 }
 

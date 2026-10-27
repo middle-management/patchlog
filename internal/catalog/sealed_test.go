@@ -35,7 +35,7 @@ func TestReadGrantKeys(t *testing.T) {
 	if r.status != 200 {
 		t.Fatalf("read-grants: %d %v", r.status, r.body)
 	}
-	gs := r.body["grants"].([]any)
+	gs := r.body["items"].([]any)
 	unwrap := func(e map[string]any) map[string][]byte {
 		t.Helper()
 		out := map[string][]byte{}
@@ -69,8 +69,10 @@ func TestReadGrantKeys(t *testing.T) {
 	if g1["grant"] != nil || names(k1) != "cat#1 season" {
 		t.Fatalf("catalog node: %v (keys %s)", g1, names(k1))
 	}
-	for _, g := range []map[string]any{g2, g3} {
-		if g["error"] == nil || g["keys"] != nil || g["grant"] != nil {
+	// A hidden item is refused as one without a placement, a hidden
+	// catalog node as one not in the catalog (§B.11.5).
+	for i, g := range []map[string]any{g2, g3} {
+		if g["status"] != []any{403.0, 404.0}[i] || g["keys"] != nil || g["grant"] != nil {
 			t.Fatalf("refused item: %v", g)
 		}
 	}
@@ -112,7 +114,7 @@ func TestReadGrantKeys(t *testing.T) {
 	// Without an enc key: the grant, and the keys withheld.
 	plain := w.caller("user:fiona", "fan-club")
 	r = w.do("POST", "/read-grants", plain, map[string]any{"items": toAny("/r/matches/derby")})
-	e := r.body["grants"].([]any)[0].(map[string]any)
+	e := entry(r, 0)
 	if e["grant"] == nil || e["keys"] != nil || e["keysWithheld"] == nil {
 		t.Fatalf("no enc: %v", e)
 	}

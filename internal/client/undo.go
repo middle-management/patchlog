@@ -68,6 +68,7 @@ import (
 	"net/url"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -336,7 +337,8 @@ type UndoResult struct {
 
 // Undo undoes gesture in ns (§11.2): it plans the inverse, stops on
 // conflicts (*ConflictError), writes it as one batch with a fresh Gesture
-// and Undoes: gesture, and re-plans after a 412 up to UndoRetries times.
+// and Undoes: gesture, and re-plans after a 412, or a 410 gone naming a
+// tombstone as head (headMoved), up to UndoRetries times.
 // An undo that can't be done is an *ImpossibleError.
 func (c *Client) Undo(ctx context.Context, ns, gesture string, opts ...UndoOption) (*UndoResult, error) {
 	cfg := undoOptions(opts)
@@ -359,13 +361,37 @@ func (c *Client) Undo(ctx context.Context, ns, gesture string, opts ...UndoOptio
 		if err == nil {
 			return &UndoResult{Plan: plan, Batch: br, Gesture: cfg.gesture, Attempts: attempt}, nil
 		}
-		if IsStale(err) {
+		if headMoved(err) {
 			last = err
 			continue
 		}
 		return nil, impossibleFromWrite(ns, gesture, err)
 	}
 	return nil, fmt.Errorf("client: undo of %s: the heads kept moving: %w", gesture, last)
+}
+
+// headMoved reports a write refused because a head it names moved since
+// it was read: a 412, or a 410 gone naming the tombstone that is now the
+// head, which an append or a create on a resource deleted meanwhile gets
+// from v0.73 instead of a 412 (§7.2, §8.1), alone or as the batch item
+// that sets the batch's status.
+func headMoved(err error) bool {
+	if IsStale(err) {
+		return true
+	}
+	ae, ok := AsAPIError(err)
+	if !ok || ae.Status != 410 {
+		return false
+	}
+	if ae.Code == "gone" {
+		return ae.Head() != ""
+	}
+	for _, it := range ae.Items() {
+		if st, _ := it["status"].(float64); st == 410 {
+			return it["code"] == "gone" && str(it, "head") != ""
+		}
+	}
+	return false
 }
 
 // PlanUndo plans the undo of gesture without writing anything: the inverse
@@ -998,7 +1024,9 @@ func (c *Client) readResource(ctx context.Context, env *undoEnv, s *gestureSite)
 		rr.start = undoState{doc: doc, exists: true}
 	}
 	if env.level == "e2e" {
-		if rr.log, rr.flags, err = env.cfg.e2e.OpenLog(ctx, env.ns, name, log); err != nil {
+		// The range follows since, which places a branch's forks: a base's
+		// ns is accepted only up to them (chainCheck, ENC-27).
+		if rr.log, rr.flags, err = env.cfg.e2e.openLog(ctx, env.ns, name, since, log); err != nil {
 			return nil, err
 		}
 	}
@@ -1113,7 +1141,8 @@ func fold(start undoState, log []LogEntry, flags []string, firstGesture int) ([]
 			fe.restore = st.deleted
 			st.deleted = false
 			if i < firstGesture {
-				nd, _, err := patch.Apply(st.doc, st.exists, ops, patch.Options{ResourceEnvelope: true})
+				// A create applies to the document null (§6.2 step 3).
+				nd, _, err := patch.Apply(st.doc, true, ops, patch.Options{ResourceEnvelope: true})
 				if err != nil {
 					return nil, st, fmt.Errorf("client: entry %s: %w", e.ID, err)
 				}
@@ -1122,22 +1151,19 @@ func fold(start undoState, log []LogEntry, flags []string, firstGesture int) ([]
 			}
 			for j, op := range ops {
 				pre := st.doc
-				nd, ws, err := patch.Apply(st.doc, st.exists, []patch.Op{op}, patch.Options{ResourceEnvelope: true})
+				nd, ws, err := patch.Apply(st.doc, true, []patch.Op{op}, patch.Options{ResourceEnvelope: true})
 				if err != nil {
 					return nil, st, fmt.Errorf("client: entry %s op %d: %w", e.ID, j, err)
 				}
 				st.doc, st.exists = nd, true
-				switch op.Op {
-				case "remove":
-					for _, w := range ws {
-						fe.writes = append(fe.writes, widen(pre, w))
-					}
-				case "move":
-					if len(ws) == 2 {
-						fe.writes = append(fe.writes, widen(pre, ws[0]), widen(nd, ws[1]))
-					}
-				default:
-					for _, w := range ws {
+				// A write is widened where its parent is an array, before
+				// the op (a removed element) or after it (an added one);
+				// a move's writes, and the arrays an op shifts (§6.4.1),
+				// may be either.
+				for _, w := range ws {
+					if v := widen(pre, w); len(v) < len(w) {
+						fe.writes = append(fe.writes, v)
+					} else {
 						fe.writes = append(fe.writes, widen(nd, w))
 					}
 				}
@@ -1430,7 +1456,7 @@ func invertRevision(fe *foldedEntry, st *undoState) ([]any, *UndoConflict) {
 		ops, err := patch.Parse([]any{op})
 		if err == nil {
 			var nd any
-			nd, _, err = patch.Apply(st.doc, st.exists, ops, patch.Options{})
+			nd, _, err = patch.Apply(st.doc, true, ops, patch.Options{})
 			if err == nil {
 				st.doc = nd
 			}
@@ -1495,18 +1521,28 @@ func moveBack(fe *foldedEntry, st *undoState, paths []pointer.Pointer) ([]any, b
 	doc := fe.pre.doc
 	back := make([]any, 0, len(moves))
 	for _, op := range moves {
-		nd, ws, err := patch.Apply(doc, true, []patch.Op{op}, patch.Options{})
-		if err != nil || len(ws) != 2 {
+		nd, _, err := patch.Apply(doc, true, []patch.Op{op}, patch.Options{})
+		if err != nil || len(op.Path) == 0 {
 			return nil, false
 		}
+		// Where it landed: an append "-" lands at the array's last index.
+		to := append(pointer.Pointer{}, op.Path...)
+		if to[len(to)-1] == "-" {
+			arr, _ := pointer.Get(nd, to[:len(to)-1])
+			a, ok := arr.([]any)
+			if !ok || len(a) == 0 {
+				return nil, false
+			}
+			to[len(to)-1] = strconv.Itoa(len(a) - 1)
+		}
 		doc = nd
-		back = append([]any{map[string]any{"op": "move", "from": ws[1].String(), "path": ws[0].String()}}, back...)
+		back = append([]any{map[string]any{"op": "move", "from": to.String(), "path": op.From.String()}}, back...)
 	}
 	ops, err := patch.Parse(back)
 	if err != nil {
 		return nil, false
 	}
-	nd, _, err := patch.Apply(st.doc, st.exists, ops, patch.Options{})
+	nd, _, err := patch.Apply(st.doc, true, ops, patch.Options{})
 	if err != nil || !same(nd, fe.pre.doc) {
 		return nil, false
 	}
@@ -1592,7 +1628,8 @@ func (c *Client) sealUndoSteps(ctx context.Context, env *undoEnv, name string, h
 		if err != nil {
 			return nil, err
 		}
-		nd, _, err := patch.Apply(st.doc, st.exists, ops, patch.Options{})
+		// A create applies to the document null (§6.2 step 3).
+		nd, _, err := patch.Apply(st.doc, true, ops, patch.Options{})
 		if err != nil {
 			return nil, fmt.Errorf("client: undo step %d of %s doesn't apply: %w", i, name, err)
 		}

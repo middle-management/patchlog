@@ -175,7 +175,9 @@ func TestSchemaBatchManyTyped(t *testing.T) {
 	unknownRev := "/r/s/s05/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	unknownRes := "/r/s/nope/rev/" + res.Items[0].IDs[0]
 	unknownNS := "/r/nons/s05/rev/" + res.Items[0].IDs[0]
-	branch := "/r/sb/s05/rev/" + res.Items[0].IDs[0]
+	// A revision the branch serves (read through from s): schema_ref for
+	// a writer who may read it there (§6.1).
+	branch := "/r/sb/" + strings.TrimPrefix(paths[5], "/r/s/")
 	items = []Item{
 		createItem("w0", typedDoc(paths[3], 3)),
 		createItem("w1", typedDoc(paths[3], 4)), // invalid

@@ -207,6 +207,69 @@ func (c *Cache) Retire(ctx context.Context, ex Execer, scope, at string) error {
 	return err
 }
 
+// Drop removes, in memory and from the database, the stored views that
+// match: by view, scope and form (json, as Stored.JSON). It is for a
+// service's start, to drop views of a form a release no longer serves at
+// their URLs (they would be served unchanged), and reads every stored
+// view's key to decide.
+func (c *Cache) Drop(ctx context.Context, match func(view, scope string, json bool) bool) error {
+	c.mu.Lock()
+	keep := c.order[:0]
+	for _, v := range c.order {
+		e, ok := c.m[v]
+		if !ok {
+			continue
+		}
+		if match(v, e.scope, e.s.JSON) {
+			delete(c.m, v)
+			continue
+		}
+		keep = append(keep, v)
+	}
+	c.order = keep
+	c.mu.Unlock()
+	if c.db == nil {
+		return nil
+	}
+	rows, err := c.db.QueryContext(ctx, `SELECT view, scope, json FROM sealed_views`)
+	if err != nil {
+		return err
+	}
+	var views []string
+	for rows.Next() {
+		var view, scope string
+		var json bool
+		if err := rows.Scan(&view, &scope, &json); err != nil {
+			rows.Close()
+			return err
+		}
+		if match(view, scope, json) {
+			views = append(views, view)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(views) == 0 {
+		return nil
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, v := range views {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sealed_view_tags WHERE view = ?`, v); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sealed_views WHERE view = ?`, v); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (c *Cache) drop(match func(cacheEntry) bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

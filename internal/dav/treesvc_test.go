@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
-	"net/url"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -24,6 +22,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/dav"
 	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/tree"
 )
@@ -45,7 +44,56 @@ type treeRun struct {
 	hits   atomic.Int64 // listing requests
 }
 
+// scopeRoles is a RoleView for tests (§B.11.5): a reader's subject set is
+// the names its grant's block rules fix /resource to (a test against a
+// schema of only an enum), and it sees the catalog nodes and the items of
+// those names. A tree service without §B.11 serves only g/all (§B.11.5),
+// so the tree services of these tests filter with it, as the catalog
+// service filters by roles, to list to grants limited to some resources.
+type scopeRoles struct{}
+
+func (scopeRoles) Resolve(_ context.Context, v *grant.Verified) ([]string, tree.Visibility, error) {
+	set := scopeSet{}
+	for _, r := range v.BlockRules {
+		m, _ := r.(map[string]any)
+		sch, _ := m["schema"].(map[string]any)
+		enum, _ := sch["enum"].([]any)
+		for _, e := range enum {
+			if s, ok := e.(string); ok && m["op"] == "test" && m["path"] == "/resource" {
+				set[s] = true
+			}
+		}
+	}
+	var subjects []string
+	for n := range set {
+		subjects = append(subjects, "scope:"+n)
+	}
+	slices.Sort(subjects)
+	return subjects, set, nil
+}
+
+func (scopeRoles) ForSubjects(subjects []string) tree.Visibility {
+	set := scopeSet{}
+	for _, s := range subjects {
+		set[strings.TrimPrefix(s, "scope:")] = true
+	}
+	return set
+}
+
+// scopeSet is the visibility of a scopeRoles subject set.
+type scopeSet map[string]bool
+
+func (s scopeSet) Node(_ *tree.Graph, n *tree.Node) bool { return s[n.Name] }
+func (s scopeSet) Item(_ *tree.Graph, n *tree.Node) bool { return s[n.ItemName] }
+
 func startTree(t *testing.T, cs *clienttest.Server, cat string, opts ...client.Option) *treeRun {
+	t.Helper()
+	return startTreeWith(t, cs, cat, scopeRoles{}, opts...)
+}
+
+// startTreeWith is startTree with rv the tree service's RoleView: nil for
+// a tree service without §B.11.
+func startTreeWith(t *testing.T, cs *clienttest.Server, cat string, rv tree.RoleView, opts ...client.Option) *treeRun {
 	t.Helper()
 	r := &treeRun{t: t}
 	base := http.DefaultTransport.(*http.Transport).Clone()
@@ -78,7 +126,7 @@ func startTree(t *testing.T, cs *clienttest.Server, cat string, opts ...client.O
 	})
 	r.core = cs.Client(t, append([]client.Option{client.WithAuthor("tree"), client.WithHTTPClient(&http.Client{Transport: rt})}, opts...)...)
 	svc, err := tree.Open(context.Background(), tree.Options{Client: r.core, Catalog: cat, DB: filepath.Join(t.TempDir(), "tree.db"),
-		MinWait: 200 * time.Millisecond, RepurgeInterval: -1, Logf: t.Logf,
+		MinWait: 200 * time.Millisecond, RepurgeInterval: -1, Logf: t.Logf, RoleView: rv,
 		FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)}})
 	if err != nil {
 		t.Fatal(err)
@@ -330,8 +378,7 @@ func TestTreeServiceFileMetadata(t *testing.T) {
 // listings f changes.
 func rewriting(t *testing.T, target string, f func([]map[string]any) []map[string]any) string {
 	t.Helper()
-	u := must(url.Parse(target))
-	rp := httputil.NewSingleHostReverseProxy(u)
+	rp := proxyTo(target)
 	rp.ModifyResponse = func(res *http.Response) error {
 		if res.StatusCode != 200 || !strings.HasPrefix(res.Header.Get("Content-Type"), "application/json") {
 			return nil
@@ -427,7 +474,8 @@ func TestTreeServiceSealedEntries(t *testing.T) {
 // listed by the tree service. While the tree service lags further than
 // TreeWait, the writer's folder is listed from the node documents, as the
 // tree service lists it (a placement of a namespace the catalog doesn't
-// trust is dangling there, §B.5); other users' listings don't wait.
+// trust is dangling there, §B.5, and is left out with or without a tree
+// service, §H.2 "Untrusted namespaces"); other users' listings don't wait.
 func TestTreeServiceOwnWrites(t *testing.T) {
 	t.Parallel()
 	var log coreLog
@@ -435,7 +483,7 @@ func TestTreeServiceOwnWrites(t *testing.T) {
 	must(e.c.CreateNamespace(e.ctx, "secret", map[string]any{"read": "public"}))
 	e.create("secret", "plans", map[string]any{"launch": "monday"})
 	e.create("cat", "secret.plans", map[string]any{"title": "plans.json", "parents": parents("cat", "season")})
-	sameStrings(t, "Season without a tree service", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json", "plans.json"})
+	sameStrings(t, "Season without a tree service", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
 	tr := startTree(t, e.s, "cat")
 	tr.caughtUp("cat", "matches")
 	ts := treeDav(e, tr.http.URL, options(func(o *dav.Options) { o.TreeWait = 3 * time.Second }))
@@ -586,6 +634,14 @@ func TestTreeServiceLimitedGrant(t *testing.T) {
 	if r := plain.doAs(limited, "PROPFIND", "/cat/", "", "Depth", "1"); r.status < 400 {
 		t.Fatalf("the limited grant listed the tree from the node documents: %d %s", r.status, r.body)
 	}
+	// Nor through a tree service without §B.11, which serves only g/all
+	// (§B.11.5): it refuses the limited grant, 403, which the gateway
+	// answers.
+	bare := startTreeWith(t, a.s, "cat", nil, client.WithBearer(a.k.Grant(t, a.s.Now(), "svc:tree", a.both, []string{"read"})))
+	bare.caughtUp("cat", "matches")
+	bg := a.gateway(t, bare.http.URL)
+	sameStrings(t, "the admin's top level through a tree service without §B.11", names(bg.propfindAs(admin, "/cat/"), "/cat/"), []string{"Hidden/", "Season/"})
+	bg.expect(bg.doAs(limited, "PROPFIND", "/cat/", "", "Depth", "1"), 403, "the limited grant through a tree service without §B.11")
 }
 
 // §H.7 through a tree service: what the tree service listed to one token
@@ -638,7 +694,7 @@ func TestTreeServiceDown(t *testing.T) {
 			io.WriteString(w, `{"code":"behind","message":"the tree service has not reached the catalog yet"}`)
 			return
 		}
-		httputil.NewSingleHostReverseProxy(must(url.Parse(tr.http.URL))).ServeHTTP(w, r)
+		proxyTo(tr.http.URL).ServeHTTP(w, r)
 	}))
 	ts := treeDav(e, front.URL, options(func(o *dav.Options) { o.CatalogTTL = time.Nanosecond }))
 	sameStrings(t, "Season", names(ts.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
@@ -673,7 +729,7 @@ func TestTreeServiceRefusedGrant(t *testing.T) {
 				io.WriteString(w, `{"code":"unauthorized","message":"no key verifies the grant"}`)
 				return
 			}
-			httputil.NewSingleHostReverseProxy(must(url.Parse(target))).ServeHTTP(w, r)
+			proxyTo(target).ServeHTTP(w, r)
 		}))
 		return front.URL
 	}
@@ -851,8 +907,10 @@ func TestTreeServiceBehindContent(t *testing.T) {
 		}
 	}
 	ts := treeDav(e, hs.URL)
+	// The tree service's message is generic, naming what it waits for
+	// only as ns, to readers of the whole catalog (§B.5).
 	r := ts.expect(ts.do("PROPFIND", "/cat/Season/", "", "Depth", "1"), 503, "PROPFIND of Season before the tree service reached matches")
-	if r.header.Get("Retry-After") == "" || !strings.Contains(r.body, "matches") {
+	if r.header.Get("Retry-After") == "" || !strings.Contains(r.body, "behind") {
 		t.Fatalf("503 %v %q", r.header, r.body)
 	}
 	if r := ts.do("DELETE", "/cat/Season", ""); r.status < 400 {
@@ -886,7 +944,7 @@ func TestTreeServiceOwnWritesUntilReached(t *testing.T) {
 		if r.URL.Query().Has("min") {
 			mins.Add(1)
 		}
-		httputil.NewSingleHostReverseProxy(must(url.Parse(tr.http.URL))).ServeHTTP(w, r)
+		proxyTo(tr.http.URL).ServeHTTP(w, r)
 	}))
 	clk := &testClock{t: time.Now()}
 	ts := treeDav(e, front.URL, options(func(o *dav.Options) { o.TreeWait = 300 * time.Millisecond; o.Now = clk.now }))
@@ -1071,7 +1129,7 @@ func minRefusedPerNamespace(t *testing.T, slow bool) {
 			// The first listing naming ghost answered after TreeWait.
 			time.Sleep(time.Second)
 		}
-		httputil.NewSingleHostReverseProxy(must(url.Parse(tr.http.URL))).ServeHTTP(rw, r)
+		proxyTo(tr.http.URL).ServeHTTP(rw, r)
 	}))
 	sentSince := func(n int) []string {
 		mu.Lock()
@@ -1090,7 +1148,7 @@ func minRefusedPerNamespace(t *testing.T, slow bool) {
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		req := must(http.NewRequest("GET", tr.http.URL+"/cat/children?of=season&min=ghost:"+tr.s.Checkpoint("matches"), nil))
 		req.Header.Set("Authorization", "Bearer "+ann)
-		res := must(http.DefaultClient.Do(req))
+		res := must(testHTTP.Do(req))
 		res.Body.Close()
 		if res.StatusCode == http.StatusBadRequest {
 			break
@@ -1179,7 +1237,7 @@ func TestTreeServiceMinsBounded(t *testing.T) {
 			io.WriteString(w, `{"code":"behind","message":"the tree service has not reached min yet"}`)
 			return
 		}
-		httputil.NewSingleHostReverseProxy(must(url.Parse(a.tr.http.URL))).ServeHTTP(w, r)
+		proxyTo(a.tr.http.URL).ServeHTTP(w, r)
 	}))
 	clk := &testClock{t: time.Now()}
 	g := a.gateway(t, front.URL, func(o *dav.Options) { o.TreeWait, o.Now = 300*time.Millisecond, clk.now })
@@ -1255,10 +1313,12 @@ func TestTreeServiceRenamedElsewhereDeletes(t *testing.T) {
 
 // A grant limited to some resources (§H.7), which doesn't read the
 // catalog's node documents (the core answers it 404 for them), keeps the
-// listing to resolve a write's path by: it edits a file it lists and
-// reads, through the tree's trust as last read with any grant; a write
-// that changes the tree's nodes (a new file or folder, a move, a delete)
-// is a 403 saying why, not the core's bare 404.
+// listing's view for names (§H.4 "Names before writes"): it edits a file
+// it lists and reads, through the tree's trust as its own /principal
+// says it; it renames and deletes a file whose placement's own document
+// it reads, checked against it, as the core lets it; a new file or folder
+// its grant can't make is the core's 403; and it deletes no folder (403,
+// saying why).
 func TestTreeServiceLimitedGrantWrites(t *testing.T) {
 	t.Parallel()
 	a := newAuthTree(t)
@@ -1274,46 +1334,47 @@ func TestTreeServiceLimitedGrantWrites(t *testing.T) {
 	if _, doc := g.load("matches", "derby"); doc.(map[string]any)["title"] != "Derby!" {
 		t.Fatalf("matches/derby %v", doc)
 	}
-	for _, c := range []struct{ method, path, body string }{
-		{"PUT", "/cat/Season/new.json", `{"x": 1}`},
-		{"MKCOL", "/cat/Season/F", ""},
-		{"MOVE", "/cat/Season/derby.json", ""},
-		{"DELETE", "/cat/Season/derby.json", ""},
-	} {
-		if r := g.expect(g.doAs(ann, c.method, c.path, c.body, "Destination", "/cat/Season/d2.json"), 403, "ann's "+c.method+" "+c.path); !strings.Contains(r.body, "node documents") {
-			t.Fatalf("%s: 403 %q", c.method, r.body)
-		}
+	g.expect(g.doAs(ann, "PUT", "/cat/Season/new.json", `{"x": 1}`), 403, "ann's PUT of a new file, whose placement her grant can't make")
+	g.expect(g.doAs(ann, "MKCOL", "/cat/Season/F", ""), 403, "ann's MKCOL, whose node her grant can't make")
+	if r := g.expect(g.doAs(ann, "DELETE", "/cat/Season", ""), 403, "ann's DELETE of a folder"); !strings.Contains(r.body, "node documents") {
+		t.Fatalf("DELETE of a folder: 403 %q", r.body)
 	}
-	if h, _ := g.load("matches", "derby"); h.State != client.Live {
-		t.Fatalf("derby is %v", h.State)
+	g.expect(g.doAs(ann, "MOVE", "/cat/Season/derby.json", "", "Destination", "/cat/Season/d2.json"), 201, "ann's rename of derby.json")
+	if doc := g.nodeDoc("cat", "matches.derby"); doc["title"] != "d2.json" {
+		t.Fatalf("derby's placement after the rename: %v", doc)
 	}
+	g.expect(g.doAs(ann, "DELETE", "/cat/Season/d2.json", ""), 204, "ann's DELETE of d2.json")
+	g.expectTombstoned("cat", "matches.derby", "derby's placement")
+	g.expectTombstoned("matches", "derby", "derby")
 }
 
 // A MOVE of a tree's file by a grant limited to some resources, which
-// can't delete it there (the node documents decide, §H.5, §H.7 "Limited
-// grants"), is refused before anything is written: onto another listed
-// file (a temporary file renamed over), the destination keeps its
-// content; to a new name in a flat namespace it can write, no copy is
-// made. The source stays either way.
+// keeps the listing's view for names (§H.4, §H.7 "Limited grants") and
+// can't delete the file there (its verbs lack delete, §C.2), is refused
+// before anything is written: onto another listed file (a temporary file
+// renamed over), the destination keeps its content; to a new name in a
+// flat namespace it can write (docs, which no tree owns, §H.2), no copy
+// is made. The source stays either way.
 func TestTreeServiceLimitedGrantMoveWritesNothing(t *testing.T) {
 	t.Parallel()
 	a := newAuthTree(t)
-	g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.Namespaces = []string{"matches"} })
+	w := a.docsNS(t)
+	g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.Namespaces = []string{"docs"} })
 	g.propfindAs(a.k.Grant(t, a.s.Now(), "user:admin", a.both, []string{"read"}), "/cat/")
-	ann := a.k.Grant(t, a.s.Now(), "user:ann", a.both, []string{"read", "create", "append", "delete"}, map[string]any{"rules": []any{
+	ann := a.k.Grant(t, a.s.Now(), "user:ann", []string{"cat", "matches", "docs"}, []string{"read", "create", "append"}, map[string]any{"rules": []any{
 		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "season", "matches.derby", "derby", "matches.cup", "cup", "moved"}}}}})
 	sameStrings(t, "ann's Season", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
 	cupBefore, _ := g.load("matches", "cup")
-	for _, dst := range []string{"/cat/Season/cup.json", "/matches/moved.json"} {
-		if r := g.expect(g.doAs(ann, "MOVE", "/cat/Season/derby.json", "", "Destination", dst, "Overwrite", "T"), 403, "ann's MOVE of derby.json to "+dst); !strings.Contains(r.body, "node documents") {
+	for _, dst := range []string{"/cat/Season/cup.json", "/docs/moved.json"} {
+		if r := g.expect(g.doAs(ann, "MOVE", "/cat/Season/derby.json", "", "Destination", dst, "Overwrite", "T"), 403, "ann's MOVE of derby.json to "+dst); !strings.Contains(r.body, "nothing was written") {
 			t.Fatalf("MOVE to %s: 403 %q", dst, r.body)
 		}
 	}
 	if cupAfter, doc := g.load("matches", "cup"); cupAfter.ID != cupBefore.ID {
 		t.Fatalf("matches/cup changed by a refused MOVE: %s -> %s, now %v", cupBefore.ID, cupAfter.ID, doc)
 	}
-	if h, _ := g.load("matches", "moved"); h.State != client.NotFound {
-		t.Fatalf("matches/moved made by a refused MOVE: %v", h.State)
+	if h := must(w.Head(a.ctx, "docs", "moved")); h.State != client.NotFound {
+		t.Fatalf("docs/moved made by a refused MOVE: %v", h.State)
 	}
 	if h, _ := g.load("matches", "derby"); h.State != client.Live {
 		t.Fatalf("derby is %v", h.State)
@@ -1325,25 +1386,28 @@ func TestTreeServiceLimitedGrantMoveWritesNothing(t *testing.T) {
 // read, create and append), or, a flat file moved to another namespace,
 // the append setting its $successor (§8.1), is refused before anything is
 // written (§H.5): a tree's file onto another listed file or to a new name
-// in a flat namespace, a flat file onto another or into a tree. The
-// destination keeps its content or isn't made, and the source stays.
+// in a flat namespace, a flat file onto another or into a tree (in docs,
+// which no tree owns, §H.2). The destination keeps its content or isn't
+// made, and the source stays.
 func TestTreeServiceNoDeleteMoveWritesNothing(t *testing.T) {
 	t.Parallel()
 	a := newAuthTree(t)
-	g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.Namespaces = []string{"matches"} })
-	bob := a.k.Grant(t, a.s.Now(), "user:bob", a.both, []string{"read", "create", "append"})
-	carl := a.k.Grant(t, a.s.Now(), "user:carl", a.both, []string{"read", "create", "delete"})
+	w := a.docsNS(t)
+	g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.Namespaces = []string{"docs"} })
+	three := []string{"cat", "matches", "docs"}
+	bob := a.k.Grant(t, a.s.Now(), "user:bob", three, []string{"read", "create", "append"})
+	carl := a.k.Grant(t, a.s.Now(), "user:carl", three, []string{"read", "create", "delete"})
 	sameStrings(t, "bob's Season", names(g.propfindAs(bob, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
 	// Each namespace's head moves with any write in it (§7.4).
 	heads := func() string {
-		return must(a.w.NSHead(a.ctx, "matches")).ID + " " + must(a.w.NSHead(a.ctx, "cat")).ID
+		return must(a.w.NSHead(a.ctx, "matches")).ID + " " + must(a.w.NSHead(a.ctx, "cat")).ID + " " + must(w.NSHead(a.ctx, "docs")).ID
 	}
 	for _, c := range []struct{ who, tok, src, dst, verb string }{
 		{"bob", bob, "/cat/Season/derby.json", "/cat/Season/cup.json", "delete"},
-		{"bob", bob, "/cat/Season/derby.json", "/matches/moved.json", "delete"},
-		{"bob", bob, "/matches/derby.json", "/matches/cup.json", "delete"},
-		{"bob", bob, "/matches/derby.json", "/cat/Season/moved.json", "delete"},
-		{"carl", carl, "/matches/derby.json", "/cat/Season/moved.json", "append"},
+		{"bob", bob, "/cat/Season/derby.json", "/docs/moved.json", "delete"},
+		{"bob", bob, "/docs/derby.json", "/docs/cup.json", "delete"},
+		{"bob", bob, "/docs/derby.json", "/cat/Season/moved.json", "delete"},
+		{"carl", carl, "/docs/derby.json", "/cat/Season/moved.json", "append"},
 	} {
 		before := heads()
 		r := g.doAs(c.tok, "MOVE", c.src, "", "Destination", c.dst, "Overwrite", "T")

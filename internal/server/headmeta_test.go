@@ -33,7 +33,7 @@ func (e *tenv) headItems(ns, nsID string, bearer ...string) map[string]map[strin
 	r := e.get("/ns/"+ns+"/rev/"+nsID+"/heads", bearer...)
 	expect(e.t, r, 200)
 	out := map[string]map[string]any{}
-	for _, x := range r.Obj()["items"].([]any) {
+	for _, x := range r.Obj()["heads"].([]any) {
 		m := x.(map[string]any)
 		out[m["resource"].(string)] = m
 	}
@@ -227,7 +227,7 @@ func TestHeadMetaEncrypted(t *testing.T) {
 			t.Fatalf("sealed revision %s: %v", id, r.H)
 		}
 		e.noRevMeta("/r/s/x/rev/" + id)
-		if c := e.do(req{method: "GET", path: "/r/s/x/rev/" + id, hdr: map[string]string{"If-None-Match": quote(id)}}); c.Code != 304 {
+		if c := e.do(req{method: "GET", path: "/r/s/x/rev/" + id, hdr: map[string]string{"If-None-Match": quote(id + ".1")}}); c.Code != 304 {
 			t.Fatalf("sealed If-None-Match: %d", c.Code)
 		}
 	}
@@ -246,8 +246,8 @@ func TestHeadMetaEncrypted(t *testing.T) {
 
 	// A public e2e namespace's keyring, served in the clear and from the
 	// transaction-free read cache.
-	pub := newRecipient(t)
-	kr, err := seal.BuildKeyring("pe", 1, seal.NewKey(), []*ecdh.PublicKey{pub})
+	_, pubPriv, _ := seal.GenerateRecipient()
+	kr, err := seal.BuildKeyringV2(pubPriv, "pe", 1, seal.NewKey(), []*ecdh.PublicKey{pubPriv.PublicKey()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestHeadMetaEncrypted(t *testing.T) {
 	f := newE2E(t, withArchive(t, t.TempDir()))
 	k := seal.NewKey()
 	readerPub, _ := seal.ParseRecipientJWK(f.readerJWK)
-	fkr, err := seal.BuildKeyring("e", 1, k, []*ecdh.PublicKey{readerPub})
+	fkr, err := seal.BuildKeyringV2(f.readerPriv, "e", 1, k, []*ecdh.PublicKey{readerPub})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestHeadMetaEncrypted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expect(t, f.prune("e", "p", map[string]any{"horizon": ids[1], "snapshot": snap}, f.writerG), 200)
+	expect(t, f.prune("e", "p", map[string]any{"horizon": ids[1], "snapshot": snap}, f.adminG), 200) // no retention rule: a * key (§8.6)
 	r := f.get("/r/e/p/rev/"+ids[1], f.readerG)
 	expect(t, r, 200)
 	if r.H.Get("X-E2E") != "snapshot" {
@@ -302,7 +302,8 @@ func TestHeadMetaEncrypted(t *testing.T) {
 // and its revisions carry no Last-Modified or Repr-Digest. The raise
 // purges ns:{ns}, which the pages and revisions cached with them carry
 // (§9), whether the namespace was public or private; raising to at-rest
-// changes nothing listed, and purges nothing.
+// purges nothing, and drops the stored size and digest, which would sit in
+// plaintext beside the encrypted content (§E.1 Stored digests, v0.56).
 func TestHeadMetaSealedLater(t *testing.T) {
 	t.Parallel()
 	rec := &recPurger{}
@@ -323,7 +324,7 @@ func TestHeadMetaSealedLater(t *testing.T) {
 		if calls := rec.take(); purged(calls, "ns:"+ns) {
 			t.Fatalf("%s: a raise to at-rest purged %v", ns, calls)
 		}
-		if it := e.headItems(ns, at)["a"]; it["digest"] == nil {
+		if it := e.headItems(ns, at)["a"]; it["created"] == nil || it["digest"] != nil || it["size"] != nil {
 			t.Fatalf("at-rest %v", it)
 		}
 		expect(t, e.patchNS(ns, ops(op("replace", "/encryption", map[string]any{"level": "sealed"})), ""), 201)
@@ -368,7 +369,7 @@ func storedMeta(t *testing.T, path string) int {
 	t.Helper()
 	driver, dsn := "sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)")
 	if strings.HasPrefix(path, "postgres") {
-		driver, dsn = "pgx", path
+		driver, dsn = "pgx", pgtest.DSN(path)
 	}
 	db, err := sql.Open(driver, dsn)
 	if err != nil {

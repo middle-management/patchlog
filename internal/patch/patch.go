@@ -110,7 +110,14 @@ func WritesStrings(w []pointer.Pointer) []string {
 	return out
 }
 
-// Apply applies ops to doc without mutating it (unless opt.InPlace).
+// Apply applies ops to doc without mutating it (unless opt.InPlace), and
+// returns the resulting document and its writes (§6.4.1).
+//
+// A create applies to the document null (§6.2 step 3): pass doc nil with
+// exists true, and test "" null, root replace, copy and move work on it. A
+// nil result with a nil error is then the document null; whether a create
+// may result in it is the caller's policy. exists false means no document
+// at all, where only a root add can start one ("no document" otherwise).
 func Apply(doc any, exists bool, ops []Op, opt Options) (any, []pointer.Pointer, error) {
 	cur := doc
 	if !opt.InPlace {
@@ -133,13 +140,16 @@ func Apply(doc any, exists bool, ops []Op, opt Options) (any, []pointer.Pointer,
 
 		switch op.Op {
 		case "add":
-			nd, w, err := addAt(cur, have, op.Path, copyUnless(share, op.Value))
+			nd, w, shifted, err := addAt(cur, have, op.Path, copyUnless(share, op.Value))
 			if err != nil {
 				return nil, nil, fail(op.PathText, err.Error())
 			}
 			cur, have = nd, true
 			if !(opt.ResourceEnvelope && isNonce(op.Path, op.Value)) {
 				writes = append(writes, w)
+			}
+			if shifted {
+				writes = append(writes, parentOf(w))
 			}
 		case "replace":
 			if !have {
@@ -150,14 +160,15 @@ func Apply(doc any, exists bool, ops []Op, opt Options) (any, []pointer.Pointer,
 			}
 			// Replace = remove, then add at the same location, so an array
 			// element is replaced in place rather than inserted before.
+			// Nothing shifts, so only path is written.
 			base := cur
 			if len(op.Path) > 0 {
 				var err error
-				if base, _, err = removeAt(cur, op.Path); err != nil {
+				if base, _, _, err = removeAt(cur, op.Path); err != nil {
 					return nil, nil, fail(op.PathText, err.Error())
 				}
 			}
-			nd, w, err := addAt(base, have, op.Path, copyUnless(share, op.Value))
+			nd, w, _, err := addAt(base, have, op.Path, copyUnless(share, op.Value))
 			if err != nil {
 				return nil, nil, fail(op.PathText, err.Error())
 			}
@@ -169,12 +180,15 @@ func Apply(doc any, exists bool, ops []Op, opt Options) (any, []pointer.Pointer,
 			if !have {
 				return nil, nil, fail(op.PathText, "the document does not exist")
 			}
-			nd, _, err := removeAt(cur, op.Path)
+			nd, _, shifted, err := removeAt(cur, op.Path)
 			if err != nil {
 				return nil, nil, fail(op.PathText, err.Error())
 			}
 			cur = nd
 			writes = append(writes, clonePtr(op.Path))
+			if shifted {
+				writes = append(writes, parentOf(op.Path))
+			}
 		case "copy":
 			if !have {
 				return nil, nil, fail(op.From.String(), "the document does not exist")
@@ -183,12 +197,15 @@ func Apply(doc any, exists bool, ops []Op, opt Options) (any, []pointer.Pointer,
 			if !ok {
 				return nil, nil, fail(op.From.String(), "copy source does not exist")
 			}
-			nd, w, err := addAt(cur, have, op.Path, jsonv.Clone(v))
+			nd, w, shifted, err := addAt(cur, have, op.Path, jsonv.Clone(v))
 			if err != nil {
 				return nil, nil, fail(op.PathText, err.Error())
 			}
 			cur = nd
 			writes = append(writes, w)
+			if shifted {
+				writes = append(writes, parentOf(w))
+			}
 		case "move":
 			if !have {
 				return nil, nil, fail(op.From.String(), "the document does not exist")
@@ -201,19 +218,33 @@ func Apply(doc any, exists bool, ops []Op, opt Options) (any, []pointer.Pointer,
 				return nil, nil, fail(op.PathText, "cannot move a value into one of its own children")
 			}
 			if samePtr(op.From, op.Path) {
-				writes = append(writes, clonePtr(op.From), clonePtr(op.Path))
+				// The document doesn't change, but the op still removes and
+				// adds: an element that isn't its array's last shifts out and
+				// back, so the array is written too (once).
+				writes = append(writes, clonePtr(op.From))
+				if notLastElement(cur, op.From) {
+					writes = append(writes, parentOf(op.From))
+				}
+				writes = append(writes, clonePtr(op.Path))
 				continue
 			}
-			nd, _, err := removeAt(cur, op.From)
+			nd, _, fromShifted, err := removeAt(cur, op.From)
 			if err != nil {
 				return nil, nil, fail(op.From.String(), err.Error())
 			}
-			nd, w, err := addAt(nd, true, op.Path, v)
+			nd, w, pathShifted, err := addAt(nd, true, op.Path, v)
 			if err != nil {
 				return nil, nil, fail(op.PathText, err.Error())
 			}
 			cur = nd
-			writes = append(writes, clonePtr(op.From), w)
+			writes = append(writes, clonePtr(op.From))
+			if fromShifted {
+				writes = append(writes, parentOf(op.From))
+			}
+			writes = append(writes, w)
+			if pathShifted && !(fromShifted && samePtr(parentOf(op.From), parentOf(w))) {
+				writes = append(writes, parentOf(w))
+			}
 		case "test":
 			if !have {
 				return nil, nil, fail(op.PathText, "test failed: the document does not exist")
@@ -268,24 +299,47 @@ func samePtr(a, b pointer.Pointer) bool {
 	return len(a) == len(b) && a.HasPrefix(b)
 }
 
-// addAt inserts val at p and returns the new node and the resolved pointer
-// (with `-` replaced by the index it landed at).
-func addAt(node any, have bool, p pointer.Pointer, val any) (any, pointer.Pointer, error) {
-	if len(p) == 0 {
-		return val, pointer.Pointer{}, nil
-	}
-	if !have {
-		return nil, nil, fmt.Errorf("the document does not exist")
-	}
-	resolved := clonePtr(p)
-	nd, err := addRec(node, p, resolved, 0, val)
-	if err != nil {
-		return nil, nil, err
-	}
-	return nd, resolved, nil
+// parentOf is a copy of p without its last segment (p non-root).
+func parentOf(p pointer.Pointer) pointer.Pointer {
+	return clonePtr(p[:len(p)-1])
 }
 
-func addRec(node any, p, resolved pointer.Pointer, depth int, val any) (any, error) {
+// notLastElement reports whether p addresses an element of an array in doc
+// other than its last.
+func notLastElement(doc any, p pointer.Pointer) bool {
+	if len(p) == 0 {
+		return false
+	}
+	arr, ok := pointer.Get(doc, p[:len(p)-1])
+	a, isArr := arr.([]any)
+	if !ok || !isArr {
+		return false
+	}
+	n, ok := pointer.ArrayIndex(p[len(p)-1])
+	return ok && n < len(a)-1
+}
+
+// addAt inserts val at p and returns the new node, the resolved pointer
+// (with `-` replaced by the index it landed at), and whether it went into
+// an array at an index below its length, shifting the elements after it
+// (§6.4.1: the array is written too).
+func addAt(node any, have bool, p pointer.Pointer, val any) (any, pointer.Pointer, bool, error) {
+	if len(p) == 0 {
+		return val, pointer.Pointer{}, false, nil
+	}
+	if !have {
+		return nil, nil, false, fmt.Errorf("the document does not exist")
+	}
+	resolved := clonePtr(p)
+	shifted := false
+	nd, err := addRec(node, p, resolved, 0, val, &shifted)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return nd, resolved, shifted, nil
+}
+
+func addRec(node any, p, resolved pointer.Pointer, depth int, val any, shifted *bool) (any, error) {
 	tok := p[depth]
 	last := depth == len(p)-1
 	switch c := node.(type) {
@@ -298,7 +352,7 @@ func addRec(node any, p, resolved pointer.Pointer, depth int, val any) (any, err
 		if !ok {
 			return nil, fmt.Errorf("path does not exist")
 		}
-		nc, err := addRec(child, p, resolved, depth+1, val)
+		nc, err := addRec(child, p, resolved, depth+1, val, shifted)
 		if err != nil {
 			return nil, err
 		}
@@ -320,6 +374,7 @@ func addRec(node any, p, resolved pointer.Pointer, depth int, val any) (any, err
 				idx = n
 			}
 			resolved[depth] = strconv.Itoa(idx)
+			*shifted = idx < len(c)
 			c = append(c, nil)
 			copy(c[idx+1:], c[idx:])
 			c[idx] = val
@@ -329,7 +384,7 @@ func addRec(node any, p, resolved pointer.Pointer, depth int, val any) (any, err
 		if !ok || n >= len(c) {
 			return nil, fmt.Errorf("path does not exist")
 		}
-		nc, err := addRec(c[n], p, resolved, depth+1, val)
+		nc, err := addRec(c[n], p, resolved, depth+1, val, shifted)
 		if err != nil {
 			return nil, err
 		}
@@ -340,15 +395,19 @@ func addRec(node any, p, resolved pointer.Pointer, depth int, val any) (any, err
 	}
 }
 
-// removeAt removes the value at p (non-root) and returns the new node.
-func removeAt(node any, p pointer.Pointer) (any, any, error) {
+// removeAt removes the value at p (non-root) and returns the new node, the
+// removed value, and whether it was an element of an array other than its
+// last, shifting the elements after it (§6.4.1: the array is written too).
+func removeAt(node any, p pointer.Pointer) (any, any, bool, error) {
 	if len(p) == 0 {
-		return nil, nil, fmt.Errorf("the document cannot be removed")
+		return nil, nil, false, fmt.Errorf("the document cannot be removed")
 	}
-	return removeRec(node, p, 0)
+	shifted := false
+	nd, old, err := removeRec(node, p, 0, &shifted)
+	return nd, old, shifted, err
 }
 
-func removeRec(node any, p pointer.Pointer, depth int) (any, any, error) {
+func removeRec(node any, p pointer.Pointer, depth int, shifted *bool) (any, any, error) {
 	tok := p[depth]
 	last := depth == len(p)-1
 	switch c := node.(type) {
@@ -361,7 +420,7 @@ func removeRec(node any, p pointer.Pointer, depth int) (any, any, error) {
 			delete(c, tok)
 			return c, child, nil
 		}
-		nc, old, err := removeRec(child, p, depth+1)
+		nc, old, err := removeRec(child, p, depth+1, shifted)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -374,10 +433,11 @@ func removeRec(node any, p pointer.Pointer, depth int) (any, any, error) {
 		}
 		if last {
 			old := c[n]
+			*shifted = n < len(c)-1
 			c = append(c[:n], c[n+1:]...)
 			return c, old, nil
 		}
-		nc, old, err := removeRec(c[n], p, depth+1)
+		nc, old, err := removeRec(c[n], p, depth+1, shifted)
 		if err != nil {
 			return nil, nil, err
 		}

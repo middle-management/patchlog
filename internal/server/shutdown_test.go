@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -224,8 +225,13 @@ func TestShutdownEndsLongPoll(t *testing.T) {
 	s.mkNS("docs", map[string]any{"read": "public"})
 	s.create("docs", "a", map[string]any{"n": 1.0})
 	since := s.nsHead("docs")
+	// With the current cursor, so it waits: one without a cursor is
+	// answered at once (§7.7).
+	cur := strconv.FormatInt(time.Now().UnixNano()/int64(s.opt.LongPollInterval), 10)
 	res := make(chan result, 1)
-	go func() { res <- send("GET", s.srv.URL+"/ns/docs/log?live=long-poll&since="+since, "", "", nil) }()
+	go func() {
+		res <- send("GET", s.srv.URL+"/ns/docs/log?live=long-poll&since="+since+"&cursor="+cur, "", "", nil)
+	}()
 	s.waitInFlight(1)
 	time.Sleep(50 * time.Millisecond) // into its wait
 	t0 := time.Now()

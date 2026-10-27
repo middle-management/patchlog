@@ -486,7 +486,7 @@ func TestTreeRenameMove(t *testing.T) {
 	e.expect(e.do("MOVE", "/cat/Empty", "", "Destination", "/cat/Empty/Empty"), 403, "a folder into itself")
 	e.expect(e.do("MOVE", "/cat/Empty", "", "Destination", "/cat/Season"), 403, "a folder over another")
 	e.expect(e.do("MOVE", "/cat/Empty/Old%20Stuff/Derby.json", "", "Destination", "/cat/Season"), 403, "a file over a folder")
-	e.expect(e.do("MOVE", "/cat/Season", "", "Destination", "/matches/Season"), 403, "a folder out of its tree")
+	e.expect(e.do("MOVE", "/cat/Season", "", "Destination", "/matches/Season"), 403, "a folder out of its tree, into the flat view")
 	e.expect(e.do("MOVE", "/cat/Empty/Old%20Stuff/Derby.json", "", "Destination", "/cat/Season/bad."), 403, "a rename to a refused name")
 	sameJSON(t, e.parentsOf("season"), parents("cat", "root"))
 }
@@ -596,7 +596,8 @@ func TestTreeDeleteThenWrite(t *testing.T) {
 // A copy is a new item with the source's content, and a placement: a raw
 // file's blob copied with Blob-From (§7.8), keeping its id, or uploaded
 // again where the source's rank doesn't allow that (§H.5 "Copy"). A
-// folder isn't copied.
+// folder is copied as a new folder of what is in it (since v0.67,
+// TestV073FolderCopy).
 func TestTreeCopy(t *testing.T) {
 	t.Parallel()
 	var froms, uploads atomic.Int64
@@ -655,41 +656,48 @@ func TestTreeCopy(t *testing.T) {
 	if b := e.expect(e.do("GET", "/cat/secret.png", ""), 200, "GET").body; b != "\x89PNG secret" {
 		t.Fatalf("GET %q", b)
 	}
-	e.expect(e.do("COPY", "/cat/Season", "", "Destination", "/cat/Season2"), 403, "COPY of a folder")
+	e.expect(e.do("COPY", "/cat/Season", "", "Destination", "/cat/Season2"), 201, "COPY of a folder")
+	sameStrings(t, "Season2", names(e.propfind("/cat/Season2/"), "/cat/Season2/"), names(e.propfind("/cat/Season/"), "/cat/Season/"))
 }
 
 // A file moved to another tree or namespace is copied, then deleted; its
 // item, deleted, names the copy in $successor (§8.1), but a JSON file
 // whose root isn't an object can't. Moved onto an existing file, its
 // content is saved into it, which keeps its history: a temporary file
-// renamed over a file (§H.5).
+// renamed over a file (§H.5). (The flat view is loose's, which no tree
+// owns, §H.2.)
 func TestTreeMoveAcross(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"matches", "docs"}, []string{"cat", "cat2"}, map[string]map[string]any{
-		"cat":  {"catalog": treeCatalog("matches")},
+	e := newEnv(t, []string{"loose"}, []string{"cat", "cat2"}, map[string]map[string]any{
+		"cat":  {"catalog": treeCatalog("matches", "loose")},
 		"cat2": {"catalog": treeCatalog("docs")},
 	})
+	for _, ns := range []string{"matches", "docs"} {
+		must(e.c.CreateNamespace(e.ctx, ns, map[string]any{"read": "public"}))
+	}
 	e.create("matches", "derby", map[string]any{"title": "Derby"})
 	for _, cat := range []string{"cat", "cat2"} {
 		e.create(cat, "root", map[string]any{"parents": []any{}})
 	}
 	e.create("cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "root")})
+	e.create("loose", "same", map[string]any{"title": "Same"})
+	e.create("cat", "loose.same", map[string]any{"title": "same.json", "parents": parents("cat", "root")})
 
 	e.expect(e.do("PUT", "/cat/report.md", "text"), 201, "PUT")
 	_, a := e.itemOf("cat", "report.md")
-	e.expect(e.do("MOVE", "/cat/report.md", "", "Destination", "/docs/report.md"), 201, "MOVE to the flat view")
-	if b := e.expect(e.do("GET", "/docs/report.md", ""), 200, "GET").body; b != "text" {
+	e.expect(e.do("MOVE", "/cat/report.md", "", "Destination", "/loose/report.md"), 201, "MOVE to the flat view")
+	if b := e.expect(e.do("GET", "/loose/report.md", ""), 200, "GET").body; b != "text" {
 		t.Fatalf("GET %q", b)
 	}
-	if h, _ := e.load("matches", a); h.State != client.Tombstoned || h.Successor != "/r/docs/report.md" {
+	if h, _ := e.load("matches", a); h.State != client.Tombstoned || h.Successor != "/r/loose/report.md" {
 		t.Fatalf("moved item %+v", h)
 	}
-	sameStrings(t, "cat", names(e.propfind("/cat/"), "/cat/"), []string{"derby.json"})
+	sameStrings(t, "cat", names(e.propfind("/cat/"), "/cat/"), []string{"derby.json", "same.json"})
 
-	e.expect(e.do("PUT", "/matches/notes.txt", "n"), 201, "PUT flat")
-	e.expect(e.do("MOVE", "/matches/notes.txt", "", "Destination", "/cat/notes.txt"), 201, "MOVE into the tree")
+	e.expect(e.do("PUT", "/loose/notes.txt", "n"), 201, "PUT flat")
+	e.expect(e.do("MOVE", "/loose/notes.txt", "", "Destination", "/cat/notes.txt"), 201, "MOVE into the tree")
 	_, b := e.itemOf("cat", "notes.txt")
-	if h, _ := e.load("matches", "notes.txt"); h.State != client.Tombstoned || h.Successor != b {
+	if h, _ := e.load("loose", "notes.txt"); h.State != client.Tombstoned || h.Successor != "/r/matches/"+b {
 		t.Fatalf("moved resource %+v, copy %s", h, b)
 	}
 	e.expect(e.do("MOVE", "/cat/notes.txt", "", "Destination", "/cat2/notes.txt"), 201, "MOVE to another tree")
@@ -703,11 +711,11 @@ func TestTreeMoveAcross(t *testing.T) {
 
 	e.expect(e.do("PUT", "/cat/list.json", `[1, 2]`), 201, "PUT a JSON array")
 	_, l := e.itemOf("cat", "list.json")
-	e.expect(e.do("MOVE", "/cat/list.json", "", "Destination", "/docs/list.json"), 201, "MOVE a JSON array")
+	e.expect(e.do("MOVE", "/cat/list.json", "", "Destination", "/loose/list.json"), 201, "MOVE a JSON array")
 	if h, _ := e.load("matches", l); h.State != client.Tombstoned || h.Successor != "" {
 		t.Fatalf("moved array %+v", h)
 	}
-	_, doc := e.load("docs", "list")
+	_, doc := e.load("loose", "list")
 	sameJSON(t, doc, []any{1, 2})
 
 	e.expect(e.do("PUT", "/cat/draft.md", "v1"), 201, "PUT")
@@ -728,7 +736,7 @@ func TestTreeMoveAcross(t *testing.T) {
 	if m := e.lastEntry("matches", "derby"); m.Parent != "" {
 		t.Fatal("derby written")
 	}
-	r := e.expect(e.do("MOVE", "/matches/derby.json", "", "Destination", "/cat/derby.json"), 403, "MOVE of a document onto itself in the tree")
+	r := e.expect(e.do("MOVE", "/loose/same.json", "", "Destination", "/cat/same.json"), 403, "MOVE of a document onto itself in the tree")
 	if !strings.Contains(r.body, "one document") {
 		t.Fatalf("403 %q", r.body)
 	}
@@ -835,22 +843,32 @@ func TestPagedFlows(t *testing.T) {
 }
 
 // Writes through a placement go only where the server would write: items
-// in a namespace the catalog trusts (§B.3) or that is served (-ns), never
-// a catalog's own nodes.
+// in a namespace the catalog trusts (§B.3), never a catalog's own nodes,
+// even in a catalog that trusts itself. A placement of an item in a
+// namespace the catalog doesn't trust isn't shown at all (§H.2
+// "Untrusted namespaces"; it showed without a tree service before
+// v0.56): its name is a new file's, and its item isn't written.
 func TestTreePlacementWrites(t *testing.T) {
 	t.Parallel()
 	e := treeEnv(t)
 	must(e.c.CreateNamespace(e.ctx, "secret", map[string]any{"read": "public"}))
 	e.create("secret", "plans", map[string]any{"launch": "monday"})
 	e.create("cat", "secret.plans", map[string]any{"title": "plans.json", "parents": parents("cat", "season")})
-	e.create("cat", "cat.empty", map[string]any{"title": "node.json", "parents": parents("cat", "season")})
-	e.expect(e.do("GET", "/cat/Season/plans.json", ""), 200, "GET a placement of an untrusted item")
-	e.expect(e.do("PUT", "/cat/Season/plans.json", `{"launch": "never"}`), 403, "PUT over an item not trusted nor served")
+	e.expect(e.do("GET", "/cat/Season/plans.json", ""), 404, "GET a placement of an untrusted item")
+	e.expect(e.do("PUT", "/cat/Season/.goutputstream-tmp", `{"planted": true}`), 201, "temporary file")
+	e.expect(e.do("MOVE", "/cat/Season/.goutputstream-tmp", "", "Destination", "/cat/Season/plans.json"), 201, "MOVE onto the name of an untrusted placement: a new file")
 	_, doc := e.load("secret", "plans")
 	sameJSON(t, doc, map[string]any{"launch": "monday"})
-	e.expect(e.do("PUT", "/cat/Season/node.json", `{"x": 1}`), 403, "PUT through a placement of a catalog node")
-	e.expect(e.do("PUT", "/matches/.goutputstream-tmp", `{"planted": true}`), 201, "temporary file")
-	e.expect(e.do("MOVE", "/matches/.goutputstream-tmp", "", "Destination", "/cat/Season/plans.json"), 403, "MOVE onto an untrusted placement")
+	if got := e.liveNames("matches"); len(got) != 2 {
+		t.Fatalf("matches holds %q, want derby and the new file", got)
+	}
+
+	self := newEnv(t, nil, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("matches", "cat")}})
+	must(self.c.CreateNamespace(self.ctx, "matches", map[string]any{"read": "public"}))
+	self.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	self.create("cat", "empty", map[string]any{"title": "Empty", "parents": parents("cat", "root")})
+	self.create("cat", "cat.empty", map[string]any{"title": "node.json", "parents": parents("cat", "root")})
+	self.expect(self.do("PUT", "/cat/node.json", `{"x": 1}`), 403, "PUT through a placement of a catalog node")
 }
 
 // counted is a tree whose core counts the requests the WebDAV server

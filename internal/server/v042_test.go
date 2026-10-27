@@ -59,7 +59,7 @@ func TestV042SignatureOrder(t *testing.T) {
 	}}})
 	expect(t, r, 200)
 	items := r.Obj()["items"].([]any)
-	if d, ok := items[0].(map[string]any); !ok || d["status"] != 422.0 || d["code"] != "signature" || items[1].(map[string]any)["status"] != 200.0 {
+	if d, ok := items[0].(map[string]any); !ok || d["status"] != 422.0 || d["code"] != "signature" || items[1].(map[string]any)["status"] != 201.0 {
 		t.Fatalf("dry run %s", r.Body)
 	}
 
@@ -183,7 +183,8 @@ func TestV042Grants(t *testing.T) {
 	gid := grantIDOf(t, w)
 	r := s.get("/ns/s/grants/"+gid, w)
 	expect(t, r, 200)
-	if !isJOSE(r) || r.H.Get("Cache-Control") != ccImmutable {
+	// read "grant": private, sealed or not (v0.63 §E.2.5).
+	if !isJOSE(r) || r.H.Get("Cache-Control") != "private, max-age=300" {
 		t.Fatalf("sealed grant headers %v", r.H)
 	}
 	keys, kr := s.keysOf("s", nil, w)
@@ -192,7 +193,7 @@ func TestV042Grants(t *testing.T) {
 	}
 	pt := open(t, string(r.Body), keys["s#1"], "s#1", seal.GrantPL("s", gid))
 	m := jsonv.MustParse(pt).(map[string]any)
-	if root, _ := m["root"].(map[string]any); m["id"] != gid || root["sub"] != "user:w" || len(m["stored"].([]any)) != 1 {
+	if root, _ := m["root"].(map[string]any); m["id"] != gid || root["sub"] != "user:w" || m["stored"] == "" || m["stored"] == nil {
 		t.Fatalf("sealed grant %s", pt)
 	}
 	if r2 := s.get("/ns/s/grants/"+gid, w); string(r2.Body) != string(r.Body) {

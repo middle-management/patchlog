@@ -312,11 +312,13 @@ func testTypedQueries(t *testing.T, noFTS bool) {
 
 	// Plain listing: typed and untyped documents, by name.
 	s.expect("/matches", "cup", "derby", "final", "notes")
-	// Text: fields through $ref (player names), object leaves under a text annotation.
+	// Text: fields through $ref (player names). An object marked text
+	// indexes nothing (v0.73, §A.2: only strings, numbers and booleans are
+	// collected), so notes' leaves aren't searchable.
 	s.expect("/matches?q=derby", "derby") // the untyped "notes" is not searchable
 	s.expect("/matches?q=larsson", "cup", "derby")
 	s.expect("/matches?q=larsson+henrik", "derby")
-	s.expect("/matches?q=red+card", "derby")
+	s.expect("/matches?q=red+card")
 	s.expect("/matches?q=lars*", "cup", "derby")
 	s.expect("/matches?q=nothing-matches-this")
 	// Facets: arrays expand, values through $defs/$ref, non-strings as JSON.
@@ -325,13 +327,15 @@ func testTypedQueries(t *testing.T, noFTS bool) {
 	s.expect("/matches?facet[/tags]=local&facet[/status]=planned", "final")
 	s.expect("/matches?facet[/players/id]=p3", "cup")
 	s.expect("/matches?facet[/live]=true", "cup")
-	// Sort and ranges (numbers typed; RFC 3339 normalised to UTC).
+	// Sort and ranges (numbers typed; strings as UTF-8 bytes, without
+	// date-time normalisation since v0.73, §A.2).
 	s.expect("/matches?sort=-/attendance", "final", "derby", "cup", "notes")
 	s.expect("/matches?sort=/kickoff&facet[/status]=planned", "final", "cup")
 	s.expect("/matches?sort=/kickoff", "derby", "final", "cup", "notes")
 	s.expect("/matches?gt[/attendance]=9000", "derby", "final")
 	s.expect("/matches?ge[/attendance]=9000&lt[/attendance]=42000", "cup")
-	s.expect("/matches?ge[/kickoff]=2026-10-05T11:30:00%2B02:00&sort=/kickoff", "final", "cup")
+	s.expect("/matches?ge[/kickoff]=2026-10-05T11:30:00%2B02:00&sort=/kickoff", "cup")
+	s.expect("/matches?ge[/kickoff]=2026-10-05T09&sort=/kickoff", "final", "cup")
 	s.expect("/matches?lt[/kickoff]=2026-10-05T00:00:00Z", "derby")
 	// Schema: exact revision or all revisions (prefix).
 	s.expect("/matches?schema="+w.match, "cup", "derby")
@@ -356,19 +360,20 @@ func testTypedQueries(t *testing.T, noFTS bool) {
 		t.Errorf("at %v", b["at"])
 	}
 
-	// Counts and paging.
+	// Counts and paging (v0.73: counts by string form, as a map; next is
+	// the after of the following page, here a resource name, §A.4).
 	b = s.search("/matches?counts=/tags&limit=2", "")
 	if got := resources(b); fmt.Sprint(got) != "[cup derby]" {
 		t.Errorf("page 1 %v", got)
 	}
-	if c := fmt.Sprint(b["counts"]); c != "map[/tags:[map[count:2 value:cup] map[count:2 value:local] map[count:1 value:rivalry]]]" {
+	if c := fmt.Sprint(b["counts"]); c != "map[/tags:map[cup:2 local:2 rivalry:1]]" {
 		t.Errorf("counts %s", c)
 	}
 	next, _ := b["next"].(string)
-	if next == "" {
-		t.Fatal("no next")
+	if next != "derby" {
+		t.Fatalf("next %q", next)
 	}
-	b = s.search(next, "")
+	b = s.search("/matches?after="+next+"&counts=/tags&limit=2", "")
 	if got := resources(b); fmt.Sprint(got) != "[final notes]" || b["next"] != nil {
 		t.Errorf("page 2 %v next %v", got, b["next"])
 	}
@@ -387,9 +392,11 @@ func testTypedQueries(t *testing.T, noFTS bool) {
 	if got := tagSet(r); !got["idx:matches"] || !got["r:matches/cup"] || !got["r:matches/final"] || got["r:matches/derby"] || got["ns:matches"] || len(got) != 3 {
 		t.Errorf("at tags: %v", r.header.Get("Cache-Tag"))
 	}
-	// A result with facet counts also carries the counts tag.
+	// A result with facet counts is tagged so too: every purge in the
+	// namespace purges idx:{ns} (§A.1, v0.73), so it needs no tag of its
+	// own.
 	r = s.raw(s.raw("/matches?counts=/tags&q=zlatan", "").header.Get("Location"), "")
-	if got := tagSet(r); !got["idx:matches:counts"] || !got["r:matches/derby"] {
+	if got := tagSet(r); !got["idx:matches"] || !got["r:matches/derby"] || len(got) != 2 {
 		t.Errorf("counts tags: %v", r.header.Get("Cache-Tag"))
 	}
 	// Bad input.
@@ -468,7 +475,8 @@ func testUpdatesTombstonePurge(t *testing.T) {
 	s.mu.Lock()
 	purges := fmt.Sprint(s.purges)
 	s.mu.Unlock()
-	if purges != "[[r:matches/final idx:matches:counts]]" {
+	// A resource purge purges idx:{ns} (§A.1, v0.73).
+	if purges != "[[r:matches/final idx:matches]]" {
 		t.Errorf("purges %s", purges)
 	}
 }
@@ -553,10 +561,14 @@ func testCheckpointSurvivesRestart(t *testing.T) {
 	h := must(w.c.Head(ctx, "matches", "cup"))
 	must(w.c.Append(ctx, "matches", "cup", h.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": "Cup replay"}}))
 
-	s2 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true})
-	if s2.ix.Checkpoint("matches") != cp {
-		t.Fatalf("checkpoint after reopen %q, want %q", s2.ix.Checkpoint("matches"), cp)
+	// Reopened without following first: a running follower may apply the
+	// append before the checkpoint is read.
+	s1 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true, noRun: true})
+	if s1.ix.Checkpoint("matches") != cp {
+		t.Fatalf("checkpoint after reopen %q, want %q", s1.ix.Checkpoint("matches"), cp)
 	}
+	s1.stop()
+	s2 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true})
 	bs := s2.appliedUpTo(s2.caughtUp("matches"))
 	if bs[0].From != cp {
 		t.Fatalf("first batch after restart from %q, want %q", bs[0].From, cp)

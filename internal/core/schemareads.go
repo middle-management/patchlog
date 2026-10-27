@@ -73,7 +73,7 @@ func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials,
 	if cred.Bearer == "" {
 		return false
 	}
-	gr, err := grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
+	gr, err := grant.DecodeLimited(cred.Bearer, t.e.grantLimits())
 	if err != nil {
 		return false
 	}
@@ -86,7 +86,8 @@ func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials,
 }
 
 // schemaReadsListed lists the namespaces whose referrers may open n's
-// schemas under schemaReads: n, and those matching schemaReads.for.
+// schemas under schemaReads: n, and those matching schemaReads.for, which
+// is never matched against a branch (§6.1, §2.1 Referrer).
 func (t *tx) schemaReadsListed(n *nsRow, cfg *Config) []*nsRow {
 	names := map[string]bool{n.name: true}
 	scan := false
@@ -112,7 +113,7 @@ func (t *tx) schemaReadsListed(n *nsRow, cfg *Config) []*nsRow {
 	}
 	var out []*nsRow
 	for _, s := range sortedKeys(names) {
-		if l := t.nsByName(s); l != nil && !l.purged && !l.isShadow() {
+		if l := t.nsByName(s); l != nil && !l.purged && !l.isShadow() && !l.isBranch() {
 			out = append(out, l)
 		}
 	}

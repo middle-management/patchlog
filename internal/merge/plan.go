@@ -35,12 +35,19 @@
 // namespace, a patch set that only adds a fresh $nonce), so the batch holds
 // its pair, but only when the target's head is a live document. On a
 // tombstone or an absent resource that would restore or fail, so the
-// resource gets no item: it stays unmerged and is offered again.
+// resource gets no item: it stays unmerged and is offered again. So does
+// one at E3 whose head references a blob a sealed op can't declare, such as
+// one from before a raise to e2e (§E.3.1).
+//
+// Blobs: a merger without unrestricted read on the branch copies the blobs
+// its items reference into the target first, or uploads them where the
+// ranks refuse a copy (blobs.go, §F.3).
 //
 // The batch's source.at is the branch revision the plan was classified
 // from (BranchAt), never a later one: re-classification after a 412 only
 // reads the target again, and a plan built later (NewPlan) reads the
-// branch's new head and uses that as its source.at.
+// branch's new head and uses that as its source.at, unless
+// Options.BranchAt fixes it.
 //
 // End-to-end namespaces (§F.8, §G.5). Sealed patch sets bind their
 // namespace (§E.3.1), so when the branch or the target is e2e the plan
@@ -158,6 +165,9 @@ type Resource struct {
 	resolution   []client.Step
 	resolvedAt   string // B the resolution was written against
 	baseLast     string // the last live revision when B is a tombstone
+	// keepBlock, at E3, names a blob B's document references that a sealed
+	// op can't declare (§E.3.1), so keeping B can't be recorded (§F.3).
+	keepBlock string
 
 	// e2e target: Steps sealed under the target's keys, and the item they
 	// were sealed for (sealedFor), so resubmitting the same item sends the
@@ -277,6 +287,12 @@ type Options struct {
 	// are never carried over (§C.3).
 	Signer *sig.Key
 
+	// BranchAt, if set, is the branch's ns_id to classify from, in place of
+	// its head: the batch's source.at. A release keeps each branch's ns_id
+	// from before its approval's freeze (§F.9). It must be in the branch's
+	// chain.
+	BranchAt string
+
 	// successor is set by Rebase: the target is the branch's successor,
 	// whose merge batches of the branch are the rebase itself, so all of
 	// them count as merge points without merge.authors (§F.6 accepts them
@@ -327,6 +343,10 @@ type Plan struct {
 	ignoredFor map[string][]MergeBatch // per resource: untrusted batches with an entry for it
 	logs       map[string]ancestry     // cache: ns/name@head
 	flags      map[string]string       // e2e: ns/name@id -> why the revision can't be read
+	// unrestricted caches readsBranch; copied the blobs copyBlobs made
+	// available (name/bid).
+	unrestricted *bool
+	copied       map[string]bool
 }
 
 // Pair is a common ancestor from an earlier merge batch (§F.3): the branch
@@ -393,16 +413,19 @@ func NewPlan(ctx context.Context, c *client.Client, target, branch string, opt O
 		}
 	}
 	p.Reencrypt = p.BranchLevel == "e2e" || p.TargetLevel == "e2e"
-	bh, err := c.NSHead(ctx, branch)
-	if err != nil {
-		return nil, fmt.Errorf("merge: branch %s: %w", branch, err)
+	p.BranchAt = opt.BranchAt
+	if p.BranchAt == "" {
+		bh, err := c.NSHead(ctx, branch)
+		if err != nil {
+			return nil, fmt.Errorf("merge: branch %s: %w", branch, err)
+		}
+		p.BranchAt = bh.ID
 	}
-	p.BranchAt = bh.ID
-	blog, err := c.NSLog(ctx, branch, bh.ID, "")
+	blog, err := c.NSLog(ctx, branch, p.BranchAt, "")
 	if err != nil {
 		return nil, fmt.Errorf("merge: branch %s log: %w", branch, err)
 	}
-	bdoc, err := c.NSDoc(ctx, branch, bh.ID)
+	bdoc, err := c.NSDoc(ctx, branch, p.BranchAt)
 	if err != nil {
 		return nil, err
 	}
@@ -657,14 +680,20 @@ func (p *Plan) ancestry(ctx context.Context, ns, name, head string) (ancestry, e
 	if a, ok := p.logs[key]; ok {
 		return a, nil
 	}
-	es, err := p.c.Log(ctx, ns, name, head, "")
+	// An e2e namespace's log is read by the key-holding view, which opens
+	// the pages from before a raise from sealed (Addendum E Levels).
+	readLog := p.c.Log
+	if p.level(ns) == "e2e" {
+		readLog = p.opt.E2E.Log
+	}
+	es, err := readLog(ctx, ns, name, head, "")
 	var a ancestry
 	switch {
 	case err == nil:
 		a = ancestry{entries: es}
 	case client.IsPruned(err) && client.Horizon(err) != "":
 		hz := client.Horizon(err)
-		es, err = p.c.Log(ctx, ns, name, head, hz)
+		es, err = readLog(ctx, ns, name, head, hz)
 		if err != nil {
 			return ancestry{}, err
 		}
@@ -731,7 +760,7 @@ func (r *Resource) reset() {
 	r.IfMatch, r.IfNoneMatch, r.Steps, r.Expected = "", false, nil, nil
 	r.BranchWrites, r.BaseWrites, r.Conflicts = nil, nil, nil
 	r.Squashed, r.Note, r.Kept, r.Pair = false, "", false, nil
-	r.baseLast, r.sealed, r.sealedFor = "", nil, ""
+	r.baseLast, r.sealed, r.sealedFor, r.keepBlock = "", nil, "", ""
 }
 
 func (r *Resource) conflict(kind, msg string, paths ...string) {
@@ -764,6 +793,14 @@ func (p *Plan) classify(ctx context.Context, r *Resource) error {
 		return err
 	}
 	r.forceClass()
+	if p.TargetLevel == "e2e" && h.State == client.Live && (r.Class == FastForward || r.Class == Replay) {
+		// Whether keeping B could be recorded with a sealed empty set,
+		// which repeats B's declared blobs (§F.3, §E.3.1). A document that
+		// can't be read here fails sealing, as before.
+		if d, err := p.doc(ctx, p.Target, r.Name, r.Base); err == nil {
+			r.keepBlock = undeclarableBlob(d)
+		}
+	}
 	if hadResolution {
 		if resolvedAt == r.Base && (r.Class == FastForward || r.Class == Replay) {
 			p.applyResolution(r, resolution)
@@ -941,12 +978,12 @@ func (p *Plan) classifyAncestry(ctx context.Context, r *Resource, h *client.Head
 		r.conflict(ConflictPruned, "the common ancestor's document is not available (pruned)")
 		return nil
 	}
-	bsc, err := foldWrites(*bstart, r.Steps)
+	bsc, err := foldWrites(*bstart, r.Steps, true)
 	if err != nil {
 		r.conflict(ConflictUnreadable, "branch side: "+err.Error())
 		return nil
 	}
-	tsc, err := foldWrites(*tstart, baseSteps)
+	tsc, err := foldWrites(*tstart, baseSteps, false)
 	if err != nil {
 		r.conflict(ConflictUnreadable, "target side: "+err.Error())
 		return nil

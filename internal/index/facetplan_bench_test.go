@@ -139,11 +139,10 @@ func fillBench(tb testing.TB, ix *Index, n int) {
 			}
 		}
 		created := benchStart.Add(time.Duration(r.Int64N(int64(365 * 24 * time.Hour)))).Format(time.RFC3339)
-		ct, _ := normTime(created)
 		score := float64(r.IntN(100000)) / 100
 		p.rows.sort = append(p.rows.sort,
 			sortRow{"/accountId", acct, str(acct)},
-			sortRow{"/createdAt", ct, str(created)},
+			sortRow{"/createdAt", created, str(created)},
 			sortRow{"/score", score, string(jsonv.Canonical(score))})
 		title := ""
 		for k := range 4 {

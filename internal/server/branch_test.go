@@ -147,7 +147,7 @@ func TestBranches(t *testing.T) {
 	e.create("main", "e", map[string]any{})
 	r = e.branch("main", map[string]any{"name": "rel2", "at": at}, "alice")
 	expect(t, r, 201)
-	hs := e.get("/ns/rel2/rev/" + e.nsHead("rel2") + "/heads").Obj()["items"].([]any)
+	hs := e.get("/ns/rel2/rev/" + e.nsHead("rel2") + "/heads").Obj()["heads"].([]any)
 	var names []string
 	for _, x := range hs {
 		m := x.(map[string]any)
@@ -156,7 +156,7 @@ func TestBranches(t *testing.T) {
 	if strings.Join(names, ",") != "a:head:"+a2+",b:head:"+b1+",d:tombstone:"+dt {
 		t.Fatalf("branch heads %v", names)
 	}
-	hs = e.get("/ns/rel/rev/" + e.nsHead("rel") + "/heads").Obj()["items"].([]any)
+	hs = e.get("/ns/rel/rev/" + e.nsHead("rel") + "/heads").Obj()["heads"].([]any)
 	if len(hs) != 4 {
 		t.Fatalf("rel heads %v", hs)
 	}

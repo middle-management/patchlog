@@ -31,6 +31,10 @@ type davError struct {
 	// tooBig: a folder holds more than a tree service listing takes
 	// (svcList), refused as a listing, not as a path (resolveCatalog)
 	tooBig bool
+	// svcRefused: a tree service refused the token's grant a listing
+	// (403), as one without tree-derived access refuses every grant that
+	// doesn't read its namespaces whole (§B.11.5)
+	svcRefused bool
 }
 
 func (e *davError) Error() string {
@@ -226,6 +230,11 @@ func (w *errWriter) WriteHeader(code int) {
 	e := w.st.err
 	if code == http.StatusOK || code == http.StatusPartialContent && wholeRange(w.Header().Get("Content-Range")) {
 		w.st.served()
+	}
+	if w.st.pdf && code != http.StatusOK && code != http.StatusPartialContent {
+		// Only a PDF's 200 or 206 goes without the sandbox (servePDF).
+		w.Header().Set("Content-Security-Policy", "sandbox")
+		w.Header().Del("Content-Disposition")
 	}
 	if w.st.noETag {
 		w.Header().Del("ETag")

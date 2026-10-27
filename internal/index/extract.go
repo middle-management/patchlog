@@ -3,16 +3,13 @@ package index
 import (
 	"context"
 	"errors"
-	"math"
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/middle-management/patchlog/internal/annot"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/jsonv"
-	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/schema"
 )
 
@@ -33,21 +30,34 @@ func NewSchemaCache(c *client.Client) *SchemaCache {
 	return &SchemaCache{c: c, m: map[string]any{}, branch: map[string]bool{}}
 }
 
-// Loader returns a schema.Loader for one Collect call, resolving paths in
-// their own namespaces only. A revision that is unknown, purged or
-// unreadable is schema.ErrUnavailable; any other failure (network, 5xx,
-// 429) is recorded in *transient so the caller can retry instead of
+// Loader returns a schema.Loader for one walk, resolving paths in their
+// own namespaces only. A revision that answers 403, 404 or 410, or that
+// can't be opened for want of keys (unavailable), is schema.ErrUnavailable;
+// any other failure (network, 5xx, 429, and a 401 to the service's own
+// grant) is recorded in *transient so the caller can retry instead of
 // indexing the document without its fields.
 func (s *SchemaCache) Loader(ctx context.Context, transient *error) schema.Loader {
 	return s.LoaderFor(ctx, "", transient)
 }
+
+// refused reports a 403, 404 or 410 answer to a schema revision (§A.1).
+func refused(err error) bool {
+	ae, ok := client.AsAPIError(err)
+	return ok && (ae.Status == 403 || ae.Status == 404 || ae.Status == 410)
+}
+
+// unavailable reports a schema revision that leaves a document indexed as
+// one without $schema (§A.1): refused, or one the service can't open for
+// want of keys (§6.1, §E.2.3), which asking again won't mend. A 401 isn't
+// one: the service's own grant failed to verify, which its operator mends.
+func unavailable(err error) bool { return refused(err) || errors.Is(err, client.ErrNoKeys) }
 
 // LoaderFor is Loader for a document of namespace ns: if ns is a branch,
 // a path its namespace can't resolve is looked up among that namespace's
 // branches (§6.1).
 func (s *SchemaCache) LoaderFor(ctx context.Context, ns string, transient *error) schema.Loader {
 	fail := func(err error) (any, error) {
-		if client.IsNotFound(err) || client.IsGone(err) || client.IsAuth(err) {
+		if unavailable(err) {
 			return nil, schema.ErrUnavailable
 		}
 		if *transient == nil {
@@ -64,11 +74,11 @@ func (s *SchemaCache) LoaderFor(ctx context.Context, ns string, transient *error
 			return jsonv.Clone(v), nil
 		}
 		d, err := s.c.ResolveSchema(ctx, r, client.ResolveOptions{})
-		if err != nil && ns != "" && (client.IsNotFound(err) || client.IsGone(err) || client.IsAuth(err)) {
+		if err != nil && ns != "" && refused(err) {
 			// Only a branch's documents may use drafts. A namespace
 			// document this client can't read (sealed, say) means no.
 			if b, berr := s.isBranch(ctx, ns); berr == nil && b {
-				if dd, derr := s.c.ResolveSchema(ctx, r, client.ResolveOptions{Drafts: true, For: ns}); derr == nil || !client.IsNotFound(derr) && !client.IsGone(derr) && !client.IsAuth(derr) {
+				if dd, derr := s.c.ResolveSchema(ctx, r, client.ResolveOptions{Drafts: true, For: ns}); derr == nil || !refused(derr) {
 					d, err = dd, derr
 				}
 			}
@@ -104,8 +114,8 @@ type textRow struct{ path, body string }
 type facetRow struct{ path, value, raw string }
 type sortRow struct {
 	path  string
-	value any    // float64 or string
-	raw   string // the value as written, canonical JSON (hits show it)
+	value any    // the least value (sortColumn)
+	raw   string // every value at the path, as written: a canonical JSON array (hits show it)
 }
 
 type refRow struct {
@@ -122,11 +132,13 @@ type docRows struct {
 }
 
 // extract returns the document's $schema and its index rows. Untyped
-// documents (no $schema) are typed=false; a schema document is typed by its
-// dialect URL. A typed
-// document whose annotations cannot be collected for a permanent reason
-// (invalid against its schema, unavailable schema) is indexed without rows
-// and logged; transient failures are returned so Apply retries.
+// documents (no $schema) are typed=false, and so is one whose pinned schema
+// revision is unavailable (§A.1): it is indexed exactly as one without
+// $schema. A schema document is typed by its dialect URL. x-index values
+// are collected by a static walk (§A.2, valueWalk), so a document that
+// doesn't validate gets rows too; a schema revision a $ref names that is
+// unavailable marks nothing. Transient failures are returned so Apply
+// retries.
 func (ix *Index) extract(ctx context.Context, ns, resource string, doc any) (string, bool, *docRows, error) {
 	obj, ok := doc.(map[string]any)
 	if !ok {
@@ -151,40 +163,44 @@ func (ix *Index) extract(ctx context.Context, ns, resource string, doc any) (str
 	}
 	var transient error
 	load := ix.schemas.LoaderFor(ctx, ns, &transient)
-	// failed classifies an error of one of the two walks: transient ones
-	// (and cancellation) are returned so Apply retries; the rest are
-	// permanent, and the document is indexed without what the walk gave.
-	failed := func(what string, err error) error {
-		if transient != nil {
-			return transient
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
-		}
-		ix.opt.Logf("index: %s/%s: %s: %v (indexed without them)", ns, resource, what, err)
-		return nil
+	ref, ok := schema.ParseRef(sch)
+	if !ok {
+		// Neither a revision path nor a dialect: the core stores none.
+		ix.opt.Logf("index: %s/%s: $schema %q is not a schema revision path (indexed without rows)", ns, resource, sch)
+		return sch, true, nil, nil
 	}
-	var rows *docRows
-	anns, err := annot.Collect(doc, load, "x-index")
+	root, err := load(ref)
 	if err != nil {
-		if err := failed("collecting x-index", err); err != nil {
+		switch {
+		case transient != nil:
+			return "", false, nil, transient
+		case errors.Is(err, schema.ErrUnavailable):
+			// §A.1: no rows, no match for schema=, a docs row only if
+			// untyped documents are listed, and its schema counts for no
+			// path (checkFields reads the docs rows' schemas).
+			ix.opt.Logf("index: %s/%s: schema %s is unavailable; indexed as a document without $schema", ns, resource, sch)
+			return "", false, nil, nil
+		default:
 			return "", false, nil, err
 		}
-	} else {
-		rows = rowsFor(doc, anns)
+	}
+	rows := collectValues(doc, ref.Path(), &markWalk{load: load, docs: map[string]any{ref.Path(): root}})
+	if transient != nil {
+		return "", false, nil, transient
 	}
 	// §A.2: references come from §6.5's static walk with the schema
 	// revision the document pins, whether or not the document validates.
 	found, err := annot.FindRefs(doc, load)
 	if err != nil {
-		if err := failed("walking x-ref", err); err != nil {
+		if transient != nil {
+			return "", false, nil, transient
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return "", false, nil, err
 		}
+		ix.opt.Logf("index: %s/%s: walking x-ref: %v (indexed without them)", ns, resource, err)
 	}
 	if len(found) > 0 {
-		if rows == nil {
-			rows = &docRows{}
-		}
 		rows.refs = refRows(found)
 	}
 	return sch, true, rows, nil
@@ -206,51 +222,6 @@ func refRows(found []annot.Ref) []refRow {
 	return out
 }
 
-// rowsFor turns x-index annotations into rows (§A.2).
-func rowsFor(doc any, anns []annot.Annotation) *docRows {
-	r := &docRows{}
-	seen := map[string]bool{}
-	sortSeen := map[string]bool{}
-	for _, a := range anns {
-		path := fieldPath(doc, a.Pointer)
-		for _, kind := range indexKinds(a.Value) {
-			key := kind + "\x00" + a.Pointer
-			if seen[key] {
-				continue // the same location annotated by several subschemas
-			}
-			seen[key] = true
-			switch kind {
-			case "text":
-				// Objects and arrays: every string leaf.
-				walkStrings(a.Instance, func(s string) {
-					if strings.TrimSpace(s) != "" {
-						r.text = append(r.text, textRow{path, s})
-					}
-				})
-			case "facet":
-				vals := []any{a.Instance}
-				if arr, ok := a.Instance.([]any); ok {
-					vals = arr
-				}
-				for _, v := range vals {
-					fv, raw := facetValue(v)
-					r.facet = append(r.facet, facetRow{path, fv, raw})
-				}
-			case "sort":
-				// One value per path: the first in document order.
-				if sortSeen[path] {
-					continue
-				}
-				if v, ok := sortValue(a.Instance); ok {
-					sortSeen[path] = true
-					r.sort = append(r.sort, sortRow{path, v, string(jsonv.Canonical(sortElem(a.Instance)))})
-				}
-			}
-		}
-	}
-	return r
-}
-
 // indexKinds reads an x-index value: "text" | "facet" | "sort", or (an
 // extension) an array of them.
 func indexKinds(v any) []string {
@@ -268,49 +239,6 @@ func indexKinds(v any) []string {
 		add(v)
 	}
 	return out
-}
-
-// fieldPath drops array indices from an instance pointer, walking the
-// document to tell array positions from object members named like numbers.
-func fieldPath(doc any, ptr string) string {
-	p, err := pointer.Parse(ptr)
-	if err != nil {
-		return ptr
-	}
-	var out pointer.Pointer
-	cur := doc
-	for _, tok := range p {
-		switch c := cur.(type) {
-		case []any:
-			i, ok := pointer.ArrayIndex(tok)
-			if !ok || i >= len(c) {
-				return out.String()
-			}
-			cur = c[i]
-		case map[string]any:
-			out = append(out, tok)
-			cur = c[tok]
-		default:
-			out = append(out, tok)
-			cur = nil
-		}
-	}
-	return out.String()
-}
-
-func walkStrings(v any, fn func(string)) {
-	switch x := v.(type) {
-	case string:
-		fn(x)
-	case []any:
-		for _, e := range x {
-			walkStrings(e, fn)
-		}
-	case map[string]any:
-		for _, k := range sortedKeys(x) {
-			walkStrings(x[k], fn)
-		}
-	}
 }
 
 func sortedKeys(m map[string]any) []string {
@@ -333,56 +261,45 @@ func facetValue(v any) (value, raw string) {
 	return raw, raw
 }
 
-// sortTime is the fixed-width UTC form RFC 3339 timestamps are normalised
-// to, so that they compare lexically in time order.
-const sortTime = "2006-01-02T15:04:05.000000000Z"
-
-// normTime returns s normalised if it is an RFC 3339 date-time.
-func normTime(s string) (string, bool) {
-	if len(s) < 20 || s[4] != '-' || (s[10] != 'T' && s[10] != 't') {
-		return "", false
+// sortLess is the order of sort values (§A.2): numbers before strings
+// before booleans; numbers by value, strings by UTF-8 bytes (no date-time
+// normalisation), false before true.
+func sortLess(a, b any) bool {
+	ra, rb := sortRank(a), sortRank(b)
+	if ra != rb {
+		return ra < rb
 	}
-	t, err := time.Parse(time.RFC3339Nano, strings.ToUpper(s))
-	if err != nil {
-		return "", false
-	}
-	return t.UTC().Format(sortTime), true
-}
-
-// sortValue is the stored sort key: numbers as REAL, strings as TEXT
-// (RFC 3339 date-times normalised to UTC with nanoseconds). Other values,
-// and arrays (first sortable element), are skipped.
-func sortValue(v any) (any, bool) {
-	switch x := v.(type) {
+	switch x := a.(type) {
 	case float64:
-		if math.IsNaN(x) || math.IsInf(x, 0) {
-			return nil, false
-		}
-		return x, true
+		return x < b.(float64)
 	case string:
-		if n, ok := normTime(x); ok {
-			return n, true
-		}
-		return x, true
-	case []any:
-		for _, e := range x {
-			if s, ok := sortValue(e); ok {
-				return s, true
-			}
-		}
+		return x < b.(string)
+	case bool:
+		return !x && b.(bool)
 	}
-	return nil, false
+	return false
 }
 
-// sortElem is the value sortValue stored the key of: the instance, or for
-// an array its first sortable element.
-func sortElem(v any) any {
-	if arr, ok := v.([]any); ok {
-		for _, e := range arr {
-			if _, ok := sortValue(e); ok {
-				return sortElem(e)
-			}
+func sortRank(v any) int {
+	switch v.(type) {
+	case float64:
+		return 0
+	case string:
+		return 1
+	}
+	return 2
+}
+
+// sortColumn is a sort value as stored, typed so that SQLite orders the
+// column as sortLess does: a number as REAL, a string as TEXT (compared as
+// bytes, BINARY), a boolean as a BLOB x'00' (false) or x'01' (true), since
+// SQLite orders REAL before TEXT before BLOB.
+func sortColumn(v any) any {
+	if b, ok := v.(bool); ok {
+		if b {
+			return []byte{1}
 		}
+		return []byte{0}
 	}
 	return v
 }

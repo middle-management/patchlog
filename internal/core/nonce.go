@@ -1,9 +1,6 @@
 package core
 
 import (
-	"context"
-
-	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -46,10 +43,11 @@ func checkRequiredNonces(s *itemState) *Error {
 // before its base set it never had it on, so leaving it off turns nothing
 // off. base is the branch's base, nil for a namespace that isn't a branch.
 // A remote branch's shadow holds what its base required when the branch
-// was created (insertShadow).
+// was created (insertShadow). The refusal is 422 invalid with errors
+// pointing at /nonce, as for the other branch fields (§7.4).
 func (t *tx) checkNonceBase(cur, cfg *Config, base *nsRow) *Error {
 	if base != nil && !cfg.NonceRequired && (cur == nil || cur.NonceRequired) && t.config(base.configSeq).NonceRequired {
-		return invalid(`/nonce: a branch can't turn off the nonce requirement its base has (§7.6, §C.7)`)
+		return docInvalid("/nonce", `/nonce: a branch can't turn off the nonce requirement its base has (§7.6, §C.7)`)
 	}
 	return nil
 }
@@ -80,24 +78,6 @@ func (t *tx) nonceDependents(n *nsRow) []string {
 		if !t.config(b.configSeq).NonceRequired {
 			out = append(out, b.name)
 		}
-	}
-	return out
-}
-
-// fetchSchemaNonces reads which namespaces of a remote branch's schema
-// closure require nonces at the base's deployment, so a schema namespace
-// created here for them takes its source's setting (requireNonces). A
-// namespace document the endpoint can't read leaves the setting optional:
-// mirroring writes nothing through the gate, so only later writes here
-// would be checked.
-func fetchSchemaNonces(ctx context.Context, c *client.Client, schemas []*remoteSchema) map[string]bool {
-	out := map[string]bool{}
-	for _, s := range schemas {
-		if _, done := out[s.ns]; done {
-			continue
-		}
-		req, err := c.NonceRequired(ctx, s.ns)
-		out[s.ns] = err == nil && req
 	}
 	return out
 }

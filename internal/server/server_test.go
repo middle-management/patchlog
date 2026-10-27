@@ -373,9 +373,10 @@ func TestWrites(t *testing.T) {
 	// Append on a tombstoned resource with the old head: 410.
 	r = e.write("PATCH", "docs", "a", id2, ops(op("replace", "/n", 3.0)))
 	expectCode(t, r, 410, "gone")
-	// Create on a tombstoned resource: 412 {head: tombstone}.
+	// Create on a tombstoned resource: 410 gone {head: tombstone}, never
+	// 412 (§7.2, §8.1).
 	r = e.write("PATCH", "docs", "a", "", addRoot(map[string]any{}))
-	expectCode(t, r, 412, "stale")
+	expectCode(t, r, 410, "gone")
 	if r.Str("head") != tomb {
 		t.Fatalf("create on tombstone: %s", r.Body)
 	}
@@ -522,11 +523,13 @@ func TestPrivateCaching(t *testing.T) {
 func TestLimits(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	e.mkNS("docs", map[string]any{"read": "public", "limits": map[string]any{"patchSetSize": 200.0, "opsPerSet": 3.0, "nestingDepth": 3.0}})
+	// 3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize (§6.6 Values).
+	e.mkNS("docs", map[string]any{"read": "public", "limits": map[string]any{"patchSetSize": 2048.0, "valueSize": 300.0, "pathSize": 40.0, "opsPerSet": 3.0, "nestingDepth": 3.0}})
 	id := e.create("docs", "a", map[string]any{"a": map[string]any{"b": 1.0}})
-	big := ops(op("add", "/big", strings.Repeat("x", 300)))
+	x := strings.Repeat("x", 290)
+	big := ops(op("add", "/big", []any{x, x, x, x, x, x, x, x}))
 	r := e.write("PATCH", "docs", "a", id, big)
-	expectLimit(t, r, 413, "patchSetSize", int64(len(canonical(big))), 200)
+	expectLimit(t, r, 422, "patchSetSize", int64(len(canonical(big))), 2048)
 	r = e.write("PATCH", "docs", "a", id, ops(op("add", "/1", 1.0), op("add", "/2", 1.0), op("add", "/3", 1.0), op("add", "/4", 1.0)))
 	expectLimit(t, r, 422, "opsPerSet", 4, 3)
 	r = e.write("PATCH", "docs", "a", id, ops(op("add", "/a/b", map[string]any{"c": map[string]any{"d": 1.0}})))

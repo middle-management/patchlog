@@ -366,7 +366,8 @@ func CanonicalPath(path string) bool {
 // included, before serving it or forwarding it as verified (§C.5.3),
 // in order:
 //
-//  1. the method is GET or HEAD;
+//  1. the method is GET or HEAD, and the request carries no Authorization
+//     (a cookie counts only on a request without one);
 //  2. the path has no empty, "." or ".." segment and no percent-escape;
 //  3. a cookie whose name is derived from its own p (others are ignored);
 //  4. a kid c holds, which vouches for p (VouchesFor), and a valid MAC;
@@ -387,7 +388,7 @@ func (c *Cookies) Check(r *http.Request, now time.Time) (p string, ok bool) {
 }
 
 func (c *Cookies) check(r *http.Request, now time.Time) *Claims {
-	if c == nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+	if c == nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) || len(r.Header.Values("Authorization")) > 0 {
 		return nil
 	}
 	path := r.URL.EscapedPath()
@@ -411,7 +412,7 @@ func (c *Cookies) check(r *http.Request, now time.Time) *Claims {
 }
 
 // FromRequest returns the claims of the first edge-grant cookie of r that
-// passes Check at now, or nil.
+// passes Check at now, or nil, as for a request carrying Authorization.
 func (c *Cookies) FromRequest(r *http.Request, now time.Time) *Claims {
 	return c.check(r, now)
 }

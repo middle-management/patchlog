@@ -350,10 +350,10 @@ func (g *grantExporter) fetchSealed(ctx context.Context, ns, gid string) (*clien
 	rec := &client.GrantDoc{}
 	rec.ID, _ = m["id"].(string)
 	rec.Root, _ = m["root"].(map[string]any)
-	arr, _ := m["stored"].([]any)
-	for _, x := range arr {
-		s, _ := x.(string)
-		rec.Stored = append(rec.Stored, s)
+	// The authority block, of either stored form (§C.3.1); a malformed one
+	// is reported where the record is checked.
+	if s, err := StoredAuthority(m["stored"]); err == nil {
+		rec.Stored = []string{s}
 	}
 	return rec, nil
 }
@@ -373,7 +373,9 @@ func (g *grantExporter) epochKey(ctx context.Context, ns, kid string) ([]byte, e
 		return nil, fmt.Errorf("export: keys of %s for its grants: %w", ns, err)
 	}
 	for _, e := range got {
-		if e.Kid != kid || e.Resource != "" {
+		// A keyring entry an e2e namespace relays (from, §E.3.2) isn't an
+		// epoch key the server holds: grants are sealed under those only.
+		if e.Kid != kid || e.Resource != "" || e.From != "" {
 			continue
 		}
 		key := e.Key
@@ -433,7 +435,11 @@ func (g *grantExporter) ensure(ctx context.Context, bw *Writer, ns, gid string, 
 		g.note("grant "+gid, "grant %s isn't carried: %s", gid, why)
 		return false, nil
 	}
-	gr, err := parseStoredGrant(rec.Stored)
+	// The line carries the authority block alone (§G.4.1), whichever form
+	// the source serves: one string, or before v0.73 every SignedBlock,
+	// authority first.
+	stored := storedOf(rec)
+	gr, err := parseStoredGrant(stored)
 	if err != nil {
 		g.note("grant "+gid, "grant %s isn't carried: the source's stored grant is malformed: %v", gid, err)
 		return false, nil
@@ -446,7 +452,7 @@ func (g *grantExporter) ensure(ctx context.Context, bw *Writer, ns, gid string, 
 	if !key.valid {
 		g.note("key "+gid, "grant %s is carried without a key: no key named %q in the namespace document at the first entry that recorded it (or in its bases' then, in a branch), or in the operator key history at %s, verifies its root block (%d candidates)", gid, gr.Blocks[0].Kid, rev.Created, key.tried)
 	}
-	line := Line{NS: lineRef.NS, GrantLine: &GrantLine{ID: rec.ID, Root: rec.Root, Stored: rec.Stored, Origin: lineRef.Origin}}
+	line := Line{NS: lineRef.NS, GrantLine: &GrantLine{ID: rec.ID, Root: rec.Root, Stored: stored, Origin: lineRef.Origin}}
 	if key.valid {
 		line.GrantLine.Key = key.entry
 	}
@@ -467,7 +473,7 @@ type foundKey struct {
 // findKey finds the key entry rec's root block verifies against at the
 // source (see the decisions above).
 func (g *grantExporter) findKey(ctx context.Context, lineRef NSRef, found bool, entry string, rec *client.GrantDoc, rev client.LogEntry, ns string) foundKey {
-	gr, err := parseStoredGrant(rec.Stored)
+	gr, err := parseStoredGrant(storedOf(rec))
 	if err != nil {
 		return foundKey{}
 	}
@@ -524,11 +530,20 @@ func (g *grantExporter) findKey(ctx context.Context, lineRef NSRef, found bool, 
 	return out
 }
 
+// storedOf is the authority block of a grant record: the first of its
+// SignedBlocks, "" if it has none.
+func storedOf(rec *client.GrantDoc) string {
+	if len(rec.Stored) == 0 {
+		return ""
+	}
+	return rec.Stored[0]
+}
+
 // FindRootKey picks, from candidate keys, the one that verifies the
-// authority block of the stored grant (§C.3.1), for exporters that write
+// stored authority block of a grant (§C.3.1), for exporters that write
 // grant lines from a store they hold, such as pruning archives (§8.6). ns
 // is the grant line's namespace.
-func FindRootKey(stored []string, ns string, candidates []KeyEntry) (KeyEntry, bool) {
+func FindRootKey(stored string, ns string, candidates []KeyEntry) (KeyEntry, bool) {
 	gr, err := parseStoredGrant(stored)
 	if err != nil {
 		return KeyEntry{}, false

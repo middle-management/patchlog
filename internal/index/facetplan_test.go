@@ -226,9 +226,10 @@ func TestPlans(t *testing.T) {
 				}
 			}
 		}
-		// counts looks a few resources up by primary key.
-		out["counts"] = strings.Join(explainPlan(t, ix.db, `SELECT f.resource, f.raw FROM json_each(?) j CROSS JOIN facet f INDEXED BY sqlite_autoindex_facet_1 WHERE f.ns = ? AND f.resource = j.value AND f.path = ?`, `["x"]`, benchNS, "/status"), "\n")
-		if !strings.Contains(out["counts"], "SEARCH f USING INDEX sqlite_autoindex_facet_1 (ns=? AND resource=? AND path=?)") {
+		// counts looks a few resources up by primary key, which covers the
+		// value it counts by (v0.73: the string form, §A.2).
+		out["counts"] = strings.Join(explainPlan(t, ix.db, `SELECT f.resource, f.value FROM json_each(?) j CROSS JOIN facet f INDEXED BY sqlite_autoindex_facet_1 WHERE f.ns = ? AND f.resource = j.value AND f.path = ?`, `["x"]`, benchNS, "/status"), "\n")
+		if !strings.Contains(out["counts"], "SEARCH f USING COVERING INDEX sqlite_autoindex_facet_1 (ns=? AND resource=? AND path=?)") {
 			t.Errorf("counts lookup:\n%s", out["counts"])
 		}
 		return out
@@ -333,16 +334,20 @@ func randomIndex(t *testing.T, r *rand.Rand, noFTS bool) *Index {
 			}
 			if r.IntN(10) < 8 {
 				f := float64(r.IntN(10)) / 2
-				p.rows.sort = append(p.rows.sort, sortRow{"/s", f, string(jsonv.Canonical(f))})
+				p.rows.sort = append(p.rows.sort, sortRow{"/s", f, string(jsonv.Canonical([]any{f}))})
 			}
 			for _, path := range []string{"/t", "/u"} {
 				if r.IntN(10) < 6 {
 					var v any = sortStrings[r.IntN(len(sortStrings))]
-					if path == "/u" && r.IntN(2) == 0 {
-						v = float64(r.IntN(5))
+					if path == "/u" {
+						switch r.IntN(4) {
+						case 0, 1:
+							v = float64(r.IntN(5))
+						case 2:
+							v = r.IntN(2) == 0
+						}
 					}
-					sv, _ := sortValue(v)
-					p.rows.sort = append(p.rows.sort, sortRow{path, sv, string(jsonv.Canonical(v))})
+					p.rows.sort = append(p.rows.sort, sortRow{path, sortColumn(v), string(jsonv.Canonical([]any{v}))})
 				}
 			}
 			for k := range r.IntN(3) {
@@ -411,20 +416,29 @@ func randomQuery(r *rand.Rand) url.Values {
 		v.Set("q", []string{"alpha", "alph*", "beta gamma", "ärlig", "nothing"}[r.IntN(5)])
 	}
 	if r.IntN(5) == 0 {
-		v.Set("schema", []string{"/r/schemas/m", "/r/schemas/m/", "/r/schemas/mm", schemaPool[0]}[r.IntN(4)])
+		v.Set("schema", []string{"/r/schemas/m", "/r/schemas/m/", "/r/schemas", "/r/schemas/mm", schemaPool[0]}[r.IntN(5)])
 	}
 	if r.IntN(4) == 0 {
 		v.Set("ref", []string{"/r/t/one", "/r/t/two", "/r/t/one/rev/" + revA, "/r/t/two#e1", "/r/a/r001", "/r/t/none"}[r.IntN(6)])
 	}
+	var counts []string
 	for range r.IntN(3) {
-		v.Add("counts", []string{"/a", "/b", "/c", "/zz"}[r.IntN(4)])
+		counts = append(counts, []string{"/a", "/b", "/c", "/zz"}[r.IntN(4)])
+	}
+	if len(counts) > 0 {
+		v.Set("counts", strings.Join(counts, ","))
 	}
 	if r.IntN(10) == 0 {
 		v.Set("fields", "/title")
 	}
 	v.Set("limit", fmt.Sprint([]int{1, 2, 5, 20, 100}[r.IntN(5)]))
 	if r.IntN(3) == 0 {
-		v.Set("after", fmt.Sprint(r.IntN(60)))
+		// A position with q or sort, else a resource name (§A.4).
+		if v.Has("q") || v.Has("sort") {
+			v.Set("after", fmt.Sprint(r.IntN(60)))
+		} else {
+			v.Set("after", fmt.Sprintf("r%03d", r.IntN(300)))
+		}
 	}
 	return v
 }
@@ -514,20 +528,11 @@ func oldCandidateSQL(fts bool, ns string, q *Query) (string, []any) {
 	}
 	sb.WriteString(` FROM docs d`)
 	if len(q.words) > 0 {
-		sb.WriteString(` JOIN (SELECT docid, sum(s) AS score FROM (`)
-		for i, w := range q.words {
-			if i > 0 {
-				sb.WriteString(` UNION ALL `)
-			}
-			if fts {
-				fmt.Fprintf(&sb, `SELECT rowid >> %d AS docid, %d AS k, -rank AS s FROM "text" WHERE "text" MATCH ?`, textShift, i)
-				args = append(args, ftsPhrase(w))
-			} else {
-				fmt.Fprintf(&sb, `SELECT docid, %d AS k, 1.0 AS s FROM "text" WHERE body LIKE ? ESCAPE '\'`, i)
-				args = append(args, likePattern(w))
-			}
-		}
-		fmt.Fprintf(&sb, `) GROUP BY docid HAVING count(DISTINCT k) = %d) t ON t.docid = d.docid`, len(q.words))
+		// v0.73: each score from its document alone (§A.4), as run
+		// computes it; the plans compared don't touch the text matches.
+		m, margs := textMatchSQL(fts, ns, q.words, nil)
+		sb.WriteString(` JOIN ` + m + ` t ON t.docid = d.docid`)
+		args = append(args, margs...)
 	}
 	for i, s := range q.Sorts {
 		fmt.Fprintf(&sb, ` LEFT JOIN "sort" s%d ON s%d.ns = d.ns AND s%d.resource = d.resource AND s%d.path = ?`, i, i, i, i)
@@ -536,9 +541,17 @@ func oldCandidateSQL(fts bool, ns string, q *Query) (string, []any) {
 	sb.WriteString(` WHERE d.ns = ?`)
 	args = append(args, ns)
 	if q.Schema != "" {
-		pre := strings.TrimRight(q.Schema, "/") + "/"
+		// v0.73: an exact $schema, or a resource path's revisions (§A.4).
+		pre := q.Schema + "/rev/"
+		if strings.Count(q.Schema, "/") != 3 || strings.HasSuffix(q.Schema, "/") {
+			pre = "\x00" // no revision path starts with it
+		}
 		sb.WriteString(` AND (d.schema = ? OR substr(d.schema, 1, ?) = ?)`)
 		args = append(args, q.Schema, len(pre), pre)
+	}
+	if q.AfterName != "" && len(q.Counts) == 0 {
+		sb.WriteString(` AND d.resource > ?`)
+		args = append(args, q.AfterName)
 	}
 	if rf := q.Ref; rf != nil {
 		cond, a := refCond(rf)
@@ -582,7 +595,8 @@ func oldCandidateSQL(fts bool, ns string, q *Query) (string, []any) {
 		}
 		fmt.Fprintf(&sb, `s%d.value IS NULL, s%d.value %s, `, i, i, dir)
 	}
-	if len(q.words) > 0 {
+	if len(q.words) > 0 && len(q.Sorts) == 0 {
+		// v0.73: ties after sort keys go by resource name alone (§A.4).
 		sb.WriteString(`t.score DESC, `)
 	}
 	sb.WriteString(`d.resource`)
@@ -614,7 +628,7 @@ func (ix *Index) oldRun(ctx context.Context, tx *sql.Tx, ns string, q *Query, al
 		}
 		n++
 		switch {
-		case n <= q.After:
+		case n <= q.After, q.AfterName != "" && h.Resource <= q.AfterName:
 		case len(res.Hits) < q.Limit:
 			res.Hits = append(res.Hits, h)
 		default:
@@ -648,49 +662,35 @@ func (ix *Index) oldRun(ctx context.Context, tx *sql.Tx, ns string, q *Query, al
 	return res, nil
 }
 
-// oldCounts is counts of v0.15.2: it reads every row of each path.
-func oldCounts(ctx context.Context, tx *sql.Tx, ns string, paths, resources []string) (map[string][]FacetCount, error) {
+// oldCounts is counts of v0.15.2, by string form as of v0.73 (§A.2): it
+// reads every row of each path.
+func oldCounts(ctx context.Context, tx *sql.Tx, ns string, paths, resources []string) (map[string]map[string]int, error) {
 	in := make(map[string]bool, len(resources))
 	for _, r := range resources {
 		in[r] = true
 	}
-	out := map[string][]FacetCount{}
+	out := map[string]map[string]int{}
 	for _, p := range paths {
-		rows, err := tx.QueryContext(ctx, `SELECT resource, raw FROM facet WHERE ns = ? AND path = ?`, ns, p)
+		rows, err := tx.QueryContext(ctx, `SELECT resource, value FROM facet WHERE ns = ? AND path = ?`, ns, p)
 		if err != nil {
 			return nil, err
 		}
 		c := map[string]int{}
 		for rows.Next() {
-			var r, raw string
-			if err := rows.Scan(&r, &raw); err != nil {
+			var r, v string
+			if err := rows.Scan(&r, &v); err != nil {
 				rows.Close()
 				return nil, err
 			}
 			if in[r] {
-				c[raw]++
+				c[v]++
 			}
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return nil, err
 		}
-		list := []FacetCount{}
-		keys := make([]string, 0, len(c))
-		for k := range c {
-			keys = append(keys, k)
-		}
-		sort.Slice(keys, func(i, j int) bool {
-			if c[keys[i]] != c[keys[j]] {
-				return c[keys[i]] > c[keys[j]]
-			}
-			return keys[i] < keys[j]
-		})
-		for _, k := range keys {
-			v, _ := jsonv.Parse([]byte(k))
-			list = append(list, FacetCount{Value: v, Count: c[k]})
-		}
-		out[p] = list
+		out[p] = c
 	}
 	return out, nil
 }

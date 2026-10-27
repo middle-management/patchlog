@@ -44,6 +44,10 @@ type Head struct {
 	// sealed and e2e namespaces; Moved reads the document at Last there,
 	// and E2E.Moved always does.
 	Successor string
+	// PurgedNS is, for a Purged head, the purge-ns entry of a purged
+	// namespace, whose every name is 410 purged with it as head (§8.5);
+	// "" for a resource purged on its own (§8.3).
+	PurgedNS string
 }
 
 // Head reads a resource's head pointer without following the redirect.
@@ -70,7 +74,11 @@ func (c *Client) Head(ctx context.Context, ns, name string) (*Head, error) {
 			}
 			return h, nil
 		}
-		return &Head{State: Purged}, nil
+		h := &Head{State: Purged}
+		if str(m, "code") == "purged" {
+			h.PurgedNS = str(m, "head")
+		}
+		return h, nil
 	}
 	return nil, r.apiError()
 }
@@ -138,6 +146,18 @@ type Doc struct {
 	// lack them.
 	Modified time.Time
 	Digest   string
+	// Rules is the schema rules marker of a schema document (§6.1), from
+	// schema.RulesHeader, which RulesKnown says the server sent: Legacy
+	// when it didn't, as a server from before markers, a sealed or e2e
+	// namespace, and any document that isn't a schema leave it out. A
+	// validator compiles the revision under it, as its server does
+	// (schema.Validator.ValidateMarked).
+	Rules      schema.Rules
+	RulesKnown bool
+	// Kid is the kid of the sealed document as served, "{ns}#{e}" naming
+	// the epoch the revision is served under (§E.2.2), "" for a document
+	// served in the clear.
+	Kid string
 }
 
 // Doc fetches the document at revision id (immutable). A tombstone id, a
@@ -157,23 +177,48 @@ func (c *Client) Doc(ctx context.Context, ns, name, id string) (*Doc, error) {
 		return nil, r.apiError()
 	}
 	body := r.body
+	kid := ""
 	if isJOSE(r) {
 		if body, err = c.open(ctx, ns, name, string(r.body), fixedPL(seal.ResourcePL(ns, name, id, seal.KindDoc))); err != nil {
 			return nil, fmt.Errorf("client: document %s/%s@%s: %w", ns, name, id, err)
+		}
+		if h, err := seal.ParseHeader(string(r.body)); err == nil {
+			kid = h.Kid
 		}
 	}
 	v, err := jsonv.Parse(body)
 	if err != nil {
 		return nil, fmt.Errorf("client: document %s/%s@%s: %w", ns, name, id, err)
 	}
-	d := &Doc{ID: id, Raw: body, Value: v}
+	d := &Doc{ID: id, Raw: body, Value: v, Kid: kid}
 	if t, err := http.ParseTime(r.header.Get("Last-Modified")); err == nil {
 		d.Modified = t
 	}
+	d.Rules, d.RulesKnown = schema.ParseRules(r.header.Get(schema.RulesHeader))
 	if !isJOSE(r) {
 		d.Digest = reprSHA256(r.header.Get("Repr-Digest"))
 	}
 	return d, nil
+}
+
+// SchemaRules reads the schema rules marker of revision id of ns/name, as
+// Doc.Rules and Doc.RulesKnown give it, with a HEAD request (immutable).
+func (c *Client) SchemaRules(ctx context.Context, ns, name, id string) (schema.Rules, bool, error) {
+	if err := checkRes(ns, name); err != nil {
+		return schema.Legacy, false, err
+	}
+	if err := checkID("revision", id); err != nil {
+		return schema.Legacy, false, err
+	}
+	r, err := c.do(ctx, "HEAD", "/r/"+ns+"/"+name+"/rev/"+id, nil, nil)
+	if err != nil {
+		return schema.Legacy, false, err
+	}
+	if r.status != 200 {
+		return schema.Legacy, false, r.apiError()
+	}
+	rules, known := schema.ParseRules(r.header.Get(schema.RulesHeader))
+	return rules, known, nil
 }
 
 // ReprDigest is the sha-256 of b in the RFC 9530 form, sha-256=:<base64>:,
@@ -220,8 +265,12 @@ type LogEntry struct {
 	// absent (pruned or purged).
 	HasPatches bool
 	Author     string
-	Created    string
-	Signature  string // author signature (§C.3), if served
+	// Via is the delegation chain of the grant the entry was written
+	// under, its delegatees in order (§7.1, §C.1); nil when there are
+	// none, and from servers before v0.63, which don't serve it.
+	Via       []string
+	Created   string
+	Signature string // author signature (§C.3), if served
 	// Grant is the grant the entry was written under (§7.1, §C.3), if
 	// served: its id and root sub and kid.
 	Grant *NSGrant
@@ -229,6 +278,10 @@ type LogEntry struct {
 	// (§7.1, §7.2), "" if none; not hashed.
 	Gesture, Undoes string
 	Raw             map[string]any // the entry as served
+	// Kid is the kid of the JWE a sealed namespace served the entry as
+	// (§E.2.2), "" for an entry served in the clear: "{ns}#{e}", the
+	// epoch the server serves that revision under.
+	Kid string
 }
 
 func parseLogEntry(v any) (LogEntry, error) {
@@ -243,6 +296,9 @@ func parseLogEntry(v any) (LogEntry, error) {
 	}
 	if p, has := m["patches"]; has {
 		e.Patches, e.HasPatches = p, true
+	}
+	if via := strList(m["via"]); len(via) > 0 {
+		e.Via = via
 	}
 	if gm, ok := m["grant"].(map[string]any); ok {
 		e.Grant = &NSGrant{ID: str(gm, "id"), Sub: str(gm, "sub"), Kid: str(gm, "kid")}
@@ -513,7 +569,9 @@ func (c *Client) Purge(ctx context.Context, ns, name, head string, force bool) (
 // PruneRequest is the body of POST /r/{ns}/{name}/prune (§8.6).
 type PruneRequest struct {
 	Horizon string
-	Keep    []string // replaces the resource's earlier keep set; nil = none
+	// Keep, when not nil, replaces the resource's keep set, and an empty
+	// slice clears it; nil leaves the stored set alone (§8.6).
+	Keep []string
 	// Snapshot is the horizon's document sealed by a key holder, required
 	// for resources of e2e namespaces (§8.6; see E2E.Prune).
 	Snapshot string
@@ -522,7 +580,9 @@ type PruneRequest struct {
 // PruneResult is the outcome of a prune.
 type PruneResult struct {
 	Horizon string // the effective horizon (may be lower than requested)
-	NSID    string // the prune entry, "" if the horizon did not move
+	// NSID is the prune entry, "" when the prune neither moved the
+	// horizon nor changed the keep set, or ran in a branch (§8.6).
+	NSID string
 }
 
 // Prune prunes a resource's history below a horizon (§8.6). It takes no

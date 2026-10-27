@@ -270,7 +270,8 @@ func TestBlobE2EDeclared(t *testing.T) {
 	a1 := etagOf(r)
 	g := e.get(blobPath("e", "a", bid))
 	expect(t, g, 200)
-	if g.H.Get("Content-Type") != core.SealedBlobType || g.H.Get("Cache-Control") != ccImmutable {
+	// e is read "grant": private (v0.63 §E.2.5).
+	if g.H.Get("Content-Type") != core.SealedBlobType || g.H.Get("Cache-Control") != "private, max-age=300" {
 		t.Fatalf("e2e blob %v", g.H)
 	}
 	b, err := plclient.DecryptBlob(ref1, g.Body)

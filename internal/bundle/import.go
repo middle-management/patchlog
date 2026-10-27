@@ -373,6 +373,9 @@ type bdoc struct {
 	// changes strings that pin, never a blob reference); nil otherwise.
 	snapGone  bool
 	snapBlobs []string
+	// epochs are, for an e2e source's document, the epoch of each line
+	// (e2eEpochs); nil otherwise.
+	epochs []int
 }
 
 type item struct {
@@ -382,6 +385,7 @@ type item struct {
 	ifMatch  string
 	ifNone   bool
 	steps    []client.Step
+	line0    int // the bundle line of steps[0], for a document's own lines (epochs)
 	expected []string
 	sizes    []int      // per step, its patch set's canonical size (stepSizes)
 	sameIDs  bool       // the ids are the source's (fast-forward): source.ids follows them
@@ -432,11 +436,15 @@ type batch struct {
 	size  int
 	rep   *BatchReport
 	keys  map[string]bool // its items' source documents (keysOf)
+	// epoch is, for an e2e target, the epoch it must be at when the batch
+	// goes (splitEpochs); 0 otherwise.
+	epoch int
 }
 
 type part struct {
 	it       *item
 	from, to int
+	epoch    int // the batch's epoch it goes in (splitEpochs), 0 if none
 }
 
 type importer struct {
@@ -484,7 +492,7 @@ type importer struct {
 	create  map[string]any  // target ns → the document it is created with
 	sealedT map[string]bool // target ns is (or is created) sealed
 	nonces  map[string]bool // target ns requires nonces (nonce.go)
-	bump    map[string]int  // new e2e target → the epoch to move it to
+	e2eAt   map[string]int  // e2e target ns → its epoch, as the import moves it (moveEpoch)
 
 	// Target heads (heads.go): the resources looked up per namespace, and
 	// the namespaces' listings (nil: looked up one by one).
@@ -583,6 +591,9 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 	}
 	if err == nil {
 		err = im.checkAccess(ctx)
+	}
+	if err == nil {
+		err = im.checkUpstreamOrigins(ctx)
 	}
 	if err != nil {
 		// Its reads are the import's first requests to the target
@@ -760,6 +771,64 @@ func (im *importer) checkUpstreams() error {
 			why = fmt.Sprintf("is %d characters, over the %d a namespace name may have (§3.6, §G.4.4): %s, or a shorter upstream suffix", len(u), maxNSName, shorter)
 		}
 		problems = append(problems, what+" "+why)
+	}
+	if len(problems) > 0 {
+		return &CheckError{Problems: problems}
+	}
+	return nil
+}
+
+// checkUpstreamOrigins refuses, at step 1, a bundle from another origin
+// than the imports that wrote an existing upstream namespace it would
+// write (§G.4.4): {ns}-upstream is written only by imports from one
+// origin, so a second origin's namespace is imported renamed, its
+// snapshot documents going through {dst}-upstream. The imports that wrote
+// one are its batch entries with a bundle source, whose origin is
+// source.origin, or the target's own where the source has none (§7.5).
+func (im *importer) checkUpstreamOrigins(ctx context.Context) error {
+	srcOf := map[string]string{} // upstream namespace → its source namespace
+	for _, k := range im.keys {
+		if d := im.docs[k]; d.info.History == Snapshot {
+			srcOf[im.upstreamNS(d.ns)] = d.ns
+		}
+	}
+	us := make([]string, 0, len(srcOf))
+	for u := range srcOf {
+		us = append(us, u)
+	}
+	sort.Strings(us)
+	var problems []string
+	for _, u := range us {
+		h, err := im.c.NSHead(ctx, u)
+		if client.IsNotFound(err) || client.IsGone(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("import: upstream namespace %s: %w", u, err)
+		}
+		log, err := im.c.NSLog(ctx, u, h.ID, "")
+		if err != nil {
+			return fmt.Errorf("import: upstream namespace %s: %w", u, err)
+		}
+		for _, e := range log {
+			if e.Kind != "batch" || !e.HasSource || e.Source == nil {
+				continue
+			}
+			if _, imported := e.Source["bundle"]; !imported {
+				continue
+			}
+			o, _ := e.Source["origin"].(string)
+			if o == "" {
+				o = im.origin
+			}
+			if o != im.h.Origin {
+				src := srcOf[u]
+				problems = append(problems, fmt.Sprintf("%s, the upstream namespace of %s's snapshot documents, was written by imports from %s, and the bundle comes from %s: "+
+					"an upstream namespace is written only by imports from one origin (§G.4.4); import %s renamed (-ns %s=<name>), so its snapshot documents go through <name>%s",
+					u, src, o, im.h.Origin, src, src, im.opt.UpstreamSuffix))
+				break
+			}
+		}
 	}
 	if len(problems) > 0 {
 		return &CheckError{Problems: problems}
@@ -1151,7 +1220,9 @@ func toPointers(ss []string) []pointer.Pointer {
 
 // sides compares two sides' steps since a common ancestor (§F.3): the
 // overlapping writes under the array rule, and the delete-versus-change
-// cases.
+// cases. The incoming side is the one replayed onto the target, as a
+// branch's is in a merge, so its writes count the from of each copy too
+// (§F.3, §G.4.4).
 func sides(anc any, ancExists bool, incoming, own []client.Step, ownDeleted bool) []merge.Conflict {
 	var out []merge.Conflict
 	// merge.Writes reads the values the ops write, and an upstream
@@ -1160,7 +1231,7 @@ func sides(anc any, ancExists bool, incoming, own []client.Step, ownDeleted bool
 	if err != nil {
 		return []merge.Conflict{conflict(merge.ConflictUnreadable, fmt.Sprintf("writes could not be computed: %v", err))}
 	}
-	iw, err1 := merge.Writes(anc, ancExists, incoming)
+	iw, err1 := merge.BranchWrites(anc, ancExists, incoming)
 	ow, err2 := merge.Writes(anc, ancExists, own)
 	if err1 != nil || err2 != nil {
 		return []merge.Conflict{conflict(merge.ConflictUnreadable, fmt.Sprintf("writes could not be computed: %v", errors.Join(err1, err2)))}
@@ -1313,7 +1384,7 @@ func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 	mk := func(class string, after int, parent string) *item {
 		r.Class = class
 		it := &item{d: d, ns: d.tns, name: d.name, ifMatch: parent, ifNone: parent == "", sameIDs: d.rw == nil,
-			steps: d.stepsFrom(after + 1)}
+			steps: d.stepsFrom(after + 1), line0: after + 1}
 		if rw := d.rw; rw != nil {
 			// New ids, computed by rename; source.ids records the source's.
 			it.expected, it.sizes, it.srcIDs = rw.ids[after+1:], rw.sizes[after+1:], lineIDs(d.lines[after+1:])
@@ -1545,7 +1616,7 @@ func (im *importer) snapshotOrder(ctx context.Context) ([]*bdoc, map[string][]an
 				return
 			}
 			ptr := at.String()
-			if declared[ptr] || ptr == "/$schema" {
+			if declared[ptr] || ptr == "/$schema" || (ptr == "/$successor" && schema.Successor(s)) {
 				return
 			}
 			bundled := t != nil && t.info.History == Snapshot && t.snap != nil && t.snap.Snapshot == r.Rev
@@ -1711,6 +1782,15 @@ func (im *importer) rewrite(d *bdoc, refs []annot.Ref) (any, error) {
 				doc, parsed = v, true
 				m["$schema"] = to
 				d.rep.Rewritten = append(d.rep.Rewritten, RewrittenRef{Pointer: "/$schema", From: s, To: to})
+			}
+		}
+		// Its $successor naming a renamed namespace (§8.1, §G.4.4), which
+		// is live and never a problem.
+		if s := successorRef(m); s != "" {
+			if to, _, _ := im.renamedRef(s); to != s {
+				doc, parsed = v, true
+				m["$successor"] = to
+				d.rep.Rewritten = append(d.rep.Rewritten, RewrittenRef{Pointer: "/$successor", From: s, To: to})
 			}
 		}
 	}
@@ -1897,9 +1977,10 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 			if ndv, err = parsedDoc(nd); err != nil {
 				return nil, err
 			}
-		}
-		if sealed {
-			// The upstream's own $nonce isn't part of the snapshot (§E.2.5).
+			// Diffs ignore $nonce (§G.4.4): a snapshot whose only change is
+			// its $nonce writes nothing. And a sealed upstream's genesis
+			// carries its own fresh one (nonced), not the snapshot's
+			// (§E.2.5); another's carries the snapshot as it is.
 			prevDoc, ndv = withoutNonce(prevDoc), withoutNonce(ndv)
 		}
 		switch {
