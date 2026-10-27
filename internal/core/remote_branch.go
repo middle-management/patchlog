@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -308,7 +309,7 @@ func (c *remoteChain) prefix(k int) *remoteChain {
 // revision): one request per schema revision, none for other documents
 // or an opaque chain. mapErr maps a failed request, as for fetchChain.
 func fetchRules(ctx context.Context, c *client.Client, ns, name string, ch *remoteChain, mapErr func(string, error) *Error) *Error {
-	if ch.opaque {
+	if ch.opaque || !ch.mentionsDialect() {
 		return nil
 	}
 	var ferr *Error
@@ -339,6 +340,24 @@ func fetchRules(ctx context.Context, c *client.Client, ns, name string, ch *remo
 		return unverified("/r/%s/%s: %v", ns, name, err)
 	}
 	return nil
+}
+
+// mentionsDialect reports whether any document of the chain may be a
+// schema document: its horizon's document or a patch set names the
+// dialect URL, which every schema
+// document's $schema does. A chain without it needn't be folded for
+// markers.
+func (c *remoteChain) mentionsDialect() bool {
+	dialect := []byte(schema.Dialect2020)
+	if bytes.Contains(c.horizonDoc, dialect) {
+		return true
+	}
+	for _, e := range c.entries {
+		if e.HasPatches && bytes.Contains(jsonv.Canonical(e.Patches), dialect) {
+			return true
+		}
+	}
+	return false
 }
 
 // fold walks the chain, calling f with each entry and the document after it
