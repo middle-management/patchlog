@@ -248,13 +248,37 @@ async function unwrapStoredKey(identity, kid, resource, wrapped) {
   }
 }
 
+/* checkRelayedEntry reads a /keys entry as internal/seal's ParseWrappedKey does (wrappedkeys.json's rejected entries):
+ * a non-empty kid; name and resource (before v0.73), each a non-empty string, naming one resource where both are
+ * given; from, if given, a thumbprint (43 base64url characters of 32 bytes); suite, if given, SUITE; and wrapped,
+ * non-empty base64url. It returns the resource name ('' for a K_e) and the wrapped bytes, and throws otherwise. */
+function checkRelayedEntry(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('malformed /keys entry');
+  if (typeof entry.kid !== 'string' || entry.kid === '') throw new Error('/keys entry without a kid');
+  let res = '';
+  for (const m of ['name', 'resource']) {
+    if (!(m in entry)) continue;
+    const v = entry[m];
+    if (typeof v !== 'string' || v === '' || (res !== '' && res !== v)) throw new Error(`/keys entry ${entry.kid}: malformed ${m}`);
+    res = v;
+  }
+  if ('from' in entry && !(typeof entry.from === 'string' && /^[A-Za-z0-9_-]{43}$/.test(entry.from) && unb64u(entry.from).length === 32)) {
+    throw new Error(`/keys entry ${entry.kid}: from must be a thumbprint`);
+  }
+  if ('suite' in entry && entry.suite !== SUITE) throw new Error(`/keys entry ${entry.kid}: unsupported suite`);
+  let wrapped;
+  try { wrapped = unb64u(entry.wrapped); } catch (_) { wrapped = null; }
+  if (!wrapped || wrapped.length === 0) throw new Error(`/keys entry ${entry.kid}: malformed wrapped`);
+  return { res, wrapped };
+}
+
 /* unwrapRelayedKey opens an entry of a POST /ns/{ns}/keys answer, { kid, name?, from?, wrapped } (§E.2.3): a keyring
  * entry relayed at E3 names its sender's thumbprint in from and opens in auth mode only with that sender's public key,
  * one of senders (x values this browser knows): anyone can wrap to a thumbprint (§E.3.2). Without from (an E2 key, or
  * an entry of a keyring stored before v0.63 relayed as stored), base mode under either info (unwrapStoredKey). */
 async function unwrapRelayedKey(identity, entry, senders) {
-  const wrapped = unb64u(entry.wrapped), res = entry.name || entry.resource || '';
-  if (!entry.from) return unwrapStoredKey(identity, entry.kid, res, wrapped);
+  const { res, wrapped } = checkRelayedEntry(entry);
+  if (!('from' in entry)) return unwrapStoredKey(identity, entry.kid, res, wrapped);
   for (const x of senders || []) {
     if ((await thumbprint(x)) !== entry.from) continue;
     const k = await hpkeOpen(identity, wrapContext(entry.kid, res), wrapped, unb64u(x));
@@ -736,7 +760,7 @@ root.PLSeal = {
   SUITE, b64u, unb64u, b32, hex, unhex, utf8, equalBytes, randomBytes, newNonce, canonical, padLen,
   sha256, chainID, revisionID, tombstoneID, idBytes,
   hkdf, resourceKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, thumbprint, parseJWK,
-  hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapStoredKey, unwrapRelayedKey, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
+  hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapStoredKey, unwrapRelayedKey, checkRelayedEntry, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
   sealPatchSet, sealedJWE, sealedBlobs, BLOB_TYPE, blobType, blobID, blobIDs, sameBlobs, parseBlob, openBlob, sealBlob, encryptBlob, decryptBlob,
   isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,
   parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,

@@ -478,6 +478,9 @@ implements the default the plan states.
     under neither no longer stops a reader that may read the keyring from trying it. The server
     now requires the §E.3.2 keyring document, and such a keyring is migrated with `patchlog e2e
     migrate-keyring` (see `/keys` and the e2e keyring below).
+  - The playground reads `/keys` entries as `seal.ParseWrappedKey` does: it refuses an entry
+    whose `name` and `resource` differ, whose `suite` isn't the reference's, whose `from` isn't
+    a thumbprint, or without a `kid` or `wrapped`, as `wrappedkeys.json` rejects them (§E.2.3).
 - **`/keys` and the e2e keyring** (§E.2.3, §E.2.5, §E.3.1, §E.3.2, §9):
   - **Breaking for E3 keyrings:** the `keyring` resource of an e2e namespace must be the keyring
     document `{ "keys": [{ "kid", "to", "from", "wrapped" }] }` (nothing else but `$nonce`,
