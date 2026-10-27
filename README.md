@@ -2096,8 +2096,10 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -H 'Content-T
   carry `enc`. Entries before v0.73 named the resource `resource` and carried `suite`; clients
   read both forms. After a raise from sealed to e2e (v0.73, Addendum E Levels), `/keys` gives the
   keys of the epochs before the raise as at E2, wrapped to `enc` in base mode without `from`: `K_e`
-  or `K_r` by the grant's scope, for the epochs of its `nbf` window (none without `nbf`), leaving
-  out, not refusing, what E2 would answer `403`. A branch of such a base gives the base's
+  or `K_r` by the grant's scope, for the epochs of its §E.2.3 window as at E2, the last epoch and
+  namespace document before the raise standing for the current ones (without `nbf`, the last
+  epoch before the raise), leaving out, not refusing, what E2 would answer `403`. Schema
+  resolution and blob copies of content from before the raise take the same window. A branch of such a base gives the base's
   pre-raise keys, `kid` and `K_r` naming the base, for the base epochs §E.2.3 selects.
 - **`$nonce`.** Every create, append and restore patch set must end up setting `/$nonce` to 128
   fresh random bits (26 base32 characters, `seal.HasFreshNonce`) that differ from the previous

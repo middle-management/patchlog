@@ -48,8 +48,8 @@ func p36Keys(t *testing.T, r *resp, unwrap func(seal.WrappedKey) ([]byte, error)
 // times from the source's own log, fetches their keys from the source's
 // POST /ns/{ns}/keys with its own grant, and its /keys gives them as at
 // E2: K_e, or K_r derived with the source's ns, kids naming the source,
-// for the base epochs §E.2.3 selects (from the one in force at the
-// reader's latest nbf; none without nbf).
+// for the base epochs §E.2.3 selects as at E2 (from the one in force at
+// the reader's latest nbf; without nbf, the last epoch before the raise).
 //
 // A here is a sealed namespace whose last config entry this test's proxy
 // serves as the e2e document of a raise from sealed (epoch 3); B reads
@@ -100,9 +100,9 @@ func TestV073P36RemotePreRaiseKeys(t *testing.T) {
 		grant string
 		want  []string
 	}{
-		"no nbf: none of the source's pre-raise epochs": {reader(), nil},
-		"nbf before the source's first epoch":           {reader(nbf(-time.Hour)), []string{"m#1", "m#2"}},
-		"nbf in epoch 2, by the source's start times":   {reader(nbf(90 * time.Minute)), []string{"m#2"}},
+		"no nbf: the last of the source's pre-raise epochs": {reader(), []string{"m#2"}},
+		"nbf before the source's first epoch":               {reader(nbf(-time.Hour)), []string{"m#1", "m#2"}},
+		"nbf in epoch 2, by the source's start times":       {reader(nbf(90 * time.Minute)), []string{"m#2"}},
 	} {
 		_, r := b.keysOf("r", nil, c.grant)
 		got := p36Keys(t, r, unwrap)

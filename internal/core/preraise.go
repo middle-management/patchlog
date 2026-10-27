@@ -336,10 +336,8 @@ func (t *tx) preRaiseKeysOpen(n *nsRow, p *preRaise, name string, epochs map[int
 	if len(epochs) == 0 || n.purged || p.m.purged {
 		return false
 	}
-	cfg := t.preRaiseConfig(p.raise)
-	all := t.epochStarts(`epoch_keys`, p.m.id, p.raise.epoch)
 	within := func(a *actor) bool {
-		for _, e := range t.grantEpochsOf(all, cfg, a) {
+		for _, e := range t.preRaiseWindow(p.m, p.raise, a) {
 			if epochs[e] {
 				return true
 			}

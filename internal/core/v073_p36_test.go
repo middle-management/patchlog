@@ -195,9 +195,10 @@ func p36Keys(t *testing.T, e *p36Env, ns string, cred Credentials, kr KeysReques
 // raise from sealed, /keys at E3 gives the keys of the epochs before the
 // raise as at E2: K_e to a grant that reads the namespace unrestricted,
 // K_r of the names a grant's rules fix and it may read, for the epochs of
-// its §E.2.3 window (from the one in force at its latest nbf; none
-// without nbf, whose window is the current epoch alone), the request's
-// epochs selecting among them; what E2 would refuse with 403 is left out.
+// its §E.2.3 window as at E2, with the last epoch before the raise
+// standing for the current one (from the one in force at its latest nbf;
+// without nbf, or with one after the raise, the last epoch before the
+// raise alone, as at E2), the request's epochs selecting among them; what E2 would refuse with 403 is left out.
 // A branch's /keys gives the base's pre-raise keys, kid and K_r naming the
 // base, for the base epochs §E.2.3 selects, which the request's epochs
 // don't narrow.
@@ -230,16 +231,16 @@ func TestV073P36PreRaiseKeys(t *testing.T) {
 		kr   KeysRequest
 		want string
 	}{
-		"no nbf: the current epoch alone":       {reader("s", nil), KeysRequest{}, ""},
-		"nbf before the first epoch":            {reader("s", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{}, "s#1,s#2"},
-		"nbf in epoch 2":                        {reader("s", map[string]any{"nbf": at(90 * time.Minute)}), KeysRequest{}, "s#2"},
-		"nbf after the raise":                   {reader("s", map[string]any{"nbf": at(125 * time.Minute)}), KeysRequest{}, ""},
-		"epochs select":                         {reader("s", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{Epochs: []int{2, 3}}, "s#2"},
-		"fixed names: K_r":                      {reader("s", map[string]any{"nbf": at(-time.Hour), "rules": enumAB}), KeysRequest{}, "s#1 a,s#1 b,s#2 a,s#2 b"},
-		"a name not fixed is left out, not 403": {reader("s", map[string]any{"nbf": at(-time.Hour), "rules": enumAB}), KeysRequest{Resources: []string{"a", "c"}}, "s#1 a,s#2 a"},
-		"an unreadable name is left out":        {reader("s", map[string]any{"nbf": at(-time.Hour), "rules": append(enumAB, notB...)}), KeysRequest{}, "s#1 a,s#2 a"},
-		"rules that refer without fixing: none": {reader("s", map[string]any{"nbf": at(-time.Hour), "rules": notB}), KeysRequest{}, ""},
-		"unrestricted: K_e, resources ignored":  {reader("s", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{Resources: []string{"zzz"}}, "s#1,s#2"},
+		"no nbf: the last epoch before the raise": {reader("s", nil), KeysRequest{}, "s#2"},
+		"nbf before the first epoch":              {reader("s", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{}, "s#1,s#2"},
+		"nbf in epoch 2":                          {reader("s", map[string]any{"nbf": at(90 * time.Minute)}), KeysRequest{}, "s#2"},
+		"nbf after the raise: the last before it": {reader("s", map[string]any{"nbf": at(125 * time.Minute)}), KeysRequest{}, "s#2"},
+		"epochs select":                           {reader("s", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{Epochs: []int{2, 3}}, "s#2"},
+		"fixed names: K_r":                        {reader("s", map[string]any{"nbf": at(-time.Hour), "rules": enumAB}), KeysRequest{}, "s#1 a,s#1 b,s#2 a,s#2 b"},
+		"a name not fixed is left out, not 403":   {reader("s", map[string]any{"nbf": at(-time.Hour), "rules": enumAB}), KeysRequest{Resources: []string{"a", "c"}}, "s#1 a,s#2 a"},
+		"an unreadable name is left out":          {reader("s", map[string]any{"nbf": at(-time.Hour), "rules": append(enumAB, notB...)}), KeysRequest{}, "s#1 a,s#2 a"},
+		"rules that refer without fixing: none":   {reader("s", map[string]any{"nbf": at(-time.Hour), "rules": notB}), KeysRequest{}, ""},
+		"unrestricted: K_e, resources ignored":    {reader("s", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{Resources: []string{"zzz"}}, "s#1,s#2"},
 	} {
 		got, _ := p36Keys(t, e, "s", c.cred, c.kr, priv)
 		if got != c.want {
@@ -274,11 +275,11 @@ func TestV073P36PreRaiseKeys(t *testing.T) {
 		kr   KeysRequest
 		want string
 	}{
-		"no nbf: base at its epoch at at":     {reader("z", nil), KeysRequest{}, ""},
-		"nbf before the base's first epoch":   {reader("z", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{}, "s#1,s#2"},
-		"nbf in epoch 2":                      {reader("z", map[string]any{"nbf": at(90 * time.Minute)}), KeysRequest{}, "s#2"},
-		"epochs don't select the base's":      {reader("z", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{Epochs: []int{}}, "s#1,s#2"},
-		"fixed names: K_r named for the base": {reader("z", map[string]any{"nbf": at(-time.Hour), "rules": enumAB}), KeysRequest{Resources: []string{"a"}}, "s#1 a,s#2 a"},
+		"no nbf: the base's last before the raise": {reader("z", nil), KeysRequest{}, "s#2"},
+		"nbf before the base's first epoch":        {reader("z", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{}, "s#1,s#2"},
+		"nbf in epoch 2":                           {reader("z", map[string]any{"nbf": at(90 * time.Minute)}), KeysRequest{}, "s#2"},
+		"epochs don't select the base's":           {reader("z", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{Epochs: []int{}}, "s#1,s#2"},
+		"fixed names: K_r named for the base":      {reader("z", map[string]any{"nbf": at(-time.Hour), "rules": enumAB}), KeysRequest{Resources: []string{"a"}}, "s#1 a,s#2 a"},
 	} {
 		got, _ := p36Keys(t, e, "z", c.cred, c.kr, priv)
 		if got != c.want {

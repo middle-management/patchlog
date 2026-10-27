@@ -578,9 +578,10 @@ func (t *tx) e2eSnapshot(row *revRow) string {
 //
 // The epochs before an e2e raise from sealed aren't keyring epochs: the
 // origin holds their keys, and gives them as at E2 (Addendum E Levels,
-// preRaiseKeys), n's own for the epochs of the same window, and in a branch
-// each base's for the base epochs baseEpochs selects, K_r derived with the
-// base's namespace; a remote branch's shadow holds those its source gave
+// preRaiseKeys), n's own for the epochs of the §E.2.3 window as at E2
+// (preRaiseWindow: without nbf, the last epoch before the raise), and in a
+// branch each base's for the base epochs baseEpochs selects, K_r derived
+// with the base's namespace; a remote branch's shadow holds those its source gave
 // this deployment's grant (fetchPreRaiseKeys).
 func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error) {
 	enc := recipientOf(a)
@@ -606,7 +607,7 @@ func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[str
 			}
 		}
 	}
-	window := selectEpochs(t.grantEpochsOf(t.keyEpochs(n, cfg.Epoch), cfg, a), kr.Epochs)
+	window := selectEpochs(t.withPreRaise(n, t.grantEpochsOf(t.keyEpochs(n, cfg.Epoch), cfg, a), a), kr.Epochs)
 	if d := t.ownKeyring(n, nil); d != nil {
 		add(keyringEntries(d, enc, window))
 	}
@@ -683,9 +684,11 @@ func (t *tx) epochNow(b *nsRow) int {
 // nbf among the grant's blocks, or at at if that is earlier; where no
 // block has nbf, the epoch b has in force now (epochNow), so none once b
 // has moved past its epoch at at. Without a grant (authentication
-// disabled), every epoch up to at. They are keyring epochs, and after a
-// raise from sealed those before it too (keyEpochs), whose keys the origin
-// gives as at E2 (preRaiseKeys); a base at at that isn't e2e gives none.
+// disabled), every epoch up to at. Those are b's keyring epochs; after a
+// raise from sealed, the epochs before it are those preRaiseWindow gives
+// the grant instead, whose keys the origin gives as at E2 (preRaiseKeys),
+// whether or not b has moved past its epoch at at. A base at at that isn't
+// e2e gives none.
 func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 	var cseq, created int64
 	if err := t.QueryRow(`SELECT config_seq, created FROM ns_log WHERE seq = ?`, at).Scan(&cseq, &created); err != nil {
@@ -706,7 +709,9 @@ func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 		switch {
 		case nbf == nil:
 			if t.epochNow(b) != atEpoch {
-				return nil
+				// None of b's keyring epochs; those before a raise from
+				// sealed still as at E2.
+				return t.withPreRaise(b, nil, a)
 			}
 			first = atEpoch
 		case !nbf.Before(time.UnixMilli(created)):
@@ -723,6 +728,38 @@ func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 	for _, x := range all {
 		if x.e >= first {
 			out = append(out, x.e)
+		}
+	}
+	return t.withPreRaise(b, out, a)
+}
+
+// preRaiseWindow lists the epochs of owner from before its raise from
+// sealed (raise) whose keys grant a gets as at E2 (Addendum E Levels,
+// §E.2.3): the §E.2.3 window applied to the epochs owner had before the
+// raise, with the last of them and the namespace document in force just
+// before the raise standing for the current ones, so a grant without nbf
+// gets the last epoch before the raise, as it did at E2, and that
+// document's historyEpochs caps it. /keys (preRaiseKeys, through
+// withPreRaise) and the server's own key checks for content from before
+// the raise (preRaiseKeysOpen: schema resolution, blob copies, a batch's
+// local source) both take it from here, so neither is looser or tighter
+// than the other (§2.1 Protection). In a branch, a is the branch's grant.
+func (t *tx) preRaiseWindow(owner *nsRow, raise *e2eRaise, a *actor) []int {
+	return t.grantEpochsOf(t.epochStarts(`epoch_keys`, owner.id, raise.epoch), t.preRaiseConfig(raise), a)
+}
+
+// withPreRaise replaces, in epochs, a window over owner's epochs (ascending),
+// those from before owner's raise from sealed with the ones preRaiseWindow
+// gives a; epochs unchanged for an owner that wasn't raised from sealed.
+func (t *tx) withPreRaise(owner *nsRow, epochs []int, a *actor) []int {
+	r := t.e2eRaiseOf(owner)
+	if r == nil || r.level != levelSealed {
+		return epochs
+	}
+	out := t.preRaiseWindow(owner, r, a)
+	for _, e := range epochs {
+		if e > r.epoch {
+			out = append(out, e)
 		}
 	}
 	return out

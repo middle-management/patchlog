@@ -535,10 +535,16 @@ implements the default the plan states.
   - **After a raise from `sealed`** (Levels, §E.2.3): `/keys` at E3 gives the keys of the epochs
     before the raise as at E2, wrapped to the grant's `enc` in base mode, without `from`: `K_e` to
     a grant that reads the namespace unrestricted, `K_r` of the names it fixes and may read to one
-    whose rules fix names, for the epochs of the grant's `nbf` window over all the namespace's
-    epochs (so none without `nbf`); what E2 would refuse with `403` is left out instead. A
-    branch's `/keys` gives its base's pre-raise keys, `kid` and `K_r` naming the base, for the
-    base epochs §E.2.3 selects, which the request's `epochs` don't narrow. Readers open content
+    whose rules fix names, for the epochs of the grant's §E.2.3 window as at E2, with the last
+    epoch and namespace document before the raise standing for the current ones (so a grant
+    without `nbf`, or with one after the raise, gets the last epoch before the raise, as it did at
+    E2, and the earlier ones take an `nbf` reaching back); what E2 would refuse with `403` is left
+    out instead. A branch's `/keys` gives its base's pre-raise keys, `kid` and `K_r` naming the
+    base, for the base epochs that window selects, which the request's `epochs` don't narrow.
+    The server's own key checks for content from before the raise (schema resolution, blob
+    copies, a batch's local `source`; §6.1, §2.1 Protection, §7.8) apply the same window, so
+    they are never looser than `/keys`, and the grant that wrote a resource at E2 keeps reading
+    and appending to it at E3. Readers open content
     with them; nothing new is sealed under them (no sender, §E.3.2) but a prune snapshot of
     content from before the raise, which the server held with its keys anyway.
   - **E3 gate** (§E.3.1): a sealed op or prune snapshot with `zip` in its header is `422
@@ -1066,8 +1072,8 @@ implements the default the plan states.
   - **Remote branches of a source raised from `sealed` to `e2e` before `at`** (§G.3, §G.5.2,
     MF-37) can be created where creation answered `502`: the deployment mirrors the history from
     before the raise, fetches the keys of the epochs before it from the source's `POST
-    /ns/{ns}/keys` with the endpoint's grant (which needs `enc` and an `nbf` reaching back before
-    them) and their start times only from the source's own log, records the epoch each mirrored
+    /ns/{ns}/keys` with the endpoint's grant (which needs `enc`, and an `nbf` reaching back for
+    any epoch before the last one before the raise) and their start times only from the source's own log, records the epoch each mirrored
     entry is served under, and gives those keys as at E2, named for the source. It serves what it
     mirrored from before the raise as the source does: sealed under that epoch, `kid` and `pl`
     naming the source, never in the clear. A prune snapshot in the branch of such content is
