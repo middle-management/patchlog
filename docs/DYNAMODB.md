@@ -822,12 +822,12 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-top-level tests (pure unit tests included), none skips on DynamoDB as
-unsupported but the 4 needing the SQL write path's hooks; the rest of
-its skips are on their own conditions (Postgres-only tests, mostly).
+1,320 top-level tests (pure unit tests included): 1,278 pass on
+DynamoDB and 42 skip — 5 as unsupported (the SQL write path's hooks),
+the rest on their own conditions (Postgres-only tests, mostly).
 The known list is empty: no test answers differently from the SQL
 backends. A test that skips partway has asserted everything before
-its skip, so the phase-1 surface is covered beyond the tests that pass.
+its skip, so the covered surface reaches beyond the 1,278.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on
