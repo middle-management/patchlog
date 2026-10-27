@@ -101,10 +101,6 @@ const (
 	logClass    = 0x504e
 )
 
-// lockSchema is the key, in lockClass, held while creating or migrating
-// the schema. Namespace keys are positive.
-const lockSchema = 0
-
 type lockMode int8
 
 const (

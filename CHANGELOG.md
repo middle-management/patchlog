@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+The core's schema is now a series of [mmmigrate](https://github.com/middle-management/mmmigrate)
+migrations (`internal/core/migrations`, README "Schema migrations"), applied on start and recorded
+in the database, instead of a schema script run on every start with checks for the columns each
+older version lacked. The schema itself is unchanged.
+
+**Changes to check before upgrading:**
+- **Databases from before v0.22.0 are no longer migrated.** Start v0.22.0 on such a database once
+  first. A database v0.22.0 created or migrated is adopted as it is.
+- **Migrations are recorded in new tables:** `mmmigrate_applied` and `mmmigrate_current` on
+  SQLite, the schema `mmmigrate` on Postgres, whose database user needs `CREATE` on the database
+  for the first start.
+
 ## v0.22.0
 
 Implements spec **v0.55**. v0.53 restructures the text with no change in behaviour (terms

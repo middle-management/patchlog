@@ -152,7 +152,7 @@ a consumer's snapshot bootstrap held the whole `/heads` listing in memory and on
 | **Postgres CPU and memory** | ~1.3 of 2 vCPU and 3.4 of 4 GB under the read measurements; the limit on server X. | Size Postgres first; a read replica takes bulk reads and private followers' log reads (the gap above). |
 | **Storage** | 6.2 GB on Postgres, 3.1 GB on SQLite for 5M revisions of ~500-byte documents. | Linear in revisions; pruning (§8.6) bounds it. |
 | **Memory** | Core: 0.5–0.8 GB steady, 1.5–1.8 GB peak during full scans. The caches are bounded: up to 256 MiB of documents, 64 MiB of read-cache revisions and 65,536 grants (a few hundred MB at most) by default. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves catch-ups; size the caches with `serve -doc-cache-size`, `-read-cache-size` and `-grant-cache`. |
-| **Upgrades** | The new namespace-log indexes build in the migration, blocking writes a few seconds per 5M log entries. | `CREATE INDEX CONCURRENTLY` beforehand (README). |
+| **Upgrades** | Schema migrations run in a transaction at start (README "Schema migrations"); one that builds an index on a large table blocks writes to it while the index builds. | Create the index `CONCURRENTLY` beforehand under the same name: migrations are written with `IF NOT EXISTS`, so they then find it. |
 
 ## Recommended changes to limits
 

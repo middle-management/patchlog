@@ -643,8 +643,10 @@ PATCHLOG_DB='postgres://patchlog:secret@db.internal:5432/patchlog?sslmode=requir
 make up-pg     # the compose stack with a postgres:16 container (compose.postgres.yaml)
 ```
 
-- **Schema.** Created on first start (and migrated by later versions) under an advisory lock, in
-  whatever schema the URL's user defaults to (add `search_path=…` to the URL for another). It
+- **Schema.** Created on first start, and migrated by later versions, under an advisory lock (see
+  [Schema migrations](#schema-migrations)), in whatever schema the URL's user defaults to (add
+  `search_path=…` to the URL for another); the record of applied migrations is kept in a schema
+  `mmmigrate`, so the user needs `CREATE` on the database the first time. It
   mirrors the SQLite layout (`internal/core/pgschema.go`): bigint identity keys, 20-byte
   `bytea` ids, canonical JSON in `text` (never `jsonb`, which would change the bytes ids are
   computed over), integer millisecond timestamps. Patch sets, head and intermediate snapshots
@@ -769,32 +771,9 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   intervals plus two minutes, covering the cache staleness bound, replica lag and the response
   deadline), then deletes the row. SQLite deployments do the same, and so do the index and tree
   services for their own purges (see [Purging](#the-local-cdn-9)).
-- **Upgrading adds indexes.** A start that finds `ns_log` without `ns_log_ns_seq (ns, seq)` or
-  `ns_log_ns_config (ns, config_seq, seq)` builds them inside the schema migration, which blocks
-  writes until it commits: a few seconds per 5 million namespace entries (about 4 s for the
-  first on a local `postgres:16`). To build them without blocking, create them beforehand with
-  `CREATE INDEX CONCURRENTLY` under the same names; the migration then finds them.
-- **Upgrading adds columns** `revisions.size` and `revisions.digest` (`/heads` sizes and
-  digests, §7.4, see [Files and sync clients](#files-and-sync-clients-71-74-78-81)), on SQLite and Postgres.
-  They are nullable without a default, so adding them changes only the catalog, instantly
-  whatever the table's size, though on Postgres the `ALTER TABLE` waits for transactions
-  using `revisions` and holds back others while it does. Nothing is backfilled. From then on
-  they take about 40 bytes (SQLite; 41 to 48 on Postgres) on each revision a write leaves as
-  a head outside sealed and e2e namespaces: for small documents written one revision at a time
-  that is nearly every revision, and grew the `revisions` table by about 40% (the whole
-  database by 9%) in a test of 20,000 such writes. Instances of the previous release keep
-  working against the migrated schema (they name their columns), so a rolling upgrade is
-  safe, with two leftovers. Heads they write, like those from before, are listed without
-  `size` and `digest` until written again. And a purge they run nulls only the patch sets: the
-  purged resource's two columns stay (never listed, since a purged resource is listed as a
-  purge, but in an encrypted-at-rest namespace a plaintext hash that destroying the data key
-  doesn't remove), and cached `/heads` pages aren't purged (`heads:{ns}`). Once no older
-  instance runs, clear the columns with `UPDATE revisions SET size = NULL, digest = NULL WHERE
-  digest IS NOT NULL AND res IN (SELECT res FROM resources WHERE state = 2)` (2: purged).
-  Responses cached before the upgrade, or served by an older instance during it, lack the
-  v0.54 fields and headers: `/heads` pages lack them and revisions `Last-Modified` and
-  `Repr-Digest` until those copies expire or are purged, so clients treat them all as optional,
-  as §7.4 says.
+- **Upgrading from before v0.22.0.** Releases since then don't migrate older schemas: start
+  v0.22.0 on the database once first (its notes in the [changelog](CHANGELOG.md) say what that
+  adds), then the current release.
 - **Keep transactions short.** The tailer can't move past the oldest running transaction in the
   database (its `xmin`), so one left open holds back every instance's wake-ups: set
   `idle_in_transaction_session_timeout` (e.g. `ALTER ROLE patchlog SET
@@ -3859,7 +3838,7 @@ internal/rules      the rule language of §6.4.2
 internal/schema     $schema resolution and JSON Schema validation
 internal/schemaimport external JSON Schemas into a namespace, refs pinned (schema import)
 internal/grant      grants, keys, roles and verification (Addendum C)
-internal/core       storage and semantics (gate, batches, branches, purge, prune)
+internal/core       storage and semantics (gate, batches, branches, purge, prune); schema migrations in migrations/
 internal/sqlitedsn  SQLite DSNs: a database path escaped, so the driver opens that file; the file earlier releases opened instead
 internal/server     HTTP API
 internal/lifecycle  /_health and /_ready, phased graceful shutdown (serve, index, tree)
@@ -3876,6 +3855,24 @@ two entries, so every multi-page path runs; each consumer package also has a `Te
 that runs some of its flows that way (`clienttest.Paged`), and the server package tests paging,
 sealed page bounds and `/heads` byte order directly (with `PATCHLOG_TEST_PG`, also on a database
 whose default collation isn't byte order).
+
+### Schema migrations
+
+The core's schema is a series of [mmmigrate](https://github.com/middle-management/mmmigrate)
+migrations, one directory per dialect: `internal/core/migrations/sqlite` and
+`internal/core/migrations/postgres`. They are embedded in the binary, and every start applies the
+ones the database lacks, in order, each in its own transaction, and records them (in
+`mmmigrate_applied`, or the `mmmigrate` schema on Postgres, under the namespace `patchlog`).
+Committed migrations are never edited: their checksums chain, and `TestMigrations` fails if one
+changed.
+
+To change the schema, write the change in both directories' `current.sql` (plain SQL, safe to run
+twice, since tests apply it after every edit), test it (`go test ./...`, and `make test-pg`), and
+commit it with `make migration DESC="what it changes"`, which needs the `mmmigrate` CLI
+(`brew install middle-management/tap/mmmigrate`, or a release binary). Tests apply `current.sql`;
+deployments apply only committed migrations, and CI fails while `current.sql` holds any SQL.
+Migrations change the schema only; the index and tree services' databases are rebuilt from the
+core's API instead (`-rebuild`).
 
 ## License
 

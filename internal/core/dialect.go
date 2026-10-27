@@ -17,7 +17,7 @@ import (
 // with ? placeholders; on Postgres the tx wrapper (stmts.go) rewrites them
 // to $1..$n. What differs:
 //
-//   - the schema (db.go schemaSQL and pgschema.go schemaPG);
+//   - the schema (migrations/sqlite and migrations/postgres, pgschema.go);
 //   - placeholders, and bool arguments, which Postgres won't coerce into
 //     the smallint flag columns the two schemas share;
 //   - values that are canonical JSON or, encrypted at rest, binary
