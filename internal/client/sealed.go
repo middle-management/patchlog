@@ -104,9 +104,10 @@ func (k *Keys) cached(kid, resource string) []byte {
 }
 
 // key returns the key opening content of resource ("" for namespace
-// content) sealed under kid, fetching it if needed from via's /keys: the
-// namespace read, which for a base's content it reads through gives the
-// base's keys (Addendum E Levels).
+// content) sealed under kid, fetching it if needed: first from via's
+// /keys, the namespace read, which for a base's content it reads through
+// gives the base's keys (Addendum E Levels), and only if that fails from
+// the /keys of the namespace the kid names (§F.8.1).
 func (k *Keys) key(ctx context.Context, c *Client, kid, resource, via string) ([]byte, error) {
 	if b := k.cached(kid, resource); b != nil {
 		return b, nil
@@ -114,17 +115,38 @@ func (k *Keys) key(ctx context.Context, c *Client, kid, resource, via string) ([
 	if k.noFetch {
 		return nil, ErrNoKeys
 	}
-	_, epoch, err := seal.ParseKid(kid)
+	kns, epoch, err := seal.ParseKid(kid)
 	if err != nil {
 		return nil, err
 	}
+	err = k.fetch(ctx, c, via, epoch, resource)
+	if b := k.cached(kid, resource); b != nil {
+		return b, nil
+	}
+	if kns != via {
+		if ferr := k.fetch(ctx, c, kns, epoch, resource); err == nil {
+			err = ferr
+		}
+		if b := k.cached(kid, resource); b != nil {
+			return b, nil
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return nil, ErrNoKeys
+}
+
+// fetch caches the keys of epoch (for resource, if set) that ns's /keys
+// gives.
+func (k *Keys) fetch(ctx context.Context, c *Client, ns string, epoch int, resource string) error {
 	var res []string
 	if resource != "" {
 		res = []string{resource}
 	}
-	got, err := c.FetchKeys(ctx, via, []int{epoch}, res)
+	got, err := c.FetchKeys(ctx, ns, []int{epoch}, res)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for _, e := range got {
 		if e.From != "" {
@@ -135,10 +157,10 @@ func (k *Keys) key(ctx context.Context, c *Client, kid, resource, via string) ([
 		key := e.Key
 		if key == nil {
 			if k.recipient == nil {
-				return nil, fmt.Errorf("client: keys are wrapped to the grant's enc; NewKeys needs the recipient private key")
+				return fmt.Errorf("client: keys are wrapped to the grant's enc; NewKeys needs the recipient private key")
 			}
 			if key, err = seal.UnwrapKey(k.recipient, e.Wrapped); err != nil {
-				return nil, fmt.Errorf("client: unwrapping %s: %w", e.Kid, err)
+				return fmt.Errorf("client: unwrapping %s: %w", e.Kid, err)
 			}
 		}
 		if e.Resource == "" {
@@ -147,10 +169,7 @@ func (k *Keys) key(ctx context.Context, c *Client, kid, resource, via string) ([
 			k.AddResource(e.Kid, e.Resource, key)
 		}
 	}
-	if b := k.cached(kid, resource); b != nil {
-		return b, nil
-	}
-	return nil, ErrNoKeys
+	return nil
 }
 
 // WithKeys decrypts sealed namespaces with keys from k (Addendum E.2).
@@ -294,7 +313,13 @@ func (c *Client) open(ctx context.Context, ns, resource, jwe string, want func(h
 	if kns != ns {
 		kind, _ := pl["kind"].(string)
 		content := resource != "" && (kind == seal.KindDoc || kind == seal.KindRev || kind == seal.KindTombstone)
-		if !content || !c.readThrough(ctx, ns, kns) {
+		through := false
+		if content {
+			if through, err = c.readThrough(ctx, ns, kns); err != nil {
+				return nil, fmt.Errorf("client: reading the bases of %s: %w", ns, err)
+			}
+		}
+		if !through {
 			return nil, fmt.Errorf("client: sealed content of %s is sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
 		}
 		pl = withNS(pl, kns)
@@ -323,14 +348,18 @@ func withNS(pl seal.PL, ns string) seal.PL {
 // (§G.3). Only e2e namespaces serve a base's sealing so; a sealed branch
 // seals what it reads through under its own keys (§E.2.5). Namespace
 // documents stay plaintext at E3, so a branch's base chain reads from them.
-func (c *Client) readThrough(ctx context.Context, ns, kns string) bool {
+// Only a chain read without a transient failure is cached.
+func (c *Client) readThrough(ctx context.Context, ns, kns string) (bool, error) {
 	key := c.BaseURL() + " " + ns
 	k := c.keys
 	k.mu.Lock()
 	bases, ok := k.bases[key]
 	k.mu.Unlock()
 	if !ok {
-		bases = c.readThroughBases(ctx, ns)
+		var err error
+		if bases, err = c.readThroughBases(ctx, ns); err != nil {
+			return false, err
+		}
 		k.mu.Lock()
 		if k.bases == nil {
 			k.bases = map[string]map[string]bool{}
@@ -338,35 +367,43 @@ func (c *Client) readThrough(ctx context.Context, ns, kns string) bool {
 		k.bases[key] = bases
 		k.mu.Unlock()
 	}
-	return bases[kns]
+	return bases[kns], nil
 }
 
 // readThroughBases lists the bases ns reads through, nil if ns isn't an e2e
-// branch or its document can't be read (readThrough).
-func (c *Client) readThroughBases(ctx context.Context, ns string) map[string]bool {
+// branch or its document can't be read (readThrough). A transport error, or
+// an answer that may change on retry (429, 5xx), is an error: the chain is
+// then unknown, not empty.
+func (c *Client) readThroughBases(ctx context.Context, ns string) (map[string]bool, error) {
 	var out map[string]bool
 	for cur, e2e := ns, true; cur != "" && !out[cur]; {
 		h, err := c.NSHead(ctx, cur)
 		if err != nil {
-			return out
+			return out, transient(err)
 		}
 		r, err := c.do(ctx, "GET", "/ns/"+cur+"/rev/"+h.ID, nil, nil)
-		if err != nil || r.status != 200 || isJOSE(r) {
-			return out
+		if err != nil {
+			return out, err
+		}
+		if r.status != 200 {
+			return out, transient(r.apiError())
+		}
+		if isJOSE(r) {
+			return out, nil
 		}
 		doc, _ := r.value().(map[string]any)
 		if e2e {
 			// ns itself must be end-to-end.
 			enc, _ := doc["encryption"].(map[string]any)
 			if lv, _ := enc["level"].(string); lv != "e2e" {
-				return nil
+				return nil, nil
 			}
 			e2e = false
 		}
 		b, _ := doc["base"].(map[string]any)
 		next, _ := b["ns"].(string)
 		if next == "" {
-			return out
+			return out, nil
 		}
 		if out == nil {
 			out = map[string]bool{}
@@ -379,12 +416,22 @@ func (c *Client) readThroughBases(ctx context.Context, ns string) map[string]boo
 					out[s] = true
 				}
 			}
-			return out
+			return out, nil
 		}
 		out[next] = true
 		cur = next
 	}
-	return out
+	return out, nil
+}
+
+// transient is err if retrying may give another answer (a transport error,
+// 429 or 5xx), else nil: a document the reader can't read ends the chain.
+func transient(err error) error {
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Status != 429 && ae.Status < 500 {
+		return nil
+	}
+	return err
 }
 
 func fixedPL(pl seal.PL) func(*seal.Header) (seal.PL, error) {

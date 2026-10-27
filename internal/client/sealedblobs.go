@@ -285,8 +285,12 @@ func (c *Client) openBlob(ctx context.Context, ns, name, bid string, sealed []by
 	}
 	// A base's blob an e2e branch reads through keeps the base's sealing
 	// (Addendum E Levels, readThrough).
-	if kns != ns && !c.readThrough(ctx, ns, kns) {
-		return nil, fmt.Errorf("client: blob of %s is sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
+	if kns != ns {
+		if through, err := c.readThrough(ctx, ns, kns); err != nil {
+			return nil, fmt.Errorf("client: reading the bases of %s: %w", ns, err)
+		} else if !through {
+			return nil, fmt.Errorf("client: blob of %s is sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
+		}
 	}
 	key, err := c.keys.key(ctx, c, h.Kid, name, ns)
 	if err != nil {
