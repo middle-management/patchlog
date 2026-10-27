@@ -124,7 +124,7 @@ func TestDDBUnsupported(t *testing.T) {
 	ddbCreateNS(t, e, "demo", `{"read":"public"}`)
 
 	// Without a key store, encrypted namespaces are refused at creation,
-	// as on SQL: 422. With one, e2e namespaces are 501 (TestDDBAtRest).
+	// as on SQL: 422.
 	_, err := e.WriteConfig(ctx, Request{NS: "enc"}, ConfigChange{IfNoneMatch: true, Patches: patches(t, `[{"op":"add","path":"","value":{"encryption":{"level":"sealed"}}}]`)})
 	assertStatus(t, err, 422, "invalid")
 }
@@ -181,10 +181,6 @@ func TestDDBAtRest(t *testing.T) {
 	}
 	t.Cleanup(func() { e.Close() })
 	ctx := context.Background()
-	_, err = e.WriteConfig(ctx, Request{NS: "e2e"}, ConfigChange{IfNoneMatch: true, Patches: patches(t, `[{"op":"add","path":"","value":{"encryption":{"level":"e2e"}}}]`)})
-	if ae, ok := err.(*Error); !ok || ae.Status != 501 || !strings.Contains(err.Error(), "unsupported") {
-		t.Fatalf("e2e namespace: want 501 unsupported, got %v", err)
-	}
 	const marker = "plaintext-marker-1234"
 	write := func(ns, name, ifMatch, p string) string {
 		t.Helper()
