@@ -258,6 +258,14 @@ type Rev struct {
 	// JWE, a sealed snapshot or a keyring there carries neither.
 	Created time.Time
 	Digest  []byte
+	// SchemaRules is, for a 200 whose Doc is a schema document served in
+	// the clear (the namespace serving the read is neither sealed nor
+	// e2e, or the revision is from before a raise to e2e from none or
+	// at-rest), the rules marker its revision row was stored with
+	// (schema.Rules.String, schemaload.go), sent as schema.RulesHeader so
+	// clients and remote mirrors compile it as this server does (§6.1).
+	// "" otherwise.
+	SchemaRules string
 }
 
 // ResourceRev serves the document at a revision.
@@ -266,7 +274,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		return c.answer(true), nil
 	}
 	g := e.rc.load(ns)
-	public, cached, plain := false, false, false
+	public, cached, plain, preRaised := false, false, false, false
 	var out *Rev
 	var job *sealJob
 	var nsRowName string
@@ -324,6 +332,19 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			out.Created = time.UnixMilli(row.created)
 		}
 		e2e := t.e2eContent(n, name)
+		// Content from before an e2e raise is served as at the level
+		// before, in the clear or sealed, its prune snapshot included
+		// (Addendum E Levels, §7.1 Paging, preraise.go).
+		pre := t.preRaiseOf(n, row)
+		if pre != nil {
+			e2e, preRaised = false, true
+			if pre.sealed() && row.kind != kindTombstone {
+				if j := (&sealJob{kind: sealDoc, key: name + "/" + row.id.String()}); t.stored(pre.m, j) {
+					out.Status, out.JWE = 200, j.jwe
+					return nil
+				}
+			}
+		}
 		if e2e {
 			// A prune's sealed snapshot is served as /rev/{H}, never as a
 			// log entry (§7.1 Paging, §8.6). It stays stored after an
@@ -353,10 +374,18 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 				out.Horizon, out.Archive = t.horizonID(row.res), t.archiveURL(row.res, row.seq)
 				return nil
 			}
-			out.Status, out.Fold, out.FoldSince = 302, true, t.e2eFoldSince(row)
+			out.Status, out.Fold, out.FoldSince = 302, true, t.preRaiseFoldSince(n, row)
 			return nil
 		}
 		b, err := t.docBytesAt(row)
+		if err != nil && pre != nil {
+			// An E3 prune at a horizon from before the raise left no
+			// document to serve as before; its snapshot stands for it.
+			if jwe := t.e2eSnapshot(row); jwe != "" {
+				out.Status, out.Snapshot, out.JWE = 200, true, jwe
+				return nil
+			}
+		}
 		if err != nil {
 			var pe *prunedError
 			if errors.As(err, &pe) {
@@ -368,13 +397,23 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			return nil
 		}
 		out.Status, out.Doc = 200, b
+		if plain || pre != nil && !pre.sealed() {
+			// In the clear, from before a raise from none or at-rest too:
+			// a key holder compiles it as the server resolves it (CIS-24).
+			out.SchemaRules = t.schemaRulesHeader(row, b)
+		}
 		if plain && row.size.Valid && row.size.Int64 == int64(len(b)) && len(row.digest) == sha256.Size {
 			// The digest the write stored of these bytes (headMeta).
 			out.Digest = row.digest
 		}
-		if t.isSealedNS(n) {
+		switch {
+		case t.isSealedNS(n):
 			nsRowName = n.name
 			job = t.resJob(n, name, row, sealDoc, func() []byte { return b })
+		case pre != nil && pre.sealed():
+			// Stored under the raised namespace, as it serves it.
+			nsRowName = pre.m.name
+			job = t.preRaiseResJob(pre, name, row, sealDoc, func() []byte { return b })
 		}
 		return nil
 	})
@@ -382,12 +421,13 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if err = e.finishSeal(ctx, nsRowName, []*sealJob{job}); err == nil {
 			out.Doc, out.JWE, out.Digest = nil, job.jwe, nil
 		}
-	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot {
+	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot && !preRaised {
 		// A plain document (sealed ones have a job, e2e content no
 		// document, and an e2e keyring is kept without its created time
 		// and digest): immutable, and the same for every reader. Hashed
-		// here unless the write stored its digest.
-		d := revDoc{doc: out.Doc, meta: plain}
+		// here unless the write stored its digest. Content from before an
+		// e2e raise isn't kept: reads of e2e content skip the cache.
+		d := revDoc{doc: out.Doc, meta: plain, rules: out.SchemaRules}
 		if plain {
 			d.created = out.Created.UnixMilli()
 			if out.Digest != nil {
@@ -420,15 +460,24 @@ type Log struct {
 	Horizon   string
 	Archive   string // with Horizon: the archive holding the newest pruned entry, if any
 	Public    bool
+	// Purged is set on a namespace log of a purged namespace, which ends
+	// with its purge-ns entry: a namespace stream ends after it (§7.3,
+	// §8.5).
+	Purged bool
+	// Until is when the credential that admitted the read expires, zero
+	// if none bounds it (admission.go): an event stream ends there at the
+	// latest (§7.3).
+	Until time.Time
 }
 
 // ResourceLog serves /r/{ns}/{name}/rev/{id}/log?since= (§7.1). With id
-// empty it serves from the current head (for long-poll and SSE). Either
-// way it answers at most limit entries after since (0: all), oldest first,
-// and sets More when the range goes on (§7.1 Paging, §7.7). A page (limit
-// > 0) also holds no more patch set bytes than logPageBytes, at E2 bytes of
-// the entries' JWEs, though always one entry; namespace logs carry no patch
-// sets.
+// empty it serves from the current head (for long-poll and SSE), and with
+// since empty too, for a resource with no entries, an empty range rather
+// than 404 (§7.3, §7.7). Either way it answers at most limit entries after
+// since (0: all), oldest first, and sets More when the range goes on (§7.1
+// Paging, §7.7). A page (limit > 0) also holds no more patch set bytes than
+// logPageBytes, at E2 bytes of the entries' JWEs, though always one entry;
+// namespace logs carry no patch sets.
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
@@ -438,20 +487,29 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, name); err != nil {
-			return err
+		a, aerr := t.reader(n, cred, name)
+		if aerr != nil {
+			return aerr
 		}
 		if n.purged {
 			return t.purgedRead(n)
 		}
-		out = &Log{Public: t.cachePublic(n)}
+		out = &Log{Public: t.cachePublic(n), Until: t.admittedUntil(n, cred, a)}
 		v := t.resolve(n, name, nil)
 		if v.state == Purged {
 			out.Status = 410
 			return nil
 		}
 		if v.head == nil {
+			// A resource with no entries: from its head and genesis (a
+			// live read with an empty since), an empty range, which an
+			// event stream or long-poll waits on, once the read check
+			// above has passed (§7.3, §7.7). Any other range of it is
+			// unknown.
 			out.Status = 404
+			if id == "" && since == "" {
+				out.Status = 200
+			}
 			return nil
 		}
 		to := v.head
@@ -480,13 +538,33 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if limit > 0 {
 			maxBytes = e.opt.Maximums.LogPageBytes
 		}
+		// No page spans an e2e raise: one that would ends with the last
+		// revision from before it, and a page from before it is served
+		// as at the level before (§7.1 Paging, Addendum E Levels).
+		var pre *preRaise
+		cut := false
+		if t.isE2E(n) {
+			if b := t.preRaiseRange(n, to, sinceID); b != nil {
+				to, cut = b, true
+			}
+			pre = t.preRaiseOf(n, to)
+		}
 		// At E2 each entry is served as its own JWE, stored or sealed now,
 		// and a page is bounded by their lengths (logBetween).
 		sealed := t.isSealedNS(n)
 		var served func(LogEntry) int
-		if sealed {
+		switch {
+		case sealed:
 			served = func(le LogEntry) int {
 				j := t.resJob(n, name, le.row, sealEntry, func() []byte { return jsonv.Canonical(le.value()) })
+				t.must(j.sealNow())
+				jobs = append(jobs, j)
+				return len(j.jwe)
+			}
+		case pre != nil && pre.sealed():
+			sealed = true
+			served = func(le LogEntry) int {
+				j := t.preRaiseResJob(pre, name, le.row, sealEntry, func() []byte { return jsonv.Canonical(le.value()) })
 				t.must(j.sealNow())
 				jobs = append(jobs, j)
 				return len(j.jwe)
@@ -506,7 +584,7 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 			}
 			return nil
 		}
-		out.Status, out.More = 200, more
+		out.Status, out.More = 200, more || cut
 		// An e2e range whose since is a pruning horizon holds only the
 		// entries after it: the horizon's sealed snapshot is served as
 		// /rev/{H} (ResourceRev), never as a log entry (§7.1 Paging).
@@ -518,6 +596,9 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if sealed {
 			jobs = jobs[:len(entries)]
 			out.Sealed, nsRowName = true, n.name
+			if pre != nil {
+				nsRowName = pre.m.name
+			}
 		}
 		return nil
 	})
@@ -593,9 +674,18 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 		cseq, doc := t.entryConfig(seq)
 		out = &NSInfo{Head: nsID, Config: t.configID(cseq).String(), Doc: []byte(doc),
 			Public: t.cachePublic(n)}
-		if t.isSealedNS(n) {
+		switch raise := t.nsPreRaise(n, seq); {
+		case t.isSealedNS(n):
 			nsRowName = n.name
 			job = t.configJob(n, seq, nsID, []byte(doc))
+		case raise != nil && raise.level == levelSealed:
+			// From before a raise from sealed: sealed as before (Addendum
+			// E Levels), which a purge, destroying the epoch keys, ends.
+			if n.purged {
+				return t.purgedRead(n)
+			}
+			nsRowName = n.name
+			job = t.preRaiseConfigJob(n, raise, seq, nsID, []byte(doc))
 		}
 		return nil
 	})
@@ -627,10 +717,12 @@ func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit in
 
 // ResourceEvents is NamespaceEvents for the event stream of resource name
 // (§7.3), which follows the namespace log for the resource's purges and
-// prunes: only entries naming it are answered, and they need read on it
-// alone, as the resource's own URLs do (§C.5). Last and More still cover
-// the whole page. With since "" it answers no entries and Last the
-// namespace head, where the stream starts following.
+// prunes: only the entries that purge or prune it are answered, as their
+// events' data, without id and prev, and in a sealed namespace each sealed
+// under the resource's K_r (eventseal.go); they need read on it alone, as
+// the resource's own URLs do (§C.5). Last and More still cover the whole
+// page. With since "" it answers no entries and Last the namespace head,
+// where the stream starts following.
 func (e *Engine) ResourceEvents(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
 	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, name, nil)
 }
@@ -641,6 +733,8 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 	var nsRowName string
 	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
+		var a *actor
+		var aerr *Error
 		switch {
 		case live != nil && live.shared:
 			// The waiters' passes stand for their read checks (live.go).
@@ -650,13 +744,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		case n == nil:
 			return t.absentNS(ns, cred)
 		case resource != "":
-			if _, err := t.reader(n, cred, resource); err != nil {
-				return err
+			if a, aerr = t.reader(n, cred, resource); aerr != nil {
+				return aerr
 			}
 		default:
-			a, err := t.nsReader(n, cred)
-			if err != nil {
-				return err
+			if a, aerr = t.nsReader(n, cred); aerr != nil {
+				return aerr
 			}
 			if live != nil {
 				live.decided(t, n, cred, a)
@@ -667,7 +760,10 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		if t.sealedPurged(n) {
 			return t.purgedRead(n)
 		}
-		out = &Log{Public: t.cachePublic(n)}
+		out = &Log{Public: t.cachePublic(n), Purged: n.purged}
+		if live == nil || !live.shared {
+			out.Until = t.admittedUntil(n, cred, a)
+		}
 		toSeq := n.headSeq.Int64
 		if resource != "" && since == "" {
 			out.Status, out.Last = 200, t.nsLogID(toSeq).String()
@@ -692,6 +788,14 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			fromSeq = s
 		}
+		// No page spans an e2e raise (§7.1 Paging, Addendum E Levels): a
+		// page that starts before the raising entry ends before it.
+		var raise *e2eRaise
+		if t.isE2E(n) {
+			if r := t.e2eRaiseOf(n); r != nil && r.seq != 0 {
+				raise = r
+			}
+		}
 		type raw struct {
 			nsLogRow
 			m map[string]any // body, parsed
@@ -704,6 +808,9 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		var rs []raw
 		units := 0
 		t.nsLogRows(n, fromSeq, toSeq, limit, func(lr nsLogRow) bool {
+			if raise != nil && len(rs) > 0 && rs[0].seq < raise.seq && lr.seq >= raise.seq {
+				return false
+			}
 			r := raw{nsLogRow: lr, m: jsonv.MustParse([]byte(lr.body)).(map[string]any)}
 			u := 1
 			if es, ok := r.m["entries"].([]any); ok && len(es) > 1 {
@@ -716,6 +823,16 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			rs = append(rs, r)
 			return true
 		})
+		// A page from before a raise from sealed is sealed as before,
+		// under the last epoch and pad setting before the raise; a purge,
+		// destroying the epoch keys, ends it, as in a sealed namespace.
+		var preSealed *e2eRaise
+		if raise != nil && raise.level == levelSealed && (len(rs) > 0 && rs[0].seq < raise.seq || len(rs) == 0 && toSeq < raise.seq) {
+			if n.purged {
+				return t.purgedRead(n)
+			}
+			preSealed = raise
+		}
 		out.Status = 200
 		out.Last = since
 		// An entry's prev is the row before it in the page, but for the
@@ -734,6 +851,11 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			m["author"] = t.authorName(r.author)
 			m["created"] = formatTime(r.created)
+			if via := parseVia(r.via); via != nil {
+				// The grant's delegatees, unhashed like author (§7.4);
+				// sealed with the entry in a sealed namespace.
+				m["via"] = anyStrings(via)
+			}
 			switch {
 			case r.grantID != nil:
 				// Not part of the hashed entry, like author and created
@@ -761,22 +883,31 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		// short of toSeq is a prefix of the range.
 		out.More = len(rs) > 0 && rs[len(rs)-1].seq < toSeq
 		if resource != "" {
-			var keep []raw
-			var entries []map[string]any
-			for i, m := range out.Entries {
-				if m["resource"] == resource {
-					keep, entries = append(keep, rs[i]), append(entries, m)
-				}
+			// A resource stream's purge and prune events (eventseal.go).
+			out.Entries = resourceEvents(out.Entries, resource)
+			switch {
+			case t.isSealedNS(n):
+				out.Sealed = true
+				out.EntryJWEs = t.sealResourceEvents(n, resource, out.Entries)
+			case preSealed != nil:
+				out.Sealed = true
+				out.EntryJWEs = t.preRaiseResourceEvents(n, preSealed, resource, out.Entries)
 			}
-			rs, out.Entries = keep, entries
+			return nil
 		}
-		if t.isSealedNS(n) {
+		rangeJob := func(since string, toSeq int64, toID string, plain func() []byte) *sealJob {
+			if preSealed != nil {
+				return t.preRaiseRangeJob(n, preSealed, since, toID, plain)
+			}
+			return t.rangeJob(n, since, toSeq, toID, plain)
+		}
+		if t.isSealedNS(n) || preSealed != nil {
 			out.Sealed, nsRowName = true, n.name
 			if perEntry {
 				for i, r := range rs {
 					m := out.Entries[i]
 					prev, _ := m["prev"].(string)
-					jobs = append(jobs, t.rangeJob(n, prev, r.seq, m["id"].(string), func() []byte { return jsonv.Canonical([]any{m}) }))
+					jobs = append(jobs, rangeJob(prev, r.seq, m["id"].(string), func() []byte { return jsonv.Canonical([]any{m}) }))
 				}
 			} else if len(rs) > 0 || nsID != "" {
 				// A range, even an empty one, is sealed as a whole, with
@@ -792,12 +923,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 				if len(rs) > 0 {
 					to, toID = rs[len(rs)-1].seq, out.Last
 				}
-				jobs = append(jobs, t.rangeJob(n, since, to, toID, func() []byte { return jsonv.Canonical(entries) }))
+				jobs = append(jobs, rangeJob(since, to, toID, func() []byte { return jsonv.Canonical(entries) }))
 			}
 		}
 		return nil
 	})
-	if err == nil && out != nil && out.Sealed {
+	if err == nil && out != nil && out.Sealed && resource == "" {
 		if err = e.finishSeal(ctx, nsRowName, jobs); err == nil {
 			if perEntry {
 				out.EntryJWEs = make([]string, len(jobs))
@@ -818,9 +949,10 @@ func ReprDigest(sum []byte) string {
 	return "sha-256=:" + base64.StdEncoding.EncodeToString(sum) + ":"
 }
 
-// HeadsPage is a page of GET /ns/{ns}/rev/{ns_id}/heads.
+// HeadsPage is a page of GET /ns/{ns}/rev/{ns_id}/heads, served as
+// { "heads": Items, "next"? } (§7.4).
 type HeadsPage struct {
-	Items  []map[string]any `json:"items"`
+	Items  []map[string]any `json:"heads"`
 	Next   string           `json:"next,omitempty"`
 	Public bool             `json:"-"`
 }
@@ -855,8 +987,11 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		// hide: created times, which their logs seal, lengths, which their
 		// padding exists for, and a hash of content (§7.4, §E.2.2). Judged
 		// by the namespace serving the page when it is listed, so pages at
-		// ns_ids from before a raise to sealed list none either.
-		plain := t.nsLevel(n) < levelSealed
+		// ns_ids from before a raise to sealed list none either. Nor do
+		// size and digest show at rest, where none are stored (§E.1 Stored
+		// digests; migration 008_clear_at_rest_digests, encryptNamespace).
+		level := t.nsLevel(n)
+		plain := level < levelSealed
 		for _, h := range page {
 			kind := "head"
 			switch h.state {
@@ -877,7 +1012,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 			// keeps its target.
 			if plain && h.row != nil && h.state != Purged {
 				item["created"] = formatTime(h.row.created)
-				if h.state == Live && h.row.size.Valid && len(h.row.digest) == sha256.Size {
+				if h.state == Live && level < levelAtRest && h.row.size.Valid && len(h.row.digest) == sha256.Size {
 					item["size"] = float64(h.row.size.Int64)
 					item["digest"] = ReprDigest(h.row.digest)
 				}
@@ -889,7 +1024,8 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 	return out, err
 }
 
-// Branches lists a namespace's direct branches (§7.4).
+// Branches lists a namespace's direct branches (§7.4): once the namespace
+// is purged, 410 purged, after the unrestricted-read check (§8.5).
 func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]map[string]any, bool, error) {
 	var out []map[string]any
 	var public bool
@@ -900,6 +1036,9 @@ func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]m
 		}
 		if _, err := t.nsReader(n, cred); err != nil {
 			return err
+		}
+		if n.purged {
+			return t.purgedRead(n)
 		}
 		public = t.cachePublic(n)
 		out = []map[string]any{}
@@ -966,13 +1105,14 @@ type nsLogRow struct {
 	grantID []byte
 	noAuth  sql.NullInt64
 	meta    sql.NullString // gesture and undoes, or gestures: JSON
+	via     sql.NullString // the grant's delegatees (§7.4)
 }
 
 // nsLogRows visits n's log entries after seq from up to and including seq
 // to, in chain order, at most limit of them (0: all), while visit returns
 // true.
 func (t *tx) nsLogRows(n *nsRow, from, to int64, limit int, visit func(nsLogRow) bool) {
-	q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
+	q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures, via FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
 	args := []any{n.id, from, to}
 	if limit > 0 {
 		q += ` LIMIT ?`
@@ -983,7 +1123,7 @@ func (t *tx) nsLogRows(n *nsRow, from, to int64, limit int, visit func(nsLogRow)
 	defer rows.Close()
 	for rows.Next() {
 		var r nsLogRow
-		t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta))
+		t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta, &r.via))
 		if !visit(r) {
 			return
 		}

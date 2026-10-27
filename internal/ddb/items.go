@@ -190,6 +190,15 @@ type revRow struct {
 	schemaRef string // the schema revision path it was typed by
 	signature string // the author signature (§C.3.1), "" for none
 	epoch     int    // the epoch it was written in, sealed namespaces only
+	// via is the writing principal's delegation chain (§7.4), canonical
+	// JSON, "" for none.
+	via string
+	// legacy marks a revision under the schema rules before v0.73 (a
+	// copy of one, or mirrored as one); others are v0.73's.
+	legacy bool
+	// declared lists the blobs an e2e revision's document references,
+	// as its sealed op declared them (§E.3.1), comma-separated.
+	declared string
 	// parentNS and parentPos name a first revision's foreign parent: a
 	// revision of the same name in the base it was read through from
 	// (§7.6).
@@ -210,8 +219,10 @@ func (r *revRow) item() item {
 	}
 	if r.kind != "tombstone" {
 		it["patches"] = avS(r.patches)
-		it["size"] = avN(r.size)
-		it["digest"] = avB(r.digest)
+		if len(r.digest) > 0 { // none for mirrored e2e content
+			it["size"] = avN(r.size)
+			it["digest"] = avB(r.digest)
+		}
 	}
 	if r.parentID != "" {
 		it["parentId"] = avS(r.parentID)
@@ -236,6 +247,15 @@ func (r *revRow) item() item {
 	}
 	if r.epoch > 0 {
 		it["epoch"] = avN(uint64(r.epoch))
+	}
+	if r.declared != "" {
+		it["declared"] = avS(r.declared)
+	}
+	if r.via != "" {
+		it["via"] = avS(r.via)
+	}
+	if r.legacy {
+		it["legacy"] = avN(1)
 	}
 	if r.parentNS != "" {
 		it["parentNs"], it["parentPos"] = avS(r.parentNS), avN(r.parentPos)
@@ -269,6 +289,9 @@ type logRow struct {
 	// which serves "grant": null (§1).
 	grantID string
 	noAuth  bool
+	// via is the grant's delegatees (§6.4.1, §C.1), canonical JSON, ""
+	// for none: unhashed, served with the entry.
+	via string
 }
 
 func (l *logRow) item() item {
@@ -298,6 +321,9 @@ func (l *logRow) item() item {
 	}
 	if l.noAuth {
 		it["noAuth"] = avN(1)
+	}
+	if l.via != "" {
+		it["via"] = avS(l.via)
 	}
 	return it
 }

@@ -1,0 +1,54 @@
+{
+  "section": "§H.1",
+  "about": "file renderings: the canonical JSON of the document without a fresh $nonce or a $successor of §8.1's form, laid out as JSON.stringify(value, null, 2) with JCS member order, one final LF",
+  "vectors": [
+    {
+      "name": "$successor of §8.1's form, left out",
+      "fn": "files.Rendering",
+      "document": "{\"$successor\":\"derby-2\",\"title\":\"Old\"}",
+      "rendering": "{\n  \"title\": \"Old\"\n}\n",
+      "bytes": 21,
+      "sha256": "95c95285328c1d56eaf7e4dd8b1ba60c392bfaa53761355ccea198833ae5fe31"
+    },
+    {
+      "name": "$successor not a resource name, kept",
+      "fn": "files.Rendering",
+      "document": "{\"$successor\":\"Not A Name\",\"a\":1}",
+      "rendering": "{\n  \"$successor\": \"Not A Name\",\n  \"a\": 1\n}\n",
+      "bytes": 43,
+      "sha256": "17a00360fc69fa4c510d3eb3b3b88bacf6622a61c609eec317c559aea35c447e"
+    },
+    {
+      "name": "$nonce not of the fresh form, kept",
+      "fn": "files.Rendering",
+      "document": "{\"$nonce\":\"short\",\"a\":1}",
+      "rendering": "{\n  \"$nonce\": \"short\",\n  \"a\": 1\n}\n",
+      "bytes": 34,
+      "sha256": "430fb96ef046a7c9c1f6d51b2ea620d62ead6c732a63234bf21d1b5da66ddc4a"
+    },
+    {
+      "name": "array root",
+      "fn": "files.Rendering",
+      "document": "[1,{\"b\":[]},\"x\"]",
+      "rendering": "[\n  1,\n  {\n    \"b\": []\n  },\n  \"x\"\n]\n",
+      "bytes": 36,
+      "sha256": "d02b9d124d54018ae64a78b16cba83b7593efda4b4d19a871b5c7c62b0455669"
+    },
+    {
+      "name": "exponents and negative zero",
+      "fn": "files.Rendering",
+      "document": "{\"big\":1e21,\"small\":1e-7,\"neg\":-0,\"f\":0.5}",
+      "rendering": "{\n  \"big\": 1e+21,\n  \"f\": 0.5,\n  \"neg\": 0,\n  \"small\": 1e-7\n}\n",
+      "bytes": 60,
+      "sha256": "2ed3c80aa6ce13b3c1457c00621818666f15b2d6af7f7f819d9278ce131d3dd0"
+    },
+    {
+      "name": "escapes",
+      "fn": "files.Rendering",
+      "document": "{\"esc\":\"\\\"\\\\\\/\\b\\f\\n\\r\\t\\u0000\\u001f\\u007f\\u2028\\ud83d\\ude00é\",\"ünï\":true}",
+      "rendering": "{\n  \"esc\": \"\\\"\\\\/\\b\\f\\n\\r\\t\\u0000\\u001f\u2028😀é\",\n  \"ünï\": true\n}\n",
+      "bytes": 70,
+      "sha256": "25a705341cb21ebb8a4fe6b4a4059fcf16d8ef3eeaed137094ba0f9dfc2f3c65"
+    }
+  ]
+}

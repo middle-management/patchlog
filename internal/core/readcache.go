@@ -94,11 +94,12 @@ type revDoc struct {
 	meta    bool
 	created int64
 	digest  [sha256.Size]byte
+	rules   string // Rev.SchemaRules
 }
 
 // answer is the 200 serving d.
 func (d *revDoc) answer(public bool) *Rev {
-	r := &Rev{Status: 200, Doc: d.doc, Public: public}
+	r := &Rev{Status: 200, Doc: d.doc, Public: public, SchemaRules: d.rules}
 	if d.meta {
 		r.Created, r.Digest = time.UnixMilli(d.created), d.digest[:]
 	}

@@ -3,6 +3,7 @@ package tree
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,9 +22,15 @@ import (
 //	                                 when the service applied ns's purge (Unix nanoseconds; "1"
 //	                                 from earlier releases); "caught:{ns}" the head its first
 //	                                 catch-up with ns reached (behind)
-//	nodes(href, name, kind, item, item_head, title, state, …)
+//	nodes(href, name, kind, item, item_head, title, state, …, born, epoch)
 //	                                 one row per node (explicit, or implicit from $parents);
-//	                                 raw parents/$access kept to rebuild the graph on start
+//	                                 raw parents/$access kept to rebuild the graph on start;
+//	                                 born, the created of the first revision of the node's
+//	                                 document (§B.5), '' where it can't be known, NULL where
+//	                                 it isn't read yet (bornVal); epoch, the epoch head is
+//	                                 served under in a sealed or e2e catalog (§E.2.6), which
+//	                                 meta "epochs" marks pending for rows from before it
+//	                                 (backfillEpochs, as for items.file's epoch)
 //	edges(child, pos, parent, ord, state)
 //	                                 one row per declared parents entry (hrefs), with its state
 //	items(ns, name, state, head, title, created, file)
@@ -32,35 +39,52 @@ import (
 //	                                 metadata (§H.3, files.go); a name without a row in a
 //	                                 namespace with "purged:{ns}" is purged (itemInfo); meta
 //	                                 "filed" marks file metadata computed for a file tree
-//	self_parents(ns, name, parents)  $parents of content documents (§B.9, -self-placing)
+//	self_parents(ns, name, parents, born)
+//	                                 $parents of content documents (§B.9, -self-placing), with
+//	                                 the content document's born
+//	explicit_gone(name)              placements whose explicit placement was deleted or
+//	                                 purged, which still win over $parents (§B.9); meta
+//	                                 "gone" marks them filled in for a database from before
+//	                                 they were kept (backfillNodes)
 //	sealed_views, sealed_view_tags   sealed listings of a sealed/e2e catalog (derived.Cache)
-//	edge_subjects(gs, subjects, exp) the subjects of each subject set the service minted edge
-//	                                 grants for, until the last of them expires (edgegrants.go);
-//	                                 meta "trusted:{ns}" is when it came to trust ns
+//	edge_subjects, edge_buckets      the subjects of each subject set the service minted edge
+//	                                 grants for, until the last of them expires, and its
+//	                                 exchangeRate buckets (svcedge.Store, edgegrants.go); meta
+//	                                 "trusted:{ns}" is when it came to trust ns
 //	cdn_repurge(id, tags, due)       second CDN purges (package repurge), kept by a rebuild
-var createStmts = []string{
-	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
-	`CREATE INDEX IF NOT EXISTS seen_by_id ON seen (ns_id)`,
-	`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`,
-	`CREATE TABLE IF NOT EXISTS nodes (href TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, kind INTEGER NOT NULL,
-		item TEXT, item_head TEXT, title TEXT, state INTEGER NOT NULL DEFAULT 0,
-		self INTEGER NOT NULL DEFAULT 0, head TEXT, parents TEXT, access TEXT,
-		dangling TEXT, cyclic INTEGER NOT NULL DEFAULT 0, deep INTEGER NOT NULL DEFAULT 0, depth INTEGER NOT NULL DEFAULT -1,
-		item_state INTEGER NOT NULL DEFAULT 0)`,
-	`CREATE TABLE IF NOT EXISTS edges (child TEXT NOT NULL, pos INTEGER NOT NULL, parent TEXT NOT NULL, ord TEXT,
-		state INTEGER NOT NULL, PRIMARY KEY (child, pos))`,
-	`CREATE INDEX IF NOT EXISTS edges_by_parent ON edges (parent, ord, child)`,
-	`CREATE TABLE IF NOT EXISTS items (ns TEXT NOT NULL, name TEXT NOT NULL, state INTEGER NOT NULL, head TEXT, title TEXT,
-		created TEXT, file TEXT, PRIMARY KEY (ns, name)) WITHOUT ROWID`,
-	`CREATE TABLE IF NOT EXISTS self_parents (ns TEXT NOT NULL, name TEXT NOT NULL, parents TEXT NOT NULL,
-		PRIMARY KEY (ns, name)) WITHOUT ROWID`,
-	`CREATE TABLE IF NOT EXISTS edge_subjects (gs TEXT PRIMARY KEY, subjects TEXT NOT NULL, exp INTEGER NOT NULL)`,
+//
+// The tables are migrations (migrations/, package dbmigrate), applied under
+// the namespace "tree"; the sealed-view cache's, the repurge queue's, the
+// edge grants' (svcedge.Store's) and a catalog hook's are applied by their
+// packages under namespaces of their own.
+//
+//go:embed migrations
+var migrations embed.FS
+
+// resetStmts empty what a rebuild replays (cdn_repurge stays, and so do
+// the edge grants' tables, svcedge.Store's, and a hook's, which its
+// Rebuild recomputes), in one transaction. checkpoints_bootstrap too: a
+// snapshot left part-way would otherwise be resumed, not replayed from its
+// first page.
+var resetStmts = []string{
+	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM meta`,
+	`DELETE FROM nodes`, `DELETE FROM edges`, `DELETE FROM items`,
+	`DELETE FROM self_parents`, `DELETE FROM explicit_gone`, derived.CacheResetStmts[0], derived.CacheResetStmts[1],
 }
 
-var dropStmts = []string{
-	`DROP TABLE IF EXISTS checkpoints`, `DROP TABLE IF EXISTS seen`, `DROP TABLE IF EXISTS meta`,
-	`DROP TABLE IF EXISTS nodes`, `DROP TABLE IF EXISTS edges`, `DROP TABLE IF EXISTS items`,
-	`DROP TABLE IF EXISTS self_parents`, derived.CacheDropStmts[0], derived.CacheDropStmts[1],
+// reset runs resetStmts.
+func reset(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range resetStmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func canonJSON(v any) string {
@@ -95,6 +119,7 @@ func (s *Service) persistNode(ctx context.Context, tx *sql.Tx, g *Graph, name st
 		return err
 	}
 	var item, itemHead, head, title, dangling any
+	born := bornVal(n.Born, n.BornUnknown)
 	if it := n.Item(); it != "" {
 		item = it
 	}
@@ -119,10 +144,14 @@ func (s *Service) persistNode(ctx context.Context, tx *sql.Tx, g *Graph, name st
 			access = canonJSON(n.rawAccess)
 		}
 	}
+	var epoch any
+	if n.Epoch > 0 {
+		epoch = n.Epoch
+	}
 	_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO nodes (href, name, kind, item, item_head, title, state, self, head, parents, access,
-		dangling, cyclic, deep, depth, item_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		dangling, cyclic, deep, depth, item_state, born, epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		href, name, n.Kind, item, itemHead, title, n.State, b2i(n.Self), head, parents, access,
-		dangling, b2i(n.Cyclic), b2i(n.Deep), n.Depth, n.ItemState)
+		dangling, b2i(n.Cyclic), b2i(n.Deep), n.Depth, n.ItemState, born, epoch)
 	if err != nil {
 		return err
 	}
@@ -138,6 +167,21 @@ func (s *Service) persistNode(ctx context.Context, tx *sql.Tx, g *Graph, name st
 	}
 	g.saved[name] = n.snapshot()
 	return nil
+}
+
+// bornVal is the born column of a node (nodes.born, self_parents.born):
+// its born, the empty string where it can't be known (Node.BornUnknown),
+// NULL where it isn't read yet (backfillNodes reads it).
+func bornVal(born string, unknown bool) any {
+	if born == "" && !unknown {
+		return nil
+	}
+	return born
+}
+
+// bornCol reads what bornVal stored.
+func bornCol(c sql.NullString) (born string, unknown bool) {
+	return c.String, c.Valid && c.String == ""
 }
 
 func b2i(b bool) int {
@@ -178,7 +222,7 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 	if err := crows.Err(); err != nil {
 		return nil, err
 	}
-	rows, err := q.QueryContext(ctx, `SELECT name, self, head, title, parents, access, state, dangling, cyclic, deep, item_state, item_head FROM nodes`)
+	rows, err := q.QueryContext(ctx, `SELECT name, self, head, title, parents, access, state, dangling, cyclic, deep, item_state, item_head, born, epoch FROM nodes`)
 	if err != nil {
 		return nil, err
 	}
@@ -190,13 +234,14 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 		state                   int
 		dangling                sql.NullString
 		cyclic, deep, itemState int
-		itemHead                sql.NullString
+		itemHead, born          sql.NullString
+		epoch                   sql.NullInt64
 	}
 	var all []rowT
 	for rows.Next() {
 		var r rowT
 		var self int
-		if err := rows.Scan(&r.name, &self, &r.head, &r.title, &r.parents, &r.access, &r.state, &r.dangling, &r.cyclic, &r.deep, &r.itemState, &r.itemHead); err != nil {
+		if err := rows.Scan(&r.name, &self, &r.head, &r.title, &r.parents, &r.access, &r.state, &r.dangling, &r.cyclic, &r.deep, &r.itemState, &r.itemHead, &r.born, &r.epoch); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -223,7 +268,30 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 		if v := parseJSON(r.access.String); v != nil {
 			doc["$access"] = v
 		}
-		g.setExplicit(ParseNode(g.Catalog, r.name, r.head.String, doc))
+		n := ParseNode(g.Catalog, r.name, r.head.String, doc)
+		n.Born, n.BornUnknown = bornCol(r.born)
+		n.Epoch = int(r.epoch.Int64)
+		g.setExplicit(n)
+	}
+	// Deleted and purged explicit placements, before the implicit ones
+	// they keep out (§B.9).
+	grows, err := q.QueryContext(ctx, `SELECT name FROM explicit_gone`)
+	if err != nil {
+		return nil, err
+	}
+	for grows.Next() {
+		var name string
+		if err := grows.Scan(&name); err != nil {
+			grows.Close()
+			return nil, err
+		}
+		if g.explicit[name] == nil {
+			g.explicitGone[name] = true
+		}
+	}
+	grows.Close()
+	if err := grows.Err(); err != nil {
+		return nil, err
 	}
 	// Saved edge states.
 	erows, err := q.QueryContext(ctx, `SELECT child, pos, state FROM edges ORDER BY child, pos`)
@@ -250,18 +318,20 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 		return nil, err
 	}
 	// Implicit placements.
-	srows, err := q.QueryContext(ctx, `SELECT ns, name, parents FROM self_parents`)
+	srows, err := q.QueryContext(ctx, `SELECT ns, name, parents, born FROM self_parents`)
 	if err != nil {
 		return nil, err
 	}
 	var selfs []*Node
 	for srows.Next() {
 		var ns, name, ps string
-		if err := srows.Scan(&ns, &name, &ps); err != nil {
+		var born sql.NullString
+		if err := srows.Scan(&ns, &name, &ps, &born); err != nil {
 			srows.Close()
 			return nil, err
 		}
 		if n := parseSelf(g.Catalog, ns, name, map[string]any{"$parents": parseJSON(ps)}); n != nil {
+			n.Born, n.BornUnknown = bornCol(born)
 			selfs = append(selfs, n)
 		}
 	}
@@ -384,12 +454,16 @@ func titleAt(doc any, p pointer.Pointer) string {
 }
 
 // setConfig records the catalog namespace document, its trust list, its
-// title pointer and whether it is a file tree.
+// title pointer and whether it is a file tree, with its root folder.
 func (g *Graph) setConfig(doc map[string]any) {
 	g.Config = doc
 	g.Trust = map[string]bool{}
 	g.TitlePtr, g.HasTitle = titlePointer(doc)
 	g.Files = isFileTree(doc)
+	g.FilesRoot = ""
+	if g.Files {
+		g.FilesRoot = filesRoot(doc)
+	}
 	cat, _ := doc["catalog"].(map[string]any)
 	arr, _ := cat["trust"].([]any)
 	for _, x := range arr {
@@ -397,6 +471,17 @@ func (g *Graph) setConfig(doc map[string]any) {
 			g.Trust[s] = true
 		}
 	}
+}
+
+// saveGone records in tx whether name is a deleted or purged explicit
+// placement (explicit_gone, §B.9).
+func saveGone(ctx context.Context, tx *sql.Tx, name string, gone bool) error {
+	q := `DELETE FROM explicit_gone WHERE name = ?`
+	if gone {
+		q = `INSERT INTO explicit_gone (name) VALUES (?) ON CONFLICT (name) DO NOTHING`
+	}
+	_, err := tx.ExecContext(ctx, q, name)
+	return err
 }
 
 func saveMeta(ctx context.Context, tx *sql.Tx, k, v string) error {

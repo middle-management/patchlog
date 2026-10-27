@@ -241,7 +241,7 @@ func TestFileTreeSealed(t *testing.T) {
 	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"parents": []any{}}))
 
 	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"}, map[string]any{"enc": svcJWK})),
-		client.WithKeys(client.NewKeys(svcPriv)))
+		client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey()))
 	x := startSvc(t, sc, svcOpts{now: s.Now}, func(o *tree.Options) { o.Recipient = svcPriv })
 	x.caughtUp("cat", "files", "secret")
 
@@ -258,7 +258,8 @@ func TestFileTreeSealed(t *testing.T) {
 		t.Fatalf("file metadata in the clear: %s", f.body)
 	}
 	es := entriesOf(t, decode(t, f.body))
-	if _, has := es["secret.s1"]["file"]; has || es["secret.s1"]["head"] == nil {
+	// An e2e item's file says why it is absent (§H.3).
+	if f := fileOf(es["secret.s1"]); fmt.Sprint(f) != "map[absent:e2e]" || es["secret.s1"]["head"] == nil {
 		t.Fatalf("e2e item %v", es["secret.s1"])
 	}
 	jwe, _ := fileOf(es["files.notes"])["sealed"].(string)
@@ -349,11 +350,13 @@ func TestFileTreeSealedCatalog(t *testing.T) {
 	}
 }
 
-// §A.4, §H.3: a listing is stored and kept for the shape of reader it was
-// computed for. A public content namespace that turns private before the
-// service's at moves gives anonymous readers of that at no heads, urls or
-// file metadata of its items, also when a trusted sealed namespace makes
-// the service store listings (§E.2.6).
+// §A.4, §H.3, §B.11.5: a listing is stored and kept for the shape of
+// reader it was computed for. A public content namespace that turns
+// private before the service's at moves gives anonymous readers of that
+// at nothing of its items: with a namespace in the checkpoint that isn't
+// public there is no anonymous listing (401), also when a trusted sealed
+// namespace (public, so the listing was anonymous) makes the service
+// store listings (§E.2.6).
 func TestFileTreeShape(t *testing.T) {
 	t.Parallel()
 	for _, withSealed := range []bool{false, true} {
@@ -367,7 +370,7 @@ func TestFileTreeShape(t *testing.T) {
 			docs := map[string]map[string]any{"pub": {"read": "public", "keys": []any{k.Entry("*")}}}
 			if withSealed {
 				trust, followed = []string{"pub", "files"}, []string{"cat", "files", "pub"}
-				docs["files"] = map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}}
+				docs["files"] = map[string]any{"read": "public", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}}
 			}
 			docs["cat"] = map[string]any{"read": "public", "keys": []any{k.Entry("*")}, "catalog": filesCatalog(trust...)}
 			for ns, doc := range docs {
@@ -396,19 +399,8 @@ func TestFileTreeShape(t *testing.T) {
 			<-x.done
 			h := must(w.NSHead(ctx, "pub"))
 			must(w.PatchConfig(ctx, "pub", h.Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
-			// With no follower to Observe the change, the service learns of it
-			// when its cached document of pub expires: the read before the
-			// stop may have refreshed it moments ago.
-			time.Sleep(checkerTTL)
-			r = x.raw(loc, "")
-			e := entriesOf(t, r.body)["pub.plan"]
-			if r.status != 200 || e == nil {
+			if r = x.raw(loc, ""); r.status != 401 {
 				t.Fatalf("listing once private: %d %v", r.status, r.body)
-			}
-			for _, k := range []string{"head", "url", "file"} {
-				if _, has := e[k]; has {
-					t.Errorf("an anonymous reader gets %s of an item now private: %v", k, e)
-				}
 			}
 		})
 	}
@@ -416,7 +408,10 @@ func TestFileTreeShape(t *testing.T) {
 
 // §2.1, §C.4: a read grant from a key with readScope "resource" that
 // doesn't fix /resource is refused, by the core and by the service alike:
-// listings show it no item's head or file metadata.
+// it reads nothing namespace-wide, so a tree service without §B.11, which
+// serves only g/all (§B.11.5), refuses it (403), and so it does one that
+// fixes /resource; a grant of a key without readScope reads g/all, with
+// the item's head and file metadata.
 func TestFileTreeReadScope(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -443,14 +438,16 @@ func TestFileTreeReadScope(t *testing.T) {
 	if h, _, err := s.Client(t, client.WithBearer(bad)).Load(ctx, "files", "secret"); err == nil && h.State == client.Live {
 		t.Fatal("the core reads with it")
 	}
-	e := entriesOf(t, x.get("/cat/children?of=root", bad))["files.secret"]
-	if e == nil || e["head"] != nil || e["file"] != nil {
-		t.Fatalf("entry under a grant the core refuses: %v", e)
+	if r := x.raw("/cat/children?of=root", bad); r.status != 403 {
+		t.Fatalf("a grant the core refuses: %d %v", r.status, r.body)
 	}
-	// Fixing /resource, it reads that item.
 	good := rk.Grant(t, s.Now(), "user:r", all, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "secret"}}})
-	if e := entriesOf(t, x.get("/cat/children?of=root", good))["files.secret"]; e["head"] == nil || fileOf(e) == nil {
-		t.Fatalf("entry under a grant fixing /resource: %v", e)
+	if r := x.raw("/cat/children?of=root", good); r.status != 403 {
+		t.Fatalf("a grant fixing /resource: %d %v", r.status, r.body)
+	}
+	whole := k.Grant(t, s.Now(), "user:r", all, []string{"read"})
+	if e := entriesOf(t, x.get("/cat/children?of=root", whole))["files.secret"]; e["head"] == nil || fileOf(e) == nil {
+		t.Fatalf("entry under a grant reading files whole: %v", e)
 	}
 }
 
@@ -542,18 +539,24 @@ func TestFileTreeSealingKeys(t *testing.T) {
 	createNonced(t, w, "files", "notes", map[string]any{"n": 1})
 	must(w.CreateDoc(ctx, "cat", "files.notes", map[string]any{"parents": parents("root")}))
 	ft := &flaky{prefix: "/ns/files/keys"}
-	sc := s.Client(t, client.WithHTTPClient(&http.Client{Transport: ft}), client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"})),
+	// The service's grant reaches back before the new epoch (nbf), so it
+	// gets epoch 1's key too, which the item's file metadata is sealed
+	// under (§E.2.3, §E.2.6), after a restart included.
+	sc := s.Client(t, client.WithHTTPClient(&http.Client{Transport: ft}), client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"},
+		map[string]any{"nbf": s.Now().Add(-24 * time.Hour).Format(time.RFC3339)})),
 		client.WithKeys(client.NewKeys(nil)))
 	var mu sync.Mutex
 	var logs []string
-	x := startSvc(t, sc, svcOpts{now: s.Now}, func(o *tree.Options) {
+	opts := svcOpts{now: s.Now, db: filepath.Join(t.TempDir(), "tree.db")}
+	logTo := func(o *tree.Options) {
 		o.Logf = func(f string, a ...any) {
 			mu.Lock()
 			logs = append(logs, fmt.Sprintf(f, a...))
 			mu.Unlock()
 			t.Logf(f, a...)
 		}
-	})
+	}
+	x := startSvc(t, sc, opts, logTo)
 	x.caughtUp("cat", "files", "secret")
 	reader := k.Grant(t, s.Now(), "user:r", all, []string{"read"})
 	sealedFile := func() string {
@@ -565,10 +568,15 @@ func TestFileTreeSealingKeys(t *testing.T) {
 		t.Fatal("no sealed file")
 	}
 
-	// A new epoch, whose key the service can't get for now when it lists.
+	// A new epoch, whose key the service can't get for now when it lists:
+	// it fetches the key as it applies the change (derived.Keys.Recheck),
+	// so a service restarted since, whose key fetches fail, holds none.
 	must(w.PatchConfig(ctx, "files", must(w.NSHead(ctx, "files")).Config, []any{map[string]any{"op": "add", "path": "/encryption/epoch", "value": 2}}))
 	x.caughtUp("files")
+	x.stop()
 	ft.fail.Store(1 << 20)
+	x = startSvc(t, sc, opts, logTo)
+	x.caughtUp("cat", "files", "secret")
 	r := x.raw("/cat/children?of=root", reader)
 	if loc := r.header.Get("Location"); r.status == 302 {
 		r = x.raw(loc, reader)
@@ -581,7 +589,9 @@ func TestFileTreeSealingKeys(t *testing.T) {
 	if jwe == "" {
 		t.Fatal("no sealed file once the key is had")
 	}
-	if kid, _ := jwtHeader(t, jwe)["kid"].(string); kid != "files#2" {
+	// Under the epoch the item's head is served under, written before
+	// the new epoch (§E.2.6 values of another resource, ENC-34).
+	if kid, _ := jwtHeader(t, jwe)["kid"].(string); kid != "files#1" {
 		t.Fatalf("sealed under %q", kid)
 	}
 	mu.Lock()

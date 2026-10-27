@@ -7,8 +7,7 @@ import (
 )
 
 // On Postgres the large columns are compressed with lz4 where the server
-// has it, not pglz, its default (pgschema.go): set when a database is
-// created, and on one created before, when it is opened again.
+// has it, not pglz, its default (migrations/postgres).
 func TestPGColumnCompression(t *testing.T) {
 	if !pgtest.Enabled() {
 		t.Skip("Postgres only")
@@ -24,12 +23,12 @@ func TestPGColumnCompression(t *testing.T) {
 		return e
 	}
 	e := open()
+	defer e.Close()
 	var lz4 bool
 	if err := e.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM pg_settings WHERE name = 'default_toast_compression' AND 'lz4' = ANY (enumvals))`).Scan(&lz4); err != nil {
 		t.Fatal(err)
 	}
 	if !lz4 {
-		e.Close()
 		t.Skip("the server has no lz4")
 	}
 	compression := func(e *Engine) map[string]string {
@@ -62,14 +61,5 @@ func TestPGColumnCompression(t *testing.T) {
 			}
 		}
 	}
-	want(e, "l")
-	// A database from before: its columns on the default, set when opened.
-	if _, err := e.db.Exec(`ALTER TABLE revisions ALTER COLUMN patches SET COMPRESSION default;
-		ALTER TABLE heads ALTER COLUMN doc SET COMPRESSION default`); err != nil {
-		t.Fatal(err)
-	}
-	e.Close()
-	e = open()
-	defer e.Close()
 	want(e, "l")
 }

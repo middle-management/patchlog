@@ -8,14 +8,22 @@
 //	checkpoints(origin, ns, ns_id)         follow.SQLCheckpoints, saved in the apply tx
 //	seen(ns, ns_id)                        every ns_id applied, for ?min= (§A.5)
 //	ns_state(ns, purged)                   purge-ns marks the namespace gone
-//	docs(docid, ns, resource, head, schema) one row per live resource (untyped too, see UntypedListing)
+//	ns_conf(ns, public, level)             the read mode and level last applied (narrowed)
+//	docs(docid, ns, resource, head, schema, epoch) one row per live resource (untyped too, see
+//	                                      UntypedListing); epoch, in a sealed or e2e namespace, the
+//	                                      epoch its head is served under (derived.EpochOf), NULL or 0
+//	                                      where not known
 //	text  fts5(ns, resource, schema, path, body)  rowid = docid<<20 | n, so a resource's rows are a rowid range
-//	facet(ns, resource, schema, path, value, raw)
-//	sort (ns, resource, schema, path, value)
+//	facet(ns, resource, schema, path, value, raw)  value: the string form (§A.2), raw: canonical JSON
+//	sort (ns, resource, schema, path, value, raw)  value: the least value (sortColumn), raw: all, a JSON array
 //	refs(ns, resource, schema, path, ref, target_ns, target, rev, entry)  x-ref references (§A.2, §A.3);
 //	                                      path is the full instance pointer, indices included
 //	sealed_views, sealed_view_tags   sealed results of sealed/e2e namespaces (derived.Cache)
 //	cdn_repurge(id, tags, due)       second CDN purges (package repurge), kept by a rebuild
+//	edge_subjects, edge_buckets      the markers of each subject set the service minted edge
+//	                                 grants for, until the last of them expires, and its
+//	                                 exchangeRate buckets (svcedge.Store, edgegrants.go)
+//	edge_filters(marker, filter, exp) what each scope marker of those stands for (readFilter)
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
@@ -26,10 +34,12 @@
 // be built WithKeys, and Recipient unwraps keys wrapped to the grant's
 // enc); an e2e (E3) namespace only with a keyring Recipient key, its
 // documents folded client-side (the keyring itself is never indexed).
-// Without keys a namespace is skipped: not followed, answered 503
-// "skipped", and reported with the reason at GET /_status. Results over a
-// sealed or e2e namespace are sealed under its current epoch key
-// (§E.2.5): see Handler.
+// Without keys a namespace is skipped: not followed, and reported with the
+// reason at GET /_status. One whose keys the service lacks is answered 404
+// as one it doesn't follow (§A.4); one whose keys it can't fetch for now,
+// 503 behind. Results over a sealed or e2e namespace are sealed under the
+// epochs their documents' heads are served under (§E.2.6, docs.epoch): see
+// Handler.
 //
 // Stored plaintext. Full-text, facet and sort queries need the indexed
 // values in the clear, so the database holds plaintext derived from
@@ -47,9 +57,11 @@ import (
 	"context"
 	"crypto/ecdh"
 	"database/sql"
+	"embed"
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,6 +70,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
@@ -65,6 +78,7 @@ import (
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/repurge"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
+	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // Purger purges the index service's own cache tags (§A.1: a purge "also
@@ -120,6 +134,19 @@ type Options struct {
 	// results, and all of them when nil, are no-store for shared caches.
 	// They are served either way.
 	Edge *edge.Verifier
+	// EdgeGrants, if set, mints and verifies the service's own edge
+	// grants (§A.4, §B.11.5, §C.5; edgegrants.go): cookies for
+	// /{ns}/g/{gs} and /_refs/g/{gs}, under a key and kid of the
+	// service's own, never the origin's. Open sets its Vouches to those
+	// prefixes. Without it, POST and DELETE /edge-grants are 404
+	// not_offered.
+	EdgeGrants *edge.Cookies
+	// ExchangeRate is the exchangeRate bucket each principal draws one
+	// token from per exchange at POST /edge-grants (§C.5.2, §6.6; default
+	// svcedge.DefaultExchangeRate). It is a deployment's limit, so the
+	// service has its own buckets, shared by every instance on its
+	// database DB (§B.11.5, svcedge.Store).
+	ExchangeRate svcedge.Rate
 	// Now is the clock for grant checks, kept results and the due times
 	// of second purges (default time.Now).
 	Now func() time.Time
@@ -158,6 +185,10 @@ type Index struct {
 	sealed  *derived.Cache // sealed results
 	kept    *kept.Store    // results kept past their checkpoint
 	repurge *repurge.Queue // second CDN purges
+	edge    *svcedge.Store // the service's edge grants (EdgeGrants)
+
+	fmu     sync.Mutex
+	filters map[string]keptFilter // scope marker -> what it stands for (edge_filters)
 
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers
@@ -166,6 +197,10 @@ type Index struct {
 	cur     map[string]string // ns -> checkpoint
 	purged  map[string]bool
 	changed chan struct{} // closed and replaced after every commit
+	// runs stops the running follower of a followed namespace (runFollower),
+	// which Apply does once a config change leaves the service without
+	// its keys (derived.Keys.Recheck).
+	runs map[string]context.CancelFunc
 }
 
 // Open opens (creating or, with Rebuild, recreating) the index database and
@@ -234,6 +269,10 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := ix.initEdge(ctx, db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("index: edge grants: %w", err)
+	}
 	ix.repurge.Start()
 	return ix, nil
 }
@@ -250,33 +289,29 @@ func (ix *Index) FTS() bool { return ix.fts }
 // Origin is the core's canonical origin, used in hit URLs.
 func (ix *Index) Origin() string { return ix.origin }
 
-var dropStmts = []string{
-	`DROP TABLE IF EXISTS checkpoints`, `DROP TABLE IF EXISTS seen`, `DROP TABLE IF EXISTS ns_state`,
-	`DROP TABLE IF EXISTS docs`, `DROP TABLE IF EXISTS "text"`, `DROP TABLE IF EXISTS facet`, `DROP TABLE IF EXISTS "sort"`, `DROP TABLE IF EXISTS refs`,
-	derived.CacheDropStmts[0], derived.CacheDropStmts[1],
+// migrations holds the index's tables but for text (initSchema), applied
+// under the namespace "index" (package dbmigrate).
+//
+//go:embed migrations
+var migrations embed.FS
+
+// resetStmts empty what a rebuild replays (cdn_repurge stays, and so do
+// the edge grants' tables, edge_filters and svcedge.Store's), in one
+// transaction. checkpoints_bootstrap too: a snapshot left part-way would
+// otherwise be resumed, not replayed from its first page. text, made by
+// initSchema rather than a migration, is dropped, so a rebuild decides
+// between FTS5 and the LIKE fallback again.
+var resetStmts = []string{
+	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM ns_state`, `DELETE FROM ns_conf`,
+	`DELETE FROM docs`, `DROP TABLE IF EXISTS "text"`, `DELETE FROM facet`, `DELETE FROM "sort"`, `DELETE FROM refs`,
+	derived.CacheResetStmts[0], derived.CacheResetStmts[1],
 }
 
-// createStmts: query.go names facet_q, sort_q, refs_t and the primary
-// keys' indexes (sqlite_autoindex_facet_1, _sort_1, _refs_1) in INDEXED
-// BY, which fails the query if one is missing; a table keeps its primary
-// key as its only constraint (TestOldSchemasIndexedBy).
-var createStmts = []string{
-	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
-	`CREATE TABLE IF NOT EXISTS ns_state (ns TEXT PRIMARY KEY, purged INTEGER NOT NULL DEFAULT 0)`,
-	`CREATE TABLE IF NOT EXISTS docs (docid INTEGER PRIMARY KEY, ns TEXT NOT NULL, resource TEXT NOT NULL, head TEXT NOT NULL, schema TEXT, UNIQUE (ns, resource))`,
-	`CREATE TABLE IF NOT EXISTS facet (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value TEXT NOT NULL, raw TEXT NOT NULL, PRIMARY KEY (ns, resource, path, value))`,
-	`CREATE TABLE IF NOT EXISTS "sort" (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value, raw TEXT, PRIMARY KEY (ns, resource, path))`,
-	`CREATE TABLE IF NOT EXISTS refs (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, ref TEXT NOT NULL, target_ns TEXT NOT NULL, target TEXT NOT NULL, rev TEXT, entry TEXT, PRIMARY KEY (ns, resource, path))`,
-	`CREATE INDEX IF NOT EXISTS docs_q ON docs (ns, schema)`,
-	// refs_t leads with ns: a ?ref= filter reads only the namespace's
-	// references to the target (refs_q, before, read every namespace's).
-	`DROP INDEX IF EXISTS refs_q`,
-	`CREATE INDEX IF NOT EXISTS refs_t ON refs (ns, target_ns, target, rev, entry)`,
-	`CREATE INDEX IF NOT EXISTS facet_q ON facet (ns, path, value)`,
-	`CREATE INDEX IF NOT EXISTS sort_q ON "sort" (ns, path, value)`,
-}
+const ftsCreate = `CREATE VIRTUAL TABLE IF NOT EXISTS "text" USING fts5(ns UNINDEXED, resource UNINDEXED, schema UNINDEXED, path UNINDEXED, body, tokenize = '` + ftsTokenizer + `')`
 
-const ftsCreate = `CREATE VIRTUAL TABLE IF NOT EXISTS "text" USING fts5(ns UNINDEXED, resource UNINDEXED, schema UNINDEXED, path UNINDEXED, body, tokenize = 'unicode61 remove_diacritics 2')`
+// ftsTokenizer is the text table's tokenizer, which query words are
+// tokenized with too (Index.ftsTokens). It has never changed.
+const ftsTokenizer = "unicode61 remove_diacritics 2"
 
 // The LIKE fallback, for SQLite builds without FTS5.
 var likeCreate = []string{
@@ -284,55 +319,86 @@ var likeCreate = []string{
 	`CREATE INDEX IF NOT EXISTS text_doc ON "text" (docid)`,
 }
 
-func (ix *Index) initSchema(ctx context.Context) error {
-	if !ix.opt.Rebuild {
-		// A database from before v0.44 has no refs table, so its documents'
-		// references were never collected (§A.2): replay it, as a rebuild.
-		var docs, refs int
-		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'docs'`).Scan(&docs); err != nil {
-			return err
-		}
-		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'refs'`).Scan(&refs); err != nil {
-			return err
-		}
-		if docs > 0 && refs == 0 {
-			ix.opt.Logf("index: the database predates reference indexing (§A.2); rebuilding it from the logs")
-			ix.opt.Rebuild = true
-		}
-		// Before v0.46 the sort table kept no value as written, and schema
-		// documents were not indexed: replay those too.
-		var noRaw int
-		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('sort') WHERE name = 'raw'`).Scan(&noRaw); err != nil {
-			return err
-		}
-		var haveSort int
-		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sort'`).Scan(&haveSort); err != nil {
-			return err
-		}
-		if haveSort > 0 && noRaw == 0 && !ix.opt.Rebuild {
-			ix.opt.Logf("index: the database predates sort values in hits and indexed schema documents (§A.4); rebuilding it from the logs")
-			ix.opt.Rebuild = true
-		}
-	}
-	if ix.opt.Rebuild {
-		for _, s := range dropStmts {
-			if _, err := ix.db.ExecContext(ctx, s); err != nil {
-				return fmt.Errorf("index: rebuild: %w", err)
-			}
-		}
-	}
-	if err := ix.cps.Init(ctx); err != nil {
+// reset runs resetStmts.
+func (ix *Index) reset(ctx context.Context) error {
+	tx, err := ix.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	for _, s := range createStmts {
-		if _, err := ix.db.ExecContext(ctx, s); err != nil {
-			return fmt.Errorf("index: schema: %w", err)
+	defer tx.Rollback()
+	for _, q := range resetStmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// indexFormat is the format of the rows, kept as the database's
+// user_version: 1 since v0.73, whose x-index values come from a static walk
+// (§A.2, valueWalk), whose sort rows hold each document's least value and
+// every value as written, booleans included, and whose counts go by string
+// form. A database of an older format is rebuilt (§A.6).
+const indexFormat = 1
+
+func (ix *Index) initSchema(ctx context.Context) error {
+	// What an existing database holds is read before the migrations bring
+	// its tables up to date: whether it has docs at all (none: a new
+	// database, with nothing to replay), and docs.epoch and ns_conf, which
+	// migrations 003 and 002 add.
+	var docs, epoch, conf int
+	if err := ix.db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'docs'),
+		(SELECT count(*) FROM pragma_table_info('docs') WHERE name = 'epoch'),
+		(SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ns_conf')`).Scan(&docs, &epoch, &conf); err != nil {
+		return err
+	}
+	if err := dbmigrate.Migrate(ctx, ix.db, migrations, "index"); err != nil {
+		return fmt.Errorf("index: schema: %w", err)
+	}
+	if !ix.opt.Rebuild {
+		// Before v0.73, x-index values were collected while validating, a
+		// sort row held one value, not the least, and booleans none: an
+		// older format is replayed (indexFormat).
+		var format int
+		if err := ix.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&format); err != nil {
+			return err
+		}
+		if docs > 0 && format < indexFormat {
+			ix.opt.Logf("index: the database predates the static x-index walk and sort order of v0.73 (§A.2); rebuilding it from the logs")
+			ix.opt.Rebuild = true
+		}
+		// Before docs.epoch, the rows of sealed and e2e namespaces don't
+		// say which epoch each head is served under, which their hits are
+		// sealed under (§E.2.6): replay those namespaces, as a rebuild.
+		// Otherwise the rows are kept, the column added.
+		if docs > 0 && epoch == 0 && !ix.opt.Rebuild {
+			protected := 1 // levels not recorded: any may be sealed
+			if conf > 0 {
+				if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM ns_conf WHERE level IN (?, ?)`, derived.LevelSealed, derived.LevelE2E).Scan(&protected); err != nil {
+					return err
+				}
+			}
+			if protected > 0 {
+				ix.opt.Logf("index: the database predates the epochs hits of sealed and e2e namespaces are sealed under (§E.2.6); rebuilding it from the logs")
+				ix.opt.Rebuild = true
+			}
 		}
 	}
 	if err := ix.sealed.Init(ctx); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
+	if err := ix.dropWholePublic(ctx); err != nil {
+		return fmt.Errorf("index: schema: %w", err)
+	}
 	if err := repurge.Init(ctx, ix.db); err != nil {
+		return fmt.Errorf("index: schema: %w", err)
+	}
+	if ix.opt.Rebuild {
+		if err := ix.reset(ctx); err != nil {
+			return fmt.Errorf("index: rebuild: %w", err)
+		}
+	}
+	if _, err := ix.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, indexFormat)); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
 	// An existing text table decides the mode; otherwise try FTS5.
@@ -359,6 +425,23 @@ func (ix *Index) initSchema(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// dropWholePublic drops stored results sealed whole at a public URL,
+// /{ns}/at/…, where the view's scope is its namespace (answer). Before
+// v0.73 a public sealed or e2e namespace's results were stored as one JWE
+// under K_e at the URLs they are sealed per entry at now, with counts
+// (ENC-33, §E.2.6: whole-response sealing only for a source that isn't
+// public); a stored view is keyed by its URL and the shape of the reader's
+// keys, so none of them may be served again, though the namespace's
+// checkpoint, which retires them, may not move for long. A database of an
+// older format is rebuilt anyway (indexFormat); this covers one written
+// since. No URL of the shapes of v0.73 matches: a public URL's results are
+// JSON, and a whole JWE's URL has /g/{gs}.
+func (ix *Index) dropWholePublic(ctx context.Context) error {
+	return ix.sealed.Drop(ctx, func(view, scope string, json bool) bool {
+		return !json && strings.HasPrefix(view, "/"+scope+"/at/")
+	})
 }
 
 func (ix *Index) loadState(ctx context.Context) error {
@@ -461,7 +544,13 @@ func (ix *Index) follow(ctx context.Context, ns string) {
 			}
 			err = fmt.Errorf("skipped: %s", reason)
 		} else {
-			err = follow.New(ix.c, ns, ix.cps, ix, opts...).Run(ctx)
+			err = ix.runFollower(ctx, ns, opts)
+			if _, lacks := ix.keys.Skip(ns); lacks && ctx.Err() == nil {
+				// Apply stopped it: a config change (a raise to e2e, an
+				// epoch) left the service without its keys. Decided as
+				// when it starts, at once.
+				continue
+			}
 		}
 		if ctx.Err() != nil {
 			return
@@ -484,11 +573,51 @@ func (ix *Index) follow(ctx context.Context, ns string) {
 	}
 }
 
+// followsRoot reports whether ns has a follower of its own (runFollower).
+func (ix *Index) followsRoot(ns string) bool {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	_, ok := ix.runs[ns]
+	return ok
+}
+
+// runFollower runs a follower of ns until it ends, or until Apply stops it
+// (stopRun).
+func (ix *Index) runFollower(ctx context.Context, ns string, opts []follow.Option) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ix.mu.Lock()
+	if ix.runs == nil {
+		ix.runs = map[string]context.CancelFunc{}
+	}
+	ix.runs[ns] = cancel
+	ix.mu.Unlock()
+	defer func() {
+		ix.mu.Lock()
+		delete(ix.runs, ns)
+		ix.mu.Unlock()
+	}()
+	return follow.New(ix.c, ns, ix.cps, ix, opts...).Run(ctx)
+}
+
+// stopRun stops the running follower of ns, reporting whether ns has one
+// (a branch a follower follows with its base has none of its own).
+func (ix *Index) stopRun(ns string) bool {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	cancel, ok := ix.runs[ns]
+	if ok {
+		cancel()
+	}
+	return ok
+}
+
 // prepared is one coalesced change with its fetched content, ready to write.
 type prepared struct {
 	resource string
 	remove   bool
 	head     string
+	epoch    int    // the epoch head is served under, 0 if not known or not sealed (derived.EpochOf)
 	schema   string // "" = untyped
 	typed    bool
 	rows     *docRows
@@ -500,9 +629,38 @@ type prepared struct {
 // transaction, so a batch entry is never half-applied (§10).
 func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	co := b.Coalesce()
+	config := false
 	for _, u := range b.Units {
 		if u.Config != nil {
 			ix.keys.Observe(b.NS, u.Config.Value)
+			config = true
+		}
+	}
+	root := ix.followsRoot(b.NS)
+	if _, lacks := ix.keys.Skip(b.NS); lacks && !root {
+		// A branch followed with its base whose keys the service lacks
+		// since a config change of it (below): not consumed, its queries
+		// 404. Its batches aren't applied: once the keys come, a restart
+		// resumes at the first.
+		return nil
+	}
+	if config {
+		// A raise (to e2e from none or at-rest, Addendum E Levels) or an
+		// epoch (a rotation, §E.2.4) whose keys the service lacks as
+		// configured: skipped as when its follower starts (queries are
+		// 404, §A.4, §E.2.6), and not followed, so nothing is consumed
+		// that can't be read or sealed. The batch isn't applied: once the
+		// keys come, a restart resumes at it. A branch followed with its
+		// base (-branches) has no follower of its own to stop: its batches
+		// are left unapplied from here on (above).
+		reason, lacks := ix.keys.Recheck(ctx, b.NS, false)
+		switch {
+		case lacks && root && ix.stopRun(b.NS):
+			ix.opt.Logf("index: skipping %s: %s", b.NS, reason)
+			return fmt.Errorf("index: %s skipped: %s", b.NS, reason)
+		case lacks && !root:
+			ix.opt.Logf("index: skipping branch %s: %s", b.NS, reason)
+			return nil
 		}
 	}
 	// Fetch FetchConcurrency documents at a time (one GET each), counting
@@ -559,22 +717,31 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 			return err
 		}
 	}
-	// §A.1, §A.4: a purge removes every cached result that shows the
-	// resource, through the r:{ns}/{name} tag each result carries per hit
-	// (and results with facet counts, which may aggregate it); a purge-ns
-	// removes every cached result and pointer of the namespace. Stored
-	// sealed results go by the same tags, in this transaction.
-	var tags []string
-	if co.PurgedNS {
-		tags = append(tags, "idx:"+b.NS, "ns:"+b.NS)
+	// §A.1, §A.4: a purge, of a resource or of the namespace, purges
+	// idx:{ns}, which every result of the namespace carries: results page
+	// by position, count facets over every hit and may show any document,
+	// so none may outlive a purge of one of them. It also purges
+	// r:{ns}/{name}, which /_refs answers showing the resource carry, and
+	// a purge-ns the namespace's pointers (ns:{ns}). So does a config
+	// entry on which §9 purges ns:{ns}, one making the namespace private
+	// or raising it to sealed or e2e: results computed before it, public
+	// or in the clear, must go. Kept results, stored sealed ones (in this
+	// transaction) and /_refs answers go by the same tags.
+	narrowed, err := ix.narrowed(ctx, tx, b)
+	if err != nil {
+		return err
 	}
+	var tags []string
 	for _, p := range preps {
 		if p.purged {
 			tags = append(tags, "r:"+b.NS+"/"+p.resource)
 		}
 	}
-	if len(tags) > 0 && !co.PurgedNS {
-		tags = append(tags, countsTag(b.NS))
+	if len(tags) > 0 || co.PurgedNS || narrowed {
+		tags = append(tags, "idx:"+b.NS)
+	}
+	if co.PurgedNS {
+		tags = append(tags, "ns:"+b.NS)
 	}
 	if err := ix.sealed.Purge(ctx, tx, tags); err != nil {
 		return err
@@ -590,7 +757,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	ix.refsPurged(ctx, b.NS, tags)
+	ix.refsPurged(ctx, b.NS, tags, co.PurgedNS)
 	if b.Partial() {
 		// A page of a snapshot later pages complete: the index doesn't
 		// reflect the namespace as of b.NewCheckpoint yet, so the
@@ -649,6 +816,54 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	return nil
 }
 
+// narrowed reports whether a config unit of b makes its namespace private
+// or raises it to sealed or e2e (§9), against the read mode and level the
+// index last applied (ns_conf), and records the last unit's, in tx. Before
+// the first it records, the namespace counts as public and unsealed, so
+// the first private or sealed document it applies counts too: once, at
+// the genesis of a namespace followed from the start, when nothing is
+// cached yet, and after an upgrade from a database without ns_conf, when
+// there may be.
+func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, b *follow.Batch) (bool, error) {
+	public, level, known := true, "", false
+	narrowed := false
+	for _, u := range b.Units {
+		if u.Config == nil {
+			continue
+		}
+		if !known {
+			err := tx.QueryRowContext(ctx, `SELECT public, level FROM ns_conf WHERE ns = ?`, b.NS).Scan(&public, &level)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return false, err
+			}
+			known = true
+		}
+		read, _ := u.Config.Value["read"].(string)
+		lv := derived.InfoOf(u.Config.Value).Level
+		if public && read != "public" || levelRank(lv) > levelRank(level) && derived.Protected(lv) {
+			narrowed = true
+		}
+		public, level = read == "public", lv
+	}
+	if !known {
+		return false, nil
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO ns_conf (ns, public, level) VALUES (?, ?, ?) ON CONFLICT (ns) DO UPDATE SET public = excluded.public, level = excluded.level`, b.NS, public, level)
+	return narrowed, err
+}
+
+// levelRank orders encryption levels as raises go (Addendum E): at rest
+// changes nothing a view shows.
+func levelRank(level string) int {
+	switch level {
+	case derived.LevelSealed:
+		return 1
+	case derived.LevelE2E:
+		return 2
+	}
+	return 0
+}
+
 // prepare fetches p.resource's document at revision id and extracts its
 // rows into p, holding one of the index's FetchConcurrency fetches.
 func (ix *Index) prepare(ctx context.Context, ns, id string, p *prepared) error {
@@ -667,7 +882,7 @@ func (ix *Index) prepare(ctx context.Context, ns, id string, p *prepared) error 
 		}
 		return err
 	}
-	p.head = doc.ID
+	p.head, p.epoch = doc.ID, derived.EpochOf(ns, doc.Kid)
 	p.schema, p.typed, p.rows, err = ix.extract(ctx, ns, p.resource, doc.Value)
 	return err
 }
@@ -721,15 +936,18 @@ func (ix *Index) write(ctx context.Context, tx *sql.Tx, ns string, p prepared) e
 		}
 		return err
 	}
-	var schemaCol any
+	var schemaCol, epochCol any
 	if p.schema != "" {
 		schemaCol = p.schema
 	}
+	if p.epoch > 0 {
+		epochCol = p.epoch
+	}
 	if found {
-		_, err = tx.ExecContext(ctx, `UPDATE docs SET head = ?, schema = ? WHERE docid = ?`, p.head, schemaCol, docid)
+		_, err = tx.ExecContext(ctx, `UPDATE docs SET head = ?, schema = ?, epoch = ? WHERE docid = ?`, p.head, schemaCol, epochCol, docid)
 	} else {
 		var res sql.Result
-		res, err = tx.ExecContext(ctx, `INSERT INTO docs (ns, resource, head, schema) VALUES (?, ?, ?, ?)`, ns, p.resource, p.head, schemaCol)
+		res, err = tx.ExecContext(ctx, `INSERT INTO docs (ns, resource, head, schema, epoch) VALUES (?, ?, ?, ?, ?)`, ns, p.resource, p.head, schemaCol, epochCol)
 		if err == nil {
 			docid, err = res.LastInsertId()
 		}

@@ -136,10 +136,9 @@ NS#<ns>                     BREF#<name>#<bid>#<fromPos12>       blob reference i
 NS#<ns>                     PEND#<bid>#<uploader>               pending blob upload (GSI2 on created for the sweep)
 NS#<ns>                     DEK#<name>                          resource data key (wrapped, keystore), at rest and sealed
 NS#<ns>                     #ENCRYPTING                         an encryption of existing content still to finish
-NS#<ns>                     EPOCHKEY#<n12>                      sealed epoch key (encrypted under the namespace's key), created
+NS#<ns>                     EPOCHKEY#<n12>                      epoch start (created); a sealed namespace's key, wrapped (e2e: none)
 NS#<ns>                     SEALED#<kind>#<key>                 sealed response (JWE), first stored wins; name, revPos
-NS#<ns>                     E2E#<n>                             e2e epoch registry row
-NS#<ns>                     E2ESNAP#<name>#<pos12>              e2e sealed snapshot (JWE)
+NS#<ns>                     E2ESNAP#<name>#<pos12>              e2e client-sealed snapshot at a pruning horizon (JWE)
 NS#<ns>                     BLOBEPOCH#<name>#<bid>#<n12>        sealed blob form per epoch: data | file (e/…), neither = 410 pruned
 NS#<ns>                     ARCH#<name>#<from12>#<to12>         pruning archive record (§8.6): key, url, created, bids
 NS#<ns>                     REG#<origin>#<branch>               registered remote branch (source side): atPos, nsPos, prevPos, expires
@@ -502,7 +501,7 @@ What landed, beyond the spike:
   carry (it only hands them back). What the backend doesn't store reads
   as empty where nothing of the kind can exist, and as **501
   "unsupported"** where a request needs a
-  feature it lacks (e2e keys) — so those refusals
+  feature it lacks — so those refusals
   are the reads', not hand-written checks. `gate_test.go` guards the
   embedding that makes this work on SQL (a read missing on `*tx` would
   compile and recurse).
@@ -588,17 +587,15 @@ What landed, beyond the spike:
   resources, grants, blobs, schemas, branches, sealed). A feature the
   backend lacks is its `lacks` 501, asked by the Engine method before
   anything else; everything the server can reach so answers 501 rather
-  than falling through to SQL:
-  e2e. Refused configurations (`"encryption": {"level": "e2e"}`,
-  `successor`) are 501 at create and change time, as
-  §10 prescribes ("refuse at Open or at namespace-config time").
+  than falling through to SQL. What remains refused is the SQL write
+  path's hooks (at Open) and mirroring a schema revision a remote base
+  pruned.
 - **One read path.** The serving reads (`ResourceHead/Raw/Rev/Log`,
   `NamespaceHead/Rev/Log/Heads`, the events and the long-poll) are the
   SQL path's own code on the gate, as the writes' checks are, over a few
   more reads: `nsLogRows` and `revsBetween` (a log's or a resource's
   range, visited so a page stops where its bytes say), `entryConfig`,
-  `resState`, `prunedIn`, and the sealed ones (below); the e2e ones
-  DynamoDB answers 501. On the table: revisions fold from the genesis (snapshots
+  `resState`, `prunedIn`, and the sealed and e2e ones (below). On the table: revisions fold from the genesis (snapshots
   are a later phase), `…/rev/{nsID}` joins the entry's denormalized
   `cfgPos`, a head as of an earlier entry comes from the history rows
   (`HeadAt`). DynamoDB's log and revision handles keep their positions'
@@ -742,7 +739,8 @@ What landed, beyond the spike:
   The storage side of following, registering and notices is the
   backend's (`remoteBases`, `followed`, `registered`, `remoteNotices`).
   Sealed bases are mirrored sealed (each shadow's content under its
-  own data keys); e2e bases are 501.
+  own data keys); an e2e level's shadow keeps its ciphertext, declared
+  blobs and epochs, as SQL's does.
 - **Encryption at rest** (§E.1). `core.Open` takes a `KeyStore` and
   checks it against the keys the table holds. The store holds no keys:
   core encrypts what it writes (`Commit.Seal`: patch sets, head and
@@ -771,7 +769,18 @@ What landed, beyond the spike:
   `BLOBEPOCH#` item, inline or a file under `e/`, stored put-if-absent
   on first read. A prune marks the epochs it stops serving (410), a
   restore clears the marks, an ended attachment or purge deletes the
-  sealings. e2e namespaces (§E.3) are 501.
+  sealings.
+- **E2E namespaces** (§E.3). The gate's checks (sealed ops, kids,
+  declared blobs, the keyring, blind rules) and the keys relay are the
+  SQL path's, over the reads `e2eEpochOK`, `declaredAt`, `e2eSnapshot`
+  and `e2eFoldSince`. An epoch's start is an `EPOCHKEY#` item without
+  a key, written by the commit that begins it, as a sealed one's. An
+  e2e revision keeps its sealed patch set and its declared blobs (REV
+  `declared`, standing in for `blob_refs`), and its resource no head
+  document. A prune (`checkE2EPrune`, split out of SQL's
+  `pruneToE2E`) archives first and records the client-sealed snapshot
+  (`E2ESNAP#`) in its commit; the patch sets below, earlier snapshots
+  and the attachments no declared list keeps go after it.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the
@@ -817,13 +826,12 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,320 top-level tests (pure unit tests included): 1,239 pass on
-DynamoDB and 81 skip — 37 as unsupported (33 e2e namespaces, 4 the SQL
-write path's hooks), the rest on their own conditions (Postgres-only
-tests, mostly).
+1,320 top-level tests (pure unit tests included): 1,278 pass on
+DynamoDB and 42 skip — 5 as unsupported (the SQL write path's hooks),
+the rest on their own conditions (Postgres-only tests, mostly).
 The known list is empty: no test answers differently from the SQL
 backends. A test that skips partway has asserted everything before
-its skip, so the phase-1 surface is covered beyond the 1,239.
+its skip, so the covered surface reaches beyond the 1,278.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on

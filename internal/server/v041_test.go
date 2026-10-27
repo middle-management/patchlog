@@ -276,14 +276,14 @@ func TestV041Grants(t *testing.T) {
 	m := r.Obj()
 	dg, _ := grant.Decode(g, 0)
 	root, _ := m["root"].(map[string]any)
-	stored, _ := m["stored"].([]any)
-	if m["id"] != gid || root["sub"] != "user:alice" || root["kid"] != "issuer" || len(stored) != 1 {
+	stored, _ := m["stored"].(string) // one string since v0.73 (§C.3.1)
+	if m["id"] != gid || root["sub"] != "user:alice" || root["kid"] != "issuer" || stored == "" {
 		t.Fatalf("grant %s", r.Body)
 	}
 	if string(canonical(root)) != string(canonical(dg.Blocks[0].Raw)) {
 		t.Fatalf("root %v", root)
 	}
-	sb, err := base64.RawURLEncoding.DecodeString(stored[0].(string))
+	sb, err := base64.RawURLEncoding.DecodeString(stored)
 	if err != nil || string(sb) != string(dg.SignedBlocks()[0]) {
 		t.Fatalf("stored %v %v", stored, err)
 	}
@@ -291,9 +291,9 @@ func TestV041Grants(t *testing.T) {
 	if le := e.lastLog("sec", "a", a0, g); le["grant"].(map[string]any)["id"] != gid {
 		t.Fatalf("log %v", le)
 	}
-	// A grant not recorded here, or a malformed id: 404.
+	// A grant not recorded here: 404; a malformed id: 400 (§7).
 	expectCode(t, e.get("/ns/sec/grants/"+grantIDOf(t, f.svcGrant(e)), f.adminG), 404, "not_found")
-	expect(t, e.get("/ns/sec/grants/nope", f.adminG), 404)
+	expectCode(t, e.get("/ns/sec/grants/nope", f.adminG), 400, "bad_input")
 	// It needs read.
 	expect(t, e.get("/ns/sec/grants/"+gid), 401)
 

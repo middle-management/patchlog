@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/rules"
 )
 
 // Edge grants (§C.5.2, §9).
@@ -18,13 +19,14 @@ import (
 // to a finite set of names, else /r/{ns} and /ns/{ns}. The edge evaluates
 // no rules, so the grant's blocks and its key's scope may refer to
 // /resource only to fix it, and never to /now. A grant with roles needs a
-// role that lists read and qualifies: its rules refer to neither
-// /resource nor /now. Roles are alternatives, so one is enough; a role
-// whose rules test /resource doesn't qualify, even when the blocks fix
-// it. The rules that remain, over /principal and /action, are constant
-// for the edge grant's reads, and must pass here, for each name fixed.
-// Anything else is 403, as are "*" and a grant without read in a
-// namespace it names.
+// qualifying role (§2.1): one that lists read, whose rules don't refer to
+// /now, refer to /resource only if the grant fixes it, and pass now for
+// each name fixed, or once if none is. Roles are alternatives, so one is
+// enough. The rules that remain, over /principal and /action, are
+// constant for the edge grant's reads, and must pass here, for each name
+// fixed. Anything else is 403, as is a grant without read in a namespace
+// it names. A grant naming "*" is 401: from a namespace key it is
+// invalid, and an operator grant authorises nothing here (§C.4).
 //
 // The answer is all or nothing across every grant: a namespace that
 // doesn't exist, is purged or refuses a grant refuses the request, 401 if
@@ -108,8 +110,8 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 	gs := make([]*grant.Grant, len(bearers))
 	bad := make([]*Error, len(bearers))
 	for i, b := range bearers {
-		g, err := grant.Decode(b, e.opt.Maximums.GrantSize)
-		if e := grantTooLarge(err); e != nil {
+		g, err := grant.DecodeLimited(b, e.grantLimits())
+		if e := grantLimit(err); e != nil {
 			return nil, e
 		}
 		if err != nil {
@@ -228,7 +230,9 @@ func (t *gate) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) 
 		var iss *edgeIssue
 		switch {
 		case ns == "*":
-			err = forbidden(`edge grants are issued per namespace; a grant naming "*" gets none (§C.5.2)`)
+			// Valid only from an operator key, whose grants authorise no
+			// read: 401 either way (§C.4).
+			err = apiErr(401, "unauthenticated", "message", `a grant naming "*" is an operator grant or invalid, and authorises no edge grant (§C.4, §C.5.2)`)
 		case !g.NamesNS(ns):
 			continue // a narrowing block leaves it out
 		default:
@@ -307,21 +311,22 @@ func (t *gate) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssu
 	if a.verified.HasRoles() {
 		var q []string
 		for _, r := range roles {
-			if edgeRole(a.verified.RoleRules(r)) {
+			if t.qualifies(a, a.verified.RoleRules(r), names) {
 				q = append(q, r)
 			}
 		}
 		if len(q) == 0 {
-			return nil, forbidden("no role of the grant that allows read qualifies for an edge grant: each has a rule referring to /resource or /now (§2.1): " + ns)
+			return nil, forbidden("no role of the grant that allows read qualifies for an edge grant: each has a rule referring to /now, or to /resource without the grant fixing it, or failing now for a name it fixes (§2.1): " + ns)
 		}
 		roles = q
 	}
 	// The blocks, the key scope and one qualifying role must pass now, for
 	// the principal and each name fixed: they decide every read under the
-	// prefix alike. Only the rules fixing /resource refer to it, and each
-	// name fixed passes every one of them, so the first stands for all:
-	// testing each would cost the square of their number, which the cap,
-	// coming after, no longer bounds (§C.5).
+	// prefix alike. The roles in roles passed for every name (qualifies).
+	// Of the blocks and key scope, only the rules fixing /resource refer
+	// to it, and each name fixed passes every one of them, so the first
+	// stands for all: testing each would cost the square of their number,
+	// which the cap, coming after, no longer bounds (§C.5).
 	first := ""
 	if names != nil {
 		first = names[0]
@@ -340,17 +345,44 @@ func (t *gate) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssu
 	return &edgeIssue{names: names, bucket: a.bucketKey}, nil
 }
 
-// edgeRole reports whether a role's rules qualify it for an edge grant
-// (§2.1 Qualifying role, §C.5.2): none refers to /resource, /now or the
-// whole envelope.
-func edgeRole(rules []any) bool {
-	for _, rv := range rules {
+// qualifies reports whether an effective role listing read, with rules
+// rs, is a qualifying role of a's grant (§2.1, §C.5.2, v0.65, v0.71): none
+// of its rules refers to /now or the whole envelope, one refers to
+// /resource only if the grant fixes it (names, nil for none), and they
+// pass now against a read envelope for the principal with /resource set
+// to each name fixed, or once if none is. A rule that doesn't refer to
+// /resource gives the same for every name, so only those that do are
+// evaluated per name.
+func (t *gate) qualifies(a *actor, rs []any, names []string) bool {
+	var once, each []*rules.Rule
+	for _, rv := range rs {
 		r, err := compileCached(rv)
 		if err != nil {
 			return false
 		}
-		if refs := r.Refs(); refs["resource"] || refs["now"] || refs["*"] {
+		switch refs := r.Refs(); {
+		case refs["now"] || refs["*"] || refs["resource"] && names == nil:
 			return false
+		case refs["resource"]:
+			each = append(each, r)
+		default:
+			once = append(once, r)
+		}
+	}
+	first := ""
+	if names != nil {
+		first = names[0]
+	}
+	for i, name := range append([]string{first}, names...) {
+		env := t.basicEnvelope("read", name, a)
+		list := each
+		if i == 0 {
+			list = once
+		}
+		for _, r := range list {
+			if !r.Eval(env) {
+				return false
+			}
 		}
 	}
 	return true

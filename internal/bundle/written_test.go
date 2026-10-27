@@ -428,7 +428,7 @@ func TestE2ENamespaceGrantsExport(t *testing.T) {
 		"keys": []any{nsKey.Entry("create", "append", "delete", "read")}})
 	reader := identity(t)
 	k1 := seal.NewKey()
-	kr := must(seal.BuildKeyring("e", 1, k1, []*ecdh.PublicKey{reader.PublicKey()}))
+	kr := must(seal.BuildKeyringV2(reader, "e", 1, k1, []*ecdh.PublicKey{reader.PublicKey()}))
 	src.create("e", "keyring", kr.Value())
 	d0 := e2eWrite(t, src, k1, "e#1", "e", "d", "", client.GenesisPatches(map[string]any{"v": marker}))
 

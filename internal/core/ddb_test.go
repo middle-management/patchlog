@@ -104,10 +104,10 @@ func TestDDBGateAnswers(t *testing.T) {
 	_, err = e.WriteResource(ctx, Request{NS: "ruled"}, Item{Resource: "d", IfMatch: w.Items[0].IDs[0], Steps: []Step{{Patches: patches(t, `[{"op":"add","path":"/m","value":2}]`)}}})
 	assertStatus(t, err, 422, "rule")
 
-	// Limits: 413 on the document.
+	// Limits: a patch set over documentSize is 422 limit (§6.6).
 	ddbCreateNS(t, e, "small", `{"read":"public","limits":{"documentSize":8}}`)
 	_, err = e.WriteResource(ctx, Request{NS: "small"}, Item{Resource: "d", IfNoneMatch: true, Steps: []Step{{Patches: patches(t, `[{"op":"add","path":"","value":{"long":true}}]`)}}})
-	assertStatus(t, err, 413, "limit")
+	assertStatus(t, err, 422, "limit")
 
 	// If-Match on the configuration: 412.
 	_, err = e.WriteConfig(ctx, Request{NS: "fz"}, ConfigChange{IfMatch: c.ConfigID + "x", Patches: patches(t, `[{"op":"add","path":"/x","value":1}]`)})
@@ -124,7 +124,7 @@ func TestDDBUnsupported(t *testing.T) {
 	ddbCreateNS(t, e, "demo", `{"read":"public"}`)
 
 	// Without a key store, encrypted namespaces are refused at creation,
-	// as on SQL: 422. With one, e2e namespaces are 501 (TestDDBAtRest).
+	// as on SQL: 422.
 	_, err := e.WriteConfig(ctx, Request{NS: "enc"}, ConfigChange{IfNoneMatch: true, Patches: patches(t, `[{"op":"add","path":"","value":{"encryption":{"level":"sealed"}}}]`)})
 	assertStatus(t, err, 422, "invalid")
 }
@@ -181,10 +181,6 @@ func TestDDBAtRest(t *testing.T) {
 	}
 	t.Cleanup(func() { e.Close() })
 	ctx := context.Background()
-	_, err = e.WriteConfig(ctx, Request{NS: "e2e"}, ConfigChange{IfNoneMatch: true, Patches: patches(t, `[{"op":"add","path":"","value":{"encryption":{"level":"e2e"}}}]`)})
-	if ae, ok := err.(*Error); !ok || ae.Status != 501 || !strings.Contains(err.Error(), "unsupported") {
-		t.Fatalf("e2e namespace: want 501 unsupported, got %v", err)
-	}
 	const marker = "plaintext-marker-1234"
 	write := func(ns, name, ifMatch, p string) string {
 		t.Helper()

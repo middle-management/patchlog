@@ -225,6 +225,9 @@ func (r *ddbReads) revRowOf(ns string, ri *ddb.RevInfo) *revRow {
 		r.must(err)
 		row.grantID = gid[:]
 	}
+	if ri.Via != "" {
+		row.via.String, row.via.Valid = ri.Via, true
+	}
 	ref.row = row
 	return row
 }
@@ -294,6 +297,9 @@ func (r *ddbReads) branchesOf(n *nsRow) []*nsRow {
 	}
 	return out
 }
+
+// localIdentity: a local base's name (baseIdentity).
+func (r *ddbReads) localIdentity(n *nsRow) string { return n.name }
 
 // baseIdentity names a branch's base: its name, which a deployment never
 // reuses, or a remote base's origin and name.
@@ -488,14 +494,14 @@ func (r *ddbReads) configEntryGestures(seq int64) (string, bool) {
 	return "", false
 }
 
-func (r *ddbReads) batchEntry(n *nsRow, seq, author int64) (ids.ID, string, bool) {
+func (r *ddbReads) batchEntry(n *nsRow, seq, author int64) (ids.ID, string, []byte, bool) {
 	le := r.entry(seq)
 	if le == nil || le.Kind != "batch" || le.Author != r.authors[author] {
-		return ids.ID{}, "", false
+		return ids.ID{}, "", nil, false
 	}
 	id, err := ids.Parse(le.ID)
 	r.must(err)
-	return id, le.Body, true
+	return id, le.Body, r.entryGrantID(seq), true
 }
 
 // --- resources and revisions ---
@@ -510,11 +516,11 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 		// No entries: a handle still, for the resource's pending blobs
 		// (an upload precedes the create that references it), as the
 		// SQL schema's resource row without a head (ensureResource).
-		v.own = &resRow{id: rh, name: name}
+		v.own = &resRow{id: rh, ns: n.id, name: name}
 		return r.readThrough(n, v)
 	}
 	r.resRows[rh] = rr
-	own := &resRow{id: rh, name: name, state: stateLive}
+	own := &resRow{id: rh, ns: n.id, name: name, state: stateLive}
 	v.own, v.src = own, own
 	headPos := rr.HeadPos
 	switch {
@@ -730,7 +736,6 @@ func (r *ddbReads) referencedUpTo(res, max int64, bid ids.ID) bool {
 	r.must(err)
 	return b != nil && b.RefPos > 0 && b.RefPos <= r.revs[max].key.pos
 }
-func (r *ddbReads) declaredAt(row *revRow) []ids.ID { panic(ddbUnsupported("e2e namespaces")) }
 
 // dek: the grants key for grantsDEK, else the resource's.
 func (r *ddbReads) dek(res int64, create bool) []byte {
@@ -744,9 +749,6 @@ func (r *ddbReads) dek(res int64, create bool) []byte {
 	}
 	r.must(err)
 	return k
-}
-func (r *ddbReads) e2eEpochOK(n *nsRow, cfg *Config, e int) bool {
-	panic(ddbUnsupported("sealed namespaces"))
 }
 
 // --- grants ---
@@ -816,11 +818,16 @@ func ddbCheck[T any](f func() T) (out T, err error) {
 		}
 		var ce *Error
 		var de *ddb.Error
+		var need *errNeedSource
 		switch v := p.(type) {
 		case *Error:
 			err = v
 		case error:
-			if errors.As(v, &ce) {
+			if errors.As(v, &need) {
+				// The write runs again with the base's document
+				// (withRemoteSource).
+				err = need
+			} else if errors.As(v, &ce) {
 				err = ce
 			} else if errors.As(v, &de) {
 				err = ddbAsErr(de)
@@ -1040,6 +1047,9 @@ func (r *ddbReads) nsLogRows(n *nsRow, from, to int64, limit int, visit func(nsL
 		if le.NoAuth {
 			row.noAuth.Int64, row.noAuth.Valid = 1, true
 		}
+		if le.Via != "" {
+			row.via.String, row.via.Valid = le.Via, true
+		}
 		// The members ns_log.gestures holds (gestureMeta, batchGestures).
 		var meta map[string]any
 		switch {
@@ -1077,9 +1087,6 @@ func (r *ddbReads) entryConfig(seq int64) (int64, string) {
 	h := r.cfgHandle(k.ns, le.CfgPos)
 	return h, string(jsonv.Canonical(r.cfgRow(h).Doc))
 }
-
-func (r *ddbReads) e2eSnapshot(row *revRow) string  { panic(ddbUnsupported("e2e namespaces")) }
-func (r *ddbReads) e2eFoldSince(row *revRow) string { panic(ddbUnsupported("e2e namespaces")) }
 
 func (r *ddbReads) allNamespaces() []*nsRow {
 	var out []*nsRow
@@ -1189,6 +1196,9 @@ func (r *ddbReads) retainedNames(n *nsRow) []string {
 // stand in for blob_refs.
 func (r *ddbReads) archivedBlobs(res, fromSeq, lastSeq int64) map[int64][]ids.ID {
 	k := r.res[res]
+	if n := r.nsByName(k.ns); n != nil && k.name != KeyringName && r.nsLevel(n) == levelE2E {
+		return r.archivedDeclared(k, fromSeq, lastSeq)
+	}
 	out := map[int64][]ids.ID{}
 	seen := map[ids.ID]bool{}
 	r.must(r.s.EachDocIn(r.ctx, k.ns, k.name, r.revs[fromSeq].key.pos, r.revs[lastSeq].key.pos, func(pos uint64, doc any) error {
@@ -1235,18 +1245,6 @@ func (r *ddbReads) firstEntryCreated() (int64, bool) {
 	ms, ok, err := r.s.FirstEntryTime(r.ctx)
 	r.must(err)
 	return ms, ok
-}
-
-// archiveSealer: nothing is encrypted at rest here.
-// archiveSealer: an archive of a resource encrypted at rest is sealed
-// with a key derived from its data key (archiveSealer of crypt.go).
-func (r *ddbReads) archiveSealer(res int64) func(io.Writer) (io.WriteCloser, error) {
-	rf := r.res[res]
-	if n := r.nsByName(rf.ns); n == nil || r.nsLevel(n) < levelAtRest {
-		return nil
-	}
-	dek := r.dek(res, true)
-	return func(w io.Writer) (io.WriteCloser, error) { return sealArchive(w, dek) }
 }
 
 // --- gestures ---

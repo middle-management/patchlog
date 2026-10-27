@@ -89,7 +89,9 @@ func TestSealedCatalog(t *testing.T) {
 
 	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat", "matches"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
 	opts := svcOpts{now: s.Now, db: filepath.Join(t.TempDir(), "tree.db")}
-	x := startSvc(t, sc, opts)
+	// The reader restricted to some catalog resources reads a subject
+	// set's listings, which need a RoleView (§B.11.5).
+	x := startSvc(t, sc, opts, withScopeView)
 	x.caughtUp("cat", "matches")
 
 	epoch := map[string][]byte{}
@@ -173,7 +175,7 @@ func TestSealedCatalog(t *testing.T) {
 		t.Fatalf("stored view tags %q", tags)
 	}
 	x.stop()
-	x = startSvc(t, sc, opts)
+	x = startSvc(t, sc, opts, withScopeView)
 	x.caughtUp("cat", "matches")
 	if again := x.fetch(f.path, full); string(again.body) != string(f.body) {
 		t.Fatal("resealed after a restart")
@@ -207,7 +209,9 @@ func TestSealedCatalog(t *testing.T) {
 }
 
 // An e2e catalog is not consumed without a keyring recipient key: listings
-// answer 503 and /_status says why.
+// answer 404, as for a catalog the service doesn't serve (§12.1 has no
+// "skipped": the index answers a namespace it lacks keys for so, §A.4,
+// §E.2.6), and /_status says why.
 func TestE2ECatalogSkipped(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -227,7 +231,7 @@ func TestE2ECatalogSkipped(t *testing.T) {
 	if st["level"] != "e2e" || !strings.Contains(fmt.Sprint(st["reason"]), "keyring recipient") {
 		t.Fatalf("status %v", st)
 	}
-	if r := x.raw("/cat/roots", ""); r.status != 503 || r.body["code"] != "skipped" {
+	if r := x.raw("/cat/roots", ""); r.status != 404 || r.body["code"] != "not_found" {
 		t.Fatalf("roots: %d %v", r.status, r.body)
 	}
 	if x.s.Checkpoint("cat") != "" {

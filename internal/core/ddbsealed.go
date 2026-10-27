@@ -58,9 +58,15 @@ func (b *ddbBackend) epochKeyFor(ctx context.Context, ns string, epoch int) ([]b
 // beginsEpoch is the key of the epoch a namespace document cfg of ns
 // begins (sealedConfigWritten of sealed.go), old being the one before
 // (nil for a new namespace): nil if it begins none.
+//
+// An e2e namespace's epoch has no key here (§E.3): its item records only
+// when the epoch began (e2eConfigWritten of e2e.go).
 func (b *ddbBackend) beginsEpoch(ctx context.Context, ns string, old, cfg *Config) (*ddb.EpochKey, error) {
-	if cfg.level != levelSealed || old != nil && old.level == levelSealed && old.Epoch == cfg.Epoch {
+	if cfg.level != levelSealed && cfg.level != levelE2E || old != nil && old.level == cfg.level && old.Epoch == cfg.Epoch {
 		return nil, nil
+	}
+	if cfg.level == levelE2E {
+		return &ddb.EpochKey{Epoch: cfg.Epoch}, nil
 	}
 	ks := b.e.opt.KeyStore
 	if ks == nil {
@@ -109,7 +115,8 @@ func (r *ddbReads) stored(n *nsRow, j *sealJob) bool {
 // revEpoch is the epoch sealing a revision as n serves it: the one it was
 // written in, if n's own; else that of its first stored sealing; else n's
 // current (revEpoch of sealed.go).
-func (r *ddbReads) revEpoch(n *nsRow, name string, row *revRow) int {
+func (r *ddbReads) revEpoch(n *nsRow, row *revRow) int {
+	name := r.revs[row.seq].key.name
 	ns := r.nsName(n.id)
 	k := r.revs[row.seq].key
 	if k.ns == ns {
@@ -148,7 +155,7 @@ func (r *ddbReads) resJob(n *nsRow, name string, row *revRow, kind string, plain
 			plKind = seal.KindTombstone
 		}
 	}
-	e := r.revEpoch(n, name, row)
+	e := r.revEpoch(n, row)
 	kr, err := seal.ResourceKey(r.epochKey(n.id, e), n.name, name)
 	r.must(err)
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), kr, seal.ResourcePL(n.name, name, row.id.String(), plKind), plain()
@@ -176,10 +183,8 @@ func (r *ddbReads) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
 }
 
 // epochStarts: n's epoch keys, which record when each epoch began.
+// An e2e namespace's (e2e_epochs) are the same items, without keys.
 func (r *ddbReads) epochStarts(table string, ns int64, max int) []epochStart {
-	if table != `epoch_keys` {
-		panic(ddbUnsupported("e2e namespaces"))
-	}
 	ks, err := r.s.EpochKeys(r.ctx, r.nsName(ns))
 	r.must(err)
 	var out []epochStart
@@ -191,9 +196,9 @@ func (r *ddbReads) epochStarts(table string, ns int64, max int) []epochStart {
 	return out
 }
 
-func (r *ddbReads) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error) {
-	panic(ddbUnsupported("e2e namespaces"))
-}
+// rotationDue: the table records no due rotations yet; a rotation after a
+// revocation runs as it did before (rotations_due of sealed.go).
+func (r *ddbReads) rotationDue(n *nsRow) bool { return true }
 
 // --- writes ---
 
@@ -226,7 +231,7 @@ func (b *ddbBackend) storeSealed(ctx context.Context, ns string, jobs []*sealJob
 
 // rotateEpoch is RotateEpoch on the table: planRotation's config change,
 // committed with its epoch's key.
-func (b *ddbBackend) rotateEpoch(ctx context.Context, ns, author string) (int, error) {
+func (b *ddbBackend) rotateEpoch(ctx context.Context, ns, author string, ifDue bool) (int, bool, error) {
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
 		r := newDDBReads(b, ctx)
 		g := &gate{checkReads: r, checkState: &checkState{e: b.e, now: b.e.now(), write: true}}
@@ -237,21 +242,23 @@ func (b *ddbBackend) rotateEpoch(ctx context.Context, ns, author string) (int, e
 			err error
 		}
 		out, perr := ddbCheck(func() planned {
-			n, _, p, err := g.planRotation(ns, author)
-			if err != nil {
+			n, _, p, err := g.planRotation(ns, author, ifDue)
+			if err != nil || p == nil {
 				return planned{err: err}
 			}
 			return planned{n, g.config(n.configSeq), p, nil}
 		})
 		switch {
 		case perr != nil:
-			return 0, perr
+			return 0, false, perr
 		case out.err != nil:
-			return 0, out.err
+			return 0, false, out.err
+		case out.p == nil:
+			return 0, false, nil // not due
 		}
 		ek, err := b.beginsEpoch(ctx, ns, out.cur, out.p.cfg)
 		if err != nil {
-			return 0, asErrOrNil(err)
+			return 0, false, asErrOrNil(err)
 		}
 		p := out.p
 		c := &ddb.Commit{NS: ns, Author: author, Created: g.now.UnixMilli(),
@@ -264,11 +271,11 @@ func (b *ddbBackend) rotateEpoch(ctx context.Context, ns, author string) (int, e
 			continue
 		}
 		if err != nil {
-			return 0, ddbAsErr(err)
+			return 0, false, ddbAsErr(err)
 		}
-		return p.cfg.Epoch, nil
+		return p.cfg.Epoch, true, nil
 	}
-	return 0, apiErr(409, "conflict", "detail", "the namespace's configuration kept moving")
+	return 0, false, apiErr(409, "conflict", "detail", "the namespace's configuration kept moving")
 }
 
 // checkEpochKeys is checkEpochKeys of sealed.go on the table: one stored

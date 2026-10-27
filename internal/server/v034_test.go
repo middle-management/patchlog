@@ -215,10 +215,12 @@ func TestV034ForcedPurge(t *testing.T) {
 			t.Fatalf("%s: forced purge entry %v", x.ns, en)
 		}
 	}
-	// A purge nothing refuses isn't forced, ?force=1 or not.
+	// A purge nothing refuses isn't forced, ?force=1 or not; a grant that
+	// can't force gets 403 for ?force=1 all the same (§6.1, v0.62).
 	t2 := e.create("schemas", "free", teamSchema("z"), sAdmin)
 	before = e.nsHead("schemas", sAdmin)
-	expect(t, e.do(req{method: "POST", path: "/r/schemas/free/purge?force=1", ifMatch: t2, bearer: sAdmin}), 204)
+	expectCode(t, e.do(req{method: "POST", path: "/r/schemas/free/purge?force=1", ifMatch: t2, bearer: sAdmin}), 403, "forbidden")
+	expect(t, e.do(req{method: "POST", path: "/r/schemas/free/purge?force=1", ifMatch: t2, bearer: op}), 204)
 	lg := e.get("/ns/schemas/rev/"+e.nsHead("schemas", sAdmin)+"/log?since="+before, sAdmin).Arr()
 	if en := lg[0].(map[string]any); en["forced"] != nil {
 		t.Fatalf("an unrefused purge says forced: %v", en)

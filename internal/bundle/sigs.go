@@ -268,24 +268,16 @@ func (v *SigVerifier) history(l *Line) {
 }
 
 // storedContainer rebuilds the Biscuit container of a grant line's stored
-// blocks, without proof: the authority block is field 2 of the container,
-// the others field 3 (§C.8).
-func storedContainer(stored []string) ([]byte, error) {
-	var out []byte
-	for i, s := range stored {
-		raw, err := base64.RawURLEncoding.Strict().DecodeString(s)
-		if err != nil {
-			return nil, fmt.Errorf("stored[%d] is not base64url without padding", i)
-		}
-		field := byte(3)
-		if i == 0 {
-			field = 2
-		}
-		out = append(out, field<<3|2)
-		out = binary.AppendUvarint(out, uint64(len(raw)))
-		out = append(out, raw...)
+// authority block, without proof: the authority block is field 2 of the
+// container (§C.8).
+func storedContainer(stored string) ([]byte, error) {
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(stored)
+	if err != nil {
+		return nil, fmt.Errorf("stored is not base64url without padding")
 	}
-	return out, nil
+	out := []byte{2<<3 | 2}
+	out = binary.AppendUvarint(out, uint64(len(raw)))
+	return append(out, raw...), nil
 }
 
 // checkGrantLine checks a grant line as §C.3.1 has a verifier do: the
@@ -342,10 +334,9 @@ func checkGrantLine(l *Line) *grantState {
 	return gs
 }
 
-// parseStoredGrant decodes the stored blocks of a grant: the structure and
-// the chain's signatures after the authority block, not the authority
-// block's, which needs the key.
-func parseStoredGrant(stored []string) (*grant.Grant, error) {
+// parseStoredGrant decodes the stored authority block of a grant: its
+// structure, not its signature, which needs the key.
+func parseStoredGrant(stored string) (*grant.Grant, error) {
 	data, err := storedContainer(stored)
 	if err != nil {
 		return nil, err

@@ -181,12 +181,12 @@ func (t *gate) planRegistration(req Request, rr RemoteRegistration) (*regPlan, *
 		return &RegistrationResult{Status: 200, NSID: t.nsLogID(row.nsSeq).String(), Origin: rr.Origin, NS: rr.NS,
 			At: t.nsLogID(row.atSeq).String(), Expires: time.UnixMilli(row.expires).UTC()}
 	}
+	// A 412 names the registration's latest entry as head, and leaves
+	// head out when there is none (§12.1).
 	stale := func() *Error {
 		e := apiErr(412, "stale")
 		if row != nil {
 			e.Body["head"] = t.nsLogID(row.nsSeq).String()
-		} else {
-			e.Body["head"] = nil
 		}
 		return e
 	}
@@ -195,10 +195,10 @@ func (t *gate) planRegistration(req Request, rr RemoteRegistration) (*regPlan, *
 		return nil, nil, badInput("both If-Match and If-None-Match")
 	case rr.IfNoneMatch:
 		if row != nil && row.expires > now {
-			// A retry of the request that wrote the latest entry: same
-			// principal and at, within the retry window (§7.2).
-			au, created := t.entryBy(row.nsSeq)
-			if au == author && row.atSeq == atSeq && now-created <= cfg.Limits.RetryWindow.Milliseconds() {
+			// A retry of the request that wrote the latest entry: the same
+			// principal and at, for as long as the registration is
+			// unexpired, with no other bound (§G.3).
+			if row.atSeq == atSeq && t.samePrincipal(row.nsSeq, a, author) {
 				return nil, latest(), nil
 			}
 			return nil, nil, stale()
@@ -209,11 +209,11 @@ func (t *gate) planRegistration(req Request, rr RemoteRegistration) (*regPlan, *
 		}
 		if rr.IfMatch != t.nsLogID(row.nsSeq).String() {
 			// A retry by the same principal whose If-Match names the entry
-			// before the latest gets the latest.
-			if row.prevSeq.Valid && rr.IfMatch == t.nsLogID(row.prevSeq.Int64).String() && row.atSeq == atSeq {
-				if au, _ := t.entryBy(row.nsSeq); au == author {
-					return nil, latest(), nil
-				}
+			// before the latest gets the latest, while the registration is
+			// unexpired (§G.3).
+			if row.prevSeq.Valid && rr.IfMatch == t.nsLogID(row.prevSeq.Int64).String() && row.atSeq == atSeq &&
+				row.expires > now && t.samePrincipal(row.nsSeq, a, author) {
+				return nil, latest(), nil
 			}
 			return nil, nil, stale()
 		}
@@ -233,6 +233,34 @@ func (t *gate) planRegistration(req Request, rr RemoteRegistration) (*regPlan, *
 	// Step 7.
 	entry := map[string]any{"kind": "branch", "remote": map[string]any{"origin": rr.Origin, "ns": rr.NS}, "at": atID.String()}
 	return &regPlan{n: n, a: a, rr: rr, atSeq: atSeq, atID: atID, row: row, entry: entry, expires: t.now.Add(cfg.Limits.RemoteRegistration)}, nil, nil
+}
+
+// samePrincipal reports whether namespace entry seq was written by the
+// principal of a, whose author id is author: the same root sub and kid,
+// or, while authentication is disabled, the same author (§7.2, §6.6). An
+// entry that records no grant, written while authentication was disabled
+// or before grants were recorded (v0.37), matches on author.
+func (t *gate) samePrincipal(seq int64, a *actor, author int64) bool {
+	if au, _ := t.entryBy(seq); au != author {
+		return false
+	}
+	gid := t.entryGrantID(seq)
+	if a.grant == nil || gid == nil {
+		return true
+	}
+	if len(a.grant.Blocks) == 0 {
+		return false
+	}
+	ref, root := t.grantRef(gid), a.grant.Blocks[0]
+	return ref != nil && ref["sub"] == root.Sub && ref["kid"] == root.Kid
+}
+
+// entryGrantID is the grant namespace entry seq was written under, nil
+// for none.
+func (t *tx) entryGrantID(seq int64) []byte {
+	var gid []byte
+	t.must(t.QueryRow(`SELECT grant_id FROM ns_log WHERE seq = ?`, seq).Scan(&gid))
+	return gid
 }
 
 // liveRegistrations lists the unexpired remote branch registrations of n.

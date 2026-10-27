@@ -7,14 +7,16 @@ package core
 // decided (ddbwrite.go, ddbblobs.go). Reads and the write checks are
 // core's own code on the gate.
 //
-// Deliberate gaps, all surfaced as 501 "unsupported" (lacks, or a read
-// that panics with it): sealed and e2e namespaces, intermediate
-// snapshots (revisions fold from the genesis, or from a pruning horizon).
-// Grants, edge grants, blobs, $schema validation and schemaReads, purges,
+// Deliberate gaps, surfaced as 501 "unsupported" (lacks, or a read that
+// panics with it): the SQL write path's hooks, and mirroring a schema
+// revision the remote base pruned. Intermediate snapshots aren't built
+// (revisions fold from the genesis, or from a pruning horizon). Grants,
+// edge grants, blobs, $schema validation and schemaReads, purges,
 // pruning, retention and archives, gestures listing, author signatures,
-// nonce-required namespaces, local and remote branches and their drafts
-// and merges, tombstones and restores, multi-step items and batches
-// (§7.5, bounded by the transaction's 100 actions) work.
+// nonce-required namespaces, encryption at rest, sealed and e2e
+// namespaces, local and remote branches and their drafts and merges,
+// tombstones and restores, multi-step items and batches (§7.5, bounded by
+// the transaction's 100 actions) work.
 
 import (
 	"context"
@@ -194,16 +196,6 @@ func ddbAsErr(err error) *Error {
 		return ce
 	}
 	return apiErr(500, "internal", "message", err.Error())
-}
-
-// ddbRefusals are the configuration features phase 1 refuses, shared by
-// creates and changes.
-func ddbRefusals(cfg *Config) *Error {
-	switch {
-	case cfg.level == levelE2E:
-		return ddbUnsupported("e2e namespaces")
-	}
-	return nil
 }
 
 // commit commits c, bracketed for the read cache as a SQL commit is

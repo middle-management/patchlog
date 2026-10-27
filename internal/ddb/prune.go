@@ -70,6 +70,9 @@ type CommitPrune struct {
 	// Archive records the archive the prune wrote of the range below the
 	// horizon, nil for none (archives.go).
 	Archive *ArchiveRow
+	// E2ESnapshot is an e2e resource's horizon document as its client
+	// sealed it (e2e.go), "" for others.
+	E2ESnapshot string
 }
 
 // pruneActs are a prune's actions in its commit's transaction.
@@ -105,16 +108,23 @@ func (s *Store) pruneActs(c *Commit) []types.TransactWriteItem {
 	if a := p.Archive; a != nil {
 		acts = append(acts, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyArch(c.NS, p.Name, a.FromPos, a.ToPos), a.item(p.Name))}})
 	}
+	if p.E2ESnapshot != "" {
+		acts = append(acts, e2eSnapAct(s.Table, c.NS, p.Name, p.HorizonPos, p.E2ESnapshot))
+	}
 	return acts
 }
 
-// actions counts a prune's actions: the RES update, the marker, and its
-// archive's record.
+// actions counts a prune's actions: the RES update, the marker, its
+// archive's record and an e2e snapshot.
 func (p *CommitPrune) actions() int {
+	n := 2
 	if p.Archive != nil {
-		return 3
+		n++
 	}
-	return 2
+	if p.E2ESnapshot != "" {
+		n++
+	}
+	return n
 }
 
 // PutSnapshots writes the documents a prune of name keeps, by position,
@@ -193,6 +203,10 @@ func (s *Store) PruneContent(ctx context.Context, ns, name string) (ok bool, err
 	// Sealed copies of what was pruned go too (core's deletePrunedSealed);
 	// kept documents keep theirs.
 	if err := s.deletePrunedSealed(ctx, ns, name, horizon, kept); err != nil {
+		return false, err
+	}
+	// An e2e resource's earlier snapshots: the horizon's stands now.
+	if err := s.deleteE2ESnapshots(ctx, ns, name, horizon); err != nil {
 		return false, err
 	}
 	return true, nil

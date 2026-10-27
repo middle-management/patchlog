@@ -427,6 +427,12 @@ func (t *tx) encryptNamespace(n *nsRow) {
 	}
 	for _, ns := range nss {
 		t.lockNS(ns, lockExclusive)
+		// The heads' sizes and plaintext digests go: at rest they would
+		// confirm a guess of a document beside its encrypted content, and
+		// sealed and e2e namespaces list none (§E.1 Stored digests,
+		// headMeta). Reads hash what they serve instead.
+		_, err := t.Exec(`UPDATE revisions SET size = NULL, digest = NULL WHERE digest IS NOT NULL AND res IN (SELECT res FROM resources WHERE ns = ?)`, ns)
+		t.must(err)
 		var resIDs []int64
 		rows, err := t.Query(`SELECT res FROM resources WHERE ns = ? AND state != ?`, ns, statePurged)
 		t.must(err)
@@ -509,43 +515,46 @@ func (t *tx) encryptResource(res int64) {
 // --- configuration checks -----------------------------------------------------
 
 // checkEncryption checks a namespace document's encryption level (§7.4,
-// Addendum E): a key store is needed for any level, a level is never
-// lowered or removed, and a branch is at least at its base's level.
-// cur is nil for a new namespace; baseLevel is -1 if there is no base.
+// Addendum E Levels): a key store is needed for any level, a level is
+// never lowered or removed, and a raise to e2e starts a new epoch. cur is
+// nil for a new namespace. baseLevel is
+// the level of a branch's local base, -1 if there is none: a branch is at
+// least at its base's level, and e2e only over an e2e base, which its
+// creation and a raise to e2e are checked against; other config writes
+// don't check it (Addendum E, Branches and dependents). Refusals are 422
+// invalid with errors pointing at the member, as branch fields are (§7.4).
 func (t *gate) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 	if cfg.level > levelNone && t.e.opt.KeyStore == nil {
-		return invalid("/encryption: no key store configured on this server")
+		return docInvalid("/encryption", "/encryption: no key store configured on this server")
 	}
 	if cur != nil && cfg.level < cur.level {
-		return invalid("/encryption: the encryption level cannot be lowered or removed")
+		return docInvalid("/encryption", "/encryption: the encryption level cannot be lowered or removed")
 	}
-	if baseLevel >= 0 && cfg.level < baseLevel {
-		return invalid("/encryption: a branch cannot have a lower encryption level than its base")
-	}
-	// End-to-end (§E.3) only from the start: an existing namespace's ids,
-	// documents and log are over plaintext, and so is a base that isn't
-	// e2e, which a branch would read through.
-	if cfg.level == levelE2E {
-		if cur != nil && cur.level < levelE2E {
-			return invalid("/encryption: an existing namespace cannot become e2e; its content is already plaintext on the server (create a new e2e namespace)")
+	toE2E := cfg.level == levelE2E && (cur == nil || cur.level < levelE2E)
+	if baseLevel >= 0 && (cur == nil || toE2E) {
+		if cfg.level < baseLevel {
+			return docInvalid("/encryption", "/encryption: a branch cannot have a lower encryption level than its base")
 		}
-		if baseLevel >= 0 && baseLevel < levelE2E {
-			return invalid("/encryption: a branch can be e2e only if its base is")
+		if cfg.level == levelE2E && baseLevel < levelE2E {
+			return docInvalid("/encryption", "/encryption: a branch can be e2e only if its base is")
 		}
 	}
-	if cur != nil && cfg.level == levelE2E && cfg.Epoch != cur.Epoch && cfg.Epoch != cur.Epoch+1 {
-		return invalid(fmt.Sprintf("/encryption/epoch can only stay at %d or be incremented to %d", cur.Epoch, cur.Epoch+1))
+	// A raise to e2e (Addendum E Levels, Changing it) starts a new epoch.
+	// From sealed it must be the current one plus one: the origin holds
+	// the earlier epochs' keys, so they mustn't seal anything written end
+	// to end. From none or at-rest, which have no epoch keys, any epoch
+	// from 1 serves (F-E1); an absent one is 1. What was stored before the
+	// raise keeps its level: e2eConfigWritten records the raise, and it is
+	// served as at the level before, from sealed sealed under the last
+	// epoch before the raise (preraise.go).
+	if cur != nil && toE2E && cur.level == levelSealed && cfg.Epoch != cur.Epoch+1 {
+		return docInvalid("/encryption/epoch", fmt.Sprintf("/encryption/epoch must be %d: a raise from sealed to e2e starts a new epoch, since the origin holds the keys of epoch %d and before (Addendum E Levels)", cur.Epoch+1, cur.Epoch))
 	}
-	// Epochs (§E.2.1): a sealed namespace's epoch only moves forward, one
-	// at a time; a namespace that becomes sealed starts at epoch 1. A new
-	// namespace or branch may start at any epoch.
-	if cur != nil && cfg.level == levelSealed {
-		switch {
-		case cur.level == levelSealed && cfg.Epoch != cur.Epoch && cfg.Epoch != cur.Epoch+1:
-			return invalid(fmt.Sprintf("/encryption/epoch can only stay at %d or be incremented to %d", cur.Epoch, cur.Epoch+1))
-		case cur.level < levelSealed && cfg.Epoch != 1:
-			return invalid("/encryption/epoch: a namespace becoming sealed starts at epoch 1")
-		}
+	// Epochs (§E.2.1): in a namespace already at sealed or e2e, the epoch
+	// only moves forward, one at a time. A new namespace or branch, or one
+	// becoming sealed, which has no epoch keys yet, may start at any epoch.
+	if cur != nil && cur.level >= levelSealed && cfg.level >= levelSealed && cfg.Epoch != cur.Epoch && cfg.Epoch != cur.Epoch+1 {
+		return docInvalid("/encryption/epoch", fmt.Sprintf("/encryption/epoch can only stay at %d or be incremented to %d", cur.Epoch, cur.Epoch+1))
 	}
 	return nil
 }
@@ -601,7 +610,9 @@ type archiveWriter struct {
 }
 
 // sealArchive returns a writer that encrypts an archive to w under a key
-// derived from dek.
+// derived from dek. Archives are sealed bundles since v0.73 (archiveseal.go);
+// nothing writes this format any more, and the tests use it to make the
+// archives from before, which openArchive still reads.
 func sealArchive(w io.Writer, dek []byte) (io.WriteCloser, error) {
 	hdr := make([]byte, archiveHdr)
 	copy(hdr, archiveMagic)
@@ -752,7 +763,8 @@ func (e *Engine) OpenArchive(ctx context.Context, ns, name string, r io.Reader) 
 }
 
 // sqlArchiveDEK is the data key an archive of ns/name is sealed with:
-// ErrArchiveKeyDestroyed once the resource is purged.
+// ErrArchiveKeyDestroyed once the resource is purged, ErrNotEncrypted
+// outside encrypted namespaces.
 func (e *Engine) sqlArchiveDEK(ctx context.Context, ns, name string) ([]byte, error) {
 	var dek []byte
 	err := e.read(ctx, func(t *tx) error {
@@ -763,6 +775,9 @@ func (e *Engine) sqlArchiveDEK(ctx context.Context, ns, name string) ([]byte, er
 		own := t.resource(n.id, name)
 		if n.purged || own == nil || own.state == statePurged {
 			return ErrArchiveKeyDestroyed
+		}
+		if t.resLevel(own.id) < levelAtRest {
+			return ErrNotEncrypted
 		}
 		if t.e.opt.KeyStore == nil {
 			return errNoKeyStore
@@ -775,16 +790,6 @@ func (e *Engine) sqlArchiveDEK(ctx context.Context, ns, name string) ([]byte, er
 		return err
 	})
 	return dek, err
-}
-
-// archiveSealer returns the Seal function of an archive of res, or nil if
-// res is not encrypted.
-func (t *tx) archiveSealer(res int64) func(io.Writer) (io.WriteCloser, error) {
-	if t.resLevel(res) < levelAtRest {
-		return nil
-	}
-	dek := t.dek(res, true)
-	return func(w io.Writer) (io.WriteCloser, error) { return sealArchive(w, dek) }
 }
 
 // checkKeyStore runs at Open: with a key store, one stored data key must

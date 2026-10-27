@@ -47,7 +47,7 @@ func TestCheckLimitsFromScratch(t *testing.T) {
 		{"append, a root remove", stepState{action: "append", raw: []any{map[string]any{"op": "remove", "path": ""}}}, false},
 	} {
 		c.s.canon = big
-		err := checkLimits(l, &itemState{steps: []*stepState{&c.s}})
+		err := checkLimits(l, &itemState{steps: []*stepState{&c.s}}, func() bool { return true })
 		if (err == nil) != c.ok {
 			t.Errorf("%s: %v", c.name, err)
 		}
@@ -92,13 +92,13 @@ func walkValuesAndPaths(l Limits, doc any) *Error {
 			return
 		}
 		if path+2 > l.PathSize {
-			bad = limitErr(413, "pathSize", int64(path+2), int64(l.PathSize), fmt.Sprintf("a path is longer than %d bytes", l.PathSize))
+			bad = limitErr(422, "pathSize", int64(path+2), int64(l.PathSize), fmt.Sprintf("a path is longer than %d bytes", l.PathSize))
 			return
 		}
 		switch x := v.(type) {
 		case string:
 			if n := canonStringLen(x); n > l.ValueSize {
-				bad = limitErr(413, "valueSize", int64(n), int64(l.ValueSize), fmt.Sprintf("a string is longer than %d bytes", l.ValueSize))
+				bad = limitErr(422, "valueSize", int64(n), int64(l.ValueSize), fmt.Sprintf("a string is longer than %d bytes", l.ValueSize))
 			}
 		case []any:
 			for i, e := range x {
@@ -121,7 +121,7 @@ func walkValuesAndPaths(l Limits, doc any) *Error {
 			for _, k := range keys {
 				n := canonStringLen(k)
 				if n > l.ValueSize {
-					bad = limitErr(413, "valueSize", int64(n), int64(l.ValueSize), fmt.Sprintf("a member name is longer than %d bytes", l.ValueSize))
+					bad = limitErr(422, "valueSize", int64(n), int64(l.ValueSize), fmt.Sprintf("a member name is longer than %d bytes", l.ValueSize))
 					return
 				}
 				// "~" and "/" are escaped as two characters in a pointer.

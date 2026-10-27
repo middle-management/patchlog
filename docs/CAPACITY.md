@@ -113,7 +113,7 @@ holds them when it verifies edge grants).
 | **One log per namespace.** Every write appends to its namespace's hash chain (§3.5), so writes to one namespace commit one at a time (on Postgres, one group of up to 32 at a time). | One namespace: ~590 single writes/s on server X from 32 writers; 700–1,000/s on SQLite (4 vCPU). | Spread write-heavy data over namespaces: writes to different namespaces run in parallel, across instances too. A sign-in storm writing per-user items belongs in many namespaces, not one. |
 | **§6.6 size limits**: documents 1 MiB by default (4 MiB a namespace may set, the deployment maximum; §6.6 says 4 MiB), patch sets 256 KiB, 1,000 ops a set, 1,000 items and 16 MiB a batch, 1,000 entries a log page. The other deployment maximums equal the defaults. | | Large documents are slow to write (next row); batches are imports, not interactive writes. `serve -max-document-size` raises the document maximum. |
 | **Whole-document work on every write**: the result is canonicalised, checked against the limits and validated against its `$schema` in full; a small patch to a large document costs the document's size. | Append p50: 7 ms at 16 KiB, 15 ms at 1 MiB, 25 ms at 3.5 MiB (server X); 1.7 / 7 / 19 ms on SQLite. | Keep frequently edited documents small: split large aggregates into resources. |
-| **Default rates** (§6.6), per instance: 50 items/s a principal (burst 100), 500 items/s a namespace (burst 1,000), 10/s a resource (burst 20). | 500/s a namespace is ~85% of server X's single-namespace ceiling. | Allowances (§6.6) replace a principal's and its namespace's buckets, for loaders and importers. The per-resource rate always applies. |
+| **Default rates** (§6.6): 50 items/s a principal (burst 100), 500 items/s a namespace (burst 1,000), 10/s a resource (burst 20); since v0.73 the instances of a Postgres deployment share the buckets (`rate_buckets`, about +1.2 ms a write), per instance only with `serve -local-rate-buckets`. | 500/s a namespace is ~85% of server X's single-namespace ceiling. | Allowances (§6.6) replace a principal's and its namespace's buckets, for loaders and importers. The per-resource rate always applies. |
 | **Followers are cheapest through the CDN** (§7.7, §9): there they cost the origin nothing per follower; at the origin, a connection each and a shared read per write. SSE streams (§7.3) are collapsed neither at the CDN nor at the origin. | See the table above. | Devices long-poll; services that need every entry use the log and checkpoints (§10). |
 | **Consumers read over HTTP**: a consumer catches up from the log and fetches each changed document (§10). | Catch-up of 4M entries: 2.4 min; bootstrap of 1M documents: ~11 min on server X. | Consumer throughput is the consumer's (gaps below); the origin side scales with instances. |
 
@@ -152,7 +152,7 @@ a consumer's snapshot bootstrap held the whole `/heads` listing in memory and on
 | **Postgres CPU and memory** | ~1.3 of 2 vCPU and 3.4 of 4 GB under the read measurements; the limit on server X. | Size Postgres first; a read replica takes bulk reads and private followers' log reads (the gap above). |
 | **Storage** | 6.2 GB on Postgres, 3.1 GB on SQLite for 5M revisions of ~500-byte documents. | Linear in revisions; pruning (§8.6) bounds it. |
 | **Memory** | Core: 0.5–0.8 GB steady, 1.5–1.8 GB peak during full scans. The caches are bounded: up to 256 MiB of documents, 64 MiB of read-cache revisions and 65,536 grants (a few hundred MB at most) by default. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves catch-ups; size the caches with `serve -doc-cache-size`, `-read-cache-size` and `-grant-cache`. |
-| **Upgrades** | The new namespace-log indexes build in the migration, blocking writes a few seconds per 5M log entries. | `CREATE INDEX CONCURRENTLY` beforehand (README). |
+| **Upgrades** | Schema migrations run in a transaction at start (README "Schema migrations"); one that builds an index on a large table blocks writes to it while the index builds. | Create the index `CONCURRENTLY` beforehand under the same name: migrations are written with `IF NOT EXISTS`, so they then find it. |
 
 ## Recommended changes to limits
 
@@ -172,9 +172,14 @@ a consumer's snapshot bootstrap held the whole `/heads` listing in memory and on
 
 ```sh
 go build -o patchlog ./cmd/patchlog && go build -o capacity ./cmd/capacity
-./patchlog serve -dev -addr :9080 -db cap.db -origin http://localhost:8080 &
+./patchlog serve -dev -addr :9080 -db cap.db -origin http://localhost:8080 -max-rate-per-namespace 1e9,1e9 &
 ./capacity -url http://127.0.0.1:9080 -pid $! -json result.json   # 1M docs, 5M revisions: about 1-1.5 h to seed
 ```
+
+- **Allowance**: the harness's namespaces give its loader an allowance of 1e9 writes a second
+  and burst, and an allowance's bucket never exceeds the deployment maximum of
+  `ratePerNamespace` (§6.6), so the core needs `-max-rate-per-namespace` raised to it; without
+  it, creating them is `422` (`limit: "ratePerNamespace"`).
 
 - **Grants**: run the core with `-operator-key <public>` (from `patchlog keygen`) and pass the
   private seed as `-operator-seed`; the namespaces are then private and every request carries a

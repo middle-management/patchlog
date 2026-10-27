@@ -47,6 +47,10 @@ func DB(t testing.TB) string {
 // NewDB returns the URL of an empty Postgres database, the test's own
 // until it ends; it may already hold the schema, from the pool. It skips
 // the test if PATCHLOG_TEST_PG isn't set.
+//
+// The URL bounds the connection pools of the engines opened on it
+// (PoolParams), which pgx itself doesn't accept: a test that opens the
+// database itself takes Open, or DSN.
 func NewDB(t testing.TB) string {
 	t.Helper()
 	u := adminURL(t)
@@ -59,7 +63,53 @@ func NewDB(t testing.TB) string {
 	}
 	u.Path = "/" + name
 	t.Cleanup(func() { pool.give(u, name) })
+	b := *u
+	q := b.Query()
+	for k, v := range PoolParams {
+		q.Set(k, v)
+	}
+	b.RawQuery = q.Encode()
+	return b.String()
+}
+
+// PoolParams are the query parameters of NewDB's URLs that bound the
+// pools of the engines opened on them (core's pgpool.go): a test run
+// starts hundreds of engines, dozens at once across the packages tested
+// in parallel, and with the default pools, which grow with the CPUs and
+// keep every connection they opened, they need more connections than a
+// stock server's max_connections of 100. Eight each leaves room for the
+// leader lock, the tailer, and the transactions and locks a test holds
+// open on an engine's pool while its writes wait (TestV073P39*); an
+// engine idle for a second, as most are once their test moved on to the
+// next, gives its connections back.
+var PoolParams = map[string]string{
+	"pool_max_conns":          "8",
+	"pool_max_conn_idle_time": "1s",
+}
+
+// DSN is a URL from NewDB without the parameters only the engine reads
+// (PoolParams), for a test that opens the database itself.
+func DSN(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	for k := range PoolParams {
+		q.Del(k)
+	}
+	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+// Open opens a database/sql pool on a URL from NewDB (DSN).
+func Open(t testing.TB, rawURL string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("pgx", DSN(rawURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
 }
 
 // FreshDB is DB with a brand-new database, with no schema, dropped when
@@ -158,7 +208,10 @@ func (p *dbPool) start(admin string) error {
 		if p.admin, p.err = sql.Open("pgx", admin); p.err != nil {
 			return
 		}
-		p.admin.SetMaxIdleConns(2)
+		// Keep none idle besides owner: a process per package tested at
+		// once holds its pool, and two idle each added up to a tenth of a
+		// stock server's 100 connections (PoolParams).
+		p.admin.SetMaxIdleConns(0)
 		if p.owner, p.err = p.admin.Conn(ctx); p.err != nil {
 			return
 		}

@@ -2,7 +2,7 @@ package core
 
 // Blobs (§7.8).
 //
-// Tables (db.go, pgschema.go; D.2 with additions):
+// Tables (migrations/; D.2 with additions):
 //
 //   - blobs: attachments, one row per resource and blob, with ref_seq (the
 //     first revision of the resource that referenced it) and pruned (set
@@ -238,13 +238,24 @@ func blobRefsOf(doc any) []blobRef {
 type batchSource struct {
 	n     *nsRow
 	atSeq int64
+	// creds are the request's grant and Source-Authorization's, whose keys
+	// open a sealed source's blobs (keywindow.go).
+	creds []Credentials
 }
 
 // blob finds bid attached to name in the source, or in a base it reads
 // through, and referenced by a document in that resource's history as the
-// source sees it at source.at (§7.8 Availability, §7.6).
+// source sees it at source.at (§7.8 Availability, §7.6), whatever the
+// ranks. From a sealed source, public or not, and from an e2e one for a
+// blob from before a raise from sealed, only a blob the caller's keys open
+// under an epoch it is served under there (§2.1 Protection); and none
+// of a resource whose source was raised to a level this server lacks
+// (upstreamRefusal), which the source can't serve.
 func (bs *batchSource) blob(t *gate, name string, bid ids.ID) *blobRow {
 	if bs == nil || bs.n == nil {
+		return nil
+	}
+	if t.upstreamRefusal(bs.n, name) != nil {
 		return nil
 	}
 	v := t.resolve(bs.n, name, &bs.atSeq)
@@ -252,6 +263,14 @@ func (bs *batchSource) blob(t *gate, name string, bid ids.ID) *blobRow {
 		return nil
 	}
 	b, _ := t.historyBlob(v.head, 0, bid)
+	if b != nil && t.isSealedNS(bs.n) && !t.keysOpen(bs.n, name, t.blobKeyEpochs(bs.n, name, bid), bs.creds) {
+		return nil
+	}
+	// So from an e2e source for a blob from before a raise from sealed,
+	// with the keys /keys gives for it as at E2 (§2.1, Addendum E Levels).
+	if b != nil && !t.preRaiseBlobOpens(bs.n, name, bid, bs.creds) {
+		return nil
+	}
 	return b
 }
 
@@ -703,6 +722,9 @@ func (t *tx) encryptBlobs(res int64) {
 type BlobUpload struct {
 	Type  string // the Content-Type header as sent
 	Nonce string // Blob-Nonce, "" if absent
+	// NonceSent reports that Blob-Nonce was present, empty or repeated
+	// included (400 at check 4 unless it is one nonce, §7.8).
+	NonceSent bool
 	// From is Blob-From: /r/{ns2}/{name2}/blob/{bid} for a copy, else "".
 	From string
 	// Body is the upload's body; Length its Content-Length, -1 if unknown.
@@ -710,6 +732,14 @@ type BlobUpload struct {
 	Length int64
 	// HasBody reports, for a copy, whether a body was sent (400).
 	HasBody bool
+	// Precondition reports that the request sent If-Match or
+	// If-None-Match, which an upload doesn't take: 428 at check 4 (§7.2,
+	// §7.8).
+	Precondition bool
+	// ShapeErr is a request-shape error the server found in the upload's
+	// headers, such as a Signature header (§C.3.1) or a missing X-Author
+	// (§7.2), answered as 400 at check 4 (§7.8).
+	ShapeErr string
 }
 
 // blobGate is what an upload's checks decided.
@@ -752,17 +782,19 @@ func parseBlobURL(s string) (ns, name string, bid ids.ID, ok bool) {
 	return parts[2], parts[3], id, true
 }
 
-// nsRank ranks namespaces for copies, as for imports (§G.5.1): public,
-// then private and sealed alike, then e2e.
-func (t *gate) nsRank(n *nsRow) int {
-	cfg := t.config(n.configSeq)
+// localSourceRank is the protection of a namespace of this deployment as a
+// source (§2.1): e2e at E3, sealed (ranked as private) at E2 whatever its
+// read, and otherwise public or private by its read. As a target it is
+// targetRank, under which a sealed namespace whose read is public is
+// public.
+func localSourceRank(cfg *Config) int {
 	switch {
 	case cfg.level == levelE2E:
-		return 2
+		return rankE2E
 	case cfg.level == levelSealed || cfg.Read != "public":
-		return 1
+		return rankPrivate
 	}
-	return 0
+	return rankPublic
 }
 
 // gateBlob runs an upload's checks in the order of §7.8, as far as they go
@@ -807,9 +839,14 @@ func (t *gate) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, dr
 		}
 	}
 	// 2. A purged namespace or resource, after authorisation and the rate
-	// limits (§7.8).
+	// limits (§7.8); between them, a resource whose source was raised to a
+	// level this server lacks (502 upstream, §1, §12.1), as at step 2.1 of
+	// a write.
 	if n.purged {
 		return nil, t.purgedNS(n)
+	}
+	if err := t.upstreamRefusal(n, name); err != nil {
+		return nil, err
 	}
 	if t.resolve(n, name, nil).state == Purged {
 		return nil, gone()
@@ -821,6 +858,10 @@ func (t *gate) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, dr
 			e.Body["successor"] = cfg.Successor
 		}
 		return nil, e
+	}
+	// 4. Request-shape errors in the upload's headers (§7.8).
+	if up.ShapeErr != "" {
+		return nil, badInput(up.ShapeErr)
 	}
 	size := up.Length
 	if up.From != "" {
@@ -846,13 +887,20 @@ func (t *gate) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, dr
 		if !ok {
 			return nil, badInput("the Content-Type must be a media type, type/subtype")
 		}
-		if up.Nonce != "" && !seal.ValidNonce(up.Nonce) {
-			return nil, badInput("Blob-Nonce must be 26 base32 characters")
+		// Present is checked, empty or repeated (joined) included: a blob
+		// without a nonce sends no Blob-Nonce (§7.8).
+		if (up.NonceSent || up.Nonce != "") && !seal.ValidNonce(up.Nonce) {
+			return nil, badInput("Blob-Nonce must be one value of 26 base32 characters; a blob without a nonce sends none")
 		}
 		g.typ, g.nonce = typ, up.Nonce
 	}
+	// An upload takes no precondition: one sent is 428 at check 4, for a
+	// copy after its source checks (§7.2, §7.8, §12.1).
+	if up.Precondition {
+		return nil, apiErr(428, "precondition_required", "message", "an upload or copy takes no precondition (§7.8)")
+	}
 	if cfg.level == levelE2E && g.typ != SealedBlobType {
-		return nil, apiErr(415, "bad_input", "message", "an e2e namespace accepts only "+SealedBlobType+" blobs (§E.3.1)")
+		return nil, apiErr(415, "unsupported_type", "message", "an e2e namespace accepts only "+SealedBlobType+" blobs (§E.3.1)")
 	}
 	// 5. Sizes: blobSize and the uploader's pending bytes.
 	if al := t.allowanceOf(cfg, a); al != nil && al.BlobPending > 0 {
@@ -904,21 +952,33 @@ func (g *blobGate) checkSize(size int64) *Error {
 }
 
 // copySource finds a copy's source blob (§7.8 Copying): readable by the
-// request (or its Source-Authorization), of no higher rank than the target,
-// and one that reading would serve. Anything else is nil (404).
+// request (or its Source-Authorization), of a namespace that ranks no
+// higher as a source than the target does as a target, if it is another
+// (§2.1), one that reading would serve and, from a sealed source, public or
+// not, or an e2e one's blob from before a raise from sealed (Addendum E
+// Levels), within one namespace too, one the request's keys open under an
+// epoch it is served under there (keywindow.go, preRaiseBlobOpens). Anything else is nil
+// (404), a source whose own source was raised to a level this server lacks
+// included (upstreamRefusal: the read fails).
 func (t *gate) copySource(target *nsRow, req Request, ns, name string, bid ids.ID) *blobRow {
 	sn := t.nsByName(ns)
 	if sn == nil || sn.purged {
 		return nil
 	}
-	if !t.sourceReadable(sn, name, req) {
+	if !t.sourceReadable(sn, name, req) || t.upstreamRefusal(sn, name) != nil {
 		return nil
 	}
-	if t.nsRank(sn) > t.nsRank(target) {
+	if sn.id != target.id && localSourceRank(t.config(sn.configSeq)) > targetRank(t.config(target.configSeq)) {
 		return nil
 	}
 	ans := t.servableBlob(sn, name, bid)
 	if ans.status != 200 {
+		return nil
+	}
+	if t.isSealedNS(sn) && !t.keysOpen(sn, name, t.blobKeyEpochs(sn, name, bid), req.anyCreds()) {
+		return nil
+	}
+	if !t.preRaiseBlobOpens(sn, name, bid, req.anyCreds()) {
 		return nil
 	}
 	return ans.row
@@ -1218,6 +1278,15 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 			// sealed under an epoch (§E.2.2, sealedblobs.go).
 			job, nsName = t.sealedBlobHead(n, name, bid, out), n.name
 			return nil
+		}
+		// Nor do e2e namespaces for a blob from before a raise from sealed,
+		// whose epoch URLs it keeps (Addendum E Levels, preraise.go).
+		if t.isE2E(n) {
+			head := t.resolve(n, name, nil).head
+			if p := t.preRaiseBlob(n, head, bid); p != nil {
+				job, nsName = t.preRaiseBlobHead(p, name, head, bid, out), p.m.name
+				return nil
+			}
 		}
 		out.Type = ans.row.typ
 		out.setContent(t.openBytes(ans.row.owner, ans.row.hash))

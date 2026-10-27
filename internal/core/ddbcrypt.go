@@ -241,6 +241,11 @@ func (b *ddbBackend) archiveDEK(ctx context.Context, ns, name string) ([]byte, e
 	if rr == nil || rr.Purged {
 		return nil, ErrArchiveKeyDestroyed
 	}
+	if lvl, err := b.nsLevelOf(ctx, ns); err != nil {
+		return nil, err
+	} else if lvl < levelAtRest {
+		return nil, ErrNotEncrypted
+	}
 	if b.e.opt.KeyStore == nil {
 		return nil, errNoKeyStore
 	}

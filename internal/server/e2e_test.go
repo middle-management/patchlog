@@ -83,7 +83,9 @@ func (f *e2eFixture) fold(ns, name, id string, keys map[string][]byte, bearer st
 		return f.snapshotAt(ns, name, id, keys, r)
 	}
 	expect(t, r, 302)
-	if r.H.Get("X-E2E") != "fold" || !strings.HasPrefix(r.H.Get("Cache-Control"), "public") {
+	// The fixture's namespaces are read "grant", so cached privately
+	// (v0.63 §E.2.5: by read mode, at E3 as at any level).
+	if r.H.Get("X-E2E") != "fold" || !strings.HasPrefix(r.H.Get("Cache-Control"), "private") {
 		t.Fatalf("fold headers %v", r.H)
 	}
 	loc := r.H.Get("Location")
@@ -150,11 +152,14 @@ func (f *e2eFixture) fold(ns, name, id string, keys map[string][]byte, bearer st
 
 // snapshotAt opens the prune snapshot that r, the answer of
 // /r/{ns}/{name}/rev/{h}, serves: 200 application/jose, or a tombstone
-// horizon's 410 carrying it, both immutable with X-E2E: snapshot.
+// horizon's 410 carrying it, both of the immutable class with X-E2E:
+// snapshot.
 func (f *e2eFixture) snapshotAt(ns, name, h string, keys map[string][]byte, r *resp) any {
 	t := f.t
 	t.Helper()
-	if r.H.Get("X-E2E") != "snapshot" || r.H.Get("ETag") != `"`+h+`"` || !strings.Contains(r.H.Get("Cache-Control"), "immutable") {
+	// The immutable class, private for the fixture's read "grant"
+	// namespaces (v0.63 §E.2.5).
+	if r.H.Get("X-E2E") != "snapshot" || r.H.Get("ETag") != `"`+h+`"` || r.H.Get("Cache-Control") != "private, max-age=300" {
 		t.Fatalf("/rev/%s: %d %v", h, r.Code, r.H)
 	}
 	var jwe string
@@ -191,36 +196,38 @@ func TestE2EGateAndReads(t *testing.T) {
 	t.Parallel()
 	f := newE2E(t)
 	e := f.tenv
-	adminPub := newRecipient(t)
+	_, adminPriv, _ := seal.GenerateRecipient()
+	adminPub := adminPriv.PublicKey()
 	f.k1 = seal.NewKey()
 	readerPub, _ := seal.ParseRecipientJWK(f.readerJWK)
 
-	// The keyring: plaintext, checked as a keyring of this namespace.
-	kr, err := seal.BuildKeyring("e", 1, f.k1, []*ecdh.PublicKey{adminPub, readerPub})
+	// The keyring: plaintext, checked as a keyring of this namespace
+	// (§E.3.2), its entries wrapped by the admin.
+	kr, err := seal.BuildKeyringV2(adminPriv, "e", 1, f.k1, []*ecdh.PublicKey{adminPub, readerPub})
 	if err != nil {
 		t.Fatal(err)
 	}
-	other, _ := seal.BuildKeyring("x", 1, f.k1, []*ecdh.PublicKey{adminPub})
+	other, _ := seal.BuildKeyringV2(adminPriv, "x", 1, f.k1, []*ecdh.PublicKey{adminPub})
 	expectCode(t, e.write("PATCH", "e", "keyring", "", addRoot(other.Value()), f.adminG), 422, "invalid")
-	ahead, _ := seal.BuildKeyring("e", 2, f.k1, []*ecdh.PublicKey{adminPub})
+	ahead, _ := seal.BuildKeyringV2(adminPriv, "e", 2, f.k1, []*ecdh.PublicKey{adminPub})
 	expectCode(t, e.write("PATCH", "e", "keyring", "", addRoot(ahead.Value()), f.adminG), 422, "invalid")
 	expectCode(t, e.write("PATCH", "e", "keyring", "", addRoot(map[string]any{"v": 1.0}), f.adminG), 422, "invalid")
 	expectCode(t, e.writeRaw("e", "keyring", "", sealed(t, f.k1, "e#1", "e", "keyring", "", addRoot(kr.Value())), f.adminG), 422, "invalid")
 	krID := e.create("e", "keyring", kr.Value(), f.adminG)
-	if d := e.doc("e", "keyring", f.readerG); d["ns"] != "e" {
+	if d := e.doc("e", "keyring", f.readerG); len(d["keys"].([]any)) != 2 {
 		t.Fatalf("keyring doc %v", d)
 	}
 
-	// POST /keys relays the reader's wrapped key only.
+	// POST /keys relays the reader's wrapped key only, with its from.
 	keys, r := e.keysOf("e", nil, f.readerG)
 	if r == nil || len(keys) != 1 {
 		t.Fatalf("keys %v %v", keys, r)
 	}
 	w, err := seal.ParseWrappedKey(r.Obj()["keys"].([]any)[0])
-	if err != nil || w.Kid != "e#1" {
+	if err != nil || w.Kid != "e#1" || w.From != seal.Thumbprint(adminPub) {
 		t.Fatalf("wrapped %v %v", w, err)
 	}
-	if k, err := seal.UnwrapKey(f.readerPriv, w); err != nil || string(k) != string(f.k1) {
+	if k, err := seal.UnwrapKeyAuth(f.readerPriv, adminPub, w); err != nil || string(k) != string(f.k1) {
 		t.Fatalf("unwrap %v", err)
 	}
 	_, r = e.keysOf("e", nil, e.grant(f.writer, "user:noenc", []string{"e"}, []string{"read"}))
@@ -286,8 +293,10 @@ func TestE2EGateAndReads(t *testing.T) {
 		map[string]any{"resource": "b2", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}}})
 	expectCode(t, r, 422, "batch")
 
-	// Namespace rules on /doc or writes fail every sealed write; rules on
-	// /action and /principal still work; deletes are checked as usual.
+	// A namespace rule whose outcome depends on /doc or writes fails a
+	// sealed write as a whole; one that passes whatever they give, as
+	// docRule does for a create, is decided as usual (§6.2, v0.67). Rules
+	// on /action and /principal still work; deletes are checked as usual.
 	docRule := map[string]any{"if": []any{map[string]any{"op": "test", "path": "/action", "value": "append"}},
 		"then": []any{map[string]any{"op": "test", "path": "/doc/n", "exists": true}}}
 	expect(t, e.patchNS("e", ops(op("add", "/rules", []any{docRule})), f.adminG), 201)
@@ -297,7 +306,7 @@ func TestE2EGateAndReads(t *testing.T) {
 		r := e.writeRaw("e", "d", d3, raw, f.writerG)
 		expectCode(t, r, 422, "rule")
 	}
-	expectCode(t, e.writeRaw("e", "n1", "", sealed(t, f.k1, "e#1", "e", "n1", "", addRoot(map[string]any{})), f.writerG), 422, "rule")
+	expect(t, e.writeRaw("e", "n1", "", sealed(t, f.k1, "e#1", "e", "n1", "", addRoot(map[string]any{})), f.writerG), 201)
 	writesRule := map[string]any{"not": map[string]any{"op": "writes", "covers": ""}}
 	expect(t, e.patchNS("e", ops(op("replace", "/rules", []any{writesRule})), f.adminG), 201)
 	expectCode(t, e.writeRaw("e", "d", d3, sealed(t, f.k1, "e#1", "e", "d", d3, ops(op("add", "/x", 1.0))), f.writerG), 422, "rule")
@@ -369,12 +378,17 @@ func TestE2EPruneRetention(t *testing.T) {
 	expectCode(t, e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap, "keep": []any{ids[1]}}, f.writerG), 422, "invalid")
 	wrong, _ := seal.SealSnapshot(k, "e#1", "e", "p", ids[2], map[string]any{"n": 2.0})
 	expectCode(t, e.prune("e", "p", map[string]any{"horizon": h, "snapshot": wrong}, f.writerG), 422, "invalid")
-	r := e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap}, f.writerG)
+	// No retention rule matches p: moving its horizon needs a * key, and
+	// the answer is { horizon } alone, the archive linked from the 410
+	// (§8.6).
+	r := e.prune("e", "p", map[string]any{"horizon": h, "snapshot": snap}, f.adminG)
 	expect(t, r, 200)
-	if r.Str("horizon") != h || r.Str("archive") == "" {
+	if r.Str("horizon") != h || len(r.Obj()) != 1 {
 		t.Fatalf("prune %s", r.Body)
 	}
-	expectCode(t, e.get("/r/e/p/rev/"+ids[1], f.readerG), 410, "pruned")
+	if g := e.get("/r/e/p/rev/"+ids[1], f.readerG); g.Code != 410 || g.Str("code") != "pruned" || g.Str("archive") == "" {
+		t.Fatalf("pruned revision %d %s", g.Code, g.Body)
+	}
 	mustEqual(t, f.fold("e", "p", ids[5], keys, f.readerG), map[string]any{"n": 5.0})
 	mustEqual(t, f.fold("e", "p", h, keys, f.readerG), map[string]any{"n": 3.0})
 	// A log from genesis crosses the horizon.
@@ -416,7 +430,7 @@ func TestE2EEpochsBranchesLevels(t *testing.T) {
 	adminPriv := func() *ecdh.PrivateKey { _, p, _ := seal.GenerateRecipient(); return p }()
 	readerPub, _ := seal.ParseRecipientJWK(f.readerJWK)
 	k1 := seal.NewKey()
-	kr, _ := seal.BuildKeyring("e", 1, k1, []*ecdh.PublicKey{adminPriv.PublicKey(), readerPub})
+	kr, _ := seal.BuildKeyringV2(adminPriv, "e", 1, k1, []*ecdh.PublicKey{adminPriv.PublicKey(), readerPub})
 	krHead := e.create("e", "keyring", kr.Value(), f.adminG)
 	d0 := etagOf(e.writeRaw("e", "d", "", sealed(t, k1, "e#1", "e", "d", "", addRoot(map[string]any{"n": 0.0})), f.writerG))
 
@@ -424,7 +438,7 @@ func TestE2EEpochsBranchesLevels(t *testing.T) {
 	// with the epoch bump in one batch; the removed reader gets nothing of
 	// the new epoch.
 	k2 := seal.NewKey()
-	if _, err := kr.Rotate(k2, []*ecdh.PublicKey{adminPriv.PublicKey()}); err != nil {
+	if err := kr.Add(adminPriv, adminPriv.PublicKey(), "e#2", k2); err != nil {
 		t.Fatal(err)
 	}
 	replace := ops(op("replace", "", kr.Value()))
@@ -435,11 +449,17 @@ func TestE2EEpochsBranchesLevels(t *testing.T) {
 	expect(t, r, 201)
 	// Epochs may only move by one.
 	expectCode(t, e.patchNS("e", ops(op("replace", "/encryption/epoch", 4.0)), f.adminG), 422, "invalid")
-	keys, _ := e.keysOf("e", nil, f.readerG)
+	// A grant gets the epochs from the one in force at its latest nbf, and
+	// the current one alone without nbf (v0.63 §E.2.3).
+	early := map[string]any{"nbf": t0.Add(-time.Hour).Format(time.RFC3339)}
+	if keys, _ := e.keysOf("e", nil, f.readerG); len(keys) != 0 {
+		t.Fatalf("removed reader without nbf %v", keys)
+	}
+	keys, _ := e.keysOf("e", nil, e.grant(f.writer, "user:reader", []string{"e"}, []string{"read"}, early, map[string]any{"enc": f.readerJWK}))
 	if _, ok := keys["e#1"]; !ok || len(keys) != 1 {
 		t.Fatalf("removed reader keys %v", keys)
 	}
-	adminEnc := e.grant(f.admin, "user:admin", []string{"e"}, []string{"read"}, map[string]any{"enc": seal.RecipientJWK(adminPriv.PublicKey())})
+	adminEnc := e.grant(f.admin, "user:admin", []string{"e"}, []string{"read"}, early, map[string]any{"enc": seal.RecipientJWK(adminPriv.PublicKey())})
 	keys, _ = e.keysOf("e", nil, adminEnc)
 	if len(keys) != 2 {
 		t.Fatalf("admin keys %v", keys)
@@ -471,10 +491,11 @@ func TestE2EEpochsBranchesLevels(t *testing.T) {
 		t.Fatalf("branch log %s", r.Body)
 	}
 
-	// Levels: e2e only from the start.
+	// Levels: an existing namespace may be raised to e2e (v0.73, Addendum
+	// E Levels); a branch only over an e2e base, and never down.
 	e.mkNS("ar", atRest(map[string]any{"keys": []any{f.admin.entry("*")}}))
 	arG := e.grant(f.admin, "user:admin", []string{"ar"}, allVerbs)
-	expectCode(t, e.patchNS("ar", ops(op("replace", "/encryption", map[string]any{"level": "e2e"})), arG), 422, "invalid")
+	expect(t, e.patchNS("ar", ops(op("replace", "/encryption", map[string]any{"level": "e2e"})), arG), 201)
 	e.mkNS("pl", map[string]any{"keys": []any{f.admin.entry("*")}})
 	plG := e.grant(f.admin, "user:admin", []string{"pl"}, allVerbs)
 	expectCode(t, e.branch("pl", map[string]any{"name": "plb", "patches": ops(op("add", "/encryption", map[string]any{"level": "e2e"}))}, plG), 422, "invalid")

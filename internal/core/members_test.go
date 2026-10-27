@@ -224,12 +224,13 @@ func TestShadowEncryption(t *testing.T) {
 	if _, err := e.shadowEncryption("matches", map[string]any{"level": "e2e", "epoch": "three"}); err == nil || err.Status != 502 {
 		t.Fatalf("malformed epoch: %v", err)
 	}
-	// Checked under this deployment's limits, which reading the shadow's
-	// document uses: here they leave no room for an e2e namespace (§6.6).
+	// Not held to §6.6 Values, which holds creations and config writes
+	// only, never a stored document such as the shadow's: the remote
+	// branch's own creation is (v0.73).
 	small := DefaultLimits()
 	small.PatchSetSize = 200 << 10
 	e = &Engine{opt: Options{Limits: small, Maximums: small}}
-	if _, err := e.shadowEncryption("matches", map[string]any{"level": "e2e"}); err == nil || err.Status != 502 {
+	if _, err := e.shadowEncryption("matches", map[string]any{"level": "e2e"}); err != nil {
 		t.Fatalf("e2e under limits without room for it: %v", err)
 	}
 }

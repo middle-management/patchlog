@@ -78,6 +78,12 @@ github.com/klauspost/compress v1.20.1 h1:T7kKElXUMXrUJ2E9QhQhxFtcK5rPyLdsGZvdbLM
 github.com/klauspost/compress v1.20.1/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
 github.com/mattn/go-isatty v0.0.24 h1:tGZZoVgT/KiqK1c8ocVLeDS8BSWMRd47J3Lbz7vsReI=
 github.com/mattn/go-isatty v0.0.24/go.mod h1:nMCL3Zebbrt45jsMDgnfIwz6ydEQApk5oEI3HqDio6A=
+github.com/middle-management/mmmigrate v0.7.0 h1:y079BIfCjEyokAq67yW9bBRihvLkMXciyiVTUx3bfBk=
+github.com/middle-management/mmmigrate v0.7.0/go.mod h1:sTVqbtgLdn9deCVtLfQHOGLDjB4AfLYN5WO1WrkHf5w=
+github.com/middle-management/mmmigrate/driver/postgres v0.0.0-20261021205057-866b4a3074f6 h1:Y7ggjqiHjxELNU6d9a5L8b2Dd1HjnrfI/FeKCjBqvZc=
+github.com/middle-management/mmmigrate/driver/postgres v0.0.0-20261021205057-866b4a3074f6/go.mod h1:l5dnzckUIYuxrhToIzgMbvIOE0k38eq/rkBcQICLE4Y=
+github.com/middle-management/mmmigrate/driver/sqlite v0.0.0-20261021205057-866b4a3074f6 h1:RhTlcMKchjnEh0ehXdK9bECNU1mOMIyyzdHu5eYcB4k=
+github.com/middle-management/mmmigrate/driver/sqlite v0.0.0-20261021205057-866b4a3074f6/go.mod h1:bkzX7WdFpaGYfVckP4Da0iM2Ild38/+qEH/wGx1RSlU=
 github.com/ncruces/go-strftime v1.0.0 h1:HMFp8mLCTPp341M/ZnA4qaf7ZlsbTc+miZjCLOFAw7w=
 github.com/ncruces/go-strftime v1.0.0/go.mod h1:Fwc5htZGVVkseilnfgOVb9mKy6w1naJmn9CehxcKcls=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=

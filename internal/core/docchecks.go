@@ -29,15 +29,65 @@ func fromScratch(s *stepState) bool {
 			return s.action == "restore"
 		}
 		ops, _ := s.raw.([]any)
-		for _, o := range ops {
-			op, _ := o.(map[string]any)
-			if op["op"] == "test" {
-				continue
-			}
-			return (op["op"] == "replace" || op["op"] == "add") && op["path"] == ""
-		}
+		return rootWrite(ops)
 	}
 	return false
+}
+
+// rootWrite reports whether a patch set's first operation other than
+// test is a root replace or add (§6.6 Whole documents).
+func rootWrite(ops []any) bool {
+	for _, o := range ops {
+		op, _ := o.(map[string]any)
+		if op["op"] == "test" {
+			continue
+		}
+		return (op["op"] == "replace" || op["op"] == "add") && op["path"] == ""
+	}
+	return false
+}
+
+// checkConfigLimits is step 4 for a namespace document a write produces:
+// config writes, a batch's config change and a namespace's creation, a
+// branch's included, are held to the patch-set and document limits as
+// resource writes are (§6.6 Configurable limits), a creation counting as
+// a create (Whole documents). l are the limits in force: the current
+// configuration's, the base's for a branch, the deployment's defaults for
+// a new namespace. canon is the patch set's canonical form, docCanon the
+// document's. A namespace document holds no blob references (§7.8), so
+// blobsPerDocument isn't measured. A caller that can't read the document
+// (readable) gets a refusal of a limit on it without measured (§6.6).
+func checkConfigLimits(l Limits, patches any, canon []byte, creation bool, docCanon []byte, readable func() bool) *Error {
+	ops, _ := patches.([]any)
+	maxPatch, key := l.PatchSetSize, "patchSetSize"
+	if creation || rootWrite(ops) {
+		maxPatch, key = l.DocumentSize, "documentSize"
+	}
+	if len(canon) > maxPatch {
+		return limitErr(422, key, int64(len(canon)), int64(maxPatch), "patch set too large")
+	}
+	if len(ops) > l.OpsPerSet {
+		return limitErr(422, "opsPerSet", int64(len(ops)), int64(l.OpsPerSet), "too many operations")
+	}
+	var err *Error
+	if len(docCanon) > l.DocumentSize {
+		err = limitErr(422, "documentSize", int64(len(docCanon)), int64(l.DocumentSize), "document too large")
+	} else if sh := shapeOf(l, docCanon); sh.depth > l.NestingDepth {
+		err = limitErr(422, "nestingDepth", int64(sh.depth), int64(l.NestingDepth), "document nested too deeply")
+	} else {
+		err = sh.bad
+	}
+	return unreadableLimit(err, readable)
+}
+
+// unreadableLimit leaves measured out of the refusal of a limit on the
+// resulting document for a caller that can't read it (§6.6): documentSize,
+// nestingDepth, valueSize, pathSize and blobsPerDocument.
+func unreadableLimit(err *Error, readable func() bool) *Error {
+	if err != nil && err.Code() == "limit" && !readable() {
+		delete(err.Body, "measured")
+	}
+	return err
 }
 
 // docShape is what step 4 measures of a resulting document (§6.6), read
@@ -83,13 +133,13 @@ type shapeScan struct {
 func (s *shapeScan) value(path, depth int) {
 	walked := s.bad == nil
 	if walked && path+2 > s.l.PathSize {
-		s.bad = limitErr(413, "pathSize", int64(path+2), int64(s.l.PathSize), fmt.Sprintf("a path is longer than %d bytes", s.l.PathSize))
+		s.bad = limitErr(422, "pathSize", int64(path+2), int64(s.l.PathSize), fmt.Sprintf("a path is longer than %d bytes", s.l.PathSize))
 		walked = false
 	}
 	switch s.b[s.i] {
 	case '"':
 		if n := s.str(); walked && n > s.l.ValueSize {
-			s.bad = limitErr(413, "valueSize", int64(n), int64(s.l.ValueSize), fmt.Sprintf("a string is longer than %d bytes", s.l.ValueSize))
+			s.bad = limitErr(422, "valueSize", int64(n), int64(s.l.ValueSize), fmt.Sprintf("a string is longer than %d bytes", s.l.ValueSize))
 		}
 	case '[':
 		s.depth = max(s.depth, depth+1)
@@ -120,7 +170,7 @@ func (s *shapeScan) value(path, depth int) {
 			n := s.str()
 			name := s.b[start:s.i]
 			if names && n > s.l.ValueSize {
-				s.bad = limitErr(413, "valueSize", int64(n), int64(s.l.ValueSize), fmt.Sprintf("a member name is longer than %d bytes", s.l.ValueSize))
+				s.bad = limitErr(422, "valueSize", int64(n), int64(s.l.ValueSize), fmt.Sprintf("a member name is longer than %d bytes", s.l.ValueSize))
 				names = false
 			}
 			if string(name) == `"$blob"` {

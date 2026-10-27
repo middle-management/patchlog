@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,30 +22,39 @@ import (
 //
 //	q=words             full text over x-index "text" fields; every word must occur in the
 //	                    document (in any text field); a trailing * makes a word a prefix
-//	schema=ref          exact $schema, or a prefix ending at a path segment
-//	                    (/r/schemas/match matches /r/schemas/match/rev/…)
+//	schema=ref          exact $schema, or a schema's resource path /r/{ns}/{name}, which
+//	                    matches its revisions /r/{ns}/{name}/rev/…; nothing else matches
 //	ref=/r/ns/name      documents that reference a resource (§A.4): any form; with
 //	                    /rev/{id} only those pinned to that revision; with #entry (sent as
 //	                    %23entry) only those naming that entry
-//	facet[/path]=v      exact match on an x-index "facet" field; repeated values of one
-//	                    path are ORed, different paths ANDed
-//	gt|ge|lt|le[/path]=v range filter on an x-index "sort" field: a number compares with
-//	                    numbers, anything else with strings (RFC 3339 date-times normalised)
+//	facet[/path]=v      exact match on an x-index "facet" field, by the value's string form
+//	                    (§A.2); repeated values of one path are ORed, different paths ANDed
+//	gt|ge|lt|le[/path]=v range filter (an extension) on an x-index "sort" field, on each
+//	                    document's least value: a number compares with numbers, anything
+//	                    else with strings, as UTF-8 bytes
 //	sort=/a,-/b         order by "sort" fields, keys comma-separated, - for descending
-//	                    (once, §A.5; missing values last); default: score (with q),
-//	                    then resource name
-//	counts=/path        facet counts over all hits (repeatable)
-//	fields=/a,/b        also show those indexed fields in hits, "text" ones included; a path
-//	                    no schema of the namespace's documents marks with x-index is 400,
-//	                    one a hit has no values at is left out of it (§A.4, checkFields)
+//	                    (once, §A.5): each document by its least value at the path, numbers
+//	                    before strings before booleans, missing values last in either
+//	                    direction (§A.2); ties by resource name
+//	counts=/a,/b        facet counts over every hit, by string form: { path: { value: hits } }
+//	                    (once, paths comma-separated)
+//	fields=/a,/b        also show those indexed fields in hits, "text" ones included
 //	limit=n             page size, 1–100 (default 20)
-//	after=n             continue after the first n hits (from "next"); a ref query
-//	after=name          without q or sort, in resource order, pages as /_refs does
-//	                    (§A.4): after is a resource name, a plain bound, and "next"
-//	                    is the after of the following page
-//	min=ns_id           read-your-writes (§A.5): an ns_id of the queried namespace, or
-//	min=ns:ns_id        ns:ns_id for any namespace the service follows; repeatable, and
-//	                    every one must be reached
+//	after=name          without q or sort, hits are in resource order and after is a
+//	                    resource name, a plain bound, as /_refs pages (§A.4)
+//	after=position      with q or sort, the opaque value a "next" gave
+//	min=ns_id           read-your-writes (§A.5): an ns_id of the queried namespace, once
+//	                    (the same value twice is one, as min is a set), or
+//	min=ns:ns_id        ns:ns_id for any namespace the service follows, repeatable; every
+//	                    one must be reached
+//
+// A fields path that no schema indexed in the namespace for a document the
+// reader may see marks with x-index, a facet or counts path none of them
+// marks facet, or a sort (or range) path none of them marks sort, is 400
+// (§A.4, checkFields). A hit carries its facet and sort values, and the
+// requested fields, each as "<path>": [values]; a path it has no values at
+// is left out of it. "next" is the after of the following page, absent on
+// the last.
 type Query struct {
 	Q      string
 	words  []string
@@ -56,12 +66,21 @@ type Query struct {
 	Counts []string
 	Fields []string
 	Limit  int
-	After  int
+	// After is the position after for a query that pages by position
+	// (with q or sort): the number of hits before the page.
+	After int
 	// AfterName is after for a query that pages by name (ByName).
 	AfterName string
 	// Mins are the ?min= values; NS is "" for a bare ns_id (the queried
 	// namespace).
 	Mins []MinRef
+	// toks are the words' tokens as the FTS5 text table has them, each
+	// word's in order (Index.ftsTokens); nil until tokenized.
+	toks [][]string
+	// epochs asks run for the epochs of the documents the result's
+	// values come from (Result.Epochs, Hit.epoch), which a sealed or e2e
+	// namespace's results are sealed under (§E.2.6).
+	epochs bool
 }
 
 // RefFilter is a parsed ?ref= (§A.4). Rev and Entry are "" when the form
@@ -81,6 +100,56 @@ func ParseRefFilter(s string) (*RefFilter, error) {
 // MinRef is one ?min= value (§A.5).
 type MinRef struct{ NS, ID string }
 
+// String is m as given: {ns}:{ns_id}, or a bare ns_id.
+func (m MinRef) String() string {
+	if m.NS == "" {
+		return m.ID
+	}
+	return m.NS + ":" + m.ID
+}
+
+// MinError is a 400 for mins refused (§A.5): its body's min lists them, as
+// given, so a tool drops them (Refused; malformed ones too, as the tree
+// service lists them).
+type MinError struct {
+	Msg     string
+	Refused []string
+}
+
+func (e *MinError) Error() string { return e.Msg }
+
+// With returns the MinError listing e's mins (e may be nil) and refused,
+// each once and in the order given (the request's min values) has them,
+// msg added to e's message: one 400 lists every min refused, whatever the
+// reasons (§A.5).
+func (e *MinError) With(given, refused []string, msg string) *MinError {
+	if len(refused) == 0 {
+		return e
+	}
+	set := map[string]bool{}
+	var msgs []string
+	if e != nil {
+		for _, s := range e.Refused {
+			set[s] = true
+		}
+		msgs = append(msgs, e.Msg)
+	}
+	for _, s := range refused {
+		set[s] = true
+	}
+	if !slices.Contains(msgs, msg) {
+		msgs = append(msgs, msg)
+	}
+	out := &MinError{Msg: strings.Join(msgs, "; ")}
+	for _, s := range given {
+		if set[s] {
+			out.Refused = append(out.Refused, s)
+			delete(set, s)
+		}
+	}
+	return out
+}
+
 // ParseMin parses "{ns_id}" or "{ns}:{ns_id}" (§A.5, §B.5).
 func ParseMin(s string) (MinRef, error) {
 	var m MinRef
@@ -98,6 +167,7 @@ func ParseMin(s string) (MinRef, error) {
 }
 
 type rangeFilter struct {
+	name     string // gt, ge, lt or le
 	op, path string
 	num      bool
 	f        float64
@@ -129,9 +199,13 @@ func validPath(p string) error {
 }
 
 // ParseQuery parses and validates query parameters. Unknown parameters are
-// rejected, so cache keys stay meaningful.
+// rejected, so cache keys stay meaningful. Malformed mins, and bare ones
+// given more than once, are a *MinError listing them returned with the
+// query, its other mins in Mins: the caller judges those too, so that one
+// 400 lists every min refused (§A.5).
 func ParseQuery(v url.Values) (*Query, error) {
 	q := &Query{Facets: map[string][]string{}, Limit: 20}
+	var bad *MinError
 	one := func(k string) (string, error) {
 		if len(v[k]) > 1 {
 			return "", fmt.Errorf("%s given more than once", k)
@@ -145,12 +219,34 @@ func ParseQuery(v url.Values) (*Query, error) {
 				return nil, err
 			}
 		case "min":
+			// A set (§A.5): the same value twice is one. A bare ns_id is
+			// given once, on a query of one namespace; only {ns}:{ns_id}
+			// repeats.
+			seen := map[MinRef]bool{}
+			var bares []string
 			for _, s := range vals {
 				m, err := ParseMin(s)
 				if err != nil {
-					return nil, err
+					if bad == nil {
+						bad = &MinError{Msg: err.Error()}
+					}
+					if !slices.Contains(bad.Refused, s) {
+						bad.Refused = append(bad.Refused, s)
+					}
+					continue
+				}
+				if seen[m] {
+					continue
+				}
+				seen[m] = true
+				if m.NS == "" {
+					bares = append(bares, s)
 				}
 				q.Mins = append(q.Mins, m)
+			}
+			if len(bares) > 1 {
+				bad = bad.With(vals, bares, "min={ns_id} given more than once; name other namespaces as min={ns}:{ns_id}")
+				q.Mins = slices.DeleteFunc(q.Mins, func(m MinRef) bool { return m.NS == "" })
 			}
 		case "sort":
 			// One parameter, keys comma-separated: the canonical form
@@ -183,11 +279,20 @@ func ParseQuery(v url.Values) (*Query, error) {
 				}
 			}
 		case "counts":
-			for _, s := range vals {
-				if err := validPath(s); err != nil {
+			// One value, paths comma-separated, as fields (§A.4, §A.5):
+			// a repeated non-repeatable parameter is 400.
+			if _, err := one(k); err != nil {
+				return nil, err
+			}
+			seen := map[string]bool{}
+			for _, p := range strings.Split(vals[0], ",") {
+				if err := validPath(p); err != nil {
 					return nil, fmt.Errorf("counts: %v", err)
 				}
-				q.Counts = append(q.Counts, s)
+				if !seen[p] {
+					seen[p] = true
+					q.Counts = append(q.Counts, p)
+				}
 			}
 		default:
 			name, path, ok := bracket(k)
@@ -202,11 +307,11 @@ func ParseQuery(v url.Values) (*Query, error) {
 				q.Facets[path] = append(q.Facets[path], vals...)
 			case rangeOps[name] != "":
 				for _, s := range vals {
-					rf := rangeFilter{op: rangeOps[name], path: path}
+					// Strings compare as stored: as UTF-8 bytes, with
+					// no date-time normalisation (§A.2).
+					rf := rangeFilter{name: name, op: rangeOps[name], path: path}
 					if f, err := strconv.ParseFloat(s, 64); err == nil {
 						rf.num, rf.f = true, f
-					} else if t, ok := normTime(s); ok {
-						rf.s = t
 					} else {
 						rf.s = s
 					}
@@ -217,7 +322,6 @@ func ParseQuery(v url.Values) (*Query, error) {
 			}
 		}
 	}
-	sort.Strings(q.Counts)
 	sort.Slice(q.Ranges, func(i, j int) bool {
 		a, b := q.Ranges[i], q.Ranges[j]
 		if a.path != b.path {
@@ -248,19 +352,37 @@ func ParseQuery(v url.Values) (*Query, error) {
 	if s := v.Get("after"); s != "" && q.ByName() {
 		q.AfterName = s
 	} else if s != "" {
-		n, err := strconv.Atoi(s)
-		if err != nil || n < 0 {
-			return nil, fmt.Errorf("after must be a non-negative integer")
+		n, err := parsePosition(s)
+		if err != nil {
+			return nil, err
 		}
 		q.After = n
+	}
+	if bad != nil {
+		return q, bad
 	}
 	return q, nil
 }
 
 // ByName reports whether q pages by resource name, as /_refs does (§A.4):
-// a ref query without q or sort, whose hits are in resource order. Its
-// after is a bare resource name, a plain bound.
-func (q *Query) ByName() bool { return q.Ref != nil && len(q.words) == 0 && len(q.Sorts) == 0 }
+// a query without q or sort, whose hits are in resource order. Its after
+// is a bare resource name, a plain bound; any other query's is the
+// position its next gives (positionAfter).
+func (q *Query) ByName() bool { return len(q.words) == 0 && len(q.Sorts) == 0 }
+
+// positionAfter is the after of the page following hits ones of a query
+// that pages by position: an opaque value (§A.4), here the count of hits
+// before that page.
+func positionAfter(hits int) string { return strconv.Itoa(hits) }
+
+// parsePosition parses a positionAfter value.
+func parsePosition(s string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 || strconv.Itoa(n) != s {
+		return 0, fmt.Errorf("after is not a position a next of this query gave")
+	}
+	return n, nil
+}
 
 // words splits q into search words: whitespace-separated, keeping only
 // words with a letter or digit; a trailing * marks a prefix.
@@ -302,6 +424,9 @@ type Hit struct {
 	Refs     []RefHit         // with ?ref=: the matching references (§A.4)
 	Self     bool             // with ?ref=: the document references itself
 	docid    int64
+	// epoch is the epoch the document's head is served under, in a
+	// sealed or e2e namespace (docs.epoch), 0 where not known.
+	epoch int
 }
 
 // RefHit is one reference of a hit: where it sits and the string as written.
@@ -312,15 +437,16 @@ type RefHit struct {
 
 // Result is a page of hits.
 type Result struct {
-	Hits   []Hit
-	More   bool
-	Counts map[string][]FacetCount
-}
-
-// FacetCount is one value of a facet count.
-type FacetCount struct {
-	Value any `json:"value"`
-	Count int `json:"count"`
+	Hits []Hit
+	More bool
+	// Counts is path → string form of a facet value (§A.2) → the hits that
+	// have it, over every hit, not only the page (§A.4).
+	Counts map[string]map[string]int
+	// Epochs are, when the query asks for them, the distinct epochs
+	// (docs.epoch, 0 where not known) of the documents the result's
+	// values come from: the page's hits, and with counts every hit
+	// counted (§E.2.6 whole-response sealing).
+	Epochs []int
 }
 
 // filter is the ?ref= filter, a ?facet= path or a range: a condition on
@@ -377,7 +503,7 @@ func (q *Query) filters() []filter {
 		fs = append(fs, f)
 	}
 	// The ranges on one path are one filter: a document has one sort value
-	// per path, and on the query index they bound one range.
+	// per path, its least, and on the query index they bound one range.
 	for i := 0; i < len(q.Ranges); {
 		f := filter{table: `"sort"`, a: "r", idx: "sort_q", pk: "sqlite_autoindex_sort_1", args: []any{q.Ranges[i].path}}
 		cond := `r.path = ?`
@@ -493,20 +619,9 @@ func (ix *Index) candidateSQL(ns string, q *Query, fs []filter, drive int) (stri
 	sb.WriteString(` FROM `)
 	switch {
 	case len(q.words) > 0:
-		sb.WriteString(`(SELECT docid, sum(s) AS score FROM (`)
-		for i, w := range q.words {
-			if i > 0 {
-				sb.WriteString(` UNION ALL `)
-			}
-			if ix.fts {
-				fmt.Fprintf(&sb, `SELECT rowid >> %d AS docid, %d AS k, -rank AS s FROM "text" WHERE "text" MATCH ?`, textShift, i)
-				args = append(args, ftsPhrase(w))
-			} else {
-				fmt.Fprintf(&sb, `SELECT docid, %d AS k, 1.0 AS s FROM "text" WHERE body LIKE ? ESCAPE '\'`, i)
-				args = append(args, likePattern(w))
-			}
-		}
-		fmt.Fprintf(&sb, `) GROUP BY docid HAVING count(DISTINCT k) = %d) t CROSS JOIN docs d`, len(q.words))
+		m, margs := textMatchSQL(ix.fts, ns, q.words, q.toks)
+		sb.WriteString(m + ` t CROSS JOIN docs d`)
+		args = append(args, margs...)
 	case drive >= 0:
 		f := fs[drive]
 		sb.WriteString(`(SELECT DISTINCT ` + f.a + `.resource FROM ` + f.table + ` ` + f.a + ` INDEXED BY ` + f.idx + ` WHERE ` + f.a + `.ns = ? AND ` + f.cond + `) m CROSS JOIN docs d`)
@@ -527,9 +642,19 @@ func (ix *Index) candidateSQL(ns string, q *Query, fs []filter, drive int) (stri
 		sb.WriteString(` AND d.resource = m.resource`)
 	}
 	if q.Schema != "" {
-		pre := strings.TrimRight(q.Schema, "/") + "/"
-		sb.WriteString(` AND (d.schema = ? OR substr(d.schema, 1, ?) = ?)`)
-		args = append(args, q.Schema, len(pre), pre)
+		// §A.4: an exact $schema, or a schema's resource path, which
+		// matches its revisions: the range of revision paths it prefixes
+		// ("/rev0" is the first string after every "/rev/…").
+		// No $schema is a resource path, so that form needs no exact
+		// test. The unary + keeps docs_q out of the plan, which the
+		// filter or the scan decides (TestPlans).
+		if r, ok := annot.ParseRefString(q.Schema); ok && r.Rev == "" && !strings.Contains(q.Schema, "#") {
+			sb.WriteString(` AND +d.schema >= ? AND +d.schema < ?`)
+			args = append(args, q.Schema+"/rev/", q.Schema+"/rev0")
+		} else {
+			sb.WriteString(` AND +d.schema = ?`)
+			args = append(args, q.Schema)
+		}
 	}
 	if q.AfterName != "" && len(q.Counts) == 0 {
 		// With counts, which count every hit, run skips those up to after.
@@ -550,10 +675,68 @@ func (ix *Index) candidateSQL(ns string, q *Query, fs []filter, drive int) (stri
 		}
 		fmt.Fprintf(&sb, `s%d.value IS NULL, s%d.value %s, `, i, i, dir)
 	}
-	if len(q.words) > 0 {
+	if len(q.words) > 0 && len(q.Sorts) == 0 {
+		// §A.4: by sort where it is given, else by score; ties always by
+		// resource name, never by score after sort keys.
 		sb.WriteString(`t.score DESC, `)
 	}
 	sb.WriteString(`d.resource`)
+	return sb.String(), args
+}
+
+// scoreK1 saturates a word's term frequency in a hit's score (§A.4): a
+// word occurring tf times in the document counts tf·(k1+1)/(tf+k1), BM25's
+// term weight with a fixed idf and no length normalisation. A score so
+// depends on its document alone, never on documents the reader can't see
+// or on other namespaces (whose statistics FTS5's rank, bm25, reads), so
+// readers who share a result share its scores too.
+const scoreK1 = 1.2
+
+// textMatchSQL is the subquery of the documents whose text matches every
+// word, (docid, score), the words' FTS5 tokens in toks (nil: not
+// tokenized). With FTS5, a word of one token occurs in a row as often as
+// the token, or for a prefix word a token it prefixes, does: those rows
+// and counts are the term's instances in the index (temp.text_vi,
+// Index.ftsTokens), read without tokenizing any text, so a query costs
+// what the instances of its terms do. Any other word's occurrences in a
+// row are the phrase instances highlight() marks, which tokenizes the row
+// again, so only rows of documents of ns (by docid, without reading the
+// row) are (in a select of its own: LIMIT -1 keeps SQLite from flattening
+// it into the aggregate, where an FTS5 auxiliary function can't run).
+// With the LIKE table, a row of ns's case-folded (ASCII) occurrences of
+// the word. A row that matched counts at least one.
+func textMatchSQL(fts bool, ns string, words []string, toks [][]string) (string, []any) {
+	var sb strings.Builder
+	var args []any
+	fmt.Fprintf(&sb, `(SELECT docid, sum(tf * %g / (tf + %g)) AS score FROM (SELECT docid, k, sum(c) AS tf FROM (`, scoreK1+1, scoreK1)
+	for i, w := range words {
+		if i > 0 {
+			sb.WriteString(` UNION ALL `)
+		}
+		switch {
+		case fts && toks != nil && len(toks[i]) == 1:
+			// The token's instances: terms equal to it, or for a prefix
+			// word every term it prefixes, [t, t+"\xf5") in byte order
+			// (no UTF-8 byte is 0xf5).
+			fmt.Fprintf(&sb, `SELECT doc >> %d AS docid, %d AS k, count(*) AS c FROM temp.text_vi WHERE `, textShift, i)
+			if t := toks[i][0]; strings.HasSuffix(w, "*") {
+				sb.WriteString(`term >= ? AND term < ?`)
+				args = append(args, t, t+"\xf5")
+			} else {
+				sb.WriteString(`term = ?`)
+				args = append(args, t)
+			}
+			sb.WriteString(` GROUP BY doc`)
+		case fts:
+			fmt.Fprintf(&sb, `SELECT * FROM (SELECT rowid >> %d AS docid, %d AS k, max(1, length(highlight("text", 4, char(1), '')) - length(body)) AS c FROM "text" WHERE "text" MATCH ? AND rowid >> %d IN (SELECT docid FROM docs WHERE ns = ?) LIMIT -1)`, textShift, i, textShift)
+			args = append(args, ftsPhrase(w), ns)
+		default:
+			fmt.Fprintf(&sb, `SELECT docid, %d AS k, max(1, (length(body) - length(replace(lower(body), lower(?), ''))) / length(?)) AS c FROM "text" WHERE body LIKE ? ESCAPE '\' AND ns = ?`, i)
+			bare := strings.TrimRight(w, "*")
+			args = append(args, bare, bare, likePattern(w), ns)
+		}
+	}
+	fmt.Fprintf(&sb, `) GROUP BY docid, k) GROUP BY docid HAVING count(*) = %d)`, len(words))
 	return sb.String(), args
 }
 
@@ -604,8 +787,56 @@ func (ix *Index) attachRefs(ctx context.Context, tx *sql.Tx, ns string, rf *RefF
 	return rows.Err()
 }
 
+// ftsTokens tokenizes q's words as the FTS5 text table does, so that
+// textMatchSQL reads a word of one token from its instances: through a
+// TEMP FTS5 table with the same tokenizer and an fts5vocab table of it,
+// in tx's connection, which also gets temp.text_vi, the text table's
+// instances. They live in TEMP only and go with tx, rolled back.
+func (ix *Index) ftsTokens(ctx context.Context, tx *sql.Tx, q *Query) error {
+	if !ix.fts || len(q.words) == 0 || q.toks != nil {
+		return nil
+	}
+	for _, s := range []string{
+		`CREATE VIRTUAL TABLE IF NOT EXISTS temp.qtok USING fts5(w, tokenize = '` + ftsTokenizer + `')`,
+		`CREATE VIRTUAL TABLE IF NOT EXISTS temp.qtok_vi USING fts5vocab(temp, qtok, instance)`,
+		`CREATE VIRTUAL TABLE IF NOT EXISTS temp.text_vi USING fts5vocab(main, "text", instance)`,
+		`DELETE FROM temp.qtok`,
+	} {
+		if _, err := tx.ExecContext(ctx, s); err != nil {
+			return fmt.Errorf("tokenizing q: %w", err)
+		}
+	}
+	for i, w := range q.words {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO temp.qtok (rowid, w) VALUES (?, ?)`, i+1, strings.TrimRight(w, "*")); err != nil {
+			return fmt.Errorf("tokenizing q: %w", err)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT doc, term FROM temp.qtok_vi ORDER BY doc, offset`)
+	if err != nil {
+		return fmt.Errorf("tokenizing q: %w", err)
+	}
+	defer rows.Close()
+	toks := make([][]string, len(q.words))
+	for rows.Next() {
+		var i int
+		var t string
+		if err := rows.Scan(&i, &t); err != nil {
+			return err
+		}
+		toks[i-1] = append(toks[i-1], t)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	q.toks = toks
+	return nil
+}
+
 // run executes q against ns inside tx. allow filters hits (nil = all).
 func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow func(resource string) bool) (*Result, error) {
+	if err := ix.ftsTokens(ctx, tx, q); err != nil {
+		return nil, err
+	}
 	fs := q.filters()
 	drive, err := ix.driver(ctx, tx, ns, q, fs)
 	if err != nil {
@@ -617,7 +848,8 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 		return nil, err
 	}
 	res := &Result{}
-	var all []string // allowed resources, when counting
+	var all []string   // allowed resources, when counting
+	var allIDs []int64 // and their docids, for their epochs
 	n := 0
 	for rows.Next() {
 		var h Hit
@@ -630,6 +862,9 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 		}
 		if len(q.Counts) > 0 {
 			all = append(all, h.Resource)
+			if q.epochs {
+				allIDs = append(allIDs, h.docid)
+			}
 		}
 		n++
 		switch {
@@ -664,19 +899,89 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 			return nil, err
 		}
 	}
+	if !q.epochs {
+		return res, nil
+	}
+	if err := attachEpochs(ctx, tx, res.Hits); err != nil {
+		return nil, err
+	}
+	epochs := map[int]bool{}
+	for _, h := range res.Hits {
+		epochs[h.epoch] = true
+	}
+	if len(q.Counts) > 0 {
+		ids, _ := json.Marshal(allIDs)
+		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT coalesce(d.epoch, 0) FROM json_each(?) j CROSS JOIN docs d WHERE d.docid = j.value`, string(ids))
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var e int
+			if err := rows.Scan(&e); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			epochs[e] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	for e := range epochs {
+		res.Epochs = append(res.Epochs, e)
+	}
+	slices.Sort(res.Epochs)
 	return res, nil
 }
 
-// FieldError is a ?fields= path that no schema indexed in the namespace
-// marks with x-index (§A.4): 400.
-type FieldError struct{ Path string }
-
-func (e *FieldError) Error() string {
-	return "fields: " + e.Path + " is not a field any schema indexed in the namespace marks with x-index"
+// attachEpochs gives each hit the epoch its document's head is served
+// under (docs.epoch).
+func attachEpochs(ctx context.Context, tx *sql.Tx, hits []Hit) error {
+	if len(hits) == 0 {
+		return nil
+	}
+	idx := map[int64]int{}
+	ph := make([]string, len(hits))
+	args := make([]any, len(hits))
+	for i, h := range hits {
+		idx[h.docid] = i
+		ph[i], args[i] = "?", h.docid
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT docid, coalesce(epoch, 0) FROM docs WHERE docid IN (`+strings.Join(ph, ",")+`)`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var e int
+		if err := rows.Scan(&id, &e); err != nil {
+			return err
+		}
+		if i, ok := idx[id]; ok {
+			hits[i].epoch = e
+		}
+	}
+	return rows.Err()
 }
 
-// attachSorts gives each hit its sort values as written, for the paths
-// that have no facet value (a field that is both shows its facet values).
+// FieldError is a path of a query that no schema indexed in the namespace
+// for a document the reader may see marks with the x-index kind it needs
+// (§A.4, checkFields): 400, naming the parameter.
+type FieldError struct{ Param, Path, Kind string }
+
+func (e *FieldError) Error() string {
+	mark := "with x-index"
+	if e.Kind != "" {
+		mark = fmt.Sprintf("%q", e.Kind)
+	}
+	return e.Param + ": " + e.Path + " is not a path any schema indexed in the namespace for a document the reader may see marks " + mark
+}
+
+// attachSorts gives each hit its sort values as written, every value at the
+// path (§A.4), for the paths that have no facet value (a field that is both
+// shows its facet values).
 func (ix *Index) attachSorts(ctx context.Context, tx *sql.Tx, ns string, hits []Hit) error {
 	if len(hits) == 0 {
 		return nil
@@ -708,10 +1013,14 @@ func (ix *Index) attachSorts(ctx context.Context, tx *sql.Tx, ns string, hits []
 		if err != nil {
 			return err
 		}
+		vs, ok := v.([]any)
+		if !ok {
+			vs = []any{v}
+		}
 		if h.Sorts == nil {
 			h.Sorts = map[string][]any{}
 		}
-		h.Sorts[p] = []any{v}
+		h.Sorts[p] = vs
 	}
 	return rows.Err()
 }
@@ -797,16 +1106,18 @@ func (ix *Index) attachFacets(ctx context.Context, tx *sql.Tx, ns string, hits [
 	return rows.Err()
 }
 
-// counts tallies the facet values at paths of resources. When they are
-// few (at most maxDriveAll, and under half the path's rows, counted up to
-// that), it looks their rows up; else it reads all of the path's rows.
-func (ix *Index) counts(ctx context.Context, tx *sql.Tx, ns string, paths, resources []string) (map[string][]FacetCount, error) {
+// counts tallies the facet values at paths of resources, by their string
+// form (§A.2: the string "1" and the number 1 count together), each value
+// once per resource. When the resources are few (at most maxDriveAll, and
+// under half the path's rows, counted up to that), it looks their rows up;
+// else it reads all of the path's rows.
+func (ix *Index) counts(ctx context.Context, tx *sql.Tx, ns string, paths, resources []string) (map[string]map[string]int, error) {
 	in := make(map[string]bool, len(resources))
 	for _, r := range resources {
 		in[r] = true
 	}
 	var resJSON []byte // resources as a JSON array, for json_each
-	out := map[string][]FacetCount{}
+	out := map[string]map[string]int{}
 	for _, p := range paths {
 		n := 0
 		if len(resources) <= maxDriveAll {
@@ -821,44 +1132,31 @@ func (ix *Index) counts(ctx context.Context, tx *sql.Tx, ns string, paths, resou
 			if resJSON == nil {
 				resJSON, _ = json.Marshal(resources)
 			}
-			rows, err = tx.QueryContext(ctx, `SELECT f.resource, f.raw FROM json_each(?) j CROSS JOIN facet f INDEXED BY sqlite_autoindex_facet_1 WHERE f.ns = ? AND f.resource = j.value AND f.path = ?`, string(resJSON), ns, p)
+			rows, err = tx.QueryContext(ctx, `SELECT f.resource, f.value FROM json_each(?) j CROSS JOIN facet f INDEXED BY sqlite_autoindex_facet_1 WHERE f.ns = ? AND f.resource = j.value AND f.path = ?`, string(resJSON), ns, p)
 		} else {
-			rows, err = tx.QueryContext(ctx, `SELECT resource, raw FROM facet WHERE ns = ? AND path = ?`, ns, p)
+			rows, err = tx.QueryContext(ctx, `SELECT resource, value FROM facet WHERE ns = ? AND path = ?`, ns, p)
 		}
 		if err != nil {
 			return nil, err
 		}
+		// A resource's rows at a path have distinct values (the primary
+		// key), so each counts one hit.
 		c := map[string]int{}
 		for rows.Next() {
-			var r, raw string
-			if err := rows.Scan(&r, &raw); err != nil {
+			var r, v string
+			if err := rows.Scan(&r, &v); err != nil {
 				rows.Close()
 				return nil, err
 			}
 			if in[r] {
-				c[raw]++
+				c[v]++
 			}
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return nil, err
 		}
-		list := []FacetCount{}
-		keys := make([]string, 0, len(c))
-		for k := range c {
-			keys = append(keys, k)
-		}
-		sort.Slice(keys, func(i, j int) bool {
-			if c[keys[i]] != c[keys[j]] {
-				return c[keys[i]] > c[keys[j]]
-			}
-			return keys[i] < keys[j]
-		})
-		for _, k := range keys {
-			v, _ := jsonv.Parse([]byte(k))
-			list = append(list, FacetCount{Value: v, Count: c[k]})
-		}
-		out[p] = list
+		out[p] = c
 	}
 	return out, nil
 }

@@ -68,6 +68,10 @@ func TestListingVisibility(t *testing.T) {
 	where := func(token, item string) map[string]any {
 		t.Helper()
 		r, _ := w.follow("/cat/where?item="+item, token)
+		if r.status == 404 {
+			// Hidden, or not in the catalog (§B.5, §B.11.5).
+			return map[string]any{}
+		}
 		if r.status != 200 {
 			t.Fatalf("where %s: %d %v", item, r.status, r.body)
 		}
@@ -93,10 +97,10 @@ func TestListingVisibility(t *testing.T) {
 	}
 	// Translators' role reads with rules on /writes, which pass as a read
 	// evaluates them (no writes: within is true, §B.11.5 v0.38): its items
-	// are visible, but not the folder (for a folder only a role without
-	// rules counts).
+	// are visible, and so is the folder, since the rules don't refer to
+	// /resource (§B.11.5 v0.67, scenario 27).
 	anna := w.caller("user:anna", "translators")
-	if r, _ := w.follow("/cat/children?of=season", anna); r.status != 404 {
+	if r, _ := w.follow("/cat/children?of=season", anna); r.status != 200 || childNames(r.body) != "matches.derby,matches.shared" {
 		t.Errorf("translator on season: %d %v", r.status, r.body)
 	}
 	if !placed(anna, "/r/matches/derby") {
@@ -106,7 +110,7 @@ func TestListingVisibility(t *testing.T) {
 	w.issue(anna, map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 200)
 
 	// A role with rules on /resource only: an item where they pass is
-	// visible, the folder isn't (it has rules).
+	// visible, the folder isn't (its rules refer to /resource).
 	sc := w.caller("user:sam", "scopers")
 	w.doc("cat", "matches.derby3", map[string]any{"parents": parents("extra")})
 	w.doc("matches", "derby3", map[string]any{"title": "d3"})
@@ -149,15 +153,12 @@ func TestListingVisibility(t *testing.T) {
 	if r.status != 200 || childNames(r.body) != "matches.derby3,matches.x1" {
 		t.Errorf("timed after its rule went: %d %v", r.status, r.body)
 	}
-	// /read-grants uses the same test for catalog nodes.
+	// /read-grants uses the same test for catalog nodes of a sealed or
+	// end-to-end catalog (TestReadGrantsCatalogNodesV073); this one is
+	// neither, so its nodes are 400, visible or not (§B.11.5).
 	rg := w.do("POST", "/read-grants", ti, map[string]any{"items": toAny("/r/cat/extra", "/r/cat/season")})
-	gs := rg.body["grants"].([]any)
-	if gs[0].(map[string]any)["error"] != nil || gs[1].(map[string]any)["error"] == nil {
-		t.Errorf("read-grants for catalog nodes: %v", gs)
-	}
-	rg = w.do("POST", "/read-grants", anna, map[string]any{"items": toAny("/r/cat/season")})
-	if rg.body["grants"].([]any)[0].(map[string]any)["error"] == nil {
-		t.Errorf("read-grants: the translator gets a folder it can't list: %v", rg.body)
+	if entry(rg, 0)["status"] != 400.0 || entry(rg, 1)["status"] != 400.0 {
+		t.Errorf("read-grants for catalog nodes: %v", rg.body)
 	}
 }
 
@@ -209,8 +210,9 @@ func TestUnfilteredListings(t *testing.T) {
 			t.Errorf("%s for a namespace-wide reader: %d %v", op, r.status, r.body)
 		}
 	}
-	// Presenting g/all without the grants for it redirects to one's own.
-	if r := w.do("GET", loc, fan, nil); r.status != 302 || r.header.Get("Location") != locFan {
+	// Presenting g/all without the grants for it is 403, never redirected
+	// (§B.11.5).
+	if r := w.do("GET", loc, fan, nil); r.status != 403 || r.header.Get("Location") != "" {
 		t.Errorf("g/all for a role reader: %d %s", r.status, r.header.Get("Location"))
 	}
 }

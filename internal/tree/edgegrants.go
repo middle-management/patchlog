@@ -2,25 +2,20 @@ package tree
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"math"
 	"net/http"
-	"net/url"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
-	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/svcedge"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -42,12 +37,18 @@ import (
 //	                                 core's issuance (§C.5.2)
 //	DELETE /edge-grants?prefix=…     withdraw them (§C.5.4)
 //
+// The exchange's request and answer, withdrawal, the subjects behind each
+// gs and the exchangeRate buckets are package svcedge's, which an index
+// minting cookies of its own uses too.
+//
 // A cookie carries only kid, p and exp. A read under one is the subject
 // set's, so the service keeps the subjects behind each gs it minted a
-// cookie for (edge_subjects, kept across restarts and -rebuild, until the
-// last such cookie expires); a gs it doesn't know, minted by another
-// instance with its own database, is 401, and the reader exchanges again
-// here. A g/all cookie is checked against every content namespace the
+// cookie for (svcedge.Store: edge_subjects, kept across restarts and
+// -rebuild, until the last such cookie expires); a gs it doesn't know,
+// minted by another instance with its own database, is 401, and the
+// reader exchanges again here. Instances on one database share it, and
+// share the exchangeRate buckets too (§B.11.5). A g/all cookie is checked
+// against every content namespace the
 // catalog trusts at issue, and covers every later at, so a read at an at
 // that includes a namespace trusted since is 403 (trustedSince). The
 // edge can't make that check, and serves a cached listing to every g/all
@@ -60,89 +61,16 @@ import (
 // (cdnAll); a purged namespace counts as read whole by every reader only
 // once that long has passed since its purge (trustList).
 
-// maxEdgeGrants is how many grants one exchange takes in its body (§C.5.2).
-const maxEdgeGrants = 50
-
 // edgeClockSkew is how far an edge's clock may lag the service's: a
 // cookie the service holds expired may still pass an edge's checks that
 // long (edgeHold).
 const edgeClockSkew = time.Minute
 
 // Rate is a token bucket (§6.6): Rate refills it per second, up to Burst.
-type Rate struct{ Rate, Burst float64 }
+type Rate = svcedge.Rate
 
 // DefaultExchangeRate is exchangeRate's default (§6.6): 10/s, burst 100.
-var DefaultExchangeRate = Rate{Rate: 10, Burst: 100}
-
-// exchangeBuckets are the exchangeRate buckets of the service's exchange
-// (§C.5, §6.6), one per principal, keyed as the core keys write buckets:
-// the principal and the kid of its grant's key. They are the process's
-// own: each instance of the service draws on its own.
-type exchangeBuckets struct {
-	mu sync.Mutex
-	b  map[string]*tokenBucket
-}
-
-type tokenBucket struct {
-	tokens float64
-	last   time.Time
-}
-
-// maxIdleBuckets is how many buckets are held before full ones are
-// dropped: a full bucket is the same as none.
-const maxIdleBuckets = 4096
-
-// admit draws one token from the bucket of each key if each holds one,
-// and otherwise draws none and returns the wait until the emptiest
-// refills one.
-func (e *exchangeBuckets) admit(now time.Time, r Rate, keys []string) (time.Duration, bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.b == nil {
-		e.b = map[string]*tokenBucket{}
-	}
-	refill := func(b *tokenBucket) {
-		if el := now.Sub(b.last); el > 0 {
-			b.tokens = math.Min(r.Burst, b.tokens+el.Seconds()*r.Rate)
-			b.last = now
-		}
-	}
-	if len(e.b) > maxIdleBuckets {
-		for k, b := range e.b {
-			if refill(b); b.tokens >= r.Burst {
-				delete(e.b, k)
-			}
-		}
-	}
-	var wait time.Duration
-	bs := make([]*tokenBucket, len(keys))
-	for i, k := range keys {
-		b := e.b[k]
-		if b == nil {
-			b = &tokenBucket{tokens: r.Burst, last: now}
-			e.b[k] = b
-		}
-		refill(b)
-		bs[i] = b
-		if b.tokens < 1 {
-			wait = max(wait, time.Duration((1-b.tokens)/r.Rate*float64(time.Second)))
-		}
-	}
-	if wait > 0 {
-		return wait, false
-	}
-	for _, b := range bs {
-		b.tokens--
-	}
-	return 0, true
-}
-
-// edgeSubjects is a subject set behind a gs, and the expiry of the last
-// edge grant the service minted for it.
-type edgeSubjects struct {
-	subjects []string
-	exp      int64
-}
+var DefaultExchangeRate = svcedge.DefaultExchangeRate
 
 // edgePrefix is the prefix of the edge grants of a subject set: its
 // listings at every at (§B.11.5).
@@ -177,35 +105,42 @@ func (s *Service) serveEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	case s.opt.EdgeGrants == nil:
 		WriteError(w, http.StatusNotFound, "not_offered", "this service mints no edge grants")
 	case r.Method == http.MethodDelete:
-		s.withdrawEdgeGrants(w, r)
+		// The core's DELETE /edge-grants takes only core prefixes, so the
+		// service withdraws its own (§C.5.3, §C.5.4).
+		svcedge.Withdraw(w, r, s.opt.EdgeGrants, func(p string) bool { _, ok := s.edgeGS(p); return ok },
+			"/"+s.opt.Catalog+"/g/{gs} (§B.11.5)")
 	default:
 		s.issueEdgeGrants(w, r)
 	}
 }
 
 // issueEdgeGrants is POST /edge-grants (§B.11.5, following §C.5.2's
-// issuance): with the grant in Authorization, or 1 to maxEdgeGrants grants
-// as { "grants": [ … ] } in an application/json body (415 otherwise), it
-// answers 200 { prefixes, exp } and one Set-Cookie per prefix. Each grant
-// is resolved as a listing resolves its reader (viewer): the prefix is
-// /{catalog}/g/{gs} of its subject set, lasting until that grant's exp or
-// the cookies' TTL (15 minutes at most), whichever is sooner, or
-// /{catalog}/g/all for a reader with namespace-wide read on the catalog
-// and every content namespace it trusts, lasting until the earliest of
-// those grants. A prefix several grants give gets one cookie, lasting as
-// long as the longest, and exp is the earliest. It answers all or
-// nothing: if any grant is refused, the request is 401 if any is 401,
-// else 403, and 502 if a namespace document can't be read; once none is,
-// a purged catalog is 410 purged with head, as its listings are (§8.5: a
-// purged sealed catalog's read check is the core's). Once nothing
-// is refused, it draws one token from the exchangeRate bucket of each
-// distinct principal among the grants (ExchangeRate, §6.6), and is 429
-// (code "rate", limit "exchangeRate", with Retry-After) while any is
-// empty. While the core's authentication is disabled (§1), it is 404
-// not_offered, before the body is read; it takes no query parameter
-// (400, as the core's, §7). Cookies are Secure, HttpOnly and SameSite as
-// EdgeGrants says (None with credentialed origins, -cors-credentials-
-// origin, else Lax).
+// issuance): with the grant in Authorization, or 1 to svcedge.MaxGrants
+// grants as { "grants": [ … ] } in an application/json body (415
+// otherwise, svcedge.Bearers), it answers 200 { prefixes, exp } and one
+// Set-Cookie per prefix. Each grant is resolved as a listing resolves
+// its reader (grantViewer): the prefix is /{catalog}/g/{gs} of its
+// subject set, lasting until that grant's exp or the cookies' TTL (15
+// minutes at most), whichever is sooner, or /{catalog}/g/all for a
+// reader whose grants would be issued a namespace-wide edge grant on
+// every namespace it trusts that isn't public, the catalog included
+// (§C.5.2), lasting until the earliest of those grants. A prefix several
+// grants give gets one cookie, lasting as long as the longest, and exp
+// is the earliest. It answers all or nothing: if any grant is over
+// grantSize or rulesPerGrant, the request is 413 limit, as the origin
+// answers before any ns check (§C.8); if any other is refused, 401 if
+// any is 401, else 403, and 502 if a namespace document can't be read;
+// once none is, a purged catalog is 410 purged with head, as its
+// listings are (§8.5: a purged sealed catalog's read check is the
+// core's). Once nothing is refused, it draws one token from the
+// exchangeRate bucket of each distinct principal among the grants
+// (ExchangeRate, §6.6), shared with the instances on its database
+// (svcedge.Store), and is 429 (code "rate", limit "exchangeRate", with
+// Retry-After) while any is empty. While the core's authentication is
+// disabled (§1), it is 404 not_offered, before the body is read; it
+// takes no query parameter (400, as the core's, §7). Cookies are Secure,
+// HttpOnly and SameSite as EdgeGrants says (None with credentialed
+// origins, -cors-credentials-origin, else Lax).
 func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	root, err := s.c.Root(ctx)
@@ -222,9 +157,9 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadRequest, "bad_input", "POST /edge-grants takes no query parameters (§7)")
 		return
 	}
-	bearers, status, msg := edgeGrantBearers(r)
-	if status != 0 {
-		WriteError(w, status, "bad_input", msg)
+	bearers, refusal := svcedge.Bearers(r, svcedge.DefaultGrantSize)
+	if refusal != nil {
+		refusal.Write(w)
 		return
 	}
 	if len(bearers) == 0 {
@@ -237,13 +172,14 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	// checked against.
 	now := s.opt.Now()
 	var (
-		vs      []*viewer
-		refusal *grant.AuthError
-		upErr   error
-		purged  string
+		vs     []*viewer
+		limit  *grantcheck.LimitError
+		denied *grant.AuthError
+		upErr  error
+		purged string
 	)
 	for _, b := range bearers {
-		v, err := s.grantViewer(ctx, b)
+		v, err := s.grantViewer(ctx, b, "", true)
 		if client.IsPurged(err) {
 			// A purged sealed catalog's document is 410 (§8.5): the core
 			// makes the read check, as for a listing (serve).
@@ -253,11 +189,16 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
+		var le *grantcheck.LimitError
 		var ae *grant.AuthError
 		switch {
+		case errors.As(err, &le):
+			if limit == nil {
+				limit = le
+			}
 		case errors.As(err, &ae):
-			if refusal == nil || ae.Status == http.StatusUnauthorized && refusal.Status != http.StatusUnauthorized {
-				refusal = ae
+			if denied == nil || ae.Status == http.StatusUnauthorized && denied.Status != http.StatusUnauthorized {
+				denied = ae
 			}
 		case err != nil:
 			upErr = err
@@ -266,8 +207,11 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	switch {
-	case refusal != nil:
-		WriteAuthError(w, refusal, s.opt.Logf)
+	case limit != nil:
+		svcedge.Limit(limit.Limit, limit.Measured, limit.Max).Write(w)
+		return
+	case denied != nil:
+		WriteAuthError(w, denied, s.opt.Logf)
 		return
 	case upErr != nil:
 		WriteAuthError(w, upErr, s.opt.Logf)
@@ -290,14 +234,16 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 			keys = append(keys, v.bucket)
 		}
 	}
-	if wait, ok := s.exchanges.admit(now, s.opt.ExchangeRate, keys); !ok {
-		w.Header().Set("Retry-After", strconv.Itoa(max(int(math.Ceil(wait.Seconds())), 1)))
-		WriteJSON(w, http.StatusTooManyRequests, map[string]any{"code": "rate", "message": "rate limit exceeded",
-			"limit": "exchangeRate", "retryAfter": math.Ceil(wait.Seconds()*1000) / 1000})
+	switch wait, err := s.edge.Draw(ctx, now, s.opt.ExchangeRate, keys); {
+	case err != nil:
+		s.opt.Logf("tree: drawing from the exchangeRate buckets: %v", err)
+		WriteError(w, http.StatusInternalServerError, "internal", "cannot draw from the exchangeRate buckets")
+		return
+	case wait > 0:
+		svcedge.RateLimited(wait).Write(w)
 		return
 	}
-	var prefixes []string
-	exps := map[string]time.Time{}
+	issues := make([]svcedge.Issue, 0, len(vs))
 	subjects := map[string][]string{}
 	for _, v := range vs {
 		exp := s.opt.EdgeGrants.Lifetime(now, v.idExp)
@@ -306,130 +252,30 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		} else {
 			subjects[v.gs] = v.subjects
 		}
-		p := s.edgePrefix(v.gs)
-		old, ok := exps[p]
-		if !ok {
-			prefixes = append(prefixes, p)
-		}
-		if !ok || exp.After(old) {
-			exps[p] = exp
-		}
+		issues = append(issues, svcedge.Issue{Prefix: s.edgePrefix(v.gs), Exp: exp})
 	}
-	if exp, ok := exps[s.edgePrefix(AllSubjects)]; ok {
-		exps[s.edgePrefix(AllSubjects)] = s.allExp(now, exp)
-	}
-	for gs, subs := range subjects {
-		if err := s.recordSubjects(ctx, gs, subs, exps[s.edgePrefix(gs)], now); err != nil {
+	issues = svcedge.Merge(issues)
+	for i, is := range issues {
+		gs, _ := s.edgeGS(is.Prefix)
+		if gs == AllSubjects {
+			issues[i].Exp = s.allExp(now, is.Exp)
+			continue
+		}
+		if err := s.edge.Record(ctx, gs, subjects[gs], is.Exp, now); err != nil {
 			s.opt.Logf("tree: recording a subject set: %v", err)
 			WriteError(w, http.StatusInternalServerError, "internal", "cannot record the subject set")
 			return
 		}
 	}
-	var first time.Time
-	for _, p := range prefixes {
-		http.SetCookie(w, s.opt.EdgeGrants.Issue(edge.Claims{Prefix: p, Exp: exps[p].Unix()}, now))
-		if first.IsZero() || exps[p].Before(first) {
-			first = exps[p]
-		}
-	}
-	WriteJSON(w, http.StatusOK, map[string]any{"prefixes": prefixes, "exp": first.UTC().Format(time.RFC3339)})
-}
-
-// edgeGrantBearers are the grants an exchange takes (§C.5.2): those of a
-// body { "grants": [ … ] }, 1 to maxEdgeGrants tokens as they would follow
-// "Bearer ", which takes no Authorization; without a body, the grant in
-// Authorization, if any. The body must be application/json (415
-// otherwise): a cross-site form can send text/plain without a CORS
-// preflight, and would set cookies of its own grant in the reader's
-// browser. status is non-zero for a request it refuses.
-func edgeGrantBearers(r *http.Request) (bearers []string, status int, msg string) {
-	const max = 8 << 20
-	body, err := io.ReadAll(io.LimitReader(r.Body, max+1))
-	switch {
-	case err != nil:
-		return nil, http.StatusBadRequest, "cannot read the body"
-	case len(body) > max:
-		return nil, http.StatusRequestEntityTooLarge, "body too large"
-	case len(body) == 0:
-		if b := Bearer(r); b != "" {
-			return []string{b}, 0, ""
-		}
-		return nil, 0, ""
-	case r.Header.Get("Authorization") != "":
-		return nil, http.StatusBadRequest, "grants in the body take no Authorization (§C.5.2)"
-	}
-	ct, _, _ := strings.Cut(r.Header.Get("Content-Type"), ";")
-	if !strings.EqualFold(strings.TrimSpace(ct), "application/json") {
-		return nil, http.StatusUnsupportedMediaType, "use application/json"
-	}
-	v, err := jsonv.Parse(body)
-	if err != nil {
-		return nil, http.StatusBadRequest, "malformed body"
-	}
-	m, _ := v.(map[string]any)
-	gs, ok := m["grants"].([]any)
-	if !ok || len(m) != 1 || len(gs) < 1 || len(gs) > maxEdgeGrants {
-		return nil, http.StatusBadRequest, fmt.Sprintf("body must be { grants: [ … ] }, 1 to %d grants (§C.5.2)", maxEdgeGrants)
-	}
-	for _, g := range gs {
-		t, ok := g.(string)
-		if !ok || strings.TrimSpace(t) == "" {
-			return nil, http.StatusBadRequest, "each grant is a string: the token as it would follow \"Bearer \" (§C.5.2)"
-		}
-		bearers = append(bearers, strings.TrimSpace(t))
-	}
-	return bearers, 0, ""
-}
-
-// withdrawEdgeGrants is DELETE /edge-grants?prefix=… (§C.5.4):
-// 204 with an expired Set-Cookie of the same name and attributes
-// for each prefix named, once even if named twice. prefix is its only
-// parameter, repeatable, and each must be one of the service's,
-// /{catalog}/g/{gs} (400 otherwise): the core's DELETE /edge-grants takes
-// only core prefixes, so the service withdraws its own. It needs no grant,
-// since it only narrows, and answers the same while authentication is
-// disabled; its preflight is allowed only for credentialed origins
-// (internal/cors).
-func (s *Service) withdrawEdgeGrants(w http.ResponseWriter, r *http.Request) {
-	q, err := url.ParseQuery(r.URL.RawQuery)
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "bad_input", "malformed query string")
-		return
-	}
-	var prefixes []string
-	seen := map[string]bool{}
-	for k, vs := range q {
-		if k != "prefix" {
-			WriteError(w, http.StatusBadRequest, "bad_input", fmt.Sprintf("unknown query parameter %q", k))
-			return
-		}
-		for _, p := range vs {
-			if _, ok := s.edgeGS(p); !ok {
-				WriteError(w, http.StatusBadRequest, "bad_input", fmt.Sprintf("prefix %q isn't one this service issues: /%s/g/{gs} (§B.11.5)", p, s.opt.Catalog))
-				return
-			}
-			if !seen[p] {
-				seen[p] = true
-				prefixes = append(prefixes, p)
-			}
-		}
-	}
-	if len(prefixes) == 0 {
-		WriteError(w, http.StatusBadRequest, "bad_input", "prefix is required (§C.5.4)")
-		return
-	}
-	for _, p := range prefixes {
-		http.SetCookie(w, s.opt.EdgeGrants.Withdraw(p))
-	}
-	w.WriteHeader(http.StatusNoContent)
+	svcedge.Mint(w, s.opt.EdgeGrants, now, issues)
 }
 
 // edgeViewer is the viewer of a read under one of the service's edge
 // grants, cl, which covers the read's path (§B.11.5): the subject set of
 // its prefix, read as a listing for any grant resolving to it would be,
-// with no grant at all. So namespace-wide reads beyond the public
-// namespaces don't count (problems, orphans and manifests need them in a
-// subject set's URL space). Under g/all, the catalog and every trusted
+// with no grant at all. So it authorises that subject set's listings
+// only, and problems, orphans and manifests are 403 under it
+// (query.unfiltered, §B.11.5). Under g/all, the catalog and every trusted
 // content namespace are read whole, and listings are kept no longer than
 // the cookie; at an at including a namespace trusted since its issue the
 // read is 403 (serve, trustedSince). A namespace that was public at issue
@@ -444,7 +290,7 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 	var subs []string
 	if gs != AllSubjects {
 		var ok bool
-		if subs, ok = s.subjectsOf(ctx, gs); !ok {
+		if subs, ok = s.edge.Subjects(ctx, gs); !ok {
 			return nil, &grant.AuthError{Status: 401, Msg: "an edge grant for a subject set this service doesn't know: exchange the grant again"}
 		}
 	}
@@ -468,7 +314,7 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 		}
 	}
 	s.mu.RUnlock()
-	v := &viewer{gs: gs, contentAll: map[string]bool{}, wideNS: map[string]bool{}, wideGrant: map[string]bool{}}
+	v := &viewer{cookie: true, gs: gs, catPublic: catPublic, contentAll: map[string]bool{}, wideNS: map[string]bool{}, wideGrant: map[string]bool{}}
 	// A purged namespace is read whole by every reader, as under a grant
 	// (trustList).
 	for ns := range gone {
@@ -497,60 +343,6 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 	}
 	v.vis = s.opt.RoleView.ForSubjects(subs)
 	return v, nil
-}
-
-// recordSubjects records the subjects behind gs, for an edge grant
-// minted at now that expires at exp, and drops the records whose last
-// edge grant has expired.
-func (s *Service) recordSubjects(ctx context.Context, gs string, subjects []string, exp, now time.Time) error {
-	b, err := json.Marshal(subjects)
-	if err != nil {
-		return err
-	}
-	s.emu.Lock()
-	defer s.emu.Unlock()
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM edge_subjects WHERE exp <= ?`, now.Unix()); err != nil {
-		return err
-	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO edge_subjects (gs, subjects, exp) VALUES (?, ?, ?)
-		ON CONFLICT (gs) DO UPDATE SET subjects = excluded.subjects, exp = max(exp, excluded.exp)`, gs, string(b), exp.Unix()); err != nil {
-		return err
-	}
-	if s.edgeSubs == nil {
-		s.edgeSubs = map[string]edgeSubjects{}
-	}
-	for k, e := range s.edgeSubs {
-		if e.exp <= now.Unix() {
-			delete(s.edgeSubs, k)
-		}
-	}
-	e := s.edgeSubs[gs]
-	s.edgeSubs[gs] = edgeSubjects{subjects: subjects, exp: max(e.exp, exp.Unix())}
-	return nil
-}
-
-// subjectsOf is the subjects behind gs, recorded when an edge grant for it
-// was minted.
-func (s *Service) subjectsOf(ctx context.Context, gs string) ([]string, bool) {
-	s.emu.Lock()
-	defer s.emu.Unlock()
-	if e, ok := s.edgeSubs[gs]; ok {
-		return e.subjects, true
-	}
-	var text string
-	var exp int64
-	if err := s.db.QueryRowContext(ctx, `SELECT subjects, exp FROM edge_subjects WHERE gs = ?`, gs).Scan(&text, &exp); err != nil {
-		return nil, false
-	}
-	var subs []string
-	if json.Unmarshal([]byte(text), &subs) != nil {
-		return nil, false
-	}
-	if s.edgeSubs == nil {
-		s.edgeSubs = map[string]edgeSubjects{}
-	}
-	s.edgeSubs[gs] = edgeSubjects{subjects: subs, exp: exp}
-	return subs, true
 }
 
 // allExp is the exp of a g/all edge grant issued at now to last until exp,

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/follow"
@@ -24,9 +25,11 @@ type Info struct {
 	Level string // encryption.level ("" if none)
 	Epoch int    // encryption.epoch of a sealed or e2e namespace (default 1)
 	Pad   bool   // encryption.pad: sealed payloads are padded (§E.2.2)
-	// HistoryEpochs is encryption.historyEpochs: how many epochs back
-	// readers get keys for (0: all).
+	// HistoryEpochs is encryption.historyEpochs: how many epochs before
+	// the current one readers get keys for (§E.2.3), when HistoryCapped;
+	// all of them without it (§7.4).
 	HistoryEpochs int
+	HistoryCapped bool
 }
 
 // Protected reports whether views derived from the namespace are sealed.
@@ -43,8 +46,8 @@ func InfoOf(doc map[string]any) Info {
 		if f, ok := enc["epoch"].(float64); ok && f >= 1 {
 			in.Epoch = int(f)
 		}
-		if f, ok := enc["historyEpochs"].(float64); ok && f >= 1 {
-			in.HistoryEpochs = int(f)
+		if f, ok := enc["historyEpochs"].(float64); ok && f >= 0 {
+			in.HistoryEpochs, in.HistoryCapped = int(f), true
 		}
 	}
 	return in
@@ -74,6 +77,44 @@ type Keys struct {
 	epoch   map[string][]byte // kid → K_e
 	reasons map[string]string // ns → why it is skipped or partly read
 	skipped map[string]bool
+	lacks   map[string]bool // ns → skipped for want of keys, not for now (Check)
+	checked map[string]Info // ns → the level and epoch its last Check judged (Recheck)
+	// failed holds, by kid, why EpochKey last failed to get a key and
+	// until when it answers that again without asking POST /keys: every
+	// query or listing over a value under that epoch asks for its key,
+	// and /keys draws from the principal's exchangeRate (§E.2.3, §6.6).
+	failed map[string]keyFailure
+}
+
+// keyFailure is a failed EpochKey, answered again until until.
+type keyFailure struct {
+	err   error
+	until time.Time
+}
+
+// keyRetry is how long EpochKey answers a failure that lasts until the
+// configuration changes (not Retryable: no key for the grant, a sender
+// the service doesn't trust, a refusal) again before it asks POST /keys
+// anew. A config change the follower delivers (Observe) or a Forget
+// clears it at once.
+var keyRetry = time.Second
+
+// failureHold is how long EpochKey answers err again without asking: a
+// lasting failure for keyRetry, a 429 until its Retry-After (§6.6), at
+// most keyRetry when it has none; any other failure, which asking again
+// may mend at once (the core unreachable, a 5xx), not at all.
+func failureHold(err error) time.Duration {
+	var ae *client.APIError
+	switch {
+	case !Retryable(err):
+		return keyRetry
+	case errors.As(err, &ae) && ae.Status == 429:
+		if ae.RetryAfter > 0 {
+			return ae.RetryAfter
+		}
+		return keyRetry
+	}
+	return 0
 }
 
 // NewKeys returns a tracker reading with c. recipient is the service's
@@ -81,7 +122,8 @@ type Keys struct {
 // enc, and makes e2e namespaces readable (the keyring must name its public
 // key). It may be nil.
 func NewKeys(c *client.Client, recipient *ecdh.PrivateKey) *Keys {
-	k := &Keys{c: c, info: map[string]Info{}, epoch: map[string][]byte{}, reasons: map[string]string{}, skipped: map[string]bool{}}
+	k := &Keys{c: c, info: map[string]Info{}, epoch: map[string][]byte{}, reasons: map[string]string{}, skipped: map[string]bool{}, lacks: map[string]bool{},
+		checked: map[string]Info{}, failed: map[string]keyFailure{}}
 	if recipient != nil {
 		k.e2e = c.E2E(recipient).WithoutValidation()
 	}
@@ -128,7 +170,18 @@ func (k *Keys) Info(ctx context.Context, ns string) (Info, error) {
 func (k *Keys) Observe(ns string, doc map[string]any) {
 	k.mu.Lock()
 	k.info[ns] = InfoOf(doc)
+	k.forgetFailures(ns)
 	k.mu.Unlock()
+}
+
+// forgetFailures drops the failures EpochKey holds for ns's kids. k.mu is
+// held.
+func (k *Keys) forgetFailures(ns string) {
+	for kid := range k.failed {
+		if n, _, err := seal.ParseKid(kid); err == nil && n == ns {
+			delete(k.failed, kid)
+		}
+	}
 }
 
 // Forget drops what is known of ns and its epoch keys (after a purge-ns,
@@ -137,6 +190,7 @@ func (k *Keys) Forget(ns string) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	delete(k.info, ns)
+	k.forgetFailures(ns)
 	for kid := range k.epoch {
 		if n, _, err := seal.ParseKid(kid); err == nil && n == ns {
 			delete(k.epoch, kid)
@@ -147,51 +201,111 @@ func (k *Keys) Forget(ns string) {
 // EpochKey returns K_e of epoch epoch of ns: from POST /ns/{ns}/keys with
 // the service's grant (which must read the whole namespace: per-resource
 // keys can't seal a view), unwrapped with the recipient key if wrapped; for
-// an e2e namespace, relayed from or read in the keyring.
+// an e2e namespace, relayed from or read in the keyring, from a keyring
+// sender the service trusts to distribute keys (client.E2E.SealKey,
+// §E.3.2): it seals views and hands out K_r under it. An epoch from before
+// a raise from sealed to e2e is no keyring epoch: /keys gives its key as at
+// E2, without a sender, and it is taken as a sealed namespace's is
+// (preRaiseKey). A failure is answered again for keyRetry without asking
+// anew.
 func (k *Keys) EpochKey(ctx context.Context, ns string, epoch int) ([]byte, error) {
 	kid := seal.Kid(ns, epoch)
 	k.mu.Lock()
 	key := k.epoch[kid]
 	in := k.info[ns]
+	f, failed := k.failed[kid]
 	k.mu.Unlock()
 	if key != nil {
 		return key, nil
 	}
-	if in.Level == LevelE2E {
-		if k.e2e == nil {
-			return nil, fmt.Errorf("%w: %s (no keyring recipient key)", client.ErrNoKeys, kid)
+	if failed && time.Now().Before(f.until) {
+		return nil, f.err
+	}
+	key, err := k.fetchEpochKey(ctx, ns, kid, epoch, in)
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if err != nil {
+		if d := failureHold(err); d > 0 {
+			k.failed[kid] = keyFailure{err: err, until: time.Now().Add(d)}
 		}
-		var err error
-		if key, err = k.e2e.Key(ctx, kid); err != nil {
-			return nil, err
-		}
-	} else {
-		got, err := k.c.FetchKeys(ctx, ns, []int{epoch}, nil)
-		if err != nil {
-			return nil, err
-		}
-		for _, e := range got {
-			if e.Kid != kid || e.Resource != "" {
-				continue
-			}
-			key = e.Key
-			if key == nil {
-				if k.recipient == nil {
-					return nil, fmt.Errorf("derived: %s is wrapped to the grant's enc and no recipient key is configured", kid)
-				}
-				if key, err = seal.UnwrapKey(k.recipient, e.Wrapped); err != nil {
-					return nil, fmt.Errorf("derived: unwrapping %s: %w", kid, err)
-				}
-			}
-		}
-		if key == nil {
-			return nil, fmt.Errorf("%w: the grant gets no epoch key %s (a per-resource grant can't seal views)", client.ErrNoKeys, kid)
+		return nil, err
+	}
+	delete(k.failed, kid)
+	k.epoch[kid] = key
+	return key, nil
+}
+
+// fetchEpochKey is EpochKey without the cache.
+func (k *Keys) fetchEpochKey(ctx context.Context, ns, kid string, epoch int, in Info) ([]byte, error) {
+	if in.Level != LevelE2E {
+		return k.plainEpochKey(ctx, ns, kid, epoch)
+	}
+	if k.e2e == nil {
+		return nil, fmt.Errorf("%w: %s (no keyring recipient key)", client.ErrNoKeys, kid)
+	}
+	key, err := k.e2e.SealKey(ctx, kid)
+	if errors.Is(err, client.ErrUntrustedKey) && epoch < in.Epoch {
+		if pre, perr := k.preRaiseKey(ctx, ns, kid, epoch); perr == nil {
+			return pre, nil
 		}
 	}
-	k.mu.Lock()
-	k.epoch[kid] = key
-	k.mu.Unlock()
+	return key, err
+}
+
+// plainEpochKey takes K_e of kid from POST /ns/{ns}/keys: the entry with
+// neither a name nor a sender, raw or wrapped to the grant's enc in base
+// mode (§E.2.3).
+func (k *Keys) plainEpochKey(ctx context.Context, ns, kid string, epoch int) ([]byte, error) {
+	got, err := k.c.FetchKeys(ctx, ns, []int{epoch}, nil)
+	if err != nil {
+		return nil, err
+	}
+	var key []byte
+	for _, e := range got {
+		// A K_r (name) or a relayed keyring entry (from, §E.3.2)
+		// can't seal a view.
+		if e.Kid != kid || e.Resource != "" || e.From != "" {
+			continue
+		}
+		key = e.Key
+		if key == nil {
+			if k.recipient == nil {
+				return nil, fmt.Errorf("derived: %s is wrapped to the grant's enc and no recipient key is configured", kid)
+			}
+			if key, err = seal.UnwrapKey(k.recipient, e.Wrapped); err != nil {
+				return nil, fmt.Errorf("derived: unwrapping %s: %w", kid, err)
+			}
+		}
+	}
+	if key == nil {
+		return nil, fmt.Errorf("%w: the grant gets no epoch key %s (a per-resource grant can't seal views)", client.ErrNoKeys, kid)
+	}
 	return key, nil
+}
+
+// preRaiseKey takes K_e of kid, an epoch of e2e namespace ns before its
+// current one that no keyring sender the service trusts gave it, as the
+// key of an epoch from before a raise from sealed (Addendum E Levels):
+// /keys gives those as at E2, without a sender (plainEpochKey), and the
+// server held that content, and its key, before the raise, so views of it
+// sealed under that key tell the server nothing it didn't hold. Only for
+// an epoch the keyring names no key of, to anyone: a keyring epoch's
+// content was sealed by key holders, and views of it are sealed only under
+// a key from a sender the service trusts (§E.3.2), never under one the
+// server could have chosen; and never the epoch current now.
+func (k *Keys) preRaiseKey(ctx context.Context, ns, kid string, epoch int) ([]byte, error) {
+	kr, _, err := k.e2e.Keyring(ctx, ns)
+	if err != nil && !client.IsNotFound(err) {
+		return nil, err
+	}
+	if kr != nil {
+		for _, e := range kr.Entries {
+			if e.Kid == kid {
+				return nil, fmt.Errorf("%w: %s is a keyring epoch", client.ErrUntrustedKey, kid)
+			}
+		}
+	}
+	return k.plainEpochKey(ctx, ns, kid, epoch)
 }
 
 // Current returns ns's Info and, for a sealed or e2e namespace, the Key
@@ -205,6 +319,39 @@ func (k *Keys) Current(ctx context.Context, ns string) (Info, Key, error) {
 	return in, Key{NS: ns, Epoch: in.Epoch, K: key, Pad: in.Pad}, err
 }
 
+// KeyAt returns the Key that seals views derived from revisions of ns
+// served under epoch (§E.2.6): that epoch's key K_e, with ns's padding as
+// it is now (padding follows the source namespace, §E.2.6); epoch 0, not
+// known, is the epoch current now (Current).
+func (k *Keys) KeyAt(ctx context.Context, ns string, epoch int) (Key, error) {
+	in, err := k.Info(ctx, ns)
+	if err != nil {
+		return Key{}, err
+	}
+	if epoch <= 0 {
+		epoch = in.Epoch
+	}
+	key, err := k.EpochKey(ctx, ns, epoch)
+	return Key{NS: ns, Epoch: epoch, K: key, Pad: in.Pad}, err
+}
+
+// EpochOf is the epoch of kid, "{ns}#{e}", the kid of a sealed document
+// or op as served (client.Doc.Kid): the epoch the revision is served
+// under, which views derived from it are sealed under (§E.2.2, §E.2.6).
+// It is 0, not known, for a kid that doesn't parse, for "" (a document
+// served in the clear, or by a server from before the kid was kept) and
+// for one naming another namespace than ns: a base's, for content a
+// branch reads through, whose epochs aren't ns's. Views take the epoch
+// current when they are sealed for those (Keys.KeyAt), as a prune
+// snapshot of such a revision takes the epoch in force (§E.3.1).
+func EpochOf(ns, kid string) int {
+	kns, e, err := seal.ParseKid(kid)
+	if err != nil || kns != ns || e < 1 {
+		return 0
+	}
+	return e
+}
+
 // ResourceKey is a per-resource key K_r of one epoch.
 type ResourceKey struct {
 	Kid      string // "{ns}#{e}"
@@ -213,18 +360,19 @@ type ResourceKey struct {
 }
 
 // ResourceKeys derives K_r of ns/name (§E.2.1) for every epoch a reader
-// gets keys for: from the current one back encryption.historyEpochs epochs
-// (all if unset), as far as the service holds their epoch keys. It returns
-// nothing for a namespace that is neither sealed nor e2e, and an error only
-// if not even the current epoch's key is available.
+// gets keys for: the current one and, with encryption.historyEpochs h, the
+// h before it (all if unset, §E.2.3), as far as the service holds their
+// epoch keys. It returns nothing for a namespace that is neither sealed
+// nor e2e, and an error only if not even the current epoch's key is
+// available.
 func (k *Keys) ResourceKeys(ctx context.Context, ns, name string) ([]ResourceKey, error) {
 	in, err := k.Info(ctx, ns)
 	if err != nil || !in.Protected() {
 		return nil, err
 	}
 	first := 1
-	if in.HistoryEpochs > 0 {
-		first = max(1, in.Epoch-in.HistoryEpochs+1)
+	if in.HistoryCapped {
+		first = max(1, in.Epoch-in.HistoryEpochs)
 	}
 	var out []ResourceKey
 	for e := in.Epoch; e >= first; e-- {
@@ -251,23 +399,30 @@ func (k *Keys) ResourceKeys(ctx context.Context, ns, name string) ([]ResourceKey
 // (Retryable: the core unreachable, a 5xx, a 429), rather than the
 // service's keys as configured: ns is skipped all the same (nothing is
 // consumed that can't be decrypted or sealed), but a consumer waiting for
-// it keeps waiting. partial (an e2e namespace whose documents can't be
-// read, which a tree service may still follow for heads) is reported when
-// allowPartial and is not a skip. A purged namespace is consumed: its
-// follower learns of the purge.
+// it keeps waiting. A skip without retry is for want of keys (Skip):
+// client.ErrNoKeys, an e2e namespace and no recipient key, a 4xx from
+// /keys, or a key the service can't unwrap. partial (an e2e namespace
+// whose documents can't be read, which a tree service may still follow
+// for heads) is reported when allowPartial and is not a skip. A purged
+// namespace is consumed: its follower learns of the purge.
 func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason string, permanent, retry bool) {
 	in, err := k.Info(ctx, ns)
+	if err == nil {
+		k.mu.Lock()
+		k.checked[ns] = in
+		k.mu.Unlock()
+	}
 	switch {
 	case err != nil && errors.Is(err, client.ErrNoKeys):
 		reason = "sealed namespace and the service has no keys for it: " + err.Error()
 	case err != nil:
 		// Not an encryption problem (e.g. the core is unreachable): the
 		// follower's own retries report it.
-		k.setReason(ns, "", false)
+		k.setReason(ns, "", false, false)
 		return "", false, false
 	case in.Level == LevelE2E && k.e2e == nil:
 		if allowPartial {
-			k.setReason(ns, "e2e namespace and no keyring recipient key: documents are not read", false)
+			k.setReason(ns, "e2e namespace and no keyring recipient key: documents are not read", false, false)
 			return "", false, false
 		}
 		reason, permanent = "e2e namespace and no keyring recipient key configured", true
@@ -276,7 +431,7 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 		if client.IsPurged(err) {
 			// Its keys are destroyed with its content (§8.5): the
 			// follower learns of the purge, and nothing is left to seal.
-			k.setReason(ns, "", false)
+			k.setReason(ns, "", false, false)
 			return "", false, false
 		}
 		if err != nil {
@@ -284,8 +439,38 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 			retry = Retryable(err)
 		}
 	}
-	k.setReason(ns, reason, reason != "")
+	k.setReason(ns, reason, reason != "", reason != "" && !retry)
 	return reason, permanent, retry
+}
+
+// Recheck is Check for a namespace being followed, after its follower
+// delivered a config change (Observe) that changed its level or its epoch
+// since it was last checked: a raise (to sealed, or to e2e from none or
+// at-rest, Addendum E Levels), or a rotation (§E.2.4: at E3, one that
+// leaves the service out of the new epoch's readers), whose keys the
+// service lacks as configured skips it as Check does when the follower
+// starts, so its queries answer 404 as after a restart (§A.4, §E.2.6),
+// and lacks tells the caller to stop following it. A failure asking again
+// may mend leaves it consumed: its queries answer 503 behind until the
+// key is had, as before the change. A config change that keeps the level
+// and the epoch needs no keys of its own.
+func (k *Keys) Recheck(ctx context.Context, ns string, allowPartial bool) (reason string, lacks bool) {
+	k.mu.Lock()
+	in, known := k.info[ns]
+	was, checked := k.checked[ns]
+	k.mu.Unlock()
+	if known && checked && in.Level == was.Level && (!in.Protected() || in.Epoch == was.Epoch) {
+		return "", false
+	}
+	reason, _, retry := k.Check(ctx, ns, allowPartial)
+	switch {
+	case reason == "":
+		return "", false
+	case retry:
+		k.setReason(ns, "", false, false)
+		return reason, false
+	}
+	return reason, true
 }
 
 // Retryable reports a failure to fetch keys that asking again may mend:
@@ -296,7 +481,7 @@ func Retryable(err error) bool {
 	return !errors.Is(err, client.ErrNoKeys) && client.Transient(err)
 }
 
-func (k *Keys) setReason(ns, reason string, skipped bool) {
+func (k *Keys) setReason(ns, reason string, skipped, lacks bool) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if reason == "" {
@@ -305,16 +490,26 @@ func (k *Keys) setReason(ns, reason string, skipped bool) {
 		k.reasons[ns] = reason
 	}
 	k.skipped[ns] = skipped
+	k.lacks[ns] = lacks
 }
 
 // Skipped returns why ns is skipped ("" if it is consumed).
 func (k *Keys) Skipped(ns string) string {
+	reason, _ := k.Skip(ns)
+	return reason
+}
+
+// Skip returns why ns is skipped ("" if it is consumed), and whether for
+// want of keys: the service lacks them as configured (§A.4, §E.2.6: a
+// query of it is 404, as of a namespace the service doesn't follow), rather
+// than failing to fetch them for now (503 behind until it can, §12.1).
+func (k *Keys) Skip(ns string) (reason string, lacksKeys bool) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if !k.skipped[ns] {
-		return ""
+		return "", false
 	}
-	return k.reasons[ns]
+	return k.reasons[ns], k.lacks[ns]
 }
 
 // Status reports nss (sorted).
@@ -335,6 +530,9 @@ func (k *Keys) Status(nss []string) []Status {
 // with the keyring recipient key: revisions flagged by the fold (§E.3.2)
 // are logged by the caller through flagged and left out. It returns
 // ErrSkip for the keyring and for an e2e namespace the service can't read.
+// The document's Kid names the epoch the revision is served under
+// (EpochOf): at E2 the kid of the sealed document fetched, at E3 that of
+// the sealed op it comes from (client.E2EDoc.Kid).
 func (k *Keys) FetchDoc(ctx context.Context, ns, name, id string, flagged func(client.Flag)) (*client.Doc, error) {
 	in, err := k.Info(ctx, ns)
 	if err != nil {
@@ -366,5 +564,7 @@ func (k *Keys) FetchDoc(ctx context.Context, ns, name, id string, flagged func(c
 			flagged(f)
 		}
 	}
-	return &client.Doc{ID: d.ID, Value: d.Value}, nil
+	// The kid of the sealed op the document comes from: the epoch views
+	// derived from it are sealed under (§E.2.6).
+	return &client.Doc{ID: d.ID, Value: d.Value, Kid: d.Kid()}, nil
 }

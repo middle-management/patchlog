@@ -132,9 +132,9 @@ func TestVerifyCatchesTampering(t *testing.T) {
 	f := newFixture(t)
 	b, _, sum := f.export(t, bundle.ExportOptions{Select: []string{"matches/derby"}})
 
-	// The digest is the truncated SHA-256 of the canonical lines, which is
-	// the file itself for a bundle the Writer wrote, and doesn't depend on
-	// whitespace.
+	// The digest is the truncated SHA-256 of the bundle's bytes as written
+	// (§I.9), whose lines are canonical: a line with whitespace isn't, and
+	// is rejected (§G.4.1).
 	h := sha256.Sum256(b)
 	var id ids.ID
 	copy(id[:], h[:])
@@ -145,9 +145,7 @@ func TestVerifyCatchesTampering(t *testing.T) {
 	for _, l := range lines(b) {
 		spaced = append(spaced, append([]byte("  "), l...))
 	}
-	if v := must(bundle.Verify(bytes.NewReader(join(spaced)))); v.Digest != sum.Digest {
-		t.Fatal("whitespace changed the digest")
-	}
+	verifyErr(t, join(spaced), "not canonical")
 
 	// A tampered patch set: its id no longer matches.
 	verifyErr(t, bytes.Replace(b, []byte(`"Derby"`), []byte(`"Derbx"`), 1), "does not match its content")
@@ -191,7 +189,7 @@ func TestVerifyCatchesTampering(t *testing.T) {
 	}
 	verifyErr(t, join(sw), "chain")
 	// Authors in a bundle without authors.
-	verifyErr(t, bytes.Replace(b, []byte(`"kind":"rev"`), []byte(`"author":"mallory","kind":"rev"`), 1), "without authors")
+	verifyErr(t, bytes.Replace(b, []byte(`{"id":`), []byte(`{"author":"mallory","id":`), 1), "without authors")
 
 	// The importer checks requires against the target: nothing is written.
 	inc, _, _ := f.export(t, bundle.ExportOptions{Select: []string{"matches/cup"}, Requires: map[string]string{"schemas/match": f.matchV1}})
@@ -481,12 +479,13 @@ func TestAtomicAndBackfill(t *testing.T) {
 		}
 	}
 
-	// Atomic without an allowance: 413, explained, nothing written.
+	// Atomic without an allowance: a limit refusal (413, or 422 limit at
+	// step 4, §6.6), explained, nothing written.
 	dst := bulkTarget(t)
 	bob := dst.c.With(client.WithAuthor("bob"))
 	rep, err := bundle.Import(ctx, bob, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Atomic})
 	var tl *bundle.TooLargeError
-	if !errors.As(err, &tl) || !strings.Contains(err.Error(), "allowance") || !strings.Contains(err.Error(), "413") {
+	if !errors.As(err, &tl) || !strings.Contains(err.Error(), "allowance") || !client.IsLimit(err) {
 		t.Fatalf("atomic import without an allowance: %v", err)
 	}
 	if len(rep.Batches) != 1 || rep.Batches[0].DryRun != "failed" {

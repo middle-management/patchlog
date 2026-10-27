@@ -149,6 +149,35 @@ func (t *tx) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJ
 	return nil
 }
 
+// blobKeyEpochs lists the epochs a request for blob bid of resource name
+// of sealed namespace n would be served under (§E.2.2), for the key window
+// of a copy or a batch's local source (keywindow.go): those fixed, or,
+// when none of its referencing revisions has an epoch yet, the current
+// one, under which such a request would fix the newest of them
+// (sealedBlobHead). None if no still served revision references it.
+func (t *gate) blobKeyEpochs(n *nsRow, name string, bid ids.ID) map[int]bool {
+	v := t.resolve(n, name, nil)
+	eps := t.blobEpochs(n, v.head, bid)
+	if len(eps) == 0 && v.head != nil && t.blobRevServed(v.head, bid) {
+		eps[t.config(n.configSeq).Epoch] = true
+	}
+	return eps
+}
+
+// blobRevServed reports whether a still served revision of the history
+// ending at head references bid, as newestBlobRev looks for one.
+func (t *tx) blobRevServed(head *revRow, bid ids.ID) bool {
+	where := ` WHERE b.res = ? AND b.bid = ? AND r.seq <= ? AND r.kind = 0 AND ` + servedRev
+	for _, seg := range t.ancestry(head) {
+		var ok bool
+		t.must(t.QueryRow(`SELECT EXISTS (SELECT 1`+refRevs+where+`)`, seg.res, bid[:], seg.max).Scan(&ok))
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
 // newestBlobRev prepares the sealing of the newest still served revision
 // of the history ending at head whose document references bid, or nil.
 func (t *tx) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID) *sealJob {
@@ -177,21 +206,29 @@ func (t *tx) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID) *sea
 
 // sealedBlobJob is the sealing of a blob under one epoch, to store.
 type sealedBlobJob struct {
-	ns    string // the serving namespace's name
-	name  string
-	bid   ids.ID
-	epoch int
-	key   []byte
-	kid   string
-	pl    seal.PL
-	plain []byte
-	pad   bool
+	// ns is the namespace whose key seals it and under which it is
+	// stored; serving the one whose answer it is, ns but for a blob an
+	// e2e branch reads through from before its base's raise from sealed
+	// (preRaise, Addendum E Levels). Both by name.
+	ns       string
+	serving  string
+	preRaise bool
+	name     string
+	bid      ids.ID
+	epoch    int
+	key      []byte
+	kid      string
+	pl       seal.PL
+	plain    []byte
+	pad      bool
 }
 
 // ReadSealedBlob answers GET /r/{ns}/{name}/blob/{bid}/e/{e} (§E.2.2): the
 // blob sealed under epoch e, if n serves it under e. Other epochs are 404
 // with NoStore, or 410 pruned once pruning removed every revision of the
-// epoch that references it. Only sealed namespaces have this URL.
+// epoch that references it. Only sealed namespaces have this URL: in any
+// other it is 404 not_offered (epochNotOffered), but 410 for a purged
+// resource (§8.3).
 func (e *Engine) ReadSealedBlob(ctx context.Context, ns, name, bidText, epochText string, cred Credentials) (*Blob, error) {
 	b, err := e.OpenSealedBlob(ctx, ns, name, bidText, epochText, cred)
 	if err != nil {
@@ -222,8 +259,26 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 		}
 		out = &Blob{Public: t.cachePublic(n)}
 		bid, perr := ids.Parse(bidText)
+		// At E3 a blob from before a raise from sealed keeps its epoch
+		// URLs (Addendum E Levels, preraise.go); other blobs there have
+		// none.
+		var pre *preRaise
+		if perr == nil && t.isE2E(n) {
+			pre = t.preRaiseBlob(n, t.resolve(n, name, nil).head, bid)
+		}
+		if !t.isSealedNS(n) && pre == nil {
+			// Only sealed namespaces have this URL: 404 not_offered,
+			// after the resource's read check, cached as short (§7.1).
+			// A purged resource's URLs are 410 first, as its blob URL
+			// answers (§8.3: "before a not_offered as in §8.5"; raw.go).
+			if t.resolve(n, name, nil).state == Purged {
+				out.Status = 410
+				return nil
+			}
+			return epochNotOffered(out.Public)
+		}
 		ep, eerr := strconv.Atoi(epochText)
-		if perr != nil || eerr != nil || ep < 1 || strconv.Itoa(ep) != epochText || !t.isSealedNS(n) {
+		if perr != nil || eerr != nil || ep < 1 || strconv.Itoa(ep) != epochText {
 			out.Status = 404
 			return nil
 		}
@@ -236,8 +291,16 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			return nil
 		}
 		v := t.resolve(n, name, nil)
-		data, file, row := t.blobEpochRow(n, name, bid, ep)
-		if !t.blobEpochs(n, v.head, bid)[ep] {
+		// Sealings are stored under the namespace whose key seals them: a
+		// pre-raise blob's under the raised namespace, as it serves it.
+		sm, epochs := n, (map[int]bool)(nil)
+		if pre != nil {
+			sm, epochs = pre.m, t.preRaiseBlobEpochs(pre, v.head, bid)
+		} else {
+			epochs = t.blobEpochs(n, v.head, bid)
+		}
+		data, file, row := t.blobEpochRow(sm, name, bid, ep)
+		if !epochs[ep] {
 			if row && data == nil && file == "" {
 				// Recorded when pruning removed every revision of that
 				// epoch referencing it: 410 (§E.2.2). Anything else not
@@ -259,10 +322,17 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			out.setContent(memContent(data))
 			return nil
 		}
-		k, err := seal.ResourceKey(t.epochKey(n.id, ep), n.name, name)
+		// A remote branch's shadow seals under its source's name
+		// (kidName), as the source serves the blob (MF-37).
+		kns := t.kidName(sm)
+		k, err := seal.ResourceKey(t.epochKey(sm.id, ep), kns, name)
 		t.must(err)
-		job = &sealedBlobJob{ns: n.name, name: name, bid: bid, epoch: ep, key: k, kid: seal.Kid(n.name, ep),
-			pl: seal.BlobPL(n.name, name, bid.String()), plain: t.blobBytes(ans.row), pad: t.config(n.configSeq).Pad}
+		pad := t.config(n.configSeq).Pad
+		if pre != nil {
+			pad = pre.raise.pad
+		}
+		job = &sealedBlobJob{ns: sm.name, serving: n.name, preRaise: pre != nil, name: name, bid: bid, epoch: ep, key: k, kid: seal.Kid(kns, ep),
+			pl: seal.BlobPL(kns, name, bid.String()), plain: t.blobBytes(ans.row), pad: pad}
 		return nil
 	})
 	if err != nil {
@@ -291,6 +361,15 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 	return out, nil
 }
 
+// epochNotOffered is …/blob/{bid}/e/{e} outside sealed namespaces (§7.1,
+// §7.8): 404 not_offered, with the short class (§9). Public is for the
+// server's cache class, as for nfNS.
+func epochNotOffered(public bool) *Error {
+	e := apiErr(404, "not_offered", "message", "epoch blob URLs are served in sealed namespaces only (§7.1, §E.2.2)")
+	e.Public = &public
+	return e
+}
+
 // storeSealedBlob stores job's sealing unless one is stored already, and
 // returns the stored bytes: the first stored wins (§E.2.2). It returns nil
 // if the blob is no longer served under the epoch (a purge or a prune
@@ -300,14 +379,26 @@ func (e *Engine) sqlStoreSealedBlob(ctx context.Context, job *sealedBlobJob, sea
 	err := e.update(ctx, func(t *tx) error {
 		// Shared: purges and prunes, which delete or mark these rows,
 		// lock exclusively.
-		n := t.nsByName(job.ns)
-		if n != nil {
-			n = t.nsByIDLocked(n.id, lockShared)
+		var n *nsRow
+		if m := t.nsByName(job.ns); m != nil {
+			n = t.nsByIDLocked(m.id, lockShared)
+		}
+		if n != nil && job.serving != job.ns {
+			n = nil
+			if m := t.nsByName(job.serving); m != nil {
+				n = t.nsByIDLocked(m.id, lockShared)
+			}
 		}
 		if n == nil || n.purged || t.servableBlob(n, job.name, job.bid).status != 200 {
 			return nil
 		}
-		if !t.blobEpochs(n, t.resolve(n, job.name, nil).head, job.bid)[job.epoch] {
+		head := t.resolve(n, job.name, nil).head
+		if job.preRaise {
+			p := t.preRaiseBlob(n, head, job.bid)
+			if p == nil || p.m.name != job.ns || !t.preRaiseBlobEpochs(p, head, job.bid)[job.epoch] {
+				return nil
+			}
+		} else if !t.blobEpochs(n, head, job.bid)[job.epoch] {
 			return nil
 		}
 		var data, file any = sealed, nil

@@ -20,8 +20,10 @@ import (
 // A trusted content namespace that is purged leaves the catalog's grants
 // working, sealed or not (§8.5): once a sealed one is purged its namespace
 // documents are 410 purged, so the service reads no includes or keys from
-// it any more. A move is decided as before, a restore of its item is 410
-// as for any purged item, and other grants on its items are 410 too.
+// it any more. Its roles are gone with it, so it shows a non-admin no
+// node (§B.11.5), whose organising requests are 404; an admin's move is
+// decided as before. A restore of its item is 410 as for any purged item,
+// and other grants on its items are 410 too.
 func TestSealedContentPurged(t *testing.T) {
 	t.Parallel()
 	for _, sealed := range []bool{false, true} {
@@ -46,12 +48,14 @@ func TestSealedContentPurged(t *testing.T) {
 			}
 			waitFor(t, "the purge", func() bool { return w.svc.Tree().Checkpoint("matches") == head })
 
-			bob := w.caller("user:bob", "match-desk")
-			w.issue(bob, map[string]any{"node": "rumours", "want": toAny("move"), "to": toAny("deskonly")}, 200)
+			bob, admin := w.caller("user:bob", "match-desk"), w.caller("user:ada", "catalog-admins")
+			w.issue(bob, map[string]any{"node": "matches.derby", "want": toAny("move"), "to": toAny("deskonly")}, 404)
+			w.issue(admin, map[string]any{"node": "rumours", "want": toAny("move"), "to": toAny("deskonly")}, 200)
 			w.issue(bob, map[string]any{"item": "/r/matches/derby", "want": toAny("restore")}, 410)
 			if sealed {
 				w.issue(bob, map[string]any{"item": "/r/matches/derby", "want": toAny("append")}, 410)
-				w.issue(bob, map[string]any{"item": "/r/matches/fresh", "want": toAny("place"), "to": toAny("season")}, 410)
+				w.issue(bob, map[string]any{"item": "/r/matches/fresh", "want": toAny("place"), "to": toAny("season")}, 404)
+				w.issue(admin, map[string]any{"item": "/r/matches/fresh", "want": toAny("place"), "to": toAny("season")}, 410)
 			}
 		})
 	}

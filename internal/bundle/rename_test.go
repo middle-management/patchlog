@@ -585,7 +585,7 @@ func TestRenamedImportOntoRemoteBranch(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name, base, at string
-		chain          []string // rel's base.chain, as the target records it
+		chain          []string // rel's base.chain, as the target checks and records it
 		renamed        bool
 	}{
 		{"remote branch", "s-data", at, []string{"s-data"}, false},
@@ -597,7 +597,12 @@ func TestRenamedImportOntoRemoteBranch(t *testing.T) {
 			dst := newDeployment(t, cmsOrigin, remote)
 			// s-data/a's $schema pins s-schemas/item, which the target needs.
 			importB(t, dst, s.schema, bundle.ImportOptions{})
-			dst.ns("rel", map[string]any{"read": "public", "base": map[string]any{"origin": stagingOrigin, "ns": tc.base, "at": tc.at}})
+			// The genesis gives base.chain (§G.3), which the target checks.
+			chain := make([]any, len(tc.chain))
+			for i, ns := range tc.chain {
+				chain[i] = ns
+			}
+			dst.ns("rel", map[string]any{"read": "public", "base": map[string]any{"origin": stagingOrigin, "ns": tc.base, "at": tc.at, "chain": chain}})
 			base, _ := dst.nsDoc("rel")["base"].(map[string]any)
 			if chain, _ := base["chain"].([]any); !slices.EqualFunc(chain, tc.chain, func(x any, ns string) bool { return x == ns }) {
 				t.Fatalf("rel's base %v", base)

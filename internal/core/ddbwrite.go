@@ -27,12 +27,21 @@ const ddbAttempts = 8
 
 // writeItems is a resource write or a batch on DynamoDB.
 func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun bool) (res *WriteResult, err error) {
-	e := b.e
-	for _, it := range items {
-		if it.Resource == KeyringName {
-			return nil, ddbUnsupported("e2e keyrings")
-		}
+	if cc != nil {
+		// A config change a remote branch's base judges reads the base's
+		// document first (withRemoteSource, §G.5.2).
+		err = b.e.withRemoteSource(ctx, func(ctx context.Context) error {
+			var werr error
+			res, werr = b.writeItems1(ctx, req, items, cc, source, isBatch, dryRun)
+			return werr
+		})
+		return res, err
 	}
+	return b.writeItems1(ctx, req, items, cc, source, isBatch, dryRun)
+}
+
+func (b *ddbBackend) writeItems1(ctx context.Context, req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun bool) (res *WriteResult, err error) {
+	e := b.e
 	ctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
 	drawn := false
@@ -58,7 +67,7 @@ func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, 
 		}
 		p := out.p
 		if p.cplan != nil {
-			if err := ddbRefusals(p.cplan.cfg); err != nil {
+			if err := ddbRaiseRefused(r.config(p.n.configSeq), p.cplan.cfg); err != nil {
 				return nil, err
 			}
 		}
@@ -70,6 +79,7 @@ func (b *ddbBackend) writeItems(ctx context.Context, req Request, items []Item, 
 		if p.cplan != nil {
 			lvl = max(lvl, p.cplan.cfg.level)
 		}
+		c.Via = viaOf(p.a)
 		if c.Grant, err = b.storeGrant(ctx, p.a, lvl >= levelAtRest); err != nil {
 			return nil, err
 		}
@@ -153,7 +163,9 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 		entries = append(entries, map[string]any{"kind": "config", "target": cp.id.String()})
 	}
 	for _, s := range p.st {
-		it := ddb.CommitItem{Name: s.Resource}
+		// e2e content has no documents here (§E.3): its steps keep their
+		// sealed patch sets and declared blobs.
+		it := ddb.CommitItem{Name: s.Resource, E2E: g.e2eContent(p.n, s.Resource)}
 		if h := s.view.head; h != nil && r.revs[h.seq].key.ns != ns {
 			// Read through from a base (§7.6): the resource's own chain
 			// starts here, its first revision continuing the base's.
@@ -176,8 +188,16 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 			if step.parentID != nil {
 				cs.ParentID = step.parentID.String()
 			}
-			if !step.del {
+			switch {
+			case step.del:
+			case it.E2E:
 				cs.Patches = string(step.canon)
+				for bid := range step.blobs {
+					cs.Declared = append(cs.Declared, bid.String())
+				}
+				slices.Sort(cs.Declared)
+			default:
+				cs.Patches, cs.Legacy = string(step.canon), step.legacy
 				if step.docCanon != nil {
 					cs.Doc = string(step.docCanon)
 				} else {
@@ -290,6 +310,18 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 		}
 		return b.createNamespace(ctx, req, cc)
 	}
+	// A change a remote branch's base judges reads the base's document
+	// first (withRemoteSource, §G.5.2).
+	err = e.withRemoteSource(ctx, func(ctx context.Context) error {
+		var werr error
+		res, werr = b.writeConfig1(ctx, req, cc)
+		return werr
+	})
+	return res, err
+}
+
+func (b *ddbBackend) writeConfig1(ctx context.Context, req Request, cc ConfigChange) (res *WriteResult, err error) {
+	e := b.e
 	ctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
@@ -328,7 +360,7 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 			return out.p.replay, nil
 		}
 		n, p := out.n, out.p
-		if err := ddbRefusals(p.cfg); err != nil {
+		if err := ddbRaiseRefused(out.cur, p.cfg); err != nil {
 			return nil, err
 		}
 		gid, err := b.storeGrant(ctx, out.a, max(out.cur.level, p.cfg.level) >= levelAtRest)
@@ -336,7 +368,7 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 			return nil, err
 		}
 		c := &ddb.Commit{
-			NS: req.NS, Author: out.a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: out.a.noAuth,
+			NS: req.NS, Author: out.a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: out.a.noAuth, Via: viaOf(out.a),
 			CfgPos: r.cfgs[n.configSeq].pos, CfgID: r.cfgRow(n.configSeq).ID,
 			Config: &ddb.CommitConfig{ID: p.id.String(), Patches: string(p.canon), Doc: string(jsonv.Canonical(p.doc)), Frozen: p.cfg.Frozen},
 			Entry:  map[string]any{"kind": "config", "target": p.id.String()}, Kind: "config",
@@ -393,9 +425,6 @@ func (b *ddbBackend) createNamespace(ctx context.Context, req Request, cc Config
 		}
 		a, _, cfg, err := g.planCreate(req, cc)
 		if err == nil {
-			err = ddbRefusals(cfg)
-		}
-		if err == nil {
 			err = checkConfigGestures(&cc)
 		}
 		return planned{a, cfg, err}
@@ -423,7 +452,7 @@ func (b *ddbBackend) createNamespace(ctx context.Context, req Request, cc Config
 	e.rc.begin(inv)
 	cfgID, nsID, err := b.store.CreateNamespace(sctx, &ddb.Create{
 		NS: req.NS, Author: out.a.id(), Patches: cc.Patches,
-		Grant: grantID, NoAuth: out.a.noAuth, EpochKey: ek,
+		Grant: grantID, NoAuth: out.a.noAuth, Via: viaOf(out.a), EpochKey: ek,
 	})
 	e.invalidate(inv, false)
 	if err != nil {

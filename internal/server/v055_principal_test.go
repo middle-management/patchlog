@@ -47,7 +47,7 @@ var sixSixKeys = []string{"patchSetSize", "opsPerSet", "documentSize", "valueSiz
 // namespace document.
 func TestV055Principal(t *testing.T) {
 	t.Parallel()
-	f := newAuthFixture(t, map[string]any{"limits": map[string]any{"patchSetSize": 100000,
+	f := newAuthFixture(t, map[string]any{"limits": map[string]any{"patchSetSize": 210000,
 		"ratePerNamespace": map[string]any{"rate": 200, "burst": 400}, "retryWindow": "PT5M"}})
 	e := f.tenv
 
@@ -88,7 +88,7 @@ func TestV055Principal(t *testing.T) {
 		t.Fatalf("limit keys %v, want %v", keys, want)
 	}
 	def := core.DefaultLimits()
-	if l["patchSetSize"] != 100000.0 || l["opsPerSet"] != float64(def.OpsPerSet) || l["logPageSize"] != float64(def.LogPageSize) ||
+	if l["patchSetSize"] != 210000.0 || l["opsPerSet"] != float64(def.OpsPerSet) || l["logPageSize"] != float64(def.LogPageSize) ||
 		!reflect.DeepEqual(l["ratePerNamespace"], map[string]any{"rate": 200.0, "burst": 400.0}) ||
 		!reflect.DeepEqual(l["exchangeRate"], map[string]any{"rate": def.ExchangeRate.Rate, "burst": def.ExchangeRate.Burst}) ||
 		l["retryWindow"] != "PT5M" || l["remoteRegistration"] != "P30D" || l["blobGrace"] != "P1D" ||

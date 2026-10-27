@@ -192,7 +192,7 @@ func encScenario(t *testing.T, e *tenv, dir string, enc bool) []string {
 		t.Fatalf("archive plaintext: %v, want %v", bytes.Contains(raw, []byte(encMarker)), !enc)
 	}
 	f, _ := os.Open(p)
-	plain, err := e.e.OpenArchive(context.Background(), "m", "a", f)
+	plain, err := e.e.ReadArchive(context.Background(), "m", "a", f)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func encScenario(t *testing.T, e *tenv, dir string, enc bool) []string {
 	expectCode(t, e.get("/r/br/b2"), 410, "gone")
 	f, _ = os.Open(kept)
 	defer f.Close()
-	rd, err := e.e.OpenArchive(context.Background(), "m", "b2", f)
+	rd, err := e.e.ReadArchive(context.Background(), "m", "b2", f)
 	if enc {
 		if !errors.Is(err, core.ErrArchiveKeyDestroyed) {
 			t.Fatalf("purged archive opened: %v", err)
@@ -396,8 +396,9 @@ func TestEncryptionTurnOn(t *testing.T) {
 	// New writes, and a prune whose archive is now encrypted.
 	x = append(x, e.appendRev("s", "x", x[6], ops(op("add", "/new", encMarker)), g))
 	e.clock.Advance(10 * time.Minute) // past the retry window, before the grants expire
-	expect(t, e.prune("s", "x", map[string]any{"horizon": x[4]}, g), 200)
-	if b, _ := os.ReadFile(filepath.Join(dir, "s", "x", x[4]+".jsonl")); !bytes.HasPrefix(b, []byte("PLAR")) || bytes.Contains(b, []byte(encMarker)) {
+	// No retention rule matches x: moving its horizon needs a * key (§8.6).
+	expect(t, e.prune("s", "x", map[string]any{"horizon": x[4]}, ga), 200)
+	if b, _ := os.ReadFile(filepath.Join(dir, "s", "x", x[4]+".jsonl")); !bytes.HasPrefix(b, []byte(`{"id":`)) || !bytes.Contains(b, []byte(`"sealedBundle":1}`)) || bytes.Contains(b, []byte(encMarker)) {
 		t.Fatal("archive of an encrypted namespace is not encrypted")
 	}
 	assertNoPlaintext(t, path)

@@ -10,6 +10,8 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/text/unicode/norm"
+
+	"github.com/middle-management/patchlog/internal/files"
 )
 
 // Names in a file tree (§H.2): a file's or folder's name is its node's
@@ -23,7 +25,9 @@ const maxTitle = 255
 // titleWhy says why name can't be given to a file or folder in a tree
 // (§H.2 "Titles"), "" if it can: it must be UTF-8 (NFC is the caller's,
 // which normalises), 1 to 255 bytes of it, not . or .., without /, \,
-// NUL, or characters of Cc, Cf, Zl and Zp; and, since Windows drops them,
+// NUL, characters of Cc, Zl and Zp, or the bidirectional controls
+// U+202A–U+202E and U+2066–U+2069 (other Cf characters, joiners, soft
+// hyphens, LRM and RLM, are allowed); and, since Windows drops them,
 // without a trailing space or dot.
 func titleWhy(name string) string {
 	switch {
@@ -40,14 +44,18 @@ func titleWhy(name string) string {
 	}
 	for _, r := range name {
 		if badTitleRune(r) {
-			return fmt.Sprintf("it holds %U, and titles hold no /, \\, NUL, control or format characters, nor line or paragraph separators", r)
+			return fmt.Sprintf("it holds %U, and titles hold no /, \\, NUL, control characters, bidirectional controls (U+202A–U+202E, U+2066–U+2069), nor line or paragraph separators", r)
 		}
 	}
 	return ""
 }
 
+// badTitleRune reports a character no title holds (§H.2 "Titles"): /, \,
+// NUL, Cc, Zl, Zp, and of Cf only the bidirectional embeddings, overrides
+// and isolates, which make a name read as another.
 func badTitleRune(r rune) bool {
-	return r == '/' || r == '\\' || r == 0 || unicode.In(r, unicode.Cc, unicode.Cf, unicode.Zl, unicode.Zp)
+	return r == '/' || r == '\\' || r == 0 || unicode.In(r, unicode.Cc, unicode.Zl, unicode.Zp) ||
+		r >= 0x202A && r <= 0x202E || r >= 0x2066 && r <= 0x2069
 }
 
 // newTitle is the title a file or folder named name is given: name in NFC,
@@ -55,7 +63,7 @@ func badTitleRune(r rune) bool {
 func newTitle(name string) (string, error) {
 	t := norm.NFC.String(name)
 	if why := titleWhy(t); why != "" {
-		return "", fail(http.StatusForbidden, "%q can't name a file or folder here: %s; a name in a file tree is 1 to 255 bytes of UTF-8, not . or .., without /, \\, NUL or control characters, and doesn't end in a space or a dot (§H.2)", name, why)
+		return "", fail(http.StatusForbidden, "%q can't name a file or folder here: %s; a name in a file tree is 1 to 255 bytes of UTF-8, not . or .., without /, \\, NUL, control characters or bidirectional controls, and doesn't end in a space or a dot (§H.2)", name, why)
 	}
 	return t, nil
 }
@@ -124,27 +132,9 @@ func pct(s string) string {
 
 // nameKey is what sibling names are compared by (§H.2 "Siblings"): NFC,
 // then, unless names are case-sensitive here, Unicode simple case
-// folding, a character for a character, as case-insensitive file systems
-// compare names (NTFS by its upcase table): full folding would make
-// "Maße" and "Masse", or "ﬁle" and "file", one name, which those file
-// systems keep apart.
-func (s *Server) nameKey(name string) string {
-	n := norm.NFC.String(name)
-	if s.opt.CaseSensitive {
-		return n
-	}
-	return norm.NFC.String(strings.Map(foldRune, n))
-}
-
-// foldRune is r's simple case folding, as a key: the least character of
-// its orbit (unicode.SimpleFold), so k, K and the Kelvin sign are one.
-func foldRune(r rune) rune {
-	least := r
-	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
-		least = min(least, f)
-	}
-	return least
-}
+// folding, as the tree service's lookup compares titles (§B.5): one
+// folding, files.TitleKey, for both.
+func (s *Server) nameKey(name string) string { return files.TitleKey(name, s.opt.CaseSensitive) }
 
 // newName is an opaque resource name for a new item or folder node
 // (§H.2): 13 random base32 characters, lowercase, without a dot.

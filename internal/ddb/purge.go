@@ -142,6 +142,10 @@ func (s *Store) PurgeContent(ctx context.Context, ns, name string) (hashes [][]b
 	if err := s.DeleteSealed(ctx, ns, name); err != nil {
 		return nil, err
 	}
+	// An e2e resource's client-sealed snapshots (e2e.go).
+	if err := s.deleteE2ESnapshots(ctx, ns, name, 0); err != nil {
+		return nil, err
+	}
 	if name == "" {
 		if err := s.DeleteEpochKeys(ctx, ns); err != nil {
 			return nil, err

@@ -105,10 +105,10 @@ commit: the `-grouped` benchmarks keep rising with writers instead.
 
 ## Simplifications (all deliberate)
 
-- The scope is plain, at-rest and sealed namespaces, local and remote
-  branches: no e2e, or the S3 offload of large values. The store holds
-  no keys: core seals what it writes and opens what the store folds
-  (crypt.go, sealed.go, blobepochs.go). Purges (purge.go) commit their flags at once
+- The scope is every namespace level (plain, at rest, sealed, e2e) and
+  local and remote branches; not the S3 offload of large values. The
+  store holds no keys: core seals what it writes and opens what the
+  store folds (crypt.go, sealed.go, blobepochs.go, e2e.go). Purges (purge.go) commit their flags at once
   and their content after (`PurgeContent`, finished by the sweep from
   `PURGING#` markers when interrupted); second CDN purges queue in the
   commit (repurge.go). Blobs (blobs.go) keep attachments and

@@ -14,10 +14,8 @@ package core
 // purges applied from a remote base, retention's prunes, rotations) serve
 // no grant at all. Mirrored schema namespaces are not among them: the
 // creating operator's entries are, including theirs (v0.38, remote_branch).
-// Neither do entries of databases from
-// before grant references that the migration couldn't give one
-// (backfillNSGrants, db.go), nor those a development server wrote before
-// v0.38, which stored nothing to tell them from the server's own.
+// Neither do entries written before grant references (v0.38), which
+// stored nothing to tell them from the server's own.
 
 import (
 	"database/sql"

@@ -78,13 +78,13 @@ func TestV050RemoteBranchOfPurgedChain(t *testing.T) {
 
 	// A 410 purged for /r/matches/… names matches, with its head.
 	rt.set(purging(t, a, "/r/matches/", "1abc"), "")
-	expectPurgedBase(t, b.mkRemote("rel", remoteGenesis("r7", f.atA, nil)), "matches", "1abc")
+	expectPurgedBase(t, b.mkRemote("rel", remoteGenesisChain(r7Chain, f.atA, nil)), "matches", "1abc")
 	expect(t, b.get("/ns/rel"), 404)
 
 	rt.set(a.srv.URL, "")
 	h7 := a.nsPurge("r7")
 	a.nsPurge("matches")
-	expectPurgedBase(t, b.mkRemote("rel", remoteGenesis("r7", f.atA, nil)), "r7", h7)
+	expectPurgedBase(t, b.mkRemote("rel", remoteGenesisChain(r7Chain, f.atA, nil)), "r7", h7)
 	expect(t, b.get("/ns/rel"), 404)
 }
 

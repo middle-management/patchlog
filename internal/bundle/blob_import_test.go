@@ -351,7 +351,7 @@ func TestBundleE2EBlobs(t *testing.T) {
 	src.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
 	reader := identity(t)
 	k := seal.NewKey()
-	kr, err := seal.BuildKeyring("e", 1, k, []*ecdh.PublicKey{reader.PublicKey()})
+	kr, err := seal.BuildKeyringV2(reader, "e", 1, k, []*ecdh.PublicKey{reader.PublicKey()})
 	noErr(t, err)
 	krHead := src.create("e", "keyring", kr.Value())
 	upload := func(data string) ([]byte, map[string]any) {

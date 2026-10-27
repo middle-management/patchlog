@@ -14,9 +14,13 @@
 //
 // Sealing (§E.2.6). Values a view derives from a sealed or e2e namespace's
 // content (scores, facets, titles, …) are sealed in the compact JWE format
-// of §E.2.2 (alg "dir", enc "A256GCM", kid "{ns}#{e}") under that
-// namespace's epoch key current when the view is produced; names, ids,
-// URLs, heads, structure, at, order and cursors stay in the clear. view is
+// of §E.2.2 (alg "dir", enc "A256GCM", kid "{ns}#{e}") under the key of
+// the epoch the revision they derive from is served under (EpochOf: the
+// kid of the sealed document fetched at E2, of the sealed op at E3;
+// Keys.KeyAt), the epoch current when the view is produced where that
+// isn't known; a whole response only when all its values derive from
+// revisions of one epoch. Names, ids, URLs, heads, structure, at, order
+// and cursors stay in the clear. view is
 // the request target (path and query) of the …/at/{at}/… URL the response
 // is served at, as the service's redirect gives it, so the ciphertext is
 // bound to one query, subject set and checkpoint:
@@ -88,8 +92,8 @@ func Marshal(v any) ([]byte, error) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
-// Key is what seals for one namespace: its current epoch, epoch key and
-// whether it pads (Keys.Current).
+// Key is what seals for one namespace under one epoch: the epoch, its
+// epoch key and whether the namespace pads (Keys.Current, Keys.KeyAt).
 type Key struct {
 	NS    string
 	Epoch int

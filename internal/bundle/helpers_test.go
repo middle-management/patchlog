@@ -50,6 +50,17 @@ func newDeployment(t testing.TB, origin string, opts ...func(*core.Options)) *de
 	for _, f := range opts {
 		f(&o)
 	}
+	if o.Maximums == (core.Limits{}) {
+		// An allowance's bucket never exceeds the maximum of
+		// ratePerNamespace (§6.6), which the importers' allowances here
+		// need raised, as the spec's example does.
+		o.Maximums = core.DefaultMaximums()
+		if o.Limits != (core.Limits{}) {
+			o.Maximums = o.Limits
+		}
+		o.Maximums.RatePerNamespace.Rate = max(o.Maximums.RatePerNamespace.Rate, 1e6)
+		o.Maximums.RatePerNamespace.Burst = max(o.Maximums.RatePerNamespace.Burst, 1e6)
+	}
 	if dir := os.Getenv(benchDBDirEnv); dir != "" && o.Path == ":memory:" {
 		// A SQLite file, as a server has, for measurements.
 		f, err := os.CreateTemp(dir, "deployment-*.db")

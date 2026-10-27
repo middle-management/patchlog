@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/xml"
@@ -16,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/net/webdav"
 
@@ -67,6 +69,10 @@ type target struct {
 	// otherCase: a kFolder or kPlacement named by another case of its
 	// name, which compares equal (nameKey) but isn't it
 	otherCase bool
+	// hiddenTop: a name at the top level of a tree whose files.root is
+	// hidden from the reader, that top level its roots (§B.11.5, §H.3;
+	// topWrite)
+	hiddenTop bool
 }
 
 func (t target) isDir() bool {
@@ -354,12 +360,17 @@ func (st *reqState) replaced(ctx context.Context, t target) error {
 	return fail(http.StatusConflict, "%s held %s/%s when you opened it, and %s: it was deleted, moved or replaced since (§H.4), so your save isn't written over what is there; reload it", t.path, ns, name, now)
 }
 
-// otherCase refuses a write to t, a tree's file named by another case of
-// its name (§H.2 "Siblings"): a client whose file system tells case
-// apart (rclone, davfs2) copying README.md and readme.md would otherwise
-// write one over the other. A client that ignores case uses the name as
-// listed, or as it read the file under (spelledSo).
+// otherCase refuses a write to t, a tree's file or folder named by
+// another case of its name (§H.2 "Siblings"): a client whose file system
+// tells case apart (rclone, davfs2) copying README.md and readme.md would
+// otherwise write one over the other. A client that ignores case uses a
+// file's name as listed, or as it read the file under (spelledSo); a
+// folder's is refused whatever the request carries, a file never written
+// over a folder.
 func otherCase(t target) error {
+	if t.kind == kFolder {
+		return fail(http.StatusConflict, "%s: %q is a folder here, and names in this tree compare without case (§H.2), so %q isn't made beside it; use another name", t.path, t.title, t.base)
+	}
 	return fail(http.StatusConflict, "%s: %q is a file here, and names in this tree compare without case (§H.2), so %q isn't made beside it, nor written over it; write it as %q, or use another name", t.path, t.title, t.base, t.title)
 }
 
@@ -423,8 +434,9 @@ func (st *reqState) offered(ctx context.Context, ns string) (why, err error) {
 }
 
 // fileInfo is a file or directory as the handler sees it. A document's
-// ETag is its revision id; a written file's is the revision its close
-// committed, if that holds exactly what was written.
+// ETag is its revision id, weak where the bytes served are the writer's
+// own (weak); a written file's is the revision its close committed, if
+// that holds exactly what was written.
 type fileInfo struct {
 	name  string
 	size  int64
@@ -434,6 +446,10 @@ type fileInfo struct {
 	rev   string
 	ctype string
 	w     *writeFile
+	// weak: the file reads as the bytes its writer uploaded, which
+	// the revision holds exactly though its rendering differs (repr):
+	// served under W/"{id}" (§H.1 "Writer's bytes")
+	weak bool
 }
 
 func (fi *fileInfo) Name() string       { return fi.name }
@@ -451,6 +467,9 @@ func (fi *fileInfo) ETag(context.Context) (string, error) {
 	}
 	if rev == "" {
 		return "", webdav.ErrNotImplemented
+	}
+	if fi.weak {
+		return `W/"` + rev + `"`, nil
 	}
 	return `"` + rev + `"`, nil
 }
@@ -470,14 +489,15 @@ func (st *reqState) dirInfo(name string) *fileInfo {
 
 // docInfo is a live document's file (§H.3): its size and type as every
 // tool lists them (files.MetaOf), but a JSON file's size is that of the
-// bytes the principal wrote where it reads those back (repr). Its time
-// is when the head was written (modTime).
+// bytes the principal wrote where it reads those back (repr), under a
+// weak ETag (§H.1 "Writer's bytes"): everyone else reads the rendering
+// under the strong one. Its time is when the head was written (modTime).
 func (st *reqState) docInfo(name string, hd headDoc) *fileInfo {
 	fi := &fileInfo{name: name, rev: hd.rev, mode: 0o644, size: hd.m.Size, ctype: hd.m.Type,
 		mod: st.s.modTime(st.p, docKey(hd.ns, hd.name, hd.rev), hd.created, hd.m.modified)}
 	if hd.m.raw == nil {
 		if b := st.s.exactOf(st.p, hd.ns, hd.name, hd.rev); b != nil {
-			fi.size = int64(len(b))
+			fi.size, fi.weak = int64(len(b)), true
 		}
 	}
 	return fi
@@ -487,9 +507,12 @@ func scratchInfo(name string, f *scratchFile) *fileInfo {
 	if f.dir {
 		return &fileInfo{name: name, dir: true, mode: fs.ModeDir | 0o755, mod: f.mod}
 	}
-	ct := fileType(name, f.ctype)
-	if m := mime.TypeByExtension(path.Ext(name)); ct == "application/octet-stream" && m != "" {
-		ct = m
+	ct := declaredType(name, f.ctype)
+	if ct == "" {
+		ct = octetStream
+		if m := mime.TypeByExtension(path.Ext(name)); m != "" {
+			ct = m
+		}
 	}
 	return &fileInfo{name: name, size: int64(len(f.data)), mod: f.mod, mode: 0o644, ctype: ct}
 }
@@ -579,8 +602,13 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 				byRes[e.node.ItemNS+"/"+e.node.ItemName] = e.name
 			}
 		}
-		// fetchHeads leaves out what it can't read, so names pair up by
-		// resource (an item is placed once per catalog, §B.2).
+		// With tree-derived access, read under grants the catalog issues
+		// (§B.11.5 /read-grants). fetchHeads leaves out what it can't
+		// read, so names pair up by resource (an item is placed once per
+		// catalog, §B.2).
+		if err := st.readGrants(ctx, t.ns, files); err != nil {
+			return nil, err
+		}
 		docs, err := st.s.fetchHeads(ctx, st.tk, files, nil, false)
 		if err != nil {
 			return nil, err
@@ -635,6 +663,11 @@ func (st *reqState) docAt(ctx context.Context, t target) (headDoc, bool, error) 
 		if hd, ok := l.docs[t.shownAs()]; !ok || !hd.listed || st.method == "PROPFIND" {
 			return hd, ok, nil
 		}
+	}
+	// With tree-derived access, under a grant the catalog issues for the
+	// item (§H.2 "Access"), to edit where the request writes it.
+	if err := st.itemAccess(ctx, t, st.writes() && (t.path == st.path || t.path == st.dst)); err != nil {
+		return headDoc{}, false, err
 	}
 	if t.kind == kPlacement && st.s.nsInfo(ctx, st.tk, t.docNS).sealed {
 		return headDoc{}, false, nil
@@ -755,12 +788,29 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 	}
 	if flag&os.O_TRUNC != 0 {
 		// A write (PUT, the destination of a COPY, a LOCK of a new name):
-		// buffered, and committed on close.
+		// buffered, and committed on close. A COPY's file refused sets a
+		// guard, as a PUT's does (saveTo, §H.6); so does a PUT or COPY
+		// refused onto a tree's folder, which the DELETE that follows
+		// (rclone's) would otherwise delete.
+		switch {
+		case st.method == "COPY" && t.path == st.dst && (t.isDoc() || t.kind == kFolder):
+			st.saveTo = t.path
+		case st.method == "PUT" && t.path == st.path && t.kind == kFolder:
+			st.saveTo = t.path
+		}
 		switch {
 		case t.kind == kMissing:
 			return nil, errNotExist
 		case t.kind == kBadName:
 			return nil, st.badName(t)
+		case t.kind == kFolder && t.otherCase:
+			// Another case of a folder's name (§H.2 "Siblings"): 409,
+			// naming the folder, not the 403 or 405 of its own name.
+			return nil, otherCase(t)
+		case t.isDir() && (st.method == "COPY" || st.method == "MOVE"):
+			// A file copied or moved onto a folder (§H.5): 403, not the
+			// 405 of a PUT to one; Overwrite: F is x/net/webdav's 412.
+			return nil, fail(http.StatusForbidden, "%s is a folder: a file copied or moved there doesn't replace it (§H.5)", t.path)
 		case t.isDir():
 			return nil, fail(http.StatusMethodNotAllowed, "%s is a directory", t.path)
 		case t.kind == kPlacement && t.otherCase && !st.spelledSo(t):
@@ -825,6 +875,9 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		return nil, errNotExist
 	}
 	if served {
+		if err := st.ifMatchGet(t, hd.rev); err != nil {
+			return nil, err
+		}
 		// What the client now has is a base of its next save, once a GET's
 		// body is sent (a 304 sends none). A client whose copy is suspect
 		// gets the file whatever its validators say (§H.1 "Identity").
@@ -836,8 +889,17 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 			st.hdr.Del("If-Modified-Since")
 		}
 	}
+	copied := st.method == "COPY" && (t.path == st.path || strings.HasPrefix(t.path, st.path+"/"))
+	if copied {
+		// The file a COPY copies next, itself or one in the folder it
+		// copies (copyFolder): none of the last one's type or blob.
+		st.ctype, st.copySrc = "", nil
+	}
 	if r := hd.m.raw; r != nil {
-		if st.method == "COPY" && t.path == st.path {
+		if served && r.typ == pdfType {
+			st.servePDF()
+		}
+		if copied {
 			// The copy's type is the source's (fileType), and its blob the
 			// source's, copied (§7.8, §H.5 "Copy").
 			st.ctype = r.typ
@@ -853,6 +915,47 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		}
 	}
 	return f, nil
+}
+
+// pdfType is the stored type of a PDF (§H.1).
+const pdfType = "application/pdf"
+
+// servePDF answers a GET or HEAD of a raw file stored as exactly
+// application/pdf without the sandbox, which blanks browsers' PDF viewers
+// (§7.8, §H.6 "Headers": PDFs are excepted), and still with nosniff; as
+// an attachment (Content-Disposition), so no browser shows it in this
+// origin, unless the deployment opts into inline display (InlinePDF).
+// Only its 200 or 206 goes so: any other answer gets the sandbox back
+// (errWriter).
+func (st *reqState) servePDF() {
+	if st.resp == nil {
+		return
+	}
+	st.pdf = true
+	st.resp.Del("Content-Security-Policy")
+	if !st.s.opt.InlinePDF {
+		st.resp.Set("Content-Disposition", "attachment")
+	}
+}
+
+// ifMatchGet checks a GET's or HEAD's If-Match against revision rev of
+// file t, which it serves, and takes it out of the request: a gateway
+// takes a weak tag like the strong one in any If-Match (§H.1 "Writer's
+// bytes"), where http.ServeContent compares them strongly (RFC 9110
+// §13.1.1), which no weak tag passes, the writer's own W/"{id}"
+// included. One that names neither * nor rev is a 412.
+func (st *reqState) ifMatchGet(t target, rev string) error {
+	if st.hdr == nil || st.hdr.Get("If-Match") == "" {
+		return nil
+	}
+	im := st.hdr.Get("If-Match")
+	for _, tag := range strings.Split(im, ",") {
+		if tag = strings.TrimSpace(tag); tag == "*" || revOfETag(tag) == rev {
+			st.hdr.Del("If-Match")
+			return nil
+		}
+	}
+	return fail(http.StatusPreconditionFailed, "%s is at revision %s, which its If-Match doesn't name", t.path, rev)
 }
 
 // preconditions checks a PUT's If-None-Match: * (create only) and
@@ -895,12 +998,14 @@ func (d *davFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error 
 }
 
 func (st *reqState) mkdir(ctx context.Context, name string) error {
-	if st.method == "COPY" {
-		return fail(http.StatusForbidden, "folders aren't copied; move them, or make one and move what goes in it")
-	}
 	t, err := st.resolve(ctx, name)
 	if err != nil {
 		return err
+	}
+	if st.method == "COPY" {
+		// x/net/webdav makes the copy of a folder before copying what is
+		// in it, one by one.
+		return st.copyFolder(ctx, t)
 	}
 	switch t.kind {
 	case kMissing:
@@ -941,6 +1046,9 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 	}
 	defer st.changed()
 	if (st.method == "MOVE" || st.method == "COPY") && t.path == st.dst {
+		if err := st.srcPrecondition(ctx); err != nil {
+			return err
+		}
 		// The handler clears an existing destination before moving or
 		// copying onto it: a document or a tree's node there is written
 		// over (an edit, a rename), never deleted first.
@@ -961,13 +1069,22 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 	case kRoot, kNSDir, kCatDir:
 		return fail(http.StatusForbidden, "the namespaces served are fixed; %s can't be deleted here", t.path)
 	case kDoc, kRaw:
-		if _, live, err := st.docAt(ctx, t); err != nil {
+		if hd, live, err := st.docAt(ctx, t); err != nil {
 			return err
 		} else if live {
 			if err := st.afterRefusedSave(ctx, t); err != nil {
 				return err
 			}
-			_, err := st.deleteDoc(ctx, t.docNS, t.docName, st.ifMatch)
+			// Without a tag, the head read here is deleted (If-Match), and
+			// one someone changed since is a 409 (§H.5 "Delete a file").
+			match := st.ifMatch
+			if match == "" {
+				match = hd.rev
+			}
+			_, err := st.deleteDoc(ctx, t.docNS, t.docName, match)
+			if de, ok := err.(*davError); ok && de.status == http.StatusPreconditionFailed && st.ifMatch == "" {
+				err = movedSinceRead(t)
+			}
 			if err == nil {
 				st.s.forgetPath(st.p, t.path)
 			}
@@ -983,6 +1100,12 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 		}
 		return err
 	case kFolder:
+		// A folder a PUT or COPY was refused onto, or a write to another
+		// case of its name (§H.2 "Siblings"), is guarded as a file is
+		// (§H.6).
+		if err := st.afterRefusedSave(ctx, t); err != nil {
+			return err
+		}
 		return st.deleteFolder(ctx, t)
 	}
 	if !st.scratchRemove(t.path) {
@@ -991,8 +1114,9 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 	return nil
 }
 
-// afterRefusedSave refuses a DELETE of the document's file t that follows
-// the principal's refused save of it, using up one guard (refusedSaveFor,
+// afterRefusedSave refuses a DELETE of t, a document's file or a tree's
+// folder, that follows the principal's refused save to its path, using up
+// one guard (refusedSaveFor,
 // §H.6), unless it names the revision it deletes, which passes and leaves
 // the guards. A document in a frozen namespace isn't deleted anyway: its
 // DELETE gets the core's refusal (§8.4), the guards left; whether it is
@@ -1017,8 +1141,12 @@ func (st *reqState) afterRefusedSave(ctx context.Context, t target) error {
 	if left > 0 {
 		again = fmt.Sprintf("it follows %d refused saves, each refusing one DELETE: delete it %d more times to delete it", left+1, left+1)
 	}
-	return fail(http.StatusConflict, "%s wasn't deleted: this DELETE follows a refused save of the same file (%d, moments ago), and some clients (rclone) delete a file whose upload failed; %s",
-		t.path, r.status, again)
+	what := "file"
+	if t.kind == kFolder {
+		what = "path, a folder's"
+	}
+	return fail(http.StatusConflict, "%s wasn't deleted: this DELETE follows a refused save of the same %s (%d, moments ago), and some clients (rclone) delete a file whose upload failed; %s",
+		t.path, what, r.status, again)
 }
 
 func (d *davFS) Rename(ctx context.Context, oldName, newName string) error {
@@ -1043,8 +1171,13 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 	if err != nil {
 		return err
 	}
+	if err := st.srcPrecondition(ctx); err != nil {
+		return err
+	}
 	defer st.changed()
-	if dst.kind == kPlacement && dst.otherCase && !(src.ns == dst.ns && src.node == dst.node) && !st.spelledSo(dst) {
+	if dst.otherCase && !(src.ns == dst.ns && src.node == dst.node) && (dst.kind == kFolder || dst.kind == kPlacement && !st.spelledSo(dst)) {
+		// Another case of a sibling's name, file or folder (§H.2
+		// "Siblings"): refused, setting a guard (§H.6).
 		st.onto = dst.path
 		return otherCase(dst)
 	}
@@ -1147,6 +1280,64 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 	return fail(http.StatusForbidden, "%s can't be moved to %s", src.path, dst.path)
 }
 
+// srcPrecondition checks a MOVE's precondition on its source, once,
+// before anything is written (§H.5 "On any MOVE, a client's If-Match
+// names the source"): the revision its If-Match (or If header) names
+// must be the source's head, a file's (its item's, in a tree) or a
+// folder's node's (F-H1), and If-Match: * asks that it exist; 412
+// otherwise, as for a DELETE. A scratch file has no revision. The moves
+// check it again where they read the source to write (moveOnto,
+// moveAcross, batchMove, moveNode), and a move that copies deletes the
+// source with If-Match on it (deleteSource).
+func (st *reqState) srcPrecondition(ctx context.Context) error {
+	if st.method != "MOVE" || st.srcMatch == "" && !st.srcAny || st.srcDone {
+		return st.srcErr
+	}
+	st.srcDone = true
+	st.srcErr = st.checkSource(ctx)
+	return st.srcErr
+}
+
+// checkSource is srcPrecondition's check.
+func (st *reqState) checkSource(ctx context.Context) error {
+	src, err := st.resolve(ctx, st.path)
+	if err != nil {
+		return err
+	}
+	rev, exists := "", false
+	switch src.kind {
+	case kDoc, kRaw, kPlacement:
+		hd, live, err := st.docAt(ctx, src)
+		if err != nil {
+			return err
+		}
+		rev, exists = hd.rev, live
+	case kFolder:
+		h, err := st.head(ctx, src.ns, src.node)
+		if err != nil {
+			return err
+		}
+		rev, exists = h.ID, h.State == client.Live
+	case kScratch:
+		_, exists = st.scratchGet(src.path)
+	}
+	switch {
+	case !exists && st.srcAny:
+		return fail(http.StatusPreconditionFailed, "%s doesn't exist (If-Match: *)", src.path)
+	case !exists:
+		return fail(http.StatusPreconditionFailed, "%s holds no file, so none has revision %s (If-Match names a MOVE's source, §H.5); reload it", src.path, st.srcMatch)
+	case st.srcMatch != "" && rev != st.srcMatch:
+		return st.sourceMoved(src.path)
+	}
+	return nil
+}
+
+// sourceMoved is a MOVE's 412 for a source whose head isn't the revision
+// its If-Match names (srcPrecondition).
+func (st *reqState) sourceMoved(p string) error {
+	return fail(http.StatusPreconditionFailed, "%s changed since %s (If-Match, which names a MOVE's source, §H.5); reload it", p, st.srcMatch)
+}
+
 // deletedPath reports whether t is the path of a file the principal's
 // DELETE removed within ownDeleteUndo (§H.6 "Delete, then write"): a flat
 // namespace's resource, or a tree's file in the same folder.
@@ -1190,9 +1381,10 @@ func (st *reqState) moveFlat(ctx context.Context, src, dst target) error {
 // before src's tombstone, with If-Match on src's head (again on the new
 // head if it moved, 412). A raw file's blob is copied to the new resource
 // first with Blob-From (§7.8), or uploaded again where the new name gives
-// it another type (§H.1). A JSON file keeps a {name}.json name and a raw
-// file a raw one, and one whose root isn't an object, which can't carry
-// $successor, isn't moved (403): it can be copied, then deleted.
+// it another type, or its bytes aren't UTF-8 for its text/ type (§H.1).
+// A JSON file keeps a {name}.json name and a raw file a raw one, and one
+// whose root isn't an object, which can't carry $successor, isn't moved
+// (403): it can be copied, then deleted.
 func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 	ns := src.ns
 	in := st.s.nsInfo(ctx, st.tk, ns)
@@ -1207,6 +1399,9 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 		}
 		if sh.State != client.Live {
 			return false, errNotExist
+		}
+		if st.srcMatch != "" && sh.ID != st.srcMatch {
+			return false, st.sourceMoved(src.path)
 		}
 		e, err := st.s.doc(ctx, st.tk, ns, src.docName, sh.ID)
 		switch {
@@ -1234,7 +1429,32 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 		}
 		doc = files.Bare(doc).(map[string]any)
 		if r := e.raw; r != nil {
-			typ := fileType(dst.base, r.typ)
+			// The new name types the file, else its type does, as a copy's
+			// upload (§H.1); a text/ type only for UTF-8 bytes, which are
+			// read for it (textBlob).
+			typ := declaredType(dst.base, r.typ)
+			switch {
+			case typ == "":
+				typ = octetStream
+			case typ == r.typ && strings.HasPrefix(typ, "text/"):
+				ok, err := st.textBlob(ctx, ns, src.docName, r)
+				if err != nil {
+					return false, err
+				}
+				if !ok {
+					typ = octetStream
+				}
+			}
+			var b []byte
+			if typ != r.typ {
+				hd := headDoc{ns: ns, name: src.docName, rev: sh.ID, m: e.meta(), e: e}
+				if b, err = st.fileBytes(ctx, &hd); err != nil {
+					return false, err
+				}
+				if !textOK(typ, b) {
+					typ = octetStream
+				}
+			}
 			if typ == r.typ {
 				if !sent[r.bid] {
 					if err := st.tk.c.CopyBlob(ctx, ns, to, r.bid, ns, src.docName, ""); err != nil {
@@ -1243,11 +1463,6 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 					sent[r.bid] = true
 				}
 			} else {
-				hd := headDoc{ns: ns, name: src.docName, rev: sh.ID, m: e.meta(), e: e}
-				b, err := st.fileBytes(ctx, &hd)
-				if err != nil {
-					return false, err
-				}
 				nonce := ""
 				if in.nonce {
 					nonce = seal.NewNonce()
@@ -1274,6 +1489,7 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 			item.IfNoneMatch = true
 			item.Steps = []client.Step{client.PatchStep(withNonce(in, doc, client.GenesisPatches(doc)))}
 		case client.Tombstoned:
+			// Restored, a name moved away too: a MOVE is no save (movedAway).
 			item.IfMatch = th.ID
 			item.Steps = []client.Step{client.PatchStep(withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}))}
 		case client.Purged:
@@ -1285,7 +1501,10 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 		res, err := st.tk.c.Batch(ctx, ns, client.BatchRequest{Items: []client.BatchItem{item, {Resource: src.docName, IfMatch: sh.ID,
 			Steps: []client.Step{client.PatchStep(succ), client.DeleteStep()}}}}, false)
 		err = batchErr(err)
-		if client.IsStale(err) {
+		if client.IsStale(err) || goneSince(err) {
+			// A head moved since it was read: the new name made (412),
+			// or tombstoned (412, or 410 gone from v0.73, §7.2), or the
+			// source deleted (410). Read again.
 			return true, nil
 		}
 		if err != nil {
@@ -1302,6 +1521,32 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 		}
 		return false, nil
 	})
+}
+
+// textBlob reports whether raw file ns/name's blob r may keep a text/
+// type: its bytes are UTF-8, a leading BOM allowed (textOK), read through
+// without keeping them.
+func (st *reqState) textBlob(ctx context.Context, ns, name string, r *rawRef) (bool, error) {
+	b, err := st.tk.c.OpenBlob(ctx, ns, name, r.bid, 0)
+	if err != nil {
+		return false, err
+	}
+	defer b.Body.Close()
+	br := bufio.NewReader(io.LimitReader(b.Body, r.size))
+	if p, _ := br.Peek(3); bytes.Equal(p, []byte{0xEF, 0xBB, 0xBF}) {
+		br.Discard(3)
+	}
+	for {
+		c, n, err := br.ReadRune()
+		switch {
+		case err == io.EOF:
+			return true, nil
+		case err != nil:
+			return false, err
+		case c == utf8.RuneError && n == 1:
+			return false, nil
+		}
+	}
 }
 
 // fileBytes returns live file hd's content as its reader gets it: a JSON
@@ -1334,6 +1579,11 @@ func (st *reqState) fileBytes(ctx context.Context, hd *headDoc) ([]byte, error) 
 // before the content), it is held as an empty placeholder (holdEmpty).
 func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (string, bool, error) {
 	defer st.changed()
+	// With tree-derived access, a file's item is edited under a grant the
+	// catalog issues for it (§H.2 "Access").
+	if err := st.itemAccess(ctx, t, true); err != nil {
+		return "", false, err
+	}
 	if len(body) == 0 {
 		hold, err := st.holdEmpty(ctx, t)
 		if err != nil {

@@ -106,12 +106,12 @@ func TestSchemas(t *testing.T) {
 	ref3 := "/r/schemas/match3/rev/" + s3
 	e.create("docs", "coded", map[string]any{"$schema": ref3, "code": "abc"})
 	expectCode(t, e.write("PATCH", "docs", "coded2", "", addRoot(map[string]any{"$schema": ref3, "code": "abcd"})), 422, "invalid")
-	// A fragment that points at nothing makes the schema invalid; an anchor
-	// on another revision isn't an accepted form.
+	// A fragment that points at nothing makes the schema invalid, and so
+	// does a plain name no anchor of the revision defines (v0.65).
 	r = e.write("PATCH", "schemas", "frag", "", addRoot(map[string]any{"$schema": dialect, "$ref": baseRef + "#/x"}))
 	expectCode(t, r, 422, "invalid")
 	r = e.write("PATCH", "schemas", "anchor", "", addRoot(map[string]any{"$schema": dialect, "$ref": baseRef + "#name"}))
-	expectCode(t, r, 422, "schema_ref")
+	expectCode(t, r, 422, "invalid")
 	// A $ref to an unknown revision makes the schema unusable.
 	r = e.write("PATCH", "schemas", "dangling", "", addRoot(map[string]any{"$schema": dialect, "$ref": "/r/schemas/base/rev/" + unknownID}))
 	expectCode(t, r, 422, "schema_unavailable")
@@ -211,8 +211,9 @@ func TestRulesExamples(t *testing.T) {
 		}
 	}
 	// Rule 0: every document is typed with the match schema.
-	ruleFail(e.write("PATCH", "matches", "a", "", addRoot(map[string]any{"score": "1-0"})), 0, "/doc/$schema")
-	ruleFail(e.write("PATCH", "matches", "a", "", addRoot(map[string]any{"$schema": "/r/other/match/rev/" + o, "score": "1-0"})), 0, "/doc/$schema")
+	// The path points at the failing rule form (§6.4.3).
+	ruleFail(e.write("PATCH", "matches", "a", "", addRoot(map[string]any{"score": "1-0"})), 0, "/rules/0/then/0")
+	ruleFail(e.write("PATCH", "matches", "a", "", addRoot(map[string]any{"$schema": "/r/other/match/rev/" + o, "score": "1-0"})), 0, "/rules/0/then/0")
 	h := e.create("matches", "a", map[string]any{"$schema": ref, "score": "1-0"})
 	// Rule 1 (reached only for non-rule-0 cases: remove) — removing $schema.
 	r := e.write("PATCH", "matches", "a", h, ops(op("remove", "/$schema")))
@@ -221,12 +222,12 @@ func TestRulesExamples(t *testing.T) {
 		t.Fatalf("remove $schema: %s", r.Body)
 	}
 	// Rule 3: no whole-document replace on appends, even keeping $schema.
-	ruleFail(e.write("PATCH", "matches", "a", h, ops(op("replace", "", map[string]any{"$schema": ref, "score": "2-0"}))), 3, "")
+	ruleFail(e.write("PATCH", "matches", "a", h, ops(op("replace", "", map[string]any{"$schema": ref, "score": "2-0"}))), 3, "/rules/3/then/0")
 	h = e.appendRev("matches", "a", h, ops(op("replace", "/score", "2-0")))
 	// Rule 2: only the ops group may delete (dev mode has no principal).
-	ruleFail(e.write("DELETE", "matches", "a", h, nil), 2, "/principal/groups")
+	ruleFail(e.write("DELETE", "matches", "a", h, nil), 2, "/rules/2/then/0")
 	r = e.do(req{method: "POST", path: "/r/matches/a/purge", ifMatch: h, author: "x"})
-	ruleFail(r, 2, "/principal/groups")
+	ruleFail(r, 2, "/rules/2/then/0")
 	// Rules don't run on reads, and failed writes wrote nothing.
 	if e.head("matches", "a") != h {
 		t.Fatal("head moved")

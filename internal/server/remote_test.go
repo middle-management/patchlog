@@ -67,8 +67,16 @@ func pair(t *testing.T, aOpts, bOpts []envOpt, bMod ...func(*core.RemoteOptions)
 	return a, b, rt
 }
 
+// remoteGenesis is the genesis of a remote branch of ns, a namespace of A
+// that isn't a branch: its base.chain is [ns] (§G.3).
 func remoteGenesis(ns, at string, extra map[string]any) []any {
-	doc := map[string]any{"read": "public", "base": map[string]any{"origin": originA, "ns": ns, "at": at}}
+	return remoteGenesisChain([]string{ns}, at, extra)
+}
+
+// remoteGenesisChain is the genesis of a remote branch of chain[0], whose
+// bases as of at are the rest of chain (§G.3).
+func remoteGenesisChain(chain []string, at string, extra map[string]any) []any {
+	doc := map[string]any{"read": "public", "base": map[string]any{"origin": originA, "ns": chain[0], "at": at, "chain": strs(chain)}}
 	for k, v := range extra {
 		doc[k] = v
 	}
@@ -374,8 +382,8 @@ func TestRemoteBranch(t *testing.T) {
 	expect(t, b.get("/r/rel/c/rev/"+f.c1), 410)        // and its content isn't here
 	expect(t, b.get("/r/rel/late"), 404)               // created after at
 	expect(t, b.get("/r/rel/derby/rev/"+f.lateD), 404) // appended after at
-	hb := b.get("/ns/rel/rev/" + b.nsHead("rel") + "/heads").Obj()["items"]
-	ha := a.get("/ns/main/rev/" + f.at + "/heads").Obj()["items"]
+	hb := b.get("/ns/rel/rev/" + b.nsHead("rel") + "/heads").Obj()["heads"]
+	ha := a.get("/ns/main/rev/" + f.at + "/heads").Obj()["heads"]
 	if string(canonical(hb)) != string(canonical(ha)) {
 		t.Fatalf("heads differ\nA %s\nB %s", canonical(ha), canonical(hb))
 	}
@@ -439,7 +447,7 @@ func TestRemoteBranch(t *testing.T) {
 
 func headAt(t *testing.T, e *tenv, ns, at, name string) string {
 	t.Helper()
-	for _, x := range e.get("/ns/" + ns + "/rev/" + at + "/heads").Obj()["items"].([]any) {
+	for _, x := range e.get("/ns/" + ns + "/rev/" + at + "/heads").Obj()["heads"].([]any) {
 		m := x.(map[string]any)
 		if m["resource"] == name {
 			s, _ := m["target"].(string)
@@ -545,7 +553,7 @@ func TestRemoteTampered(t *testing.T) {
 	for _, c := range cases {
 		rt.set(tamper(t, a, c.match, func(b []byte) []byte { return bytes.ReplaceAll(b, []byte(c.from), []byte(c.to)) }), "")
 		r := b.mkRemote("rel", remoteGenesis("main", f.at, nil))
-		if r.Code != 502 || r.Str("code") != "remote" {
+		if r.Code != 502 || r.Str("code") != "upstream" || r.Str("origin") != originA {
 			t.Errorf("%s: %d %s", c.name, r.Code, r.Body)
 		}
 		expect(t, b.get("/ns/rel"), 404)
@@ -553,7 +561,7 @@ func TestRemoteTampered(t *testing.T) {
 	}
 	// Unreachable: 502.
 	rt.set("http://127.0.0.1:1", "")
-	expectCode(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 502, "remote")
+	expectCode(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 502, "upstream")
 	// Genuine data through the same proxy works.
 	rt.set(tamper(t, a, "/nothing", nil), "")
 	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
@@ -576,8 +584,8 @@ func TestRemoteKeys(t *testing.T) {
 	rt := &route{url: a.srv.URL}
 	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt))
 	b.opPriv = bPriv
-	// Without a read grant at A, the base can't be fetched.
-	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, map[string]any{"read": "grant"})), 502, "remote")
+	// Without a read grant at A, B can't read the base: 422 (§G.3, §G.5.2).
+	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, map[string]any{"read": "grant"})), 422, "invalid")
 	rt.set(a.srv.URL, a.grant(kA, "svc:b", []string{"main"}, []string{"read"}))
 	// Only the operator key creates remote branches.
 	q := req{method: "PATCH", path: "/ns/rel", ifNoneMatch: "*", body: remoteGenesis("main", at, nil), bearer: gA}
@@ -665,26 +673,29 @@ func TestRemotePurgeFollowed(t *testing.T) {
 	expect(t, b.get("/r/rel/mine"), 302)
 }
 
-// With IgnorePurges, A's purges are recorded as notices only.
+// A deployment that doesn't follow its bases' logs (no SyncRemotes, as
+// with -remote-follow-interval 0) sees no purge; one that follows applies
+// every purge it sees, and never records one only as a notice (§4, §G.3).
 func TestRemotePurgeNotFollowed(t *testing.T) {
 	t.Parallel()
-	a, b, _ := pair(t, nil, nil, func(o *core.RemoteOptions) { o.IgnorePurges = true })
+	a, b, _ := pair(t, nil, nil)
 	f := populateA(t, a)
 	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
 	expect(t, a.purge("main", "derby", f.lateD, "admin"), 204)
 	ctx := context.Background()
+	if b.head("rel", "derby") != f.d2 {
+		t.Fatal("purge applied without following")
+	}
+	if ns, _ := b.e.RemoteNotices(ctx, ""); len(ns) != 0 {
+		t.Fatalf("notices without following %+v", ns)
+	}
 	if err := b.e.SyncRemotes(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if b.head("rel", "derby") != f.d2 {
-		t.Fatal("purge applied")
-	}
 	ns, _ := b.e.RemoteNotices(ctx, "")
-	if len(ns) != 1 || ns[0].Applied || ns[0].Branch != "rel" || ns[0].Resource != "derby" {
+	if len(ns) != 1 || !ns[0].Applied || ns[0].Branch != "rel" || ns[0].Resource != "derby" {
 		t.Fatalf("notices %+v", ns)
 	}
-	// The operator follows it with an ordinary purge.
-	expect(t, b.purge("rel", "derby", f.d2, "op"), 204)
 	expect(t, b.get("/r/rel/derby/rev/"+f.d1), 410)
 }
 

@@ -123,8 +123,9 @@ func (c *Client) signBatch(ctx context.Context, ns string, items []BatchItem) ([
 }
 
 // GrantDoc is a stored grant as GET /ns/{ns}/grants/{gid} serves it
-// (§C.3.1): its id, root block and the non-bearer form's SignedBlocks,
-// authority first, in base64url without padding.
+// (§C.3.1): its id, root block and its stored SignedBlocks in base64url
+// without padding: the authority block alone, or from servers before v0.73
+// every one, authority first.
 type GrantDoc struct {
 	ID     string
 	Root   map[string]any
@@ -180,6 +181,11 @@ func (c *Client) Grant(ctx context.Context, ns, gid string) (*GrantDoc, error) {
 		return nil, fmt.Errorf("client: %s: grant %q answered for %q", r.path, g.ID, gid)
 	}
 	g.Root, _ = m["root"].(map[string]any)
+	// stored is the authority SignedBlock, one string (§C.3.1); servers
+	// before v0.73 serve every SignedBlock, authority first.
+	if s, ok := m["stored"].(string); ok {
+		g.Stored = []string{s}
+	}
 	arr, _ := m["stored"].([]any)
 	for _, x := range arr {
 		s, _ := x.(string)

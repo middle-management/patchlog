@@ -31,12 +31,20 @@ type EpochKey struct {
 
 func epochKeyAct(table, ns string, k *EpochKey, created int64) types.TransactWriteItem {
 	return types.TransactWriteItem{Put: &types.Put{
-		TableName: &table,
-		Item: withKey(keyEpochKey(ns, k.Epoch), item{
-			"epoch": avN(uint64(k.Epoch)), "wrapped": avB(k.Wrapped), "keystore": avS(k.KeyStore), "created": avI(created),
-		}),
+		TableName:           &table,
+		Item:                withKey(keyEpochKey(ns, k.Epoch), k.item(created)),
 		ConditionExpression: strptr("attribute_not_exists(PK)"),
 	}}
+}
+
+// item is k's EPOCHKEY item: an e2e namespace's has no key, only the
+// epoch's start (§E.3).
+func (k *EpochKey) item(created int64) item {
+	it := item{"epoch": avN(uint64(k.Epoch)), "created": avI(created)}
+	if len(k.Wrapped) > 0 {
+		it["wrapped"], it["keystore"] = avB(k.Wrapped), avS(k.KeyStore)
+	}
+	return it
 }
 
 func scanEpochKey(i item) *EpochKey {
@@ -63,11 +71,13 @@ func (s *Store) EpochKeys(ctx context.Context, ns string) ([]*EpochKey, error) {
 }
 
 // AnyEpochKey is one stored epoch key and its namespace, for checking at
-// start-up that the key store unwraps them; nil for none.
+// start-up that the key store unwraps them; nil for none. e2e epochs,
+// which have no key, don't count.
 func (s *Store) AnyEpochKey(ctx context.Context) (string, *EpochKey, error) {
 	in := &dynamodb.ScanInput{
 		TableName:                 &s.Table,
-		FilterExpression:          strptr("begins_with(SK, :p)"),
+		FilterExpression:          strptr("begins_with(SK, :p) AND attribute_exists(#w)"),
+		ExpressionAttributeNames:  map[string]string{"#w": "wrapped"},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":p": avS("EPOCHKEY#")},
 	}
 	for {
@@ -159,4 +169,20 @@ func (s *Store) deletePrunedSealed(ctx context.Context, ns, name string, horizon
 		}
 		return s.deleteKey(ctx, Key{i.s("PK"), i.s("SK")})
 	})
+}
+
+// PutEpochStart records that epoch of ns began at created, unless it is
+// recorded: a keyless EPOCHKEY item, an e2e epoch's (a remote branch's
+// shadow following its base's epochs).
+func (s *Store) PutEpochStart(ctx context.Context, ns string, epoch int, created int64) error {
+	k := &EpochKey{Epoch: epoch}
+	_, err := s.Client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: &s.Table, Item: withKey(keyEpochKey(ns, epoch), k.item(created)),
+		ConditionExpression: strptr("attribute_not_exists(PK)"),
+	})
+	var cf *types.ConditionalCheckFailedException
+	if errors.As(err, &cf) {
+		return nil
+	}
+	return err
 }

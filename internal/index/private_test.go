@@ -54,7 +54,8 @@ func TestPrivateNamespace(t *testing.T) {
 	bob := issuer.Grant(t, s.Now(), "user:bob", []string{"sec"}, []string{"read"}, map[string]any{"groups": []any{"editors"}})
 	r := x.raw("/sec?q=secret", bob)
 	loc := r.header.Get("Location")
-	if r.status != 302 || !strings.HasPrefix(loc, "/sec/g/") || !strings.HasSuffix(loc, "/at/"+cp+"?q=secret") || r.header.Get("Cache-Control") != "private, no-cache" || r.header.Get("Vary") != "Authorization" {
+	// A redirect that adds /g/{gs} is private, no-store (§A.4, v0.73).
+	if r.status != 302 || !strings.HasPrefix(loc, "/sec/g/") || !strings.HasSuffix(loc, "/at/"+cp+"?q=secret") || r.header.Get("Cache-Control") != "private, no-store" || r.header.Get("Vary") != "Authorization" {
 		t.Fatalf("pointer: %d %s %v", r.status, loc, r.header)
 	}
 	gs := strings.Split(loc, "/")[3]
@@ -111,10 +112,13 @@ func TestPrivateNamespace(t *testing.T) {
 	if strings.HasPrefix(r.header.Get("Location"), "/sec/g/"+gs+"/") {
 		t.Error("a scoped grant shares the whole-namespace subject set")
 	}
-	// Presenting someone else's gs redirects to one's own.
-	r = x.raw(at, onlyA)
-	if r.status != 302 || strings.Contains(r.header.Get("Location"), gs) {
-		t.Errorf("foreign gs: %d %s", r.status, r.header.Get("Location"))
+	// A grant reads only at its own gs (§A.4, §B.11.5, v0.73): someone
+	// else's is 403, no-store, with or without min, never redirected.
+	for _, p := range []string{at, at + "&min=" + cp} {
+		r = x.raw(p, onlyA)
+		if r.status != 403 || r.body["code"] != "forbidden" || r.header.Get("Cache-Control") != "no-store" || r.header.Get("Location") != "" {
+			t.Errorf("foreign gs %s: %d %v %v", p, r.status, r.body, r.header)
+		}
 	}
 	// A reader's gs on a public-style URL of a private namespace is not served.
 	if r := x.raw("/sec/at/"+cp, onlyA); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/sec/g/") {

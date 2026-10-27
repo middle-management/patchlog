@@ -153,18 +153,17 @@ func (t *gate) draftsServe(c *nsRow, ccfg *Config, w *nsRow) bool {
 
 // schemaReadsServe reports whether n's schemaReads opens its schema
 // revisions for writes to w (§6.1): w is n, or listed in schemaReads.for,
-// or a local branch of such a namespace.
+// or a local branch of such a namespace, branches of branches included.
+// schemaReads.for is never matched against a branch: a branch qualifies
+// only through the namespace at the root of its chain of local bases.
 func (t *gate) schemaReadsServe(n *nsRow, w *nsRow) bool {
 	cfg := t.config(n.configSeq)
 	if cfg.SchemaReadsFor == nil || cfg.level >= levelSealed || n.isBranch() {
 		return false
 	}
 	for x := w; ; {
-		if x.id == n.id || DraftsMatch(cfg.SchemaReadsFor, x.name) {
-			return true
-		}
 		if !x.isBranch() {
-			return false
+			return x.id == n.id || DraftsMatch(cfg.SchemaReadsFor, x.name)
 		}
 		x = t.nsRowUnlocked(x.base.Int64)
 		if x.isShadow() {
@@ -274,19 +273,54 @@ type schemaCtx struct {
 	// creds are the request's grant and those of Source-Authorization:
 	// any that verifies for a candidate branch reads drafts there.
 	creds []Credentials
+	// source is a batch's local source the writer reads unrestricted
+	// (checkSource), whose revisions a write may copy (copiesIn); nil if
+	// none.
+	source *batchSource
+	// copied are the rules markers docRules fixed, by revision id; copies
+	// the namespaces a copy inherits a marker from (copiesIn), once known.
+	copied map[ids.ID]schema.Rules
+	copies []int64
+}
+
+// copiesIn lists the namespaces whose revisions a write may copy by id,
+// inheriting their rules marker (docRules): the namespace written and its
+// bases, which it reads through, and a batch's local source, read
+// unrestricted, and its bases.
+func (sc *schemaCtx) copiesIn(t *tx) []int64 {
+	if sc.copies != nil {
+		return sc.copies
+	}
+	sc.copies = []int64{}
+	add := func(n *nsRow) {
+		for x := n; x != nil; {
+			sc.copies = append(sc.copies, x.id)
+			if !x.isBranch() {
+				return
+			}
+			x = t.nsRowUnlocked(x.base.Int64)
+		}
+	}
+	if sc.target != nil {
+		add(sc.target)
+	}
+	if sc.source != nil && sc.source.n != nil {
+		add(sc.source.n)
+	}
+	return sc.copies
 }
 
 // loadDraft looks a schema revision up among the candidates serving the
-// write's target (§6.1). Each namespace holding a copy is locked shared and
-// read as of its lock (D.8). A revision the writer can't read there counts
-// as not found.
-func (t *gate) loadDraft(ref schema.Ref, sc *schemaCtx) (any, bool) {
+// write's target (§6.1), and returns it with the row it was read from.
+// Each namespace holding a copy is locked shared and read as of its lock
+// (D.8). A revision the writer can't read there counts as not found.
+func (t *gate) loadDraft(ref schema.Ref, sc *schemaCtx) (any, int64, bool) {
 	if sc == nil || sc.target == nil || !sc.target.isBranch() {
-		return nil, false
+		return nil, 0, false
 	}
 	id, err := ids.Parse(ref.Rev)
 	if err != nil {
-		return nil, false
+		return nil, 0, false
 	}
 	for _, cr := range t.copyRows(id, ref.Name) {
 		if cr.state == statePurged {
@@ -299,13 +333,17 @@ func (t *gate) loadDraft(ref schema.Ref, sc *schemaCtx) (any, bool) {
 		if !t.credsRead(c, ref.Name, sc.creds) {
 			continue
 		}
-		d, err := t.docAt(t.rev(cr.seq))
+		row := t.rev(cr.seq)
+		if !t.schemaKeysOpen(c, ref.Name, row, sc) {
+			continue // a sealed candidate's draft takes keys (§6.1)
+		}
+		d, err := t.docAt(row)
 		if err != nil {
 			continue
 		}
-		return d, true
+		return d, row.seq, true
 	}
-	return nil, false
+	return nil, 0, false
 }
 
 // pendingNS is the namespace of the schema paths under which the documents

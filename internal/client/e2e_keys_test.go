@@ -34,7 +34,7 @@ func TestE2EKeyTransient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	kid := seal.Kid("secret", kr.Current)
+	kid := seal.Kid("secret", kr.Current("secret"))
 	var mode atomic.Value
 	base := http.DefaultTransport.(*http.Transport).Clone()
 	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
@@ -51,7 +51,7 @@ func TestE2EKeyTransient(t *testing.T) {
 		return base.RoundTrip(req)
 	})
 	svc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"secret"}, []string{"read"}, map[string]any{"enc": svcJWK})),
-		client.WithHTTPClient(&http.Client{Transport: rt}))
+		client.WithHTTPClient(&http.Client{Transport: rt}), client.WithKeyringSenders(wPriv.PublicKey()))
 	for _, m := range []string{"reset", "503"} {
 		mode.Store(m)
 		_, err := svc.E2E(svcPriv).Key(ctx, kid)

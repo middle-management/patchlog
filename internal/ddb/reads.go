@@ -33,7 +33,12 @@ type RevInfo struct {
 	GrantID   string // the grant it was written under, "" for none
 	SchemaRef string
 	Signature string // the author signature (§C.3.1)
+	Via       string // the writing principal's delegation chain, canonical JSON
+	Legacy    bool   // the schema rules before v0.73 (schema.Legacy)
 	Epoch     int    // the epoch it was written in (sealed namespaces)
+	// Declared are the blobs an e2e revision's document references, as
+	// its sealed op declared them (§E.3.1).
+	Declared []string
 	// ParentNS and ParentPos are a first revision's foreign parent.
 	ParentNS  string
 	ParentPos uint64
@@ -170,4 +175,39 @@ func (s *Store) foldFrom(ctx context.Context, ns, name string, fromPos, toPos ui
 		return nil, nil, err
 	}
 	return doc, jsonv.Canonical(doc), nil
+}
+
+// IDRev is a revision found by id, with its namespace.
+type IDRev struct {
+	NS  string
+	Rev RevInfo
+}
+
+// RevsWithID lists every revision of id, in any namespace and resource
+// (GSI1): the copies of a revision.
+func (s *Store) RevsWithID(ctx context.Context, id string) ([]IDRev, error) {
+	in := &dynamodb.QueryInput{
+		TableName:              &s.Table,
+		IndexName:              strptr(gsiName),
+		KeyConditionExpression: strptr("G1PK = :g"),
+		FilterExpression:       strptr("begins_with(SK, :pfx)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":g": avS(g1RevID(id)), ":pfx": avS("REV#"),
+		},
+	}
+	var out []IDRev
+	for {
+		q, err := s.Client.Query(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		for _, it := range q.Items {
+			i := item(it)
+			out = append(out, IDRev{NS: strings.TrimPrefix(i.s("PK"), "NS#"), Rev: scanRevInfo(i)})
+		}
+		if q.LastEvaluatedKey == nil {
+			return out, nil
+		}
+		in.ExclusiveStartKey = q.LastEvaluatedKey
+	}
 }

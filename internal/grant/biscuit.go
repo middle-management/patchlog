@@ -63,7 +63,8 @@ type signedBlock struct {
 	version uint32 // signature payload version, 0 or 1
 }
 
-// container is a parsed Biscuit (or its stored form, without proof).
+// container is a parsed Biscuit (or a stored grant: without proof, the
+// authority block alone or, in rows from before v0.73, every block).
 type container struct {
 	blocks     []signedBlock
 	nextSecret []byte // 32-byte Ed25519 seed; nil if sealed or stored
@@ -101,7 +102,7 @@ func (sb signedBlock) encode() []byte {
 }
 
 // encode serializes the container. Without nextSecret and finalSig the
-// result has no proof: the stored form of §C.3, which is not a token.
+// result has no proof, the stored form before v0.73, which is not a token.
 func (c *container) encode() []byte {
 	var b []byte
 	b = pbBytes(b, 2, c.blocks[0].encode())
@@ -243,7 +244,8 @@ var (
 )
 
 // parseContainer parses a Biscuit. With bearer, the proof is required;
-// otherwise (the stored form) it must be absent. No signature is checked.
+// otherwise (a stored row from before v0.73) it must be absent. No
+// signature is checked.
 func parseContainer(data []byte, bearer bool) (*container, error) {
 	top, err := schemaBiscuit.parse("Biscuit", data)
 	if err != nil {

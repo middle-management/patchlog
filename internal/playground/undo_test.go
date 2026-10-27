@@ -357,7 +357,7 @@ func runUndoHarness(t *testing.T, node, harness string, input map[string]any) []
 	var fns []string
 	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "nsLogRead", "openEntries", "openSealed", "readDoc", "foldTarget",
 		"undoPtr", "undoPtrStr", "ptrGet", "sameAt", "hasPrefix", "widenWrite", "coverPaths", "pathsOverlap", "foldUndo", "moveBack", "invertRev",
-		"planUndoResource", "undoSites", "undoStackFrom", "undoGestureList", "undoNSLog", "undoNSLogOr", "undoReadRes", "undoKeysLevel", "undoPlan", "undoImpossible", "undoRun",
+		"planUndoResource", "undoSites", "undoStackFrom", "undoGestureList", "undoNSLog", "undoNSLogOr", "undoReadRes", "undoKeysLevel", "undoPlan", "undoImpossible", "undoHeadMoved", "undoRun",
 		"undoLatest", "needsNonce"} {
 		fns = append(fns, jsFunction(t, js, f))
 	}

@@ -33,10 +33,12 @@ package core
 // the same input a successful write is stored with: a bad signature on a
 // write whose precondition is stale is 422, not 412.
 //
-// A write without a usable precondition (no If-Match or If-None-Match, or
-// a malformed If-Match) has no parent to bind, so its signatures can't be
-// checked: they aren't, "required" included, and it gets the
-// precondition's own error (428, or 400) at step 2.5 (§C.3.1 "The parent").
+// A write without a usable precondition (no If-Match or If-None-Match, a
+// malformed If-Match, or a "delete" first under If-None-Match, which is
+// 428 whatever the resource's state, §7.5, §12.1) has no parent to bind,
+// so its signatures can't be checked: they aren't, "required" included,
+// and it gets the precondition's own error (428, or 400) at step 2.5
+// (§C.3.1 "The parent").
 
 import (
 	"fmt"
@@ -61,7 +63,7 @@ func checkSignatureShapes(req Request, items []Item, isBatch bool) *Error {
 			if st.Signature == "" {
 				continue
 			}
-			if _, err := sig.Parse(st.Signature); err != nil {
+			if _, err := sig.ParseInput(st.Signature); err != nil {
 				if !isBatch {
 					return badInput("malformed Signature: " + err.Error())
 				}
@@ -115,10 +117,12 @@ func (t *gate) checkItemSignatures(n *nsRow, s *itemState, signers []sig.Signer,
 			return nil // malformed: step 2.5 answers it
 		}
 		parent = &p
-	case s.IfNoneMatch && s.IfMatch == "":
+	case s.IfNoneMatch && s.IfMatch == "" && len(s.Steps) > 0 && !s.Steps[0].Delete:
 	default:
 		// No usable precondition: nothing to bind, and step 2.5
-		// answers it (see the package comment above).
+		// answers it (see the package comment above). A "delete" first
+		// under If-None-Match is one: 428 whatever the resource's state
+		// (§7.5, §12.1).
 		return nil
 	}
 	origin := t.e.Origin()

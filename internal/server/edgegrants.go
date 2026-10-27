@@ -107,7 +107,8 @@ func (s *Server) edgeGrants(w http.ResponseWriter, r *http.Request) {
 // cookie never authorises issuing another. The body must be
 // application/json (415 otherwise): a cross-site form can send text/plain
 // without a CORS preflight, and would set cookies of its own grant in the
-// reader's browser.
+// reader's browser. It is compared as a media type: a charset naming UTF-8
+// is the only parameter it may carry (§7.2).
 func (s *Server) edgeGrantBearers(r *http.Request) ([]string, error) {
 	// Room for every grant at the largest grant size, as base64 with its
 	// optional prefix and padding, quoted, and some whitespace.
@@ -131,8 +132,8 @@ func (s *Server) edgeGrantBearers(r *http.Request) ([]string, error) {
 	if r.Header.Get("Authorization") != "" {
 		return nil, badInput("grants in the body take no Authorization (§C.5.2)")
 	}
-	if mediaType(r) != "application/json" {
-		return nil, &core.Error{Status: 415, Body: map[string]any{"code": "bad_input", "message": "use application/json"}}
+	if err := requireType(r, jsonType); err != nil {
+		return nil, err
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	v, err := readJSON(r, max, noLimit)

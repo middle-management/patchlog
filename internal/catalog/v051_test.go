@@ -13,12 +13,14 @@ import (
 // checkpoint is { ns: ns_id } of the catalog and of the named item's
 // namespace, which are all it depends on, so a write to another content
 // namespace the catalog trusts moves listings' at but not the checkpoint
-// of a decision on a matches item. In POST /read-grants each entry
-// carries its own: a placement node names its item's namespace, a folder
-// none; a public item of a followed namespace carries the checkpoint its
-// exposure was read at, and one of a namespace the service doesn't
-// follow, read at the head, none. Every item comes back with a grant,
-// "public": true or its node's answer, so the reader may read them all.
+// of a decision on a matches item. POST /read-grants carries one
+// checkpoint, over every namespace its decisions read (v0.73): the
+// catalog's and each item's namespace's, a public one the service
+// doesn't follow, read at the head, having none. A catalog node, 400 in a
+// catalog that is neither sealed nor end-to-end, reads only the catalog's
+// level (in a sealed one, a folder's visibility reads every trusted
+// namespace, v0.56 note 4). Every item but the node comes back with a
+// grant or "public": true, so the reader may read them all.
 func TestCheckpointNamesItsNamespaces(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -47,7 +49,7 @@ func TestCheckpointNamesItsNamespaces(t *testing.T) {
 
 	bob := w.caller("user:bob", "match-desk")
 	read := map[string]any{"item": "/r/matches/derby", "want": toAny("read")}
-	items := toAny("/r/matches/derby", "/r/cat/matches.derby", "/r/cat/season", "/r/open/notice")
+	items := toAny("/r/matches/derby", "/r/open/notice")
 	cp := w.checkpointOf("matches")
 	at := w.listingAt(bob)
 	check := func(when string) {
@@ -56,15 +58,18 @@ func TestCheckpointNamesItsNamespaces(t *testing.T) {
 			t.Errorf("%s: grant checkpoint %v, want %v", when, r.body["checkpoint"], cp)
 		}
 		rg := w.do("POST", "/read-grants", bob, map[string]any{"items": items})
-		for i, want := range []any{cp, cp, w.checkpointOf(), nil} {
+		if !reflect.DeepEqual(rg.body["checkpoint"], cp) {
+			t.Errorf("%s: read-grants checkpoint %v, want %v", when, rg.body["checkpoint"], cp)
+		}
+		for i := range items {
 			e := entry(rg, i)
-			if e == nil || e["error"] != nil || (i == 0) != (e["grant"] != nil) || (i == 3) != (e["public"] == true) {
+			if e == nil || e["status"] != nil || e["checkpoint"] != nil || (i == 0) != (e["grant"] != nil) || (i == 1) != (e["public"] == true) {
 				t.Errorf("%s: entry %d: %v", when, i, e)
-				continue
 			}
-			if got, has := e["checkpoint"]; has != (want != nil) || has && !reflect.DeepEqual(got, want) {
-				t.Errorf("%s: entry %d (%v): checkpoint %v, want %v", when, i, e["item"], got, want)
-			}
+		}
+		rg = w.do("POST", "/read-grants", bob, map[string]any{"items": append(items, "/r/cat/season")})
+		if !reflect.DeepEqual(rg.body["checkpoint"], cp) || entry(rg, 2)["status"] != 400.0 {
+			t.Errorf("%s: read-grants naming a folder: %v, want checkpoint %v", when, rg.body, cp)
 		}
 	}
 	check("before")

@@ -36,8 +36,22 @@ func groupEngine(t *testing.T) *Engine {
 // other at BeforeWriteLock, so they queue together; fn, if set, runs once
 // all have arrived, before they go on.
 func holdChecked(t *testing.T, e *Engine, n int, fn func()) {
+	holdCheckedFor(t, e, n, 10*time.Second, fn)
+}
+
+// holdCheckedFor is holdChecked whose writes wait for each other at most
+// wait, then report it. A write still held when the test ends goes on
+// without reporting, as the test can't take a report then (testing panics,
+// ending the whole run).
+func holdCheckedFor(t *testing.T, e *Engine, n int, wait time.Duration, fn func()) {
 	var mu sync.Mutex
 	arrived := make(chan struct{})
+	ended := false
+	t.Cleanup(func() {
+		mu.Lock()
+		ended = true
+		mu.Unlock()
+	})
 	e.opt.BeforeWriteLock = func() {
 		mu.Lock()
 		if n == 0 {
@@ -53,8 +67,12 @@ func holdChecked(t *testing.T, e *Engine, n int, fn func()) {
 		mu.Unlock()
 		select {
 		case <-arrived:
-		case <-time.After(10 * time.Second):
-			t.Error("the writes didn't all finish their checks")
+		case <-time.After(wait):
+			mu.Lock()
+			if !ended {
+				t.Error("the writes didn't all finish their checks")
+			}
+			mu.Unlock()
 		}
 	}
 }
@@ -556,6 +574,59 @@ func waiting(e *Engine) int {
 	return n
 }
 
+// groupBlocked reports whether e's writes of ns have all left their check
+// phase and the queue, taken into a group by a running worker, and a
+// transaction waits for the namespace lock key (lockClass): the group's,
+// as nothing else a test runs takes that lock but the holder of holdLock.
+// Other lock waits show no group: the writes' rate-limit draws (rate_draw,
+// ratebuckets.go) wait for each other's bucket rows in their check phase,
+// before any group forms, and a request cancelled then is never written.
+func groupBlocked(e *Engine, ns string, key int32) bool {
+	if !groupFormed(e, ns) {
+		return false
+	}
+	var n int
+	e.db.QueryRow(`SELECT COUNT(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+		WHERE l.locktype = 'advisory' AND l.classid = ($1::bigint)::oid AND l.objid = ($2::bigint)::oid AND l.objsubid = 2
+		AND NOT l.granted AND a.datname = current_database()`, lockClass, key).Scan(&n)
+	return n > 0
+}
+
+// groupFormed reports whether e's writes of ns have all left their check
+// phase and the queue, taken into a group by a running worker.
+func groupFormed(e *Engine, ns string) bool {
+	e.groups.mu.Lock()
+	defer e.groups.mu.Unlock()
+	s := e.groups.ns[ns]
+	return s != nil && s.worker && s.checking == 0 && s.solo == 0 && len(s.queue) == 0
+}
+
+// lockWaiter is the backend of e's database that waits for the advisory
+// lock key of class, or 0 if none does.
+func lockWaiter(e *Engine, class int, key int32) int {
+	var pid int
+	e.db.QueryRow(`SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+		WHERE l.locktype = 'advisory' AND l.classid = ($1::bigint)::oid AND l.objid = ($2::bigint)::oid AND l.objsubid = 2
+		AND NOT l.granted AND a.datname = current_database() LIMIT 1`, class, key).Scan(&pid)
+	return pid
+}
+
+// groupWaitsOn reports whether e's writes of ns have formed a group
+// (groupFormed) and a transaction other than a rate draw waits for a lock
+// the backend pid holds: the group's insert, waiting for a row pid's
+// transaction inserted. Like groupBlocked, it isn't fooled by the writes'
+// rate draws waiting for each other's bucket rows before any group forms.
+func groupWaitsOn(e *Engine, ns string, pid int) bool {
+	if !groupFormed(e, ns) {
+		return false
+	}
+	var n int
+	e.db.QueryRow(`SELECT COUNT(*) FROM pg_stat_activity
+		WHERE datname = current_database() AND wait_event_type = 'Lock' AND query NOT LIKE '%rate_draw(%'
+		AND $1 = ANY (pg_blocking_pids(pid))`, pid).Scan(&n)
+	return n > 0
+}
+
 // waitFor polls cond until it holds or d passes, and reports whether it
 // held. Unlike within it may run outside the test's goroutine.
 func waitFor(d time.Duration, cond func() bool) bool {
@@ -816,6 +887,13 @@ func TestPGGroupCommitNoDeadlockWithSingleWrite(t *testing.T) {
 // transaction runs again, and the re-check leaves x's write out, to be
 // answered 412 alone; the others commit together.
 func TestPGGroupCommitLostRaceLeavesLoserOut(t *testing.T) {
+	lostRaceLeavesLoserOut(t, nil)
+}
+
+// lostRaceLeavesLoserOut runs TestPGGroupCommitLostRaceLeavesLoserOut.
+// drawing, if not nil, is called with the single write's backend just
+// before the group's writes start.
+func lostRaceLeavesLoserOut(t *testing.T, drawing func(a *Engine, single int)) {
 	a, b := twoInstancesAt(t, slowDeadlockDB(t))
 	a.noSolo = true
 	a.opt.GroupCommitWait = 5 * time.Second
@@ -825,7 +903,8 @@ func TestPGGroupCommitLostRaceLeavesLoserOut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	release := holdLock(t, a, logClass, lockKey(nsIDOf(t, a, "n")))
+	logKey := lockKey(nsIDOf(t, a, "n"))
+	release := holdLock(t, a, logClass, logKey)
 	type outcome struct {
 		res *WriteResult
 		err error
@@ -835,18 +914,27 @@ func TestPGGroupCommitLostRaceLeavesLoserOut(t *testing.T) {
 		r, err := write(b, "n", "x", h, 99)
 		single <- outcome{r, err}
 	}()
-	within(t, 5*time.Second, "the single write waits for the log lock", func() bool { return waiting(a) == 1 })
+	var pid int
+	within(t, 5*time.Second, "the single write waits for the log lock", func() bool {
+		pid = lockWaiter(a, logClass, logKey)
+		return pid != 0
+	})
 	sizes := groupSizes(a)
 	alone := a.groups.alone.Load()
 	holdChecked(t, a, 3, nil)
 	go func() {
 		// Once the group waits for the single write's row, the single write
-		// may append.
-		if !waitFor(5*time.Second, func() bool { return waiting(a) == 2 }) {
+		// may append. (Any second lock wait is no sign of it: the group's
+		// writes draw their rate-limit tokens in their check phase, and one
+		// draw may wait for another's bucket row before any group forms.)
+		if !waitFor(5*time.Second, func() bool { return groupWaitsOn(a, "n", pid) }) {
 			t.Error("the group didn't wait for the single write's row")
 		}
 		release()
 	}()
+	if drawing != nil {
+		drawing(a, pid)
+	}
 	start := time.Now()
 	res, errs := concurrently(3, func(i int) (*WriteResult, error) {
 		if i == 0 {
@@ -1227,32 +1315,42 @@ func TestPGGroupCommitCancelQueued(t *testing.T) {
 // exclusively elsewhere) goes on while some of its requests are cancelled,
 // and stops waiting once all are: nothing is written, every request returns
 // its cancellation, and the namespace's state is dropped.
+//
+// The requests are cancelled only once the group has formed and waits for
+// the lock (groupBlocked), and each cancellation returns once every
+// context.AfterFunc of its request has run (lagCtx, released at once), so
+// the group has seen it before the test looks.
 func TestPGGroupCommitCancelBlockedGroup(t *testing.T) {
 	e := groupEngine(t)
 	mkNS(t, e, "n", map[string]any{"read": "public"})
-	release := holdLock(t, e, lockClass, lockKey(nsIDOf(t, e, "n")))
+	key := lockKey(nsIDOf(t, e, "n"))
+	release := holdLock(t, e, lockClass, key)
 	const n = 3
-	ctxs, cancels := make([]context.Context, n), make([]context.CancelFunc, n)
+	ctxs := make([]*lagCtx, n)
 	errs := make([]chan error, n)
 	sizes := groupSizes(e)
 	holdChecked(t, e, n, nil)
 	for i := range n {
-		ctxs[i], cancels[i] = context.WithCancel(context.Background())
+		ctxs[i] = newLagCtx()
 		errs[i] = make(chan error, 1)
 		go func() {
 			_, err := writeCtx(ctxs[i], e, "n", fmt.Sprint("c", i), i)
 			errs[i] <- err
 		}()
 	}
-	within(t, 5*time.Second, "the group waits for the lock", func() bool { return waiting(e) > 0 })
-	cancels[0]()
-	cancels[1]()
+	cancel := func(i int) {
+		ctxs[i].cancel()
+		ctxs[i].release()
+	}
+	within(t, 5*time.Second, "the group waits for the lock", func() bool { return groupBlocked(e, "n", key) })
+	cancel(0)
+	cancel(1)
 	select {
 	case err := <-errs[0]:
 		t.Fatalf("a write of the group returned before the group did: %v", err)
 	case <-time.After(300 * time.Millisecond):
 	}
-	cancels[2]()
+	cancel(2)
 	for i := range n {
 		select {
 		case err := <-errs[i]:
@@ -1275,11 +1373,17 @@ func TestPGGroupCommitCancelBlockedGroup(t *testing.T) {
 
 // A request cancelled after its group formed still gets the group's
 // outcome: the group isn't cancelled while another of its requests isn't.
+//
+// The request is cancelled only once the group has formed and waits for
+// the lock (groupBlocked), and the lock is released only once every
+// context.AfterFunc of the request has run (lagCtx, released at once), so
+// a group cancelled by it would have stopped by then.
 func TestPGGroupCommitCancelOneOfGroup(t *testing.T) {
 	e := groupEngine(t)
 	mkNS(t, e, "n", map[string]any{"read": "public"})
-	release := holdLock(t, e, lockClass, lockKey(nsIDOf(t, e, "n")))
-	ctx, cancel := context.WithCancel(context.Background())
+	key := lockKey(nsIDOf(t, e, "n"))
+	release := holdLock(t, e, lockClass, key)
+	ctx := newLagCtx()
 	holdChecked(t, e, 2, nil)
 	res, errs := make([]*WriteResult, 2), make([]error, 2)
 	var wg sync.WaitGroup
@@ -1287,16 +1391,16 @@ func TestPGGroupCommitCancelOneOfGroup(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c := context.Background()
+			var c context.Context = context.Background()
 			if i == 0 {
 				c = ctx
 			}
 			res[i], errs[i] = writeCtx(c, e, "n", fmt.Sprint("c", i), i)
 		}()
 	}
-	within(t, 5*time.Second, "the group waits for the lock", func() bool { return waiting(e) > 0 })
-	cancel()
-	time.Sleep(100 * time.Millisecond)
+	within(t, 5*time.Second, "the group waits for the lock", func() bool { return groupBlocked(e, "n", key) })
+	ctx.cancel()
+	ctx.release()
 	release()
 	wg.Wait()
 	for i, err := range errs {
