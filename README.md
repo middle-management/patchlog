@@ -811,6 +811,14 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   may keep its buckets in memory, as SQLite does, with `serve -local-rate-buckets`
   (`Options.LocalRateBuckets`); before v0.73 every instance enforced the limits on what it
   served.
+- **Connections.** An instance opens up to 4 × `GOMAXPROCS` connections for its transactions,
+  plus up to `GOMAXPROCS` (at least 2) for its rate-limit draws unless `-local-rate-buckets`,
+  and keeps them open, idle, for later requests; one of them holds the background loops' leader
+  lock. Keep the sum over every instance under the server's `max_connections` (100 by default),
+  or bound each instance with two parameters of the URL, as pgxpool names them:
+  `pool_max_conns=N` caps the first pool at `N` connections (at least 2) and the draws' at a
+  quarter of `N` (at least 2), and `pool_max_conn_idle_time=5m` closes a connection idle for
+  longer.
 - **Per instance:** the in-memory caches above.
 - **Edge-grant keys.** Without `-edge-grant-key`, each instance signs edge-grant cookies with a
   random key of its own, so a cookie one instance mints is refused by the others: behind a load

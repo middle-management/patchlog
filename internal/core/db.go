@@ -76,13 +76,15 @@ func openSQLite(path string) (*sql.DB, error) {
 
 // openPG opens a Postgres database and creates or migrates its schema.
 func openPG(url string) (*sql.DB, error) {
+	url, pool, err := parsePGPool(url)
+	if err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("pgx", url)
 	if err != nil {
 		return nil, err
 	}
-	n := 4 * runtime.GOMAXPROCS(0)
-	db.SetMaxOpenConns(n)
-	db.SetMaxIdleConns(n)
+	pool.sizeMain(db)
 	if err := dbmigrate.Migrate(context.Background(), db, migrations, "patchlog"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)

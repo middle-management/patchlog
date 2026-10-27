@@ -1322,6 +1322,11 @@ index's 002–004, and those of the services' edge grants (`internal/svcedge`, 0
   with jitter, before running again; retrying at once could lose the rows to the statement that
   survived the deadlock and close the same cycle on every attempt, failing the request. Such
   deadlocks need a statement that locks bucket rows out of key order, such as an operator's.
+- **Postgres: fewer connections per instance.** The rate-limit draws' pool of its own holds up to
+  `GOMAXPROCS` connections (at least 2), not twice that, beside the 4 × `GOMAXPROCS` of the main
+  pool. The URL's `pool_max_conns=N` caps the main pool at `N` and the draws' at a quarter of it,
+  and `pool_max_conn_idle_time=D` closes idle connections (README "Postgres", Connections), so
+  several instances fit a server's `max_connections`.
 - **Tests:** `TestPGGroupCommitCancelBlockedGroup`, `TestPGGroupCommitCancelOneOfGroup`,
   `TestPGGroupCommitLostRaceLeavesLoserOut` and `TestV073P17DrawRetriesDeadlock` (Postgres) wait for
   the state they test instead of any lock wait or a fixed sleep (a rate draw's wait for a bucket

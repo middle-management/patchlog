@@ -65,17 +65,28 @@ type bucketStore struct {
 
 // openBucketStore opens the bucket pool on the Postgres database url.
 func openBucketStore(url string) (*bucketStore, error) {
+	url, pool, err := parsePGPool(url)
+	if err != nil {
+		return nil, err
+	}
 	cfg, err := pgx.ParseConfig(url)
 	if err != nil {
 		return nil, err
 	}
 	cfg.RuntimeParams["synchronous_commit"] = "off"
 	db := stdlib.OpenDB(*cfg)
-	n := 2 * runtime.GOMAXPROCS(0)
-	db.SetMaxOpenConns(n)
-	db.SetMaxIdleConns(n)
+	pool.sizeBuckets(db)
 	return &bucketStore{db: db}, nil
 }
+
+// bucketConns is the size of the bucket pool: a quarter of the main
+// pool's (mainConns, 4 × GOMAXPROCS), a connection per CPU, at least two
+// (a sweep holds one). A draw is one short statement, a fraction of the
+// round trips of the write that waits for it on the main pool, and draws
+// on one bucket queue on its row lock whatever the pool's size: more
+// connections would only hold more of the server's max_connections, which
+// every instance's two pools share.
+func bucketConns() int { return max(2, runtime.GOMAXPROCS(0)) }
 
 // close waits for a running sweep and closes the pool.
 func (s *bucketStore) close() error {
