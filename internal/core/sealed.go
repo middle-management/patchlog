@@ -268,6 +268,25 @@ func (t *tx) createEpochKey(ns int64, epoch int) {
 	t.newEpochKeys[epochRef{ns, epoch}] = k
 }
 
+// storeEpochKey stores key as the epoch key of (ns, epoch), which began at
+// created, if none is stored: a remote branch's shadow keeps the keys its
+// source gave of the epochs before its raise to e2e (fetchPreRaiseKeys).
+func (t *tx) storeEpochKey(ns int64, epoch int, key []byte, created time.Time) {
+	if t.hasEpochKey(ns, epoch) {
+		return
+	}
+	ks := t.e.opt.KeyStore
+	if ks == nil {
+		panic(errNoKeyStore)
+	}
+	w, err := ks.Wrap(t.context(), key, epochAAD(ns, epoch))
+	if err != nil {
+		panic(encUnavailable(fmt.Sprintf("wrapping an epoch key with key store %s: %v", ks.Name(), err)))
+	}
+	_, err = t.Exec(`INSERT INTO epoch_keys (ns, epoch, wrapped, keystore, created) VALUES (?,?,?,?,?)`, ns, epoch, w, ks.Name(), created.UnixMilli())
+	t.must(err)
+}
+
 // epochKey returns the epoch key of (ns, epoch), panicking with a 500 when
 // it can't be had.
 func (t *tx) epochKey(ns int64, epoch int) []byte {

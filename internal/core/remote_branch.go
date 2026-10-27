@@ -274,8 +274,12 @@ type remoteChain struct {
 	horizonDoc []byte
 	index      map[string]int
 	// opaque marks e2e content (§E.3): patch sets are ciphertext, never
-	// applied, and the chain has no documents.
+	// applied, and the chain has no documents. In a level raised to e2e,
+	// the first plain entries are from before the raise (plainPrefix): in
+	// the clear, as the base serves them (Addendum E Levels), with
+	// documents as in a chain that isn't opaque.
 	opaque bool
+	plain  int
 	// blobs are the blobs its documents reference, fetched from the base
 	// and verified (remote_blobs.go).
 	blobs map[ids.ID]*remoteBlob
@@ -301,7 +305,25 @@ func (c *remoteChain) last() client.LogEntry { return c.entries[len(c.entries)-1
 func (c *remoteChain) prefix(k int) *remoteChain {
 	p := newChain(c.entries[:k+1], c.horizonDoc)
 	p.opaque, p.blobs, p.rules = c.opaque, c.blobs, c.rules
+	p.plain = min(c.plain, len(p.entries))
 	return p
+}
+
+// plainPrefix is the number of an opaque chain's first entries that come
+// before its first sealed op (§E.3.1): in a level raised to e2e, content
+// from before the raise, which the base serves at the level before it, in
+// the clear or sealed, which the client opens (Addendum E Levels). A
+// restore with [] there keeps the last live document, before the raise or
+// after it alike.
+func (c *remoteChain) plainPrefix() int {
+	for i, e := range c.entries {
+		if e.Kind == "rev" && e.HasPatches {
+			if _, _, ok := seal.SealedOp(e.Patches); ok {
+				return i
+			}
+		}
+	}
+	return len(c.entries)
 }
 
 // fetchRules reads, for each schema document of ch, the rules marker the
@@ -368,7 +390,7 @@ func (c *remoteChain) fold(f func(i int, e client.LogEntry, doc any) error) erro
 	exists := false
 	for i, e := range c.entries {
 		switch {
-		case c.opaque && (e.Kind == "rev" || e.Kind == "tombstone"):
+		case c.opaque && i >= c.plain && (e.Kind == "rev" || e.Kind == "tombstone"):
 			// Ciphertext: readers verify and fold it (§E.3.2).
 		case i == 0 && c.horizonDoc != nil:
 			doc, exists = jsonv.MustParse(c.horizonDoc), true
@@ -539,6 +561,17 @@ type remoteLevel struct {
 	// they began (§E.3.2), for the shadow's keyring relay.
 	enc    map[string]any
 	epochs []epochStart
+	// raise is the index in log of the entry that raised an e2e level to
+	// e2e before at, -1 if it was e2e from its creation (Addendum E
+	// Levels); preEnc is its encryption member before (nil for none), and
+	// from sealed, preEpochs are the epochs before the raise with when each
+	// began, which only the source's own log gives (§G.5.2), and preKeys
+	// the keys of those its source's /keys gave this deployment's grant
+	// (fetchPreRaiseKeys), which the branch's /keys gives as at E2.
+	raise     int
+	preEnc    map[string]any
+	preEpochs []epochStart
+	preKeys   map[int][]byte
 	// nonce: the base itself (level 0) requires nonces as of at (§C.7).
 	nonce bool
 }
@@ -647,7 +680,7 @@ func fetchLevel(ctx context.Context, c *client.Client, origin, ns, at string, ma
 	if last != at {
 		return nil, nil, unverified("/ns/%s: the namespace log ends at %s, not at %s", ns, last, at)
 	}
-	lv := &remoteLevel{ns: ns, at: at, log: log, byName: map[string]*remoteRes{}}
+	lv := &remoteLevel{ns: ns, at: at, log: log, byName: map[string]*remoteRes{}, raise: -1}
 	set := func(name, kind, target string, i int) {
 		r := &remoteRes{name: name, kind: kind, target: target, lastIdx: i}
 		if prev := lv.byName[name]; kind == "purge" && prev != nil && prev.kind == "tombstone" {
@@ -752,46 +785,121 @@ func docLevel(doc map[string]any) int {
 // epochs with when each began: the created time of the first entry of its
 // log whose configuration names it (§E.3.2). Configuration documents are
 // only as trustworthy as the channel; they only decide which epochs a grant
-// on this side gets relayed (§E.2.3).
+// on this side gets relayed (§E.2.3). A level raised to e2e before at
+// (Addendum E Levels) has configurations below e2e before the raise: the
+// raise, what was in force before it and, from sealed, the epochs before it
+// are recorded too (remoteLevel.raise), whose keys fetchPreRaiseKeys gets.
+// Levels never go down, so a level below e2e after an e2e one fails
+// verification.
 func (e *Engine) fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLevel, mapErr func(string, error) *Error) *Error {
-	epochOf := func(nsID string) (map[string]any, int, *Error) {
+	docOf := func(nsID string) (map[string]any, *Error) {
 		d, err := c.NSDoc(ctx, lv.ns, nsID)
 		if err != nil {
-			return nil, 0, mapErr("/ns/"+lv.ns+"/rev/"+nsID, err)
+			return nil, mapErr("/ns/"+lv.ns+"/rev/"+nsID, err)
 		}
-		enc, _ := d.Value["encryption"].(map[string]any)
-		if lvl, _ := enc["level"].(string); lvl != "e2e" {
-			return nil, 0, unverified("/ns/%s: an e2e base's chain holds a namespace that isn't e2e", lv.ns)
-		}
+		return d.Value, nil
+	}
+	epochOf := func(enc map[string]any) int {
 		ep := 1
 		if f, ok := enc["epoch"].(float64); ok {
 			ep = int(f)
 		}
-		return enc, ep, nil
+		return ep
 	}
-	enc, cur, ferr := epochOf(lv.at)
+	atDoc, ferr := docOf(lv.at)
 	if ferr != nil {
 		return ferr
 	}
+	enc, _ := atDoc["encryption"].(map[string]any)
+	if docLevel(atDoc) != levelE2E {
+		return unverified("/ns/%s: an e2e base's chain holds a namespace that isn't e2e at at", lv.ns)
+	}
+	cur := epochOf(enc)
 	if lv.enc, ferr = e.shadowEncryption(lv.ns, enc); ferr != nil {
 		return ferr
 	}
-	seen := map[int]bool{}
-	for _, en := range lv.log {
-		isConfig := en.Kind == "config"
-		for _, s := range en.Entries {
-			isConfig = isConfig || s.Kind == "config"
-		}
-		if !isConfig {
+	lv.raise = -1
+	seen, preSeen := map[int]bool{}, map[int]bool{}
+	prev := -1 // the level of the last configuration read
+	var prevEnc map[string]any
+	for i, en := range lv.log {
+		if !configChanged(en) {
 			continue
 		}
-		_, ep, ferr := epochOf(en.ID)
+		d, ferr := docOf(en.ID)
 		if ferr != nil {
 			return ferr
 		}
-		if !seen[ep] && ep <= cur {
-			seen[ep] = true
-			lv.epochs = append(lv.epochs, epochStart{e: ep, created: time.UnixMilli(parseCreated(en.Created, time.Now()))})
+		enc, _ := d["encryption"].(map[string]any)
+		level, ep := docLevel(d), epochOf(enc)
+		created := time.UnixMilli(parseCreated(en.Created, time.Now()))
+		switch {
+		case level == levelE2E:
+			if prev >= 0 && prev < levelE2E {
+				lv.raise = i
+				if prevEnc != nil {
+					if lv.preEnc, ferr = e.shadowEncryption(lv.ns, prevEnc); ferr != nil {
+						return ferr
+					}
+				}
+			}
+			if !seen[ep] && ep <= cur {
+				seen[ep] = true
+				lv.epochs = append(lv.epochs, epochStart{e: ep, created: created})
+			}
+		case prev == levelE2E:
+			return unverified("/ns/%s: its encryption level went down from e2e (Addendum E Levels)", lv.ns)
+		case level == levelSealed && !preSeen[ep]:
+			preSeen[ep] = true
+			lv.preEpochs = append(lv.preEpochs, epochStart{e: ep, created: created})
+		}
+		prev, prevEnc = level, enc
+	}
+	return nil
+}
+
+// fetchPreRaiseKeys gets, for a level raised to e2e from sealed before at,
+// the keys of its epochs before the raise from the source's POST
+// /ns/{ns}/keys with this deployment's grant (Addendum E Levels, §G.3
+// Reading through): they are the origin's, given as at E2, raw or wrapped
+// to the grant's enc in base mode, which the endpoint's Identity unwraps.
+// The branch's /keys gives them to its own grants as at E2 (preRaiseKeys),
+// with start times only from the source's own log (§G.5.2). Keys the source
+// gives this grant none of, it relays none of; keyring entries (from) are
+// the mirrored keyring's. Only no answer, or a 5xx, fails creation.
+func fetchPreRaiseKeys(ctx context.Context, c *client.Client, ep RemoteEndpoint, lv *remoteLevel) *Error {
+	if lv.raise < 0 || len(lv.preEpochs) == 0 {
+		return nil
+	}
+	epochs := make([]int, len(lv.preEpochs))
+	for i, x := range lv.preEpochs {
+		epochs[i] = x.e
+	}
+	got, err := c.FetchKeys(ctx, lv.ns, epochs, nil)
+	if err != nil {
+		if noAnswer(err) {
+			return upstreamErr("/ns/%s/keys: %v", lv.ns, err)
+		}
+		log.Printf("remote base %s: its keys of the epochs before its raise to e2e: %v; the branch gives none of them", lv.ns, err)
+		return nil
+	}
+	lv.preKeys = map[int][]byte{}
+	for _, k := range got {
+		kns, e, err := seal.ParseKid(k.Kid)
+		if err != nil || kns != lv.ns || k.From != "" || k.Resource != "" || !slices.Contains(epochs, e) {
+			continue
+		}
+		key := k.Key
+		if key == nil {
+			if ep.Identity == nil {
+				continue
+			}
+			if key, err = seal.UnwrapKey(ep.Identity, k.Wrapped); err != nil {
+				continue
+			}
+		}
+		if len(key) == seal.KeySize {
+			lv.preKeys[e] = key
 		}
 	}
 	return nil
@@ -828,7 +936,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 			failed.Body["origin"] = base.Origin
 		}
 	}()
-	c, _, err := e.remoteClient(base.Origin)
+	c, ep, err := e.remoteClient(base.Origin)
 	if err != nil {
 		return nil, upstreamErr("%s: %v", base.Origin, err)
 	}
@@ -909,12 +1017,16 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 		ns, at = next.NS, next.At
 		mapErrs = append(mapErrs, levelErr(base.Origin, ns, unreadableBase(ns)))
 	}
-	opaque := m.level == levelE2E
+	opaque, raised := m.level == levelE2E, false
 	if opaque {
 		for i, lv := range m.levels {
 			if ferr := e.fetchEpochs(ctx, c, lv, mapErrs[i]); ferr != nil {
 				return nil, ferr
 			}
+			if ferr := fetchPreRaiseKeys(ctx, c, ep, lv); ferr != nil {
+				return nil, ferr
+			}
+			raised = raised || lv.raise >= 0
 		}
 	}
 	// Every resource as the base sees it at at: the topmost level with
@@ -966,6 +1078,10 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 		ch, ferr := fetchChain(ctx, c, lv.ns, name, r.target, opaque && name != KeyringName, mapErrs[i])
 		if ferr != nil {
 			return nil, ferr
+		}
+		if ch.opaque && raised {
+			// History from before a raise to e2e (MF-37).
+			ch.plain = ch.plainPrefix()
 		}
 		if ferr := fetchRules(ctx, c, lv.ns, name, ch, mapErrs[i]); ferr != nil {
 			return nil, ferr
@@ -1255,10 +1371,18 @@ func (t *tx) insertShadows(branch string, m *remoteMirror) (*nsRow, int64) {
 	var at int64
 	heads := map[*remoteRes]int64{}
 	for i := len(m.levels) - 1; i >= 0; i-- {
-		sh, at = t.insertShadow(shadowLevelName(branch, i), m.read, m.levels[i], sh, at, heads)
-		for _, x := range m.levels[i].epochs {
+		lv := m.levels[i]
+		sh, at = t.insertShadow(shadowLevelName(branch, i), m.read, lv, sh, at, heads)
+		for _, x := range lv.epochs {
 			_, err := t.Exec(`INSERT INTO e2e_epochs (ns, epoch, created) VALUES (?,?,?) ON CONFLICT DO NOTHING`, sh.id, x.e, x.created.UnixMilli())
 			t.must(err)
+		}
+		// The keys of the epochs before a raise from sealed, with the start
+		// times the source's log gives them (preRaiseKeys).
+		for _, x := range lv.preEpochs {
+			if k := lv.preKeys[x.e]; k != nil {
+				t.storeEpochKey(sh.id, x.e, k, x.created)
+			}
 		}
 	}
 	return sh, at
@@ -1290,7 +1414,18 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 		// The branch can't turn it off (checkNonceBase).
 		cdoc["nonce"] = "required"
 	}
-	genesis := []any{map[string]any{"op": "add", "path": "", "value": cdoc}}
+	// A level raised to e2e before at (Addendum E Levels) has two
+	// configurations: the one before the raise, in force at the entries
+	// before it, and the e2e one from the raising entry on, so the shadow's
+	// raise lies where the source's does (e2eRaiseOf).
+	first := cdoc
+	if lv.raise >= 0 {
+		first = map[string]any{"read": read}
+		if lv.preEnc != nil {
+			first["encryption"] = lv.preEnc
+		}
+	}
+	genesis := []any{map[string]any{"op": "add", "path": "", "value": first}}
 	gcanon := jsonv.Canonical(genesis)
 	cid := ids.Revision(nil, gcanon)
 	var bid, bat, bcfg any
@@ -1299,7 +1434,28 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 	}
 	sid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?) RETURNING ns`, name, bid, bat, bcfg)
 	cseq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?) RETURNING seq`,
-		sid, cid[:], string(gcanon), string(jsonv.Canonical(cdoc)), remote, t.now.UnixMilli())
+		sid, cid[:], string(gcanon), string(jsonv.Canonical(first)), remote, t.now.UnixMilli())
+	preSeq := cseq
+	if lv.raise >= 0 {
+		raised := []any{map[string]any{"op": "replace", "path": "", "value": cdoc}}
+		rcanon := jsonv.Canonical(raised)
+		rid := ids.Revision(&cid, rcanon)
+		cseq = t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,?,?,?,?,?) RETURNING seq`,
+			sid, rid[:], preSeq, string(rcanon), string(jsonv.Canonical(cdoc)), remote, parseCreated(lv.log[lv.raise].Created, t.now))
+		level, epoch, pad := levelNone, 0, 0
+		if pre, perr := t.e.parseConfig(first); perr == nil {
+			level = pre.level
+			if level == levelSealed {
+				epoch = pre.Epoch
+				if pre.Pad {
+					pad = 1
+				}
+			}
+		}
+		_, err := t.Exec(`INSERT INTO e2e_raises (ns, config_seq, level, epoch, pad, created) VALUES (?,?,?,?,?,?)`,
+			sid, cseq, level, epoch, pad, parseCreated(lv.log[lv.raise].Created, t.now))
+		t.must(err)
+	}
 	// Resources first, so the log rows can name them.
 	resIDs := map[string]int64{}
 	for _, rr := range lv.res {
@@ -1354,8 +1510,12 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 		if en.Author != "" {
 			author = t.authorID(en.Author)
 		}
+		entryCfg := cseq
+		if i < lv.raise {
+			entryCfg = preSeq
+		}
 		atSeq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created) VALUES (?,?,?,?,?,NULL,?,?,?,?) RETURNING seq`,
-			sid, id[:], prev, nsKindCode(en.Kind), res, string(body), cseq, author, parseCreated(en.Created, t.now))
+			sid, id[:], prev, nsKindCode(en.Kind), res, string(body), entryCfg, author, parseCreated(en.Created, t.now))
 		prev = atSeq
 		for _, rr := range settles[i] {
 			_, err := t.Exec(`INSERT INTO head_history (res, ns_seq, target_seq) VALUES (?,?,?)`, resIDs[rr.name], atSeq, heads[rr])
