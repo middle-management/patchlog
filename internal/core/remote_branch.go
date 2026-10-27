@@ -79,7 +79,7 @@ const RemoteAuthor = "system:remote"
 func shadowName(branch string) string { return "~" + branch }
 
 // remoteShadow returns the shadow n reads through, if n is a remote branch.
-func (t *tx) remoteShadow(n *nsRow) *nsRow {
+func (t *gate) remoteShadow(n *nsRow) *nsRow {
 	if !n.isBranch() {
 		return nil
 	}

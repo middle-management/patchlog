@@ -80,7 +80,7 @@ func signatureErr(msg string) *Error {
 // checkSignatures is the signature check of §6.2 step 2.3 for the items
 // still standing, against cfg, the configuration the write is checked
 // against.
-func (t *tx) checkSignatures(n *nsRow, cfg *Config, a *actor, st []*itemState) []itemErr {
+func (t *gate) checkSignatures(n *nsRow, cfg *Config, a *actor, st []*itemState) []itemErr {
 	var signers []sig.Signer
 	if a != nil && a.grant != nil && len(a.grant.Blocks) > 0 {
 		signers = a.grant.Blocks[0].Signers
@@ -99,7 +99,7 @@ func (t *tx) checkSignatures(n *nsRow, cfg *Config, a *actor, st []*itemState) [
 	return fs
 }
 
-func (t *tx) checkItemSignatures(n *nsRow, s *itemState, signers []sig.Signer, required bool) *Error {
+func (t *gate) checkItemSignatures(n *nsRow, s *itemState, signers []sig.Signer, required bool) *Error {
 	where := func(j int) string {
 		if len(s.Steps) == 1 {
 			return ""

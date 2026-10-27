@@ -374,7 +374,7 @@ func (t *tx) archiveURL(res, seq int64) string {
 }
 
 // prunedInfo is the horizon and archive of the 410 of §7.1.
-func (t *tx) prunedInfo(pe *prunedError) (horizon, archive string) {
+func (t *gate) prunedInfo(pe *prunedError) (horizon, archive string) {
 	return t.horizonID(pe.res), t.archiveURL(pe.res, pe.seq)
 }
 

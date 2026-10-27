@@ -142,7 +142,7 @@ func uploaderOf(a *actor) string {
 }
 
 // blobCutoff is the creation time before which a pending entry has expired.
-func (t *tx) blobCutoff(cfg *Config) int64 { return t.now.Add(-cfg.Limits.BlobGrace).UnixMilli() }
+func (t *gate) blobCutoff(cfg *Config) int64 { return t.now.Add(-cfg.Limits.BlobGrace).UnixMilli() }
 
 // referencedUpTo reports whether a document of res's chain up to seq max
 // references bid.
@@ -156,7 +156,7 @@ func (t *tx) referencedUpTo(res, max int64, bid ids.ID) bool {
 // chains make up the history ending at head (§7.6: crossing foreign
 // parents), skipping res skip, where a document of that history references
 // it. It returns the attachment, or else a pruned one, or nil.
-func (t *tx) historyBlob(head *revRow, skip int64, bid ids.ID) (live, pruned *blobRow) {
+func (t *gate) historyBlob(head *revRow, skip int64, bid ids.ID) (live, pruned *blobRow) {
 	for _, seg := range t.ancestry(head) {
 		if seg.res == skip {
 			continue
@@ -244,7 +244,7 @@ type batchSource struct {
 // blob finds bid attached to name in the source, or in a base it reads
 // through, and referenced by a document in that resource's history as the
 // source sees it at source.at (§7.8 Availability, §7.6).
-func (bs *batchSource) blob(t *tx, name string, bid ids.ID) *blobRow {
+func (bs *batchSource) blob(t *gate, name string, bid ids.ID) *blobRow {
 	if bs == nil || bs.n == nil {
 		return nil
 	}
@@ -259,7 +259,7 @@ func (bs *batchSource) blob(t *tx, name string, bid ids.ID) *blobRow {
 // sourceUnrestricted reports whether a batch may read its local source
 // unrestricted (§7.5): every resource of it, as branch creation requires
 // (§7.6), with the request's own grant or any in Source-Authorization.
-func (t *tx) sourceUnrestricted(n *nsRow, req Request) bool {
+func (t *gate) sourceUnrestricted(n *nsRow, req Request) bool {
 	for _, cred := range req.anyCreds() {
 		if _, err := t.nsReader(n, cred); err == nil {
 			return true
@@ -287,7 +287,7 @@ func (t *tx) sourceReadable(n *nsRow, name string, req Request) bool {
 // reference of every step's resulting document names a blob available to
 // the item's resource and matches its type, size and nonce. It records each
 // step's blobs and where they come from, for step 7.
-func (t *tx) checkBlobs(n *nsRow, s *itemState, a *actor, bs *batchSource) *Error {
+func (t *gate) checkBlobs(n *nsRow, s *itemState, a *actor, bs *batchSource) *Error {
 	cutoff := t.blobCutoff(t.config(n.configSeq))
 	uploader := uploaderOf(a)
 	var lastLive []ids.ID // at E3, the last live document's declared list
@@ -336,7 +336,7 @@ func (t *tx) checkBlobs(n *nsRow, s *itemState, a *actor, bs *batchSource) *Erro
 
 // availableBlob finds where a blob available to an item's resource comes
 // from (§7.8 Availability), or nil.
-func (t *tx) availableBlob(n *nsRow, s *itemState, uploader string, cutoff int64, bid ids.ID, bs *batchSource) *blobRow {
+func (t *gate) availableBlob(n *nsRow, s *itemState, uploader string, cutoff int64, bid ids.ID, bs *batchSource) *blobRow {
 	var own int64
 	if s.view != nil && s.view.own != nil {
 		own = s.view.own.id

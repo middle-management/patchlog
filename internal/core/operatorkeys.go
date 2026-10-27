@@ -40,7 +40,7 @@ type OperatorKeyPeriod struct {
 
 // operatorKeys is Options.OperatorKeys without the keys past their until
 // in the history (§C.4): nil if none are configured, else possibly empty.
-func (t *tx) operatorKeys() []grant.Key {
+func (t *gate) operatorKeys() []grant.Key {
 	keys := t.e.opt.OperatorKeys
 	if len(keys) == 0 || len(t.e.opt.OperatorKeyHistory) == 0 {
 		return keys

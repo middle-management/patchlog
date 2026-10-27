@@ -571,10 +571,12 @@ func limitKeyErr(status int, key, msg string) *Error {
 // tx is one database transaction with the engine's helpers.
 type tx struct {
 	*sql.Tx
+	// The write gate's state and logic (gate.go): its fields and methods
+	// resolve on the transaction as they always did, and the gate reads
+	// through the transaction (checkReads).
+	*checkState
+	*gate
 	ctx    context.Context
-	e      *Engine
-	now    time.Time
-	write  bool
 	notify map[string]bool // namespaces whose logs changed
 	tags   []string        // cache tags to purge after commit
 	// lastNS is the seq of the last namespace entry this transaction
@@ -585,23 +587,6 @@ type tx struct {
 	// a namespace's log: its configuration, or a purge (readcache.go).
 	metaChanged bool
 	docPuts     []docPut // documents to cache after commit
-	// reqCreds are the request's grant and those of Source-Authorization,
-	// for an in_use answer's referencing list (§6.1, the rule for other
-	// namespaces of §7.5).
-	reqCreds []Credentials
-	// decoded are bearer grants this transaction already decoded and
-	// hasn't verified (decodeGrant), so a request naming many namespaces
-	// decodes each grant once (POST /edge-grants).
-	decoded map[string]*grant.Grant
-	// deps, when set, records what a write's check phase read that a
-	// concurrent write could change (D.3 re-check).
-	deps *writeDeps
-	// schemas are the schema paths resolved in this transaction, per
-	// writer (loadSchema).
-	schemas map[schemaKey]schemaLoaded
-	// rateDrawn, when set, records that a write drew its rate-limit tokens,
-	// so a transaction run again doesn't draw them twice.
-	rateDrawn *bool
 	// memo and dirty: rows read in this transaction, and whether it has
 	// written (memo.go).
 	memo    memo
@@ -658,9 +643,6 @@ type tx struct {
 	// sharedNS is the namespace a resource write or batch appends to
 	// holding its lock only shared (pglock.go); 0 if none.
 	sharedNS int64
-	// exclusive makes a resource write or batch lock its namespace
-	// exclusively, as other writes do (writeLocked's last attempt).
-	exclusive bool
 	// Blob files (blobstore.go): those this transaction stored, deleted
 	// if it rolls back, and those whose rows it deleted, deleted once it
 	// has committed.
@@ -701,7 +683,7 @@ func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
 		}
 		err = ctxErr(ctx, err)
 	}()
-	return f(&tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now()})
+	return f(newTx(sqlTx, ctx, e, false))
 }
 
 // ctxErr reports a failure after ctx ended as the context's error: database/sql
@@ -767,7 +749,8 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 	if err != nil {
 		return nil, err
 	}
-	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}}
+	t := newTx(sqlTx, ctx, e, true)
+	t.notify = map[string]bool{}
 	committing := false
 	defer func() {
 		if p := recover(); p != nil {

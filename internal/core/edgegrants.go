@@ -448,7 +448,7 @@ func fixesResource(rv any) ([]string, bool) {
 // stands for it without rules. It carries no subject, so the actor is
 // named, and its bucket keyed, by the prefix. Each read checks its exp, so
 // an event stream opened under it ends there, as under the grant.
-func (t *tx) edgeReader(n *nsRow, eg *EdgeGrant, resource string) (*actor, *Error) {
+func (t *gate) edgeReader(n *nsRow, eg *EdgeGrant, resource string) (*actor, *Error) {
 	if !eg.Exp.IsZero() && !t.now.Before(eg.Exp) {
 		return nil, apiErr(401, "unauthenticated", "message", "the edge grant has expired")
 	}

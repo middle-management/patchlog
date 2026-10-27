@@ -349,18 +349,18 @@ func (t *tx) putDoc(table string, res, seq int64, doc []byte) any {
 }
 
 // patchesOf returns a revision's canonical patch set (the row must have one).
-func (t *tx) patchesOf(r *revRow) []byte {
+func (t *gate) patchesOf(r *revRow) []byte {
 	return t.openValue(r.res, r.patches.String, func() []byte { return revAAD(r.res, r.id) })
 }
 
 // docOf returns a stored heads or snapshots document.
-func (t *tx) docOf(table string, res, seq int64, raw string) []byte {
+func (t *gate) docOf(table string, res, seq int64, raw string) []byte {
 	return t.openValue(res, raw, func() []byte { return docAAD(table, res, seq) })
 }
 
 // openValue returns the canonical JSON of a stored value: decrypted if it
 // is encrypted, then decompressed if it is compressed (compress.go).
-func (t *tx) openValue(res int64, raw string, aad func() []byte) []byte {
+func (t *gate) openValue(res int64, raw string, aad func() []byte) []byte {
 	b := []byte(raw)
 	if isSealed(raw) {
 		var err error
@@ -512,7 +512,7 @@ func (t *tx) encryptResource(res int64) {
 // Addendum E): a key store is needed for any level, a level is never
 // lowered or removed, and a branch is at least at its base's level.
 // cur is nil for a new namespace; baseLevel is -1 if there is no base.
-func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
+func (t *gate) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 	if cfg.level > levelNone && t.e.opt.KeyStore == nil {
 		return invalid("/encryption: no key store configured on this server")
 	}
@@ -552,7 +552,7 @@ func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 
 // lowerDependents lists the unpurged branches of n below level: raising n
 // to level would leave copies of its content less protected (§7.4).
-func (t *tx) lowerDependents(n *nsRow, level int) []string {
+func (t *gate) lowerDependents(n *nsRow, level int) []string {
 	var out []string
 	for _, b := range t.branchesOf(n) {
 		if !b.purged && t.config(b.configSeq).level < level {

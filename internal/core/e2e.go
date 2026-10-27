@@ -75,11 +75,11 @@ import (
 const KeyringName = "keyring"
 
 // isE2E reports whether n is an end-to-end namespace.
-func (t *tx) isE2E(n *nsRow) bool { return t.nsLevel(n) == levelE2E }
+func (t *gate) isE2E(n *nsRow) bool { return t.nsLevel(n) == levelE2E }
 
 // e2eContent reports whether resource name of n holds sealed content: any
 // resource of an e2e namespace but its keyring.
-func (t *tx) e2eContent(n *nsRow, name string) bool { return name != KeyringName && t.isE2E(n) }
+func (t *gate) e2eContent(n *nsRow, name string) bool { return name != KeyringName && t.isE2E(n) }
 
 // e2eConfigWritten records the start of an e2e namespace's epoch: its
 // creation (or a branch's), and every write that increments the epoch.
@@ -109,7 +109,7 @@ func (t *tx) e2eEpochOK(n *nsRow, cfg *Config, e int) bool {
 
 // checkSealedHeader checks a JWE's protected header without a key: kid
 // "{ns}#{e}" for a usable epoch of n, and pl exactly want.
-func (t *tx) checkSealedHeader(n *nsRow, cfg *Config, jwe string, want seal.PL, what string) *Error {
+func (t *gate) checkSealedHeader(n *nsRow, cfg *Config, jwe string, want seal.PL, what string) *Error {
 	h, err := seal.ParseHeader(jwe)
 	if err != nil || strings.Split(jwe, ".")[1] != "" {
 		return invalid(fmt.Sprintf("the %s is not a compact JWE with alg dir and enc A256GCM", what))
@@ -130,7 +130,7 @@ func (t *tx) checkSealedHeader(n *nsRow, cfg *Config, jwe string, want seal.PL, 
 // applyStepsE2E is step 3 for a resource of an e2e namespace (§6.2): each
 // patch step must be one sealed op bound to this write (or [] for a
 // restore); nothing is applied.
-func (t *tx) applyStepsE2E(n *nsRow, cfg *Config, s *itemState) *Error {
+func (t *gate) applyStepsE2E(n *nsRow, cfg *Config, s *itemState) *Error {
 	var parentID *ids.ID
 	tomb := false
 	if s.parent != nil {
@@ -215,7 +215,7 @@ func parseDeclared(list []string) ([]ids.ID, *Error) {
 // checkDeclared is step 4 for a sealed step (§6.2, §E.3.1): every blob of
 // its declared list is available to the item's resource, and is a sealed
 // blob, the only type an e2e reference has.
-func (t *tx) checkDeclared(n *nsRow, s *itemState, step *stepState, list []ids.ID, uploader string, cutoff int64, bs *batchSource) *Error {
+func (t *gate) checkDeclared(n *nsRow, s *itemState, step *stepState, list []ids.ID, uploader string, cutoff int64, bs *batchSource) *Error {
 	step.blobs = map[ids.ID]*blobRow{}
 	for i, bid := range list {
 		ptr := "/0/blobs/" + strconv.Itoa(i)
@@ -249,7 +249,7 @@ func (t *tx) declaredAt(row *revRow) []ids.ID {
 
 // checkKeyring checks the keyring resource's documents in an e2e
 // namespace: a keyring of this namespace whose current epoch has begun.
-func (t *tx) checkKeyring(n *nsRow, cfg *Config, s *itemState) *Error {
+func (t *gate) checkKeyring(n *nsRow, cfg *Config, s *itemState) *Error {
 	for _, st := range s.steps {
 		if st.del {
 			continue
@@ -288,7 +288,7 @@ const blindMsg = "the server can't see writes or /doc of a sealed write in an e2
 // checkRulesE2E is step 6 for a sealed create, append or restore: like
 // checkRules, but a namespace rule reading writes or /doc fails with 422
 // rule, and such a grant, key or role rule with 403.
-func (t *tx) checkRulesE2E(cfg *Config, a *actor, env map[string]any) *Error {
+func (t *gate) checkRulesE2E(cfg *Config, a *actor, env map[string]any) *Error {
 	verb := env["action"].(string)
 	if a.verified != nil {
 		if ok, _ := a.verified.Allows(verb); !ok {

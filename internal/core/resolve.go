@@ -371,7 +371,7 @@ func (t *tx) ancestry(head *revRow) []segment {
 }
 
 // findInAncestry returns the row with id in the ancestry of head, or nil.
-func (t *tx) findInAncestry(head *revRow, id ids.ID) *revRow {
+func (t *gate) findInAncestry(head *revRow, id ids.ID) *revRow {
 	if head.id == id {
 		return head
 	}
@@ -406,7 +406,7 @@ func (purgedError) Error() string { return "purged" }
 // docAt returns the document at a revision row (for a tombstone: the last
 // live document). exists is false when the chain has no document (a
 // tombstone right after nothing, which cannot happen, or a failed fold).
-func (t *tx) docAt(r *revRow) (any, error) {
+func (t *gate) docAt(r *revRow) (any, error) {
 	b, err := t.docBytesAt(r)
 	if err != nil {
 		return nil, err
@@ -608,7 +608,7 @@ func (e LogEntry) value() map[string]any {
 	return m
 }
 
-func (t *tx) logEntry(r *revRow) LogEntry {
+func (t *gate) logEntry(r *revRow) LogEntry {
 	e := LogEntry{ID: r.id.String(), Author: t.authorName(r.author), Created: formatTime(r.created), row: r}
 	if r.parentSeq.Valid {
 		e.Parent = t.revID(r.parentSeq.Int64).String()
@@ -810,7 +810,7 @@ var errNotAncestor = errors.New("not an ancestor")
 
 // lastLive returns the last live revision at or before r (r itself if it is
 // a revision, else the tombstone's parent).
-func (t *tx) lastLive(r *revRow) *revRow {
+func (t *gate) lastLive(r *revRow) *revRow {
 	for r.kind == kindTombstone && r.parentSeq.Valid {
 		r = t.rev(r.parentSeq.Int64)
 	}

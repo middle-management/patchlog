@@ -538,6 +538,30 @@ What landed, beyond the spike:
   commit lock, shared with the worker, from their reads to their commit.
   §11 has the measurements.
 
+**Next: one gate for both stores.** Nearly every divergence the API
+suites found (below) came from the seam re-implementing §6.2's checks
+(`ddbGate`, `ddbDraw`, the batch checks), and every fix reused core's
+own functions. The remaining features — authentication, `$schema`,
+branches, blobs — live in that gate too, so the plan is to run the SQL
+path's gate on DynamoDB instead of growing the copy:
+
+1. *Done:* the gate is extracted behind a read interface
+   (`internal/core/gate.go`). `checkItems` and the logic it reaches (82
+   methods, authentication, rate limits, preconditions, limits, schemas,
+   rules, blobs, sealed/e2e checks) run on a `gate`, whose state is
+   `checkState` and whose storage is `checkReads`: 38 reads (namespaces
+   and the locks a write takes, resources and revisions, configurations,
+   blobs, keys, branches, schemas, the retry lookup, a config change's
+   plan). The SQL transaction implements them unchanged; behaviour is
+   unchanged on SQLite, Postgres and DynamoDB.
+2. DynamoDB implements `checkReads` for the subset it stores, and the
+   seam's own gate goes; the store keeps "read state" and "commit this
+   plan". The reads are SQL-shaped today (int64 row ids, `nsRow`,
+   `revRow`, `lockNS`, prefetches): DynamoDB answers them with its
+   positions as ids and no-op locks, or the interface narrows as it goes.
+3. Features then arrive as data: authentication is storing grants and
+   keys and answering their reads.
+
 Requirements and limits, by design: `-dev` (writes need authentication
 disabled; reads of non-`public` namespaces are 501), one instance (no
 stream invalidation — §6 is phase 3), no background loops (retention,

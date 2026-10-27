@@ -40,7 +40,7 @@ func nfNS(public bool) *Error {
 // "purged", with head, the ns_id of its purge-ns entry, the log's last.
 // /ns/{ns} and its log stay readable, except in a sealed namespace
 // (sealedPurged).
-func (t *tx) purgedNS(n *nsRow) *Error {
+func (t *gate) purgedNS(n *nsRow) *Error {
 	return apiErr(410, "purged", "head", t.nsLogID(n.headSeq.Int64).String())
 }
 
@@ -65,7 +65,7 @@ func (t *tx) sealedPurged(n *nsRow) bool { return n.purged && t.isSealedNS(n) }
 // read-through ones, sorted by name in ascending byte order (§7.4), by Go's
 // string order and never by the database's collation, which on Postgres may
 // order punctuation otherwise.
-func (t *tx) listHeads(n *nsRow, asOf *int64) []headItem {
+func (t *gate) listHeads(n *nsRow, asOf *int64) []headItem {
 	var out []headItem
 	for after := ""; ; {
 		page, next := t.pageHeads(n, asOf, after, 1000)
@@ -114,7 +114,7 @@ func (t *tx) namesAfter(n *nsRow, after string, k int) []string {
 // needs, so a page costs its own size, not the namespace's: names are
 // fetched in chunks, skipping those with no head at asOf, until the page
 // is full and one more resource is known to exist.
-func (t *tx) pageHeads(n *nsRow, asOf *int64, after string, limit int) (out []headItem, next string) {
+func (t *gate) pageHeads(n *nsRow, asOf *int64, after string, limit int) (out []headItem, next string) {
 	chunk := limit + 1
 	for {
 		names := t.namesAfter(n, after, chunk)

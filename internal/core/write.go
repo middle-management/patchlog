@@ -348,7 +348,7 @@ func (e *Engine) Batch(ctx context.Context, req Request, items []Item, cfg *Conf
 
 // batchLimits are a principal's batch limits in a configuration: the
 // namespace's, or its allowance's (§6.6).
-func (t *tx) batchLimits(cfg *Config, a *actor) (items, size int) {
+func (t *gate) batchLimits(cfg *Config, a *actor) (items, size int) {
 	items, size = cfg.Limits.ItemsPerBatch, cfg.Limits.BatchSize
 	if al := t.allowanceOf(cfg, a); al != nil {
 		if al.ItemsPerBatch > 0 {
@@ -431,7 +431,7 @@ type writePlan struct {
 // checkItems runs steps 1–6 of §6.2 for a resource write or batch. It
 // returns a plan to insert, or a final result (an idempotent retry, a dry
 // run), or an error.
-func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun, rateDrawn bool) (*writePlan, *WriteResult, error) {
+func (t *gate) checkItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun, rateDrawn bool) (*writePlan, *WriteResult, error) {
 	// A config change locks the namespace exclusively; resource writes
 	// alone lock it shared (pglock.go).
 	t.reqCreds = req.anyCreds()
@@ -972,7 +972,7 @@ func hasCandidates(it Item) bool {
 // an item with candidate verbs from the resource's state as the writer sees
 // it (a branch's view, read-through included), and refuses one that isn't
 // a candidate with 403, before the precondition is compared.
-func (t *tx) settle(n *nsRow, s *itemState) *Error {
+func (t *gate) settle(n *nsRow, s *itemState) *Error {
 	if s.cands == nil {
 		return nil
 	}
@@ -991,7 +991,7 @@ func (t *tx) settle(n *nsRow, s *itemState) *Error {
 
 // entryVerb is the verb an entry was written with: restore when its parent
 // is a tombstone, append otherwise (§6.2).
-func (t *tx) entryVerb(row *revRow) string {
+func (t *gate) entryVerb(row *revRow) string {
 	if row.parentSeq.Valid && t.rev(row.parentSeq.Int64).kind == kindTombstone {
 		return "restore"
 	}
@@ -1052,7 +1052,7 @@ func expectedIDs(s *itemState) ([]ids.ID, bool) {
 // purgedItems answers 410 for each item whose resource is purged, as the
 // writer sees it (§7.6): the idempotent-retry lookup doesn't apply to it
 // (§6.2 step 2, §7.2), and every URL of it is 410 (§8.3).
-func (t *tx) purgedItems(n *nsRow, st []*itemState) []itemErr {
+func (t *gate) purgedItems(n *nsRow, st []*itemState) []itemErr {
 	var fs []itemErr
 	for _, s := range st {
 		if t.resolve(n, s.Resource, nil).state == Purged {
@@ -1205,7 +1205,7 @@ func (t *tx) candidateVerbsMatch(n *nsRow, st []*itemState) bool {
 }
 
 // precondition is step 2 for one item (§7.2, §7.6 first writes).
-func (t *tx) precondition(n *nsRow, s *itemState) *Error {
+func (t *gate) precondition(n *nsRow, s *itemState) *Error {
 	v := t.resolve(n, s.Resource, nil)
 	s.view = v
 	headErr := func() *Error {
@@ -1268,7 +1268,7 @@ func doubleDelete() *Error {
 // (patch.Options ShareLast): a create's whole-document add copies nothing.
 // Each later step applies to a copy of the document before it; the first
 // applies in place to the parent's, which is parsed for this item alone.
-func (t *tx) applySteps(s *itemState) *Error {
+func (t *gate) applySteps(s *itemState) *Error {
 	var doc any
 	exists := false
 	owned := true // doc is no step's yet: nil, or the parent's parsed here
@@ -1419,7 +1419,7 @@ func checkLimits(l Limits, s *itemState) *Error {
 
 // validateDoc is step 5: resolve $schema and validate (§6.1). It returns the
 // document's $schema, if typed.
-func (t *tx) validateDoc(doc any, sc *schemaCtx, pending map[string]any) (string, *Error) {
+func (t *gate) validateDoc(doc any, sc *schemaCtx, pending map[string]any) (string, *Error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
 		return "", nil
@@ -1534,7 +1534,7 @@ func schemaErr(err error, path string) *Error {
 // way for the same writer (sc) every time: the result is kept for the
 // transaction (t.schemas), so a batch's documents typed by the same schemas
 // resolve and parse each once, not once for every document and $ref.
-func (t *tx) loadSchema(ref schema.Ref, sc *schemaCtx, pending map[string]any) (any, error) {
+func (t *gate) loadSchema(ref schema.Ref, sc *schemaCtx, pending map[string]any) (any, error) {
 	if d, ok := pending[ref.Path()]; ok {
 		return d, nil
 	}
@@ -1576,7 +1576,7 @@ type schemaLoaded struct {
 // schemaRefs is schema.Refs of d, the schema loadSchema resolved ref to,
 // kept with it for the transaction (t.schemas): every document typed by a
 // schema walks its $ref closure (validateDoc).
-func (t *tx) schemaRefs(ref schema.Ref, d any, sc *schemaCtx, pending map[string]any) []schema.Ref {
+func (t *gate) schemaRefs(ref schema.Ref, d any, sc *schemaCtx, pending map[string]any) []schema.Ref {
 	key := schemaKey{sc, ref.Path()}
 	l, ok := t.schemas[key]
 	if _, own := pending[key.path]; own || !ok {
@@ -1594,7 +1594,7 @@ func (t *tx) schemaRefs(ref schema.Ref, d any, sc *schemaCtx, pending map[string
 // written, with the write's own grant; in any other, by the rule for other
 // namespaces (§7.5). A revision it can't read there is ErrForbidden, which
 // falls through to drafts in a branch (loadSchema), as an absent one does.
-func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
+func (t *gate) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
 	n := t.schemaNS(ref.NS)
 	if n == nil || n.purged {
 		return nil, schema.ErrUnavailable
@@ -1743,7 +1743,7 @@ func (t *tx) prefetchSchemas(refs []schema.Ref) {
 // schemaRevIn loads revision ref.Rev of resource ref.Name in n, a
 // namespace that isn't a branch: ErrUnavailable if unknown, purged,
 // pruned or a tombstone.
-func (t *tx) schemaRevIn(n *nsRow, ref schema.Ref) (any, error) {
+func (t *gate) schemaRevIn(n *nsRow, ref schema.Ref) (any, error) {
 	v := t.resolve(n, ref.Name, nil)
 	if v.head == nil || v.state == Purged || v.state == NotFound {
 		return nil, schema.ErrUnavailable
@@ -1811,7 +1811,7 @@ func rulesRead(cfg *Config, a *actor, verb, m string) bool {
 // stepEnvelope builds the change envelope of §6.4.1 for one step. Its
 // patches are a copy of the step's, parsed again only if a rule reads them
 // (withPatches); otherwise the member is absent, which no rule sees.
-func (t *tx) stepEnvelope(s *itemState, step *stepState, a *actor, withPatches bool) map[string]any {
+func (t *gate) stepEnvelope(s *itemState, step *stepState, a *actor, withPatches bool) map[string]any {
 	env := t.basicEnvelope(step.action, s.Resource, a)
 	w := make([]any, len(step.writes))
 	for i, x := range step.writes {
@@ -1840,7 +1840,7 @@ func (t *tx) stepEnvelope(s *itemState, step *stepState, a *actor, withPatches b
 // source.at it checked, the source that makes blobs available (§7.8). Any
 // other caller's local source is recorded unchecked and makes no blobs
 // available, so the check reveals nothing about a namespace it can't read.
-func (t *tx) checkSource(req Request, v any) (any, *batchSource, *Error) {
+func (t *gate) checkSource(req Request, v any) (any, *batchSource, *Error) {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return nil, nil, invalid("source must be an object")

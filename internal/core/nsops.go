@@ -249,7 +249,7 @@ func messagePointer(msg string) string {
 }
 
 // validateConfig is step 5 for a config write.
-func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, a *actor) (*Config, *Error) {
+func (t *gate) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, a *actor) (*Config, *Error) {
 	cfg, err := t.e.newConfig(newDoc, cur.Doc, nil)
 	if err != nil {
 		return nil, err
@@ -353,7 +353,7 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 	return cfg, nil
 }
 
-func (t *tx) publicDependents(n *nsRow) []string {
+func (t *gate) publicDependents(n *nsRow) []string {
 	var out []string
 	for _, b := range t.branchesOf(n) {
 		if !b.purged && t.config(b.configSeq).Read == "public" {
@@ -365,7 +365,7 @@ func (t *tx) publicDependents(n *nsRow) []string {
 
 // liveBranches counts n's direct branches that are live (§6.6): neither
 // frozen nor purged, leaving out except.
-func (t *tx) liveBranches(n, except *nsRow) int {
+func (t *gate) liveBranches(n, except *nsRow) int {
 	live := 0
 	for _, b := range t.branchesOf(n) {
 		if except != nil && b.id == except.id {
