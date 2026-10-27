@@ -517,6 +517,26 @@ func v073SQL(t *testing.T, path string) (db *sql.DB, q func(string) string) {
 	return db, q
 }
 
+// v073Unapplied removes the record of the core's migration name (package
+// dbmigrate, under mmmigrate's namespace patchlog) from the database at
+// path, a test's own (v073DB), as a database an earlier release wrote
+// lacks it: the next open applies it.
+func v073Unapplied(t *testing.T, path, name string) {
+	t.Helper()
+	db, q := v073SQL(t, path)
+	table := "mmmigrate_applied"
+	if strings.HasPrefix(path, "postgres") {
+		table = "mmmigrate.applied"
+	}
+	r, err := db.Exec(q(`DELETE FROM `+table+` WHERE (namespace = 'patchlog' OR namespace LIKE 'patchlog@%') AND name = ?`), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.RowsAffected(); err != nil || n != 1 {
+		t.Fatalf("migration %s: %d records (%v), want 1", name, n, err)
+	}
+}
+
 // v073Epoch is encryption.epoch of a namespace's current document, as
 // stored.
 func v073Epoch(t *testing.T, path, ns string) float64 {
@@ -621,7 +641,8 @@ func TestV073RemoteBranchCreationHeldToLimits(t *testing.T) {
 // v0.73 §E.1 Stored digests, for a database an earlier version wrote: it
 // stored the heads' plaintext sizes and sha-256s at every level below
 // sealed, at rest included, and nothing later clears them in a namespace
-// already at rest. Opening it clears them, once (migrations), from the
+// already at rest. Opening it clears them, once (migration
+// 008_clear_at_rest_digests), from the
 // revisions of namespaces encrypted at all, and keeps a plain namespace's;
 // /heads at rest lists none, even where a row still has them.
 func TestV073AtRestDigestsFromBeforeUpgrade(t *testing.T) {
@@ -637,8 +658,9 @@ func TestV073AtRestDigestsFromBeforeUpgrade(t *testing.T) {
 	e.create("p", "b", map[string]any{"b": 1.0})
 	e.srv.Close()
 	e.e.Close()
-	// As an earlier version left it: no migrations table, and a size and
-	// digest on each revision written as a head at rest.
+	// As an earlier version left it: migration 008_clear_at_rest_digests
+	// not applied, and a size and digest on each revision written as a
+	// head at rest.
 	db, q := v073SQL(t, path)
 	stale := func() {
 		t.Helper()
@@ -649,9 +671,7 @@ func TestV073AtRestDigestsFromBeforeUpgrade(t *testing.T) {
 		}
 	}
 	stale()
-	if _, err := db.Exec(`DROP TABLE migrations`); err != nil {
-		t.Fatal(err)
-	}
+	v073Unapplied(t, path, "clear_at_rest_digests")
 	if n := storedMeta(t, path); n != 3 {
 		t.Fatalf("%d revisions with a size or digest before the upgrade, want 3", n)
 	}

@@ -161,12 +161,6 @@ func (f *readFilter) allows(resource string) bool {
 	return slices.ContainsFunc(f.compiled[2:], pass)
 }
 
-// filterStmts create edge_filters, the readFilter behind each scope
-// marker the service minted a cookie for, until the last of them expires.
-var filterStmts = []string{
-	`CREATE TABLE IF NOT EXISTS edge_filters (marker TEXT PRIMARY KEY, filter TEXT NOT NULL, exp INTEGER NOT NULL)`,
-}
-
 // keptFilter is a readFilter the service holds in memory (Index.filters),
 // with the Unix time its last edge grant known here expires.
 type keptFilter struct {
@@ -810,7 +804,7 @@ func grantExp(v *grant.Verified) time.Time {
 
 // initEdge sets up the service's edge grants, with EdgeGrants: its key
 // vouches only for its own prefixes (edgeGS), and their state lives in
-// the database (svcedge.Store, edge_filters).
+// the database (svcedge.Store, and edge_filters, migration 004).
 func (ix *Index) initEdge(ctx context.Context, db *sql.DB) error {
 	ix.filters = map[string]keptFilter{}
 	if ix.opt.EdgeGrants == nil {
@@ -819,11 +813,6 @@ func (ix *Index) initEdge(ctx context.Context, db *sql.DB) error {
 	ix.opt.EdgeGrants.Vouches = func(p string) bool { _, _, ok := edgeGS(p); return ok }
 	if ix.opt.ExchangeRate.Rate <= 0 || ix.opt.ExchangeRate.Burst < 1 {
 		ix.opt.ExchangeRate = svcedge.DefaultExchangeRate
-	}
-	for _, q := range filterStmts {
-		if _, err := db.ExecContext(ctx, q); err != nil {
-			return err
-		}
 	}
 	var err error
 	ix.edge, err = svcedge.NewStore(ctx, db)

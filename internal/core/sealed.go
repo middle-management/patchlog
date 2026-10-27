@@ -39,13 +39,11 @@ import (
 	"crypto/ecdh"
 	"database/sql"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -109,64 +107,15 @@ func epochAAD(ns int64, epoch int) []byte {
 // classes of §9. Sealed and e2e namespaces are cached by their read mode
 // like any other (§E.2.5): a public one publicly, its ciphertext opening
 // only to key holders; one with read "grant" privately, with edge
-// lifetimes only on a read its verifying edge verified.
+// lifetimes only on a read its verifying edge verified. Edge copies that
+// versions before v0.73, which cached every sealed and e2e namespace
+// publicly, left of those with read "grant" are purged once on upgrade
+// (migration 009_purge_grant_caches, RH-44).
 func (t *tx) cachePublic(n *nsRow) bool { return t.config(n.configSeq).cachePublic() }
 
 // cachePublic reports whether a namespace with this document uses the
 // public cache classes (see tx.cachePublic).
 func (c *Config) cachePublic() bool { return c.Read == "public" }
-
-// purgeGrantCaches is the data migration for cachePublic's change (RH-44):
-// versions before v0.73 cached every sealed and e2e namespace publicly,
-// and nothing purges the edge copies they left of those whose read isn't
-// "public" (a config write purges ns:{ns} only when it changes
-// cachePublic), which serve the ciphertext and the metadata read "grant"
-// hides (§E.2.5) until they expire. It queues their ns:{ns} purge in
-// cdn_repurge, due at once, which the leader sends (repurgeLoop) as it
-// sends any write's second purge. The level and read are read from each
-// namespace's current document, stored in plaintext; a remote branch's
-// shadows ("~…") serve under the branch's name.
-func purgeGrantCaches(ctx context.Context, tx *sql.Tx, ph func(n int) string) error {
-	rows, err := tx.QueryContext(ctx, `SELECT n.name, c.doc FROM namespaces n JOIN ns_config c ON c.seq = n.config_seq ORDER BY n.name`)
-	if err != nil {
-		return err
-	}
-	var tags []string
-	for rows.Next() {
-		var name string
-		var doc sql.NullString
-		if err := rows.Scan(&name, &doc); err != nil {
-			rows.Close()
-			return err
-		}
-		var d struct {
-			Read       any `json:"read"`
-			Encryption struct {
-				Level string `json:"level"`
-			} `json:"encryption"`
-		}
-		if !strings.HasPrefix(name, "~") && doc.Valid && json.Unmarshal([]byte(doc.String), &d) == nil &&
-			levelOf(d.Encryption.Level) >= levelSealed && d.Read != "public" {
-			tags = append(tags, "ns:"+name)
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for len(tags) > 0 {
-		n := min(len(tags), 100)
-		b, err := json.Marshal(tags[:n])
-		if err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO cdn_repurge (tags, due) VALUES (`+ph(1)+`, 0)`, string(b)); err != nil {
-			return err
-		}
-		tags = tags[n:]
-	}
-	return nil
-}
 
 // isSealedNS reports whether n serves sealed content.
 func (t *tx) isSealedNS(n *nsRow) bool { return t.config(n.configSeq).level == levelSealed }

@@ -662,9 +662,14 @@ PATCHLOG_DB='postgres://patchlog:secret@db.internal:5432/patchlog?sslmode=requir
 make up-pg     # the compose stack with a postgres:16 container (compose.postgres.yaml)
 ```
 
-- **Schema.** Created on first start (and migrated by later versions) under an advisory lock, in
-  whatever schema the URL's user defaults to (add `search_path=…` to the URL for another). It
-  mirrors the SQLite layout (`internal/core/pgschema.go`): bigint identity keys, 20-byte
+- **Schema.** Created on first start, and migrated by later versions, under an advisory lock (see
+  [Schema migrations](#schema-migrations)), in whatever schema the URL's user defaults to (add
+  `search_path=…` to the URL for another); the record of applied migrations is kept in a schema
+  `mmmigrate`, per schema (namespace `patchlog@<schema>`), so several deployments can share a
+  database in schemas of their own. The user needs `CREATE` on the database on every start:
+  mmmigrate runs `CREATE SCHEMA IF NOT EXISTS mmmigrate` each time, which Postgres checks the
+  privilege for even when the schema exists. It
+  mirrors the SQLite layout (`internal/core/migrations`, the types in `internal/core/dialect.go`): bigint identity keys, 20-byte
   `bytea` ids, canonical JSON in `text` (never `jsonb`, which would change the bytes ids are
   computed over), integer millisecond timestamps. Patch sets, head and intermediate snapshots
   and grants are `bytea`, because encryption at rest stores binary rows there.
@@ -788,38 +793,15 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   intervals plus two minutes, covering the cache staleness bound, replica lag and the response
   deadline), then deletes the row. SQLite deployments do the same, and so do the index and tree
   services for their own purges (see [Purging](#the-local-cdn-9)).
-- **Upgrading adds indexes.** A start that finds `ns_log` without `ns_log_ns_seq (ns, seq)` or
-  `ns_log_ns_config (ns, config_seq, seq)` builds them inside the schema migration, which blocks
-  writes until it commits: a few seconds per 5 million namespace entries (about 4 s for the
-  first on a local `postgres:16`). To build them without blocking, create them beforehand with
-  `CREATE INDEX CONCURRENTLY` under the same names; the migration then finds them.
-- **Upgrading adds columns** `revisions.size` and `revisions.digest` (`/heads` sizes and
-  digests, §7.4, see [Files and sync clients](#files-and-sync-clients-71-74-78-81)), on SQLite and Postgres.
-  They are nullable without a default, so adding them changes only the catalog, instantly
-  whatever the table's size, though on Postgres the `ALTER TABLE` waits for transactions
-  using `revisions` and holds back others while it does. Nothing is backfilled. From then on
-  they take about 40 bytes (SQLite; 41 to 48 on Postgres) on each revision a write leaves as
-  a head outside sealed and e2e namespaces: for small documents written one revision at a time
-  that is nearly every revision, and grew the `revisions` table by about 40% (the whole
-  database by 9%) in a test of 20,000 such writes. Instances of the previous release keep
-  working against the migrated schema (they name their columns), so a rolling upgrade is
-  safe, with two leftovers. Heads they write, like those from before, are listed without
-  `size` and `digest` until written again. And a purge they run nulls only the patch sets: the
-  purged resource's two columns stay (never listed, since a purged resource is listed as a
-  purge, but in an encrypted-at-rest namespace a plaintext hash that destroying the data key
-  doesn't remove), and cached `/heads` pages aren't purged (`heads:{ns}`). Once no older
-  instance runs, clear the columns with `UPDATE revisions SET size = NULL, digest = NULL WHERE
-  digest IS NOT NULL AND res IN (SELECT res FROM resources WHERE state = 2)` (2: purged).
-  Responses cached before the upgrade, or served by an older instance during it, lack the
-  v0.54 fields and headers: `/heads` pages lack them and revisions `Last-Modified` and
-  `Repr-Digest` until those copies expire or are purged, so clients treat them all as optional,
-  as §7.4 says.
+- **Upgrading from before v0.22.0.** Releases since then don't migrate older schemas: start
+  v0.22.0 on the database once first (its notes in the [changelog](CHANGELOG.md) say what that
+  adds), then the current release.
 - **Keep transactions short.** The tailer can't move past the oldest running transaction in the
   database (its `xmin`), so one left open holds back every instance's wake-ups: set
   `idle_in_transaction_session_timeout` (e.g. `ALTER ROLE patchlog SET
   idle_in_transaction_session_timeout = '60s'`).
 - **Rate-limit buckets are shared** (§6.6 Cost, v0.73): instances on one database draw on the
-  same buckets, rows of `rate_buckets`, created at startup with the function `rate_draw`. A
+  same buckets, rows of `rate_buckets`, created with the function `rate_draw` by a migration. A
   request's draw is one atomic statement that locks its buckets in key order and commits on its
   own before the write it admits can, so the instances together admit no more than a bucket's
   burst; an admitted write's deduction is never lost, and a request refused after admission
@@ -1935,7 +1917,7 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   reading through it, and writes to them other than purges (prunes, blob uploads and copies
   included) get that `502` at step 2.1, before the idempotent-retry lookup; a resource purged
   since stays `410`, and purges still work. A branch created before v0.73 reads A's document
-  once more on the first follow after the upgrade (data migration `remote-levels-catch-up`),
+  once more on the first follow after the upgrade (migration `010_remote_catch_up`),
   so a raise or a `read` change A made earlier is followed.
 - **Config writes are judged by A now** (§G.5.2, v0.73). A config write that makes the branch
   public, raises it to `e2e` or turns off a nonce requirement A has, or a batch with such a
@@ -2012,8 +1994,8 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -H 'Content-T
   classes, with `read: "grant"` privately, edge lifetimes only on reads a verifying edge
   verified, as for private plaintext. Earlier versions cached both publicly: the first start
   after upgrading queues a purge of the `ns:{ns}` tags of sealed and e2e namespaces with read
-  `grant`, which the leader sends with its second purges (purge them by hand where the second
-  purge is turned off, `RepurgeDelay` < 0).
+  `grant` (migration `009_purge_grant_caches`), which the leader sends with its second purges
+  (purge them by hand where the second purge is turned off, `RepurgeDelay` < 0).
 - **Wire shapes.**
   - `GET /r/{ns}/{name}/rev/{id}`: one JWE, `pl { ns, name, id, kind: "doc" }`.
   - `…/rev/{id}/log` and resource long-polls: a JSON array of per-entry JWE strings, `pl { ns,
@@ -3910,8 +3892,8 @@ copies cached before. `created` was always stored. Namespaces encrypted at rest,
 shadows of such branches, store neither (§E.1 Stored digests): they would sit in plaintext
 next to encrypted rows, and let a dump confirm a guess of a head's whole document even after a
 purge. A raise to at rest or above clears those stored before, and the first start of this
-version clears, once, the ones earlier versions stored at rest (recorded in the `migrations`
-table); `/heads` lists `size` and `digest` only for namespaces without encryption. A revision
+version clears, once, the ones earlier versions stored at rest (migration
+`008_clear_at_rest_digests`); `/heads` lists `size` and `digest` only for namespaces without encryption. A revision
 read at rest still sends `Repr-Digest`, computed from the document it serves (§7.1).
 
 **Beyond the spec.** A resource purge also purges the `/heads` pages of every namespace it
@@ -4585,7 +4567,8 @@ internal/rules      the rule language of §6.4.2
 internal/schema     $schema resolution and JSON Schema validation
 internal/schemaimport external JSON Schemas into a namespace, refs pinned (schema import)
 internal/grant      grants, keys, roles and verification (Addendum C)
-internal/core       storage and semantics (gate, batches, branches, purge, prune)
+internal/core       storage and semantics (gate, batches, branches, purge, prune); schema migrations in migrations/
+internal/dbmigrate  applies a package's schema migrations (mmmigrate), and checks them all
 internal/sqlitedsn  SQLite DSNs: a database path escaped, so the driver opens that file; the file earlier releases opened instead
 internal/server     HTTP API
 internal/lifecycle  /_health and /_ready, phased graceful shutdown (serve, index, tree)
@@ -4602,6 +4585,45 @@ two entries, so every multi-page path runs; each consumer package also has a `Te
 that runs some of its flows that way (`clienttest.Paged`), and the server package tests paging,
 sealed page bounds and `/heads` byte order directly (with `PATCHLOG_TEST_PG`, also on a database
 whose default collation isn't byte order).
+
+### Schema migrations
+
+Every database's schema is a series of
+[mmmigrate](https://github.com/middle-management/mmmigrate) migrations, kept by the package that
+owns the tables, in its `migrations` directory, one subdirectory per dialect it runs on
+(`internal/dbmigrate`, whose `Migrate` picks the dialect from the database's driver):
+
+| Directory | Namespace | Database |
+|-----------|-----------|----------|
+| `internal/core/migrations/sqlite`, `…/postgres` | `patchlog` (`patchlog@<schema>` on Postgres) | the core's |
+| `internal/tree/migrations/sqlite` | `tree` | the tree service's |
+| `internal/catalog/migrations/sqlite` | `catalog` | the tree service's, as a catalog |
+| `internal/index/migrations/sqlite` | `index` | the search index's (but its `text` table, FTS5 or a plain table depending on the SQLite build) |
+| `internal/derived/migrations/sqlite` | `derived` | the tree service's and the index's (sealed views) |
+| `internal/repurge/migrations/sqlite` | `repurge` | the tree service's and the index's (second CDN purges) |
+| `internal/svcedge/migrations/sqlite` | `svcedge` | the tree service's and the index's (their own edge grants) |
+
+The services run on SQLite only, so their packages have no `postgres` directory; a database whose
+dialect has none is refused rather than given another dialect's SQL.
+
+They are embedded in the binary, and every start applies the ones a database lacks, in order, each
+in its own transaction, and records them per namespace (in `mmmigrate_applied`, or the
+`mmmigrate` schema on Postgres). Committed migrations are never edited: their checksums chain, and
+`TestMigrations` (`internal/dbmigrate`) fails if one changed. A rebuild (`-rebuild`) empties the
+tables it replays and leaves the schema as it is.
+
+Rows the code expects to exist (seeds) are SQL as well, in `migrations/seed/<dialect>.sql` (the
+core's `cache_gen` row on Postgres): they run after the migrations on every start, so they must be
+safe to run again (`INSERT … ON CONFLICT DO NOTHING`). Changes an upgrade makes once to rows an
+earlier version stored (data migrations, such as the core's 008–010) are numbered migrations
+like the schema's, in SQL, so they run exactly once, in order with them.
+
+To change a schema, write the change in the `current.sql` of each dialect's directory (plain SQL, safe to run twice, since tests apply it after every edit), test it
+(`go test ./...`, and `make test-pg` for the core), and commit it with
+`make migration DESC="what it changes"`, which commits every `current.sql` holding SQL and needs
+the `mmmigrate` CLI (`brew install middle-management/tap/mmmigrate`, or a release binary). Tests
+apply `current.sql`; services apply only committed migrations, and CI fails while a `current.sql`
+holds any SQL.
 
 ## License
 

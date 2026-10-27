@@ -2,14 +2,10 @@ package server
 
 import (
 	"context"
-	"database/sql"
-	"path/filepath"
 	"testing"
 
 	plclient "github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/core"
-	"github.com/middle-management/patchlog/internal/pgtest"
-	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // §1, §7, §G.1 (v0.38): GET / publishes the spec version, whether
@@ -87,47 +83,6 @@ func TestV038ClientGrantNull(t *testing.T) {
 	}
 	if last.Kind != "purge" || last.GrantNull || last.Grant != nil {
 		t.Fatalf("propagated purge %+v", last)
-	}
-}
-
-// §1, §7.4 (v0.38): entries a development server wrote before it recorded
-// "grant": null can't be told from the server's own, so after the
-// migration they serve no grant, and count for no one; entries written
-// from then on serve null.
-func TestV038GrantNullMigration(t *testing.T) {
-	t.Parallel()
-	path, driver := filepath.Join(t.TempDir(), "old.db"), "sqlite"
-	if pgtest.Enabled() {
-		path, driver = pgtest.FreshDB(t), "pgx"
-	}
-	e := newEnv(t, withPath(path))
-	e.mkNS("main", map[string]any{})
-	e.create("main", "a", map[string]any{}, "ann")
-	e.close()
-
-	dsn := path
-	if driver == "sqlite" {
-		dsn = sqlitedsn.DSN(path, "")
-	}
-	db, err := sql.Open(driver, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`ALTER TABLE ns_log DROP COLUMN no_auth`); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-
-	e2 := newEnv(t, withPath(path))
-	e2.create("main", "b", map[string]any{}, "ann")
-	lg := e2.get("/ns/main/rev/" + e2.nsHead("main") + "/log").Arr()
-	if len(lg) != 3 {
-		t.Fatalf("log %v", lg)
-	}
-	for i, want := range []string{"", "", "null"} {
-		if got := entryRef(t, lg[i]); got != want {
-			t.Fatalf("entry %d: grant %q, want %q", i, got, want)
-		}
 	}
 }
 

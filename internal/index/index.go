@@ -57,6 +57,7 @@ import (
 	"context"
 	"crypto/ecdh"
 	"database/sql"
+	"embed"
 	"errors"
 	"fmt"
 	"log"
@@ -69,6 +70,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
@@ -287,31 +289,22 @@ func (ix *Index) FTS() bool { return ix.fts }
 // Origin is the core's canonical origin, used in hit URLs.
 func (ix *Index) Origin() string { return ix.origin }
 
-var dropStmts = []string{
-	`DROP TABLE IF EXISTS checkpoints`, `DROP TABLE IF EXISTS seen`, `DROP TABLE IF EXISTS ns_state`, `DROP TABLE IF EXISTS ns_conf`,
-	`DROP TABLE IF EXISTS docs`, `DROP TABLE IF EXISTS "text"`, `DROP TABLE IF EXISTS facet`, `DROP TABLE IF EXISTS "sort"`, `DROP TABLE IF EXISTS refs`,
-	derived.CacheDropStmts[0], derived.CacheDropStmts[1],
-}
+// migrations holds the index's tables but for text (initSchema), applied
+// under the namespace "index" (package dbmigrate).
+//
+//go:embed migrations
+var migrations embed.FS
 
-// createStmts: query.go names facet_q, sort_q, refs_t and the primary
-// keys' indexes (sqlite_autoindex_facet_1, _sort_1, _refs_1) in INDEXED
-// BY, which fails the query if one is missing; a table keeps its primary
-// key as its only constraint (TestOldSchemasIndexedBy).
-var createStmts = []string{
-	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
-	`CREATE TABLE IF NOT EXISTS ns_state (ns TEXT PRIMARY KEY, purged INTEGER NOT NULL DEFAULT 0)`,
-	`CREATE TABLE IF NOT EXISTS ns_conf (ns TEXT PRIMARY KEY, public INTEGER NOT NULL, level TEXT NOT NULL)`,
-	`CREATE TABLE IF NOT EXISTS docs (docid INTEGER PRIMARY KEY, ns TEXT NOT NULL, resource TEXT NOT NULL, head TEXT NOT NULL, schema TEXT, epoch INTEGER, UNIQUE (ns, resource))`,
-	`CREATE TABLE IF NOT EXISTS facet (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value TEXT NOT NULL, raw TEXT NOT NULL, PRIMARY KEY (ns, resource, path, value))`,
-	`CREATE TABLE IF NOT EXISTS "sort" (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value, raw TEXT, PRIMARY KEY (ns, resource, path))`,
-	`CREATE TABLE IF NOT EXISTS refs (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, ref TEXT NOT NULL, target_ns TEXT NOT NULL, target TEXT NOT NULL, rev TEXT, entry TEXT, PRIMARY KEY (ns, resource, path))`,
-	`CREATE INDEX IF NOT EXISTS docs_q ON docs (ns, schema)`,
-	// refs_t leads with ns: a ?ref= filter reads only the namespace's
-	// references to the target (refs_q, before, read every namespace's).
-	`DROP INDEX IF EXISTS refs_q`,
-	`CREATE INDEX IF NOT EXISTS refs_t ON refs (ns, target_ns, target, rev, entry)`,
-	`CREATE INDEX IF NOT EXISTS facet_q ON facet (ns, path, value)`,
-	`CREATE INDEX IF NOT EXISTS sort_q ON "sort" (ns, path, value)`,
+// resetStmts empty what a rebuild replays (cdn_repurge stays, and so do
+// the edge grants' tables, edge_filters and svcedge.Store's), in one
+// transaction. checkpoints_bootstrap too: a snapshot left part-way would
+// otherwise be resumed, not replayed from its first page. text, made by
+// initSchema rather than a migration, is dropped, so a rebuild decides
+// between FTS5 and the LIKE fallback again.
+var resetStmts = []string{
+	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM ns_state`, `DELETE FROM ns_conf`,
+	`DELETE FROM docs`, `DROP TABLE IF EXISTS "text"`, `DELETE FROM facet`, `DELETE FROM "sort"`, `DELETE FROM refs`,
+	derived.CacheResetStmts[0], derived.CacheResetStmts[1],
 }
 
 const ftsCreate = `CREATE VIRTUAL TABLE IF NOT EXISTS "text" USING fts5(ns UNINDEXED, resource UNINDEXED, schema UNINDEXED, path UNINDEXED, body, tokenize = '` + ftsTokenizer + `')`
@@ -326,6 +319,21 @@ var likeCreate = []string{
 	`CREATE INDEX IF NOT EXISTS text_doc ON "text" (docid)`,
 }
 
+// reset runs resetStmts.
+func (ix *Index) reset(ctx context.Context) error {
+	tx, err := ix.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range resetStmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // indexFormat is the format of the rows, kept as the database's
 // user_version: 1 since v0.73, whose x-index values come from a static walk
 // (§A.2, valueWalk), whose sort rows hold each document's least value and
@@ -334,34 +342,20 @@ var likeCreate = []string{
 const indexFormat = 1
 
 func (ix *Index) initSchema(ctx context.Context) error {
+	// What an existing database holds is read before the migrations bring
+	// its tables up to date: whether it has docs at all (none: a new
+	// database, with nothing to replay), and docs.epoch and ns_conf, which
+	// migrations 003 and 002 add.
+	var docs, epoch, conf int
+	if err := ix.db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'docs'),
+		(SELECT count(*) FROM pragma_table_info('docs') WHERE name = 'epoch'),
+		(SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ns_conf')`).Scan(&docs, &epoch, &conf); err != nil {
+		return err
+	}
+	if err := dbmigrate.Migrate(ctx, ix.db, migrations, "index"); err != nil {
+		return fmt.Errorf("index: schema: %w", err)
+	}
 	if !ix.opt.Rebuild {
-		// A database from before v0.44 has no refs table, so its documents'
-		// references were never collected (§A.2): replay it, as a rebuild.
-		var docs, refs int
-		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'docs'`).Scan(&docs); err != nil {
-			return err
-		}
-		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'refs'`).Scan(&refs); err != nil {
-			return err
-		}
-		if docs > 0 && refs == 0 {
-			ix.opt.Logf("index: the database predates reference indexing (§A.2); rebuilding it from the logs")
-			ix.opt.Rebuild = true
-		}
-		// Before v0.46 the sort table kept no value as written, and schema
-		// documents were not indexed: replay those too.
-		var noRaw int
-		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('sort') WHERE name = 'raw'`).Scan(&noRaw); err != nil {
-			return err
-		}
-		var haveSort int
-		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sort'`).Scan(&haveSort); err != nil {
-			return err
-		}
-		if haveSort > 0 && noRaw == 0 && !ix.opt.Rebuild {
-			ix.opt.Logf("index: the database predates sort values in hits and indexed schema documents (§A.4); rebuilding it from the logs")
-			ix.opt.Rebuild = true
-		}
 		// Before v0.73, x-index values were collected while validating, a
 		// sort row held one value, not the least, and booleans none: an
 		// older format is replayed (indexFormat).
@@ -369,64 +363,26 @@ func (ix *Index) initSchema(ctx context.Context) error {
 		if err := ix.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&format); err != nil {
 			return err
 		}
-		if docs > 0 && format < indexFormat && !ix.opt.Rebuild {
+		if docs > 0 && format < indexFormat {
 			ix.opt.Logf("index: the database predates the static x-index walk and sort order of v0.73 (§A.2); rebuilding it from the logs")
 			ix.opt.Rebuild = true
 		}
 		// Before docs.epoch, the rows of sealed and e2e namespaces don't
 		// say which epoch each head is served under, which their hits are
 		// sealed under (§E.2.6): replay those namespaces, as a rebuild.
-		// Without one, the column is added below.
-		var noEpoch, protected int
-		if docs > 0 && !ix.opt.Rebuild {
-			if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('docs') WHERE name = 'epoch'`).Scan(&noEpoch); err != nil {
-				return err
-			}
-			var conf int
-			if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ns_conf'`).Scan(&conf); err != nil {
-				return err
-			}
-			switch {
-			case noEpoch > 0:
-			case conf == 0:
-				protected = 1 // levels not recorded: any may be sealed
-			default:
+		// Otherwise the rows are kept, the column added.
+		if docs > 0 && epoch == 0 && !ix.opt.Rebuild {
+			protected := 1 // levels not recorded: any may be sealed
+			if conf > 0 {
 				if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM ns_conf WHERE level IN (?, ?)`, derived.LevelSealed, derived.LevelE2E).Scan(&protected); err != nil {
 					return err
 				}
 			}
-			if noEpoch == 0 && protected > 0 {
+			if protected > 0 {
 				ix.opt.Logf("index: the database predates the epochs hits of sealed and e2e namespaces are sealed under (§E.2.6); rebuilding it from the logs")
 				ix.opt.Rebuild = true
 			}
 		}
-	}
-	if ix.opt.Rebuild {
-		for _, s := range dropStmts {
-			if _, err := ix.db.ExecContext(ctx, s); err != nil {
-				return fmt.Errorf("index: rebuild: %w", err)
-			}
-		}
-	}
-	if err := ix.cps.Init(ctx); err != nil {
-		return err
-	}
-	for _, s := range createStmts {
-		if _, err := ix.db.ExecContext(ctx, s); err != nil {
-			return fmt.Errorf("index: schema: %w", err)
-		}
-	}
-	var hasEpoch int
-	if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('docs') WHERE name = 'epoch'`).Scan(&hasEpoch); err != nil {
-		return err
-	}
-	if hasEpoch == 0 {
-		if _, err := ix.db.ExecContext(ctx, `ALTER TABLE docs ADD COLUMN epoch INTEGER`); err != nil {
-			return fmt.Errorf("index: schema: %w", err)
-		}
-	}
-	if _, err := ix.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, indexFormat)); err != nil {
-		return fmt.Errorf("index: schema: %w", err)
 	}
 	if err := ix.sealed.Init(ctx); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
@@ -435,6 +391,14 @@ func (ix *Index) initSchema(ctx context.Context) error {
 		return fmt.Errorf("index: schema: %w", err)
 	}
 	if err := repurge.Init(ctx, ix.db); err != nil {
+		return fmt.Errorf("index: schema: %w", err)
+	}
+	if ix.opt.Rebuild {
+		if err := ix.reset(ctx); err != nil {
+			return fmt.Errorf("index: rebuild: %w", err)
+		}
+	}
+	if _, err := ix.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, indexFormat)); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
 	// An existing text table decides the mode; otherwise try FTS5.

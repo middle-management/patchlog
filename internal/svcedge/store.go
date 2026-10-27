@@ -3,10 +3,14 @@ package svcedge
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 )
 
 // Rate is a token bucket (§6.6): Rate refills it per second, up to Burst.
@@ -41,19 +45,18 @@ type subjectSet struct {
 	exp      int64
 }
 
-// CreateStmts create the store's tables in a service's database.
-var CreateStmts = []string{
-	`CREATE TABLE IF NOT EXISTS edge_subjects (gs TEXT PRIMARY KEY, subjects TEXT NOT NULL, exp INTEGER NOT NULL)`,
-	`CREATE TABLE IF NOT EXISTS edge_buckets (k TEXT PRIMARY KEY, tokens REAL NOT NULL, last INTEGER NOT NULL) WITHOUT ROWID`,
-}
+// migrations holds the store's tables, applied under the namespace
+// "svcedge" (package dbmigrate) in the database of each service that keeps
+// one.
+//
+//go:embed migrations
+var migrations embed.FS
 
 // NewStore opens the store in db, a service's SQLite database, creating
-// its tables.
+// or migrating its tables.
 func NewStore(ctx context.Context, db *sql.DB) (*Store, error) {
-	for _, q := range CreateStmts {
-		if _, err := db.ExecContext(ctx, q); err != nil {
-			return nil, err
-		}
+	if err := dbmigrate.Migrate(ctx, db, migrations, "svcedge"); err != nil {
+		return nil, fmt.Errorf("svcedge: schema: %w", err)
 	}
 	return &Store{db: db, subs: map[string]subjectSet{}}, nil
 }

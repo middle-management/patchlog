@@ -482,63 +482,6 @@ func TestHeadMetaPurgeTags(t *testing.T) {
 	}
 }
 
-// A database from before the extension (the columns dropped) is migrated:
-// heads written before list created but no size or digest until the next
-// write, and the pages that list them don't change; reads of their
-// revisions carry Last-Modified and Repr-Digest all the same, computed
-// from what they serve.
-func TestHeadMetaMigration(t *testing.T) {
-	t.Parallel()
-	path, driver := filepath.Join(t.TempDir(), "old.db"), "sqlite"
-	if pgtest.Enabled() {
-		path, driver = pgtest.FreshDB(t), "pgx"
-	}
-	e := newEnv(t, withPath(path))
-	e.mkNS("main", map[string]any{"read": "public"})
-	a := e.create("main", "a", map[string]any{"a": 1.0})
-	e.create("main", "b", map[string]any{"b": 1.0})
-	e.close()
-
-	dsn := path
-	if driver == "sqlite" {
-		dsn = sqlitedsn.DSN(path, "")
-	}
-	db, err := sql.Open(driver, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, q := range []string{`ALTER TABLE revisions DROP COLUMN size`, `ALTER TABLE revisions DROP COLUMN digest`} {
-		if _, err := db.Exec(q); err != nil {
-			t.Fatal(q, err)
-		}
-	}
-	db.Close()
-
-	e2 := newEnv(t, withPath(path))
-	old := e2.nsHead("main")
-	page := e2.get("/ns/main/rev/" + old + "/heads").Body
-	hs := e2.headItems("main", old)
-	for _, name := range []string{"a", "b"} {
-		it := hs[name]
-		if it["created"] != e2.logCreated("main", name, it["target"].(string)) || it["size"] != nil || it["digest"] != nil {
-			t.Fatalf("%s from before: %v", name, it)
-		}
-	}
-	g := e2.get("/r/main/a/rev/" + a)
-	if g.H.Get("Repr-Digest") != reprDigest(g.Body) || g.H.Get("Last-Modified") == "" {
-		t.Fatalf("revision from before: %v", g.H)
-	}
-	e2.appendRev("main", "a", a, ops(op("add", "/x", 2.0)))
-	hs = e2.headItems("main", e2.nsHead("main"))
-	e2.checkLiveHead("main", hs["a"])
-	if hs["b"]["size"] != nil {
-		t.Fatalf("b, not written since: %v", hs["b"])
-	}
-	if now := e2.get("/ns/main/rev/" + old + "/heads").Body; string(now) != string(page) {
-		t.Fatalf("page changed:\n%s\n%s", page, now)
-	}
-}
-
 // A remote branch lists the base's heads as the base does, sizes and
 // digests included, from the chains it mirrors; so does a namespace its
 // schemas are mirrored into (§G.3, insertChain).

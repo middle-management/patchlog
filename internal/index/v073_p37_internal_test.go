@@ -8,7 +8,7 @@ import (
 )
 
 // TestV073P37EpochColumnUpgrade (ENC-32, IX-25): a database whose docs rows
-// predate docs.epoch is rebuilt if it follows a sealed or e2e namespace,
+// predate docs.epoch (migration 003_docs_epoch) is rebuilt if it follows a sealed or e2e namespace,
 // whose hits are sealed under their heads' epochs (§E.2.6), and otherwise
 // keeps its rows, the column added.
 func TestV073P37EpochColumnUpgrade(t *testing.T) {
@@ -20,6 +20,7 @@ func TestV073P37EpochColumnUpgrade(t *testing.T) {
 		ix := openBare(t, path)
 		for _, q := range []string{
 			`ALTER TABLE docs DROP COLUMN epoch`,
+			`DELETE FROM mmmigrate_applied WHERE namespace = 'index' AND name = 'docs_epoch'`,
 			`INSERT INTO docs (ns, resource, head, schema) VALUES ('n', 'a', 'h', NULL)`,
 			`INSERT INTO ns_conf (ns, public, level) VALUES ('n', 0, '` + c.level + `')`,
 		} {
@@ -47,11 +48,6 @@ func TestV073P37FiltersForgotten(t *testing.T) {
 	ctx := context.Background()
 	ix := openBare(t, filepath.Join(t.TempDir(), "i.db"))
 	ix.filters = map[string]keptFilter{}
-	for _, q := range filterStmts {
-		if _, err := ix.db.Exec(q); err != nil {
-			t.Fatal(err)
-		}
-	}
 	t0 := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	f := func() *readFilter { return &readFilter{principal: map[string]any{}} }
 	must := func(err error) {

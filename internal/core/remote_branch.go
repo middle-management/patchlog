@@ -2100,19 +2100,6 @@ func (t *tx) remoteBases(where string, args ...any) []*remoteBase {
 	return out
 }
 
-// markRemoteCatchUp is the data migration that has the follower read once
-// more, as of its checkpoint, the namespace document of the base of every
-// remote branch a database from before v0.73's follower holds (§G.5.2,
-// followRemote): that follower skipped config entries but moved the
-// checkpoint past them, so a raise of the base's level, or a read made
-// non-public, seen by it was never followed, and the branch would go on
-// serving its source's content below the level its source serves it at
-// (§1, Addendum E Levels) until the base wrote another config entry.
-func markRemoteCatchUp(ctx context.Context, tx *sql.Tx, _ func(n int) string) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO remote_catchup (branch) SELECT branch FROM remote_bases`)
-	return err
-}
-
 // RemoteNotice is a purge seen in a remote base's log (§G.3), or a config
 // change there that raised the base's level above the branch's or made its
 // read non-public (§G.5.2).
@@ -2233,7 +2220,7 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 // or a batch with a config change, the base's namespace document after it
 // is read, before the write transaction, and a raise of its level, or a
 // read made non-public, is followed (followConfig, §G.5.2). A remote
-// branch from before this follower (catchUp, markRemoteCatchUp) first
+// branch from before this follower (catchUp, migration 010_remote_catch_up) first
 // follows the base's document as of the checkpoint, once, whether or not
 // the log has moved since: the entries before it were followed only for
 // their purges. The epochs the e2e bases below the base have in force now

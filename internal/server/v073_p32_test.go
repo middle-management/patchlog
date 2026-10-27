@@ -536,12 +536,12 @@ func TestV073RemoteCatchUpAfterUpgrade(t *testing.T) {
 	}{
 		{`UPDATE remote_bases SET checkpoint = ? WHERE ns = ?`, []any{a.nsHead("m"), "m"}},
 		{`UPDATE remote_bases SET checkpoint = ? WHERE ns = ?`, []any{a.nsHead("p"), "p"}},
-		{`DELETE FROM migrations WHERE name = 'remote-levels-catch-up'`, nil},
 	} {
 		if _, err := db.Exec(q(c.s), c.args...); err != nil {
 			t.Fatal(err)
 		}
 	}
+	v073Unapplied(t, path, "remote_catch_up")
 	b = newEnv(t, withOrigin(originB), withRemote(rt), withEncTuning, at)
 	if n := count("remote_catchup"); n != 2 {
 		t.Fatalf("marked for a catch-up on upgrade: %d, want 2", n)

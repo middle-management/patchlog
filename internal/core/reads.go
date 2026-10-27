@@ -1012,7 +1012,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		// by the namespace serving the page when it is listed, so pages at
 		// ns_ids from before a raise to sealed list none either. Nor do
 		// size and digest show at rest, where none are stored (§E.1 Stored
-		// digests; clearAtRestDigests, encryptNamespace).
+		// digests; migration 008_clear_at_rest_digests, encryptNamespace).
 		level := t.nsLevel(n)
 		plain := level < levelSealed
 		for _, h := range page {

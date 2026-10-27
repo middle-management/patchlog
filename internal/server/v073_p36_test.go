@@ -241,12 +241,12 @@ func TestV073P36RemoteE2ERaiseAsFarAsLevelsAllow(t *testing.T) {
 		args []any
 	}{
 		{`UPDATE remote_bases SET checkpoint = ? WHERE ns = ?`, []any{raised, "m"}},
-		{`DELETE FROM migrations WHERE name = 'remote-levels-catch-up'`, nil},
 	} {
 		if _, err := db.Exec(q(c.s), c.args...); err != nil {
 			t.Fatal(err)
 		}
 	}
+	v073Unapplied(t, path, "remote_catch_up")
 	b = newEnv(t, withOrigin(originB), withRemote(rt), withKeyStore(ksB), withEncTuning, at)
 	if err := syncRemotes(t, b); err != nil {
 		t.Fatal(err)

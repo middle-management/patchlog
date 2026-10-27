@@ -808,10 +808,9 @@ func TestV073GrantCachesPurgedOnUpgrade(t *testing.T) {
 	e.e.Close()
 	// As an earlier version left it: the migration not run, nothing queued.
 	db, q := v073SQL(t, path)
-	for _, s := range []string{`DELETE FROM migrations WHERE name = 'grant-caches-private'`, `DELETE FROM cdn_repurge`} {
-		if _, err := db.Exec(q(s)); err != nil {
-			t.Fatal(err)
-		}
+	v073Unapplied(t, path, "purge_grant_caches")
+	if _, err := db.Exec(q(`DELETE FROM cdn_repurge`)); err != nil {
+		t.Fatal(err)
 	}
 	e = newEnv(t, withKeyStore(ks), withEncTuning, at)
 	p.take()

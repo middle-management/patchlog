@@ -231,35 +231,6 @@ func TestReferenceQueries(t *testing.T) {
 	}
 }
 
-// An index database written before v0.44 has no refs table: opening it
-// replays the logs instead of serving an index that never saw a reference.
-func TestReferenceUpgrade(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
-	c := s.Client(t, client.WithAuthor("admin"))
-	for _, ns := range []string{"schemas", "pages"} {
-		must(c.CreateNamespace(ctx, ns, map[string]any{"read": "public"}))
-	}
-	sch := must(c.CreateDoc(ctx, "schemas", "page", pageSchema(true)))
-	must(c.CreateDoc(ctx, "pages", "a", map[string]any{"$schema": "/r/schemas/page/rev/" + sch.ID, "related": []any{"/r/pages/b"}}))
-	db := filepath.Join(t.TempDir(), "i.db")
-	x := startSvc(t, c, svcOpts{db: db, ns: []string{"pages"}})
-	x.caughtUp("pages")
-	x.stop()
-	// Simulate the old database.
-	{
-		o := startSvc(t, c, svcOpts{db: db, ns: []string{"pages"}, noRun: true})
-		if _, err := o.ix.DropRefsForTest(); err != nil {
-			t.Fatal(err)
-		}
-		o.stop()
-	}
-	y := startSvc(t, c, svcOpts{db: db, ns: []string{"pages"}})
-	y.caughtUp("pages")
-	y.expect("/pages?ref=%2Fr%2Fpages%2Fb", "a")
-}
-
 // Private namespaces: reference queries follow the catalog-listing rules,
 // are routed under the reader's subject set, keep the encoded query, and
 // show only what the reader may read.

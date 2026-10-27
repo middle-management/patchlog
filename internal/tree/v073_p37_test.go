@@ -264,10 +264,11 @@ func TestV073P37EpochsBackfilled(t *testing.T) {
 	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
 	x.caughtUp("cat", "files")
 	x.stop()
-	// As an earlier release left it: no nodes.epoch, no epoch in items.file.
+	// As an earlier release left it: no nodes.epoch (nor migration
+	// 003_nodes_epoch, which adds it), no epoch in items.file.
 	sq := must(sql.Open("sqlite", db))
-	for _, q := range []string{`ALTER TABLE nodes DROP COLUMN epoch`, `UPDATE items SET file = json_remove(file, '$.epoch') WHERE file IS NOT NULL`,
-		`DELETE FROM sealed_views`} {
+	for _, q := range []string{`ALTER TABLE nodes DROP COLUMN epoch`, `DELETE FROM mmmigrate_applied WHERE namespace = 'tree' AND name = 'nodes_epoch'`,
+		`UPDATE items SET file = json_remove(file, '$.epoch') WHERE file IS NOT NULL`, `DELETE FROM sealed_views`} {
 		if _, err := sq.Exec(q); err != nil {
 			t.Fatal(err)
 		}

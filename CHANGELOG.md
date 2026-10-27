@@ -23,7 +23,25 @@ source is served under, the proposed Addendum I additions, and fixes to flaky Po
 `GET /` answers `"spec": "0.73"`. Where the spec leaves a question open, the reference
 implements the default the plan states.
 
+The schemas of the core, the tree service (with the catalog) and the search index are now
+[mmmigrate](https://github.com/middle-management/mmmigrate) migrations (README "Schema
+migrations"), applied on start and recorded in each database, instead of schema statements run on
+every start with checks for what each older version lacked. The v0.22.0 schemas are the first
+migration of each (`001_baseline_schema`), unchanged; v0.73's schema changes below are the
+migrations after them: the core's 002–010 (on SQLite and Postgres alike: new columns and tables,
+and three that fix data an earlier version stored, each run once), the tree service's and the
+index's 002–004, and those of the services' edge grants (`internal/svcedge`, 001).
+
 **Changes to check before upgrading:**
+- **Databases from before v0.22.0 are no longer migrated.** Start v0.22.0 on such a database once
+  first (the core's, the tree service's and the index's alike). A database v0.22.0 created or
+  migrated is adopted as it is.
+- **Migrations are recorded in new tables:** `mmmigrate_applied` and `mmmigrate_current` on
+  SQLite, the schema `mmmigrate` on Postgres (per schema the core's tables are in, so deployments
+  in different schemas of one database stay apart). On Postgres the database user needs `CREATE`
+  on the database on every start, not only the first.
+- **A rebuild of the tree service or the index empties its tables** rather than dropping and
+  recreating them; it replays from the beginning as before.
 - **Development tools need `-author`** (§7.2). With authentication disabled, a write without
   `X-Author` is `400 bad_input`; reads are unaffected. `patchlog janitor`, `merge`, `rebase`,
   `import` and `schema` against a `-dev` server must pass `-author`, and so must `patchlog dav`
@@ -288,10 +306,10 @@ implements the default the plan states.
   - **Allowances**: the first matching entry whose `until` hasn't passed applies; an ended entry
     no longer hides a later one (with authentication disabled, entries match on `sub` alone).
   - **Rate-limit buckets are shared on Postgres** (§6.6 Cost): instances sharing a database draw
-    on the same buckets (new table `rate_buckets` and function `rate_draw`, both created at
-    startup), each draw one atomic statement that locks the buckets in key order and commits on
-    its own before the write it admits can commit, so the instances together admit no more than
-    a bucket's burst; an admitted write's deduction is never lost, and a request refused after
+    on the same buckets (new table `rate_buckets` and function `rate_draw`, both created by
+    migration `004_rate_buckets`), each draw one atomic statement that locks the buckets in key
+    order and commits on its own before the write it admits can commit, so the instances
+    together admit no more than a bucket's burst; an admitted write's deduction is never lost, and a request refused after
     admission keeps it. Each instance deletes full buckets once a minute, without waiting on a
     draw, and a draw rolled back as a deadlock victim runs again. SQLite keeps buckets in
     memory, and so does a single Postgres instance started with **`serve -local-rate-buckets`**
@@ -308,8 +326,8 @@ implements the default the plan states.
   did (§6.1, invariant 3), also inside a new schema's `$ref` closure. A revision reached by any
   `$ref` whose path is a revision path counts as referenced, whatever its fragment, for `in_use`
   purges, the index's reference rows and bundle renames. **Each revision now records the schema
-  rules it was written under** (the database migration adds `revisions.rules`; revision ids are
-  unchanged): revisions stored before count as written under the earlier rules; a schema revision
+  rules it was written under** (migration `003_revisions_rules` adds `revisions.rules`; revision
+  ids are unchanged): revisions stored before count as written under the earlier rules; a schema revision
   whose id rows of the namespace written, its local bases or a batch's local source already have
   (a fast-forward merge, a same-deployment import, a branch's replay) is a copy of them and keeps
   their marker, so core merges, imports and replays of stored schema documents are no longer
@@ -399,7 +417,7 @@ implements the default the plan states.
   - Resource and namespace log entries carry **`via`**, the delegatees of the grant they were
     written under, in order, unhashed: absent when there are none, sealed with the entry at E2,
     never recorded on entries the server writes itself, and mirrored by remote branches (§G.3).
-    A new `ns_log.via` column (SQLite and Postgres migrations) stores it; entries written before
+    A new `ns_log.via` column (migration `002_ns_log_via`) stores it; entries written before
     have none (`LogEntry.Via`, `NSEntry.Via`).
   - **Breaking:** `GET /ns/{ns}/rev/{ns_id}/heads` answers `{ "heads": [...], "next"? }` instead
     of `{ items, next? }`. The client and playground still read `items` from older servers.
@@ -1115,14 +1133,14 @@ implements the default the plan states.
     `-remote-follow-interval 0` stops following bases altogether.
   - **Upgrading:** remote branches created before this version read their base's namespace
     document once more on the first follow after the upgrade, as of the follower's checkpoint
-    (data migration `remote-levels-catch-up`, table `remote_catchup`), since the earlier follower
+    (migration `010_remote_catch_up`, table `remote_catchup`), since the earlier follower
     moved its checkpoint past config entries unread and so never followed a raise or a `read`
     made non-public before the upgrade. A branch on a server without the new level then answers
     `502 upstream` instead of serving the base's content in the clear, and a public branch is
     restricted.
 - **Stored digests at rest** (§E.1, §7.1): namespaces encrypted at rest store no plaintext head
-  size or sha-256, and the first start clears those stored before (a new `migrations` table
-  records it); `/heads` lists `size` and `digest` only without encryption. Revision reads still
+  size or sha-256, and the first start clears those stored before (migration
+  `008_clear_at_rest_digests`, once); `/heads` lists `size` and `digest` only without encryption. Revision reads still
   send `Repr-Digest`, computed when served.
 - `docs/TESTVECTORS.md`, the v0.55 draft of the vectors, now points at SPEC.md Addendum I, and
   `docs/vectorgen` is removed: the draft listed the integer literal 10²¹ and the id

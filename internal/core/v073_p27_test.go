@@ -237,9 +237,17 @@ func TestV073RulesMarkerMigration(t *testing.T) {
 	s.now.Store(time.Now().UnixMilli())
 	s.mkNS("n")
 	sid := s.put("n", "s", "", idnSchema())
-	// The database as an earlier version left it: no column.
-	if _, err := e.db.Exec(`ALTER TABLE revisions DROP COLUMN rules`); err != nil {
-		t.Fatal(err)
+	// The database as an earlier version left it: no column, and no
+	// record of migration 003_revisions_rules, which adds it.
+	applied := "mmmigrate_applied"
+	if e.pg {
+		applied = "mmmigrate.applied"
+	}
+	for _, q := range []string{`ALTER TABLE revisions DROP COLUMN rules`,
+		`DELETE FROM ` + applied + ` WHERE (namespace = 'patchlog' OR namespace LIKE 'patchlog@%') AND name = 'revisions_rules'`} {
+		if _, err := e.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
 	}
 	e.Close()
 	e = open()

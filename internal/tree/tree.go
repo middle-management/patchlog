@@ -65,6 +65,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
@@ -334,42 +335,12 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 }
 
 func (s *Service) init(ctx context.Context) error {
-	if s.opt.Rebuild {
-		for _, q := range dropStmts {
-			if _, err := s.db.ExecContext(ctx, q); err != nil {
-				return fmt.Errorf("tree: rebuild: %w", err)
-			}
-		}
-	}
-	if err := s.cps.Init(ctx); err != nil {
-		return err
-	}
-	for _, q := range createStmts {
-		if _, err := s.db.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("tree: schema: %w", err)
-		}
+	if err := dbmigrate.Migrate(ctx, s.db, migrations, "tree"); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
 	}
 	var err error
 	if s.edge, err = svcedge.NewStore(ctx, s.db); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
-	}
-	// A database from an earlier release (addedColumns).
-	for _, tc := range addedColumns {
-		var has int
-		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, tc[0], tc[1]).Scan(&has); err != nil {
-			return fmt.Errorf("tree: schema: %w", err)
-		}
-		if has == 0 {
-			if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+tc[0]+` ADD COLUMN `+tc[1]+` TEXT`); err != nil {
-				return fmt.Errorf("tree: schema: %w", err)
-			}
-			if tc == [2]string{"nodes", "epoch"} {
-				// The epochs of its heads are read in (backfillEpochs).
-				if _, err := s.db.ExecContext(ctx, `INSERT INTO meta (k, v) VALUES ('epochs', 'pending') ON CONFLICT (k) DO NOTHING`); err != nil {
-					return fmt.Errorf("tree: schema: %w", err)
-				}
-			}
-		}
 	}
 	if err := s.sealed.Init(ctx); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
@@ -379,6 +350,11 @@ func (s *Service) init(ctx context.Context) error {
 	}
 	if err := repurge.Init(ctx, s.db); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
+	}
+	if s.opt.Rebuild {
+		if err := reset(ctx, s.db); err != nil {
+			return fmt.Errorf("tree: rebuild: %w", err)
+		}
 	}
 	if s.opt.Hook != nil {
 		if err := s.opt.Hook.Init(ctx, s.db); err != nil {

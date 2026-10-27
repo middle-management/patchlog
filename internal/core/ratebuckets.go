@@ -23,8 +23,8 @@ import (
 // A bucket's check and its deduction are one atomic step across every
 // instance that shares the store (§6.6 Cost). On Postgres the buckets are
 // rows of rate_buckets, and a request's draw is one call of rate_draw
-// (pgschema.go), one statement: it adds the rows of buckets never drawn
-// on, full, then locks the rows of every bucket the request draws on in
+// (migration 004_rate_buckets), one statement: it adds the rows of
+// buckets never drawn on, full, then locks the rows of every bucket the request draws on in
 // key order, so two draws never wait on each other in a cycle (and the
 // sweep of full buckets never waits on a draw: maybeSweep), refills
 // them to now, and deducts each cost only if every one holds a token.

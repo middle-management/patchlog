@@ -2,6 +2,7 @@ package index_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/index"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 func must[T any](v T, err error) T {
@@ -591,12 +593,34 @@ func testRebuild(t *testing.T) {
 	s := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true})
 	s.caughtUp("matches")
 	s.stop()
+	// A snapshot left part-way: a rebuild replays from its first page
+	// rather than resume it after the names the rebuild emptied.
+	exec := func(q string) int {
+		t.Helper()
+		sq, err := sql.Open("sqlite", sqlitedsn.DSN(db, ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sq.Close()
+		r, err := sq.Exec(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, _ := r.RowsAffected()
+		return int(n)
+	}
+	if exec(`INSERT INTO checkpoints_bootstrap (origin, ns, at_id, after_name) SELECT origin, ns, ns_id, 'm' FROM checkpoints`) == 0 {
+		t.Fatal("no checkpoint to leave a snapshot at")
+	}
 
 	s2 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true, rebuild: true, noRun: true})
 	if s2.ix.Checkpoint("matches") != "" {
 		t.Fatal("rebuild kept the checkpoint")
 	}
 	s2.stop()
+	if n := exec(`DELETE FROM checkpoints_bootstrap`); n != 0 {
+		t.Fatalf("rebuild kept %d snapshot positions", n)
+	}
 	s3 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true, rebuild: true})
 	if bs := s3.appliedUpTo(s3.caughtUp("matches")); bs[0].From != "" {
 		t.Fatal("rebuild did not replay from the beginning")

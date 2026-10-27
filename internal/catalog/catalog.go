@@ -84,6 +84,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"database/sql"
+	"embed"
 	"errors"
 	"fmt"
 	"net/http"
@@ -93,6 +94,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/pointer"
@@ -246,44 +248,26 @@ func (s *Service) Handler() http.Handler {
 
 // --- storage (tree.Hook) ------------------------------------------------------
 
-// Init creates the tables of §B.11.7. The spec's nodes(node, inherit) is
-// access_nodes here (the tree service has its own nodes table), and
-// effective is kept for every node (folders too, for listing visibility),
-// keyed by the node's href. Rows with tombstoned = 1 are a deleted item's,
-// frozen as they were when its tombstone was seen, and rows with
-// tombstoned = 2 a deleted placement's, kept as they were when its
-// catalog tombstone was seen (§B.11.7). A row with an empty subject and
-// role (keptMarker) records a deletion kept without rows.
+// Init creates or migrates the tables of §B.11.7 (migrations/), applied
+// under the namespace "catalog" (package dbmigrate). The spec's
+// nodes(node, inherit) is access_nodes here (the tree service has its own
+// nodes table), and effective is kept for every node (folders too, for
+// listing visibility), keyed by the node's href. Rows with tombstoned = 1
+// are a deleted item's, frozen as they were when its tombstone was seen,
+// and rows with tombstoned = 2 a deleted placement's, kept as they were
+// when its catalog tombstone was seen (§B.11.7). A row with an empty
+// subject and role (keptMarker) records a deletion kept without rows.
 func (s *Service) Init(ctx context.Context, db *sql.DB) error {
-	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS access_nodes (node TEXT PRIMARY KEY, inherit INTEGER NOT NULL DEFAULT 1)`,
-		`CREATE TABLE IF NOT EXISTS acl (node TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY (node, subject, role)) WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS effective (node TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL,
-			tombstoned INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (node, subject, role)) WITHOUT ROWID`,
-		`CREATE INDEX IF NOT EXISTS effective_by_subject ON effective (subject, node)`,
-	} {
-		if _, err := db.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("catalog: schema: %w", err)
-		}
-	}
-	// A database from before tombstoned rows: the rows of placements whose
-	// item is tombstoned become its frozen rows.
-	var has int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('effective') WHERE name = 'tombstoned'`).Scan(&has); err != nil {
+	if err := dbmigrate.Migrate(ctx, db, migrations, "catalog"); err != nil {
 		return fmt.Errorf("catalog: schema: %w", err)
-	}
-	if has == 0 {
-		for _, q := range []string{
-			`ALTER TABLE effective ADD COLUMN tombstoned INTEGER NOT NULL DEFAULT 0`,
-			fmt.Sprintf(`UPDATE effective SET tombstoned = 1 WHERE node IN (SELECT href FROM nodes WHERE item_state = %d)`, tree.ItemTombstoned),
-		} {
-			if _, err := db.ExecContext(ctx, q); err != nil {
-				return fmt.Errorf("catalog: schema: %w", err)
-			}
-		}
 	}
 	return nil
 }
+
+// migrations holds the catalog's tables in the tree service's database.
+//
+//go:embed migrations
+var migrations embed.FS
 
 // Rebuild recomputes acl and effective from the graph. Frozen rows of
 // deleted items, and the rows of deleted placements, can't be derived
