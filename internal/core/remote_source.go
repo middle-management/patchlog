@@ -45,16 +45,17 @@ func (r *RegistrationResult) Value() map[string]any {
 	}
 }
 
-// regRow is a remote_branches row.
+// regRow is a remote_branches row: the registration's at, its latest
+// entry and the one before, and when it expires.
 type regRow struct {
 	atSeq, nsSeq int64
 	prevSeq      sql.NullInt64
 	expires      int64
 }
 
-func (t *tx) registration(ns int64, origin, name string) *regRow {
+func (t *tx) registration(n *nsRow, origin, name string) *regRow {
 	r := &regRow{}
-	err := t.QueryRow(`SELECT at_seq, ns_seq, prev_seq, expires FROM remote_branches WHERE ns = ? AND origin = ? AND name = ?`, ns, origin, name).
+	err := t.QueryRow(`SELECT at_seq, ns_seq, prev_seq, expires FROM remote_branches WHERE ns = ? AND origin = ? AND name = ?`, n.id, origin, name).
 		Scan(&r.atSeq, &r.nsSeq, &r.prevSeq, &r.expires)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
@@ -63,83 +64,122 @@ func (t *tx) registration(ns int64, origin, name string) *regRow {
 	return r
 }
 
+// entryBy is the author and created time of n's entry seq.
+func (t *tx) entryBy(seq int64) (author, created int64) {
+	t.must(t.QueryRow(`SELECT author, created FROM ns_log WHERE seq = ?`, seq).Scan(&author, &created))
+	return author, created
+}
+
 // RegisterRemoteBranch registers or renews a remote branch of a namespace
 // (§G.3). It needs unrestricted read and export, is evaluated as an export
 // envelope whose doc is { remote, at }, and appends a remote branch entry
 // (§3.5).
 func (e *Engine) RegisterRemoteBranch(ctx context.Context, req Request, rr RemoteRegistration) (*RegistrationResult, error) {
-	if err := e.be.lacks("remote branches"); err != nil {
-		return nil, err
-	}
+	return e.be.registerRemote(ctx, req, rr)
+}
+
+// sqlRegisterRemote is RegisterRemoteBranch on SQL.
+func (e *Engine) sqlRegisterRemote(ctx context.Context, req Request, rr RemoteRegistration) (*RegistrationResult, error) {
 	var out *RegistrationResult
 	err := e.update(ctx, func(t *tx) error {
-		r, err := t.registerRemote(req, rr)
-		out = r
-		return asErr(err)
+		p, replay, err := t.planRegistration(req, rr)
+		switch {
+		case err != nil:
+			return err
+		case replay != nil:
+			out = replay
+			return nil
+		}
+		seq, nsID := t.appendNS(p.n, p.entry, nil, nil, p.n.configSeq, t.actorID(p.a))
+		var prev any
+		if p.row != nil {
+			prev = p.row.nsSeq
+		}
+		_, xerr := t.Exec(`INSERT INTO remote_branches (ns, origin, name, at_seq, ns_seq, prev_seq, expires) VALUES (?,?,?,?,?,?,?)
+		ON CONFLICT (ns, origin, name) DO UPDATE SET at_seq = excluded.at_seq, ns_seq = excluded.ns_seq, prev_seq = excluded.prev_seq, expires = excluded.expires`,
+			p.n.id, rr.Origin, rr.NS, p.atSeq, seq, prev, p.expires.UnixMilli())
+		t.must(xerr)
+		out = p.result(nsID.String())
+		return nil
 	})
 	return out, err
 }
 
-func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationResult, *Error) {
+// regPlan is a registration the gate allowed: its entry in n, by a, at
+// atSeq, expiring at expires; row is the registration it renews, if any.
+type regPlan struct {
+	n       *nsRow
+	a       *actor
+	rr      RemoteRegistration
+	atSeq   int64
+	atID    ids.ID
+	row     *regRow
+	entry   map[string]any
+	expires time.Time
+}
+
+func (p *regPlan) result(nsID string) *RegistrationResult {
+	return &RegistrationResult{Status: 201, NSID: nsID, Origin: p.rr.Origin, NS: p.rr.NS, At: p.atID.String(), Expires: p.expires}
+}
+
+// planRegistration checks a registration (§G.3): authentication, read and
+// export, the rate limit, the preconditions and retries, the rules. A
+// retry of the latest entry answers it (replay).
+func (t *gate) planRegistration(req Request, rr RemoteRegistration) (*regPlan, *RegistrationResult, *Error) {
 	n := t.nsForWrite(req.NS)
 	if n == nil {
-		return nil, t.absentNS(req.NS, req.Cred)
+		return nil, nil, t.absentNS(req.NS, req.Cred)
 	}
 	cfg := t.config(n.configSeq)
 	a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
 	if aerr != nil {
-		return nil, aerr
+		return nil, nil, aerr
 	}
 	// Step 1: unrestricted read (§2.1) and export, then the rate limit.
 	// Remote entries don't count toward the live-branches limit, but are
 	// rate-limited.
 	if !t.readsNS(n, cfg, a, true) {
-		return nil, forbidden("registering a remote branch needs unrestricted read (§2.1)")
+		return nil, nil, forbidden("registering a remote branch needs unrestricted read (§2.1)")
 	}
 	if err := t.authorize(a, "export", ""); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := t.rateLimit(n, cfg, a, nil, 1); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// 410 after authorisation and the rate limit, like every write to a
 	// purged namespace (§6.2, §8.5).
 	if n.purged {
-		return nil, t.purgedNS(n)
+		return nil, nil, t.purgedNS(n)
 	}
 	// A remote branch of a private, sealed or e2e namespace must itself be
 	// private or sealed (§G.5). This side can't enforce it: it is part of
 	// what the export grant entrusts, and the branch's deployment enforces
 	// it when it creates the branch.
 	if !ValidRemoteOrigin(rr.Origin) {
-		return nil, invalid("remote.origin must be an https origin (or http on a loopback host)")
+		return nil, nil, invalid("remote.origin must be an https origin (or http on a loopback host)")
 	}
 	if rr.Origin == t.e.opt.Origin {
-		return nil, invalid("remote.origin is this deployment; create a local branch instead")
+		return nil, nil, invalid("remote.origin is this deployment; create a local branch instead")
 	}
 	if !ValidNSName(rr.NS) {
-		return nil, invalid("remote.ns must be a namespace name")
+		return nil, nil, invalid("remote.ns must be a namespace name")
 	}
 	atID, perr := ids.Parse(rr.At)
 	if perr != nil {
-		return nil, invalid("at is not in the namespace's chain")
+		return nil, nil, invalid("at is not in the namespace's chain")
 	}
 	atSeq, ok := t.nsLogSeq(n.id, atID)
 	if !ok {
-		return nil, invalid("at is not in the namespace's chain")
+		return nil, nil, invalid("at is not in the namespace's chain")
 	}
 	// Step 2: preconditions and idempotent retries.
 	author := t.actorID(a)
 	now := t.now.UnixMilli()
-	row := t.registration(n.id, rr.Origin, rr.NS)
+	row := t.registration(n, rr.Origin, rr.NS)
 	latest := func() *RegistrationResult {
 		return &RegistrationResult{Status: 200, NSID: t.nsLogID(row.nsSeq).String(), Origin: rr.Origin, NS: rr.NS,
 			At: t.nsLogID(row.atSeq).String(), Expires: time.UnixMilli(row.expires).UTC()}
-	}
-	entryBy := func(seq int64) (int64, int64) {
-		var au, created int64
-		t.must(t.QueryRow(`SELECT author, created FROM ns_log WHERE seq = ?`, seq).Scan(&au, &created))
-		return au, created
 	}
 	stale := func() *Error {
 		e := apiErr(412, "stale")
@@ -152,57 +192,47 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 	}
 	switch {
 	case rr.IfNoneMatch && rr.IfMatch != "":
-		return nil, badInput("both If-Match and If-None-Match")
+		return nil, nil, badInput("both If-Match and If-None-Match")
 	case rr.IfNoneMatch:
 		if row != nil && row.expires > now {
 			// A retry of the request that wrote the latest entry: same
 			// principal and at, within the retry window (§7.2).
-			au, created := entryBy(row.nsSeq)
+			au, created := t.entryBy(row.nsSeq)
 			if au == author && row.atSeq == atSeq && now-created <= cfg.Limits.RetryWindow.Milliseconds() {
-				return latest(), nil
+				return nil, latest(), nil
 			}
-			return nil, stale()
+			return nil, nil, stale()
 		}
 	case rr.IfMatch != "":
 		if row == nil {
-			return nil, stale()
+			return nil, nil, stale()
 		}
 		if rr.IfMatch != t.nsLogID(row.nsSeq).String() {
 			// A retry by the same principal whose If-Match names the entry
 			// before the latest gets the latest.
 			if row.prevSeq.Valid && rr.IfMatch == t.nsLogID(row.prevSeq.Int64).String() && row.atSeq == atSeq {
-				if au, _ := entryBy(row.nsSeq); au == author {
-					return latest(), nil
+				if au, _ := t.entryBy(row.nsSeq); au == author {
+					return nil, latest(), nil
 				}
 			}
-			return nil, stale()
+			return nil, nil, stale()
 		}
 		if row.atSeq != atSeq {
-			return nil, invalid("a renewal must keep the registration's at")
+			return nil, nil, invalid("a renewal must keep the registration's at")
 		}
 	default:
-		return nil, apiErr(428, "precondition_required")
+		return nil, nil, apiErr(428, "precondition_required")
 	}
 	// Step 6: the export envelope.
 	doc := map[string]any{"remote": map[string]any{"origin": rr.Origin, "ns": rr.NS}, "at": atID.String()}
 	env := t.basicEnvelope("export", "", a)
 	env["writes"], env["patches"], env["doc"] = []any{}, []any{}, doc
 	if err := t.checkRules(cfg, a, env, false); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Step 7.
 	entry := map[string]any{"kind": "branch", "remote": map[string]any{"origin": rr.Origin, "ns": rr.NS}, "at": atID.String()}
-	seq, nsID := t.appendNS(n, entry, nil, nil, n.configSeq, author)
-	expires := t.now.Add(cfg.Limits.RemoteRegistration)
-	var prev any
-	if row != nil {
-		prev = row.nsSeq
-	}
-	_, err := t.Exec(`INSERT INTO remote_branches (ns, origin, name, at_seq, ns_seq, prev_seq, expires) VALUES (?,?,?,?,?,?,?)
-		ON CONFLICT (ns, origin, name) DO UPDATE SET at_seq = excluded.at_seq, ns_seq = excluded.ns_seq, prev_seq = excluded.prev_seq, expires = excluded.expires`,
-		n.id, rr.Origin, rr.NS, atSeq, seq, prev, expires.UnixMilli())
-	t.must(err)
-	return &RegistrationResult{Status: 201, NSID: nsID.String(), Origin: rr.Origin, NS: rr.NS, At: atID.String(), Expires: expires}, nil
+	return &regPlan{n: n, a: a, rr: rr, atSeq: atSeq, atID: atID, row: row, entry: entry, expires: t.now.Add(cfg.Limits.RemoteRegistration)}, nil, nil
 }
 
 // liveRegistrations lists the unexpired remote branch registrations of n.

@@ -82,6 +82,9 @@ type Commit struct {
 	Repurge *Repurge
 	// Branch creates a branch of NS at the commit's entry (branch.go).
 	Branch *CommitBranch
+	// Registration records a remote branch's registration with the
+	// commit's entry (remote.go).
+	Registration *CommitRegistration
 	// Copies are resources of other namespaces whose copies of a schema
 	// revision a purge's in_use check relied on (§6.1): it is stale if
 	// one is purged meanwhile, as SQL's locks order the two.
@@ -244,6 +247,9 @@ func (c *Commit) actions() int {
 		n++ // the queued second purge
 	}
 	n += len(c.Copies)
+	if c.Registration != nil {
+		n++
+	}
 	if c.Branch != nil {
 		n += branchActions
 		if c.Grant != "" {
@@ -427,7 +433,7 @@ func touchesMeta(cs []*Commit) bool {
 // alone reports whether c commits on its own, outside group commit: one
 // that updates #META, purges, prunes or branches.
 func (c *Commit) alone() bool {
-	return c.Config != nil || c.PurgeNS || c.Purge != nil || c.Branch != nil || c.Prune != nil
+	return c.Config != nil || c.PurgeNS || c.Purge != nil || c.Branch != nil || c.Prune != nil || c.Registration != nil
 }
 
 // commitActs are one commit's actions, in this order — the layout
@@ -475,6 +481,7 @@ func (s *Store) commitActs(c *Commit, entry logRow) []types.TransactWriteItem {
 		}})
 	}
 	out = append(out, s.branchActs(c, entry)...)
+	out = append(out, s.registrationActs(c, entry)...)
 	marker := item{"ns": avS(ns), "logPos": avN(entry.pos)}
 	if len(c.Items) == 1 && c.Kind != "batch" {
 		marker["revId"] = avS(c.Items[0].Steps[len(c.Items[0].Steps)-1].ID)

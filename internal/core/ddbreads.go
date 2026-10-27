@@ -1075,8 +1075,6 @@ func (r *ddbReads) branchEntry(base *nsRow, gseq int64) (int64, bool) {
 	return r.logHandle(bname, b.EntryPos), true
 }
 
-// liveRegistrations: no remote branches here.
-func (r *ddbReads) liveRegistrations(n *nsRow) []map[string]any { return nil }
 
 // readThrough completes the view of a resource n has no head of: in a
 // branch, the base's as of the entry it branched at (resolve of
@@ -1127,8 +1125,6 @@ func (r *ddbReads) headAtEntry(res, at int64) (int64, bool) {
 	return r.revHandle(k.ns, k.name, h.Pos), true
 }
 
-// registeredAts: there are no remote branches here.
-func (r *ddbReads) registeredAts(n *nsRow) []int64 { return nil }
 
 func (r *ddbReads) retainedNames(n *nsRow) []string {
 	names, err := r.s.RetainedNames(r.ctx, r.nsName(n.id))

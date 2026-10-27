@@ -135,6 +135,8 @@ type branchReads interface {
 	branchEntry(base *nsRow, gseq int64) (int64, bool)
 	liveRegistrations(n *nsRow) []map[string]any
 	registeredAts(n *nsRow) []int64
+	registration(n *nsRow, origin, name string) *regRow
+	entryBy(seq int64) (author, created int64)
 	baseIdentity(n *nsRow) string
 	copyRows(id ids.ID, name string) []copyRow
 }
