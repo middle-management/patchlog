@@ -329,8 +329,12 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		return
 	}
 	// Keys the service fails to fetch for now (lacking them is the 404
-	// above): behind, as before its first checkpoint (§A.4, §12.1).
-	if reason, _ := ix.keys.Skip(ns); reason != "" {
+	// above, which a config change the follower delivered meanwhile may
+	// have made so): behind, as before its first checkpoint (§A.4, §12.1).
+	if reason, lacks := ix.keys.Skip(ns); lacks {
+		writeErr(w, http.StatusNotFound, "not_found", "namespace not indexed")
+		return
+	} else if reason != "" {
 		writeBehind(w, "the index cannot obtain the keys of the namespace yet")
 		return
 	}

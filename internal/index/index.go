@@ -168,6 +168,10 @@ type Index struct {
 	cur     map[string]string // ns -> checkpoint
 	purged  map[string]bool
 	changed chan struct{} // closed and replaced after every commit
+	// runs stops the running follower of a followed namespace (runFollower),
+	// which Apply does once a config change leaves the service without
+	// its keys (derived.Keys.Recheck).
+	runs map[string]context.CancelFunc
 }
 
 // Open opens (creating or, with Rebuild, recreating) the index database and
@@ -521,7 +525,13 @@ func (ix *Index) follow(ctx context.Context, ns string) {
 			}
 			err = fmt.Errorf("skipped: %s", reason)
 		} else {
-			err = follow.New(ix.c, ns, ix.cps, ix, opts...).Run(ctx)
+			err = ix.runFollower(ctx, ns, opts)
+			if _, lacks := ix.keys.Skip(ns); lacks && ctx.Err() == nil {
+				// Apply stopped it: a config change (a raise to e2e, an
+				// epoch) left the service without its keys. Decided as
+				// when it starts, at once.
+				continue
+			}
 		}
 		if ctx.Err() != nil {
 			return
@@ -544,6 +554,45 @@ func (ix *Index) follow(ctx context.Context, ns string) {
 	}
 }
 
+// followsRoot reports whether ns has a follower of its own (runFollower).
+func (ix *Index) followsRoot(ns string) bool {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	_, ok := ix.runs[ns]
+	return ok
+}
+
+// runFollower runs a follower of ns until it ends, or until Apply stops it
+// (stopRun).
+func (ix *Index) runFollower(ctx context.Context, ns string, opts []follow.Option) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ix.mu.Lock()
+	if ix.runs == nil {
+		ix.runs = map[string]context.CancelFunc{}
+	}
+	ix.runs[ns] = cancel
+	ix.mu.Unlock()
+	defer func() {
+		ix.mu.Lock()
+		delete(ix.runs, ns)
+		ix.mu.Unlock()
+	}()
+	return follow.New(ix.c, ns, ix.cps, ix, opts...).Run(ctx)
+}
+
+// stopRun stops the running follower of ns, reporting whether ns has one
+// (a branch a follower follows with its base has none of its own).
+func (ix *Index) stopRun(ns string) bool {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	cancel, ok := ix.runs[ns]
+	if ok {
+		cancel()
+	}
+	return ok
+}
+
 // prepared is one coalesced change with its fetched content, ready to write.
 type prepared struct {
 	resource string
@@ -560,9 +609,23 @@ type prepared struct {
 // transaction, so a batch entry is never half-applied (§10).
 func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	co := b.Coalesce()
+	config := false
 	for _, u := range b.Units {
 		if u.Config != nil {
 			ix.keys.Observe(b.NS, u.Config.Value)
+			config = true
+		}
+	}
+	if config && ix.followsRoot(b.NS) {
+		// A raise (to e2e from none or at-rest, Addendum E Levels) or an
+		// epoch whose keys the service lacks as configured: skipped as
+		// when its follower starts (queries are 404, §A.4, §E.2.6), and
+		// not followed, so nothing is consumed that can't be read or
+		// sealed. The batch isn't applied: once the keys come, a restart
+		// resumes at it.
+		if reason, lacks := ix.keys.Recheck(ctx, b.NS, false); lacks && ix.stopRun(b.NS) {
+			ix.opt.Logf("index: skipping %s: %s", b.NS, reason)
+			return fmt.Errorf("index: %s skipped: %s", b.NS, reason)
 		}
 	}
 	// Fetch FetchConcurrency documents at a time (one GET each), counting

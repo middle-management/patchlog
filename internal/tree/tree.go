@@ -245,6 +245,10 @@ type Service struct {
 	runCtx  context.Context
 	running map[string]context.CancelFunc
 	fwg     sync.WaitGroup
+	// runs stops the running follower of a followed namespace, by the
+	// name it follows (runFollower), which Apply does once a config
+	// change leaves the service without its keys (derived.Keys.Recheck).
+	runs map[string]context.CancelFunc
 }
 
 // Open opens (creating) the database, reads the core's origin and loads
@@ -812,12 +816,18 @@ func (s *Service) follow(ctx context.Context, ns string) {
 				return
 			}
 			err = fmt.Errorf("skipped: %s", reason)
-		} else if ns != s.opt.Catalog && s.opt.RoleView != nil {
-			if err = s.ensureContent(ctx, ns); err == nil {
-				err = follow.New(s.c, real, s.cps, s, opts...).Run(ctx)
-			}
 		} else {
-			err = follow.New(s.c, real, s.cps, s, opts...).Run(ctx)
+			if ns == s.opt.Catalog || s.opt.RoleView == nil {
+				err = s.runFollower(ctx, real, opts)
+			} else if err = s.ensureContent(ctx, ns); err == nil {
+				err = s.runFollower(ctx, real, opts)
+			}
+			if _, lacks := s.keys.Skip(real); lacks && ctx.Err() == nil {
+				// Apply stopped it: a config change (a raise to e2e, an
+				// epoch) left the service without its keys. Decided as
+				// when it starts, at once.
+				continue
+			}
 		}
 		if ctx.Err() != nil {
 			return
@@ -841,6 +851,46 @@ func (s *Service) follow(ctx context.Context, ns string) {
 			pause *= 2
 		}
 	}
+}
+
+// runFollower runs a follower of real until it ends, or until Apply stops
+// it (stopRun).
+func (s *Service) runFollower(ctx context.Context, real string, opts []follow.Option) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s.fmu.Lock()
+	if s.runs == nil {
+		s.runs = map[string]context.CancelFunc{}
+	}
+	s.runs[real] = cancel
+	s.fmu.Unlock()
+	defer func() {
+		s.fmu.Lock()
+		delete(s.runs, real)
+		s.fmu.Unlock()
+	}()
+	return follow.New(s.c, real, s.cps, s, opts...).Run(ctx)
+}
+
+// hasRun reports whether real has a running follower of its own
+// (runFollower).
+func (s *Service) hasRun(real string) bool {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+	_, ok := s.runs[real]
+	return ok
+}
+
+// stopRun stops the running follower of real, reporting whether it had
+// one.
+func (s *Service) stopRun(real string) bool {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+	cancel, ok := s.runs[real]
+	if ok {
+		cancel()
+	}
+	return ok
 }
 
 // prep is one coalesced change with its fetched content.
@@ -889,6 +939,18 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		if u.Config != nil {
 			cfg = u.Config
 			s.keys.Observe(fb.NS, u.Config.Value)
+		}
+	}
+	if cfg != nil && s.hasRun(fb.NS) {
+		// A raise (to e2e from none or at-rest, Addendum E Levels) or an
+		// epoch whose keys the service lacks as configured: skipped as
+		// when its follower starts (the catalog's listings are 404,
+		// §E.2.6; a content namespace is still followed for heads), and
+		// not followed. The batch isn't applied: once the keys come, a
+		// restart resumes at it.
+		if reason, lacks := s.keys.Recheck(ctx, fb.NS, !isCat); lacks && s.stopRun(fb.NS) {
+			s.opt.Logf("tree: skipping %s: %s", fb.NS, reason)
+			return fmt.Errorf("tree: %s skipped: %s", fb.NS, reason)
 		}
 	}
 	// A content namespace's document as of the new checkpoint, which a
