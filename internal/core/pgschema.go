@@ -7,6 +7,8 @@ import (
 	"runtime"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 )
 
 // The Postgres layout (Addendum D.8, migrations/postgres) is that of SQLite
@@ -38,7 +40,7 @@ func openPG(url string) (*sql.DB, error) {
 	db.SetMaxOpenConns(n)
 	db.SetMaxIdleConns(n)
 	ctx := context.Background()
-	if err := migrate(ctx, db); err != nil {
+	if err := dbmigrate.Migrate(ctx, db, migrations, "patchlog"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}

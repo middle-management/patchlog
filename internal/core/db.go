@@ -3,12 +3,21 @@ package core
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"fmt"
 	"runtime"
 
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
 	_ "modernc.org/sqlite"
 )
+
+// migrations holds the schema, one directory per dialect, applied under
+// the namespace "patchlog" (package dbmigrate), which keeps it apart in a
+// Postgres database shared with others.
+//
+//go:embed migrations
+var migrations embed.FS
 
 // openDB opens the database: a Postgres URL (pgschema.go), or a SQLite
 // file or ":memory:".
@@ -56,7 +65,7 @@ func openSQLite(path string) (*sql.DB, error) {
 		db.SetMaxOpenConns(n)
 		db.SetMaxIdleConns(n)
 	}
-	if err := migrate(context.Background(), db); err != nil {
+	if err := dbmigrate.Migrate(context.Background(), db, migrations, "patchlog"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}
