@@ -250,14 +250,19 @@ func (s *Store) ClearHorizon(ctx context.Context, ns, name string, horizonPos ui
 }
 
 // RestoreAttachment brings back an attachment pruning ended, its bytes
-// stored again under hash.
-func (s *Store) RestoreAttachment(ctx context.Context, ns, name, bid string, hash []byte) error {
+// stored again under hash, encrypted by owner's key ("" for none).
+func (s *Store) RestoreAttachment(ctx context.Context, ns, name, bid string, hash []byte, owner string) error {
+	upd, vals := "SET #h = :h REMOVE pruned, #o", map[string]types.AttributeValue{":h": avB(hash)}
+	if owner != "" {
+		upd = "SET #h = :h, #o = :o REMOVE pruned"
+		vals[":o"] = avS(owner)
+	}
 	_, err := s.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: &s.Table, Key: keyAV(keyBlob(ns, name, bid)),
-		UpdateExpression:          strptr("SET #h = :h REMOVE pruned"),
+		UpdateExpression:          &upd,
 		ConditionExpression:       strptr("attribute_exists(PK)"),
-		ExpressionAttributeNames:  map[string]string{"#h": "hash"},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":h": avB(hash)},
+		ExpressionAttributeNames:  map[string]string{"#h": "hash", "#o": "owner"},
+		ExpressionAttributeValues: vals,
 	})
 	return err
 }

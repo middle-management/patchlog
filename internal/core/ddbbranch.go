@@ -42,7 +42,11 @@ func (b *ddbBackend) createBranch(ctx context.Context, req Request, br BranchReq
 			return out.replay, nil
 		}
 		p := out.p
-		gid, err := b.storeGrant(ctx, p.a)
+		sealed, serr := r.atRest(p.base)
+		if serr != nil {
+			return nil, serr
+		}
+		gid, err := b.storeGrant(ctx, p.a, sealed)
 		if err != nil {
 			return nil, err
 		}

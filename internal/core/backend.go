@@ -56,6 +56,10 @@ type backend interface {
 	registered(ctx context.Context, b *remoteBase, nsID string, expires time.Time) error
 	remoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error)
 
+	// archiveDEK is the data key an encrypted archive of ns/name is
+	// sealed with (OpenArchive).
+	archiveDEK(ctx context.Context, ns, name string) ([]byte, error)
+
 	// archives lists the archives of unpurged resources (Archives);
 	// restore puts archived patch sets back (RestoreResource, §D.4).
 	archives(ctx context.Context, ns, name string) ([]ArchiveRecord, error)
@@ -161,6 +165,10 @@ func (b sqlBackend) registered(ctx context.Context, rb *remoteBase, nsID string,
 
 func (b sqlBackend) remoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error) {
 	return b.e.sqlRemoteNotices(ctx, ns)
+}
+
+func (b sqlBackend) archiveDEK(ctx context.Context, ns, name string) ([]byte, error) {
+	return b.e.sqlArchiveDEK(ctx, ns, name)
 }
 
 func (b sqlBackend) archives(ctx context.Context, ns, name string) ([]ArchiveRecord, error) {

@@ -201,7 +201,9 @@ func (r *ddbReads) revRowOf(ns string, ri *ddb.RevInfo) *revRow {
 		row.kind = kindTombstone
 	} else {
 		row.kind = kindRev
-		row.patches.String, row.patches.Valid = ri.Patches, !ri.Pruned
+		patches, err := r.b.openValue(r.ctx, ns, ri.Name, "rev", ri.ID, ri.Patches)
+		r.must(err)
+		row.patches.String, row.patches.Valid = patches, !ri.Pruned
 		row.size.Int64, row.size.Valid = int64(ri.Size), true
 		row.digest = ri.Digest
 	}
@@ -367,7 +369,18 @@ func (r *ddbReads) prefetchResources(int64, []string)      {}
 func (r *ddbReads) prefetchHeads(*nsRow, []string, *int64) {}
 func (r *ddbReads) prefetchSchemas([]schema.Ref)           {}
 
-func (r *ddbReads) nsLevel(n *nsRow) int { return r.config(n.configSeq).level }
+// nsLevel: a remote branch's shadow follows its branch (nsLevel of
+// crypt.go).
+func (r *ddbReads) nsLevel(n *nsRow) int {
+	if n.isShadow() {
+		branch, _, _ := strings.Cut(n.name[1:], "~")
+		if b := r.nsByName(branch); b != nil {
+			return r.config(b.configSeq).level
+		}
+		return levelNone
+	}
+	return r.config(n.configSeq).level
+}
 
 // --- configurations ---
 
@@ -716,8 +729,21 @@ func (r *ddbReads) referencedUpTo(res, max int64, bid ids.ID) bool {
 	r.must(err)
 	return b != nil && b.RefPos > 0 && b.RefPos <= r.revs[max].key.pos
 }
-func (r *ddbReads) declaredAt(row *revRow) []ids.ID   { panic(ddbUnsupported("e2e namespaces")) }
-func (r *ddbReads) dek(res int64, create bool) []byte { panic(ddbUnsupported("encryption at rest")) }
+func (r *ddbReads) declaredAt(row *revRow) []ids.ID { panic(ddbUnsupported("e2e namespaces")) }
+
+// dek: the grants key for grantsDEK, else the resource's.
+func (r *ddbReads) dek(res int64, create bool) []byte {
+	var k []byte
+	var err error
+	if res == grantsDEK {
+		k, err = r.b.dekFor(r.ctx, "", "", create)
+	} else {
+		rf := r.res[res]
+		k, err = r.b.dekFor(r.ctx, rf.ns, rf.name, create)
+	}
+	r.must(err)
+	return k
+}
 func (r *ddbReads) e2eEpochOK(n *nsRow, cfg *Config, e int) bool {
 	panic(ddbUnsupported("sealed namespaces"))
 }
@@ -813,9 +839,26 @@ func ddbCheck[T any](f func() T) (out T, err error) {
 // --- blobs ---
 
 // ddbBlobRow is a store row as the gate's, of resource handle res.
-func ddbBlobRow(res int64, b *ddb.BlobRow) *blobRow {
+// blobRowOf is a store row as the gate's, of resource handle res: its
+// owner the handle of the resource whose key encrypts its bytes, 0 for
+// plaintext ones (openBytes).
+func (r *ddbReads) blobRowOf(res int64, b *ddb.BlobRow) *blobRow {
 	bid, _ := ids.Parse(b.Bid)
-	return &blobRow{res: res, bid: bid, typ: b.Type, nonce: b.Nonce, size: b.Size, hash: b.Hash, pending: !b.Attachment, pruned: b.Pruned}
+	out := &blobRow{res: res, bid: bid, typ: b.Type, nonce: b.Nonce, size: b.Size, hash: b.Hash, pending: !b.Attachment, pruned: b.Pruned}
+	if b.Owner != "" {
+		ns, name, _ := strings.Cut(b.Owner, "\x00")
+		out.owner = r.resHandle(ns, name)
+	}
+	return out
+}
+
+// ownerName is the owner of a blob row's bytes as the store names it.
+func (r *ddbReads) ownerName(owner int64) string {
+	if owner == 0 {
+		return ""
+	}
+	k := r.res[owner]
+	return ownerOf(k.ns, k.name)
 }
 
 func (r *ddbReads) attachedBlob(res int64, bid ids.ID) *blobRow {
@@ -825,7 +868,7 @@ func (r *ddbReads) attachedBlob(res int64, bid ids.ID) *blobRow {
 	if b == nil {
 		return nil
 	}
-	return ddbBlobRow(res, b)
+	return r.blobRowOf(res, b)
 }
 
 func (r *ddbReads) pendingBlob(res int64, bid ids.ID, uploader string, cutoff int64) *blobRow {
@@ -835,7 +878,7 @@ func (r *ddbReads) pendingBlob(res int64, bid ids.ID, uploader string, cutoff in
 	if b == nil || b.Created < cutoff {
 		return nil
 	}
-	return ddbBlobRow(res, b)
+	return r.blobRowOf(res, b)
 }
 
 // blobArchive: no archives on this backend.
@@ -851,6 +894,19 @@ func (r *ddbReads) openBytes(owner int64, hash []byte) blobContent {
 	r.must(err)
 	if !ok {
 		panic(fmt.Errorf("blob bytes %x are missing", hash))
+	}
+	if owner != 0 {
+		// Encrypted under their owner's key: opened whole.
+		if file != "" {
+			f, err := r.e.blobs.open(file)
+			r.must(err)
+			data, err = io.ReadAll(f)
+			f.Close()
+			r.must(err)
+		}
+		plain, err := r.b.openOwned(r.ctx, r.ownerName(owner), hash, data)
+		r.must(err)
+		return memContent(plain)
 	}
 	if file == "" {
 		return memContent(data)
@@ -1194,7 +1250,16 @@ func (r *ddbReads) firstEntryCreated() (int64, bool) {
 }
 
 // archiveSealer: nothing is encrypted at rest here.
-func (r *ddbReads) archiveSealer(res int64) func(io.Writer) (io.WriteCloser, error) { return nil }
+// archiveSealer: an archive of a resource encrypted at rest is sealed
+// with a key derived from its data key (archiveSealer of crypt.go).
+func (r *ddbReads) archiveSealer(res int64) func(io.Writer) (io.WriteCloser, error) {
+	rf := r.res[res]
+	if n := r.nsByName(rf.ns); n == nil || r.nsLevel(n) < levelAtRest {
+		return nil
+	}
+	dek := r.dek(res, true)
+	return func(w io.Writer) (io.WriteCloser, error) { return sealArchive(w, dek) }
+}
 
 // --- gestures ---
 

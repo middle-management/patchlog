@@ -78,7 +78,11 @@ func (s *Store) walkChain(ctx context.Context, ns, name string, fromPos, toPos u
 			return false
 		}
 		last = pos
-		doc, ferr = apply(pos, doc, exists, i.s("patches"))
+		var patches string
+		if patches, ferr = s.open(ctx, ns, name, "rev", i.s("id"), i.s("patches")); ferr != nil {
+			return false
+		}
+		doc, ferr = apply(pos, doc, exists, patches)
 		exists, dead = true, false
 		return ferr == nil
 	})

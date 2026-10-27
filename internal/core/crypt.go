@@ -744,9 +744,16 @@ func (e *Engine) OpenArchive(ctx context.Context, ns, name string, r io.Reader) 
 	if string(head) != archiveMagic {
 		return br, nil
 	}
-	if err := e.be.lacks("encryption at rest"); err != nil {
+	dek, err := e.be.archiveDEK(ctx, ns, name)
+	if err != nil {
 		return nil, err
 	}
+	return openArchive(br, dek)
+}
+
+// sqlArchiveDEK is the data key an archive of ns/name is sealed with:
+// ErrArchiveKeyDestroyed once the resource is purged.
+func (e *Engine) sqlArchiveDEK(ctx context.Context, ns, name string) ([]byte, error) {
 	var dek []byte
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
@@ -767,10 +774,7 @@ func (e *Engine) OpenArchive(ctx context.Context, ns, name string, r io.Reader) 
 		dek = k
 		return err
 	})
-	if err != nil {
-		return nil, err
-	}
-	return openArchive(br, dek)
+	return dek, err
 }
 
 // archiveSealer returns the Seal function of an archive of res, or nil if

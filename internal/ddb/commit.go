@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -89,6 +90,14 @@ type Commit struct {
 	// revision a purge's in_use check relied on (§6.1): it is stale if
 	// one is purged meanwhile, as SQL's locks order the two.
 	Copies []ResourceRef
+	// Encrypting marks a config change that raises the namespace to
+	// encryption at rest: its plaintext content is encrypted after the
+	// commit (EncryptContent), the #ENCRYPTING marker naming the work
+	// until it is done.
+	Encrypting bool
+	// Seal, when set, encrypts the items' patch sets and head documents
+	// at rest (Store.Open): of name, a kind and its key, the plaintext.
+	Seal func(name, kind, key, plain string) string
 	// Pins are the configurations of other namespaces the checks relied
 	// on (the schemas' namespaces: whether the writer may read them): a
 	// pin that moved makes the commit stale, as its own configuration's.
@@ -252,6 +261,9 @@ func (c *Commit) actions() int {
 	}
 	n += len(c.Copies)
 	if c.Registration != nil {
+		n++
+	}
+	if c.Encrypting {
 		n++
 	}
 	if c.Branch != nil {
@@ -486,6 +498,9 @@ func (s *Store) commitActs(c *Commit, entry logRow) []types.TransactWriteItem {
 	}
 	out = append(out, s.branchActs(c, entry)...)
 	out = append(out, s.registrationActs(c, entry)...)
+	if c.Encrypting {
+		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyEncrypting(ns), item{"ns": avS(ns)})}})
+	}
 	marker := item{"ns": avS(ns), "logPos": avN(entry.pos)}
 	if len(c.Items) == 1 && c.Kind != "batch" {
 		marker["revId"] = avS(c.Items[0].Steps[len(c.Items[0].Steps)-1].ID)
@@ -525,7 +540,7 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 			r.kind = "tombstone"
 		} else {
 			digest := sha256.Sum256([]byte(st.Doc))
-			r.patches, r.size, r.digest = st.Patches, uint64(len(st.Doc)), digest[:]
+			r.patches, r.size, r.digest = c.seal(it.Name, "rev", st.ID, st.Patches), uint64(len(st.Doc)), digest[:]
 		}
 		out = append(out, types.TransactWriteItem{Put: &types.Put{
 			TableName: table, Item: withKey(keyRev(ns, it.Name, pos), r.item()),
@@ -564,7 +579,7 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 		ExpressionAttributeValues: vals,
 	}})
 	if live := it.lastLive(); live != nil {
-		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyDocHead(ns, it.Name), item{"revPos": avN(lastPos), "doc": avS(live.Doc)})}})
+		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyDocHead(ns, it.Name), item{"revPos": avN(lastPos), "doc": avS(c.seal(it.Name, "head", strconv.FormatUint(lastPos, 10), live.Doc))})}})
 	}
 	if final.kind != "tombstone" {
 		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyHist(ns, it.Name, entry.pos), item{"revPos": avN(final.pos)})}})
@@ -634,4 +649,12 @@ func classifyCancel(err error, cs []*Commit, n int) (stale []bool, tipMoved bool
 		off += k
 	}
 	return stale, tipMoved, nil
+}
+
+// seal is Seal, for a commit that has one.
+func (c *Commit) seal(name, kind, key, plain string) string {
+	if c.Seal == nil {
+		return plain
+	}
+	return c.Seal(name, kind, key, plain)
 }

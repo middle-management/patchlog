@@ -150,6 +150,16 @@ func (b *ddbBackend) restore(ctx context.Context, ns, name string, entries func(
 	if err != nil {
 		return nil, ddbAsErr(err)
 	}
+	level, err := b.nsLevelOf(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	var dek []byte
+	if level >= levelAtRest && rr != nil && !rr.Purged {
+		if dek, err = b.dekFor(ctx, ns, name, true); err != nil {
+			return nil, asErrOrNil(err)
+		}
+	}
 	if n.Purged || rr != nil && rr.Purged {
 		out.Purged = true
 		return out, entries(func(ArchiveEntry) error { return nil })
@@ -203,7 +213,11 @@ func (b *ddbBackend) restore(ctx context.Context, ns, name string, entries func(
 			out.Skipped++
 			return nil
 		}
-		ok, err := b.store.RestorePatches(ctx, ns, name, ri.Pos, string(canon))
+		stored := string(canon)
+		if dek != nil {
+			stored = sealValue(dek, "rev", ns, name, ri.ID, stored)
+		}
+		ok, err := b.store.RestorePatches(ctx, ns, name, ri.Pos, stored)
 		if err != nil {
 			return err
 		}
@@ -224,7 +238,7 @@ func (b *ddbBackend) restore(ctx context.Context, ns, name string, entries func(
 	defer e.invalidate(inv, false)
 	if rr.HorizonPos == 0 {
 		// Cleared before: every document is stored.
-		out.Blobs, err = b.restoreBlobs(ctx, ns, name, blobs)
+		out.Blobs, err = b.restoreBlobs(ctx, ns, name, ownerFor(level, ns, name), blobs)
 		return out, err
 	}
 	missing, err := b.store.PatchesMissing(ctx, ns, name, rr.HorizonPos)
@@ -234,7 +248,7 @@ func (b *ddbBackend) restore(ctx context.Context, ns, name string, entries func(
 	if err := b.store.ClearHorizon(ctx, ns, name, rr.HorizonPos); err != nil {
 		return nil, ddbAsErr(err)
 	}
-	if out.Blobs, err = b.restoreBlobs(ctx, ns, name, blobs); err != nil {
+	if out.Blobs, err = b.restoreBlobs(ctx, ns, name, ownerFor(level, ns, name), blobs); err != nil {
 		return nil, err
 	}
 	b.committed(ns, "r:"+ns+"/"+name)
@@ -245,7 +259,7 @@ func (b *ddbBackend) restore(ctx context.Context, ns, name string, entries func(
 // restoreBlobs brings back name's attachments that pruning ended, from
 // the archives' blob lines (restoreBlobs of archive.go). It returns how
 // many it brought back.
-func (b *ddbBackend) restoreBlobs(ctx context.Context, ns, name string, blobs map[ids.ID]*ArchiveBlob) (int, error) {
+func (b *ddbBackend) restoreBlobs(ctx context.Context, ns, name, owner string, blobs map[ids.ID]*ArchiveBlob) (int, error) {
 	ended, err := b.store.Attachments(ctx, ns, name, true)
 	if err != nil {
 		return 0, ddbAsErr(err)
@@ -261,10 +275,11 @@ func (b *ddbBackend) restoreBlobs(ctx context.Context, ns, name string, blobs ma
 			continue
 		}
 		h := sha256.Sum256(ab.Data)
-		if err := b.putBytes(ctx, h[:], ab.Data); err != nil {
+		key, err := b.putOwnedBytes(ctx, owner, h[:], ab.Data)
+		if err != nil {
 			return n, err
 		}
-		if err := b.store.RestoreAttachment(ctx, ns, name, a.Bid, h[:]); err != nil {
+		if err := b.store.RestoreAttachment(ctx, ns, name, a.Bid, key, owner); err != nil {
 			return n, ddbAsErr(err)
 		}
 		n++

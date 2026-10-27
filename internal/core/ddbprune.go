@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"strconv"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/ddb"
@@ -46,7 +47,7 @@ func (b *ddbBackend) prune(ctx context.Context, req Request, name string, pr Pru
 		case out.p.e2e:
 			return nil, ddbUnsupported("e2e namespaces")
 		}
-		gid, err := b.storeGrant(ctx, out.p.a)
+		gid, err := b.storeGrant(ctx, out.p.a, out.p.cfg.level >= levelAtRest)
 		if err != nil {
 			return nil, err
 		}
@@ -165,6 +166,15 @@ func (b *ddbBackend) pruneTo(ctx context.Context, r *ddbReads, g *gate, p *prune
 		var err error
 		if arch, err = b.writeArchive(ctx, r, g, p); err != nil {
 			return nil, err
+		}
+	}
+	if p.cfg.level >= levelAtRest {
+		dek, err := b.dekFor(ctx, ns, name, true)
+		if err != nil {
+			return nil, asErrOrNil(err)
+		}
+		for pos, doc := range pl.docs {
+			pl.docs[pos] = []byte(sealValue(dek, "snap", ns, name, strconv.FormatUint(pos, 10), string(doc)))
 		}
 	}
 	if err := b.store.PutSnapshots(ctx, ns, name, pl.docs); err != nil {

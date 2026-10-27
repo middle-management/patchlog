@@ -51,7 +51,11 @@ func (b *ddbBackend) purgeWith(ctx context.Context, req Request, name string, pl
 			return "", out.err
 		}
 		p := out.p
-		gid, err := b.storeGrant(ctx, p.a)
+		sealed, serr := r.atRest(p.n)
+		if serr != nil {
+			return "", serr
+		}
+		gid, err := b.storeGrant(ctx, p.a, sealed)
 		if err != nil {
 			return "", err
 		}
@@ -128,6 +132,12 @@ func (b *ddbBackend) finishPurge(ctx context.Context, ns, name string) error {
 	if err := b.deleteArchives(ctx, ns, name); err != nil {
 		return err
 	}
+	// Destroying the data keys makes whatever survives of the content,
+	// and of its archives, unreadable (§8.3, §E.1).
+	if err := b.store.DeleteDEKs(ctx, ns, name); err != nil {
+		return ddbAsErr(err)
+	}
+	b.keys.flush()
 	// A remote branch's mirrored copy goes too, in every shadow (§G.3).
 	if err := b.purgeShadows(ctx, ns, name); err != nil {
 		return err

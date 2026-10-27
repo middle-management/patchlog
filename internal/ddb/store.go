@@ -35,6 +35,13 @@ type Store struct {
 	Client API
 	Table  string
 	Now    func() time.Time // nil: time.Now
+	// Open, when set, opens a stored value the store folds or serves
+	// itself — a revision's patch set ("rev", keyed by the revision id),
+	// a head document ("head", by its revision's position), a snapshot
+	// ("snap", by position) — that core encrypted at rest (core's
+	// ddbcrypt.go). A value is encrypted exactly when it starts with
+	// Sealed; the store holds no keys.
+	Open func(ctx context.Context, ns, name, kind, key, raw string) (string, error)
 	// GroupCommit is at most how many checked writes of a namespace one
 	// transaction appends (group.go); ≤ 1 commits each write on its own.
 	GroupCommit int
@@ -243,4 +250,15 @@ func scanRevInfo(i item) RevInfo {
 		ParentNS:  i.s("parentNs"), ParentPos: i.n("parentPos"),
 		Pruned: i.s("kind") != "tombstone" && !i.has("patches"),
 	}
+}
+
+// Sealed starts a value encrypted at rest (Store.Open, Commit.Seal).
+const Sealed = "\x01"
+
+// open is Open for a stored value, which a plaintext one needs not.
+func (s *Store) open(ctx context.Context, ns, name, kind, key, raw string) (string, error) {
+	if s.Open == nil || !strings.HasPrefix(raw, Sealed) {
+		return raw, nil
+	}
+	return s.Open(ctx, ns, name, kind, key, raw)
 }

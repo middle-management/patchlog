@@ -92,15 +92,19 @@ type ShadowBlob struct {
 	Bid, Type, Nonce string
 	Size             int64
 	Hash             []byte
+	Owner            string
 	RefPos           uint64
 }
 
-// ImportShadow writes a shadow's content, after deleting whatever an
-// earlier import of it left, and returns its token.
+// ClearShadow deletes whatever an earlier, failed import of a shadow
+// left, before the next import (whose data keys it must not take).
+func (s *Store) ClearShadow(ctx context.Context, name string) error {
+	return s.deletePartition(ctx, name)
+}
+
+// ImportShadow writes a shadow's content, into a partition ClearShadow
+// cleared, and returns its token.
 func (s *Store) ImportShadow(ctx context.Context, im *ShadowImport) (string, error) {
-	if err := s.deletePartition(ctx, im.Name); err != nil {
-		return "", err
-	}
 	tok := make([]byte, 16)
 	rand.Read(tok)
 	token := hex.EncodeToString(tok)
@@ -190,7 +194,7 @@ func (s *Store) shadowRes(ns string, im *ShadowImport, r *ShadowRes, put func(Ke
 		put(keyDocHead(ns, r.Name), item{"revPos": avN(r.LastLivePos), "doc": avS(r.HeadDoc)})
 	}
 	for _, b := range r.Attach {
-		row := &BlobRow{Name: r.Name, Bid: b.Bid, Type: b.Type, Nonce: b.Nonce, Size: b.Size, Hash: b.Hash, Created: im.Created, RefPos: b.RefPos}
+		row := &BlobRow{Name: r.Name, Bid: b.Bid, Type: b.Type, Nonce: b.Nonce, Size: b.Size, Hash: b.Hash, Owner: b.Owner, Created: im.Created, RefPos: b.RefPos}
 		put(keyBlob(ns, r.Name, b.Bid), row.item())
 	}
 }

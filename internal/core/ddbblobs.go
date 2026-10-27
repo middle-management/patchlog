@@ -20,10 +20,21 @@ import (
 func (b *ddbBackend) uploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error {
 	e := b.e
 	var g *blobGate
+	// An encrypted resource's bytes are its own (ddbcrypt.go): a copy of
+	// another's is stored again under its key, from their plaintext.
+	var owner string
+	var copied []byte
 	if err := b.gateRead(ctx, func(t *gate) error {
 		gg, err := t.gateBlob(req, name, bid, &up, true)
 		g = gg
-		return asErr(err)
+		if err != nil {
+			return err
+		}
+		owner = ownerFor(t.nsLevel(gg.n), gg.n.name, name)
+		if gg.src != nil && t.checkReads.(*ddbReads).ownerName(gg.src.owner) != owner {
+			copied = t.blobBytes(gg.src)
+		}
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -31,21 +42,26 @@ func (b *ddbBackend) uploadBlob(ctx context.Context, req Request, name string, b
 	if err != nil {
 		return err
 	}
+	if copied != nil {
+		data = copied
+	}
 	var hash []byte
-	if g.src != nil {
-		hash = g.src.hash // stored already: the source's attachment names them
-	} else {
+	store := func() error {
 		h := sha256.Sum256(data)
-		hash = h[:]
-		if err := b.putBytes(ctx, hash, data); err != nil {
-			return err
-		}
+		var err error
+		hash, err = b.putOwnedBytes(ctx, owner, h[:], data)
+		return err
+	}
+	if g.src != nil && copied == nil {
+		hash = g.src.hash // stored already: the source's attachment names them
+	} else if err := store(); err != nil {
+		return err
 	}
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
-		if attempt > 0 && g.src == nil {
+		if attempt > 0 && (g.src == nil || copied != nil) {
 			// A purge may have collected the bytes since (PutPending's
 			// condition on them): stored again.
-			if err := b.putBytes(ctx, hash, data); err != nil {
+			if err := store(); err != nil {
 				return err
 			}
 		}
@@ -75,7 +91,7 @@ func (b *ddbBackend) uploadBlob(ctx context.Context, req Request, name string, b
 		}
 		ns := r.nsName(g.n.id)
 		err := b.store.PutPending(ctx, ns, r.cfgs[g.n.configSeq].pos, r.cfgRow(g.n.configSeq).ID, r.uploaderVer, &ddb.BlobRow{
-			Name: name, Bid: bid.String(), Type: g.typ, Nonce: g.nonce, Size: size, Hash: hash,
+			Name: name, Bid: bid.String(), Type: g.typ, Nonce: g.nonce, Size: size, Hash: hash, Owner: owner,
 			Created: t.now.UnixMilli(), Uploader: g.uploader,
 		})
 		if errors.Is(err, ddb.ErrStale) {
@@ -92,13 +108,19 @@ func (b *ddbBackend) uploadBlob(ctx context.Context, req Request, name string, b
 // putBytes stores blob bytes: in a file of the blob store when there
 // is one (whose name the BYTES item records), else in the item.
 func (b *ddbBackend) putBytes(ctx context.Context, hash, data []byte) error {
+	return b.putFile(ctx, bytesFile(0, hash), hash, data)
+}
+
+// putFile is putBytes under a file name prefix: an encrypted resource's
+// bytes aren't under the plaintext ones' "0/" (putOwnedBytes).
+func (b *ddbBackend) putFile(ctx context.Context, prefix string, hash, data []byte) error {
 	e := b.e
 	now := e.now().UnixMilli()
 	if e.blobs.root() == "" {
 		_, err := b.store.PutBytes(ctx, hash, data, "", now)
 		return asErrOrNil(err)
 	}
-	name, err := e.blobs.put(bytesFile(0, hash), data)
+	name, err := e.blobs.put(prefix, data)
 	if err != nil {
 		return err
 	}
@@ -160,6 +182,17 @@ func (b *ddbBackend) sweepBlobs(ctx context.Context) (int, error) {
 	}
 	for i := range pnss {
 		if err := b.finishPurge(ctx, pnss[i], pnames[i]); err != nil {
+			return 0, ddbAsErr(err)
+		}
+	}
+	// Namespaces raised to encryption at rest whose content is still to
+	// be encrypted (ddbcrypt.go).
+	encs, err := b.store.Encrypting(ctx)
+	if err != nil {
+		return 0, ddbAsErr(err)
+	}
+	for _, ns := range encs {
+		if err := b.encryptNamespace(ctx, ns); err != nil {
 			return 0, ddbAsErr(err)
 		}
 	}

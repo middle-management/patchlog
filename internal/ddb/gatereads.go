@@ -8,6 +8,7 @@ package ddb
 
 import (
 	"context"
+	"strconv"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -163,7 +164,8 @@ func (s *Store) DocAt(ctx context.Context, ns, name string, pos uint64) ([]byte,
 		if it == nil {
 			return nil, apiErr(409, "conflict", "detail", "head document missing")
 		}
-		return []byte(item(it).s("doc")), nil
+		d, err := s.open(ctx, ns, name, "head", strconv.FormatUint(item(it).n("revPos"), 10), item(it).s("doc"))
+		return []byte(d), err
 	}
 	r, err := s.RevAt(ctx, ns, name, pos)
 	if err != nil {

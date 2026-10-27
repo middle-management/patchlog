@@ -38,6 +38,10 @@ type ddbBackend struct {
 	byID map[string]*Config
 	// refsMarked are the schema references marked (schemaRefs).
 	refsMarked markedSet
+	// keys are the data keys unwrapped (ddbcrypt.go); grantsSealed the
+	// grants stored encrypted.
+	keys         ddbKeys
+	grantsSealed markedSet
 }
 
 // markedSet is a bounded set of keys: when full it starts over (a key
@@ -126,7 +130,12 @@ func openDDB(opt Options) (*Engine, error) {
 	if e.opt.Remote.RenewBefore == 0 {
 		e.opt.Remote.RenewBefore = 7 * 24 * time.Hour
 	}
-	e.be = &ddbBackend{e: e, store: store, byID: map[string]*Config{}}
+	b := &ddbBackend{e: e, store: store, byID: map[string]*Config{}}
+	e.be = b
+	store.Open = b.openValue
+	if err := b.checkKeyStore(context.Background()); err != nil {
+		return nil, err
+	}
 	return e, nil
 }
 
@@ -191,8 +200,10 @@ func ddbAsErr(err error) *Error {
 // creates and changes.
 func ddbRefusals(cfg *Config) *Error {
 	switch {
-	case cfg.Encryption != "":
-		return ddbUnsupported("encrypted namespaces")
+	case cfg.level == levelSealed:
+		return ddbUnsupported("sealed namespaces")
+	case cfg.level == levelE2E:
+		return ddbUnsupported("e2e namespaces")
 	}
 	return nil
 }

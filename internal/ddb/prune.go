@@ -24,6 +24,7 @@ package ddb
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -135,7 +136,8 @@ func (s *Store) snapshot(ctx context.Context, ns, name string, pos uint64) ([]by
 	if it == nil || err != nil {
 		return nil, false, err
 	}
-	return []byte(item(it).s("doc")), true, nil
+	d, err := s.open(ctx, ns, name, "snap", strconv.FormatUint(pos, 10), item(it).s("doc"))
+	return []byte(d), err == nil, err
 }
 
 // PruneContent drops what a committed prune of name in ns left: the
@@ -390,7 +392,11 @@ func (s *Store) EachSnapshot(ctx context.Context, ns, name string, visit func(do
 		if resNameFromRev(i.s("SK")) != "SNAP#"+name {
 			return nil // another resource whose name extends this one
 		}
-		doc, err := jsonv.Parse([]byte(i.s("doc")))
+		raw, err := s.open(ctx, ns, name, "snap", strconv.FormatUint(i.n("pos"), 10), i.s("doc"))
+		if err != nil {
+			return err
+		}
+		doc, err := jsonv.Parse([]byte(raw))
 		if err != nil {
 			return err
 		}

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -51,7 +52,11 @@ func (b *ddbBackend) registerRemote(ctx context.Context, req Request, rr RemoteR
 			return out.replay, nil
 		}
 		p := out.p
-		gid, err := b.storeGrant(ctx, p.a)
+		sealed, serr := r.atRest(p.n)
+		if serr != nil {
+			return nil, serr
+		}
+		gid, err := b.storeGrant(ctx, p.a, sealed)
 		if err != nil {
 			return nil, err
 		}
@@ -184,7 +189,7 @@ func (b *ddbBackend) createRemoteBranch(ctx context.Context, req Request, cc Con
 	if err := ddbRefusals(cfg); err != nil {
 		return nil, err
 	}
-	gid, err := b.storeGrant(ctx, a)
+	gid, err := b.storeGrant(ctx, a, cfg.level >= levelAtRest)
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +205,11 @@ func (b *ddbBackend) createRemoteBranch(ctx context.Context, req Request, cc Con
 	now := e.now()
 	for i := len(m.levels) - 1; i >= 0; i-- {
 		name := shadowLevelName(req.NS, i)
-		im, err := b.shadowImport(ctx, name, m.read, m.levels[i], below, belowAt, heads, now)
+		if err := b.store.ClearShadow(ctx, name); err != nil {
+			return nil, ddbAsErr(err)
+		}
+		b.keys.flush() // a cleared shadow's data keys are gone
+		im, err := b.shadowImport(ctx, name, m.read, m.levels[i], below, belowAt, heads, now, cfg.level)
 		if err != nil {
 			return nil, err
 		}
@@ -245,7 +254,10 @@ type shadowHead struct {
 // ids, verified again, and the resources it mirrors, whose blobs' bytes
 // it stores first. heads records each mirrored resource's head for the
 // foreign parents of the levels above.
-func (b *ddbBackend) shadowImport(ctx context.Context, name, read string, lv *remoteLevel, base string, baseAt uint64, heads map[*remoteRes]shadowHead, now time.Time) (*ddb.ShadowImport, error) {
+//
+// Its rows follow the branch's level: encrypted at rest, under the
+// shadow's own data keys, at level at-rest or above.
+func (b *ddbBackend) shadowImport(ctx context.Context, name, read string, lv *remoteLevel, base string, baseAt uint64, heads map[*remoteRes]shadowHead, now time.Time, level int) (*ddb.ShadowImport, error) {
 	if lv.enc != nil {
 		return nil, ddbUnsupported("e2e namespaces")
 	}
@@ -292,7 +304,7 @@ func (b *ddbBackend) shadowImport(ctx context.Context, name, read string, lv *re
 			heads[rr] = shadowHead{name, 1}
 			continue
 		}
-		sr, err := b.shadowChain(ctx, rr, heads, now)
+		sr, err := b.shadowChain(ctx, name, rr, heads, now, level)
 		if err != nil {
 			return nil, err
 		}
@@ -310,10 +322,19 @@ func (b *ddbBackend) shadowImport(ctx context.Context, name, read string, lv *re
 
 // shadowChain is a mirrored resource's own part of its chain (insertChain
 // of remote_branch.go, as data); nil if it has none at this level.
-func (b *ddbBackend) shadowChain(ctx context.Context, rr *remoteRes, heads map[*remoteRes]shadowHead, now time.Time) (*ddb.ShadowRes, error) {
+func (b *ddbBackend) shadowChain(ctx context.Context, shadow string, rr *remoteRes, heads map[*remoteRes]shadowHead, now time.Time, level int) (*ddb.ShadowRes, error) {
 	ch := rr.chain
 	if rr.from >= len(ch.entries) {
 		return nil, nil
+	}
+	owner := ownerFor(level, shadow, rr.name)
+	seal := func(kind, key, plain string) string { return plain }
+	if owner != "" {
+		dek, err := b.dekFor(ctx, shadow, rr.name, true)
+		if err != nil {
+			return nil, err
+		}
+		seal = func(kind, key, plain string) string { return sealValue(dek, kind, shadow, rr.name, key, plain) }
 	}
 	sr := &ddb.ShadowRes{Name: rr.name}
 	if rr.parent != nil {
@@ -346,10 +367,10 @@ func (b *ddbBackend) shadowChain(ctx context.Context, rr *remoteRes, heads map[*
 			return nil
 		}
 		if e.HasPatches {
-			v.Patches = string(jsonv.Canonical(e.Patches))
+			v.Patches = seal("rev", e.ID, string(jsonv.Canonical(e.Patches)))
 		} else {
 			// The horizon: its document is kept as a snapshot (§8.6).
-			sr.HorizonPos, sr.HorizonDoc = pos, string(canon)
+			sr.HorizonPos, sr.HorizonDoc = pos, seal("snap", strconv.FormatUint(pos, 10), string(canon))
 		}
 		if dm, ok := doc.(map[string]any); ok {
 			if s, ok := dm["$schema"].(string); ok {
@@ -369,17 +390,18 @@ func (b *ddbBackend) shadowChain(ctx context.Context, rr *remoteRes, heads map[*
 			}
 			attached[ref.bid] = true
 			h := sha256.Sum256(bl.data)
-			if err := b.putBytes(ctx, h[:], bl.data); err != nil {
+			key, err := b.putOwnedBytes(ctx, owner, h[:], bl.data)
+			if err != nil {
 				return err
 			}
-			sr.Attach = append(sr.Attach, ddb.ShadowBlob{Bid: ref.bid.String(), Type: bl.typ, Nonce: bl.nonce, Size: int64(len(bl.data)), Hash: h[:], RefPos: pos})
+			sr.Attach = append(sr.Attach, ddb.ShadowBlob{Bid: ref.bid.String(), Type: bl.typ, Nonce: bl.nonce, Size: int64(len(bl.data)), Hash: key, Owner: owner, RefPos: pos})
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	sr.HeadDoc = string(lastDoc)
+	sr.HeadDoc = seal("head", strconv.FormatUint(sr.LastLivePos, 10), string(lastDoc))
 	return sr, nil
 }
 
@@ -439,6 +461,10 @@ func (b *ddbBackend) mirrorInto(ctx context.Context, ns string, schemas []*remot
 		}
 		c := &ddb.Commit{NS: ns, Author: a.id(), Created: b.e.now().UnixMilli(), Grant: gid, NoAuth: a.noAuth,
 			CfgPos: n.ConfigPos, CfgID: n.ConfigID, Kind: "batch"}
+		level, err := b.nsLevelOf(ctx, ns)
+		if err != nil {
+			return err
+		}
 		var entries []any
 		for _, s := range schemas {
 			own, err := b.store.Resource(ctx, ns, s.name)
@@ -512,6 +538,13 @@ func (b *ddbBackend) mirrorInto(ctx context.Context, ns string, schemas []*remot
 			return nil
 		}
 		c.Entry = map[string]any{"kind": "batch", "entries": entries}
+		names := make([]string, len(c.Items))
+		for i, it := range c.Items {
+			names[i] = it.Name
+		}
+		if c.Seal, err = b.sealer(ctx, ns, level, names); err != nil {
+			return asErrOrNil(err)
+		}
 		_, err = b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
 			continue
@@ -698,6 +731,10 @@ func (b *ddbBackend) shadowsOf(ctx context.Context, branch string) []string {
 // the branch's purge (purgeShadow of remote_branch.go).
 func (b *ddbBackend) purgeShadows(ctx context.Context, ns, name string) error {
 	for _, sh := range b.shadowsOf(ctx, ns) {
+		if err := b.store.DeleteDEKs(ctx, sh, name); err != nil {
+			return ddbAsErr(err)
+		}
+		b.keys.flush()
 		hashes, err := b.store.PurgeShadow(ctx, sh, name)
 		if err != nil {
 			return ddbAsErr(err)
