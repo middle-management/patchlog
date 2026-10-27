@@ -23,11 +23,14 @@ package repurge
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"encoding/json"
 	"log"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 )
 
 // DefaultDelay is how long after a purge it is sent again unless set:
@@ -103,20 +106,15 @@ func New(db *sql.DB, p Purger, opt Options) *Queue {
 	return &Queue{db: db, p: p, opt: opt}
 }
 
-var createStmts = []string{
-	`CREATE TABLE IF NOT EXISTS cdn_repurge (id INTEGER PRIMARY KEY AUTOINCREMENT, tags TEXT NOT NULL, due INTEGER NOT NULL)`,
-	`CREATE INDEX IF NOT EXISTS cdn_repurge_due ON cdn_repurge (due)`,
-}
+// migrations holds the table, applied under the namespace "repurge"
+// (package dbmigrate).
+//
+//go:embed migrations/*.sql
+var migrations embed.FS
 
-// Init creates the table in a service's database (an existing database
-// gets it on start).
-func Init(ctx context.Context, db Execer) error {
-	for _, s := range createStmts {
-		if _, err := db.ExecContext(ctx, s); err != nil {
-			return err
-		}
-	}
-	return nil
+// Init creates or migrates the table in a service's database.
+func Init(ctx context.Context, db *sql.DB) error {
+	return dbmigrate.SQLite(ctx, db, migrations, "migrations", "repurge")
 }
 
 // Add queues the second purge of tags through ex, the transaction that

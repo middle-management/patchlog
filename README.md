@@ -3839,6 +3839,7 @@ internal/schema     $schema resolution and JSON Schema validation
 internal/schemaimport external JSON Schemas into a namespace, refs pinned (schema import)
 internal/grant      grants, keys, roles and verification (Addendum C)
 internal/core       storage and semantics (gate, batches, branches, purge, prune); schema migrations in migrations/
+internal/dbmigrate  applies a package's schema migrations (mmmigrate), and checks them all
 internal/sqlitedsn  SQLite DSNs: a database path escaped, so the driver opens that file; the file earlier releases opened instead
 internal/server     HTTP API
 internal/lifecycle  /_health and /_ready, phased graceful shutdown (serve, index, tree)
@@ -3858,21 +3859,32 @@ whose default collation isn't byte order).
 
 ### Schema migrations
 
-The core's schema is a series of [mmmigrate](https://github.com/middle-management/mmmigrate)
-migrations, one directory per dialect: `internal/core/migrations/sqlite` and
-`internal/core/migrations/postgres`. They are embedded in the binary, and every start applies the
-ones the database lacks, in order, each in its own transaction, and records them (in
-`mmmigrate_applied`, or the `mmmigrate` schema on Postgres, under the namespace `patchlog`).
-Committed migrations are never edited: their checksums chain, and `TestMigrations` fails if one
-changed.
+Every database's schema is a series of
+[mmmigrate](https://github.com/middle-management/mmmigrate) migrations, kept by the package that
+owns the tables, in its `migrations` directory (`internal/dbmigrate`):
 
-To change the schema, write the change in both directories' `current.sql` (plain SQL, safe to run
-twice, since tests apply it after every edit), test it (`go test ./...`, and `make test-pg`), and
-commit it with `make migration DESC="what it changes"`, which needs the `mmmigrate` CLI
-(`brew install middle-management/tap/mmmigrate`, or a release binary). Tests apply `current.sql`;
-deployments apply only committed migrations, and CI fails while `current.sql` holds any SQL.
-Migrations change the schema only; the index and tree services' databases are rebuilt from the
-core's API instead (`-rebuild`).
+| Directory | Namespace | Database |
+|-----------|-----------|----------|
+| `internal/core/migrations/sqlite`, `…/postgres` | `patchlog` | the core's, per dialect |
+| `internal/tree/migrations` | `tree` | the tree service's |
+| `internal/catalog/migrations` | `catalog` | the tree service's, as a catalog |
+| `internal/index/migrations` | `index` | the search index's (but its `text` table, FTS5 or a plain table depending on the SQLite build) |
+| `internal/derived/migrations` | `derived` | the tree service's and the index's (sealed views) |
+| `internal/repurge/migrations` | `repurge` | the tree service's and the index's (second CDN purges) |
+
+They are embedded in the binary, and every start applies the ones a database lacks, in order, each
+in its own transaction, and records them per namespace (in `mmmigrate_applied`, or the
+`mmmigrate` schema on Postgres). Committed migrations are never edited: their checksums chain, and
+`TestMigrations` (`internal/dbmigrate`) fails if one changed. A rebuild (`-rebuild`) empties the
+tables it replays and leaves the schema as it is.
+
+To change a schema, write the change in the directory's `current.sql` (for the core, in both
+dialects': plain SQL, safe to run twice, since tests apply it after every edit), test it
+(`go test ./...`, and `make test-pg` for the core), and commit it with
+`make migration DESC="what it changes"`, which commits every `current.sql` holding SQL and needs
+the `mmmigrate` CLI (`brew install middle-management/tap/mmmigrate`, or a release binary). Tests
+apply `current.sql`; services apply only committed migrations, and CI fails while a `current.sql`
+holds any SQL.
 
 ## License
 

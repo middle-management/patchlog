@@ -2,17 +2,20 @@
 
 ## Unreleased
 
-The core's schema is now a series of [mmmigrate](https://github.com/middle-management/mmmigrate)
-migrations (`internal/core/migrations`, README "Schema migrations"), applied on start and recorded
-in the database, instead of a schema script run on every start with checks for the columns each
-older version lacked. The schema itself is unchanged.
+The schemas of the core, the tree service (with the catalog) and the search index are now
+[mmmigrate](https://github.com/middle-management/mmmigrate) migrations (README "Schema
+migrations"), applied on start and recorded in each database, instead of schema statements run on
+every start with checks for what each older version lacked. The schemas themselves are unchanged.
 
 **Changes to check before upgrading:**
 - **Databases from before v0.22.0 are no longer migrated.** Start v0.22.0 on such a database once
-  first. A database v0.22.0 created or migrated is adopted as it is.
+  first (the core's, the tree service's and the index's alike). A database v0.22.0 created or
+  migrated is adopted as it is.
 - **Migrations are recorded in new tables:** `mmmigrate_applied` and `mmmigrate_current` on
   SQLite, the schema `mmmigrate` on Postgres, whose database user needs `CREATE` on the database
   for the first start.
+- **A rebuild of the tree service or the index empties its tables** rather than dropping and
+  recreating them; it replays from the beginning as before.
 
 ## v0.22.0
 
