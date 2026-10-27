@@ -26,7 +26,7 @@ fmt: ## gofmt the tree
 check: vet test ## vet and test, and fail on unformatted files
 	@test -z "$$(gofmt -l internal cmd)" || (gofmt -l internal cmd; exit 1)
 
-MIGRATIONS = $(sort $(dir $(wildcard internal/*/migrations/current.sql internal/*/migrations/*/current.sql)))
+MIGRATIONS = $(sort $(dir $(wildcard internal/*/migrations/*/current.sql)))
 
 migration: ## commit each migrations directory's current.sql that holds SQL as its next numbered migration (DESC="what it changes"; needs mmmigrate on PATH)
 	@test -n "$(DESC)" || (echo 'set DESC="what the migration changes"'; exit 1)

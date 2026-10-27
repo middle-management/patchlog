@@ -109,12 +109,12 @@ func New(db *sql.DB, p Purger, opt Options) *Queue {
 // migrations holds the table, applied under the namespace "repurge"
 // (package dbmigrate).
 //
-//go:embed migrations/*.sql
+//go:embed migrations
 var migrations embed.FS
 
 // Init creates or migrates the table in a service's database.
 func Init(ctx context.Context, db *sql.DB) error {
-	return dbmigrate.SQLite(ctx, db, migrations, "migrations", "repurge")
+	return dbmigrate.Migrate(ctx, db, migrations, "repurge")
 }
 
 // Add queues the second purge of tags through ex, the transaction that

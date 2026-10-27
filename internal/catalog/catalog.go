@@ -227,7 +227,7 @@ func (s *Service) Handler() http.Handler {
 // Init creates or migrates the tables of §B.11.7 (migrations/), applied
 // under the namespace "catalog" (package dbmigrate).
 func (s *Service) Init(ctx context.Context, db *sql.DB) error {
-	if err := dbmigrate.SQLite(ctx, db, migrations, "migrations", "catalog"); err != nil {
+	if err := dbmigrate.Migrate(ctx, db, migrations, "catalog"); err != nil {
 		return fmt.Errorf("catalog: schema: %w", err)
 	}
 	return nil
@@ -235,7 +235,7 @@ func (s *Service) Init(ctx context.Context, db *sql.DB) error {
 
 // migrations holds the catalog's tables in the tree service's database.
 //
-//go:embed migrations/*.sql
+//go:embed migrations
 var migrations embed.FS
 
 // Rebuild recomputes acl and effective from the graph. Frozen rows of

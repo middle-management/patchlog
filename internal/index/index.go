@@ -255,7 +255,7 @@ func (ix *Index) Origin() string { return ix.origin }
 // migrations holds the index's tables but for text (initSchema), applied
 // under the namespace "index" (package dbmigrate).
 //
-//go:embed migrations/*.sql
+//go:embed migrations
 var migrations embed.FS
 
 // resetStmts empty what a rebuild replays (cdn_repurge stays). text, made
@@ -276,7 +276,7 @@ var likeCreate = []string{
 }
 
 func (ix *Index) initSchema(ctx context.Context) error {
-	if err := dbmigrate.SQLite(ctx, ix.db, migrations, "migrations", "index"); err != nil {
+	if err := dbmigrate.Migrate(ctx, ix.db, migrations, "index"); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
 	if err := ix.sealed.Init(ctx); err != nil {

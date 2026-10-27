@@ -320,7 +320,7 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 }
 
 func (s *Service) init(ctx context.Context) error {
-	if err := dbmigrate.SQLite(ctx, s.db, migrations, "migrations", "tree"); err != nil {
+	if err := dbmigrate.Migrate(ctx, s.db, migrations, "tree"); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
 	}
 	if err := s.sealed.Init(ctx); err != nil {

@@ -45,7 +45,7 @@ import (
 // catalog hook's are applied by their packages under namespaces of their
 // own.
 //
-//go:embed migrations/*.sql
+//go:embed migrations
 var migrations embed.FS
 
 // resetStmts empty what a rebuild replays (cdn_repurge and edge_subjects

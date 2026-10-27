@@ -19,9 +19,6 @@ var migrations embed.FS
 const migrationNamespace = "patchlog"
 
 // migrate brings the schema up to date.
-func migrate(ctx context.Context, db *sql.DB, pg bool) error {
-	if pg {
-		return dbmigrate.Postgres(ctx, db, migrations, "migrations/postgres", migrationNamespace)
-	}
-	return dbmigrate.SQLite(ctx, db, migrations, "migrations/sqlite", migrationNamespace)
+func migrate(ctx context.Context, db *sql.DB) error {
+	return dbmigrate.Migrate(ctx, db, migrations, migrationNamespace)
 }

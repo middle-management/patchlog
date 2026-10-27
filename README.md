@@ -3861,16 +3861,20 @@ whose default collation isn't byte order).
 
 Every database's schema is a series of
 [mmmigrate](https://github.com/middle-management/mmmigrate) migrations, kept by the package that
-owns the tables, in its `migrations` directory (`internal/dbmigrate`):
+owns the tables, in its `migrations` directory, one subdirectory per dialect it runs on
+(`internal/dbmigrate`, whose `Migrate` picks the dialect from the database's driver):
 
 | Directory | Namespace | Database |
 |-----------|-----------|----------|
-| `internal/core/migrations/sqlite`, `…/postgres` | `patchlog` | the core's, per dialect |
-| `internal/tree/migrations` | `tree` | the tree service's |
-| `internal/catalog/migrations` | `catalog` | the tree service's, as a catalog |
-| `internal/index/migrations` | `index` | the search index's (but its `text` table, FTS5 or a plain table depending on the SQLite build) |
-| `internal/derived/migrations` | `derived` | the tree service's and the index's (sealed views) |
-| `internal/repurge/migrations` | `repurge` | the tree service's and the index's (second CDN purges) |
+| `internal/core/migrations/sqlite`, `…/postgres` | `patchlog` | the core's |
+| `internal/tree/migrations/sqlite` | `tree` | the tree service's |
+| `internal/catalog/migrations/sqlite` | `catalog` | the tree service's, as a catalog |
+| `internal/index/migrations/sqlite` | `index` | the search index's (but its `text` table, FTS5 or a plain table depending on the SQLite build) |
+| `internal/derived/migrations/sqlite` | `derived` | the tree service's and the index's (sealed views) |
+| `internal/repurge/migrations/sqlite` | `repurge` | the tree service's and the index's (second CDN purges) |
+
+The services run on SQLite only, so their packages have no `postgres` directory; a database whose
+dialect has none is refused rather than given another dialect's SQL.
 
 They are embedded in the binary, and every start applies the ones a database lacks, in order, each
 in its own transaction, and records them per namespace (in `mmmigrate_applied`, or the
@@ -3878,8 +3882,7 @@ in its own transaction, and records them per namespace (in `mmmigrate_applied`, 
 `TestMigrations` (`internal/dbmigrate`) fails if one changed. A rebuild (`-rebuild`) empties the
 tables it replays and leaves the schema as it is.
 
-To change a schema, write the change in the directory's `current.sql` (for the core, in both
-dialects': plain SQL, safe to run twice, since tests apply it after every edit), test it
+To change a schema, write the change in the `current.sql` of each dialect's directory (plain SQL, safe to run twice, since tests apply it after every edit), test it
 (`go test ./...`, and `make test-pg` for the core), and commit it with
 `make migration DESC="what it changes"`, which commits every `current.sql` holding SQL and needs
 the `mmmigrate` CLI (`brew install middle-management/tap/mmmigrate`, or a release binary). Tests

@@ -38,7 +38,7 @@ func openPG(url string) (*sql.DB, error) {
 	db.SetMaxOpenConns(n)
 	db.SetMaxIdleConns(n)
 	ctx := context.Background()
-	if err := migrate(ctx, db, true); err != nil {
+	if err := migrate(ctx, db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}

@@ -55,7 +55,7 @@ type cacheEntry struct {
 // migrations holds the cache's tables, applied under the namespace
 // "derived" (package dbmigrate).
 //
-//go:embed migrations/*.sql
+//go:embed migrations
 var migrations embed.FS
 
 // CacheResetStmts empty the cache's tables (a service's rebuild).
@@ -76,7 +76,7 @@ func (c *Cache) Init(ctx context.Context) error {
 	if c.db == nil {
 		return nil
 	}
-	return dbmigrate.SQLite(ctx, c.db, migrations, "migrations", "derived")
+	return dbmigrate.Migrate(ctx, c.db, migrations, "derived")
 }
 
 func splitTags(tags string) map[string]bool {

@@ -56,7 +56,7 @@ func openSQLite(path string) (*sql.DB, error) {
 		db.SetMaxOpenConns(n)
 		db.SetMaxIdleConns(n)
 	}
-	if err := migrate(context.Background(), db, false); err != nil {
+	if err := migrate(context.Background(), db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}
