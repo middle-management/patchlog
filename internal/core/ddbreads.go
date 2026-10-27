@@ -2,10 +2,8 @@ package core
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -178,6 +176,11 @@ func (r *ddbReads) revRowOf(ns string, ri *ddb.RevInfo) *revRow {
 	}
 	if ri.Undoes != "" {
 		row.undoes.String, row.undoes.Valid = ri.Undoes, true
+	}
+	if ri.GrantID != "" {
+		gid, err := ids.Parse(ri.GrantID)
+		r.must(err)
+		row.grantID = gid[:]
 	}
 	ref.row = row
 	return row
@@ -480,11 +483,51 @@ func (r *ddbReads) dek(res int64, create bool) []byte              { panic(ddbUn
 func (r *ddbReads) e2eEpochOK(n *nsRow, cfg *Config, e int) bool {
 	panic(ddbUnsupported("sealed namespaces"))
 }
-func (r *ddbReads) grantRef(id []byte) map[string]any {
-	panic(ddbUnsupported("grants (" + hex.EncodeToString(id) + ")"))
+func (r *ddbReads) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
+	panic(ddbUnsupported("sealed namespaces"))
 }
-func (r *ddbReads) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
-	panic(ddbUnsupported("grants"))
+
+// --- grants ---
+
+func (r *ddbReads) grantRow(id []byte) ([]byte, *grantRoot, bool) {
+	g, err := r.s.Grant(r.ctx, ids.FromBytes(id).String())
+	r.must(err)
+	if g == nil {
+		return nil, nil, false
+	}
+	return g.Blocks, &grantRoot{sub: g.Sub, kid: g.Kid}, true
+}
+
+// recordsGrant: no bases on this backend (ddbRefusals), so the
+// namespace's own marker.
+func (r *ddbReads) recordsGrant(n *nsRow, id ids.ID) bool {
+	ok, err := r.s.RecordsGrant(r.ctx, r.nsName(n.id), id.String())
+	r.must(err)
+	return ok
+}
+
+func (r *ddbReads) nextEntryCreated(ns, seq int64) (int64, bool) {
+	k, ok := r.logs[seq]
+	if !ok {
+		panic(fmt.Errorf("ddb: unknown entry handle %d", seq))
+	}
+	le, err := r.s.EntryAt(r.ctx, k.ns, k.pos+1)
+	r.must(err)
+	if le == nil {
+		return 0, false
+	}
+	return le.Created, true
+}
+
+// ddbGateRead is gateRead on DynamoDB: f on a gate over the table's
+// reads, what they panic with returned as errors (ddbCheck).
+func (e *Engine) ddbGateRead(ctx context.Context, f func(t *gate) error) error {
+	g := &gate{checkReads: newDDBReads(e, ctx), checkState: &checkState{e: e, now: e.now()}}
+	err, perr := ddbCheck(func() error { return f(g) })
+	if perr != nil {
+		return perr
+	}
+	return err
 }
 
 // ddbCheck runs f, a gate's check, turning what its reads panic with into

@@ -7,7 +7,6 @@ package core
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -140,23 +139,11 @@ func TestDDBUnsupported(t *testing.T) {
 	check("prune", err)
 	_, err = e.Purge(ctx, Request{NS: "demo"}, "d", "", false)
 	check("purge", err)
-	_, err = e.NamespaceEvents(ctx, "demo", "", 0, Credentials{})
-	check("events", err)
 
-	// Encrypted namespaces are refused at creation.
+	// Encrypted namespaces are refused at creation: Open refuses a key
+	// store, so as on SQL without one, 422.
 	_, err = e.WriteConfig(ctx, Request{NS: "enc"}, ConfigChange{IfNoneMatch: true, Patches: patches(t, `[{"op":"add","path":"","value":{"encryption":{"level":"sealed"}}}]`)})
-	check("sealed create", err)
-}
-
-func TestDDBOpenRequiresDev(t *testing.T) {
-	endpoint := os.Getenv("DDB_ENDPOINT")
-	if endpoint == "" {
-		t.Skip("DDB_ENDPOINT not set: skipping DynamoDB Local integration test")
-	}
-	_, err := Open(Options{Path: "dynamodb://whatever?region=us-east-1&endpoint=" + endpoint})
-	if !errors.Is(err, ErrUnsupported) || !strings.Contains(err.Error(), "-dev") {
-		t.Fatalf("want the -dev requirement, got %v", err)
-	}
+	assertStatus(t, err, 422, "invalid")
 }
 
 func mustErr(t *testing.T, err error) *Error {

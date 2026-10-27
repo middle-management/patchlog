@@ -50,6 +50,17 @@ func keyHist(ns, name string, logPos uint64) Key {
 	return Key{nsPK(ns), "HIST#" + name + "#" + padPos(logPos)}
 }
 
+// keyNSGrant marks that an entry of ns records grant gid (recordsGrant
+// of core's grants.go): the grant is served under the namespace.
+func keyNSGrant(ns, gid string) Key { return Key{nsPK(ns), "GRANT#" + gid} }
+
+// keyGrant is a grant's stored, non-bearer form (§C.3), deployment-wide
+// as the SQL grants table is.
+func keyGrant(gid string) Key { return Key{"GRANT#" + gid, "#"} }
+
+// keyDeploy holds deployment-wide facts: the first entry's created time.
+func keyDeploy() Key { return Key{"#DEPLOY", "#"} }
+
 // keyNSID is the idempotency marker of a namespace log entry: one item per
 // (namespace, entry id), written with attribute_not_exists in the entry's
 // transaction (docs/DYNAMODB.md §4). Entry ids are content hashes over the

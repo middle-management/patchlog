@@ -134,6 +134,7 @@ type revRow struct {
 	gesture  string
 	undoes   string
 	logPos   uint64 // the namespace entry that committed it: the retry lookup's answer
+	grantID  string // the grant it was written under, "" for none
 }
 
 func (r *revRow) item() item {
@@ -164,6 +165,9 @@ func (r *revRow) item() item {
 	if r.logPos > 0 {
 		it["logPos"] = avN(r.logPos)
 	}
+	if r.grantID != "" {
+		it["grantId"] = avS(r.grantID)
+	}
 	return it
 }
 
@@ -188,6 +192,11 @@ type logRow struct {
 	// when served, like gesture and undoes.
 	gestures string
 	cfgPos   uint64
+	// grantID is the grant the entry was written under (§7.4), "" for
+	// none; noAuth an entry written while authentication was disabled,
+	// which serves "grant": null (§1).
+	grantID string
+	noAuth  bool
 }
 
 func (l *logRow) item() item {
@@ -211,6 +220,12 @@ func (l *logRow) item() item {
 	}
 	if l.gestures != "" {
 		it["gestures"] = avS(l.gestures)
+	}
+	if l.grantID != "" {
+		it["grantId"] = avS(l.grantID)
+	}
+	if l.noAuth {
+		it["noAuth"] = avN(1)
 	}
 	return it
 }

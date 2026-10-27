@@ -46,7 +46,7 @@ func (t *gate) purgedNS(n *nsRow) *Error {
 
 // purgedRead is purgedNS for a cacheable read, which §9 answers with the
 // long class, as any purge; Public is as for nfNS.
-func (t *tx) purgedRead(n *nsRow) *Error {
+func (t *gate) purgedRead(n *nsRow) *Error {
 	e := t.purgedNS(n)
 	public := t.cachePublic(n)
 	e.Public = &public
@@ -645,7 +645,7 @@ func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit
 // (EntryJWEs).
 func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit int, cred Credentials) (*Log, error) {
 	if e.ddb != nil {
-		return nil, ddbUnsupported("event streams")
+		return e.ddbEvents(ctx, ns, "", since, limit, cred)
 	}
 	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, "", nil)
 }
@@ -658,7 +658,7 @@ func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit in
 // namespace head, where the stream starts following.
 func (e *Engine) ResourceEvents(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
 	if e.ddb != nil {
-		return nil, ddbUnsupported("event streams")
+		return e.ddbEvents(ctx, ns, name, since, limit, cred)
 	}
 	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, name, nil)
 }

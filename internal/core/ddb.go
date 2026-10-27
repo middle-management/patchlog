@@ -1,21 +1,19 @@
 package core
 
 // The DynamoDB backend (docs/DYNAMODB.md), phase 1 of §10's path C:
-// plain namespaces, authentication disabled (-dev), one instance. The
-// seam: Open keeps a *ddbBackend on the Engine when -db is a dynamodb://
-// URL, and each Engine method of the phase-1 serving set delegates when
-// it is set — writes through the store's check hook (the gate of §6.2,
-// subset), reads mapped onto the store's items. What the phase doesn't
-// cover answers 501 rather than falling through to SQL.
+// plain namespaces, one instance. The seam: Open keeps a *ddbBackend on
+// the Engine when -db is a dynamodb:// URL, and each Engine method of the
+// phase-1 serving set delegates when it is set — writes through the gate
+// of §6.2 over the table's reads (ddbwrite.go, ddbreads.go), reads mapped
+// onto the store's items, authorised by the same gate. What the phase
+// doesn't cover answers 501 rather than falling through to SQL.
 //
-// Deliberate gaps, all surfaced as 501 "unsupported": grants and private
-// reads (writes require -dev), multi-step items, branches, purges and
-// pruning, blobs (batch sources with them), sealed and e2e namespaces,
-// $schema validation, nonce-required namespaces, gestures listing, SSE
-// events, author signatures, rate limiting, head snapshots (revisions
-// fold from the genesis). Tombstones and restores work (§8.1), and
-// batches (§7.5): single-step items, per-item failures, dry runs, an
-// optional config change, bounded by the transaction's 100 actions.
+// Deliberate gaps, all surfaced as 501 "unsupported": branches, purges
+// and pruning, blobs (batch sources with them), sealed and e2e
+// namespaces, $schema validation, nonce-required namespaces, gestures
+// listing, author signatures, head snapshots (revisions fold from the
+// genesis). Grants, edge grants, tombstones and restores, multi-step
+// items and batches (§7.5, bounded by the transaction's 100 actions) work.
 
 import (
 	"context"
@@ -26,6 +24,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/ddb"
+	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/schema"
@@ -64,9 +63,6 @@ func openDDB(opt Options) (*Engine, error) {
 	}
 	if opt.BlobDir != "" {
 		return nil, fmt.Errorf("core: blob storage: %w (DynamoDB, docs/DYNAMODB.md phase 1)", ErrUnsupported)
-	}
-	if !opt.AuthDisabled {
-		return nil, fmt.Errorf("core: authentication: %w (DynamoDB writes in -dev mode only, docs/DYNAMODB.md phase 1); run with -dev", ErrUnsupported)
 	}
 	// What it would otherwise ignore: an archive no retention loop writes,
 	// and the SQL write path's test hooks, which it never reaches — a
@@ -183,14 +179,6 @@ func ddbRefusals(cfg *Config) *Error {
 	return nil
 }
 
-// ddbAuthor is the dev-mode author (authenticate's AuthDisabled branch).
-func ddbAuthor(cred Credentials) string {
-	if cred.Author != "" {
-		return cred.Author
-	}
-	return "anonymous"
-}
-
 // ddbCommitted is the post-commit of a write: wake the namespace's live
 // readers and purge the cache tags the write's transaction would have
 // collected on SQL (t.tags: none for resource writes; ns:{ns} when a
@@ -219,30 +207,46 @@ func applyConfigPatches(doc any, exists bool, patches any) (any, *Error) {
 	return out, nil
 }
 
-// ddbBatchBodyLimit is BatchBodyLimit's bound for a ddb namespace: the
-// same formula over the configuration's batch limits (no allowances in
-// dev mode).
-func (e *Engine) ddbBatchBodyLimit(ctx context.Context, req Request) (bound, batchSize int, err error) {
-	info, err := e.ddb.store.ReadNSInfo(ctx, req.NS)
-	if err != nil {
-		return 0, 0, ddbAsErr(err)
-	}
-	if !info.Exists {
-		return 0, 0, apiErr(404, "not_found", "namespace", req.NS)
-	}
-	cfg, perr := e.ddbConfig(ctx, req.NS, info.ConfigID)
-	if perr != nil {
-		return 0, 0, perr
-	}
-	items, size := cfg.Limits.ItemsPerBatch, cfg.Limits.BatchSize
-	bound = size + size/4 + 512*items + max(cfg.Limits.PatchSetSize, cfg.Limits.DocumentSize) + 64<<10
-	return bound, size, nil
-}
-
 // --- reads ---
 
-// ddbNS guards a read's namespace and answers whether it's public.
-func (e *Engine) ddbNS(ctx context.Context, ns string) (*ddb.NSInfo, bool, *Error) {
+// ddbGrantRef is the grant reference of grant gid (grantRef).
+func (e *Engine) ddbGrantRef(ctx context.Context, gid string) (map[string]any, *Error) {
+	id, perr := ids.Parse(gid)
+	if perr != nil {
+		return nil, nil
+	}
+	var ref map[string]any
+	if err := e.ddbGateRead(ctx, func(t *gate) error {
+		ref = t.grantRef(id[:])
+		return nil
+	}); err != nil {
+		return nil, ddbAsErr(err)
+	}
+	return ref, nil
+}
+
+// ddbNS guards a read's namespace: the gate's authorisation of the
+// reader (reader, or nsReader for a read of the namespace's own URLs,
+// resource ""), as the SQL reads do; it answers whether the namespace is
+// public.
+func (e *Engine) ddbNS(ctx context.Context, ns string, cred Credentials, resource string) (*ddb.NSInfo, bool, *Error) {
+	var public bool
+	if err := e.ddbGateRead(ctx, func(t *gate) error {
+		n := t.nsByName(ns)
+		if n == nil {
+			return t.absentNS(ns, cred)
+		}
+		var err *Error
+		if resource != "" {
+			_, err = t.reader(n, cred, resource)
+		} else {
+			_, err = t.nsReader(n, cred)
+		}
+		public = t.config(n.configSeq).Read == "public"
+		return asErr(err)
+	}); err != nil {
+		return nil, false, ddbAsErr(err)
+	}
 	info, err := e.ddb.store.ReadNSInfo(ctx, ns)
 	if err != nil {
 		return nil, false, ddbAsErr(err)
@@ -253,19 +257,11 @@ func (e *Engine) ddbNS(ctx context.Context, ns string) (*ddb.NSInfo, bool, *Erro
 	if info.Purged {
 		return nil, false, apiErr(410, "purged", "namespace", ns)
 	}
-	cfg, perr := e.ddbConfig(ctx, ns, info.ConfigID)
-	if perr != nil {
-		return nil, false, perr
-	}
-	public := cfg.Read == "public"
-	if !public && !e.opt.AuthDisabled {
-		return nil, false, ddbUnsupported("private reads (grants)")
-	}
 	return info, public, nil
 }
 
 func (e *Engine) ddbResourceHead(ctx context.Context, ns, name string, cred Credentials) (*Head, error) {
-	_, public, err := e.ddbNS(ctx, ns)
+	_, public, err := e.ddbNS(ctx, ns, cred, name)
 	if err != nil {
 		return nil, err
 	}
@@ -293,7 +289,7 @@ func (e *Engine) ddbResourceHead(ctx context.Context, ns, name string, cred Cred
 }
 
 func (e *Engine) ddbResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
-	_, public, err := e.ddbNS(ctx, ns)
+	_, public, err := e.ddbNS(ctx, ns, cred, name)
 	if err != nil {
 		return nil, err
 	}
@@ -347,7 +343,7 @@ func (e *Engine) ddbResourceRaw(ctx context.Context, ns, name, id string, cred C
 }
 
 func (e *Engine) ddbResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
-	_, public, err := e.ddbNS(ctx, ns)
+	_, public, err := e.ddbNS(ctx, ns, cred, name)
 	if err != nil {
 		return nil, err
 	}
@@ -393,13 +389,18 @@ func (e *Engine) ddbResourceLog(ctx context.Context, ns, name, id, since string,
 	}
 	out := &Log{Status: 200, Public: public, Last: since, More: more}
 	for _, re := range entries {
-		// LogEntry.value's shape: dev-mode writes carry no grant, so
-		// resource entries serve none (only namespace entries mark
-		// no_auth with "grant": null).
+		// LogEntry.value's shape: a resource entry serves its grant's
+		// reference, or none (only namespace entries mark no_auth with
+		// "grant": null).
 		le := LogEntry{
 			ID: re.ID, Parent: re.ParentID, Kind: re.Kind, Patches: re.Patches,
 			Author: re.Author, Created: formatTime(re.Created),
 			Gesture: re.Gesture, Undoes: re.Undoes,
+		}
+		if re.GrantID != "" {
+			if le.Grant, err = e.ddbGrantRef(ctx, re.GrantID); err != nil {
+				return nil, err
+			}
 		}
 		out.Entries = append(out.Entries, le.value())
 		out.Last = re.ID
@@ -408,10 +409,41 @@ func (e *Engine) ddbResourceLog(ctx context.Context, ns, name, id, since string,
 }
 
 func (e *Engine) ddbNamespaceLog(ctx context.Context, ns, id, since string, limit int, cred Credentials) (*Log, error) {
-	_, public, err := e.ddbNS(ctx, ns)
+	_, public, err := e.ddbNS(ctx, ns, cred, "")
 	if err != nil {
 		return nil, err
 	}
+	return e.ddbLog(ctx, ns, id, since, limit, public)
+}
+
+// ddbEvents is NamespaceEvents, and ResourceEvents for resource name
+// (namespaceLog's perEntry reads): the namespace log, for a resource only
+// the entries naming it, which need read on it alone.
+func (e *Engine) ddbEvents(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
+	info, public, err := e.ddbNS(ctx, ns, cred, name)
+	if err != nil {
+		return nil, err
+	}
+	if name != "" && since == "" {
+		return &Log{Status: 200, Public: public, Last: info.HeadID}, nil
+	}
+	lg, lerr := e.ddbLog(ctx, ns, "", since, limit, public)
+	if lerr != nil || name == "" {
+		return lg, lerr
+	}
+	var keep []map[string]any
+	for _, m := range lg.Entries {
+		if m["resource"] == name {
+			keep = append(keep, m)
+		}
+	}
+	lg.Entries = keep
+	return lg, nil
+}
+
+// ddbLog reads the namespace log for a reader already authorised.
+func (e *Engine) ddbLog(ctx context.Context, ns, id, since string, limit int, public bool) (*Log, error) {
+	var err *Error
 	entries, next, derr := e.ddb.store.ReadLog(ctx, ns, id, since, limit)
 	if derr != nil {
 		var de *ddb.Error
@@ -421,17 +453,36 @@ func (e *Engine) ddbNamespaceLog(ctx context.Context, ns, id, since string, limi
 		return nil, ddbAsErr(derr)
 	}
 	out := &Log{Status: 200, Public: public, Last: since}
-	for _, e := range entries {
-		e["grant"] = nil // dev mode: entries serve "grant": null (§1)
-		out.Entries = append(out.Entries, e)
-		out.Last = e["id"].(string)
+	var refs map[ddb.GrantID]map[string]any
+	for _, le := range entries {
+		if gid, ok := le["grant"].(ddb.GrantID); ok {
+			// The grant reference (grantRef), or none if the grant isn't
+			// stored.
+			ref, seen := refs[gid]
+			if !seen {
+				if ref, err = e.ddbGrantRef(ctx, string(gid)); err != nil {
+					return nil, err
+				}
+				if refs == nil {
+					refs = map[ddb.GrantID]map[string]any{}
+				}
+				refs[gid] = ref
+			}
+			if ref != nil {
+				le["grant"] = ref
+			} else {
+				delete(le, "grant")
+			}
+		}
+		out.Entries = append(out.Entries, le)
+		out.Last = le["id"].(string)
 	}
 	out.More = next != ""
 	return out, nil
 }
 
 func (e *Engine) ddbNamespaceHead(ctx context.Context, ns string, cred Credentials) (*NSInfo, error) {
-	info, public, err := e.ddbNS(ctx, ns)
+	info, public, err := e.ddbNS(ctx, ns, cred, "")
 	if err != nil {
 		return nil, err
 	}
@@ -439,7 +490,7 @@ func (e *Engine) ddbNamespaceHead(ctx context.Context, ns string, cred Credentia
 }
 
 func (e *Engine) ddbNamespaceRev(ctx context.Context, ns, id string, cred Credentials) (*NSInfo, error) {
-	_, public, err := e.ddbNS(ctx, ns)
+	_, public, err := e.ddbNS(ctx, ns, cred, "")
 	if err != nil {
 		return nil, err
 	}
@@ -457,7 +508,7 @@ func (e *Engine) ddbNamespaceRev(ctx context.Context, ns, id string, cred Creden
 }
 
 func (e *Engine) ddbNamespaceHeads(ctx context.Context, ns, nsID, after string, cred Credentials) (*HeadsPage, error) {
-	_, public, err := e.ddbNS(ctx, ns)
+	_, public, err := e.ddbNS(ctx, ns, cred, "")
 	if err != nil {
 		return nil, err
 	}

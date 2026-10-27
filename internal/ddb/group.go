@@ -202,7 +202,7 @@ func (s *Store) groupWorker(ns string, q *nsQueue) {
 func (q *nsQueue) take(limit int) []*groupMember {
 	first := q.queue[0]
 	group := []*groupMember{first}
-	acts, size := txShared+first.c.actions(), first.c.bytes()
+	acts, size := txShared+first.c.txActions(), first.c.bytes()
 	names := map[string]bool{}
 	for _, n := range first.names() {
 		names[n] = true
@@ -210,13 +210,13 @@ func (q *nsQueue) take(limit int) []*groupMember {
 	rest := q.queue[:0:0]
 	for _, w := range q.queue[1:] {
 		fits := len(group) < limit && w.c.CfgPos == first.c.CfgPos &&
-			acts+w.c.actions() <= maxTxActions && size+w.c.bytes() <= groupBytes
+			acts+w.c.txActions() <= maxTxActions && size+w.c.bytes() <= groupBytes
 		for _, n := range w.names() {
 			fits = fits && !names[n]
 		}
 		if fits {
 			group = append(group, w)
-			acts, size = acts+w.c.actions(), size+w.c.bytes()
+			acts, size = acts+w.c.txActions(), size+w.c.bytes()
 			for _, n := range w.names() {
 				names[n] = true
 			}

@@ -28,12 +28,9 @@ type PrincipalAnswer struct {
 // authentication disabled (§1) there is no grant: principal and kid are
 // left out, as from envelopes (§6.4.1), and every verb is allowed.
 func (e *Engine) Principal(ctx context.Context, ns string, cred Credentials) (*PrincipalAnswer, error) {
-	if e.ddb != nil {
-		return nil, ddbUnsupported("principal lookup (grants)")
-	}
 	cred.Edge = nil
 	var ans *PrincipalAnswer
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNSOp(ns, cred, true)
@@ -66,7 +63,7 @@ func (e *Engine) Principal(ctx context.Context, ns string, cred Credentials) (*P
 // operatorPrincipal verifies g against the deployment operator keys when
 // its root kid names one (§C.4), once the namespace's keys refused it with
 // nerr. The operator's refusal wins for a kid the namespace doesn't list.
-func (t *tx) operatorPrincipal(g *grant.Grant, n *nsRow, cfg *Config, nerr *Error) (*actor, *Error) {
+func (t *gate) operatorPrincipal(g *grant.Grant, n *nsRow, cfg *Config, nerr *Error) (*actor, *Error) {
 	kid := g.Blocks[0].Kid
 	if _, ok := findKey(t.operatorKeys(), kid); !ok {
 		return nil, nerr
@@ -83,7 +80,7 @@ func (t *tx) operatorPrincipal(g *grant.Grant, n *nsRow, cfg *Config, nerr *Erro
 
 // principalBody is the §7.4 answer for a verified grant v (nil with
 // authentication disabled) under the configuration cfg.
-func (t *tx) principalBody(v *grant.Verified, cfg *Config) map[string]any {
+func (t *gate) principalBody(v *grant.Verified, cfg *Config) map[string]any {
 	can, roles := []any{}, []any{}
 	out := map[string]any{}
 	if v == nil {
@@ -128,7 +125,7 @@ func (t *tx) principalBody(v *grant.Verified, cfg *Config) map[string]any {
 // namespace whose configuration is cfg: the document's, over the
 // deployment's defaults and within its maximums, which hold alone for the
 // deployment-only limits.
-func (t *tx) limitsInForce(cfg *Config) map[string]any {
+func (t *gate) limitsInForce(cfg *Config) map[string]any {
 	l, max := cfg.Limits, t.e.opt.Maximums
 	l.LogPageSize, l.LogPageBytes, l.BranchDepth, l.ExchangeRate = max.LogPageSize, max.LogPageBytes, max.BranchDepth, max.ExchangeRate
 	l.RulesPerGrant = t.rulesPerGrant(cfg)

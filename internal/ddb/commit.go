@@ -36,7 +36,7 @@ const maxTxActions = 100
 // MaxBatchItems is the most single-step items a batch is sure to fit in
 // one transaction, a config change's actions included: docs/DYNAMODB.md
 // §10's lowered ItemsPerBatch.
-const MaxBatchItems = (maxTxActions - txShared - (commitShared - 1) - 2) / 4
+const MaxBatchItems = (maxTxActions - txShared - (commitShared - 1) - 2 - 1) / 4
 
 // commitShared are a commit's actions beyond its items' and its config
 // change's: the entry, the tip move, the entry's marker.
@@ -64,6 +64,11 @@ type Commit struct {
 	Kind            string
 	Gesture, Undoes string
 	Gestures        any
+	// Grant is the id of the grant the write was made under (§7.4), ""
+	// for none; its stored form is PutGrant's. NoAuth is a write made
+	// while authentication was disabled: its entry serves "grant": null.
+	Grant  string
+	NoAuth bool
 }
 
 // CommitConfig is a config change: the configuration it makes.
@@ -110,7 +115,7 @@ type CommitResult struct {
 // returns ErrStale. With group commit, a write without a config change
 // commits in its namespace's group (group.go).
 func (s *Store) Commit(ctx context.Context, c *Commit) (*CommitResult, error) {
-	if acts := c.actions() + txShared; acts > maxTxActions {
+	if acts := c.txActions() + txShared; acts > maxTxActions {
 		return nil, apiErr(413, "limit", "limit", "itemsPerBatch", "measured", acts, "max", maxTxActions,
 			"message", "the batch's transaction exceeds 100 actions")
 	}
@@ -183,6 +188,16 @@ func (c *Commit) actions() int {
 	return n
 }
 
+// txActions counts the actions c adds to a transaction: its own, and the
+// grant's namespace marker, which a transaction writes once however many
+// of its commits record the grant (grantMarks).
+func (c *Commit) txActions() int {
+	if c.Grant != "" {
+		return c.actions() + 1
+	}
+	return c.actions()
+}
+
 // lastLive is the item's last revision step, nil if all are tombstones.
 func (it *CommitItem) lastLive() *CommitStep {
 	for i := len(it.Steps) - 1; i >= 0; i-- {
@@ -227,6 +242,7 @@ func (s *Store) buildCommits(ns string, cs []*Commit, t tip) ([]types.TransactWr
 			pos: prev.headPos + 1, id: ids.Hash(prevID, body).String(), prevPos: prev.headPos,
 			kind: c.Kind, body: string(body), author: c.Author, created: c.Created,
 			gesture: c.Gesture, undoes: c.Undoes, cfgPos: c.CfgPos,
+			grantID: c.Grant, noAuth: c.NoAuth,
 		}
 		if c.Gestures != nil {
 			entry.gestures = string(jsonv.Canonical(c.Gestures))
@@ -238,6 +254,7 @@ func (s *Store) buildCommits(ns string, cs []*Commit, t tip) ([]types.TransactWr
 		res = append(res, &CommitResult{NSID: entry.id, Pos: entry.pos, Created: c.Created})
 		prev = tip{headPos: entry.pos, headID: entry.id}
 	}
+	out = append(out, s.grantMarks(ns, cs, res)...)
 	out = append(out, types.TransactWriteItem{Update: &types.Update{
 		TableName:        &s.Table,
 		Key:              keyAV(keyTip(ns)),
@@ -260,6 +277,32 @@ func (s *Store) buildCommits(ns string, cs []*Commit, t tip) ([]types.TransactWr
 		}})
 	}
 	return out, res, nil
+}
+
+// grantMarks are the namespace markers of the grants cs record, one per
+// grant (a transaction can't touch an item twice), each keeping the first
+// entry that records it. Unconditional: they never cancel a transaction,
+// so classifyCancel's layout ignores them.
+func (s *Store) grantMarks(ns string, cs []*Commit, res []*CommitResult) []types.TransactWriteItem {
+	var out []types.TransactWriteItem
+	seen := map[string]bool{}
+	for i, c := range cs {
+		if c.Grant == "" || seen[c.Grant] {
+			continue
+		}
+		seen[c.Grant] = true
+		out = append(out, grantMark(s.Table, ns, c.Grant, res[i].Pos))
+	}
+	return out
+}
+
+func grantMark(table, ns, gid string, pos uint64) types.TransactWriteItem {
+	return types.TransactWriteItem{Update: &types.Update{
+		TableName:                 &table,
+		Key:                       keyAV(keyNSGrant(ns, gid)),
+		UpdateExpression:          strptr("SET firstPos = if_not_exists(firstPos, :p)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":p": avN(pos)},
+	}}
 }
 
 // changesConfig reports whether one of cs changes the configuration (a
@@ -334,7 +377,7 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 	for i := range it.Steps {
 		st := &it.Steps[i]
 		pos++
-		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos}
+		r := revRow{pos: pos, id: st.ID, parentID: st.ParentID, author: c.Author, created: c.Created, gesture: st.Gesture, undoes: st.Undoes, logPos: entry.pos, grantID: c.Grant}
 		if st.Tombstone {
 			r.kind = "tombstone"
 		} else {

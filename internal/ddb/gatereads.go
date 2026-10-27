@@ -172,6 +172,8 @@ type EntryRow struct {
 	Undoes   string
 	Gestures string
 	CfgPos   uint64
+	GrantID  string
+	NoAuth   bool
 }
 
 // EntryAt reads ns's log entry at pos; nil when there is none.
@@ -184,7 +186,7 @@ func (s *Store) EntryAt(ctx context.Context, ns string, pos uint64) (*EntryRow, 
 	return &EntryRow{
 		Pos: i.n("pos"), ID: i.s("id"), Kind: i.s("kind"), Body: i.s("body"), Author: i.s("author"),
 		Created: int64(i.n("created")), Gesture: i.s("gesture"), Undoes: i.s("undoes"), Gestures: i.s("gestures"),
-		CfgPos: i.n("cfgPos"),
+		CfgPos: i.n("cfgPos"), GrantID: i.s("grantId"), NoAuth: i.n("noAuth") != 0,
 	}, nil
 }
 

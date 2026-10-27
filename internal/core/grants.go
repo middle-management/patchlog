@@ -56,13 +56,10 @@ type GrantDoc struct {
 
 // Grant serves a grant recorded in ns (§C.3.1).
 func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*GrantDoc, error) {
-	if e.ddb != nil {
-		return nil, ddbUnsupported("grants")
-	}
 	var out *GrantDoc
 	var job *sealJob
 	var nsRowID int64
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -154,13 +151,11 @@ func (t *tx) recordsGrant(n *nsRow, id ids.ID) bool {
 
 // storedGrant reads and parses the stored form of grant id, decrypting it
 // if it is stored encrypted at rest (§E.1).
-func (t *tx) storedGrant(id ids.ID) (*grant.Grant, bool) {
-	var blocks []byte
-	err := t.QueryRow(`SELECT blocks FROM grants WHERE id = ?`, id[:]).Scan(&blocks)
-	if errors.Is(err, sql.ErrNoRows) {
+func (t *gate) storedGrant(id ids.ID) (*grant.Grant, bool) {
+	blocks, _, ok := t.grantRow(id[:])
+	if !ok {
 		return nil, false
 	}
-	t.must(err)
 	if isSealed(string(blocks)) {
 		plain, err := openRow(t.dek(grantsDEK, false), grantAAD(id[:]), blocks)
 		if err != nil {

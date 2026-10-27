@@ -48,7 +48,7 @@ func patches(v string) any { return jsonv.MustParse([]byte(v)) }
 
 func mustCreateNS(t testing.TB, s *Store, ns string) (cfgID, nsID string) {
 	t.Helper()
-	cfgID, nsID, err := s.CreateNamespace(context.Background(), ns, "test", patches(`[{"op":"add","path":"","value":{}}]`))
+	cfgID, nsID, err := s.CreateNamespace(context.Background(), &Create{NS: ns, Author: "test", Patches: patches(`[{"op":"add","path":"","value":{}}]`)})
 	if err != nil {
 		t.Fatalf("CreateNamespace: %v", err)
 	}

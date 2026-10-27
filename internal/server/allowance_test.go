@@ -20,8 +20,10 @@ func batchOf(prefix string, n int) map[string]any {
 // §6.6 allowances: a named principal gets its own rate and batch limits.
 func TestAllowances(t *testing.T) {
 	t.Parallel()
+	// Under every backend's own maximum (DynamoDB's is 23, a
+	// transaction's actions).
 	max := core.DefaultLimits()
-	max.ItemsPerBatch = 50
+	max.ItemsPerBatch = 22
 	f := newAuthFixture(t, map[string]any{
 		"limits": map[string]any{
 			"itemsPerBatch":    2,
@@ -56,7 +58,7 @@ func TestAllowances(t *testing.T) {
 	expectCode(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: f.issuerG,
 		body: ops(op("replace", "/allowances/0/bucket/rate", 1000))}), 403, "forbidden")
 	expectCode(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: f.adminG,
-		body: ops(op("replace", "/allowances/0/itemsPerBatch", 51))}), 422, "limit")
+		body: ops(op("replace", "/allowances/0/itemsPerBatch", 23))}), 422, "limit")
 	expectCode(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: f.adminG,
 		body: ops(op("replace", "/allowances/0/batchSize", "lots"))}), 422, "invalid")
 	// Sizes are integers in bytes (§6.6): the "1 MiB" form is refused.
@@ -68,7 +70,7 @@ func TestAllowances(t *testing.T) {
 	expectCode(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: f.adminG,
 		body: ops(op("replace", "/allowances/0/bucket", map[string]any{"rate": 100}))}), 422, "invalid")
 	expect(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: f.adminG,
-		body: ops(op("replace", "/allowances/0/itemsPerBatch", 50))}), 201)
+		body: ops(op("replace", "/allowances/0/itemsPerBatch", 22))}), 201)
 
 	// Size limits are integers in bytes; units are refused.
 	cid = e.configID("sec", f.adminG)

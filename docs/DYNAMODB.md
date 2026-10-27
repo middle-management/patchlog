@@ -479,8 +479,8 @@ Phase 1 of §10's path C is implemented and wired in, behind the `-db`
 URL scheme:
 
 ```sh
-patchlog -dev -db 'dynamodb://patchlog?region=eu-west-1'          # AWS
-patchlog -dev -db 'dynamodb://spike?region=us-east-1&endpoint=http://localhost:8000'
+patchlog -db 'dynamodb://patchlog?region=eu-west-1'          # AWS
+patchlog -db 'dynamodb://spike?region=us-east-1&endpoint=http://localhost:8000'
 ```
 
 The table is pre-created (PAY_PER_REQUEST is fine) with the key schema of
@@ -498,7 +498,7 @@ What landed, beyond the spike:
   carry (it only hands them back). What the backend doesn't store reads
   as empty where nothing of the kind can exist (branches, draft copies,
   schema uses, horizons), and as **501 "unsupported"** where a request
-  needs a feature it lacks (blobs, sealed/e2e keys, grants, `$schema`
+  needs a feature it lacks (blobs, sealed/e2e keys, `$schema`
   namespaces, archives, reads at an earlier entry) — so those refusals
   are the reads', not hand-written checks. `gate_test.go` guards the
   embedding that makes this work on SQL (a read missing on `*tx` would
@@ -512,18 +512,32 @@ What landed, beyond the spike:
   `ErrStale` and core checks the write again from the start (D.3's
   recheck, `ddbwrite.go`); a moved tip, which no check reads, the store
   re-reads and re-chains over itself. Namespace creation is the store's
-  own transaction (`CreateNamespace`), its document checked as
-  `createNamespace` checks it.
+  own transaction (`CreateNamespace`), checked by the gate's
+  `planCreate`, which SQL's `createNamespace` runs too.
+- **Authentication.** Grants are data like the rest: the gate verifies
+  them as on SQL, and the write's grant is stored (`PutGrant`, once per
+  grant and engine, before its commit — a group's commits may share one,
+  and a transaction can't write an item twice) and recorded on the LOG
+  and REV items (`grantId`; `noAuth` on LOG for writes with
+  authentication disabled, served `"grant": null`). A per-namespace
+  marker, written once per transaction, answers
+  `GET /ns/{ns}/grants/{gid}`; `#DEPLOY` keeps the first entry's time,
+  which dates operator keys (§C.4). Reads are authorised by the same gate
+  (`reader`, `nsReader`, `absentNS`), and `Grant`, `Principal`,
+  `IssueEdgeGrants` and `BatchBodyLimit` run on it through `gateRead`. The
+  gate's grant reads were split out of their SQL (`grantRow`,
+  `recordsGrant`, `nextEntryCreated`), as `checkAt`, `grantRef` and
+  `storedGrant` became gate logic.
 - **`internal/core/ddb.go`, the seam.** `core.Open` branches on
   `ddb.IsURL(opt.Path)`; the Engine keeps a `*ddbBackend` and the write
   methods (`WriteResource`, `Batch`, `WriteConfig`) and the reads
   (`ResourceHead/Raw/Rev/Log`, `NamespaceHead/Rev/Log/Heads`,
-  `NamespaceLiveLog`, `Wait`, `Ping`, `Close`) delegate. Everything else
+  `NamespaceLiveLog`, `Namespace/ResourceEvents`, `Wait`, `Ping`,
+  `Close`) delegate, or run on the gate (`gateRead`). Everything else
   the server can reach answers 501 rather than falling through to SQL:
-  branches, purges and pruning, blobs, sealed/e2e, grants (`Grant`,
-  `Principal`, `Keys`, `IssueEdgeGrants`), gestures listing, event
-  streams, author signatures (which the gate would verify but the commit
-  doesn't store), remote branches, retention, sweeps, rotation. Refused
+  branches, purges and pruning, blobs, sealed/e2e, gestures listing,
+  author signatures (which the gate would verify but the commit doesn't
+  store), remote branches, retention, sweeps, rotation. Refused
   configurations (`encryption`, `nonce: required`, `signatures:
   required`, `base`, `successor`) are 501 at create and change time, as
   §10 prescribes ("refuse at Open or at namespace-config time").
@@ -532,7 +546,8 @@ What landed, beyond the spike:
   denormalized `cfgPos` (the `ns_log.config_seq` of the SQL schema);
   `/heads` serves `created`/`size`/`digest` off the RES item's head
   metadata, and at an earlier entry from the history rows; log entries
-  serve `grant: null` in `-dev`, with gestures merged in unhashed (§7.4).
+  serve their grant's reference (or `null`, written with authentication
+  disabled), with gestures merged in unhashed (§7.4).
 - **Errors in the core's body shape** (`{"code": …}`), so the HTTP layer
   serves either backend alike.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
@@ -552,15 +567,14 @@ The gate's extraction came first, behind no behaviour change on SQLite
 and Postgres; then DynamoDB's reads and commit replaced the seam's own
 copy of the checks (`ddbGate`, `ddbDraw`, the store's write planning),
 which is where nearly every divergence the API suites found had come
-from. Features now arrive as data: authentication is storing grants and
-keys and answering their reads (`checkAt`, `grantRef`), `$schema` is
-answering `schemaNS`, branches `resolve` at an earlier entry and
-`ancestry` across foreign parents, blobs their four reads.
+from. Features now arrive as data: authentication was storing grants and
+answering their reads (above); `$schema` is answering `schemaNS`,
+branches `resolve` at an earlier entry and `ancestry` across foreign
+parents, blobs their four reads.
 
-Requirements and limits, by design: `-dev` (writes need authentication
-disabled; reads of non-`public` namespaces are 501), one instance (no
-stream invalidation — §6 is phase 3), no background loops (retention,
-sweeps, rotation, remote follow don't start).
+Requirements and limits, by design: one instance (no stream
+invalidation — §6 is phase 3), no background loops (retention, sweeps,
+rotation, remote follow don't start).
 
 Tests: the API-level suites are backend-agnostic. Every test server —
 the server package's HTTP harness, and `clienttest`'s, which the client,
@@ -574,23 +588,41 @@ PATCHLOG_TEST_BACKEND=dynamodb DDB_ENDPOINT=http://localhost:8000 go test ./...
 runs them on DynamoDB Local, a fresh table each, as `PATCHLOG_TEST_PG`
 runs them on Postgres; CI's `dynamodb` job does. What the backend hasn't
 built skips without per-test annotations: `core.Open` refusing an option
-with `core.ErrUnsupported` (authentication, encryption at rest, blobs,
-archives, the SQL write path's hooks), or a `501 {"code":"unsupported"}`
+with `core.ErrUnsupported` (encryption at rest, blobs, archives, the
+SQL write path's hooks), or a `501 {"code":"unsupported"}`
 answer on the test's own goroutine. Tests that run and answer
 differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
-backend's to-do list. At the time of writing, of the suites' 1,009
-top-level tests: 306 pass on DynamoDB and 703 skip — 589 as unsupported
-(232 for authentication, 114 encryption at rest, 72 branches, 65
-`$schema`, 34 blobs, …), and 114 meeting an unsupported feature inside a
-service (mostly the dav gateway's principal lookup), where no skip can
-reach. No test answers differently from the SQL backends: the list's
-divergences section is empty. A test that skips partway has asserted
-everything before its skip, so the phase-1 surface is covered beyond the
-306.
+backend's to-do list. At the time of writing, of the repository's
+1,329 top-level tests (pure unit tests included): 819 pass on DynamoDB
+and 510 skip — 443 as unsupported (115 encryption at rest, 100
+branches, 85 `$schema`, 40 blobs, 37 purges, …), 36 on their own
+conditions, and 31 meeting blobs inside a service (the dav gateway's
+raw files), where no skip can reach. No test answers differently from
+the SQL backends: the list's divergences section is empty. A test that
+skips partway has asserted everything before its skip, so the phase-1
+surface is covered beyond the 819.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on
 `DDB_ENDPOINT`, and the full suite passes with and without it — the SQL
 backends are untouched when `e.ddb` is nil.
+
+### Toward a separate module
+
+The goal is a core that doesn't import the AWS SDK: the DynamoDB backend
+becomes its own Go module, which a build links in to serve
+`dynamodb://`. Until then the work keeps to the shape that move needs:
+
+- AWS-specific code lives only in `internal/ddb` and core's adapter
+  files (`ddb.go`, `ddbreads.go`, `ddbwrite.go`); the rest of core
+  depends on the gate and its read interface, never on the store.
+- The move takes the adapter files into the module, so core exports what
+  they use: `checkReads` (and the row types it returns, or narrower
+  ones), the gate's entry points (`checkItems`, `planConfig`,
+  `planCreate`, the readers), the write plan, and the error shape.
+- `core.Open`'s branch on the URL becomes a registry (a backend
+  registers its scheme), and the Engine's `e.ddb != nil` dispatches (43
+  today) a backend interface, which the SQL path implements as now.
+

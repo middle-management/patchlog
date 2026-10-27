@@ -515,7 +515,7 @@ func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 // authorizeTaken authorises a create of an existing namespace, before its
 // 412: an operator grant may create namespaces (§C.4), and otherwise the
 // caller needs config on the namespace itself.
-func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
+func (t *gate) authorizeTaken(n *nsRow, req Request) *Error {
 	if keys := t.operatorKeys(); len(keys) > 0 {
 		if a, err := t.authenticate(n.name, nil, nil, req.Cred, keys); err == nil && (a.verified == nil || a.star) {
 			return nil
@@ -530,8 +530,21 @@ func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
 
 // createNamespace bootstraps a namespace with an operator key (§C.4).
 func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error) {
+	a, doc, cfg, err := t.planCreate(req, cc)
+	if err != nil {
+		return nil, err
+	}
+	nn, id, nsID := t.insertNamespace(req.NS, cc.Patches, doc, cfg.Frozen, t.actorID(a))
+	t.sealedConfigWritten(nn, nil, cfg)
+	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: id.String()}, nil
+}
+
+// planCreate checks a namespace's creation: the name, an operator's
+// credentials, the document. It returns the creating actor and the
+// namespace's document and configuration.
+func (t *gate) planCreate(req Request, cc ConfigChange) (*actor, any, *Config, *Error) {
 	if !ValidNSName(req.NS) {
-		return nil, badInput("invalid namespace name")
+		return nil, nil, nil, badInput("invalid namespace name")
 	}
 	keys := t.operatorKeys()
 	if keys == nil {
@@ -539,38 +552,36 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	}
 	a, aerr := t.authenticate(req.NS, nil, nil, req.Cred, keys)
 	if aerr != nil {
-		return nil, aerr
+		return nil, nil, nil, aerr
 	}
 	if a.verified != nil && !a.star {
-		return nil, forbidden("creating a namespace needs a deployment operator key")
+		return nil, nil, nil, forbidden("creating a namespace needs a deployment operator key")
 	}
 	ops, err := patch.Parse(cc.Patches)
 	if err != nil {
-		return nil, patchErr(err)
+		return nil, nil, nil, patchErr(err)
 	}
 	doc, _, err := patch.Apply(nil, false, ops, patch.Options{})
 	if err != nil {
-		return nil, patchErr(err)
+		return nil, nil, nil, patchErr(err)
 	}
 	cfg, perr := t.e.newConfig(doc, nil, nil)
 	if perr != nil {
-		return nil, perr
+		return nil, nil, nil, perr
 	}
 	if aerr := t.e.checkArchives(cfg); aerr != nil {
-		return nil, aerr
+		return nil, nil, nil, aerr
 	}
 	if cfg.Base != nil {
-		return nil, invalid("branches are created with POST /ns/{base}/branches")
+		return nil, nil, nil, invalid("branches are created with POST /ns/{base}/branches")
 	}
 	if err := t.checkEncryption(nil, cfg, -1); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	if cfg.Successor != "" {
-		return nil, invalid("a new namespace cannot have a successor")
+		return nil, nil, nil, invalid("a new namespace cannot have a successor")
 	}
-	nn, id, nsID := t.insertNamespace(req.NS, cc.Patches, doc, cfg.Frozen, t.actorID(a))
-	t.sealedConfigWritten(nn, nil, cfg)
-	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: id.String()}, nil
+	return a, doc, cfg, nil
 }
 
 // insertNamespace inserts a new non-branch namespace with its config genesis

@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/middle-management/patchlog/internal/ddb"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
@@ -68,6 +69,10 @@ func (e *Engine) ddbWriteItems(ctx context.Context, req Request, items []Item, c
 		if cerr != nil {
 			return nil, cerr
 		}
+		if c.Grant, err = e.ddbStoreGrant(ctx, p.a); err != nil {
+			return nil, err
+		}
+		c.NoAuth = p.a.noAuth
 		cres, err := e.ddb.store.Commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
 			continue
@@ -87,6 +92,7 @@ func (e *Engine) ddbWriteItems(ctx context.Context, req Request, items []Item, c
 		}
 		if !p.isBatch {
 			res.Entry = ddbStepEntry(c, &c.Items[0], len(c.Items[0].Steps)-1)
+			res.Entry.Grant = grantRefOf(p.a.grant)
 		}
 		e.ddbCommitted(req.NS, tags...)
 		return res, nil
@@ -160,7 +166,7 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 }
 
 // ddbStepEntry is a committed step's resource log entry, as a write
-// answers it (logEntry of resolve.go): -dev writes carry no grant.
+// answers it (logEntry of resolve.go), less its grant (grantRefOf).
 func ddbStepEntry(c *ddb.Commit, it *ddb.CommitItem, j int) *LogEntry {
 	st := it.Steps[j]
 	le := &LogEntry{ID: st.ID, Parent: st.ParentID, Kind: "rev", Author: c.Author, Created: formatTime(c.Created), Gesture: st.Gesture, Undoes: st.Undoes}
@@ -177,6 +183,9 @@ func ddbStepEntry(c *ddb.Commit, it *ddb.CommitItem, j int) *LogEntry {
 // planConfig (writeConfig of nsops.go).
 func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChange) (res *WriteResult, err error) {
 	if cc.IfNoneMatch {
+		if remoteBaseIn(cc.Patches) {
+			return nil, ddbUnsupported("branches")
+		}
 		return e.ddbCreateNamespace(ctx, req, cc)
 	}
 	ctx, span := e.dbSpan(ctx, "core.db.update")
@@ -187,6 +196,7 @@ func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChang
 		type planned struct {
 			n   *nsRow
 			cur *Config
+			a   *actor
 			p   *configPlan
 			err error
 		}
@@ -205,7 +215,7 @@ func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChang
 				return planned{err: err}
 			}
 			p, err := g.planConfig(n, cur, a, &cc, false)
-			return planned{n, cur, p, err}
+			return planned{n, cur, a, p, err}
 		})
 		switch {
 		case perr != nil:
@@ -219,8 +229,12 @@ func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChang
 		if err := ddbRefusals(p.cfg); err != nil {
 			return nil, err
 		}
+		gid, err := e.ddbStoreGrant(ctx, out.a)
+		if err != nil {
+			return nil, err
+		}
 		c := &ddb.Commit{
-			NS: req.NS, Author: ddbAuthor(req.Cred), Created: g.now.UnixMilli(),
+			NS: req.NS, Author: out.a.id(), Created: g.now.UnixMilli(), Grant: gid, NoAuth: out.a.noAuth,
 			CfgPos: r.cfgs[n.configSeq].pos, CfgID: r.cfgRow(n.configSeq).ID,
 			Config: &ddb.CommitConfig{ID: p.id.String(), Patches: string(p.canon), Doc: string(jsonv.Canonical(p.doc)), Frozen: p.cfg.Frozen},
 			Entry:  map[string]any{"kind": "config", "target": p.id.String()}, Kind: "config",
@@ -245,33 +259,84 @@ func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChang
 	return nil, apiErr(409, "conflict", "detail", "the namespace's configuration kept moving")
 }
 
-// ddbCreateNamespace is PUT /ns/{ns} (insertNamespace): the store's own
-// creation transaction, the document checked as createNamespace checks
-// it, less what this backend refuses.
-func (e *Engine) ddbCreateNamespace(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error) {
-	if err := checkConfigGestures(&cc); err != nil {
-		return nil, err
+// ddbCreateNamespace is PUT /ns/{ns} with If-None-Match: * (writeConfig's
+// create path): checked by the gate as createNamespace checks it, less
+// what this backend refuses, then the store's creation transaction.
+func (e *Engine) ddbCreateNamespace(ctx context.Context, req Request, cc ConfigChange) (res *WriteResult, err error) {
+	g := &gate{checkReads: newDDBReads(e, ctx), checkState: &checkState{e: e, now: e.now(), write: true}}
+	type planned struct {
+		a   *actor
+		err *Error
 	}
-	if !ValidNSName(req.NS) {
-		return nil, badInput("invalid namespace name")
-	}
-	doc, perr := applyConfigPatches(nil, false, cc.Patches)
-	if perr != nil {
+	out, perr := ddbCheck(func() planned {
+		if n := g.nsForWrite(req.NS); n != nil {
+			// The name is taken (writeConfig): 412 to whoever may know.
+			if err := g.authorizeTaken(n, req); err != nil {
+				return planned{err: err}
+			}
+			return planned{err: apiErr(412, "stale", "config", g.configID(n.configSeq).String())}
+		}
+		a, _, cfg, err := g.planCreate(req, cc)
+		if err == nil {
+			err = ddbRefusals(cfg)
+		}
+		if err == nil {
+			err = checkConfigGestures(&cc)
+		}
+		return planned{a, err}
+	})
+	switch {
+	case perr != nil:
 		return nil, perr
+	case out.err != nil:
+		return nil, out.err
 	}
-	cfg, perr := e.newConfig(doc, nil, nil)
-	if perr != nil {
-		return nil, perr
-	}
-	if err := ddbRefusals(cfg); err != nil {
+	grantID, err := e.ddbStoreGrant(ctx, out.a)
+	if err != nil {
 		return nil, err
 	}
 	sctx, span := e.dbSpan(ctx, "core.db.update")
-	cfgID, nsID, err := e.ddb.store.CreateNamespace(sctx, req.NS, ddbAuthor(req.Cred), cc.Patches)
-	endDBSpan(span, err)
+	defer func() { endDBSpan(span, err) }()
+	cfgID, nsID, err := e.ddb.store.CreateNamespace(sctx, &ddb.Create{
+		NS: req.NS, Author: out.a.id(), Patches: cc.Patches,
+		Grant: grantID, NoAuth: out.a.noAuth,
+	})
 	if err != nil {
 		return nil, ddbAsErr(err)
 	}
 	e.ddbCommitted(req.NS)
 	return &WriteResult{Status: 201, NSID: nsID, ConfigID: cfgID, Entry: &LogEntry{Gesture: cc.Gesture, Undoes: cc.Undoes}}, nil
+}
+
+// grantRefOf is the grant reference an entry written under g serves
+// (grantRef of grantref.go), nil for none.
+func grantRefOf(g *grant.Grant) map[string]any {
+	if g == nil || len(g.Blocks) == 0 {
+		return nil
+	}
+	return map[string]any{"id": g.ID().String(), "sub": g.Blocks[0].Sub, "kid": g.Blocks[0].Kid}
+}
+
+// ddbStoreGrant stores the grant a write is made under (storeGrant of
+// write.go), before its commit (ddb.Store.PutGrant), and returns its id:
+// "" for none. A grant whose root the engine has cached (grantRoots,
+// which holds stored grants only) is stored already.
+func (e *Engine) ddbStoreGrant(ctx context.Context, a *actor) (string, error) {
+	if a == nil || a.grant == nil {
+		return "", nil
+	}
+	id := a.grant.ID()
+	gid := id.String()
+	if _, ok := e.grantRoots.get(id); ok {
+		return gid, nil
+	}
+	sg := ddb.StoredGrant{Blocks: a.grant.Stored()}
+	if len(a.grant.Blocks) > 0 {
+		sg.Sub, sg.Kid = a.grant.Blocks[0].Sub, a.grant.Blocks[0].Kid
+	}
+	if err := e.ddb.store.PutGrant(ctx, gid, sg); err != nil {
+		return "", ddbAsErr(err)
+	}
+	e.grantRoots.put(id, grantRoot{sub: sg.Sub, kid: sg.Kid})
+	return gid, nil
 }

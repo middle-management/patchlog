@@ -99,9 +99,6 @@ func (e *Engine) EdgeGrantsOffered() error {
 // exchanged, as they would follow "Bearer " (§C.5.2). None is 401; the
 // server keeps their number within MaxEdgeGrants.
 func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGrants, error) {
-	if e.ddb != nil {
-		return nil, ddbUnsupported("edge grants")
-	}
 	if err := e.EdgeGrantsOffered(); err != nil {
 		return nil, err
 	}
@@ -123,7 +120,7 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 	}
 	out := &EdgeGrants{Now: e.now()}
 	col := &edgeCollect{seen: map[string]bool{}}
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		t.decoded = map[string]*grant.Grant{}
 		for i, g := range gs {
 			if g != nil {
@@ -216,7 +213,7 @@ func (c *edgeCollect) add(eg EdgeGrant) bool {
 // order its root block names namespaces (§C.5.2), and adds them to col,
 // each with g's exp. It returns the key of g's principal's buckets, as a
 // write's are keyed (§6.6), and the first refusal of the lowest rank.
-func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) (string, *Error) {
+func (t *gate) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) (string, *Error) {
 	var exp time.Time
 	for _, b := range g.Blocks {
 		if b.Exp != nil && (exp.IsZero() || b.Exp.Before(exp)) {
@@ -286,7 +283,7 @@ type edgeIssue struct {
 }
 
 // edgeGrant decides g's edge grants in namespace ns (§C.5.2).
-func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue, *Error) {
+func (t *gate) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue, *Error) {
 	n := t.nsByName(ns)
 	if n == nil {
 		return nil, t.absentNS(ns, cred)

@@ -34,7 +34,7 @@ type checkReads interface {
 	baseIdentity(n *nsRow) string
 	batchEntry(n *nsRow, seq, author int64) (ids.ID, string, bool)
 	branchesOf(n *nsRow) []*nsRow
-	checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error
+	nextEntryCreated(ns, seq int64) (int64, bool)
 	config(seq int64) *Config
 	configByID(n *nsRow, id ids.ID) (seq, author int64, ok bool)
 	configEntryGestures(seq int64) (string, bool)
@@ -46,7 +46,9 @@ type checkReads interface {
 	entriesTo(row *revRow) []int64
 	e2eEpochOK(n *nsRow, cfg *Config, e int) bool
 	firstEntryOfConfig(n *nsRow, seq int64) (int64, bool)
-	grantRef(id []byte) map[string]any
+	grantRow(id []byte) (blocks []byte, root *grantRoot, ok bool)
+	recordsGrant(n *nsRow, id ids.ID) bool
+	grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob
 	horizonID(res int64) string
 	locate(segs []segment, id ids.ID) (int, *revRow)
 	lockNS(ns int64, mode lockMode)
@@ -114,3 +116,14 @@ func newTx(sqlTx *sql.Tx, ctx context.Context, e *Engine, write bool) *tx {
 }
 
 var _ checkReads = (*tx)(nil)
+
+// gateRead runs f on a gate over the store's reads, outside any write:
+// the read transaction's gate on SQL, DynamoDB's reads otherwise
+// (ddbGateRead). An Engine method whose body needs only the gate's logic
+// and reads runs on every backend this way.
+func (e *Engine) gateRead(ctx context.Context, f func(t *gate) error) error {
+	if e.ddb != nil {
+		return e.ddbGateRead(ctx, f)
+	}
+	return e.read(ctx, func(t *tx) error { return f(t.gate) })
+}

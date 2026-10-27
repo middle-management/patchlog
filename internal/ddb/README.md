@@ -2,8 +2,7 @@
 
 The DynamoDB backend of docs/DYNAMODB.md: the key design of §3, the
 transactions of §4, wired into `internal/core` for phase 1 of §10's path
-C (plain namespaces, `-dev`, one instance — the integration status is
-§13). It reuses the production id scheme (`internal/ids`), canonical JSON
+C (plain namespaces, one instance — the integration status is §13). It reuses the production id scheme (`internal/ids`), canonical JSON
 (`internal/jsonv`) and patch engine (`internal/patch`), so the bytes it
 hashes and folds are the production bytes.
 
@@ -14,7 +13,9 @@ config change, the namespace entry — conditioned on those heads and the
 configuration in force, `ErrStale` when they moved; `CreateNamespace`
 is its own transaction. The gate's reads (gatereads.go: `Namespace`,
 `ConfigAt`, `ConfigByID`, `Resource`, `RevAt`, `ReadRevOf`, `DocAt`,
-`EntryAt`, `EntryPos`) are what core/ddbreads.go answers the gate with.
+`EntryAt`, `EntryPos`, and grants.go's `Grant`, `RecordsGrant`) are
+what core/ddbreads.go answers the gate with; `PutGrant` stores a write's
+grant, `FirstEntryTime` dates the operator keys (§C.4).
 Serving reads: `ReadHead`, `ReadLog` (paged, id cursors, upper bounds),
 `ReadRevByID` (GSI1), `FoldResource` (crossing tombstones: the restore
 applies to the last live document), `ResourceLog`, `ListHeads`,
@@ -80,8 +81,13 @@ commit: the `-grouped` benchmarks keep rising with writers instead.
 
 ## Simplifications (all deliberate)
 
-- The scope is plain namespaces: no grants, blobs, branches, purges,
-  sealed/e2e, or the S3 offload of large values. What the scope doesn't
+- The scope is plain namespaces: no blobs, branches, purges, sealed/e2e,
+  or the S3 offload of large values. Grants are stored (grants.go): each
+  once, before the commits that record it, outside their transactions (a
+  group's commits may share one); a namespace marker per grant, written
+  once per transaction, answers GET /ns/{ns}/grants/{gid}; LOG and REV
+  items carry `grantId`, and LOG items `noAuth` for writes made with
+  authentication disabled. What the scope doesn't
   cover is refused (501) by core's reads or seam, not silently dropped.
 - A commit is bounded by the 100-action transaction budget, which lowers
   the deployment's `ItemsPerBatch` to `MaxBatchItems` (23) —

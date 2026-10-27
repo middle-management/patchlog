@@ -142,9 +142,14 @@ func (e *Engine) firstEntryTime(ctx context.Context) (time.Time, error) {
 		return e.firstEntry, nil
 	}
 	var ms sql.NullInt64
-	err := e.read(ctx, func(t *tx) error {
-		return t.QueryRow(`SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms)
-	})
+	var err error
+	if e.ddb != nil {
+		ms.Int64, ms.Valid, err = e.ddb.store.FirstEntryTime(ctx)
+	} else {
+		err = e.read(ctx, func(t *tx) error {
+			return t.QueryRow(`SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms)
+		})
+	}
 	if err != nil {
 		return time.Time{}, err
 	}

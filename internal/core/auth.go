@@ -335,7 +335,7 @@ func (t *gate) effectiveRevoked(n *nsRow, cfg *Config) map[string]bool {
 // some point within maxLag before the grant was issued (or later). maxLag
 // is the target namespace's (default 60 seconds), or the key's when that
 // is stricter.
-func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
+func (t *gate) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 	return func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 		target := n
 		if s, ok := requireAt.(string); ok {
@@ -363,8 +363,8 @@ func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxL
 		if !ok {
 			return fmt.Errorf("at is not in the chain of %s", target.name)
 		}
-		var nextMs int64
-		if err := t.QueryRow(`SELECT created FROM ns_log WHERE ns = ? AND prev_seq = ?`, target.id, seq).Scan(&nextMs); err != nil {
+		nextMs, ok := t.nextEntryCreated(target.id, seq)
+		if !ok {
 			return nil // at is still the head
 		}
 		next := time.UnixMilli(nextMs)
@@ -374,6 +374,16 @@ func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxL
 		}
 		return nil
 	}
+}
+
+// nextEntryCreated is the created time of the entry of ns after entry
+// seq; false if seq is the head.
+func (t *tx) nextEntryCreated(ns, seq int64) (int64, bool) {
+	var ms int64
+	if err := t.QueryRow(`SELECT created FROM ns_log WHERE ns = ? AND prev_seq = ?`, ns, seq).Scan(&ms); err != nil {
+		return 0, false
+	}
+	return ms, true
 }
 
 // basicEnvelope is the envelope of step 1 and of reads.

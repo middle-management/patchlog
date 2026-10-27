@@ -369,10 +369,7 @@ func (t *gate) batchLimits(cfg *Config, a *actor) (items, size int) {
 // which reveals nothing about any item (§7.5). The batch itself
 // authenticates again.
 func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (bound, batchSize int, err error) {
-	if e.ddb != nil {
-		return e.ddbBatchBodyLimit(ctx, req)
-	}
-	err = e.read(ctx, func(t *tx) error {
+	err = e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(req.NS)
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)

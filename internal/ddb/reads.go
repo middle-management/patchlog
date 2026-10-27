@@ -30,6 +30,7 @@ type RevInfo struct {
 	Gesture  string
 	Undoes   string
 	LogPos   uint64 // the namespace entry that committed it (0: unknown)
+	GrantID  string // the grant it was written under, "" for none
 }
 
 // ReadRevByID finds a revision of a namespace by its id (the revisions_by_id
@@ -153,6 +154,7 @@ type ResLogEntry struct {
 	Created  int64
 	Gesture  string
 	Undoes   string
+	GrantID  string
 }
 
 // ResourceLog reads a resource's revisions in chain order after position
@@ -196,6 +198,7 @@ func (s *Store) ResourceLog(ctx context.Context, ns, name string, from, to uint6
 				Created:  int64(i.n("created")),
 				Gesture:  i.s("gesture"),
 				Undoes:   i.s("undoes"),
+				GrantID:  i.s("grantId"),
 			}
 			if re.Pos != last+1 {
 				return nil, false, apiErr(409, "conflict", "detail", "gap in the revision chain")

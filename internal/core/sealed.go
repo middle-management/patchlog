@@ -105,7 +105,7 @@ func epochAAD(ns int64, epoch int) []byte {
 // cachePublic reports whether a namespace's responses use the public cache
 // classes of §9: public namespaces, and sealed and e2e ones whatever their
 // read mode (§E.2.5): they only ever serve ciphertext.
-func (t *tx) cachePublic(n *nsRow) bool { return t.config(n.configSeq).cachePublic() }
+func (t *gate) cachePublic(n *nsRow) bool { return t.config(n.configSeq).cachePublic() }
 
 // cachePublic reports whether a namespace with this document uses the
 // public cache classes (see tx.cachePublic).

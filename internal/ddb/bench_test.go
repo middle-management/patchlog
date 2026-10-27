@@ -71,7 +71,7 @@ func benchStores(b *testing.B, n int) []*Store {
 	var stores []*Store
 	for i := range n {
 		ns := fmt.Sprintf("ns%d", i)
-		if _, _, err := s.CreateNamespace(context.Background(), ns, "bench", patches(`[{"op":"add","path":"","value":{}}]`)); err != nil {
+		if _, _, err := s.CreateNamespace(context.Background(), &Create{NS: ns, Author: "bench", Patches: patches(`[{"op":"add","path":"","value":{}}]`)}); err != nil {
 			b.Fatal(err)
 		}
 		stores = append(stores, s)

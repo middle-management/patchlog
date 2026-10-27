@@ -20,6 +20,7 @@ type API interface {
 	GetItem(ctx context.Context, in *dynamodb.GetItemInput, opt ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
 	BatchGetItem(ctx context.Context, in *dynamodb.BatchGetItemInput, opt ...func(*dynamodb.Options)) (*dynamodb.BatchGetItemOutput, error)
 	Query(ctx context.Context, in *dynamodb.QueryInput, opt ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
+	PutItem(ctx context.Context, in *dynamodb.PutItemInput, opt ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
 	TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, opt ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
 	DescribeTable(ctx context.Context, in *dynamodb.DescribeTableInput, opt ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error)
 }
@@ -44,10 +45,22 @@ func (s *Store) now() time.Time {
 	return time.Now()
 }
 
+// Create is a namespace's creation, as core's checks decided it. Patches
+// is the decoded JSON Patch set producing the namespace document.
+type Create struct {
+	NS, Author      string
+	Patches         any
+	Gesture, Undoes string
+	// Grant and NoAuth are Commit's.
+	Grant  string
+	NoAuth bool
+}
+
 // CreateNamespace bootstraps a namespace with its config genesis and first
-// log entry (insertNamespace of nsops.go). patches is the decoded JSON
-// Patch set producing the namespace document.
-func (s *Store) CreateNamespace(ctx context.Context, ns, author string, patches any) (cfgID, nsID string, err error) {
+// log entry (insertNamespace of nsops.go).
+
+func (s *Store) CreateNamespace(ctx context.Context, c *Create) (cfgID, nsID string, err error) {
+	ns, author, patches := c.NS, c.Author, c.Patches
 	doc, _, err := applyPatches(nil, false, patches)
 	if err != nil {
 		return "", "", patchErr(err)
@@ -57,13 +70,18 @@ func (s *Store) CreateNamespace(ctx context.Context, ns, author string, patches 
 	body := jsonv.Canonical(map[string]any{"kind": "config", "target": cfg.String()})
 	entryID := ids.Hash(nil, body)
 	now := s.now().UnixMilli()
-	entry := logRow{pos: 1, id: entryID.String(), kind: "config", body: string(body), author: author, created: now, cfgPos: 1}
+	entry := logRow{pos: 1, id: entryID.String(), kind: "config", body: string(body), author: author, created: now, cfgPos: 1,
+		grantID: c.Grant, noAuth: c.NoAuth, gesture: c.Gesture, undoes: c.Undoes}
 	meta := &nsMeta{configPos: 1, configID: cfg.String()}
 
-	_, err = s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-		// buildCreateTx's action order: 0 #META, 1 CFG, 2 LOG, 3 #TIP, 4 NSID.
-		TransactItems: buildCreateTx(s.Table, ns, meta, cfg.String(), string(canon), string(jsonv.Canonical(doc)), entry),
-	})
+	// buildCreateTx's action order: 0 #META, 1 CFG, 2 LOG, 3 #TIP, 4 NSID;
+	// then the deployment's first entry time and the grant's marker.
+	acts := buildCreateTx(s.Table, ns, meta, cfg.String(), string(canon), string(jsonv.Canonical(doc)), entry)
+	acts = append(acts, deployFirst(s.Table, now))
+	if c.Grant != "" {
+		acts = append(acts, grantMark(s.Table, ns, c.Grant, 1))
+	}
+	_, err = s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: acts})
 	if err != nil {
 		var ce *types.TransactionCanceledException
 		if errors.As(err, &ce) && len(ce.CancellationReasons) > 0 {
@@ -140,8 +158,13 @@ func (s *Store) ReadHead(ctx context.Context, ns, name string) (*HeadInfo, error
 }
 
 // LogEntry is a served namespace log entry (namespaceLog of reads.go):
-// the hashed body merged with id, prev, author and created.
+// the hashed body merged with id, prev, author and created. Its "grant"
+// is a GrantID the caller resolves to the grant reference, nil for an
+// entry written while authentication was disabled, absent for none.
 type LogEntry map[string]any
+
+// GrantID is a grant's id in text form (§C.3).
+type GrantID string
 
 // ReadLog pages the namespace log (§7.1, spike shape): entries after
 // since ("" for the start), at most limit; next is the cursor for the
@@ -220,6 +243,12 @@ func (s *Store) ReadLog(ctx context.Context, ns, at, since string, limit int) (e
 		}
 		if gs := i.s("gestures"); gs != "" {
 			e["gestures"], _ = jsonv.Parse([]byte(gs))
+		}
+		switch {
+		case i.s("grantId") != "":
+			e["grant"] = GrantID(i.s("grantId"))
+		case i.n("noAuth") != 0:
+			e["grant"] = nil
 		}
 		idsByPos[pos] = e["id"].(string)
 		if prev := i.n("prevPos"); prev > 0 {
@@ -364,5 +393,6 @@ func scanRevInfo(i item) RevInfo {
 		Gesture:  i.s("gesture"),
 		Undoes:   i.s("undoes"),
 		LogPos:   i.n("logPos"),
+		GrantID:  i.s("grantId"),
 	}
 }
