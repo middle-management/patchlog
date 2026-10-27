@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"runtime"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "modernc.org/sqlite"
+
 	"github.com/middle-management/patchlog/internal/dbmigrate"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
-	_ "modernc.org/sqlite"
 )
 
 // migrations holds the schema, one directory per dialect, applied under
@@ -19,7 +21,7 @@ import (
 //go:embed migrations
 var migrations embed.FS
 
-// openDB opens the database: a Postgres URL (pgschema.go), or a SQLite
+// openDB opens the database: a Postgres URL (openPG), or a SQLite
 // file or ":memory:".
 //
 // In SQLite, secure_delete zeroes deleted and overwritten content, so a
@@ -68,6 +70,29 @@ func openSQLite(path string) (*sql.DB, error) {
 	if err := dbmigrate.Migrate(context.Background(), db, migrations, "patchlog"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
+	}
+	return db, nil
+}
+
+// openPG opens a Postgres database and creates or migrates its schema.
+func openPG(url string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", url)
+	if err != nil {
+		return nil, err
+	}
+	n := 4 * runtime.GOMAXPROCS(0)
+	db.SetMaxOpenConns(n)
+	db.SetMaxIdleConns(n)
+	ctx := context.Background()
+	if err := dbmigrate.Migrate(ctx, db, migrations, "patchlog"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating schema: %w", err)
+	}
+	// cache_gen's one row (tailer.go), on every open: a database emptied
+	// of rows keeps its schema, and the migrations don't run again.
+	if _, err := db.ExecContext(ctx, `INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING`); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return db, nil
 }

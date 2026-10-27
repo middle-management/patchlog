@@ -647,7 +647,7 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   [Schema migrations](#schema-migrations)), in whatever schema the URL's user defaults to (add
   `search_path=…` to the URL for another); the record of applied migrations is kept in a schema
   `mmmigrate`, so the user needs `CREATE` on the database the first time. It
-  mirrors the SQLite layout (`internal/core/pgschema.go`): bigint identity keys, 20-byte
+  mirrors the SQLite layout (`internal/core/migrations`, the types in `internal/core/dialect.go`): bigint identity keys, 20-byte
   `bytea` ids, canonical JSON in `text` (never `jsonb`, which would change the bytes ids are
   computed over), integer millisecond timestamps. Patch sets, head and intermediate snapshots
   and grants are `bytea`, because encryption at rest stores binary rows there.

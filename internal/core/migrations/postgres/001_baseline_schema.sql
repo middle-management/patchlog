@@ -1,7 +1,7 @@
 -- Migration: baseline schema
--- Created: 2026-10-27T07:41:22Z
--- Checksum: 2a90e7c06ed3dd6b57fdc73680538ee0a71e2417ba247291b2c314167fbed2e5
--- Chain: 5fc4e3c95aa42b2fa15378ae88c584c650f8bde71dc0506c180b1ad35af61542
+-- Created: 2026-10-27T08:51:51Z
+-- Checksum: 40fa62f117d3b36d0d329ea7152c02af1b6fa00836a3f9c400c700f2385d83da
+-- Chain: 2d7674250adf336d545274355fb0bd4e6045df4333213368929cb076519ae3bf
 --
 -- IMPORTANT: Do not modify this file after commit. The checksum above
 -- tracks the integrity of this migration. Any changes will be detected
@@ -9,7 +9,7 @@
 --
 
 -- The layout of the SQLite schema on Postgres (Addendum D.8; see
--- pgschema.go for how the types differ).
+-- dialect.go for how the types differ).
 --
 -- IF NOT EXISTS throughout: a database created before migrations were
 -- tracked (v0.22.0) already has all of it, and is adopted as is.

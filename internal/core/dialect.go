@@ -17,7 +17,20 @@ import (
 // with ? placeholders; on Postgres the tx wrapper (stmts.go) rewrites them
 // to $1..$n. What differs:
 //
-//   - the schema (migrations/sqlite and migrations/postgres, pgschema.go);
+//   - the schema (migrations/sqlite and migrations/postgres). The tables,
+//     columns and constraints are the same, so every query runs on both;
+//     the types differ. On Postgres integer keys are bigint identities,
+//     flags and small codes smallint (not boolean: queries compare them
+//     with 0 and 1 on both dialects); hashes are bytea, checked to be 20
+//     bytes; canonical JSON is text, never jsonb, which would reorder keys
+//     and normalise numbers: ids are served and re-hashed from exactly the
+//     stored bytes (§3.1). The columns that hold an encrypted row when
+//     encryption at rest is on (crypt.go: revisions.patches, heads.doc,
+//     snapshots.doc, grants.blocks) are bytea, which keeps the plaintext's
+//     bytes just as exactly. Timestamps stay integer Unix milliseconds, as
+//     in SQLite. Patch sets stay in revisions rather than in a table of
+//     their own (D.8 "content apart from the skeleton"): purge and pruning
+//     set them to NULL, and vacuum reclaims the space;
 //   - placeholders, and bool arguments, which Postgres won't coerce into
 //     the smallint flag columns the two schemas share;
 //   - values that are canonical JSON or, encrypted at rest, binary
