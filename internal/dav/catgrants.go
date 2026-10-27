@@ -60,10 +60,17 @@ type svcKind struct {
 // derived reports whether catalog cat's tree service is a catalog service
 // (§B.11): one that answers POST /grants, which a tree service without
 // §B.11 refuses (405, GET and HEAD only). A tree service that can't be
-// asked for now is the error.
+// asked for now is the error. Over a core with authentication disabled
+// no tree is: every request there counts as holding a * key (§1), so the
+// user's X-Author reads and writes the content namespace itself, as
+// through a plain tree service, and a user's token has no grant a
+// catalog service could issue against (POST /grants needs one).
 func (st *reqState) derived(ctx context.Context, cat string) (bool, error) {
 	base := st.s.treeURL(cat)
 	if base == "" {
+		return false, nil
+	}
+	if off, de := st.s.authOff(ctx); de == nil && off {
 		return false, nil
 	}
 	now := st.s.opt.Now()
