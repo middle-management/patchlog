@@ -1050,6 +1050,11 @@ implements the default the plan states.
     only a client holding the keys can carry the content over, sealed again with new ids.
   - The importer counts the `from` of each `copy` on the bundle's side when looking for
     conflicts, as a merge does for a branch (§F.3, §G.4.4), and accepts a dry run's `201`.
+  - Export refuses to write unsealed, unless `Plaintext` (`-plaintext`) or `Recipients` is
+    given, an e2e namespace whose exported history from before it became end-to-end is sealed
+    content, as after a raise from `sealed`, or plaintext of a namespace whose `read` isn't
+    public (§G.5.1, §2.1, Levels): the exporter's client opens that history, so the bundle
+    carries it in plaintext under access `e2e`, as it refuses for a sealed namespace.
 - **Remote branches** (§G.3, §G.5.2, §12.1):
   - **Breaking:** a creation that fails at the base's deployment answers `502` with code
     `upstream` (was `remote`) and `origin`; what the base answers for its own URLs at creation

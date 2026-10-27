@@ -3651,7 +3651,9 @@ patchlog import -ns secret -i s.plb -identity me.jwk -atomic
 
 - **`access`** in the header records each namespace's protection: `public`, `private`, `sealed`
   or `e2e` (missing means `private`). Export refuses to write private or sealed content unsealed
-  unless `-plaintext`; `-identity` unwraps a sealed source's keys when the grant's `enc` names it.
+  unless `-plaintext`, including an e2e namespace's history from before a raise from `sealed`
+  (or from a non-public namespace), which the exporter opens into plaintext; `-identity` unwraps
+  a sealed source's keys when the grant's `enc` names it.
 - **Sealed bundles** (`application/vnd.patchlog.sealed-bundle+jsonl`): an envelope line with a
   random id and the content key HPKE-wrapped per recipient (kid: RFC 7638 thumbprint), then one
   JWE per bundle line with `pl: {bundle, line}`, the final one's `pl` carrying `last: true`
