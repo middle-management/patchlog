@@ -1072,7 +1072,6 @@ func (r *ddbReads) entryConfig(seq int64) (int64, string) {
 	return h, string(jsonv.Canonical(r.cfgRow(h).Doc))
 }
 
-
 func (r *ddbReads) allNamespaces() []*nsRow {
 	var out []*nsRow
 	for _, name := range r.nsNames() {

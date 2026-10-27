@@ -195,7 +195,6 @@ func (r *ddbReads) epochStarts(table string, ns int64, max int) []epochStart {
 	return out
 }
 
-
 // --- writes ---
 
 // storeSealed is finishSeal's storing on the table: put-if-absent, then
