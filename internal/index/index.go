@@ -47,6 +47,7 @@ import (
 	"context"
 	"crypto/ecdh"
 	"database/sql"
+	"embed"
 	"errors"
 	"fmt"
 	"log"
@@ -58,6 +59,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
@@ -250,30 +252,21 @@ func (ix *Index) FTS() bool { return ix.fts }
 // Origin is the core's canonical origin, used in hit URLs.
 func (ix *Index) Origin() string { return ix.origin }
 
-var dropStmts = []string{
-	`DROP TABLE IF EXISTS checkpoints`, `DROP TABLE IF EXISTS seen`, `DROP TABLE IF EXISTS ns_state`,
-	`DROP TABLE IF EXISTS docs`, `DROP TABLE IF EXISTS "text"`, `DROP TABLE IF EXISTS facet`, `DROP TABLE IF EXISTS "sort"`, `DROP TABLE IF EXISTS refs`,
-	derived.CacheDropStmts[0], derived.CacheDropStmts[1],
-}
+// migrations holds the index's tables but for text (initSchema), applied
+// under the namespace "index" (package dbmigrate).
+//
+//go:embed migrations
+var migrations embed.FS
 
-// createStmts: query.go names facet_q, sort_q, refs_t and the primary
-// keys' indexes (sqlite_autoindex_facet_1, _sort_1, _refs_1) in INDEXED
-// BY, which fails the query if one is missing; a table keeps its primary
-// key as its only constraint (TestOldSchemasIndexedBy).
-var createStmts = []string{
-	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
-	`CREATE TABLE IF NOT EXISTS ns_state (ns TEXT PRIMARY KEY, purged INTEGER NOT NULL DEFAULT 0)`,
-	`CREATE TABLE IF NOT EXISTS docs (docid INTEGER PRIMARY KEY, ns TEXT NOT NULL, resource TEXT NOT NULL, head TEXT NOT NULL, schema TEXT, UNIQUE (ns, resource))`,
-	`CREATE TABLE IF NOT EXISTS facet (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value TEXT NOT NULL, raw TEXT NOT NULL, PRIMARY KEY (ns, resource, path, value))`,
-	`CREATE TABLE IF NOT EXISTS "sort" (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value, raw TEXT, PRIMARY KEY (ns, resource, path))`,
-	`CREATE TABLE IF NOT EXISTS refs (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, ref TEXT NOT NULL, target_ns TEXT NOT NULL, target TEXT NOT NULL, rev TEXT, entry TEXT, PRIMARY KEY (ns, resource, path))`,
-	`CREATE INDEX IF NOT EXISTS docs_q ON docs (ns, schema)`,
-	// refs_t leads with ns: a ?ref= filter reads only the namespace's
-	// references to the target (refs_q, before, read every namespace's).
-	`DROP INDEX IF EXISTS refs_q`,
-	`CREATE INDEX IF NOT EXISTS refs_t ON refs (ns, target_ns, target, rev, entry)`,
-	`CREATE INDEX IF NOT EXISTS facet_q ON facet (ns, path, value)`,
-	`CREATE INDEX IF NOT EXISTS sort_q ON "sort" (ns, path, value)`,
+// resetStmts empty what a rebuild replays (cdn_repurge stays), in one
+// transaction. checkpoints_bootstrap too: a snapshot left part-way would
+// otherwise be resumed, not replayed from its first page. text, made by
+// initSchema rather than a migration, is dropped, so a rebuild decides
+// between FTS5 and the LIKE fallback again.
+var resetStmts = []string{
+	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM ns_state`,
+	`DELETE FROM docs`, `DROP TABLE IF EXISTS "text"`, `DELETE FROM facet`, `DELETE FROM "sort"`, `DELETE FROM refs`,
+	derived.CacheResetStmts[0], derived.CacheResetStmts[1],
 }
 
 const ftsCreate = `CREATE VIRTUAL TABLE IF NOT EXISTS "text" USING fts5(ns UNINDEXED, resource UNINDEXED, schema UNINDEXED, path UNINDEXED, body, tokenize = 'unicode61 remove_diacritics 2')`
@@ -284,56 +277,35 @@ var likeCreate = []string{
 	`CREATE INDEX IF NOT EXISTS text_doc ON "text" (docid)`,
 }
 
-func (ix *Index) initSchema(ctx context.Context) error {
-	if !ix.opt.Rebuild {
-		// A database from before v0.44 has no refs table, so its documents'
-		// references were never collected (§A.2): replay it, as a rebuild.
-		var docs, refs int
-		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'docs'`).Scan(&docs); err != nil {
-			return err
-		}
-		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'refs'`).Scan(&refs); err != nil {
-			return err
-		}
-		if docs > 0 && refs == 0 {
-			ix.opt.Logf("index: the database predates reference indexing (§A.2); rebuilding it from the logs")
-			ix.opt.Rebuild = true
-		}
-		// Before v0.46 the sort table kept no value as written, and schema
-		// documents were not indexed: replay those too.
-		var noRaw int
-		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('sort') WHERE name = 'raw'`).Scan(&noRaw); err != nil {
-			return err
-		}
-		var haveSort int
-		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sort'`).Scan(&haveSort); err != nil {
-			return err
-		}
-		if haveSort > 0 && noRaw == 0 && !ix.opt.Rebuild {
-			ix.opt.Logf("index: the database predates sort values in hits and indexed schema documents (§A.4); rebuilding it from the logs")
-			ix.opt.Rebuild = true
-		}
-	}
-	if ix.opt.Rebuild {
-		for _, s := range dropStmts {
-			if _, err := ix.db.ExecContext(ctx, s); err != nil {
-				return fmt.Errorf("index: rebuild: %w", err)
-			}
-		}
-	}
-	if err := ix.cps.Init(ctx); err != nil {
+// reset runs resetStmts.
+func (ix *Index) reset(ctx context.Context) error {
+	tx, err := ix.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	for _, s := range createStmts {
-		if _, err := ix.db.ExecContext(ctx, s); err != nil {
-			return fmt.Errorf("index: schema: %w", err)
+	defer tx.Rollback()
+	for _, q := range resetStmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return err
 		}
+	}
+	return tx.Commit()
+}
+
+func (ix *Index) initSchema(ctx context.Context) error {
+	if err := dbmigrate.Migrate(ctx, ix.db, migrations, "index"); err != nil {
+		return fmt.Errorf("index: schema: %w", err)
 	}
 	if err := ix.sealed.Init(ctx); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
 	if err := repurge.Init(ctx, ix.db); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
+	}
+	if ix.opt.Rebuild {
+		if err := ix.reset(ctx); err != nil {
+			return fmt.Errorf("index: rebuild: %w", err)
+		}
 	}
 	// An existing text table decides the mode; otherwise try FTS5.
 	var sqlText string

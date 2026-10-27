@@ -2,7 +2,7 @@ package core
 
 // Blobs (§7.8).
 //
-// Tables (db.go, pgschema.go; D.2 with additions):
+// Tables (migrations/; D.2 with additions):
 //
 //   - blobs: attachments, one row per resource and blob, with ref_seq (the
 //     first revision of the resource that referenced it) and pruned (set

@@ -1,14 +1,9 @@
 package server
 
 import (
-	"database/sql"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/middle-management/patchlog/internal/pgtest"
-	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 const (
@@ -310,61 +305,6 @@ func TestV039GesturesNotOffered(t *testing.T) {
 		t.Fatalf("public listing %d %s", r.Code, r.Body)
 	}
 	expect(t, e.get("/ns/nope/gestures/"+gA), 404)
-}
-
-// D.2 (v0.39): opening a database from before gestures adds the columns
-// and their partial indexes; old entries serve none.
-func TestV039GestureMigration(t *testing.T) {
-	t.Parallel()
-	path, driver := filepath.Join(t.TempDir(), "old.db"), "sqlite"
-	if pgtest.Enabled() {
-		path, driver = pgtest.FreshDB(t), "pgx"
-	}
-	e := newEnv(t, withPath(path))
-	e.mkNS("main", map[string]any{})
-	a := e.create("main", "a", map[string]any{})
-	e.close()
-
-	dsn := path
-	if driver == "sqlite" {
-		dsn = sqlitedsn.DSN(path, "")
-	}
-	db, err := sql.Open(driver, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, q := range []string{`DROP INDEX revisions_by_gesture`, `DROP INDEX revisions_by_undoes`,
-		`ALTER TABLE revisions DROP COLUMN gesture`, `ALTER TABLE revisions DROP COLUMN undoes`, `ALTER TABLE ns_log DROP COLUMN gestures`} {
-		if _, err := db.Exec(q); err != nil {
-			t.Fatal(q, err)
-		}
-	}
-	db.Close()
-
-	e2 := newEnv(t, withPath(path))
-	r := e2.gw("PATCH", "main", "a", a, ops(op("add", "/x", 1.0)), map[string]string{"Gesture": gA})
-	expect(t, r, 201)
-	lg := e2.get("/r/main/a/rev/" + etagOf(r) + "/log").Arr()
-	if len(lg) != 2 || lg[0].(map[string]any)["gesture"] != nil || lg[1].(map[string]any)["gesture"] != gA {
-		t.Fatalf("log %v", lg)
-	}
-	if l := e2.get("/ns/main/gestures/" + gA).Arr(); len(l) != 1 {
-		t.Fatalf("listing %v", l)
-	}
-	e2.close()
-	db, err = sql.Open(driver, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	q := `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('revisions_by_gesture', 'revisions_by_undoes')`
-	if driver == "pgx" {
-		q = `SELECT COUNT(*) FROM pg_indexes WHERE indexname IN ('revisions_by_gesture', 'revisions_by_undoes')`
-	}
-	var n int
-	if err := db.QueryRow(q).Scan(&n); err != nil || n != 2 {
-		t.Fatalf("indexes %d %v", n, err)
-	}
 }
 
 // §G.3 (v0.39): a remote branch mirrors its base's gestures with the

@@ -1,6 +1,6 @@
 # Common tasks. `make up` starts the whole stack in Docker; `make dev` runs
 # just the core server natively.
-.PHONY: help build test test-pg vet fmt check dev up up-pg down logs seed cdn-check cdn-restart clean fixture
+.PHONY: help build test test-pg vet fmt check migration dev up up-pg down logs seed cdn-check cdn-restart clean fixture
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-12s %s\n", $$1, $$2}'
@@ -25,6 +25,14 @@ fmt: ## gofmt the tree
 
 check: vet test ## vet and test, and fail on unformatted files
 	@test -z "$$(gofmt -l internal cmd)" || (gofmt -l internal cmd; exit 1)
+
+MIGRATIONS = $(sort $(dir $(wildcard internal/*/migrations/*/current.sql)))
+
+migration: ## commit each migrations directory's current.sql that holds SQL as its next numbered migration (DESC="what it changes"; needs mmmigrate on PATH)
+	@test -n "$(DESC)" || (echo 'set DESC="what the migration changes"'; exit 1)
+	@for d in $(MIGRATIONS); do \
+		mmmigrate check -migrations $$d >/dev/null 2>&1 || mmmigrate commit -migrations $$d -description "$(DESC)" -skip-verify || exit 1; \
+	done
 
 dev: ## run the core server natively in dev mode on :8080 (dev.db; dev.key enables sealed/e2e namespaces)
 	go run ./cmd/patchlog serve -dev -db dev.db -master-key dev.key -master-key-create

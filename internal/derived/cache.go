@@ -3,9 +3,12 @@ package derived
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"errors"
 	"strings"
 	"sync"
+
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 )
 
 // Stored is one sealed view as it is served: the JWE (application/jose),
@@ -49,16 +52,14 @@ type cacheEntry struct {
 	s         Stored
 }
 
-var cacheCreate = []string{
-	`CREATE TABLE IF NOT EXISTS sealed_views (view TEXT PRIMARY KEY, scope TEXT NOT NULL, at TEXT NOT NULL,
-		body BLOB NOT NULL, json INTEGER NOT NULL, tags TEXT NOT NULL)`,
-	`CREATE INDEX IF NOT EXISTS sealed_views_scope ON sealed_views (scope, at)`,
-	`CREATE TABLE IF NOT EXISTS sealed_view_tags (tag TEXT NOT NULL, view TEXT NOT NULL, PRIMARY KEY (tag, view)) WITHOUT ROWID`,
-	`CREATE INDEX IF NOT EXISTS sealed_view_tags_view ON sealed_view_tags (view)`,
-}
+// migrations holds the cache's tables, applied under the namespace
+// "derived" (package dbmigrate).
+//
+//go:embed migrations
+var migrations embed.FS
 
-// CacheDropStmts drop the cache's tables (a service's rebuild).
-var CacheDropStmts = []string{`DROP TABLE IF EXISTS sealed_views`, `DROP TABLE IF EXISTS sealed_view_tags`}
+// CacheResetStmts empty the cache's tables (a service's rebuild).
+var CacheResetStmts = []string{`DELETE FROM sealed_views`, `DELETE FROM sealed_view_tags`}
 
 // NewCache returns a cache persisting to db (nil: memory only) with an
 // in-memory front of at most max entries (default 4096). Call Init before
@@ -70,17 +71,12 @@ func NewCache(max int, db *sql.DB) *Cache {
 	return &Cache{db: db, max: max, m: map[string]cacheEntry{}}
 }
 
-// Init creates the tables.
+// Init creates or migrates the tables.
 func (c *Cache) Init(ctx context.Context) error {
 	if c.db == nil {
 		return nil
 	}
-	for _, q := range cacheCreate {
-		if _, err := c.db.ExecContext(ctx, q); err != nil {
-			return err
-		}
-	}
-	return nil
+	return dbmigrate.Migrate(ctx, c.db, migrations, "derived")
 }
 
 func splitTags(tags string) map[string]bool {

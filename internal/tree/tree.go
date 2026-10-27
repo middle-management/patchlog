@@ -61,6 +61,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/dbmigrate"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
@@ -319,39 +320,19 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 }
 
 func (s *Service) init(ctx context.Context) error {
-	if s.opt.Rebuild {
-		for _, q := range dropStmts {
-			if _, err := s.db.ExecContext(ctx, q); err != nil {
-				return fmt.Errorf("tree: rebuild: %w", err)
-			}
-		}
-	}
-	if err := s.cps.Init(ctx); err != nil {
-		return err
-	}
-	for _, q := range createStmts {
-		if _, err := s.db.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("tree: schema: %w", err)
-		}
-	}
-	// A database from before item titles (§B.5), or created times and file
-	// metadata (§H.3), which backfillFiles fills in for a file tree.
-	for _, col := range []string{"title", "created", "file"} {
-		var has int
-		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('items') WHERE name = ?`, col).Scan(&has); err != nil {
-			return fmt.Errorf("tree: schema: %w", err)
-		}
-		if has == 0 {
-			if _, err := s.db.ExecContext(ctx, `ALTER TABLE items ADD COLUMN `+col+` TEXT`); err != nil {
-				return fmt.Errorf("tree: schema: %w", err)
-			}
-		}
+	if err := dbmigrate.Migrate(ctx, s.db, migrations, "tree"); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
 	}
 	if err := s.sealed.Init(ctx); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
 	}
 	if err := repurge.Init(ctx, s.db); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
+	}
+	if s.opt.Rebuild {
+		if err := reset(ctx, s.db); err != nil {
+			return fmt.Errorf("tree: rebuild: %w", err)
+		}
 	}
 	if s.opt.Hook != nil {
 		if err := s.opt.Hook.Init(ctx, s.db); err != nil {

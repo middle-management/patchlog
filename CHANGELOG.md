@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+The schemas of the core, the tree service (with the catalog) and the search index are now
+[mmmigrate](https://github.com/middle-management/mmmigrate) migrations (README "Schema
+migrations"), applied on start and recorded in each database, instead of schema statements run on
+every start with checks for what each older version lacked. The schemas themselves are unchanged.
+
+**Changes to check before upgrading:**
+- **Databases from before v0.22.0 are no longer migrated.** Start v0.22.0 on such a database once
+  first (the core's, the tree service's and the index's alike). A database v0.22.0 created or
+  migrated is adopted as it is.
+- **Migrations are recorded in new tables:** `mmmigrate_applied` and `mmmigrate_current` on
+  SQLite, the schema `mmmigrate` on Postgres (per schema the core's tables are in, so deployments
+  in different schemas of one database stay apart). On Postgres the database user needs `CREATE`
+  on the database on every start, not only the first.
+- **A rebuild of the tree service or the index empties its tables** rather than dropping and
+  recreating them; it replays from the beginning as before.
+
 ## v0.22.0
 
 Implements spec **v0.55**. v0.53 restructures the text with no change in behaviour (terms

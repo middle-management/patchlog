@@ -3,6 +3,7 @@ package tree
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,29 +39,38 @@ import (
 //	                                 grants for, until the last of them expires (edgegrants.go);
 //	                                 meta "trusted:{ns}" is when it came to trust ns
 //	cdn_repurge(id, tags, due)       second CDN purges (package repurge), kept by a rebuild
-var createStmts = []string{
-	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
-	`CREATE INDEX IF NOT EXISTS seen_by_id ON seen (ns_id)`,
-	`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`,
-	`CREATE TABLE IF NOT EXISTS nodes (href TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, kind INTEGER NOT NULL,
-		item TEXT, item_head TEXT, title TEXT, state INTEGER NOT NULL DEFAULT 0,
-		self INTEGER NOT NULL DEFAULT 0, head TEXT, parents TEXT, access TEXT,
-		dangling TEXT, cyclic INTEGER NOT NULL DEFAULT 0, deep INTEGER NOT NULL DEFAULT 0, depth INTEGER NOT NULL DEFAULT -1,
-		item_state INTEGER NOT NULL DEFAULT 0)`,
-	`CREATE TABLE IF NOT EXISTS edges (child TEXT NOT NULL, pos INTEGER NOT NULL, parent TEXT NOT NULL, ord TEXT,
-		state INTEGER NOT NULL, PRIMARY KEY (child, pos))`,
-	`CREATE INDEX IF NOT EXISTS edges_by_parent ON edges (parent, ord, child)`,
-	`CREATE TABLE IF NOT EXISTS items (ns TEXT NOT NULL, name TEXT NOT NULL, state INTEGER NOT NULL, head TEXT, title TEXT,
-		created TEXT, file TEXT, PRIMARY KEY (ns, name)) WITHOUT ROWID`,
-	`CREATE TABLE IF NOT EXISTS self_parents (ns TEXT NOT NULL, name TEXT NOT NULL, parents TEXT NOT NULL,
-		PRIMARY KEY (ns, name)) WITHOUT ROWID`,
-	`CREATE TABLE IF NOT EXISTS edge_subjects (gs TEXT PRIMARY KEY, subjects TEXT NOT NULL, exp INTEGER NOT NULL)`,
+//
+// The tables are migrations (migrations/, package dbmigrate), applied under
+// the namespace "tree"; the sealed-view cache's, the repurge queue's and a
+// catalog hook's are applied by their packages under namespaces of their
+// own.
+//
+//go:embed migrations
+var migrations embed.FS
+
+// resetStmts empty what a rebuild replays (cdn_repurge and edge_subjects
+// stay, and so do a hook's tables, which its Rebuild recomputes), in one
+// transaction. checkpoints_bootstrap too: a snapshot left part-way would
+// otherwise be resumed, not replayed from its first page.
+var resetStmts = []string{
+	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM meta`,
+	`DELETE FROM nodes`, `DELETE FROM edges`, `DELETE FROM items`,
+	`DELETE FROM self_parents`, derived.CacheResetStmts[0], derived.CacheResetStmts[1],
 }
 
-var dropStmts = []string{
-	`DROP TABLE IF EXISTS checkpoints`, `DROP TABLE IF EXISTS seen`, `DROP TABLE IF EXISTS meta`,
-	`DROP TABLE IF EXISTS nodes`, `DROP TABLE IF EXISTS edges`, `DROP TABLE IF EXISTS items`,
-	`DROP TABLE IF EXISTS self_parents`, derived.CacheDropStmts[0], derived.CacheDropStmts[1],
+// reset runs resetStmts.
+func reset(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range resetStmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func canonJSON(v any) string {
