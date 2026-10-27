@@ -45,6 +45,8 @@ type ddbReads struct {
 	logAt   map[ddbPosKey]int64
 	// resRows are the resources read, by handle: the commit pins them.
 	resRows map[int64]*ddb.ResRow
+	// uploaderVer is the version pendingUsed read: the upload pins it.
+	uploaderVer uint64
 }
 
 type ddbNS struct {
@@ -368,11 +370,15 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 	v := &view{ns: n, name: name}
 	rr, err := r.s.Resource(r.ctx, ns, name)
 	r.must(err)
+	rh := r.resHandle(ns, name)
 	if rr == nil {
+		// No entries: a handle still, for the resource's pending blobs
+		// (an upload precedes the create that references it), as the
+		// SQL schema's resource row without a head (ensureResource).
 		v.state = NotFound
+		v.own = &resRow{id: rh, name: name}
 		return v
 	}
-	rh := r.resHandle(ns, name)
 	r.resRows[rh] = rr
 	hh := r.revHandle(ns, name, rr.HeadPos)
 	own := &resRow{id: rh, name: name, state: stateLive}
@@ -471,15 +477,11 @@ func (r *ddbReads) authorName(id int64) string { return r.authors[id] }
 // --- what this backend doesn't store ---
 
 func (r *ddbReads) archiveURL(res, seq int64) string { panic(ddbUnsupported("archives")) }
-func (r *ddbReads) attachedBlob(res int64, bid ids.ID) *blobRow {
-	panic(ddbUnsupported("blobs"))
+func (r *ddbReads) referencedUpTo(res, max int64, bid ids.ID) bool {
+	panic(ddbUnsupported("blob references in a history (branches, batch sources)"))
 }
-func (r *ddbReads) pendingBlob(res int64, bid ids.ID, uploader string, cutoff int64) *blobRow {
-	panic(ddbUnsupported("blobs"))
-}
-func (r *ddbReads) referencedUpTo(res, max int64, bid ids.ID) bool { panic(ddbUnsupported("blobs")) }
-func (r *ddbReads) declaredAt(row *revRow) []ids.ID                { panic(ddbUnsupported("e2e namespaces")) }
-func (r *ddbReads) dek(res int64, create bool) []byte              { panic(ddbUnsupported("encryption at rest")) }
+func (r *ddbReads) declaredAt(row *revRow) []ids.ID   { panic(ddbUnsupported("e2e namespaces")) }
+func (r *ddbReads) dek(res int64, create bool) []byte { panic(ddbUnsupported("encryption at rest")) }
 func (r *ddbReads) e2eEpochOK(n *nsRow, cfg *Config, e int) bool {
 	panic(ddbUnsupported("sealed namespaces"))
 }
@@ -558,4 +560,75 @@ func ddbCheck[T any](f func() T) (out T, err error) {
 		}
 	}()
 	return f(), nil
+}
+
+// --- blobs ---
+
+// ddbBlobRow is a store row as the gate's, of resource handle res.
+func ddbBlobRow(res int64, b *ddb.BlobRow) *blobRow {
+	bid, _ := ids.Parse(b.Bid)
+	return &blobRow{res: res, bid: bid, typ: b.Type, nonce: b.Nonce, size: b.Size, hash: b.Hash, pending: !b.Attachment}
+}
+
+func (r *ddbReads) attachedBlob(res int64, bid ids.ID) *blobRow {
+	k := r.res[res]
+	b, err := r.s.Attachment(r.ctx, k.ns, k.name, bid.String())
+	r.must(err)
+	if b == nil {
+		return nil
+	}
+	return ddbBlobRow(res, b)
+}
+
+func (r *ddbReads) pendingBlob(res int64, bid ids.ID, uploader string, cutoff int64) *blobRow {
+	k := r.res[res]
+	b, err := r.s.Pending(r.ctx, k.ns, k.name, bid.String(), uploader)
+	r.must(err)
+	if b == nil || b.Created < cutoff {
+		return nil
+	}
+	return ddbBlobRow(res, b)
+}
+
+// blobArchive: no archives on this backend.
+func (r *ddbReads) blobArchive(res int64, bid ids.ID) string { return "" }
+
+func (r *ddbReads) openBytes(owner int64, hash []byte) blobContent {
+	data, file, ok, err := r.s.Bytes(r.ctx, hash)
+	r.must(err)
+	if !ok {
+		panic(fmt.Errorf("blob bytes %x are missing", hash))
+	}
+	if file == "" {
+		return memContent(data)
+	}
+	f, err := r.e.blobs.open(file)
+	r.must(err)
+	return fileContent(f)
+}
+
+func (r *ddbReads) pendingUsed(n *nsRow, uploader string, cutoff, res int64, bid ids.ID) int64 {
+	// The version first: an upload committed after it moves it, and this
+	// one's PutPending fails stale.
+	ver, err := r.s.UploaderVersion(r.ctx, r.nsName(n.id), uploader)
+	r.must(err)
+	r.uploaderVer = ver
+	ps, err := r.s.PendingOf(r.ctx, r.nsName(n.id))
+	r.must(err)
+	var skip ddbResRef
+	if res != 0 {
+		skip = r.res[res]
+	}
+	var used int64
+	for _, p := range ps {
+		if p.Uploader != uploader || p.Created < cutoff || (res != 0 && p.Name == skip.name && p.Bid == bid.String()) {
+			continue
+		}
+		used += max(p.Size, pendingMin)
+	}
+	return used
+}
+
+func (r *ddbReads) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJob {
+	panic(ddbUnsupported("sealed namespaces"))
 }

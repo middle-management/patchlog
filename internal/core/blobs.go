@@ -279,7 +279,7 @@ func (r Request) anyCreds() []Credentials {
 // /r/{ns}/{name} by the rule for other namespaces (§7.5): the request's own
 // grant or any in Source-Authorization that names the namespace, verifies
 // under its keys and allows the read. A public namespace needs none.
-func (t *tx) sourceReadable(n *nsRow, name string, req Request) bool {
+func (t *gate) sourceReadable(n *nsRow, name string, req Request) bool {
 	return t.credsRead(n, name, req.anyCreds())
 }
 
@@ -755,7 +755,7 @@ func parseBlobURL(s string) (ns, name string, bid ids.ID, ok bool) {
 
 // nsRank ranks namespaces for copies, as for imports (§G.5.1): public,
 // then private and sealed alike, then e2e.
-func (t *tx) nsRank(n *nsRow) int {
+func (t *gate) nsRank(n *nsRow) int {
 	cfg := t.config(n.configSeq)
 	switch {
 	case cfg.level == levelE2E:
@@ -768,7 +768,7 @@ func (t *tx) nsRank(n *nsRow) int {
 
 // gateBlob runs an upload's checks in the order of §7.8, as far as they go
 // without the body. With draw, it draws the rate-limit tokens.
-func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw bool) (*blobGate, *Error) {
+func (t *gate) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw bool) (*blobGate, *Error) {
 	n := t.nsByName(req.NS)
 	if n == nil {
 		return nil, t.absentNS(req.NS, req.Cred)
@@ -862,27 +862,35 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 		g.pendMax = int64(cfg.Limits.BlobPending)
 	}
 	var res int64
-	if r := t.resource(n.id, name); r != nil {
-		res = r.id
+	if v := t.resolve(n, name, nil); v.own != nil {
+		res = v.own.id
 	}
-	if t.e.pg && t.write {
-		// The namespace's lock is only shared (D.8): the uploader's row
-		// orders its concurrent uploads, so their pending total is read
-		// after the other's commit (blob_uploaders).
-		_, err := t.Exec(`INSERT INTO blob_uploaders (ns, uploader) VALUES (?, ?)
-			ON CONFLICT (ns, uploader) DO UPDATE SET uploader = excluded.uploader`, n.id, g.uploader)
-		t.must(err)
-	}
-	t.must(t.QueryRow(`SELECT COALESCE(SUM(CASE WHEN p.size < ? THEN ? ELSE p.size END), 0)
-		FROM blob_pending p JOIN resources r ON r.res = p.res
-		WHERE r.ns = ? AND p.uploader = ? AND p.created >= ? AND NOT (p.res = ? AND p.bid = ?)`,
-		pendingMin, pendingMin, n.id, g.uploader, g.cutoff, res, bid[:]).Scan(&g.pendUsed))
+	g.pendUsed = t.pendingUsed(n, g.uploader, g.cutoff, res, bid)
 	if size >= 0 {
 		if err := g.checkSize(size); err != nil {
 			return nil, err
 		}
 	}
 	return g, nil
+}
+
+// pendingUsed is uploader's pending bytes in n (each at least pendingMin)
+// of entries created at or after cutoff, but res's of bid.
+func (t *tx) pendingUsed(n *nsRow, uploader string, cutoff, res int64, bid ids.ID) int64 {
+	if t.e.pg && t.write {
+		// The namespace's lock is only shared (D.8): the uploader's row
+		// orders its concurrent uploads, so their pending total is read
+		// after the other's commit (blob_uploaders).
+		_, err := t.Exec(`INSERT INTO blob_uploaders (ns, uploader) VALUES (?, ?)
+			ON CONFLICT (ns, uploader) DO UPDATE SET uploader = excluded.uploader`, n.id, uploader)
+		t.must(err)
+	}
+	var used int64
+	t.must(t.QueryRow(`SELECT COALESCE(SUM(CASE WHEN p.size < ? THEN ? ELSE p.size END), 0)
+		FROM blob_pending p JOIN resources r ON r.res = p.res
+		WHERE r.ns = ? AND p.uploader = ? AND p.created >= ? AND NOT (p.res = ? AND p.bid = ?)`,
+		pendingMin, pendingMin, n.id, uploader, cutoff, res, bid[:]).Scan(&used))
+	return used
 }
 
 // checkSize is check 5 for a body of size bytes.
@@ -899,7 +907,7 @@ func (g *blobGate) checkSize(size int64) *Error {
 // copySource finds a copy's source blob (§7.8 Copying): readable by the
 // request (or its Source-Authorization), of no higher rank than the target,
 // and one that reading would serve. Anything else is nil (404).
-func (t *tx) copySource(target *nsRow, req Request, ns, name string, bid ids.ID) *blobRow {
+func (t *gate) copySource(target *nsRow, req Request, ns, name string, bid ids.ID) *blobRow {
 	sn := t.nsByName(ns)
 	if sn == nil || sn.purged {
 		return nil
@@ -920,12 +928,12 @@ func (t *tx) copySource(target *nsRow, req Request, ns, name string, bid ids.ID)
 // UploadBlob uploads or copies a blob (§7.8). It answers 201 (nil error)
 // whether or not the bytes were stored already.
 func (e *Engine) UploadBlob(ctx context.Context, req Request, name, bidText string, up BlobUpload) error {
-	if e.ddb != nil {
-		return ddbUnsupported("blobs")
-	}
 	bid, perr := ids.Parse(bidText)
 	if perr != nil {
 		return badInput("malformed blob id")
+	}
+	if e.ddb != nil {
+		return e.ddbUploadBlob(ctx, req, name, bid, up)
 	}
 	// The checks that need no body, outside the write lock; the rate-limit
 	// tokens are drawn here, once.
@@ -938,23 +946,9 @@ func (e *Engine) UploadBlob(ctx context.Context, req Request, name, bidText stri
 	if err != nil {
 		return err
 	}
-	var data []byte
-	if up.From == "" {
-		data, err = io.ReadAll(io.LimitReader(up.Body, g.maxSize+1))
-		if err != nil {
-			return badInput("could not read the body")
-		}
-		if err := g.checkSize(int64(len(data))); err != nil {
-			return err
-		}
-		if extra := int64(len(data)) - min(max(up.Length, 0), g.maxSize+1); extra > 0 {
-			d := g.rate[len(g.rate)-1]
-			d.cost = float64(extra)
-			e.rate.charge(e.now(), d)
-		}
-		if ids.Blob(g.typ, g.nonce, data) != bid {
-			return apiErr(422, "blob_mismatch", "message", "the body doesn't hash to the blob id (§3.7)")
-		}
+	data, err := e.readUpload(g, &up, bid)
+	if err != nil {
+		return err
 	}
 	return e.update(ctx, func(t *tx) error {
 		g, gerr := t.gateBlob(req, name, bid, &up, false)
@@ -1007,6 +1001,31 @@ func (e *Engine) UploadBlob(ctx context.Context, req Request, name, bidText stri
 	})
 }
 
+// readUpload reads an upload's body (none for a copy) once the checks
+// that need none passed: check 5 on its size, the bytes beyond the
+// declared length charged, the hash checked against the blob id.
+func (e *Engine) readUpload(g *blobGate, up *BlobUpload, bid ids.ID) ([]byte, error) {
+	if up.From != "" {
+		return nil, nil
+	}
+	data, err := io.ReadAll(io.LimitReader(up.Body, g.maxSize+1))
+	if err != nil {
+		return nil, badInput("could not read the body")
+	}
+	if err := g.checkSize(int64(len(data))); err != nil {
+		return nil, err
+	}
+	if extra := int64(len(data)) - min(max(up.Length, 0), g.maxSize+1); extra > 0 {
+		d := g.rate[len(g.rate)-1]
+		d.cost = float64(extra)
+		e.rate.charge(e.now(), d)
+	}
+	if ids.Blob(g.typ, g.nonce, data) != bid {
+		return nil, apiErr(422, "blob_mismatch", "message", "the body doesn't hash to the blob id (§3.7)")
+	}
+	return data, nil
+}
+
 // ensureResource returns name's resource row in n, inserting one without
 // entries if there is none (a pending blob needs a row, D.2).
 func (t *tx) ensureResource(n *nsRow, name string) int64 {
@@ -1037,7 +1056,7 @@ type blobAnswer struct {
 // aside: the blobs attached to the resource and, in a branch, the base's
 // blobs the branch's view references (§7.6). Pending and unknown blobs are
 // 404; a purge, or pruning that ended the attachment, 410.
-func (t *tx) servableBlob(n *nsRow, name string, bid ids.ID) blobAnswer {
+func (t *gate) servableBlob(n *nsRow, name string, bid ids.ID) blobAnswer {
 	if n.purged {
 		return blobAnswer{status: 410}
 	}
@@ -1066,17 +1085,22 @@ func (t *tx) servableBlob(n *nsRow, name string, bid ids.ID) blobAnswer {
 		}
 	}
 	if pruned != nil {
-		ans := blobAnswer{status: 410, pruned: pruned, horizon: t.horizonID(pruned.res)}
-		// The newest archive of a range that references the blob.
-		err := t.QueryRow(`SELECT a.url FROM archives a WHERE a.res = ? AND EXISTS (SELECT 1 FROM blob_refs r
-			WHERE r.res = a.res AND r.bid = ? AND r.from_seq <= a.to_seq AND (r.to_seq IS NULL OR r.to_seq > a.from_seq))
-			ORDER BY a.seq DESC LIMIT 1`, pruned.res, bid[:]).Scan(&ans.archive)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			t.must(err)
-		}
-		return ans
+		return blobAnswer{status: 410, pruned: pruned, horizon: t.horizonID(pruned.res), archive: t.blobArchive(pruned.res, bid)}
 	}
 	return blobAnswer{status: 404}
+}
+
+// blobArchive is the newest archive of a range of res that references
+// bid, or "".
+func (t *tx) blobArchive(res int64, bid ids.ID) string {
+	var url string
+	err := t.QueryRow(`SELECT a.url FROM archives a WHERE a.res = ? AND EXISTS (SELECT 1 FROM blob_refs r
+		WHERE r.res = a.res AND r.bid = ? AND r.from_seq <= a.to_seq AND (r.to_seq IS NULL OR r.to_seq > a.from_seq))
+		ORDER BY a.seq DESC LIMIT 1`, res, bid[:]).Scan(&url)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.must(err)
+	}
+	return url
 }
 
 // Blob is the answer of GET /r/{ns}/{name}/blob/{bid}, or in a sealed
@@ -1156,9 +1180,6 @@ func (e *Engine) ReadBlob(ctx context.Context, ns, name, bidText string, cred Cr
 // OpenBlob is ReadBlob with the bytes in Content, read from their file
 // where they are stored as is (ranges then read only what they need).
 func (e *Engine) OpenBlob(ctx context.Context, ns, name, bidText string, cred Credentials) (*Blob, error) {
-	if e.ddb != nil {
-		return nil, ddbUnsupported("blobs")
-	}
 	return readAgain(func() (*Blob, error) { return e.openBlob(ctx, ns, name, bidText, cred) })
 }
 
@@ -1166,7 +1187,7 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 	var out *Blob
 	var job *sealJob
 	var nsID int64
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -1236,7 +1257,7 @@ type BlobStats struct {
 // BlobStats counts the rows of blob storage, and sizes their files.
 func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) {
 	if e.ddb != nil {
-		return nil, ddbUnsupported("blobs")
+		return e.ddbBlobStats(ctx)
 	}
 	s := &BlobStats{Dir: e.blobs.root()}
 	var files []string
@@ -1276,7 +1297,7 @@ func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) {
 // entries it deleted.
 func (e *Engine) SweepBlobs(ctx context.Context) (int, error) {
 	if e.ddb != nil {
-		return 0, ddbUnsupported("blobs")
+		return e.ddbSweepBlobs(ctx)
 	}
 	var nss []int64
 	err := e.read(ctx, func(t *tx) error {

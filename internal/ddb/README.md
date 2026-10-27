@@ -15,7 +15,10 @@ is its own transaction. The gate's reads (gatereads.go: `Namespace`,
 `ConfigAt`, `ConfigByID`, `Resource`, `RevAt`, `ReadRevOf`, `DocAt`,
 `EntryAt`, `EntryPos`, and grants.go's `Grant`, `RecordsGrant`) are
 what core/ddbreads.go answers the gate with; `PutGrant` stores a write's
-grant, `FirstEntryTime` dates the operator keys (§C.4).
+grant, `FirstEntryTime` dates the operator keys (§C.4); blobs.go's
+`Attachment`, `Pending`, `PendingOf`, `UploaderVersion`, `Bytes` are the
+blob reads, `PutBytes` and `PutPending` an upload's writes, `ScanBlobs`,
+`DeletePending`, `DeleteBytes` the sweep's.
 Serving reads: `ReadHead`, `ReadLog` (paged, id cursors, upper bounds),
 `ReadRevByID` (GSI1), `FoldResource` (crossing tombstones: the restore
 applies to the last live document), `ResourceLog`, `ListHeads`,
@@ -81,8 +84,13 @@ commit: the `-grouped` benchmarks keep rising with writers instead.
 
 ## Simplifications (all deliberate)
 
-- The scope is plain namespaces: no blobs, branches, purges, sealed/e2e,
-  or the S3 offload of large values. Grants are stored (grants.go): each
+- The scope is plain namespaces: no branches, purges, sealed/e2e, or the
+  S3 offload of large values. Blobs (blobs.go) keep attachments and
+  pending entries as items of the namespace's partition and their bytes
+  in `BYTES#<sha256>` items, inline (≤ `MaxInlineBytes`, which bounds
+  `blobSize` without a blob directory) or as a file of `-blob-dir`; no
+  reference intervals yet, so blobs don't cross branches or batch
+  sources. Grants are stored (grants.go): each
   once, before the commits that record it, outside their transactions (a
   group's commits may share one); a namespace marker per grant, written
   once per transaction, answers GET /ns/{ns}/grants/{gid}; LOG and REV

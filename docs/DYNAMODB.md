@@ -498,8 +498,9 @@ What landed, beyond the spike:
   carry (it only hands them back). What the backend doesn't store reads
   as empty where nothing of the kind can exist (branches, draft copies,
   schema uses, horizons), and as **501 "unsupported"** where a request
-  needs a feature it lacks (blobs, sealed/e2e keys, `$schema`
-  namespaces, archives, reads at an earlier entry) — so those refusals
+  needs a feature it lacks (sealed/e2e keys, `$schema` namespaces,
+  archives, reads at an earlier entry, blob references across a
+  history) — so those refusals
   are the reads', not hand-written checks. `gate_test.go` guards the
   embedding that makes this work on SQL (a read missing on `*tx` would
   compile and recurse).
@@ -528,6 +529,23 @@ What landed, beyond the spike:
   gate's grant reads were split out of their SQL (`grantRow`,
   `recordsGrant`, `nextEntryCreated`), as `checkAt`, `grantRef` and
   `storedGrant` became gate logic.
+- **Blobs** (§7.8), with §3's items: attachments (`BLOB#<name>#<bid>`)
+  and pending entries (`PEND#<name>#<bid>#<uploader>`) in the
+  namespace's partition, bytes in `BYTES#<sha256>` — inline up to 350 KiB
+  (`MaxInlineBytes`, which then lowers the deployment's `blobSize`), or a
+  file under `-blob-dir` (one instance; S3 behind the same `blobStore`
+  is the multi-instance answer, §7). An upload runs the SQL path's
+  `gateBlob` over the table's reads, stores the bytes, then writes its
+  pending entry conditioned on the configuration and on the uploader's
+  version item (`UPL#`), which orders concurrent uploads against
+  `blobPending` as `blob_uploaders` does on Postgres. A write attaches in
+  its own commit (`CommitItem.Attach`) and ends the pending entries of
+  every blob it references (`EndPending`); serving is `openBlob` on the
+  gate. `SweepBlobs` deletes expired pending entries and the bytes
+  nothing names (by a scan; bytes touched in the last 10 minutes stay,
+  for an upload between its two writes), `BlobStats` counts by the same
+  scan, `SweepBlobFiles` removes orphaned files. Not yet: `blob_refs`'s
+  reference intervals, so blobs don't cross branches or batch sources.
 - **`internal/core/ddb.go`, the seam.** `core.Open` branches on
   `ddb.IsURL(opt.Path)`; the Engine keeps a `*ddbBackend` and the write
   methods (`WriteResource`, `Batch`, `WriteConfig`) and the reads
@@ -535,7 +553,7 @@ What landed, beyond the spike:
   `NamespaceLiveLog`, `Namespace/ResourceEvents`, `Wait`, `Ping`,
   `Close`) delegate, or run on the gate (`gateRead`). Everything else
   the server can reach answers 501 rather than falling through to SQL:
-  branches, purges and pruning, blobs, sealed/e2e, gestures listing,
+  branches, purges and pruning, sealed/e2e, gestures listing,
   author signatures (which the gate would verify but the commit doesn't
   store), remote branches, retention, sweeps, rotation. Refused
   configurations (`encryption`, `nonce: required`, `signatures:
@@ -568,9 +586,9 @@ and Postgres; then DynamoDB's reads and commit replaced the seam's own
 copy of the checks (`ddbGate`, `ddbDraw`, the store's write planning),
 which is where nearly every divergence the API suites found had come
 from. Features now arrive as data: authentication was storing grants and
-answering their reads (above); `$schema` is answering `schemaNS`,
-branches `resolve` at an earlier entry and `ancestry` across foreign
-parents, blobs their four reads.
+answering their reads, blobs storing their items and answering theirs
+(above); `$schema` is answering `schemaNS`, branches `resolve` at an
+earlier entry and `ancestry` across foreign parents.
 
 Requirements and limits, by design: one instance (no stream
 invalidation — §6 is phase 3), no background loops (retention, sweeps,
@@ -588,21 +606,22 @@ PATCHLOG_TEST_BACKEND=dynamodb DDB_ENDPOINT=http://localhost:8000 go test ./...
 runs them on DynamoDB Local, a fresh table each, as `PATCHLOG_TEST_PG`
 runs them on Postgres; CI's `dynamodb` job does. What the backend hasn't
 built skips without per-test annotations: `core.Open` refusing an option
-with `core.ErrUnsupported` (encryption at rest, blobs, archives, the
-SQL write path's hooks), or a `501 {"code":"unsupported"}`
+with `core.ErrUnsupported` (encryption at rest, archives, the SQL write
+path's hooks), or a `501 {"code":"unsupported"}`
 answer on the test's own goroutine. Tests that run and answer
 differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,329 top-level tests (pure unit tests included): 819 pass on DynamoDB
-and 510 skip — 443 as unsupported (115 encryption at rest, 100
-branches, 85 `$schema`, 40 blobs, 37 purges, …), 36 on their own
-conditions, and 31 meeting blobs inside a service (the dav gateway's
-raw files), where no skip can reach. No test answers differently from
-the SQL backends: the list's divergences section is empty. A test that
-skips partway has asserted everything before its skip, so the phase-1
-surface is covered beyond the 819.
+1,329 top-level tests (pure unit tests included): 872 pass on DynamoDB
+and 457 skip — 420 as unsupported (115 encryption at rest, 104
+branches, 87 `$schema`, 46 purges, …), 36 on their own conditions, and
+1 on the known list, which holds two tests (one a subtest) meeting
+purges where no skip can reach: inside a service, or on a test's own
+goroutines. No test answers differently from the SQL
+backends: the list's divergences section is empty. A test that skips
+partway has asserted everything before its skip, so the phase-1 surface
+is covered beyond the 872.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on

@@ -30,6 +30,10 @@ type checkReads interface {
 	ancestry(head *revRow) []segment
 	archiveURL(res, seq int64) string
 	attachedBlob(res int64, bid ids.ID) *blobRow
+	blobArchive(res int64, bid ids.ID) string
+	sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJob
+	openBytes(owner int64, hash []byte) blobContent
+	pendingUsed(n *nsRow, uploader string, cutoff, res int64, bid ids.ID) int64
 	authorName(id int64) string
 	baseIdentity(n *nsRow) string
 	batchEntry(n *nsRow, seq, author int64) (ids.ID, string, bool)

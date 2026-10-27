@@ -7,36 +7,5 @@
 # Divergences: the backend answers differently from the spec.
 
 # Unsupported features met where the harness cannot skip.
-dav/TestDeadProps unsupported, met inside a service (501): blobs
-dav/TestDeleteAfterRefusedMove unsupported, met inside a service (501): blobs
-dav/TestDeleteThenMoveOnto unsupported, met inside a service (501): blobs
-dav/TestEmptyFiles unsupported, met inside a service (501): blobs
-dav/TestFileSizes unsupported, met inside a service (501): blobs
-dav/TestFileTypes unsupported, met inside a service (501): blobs
-dav/TestFlatCopyAndDupNames unsupported, met inside a service (501): blobs
-dav/TestFlatMovesRefused unsupported, met inside a service (501): blobs
-dav/TestLockLifecycle unsupported, met inside a service (501): blobs
-dav/TestMoveOntoExisting unsupported, met inside a service (501): blobs
-dav/TestPartialPut unsupported, met inside a service (501): blobs
-dav/TestPutCreateEdit unsupported, met inside a service (501): blobs
-dav/TestRawEditorSaves unsupported, met inside a service (501): blobs
-dav/TestRawFiles unsupported, met inside a service (501): blobs
-dav/TestRawOwnSaves unsupported, met inside a service (501): blobs
-dav/TestRawSaves unsupported, met inside a service (501): blobs
-dav/TestTreeCaseVariants unsupported, met inside a service (501): blobs
-dav/TestTreeCopy unsupported, met inside a service (501): blobs
-dav/TestTreeDelete unsupported, met inside a service (501): blobs
-dav/TestTreeDeleteThenWrite unsupported, met inside a service (501): blobs
-dav/TestTreeDotFolders unsupported, met inside a service (501): blobs
-dav/TestTreeEditorSaves unsupported, met inside a service (501): blobs
-dav/TestTreeMoveAcross unsupported, met inside a service (501): blobs
-dav/TestTreeNewFileCleanupRetried unsupported, met inside a service (501): blobs
-dav/TestTreeNewFileRefused unsupported, met inside a service (501): blobs
-dav/TestTreeNewFiles unsupported, met inside a service (501): blobs
-dav/TestTreeServiceOwnWrites unsupported, met inside a service (501): blobs
-dav/TestTreeServiceOwnWritesUntilReached unsupported, met inside a service (501): blobs
-dav/TestTreeServiceStaleNameWrites unsupported, met inside a service (501): blobs
-dav/TestTreeServiceUserTokens unsupported, met inside a service (501): blobs
-server/TestV034ConcurrentUploadsPending unsupported, met inside a service (501): blobs
-server/TestV055LimitStreamedBlob unsupported, met inside a service (501): blobs
 tree/TestHopsUnderWrites unsupported, met inside a service (501): purges
+server/TestBlobPurgeRacesUpload unsupported, met outside the harness (501): purges, from the test's own goroutines

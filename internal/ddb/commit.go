@@ -90,6 +90,11 @@ type CommitItem struct {
 	LastID         string
 	LastPos        uint64
 	Steps          []CommitStep
+	// Attach are the blobs the item's documents reference that aren't
+	// attached to its resource yet, EndPending the pending entries of
+	// the blobs they reference (blobs.go).
+	Attach     []BlobAttach
+	EndPending []BlobPending
 }
 
 // CommitStep is one revision or tombstone. Doc is a revision's canonical
@@ -177,7 +182,7 @@ func (c *Commit) actions() int {
 		n += 2 // the META update, the CFG put
 	}
 	for _, it := range c.Items {
-		n += len(it.Steps) + 1 // the revisions, the head
+		n += len(it.Steps) + 1 + it.attachActions() // the revisions, the head, attachments
 		if it.lastLive() != nil {
 			n++ // the head document
 		}
@@ -425,7 +430,7 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 	if final.kind != "tombstone" {
 		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyHist(ns, it.Name, entry.pos), item{"revPos": avN(final.pos)})}})
 	}
-	return out
+	return append(out, s.attachActs(c, it)...)
 }
 
 // classifyCancel sorts a cancelled transaction of commits cs (built by

@@ -9,11 +9,12 @@ package core
 // doesn't cover answers 501 rather than falling through to SQL.
 //
 // Deliberate gaps, all surfaced as 501 "unsupported": branches, purges
-// and pruning, blobs (batch sources with them), sealed and e2e
-// namespaces, $schema validation, nonce-required namespaces, gestures
+// and pruning, batch sources whose documents reference blobs, sealed and
+// e2e namespaces, $schema validation, nonce-required namespaces, gestures
 // listing, author signatures, head snapshots (revisions fold from the
-// genesis). Grants, edge grants, tombstones and restores, multi-step
-// items and batches (§7.5, bounded by the transaction's 100 actions) work.
+// genesis). Grants, edge grants, blobs, tombstones and restores,
+// multi-step items and batches (§7.5, bounded by the transaction's 100
+// actions) work.
 
 import (
 	"context"
@@ -61,9 +62,6 @@ func openDDB(opt Options) (*Engine, error) {
 	if opt.KeyStore != nil {
 		return nil, fmt.Errorf("core: encryption at rest: %w (DynamoDB, docs/DYNAMODB.md phase 1)", ErrUnsupported)
 	}
-	if opt.BlobDir != "" {
-		return nil, fmt.Errorf("core: blob storage: %w (DynamoDB, docs/DYNAMODB.md phase 1)", ErrUnsupported)
-	}
 	// What it would otherwise ignore: an archive no retention loop writes,
 	// and the SQL write path's test hooks, which it never reaches — a
 	// caller waiting on one would wait for good.
@@ -90,7 +88,19 @@ func openDDB(opt Options) (*Engine, error) {
 	// and a batch over it is §6.6's 413 itemsPerBatch, not the action cap.
 	opt.Maximums.ItemsPerBatch = min(opt.Maximums.ItemsPerBatch, ddb.MaxBatchItems)
 	opt.Limits.ItemsPerBatch = min(opt.Limits.ItemsPerBatch, opt.Maximums.ItemsPerBatch)
+	// Blob bytes go to files under -blob-dir (one instance: phase 1), or
+	// else into their items, which bounds blobSize by an item's size.
+	var blobs blobStore = tableStore{}
+	if opt.BlobDir != "" {
+		if blobs, err = openBlobStore(opt.BlobDir, "", false); err != nil {
+			return nil, err
+		}
+	} else {
+		opt.Maximums.BlobSize = min(opt.Maximums.BlobSize, ddb.MaxInlineBytes)
+		opt.Limits.BlobSize = min(opt.Limits.BlobSize, opt.Maximums.BlobSize)
+	}
 	e := &Engine{
+		blobs:      blobs,
 		opt:        opt,
 		validator:  schema.NewValidator(),
 		hub:        newHub(),

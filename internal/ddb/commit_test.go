@@ -199,3 +199,26 @@ func TestClassifyCancel(t *testing.T) {
 		}
 	}
 }
+
+// An item's attachments and the pending entries it ends ride in its own
+// actions, before the entry: unconditional, so classifyCancel's layout
+// (the entry second to last of a commit) holds.
+func TestBuildCommitAttach(t *testing.T) {
+	s := &Store{Table: "tbl"}
+	c := createCommit("doc1")
+	c.Items[0].Attach = []BlobAttach{{Bid: "b1", Type: "text/plain", Size: 3, Hash: []byte{1}}}
+	c.Items[0].EndPending = []BlobPending{{Bid: "b1", Uploader: "u"}, {Bid: "b2", Uploader: "u"}}
+	acts, _, err := s.buildCommits("demo", []*Commit{c}, testTip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(acts) != c.actions()+txShared || len(acts) != 11 {
+		t.Fatalf("%d actions (counted %d)", len(acts), c.actions()+txShared)
+	}
+	if sk(acts[4]) != "BLOB#doc1#b1" || cond(acts[4]) != "" || acts[5].Delete == nil || acts[6].Delete == nil {
+		t.Fatalf("attachment actions %s %q", sk(acts[4]), cond(acts[4]))
+	}
+	if sk(acts[c.actions()-2]) != "LOG#"+padPos(8) {
+		t.Fatalf("entry at %s", sk(acts[c.actions()-2]))
+	}
+}

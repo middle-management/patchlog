@@ -112,7 +112,7 @@ func (t *gate) cachePublic(n *nsRow) bool { return t.config(n.configSeq).cachePu
 func (c *Config) cachePublic() bool { return c.Read == "public" || c.level >= levelSealed }
 
 // isSealedNS reports whether n serves sealed content.
-func (t *tx) isSealedNS(n *nsRow) bool { return t.config(n.configSeq).level == levelSealed }
+func (t *gate) isSealedNS(n *nsRow) bool { return t.config(n.configSeq).level == levelSealed }
 
 // --- epoch keys -----------------------------------------------------------
 

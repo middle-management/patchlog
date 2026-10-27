@@ -1,11 +1,14 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
@@ -141,6 +144,7 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 			}
 			it.Steps = append(it.Steps, cs)
 		}
+		it.Attach, it.EndPending = r.attachOf(s)
 		c.Items = append(c.Items, it)
 		final := s.steps[len(s.steps)-1]
 		kind := "head"
@@ -163,6 +167,46 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 	c.Kind = c.Entry["kind"].(string)
 	c.Gesture, c.Undoes = p.st[0].Steps[0].Gesture, p.st[0].Steps[0].Undoes
 	return c
+}
+
+// attachOf lists the blobs an item's steps reference that its resource
+// hasn't attached (attachStep of blobs.go), each with the first step that
+// references it, and the pending entries of every blob they reference,
+// which the write ends.
+func (r *ddbReads) attachOf(s *itemState) ([]ddb.BlobAttach, []ddb.BlobPending) {
+	own := s.view.own.id
+	var out []ddb.BlobAttach
+	refs := map[string]bool{}
+	for j, step := range s.steps {
+		bids := make([]ids.ID, 0, len(step.blobs))
+		for bid := range step.blobs {
+			bids = append(bids, bid)
+		}
+		slices.SortFunc(bids, func(a, b ids.ID) int { return bytes.Compare(a[:], b[:]) })
+		for _, bid := range bids {
+			src := step.blobs[bid]
+			if refs[bid.String()] {
+				continue
+			}
+			refs[bid.String()] = true
+			if !src.pending && src.res == own {
+				continue // attached already
+			}
+			out = append(out, ddb.BlobAttach{Bid: bid.String(), Type: src.typ, Nonce: src.nonce, Size: src.size, Hash: src.hash, Step: j})
+		}
+	}
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	ps, err := r.s.PendingOf(r.ctx, r.res[own].ns)
+	r.must(err)
+	var end []ddb.BlobPending
+	for _, p := range ps {
+		if p.Name == s.Resource && refs[p.Bid] {
+			end = append(end, ddb.BlobPending{Bid: p.Bid, Uploader: p.Uploader})
+		}
+	}
+	return out, end
 }
 
 // ddbStepEntry is a committed step's resource log entry, as a write

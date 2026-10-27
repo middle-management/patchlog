@@ -790,7 +790,7 @@ func principalDraw(ns string, cfg *Config, a *actor, cost float64, now time.Time
 
 // blobDraw is the draw of an upload's bytes from the principal's blobRate
 // bucket, or its allowance's (§6.6, §7.8).
-func (t *tx) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
+func (t *gate) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
 	if al := t.allowanceOf(cfg, a); al != nil && al.BlobRate.Rate > 0 {
 		return draw{"ab\x00" + n.name + "\x00" + al.Sub + "\x00" + al.Kid, al.BlobRate, float64(size), "allowance.blobRate"}
 	}

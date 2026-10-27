@@ -288,9 +288,6 @@ func epochFile(ns int64, bid []byte, e int) string {
 // crash, an ambiguous commit or a lost race leaves (blobstore.go). It
 // returns how many it deleted.
 func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
-	if e.ddb != nil {
-		return 0, ddbUnsupported("blobs")
-	}
 	dir := e.blobs.root()
 	if dir == "" {
 		return 0, nil
@@ -349,7 +346,24 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	var orphans []string
-	err = e.read(ctx, func(t *tx) error {
+	if e.ddb != nil {
+		// The BYTES items name the files (ddbPutBytes).
+		_, _, bytes, err := e.ddb.store.ScanBlobs(ctx)
+		if err != nil {
+			return 0, ddbAsErr(err)
+		}
+		named := map[string]bool{}
+		for _, b := range bytes {
+			named[b.File] = true
+		}
+		for _, files := range cands {
+			for _, f := range files {
+				if !named[f] {
+					orphans = append(orphans, f)
+				}
+			}
+		}
+	} else if err := e.read(ctx, func(t *tx) error {
 		for g, files := range cands {
 			col := "owner"
 			if g.table == "blob_epochs" {
@@ -371,8 +385,7 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 			}
 		}
 		return nil
-	})
-	if err != nil {
+	}); err != nil {
 		return 0, err
 	}
 	orphans = append(orphans, temps...)

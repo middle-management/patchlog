@@ -128,13 +128,8 @@ func newTable(t testing.TB) string {
 }
 
 // BlobDir is the blob directory a harness gives the engines it starts by
-// default: the test's temporary directory, except on DynamoDB, which
-// refuses one (blobs aren't built there; a test that writes them is
-// answered 501 and skipped).
+// default: the test's temporary directory.
 func BlobDir(t testing.TB) string {
-	if Backend() == DynamoDB {
-		return ""
-	}
 	return t.TempDir()
 }
 
