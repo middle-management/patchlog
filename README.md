@@ -1356,7 +1356,9 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   sealed as at E2 for one from before a raise from `sealed`. A result whose hits come from several
   epochs is sealed per entry, and `counts` over several epochs is `400`. After a restart the index
   needs the keys of those older epochs, so its grant needs an `nbf` reaching back before them
-  (§E.2.3); without one, such results are `503 behind`. A rotation that leaves the index out of
+  (§E.2.3); without one, such results are `503 behind`. After a raise from `sealed` the keys of
+  the epochs before it come from `/keys` without a sender, as at E2: the index takes them for an
+  epoch the keyring names no key of, while keyring epochs take only trusted senders. A rotation that leaves the index out of
   the new epoch's readers skips the namespace (`404`), as do branches followed with `-branches`.
   An index database following a sealed or e2e namespace is rebuilt once on upgrade to record each
   document's epoch.

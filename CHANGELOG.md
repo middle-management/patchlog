@@ -913,6 +913,15 @@ implements the default the plan states.
     one the index answers `503 behind`, and the tree service shows the nodes served under an epoch
     it can never get by name only, with no `sealed` values; a key it can't fetch for the moment is
     `503 behind`, only for listings that show such nodes, and is fetched outside the graph lock.
+  - **Services past a raise from `sealed`** (Levels, §E.2.6, §E.3.2): a service whose view of
+    the namespace already says `e2e` (after a restart, or once it followed the raise) takes the
+    key of an epoch before the raise as a sealed namespace's, from `/keys` without a sender, for
+    an epoch older than the current one that the keyring names no key of; the server held that
+    content and its key before the raise. Keyring epochs still seal only under keys from a sender
+    the service trusts. Index queries and tree listings over pre-raise documents no longer stay
+    `503 behind` after a restart. A failure to get a key that lasts until the configuration
+    changes is answered again for a second, and a `429` until its `Retry-After`, without asking
+    `POST /ns/{ns}/keys` anew, so a query no longer spends the service's `exchangeRate`.
   - **Upgrade:** an index database that follows a sealed or e2e namespace is rebuilt once, to
     record each document's epoch. A tree database reads in, on start, the epoch each node head
     and each sealed item's file metadata is served under; heads it can never read keep sealing
