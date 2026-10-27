@@ -17,6 +17,10 @@
 //	                                      path is the full instance pointer, indices included
 //	sealed_views, sealed_view_tags   sealed results of sealed/e2e namespaces (derived.Cache)
 //	cdn_repurge(id, tags, due)       second CDN purges (package repurge), kept by a rebuild
+//	edge_subjects, edge_buckets      the markers of each subject set the service minted edge
+//	                                 grants for, until the last of them expires, and its
+//	                                 exchangeRate buckets (svcedge.Store, edgegrants.go)
+//	edge_filters(marker, filter, exp) what each scope marker of those stands for (readFilter)
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
@@ -68,6 +72,7 @@ import (
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/repurge"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
+	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // Purger purges the index service's own cache tags (§A.1: a purge "also
@@ -123,6 +128,19 @@ type Options struct {
 	// results, and all of them when nil, are no-store for shared caches.
 	// They are served either way.
 	Edge *edge.Verifier
+	// EdgeGrants, if set, mints and verifies the service's own edge
+	// grants (§A.4, §B.11.5, §C.5; edgegrants.go): cookies for
+	// /{ns}/g/{gs} and /_refs/g/{gs}, under a key and kid of the
+	// service's own, never the origin's. Open sets its Vouches to those
+	// prefixes. Without it, POST and DELETE /edge-grants are 404
+	// not_offered.
+	EdgeGrants *edge.Cookies
+	// ExchangeRate is the exchangeRate bucket each principal draws one
+	// token from per exchange at POST /edge-grants (§C.5.2, §6.6; default
+	// svcedge.DefaultExchangeRate). It is a deployment's limit, so the
+	// service has its own buckets, shared by every instance on its
+	// database DB (§B.11.5, svcedge.Store).
+	ExchangeRate svcedge.Rate
 	// Now is the clock for grant checks, kept results and the due times
 	// of second purges (default time.Now).
 	Now func() time.Time
@@ -161,6 +179,10 @@ type Index struct {
 	sealed  *derived.Cache // sealed results
 	kept    *kept.Store    // results kept past their checkpoint
 	repurge *repurge.Queue // second CDN purges
+	edge    *svcedge.Store // the service's edge grants (EdgeGrants)
+
+	fmu     sync.Mutex
+	filters map[string]*readFilter // scope marker -> what it stands for (edge_filters)
 
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers
@@ -240,6 +262,10 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 	if err := ix.loadState(ctx); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if err := ix.initEdge(ctx, db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("index: edge grants: %w", err)
 	}
 	ix.repurge.Start()
 	return ix, nil

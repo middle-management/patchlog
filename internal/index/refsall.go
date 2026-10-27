@@ -190,6 +190,13 @@ func (ix *Index) refsNamespaces() []string {
 // 401 if any refusal is, else 403. Otherwise it notes whether the grant
 // verified (unverified), which decides the refusal at another gs's URL.
 func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[string]string) (*refsReader, error) {
+	if bearer(r) == "" {
+		// One of the service's edge grants for /_refs/g/{gs}, on a
+		// request without Authorization (edgegrants.go).
+		if rd, ok, err := ix.refsCookieReader(ctx, r, reached); ok || err != nil {
+			return rd, err
+		}
+	}
 	rd := &refsReader{public: true, allow: map[string]func(string) bool{}}
 	var (
 		markers  []string
@@ -236,7 +243,7 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			// access marks it (§A.4), and refuses a namespace whose
 			// read rules refer to /now.
 			if !a.all {
-				rd.allow[ns] = func(name string) bool { return ix.checker.AllowsRead(a.v, name) }
+				rd.allow[ns] = a.allow
 			}
 			rd.public, markers = false, append(markers, a.marker)
 		}
@@ -352,6 +359,15 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 			writeErr(w, http.StatusNotFound, "not_found", "malformed subject set")
 			return
 		}
+	case len(segs) == 3 && segs[1] == "g":
+		// The head pointer under a subject set's prefix, which its edge
+		// grants cover (§B.11.5).
+		gs = segs[2]
+		telemetry.SetRoute(r, "/_refs/g/{gs}")
+		if _, err := ids.Parse(gs); err != nil {
+			writeErr(w, http.StatusNotFound, "not_found", "malformed subject set")
+			return
+		}
 	default:
 		writeErr(w, http.StatusNotFound, "not_found", "not found")
 		return
@@ -417,7 +433,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	// redirected; a request without one the service verifies, which needs
 	// one for that gs, is 401, as a query of one namespace answers it
 	// (§B.11.5, §12.1). Only the pointer redirects into the reader's.
-	if at != "" && gs != rd.gs {
+	if gs != "" && gs != rd.gs {
 		w.Header().Set("Cache-Control", "no-store")
 		if rd.unverified {
 			w.Header().Set("WWW-Authenticate", "Bearer")

@@ -55,6 +55,9 @@ const strictMins = false
 //	GET /{ns}/g/{gs}/at/{ns_id}?… private namespaces: as above, keyed by the
 //	                              reader's subject set gs (§A.4, §B.11.5), the
 //	                              subject set before the checkpoint
+//	GET /{ns}/g/{gs}?…            the head pointer under the subject set's
+//	                              prefix, which its edge grants cover
+//	POST, DELETE /edge-grants     the service's own edge grants (edgegrants.go)
 //
 // The forms before v0.51, /g/{gs}/{ns}?… and /g/{gs}/{ns}/at/{ns_id}?…,
 // are moved permanently (301) to /{ns}?… and /{ns}/g/{gs}/at/{ns_id}?….
@@ -79,7 +82,10 @@ const strictMins = false
 // Private namespaces need Authorization: Bearer <grant>, which reads only
 // under its own gs: an at URL of another gs is 403; the head pointer and
 // an at URL without /g/{gs} are redirected into the reader's (with min, by
-// the redirect above), private, no-store (§A.4, §B.11.5).
+// the redirect above), private, no-store (§A.4, §B.11.5). A request
+// without Authorization may carry instead an edge grant the service
+// minted for the gs of its URL (Options.EdgeGrants), and is read as that
+// subject set; one with neither is 401.
 //
 // Sealed and e2e namespaces (§E.2.5, §E.2.6; package derived). A result
 // has one source, so in a private namespace a reader of it whole (marker
@@ -112,6 +118,12 @@ func (ix *Index) Handler() http.Handler {
 }
 
 func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/edge-grants" && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		// The index's own edge grants (edgegrants.go); a GET is a query
+		// of a namespace of that name, as any other.
+		ix.serveEdgeGrants(w, r)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		writeErr(w, http.StatusMethodNotAllowed, "bad_input", "method not allowed")
@@ -134,6 +146,12 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(segs) == 3 && segs[1] == "at":
 		ns, at, isAt = segs[0], segs[2], true
 		telemetry.SetRoute(r, "/{ns}/at/{at}")
+	case len(segs) == 3 && segs[1] == "g":
+		// The head pointer under a subject set's prefix, which its edge
+		// grants cover (§B.11.5). No subject set is "g", so the form
+		// before v0.51 below, /g/{gs}/{ns}, never matches here.
+		ns, gs = segs[0], segs[2]
+		telemetry.SetRoute(r, "/{ns}/g/{gs}")
 	case len(segs) == 5 && segs[1] == "g" && segs[3] == "at":
 		ns, gs, at, isAt = segs[0], segs[2], segs[4], true
 		telemetry.SetRoute(r, "/{ns}/g/{gs}/at/{at}")
@@ -176,10 +194,18 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 // access is the outcome of the read check for one request.
 type access struct {
 	public bool
-	v      *grant.Verified
-	all    bool   // reads every resource: no per-resource filtering
-	marker string // what the reader's answers depend on (private only, §A.4)
-	gs     string // subject-set id over marker (private only)
+	v      *grant.Verified // nil under an edge grant (cookie)
+	all    bool            // reads every resource: no per-resource filtering
+	marker string          // what the reader's answers depend on (private only, §A.4)
+	gs     string          // subject-set id over marker (private only)
+	// allow is the per-resource read check of a reader that isn't all:
+	// the grant's, or under an edge grant the filter its marker stands
+	// for (readFilter).
+	allow func(resource string) bool
+	// filter is what a scope marker stands for, which an edge grant
+	// minted for it authorises from (readFilter).
+	filter *readFilter
+	cookie bool // read under one of the service's edge grants
 }
 
 // writeLimit answers a grant over grantSize or rulesPerGrant, which the
@@ -206,12 +232,23 @@ func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*acces
 	}
 	token := bearer(r)
 	if token == "" {
+		// One of the service's edge grants for this namespace's subject
+		// set, on a request without Authorization (edgegrants.go).
+		if a, ok, err := ix.cookieAccess(ctx, ns, r); ok || err != nil {
+			return a, err
+		}
 		return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
 	}
 	v, err := ix.checker.Verify(ctx, ns, token)
 	if err != nil {
 		return nil, err
 	}
+	return ix.grantAccess(ns, v)
+}
+
+// grantAccess is access to private namespace ns for v, a grant verified
+// there.
+func (ix *Index) grantAccess(ns string, v *grant.Verified) (*access, error) {
 	if ok, _ := v.Allows("read"); !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
 	}
@@ -236,7 +273,8 @@ func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*acces
 	if !ix.checker.ReadsPerResource(v) {
 		return nil, &grant.AuthError{Status: 403, Msg: "a grant or key rule refuses the read"}
 	}
-	return marked(&access{v: v, marker: "reads:" + ns + ":scope:" + digest}), nil
+	return marked(&access{v: v, marker: "reads:" + ns + ":scope:" + digest, filter: filterOf(v),
+		allow: func(resource string) bool { return ix.checker.AllowsRead(v, resource) }}), nil
 }
 
 // marked sets a's gs, the subject set of its marker alone.
@@ -287,7 +325,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// A purged sealed namespace's document is 410 too (§8.5): the
 		// core makes the read check before answering it, as below.
 		var head string
-		if head, err = ix.checker.PurgedRead(ctx, ns, bearer(r)); err == nil {
+		if head, err = ix.purgedRead(ctx, ns, r, err); err == nil {
 			writePurged(w, head)
 			return
 		}
@@ -360,6 +398,12 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	// one, which no grant decides, is redirected to the same at in the
 	// reader's space; with min, the redirects below land there, without
 	// min (§A.5).
+	if !isAt && gs != "" && gs != a.gs && !a.public {
+		// The head pointer under another subject set's prefix (§B.11.5).
+		w.Header().Set("Cache-Control", "no-store")
+		writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
+		return
+	}
 	if isAt && gs != a.gs {
 		if gs != "" && !a.public {
 			w.Header().Set("Cache-Control", "no-store")
@@ -537,7 +581,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	}
 	var allow func(string) bool
 	if !a.all {
-		allow = func(resource string) bool { return ix.checker.AllowsRead(a.v, resource) }
+		allow = a.allow
 	}
 	gen := ix.kept.Generation(ns)
 	res, at, err := ix.query(ctx, ns, q, allow)
