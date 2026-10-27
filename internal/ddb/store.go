@@ -14,7 +14,7 @@ import (
 	"github.com/middle-management/patchlog/internal/patch"
 )
 
-// API is the DynamoDB surface the spike uses. *dynamodb.Client satisfies
+// API is the DynamoDB surface the store uses. *dynamodb.Client satisfies
 // it; tests may fake it.
 type API interface {
 	GetItem(ctx context.Context, in *dynamodb.GetItemInput, opt ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
@@ -29,7 +29,7 @@ type API interface {
 	DescribeTable(ctx context.Context, in *dynamodb.DescribeTableInput, opt ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error)
 }
 
-// Store is the spike's storage backend: one DynamoDB table, the key design
+// Store is the storage: one DynamoDB table, the key design
 // of keys.go.
 type Store struct {
 	Client API

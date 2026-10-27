@@ -11,7 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
-// The serving reads beyond the spike's head and log: revision-by-id,
+// The serving reads beyond the head and the log: revision-by-id,
 // folds, resource logs, namespace info.
 
 // RevInfo is a revision found by id (GSI1): where it lives and what the

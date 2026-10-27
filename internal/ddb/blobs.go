@@ -20,8 +20,9 @@ package ddb
 //
 // The sweep (core's SweepBlobs) deletes expired pending entries and the
 // bytes no item names any more, by a scan. An attachment pruning ended
-// (pruned, prune.go) names none. Not yet: reference intervals (blob_refs:
-// archives read them).
+// (pruned, prune.go) names none. There are no reference intervals
+// (blob_refs of the SQL schema): which revisions reference a blob, for
+// archives and sealed blobs, core derives from the revisions themselves.
 
 import (
 	"context"

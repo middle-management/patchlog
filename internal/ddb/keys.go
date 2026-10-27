@@ -1,11 +1,10 @@
-// Package ddb is a spike of the DynamoDB storage backend sketched in
-// docs/DYNAMODB.md (phase 1): keys and items, namespace create,
-// single-resource writes with their log entry, tip condition and idempotent
-// replay, and head and log reads. It reuses the production id and canonical
-// JSON schemes (internal/ids, internal/jsonv) and the production patch
-// application (internal/patch), so the bytes it hashes are the bytes
-// internal/core hashes. What it is not: integrated, authorised, or complete
-// — see README.md in this directory.
+// Package ddb is the DynamoDB store of docs/DYNAMODB.md: the single
+// table's keys and items (§3) and the transactions committing what core's
+// write gate decided (§4), with the reads core's gate and serving paths
+// make over them. It reuses the production id and canonical JSON schemes
+// (internal/ids, internal/jsonv) and the production patch application
+// (internal/patch), so the bytes it hashes are the bytes internal/core
+// hashes. Authorisation and every other check are core's (README.md).
 package ddb
 
 import (

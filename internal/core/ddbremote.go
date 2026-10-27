@@ -271,7 +271,7 @@ type shadowHead struct {
 func (b *ddbBackend) shadowImport(ctx context.Context, name, read string, lv *remoteLevel, base string, baseAt uint64, heads map[*remoteRes]shadowHead, now time.Time, level int) (*ddb.ShadowImport, error) {
 	if lv.raise >= 0 {
 		// A level raised to e2e before at mirrors its pre-raise history
-		// and keys (Addendum E Levels), which isn't built here.
+		// and keys (Addendum E Levels), which this backend doesn't mirror.
 		return nil, ddbUnsupported("mirroring a base raised to e2e")
 	}
 	cdoc := map[string]any{"read": read}

@@ -1,6 +1,6 @@
 package core
 
-// Engine-level tests of the DynamoDB backend (docs/DYNAMODB.md phase 1):
+// Engine-level tests of the DynamoDB backend (docs/DYNAMODB.md §13):
 // the seam's delegations, the thin gate's answers, and the 501s, end to
 // end through Open with a dynamodb:// URL against DynamoDB Local
 // (DDB_ENDPOINT; skipped without it).
@@ -22,7 +22,7 @@ import (
 )
 
 // ddbEngine opens an engine on a fresh table of DynamoDB Local, in -dev
-// mode as phase 1 requires.
+// mode, so writes need no grants.
 func ddbEngine(t *testing.T) *Engine {
 	t.Helper()
 	endpoint := os.Getenv("DDB_ENDPOINT")

@@ -28,6 +28,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -735,8 +737,19 @@ func ctxErr(ctx context.Context, err error) error {
 
 // panicErr turns a recovered panic (t.must) into an error, keeping a panicked
 // error wrapped so constraint violations can be recognised (D.3).
+//
+// A runtime fault (a nil dereference, an index out of range) or a panic
+// with something other than an error is a bug, not a failed statement:
+// it is logged with the panicking stack, which the answer's 500 loses.
+// panicErr must be called from the deferred function that recovered p,
+// so the stack still holds the panic's frames.
 func panicErr(p any) error {
-	if pe, ok := p.(error); ok {
+	pe, ok := p.(error)
+	var re runtime.Error
+	if !ok || errors.As(pe, &re) {
+		log.Printf("internal error: %v\n%s", p, debug.Stack())
+	}
+	if ok {
 		return fmt.Errorf("internal error: %w", pe)
 	}
 	return fmt.Errorf("internal error: %v", p)

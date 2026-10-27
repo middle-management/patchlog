@@ -1,13 +1,12 @@
 # A DynamoDB backend — design exploration
 
-Status: exploration on branch `dynamodb`, off `main` (v0.22.x). Phase 1 is
-spiked and green in [internal/ddb](../internal/ddb) (keys, namespace
-create, the single-resource write transaction, head and log reads, against
-DynamoDB Local); its findings are folded into §3, §11 and §12 and listed
-in its README. The rest of this document stands as written: it maps what a
-DynamoDB storage backend for the core (`internal/core`) would have to do,
-proposes a concrete table and key design, and names the hard problems
-before any code commits to them.
+Status: implemented on branch `dynamodb` for one instance — the full
+API of the SQL backends but the gaps §13 lists, the store in
+[internal/ddb](../internal/ddb), the backend in `internal/core/ddb*.go`
+(§13). Sections 1–12 are the design as it was explored before the code,
+from a first spike whose findings are folded into §3, §11 and §12; they
+stand as written, as the reasoning behind the code. What changed in the
+building is §13.
 
 References are to the code on this branch: `internal/core/db.go` (SQLite
 schema, Addendum D.2), `internal/core/pgschema.go` and `pglock.go` (D.8),
@@ -476,18 +475,17 @@ large patch sets and documents (§3).
   the spike: first page `begins_with`, later pages `SK > cursor` stopping
   at the prefix boundary.
 
-## 13. Status: phase 1 integrated
+## 13. Status: integrated
 
-Phase 1 of §10's path C is implemented and wired in, behind the `-db`
-URL scheme:
+§10's path C is implemented and wired in, behind the `-db` URL scheme:
 
 ```sh
 patchlog -db 'dynamodb://patchlog?region=eu-west-1'          # AWS
-patchlog -db 'dynamodb://spike?region=us-east-1&endpoint=http://localhost:8000'
+patchlog -db 'dynamodb://patchlog?region=us-east-1&endpoint=http://localhost:8000'
 ```
 
 The table is pre-created (PAY_PER_REQUEST is fine) with the key schema of
-§3 and GSI1 (`G1PK`, project ALL); phase 1 does not create it for you.
+§3 and GSI1 (`G1PK`, project ALL); the server does not create it for you.
 
 What landed, beyond the spike:
 

@@ -6,11 +6,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// Item shapes. All values inline: nothing in the spike approaches the
-// 400 KiB item limit (docs/DYNAMODB.md §3's S3 offload is unimplemented).
+// Item shapes. All values inline: one over the 400 KiB item limit fails
+// its write (docs/DYNAMODB.md §3's S3 offload isn't implemented; core
+// answers 501). Blob bytes may go to files instead (blobs.go).
 //
 // The SQL backend stores entry kinds as ints and authors as integer keys;
-// the spike stores kind names and author names, denormalised as §3 allows
+// the table stores kind names and author names, denormalised as §3 allows
 // (both are unhashed metadata).
 
 func avS(v string) types.AttributeValue { return &types.AttributeValueMemberS{Value: v} }
