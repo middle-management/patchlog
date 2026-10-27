@@ -1,0 +1,39 @@
+{
+  "section": "§F.9",
+  "about": "a release's plan digest, text(trunc160(sha256(canonical(plan)))): two batches of one catalog branch (steps 2 and 4), the split node matches.cup in both, the second half's precondition { batch, item } on the first's result (items in each batch by resource name, as the reference orders them); fresh $nonce ops, and a fresh top-level $nonce in a root operation's value, are left out of the steps",
+  "vectors": [
+    {
+      "name": "two batches with a split node and nonce'd steps",
+      "fn": "merge.digestItems (digestSteps), merge.PlanObject, merge.PlanDigest",
+      "items": [
+        {
+          "step": 2,
+          "resource": "season",
+          "steps as sent": "[[{\"op\":\"remove\",\"path\":\"/$access/group:fans\"},{\"op\":\"add\",\"path\":\"/$nonce\",\"value\":\"abcdefghijklmnopqrstuvwxyz\"}]]"
+        },
+        {
+          "step": 2,
+          "resource": "matches.cup",
+          "steps as sent": "[[{\"op\":\"replace\",\"path\":\"/parents\",\"value\":[{\"href\":\"/r/cat-season/vault\"}]},{\"op\":\"replace\",\"path\":\"/$nonce\",\"value\":\"zyxwvutsrqponmlkjihgfedcba\"}]]"
+        },
+        {
+          "step": 2,
+          "resource": "matches.old",
+          "steps as sent": "[\"delete\"]"
+        },
+        {
+          "step": 4,
+          "resource": "matches.newbie",
+          "steps as sent": "[[{\"op\":\"add\",\"path\":\"\",\"value\":{\"$nonce\":\"abcdefghijklmnopqrstuvwxyz\",\"parents\":[{\"href\":\"/r/cat-season/season\"}]}}]]"
+        },
+        {
+          "step": 4,
+          "resource": "matches.cup",
+          "steps as sent": "[[{\"op\":\"replace\",\"path\":\"/parents\",\"value\":[{\"href\":\"/r/cat-season/embargo\"}]},{\"op\":\"add\",\"path\":\"/$nonce\",\"value\":\"not-fresh\"}]]"
+        }
+      ],
+      "plan": "{\"batches\":[{\"items\":[{\"ifMatch\":\"1sywh54kpo3c4ezn2znktvl3avge4zl5d\",\"resource\":\"matches.cup\",\"steps\":[[{\"op\":\"replace\",\"path\":\"/parents\",\"value\":[{\"href\":\"/r/cat-season/vault\"}]}]]},{\"ifMatch\":\"1idx6u2b3z42obqmwsgmlzvrfuutks2bq\",\"resource\":\"matches.old\",\"steps\":[\"delete\"]},{\"ifMatch\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"resource\":\"season\",\"steps\":[[{\"op\":\"remove\",\"path\":\"/$access/group:fans\"}]]}],\"ns\":\"cat-season\",\"source\":{\"at\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\",\"ns\":\"cat-season-r7\"}},{\"items\":[{\"ifMatch\":{\"batch\":0,\"item\":0},\"resource\":\"matches.cup\",\"steps\":[[{\"op\":\"replace\",\"path\":\"/parents\",\"value\":[{\"href\":\"/r/cat-season/embargo\"}]},{\"op\":\"add\",\"path\":\"/$nonce\",\"value\":\"not-fresh\"}]]},{\"ifNoneMatch\":\"*\",\"resource\":\"matches.newbie\",\"steps\":[[{\"op\":\"add\",\"path\":\"\",\"value\":{\"parents\":[{\"href\":\"/r/cat-season/season\"}]}}]]}],\"ns\":\"cat-season\",\"source\":{\"at\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\",\"ns\":\"cat-season-r7\"}}],\"release\":\"/r/releases/release-7/rev/1vmctae4vewju6nvxi374rkrkmyzpdrif\"}",
+      "digest": "1rvfmashxuxn5rbmma7dupfj55l74r3jb"
+    }
+  ]
+}
