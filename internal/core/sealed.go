@@ -353,7 +353,7 @@ func (t *tx) resJob(n *nsRow, name string, row *revRow, kind string, plain func(
 }
 
 // configJob prepares the sealing of n's namespace document at ns_log seq.
-func (t *tx) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
+func (t *gate) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
 	j := &sealJob{kind: sealConfig, key: nsID}
 	if t.stored(n, j) {
 		return j
@@ -366,7 +366,7 @@ func (t *tx) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
 
 // rangeJob prepares the sealing of n's namespace log range (since, to],
 // where to is ns_log seq toSeq with id toID.
-func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain func() []byte) *sealJob {
+func (t *gate) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain func() []byte) *sealJob {
 	j := &sealJob{kind: sealRange, key: since + ":" + toID}
 	if t.stored(n, j) {
 		return j

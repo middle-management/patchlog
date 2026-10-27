@@ -59,7 +59,7 @@ func (t *gate) purgedRead(n *nsRow) *Error {
 // rather than in the clear, which would show authors and timing to anyone
 // the keys kept out (§8.5). /ns/{ns} still redirects, to a revision that
 // is 410, and the 410's head tells a consumer of the purge.
-func (t *tx) sealedPurged(n *nsRow) bool { return n.purged && t.isSealedNS(n) }
+func (t *gate) sealedPurged(n *nsRow) bool { return n.purged && t.isSealedNS(n) }
 
 // listHeads lists every resource of n as of asOf (nil = now), including
 // read-through ones, sorted by name in ascending byte order (§7.4), by Go's
@@ -153,16 +153,13 @@ type Head struct {
 
 // ResourceHead resolves the head pointer.
 func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credentials) (*Head, error) {
-	if e.ddb != nil {
-		return e.ddbResourceHead(ctx, ns, name, cred)
-	}
 	if h, ok := e.rc.head(ns, name); ok {
 		return &h, nil
 	}
 	g := e.rc.load(ns)
 	var h *Head
 	public, cached := false, false
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -207,7 +204,7 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 // if it has none, another form, or the document can't be read. The row
 // may be a base's (read-through) or a remote base's mirror: its document
 // is read here either way. Whoever wrote the document wrote it (§8.1).
-func (t *tx) successorAt(row *revRow) string {
+func (t *gate) successorAt(row *revRow) string {
 	if row == nil || row.kind != kindRev {
 		return ""
 	}
@@ -265,9 +262,6 @@ type Rev struct {
 
 // ResourceRev serves the document at a revision.
 func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
-	if e.ddb != nil {
-		return e.ddbResourceRev(ctx, ns, name, id, cred)
-	}
 	if c := e.rc.rev(ns, name, id); c != nil {
 		return c.answer(true), nil
 	}
@@ -276,7 +270,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 	var out *Rev
 	var job *sealJob
 	var nsRowID int64
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -351,9 +345,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		if e2e {
 			if !row.patches.Valid {
-				var state int
-				t.must(t.QueryRow(`SELECT state FROM resources WHERE res = ?`, row.res).Scan(&state))
-				if state == statePurged {
+				if t.resState(row.res) == statePurged {
 					out.Status = 410
 					return nil
 				}
@@ -438,13 +430,10 @@ type Log struct {
 // the entries' JWEs, though always one entry; namespace logs carry no patch
 // sets.
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
-	if e.ddb != nil {
-		return e.ddbResourceLog(ctx, ns, name, id, since, limit, cred)
-	}
 	var out *Log
 	var jobs []*sealJob
 	var nsRowID int64
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -555,11 +544,8 @@ type NSInfo struct {
 
 // NamespaceHead returns the namespace head and config ids.
 func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials) (*NSInfo, error) {
-	if e.ddb != nil {
-		return e.ddbNamespaceHead(ctx, ns, cred)
-	}
 	var out *NSInfo
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -581,13 +567,10 @@ func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials)
 // NamespaceRev returns the namespace document in force at an ns_id; in a
 // purged sealed namespace it is 410 purged at any (§8.5).
 func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credentials) (*NSInfo, error) {
-	if e.ddb != nil {
-		return e.ddbNamespaceRev(ctx, ns, nsID, cred)
-	}
 	var out *NSInfo
 	var job *sealJob
 	var nsRowID int64
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -607,9 +590,7 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 		if !ok {
 			return nfNS(t.cachePublic(n))
 		}
-		var cseq int64
-		var doc string
-		t.must(t.QueryRow(`SELECT l.config_seq, c.doc FROM ns_log l JOIN ns_config c ON c.seq = l.config_seq WHERE l.seq = ?`, seq).Scan(&cseq, &doc))
+		cseq, doc := t.entryConfig(seq)
 		out = &NSInfo{Head: nsID, Config: t.configID(cseq).String(), Doc: []byte(doc),
 			Public: t.cachePublic(n)}
 		if t.isSealedNS(n) {
@@ -633,9 +614,6 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 // namespace the answer is one JWE for the page actually served, pl.range
 // [since, Last] (§E.2.2), and once it is purged, 410 purged (§8.5).
 func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials) (*Log, error) {
-	if e.ddb != nil {
-		return e.ddbNamespaceLog(ctx, ns, nsID, since, limit, cred)
-	}
 	return e.namespaceLog(ctx, ns, nsID, since, limit, cred, false, "", nil)
 }
 
@@ -644,9 +622,6 @@ func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit
 // sealed namespace each entry is sealed on its own, as the range (prev, id]
 // (EntryJWEs).
 func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit int, cred Credentials) (*Log, error) {
-	if e.ddb != nil {
-		return e.ddbEvents(ctx, ns, "", since, limit, cred)
-	}
 	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, "", nil)
 }
 
@@ -657,9 +632,6 @@ func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit in
 // the whole page. With since "" it answers no entries and Last the
 // namespace head, where the stream starts following.
 func (e *Engine) ResourceEvents(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
-	if e.ddb != nil {
-		return e.ddbEvents(ctx, ns, name, since, limit, cred)
-	}
 	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, name, nil)
 }
 
@@ -667,7 +639,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 	var out *Log
 	var jobs []*sealJob
 	var nsRowID int64
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		switch {
 		case live != nil && live.shared:
@@ -720,25 +692,9 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			fromSeq = s
 		}
-		q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
-		args := []any{n.id, fromSeq, toSeq}
-		if limit > 0 {
-			q += ` LIMIT ?`
-			args = append(args, limit)
-		}
-		rows, err := t.Query(q, args...)
-		t.must(err)
 		type raw struct {
-			seq     int64
-			id      []byte
-			prev    *int64
-			body    string
-			author  int64
-			created int64
-			grantID []byte
-			noAuth  sql.NullInt64
-			meta    sql.NullString
-			m       map[string]any // body, parsed
+			nsLogRow
+			m map[string]any // body, parsed
 		}
 		// A page holds at most limit entries, and at most limit resource
 		// entries, a batch entry counting as its items (it carries them):
@@ -747,21 +703,19 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		// 1,000 items each held a million.
 		var rs []raw
 		units := 0
-		for rows.Next() {
-			var r raw
-			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta))
-			r.m = jsonv.MustParse([]byte(r.body)).(map[string]any)
+		t.nsLogRows(n, fromSeq, toSeq, limit, func(lr nsLogRow) bool {
+			r := raw{nsLogRow: lr, m: jsonv.MustParse([]byte(lr.body)).(map[string]any)}
 			u := 1
 			if es, ok := r.m["entries"].([]any); ok && len(es) > 1 {
 				u = len(es)
 			}
 			if limit > 0 && len(rs) > 0 && units+u > limit {
-				break
+				return false
 			}
 			units += u
 			rs = append(rs, r)
-		}
-		rows.Close()
+			return true
+		})
 		out.Status = 200
 		out.Last = since
 		// An entry's prev is the row before it in the page, but for the
@@ -876,11 +830,8 @@ type HeadsPage struct {
 // (a byte-order bound, not necessarily a name), a page of at most the log
 // page size (§7.4).
 func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cred Credentials) (*HeadsPage, error) {
-	if e.ddb != nil {
-		return e.ddbNamespaceHeads(ctx, ns, nsID, after, cred)
-	}
 	var out *HeadsPage
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -1005,3 +956,54 @@ func (h *hub) publish(ns string) {
 }
 
 var _ = sort.Strings
+
+// nsLogRow is a namespace log entry as stored: its hashed body, and the
+// members served beside it (§7.4).
+type nsLogRow struct {
+	seq     int64
+	id      []byte
+	prev    *int64
+	body    string
+	author  int64
+	created int64
+	grantID []byte
+	noAuth  sql.NullInt64
+	meta    sql.NullString // gesture and undoes, or gestures: JSON
+}
+
+// nsLogRows visits n's log entries after seq from up to and including seq
+// to, in chain order, at most limit of them (0: all), while visit returns
+// true.
+func (t *tx) nsLogRows(n *nsRow, from, to int64, limit int, visit func(nsLogRow) bool) {
+	q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
+	args := []any{n.id, from, to}
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := t.Query(q, args...)
+	t.must(err)
+	defer rows.Close()
+	for rows.Next() {
+		var r nsLogRow
+		t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta))
+		if !visit(r) {
+			return
+		}
+	}
+	t.must(rows.Err())
+}
+
+// resState is resource row res's state.
+func (t *tx) resState(res int64) int {
+	var state int
+	t.must(t.QueryRow(`SELECT state FROM resources WHERE res = ?`, res).Scan(&state))
+	return state
+}
+
+// entryConfig is the configuration in force at log entry seq: its seq
+// and document.
+func (t *tx) entryConfig(seq int64) (cseq int64, doc string) {
+	t.must(t.QueryRow(`SELECT l.config_seq, c.doc FROM ns_log l JOIN ns_config c ON c.seq = l.config_seq WHERE l.seq = ?`, seq).Scan(&cseq, &doc))
+	return cseq, doc
+}

@@ -568,11 +568,10 @@ What landed, beyond the spike:
   `openRefers`) is gate logic now, over the reads `nsNames`,
   `pinnedRefs`, `pinningNames`, `schemaRefOf`.
 - **`internal/core/ddb.go`, the seam.** `core.Open` branches on
-  `ddb.IsURL(opt.Path)`; the Engine keeps a `*ddbBackend` and the write
-  methods (`WriteResource`, `Batch`, `WriteConfig`) and the reads
-  (`ResourceHead/Raw/Rev/Log`, `NamespaceHead/Rev/Log/Heads`,
-  `NamespaceLiveLog`, `Namespace/ResourceEvents`, `Wait`, `Ping`,
-  `Close`) delegate, or run on the gate (`gateRead`). Everything else
+  `ddb.IsURL(opt.Path)`; the Engine keeps a `*ddbBackend`, the write
+  methods (`WriteResource`, `Batch`, `WriteConfig`, `UploadBlob`)
+  delegate to the gate's DynamoDB commit, and the reads run on the gate
+  (`gateRead`) for both backends. Everything else
   the server can reach answers 501 rather than falling through to SQL:
   branches, purges and pruning, sealed/e2e, gestures listing,
   author signatures (which the gate would verify but the commit doesn't
@@ -580,13 +579,22 @@ What landed, beyond the spike:
   configurations (`encryption`, `nonce: required`, `signatures:
   required`, `base`, `successor`) are 501 at create and change time, as
   §10 prescribes ("refuse at Open or at namespace-config time").
-- **Reads as items.** Revision-by-id is GSI1; `…/rev/{id}` folds from the
-  genesis (snapshots are a later phase); `…/rev/{nsID}` joins the entry's
-  denormalized `cfgPos` (the `ns_log.config_seq` of the SQL schema);
-  `/heads` serves `created`/`size`/`digest` off the RES item's head
-  metadata, and at an earlier entry from the history rows; log entries
-  serve their grant's reference (or `null`, written with authentication
-  disabled), with gestures merged in unhashed (§7.4).
+- **One read path.** The serving reads (`ResourceHead/Raw/Rev/Log`,
+  `NamespaceHead/Rev/Log/Heads`, the events and the long-poll) are the
+  SQL path's own code on the gate, as the writes' checks are, over a few
+  more reads: `nsLogRows` and `revsBetween` (a log's or a resource's
+  range, visited so a page stops where its bytes say), `entryConfig`,
+  `resState`, `prunedIn`, and the sealed/e2e ones, which DynamoDB
+  answers 501. On the table: revisions fold from the genesis (snapshots
+  are a later phase), `…/rev/{nsID}` joins the entry's denormalized
+  `cfgPos`, a head as of an earlier entry comes from the history rows
+  (`HeadAt`). DynamoDB's log and revision handles keep their positions'
+  order within a namespace or resource, since the reads compare them as
+  SQL's seqs. DynamoDB commits bracket the read cache as SQL commits do
+  (`ddbCommit`), so the shared reads may cache on both. This replaced
+  the seam's hand-written reads, ~400 lines whose answers had drifted
+  (a log page didn't count a batch entry as its items, raw documents
+  went unrecognised).
 - **Errors in the core's body shape** (`{"code": …}`), so the HTTP layer
   serves either backend alike.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
@@ -634,15 +642,15 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,331 top-level tests (pure unit tests included): 906 pass on DynamoDB
-and 422 skip — 385 as unsupported (118 branches, 115 encryption at rest,
-80 purges, 20 nonce-required, …), 36 on their own conditions, and 1 on
+1,331 top-level tests (pure unit tests included): 907 pass on DynamoDB
+and 421 skip — 384 as unsupported (118 branches, 115 encryption at rest,
+79 purges, 20 nonce-required, …), 36 on their own conditions, and 1 on
 the known list, which holds three tests (two by a subtest) meeting
 purges where no skip can reach: inside a service, or on a test's own
 goroutines. No test answers differently from the SQL
 backends: the list's divergences section is empty. A test that skips
 partway has asserted everything before its skip, so the phase-1 surface
-is covered beyond the 906.
+is covered beyond the 907.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on
@@ -663,6 +671,6 @@ becomes its own Go module, which a build links in to serve
   ones), the gate's entry points (`checkItems`, `planConfig`,
   `planCreate`, the readers), the write plan, and the error shape.
 - `core.Open`'s branch on the URL becomes a registry (a backend
-  registers its scheme), and the Engine's `e.ddb != nil` dispatches (43
+  registers its scheme), and the Engine's `e.ddb != nil` dispatches (31
   today) a backend interface, which the SQL path implements as now.
 

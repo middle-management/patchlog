@@ -98,7 +98,7 @@ var testLiveRead func(*Engine)
 var errNotShared = errors.New("core: live read not shared")
 
 // decided records the pass a read check allows (see above).
-func (l *liveRead) decided(t *tx, n *nsRow, cred Credentials, a *actor) {
+func (l *liveRead) decided(t *gate, n *nsRow, cred Credentials, a *actor) {
 	if l.meta%2 != 0 {
 		return
 	}
@@ -159,9 +159,6 @@ func (e *Engine) livePassValid(p *LivePass, ns string) bool {
 // with a valid pass isn't checked again, and is shared with the other
 // waiters of the namespace reading the same since and page.
 func (e *Engine) NamespaceLiveLog(ctx context.Context, ns, since string, limit int, cred Credentials, pass *LivePass) (*Log, *LivePass, error) {
-	if e.ddb != nil {
-		return e.ddbNamespaceLiveLog(ctx, ns, since, limit, cred, pass)
-	}
 	if e.livePassValid(pass, ns) {
 		// The namespace's log counter is in the key: it moves before a
 		// commit wakes the waiters (invalidate), so a waiter woken by a

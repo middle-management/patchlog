@@ -2,7 +2,6 @@ package ddb
 
 import (
 	"context"
-	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -17,81 +16,18 @@ import (
 // limit 1"), with the one case they don't cover — a delete puts none —
 // settled from the chain and, rarely, the log.
 
-// HeadsAt pages a namespace's resources as of the log entry at, in byte
-// order of name after after, at most limit (0: all), with the name to
-// resume after when more follow (pageHeads of core's reads.go). Names with
-// no head at the entry — created after it — are skipped, however many lie
-// between two that have one: the page is filled from chunks of names, not
-// from one. found is false when at is no entry of the log (the 404 of an
-// unknown ns_id).
-func (s *Store) HeadsAt(ctx context.Context, ns, at, after string, limit int) (page []HeadEntry, next string, found bool, err error) {
-	mk, err := s.getItem(ctx, keyNSID(ns, at))
-	if err != nil || mk == nil {
-		return nil, "", false, err
+// HeadAt is name's head in ns as of log position atPos (core's resolve
+// at an earlier entry): nil when it had none.
+func (s *Store) HeadAt(ctx context.Context, ns, name string, atPos uint64) (*HeadEntry, error) {
+	it, err := s.getItem(ctx, keyRes(ns, name))
+	if it == nil || err != nil {
+		return nil, err
 	}
-	atPos := item(mk).n("logPos")
-	chunk := limit + 1
-	if limit <= 0 {
-		chunk = 1000
-	}
-	for {
-		names, rows, err := s.resChunk(ctx, ns, after, chunk)
-		if err != nil {
-			return nil, "", false, err
-		}
-		heads, err := s.headsAtPos(ctx, ns, names, rows, atPos)
-		if err != nil {
-			return nil, "", false, err
-		}
-		for _, h := range heads {
-			if h == nil {
-				continue
-			}
-			if limit > 0 && len(page) == limit {
-				return page, page[len(page)-1].Name, true, nil
-			}
-			page = append(page, *h)
-		}
-		if len(names) < chunk {
-			return page, "", true, nil
-		}
-		after = names[len(names)-1]
-	}
-}
-
-// resChunk reads up to k RES# items with names after after, in byte
-// order (ListHeads's query, keeping the rows: headsAtPos needs their
-// entry ids).
-func (s *Store) resChunk(ctx context.Context, ns, after string, k int) ([]string, []*resRow, error) {
-	cond := "PK = :pk AND begins_with(SK, :pfx)"
-	vals := map[string]types.AttributeValue{":pk": avS(nsPK(ns)), ":pfx": avS("RES#")}
-	if after != "" {
-		// SK > the bound can run past RES# into REV#: the loop stops at
-		// the prefix boundary.
-		cond = "PK = :pk AND SK > :after"
-		vals = map[string]types.AttributeValue{":pk": avS(nsPK(ns)), ":after": avS("RES#" + after)}
-	}
-	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
-		TableName:                 &s.Table,
-		KeyConditionExpression:    &cond,
-		ExpressionAttributeValues: vals,
-		Limit:                     int32ptr(int32(k)),
-		ConsistentRead:            boolptr(true),
-	})
+	hs, err := s.headsAtPos(ctx, ns, []string{name}, []*resRow{scanRes(item(it))}, atPos)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	var names []string
-	var rows []*resRow
-	for _, it := range q.Items {
-		i := item(it)
-		if !strings.HasPrefix(i.s("SK"), "RES#") {
-			break
-		}
-		names = append(names, resName(i.s("SK")))
-		rows = append(rows, scanRes(i))
-	}
-	return names, rows, nil
+	return hs[0], nil
 }
 
 // headsAtPos resolves each resource's head as of log position atPos (nil:
@@ -122,7 +58,7 @@ func (s *Store) headsAtPos(ctx context.Context, ns string, names []string, rows 
 			return nil, apiErr(500, "stored_log", "namespace", ns, "resource", names[i])
 		}
 		if mk.n("logPos") <= atPos {
-			h := &HeadEntry{Name: names[i], ID: r.headID, Tombstoned: r.state == "tombstoned"}
+			h := &HeadEntry{Name: names[i], ID: r.headID, Tombstoned: r.state == "tombstoned", Pos: r.headPos}
 			if h.Tombstoned {
 				tombs = append(tombs, keyRev(ns, names[i], r.headPos))
 			} else {
@@ -208,11 +144,11 @@ func (s *Store) headBefore(ctx context.Context, ns, name string, r *resRow, atPo
 			}
 		}
 		if deleted {
-			return &HeadEntry{Name: name, ID: tid, Tombstoned: true, Created: int64(next.n("created"))}, nil
+			return &HeadEntry{Name: name, ID: tid, Tombstoned: true, Created: int64(next.n("created")), Pos: revPos + 1}, nil
 		}
 	}
 	return &HeadEntry{
-		Name: name, ID: live.s("id"),
+		Name: name, ID: live.s("id"), Pos: revPos,
 		Created: int64(live.n("created")), Size: live.n("size"), Digest: live.b("digest"),
 	}, nil
 }

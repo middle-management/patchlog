@@ -75,6 +75,21 @@ type checkReads interface {
 	revByID(n *nsRow, name string, id ids.ID) *revRow
 	revID(seq int64) ids.ID
 	schemaNS(name string) *nsRow
+
+	// Serving reads (reads.go, resolve.go).
+	knowRevID(seq int64, id ids.ID)
+	prunedIn(segs []segment, lo int64) error
+	revsBetween(res, from, max int64, limit int, visit func(*revRow) bool)
+	nsLogRows(n *nsRow, from, to int64, limit int, visit func(nsLogRow) bool)
+	resState(res int64) int
+	entryConfig(seq int64) (cseq int64, doc string)
+	// Sealed and e2e serving (sealed.go, e2e.go).
+	resJob(n *nsRow, name string, row *revRow, kind string, plain func() []byte) *sealJob
+	stored(n *nsRow, j *sealJob) bool
+	entryEpoch(n *nsRow, seq int64) int
+	epochKey(ns int64, epoch int) []byte
+	e2eSnapshot(row *revRow) string
+	e2eFoldSince(row *revRow) string
 	nsNames() []string
 	noLocks() func()
 	pinnedRefs(l *nsRow) []string

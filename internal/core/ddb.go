@@ -19,26 +19,19 @@ package core
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/middle-management/patchlog/internal/ddb"
-	"github.com/middle-management/patchlog/internal/ids"
-	"github.com/middle-management/patchlog/internal/jsonv"
-	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/schema"
 )
 
-// ddbBackend is the Engine's DynamoDB state: the store and the
-// configuration cache (configs change only through this instance in phase
-// 1, so the cache invalidates on its own commits).
+// ddbBackend is the Engine's DynamoDB state: the store and what the
+// engine keeps of it.
 type ddbBackend struct {
 	store *ddb.Store
 	cfgMu sync.Mutex
-	cfgs  map[string]*ddbCfgEntry
 	// byID are the configurations the gate's reads parsed, by namespace
 	// and id (ddbReads.config): a configuration never changes.
 	byID map[string]*Config
@@ -66,11 +59,6 @@ func (s *markedSet) add(k string) {
 		s.m = map[string]bool{}
 	}
 	s.m[k] = true
-}
-
-type ddbCfgEntry struct {
-	id  string
-	cfg *Config
 }
 
 // ErrUnsupported wraps Open's refusal of an option the backend the path
@@ -139,7 +127,7 @@ func openDDB(opt Options) (*Engine, error) {
 	}
 	e.rc.maxBytes = opt.ReadCacheBytes
 	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
-	e.ddb = &ddbBackend{store: store, cfgs: map[string]*ddbCfgEntry{}, byID: map[string]*Config{}}
+	e.ddb = &ddbBackend{store: store, byID: map[string]*Config{}}
 	return e, nil
 }
 
@@ -162,38 +150,6 @@ func ddbAsErr(err error) *Error {
 	return apiErr(500, "internal", "message", err.Error())
 }
 
-// ddbConfig is the namespace's compiled configuration, cached by id.
-func (e *Engine) ddbConfig(ctx context.Context, ns, cfgID string) (*Config, *Error) {
-	b := e.ddb
-	b.cfgMu.Lock()
-	if c := b.cfgs[ns]; c != nil && c.id == cfgID {
-		cfg := c.cfg
-		b.cfgMu.Unlock()
-		return cfg, nil
-	}
-	b.cfgMu.Unlock()
-	doc, id, err := b.store.ReadConfig(ctx, ns)
-	if err != nil {
-		return nil, ddbAsErr(err)
-	}
-	cfg, perr := e.newConfig(doc, nil, nil)
-	if perr != nil {
-		return nil, perr
-	}
-	b.cfgMu.Lock()
-	b.cfgs[ns] = &ddbCfgEntry{id: id, cfg: cfg}
-	b.cfgMu.Unlock()
-	return cfg, nil
-}
-
-// ddbForgetConfig drops a namespace's cached configuration: the next read
-// re-reads it (single instance; commits are this instance's).
-func (e *Engine) ddbForgetConfig(ns string) {
-	e.ddb.cfgMu.Lock()
-	delete(e.ddb.cfgs, ns)
-	e.ddb.cfgMu.Unlock()
-}
-
 // ddbRefusals are the configuration features phase 1 refuses, shared by
 // creates and changes.
 func ddbRefusals(cfg *Config) *Error {
@@ -214,375 +170,25 @@ func ddbRefusals(cfg *Config) *Error {
 	return nil
 }
 
-// ddbCommitted is the post-commit of a write: wake the namespace's live
-// readers and purge the cache tags the write's transaction would have
-// collected on SQL (t.tags: none for resource writes; ns:{ns} when a
-// config change ends public caching, insertConfig). The read cache holds
-// no ddb entries in phase 1.
+// ddbCommit commits c, bracketed for the read cache as a SQL commit is
+// (commit of engine.go): its generations move before and after, so a read
+// that overlapped it doesn't store what it read, and the namespace's live
+// readers wake. A config change may change what any read answers (meta).
+func (e *Engine) ddbCommit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResult, error) {
+	inv := invalidation{nss: []string{c.NS}, meta: c.Config != nil}
+	e.rc.begin(inv)
+	defer e.invalidate(inv, false)
+	return e.ddb.store.Commit(ctx, c)
+}
+
+// ddbCommitted is the post-commit of a write: purge the cache tags the
+// write's transaction would have collected on SQL (t.tags: none for
+// resource writes; ns:{ns} when a config change ends public caching,
+// insertConfig).
 func (e *Engine) ddbCommitted(ns string, tags ...string) {
-	e.hub.publish(ns)
 	if len(tags) > 0 {
 		e.opt.Purger.PurgeTags(tags)
 	}
 }
 
-// --- writes: ddbwrite.go ---
-
-// applyConfigPatches folds config patches into a namespace document, as
-// createNamespace does (nsops.go).
-func applyConfigPatches(doc any, exists bool, patches any) (any, *Error) {
-	ops, err := patch.Parse(patches)
-	if err != nil {
-		return nil, patchErr(err)
-	}
-	out, _, err := patch.Apply(doc, exists, ops, patch.Options{})
-	if err != nil {
-		return nil, patchErr(err)
-	}
-	return out, nil
-}
-
 // --- reads ---
-
-// ddbGrantRef is the grant reference of grant gid (grantRef).
-func (e *Engine) ddbGrantRef(ctx context.Context, gid string) (map[string]any, *Error) {
-	id, perr := ids.Parse(gid)
-	if perr != nil {
-		return nil, nil
-	}
-	var ref map[string]any
-	if err := e.ddbGateRead(ctx, func(t *gate) error {
-		ref = t.grantRef(id[:])
-		return nil
-	}); err != nil {
-		return nil, ddbAsErr(err)
-	}
-	return ref, nil
-}
-
-// ddbNS guards a read's namespace: the gate's authorisation of the
-// reader (reader, or nsReader for a read of the namespace's own URLs,
-// resource ""), as the SQL reads do; it answers whether the namespace is
-// public.
-func (e *Engine) ddbNS(ctx context.Context, ns string, cred Credentials, resource string) (*ddb.NSInfo, bool, *Error) {
-	info, public, _, err := e.ddbNSRev(ctx, ns, cred, resource, "")
-	return info, public, err
-}
-
-// ddbNSRev is ddbNS for a revision read (rev, a revision id): a reader
-// refused may still read a schema revision the namespace opens with
-// schemaReads to a referrer (schemaReadsRev, ResourceRev).
-func (e *Engine) ddbNSRev(ctx context.Context, ns string, cred Credentials, resource, rev string) (*ddb.NSInfo, bool, bool, *Error) {
-	var public, referrer bool
-	g := e.rc.load(ns)
-	if err := e.ddbGateRead(ctx, func(t *gate) error {
-		n := t.nsByName(ns)
-		if n == nil {
-			return t.absentNS(ns, cred)
-		}
-		var err *Error
-		if resource != "" {
-			_, err = t.reader(n, cred, resource)
-		} else {
-			_, err = t.nsReader(n, cred)
-		}
-		if err != nil && rev != "" {
-			if rid, perr := ids.Parse(rev); perr == nil && t.schemaReadsRev(n, resource, rid, cred, g) {
-				err, referrer = nil, true
-			}
-		}
-		public = t.config(n.configSeq).Read == "public"
-		return asErr(err)
-	}); err != nil {
-		return nil, false, false, ddbAsErr(err)
-	}
-	info, err := e.ddb.store.ReadNSInfo(ctx, ns)
-	if err != nil {
-		return nil, false, false, ddbAsErr(err)
-	}
-	if !info.Exists {
-		return nil, false, false, apiErr(404, "not_found", "namespace", ns)
-	}
-	if info.Purged {
-		return nil, false, false, apiErr(410, "purged", "namespace", ns)
-	}
-	return info, public, referrer, nil
-}
-
-func (e *Engine) ddbResourceHead(ctx context.Context, ns, name string, cred Credentials) (*Head, error) {
-	_, public, err := e.ddbNS(ctx, ns, cred, name)
-	if err != nil {
-		return nil, err
-	}
-	head, derr := e.ddb.store.ReadHead(ctx, ns, name)
-	if derr != nil {
-		return nil, ddbAsErr(derr)
-	}
-	if head == nil {
-		return &Head{State: NotFound, Public: public}, nil
-	}
-	if !head.Live {
-		h := &Head{State: Tombstoned, Head: head.ID, Last: head.LastID, Public: public}
-		// Successor is the last live document's well-formed top-level
-		// $successor (§8.1, §6.5), as the SQL path serves it.
-		if doc, _, err := e.ddb.store.FoldResource(ctx, ns, name, head.LastPos); err == nil {
-			if m, ok := doc.(map[string]any); ok {
-				if s, ok := m["$successor"]; ok && schema.Successor(s) {
-					h.Successor, _ = s.(string)
-				}
-			}
-		}
-		return h, nil
-	}
-	return &Head{State: Live, Head: head.ID, Public: public}, nil
-}
-
-func (e *Engine) ddbResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
-	_, public, referrer, err := e.ddbNSRev(ctx, ns, cred, name, id)
-	if err != nil {
-		return nil, err
-	}
-	if id == "" {
-		head, herr := e.ddb.store.ReadHead(ctx, ns, name)
-		if herr != nil {
-			return nil, ddbAsErr(herr)
-		}
-		if head == nil {
-			return &Rev{Status: 404, Public: public}, nil
-		}
-		if !head.Live {
-			return &Rev{Status: 410, Code: "tombstone", Public: public}, nil
-		}
-		id = head.ID
-	}
-	// The resource's own chain (findInAncestry): a genesis twin's id
-	// names a revision of each.
-	rev, derr := e.ddb.store.ReadRevOf(ctx, ns, name, id)
-	if derr != nil {
-		return nil, ddbAsErr(derr)
-	}
-	if rev == nil {
-		return &Rev{Status: 404, Public: public}, nil
-	}
-	if rev.Kind == "tombstone" {
-		return &Rev{Status: 410, Code: "tombstone", Public: public}, nil
-	}
-	_, canon, derr := e.ddb.store.FoldResource(ctx, ns, name, rev.Pos)
-	if derr != nil {
-		return nil, ddbAsErr(derr)
-	}
-	return &Rev{Status: 200, Doc: canon, Public: public, Referrer: referrer, Created: time.UnixMilli(rev.Created).UTC(), Digest: rev.Digest}, nil
-}
-
-func (e *Engine) ddbResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
-	_, public, err := e.ddbNS(ctx, ns, cred, name)
-	if err != nil {
-		return nil, err
-	}
-	// The range (since, to] of ResourceLog (§7.1): to is the id's
-	// position, or the head's for ""; since, when given, a revision of the
-	// chain at or below it. The chain is linear, so every revision of it
-	// is an ancestor of the head; anything else is 404, as is an absent
-	// resource.
-	headPos, derr := e.ddb.store.HeadPos(ctx, ns, name)
-	if derr != nil {
-		return nil, ddbAsErr(derr)
-	}
-	if headPos == 0 {
-		return &Log{Status: 404, Public: public}, nil
-	}
-	toPos := headPos
-	if id != "" {
-		if toPos, derr = e.ddb.store.RevPos(ctx, ns, name, id); derr != nil {
-			return nil, ddbAsErr(derr)
-		}
-		if toPos == 0 || toPos > headPos {
-			return &Log{Status: 404, Public: public}, nil
-		}
-	}
-	var fromPos uint64
-	if since != "" {
-		if fromPos, derr = e.ddb.store.RevPos(ctx, ns, name, since); derr != nil {
-			return nil, ddbAsErr(derr)
-		}
-		if fromPos == 0 || fromPos > toPos {
-			return &Log{Status: 404, Public: public}, nil
-		}
-	}
-	// A page (limit > 0) is also bounded by logPageBytes of patch sets,
-	// though it always holds one entry (logBetween).
-	maxBytes := 0
-	if limit > 0 {
-		maxBytes = e.opt.Maximums.LogPageBytes
-	}
-	entries, more, derr := e.ddb.store.ResourceLog(ctx, ns, name, fromPos, toPos, limit, maxBytes)
-	if derr != nil {
-		return nil, ddbAsErr(derr)
-	}
-	out := &Log{Status: 200, Public: public, Last: since, More: more}
-	for _, re := range entries {
-		// LogEntry.value's shape: a resource entry serves its grant's
-		// reference, or none (only namespace entries mark no_auth with
-		// "grant": null).
-		le := LogEntry{
-			ID: re.ID, Parent: re.ParentID, Kind: re.Kind, Patches: re.Patches,
-			Author: re.Author, Created: formatTime(re.Created),
-			Gesture: re.Gesture, Undoes: re.Undoes,
-		}
-		if re.GrantID != "" {
-			if le.Grant, err = e.ddbGrantRef(ctx, re.GrantID); err != nil {
-				return nil, err
-			}
-		}
-		out.Entries = append(out.Entries, le.value())
-		out.Last = re.ID
-	}
-	return out, nil
-}
-
-func (e *Engine) ddbNamespaceLog(ctx context.Context, ns, id, since string, limit int, cred Credentials) (*Log, error) {
-	_, public, err := e.ddbNS(ctx, ns, cred, "")
-	if err != nil {
-		return nil, err
-	}
-	return e.ddbLog(ctx, ns, id, since, limit, public)
-}
-
-// ddbEvents is NamespaceEvents, and ResourceEvents for resource name
-// (namespaceLog's perEntry reads): the namespace log, for a resource only
-// the entries naming it, which need read on it alone.
-func (e *Engine) ddbEvents(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
-	info, public, err := e.ddbNS(ctx, ns, cred, name)
-	if err != nil {
-		return nil, err
-	}
-	if name != "" && since == "" {
-		return &Log{Status: 200, Public: public, Last: info.HeadID}, nil
-	}
-	lg, lerr := e.ddbLog(ctx, ns, "", since, limit, public)
-	if lerr != nil || name == "" {
-		return lg, lerr
-	}
-	var keep []map[string]any
-	for _, m := range lg.Entries {
-		if m["resource"] == name {
-			keep = append(keep, m)
-		}
-	}
-	lg.Entries = keep
-	return lg, nil
-}
-
-// ddbLog reads the namespace log for a reader already authorised.
-func (e *Engine) ddbLog(ctx context.Context, ns, id, since string, limit int, public bool) (*Log, error) {
-	var err *Error
-	entries, next, derr := e.ddb.store.ReadLog(ctx, ns, id, since, limit)
-	if derr != nil {
-		var de *ddb.Error
-		if errors.As(derr, &de) && de.Status == 404 {
-			return &Log{Status: 404, Public: public}, nil
-		}
-		return nil, ddbAsErr(derr)
-	}
-	out := &Log{Status: 200, Public: public, Last: since}
-	var refs map[ddb.GrantID]map[string]any
-	for _, le := range entries {
-		if gid, ok := le["grant"].(ddb.GrantID); ok {
-			// The grant reference (grantRef), or none if the grant isn't
-			// stored.
-			ref, seen := refs[gid]
-			if !seen {
-				if ref, err = e.ddbGrantRef(ctx, string(gid)); err != nil {
-					return nil, err
-				}
-				if refs == nil {
-					refs = map[ddb.GrantID]map[string]any{}
-				}
-				refs[gid] = ref
-			}
-			if ref != nil {
-				le["grant"] = ref
-			} else {
-				delete(le, "grant")
-			}
-		}
-		out.Entries = append(out.Entries, le)
-		out.Last = le["id"].(string)
-	}
-	out.More = next != ""
-	return out, nil
-}
-
-func (e *Engine) ddbNamespaceHead(ctx context.Context, ns string, cred Credentials) (*NSInfo, error) {
-	info, public, err := e.ddbNS(ctx, ns, cred, "")
-	if err != nil {
-		return nil, err
-	}
-	return &NSInfo{Head: info.HeadID, Config: info.ConfigID, Public: public}, nil
-}
-
-func (e *Engine) ddbNamespaceRev(ctx context.Context, ns, id string, cred Credentials) (*NSInfo, error) {
-	_, public, err := e.ddbNS(ctx, ns, cred, "")
-	if err != nil {
-		return nil, err
-	}
-	doc, cfgID, derr := e.ddb.store.ReadDocAtEntry(ctx, ns, id)
-	if derr != nil {
-		// An id that is no entry of the log: the 404 of NamespaceRev,
-		// not a document (nfNS).
-		var de *ddb.Error
-		if errors.As(derr, &de) && de.Status == 404 {
-			return nil, nfNS(public)
-		}
-		return nil, ddbAsErr(derr)
-	}
-	return &NSInfo{Head: id, Config: cfgID, Public: public, Doc: jsonv.Canonical(doc)}, nil
-}
-
-func (e *Engine) ddbNamespaceHeads(ctx context.Context, ns, nsID, after string, cred Credentials) (*HeadsPage, error) {
-	_, public, err := e.ddbNS(ctx, ns, cred, "")
-	if err != nil {
-		return nil, err
-	}
-	// The heads as of the entry nsID (§7.4): names created after it are
-	// skipped, heads moved since are the ones it saw (HeadsAt). An id
-	// that is no entry of the log is 404 (nfNS), "" included.
-	if nsID == "" {
-		return nil, nfNS(public)
-	}
-	page, next, found, derr := e.ddb.store.HeadsAt(ctx, ns, nsID, after, e.opt.Maximums.LogPageSize)
-	if derr != nil {
-		return nil, ddbAsErr(derr)
-	}
-	if !found {
-		return nil, nfNS(public)
-	}
-	out := &HeadsPage{Items: []map[string]any{}, Public: public, Next: next}
-	for _, h := range page {
-		kind := "head"
-		if h.Tombstoned {
-			kind = "tombstone"
-		}
-		item := map[string]any{"resource": h.Name, "kind": kind, "target": h.ID}
-		// created, the target's created time as log entries give it, a
-		// tombstone's too; size and digest, a live head's document's
-		// (NamespaceHeads; plain namespaces only in phase 1).
-		if h.Created != 0 {
-			item["created"] = formatTime(h.Created)
-		}
-		if !h.Tombstoned && len(h.Digest) == sha256.Size {
-			item["size"] = float64(h.Size)
-			item["digest"] = ReprDigest(h.Digest)
-		}
-		out.Items = append(out.Items, item)
-	}
-	return out, nil
-}
-
-// ddbNamespaceLiveLog is NamespaceLog for the long-poll fetch: correct,
-// without the SQL path's sharing of reads among waiters (live.go's
-// collapse is an optimization; Streams are phase 3).
-func (e *Engine) ddbNamespaceLiveLog(ctx context.Context, ns, since string, limit int, cred Credentials, pass *LivePass) (*Log, *LivePass, error) {
-	lg, err := e.ddbNamespaceLog(ctx, ns, "", since, limit, cred)
-	return lg, nil, err
-}

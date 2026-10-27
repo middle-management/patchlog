@@ -134,25 +134,30 @@ func mustWrite(t testing.TB, s *Store, ns, name, ifMatch, p string) *written {
 // want entries, and returns its ids.
 func checkChain(t testing.TB, s *Store, ns string, want int) map[string]bool {
 	t.Helper()
-	entries, _, err := s.ReadLog(context.Background(), ns, "", "", 0)
+	ctx := context.Background()
+	n, err := s.Namespace(ctx, ns)
 	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []*EntryRow
+	if err := s.EntriesBetween(ctx, ns, 0, n.TipPos, 0, func(e *EntryRow) bool {
+		entries = append(entries, e)
+		return true
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if len(entries) != want {
 		t.Fatalf("%d entries, want %d", len(entries), want)
 	}
 	seen := map[string]bool{}
-	prev := entries[0]["id"].(string)
-	seen[prev] = true
-	for i, e := range entries[1:] {
-		if e["prev"] != prev {
-			t.Fatalf("entry %d prev %v, want %s: a gap in the chain", i+2, e["prev"], prev)
+	for i, e := range entries {
+		if e.Pos != uint64(i+1) || e.PrevPos != uint64(i) {
+			t.Fatalf("entry %d at %d after %d: a gap in the chain", i+1, e.Pos, e.PrevPos)
 		}
-		prev = e["id"].(string)
-		if seen[prev] {
-			t.Fatalf("duplicate entry id %s", prev)
+		if seen[e.ID] {
+			t.Fatalf("duplicate entry id %s", e.ID)
 		}
-		seen[prev] = true
+		seen[e.ID] = true
 	}
 	return seen
 }

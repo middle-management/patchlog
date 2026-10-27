@@ -879,7 +879,7 @@ func (e *Engine) invalidate(inv invalidation, seen bool) {
 	}
 }
 
-func (t *tx) must(err error) {
+func (t *gate) must(err error) {
 	if err != nil {
 		panic(err)
 	}

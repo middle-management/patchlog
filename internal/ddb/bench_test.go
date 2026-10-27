@@ -158,7 +158,11 @@ func BenchmarkDDB(b *testing.B) {
 			b.Fatal(err)
 		}
 		bench(b, 8, 3*time.Second, func(i int) error {
-			_, err := s.ReadHead(ctx, "ns0", "doc")
+			res, err := s.Resource(ctx, "ns0", "doc")
+			if err != nil {
+				return err
+			}
+			_, err = s.DocAt(ctx, "ns0", "doc", res.HeadPos)
 			return err
 		})
 	})
@@ -171,8 +175,7 @@ func BenchmarkDDB(b *testing.B) {
 			}
 		}
 		bench(b, 1, 3*time.Second, func(i int) error {
-			_, _, err := s.ReadLog(ctx, "ns0", "", "", 100)
-			return err
+			return s.EntriesBetween(ctx, "ns0", 0, 1<<40, 100, func(*EntryRow) bool { return true })
 		})
 	})
 }

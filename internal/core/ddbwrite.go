@@ -79,7 +79,7 @@ func (e *Engine) ddbWriteItems(ctx context.Context, req Request, items []Item, c
 			return nil, err
 		}
 		c.NoAuth = p.a.noAuth
-		cres, err := e.ddb.store.Commit(ctx, c)
+		cres, err := e.ddbCommit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
 			continue
 		}
@@ -91,7 +91,6 @@ func (e *Engine) ddbWriteItems(ctx context.Context, req Request, items []Item, c
 		var tags []string
 		if p.cplan != nil {
 			res.ConfigID = p.cplan.id.String()
-			e.ddbForgetConfig(req.NS)
 			if old := r.config(p.n.configSeq); old.cachePublic() && !p.cplan.cfg.cachePublic() {
 				tags = append(tags, "ns:"+req.NS)
 			}
@@ -291,14 +290,13 @@ func (e *Engine) ddbWriteConfig(ctx context.Context, req Request, cc ConfigChang
 			Entry:  map[string]any{"kind": "config", "target": p.id.String()}, Kind: "config",
 			Gesture: cc.Gesture, Undoes: cc.Undoes,
 		}
-		cres, err := e.ddb.store.Commit(ctx, c)
+		cres, err := e.ddbCommit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
 			continue
 		}
 		if err != nil {
 			return nil, ddbAsErr(err)
 		}
-		e.ddbForgetConfig(req.NS)
 		var tags []string
 		if out.cur.cachePublic() && !p.cfg.cachePublic() {
 			// Public copies at the edge must go (§9, insertConfig).
@@ -348,14 +346,17 @@ func (e *Engine) ddbCreateNamespace(ctx context.Context, req Request, cc ConfigC
 	}
 	sctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
+	// A namespace that now exists changes what reads of it answer.
+	inv := invalidation{nss: []string{req.NS}, meta: true}
+	e.rc.begin(inv)
 	cfgID, nsID, err := e.ddb.store.CreateNamespace(sctx, &ddb.Create{
 		NS: req.NS, Author: out.a.id(), Patches: cc.Patches,
 		Grant: grantID, NoAuth: out.a.noAuth,
 	})
+	e.invalidate(inv, false)
 	if err != nil {
 		return nil, ddbAsErr(err)
 	}
-	e.ddbCommitted(req.NS)
 	return &WriteResult{Status: 201, NSID: nsID, ConfigID: cfgID, Entry: &LogEntry{Gesture: cc.Gesture, Undoes: cc.Undoes}}, nil
 }
 
