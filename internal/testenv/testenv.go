@@ -16,8 +16,8 @@
 // opens the SQLite engines of those tests, and of the server package's,
 // with stored patch sets compressed (core.Options.StoreCompression): from
 // a minimum size (default: the option's), or with -1 every patch set,
-// whether it shrinks or not. On Postgres, which refuses the option, it
-// does nothing.
+// whether it shrinks or not. On Postgres, which refuses the option, and
+// DynamoDB, it does nothing.
 package testenv
 
 import (
@@ -42,7 +42,7 @@ const (
 // panics.
 func StoreCompression(o *core.Options) {
 	v := os.Getenv(StoreCompressionEnv)
-	if v == "" || o.StoreCompression != "" || strings.HasPrefix(o.Path, "postgres") {
+	if v == "" || o.StoreCompression != "" || strings.HasPrefix(o.Path, "postgres") || strings.HasPrefix(o.Path, "dynamodb") {
 		return
 	}
 	o.StoreCompression = v
