@@ -67,8 +67,16 @@ func pair(t *testing.T, aOpts, bOpts []envOpt, bMod ...func(*core.RemoteOptions)
 	return a, b, rt
 }
 
+// remoteGenesis is the genesis of a remote branch of ns, a namespace of A
+// that isn't a branch: its base.chain is [ns] (§G.3).
 func remoteGenesis(ns, at string, extra map[string]any) []any {
-	doc := map[string]any{"read": "public", "base": map[string]any{"origin": originA, "ns": ns, "at": at}}
+	return remoteGenesisChain([]string{ns}, at, extra)
+}
+
+// remoteGenesisChain is the genesis of a remote branch of chain[0], whose
+// bases as of at are the rest of chain (§G.3).
+func remoteGenesisChain(chain []string, at string, extra map[string]any) []any {
+	doc := map[string]any{"read": "public", "base": map[string]any{"origin": originA, "ns": chain[0], "at": at, "chain": strs(chain)}}
 	for k, v := range extra {
 		doc[k] = v
 	}
@@ -545,7 +553,7 @@ func TestRemoteTampered(t *testing.T) {
 	for _, c := range cases {
 		rt.set(tamper(t, a, c.match, func(b []byte) []byte { return bytes.ReplaceAll(b, []byte(c.from), []byte(c.to)) }), "")
 		r := b.mkRemote("rel", remoteGenesis("main", f.at, nil))
-		if r.Code != 502 || r.Str("code") != "remote" {
+		if r.Code != 502 || r.Str("code") != "upstream" || r.Str("origin") != originA {
 			t.Errorf("%s: %d %s", c.name, r.Code, r.Body)
 		}
 		expect(t, b.get("/ns/rel"), 404)
@@ -553,7 +561,7 @@ func TestRemoteTampered(t *testing.T) {
 	}
 	// Unreachable: 502.
 	rt.set("http://127.0.0.1:1", "")
-	expectCode(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 502, "remote")
+	expectCode(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 502, "upstream")
 	// Genuine data through the same proxy works.
 	rt.set(tamper(t, a, "/nothing", nil), "")
 	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
@@ -576,8 +584,8 @@ func TestRemoteKeys(t *testing.T) {
 	rt := &route{url: a.srv.URL}
 	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt))
 	b.opPriv = bPriv
-	// Without a read grant at A, the base can't be fetched.
-	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, map[string]any{"read": "grant"})), 502, "remote")
+	// Without a read grant at A, B can't read the base: 422 (§G.3, §G.5.2).
+	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, map[string]any{"read": "grant"})), 422, "invalid")
 	rt.set(a.srv.URL, a.grant(kA, "svc:b", []string{"main"}, []string{"read"}))
 	// Only the operator key creates remote branches.
 	q := req{method: "PATCH", path: "/ns/rel", ifNoneMatch: "*", body: remoteGenesis("main", at, nil), bearer: gA}

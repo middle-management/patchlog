@@ -169,17 +169,19 @@ func TestSaveOverOthersDelete(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/z.json", `{"a": "1", "b": "2"}`), 201, "PUT 31 s after the user's DELETE")
 	whole("z")
 
-	// Moved away (its last document has $successor): a write to the old
-	// name moments after makes it anew, without the $successor.
+	// Moved away (its last document has $successor): no write to the old
+	// name makes it anew, moments after or later (§H.2, §H.4): a 409
+	// naming the new path.
 	e.create("docs", "m", map[string]any{"a": "1"})
 	e.expect(e.do("MOVE", "/docs/m.json", "", "Destination", "/docs/n.json"), 201, "MOVE")
 	if h, _ := e.load("docs", "m"); h.Successor != "n" {
 		t.Fatalf("m's successor %q", h.Successor)
 	}
-	e.expect(e.do("PUT", "/docs/m.json", `{"a": "again"}`), 201, "PUT the old name")
-	whole("m")
-	_, doc = e.load("docs", "m")
-	sameJSON(t, doc, map[string]any{"a": "again"})
+	r = e.expect(e.do("PUT", "/docs/m.json", `{"a": "again"}`), 409, "PUT the old name")
+	if !strings.Contains(r.body, "/docs/n.json") {
+		t.Fatalf("409 %q", r.body)
+	}
+	e.expectTombstoned("docs", "m", "after the refused save")
 }
 
 // Saves of a JSON file are patch sets from the base's rendering (§H.4):
@@ -190,9 +192,10 @@ func TestSaveOverOthersDelete(t *testing.T) {
 // head; one merged with others' edits is a 413 instead.
 func TestOversizeSave(t *testing.T) {
 	t.Parallel()
+	// 3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize (§6.6 Values).
 	e := newEnv(t, []string{"lim", "dflt", "sealedish"}, nil, map[string]map[string]any{
-		"lim":       {"limits": map[string]any{"patchSetSize": 1024, "opsPerSet": 3}},
-		"sealedish": {"nonce": "required", "limits": map[string]any{"patchSetSize": 1024}},
+		"lim":       {"limits": map[string]any{"patchSetSize": 2048, "valueSize": 300, "pathSize": 40, "opsPerSet": 3}},
+		"sealedish": {"nonce": "required", "limits": map[string]any{"patchSetSize": 2048, "valueSize": 300, "pathSize": 40}},
 	})
 	isWhole := func(ns, name string) {
 		t.Helper()
@@ -201,14 +204,19 @@ func TestOversizeSave(t *testing.T) {
 			t.Fatalf("%s/%s: not a root replace: %q", ns, name, p)
 		}
 	}
-	big := strings.Repeat("x", 2000)
+	// Over patchSetSize, in strings within valueSize.
+	bigV := make([]any, 8)
+	for i := range bigV {
+		bigV[i] = strings.Repeat("x", 290)
+	}
+	big := rendered(bigV)
 
 	e.create("lim", "x", map[string]any{"v": "1", "$successor": "elsewhere"})
 	buf := e.expect(e.do("GET", "/lim/x.json", ""), 200, "GET").body
-	e.expect(e.do("PUT", "/lim/x.json", edit(t, buf, `"v": "1"`, `"v": "`+big+`"`)), 201, "PUT over patchSetSize")
+	e.expect(e.do("PUT", "/lim/x.json", edit(t, buf, `"v": "1"`, `"v": `+big)), 201, "PUT over patchSetSize")
 	isWhole("lim", "x")
 	_, doc := e.load("lim", "x")
-	sameJSON(t, doc, map[string]any{"v": big, "$successor": "elsewhere"})
+	sameJSON(t, doc, map[string]any{"v": bigV, "$successor": "elsewhere"})
 
 	e.create("lim", "ops", map[string]any{"a": "0", "b": "0", "c": "0", "d": "0"})
 	e.expect(e.do("GET", "/lim/ops.json", ""), 200, "GET")
@@ -219,8 +227,8 @@ func TestOversizeSave(t *testing.T) {
 	buf = e.expect(e.do("GET", "/lim/merged.json", ""), 200, "GET").body
 	e.theirs("lim", "merged", replace("/w", "theirs"))
 	h, _ := e.load("lim", "merged")
-	r := e.expect(e.do("PUT", "/lim/merged.json", edit(t, buf, `"v": "1"`, `"v": "`+big+`"`)), 413, "PUT over patchSetSize, merged")
-	if !strings.HasPrefix(r.body, "too large: patchSetSize 2041 > 1024 (§6.6)") || !strings.Contains(r.body, "merged") {
+	r := e.expect(e.do("PUT", "/lim/merged.json", edit(t, buf, `"v": "1"`, `"v": `+big)), 413, "PUT over patchSetSize, merged")
+	if !strings.HasPrefix(r.body, "too large: patchSetSize ") || !strings.Contains(r.body, " > 2048 (§6.6)") || !strings.Contains(r.body, "merged") {
 		t.Fatalf("413 %q", r.body)
 	}
 	e.expectLive("lim", "merged", h, "after a 413")
@@ -258,7 +266,7 @@ func TestOversizeSave(t *testing.T) {
 	// Where nonces are required, the root replace carries a fresh one.
 	e.create("sealedish", "x", map[string]any{"v": "1", "$nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaa"})
 	e.expect(e.do("GET", "/sealedish/x.json", ""), 200, "GET")
-	e.expect(e.do("PUT", "/sealedish/x.json", `{"v": "`+big+`"}`), 201, "PUT over patchSetSize, nonces required")
+	e.expect(e.do("PUT", "/sealedish/x.json", `{"v": `+big+`}`), 201, "PUT over patchSetSize, nonces required")
 	isWhole("sealedish", "x")
 	_, doc = e.load("sealedish", "x")
 	if n, _ := doc.(map[string]any)["$nonce"].(string); n == "" || n == "aaaaaaaaaaaaaaaaaaaaaaaaaa" {
@@ -308,8 +316,9 @@ func TestSaveRangeReadNoBase(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/x.json", edit(t, editor, `"A"`, `"Mine"`)), 201, "PUT after it: the reload")
 }
 
-// Records last a day (§H.4): after it, a save without a tag has no base,
-// and the file as written wins.
+// Records last a day (§H.4): after it they count as evicted, so a save
+// without a tag is a 409, never written over others' edits as one with
+// no base would be, and after the reload it asks for the save merges.
 func TestSaveRecordsForADay(t *testing.T) {
 	t.Parallel()
 	c := newClock()
@@ -326,9 +335,11 @@ func TestSaveRecordsForADay(t *testing.T) {
 	buf = e.expect(e.do("GET", "/docs/y.json", ""), 200, "GET").body
 	e.theirs("docs", "y", replace("/b", "theirs"))
 	c.add(25 * time.Hour)
-	e.expect(e.do("PUT", "/docs/y.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT after 25 h")
+	e.expect(e.do("PUT", "/docs/y.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 409, "PUT after 25 h")
+	buf = e.expect(e.do("GET", "/docs/y.json", ""), 200, "the reload").body
+	e.expect(e.do("PUT", "/docs/y.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT after the reload")
 	_, doc = e.load("docs", "y")
-	sameJSON(t, doc, map[string]any{"a": "mine", "b": "1"})
+	sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
 }
 
 // A write moments after the user's own DELETE restores the file rebased

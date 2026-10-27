@@ -58,7 +58,6 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/middle-management/patchlog/internal/client"
-	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
@@ -132,8 +131,9 @@ type Options struct {
 	// revisions they were served, the content they wrote), for every user
 	// together (default the larger of 128 MiB and 8 times MaxFileSize);
 	// over it, the user keeping the most gives way first. RecordIdle drops
-	// a document's versions untouched that long (default a day). They
-	// outlive the user's scratch files.
+	// a document's versions untouched that long (default a day), which then
+	// count as evicted (§H.4): a save without a tag is refused until a
+	// reload. They outlive the user's scratch files.
 	RecordBytes int
 	RecordIdle  time.Duration
 	// MaxPrincipals bounds the users a gateway keeps state for (§H.7), the
@@ -147,10 +147,10 @@ type Options struct {
 	// MaxLocks bounds one user's locks (default 256).
 	MaxLocks int
 	// VerifyEvery is how often a gateway asks the core again whether a
-	// token's grant is accepted (default 5 minutes): at least as often as
-	// edge grants expire (§H.7, §C.5.2), at most edge.MaxGrantTTL, which
-	// bounds how long a revoked grant still reaches its user's scratch
-	// files. Writers' settings (§7.4 writer) are kept for no longer.
+	// token's grant is accepted (default and at most maxVerifyEvery, five
+	// minutes: §H.7 "Re-checking"), which bounds how long a revoked grant
+	// still reaches its user's scratch files. Writers' settings (§7.4
+	// writer) are kept for no longer.
 	VerifyEvery time.Duration
 	// CatalogTTL is how long a token's read of a catalog's tree serves its
 	// requests, unless this server writes meanwhile (default 5s).
@@ -176,6 +176,11 @@ const (
 	heavyBody  = 4 << 10
 	maxHeavy   = 4
 )
+
+// maxVerifyEvery is the longest a gateway serves a grant without asking
+// the core again whether it is accepted (§H.7 "Re-checking": at least
+// every five minutes), shorter than edge grants live (edge.MaxGrantTTL).
+const maxVerifyEvery = 5 * time.Minute
 
 // maxMetas bounds the files' metadata kept by revision id (fileMeta, a
 // few dozen bytes each), so a listing reads each revision's document once
@@ -270,12 +275,12 @@ func New(opt Options) (*Server, error) {
 	def(&opt.Retries, 5)
 	defDur(&opt.ScratchIdle, time.Hour)
 	defDur(&opt.RecordIdle, 24*time.Hour)
-	defDur(&opt.VerifyEvery, 5*time.Minute)
+	defDur(&opt.VerifyEvery, maxVerifyEvery)
 	defDur(&opt.CatalogTTL, 5*time.Second)
 	defDur(&opt.MaxRetryWait, 2*time.Second)
 	defDur(&opt.TreeWait, 3*time.Second)
-	if opt.VerifyEvery > edge.MaxGrantTTL {
-		return nil, fmt.Errorf("dav: VerifyEvery %v is longer than edge grants live (%v): a gateway re-checks a grant at least as often as they expire (§H.7, §C.5.2)", opt.VerifyEvery, edge.MaxGrantTTL)
+	if opt.VerifyEvery > maxVerifyEvery {
+		return nil, fmt.Errorf("dav: VerifyEvery %v is longer than %v: a gateway re-checks a grant at least every five minutes (§H.7)", opt.VerifyEvery, maxVerifyEvery)
 	}
 	if opt.Realm == "" {
 		opt.Realm = "patchlog"
@@ -400,6 +405,35 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Overwrite") == "" {
 			r.Header.Set("Overwrite", "T")
 		}
+		if r.Method == "MOVE" {
+			// A MOVE's If-Match (its first value), or failing that the If
+			// header's entity tag for its source, names the revision the
+			// source must be at (§H.5): never the target's base, which a
+			// move onto a file takes as a save's without one (§H.4), so it
+			// is kept apart from ifMatch (srcPrecondition). The If lists of
+			// entity tags only are taken out, as for a PUT.
+			ifTag := ifHeaderETag(r.Header.Get("If"), st.path)
+			if h := r.Header.Get("If"); h != "" {
+				if rest := splitIf(h); rest == "" {
+					r.Header.Del("If")
+				} else {
+					r.Header.Set("If", rest)
+				}
+			}
+			switch im := strings.TrimSpace(r.Header.Get("If-Match")); {
+			case im == "*":
+				st.srcAny = true
+			case im != "":
+				rev, ok := matchTag(im)
+				if !ok {
+					badMatch(w, im)
+					return
+				}
+				st.srcMatch = rev
+			default:
+				st.srcMatch = ifTag
+			}
+		}
 		if u, err := url.Parse(r.Header.Get("Destination")); err == nil && u.Path != "" {
 			st.dst = slashClean(u.Path)
 			// A proxy that sets X-Forwarded-Host and passes its own Host
@@ -430,20 +464,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				r.Header.Set("If", rest)
 			}
 		}
+		switch im := strings.TrimSpace(r.Header.Get("If-Match")); {
+		case im == "*":
+			st.matchAny = true
+		case im != "":
+			rev, ok := matchTag(im)
+			if !ok {
+				badMatch(w, im)
+				return
+			}
+			st.ifMatch = rev
+		default:
+			st.ifMatch = ifTag
+		}
 		if r.Method == "PUT" {
 			// The write that follows a document's move aside (vim's backup)
 			// is the edit of it, even create-only (davfs2 then believes the
 			// name free).
 			aside := tk.p.takeAside(st.path, s.opt.Now())
 			st.noneMatch = r.Header.Get("If-None-Match") == "*" && !aside
-		}
-		switch im := strings.TrimSpace(r.Header.Get("If-Match")); {
-		case im == "*":
-			st.matchAny = true
-		case im != "":
-			st.ifMatch = revOfETag(strings.TrimSpace(strings.Split(im, ",")[0]))
-		default:
-			st.ifMatch = ifTag
 		}
 	}
 	switch {
@@ -552,6 +591,28 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 		b.st.bodyErr = err
 	}
 	return n, err
+}
+
+// matchTag is the revision the first entity tag of If-Match value im
+// names (§H.4 "The base", §H.5), empty list elements skipped (RFC 9110
+// §5.6.1), and false where that first value isn't an entity tag (one
+// unquoted, say): it names no revision, so the condition is false, not
+// absent (RFC 9110 §13.1.1), and the request is refused (badMatch)
+// rather than done without one.
+func matchTag(im string) (string, bool) {
+	for _, v := range strings.Split(im, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			rev := revOfETag(v)
+			return rev, rev != ""
+		}
+	}
+	return "", false
+}
+
+// badMatch answers a PUT, DELETE or MOVE whose If-Match names no
+// revision (matchTag): 412, nothing done.
+func badMatch(w http.ResponseWriter, im string) {
+	http.Error(w, fmt.Sprintf("If-Match %q isn't an entity tag (a quoted revision, as ETag gives it, RFC 9110 §8.8.3): it names no revision, so the condition is false (RFC 9110 §13.1.1); nothing was done", im), http.StatusPreconditionFailed)
 }
 
 // revOfETag is the revision an entity tag names: this server's tags are
@@ -1986,6 +2047,13 @@ type reqState struct {
 	ifMatch   string      // the revision a PUT's or DELETE's If-Match or If header names
 	matchAny  bool        // If-Match: *
 	noneMatch bool        // If-None-Match: *
+	// srcMatch is the revision a MOVE's If-Match or If header names for
+	// its source, srcAny its If-Match: * (srcPrecondition, §H.5); srcDone,
+	// srcErr: checked, and the answer
+	srcMatch string
+	srcAny   bool
+	srcDone  bool
+	srcErr   error
 	// placeholder: the PUT's preconditions found an empty placeholder
 	// (scratch) at its document path, which exists for If-Match: *.
 	placeholder bool
@@ -2010,6 +2078,10 @@ type reqState struct {
 	// gone (tombBase).
 	onto string
 	gone []stagedServe
+	// moving: a live file's content is being written to the MOVE's
+	// destination (moveAcross), which a name moved away takes as a new
+	// file: a move, not a save (movedAway)
+	moving bool
 
 	lists  map[string]*listing     // by directory path
 	graphs map[string]*catGraph    // by catalog

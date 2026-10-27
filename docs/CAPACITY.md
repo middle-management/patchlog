@@ -172,9 +172,14 @@ a consumer's snapshot bootstrap held the whole `/heads` listing in memory and on
 
 ```sh
 go build -o patchlog ./cmd/patchlog && go build -o capacity ./cmd/capacity
-./patchlog serve -dev -addr :9080 -db cap.db -origin http://localhost:8080 &
+./patchlog serve -dev -addr :9080 -db cap.db -origin http://localhost:8080 -max-rate-per-namespace 1e9,1e9 &
 ./capacity -url http://127.0.0.1:9080 -pid $! -json result.json   # 1M docs, 5M revisions: about 1-1.5 h to seed
 ```
+
+- **Allowance**: the harness's namespaces give its loader an allowance of 1e9 writes a second
+  and burst, and an allowance's bucket never exceeds the deployment maximum of
+  `ratePerNamespace` (§6.6), so the core needs `-max-rate-per-namespace` raised to it; without
+  it, creating them is `422` (`limit: "ratePerNamespace"`).
 
 - **Grants**: run the core with `-operator-key <public>` (from `patchlog keygen`) and pass the
   private seed as `-operator-seed`; the namespaces are then private and every request carries a

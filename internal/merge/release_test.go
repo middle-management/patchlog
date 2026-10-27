@@ -180,12 +180,13 @@ func (w *relWorld) annaBearer() string {
 		map[string]any{"groups": sAny("match-desk", "catalog-admins"), "exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})
 }
 
+// branch creates a branch of base as anna, with the bases' cleanup periods
+// as its own: cleanup isn't copied into branches (§7.6), and the janitor
+// purges a branch only by its own (§F.6).
 func (w *relWorld) branch(base, name string, patches ...map[string]any) {
 	w.t.Helper()
-	br := client.BranchRequest{Name: name}
-	if len(patches) > 0 {
-		br.Patches = ops(patches...)
-	}
+	cleanup := map[string]any{"merged": "PT0S", "superseded": "PT0S", "abandoned": "PT0S"}
+	br := client.BranchRequest{Name: name, Patches: ops(append([]map[string]any{op("add", "/cleanup", cleanup)}, patches...)...)}
 	must(w.anna.CreateBranch(ctx, base, br))
 }
 
@@ -386,9 +387,10 @@ func testReleaseMerge(t *testing.T) {
 		t.Fatal("step 3 or 4 ran before the stop")
 	}
 
-	// One release per catalog base: release-8 waits for release-7.
-	if holder := must(merge.LockHolder(ctx, w.anna, w.opts("release-8"), "cat-season")); holder != "/r/releases/release-7" {
-		t.Fatalf("lock holder %q", holder)
+	// One release per catalog base: release-8 waits for release-7, whose
+	// merge service (anna's sub here) holds the lock for its plan (§F.9).
+	if l := must(merge.ReadLock(ctx, w.anna, w.opts("release-8"), "cat-season")); l.Holder != "user:anna" || l.Plan != rp.Digest {
+		t.Fatalf("lock %+v, want held by user:anna for %s", l, rp.Digest)
 	}
 	if _, err := merge.ApplyRelease(ctx, w.anna, w.opts("release-8")); !errors.Is(err, merge.ErrLocked) {
 		t.Fatalf("release-8 while release-7 merges: %v", err)

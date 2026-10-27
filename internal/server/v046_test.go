@@ -283,17 +283,18 @@ func TestV046EdgeGrants(t *testing.T) {
 	expect(t, e.do(req{method: "GET", path: "/r/sec/a/rev/" + a + "/log", hdr: cookieHdr(fc)}), 200)
 	expect(t, e.do(req{method: "GET", path: "/r/sec/b", hdr: cookieHdr(fc)}), 401)
 
-	// Refused: rules the edge can't evaluate, "*", no read.
+	// Refused: rules the edge can't evaluate, no read.
 	for name, g := range map[string]string{
 		"unfixed": e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/resource", "value": "z"}}}}),
 		"now":     e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}}}),
-		"star":    mint(t, e.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"*"}, "can": []any{"read"}, "exp": e.clock.Now().Add(time.Hour).Format(time.RFC3339)}),
 		"noread":  e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"append"}),
 	} {
 		if r := issue(g); r.Code != 403 {
 			t.Fatalf("%s: %d %s", name, r.Code, r.Body)
 		}
 	}
+	// "*": an operator grant authorises no edge grant, 401 (§C.4, v0.63).
+	expect(t, issue(mint(t, e.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"*"}, "can": []any{"read"}, "exp": e.clock.Now().Add(time.Hour).Format(time.RFC3339)})), 401)
 	expect(t, issue(""), 401)
 
 	// None outlives the grant's exp; expired ones stop working.

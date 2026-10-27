@@ -427,6 +427,12 @@ func (t *tx) encryptNamespace(n *nsRow) {
 	}
 	for _, ns := range nss {
 		t.lockNS(ns, lockExclusive)
+		// The heads' sizes and plaintext digests go: at rest they would
+		// confirm a guess of a document beside its encrypted content, and
+		// sealed and e2e namespaces list none (§E.1 Stored digests,
+		// headMeta). Reads hash what they serve instead.
+		_, err := t.Exec(`UPDATE revisions SET size = NULL, digest = NULL WHERE digest IS NOT NULL AND res IN (SELECT res FROM resources WHERE ns = ?)`, ns)
+		t.must(err)
 		var resIDs []int64
 		rows, err := t.Query(`SELECT res FROM resources WHERE ns = ? AND state != ?`, ns, statePurged)
 		t.must(err)

@@ -61,7 +61,7 @@ func checkSignatureShapes(req Request, items []Item, isBatch bool) *Error {
 			if st.Signature == "" {
 				continue
 			}
-			if _, err := sig.Parse(st.Signature); err != nil {
+			if _, err := sig.ParseInput(st.Signature); err != nil {
 				if !isBatch {
 					return badInput("malformed Signature: " + err.Error())
 				}

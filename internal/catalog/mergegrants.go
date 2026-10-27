@@ -65,9 +65,12 @@ import (
 //   - any other edit (titles, order): a role with move on every current
 //     parent.
 //
-// Tree powers on a folder the same batch creates come only from its own
-// $access in the batch's result (and an admin may enter one nobody holds
-// them on yet); on other folders from the graph as it is.
+// Tree powers are judged as for organising requests (powers, §B.11.2):
+// an approver in the admin group needs none, a broken parent gives none,
+// only subjects the catalog's key in the catalog may assert count, and a
+// folder without $access has, per subject, the powers held at all its
+// parents. On a folder the same batch creates they are judged in the
+// batch's result; on other folders from the graph as it is.
 
 // MergeGrantRequest is the body of POST /merge-grants.
 type MergeGrantRequest struct {
@@ -271,6 +274,12 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 	if err != nil {
 		return nil, err
 	}
+	// The catalog's key in the catalog, whose scopes decide which of the
+	// approver's subjects give tree powers (powers).
+	catLatest, err := s.t.Checker().Config(ctx, cat)
+	if err != nil {
+		return nil, configErr(cat, err)
+	}
 	subs := Subjects(av)
 	admin := s.isAdmin(av)
 	var incs map[string]Includes
@@ -336,25 +345,34 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 			changes[mi.name] = mi.after
 		}
 		after := g.With(changes)
-		// Tree powers on a folder the same batch creates come only from
-		// its own $access (§B.11.4 create a folder); until it gives some,
-		// only admins can move or place anything into it.
+		// Tree powers as for organising requests (powers): admins need
+		// none; on a folder the same batch creates they are judged in the
+		// batch's result, where one without $access has, per subject, the
+		// powers held at all its parents (§B.11.2, §B.11.4 create a
+		// folder).
+		ck := s.keyAt(g, cat, catLatest)
+		pwBefore, pwAfter := powersAt(g, ck, callerOf(av)), powersAt(after, ck, callerOf(av))
 		power := func(folder, p string, _ int) bool {
+			if admin {
+				return true
+			}
 			if g.Explicit(folder) {
 				if _, changed := changes[folder]; !changed {
-					return powerOn(g, folder, subs, p, admin)
+					return pwBefore.has(folder, p)
 				}
-				return powerOn(g, folder, subs, p, admin) || hasPower(after, folder, subs, p)
+				return pwBefore.has(folder, p) || pwAfter.has(folder, p)
 			}
 			if doc, created := changes[folder]; created && doc != nil {
-				return powerOn(after, folder, subs, p, admin)
+				return pwAfter.has(folder, p)
 			}
 			return false
 		}
+		// names is a document's parents by node name, "" for an entry that
+		// isn't a live link to a node of the catalog, which gives no power.
 		names := func(doc any) []string {
 			var out []string
 			for _, p := range tree.ParseNode(cat, "x", "", doc).Parents {
-				if p.Name != "" && !contains(out, p.Name) {
+				if !contains(out, p.Name) {
 					out = append(out, p.Name)
 				}
 			}
@@ -388,7 +406,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 			case mi.after == nil:
 				chk.Change = "delete"
 				for _, p := range names(mi.before) {
-					if g.Node(p) != nil && g.Node(p).Kind == tree.KindFolder && !power(p, "move", 0) {
+					if !power(p, "move", 0) {
 						err = forbidden("%s: no role of yours with move is assigned on %s", mi.name, p)
 						return
 					}
@@ -426,7 +444,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 					chk.Change = "move"
 					moved = append(moved, mi.name)
 					for _, p := range bp {
-						if !contains(ap, p) && g.Node(p) != nil && g.Node(p).Kind == tree.KindFolder && !power(p, "move", 0) {
+						if !contains(ap, p) && !power(p, "move", 0) {
 							err = forbidden("%s: no role of yours with move is assigned on %s, which the node leaves", mi.name, p)
 							return
 						}
@@ -474,7 +492,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 				b := Effective(g, d, nil)
 				for _, subj := range subjectsOf(a) {
 					for _, r := range a[subj] {
-						if !present(after, d, r, b[subj], incs) {
+						if !present(d, r, b[subj], incs) {
 							err = forbidden("moving %s would give %s the role %s on %s", name, subj, r, after.Href(d))
 							return
 						}
@@ -496,20 +514,27 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 		out.Admin = true
 		return out, nil
 	}
+	// The batch's pairs of /resource and /action, as one alternative per
+	// action naming its resources, so the rule's forms stay within
+	// rulesPerGrant (§12.2) however many items the batch has.
 	var can []string
-	var alts []any
+	names := map[string][]any{}
 	for _, mi := range items {
 		for _, a := range mi.actions {
 			if !contains(can, a) {
 				can = append(can, a)
 			}
+			names[a] = append(names[a], mi.name)
 		}
-		alts = append(alts, map[string]any{"all": []any{
-			resourceRule(mi.name),
-			map[string]any{"op": "test", "path": "/action", "schema": map[string]any{"enum": toAny(mi.actions)}},
-		}})
 	}
 	sort.Strings(can)
+	alts := []any{}
+	for _, a := range can {
+		alts = append(alts, map[string]any{"all": []any{
+			map[string]any{"op": "test", "path": "/action", "value": a},
+			map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": names[a]}},
+		}})
+	}
 	for _, a := range can {
 		if !key.IsStar() && !contains(key.Can, a) {
 			return nil, forbidden("the merge key may not %s in %s", a, cat)

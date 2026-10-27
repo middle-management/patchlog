@@ -119,12 +119,12 @@ func (t *gate) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inB
 	newDoc, writes = d, patch.WritesStrings(w)
 	p.canon = jsonv.Canonical(cc.Patches)
 	p.id = ids.Revision(&curID, p.canon)
-	// Step 4.
-	if len(p.canon) > cur.Limits.PatchSetSize {
-		return nil, limitErr(413, "patchSetSize", int64(len(p.canon)), int64(cur.Limits.PatchSetSize), "patch set too large")
-	}
-	if n := len(jsonv.Canonical(newDoc)); n > cur.Limits.DocumentSize {
-		return nil, limitErr(413, "documentSize", int64(n), int64(cur.Limits.DocumentSize), "document too large")
+	// Step 4: the patch-set and document limits in force, as for a
+	// resource write (§6.6). Only a caller with unrestricted read may
+	// read the namespace document.
+	readable := func() bool { return t.readsNS(n, cur, a, false) }
+	if err := checkConfigLimits(cur.Limits, cc.Patches, p.canon, false, jsonv.Canonical(newDoc), readable); err != nil {
+		return nil, err
 	}
 	// Step 5: the built-in namespace-document schema and branch fields.
 	cfg, verr := t.validateConfig(n, cur, newDoc, writes, a)
@@ -197,12 +197,25 @@ func freezeOnly(writes []string, doc any) bool {
 // produces (§7.4): parseConfig, then checkMembers against prev, what the
 // write keeps (nil for a new namespace). base is a new branch's base's
 // document, so a member refused because the branch inherits it says so.
+// A limit or allowance prev holds unchanged is held to the deployment's
+// maximums rather than refused (configMode, §6.6).
 func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error) {
-	cfg, err := e.parseConfig(doc)
-	if err == nil && len(cfg.Rules) > cfg.Limits.RulesPerNS && rulesOrBoundChanged(cfg.Doc, prev) {
-		// The document's own rulesPerNamespace, which parseConfig, reading
-		// stored documents too, doesn't hold them to (§6.6).
-		err = sizeLimit("rulesPerNamespace", len(cfg.Rules), cfg.Limits.RulesPerNS, fmt.Sprintf("more than %d rules", cfg.Limits.RulesPerNS))
+	cfg, err := parseConfigIn(doc, e.opt.Limits, e.opt.Maximums, configMode{prev: prev})
+	if err == nil {
+		// rulesPerNamespace, the document's own or the default, within the
+		// deployment's maximum, counts every rule form of rules, roles and
+		// key scopes (§12.2). It holds a creation, a branch's included,
+		// and the writes that change what it bounds, not a document
+		// stored over it (§6.6).
+		if bound := min(cfg.Limits.RulesPerNS, e.opt.Maximums.RulesPerNS); cfg.ruleForms > bound && (base != nil || rulesOrBoundChanged(cfg.Doc, prev)) {
+			err = sizeLimit("rulesPerNamespace", cfg.ruleForms, bound, fmt.Sprintf("more than %d rule forms in rules, roles and key scopes (§12.2)", bound))
+		}
+	}
+	if err == nil && (prev == nil || base != nil || valuesChanged(cfg.Doc, prev)) {
+		// A creation, a branch's included, or a write that changes limits
+		// or encryption (§6.6 Values); never a stored document, nor an
+		// epoch's rotation.
+		err = cfg.checkValues()
 	}
 	if err == nil {
 		err = checkMembers(cfg.Doc, prev)
@@ -219,19 +232,70 @@ func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error)
 	return cfg, nil
 }
 
-// rulesOrBoundChanged reports whether doc changes its rules or its own
-// rulesPerNamespace from prev (nil for a new namespace): the writes that
-// bound holds (§6.6). A document an earlier release stored over it, which
-// checked only the deployment's maximum, takes any other write, a freeze
-// among them, as members stored under an earlier version are kept until
-// they are changed (§7.4).
+// valuesChanged reports whether doc changes from prev what the §6.6 Values
+// inequality holds a config write to: limits, or encryption other than its
+// epoch. An epoch moves on every rotation, the server's on a schedule and
+// whenever read access is revoked (§E.2.1), and an E3 client's bump; it
+// changes no term of the inequality, and refusing it would leave a
+// namespace stored under an earlier bound, or a since lowered default,
+// sealed under the key a revoked reader holds.
+func valuesChanged(doc, prev map[string]any) bool {
+	return !jsonv.Equal(doc["limits"], prev["limits"]) || !jsonv.Equal(withoutEpoch(doc["encryption"]), withoutEpoch(prev["encryption"]))
+}
+
+// withoutEpoch is an encryption member without its epoch.
+func withoutEpoch(v any) any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return v
+	}
+	out := make(map[string]any, len(m))
+	for k, x := range m {
+		if k != "epoch" {
+			out[k] = x
+		}
+	}
+	return out
+}
+
+// rulesOrBoundChanged reports whether doc changes its rule forms, in
+// rules, roles or key scopes, or its own rulesPerNamespace from prev (nil
+// for a new namespace): the writes that bound holds (§6.6, §12.2). A
+// document an earlier release stored over it, which checked only the
+// deployment's maximum, or counted only rules, takes any other write, a
+// freeze among them, as members stored under an earlier version are kept
+// until they are changed (§7.4).
 func rulesOrBoundChanged(doc, prev map[string]any) bool {
 	if prev == nil {
 		return true
 	}
 	dl, _ := doc["limits"].(map[string]any)
 	pl, _ := prev["limits"].(map[string]any)
-	return !jsonv.Equal(doc["rules"], prev["rules"]) || !jsonv.Equal(dl["rulesPerNamespace"], pl["rulesPerNamespace"])
+	return !jsonv.Equal(ruleLists(doc), ruleLists(prev)) || !jsonv.Equal(dl["rulesPerNamespace"], pl["rulesPerNamespace"])
+}
+
+// ruleLists gathers the rule lists of a namespace document that
+// rulesPerNamespace counts: rules, each role's and each key scope's, by
+// role name and kid, leaving out roles and keys without rules.
+func ruleLists(doc map[string]any) map[string]any {
+	out := map[string]any{}
+	if v, ok := doc["rules"]; ok {
+		out["rules"] = v
+	}
+	roles, _ := doc["roles"].(map[string]any)
+	for name, r := range roles {
+		if m, _ := r.(map[string]any); m != nil && m["rules"] != nil {
+			out["roles/"+name] = m["rules"]
+		}
+	}
+	keys, _ := doc["keys"].([]any)
+	for _, k := range keys {
+		if m, _ := k.(map[string]any); m != nil && m["rules"] != nil {
+			kid, _ := m["kid"].(string) // unique (grant.ParseKeys)
+			out["keys/"+kid] = m["rules"]
+		}
+	}
+	return out
 }
 
 // configErr is the 422 for a namespace document that fails its schema: a
@@ -567,6 +631,11 @@ func (t *gate) planCreate(req Request, cc ConfigChange) (*actor, any, *Config, *
 	if err != nil {
 		return nil, nil, nil, patchErr(err)
 	}
+	// Step 4: a creation counts as a create (§6.6), held to the
+	// deployment's defaults, which no document has lowered yet.
+	if err := checkConfigLimits(t.e.opt.Limits, cc.Patches, jsonv.Canonical(cc.Patches), true, jsonv.Canonical(doc), func() bool { return true }); err != nil {
+		return nil, nil, nil, err
+	}
 	cfg, perr := t.e.newConfig(doc, nil, nil)
 	if perr != nil {
 		return nil, nil, nil, perr
@@ -758,6 +827,11 @@ func (t *gate) planBranch(req Request, br BranchRequest) (p *branchPlan, replay 
 	// their merge don't block new ones.
 	if live := t.liveBranches(base, nil); live >= bcfg.Limits.BranchesPerNamespace {
 		return nil, nil, limitErr(422, "branchesPerNamespace", int64(live+1), int64(bcfg.Limits.BranchesPerNamespace), "too many live branches")
+	}
+	// The patches and the document, a creation counting as a create, held
+	// to the base's limits (§6.6). Step 1 needed unrestricted read.
+	if err := checkConfigLimits(bcfg.Limits, br.Patches, jsonv.Canonical(br.Patches), true, jsonv.Canonical(nd), func() bool { return true }); err != nil {
+		return nil, nil, err
 	}
 	// Step 5. The document starts as the base's, so the members this
 	// version defines that it holds unchanged are judged as there; any
@@ -1146,10 +1220,17 @@ func (e *Engine) sqlPurgeNamespace(ctx context.Context, req Request, ifMatch str
 type PruneRequest struct {
 	Horizon string
 	Keep    []string
+	// KeepSent reports that the request sent keep, so that keep: []
+	// (clear the keep set) is told from no keep (leave it) (§8.6, §6.4.1).
+	KeepSent bool
 	// Snapshot is the horizon's document sealed by a key-holding client
 	// (seal.SealSnapshot), required for e2e resources and refused
 	// elsewhere (§8.6).
 	Snapshot string
+	// Precondition reports that the request sent If-Match or
+	// If-None-Match, which a prune doesn't take: 428 at step 2.5 (§7.2,
+	// §8.6). Both together are the server's 400.
+	Precondition bool
 }
 
 // PruneResult is the answer to a prune.

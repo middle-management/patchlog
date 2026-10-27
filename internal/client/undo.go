@@ -68,6 +68,7 @@ import (
 	"net/url"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1127,17 +1128,14 @@ func fold(start undoState, log []LogEntry, flags []string, firstGesture int) ([]
 					return nil, st, fmt.Errorf("client: entry %s op %d: %w", e.ID, j, err)
 				}
 				st.doc, st.exists = nd, true
-				switch op.Op {
-				case "remove":
-					for _, w := range ws {
-						fe.writes = append(fe.writes, widen(pre, w))
-					}
-				case "move":
-					if len(ws) == 2 {
-						fe.writes = append(fe.writes, widen(pre, ws[0]), widen(nd, ws[1]))
-					}
-				default:
-					for _, w := range ws {
+				// A write is widened where its parent is an array, before
+				// the op (a removed element) or after it (an added one);
+				// a move's writes, and the arrays an op shifts (§6.4.1),
+				// may be either.
+				for _, w := range ws {
+					if v := widen(pre, w); len(v) < len(w) {
+						fe.writes = append(fe.writes, v)
+					} else {
 						fe.writes = append(fe.writes, widen(nd, w))
 					}
 				}
@@ -1495,12 +1493,22 @@ func moveBack(fe *foldedEntry, st *undoState, paths []pointer.Pointer) ([]any, b
 	doc := fe.pre.doc
 	back := make([]any, 0, len(moves))
 	for _, op := range moves {
-		nd, ws, err := patch.Apply(doc, true, []patch.Op{op}, patch.Options{})
-		if err != nil || len(ws) != 2 {
+		nd, _, err := patch.Apply(doc, true, []patch.Op{op}, patch.Options{})
+		if err != nil || len(op.Path) == 0 {
 			return nil, false
 		}
+		// Where it landed: an append "-" lands at the array's last index.
+		to := append(pointer.Pointer{}, op.Path...)
+		if to[len(to)-1] == "-" {
+			arr, _ := pointer.Get(nd, to[:len(to)-1])
+			a, ok := arr.([]any)
+			if !ok || len(a) == 0 {
+				return nil, false
+			}
+			to[len(to)-1] = strconv.Itoa(len(a) - 1)
+		}
 		doc = nd
-		back = append([]any{map[string]any{"op": "move", "from": ws[1].String(), "path": ws[0].String()}}, back...)
+		back = append([]any{map[string]any{"op": "move", "from": to.String(), "path": op.From.String()}}, back...)
 	}
 	ops, err := patch.Parse(back)
 	if err != nil {

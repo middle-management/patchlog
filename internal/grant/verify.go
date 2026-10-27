@@ -76,24 +76,21 @@ func EffectiveMaxLag(nsMaxLag, keyMaxLag *time.Duration) time.Duration {
 	return lag
 }
 
-// Issued is when a grant counts as issued for requireAt (§C.4):
-// max(nbf, exp − maxTtl) of the root block, or nbf when the key sets no
-// maxTtl. Without either, it is now.
-func Issued(root Block, key *Key, now time.Time) time.Time {
-	var issued *time.Time
+// Issued is when a grant counts as issued for requireAt (§C.4): the later
+// of the root block's nbf and exp − maxTtl, of those that exist (exp −
+// maxTtl only when the key sets maxTtl). ok is false when neither exists:
+// the grant then fails the key scope, since nothing bounds how long ago it
+// was issued.
+func Issued(root Block, key *Key) (issued time.Time, ok bool) {
 	if root.Nbf != nil {
-		issued = root.Nbf
+		issued, ok = *root.Nbf, true
 	}
 	if key != nil && key.MaxTTL != nil && root.Exp != nil {
-		s := root.Exp.Add(-*key.MaxTTL)
-		if issued == nil || s.After(*issued) {
-			issued = &s
+		if s := root.Exp.Add(-*key.MaxTTL); !ok || s.After(issued) {
+			issued, ok = s, true
 		}
 	}
-	if issued == nil {
-		return now
-	}
-	return *issued
+	return issued, ok
 }
 
 // HeadWithin reports whether a revision was its namespace's head at some
@@ -105,14 +102,23 @@ func HeadWithin(next *time.Time, issued time.Time, lag time.Duration) bool {
 
 // Verified is the result of a successful verification.
 type Verified struct {
-	Grant          *Grant
-	Key            *Key
-	Principal      Principal
-	Can            map[string]bool
+	Grant     *Grant
+	Key       *Key
+	Principal Principal
+	// Can are the verbs the grant allows (§C.2 item 2): those the
+	// intersection of its blocks' can allows (the root's roles' verbs for
+	// a root without can), within its key's can for a namespace key, and,
+	// if it carries roles, listed by an effective role.
+	Can map[string]bool
+	// EffectiveRoles are its effective roles (§2.1): nil if it carries
+	// none, and empty, allowing no verb, if it carries roles but none is
+	// effective.
 	EffectiveRoles []string
 	StarKey        bool
-	BlockRules     []any
-	KeyRules       []any
+	// Operator: an operator key verified it (Env.Operator, §C.4).
+	Operator   bool
+	BlockRules []any
+	KeyRules   []any
 
 	roles Roles
 }
@@ -120,9 +126,9 @@ type Verified struct {
 // Verify checks a decoded grant against the configuration in force (§C.2,
 // §C.4), in the order of §C.2: first that every block carrying ns names
 // env.NS (403, before anything is verified), then the signature chain,
-// times and revocation (401: no usable grant), then the key scope (403),
-// readScope included, so the core and the services that verify grants
-// (grantcheck) refuse the same grants.
+// times, revocation and "*" in ns outside an operator grant (401: no usable
+// grant), then the key scope (403), readScope included, so the core and the
+// services that verify grants (grantcheck) refuse the same grants.
 func Verify(g *Grant, env Env) (*Verified, error) {
 	if g == nil || len(g.Blocks) == 0 {
 		return nil, unauth("missing grant")
@@ -150,56 +156,50 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 
 	// Time window: nbf <= now < exp for every block.
 	now := env.Now
-	var effExp, effNbf *time.Time
 	for i, b := range g.Blocks {
-		if b.Nbf != nil {
-			if now.Before(*b.Nbf) {
-				return nil, unauth("grant block %d not yet valid", i)
-			}
-			if effNbf == nil || b.Nbf.After(*effNbf) {
-				effNbf = b.Nbf
-			}
+		if b.Nbf != nil && now.Before(*b.Nbf) {
+			return nil, unauth("grant block %d not yet valid", i)
 		}
-		if b.Exp != nil {
-			if !now.Before(*b.Exp) {
-				return nil, unauth("grant block %d expired", i)
-			}
-			if effExp == nil || b.Exp.Before(*effExp) {
-				effExp = b.Exp
-			}
+		if b.Exp != nil && !now.Before(*b.Exp) {
+			return nil, unauth("grant block %d expired", i)
 		}
 	}
 
-	// Revocation.
+	// Revocation (§C.4). The root block's revocation id is its grant id;
+	// the text id of its signature, which named it before v0.71, still
+	// revokes it, so a revoked list written then keeps revoking.
 	for i, r := range g.RevocationIDs() {
-		if env.Revoked[r] {
+		if env.Revoked[r] || i == 0 && env.Revoked[g.rootSigID()] {
 			return nil, unauth("grant block %d revoked", i)
 		}
 	}
 
-	// "*" in ns: operator grants only (§C.4). The grant is valid, it just
-	// doesn't apply here.
+	// "*" in ns: only grants an operator key signs may name it (§C.4); in
+	// any other the grant is invalid.
 	if g.usesStar() && !env.Operator {
-		return nil, forbid(`only operator grants may name "*" in ns`)
+		return nil, unauth(`only operator grants may name "*" in ns`)
 	}
 
-	// Key scope.
+	// Key scope. Only the root block's can is the issuer's (§C.4): a
+	// narrowing block's verbs outside the key's can narrow nothing more,
+	// since verbs are intersected below (§C.1).
 	star := key.IsStar()
 	if !star {
-		for i, b := range g.Blocks {
-			for _, c := range b.Can {
-				if !contains(key.Can, c) {
-					return nil, forbid("key %q may not grant %q (block %d)", key.Kid, c, i)
-				}
+		for _, c := range root.Can {
+			if !contains(key.Can, c) {
+				return nil, forbid("key %q may not grant %q", key.Kid, c)
 			}
 		}
 	}
 	if key.MaxTTL != nil {
+		// The root block's remaining lifetime, exp − max(now, nbf): a
+		// narrowing block's earlier exp doesn't shorten what the issuer
+		// signed (§C.4).
 		start := now
-		if effNbf != nil && effNbf.After(start) {
-			start = *effNbf
+		if root.Nbf != nil && root.Nbf.After(start) {
+			start = *root.Nbf
 		}
-		if effExp.Sub(start) > *key.MaxTTL {
+		if root.Exp.Sub(start) > *key.MaxTTL {
 			return nil, forbid("grant lifetime exceeds key maxTtl")
 		}
 	}
@@ -224,17 +224,24 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 		if root.At == nil {
 			return nil, forbid("key %q requires at", key.Kid)
 		}
+		issued, ok := Issued(root, key)
+		if !ok {
+			return nil, forbid("key %q requires at, and the grant has neither nbf nor a key maxTtl to date its issuance (§C.4)", key.Kid)
+		}
 		if env.CheckAt == nil {
 			return nil, forbid("cannot check at")
 		}
-		if err := env.CheckAt(key.RequireAt, root.At, Issued(root, key, now), key.MaxLag); err != nil {
+		if err := env.CheckAt(key.RequireAt, root.At, issued, key.MaxLag); err != nil {
 			return nil, forbid("at rejected: %v", err)
 		}
 	}
 
-	// Effective roles: root roles kept by every narrowing block and defined.
+	// Effective roles (§2.1), for a grant that carries roles, one with a
+	// block listing roles: the root block's (none if it lists none) that
+	// every narrowing block listing roles keeps and the configuration
+	// defines.
 	var effRoles []string
-	if root.HasRoles {
+	if g.carriesRoles() {
 		effRoles = []string{}
 		for _, r := range root.Roles {
 			if _, ok := env.Roles[r]; !ok || contains(effRoles, r) {
@@ -275,11 +282,9 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 			}
 		}
 	}
-	if !star {
-		for c := range can {
-			if !contains(key.Can, c) {
-				delete(can, c)
-			}
+	for c := range can {
+		if !star && !contains(key.Can, c) || effRoles != nil && !listedBy(env.Roles, effRoles, c) {
+			delete(can, c)
 		}
 	}
 
@@ -312,6 +317,7 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 		Can:            can,
 		EffectiveRoles: effRoles,
 		StarKey:        star,
+		Operator:       env.Operator,
 		BlockRules:     blockRules,
 		KeyRules:       key.Rules,
 		roles:          env.Roles,
@@ -326,8 +332,30 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 	return v, nil
 }
 
-// HasRoles reports whether the grant carries roles (its root lists roles).
-func (v *Verified) HasRoles() bool { return v.Grant.Blocks[0].HasRoles }
+// listedBy reports whether one of roles, defined in defs, lists verb.
+func listedBy(defs Roles, roles []string, verb string) bool {
+	for _, r := range roles {
+		if contains(defs[r].Can, verb) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasRoles reports whether the grant carries roles (§2.1): a block of it,
+// the root or a narrowing one, lists roles. Its verbs then need an
+// effective role listing them (Allows).
+func (v *Verified) HasRoles() bool { return v.Grant.carriesRoles() }
+
+// carriesRoles reports whether a block of g lists roles (§2.1).
+func (g *Grant) carriesRoles() bool {
+	for _, b := range g.Blocks {
+		if b.HasRoles {
+			return true
+		}
+	}
+	return false
+}
 
 // Allows reports whether verb is allowed at step 1 of §6.2: the blocks (and
 // key) allow it and, if the grant carries roles, at least one effective role

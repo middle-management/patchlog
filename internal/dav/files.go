@@ -39,12 +39,32 @@ var extTypes = map[string]string{
 // blobTypeRe is a type a blob id takes (§3.7), as the core checks it.
 var blobTypeRe = regexp.MustCompile(`^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$`)
 
-// fileType is the type of a raw file named name, uploaded with
-// Content-Type ctype ("" for none), as every tool stores it (§H.1): by the
-// name's extension (extTypes), else ctype without its parameters unless it
-// says nothing of the bytes (an octet stream, a form), else
-// application/octet-stream.
-func fileType(name, ctype string) string {
+// fileType is the type a raw file named name, holding body, is stored
+// with, as every tool takes it (§H.1): by the name's extension
+// (extTypes); else the upload's Content-Type ctype ("" for none) without
+// its parameters, unless it says nothing of the bytes (an octet stream, a
+// form); else, for an existing file, had, the type it has ("" for a new
+// one); else application/octet-stream. A text/ type needs body in UTF-8,
+// a leading BOM allowed (§3.7): any other body is
+// application/octet-stream, whatever the name or upload says. The type is
+// part of the blob id (§3.7), so it is taken once the head is read.
+func fileType(name, ctype, had string, body []byte) string {
+	typ := declaredType(name, ctype)
+	if typ == "" {
+		typ = had
+	}
+	if typ == "" || !textOK(typ, body) {
+		return octetStream
+	}
+	return typ
+}
+
+// octetStream is the type of bytes nothing says more of (§H.1).
+const octetStream = "application/octet-stream"
+
+// declaredType is the type a raw file's name or upload says (fileType),
+// "" where neither says one.
+func declaredType(name, ctype string) string {
 	if i := strings.LastIndexByte(name, '.'); i >= 0 {
 		if t, ok := extTypes[strings.ToLower(name[i+1:])]; ok {
 			return t
@@ -53,13 +73,19 @@ func fileType(name, ctype string) string {
 	if mt, _, err := mime.ParseMediaType(ctype); err == nil {
 		mt = strings.ToLower(mt)
 		switch {
-		case mt == "application/octet-stream", mt == "binary/octet-stream", mt == "application/x-www-form-urlencoded",
+		case mt == octetStream, mt == "binary/octet-stream", mt == "application/x-www-form-urlencoded",
 			strings.HasPrefix(mt, "multipart/"):
 		case blobTypeRe.MatchString(mt):
 			return mt
 		}
 	}
-	return "application/octet-stream"
+	return ""
+}
+
+// textOK reports whether body may be stored as type typ (§H.1, §3.7): a
+// text/ type needs UTF-8, a leading BOM allowed.
+func textOK(typ string, body []byte) bool {
+	return !strings.HasPrefix(typ, "text/") || utf8.Valid(trimBOM(body))
 }
 
 // rawRef is a raw document's blob reference (§7.8): the file's bytes, as

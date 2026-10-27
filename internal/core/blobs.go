@@ -704,6 +704,9 @@ func (t *tx) encryptBlobs(res int64) {
 type BlobUpload struct {
 	Type  string // the Content-Type header as sent
 	Nonce string // Blob-Nonce, "" if absent
+	// NonceSent reports that Blob-Nonce was present, empty or repeated
+	// included (400 at check 4 unless it is one nonce, §7.8).
+	NonceSent bool
 	// From is Blob-From: /r/{ns2}/{name2}/blob/{bid} for a copy, else "".
 	From string
 	// Body is the upload's body; Length its Content-Length, -1 if unknown.
@@ -711,6 +714,14 @@ type BlobUpload struct {
 	Length int64
 	// HasBody reports, for a copy, whether a body was sent (400).
 	HasBody bool
+	// Precondition reports that the request sent If-Match or
+	// If-None-Match, which an upload doesn't take: 428 at check 4 (§7.2,
+	// §7.8).
+	Precondition bool
+	// ShapeErr is a request-shape error the server found in the upload's
+	// headers, such as a Signature header (§C.3.1) or a missing X-Author
+	// (§7.2), answered as 400 at check 4 (§7.8).
+	ShapeErr string
 }
 
 // blobGate is what an upload's checks decided.
@@ -823,6 +834,10 @@ func (t *gate) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, dr
 		}
 		return nil, e
 	}
+	// 4. Request-shape errors in the upload's headers (§7.8).
+	if up.ShapeErr != "" {
+		return nil, badInput(up.ShapeErr)
+	}
 	size := up.Length
 	if up.From != "" {
 		// A copy: a body or an unparseable Blob-From is 400, before any
@@ -853,7 +868,7 @@ func (t *gate) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, dr
 		g.typ, g.nonce = typ, up.Nonce
 	}
 	if cfg.level == levelE2E && g.typ != SealedBlobType {
-		return nil, apiErr(415, "bad_input", "message", "an e2e namespace accepts only "+SealedBlobType+" blobs (§E.3.1)")
+		return nil, apiErr(415, "unsupported_type", "message", "an e2e namespace accepts only "+SealedBlobType+" blobs (§E.3.1)")
 	}
 	// 5. Sizes: blobSize and the uploader's pending bytes.
 	if al := t.allowanceOf(cfg, a); al != nil && al.BlobPending > 0 {

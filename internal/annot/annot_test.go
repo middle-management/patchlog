@@ -359,13 +359,22 @@ func TestResolveRefFragmentErrors(t *testing.T) {
 	c := newCollector(loader, nil)
 	base := syntheticBase + pathFragUser
 	for _, ref := range []string{
-		pathFragLib + "#tag", pathFragLib + "#$defs/tag", pathFragLib + "#/$defs/%zz",
+		pathFragLib + "#/$defs/%zz",
 		pathFragLib + "#/$defs/x~2", pathFragLib + "#/a b", "/r/s/x/../y/rev/" + rev('a') + "#/x",
 	} {
 		_, err := c.resolveRef(base, ref)
 		var re *schema.RefError
 		if !errors.As(err, &re) {
 			t.Errorf("%q: got %v, want RefError", ref, err)
+		}
+	}
+	// A plain name is an anchor of the revision (§6.1): one it lacks, or
+	// one no anchor could define, names nothing.
+	for _, ref := range []string{pathFragLib + "#tag", pathFragLib + "#$defs/tag"} {
+		_, err := c.resolveRef(base, ref)
+		var se *schema.SchemaError
+		if !errors.As(err, &se) {
+			t.Errorf("%q: got %v, want SchemaError", ref, err)
 		}
 	}
 	l, err := c.resolveRef(base, pathFragLib+"#/$defs/a%20b")

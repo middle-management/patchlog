@@ -361,6 +361,8 @@ DO $$ DECLARE c record; BEGIN
     END LOOP;
   END IF;
 END $$;
+-- The one-time data migrations done (dataMigrations, db.go), by name.
+CREATE TABLE IF NOT EXISTS migrations (name text PRIMARY KEY);
 `
 
 // openPG opens a Postgres database and creates or migrates its schema.
@@ -406,6 +408,9 @@ func migratePG(db *sql.DB) error {
 		if err := backfillGrantRoots(func(n int) string { return fmt.Sprintf("$%d", n) })(ctx, tx); err != nil {
 			return fmt.Errorf("backfilling grant roots: %w", err)
 		}
+	}
+	if err := migrateData(ctx, tx, func(n int) string { return fmt.Sprintf("$%d", n) }); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

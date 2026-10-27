@@ -10,8 +10,8 @@
 //	ns_state(ns, purged)                   purge-ns marks the namespace gone
 //	docs(docid, ns, resource, head, schema) one row per live resource (untyped too, see UntypedListing)
 //	text  fts5(ns, resource, schema, path, body)  rowid = docid<<20 | n, so a resource's rows are a rowid range
-//	facet(ns, resource, schema, path, value, raw)
-//	sort (ns, resource, schema, path, value)
+//	facet(ns, resource, schema, path, value, raw)  value: the string form (§A.2), raw: canonical JSON
+//	sort (ns, resource, schema, path, value, raw)  value: the least value (sortColumn), raw: all, a JSON array
 //	refs(ns, resource, schema, path, ref, target_ns, target, rev, entry)  x-ref references (§A.2, §A.3);
 //	                                      path is the full instance pointer, indices included
 //	sealed_views, sealed_view_tags   sealed results of sealed/e2e namespaces (derived.Cache)
@@ -26,10 +26,11 @@
 // be built WithKeys, and Recipient unwraps keys wrapped to the grant's
 // enc); an e2e (E3) namespace only with a keyring Recipient key, its
 // documents folded client-side (the keyring itself is never indexed).
-// Without keys a namespace is skipped: not followed, answered 503
-// "skipped", and reported with the reason at GET /_status. Results over a
-// sealed or e2e namespace are sealed under its current epoch key
-// (§E.2.5): see Handler.
+// Without keys a namespace is skipped: not followed, and reported with the
+// reason at GET /_status. One whose keys the service lacks is answered 404
+// as one it doesn't follow (§A.4); one whose keys it can't fetch for now,
+// 503 behind. Results over a sealed or e2e namespace are sealed under its
+// current epoch key (§E.2.5): see Handler.
 //
 // Stored plaintext. Full-text, facet and sort queries need the indexed
 // values in the clear, so the database holds plaintext derived from
@@ -284,6 +285,13 @@ var likeCreate = []string{
 	`CREATE INDEX IF NOT EXISTS text_doc ON "text" (docid)`,
 }
 
+// indexFormat is the format of the rows, kept as the database's
+// user_version: 1 since v0.73, whose x-index values come from a static walk
+// (§A.2, valueWalk), whose sort rows hold each document's least value and
+// every value as written, booleans included, and whose counts go by string
+// form. A database of an older format is rebuilt (§A.6).
+const indexFormat = 1
+
 func (ix *Index) initSchema(ctx context.Context) error {
 	if !ix.opt.Rebuild {
 		// A database from before v0.44 has no refs table, so its documents'
@@ -313,6 +321,17 @@ func (ix *Index) initSchema(ctx context.Context) error {
 			ix.opt.Logf("index: the database predates sort values in hits and indexed schema documents (§A.4); rebuilding it from the logs")
 			ix.opt.Rebuild = true
 		}
+		// Before v0.73, x-index values were collected while validating, a
+		// sort row held one value, not the least, and booleans none: an
+		// older format is replayed (indexFormat).
+		var format int
+		if err := ix.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&format); err != nil {
+			return err
+		}
+		if docs > 0 && format < indexFormat && !ix.opt.Rebuild {
+			ix.opt.Logf("index: the database predates the static x-index walk and sort order of v0.73 (§A.2); rebuilding it from the logs")
+			ix.opt.Rebuild = true
+		}
 	}
 	if ix.opt.Rebuild {
 		for _, s := range dropStmts {
@@ -328,6 +347,9 @@ func (ix *Index) initSchema(ctx context.Context) error {
 		if _, err := ix.db.ExecContext(ctx, s); err != nil {
 			return fmt.Errorf("index: schema: %w", err)
 		}
+	}
+	if _, err := ix.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, indexFormat)); err != nil {
+		return fmt.Errorf("index: schema: %w", err)
 	}
 	if err := ix.sealed.Init(ctx); err != nil {
 		return fmt.Errorf("index: schema: %w", err)

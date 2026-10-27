@@ -242,12 +242,15 @@ func Encode(ctx context.Context, w io.Writer, b *core.ArchiveBundle) error {
 		if g := e.GrantLine; g != nil {
 			// A grant line (§8.6, §G.4.1), with the key that verifies its
 			// root block among the candidates; left out if none does.
-			gl := &bundle.GrantLine{ID: g.ID, Root: g.Root, Stored: g.Stored}
+			gl := &bundle.GrantLine{ID: g.ID, Root: g.Root}
+			if len(g.Stored) > 0 {
+				gl.Stored = g.Stored[0] // the authority block (§C.3.1)
+			}
 			cands := make([]bundle.KeyEntry, len(g.Keys))
 			for i, k := range g.Keys {
 				cands[i] = bundle.KeyEntry{Kid: k.Kid, Alg: sig.Alg, Pub: base64.RawURLEncoding.EncodeToString(k.Pub)}
 			}
-			if k, ok := bundle.FindRootKey(g.Stored, g.NS, cands); ok {
+			if k, ok := bundle.FindRootKey(gl.Stored, g.NS, cands); ok {
 				gl.Key = k
 			}
 			return bw.Line(bundle.Line{NS: g.NS, GrantLine: gl})

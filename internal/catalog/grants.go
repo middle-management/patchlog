@@ -582,9 +582,10 @@ func parentHrefsRule(list []string) any {
 }
 
 // planContent decides content verbs (read, append, create, …) on an item
-// from the caller's effective roles at its placement, collected only
-// through subjects the catalog's key in the content namespace may assert
-// (§B.11.4); restore is planRestore's. The roles, their definitions and
+// from the caller's roles at its placement, collected only through
+// subjects the catalog's key in the content namespace may grant through
+// (who.through: its sub and groups scopes, §B.11.2, §B.11.4); restore is
+// planRestore's. The roles, their definitions and
 // the catalog's key are those as of the checkpoint the decision reports
 // (configAt), as for visibility.
 func (s *Service) planContent(ctx context.Context, v *grant.Verified, item string, want []string) (_ *plan, err error) {
@@ -641,9 +642,10 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		if n := g.Node(pl); n != nil && !n.Self {
 			placed, state, itemSt = true, n.State, n.ItemState
 		}
-		// Effective roles are collected only through subjects the catalog's
-		// key in the content namespace may assert (§B.11.4 Resolve).
-		roles = s.rolesFor(pl, assertable(key, Subjects(v)))
+		// Roles count only through subjects the catalog's key in the
+		// content namespace may grant through: its sub and groups scopes
+		// (§B.11.2 Through the key, §B.11.4 Resolve).
+		roles = s.rolesFor(pl, callerOf(v).through(key))
 	})
 	switch {
 	case key == nil:
@@ -794,7 +796,7 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 		if key = findKey(cfg.Keys, s.opt.Kid); key == nil {
 			return
 		}
-		subs := assertable(key, Subjects(v))
+		subs := callerOf(v).through(key)
 		incs := map[string]Includes{ns: ParseIncludes(cfg.Doc)}
 		n := g.Node(pl)
 		placed = n != nil && !n.Self
@@ -809,21 +811,7 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 		if !placed || admin {
 			return
 		}
-		frozen := s.frozen[pl]
-		after := Effective(g, pl, nil)
-		subjects := make([]string, 0, len(after))
-		for subj := range after {
-			subjects = append(subjects, subj)
-		}
-		sort.Strings(subjects)
-		for _, subj := range subjects {
-			for _, r := range after[subj] {
-				if !present(g, pl, r, frozen[subj], incs) {
-					wSubj, wRol, widens = subj, r, true
-					return
-				}
-			}
-		}
+		wSubj, wRol, widens = widening(pl, Effective(g, pl, nil), s.frozen[pl], incs)
 	})
 	if key == nil {
 		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
@@ -882,31 +870,52 @@ func liveFolder(g *tree.Graph, name string) bool {
 	return n != nil && n.Kind == tree.KindFolder && !n.Cyclic
 }
 
-// powerAccess is the $access entries whose roles give tree powers on a
-// folder: its own, or with inheritPowers the effective ones, collected on
-// the walk up (§B.11.2).
-func powerAccess(g *tree.Graph, n *tree.Node) map[string][]string {
-	if n.InheritPowers {
-		return Effective(g, n.Name, nil)
+// parentLabel names a parents entry in a refusal: its node name, or its
+// href if that isn't a live link to a node of the catalog.
+func parentLabel(p tree.Parent) string {
+	if p.Name != "" {
+		return p.Name
 	}
-	return n.Access
+	return fmt.Sprintf("%q", p.Href)
 }
 
-// hasPower reports whether a subject of subs is assigned, directly on
-// folder, a catalog role with the tree power (move or place, §B.11.1); on
-// a folder with inheritPowers also through its ancestors (§B.11.2).
-func hasPower(g *tree.Graph, folder string, subs map[string]bool, power string) bool {
-	n := g.Node(folder)
-	if n == nil {
-		return false
-	}
-	roles, _ := g.Config["roles"].(map[string]any)
-	for subj, rs := range powerAccess(g, n) {
-		if !subs[subj] {
-			continue
-		}
-		for _, r := range rs {
-			if def, _ := roles[r].(map[string]any); def[power] == true {
+// powers decides one caller's tree powers (move, place, §B.11.1) at the
+// checkpoint g reflects (§B.11.2 Tree powers):
+//
+//   - they count only at a live folder that isn't cyclic, and only through
+//     the caller's subjects the catalog's key in the catalog may grant
+//     through (who.through: its sub and groups scopes);
+//   - at a folder with $access, a subject's roles have them where they are
+//     assigned there, and with inheritPowers also where they are collected
+//     on the walk up from it;
+//   - at a folder without $access but with parents, a subject's role has
+//     them when the same subject's role has them at every parents entry,
+//     a tombstoned, purged, dangling (missing), cyclic or non-folder parent,
+//     or an entry that isn't a live link to a node of the catalog, giving
+//     none; a root without $access gives none.
+//
+// The walk through parents is recursive, bounded by tree.MaxDepth, and
+// safe on cycles (cyclic nodes give nothing). Callers in the admin group
+// need no tree power (§B.11.4) and don't ask. Use it under View.
+type powers struct {
+	g    *tree.Graph
+	subs map[string]bool
+	defs map[string]any // the catalog's roles, as of the checkpoint
+	memo map[string]map[string]map[string]bool
+}
+
+// powersAt is the caller w's tree powers at the checkpoint g reflects, key
+// the catalog's key in the catalog namespace there (keyAt; nil gives none).
+func powersAt(g *tree.Graph, key *grant.Key, w who) *powers {
+	defs, _ := g.Config["roles"].(map[string]any)
+	return &powers{g: g, subs: w.through(key), defs: defs, memo: map[string]map[string]map[string]bool{}}
+}
+
+// has reports whether the caller holds power p at folder.
+func (pw *powers) has(folder, p string) bool {
+	for _, roles := range pw.rolesAt(folder, 0) {
+		for r := range roles {
+			if def, _ := pw.defs[r].(map[string]any); def[p] == true {
 				return true
 			}
 		}
@@ -914,37 +923,74 @@ func hasPower(g *tree.Graph, folder string, subs map[string]bool, power string) 
 	return false
 }
 
-// noPower reports whether no catalog role with the tree power applies on
-// folder at all (assigned directly, or with inheritPowers through its
-// ancestors): until an admin gives it some, only admins can move or place
-// anything into it (§B.11.4 Create a folder).
-func noPower(g *tree.Graph, folder, power string) bool {
-	n := g.Node(folder)
-	if n == nil {
-		return true
+// rolesAt is, per subject of the caller's, its roles that hold for tree
+// powers at folder (powers).
+func (pw *powers) rolesAt(folder string, depth int) map[string]map[string]bool {
+	if m, ok := pw.memo[folder]; ok {
+		return m
 	}
-	roles, _ := g.Config["roles"].(map[string]any)
-	for _, rs := range powerAccess(g, n) {
-		for _, r := range rs {
-			if def, _ := roles[r].(map[string]any); def[power] == true {
-				return false
+	pw.memo[folder] = nil // a cycle back here gives nothing
+	out := map[string]map[string]bool{}
+	n := pw.g.Node(folder)
+	switch {
+	case n == nil || n.Self || n.Kind != tree.KindFolder || n.Cyclic || depth > tree.MaxDepth:
+	case n.HasAccess:
+		access := n.Access
+		if n.InheritPowers {
+			access = Effective(pw.g, folder, nil)
+		}
+		for subj, roles := range access {
+			if pw.subs[subj] {
+				for _, r := range roles {
+					addRole(out, subj, r)
+				}
+			}
+		}
+	case len(n.Parents) > 0:
+		// Per subject and role: held at every parents entry.
+		for i, p := range n.Parents {
+			if i >= len(n.EdgeStates) || n.EdgeStates[i] != tree.EdgeValid {
+				out = map[string]map[string]bool{}
+				break
+			}
+			at := pw.rolesAt(p.Name, depth+1)
+			if i == 0 {
+				for subj, roles := range at {
+					for r := range roles {
+						addRole(out, subj, r)
+					}
+				}
+				continue
+			}
+			for subj, roles := range out {
+				for r := range roles {
+					if !at[subj][r] {
+						delete(roles, r)
+					}
+				}
+				if len(roles) == 0 {
+					delete(out, subj)
+				}
 			}
 		}
 	}
-	return true
+	pw.memo[folder] = out
+	return out
 }
 
-// powerOn is hasPower, or for an admin a folder nobody holds the power on
-// yet (§B.11.4).
-func powerOn(g *tree.Graph, folder string, subs map[string]bool, power string, admin bool) bool {
-	return hasPower(g, folder, subs, power) || admin && noPower(g, folder, power)
+func addRole(m map[string]map[string]bool, k, v string) {
+	if m[k] == nil {
+		m[k] = map[string]bool{}
+	}
+	m[k][v] = true
 }
 
 // planCreateFolder decides creating a folder (§B.11.4): a role with move
-// on every folder in to. Items in it get their parents' roles through the
-// walk-up, but tree powers on it come only from its own $access, which
-// needs the admin group, as any $access does: the grant refuses a document
-// with $access unless the caller is an admin.
+// on every folder in to, unless the caller is an admin. Items in it get
+// their parents' roles through the walk-up, and until an admin gives it
+// $access (the grant refuses a document with $access unless the caller is
+// an admin), each subject's role has the powers there that it has at all
+// its parents (powers).
 func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node string, to []string) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	name, ok := tree.Resolve(cat, node)
@@ -959,7 +1005,6 @@ func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node 
 	if err != nil {
 		return nil, err
 	}
-	subs := Subjects(v)
 	admin := s.isAdmin(v)
 	var cp string
 	var checkpoint map[string]string
@@ -967,7 +1012,8 @@ func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node 
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		checkpoint = checkpointAt(g, cur)
-		switch key := s.keyAt(g, cat, latest); {
+		key := s.keyAt(g, cat, latest)
+		switch {
 		case key == nil:
 			err = s.noCatalogKey()
 			return
@@ -975,12 +1021,13 @@ func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node 
 			err = forbidden("the catalog's key may not create in %s", cat)
 			return
 		}
+		pw := powersAt(g, key, callerOf(v))
 		for _, f := range tos {
 			if !liveFolder(g, f) {
 				err = errf(422, "not_folder", "%s is not a live folder of %s", f, cat)
 				return
 			}
-			if !powerOn(g, f, subs, "move", admin) {
+			if !admin && !pw.has(f, "move") {
 				err = forbidden("no role of yours with move is assigned on %s", f)
 				return
 			}
@@ -1005,13 +1052,11 @@ func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node 
 	return &plan{ns: cat, resource: name, can: []string{"create"}, rules: rules, cp: cp, checkpoint: checkpoint, key: signer}, nil
 }
 
+// isAdmin reports whether the caller is in the admin group: its grant's
+// groups list it, as the catalog's rule tests /principal/groups (§B.11.3).
+// A group written "group:catalog-admins" is another group (groupSubjects).
 func (s *Service) isAdmin(v *grant.Verified) bool {
-	for _, g := range v.Principal.Groups {
-		if g == s.opt.AdminGroup || g == "group:"+s.opt.AdminGroup {
-			return true
-		}
-	}
-	return false
+	return contains(v.Principal.Groups, s.opt.AdminGroup)
 }
 
 // catalogKey is the catalog namespace's document at the head and the
@@ -1041,7 +1086,10 @@ func (s *Service) keyAt(g *tree.Graph, ns string, latest *grantcheck.Config) *gr
 
 // planPlace decides a placement (§B.11.4): the caller is in the content
 // namespace's catalogs.{catalog}.place list, and has a role with place
-// assigned on every target folder.
+// assigned on every target folder. Re-placing a deleted placement (a
+// restore) must also not widen, unless the caller is an admin: the item's
+// roles from its placement after the write, under to, are compared with
+// the deleted placement's rows (§B.11.4 No widening, §B.11.7).
 //
 // The catalog only issues the grant; the client writes the placement
 // document. Clients should give every placement (create or restore) a
@@ -1073,9 +1121,11 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 		return nil, err
 	}
 	var (
-		key        *grant.Key
-		cp         string
-		checkpoint map[string]string
+		key           *grant.Key
+		cp            string
+		checkpoint    map[string]string
+		wSubj, wRole  string
+		widens, seenD bool
 	)
 	defer func() { err = decidedAt(err, checkpoint) }()
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
@@ -1094,18 +1144,29 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 			err = errf(422, "untrusted", "namespace %s is not trusted by catalog %s", ns, cat)
 			return
 		}
+		pw := powersAt(g, key, callerOf(v))
 		for _, f := range tos {
 			if !liveFolder(g, f) {
 				err = errf(422, "not_folder", "%s is not a live folder of %s", f, cat)
 				return
 			}
-			if !powerOn(g, f, subs, "place", admin) {
+			if !admin && !pw.has(f, "place") {
 				err = forbidden("no role of yours with place is assigned on %s", f)
 				return
 			}
 		}
 		if n := g.Node(pl); n != nil && !n.Self {
 			err = conflict("%s is already placed in %s; move it instead", item, cat)
+			return
+		}
+		if !admin {
+			// Judged here, at the checkpoint, for a re-place below: the
+			// rows the placement had when it was deleted, against the
+			// roles it would have under to, with no $access (§B.11.3).
+			var kept map[string][]string
+			kept, seenD = s.unplacedRows(pl)
+			incs := map[string]Includes{ns: ParseIncludes(s.configAt(g, ns, ccfg).Doc)}
+			wSubj, wRole, widens = widening(pl, rolesUnder(g, tos), kept, incs)
 		}
 	})
 	if err != nil {
@@ -1124,6 +1185,15 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 		return nil, ahead(conflict("%s is already placed in %s; move it instead", item, cat))
 	case h.State == client.Purged:
 		return nil, ahead(conflict("the placement %s was purged", pl))
+	case h.State == client.Tombstoned && widens && !seenD:
+		// The service holds no rows of the placement's deletion (it never
+		// saw it, or it is from before deleted placements' rows were
+		// kept): compared with none, and not decided at the checkpoint.
+		return nil, ahead(forbidden("re-placing %s would give %s the role %s, and the catalog keeps no rows of its deleted placement to compare with; a catalog admin can place it", item, wSubj, wRole))
+	case h.State == client.Tombstoned && widens:
+		// A re-place that widens the deleted placement's rows (§B.11.4
+		// No widening, §B.11.7).
+		return nil, forbidden("re-placing %s would give %s the role %s, which it didn't have when its placement was deleted; a catalog admin can place it", item, wSubj, wRole)
 	case h.State == client.Tombstoned:
 		// Re-placing restores the old placement (§B.11.4): the grant carries
 		// only restore, never create or append, and the client restores
@@ -1157,8 +1227,9 @@ func inPlaceList(doc map[string]any, cat string, subs map[string]bool) bool {
 
 // planMove decides a move (§B.11.4): a role with move on every current
 // parent the node leaves and on every target folder, and no widening of
-// anyone's effective roles in the moved subtree unless the caller is a
-// catalog admin.
+// anyone's roles in the moved subtree, unless the caller is a catalog
+// admin, who needs neither. A parents entry left that gives no power, a
+// broken one included (powers), is refused.
 func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, to []string) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	name, ok := tree.Resolve(cat, node)
@@ -1173,7 +1244,6 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 	if err != nil {
 		return nil, err
 	}
-	subs := Subjects(v)
 	admin := s.isAdmin(v)
 	var incs map[string]Includes
 	if !admin {
@@ -1187,7 +1257,8 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		checkpoint = checkpointAt(g, cur, itemNS(name)...)
-		if s.keyAt(g, cat, latest) == nil {
+		key := s.keyAt(g, cat, latest)
+		if key == nil {
 			err = s.noCatalogKey()
 			return
 		}
@@ -1199,6 +1270,7 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 			err = errf(404, "not_found", "no node %s in %s", name, cat)
 			return
 		}
+		pw := powersAt(g, key, callerOf(v))
 		below := g.Descendants([]string{name})
 		for _, f := range tos {
 			if !liveFolder(g, f) {
@@ -1209,17 +1281,17 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 				err = conflict("moving %s under %s would make a cycle", name, f)
 				return
 			}
-			if !powerOn(g, f, subs, "move", admin) {
+			if !admin && !pw.has(f, "move") {
 				err = forbidden("no role of yours with move is assigned on %s", f)
 				return
 			}
 		}
 		for _, p := range n.Parents {
-			if p.Name == "" || contains(tos, p.Name) {
+			if admin || p.Name != "" && contains(tos, p.Name) {
 				continue
 			}
-			if pn := g.Node(p.Name); pn != nil && pn.Kind == tree.KindFolder && !hasPower(g, p.Name, subs, "move") {
-				err = forbidden("no role of yours with move is assigned on %s, which the node leaves", p.Name)
+			if !pw.has(p.Name, "move") {
+				err = forbidden("no role of yours with move is assigned on %s, which the node leaves", parentLabel(p))
 				return
 			}
 		}
@@ -1319,28 +1391,59 @@ func (s *Service) includesAt(g *tree.Graph, latest map[string]Includes) map[stri
 	return out
 }
 
-// present reports whether role r counts as present before the move at
-// node d, given the roles before (§B.11.4: it, or a role including it,
-// was present). For a placement, includes are read from its item's own
-// content namespace. A folder's roles reach whatever is, or will be,
-// placed below it, so for a folder r must be implied in every trusted
-// content namespace (a namespace declaring nothing implies nothing).
-func present(g *tree.Graph, d, r string, before []string, incs map[string]Includes) bool {
+// present reports whether role r counts as present before at node d,
+// given the roles before (§B.11.4: it, or a role that includes it, was
+// present). Includes apply only to an item's roles, read from its own
+// content namespace: for a placement {ns}.{name}, incs[ns]. A folder's
+// roles compare by name (§B.11.4 No widening).
+func present(d, r string, before []string, incs map[string]Includes) bool {
 	if contains(before, r) {
 		return true
 	}
-	if n := g.Node(d); n != nil && n.ItemNS != "" {
-		return incs[n.ItemNS].closure(before)[r]
+	if ns, _, ok := tree.SplitPlacement(d); ok {
+		return incs[ns].closure(before)[r]
 	}
-	if len(incs) == 0 {
-		return false
+	return false
+}
+
+// widening reports the first subject and role, in byte order, of after
+// (roles per subject at node d after a write) that isn't present in
+// before (§B.11.4 No widening, present).
+func widening(d string, after, before map[string][]string, incs map[string]Includes) (subject, role string, bad bool) {
+	subjects := make([]string, 0, len(after))
+	for subj := range after {
+		subjects = append(subjects, subj)
 	}
-	for _, inc := range incs {
-		if !inc.closure(before)[r] {
-			return false
+	sort.Strings(subjects)
+	for _, subj := range subjects {
+		for _, r := range after[subj] {
+			if !present(d, r, before[subj], incs) {
+				return subj, r, true
+			}
 		}
 	}
-	return true
+	return "", "", false
+}
+
+// rolesUnder is the roles a node without $access would have under the
+// live folders tos (§B.11.2 Walk up): the union of theirs.
+func rolesUnder(g *tree.Graph, tos []string) map[string][]string {
+	acc := map[string]map[string]bool{}
+	for _, f := range tos {
+		for subj, roles := range Effective(g, f, nil) {
+			for _, r := range roles {
+				addRole(acc, subj, r)
+			}
+		}
+	}
+	out := map[string][]string{}
+	for subj, m := range acc {
+		for r := range m {
+			out[subj] = append(out[subj], r)
+		}
+		sort.Strings(out[subj])
+	}
+	return out
 }
 
 // widens reports a subject, node and role that a move of name to tos
@@ -1361,26 +1464,16 @@ func (s *Service) widens(g *tree.Graph, name string, tos []string, incs map[stri
 		// against the roles the item would have now, not against its frozen
 		// rows (§B.11.7). Who may restore it still doesn't change with a
 		// move, and a restore that would widen is refused (planRestore).
-		after := Effective(g, d, override)
-		before := Effective(g, d, nil)
-		subjects := make([]string, 0, len(after))
-		for subj := range after {
-			subjects = append(subjects, subj)
-		}
-		sort.Strings(subjects)
-		for _, subj := range subjects {
-			for _, r := range after[subj] {
-				if !present(g, d, r, before[subj], incs) {
-					return subj, d, r, true
-				}
-			}
+		if subj, r, bad := widening(d, Effective(g, d, override), Effective(g, d, nil), incs); bad {
+			return subj, d, r, true
 		}
 	}
 	return "", "", "", false
 }
 
 // planUnplace decides deleting a placement: a role with move on every
-// current parent (§B.11.4).
+// current parent (§B.11.4), a broken one giving none (powers), unless the
+// caller is a catalog admin.
 func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node string) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	name, ok := tree.Resolve(cat, node)
@@ -1394,7 +1487,7 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 	if err != nil {
 		return nil, err
 	}
-	subs := Subjects(v)
+	admin := s.isAdmin(v)
 	var (
 		cp         string
 		checkpoint map[string]string
@@ -1404,7 +1497,8 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		checkpoint = checkpointAt(g, cur, itemNS(name)...)
-		if s.keyAt(g, cat, latest) == nil {
+		key := s.keyAt(g, cat, latest)
+		if key == nil {
 			err = s.noCatalogKey()
 			return
 		}
@@ -1413,10 +1507,11 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 			err = errf(404, "not_found", "no placement %s in %s", name, cat)
 			return
 		}
+		pw := powersAt(g, key, callerOf(v))
 		for _, p := range n.Parents {
 			hrefs = append(hrefs, p.Href)
-			if pn := g.Node(p.Name); p.Name != "" && pn != nil && pn.Kind == tree.KindFolder && !hasPower(g, p.Name, subs, "move") {
-				err = forbidden("no role of yours with move is assigned on %s", p.Name)
+			if !admin && !pw.has(p.Name, "move") {
+				err = forbidden("no role of yours with move is assigned on %s", parentLabel(p))
 				return
 			}
 		}

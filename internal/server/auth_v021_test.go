@@ -50,18 +50,18 @@ func TestAuthUnknownNamespace(t *testing.T) {
 }
 
 // §C.4: "*" in ns names every namespace, and only operator grants may use
-// it. From a namespace key it is refused (403).
+// it. From a namespace key the grant is invalid (401, v0.63).
 func TestAuthStarNS(t *testing.T) {
 	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	a := e.create("sec", "a", map[string]any{}, f.issuerG)
 	star := e.grant(f.issuer, "user:bob", []string{"*"}, []string{"read", "append"})
-	// A read answers 404, like any valid grant that doesn't allow it.
-	expectCode(t, e.get("/r/sec/a", star), 404, "not_found")
-	expectCode(t, e.write("PATCH", "sec", "a", a, ops(op("add", "/x", 1.0)), star), 403, "forbidden")
+	// No usable grant: a read is 401 too.
+	expectCode(t, e.get("/r/sec/a", star), 401, "unauthenticated")
+	expectCode(t, e.write("PATCH", "sec", "a", a, ops(op("add", "/x", 1.0)), star), 401, "unauthenticated")
 	both := e.grant(f.issuer, "user:bob", []string{"sec", "*"}, []string{"read", "append"})
-	expectCode(t, e.write("PATCH", "sec", "a", a, ops(op("add", "/x", 1.0)), both), 403, "forbidden")
+	expectCode(t, e.write("PATCH", "sec", "a", a, ops(op("add", "/x", 1.0)), both), 401, "unauthenticated")
 	// An operator grant with "*" creates any namespace.
 	opStar := mint(t, e.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"*"}, "can": []any{"config"},
 		"exp": e.clock.Now().Add(time.Hour).Format(time.RFC3339)})

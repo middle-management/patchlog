@@ -68,6 +68,10 @@ func TestListingVisibility(t *testing.T) {
 	where := func(token, item string) map[string]any {
 		t.Helper()
 		r, _ := w.follow("/cat/where?item="+item, token)
+		if r.status == 404 {
+			// Hidden, or not in the catalog (§B.5, §B.11.5).
+			return map[string]any{}
+		}
 		if r.status != 200 {
 			t.Fatalf("where %s: %d %v", item, r.status, r.body)
 		}
@@ -93,10 +97,10 @@ func TestListingVisibility(t *testing.T) {
 	}
 	// Translators' role reads with rules on /writes, which pass as a read
 	// evaluates them (no writes: within is true, §B.11.5 v0.38): its items
-	// are visible, but not the folder (for a folder only a role without
-	// rules counts).
+	// are visible, and so is the folder, since the rules don't refer to
+	// /resource (§B.11.5 v0.67, scenario 27).
 	anna := w.caller("user:anna", "translators")
-	if r, _ := w.follow("/cat/children?of=season", anna); r.status != 404 {
+	if r, _ := w.follow("/cat/children?of=season", anna); r.status != 200 || childNames(r.body) != "matches.derby,matches.shared" {
 		t.Errorf("translator on season: %d %v", r.status, r.body)
 	}
 	if !placed(anna, "/r/matches/derby") {
@@ -106,7 +110,7 @@ func TestListingVisibility(t *testing.T) {
 	w.issue(anna, map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 200)
 
 	// A role with rules on /resource only: an item where they pass is
-	// visible, the folder isn't (it has rules).
+	// visible, the folder isn't (its rules refer to /resource).
 	sc := w.caller("user:sam", "scopers")
 	w.doc("cat", "matches.derby3", map[string]any{"parents": parents("extra")})
 	w.doc("matches", "derby3", map[string]any{"title": "d3"})
@@ -155,9 +159,10 @@ func TestListingVisibility(t *testing.T) {
 	if gs[0].(map[string]any)["error"] != nil || gs[1].(map[string]any)["error"] == nil {
 		t.Errorf("read-grants for catalog nodes: %v", gs)
 	}
-	rg = w.do("POST", "/read-grants", anna, map[string]any{"items": toAny("/r/cat/season")})
-	if rg.body["grants"].([]any)[0].(map[string]any)["error"] == nil {
-		t.Errorf("read-grants: the translator gets a folder it can't list: %v", rg.body)
+	rg = w.do("POST", "/read-grants", anna, map[string]any{"items": toAny("/r/cat/season", "/r/cat/extra")})
+	gs = rg.body["grants"].([]any)
+	if gs[0].(map[string]any)["error"] != nil || gs[1].(map[string]any)["error"] == nil {
+		t.Errorf("read-grants: the translator's folders: %v", rg.body)
 	}
 }
 

@@ -40,6 +40,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // Options configure an Engine.
@@ -47,7 +48,9 @@ type Options struct {
 	// Path of the SQLite database, or ":memory:", or a Postgres URL
 	// (postgres://…, Addendum D.8).
 	Path string
-	// Origin is the deployment's canonical origin (§G.1), e.g. https://cms.example.
+	// Origin is the deployment's canonical origin (§G.1), e.g. https://cms.example:
+	// scheme://host[:port] in lowercase ASCII without a default port
+	// (sig.CanonicalOrigin); Open refuses any other non-empty value.
 	Origin string
 	// AuthDisabled accepts every request (development only). The author is
 	// taken from X-Author.
@@ -299,6 +302,13 @@ func Open(opt Options) (*Engine, error) {
 	if testOptions != nil {
 		testOptions(&opt)
 	}
+	// GET / publishes the origin, and signing inputs, batch sources and
+	// bundle headers carry it, all in the canonical form (§7, §3.5, §C.3,
+	// §G.4.1): a deployment that started with another couldn't have its
+	// bundles imported or its signatures verified elsewhere.
+	if opt.Origin != "" && !sig.CanonicalOrigin(opt.Origin) {
+		return nil, fmt.Errorf("core: origin %q is not a canonical origin (§C.3): scheme://host[:port] in lowercase ASCII, an IDN host as its A-label, without a default port, path or trailing slash", opt.Origin)
+	}
 	if opt.Limits == (Limits{}) {
 		opt.Limits = DefaultLimits()
 		if opt.Maximums == (Limits{}) {
@@ -491,7 +501,7 @@ func (e *Engine) Ping(ctx context.Context) error {
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.55"
+const SpecVersion = "0.73"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a
@@ -516,6 +526,13 @@ func (e *Engine) Limits() Limits { return e.opt.Maximums }
 // parseConfig parses a namespace document with this deployment's limits.
 func (e *Engine) parseConfig(doc any) (*Config, error) {
 	return parseConfig(doc, e.opt.Limits, e.opt.Maximums)
+}
+
+// parseStoredConfig parses a stored namespace document, holding its limits
+// and allowances to this deployment's maximums rather than refusing them:
+// a value stored before a maximum was lowered (§6.6).
+func (e *Engine) parseStoredConfig(doc any) (*Config, error) {
+	return parseConfigIn(doc, e.opt.Limits, e.opt.Maximums, configMode{stored: true})
 }
 
 func (e *Engine) now() time.Time { return e.opt.Now().UTC() }
@@ -1048,7 +1065,7 @@ func (t *tx) config(seq int64) *Config {
 	}
 	var doc string
 	t.must(t.QueryRow(`SELECT doc FROM ns_config WHERE seq = ?`, seq).Scan(&doc))
-	c, err := t.e.parseConfig(jsonv.MustParse([]byte(doc)))
+	c, err := t.e.parseStoredConfig(jsonv.MustParse([]byte(doc)))
 	if err != nil {
 		panic(fmt.Errorf("stored namespace document %d is invalid: %w", seq, err))
 	}

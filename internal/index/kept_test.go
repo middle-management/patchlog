@@ -105,7 +105,9 @@ func TestHopsUnderWrites(t *testing.T) {
 		s.caughtUp("matches")
 		// 40 writes a second; the core's clock moves a second each, so its
 		// rate buckets (§6.6) refill.
-		q := []string{"?q=derby", "?facet[/status]=done", "?sort=/title&limit=5", "?schema=" + url.QueryEscape(w.match)}
+		// (A sort path must be marked sort, v0.73 §A.4: /kickoff is, /title
+		// only text.)
+		q := []string{"?q=derby", "?facet[/status]=done", "?sort=/kickoff&limit=5", "?schema=" + url.QueryEscape(w.match)}
 		hopsUnder(t, s, 4, q, 25*time.Millisecond, 0, func(ctx context.Context, i int) error {
 			w.s.Clock.Advance(time.Second)
 			_, err := w.c.CreateDoc(ctx, "matches", fmt.Sprintf("m%d", i), map[string]any{"$schema": w.match, "title": "Match", "status": "planned"})

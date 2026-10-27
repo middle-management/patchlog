@@ -5,7 +5,8 @@ package main
 //
 //	patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}  (cmd/patchlog/release.go)
 //	patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
-//	        [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]... [-json]
+//	        [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]...
+//	        [-source-grant G]... [-json]
 //	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]... [-json]
 //	patchlog janitor -api URL -ns base1,base2 [-release LINK]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
 
@@ -32,7 +33,8 @@ import (
 const mergeUsage = `usage:
   patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}   (§F.9; see patchlog merge release)
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
-          [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]... [-json]
+          [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]...
+          [-source-grant G]... [-json]
   patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]... [-json]
   patchlog janitor -api URL -ns base1,base2 [-release /r/{ns}/{release}]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]`
 
@@ -162,8 +164,9 @@ func mergeCmd(args []string) {
 	cfgFile := fs.String("config", "", "file with an explicit config change (a patch set) for the target")
 	var resolves multi
 	fs.Var(&resolves, "resolve", "name=file.json: resolution for a conflicting resource, against the target's head: a patch set, a list of steps, \"delete\", or \"keep\" (repeatable)")
-	var identities multi
+	var identities, srcGrants multi
 	fs.Var(&identities, "identity", identityHelp)
+	fs.Var(&srcGrants, "source-grant", "a grant sent as Source-Authorization with every batch and blob copy (reads the branch: its blobs, drafts; §7.5, §7.8); with unrestricted read on the branch, the batch's source makes its blobs available and nothing is copied (§F.3); repeatable")
 	fs.Parse(args[1:])
 	if *branch == "" {
 		fmt.Fprintln(os.Stderr, "merge: -branch is required")
@@ -175,7 +178,7 @@ func mergeCmd(args []string) {
 	if target == "" {
 		target = branchBase(ctx, c, *branch)
 	}
-	opt := merge.Options{Squash: *squash, E2E: e2eView(c, identities), Signer: tf.signer()}
+	opt := merge.Options{Squash: *squash, E2E: e2eView(c, identities), Signer: tf.signer(), SourceAuthorizations: srcGrants}
 	if *cfgFile != "" {
 		v, err := readJSONFile(*cfgFile)
 		if err != nil {

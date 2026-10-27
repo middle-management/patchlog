@@ -82,7 +82,8 @@ func TestLimitsDoc(t *testing.T) {
 	}
 	var back Limits
 	back.LogPageSize, back.LogPageBytes, back.BranchDepth, back.ExchangeRate, back.RetryWindowMin = l.LogPageSize, l.LogPageBytes, l.BranchDepth, l.ExchangeRate, l.RetryWindowMin
-	if err := parseLimits(doc, &back, l); err != nil {
+	back.GrantSize, back.RulesPerGrant = l.GrantSize, l.RulesPerGrant
+	if err := parseLimits(doc, &back, l, configMode{}); err != nil {
 		t.Fatal(err)
 	}
 	if back != l {

@@ -102,9 +102,15 @@ func (p *Plan) applyResolution(r *Resource, steps []client.Step) {
 	r.IfMatch, r.IfNoneMatch = r.Base, r.Base == ""
 	if len(steps) == 0 {
 		r.Dropped, r.Resolved, r.Steps, r.Kept = true, true, nil, false
-		if r.BaseState == client.Live.String() {
+		switch {
+		case r.BaseState == client.Live.String() && r.keepBlock != "":
+			// At E3 the sealed empty set repeats B's declared blobs, and a
+			// sealed op can't declare this one (§E.3.1).
+			r.IfMatch, r.IfNoneMatch = "", false
+			r.Note = "kept as in the target, whose head references " + r.keepBlock + ", which a sealed op can't declare: this can't be recorded in the batch, so the resource stays unmerged and is offered again (§F.3, §E.3.1)"
+		case r.BaseState == client.Live.String():
 			r.Kept, r.Steps = true, []client.Step{p.keepStep()}
-		} else {
+		default:
 			r.IfMatch, r.IfNoneMatch = "", false
 			r.Note = "kept as in the target, whose head is " + map[bool]string{true: "a tombstone", false: "absent"}[r.BaseState == client.Tombstoned.String()] + ": this can't be recorded in the batch, so the resource stays unmerged and is offered again (§F.3)"
 		}
@@ -131,7 +137,7 @@ func (p *Plan) squash(ctx context.Context, r *Resource, h *client.Head) error {
 		}
 		start = docState{doc: d, exists: true, deleted: true}
 	}
-	sc, err := foldWrites(docState{doc: jsonv.Clone(start.doc), exists: start.exists, deleted: start.deleted}, r.Steps)
+	sc, err := foldWrites(docState{doc: jsonv.Clone(start.doc), exists: start.exists, deleted: start.deleted}, r.Steps, false)
 	if err != nil {
 		r.conflict(ConflictUnreadable, "squash: "+err.Error())
 		return nil
@@ -215,7 +221,11 @@ func (p *Plan) batchClient() *client.Client {
 
 // SetBatchClient replaces the client the plan's batches (dry runs
 // included) are submitted with, e.g. with a fresh grant before a retry.
-func (p *Plan) SetBatchClient(c *client.Client) { p.opt.BatchClient = c }
+// Blobs are copied again under it, if it must copy them.
+func (p *Plan) SetBatchClient(c *client.Client) {
+	p.opt.BatchClient = c
+	p.unrestricted, p.copied = nil, nil
+}
 
 // Order moves the named resources to the front of the plan, in the order
 // given, so their items come first in the batch: schema resources in $ref
@@ -277,6 +287,11 @@ func (p *Plan) DryRun(ctx context.Context) (*client.BatchResult, error) {
 	if p.empty(req) {
 		return nil, nil
 	}
+	// The dry run checks blob references too, so the blobs a merger must
+	// copy are copied first: pending, visible to nobody (§7.8).
+	if err := p.copyBlobs(ctx); err != nil {
+		return nil, err
+	}
 	res, err := p.batchClient().Batch(ctx, p.Target, req, true)
 	if err != nil {
 		return nil, err
@@ -295,9 +310,11 @@ type Result struct {
 	Noop     bool                `json:"noop,omitempty"`
 }
 
-// Apply submits the batch with source { ns: branch, at: branchAt }. If the
-// target moved meanwhile, the failing items (412) are re-classified and the
-// batch resubmitted, up to MaxRetries times. Re-classification reads the
+// Apply submits the batch with source { ns: branch, at: branchAt }, after
+// copying the blobs its items reference where the source doesn't make them
+// available (copyBlobs, §F.3 Blobs). If the target moved meanwhile, the
+// failing items (412) are re-classified and the batch resubmitted, up to
+// MaxRetries times. Re-classification reads the
 // target again but keeps the branch revision the plan was built from, so
 // source.at stays the revision every item was classified from; work the
 // branch got meanwhile is left for the next merge. It returns ErrConflicts when a
@@ -316,6 +333,9 @@ func (p *Plan) Apply(ctx context.Context) (*Result, error) {
 		}
 		if p.empty(req) {
 			return &Result{Noop: true, Attempts: attempt}, nil
+		}
+		if err := p.copyBlobs(ctx); err != nil {
+			return nil, err
 		}
 		res, err := p.batchClient().Batch(ctx, p.Target, req, false)
 		if err == nil {

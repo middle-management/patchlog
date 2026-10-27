@@ -440,8 +440,12 @@ func TestStackedRetargetAfterFastForward(t *testing.T) {
 			t.Fatalf("%s: %s vs %s", n, a.ID, b.ID)
 		}
 	}
-	if _, err := merge.Rebase(ctx, e.c, merge.RebaseOptions{Branch: "b2", New: "b2-c", Onto: "matches", Switch: true}); err == nil {
-		t.Fatal("switch to a successor with another base")
+	// matches is up b2's base chain, so a switch onto it is the server's to
+	// judge (§7.4, TestV073RebaseSwitchUpTheChain); one onto a namespace
+	// outside the chain is refused.
+	must(e.c.CreateNamespace(ctx, "other", map[string]any{"read": "public"}))
+	if _, err := merge.Rebase(ctx, e.c, merge.RebaseOptions{Branch: "b2", New: "b2-c", Onto: "other", Switch: true}); err == nil {
+		t.Fatal("switch to a successor outside the base chain")
 	}
 }
 

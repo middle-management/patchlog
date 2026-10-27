@@ -397,8 +397,9 @@ func testTreeListings(t *testing.T) {
 	if b["placement"].(map[string]any)["href"] != "/r/cat/matches.opener" || pathsOf(b["paths"]) != "root/season" {
 		t.Errorf("where: %v", b)
 	}
-	if b := x.get("/cat/where?item=/r/matches/nowhere", ""); b["placement"] != nil {
-		t.Errorf("where unplaced: %v", b)
+	// An item not in the catalog is 404, as a node not in it is (§B.5).
+	if r := x.raw("/cat/at/"+x.s.At()+"/where?item=%2Fr%2Fmatches%2Fnowhere", ""); r.status != 404 || r.body["code"] != "not_found" {
+		t.Errorf("where unplaced: %d %v", r.status, r.body)
 	}
 	if r := x.raw("/cat/at/"+x.s.At()+"/children?of=nope", ""); r.status != 404 {
 		t.Errorf("unknown folder: %d", r.status)
@@ -459,8 +460,8 @@ func testMovesAndDeletes(t *testing.T) {
 	if got := names(x.get("/cat/children?of=derbies", "")["children"]); got != "matches.derby,season" {
 		t.Errorf("after unplace: %s", got)
 	}
-	if b := x.get("/cat/where?item=/r/matches/opener", ""); b["placement"] != nil {
-		t.Errorf("where after unplace: %v", b)
+	if r := x.raw("/cat/at/"+x.s.At()+"/where?item=%2Fr%2Fmatches%2Fopener", ""); r.status != 404 {
+		t.Errorf("where after unplace: %d %v", r.status, r.body)
 	}
 
 	// Deleting content leaves its placement dangling: out of listings, into problems.
@@ -712,16 +713,24 @@ func TestSelfPlacing(t *testing.T) {
 	if got := names(y.get("/cat/children?of=root", "")["children"]); got != "matches.s1,news" {
 		t.Errorf("root: %s", got)
 	}
-	// Removing the explicit one brings back the implicit one.
+	// A deleted explicit placement still wins (§B.9): the implicit one
+	// stays out, however the content moves.
 	w.del(t, "cat", "matches.s1")
 	y.caughtUp("cat")
-	if got := names(y.get("/cat/children?of=news", "")["children"]); got != "matches.s1" {
+	if got := names(y.get("/cat/children?of=news", "")["children"]); got != "" {
 		t.Errorf("implicit after unplace: %s", got)
 	}
-	// Moving the implicit placement means editing the content.
 	w.replace(t, "matches", "s1", "/$parents", []any{map[string]any{"href": "/r/cat/root"}})
 	y.caughtUp("matches")
-	if got := names(y.get("/cat/children?of=root", "")["children"]); got != "matches.s1,news" {
+	if got := names(y.get("/cat/children?of=root", "")["children"]); got != "news" {
+		t.Errorf("after content move: %s", got)
+	}
+	// Moving an implicit placement means editing the content.
+	must(w.c.CreateDoc(context.Background(), "matches", "s2", map[string]any{"$parents": []any{map[string]any{"href": "/r/cat/news"}}}))
+	y.caughtUp("matches")
+	w.replace(t, "matches", "s2", "/$parents", []any{map[string]any{"href": "/r/cat/root"}})
+	y.caughtUp("matches")
+	if got := names(y.get("/cat/children?of=root", "")["children"]); got != "matches.s2,news" {
 		t.Errorf("after content move: %s", got)
 	}
 }

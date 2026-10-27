@@ -25,7 +25,7 @@ func TestFileTypeTable(t *testing.T) {
 		{"x", "text", "application/octet-stream"},
 		{"x", "multipart/mixed", "application/octet-stream"},
 	} {
-		if got := fileType(c.name, c.ctype); got != c.want {
+		if got := fileType(c.name, c.ctype, "", []byte("text")); got != c.want {
 			t.Errorf("fileType(%q, %q) = %q, want %q", c.name, c.ctype, got, c.want)
 		}
 	}

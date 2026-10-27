@@ -137,6 +137,7 @@ type branchReads interface {
 	registeredAts(n *nsRow) []int64
 	registration(n *nsRow, origin, name string) *regRow
 	entryBy(seq int64) (author, created int64)
+	entryGrantID(seq int64) []byte
 	baseIdentity(n *nsRow) string
 	copyRows(id ids.ID, name string) []copyRow
 }

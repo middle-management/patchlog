@@ -107,6 +107,15 @@ func (r *ddbReads) entryBy(seq int64) (author, created int64) {
 	return r.authorHandle(le.Author), le.Created
 }
 
+func (r *ddbReads) entryGrantID(seq int64) []byte {
+	if le := r.entry(seq); le != nil && le.GrantID != "" {
+		id, err := ids.Parse(le.GrantID)
+		r.must(err)
+		return id[:]
+	}
+	return nil
+}
+
 // liveRegistrations: n's unexpired registrations.
 func (r *ddbReads) liveRegistrations(n *nsRow) []map[string]any {
 	ns := r.nsName(n.id)
@@ -177,9 +186,11 @@ func (b *ddbBackend) createRemoteBranch(ctx context.Context, req Request, cc Con
 		if err != nil {
 			return err
 		}
-		cfg, a = c, ac
-		cc, doc, err = remoteObligations(c, d, cc, m)
-		return asErr(err)
+		cfg, a, doc = c, ac, d
+		if err := remoteObligations(req.NS, c, m); err != nil {
+			return err
+		}
+		return nil
 	}); err != nil {
 		return nil, err
 	}
@@ -454,14 +465,16 @@ func (b *ddbBackend) mirrorSchemas(ctx context.Context, m *remoteMirror, branch 
 		if nsName == branch || row != nil && (row.Base != "" || row.Purged) {
 			return conflict(byNS[nsName][0], "the schema namespace here is a branch or purged")
 		}
+		src := m.schemaSources[nsName]
 		created := row == nil
 		if created {
-			doc := map[string]any{"read": cfg.Read}
-			for _, k := range []string{"keys", "roles", "encryption"} {
-				if v, ok := cfg.Doc[k]; ok {
-					doc[k] = jsonv.Clone(v)
-				}
+			// By its source's protection (§2.1, mirrorSchemas of
+			// remote_branch.go).
+			read := "grant"
+			if src.rank == rankPublic {
+				read = "public"
 			}
+			doc := map[string]any{"read": read}
 			if _, _, err := b.store.CreateNamespace(ctx, &ddb.Create{NS: nsName, Author: a.id(), Grant: gid, NoAuth: a.noAuth,
 				Patches: []any{map[string]any{"op": "add", "path": "", "value": doc}}}); err != nil {
 				return ddbAsErr(err)
@@ -470,7 +483,7 @@ func (b *ddbBackend) mirrorSchemas(ctx context.Context, m *remoteMirror, branch 
 		if err := b.mirrorInto(ctx, nsName, byNS[nsName], a, gid, conflict); err != nil {
 			return err
 		}
-		if created && m.schemaNonce[nsName] {
+		if created && src.nonce {
 			if err := b.requireNonces(ctx, nsName, a, gid); err != nil {
 				return err
 			}

@@ -70,7 +70,7 @@ func TestRemoteBranchSealed(t *testing.T) {
 	sealed := map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}}
 	// Without the identity, the wrapped keys can't be opened.
 	r := b.mkRemote("rel", remoteGenesis("s", at, sealed))
-	expectCode(t, r, 502, "remote")
+	expectCode(t, r, 502, "upstream")
 	expect(t, b.get("/ns/rel"), 404)
 	mu.Lock()
 	id = bPriv
@@ -390,7 +390,9 @@ func TestRemoteBranchE2EChain(t *testing.T) {
 	}
 	expectCode(t, b.mkRemote("rel", genesis("eb")), 422, "invalid")
 	expectCode(t, b.mkRemote("rel", genesis("eb", "x")), 422, "invalid")
-	expect(t, b.mkRemote("rel", genesis()), 201)
+	// The genesis must give chain; it isn't added (§G.3).
+	expectCode(t, b.mkRemote("rel", genesis()), 422, "invalid")
+	expect(t, b.mkRemote("rel", genesis("eb", "e")), 201)
 	expect(t, b.mkRemote("rel2", genesis("eb", "e")), 201)
 	bAdmin := b.grant(kB, "user:b", []string{"rel"}, allVerbs)
 	base := b.get("/ns/rel/rev/"+b.nsHead("rel", bAdmin), bAdmin).Obj()["base"].(map[string]any)

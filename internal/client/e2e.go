@@ -193,7 +193,7 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	// fetch that failed for a reason asking again may mend (Transient),
 	// with no key found otherwise, is that failure, not ErrNoKeys: the key
 	// may be there (a service waiting for the namespace keeps waiting).
-	var failed error
+	var failed, unwrapErr error
 	relays := []string{ns}
 	if via != "" && via != ns {
 		relays = []string{via, ns}
@@ -212,14 +212,12 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 			}
 			key := e.Key
 			if key == nil {
-				var uerr error
-				for _, priv := range privs {
-					if key, uerr = seal.UnwrapKey(priv, e.Wrapped); uerr == nil {
-						break
-					}
-				}
-				if uerr != nil {
-					return nil, fmt.Errorf("client: unwrapping %s: %w", kid, uerr)
+				if key, err = unwrapRelayed(privs, e.Wrapped); err != nil {
+					// Not the key for us (anyone can wrap to a
+					// thumbprint, §E.3.2): the other relay or the
+					// keyring may still hold it.
+					unwrapErr = fmt.Errorf("client: unwrapping %s: %w", kid, err)
+					continue
 				}
 			}
 			x.AddKey(kid, key)
@@ -244,7 +242,29 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	if failed != nil {
 		return nil, fmt.Errorf("client: fetching the epoch key %s: %w", kid, failed)
 	}
+	if unwrapErr != nil {
+		return nil, unwrapErr
+	}
 	return nil, fmt.Errorf("%w: %s", ErrNoKeys, kid)
+}
+
+// unwrapRelayed opens a K_e that /keys relays from a keyring (§E.3.2) with
+// one of privs: under the HPKE info of v0.63 or, for an entry of a keyring
+// stored before, the info of that time, as Keyring.EpochKey reads the
+// keyring itself. Both infos bind the kid (and a K_r's resource), so an
+// entry can't be presented as another epoch's under either.
+func unwrapRelayed(privs []*ecdh.PrivateKey, w seal.WrappedKey) ([]byte, error) {
+	var err error
+	for _, priv := range privs {
+		var key []byte
+		if key, err = seal.UnwrapKey(priv, w); err == nil {
+			return key, nil
+		}
+		if key, err = seal.UnwrapKeyLegacy(priv, w); err == nil {
+			return key, nil
+		}
+	}
+	return nil, err
 }
 
 // EncryptionLevel returns a namespace's encryption.level ("" if none). A
@@ -439,7 +459,7 @@ func (x *E2E) prepareWrite(ctx context.Context, ns, name, base string, patches a
 		return fail(fmt.Errorf("client: e2e write %s/%s: %w", ns, name, err))
 	}
 	if !x.noValidate {
-		if msg, err := x.validate(ctx, ns, nd); err != nil {
+		if msg, err := x.validate(ctx, ns, nd, false); err != nil {
 			return nil, err
 		} else if msg != "" {
 			return nil, fmt.Errorf("client: e2e write %s/%s: the document doesn't validate against its $schema: %s", ns, name, msg)
@@ -890,7 +910,7 @@ func (x *E2E) Validate(ctx context.Context, doc any) (string, error) {
 	if x.noValidate {
 		return "", nil
 	}
-	return x.validate(ctx, "", doc)
+	return x.validate(ctx, "", doc, false)
 }
 
 // ValidateIn is Validate for a document written to namespace target,
@@ -901,7 +921,7 @@ func (x *E2E) ValidateIn(ctx context.Context, target string, doc any) (string, e
 	if x.noValidate {
 		return "", nil
 	}
-	return x.validate(ctx, target, doc)
+	return x.validate(ctx, target, doc, false)
 }
 
 // snapshot fetches the sealed snapshot of the pruning horizon h of ns/name
@@ -1033,7 +1053,7 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 			flag("patch set doesn't apply: " + err.Error())
 			continue
 		}
-		msg, err = x.validate(ctx, ns, nd)
+		msg, err = x.validate(ctx, ns, nd, true)
 		if err != nil {
 			return nil, err
 		}
@@ -1073,8 +1093,11 @@ func (e *errSchemaLoad) Unwrap() error { return e.err }
 
 // validate checks doc against its $schema (§6.1 forms), fetching schemas
 // through the client. It returns a message for an invalid document, or an
-// error when a schema couldn't be fetched.
-func (x *E2E) validate(ctx context.Context, target string, doc any) (string, error) {
+// error when a schema couldn't be fetched. stored is for a revision a fold
+// re-validates, which is held to the rules it was written under (§6.1):
+// Legacy, until revisions keep their markers, so a schema document an
+// earlier version accepted still folds.
+func (x *E2E) validate(ctx context.Context, target string, doc any, stored bool) (string, error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
 		return "", nil
@@ -1151,7 +1174,12 @@ func (x *E2E) validate(ctx context.Context, target string, doc any) (string, err
 			}
 		}
 	}
-	err := x.schemas.v.Validate(doc, load)
+	var err error
+	if stored {
+		err = x.schemas.v.ValidateRules(doc, load, schema.Legacy)
+	} else {
+		err = x.schemas.v.Validate(doc, load)
+	}
 	if err == nil {
 		return "", nil
 	}

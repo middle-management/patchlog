@@ -9,8 +9,9 @@
 //
 // The bearer form is Biscuit's URL-safe base64 (padded, accepted with or
 // without padding and with or without the "biscuit:" prefix). The
-// non-bearer stored form (§C.3) is the same protobuf message without its
-// proof, so every block signature can be checked but it is not a token.
+// non-bearer stored form (§C.3, §C.8) is the authority block's protobuf
+// SignedBlock alone, so its signature can be checked but it is not a
+// token; rows stored before v0.73 hold the whole chain without proof.
 package grant
 
 import (
@@ -22,11 +23,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/lru"
+	"github.com/middle-management/patchlog/internal/rules"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sig"
 )
@@ -66,6 +70,25 @@ type TooLargeError struct{ Size, Max int }
 
 func (e *TooLargeError) Error() string        { return ErrTooLarge.Error() }
 func (e *TooLargeError) Is(target error) bool { return target == ErrTooLarge }
+
+// ErrTooManyRules reports a token whose blocks carry more rule forms than
+// rulesPerGrant allows (§C.8, §12.2). DecodeLimited returns it as a
+// *TooManyRulesError, which carries the counts.
+var ErrTooManyRules = errors.New("grant carries too many rules")
+
+// TooManyRulesError is ErrTooManyRules with what a limit refusal reports
+// (§6.6): Count the rule forms of the token's blocks, Max the limit.
+type TooManyRulesError struct{ Count, Max int }
+
+func (e *TooManyRulesError) Error() string        { return ErrTooManyRules.Error() }
+func (e *TooManyRulesError) Is(target error) bool { return target == ErrTooManyRules }
+
+// Limits are a deployment's bounds on a bearer token, both deployment only
+// (§12.2), which DecodeLimited checks before anything is verified, as
+// request-shape errors (§C.8): Size bounds its decoded bytes (grantSize),
+// Rules the rule forms of its blocks (rulesPerGrant). Each is ignored when
+// <= 0.
+type Limits struct{ Size, Rules int }
 
 // AuthError is an authentication (401) or authorisation (403) failure.
 type AuthError struct {
@@ -147,24 +170,33 @@ func (g *Grant) ChainVerified() bool { return g.chainKey.Load() != nil }
 // ID is the grant id of §C.3: trunc160(sha256(canonical(root block))).
 func (g *Grant) ID() ids.ID { return ids.Of(jsonv.Canonical(g.Blocks[0].Raw)) }
 
-// RevocationIDs returns the revocation id of every block, in order:
-// text(trunc160(sha256(its Biscuit signature))) (§C.4, §C.8).
+// RevocationIDs returns the revocation id of every block, in order (§C.4,
+// §C.8): the root block's is its grant id (ID), so revoking it revokes
+// every token minted with that root block, however re-serialised or
+// re-minted; a narrowing block's is text(trunc160(sha256(its Biscuit
+// signature))).
 func (g *Grant) RevocationIDs() []string {
 	out := make([]string, len(g.c.blocks))
 	for i, sb := range g.c.blocks {
 		out[i] = ids.Of(sb.sig).String()
 	}
+	out[0] = g.ID().String()
 	return out
 }
 
-// Stored is the non-bearer form (§C.3): the Biscuit without its proof.
-func (g *Grant) Stored() []byte {
-	return (&container{blocks: g.c.blocks}).encode()
-}
+// rootSigID is the text id of the root block's signature, its revocation
+// id before v0.71, which Verify still honours in revoked lists (§C.4).
+func (g *Grant) rootSigID() string { return ids.Of(g.c.blocks[0].sig).String() }
+
+// Stored is the non-bearer form (§C.3, §C.8): the authority block's
+// SignedBlock (its block data, next key and signature), without the other
+// blocks or the token's proof. Its signature can still be checked under
+// the root key, but it is no longer a token. ParseStored reads it back.
+func (g *Grant) Stored() []byte { return g.c.blocks[0].encode() }
 
 // SignedBlocks are the token's protobuf SignedBlock messages in order,
-// authority first: the stored form's blocks, as GET /ns/{ns}/grants/{gid}
-// serves them (§C.3.1).
+// authority first. A grant parsed from its stored form has the authority
+// block alone, which GET /ns/{ns}/grants/{gid} serves (§C.3.1).
 func (g *Grant) SignedBlocks() [][]byte {
 	out := make([][]byte, len(g.c.blocks))
 	for i, sb := range g.c.blocks {
@@ -318,11 +350,23 @@ func (g *Grant) Seal() (*Grant, error) {
 
 // Decode parses a bearer token: Biscuit URL-safe base64, with or without
 // padding and the "biscuit:" prefix. It checks the structure and the JSON
-// blocks but no signature: Verify checks the chain, after the namespace
-// check of §C.2 (whose 403 comes first). maxSize bounds the decoded bytes
-// and is ignored when <= 0. Errors are ErrTooLarge or *AuthError with
-// status 401.
+// blocks, and compiles every block's rules, but checks no signature:
+// Verify checks the chain, after the namespace check of §C.2 (whose 403
+// comes first). maxSize bounds the decoded bytes and is ignored when <= 0.
+// Errors are ErrTooLarge or *AuthError with status 401.
 func Decode(token string, maxSize int) (*Grant, error) {
+	return DecodeLimited(token, Limits{Size: maxSize})
+}
+
+// DecodeLimited is Decode under both of a deployment's bounds on a bearer
+// (§C.8), in this order: grantSize before the token is decoded
+// (ErrTooLarge); a token that can't be decoded, or whose blocks break §C.1
+// or §C.8 (401); rulesPerGrant over its blocks' rule forms, those nested
+// in all, any, not, if and then included, the key scope's not (§12.2,
+// ErrTooManyRules); and last, a rule that doesn't compile (§6.4.2, §6.6:
+// the grant is invalid, 401), so an oversized grant isn't compiled.
+func DecodeLimited(token string, lim Limits) (*Grant, error) {
+	maxSize := lim.Size
 	token = strings.TrimPrefix(token, tokenPrefix)
 	if maxSize > 0 && len(token) > base64.URLEncoding.EncodedLen(maxSize) {
 		n := base64.RawURLEncoding.DecodedLen(len(strings.TrimRight(token, "=")))
@@ -342,28 +386,133 @@ func Decode(token string, maxSize int) (*Grant, error) {
 		return nil, &TooLargeError{Size: len(data), Max: maxSize}
 	}
 	g, err := decode(data, true)
-	if err == nil {
-		g.size = len(data)
+	if err != nil {
+		return nil, err
 	}
-	return g, err
+	g.size = len(data)
+	if n := g.ruleForms(); lim.Rules > 0 && n > lim.Rules {
+		return nil, &TooManyRulesError{Count: n, Max: lim.Rules}
+	}
+	if err := g.compileRules(); err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
+// ruleForms counts the rule forms of g's blocks as rulesPerGrant does
+// (§12.2): every form, those nested in all, any, not, if and then
+// included.
+func (g *Grant) ruleForms() int {
+	n := 0
+	for _, b := range g.Blocks {
+		for _, r := range b.Rules {
+			n += countForms(r)
+		}
+	}
+	return n
+}
+
+// countForms counts the rule forms of rule v: v itself and those nested in
+// its all, any, not, if and then. Any other member is not a rule.
+func countForms(v any) int {
+	n := 1
+	m, ok := v.(map[string]any)
+	if !ok {
+		return n
+	}
+	if _, isOp := m["op"]; isOp {
+		return n
+	}
+	for _, k := range []string{"all", "any", "if", "then"} {
+		if arr, ok := m[k].([]any); ok {
+			for _, x := range arr {
+				n += countForms(x)
+			}
+		}
+	}
+	if x, ok := m["not"]; ok {
+		n += countForms(x)
+	}
+	return n
+}
+
+// compileRules compiles every rule of g's blocks (§6.4.2): a grant that
+// carries one that doesn't compile, such as one of an unknown form or with
+// a pattern RE2 doesn't accept, is invalid (401, §6.6), on every request
+// that doesn't ignore it, not only those that evaluate it.
+func (g *Grant) compileRules() error {
+	for i, b := range g.Blocks {
+		for j, r := range b.Rules {
+			if _, err := compileRule(r); err != nil {
+				return unauth("block %d: rules/%d: %v", i, j, err)
+			}
+		}
+	}
+	return nil
+}
+
+// ruleCache keeps compiled rules by their canonical form, so grants
+// re-minted with the same rules, as issuers do every few minutes, don't
+// compile them again: compiling a rule's schema costs more than decoding
+// the token. It is bounded, since tokens are decoded before they verify.
+var ruleCache struct {
+	mu sync.Mutex
+	c  lru.Cache[string, *rules.Rule]
+}
+
+func compileRule(v any) (*rules.Rule, error) {
+	k := string(jsonv.Canonical(v))
+	ruleCache.mu.Lock()
+	r, ok := ruleCache.c.Get(k)
+	ruleCache.mu.Unlock()
+	if ok {
+		return r, nil
+	}
+	r, err := rules.Compile(v)
+	if err != nil {
+		return nil, err
+	}
+	ruleCache.mu.Lock()
+	if ruleCache.c.MaxEntries == 0 {
+		ruleCache.c.MaxEntries, ruleCache.c.MaxBytes = 4096, 4<<20
+	}
+	ruleCache.c.Put(k, r, len(k))
+	ruleCache.mu.Unlock()
+	return r, nil
 }
 
 // Size is a decoded bearer's length in bytes, as grantSize bounds it
 // (§6.6); 0 for a grant that wasn't decoded from a bearer.
 func (g *Grant) Size() int { return g.size }
 
-// ParseStored parses the non-bearer stored form and checks its structure
-// and the chain signatures (not the root signature, which needs the
-// namespace keys). The result has no proof.
-func ParseStored(data []byte) (*Grant, error) {
-	g, err := decode(data, false)
+// ParseStoredBlock parses the stored form (§C.3, §C.8, Stored): one
+// authority SignedBlock, whose structure and grant_block it checks. Its
+// signature needs the root key (SignedBy, Verify). The result has the
+// root block only, and no proof.
+func ParseStoredBlock(data []byte) (*Grant, error) {
+	sb, err := parseSignedBlock(data)
 	if err != nil {
-		return nil, err
+		return nil, unauth("malformed stored grant: %v", err)
 	}
-	if err := g.c.verify(nil); err != nil {
-		return nil, unauth("%v", err)
+	return decodeContainer(&container{blocks: []signedBlock{sb}})
+}
+
+// ParseStored parses a stored grant: the authority SignedBlock of
+// ParseStoredBlock, or a row stored before v0.73, the whole chain as a
+// Biscuit without proof, of which it keeps the authority block, as the
+// stored form now has it (§C.8). The two can't be mistaken for each
+// other: a SignedBlock's field 1 is its block data, a Biscuit's the
+// integer rootKeyId. The result has the root block only, and no proof.
+func ParseStored(data []byte) (*Grant, error) {
+	if g, err := ParseStoredBlock(data); err == nil {
+		return g, nil
 	}
-	return g, nil
+	c, err := parseContainer(data, false)
+	if err != nil {
+		return nil, unauth("malformed stored grant: %v", err)
+	}
+	c.blocks = c.blocks[:1]
+	return decodeContainer(c)
 }
 
 func decode(data []byte, bearer bool) (*Grant, error) {
@@ -371,6 +520,11 @@ func decode(data []byte, bearer bool) (*Grant, error) {
 	if err != nil {
 		return nil, unauth("malformed grant: %v", err)
 	}
+	return decodeContainer(c)
+}
+
+// decodeContainer reads the JSON blocks of a parsed container (§C.8).
+func decodeContainer(c *container) (*Grant, error) {
 	strs, symbols, err := c.blockStrings()
 	if err != nil {
 		return nil, unauth("malformed grant: %v", err)

@@ -303,7 +303,7 @@ func TestRaceAllowance(t *testing.T) {
 	}, func(o *core.Options) { o.Maximums = max }, withRaceHook(h))
 	e := f.tenv
 	h.arm(func() { expect(t, e.patchNS("sec", ops(op("remove", "/allowances")), f.adminG), 201) })
-	expectCode(t, e.batchReq("sec", batchOf("b", 5), f.issuerG), 413, "limit")
+	expectCode(t, e.batchReq("sec", batchOf("b", 5), f.issuerG), 422, "limit")
 	expect(t, e.batchReq("sec", batchOf("c", 2), f.issuerG), 201)
 }
 

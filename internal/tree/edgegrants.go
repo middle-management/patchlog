@@ -224,7 +224,11 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	}
 	bearers, status, msg := edgeGrantBearers(r)
 	if status != 0 {
-		WriteError(w, status, "bad_input", msg)
+		code := "bad_input"
+		if status == http.StatusUnsupportedMediaType {
+			code = "unsupported_type" // §12.1
+		}
+		WriteError(w, status, code, msg)
 		return
 	}
 	if len(bearers) == 0 {
@@ -358,8 +362,9 @@ func edgeGrantBearers(r *http.Request) (bearers []string, status int, msg string
 	case r.Header.Get("Authorization") != "":
 		return nil, http.StatusBadRequest, "grants in the body take no Authorization (§C.5.2)"
 	}
-	ct, _, _ := strings.Cut(r.Header.Get("Content-Type"), ";")
-	if !strings.EqualFold(strings.TrimSpace(ct), "application/json") {
+	// Compared as a media type, a charset naming UTF-8 its only parameter
+	// (§7.2).
+	if !jsonv.MediaType(r.Header.Get("Content-Type"), "application/json") {
 		return nil, http.StatusUnsupportedMediaType, "use application/json"
 	}
 	v, err := jsonv.Parse(body)

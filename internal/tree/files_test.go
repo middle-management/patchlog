@@ -258,7 +258,8 @@ func TestFileTreeSealed(t *testing.T) {
 		t.Fatalf("file metadata in the clear: %s", f.body)
 	}
 	es := entriesOf(t, decode(t, f.body))
-	if _, has := es["secret.s1"]["file"]; has || es["secret.s1"]["head"] == nil {
+	// An e2e item's file says why it is absent (§H.3).
+	if f := fileOf(es["secret.s1"]); fmt.Sprint(f) != "map[absent:e2e]" || es["secret.s1"]["head"] == nil {
 		t.Fatalf("e2e item %v", es["secret.s1"])
 	}
 	jwe, _ := fileOf(es["files.notes"])["sealed"].(string)

@@ -535,7 +535,8 @@ func TestSealedBundleCLI(t *testing.T) {
 	if code := run("import", "-api", dst.url, "-ns", "priv", "-i", out, "-identity", idPath, "-atomic"); code != 1 || !strings.Contains(se.String(), "less protected") {
 		t.Fatalf("import into a public target: %d %s", code, se.String())
 	}
-	if code := run("import", "-api", dst.url, "-ns", "priv", "-i", out, "-identity", idPath, "-atomic", "-allow-less-protected"); code != 0 {
+	// A development server needs X-Author on writes (§7.2).
+	if code := run("import", "-api", dst.url, "-ns", "priv", "-i", out, "-identity", idPath, "-atomic", "-allow-less-protected", "-author", "importer"); code != 0 {
 		t.Fatalf("import: %s", se.String())
 	}
 	if d := dst.doc("priv", "a"); d["v"] != marker {

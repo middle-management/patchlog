@@ -118,13 +118,15 @@ func TestRaw(t *testing.T) {
 	}
 	expectCode(t, e.get("/r/schemas/file/raw"), 404, "not_found")
 	// Unknown: as the document URLs, short.
-	for _, path := range []string{"/r/m/none/raw", "/r/m/notes/rev/" + hashID(t, "", []byte("x")) + "/raw", "/r/m/notes/rev/nope/raw", "/r/none/x/raw"} {
+	for _, path := range []string{"/r/m/none/raw", "/r/m/notes/rev/" + hashID(t, "", []byte("x")) + "/raw", "/r/none/x/raw"} {
 		r := e.get(path)
 		expect(t, r, 404)
 		if path != "/r/none/x/raw" && r.H.Get("Cache-Control") != ccShort {
 			t.Fatalf("%s: %v", path, r.H)
 		}
 	}
+	// A malformed id is a request-shape error (§7).
+	expectCode(t, e.get("/r/m/notes/rev/nope/raw"), 400, "bad_input")
 	expectCode(t, e.get("/r/m/notes/raw?x=1"), 400, "bad_input")
 
 	// A branch reads it through, under its own URLs.

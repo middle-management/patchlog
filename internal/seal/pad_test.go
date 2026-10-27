@@ -88,8 +88,8 @@ func TestSealPadded(t *testing.T) {
 			t.Fatalf("padded seal: zip %q, %d bytes", h.Zip, len(pt))
 		}
 	}
-	// Unpadded and compressed: not padded.
-	jwe, _ := Seal(k, kid, ResourcePL("matches", "derby", "1aaaa", KindDoc), large)
+	// Compressed (legacy bytes; Seal never compresses, §E.2.2): not padded.
+	jwe := handJWE(t, k, `{"alg":"dir","enc":"A256GCM","kid":"matches#1","pl":{"id":"1aaaa","kind":"doc","name":"derby","ns":"matches"},"zip":"DEF"}`, Pad(large), true)
 	h, pt, _ := Open(jwe, k)
 	if h.Zip != ZipDeflate || IsPadded(h, pt) {
 		t.Fatalf("compressed seal counted as padded")

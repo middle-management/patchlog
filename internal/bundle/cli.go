@@ -142,6 +142,7 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	var recipients multiFlag
 	fs.Var(&recipients, "recipient", "seal the bundle to this X25519 public key: a JWK file, or inline JSON (repeatable, §G.5.1.1)")
 	plaintext := fs.Bool("plaintext", false, "write private or sealed content unsealed (§G.5.1: it should be sealed to its recipient)")
+	pad := fs.Bool("pad", false, "with -recipient: pad each sealed line to its size bucket (§E.2.2, §G.5.1.1)")
 	idFile := fs.String("identity", "", "private key (JWK) that unwraps the keys of sealed source namespaces, when the grant's enc names it (§E.2.3)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -150,13 +151,16 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if len(nss) == 0 {
 		return fmt.Errorf("export: -ns is required")
 	}
-	opt := ExportOptions{Bearer: *bearer, External: splitList(*external), Authors: *authors, UntypedRefs: *untyped, ForeignParents: *foreign, Plaintext: *plaintext}
+	opt := ExportOptions{Bearer: *bearer, External: splitList(*external), Authors: *authors, UntypedRefs: *untyped, ForeignParents: *foreign, Plaintext: *plaintext, Pad: *pad}
 	for _, r := range recipients {
 		pub, err := LoadRecipient(r)
 		if err != nil {
 			return fmt.Errorf("export: -recipient %s: %w", r, err)
 		}
 		opt.Recipients = append(opt.Recipients, pub)
+	}
+	if *pad && len(opt.Recipients) == 0 {
+		return fmt.Errorf("export: -pad pads sealed lines, so it needs -recipient")
 	}
 	identity, err := loadIdentity(*idFile)
 	if err != nil {

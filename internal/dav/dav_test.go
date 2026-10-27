@@ -86,7 +86,8 @@ func TestPutCreateEdit(t *testing.T) {
 	if en := e.lastEntry("docs", "new"); en.Author != "dav" {
 		t.Fatalf("author %q", en.Author)
 	}
-	if l := e.propfind("/docs/"); l["/docs/new.json"].size != strconv.Itoa(len(upload)) || l["/docs/new.json"].etag != `"`+h.ID+`"` {
+	// The writer's bytes are listed under the weak tag (§H.1).
+	if l := e.propfind("/docs/"); l["/docs/new.json"].size != strconv.Itoa(len(upload)) || l["/docs/new.json"].etag != `W/"`+h.ID+`"` {
 		t.Fatalf("listed after PUT %+v, want size %d", l["/docs/new.json"], len(upload))
 	}
 
@@ -454,7 +455,8 @@ func TestNonceRequired(t *testing.T) {
 func TestLimits(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, []string{"small", "slow", "tiny"}, nil, map[string]map[string]any{
-		"small": {"limits": map[string]any{"patchSetSize": 1024}},
+		// 3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize (§6.6 Values).
+		"small": {"limits": map[string]any{"patchSetSize": 2048, "valueSize": 300, "pathSize": 40}},
 		"slow":  {"limits": map[string]any{"ratePerResource": map[string]any{"rate": 0.001, "burst": 1.0}}},
 		"tiny":  {"limits": map[string]any{"documentSize": 2048}},
 	})
@@ -463,7 +465,12 @@ func TestLimits(t *testing.T) {
 	// A patch set over patchSetSize from the head is written as a root
 	// replace, which may be as large as documentSize (§H.4, §6.6), where
 	// it was a 413 before Addendum H (TestOversizeSave has more).
-	e.expect(e.do("PUT", "/small/x.json", `{"v": 1, "big": "`+strings.Repeat("x", 2000)+`"}`), 201, "PUT over patchSetSize, from the head")
+	bigV := make([]any, 8) // over patchSetSize, in strings within valueSize
+	for i := range bigV {
+		bigV[i] = strings.Repeat("x", 290)
+	}
+	big := rendered(bigV)
+	e.expect(e.do("PUT", "/small/x.json", `{"v": 1, "big": `+big+`}`), 201, "PUT over patchSetSize, from the head")
 	if p := e.lastEntry("small", "x").Patches.([]any); len(p) != 1 || p[0].(map[string]any)["path"] != "" {
 		t.Fatalf("not a root replace: %v", p)
 	}
@@ -473,8 +480,8 @@ func TestLimits(t *testing.T) {
 	e.create("small", "y", map[string]any{"v": 1, "w": 1})
 	e.do("GET", "/small/y.json", "")
 	e.theirs("small", "y", replace("/w", 2))
-	r := e.expect(e.do("PUT", "/small/y.json", `{"v": 1, "w": 1, "big": "`+strings.Repeat("x", 2000)+`"}`), 413, "PUT over patchSetSize, merged")
-	if !strings.HasPrefix(r.body, "too large: patchSetSize 2039 > 1024 (§6.6): patch set too large") || !strings.Contains(r.body, "merged") {
+	r := e.expect(e.do("PUT", "/small/y.json", `{"v": 1, "w": 1, "big": `+big+`}`), 413, "PUT over patchSetSize, merged")
+	if !strings.HasPrefix(r.body, "too large: patchSetSize ") || !strings.Contains(r.body, " > 2048 (§6.6): patch set too large") || !strings.Contains(r.body, "merged") {
 		t.Fatalf("413 text %q", r.body)
 	}
 	// The core's refusals give their limit and sizes (§12): a create, its
@@ -927,7 +934,9 @@ func TestLockLifecycle(t *testing.T) {
 	if _, data := e.rawOf("docs", "m2.md"); string(data) != "move me" {
 		t.Fatalf("m2.md %q", data)
 	}
-	e.expect(e.do("PUT", "/docs/m.md", "new"), 201, "PUT to the moved file's name without a token")
+	// No lock is left on the old name (423): the PUT gets the answer for
+	// a name moved away (§H.2), which no save makes anew.
+	e.expect(e.do("PUT", "/docs/m.md", "new"), 409, "PUT to the moved file's name without a token")
 	e.expect(e.do("PUT", "/docs/m2.md", "edited"), 201, "PUT the moved file without a token")
 
 	e.expect(e.do("PUT", "/docs/c.md", "copy me"), 201, "PUT c.md")

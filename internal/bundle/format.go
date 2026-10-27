@@ -9,16 +9,17 @@
 //
 // # Format decisions (where §G.4.1 leaves room)
 //
-//   - Every line, header included, is written as canonical JSON (JCS, §3.1)
-//     followed by "\n". Readers accept any I-JSON line and ignore blank
-//     lines.
+//   - Every line, header included, is canonical JSON (JCS, §3.1) followed
+//     by one 0x0A (§G.4.1). Readers reject a bundle with any other line: a
+//     blank line, one that isn't byte for byte its canonical form (spaces,
+//     another member order or number spelling, a CR), or a last line
+//     without its 0x0A. So a hand-edited or pretty-printed bundle doesn't
+//     read.
 //   - The bundle digest used in source.bundle (§3.5, §G.4.4) is
-//     text(trunc160(sha256(L₁ ‖ 0x0A ‖ L₂ ‖ 0x0A ‖ … ‖ Lₙ ‖ 0x0A))), where Lᵢ is
-//     canonical(line i), header first. For a bundle written by Writer that
-//     is the truncated SHA-256 of the file's bytes. The spec only says
-//     text(digest); the text form of §3.2 is defined for 160-bit values, so
-//     the digest is truncated like an id, and hashing canonical lines makes
-//     it independent of whitespace.
+//     text(trunc160(sha256(b))), where b is the bundle's bytes as written
+//     (§I.9), header first; with canonical lines that is
+//     L₁ ‖ 0x0A ‖ … ‖ Lₙ ‖ 0x0A, Lᵢ the canonical form of line i. Of a sealed
+//     bundle (§G.5.1.1) it is the decrypted bundle's.
 //   - Keys of docs and requires are "{ns}/{name}". external entries are
 //     "{ns}/{name}" for a live dependency (checked by name in the target)
 //     or "{ns}/{name}/rev/{id}" for a pinned one (checked by id).
@@ -33,7 +34,9 @@
 //   - Grant lines (§G.4.1, §C.3.1): with "authors": true a bundle carries
 //     one line { "ns", "grant", "root", "stored", "key"?: { "kid", "alg",
 //     "pub" } } per grant its history lines reference, before the first
-//     that does. Its ns is the namespace whose entry first recorded the
+//     that does. stored is the authority SignedBlock in base64url, one
+//     string, as /grants/{gid} serves it; bundles written before v0.73
+//     carry an array of the token's SignedBlocks, read as its first. Its ns is the namespace whose entry first recorded the
 //     grant, a name or { origin, ns } like "written", and a grant is one
 //     line per bundle whatever its ns; key is left out when the exporter
 //     could find none. A history line for a revision written in another
@@ -75,11 +78,17 @@
 //     isn't, so it refuses. Nothing is folded, so an e2e document brings
 //     no dependencies.
 //   - The importer enforces what the source can't: a private or sealed
-//     source goes only into a private or sealed target, an e2e source only
-//     into an e2e target of the same name (sealed patch sets bind pl.ns,
+//     source goes only into a private or sealed target, a sealed target
+//     whose read is public ranking public (§2.1), an e2e source only into
+//     an e2e target of the same name (sealed patch sets bind pl.ns,
 //     §E.3.1; importing under another name is a merge by a client holding
 //     both sets of keys, §F.8), unless ImportOptions.AllowLessProtected.
-//     Missing targets are created as protected as their source.
+//     A bundle of a namespace back into itself isn't ranked. Missing
+//     targets are created as protected as their source.
+//   - An e2e source's lines go in batches per epoch, in epoch order, the
+//     target moved up one epoch at a time between them as its keyring
+//     lines arrive, created or existing, so each line is submitted while
+//     its epoch is in force (§E.3.1, §G.5.1; access.go, splitEpochs).
 package bundle
 
 import (
@@ -92,7 +101,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -280,17 +288,12 @@ func parseNSRef(v any) (NSRef, error) {
 		}
 		o, _ := x["origin"].(string)
 		n, _ := x["ns"].(string)
-		if !validOrigin(o) || !client.ValidNSName(n) {
-			return NSRef{}, fmt.Errorf("want a namespace name or { origin, ns } with an origin and a valid ns")
+		if !sig.CanonicalOrigin(o) || !client.ValidNSName(n) {
+			return NSRef{}, fmt.Errorf("want a namespace name or { origin, ns } with a canonical origin (§C.3) and a valid ns")
 		}
 		return NSRef{Origin: o, NS: n}, nil
 	}
 	return NSRef{}, fmt.Errorf("want a namespace name or { origin, ns }")
-}
-
-func validOrigin(o string) bool {
-	u, err := url.Parse(o)
-	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" && u.Path == "" && u.RawQuery == "" && u.Fragment == "" && u.User == nil
 }
 
 // KeyEntry is a signer or namespace key entry as a grant line's key gives
@@ -303,9 +306,11 @@ type KeyEntry struct{ Kid, Alg, Pub string }
 // (§C.3.1), with the key entry its root block verified against at the
 // source. Key is attested by the exporter, not proven.
 type GrantLine struct {
-	ID     string         // the grant id, text(trunc160(sha256(canonical(root))))
-	Root   map[string]any // the root block
-	Stored []string       // the token's SignedBlocks in base64url, authority first
+	ID   string         // the grant id, text(trunc160(sha256(canonical(root))))
+	Root map[string]any // the root block
+	// Stored is the authority SignedBlock in base64url without padding,
+	// the stored form of §C.3.1.
+	Stored string
 	// Key is the key entry the root block verified against; the zero value
 	// (no Kid) when the exporter could find none, and the line leaves
 	// `key` out.
@@ -353,11 +358,7 @@ func HistoryLine(ns, name string, e client.LogEntry, authors bool) Line {
 
 func (l *Line) value() map[string]any {
 	if g := l.GrantLine; g != nil {
-		stored := make([]any, len(g.Stored))
-		for i, b := range g.Stored {
-			stored[i] = b
-		}
-		m := map[string]any{"ns": NSRef{Origin: g.Origin, NS: l.NS}.value(), "grant": g.ID, "root": g.Root, "stored": stored}
+		m := map[string]any{"ns": NSRef{Origin: g.Origin, NS: l.NS}.value(), "grant": g.ID, "root": g.Root, "stored": g.Stored}
 		if g.HasKey() {
 			m["key"] = map[string]any{"kid": g.Key.Kid, "alg": g.Key.Alg, "pub": g.Key.Pub}
 		}
@@ -488,6 +489,12 @@ func parseHeader(v any) (*Header, error) {
 	h.Origin, _ = m["origin"].(string)
 	if h.Origin == "" {
 		return nil, fmt.Errorf("header needs an origin")
+	}
+	// The exporting deployment's canonical origin (§C.3): an import copies
+	// it into every batch's source.origin, which takes no other form
+	// (§3.5), and verifiers put it in signing inputs.
+	if !sig.CanonicalOrigin(h.Origin) {
+		return nil, fmt.Errorf("header origin %q is not a canonical origin (§C.3, §G.4.1): scheme://host[:port] in lowercase ASCII without a default port", h.Origin)
 	}
 	h.Created, _ = m["created"].(string)
 	if h.Created == "" {
@@ -781,20 +788,11 @@ func parseGrantLine(m map[string]any, l *Line, authors bool) (*Line, error) {
 		return nil, fmt.Errorf("grant line %s: root must be an object", g.ID)
 	}
 	g.Root = root
-	arr, ok := m["stored"].([]any)
-	if !ok || len(arr) == 0 {
-		return nil, fmt.Errorf("grant line %s: stored must be a non-empty array of base64url blocks", g.ID)
+	stored, err := StoredAuthority(m["stored"])
+	if err != nil {
+		return nil, fmt.Errorf("grant line %s: %v", g.ID, err)
 	}
-	for _, x := range arr {
-		str, ok := x.(string)
-		if !ok || str == "" {
-			return nil, fmt.Errorf("grant line %s: stored must be an array of base64url strings", g.ID)
-		}
-		if _, err := base64.RawURLEncoding.Strict().DecodeString(str); err != nil {
-			return nil, fmt.Errorf("grant line %s: stored blocks must be base64url without padding", g.ID)
-		}
-		g.Stored = append(g.Stored, str)
-	}
+	g.Stored = stored
 	kv, hasKey := m["key"]
 	if !hasKey {
 		// The exporter found no key (§G.4.1): the chain can't be completed
@@ -824,6 +822,36 @@ func parseGrantLine(m map[string]any, l *Line, authors bool) (*Line, error) {
 	return l, nil
 }
 
+// StoredAuthority reads the stored form of a grant (§C.3.1) as a grant
+// line or GET /ns/{ns}/grants/{gid} gives it: the authority SignedBlock,
+// one base64url string without padding. The form before v0.73, an array of
+// the token's SignedBlocks authority first, is read as its first.
+func StoredAuthority(v any) (string, error) {
+	block := func(x any) (string, error) {
+		s, ok := x.(string)
+		if !ok || s == "" {
+			return "", fmt.Errorf("stored must be the authority block, a base64url string")
+		}
+		if _, err := base64.RawURLEncoding.Strict().DecodeString(s); err != nil {
+			return "", fmt.Errorf("stored must be base64url without padding")
+		}
+		return s, nil
+	}
+	arr, legacy := v.([]any)
+	if !legacy {
+		return block(v)
+	}
+	if len(arr) == 0 {
+		return "", fmt.Errorf("stored must be the authority block, a base64url string")
+	}
+	for _, x := range arr {
+		if _, err := block(x); err != nil {
+			return "", err
+		}
+	}
+	return arr[0].(string), nil
+}
+
 // --- the checker shared by Reader and Writer ---------------------------------
 
 type docState struct {
@@ -844,6 +872,8 @@ func newChecker(h *Header) *checker {
 	return &checker{h: h, docs: map[string]*docState{}, blobs: map[string]bool{}, grants: map[string]bool{}, n: 1, hash: sha256.New()}
 }
 
+// digestLine adds a line to the digest: its bytes as written, which are
+// its canonical form, and the 0x0A after them (§G.4.1, §I.9).
 func (c *checker) digestLine(canon []byte) {
 	c.hash.Write(canon)
 	c.hash.Write([]byte{0x0A})
@@ -1023,28 +1053,49 @@ func (r *Reader) Header() *Header { return r.h }
 // alive for as long as the line.
 func (r *Reader) keepDocCanon() { r.docCanon = true }
 
+// next reads the next line and parses it: its value and its bytes as
+// read, without the 0x0A, which are its canonical form.
 func (r *Reader) next() (any, []byte, error) {
-	for {
-		b, err := r.br.ReadBytes('\n')
-		if len(b) == 0 && err != nil {
-			if err == io.EOF {
-				return nil, nil, io.EOF
-			}
-			return nil, nil, err
-		}
-		if err != nil && err != io.EOF {
-			return nil, nil, err
-		}
-		r.lineNo++
-		if len(bytes.TrimSpace(b)) == 0 {
-			continue
-		}
-		v, perr := jsonv.Parse(b)
-		if perr != nil {
-			return nil, nil, &Error{Line: r.lineNo, Msg: "not I-JSON: " + perr.Error()}
-		}
-		return v, jsonv.Canonical(v), nil
+	b, err := r.br.ReadBytes('\n')
+	if len(b) == 0 && err != nil {
+		return nil, nil, err
 	}
+	if err != nil && err != io.EOF {
+		return nil, nil, err
+	}
+	r.lineNo++
+	body, lerr := lineBody(r.lineNo, b)
+	if lerr != nil {
+		return nil, nil, lerr
+	}
+	return parseCanonical(r.lineNo, body)
+}
+
+// lineBody is a line as ReadBytes read it, without its 0x0A: each line is
+// followed by one 0x0A, the last included, and none is blank (§G.4.1).
+func lineBody(lineNo int, b []byte) ([]byte, error) {
+	if len(b) == 0 || b[len(b)-1] != '\n' {
+		return nil, &Error{Line: lineNo, Msg: "the last line doesn't end in 0x0A (truncated?); every line is followed by one (§G.4.1)"}
+	}
+	if len(b) == 1 {
+		return nil, &Error{Line: lineNo, Msg: "a blank line; every line is canonical JSON (§G.4.1)"}
+	}
+	return b[:len(b)-1], nil
+}
+
+// parseCanonical parses a line's bytes, which must be its canonical JSON
+// byte for byte (§3.1, §G.4.1): a bundle with any other line is rejected,
+// so the digest over the bytes as written (§I.9) is one over canonical
+// lines. The bytes are returned as the canonical form, which they are.
+func parseCanonical(lineNo int, body []byte) (any, []byte, error) {
+	v, err := jsonv.Parse(body)
+	if err != nil {
+		return nil, nil, &Error{Line: lineNo, Msg: "not I-JSON: " + err.Error()}
+	}
+	if !bytes.Equal(jsonv.Canonical(v), body) {
+		return nil, nil, &Error{Line: lineNo, Msg: "not canonical JSON (§3.1); every line is written in its canonical form (§G.4.1)"}
+	}
+	return v, body, nil
 }
 
 // Next returns the next line, checked. At the end it runs the whole-bundle
@@ -1147,12 +1198,12 @@ func (r *Reader) parallel(workers int) {
 	for i := 0; i < workers; i++ {
 		go func() {
 			for j := range jobs {
-				v, perr := jsonv.Parse(j.b)
-				if perr != nil {
-					j.out <- parsedLine{lineNo: j.lineNo, err: &Error{Line: j.lineNo, Msg: "not I-JSON: " + perr.Error()}}
+				v, canon, err := parseCanonical(j.lineNo, j.b)
+				if err != nil {
+					j.out <- parsedLine{lineNo: j.lineNo, err: err}
 					continue
 				}
-				j.out <- parseAt(j.lineNo, v, jsonv.Canonical(v), authors, docCanon)
+				j.out <- parseAt(j.lineNo, v, canon, authors, docCanon)
 			}
 		}()
 	}
@@ -1167,25 +1218,28 @@ func (r *Reader) parallel(workers int) {
 				return false
 			}
 		}
+		fail := func(lineNo int, err error) {
+			out := make(chan parsedLine, 1)
+			out <- parsedLine{lineNo: lineNo, err: err}
+			send(out)
+		}
 		for {
 			b, err := br.ReadBytes('\n')
 			if len(b) == 0 && err != nil {
-				out := make(chan parsedLine, 1)
-				out <- parsedLine{lineNo: lineNo, err: err}
-				send(out)
+				fail(lineNo, err)
 				return
 			}
 			if err != nil && err != io.EOF {
-				out := make(chan parsedLine, 1)
-				out <- parsedLine{lineNo: lineNo, err: err}
-				send(out)
+				fail(lineNo, err)
 				return
 			}
 			lineNo++
-			if len(bytes.TrimSpace(b)) == 0 {
-				continue
+			body, err := lineBody(lineNo, b)
+			if err != nil {
+				fail(lineNo, err)
+				return
 			}
-			j := job{lineNo: lineNo, b: b, out: make(chan parsedLine, 1)}
+			j := job{lineNo: lineNo, b: body, out: make(chan parsedLine, 1)}
 			if !send(j.out) {
 				return
 			}

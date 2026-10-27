@@ -504,12 +504,9 @@ func compileCompare(m map[string]any) (node, error) {
 		return nil, fmt.Errorf(`%s: operand needs exactly one of "value", "path"`, n.op)
 	}
 	if hv {
+		// A literal that isn't an array makes in false, as a path to one
+		// does, not the rule invalid (§6.4.2).
 		n.right.value = jsonv.Clone(o["value"])
-		if n.op == "in" {
-			if _, ok := n.right.value.([]any); !ok {
-				return nil, errors.New(`in: "value" must be an array`)
-			}
-		}
 	} else {
 		q, qraw, err := ptrField(o, "path")
 		if err != nil {

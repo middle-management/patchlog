@@ -12,9 +12,15 @@ package main
 // fast-forward, catalog changes that narrow access, content, catalog
 // changes that widen it), each classified again with a dry run right
 // before it is submitted, and resumes a merge that stopped. status shows
-// the stored plan. rebase creates a successor of every branch (§F.5) and
-// writes a new revision of the release document listing them. abandon
-// freezes every branch with abandoned: true (needs a * key, §F.6).
+// the stored plan and the catalog bases' merge locks, which live in the
+// release document's namespace: { holder, plan } while held, {} while
+// free (§F.9). A lock another plan holds, or one an earlier version wrote
+// ({ "release" }), is released by a person: append {} to it. The one
+// exception is a merge an earlier version stopped part-way: apply resumes
+// it from its stored plan, taking over the lock that version took for it.
+// rebase creates a successor of every branch (§F.5) and writes a new
+// revision of the release document listing them. abandon freezes every
+// branch with abandoned: true (needs a * key, §F.6).
 //
 // Catalog batches (§F.8): -merge-bearer is the merge service's own grant
 // for the catalog (merge grants are issued only to it); -bearer, the
@@ -58,7 +64,7 @@ func releaseCmd(args []string) {
 	}
 	fs := flag.NewFlagSet("merge release "+sub, flag.ExitOnError)
 	tf := addToolFlags(fs)
-	stateNS := fs.String("state-ns", "", "namespace of the stored plan and the catalog locks (default: the release document's)")
+	stateNS := fs.String("state-ns", "", "namespace of the stored plan (default: the release document's); the catalog bases' merge locks are always in the release document's namespace (§F.9)")
 	dry := fs.Bool("dry-run", false, "plan: report only, store nothing")
 	suffix := fs.String("suffix", "", "rebase: successor names are each branch's name plus this suffix")
 	at := fs.String("at", "", "rebase: the new release document's combined checkpoint (§B.5), if known")
@@ -199,12 +205,22 @@ func releaseCmd(args []string) {
 	}
 
 	var rp *merge.ReleasePlan
+	var locks []*merge.Lock
 	var err error
 	switch sub {
 	case "status":
 		rp, err = merge.LoadReleasePlan(ctx, c, opt)
 		if err == nil && rp == nil {
 			err = errors.New("no stored plan for this release")
+		}
+		for _, b := range planBranches(rp) {
+			if !b.Catalog || err != nil {
+				continue
+			}
+			var l *merge.Lock
+			if l, err = merge.ReadLock(ctx, c, opt, b.Target); err == nil {
+				locks = append(locks, l)
+			}
 		}
 	case "plan":
 		var old *merge.ReleasePlan
@@ -233,12 +249,16 @@ func releaseCmd(args []string) {
 	}
 	if *tf.asJSON {
 		out := map[string]any{"plan": rp}
+		if locks != nil {
+			out["locks"] = locks
+		}
 		if err != nil {
 			out["error"] = err.Error()
 		}
 		printJSON(out)
 	} else if rp != nil {
 		printReleasePlan(rp)
+		printLocks(rp, locks)
 	}
 	if err != nil {
 		if !*tf.asJSON {
@@ -248,6 +268,36 @@ func releaseCmd(args []string) {
 	}
 	if sub == "plan" && !rp.Clean() {
 		os.Exit(1)
+	}
+}
+
+func planBranches(rp *merge.ReleasePlan) []*merge.ReleaseBranch {
+	if rp == nil {
+		return nil
+	}
+	return rp.Branches
+}
+
+// printLocks shows the catalog bases' merge locks (§F.9).
+func printLocks(rp *merge.ReleasePlan, locks []*merge.Lock) {
+	for _, l := range locks {
+		where := l.NS + "/" + l.Name
+		switch {
+		case l.Free():
+			fmt.Printf("  lock %s: free\n", where)
+		case l.Legacy != "" && l.Legacy == rp.Release && rp.Format == 0 && rp.State == merge.ReleaseMerging:
+			fmt.Printf("  lock %s: held by an earlier version's merge of this release, stopped part-way; apply resumes it and takes the lock over\n", where)
+		case l.Legacy != "":
+			fmt.Printf("  lock %s: held by an earlier version's merge of %s; a person releases it (append {})\n", where, l.Legacy)
+		case l.Plan == rp.Digest:
+			fmt.Printf("  lock %s: held by %s for this plan\n", where, l.Holder)
+		default:
+			plan := l.Plan
+			if plan == "" {
+				plan = "(none)"
+			}
+			fmt.Printf("  lock %s: held by %s for plan %s\n", where, l.Holder, plan)
+		}
 	}
 }
 

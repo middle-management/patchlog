@@ -93,7 +93,7 @@ func (im *importer) sendBlobs(ctx context.Context, b *batch, l limits) error {
 				return err
 			})
 			if err != nil {
-				if ae, ok := client.AsAPIError(err); ok && ae.Status == 413 {
+				if client.IsLimit(err) {
 					return fmt.Errorf("import: uploading blob %s to %s/%s: %w; a large import needs an allowance that raises the importer's blobPending (§6.6, §G.4.4)", nd.bid, it.ns, it.name, err)
 				}
 				return fmt.Errorf("import: uploading blob %s to %s/%s: %w", nd.bid, it.ns, it.name, err)

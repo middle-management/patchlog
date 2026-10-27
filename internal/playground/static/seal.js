@@ -5,7 +5,7 @@
  *     {alg, enc, kid: "{ns}#{e}", pl, zip?: "DEF"}, AAD = the base64url header (§E.2.2)
  *   - K_r = HKDF-SHA256(ikm K_e, salt "patchlog-e2", info ns ‖ 0x0A ‖ name) (§E.2.1)
  *   - HPKE base mode (RFC 9180), DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-256-GCM,
- *     single shot, empty AAD, wire form enc ‖ ct, info "patchlog-keys-v1\n" ‖ kid [‖ "\n" ‖ resource] (§E.2.3)
+ *     single shot, empty AAD, wire form enc ‖ ct, info "patchlog-key-v1\n" ‖ kid ‖ "\n" ‖ resource, resource "" for K_e (§E.2.3)
  *   - E3 keyring documents and recipient ids text(trunc160(sha256(canonical(jwk)))) (§E.3.2)
  *   - revision ids trunc160(sha256(parent ‖ 0x0A ‖ canonical patches)) (§3.3)
  *   - RFC 6902 JSON Patch, for folding e2e logs client-side
@@ -22,7 +22,7 @@ const te = new TextEncoder();
 const td = new TextDecoder('utf-8', { fatal: true });
 
 const SUITE = 'hpke-base-0x0020-0x0001-0x0002';
-const WRAP_INFO_PREFIX = 'patchlog-keys-v1\n';
+const WRAP_INFO_PREFIX = 'patchlog-key-v1\n';
 const RESOURCE_KEY_SALT = 'patchlog-e2';
 
 /* ---------------- bytes ---------------- */
@@ -206,7 +206,7 @@ async function hpkeOpen(identity, info, wrapped) {
   const ks = await keySchedule(shared, info);
   return gcmOpen(ks.key, ks.nonce, ct, new Uint8Array(0));
 }
-function wrapContext(kid, resource) { return utf8(WRAP_INFO_PREFIX + kid + (resource ? '\n' + resource : '')); }
+function wrapContext(kid, resource) { return utf8(WRAP_INFO_PREFIX + kid + '\n' + (resource || '')); }
 async function wrapKey(recipientX, kid, resource, key) {
   if (key.length !== 32) throw new Error('key must be 32 bytes');
   return hpkeSeal(unb64u(recipientX), wrapContext(kid, resource), key);
@@ -215,6 +215,21 @@ async function unwrapKey(identity, kid, resource, wrapped) {
   const k = await hpkeOpen(identity, wrapContext(kid, resource), wrapped);
   if (k.length !== 32) throw new Error('unwrapped key is not 32 bytes');
   return k;
+}
+/* Keyrings stored before v0.63 wrapped their keys under the info of that time, "patchlog-keys-v1\n" ‖ kid, then
+ * "\n" ‖ resource for a K_r only; /keys relays such entries as stored. Like the current info it binds kid and resource. */
+function legacyWrapContext(kid, resource) { return utf8('patchlog-keys-v1\n' + kid + (resource ? '\n' + resource : '')); }
+/* unwrapStoredKey opens a keyring entry, read in the keyring or relayed by /keys (§E.3.2), under the current info or,
+ * failing that, the legacy one (internal/seal's Keyring.EpochKey and the client's relayed entries do the same). */
+async function unwrapStoredKey(identity, kid, resource, wrapped) {
+  try {
+    return await unwrapKey(identity, kid, resource, wrapped);
+  } catch (e) {
+    let k;
+    try { k = await hpkeOpen(identity, legacyWrapContext(kid, resource), wrapped); } catch (_) { throw e; }
+    if (k.length !== 32) throw e;
+    return k;
+  }
 }
 
 /* ---------------- kids ---------------- */
@@ -409,7 +424,7 @@ async function keyringEpochKey(kr, identity, epoch) {
   const rid = await recipientID(identity.x);
   const w = (kr.epochs[String(epoch)] || {})[rid];
   if (!w) throw new Error(`the keyring has no key for this identity in epoch ${epoch}`);
-  return unwrapKey(identity, kid(kr.ns, epoch), '', unb64u(w));
+  return unwrapStoredKey(identity, kid(kr.ns, epoch), '', unb64u(w));
 }
 
 /* ---------------- JSON Patch (RFC 6902) ---------------- */
@@ -644,7 +659,7 @@ root.PLSeal = {
   SUITE, b64u, unb64u, b32, hex, unhex, utf8, equalBytes, randomBytes, newNonce, canonical, padLen,
   sha256, chainID, revisionID, tombstoneID, idBytes,
   hkdf, resourceKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, parseJWK,
-  hpkeSeal, hpkeOpen, wrapKey, unwrapKey, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
+  hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapStoredKey, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
   sealPatchSet, sealedJWE, sealedBlobs, BLOB_TYPE, blobType, blobID, blobIDs, sameBlobs, parseBlob, openBlob, sealBlob, encryptBlob, decryptBlob,
   parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,
   applyPatch, validate, selfTest,

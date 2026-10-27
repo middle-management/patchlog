@@ -152,7 +152,7 @@ func TestWrites(t *testing.T) {
 		{"move writes from and path", `{"a":1}`, `[{"op":"move","from":"/a","path":"/b"}]`, Options{}, []string{"/a", "/b"}},
 		{"move same location", `{"a":1}`, `[{"op":"move","from":"/a","path":"/a"}]`, Options{}, []string{"/a", "/a"}},
 		{"append index", `{"a":[1,2,3]}`, `[{"op":"add","path":"/a/-","value":4},{"op":"add","path":"/a/-","value":5}]`, Options{}, []string{"/a/3", "/a/4"}},
-		{"move append", `{"a":[1],"b":[7,8]}`, `[{"op":"move","from":"/b/0","path":"/a/-"}]`, Options{}, []string{"/b/0", "/a/1"}},
+		{"move append", `{"a":[1],"b":[7,8]}`, `[{"op":"move","from":"/b/0","path":"/a/-"}]`, Options{}, []string{"/b/0", "/b", "/a/1"}},
 		{"copy append", `{"a":[1]}`, `[{"op":"copy","from":"/a/0","path":"/a/-"}]`, Options{}, []string{"/a/1"}},
 		{"root", `{"a":1}`, `[{"op":"replace","path":"","value":{}}]`, Options{}, []string{""}},
 		{"test writes nothing", `{"a":1}`, `[{"op":"test","path":"/a","value":1}]`, Options{}, nil},

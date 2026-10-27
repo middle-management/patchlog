@@ -192,9 +192,10 @@ func TestMultiMinElsewhere(t *testing.T) {
 
 // TestMultiMinPurgedSealed (§A.5, §8.5): behind Multi, a min naming a
 // purged sealed namespace that another catalog's service follows, whose
-// document is 410 purged, is judged by the core's read check: a reader
-// who passes is redirected to the current at, any other gets the 400 of a
-// namespace no catalog follows. Never a 502.
+// document is 410 purged, counts as reached without a read check (a purge
+// is no secret, §E.4): every reader is redirected to the current at,
+// never answered 400 or 502. A min naming a namespace no catalog follows
+// is 400, its body listing it.
 func TestMultiMinPurgedSealed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -239,9 +240,12 @@ func TestMultiMinPurgedSealed(t *testing.T) {
 	}
 	catOnly := k.Grant(t, s.Now(), "user:c", []string{"cat"}, []string{"read"})
 	for name, tok := range map[string]string{"anonymous": "", "a grant for cat only": catOnly} {
-		hidden, unknown := x.raw("/cat/roots?min=sec:"+purged, tok), x.raw("/cat/roots?min=zz:"+purged, tok)
-		if hidden.status != 400 || hidden.body["message"] != unknown.body["message"] || hidden.header.Get("Cache-Control") != "no-store" {
-			t.Errorf("%s: %d %v, unknown %d %v", name, hidden.status, hidden.body, unknown.status, unknown.body)
+		if r := x.raw("/cat/roots?min=sec:"+purged, tok); r.status != 302 || !strings.HasSuffix(r.header.Get("Location"), "/at/"+cat.s.At()+"/roots") {
+			t.Errorf("%s: %d %v %s", name, r.status, r.body, r.header.Get("Location"))
+		}
+		unknown := x.raw("/cat/roots?min=zz:"+purged, tok)
+		if unknown.status != 400 || unknown.header.Get("Cache-Control") != "no-store" || fmt.Sprint(unknown.body["min"]) != "[zz:"+purged+"]" {
+			t.Errorf("%s: unknown %d %v", name, unknown.status, unknown.body)
 		}
 	}
 }
