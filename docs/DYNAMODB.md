@@ -579,7 +579,7 @@ What landed, beyond the spike:
   backend lacks is its `lacks` 501, asked by the Engine method before
   anything else; everything the server can reach so answers 501 rather
   than falling through to SQL:
-  branches, purges and pruning, sealed/e2e, gestures listing,
+  branches, pruning, sealed/e2e, gestures listing,
   author signatures (which the gate would verify but the commit doesn't
   store), remote branches, retention, sweeps, rotation. Refused
   configurations (`encryption`, `nonce: required`, `signatures:
@@ -603,6 +603,24 @@ What landed, beyond the spike:
   went unrecognised).
 - **Errors in the core's body shape** (`{"code": …}`), so the HTTP layer
   serves either backend alike.
+- **Purges** (§8.3, §8.5). The gate's `planPurge` and `planPurgeNS`
+  (split out of SQL's `Purge` and `PurgeNamespace`, which run them in
+  their transactions) decide; the commit carries what must be atomic: a
+  resource's RES item marked `purged` on the head the checks read and its
+  head document deleted, or `#META` marked purged on the configuration
+  in force; the entry; a `PURGING#` marker; the second CDN purge. Every
+  write conditions RES items and `#META` on not purged, so one checked
+  before a purge is stale after it, and reads answer 410 from the flags.
+  The content can't fit 100 actions: every revision's patch set and
+  document metadata, attachments and pending entries go right after the
+  commit (`PurgeContent`), then the bytes nothing names (`CollectBytes`,
+  a scan); an interrupted one is finished by the blob sweep, from its
+  marker. An upload's pending entry is conditioned on its bytes, so a
+  purge's collection can't race it. `in_use` (§6.1) works as on SQL:
+  `schemaUses` is gate logic now, over `allNamespaces` and the schema
+  references. Second CDN purges (D.8) are queued by the commit that
+  purges the tags (`#REPURGE`, `Commit.Repurge`) and sent by `Repurge`,
+  whose queue is the backend's (`dueRepurges`, `doneRepurge`).
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the
@@ -648,15 +666,14 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,331 top-level tests (pure unit tests included): 907 pass on DynamoDB
-and 421 skip — 384 as unsupported (118 branches, 115 encryption at rest,
-79 purges, 20 nonce-required, …), 36 on their own conditions, and 1 on
-the known list, which holds three tests (two by a subtest) meeting
-purges where no skip can reach: inside a service, or on a test's own
-goroutines. No test answers differently from the SQL
-backends: the list's divergences section is empty. A test that skips
-partway has asserted everything before its skip, so the phase-1 surface
-is covered beyond the 907.
+1,332 top-level tests (pure unit tests included): 959 pass on DynamoDB
+and 373 skip — 337 as unsupported (144 branches, 115 encryption at
+rest, 20 nonce-required, 15 pruning, 14 gestures listing, …) and 36 on
+their own conditions. The known list is empty: no test answers
+differently from the SQL backends, and none meets an unsupported
+feature where no skip can reach. A test that skips partway has asserted
+everything before its skip, so the phase-1 surface is covered beyond
+the 959.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on

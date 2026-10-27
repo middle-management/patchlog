@@ -8,19 +8,20 @@ package core
 // core's own code on the gate.
 //
 // Deliberate gaps, all surfaced as 501 "unsupported" (lacks, or a read
-// that panics with it): branches, purges and pruning, batch sources
-// whose documents reference blobs, sealed and e2e namespaces,
+// that panics with it): branches, pruning, batch sources whose
+// documents reference blobs, sealed and e2e namespaces,
 // nonce-required namespaces, gestures listing, author signatures, head
 // snapshots (revisions fold from the genesis). Grants, edge grants,
-// blobs, $schema validation and schemaReads, tombstones and restores,
-// multi-step items and batches (§7.5, bounded by the transaction's 100
-// actions) work.
+// blobs, $schema validation and schemaReads, purges, tombstones and
+// restores, multi-step items and batches (§7.5, bounded by the
+// transaction's 100 actions) work.
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/schema"
@@ -214,7 +215,10 @@ func ddbRefusals(cfg *Config) *Error {
 // readers wake. A config change may change what any read answers (meta).
 func (b *ddbBackend) commit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResult, error) {
 	e := b.e
-	inv := invalidation{nss: []string{c.NS}, meta: c.Config != nil}
+	// A purge takes content away from every cached answer (flushDocs, as
+	// purgeResource's).
+	purges := c.Purge != nil || c.PurgeNS
+	inv := invalidation{nss: []string{c.NS}, meta: c.Config != nil || purges, flushDocs: purges}
 	e.rc.begin(inv)
 	defer e.invalidate(inv, false)
 	return b.store.Commit(ctx, c)
@@ -232,3 +236,28 @@ func (b *ddbBackend) committed(ns string, tags ...string) {
 }
 
 // --- reads ---
+
+// repurgeOf is the second purge of tags a commit queues (repurge.go): nil
+// for none, or with RepurgeDelay negative.
+func (b *ddbBackend) repurgeOf(now time.Time, tags []string) *ddb.Repurge {
+	if len(tags) == 0 || b.e.opt.RepurgeDelay < 0 {
+		return nil
+	}
+	return &ddb.Repurge{Due: now.Add(b.e.opt.RepurgeDelay).UnixMilli(), Tags: tags}
+}
+
+func (b *ddbBackend) dueRepurges(ctx context.Context, now time.Time) ([]dueRepurge, error) {
+	rs, err := b.store.DueRepurges(ctx, now.UnixMilli(), 100)
+	if err != nil {
+		return nil, ddbAsErr(err)
+	}
+	out := make([]dueRepurge, len(rs))
+	for i, r := range rs {
+		out[i] = dueRepurge{key: r.Key, tags: r.Tags}
+	}
+	return out, nil
+}
+
+func (b *ddbBackend) doneRepurge(ctx context.Context, key any) error {
+	return asErrOrNil(b.store.DoneRepurge(ctx, key.(string)))
+}

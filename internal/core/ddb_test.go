@@ -137,8 +137,6 @@ func TestDDBUnsupported(t *testing.T) {
 	check("branches", err)
 	_, err = e.Prune(ctx, Request{NS: "demo"}, "d", PruneRequest{})
 	check("prune", err)
-	_, err = e.Purge(ctx, Request{NS: "demo"}, "d", "", false)
-	check("purge", err)
 
 	// Encrypted namespaces are refused at creation: Open refuses a key
 	// store, so as on SQL without one, 422.

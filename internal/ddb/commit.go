@@ -69,10 +69,33 @@ type Commit struct {
 	// while authentication was disabled: its entry serves "grant": null.
 	Grant  string
 	NoAuth bool
+	// Purge is a resource purge (§8.3), PurgeNS the namespace's (§8.5):
+	// what they commit at once (purgeActs); the bulk of the content goes
+	// after the commit (PurgeContent).
+	Purge   *CommitPurge
+	PurgeNS bool
+	// Repurge queues the second CDN purge of the tags the commit purges
+	// (repurge.go), in its transaction.
+	Repurge *Repurge
 	// Pins are the configurations of other namespaces the checks relied
 	// on (the schemas' namespaces: whether the writer may read them): a
 	// pin that moved makes the commit stale, as its own configuration's.
 	Pins []NSPin
+}
+
+// CommitPurge is a resource purge: of name, whose head the checks read.
+type CommitPurge struct {
+	Name    string
+	HeadPos uint64
+	HeadID  string
+}
+
+// metaCond is a commit's condition on a namespace's #META: the
+// configuration its checks ran under, and not purged (§8.5).
+const metaCond = "configPos = :cp AND configId = :ci AND purged = :np"
+
+func metaVals(pos uint64, id string) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{":cp": avN(pos), ":ci": avS(id), ":np": avS("0")}
 }
 
 // NSPin is a namespace's configuration as a check read it.
@@ -136,7 +159,7 @@ func (s *Store) Commit(ctx context.Context, c *Commit) (*CommitResult, error) {
 		return nil, apiErr(413, "limit", "limit", "itemsPerBatch", "measured", acts, "max", maxTxActions,
 			"message", "the batch's transaction exceeds 100 actions")
 	}
-	if s.grouping() && c.Config == nil {
+	if s.grouping() && !c.alone() {
 		return s.commitGrouped(ctx, c)
 	}
 	// A config change takes the namespace's commit lock, which the group
@@ -192,6 +215,15 @@ func (c *Commit) actions() int {
 	n := commitShared - 1 // entry, marker
 	if c.Config != nil {
 		n += 2 // the META update, the CFG put
+	}
+	if c.Repurge != nil {
+		n++ // the queued second purge
+	}
+	switch {
+	case c.Purge != nil:
+		n += 3 // the RES update, the document's delete, the PURGING marker
+	case c.PurgeNS:
+		n += 2 // the META update, the PURGING marker
 	}
 	for _, it := range c.Items {
 		n += len(it.Steps) + 1 + it.attachActions() // the revisions, the head, attachments
@@ -293,8 +325,8 @@ func (s *Store) buildCommits(ns string, cs []*Commit, t tip) ([]types.TransactWr
 		out = append(out, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
 			TableName:                 &s.Table,
 			Key:                       keyAV(keyMeta(p.NS)),
-			ConditionExpression:       strptr("configPos = :cp AND configId = :ci"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{":cp": avN(p.CfgPos), ":ci": avS(p.CfgID)},
+			ConditionExpression:       strptr(metaCond),
+			ExpressionAttributeValues: metaVals(p.CfgPos, p.CfgID),
 		}})
 	}
 	out = append(out, types.TransactWriteItem{Update: &types.Update{
@@ -309,13 +341,13 @@ func (s *Store) buildCommits(ns string, cs []*Commit, t tip) ([]types.TransactWr
 			":h": avN(t.headPos), ":i": avS(t.headID),
 		},
 	}})
-	if !changesConfig(cs) {
+	if !touchesMeta(cs) {
 		c := cs[0]
 		out = append(out, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
 			TableName:                 &s.Table,
 			Key:                       keyAV(keyMeta(ns)),
-			ConditionExpression:       strptr("configPos = :cp AND configId = :ci"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{":cp": avN(c.CfgPos), ":ci": avS(c.CfgID)},
+			ConditionExpression:       strptr(metaCond),
+			ExpressionAttributeValues: metaVals(c.CfgPos, c.CfgID),
 		}})
 	}
 	return out, res, nil
@@ -347,16 +379,21 @@ func grantMark(table, ns, gid string, pos uint64) types.TransactWriteItem {
 	}}
 }
 
-// changesConfig reports whether one of cs changes the configuration (a
-// config change commits on its own).
-func changesConfig(cs []*Commit) bool {
+// touchesMeta reports whether one of cs updates #META — a config change
+// or a namespace purge, which conditions the update itself (and commits on
+// its own).
+func touchesMeta(cs []*Commit) bool {
 	for _, c := range cs {
-		if c.Config != nil {
+		if c.Config != nil || c.PurgeNS {
 			return true
 		}
 	}
 	return false
 }
+
+// alone reports whether c commits on its own, outside group commit: one
+// that updates #META or purges.
+func (c *Commit) alone() bool { return c.Config != nil || c.PurgeNS || c.Purge != nil }
 
 // commitActs are one commit's actions, in this order — the layout
 // classifyCancel reads: a config change's META update and CFG put; each
@@ -375,10 +412,10 @@ func (s *Store) commitActs(c *Commit, entry logRow) []types.TransactWriteItem {
 				TableName:           table,
 				Key:                 keyAV(keyMeta(ns)),
 				UpdateExpression:    strptr("SET configPos = :new, configId = :newi, frozen = :fr"),
-				ConditionExpression: strptr("configPos = :old AND configId = :oldi"),
+				ConditionExpression: strptr("configPos = :old AND configId = :oldi AND purged = :np"),
 				ExpressionAttributeValues: map[string]types.AttributeValue{
 					":new": avN(c.CfgPos + 1), ":newi": avS(cc.ID), ":fr": avS(frozen),
-					":old": avN(c.CfgPos), ":oldi": avS(c.CfgID),
+					":old": avN(c.CfgPos), ":oldi": avS(c.CfgID), ":np": avS("0"),
 				},
 			}},
 			types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyCfg(ns, c.CfgPos+1), item{
@@ -391,6 +428,8 @@ func (s *Store) commitActs(c *Commit, entry logRow) []types.TransactWriteItem {
 	for i := range c.Items {
 		out = append(out, s.itemActs(c, &c.Items[i], entry)...)
 	}
+	out = append(out, s.purgeActs(c)...)
+	out = append(out, s.repurgeAct(c, entry)...)
 	marker := item{"ns": avS(ns), "logPos": avN(entry.pos)}
 	if len(c.Items) == 1 && c.Kind != "batch" {
 		marker["revId"] = avS(c.Items[0].Steps[len(c.Items[0].Steps)-1].ID)
@@ -441,8 +480,9 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 	if it.HeadPos == 0 {
 		cond = "attribute_not_exists(PK)"
 	} else {
-		cond = "headPos = :old AND headId = :oldi"
-		vals[":old"], vals[":oldi"] = avN(it.HeadPos), avS(it.HeadID)
+		// Not purged since (§8.3): the head stays a purged resource's.
+		cond = "headPos = :old AND headId = :oldi AND #st <> :pg"
+		vals[":old"], vals[":oldi"], vals[":pg"] = avN(it.HeadPos), avS(it.HeadID), avS("purged")
 	}
 	vals[":h"], vals[":i"], vals[":e"] = avN(final.pos), avS(final.id), avS(entry.id)
 	var update string
@@ -491,7 +531,7 @@ func classifyCancel(err error, cs []*Commit, n int) (stale []bool, tipMoved bool
 		return i < len(r) && r[i].Code != nil && *r[i].Code == "ConditionalCheckFailed"
 	}
 	tipAt := n - 1
-	if !changesConfig(cs) {
+	if !touchesMeta(cs) {
 		tipAt = n - 2
 		if failed(n - 1) {
 			for i := range stale {

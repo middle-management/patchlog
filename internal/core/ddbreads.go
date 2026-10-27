@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -289,9 +290,6 @@ func (r *ddbReads) schemaPins(own string) []ddb.NSPin {
 func (r *ddbReads) prefetchResources(int64, []string)      {}
 func (r *ddbReads) prefetchHeads(*nsRow, []string, *int64) {}
 func (r *ddbReads) prefetchSchemas([]schema.Ref)           {}
-func (r *ddbReads) schemaUses(func(ns *nsRow, res string) bool) map[string]map[int64]*nsRow {
-	return map[string]map[int64]*nsRow{}
-}
 
 func (r *ddbReads) nsLevel(n *nsRow) int { return r.config(n.configSeq).level }
 
@@ -415,26 +413,6 @@ func (r *ddbReads) batchEntry(n *nsRow, seq, author int64) (ids.ID, string, bool
 func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 	ns := r.nsName(n.id)
 	v := &view{ns: n, name: name}
-	if asOf != nil {
-		// The head as of a log entry: the history rows (ddb.Store.HeadAt),
-		// as SQL's head_history.
-		h, err := r.s.HeadAt(r.ctx, ns, name, r.logs[*asOf].pos)
-		r.must(err)
-		rh := r.resHandle(ns, name)
-		v.own = &resRow{id: rh, name: name}
-		if h == nil {
-			v.state = NotFound
-			return v
-		}
-		v.src = v.own
-		v.head = r.rev(r.revHandle(ns, name, h.Pos))
-		if v.head.kind == kindTombstone {
-			v.state = Tombstoned
-		} else {
-			v.state = Live
-		}
-		return v
-	}
 	rr, err := r.s.Resource(r.ctx, ns, name)
 	r.must(err)
 	rh := r.resHandle(ns, name)
@@ -447,11 +425,30 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 		return v
 	}
 	r.resRows[rh] = rr
-	hh := r.revHandle(ns, name, rr.HeadPos)
 	own := &resRow{id: rh, name: name, state: stateLive}
-	own.headSeq.Int64, own.headSeq.Valid = hh, true
 	v.own, v.src = own, own
-	v.head = r.rev(hh)
+	headPos := rr.HeadPos
+	switch {
+	case rr.Purged:
+		// Purged at every entry, with its head (§8.3).
+		own.state = statePurged
+		v.state = Purged
+		v.head = r.rev(r.revHandle(ns, name, headPos))
+		return v
+	case asOf != nil:
+		// The head as of a log entry: the history rows (ddb.Store.HeadAt),
+		// as SQL's head_history.
+		h, err := r.s.HeadAt(r.ctx, ns, name, r.logs[*asOf].pos)
+		r.must(err)
+		if h == nil {
+			v.state, v.src = NotFound, nil
+			return v
+		}
+		headPos = h.Pos
+	}
+	hh := r.revHandle(ns, name, rr.HeadPos)
+	own.headSeq.Int64, own.headSeq.Valid = hh, true
+	v.head = r.rev(r.revHandle(ns, name, headPos))
 	if v.head.kind == kindTombstone {
 		v.state = Tombstoned
 	} else {
@@ -769,8 +766,16 @@ func (r *ddbReads) schemaRefOf(seq int64) (string, bool) {
 
 func (r *ddbReads) knowRevID(seq int64, id ids.ID) {}
 
-// prunedIn: nothing is pruned or purged on this backend.
-func (r *ddbReads) prunedIn(segs []segment, lo int64) error { return nil }
+// prunedIn: nothing is pruned on this backend; a purged resource's range
+// is (prunedIn of resolve.go).
+func (r *ddbReads) prunedIn(segs []segment, lo int64) error {
+	for _, s := range segs {
+		if r.purgedRes(s.res) {
+			return purgedError{}
+		}
+	}
+	return nil
+}
 
 func (r *ddbReads) revsBetween(res, from, max int64, limit int, visit func(*revRow) bool) {
 	k := r.res[res]
@@ -820,8 +825,25 @@ func (r *ddbReads) nsLogRows(n *nsRow, from, to int64, limit int, visit func(nsL
 	}))
 }
 
-// resState: no purges here, so every resource is live.
-func (r *ddbReads) resState(res int64) int { return stateLive }
+func (r *ddbReads) resState(res int64) int {
+	if r.purgedRes(res) {
+		return statePurged
+	}
+	return stateLive
+}
+
+// purgedRes reports whether resource handle res is purged.
+func (r *ddbReads) purgedRes(res int64) bool {
+	rr, ok := r.resRows[res]
+	if !ok {
+		k := r.res[res]
+		var err error
+		rr, err = r.s.Resource(r.ctx, k.ns, k.name)
+		r.must(err)
+		r.resRows[res] = rr
+	}
+	return rr != nil && rr.Purged
+}
 
 func (r *ddbReads) entryConfig(seq int64) (int64, string) {
 	k := r.logs[seq]
@@ -843,3 +865,16 @@ func (r *ddbReads) epochKey(ns int64, epoch int) []byte {
 }
 func (r *ddbReads) e2eSnapshot(row *revRow) string  { panic(ddbUnsupported("e2e namespaces")) }
 func (r *ddbReads) e2eFoldSince(row *revRow) string { panic(ddbUnsupported("e2e namespaces")) }
+
+func (r *ddbReads) allNamespaces() []*nsRow {
+	var out []*nsRow
+	for _, name := range r.nsNames() {
+		if n := r.nsByName(name); n != nil && !n.purged && !strings.HasPrefix(name, "~") {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// schemaPinsIn: only branches ask (schemaUses), and there are none here.
+func (r *ddbReads) schemaPinsIn(n *nsRow) []schemaUse { return nil }

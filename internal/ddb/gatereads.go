@@ -107,6 +107,7 @@ type ResRow struct {
 	HeadPos    uint64
 	HeadID     string
 	Tombstoned bool
+	Purged     bool
 	EntryID    string
 	LastID     string
 	LastPos    uint64
@@ -118,7 +119,7 @@ func (s *Store) Resource(ctx context.Context, ns, name string) (*ResRow, error) 
 	if err != nil || r == nil || r.headPos == 0 {
 		return nil, err
 	}
-	return &ResRow{HeadPos: r.headPos, HeadID: r.headID, Tombstoned: r.state == "tombstoned", EntryID: r.entryID, LastID: r.lastID, LastPos: r.lastPos}, nil
+	return &ResRow{HeadPos: r.headPos, HeadID: r.headID, Tombstoned: r.state == "tombstoned", Purged: r.state == "purged", EntryID: r.entryID, LastID: r.lastID, LastPos: r.lastPos}, nil
 }
 
 // RevAt reads resource name's chain at pos; nil when there is none.

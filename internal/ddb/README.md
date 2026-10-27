@@ -87,8 +87,11 @@ commit: the `-grouped` benchmarks keep rising with writers instead.
 
 ## Simplifications (all deliberate)
 
-- The scope is plain namespaces: no branches, purges, sealed/e2e, or the
-  S3 offload of large values. Blobs (blobs.go) keep attachments and
+- The scope is plain namespaces: no branches, sealed/e2e, or the S3
+  offload of large values. Purges (purge.go) commit their flags at once
+  and their content after (`PurgeContent`, finished by the sweep from
+  `PURGING#` markers when interrupted); second CDN purges queue in the
+  commit (repurge.go). Blobs (blobs.go) keep attachments and
   pending entries as items of the namespace's partition and their bytes
   in `BYTES#<sha256>` items, inline (≤ `MaxInlineBytes`, which bounds
   `blobSize` without a blob directory) or as a file of `-blob-dir`; no
