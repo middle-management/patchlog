@@ -186,7 +186,7 @@ type Index struct {
 	edge    *svcedge.Store // the service's edge grants (EdgeGrants)
 
 	fmu     sync.Mutex
-	filters map[string]*readFilter // scope marker -> what it stands for (edge_filters)
+	filters map[string]keptFilter // scope marker -> what it stands for (edge_filters)
 
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers

@@ -167,9 +167,17 @@ var filterStmts = []string{
 	`CREATE TABLE IF NOT EXISTS edge_filters (marker TEXT PRIMARY KEY, filter TEXT NOT NULL, exp INTEGER NOT NULL)`,
 }
 
+// keptFilter is a readFilter the service holds in memory (Index.filters),
+// with the Unix time its last edge grant known here expires.
+type keptFilter struct {
+	f   *readFilter
+	exp int64
+}
+
 // recordFilters records the filters behind scope markers, for edge grants
 // minted at now that expire by exp, and drops those whose last edge grant
-// has expired.
+// has expired, from the database and from memory, as svcedge.Store.Record
+// does for subject sets.
 func (ix *Index) recordFilters(ctx context.Context, filters map[string]*readFilter, exp, now time.Time) error {
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -189,8 +197,13 @@ func (ix *Index) recordFilters(ctx context.Context, filters map[string]*readFilt
 		return err
 	}
 	ix.fmu.Lock()
+	for m, k := range ix.filters {
+		if k.exp <= now.Unix() {
+			delete(ix.filters, m)
+		}
+	}
 	for m, f := range filters {
-		ix.filters[m] = f
+		ix.filters[m] = keptFilter{f: f, exp: max(ix.filters[m].exp, exp.Unix())}
 	}
 	ix.fmu.Unlock()
 	return nil
@@ -200,13 +213,16 @@ func (ix *Index) recordFilters(ctx context.Context, filters map[string]*readFilt
 // grant for it was minted, by this instance or another on the database.
 func (ix *Index) filter(ctx context.Context, m string) (*readFilter, bool) {
 	ix.fmu.Lock()
-	f, ok := ix.filters[m]
+	k, ok := ix.filters[m]
 	ix.fmu.Unlock()
 	if ok {
-		return f, true
+		return k.f, true
 	}
-	var s string
-	if err := ix.db.QueryRowContext(ctx, `SELECT filter FROM edge_filters WHERE marker = ?`, m).Scan(&s); err != nil {
+	var (
+		s   string
+		exp int64
+	)
+	if err := ix.db.QueryRowContext(ctx, `SELECT filter, exp FROM edge_filters WHERE marker = ?`, m).Scan(&s, &exp); err != nil {
 		return nil, false
 	}
 	f, err := decodeFilter(s)
@@ -214,7 +230,7 @@ func (ix *Index) filter(ctx context.Context, m string) (*readFilter, bool) {
 		return nil, false
 	}
 	ix.fmu.Lock()
-	ix.filters[m] = f
+	ix.filters[m] = keptFilter{f: f, exp: exp}
 	ix.fmu.Unlock()
 	return f, true
 }
@@ -796,7 +812,7 @@ func grantExp(v *grant.Verified) time.Time {
 // vouches only for its own prefixes (edgeGS), and their state lives in
 // the database (svcedge.Store, edge_filters).
 func (ix *Index) initEdge(ctx context.Context, db *sql.DB) error {
-	ix.filters = map[string]*readFilter{}
+	ix.filters = map[string]keptFilter{}
 	if ix.opt.EdgeGrants == nil {
 		return nil
 	}
