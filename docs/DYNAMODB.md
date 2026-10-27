@@ -414,9 +414,17 @@ with grants; a write there is ~13 statements).
 | write, 8 writers, one ns | 167/s, p50 9.9 ms — `#TIP` contention | 310/s |
 | write, 32 writers, one ns | 82/s, p50 156 ms — contention degenerates | 590/s, p50 52 ms (group commit) |
 | write, 32 writers, 64 ns | 266/s (collisions where writers met) | 420/s over 1,000 ns |
+| write, 8 writers, one ns, grouped | 289/s, p50 27 ms, ~3 writes a group (vs 80/s ungrouped, same run) | 310/s |
+| write, 32 writers, one ns, grouped | 346/s, p50 94 ms, ~12 a group (vs 49/s ungrouped, same run) | 590/s, p50 52 ms (group commit) |
 | append, 1 writer, 1 doc | 261/s, p50 3.7 ms | — |
 | read head, 8 readers | ~2,000/s, p50 2 ms (1 RT) | 1,000–1,600/s, p50 4.6–6.6 ms |
 | log pages of 100 | 302 pages/s ≈ 30k entries/s | catch-up ≈ 28k entries/s |
+
+The grouped rows are phase 2's `group.go` (§13), measured on a slower
+host than the spike's rows (one writer there: 164/s, p50 5.9 ms), with
+the ungrouped figures of the same run alongside: grouping removes the
+collapse and the errors, and the ceiling it then meets is DynamoDB
+Local's per-action transaction cost, not `#TIP`.
 
 Read the DynamoDB column as *round-trip structure*, not AWS projection:
 real in-region latency adds ~1–3 ms per RT. What it establishes:
@@ -512,13 +520,28 @@ What landed, beyond the spike:
   merged in unhashed (§7.4).
 - **Errors in the core's body shape** (`{"code": …}`), so the HTTP layer
   serves either backend alike.
+- **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
+  `-group-commit` (default 32) as on Postgres: each resource write or
+  delete runs its check phase alone, then queues; a worker per namespace
+  takes the queued writes that fit one transaction (distinct resources,
+  one configuration, ≤ 100 actions: six a write, five a delete, two
+  shared, so ≤ 16 writes) and re-chains their entries over the tip at
+  consecutive positions — an entry's id covers the one before it, not
+  anything the write's gate read. The transaction pins every write's head
+  as ungrouped, moves `#TIP` once, and carries a `ConditionCheck` that
+  `#META`'s `configPos` is still the one the writes were checked under,
+  so a write's gate holds at commit though the tip it read moved on. A
+  write whose head moved is answered alone (412, or its replay); a moved
+  tip (another instance) is re-read and the group re-chained; a changed
+  configuration or an unknown outcome sends each write back round its own
+  loop. Batches and config writes don't queue: they hold a per-namespace
+  commit lock, shared with the worker, from their reads to their commit.
+  §11 has the measurements.
 
 Requirements and limits, by design: `-dev` (writes need authentication
 disabled; reads of non-`public` namespaces are 501), one instance (no
 stream invalidation — §6 is phase 3), no background loops (retention,
-sweeps, rotation, remote follow don't start). Group commit (§4) remains
-phase 2: the optimistic `#TIP` retry of §11 stands, lowered concurrency
-expectations with it.
+sweeps, rotation, remote follow don't start).
 
 Tests: `internal/core/ddb_test.go` runs the phase-1 surface end to end
 against DynamoDB Local (flow, the gate's 404/409/412/413/422 answers,
