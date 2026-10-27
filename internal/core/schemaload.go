@@ -1,10 +1,12 @@
 package core
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 
 	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schema"
 )
 
@@ -14,9 +16,16 @@ import (
 // Each revision row records, in revisions.rules, the rules its document was
 // written under (schema.Rules): V073 for those written now, Legacy for a
 // copy of a revision stored under the earlier rules. Rows from before the
-// column, and those a remote branch mirrors from another deployment
-// (§G.3), whose marker there this deployment can't know, are NULL, read
-// as Legacy. The marker never changes, and isn't part of the revision id.
+// column are NULL, read as Legacy. The marker never changes, and isn't
+// part of the revision id.
+//
+// A schema revision read in the clear carries its marker in
+// schema.RulesHeader (Rev.SchemaRules), so clients validating at E3 and
+// other deployments compile it as this one does. The rows a remote branch
+// mirrors from another deployment (§G.3) keep the marker the base serves
+// each schema revision with (fetchRules, F-S1), and are NULL where it
+// serves none: a base from before markers compiles every schema as
+// Legacy, and a sealed one sends none.
 //
 // A schema document's marker selects how it is checked when written (V073:
 // write mode; Legacy: the stored mode, as v0.55 checked it) and how it
@@ -85,7 +94,8 @@ func (t *tx) docRules(id ids.ID, doc any, sc *schemaCtx) schema.Rules {
 }
 
 // rowRules is the rules marker revision row seq was stored with: NULL
-// (written before markers, or mirrored) is Legacy. A row's marker never
+// (written before markers, or mirrored from a base that served none) is
+// Legacy. A row's marker never
 // changes, whoever resolves it: the transaction keeps it (t.schemas, by
 // seq), read ahead with the heads of a batch's pinned schemas
 // (prefetchRules).
@@ -97,6 +107,23 @@ func (t *tx) rowRules(seq int64) schema.Rules {
 	t.must(t.QueryRow(`SELECT rules FROM revisions WHERE seq = ?`, seq).Scan(&r))
 	return t.knowRules(seq, r)
 }
+
+// schemaRulesHeader is Rev.SchemaRules for revision row r served with
+// document b: its marker if b is a schema document, "" otherwise.
+func (t *tx) schemaRulesHeader(r *revRow, b []byte) string {
+	if !bytes.Contains(b, schemaDialectMember) {
+		return ""
+	}
+	doc, err := jsonv.Parse(b)
+	if err != nil || !schema.IsSchemaDoc(doc) {
+		return ""
+	}
+	return t.rowRules(r.seq).String()
+}
+
+// schemaDialectMember is how a schema document's $schema reads in its
+// canonical bytes (§3.1), which every schema document holds.
+var schemaDialectMember = []byte(`"$schema":"` + schema.Dialect2020 + `"`)
 
 // knowRules keeps the marker of row seq, stored as r, for the transaction.
 func (t *tx) knowRules(seq int64, r sql.NullInt64) schema.Rules {

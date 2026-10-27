@@ -419,7 +419,7 @@ CREATE TABLE IF NOT EXISTS rotations_due (
 ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS via text;
 -- P27: the schema rules marker of a revision (db.go, schemaload.go): 1 for
 -- V073, 0 for Legacy; NULL, read as Legacy, in rows from before it and in
--- rows a remote branch mirrors (§6.1).
+-- rows a remote branch mirrors from a base that serves no marker (§6.1).
 ALTER TABLE revisions ADD COLUMN IF NOT EXISTS rules smallint;
 -- Raises to e2e (Addendum E Levels; db.go, e2e.go): the configuration that
 -- made a namespace end-to-end after its creation, the level before, and

@@ -39,6 +39,23 @@ func (r Rules) String() string {
 	return "legacy"
 }
 
+// RulesHeader is the response header a revision read of a schema
+// document served in the clear carries, naming its marker (Rules.String):
+// an addition, so a client or another deployment compiles the revision as
+// its server does (§6.1). A server that sends none compiles it as Legacy.
+const RulesHeader = "X-Schema-Rules"
+
+// ParseRules reads a marker as Rules.String writes it.
+func ParseRules(s string) (Rules, bool) {
+	switch s {
+	case "v0.73":
+		return V073, true
+	case "legacy":
+		return Legacy, true
+	}
+	return Legacy, false
+}
+
 // formats2020 is the format set draft 2020-12 defines. A schema written
 // now naming any other is invalid, as an unknown keyword is (§6.2 step 5,
 // §6.5).

@@ -278,6 +278,12 @@ type remoteChain struct {
 	// blobs are the blobs its documents reference, fetched from the base
 	// and verified (remote_blobs.go).
 	blobs map[ids.ID]*remoteBlob
+	// rules are the schema rules markers the base serves for the
+	// chain's schema documents, by entry id (fetchRules): the rows that
+	// mirror them keep them, so a revision compiles here as it does there
+	// (§6.1, F-S1). An entry the base sends none for is stored without one
+	// (NULL, read as Legacy).
+	rules map[string]schema.Rules
 }
 
 func newChain(entries []client.LogEntry, horizonDoc []byte) *remoteChain {
@@ -293,8 +299,46 @@ func (c *remoteChain) last() client.LogEntry { return c.entries[len(c.entries)-1
 // prefix is the chain's entries up to index k.
 func (c *remoteChain) prefix(k int) *remoteChain {
 	p := newChain(c.entries[:k+1], c.horizonDoc)
-	p.opaque, p.blobs = c.opaque, c.blobs
+	p.opaque, p.blobs, p.rules = c.opaque, c.blobs, c.rules
 	return p
+}
+
+// fetchRules reads, for each schema document of ch, the rules marker the
+// base serves its revision with (schema.RulesHeader, a HEAD of the
+// revision): one request per schema revision, none for other documents
+// or an opaque chain. mapErr maps a failed request, as for fetchChain.
+func fetchRules(ctx context.Context, c *client.Client, ns, name string, ch *remoteChain, mapErr func(string, error) *Error) *Error {
+	if ch.opaque {
+		return nil
+	}
+	var ferr *Error
+	err := ch.fold(func(i int, e client.LogEntry, doc any) error {
+		if e.Kind != "rev" || !schema.IsSchemaDoc(doc) {
+			return nil
+		}
+		if _, done := ch.rules[e.ID]; done {
+			return nil
+		}
+		r, known, err := c.SchemaRules(ctx, ns, name, e.ID)
+		if err != nil {
+			ferr = mapErr("/r/"+ns+"/"+name+"/rev/"+e.ID, err)
+			return errStop
+		}
+		if known {
+			if ch.rules == nil {
+				ch.rules = map[string]schema.Rules{}
+			}
+			ch.rules[e.ID] = r
+		}
+		return nil
+	})
+	if ferr != nil {
+		return ferr
+	}
+	if err != nil {
+		return unverified("/r/%s/%s: %v", ns, name, err)
+	}
+	return nil
 }
 
 // fold walks the chain, calling f with each entry and the document after it
@@ -904,6 +948,9 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 		if ferr != nil {
 			return nil, ferr
 		}
+		if ferr := fetchRules(ctx, c, lv.ns, name, ch, mapErrs[i]); ferr != nil {
+			return nil, ferr
+		}
 		r.chain = ch
 		// The blobs its documents reference, mirrored with it (§G.3).
 		if ferr := fetchBlobs(ctx, c, lv.ns, name, ch, mapErrs[i]); ferr != nil {
@@ -981,7 +1028,12 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 		queue = append(queue, schema.Refs(doc)...)
 	}
 	for _, k := range sortedKeys(schemas) {
-		m.schemas = append(m.schemas, schemas[k])
+		s := schemas[k]
+		ref := schema.Ref{NS: s.ns, Name: s.name, Rev: s.chain.last().ID}
+		if ferr := fetchRules(ctx, c, s.ns, s.name, s.chain, schemaFetchErr(ref)); ferr != nil {
+			return nil, ferr
+		}
+		m.schemas = append(m.schemas, s)
 	}
 	sources, ferr := fetchSchemaSources(ctx, c, m.schemas)
 	if ferr != nil {
@@ -1395,6 +1447,12 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 		if len(e.Via) > 0 {
 			via = string(jsonv.Canonical(anyStrings(e.Via)))
 		}
+		// The marker the base serves a schema revision with (fetchRules),
+		// or none, read as Legacy (schemaload.go).
+		var rules any
+		if r, ok := ch.rules[e.ID]; ok && kind == kindRev {
+			rules = int(r)
+		}
 		var size, digest any
 		if kind == kindRev && !ch.opaque && i == len(ch.entries)-1 && t.resLevel(res) < levelAtRest {
 			// The head the chain leaves (headMeta), but not in a shadow
@@ -1403,8 +1461,8 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 			sz, sum := headMeta(canonDoc)
 			size, digest = sz, sum
 		}
-		last = t.mustInsert(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created, gesture, undoes, size, digest) VALUES (?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?) RETURNING seq`,
-			res, id[:], parentSeq, first, kind, patches, author, via, sig, typed, parseCreated(e.Created, t.now), gesture, undoes, size, digest)
+		last = t.mustInsert(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created, gesture, undoes, size, digest, rules) VALUES (?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?) RETURNING seq`,
+			res, id[:], parentSeq, first, kind, patches, author, via, sig, typed, parseCreated(e.Created, t.now), gesture, undoes, size, digest, rules)
 		parentSeq = last
 		if kind == kindTombstone {
 			state = stateTombstoned

@@ -258,6 +258,13 @@ type Rev struct {
 	// JWE, a sealed snapshot or a keyring there carries neither.
 	Created time.Time
 	Digest  []byte
+	// SchemaRules is, for a 200 whose Doc is a schema document served in
+	// the clear (the namespace serving the read is neither sealed nor
+	// e2e), the rules marker its revision row was stored with
+	// (schema.Rules.String, schemaload.go), sent as schema.RulesHeader so
+	// clients and remote mirrors compile it as this server does (§6.1).
+	// "" otherwise.
+	SchemaRules string
 }
 
 // ResourceRev serves the document at a revision.
@@ -370,6 +377,9 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			return nil
 		}
 		out.Status, out.Doc = 200, b
+		if plain {
+			out.SchemaRules = t.schemaRulesHeader(row, b)
+		}
 		if plain && row.size.Valid && row.size.Int64 == int64(len(b)) && len(row.digest) == sha256.Size {
 			// The digest the write stored of these bytes (headMeta).
 			out.Digest = row.digest
@@ -389,7 +399,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		// document, and an e2e keyring is kept without its created time
 		// and digest): immutable, and the same for every reader. Hashed
 		// here unless the write stored its digest.
-		d := revDoc{doc: out.Doc, meta: plain}
+		d := revDoc{doc: out.Doc, meta: plain, rules: out.SchemaRules}
 		if plain {
 			d.created = out.Created.UnixMilli()
 			if out.Digest != nil {

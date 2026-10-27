@@ -471,7 +471,7 @@ func migrate(db *sql.DB) error {
 		// P27: revisions.rules, the schema rules marker of a revision
 		// (schema.Rules, schemaload.go): 1 for V073, 0 for Legacy; NULL,
 		// read as Legacy, in rows from before it and in rows a remote
-		// branch mirrors (§6.1, F-S1).
+		// branch mirrors from a base that serves no marker (§6.1, F-S1).
 		{"revisions", "rules", "INTEGER", "", nil}} {
 		var has bool
 		if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)`, c.table, c.col).Scan(&has); err != nil {

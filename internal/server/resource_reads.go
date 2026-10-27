@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -188,6 +189,12 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("ETag", tag)
 		w.Header().Set("X-Revision", id)
+		if rev.SchemaRules != "" {
+			// The rules marker of a schema revision (§6.1), immutable as
+			// the revision is: a client or a remote mirror compiles it as
+			// this server does.
+			w.Header().Set(schema.RulesHeader, rev.SchemaRules)
+		}
 		if s.notModified(r, tag, rev) {
 			w.WriteHeader(304)
 			return
