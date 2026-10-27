@@ -214,3 +214,49 @@ func TestV073P39DrawPausesAfterDeadlock(t *testing.T) {
 		t.Fatalf("the draw ran again %v after its deadlock, want a pause of at least %v", gap, deadlockPause/2)
 	}
 }
+
+// TestPGGroupCommitLostRaceLeavesLoserOut let the single write append once
+// two lock waits showed, taken for the group waiting for its row, the
+// cause of FL-1: a draw of the group's write of x waiting for x's bucket
+// row is a second wait before any group forms, the single write then
+// appended first and the group never lost the race (one attempt, not two).
+// Here x's bucket row is held while the group's writes check, so that
+// draw waits; the test waits for the group itself (groupWaitsOn).
+func TestV073P39LostRaceWaitsForTheGroup(t *testing.T) {
+	if !pgtest.Enabled() {
+		t.Skip("Postgres only")
+	}
+	lostRaceLeavesLoserOut(t, func(a *Engine, single int) {
+		rtx, err := a.db.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { rtx.Rollback() })
+		var held, pid int
+		if err := rtx.QueryRow(`WITH l AS (SELECT 1 FROM rate_buckets WHERE substring(key from 1 for 6) = $1 FOR UPDATE)
+			SELECT COUNT(*), pg_backend_pid() FROM l`, []byte("r\x00n\x00x\x00")).Scan(&held, &pid); err != nil || held != 1 {
+			t.Fatalf("holding x's bucket row: %d, %v", held, err)
+		}
+		done := make(chan struct{})
+		t.Cleanup(func() { <-done })
+		go func() {
+			defer close(done)
+			defer rtx.Rollback()
+			if !waitFor(10*time.Second, func() bool {
+				var n int
+				a.db.QueryRow(`SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database()
+					AND wait_event_type = 'Lock' AND query LIKE '%rate_draw(%' AND $1 = ANY (pg_blocking_pids(pid))`, pid).Scan(&n)
+				return n > 0
+			}) {
+				t.Error("no draw waited for x's bucket row")
+				return
+			}
+			if w := waiting(a); w < 2 {
+				t.Errorf("%d lock waits while a draw waits, want the single write's and the draw's", w)
+			}
+			if groupWaitsOn(a, "n", single) {
+				t.Error("the group waits for the single write's row while a write draws its tokens")
+			}
+		}()
+	})
+}

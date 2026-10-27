@@ -582,17 +582,48 @@ func waiting(e *Engine) int {
 // ratebuckets.go) wait for each other's bucket rows in their check phase,
 // before any group forms, and a request cancelled then is never written.
 func groupBlocked(e *Engine, ns string, key int32) bool {
-	e.groups.mu.Lock()
-	s := e.groups.ns[ns]
-	formed := s != nil && s.worker && s.checking == 0 && s.solo == 0 && len(s.queue) == 0
-	e.groups.mu.Unlock()
-	if !formed {
+	if !groupFormed(e, ns) {
 		return false
 	}
 	var n int
 	e.db.QueryRow(`SELECT COUNT(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid)
 		WHERE l.locktype = 'advisory' AND l.classid = ($1::bigint)::oid AND l.objid = ($2::bigint)::oid AND l.objsubid = 2
 		AND NOT l.granted AND a.datname = current_database()`, lockClass, key).Scan(&n)
+	return n > 0
+}
+
+// groupFormed reports whether e's writes of ns have all left their check
+// phase and the queue, taken into a group by a running worker.
+func groupFormed(e *Engine, ns string) bool {
+	e.groups.mu.Lock()
+	defer e.groups.mu.Unlock()
+	s := e.groups.ns[ns]
+	return s != nil && s.worker && s.checking == 0 && s.solo == 0 && len(s.queue) == 0
+}
+
+// lockWaiter is the backend of e's database that waits for the advisory
+// lock key of class, or 0 if none does.
+func lockWaiter(e *Engine, class int, key int32) int {
+	var pid int
+	e.db.QueryRow(`SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+		WHERE l.locktype = 'advisory' AND l.classid = ($1::bigint)::oid AND l.objid = ($2::bigint)::oid AND l.objsubid = 2
+		AND NOT l.granted AND a.datname = current_database() LIMIT 1`, class, key).Scan(&pid)
+	return pid
+}
+
+// groupWaitsOn reports whether e's writes of ns have formed a group
+// (groupFormed) and a transaction other than a rate draw waits for a lock
+// the backend pid holds: the group's insert, waiting for a row pid's
+// transaction inserted. Like groupBlocked, it isn't fooled by the writes'
+// rate draws waiting for each other's bucket rows before any group forms.
+func groupWaitsOn(e *Engine, ns string, pid int) bool {
+	if !groupFormed(e, ns) {
+		return false
+	}
+	var n int
+	e.db.QueryRow(`SELECT COUNT(*) FROM pg_stat_activity
+		WHERE datname = current_database() AND wait_event_type = 'Lock' AND query NOT LIKE '%rate_draw(%'
+		AND $1 = ANY (pg_blocking_pids(pid))`, pid).Scan(&n)
 	return n > 0
 }
 
@@ -856,6 +887,13 @@ func TestPGGroupCommitNoDeadlockWithSingleWrite(t *testing.T) {
 // transaction runs again, and the re-check leaves x's write out, to be
 // answered 412 alone; the others commit together.
 func TestPGGroupCommitLostRaceLeavesLoserOut(t *testing.T) {
+	lostRaceLeavesLoserOut(t, nil)
+}
+
+// lostRaceLeavesLoserOut runs TestPGGroupCommitLostRaceLeavesLoserOut.
+// drawing, if not nil, is called with the single write's backend just
+// before the group's writes start.
+func lostRaceLeavesLoserOut(t *testing.T, drawing func(a *Engine, single int)) {
 	a, b := twoInstancesAt(t, slowDeadlockDB(t))
 	a.noSolo = true
 	a.opt.GroupCommitWait = 5 * time.Second
@@ -865,7 +903,8 @@ func TestPGGroupCommitLostRaceLeavesLoserOut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	release := holdLock(t, a, logClass, lockKey(nsIDOf(t, a, "n")))
+	logKey := lockKey(nsIDOf(t, a, "n"))
+	release := holdLock(t, a, logClass, logKey)
 	type outcome struct {
 		res *WriteResult
 		err error
@@ -875,18 +914,27 @@ func TestPGGroupCommitLostRaceLeavesLoserOut(t *testing.T) {
 		r, err := write(b, "n", "x", h, 99)
 		single <- outcome{r, err}
 	}()
-	within(t, 5*time.Second, "the single write waits for the log lock", func() bool { return waiting(a) == 1 })
+	var pid int
+	within(t, 5*time.Second, "the single write waits for the log lock", func() bool {
+		pid = lockWaiter(a, logClass, logKey)
+		return pid != 0
+	})
 	sizes := groupSizes(a)
 	alone := a.groups.alone.Load()
 	holdChecked(t, a, 3, nil)
 	go func() {
 		// Once the group waits for the single write's row, the single write
-		// may append.
-		if !waitFor(5*time.Second, func() bool { return waiting(a) == 2 }) {
+		// may append. (Any second lock wait is no sign of it: the group's
+		// writes draw their rate-limit tokens in their check phase, and one
+		// draw may wait for another's bucket row before any group forms.)
+		if !waitFor(5*time.Second, func() bool { return groupWaitsOn(a, "n", pid) }) {
 			t.Error("the group didn't wait for the single write's row")
 		}
 		release()
 	}()
+	if drawing != nil {
+		drawing(a, pid)
+	}
 	start := time.Now()
 	res, errs := concurrently(3, func(i int) (*WriteResult, error) {
 		if i == 0 {
