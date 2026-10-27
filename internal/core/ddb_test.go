@@ -131,8 +131,6 @@ func TestDDBUnsupported(t *testing.T) {
 	}
 	_, err := e.Gestures(ctx, "demo", "g1", "", Credentials{})
 	check("gestures", err)
-	_, err = e.Prune(ctx, Request{NS: "demo"}, "d", PruneRequest{})
-	check("prune", err)
 
 	// Encrypted namespaces are refused at creation: Open refuses a key
 	// store, so as on SQL without one, 422.

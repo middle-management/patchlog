@@ -24,9 +24,8 @@ import (
 // configSeq, revRow.seq and res, author ids, entry seqs): here they are
 // handles, minted per check, onto the table's keys. What the backend
 // doesn't store reads as empty where nothing of the kind can exist
-// (branches, draft copies, schema uses, pruning horizons), and as 501
-// where a request needs a feature it lacks (blobs, sealed and e2e keys,
-// grants, $schema namespaces, archives, reads at an earlier entry).
+// (remote registrations, archives), and as 501 where a request needs a
+// feature it lacks (sealed and e2e keys).
 type ddbReads struct {
 	e   *Engine
 	b   *ddbBackend
@@ -198,7 +197,7 @@ func (r *ddbReads) revRowOf(ns string, ri *ddb.RevInfo) *revRow {
 		row.kind = kindTombstone
 	} else {
 		row.kind = kindRev
-		row.patches.String, row.patches.Valid = ri.Patches, true
+		row.patches.String, row.patches.Valid = ri.Patches, !ri.Pruned
 		row.size.Int64, row.size.Valid = int64(ri.Size), true
 		row.digest = ri.Digest
 	}
@@ -485,6 +484,10 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 	}
 	hh := r.revHandle(ns, name, rr.HeadPos)
 	own.headSeq.Int64, own.headSeq.Valid = hh, true
+	if rr.HorizonPos > 0 {
+		own.horizonSeq.Int64, own.horizonSeq.Valid = r.revHandle(ns, name, rr.HorizonPos), true
+		own.keep.String, own.keep.Valid = rr.Keep, true
+	}
 	v.head = r.rev(r.revHandle(ns, name, headPos))
 	if v.head.kind == kindTombstone {
 		v.state = Tombstoned
@@ -534,7 +537,12 @@ func (r *ddbReads) entriesTo(row *revRow) []int64 {
 
 func (r *ddbReads) docBytesAt(row *revRow) ([]byte, error) {
 	ref := r.revs[row.seq]
-	return r.s.DocAt(r.ctx, ref.key.ns, ref.key.name, ref.key.pos)
+	b, err := r.s.DocAt(r.ctx, ref.key.ns, ref.key.name, ref.key.pos)
+	var pe *ddb.PrunedError
+	if errors.As(err, &pe) {
+		return nil, &prunedError{res: r.resHandle(pe.NS, pe.Name), seq: r.revHandle(pe.NS, pe.Name, pe.Pos)}
+	}
+	return b, err
 }
 
 // ancestry: a resource's chain, then its first revision's foreign
@@ -564,7 +572,25 @@ func (r *ddbReads) locate(segs []segment, id ids.ID) (int, *revRow) {
 	return -1, nil
 }
 
-func (r *ddbReads) horizonID(res int64) string { return "" }
+func (r *ddbReads) horizonID(res int64) string {
+	if rr := r.resItem(res); rr != nil {
+		return rr.HorizonID
+	}
+	return ""
+}
+
+// resItem is resource handle res's item, read once per check.
+func (r *ddbReads) resItem(res int64) *ddb.ResRow {
+	rr, ok := r.resRows[res]
+	if !ok {
+		k := r.res[res]
+		var err error
+		rr, err = r.s.Resource(r.ctx, k.ns, k.name)
+		r.must(err)
+		r.resRows[res] = rr
+	}
+	return rr
+}
 
 // namesAfter: n's own names and its bases' (read-through), the k
 // smallest of their union (namesAfter of reads.go).
@@ -628,12 +654,16 @@ func (r *ddbReads) authorName(id int64) string { return r.authors[id] }
 
 // --- what this backend doesn't store ---
 
-func (r *ddbReads) archiveURL(res, seq int64) string { panic(ddbUnsupported("archives")) }
+// archiveURL: nothing is archived on this backend (a prune that would
+// archive is refused, ddbprune.go).
+func (r *ddbReads) archiveURL(res, seq int64) string { return "" }
 
 // referencedUpTo: every blob a document of res references is attached to
-// res, at the first revision that referenced it (refPos), and pruning,
-// which ends attachments, isn't built here: a document up to max
-// references bid exactly when the attachment's first is at or before.
+// res, at the first revision that referenced it (refPos): a document up
+// to max references bid when the attachment's first is at or before. A
+// pruned attachment keeps its refPos; below the horizon nothing is
+// served, and a document above it that references the blob kept it
+// attached (ddbprune.go).
 func (r *ddbReads) referencedUpTo(res, max int64, bid ids.ID) bool {
 	k := r.res[res]
 	b, err := r.s.Attachment(r.ctx, k.ns, k.name, bid.String())
@@ -739,7 +769,7 @@ func ddbCheck[T any](f func() T) (out T, err error) {
 // ddbBlobRow is a store row as the gate's, of resource handle res.
 func ddbBlobRow(res int64, b *ddb.BlobRow) *blobRow {
 	bid, _ := ids.Parse(b.Bid)
-	return &blobRow{res: res, bid: bid, typ: b.Type, nonce: b.Nonce, size: b.Size, hash: b.Hash, pending: !b.Attachment}
+	return &blobRow{res: res, bid: bid, typ: b.Type, nonce: b.Nonce, size: b.Size, hash: b.Hash, pending: !b.Attachment, pruned: b.Pruned}
 }
 
 func (r *ddbReads) attachedBlob(res int64, bid ids.ID) *blobRow {
@@ -849,12 +879,26 @@ func (r *ddbReads) schemaRefOf(seq int64) (string, bool) {
 
 func (r *ddbReads) knowRevID(seq int64, id ids.ID) {}
 
-// prunedIn: nothing is pruned on this backend; a purged resource's range
-// is (prunedIn of resolve.go).
+// prunedIn: a purged resource's range is purged; one reaching below a
+// horizon is pruned at its newest revision there (ddb.Store.PrunedBelow;
+// prunedIn of resolve.go).
 func (r *ddbReads) prunedIn(segs []segment, lo int64) error {
-	for _, s := range segs {
-		if r.purgedRes(s.res) {
+	for i, sg := range segs {
+		if r.purgedRes(sg.res) {
 			return purgedError{}
+		}
+		if rr := r.resItem(sg.res); rr == nil || rr.HorizonPos == 0 {
+			continue
+		}
+		var from uint64
+		if i == len(segs)-1 && lo != 0 {
+			from = r.revs[lo].key.pos
+		}
+		k := r.res[sg.res]
+		pos, err := r.s.PrunedBelow(r.ctx, k.ns, k.name, from, r.revs[sg.max].key.pos)
+		r.must(err)
+		if pos > 0 {
+			return &prunedError{res: sg.res, seq: r.revHandle(k.ns, k.name, pos)}
 		}
 	}
 	return nil
@@ -917,14 +961,7 @@ func (r *ddbReads) resState(res int64) int {
 
 // purgedRes reports whether resource handle res is purged.
 func (r *ddbReads) purgedRes(res int64) bool {
-	rr, ok := r.resRows[res]
-	if !ok {
-		k := r.res[res]
-		var err error
-		rr, err = r.s.Resource(r.ctx, k.ns, k.name)
-		r.must(err)
-		r.resRows[res] = rr
-	}
+	rr := r.resItem(res)
 	return rr != nil && rr.Purged
 }
 
@@ -1015,13 +1052,44 @@ func (r *ddbReads) readThrough(n *nsRow, v *view) *view {
 
 // --- pruning ---
 
-func (r *ddbReads) firstRev(res int64) int64 { panic(ddbUnsupported("pruning")) }
-func (r *ddbReads) firstRevSince(res, cutoff int64) (int64, bool) {
-	panic(ddbUnsupported("pruning"))
-}
-func (r *ddbReads) nthNewestRev(res int64, k int) (int64, bool) { panic(ddbUnsupported("pruning")) }
-func (r *ddbReads) headAtEntry(res, at int64) (int64, bool)     { panic(ddbUnsupported("pruning")) }
+// --- pruning ---
 
-// registeredAts: no remote branches here.
-func (r *ddbReads) registeredAts(n *nsRow) []int64  { return nil }
-func (r *ddbReads) retainedNames(n *nsRow) []string { panic(ddbUnsupported("pruning")) }
+func (r *ddbReads) firstRev(res int64) int64 {
+	k := r.res[res]
+	return r.revHandle(k.ns, k.name, 1)
+}
+
+func (r *ddbReads) firstRevSince(res, cutoff int64) (int64, bool) {
+	k := r.res[res]
+	pos, err := r.s.FirstRevSince(r.ctx, k.ns, k.name, cutoff)
+	r.must(err)
+	return r.revHandle(k.ns, k.name, pos), pos > 0
+}
+
+func (r *ddbReads) nthNewestRev(res int64, n int) (int64, bool) {
+	k := r.res[res]
+	pos, err := r.s.NthNewestRev(r.ctx, k.ns, k.name, n)
+	r.must(err)
+	return r.revHandle(k.ns, k.name, pos), pos > 0
+}
+
+// headAtEntry: the history rows (ddb.Store.HeadAt), as resolve at an
+// earlier entry reads them.
+func (r *ddbReads) headAtEntry(res, at int64) (int64, bool) {
+	k := r.res[res]
+	h, err := r.s.HeadAt(r.ctx, k.ns, k.name, r.logs[at].pos)
+	r.must(err)
+	if h == nil {
+		return 0, false
+	}
+	return r.revHandle(k.ns, k.name, h.Pos), true
+}
+
+// registeredAts: there are no remote branches here.
+func (r *ddbReads) registeredAts(n *nsRow) []int64 { return nil }
+
+func (r *ddbReads) retainedNames(n *nsRow) []string {
+	names, err := r.s.RetainedNames(r.ctx, r.nsName(n.id))
+	r.must(err)
+	return names
+}

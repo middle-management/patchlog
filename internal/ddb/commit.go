@@ -74,6 +74,9 @@ type Commit struct {
 	// after the commit (PurgeContent).
 	Purge   *CommitPurge
 	PurgeNS bool
+	// Prune moves a resource's pruning horizon (§8.6, prune.go); the
+	// patch sets below it go after the commit (PruneContent).
+	Prune *CommitPrune
 	// Repurge queues the second CDN purge of the tags the commit purges
 	// (repurge.go), in its transaction.
 	Repurge *Repurge
@@ -249,6 +252,8 @@ func (c *Commit) actions() int {
 		n += 3 // the RES update, the document's delete, the PURGING marker
 	case c.PurgeNS:
 		n += 2 // the META update, the PURGING marker
+	case c.Prune != nil:
+		n += pruneActions
 	}
 	for _, it := range c.Items {
 		n += len(it.Steps) + 1 + it.attachActions() // the revisions, the head, attachments
@@ -417,9 +422,9 @@ func touchesMeta(cs []*Commit) bool {
 }
 
 // alone reports whether c commits on its own, outside group commit: one
-// that updates #META or purges.
+// that updates #META, purges, prunes or branches.
 func (c *Commit) alone() bool {
-	return c.Config != nil || c.PurgeNS || c.Purge != nil || c.Branch != nil
+	return c.Config != nil || c.PurgeNS || c.Purge != nil || c.Branch != nil || c.Prune != nil
 }
 
 // commitActs are one commit's actions, in this order — the layout
@@ -456,6 +461,7 @@ func (s *Store) commitActs(c *Commit, entry logRow) []types.TransactWriteItem {
 		out = append(out, s.itemActs(c, &c.Items[i], entry)...)
 	}
 	out = append(out, s.purgeActs(c)...)
+	out = append(out, s.pruneActs(c)...)
 	out = append(out, s.repurgeAct(c, entry)...)
 	for _, cp := range c.Copies {
 		out = append(out, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{

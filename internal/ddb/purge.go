@@ -124,6 +124,27 @@ func (s *Store) PurgeContent(ctx context.Context, ns, name string) (hashes [][]b
 			return nil, err
 		}
 	}
+	// A pruned resource's kept documents, and a prune left to finish.
+	snaps, prunes := "SNAP#", "PRUNING#"
+	if name != "" {
+		snaps, prunes = snaps+name+"#", prunes+name
+	}
+	if err := s.eachItem(ctx, ns, snaps, func(i item) error {
+		if name != "" && resNameFromRev(i.s("SK")) != "SNAP#"+name {
+			return nil // another resource whose name extends this one
+		}
+		return s.deleteKey(ctx, Key{i.s("PK"), i.s("SK")})
+	}); err != nil {
+		return nil, err
+	}
+	if err := s.eachItem(ctx, ns, prunes, func(i item) error {
+		if name != "" && i.s("name") != name {
+			return nil
+		}
+		return s.deleteKey(ctx, Key{i.s("PK"), i.s("SK")})
+	}); err != nil {
+		return nil, err
+	}
 	return hashes, s.deleteKey(ctx, keyPurging(ns, name))
 }
 
@@ -131,7 +152,7 @@ func (s *Store) PurgeContent(ctx context.Context, ns, name string) (hashes [][]b
 // document metadata.
 func (s *Store) purgeRevisions(ctx context.Context, ns, name string) error {
 	return s.eachItem(ctx, ns, "REV#"+name+"#", func(i item) error {
-		if resNameFromRev(i.s("SK")) != name || !i.has("patches") {
+		if resNameFromRev(i.s("SK")) != name || !i.has("patches") && !i.has("size") {
 			return nil
 		}
 		_, err := s.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{

@@ -130,7 +130,9 @@ func (b *ddbBackend) blobStats(ctx context.Context) (*BlobStats, error) {
 	}
 	s := &BlobStats{Dir: e.blobs.root(), Bytes: len(bytes)}
 	for _, b := range blobs {
-		if b.Attachment {
+		if b.Attachment && b.Pruned {
+			s.Pruned++
+		} else if b.Attachment {
 			s.Attached++
 		} else {
 			s.Pending++
@@ -158,6 +160,17 @@ func (b *ddbBackend) sweepBlobs(ctx context.Context) (int, error) {
 	}
 	for i := range pnss {
 		if _, err := b.store.PurgeContent(ctx, pnss[i], pnames[i]); err != nil {
+			return 0, ddbAsErr(err)
+		}
+	}
+	// So do prunes: their ended attachments name no bytes either
+	// (ddbprune.go).
+	pnss, pnames, err = b.store.Pruning(ctx)
+	if err != nil {
+		return 0, ddbAsErr(err)
+	}
+	for i := range pnss {
+		if err := b.finishPrune(ctx, pnss[i], pnames[i]); err != nil {
 			return 0, ddbAsErr(err)
 		}
 	}
@@ -199,7 +212,9 @@ func (b *ddbBackend) sweepBlobs(ctx context.Context) (int, error) {
 				}
 			}
 		}
-		named[string(bl.Hash)] = true
+		if !bl.Pruned {
+			named[string(bl.Hash)] = true
+		}
 	}
 	touched := e.now().Add(-bytesGrace).UnixMilli()
 	var files []string

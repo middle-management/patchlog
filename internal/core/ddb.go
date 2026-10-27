@@ -8,13 +8,14 @@ package core
 // core's own code on the gate.
 //
 // Deliberate gaps, all surfaced as 501 "unsupported" (lacks, or a read
-// that panics with it): remote branches, pruning, sealed and e2e
+// that panics with it): remote branches, archives, sealed and e2e
 // namespaces, nonce-required namespaces, gestures listing, author
-// signatures, head snapshots (revisions fold from the genesis). Grants,
-// edge grants, blobs, $schema validation and schemaReads, purges, local
-// branches and their drafts and merges, tombstones and restores,
-// multi-step items and batches (§7.5, bounded by the transaction's 100
-// actions) work.
+// signatures, intermediate snapshots (revisions fold from the genesis,
+// or from a pruning horizon). Grants, edge grants, blobs, $schema
+// validation and schemaReads, purges, pruning and retention without
+// archives, local branches and their drafts and merges, tombstones and
+// restores, multi-step items and batches (§7.5, bounded by the
+// transaction's 100 actions) work.
 
 import (
 	"context"
@@ -215,8 +216,11 @@ func (b *ddbBackend) commit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResu
 	e := b.e
 	// A purge takes content away from every cached answer (flushDocs, as
 	// purgeResource's).
-	purges := c.Purge != nil || c.PurgeNS
-	inv := invalidation{nss: []string{c.NS}, meta: c.Config != nil || purges, flushDocs: purges}
+	// So does a prune, from the documents below its horizon, which
+	// cached answers to revision reads hold until the meta generation
+	// moves (the SQL invalidation's: meta with every flush).
+	flush := c.Purge != nil || c.PurgeNS || c.Prune != nil
+	inv := invalidation{nss: []string{c.NS}, meta: c.Config != nil || flush, flushDocs: flush}
 	if c.Branch != nil {
 		// A namespace that now exists.
 		inv.nss, inv.meta = append(inv.nss, c.Branch.Name), true
@@ -262,12 +266,4 @@ func (b *ddbBackend) dueRepurges(ctx context.Context, now time.Time) ([]dueRepur
 
 func (b *ddbBackend) doneRepurge(ctx context.Context, key any) error {
 	return asErrOrNil(b.store.DoneRepurge(ctx, key.(string)))
-}
-
-func (b *ddbBackend) prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
-	return nil, ddbUnsupported("pruning")
-}
-
-func (b *ddbBackend) retain(ctx context.Context, ns, name string) (bool, bool, error) {
-	return false, false, ddbUnsupported("pruning")
 }

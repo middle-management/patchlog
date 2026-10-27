@@ -123,12 +123,13 @@ NS#<ns>                     #TIP                                namespace log ti
 NS#<ns>                     CFG#<pos12>                         config chain entry: id, parentPos, patches, doc|docRef, firstLogPos
 NS#<ns>                     LOG#<pos12>                         ns_log entry: id, prevPos, kind, res?, body|bodyRef, cfgPos,
                                                                 author, created, grantId, noAuth, gestures
-NS#<ns>                     RES#<name>                          resource: headPos, headId, state, horizonPos, keep, snapRevs/Bytes
+NS#<ns>                     RES#<name>                          resource: headPos, headId, state, horizonPos/Id/Base, keep, kept, snapRevs/Bytes
 NS#<ns>                     REV#<name>#<pos12>                  revision: id, parent (pos | {ns,name,pos} foreign), kind, first,
                                                                 patches|patchesRef, author, created, grantId, schemaRef,
                                                                 gesture?, undoes?, size?, digest?, epoch?
 NS#<ns>                     DOC#<name>#HEAD                     head snapshot: revPos, doc|docRef
-NS#<ns>                     DOC#<name>#SNAP#<pos12>             intermediate / kept snapshot (D.4, §8.6)
+NS#<ns>                     SNAP#<name>#<pos12>                 kept snapshot below a horizon (§8.6); intermediate (D.4) not built
+NS#<ns>                     PRUNING#<name>                      a prune whose content is still to go: horizonPos, kept positions
 NS#<ns>                     HIST#<name>#<logPos12>              head_history row: revPos
 NS#<ns>                     BLOB#<name>#<bid>                   blob attachment: type, nonce, size, hash, owner, refPos, pruned
 NS#<ns>                     BREF#<name>#<bid>#<fromPos12>       blob reference interval: toPos?
@@ -496,8 +497,8 @@ What landed, beyond the spike:
   them with its queries; `internal/core/ddbreads.go` implements them over
   the table, with per-check handles for the int64 ids the gate's rows
   carry (it only hands them back). What the backend doesn't store reads
-  as empty where nothing of the kind can exist (remote registrations,
-  horizons), and as **501 "unsupported"** where a request needs a
+  as empty where nothing of the kind can exist (remote registrations),
+  and as **501 "unsupported"** where a request needs a
   feature it lacks (sealed/e2e keys, archives) — so those refusals
   are the reads', not hand-written checks. `gate_test.go` guards the
   embedding that makes this work on SQL (a read missing on `*tx` would
@@ -545,8 +546,8 @@ What landed, beyond the spike:
   scan, `SweepBlobFiles` removes orphaned files. `blob_refs`' question —
   does a document of a chain up to a revision reference a blob — is the
   attachment's: every referenced blob is attached at the first revision
-  that referenced it (`refPos`), and nothing ends an attachment here
-  (pruning isn't built), so blobs cross branches and batch sources too.
+  that referenced it (`refPos`), and only pruning ends one (marking it
+  `pruned`, below), so blobs cross branches and batch sources too.
   Where blob bytes live is to become configurable for every database
   backend — a filesystem and an S3 store to begin with, behind
   `blobStore` (whose `open` must then return a reader, not an
@@ -581,9 +582,9 @@ What landed, beyond the spike:
   backend lacks is its `lacks` 501, asked by the Engine method before
   anything else; everything the server can reach so answers 501 rather
   than falling through to SQL:
-  remote branches, pruning, sealed/e2e, gestures listing,
+  remote branches, archives, sealed/e2e, gestures listing,
   author signatures (which the gate would verify but the commit doesn't
-  store), remote branches, retention, sweeps, rotation. Refused
+  store), rotation. Refused
   configurations (`encryption`, `nonce: required`, `signatures:
   required`, `base`, `successor`) are 501 at create and change time, as
   §10 prescribes ("refuse at Open or at namespace-config time").
@@ -649,6 +650,31 @@ What landed, beyond the spike:
   references. Second CDN purges (D.8) are queued by the commit that
   purges the tags (`#REPURGE`, `Commit.Repurge`) and sent by `Repurge`,
   whose queue is the backend's (`dueRepurges`, `doneRepurge`).
+- **Pruning and retention** (§8.6), without archives. The gate's
+  `planPrune` and `planRetention` (split out of SQL's `Prune` and
+  `applyRetention`, with `protect` and the retention boundary over the
+  reads `firstRev`, `firstRevSince`, `nthNewestRev`, `headAtEntry`)
+  decide; the documents that stay below the horizon — its last live
+  one, the keep set's, referenced schema revisions' — are `SNAP#` items
+  written just before the commit (one left by a failed commit is a
+  document its revision still has). The commit moves the RES item's
+  horizon (`horizonPos`, `horizonId`, `horizonBase`, the last live
+  revision a fold above it starts from, `keep`, and `kept`, the
+  positions below it whose snapshots are served), pinned on the head and
+  the old horizon, with the prune entry and a `PRUNING#` marker. Reads go
+  by the horizon from then on: a document below it is a kept snapshot or
+  410 pruned, a log range reaching
+  below it is pruned (`PrunedBelow`), and the meta generation moves so
+  the read cache drops revisions it held. After the commit the patch sets
+  below the horizon go and the snapshots no longer kept
+  (`PruneContent`), then the attachments no servable document
+  references end (`EndAttachment`, conditioned on the head the documents
+  were read up to) and their bytes are collected — the fold from the
+  horizon to the head stands in for `blob_refs`; an interrupted prune is
+  finished by the blob sweep from its marker. A purge removes snapshots
+  and markers with the rest. A prune that would write an archive (an
+  operator `Archiver`, a rule's `archive`) answers 501; `"archive":
+  false` rules and `*`-chained prunes work.
 - **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the
@@ -673,7 +699,8 @@ entry and `ancestry` across foreign parents.
 
 Requirements and limits, by design: one instance (no stream
 invalidation — §6 is phase 3), no background loops (retention, sweeps,
-rotation, remote follow don't start).
+second CDN purges, rotation, remote follow don't start; `ApplyRetention`,
+`SweepBlobs` and `Repurge` work when called).
 
 Tests: the API-level suites are backend-agnostic. Every test server —
 the server package's HTTP harness, and `clienttest`'s, which the client,
@@ -694,13 +721,13 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,332 top-level tests (pure unit tests included): 1,061 pass on
-DynamoDB and 271 skip — 234 as unsupported (115 encryption at rest, 35
-remote branches, 22 nonce-required, 20 pruning, 16 gestures listing,
-…), 36 on their own conditions, and one on the known list, which calls
-pruning (retention) on its own. No test answers differently from the
-SQL backends. A test that skips partway has asserted everything before
-its skip, so the phase-1 surface is covered beyond the 1,061.
+1,318 top-level tests (pure unit tests included): 1,063 pass on
+DynamoDB and 255 skip — most as unsupported (115 encryption at rest,
+then remote branches, nonce-required namespaces, gestures listing and
+10 archives), the rest on their own conditions (Postgres-only tests).
+The known list is empty: no test answers differently from the SQL
+backends. A test that skips partway has asserted everything before
+its skip, so the phase-1 surface is covered beyond the 1,063.
 
 `internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on

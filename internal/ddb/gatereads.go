@@ -117,6 +117,11 @@ type ResRow struct {
 	EntryID    string
 	LastID     string
 	LastPos    uint64
+	// HorizonPos and HorizonID are the pruning horizon (0: none), Keep
+	// its keep set as served (prune.go).
+	HorizonPos uint64
+	HorizonID  string
+	Keep       string
 }
 
 // Resource reads ns's resource name; nil when it has none.
@@ -125,7 +130,8 @@ func (s *Store) Resource(ctx context.Context, ns, name string) (*ResRow, error) 
 	if err != nil || r == nil || r.headPos == 0 {
 		return nil, err
 	}
-	return &ResRow{HeadPos: r.headPos, HeadID: r.headID, HeadNS: r.headNS, Tombstoned: r.state == "tombstoned", Purged: r.state == "purged", EntryID: r.entryID, LastID: r.lastID, LastPos: r.lastPos}, nil
+	return &ResRow{HeadPos: r.headPos, HeadID: r.headID, HeadNS: r.headNS, Tombstoned: r.state == "tombstoned", Purged: r.state == "purged", EntryID: r.entryID, LastID: r.lastID, LastPos: r.lastPos,
+		HorizonPos: r.horizonPos, HorizonID: r.horizonID, Keep: r.keep}, nil
 }
 
 // RevAt reads resource name's chain at pos; nil when there is none.
@@ -140,7 +146,10 @@ func (s *Store) RevAt(ctx context.Context, ns, name string, pos uint64) (*RevInf
 
 // DocAt is the canonical document at resource name's pos — for a
 // tombstone, the last live one (a restore's base): the head's from the
-// document item the head keeps, any other by folding the chain.
+// document item the head keeps, a kept one's below a pruning horizon
+// from its snapshot (prune.go), any other by folding the chain — from the
+// horizon's document if pruned. One below the horizon that isn't kept is
+// a *PrunedError.
 func (s *Store) DocAt(ctx context.Context, ns, name string, pos uint64) ([]byte, error) {
 	res, err := s.getRes(ctx, ns, name)
 	if err != nil {
@@ -160,12 +169,6 @@ func (s *Store) DocAt(ctx context.Context, ns, name string, pos uint64) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	first := r
-	if pos != 1 {
-		if first, err = s.RevAt(ctx, ns, name, 1); err != nil {
-			return nil, err
-		}
-	}
 	if r != nil && r.Kind == "tombstone" {
 		if pos == 1 && r.ParentNS != "" {
 			// A tombstone on a revision read through from the base.
@@ -173,9 +176,41 @@ func (s *Store) DocAt(ctx context.Context, ns, name string, pos uint64) ([]byte,
 		}
 		pos-- // the chain is linear: the tombstone's parent
 	}
+	if res != nil && res.horizonPos > 0 {
+		// Below the horizon only a kept position's snapshot is served:
+		// one an earlier prune kept goes after this one's commit.
+		if pos >= res.horizonPos || res.keeps(pos) {
+			if doc, ok, err := s.snapshot(ctx, ns, name, pos); err != nil || ok {
+				return doc, err
+			}
+		}
+		if pos < res.horizonPos {
+			return nil, &PrunedError{NS: ns, Name: name, Pos: pos}
+		}
+		base, ok, err := s.snapshot(ctx, ns, name, res.horizonBase)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, apiErr(409, "conflict", "detail", "horizon snapshot missing")
+		}
+		start, err := jsonv.Parse(base)
+		if err != nil {
+			return nil, err
+		}
+		_, canon, err := s.foldFrom(ctx, ns, name, res.horizonBase, pos, start, true)
+		return canon, err
+	}
+	first := r
+	if first == nil || first.Pos != 1 {
+		if first, err = s.RevAt(ctx, ns, name, 1); err != nil {
+			return nil, err
+		}
+	}
 	// A chain whose first revision continues a foreign parent (§7.6)
 	// folds from that parent's document.
 	var start any
+	var exists bool
 	if first != nil && first.ParentNS != "" {
 		b, err := s.DocAt(ctx, first.ParentNS, name, first.ParentPos)
 		if err != nil {
@@ -184,8 +219,9 @@ func (s *Store) DocAt(ctx context.Context, ns, name string, pos uint64) ([]byte,
 		if start, err = jsonv.Parse(b); err != nil {
 			return nil, err
 		}
+		exists = true
 	}
-	_, canon, err := s.foldFrom(ctx, ns, name, pos, start)
+	_, canon, err := s.foldFrom(ctx, ns, name, 0, pos, start, exists)
 	return canon, err
 }
 

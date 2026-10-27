@@ -21,7 +21,13 @@ blob reads, `PutBytes` and `PutPending` an upload's writes, `ScanBlobs`,
 `DeletePending`, `DeleteBytes` the sweep's; schemas.go's `SchemaRefs`,
 `Namespaces` and `RevsByID` answer schemaReads' referrer checks, from
 `PutSchemaRefs`' markers, the `#NAMESPACES` registry `CreateNamespace`
-writes, and GSI1.
+writes, and GSI1. Pruning (prune.go): `Commit.Prune` moves a
+resource's horizon, `PutSnapshots` writes the documents it keeps before
+the commit, `PruneContent`, `EachDoc`, `EachSnapshot`, `Attachments`,
+`EndAttachment` and `DonePruning` finish it, `Pruning` lists the
+unfinished for the sweep; `PrunedBelow`, `FirstRevSince`,
+`NthNewestRev` and `RetainedNames` are the retention and paging reads,
+and `DocAt` answers a `*PrunedError` below a horizon.
 Serving reads are core's, through the same reads: `EntriesBetween` and
 `RevsBetween` (a log's or a chain's range), `HeadAt` (a head as of an
 entry, from the history rows), `ListHeads`, `FoldResource` (crossing

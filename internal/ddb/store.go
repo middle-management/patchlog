@@ -239,5 +239,6 @@ func scanRevInfo(i item) RevInfo {
 		GrantID:   i.s("grantId"),
 		SchemaRef: i.s("schemaRef"),
 		ParentNS:  i.s("parentNs"), ParentPos: i.n("parentPos"),
+		Pruned: i.s("kind") != "tombstone" && !i.has("patches"),
 	}
 }
