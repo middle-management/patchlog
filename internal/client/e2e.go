@@ -797,9 +797,13 @@ type E2EDoc struct {
 	PreRaise bool
 
 	// log is the range folded, after since, whose snapshot's kid is
-	// sinceKid (PruneE2E's snapshot epoch, §E.3.1).
+	// sinceKid (PruneE2E's snapshot epoch, §E.3.1); sincePre is set when
+	// since is a revision from before a raise to e2e, served as at the
+	// level before, whose kid ("" in the clear) is the epoch it is served
+	// under and may name a base the namespace reads it through.
 	log             []LogEntry
 	since, sinceKid string
+	sincePre        bool
 }
 
 // LoadE2E reads the head and, if live, folds the document at it.
@@ -857,7 +861,7 @@ func (x *E2E) DocE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) 
 		if err != nil {
 			return nil, err
 		}
-		return &E2EDoc{ID: id, Value: doc, ValidID: id, PreRaise: true, since: id, sinceKid: kid}, nil
+		return &E2EDoc{ID: id, Value: doc, ValidID: id, PreRaise: true, since: id, sinceKid: kid, sincePre: true}, nil
 	case r.status == 200:
 		d, err := x.c.Doc(ctx, ns, name, id)
 		if err != nil {
@@ -1474,21 +1478,23 @@ func (x *E2E) ValidateIn(ctx context.Context, target string, doc any) (string, e
 // level before (openPreRaise), where the server's fold redirect starts
 // the range written end to end (F-E1, Addendum E Levels). It returns the
 // document and the kid sealing it ("" for one in the clear).
-func (x *E2E) foldStart(ctx context.Context, ns, name, since string, nsOK *chainCheck) (any, string, error) {
+func (x *E2E) foldStart(ctx context.Context, ns, name, since string, nsOK *chainCheck) (doc any, kid string, preRaise bool, err error) {
 	r, err := x.c.do(ctx, "GET", "/r/"+ns+"/"+name+"/rev/"+since, nil, nil)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
 	if r.status == 200 && r.header.Get("X-E2E") == "" {
-		return x.openPreRaise(ctx, ns, name, since, r, nsOK)
+		doc, kid, err = x.openPreRaise(ctx, ns, name, since, r, nsOK)
+		return doc, kid, true, err
 	}
 	if (r.status != 200 && r.status != 410) || r.header.Get("X-E2E") != "snapshot" {
 		if r.status >= 400 {
-			return nil, "", r.apiError()
+			return nil, "", false, r.apiError()
 		}
-		return nil, "", fmt.Errorf("client: e2e log of %s/%s: /rev/%s doesn't serve the document the fold starts from (status %d): %w", ns, name, since, r.status, seal.ErrMismatch)
+		return nil, "", false, fmt.Errorf("client: e2e log of %s/%s: /rev/%s doesn't serve the document the fold starts from (status %d): %w", ns, name, since, r.status, seal.ErrMismatch)
 	}
-	return x.openSnapshot(ctx, ns, name, since, r, nsOK)
+	doc, kid, err = x.openSnapshot(ctx, ns, name, since, r, nsOK)
+	return doc, kid, false, err
 }
 
 // isE2E reports whether ns's namespace document says it is e2e. One this
@@ -1746,7 +1752,7 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 	}
 	if since != "" {
 		var err error
-		if doc, out.sinceKid, err = x.foldStart(ctx, ns, name, since, nsOK); err != nil {
+		if doc, out.sinceKid, out.sincePre, err = x.foldStart(ctx, ns, name, since, nsOK); err != nil {
 			return nil, err
 		}
 		nsOK.at(since)
@@ -2024,12 +2030,31 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 	if err != nil {
 		return nil, err
 	}
-	kid := seal.Kid(ns, snapshotEpoch(ns, cfg.Epoch, d))
-	key, err := x.SealKey(ctx, kid)
+	kid, preRaise := snapshotKid(ns, cfg.Epoch, d)
+	// A snapshot of content from before a raise from sealed is sealed
+	// under the epoch it is served under, a key /keys gives as at E2, with
+	// no sender (Addendum E Levels): the server held that content and its
+	// keys before the raise, so sealing it again under such a key tells it
+	// nothing. Anything else is sealed only under a key from a trusted
+	// sender (SealKey, §E.3.2).
+	var key []byte
+	if preRaise {
+		key, err = x.keyVia(ctx, kid, ns)
+	} else {
+		key, err = x.SealKey(ctx, kid)
+	}
 	if err != nil {
 		return nil, err
 	}
-	kr, err := resourceKey(key, ns, name)
+	// K_r is derived with the namespace the kid names, the base's for a
+	// base's content a branch reads through, as that content's own sealing
+	// is (openPreRaise); pl names this namespace, as the server checks it
+	// (§E.3.1).
+	kns, _, err := seal.ParseKid(kid)
+	if err != nil {
+		return nil, err
+	}
+	kr, err := resourceKey(key, kns, name)
 	if err != nil {
 		return nil, err
 	}
@@ -2042,15 +2067,44 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 	return x.c.Prune(ctx, ns, name, PruneRequest{Horizon: horizon, Snapshot: snap})
 }
 
-// snapshotEpoch is the epoch a prune's snapshot of the document d folds is
+// snapshotKid is the kid a prune's snapshot of the document d folds is
 // sealed under (§E.3.1), as the server checks it: set by the newest
 // revision of the range d folded that isn't a tombstone and whose patch
 // set isn't [], the epoch of its sealed op where the op is ns's own, not a
 // base's, and otherwise current, ns's epoch in force. Where the range
-// holds no such revision, the snapshot the fold started from stands for
-// those below it, its epoch counting where its kid names ns (F-E2). Content
-// from before a raise to e2e from sealed is P35's to fold; the rest from
-// before a raise is plaintext, and takes current.
+// holds no such revision, the document the fold started from stands for
+// those below it: a snapshot's epoch counts where its kid names ns (F-E2);
+// a revision from before a raise from sealed, served sealed as at E2, is
+// sealed under the epoch it is served under, its kid naming ns or the base
+// a branch reads it through (Addendum E Levels), and preRaise is set; one
+// from before a raise from none or at-rest is in the clear and takes
+// current.
+func snapshotKid(ns string, current int, d *E2EDoc) (kid string, preRaise bool) {
+	if d.since != "" && d.sincePre && d.sinceKid != "" && !foldedOp(d) {
+		if _, _, err := seal.ParseKid(d.sinceKid); err == nil {
+			return d.sinceKid, true
+		}
+	}
+	return seal.Kid(ns, snapshotEpoch(ns, current, d)), false
+}
+
+// foldedOp reports whether the range d folded holds a revision that isn't
+// a tombstone and whose patch set isn't [] (snapshotKid).
+func foldedOp(d *E2EDoc) bool {
+	for _, e := range d.log {
+		if e.Kind == "tombstone" || !e.HasPatches {
+			continue
+		}
+		if a, ok := e.Patches.([]any); ok && len(a) == 0 {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// snapshotEpoch is snapshotKid's epoch of ns for everything but content
+// from before a raise from sealed.
 func snapshotEpoch(ns string, current int, d *E2EDoc) int {
 	for i := len(d.log) - 1; i >= 0; i-- {
 		e := d.log[i]
