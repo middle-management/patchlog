@@ -74,6 +74,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -521,11 +522,18 @@ func (t *tx) e2eSnapshot(row *revRow) string {
 // keysE2E answers POST /ns/{ns}/keys for an e2e namespace (§E.2.3,
 // §E.3.2): the keyring entries whose to is the thumbprint of the grant's
 // enc, with their from. Those of n's own keyring, for the epochs of the
-// §E.2.3 window the request asks; in a branch, those of each local base's
+// §E.2.3 window the request asks; in a branch, those of each base's
 // keyring as of at (§F.8.1), whether or not the branch has written its own
 // since, for that base's epochs baseEpochs selects, which the request's
-// epochs don't narrow; and for a remote branch, those of the shadows it
-// reads through.
+// epochs don't narrow. A remote branch's shadows are bases like any other:
+// each holds a level of the remote base's chain as of at (§G.5.2).
+//
+// The epochs before an e2e raise from sealed aren't keyring epochs: the
+// origin holds their keys, and gives them as at E2 (Addendum E Levels,
+// preRaiseKeys), n's own for the epochs of the same window, and in a branch
+// each base's for the base epochs baseEpochs selects, K_r derived with the
+// base's namespace; a remote branch's shadow holds those its source gave
+// this deployment's grant (fetchPreRaiseKeys).
 func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error) {
 	enc := recipientOf(a)
 	if enc == nil {
@@ -537,34 +545,40 @@ func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[str
 		return nil, err
 	}
 	out := []map[string]any{}
-	seen := map[string]bool{} // kids relayed
+	seen := map[string]bool{} // kids relayed, with name for a K_r
 	add := func(entries []map[string]any) {
 		for _, e := range entries {
-			if kid, _ := e["kid"].(string); !seen[kid] {
+			kid, _ := e["kid"].(string)
+			if name, ok := e["name"].(string); ok {
+				kid += "\n" + name
+			}
+			if !seen[kid] {
 				seen[kid] = true
 				out = append(out, e)
 			}
 		}
 	}
+	window := selectEpochs(t.grantEpochsOf(t.keyEpochs(n, cfg.Epoch), cfg, a), kr.Epochs)
 	if d := t.ownKeyring(n, nil); d != nil {
-		add(keyringEntries(d, enc, selectEpochs(t.grantEpochsOf(t.epochStarts(`e2e_epochs`, n.id, cfg.Epoch), cfg, a), kr.Epochs)))
+		add(keyringEntries(d, enc, window))
 	}
+	keys, err := t.preRaiseKeys(n, window, a, kr, enc)
+	if err != nil {
+		return nil, err
+	}
+	add(keys)
 	for child := n; child.isBranch(); {
 		b := t.nsByID(child.base.Int64)
-		if b.isShadow() {
-			// A remote branch's shadows may hold keyrings of the remote
-			// base's own bases, mirrored as foreign parents or read
-			// through (§G.5.2): readers need them for the ciphertext
-			// those bases sealed.
-			for _, sh := range t.remoteShadows(child) {
-				add(t.relayKeyring(sh, a, kr, enc))
-			}
-			break
-		}
 		at := child.baseAt.Int64
+		epochs := t.baseEpochs(b, at, a)
 		if d := t.ownKeyring(b, &at); d != nil {
-			add(keyringEntries(d, enc, t.baseEpochs(b, at, a)))
+			add(keyringEntries(d, enc, epochs))
 		}
+		keys, err := t.preRaiseKeys(b, epochs, a, kr, enc)
+		if err != nil {
+			return nil, err
+		}
+		add(keys)
 		child = b
 	}
 	return out, nil
@@ -585,14 +599,45 @@ func (t *tx) ownKeyring(n *nsRow, asOf *int64) any {
 	return d
 }
 
-// baseEpochs lists the epochs of local base b whose keys a branch's /keys
-// relays from b's keyring as of at, b's namespace entry seq (§E.2.3): b's
-// epochs up to the one in force at at, starting from the one b had in
-// force at the latest nbf among the grant's blocks, or at at if that is
-// earlier; where no block has nbf, the epoch b has in force now, so none
-// once b has moved past its epoch at at. Without a grant (authentication
-// disabled), every epoch up to at. Epochs from before an e2e raise are
-// not keyring epochs (Levels, P36).
+// keyEpochs lists n's epochs up to max with when each began, ascending, as
+// the §E.2.3 window reads them at E3: those begun at e2e (e2e_epochs) and,
+// after a raise from sealed, the epochs before it, whose keys the origin
+// holds (epoch_keys), up to the last one before the raise.
+func (t *tx) keyEpochs(n *nsRow, max int) []epochStart {
+	all := t.epochStarts(`e2e_epochs`, n.id, max)
+	r := t.e2eRaiseOf(n)
+	if r == nil || r.level != levelSealed {
+		return all
+	}
+	return append(t.epochStarts(`epoch_keys`, n.id, min(max, r.epoch)), all...)
+}
+
+// epochNow is the epoch base b has in force now (§E.2.3): its document's,
+// or for a remote branch's shadow, whose document stays as the remote base's
+// was at at, the latest of the source's epochs the follower has seen
+// (followRemote), if later.
+func (t *tx) epochNow(b *nsRow) int {
+	cur := t.config(b.configSeq).Epoch
+	if !b.isShadow() {
+		return cur
+	}
+	var max sql.NullInt64
+	t.must(t.QueryRow(`SELECT MAX(epoch) FROM e2e_epochs WHERE ns = ?`, b.id).Scan(&max))
+	if max.Valid && int(max.Int64) > cur {
+		return int(max.Int64)
+	}
+	return cur
+}
+
+// baseEpochs lists the epochs of base b whose keys a branch's /keys gives
+// from b as of at, b's namespace entry seq (§E.2.3): b's epochs up to the
+// one in force at at, starting from the one b had in force at the latest
+// nbf among the grant's blocks, or at at if that is earlier; where no
+// block has nbf, the epoch b has in force now (epochNow), so none once b
+// has moved past its epoch at at. Without a grant (authentication
+// disabled), every epoch up to at. They are keyring epochs, and after a
+// raise from sealed those before it too (keyEpochs), whose keys the origin
+// gives as at E2 (preRaiseKeys); a base at at that isn't e2e gives none.
 func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 	var cseq, created int64
 	if err := t.QueryRow(`SELECT config_seq, created FROM ns_log WHERE seq = ?`, at).Scan(&cseq, &created); err != nil {
@@ -603,7 +648,7 @@ func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 		return nil
 	}
 	atEpoch := acfg.Epoch
-	all := t.epochStarts(`e2e_epochs`, b.id, atEpoch)
+	all := t.keyEpochs(b, atEpoch)
 	if len(all) == 0 {
 		return nil
 	}
@@ -612,7 +657,7 @@ func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 		nbf := latestNbf(a)
 		switch {
 		case nbf == nil:
-			if t.config(b.configSeq).Epoch != atEpoch {
+			if t.epochNow(b) != atEpoch {
 				return nil
 			}
 			first = atEpoch
@@ -635,24 +680,145 @@ func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 	return out
 }
 
-// relayKeyring returns the entries for enc of the keyring as n, a remote
-// branch's shadow, sees it, for the epochs of the §E.2.3 window of the
-// keyring's owner that the request asks.
-func (t *tx) relayKeyring(n *nsRow, a *actor, kr KeysRequest, enc *ecdh.PublicKey) []map[string]any {
-	v := t.resolve(n, KeyringName, nil)
-	if v.state != Live || v.head == nil {
-		return nil
+// preRaiseKeys gives grant a, asking /keys of an e2e namespace, the keys of
+// owner's epochs from before its raise from sealed among epochs, as /keys
+// gives them at E2 (Addendum E Levels, §E.2.3): owner is that namespace or
+// one of its bases. A grant whose rules fix /resource (§2.1) gets K_r of
+// the names asked, by default every name its rules fix; any other gets K_e
+// if it reads the namespace unrestricted. What E2 would refuse with 403 is
+// left out instead: names the rules don't fix or the grant may not read,
+// and every key for a grant that neither fixes names nor reads
+// unrestricted. Kids, and K_r, name the namespace owner's content is
+// sealed under (kidName): owner itself, or for a remote branch's shadow
+// its source. Keys are wrapped to enc in HPKE base mode, like any key the
+// origin hands out (§E.2.3), so they carry no from. Nothing for an owner
+// that wasn't raised from sealed: content from before a raise from none or
+// at-rest is in the clear.
+func (t *tx) preRaiseKeys(owner *nsRow, epochs []int, a *actor, kr KeysRequest, enc *ecdh.PublicKey) ([]map[string]any, error) {
+	r := t.e2eRaiseOf(owner)
+	if r == nil || r.level != levelSealed {
+		return nil, nil
 	}
-	d, err := t.docAt(v.head)
-	if err != nil {
-		return nil
+	var pre []int
+	for _, e := range epochs {
+		if e <= r.epoch {
+			pre = append(pre, e)
+		}
 	}
-	owner := n
-	if v.src != nil && v.src.ns != n.id {
-		owner = t.nsByID(v.src.ns)
+	if len(pre) == 0 {
+		return nil, nil
 	}
-	ocfg := t.config(owner.configSeq)
-	return keyringEntries(d, enc, selectEpochs(t.grantEpochsOf(t.epochStarts(`e2e_epochs`, owner.id, ocfg.Epoch), ocfg, a), kr.Epochs))
+	names, perResource, none := t.preRaiseScope(a, kr)
+	if none {
+		return nil, nil
+	}
+	kns := t.kidName(owner)
+	var out []map[string]any
+	for _, e := range pre {
+		if !t.hasEpochKey(owner.id, e) {
+			// A remote branch's shadow holds only the keys its source gave
+			// this deployment (fetchPreRaiseKeys).
+			continue
+		}
+		ke := t.epochKey(owner.id, e)
+		kid := seal.Kid(kns, e)
+		if !perResource {
+			w, err := seal.WrapKey(enc, kid, "", ke)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, w.Value())
+			continue
+		}
+		for _, name := range names {
+			k, err := seal.ResourceKey(ke, kns, name)
+			if err != nil {
+				return nil, err
+			}
+			w, err := seal.WrapKey(enc, kid, name, k)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, w.Value())
+		}
+	}
+	return out, nil
+}
+
+// preRaiseScope is keysScope for the keys of epochs from before an e2e
+// raise (preRaiseKeys), which leaves out what keysScope refuses: the names
+// asked, by default every name a's rules fix, that they fix and a may read
+// (perResource), or, for rules that fix no name, K_e if a reads the
+// namespace unrestricted; none when a gets no key. Without a grant
+// (authentication disabled), K_e.
+func (t *tx) preRaiseScope(a *actor, kr KeysRequest) (names []string, perResource, none bool) {
+	if a == nil || a.verified == nil {
+		return nil, false, false
+	}
+	fixed, fixes := fixedNames(a)
+	if !fixes {
+		return nil, false, !t.readsUnrestricted(a)
+	}
+	in := make(map[string]bool, len(fixed))
+	for _, n := range fixed {
+		in[n] = true
+	}
+	want := kr.Resources
+	if want == nil {
+		want = fixed
+	}
+	seen := map[string]bool{}
+	for _, r := range want {
+		if seen[r] || !in[r] {
+			continue
+		}
+		seen[r] = true
+		if t.grantRules(a, "read", nil, t.basicEnvelope("read", r, a), false) == nil {
+			names = append(names, r)
+		}
+	}
+	sort.Strings(names)
+	return names, true, len(names) == 0
+}
+
+// hasEpochKey reports whether the key of (ns, epoch) is stored.
+func (t *tx) hasEpochKey(ns int64, epoch int) bool {
+	var ok bool
+	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM epoch_keys WHERE ns = ? AND epoch = ?)`, ns, epoch).Scan(&ok))
+	return ok
+}
+
+// kidName is the namespace that kids of b's content name: b itself, or for
+// a remote branch's shadow the namespace of the remote base's chain it
+// mirrors, whose name read-through ciphertext keeps (§G.5.2): the remote
+// base for the branch's first shadow, and its base.chain's i-th name for
+// the shadow i levels below.
+func (t *tx) kidName(b *nsRow) string {
+	if !b.isShadow() {
+		return b.name
+	}
+	cur := b.id
+	for depth := 0; ; depth++ {
+		var branch int64
+		var ns string
+		err := t.QueryRow(`SELECT branch, ns FROM remote_bases WHERE shadow = ?`, cur).Scan(&branch, &ns)
+		if err == nil {
+			if depth == 0 {
+				return ns
+			}
+			if base := t.config(t.nsByID(branch).configSeq).Base; base != nil && depth < len(base.Chain) {
+				return base.Chain[depth]
+			}
+			return b.name
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.must(err)
+		}
+		// The shadow above reads through this one.
+		if t.QueryRow(`SELECT ns FROM namespaces WHERE base = ? AND name LIKE '~%'`, cur).Scan(&cur) != nil {
+			return b.name
+		}
+	}
 }
 
 // keyringEntries returns the entries of keyring document d for the

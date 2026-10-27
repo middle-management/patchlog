@@ -1,8 +1,19 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/ed25519"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/keystore"
+	"github.com/middle-management/patchlog/internal/pgtest"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // P36 LEVELS-KEYS-BRANCHES: keys and branches after a raise to e2e
@@ -64,5 +75,219 @@ func TestV073P36BranchAtBeforeRaise(t *testing.T) {
 	}
 	if _, err := p36Branch(e, "c", "cb", first); err != nil {
 		t.Fatalf("a branch of a namespace e2e from its creation: %v", err)
+	}
+}
+
+// p36Env is an engine with a key store and authentication, whose clock
+// the test moves, and the signing keys its namespaces list.
+type p36Env struct {
+	*Engine
+	now  *time.Time
+	keys p17Keys
+	op   ed25519.PrivateKey
+}
+
+var p36T0 = time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+
+func p36NewEnv(t *testing.T) *p36Env {
+	t.Helper()
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opPub, opPriv := grant.GenerateKey()
+	ops, err := grant.ParseKeys(jsonv.FromGo([]any{map[string]any{"kid": "operator", "alg": "ed25519", "pub": opPub, "can": []any{"*"}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := p36T0
+	env := &p36Env{now: &now, op: opPriv}
+	env.keys.add("admin", map[string]any{"can": []any{"*"}})
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1, BlobSweepInterval: -1,
+		Remote: RemoteOptions{FollowInterval: -1}, Limits: p17Fast(), Purger: discardPurger{}, KeyStore: ks,
+		Now: func() time.Time { return *env.now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close() })
+	env.Engine = e
+	return env
+}
+
+func (e *p36Env) advance(d time.Duration) { *e.now = e.now.Add(d) }
+
+// mint mints a grant of the admin key for sub on nss, with extra members
+// in its root block; exp defaults to the clock plus a day.
+func (e *p36Env) mint(t *testing.T, sub string, nss []string, can []string, extra map[string]any) Credentials {
+	t.Helper()
+	root := map[string]any{"kid": "admin", "sub": sub, "ns": anyStrings(nss), "can": anyStrings(can), "exp": e.now.Add(24 * time.Hour).Format(time.RFC3339)}
+	for k, v := range extra {
+		root[k] = v
+	}
+	return e.keys.mint(t, root)
+}
+
+// star is a grant chained to the admin * key, with every verb.
+func (e *p36Env) star(t *testing.T, nss ...string) Request {
+	return Request{NS: nss[0], Cred: e.mint(t, "user:admin", nss, grant.Verbs, nil)}
+}
+
+// create creates ns with an operator grant.
+func (e *p36Env) create(t *testing.T, ns string, doc map[string]any) {
+	t.Helper()
+	doc["keys"] = e.keys.entries
+	g, err := grant.Mint(map[string]any{"kid": "operator", "sub": "user:op", "ns": []any{ns}, "can": []any{"config"}, "exp": e.now.Add(time.Hour).Format(time.RFC3339)}, e.op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.WriteConfig(context.Background(), Request{NS: ns, Cred: Credentials{Bearer: g.Encode()}}, ConfigChange{IfNoneMatch: true, Patches: []any{p29Add("", doc)}}); err != nil {
+		t.Fatalf("creating %s: %v", ns, err)
+	}
+}
+
+// config writes patches to ns's document under a * grant.
+func (e *p36Env) config(t *testing.T, ns string, patches ...any) *WriteResult {
+	t.Helper()
+	ctx := context.Background()
+	req := e.star(t, ns)
+	h, err := e.NamespaceHead(ctx, ns, req.Cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := e.WriteConfig(ctx, req, ConfigChange{IfMatch: h.Config, Patches: patches})
+	if err != nil {
+		t.Fatalf("config of %s %v: %v", ns, patches, err)
+	}
+	return w
+}
+
+// keyKids is the kids ("kid name" for a K_r) of /keys for cred, in
+// order, each key unwrapped with priv into got by that label.
+func p36Keys(t *testing.T, e *p36Env, ns string, cred Credentials, kr KeysRequest, priv *ecdh.PrivateKey) (string, map[string][]byte) {
+	t.Helper()
+	ans, err := e.Keys(context.Background(), ns, cred, kr)
+	if err != nil {
+		t.Fatalf("/keys of %s: %v", ns, err)
+	}
+	var kids []string
+	got := map[string][]byte{}
+	for _, k := range ans.Keys {
+		w, err := seal.ParseWrappedKey(jsonv.FromGo(k))
+		if err != nil {
+			t.Fatalf("/keys entry %v: %v", k, err)
+		}
+		label := w.Kid
+		if w.Resource != "" {
+			label += " " + w.Resource
+		}
+		kids = append(kids, label)
+		if w.From == "" {
+			if got[label], err = seal.UnwrapKey(priv, w); err != nil {
+				t.Fatalf("unwrapping %s: %v", label, err)
+			}
+		}
+	}
+	return strings.Join(kids, ","), got
+}
+
+// v0.73 Addendum E Levels, After a raise and Branches of a raised base
+// (ENC-42, CONFORMANCE ENC-9, ENC-10, Levels scenarios 5 and 24): after a
+// raise from sealed, /keys at E3 gives the keys of the epochs before the
+// raise as at E2: K_e to a grant that reads the namespace unrestricted,
+// K_r of the names a grant's rules fix and it may read, for the epochs of
+// its §E.2.3 window (from the one in force at its latest nbf; none
+// without nbf, whose window is the current epoch alone), the request's
+// epochs selecting among them; what E2 would refuse with 403 is left out.
+// A branch's /keys gives the base's pre-raise keys, kid and K_r naming the
+// base, for the base epochs §E.2.3 selects, which the request's epochs
+// don't narrow.
+func TestV073P36PreRaiseKeys(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	e := p36NewEnv(t)
+	p29RaiseFromSealed(t, e.Engine)
+	e.create(t, "s", map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}})
+	e.advance(time.Hour)
+	e.config(t, "s", p29Add("/encryption/epoch", 2.0)) // epoch 2 from t0+1h
+	e.advance(time.Hour)
+	e.config(t, "s", map[string]any{"op": "replace", "path": "/encryption", "value": map[string]any{"level": "e2e", "epoch": 3.0}}) // e2e epoch 3 from t0+2h
+	e.advance(10 * time.Minute)
+	jwk, priv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := func(d time.Duration) string { return p36T0.Add(d).Format(time.RFC3339) }
+	reader := func(ns string, extra map[string]any) Credentials {
+		m := map[string]any{"enc": jwk}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return e.mint(t, "user:r", []string{ns}, []string{"read"}, m)
+	}
+	enumAB := []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"a", "b"}}}}
+	notB := []any{map[string]any{"not": map[string]any{"op": "test", "path": "/resource", "value": "b"}}}
+	for name, c := range map[string]struct {
+		cred Credentials
+		kr   KeysRequest
+		want string
+	}{
+		"no nbf: the current epoch alone":       {reader("s", nil), KeysRequest{}, ""},
+		"nbf before the first epoch":            {reader("s", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{}, "s#1,s#2"},
+		"nbf in epoch 2":                        {reader("s", map[string]any{"nbf": at(90 * time.Minute)}), KeysRequest{}, "s#2"},
+		"nbf after the raise":                   {reader("s", map[string]any{"nbf": at(125 * time.Minute)}), KeysRequest{}, ""},
+		"epochs select":                         {reader("s", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{Epochs: []int{2, 3}}, "s#2"},
+		"fixed names: K_r":                      {reader("s", map[string]any{"nbf": at(-time.Hour), "rules": enumAB}), KeysRequest{}, "s#1 a,s#1 b,s#2 a,s#2 b"},
+		"a name not fixed is left out, not 403": {reader("s", map[string]any{"nbf": at(-time.Hour), "rules": enumAB}), KeysRequest{Resources: []string{"a", "c"}}, "s#1 a,s#2 a"},
+		"an unreadable name is left out":        {reader("s", map[string]any{"nbf": at(-time.Hour), "rules": append(enumAB, notB...)}), KeysRequest{}, "s#1 a,s#2 a"},
+		"rules that refer without fixing: none": {reader("s", map[string]any{"nbf": at(-time.Hour), "rules": notB}), KeysRequest{}, ""},
+		"unrestricted: K_e, resources ignored":  {reader("s", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{Resources: []string{"zzz"}}, "s#1,s#2"},
+	} {
+		got, _ := p36Keys(t, e, "s", c.cred, c.kr, priv)
+		if got != c.want {
+			t.Errorf("%s: %q, want %q", name, got, c.want)
+		}
+	}
+	// The keys are the origin's epoch keys, K_r derived with the namespace.
+	var k1, k2 []byte
+	if err := e.read(ctx, func(t *tx) error {
+		n := t.nsByName("s")
+		k1, k2 = t.epochKey(n.id, 1), t.epochKey(n.id, 2)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, got := p36Keys(t, e, "s", reader("s", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{}, priv)
+	if !bytes.Equal(got["s#1"], k1) || !bytes.Equal(got["s#2"], k2) {
+		t.Fatalf("pre-raise K_e don't match the epoch keys: %v", got)
+	}
+	_, got = p36Keys(t, e, "s", reader("s", map[string]any{"nbf": at(-time.Hour), "rules": enumAB}), KeysRequest{}, priv)
+	if kr, _ := seal.ResourceKey(k1, "s", "a"); !bytes.Equal(got["s#1 a"], kr) {
+		t.Fatal("pre-raise K_r isn't derived with the namespace")
+	}
+
+	// A branch at the head: the base's pre-raise keys, named for the base.
+	if _, err := e.CreateBranch(ctx, e.star(t, "s", "z"), BranchRequest{Name: "z", IfNoneMatch: true}); err != nil {
+		t.Fatal(err)
+	}
+	e.advance(10 * time.Minute)
+	for name, c := range map[string]struct {
+		cred Credentials
+		kr   KeysRequest
+		want string
+	}{
+		"no nbf: base at its epoch at at":     {reader("z", nil), KeysRequest{}, ""},
+		"nbf before the base's first epoch":   {reader("z", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{}, "s#1,s#2"},
+		"nbf in epoch 2":                      {reader("z", map[string]any{"nbf": at(90 * time.Minute)}), KeysRequest{}, "s#2"},
+		"epochs don't select the base's":      {reader("z", map[string]any{"nbf": at(-time.Hour)}), KeysRequest{Epochs: []int{}}, "s#1,s#2"},
+		"fixed names: K_r named for the base": {reader("z", map[string]any{"nbf": at(-time.Hour), "rules": enumAB}), KeysRequest{Resources: []string{"a"}}, "s#1 a,s#2 a"},
+	} {
+		got, _ := p36Keys(t, e, "z", c.cred, c.kr, priv)
+		if got != c.want {
+			t.Errorf("branch, %s: %q, want %q", name, got, c.want)
+		}
+	}
+	_, got = p36Keys(t, e, "z", reader("z", map[string]any{"nbf": at(-time.Hour), "rules": enumAB}), KeysRequest{}, priv)
+	if kr, _ := seal.ResourceKey(k2, "s", "b"); !bytes.Equal(got["s#2 b"], kr) {
+		t.Fatal("a branch's pre-raise K_r isn't derived with the base's namespace")
 	}
 }
