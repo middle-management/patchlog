@@ -25,8 +25,10 @@ import (
 // and stores it with the item (items.file), so a folder lists in one
 // request. Items of every trusted namespace get it, not only files.ns,
 // including implicit placements (§B.9). In sealed (E2) namespaces it is
-// read with keys and sealed per entry under the item's K_r when listed
-// (§E.2.6); at E3 it is absent, and the listing says so ({ "absent":
+// read with keys and sealed when listed in place of the value, as a value
+// of another resource (§E.2.6), under the item's K_r of the epoch its head
+// is served under (FileMeta.Epoch); at E3 it is absent, and the listing
+// says so ({ "absent":
 // "e2e" }), as it says a head not read for it is ({ "absent": "pending"
 // }, query.file). When catalog.files appears, every live
 // item's head is read for it, and when it goes, the metadata does
@@ -41,6 +43,11 @@ type FileMeta struct {
 	// written before servers stored it (§7.4), whose document was served
 	// without Last-Modified.
 	Modified string
+	// Epoch is the epoch the head is served under in a sealed namespace
+	// (derived.EpochOf), which a listing seals the metadata under
+	// (§E.2.6 values of another resource); 0 where not known, as for rows
+	// stored before it was kept, which take the epoch current then.
+	Epoch int
 }
 
 // value is m as a listing gives it: { "size", "type", "modified"? }.
@@ -52,12 +59,17 @@ func (m *FileMeta) value() map[string]any {
 	return v
 }
 
-// encode is m as the items table stores it, "" for none.
+// encode is m as the items table stores it, "" for none: its value, and
+// its epoch where known.
 func (m *FileMeta) encode() string {
 	if m == nil {
 		return ""
 	}
-	b, _ := json.Marshal(m.value())
+	v := m.value()
+	if m.Epoch > 0 {
+		v["epoch"] = m.Epoch
+	}
+	b, _ := json.Marshal(v)
 	return string(b)
 }
 
@@ -70,19 +82,20 @@ func decodeFile(s string) *FileMeta {
 		Size     *int64 `json:"size"`
 		Type     string `json:"type"`
 		Modified string `json:"modified"`
+		Epoch    int    `json:"epoch"`
 	}
 	if json.Unmarshal([]byte(s), &v) != nil || v.Size == nil || v.Type == "" {
 		return nil
 	}
-	return &FileMeta{Size: *v.Size, Type: v.Type, Modified: v.Modified}
+	return &FileMeta{Size: *v.Size, Type: v.Type, Modified: v.Modified, Epoch: v.Epoch}
 }
 
-// fileMetaOf is the file metadata of an item's head doc (§H.3), with
-// created, the head's created as the log gives it, else doc's
-// Last-Modified.
-func fileMetaOf(doc *client.Doc, created string) *FileMeta {
+// fileMetaOf is the file metadata of an item's head doc (§H.3), read in
+// namespace ns, with created, the head's created as the log gives it,
+// else doc's Last-Modified, and the epoch the head is served under.
+func fileMetaOf(doc *client.Doc, created, ns string) *FileMeta {
 	m := files.MetaOf(doc.Value)
-	out := &FileMeta{Size: m.Size, Type: m.Type, Modified: created}
+	out := &FileMeta{Size: m.Size, Type: m.Type, Modified: created, Epoch: derived.EpochOf(ns, doc.Kid)}
 	if out.Modified == "" && !doc.Modified.IsZero() {
 		out.Modified = doc.Modified.UTC().Format(time.RFC3339)
 	}
@@ -187,7 +200,7 @@ func (s *Service) refile(ctx context.Context, on bool) (*refiling, error) {
 		if doc.ID != i.head {
 			created = ""
 		}
-		fr.metas[[2]string{i.ns, i.name}] = fileMetaOf(doc, created)
+		fr.metas[[2]string{i.ns, i.name}] = fileMetaOf(doc, created, s.actual(i.ns))
 	}
 	return fr, nil
 }
@@ -305,16 +318,22 @@ func (s *Service) retryBackfill(ctx context.Context, what string, fill func(cont
 
 // fileSealing is how a listing gives placements their file metadata
 // (§H.3): not at all outside a file tree; for items of a sealed (E2)
-// namespace sealed per entry under the item's K_r (§E.2.6), with that
-// namespace's current epoch key and padding; for items of an e2e one, or
-// one whose keys the service can't have (lastingly), not at all;
-// otherwise in the clear. Its keys are read before the graph is, never
-// under its lock.
+// namespace sealed in place of the value under the item's K_r of the epoch
+// its head is served under (FileMeta.Epoch, the current one where that
+// isn't known; §E.2.6 values of another resource), with that namespace's
+// padding; for items of an e2e one, or one whose keys the service can't
+// have (lastingly), not at all; otherwise in the clear. Its keys are read
+// before the graph is, never under its lock: the current epoch's, and
+// those of every older epoch a head shown may be served under (epochs).
 type fileSealing struct {
-	on   bool
-	keys map[string]derived.Key // by the namespace read (Graph.Actual)
-	omit map[string]bool
-	e2e  map[string]bool // omitted as end-to-end (§H.3 absent: e2e)
+	on     bool
+	keys   map[string]derived.Key         // the current epoch's, by the namespace read (Graph.Actual)
+	epochs map[string]map[int]derived.Key // older epochs' keys, by namespace and epoch
+	// lacking are older epochs whose keys the service can't have, by
+	// namespace: their items' metadata is left out, as for omit.
+	lacking map[string]map[int]bool
+	omit    map[string]bool
+	e2e     map[string]bool // omitted as end-to-end (§H.3 absent: e2e)
 }
 
 // seals reports whether listings seal file metadata.
@@ -325,11 +344,19 @@ func (fs *fileSealing) seals() bool { return fs != nil && len(fs.keys) > 0 }
 // key, rather than computed and kept without it at its at.
 var errFileKeys = errors.New("the key that seals file metadata")
 
+// lastingKeyErr reports a failure to get a key that lasts until the
+// configuration changes: no keys for the service's grant, a namespace it
+// can't read, absent or gone.
+func lastingKeyErr(err error) bool {
+	return errors.Is(err, client.ErrNoKeys) || client.IsNotFound(err) || client.IsAuth(err) || client.IsGone(err)
+}
+
 // fileSealing reads what listings need now to give file metadata. Only
-// sealed namespaces' epoch keys are asked for. A failure that lasts until
-// the configuration changes (no keys for the service's grant, a namespace
-// it can't read, absent or gone) leaves that namespace's file metadata
-// out; any other is errFileKeys.
+// sealed namespaces' epoch keys are asked for: the current one, and each
+// older epoch the file metadata of a live item is served under. A
+// failure that lasts until the configuration changes leaves that
+// namespace's file metadata out, or for an older epoch, that of the items
+// served under it; any other is errFileKeys.
 func (s *Service) fileSealing(ctx context.Context) (*fileSealing, error) {
 	s.mu.RLock()
 	on := s.g.Files
@@ -339,8 +366,25 @@ func (s *Service) fileSealing(ctx context.Context) (*fileSealing, error) {
 			nss = append(nss, s.actual(ns))
 		}
 	}
+	// The epochs the items' file metadata is served under.
+	used := map[string]map[int]bool{}
+	if on {
+		for _, m := range []map[string]*Node{s.g.explicit, s.g.self} {
+			for _, n := range m {
+				if n.ItemFile == nil || n.ItemFile.Epoch <= 0 {
+					continue
+				}
+				ns := s.g.Actual(n.ItemNS)
+				if used[ns] == nil {
+					used[ns] = map[int]bool{}
+				}
+				used[ns][n.ItemFile.Epoch] = true
+			}
+		}
+	}
 	s.mu.RUnlock()
-	fs := &fileSealing{on: on, keys: map[string]derived.Key{}, omit: map[string]bool{}, e2e: map[string]bool{}}
+	fs := &fileSealing{on: on, keys: map[string]derived.Key{}, epochs: map[string]map[int]derived.Key{},
+		lacking: map[string]map[int]bool{}, omit: map[string]bool{}, e2e: map[string]bool{}}
 	if !on {
 		return fs, nil
 	}
@@ -351,15 +395,39 @@ func (s *Service) fileSealing(ctx context.Context) (*fileSealing, error) {
 			_, key, err = s.keys.Current(ctx, ns)
 		}
 		switch {
-		case err != nil && (errors.Is(err, client.ErrNoKeys) || client.IsNotFound(err) || client.IsAuth(err) || client.IsGone(err)):
+		case err != nil && lastingKeyErr(err):
 			s.opt.Logf("tree: file metadata of %s left out: %v", ns, err)
 			fs.omit[ns] = true
+			continue
 		case err != nil:
 			return nil, fmt.Errorf("%w of %s: %w", errFileKeys, ns, err)
 		case in.Level == derived.LevelE2E:
 			fs.omit[ns], fs.e2e[ns] = true, true
-		case in.Level == derived.LevelSealed:
-			fs.keys[ns] = key
+			continue
+		case in.Level != derived.LevelSealed:
+			continue
+		}
+		fs.keys[ns] = key
+		for e := range used[ns] {
+			if e == key.Epoch {
+				continue
+			}
+			k, err := s.keys.KeyAt(ctx, ns, e)
+			switch {
+			case err != nil && lastingKeyErr(err):
+				s.opt.Logf("tree: file metadata of %s served under epoch %d left out: %v", ns, e, err)
+				if fs.lacking[ns] == nil {
+					fs.lacking[ns] = map[int]bool{}
+				}
+				fs.lacking[ns][e] = true
+			case err != nil:
+				return nil, fmt.Errorf("%w of %s epoch %d: %w", errFileKeys, ns, e, err)
+			default:
+				if fs.epochs[ns] == nil {
+					fs.epochs[ns] = map[int]derived.Key{}
+				}
+				fs.epochs[ns][e] = k
+			}
 		}
 	}
 	return fs, nil
@@ -387,6 +455,22 @@ func (q *query) file(n *Node) any {
 	if !sealed {
 		return n.ItemFile.value()
 	}
+	if e := n.ItemFile.Epoch; e > 0 && e != k.Epoch {
+		// Sealed under the epoch the item's head is served under (§E.2.6).
+		ek, ok := fs.epochs[ns][e]
+		switch {
+		case fs.lacking[ns][e]:
+			return map[string]any{"absent": "pending"}
+		case !ok:
+			// A head read since the keys were: asked again.
+			if q.serr != nil && *q.serr == nil {
+				*q.serr = fmt.Errorf("%w of %s epoch %d: not read yet", errFileKeys, ns, e)
+			}
+			return nil
+		}
+		k = ek
+	}
+	// The plaintext is { "file": value } (F-E5, the default kept).
 	jwe, err := derived.SealItem(k, q.view, n.ItemName, map[string]any{"file": n.ItemFile.value()})
 	if err != nil {
 		if q.serr != nil && *q.serr == nil {

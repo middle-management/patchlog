@@ -898,6 +898,7 @@ type prep struct {
 	name  string
 	kind  string // head, tombstone or purge
 	head  string
+	epoch int // the epoch head is served under (derived.EpochOf), 0 if not known
 	doc   any
 	title string // the item's title at the catalog's pointer (§B.5)
 	// created is the head's created as the log gives it, file its file
@@ -1030,12 +1031,12 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 					// entry's created isn't its (follow.FetchDoc).
 					p.created = ""
 				}
-				p.head, p.doc = doc.ID, doc.Value
+				p.head, p.doc, p.epoch = doc.ID, doc.Value, derived.EpochOf(fb.NS, doc.Kid)
 				if titled {
 					p.title = titleAt(doc.Value, tptr)
 				}
 				if filed {
-					p.file = fileMetaOf(doc, p.created)
+					p.file = fileMetaOf(doc, p.created, fb.NS)
 				}
 				// A node's born (§B.5): a catalog node's, or that of the
 				// implicit placement a content document makes (§B.9).
@@ -1277,7 +1278,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			changed[p.name] = true
 			if p.kind == "head" && p.doc != nil {
 				n := ParseNode(cat, p.name, p.head, p.doc)
-				n.Born, n.BornUnknown = p.born, p.bornUnknown
+				n.Born, n.BornUnknown, n.Epoch = p.born, p.bornUnknown, p.epoch
 				if g.explicitGone[p.name] {
 					if err := saveGone(ctx, tx, p.name, false); err != nil {
 						return nil, err

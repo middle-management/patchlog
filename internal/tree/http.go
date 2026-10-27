@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
@@ -524,16 +525,16 @@ var ops = map[string]bool{
 // type, modified } of that head, in the clear for items of a namespace
 // that is neither sealed nor e2e. For an item of a sealed (E2) namespace
 // it is "file": { "sealed": JWE of { file } } under the item's own K_r,
-// kid its namespace's current epoch, pl { ns, name, view } of the item, so
+// kid the epoch the item's head is served under (§E.2.6 values of another
+// resource; FileMeta.Epoch), pl { ns, name, view } of the item, so
 // readers given K_r by /read-grants open it, whatever the catalog's level;
 // for an e2e item it is { "absent": "e2e" }, and { "absent": "pending" }
 // for a head not read for it yet (§H.3). A listing holding any sealed file is
 // stored and served unchanged like a sealed catalog's. While a sealed
 // namespace's key can't be had for the moment, listings are 503, no-store
-// (fileSealing). The "file": { "sealed" } form, and its nesting inside a
-// sealed catalog's whole-listing JWE below, are provisional: §E.2.6 has a
-// per-entry "sealed" member for values of one source (the catalog's
-// titles), and no form yet for values another namespace's resource gives.
+// (fileSealing). The "file": { "sealed" } form nests inside a sealed
+// catalog's whole-listing JWE below (§E.2.6 values of another resource);
+// its plaintext is { "file": value }, as F-E5's default keeps it.
 //
 // A sealed or e2e catalog (§E.2.5, §E.2.6; package derived). Titles and
 // born are the only values a listing takes from the catalog's content
@@ -541,16 +542,18 @@ var ops = map[string]bool{
 // stay in the clear, and
 // content namespaces contribute nothing else but file metadata, sealed on
 // its own), so the catalog is the one source of what a listing seals
-// whole. A g/all listing of a catalog that isn't public, which every
-// reader its URL admits reads whole, is sealed as one JWE under the
-// catalog's current epoch key, Content-Type application/jose, pl { ns,
-// view } where view is the listing's request target
-// (/{catalog}/g/all/at/{at}/{op}?{query}, the canonical form). Any other
-// (a public catalog's, or a subject set's, whose readers see nodes only
-// through roles) is JSON in which every node with a title or born
-// carries "sealed": JWE of { title?, born? } under that catalog
-// resource's K_r, pl { ns, name, view }, in their place (§E.2.6,
-// viewer.sealsWhole). Sealed listings are produced once per
+// whole. Each node's values are sealed under the epoch its head is
+// served under (Node.Epoch; the current one where that isn't known),
+// title and born alike. A g/all listing of a catalog that isn't public,
+// which every reader its URL admits reads whole, whose nodes' values all
+// come from one epoch, is sealed as one JWE under that epoch's key,
+// Content-Type application/jose, pl { ns, view } where view is the
+// listing's request target (/{catalog}/g/all/at/{at}/{op}?{query}, the
+// canonical form). Any other (a public catalog's, a subject set's, whose
+// readers see nodes only through roles, or one mixing epochs) is JSON in
+// which every node with a title or born carries "sealed": JWE of {
+// title?, born? } under that catalog resource's K_r of its epoch, pl {
+// ns, name, view }, in their place (§E.2.6, viewer.sealsWhole). Sealed listings are produced once per
 // view (a rotation moves at), stored in the database with their cache
 // tags, and served unchanged, across restarts, until a purge with one of
 // those tags or a new at retires them (derived.Cache).
@@ -866,6 +869,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "5")
 		WriteError(w, http.StatusServiceUnavailable, "behind", "the service cannot obtain the key that seals the file metadata of a trusted namespace yet")
+	case errors.Is(err, errCatalogKeys):
+		s.opt.Logf("tree: %v", err)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusServiceUnavailable, "behind", "the service cannot obtain the key of an epoch a catalog node is served under yet")
 	case err != nil:
 		s.opt.Logf("tree: sealing a listing: %v", err)
 		WriteError(w, http.StatusInternalServerError, "internal", "sealing failed")
@@ -958,34 +966,85 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		view derived.View
 		serr error
 	)
+	// Each node's values are sealed under the epoch its head is served
+	// under (Node.Epoch; §E.2.6), the current one where that isn't known:
+	// the keys of every epoch a node's head is served under, read before
+	// the graph is.
+	keys, err := s.catalogKeys(ctx, info, key)
+	if err != nil {
+		return nil, err
+	}
+	keyAt := func(epoch int) (derived.Key, error) {
+		if epoch <= 0 {
+			epoch = key.Epoch
+		}
+		k, ok := keys[epoch]
+		if !ok {
+			// A head read since the keys were: asked again.
+			return k, fmt.Errorf("%w %s#%d: not read yet", errCatalogKeys, cat, epoch)
+		}
+		return k, nil
+	}
+	epochOf := func(g *Graph, name string) int {
+		if n := g.Node(name); n != nil && n.Epoch > 0 {
+			return n.Epoch
+		}
+		return key.Epoch
+	}
 	// Sealed whole only where every reader the URL admits reads the
-	// catalog whole and it isn't public, else per entry (§E.2.6).
+	// catalog whole and it isn't public, and every value derives from
+	// revisions served under one epoch, else per entry (§E.2.6).
 	perEntry := info.Protected() && !v.sealsWhole()
+	whole := key.Epoch
 	var cps map[string]string
 	var more []keptPage
 	s.View(func(g *Graph, curMap map[string]string) {
 		l.at, nss = CombinedAt(g, curMap)
 		cps = checkpointsOf(g, curMap)
 		view = derived.View{NS: cat, Target: canon(l.at)}
-		q := &query{s: s, g: g, cur: curMap, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
-		if perEntry {
-			q.sealValues = func(name string, vals map[string]any) string {
-				jwe, err := derived.SealItem(key, q.view, name, vals)
-				if err != nil && serr == nil {
-					serr = err
+		run := func() map[int]bool {
+			more, serr = nil, nil
+			epochs := map[int]bool{}
+			q := &query{s: s, g: g, cur: curMap, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
+			switch {
+			case perEntry:
+				q.sealValues = func(name string, vals map[string]any) string {
+					k, err := keyAt(epochOf(g, name))
+					if err != nil {
+						if serr == nil {
+							serr = err
+						}
+						return ""
+					}
+					jwe, err := derived.SealItem(k, q.view, name, vals)
+					if err != nil && serr == nil {
+						serr = err
+					}
+					return jwe
 				}
-				return jwe
+			case info.Protected():
+				q.noteValues = func(name string) { epochs[epochOf(g, name)] = true }
 			}
+			if op == "children" && keep {
+				// The following pages are kept with this one, each at its
+				// own URL: the same at with the query their next gives.
+				path, _, _ := strings.Cut(view.Target, "?")
+				q.pages = &more
+				q.pageView = func(query string) derived.View { return derived.View{NS: cat, Target: path + query} }
+			}
+			body, l.status, l.msg = q.run(op)
+			tags = q.tags
+			return epochs
 		}
-		if op == "children" && keep {
-			// The following pages are kept with this one, each at its own
-			// URL: the same at with the query their next gives.
-			path, _, _ := strings.Cut(view.Target, "?")
-			q.pages = &more
-			q.pageView = func(query string) derived.View { return derived.View{NS: cat, Target: path + query} }
+		epochs := run()
+		if l.status == http.StatusOK && info.Protected() && !perEntry && len(epochs) > 1 {
+			// Values of several epochs: per entry after all.
+			perEntry = true
+			run()
 		}
-		body, l.status, l.msg = q.run(op)
-		tags = q.tags
+		for e := range epochs {
+			whole = e
+		}
 	})
 	if l.status != http.StatusOK {
 		return l, nil
@@ -996,7 +1055,11 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		var err error
 		if info.Protected() && !perEntry {
 			var jwe string
-			jwe, err = derived.SealView(key, view, body)
+			var k derived.Key
+			if k, err = keyAt(whole); err != nil {
+				return st, err
+			}
+			jwe, err = derived.SealView(k, view, body)
 			st.Body, st.JSON = []byte(jwe), false
 		} else {
 			st.Body, err = derived.Marshal(body)
@@ -1073,6 +1136,39 @@ func (s *Service) dropWholeViews(ctx context.Context) error {
 	return s.sealed.Drop(ctx, func(view, _ string, json bool) bool {
 		return !json && (public || !strings.HasPrefix(view, all))
 	})
+}
+
+// errCatalogKeys is a key of an epoch a catalog node's head is served
+// under, which seals its entries (§E.2.6), that the service can't obtain
+// for now: the listing is 503 behind, as for the catalog's current key.
+var errCatalogKeys = errors.New("the key of an epoch a catalog node is served under")
+
+// catalogKeys are the keys that seal the entries of a sealed or e2e
+// catalog's listings, by epoch: the current one's (key) and those of
+// every older epoch a node's head is served under (Node.Epoch), read
+// before the graph is, never under its lock. None for a catalog that is
+// neither.
+func (s *Service) catalogKeys(ctx context.Context, info derived.Info, key derived.Key) (map[int]derived.Key, error) {
+	keys := map[int]derived.Key{key.Epoch: key}
+	if !info.Protected() {
+		return keys, nil
+	}
+	used := map[int]bool{}
+	s.mu.RLock()
+	for _, n := range s.g.explicit {
+		if n.Epoch > 0 && n.Epoch != key.Epoch {
+			used[n.Epoch] = true
+		}
+	}
+	s.mu.RUnlock()
+	for e := range used {
+		k, err := s.keys.KeyAt(ctx, key.NS, e)
+		if err != nil {
+			return nil, fmt.Errorf("%w %s#%d: %w", errCatalogKeys, key.NS, e, err)
+		}
+		keys[e] = k
+	}
+	return keys, nil
 }
 
 // listingKey is what a listing at url is stored and kept under for reader
@@ -1687,8 +1783,11 @@ type query struct {
 	cur map[string]string
 	// sealValues, if set, seals the values an entry takes from the
 	// catalog's content (title, born) for per-entry sealing (§E.2.6): the
-	// entry carries "sealed" in their place.
+	// entry carries "sealed" in their place. noteValues, if set, is told
+	// of each entry whose values are given in the clear, for a listing
+	// sealed whole (the epochs they derive from).
 	sealValues func(name string, vals map[string]any) string
+	noteValues func(name string)
 	// files says how placements carry file metadata in a file tree
 	// (§H.3), sealed under view; serr records a sealing failure.
 	files *fileSealing
@@ -1710,6 +1809,9 @@ func (q *query) values(m map[string]any, name string, vals map[string]any) {
 	case q.sealValues != nil:
 		m["sealed"] = q.sealValues(name, vals)
 	default:
+		if q.noteValues != nil {
+			q.noteValues(name)
+		}
 		for k, v := range vals {
 			m[k] = v
 		}

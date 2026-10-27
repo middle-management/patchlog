@@ -578,7 +578,9 @@ func TestFileTreeSealingKeys(t *testing.T) {
 	if jwe == "" {
 		t.Fatal("no sealed file once the key is had")
 	}
-	if kid, _ := jwtHeader(t, jwe)["kid"].(string); kid != "files#2" {
+	// Under the epoch the item's head is served under, written before
+	// the new epoch (§E.2.6 values of another resource, ENC-34).
+	if kid, _ := jwtHeader(t, jwe)["kid"].(string); kid != "files#1" {
 		t.Fatalf("sealed under %q", kid)
 	}
 	mu.Lock()
