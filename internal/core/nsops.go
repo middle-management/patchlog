@@ -1166,105 +1166,26 @@ type PruneResult struct {
 // below what the resource's retention rule keeps; otherwise the grant must
 // be chained to a * key.
 func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
-	if err := e.be.lacks("pruning"); err != nil {
-		return nil, err
-	}
+	return e.be.prune(ctx, req, name, pr)
+}
+
+// sqlPrune is Prune on SQL.
+func (e *Engine) sqlPrune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
 	var out *PruneResult
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsForWrite(req.NS)
-		if n == nil {
-			return t.absentNS(req.NS, req.Cred)
-		}
-		cfg := t.config(n.configSeq)
-		a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
-		if aerr != nil {
-			return aerr
-		}
-		if err := t.authorize(a, "prune", name); err != nil {
-			return err
-		}
-		// 410 after authorisation, like every write (§6.2).
-		if n.purged {
-			return t.purgedNS(n)
-		}
-		if n.isBranch() {
-			return invalid("branches don't prune (§8.6)")
-		}
-		v := t.resolve(n, name, nil)
-		if v.state == NotFound {
-			return notFound()
-		}
-		if v.state == Purged {
-			return gone()
-		}
-		hid, err := ids.Parse(pr.Horizon)
-		if err != nil {
-			return invalid("horizon must be an ancestor of the head")
-		}
-		h := t.findInAncestry(v.head, hid)
-		if h == nil {
-			return invalid("horizon must be an ancestor of the head")
-		}
-		if len(pr.Keep) > cfg.Limits.KeepPerResource {
-			return limitErr(422, "keepPerResource", int64(len(pr.Keep)), int64(cfg.Limits.KeepPerResource), "too many kept revisions")
-		}
-		e2e := t.e2eContent(n, name)
-		switch {
-		case !e2e && pr.Snapshot != "":
-			return invalid("snapshot is only for e2e resources, whose documents the server can't compute (§8.6)")
-		case e2e && len(pr.Keep) > 0:
-			return invalid("keep is not supported for e2e resources: the server can't keep documents it can't compute (protect revisions with retention or a lower horizon)")
-		case e2e && pr.Snapshot == "":
-			return invalid("pruning an e2e resource needs the horizon's document as a sealed snapshot (§8.6)")
-		}
-		var keep []*revRow
-		for _, k := range pr.Keep {
-			kid, err := ids.Parse(k)
-			var row *revRow
-			if err == nil {
-				row = t.findInAncestry(v.head, kid)
-			}
-			if row == nil || row.kind != kindRev {
-				return invalid("keep lists a revision that is not in the resource's history")
-			}
-			keep = append(keep, row)
-		}
-		h = t.protect(n, cfg, v.own.id, h)
-		rule := cfg.retentionRule(name)
-		dest, hasArchive := t.archiveDest(rule)
-		noArchive := rule != nil && rule.NoArchive
-		if noArchive {
-			// The rule prunes without an archive (§8.6).
-			dest, hasArchive = "", false
-		}
-		if e2e && !hasArchive {
-			return invalid("pruning an e2e resource needs an archive destination (§8.6)")
-		}
-		if !a.star {
-			// Applying a rule that says "archive": false, within what it
-			// keeps, needs only prune: the * key was needed to write it.
-			if !hasArchive && !noArchive {
-				return forbidden("pruning where no archive is configured needs a grant chained to a * key")
-			}
-			if rule != nil && h.seq > t.retentionBoundary(rule, v.own) {
-				return forbidden("going below what retention keeps needs a grant chained to a * key")
-			}
-		}
-		env := t.basicEnvelope("prune", name, a)
-		env["writes"], env["patches"] = []any{}, []any{}
-		env["doc"] = map[string]any{"horizon": pr.Horizon, "keep": anyStrings(pr.Keep)}
-		if err := t.checkRules(cfg, a, env, false); err != nil {
-			return err
-		}
-		var res *PruneResult
-		var perr error
-		if e2e {
-			res, perr = t.pruneToE2E(n, cfg, name, v.own, h, hid, pr, dest, t.actorID(a))
-		} else {
-			res, perr = t.pruneTo(n, name, v.own, h, keep, pr.Keep, dest, hasArchive, t.actorID(a))
-		}
+		p, perr := t.planPrune(req, name, pr)
 		if perr != nil {
 			return perr
+		}
+		var res *PruneResult
+		var err error
+		if p.e2e {
+			res, err = t.pruneToE2E(p.n, p.cfg, name, p.own, p.h, p.hid, pr, p.dest, t.actorID(p.a))
+		} else {
+			res, err = t.pruneTo(p.n, name, p.own, p.h, p.keep, pr.Keep, p.dest, p.hasArchive, t.actorID(p.a))
+		}
+		if err != nil {
+			return err
 		}
 		out = res
 		return nil
@@ -1272,15 +1193,120 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 	return out, err
 }
 
+// prunePlan is a prune the gate allowed (§8.6): of own, to horizon h,
+// keeping keep.
+type prunePlan struct {
+	n          *nsRow
+	cfg        *Config
+	a          *actor // nil: the retention applier
+	own        *resRow
+	h          *revRow
+	hid        ids.ID
+	keep       []*revRow
+	keepStrs   []string
+	dest       string
+	hasArchive bool
+	e2e        bool
+}
+
+// planPrune checks a prune (§8.6, §6.2): authentication, the verb, the
+// horizon and keep set, what the rules and retention allow.
+func (t *gate) planPrune(req Request, name string, pr PruneRequest) (*prunePlan, *Error) {
+	n := t.nsForWrite(req.NS)
+	if n == nil {
+		return nil, t.absentNS(req.NS, req.Cred)
+	}
+	cfg := t.config(n.configSeq)
+	a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if err := t.authorize(a, "prune", name); err != nil {
+		return nil, err
+	}
+	// 410 after authorisation, like every write (§6.2).
+	if n.purged {
+		return nil, t.purgedNS(n)
+	}
+	if n.isBranch() {
+		return nil, invalid("branches don't prune (§8.6)")
+	}
+	v := t.resolve(n, name, nil)
+	if v.state == NotFound {
+		return nil, notFound()
+	}
+	if v.state == Purged {
+		return nil, gone()
+	}
+	hid, err := ids.Parse(pr.Horizon)
+	if err != nil {
+		return nil, invalid("horizon must be an ancestor of the head")
+	}
+	h := t.findInAncestry(v.head, hid)
+	if h == nil {
+		return nil, invalid("horizon must be an ancestor of the head")
+	}
+	if len(pr.Keep) > cfg.Limits.KeepPerResource {
+		return nil, limitErr(422, "keepPerResource", int64(len(pr.Keep)), int64(cfg.Limits.KeepPerResource), "too many kept revisions")
+	}
+	e2e := t.e2eContent(n, name)
+	switch {
+	case !e2e && pr.Snapshot != "":
+		return nil, invalid("snapshot is only for e2e resources, whose documents the server can't compute (§8.6)")
+	case e2e && len(pr.Keep) > 0:
+		return nil, invalid("keep is not supported for e2e resources: the server can't keep documents it can't compute (protect revisions with retention or a lower horizon)")
+	case e2e && pr.Snapshot == "":
+		return nil, invalid("pruning an e2e resource needs the horizon's document as a sealed snapshot (§8.6)")
+	}
+	var keep []*revRow
+	for _, k := range pr.Keep {
+		kid, err := ids.Parse(k)
+		var row *revRow
+		if err == nil {
+			row = t.findInAncestry(v.head, kid)
+		}
+		if row == nil || row.kind != kindRev {
+			return nil, invalid("keep lists a revision that is not in the resource's history")
+		}
+		keep = append(keep, row)
+	}
+	h = t.protect(n, cfg, v.own.id, h)
+	rule := cfg.retentionRule(name)
+	dest, hasArchive := t.archiveDest(rule)
+	noArchive := rule != nil && rule.NoArchive
+	if noArchive {
+		// The rule prunes without an archive (§8.6).
+		dest, hasArchive = "", false
+	}
+	if e2e && !hasArchive {
+		return nil, invalid("pruning an e2e resource needs an archive destination (§8.6)")
+	}
+	if !a.star {
+		// Applying a rule that says "archive": false, within what it
+		// keeps, needs only prune: the * key was needed to write it.
+		if !hasArchive && !noArchive {
+			return nil, forbidden("pruning where no archive is configured needs a grant chained to a * key")
+		}
+		if rule != nil && h.seq > t.retentionBoundary(rule, v.own) {
+			return nil, forbidden("going below what retention keeps needs a grant chained to a * key")
+		}
+	}
+	env := t.basicEnvelope("prune", name, a)
+	env["writes"], env["patches"] = []any{}, []any{}
+	env["doc"] = map[string]any{"horizon": pr.Horizon, "keep": anyStrings(pr.Keep)}
+	if err := t.checkRules(cfg, a, env, false); err != nil {
+		return nil, err
+	}
+	return &prunePlan{n: n, cfg: cfg, a: a, own: v.own, h: h, hid: hid, keep: keep, keepStrs: pr.Keep, dest: dest, hasArchive: hasArchive, e2e: e2e}, nil
+}
+
 // protect moves a horizon down past the protected revisions of §8.6: the
 // retry window and the heads as of the at of every live local branch and
 // every unexpired remote branch registration.
-func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
-	var minSeq sql.NullInt64
+func (t *gate) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 	cutoff := t.now.Add(-cfg.Limits.RetryWindow).UnixMilli()
-	t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ? AND created >= ?`, res, cutoff).Scan(&minSeq))
-	if minSeq.Valid && minSeq.Int64 < h.seq {
-		h = t.rev(minSeq.Int64)
+	if seq, ok := t.firstRevSince(res, cutoff); ok && seq < h.seq {
+		h = t.rev(seq)
 	}
 	var ats []int64
 	for _, b := range t.allBranchesOf(n) {
@@ -1289,12 +1315,28 @@ func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 	// Remote branches whose registration hasn't expired (§G.3).
 	ats = append(ats, t.registeredAts(n)...)
 	for _, at := range ats {
-		var p int64
-		if err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1`, res, at).Scan(&p); err == nil && p < h.seq {
+		if p, ok := t.headAtEntry(res, at); ok && p < h.seq {
 			h = t.rev(p)
 		}
 	}
 	return h
+}
+
+// firstRevSince is res's first revision created at or after cutoff
+// (milliseconds).
+func (t *tx) firstRevSince(res, cutoff int64) (int64, bool) {
+	var seq sql.NullInt64
+	t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ? AND created >= ?`, res, cutoff).Scan(&seq))
+	return seq.Int64, seq.Valid
+}
+
+// headAtEntry is res's head as of its namespace's log entry at.
+func (t *tx) headAtEntry(res, at int64) (int64, bool) {
+	var p int64
+	if err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1`, res, at).Scan(&p); err != nil {
+		return 0, false
+	}
+	return p, true
 }
 
 // pruneTo prunes own below h, which protect has already moved down. With
@@ -1423,7 +1465,7 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 }
 
 // allBranchesOf lists the direct branches of n that aren't purged.
-func (t *tx) allBranchesOf(n *nsRow) []*nsRow {
+func (t *gate) allBranchesOf(n *nsRow) []*nsRow {
 	var out []*nsRow
 	for _, b := range t.branchesOf(n) {
 		if !b.purged {

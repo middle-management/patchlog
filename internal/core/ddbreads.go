@@ -1012,3 +1012,16 @@ func (r *ddbReads) readThrough(n *nsRow, v *view) *view {
 	v.state, v.head, v.src = bv.state, bv.head, bv.src
 	return v
 }
+
+// --- pruning ---
+
+func (r *ddbReads) firstRev(res int64) int64 { panic(ddbUnsupported("pruning")) }
+func (r *ddbReads) firstRevSince(res, cutoff int64) (int64, bool) {
+	panic(ddbUnsupported("pruning"))
+}
+func (r *ddbReads) nthNewestRev(res int64, k int) (int64, bool) { panic(ddbUnsupported("pruning")) }
+func (r *ddbReads) headAtEntry(res, at int64) (int64, bool)     { panic(ddbUnsupported("pruning")) }
+
+// registeredAts: no remote branches here.
+func (r *ddbReads) registeredAts(n *nsRow) []int64  { return nil }
+func (r *ddbReads) retainedNames(n *nsRow) []string { panic(ddbUnsupported("pruning")) }

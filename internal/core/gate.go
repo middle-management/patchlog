@@ -78,6 +78,7 @@ type resourceReads interface {
 	resolve(n *nsRow, name string, asOf *int64) *view
 	resState(res int64) int
 	namesAfter(n *nsRow, after string, k int) []string
+	retainedNames(n *nsRow) []string
 	prefetchResources(ns int64, names []string)
 	prefetchHeads(n *nsRow, names []string, asOf *int64)
 	rev(seq int64) *revRow
@@ -85,6 +86,10 @@ type resourceReads interface {
 	knowRevID(seq int64, id ids.ID)
 	revByID(n *nsRow, name string, id ids.ID) *revRow
 	revsBetween(res, from, max int64, limit int, visit func(*revRow) bool)
+	firstRev(res int64) int64
+	firstRevSince(res, cutoff int64) (int64, bool)
+	nthNewestRev(res int64, k int) (int64, bool)
+	headAtEntry(res, at int64) (int64, bool)
 	ancestry(head *revRow) []segment
 	locate(segs []segment, id ids.ID) (int, *revRow)
 	docBytesAt(r *revRow) ([]byte, error)
@@ -125,6 +130,7 @@ type branchReads interface {
 	configGenesis(n *nsRow) (seq, author int64, id ids.ID, ok bool)
 	branchEntry(base *nsRow, gseq int64) (int64, bool)
 	liveRegistrations(n *nsRow) []map[string]any
+	registeredAts(n *nsRow) []int64
 	baseIdentity(n *nsRow) string
 	copyRows(id ids.ID, name string) []copyRow
 }

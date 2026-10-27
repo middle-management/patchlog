@@ -32,6 +32,10 @@ type backend interface {
 	// the purge entry's ns_id.
 	purge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error)
 	purgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error)
+	// prune is §8.6's prune: the gate's planPrune, then the backend's
+	// commit; retain applies retention to one resource (ApplyRetention).
+	prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error)
+	retain(ctx context.Context, ns, name string) (checked, pruned bool, err error)
 	// createBranch is a branch's creation (§7.6): the gate's planBranch,
 	// then the backend's commit.
 	createBranch(ctx context.Context, req Request, br BranchRequest) (*WriteResult, error)
@@ -102,6 +106,14 @@ func (b sqlBackend) purge(ctx context.Context, req Request, name, ifMatch string
 
 func (b sqlBackend) purgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error) {
 	return b.e.sqlPurgeNamespace(ctx, req, ifMatch, force)
+}
+
+func (b sqlBackend) prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
+	return b.e.sqlPrune(ctx, req, name, pr)
+}
+
+func (b sqlBackend) retain(ctx context.Context, ns, name string) (bool, bool, error) {
+	return b.e.sqlRetain(ctx, ns, name)
 }
 
 func (b sqlBackend) createBranch(ctx context.Context, req Request, br BranchRequest) (*WriteResult, error) {

@@ -116,7 +116,7 @@ func ArchiveKey(ns, name, horizon string) string { return ns + "/" + name + "/" 
 // archiveDest resolves where a prune of a resource under rule archives to.
 // ok is false if there is nowhere to archive: no archiver, no default, or a
 // rule destination the operator doesn't (or no longer does) allow.
-func (t *tx) archiveDest(rule *RetentionRule) (dest string, ok bool) {
+func (t *gate) archiveDest(rule *RetentionRule) (dest string, ok bool) {
 	a := t.e.opt.Archiver
 	if a == nil {
 		return "", false

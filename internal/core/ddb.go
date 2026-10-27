@@ -263,3 +263,11 @@ func (b *ddbBackend) dueRepurges(ctx context.Context, now time.Time) ([]dueRepur
 func (b *ddbBackend) doneRepurge(ctx context.Context, key any) error {
 	return asErrOrNil(b.store.DoneRepurge(ctx, key.(string)))
 }
+
+func (b *ddbBackend) prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
+	return nil, ddbUnsupported("pruning")
+}
+
+func (b *ddbBackend) retain(ctx context.Context, ns, name string) (bool, bool, error) {
+	return false, false, ddbUnsupported("pruning")
+}
