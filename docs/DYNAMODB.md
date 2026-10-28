@@ -791,6 +791,13 @@ What landed, beyond the spike:
   can't follow is a `#REMLEVEL` item (`RemoteLevels`), and one this
   server lacks a key store for makes what the branch read through
   answer 502 upstream (`lostRemote`).
+- **Telemetry** (README's OpenTelemetry section). Reads and writes are
+  core's `core.db.read` and `core.db.update` spans, with a client span
+  per DynamoDB call under them (`ddbstore/trace.go`, a wrapper of the
+  store's `API`, so no AWS instrumentation package: it uses the engine's
+  providers and records only within a trace). Group commits report their
+  sizes (`ddb.Options.OnGroup`); commits checked again after `ErrStale`
+  count in `patchlog.db.conflicts`.
 - **Group commit (§4, phase 2).** `internal/ddbstore/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the

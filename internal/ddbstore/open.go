@@ -19,7 +19,7 @@ func init() {
 		if err != nil {
 			return nil, err
 		}
-		s.Now, s.Open, s.GroupCommit = o.Now, o.OpenValue, o.GroupCommit
+		s.Now, s.Open, s.GroupCommit, s.OnGroup = o.Now, o.OpenValue, o.GroupCommit, o.OnGroup
 		return s, nil
 	})
 }
@@ -67,5 +67,5 @@ func Open(ctx context.Context, rawurl string) (*Store, error) {
 	} else {
 		client = dynamodb.NewFromConfig(cfg)
 	}
-	return &Store{Client: client, Table: table}, nil
+	return &Store{Client: tracedAPI{client, table}, Table: table}, nil
 }

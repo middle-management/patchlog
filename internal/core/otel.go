@@ -16,7 +16,8 @@ import (
 // OpenTelemetry in the engine, kept light: a span per database
 // transaction ("core.db.read", "core.db.update": what a request costs
 // beyond the read cache), the sizes of group commits and the time spent
-// waiting for Postgres advisory locks. Nothing is recorded while telemetry
+// waiting for Postgres advisory locks, and on DynamoDB, which has no
+// locks, the commits that lost a race and were checked again. Nothing is recorded while telemetry
 // is off (telemetry.Instruments.Get is nil). Engine-level spans of writes
 // are made by its HTTP caller (internal/server/otel.go).
 
@@ -24,6 +25,7 @@ type coreInst struct {
 	tracer    trace.Tracer
 	groupSize metric.Int64Histogram
 	lockWait  metric.Float64Histogram
+	conflicts metric.Int64Counter
 }
 
 var inst = telemetry.NewInstruments("internal/core", func(t trace.Tracer, m metric.Meter) *coreInst {
@@ -37,6 +39,9 @@ var inst = telemetry.NewInstruments("internal/core", func(t trace.Tracer, m metr
 			metric.WithDescription("Time spent waiting for a Postgres advisory lock (namespace or log lock)"),
 			metric.WithUnit("s"),
 			metric.WithExplicitBucketBoundaries(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5))),
+		conflicts: telemetry.Must(m.Int64Counter("patchlog.db.conflicts",
+			metric.WithDescription("Commits that found what their checks read had moved since, and were checked again (DynamoDB: optimistic concurrency in place of locks)"),
+			metric.WithUnit("{commit}"))),
 	}
 })
 
@@ -74,6 +79,14 @@ func endDBSpan(span trace.Span, err error) {
 func observeGroup(n int) {
 	if in := inst.Get(); in != nil {
 		in.groupSize.Record(context.Background(), int64(n))
+	}
+}
+
+// observeConflict counts a commit checked again because what its checks
+// read had moved (DynamoDB's ErrStale).
+func observeConflict() {
+	if in := inst.Get(); in != nil {
+		in.conflicts.Add(context.Background(), 1)
 	}
 }
 

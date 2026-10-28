@@ -46,6 +46,9 @@ type Store struct {
 	// GroupCommit is at most how many checked writes of a namespace one
 	// transaction appends (group.go); ≤ 1 commits each write on its own.
 	GroupCommit int
+	// OnGroup, when set, is called with the size of each group a
+	// transaction committed (group.go): core's patchlog.groupcommit.size.
+	OnGroup func(size int)
 
 	g groups
 }

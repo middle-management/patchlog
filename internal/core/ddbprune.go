@@ -57,6 +57,7 @@ func (b *ddbBackend) prune(ctx context.Context, req Request, name string, pr Pru
 			res, err = b.pruneTo(ctx, r, g, out.p, out.p.a.id(), gid, out.p.a.noAuth)
 		}
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			continue
 		}
 		return res, err
@@ -87,6 +88,7 @@ func (b *ddbBackend) retain(ctx context.Context, ns, name string) (checked, prun
 		}
 		res, err := b.pruneTo(ctx, r, g, out.p, RetentionAuthor, "", false)
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			continue
 		}
 		if err != nil {
@@ -221,6 +223,7 @@ func (b *ddbBackend) pruneTo(ctx context.Context, r *ddbReads, g *gate, p *prune
 	cres, err := b.commit(ctx, c)
 	if err != nil {
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			return nil, err
 		}
 		return nil, ddbAsErr(err)
@@ -257,6 +260,7 @@ func (b *ddbBackend) finishPrune(ctx context.Context, ns, name string) error {
 		if !errors.Is(err, ddb.ErrStale) || attempt >= ddbAttempts {
 			return err
 		}
+		observeConflict()
 	}
 	return b.store.DonePruning(ctx, ns, name)
 }

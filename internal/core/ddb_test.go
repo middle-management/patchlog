@@ -15,10 +15,17 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/middle-management/patchlog/internal/ddbstore"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/keystore"
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // ddbEngine opens an engine on a fresh table of DynamoDB Local, in -dev
@@ -253,4 +260,88 @@ func configOf(t *testing.T, e *Engine, ns string) string {
 		t.Fatal(err)
 	}
 	return id
+}
+
+// Telemetry on DynamoDB: within a request's trace, a read and a write are
+// "core.db.read" and "core.db.update" spans with a span per DynamoDB call
+// under them (ddbstore/trace.go), and a group commit's size is recorded
+// (patchlog.groupcommit.size). Outside a trace nothing is. Not parallel:
+// telemetry.Use sets the process's providers.
+func TestDDBTelemetry(t *testing.T) {
+	e := ddbEngine(t)
+	ddbCreateNS(t, e, "obs", `{"read":"public"}`)
+	rec := tracetest.NewSpanRecorder()
+	reader := sdkmetric.NewManualReader()
+	t.Cleanup(telemetry.Use(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec)), sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))))
+	write := func(ctx context.Context, name string) {
+		t.Helper()
+		if _, err := e.WriteResource(ctx, Request{NS: "obs"}, Item{Resource: name, IfNoneMatch: true,
+			Steps: []Step{{Patches: patches(t, `[{"op":"add","path":"","value":{}}]`)}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Outside a trace: no spans.
+	write(context.Background(), "untraced")
+	if len(rec.Ended()) != 0 {
+		t.Fatalf("spans outside a trace: %v", spanNames(rec.Ended()))
+	}
+
+	ctx, root := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec)).Tracer("test").Start(context.Background(), "request")
+	write(ctx, "a")
+	e.FlushCaches()
+	if _, err := e.ResourceHead(ctx, "obs", "a", Credentials{}); err != nil {
+		t.Fatal(err)
+	}
+	root.End()
+	byName := map[string][]sdktrace.ReadOnlySpan{}
+	for _, s := range rec.Ended() {
+		if s.SpanContext().TraceID() != root.SpanContext().TraceID() {
+			t.Fatalf("%s outside the request's trace", s.Name())
+		}
+		byName[s.Name()] = append(byName[s.Name()], s)
+	}
+	for _, name := range []string{"core.db.update", "core.db.read", "DynamoDB.TransactWriteItems", "DynamoDB.GetItem"} {
+		if len(byName[name]) == 0 {
+			t.Fatalf("no %s span: %v", name, spanNames(rec.Ended()))
+		}
+	}
+	update := byName["core.db.update"][0]
+	tx := byName["DynamoDB.TransactWriteItems"][0]
+	if tx.Parent().SpanID() != update.SpanContext().SpanID() || tx.SpanKind() != trace.SpanKindClient {
+		t.Fatal("the commit's DynamoDB span is not a client span under core.db.update")
+	}
+	attrs := map[attribute.Key]string{}
+	for _, kv := range tx.Attributes() {
+		attrs[kv.Key] = kv.Value.Emit()
+	}
+	if attrs["db.system.name"] != "aws.dynamodb" || attrs["rpc.method"] != "TransactWriteItems" || !strings.Contains(attrs["aws.dynamodb.table_names"], "coretest-") {
+		t.Fatalf("DynamoDB span attributes %v", attrs)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	groups := uint64(0)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == "patchlog.groupcommit.size" {
+				for _, dp := range m.Data.(metricdata.Histogram[int64]).DataPoints {
+					groups += dp.Count
+				}
+			}
+		}
+	}
+	if groups == 0 {
+		t.Fatal("no group commit recorded")
+	}
+}
+
+func spanNames(ss []sdktrace.ReadOnlySpan) []string {
+	var out []string
+	for _, s := range ss {
+		out = append(out, s.Name())
+	}
+	return out
 }

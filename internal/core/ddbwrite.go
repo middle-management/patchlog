@@ -124,6 +124,7 @@ func (b *ddbBackend) writeItems1(ctx context.Context, req Request, items []Item,
 		}
 		cres, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			continue
 		}
 		if err != nil {
@@ -409,6 +410,7 @@ func (b *ddbBackend) writeConfigAs(ctx context.Context, req Request, cc ConfigCh
 		}
 		cres, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			continue
 		}
 		if err != nil {

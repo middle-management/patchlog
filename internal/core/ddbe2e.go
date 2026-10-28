@@ -108,6 +108,7 @@ func (b *ddbBackend) pruneE2E(ctx context.Context, r *ddbReads, g *gate, p *prun
 	cres, err := b.commit(ctx, c)
 	if err != nil {
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			return nil, err
 		}
 		return nil, ddbAsErr(err)

@@ -195,6 +195,9 @@ type Options struct {
 	// GroupCommit is at most how many checked writes of a namespace one
 	// transaction appends; ≤ 1 commits each write on its own.
 	GroupCommit int
+	// OnGroup, when set, is called with the size of each group of
+	// writes one transaction committed.
+	OnGroup func(size int)
 }
 
 // Opener opens the table a dynamodb:// URL names.

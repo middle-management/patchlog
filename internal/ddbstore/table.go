@@ -19,7 +19,7 @@ func CreateTable(ctx context.Context, rawurl string) error {
 	if err != nil {
 		return err
 	}
-	client, ok := s.Client.(*dynamodb.Client)
+	client, ok := sdkClient(s.Client)
 	if !ok {
 		return fmt.Errorf("ddb: CreateTable needs a *dynamodb.Client")
 	}
@@ -63,10 +63,20 @@ func DeleteTable(ctx context.Context, rawurl string) error {
 	if err != nil {
 		return err
 	}
-	client, ok := s.Client.(*dynamodb.Client)
+	client, ok := sdkClient(s.Client)
 	if !ok {
 		return fmt.Errorf("ddb: DeleteTable needs a *dynamodb.Client")
 	}
 	_, err = client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(s.Table)})
 	return err
+}
+
+// sdkClient is the SDK's client under c, traced or not (trace.go): table
+// management isn't part of API.
+func sdkClient(c API) (*dynamodb.Client, bool) {
+	if t, ok := c.(tracedAPI); ok {
+		c = t.API
+	}
+	cl, ok := c.(*dynamodb.Client)
+	return cl, ok
 }

@@ -102,6 +102,7 @@ func (b *ddbBackend) purgeWith(ctx context.Context, req Request, name string, pl
 		}
 		res, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			continue
 		}
 		if err != nil {
@@ -257,6 +258,7 @@ func (b *ddbBackend) propagatePurge(ctx context.Context, bp branchPurge, name, a
 		}
 		_, err = b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			continue
 		}
 		if err != nil {
