@@ -33,16 +33,25 @@ OUT=$(mktemp)
 TAGS=$(mktemp -d)
 trap 'rm -rf "$OUT" "$TAGS"' EXIT
 
-curl -sf -X PATCH "$BASE/ns/$NS" -H "$CT" -H "$AU" -H 'If-None-Match: *' \
-  -d '[{"op":"add","path":"","value":{"read":"public"}}]' >/dev/null
+# The setup's requests say why they failed: the server's answer, or
+# curl's (not listening, wrong port).
+setup() { # setup URL BODY -> the response headers, or the failure on stderr and exit
+  local out
+  if ! out=$(curl -sS --fail-with-body -D - -o "$TAGS/body" -X PATCH "$1" -H "$CT" -H "$AU" -H 'If-None-Match: *' -d "$2"); then
+    echo "bench: PATCH $1 failed: $(cat "$TAGS/body" 2>/dev/null)" >&2
+    exit 1
+  fi
+  printf '%s\n' "$out"
+}
+
+setup "$BASE/ns/$NS" '[{"op":"add","path":"","value":{"read":"public"}}]' >/dev/null
 
 etag() { awk 'tolower($1)=="etag:"{print $2}' | tr -d '\r'; }
 
 # The resources, before the clock starts: a reader never asks for one not
 # made yet.
 for i in $(seq 1 "$W"); do
-  curl -sf -D - -o /dev/null -X PATCH "$BASE/r/$NS/r$i" -H "$CT" -H "$AU" -H 'If-None-Match: *' \
-    -d '[{"op":"add","path":"","value":{"v":0}}]' | etag >"$TAGS/$i"
+  setup "$BASE/r/$NS/r$i" '[{"op":"add","path":"","value":{"v":0}}]' | etag >"$TAGS/$i"
 done
 
 writer() { # writer I: appends N revisions to r$I, each on the last's ETag
