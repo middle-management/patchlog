@@ -122,7 +122,8 @@ type Options struct {
 	// MergeKey signs merge grants (§F.8), and nothing else; MergeKid is
 	// its id in the catalog namespace. MergeService is the merge
 	// service's sub: merge grants are issued only to it, and name it as
-	// their root sub. Without MergeKey, POST /merge-grants is refused.
+	// their root sub. Without MergeKey, POST /merge-grants is 404
+	// not_offered (§F.8).
 	MergeKey     ed25519.PrivateKey
 	MergeKid     string
 	MergeService string

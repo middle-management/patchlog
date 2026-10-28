@@ -310,8 +310,10 @@ func (s *Service) IssueMerge(ctx context.Context, v, av, adm *grant.Verified, ba
 	if derived.InfoOf(catLatest.Doc).Level == derived.LevelE2E {
 		return nil, errf(404, "not_offered", "%s is an end-to-end catalog: the catalog service issues no merge grants and checks no batch for it (§F.8)", cat)
 	}
+	// Without a merge key the service issues no merge grants at all:
+	// 404 not_offered, as for an end-to-end catalog, whoever asks (§F.8).
 	if s.opt.MergeKey == nil {
-		return nil, forbidden("this catalog service issues no merge grants: it has no merge key (§F.8)")
+		return nil, errf(404, "not_offered", "this catalog service issues no merge grants: it has no merge key (§F.8)")
 	}
 	if v.Principal.ID != s.opt.MergeService {
 		return nil, forbidden("merge grants are issued only to the merge service (%s), which submits them itself (§F.8)", s.opt.MergeService)
