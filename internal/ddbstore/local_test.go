@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,7 +29,7 @@ import (
 
 func newLocalStore(t testing.TB) *Store {
 	t.Helper()
-	endpoint := os.Getenv("DDB_ENDPOINT")
+	endpoint, _, _ := strings.Cut(os.Getenv("DDB_ENDPOINT"), ",") // the first of a list (testenv)
 	if endpoint == "" {
 		t.Skip("DDB_ENDPOINT not set: skipping DynamoDB Local integration test")
 	}
