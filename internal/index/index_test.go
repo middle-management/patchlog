@@ -721,41 +721,40 @@ func TestPurgeNamespace(t *testing.T) {
 }
 
 // TestMinSeveralNamespaces: a service following several namespaces takes
-// ?min={ns}:{ns_id} for any of them, repeatable, and waits for all (§A.5).
+// ?min={ns}:{ns_id}, repeatable, but on a query of one namespace a min
+// naming another is 400, listing it, before any wait (§A.5, v0.74 Open
+// 84); mins of the queried namespace are waited for, and one not reached
+// in time is 503.
 func TestMinSeveralNamespaces(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	w := setup(t)
 	must(w.c.CreateNamespace(ctx, "fixtures", map[string]any{"read": "public"}))
-	// fixtures' documents are fetched late, so its write is applied after
-	// matches' (an untyped document, it would usually go first): the check
-	// below then tells whether the wait covered fixtures, not the order the
-	// two were applied in. The delay only sharpens the check: if matches
-	// is applied slower than that, a wait that skipped fixtures may pass
-	// it, but a correct wait never fails it.
-	rf := &revFetches{prefix: "/r/fixtures/", delay: 500 * time.Millisecond, rt: transport, paths: map[string]int{}}
-	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "fixtures"}, minWait: 30 * time.Second, hc: &http.Client{Transport: rf}})
+	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "fixtures"}, minWait: 30 * time.Second})
 	s.caughtUp("matches")
 	s.caughtUp("fixtures")
-	a := w.doc(t, "derby", w.match, map[string]any{"title": "The Derby"})
+	first := w.doc(t, "derby", w.match, map[string]any{"title": "The Derby"})
+	a := w.doc(t, "cup", w.match, map[string]any{"title": "Cup final"})
 	b := must(w.c.CreateDoc(ctx, "fixtures", "f1", map[string]any{"title": "x"}))
 	r := s.raw("/matches?q=derby&min=fixtures:"+b.NSID+"&min=matches:"+a.NSID, "")
-	if r.status != 302 {
+	if r.status != 400 || fmt.Sprint(r.body["min"]) != fmt.Sprint([]string{"fixtures:" + b.NSID}) {
 		t.Fatalf("min over two namespaces: %d %v", r.status, r.body)
 	}
-	// The wait covered fixtures too: what it waits for is committed with
-	// the checkpoint, which Checkpoint follows just after (Index.Apply).
-	if got := s.ix.Committed("fixtures"); got != b.NSID {
-		t.Errorf("fixtures checkpoint %s, want %s", got, b.NSID)
+	r = s.raw("/matches?q=derby&min=matches:"+first.NSID+"&min=matches:"+a.NSID, "")
+	if r.status != 302 {
+		t.Fatalf("two mins of matches: %d %v", r.status, r.body)
+	}
+	if got := s.ix.Committed("matches"); got != a.NSID {
+		t.Errorf("matches checkpoint %s, want %s", got, a.NSID)
 	}
 	s.expect(r.header.Get("Location"), "derby")
 
-	// One of them unreachable → 503.
+	// One unreachable → 503.
 	s.cancel()
 	<-s.done
 	s.ix.SetMinWait(100 * time.Millisecond)
-	c := must(w.c.CreateDoc(ctx, "fixtures", "f2", map[string]any{"title": "y"}))
-	if r := s.raw("/matches?min=matches:"+a.NSID+"&min=fixtures:"+c.NSID, ""); r.status != 503 {
-		t.Fatalf("min ahead in another namespace: %d", r.status)
+	c := w.doc(t, "rematch", w.match, map[string]any{"title": "Derby rematch"})
+	if r := s.raw("/matches?min=matches:"+a.NSID+"&min=matches:"+c.NSID, ""); r.status != 503 {
+		t.Fatalf("min ahead: %d", r.status)
 	}
 }

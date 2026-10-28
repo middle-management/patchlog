@@ -10,11 +10,11 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// CIS-17, INV-2: a fold re-validates a stored revision under the rules it
-// was written under (§6.1, §E.3.2): Legacy, until revisions keep their
-// markers. A schema document an earlier version accepted (a format draft
-// 2020-12 doesn't define, a nested dialect $schema) still folds, though a
-// write now refuses it; one no version accepted is still flagged.
+// CIS-17, INV-2, as v0.74 has it: a fold re-validates a stored revision
+// (§E.3.2) as every schema compiles now, whenever it was written (§6.1).
+// A schema document only an earlier version accepted (a format draft
+// 2020-12 doesn't define, a nested dialect $schema) is flagged, as one no
+// version accepted is.
 func TestV073FoldStoredSchemaDocument(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -35,14 +35,14 @@ func TestV073FoldStoredSchemaDocument(t *testing.T) {
 	// Stored as an earlier version's client wrote it.
 	w := must(x.WithoutValidation().CreateDocSealed(ctx, "e", "s", old))
 	d := must(x.DocE2E(ctx, "e", "s", w.ID))
-	if d.ValidID != w.ID || len(d.Flagged) != 0 {
-		t.Fatalf("fold of a schema document an earlier version accepted: %+v", d)
+	if d.ValidID == w.ID || len(d.Flagged) != 1 || d.Flagged[0].ID != w.ID {
+		t.Fatalf("fold of a schema document only an earlier version accepted: %+v", d)
 	}
 	sameJSON(t, d.Value, old)
 
 	bad := must(x.WithoutValidation().AppendSealed(ctx, "e", "s", w.ID, ops(op("add", "/foo", 1))))
 	d = must(x.DocE2E(ctx, "e", "s", bad.ID))
-	if d.ValidID != w.ID || len(d.Flagged) != 1 || d.Flagged[0].ID != bad.ID {
+	if d.ValidID == bad.ID || len(d.Flagged) != 2 || d.Flagged[1].ID != bad.ID {
 		t.Fatalf("fold of a schema document no version accepted: %+v", d)
 	}
 }

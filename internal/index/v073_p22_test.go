@@ -61,7 +61,8 @@ func v073P22Setup(t *testing.T, extra ...string) *v073P22World {
 // lists every one refused, as given, in its body's min, no-store, with one
 // message for a namespace the reader can't see and one the service doesn't
 // follow; a min it accepts isn't listed. So on /_refs, and for malformed
-// mins.
+// mins. Since v0.74 (Open 84) a query of one namespace refuses a min
+// naming any other, one the reader may see (pub) included.
 func TestV073MinRefusedListed(t *testing.T) {
 	t.Parallel()
 	w := v073P22Setup(t)
@@ -74,7 +75,7 @@ func TestV073MinRefusedListed(t *testing.T) {
 		}
 	}
 	both := x.raw("/pa?limit=5&min=pb:"+pb+"&min=pub:"+pub+"&min=zz:"+pb, w.amy)
-	refused(both, "pb:"+pb, "zz:"+pb)
+	refused(both, "pb:"+pb, "pub:"+pub, "zz:"+pb)
 	hidden, unknown := x.raw("/pa?min=pb:"+pb, w.amy), x.raw("/pa?min=zz:"+pb, w.amy)
 	refused(hidden, "pb:"+pb)
 	refused(unknown, "zz:"+pb)
@@ -85,7 +86,7 @@ func TestV073MinRefusedListed(t *testing.T) {
 	q := "/_refs?to=" + url.QueryEscape("/r/target/x")
 	refs := x.raw(q+"&min=pb:"+pb+"&min=pa:"+x.ix.Checkpoint("pa")+"&min=zz:"+pb, w.amy)
 	refused(refs, "pb:"+pb, "zz:"+pb)
-	if refs.body["message"] != hidden.body["message"] {
+	if refs.body["message"] != "min names a namespace the service does not follow or the reader can't see" {
 		t.Errorf("/_refs message %v", refs.body["message"])
 	}
 	// Malformed ones are listed too, as the tree service lists them, with
@@ -161,9 +162,9 @@ func TestV073BareMinOnce(t *testing.T) {
 
 // TestV073MinSkippedNamespace (carry-over of P08, §A.4, §A.5, §12.1): a min
 // naming a followed namespace whose keys the service can't fetch for now
-// is answered alike by a query of another namespace and by /_refs: 503
-// behind, at once, to a reader who may see it, and the 400 listing it to
-// one who can't.
+// is answered by /_refs 503 behind, at once, to a reader who may see it,
+// and the 400 listing it to one who can't; a query of another namespace
+// refuses it 400 whoever reads it (v0.74, Open 84).
 func TestV073MinSkippedNamespace(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -200,7 +201,12 @@ func TestV073MinSkippedNamespace(t *testing.T) {
 	bob := issuer.Grant(t, s.Now(), "user:bob", []string{"sec", "pub"}, []string{"read"})
 	amy := issuer.Grant(t, s.Now(), "user:amy", []string{"pub"}, []string{"read"})
 	q := "/_refs?to=" + url.QueryEscape("/r/target/x")
-	for _, p := range []string{"/pub?min=sec:" + id, q + "&min=sec:" + id} {
+	for _, tok := range []string{bob, amy} {
+		if r := x.raw("/pub?min=sec:"+id, tok); r.status != 400 || fmt.Sprint(r.body["min"]) != "[sec:"+id+"]" {
+			t.Errorf("/pub?min=sec: %d %v, want 400 listing it", r.status, r.body)
+		}
+	}
+	for _, p := range []string{q + "&min=sec:" + id} {
 		start := time.Now()
 		r := x.raw(p, bob)
 		if r.status != 503 || r.body["code"] != "behind" || r.header.Get("Retry-After") == "" || r.header.Get("Cache-Control") != "no-store" {

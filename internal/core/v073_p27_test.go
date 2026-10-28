@@ -105,10 +105,10 @@ func expectAPI(t *testing.T, err error, status int, code string) {
 }
 
 // CIS-17: revisions written now carry the V073 marker, stored beside the
-// row and outside its id; a document typed by a schema revision is
-// validated under that revision's marker: V073 asserts idn-email, and a
-// revision stored before the upgrade (no marker) compiles as v0.55 did,
-// leaving it unasserted (§6.1).
+// row and outside its id. Since v0.74 the marker selects nothing: a
+// document typed by a schema revision is validated under this version's
+// rules whatever the revision's marker, so idn-email is asserted for a
+// revision stored before the upgrade (no marker) too (§6.1).
 func TestV073RulesMarkerTypedDocs(t *testing.T) {
 	t.Parallel()
 	s := newSchemaEnv(t)
@@ -129,9 +129,10 @@ func TestV073RulesMarkerTypedDocs(t *testing.T) {
 	expectAPI(t, err, 422, "invalid")
 	s.put("n", "d2", "", map[string]any{"$schema": path, "e": "user@example.com"})
 
-	// Stored before the upgrade: as v0.55 compiled it.
+	// Stored before the upgrade: compiled as every schema is now.
 	s.storedBefore("n", "s", sid)
-	s.put("n", "d3", "", map[string]any{"$schema": path, "e": "not an email"})
+	_, err = s.e.WriteResource(context.Background(), s.req("n"), createItem("d3", map[string]any{"$schema": path, "e": "not an email"}))
+	expectAPI(t, err, 422, "invalid")
 
 	// Within one batch, a document typed by a schema an earlier item
 	// writes follows that revision's marker too.
@@ -146,12 +147,13 @@ func TestV073RulesMarkerTypedDocs(t *testing.T) {
 	}
 }
 
-// CIS-17 and the carry-over of P03: a content-addressed copy of a schema
-// revision stored under the earlier rules (a fast-forward merge, a
-// same-deployment import, a branch's replay) inherits its Legacy marker, so
-// it is checked as it was stored and compiles as it did; new content, and
-// a copy from a namespace the write can't take content from, is held to
-// today's rules (§6.1, §G.4.4, F-S1).
+// CIS-17 and the carry-over of P03, as v0.74 has it: a content-addressed
+// copy of a schema revision stored under the earlier rules (a fast-forward
+// merge, a same-deployment import, a branch's replay) still inherits its
+// Legacy marker, but the marker selects nothing: every schema compiles
+// under this version (§6.1), so a copy of one today's rules refuse is
+// refused as new content is, and documents typed by the stored revision
+// are refused as typed by an invalid schema.
 func TestV073CopyInheritsLegacyMarker(t *testing.T) {
 	t.Parallel()
 	s := newSchemaEnv(t)
@@ -163,38 +165,27 @@ func TestV073CopyInheritsLegacyMarker(t *testing.T) {
 	_, err := s.e.WriteResource(context.Background(), s.req("third"), createItem("fresh", map[string]any{
 		"$schema": schema.Dialect2020, "title": "new content", "properties": map[string]any{"c": map[string]any{"format": "color"}}}))
 	expectAPI(t, err, 422, "invalid")
-	// A copy into a namespace that neither reads old through nor names it
-	// as the batch's source is new content too.
 	_, err = s.e.WriteResource(context.Background(), s.req("third"), createItem("s", legacySchema()))
 	expectAPI(t, err, 422, "invalid")
 
-	// A branch of old replays it: the same id, read through from its base.
+	// A branch of old replaying it: the same id, refused all the same.
 	if _, err := s.e.CreateBranch(context.Background(), s.req("old"), BranchRequest{Name: "old-b", IfNoneMatch: true}); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.put("old-b", "t", "", legacySchema()); got != x {
-		t.Fatalf("copy id %s, want %s", got, x)
-	}
-	if r := s.rowRulesOf("old-b", "t", x); !r.Valid || r.Int64 != int64(schema.Legacy) {
-		t.Fatalf("copy's marker %v, want %d (Legacy)", r, schema.Legacy)
-	}
+	_, err = s.e.WriteResource(context.Background(), s.req("old-b"), createItem("t", legacySchema()))
+	expectAPI(t, err, 422, "invalid")
 
 	// A batch whose local source is old, as a merge or a same-deployment
-	// import sends it: the copy inherits the marker.
+	// import sends it.
 	at := s.nsHeadID("old")
-	res, err := s.e.Batch(context.Background(), s.req("other"), []Item{createItem("s", legacySchema())}, nil,
+	_, err = s.e.Batch(context.Background(), s.req("other"), []Item{createItem("s", legacySchema())}, nil,
 		map[string]any{"ns": "old", "at": at}, false)
-	if err != nil {
-		t.Fatalf("batch with old as source: %v", err)
+	if got := itemFails(t, err); got[0] != "invalid" || len(got) != 1 {
+		t.Fatalf("batch with old as source: failures %v, want item 0 invalid", got)
 	}
-	if res.Items[0].IDs[0] != x {
-		t.Fatal("not the same id")
-	}
-	// Documents typed by the copy compile under Legacy: an unknown format
-	// is ignored, the rest validates.
-	path := "/r/other/s/rev/" + x
-	s.put("other", "d", "", map[string]any{"$schema": path, "c": "not a colour"})
-	_, err = s.e.WriteResource(context.Background(), s.req("other"), createItem("e", map[string]any{"$schema": path, "c": 5.0}))
+	// Documents typed by the stored revision: an invalid schema.
+	path := "/r/old/s/rev/" + x
+	_, err = s.e.WriteResource(context.Background(), s.req("old"), createItem("d", map[string]any{"$schema": path, "c": "not a colour"}))
 	expectAPI(t, err, 422, "invalid")
 }
 
@@ -214,7 +205,8 @@ func (s *schemaEnv) nsHeadID(ns string) string {
 }
 
 // CIS-17: a database from before markers gets the column, and its rows,
-// NULL, read as Legacy; rows written afterwards are V073 (§6.1).
+// NULL, read as Legacy; rows written afterwards are V073. Either way the
+// revision compiles under this version (§6.1, v0.74).
 func TestV073RulesMarkerMigration(t *testing.T) {
 	t.Parallel()
 	path := pgtest.FreshDB(t)
@@ -257,76 +249,69 @@ func TestV073RulesMarkerMigration(t *testing.T) {
 		t.Fatalf("migrated row's marker %v, want NULL", r)
 	}
 	p := "/r/n/s/rev/" + sid
-	s.put("n", "d", "", map[string]any{"$schema": p, "e": "not an email"})
+	// NULL is Legacy, which since v0.74 selects nothing (§6.1).
+	_, err := e.WriteResource(context.Background(), s.req("n"), createItem("d", map[string]any{"$schema": p, "e": "not an email"}))
+	expectAPI(t, err, 422, "invalid")
 	newer := idnSchema()
 	newer["title"] = "written after the upgrade"
 	s2 := s.put("n", "s2", "", newer)
 	if r := s.rowRulesOf("n", "s2", s2); !r.Valid || r.Int64 != int64(schema.V073) {
 		t.Fatalf("new row's marker %v, want %d", r, schema.V073)
 	}
-	_, err := e.WriteResource(context.Background(), s.req("n"), createItem("d2", map[string]any{"$schema": "/r/n/s2/rev/" + s2, "e": "not an email"}))
+	_, err = e.WriteResource(context.Background(), s.req("n"), createItem("d2", map[string]any{"$schema": "/r/n/s2/rev/" + s2, "e": "not an email"}))
 	expectAPI(t, err, 422, "invalid")
 }
 
-// CIS-17 (P27 review), §6.1 "A schema stored under an earlier version is
-// compiled as that version did", wherever it is reached from: a revision
-// stored before the upgrade (Legacy), reached through the $ref of a schema
-// written now (V073), compiles as it does when a document names it, not
-// under the V073 marker of the root: semver asserted (v0.55 asserted it),
-// idn-email not (v0.55 ignored it). The V073 schema's own idn-email is
-// asserted.
+// CIS-17 (P27 review) as v0.74 has it, §6.1 "every schema compiles under
+// this version": a revision stored before the upgrade (Legacy), named
+// directly or reached through the $ref of a schema written now, compiles
+// under today's rules: idn-email asserted. One naming semver, which only
+// the earlier rules accepted, is an invalid schema wherever it is
+// reached from: a document typed by it, and a schema written now that
+// $refs it, are 422 invalid.
 func TestV073LegacyRevisionInV073Closure(t *testing.T) {
 	t.Parallel()
 	s := newSchemaEnv(t)
 	s.mkNS("n")
 	ctx := context.Background()
-	l := s.legacyRow("n", "l", map[string]any{"$schema": schema.Dialect2020, "type": "object",
-		"properties": map[string]any{"v": map[string]any{"type": "string", "format": "semver"}, "e": map[string]any{"type": "string", "format": "idn-email"}}})
+	l := s.legacyRow("n", "l", idnSchema())
 	lpath := "/r/n/l/rev/" + l
-	// Named directly: as v0.55 compiled it.
-	_, err := s.e.WriteResource(ctx, s.req("n"), createItem("d1", map[string]any{"$schema": lpath, "v": "not a version"}))
+	// Named directly.
+	_, err := s.e.WriteResource(ctx, s.req("n"), createItem("d1", map[string]any{"$schema": lpath, "e": "not an email"}))
 	expectAPI(t, err, 422, "invalid")
-	s.put("n", "d2", "", map[string]any{"$schema": lpath, "e": "not an email"})
+	s.put("n", "d2", "", map[string]any{"$schema": lpath, "e": "user@example.com"})
 
 	// Through the $ref of a schema written now: the same.
 	sid := s.put("n", "s", "", map[string]any{"$schema": schema.Dialect2020, "type": "object",
-		"properties": map[string]any{"old": map[string]any{"$ref": lpath}, "e": map[string]any{"type": "string", "format": "idn-email"}}})
+		"properties": map[string]any{"old": map[string]any{"$ref": lpath}}})
 	spath := "/r/n/s/rev/" + sid
-	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("d3", map[string]any{"$schema": spath, "old": map[string]any{"v": "not a version"}}))
+	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("d3", map[string]any{"$schema": spath, "old": map[string]any{"e": "not an email"}}))
 	expectAPI(t, err, 422, "invalid")
-	s.put("n", "d4", "", map[string]any{"$schema": spath, "old": map[string]any{"e": "not an email"}})
-	// The V073 schema's own formats are V073's.
-	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("d5", map[string]any{"$schema": spath, "e": "not an email"}))
+	s.put("n", "d4", "", map[string]any{"$schema": spath, "old": map[string]any{"e": "user@example.com"}})
+
+	// A stored revision naming semver.
+	v := s.legacyRow("n", "v", map[string]any{"$schema": schema.Dialect2020, "type": "object",
+		"properties": map[string]any{"v": map[string]any{"type": "string", "format": "semver"}}})
+	vpath := "/r/n/v/rev/" + v
+	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("d5", map[string]any{"$schema": vpath, "v": "1.2.3"}))
 	expectAPI(t, err, 422, "invalid")
-	// And so for a schema whose root is only a $ref, written in one batch
-	// with documents typed by it and by the stored revision (one
-	// transaction, the root an earlier item's, both markers).
-	pendingRoot := func(title string) (map[string]any, string) {
-		doc := map[string]any{"$schema": schema.Dialect2020, "title": title, "$ref": lpath}
-		return doc, "/r/n/" + title + "/rev/" + ids.Revision(nil, genesisCanon(doc)).String()
+	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("s2", map[string]any{"$schema": schema.Dialect2020, "$ref": vpath}))
+	expectAPI(t, err, 422, "invalid")
+	// And in one batch with a pending root that $refs it.
+	rdoc := map[string]any{"$schema": schema.Dialect2020, "title": "r", "$ref": vpath}
+	rpath := "/r/n/r/rev/" + ids.Revision(nil, genesisCanon(rdoc)).String()
+	_, err = s.batch("n", []Item{createItem("r", rdoc),
+		createItem("d6", map[string]any{"$schema": rpath, "v": "1.2.3"})}, false)
+	if got := itemFails(t, err); got[0] != "invalid" {
+		t.Errorf("a pending root that $refs the stored semver revision: %v, want item 0 invalid", got)
 	}
-	rdoc, rpath := pendingRoot("r")
-	s.mustBatch("n", []Item{createItem("r", rdoc),
-		createItem("d6", map[string]any{"$schema": rpath, "e": "not an email"}),
-		createItem("d8", map[string]any{"$schema": lpath, "e": "not an email"})})
-	r2doc, r2path := pendingRoot("r2")
-	_, err = s.batch("n", []Item{createItem("r2", r2doc),
-		createItem("d7", map[string]any{"$schema": r2path, "v": "not a version"})}, false)
-	if got := itemFails(t, err); len(got) != 1 || got[1] != "invalid" {
-		t.Errorf("d7 typed by a pending V073 root that $refs the stored revision: %v, want item 1 invalid", got)
-	}
-	// Written since, it compiles the same way.
-	s.put("n", "d9", "", map[string]any{"$schema": rpath, "e": "not an email"})
-	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("d10", map[string]any{"$schema": rpath, "v": "not a version"}))
-	expectAPI(t, err, 422, "invalid")
 }
 
-// CIS-17 regression (P27 review): a schema written now may $ref a revision
-// stored before the upgrade whose pattern RE2 took as written though
-// §6.6's translation refuses it (P03, TestV073WriteRefsStoredPattern).
-// The write of that schema is accepted, and so are the documents typed by
-// it: the stored revision's pattern compiles as it did. Compiled under the
-// root's V073 marker, every one was refused ("lone surrogate").
+// CIS-17 regression (P27 review) as v0.74 has it: a revision stored before
+// the upgrade whose pattern RE2 took as written though §6.6's translation
+// refuses it (a lone surrogate written \x{D800}) compiles under this
+// version too (§6.1), so it is an invalid schema: a document typed by it,
+// and a schema written now that $refs it, are 422 invalid.
 func TestV073StoredPatternInV073Closure(t *testing.T) {
 	t.Parallel()
 	s := newSchemaEnv(t)
@@ -335,10 +320,8 @@ func TestV073StoredPatternInV073Closure(t *testing.T) {
 	l := s.legacyRow("n", "oldpat", map[string]any{"$schema": schema.Dialect2020, "type": "object",
 		"properties": map[string]any{"a": map[string]any{"type": "string", "pattern": "^a\\x{D800}?$"}}})
 	lpath := "/r/n/oldpat/rev/" + l
-	s.put("n", "d1", "", map[string]any{"$schema": lpath, "a": "a"})
-	sid := s.put("n", "s", "", map[string]any{"$schema": schema.Dialect2020, "$ref": lpath})
-	spath := "/r/n/s/rev/" + sid
-	s.put("n", "d2", "", map[string]any{"$schema": spath, "a": "a"})
-	_, err := s.e.WriteResource(ctx, s.req("n"), createItem("d3", map[string]any{"$schema": spath, "a": "b"}))
+	_, err := s.e.WriteResource(ctx, s.req("n"), createItem("d1", map[string]any{"$schema": lpath, "a": "a"}))
+	expectAPI(t, err, 422, "invalid")
+	_, err = s.e.WriteResource(ctx, s.req("n"), createItem("s", map[string]any{"$schema": schema.Dialect2020, "$ref": lpath}))
 	expectAPI(t, err, 422, "invalid")
 }

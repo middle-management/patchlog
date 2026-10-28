@@ -758,19 +758,32 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		}
 		protected[ns] = info.Protected()
 	}
+	// An epoch whose key the service's grant gets none of, for good (a 4xx
+	// from /keys, no key for it, one it can't unwrap: lacksKey),
+	// leaves its hits by name only (§E.2.6), kept so in the stored result;
+	// one it can't get for now is behind.
 	keys := map[string]derived.Key{}
-	keyAt := func(ns string, epoch int) (derived.Key, error) {
+	lacking := map[string]bool{}
+	keyAt := func(ns string, epoch int) (key derived.Key, lacks bool, err error) {
 		k := ns + "#" + strconv.Itoa(epoch)
 		if key, ok := keys[k]; ok {
-			return key, nil
+			return key, false, nil
 		}
-		key, err := ix.keys.KeyAt(ctx, ns, epoch)
-		if err != nil {
+		if lacking[k] {
+			return key, true, nil
+		}
+		key, err = ix.keys.KeyAt(ctx, ns, epoch)
+		switch {
+		case lacksKey(ctx, err):
+			ix.opt.Logf("index: key of %s epoch %d, for good: %v (its hits by name only)", ns, epoch, err)
+			lacking[k] = true
+			return key, true, nil
+		case err != nil:
 			ix.opt.Logf("index: key of %s epoch %d: %v", ns, epoch, err)
-			return key, errRefsKeys
+			return key, false, errRefsKeys
 		}
 		keys[k] = key
-		return key, nil
+		return key, false, nil
 	}
 
 	tags := make([]string, 0, len(nss)+len(hits))
@@ -799,15 +812,19 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		if protected[ns] {
 			// Per-entry sealing (§E.2.6): what the document gave, under
 			// its resource's key of the epoch it is served under.
-			key, err := keyAt(ns, h.epoch)
-			if err != nil {
+			key, lacks, err := keyAt(ns, h.epoch)
+			switch {
+			case err != nil:
 				return derived.Stored{}, "", false, err
+			case lacks:
+				m = map[string]any{}
+			default:
+				jwe, err := derived.SealItem(key, derived.View{NS: ns, Target: view}, h.Resource, m)
+				if err != nil {
+					return derived.Stored{}, "", false, fmt.Errorf("sealing a hit: %w", err)
+				}
+				m = map[string]any{"sealed": jwe}
 			}
-			jwe, err := derived.SealItem(key, derived.View{NS: ns, Target: view}, h.Resource, m)
-			if err != nil {
-				return derived.Stored{}, "", false, fmt.Errorf("sealing a hit: %w", err)
-			}
-			m = map[string]any{"sealed": jwe}
 		}
 		m["ns"], m["resource"], m["id"] = ns, h.Resource, h.ID
 		m["url"] = ix.origin + "/r/" + ns + "/" + h.Resource + "/rev/" + h.ID
@@ -824,8 +841,13 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		return derived.Stored{}, "", false, err
 	}
 	st := derived.Stored{Body: b, JSON: true, Tags: strings.Join(tags, ",")}
-	if len(keys) > 0 {
-		// Some hit is sealed: it is bound to its URL.
+	if err := ctx.Err(); err != nil {
+		// The reader went away: keep nothing built meanwhile.
+		return derived.Stored{}, "", false, err
+	}
+	if len(keys) > 0 || len(lacking) > 0 {
+		// Some hit is sealed, or by name only for want of its key: it is
+		// bound to its URL.
 		// Sealed once (§E.2.6): stored while at is current, as sealed
 		// results of one namespace are.
 		scope := "/_refs/g/" + rd.gs

@@ -338,8 +338,11 @@ func (ix *Index) reset(ctx context.Context) error {
 // user_version: 1 since v0.73, whose x-index values come from a static walk
 // (§A.2, valueWalk), whose sort rows hold each document's least value and
 // every value as written, booleans included, and whose counts go by string
-// form. A database of an older format is rebuilt (§A.6).
-const indexFormat = 1
+// form; 2 since v0.74, whose walk follows every dependentSchemas entry
+// whatever the data (§A.4) and matches patternProperties as this version
+// compiles every schema (§6.1). A database of an older format is rebuilt
+// (§A.6).
+const indexFormat = 2
 
 func (ix *Index) initSchema(ctx context.Context) error {
 	// What an existing database holds is read before the migrations bring
@@ -357,14 +360,15 @@ func (ix *Index) initSchema(ctx context.Context) error {
 	}
 	if !ix.opt.Rebuild {
 		// Before v0.73, x-index values were collected while validating, a
-		// sort row held one value, not the least, and booleans none: an
-		// older format is replayed (indexFormat).
+		// sort row held one value, not the least, and booleans none; before
+		// v0.74, dependentSchemas were followed only for members present:
+		// an older format is replayed (indexFormat).
 		var format int
 		if err := ix.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&format); err != nil {
 			return err
 		}
 		if docs > 0 && format < indexFormat {
-			ix.opt.Logf("index: the database predates the static x-index walk and sort order of v0.73 (§A.2); rebuilding it from the logs")
+			ix.opt.Logf("index: the database predates the x-index walk and sort order of v0.74 (§A.2, §A.4); rebuilding it from the logs")
 			ix.opt.Rebuild = true
 		}
 		// Before docs.epoch, the rows of sealed and e2e namespaces don't

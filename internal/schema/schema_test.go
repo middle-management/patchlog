@@ -260,11 +260,13 @@ func TestStoredSchemaInvalid(t *testing.T) {
 			t.Errorf("%s: got %v, want SchemaError", p, err)
 		}
 	}
-	// own $id is allowed
+	// Even its own path as $id is invalid: every schema compiles under
+	// this version, whenever it was stored (§6.1).
 	p := "/r/s/withid/rev/" + rev('g')
 	s.docs[p] = j(`{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"` + p + `","type":"object"}`)
-	if err := v.Validate(map[string]any{"$schema": p}, s.load); err != nil {
-		t.Fatal(err)
+	var se *SchemaError
+	if err := v.Validate(map[string]any{"$schema": p}, s.load); !errors.As(err, &se) {
+		t.Fatalf("own $id: got %v, want SchemaError", err)
 	}
 }
 
@@ -335,19 +337,15 @@ func TestDialectDocuments(t *testing.T) {
 	}
 }
 
+// Any $id is invalid (§6.1), stored or written, its own path included:
+// every schema compiles under this version.
 func TestCheckSchemaDocumentSelfID(t *testing.T) {
 	doc := j(`{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"` + pathPerson + `"}`)
-	if err := CheckSchemaDocument(doc, pathPerson); err != nil {
-		t.Fatal(err)
-	}
-	var re *RefError
-	if err := CheckSchemaDocument(doc, pathAddress); !errors.As(err, &re) {
-		t.Fatalf("got %v", err)
-	}
-	// Written, any $id is invalid (§6.1).
-	var se *SchemaError
-	if err := CheckSchemaDocument(doc, ""); !errors.As(err, &se) {
-		t.Fatalf("got %v", err)
+	for _, self := range []string{pathPerson, pathAddress, ""} {
+		var se *SchemaError
+		if err := CheckSchemaDocument(doc, self); !errors.As(err, &se) {
+			t.Fatalf("%q: got %v", self, err)
+		}
 	}
 }
 
@@ -552,13 +550,13 @@ func TestValidatorCachesBounded(t *testing.T) {
 	if v.compiled.Len() > maxCompiledSchemas || v.docs.Len() > maxSchemaDocs {
 		t.Fatalf("%d compiled, %d documents kept", v.compiled.Len(), v.docs.Len())
 	}
-	if _, ok := v.compiled.Get(compiledKey{path(0), Legacy}); ok {
+	if _, ok := v.compiled.Get(path(0)); ok {
 		t.Fatal("the least recently used schema kept")
 	}
 	if err := v.Validate(map[string]any{"$schema": path(0)}, load); err == nil {
 		t.Fatal("an evicted schema no longer validates")
 	}
-	if _, ok := v.compiled.Get(compiledKey{path(0), Legacy}); !ok {
+	if _, ok := v.compiled.Get(path(0)); !ok {
 		t.Fatal("an evicted schema wasn't compiled again")
 	}
 }

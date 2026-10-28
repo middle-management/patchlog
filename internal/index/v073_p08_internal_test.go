@@ -140,9 +140,9 @@ func TestV073ValueWalk(t *testing.T) {
 		{"patternProperties and additionalProperties",
 			`{"properties": {"a": {}}, "patternProperties": {"^x-": {"x-index": "facet"}}, "additionalProperties": {"x-index": "sort"}}`, `{"a": 1, "x-b": "p", "z": 7}`,
 			"", "/x-b=p", "/z=7 [7]"},
-		{"dependentSchemas of a member present",
+		{"dependentSchemas whatever members are present (v0.74, §A.4)",
 			`{"dependentSchemas": {"k": {"properties": {"a": {"x-index": "facet"}}}, "m": {"properties": {"b": {"x-index": "facet"}}}}}`, `{"k": 1, "a": "1", "b": "2"}`,
-			"", "/a=1", ""},
+			"", "/a=1,/b=2", ""},
 		{"$ref to another revision",
 			`{"properties": {"o": {"$ref": "` + other + `"}}}`, `{"o": {"label": "l"}}`,
 			"", "/o/label=l", ""},
@@ -183,10 +183,11 @@ func TestV073SortLess(t *testing.T) {
 	}
 }
 
-// TestV073Unavailable (IX-22, §A.1): a schema revision that answers 403,
-// 404 or 410, or can't be opened for want of keys, is unavailable (the
-// document is indexed as one without $schema); a 401 to the service's own
-// grant, and failures asking again may mend, are not.
+// TestV073Unavailable (IX-22, §A.1): a schema revision that answers a 4xx
+// other than 429, or can't be opened for want of keys, is unavailable (the
+// document is indexed as one without $schema), a 401 to the service's own
+// grant too since v0.74 (Open 86); failures asking again may mend are
+// not.
 func TestV073Unavailable(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
@@ -198,7 +199,9 @@ func TestV073Unavailable(t *testing.T) {
 		{&client.APIError{Status: http.StatusGone, Code: "purged"}, true},
 		{&client.APIError{Status: http.StatusGone, Code: "pruned"}, true},
 		{fmt.Errorf("resolving: %w", client.ErrNoKeys), true},
-		{&client.APIError{Status: http.StatusUnauthorized}, false},
+		{&client.APIError{Status: http.StatusUnauthorized}, true},
+		{&client.APIError{Status: http.StatusBadRequest}, true},
+		{&client.APIError{Status: http.StatusTooManyRequests}, false},
 		{&client.APIError{Status: http.StatusServiceUnavailable}, false},
 		{errors.New("connection reset"), false},
 	} {

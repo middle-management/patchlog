@@ -51,54 +51,56 @@ var (
 type mode uint8
 
 const (
-	// write: a schema document written now (§6.1, §6.2 step 5, §6.5, §6.6).
+	// write: a schema document, written now or stored under an earlier
+	// version, since every schema compiles under this version (§6.1, §6.2
+	// step 5, §6.5, §6.6).
 	write mode = iota
-	// stored: a schema document stored under an earlier version, held to
-	// the rules it was written under (§6.1): v0.55's, which allowed a
-	// nested dialect $schema, a root $id equal to its own revision path
-	// and any format, together with all that writes accept now. Its
-	// revision path is selfPath; without one (re-validating its content,
-	// ValidateRules) any $id is refused, as v0.55 refused it at write.
-	stored
 	// fragment: a rule's schema fragment (§6.4.2): write's rules, with no
 	// $schema in any subschema and same-document references only.
 	fragment
+	// walk: a stored schema read for its structure by the static walk that
+	// finds declared references (§6.5), not compiled to validate: what an
+	// earlier version stored is walked as it accepted it, v0.55's root $id
+	// equal to its own revision path (selfPath), dialect $schema in any
+	// subschema and any format included, with patterns compiled as v0.55
+	// compiled them (Legacy).
+	walk
 )
 
 type checker struct {
 	mode     mode
-	selfPath string // stored: the revision path the schema is stored at
-}
-
-// rules is the marker a check compiles patterns under.
-func (ck checker) rules() Rules {
-	if ck.mode == stored {
-		return Legacy
-	}
-	return V073
+	selfPath string // walk: the revision path the schema is stored at
 }
 
 // CheckSchemaDocument validates the constraints of §6.1, §6.5 and §6.6 for a
 // document that is a schema: $schema, $id, $ref/$dynamicRef forms, unknown
 // keywords, formats and RE2-compatible regular expressions.
 //
-// selfPath "" checks a schema being written (write mode): $id is invalid
-// anywhere, $schema anywhere but the root, and so is a format draft
-// 2020-12 doesn't define. Otherwise selfPath is the revision path the
-// schema is stored at (stored mode), and the schema is held to the rules
-// it was stored under (§6.1), which accepted a root $id equal to
-// selfPath, a dialect $schema in any subschema and any format.
+// $id is invalid anywhere, $schema anywhere but the root, and so is a
+// format draft 2020-12 doesn't define. selfPath, the revision path a
+// stored schema is loaded from, or "" for one being written, selects
+// nothing: every schema is held to this version's rules, whenever it was
+// stored (§6.1), so one v0.55 accepted with a root $id equal to its own
+// path, a nested dialect $schema or a format such as semver is invalid.
 //
 // In either mode a top-level $nonce of the fresh-nonce form and a
 // $successor of the form of §8.1 are mechanics, not keywords, as for
 // validation (Instance), so namespaces that require nonces can hold
 // schemas (§6.2, §C.7) and schema resources can move (§8.1, §6.5).
 func CheckSchemaDocument(doc any, selfPath string) error {
-	ck := checker{mode: write}
-	if selfPath != "" {
-		ck = checker{mode: stored, selfPath: selfPath}
-	}
-	return ck.check(leaveOut(doc), pointer.Pointer{})
+	return checker{mode: write}.check(leaveOut(doc), pointer.Pointer{})
+}
+
+// CheckSchemaWalk checks a stored schema document, at revision path
+// selfPath, for the static walk that finds declared references (§6.5):
+// "a static walk, not annotation collection during validation", so a
+// document stored against a schema an earlier version accepted still
+// declares the references it did, though that schema no longer compiles
+// (§6.1). It refuses what CheckSchemaDocument does, but for a root $id
+// equal to selfPath, a dialect $schema in a subschema and any format, and
+// it compiles patterns as v0.55 did.
+func CheckSchemaWalk(doc any, selfPath string) error {
+	return checker{mode: walk, selfPath: selfPath}.check(leaveOut(doc), pointer.Pointer{})
 }
 
 // CheckFragment checks a rule's schema fragment (§6.4.2): it is held to
@@ -235,12 +237,8 @@ func (ck checker) checkCore(obj map[string]any, at pointer.Pointer) error {
 		}
 	}
 	if v, ok := obj["$id"]; ok {
-		if ck.mode != stored {
+		if s, _ := v.(string); ck.mode != walk || len(at) != 0 || ck.selfPath == "" || s != ck.selfPath {
 			return &SchemaError{Msg: fmt.Sprintf("$id at %s is not allowed", loc(at))}
-		}
-		s, _ := v.(string)
-		if len(at) != 0 || ck.selfPath == "" || s != ck.selfPath {
-			return &RefError{Msg: fmt.Sprintf("$id at %s is not allowed", loc(at))}
 		}
 	}
 	if v, ok := obj["$ref"]; ok {
@@ -267,7 +265,7 @@ func (ck checker) checkCore(obj map[string]any, at pointer.Pointer) error {
 			return &RefError{Msg: fmt.Sprintf("$dynamicRef at %s must be a fragment", loc(at))}
 		}
 	}
-	if v, ok := obj["format"]; ok && ck.mode != stored {
+	if v, ok := obj["format"]; ok && ck.mode != walk {
 		f, ok := v.(string)
 		if !ok {
 			return &SchemaError{Msg: fmt.Sprintf("format at %s must be a string", loc(at))}
@@ -280,7 +278,11 @@ func (ck checker) checkCore(obj map[string]any, at pointer.Pointer) error {
 }
 
 func (ck checker) checkRegexp(re string, at pointer.Pointer) error {
-	if _, err := ck.rules().CompileRegexp(re); err != nil {
+	rules := current
+	if ck.mode == walk {
+		rules = Legacy
+	}
+	if _, err := rules.CompileRegexp(re); err != nil {
 		return &SchemaError{Msg: fmt.Sprintf("regular expression at %s is not RE2-compatible: %v", loc(at), err)}
 	}
 	return nil
