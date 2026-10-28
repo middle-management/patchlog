@@ -493,11 +493,13 @@ func TestV073SupersededKeyReplacedUnderSameKid(t *testing.T) {
 }
 
 // §F.6 superseded, §8.5: a successor purged after the freeze answers 410
-// for its grants, so a replay under a * key is checked against its grant
-// as another namespace serves it: the successor's base, whose branch
-// entry records the rebase tool's grant (r7). A replay under a grant only
-// the purged successor recorded can't be checked against the key, and the
-// branch is kept for a manual purge (r9).
+// for its grants, so a replay under a * key can't be checked against its
+// grant, and the branch is kept for a manual purge. Since v0.74 the grant
+// isn't read from another namespace instead, such as the successor's base,
+// whose branch entry records the rebase tool's grant (r7): only one the
+// janitor read from the successor before the purge counts (v074_v05_test).
+// A replay under a grant only the purged successor recorded (r9) is kept
+// as before.
 func TestV073PurgedSuccessorStarKeyGrant(t *testing.T) {
 	t.Parallel()
 	a := newAuthEnv(t, []string{"r7", "r7-b", "r9", "r9-b"}, nil)
@@ -514,8 +516,6 @@ func TestV073PurgedSuccessorStarKeyGrant(t *testing.T) {
 		patchConfig(t, a.admin, ns, op("add", "/frozen", true))
 		must(a.admin.PurgeNamespace(ctx, ns, must(a.admin.NSHead(ctx, ns)).ID))
 	}
-	if d := a.check(t, "matches", "r7", 2*day); d.Action != janitor.ActionPurged || d.Claim != "superseded" {
-		t.Fatalf("r7: %+v", d)
-	}
-	wantKeep(t, a.check(t, "matches", "r9", 2*day), "can't be read since r9-b was purged (§8.5), so its key can't be checked: verify by hand")
+	wantKeep(t, a.check(t, "matches", "r7", 2*day), "can't be read since r7-b was purged (§8.5), and the janitor didn't read it before the purge, so its key can't be checked: verify by hand")
+	wantKeep(t, a.check(t, "matches", "r9", 2*day), "can't be read since r9-b was purged (§8.5), and the janitor didn't read it before the purge, so its key can't be checked: verify by hand")
 }

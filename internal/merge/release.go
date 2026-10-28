@@ -365,10 +365,10 @@ type ReleaseOptions struct {
 	// (it changes $access, restores a folder, or widens) is submitted,
 	// narrowed to exactly that batch with Via (§F.8). The catalog service
 	// judges such a batch, which only an approver in catalog-admins gets
-	// through, with this admin as the caller too (F-T4); for an end-to-end
-	// catalog, which it checks no batch of, the merge service judges
-	// whether a batch needs catalog-admins itself. Via is the merge
-	// service's sub (default: Who).
+	// through, with this admin as the caller too (F-T4). Every catalog
+	// batch of an end-to-end catalog, which it checks no batch of, goes
+	// under it, whatever the batch changes; its root groups must list
+	// catalog-admins. Via is the merge service's sub (default: Who).
 	AdminGrant string
 	Via        string
 	// Digest, if set, is the digest the approving person reviewed:
@@ -2481,7 +2481,7 @@ func checkNarrowing(ctx context.Context, c *client.Client, b *ReleaseBranch, p *
 //     the batch goes under as the caller too (F-T4), and then AdminGrant
 //     narrowed to exactly that batch with the merge service's via;
 //   - for an end-to-end catalog, whose batches the service doesn't check
-//     (404 not_offered), grantE2E.
+//     (404 not_offered), grantE2E: every batch goes under AdminGrant.
 func grantFor(ctx context.Context, c *client.Client, opt ReleaseOptions, cat string, p *Plan) error {
 	if p.TargetLevel == "e2e" {
 		return grantE2E(ctx, c, opt, cat, p)
@@ -2527,17 +2527,28 @@ func grantFor(ctx context.Context, c *client.Client, opt ReleaseOptions, cat str
 
 // grantE2E sets the client an end-to-end catalog's batch is submitted with
 // (§F.8). The catalog service issues no merge grants and checks no batch
-// for such a catalog, so a batch that needs catalog-admins (adminChange)
-// goes under AdminGrant, narrowed to exactly that batch with the merge
-// service's via, without the service's dry run; any other is refused,
-// since no merge grant can be had for it.
+// for such a catalog, so every catalog batch of it, one that needs
+// catalog-admins (adminChange) or not, goes only with an approver in
+// catalog-admins: under AdminGrant, a grant whose root groups list
+// catalog-admins, narrowed to exactly that batch with the merge service's
+// via, without the service's dry run. adminChange says why the batch would
+// need catalog-admins elsewhere, for the error only.
 func grantE2E(ctx context.Context, c *client.Client, opt ReleaseOptions, cat string, p *Plan) error {
 	why, err := adminChange(ctx, c, cat, p)
 	if err != nil {
 		return err
 	}
 	if why == "" {
-		return fmt.Errorf("%w: %s is an end-to-end catalog, and the batch needs no catalog-admins, the only batches the merge service submits there, under a catalog admin's grant (§F.8)", ErrNotOffered, cat)
+		why = cat + " is an end-to-end catalog, whose every catalog batch goes under a catalog admin's grant"
+	}
+	if opt.AdminGrant != "" {
+		g, err := grant.Decode(opt.AdminGrant, 0)
+		if err != nil {
+			return fmt.Errorf("merge: the admin grant: %w", err)
+		}
+		if len(g.Blocks) == 0 || !slicesContains(g.Blocks[0].Groups, "catalog-admins") {
+			return fmt.Errorf("%s: %w: the grant given (ReleaseOptions.AdminGrant) isn't a catalog-admins member's (§F.8)", why, ErrAdminNeeded)
+		}
 	}
 	g, err := adminGrant(opt, cat, p)
 	if err != nil {

@@ -21,12 +21,16 @@ package seal
 //     (there is one key) and no compression. The plaintext of line n is
 //     bundle line n as canonical JSON (§3.1), without its newline, and with
 //     BundleWriter.Pad followed by spaces up to its §E.2.2 bucket.
-//   - A reader rejects the whole sealed bundle if a line fails to decrypt,
-//     its header has other members, pl.bundle isn't id, the line numbers
-//     aren't 0, 1, 2… in order, or no line says last or a line follows it.
-//     Sealed bundles written before v0.73 carry last beside pl rather than
-//     in it, which a reader still takes. Trailing spaces (padding, which
-//     canonical JSON never ends in) are removed from each line's plaintext.
+//   - A reader rejects the whole sealed bundle if it isn't framed strictly
+//     (v0.74): the envelope not canonical JSON, a line not followed by
+//     exactly one 0x0A (a 0x0D, a blank line, or a last line without its
+//     0x0A), or a protected header that isn't canonical JSON. It rejects
+//     it too if a line fails to decrypt, its header, pl included, has
+//     other members (so last beside pl, as written before v0.73, is
+//     refused), pl.bundle isn't id, the line numbers aren't 0, 1, 2… in
+//     order, or no line says last or a line follows it. Trailing spaces
+//     (padding, which canonical JSON never ends in) are removed from each
+//     line's plaintext.
 //     What it yields is the plain bundle, which the caller checks as a
 //     bundle (§G.4.1); its digest (source.bundle) is the plain bundle's.
 //
@@ -278,8 +282,9 @@ type BundleEnvelope struct {
 	Recipients map[string][]byte // kid (thumbprint) → wrapped
 }
 
-// ParseBundleEnvelope parses a sealed bundle's envelope line; ok is false
-// if the line isn't one (a plain bundle's header, say).
+// ParseBundleEnvelope parses a sealed bundle's envelope line, without its
+// 0x0A; ok is false if the line isn't one (a plain bundle's header, say).
+// The envelope must be canonical JSON (§G.5.1.1, §3.1).
 func ParseBundleEnvelope(line []byte) (env *BundleEnvelope, ok bool, err error) {
 	v, perr := jsonv.Parse(line)
 	m, isObj := v.(map[string]any)
@@ -291,6 +296,9 @@ func ParseBundleEnvelope(line []byte) (env *BundleEnvelope, ok bool, err error) 
 	}
 	fail := func(msg string) (*BundleEnvelope, bool, error) {
 		return nil, true, &BundleError{Line: 1, Msg: "sealed bundle envelope: " + msg}
+	}
+	if !bytes.Equal(jsonv.Canonical(v), line) {
+		return fail("not canonical JSON (§3.1), or not followed by exactly one 0x0A (§G.5.1.1)")
 	}
 	for k := range m {
 		if k != "sealedBundle" && k != "id" && k != "recipients" {
@@ -368,8 +376,11 @@ func OpenBundleMax(r io.Reader, identity *ecdh.PrivateKey, maxLine int) (io.Read
 	br := bufio.NewReaderSize(r, 1<<16)
 	first, err := readBundleLine(br, lineBound(maxLine))
 	if err != nil {
+		var be *BundleError
 		if err == io.EOF {
 			return nil, &BundleError{Line: 1, Msg: "empty bundle"}
+		} else if errors.As(err, &be) {
+			be.Line = 1
 		}
 		return nil, err
 	}
@@ -417,10 +428,14 @@ func (r *bundleReader) next() error {
 		}
 		return io.EOF
 	}
+	line := r.n + 2 // file line: the envelope is line 1
 	if rerr != nil {
+		var be *BundleError
+		if errors.As(rerr, &be) && be.Line == 0 {
+			be.Line = line
+		}
 		return rerr
 	}
-	line := r.n + 2 // file line: the envelope is line 1
 	fail := func(msg string) error { return &BundleError{Line: line, Msg: "sealed bundle: " + msg} }
 	if r.last {
 		return fail("a line follows the last one")
@@ -445,8 +460,13 @@ func (r *bundleReader) next() error {
 	if err != nil || h == nil || h["alg"] != AlgDir || h["enc"] != EncA256GCM {
 		return fail("the protected header must be alg dir, enc A256GCM")
 	}
+	if !bytes.Equal(jsonv.Canonical(hv), raw) {
+		return fail("the protected header is not canonical JSON (§3.1)")
+	}
+	// Only alg, enc and pl: last beside pl, as written before v0.73, is
+	// another member (§G.5.1.1, v0.74).
 	for k := range h {
-		if k != "alg" && k != "enc" && k != "pl" && k != "last" {
+		if k != "alg" && k != "enc" && k != "pl" {
 			return fail(fmt.Sprintf("unsupported header member %q", k))
 		}
 	}
@@ -465,17 +485,9 @@ func (r *bundleReader) next() error {
 	if n, ok := pl["line"].(float64); !ok || n != float64(r.n) {
 		return fail(fmt.Sprintf("line %v out of order, want %d", pl["line"], r.n))
 	}
-	// last is in pl (§G.5.1.1); sealed bundles written before v0.73 put it
-	// beside pl, which is still read.
 	if l, has := pl["last"]; has {
 		if l != true {
 			return fail("pl.last must be true if present")
-		}
-		r.last = true
-	}
-	if l, has := h["last"]; has {
-		if l != true {
-			return fail("last must be true if present")
 		}
 		r.last = true
 	}
@@ -491,29 +503,42 @@ func (r *bundleReader) next() error {
 	return nil
 }
 
-// readBundleLine reads the next non-blank line of a sealed bundle, without
-// its line end; one longer than max bytes is refused, unless max is -1.
+// readBundleLine reads the next line of a sealed bundle, without its
+// 0x0A; io.EOF when nothing is left. A sealed bundle is framed strictly
+// (§G.5.1.1): each line is followed by exactly one 0x0A, so a blank line,
+// a 0x0D (a CRLF line end) or a last line without its 0x0A is refused. A
+// line longer than max bytes is refused, unless max is -1.
 func readBundleLine(br *bufio.Reader, max int) ([]byte, error) {
+	var line []byte
 	for {
-		var line []byte
-		for {
-			chunk, isPrefix, err := br.ReadLine()
-			if err != nil {
-				if err == io.EOF && len(line) > 0 {
-					break
-				}
-				return nil, err
-			}
-			line = append(line, chunk...)
-			if max >= 0 && len(line) > max {
-				return nil, &BundleError{Msg: fmt.Sprintf("sealed bundle: a line is too long (more than %d bytes)", max)}
-			}
-			if !isPrefix {
-				break
-			}
+		chunk, err := br.ReadSlice('\n')
+		line = append(line, chunk...)
+		n := len(line)
+		if err == nil {
+			n--
 		}
-		if len(bytes.TrimSpace(line)) > 0 {
-			return line, nil
+		if max >= 0 && n > max {
+			return nil, &BundleError{Msg: fmt.Sprintf("sealed bundle: a line is too long (more than %d bytes)", max)}
 		}
+		switch {
+		case err == nil:
+		case err == bufio.ErrBufferFull:
+			continue
+		case err == io.EOF && len(line) == 0:
+			return nil, io.EOF
+		case err == io.EOF:
+			return nil, &BundleError{Msg: "sealed bundle: the last line doesn't end in 0x0A (truncated?); every line is followed by one (§G.5.1.1)"}
+		default:
+			return nil, err
+		}
+		break
 	}
+	line = line[:len(line)-1]
+	if len(line) == 0 {
+		return nil, &BundleError{Msg: "sealed bundle: a blank line; every line is followed by exactly one 0x0A (§G.5.1.1)"}
+	}
+	if bytes.IndexByte(line, '\r') >= 0 {
+		return nil, &BundleError{Msg: "sealed bundle: a 0x0D in a line (a CRLF line end?); every line is followed by exactly one 0x0A (§G.5.1.1)"}
+	}
+	return line, nil
 }

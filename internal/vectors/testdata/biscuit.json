@@ -179,6 +179,20 @@
       "verdict": "401"
     },
     {
+      "name": "a narrowing block signed over the version 0 payload",
+      "rule": "only Biscuit's version 1 payload",
+      "token": "EpcCCqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAWgaUHLoFLrXYHs2MaIetUEXWGK0SK3h0v5xBRUsBNE2qQ14tB8LGmoIYtimpZPta1sYSQLSXob_gozBFMAKwBCgBGp0BCjMKI3siY2FuIjpbInJlYWQiXSwidmlhIjoic3ZjOnJlYWRlciJ9GAMiCgoICIAIEgMYgggSJAgAEiAXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk_1RpAcA3tGSSm6ajG_NROGP6AFsVAKl3cr85rtTGGkGEuLIYZx_xGlNa3SHvsSTqPbayA-5_XuAMkQx0BprCDi6z8CCIiCiBgYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-fw==",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
+      "name": "the authority block signed over the version 0 payload",
+      "rule": "only Biscuit's version 1 payload",
+      "token": "EpUCCqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAR390ES6m124CT6-KfW2uw4Dz91xj3lHTZ2wiGCUREGUqs3kk7wCcinN8DPoiBXLEX7PoVBedXK_PoFGVIzKGACIiCiBAQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eXw==",
+      "fn": "grant.DecodeLimited",
+      "verdict": "401"
+    },
+    {
       "name": "a signature with S + L (non-canonical S)",
       "rule": "Ed25519 verified strictly, S < L",
       "token": "EpcCCqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAWgaUHLoFLrXYHs2MaIetUEXWGK0SK3h0v5xBRUsBNE2XF1SKISXZ8li1rcyHXtpv1sYSQLSXob_gozBFMAKwFCgBIiIKIEBBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f",

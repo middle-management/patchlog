@@ -59,8 +59,9 @@ func TestV073SealedBundleInSeal(t *testing.T) {
 		if _, err := OpenBundle(bytes.NewReader(b), eve); !errors.Is(err, ErrNotRecipient) {
 			t.Fatalf("pad %v: another identity: %v", pad, err)
 		}
-		// Truncated: the last line is missing.
-		r, err := env.Open(bufio.NewReader(bytes.NewReader(bytes.Join(lines[1:3], []byte("\n")))), alice)
+		// Truncated: the last line is missing (the others each followed by
+		// their 0x0A, which v0.74 requires).
+		r, err := env.Open(bufio.NewReader(bytes.NewReader(append(bytes.Join(lines[1:3], []byte("\n")), '\n'))), alice)
 		if err != nil {
 			t.Fatal(err)
 		}

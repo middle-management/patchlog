@@ -99,7 +99,8 @@ func Bearer(r *http.Request) string {
 //   - a body over BodyMax(grantSize) is 400 bad_input before it is
 //     parsed, since no grant was measured against grantSize yet: a single
 //     grant over it is 413 once decoded (§C.5.2);
-//   - a body together with Authorization is 400 bad_input;
+//   - a body together with Authorization, even an empty one (§C.5.3),
+//     is 400 bad_input;
 //   - a body that isn't application/json, compared as a media type whose
 //     only parameter may be a charset naming UTF-8 (§7.2), is 415
 //     unsupported_type: a cross-site form can send text/plain without a
@@ -121,7 +122,7 @@ func Bearers(r *http.Request, grantSize int) ([]string, *Error) {
 			return []string{b}, nil
 		}
 		return nil, nil
-	case r.Header.Get("Authorization") != "":
+	case len(r.Header.Values("Authorization")) > 0: // even an empty one (§C.5.3)
 		return nil, Refuse(http.StatusBadRequest, "bad_input", "grants in the body take no Authorization (§C.5.2)")
 	}
 	if !jsonv.MediaType(r.Header.Get("Content-Type"), "application/json") {

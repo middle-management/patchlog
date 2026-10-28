@@ -98,22 +98,34 @@ func TestWrappedKeysOpen(t *testing.T) {
 }
 
 // TestSealedBundleRules: each rejected sealed bundle names the rule it
-// breaks, and the cases the spec leaves open are marked informative.
+// breaks. Since v0.74 the strict framing, canonical envelope and last
+// beside pl are rules (§G.5.1.1), so those cases are rejected, not
+// informative.
 func TestSealedBundleRules(t *testing.T) {
 	t.Parallel()
-	open := []string{"last beside pl (before v0.73)", "a blank line between sealed lines", "envelope not canonical"}
+	strict := []string{"last beside pl (as written before v0.73)", "a blank line between sealed lines", "envelope not canonical",
+		"protected header not canonical", "CRLF line ends", "no 0x0A after the last line", "an extra pl member"}
+	seen := map[string]bool{}
 	for _, v := range loadVectors(t, "sealedbundle").Vectors {
 		name := v["name"].(string)
+		seen[name] = true
 		if _, ok := v["because"]; ok {
 			t.Errorf("%s: stores the reference's error text", name)
 		}
+		if _, ok := v["informative"]; ok {
+			t.Errorf("%s: marked informative", name)
+		}
 		rule, _ := v["rule"].(string)
-		informative, _ := v["informative"].(string)
 		switch {
-		case slices.Contains(open, name) && informative == "":
-			t.Errorf("%s: an open question not marked informative", name)
+		case slices.Contains(strict, name) && v["verdict"] != "reject":
+			t.Errorf("%s: not rejected (§G.5.1.1, v0.74)", name)
 		case v["verdict"] == "reject" && !strings.Contains(rule, "§G."):
 			t.Errorf("%s: rejected without the rule of §G.5.1.1 or §G.4.1 it breaks", name)
+		}
+	}
+	for _, name := range strict {
+		if !seen[name] {
+			t.Errorf("no vector %q", name)
 		}
 	}
 }

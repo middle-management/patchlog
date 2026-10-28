@@ -43,10 +43,13 @@
 //     the branch (as for abandoned, below), with nothing after it in the
 //     branch. The rebase tool counts any such batch (§F.5); the janitor
 //     only these, so a successor's writers can't get unmerged work purged.
-//     A purged successor serves no grants (§8.5): the grant is then read
-//     from the successor's base, whose branch entry records its creator's,
-//     or from the branch, and if neither has it the branch is kept for a
-//     manual purge.
+//     A purged successor serves no grants (§8.5): the * key route then
+//     counts only with a grant this janitor read from the successor's
+//     /grants while it was live, before the purge (§F.6, v0.74), which it
+//     keeps across sweeps by successor and grant id, in memory: a branch
+//     frozen with that successor reads them whenever it is checked. If it
+//     didn't, the branch is kept for a manual purge; the grant isn't read
+//     from anywhere else. The merge.authors route needs no grant.
 //   - in both checks, every resource with a head, tombstone or batch entry
 //     of the branch's own up to that source.at has an entry in a batch
 //     that counts there whose source.at is at or after its last such
@@ -74,8 +77,9 @@
 //     holding a * key, and for no one under "grants". An entry without
 //     "grant" at all (the server's own, or one from before v0.37) counts
 //     for no one.
-//   - a branch with no head, tombstone or batch entry of its own counts as
-//     merged.
+//   - a branch with no head, tombstone or batch entry of its own, other
+//     than for resources purged in it (§F.6), counts as merged: a batch
+//     counts only if it has other items.
 //   - at E3, entries for the branch's keyring resource don't count in any
 //     of these, since the keyring is never merged (§F.8.1); a batch counts
 //     only if it has other items. Everything stays plaintext, so the
@@ -86,6 +90,7 @@
 package janitor
 
 import (
+	"container/list"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -97,6 +102,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -164,6 +170,62 @@ type Decision struct {
 type Janitor struct {
 	c   *client.Client
 	opt Options
+
+	// seen holds the stored grants read from a successor's /grants while
+	// it was live, by successor and grant id: once it is purged it serves
+	// none (§8.5), and the * key route of a superseded claim counts only
+	// with one read before the purge (§F.6). It lasts as long as the
+	// Janitor, across sweeps; the janitor has no store to persist it in.
+	// It holds at most seenCap grants, the least recently used dropped
+	// first (order): a grant dropped only keeps a branch for a manual
+	// purge, as one never read does.
+	seenMu  sync.Mutex
+	seen    map[seenKey]*list.Element
+	order   list.List // of seenGrant, most recently used first
+	seenCap int
+}
+
+// maxSeen is the default bound of Janitor.seen.
+const maxSeen = 4096
+
+// seenKey names a grant read from a successor's /grants.
+type seenKey struct{ ns, gid string }
+
+// seenGrant is an entry of Janitor.order.
+type seenGrant struct {
+	k seenKey
+	g *grant.Grant
+}
+
+// remember keeps a grant read from ns's /grants while ns was live.
+func (j *Janitor) remember(ns, gid string, g *grant.Grant) {
+	j.seenMu.Lock()
+	defer j.seenMu.Unlock()
+	k := seenKey{ns, gid}
+	if el, ok := j.seen[k]; ok {
+		el.Value = seenGrant{k, g}
+		j.order.MoveToFront(el)
+		return
+	}
+	if j.seen == nil {
+		j.seen = map[seenKey]*list.Element{}
+	}
+	j.seen[k] = j.order.PushFront(seenGrant{k, g})
+	for j.order.Len() > j.seenCap {
+		delete(j.seen, j.order.Remove(j.order.Back()).(seenGrant).k)
+	}
+}
+
+// recalled returns a grant remembered from ns's /grants, if any.
+func (j *Janitor) recalled(ns, gid string) (*grant.Grant, bool) {
+	j.seenMu.Lock()
+	defer j.seenMu.Unlock()
+	el, ok := j.seen[seenKey{ns, gid}]
+	if !ok {
+		return nil, false
+	}
+	j.order.MoveToFront(el)
+	return el.Value.(seenGrant).g, true
 }
 
 // New returns a janitor.
@@ -174,7 +236,7 @@ func New(c *client.Client, opt Options) *Janitor {
 	if opt.Interval <= 0 {
 		opt.Interval = time.Minute
 	}
-	return &Janitor{c: c, opt: opt}
+	return &Janitor{c: c, opt: opt, seenCap: maxSeen}
 }
 
 // Sweep makes one pass over every base's branch tree, leaves first, and
@@ -369,7 +431,8 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 
 	enc, _ := doc.Value["encryption"].(map[string]any)
 	b := &branch{j: j, base: base, ns: ns, doc: doc.Value, log: log, e2e: enc["level"] == "e2e",
-		docs: map[string]nsAt{ns: {head.ID, doc.Value}}, keyCache: map[string]map[string]nsKey{}}
+		docs: map[string]nsAt{ns: {head.ID, doc.Value}}, keyCache: map[string]map[string]nsKey{},
+		purged: purges(log)}
 	if b.cfgs, err = b.configDocs(ctx); err != nil {
 		return d, err
 	}
@@ -512,6 +575,62 @@ type branch struct {
 	keyCache map[string]map[string]nsKey
 	// grants holds stored grants by id (signedBy).
 	grants map[string]*grant.Grant
+	// purged holds the resources purged in the branch (purges), which
+	// have nothing left to merge (§F.6).
+	purged map[string]bool
+}
+
+// purges lists the resources a branch's log has a purge entry for: purged
+// in the branch, or in a base and propagated (§8.5). A purged name can't
+// be written again.
+func purges(log []client.NSEntry) map[string]bool {
+	out := map[string]bool{}
+	for _, e := range log {
+		if e.Kind == "purge" && e.Resource != "" {
+			out[e.Resource] = true
+		}
+	}
+	return out
+}
+
+// ownDocEntries reports whether the branch has a head, tombstone or batch
+// entry of its own, other than for its keyring at E3 (isDocEntry) and
+// resources purged in it (§F.6).
+func (b *branch) ownDocEntries() bool {
+	for _, e := range b.log {
+		switch e.Kind {
+		case "head", "tombstone":
+			if isDocEntry(e, b.e2e) && !b.purged[e.Resource] {
+				return true
+			}
+		case "batch":
+			if b.ownBatch(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ownBatch reports whether batch entry e is one of the branch's own for
+// §F.6: it has an item for a resource other than one purged in the branch
+// and, at E3, its keyring; or it changes the config (§7.5: items may be
+// empty then), which is work of its own too, unless it has a keyring item
+// at E3, as such a batch counts only if it has other items (an epoch bump
+// goes with its keyring entry, §E.2.1, §E.3.2).
+func (b *branch) ownBatch(e client.NSEntry) bool {
+	config, keyring := len(e.Entries) == 0, false
+	for _, s := range e.Entries {
+		switch {
+		case s.Kind != "head" && s.Kind != "tombstone":
+			config = true
+		case b.e2e && s.Resource == client.KeyringName:
+			keyring = true
+		case !b.purged[s.Resource]:
+			return true
+		}
+	}
+	return config && !keyring
 }
 
 // nsAt is a namespace's head and its document there.
@@ -545,11 +664,12 @@ func (b *branch) current(ctx context.Context, ns string) (map[string]any, error)
 
 // verify checks one claim (§F.6); present is false when the branch
 // doesn't make it. A branch with no head, tombstone or batch entry of its
-// own (its keyring's aside at E3) counts as merged.
+// own (its keyring's aside at E3, and those of resources purged in it)
+// counts as merged.
 func (b *branch) verify(ctx context.Context, claim string, frozeAt time.Time) (present, ok bool, reason string, err error) {
 	switch claim {
 	case "merged":
-		if !hasDocEntries(b.log, -1, b.e2e) {
+		if !b.ownDocEntries() {
 			return true, true, "", nil
 		}
 		if _, has := b.doc["merged"]; !has {
@@ -746,14 +866,8 @@ func (b *branch) closing(ctx context.Context, target string, cov *coverage) (boo
 			}
 		}
 	}
-	purged := map[string]bool{}
-	for _, e := range b.log {
-		if e.Kind == "purge" {
-			purged[e.Resource] = true
-		}
-	}
 	for _, name := range slices.Sorted(maps.Keys(last)) {
-		if purged[name] {
+		if b.purged[name] {
 			continue
 		}
 		if i, ok := cov.at[name]; ok && i >= last[name] {
@@ -875,8 +989,9 @@ func (b *branch) baseChain(ctx context.Context) ([]string, error) {
 //     whose source.at is in the branch's chain, and whose recorded grant
 //     has a root sub and kid in the base's current merge.authors or
 //     chains to a current * key of the branch (starKey, which reads the
-//     grant from the successor, or once it is purged from its base or the
-//     branch), with nothing after that source.at in the branch. One
+//     grant from the successor, or once it is purged takes the one this
+//     janitor read from it before the purge, §F.6), with nothing after
+//     that source.at in the branch. One
 //     recording "grant": null counts while the deployment runs with
 //     authentication disabled (§1).
 //     The rebase tool counts any such batch as an earlier merge (§F.5),
@@ -965,10 +1080,9 @@ func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time
 		case e.Grant == nil:
 			return false, "", nil
 		}
-		// The successor's base records its creator's grant, the rebase
-		// tool's, and the branch the grant of a switch (§F.5), should the
-		// successor be purged since.
-		return b.starKey(ctx, e, succ, sbase, b.ns)
+		// Once the successor is purged, only a grant read from it before
+		// the purge counts (§F.6, signedBy).
+		return b.starKey(ctx, e, succ)
 	}
 	return b.covered(ctx, succ, entries, trusted, "a principal in the base's merge.authors or under a current * key of the branch", disabled)
 }
@@ -1163,11 +1277,10 @@ func (b *branch) revoked(ctx context.Context, ns string) (map[string]bool, error
 // is rotated, no longer counts: the grant doesn't verify under it, just
 // as it no longer works anywhere (§C.4). For an entry written in another
 // namespace, in (a successor), the kid must also name the same key, alg
-// and pub, among those in accepts now; alt are other namespaces whose
-// entries may record the same grant, read if in no longer serves it. why
-// says what failed. An entry without a grant, such as one written while
-// authentication was disabled, is the caller's to judge.
-func (b *branch) starKey(ctx context.Context, e client.NSEntry, in string, alt ...string) (ok bool, why string, err error) {
+// and pub, among those in accepts now. why says what failed. An entry
+// without a grant, such as one written while authentication was disabled,
+// is the caller's to judge.
+func (b *branch) starKey(ctx context.Context, e client.NSEntry, in string) (ok bool, why string, err error) {
 	if e.Grant == nil || e.Grant.Kid == "" {
 		return false, "it records no key", nil
 	}
@@ -1199,43 +1312,39 @@ func (b *branch) starKey(ctx context.Context, e client.NSEntry, in string, alt .
 			return false, fmt.Sprintf("key %q of %s isn't the branch's * key of that name", kid, in), nil
 		}
 	}
-	return b.signedBy(ctx, e, kid, k, append([]string{in}, alt...))
+	return b.signedBy(ctx, e, kid, k, in)
 }
 
 // signedBy reports whether the grant an entry records was signed by k,
 // the key kid names now (§C.3.1): the stored grant, as GET
 // /ns/{ns}/grants/{gid} serves it, has the entry's grant id and root kid,
-// and its signature chain verifies under k's pub. It is read from the
-// first namespace of from, the one the entry was written in, that serves
-// it. Where that one is a successor purged since, which answers 410 for
-// its grants (§8.5), the others may serve the same grant, as the id and
-// signature are checked whoever serves it; if none does, it can't be
-// checked, and the branch is kept for a manual purge.
-func (b *branch) signedBy(ctx context.Context, e client.NSEntry, kid string, k nsKey, from []string) (ok bool, why string, err error) {
+// and its signature chain verifies under k's pub. It is read from in, the
+// namespace the entry was written in, and kept where in is a successor
+// (Janitor.remember). Where in is a successor purged since, which answers
+// 410 for its grants (§8.5), only a grant this janitor read from it before
+// the purge counts (§F.6): none is read from anywhere else, and without
+// one the branch is kept for a manual purge.
+func (b *branch) signedBy(ctx context.Context, e client.NSEntry, kid string, k nsKey, in string) (ok bool, why string, err error) {
 	gid := e.Grant.ID
 	g, ok := b.grants[gid]
 	if !ok {
-		var doc *client.GrantDoc
-		src, purged := "", false
-		for i, ns := range from {
-			doc, err = b.j.c.Grant(ctx, ns, gid)
-			if i == 0 {
-				purged = client.IsPurged(err)
-			}
-			if src = ns; !client.IsNotFound(err) && !client.IsPurged(err) {
-				break
-			}
-		}
+		doc, err := b.j.c.Grant(ctx, in, gid)
 		switch {
-		case purged && (client.IsNotFound(err) || client.IsPurged(err)):
-			return false, fmt.Sprintf("its grant %s can't be read since %s was purged (§8.5), so its key can't be checked: verify by hand", gid, from[0]), nil
-		case client.IsNotFound(err) || client.IsPurged(err):
-			return false, fmt.Sprintf("its grant %s isn't served by %s (§C.3.1), so its key can't be checked", gid, from[0]), nil
+		case client.IsPurged(err):
+			if g, ok = b.j.recalled(in, gid); !ok {
+				return false, fmt.Sprintf("its grant %s can't be read since %s was purged (§8.5), and the janitor didn't read it before the purge, so its key can't be checked: verify by hand", gid, in), nil
+			}
+		case client.IsNotFound(err):
+			return false, fmt.Sprintf("its grant %s isn't served by %s (§C.3.1), so its key can't be checked", gid, in), nil
 		case err != nil:
-			return false, "", fmt.Errorf("janitor: grant %s of %s: %w", gid, src, err)
-		}
-		if g, err = parseGrantDoc(doc); err != nil {
-			return false, fmt.Sprintf("its grant %s as %s serves it is malformed: %v", gid, src, err), nil
+			return false, "", fmt.Errorf("janitor: grant %s of %s: %w", gid, in, err)
+		default:
+			if g, err = parseGrantDoc(doc); err != nil {
+				return false, fmt.Sprintf("its grant %s as %s serves it is malformed: %v", gid, in, err), nil
+			}
+			if in != b.ns {
+				b.j.remember(in, gid, g)
+			}
 		}
 		if b.grants == nil {
 			b.grants = map[string]*grant.Grant{}

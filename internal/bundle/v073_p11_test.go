@@ -131,8 +131,8 @@ func sealedProtected(t *testing.T, line []byte) map[string]any {
 }
 
 // A sealed bundle's last line says so in pl, { bundle, line, last: true }
-// (§G.5.1.1, MF-60); one with last beside pl, as written before v0.73,
-// still reads.
+// (§G.5.1.1, MF-60); one with last beside pl, as written before v0.73, is
+// rejected since v0.74.
 func TestV073SealedBundleLastInPL(t *testing.T) {
 	t.Parallel()
 	plain := writtenBundle(t)
@@ -176,11 +176,14 @@ func TestV073SealedBundleLastInPL(t *testing.T) {
 		}
 		return h
 	}
-	// The form written before v0.73.
+	// The form written before v0.73, last beside pl: since v0.74 another
+	// header member, rejected (§G.5.1.1).
 	legacy := with(sealLine(t, key, hdr(map[string]any{"bundle": bid, "line": last - 1}, map[string]any{"last": true}), pt))
 	r, _, err = bundle.Unseal(bytes.NewReader(legacy), id)
-	noErr(t, err)
-	if s, err := bundle.Verify(r); err != nil || s.Digest != must(bundle.Verify(bytes.NewReader(plain))).Digest {
+	if err == nil {
+		_, err = bundle.Verify(r)
+	}
+	if err == nil || !errors.Is(err, bundle.ErrInvalid) || !strings.Contains(err.Error(), "unsupported header member") {
 		t.Fatalf("legacy last: %v", err)
 	}
 	for name, c := range map[string]struct {
