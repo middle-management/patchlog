@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -37,13 +38,9 @@ var validNS = client.ValidNSName
 // doesn't tell which private namespaces exist and are indexed.
 const minElsewhere = "min names a namespace the service does not follow or the reader can't see"
 
-// strictMins reads §A.5 literally on a query of one namespace (F-I1): its
-// checkpoint covers that namespace alone, so a min naming any other is
-// 400, as one naming a namespace the current checkpoint doesn't cover. Off,
-// as until the question is answered: the v0.51 behaviour stays, and such a
-// min, naming a namespace the service follows and the reader may see, is
-// waited for and then redirected to the current checkpoint.
-const strictMins = false
+// minOther is the 400 for a min naming another namespace on a query of
+// one (§A.5): that query's checkpoint covers its namespace alone.
+const minOther = "min names a namespace other than the one queried"
 
 // Handler returns the query API (§A.4):
 //
@@ -317,9 +314,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// to a reader who passes it, the 400 lists every other min refused
 		// too, so that one 400 names every min refused (§A.5).
 		if err == nil {
-			if refused, _, err := ix.judgeMins(ctx, r, ns, q.Mins, strictMins); err == nil {
-				bad = bad.With(vals["min"], refused, minElsewhere)
-			}
+			bad = bad.With(vals["min"], judgeMins(ns, q.Mins), minOther)
 		}
 		writeMinErr(w, bad)
 		return
@@ -419,24 +414,31 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			return
 		}
 	}
-	refused, behind, err := ix.judgeMins(ctx, r, ns, q.Mins, strictMins)
-	switch {
-	case err != nil:
-		ix.opt.Logf("index: access check for a min: %v", err)
-		w.Header().Set("Cache-Control", "no-store")
-		writeErr(w, http.StatusBadGateway, "upstream", "cannot read the namespace configuration")
-		return
-	case len(refused) > 0:
-		writeMinRefused(w, refused)
-		return
-	case behind:
-		writeBehind(w, "the index cannot obtain the keys of a namespace min names yet")
+	if refused := judgeMins(ns, q.Mins); len(refused) > 0 {
+		writeMinErr(w, &MinError{Msg: minOther, Refused: refused})
 		return
 	}
 	// target is the canonical URL of this query's result at an ns_id (§A.5):
 	// what redirects name, what results are kept under, and in a sealed or
 	// e2e namespace the view a result is bound to (§E.2.6).
-	target := func(id string) string { return base(a, ns) + "/at/" + id + derived.CanonicalQuery(vals, "min") }
+	targetOf := func(v url.Values, id string) string {
+		return base(a, ns) + "/at/" + id + derived.CanonicalQuery(v, "min")
+	}
+	target := func(id string) string { return targetOf(vals, id) }
+	// elsewhere is the query a redirect to another at sends (§A.4): an
+	// after naming a resource is kept, applied to the new result, and an
+	// opaque one, a position in this at's result, is dropped, starting
+	// again.
+	elsewhere := func() (url.Values, *Query) {
+		if q.ByName() || !vals.Has("after") {
+			return vals, q
+		}
+		ev := maps.Clone(vals)
+		delete(ev, "after")
+		eq := *q
+		eq.After = 0
+		return ev, &eq
+	}
 	if !ix.waitMins(ctx, q.Mins) {
 		writeBehind(w, "the index has not reached min yet")
 		return
@@ -499,20 +501,26 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// resolved as redirect, as §A.4 shows; §A.5), with the result
 		// computed there and kept, so the redirect is answered even if the
 		// checkpoint moves on before it is followed. If it can't be
-		// computed, the at URL says why.
+		// computed, the at URL says why. From an at URL to another at, an
+		// opaque after is dropped (elsewhere); the head pointer names no
+		// at, and passes the query on whole.
+		rv, rq := vals, q
+		if isAt && at != cur {
+			rv, rq = elsewhere()
+		}
 		to := cur
-		if _, _, ok := ix.kept.Get(target(cur)); !ok {
+		if _, _, ok := ix.kept.Get(targetOf(rv, cur)); !ok {
 			if info, _, err := ix.keys.Current(ctx, ns); err == nil {
 				var fe *FieldError
-				if _, got, err := ix.answer(ctx, a, ns, vals, q, info); err == nil {
+				if _, got, err := ix.answer(ctx, a, ns, rv, rq, info); err == nil {
 					to = got
-				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) {
+				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) && !errors.Is(err, errLackCounts) {
 					ix.opt.Logf("index: query %s: %v", r.URL, err)
 				}
 			}
 		}
 		setPtrHeaders()
-		redirect(w, target(to))
+		redirect(w, targetOf(rv, to))
 		return
 	}
 	if !canonical {
@@ -543,7 +551,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	case errors.As(err, &fe):
 		writeErr(w, http.StatusBadRequest, "bad_input", fe.Error())
 		return
-	case errors.Is(err, errCounts) || errors.Is(err, errEpochCounts):
+	case errors.Is(err, errCounts) || errors.Is(err, errEpochCounts) || errors.Is(err, errLackCounts):
 		writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
 		return
 	case errors.Is(err, errEpochKey):
@@ -560,9 +568,16 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	}
 	if got != at {
 		// The checkpoint moved between the check and the read transaction;
-		// the result is kept at the new one.
+		// the result is kept at the new one, or, with an opaque after,
+		// computed there afresh without it (elsewhere).
+		rv, rq := elsewhere()
+		if len(rv) != len(vals) {
+			if _, g, err := ix.answer(ctx, a, ns, rv, rq, info); err == nil {
+				got = g
+			}
+		}
 		setPtrHeaders()
-		redirect(w, target(got))
+		redirect(w, targetOf(rv, got))
 		return
 	}
 	ix.writeStored(w, r, a, at, st)
@@ -579,9 +594,31 @@ var errCounts = errors.New("counts over a sealed namespace are served only seale
 // only sealed whole.
 var errEpochCounts = errors.New("counts over documents served under several epochs can't be sealed whole under one epoch's key, and are served only sealed whole (§E.2.6)")
 
+// errLackCounts refuses counts over documents served under an epoch whose
+// key the service's grant gets none of (400, §E.2.6): such hits are served
+// by name only, per entry, and counts are served only sealed whole.
+var errLackCounts = errors.New("counts over documents served under an epoch the index gets no key for can't be sealed whole, and are served only sealed whole (§E.2.6)")
+
 // errEpochKey is a key of an epoch a hit's document is served under, which
 // seals it (§E.2.6), that the service can't obtain for now: 503 behind.
 var errEpochKey = errors.New("the index cannot obtain the key of an epoch a hit is served under")
+
+// lacksKey reports whether err, from fetching the key of an epoch, leaves
+// the service lacking that key as its grant and keys are configured
+// (§A.4, §E.2.6): /keys answered a 4xx other than 429, or gave no key for
+// the epoch (ErrNoKeys) or none the service can unwrap (seal.ErrDecrypt)
+// or will take (ErrUntrustedKey, §E.3.2). Any other failure, the reader's
+// request ending while the key is read among them, is for now. So is any
+// failure once ctx is done, which may be why it failed.
+func lacksKey(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	if ae, ok := client.AsAPIError(err); ok {
+		return ae.Status >= 400 && ae.Status < 500 && ae.Status != 429
+	}
+	return errors.Is(err, client.ErrNoKeys) || errors.Is(err, seal.ErrDecrypt) || errors.Is(err, client.ErrUntrustedKey)
+}
 
 // answer runs q at the current checkpoint in one read transaction, builds
 // its result, sealed in a sealed or e2e namespace, keeps it (and stores a
@@ -602,21 +639,34 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	if perEntry && len(q.Counts) > 0 {
 		return derived.Stored{}, "", errCounts
 	}
+	// An epoch whose key the service's grant gets none of, for good (a 4xx
+	// from /keys, no key for it, one it can't unwrap: lacksKey), leaves the
+	// hits served under it by name only, in a result sealed per entry
+	// (§E.2.6), kept so; one it can't get for now is behind.
 	keys := map[int]derived.Key{}
-	keyAt := func(epoch int) (derived.Key, error) {
+	lacking := map[int]bool{}
+	keyAt := func(epoch int) (k derived.Key, lacks bool, err error) {
 		if epoch <= 0 {
 			epoch = info.Epoch
 		}
 		if k, ok := keys[epoch]; ok {
-			return k, nil
+			return k, false, nil
 		}
-		k, err := ix.keys.KeyAt(ctx, ns, epoch)
-		if err != nil {
+		if lacking[epoch] {
+			return k, true, nil
+		}
+		k, err = ix.keys.KeyAt(ctx, ns, epoch)
+		switch {
+		case lacksKey(ctx, err):
+			ix.opt.Logf("index: key of %s epoch %d, for good: %v (its hits by name only)", ns, epoch, err)
+			lacking[epoch] = true
+			return k, true, nil
+		case err != nil:
 			ix.opt.Logf("index: key of %s epoch %d: %v", ns, epoch, err)
-			return k, fmt.Errorf("%w (%s#%d)", errEpochKey, ns, epoch)
+			return k, false, fmt.Errorf("%w (%s#%d)", errEpochKey, ns, epoch)
 		}
 		keys[epoch] = k
-		return k, nil
+		return k, false, nil
 	}
 	var allow func(string) bool
 	if !a.all {
@@ -647,6 +697,17 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 			whole = info.Epoch
 			for e := range epochs {
 				whole = e
+			}
+			// One epoch whose key the service lacks: per entry, by name
+			// only, as for several epochs.
+			_, lacks, err := keyAt(whole)
+			switch {
+			case err != nil:
+				return derived.Stored{}, "", err
+			case lacks && len(q.Counts) > 0:
+				return derived.Stored{}, "", errLackCounts
+			case lacks:
+				perEntry = true
 			}
 		}
 	}
@@ -688,9 +749,14 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 					values[k] = v
 				}
 			}
-			key, err := keyAt(h.epoch)
+			key, lacks, err := keyAt(h.epoch)
 			if err != nil {
 				return derived.Stored{}, "", err
+			}
+			if lacks {
+				m = map[string]any{"resource": m["resource"], "id": m["id"], "url": m["url"]}
+				hits = append(hits, m)
+				continue
 			}
 			jwe, err := derived.SealItem(key, view, h.Resource, values)
 			if err != nil {
@@ -714,7 +780,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	}
 	st := derived.Stored{JSON: true, Tags: resultTags(ns, res)}
 	if info.Protected() && !perEntry {
-		key, err := keyAt(whole)
+		key, _, err := keyAt(whole) // found above
 		if err != nil {
 			return derived.Stored{}, "", err
 		}
@@ -728,6 +794,10 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	}
 	if err != nil {
 		return derived.Stored{}, "", fmt.Errorf("encoding a result: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		// The reader went away: keep nothing built meanwhile.
+		return derived.Stored{}, "", err
 	}
 	if info.Protected() {
 		if st, err = ix.sealed.Put(ctx, view.Target, ns, at, st); err != nil {
@@ -872,54 +942,23 @@ func (ix *Index) atIncludes(ctx context.Context, ns, at string, mins []MinRef, u
 }
 
 // judgeMins judges the mins of a query of ns (a bare one names ns, and is
-// set to) before any is waited for (§A.5). A min naming another namespace,
-// which this URL's at doesn't cover, goes to the current checkpoint once
-// reached (atIncludes judges only ns), in one hop, if the service follows
-// it and the reader may see it; with strict, or naming any other, it is
-// refused. refused lists every refused min as given, so the 400 names them
-// all, with one message whatever the reason, as in /_refs, so a min
-// doesn't tell which private namespaces are indexed. A namespace whose keys
-// the service lacks is one it doesn't follow (§A.4): no checkpoint will
-// cover it. One whose keys it can't fetch for now is behind (§12.1), as a
-// query of it is, and as /_refs answers it: the reader may see it, so a
-// 400 would have its tool drop a min it can still wait for. err is a
-// namespace document the service can't read (502).
-func (ix *Index) judgeMins(ctx context.Context, r *http.Request, ns string, mins []MinRef, strict bool) (refused []string, behind bool, err error) {
+// set to) before any is waited for (§A.5): this URL's checkpoint covers ns
+// alone, so a min naming any other namespace is refused, whether the
+// service follows it, the reader may see it, it is purged or its keys
+// can't be had, before any of that is looked at (§A.4, Open 84). refused
+// lists every refused min as given, so the 400 names them all. The
+// purged-namespace exemption is /_refs' and tree listings' only.
+func judgeMins(ns string, mins []MinRef) (refused []string) {
 	for i, m := range mins {
-		switch {
-		case m.NS == "":
+		switch m.NS {
+		case "":
 			mins[i].NS = ns
-			continue
-		case m.NS == ns:
-			continue
-		case strict || !ix.known(m.NS):
+		case ns:
+		default:
 			refused = append(refused, m.String())
-			continue
-		}
-		reason, lacks := ix.keys.Skip(m.NS)
-		if lacks {
-			refused = append(refused, m.String())
-			continue
-		}
-		_, err := ix.access(ctx, m.NS, r)
-		if client.IsPurged(err) {
-			// A purged sealed namespace's document is 410 (§8.5): the core
-			// makes the read check, as for ns, and a reader who passes goes
-			// to the current checkpoint, which has reached the purge.
-			_, err = ix.checker.PurgedRead(ctx, m.NS, bearer(r))
-			reason = ""
-		}
-		var ae *grant.AuthError
-		switch {
-		case errors.As(err, &ae):
-			refused = append(refused, m.String())
-		case err != nil:
-			return nil, false, fmt.Errorf("%s: %w", m.NS, err)
-		case reason != "":
-			behind = true
 		}
 	}
-	return refused, behind, nil
+	return refused
 }
 
 // waitMins waits, within one MinWait budget, until every min is reached.

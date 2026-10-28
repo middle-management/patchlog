@@ -362,8 +362,8 @@ func TestV073BranchesOfPurgedNamespace(t *testing.T) {
 	// Without unrestricted read, the read check answers first, as for a
 	// namespace that isn't purged.
 	limited := e.grant(f.issuer, "user:l", []string{"sec"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
-	if r := e.get("/ns/sec/branches", limited); r.Code != 404 {
-		t.Errorf("limited reader: %d %s, want the read check's 404", r.Code, r.Body)
+	if r := e.get("/ns/sec/branches", limited); r.Code != 403 {
+		t.Errorf("limited reader: %d %s, want the read check's 403 (v0.74)", r.Code, r.Body)
 	}
 	// A public namespace's 410 is cached long.
 	p := newEnv(t)

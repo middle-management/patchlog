@@ -430,8 +430,12 @@ func (s *Service) atTrust(at, cur string) []trustTime {
 			}
 		}
 	} else {
+		// The current at leaves out the namespaces the service holds as
+		// purged (combinedAt, §B.5).
 		for ns := range s.g.Trust {
-			nss = append(nss, ns)
+			if !s.purgedLocked(ns) {
+				nss = append(nss, ns)
+			}
 		}
 	}
 	sort.Strings(nss)

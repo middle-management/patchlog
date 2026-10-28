@@ -73,8 +73,8 @@ func TestV073BlobPutHeaders(t *testing.T) {
 
 // GB-58 (BBD-25): an upload or copy takes no precondition; one sent is
 // 428 precondition_required at check 4, after authorisation, purges and
-// a frozen namespace, and for a copy after its source checks (§7.2, §7.8,
-// §12.1).
+// a frozen namespace, and for a copy before its bid and source checks
+// (§7.2, §7.8, §12.1).
 func TestV073BlobPutPrecondition(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, withBlobTuning)
@@ -94,14 +94,16 @@ func TestV073BlobPutPrecondition(t *testing.T) {
 		t.Fatalf("stats %+v: a refused upload stored a pending entry", s)
 	}
 
-	// A copy: the source checks, then 428.
+	// A copy: 428 before the bid and source checks (v0.74, §7.8 Copying).
 	expect(t, e.putBlobAs("p", "a", bid, "text/plain", "", data), 201)
 	e.create("p", "a", map[string]any{"b": ref(bid, "text/plain", len(data), "")})
 	from := [2]string{"Blob-From", path}
 	expectCode(t, e.putBlobHdr(blobPath("p", "c", bid), "", "", [][2]string{from, {"If-None-Match", "*"}}), 428, "precondition_required")
-	expectCode(t, e.putBlobHdr(blobPath("p", "c", bid), "", "", [][2]string{{"Blob-From", blobPath("p", "none", bid)}, {"If-None-Match", "*"}}), 404, "not_found")
+	expectCode(t, e.putBlobHdr(blobPath("p", "c", bid), "", "", [][2]string{{"Blob-From", blobPath("p", "none", bid)}, {"If-None-Match", "*"}}), 428, "precondition_required")
+	expectCode(t, e.putBlobHdr(blobPath("p", "c", bid), "", "", [][2]string{{"Blob-From", blobPath("p", "none", bid)}}), 404, "not_found")
 	other := blobID("text/plain", "", []byte("other"))
-	expectCode(t, e.putBlobHdr(blobPath("p", "c", other), "", "", [][2]string{from, {"If-None-Match", "*"}}), 422, "blob")
+	expectCode(t, e.putBlobHdr(blobPath("p", "c", other), "", "", [][2]string{from, {"If-None-Match", "*"}}), 428, "precondition_required")
+	expectCode(t, e.putBlobHdr(blobPath("p", "c", other), "", "", [][2]string{from}), 422, "blob")
 	// Without one it copies.
 	expect(t, e.putBlobHdr(blobPath("p", "c", bid), "", "", [][2]string{from}), 201)
 

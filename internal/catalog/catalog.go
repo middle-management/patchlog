@@ -122,7 +122,8 @@ type Options struct {
 	// MergeKey signs merge grants (§F.8), and nothing else; MergeKid is
 	// its id in the catalog namespace. MergeService is the merge
 	// service's sub: merge grants are issued only to it, and name it as
-	// their root sub. Without MergeKey, POST /merge-grants is refused.
+	// their root sub. Without MergeKey, POST /merge-grants is 404
+	// not_offered (§F.8).
 	MergeKey     ed25519.PrivateKey
 	MergeKid     string
 	MergeService string
@@ -772,17 +773,24 @@ func Subjects(v *grant.Verified) map[string]bool {
 // who is a caller as the catalog's keys see it (§B.11.2 Through the key):
 // its subject set, and the sub a key's sub scope is matched against. For
 // POST /grants that is the grant's root sub, which the signed grant
-// carries; for a listing it is the subject set's user: subject, and a set
-// without one (hasSub false) fails every sub scope (§B.11.5).
+// carries, if it starts with "user:"; for a listing it is the subject
+// set's user: subject. A caller without one (hasSub false) fails every
+// sub scope (§B.11.4, §B.11.5).
 type who struct {
 	subs   map[string]bool
 	sub    string
 	hasSub bool
 }
 
-// callerOf is the caller of a verified grant.
+// callerOf is the caller of a verified grant. A key's sub scope matches
+// only a sub that starts with "user:" (§B.11.4 Through the key): a
+// svc:bot or other root sub fails every sub scope, whatever its pattern.
 func callerOf(v *grant.Verified) who {
-	return who{subs: Subjects(v), sub: v.Principal.ID, hasSub: true}
+	w := who{subs: Subjects(v)}
+	if u := UserSubject(v.Principal.ID); u != "" {
+		w.sub, w.hasSub = u, true
+	}
+	return w
 }
 
 // whoOf is a subject set's caller (§B.11.5), and the groups among its

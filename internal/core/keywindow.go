@@ -24,9 +24,10 @@ package core
 //     which a read would fix it now. The check doesn't store that sealing:
 //     the request that next reads the content does.
 //
-// With authentication disabled every request gets every epoch's K_e, as
-// far as historyEpochs allows, as /keys gives them. The check draws no
-// exchangeRate token: no keys are handed out.
+// With authentication disabled every request gets K_e of the current
+// epoch only, as /keys gives it: a request is judged as a grant without
+// nbf (§E.2.3). The check draws no exchangeRate token: no keys are handed
+// out.
 
 // keysOpen reports whether any of creds gets from n's /keys (§E.2.3) a key
 // opening resource name's content sealed under one of epochs.

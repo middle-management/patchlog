@@ -521,6 +521,8 @@ func TestVectorSealedBundles(t *testing.T) {
 			case "top-last":
 				delete(p, "last")
 				h["last"] = true
+			case "pl-extra":
+				p["x"] = extra[i+1]
 			}
 		}
 		return h
@@ -530,21 +532,28 @@ func TestVectorSealedBundles(t *testing.T) {
 	// Each case a reader must reject names the rule of §G.5.1.1 (or of
 	// §G.4.1, which the decrypted bundle is checked by) that it breaks,
 	// and why is a fragment of the reference's error, checked here only:
-	// error text isn't vector content. The informative cases are ones the
-	// spec leaves open; the file records what the reference does, and the
-	// test asserts nothing of them.
+	// error text isn't vector content. Since v0.74 no case is left open:
+	// the framing, the envelope's and protected headers' canonical form and
+	// last beside pl, informative before, are rejection rules.
 	const (
 		inOrder   = "line numbers are 0, 1, 2… in order (§G.5.1.1)"
 		saysLast  = "a line says last (§G.5.1.1)"
 		decrypts  = "every line decrypts under K_b (§G.5.1.1)"
 		canonical = "the decrypted bundle is checked as in §G.4.1: every line is canonical JSON"
+		framed    = "each line is followed by one 0x0A, and no other line, a blank one included (§G.5.1.1)"
+		members   = "the protected header, pl included, has no other members (§G.5.1.1)"
 	)
+	// A line whose protected header is the canonical one with pl's members
+	// reordered: the same members, not canonical JSON.
+	reordered := func() string {
+		raw := `{"alg":"dir","enc":"A256GCM","pl":{"line":1,"last":true,"bundle":"` + env.ID + `"}}`
+		return sealLineRaw(t, kb, raw, []byte(entry)) + "\n"
+	}()
 	vs := []any{}
 	for _, c := range []struct {
 		name, sealed string
 		stored       bool   // the bundle is stored, not computed
 		rule, why    string // the rule a rejected case breaks; a fragment of the reference's error
-		informative  string // the spec leaves the verdict open
 	}{
 		{name: "sealed bundle", sealed: string(base), stored: true},
 		{name: "sealed bundle, padded lines", sealed: string(src["sealed bundle, padded lines"]), stored: true},
@@ -558,12 +567,13 @@ func TestVectorSealedBundles(t *testing.T) {
 		{name: "no line says last", sealed: lines[0] + lines[1] + line(pl(1, false), entry), rule: saysLast, why: "no line says last"},
 		{name: "plaintext line not canonical", sealed: lines[0] + lines[1] + line(pl(1, true), strings.Replace(entry, `"views":0`, `"views":0.0`, 1)), rule: canonical, why: "not canonical"},
 		{name: "plaintext line blank", sealed: lines[0] + lines[1] + line(pl(1, false), "") + line(pl(2, true), entry), rule: canonical, why: "blank line"},
-		{name: "last beside pl (before v0.73)", sealed: lines[0] + line(pl(0, false), header) + line(pl(1, false, "top-last", ""), entry),
-			informative: "the reference still reads last beside pl, as written before v0.73; §G.5.1.1 doesn't say whether a reader must"},
-		{name: "a blank line between sealed lines", sealed: lines[0] + lines[1] + "\n" + lines[2],
-			informative: "the reference skips a blank line; open question: may a JWE line be followed by anything but one LF?"},
-		{name: "envelope not canonical", sealed: strings.Replace(lines[0], `{"id":`, `{ "id":`, 1) + lines[1] + lines[2],
-			informative: "the reference accepts it; open question: must the envelope line be canonical?"},
+		{name: "last beside pl (as written before v0.73)", sealed: lines[0] + line(pl(0, false), header) + line(pl(1, false, "top-last", ""), entry), rule: members, why: "unsupported header member"},
+		{name: "an extra pl member", sealed: lines[0] + lines[1] + line(pl(1, true, "pl-extra", "1"), entry), rule: members, why: "pl must be"},
+		{name: "protected header not canonical", sealed: lines[0] + lines[1] + reordered, rule: "the protected header is canonical JSON (§G.5.1.1)", why: "not canonical"},
+		{name: "a blank line between sealed lines", sealed: lines[0] + lines[1] + "\n" + lines[2], rule: framed, why: "blank line"},
+		{name: "CRLF line ends", sealed: strings.ReplaceAll(string(base), "\n", "\r\n"), rule: framed, why: "0x0D"},
+		{name: "no 0x0A after the last line", sealed: strings.TrimSuffix(string(base), "\n"), rule: framed, why: "doesn't end in 0x0A"},
+		{name: "envelope not canonical", sealed: strings.Replace(lines[0], `{"id":`, `{ "id":`, 1) + lines[1] + lines[2], rule: "the envelope is canonical JSON (§G.5.1.1)", why: "not canonical"},
 	} {
 		v := obj{{Key: "name", Value: c.name}}
 		if c.stored {
@@ -572,11 +582,8 @@ func TestVectorSealedBundles(t *testing.T) {
 			v = append(v, golden.Member{Key: "fn", Value: "built from the sealed bundle's lines (opened by seal.OpenBundle, read by bundle.NewReader)"})
 		}
 		v = append(v, golden.Member{Key: "sealed", Value: c.sealed})
-		switch {
-		case c.rule != "":
+		if c.rule != "" {
 			v = append(v, golden.Member{Key: "rule", Value: c.rule})
-		case c.informative != "":
-			v = append(v, golden.Member{Key: "informative", Value: c.informative})
 		}
 		plain, digest, err := openSealed([]byte(c.sealed), recipient)
 		if err != nil {
@@ -602,7 +609,7 @@ func TestVectorSealedBundles(t *testing.T) {
 	}
 	golden.Check(t, "sealedbundle", obj{
 		{Key: "section", Value: "§G.5.1.1"},
-		{Key: "about", Value: "sealed bundles to the recipient seq(0x20) (keywrap.json): the envelope line, then each bundle line as a JWE under K_b with pl {bundle, line, last?}; the digest is the plain bundle's (§G.4.1). The stored bundles were drawn under a fixed seed and are decrypt vectors; the rejection cases reuse their envelope and lines, or seal a line under the same K_b with the IV seq(0xc0)[:12]; each rejected case names the rule it breaks, and the informative ones, which the spec leaves open, give the reference's verdict only"},
+		{Key: "about", Value: "sealed bundles to the recipient seq(0x20) (keywrap.json): the envelope line, then each bundle line as a JWE under K_b with pl {bundle, line, last?}; the digest is the plain bundle's (§G.4.1). The stored bundles were drawn under a fixed seed and are decrypt vectors; the rejection cases reuse their envelope and lines, or seal a line under the same K_b with the IV seq(0xc0)[:12]; each rejected case names the rule it breaks"},
 		{Key: "recipient_private", Value: golden.Hex(recipient.Bytes())},
 		{Key: "K_b", Value: golden.Hex(kb)},
 		{Key: "vectors", Value: vs},
@@ -655,6 +662,21 @@ func sealLine(t *testing.T, kb []byte, hdr map[string]any, pt []byte) string {
 	}
 	gcm, _ := cipher.NewGCM(block)
 	protected := b64u.EncodeToString(jsonv.Canonical(hdr))
+	ct := gcm.Seal(nil, fixedIV, pt, []byte(protected))
+	n := len(ct) - gcm.Overhead()
+	return protected + ".." + b64u.EncodeToString(fixedIV) + "." + b64u.EncodeToString(ct[:n]) + "." + b64u.EncodeToString(ct[n:])
+}
+
+// sealLineRaw is sealLine with the protected header given as its bytes,
+// canonical or not.
+func sealLineRaw(t *testing.T, kb []byte, raw string, pt []byte) string {
+	t.Helper()
+	block, err := aes.NewCipher(kb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcm, _ := cipher.NewGCM(block)
+	protected := b64u.EncodeToString([]byte(raw))
 	ct := gcm.Seal(nil, fixedIV, pt, []byte(protected))
 	n := len(ct) - gcm.Overhead()
 	return protected + ".." + b64u.EncodeToString(fixedIV) + "." + b64u.EncodeToString(ct[:n]) + "." + b64u.EncodeToString(ct[n:])

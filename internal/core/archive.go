@@ -461,12 +461,14 @@ func (e *Engine) ArchiveReader(ctx context.Context, ns, name string) func(r io.R
 			return openArchive(br, dek)
 		}
 		// The first line decides: a sealed bundle's envelope, or a plain
-		// bundle's header, passed through as it is.
+		// bundle's header, passed through as it is. The envelope is
+		// followed by exactly one 0x0A, nothing else (§G.5.1.1): only that
+		// is taken off, as bundle import does (bundle.Unseal).
 		first, err := br.ReadBytes('\n')
 		if err != nil && err != io.EOF {
 			return nil, err
 		}
-		env, ok, err := seal.ParseBundleEnvelope(bytes.TrimSpace(first))
+		env, ok, err := seal.ParseBundleEnvelope(bytes.TrimSuffix(first, []byte("\n")))
 		if err != nil {
 			return nil, err
 		}

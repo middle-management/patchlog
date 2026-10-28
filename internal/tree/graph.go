@@ -92,6 +92,11 @@ type Node struct {
 	// it (an implicit placement whose item is in a sealed or e2e
 	// namespace, §B.9): it isn't asked for again until the chain changes.
 	BornUnknown bool
+	// BornEpoch is the epoch the first revision of an explicit node's
+	// document is served under in a sealed or e2e catalog (derived.EpochOf
+	// of its log's kid), which born is sealed under apart from the node's
+	// other values where it isn't Epoch (§E.2.6); 0 where not known.
+	BornEpoch int
 
 	// Derived by analyze.
 	State      int    // StateLive or StateDangling

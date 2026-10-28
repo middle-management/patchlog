@@ -1,5 +1,224 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.74**. `GET /` answers `"spec": "0.74"`. The upgrade was done in five
+packages: core keys, epochs, E3 gate checks and grant answers; core remote branches, reads, live
+streams, gestures and blob copies; schema compilation and the search index; the tree and catalog
+services; and grant tokens, the edge exchange header, sealed bundles and vectors, the janitor, the
+WebDAV gateway, bundle imports and merge releases. The one schema change is the tree service's
+migration `005_nodes_born_epoch`; the core's and the index's schemas are unchanged (the index
+rebuilds its tables from the logs once, below). Where the spec leaves a question open, the
+reference implements the reading noted here.
+
+**Changes to check before upgrading:**
+- **No key from before a raise from `sealed` without `nbf`.** After a raise from sealed to e2e,
+  `POST /ns/{ns}/keys` gives the epochs before the raise only within the §E.2.3 window judged
+  against the namespace's current epoch and current namespace document (Addendum E Levels): a
+  grant without `nbf` gets none of them, and the current `historyEpochs` caps the rest. Copies, a
+  batch's local source and schema resolution of content from before the raise take only what
+  those keys open. A reader or writer that needs content from before the raise (an E3 fold that
+  starts before it, say) needs a grant with an `nbf` reaching back. A remote branch whose
+  endpoint grant has no `nbf` gets no pre-raise keys from its source, and creating one over
+  sealed history from before the raise is then `422`.
+- **With authentication disabled, `/keys` gives the current epoch alone** (§E.2.3), and the
+  server's own key checks take the same: no earlier epoch, and none from before a raise. A
+  `serve -dev` server's playground, and the index, tree and derived services reading it without
+  grants, can no longer open sealed content of earlier epochs after a rotation. An index or tree
+  service that already holds such content keeps it, and serves the hits it can't seal by name only
+  (below). One that reads the namespace afresh (a new service, `-rebuild`, or the index's one-time
+  rebuild below) can't read those documents: it leaves them out of its results, and of the
+  catalog's tree, and indexes and lists the rest. Upgrading an auth-disabled deployment whose
+  sealed namespaces were rotated therefore drops their earlier epochs' documents from the index;
+  a service grant with an `nbf` reaching back keeps them. Such a service no longer stops at the
+  namespace's genesis document, sealed under epoch 1: the namespace document at the head stands
+  in for it (§E.2.3, §E.2.6, §A.4).
+- **A branch's `/keys` relays its bases' entries for at most that base's `historyEpochs` at
+  `at`** before its epoch there (§E.2.3 At E3). The keys a base had before a raise from sealed
+  follow that base-epoch rule alone (Addendum E Levels, Branches of a raised base), not the raised
+  namespace's own window, so a base that lowers `historyEpochs` or rotates after the branch's
+  `at` doesn't withhold them from the branch; blob copies, a batch's local source and schema
+  resolution through the branch give the same epochs as its `/keys`.
+- **A verified grant that may not read is `403`, not `404`,** at `/ns/{ns}` and every URL under
+  it (the gestures listing included) and at `POST /ns/{ns}/keys`, a public namespace's included,
+  and at E3 `/keys` for a grant whose rules refuse every read (§7, §C.2, §E.2.3). A grant whose
+  read is limited to some resources gets `403` on `/ns/…` URLs too. Only a resource's own URLs
+  keep the `404` that hides it; unauthenticated callers keep `401`, and a purged namespace's
+  `410` still comes after the read check.
+- **Every schema compiles under v0.74, whatever version stored it** (§6.1, §6.2 step 5, §6.6). A
+  stored schema revision that only an earlier version accepted (a format outside 2020-12 such as
+  `semver` or `period`, a `\x{D800}`-style pattern, a root `$id` equal to its own path, a nested
+  dialect `$schema`) is now an invalid schema, and a write pinning it is `422 invalid`: stored
+  legacy schemas may now refuse writes. Formats are asserted as they are now (`idn-*` below). The
+  `revisions.rules` marker and the `X-Schema-Rules` header are kept as metadata only, so remote
+  branches still mirror them and nothing is migrated. At E3 the client re-validates folded
+  revisions under current rules, so revisions typed by such a schema, or whose verdict changed,
+  are flagged, and a document's valid head can move back to an earlier revision; a schema
+  document that itself names `semver`/`period`, carries its own `$id` or a nested `$schema` is
+  flagged the same way (pending a spec ruling on invariant Valid). Stored rule fragments keep
+  their present compile.
+- **`idn-hostname` and `idn-email` follow RFC 5890** (IDNA2008 registration) without UTS 46
+  mapping, with RFC 5892's CONTEXTO rules (MIDDLE DOT, GREEK KERAIA, HEBREW GERESH/GERSHAYIM,
+  KATAKANA MIDDLE DOT, Arabic-Indic digit sets) for U-labels and for A-labels once decoded (§6.2
+  step 5). An uppercase or fullwidth letter in a U-label (`Bücher.example`) is `422`; an all-ASCII
+  host name in any case (`EXAMPLE.com`) still passes.
+- **Sealed bundles are framed strictly** (§G.5.1.1). Readers reject a non-canonical envelope,
+  blank lines, CRLF line ends, a last line without its 0x0A, a non-canonical protected header, and
+  one with members other than `alg`, `enc` and `pl`, so `last` beside `pl`: sealed bundles
+  exported by v0.22.0 and earlier no longer import. A server-read encrypted archive's envelope
+  line is framed as strictly.
+- **Bearer tokens signed over Biscuit's version 0 payload are `401`** (§C.8, CONFORMANCE Grant
+  scope 52); stored grants from before still verify. Tokens made by biscuit-go v2.2.0, which signs
+  version 0, no longer verify as bearers.
+- **Under `grants`, a retry no longer matches an entry recorded without a grant**, even by its
+  author (§7.2): resource writes, batches, config writes, branch creation and remote
+  registrations retried after enabling authentication are `412`.
+- **E3 sealed ops and prune snapshots need a canonical protected header** with only `alg`,
+  `enc`, `kid` and `pl` (§E.3.1, §E.2.2): any other is `422 invalid`. The Go client and the
+  playground already write such headers.
+- **An empty `Authorization` counts as present** (§C.5.2, §C.5.3, §B.11.5): `POST /edge-grants`
+  and the services' exchanges answer a body with one `400` (before, `415`), and edge cookies,
+  the origin's and the catalog's and index's own, count only on a read without any
+  `Authorization` field.
+- **Gestures listing:** an `after` not of the form `{resource}/{id}` is `400 bad_input`, before
+  the namespace lookup (so ahead of a private namespace's `401`/`403`); one naming an entry of a
+  purged resource is `404` (§7.4, §6.2).
+- **Blob copies:** a sent precondition is `428`, after the copy's `400`s and before the
+  different-bid `422` and the source check's `404` (§7.8 Copying).
+- **A purged namespace's events and long-polls from its `purge-ns` entry** (`since` or
+  `Last-Event-ID`) answer `410 purged` with `head` instead of an empty stream or `204` (§8.5).
+  The immutable `/rev/{id}/log` range is unchanged.
+- **Remote branches follow a raise to `e2e` to `sealed`:** a remote branch whose source is raised
+  to `e2e` raises itself and its dependents, leaves first, to `sealed`, as far as Levels allow,
+  and is marked for a rebase (§G.5.2). `502 upstream` is reserved for a server lacking the level
+  (no key store, or a key store that has gone) (§1). A raise the server could make but whose
+  config writes fail for another reason is recorded for a rebase and retried on start and at every
+  sync, and meanwhile the branch holds what it had at `at` rather than serve it below the source's level
+  (Addendum E Levels Invariant): reads and writes of those resources other than purges answer
+  `503 encryption_unavailable` with `Retry-After`. `/heads` rows of resources answering `502` or
+  so held leave out `created`, `size` and `digest`, at the remote branch and at branches reading
+  through it (§7.4).
+- **Remote branches v0.23 left below `sealed` are raised on the first start.** v0.23 followed a
+  source's raise to `e2e` only as far as the source's level before it, so a remote branch of a
+  source raised from `none` to `e2e` stayed at `none`, recorded for a rebase, and served its
+  content in the clear. On a server with a key store, the first start raises such a branch and its
+  dependents, leaves first, to `sealed` before anything is served (§G.5.2, Addendum E Levels), as
+  it does any raise recorded but not yet made: from then on that content is served only sealed,
+  and readers without keys to it lose access to content they could read before. A raise that still
+  fails holds the content, `503 encryption_unavailable`, until a later sync makes it (above).
+- **Remote branches take the start times of a source's epochs before its `e2e` raise only from
+  `base.origin` itself** (§G.5.2), never from a mirror the endpoint may be. A `-remote-url` other
+  than the origin now counts as a possible intermediary; set `-remote-origin-url ORIGIN=URL`
+  (below) where the origin itself answers at another address. When the origin can't be read, an
+  E3 remote branch still holds the source's keys of those epochs, mirrors its sealings verbatim
+  and serves that content as the source does, but hands none of the keys out until a later sync
+  reads their start times from the origin.
+- **Search index:** on a query of one namespace, a `min` naming any other namespace is `400` with
+  the body's `min` listing it (before, a readable followed one was waited for and redirected, a
+  purged one redirected, and one skipped for keys was `503`) (§A.5). The index database format
+  goes to 2, so existing indexes rebuild from the logs on start (with authentication disabled,
+  without documents of a rotated sealed namespace's earlier epochs, above).
+- **Catalog service:** without a merge key, `POST /merge-grants` is `404 not_offered`, whoever
+  asks (§F.8); a key's `sub` scope matches only a caller sub starting with `user:`, so `svc:` and
+  other subs fail every `sub` scope (§B.11.4 Through the key); item requests other than Place
+  answer `403` first for an item in a namespace the catalog doesn't trust, before `410 purged`,
+  `/read-grants` items too (§B.11.4).
+- **Tree service:** in a sealed or e2e catalog, a node's `born` whose first revision is served
+  under another epoch than its head is sealed apart in place as `"born": {"sealed": JWE}` under
+  that epoch's `K_r`, and left out when that key can't be had; such a listing is no longer sealed
+  whole (§E.2.6). The epoch is stored in `nodes.born_epoch` (migration 005) and backfilled on
+  start, nodes edited while the backfill runs included. The WebDAV gateway decodes such entries.
+- **Merge service:** every catalog batch of an end-to-end catalog goes under
+  `ReleaseOptions.AdminGrant`, which must be a catalog-admins member's grant (its root `groups`),
+  narrowed with the merge service's `via`; without one it is `ErrAdminNeeded`. Unplaces and
+  narrowing moves were refused as not offered before (§F.8).
+- **Janitor:** once a successor is purged, a superseded claim counts through a branch `*` key
+  only with a grant the janitor read from the successor's `/grants` before the purge; it no
+  longer reads it from the successor's base or the old branch, so such branches are kept for a
+  manual decision (§F.6, §8.5). `patchlog janitor` keeps the grants it read while it runs, at
+  most 4096, least recently used dropped first, and only successors'.
+
+**New:**
+- `patchlog serve -remote-origin-url ORIGIN=URL` (`RemoteEndpoint.OriginURL`) says where the
+  deployment at `ORIGIN` itself answers, for example the internal address given with
+  `-remote-url` (§G.5.2).
+- E3 remote branches of a source raised from `sealed` mirror the source's sealings of pre-raise
+  revisions, log entries and blobs byte for byte, each checked against the mirrored content and
+  keeping its epoch, also for content of deeper bases in `base.chain` (§G.5.2). A sealing whose
+  epoch key the branch lacks is sealed by the branch itself, as before.
+- An E3 prune at a horizon from before a raise from sealed first stores that document's sealing
+  if none is stored (for a tombstone, the last live document's), and `/rev/{H}` keeps serving
+  those bytes (Addendum E Levels).
+- `POST /edge-grants` accepts block and key rules that refer to `/resource` in other forms when
+  the grant fixes `/resource`, and runs them for every fixed name, so one name they refuse is
+  `403` (§C.5.2).
+- Search index: a hit served under an epoch whose key the index's grant gets none of, for good
+  (`/keys` answering a `4xx` other than `429`, no key for that epoch, or a key it can't unwrap or
+  won't take from an untrusted sender), is served by name only (`resource`, `id`, `url`, plus `ns`
+  on `/_refs`), where it used to be `503`. Such a result is sealed per entry and `counts` over it
+  are `400`. Any other key failure, a reader disconnecting while the key is read included, is
+  still `503 behind`, and a result built after the request ended is never kept or stored
+  (§E.2.6, §A.4).
+- Search index: a schema revision answering any `4xx` other than `429` (a `401` to the service's
+  own grant included) leaves the document indexed as untyped instead of retrying forever (§A.1);
+  values are collected through `dependentSchemas` whatever members the document holds (§A.2,
+  §A.4); a redirect from an `at` URL to another `at` drops an opaque `after` (a `q` or `sort`
+  position) and keeps one naming a resource (§A.4).
+- Catalog service: `POST /grants` answers `parents` (the node's parents as decided) for every
+  Move, admins' included, and for every Unplace or folder delete, beside `head` (§B.11.4
+  checkpoint). A purged item's read check and Restore judge "a role that makes it visible" as
+  listings do, with role and key-scope rules evaluated for the item (a rule on `/now` never
+  counts), and with the grant's own subjects, `user:{sub}` always among them, so a role held in a
+  deleted item's frozen rows through a since-removed `user:` entry still counts (§B.11.2,
+  §B.11.4, §B.11.5).
+- Tree service: in a subject set's listings, a visible node with no visible parent is a root,
+  including one whose parents are all gone, dangling or cyclic; `roots` lists it and its paths
+  end at it. Unfiltered listings keep §B.5's roots and orphans (§B.11.5). Purged namespaces leave
+  the combined checkpoint `at`, listings' `ns:{ns}` tags, the coverage of problems and orphans,
+  and `g/all` trust timing (§B.5).
+- WebDAV gateway: a user's own entries are judged by the key their kid named when they were
+  written, from the namespace's config history, so entries written before a kid was given to
+  another key no longer count as the new holder's own (§H.7). The history is read once per
+  gateway and namespace and shared with another token only after that token has read one log
+  entry, showing it may read the namespace log; tokens that can't still use the current mapping.
+- WebDAV gateway: a save over a deleted file whose last revision the gateway can't read (sealed)
+  is `409`, naming the new path where the head gives it, never a new file (§H.4, §H.6).
+- Bundle import: a partial import treats the upstream of a held snapshot document as nonced where
+  the target requires nonces (§G.4.4).
+- Vectors: `re2.json` gains I.11's `\ud83dA` row, and the `\x{D800}` refusal is no longer marked
+  informative. `sealedbundle.json`'s three informative cases are now rejections, with new
+  rejections for an extra `pl` member, a non-canonical protected header, CRLF line ends and a
+  missing final 0x0A. `biscuit.json` gains two refused version-0 tokens (Addendum I.11, I.14,
+  §G.5.1.1).
+
+**Fixes:**
+- Janitor: a branch whose only own entries are for resources purged in it counts as merged
+  (§F.6, MRG-4), while a batch carrying a config change (config and no items, §7.5, or config
+  with items only for resources purged later) still counts as the branch's own work, at E3 too,
+  so such a branch is never purged as merged with that change unmerged; at E3 an epoch bump
+  (config and keyring) with nothing else still doesn't count (§F.6).
+- References (§6.5): the static x-ref walk reads a stored schema revision as the version that
+  stored it accepted it (a format outside 2020-12, a root `$id` equal to its own path, a nested
+  dialect `$schema`, a pattern only raw RE2 accepts), so bundle export, import and rename and the
+  index's `/_refs` keep finding the references of documents typed by such schemas, though writes
+  pinning them are now `422`.
+- Encrypted archives: the server reads an archive's sealed-bundle envelope line as strictly as
+  bundle import does, taking off only its 0x0A (§G.5.1.1); before, surrounding spaces or a CRLF
+  were trimmed and such an archive restored.
+- Pre-raise blobs (Addendum E Levels, §7.8): a remote branch of an e2e branch of a base raised
+  from sealed serves a blob a pre-raise revision references as the source does, `…/blob/{bid}`
+  redirecting to its epoch and `…/e/{e}` the source's sealing; before, the shadow of the
+  branch, which has no raise of its own, ended the search, so the epoch URL was `404` and
+  `…/blob/{bid}` served the plaintext. Its resource logs page as the source's too (§7.1
+  Paging): the first page ends before the raise, its entries sealed as the source serves them;
+  before, one page spanned the raise and served the entries from before it in the clear.
+- Follower: a namespace purged between the head a follower reads when it starts and its check
+  for a purge at that head (the `/heads` 410, §8.5) is delivered from the log up to its `purge-ns`
+  entry, the freeze before it applied and reported as `Frozen`; before, a synthetic `purge-ns`
+  unit at the 410's head skipped those entries, so `WithOnState` never reported the freeze. A
+  purge's state now reports `Frozen` too (only a frozen namespace is purged, §8.5), including a
+  sealed one whose freeze is `410` with the rest of its log.
+
 ## v0.23.0
 
 Implements spec **v0.73**, the whole upgrade from v0.55. v0.56 folds in the reference's notes

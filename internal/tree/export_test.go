@@ -40,3 +40,10 @@ func (s *Service) QueuedRepurges() [][]string {
 	}
 	return out
 }
+
+// EpochsPending reports whether the epochs backfill (meta "epochs") is
+// still to run (tests).
+func (s *Service) EpochsPending() bool {
+	var v string
+	return s.db.QueryRow(`SELECT v FROM meta WHERE k = 'epochs'`).Scan(&v) == nil
+}

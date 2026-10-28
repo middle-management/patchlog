@@ -294,11 +294,17 @@ func (st *reqState) tombLast(ctx context.Context, ns, name string, h *client.Hea
 			return nil, err
 		}
 	}
-	// Successors aren't trusted where the gateway can't read them
-	// (sealed, F-H11).
+	// A last revision the gateway can't read (served sealed, F-H11) may
+	// have $successor: there is no exception for sealed namespaces (§H.4,
+	// §H.6, v0.74), so a save never makes a new file over it. A successor
+	// the head names is named; otherwise the save is 409 all the same.
 	sealed := last != nil && last.sealed
-	if !st.moving && !sealed {
-		if err := movedAway(ns, name, h, last); err != nil {
+	if !st.moving {
+		err := movedAway(ns, name, h, last)
+		if err == nil && sealed {
+			err = fail(http.StatusConflict, "%s/%s was deleted, and its last revision can't be read here (sealed, §H.7) to find out whether it moved (§8.1): no save recreates it at its old name (§H.4, §H.6); save under another name", ns, name)
+		}
+		if err != nil {
 			if theirs {
 				st.refuse(ns, name)
 			}
@@ -310,7 +316,7 @@ func (st *reqState) tombLast(ctx context.Context, ns, name string, h *client.Hea
 		st.refuse(ns, name)
 		return nil, fail(http.StatusConflict, "%s/%s was deleted by someone else since you opened it (§11.3, §H.4): your save isn't written over the delete; reload it (it reads as gone), and save it again to make it anew", ns, name)
 	case sealed:
-		// A new file.
+		// A MOVE of a live file to the name (st.moving): a new file.
 		return nil, nil
 	}
 	if !own && mine {

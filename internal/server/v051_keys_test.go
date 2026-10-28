@@ -59,7 +59,7 @@ func TestKeysLimitedWriter(t *testing.T) {
 		expectCode(t, r, 404, "not_offered")
 		// The read check comes first.
 		_, r = e.keysOf(ns, nil, e.grant(k, "user:w", []string{ns}, []string{"append"}))
-		expectCode(t, r, 404, "not_found")
+		expectCode(t, r, 403, "forbidden") // a verified grant without read (§E.2.3, v0.74)
 	}
 
 	// Sealed (E2): per-resource keys, wrapped, with the epoch and pad.
@@ -132,5 +132,5 @@ func TestKeysLimitedWriter(t *testing.T) {
 	expectCode(t, r, 422, "invalid")
 	refuses := map[string]any{"enc": jwk, "rules": []any{map[string]any{"op": "test", "path": "/action", "value": "append"}}}
 	_, r = e.keysOf("x", nil, e.grant(k, "user:w", []string{"x"}, rights, refuses))
-	expectCode(t, r, 404, "not_found")
+	expectCode(t, r, 403, "forbidden") // rules refusing every read (§E.2.3, v0.74)
 }

@@ -218,6 +218,11 @@ type RemoteEndpoint struct {
 	// Identity unwraps the keys of a sealed base (Addendum E.2) that the
 	// base wraps to the grant's enc (§E.2.3, §G.5). Nil: raw keys only.
 	Identity *ecdh.PrivateKey
+	// OriginURL is where the origin itself answers, for what §G.5.2 reads
+	// only through base.origin: the start times of a source's epochs from
+	// before its e2e raise. "": the origin's own URL. A BaseURL that is
+	// neither may be a mirror or other intermediary.
+	OriginURL string
 }
 
 // Purger purges CDN cache tags.
@@ -477,6 +482,10 @@ func Open(opt Options) (*Engine, error) {
 		e.bg.Add(1)
 		go e.repurgeLoop(e.opt.RepurgeInterval)
 	}
+	// Before anything is served: a raise a remote branch recorded but
+	// hasn't made, as one an earlier version left, is made now rather than
+	// at the first sync (catchUpLevels).
+	e.catchUpLevels(context.Background())
 	if e.opt.Remote.FollowInterval > 0 {
 		e.bg.Add(1)
 		go e.remoteLoop(e.opt.Remote.FollowInterval)
@@ -502,7 +511,7 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.73"
+const SpecVersion = "0.74"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a

@@ -302,6 +302,104 @@ func TestRootErrors(t *testing.T) {
 	}
 }
 
+// TestPurgedSinceHead: a follower whose checkpoint is the head it reads
+// when it starts checks for a purge with /heads (§8.5), and the purge may
+// come in between, after a freeze (§8.5, not_frozen): the 410 then names a
+// purge-ns entry past the checkpoint. The entries up to it come from the
+// log, which still serves them, so the freeze is applied and reported as
+// Frozen, the purge-ns entry last, not skipped by a synthetic purge-ns unit
+// at the 410's head (the race behind TestBranchDiscovery's "states"
+// timeouts under load).
+func TestPurgedSinceHead(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"long-poll", "sse"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			testPurgedSinceHead(t, mode)
+		})
+	}
+}
+
+func testPurgedSinceHead(t *testing.T, mode string) {
+	ctx := context.Background()
+	var (
+		c      *client.Client
+		once   sync.Once
+		mu     sync.Mutex
+		purged string
+		perr   error
+	)
+	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond, Wrap: func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/ns/main/rev/") && strings.HasSuffix(r.URL.Path, "/heads") && r.URL.Query().Get("after") != "" {
+				// The follower's check of its checkpoint at the head:
+				// freeze and purge main before it is answered.
+				once.Do(func() {
+					head, err := c.NSHead(ctx, "main")
+					if err == nil {
+						_, err = c.PatchConfig(ctx, "main", head.Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}})
+					}
+					if err == nil {
+						head, err = c.NSHead(ctx, "main")
+					}
+					var id string
+					if err == nil {
+						id, err = c.PurgeNamespace(ctx, "main", head.ID)
+					}
+					mu.Lock()
+					purged, perr = id, err
+					mu.Unlock()
+				})
+			}
+			h.ServeHTTP(w, r)
+		})
+	}})
+	c = s.Client(t, client.WithAuthor("admin"))
+	must(c.CreateNamespace(ctx, "main", map[string]any{"read": "public"}))
+	must(c.CreateDoc(ctx, "main", "a", map[string]any{"n": 0}))
+	at := must(c.NSHead(ctx, "main")).ID
+
+	cp := &follow.MemoryCheckpoints{}
+	cp.Save(clienttest.Origin, "main", at)
+	rec := &recorder{cp: cp}
+	var states []follow.State
+	opts := []follow.Option{follow.WithBackoff(time.Millisecond, 10*time.Millisecond),
+		follow.WithOnState(func(s follow.State) { states = append(states, s) })}
+	if mode == "sse" {
+		opts = append(opts, follow.WithSSE())
+	}
+	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	err := follow.New(c, "main", cp, rec, opts...).Run(rctx)
+	mu.Lock()
+	defer mu.Unlock()
+	if perr != nil {
+		t.Fatalf("purging: %v", perr)
+	}
+	if !errors.Is(err, follow.ErrPurged) {
+		t.Fatalf("Run: %v", err)
+	}
+	if k := rec.kinds("main"); fmt.Sprint(k) != "[config purge-ns]" {
+		t.Fatalf("kinds %v, want the freeze and the purge-ns entry from the log", k)
+	}
+	for _, b := range rec.snapshot() {
+		if b.Snapshot || b.Units[0].Synthetic {
+			t.Fatalf("batch %+v isn't from the log", b)
+		}
+	}
+	if got := must(cp.Load(ctx, clienttest.Origin, "main")); got != purged {
+		t.Errorf("checkpoint %s, want the purge-ns entry %s", got, purged)
+	}
+	var frozen, gone bool
+	for _, s := range states {
+		frozen = frozen || s.NS == "main" && s.Frozen
+		gone = gone || s.NS == "main" && s.Purged
+	}
+	if !frozen || !gone {
+		t.Errorf("states %+v, want frozen and purged", states)
+	}
+}
+
 // TestSnapshotOfPurged: /heads of a purged namespace is 410 purged (§8.5);
 // a consumer starting from a snapshot learns of the purge there (§10), gets
 // the purge-ns entry as from the log, and stops with ErrPurged. The 410

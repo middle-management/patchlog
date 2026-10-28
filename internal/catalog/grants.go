@@ -166,31 +166,39 @@ func (s *Service) purgedIn(g *tree.Graph, cur map[string]string, ns string) erro
 	return e
 }
 
-// purgedAt is purgedIn at the checkpoint the service is at.
-func (s *Service) purgedAt(ns string) (err error) {
-	s.t.View(func(g *tree.Graph, cur map[string]string) { err = s.purgedIn(g, cur, ns) })
-	return err
+// untrustedIn is the 403 for an item of a namespace the catalog doesn't
+// trust, decided at the checkpoint g and cur reflect; nil for a trusted
+// one. Item requests other than Place answer it first, before 410 purged
+// (§B.11.4): of an untrusted namespace's names, purged or not, the
+// service follows nothing. Call it under View.
+func (s *Service) untrustedIn(g *tree.Graph, cur map[string]string, ns string) error {
+	if g.Trust[ns] {
+		return nil
+	}
+	e := untrusted(ns, g.Catalog).(*Error)
+	e.Checkpoint = checkpointAt(g, cur, ns)
+	return e
 }
 
 // contentConfig is content namespace ns's document at the head (the grant
 // checker's copy), whose entry for the catalog's key signs a grant for its
 // items (plan.key). Before it reads the document it answers what the
-// checkpoint alone decides, in order: 410 purged for every name of a
-// namespace the service holds as purged (purgedIn), then 403 for an item
-// of a namespace the catalog doesn't trust (untrusted), whose document the
-// service's own grant needn't read and whose names it doesn't follow
-// (itemIn), so that the answer is a refusal, not a 502 about the service's
-// grant (§B.11.4, §B.11.5). One whose document the core answers 410 purged
-// (a sealed one, §8.5) is 410 purged too, from the core's head (configErr).
+// checkpoint alone decides, in order: 403 for an item of a namespace the
+// catalog doesn't trust (untrustedIn), whose document the service's own
+// grant needn't read and whose names it doesn't follow (itemIn), so that
+// the answer is a refusal, not a 502 about the service's grant, and comes
+// first, before a purge the service may still hold of it (§B.11.4,
+// §B.11.5); then 410 purged for every name of a namespace the service
+// holds as purged (purgedIn). One whose document the core answers 410
+// purged (a sealed one, §8.5) is 410 purged too, from the core's head
+// (configErr).
 func (s *Service) contentConfig(ctx context.Context, ns string) (*grantcheck.Config, error) {
 	var err error
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
-		if err = s.purgedIn(g, cur, ns); err != nil || g.Trust[ns] {
+		if err = s.untrustedIn(g, cur, ns); err != nil {
 			return
 		}
-		e := untrusted(ns, g.Catalog).(*Error)
-		e.Checkpoint = checkpointAt(g, cur, ns)
-		err = e
+		err = s.purgedIn(g, cur, ns)
 	})
 	if err != nil {
 		return nil, err
@@ -437,10 +445,7 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 	// Every item is judged by the visibility test of the subject set the
 	// caller's listings are keyed by (§B.11.5, Resolve).
 	var vis *visibility
-	s.t.View(func(g *tree.Graph, _ map[string]string) {
-		w, groups := whoOf(s.keyedAt(g, v))
-		vis = &visibility{s: s, who: w, groups: groups}
-	})
+	s.t.View(func(g *tree.Graph, _ map[string]string) { vis = s.visibilityOf(g, v) })
 	read := map[string]bool{}
 	out := []any{}
 	for _, item := range items {
@@ -504,7 +509,10 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 
 // decideRead decides a /read-grants item of content namespace ns into e
 // (decideReads), and returns the keys its answer carries. Every name of a
-// purged namespace is 410 purged first (§B.11.4); an item in a public
+// purged namespace the catalog trusts is 410 purged first; one of an
+// untrusted namespace is never 410, but answered as below, 403 if it
+// isn't public (planRead), as item requests answer 403 before 410 there
+// (§B.11.4); an item in a public
 // namespace that isn't sealed is "public": true, with no grant and no
 // check; any other is decided by planRead, and then gets a grant if its
 // namespace is private, or, if it is public, its keys alone where it is
@@ -512,7 +520,13 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 // not K_r, opens its revisions (§E.3.2) and no grant is needed to read
 // them.
 func (s *Service) decideRead(ctx context.Context, v *grant.Verified, vis *visibility, e map[string]any, ns, name, item string, lagOK map[string]bool) ([]keyOf, error) {
-	if err := s.purgedAt(ns); err != nil {
+	var err error
+	s.t.View(func(g *tree.Graph, cur map[string]string) {
+		if g.Trust[ns] {
+			err = s.purgedIn(g, cur, ns)
+		}
+	})
+	if err != nil {
 		return nil, err
 	}
 	public, in := s.exposureAt(ctx, ns)
@@ -853,7 +867,9 @@ func (s *Service) noContentKey(ns string) error {
 // those as of the checkpoint the decision reports (configAt), as for
 // visibility.
 //
-// A create answers, in order (§B.11.4 Create): 410 purged in a purged
+// Every item request answers 403 first for an item of a namespace the
+// catalog doesn't trust (untrustedIn), purged or not (§B.11.4). Then a
+// create answers, in order (§B.11.4 Create): 410 purged in a purged
 // namespace (contentConfig, purgedIn), or in one the core holds as purged
 // before the service applies it (coreHead); 409 for a name that exists or
 // existed, as the checkpoint has it, then as the core's head has it (a
@@ -863,15 +879,16 @@ func (s *Service) noContentKey(ns string) error {
 //
 // Other verbs answer as Restore's list does (§B.11.4): 410 purged; 404
 // for a name that never existed; for a purged item, 403 without a role
-// that counts for read at its placement, computed as for a live item
-// (Effective), and 410 gone otherwise; then 403 when no role is kept, a
+// that makes it visible at its placement (§B.11.5: the role's and the
+// key's scope rules pass for a read of it, itemRoles), computed as for a
+// live item (Effective), and 410 gone otherwise; then 403 when no role is kept, a
 // dangling placement included (§B.11.2), with one message whether the
 // item has a placement or not (noRole).
 //
 // Names are decided only in a namespace the service has a checkpoint of
 // (itemFacts.known), and the service follows only trusted ones: an item of
-// a namespace the catalog doesn't trust is 403 after the 410, before its
-// document is read (contentConfig).
+// a namespace the catalog doesn't trust is 403 before the 410, and before
+// its document is read (contentConfig).
 func (s *Service) planContent(ctx context.Context, v *grant.Verified, item string, want []string) (_ *plan, err error) {
 	for _, w := range want {
 		if !grant.IsVerb(w) {
@@ -913,6 +930,9 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		checkpoint = checkpointAt(g, cur, ns)
+		if err = s.untrustedIn(g, cur, ns); err != nil {
+			return
+		}
 		if err = s.purgedIn(g, cur, ns); err != nil {
 			return
 		}
@@ -932,13 +952,15 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		case f.state == tree.ItemPurged:
 			// Restore's read check, at its placement as for a live item:
 			// a purged item's placement dangles and grants nothing
-			// (§B.11.2), but a caller who could read it learns it was
-			// purged, as the core would tell it (§8.3).
+			// (§B.11.2), but a caller with a role that would make it
+			// visible there learns it was purged, as the core would tell
+			// it (§8.3): judged as listings judge visibility, the role's
+			// and the key's scope rules included (§B.11.5).
 			var at map[string][]string
 			if f.node != nil {
 				at = Effective(g, pl, nil)
 			}
-			if len(counting(cfg, key, rolesIn(at, subs), "read")) == 0 {
+			if vis := s.itemVisibilityOf(v); len(vis.itemRoles(vis.roles(g, ns), at, name)) == 0 {
 				err = noRole(want, item)
 			} else {
 				err = errf(410, "gone", "%s was purged", item)
@@ -1050,14 +1072,16 @@ func (s *Service) contentSigner(latest *grantcheck.Config, checkpoint *map[strin
 // The answers come in this order, so they reveal nothing to callers
 // without read beyond what names and purges already do (§E.4):
 //
-//   - 410 purged for every name of a purged namespace (contentConfig,
-//     purgedIn), and 403 for an item of a namespace the catalog doesn't
-//     trust, of whose names the service knows nothing;
+//   - 403 for an item of a namespace the catalog doesn't trust, of whose
+//     names the service knows nothing, purged or not (untrustedIn), then
+//     410 purged for every name of a purged namespace (contentConfig,
+//     purgedIn);
 //   - 404 for a name that never existed;
-//   - 403 for a caller without a role that counts for read on the item
-//     both at its placement now and, if it is deleted, in its frozen rows
-//     (an item without a placement has no role there), answered as one
-//     without a role kept (noRole);
+//   - 403 for a caller without a role that makes the item visible
+//     (§B.11.5, itemRoles: its own and the key's scope rules passing for
+//     a read of it) both at its placement now and, if it is deleted, in
+//     its frozen rows (an item without a placement has no role there),
+//     answered as one without a role kept (noRole);
 //   - 410 gone for a purged item (§8.3), 409 for a live one;
 //   - 403 for a caller without a role kept, or whose restore would widen:
 //     the roles the item would have after it, from its current
@@ -1084,6 +1108,9 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		checkpoint = checkpointAt(g, cur, ns)
+		if err = s.untrustedIn(g, cur, ns); err != nil {
+			return
+		}
 		if err = s.purgedIn(g, cur, ns); err != nil {
 			return
 		}
@@ -1110,15 +1137,23 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 		if f.node != nil {
 			now = Effective(g, pl, nil)
 		}
-		// The roles at its placement now, and for a deleted item those
-		// in its frozen rows too (§B.11.7).
+		// A role that makes the item visible (§B.11.5), its own and the
+		// key's scope rules passing for a read of it, at its placement
+		// now and, for a deleted item, in its frozen rows too (§B.11.7).
+		vis := s.itemVisibilityOf(v)
+		rr := vis.roles(g, ns)
+		seen := setOf(vis.itemRoles(rr, now, name))
+		if f.state == tree.ItemTombstoned {
+			seen = intersect(seen, setOf(vis.itemRoles(rr, s.frozen[pl], name)))
+		}
+		if len(seen) == 0 {
+			err = noRole(want, item)
+			return
+		}
+		// The roles kept for restore, at both, as the grant has them.
 		both := rolesIn(now, subs)
 		if f.state == tree.ItemTombstoned {
 			both = intersect(both, s.frozenRolesFor(pl, subs))
-		}
-		if len(counting(cfg, key, both, "read")) == 0 {
-			err = noRole(want, item)
-			return
 		}
 		switch f.state {
 		case tree.ItemPurged:
@@ -1181,6 +1216,9 @@ func (s *Service) planRead(ctx context.Context, vis *visibility, item string) (_
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		checkpoint = checkpointAt(g, cur, ns)
+		if err = s.untrustedIn(g, cur, ns); err != nil {
+			return
+		}
 		if err = s.purgedIn(g, cur, ns); err != nil {
 			return
 		}
@@ -1425,15 +1463,49 @@ type organising struct {
 
 // organisingAt is the caller v's organising view at the checkpoint g
 // reflects: for a caller not in catalog-admins, that of the subject set
-// its listings are keyed by (keyedAt), as §B.11.5 judges visibility.
+// its listings are keyed by (visibilityOf), as §B.11.5 judges visibility.
 // Call it under View.
 func (s *Service) organisingAt(g *tree.Graph, v *grant.Verified, admin bool) *organising {
 	o := &organising{g: g, admin: admin, read: map[string]bool{}}
 	if !admin {
-		w, groups := whoOf(s.keyedAt(g, v))
-		o.vis = &visibility{s: s, who: w, groups: groups}
+		o.vis = s.visibilityOf(g, v)
 	}
 	return o
+}
+
+// visibilityOf is the caller v's view of the catalog as §B.11.5 judges
+// visibility, at the checkpoint g reflects: that of the subject set its
+// listings are keyed by (keyedAt), for organising requests and
+// /read-grants, which judge live rows of the current graph. Call it
+// under View.
+func (s *Service) visibilityOf(g *tree.Graph, v *grant.Verified) *visibility {
+	w, groups := whoOf(s.keyedAt(g, v))
+	return &visibility{s: s, who: w, groups: groups}
+}
+
+// itemVisibilityOf is the caller v's view for an item request's
+// visibility answers (§B.11.4: a role that makes the item visible,
+// §B.11.5): that of the grant's own subjects (§B.11.2), user:{sub}
+// always among them, as the roles kept are collected. A deleted item's
+// frozen rows (§B.11.7) may hold a direct entry the current graph no
+// longer names, which keyedAt would drop.
+func (s *Service) itemVisibilityOf(v *grant.Verified) *visibility {
+	subjects := make([]string, 0, len(v.Principal.Groups)+1)
+	for subj := range Subjects(v) {
+		subjects = append(subjects, subj)
+	}
+	sort.Strings(subjects)
+	w, groups := whoOf(subjects)
+	return &visibility{s: s, who: w, groups: groups}
+}
+
+// setOf is xs as a set.
+func setOf(xs []string) map[string]bool {
+	out := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		out[x] = true
+	}
+	return out
 }
 
 // checkpoint is the checkpoint the decision reports (§B.11.4): the
@@ -1899,8 +1971,9 @@ func inPlaceList(doc map[string]any, cat string, subs map[string]bool) bool {
 // parents as decided, which the answer gives as parents (a rule on
 // /patches/0), so it moves the node only from where it was judged: a
 // stale test fails at step 3, a missing or different one the rule. The
-// answer gives the node's head as decided too, and the grant expires
-// within the catalog's maxLag of the decision (§B.11.8).
+// answer gives the node's parents and head as decided, for admins too
+// (§B.11.4 checkpoint), and the grant expires within the catalog's
+// maxLag of the decision (§B.11.8).
 func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, req Request) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	name, ok := tree.Resolve(cat, node)
@@ -1990,8 +2063,11 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 				}
 				return
 			}
-			parents = n.RawParents()
 		}
+		// The answer gives the node's parents as decided for every Move,
+		// an admin's included (§B.11.4 checkpoint); only a non-admin's
+		// grant requires the leading test of them.
+		parents = n.RawParents()
 		head = n.Head
 		// Decided now, at this checkpoint: the grant lives at most the
 		// catalog's maxLag, as of the checkpoint, from here (§B.11.8, §7.4).
@@ -2187,7 +2263,7 @@ func (s *Service) widens(g *tree.Graph, name string, tos []string, incs map[stri
 // non-admin's root or hidden parent (organising.leaves). The grant fixes
 // /doc/parents, the document being deleted, to exactly the parents
 // checked, by href, so the node can't be moved first; the answer gives
-// the node's head as decided.
+// the node's parents and head as decided (§B.11.4 checkpoint).
 func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node string) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	name, ok := tree.Resolve(cat, node)
@@ -2203,6 +2279,7 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 		cp         string
 		checkpoint map[string]string
 		hrefs      []string
+		parents    any
 		head       string
 	)
 	defer func() { err = decidedAt(err, checkpoint) }()
@@ -2233,7 +2310,7 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 				return
 			}
 		}
-		head = n.Head
+		parents, head = n.RawParents(), n.Head
 	})
 	if err != nil {
 		return nil, err
@@ -2243,7 +2320,7 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 		return nil, err
 	}
 	return &plan{ns: cat, resource: name, can: []string{"delete"}, rules: []any{resourceRule(name), parentHrefsRule(hrefs)},
-		cp: cp, checkpoint: checkpoint, key: signer, head: head}, nil
+		cp: cp, checkpoint: checkpoint, key: signer, parents: parents, head: head}, nil
 }
 
 // planRestoreNode answers a request to restore a catalog node, as

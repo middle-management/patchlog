@@ -241,10 +241,12 @@ func TestV073MalformedIDs(t *testing.T) {
 	}
 	// An empty since is genesis; an empty Last-Event-ID is none.
 	expect(t, e.get("/r/pub/a/rev/"+id+"/log?since="), 200)
-	// A gesture listing's after is a cursor: an unknown one is 404.
+	// A gesture listing's after is a cursor: a malformed one is a
+	// request-shape 400 (v0.74, §7.4), a well-formed unknown one 404.
 	d := newEnv(t)
 	d.mkNS("m", map[string]any{"read": "public"})
-	expectCode(t, d.get("/ns/m/gestures/"+strings.Repeat("a", 26)+"?after=nope"), 404, "not_found")
+	expectCode(t, d.get("/ns/m/gestures/"+strings.Repeat("a", 26)+"?after=nope"), 400, "bad_input")
+	expectCode(t, d.get("/ns/m/gestures/"+strings.Repeat("a", 26)+"?after=nope/"+good), 404, "not_found")
 }
 
 // §7.3 (RH-31): a present, non-empty Last-Event-ID wins over since, on

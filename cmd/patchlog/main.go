@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
+//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-origin-url ORIGIN=URL]... [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
@@ -106,7 +106,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-schema-fetch [-schema-fetch-hosts H,H]] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
-                 [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-follow-interval 5m] [-remote-register]
+                 [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-origin-url ORIGIN=URL]... [-remote-follow-interval 5m] [-remote-register]
                  [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
   patchlog version
   patchlog keygen
@@ -173,6 +173,8 @@ func serve(args []string) {
 	var remoteBearers, remoteURLs multi
 	fs.Var(&remoteBearers, "remote-bearer", "ORIGIN=GRANT: grant sent to the deployment at ORIGIN for remote branches (read, and export to register) (repeatable, §G.3)")
 	fs.Var(&remoteURLs, "remote-url", "ORIGIN=URL: reach the deployment at ORIGIN through URL instead (repeatable)")
+	var remoteOriginURLs multi
+	fs.Var(&remoteOriginURLs, "remote-origin-url", "ORIGIN=URL: where the deployment at ORIGIN itself answers, when that isn't ORIGIN, such as the -remote-url of an internal address of it; the start times of a source's epochs from before its e2e raise, whose keys a remote branch hands out, are read only there, never through a -remote-url that is a mirror or other intermediary (repeatable, §G.5.2)")
 	var remoteIDs multi
 	fs.Var(&remoteIDs, "remote-identity", "ORIGIN=FILE: X25519 private key (JWK) unwrapping the keys of sealed bases at ORIGIN, named by the -remote-bearer grant's enc (repeatable, §G.5.2)")
 	remoteFollow := fs.Duration("remote-follow-interval", 5*time.Minute, "how often remote bases' logs are followed: their purges applied and their raises of level followed (§G.3, §G.5.2); 0 disables following")
@@ -207,7 +209,7 @@ func serve(args []string) {
 	if len(edgeGrantKeys) > 0 {
 		log.Printf("edge grants: minted under kid %s, accepted under %s", cookies.Kid(), strings.Join(cookies.Kids(), ", "))
 	}
-	remote, err := remoteOptions(remoteBearers, remoteURLs, remoteIDs)
+	remote, err := remoteOptions(remoteBearers, remoteURLs, remoteIDs, remoteOriginURLs)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -671,9 +673,9 @@ func operatorKeyHistory(flags []string) ([]core.OperatorKeyPeriod, error) {
 }
 
 // remoteOptions builds the endpoints of remote bases from ORIGIN=VALUE flags.
-func remoteOptions(bearers, urls, identities []string) (core.RemoteOptions, error) {
+func remoteOptions(bearers, urls, identities, originURLs []string) (core.RemoteOptions, error) {
 	eps := map[string]core.RemoteEndpoint{}
-	for _, pair := range [][]string{bearers, urls, identities} {
+	for _, pair := range [][]string{bearers, urls, identities, originURLs} {
 		for _, kv := range pair {
 			o, v, ok := strings.Cut(kv, "=")
 			if !ok || !core.ValidRemoteOrigin(o) || v == "" {
@@ -692,6 +694,12 @@ func remoteOptions(bearers, urls, identities []string) (core.RemoteOptions, erro
 		o, v, _ := strings.Cut(kv, "=")
 		ep := eps[o]
 		ep.BaseURL = v
+		eps[o] = ep
+	}
+	for _, kv := range originURLs {
+		o, v, _ := strings.Cut(kv, "=")
+		ep := eps[o]
+		ep.OriginURL = v
 		eps[o] = ep
 	}
 	for _, kv := range identities {

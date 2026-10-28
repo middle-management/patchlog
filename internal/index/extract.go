@@ -31,11 +31,11 @@ func NewSchemaCache(c *client.Client) *SchemaCache {
 }
 
 // Loader returns a schema.Loader for one walk, resolving paths in their
-// own namespaces only. A revision that answers 403, 404 or 410, or that
-// can't be opened for want of keys (unavailable), is schema.ErrUnavailable;
-// any other failure (network, 5xx, 429, and a 401 to the service's own
-// grant) is recorded in *transient so the caller can retry instead of
-// indexing the document without its fields.
+// own namespaces only. A revision that answers a 4xx other than 429, a
+// 401 to the service's own grant included, or that can't be opened for
+// want of keys (unavailable), is schema.ErrUnavailable; any other failure
+// (network, 5xx, 429) is recorded in *transient so the caller can retry
+// instead of indexing the document without its fields (§A.1).
 func (s *SchemaCache) Loader(ctx context.Context, transient *error) schema.Loader {
 	return s.LoaderFor(ctx, "", transient)
 }
@@ -47,10 +47,16 @@ func refused(err error) bool {
 }
 
 // unavailable reports a schema revision that leaves a document indexed as
-// one without $schema (§A.1): refused, or one the service can't open for
-// want of keys (§6.1, §E.2.3), which asking again won't mend. A 401 isn't
-// one: the service's own grant failed to verify, which its operator mends.
-func unavailable(err error) bool { return refused(err) || errors.Is(err, client.ErrNoKeys) }
+// one without $schema (§A.1): one answering a 4xx other than 429, which
+// is final, a 401 to the service's own grant too, or one the service
+// can't open for want of keys (§6.1, §E.2.3), which asking again won't
+// mend. A transport error, a 5xx or a 429 is transient, and retried.
+func unavailable(err error) bool {
+	if ae, ok := client.AsAPIError(err); ok && ae.Status >= 400 && ae.Status < 500 && ae.Status != 429 {
+		return true
+	}
+	return errors.Is(err, client.ErrNoKeys)
+}
 
 // LoaderFor is Loader for a document of namespace ns: if ns is a branch,
 // a path its namespace can't resolve is looked up among that namespace's

@@ -10,9 +10,12 @@ import (
 )
 
 // w4x (raises lens), §G.3, §G.5.2, Addendum E Levels: a remote branch of a
-// source raised from sealed can be created with an endpoint grant without
-// nbf, which the source's /keys gave its only epoch while sealed, and
-// serves the source's content from before the raise.
+// source raised from sealed serves the source's content from before the
+// raise with the keys the source's /keys gives its endpoint grant. Since
+// v0.74 that window is judged against the source's current epoch, so a
+// grant without nbf, which got the source's only epoch while it was
+// sealed, gets none of the epochs before the raise; one whose nbf
+// precedes them does.
 func TestV073W4xRemoteBranchEndpointGrantWithoutNbf(t *testing.T) {
 	t.Parallel()
 	var aPriv ed25519.PrivateKey
@@ -38,17 +41,21 @@ func TestV073W4xRemoteBranchEndpointGrantWithoutNbf(t *testing.T) {
 		t.Fatalf("the source's pre-raise revision: %v %+v", err, h)
 	}
 
-	// B's endpoint grant has enc and B's key pair, and no nbf: the
-	// source's /keys gives it the last epoch before the raise as at E2
-	// (§E.2.3, Addendum E Levels), here m#1, the only one, as it did
-	// while the source was sealed.
+	// Without nbf, the source's /keys at E3 gives none of the epochs
+	// before the raise (§E.2.3, Addendum E Levels, v0.74).
 	bJWK, bID, err := seal.GenerateRecipient()
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, kr1 := a.keysOf("m", nil, a.grant(kA, "svc:b", []string{"m"}, []string{"read", "export"}, map[string]any{"enc": bJWK}))
+	if got := kidsOf(t, kr1); got != "" {
+		t.Fatalf("source /keys at E3 for a no-nbf grant: %q, want none of the epochs before the raise", got)
+	}
+	// B's endpoint grant has enc and B's key pair, and an nbf before m's
+	// first epoch: the source's /keys gives it m#1 as at E2.
 	var mu sync.Mutex
 	id := bID
-	rt := &route{url: a.srv.URL, bearer: a.grant(kA, "svc:b", []string{"m"}, []string{"read", "export"}, map[string]any{"enc": bJWK})}
+	rt := &route{url: a.srv.URL, bearer: a.grant(kA, "svc:b", []string{"m"}, []string{"read", "export"}, map[string]any{"enc": bJWK, "nbf": t0.Add(-time.Hour).Format(time.RFC3339)})}
 	var bPriv ed25519.PrivateKey
 	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt, withRemoteIdentity(&mu, &id)), withKeyStore(newKeyStore(t)), withEncTuning)
 	b.opPriv = bPriv

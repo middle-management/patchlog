@@ -24,9 +24,10 @@ func (g noGranter) MergeGrant(context.Context, string, map[string]any, string) (
 // end-to-end catalog gets no merge grants and no batch check (§F.8), so
 // the merge service submits a batch that needs catalog-admins (a widening
 // move, a $access change, a restored node) under its AdminGrant, narrowed
-// with its via, without asking the catalog service, and refuses any other
-// (ErrNotOffered): no merge grant can be had for it. It judges which is
-// which itself, from the catalog's documents opened with its keys.
+// with its via, without asking the catalog service. Since v0.74 so does
+// it any other batch of an end-to-end catalog (an unplace, a narrowing
+// move), which goes only under a catalog-admins grant, never refused as
+// not offered; without AdminGrant every one is ErrAdminNeeded.
 func TestV073E2ECatalogBatchesUnderAdminGrant(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -90,28 +91,27 @@ func TestV073E2ECatalogBatchesUnderAdminGrant(t *testing.T) {
 		name     string
 		resource string
 		write    func(ns string)
-		admin    bool
 	}{
 		{"a widening move", "matches.derby", func(ns string) {
 			h := headOf(ns, "matches.derby")
 			mustDo(x.AppendSealed(ctx, ns, "matches.derby", h.ID, step(map[string]any{"op": "replace", "path": "/parents", "value": parents("derbies")})))
-		}, true},
+		}},
 		{"a $access change", "season", func(ns string) {
 			h := headOf(ns, "season")
 			mustDo(x.AppendSealed(ctx, ns, "season", h.ID, step(map[string]any{"op": "remove", "path": "/$access/group:fan-club"})))
-		}, true},
+		}},
 		{"a re-placing", "matches.gone", func(ns string) {
 			h := headOf(ns, "matches.gone")
 			mustDo(x.RestoreSealed(ctx, ns, "matches.gone", h.ID, step(map[string]any{"op": "replace", "path": "", "value": map[string]any{"parents": parents("season")}})))
-		}, true},
+		}},
 		{"an unplace", "matches.cup", func(ns string) {
 			h := headOf(ns, "matches.cup")
 			mustDo(c.Delete(ctx, ns, "matches.cup", h.ID))
-		}, false},
+		}},
 		{"a narrowing move", "matches.cup", func(ns string) {
 			h := headOf(ns, "matches.cup")
 			mustDo(x.AppendSealed(ctx, ns, "matches.cup", h.ID, step(map[string]any{"op": "replace", "path": "/parents", "value": parents("root")})))
-		}, false},
+		}},
 	} {
 		br := "cat-r" + string(rune('1'+i))
 		mustDo(c.CreateBranch(ctx, "cat", client.BranchRequest{Name: br}))
@@ -126,19 +126,14 @@ func TestV073E2ECatalogBatchesUnderAdminGrant(t *testing.T) {
 		}
 		opt := ReleaseOptions{Granter: noGranter{t}, AdminGrant: admin, Via: "svc:merge"}
 		err = grantFor(ctx, c, opt, "cat", p)
-		switch {
-		case c2.admin && (err != nil || p.opt.BatchClient == nil):
+		if err != nil || p.opt.BatchClient == nil {
 			t.Errorf("%s: %v (batch client %v)", c2.name, err, p.opt.BatchClient)
-		case !c2.admin && (!errors.Is(err, ErrNotOffered) || p.opt.BatchClient != nil):
-			t.Errorf("%s: %v, want ErrNotOffered", c2.name, err)
 		}
-		// Without an admin's grant, one that needs it is refused too.
-		if c2.admin {
-			p.opt.BatchClient = nil
-			opt.AdminGrant = ""
-			if err := grantFor(ctx, c, opt, "cat", p); !errors.Is(err, ErrAdminNeeded) || p.opt.BatchClient != nil {
-				t.Errorf("%s without an admin's grant: %v", c2.name, err)
-			}
+		// Without an admin's grant, every one is refused.
+		p.opt.BatchClient = nil
+		opt.AdminGrant = ""
+		if err := grantFor(ctx, c, opt, "cat", p); !errors.Is(err, ErrAdminNeeded) || p.opt.BatchClient != nil {
+			t.Errorf("%s without an admin's grant: %v", c2.name, err)
 		}
 	}
 }

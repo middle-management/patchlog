@@ -154,7 +154,8 @@ func testMergeGrants(t *testing.T) {
 	}
 }
 
-// Without a merge key the catalog service issues no merge grants.
+// Without a merge key the catalog service issues no merge grants: 404
+// not_offered since v0.74 (§F.8), 403 before.
 func TestMergeGrantsNeedMergeKey(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -165,7 +166,7 @@ func TestMergeGrantsNeedMergeKey(t *testing.T) {
 	r := w.doWith("POST", "/merge-grants", w.caller("svc:merge"), map[string]any{"batch": map[string]any{
 		"items":  []any{map[string]any{"resource": "matches.derby", "ifMatch": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "steps": []any{"delete"}}},
 		"source": map[string]any{"ns": "cat-r1", "at": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}, nil)
-	if msg, _ := r.body["message"].(string); r.status != 403 || !strings.Contains(msg, "merge key") {
+	if msg, _ := r.body["message"].(string); r.status != 404 || r.body["code"] != "not_offered" || !strings.Contains(msg, "merge key") {
 		t.Fatalf("without a merge key: %d %v", r.status, r.body)
 	}
 }

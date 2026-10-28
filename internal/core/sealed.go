@@ -514,7 +514,7 @@ type KeysAnswer struct {
 
 // Keys answers POST /ns/{ns}/keys (§E.2.3). It needs a verified grant
 // with read on the namespace (with authentication disabled, anyone gets
-// raw epoch keys). At E2 a grant whose rules fix /resource (§2.1) gets
+// the raw key of the current epoch, as a grant without nbf would). At E2 a grant whose rules fix /resource (§2.1) gets
 // K_r for the names asked, by default every name it fixes, and is 403 for
 // a name it doesn't fix or may not read; any other gets K_e if it reads
 // the namespace unrestricted, and is 403 otherwise (keysScope). Epochs are
@@ -536,8 +536,8 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		cfg := t.config(n.configSeq)
 		// Refused as /principal is, in a public namespace too (§7): 401
 		// without a usable grant, 403 for one that doesn't name the
-		// namespace or that its key's scope refuses (§C.2 item 1), and 404
-		// for one that has no read.
+		// namespace or that its key's scope refuses (§C.2 item 1), and 403
+		// for one that has no read (§E.2.3).
 		a, aerr := t.keysReader(n, cred, func(a *actor) bool {
 			return t.e.opt.AuthDisabled || a != nil && a.verified.Can["read"]
 		})
@@ -550,9 +550,10 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			// the namespace gets its own, unrestricted or limited to some
 			// resources: such a writer needs them, and the epoch and pad,
 			// to seal (§E.2.3, §E.3.1). Per-resource keys don't exist at
-			// E3. A grant whose rules refuse every read reads nothing.
+			// E3. A grant whose rules refuse every read reads nothing:
+			// 403, as any other verified grant /keys refuses (§7).
 			if _, refused := t.keysReadScope(a); refused {
-				return notFound()
+				return forbidden("the grant's rules refuse every read in " + ns)
 			}
 			// 410 once the read check passes, as every URL of a
 			// purged namespace (§8.5).
@@ -834,22 +835,19 @@ func latestNbf(a *actor) *time.Time {
 // a batch's config change included, that sets it, at that entry's time,
 // so the epoch in force at the last entry at or before nbf is the latest
 // that began at or before it. Epochs that began after the grant's exp are
-// not left out (v0.63). Without a grant (authentication disabled), every
-// epoch, as far as historyEpochs allows.
+// not left out (v0.63). Without a grant (authentication disabled), as
+// for a grant without nbf: the current epoch alone (§E.2.3).
 func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 	if len(all) == 0 {
 		return nil
 	}
 	first := all[0].e
-	if a != nil && a.grant != nil {
-		nbf := latestNbf(a)
-		if nbf == nil {
-			first = cfg.Epoch
-		} else {
-			for _, x := range all {
-				if !x.created.After(*nbf) {
-					first = x.e
-				}
+	if nbf := latestNbf(a); nbf == nil {
+		first = cfg.Epoch
+	} else {
+		for _, x := range all {
+			if !x.created.After(*nbf) {
+				first = x.e
 			}
 		}
 	}

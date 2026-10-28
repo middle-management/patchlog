@@ -792,6 +792,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			fromSeq = s
 		}
+		// Events and long-poll from a purged namespace's purge-ns entry,
+		// its last, are 410 purged, so a follower can tell the end from a
+		// restart; an immutable range from it stays an empty page (§8.5).
+		if n.purged && resource == "" && (perEntry || live != nil) && since != "" && fromSeq == n.headSeq.Int64 {
+			return t.purgedRead(n)
+		}
 		q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures, via FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
 		args := []any{n.id, fromSeq, toSeq}
 		if limit > 0 {
@@ -1015,6 +1021,11 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		// digests; migration 008_clear_at_rest_digests, encryptNamespace).
 		level := t.nsLevel(n)
 		plain := level < levelSealed
+		// Nor for a resource §1 answers 502 for, read through a remote
+		// branch whose source was raised to a level this server lacks, or
+		// one held back while the branch's raise fails (503, remoteHeld):
+		// its source hides them now (§1, §7.4).
+		rb, _, _, lost := t.lostRemote(n)
 		for _, h := range page {
 			kind := "head"
 			switch h.state {
@@ -1033,7 +1044,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 			// as GET …/rev/{target} serves it uncoded, where the write
 			// stored them (headMeta). A pruned head keeps them, as it
 			// keeps its target.
-			if plain && h.row != nil && h.state != Purged {
+			if plain && h.row != nil && h.state != Purged && !(lost && t.upstreamCovers(rb, h.name, &view{state: h.state})) {
 				item["created"] = formatTime(h.row.created)
 				if h.state == Live && level < levelAtRest && h.row.size.Valid && len(h.row.digest) == sha256.Size {
 					item["size"] = float64(h.row.size.Int64)

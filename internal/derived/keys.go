@@ -16,8 +16,10 @@ import (
 
 // ErrSkip is returned by FetchDoc for a resource that is not content to a
 // consumer (the keyring of an e2e namespace) or that the service cannot
-// read (an e2e namespace without a keyring recipient key). Consumers treat
-// it as "no document", never as ciphertext to consume.
+// read (an e2e namespace without a keyring recipient key, or a revision
+// sealed under an epoch its grant gets no key for, which also matches
+// follow.LacksKey). Consumers treat it as "no document", never as
+// ciphertext to consume.
 var ErrSkip = errors.New("derived: not readable content")
 
 // Info is what the services need of a namespace's encryption.
@@ -529,8 +531,9 @@ func (k *Keys) Status(nss []string) []Status {
 // client decrypts a sealed namespace), and folds it for an e2e namespace
 // with the keyring recipient key: revisions flagged by the fold (§E.3.2)
 // are logged by the caller through flagged and left out. It returns
-// ErrSkip for the keyring and for an e2e namespace the service can't read.
-// The document's Kid names the epoch the revision is served under
+// ErrSkip for the keyring, for an e2e namespace the service can't read,
+// and for a revision of a sealed namespace sealed under an epoch the
+// service gets no key for while it has the current one's. The document's Kid names the epoch the revision is served under
 // (EpochOf): at E2 the kid of the sealed document fetched, at E3 that of
 // the sealed op it comes from (client.E2EDoc.Kid).
 func (k *Keys) FetchDoc(ctx context.Context, ns, name, id string, flagged func(client.Flag)) (*client.Doc, error) {
@@ -539,7 +542,20 @@ func (k *Keys) FetchDoc(ctx context.Context, ns, name, id string, flagged func(c
 		return nil, err
 	}
 	if in.Level != LevelE2E {
-		return follow.FetchDoc(ctx, k.c, ns, name, id)
+		d, err := follow.FetchDoc(ctx, k.c, ns, name, id)
+		if err != nil && in.Protected() && follow.LacksKey(ctx, err) {
+			// A revision sealed under an epoch the service's grant gets
+			// no key for (§E.2.3), as an earlier one after a rotation
+			// with authentication disabled: while the current epoch's
+			// key is had, it is content the service can't read, and
+			// left out, rather than retried for ever (§A.4, §E.2.6).
+			// Without that key the namespace is skipped (Check,
+			// Recheck), so the failure is returned.
+			if _, kerr := k.EpochKey(ctx, ns, in.Epoch); kerr == nil {
+				return nil, fmt.Errorf("%w: %s/%s@%s is sealed under an epoch the service gets no key for: %w", ErrSkip, ns, name, id, err)
+			}
+		}
+		return d, err
 	}
 	if name == client.KeyringName || k.e2e == nil {
 		return nil, ErrSkip

@@ -897,6 +897,9 @@ type prep struct {
 	// can't be known, or isn't read (Node.BornUnknown).
 	born        string
 	bornUnknown bool
+	// bornEpoch is the epoch born's revision is served under in a sealed
+	// or e2e catalog (Node.BornEpoch), 0 if not known.
+	bornEpoch int
 }
 
 // Apply implements follow.Handler. The batch's units are coalesced and
@@ -1029,7 +1032,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 				self := !isCat && s.opt.SelfPlacing && parseSelf(s.opt.Catalog, b.NS, ch.Resource, doc.Value) != nil
 				switch {
 				case isCat || self && bornable:
-					if p.born, p.bornUnknown, err = s.nodeBorn(ctx, fb.NS, ch.Resource, p.head, self, ch.Purged); err != nil {
+					if p.born, p.bornUnknown, p.bornEpoch, err = s.nodeBorn(ctx, fb.NS, ch.Resource, p.head, self, ch.Purged); err != nil {
 						return err
 					}
 				case self:
@@ -1264,7 +1267,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			changed[p.name] = true
 			if p.kind == "head" && p.doc != nil {
 				n := ParseNode(cat, p.name, p.head, p.doc)
-				n.Born, n.BornUnknown, n.Epoch = p.born, p.bornUnknown, p.epoch
+				n.Born, n.BornUnknown, n.Epoch, n.BornEpoch = p.born, p.bornUnknown, p.epoch, p.bornEpoch
 				if g.explicitGone[p.name] {
 					if err := saveGone(ctx, tx, p.name, false); err != nil {
 						return nil, err
@@ -1599,12 +1602,12 @@ func (s *Service) Seen(ctx context.Context, nsID string) bool {
 
 // nodeBorn is the born of a node (§B.5) whose document is ns/name, head
 // head (ns as followed): a catalog node's, or with self an implicit
-// placement's, which a content document makes (§B.9), and whether it
-// can't be known. The service keeps both with the node, so it reads the
-// log only for a node it holds neither for, or whose chain a purge in
-// this batch replaced (purged), never again for a chain whose born is
-// unknown (bornOf).
-func (s *Service) nodeBorn(ctx context.Context, ns, name, head string, self, purged bool) (string, bool, error) {
+// placement's, which a content document makes (§B.9), whether it can't be
+// known, and the epoch its revision is served under (Node.BornEpoch). The
+// service keeps them with the node, so it reads the log only for a node
+// it holds neither for, or whose chain a purge in this batch replaced
+// (purged), never again for a chain whose born is unknown (bornOf).
+func (s *Service) nodeBorn(ctx context.Context, ns, name, head string, self, purged bool) (string, bool, int, error) {
 	node := name
 	if self {
 		node = s.logical(ns) + "." + name
@@ -1615,16 +1618,17 @@ func (s *Service) nodeBorn(ctx context.Context, ns, name, head string, self, pur
 		n = s.g.self[node]
 	}
 	var born string
+	var epoch int
 	known := false
 	if n != nil && !purged {
-		born, known = n.Born, n.Born != "" || n.BornUnknown
+		born, known, epoch = n.Born, n.Born != "" || n.BornUnknown, n.BornEpoch
 	}
 	s.mu.RUnlock()
 	if known {
-		return born, born == "", nil
+		return born, born == "", epoch, nil
 	}
-	born, err := s.bornOf(ctx, ns, name, head)
-	return born, err == nil && born == "", err
+	born, epoch, err := s.bornOf(ctx, ns, name, head)
+	return born, err == nil && born == "", epoch, err
 }
 
 // bornOf is when ns/name was created (§B.5 born): the created of the first
@@ -1632,23 +1636,26 @@ func (s *Service) nodeBorn(ctx context.Context, ns, name, head string, self, pur
 // A log that can't be read for the moment (Transient) is an error, so the
 // apply is made again; otherwise, as for a resource gone since or a chain
 // a prune cut (410 pruned, §7.1), the born is unknown (""), and only
-// failures other than those are logged.
-func (s *Service) bornOf(ctx context.Context, ns, name, head string) (string, error) {
+// failures other than those are logged. epoch is the epoch that revision
+// is served under in a sealed or e2e namespace (derived.EpochOf of the
+// entry's kid; at E3 the kid a prune's snapshot of it would carry, as
+// for heads, §E.3.1), 0 if not known.
+func (s *Service) bornOf(ctx context.Context, ns, name, head string) (born string, epoch int, err error) {
 	es, _, err := s.c.LogPage(ctx, ns, name, head, "")
 	switch {
 	case err == nil:
 	case client.Transient(err):
-		return "", fmt.Errorf("tree: the log of %s/%s: %w", ns, name, err)
+		return "", 0, fmt.Errorf("tree: the log of %s/%s: %w", ns, name, err)
 	default:
 		if !client.IsGone(err) && !client.IsPruned(err) && !client.IsNotFound(err) {
 			s.opt.Logf("tree: the born of %s/%s is unknown: %v", ns, name, err)
 		}
-		return "", nil
+		return "", 0, nil
 	}
 	if len(es) == 0 {
-		return "", nil
+		return "", 0, nil
 	}
-	return es[0].Created, nil
+	return es[0].Created, derived.EpochOf(ns, es[0].Kid), nil
 }
 
 // bornReads bounds the logs backfillNodes reads at once.
@@ -1731,6 +1738,7 @@ func (s *Service) backfillNodes(ctx context.Context) error {
 		}
 	}
 	borns := make([]string, len(wants)) // "" where unknown
+	bornEpochs := make([]int, len(wants))
 	eg, ectx := errgroup.WithContext(ctx)
 	eg.SetLimit(bornReads)
 	for i, w := range wants {
@@ -1738,8 +1746,8 @@ func (s *Service) backfillNodes(ctx context.Context) error {
 			continue
 		}
 		eg.Go(func() error {
-			b, err := s.bornOf(ectx, w.ns, w.name, w.head)
-			borns[i] = b
+			b, e, err := s.bornOf(ectx, w.ns, w.name, w.head)
+			borns[i], bornEpochs[i] = b, e
 			return err
 		})
 	}
@@ -1776,6 +1784,9 @@ func (s *Service) backfillNodes(ctx context.Context) error {
 			continue
 		}
 		n.Born, n.BornUnknown = borns[i], borns[i] == ""
+		if !w.self {
+			n.BornEpoch = bornEpochs[i]
+		}
 		if w.self {
 			if _, err := tx.ExecContext(ctx, `UPDATE self_parents SET born = ? WHERE ns = ? AND name = ?`, bornVal(n.Born, n.BornUnknown), n.ItemNS, n.ItemName); err != nil {
 				return err
