@@ -8,7 +8,7 @@
 #   ./deploy/ec2-bench.sh [-y] [writes/s] [seconds]   (default 100 20)
 #   ./deploy/ec2-bench.sh cleanup                      the IAM role, profile
 #
-# The arguments, READS and LOGS are bench.sh's. The instance runs this
+# The arguments, READS, LOGS and NAMESPACES are bench.sh's. The instance runs this
 # checkout's bench.sh and spans.py, and oha's release OHA (default v1.14.0).
 #
 # Settings (environment):
@@ -34,7 +34,7 @@ TABLE=${TABLE:-patchlog}
 VERSION=${VERSION:-v0.24.0-ddb.3}
 TYPE=${TYPE:-c7g.large}
 OHA=${OHA:-v1.14.0}
-READS=${READS:-}; LOGS=${LOGS:-}
+READS=${READS:-}; LOGS=${LOGS:-}; NAMESPACES=${NAMESPACES:-}
 ROLE=patchlog-bench
 REPO=middle-management/patchlog
 [ -n "$REGION" ] || { echo "ec2-bench: set REGION (or aws configure set region …)" >&2; exit 1; }
@@ -53,7 +53,7 @@ fi
 YES=""
 [ "${1:-}" = -y ] && { YES=1; shift; }
 RATE=${1:-100}; SECS=${2:-20}
-case "$RATE$SECS$READS$LOGS" in *[!0-9]*) echo "usage: $0 [-y] [writes/s] [seconds] | cleanup" >&2; exit 2 ;; esac
+case "$RATE$SECS$READS$LOGS$NAMESPACES" in *[!0-9]*) echo "usage: $0 [-y] [writes/s] [seconds] | cleanup" >&2; exit 2 ;; esac
 
 # What's there, and what would be made.
 account=$(aws sts get-caller-identity --query Account --output text)
@@ -74,7 +74,7 @@ echo "account $account, region $REGION"
 echo "  table $TABLE: $([ -n "$table_arn" ] && echo exists || echo 'to make (on-demand)')"
 echo "  role $ROLE: $([ -n "$have_role" ] && echo 'exists (its DynamoDB policy is set to this table)' || echo 'to make')"
 echo "  instance: $TYPE ($arch, $ami) in $SUBNET, terminated on exit"
-echo "  run: patchlog $VERSION, bench $RATE writes/s for ${SECS}s${READS:+, reads $READS/s}${LOGS:+, logs $LOGS/s}"
+echo "  run: patchlog $VERSION, bench $RATE writes/s for ${SECS}s${READS:+, reads $READS/s}${LOGS:+, logs $LOGS/s}${NAMESPACES:+, over $NAMESPACES namespaces}"
 if [ -z "$YES" ]; then
   read -r -p "Go ahead? [y/N] " ok
   [ "$ok" = y ] || [ "$ok" = Y ] || exit 1
@@ -136,7 +136,7 @@ OTEL_TRACES_EXPORTER=console OTEL_METRICS_EXPORTER=none \\
     -db 'dynamodb://$TABLE?region=$REGION' 2>spans.jsonl &
 server=\$!
 for _ in \$(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8080/ && break; kill -0 \$server || { grep -v '^{' spans.jsonl; exit 1; }; sleep 1; done
-${READS:+READS=$READS }${LOGS:+LOGS=$LOGS }./bench.sh "\$1" "\$2" || echo "bench failed: \$?"
+${READS:+READS=$READS }${LOGS:+LOGS=$LOGS }${NAMESPACES:+NAMESPACES=$NAMESPACES }./bench.sh "\$1" "\$2" || echo "bench failed: \$?"
 kill \$server; wait \$server || true
 echo; ./spans.py spans.jsonl
 RUN

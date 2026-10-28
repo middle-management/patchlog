@@ -318,6 +318,18 @@ func TestDDBTelemetry(t *testing.T) {
 	if attrs["db.system.name"] != "aws.dynamodb" || attrs["rpc.method"] != "TransactWriteItems" || !strings.Contains(attrs["aws.dynamodb.table_names"], "coretest-") {
 		t.Fatalf("DynamoDB span attributes %v", attrs)
 	}
+	// What the call cost and waited for: one attempt, none throttled, and
+	// the write units DynamoDB says the transaction consumed.
+	if attrs["patchlog.dynamodb.attempts"] != "1" || attrs["patchlog.dynamodb.throttled"] != "0" || attrs["patchlog.dynamodb.write_units"] == "" || attrs["patchlog.dynamodb.write_units"] == "0" {
+		t.Fatalf("DynamoDB transaction's cost attributes %v", attrs)
+	}
+	get := map[attribute.Key]string{}
+	for _, kv := range byName["DynamoDB.GetItem"][0].Attributes() {
+		get[kv.Key] = kv.Value.Emit()
+	}
+	if get["patchlog.dynamodb.read_units"] == "" || get["patchlog.dynamodb.write_units"] != "" {
+		t.Fatalf("DynamoDB read's cost attributes %v", get)
+	}
 
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &rm); err != nil {

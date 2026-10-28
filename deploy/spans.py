@@ -12,14 +12,20 @@ Per request kind (the server span's route): how many, p50 and p95 of the
 total, of the time in DynamoDB calls (summed: they run one after another)
 and of the rest (the server's own work, and waiting: for a group commit,
 a rate limit, a lock), and the calls a request made. Then per DynamoDB
-operation: how many, p50 and p95. A group commit's transaction is traced
-in the first of its writes' requests only, so the other writes of a
-group show no commit call, and their wait for it as the rest.
+operation: how many, p50 and p95, the capacity units they consumed, the
+calls the SDK retried, the attempts DynamoDB throttled, batch keys left
+unprocessed, and failures. Then the table's units per second: a
+namespace is one partition key, which takes about 3,000 read and 1,000
+write units a second (docs/DYNAMODB.md §3), so a load whose namespace
+nears those is throttled whatever the table's capacity. Last, the
+failures' messages. A group commit's transaction is traced in the first
+of its writes' requests only, so the other writes of a group show no
+commit call, and their wait for it as the rest.
 """
 
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 
@@ -59,41 +65,77 @@ def main(path):
     by_trace = defaultdict(list)
     for s in spans:
         s["dur"] = instant(s["EndTime"]) - instant(s["StartTime"])
+        s["attrs"] = {a["Key"]: a["Value"]["Value"] for a in s.get("Attributes") or []}
         by_trace[s["SpanContext"]["TraceID"]].append(s)
 
-    kinds = defaultdict(lambda: {"total": [], "ddb": [], "rest": [], "calls": []})
-    ops = defaultdict(list)
-    failed = defaultdict(int)
+    kinds = defaultdict(lambda: {"total": [], "ddb": [], "rest": [], "calls": [], "ru": [], "wu": []})
+    ops = defaultdict(lambda: {"dur": [], "units": [], "retried": 0, "throttled": 0, "unprocessed": 0, "failed": 0, "conditions": 0})
+    per_sec = defaultdict(lambda: [0.0, 0.0, 0])  # second -> read units, write units, throttled
+    messages = Counter()
     for trace in by_trace.values():
         roots = [s for s in trace if s["Parent"]["SpanID"] == "0000000000000000"]
         if not roots:
             continue
         root = roots[0]
         calls = [s for s in trace if s["Name"].startswith("DynamoDB.")]
+        ru = wu = 0.0
         for c in calls:
-            ops[c["Name"]].append(c["dur"])
-            attrs = {a["Key"]: a["Value"]["Value"] for a in c.get("Attributes") or []}
-            if attrs.get("patchlog.dynamodb.condition_failed"):
-                failed[c["Name"]] += 1
+            a, o = c["attrs"], ops[c["Name"]]
+            o["dur"].append(c["dur"])
+            r, w = float(a.get("patchlog.dynamodb.read_units", 0)), float(a.get("patchlog.dynamodb.write_units", 0))
+            o["units"].append(r + w)
+            ru, wu = ru + r, wu + w
+            throttled = int(a.get("patchlog.dynamodb.throttled", 0))
+            o["retried"] += int(a.get("patchlog.dynamodb.attempts", 1)) > 1
+            o["throttled"] += throttled
+            o["unprocessed"] += int(a.get("patchlog.dynamodb.unprocessed", 0))
+            o["conditions"] += bool(a.get("patchlog.dynamodb.condition_failed"))
+            sec = per_sec[instant(c["StartTime"]) // 10**9]
+            sec[0], sec[1], sec[2] = sec[0] + r, sec[1] + w, sec[2] + throttled
+            if (c.get("Status") or {}).get("Code") == "Error":
+                o["failed"] += 1
+                for e in c.get("Events") or []:
+                    for ea in e.get("Attributes") or []:
+                        if ea["Key"] == "exception.message":
+                            messages[f"{c['Name']}: {ea['Value']['Value'][:160]}"] += 1
         k = kinds[root["Name"]]
         in_ddb = sum(c["dur"] for c in calls)
         k["total"].append(root["dur"])
         k["ddb"].append(in_ddb)
         k["rest"].append(max(0, root["dur"] - in_ddb))
         k["calls"].append(len(calls))
+        k["ru"].append(ru)
+        k["wu"].append(wu)
 
     print(f"{len(by_trace)} requests, {len(spans)} spans\n")
-    print(f"{'request':34} {'n':>5}  {'total p50/p95':>15}  {'DynamoDB p50/p95':>17}  {'rest p50/p95':>14}  {'calls p50':>9}")
+    print(f"{'request':34} {'n':>5}  {'total p50/p95':>15}  {'DynamoDB p50/p95':>17}  {'rest p50/p95':>14}  {'calls':>5}  {'RU p50':>6}  {'WU p50':>6}")
     for name, k in sorted(kinds.items(), key=lambda kv: -len(kv[1]["total"])):
         print(f"{name[:34]:34} {len(k['total']):>5}  "
               f"{ms(pct(k['total'], .5)):7.1f}/{ms(pct(k['total'], .95)):<7.1f}  "
               f"{ms(pct(k['ddb'], .5)):8.1f}/{ms(pct(k['ddb'], .95)):<8.1f}  "
               f"{ms(pct(k['rest'], .5)):6.1f}/{ms(pct(k['rest'], .95)):<7.1f}  "
-              f"{pct(k['calls'], .5):>9}")
-    print(f"\n{'DynamoDB call':34} {'n':>5}  {'p50 ms':>8}  {'p95 ms':>8}  condition failed")
-    for name, ds in sorted(ops.items(), key=lambda kv: -len(kv[1])):
-        print(f"{name:34} {len(ds):>5}  {ms(pct(ds, .5)):8.1f}  {ms(pct(ds, .95)):8.1f}  {failed.get(name, 0)}")
+              f"{pct(k['calls'], .5):>5}  {pct(k['ru'], .5):6.1f}  {pct(k['wu'], .5):6.1f}")
 
+    print(f"\n{'DynamoDB call':28} {'n':>6}  {'p50 ms':>7}  {'p95 ms':>7}  {'units p50':>9}  {'units':>9}  {'retried':>7}  {'throttled':>9}  {'unprocessed':>11}  {'failed':>6}  {'cond. failed':>12}")
+    for name, o in sorted(ops.items(), key=lambda kv: -len(kv[1]["dur"])):
+        print(f"{name:28} {len(o['dur']):>6}  {ms(pct(o['dur'], .5)):7.1f}  {ms(pct(o['dur'], .95)):7.1f}  "
+              f"{pct(o['units'], .5):9.1f}  {sum(o['units']):9.0f}  {o['retried']:>7}  {o['throttled']:>9}  "
+              f"{o['unprocessed']:>11}  {o['failed']:>6}  {o['conditions']:>12}")
+
+    if per_sec:
+        secs = sorted(per_sec)
+        busy = [per_sec[t] for t in secs[1:-1]] or [per_sec[t] for t in secs]  # whole seconds only
+        print(f"\nunits per second, over {len(busy)} whole seconds (a namespace's partition key: ~3,000 RU/s, ~1,000 WU/s)")
+        for label, i in (("read", 0), ("write", 1)):
+            xs = [b[i] for b in busy]
+            print(f"  {label:5} mean {sum(xs) / len(xs):8.0f}   p50 {pct(xs, .5):8.0f}   max {max(xs):8.0f}")
+        th = [b[2] for b in busy]
+        print(f"  throttled attempts: {sum(th)} in {sum(1 for x in th if x)} of the seconds")
+
+    if messages:
+        print("\nfailures")
+        for m, n in messages.most_common(8):
+            print(f"  {n:>6}  {m}")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:

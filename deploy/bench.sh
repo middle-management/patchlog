@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 # A load test of a running server with oha (https://github.com/hatoo/oha):
 # for S seconds, writes at a fixed rate while readers read resources' heads
-# and the namespace log, each at its own fixed rate. Prints, per kind, the
-# requests answered, their rate, p50, p95, p99 and max latency (ms) and the
-# statuses other than success.
+# and follow the namespace logs, each at its own fixed rate. Prints, per
+# kind, the requests answered, their rate, p50, p95, p99 and max latency
+# (ms) and the statuses other than success.
 #
 #   ./deploy/bench.sh [writes/s] [seconds]      (default 100 20)
 #
-#   READS  reads of a resource's head per second, following its 302 to the
-#          revision (default: writes/s)
-#   LOGS   reads of the namespace log per second, following its 302 to the
-#          entry (default: writes/s / 2)
-#   BASE   the server (default http://localhost:8080)
+#   READS       reads of a resource's head per second, following its 302 to
+#               the revision (default: writes/s)
+#   LOGS        reads of a namespace's log per second (default: writes/s / 2)
+#   NAMESPACES  namespaces the load is spread over, evenly (default 1)
+#   BASE        the server (default http://localhost:8080)
+#
+# A log read follows the log as a follower does: the entries since a
+# recent one (?since=), not the log from its start, whose first page (up
+# to 1,000 entries) a CDN would serve. The bench runs in one-second
+# slices, each reading since the head at its start.
 #
 # A write creates a resource (If-None-Match: *), a randomly named one: an
 # append needs the head its writer last saw (If-Match), which a load tool
@@ -46,8 +51,8 @@
 set -euo pipefail
 BASE=${BASE:-http://localhost:8080}
 WRITES=${1:-100}; SECS=${2:-20}
-READS=${READS:-$WRITES}; LOGS=${LOGS:-$(( WRITES / 2 ))}
-NS=bench$RANDOM; RESOURCES=16; PER_AUTHOR=40
+READS=${READS:-$WRITES}; LOGS=${LOGS:-$(( WRITES / 2 ))}; NAMESPACES=${NAMESPACES:-1}
+RUN=bench$RANDOM; RESOURCES=16; PER_AUTHOR=40
 CT='Content-Type: application/json-patch+json'
 command -v oha >/dev/null || { echo "bench: needs oha (https://github.com/hatoo/oha/releases)" >&2; exit 1; }
 OUT=$(mktemp -d)
@@ -62,16 +67,23 @@ setup() { # setup URL BODY
   fi
 }
 
-config='{"read":"public"}'
-if [ "$WRITES" -gt 400 ]; then
-  config="{\"read\":\"public\",\"limits\":{\"ratePerNamespace\":{\"rate\":$(( WRITES * 2 )),\"burst\":$(( WRITES * 4 ))}}}"
-fi
-setup "$BASE/ns/$NS" "[{\"op\":\"add\",\"path\":\"\",\"value\":$config}]"
-names=""
-for i in $(seq 1 "$RESOURCES"); do
-  setup "$BASE/r/$NS/r$i" '[{"op":"add","path":"","value":{"v":0}}]'
-  names="$names${names:+|}r$i"
+# Each namespace's share of a rate, n of NAMESPACES (1-based).
+share() { echo $(( $1 / NAMESPACES + ($2 <= $1 % NAMESPACES ? 1 : 0) )); }
+
+nss=""; names=""
+for n in $(seq 1 "$NAMESPACES"); do
+  ns=$RUN-$n
+  config='{"read":"public"}'
+  if [ "$(share "$WRITES" "$n")" -gt 400 ]; then
+    config="{\"read\":\"public\",\"limits\":{\"ratePerNamespace\":{\"rate\":$(( WRITES * 2 )),\"burst\":$(( WRITES * 4 ))}}}"
+  fi
+  setup "$BASE/ns/$ns" "[{\"op\":\"add\",\"path\":\"\",\"value\":$config}]"
+  for i in $(seq 1 "$RESOURCES"); do
+    setup "$BASE/r/$ns/r$i" '[{"op":"add","path":"","value":{"v":0}}]'
+  done
+  nss="$nss${nss:+|}$ns"
 done
+for i in $(seq 1 "$RESOURCES"); do names="$names${names:+|}r$i"; done
 
 # load KIND RATE ARGS…: one oha run, its JSON in $OUT/KIND.json. Requests
 # under way at the end are waited for (-w). A write's 201 has a Location,
@@ -83,18 +95,35 @@ load() {
     -c "$(( rate / 4 + 4 ))" "$@" >"$OUT/$kind.json"
 }
 
-authors=$(( (WRITES + PER_AUTHOR - 1) / PER_AUTHOR ))
-for a in $(seq 1 "$authors"); do
-  rate=$(( WRITES / authors + (a <= WRITES % authors ? 1 : 0) ))
-  load "write.$a" "$rate" -r 0 -m PATCH -H "$CT" -H "X-Author: bench$a" -H 'If-None-Match: *' \
-    -d '[{"op":"add","path":"","value":{"v":1}}]' --rand-regex-url "$BASE/r/$NS/w[a-z0-9]{16}" &
+# follow NS RATE: SECS one-second slices of log reads, each since the head
+# at its start (the id in the log's redirect).
+follow() {
+  local ns=$1 rate=$2 head i
+  [ "$rate" -gt 0 ] || return 0
+  for i in $(seq 1 "$SECS"); do
+    head=$(curl -s -o /dev/null -w '%{redirect_url}' "$BASE/ns/$ns/log" | sed -n 's|.*/rev/\([^/]*\)/log.*|\1|p')
+    oha --no-tui --output-format json -z 1s -w -q "$rate" --latency-correction -c "$(( rate / 4 + 4 ))" \
+      "$BASE/ns/$ns/log?since=$head" >"$OUT/log.$ns.$i.json"
+  done
+}
+
+authors=0
+for n in $(seq 1 "$NAMESPACES"); do
+  ns=$RUN-$n; rate=$(share "$WRITES" "$n")
+  k=$(( (rate + PER_AUTHOR - 1) / PER_AUTHOR ))
+  for a in $(seq 1 "$k"); do
+    r=$(( rate / k + (a <= rate % k ? 1 : 0) ))
+    authors=$(( authors + 1 ))
+    load "write.$n.$a" "$r" -r 0 -m PATCH -H "$CT" -H "X-Author: bench$n-$a" -H 'If-None-Match: *' \
+      -d '[{"op":"add","path":"","value":{"v":1}}]' --rand-regex-url "$BASE/r/($ns)/w[a-z0-9]{16}" &
+  done
+  follow "$ns" "$(share "$LOGS" "$n")" &
 done
-load read "$READS" --rand-regex-url "$BASE/r/$NS/($names)" &
-load log "$LOGS" "$BASE/ns/$NS/log" &
+load read "$READS" --rand-regex-url "$BASE/r/($nss)/($names)" &
 wait
 
-echo "namespace $NS, ${SECS}s: writes $WRITES/s ($authors authors), reads $READS/s, logs $LOGS/s"
-python3 - "$OUT" <<'EOF'
+echo "$NAMESPACES namespace(s) $RUN-*, ${SECS}s: writes $WRITES/s ($authors authors), reads $READS/s, logs $LOGS/s"
+python3 - "$OUT" "$SECS" <<'EOF'
 import glob, json, os, sys
 from collections import Counter
 
@@ -118,9 +147,10 @@ for kind in ("write", "read", "log"):
     runs = k["runs"]
     n = sum(k["statuses"].values())
     ok = sum(c for s, c in k["statuses"].items() if s.startswith("2"))
-    rate = sum(r["summary"]["requestsPerSec"] for r in runs)
-    # One run per kind but for writes, one per author at the same rate: the
-    # authors' percentiles are of equal shares, so their mean stands for all.
+    rate = ok / float(sys.argv[2])
+    # Several runs of a kind (writes: one per author; logs: one per
+    # namespace and second) at about the same rate: their percentiles are of
+    # equal shares, so their mean stands for all.
     pct = {p: sum(r["latencyPercentiles"][p] or 0 for r in runs) / len(runs) for p in ("p50", "p95", "p99")}
     slowest = max(r["summary"]["slowest"] or 0 for r in runs)
     other = ", ".join(f"{c}×{s}" for s, c in sorted(k["statuses"].items()) if not s.startswith("2"))
