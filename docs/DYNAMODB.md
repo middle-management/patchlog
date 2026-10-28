@@ -828,7 +828,10 @@ PATCHLOG_TEST_BACKEND=dynamodb DDB_ENDPOINT=http://localhost:8000 go test ./...
 ```
 
 runs them on DynamoDB Local, a fresh table each, as `PATCHLOG_TEST_PG`
-runs them on Postgres; CI's `dynamodb` job does. What the backend hasn't
+runs them on Postgres; CI's `dynamodb` job does. DynamoDB Local serves
+about one request at a time, so `DDB_ENDPOINT` may list several
+instances, comma-separated, and the tests' tables are spread over them:
+four take a full run from 410 s to 277 s on four cores. What the backend hasn't
 built skips without per-test annotations: `core.Open` refusing an option
 with `core.ErrUnsupported` (the SQL write path's hooks), or a `501 {"code":"unsupported"}`
 answer on the test's own goroutine. Tests that run and answer

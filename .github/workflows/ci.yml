@@ -46,6 +46,8 @@ jobs:
   # server (the server package's harness, clienttest) gets a fresh table
   # (internal/testenv). What the backend hasn't built skips; its known
   # divergences (internal/testenv/known_dynamodb.txt) skip until fixed.
+  # DynamoDB Local serves about one request at a time, so the tests' tables
+  # are spread over four of them (a third faster than one).
   dynamodb:
     runs-on: ubuntu-latest
     services:
@@ -53,9 +55,21 @@ jobs:
         image: amazon/dynamodb-local:latest
         ports:
           - 8000:8000
+      dynamodb1:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8001:8000
+      dynamodb2:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8002:8000
+      dynamodb3:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8003:8000
     env:
       PATCHLOG_TEST_BACKEND: dynamodb
-      DDB_ENDPOINT: http://localhost:8000
+      DDB_ENDPOINT: http://localhost:8000,http://localhost:8001,http://localhost:8002,http://localhost:8003
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
