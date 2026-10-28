@@ -399,10 +399,8 @@ func TestV074RemotePreRaiseSealingsVerbatim(t *testing.T) {
 // before eb was made: B's remote branch of eb (chain [eb, e]) serves e's
 // pre-raise x1, written in e's epoch 1, under e#1 as A does, and x2
 // under e#2, byte for byte as A serves them, though B fetches x's chain
-// through eb, which wrote on it since. (The blob x1 references isn't
-// checked here: preRaiseBlob stops at eb's shadow, which has no raise of
-// its own, so B answers 404 for its epoch URLs; TestV074RemotePreRaise-
-// SealingsVerbatim checks a pre-raise blob's epoch URL.)
+// through eb, which wrote on it since. (The blob x1 references is
+// checked by TestV074RemoteShadowPreRaiseBlob.)
 func TestV074RemoteChainBasePreRaiseEpochs(t *testing.T) {
 	t.Parallel()
 	var aPriv ed25519.PrivateKey

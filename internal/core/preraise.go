@@ -401,10 +401,11 @@ func (t *tx) preRaiseBlob(n *nsRow, head *revRow, bid ids.ID) *preRaise {
 		}
 		raise := t.e2eRaiseOf(m)
 		if raise == nil {
-			if m.isShadow() {
-				return nil
-			}
-			continue // written end to end (preRaiseBoundary)
+			// Written end to end (preRaiseBoundary): a namespace e2e from
+			// its creation, or a remote branch's shadow of one, a level
+			// with no raise before at; an e2e remote branch has no other
+			// (followLevel). A base below may have one.
+			continue
 		}
 		if raise.level != levelSealed {
 			return nil

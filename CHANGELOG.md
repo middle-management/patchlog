@@ -205,6 +205,11 @@ reference implements the reading noted here.
 - Encrypted archives: the server reads an archive's sealed-bundle envelope line as strictly as
   bundle import does, taking off only its 0x0A (§G.5.1.1); before, surrounding spaces or a CRLF
   were trimmed and such an archive restored.
+- Pre-raise blobs (Addendum E Levels, §7.8): a remote branch of an e2e branch of a base raised
+  from sealed serves a blob a pre-raise revision references as the source does, `…/blob/{bid}`
+  redirecting to its epoch and `…/e/{e}` the source's sealing; before, the shadow of the
+  branch, which has no raise of its own, ended the search, so the epoch URL was `404` and
+  `…/blob/{bid}` served the plaintext.
 
 ## v0.23.0
 
