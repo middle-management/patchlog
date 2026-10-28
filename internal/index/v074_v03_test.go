@@ -1,16 +1,24 @@
 package index_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // answering answers GETs under prefix with status, as the core would
@@ -162,5 +170,128 @@ func TestV074V03RedirectDropsOpaqueAfter(t *testing.T) {
 	b := s.search("/matches/at/"+old+"?after=1&limit=1&q=word", "")
 	if b["at"] != cur || len(resources(b)) != 1 {
 		t.Errorf("restarted: %v", b)
+	}
+}
+
+// epochRefusing answers POST {path} asking for epoch 1's key with status
+// while armed, as /keys answers a grant that gets no key for it.
+type epochRefusing struct {
+	path   string
+	status atomic.Int32
+	rt     http.RoundTripper
+}
+
+func (f *epochRefusing) RoundTrip(r *http.Request) (*http.Response, error) {
+	if st := f.status.Load(); st != 0 && r.Method == "POST" && r.URL.Path == f.path && r.Body != nil {
+		b, err := io.ReadAll(r.Body)
+		r.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		r.Body = io.NopCloser(bytes.NewReader(b))
+		if bytes.Contains(b, []byte(`"epochs":[1]`)) {
+			return &http.Response{StatusCode: int(st), Header: http.Header{"Content-Type": {"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`{"code":"forbidden","message":"injected"}`)), Request: r}, nil
+		}
+	}
+	return f.rt.RoundTrip(r)
+}
+
+// SERVICES-5 (§E.2.6, Open 15): a hit served under an epoch whose key the
+// service's grant gets none of, for good (a 4xx from /keys), is served by
+// name only, resource, id and url and no sealed, in a result sealed per
+// entry, on a query of the namespace and on /_refs; a key it can't get for
+// now (a 5xx) is still 503 behind.
+func TestV074V03NameOnlyWithoutEpochKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for _, ns := range []string{"sec", "schemas"} {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+		if ns == "sec" {
+			doc["read"] = "grant"
+			doc["encryption"] = map[string]any{"level": "sealed"}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"sec", "schemas"}, []string{"read", "create", "append", "config"})), client.WithKeys(client.NewKeys(nil)))
+	sch := must(w.CreateDoc(ctx, "schemas", "item", pageSchemaWith(map[string]any{
+		"title": map[string]any{"type": "string", "x-index": "text"}, "tag": map[string]any{"type": "string", "x-index": "facet"}})))
+	ref := "/r/schemas/item/rev/" + sch.ID
+	for _, n := range []string{"a", "b"} {
+		must(createNonced(w, "sec", n, map[string]any{"$schema": ref, "title": "old " + n, "tag": "t", "related": []any{"/r/target/x"}}))
+	}
+	jwk, priv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", []string{"sec"}, []string{"read"}, map[string]any{"enc": jwk})),
+		client.WithKeys(client.NewKeys(priv)))
+	db := filepath.Join(t.TempDir(), "i.db")
+	first := startSvcWith(t, ic, svcOpts{db: db, ns: []string{"sec"}, now: s.Now}, func(o *indexOpts) { o.Recipient = priv })
+	first.caughtUp("sec")
+	first.stop()
+	must(s.Engine.RotateEpoch(ctx, "sec", "system:rotate"))
+	must(createNonced(w, "sec", "c", map[string]any{"$schema": ref, "title": "new c", "tag": "t", "related": []any{"/r/target/x"}}))
+	// Restarted, the service holds no key of epoch 1, which a and b are
+	// served under, and asks /keys for it when it seals their hits.
+	fk := &epochRefusing{path: "/ns/sec/keys", rt: transport}
+	x := startSvcWith(t, ic, svcOpts{db: db, ns: []string{"sec"}, now: s.Now, hc: &http.Client{Transport: fk}},
+		func(o *indexOpts) { o.Recipient = priv })
+	x.caughtUp("sec")
+	whole := k.Grant(t, s.Now(), "user:r", []string{"sec"}, []string{"read"})
+	follow := func(path string) resp {
+		t.Helper()
+		r := x.raw(path, whole)
+		if r.status == 302 {
+			r = x.raw(r.header.Get("Location"), whole)
+		}
+		return r
+	}
+
+	// For now: behind.
+	fk.status.Store(503)
+	for _, p := range []string{"/sec?q=old", "/sec?facet%5B%2Ftag%5D=t", "/_refs?to=" + url.QueryEscape("/r/target/x")} {
+		if r := follow(p); r.status != 503 || r.body["code"] != "behind" {
+			t.Errorf("%s, epoch 1's key for now: %d %v", p, r.status, r.body)
+		}
+	}
+	// For good: by name only.
+	fk.status.Store(403)
+	for _, c := range []struct {
+		path string
+		want string // each hit's kid, "" by name only
+	}{
+		{"/sec?q=old", "map[a: b:]"},
+		{"/sec?facet%5B%2Ftag%5D=t", "map[a: b: c:sec#2]"},
+		{"/_refs?to=" + url.QueryEscape("/r/target/x"), "map[sec/a: sec/b: sec/c:sec#2]"},
+	} {
+		f := x.fetch(c.path, whole)
+		if f.header.Get("Content-Type") != "application/json" {
+			t.Errorf("%s: %s, want JSON sealed per entry", c.path, f.header.Get("Content-Type"))
+			continue
+		}
+		if got := p37Kids(t, f.body); fmt.Sprint(got) != c.want {
+			t.Errorf("%s: kids %v, want %s", c.path, got, c.want)
+		}
+		for _, h := range decodeJSON(t, f.body)["hits"].([]any) {
+			h := h.(map[string]any)
+			if _, sealed := h["sealed"]; sealed {
+				continue
+			}
+			keys := slices.Sorted(maps.Keys(h))
+			want := []string{"id", "resource", "url"}
+			if _, ok := h["ns"]; ok {
+				want = []string{"id", "ns", "resource", "url"}
+			}
+			if !slices.Equal(keys, want) {
+				t.Errorf("%s: a hit by name only has %v", c.path, keys)
+			}
+		}
+	}
+	// Counts are served only sealed whole: 400.
+	if r := follow("/sec?q=old&counts=/tag"); r.status != 400 || r.body["code"] != "bad_input" {
+		t.Errorf("counts over a lacking epoch: %d %v", r.status, r.body)
 	}
 }

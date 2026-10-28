@@ -514,7 +514,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 				var fe *FieldError
 				if _, got, err := ix.answer(ctx, a, ns, rv, rq, info); err == nil {
 					to = got
-				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) {
+				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) && !errors.Is(err, errLackCounts) {
 					ix.opt.Logf("index: query %s: %v", r.URL, err)
 				}
 			}
@@ -551,7 +551,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	case errors.As(err, &fe):
 		writeErr(w, http.StatusBadRequest, "bad_input", fe.Error())
 		return
-	case errors.Is(err, errCounts) || errors.Is(err, errEpochCounts):
+	case errors.Is(err, errCounts) || errors.Is(err, errEpochCounts) || errors.Is(err, errLackCounts):
 		writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
 		return
 	case errors.Is(err, errEpochKey):
@@ -594,6 +594,11 @@ var errCounts = errors.New("counts over a sealed namespace are served only seale
 // only sealed whole.
 var errEpochCounts = errors.New("counts over documents served under several epochs can't be sealed whole under one epoch's key, and are served only sealed whole (§E.2.6)")
 
+// errLackCounts refuses counts over documents served under an epoch whose
+// key the service's grant gets none of (400, §E.2.6): such hits are served
+// by name only, per entry, and counts are served only sealed whole.
+var errLackCounts = errors.New("counts over documents served under an epoch the index gets no key for can't be sealed whole, and are served only sealed whole (§E.2.6)")
+
 // errEpochKey is a key of an epoch a hit's document is served under, which
 // seals it (§E.2.6), that the service can't obtain for now: 503 behind.
 var errEpochKey = errors.New("the index cannot obtain the key of an epoch a hit is served under")
@@ -617,21 +622,34 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	if perEntry && len(q.Counts) > 0 {
 		return derived.Stored{}, "", errCounts
 	}
+	// An epoch whose key the service's grant gets none of, for good (a 4xx
+	// from /keys, no key for it, one it can't unwrap: !derived.Retryable),
+	// leaves the hits served under it by name only, in a result sealed per
+	// entry (§E.2.6), kept so; one it can't get for now is behind.
 	keys := map[int]derived.Key{}
-	keyAt := func(epoch int) (derived.Key, error) {
+	lacking := map[int]bool{}
+	keyAt := func(epoch int) (k derived.Key, lacks bool, err error) {
 		if epoch <= 0 {
 			epoch = info.Epoch
 		}
 		if k, ok := keys[epoch]; ok {
-			return k, nil
+			return k, false, nil
 		}
-		k, err := ix.keys.KeyAt(ctx, ns, epoch)
-		if err != nil {
+		if lacking[epoch] {
+			return k, true, nil
+		}
+		k, err = ix.keys.KeyAt(ctx, ns, epoch)
+		switch {
+		case err != nil && !derived.Retryable(err):
+			ix.opt.Logf("index: key of %s epoch %d, for good: %v (its hits by name only)", ns, epoch, err)
+			lacking[epoch] = true
+			return k, true, nil
+		case err != nil:
 			ix.opt.Logf("index: key of %s epoch %d: %v", ns, epoch, err)
-			return k, fmt.Errorf("%w (%s#%d)", errEpochKey, ns, epoch)
+			return k, false, fmt.Errorf("%w (%s#%d)", errEpochKey, ns, epoch)
 		}
 		keys[epoch] = k
-		return k, nil
+		return k, false, nil
 	}
 	var allow func(string) bool
 	if !a.all {
@@ -662,6 +680,17 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 			whole = info.Epoch
 			for e := range epochs {
 				whole = e
+			}
+			// One epoch whose key the service lacks: per entry, by name
+			// only, as for several epochs.
+			_, lacks, err := keyAt(whole)
+			switch {
+			case err != nil:
+				return derived.Stored{}, "", err
+			case lacks && len(q.Counts) > 0:
+				return derived.Stored{}, "", errLackCounts
+			case lacks:
+				perEntry = true
 			}
 		}
 	}
@@ -703,9 +732,14 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 					values[k] = v
 				}
 			}
-			key, err := keyAt(h.epoch)
+			key, lacks, err := keyAt(h.epoch)
 			if err != nil {
 				return derived.Stored{}, "", err
+			}
+			if lacks {
+				m = map[string]any{"resource": m["resource"], "id": m["id"], "url": m["url"]}
+				hits = append(hits, m)
+				continue
 			}
 			jwe, err := derived.SealItem(key, view, h.Resource, values)
 			if err != nil {
@@ -729,7 +763,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	}
 	st := derived.Stored{JSON: true, Tags: resultTags(ns, res)}
 	if info.Protected() && !perEntry {
-		key, err := keyAt(whole)
+		key, _, err := keyAt(whole) // found above
 		if err != nil {
 			return derived.Stored{}, "", err
 		}
