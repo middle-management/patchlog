@@ -632,8 +632,13 @@ func (st *reqState) svcDir(ctx context.Context, cat string, ents []svcItem) (*tr
 		if ok {
 			te.order = e.Order
 			kids = append(kids, te)
-			if t, err := time.Parse(time.RFC3339Nano, e.Born); err == nil {
-				born[e.Name] = t
+			// A born sealed apart (§E.2.6) is an object, and orders as
+			// none: it comes only in a sealed catalog, not offered (§H.3).
+			var b string
+			if json.Unmarshal(e.Born, &b) == nil {
+				if t, err := time.Parse(time.RFC3339Nano, b); err == nil {
+					born[e.Name] = t
+				}
 			}
 		}
 	}
@@ -730,16 +735,16 @@ func (st *reqState) svcProbe(ctx context.Context, cat, folder string, mins []str
 // svcItem is an entry of a children listing, of roots or a lookup's node
 // (§B.5, §H.3).
 type svcItem struct {
-	Name   string   `json:"name"`
-	Kind   string   `json:"kind"`
-	Title  string   `json:"title"`
-	Sealed *string  `json:"sealed"` // a title sealed (§E.2.6)
-	Item   string   `json:"item"`
-	Head   string   `json:"head"`
-	Self   bool     `json:"self"`
-	File   *svcFile `json:"file"`
-	Born   string   `json:"born"`  // the created of the node's first revision (§B.5)
-	Order  string   `json:"order"` // its parents entry's order there (§B.2)
+	Name   string          `json:"name"`
+	Kind   string          `json:"kind"`
+	Title  string          `json:"title"`
+	Sealed *string         `json:"sealed"` // a title sealed (§E.2.6)
+	Item   string          `json:"item"`
+	Head   string          `json:"head"`
+	Self   bool            `json:"self"`
+	File   *svcFile        `json:"file"`
+	Born   json.RawMessage `json:"born"`  // the created of the node's first revision (§B.5), or { "sealed": JWE } (§E.2.6)
+	Order  string          `json:"order"` // its parents entry's order there (§B.2)
 }
 
 // svcFile is a placement's file metadata (§H.3).
