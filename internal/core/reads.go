@@ -792,6 +792,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			fromSeq = s
 		}
+		// Events and long-poll from a purged namespace's purge-ns entry,
+		// its last, are 410 purged, so a follower can tell the end from a
+		// restart; an immutable range from it stays an empty page (§8.5).
+		if n.purged && resource == "" && (perEntry || live != nil) && since != "" && fromSeq == n.headSeq.Int64 {
+			return t.purgedRead(n)
+		}
 		q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures, via FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
 		args := []any{n.id, fromSeq, toSeq}
 		if limit > 0 {

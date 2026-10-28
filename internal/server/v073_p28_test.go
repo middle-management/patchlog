@@ -430,7 +430,7 @@ func TestV073P28SealedResourcePurgePruneEvents(t *testing.T) {
 }
 
 // §7.3, §8.5 (RH-35): a namespace stream ends after emitting its purge-ns
-// event, and one whose since names that entry sends the headers and ends.
+// event, and one whose since names that entry is 410 purged (v0.74).
 func TestV073P28NamespaceStreamEndsAtPurge(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -455,18 +455,9 @@ func TestV073P28NamespaceStreamEndsAtPurge(t *testing.T) {
 	}
 	p28Ends(t, "after the replayed purge-ns", ch, 5*time.Second)
 
-	// since names the purge-ns entry: the headers, then the end.
-	for _, hdr := range []map[string]string{nil, {"Last-Event-ID": purgeNS}} {
-		path := "/ns/docs/events?since=" + purgeNS
-		if hdr != nil {
-			path = "/ns/docs/events"
-		}
-		st, ch := e.p28SSE(path, hdr)
-		if st != 200 {
-			t.Fatalf("since the purge-ns entry: %d", st)
-		}
-		p28Ends(t, "since the purge-ns entry", ch, 5*time.Second)
-	}
+	// since names the purge-ns entry: 410 purged (v0.74, §8.5).
+	expectPurged(t, e.get("/ns/docs/events?since="+purgeNS), purgeNS)
+	expectPurged(t, e.do(req{method: "GET", path: "/ns/docs/events", hdr: map[string]string{"Last-Event-ID": purgeNS}}), purgeNS)
 }
 
 // §7.3, §C.2, §C.5.3 (RH-36): a stream ends, at the latest, when the

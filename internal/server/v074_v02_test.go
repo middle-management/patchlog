@@ -67,3 +67,30 @@ func TestV074BlobCopyPreconditionFirst(t *testing.T) {
 	expectCode(t, put(blobPath("sec", "c", bid), map[string]string{"Blob-From": "/nope", "If-None-Match": "*"}), 400, "bad_input")
 	expect(t, put(blobPath("sec", "c", bid), map[string]string{"Blob-From": from}), 201)
 }
+
+// §8.5 (v0.74, CORE-4): in an unsealed purged namespace, events and
+// long-poll from the purge-ns entry are 410 purged with head; earlier
+// since values and the immutable range from it are served as before.
+func TestV074PurgedStreamFromPurgeNS(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("n", map[string]any{"read": "public"})
+	e.create("n", "a", map[string]any{})
+	before := e.nsHead("n")
+	p := e.nsPurge("n")
+	expectPurged(t, e.get("/ns/n/events?since="+p), p)
+	expectPurged(t, e.do(req{method: "GET", path: "/ns/n/events", hdr: map[string]string{"Last-Event-ID": p}}), p)
+	expectPurged(t, e.get("/ns/n/log?since="+p+"&live=long-poll"), p)
+	// A long-poll from before the purge gets its entries at once.
+	r := e.get("/ns/n/log?since=" + before + "&live=long-poll")
+	expect(t, r, 200)
+	if es := r.Arr(); len(es) != 2 || es[1].(map[string]any)["kind"] != "purge-ns" {
+		t.Fatalf("long-poll from before the purge: %s", r.Body)
+	}
+	// The immutable range from it is an empty page.
+	r = e.get("/ns/n/rev/" + p + "/log?since=" + p)
+	expect(t, r, 200)
+	if len(r.Arr()) != 0 {
+		t.Fatalf("range from the purge-ns entry: %s", r.Body)
+	}
+}
