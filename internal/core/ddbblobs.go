@@ -95,6 +95,7 @@ func (b *ddbBackend) uploadBlob(ctx context.Context, req Request, name string, b
 			Created: t.now.UnixMilli(), Uploader: g.uploader,
 		})
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			continue
 		}
 		if err != nil {

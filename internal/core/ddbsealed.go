@@ -315,6 +315,7 @@ func (b *ddbBackend) rotateEpoch(ctx context.Context, ns, author string, ifDue b
 			EpochKey: ek, Pins: r.configPins(ns)}
 		_, err = b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			continue
 		}
 		if err != nil {

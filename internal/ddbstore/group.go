@@ -284,6 +284,9 @@ func (s *Store) commitGroup(ns string, group []*groupMember, known *tip) *tip {
 			}
 			s.g.committed.Add(1)
 			s.g.appended.Add(int64(len(live)))
+			if s.OnGroup != nil {
+				s.OnGroup(len(live))
+			}
 			last := res[len(res)-1]
 			return &tip{headPos: last.Pos, headID: last.NSID}
 		}

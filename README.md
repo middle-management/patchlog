@@ -1061,6 +1061,12 @@ What is instrumented:
 - **Postgres**: `patchlog.groupcommit.size` (writes per group commit transaction, D.8) and
   `patchlog.db.lock.wait` (s, by `patchlog.lock` = `ns` or `log`: time waiting for advisory
   locks).
+- **DynamoDB** (docs/DYNAMODB.md): under `core.db.read` and `core.db.update`, a client span per
+  DynamoDB call (`DynamoDB.GetItem`, `DynamoDB.TransactWriteItems`, …, with `rpc.method` and
+  `aws.dynamodb.table_names`); a call refused by its conditions is an outcome, marked
+  `patchlog.dynamodb.condition_failed`, not a span error. `patchlog.groupcommit.size` as on
+  Postgres, and `patchlog.db.conflicts` (commits that found what their checks read had moved,
+  and were checked again: DynamoDB's optimistic concurrency in place of locks).
 - **Consumers** (index, tree, catalog): `patchlog.follow.units` (units applied, by
   `patchlog.follow.snapshot`) and `patchlog.follow.lag` (s: from the newest applied entry's
   `created` to its application, so catching up shows as large values).

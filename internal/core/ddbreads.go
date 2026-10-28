@@ -880,8 +880,10 @@ func (r *ddbReads) nextEntryCreated(ns, seq int64) (int64, bool) {
 
 // gateRead runs f on a gate over the table's
 // reads, what they panic with returned as errors (ddbCheck).
-func (b *ddbBackend) gateRead(ctx context.Context, f func(t *gate) error) error {
+func (b *ddbBackend) gateRead(ctx context.Context, f func(t *gate) error) (err error) {
 	e := b.e
+	ctx, span := e.dbSpan(ctx, "core.db.read")
+	defer func() { endDBSpan(span, err) }()
 	g := &gate{checkReads: newDDBReads(ctx, b), checkState: &checkState{e: e, now: e.now()}}
 	err, perr := ddbCheck(func() error { return f(g) })
 	if perr != nil {

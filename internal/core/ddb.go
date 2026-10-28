@@ -104,6 +104,7 @@ func openDDB(opt Options) (*Engine, error) {
 		OpenValue: func(ctx context.Context, ns, name, kind, key, raw string) (string, error) {
 			return b.openValue(ctx, ns, name, kind, key, raw)
 		},
+		OnGroup: observeGroup,
 	})
 	if err != nil {
 		return nil, err

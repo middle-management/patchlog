@@ -62,6 +62,7 @@ func (b *ddbBackend) createBranch(ctx context.Context, req Request, br BranchReq
 		}
 		cres, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			continue
 		}
 		if err != nil {

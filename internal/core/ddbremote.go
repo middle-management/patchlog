@@ -72,6 +72,7 @@ func (b *ddbBackend) registerRemote(ctx context.Context, req Request, rr RemoteR
 		}
 		cres, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			continue
 		}
 		if err != nil {
@@ -645,6 +646,7 @@ func (b *ddbBackend) mirrorInto(ctx context.Context, ns string, schemas []*remot
 		}
 		_, err = b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			continue
 		}
 		if err != nil {
@@ -685,6 +687,7 @@ func (b *ddbBackend) requireNonces(ctx context.Context, ns string, a *actor, gid
 			Entry:  map[string]any{"kind": "config", "target": p.id.String()}, Kind: "config"}
 		_, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
+			observeConflict()
 			continue
 		}
 		return asErrOrNil(err)
