@@ -2,11 +2,13 @@ package index_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/follow"
 )
@@ -96,5 +98,32 @@ func TestV074V03DependentSchemasWhateverTheData(t *testing.T) {
 	counts, _ := body["counts"].(map[string]any)
 	if got, _ := counts["/b"].(map[string]any); len(got) != 1 || got["x"] != 1.0 {
 		t.Errorf("counts %v, want {/b: {x: 1}}", body["counts"])
+	}
+}
+
+// SERVICES-1 (§A.5, §A.4, Open 84): on a query of one namespace, a min
+// naming another namespace is 400, the body's min listing it, even one the
+// service follows and the reader may see, which v0.51 waited for and
+// redirected; no wait comes first.
+func TestV074V03ForeignMinStrict(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "schemas"}, minWait: time.Minute})
+	w.doc(t, "derby", w.match, map[string]any{"title": "The Derby"})
+	at := s.caughtUp("matches")
+	sch := s.caughtUp("schemas")
+	start := time.Now()
+	for _, u := range []string{"/matches?q=derby&min=schemas:" + sch, "/matches/at/" + at + "?q=derby&min=schemas:" + sch,
+		"/matches?q=derby&min=matches:" + at + "&min=schemas:" + sch} {
+		r := s.raw(u, "")
+		if r.status != 400 || r.body["code"] != "bad_input" || fmt.Sprint(r.body["min"]) != fmt.Sprint([]string{"schemas:" + sch}) {
+			t.Errorf("%s: %d %v, want 400 listing schemas:%s", u, r.status, r.body, sch)
+		}
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("waited %s before refusing", d)
+	}
+	if r := s.raw("/matches?q=derby&min=matches:"+at, ""); r.status != 302 {
+		t.Errorf("a min of matches: %d %v", r.status, r.body)
 	}
 }

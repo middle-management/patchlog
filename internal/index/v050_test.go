@@ -2,6 +2,7 @@ package index_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -18,8 +19,8 @@ import (
 // An at URL whose result already includes every min redirects to itself
 // without min; anything else waits for min and redirects to the current
 // checkpoint, without min, or answers 503 behind if min isn't reached in
-// time. A min of another followed namespace is never included in a result
-// of one namespace.
+// time. A min of another followed namespace is 400 on a query of one
+// namespace (v0.74, Open 84).
 func TestMinAlwaysRedirects(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -52,11 +53,10 @@ func TestMinAlwaysRedirects(t *testing.T) {
 	cur := s.caughtUp("matches")
 	curLoc := "/matches/at/" + cur + q
 	for m, want := range map[string]string{
-		"matches:" + first:     loc,
-		at:                     loc,
-		rematch:                curLoc,
-		"matches:" + rematch:   curLoc,
-		"schemas:" + schemasAt: curLoc,
+		"matches:" + first:   loc,
+		at:                   loc,
+		rematch:              curLoc,
+		"matches:" + rematch: curLoc,
 		// A bare min is given once (§A.5, v0.73): more name the
 		// namespace.
 		"matches:" + first + "&min=matches:" + at:  loc,
@@ -66,6 +66,11 @@ func TestMinAlwaysRedirects(t *testing.T) {
 		if r.status != 302 || r.header.Get("Location") != want {
 			t.Errorf("kept at, min=%s: %d %s, want %s", m, r.status, r.header.Get("Location"), want)
 		}
+	}
+	// A min of another followed namespace is 400, listing it (v0.74, Open
+	// 84).
+	if r := s.raw(loc+"&min=schemas:"+schemasAt, ""); r.status != 400 || fmt.Sprint(r.body["min"]) != fmt.Sprint([]string{"schemas:" + schemasAt}) {
+		t.Errorf("kept at, min=schemas:%s: %d %v, want 400", schemasAt, r.status, r.body)
 	}
 	if r := s.raw(loc, ""); r.status != 200 || r.body["at"] != at || strings.Join(resources(r.body), ",") != "derby" {
 		t.Errorf("kept at: %d %v", r.status, r.body)
