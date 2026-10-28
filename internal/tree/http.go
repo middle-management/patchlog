@@ -221,9 +221,10 @@ func (s *Service) viewer(ctx context.Context, r *http.Request, want string) (*vi
 }
 
 // edgeClaims is the edge grant the service minted that a GET or HEAD
-// without Authorization carries, covering its path, if any.
+// without Authorization, not even an empty one (§C.5.3), carries, covering
+// its path, if any.
 func (s *Service) edgeClaims(r *http.Request) *edge.Claims {
-	if s.opt.EdgeGrants == nil || r.Header.Get("Authorization") != "" {
+	if s.opt.EdgeGrants == nil || len(r.Header.Values("Authorization")) > 0 {
 		return nil
 	}
 	return s.opt.EdgeGrants.FromRequest(r, s.opt.Now())

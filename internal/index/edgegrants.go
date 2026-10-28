@@ -257,9 +257,10 @@ func edgeGS(p string) (ns, gs string, ok bool) {
 }
 
 // edgeClaims is the edge grant the service minted that a GET or HEAD
-// without Authorization carries, covering its path, if any.
+// without Authorization, not even an empty one (§C.5.3), carries, covering
+// its path, if any.
 func (ix *Index) edgeClaims(r *http.Request) *edge.Claims {
-	if ix.opt.EdgeGrants == nil || r.Header.Get("Authorization") != "" {
+	if ix.opt.EdgeGrants == nil || len(r.Header.Values("Authorization")) > 0 {
 		return nil
 	}
 	return ix.opt.EdgeGrants.FromRequest(r, ix.opt.Now())
