@@ -209,7 +209,9 @@ reference implements the reading noted here.
   from sealed serves a blob a pre-raise revision references as the source does, `…/blob/{bid}`
   redirecting to its epoch and `…/e/{e}` the source's sealing; before, the shadow of the
   branch, which has no raise of its own, ended the search, so the epoch URL was `404` and
-  `…/blob/{bid}` served the plaintext.
+  `…/blob/{bid}` served the plaintext. Its resource logs page as the source's too (§7.1
+  Paging): the first page ends before the raise, its entries sealed as the source serves them;
+  before, one page spanned the raise and served the entries from before it in the clear.
 
 ## v0.23.0
 
