@@ -39,9 +39,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"errors"
-	"fmt"
-	"io/fs"
-	"os"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -444,13 +442,19 @@ func (t *tx) blobEpochRow(n *nsRow, name string, bid ids.ID, ep int) (data []byt
 
 // openBlobFile opens a file a row names, or panics with errBytesGone if
 // it is gone (deleted after this read began).
-func (t *gate) openBlobFile(name string) *os.File {
-	f, err := t.e.blobs.open(name)
-	if errors.Is(err, fs.ErrNotExist) {
-		panic(fmt.Errorf("%w: %s", errBytesGone, name))
-	}
+func (t *gate) openBlobFile(name string) io.ReadSeekCloser {
+	f, err := t.e.openStored(t.context(), name)
 	t.must(err)
 	return f
+}
+
+// context is the context of the reads the gate runs over, for the blob
+// store's requests.
+func (t *gate) context() context.Context {
+	if c, ok := t.checkReads.(interface{ context() context.Context }); ok {
+		return c.context()
+	}
+	return context.Background()
 }
 
 // deleteBlobEpochs deletes the stored sealings of blobs matching where, a

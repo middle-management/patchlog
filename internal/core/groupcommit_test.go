@@ -1082,7 +1082,7 @@ func TestPGGroupCommitKidPerWrite(t *testing.T) {
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e, err := Open(Options{Path: pgtest.NewDB(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.NewDB(t), BlobStore: fileBlobs(t), OperatorKeys: ops, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Limits: lim, TailInterval: tailEvery, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
@@ -1230,7 +1230,7 @@ func TestPGGroupCommitAloneDrawsTokensOnce(t *testing.T) {
 	fast := Rate{1e9, 1e9}
 	lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast
 	lim.RatePerResource = Rate{1e-9, 1}
-	e, err := Open(Options{Path: pgtest.NewDB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.NewDB(t), BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Limits: lim, TailInterval: tailEvery, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)

@@ -221,7 +221,7 @@ func newRemoteDeployment(t *testing.T, aURL string) *remoteDeployment {
 	if err != nil {
 		t.Fatal(err)
 	}
-	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: "https://b.example", OperatorKeys: ks,
+	o := core.Options{Path: pgtest.DB(t), BlobStore: testenv.FileBlobs(t), Origin: "https://b.example", OperatorKeys: ks,
 		Purger: nopPurger{}, RetentionInterval: -1, LongPollInterval: 300 * time.Millisecond,
 		Remote: core.RemoteOptions{FollowInterval: -1, Resolve: func(origin string) (core.RemoteEndpoint, error) {
 			if origin != clienttest.Origin {

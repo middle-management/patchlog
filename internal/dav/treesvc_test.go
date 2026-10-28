@@ -95,6 +95,14 @@ func startTree(t *testing.T, cs *clienttest.Server, cat string, opts ...client.O
 // a tree service without §B.11.
 func startTreeWith(t *testing.T, cs *clienttest.Server, cat string, rv tree.RoleView, opts ...client.Option) *treeRun {
 	t.Helper()
+	return startTreeWait(t, cs, cat, rv, 200*time.Millisecond, opts...)
+}
+
+// startTreeWait is startTreeWith with minWait the tree service's MinWait:
+// how long a listing with ?min= waits for the service to reach the
+// entries before it answers 503.
+func startTreeWait(t *testing.T, cs *clienttest.Server, cat string, rv tree.RoleView, minWait time.Duration, opts ...client.Option) *treeRun {
+	t.Helper()
 	r := &treeRun{t: t}
 	base := http.DefaultTransport.(*http.Transport).Clone()
 	hold := func(ctx context.Context) error {
@@ -126,7 +134,7 @@ func startTreeWith(t *testing.T, cs *clienttest.Server, cat string, rv tree.Role
 	})
 	r.core = cs.Client(t, append([]client.Option{client.WithAuthor("tree"), client.WithHTTPClient(&http.Client{Transport: rt})}, opts...)...)
 	svc, err := tree.Open(context.Background(), tree.Options{Client: r.core, Catalog: cat, DB: filepath.Join(t.TempDir(), "tree.db"),
-		MinWait: 200 * time.Millisecond, RepurgeInterval: -1, Logf: t.Logf, RoleView: rv,
+		MinWait: minWait, RepurgeInterval: -1, Logf: t.Logf, RoleView: rv,
 		FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)}})
 	if err != nil {
 		t.Fatal(err)
@@ -476,17 +484,26 @@ func TestTreeServiceSealedEntries(t *testing.T) {
 // tree service lists it (a placement of a namespace the catalog doesn't
 // trust is dangling there, §B.5, and is left out with or without a tree
 // service, §H.2 "Untrusted namespaces"); other users' listings don't wait.
+//
+// The gateway waits ownWait for the tree service to reach a write, and the
+// tree service itself longer (a ?min= answers 503 only after its MinWait):
+// on a loaded machine following the write can take a second or more, and
+// a listing that gave up sooner would come from the node documents.
+// ownWait stays under the gateway's slowFor (5s), which a slow tree
+// service's catalog is marked for from when its listing began: so the
+// lagging listing below waits once, not once per folder.
 func TestTreeServiceOwnWrites(t *testing.T) {
 	t.Parallel()
+	const ownWait = 2 * time.Second
 	var log coreLog
 	e := treeEnv(t, log.wrap)
 	must(e.c.CreateNamespace(e.ctx, "secret", map[string]any{"read": "public"}))
 	e.create("secret", "plans", map[string]any{"launch": "monday"})
 	e.create("cat", "secret.plans", map[string]any{"title": "plans.json", "parents": parents("cat", "season")})
 	sameStrings(t, "Season without a tree service", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
-	tr := startTree(t, e.s, "cat")
+	tr := startTreeWait(t, e.s, "cat", scopeRoles{}, 2*ownWait)
 	tr.caughtUp("cat", "matches")
-	ts := treeDav(e, tr.http.URL, options(func(o *dav.Options) { o.TreeWait = 3 * time.Second }))
+	ts := treeDav(e, tr.http.URL, options(func(o *dav.Options) { o.TreeWait = ownWait }))
 	sameStrings(t, "Season", names(ts.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
 
 	viaTree := func(what string) {
@@ -522,15 +539,14 @@ func TestTreeServiceOwnWrites(t *testing.T) {
 	viaTree("the listing after an edit")
 
 	// The tree service stops following: the writer's listing waits up to
-	// TreeWait (the tree service answers 503 sooner), then reads the node
-	// documents.
+	// TreeWait, then reads the node documents.
 	tr.paused.Store(true)
 	ts.expect(ts.do("PUT", "/cat/Season/late.txt", "late"), 201, "PUT while the tree service lags")
 	log.take()
 	start := time.Now()
 	sameStrings(t, "Season while the tree service lags", names(ts.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json", "late.txt"})
-	if d := time.Since(start); d > 3*time.Second {
-		t.Fatalf("the listing took %v", d)
+	if d := time.Since(start); d > ownWait+2*time.Second {
+		t.Fatalf("the listing took %v, waiting up to %v", d, ownWait)
 	}
 	if paths := log.take(); !strings.Contains(strings.Join(paths, " "), "/ns/cat/rev/") {
 		t.Fatalf("not listed from the node documents: %q", paths)

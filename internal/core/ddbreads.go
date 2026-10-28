@@ -1019,6 +1019,8 @@ func (r *ddbReads) blobArchive(res int64, bid ids.ID) string {
 	return u
 }
 
+func (r *ddbReads) context() context.Context { return r.ctx }
+
 func (r *ddbReads) openBytes(owner int64, hash []byte) blobContent {
 	data, file, ok, err := r.s.Bytes(r.ctx, hash)
 	r.must(err)
@@ -1028,7 +1030,7 @@ func (r *ddbReads) openBytes(owner int64, hash []byte) blobContent {
 	if owner != 0 {
 		// Encrypted under their owner's key: opened whole.
 		if file != "" {
-			f, err := r.e.blobs.open(file)
+			f, err := r.e.openStored(r.ctx, file)
 			r.must(err)
 			data, err = io.ReadAll(f)
 			f.Close()
@@ -1041,7 +1043,7 @@ func (r *ddbReads) openBytes(owner int64, hash []byte) blobContent {
 	if file == "" {
 		return memContent(data)
 	}
-	f, err := r.e.blobs.open(file)
+	f, err := r.e.openStored(r.ctx, file)
 	r.must(err)
 	return fileContent(f)
 }

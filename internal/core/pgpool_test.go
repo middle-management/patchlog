@@ -42,7 +42,7 @@ func TestParsePGPool(t *testing.T) {
 // quarter of it for the buckets.
 func TestPGPoolCap(t *testing.T) {
 	url := pgtest.NewDB(t)
-	e, err := Open(Options{Path: url, BlobDir: t.TempDir(), AuthDisabled: true})
+	e, err := Open(Options{Path: url, BlobStore: fileBlobs(t), AuthDisabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestPGPoolCap(t *testing.T) {
 		t.Errorf("bucket pool: %d connections, want %d", got, want)
 	}
 	bad := strings.Replace(url, "pool_max_conns=8", "pool_max_conns=1", 1)
-	if _, err := Open(Options{Path: bad, BlobDir: t.TempDir(), AuthDisabled: true}); err == nil || !strings.Contains(err.Error(), "pool_max_conns") {
+	if _, err := Open(Options{Path: bad, BlobStore: fileBlobs(t), AuthDisabled: true}); err == nil || !strings.Contains(err.Error(), "pool_max_conns") {
 		t.Errorf("pool_max_conns=1: %v, want refused", err)
 	}
 }

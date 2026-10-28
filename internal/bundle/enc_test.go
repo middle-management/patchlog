@@ -41,7 +41,7 @@ func newEncDeployment(t *testing.T, origin string) *deployment {
 	if err != nil {
 		t.Fatal(err)
 	}
-	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: origin, AuthDisabled: true, Purger: nopPurger{}, KeyStore: ks}
+	o := core.Options{Path: pgtest.DB(t), BlobStore: testenv.FileBlobs(t), Origin: origin, AuthDisabled: true, Purger: nopPurger{}, KeyStore: ks}
 	testenv.Apply(&o)
 	e, err := core.Open(o)
 	if err != nil {

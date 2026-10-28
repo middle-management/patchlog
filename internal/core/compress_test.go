@@ -192,7 +192,7 @@ func compressEngine(t testing.TB, path, mode string, min int, opts ...func(*Opti
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	o := Options{Path: path, BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	o := Options{Path: path, BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Limits: lim, Purger: discardPurger{}, StoreCompression: mode, StoreCompressMin: min}
 	for _, f := range opts {
 		f(&o)

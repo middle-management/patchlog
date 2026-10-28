@@ -16,6 +16,7 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/server"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
+	"github.com/middle-management/patchlog/internal/testenv"
 )
 
 // Store compression (core.Options.StoreCompression) applies only to
@@ -32,7 +33,7 @@ func TestStoreCompressionLevels(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "levels.db")
 	ks, err := keystore.New(keystore.Generate())
 	noErr(t, err)
-	e, err := core.Open(core.Options{Path: path, BlobDir: t.TempDir(), Origin: cmsOrigin, AuthDisabled: true, Purger: nopPurger{}, KeyStore: ks,
+	e, err := core.Open(core.Options{Path: path, BlobStore: testenv.FileBlobs(t), Origin: cmsOrigin, AuthDisabled: true, Purger: nopPurger{}, KeyStore: ks,
 		RetentionInterval: -1, StoreCompression: "zstd", StoreCompressMin: 64})
 	noErr(t, err)
 	hs := httptest.NewServer(clienttest.CountPages(server.New(e)))
