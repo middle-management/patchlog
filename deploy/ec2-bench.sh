@@ -19,7 +19,11 @@
 #   REGION   the table's region (default: aws configure's)
 #   TABLE    the table (default patchlog); made, on-demand, if it's missing
 #   VERSION  a release to run instead of building, e.g. v0.24.0-ddb.3
-#   TYPE     the instance type (default c7g.large, arm64)
+#   TYPE     the instance type (default c7g.xlarge, arm64: 4 cores for the
+#            server, oha and the server's console spans)
+#   SAMPLE   the share of requests traced (default 1, 0.1 above 300 writes/s:
+#            every request's spans would cost the server and spans.py more
+#            than they tell); spans.py scales its units per second back up
 #   SUBNET   a subnet with a route out (default: the default VPC's)
 #
 # What it makes, after asking (-y doesn't ask):
@@ -36,7 +40,7 @@ set -euo pipefail
 REGION=${REGION:-${AWS_REGION:-$(aws configure get region || true)}}
 TABLE=${TABLE:-patchlog}
 VERSION=${VERSION:-}
-TYPE=${TYPE:-c7g.large}
+TYPE=${TYPE:-c7g.xlarge}
 OHA=${OHA:-v1.14.0}
 READS=${READS:-}; LOGS=${LOGS:-}; NAMESPACES=${NAMESPACES:-}
 ROLE=patchlog-bench
@@ -57,6 +61,8 @@ fi
 YES=""
 [ "${1:-}" = -y ] && { YES=1; shift; }
 RATE=${1:-100}; SECS=${2:-20}
+SAMPLE=${SAMPLE:-$([ "$RATE" -gt 300 ] 2>/dev/null && echo 0.1 || echo 1)}
+case $SAMPLE in 0.[0-9]*|1) ;; *) echo "ec2-bench: SAMPLE is a share of requests, 0.01 to 1" >&2; exit 2 ;; esac
 case "$RATE$SECS$READS$LOGS$NAMESPACES" in *[!0-9]*) echo "usage: $0 [-y] [writes/s] [seconds] | cleanup" >&2; exit 2 ;; esac
 
 # What's there, and what would be made.
@@ -90,7 +96,7 @@ echo "  table $TABLE: $([ -n "$table_arn" ] && echo exists || echo 'to make (on-
 echo "  role $ROLE: $([ -n "$have_role" ] && echo 'exists (its DynamoDB policy is set to this table)' || echo 'to make')"
 echo "  instance: $TYPE ($arch, $ami) in $SUBNET, terminated on exit"
 echo "  server: $server"
-echo "  run: bench $RATE writes/s for ${SECS}s${READS:+, reads $READS/s}${LOGS:+, logs $LOGS/s}${NAMESPACES:+, over $NAMESPACES namespaces}"
+echo "  run: bench $RATE writes/s for ${SECS}s${READS:+, reads $READS/s}${LOGS:+, logs $LOGS/s}${NAMESPACES:+, over $NAMESPACES namespaces}, tracing $SAMPLE of requests"
 if [ -z "$YES" ]; then
   read -r -p "Go ahead? [y/N] " ok
   [ "$ok" = y ] || [ "$ok" = Y ] || exit 1
@@ -166,14 +172,14 @@ cat >run.sh <<'RUN'
 set -eu
 cd /opt/bench
 export PATH=/opt/bench:\$PATH
-OTEL_TRACES_EXPORTER=console OTEL_METRICS_EXPORTER=none \\
+OTEL_TRACES_EXPORTER=console OTEL_METRICS_EXPORTER=none OTEL_TRACES_SAMPLER=traceidratio OTEL_TRACES_SAMPLER_ARG=$SAMPLE \\
   ./patchlog serve -dev -addr 127.0.0.1:8080 -max-rate-per-namespace 100000,1000000 \\
     -db 'dynamodb://$TABLE?region=$REGION' 2>spans.jsonl &
 server=\$!
 for _ in \$(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8080/ && break; kill -0 \$server || { grep -v '^{' spans.jsonl; exit 1; }; sleep 1; done
 ${READS:+READS=$READS }${LOGS:+LOGS=$LOGS }${NAMESPACES:+NAMESPACES=$NAMESPACES }./bench.sh "\$1" "\$2" || echo "bench failed: \$?"
 kill \$server; wait \$server || true
-echo; ./spans.py spans.jsonl
+echo; ./spans.py --sample $SAMPLE spans.jsonl
 RUN
 chmod +x run.sh
 touch ready

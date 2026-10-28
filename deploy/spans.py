@@ -8,6 +8,13 @@ costs. Standard library only.
     ./deploy/bench.sh 8 50          # or any load; then stop the server
     ./deploy/spans.py spans.jsonl
 
+With OTEL_TRACES_SAMPLER=traceidratio and OTEL_TRACES_SAMPLER_ARG=R, a
+share R of the requests is traced (a load of thousands a second prints
+more spans than is useful); --sample R scales the units per second back
+to the whole load's:
+
+    ./deploy/spans.py --sample 0.1 spans.jsonl
+
 Per request kind (the server span's route): how many, p50 and p95 of the
 total, of the time in DynamoDB calls (summed: they run one after another)
 and of the rest (the server's own work, and waiting: for a group commit,
@@ -47,8 +54,31 @@ def ms(ns):
     return ns / 1e6
 
 
-def main(path):
-    spans = []
+# The attributes kept of a span; the rest of its JSON is dropped as it is
+# read, so a run's spans fit in memory.
+KEEP = ("code.function.name",)
+KEEP_PREFIX = "patchlog.dynamodb."
+
+
+def compact(s):
+    """What the summary reads of a span."""
+    c = {
+        "Name": s["Name"],
+        "start": instant(s["StartTime"]),
+        "dur": instant(s["EndTime"]) - instant(s["StartTime"]),
+        "root": s["Parent"]["SpanID"] == "0000000000000000",
+        "attrs": {a["Key"]: a["Value"]["Value"] for a in s.get("Attributes") or []
+                  if a["Key"] in KEEP or a["Key"].startswith(KEEP_PREFIX)},
+    }
+    if (s.get("Status") or {}).get("Code") == "Error":
+        c["msgs"] = [ea["Value"]["Value"][:160] for e in s.get("Events") or [] for ea in e.get("Attributes") or []
+                     if ea["Key"] == "exception.message"]
+    return c
+
+
+def main(path, sample):
+    by_trace = defaultdict(list)
+    n_spans = 0
     with open(path, encoding="utf-8") as f:
         for line in f:
             if not line.startswith("{"):
@@ -59,15 +89,10 @@ def main(path):
                 continue
             if "Name" not in s or "SpanContext" not in s:
                 continue
-            spans.append(s)
-    if not spans:
+            by_trace[s["SpanContext"]["TraceID"]].append(compact(s))
+            n_spans += 1
+    if not n_spans:
         sys.exit(f"{path}: no spans (was the server run with OTEL_TRACES_EXPORTER=console, its stderr saved?)")
-
-    by_trace = defaultdict(list)
-    for s in spans:
-        s["dur"] = instant(s["EndTime"]) - instant(s["StartTime"])
-        s["attrs"] = {a["Key"]: a["Value"]["Value"] for a in s.get("Attributes") or []}
-        by_trace[s["SpanContext"]["TraceID"]].append(s)
 
     kinds = defaultdict(lambda: {"total": [], "ddb": [], "rest": [], "calls": [], "ru": [], "wu": []})
     ops = defaultdict(lambda: {"dur": [], "units": [], "retried": 0, "throttled": 0, "unprocessed": 0, "failed": 0, "conditions": 0})
@@ -75,7 +100,7 @@ def main(path):
     per_sec = defaultdict(lambda: [0.0, 0.0, 0])  # second -> read units, write units, throttled
     messages = Counter()
     for trace in by_trace.values():
-        roots = [s for s in trace if s["Parent"]["SpanID"] == "0000000000000000"]
+        roots = [s for s in trace if s["root"]]
         if not roots:
             continue
         root = roots[0]
@@ -96,14 +121,12 @@ def main(path):
             o["throttled"] += throttled
             o["unprocessed"] += int(a.get("patchlog.dynamodb.unprocessed", 0))
             o["conditions"] += bool(a.get("patchlog.dynamodb.condition_failed"))
-            sec = per_sec[instant(c["StartTime"]) // 10**9]
+            sec = per_sec[c["start"] // 10**9]
             sec[0], sec[1], sec[2] = sec[0] + r, sec[1] + w, sec[2] + throttled
-            if (c.get("Status") or {}).get("Code") == "Error":
+            if "msgs" in c:
                 o["failed"] += 1
-                for e in c.get("Events") or []:
-                    for ea in e.get("Attributes") or []:
-                        if ea["Key"] == "exception.message":
-                            messages[f"{c['Name']}: {ea['Value']['Value'][:160]}"] += 1
+                for m in c["msgs"]:
+                    messages[f"{c['Name']}: {m}"] += 1
         k = kinds[root["Name"]]
         in_ddb = sum(c["dur"] for c in calls)
         k["total"].append(root["dur"])
@@ -113,7 +136,7 @@ def main(path):
         k["ru"].append(ru)
         k["wu"].append(wu)
 
-    print(f"{len(by_trace)} requests, {len(spans)} spans\n")
+    print(f"{len(by_trace)} requests, {n_spans} spans" + (f", a {sample:g} sample of the requests" if sample < 1 else "") + "\n")
     print(f"{'request':34} {'n':>5}  {'total p50/p95':>15}  {'DynamoDB p50/p95':>17}  {'rest p50/p95':>14}  {'calls':>5}  {'RU p50':>6}  {'WU p50':>6}")
     for name, k in sorted(kinds.items(), key=lambda kv: -len(kv[1]["total"])):
         print(f"{name[:34]:34} {len(k['total']):>5}  "
@@ -137,12 +160,14 @@ def main(path):
     if per_sec:
         secs = sorted(per_sec)
         busy = [per_sec[t] for t in secs[1:-1]] or [per_sec[t] for t in secs]  # whole seconds only
-        print(f"\nunits per second, over {len(busy)} whole seconds (a namespace's partition key: ~3,000 RU/s, ~1,000 WU/s)")
+        busy = [[x / sample for x in b] for b in busy]  # the whole load's, from a sample
+        print(f"\nunits per second, over {len(busy)} whole seconds (a namespace's partition key: ~3,000 RU/s, ~1,000 WU/s)"
+              + (", scaled from the sample" if sample < 1 else ""))
         for label, i in (("read", 0), ("write", 1)):
             xs = [b[i] for b in busy]
             print(f"  {label:5} mean {sum(xs) / len(xs):8.0f}   p50 {pct(xs, .5):8.0f}   max {max(xs):8.0f}")
         th = [b[2] for b in busy]
-        print(f"  throttled attempts: {sum(th)} in {sum(1 for x in th if x)} of the seconds")
+        print(f"  throttled attempts: {sum(th):.0f} in {sum(1 for x in th if x)} of the seconds")
 
     if messages:
         print("\nfailures")
@@ -150,6 +175,10 @@ def main(path):
             print(f"  {n:>6}  {m}")
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    sample = 1.0
+    if len(args) == 3 and args[0] == "--sample":
+        sample, args = float(args[1]), args[2:]
+    if len(args) != 1 or not 0 < sample <= 1:
         sys.exit(__doc__)
-    main(sys.argv[1])
+    main(args[0], sample)
