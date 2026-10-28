@@ -91,6 +91,7 @@ type purgedRun struct {
 	cp     *follow.MemoryCheckpoints
 	mu     sync.Mutex
 	purged bool // a purged state was reported
+	frozen bool // a frozen state was reported
 	err    error
 	done   chan struct{}
 }
@@ -125,6 +126,7 @@ func testFollowSealedPurged(t *testing.T, mode string) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			r.purged = r.purged || st.NS == "main" && st.Purged
+			r.frozen = r.frozen || st.NS == "main" && st.Frozen
 		}))...)
 		go func() {
 			defer close(r.done)
@@ -135,7 +137,9 @@ func testFollowSealedPurged(t *testing.T, mode string) {
 		return r
 	}
 	// ended checks a run ended at the purge: its last unit is the purge-ns
-	// at head, its checkpoint is head, and it reported the state.
+	// at head, its checkpoint is head, and it reported the state, frozen
+	// too, though the freeze's config entry is 410 with the rest of the
+	// log (§8.5).
 	ended := func(what string, r *purgedRun, head string) {
 		t.Helper()
 		<-r.done
@@ -156,8 +160,8 @@ func testFollowSealedPurged(t *testing.T, mode string) {
 		}
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		if !r.purged {
-			t.Fatalf("%s: no purged state", what)
+		if !r.purged || !r.frozen {
+			t.Fatalf("%s: purged state %v, frozen state %v", what, r.purged, r.frozen)
 		}
 	}
 

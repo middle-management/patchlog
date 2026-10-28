@@ -212,6 +212,12 @@ reference implements the reading noted here.
   `…/blob/{bid}` served the plaintext. Its resource logs page as the source's too (§7.1
   Paging): the first page ends before the raise, its entries sealed as the source serves them;
   before, one page spanned the raise and served the entries from before it in the clear.
+- Follower: a namespace purged between the head a follower reads when it starts and its check
+  for a purge at that head (the `/heads` 410, §8.5) is delivered from the log up to its `purge-ns`
+  entry, the freeze before it applied and reported as `Frozen`; before, a synthetic `purge-ns`
+  unit at the 410's head skipped those entries, so `WithOnState` never reported the freeze. A
+  purge's state now reports `Frozen` too (only a frozen namespace is purged, §8.5), including a
+  sealed one whose freeze is `410` with the rest of its log.
 
 ## v0.23.0
 
