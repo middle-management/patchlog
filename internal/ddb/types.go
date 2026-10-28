@@ -97,6 +97,12 @@ type Commit struct {
 	// CfgPos and CfgID are the configuration the write was checked under.
 	CfgPos uint64
 	CfgID  string
+	// TipPos and TipID are the namespace's log tip as the checks read it
+	// (0, "": unknown): the commit chains over it first, and reads the
+	// tip again only if its condition finds it moved — a round trip
+	// saved, the tip's condition still deciding.
+	TipPos uint64
+	TipID  string
 	Config *CommitConfig // a config change, or nil
 	Items  []CommitItem
 	// Entry is the namespace entry's hashed members (§3.5); its id chains
@@ -291,6 +297,15 @@ type ResRow struct {
 	HorizonPos uint64
 	HorizonID  string
 	Keep       string
+}
+
+// Prefetched is what Store.Prefetch read of one resource: its item as
+// Resource answers it (nil: none, or no head), and its head document
+// (DocPos 0: none), the document at DocPos.
+type Prefetched struct {
+	Res    *ResRow
+	DocPos uint64
+	Doc    []byte
 }
 
 // EntryRow is one namespace log entry as stored.

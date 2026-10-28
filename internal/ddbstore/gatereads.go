@@ -9,6 +9,7 @@ package ddbstore
 import (
 	"context"
 	"strconv"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -19,27 +20,53 @@ import (
 
 // Namespace reads ns's meta and tip; nil when it doesn't exist.
 func (s *Store) Namespace(ctx context.Context, ns string) (*ddb.NSRow, error) {
+	r, _, err := s.Prefetch(ctx, ns, nil)
+	return r, err
+}
+
+// maxPrefetch bounds the names one Prefetch reads with its namespace: two
+// keys each, within BatchGetItem's 100 with the namespace's two.
+const maxPrefetch = 40
+
+// Prefetch reads ns's meta and tip (Namespace) and, in the same round
+// trip, each of names' resource item (Resource) and head document
+// (DocAt's): what a write's checks read first, in one call rather than
+// one each. Names past maxPrefetch are left out; a name absent from the
+// result wasn't read.
+func (s *Store) Prefetch(ctx context.Context, ns string, names []string) (*ddb.NSRow, map[string]ddb.Prefetched, error) {
+	names = names[:min(len(names), maxPrefetch)]
+	keys := []map[string]types.AttributeValue{keyAV(keyMeta(ns)), keyAV(keyTip(ns))}
+	for _, n := range names {
+		keys = append(keys, keyAV(keyRes(ns, n)), keyAV(keyDocHead(ns, n)))
+	}
 	out, err := s.Client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
 		RequestItems: map[string]types.KeysAndAttributes{
-			s.Table: {Keys: []map[string]types.AttributeValue{keyAV(keyMeta(ns)), keyAV(keyTip(ns))}, ConsistentRead: boolptr(true)},
+			s.Table: {Keys: keys, ConsistentRead: boolptr(true)},
 		},
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(out.UnprocessedKeys) > 0 {
-		return nil, apiErr(503, "throughput", "detail", "unprocessed keys")
+		return nil, nil, apiErr(503, "throughput", "detail", "unprocessed keys")
 	}
 	var r *ddb.NSRow
 	var t *tip
+	res := map[string]*resRow{}
+	docs := map[string]item{}
 	for _, it := range out.Responses[s.Table] {
-		switch i := item(it); i.s("SK") {
-		case "#META":
+		i := item(it)
+		switch sk := i.s("SK"); {
+		case sk == "#META":
 			m := scanNSMeta(i)
 			r = &ddb.NSRow{Frozen: m.frozen, Purged: m.purged, ConfigPos: m.configPos, ConfigID: m.configID,
 				Base: m.base, BaseAt: m.baseAt, BaseCfgPos: m.baseCfgPos}
-		case "#TIP":
+		case sk == "#TIP":
 			t = scanTip(i)
+		case strings.HasPrefix(sk, "RES#"):
+			res[strings.TrimPrefix(sk, "RES#")] = scanRes(i)
+		case strings.HasPrefix(sk, "DOC#") && strings.HasSuffix(sk, "#HEAD"):
+			docs[strings.TrimSuffix(strings.TrimPrefix(sk, "DOC#"), "#HEAD")] = i
 		}
 	}
 	if r != nil && r.Purged {
@@ -50,14 +77,27 @@ func (s *Store) Namespace(ctx context.Context, ns string) (*ddb.NSRow, error) {
 		// 410 names it as head).
 		ti, err := s.getTip(ctx, ns)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		t = ti
 	}
 	if r != nil && t != nil {
 		r.TipPos, r.TipID = t.headPos, t.headID
 	}
-	return r, nil
+	pre := make(map[string]ddb.Prefetched, len(names))
+	for _, n := range names {
+		p := ddb.Prefetched{Res: resOut(res[n])}
+		if d, ok := docs[n]; ok {
+			pos := d.n("revPos")
+			doc, err := s.open(ctx, ns, n, "head", strconv.FormatUint(pos, 10), d.s("doc"))
+			if err != nil {
+				return nil, nil, err
+			}
+			p.DocPos, p.Doc = pos, []byte(doc)
+		}
+		pre[n] = p
+	}
+	return r, pre, nil
 }
 
 func scanConfigRow(i item) (*ddb.ConfigRow, error) {
@@ -100,11 +140,19 @@ func (s *Store) ConfigByID(ctx context.Context, ns, id string) (*ddb.ConfigRow, 
 // Resource reads ns's resource name; nil when it has none.
 func (s *Store) Resource(ctx context.Context, ns, name string) (*ddb.ResRow, error) {
 	r, err := s.getRes(ctx, ns, name)
-	if err != nil || r == nil || r.headPos == 0 {
+	if err != nil {
 		return nil, err
 	}
+	return resOut(r), nil
+}
+
+// resOut is a resource item as Resource answers it: nil without a head.
+func resOut(r *resRow) *ddb.ResRow {
+	if r == nil || r.headPos == 0 {
+		return nil
+	}
 	return &ddb.ResRow{HeadPos: r.headPos, HeadID: r.headID, HeadNS: r.headNS, Tombstoned: r.state == "tombstoned", Purged: r.state == "purged", EntryID: r.entryID, LastID: r.lastID, LastPos: r.lastPos,
-		HorizonPos: r.horizonPos, HorizonID: r.horizonID, Keep: r.keep}, nil
+		HorizonPos: r.horizonPos, HorizonID: r.horizonID, Keep: r.keep}
 }
 
 // RevAt reads resource name's chain at pos; nil when there is none.
@@ -124,6 +172,17 @@ func (s *Store) RevAt(ctx context.Context, ns, name string, pos uint64) (*ddb.Re
 // horizon's document if pruned. One below the horizon that isn't kept is
 // a *PrunedError.
 func (s *Store) DocAt(ctx context.Context, ns, name string, pos uint64) ([]byte, error) {
+	// The head's document first, one read: the document item names the
+	// position it holds, and a position's document never changes, so it
+	// answers for pos without the resource item. Any other position (an
+	// earlier one, a tombstone's, an e2e resource without the item) reads
+	// on as below.
+	if it, err := s.getItem(ctx, keyDocHead(ns, name)); err != nil {
+		return nil, err
+	} else if it != nil && item(it).n("revPos") == pos {
+		d, err := s.open(ctx, ns, name, "head", strconv.FormatUint(pos, 10), item(it).s("doc"))
+		return []byte(d), err
+	}
 	res, err := s.getRes(ctx, ns, name)
 	if err != nil {
 		return nil, err

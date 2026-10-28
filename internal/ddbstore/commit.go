@@ -56,6 +56,14 @@ func metaVals(pos uint64, id string) map[string]types.AttributeValue {
 // Commit commits c, re-chaining over the tip as other writes move it, or
 // returns ErrStale. With group commit, a write without a config change
 // commits in its namespace's group (group.go).
+// hintedTip is the tip c's checks read, nil if unknown (Commit.TipPos).
+func hintedTip(c *ddb.Commit) *tip {
+	if c.TipID == "" {
+		return nil
+	}
+	return &tip{headPos: c.TipPos, headID: c.TipID}
+}
+
 func (s *Store) Commit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResult, error) {
 	if acts := commitTxActions(c) + txShared; acts > maxTxActions {
 		return nil, apiErr(413, "limit", "limit", "itemsPerBatch", "measured", acts, "max", maxTxActions,
@@ -70,7 +78,7 @@ func (s *Store) Commit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResult, e
 	if s.grouping() {
 		defer release(s.serialize(c.NS))
 	}
-	var known *tip
+	known := hintedTip(c)
 	for attempt := 0; attempt < maxWriteAttempts; attempt++ {
 		t := known
 		if t == nil {

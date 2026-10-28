@@ -255,6 +255,15 @@ func (s *Store) commitGroup(ns string, group []*groupMember, known *tip) *tip {
 	}
 	live := group
 	t := known
+	if t == nil {
+		// The newest tip its commits' checks read, a first guess (the
+		// tip's condition decides, a moved one is read again).
+		for _, w := range group {
+			if h := hintedTip(w.c); h != nil && (t == nil || h.headPos > t.headPos) {
+				t = h
+			}
+		}
+	}
 	for attempt := 0; len(live) > 0; attempt++ {
 		if attempt >= maxWriteAttempts {
 			return fail(live, apiErr(409, "conflict", "detail", "log tip contention"))

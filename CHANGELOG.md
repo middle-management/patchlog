@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.24.0-ddb.2
+
+The second prerelease from the `dynamodb` branch. DynamoDB's latency is per call, so this one
+cuts the calls a request waits on: a write makes 4 round trips instead of 8 (its namespace,
+resources and their head documents in one batch; the commit chains over the tip its checks
+read instead of reading it again), and a revision read 4 instead of 5. The client keeps up to
+256 idle connections to DynamoDB (the SDK's default is 10), so concurrent requests don't pay a
+new TLS handshake. `serve` checks at start that its table answers, and fails naming what to
+check (the URL's region, AWS credentials, the table) rather than answering every request with
+an error; a timeout inside the AWS SDK is a logged 503 `unavailable`, no longer "request
+cancelled". `deploy/bench.sh` says why a setup request failed. Tests of lost races, failed
+calls, crash recovery and heads at entries, and a test bounding each request's calls.
+
 ## v0.24.0-ddb.1
 
 A prerelease from the `dynamodb` branch: v0.23.0 with a DynamoDB storage backend

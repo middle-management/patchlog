@@ -3,9 +3,11 @@ package ddbstore
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -38,6 +40,9 @@ func (s *Store) MaxBatchItems() int { return MaxBatchItems }
 // instance profile); endpoint is for development and tests, where static
 // "local" credentials stand in (DynamoDB Local ignores them) and checksum
 // validation is off (its responses trip the SDK's).
+// maxIdleConns is how many idle connections to DynamoDB the client keeps.
+const maxIdleConns = 256
+
 func Open(ctx context.Context, rawurl string) (*Store, error) {
 	u, err := url.Parse(rawurl)
 	if err != nil || u.Scheme != "dynamodb" || u.Host == "" {
@@ -46,7 +51,13 @@ func Open(ctx context.Context, rawurl string) (*Store, error) {
 	table := u.Host
 	region := u.Query().Get("region")
 	endpoint := u.Query().Get("endpoint")
-	opts := []func(*config.LoadOptions) error{}
+	// The SDK keeps 10 idle connections a host by default: with more
+	// requests in flight than that (writers, readers, group commits), the
+	// rest open new ones, each a TLS handshake (~10 ms) before its call.
+	httpClient := awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+		tr.MaxIdleConns, tr.MaxIdleConnsPerHost = maxIdleConns, maxIdleConns
+	})
+	opts := []func(*config.LoadOptions) error{config.WithHTTPClient(httpClient)}
 	if region != "" {
 		opts = append(opts, config.WithRegion(region))
 	}

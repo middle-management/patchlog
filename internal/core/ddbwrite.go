@@ -45,8 +45,15 @@ func (b *ddbBackend) writeItems1(ctx context.Context, req Request, items []Item,
 	ctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
 	drawn := false
+	names := make([]string, len(items))
+	for i, it := range items {
+		names[i] = it.Resource
+	}
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
 		r := newDDBReads(ctx, b)
+		if err := r.prefetch(req.NS, names); err != nil {
+			return nil, ddbAsErr(err)
+		}
 		g := &gate{checkReads: r, checkState: &checkState{e: e, now: e.now(), write: true, rateDrawn: &drawn}}
 		type checked struct {
 			p   *writePlan
@@ -162,6 +169,7 @@ func (r *ddbReads) commitOf(g *gate, p *writePlan) *ddb.Commit {
 		CfgPos: cfgRef.pos, CfgID: r.cfgRow(p.n.configSeq).ID,
 		Pins: r.schemaPins(ns),
 	}
+	c.TipPos, c.TipID = r.tipOf(ns)
 	var entries []any
 	if cp := p.cplan; cp != nil {
 		c.Pins = r.configPins(ns)
@@ -394,6 +402,7 @@ func (b *ddbBackend) writeConfigAs(ctx context.Context, req Request, cc ConfigCh
 			Pins:       r.configPins(req.NS),
 			Encrypting: out.cur.level < levelAtRest && p.cfg.level >= levelAtRest,
 		}
+		c.TipPos, c.TipID = r.tipOf(req.NS)
 		if c.EpochKey, err = b.beginsEpoch(ctx, req.NS, out.cur, p.cfg); err != nil {
 			return nil, asErrOrNil(err)
 		}
