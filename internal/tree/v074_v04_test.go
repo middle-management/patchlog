@@ -3,8 +3,11 @@ package tree_test
 import (
 	"context"
 	"database/sql"
+	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -195,4 +198,104 @@ func TestV074BornOfAnotherEpoch(t *testing.T) {
 	createNonced(t, w, "cat", "latest", map[string]any{"parents": parents("old")})
 	x.caughtUp("cat", "c")
 	waitFor(t, "the born epochs to be read in", func() bool { return check("backfilled") })
+}
+
+// TestV074BornEpochBackfillHeadMoved (§E.2.6): a born's epoch is that
+// of the node's first revision, whatever its head. The backfill of a
+// database from before born_epoch was kept reads it with the head it
+// saw; a node whose head moves before the backfill applies what it read
+// still gets it (Apply keeps a known born as it is and never reads its
+// epoch again), so its born is sealed apart under cat#1, not under the
+// head's epoch.
+func TestV074BornEpochBackfillHeadMoved(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "c"))).CreateNamespace(ctx, "c", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"encryption": map[string]any{"level": "sealed"}, "catalog": map[string]any{"trust": []any{"c"}, "mode": "tree"}}))
+	all := []string{"cat", "c"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "append", "config"})), client.WithKeys(client.NewKeys(nil)))
+	createNonced(t, w, "cat", "root", map[string]any{"parents": []any{}})
+	createNonced(t, w, "cat", "old", map[string]any{"title": "Old", "parents": parents("root")})
+	keys := map[string][]byte{}
+	addKeys := func() {
+		for _, e := range must(w.FetchKeys(ctx, "cat", nil, nil)) {
+			keys[e.Kid] = e.Key
+		}
+	}
+	addKeys()
+	must(s.Engine.RotateEpoch(ctx, "cat", "system:rotate"))
+	addKeys()
+	keyOf := func(kid string) []byte { return keys[kid] }
+	retitle := func(title string) {
+		h := must(w.Head(ctx, "cat", "old"))
+		must(w.Append(ctx, "cat", "old", h.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": title},
+			map[string]any{"op": "add", "path": "/$nonce", "value": seal.NewNonce()}}))
+	}
+	retitle("Older")
+
+	grantOpts := []client.Option{client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"},
+		map[string]any{"nbf": s.Now().Add(-24 * time.Hour).Format(time.RFC3339)})), client.WithKeys(client.NewKeys(nil))}
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, s.Client(t, grantOpts...), svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat", "c")
+	x.stop()
+	sq := must(sql.Open("sqlite", db))
+	for _, q := range []string{`UPDATE nodes SET born_epoch = NULL`, `INSERT INTO meta (k, v) VALUES ('epochs', 'pending') ON CONFLICT (k) DO NOTHING`,
+		`DELETE FROM sealed_views`} {
+		if _, err := sq.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sq.Close()
+
+	// The backfill's read of old's log waits until an apply has moved
+	// old's head.
+	var running atomic.Pointer[tree.Service]
+	var once sync.Once
+	moveHead := func() {
+		// On the backfill's goroutine: no t.Fatal here.
+		h := must(w.Head(ctx, "cat", "old"))
+		if _, err := w.Append(ctx, "cat", "old", h.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": "Oldest"},
+			map[string]any{"op": "add", "path": "/$nonce", "value": seal.NewNonce()}}); err != nil {
+			t.Errorf("moving old's head: %v", err)
+			return
+		}
+		nh, err := w.NSHead(ctx, "cat")
+		for deadline := time.Now().Add(30 * time.Second); err == nil && time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+			if sv := running.Load(); sv != nil && sv.Checkpoint("cat") == nh.ID {
+				return
+			}
+		}
+		t.Errorf("the tree service didn't apply old's new head: %v", err)
+	}
+	wrap := client.WithTransport(func(rt http.RoundTripper) http.RoundTripper {
+		return roundTrip(func(r *http.Request) (*http.Response, error) {
+			if strings.HasPrefix(r.URL.Path, "/r/cat/old/rev/") && strings.HasSuffix(r.URL.Path, "/log") {
+				once.Do(moveHead)
+			}
+			return rt.RoundTrip(r)
+		})
+	})
+	x = startSvc(t, s.Client(t, append(grantOpts, wrap)...), svcOpts{now: s.Now, db: db})
+	running.Store(x.s)
+	waitFor(t, "the epochs backfill", func() bool { return !x.s.EpochsPending() })
+	x.caughtUp("cat", "c")
+
+	f := x.fetch("/cat/children?of=root", k.Grant(t, s.Now(), "user:r", all, []string{"read"}))
+	if f.header.Get("Content-Type") != "application/json" {
+		t.Fatalf("g/all listing %s, want per entry", f.header.Get("Content-Type"))
+	}
+	view := derived.View{NS: "cat", Target: f.path}
+	e := entriesOf(t, decode(t, f.body))["old"]
+	jwe, _ := e["sealed"].(string)
+	if vals := decode(t, must(derived.OpenItem(jwe, derived.ItemKey(keyOf, "cat", "old"), view, "cat", "old"))); vals["title"] != "Oldest" || vals["born"] != nil {
+		t.Fatalf("old's sealed values %v, want only its new title", vals)
+	}
+	born, _ := e["born"].(map[string]any)
+	if bj, _ := born["sealed"].(string); len(born) != 1 || bj == "" || must(seal.ParseHeader(bj)).Kid != "cat#1" {
+		t.Fatalf("old's born %v, want { sealed } under cat#1", e["born"])
+	}
 }

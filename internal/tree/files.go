@@ -509,7 +509,8 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 	type want struct {
 		node, ns, name, head string // node for a catalog node; ns logical for an item
 		file                 *FileMeta
-		born                 bool // the epoch of the node's born, not of its head
+		born                 bool   // the epoch of the node's born, not of its head
+		bornAt               string // that born
 	}
 	var wants []want
 	s.mu.RLock()
@@ -520,7 +521,7 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 			wants = append(wants, want{node: name, ns: catNS, name: name, head: n.Head})
 		}
 		if n.BornEpoch == 0 && n.Born != "" && n.Head != "" {
-			wants = append(wants, want{node: name, ns: catNS, name: name, head: n.Head, born: true})
+			wants = append(wants, want{node: name, ns: catNS, name: name, head: n.Head, born: true, bornAt: n.Born})
 		}
 	}
 	s.mu.RUnlock()
@@ -620,8 +621,11 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 			continue
 		}
 		if w.born {
-			// A head changed since was read with its born's epoch.
-			if n := g.explicit[w.node]; n != nil && n.Head == w.head && n.BornEpoch == 0 {
+			// The born's epoch is its first revision's, whatever the head
+			// (§E.2.6): a head changed since keeps it, and Apply, which
+			// keeps a known born as it is, never reads it again. A born
+			// changed since is another revision's.
+			if n := g.explicit[w.node]; n != nil && n.Born == w.bornAt && n.BornEpoch == 0 {
 				n.BornEpoch, changed = e, true
 				if g.nodes[w.node] == n {
 					if _, err := tx.ExecContext(ctx, `UPDATE nodes SET born_epoch = ? WHERE name = ?`, e, w.node); err != nil {
