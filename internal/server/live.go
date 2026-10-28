@@ -40,6 +40,24 @@ func liveQuery(q url.Values) (live bool, cursor int64, err error) {
 	return live, cursor, nil
 }
 
+// judgeCursor judges a long-poll's cursor (-1: none) at now (§7.7
+// Intervals and cursors): it returns this server's cursor, the number of
+// the interval now falls in, or 400 for a cursor more than an hour's worth
+// of intervals ahead of or behind it. Exactly an hour's worth is not more:
+// a cursor that is that far behind in one interval is too far behind in
+// the next, since the server's cursor advanced.
+func judgeCursor(now time.Time, interval time.Duration, reqCursor int64) (int64, error) {
+	current := now.UnixNano() / int64(interval)
+	hour := int64(time.Hour / interval)
+	switch {
+	case reqCursor > current+hour:
+		return current, badInput("cursor too far ahead (§7.7)")
+	case reqCursor >= 0 && reqCursor < current-hour:
+		return current, badInput("cursor too far behind: poll again without it (§7.7)")
+	}
+	return current, nil
+}
+
 // longPoll implements §7.7 for a log fetched by fetch, with the request's
 // cursor (liveQuery), -1 without one.
 //
@@ -53,15 +71,9 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 	fetch func(ctx context.Context, since string) (*core.Log, error)) {
 	since := r.URL.Query().Get("since")
 	interval := s.e.LongPollInterval()
-	now := time.Now()
-	current := now.UnixNano() / int64(interval)
-	hour := int64(time.Hour / interval)
-	switch {
-	case reqCursor > current+hour:
-		writeErr(w, badInput("cursor too far ahead (§7.7)"))
-		return
-	case reqCursor >= 0 && reqCursor < current-hour:
-		writeErr(w, badInput("cursor too far behind: poll again without it (§7.7)"))
+	current, err := judgeCursor(time.Now(), interval, reqCursor)
+	if err != nil {
+		writeErr(w, err)
 		return
 	}
 	atOnce := reqCursor < current
