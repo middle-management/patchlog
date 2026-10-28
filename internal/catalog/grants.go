@@ -166,31 +166,39 @@ func (s *Service) purgedIn(g *tree.Graph, cur map[string]string, ns string) erro
 	return e
 }
 
-// purgedAt is purgedIn at the checkpoint the service is at.
-func (s *Service) purgedAt(ns string) (err error) {
-	s.t.View(func(g *tree.Graph, cur map[string]string) { err = s.purgedIn(g, cur, ns) })
-	return err
+// untrustedIn is the 403 for an item of a namespace the catalog doesn't
+// trust, decided at the checkpoint g and cur reflect; nil for a trusted
+// one. Item requests other than Place answer it first, before 410 purged
+// (§B.11.4): of an untrusted namespace's names, purged or not, the
+// service follows nothing. Call it under View.
+func (s *Service) untrustedIn(g *tree.Graph, cur map[string]string, ns string) error {
+	if g.Trust[ns] {
+		return nil
+	}
+	e := untrusted(ns, g.Catalog).(*Error)
+	e.Checkpoint = checkpointAt(g, cur, ns)
+	return e
 }
 
 // contentConfig is content namespace ns's document at the head (the grant
 // checker's copy), whose entry for the catalog's key signs a grant for its
 // items (plan.key). Before it reads the document it answers what the
-// checkpoint alone decides, in order: 410 purged for every name of a
-// namespace the service holds as purged (purgedIn), then 403 for an item
-// of a namespace the catalog doesn't trust (untrusted), whose document the
-// service's own grant needn't read and whose names it doesn't follow
-// (itemIn), so that the answer is a refusal, not a 502 about the service's
-// grant (§B.11.4, §B.11.5). One whose document the core answers 410 purged
-// (a sealed one, §8.5) is 410 purged too, from the core's head (configErr).
+// checkpoint alone decides, in order: 403 for an item of a namespace the
+// catalog doesn't trust (untrustedIn), whose document the service's own
+// grant needn't read and whose names it doesn't follow (itemIn), so that
+// the answer is a refusal, not a 502 about the service's grant, and comes
+// first, before a purge the service may still hold of it (§B.11.4,
+// §B.11.5); then 410 purged for every name of a namespace the service
+// holds as purged (purgedIn). One whose document the core answers 410
+// purged (a sealed one, §8.5) is 410 purged too, from the core's head
+// (configErr).
 func (s *Service) contentConfig(ctx context.Context, ns string) (*grantcheck.Config, error) {
 	var err error
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
-		if err = s.purgedIn(g, cur, ns); err != nil || g.Trust[ns] {
+		if err = s.untrustedIn(g, cur, ns); err != nil {
 			return
 		}
-		e := untrusted(ns, g.Catalog).(*Error)
-		e.Checkpoint = checkpointAt(g, cur, ns)
-		err = e
+		err = s.purgedIn(g, cur, ns)
 	})
 	if err != nil {
 		return nil, err
@@ -504,7 +512,10 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 
 // decideRead decides a /read-grants item of content namespace ns into e
 // (decideReads), and returns the keys its answer carries. Every name of a
-// purged namespace is 410 purged first (§B.11.4); an item in a public
+// purged namespace the catalog trusts is 410 purged first; one of an
+// untrusted namespace is never 410, but answered as below, 403 if it
+// isn't public (planRead), as item requests answer 403 before 410 there
+// (§B.11.4); an item in a public
 // namespace that isn't sealed is "public": true, with no grant and no
 // check; any other is decided by planRead, and then gets a grant if its
 // namespace is private, or, if it is public, its keys alone where it is
@@ -512,7 +523,13 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 // not K_r, opens its revisions (§E.3.2) and no grant is needed to read
 // them.
 func (s *Service) decideRead(ctx context.Context, v *grant.Verified, vis *visibility, e map[string]any, ns, name, item string, lagOK map[string]bool) ([]keyOf, error) {
-	if err := s.purgedAt(ns); err != nil {
+	var err error
+	s.t.View(func(g *tree.Graph, cur map[string]string) {
+		if g.Trust[ns] {
+			err = s.purgedIn(g, cur, ns)
+		}
+	})
+	if err != nil {
 		return nil, err
 	}
 	public, in := s.exposureAt(ctx, ns)
@@ -853,7 +870,9 @@ func (s *Service) noContentKey(ns string) error {
 // those as of the checkpoint the decision reports (configAt), as for
 // visibility.
 //
-// A create answers, in order (§B.11.4 Create): 410 purged in a purged
+// Every item request answers 403 first for an item of a namespace the
+// catalog doesn't trust (untrustedIn), purged or not (§B.11.4). Then a
+// create answers, in order (§B.11.4 Create): 410 purged in a purged
 // namespace (contentConfig, purgedIn), or in one the core holds as purged
 // before the service applies it (coreHead); 409 for a name that exists or
 // existed, as the checkpoint has it, then as the core's head has it (a
@@ -870,8 +889,8 @@ func (s *Service) noContentKey(ns string) error {
 //
 // Names are decided only in a namespace the service has a checkpoint of
 // (itemFacts.known), and the service follows only trusted ones: an item of
-// a namespace the catalog doesn't trust is 403 after the 410, before its
-// document is read (contentConfig).
+// a namespace the catalog doesn't trust is 403 before the 410, and before
+// its document is read (contentConfig).
 func (s *Service) planContent(ctx context.Context, v *grant.Verified, item string, want []string) (_ *plan, err error) {
 	for _, w := range want {
 		if !grant.IsVerb(w) {
@@ -913,6 +932,9 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		checkpoint = checkpointAt(g, cur, ns)
+		if err = s.untrustedIn(g, cur, ns); err != nil {
+			return
+		}
 		if err = s.purgedIn(g, cur, ns); err != nil {
 			return
 		}
@@ -1050,9 +1072,10 @@ func (s *Service) contentSigner(latest *grantcheck.Config, checkpoint *map[strin
 // The answers come in this order, so they reveal nothing to callers
 // without read beyond what names and purges already do (§E.4):
 //
-//   - 410 purged for every name of a purged namespace (contentConfig,
-//     purgedIn), and 403 for an item of a namespace the catalog doesn't
-//     trust, of whose names the service knows nothing;
+//   - 403 for an item of a namespace the catalog doesn't trust, of whose
+//     names the service knows nothing, purged or not (untrustedIn), then
+//     410 purged for every name of a purged namespace (contentConfig,
+//     purgedIn);
 //   - 404 for a name that never existed;
 //   - 403 for a caller without a role that counts for read on the item
 //     both at its placement now and, if it is deleted, in its frozen rows
@@ -1084,6 +1107,9 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		checkpoint = checkpointAt(g, cur, ns)
+		if err = s.untrustedIn(g, cur, ns); err != nil {
+			return
+		}
 		if err = s.purgedIn(g, cur, ns); err != nil {
 			return
 		}
@@ -1181,6 +1207,9 @@ func (s *Service) planRead(ctx context.Context, vis *visibility, item string) (_
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		checkpoint = checkpointAt(g, cur, ns)
+		if err = s.untrustedIn(g, cur, ns); err != nil {
+			return
+		}
 		if err = s.purgedIn(g, cur, ns); err != nil {
 			return
 		}

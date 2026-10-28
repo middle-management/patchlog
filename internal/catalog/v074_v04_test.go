@@ -1,8 +1,11 @@
 package catalog_test
 
 import (
+	"context"
 	"reflect"
 	"testing"
+
+	"github.com/middle-management/patchlog/internal/client"
 )
 
 // TestNoMergeKeyNotOfferedV074 (Open 106): a catalog service without a
@@ -78,5 +81,40 @@ func TestParentsInEveryAnswerV074(t *testing.T) {
 		if r.body["head"] != w.catHead(c.node) {
 			t.Errorf("%s: head %v, want %s", c.what, r.body["head"], w.catHead(c.node))
 		}
+	}
+}
+
+// TestUntrustedBeforePurgedV074: item requests other than Place answer
+// 403 first for an item in a namespace the catalog doesn't trust, before
+// the 410 of a purged namespace the service still holds as purged from
+// when it trusted it: read, create and restore on POST /grants, and a
+// /read-grants item (§B.11.4, §B.11.5).
+func TestUntrustedBeforePurgedV074(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	w.purge("matches")
+	opc := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"cat"}, []string{"config"})))
+	must(opc.PatchConfig(ctx, "cat", must(w.ops.NSHead(ctx, "cat")).Config, []any{
+		map[string]any{"op": "replace", "path": "/catalog/trust", "value": []any{}}}))
+	head := must(w.ops.NSHead(ctx, "cat")).ID
+	waitFor(t, "the catalog to stop trusting matches", func() bool { return w.svc.Tree().Checkpoint("cat") == head })
+
+	bob := w.caller("user:bob", "match-desk")
+	for _, req := range []map[string]any{
+		{"item": "/r/matches/derby", "want": toAny("read")},
+		{"item": "/r/matches/fresh", "want": toAny("create")},
+		{"item": "/r/matches/derby", "want": toAny("restore")},
+	} {
+		if r := w.do("POST", "/grants", bob, req); r.status != 403 || r.body["code"] != "forbidden" {
+			t.Errorf("%v: %d %v (want 403)", req, r.status, r.body)
+		}
+	}
+	rg := w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/matches/derby")})
+	if e := entry(rg, 0); e["status"] != 403.0 || e["code"] != "forbidden" {
+		t.Errorf("read-grants: %v (want status 403)", e)
 	}
 }
