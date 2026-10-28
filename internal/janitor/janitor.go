@@ -566,8 +566,8 @@ func purges(log []client.NSEntry) map[string]bool {
 }
 
 // ownDocEntries reports whether the branch has a head, tombstone or batch
-// entry of its own (isDocEntry), other than for resources purged in it
-// (§F.6): a batch counts only if it has other items.
+// entry of its own, other than for its keyring at E3 (isDocEntry) and
+// resources purged in it (§F.6).
 func (b *branch) ownDocEntries() bool {
 	for _, e := range b.log {
 		switch e.Kind {
@@ -576,14 +576,33 @@ func (b *branch) ownDocEntries() bool {
 				return true
 			}
 		case "batch":
-			for _, s := range e.Entries {
-				if isDocEntry(s, b.e2e) && !b.purged[s.Resource] {
-					return true
-				}
+			if b.ownBatch(e) {
+				return true
 			}
 		}
 	}
 	return false
+}
+
+// ownBatch reports whether batch entry e is one of the branch's own for
+// §F.6: it has an item for a resource other than one purged in the branch
+// and, at E3, its keyring; or it changes the config (§7.5: items may be
+// empty then), which is work of its own too, unless it has a keyring item
+// at E3, as such a batch counts only if it has other items (an epoch bump
+// goes with its keyring entry, §E.2.1, §E.3.2).
+func (b *branch) ownBatch(e client.NSEntry) bool {
+	config, keyring := len(e.Entries) == 0, false
+	for _, s := range e.Entries {
+		switch {
+		case s.Kind != "head" && s.Kind != "tombstone":
+			config = true
+		case b.e2e && s.Resource == client.KeyringName:
+			keyring = true
+		case !b.purged[s.Resource]:
+			return true
+		}
+	}
+	return config && !keyring
 }
 
 // nsAt is a namespace's head and its document there.
