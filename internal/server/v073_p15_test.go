@@ -308,8 +308,8 @@ func TestV073P15RetrySameRootKid(t *testing.T) {
 }
 
 // §7.2 (GR-21): an entry written while authentication was disabled records
-// no grant, and matches a retry on its author once authentication is on;
-// another sub gets 412.
+// no grant, and under grants matches no one (v0.74, Open 83): a retry by
+// its author is 412 as another sub's is.
 func TestV073P15RetryOfUnauthenticatedEntry(t *testing.T) {
 	t.Parallel()
 	k := newKey("k")
@@ -327,11 +327,11 @@ func TestV073P15RetryOfUnauthenticatedEntry(t *testing.T) {
 	can := []string{"create", "append", "delete", "restore"}
 	alice, bob := e.grant(k, "alice", []string{"m"}, can), e.grant(k, "bob", []string{"m"}, can)
 	r := e.write("PATCH", "m", "a", "", genesis, alice)
-	expect(t, r, 200)
-	if etagOf(r) != a0 {
-		t.Fatalf("retry by its author: %v", r.H)
+	expectCode(t, r, 412, "stale")
+	if r.Str("head") != a0 {
+		t.Fatalf("retry by its author: %s", r.Body)
 	}
-	expect(t, e.batchReq("m", batch, alice), 200)
+	expectCode(t, e.batchReq("m", batch, alice), 412, "batch")
 	expectCode(t, e.write("PATCH", "m", "a", "", genesis, bob), 412, "stale")
 	expectCode(t, e.batchReq("m", batch, bob), 412, "batch")
 }
