@@ -52,7 +52,7 @@ func (s *Store) purgeActs(c *ddb.Commit) []types.TransactWriteItem {
 				TableName: table, Key: keyAV(keyRes(ns, p.Name)),
 				// The head stays (Purged answers with it); its document's
 				// metadata goes with the document.
-				UpdateExpression:          strptr("SET #st = :pg REMOVE headCreated, headSize, headDigest"),
+				UpdateExpression:          strptr("SET #st = :pg REMOVE headCreated, headSize, headDigest, doc, docPos"),
 				ConditionExpression:       strptr("headPos = :h AND headId = :i AND #st <> :pg"),
 				ExpressionAttributeNames:  map[string]string{"#st": "state"},
 				ExpressionAttributeValues: map[string]types.AttributeValue{":pg": avS("purged"), ":h": avN(p.HeadPos), ":i": avS(p.HeadID)},
@@ -95,7 +95,7 @@ func (s *Store) PurgeContent(ctx context.Context, ns, name string) (hashes [][]b
 			// A purged namespace's resources are purged (§8.5).
 			if _, err := s.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 				TableName: &s.Table, Key: keyAV(keyRes(ns, n)),
-				UpdateExpression:          strptr("SET #st = :pg REMOVE headCreated, headSize, headDigest"),
+				UpdateExpression:          strptr("SET #st = :pg REMOVE headCreated, headSize, headDigest, doc, docPos"),
 				ExpressionAttributeNames:  map[string]string{"#st": "state"},
 				ExpressionAttributeValues: map[string]types.AttributeValue{":pg": avS("purged")},
 			}); err != nil {

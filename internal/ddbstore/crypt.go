@@ -176,6 +176,9 @@ func (s *Store) EncryptContent(ctx context.Context, ns string, seal func(name, k
 			case strings.HasPrefix(sk, "REV#"):
 				grant(i)
 				err = replace(i, "patches", "rev", resNameFromRev(sk), i.s("id"))
+			case strings.HasPrefix(sk, "RES#") && i.has("doc"):
+				// A head document on its resource item (commit.go).
+				err = replace(i, "doc", "head", strings.TrimPrefix(sk, "RES#"), strconv.FormatUint(i.n("docPos"), 10))
 			case strings.HasPrefix(sk, "DOC#") && strings.HasSuffix(sk, "#HEAD"):
 				name := strings.TrimSuffix(strings.TrimPrefix(sk, "DOC#"), "#HEAD")
 				err = replace(i, "doc", "head", name, strconv.FormatUint(i.n("revPos"), 10))

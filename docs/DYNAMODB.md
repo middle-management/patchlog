@@ -113,7 +113,18 @@ item; twice the units, as a transaction): with all of them under the
 namespace's key, a namespace took ~70 writes a second (measured, §11).
 Apart, a write puts its log entry and resource item under the namespace's
 key, the rest under its resource's, and reads of different resources go
-to different keys. The log can't be split: it is one chain. Single-table because the write path's transactions
+to different keys. The log can't be split: it is one chain.
+
+A write's items are each under 1 KB, so each costs what a transaction
+charges an item at least, two write units: their number is the cost. A
+head document up to 400 bytes (canonical, before sealing) rides on the
+resource item the write updates anyway, in place of an item of its own;
+a larger one has its DOC# item, the resource item's copy removed. A
+DOC# item left by a head whose document then shrank holds its position's
+document still (it never changes), and is deleted once a pruning horizon
+passes it. A write is then its revision, the resource item, its history
+row, the log entry and the entry's marker, and a group's tip: about ten
+units, and the revision's GSI1 entry. Single-table because the write path's transactions
 are confined to one namespace's items, one stream then feeds all
 cross-instance invalidation (§6), and GSIs are shared by every entity.
 Multi-table is viable (DynamoDB transactions span tables) and is noted where
@@ -133,11 +144,12 @@ NS#<ns>                     #TIP                                namespace log ti
 NS#<ns>                     CFG#<pos12>                         config chain entry: id, parentPos, patches, doc|docRef, firstLogPos
 NS#<ns>                     LOG#<pos12>                         ns_log entry: id, prevPos, kind, res?, body|bodyRef, cfgPos,
                                                                 author, created, grantId, noAuth, gestures
-NS#<ns>                     RES#<name>                          resource: headPos, headId, state, horizonPos/Id/Base, keep, kept, snapRevs/Bytes
+NS#<ns>                     RES#<name>                          resource: headPos, headId, state, horizonPos/Id/Base, keep, kept, snapRevs/Bytes,
+                                                                doc?, docPos? (the head document when ≤ 400 B, below)
 R#<ns>#<name>               REV#<name>#<pos12>                  revision: id, parent (pos | {ns,name,pos} foreign), kind, first,
                                                                 patches|patchesRef, author, created, grantId, schemaRef,
                                                                 gesture?, undoes?, signature?, size?, digest?, epoch?
-R#<ns>#<name>               DOC#<name>#HEAD                     head snapshot: revPos, doc|docRef
+R#<ns>#<name>               DOC#<name>#HEAD                     head snapshot when larger: revPos, doc|docRef
 R#<ns>#<name>               SNAP#<name>#<pos12>                 kept snapshot below a horizon (§8.6); intermediate (D.4) not built
 NS#<ns>                     PRUNING#<name>                      a prune whose content is still to go: horizonPos, kept positions
 R#<ns>#<name>               HIST#<name>#<logPos12>              head_history row: revPos

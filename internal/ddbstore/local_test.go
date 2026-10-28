@@ -617,7 +617,32 @@ func TestLocalWritePartitions(t *testing.T) {
 	if ns["LOG"] != 4 || ns["RES"] != 2 {
 		t.Errorf("the namespace's partition: %v, want 4 log entries (config, 3 writes) and 2 resources", ns)
 	}
-	if a := types(resPK("p", "a")); a["REV"] != 2 || a["DOC"] != 1 || a["HIST"] != 2 || len(a) != 3 {
-		t.Errorf("a's partition: %v, want 2 revisions, its head document, 2 history rows", a)
+	if a := types(resPK("p", "a")); a["REV"] != 2 || a["HIST"] != 2 || len(a) != 2 {
+		t.Errorf("a's partition: %v, want 2 revisions and 2 history rows (its small head document on its resource item)", a)
+	}
+	// A head document too large for the resource item has its own; one
+	// that shrinks moves back, the DOC# item staying with its position's
+	// document until a horizon passes it.
+	big := strings.Repeat("x", inlineDocMax)
+	w = mustWrite(t, s, "p", "c", "", `[{"op":"add","path":"","value":{"v":"`+big+`"}}]`)
+	res, err := s.getRes(ctx, "p", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := types(resPK("p", "c")); c["DOC"] != 1 || res.doc != "" {
+		t.Errorf("a large head document: partition %v, resource item's doc %d bytes; want a DOC# item, none on the resource item", c, len(res.doc))
+	}
+	mustWrite(t, s, "p", "c", w.ID, `[{"op":"replace","path":"/v","value":1}]`)
+	if res, err = s.getRes(ctx, "p", "c"); err != nil {
+		t.Fatal(err)
+	}
+	if res.doc == "" || res.docPos != 2 {
+		t.Errorf("a document shrunk back: resource item's doc %q at %d, want the head's at 2", res.doc, res.docPos)
+	}
+	for pos, want := range map[uint64]string{1: big, 2: "1"} {
+		doc, err := s.DocAt(ctx, "p", "c", pos)
+		if err != nil || !strings.Contains(string(doc), want) {
+			t.Errorf("DocAt(%d) = %.40s…, %v; want the document holding %.10s", pos, doc, err, want)
+		}
 	}
 }

@@ -366,7 +366,7 @@ func (s *Store) PurgeShadow(ctx context.Context, shadow, name string) ([][]byte,
 	}
 	_, err := s.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: &s.Table, Key: keyAV(keyRes(shadow, name)),
-		UpdateExpression:          strptr("SET #st = :pg REMOVE headCreated, headSize, headDigest, keep, kept, horizonPos, horizonId, horizonBase"),
+		UpdateExpression:          strptr("SET #st = :pg REMOVE headCreated, headSize, headDigest, keep, kept, horizonPos, horizonId, horizonBase, doc, docPos"),
 		ConditionExpression:       strptr("attribute_exists(PK)"),
 		ExpressionAttributeNames:  map[string]string{"#st": "state"},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":pg": avS("purged")},

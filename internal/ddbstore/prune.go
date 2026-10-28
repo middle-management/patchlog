@@ -166,6 +166,16 @@ func (s *Store) PruneContent(ctx context.Context, ns, name string) (ok bool, err
 			return false, err
 		}
 	}
+	// A DOC# item an earlier head left when a smaller document moved onto
+	// the resource item (commit.go) holds a document below the horizon
+	// now: it goes, unless a later head has put it again since.
+	if _, err := s.Client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: &s.Table, Key: keyAV(keyDocHead(ns, name)),
+		ConditionExpression:       strptr("revPos < :h"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":h": avN(horizon)},
+	}); err != nil && !conditionFailed(err) {
+		return false, err
+	}
 	// Sealed copies of what was pruned go too (core's deletePrunedSealed);
 	// kept documents keep theirs.
 	if err := s.deletePrunedSealed(ctx, ns, name, horizon, kept); err != nil {

@@ -11,7 +11,10 @@ namespace's: a namespace took ~70 writes a second on AWS. Now a write puts only 
 resource item there. A creation no longer looks its revision id up (every resource created with the
 same patches shares it, and the lookup read them all). DynamoDB spans record the units each call
 consumed, its attempts, throttles and the store function making it; `deploy/spans.py` reports them.
-`deploy/bench.sh` runs on oha at fixed rates, follows logs since a recent entry, and spreads over
+A head document up to 400 bytes is kept on its resource item rather than an item of its own, a
+write's items down from six to five (each item of a transaction costs at least two write units).
+Throttling DynamoDB answers within a batch or a transaction is retried with a short backoff, rather
+than failing a group commit's writes or answering 503. `deploy/bench.sh` runs on oha at fixed rates, follows logs since a recent entry, and spreads over
 `NAMESPACES`; `deploy/ec2-bench.sh` runs it on an EC2 instance next to the table, with the server built
 from the checkout.
 

@@ -160,8 +160,8 @@ func commitActions(c *ddb.Commit) int {
 	}
 	for _, it := range c.Items {
 		n += len(it.Steps) + 1 + attachActions(&it) // the revisions, the head, attachments
-		if lastLive(&it) != nil {
-			n++ // the head document
+		if live, small := headDoc(&it); live != nil && !small {
+			n++ // the head document's own item
 		}
 		if !it.Steps[len(it.Steps)-1].Tombstone {
 			n++ // the history row
@@ -445,6 +445,23 @@ func (s *Store) itemActs(c *ddb.Commit, it *ddb.CommitItem, entry logRow) []type
 		vals[":old"], vals[":oldi"], vals[":pg"] = avN(it.HeadPos), avS(it.HeadID), avS("purged")
 	}
 	vals[":h"], vals[":i"], vals[":e"] = avN(final.pos), avS(final.id), avS(entry.id)
+	// The head document (the last live one, which a tombstone keeps): on
+	// the resource item when small (inlineDocMax), else in its DOC# item,
+	// the item's copy removed. A DOC# item a smaller document leaves holds
+	// its position's document still, which never changes; PruneContent
+	// deletes it below a horizon.
+	var docPut *types.TransactWriteItem
+	inline, removeDoc := "", ""
+	if live, small := headDoc(it); live != nil {
+		doc := commitSeal(c, it.Name, "head", strconv.FormatUint(lastPos, 10), live.Doc)
+		if small {
+			inline = "doc = :doc, docPos = :dp, "
+			vals[":doc"], vals[":dp"] = avS(doc), avN(lastPos)
+		} else {
+			docPut = &types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyDocHead(ns, it.Name), item{"revPos": avN(lastPos), "doc": avS(doc)})}}
+			removeDoc = ", doc, docPos"
+		}
+	}
 	var update string
 	if final.kind == "tombstone" {
 		// The /heads metadata dies with the document; the last live
@@ -455,19 +472,30 @@ func (s *Store) itemActs(c *ddb.Commit, it *ddb.CommitItem, entry logRow) []type
 		update = "SET headPos = :h, headId = :i, #st = :live, entryId = :e, headCreated = :c, headSize = :s, headDigest = :d REMOVE lastId, lastPos"
 		vals[":live"], vals[":c"], vals[":s"], vals[":d"] = avS("live"), avI(final.created), avN(final.size), avB(final.digest)
 	}
+	update = "SET " + inline + strings.TrimPrefix(update, "SET ") + removeDoc
 	out = append(out, types.TransactWriteItem{Update: &types.Update{
 		TableName: table, Key: keyAV(keyRes(ns, it.Name)),
 		UpdateExpression: &update, ConditionExpression: &cond,
 		ExpressionAttributeNames:  map[string]string{"#st": "state"},
 		ExpressionAttributeValues: vals,
 	}})
-	if live := lastLive(it); live != nil && !it.E2E {
-		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyDocHead(ns, it.Name), item{"revPos": avN(lastPos), "doc": avS(commitSeal(c, it.Name, "head", strconv.FormatUint(lastPos, 10), live.Doc))})}})
+	if docPut != nil {
+		out = append(out, *docPut)
 	}
 	if final.kind != "tombstone" {
 		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyHist(ns, it.Name, entry.pos), item{"revPos": avN(final.pos)})}})
 	}
 	return append(out, s.attachActs(c, it)...)
+}
+
+// headDoc is the step whose document is the item's head document (nil: none,
+// e2e content has none), and whether that is small enough for the
+// resource item (inlineDocMax).
+func headDoc(it *ddb.CommitItem) (live *ddb.CommitStep, small bool) {
+	if live = lastLive(it); live == nil || it.E2E {
+		return nil, false
+	}
+	return live, len(live.Doc) <= inlineDocMax
 }
 
 // classifyCancel sorts a cancelled transaction of commits cs (built by

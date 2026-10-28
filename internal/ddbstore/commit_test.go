@@ -1,6 +1,7 @@
 package ddbstore
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -48,9 +49,10 @@ func createCommit(name string) *ddb.Commit {
 }
 
 // A create's transaction: its revision (one child per parent), the head
-// (genesis: attribute_not_exists), the document, the history row, the
-// entry, the marker — then the tip move pinned on the tip it chained
-// over, and the configuration's condition.
+// (genesis: attribute_not_exists) with its small document on it, the
+// history row, the entry, the marker — then the tip move pinned on the
+// tip it chained over, and the configuration's condition. A large
+// document has an item of its own, after the head.
 func TestBuildCommitCreate(t *testing.T) {
 	s := &Store{Table: "tbl"}
 	c := createCommit("doc1")
@@ -61,7 +63,6 @@ func TestBuildCommitCreate(t *testing.T) {
 	want := []struct{ sk, cond string }{
 		{"REV#doc1#" + padPos(1), "attribute_not_exists(PK)"},
 		{"RES#doc1", "attribute_not_exists(PK)"},
-		{"DOC#doc1#HEAD", ""},
 		{"HIST#doc1#" + padPos(8), ""},
 		{"LOG#" + padPos(8), "attribute_not_exists(PK)"},
 		{"#", "attribute_not_exists(PK)"}, // the marker
@@ -82,8 +83,24 @@ func TestBuildCommitCreate(t *testing.T) {
 	if res[0].Pos != 8 || res[0].NSID != ids.Hash(&tid, []byte(body)).String() {
 		t.Fatalf("entry %+v", res[0])
 	}
-	if v := acts[6].Update.ExpressionAttributeValues; v[":new"].(*types.AttributeValueMemberN).Value != "8" || v[":newi"].(*types.AttributeValueMemberS).Value != res[0].NSID {
+	if v := acts[5].Update.ExpressionAttributeValues; v[":new"].(*types.AttributeValueMemberN).Value != "8" || v[":newi"].(*types.AttributeValueMemberS).Value != res[0].NSID {
 		t.Fatalf("tip move %v", v)
+	}
+}
+
+func TestBuildCommitLargeDoc(t *testing.T) {
+	s := &Store{Table: "tbl"}
+	c := createCommit("doc1")
+	c.Items[0].Steps[0].Doc = `{"v":"` + strings.Repeat("x", inlineDocMax) + `"}`
+	acts, _, err := s.buildCommits("demo", []*ddb.Commit{c}, testTip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(acts) != commitActions(c)+txShared || sk(acts[2]) != "DOC#doc1#HEAD" {
+		t.Fatalf("%d actions (counted %d), third %s; want the document's own item after the head", len(acts), commitActions(c)+txShared, sk(acts[2]))
+	}
+	if u := *acts[1].Update.UpdateExpression; !strings.HasSuffix(u, ", doc, docPos") {
+		t.Fatalf("head update %q: want the resource item's copy removed", u)
 	}
 }
 
@@ -213,11 +230,11 @@ func TestBuildCommitAttach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(acts) != commitActions(c)+txShared || len(acts) != 11 {
+	if len(acts) != commitActions(c)+txShared || len(acts) != 10 {
 		t.Fatalf("%d actions (counted %d)", len(acts), commitActions(c)+txShared)
 	}
-	if sk(acts[4]) != "BLOB#doc1#b1" || cond(acts[4]) != "" || acts[5].Delete == nil || acts[6].Delete == nil {
-		t.Fatalf("attachment actions %s %q", sk(acts[4]), cond(acts[4]))
+	if sk(acts[3]) != "BLOB#doc1#b1" || cond(acts[3]) != "" || acts[4].Delete == nil || acts[5].Delete == nil {
+		t.Fatalf("attachment actions %s %q", sk(acts[3]), cond(acts[3]))
 	}
 	if sk(acts[commitActions(c)-2]) != "LOG#"+padPos(8) {
 		t.Fatalf("entry at %s", sk(acts[commitActions(c)-2]))

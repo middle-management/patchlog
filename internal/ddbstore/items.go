@@ -148,7 +148,20 @@ type resRow struct {
 	// served: a snapshot of any other there is one PruneContent hasn't
 	// deleted yet.
 	kept []uint64
+	// doc is the head document as stored (sealed where content is), when
+	// small enough to ride on this item (inlineDocMax), the document at
+	// docPos; "": in the DOC# item (keyDocHead). Every write updates this
+	// item, so a small document costs it no item of its own.
+	doc    string
+	docPos uint64
 }
+
+// inlineDocMax is the largest head document (canonical JSON, before any
+// sealing) kept on its resource's item: sealed, about a third larger and
+// a header, it stays with the item's own attributes within the 1 KB a
+// write unit pays for (twice, in a transaction), as the DOC# item's put
+// would cost.
+const inlineDocMax = 400
 
 func scanRes(it item) *resRow {
 	return &resRow{
@@ -157,6 +170,7 @@ func scanRes(it item) *resRow {
 		lastID: it.s("lastId"), lastPos: it.n("lastPos"),
 		horizonPos: it.n("horizonPos"), horizonBase: it.n("horizonBase"), horizonID: it.s("horizonId"), keep: it.s("keep"),
 		kept: it.ns("kept"),
+		doc:  it.s("doc"), docPos: it.n("docPos"),
 	}
 }
 

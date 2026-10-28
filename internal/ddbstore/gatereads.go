@@ -92,7 +92,15 @@ func (s *Store) Prefetch(ctx context.Context, ns string, names []string) (*ddb.N
 	pre := make(map[string]ddb.Prefetched, len(names))
 	for _, n := range names {
 		p := ddb.Prefetched{Res: resOut(res[n])}
-		if d, ok := docs[n]; ok {
+		if r := res[n]; r != nil && r.doc != "" {
+			// The resource item's copy is the head's; a DOC# item beside
+			// it is an earlier head's (commit.go).
+			doc, err := s.open(ctx, ns, n, "head", strconv.FormatUint(r.docPos, 10), r.doc)
+			if err != nil {
+				return nil, nil, err
+			}
+			p.DocPos, p.Doc = r.docPos, []byte(doc)
+		} else if d, ok := docs[n]; ok {
 			pos := d.n("revPos")
 			doc, err := s.open(ctx, ns, n, "head", strconv.FormatUint(pos, 10), d.s("doc"))
 			if err != nil {
@@ -177,31 +185,33 @@ func (s *Store) RevAt(ctx context.Context, ns, name string, pos uint64) (*ddb.Re
 // horizon's document if pruned. One below the horizon that isn't kept is
 // a *PrunedError.
 func (s *Store) DocAt(ctx context.Context, ns, name string, pos uint64) ([]byte, error) {
-	// The head's document first, one read: the document item names the
-	// position it holds, and a position's document never changes, so it
-	// answers for pos without the resource item. Any other position (an
-	// earlier one, a tombstone's, an e2e resource without the item) reads
-	// on as below.
-	if it, err := s.getItem(ctx, keyDocHead(ns, name)); err != nil {
-		return nil, err
-	} else if it != nil && item(it).n("revPos") == pos {
-		d, err := s.open(ctx, ns, name, "head", strconv.FormatUint(pos, 10), item(it).s("doc"))
-		return []byte(d), err
-	}
-	res, err := s.getRes(ctx, ns, name)
+	// The head's document first, one read of both items it may be on:
+	// the resource item (commit.go: a small one, the head's), or the DOC#
+	// item, which names the position it holds; a position's document never
+	// changes, so either answers for that position. A DOC# item a smaller
+	// head's left below a pruning horizon isn't served: PruneContent
+	// deletes it. Any other position (an earlier one, a tombstone's, an
+	// e2e resource's) reads on as below.
+	got, err := s.batchGet(ctx, []Key{keyRes(ns, name), keyDocHead(ns, name)})
 	if err != nil {
 		return nil, err
 	}
-	if res != nil && res.headPos == pos {
-		it, err := s.getItem(ctx, keyDocHead(ns, name))
-		if err != nil {
-			return nil, err
-		}
-		if it == nil {
-			return nil, apiErr(409, "conflict", "detail", "head document missing")
-		}
-		d, err := s.open(ctx, ns, name, "head", strconv.FormatUint(item(it).n("revPos"), 10), item(it).s("doc"))
+	var res *resRow
+	if it, ok := got[keyRes(ns, name)]; ok {
+		res = scanRes(it)
+	}
+	if res != nil && res.doc != "" && (res.docPos == pos || res.headPos == pos) {
+		// A tombstone head's is the last live one.
+		d, err := s.open(ctx, ns, name, "head", strconv.FormatUint(res.docPos, 10), res.doc)
 		return []byte(d), err
+	}
+	if d, ok := got[keyDocHead(ns, name)]; ok && (res == nil || d.n("revPos") >= res.horizonPos) &&
+		(d.n("revPos") == pos || res != nil && res.doc == "" && res.headPos == pos) {
+		d, err := s.open(ctx, ns, name, "head", strconv.FormatUint(d.n("revPos"), 10), d.s("doc"))
+		return []byte(d), err
+	}
+	if res != nil && res.headPos == pos && res.doc == "" {
+		return nil, apiErr(409, "conflict", "detail", "head document missing")
 	}
 	r, err := s.RevAt(ctx, ns, name, pos)
 	if err != nil {
