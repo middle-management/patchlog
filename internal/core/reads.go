@@ -1021,6 +1021,10 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		// digests; migration 008_clear_at_rest_digests, encryptNamespace).
 		level := t.nsLevel(n)
 		plain := level < levelSealed
+		// Nor for a resource §1 answers 502 for, read through a remote
+		// branch whose source was raised to a level this server lacks: its
+		// source hides them now (§1, §7.4).
+		rb, _, lost := t.lostRemote(n)
 		for _, h := range page {
 			kind := "head"
 			switch h.state {
@@ -1039,7 +1043,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 			// as GET …/rev/{target} serves it uncoded, where the write
 			// stored them (headMeta). A pruned head keeps them, as it
 			// keeps its target.
-			if plain && h.row != nil && h.state != Purged {
+			if plain && h.row != nil && h.state != Purged && !(lost && t.upstreamCovers(rb, h.name, &view{state: h.state})) {
 				item["created"] = formatTime(h.row.created)
 				if h.state == Live && level < levelAtRest && h.row.size.Valid && len(h.row.digest) == sha256.Size {
 					item["size"] = float64(h.row.size.Int64)
