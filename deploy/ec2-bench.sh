@@ -5,14 +5,16 @@
 # summary of where the requests spent their time, then terminates the
 # instance.
 #
-#   ./deploy/ec2-bench.sh [-y] [writers] [writes-per-writer]   (default 8 50)
-#   ./deploy/ec2-bench.sh cleanup                               the IAM role, profile
+#   ./deploy/ec2-bench.sh [-y] [writes/s] [seconds]   (default 100 20)
+#   ./deploy/ec2-bench.sh cleanup                      the IAM role, profile
+#
+# The arguments, READS and LOGS are bench.sh's. The instance runs this
+# checkout's bench.sh and spans.py, and oha's release OHA (default v1.14.0).
 #
 # Settings (environment):
 #   REGION   the table's region (default: aws configure's)
 #   TABLE    the table (default patchlog); made, on-demand, if it's missing
-#   VERSION  the release to run (default v0.24.0-ddb.3); bench.sh and
-#            spans.py are taken from the same tag
+#   VERSION  the release to run (default v0.24.0-ddb.3)
 #   TYPE     the instance type (default c7g.large, arm64)
 #   SUBNET   a subnet with a route out (default: the default VPC's)
 #
@@ -31,6 +33,8 @@ REGION=${REGION:-${AWS_REGION:-$(aws configure get region || true)}}
 TABLE=${TABLE:-patchlog}
 VERSION=${VERSION:-v0.24.0-ddb.3}
 TYPE=${TYPE:-c7g.large}
+OHA=${OHA:-v1.14.0}
+READS=${READS:-}; LOGS=${LOGS:-}
 ROLE=patchlog-bench
 REPO=middle-management/patchlog
 [ -n "$REGION" ] || { echo "ec2-bench: set REGION (or aws configure set region …)" >&2; exit 1; }
@@ -48,8 +52,8 @@ fi
 
 YES=""
 [ "${1:-}" = -y ] && { YES=1; shift; }
-W=${1:-8}; N=${2:-50}
-case "$W$N" in *[!0-9]*) echo "usage: $0 [-y] [writers] [writes-per-writer] | cleanup" >&2; exit 2 ;; esac
+RATE=${1:-100}; SECS=${2:-20}
+case "$RATE$SECS$READS$LOGS" in *[!0-9]*) echo "usage: $0 [-y] [writes/s] [seconds] | cleanup" >&2; exit 2 ;; esac
 
 # What's there, and what would be made.
 account=$(aws sts get-caller-identity --query Account --output text)
@@ -70,7 +74,7 @@ echo "account $account, region $REGION"
 echo "  table $TABLE: $([ -n "$table_arn" ] && echo exists || echo 'to make (on-demand)')"
 echo "  role $ROLE: $([ -n "$have_role" ] && echo 'exists (its DynamoDB policy is set to this table)' || echo 'to make')"
 echo "  instance: $TYPE ($arch, $ami) in $SUBNET, terminated on exit"
-echo "  run: patchlog $VERSION, bench $W writers × $N writes"
+echo "  run: patchlog $VERSION, bench $RATE writes/s for ${SECS}s${READS:+, reads $READS/s}${LOGS:+, logs $LOGS/s}"
 if [ -z "$YES" ]; then
   read -r -p "Go ahead? [y/N] " ok
   [ "$ok" = y ] || [ "$ok" = Y ] || exit 1
@@ -106,28 +110,33 @@ aws iam put-role-policy --role-name $ROLE --policy-name dynamodb --policy-docume
     \"dynamodb:BatchWriteItem\", \"dynamodb:ConditionCheckItem\"],
     \"Resource\": [\"$table_arn\", \"$table_arn/index/*\"]}]}"
 
-# The instance prepares itself (the release, bench.sh, spans.py) and powers
-# off after 90 minutes whatever happens: shutdown terminates it.
+# The instance prepares itself (the release, oha, this checkout's bench.sh
+# and spans.py) and powers off after 90 minutes whatever happens: shutdown
+# terminates it.
 userdata=$(mktemp)
 trap 'rm -f "$userdata"' EXIT
+scripts=$(tar -C "$(dirname "$0")" -cz bench.sh spans.py | base64 | tr -d '\n')
 cat >"$userdata" <<EOF
 #!/bin/bash
 shutdown -h +90
 set -eux
 mkdir -p /opt/bench && cd /opt/bench
 curl -fsSL https://github.com/$REPO/releases/download/$VERSION/patchlog_${VERSION}_linux_$goarch.tar.gz | tar xz --strip-components=1
-for f in bench.sh spans.py; do curl -fsSLO https://raw.githubusercontent.com/$REPO/$VERSION/deploy/\$f; done
-chmod +x patchlog bench.sh spans.py
+curl -fsSL -o oha https://github.com/hatoo/oha/releases/download/$OHA/oha-linux-$goarch
+echo $scripts | base64 -d | tar xz
+chmod +x patchlog oha bench.sh spans.py
 cat >run.sh <<'RUN'
 #!/bin/bash
-# run.sh W N: the server with its spans on stderr, the bench, the summary.
+# run.sh RATE SECS: the server with its spans on stderr, the bench, the summary.
 set -eu
 cd /opt/bench
+export PATH=/opt/bench:\$PATH
 OTEL_TRACES_EXPORTER=console OTEL_METRICS_EXPORTER=none \\
-  ./patchlog serve -dev -addr 127.0.0.1:8080 -db 'dynamodb://$TABLE?region=$REGION' 2>spans.jsonl &
+  ./patchlog serve -dev -addr 127.0.0.1:8080 -max-rate-per-namespace 100000,1000000 \\
+    -db 'dynamodb://$TABLE?region=$REGION' 2>spans.jsonl &
 server=\$!
 for _ in \$(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8080/ && break; kill -0 \$server || { grep -v '^{' spans.jsonl; exit 1; }; sleep 1; done
-./bench.sh "\$1" "\$2" || echo "bench failed: \$?"
+${READS:+READS=$READS }${LOGS:+LOGS=$LOGS }./bench.sh "\$1" "\$2" || echo "bench failed: \$?"
 kill \$server; wait \$server || true
 echo; ./spans.py spans.jsonl
 RUN
@@ -161,7 +170,7 @@ for _ in $(seq 1 60); do
   sleep 5
 done
 cmd=$(aws ssm send-command --instance-ids "$id" --document-name AWS-RunShellScript \
-  --parameters "{\"commands\": [\"for i in \$(seq 1 120); do [ -f /opt/bench/ready ] && break; sleep 2; done; /opt/bench/run.sh $W $N\"], \"executionTimeout\": [\"3600\"]}" \
+  --parameters "{\"commands\": [\"for i in \$(seq 1 120); do [ -f /opt/bench/ready ] && break; sleep 2; done; /opt/bench/run.sh $RATE $SECS\"], \"executionTimeout\": [\"3600\"]}" \
   --query Command.CommandId --output text)
 echo "running the bench ($cmd)"
 while :; do
