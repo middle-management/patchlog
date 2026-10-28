@@ -29,6 +29,8 @@
 # Each request also pays for a curl process and a connection (a few ms),
 # so compare runs with each other rather than read them as absolutes.
 # Needs GNU date (date +%s%N; on macOS, coreutils' gdate as date).
+# deploy/ec2-bench.sh runs it, with the server, on an EC2 instance in a
+# real table's region.
 set -euo pipefail
 BASE=${BASE:-http://localhost:8080}
 W=${1:-8}; N=${2:-50}; NS=bench$RANDOM
