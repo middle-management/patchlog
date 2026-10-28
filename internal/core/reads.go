@@ -1022,9 +1022,10 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		level := t.nsLevel(n)
 		plain := level < levelSealed
 		// Nor for a resource §1 answers 502 for, read through a remote
-		// branch whose source was raised to a level this server lacks: its
-		// source hides them now (§1, §7.4).
-		rb, _, lost := t.lostRemote(n)
+		// branch whose source was raised to a level this server lacks, or
+		// one held back while the branch's raise fails (503, remoteHeld):
+		// its source hides them now (§1, §7.4).
+		rb, _, _, lost := t.lostRemote(n)
 		for _, h := range page {
 			kind := "head"
 			switch h.state {

@@ -744,8 +744,10 @@ func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 // the raise (preRaiseKeysOpen: schema resolution, blob copies, a batch's
 // local source) both take it from here, so neither is looser or tighter
 // than the other (§2.1 Protection). In a branch, a is the branch's grant.
+// A remote branch's shadow's epochs whose start times base.origin hasn't
+// given are in no window (knownStarts, §G.5.2).
 func (t *tx) preRaiseWindow(owner *nsRow, raise *e2eRaise, a *actor) []int {
-	return t.grantEpochsOf(t.epochStarts(`epoch_keys`, owner.id, raise.epoch), t.preRaiseConfig(raise), a)
+	return t.grantEpochsOf(knownStarts(t.epochStarts(`epoch_keys`, owner.id, raise.epoch)), t.preRaiseConfig(raise), a)
 }
 
 // withPreRaise replaces, in epochs, a window over owner's epochs (ascending),

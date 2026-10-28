@@ -65,7 +65,7 @@ import (
 // its base's current document judges (checkRemoteSource), and by raising
 // its level when the base's rises (followLevel), or, on a server that
 // lacks the level, answering 502 upstream for what it mirrored (§1,
-// upstream.go). The shadows follow the branch's level (at rest, and for
+// upstream.go), and 503 while a raise it could make fails. The shadows follow the branch's level (at rest, and for
 // sealing and e2e).
 //
 //   - E2. B fetches with keys: the endpoint's grant gets them from the
@@ -82,7 +82,9 @@ import (
 //     began, from its configuration history. History the base pruned can't
 //     be mirrored: its horizon is a sealed snapshot. Content from before a
 //     raise from sealed is mirrored with the base's sealings of it,
-//     verbatim, each keeping its epoch (fetchPreSealings, §G.5.2).
+//     verbatim, each keeping its epoch (fetchPreSealings, §G.5.2), checked
+//     with the base's keys of those epochs, which the branch hands out by
+//     start times read only from base.origin itself (originStarts).
 
 // RemoteAuthor is the author of entries this deployment writes on behalf of
 // a remote base: purges followed from its log, and mirrored horizons whose
@@ -572,7 +574,8 @@ type remoteLevel struct {
 	// e2e before at, -1 if it was e2e from its creation (Addendum E
 	// Levels); preEnc is its encryption member before (nil for none), and
 	// from sealed, preEpochs are the epochs before the raise with when each
-	// began, which only the source's own log gives (§G.5.2), and preKeys
+	// began, which only the source's own log gives (§G.5.2; unknown where
+	// it can't be read, originStarts), and preKeys
 	// the keys of those its source's /keys gave this deployment's grant
 	// (fetchPreRaiseKeys), which the branch's /keys gives as at E2.
 	raise     int
@@ -874,11 +877,15 @@ func (e *Engine) fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLe
 // aren't hashed (§5), so only the ids verify what the endpoint served.
 // Where the endpoint isn't the origin (RemoteEndpoint.OriginURL), the log
 // is read again from the origin with the endpoint's grant and keys; where
-// that fails, no start times are recorded, and the branch hands out none
-// of those keys (fetchPreRaiseKeys), rather than by times it can't trust.
-// The relayed keyring entries' epochs keep the endpoint's times: they are
-// wrapped to keyring recipients, so a wrong time only changes which of
-// them a grant receives. Only no answer from the endpoint fails creation.
+// that fails, each start time is recorded as unknown (epochStartUnknown):
+// the branch still fetches and holds those keys, which check the source's
+// sealings and serve its content from before the raise as the source does
+// (fetchPreRaiseKeys, fetchPreSealings), but hands out none of them
+// (knownStarts) until a later sync reads the times from the origin
+// (followPreStarts), rather than by times it can't trust. The relayed
+// keyring entries' epochs keep the endpoint's times: they are wrapped to
+// keyring recipients, so a wrong time only changes which of them a grant
+// receives. Only no answer from the endpoint fails creation.
 func originStarts(ctx context.Context, ep RemoteEndpoint, origin string, lv *remoteLevel) *Error {
 	if lv.raise < 0 || len(lv.preEpochs) == 0 {
 		return nil
@@ -892,14 +899,36 @@ func originStarts(ctx context.Context, ep RemoteEndpoint, origin string, lv *rem
 	}
 	created, err := originCreated(ctx, ep, direct, lv)
 	if err != nil {
-		log.Printf("remote base %s/ns/%s: the start times of its epochs before its raise to e2e, read from the origin itself: %v; the branch gives none of their keys", origin, lv.ns, err)
-		lv.preEpochs, lv.preIDs = nil, nil
+		log.Printf("remote base %s/ns/%s: the start times of its epochs before its raise to e2e, read from the origin itself: %v; the branch gives none of their keys until it can read them", origin, lv.ns, err)
+		for i := range lv.preEpochs {
+			lv.preEpochs[i].created = time.UnixMilli(epochStartUnknown)
+		}
 		return nil
 	}
 	for i, id := range lv.preIDs {
 		lv.preEpochs[i].created = created[id]
 	}
 	return nil
+}
+
+// epochStartUnknown is the start time, in Unix milliseconds, recorded for
+// a remote branch's shadow's key of an epoch from before its source's e2e
+// raise whose start base.origin couldn't give (originStarts): earlier than
+// any real one, and never in a §E.2.3 window (knownStarts).
+const epochStartUnknown int64 = -1 << 62
+
+// knownStarts leaves out of all the epochs whose start time is unknown
+// (epochStartUnknown): /keys hands out none of their keys, and no grant's
+// window covers them, until the follower reads the times from base.origin
+// itself (§G.5.2, followPreStarts).
+func knownStarts(all []epochStart) []epochStart {
+	out := all[:0:0]
+	for _, x := range all {
+		if x.created.UnixMilli() != epochStartUnknown {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // originCreated reads the level's namespace log up to at from url, which
@@ -938,9 +967,11 @@ func originCreated(ctx context.Context, ep RemoteEndpoint, url string, lv *remot
 // Reading through): they are the origin's, given as at E2, raw or wrapped
 // to the grant's enc in base mode, which the endpoint's Identity unwraps.
 // The branch's /keys gives them to its own grants as at E2 (preRaiseKeys),
-// with start times only from the source's own log (§G.5.2). Keys the source
-// gives this grant none of, it relays none of; keyring entries (from) are
-// the mirrored keyring's. Only no answer, or a 5xx, fails creation.
+// with start times only from the source's own log (§G.5.2), and none while
+// those are unknown (originStarts), though it still holds them to check and
+// serve the source's sealings. Keys the source gives this grant none of, it
+// relays none of; keyring entries (from) are the mirrored keyring's. Only
+// no answer, or a 5xx, fails creation.
 func fetchPreRaiseKeys(ctx context.Context, c *client.Client, ep RemoteEndpoint, lv *remoteLevel) *Error {
 	if lv.raise < 0 || len(lv.preEpochs) == 0 {
 		return nil
@@ -1470,7 +1501,8 @@ func (t *tx) insertShadows(branch string, m *remoteMirror) (*nsRow, int64) {
 			t.must(err)
 		}
 		// The keys of the epochs before a raise from sealed, with the start
-		// times the source's log gives them (preRaiseKeys).
+		// times the source's own log gives them, or unknown where it
+		// couldn't be read (originStarts, preRaiseKeys).
 		for _, x := range lv.preEpochs {
 			if k := lv.preKeys[x.e]; k != nil {
 				t.storeEpochKey(sh.id, x.e, k, x.created)
@@ -2321,13 +2353,74 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 // follows the base's document as of the checkpoint, once, whether or not
 // the log has moved since: the entries before it were followed only for
 // their purges. The epochs the e2e bases below the base have in force now
-// are followed too (followChainEpochs).
+// are followed too (followChainEpochs), and start times base.origin
+// couldn't give at creation are read from it again (followPreStarts).
 func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	c, ep, err := e.remoteClient(b.origin)
 	if err != nil {
 		return err
 	}
-	return errors.Join(e.followLog(ctx, c, ep, b), e.retryLevel(ctx, b), e.followChainEpochs(ctx, c, ep, b))
+	return errors.Join(e.followLog(ctx, c, ep, b), e.retryLevel(ctx, b), e.followChainEpochs(ctx, c, ep, b), e.followPreStarts(ctx, c, ep, b))
+}
+
+// followPreStarts reads again, for each shadow of a remote branch holding
+// keys of its source's epochs from before an e2e raise whose start times
+// base.origin couldn't give (originStarts, epochStartUnknown), the level
+// as of the shadow's at through the endpoint, and the start times from
+// base.origin itself (§G.5.2), and records those it now gets: from then
+// on the branch's /keys hands those keys out by them (knownStarts). A
+// level still unreadable keeps them unknown; the error is reported.
+func (e *Engine) followPreStarts(ctx context.Context, c *client.Client, ep RemoteEndpoint, b *remoteBase) error {
+	type level struct {
+		shadow int64
+		ns, at string
+	}
+	var levels []level
+	if err := e.read(ctx, func(t *tx) error {
+		bn := t.nsByID(b.branch)
+		if bn == nil || bn.purged {
+			return nil
+		}
+		for _, sh := range t.remoteShadows(bn) {
+			var unknown bool
+			t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM epoch_keys WHERE ns = ? AND created = ?)`, sh.id, epochStartUnknown).Scan(&unknown))
+			if unknown && sh.headSeq.Valid {
+				levels = append(levels, level{sh.id, t.kidName(sh), t.nsLogID(sh.headSeq.Int64).String()})
+			}
+		}
+		return nil
+	}); err != nil || len(levels) == 0 {
+		return err
+	}
+	starts := map[int64][]epochStart{}
+	var errs []error
+	for _, l := range levels {
+		mapErr := func(what string, err error) *Error { return upstreamErr("%s: %v", what, err) }
+		lv, _, ferr := fetchLevel(ctx, c, b.origin, l.ns, l.at, mapErr)
+		if ferr == nil {
+			ferr = e.fetchEpochs(ctx, c, lv, mapErr)
+		}
+		if ferr == nil {
+			ferr = originStarts(ctx, ep, b.origin, lv)
+		}
+		if ferr != nil {
+			errs = append(errs, fmt.Errorf("/ns/%s: the start times of its epochs before its raise to e2e: %w", l.ns, ferr))
+			continue
+		}
+		starts[l.shadow] = knownStarts(lv.preEpochs)
+	}
+	if len(starts) > 0 {
+		errs = append(errs, e.update(ctx, func(t *tx) error {
+			for sh, xs := range starts {
+				for _, x := range xs {
+					_, err := t.Exec(`UPDATE epoch_keys SET created = ? WHERE ns = ? AND epoch = ? AND created = ?`, x.created.UnixMilli(), sh, x.e, epochStartUnknown)
+					t.must(err)
+				}
+			}
+			return nil
+		}))
+	}
+	return errors.Join(errs...)
 }
 
 // followChainEpochs follows, for a remote branch of a branch, the epoch
@@ -2664,7 +2757,9 @@ func (t *tx) followConfig(bn *nsRow, id string, d sourceDoc) {
 //     dependent's document holding a member the level refuses that a
 //     server write can't remove, say): Levels refuse it, so the branch
 //     needs a rebase (§G.5.2). A failed raise is tried again at every sync
-//     (retryLevel), while the branch goes on serving at its own level.
+//     (retryLevel); until it is made, the resources the base had at at
+//     answer 503 rather than be served below the base's level (Addendum E
+//     Levels, Invariant; remoteHeld, upstreamRefusal).
 func (t *tx) followLevel(bn *nsRow, id string, level int) bool {
 	lacks, rebase := false, level == levelE2E
 	if t.e.opt.KeyStore == nil {
@@ -2675,23 +2770,23 @@ func (t *tx) followLevel(bn *nsRow, id string, level int) bool {
 			rebase = true
 		}
 	}
-	var wasLacks bool
-	if err := t.QueryRow(`SELECT lacks FROM remote_levels WHERE branch = ?`, bn.id).Scan(&wasLacks); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		t.must(err)
-	}
+	_, wasLacks, wasHeld := t.remoteHeld(bn)
 	_, err := t.Exec(`DELETE FROM remote_levels WHERE branch = ?`, bn.id)
 	t.must(err)
-	if lacks != wasLacks {
-		// Copies of its resources, at the edge and in the read cache, go:
-		// they answer 502 now, or again as before (§9).
-		t.lostChanged(bn)
-	}
 	if !lacks && !rebase {
+		if wasHeld {
+			t.lostChanged(bn)
+		}
 		return true
 	}
 	_, err = t.Exec(`INSERT INTO remote_levels (branch, level, lacks, rebase, id, created) VALUES (?,?,?,?,?,?)`,
 		bn.id, level, lacks, rebase, id, t.now.UnixMilli())
 	t.must(err)
+	if _, nowLacks, held := t.remoteHeld(t.nsByID(bn.id)); held != wasHeld || nowLacks != wasLacks {
+		// Copies of its resources, at the edge and in the read cache, go:
+		// they answer 502 or 503 now, or again as before (§9).
+		t.lostChanged(bn)
+	}
 	if lacks {
 		log.Printf("remote branch %s: its base was raised to %s, which this server lacks: what it had at at answers 502 upstream (§1)", bn.name, levelNames[level])
 	} else {
@@ -2708,8 +2803,8 @@ func followTarget(level int) int {
 }
 
 // lostChanged drops the copies of bn's resources and its dependents', at
-// the edge and in the read cache, when whether they answer 502 upstream
-// changes (§1, §9, followLevel).
+// the edge and in the read cache, when whether they answer 502 upstream,
+// or 503 while a raise is held (remoteHeld), changes (§1, §9, followLevel).
 func (t *tx) lostChanged(bn *nsRow) {
 	t.metaChanged = true
 	for _, n := range t.leavesFirst(bn) {

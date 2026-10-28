@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -135,9 +136,11 @@ func TestV074RemoteE2ERaiseFollowsToSealed(t *testing.T) {
 // its raise needs a level its server lacks. Here the server has a key
 // store but the raise's config writes fail (the deployment's patchSetSize
 // maximum was lowered below what §6.6 Values needs, so no config write
-// that changes encryption passes): its resources keep answering, the
-// raise is recorded for a rebase, not as lacking, and the next sync tries
-// it again, which succeeds once the maximum is back.
+// that changes encryption passes): its resources answer 503 with
+// Retry-After, not 502, and aren't served below the source's level
+// (Addendum E Levels, Invariant); the raise is recorded for a rebase, not
+// as lacking, and the next sync tries it again, which succeeds once the
+// maximum is back.
 func TestV074RemoteFailedRaiseIsNot502(t *testing.T) {
 	t.Parallel()
 	a := newEnv(t, withOrigin(originA), withKeyStore(newKeyStore(t)), withEncTuning)
@@ -159,18 +162,26 @@ func TestV074RemoteFailedRaiseIsNot502(t *testing.T) {
 	if l := levelOf(b.configOf("r")); l != "" {
 		t.Fatalf("raised to %q although its config writes fail", l)
 	}
+	held := func(p string) {
+		t.Helper()
+		g := b.get(p)
+		expect(t, g, 503)
+		if g.H.Get("Retry-After") == "" || !strings.Contains(string(g.Body), `"encryption_unavailable"`) {
+			t.Fatalf("%s: %v %s, want 503 encryption_unavailable with Retry-After", p, g.H, g.Body)
+		}
+	}
 	for _, p := range []string{"/r/r/x/rev/" + x, "/r/rx/x/rev/" + x} {
-		expect(t, b.get(p), 200)
+		held(p)
 	}
 	ls, err := b.e.RemoteLevels(context.Background(), "r")
 	if err != nil || len(ls) != 1 || ls[0].Level != "sealed" || ls[0].Lacks || !ls[0].Rebase {
 		t.Fatalf("levels %+v %v, want sealed, not lacking, marked for a rebase", ls, err)
 	}
-	// Tried again at every sync: still failing, still answering.
+	// Tried again at every sync: still failing, still held.
 	if err := syncRemotes(t, b); err != nil {
 		t.Fatal(err)
 	}
-	expect(t, b.get("/r/r/x/rev/"+x), 200)
+	held("/r/r/x/rev/" + x)
 	// With the maximum back, the next sync raises, leaves first.
 	b = reopen()
 	if err := syncRemotes(t, b); err != nil {
