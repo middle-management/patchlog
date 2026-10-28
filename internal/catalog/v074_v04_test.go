@@ -24,3 +24,23 @@ func TestNoMergeKeyNotOfferedV074(t *testing.T) {
 		}
 	}
 }
+
+// TestKeySubScopeUserOnlyV074 (Open 102): a key's sub scope matches the
+// caller's sub only if it starts with user: (§B.11.4 Through the key). A
+// svc: sub fails it, even under a pattern made for it, so a role
+// collected through the caller's groups doesn't count either.
+func TestKeySubScopeUserOnlyV074(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	bot := w.caller("svc:bot", "fan-club")
+	read := map[string]any{"item": "/r/matches/derby", "want": toAny("read")}
+	// Without a sub scope fan-club's reader at season counts for svc:bot.
+	w.issue(bot, read, 200)
+	// keys[2] is the catalog's key in matches.
+	w.patchMatches(map[string]any{"op": "add", "path": "/keys/2/sub", "value": "(svc|user):.*"})
+	w.issue(bot, read, 403)
+	w.issue(w.caller("user:fred", "fan-club"), read, 200)
+}
