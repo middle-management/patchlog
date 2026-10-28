@@ -536,11 +536,14 @@ func TestSealedRotation(t *testing.T) {
 	a1 := e.wr("s", "a", "", withNonce(addRoot(map[string]any{"v": 1.0})))
 	before := string(e.get("/r/s/a/rev/" + a1).Body)
 	beforeLog := string(e.get("/r/s/a/rev/" + a1 + "/log").Body)
+	keys1, _ := e.keysOf("s", nil, "")
 	expect(t, e.patchNS("s", ops(op("add", "/encryption/epoch", 2.0)), ""), 201)
 	a2 := e.wr("s", "a", a1, withNonce(ops(op("replace", "/v", 2.0))))
+	// With authentication disabled, /keys gives the current epoch's key
+	// alone, as to a grant without nbf (§E.2.3, v0.74).
 	keys, _ := e.keysOf("s", nil, "")
-	if keys["s#1"] == nil || keys["s#2"] == nil || string(keys["s#1"]) == string(keys["s#2"]) {
-		t.Fatalf("keys %v", keys)
+	if len(keys) != 1 || keys1["s#1"] == nil || keys["s#2"] == nil || string(keys1["s#1"]) == string(keys["s#2"]) {
+		t.Fatalf("keys %v, before the rotation %v", keys, keys1)
 	}
 	if got := string(e.get("/r/s/a/rev/" + a1).Body); got != before {
 		t.Fatal("an old revision's bytes changed after rotation")

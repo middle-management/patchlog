@@ -48,8 +48,13 @@ func p36Keys(t *testing.T, r *resp, unwrap func(seal.WrappedKey) ([]byte, error)
 // times from the source's own log, fetches their keys from the source's
 // POST /ns/{ns}/keys with its own grant, and its /keys gives them as at
 // E2: K_e, or K_r derived with the source's ns, kids naming the source,
-// for the base epochs §E.2.3 selects as at E2 (from the one in force at
-// the reader's latest nbf; without nbf, the last epoch before the raise).
+// for the base epochs §E.2.3 selects (from the one in force at the
+// reader's latest nbf; without nbf, none since v0.74).
+//
+// Since v0.74 the source's /keys gives a grant without nbf no epoch from
+// before the raise, and while authentication is disabled only the current
+// epoch (§E.2.3, Addendum E Levels), so A authenticates and B's endpoint
+// grant carries an nbf before A's first epoch.
 //
 // A here is a sealed namespace whose last config entry this test's proxy
 // serves as the e2e document of a raise from sealed (epoch 3); B reads
@@ -59,17 +64,22 @@ func p36Keys(t *testing.T, r *resp, unwrap func(seal.WrappedKey) ([]byte, error)
 // for real, now that servers make it (P35).
 func TestV073P36RemotePreRaiseKeys(t *testing.T) {
 	t.Parallel()
-	a := newEnv(t, withOrigin(originA), withKeyStore(newKeyStore(t)), withEncTuning)
-	a.mkNS("m", sealedDoc(map[string]any{"read": "grant"}))
-	x1 := a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning)
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("m", sealedDoc(map[string]any{"read": "grant", "keys": []any{kA.entry("*")}}))
+	root := func() string { return a.grant(kA, "user:root", []string{"m"}, allVerbs) }
+	x1 := a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})), root())
 	a.clock.Advance(time.Hour)
-	expect(t, a.patchNS("m", ops(op("add", "/encryption/epoch", 2.0)), ""), 201) // epoch 2 from t0+1h
-	x2 := a.wr("m", "x", x1, withNonce(ops(op("replace", "/v", 2.0))))
+	expect(t, a.patchNS("m", ops(op("add", "/encryption/epoch", 2.0)), root()), 201) // epoch 2 from t0+1h
+	x2 := a.wr("m", "x", x1, withNonce(ops(op("replace", "/v", 2.0))), root())
 	a.clock.Advance(time.Hour)
-	expect(t, a.patchNS("m", ops(op("add", "/x-raise", true)), ""), 201) // "e2e" epoch 3 from t0+2h
-	raised := a.nsHead("m")
+	expect(t, a.patchNS("m", ops(op("add", "/x-raise", true)), root()), 201) // "e2e" epoch 3 from t0+2h
+	raised := a.nsHead("m", root())
 	raisedDoc, _ := json.Marshal(map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e", "epoch": 3.0}})
-	ak, _ := a.keysOf("m", nil, "")
+	endpoint := a.grant(kA, "svc:b", []string{"m"}, []string{"read", "export"}, map[string]any{"nbf": t0.Add(-time.Hour).Format(time.RFC3339)})
+	ak, _ := a.keysOf("m", nil, endpoint)
 
 	var bPriv ed25519.PrivateKey
 	rt := &route{}
@@ -80,7 +90,7 @@ func TestV073P36RemotePreRaiseKeys(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(raisedDoc)
 		return true
-	}, "", nil), "")
+	}, "", nil), endpoint)
 	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt), withKeyStore(newKeyStore(t)), withEncTuning)
 	b.opPriv = bPriv
 	b.clock.Advance(3 * time.Hour)
@@ -100,9 +110,9 @@ func TestV073P36RemotePreRaiseKeys(t *testing.T) {
 		grant string
 		want  []string
 	}{
-		"no nbf: the last of the source's pre-raise epochs": {reader(), []string{"m#2"}},
-		"nbf before the source's first epoch":               {reader(nbf(-time.Hour)), []string{"m#1", "m#2"}},
-		"nbf in epoch 2, by the source's start times":       {reader(nbf(90 * time.Minute)), []string{"m#2"}},
+		"no nbf: none of the source's pre-raise epochs": {reader(), nil},
+		"nbf before the source's first epoch":           {reader(nbf(-time.Hour)), []string{"m#1", "m#2"}},
+		"nbf in epoch 2, by the source's start times":   {reader(nbf(90 * time.Minute)), []string{"m#2"}},
 	} {
 		_, r := b.keysOf("r", nil, c.grant)
 		got := p36Keys(t, r, unwrap)
@@ -329,18 +339,26 @@ func TestV073P36RemoteChainBaseEpochNow(t *testing.T) {
 // refuses one.
 func TestV073P36RemotePreRaiseSnapshotEpoch(t *testing.T) {
 	t.Parallel()
-	a := newEnv(t, withOrigin(originA), withKeyStore(newKeyStore(t)), withEncTuning)
-	a.mkNS("m", sealedDoc(map[string]any{"read": "grant"}))
-	x1 := a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})))
-	x2 := a.wr("m", "x", x1, withNonce(ops(op("replace", "/v", 2.0)))) // epoch 1
+	// A authenticates, and B's endpoint grant has an nbf before A's first
+	// epoch, so A's /keys gives it the epochs before the raise (v0.74,
+	// TestV073P36RemotePreRaiseKeys).
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning)
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("m", sealedDoc(map[string]any{"read": "grant", "keys": []any{kA.entry("*")}}))
+	root := func() string { return a.grant(kA, "user:root", []string{"m"}, allVerbs) }
+	x1 := a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})), root())
+	x2 := a.wr("m", "x", x1, withNonce(ops(op("replace", "/v", 2.0))), root()) // epoch 1
 	a.clock.Advance(time.Hour)
-	expect(t, a.patchNS("m", ops(op("add", "/encryption/epoch", 2.0)), ""), 201)
+	expect(t, a.patchNS("m", ops(op("add", "/encryption/epoch", 2.0)), root()), 201)
 	a.clock.Advance(time.Hour)
-	expect(t, a.patchNS("m", ops(op("add", "/x-raise", true)), ""), 201)
-	raised := a.nsHead("m")
+	expect(t, a.patchNS("m", ops(op("add", "/x-raise", true)), root()), 201)
+	raised := a.nsHead("m", root())
 	raisedDoc, _ := json.Marshal(map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e", "epoch": 3.0}})
+	endpoint := a.grant(kA, "svc:b", []string{"m"}, []string{"read", "export"}, map[string]any{"nbf": t0.Add(-time.Hour).Format(time.RFC3339)})
 	// A serves x2 under the epoch it was written in.
-	g := a.get("/r/m/x/rev/" + x2)
+	g := a.get("/r/m/x/rev/"+x2, root())
 	if g.Code != 200 || !isJOSE(g) {
 		t.Fatalf("A's x2: %d %s", g.Code, g.Body)
 	}
@@ -358,7 +376,7 @@ func TestV073P36RemotePreRaiseSnapshotEpoch(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(raisedDoc)
 		return true
-	}, "", nil), "")
+	}, "", nil), endpoint)
 	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt), withKeyStore(newKeyStore(t)), withEncTuning)
 	b.opPriv = bPriv
 	b.clock.Advance(3 * time.Hour)

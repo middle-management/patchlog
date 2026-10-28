@@ -204,11 +204,13 @@ func TestBlobSealedFixesEpoch(t *testing.T) {
 	if g.H.Get("Location") != blobPath("s", "a", bid)+"/e/2" {
 		t.Fatalf("redirect %v", g.H)
 	}
-	// The revision keeps that epoch, even after another rotation.
+	// The revision keeps that epoch, even after another rotation. With
+	// authentication disabled /keys gives only the current epoch's key
+	// (§E.2.3, v0.74), so epoch 2's is fetched before the rotation.
+	keys, _ := e.keysOf("s", nil, "")
 	if _, err := e.e.RotateEpoch(context.Background(), "s", core.RotateAuthor); err != nil {
 		t.Fatal(err)
 	}
-	keys, _ := e.keysOf("s", nil, "")
 	rv := e.get("/r/s/a/rev/" + a1)
 	expect(t, rv, 200)
 	open(t, string(rv.Body), resKey(t, keys["s#2"], "s", "a"), "s#2", seal.ResourcePL("s", "a", a1, seal.KindDoc))
