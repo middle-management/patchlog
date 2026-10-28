@@ -326,3 +326,129 @@ func contains(xs []string, x string) bool {
 	}
 	return false
 }
+
+// §G.5.2 E3 sources (v0.74, LEVELS-7): B mirrors A's sealings of content
+// from before its raise from sealed verbatim. B's answers for a revision
+// from before the raise, its log entries and its blob's epoch URL are
+// A's bytes (same IV and tag), not B's own sealing under the same kid,
+// pl and key.
+func TestV074RemotePreRaiseSealingsVerbatim(t *testing.T) {
+	t.Parallel()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("m", sealedDoc(map[string]any{"read": "grant", "keys": []any{kA.entry("*")}}))
+	root := func() string { return a.grant(kA, "user:root", []string{"m"}, allVerbs) }
+	x1 := a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})), root())
+	a.clock.Advance(time.Hour)
+	expect(t, a.patchNS("m", ops(op("add", "/encryption/epoch", 2.0)), root()), 201)
+	data := []byte("a blob from before the raise")
+	bid := a.upload("m", "x", "text/plain", data, root())
+	x2 := a.wr("m", "x", x1, withNonce(ops(op("replace", "/v", 2.0), op("add", "/b", ref(bid, "text/plain", len(data), "")))), root())
+	a.clock.Advance(time.Hour)
+	expect(t, a.patchNS("m", ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 3.0})), root()), 201)
+	raised := a.nsHead("m", root())
+
+	bJWK, bID, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	id := bID
+	rt := &route{url: a.srv.URL, bearer: a.grant(kA, "svc:b", []string{"m"}, []string{"read", "export"}, map[string]any{"enc": bJWK, "nbf": t0.Add(-time.Hour).Format(time.RFC3339)})}
+	var bPriv ed25519.PrivateKey
+	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt, withRemoteIdentity(&mu, &id)), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+	b.opPriv = bPriv
+	b.clock.Advance(3 * time.Hour)
+	kB := newKey("badmin")
+	expect(t, b.mkRemote("r", remoteGenesis("m", raised, e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}}))), 201)
+	g := b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+	ga := root()
+
+	same := func(what, pa, pb string) {
+		t.Helper()
+		ra, rb := a.get(pa, ga), b.get(pb, g)
+		expect(t, ra, 200)
+		expect(t, rb, 200)
+		if !bytes.Equal(ra.Body, rb.Body) {
+			t.Errorf("%s: B serves other bytes than A\\nA: %.120s\\nB: %.120s", what, ra.Body, rb.Body)
+		}
+	}
+	for _, rev := range []string{x1, x2} {
+		same("revision "+rev, "/r/m/x/rev/"+rev, "/r/r/x/rev/"+rev)
+	}
+	same("log", "/r/m/x/rev/"+x2+"/log", "/r/r/x/rev/"+x2+"/log")
+	same("epoch blob URL", "/r/m/x/blob/"+bid+"/e/2", "/r/r/x/blob/"+bid+"/e/2")
+}
+
+// §G.5.2 (v0.74, LEVELS-7): mirrored sealings keep their epochs, also for
+// content of a base deeper in base.chain, which the source serves under
+// that base's kid. Here A's eb is a branch of e, raised from sealed
+// before eb was made: B's remote branch of eb (chain [eb, e]) serves e's
+// pre-raise x1, written in e's epoch 1, under e#1 as A does, and x2
+// under e#2, byte for byte as A serves them, though B fetches x's chain
+// through eb, which wrote on it since. (The blob x1 references isn't
+// checked here: preRaiseBlob stops at eb's shadow, which has no raise of
+// its own, so B answers 404 for its epoch URLs; TestV074RemotePreRaise-
+// SealingsVerbatim checks a pre-raise blob's epoch URL.)
+func TestV074RemoteChainBasePreRaiseEpochs(t *testing.T) {
+	t.Parallel()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("e", sealedDoc(map[string]any{"read": "grant", "keys": []any{kA.entry("*")}}))
+	root := func() string { return a.grant(kA, "user:root", []string{"e", "eb"}, allVerbs) }
+	g := root()
+	data := []byte("e's blob in epoch 1")
+	bid := a.upload("e", "x", "text/plain", data, g)
+	x1 := a.wr("e", "x", "", withNonce(addRoot(map[string]any{"v": 1.0, "b": ref(bid, "text/plain", len(data), "")})), g)
+	a.clock.Advance(time.Hour)
+	g = root()
+	expect(t, a.do(req{method: "PATCH", path: "/ns/e", ifMatch: a.configID("e", g), body: ops(op("add", "/encryption/epoch", 2.0)), bearer: g}), 201)
+	x2 := a.wr("e", "x", x1, withNonce(ops(op("replace", "/v", 2.0))), g)
+	a.clock.Advance(time.Hour)
+	g = root()
+	expect(t, a.do(req{method: "PATCH", path: "/ns/e", ifMatch: a.configID("e", g), body: ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 3.0})), bearer: g}), 201)
+	expect(t, a.branch("e", map[string]any{"name": "eb"}, g), 201)
+	// eb writes on x, so B fetches x's chain through eb, e's part of it
+	// included, which eb serves under e's kids.
+	expect(t, a.do(req{method: "DELETE", path: "/r/eb/x", ifMatch: x2, bearer: g}), 200)
+	at := a.nsHead("eb", g)
+	if r := a.get("/r/eb/x/rev/"+x1, g); r.Code != 200 || mustHeader(t, r.Body).Kid != "e#1" {
+		t.Fatalf("A serves e's x1 through eb: %d %s", r.Code, r.Body)
+	}
+
+	bJWK, bID, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	id := bID
+	rt := &route{url: a.srv.URL, bearer: a.grant(kA, "svc:b", []string{"e", "eb"}, []string{"read", "export"}, map[string]any{"enc": bJWK, "nbf": t0.Add(-time.Hour).Format(time.RFC3339)})}
+	var bPriv ed25519.PrivateKey
+	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt, withRemoteIdentity(&mu, &id)), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+	b.opPriv = bPriv
+	b.clock.Advance(3 * time.Hour)
+	kB := newKey("badmin")
+	doc := e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}})
+	doc["base"] = map[string]any{"origin": originA, "ns": "eb", "at": at, "chain": []any{"eb", "e"}}
+	expect(t, b.mkRemote("rel", addRoot(doc)), 201)
+	gb := b.grant(kB, "user:reader", []string{"rel"}, []string{"read"})
+
+	for _, c := range []struct{ what, pa, pb, kid string }{
+		{"x1", "/r/eb/x/rev/" + x1, "/r/rel/x/rev/" + x1, "e#1"},
+		{"x2", "/r/eb/x/rev/" + x2, "/r/rel/x/rev/" + x2, "e#2"},
+	} {
+		ra, rb := a.get(c.pa, g), b.get(c.pb, gb)
+		expect(t, ra, 200)
+		if rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {
+			t.Errorf("%s: B answers %d, not A's bytes", c.what, rb.Code)
+			continue
+		}
+		if c.kid != "" && mustHeader(t, rb.Body).Kid != c.kid {
+			t.Errorf("%s: kid %q, want %q", c.what, mustHeader(t, rb.Body).Kid, c.kid)
+		}
+	}
+}

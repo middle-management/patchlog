@@ -80,7 +80,9 @@ import (
 //     wrapped keys (kid "{base ns}#{e}") until the branch writes a keyring
 //     of its own; each shadow records its level's epochs and when they
 //     began, from its configuration history. History the base pruned can't
-//     be mirrored: its horizon is a sealed snapshot.
+//     be mirrored: its horizon is a sealed snapshot. Content from before a
+//     raise from sealed is mirrored with the base's sealings of it,
+//     verbatim, each keeping its epoch (fetchPreSealings, §G.5.2).
 
 // RemoteAuthor is the author of entries this deployment writes on behalf of
 // a remote base: purges followed from its log, and mirrored horizons whose
@@ -290,6 +292,9 @@ type remoteChain struct {
 	// (§6.1, F-S1). An entry the base sends none for is stored without one
 	// (NULL, read as Legacy).
 	rules map[string]schema.Rules
+	// sealings are the base's sealings of entries from before a raise
+	// from sealed, mirrored verbatim (fetchPreSealings); nil for none.
+	sealings *preSealings
 }
 
 func newChain(entries []client.LogEntry, horizonDoc []byte) *remoteChain {
@@ -305,7 +310,7 @@ func (c *remoteChain) last() client.LogEntry { return c.entries[len(c.entries)-1
 // prefix is the chain's entries up to index k.
 func (c *remoteChain) prefix(k int) *remoteChain {
 	p := newChain(c.entries[:k+1], c.horizonDoc)
-	p.ns, p.opaque, p.blobs, p.rules = c.ns, c.opaque, c.blobs, c.rules
+	p.ns, p.opaque, p.blobs, p.rules, p.sealings = c.ns, c.opaque, c.blobs, c.rules, c.sealings
 	p.plain = min(c.plain, len(p.entries))
 	return p
 }
@@ -1101,6 +1106,14 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 			raised = raised || lv.raise >= 0
 		}
 	}
+	// The source's keys of the epochs before each raise, by namespace,
+	// which check its sealings of that content (fetchPreSealings).
+	preKeys := map[string]map[int][]byte{}
+	for _, lv := range m.levels {
+		if lv.preKeys != nil {
+			preKeys[lv.ns] = lv.preKeys
+		}
+	}
 	// Every resource as the base sees it at at: the topmost level with
 	// entries for it (§7.6).
 	visible := map[string]int{}
@@ -1162,6 +1175,13 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 		// The blobs its documents reference, mirrored with it (§G.3).
 		if ferr := fetchBlobs(ctx, c, lv.ns, name, ch, mapErrs[i]); ferr != nil {
 			return nil, ferr
+		}
+		// And the source's sealings from before its raise, verbatim
+		// (§G.5.2 E3 sources).
+		if ch.opaque && raised {
+			if ferr := fetchPreSealings(ctx, ep, c.BaseURL(), lv.ns, name, ch, preKeys); ferr != nil {
+				return nil, ferr
+			}
 		}
 		if !ch.opaque {
 			doc, err := ch.docAt(len(ch.entries) - 1)
@@ -1549,7 +1569,7 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 		if rr.parent != nil {
 			parent = t.rev(heads[rr.parent])
 		}
-		heads[rr] = t.insertChain(res, rr.chain, rr.from, parent, parent != nil)
+		heads[rr] = t.insertChain(res, rr.chain, rr.from, parent, parent != nil, lv.ns)
 	}
 	settles := map[int][]*remoteRes{} // log index → resources whose head it set
 	for _, rr := range lv.res {
@@ -1627,7 +1647,7 @@ func parseCreated(s string, now time.Time) int64 {
 // head, state, horizon and cached documents. With foreign, parent is in a
 // base's resource, and the first entry is res's first, with a foreign
 // parent (§3.3). It returns the head row's seq.
-func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, foreign bool) int64 {
+func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, foreign bool, kidNS string) int64 {
 	remote := t.authorID(RemoteAuthor)
 	var parentSeq any
 	if parent != nil {
@@ -1719,11 +1739,18 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 			// Served sealed by its source, which serves it under the epoch
 			// the kid names: a revision from before a raise from sealed
 			// keeps that epoch (Addendum E Levels), which a prune snapshot
-			// of it names (§E.3.1, preRaiseEpoch).
-			if kns, ep, err := seal.ParseKid(e.Kid); err == nil && kns == ch.ns {
+			// of it names (§E.3.1, preRaiseEpoch). The kid names the
+			// namespace of the source's chain the shadow mirrors (kidNS),
+			// also for content of a base read through the source, which
+			// the source serves under the base's kid (§G.5.2).
+			if kns, ep, err := seal.ParseKid(e.Kid); err == nil && kns == kidNS {
 				_, err := t.Exec(`INSERT INTO rev_epochs (seq, epoch) VALUES (?,?)`, last, ep)
 				t.must(err)
 			}
+		}
+		if ch.opaque && i < ch.plain {
+			// From before the raise: the source's sealings, verbatim.
+			t.storePreSealings(res, kidNS, ch.sealings, e, last, declared[i])
 		}
 		if kind == kindTombstone {
 			state = stateTombstoned
@@ -1898,7 +1925,7 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, author int64) *Error 
 			if res == 0 {
 				res = t.mustInsert(`INSERT INTO resources (ns, name) VALUES (?,?) RETURNING res`, n.id, w.s.name)
 			}
-			head := t.insertChain(res, w.s.chain, w.from, w.parent, false)
+			head := t.insertChain(res, w.s.chain, w.from, w.parent, false, w.s.chain.ns)
 			changes = append(changes, change{w.s.name, w.s.chain.last().Kind, head, res})
 		}
 		var entries []any

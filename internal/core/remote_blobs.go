@@ -1,10 +1,17 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"strconv"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -209,4 +216,284 @@ func (t *tx) attachFetched(res int64, ch *remoteChain, bids []ids.ID, seq int64)
 		step.blobs[bid] = &blobRow{res: res, bid: bid, typ: b.typ, nonce: b.nonce, size: int64(len(b.data)), hash: h[:], owner: owner}
 	}
 	t.attachStep(res, step, seq)
+}
+
+// --- A's sealings from before its raise ---------------------------------------
+
+// E3 sources raised from sealed (§G.5.2, Addendum E Levels). B mirrors
+// A's sealings of content from before the raise verbatim: the JWEs A
+// serves for those revisions' documents and log entries, and the sealed
+// blobs at their epoch URLs. They are fetched as A serves them, checked to
+// open under the keys of the epoch their kid names (the source's, which B
+// holds for its own /keys, fetchPreRaiseKeys) to the content the chain
+// verified, and stored under the shadow where B would store its own
+// sealing of them (the sealed table, blob_epochs), so B serves A's bytes
+// and never seals them again (preRaiseResJob, openSealedBlob). A sealing B
+// can't check, for want of its epoch's key, is left out: B seals it, as
+// before, under the same kid, pl and K_r.
+
+// preSealings are the sealings of an opaque chain's entries from before
+// its raise, as the base served them: by entry id, the log entry's and the
+// document's JWE, and by blob, the sealed bytes of each epoch URL.
+type preSealings struct {
+	entries map[string]string
+	docs    map[string]string
+	blobs   map[ids.ID]map[int][]byte
+}
+
+// rawGet fetches path from the base as served, with the endpoint's grant.
+// A status other than 200 is returned with no error.
+func rawGet(ctx context.Context, ep RemoteEndpoint, baseURL, path string, q url.Values) (int, http.Header, []byte, error) {
+	u := baseURL + path
+	if len(q) > 0 {
+		u += "?" + q.Encode()
+	}
+	hr, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	if ep.Bearer != "" {
+		hr.Header.Set("Authorization", "Bearer "+ep.Bearer)
+	}
+	res, err := ep.HTTPClient.Do(hr)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, maxPreSealing))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	return res.StatusCode, res.Header, body, nil
+}
+
+// maxPreSealing bounds one fetched answer: a log page or a document's
+// JWE, or a sealed blob, which the deployment's blob size bounds anyway.
+const maxPreSealing = 1 << 30
+
+// fetchPreSealings fetches the base's sealings of ch's entries from before
+// its raise from sealed (ch.plain, those served with a kid) from resource
+// name of base namespace ns, checks them, and keeps them in ch.sealings,
+// which prefixes share. keys are the source's epoch keys from before each
+// raise, by namespace (remoteLevel.preKeys). Only no answer, or a 5xx,
+// fails creation, and a sealing that opens to other content than the
+// chain verified is unverified.
+func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name string, ch *remoteChain, keys map[string]map[int][]byte) *Error {
+	last := -1
+	for i := 0; i < ch.plain; i++ {
+		if ch.entries[i].Kid != "" {
+			last = i
+		}
+	}
+	if last < 0 {
+		return nil
+	}
+	what := "/r/" + ns + "/" + name
+	fail := func(err error) *Error {
+		if noAnswer(err) {
+			return upstreamErr("%s: %v", what, err)
+		}
+		return nil
+	}
+	ps := &preSealings{entries: map[string]string{}, docs: map[string]string{}, blobs: map[ids.ID]map[int][]byte{}}
+	// The log entries, from pages entirely from before the raise (§7.1
+	// Paging): each a JWE.
+	path := what + "/rev/" + ch.entries[last].ID + "/log"
+	for since := ""; ; {
+		var q url.Values
+		if since != "" {
+			q = url.Values{"since": {since}}
+		}
+		st, hdr, body, err := rawGet(ctx, ep, baseURL, path, q)
+		if err != nil || st >= 500 {
+			if err == nil {
+				err = fmt.Errorf("%d", st)
+			}
+			return fail(&url.Error{Op: "GET", URL: path, Err: err})
+		}
+		if st != 200 {
+			log.Printf("remote base %s: its sealed log entries from before its raise: %d; the branch seals them itself", what, st)
+			return nil
+		}
+		var page []any
+		if json.Unmarshal(body, &page) != nil {
+			return unverified("%s: a log page that isn't an array", path)
+		}
+		for _, v := range page {
+			s, ok := v.(string)
+			if !ok {
+				continue
+			}
+			if h, err := seal.ParseHeader(s); err == nil {
+				if id, ok := h.PL["id"].(string); ok {
+					ps.entries[id] = s
+				}
+			}
+		}
+		next := hdr.Get("X-Log-Next")
+		if next == "" || next == since {
+			break
+		}
+		since = next
+	}
+	docs := map[int]any{}
+	if err := ch.fold(func(i int, e client.LogEntry, doc any) error {
+		if i < ch.plain {
+			docs[i] = doc
+		}
+		return nil
+	}); err != nil {
+		return unverified("%s: %v", what, err)
+	}
+	blobEpochs := map[ids.ID]map[int]bool{}
+	for i := 0; i <= last; i++ {
+		e := ch.entries[i]
+		if e.Kid == "" {
+			continue
+		}
+		kns, epoch, err := seal.ParseKid(e.Kid)
+		key := keys[kns][epoch]
+		if err != nil || key == nil {
+			delete(ps.entries, e.ID)
+			continue
+		}
+		kr, err := seal.ResourceKey(key, kns, name)
+		if err != nil {
+			delete(ps.entries, e.ID)
+			continue
+		}
+		if jwe, ok := ps.entries[e.ID]; ok {
+			kind := seal.KindRev
+			if e.Kind == "tombstone" {
+				kind = seal.KindTombstone
+			}
+			pt, err := seal.OpenExpect(jwe, kr, e.Kid, seal.ResourcePL(kns, name, e.ID, kind))
+			v, perr := jsonv.Parse(pt)
+			if err != nil || perr != nil || !bytes.Equal(jsonv.Canonical(v), jsonv.Canonical(e.Raw)) {
+				return unverified("%s: its sealing of the log entry %s doesn't open to the entry its log gives", what, e.ID)
+			}
+		}
+		if e.Kind != "rev" {
+			continue
+		}
+		st, _, body, err := rawGet(ctx, ep, baseURL, what+"/rev/"+e.ID, nil)
+		switch {
+		case err != nil || st >= 500:
+			if err == nil {
+				err = fmt.Errorf("%d", st)
+			}
+			if ferr := fail(&url.Error{Op: "GET", URL: what + "/rev/" + e.ID, Err: err}); ferr != nil {
+				return ferr
+			}
+		case st == 200:
+			jwe := string(bytes.TrimSpace(body))
+			pt, err := seal.OpenExpect(jwe, kr, e.Kid, seal.ResourcePL(kns, name, e.ID, seal.KindDoc))
+			v, perr := jsonv.Parse(pt)
+			if err != nil || perr != nil || !bytes.Equal(jsonv.Canonical(v), jsonv.Canonical(docs[i])) {
+				return unverified("%s: its sealing of the document of %s doesn't open to the document its log gives", what, e.ID)
+			}
+			ps.docs[e.ID] = string(body)
+		}
+		for _, r := range blobRefsOf(docs[i]) {
+			if blobEpochs[r.bid] == nil {
+				blobEpochs[r.bid] = map[int]bool{}
+			}
+			blobEpochs[r.bid][epoch] = true
+		}
+	}
+	// The sealed blobs at the epoch URLs of the revisions that reference
+	// them (§E.2.2, Levels).
+	for bid, eps := range blobEpochs {
+		b := ch.blobs[bid]
+		if b == nil {
+			continue
+		}
+		for epoch := range eps {
+			p := what + "/blob/" + bid.String() + "/e/" + strconv.Itoa(epoch)
+			st, _, body, err := rawGet(ctx, ep, baseURL, p, nil)
+			if err != nil || st >= 500 {
+				if err == nil {
+					err = fmt.Errorf("%d", st)
+				}
+				if ferr := fail(&url.Error{Op: "GET", URL: p, Err: err}); ferr != nil {
+					return ferr
+				}
+				continue
+			}
+			if st != 200 {
+				continue
+			}
+			h, err := seal.ParseBlobHeader(body)
+			if err != nil {
+				return unverified("%s: %v", p, err)
+			}
+			kns, e, err := seal.ParseKid(h.Kid)
+			key := keys[kns][e]
+			if err != nil || key == nil || e != epoch {
+				continue
+			}
+			kr, err := seal.ResourceKey(key, kns, name)
+			if err != nil {
+				continue
+			}
+			_, pt, err := seal.OpenBlob(body, kr)
+			want := seal.BlobPL(kns, name, bid.String())
+			if err != nil || !bytes.Equal(pt, b.data) || !bytes.Equal(jsonv.Canonical(map[string]any(h.PL)), jsonv.Canonical(map[string]any(want))) {
+				return unverified("%s doesn't open to the blob its reference names", p)
+			}
+			if ps.blobs[bid] == nil {
+				ps.blobs[bid] = map[int][]byte{}
+			}
+			ps.blobs[bid][epoch] = body
+		}
+	}
+	ch.sealings = ps
+	return nil
+}
+
+// storePreSealings stores the base's sealings of mirrored entry e of
+// resource row res, inserted as revision seq, under the shadow holding it
+// (fetchPreSealings): keyed as preRaiseResJob and openSealedBlob key their
+// own, so they are served as A serves them. kidNS is the namespace of the
+// base's chain the shadow mirrors; a sealing whose kid names another isn't
+// one the shadow serves. bids are the blobs the revision's document
+// references.
+func (t *tx) storePreSealings(res int64, kidNS string, ps *preSealings, e client.LogEntry, seq int64, bids []ids.ID) {
+	if ps == nil || e.Kid == "" {
+		return
+	}
+	kns, epoch, err := seal.ParseKid(e.Kid)
+	if err != nil || kns != kidNS {
+		return
+	}
+	var sh int64
+	var name string
+	t.must(t.QueryRow(`SELECT ns, name FROM resources WHERE res = ?`, res).Scan(&sh, &name))
+	key := name + "/" + e.ID
+	for kind, jwe := range map[string]string{sealEntry: ps.entries[e.ID], sealDoc: ps.docs[e.ID]} {
+		if jwe == "" {
+			continue
+		}
+		_, err := t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
+			sh, kind, key, name, seq, jwe, t.now.UnixMilli())
+		t.must(err)
+	}
+	for _, bid := range bids {
+		data := ps.blobs[bid][epoch]
+		if data == nil {
+			continue
+		}
+		var exists bool
+		t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM blob_epochs WHERE ns = ? AND name = ? AND bid = ? AND epoch = ?)`, sh, name, bid[:], epoch).Scan(&exists))
+		if exists {
+			continue
+		}
+		var stored, file any = data, nil
+		if f := t.storeFile(epochFile(sh, bid[:], epoch), data); f != "" {
+			stored, file = nil, f
+		}
+		_, err := t.Exec(`INSERT INTO blob_epochs (ns, name, bid, epoch, data, file, created) VALUES (?,?,?,?,?,?,?)`,
+			sh, name, bid[:], epoch, stored, file, t.now.UnixMilli())
+		t.must(err)
+	}
 }
