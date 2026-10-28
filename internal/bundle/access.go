@@ -443,7 +443,8 @@ func (im *importer) checkAccess(ctx context.Context) error {
 	// The upstream namespaces of the snapshot documents a partial import
 	// holds (partial.go) aren't targets, but their chains are compared as
 	// a target's are: without the $nonce a sealed or nonce-requiring one,
-	// or one whose target is sealed, gives each patch set.
+	// or one whose target is sealed or requires nonces, gives each patch
+	// set (§G.4.4).
 	for _, k := range im.heldKeys {
 		d := im.docs[k]
 		u := im.upstreamNS(d.ns)
@@ -461,7 +462,7 @@ func (im *importer) checkAccess(ctx context.Context) error {
 		if ok {
 			if tt, tok, err := im.existing(ctx, d.tns); err != nil {
 				return fmt.Errorf("import: target namespace %s: %w", d.tns, err)
-			} else if tok && tt.sealed {
+			} else if tok && (tt.sealed || tt.nonce) {
 				im.sealedT[u] = true
 			}
 		}
