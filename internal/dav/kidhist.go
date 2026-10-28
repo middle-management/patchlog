@@ -30,16 +30,54 @@ type keyChange struct {
 // keyHistory is a namespace's config writes as a token read them: its log
 // up to head, of which asOf is the latest created time known to be
 // covered (a later entry may follow a config write not read yet), read at
-// read by the server's clock.
+// read by the server's clock. probe and probeSince name a one-entry range
+// of the log a token read for it, which another token reads to show it
+// may read the log before it takes the history (sharedKeyHistory). It
+// isn't changed once kept.
 type keyHistory struct {
-	head, config string
-	asOf         time.Time
-	read         time.Time
-	changes      []keyChange
+	head, config      string
+	probe, probeSince string
+	asOf              time.Time
+	read              time.Time
+	changes           []keyChange
 }
 
 // maxKeyHistories bounds the namespaces whose key history a token keeps.
 const maxKeyHistories = 64
+
+// sharedKeyHistory returns the key history of ns another token read, for
+// tk, which has none: the namespace log is the same for every grant that
+// may read it, which needs unrestricted read (§2.1, §7.7), so tk first
+// reads the one-entry range the history names, and it isn't read whole
+// again, page after page, for every token judging the user's entries in
+// ns. nil where there is none, or tk can't read that range.
+func (s *Server) sharedKeyHistory(ctx context.Context, tk *token, ns string) *keyHistory {
+	s.keyHistMu.Lock()
+	h, ok := s.keyHists.Get(ns)
+	s.keyHistMu.Unlock()
+	if !ok || h.probe == "" {
+		return nil
+	}
+	if _, _, err := tk.c.NSLogPage(ctx, ns, h.probe, h.probeSince); err != nil {
+		return nil
+	}
+	return h
+}
+
+// keepKeyHistory keeps h as ns's for other tokens (sharedKeyHistory),
+// where it names a range to read.
+func (s *Server) keepKeyHistory(ns string, h *keyHistory) {
+	if h.probe == "" {
+		return
+	}
+	n := 64
+	for _, c := range h.changes {
+		n += 64 + 128*len(c.keys)
+	}
+	s.keyHistMu.Lock()
+	s.keyHists.Put(ns, h, n)
+	s.keyHistMu.Unlock()
+}
 
 // keysOf reads a namespace document's keys and local base.
 func keysOf(doc map[string]any) (map[string]string, string) {
@@ -70,14 +108,18 @@ func isConfig(e client.NSEntry) bool {
 
 // keyHistory returns ns's key history as the token reads it, covering
 // every config write created at or before need: read whole the first
-// time, then from where it was left whenever an entry later than what it
-// covers is judged, and at least every writerTTL. ok is false where it
-// can't be read (a grant without read of the namespace log, say).
+// time, unless another token read it (sharedKeyHistory), then from where
+// it was left whenever an entry later than what it covers is judged, and
+// at least every writerTTL. ok is false where it can't be read (a grant
+// without read of the namespace log, say).
 func (st *reqState) keyHistory(ctx context.Context, ns string, need time.Time) (*keyHistory, bool) {
 	tk, now := st.tk, st.s.opt.Now()
 	tk.mu.Lock()
 	h := tk.keyHist[ns]
 	tk.mu.Unlock()
+	if h == nil {
+		h = st.s.sharedKeyHistory(ctx, tk, ns)
+	}
 	if h != nil && !need.After(h.asOf) && now.Sub(h.read) < st.s.writerTTL() {
 		return h, true
 	}
@@ -89,6 +131,7 @@ func (st *reqState) keyHistory(ctx context.Context, ns string, need time.Time) (
 	since := ""
 	if h != nil {
 		nh.asOf, nh.changes, since = h.asOf, h.changes, h.head
+		nh.probe, nh.probeSince = h.probe, h.probeSince
 	}
 	if h == nil || head.ID != h.head {
 		if h != nil && head.Config == h.config {
@@ -100,6 +143,9 @@ func (st *reqState) keyHistory(ctx context.Context, ns string, need time.Time) (
 				return nil, false
 			}
 			nh.changes = append([]keyChange(nil), nh.changes...)
+			if n := len(es); n > 0 {
+				nh.probe, nh.probeSince = es[n-1].ID, es[n-1].Prev
+			}
 			for _, e := range es {
 				at, err := time.Parse(time.RFC3339Nano, e.Created)
 				if err != nil {
@@ -126,6 +172,7 @@ func (st *reqState) keyHistory(ctx context.Context, ns string, need time.Time) (
 	}
 	tk.keyHist[ns] = nh
 	tk.mu.Unlock()
+	st.s.keepKeyHistory(ns, nh)
 	return nh, true
 }
 

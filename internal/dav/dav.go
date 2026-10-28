@@ -245,6 +245,9 @@ type Server struct {
 	viewMu sync.Mutex
 	views  lru.Cache[string, tokenView] // by token id: catalogs' graphs and folders it read (views)
 
+	keyHistMu sync.Mutex
+	keyHists  lru.Cache[string, *keyHistory] // gateway mode, by namespace: its keys over time, as a token read them (kidhist.go)
+
 	recMu    sync.Mutex
 	recRoots map[string]*recStore         // by user
 	recBytes int                          // what every user's records cost
@@ -348,6 +351,7 @@ func New(opt Options) (*Server, error) {
 		s.verifySem = make(chan struct{}, maxVerifying)
 		s.refused.MaxEntries = 1 << 12
 		s.kidNS.MaxEntries, s.kidNS.MaxBytes = 1<<12, 1<<16
+		s.keyHists.MaxEntries, s.keyHists.MaxBytes = 1<<10, 1<<24
 		s.idUsers.init(maxIDUsers, maxIDsPerUser)
 	} else {
 		s.local = s.newToken("local", opt.Client, s.newScopeLocked(s.newPrincipal("local"), ""), nil)
