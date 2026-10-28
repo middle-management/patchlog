@@ -871,9 +871,10 @@ store can be a module a build links in to serve `dynamodb://`. Done:
   gate, rows and caches, which a package outside core would make core
   export wholesale.
 
-What a `go.mod` of its own for `internal/ddbstore` still has to decide
-is where the binary that serves `dynamodb://` lives: while
-`cmd/patchlog` and `internal/testenv` import the store, the main
-module requires it, and with it the AWS SDK. Moving that import into a
-binary of the store's module (and DynamoDB test runs with it) keeps the
-SDK out of the main module's requirements.
+The store stays in the main module for now, by choice: `cmd/patchlog`
+serves `dynamodb://` as it serves SQLite and Postgres, and the AWS SDK
+is in the main module's requirements, linked into that binary and the
+test harness only. A `go.mod` of the store's own would keep the SDK out
+of those requirements only if the binary that serves `dynamodb://` (and
+DynamoDB test runs) moved into the store's module, or linked it behind
+a build tag; the split above is what either would start from.
