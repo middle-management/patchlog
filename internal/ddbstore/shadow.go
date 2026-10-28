@@ -57,7 +57,7 @@ func (s *Store) ImportShadow(ctx context.Context, im *ddb.ShadowImport) (string,
 	put(keyMeta(ns), mi)
 	put(keyCfg(ns, 1), item{
 		"pos": avN(1), "id": avS(im.CfgID), "logPos": avN(1), "patches": avS(im.CfgPatches), "doc": avS(im.CfgDoc),
-		"author": avS(im.Author), "created": avI(im.Created), "G1PK": avS(g1RevID(im.CfgID)),
+		"author": avS(im.Author), "created": avI(im.Created), "G1PK": avS(g1Key(im.CfgID, ns, "")),
 	})
 	for i, e := range im.Log {
 		l := logRow{pos: uint64(i + 1), id: e.ID, kind: e.Kind, body: e.Body, author: e.Author, created: e.Created, cfgPos: 1, via: e.Via}
@@ -97,7 +97,7 @@ func (s *Store) shadowRes(ns string, im *ddb.ShadowImport, r *ddb.ShadowRes, put
 		if pos == head {
 			rr.logPos = entryPos
 		}
-		it := rr.item()
+		it := rr.item(ns, r.Name)
 		if v.Kind != "tombstone" && v.Patches == "" {
 			delete(it, "patches") // the horizon, or purged at the base
 		}

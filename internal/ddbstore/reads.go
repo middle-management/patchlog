@@ -80,40 +80,71 @@ func (s *Store) walkChain(ctx context.Context, ns, name string, fromPos, toPos u
 // of one twin must not answer the other's (findInAncestry walks the
 // resource's own chain). Absent is nil, not an error.
 func (s *Store) ReadRevOf(ctx context.Context, ns, name, id string) (*ddb.RevInfo, error) {
-	in := &dynamodb.QueryInput{
-		TableName:              &s.Table,
-		IndexName:              strptr(gsiName),
-		KeyConditionExpression: strptr("G1PK = :g"),
-		FilterExpression:       strptr("PK = :pk AND begins_with(SK, :pfx)"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":g": avS(g1RevID(id)), ":pk": avS(resPK(ns, name)), ":pfx": avS("REV#" + name + "#"),
-		},
-	}
-	for {
-		q, err := s.Client.Query(ctx, in)
-		if err != nil {
-			return nil, err
-		}
-		for _, it := range q.Items {
-			i := item(it)
-			if resNameFromRev(i.s("SK")) != name {
-				continue // a name of which this one is a prefix
-			}
+	var out *ddb.RevInfo
+	err := s.eachG1(ctx, s.g1Of(id, ns, name), "PK = :pk AND begins_with(SK, :pfx)",
+		map[string]types.AttributeValue{":pk": avS(resPK(ns, name)), ":pfx": avS("REV#" + name + "#")},
+		func(i item) bool {
 			r := scanRevInfo(i)
-			return &r, nil
-		}
-		if q.LastEvaluatedKey == nil {
-			return nil, nil
-		}
-		in.ExclusiveStartKey = q.LastEvaluatedKey
+			out = &r
+			return false
+		})
+	return out, err
+}
+
+// g1Of are the GSI1 keys of id's item in resource name of ns ("": ns's
+// configuration): its shard's, and on a table upgraded from layout 2 the
+// unsharded one items written then are under.
+func (s *Store) g1Of(id, ns, name string) []string {
+	keys := []string{g1Key(id, ns, name)}
+	if s.legacyG1 {
+		keys = append(keys, g1Legacy(id))
 	}
+	return keys
+}
+
+// eachG1 visits the GSI1 items under keys that filter (with vals, ":g"
+// aside) admits, while visit returns true.
+func (s *Store) eachG1(ctx context.Context, keys []string, filter string, vals map[string]types.AttributeValue, visit func(item) bool) error {
+	for _, k := range keys {
+		in := &dynamodb.QueryInput{
+			TableName:                 &s.Table,
+			IndexName:                 strptr(gsiName),
+			KeyConditionExpression:    strptr("G1PK = :g"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":g": avS(k)},
+		}
+		if filter != "" {
+			in.FilterExpression = &filter
+			for n, v := range vals {
+				in.ExpressionAttributeValues[n] = v
+			}
+		}
+		for {
+			q, err := s.Client.Query(ctx, in)
+			if err != nil {
+				return err
+			}
+			for _, it := range q.Items {
+				if !visit(item(it)) {
+					return nil
+				}
+			}
+			if len(q.LastEvaluatedKey) == 0 {
+				break
+			}
+			in.ExclusiveStartKey = q.LastEvaluatedKey
+		}
+	}
+	return nil
 }
 
 // layout is the version of the table's key layout: 2 since a resource's
-// own items have their own partition key (resPK). Version 1 kept them
-// under the namespace's, where this layout doesn't look: a table of it is
-// refused, not served as if its resources had no history.
-const layout = 2
+// own items have their own partition key (resPK), 3 since GSI1 keys are
+// sharded by resource (g1Key). Version 1 kept a resource's items under
+// the namespace's key, where this layout doesn't look: a table of it is
+// refused, not served as if its resources had no history. A table of
+// version 2 is upgraded in place: its items stay under their unsharded
+// GSI1 keys, which lookups on it read too (legacyG1).
+const layout = 3
 
 func keyLayout() Key { return Key{"#DEPLOY", "LAYOUT"} }
 
@@ -125,10 +156,25 @@ func (s *Store) CheckLayout(ctx context.Context) error {
 		return err
 	}
 	if it != nil {
-		if v := item(it).n("version"); v != layout {
+		switch v := item(it).n("version"); v {
+		case layout:
+			s.legacyG1 = item(it).has("legacyG1")
+			return nil
+		case 2:
+			_, err := s.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+				TableName: &s.Table, Key: keyAV(keyLayout()),
+				UpdateExpression:          strptr("SET version = :v, legacyG1 = :one"),
+				ConditionExpression:       strptr("version = :old"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{":v": avN(layout), ":one": avN(1), ":old": avN(2)},
+			})
+			var cf *types.ConditionalCheckFailedException
+			if err != nil && !errors.As(err, &cf) {
+				return err
+			}
+			return s.CheckLayout(ctx) // upgraded, here or by another instance
+		default:
 			return fmt.Errorf("ddbstore: table %s has key layout %d, this server reads layout %d", s.Table, v, layout)
 		}
-		return nil
 	}
 	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
 		TableName:                 &s.Table,
@@ -191,28 +237,11 @@ func (s *Store) foldFrom(ctx context.Context, ns, name string, fromPos, toPos ui
 // RevsWithID lists every revision of id, in any namespace and resource
 // (GSI1): the copies of a revision.
 func (s *Store) RevsWithID(ctx context.Context, id string) ([]ddb.IDRev, error) {
-	in := &dynamodb.QueryInput{
-		TableName:              &s.Table,
-		IndexName:              strptr(gsiName),
-		KeyConditionExpression: strptr("G1PK = :g"),
-		FilterExpression:       strptr("begins_with(SK, :pfx)"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":g": avS(g1RevID(id)), ":pfx": avS("REV#"),
-		},
-	}
 	var out []ddb.IDRev
-	for {
-		q, err := s.Client.Query(ctx, in)
-		if err != nil {
-			return nil, err
-		}
-		for _, it := range q.Items {
-			i := item(it)
+	err := s.eachG1(ctx, g1Keys(id, s.legacyG1), "begins_with(SK, :pfx)", map[string]types.AttributeValue{":pfx": avS("REV#")},
+		func(i item) bool {
 			out = append(out, ddb.IDRev{NS: nsOfPK(i.s("PK")), Rev: scanRevInfo(i)})
-		}
-		if q.LastEvaluatedKey == nil {
-			return out, nil
-		}
-		in.ExclusiveStartKey = q.LastEvaluatedKey
-	}
+			return true
+		})
+	return out, err
 }

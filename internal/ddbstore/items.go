@@ -221,13 +221,14 @@ type revRow struct {
 	parentPos uint64
 }
 
-func (r *revRow) item() item {
+// item is the REV# item of r in resource name of ns.
+func (r *revRow) item(ns, name string) item {
 	it := item{
 		"pos":     avN(r.pos),
 		"id":      avS(r.id),
 		"author":  avS(r.author),
 		"created": avI(r.created),
-		"G1PK":    avS(g1RevID(r.id)),
+		"G1PK":    avS(g1Key(r.id, ns, name)),
 	}
 	if r.kind != "" {
 		it["kind"] = avS(r.kind)

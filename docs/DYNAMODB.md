@@ -169,7 +169,7 @@ NS#<branch>                 NOTICE#<nsId>                       purge notice: ki
 #REMOTES                    <branch>                            the remote branches (SyncRemotes)
 GRANT#<id32>                #                                   grant: blocks, rootSub, rootKid
 #DEPLOY                     DEK                                 the deployment's grants key (wrapped)
-#DEPLOY                     LAYOUT                              the table's key layout: version (2)
+#DEPLOY                     LAYOUT                              the table's key layout: version (3), legacyG1?
 BLOB#<owner>#<hash64>       #                                   blob bytes pointer: S3 key (or inline ≤ ~350 KB)
 BUCKET#<hash>               #                                   shared rate bucket (multi-instance)
 JOB#REPURGE#<logId>         #                                    second CDN purge: tags, due (GSI2 on due)
@@ -178,9 +178,15 @@ META#<name>                 #                                   schema version, 
 
 GSIs (both on the one table):
 
-- **GSI1** `G1PK` — global id lookups, sparse: revision by id
-  (`REVID#<id32>`; §6.1 drafts), config entry by id (`CFGID#<id32>`),
-  branches of a base (`BASE#<ns>`). The spike refined the ns-entry lookup:
+- **GSI1** `G1PK` — global id lookups, sparse: revision and config entry
+  by id (`REVID#<id32>#<shard>`, shard = FNV-1a of namespace and resource
+  name mod 16, the namespace alone for a config entry; §6.1 drafts). Ids
+  are shared by twins (resources created with the same patches, namespaces
+  with the same configuration), and one key takes ~1,000 writes a second:
+  unsharded, every such creation across the table wrote the one key, and a
+  throttled index throttles the writes feeding it. A lookup that knows its
+  resource reads one shard; one by id alone (the copies of a revision)
+  reads all sixteen. Also branches of a base (`BASE#<ns>`). The spike refined the ns-entry lookup:
   entry ids are unique *per namespace*, not globally (identical genesis
   patches in two namespaces hash identically), so the idempotency marker
   and the `since` resolver are plain items keyed `NSID#<ns>#<id32>` — no
@@ -202,13 +208,15 @@ Why this shape for the SQL reader:
   partition key holds everything a fold or a prune touches. What spans a
   namespace's resources (its purge, encryption of existing content, a
   shadow's removal) lists them (`RES#`) and visits each one's key.
-- The table records its key layout (`#DEPLOY`/`LAYOUT`, version 2, the
+- The table records its key layout (`#DEPLOY`/`LAYOUT`, version 3, the
   layout above): a server gives a table with no namespace this one at
   start-up, and refuses a table of namespaces without the record, which
-  is of the earlier layout (v0.24.0-ddb.3 and before, where the resources'
+  is of the first layout (v0.24.0-ddb.3 and before, where the resources'
   items were under the namespace's key), rather than serve it as if its
-  resources had no history. There is no migration: such a table is served
-  by that release, or this one is given a new table.
+  resources had no history: such a table is served by that release, or
+  this one is given a new table. A table of version 2 (unsharded GSI1
+  keys) is upgraded in place: its record says so (`legacyG1`), and
+  lookups by id read the unsharded key too.
 - A namespace log page: `Query(PK, SK BETWEEN LOG#a AND LOG#b)` — one page
   per 1 MiB of DynamoDB read, chained exactly like `X-Log-Next`.
 - The grants/authors tables lose their raison d'être: grants key by id

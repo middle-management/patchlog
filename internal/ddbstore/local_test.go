@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"os"
 	"strings"
 	"sync"
@@ -576,6 +577,28 @@ func TestLocalLayout(t *testing.T) {
 	if err := s.CheckLayout(ctx); err == nil || !strings.Contains(err.Error(), "key layout 1") {
 		t.Fatalf("a table of namespaces without a layout record: %v, want refused as layout 1", err)
 	}
+	// Layout 2 is upgraded in place, its items' unsharded GSI1 keys still
+	// read.
+	w := mustWrite(t, s, "kept", "old", "", `[{"op":"add","path":"","value":{}}]`)
+	if _, err := s.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &s.Table, Key: keyAV(keyRev("kept", "old", 1)),
+		UpdateExpression:          strptr("SET G1PK = :g"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":g": avS(g1Legacy(w.ID))},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Client.PutItem(ctx, &dynamodb.PutItemInput{TableName: &s.Table, Item: withKey(keyLayout(), item{"version": avN(2)})}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckLayout(ctx); err != nil || !s.legacyG1 {
+		t.Fatalf("a table of layout 2: %v, legacy %v; want upgraded, its unsharded keys read", err, s.legacyG1)
+	}
+	if it, err := s.getItem(ctx, keyLayout()); err != nil || item(it).n("version") != layout {
+		t.Fatalf("layout after the upgrade: %v %v", it, err)
+	}
+	if r, err := s.ReadRevOf(ctx, "kept", "old", w.ID); err != nil || r == nil || r.Pos != 1 {
+		t.Fatalf("a layout 2 revision by id: %+v, %v", r, err)
+	}
 	if _, err := s.Client.PutItem(ctx, &dynamodb.PutItemInput{TableName: &s.Table, Item: withKey(keyLayout(), item{"version": avN(9)})}); err != nil {
 		t.Fatal(err)
 	}
@@ -644,5 +667,43 @@ func TestLocalWritePartitions(t *testing.T) {
 		if err != nil || !strings.Contains(string(doc), want) {
 			t.Errorf("DocAt(%d) = %.40s…, %v; want the document holding %.10s", pos, doc, err, want)
 		}
+	}
+}
+
+// Resources created with the same patches share their first revision's id
+// (genesis twins); their GSI1 keys are spread over shards by resource, so
+// creating many doesn't write one key. A lookup by resource reads its
+// shard and finds its own; one by id alone reads every shard.
+func TestLocalTwinsSharded(t *testing.T) {
+	ctx := context.Background()
+	s := newLocalStore(t)
+	mustCreateNS(t, s, "tw")
+	var id string
+	shards := map[int]bool{}
+	for i := range 12 {
+		name := fmt.Sprintf("t%d", i)
+		w := mustWrite(t, s, "tw", name, "", `[{"op":"add","path":"","value":{}}]`)
+		if id != "" && w.ID != id {
+			t.Fatalf("twins with ids %s and %s", id, w.ID)
+		}
+		id = w.ID
+		shards[g1Shard("tw", name)] = true
+		it, err := s.getItem(ctx, keyRev("tw", name, 1))
+		if err != nil || item(it).s("G1PK") != g1Key(id, "tw", name) {
+			t.Fatalf("%s's GSI1 key %q, want %q (%v)", name, item(it).s("G1PK"), g1Key(id, "tw", name), err)
+		}
+	}
+	if len(shards) < 4 {
+		t.Fatalf("12 twins over %d shards", len(shards))
+	}
+	for i := range 12 {
+		name := fmt.Sprintf("t%d", i)
+		if r, err := s.ReadRevOf(ctx, "tw", name, id); err != nil || r == nil || r.Pos != 1 {
+			t.Fatalf("ReadRevOf(%s): %+v, %v", name, r, err)
+		}
+	}
+	all, err := s.RevsWithID(ctx, id)
+	if err != nil || len(all) != 12 {
+		t.Fatalf("RevsWithID: %d revisions, %v; want the 12 twins", len(all), err)
 	}
 }

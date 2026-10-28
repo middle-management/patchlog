@@ -99,27 +99,11 @@ func (s *Store) Namespaces(ctx context.Context) ([]string, error) {
 // (GSI1; the copies of §6.1).
 func (s *Store) RevsByID(ctx context.Context, id, name string) ([]ddb.RevCopy, error) {
 	var out []ddb.RevCopy
-	in := &dynamodb.QueryInput{
-		TableName:                 &s.Table,
-		IndexName:                 strptr(gsiName),
-		KeyConditionExpression:    strptr("G1PK = :g"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{":g": avS(g1RevID(id))},
-	}
-	for {
-		q, err := s.Client.Query(ctx, in)
-		if err != nil {
-			return nil, err
-		}
-		for _, it := range q.Items {
-			i := item(it)
-			if !strings.HasPrefix(i.s("SK"), "REV#") || resNameFromRev(i.s("SK")) != name {
-				continue
-			}
+	err := s.eachG1(ctx, g1Keys(id, s.legacyG1), "", nil, func(i item) bool {
+		if strings.HasPrefix(i.s("SK"), "REV#") && resNameFromRev(i.s("SK")) == name {
 			out = append(out, ddb.RevCopy{NS: nsOfPK(i.s("PK")), RevInfo: scanRevInfo(i)})
 		}
-		if len(q.LastEvaluatedKey) == 0 {
-			return out, nil
-		}
-		in.ExclusiveStartKey = q.LastEvaluatedKey
-	}
+		return true
+	})
+	return out, err
 }

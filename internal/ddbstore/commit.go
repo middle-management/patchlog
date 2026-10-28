@@ -359,7 +359,7 @@ func (s *Store) commitActs(c *ddb.Commit, entry logRow) []types.TransactWriteIte
 			types.TransactWriteItem{Put: &types.Put{TableName: table, Item: withKey(keyCfg(ns, c.CfgPos+1), item{
 				"pos": avN(c.CfgPos + 1), "id": avS(cc.ID), "parentPos": avN(c.CfgPos), "logPos": avN(entry.pos),
 				"patches": avS(cc.Patches), "doc": avS(cc.Doc), "author": avS(c.Author), "created": avI(c.Created),
-				"G1PK": avS(g1RevID(cc.ID)),
+				"G1PK": avS(g1Key(cc.ID, ns, "")),
 			})}},
 		)
 	}
@@ -429,7 +429,7 @@ func (s *Store) itemActs(c *ddb.Commit, it *ddb.CommitItem, entry logRow) []type
 			r.patches, r.size, r.digest = commitSeal(c, it.Name, "rev", st.ID, st.Patches), uint64(len(st.Doc)), digest[:]
 		}
 		out = append(out, types.TransactWriteItem{Put: &types.Put{
-			TableName: table, Item: withKey(keyRev(ns, it.Name, pos), r.item()),
+			TableName: table, Item: withKey(keyRev(ns, it.Name, pos), r.item(ns, it.Name)),
 			ConditionExpression: strptr("attribute_not_exists(PK)"),
 		}})
 		if !st.Tombstone {

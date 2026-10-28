@@ -132,23 +132,14 @@ func (s *Store) ConfigAt(ctx context.Context, ns string, pos uint64) (*ddb.Confi
 }
 
 // ConfigByID finds ns's configuration id (GSI1); nil when there is none.
-func (s *Store) ConfigByID(ctx context.Context, ns, id string) (*ddb.ConfigRow, error) {
-	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
-		TableName:              &s.Table,
-		IndexName:              strptr(gsiName),
-		KeyConditionExpression: strptr("G1PK = :g"),
-		FilterExpression:       strptr("PK = :pk AND begins_with(SK, :sk)"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":g": avS(g1RevID(id)), ":pk": avS(nsPK(ns)), ":sk": avS("CFG#"),
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	for _, it := range q.Items {
-		return scanConfigRow(item(it))
-	}
-	return nil, nil
+func (s *Store) ConfigByID(ctx context.Context, ns, id string) (row *ddb.ConfigRow, err error) {
+	err = s.eachG1(ctx, s.g1Of(id, ns, ""), "PK = :pk AND begins_with(SK, :sk)",
+		map[string]types.AttributeValue{":pk": avS(nsPK(ns)), ":sk": avS("CFG#")},
+		func(i item) bool {
+			row, err = scanConfigRow(i)
+			return false
+		})
+	return row, err
 }
 
 // Resource reads ns's resource name; nil when it has none.

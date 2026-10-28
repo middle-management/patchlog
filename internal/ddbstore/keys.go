@@ -11,6 +11,7 @@ package ddbstore
 
 import (
 	"fmt"
+	"hash/fnv"
 	"strconv"
 	"strings"
 )
@@ -116,13 +117,50 @@ func keyDeploy() Key { return Key{"#DEPLOY", "#"} }
 func keyNSID(ns, entryID string) Key { return Key{"NSID#" + ns + "#" + entryID, "#"} }
 
 // gsiName is the table's one GSI (docs/DYNAMODB.md §3, GSI1): global id
-// lookups, sparse. Revision items project G1PK = REVID#<id>; ids are
-// unique per resource, not globally (genesis twins share one), so answers
-// are filtered by namespace.
+// lookups, sparse. Revision and configuration items project G1PK =
+// REVID#<id>#<shard>; ids are unique per resource, not globally (genesis
+// twins share one), so answers are filtered by namespace.
 const gsiName = "GSI1"
 
-// g1RevID is a revision's GSI1 partition key.
-func g1RevID(id string) string { return "REVID#" + id }
+// g1Shards is how many GSI1 keys an id's items are spread over, by
+// resource (g1Shard). Resources created with the same patches share their
+// first revision's id, and namespaces created with the same configuration
+// their first configuration's: under one key, every such creation would
+// write the one GSI1 key, which DynamoDB holds to ~1,000 writes a second,
+// and a throttled index throttles the writes feeding it.
+const g1Shards = 16
+
+// g1Shard is resource name of ns's shard ("" for ns's configuration).
+func g1Shard(ns, name string) int {
+	h := fnv.New32a()
+	h.Write([]byte(ns))
+	h.Write([]byte{0})
+	h.Write([]byte(name))
+	return int(h.Sum32() % g1Shards)
+}
+
+// g1Key is the GSI1 key of id's item in resource name of ns ("": ns's
+// configuration chain): a lookup that knows the resource reads one key.
+func g1Key(id, ns, name string) string {
+	return "REVID#" + id + "#" + strconv.Itoa(g1Shard(ns, name))
+}
+
+// g1Keys are every GSI1 key id's items can be under, for a lookup that
+// doesn't know the resource; legacy adds a layout 2 table's unsharded one
+// (Store.legacyG1).
+func g1Keys(id string, legacy bool) []string {
+	keys := make([]string, 0, g1Shards+1)
+	for i := range g1Shards {
+		keys = append(keys, "REVID#"+id+"#"+strconv.Itoa(i))
+	}
+	if legacy {
+		keys = append(keys, g1Legacy(id))
+	}
+	return keys
+}
+
+// g1Legacy is the GSI1 key layout 2 gave every item of id.
+func g1Legacy(id string) string { return "REVID#" + id }
 
 // resName is the resource name of a RES# sort key.
 func resName(sk string) string { return strings.TrimPrefix(sk, "RES#") }

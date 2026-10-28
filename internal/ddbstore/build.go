@@ -44,7 +44,7 @@ func buildCreateTx(table, ns string, m *nsMeta, cfgID string, patchesCanon, docC
 		{Put: &types.Put{TableName: &table, Item: withKey(metaK, m.item()), ConditionExpression: &notExists}},
 		{Put: &types.Put{TableName: &table, Item: withKey(cfgK, item{
 			"pos": avN(1), "id": avS(cfgID), "logPos": avN(1), "patches": avS(patchesCanon), "doc": avS(docCanon), "author": avS(entry.author), "created": avI(entry.created),
-			"G1PK": avS(g1RevID(cfgID)),
+			"G1PK": avS(g1Key(cfgID, ns, "")),
 		})}},
 		{Put: &types.Put{TableName: &table, Item: withKey(logK, entry.item())}},
 		{Put: &types.Put{TableName: &table, Item: withKey(tipK, (&tip{headPos: 1, headID: entry.id}).item())}},

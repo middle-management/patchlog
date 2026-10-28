@@ -35,7 +35,11 @@ type API interface {
 type Store struct {
 	Client API
 	Table  string
-	Now    func() time.Time // nil: time.Now
+	// legacyG1 is a table upgraded from key layout 2 (CheckLayout), whose
+	// items written then are under their unsharded GSI1 key (g1Legacy):
+	// lookups by id look there too.
+	legacyG1 bool
+	Now      func() time.Time // nil: time.Now
 	// Open, when set, opens a stored value the store folds or serves
 	// itself — a revision's patch set ("rev", keyed by the revision id),
 	// a head document ("head", by its revision's position), a snapshot
