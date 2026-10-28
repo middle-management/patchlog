@@ -233,7 +233,7 @@ func (st *reqState) ownLogEntry(ctx context.Context, ns, name string, e client.L
 		return true
 	}
 	st.knowUser(ctx, ns)
-	return st.p.wroteAs(ns, e)
+	return st.wroteAs(ctx, ns, e)
 }
 
 // knowUser makes sure the user's identity is known for ns (wroteAs): the
@@ -277,7 +277,7 @@ func (st *reqState) ownHead(ctx context.Context, ns, name string, h *client.Head
 	if err != nil || len(es) == 0 || es[len(es)-1].ID != h.ID {
 		return false
 	}
-	return st.p.wroteAs(ns, es[len(es)-1])
+	return st.wroteAs(ctx, ns, es[len(es)-1])
 }
 
 // recordsOf returns p's records of ns/name. Records the bounds dropped

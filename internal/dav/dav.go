@@ -1810,6 +1810,7 @@ type token struct {
 	writers map[string]writerAt    // by namespace: §7.4's writer block
 	docs    map[string]nsDocAt     // by namespace: what its document says
 	issued  map[string]issuedGrant // by ns/name: grants a catalog service issued it (catgrants.go)
+	keyHist map[string]*keyHistory // by namespace: its keys over time (kidhist.go)
 }
 
 // newToken makes a token sending its requests with c, but those a
@@ -1848,8 +1849,10 @@ type principal struct {
 	// who the user is as the core records its writes (§H.7 "Users",
 	// wroteAs): its root sub and key thumbprint, or, with authentication
 	// disabled, its X-Author (author); kids, by namespace, the kids that
-	// named key there when the user's grants were verified there, or under
-	// which the catalog issued them grants there (§B.11.4)
+	// named key there when the user's grants were verified there (true),
+	// or under which the catalog issued them grants there (false,
+	// §B.11.4), each entry judged by the key its kid named when written
+	// (kidhist.go)
 	sub, key, author string
 	kids             map[string]map[string]bool
 }
@@ -2198,7 +2201,7 @@ const maxKids = 16
 // one bearer, a gateway's user as verify found it), and, for one of its
 // sub and key (from a core that names no key, only as the user's
 // verifying namespace says it), the kid that named the key there
-// (wroteAs).
+// (wroteAs), its entries judged by the key it named when written.
 func (p *principal) verifiedAs(ns string, info *client.PrincipalInfo) {
 	if info == nil || info.Sub == "" {
 		return
@@ -2211,7 +2214,7 @@ func (p *principal) verifiedAs(ns string, info *client.PrincipalInfo) {
 	if info.Sub != p.sub || info.Key != p.key || p.key == "" && len(p.kids) > 0 && p.kids[ns] == nil {
 		return
 	}
-	p.addKidLocked(ns, info.Kid)
+	p.addKidLocked(ns, info.Kid, true)
 }
 
 // issuedTo notes that a grant kid signed for the user's sub in ns, which
@@ -2221,11 +2224,14 @@ func (p *principal) issuedTo(ns, sub, kid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if sub != "" && sub == p.sub {
-		p.addKidLocked(ns, kid)
+		p.addKidLocked(ns, kid, false)
 	}
 }
 
-func (p *principal) addKidLocked(ns, kid string) {
+// addKidLocked notes kid as one of the user's in ns: verified, one that
+// named the user's key there (verifiedAs), else one the catalog issued it
+// a grant under (issuedTo).
+func (p *principal) addKidLocked(ns, kid string, verified bool) {
 	if kid == "" {
 		return
 	}
@@ -2237,28 +2243,29 @@ func (p *principal) addKidLocked(ns, kid string) {
 		ks = map[string]bool{}
 		p.kids[ns] = ks
 	}
-	if len(ks) < maxKids {
-		ks[kid] = true
+	if _, has := ks[kid]; has || len(ks) < maxKids {
+		ks[kid] = ks[kid] || verified
 	}
 }
 
-// wroteAs reports whether log entry e of namespace ns was written by
-// user p as the core records its writes (§H.7 "Users"): with
+// wroteAs reports whether log entry e of namespace ns may have been
+// written by user p as the core records its writes (§H.7 "Users"): with
 // authentication disabled, under its X-Author (author, no grant); else
-// under a grant with its sub and a kid that named its key in ns
-// (verifiedAs), or the catalog's kid there for its sub (issuedTo). A kid
-// is judged as it names the key now, which a namespace that gave the kid
-// to another key since would get wrong.
-func (p *principal) wroteAs(ns string, e client.LogEntry) bool {
+// under a grant with its sub and one of its kids in ns, verified when it
+// named the user's key there (verifiedAs), key, else the catalog's kid
+// there for its sub (issuedTo). Which key the kid named when the entry was
+// written is reqState.wroteAs's to judge.
+func (p *principal) wroteAs(ns string, e client.LogEntry) (known, verified bool, key string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	switch {
 	case p.author != "":
-		return e.Grant == nil && e.Author == p.author
-	case p.sub == "" || e.Grant == nil:
-		return false
+		return e.Grant == nil && e.Author == p.author, false, ""
+	case p.sub == "" || e.Grant == nil || e.Grant.Sub != p.sub:
+		return false, false, ""
 	}
-	return e.Grant.Sub == p.sub && p.kids[ns][e.Grant.Kid]
+	v, ok := p.kids[ns][e.Grant.Kid]
+	return ok, v, p.key
 }
 
 // authOff reports whether the core has authentication disabled (GET /
