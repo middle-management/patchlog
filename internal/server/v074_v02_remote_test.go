@@ -1,11 +1,17 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
+	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // headRows is a /heads page's rows by resource.
@@ -181,4 +187,142 @@ func TestV074RemoteFailedRaiseIsNot502(t *testing.T) {
 	if ls, _ := b.e.RemoteLevels(context.Background(), "r"); len(ls) != 0 {
 		t.Fatalf("levels after the retry %+v", ls)
 	}
+}
+
+// withOriginURL makes the endpoint of withRemote say the origin itself
+// answers at url, as an endpoint that is a mirror would (§G.5.2).
+func withOriginURL(url string) func(*core.RemoteOptions) {
+	return func(o *core.RemoteOptions) {
+		inner := o.Resolve
+		o.Resolve = func(origin string) (core.RemoteEndpoint, error) {
+			ep, err := inner(origin)
+			ep.OriginURL = url
+			return ep, err
+		}
+	}
+}
+
+// §G.5.2 Epoch start times (v0.74, LEVELS-6): for the keys of a source's
+// epochs from before its e2e raise, which B hands out itself, B reads the
+// start times only through base.origin itself. B's endpoint here is a
+// mirror that serves A's API and origin but rewrites when A's epoch 2
+// began (t0+1h) to t0+20m in A's namespace log, which no id covers: a
+// reader whose nbf is t0+40m gets the epochs the real times select (m#1
+// and m#2), not m#2 alone; where the origin can't be reached, none.
+func TestV074RemoteStartTimesFromOrigin(t *testing.T) {
+	t.Parallel()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning)
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("m", sealedDoc(map[string]any{"read": "grant", "keys": []any{kA.entry("*")}}))
+	root := func() string { return a.grant(kA, "user:root", []string{"m"}, allVerbs) }
+	x1 := a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})), root())
+	a.clock.Advance(time.Hour)
+	expect(t, a.patchNS("m", ops(op("add", "/encryption/epoch", 2.0)), root()), 201)
+	epoch2 := a.nsHead("m", root())
+	a.wr("m", "x", x1, withNonce(ops(op("replace", "/v", 2.0))), root())
+	ak, kr := a.keysOf("m", nil, a.grant(kA, "user:k", []string{"m"}, []string{"read"}, map[string]any{"nbf": t0.Add(-time.Hour).Format(time.RFC3339)}))
+	expect(t, kr, 200)
+	a.clock.Advance(time.Hour)
+	expect(t, a.patchNS("m", ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 3.0})), root()), 201)
+	raised := a.nsHead("m", root())
+
+	// The mirror: A's log with epoch 2's start moved, sealed pages
+	// opened and sealed again under the same header.
+	fake := t0.Add(20 * time.Minute).UTC().Format("2006-01-02T15:04:05.000Z")
+	rewrite := func(entries []byte) []byte {
+		var es []map[string]any
+		if err := json.Unmarshal(entries, &es); err != nil {
+			t.Errorf("A's log page: %v", err)
+			return entries
+		}
+		for _, e := range es {
+			if e["id"] == epoch2 {
+				e["created"] = fake
+			}
+		}
+		out, _ := json.Marshal(es)
+		return out
+	}
+	rewritten := false
+	var rmu sync.Mutex
+	mirror := proxyA(t, a, nil, "/ns/m/rev/"+raised+"/log", func(body []byte) []byte {
+		if !bytes.HasPrefix(bytes.TrimSpace(body), []byte("ey")) {
+			return rewrite(body)
+		}
+		h, plain, err := seal.Open(string(bytes.TrimSpace(body)), ak[mustHeader(t, body).Kid])
+		if err != nil {
+			t.Errorf("A's sealed log page: %v", err)
+			return body
+		}
+		out, err := seal.Seal(ak[h.Kid], h.Kid, h.PL, rewrite(plain))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rmu.Lock()
+		rewritten = true
+		rmu.Unlock()
+		return []byte(out)
+	})
+
+	bJWK, bID, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerJWK, readerPriv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone := httptest.NewServer(nil)
+	gone.Close()
+	for _, c := range []struct {
+		name, originURL string
+		want            []string
+	}{
+		{"origin reachable", a.srv.URL, []string{"m#1", "m#2"}},
+		{"origin unreachable", gone.URL, nil},
+	} {
+		var mu sync.Mutex
+		id := bID
+		rt := &route{url: mirror, bearer: a.grant(kA, "svc:b", []string{"m"}, []string{"read", "export"}, map[string]any{"enc": bJWK, "nbf": t0.Add(-time.Hour).Format(time.RFC3339)})}
+		var bPriv ed25519.PrivateKey
+		b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt, withRemoteIdentity(&mu, &id), withOriginURL(c.originURL)), withKeyStore(newKeyStore(t)), withEncTuning)
+		b.opPriv = bPriv
+		b.clock.Advance(3 * time.Hour)
+		kB := newKey("badmin")
+		expect(t, b.mkRemote("r", remoteGenesis("m", raised, e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}}))), 201)
+		g := b.grant(kB, "user:reader", []string{"r"}, []string{"read"}, map[string]any{"enc": readerJWK, "nbf": t0.Add(40 * time.Minute).Format(time.RFC3339)})
+		_, r := b.keysOf("r", nil, g)
+		got := p36Keys(t, r, func(w seal.WrappedKey) ([]byte, error) { return seal.UnwrapKey(readerPriv, w) })
+		for _, kid := range []string{"m#1", "m#2"} {
+			_, has := got[kid]
+			if want := contains(c.want, kid); has != want {
+				t.Errorf("%s: %s given %v, want %v (keys %v)", c.name, kid, has, want, got)
+			} else if has && !bytes.Equal(got[kid], ak[kid]) {
+				t.Errorf("%s: %s isn't the source's key", c.name, kid)
+			}
+		}
+	}
+	if !rewritten {
+		t.Fatal("the mirror rewrote no sealed log page")
+	}
+}
+
+func mustHeader(t *testing.T, jwe []byte) *seal.Header {
+	t.Helper()
+	h, err := seal.ParseHeader(string(bytes.TrimSpace(jwe)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+func contains(xs []string, x string) bool {
+	for _, y := range xs {
+		if y == x {
+			return true
+		}
+	}
+	return false
 }

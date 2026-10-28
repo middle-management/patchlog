@@ -573,6 +573,7 @@ type remoteLevel struct {
 	raise     int
 	preEnc    map[string]any
 	preEpochs []epochStart
+	preIDs    []string // the entry that began each of preEpochs
 	preKeys   map[int][]byte
 	// nonce: the base itself (level 0) requires nonces as of at (§C.7).
 	nonce bool
@@ -854,10 +855,76 @@ func (e *Engine) fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLe
 		case level == levelSealed && !preSeen[ep]:
 			preSeen[ep] = true
 			lv.preEpochs = append(lv.preEpochs, epochStart{e: ep, created: created})
+			lv.preIDs = append(lv.preIDs, en.ID)
 		}
 		prev, prevEnc = level, enc
 	}
 	return nil
+}
+
+// originStarts takes the start times of a level's epochs from before its
+// raise to e2e, the keys of which the branch hands out itself, from the
+// namespace log as base.origin itself serves it, never from a mirror or
+// other intermediary, whatever its GET / says (§G.5.2): created times
+// aren't hashed (§5), so only the ids verify what the endpoint served.
+// Where the endpoint isn't the origin (RemoteEndpoint.OriginURL), the log
+// is read again from the origin with the endpoint's grant and keys; where
+// that fails, no start times are recorded, and the branch hands out none
+// of those keys (fetchPreRaiseKeys), rather than by times it can't trust.
+// The relayed keyring entries' epochs keep the endpoint's times: they are
+// wrapped to keyring recipients, so a wrong time only changes which of
+// them a grant receives. Only no answer from the endpoint fails creation.
+func originStarts(ctx context.Context, ep RemoteEndpoint, origin string, lv *remoteLevel) *Error {
+	if lv.raise < 0 || len(lv.preEpochs) == 0 {
+		return nil
+	}
+	direct := ep.OriginURL
+	if direct == "" {
+		direct = origin
+	}
+	if strings.TrimSuffix(ep.BaseURL, "/") == strings.TrimSuffix(direct, "/") {
+		return nil
+	}
+	created, err := originCreated(ctx, ep, direct, lv)
+	if err != nil {
+		log.Printf("remote base %s/ns/%s: the start times of its epochs before its raise to e2e, read from the origin itself: %v; the branch gives none of their keys", origin, lv.ns, err)
+		lv.preEpochs, lv.preIDs = nil, nil
+		return nil
+	}
+	for i, id := range lv.preIDs {
+		lv.preEpochs[i].created = created[id]
+	}
+	return nil
+}
+
+// originCreated reads the level's namespace log up to at from url, which
+// must be the same chain, and returns each entry's created time by id.
+func originCreated(ctx context.Context, ep RemoteEndpoint, url string, lv *remoteLevel) (map[string]time.Time, error) {
+	opts := []client.Option{client.WithHTTPClient(ep.HTTPClient), client.WithKeys(client.NewKeys(ep.Identity))}
+	if ep.Bearer != "" {
+		opts = append(opts, client.WithBearer(ep.Bearer))
+	}
+	oc, err := client.New(url, opts...)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := oc.NSLog(ctx, lv.ns, lv.at, "")
+	if err != nil {
+		return nil, err
+	}
+	if last, verr := verify.VerifyNSChain(entries, ""); verr != nil || last != lv.at {
+		return nil, fmt.Errorf("its namespace log doesn't verify up to %s", lv.at)
+	}
+	out := make(map[string]time.Time, len(entries))
+	for _, en := range entries {
+		out[en.ID] = time.UnixMilli(parseCreated(en.Created, time.Now()))
+	}
+	for _, id := range lv.preIDs {
+		if _, ok := out[id]; !ok {
+			return nil, fmt.Errorf("its namespace log lacks %s", id)
+		}
+	}
+	return out, nil
 }
 
 // fetchPreRaiseKeys gets, for a level raised to e2e from sealed before at,
@@ -1023,6 +1090,9 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 	if opaque {
 		for i, lv := range m.levels {
 			if ferr := e.fetchEpochs(ctx, c, lv, mapErrs[i]); ferr != nil {
+				return nil, ferr
+			}
+			if ferr := originStarts(ctx, ep, base.Origin, lv); ferr != nil {
 				return nil, ferr
 			}
 			if ferr := fetchPreRaiseKeys(ctx, c, ep, lv); ferr != nil {
