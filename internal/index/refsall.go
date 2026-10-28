@@ -759,7 +759,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		protected[ns] = info.Protected()
 	}
 	// An epoch whose key the service's grant gets none of, for good (a 4xx
-	// from /keys, no key for it, one it can't unwrap: !derived.Retryable),
+	// from /keys, no key for it, one it can't unwrap: lacksKey),
 	// leaves its hits by name only (§E.2.6), kept so in the stored result;
 	// one it can't get for now is behind.
 	keys := map[string]derived.Key{}
@@ -774,7 +774,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		}
 		key, err = ix.keys.KeyAt(ctx, ns, epoch)
 		switch {
-		case err != nil && !derived.Retryable(err):
+		case lacksKey(ctx, err):
 			ix.opt.Logf("index: key of %s epoch %d, for good: %v (its hits by name only)", ns, epoch, err)
 			lacking[k] = true
 			return key, true, nil
@@ -841,6 +841,10 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		return derived.Stored{}, "", false, err
 	}
 	st := derived.Stored{Body: b, JSON: true, Tags: strings.Join(tags, ",")}
+	if err := ctx.Err(); err != nil {
+		// The reader went away: keep nothing built meanwhile.
+		return derived.Stored{}, "", false, err
+	}
 	if len(keys) > 0 || len(lacking) > 0 {
 		// Some hit is sealed, or by name only for want of its key: it is
 		// bound to its URL.

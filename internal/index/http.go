@@ -603,6 +603,23 @@ var errLackCounts = errors.New("counts over documents served under an epoch the 
 // seals it (§E.2.6), that the service can't obtain for now: 503 behind.
 var errEpochKey = errors.New("the index cannot obtain the key of an epoch a hit is served under")
 
+// lacksKey reports whether err, from fetching the key of an epoch, leaves
+// the service lacking that key as its grant and keys are configured
+// (§A.4, §E.2.6): /keys answered a 4xx other than 429, or gave no key for
+// the epoch (ErrNoKeys) or none the service can unwrap (seal.ErrDecrypt)
+// or will take (ErrUntrustedKey, §E.3.2). Any other failure, the reader's
+// request ending while the key is read among them, is for now. So is any
+// failure once ctx is done, which may be why it failed.
+func lacksKey(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	if ae, ok := client.AsAPIError(err); ok {
+		return ae.Status >= 400 && ae.Status < 500 && ae.Status != 429
+	}
+	return errors.Is(err, client.ErrNoKeys) || errors.Is(err, seal.ErrDecrypt) || errors.Is(err, client.ErrUntrustedKey)
+}
+
 // answer runs q at the current checkpoint in one read transaction, builds
 // its result, sealed in a sealed or e2e namespace, keeps it (and stores a
 // sealed one), and returns the result kept with the checkpoint it is at.
@@ -623,9 +640,9 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		return derived.Stored{}, "", errCounts
 	}
 	// An epoch whose key the service's grant gets none of, for good (a 4xx
-	// from /keys, no key for it, one it can't unwrap: !derived.Retryable),
-	// leaves the hits served under it by name only, in a result sealed per
-	// entry (§E.2.6), kept so; one it can't get for now is behind.
+	// from /keys, no key for it, one it can't unwrap: lacksKey), leaves the
+	// hits served under it by name only, in a result sealed per entry
+	// (§E.2.6), kept so; one it can't get for now is behind.
 	keys := map[int]derived.Key{}
 	lacking := map[int]bool{}
 	keyAt := func(epoch int) (k derived.Key, lacks bool, err error) {
@@ -640,7 +657,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		}
 		k, err = ix.keys.KeyAt(ctx, ns, epoch)
 		switch {
-		case err != nil && !derived.Retryable(err):
+		case lacksKey(ctx, err):
 			ix.opt.Logf("index: key of %s epoch %d, for good: %v (its hits by name only)", ns, epoch, err)
 			lacking[epoch] = true
 			return k, true, nil
@@ -777,6 +794,10 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	}
 	if err != nil {
 		return derived.Stored{}, "", fmt.Errorf("encoding a result: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		// The reader went away: keep nothing built meanwhile.
+		return derived.Stored{}, "", err
 	}
 	if info.Protected() {
 		if st, err = ix.sealed.Put(ctx, view.Target, ns, at, st); err != nil {
