@@ -90,6 +90,7 @@
 package janitor
 
 import (
+	"container/list"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -175,29 +176,56 @@ type Janitor struct {
 	// none (§8.5), and the * key route of a superseded claim counts only
 	// with one read before the purge (§F.6). It lasts as long as the
 	// Janitor, across sweeps; the janitor has no store to persist it in.
-	seenMu sync.Mutex
-	seen   map[seenKey]*grant.Grant
+	// It holds at most seenCap grants, the least recently used dropped
+	// first (order): a grant dropped only keeps a branch for a manual
+	// purge, as one never read does.
+	seenMu  sync.Mutex
+	seen    map[seenKey]*list.Element
+	order   list.List // of seenGrant, most recently used first
+	seenCap int
 }
+
+// maxSeen is the default bound of Janitor.seen.
+const maxSeen = 4096
 
 // seenKey names a grant read from a successor's /grants.
 type seenKey struct{ ns, gid string }
+
+// seenGrant is an entry of Janitor.order.
+type seenGrant struct {
+	k seenKey
+	g *grant.Grant
+}
 
 // remember keeps a grant read from ns's /grants while ns was live.
 func (j *Janitor) remember(ns, gid string, g *grant.Grant) {
 	j.seenMu.Lock()
 	defer j.seenMu.Unlock()
-	if j.seen == nil {
-		j.seen = map[seenKey]*grant.Grant{}
+	k := seenKey{ns, gid}
+	if el, ok := j.seen[k]; ok {
+		el.Value = seenGrant{k, g}
+		j.order.MoveToFront(el)
+		return
 	}
-	j.seen[seenKey{ns, gid}] = g
+	if j.seen == nil {
+		j.seen = map[seenKey]*list.Element{}
+	}
+	j.seen[k] = j.order.PushFront(seenGrant{k, g})
+	for j.order.Len() > j.seenCap {
+		delete(j.seen, j.order.Remove(j.order.Back()).(seenGrant).k)
+	}
 }
 
 // recalled returns a grant remembered from ns's /grants, if any.
 func (j *Janitor) recalled(ns, gid string) (*grant.Grant, bool) {
 	j.seenMu.Lock()
 	defer j.seenMu.Unlock()
-	g, ok := j.seen[seenKey{ns, gid}]
-	return g, ok
+	el, ok := j.seen[seenKey{ns, gid}]
+	if !ok {
+		return nil, false
+	}
+	j.order.MoveToFront(el)
+	return el.Value.(seenGrant).g, true
 }
 
 // New returns a janitor.
@@ -208,7 +236,7 @@ func New(c *client.Client, opt Options) *Janitor {
 	if opt.Interval <= 0 {
 		opt.Interval = time.Minute
 	}
-	return &Janitor{c: c, opt: opt}
+	return &Janitor{c: c, opt: opt, seenCap: maxSeen}
 }
 
 // Sweep makes one pass over every base's branch tree, leaves first, and
@@ -1291,11 +1319,11 @@ func (b *branch) starKey(ctx context.Context, e client.NSEntry, in string) (ok b
 // the key kid names now (§C.3.1): the stored grant, as GET
 // /ns/{ns}/grants/{gid} serves it, has the entry's grant id and root kid,
 // and its signature chain verifies under k's pub. It is read from in, the
-// namespace the entry was written in, and kept (Janitor.remember). Where
-// in is a successor purged since, which answers 410 for its grants
-// (§8.5), only a grant this janitor read from it before the purge counts
-// (§F.6): none is read from anywhere else, and without one the branch is
-// kept for a manual purge.
+// namespace the entry was written in, and kept where in is a successor
+// (Janitor.remember). Where in is a successor purged since, which answers
+// 410 for its grants (§8.5), only a grant this janitor read from it before
+// the purge counts (§F.6): none is read from anywhere else, and without
+// one the branch is kept for a manual purge.
 func (b *branch) signedBy(ctx context.Context, e client.NSEntry, kid string, k nsKey, in string) (ok bool, why string, err error) {
 	gid := e.Grant.ID
 	g, ok := b.grants[gid]
@@ -1314,7 +1342,9 @@ func (b *branch) signedBy(ctx context.Context, e client.NSEntry, kid string, k n
 			if g, err = parseGrantDoc(doc); err != nil {
 				return false, fmt.Sprintf("its grant %s as %s serves it is malformed: %v", gid, in, err), nil
 			}
-			b.j.remember(in, gid, g)
+			if in != b.ns {
+				b.j.remember(in, gid, g)
+			}
 		}
 		if b.grants == nil {
 			b.grants = map[string]*grant.Grant{}
