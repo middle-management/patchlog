@@ -58,10 +58,18 @@ const (
 	// fragment: a rule's schema fragment (§6.4.2): write's rules, with no
 	// $schema in any subschema and same-document references only.
 	fragment
+	// walk: a stored schema read for its structure by the static walk that
+	// finds declared references (§6.5), not compiled to validate: what an
+	// earlier version stored is walked as it accepted it, v0.55's root $id
+	// equal to its own revision path (selfPath), dialect $schema in any
+	// subschema and any format included, with patterns compiled as v0.55
+	// compiled them (Legacy).
+	walk
 )
 
 type checker struct {
-	mode mode
+	mode     mode
+	selfPath string // walk: the revision path the schema is stored at
 }
 
 // CheckSchemaDocument validates the constraints of §6.1, §6.5 and §6.6 for a
@@ -81,6 +89,18 @@ type checker struct {
 // schemas (§6.2, §C.7) and schema resources can move (§8.1, §6.5).
 func CheckSchemaDocument(doc any, selfPath string) error {
 	return checker{mode: write}.check(leaveOut(doc), pointer.Pointer{})
+}
+
+// CheckSchemaWalk checks a stored schema document, at revision path
+// selfPath, for the static walk that finds declared references (§6.5):
+// "a static walk, not annotation collection during validation", so a
+// document stored against a schema an earlier version accepted still
+// declares the references it did, though that schema no longer compiles
+// (§6.1). It refuses what CheckSchemaDocument does, but for a root $id
+// equal to selfPath, a dialect $schema in a subschema and any format, and
+// it compiles patterns as v0.55 did.
+func CheckSchemaWalk(doc any, selfPath string) error {
+	return checker{mode: walk, selfPath: selfPath}.check(leaveOut(doc), pointer.Pointer{})
 }
 
 // CheckFragment checks a rule's schema fragment (§6.4.2): it is held to
@@ -216,8 +236,10 @@ func (ck checker) checkCore(obj map[string]any, at pointer.Pointer) error {
 			return &RefError{Msg: fmt.Sprintf("$schema at %s must be a supported dialect URL", loc(at))}
 		}
 	}
-	if _, ok := obj["$id"]; ok {
-		return &SchemaError{Msg: fmt.Sprintf("$id at %s is not allowed", loc(at))}
+	if v, ok := obj["$id"]; ok {
+		if s, _ := v.(string); ck.mode != walk || len(at) != 0 || ck.selfPath == "" || s != ck.selfPath {
+			return &SchemaError{Msg: fmt.Sprintf("$id at %s is not allowed", loc(at))}
+		}
 	}
 	if v, ok := obj["$ref"]; ok {
 		s, ok := v.(string)
@@ -243,7 +265,7 @@ func (ck checker) checkCore(obj map[string]any, at pointer.Pointer) error {
 			return &RefError{Msg: fmt.Sprintf("$dynamicRef at %s must be a fragment", loc(at))}
 		}
 	}
-	if v, ok := obj["format"]; ok {
+	if v, ok := obj["format"]; ok && ck.mode != walk {
 		f, ok := v.(string)
 		if !ok {
 			return &SchemaError{Msg: fmt.Sprintf("format at %s must be a string", loc(at))}
@@ -256,7 +278,11 @@ func (ck checker) checkCore(obj map[string]any, at pointer.Pointer) error {
 }
 
 func (ck checker) checkRegexp(re string, at pointer.Pointer) error {
-	if _, err := current.CompileRegexp(re); err != nil {
+	rules := current
+	if ck.mode == walk {
+		rules = Legacy
+	}
+	if _, err := rules.CompileRegexp(re); err != nil {
 		return &SchemaError{Msg: fmt.Sprintf("regular expression at %s is not RE2-compatible: %v", loc(at), err)}
 	}
 	return nil

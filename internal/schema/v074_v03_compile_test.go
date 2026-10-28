@@ -48,3 +48,40 @@ func TestV074V03EveryRevisionCompilesCurrent(t *testing.T) {
 		t.Errorf("a copy of a Legacy schema naming semver: %v, want invalid", err)
 	}
 }
+
+// The static walk for declared references (§6.5) reads a stored schema as
+// the version that stored it accepted it (CheckSchemaWalk), though it no
+// longer compiles (§6.1): CheckSchemaDocument refuses these, the walk's
+// check doesn't; what no version accepted, both refuse.
+func TestV074V03CheckSchemaWalk(t *testing.T) {
+	t.Parallel()
+	const self = "/r/s/legacy/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for name, d := range map[string]map[string]any{
+		"semver":         {"format": "semver"},
+		"own $id":        {"$id": self},
+		"nested $schema": {"properties": map[string]any{"a": map[string]any{"$schema": Dialect2020}}},
+		"raw RE2":        {"patternProperties": map[string]any{`[\x{D800}]`: true}},
+	} {
+		d["$schema"] = Dialect2020
+		if err := CheckSchemaDocument(d, self); err == nil {
+			t.Errorf("%s: CheckSchemaDocument accepted it", name)
+		}
+		if err := CheckSchemaWalk(d, self); err != nil {
+			t.Errorf("%s: CheckSchemaWalk: %v", name, err)
+		}
+	}
+	for name, d := range map[string]map[string]any{
+		"unknown keyword": {"frobnicate": 1},
+		"other $id":       {"$id": "/r/s/x/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		"nested $id":      {"properties": map[string]any{"a": map[string]any{"$id": self}}},
+		"bad pattern":     {"pattern": "("},
+	} {
+		d["$schema"] = Dialect2020
+		if err := CheckSchemaWalk(d, self); err == nil {
+			t.Errorf("%s: CheckSchemaWalk accepted it", name)
+		}
+	}
+	if err := CheckSchemaWalk(map[string]any{"$schema": Dialect2020, "$id": self}, ""); err == nil {
+		t.Error("CheckSchemaWalk without a revision path accepted a root $id")
+	}
+}

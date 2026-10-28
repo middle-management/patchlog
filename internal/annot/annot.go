@@ -204,7 +204,10 @@ func (c *collector) doc(u string) (any, error) {
 	default:
 		return fail(&schema.SchemaError{Msg: path + " is not a schema document"})
 	}
-	if err := schema.CheckSchemaDocument(d, path); err != nil {
+	// Read for its structure (§6.5's static walk), as an earlier version
+	// stored it; Collect's validation compiles it under this version's
+	// rules all the same (§6.1).
+	if err := schema.CheckSchemaWalk(d, path); err != nil {
 		return fail(err)
 	}
 	d = jsonv.Clone(d)
@@ -453,7 +456,10 @@ func (c *collector) regexp(re string) (*regexp.Regexp, error) {
 	if r, ok := c.regexps[re]; ok {
 		return r, nil
 	}
-	r, err := schema.V073.CompileRegexp(re)
+	// As the walk reads stored schemas (CheckSchemaWalk): patterns as v0.55
+	// compiled them. Collect has compiled the schema under this version's
+	// rules before it walks.
+	r, err := schema.Legacy.CompileRegexp(re)
 	if err != nil {
 		return nil, &schema.SchemaError{Msg: fmt.Sprintf("patternProperties %q: %v", re, err)}
 	}
