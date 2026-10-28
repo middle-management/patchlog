@@ -162,8 +162,9 @@ func (s sourced) String() string { return s.src }
 // idnHost checks host names as RFC 5890 defines them, without UTS 46
 // mapping (§6.2 step 5): IDNA2008's registration rules (RFC 5891 §4),
 // which refuse any code point UTS 46 would map (an uppercase or fullwidth
-// letter in a U-label), with the Bidi rule (RFC 5893), the contextual
-// rules and DNS's lengths.
+// letter in a U-label), with the Bidi rule (RFC 5893), CONTEXTJ and DNS's
+// lengths. The profile leaves out RFC 5892's CONTEXTO rules, which
+// contextO checks after it.
 var idnHost = idna.New(idna.ValidateForRegistration())
 
 // validateIDNHostname asserts idn-hostname: a host name of labels that are
@@ -178,8 +179,65 @@ func validateIDNHostname(v any) error {
 	if !ok {
 		return nil
 	}
-	if _, err := idnHost.ToASCII(foldLDH(s)); err != nil {
+	f := foldLDH(s)
+	if _, err := idnHost.ToASCII(f); err != nil {
 		return jsonschema.LocalizableError("%v", err)
+	}
+	u, err := idnHost.ToUnicode(f)
+	if err != nil {
+		return jsonschema.LocalizableError("%v", err)
+	}
+	for _, l := range strings.Split(u, ".") {
+		if err := contextO(l); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// contextO checks a U-label against RFC 5892 Appendix A's CONTEXTO rules,
+// part of a U-label's validity (RFC 5891 §4.2.3.3, §5.4): a MIDDLE DOT
+// between two l, a GREEK KERAIA before a Greek letter, a HEBREW GERESH or
+// GERSHAYIM after a Hebrew one, a KATAKANA MIDDLE DOT in a label with a
+// Hiragana, Katakana or Han character, and Arabic-Indic digits not mixed
+// with extended ones.
+func contextO(label string) error {
+	rs := []rune(label)
+	at := func(i int) rune {
+		if i < 0 || i >= len(rs) {
+			return -1
+		}
+		return rs[i]
+	}
+	var arabic, extended, kana bool
+	for _, r := range rs {
+		switch {
+		case r >= 0x0660 && r <= 0x0669:
+			arabic = true
+		case r >= 0x06F0 && r <= 0x06F9:
+			extended = true
+		case unicode.In(r, unicode.Hiragana, unicode.Katakana, unicode.Han):
+			kana = true
+		}
+	}
+	for i, r := range rs {
+		ok := true
+		switch r {
+		case 0x00B7:
+			ok = at(i-1) == 'l' && at(i+1) == 'l'
+		case 0x0375:
+			ok = at(i+1) >= 0 && unicode.Is(unicode.Greek, at(i+1))
+		case 0x05F3, 0x05F4:
+			ok = at(i-1) >= 0 && unicode.Is(unicode.Hebrew, at(i-1))
+		case 0x30FB:
+			ok = kana
+		}
+		if !ok {
+			return jsonschema.LocalizableError("idna: %+q in label %q breaks its CONTEXTO rule (RFC 5892)", r, label)
+		}
+	}
+	if arabic && extended {
+		return jsonschema.LocalizableError("idna: label %q mixes Arabic-Indic and extended Arabic-Indic digits (RFC 5892)", label)
 	}
 	return nil
 }

@@ -89,3 +89,41 @@ func TestV074V03IDNHostnameValidate(t *testing.T) {
 		}
 	}
 }
+
+// A U-label's validity under RFC 5890 includes RFC 5892's CONTEXTO rules
+// (RFC 5891 §4.2.3.3, §5.4), which IDNA2008's registration profile in
+// x/net/idna leaves out (§6.2 step 5); an A-label decoding to such a label
+// is refused as the U-label is.
+func TestV074V03IDNContextO(t *testing.T) {
+	t.Parallel()
+	for _, x := range []struct {
+		host string
+		ok   bool
+	}{
+		{"l·l.com", true},
+		{"a·l.com", false}, // MIDDLE DOT not between two l
+		{"·l.com", false},
+		{"l·.com", false},
+		{"xn--al-0ea.com", false}, // a·l as an A-label
+		{"・ア.com", true},
+		{"漢・.com", true},
+		{"・.com", false}, // KATAKANA MIDDLE DOT without Hiragana, Katakana or Han
+		{"͵α.com", true},
+		{"a͵.com", false}, // GREEK KERAIA not followed by Greek
+		{"͵.com", false},
+		{"א׳.com", true},
+		{"׳.com", false},  // HEBREW GERESH not preceded by Hebrew
+		{"״א.com", false}, // HEBREW GERSHAYIM likewise
+		{"ب١٢.com", true},
+		{"ب١۲.com", false}, // Arabic-Indic and extended digits mixed
+	} {
+		err := validateIDNHostname(x.host)
+		if (err == nil) != x.ok {
+			t.Errorf("idn-hostname %+q: err %v, want ok %v", x.host, err, x.ok)
+		}
+		err = validateIDNEmail("a@" + x.host)
+		if (err == nil) != x.ok {
+			t.Errorf("idn-email a@%+q: err %v, want ok %v", x.host, err, x.ok)
+		}
+	}
+}
