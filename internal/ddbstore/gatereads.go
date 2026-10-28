@@ -34,7 +34,17 @@ const maxPrefetch = 40
 // one each. Names past maxPrefetch are left out; a name absent from the
 // result wasn't read.
 func (s *Store) Prefetch(ctx context.Context, ns string, names []string) (*ddb.NSRow, map[string]ddb.Prefetched, error) {
-	names = names[:min(len(names), maxPrefetch)]
+	// Each name once (a batch may name one twice, which its checks
+	// refuse; BatchGetItem refuses duplicate keys before that).
+	seen := map[string]bool{}
+	var uniq []string
+	for _, n := range names {
+		if !seen[n] && len(uniq) < maxPrefetch {
+			seen[n] = true
+			uniq = append(uniq, n)
+		}
+	}
+	names = uniq
 	keys := []map[string]types.AttributeValue{keyAV(keyMeta(ns)), keyAV(keyTip(ns))}
 	for _, n := range names {
 		keys = append(keys, keyAV(keyRes(ns, n)), keyAV(keyDocHead(ns, n)))
