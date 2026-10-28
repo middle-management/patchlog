@@ -118,3 +118,44 @@ func TestUntrustedBeforePurgedV074(t *testing.T) {
 		t.Errorf("read-grants: %v (want status 403)", e)
 	}
 }
+
+// TestItemVisibilityWithRulesV074 (Open 105): an item request judges
+// "a role that makes it visible" as listings do (§B.11.5), the role's
+// and the key's scope rules evaluated for a read of the item: a purged
+// item is 403, not 410, to a caller whose role there has a rule that
+// fails for its name, and so is a Restore of a deleted one, though the
+// role counts for read and restore (§B.11.4).
+func TestItemVisibilityWithRulesV074(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	for _, n := range []string{"doomed", "gone"} {
+		w.doc("matches", n, map[string]any{"title": n})
+		w.doc("cat", "matches."+n, map[string]any{"parents": parents("season")})
+	}
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	must(w.ops.Delete(ctx, "matches", "doomed", must(w.ops.Head(ctx, "matches", "doomed")).ID))
+	purger := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"matches"}, []string{"read", "purge"})))
+	must(purger.Purge(ctx, "matches", "doomed", must(w.ops.Head(ctx, "matches", "doomed")).ID, false))
+	must(w.ops.Delete(ctx, "matches", "gone", must(w.ops.Head(ctx, "matches", "gone")).ID))
+	w.caughtUp()
+	bob := w.caller("user:bob", "match-desk")
+	purged := map[string]any{"item": "/r/matches/doomed", "want": toAny("read")}
+	restore := map[string]any{"item": "/r/matches/gone", "want": toAny("restore")}
+	// desk counts at season for match-desk: the purged item is 410, the
+	// deleted one restorable.
+	w.issue(bob, purged, 410)
+	w.issue(bob, restore, 200)
+	// desk's rule makes it visible only on "other".
+	w.patchMatches(map[string]any{"op": "add", "path": "/roles/desk/rules",
+		"value": []any{map[string]any{"op": "test", "path": "/resource", "value": "other"}}})
+	w.issue(bob, purged, 403)
+	w.issue(bob, restore, 403)
+	// A rule that reads /now never counts for visibility (§B.11.5).
+	w.patchMatches(map[string]any{"op": "replace", "path": "/roles/desk/rules",
+		"value": []any{map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}}})
+	w.issue(bob, purged, 403)
+	w.issue(bob, restore, 403)
+}

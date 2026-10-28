@@ -445,10 +445,7 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 	// Every item is judged by the visibility test of the subject set the
 	// caller's listings are keyed by (§B.11.5, Resolve).
 	var vis *visibility
-	s.t.View(func(g *tree.Graph, _ map[string]string) {
-		w, groups := whoOf(s.keyedAt(g, v))
-		vis = &visibility{s: s, who: w, groups: groups}
-	})
+	s.t.View(func(g *tree.Graph, _ map[string]string) { vis = s.visibilityOf(g, v) })
 	read := map[string]bool{}
 	out := []any{}
 	for _, item := range items {
@@ -882,8 +879,9 @@ func (s *Service) noContentKey(ns string) error {
 //
 // Other verbs answer as Restore's list does (§B.11.4): 410 purged; 404
 // for a name that never existed; for a purged item, 403 without a role
-// that counts for read at its placement, computed as for a live item
-// (Effective), and 410 gone otherwise; then 403 when no role is kept, a
+// that makes it visible at its placement (§B.11.5: the role's and the
+// key's scope rules pass for a read of it, itemRoles), computed as for a
+// live item (Effective), and 410 gone otherwise; then 403 when no role is kept, a
 // dangling placement included (§B.11.2), with one message whether the
 // item has a placement or not (noRole).
 //
@@ -954,13 +952,15 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		case f.state == tree.ItemPurged:
 			// Restore's read check, at its placement as for a live item:
 			// a purged item's placement dangles and grants nothing
-			// (§B.11.2), but a caller who could read it learns it was
-			// purged, as the core would tell it (§8.3).
+			// (§B.11.2), but a caller with a role that would make it
+			// visible there learns it was purged, as the core would tell
+			// it (§8.3): judged as listings judge visibility, the role's
+			// and the key's scope rules included (§B.11.5).
 			var at map[string][]string
 			if f.node != nil {
 				at = Effective(g, pl, nil)
 			}
-			if len(counting(cfg, key, rolesIn(at, subs), "read")) == 0 {
+			if vis := s.visibilityOf(g, v); len(vis.itemRoles(vis.roles(g, ns), at, name)) == 0 {
 				err = noRole(want, item)
 			} else {
 				err = errf(410, "gone", "%s was purged", item)
@@ -1077,10 +1077,11 @@ func (s *Service) contentSigner(latest *grantcheck.Config, checkpoint *map[strin
 //     410 purged for every name of a purged namespace (contentConfig,
 //     purgedIn);
 //   - 404 for a name that never existed;
-//   - 403 for a caller without a role that counts for read on the item
-//     both at its placement now and, if it is deleted, in its frozen rows
-//     (an item without a placement has no role there), answered as one
-//     without a role kept (noRole);
+//   - 403 for a caller without a role that makes the item visible
+//     (§B.11.5, itemRoles: its own and the key's scope rules passing for
+//     a read of it) both at its placement now and, if it is deleted, in
+//     its frozen rows (an item without a placement has no role there),
+//     answered as one without a role kept (noRole);
 //   - 410 gone for a purged item (§8.3), 409 for a live one;
 //   - 403 for a caller without a role kept, or whose restore would widen:
 //     the roles the item would have after it, from its current
@@ -1136,15 +1137,23 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 		if f.node != nil {
 			now = Effective(g, pl, nil)
 		}
-		// The roles at its placement now, and for a deleted item those
-		// in its frozen rows too (§B.11.7).
+		// A role that makes the item visible (§B.11.5), its own and the
+		// key's scope rules passing for a read of it, at its placement
+		// now and, for a deleted item, in its frozen rows too (§B.11.7).
+		vis := s.visibilityOf(g, v)
+		rr := vis.roles(g, ns)
+		seen := setOf(vis.itemRoles(rr, now, name))
+		if f.state == tree.ItemTombstoned {
+			seen = intersect(seen, setOf(vis.itemRoles(rr, s.frozen[pl], name)))
+		}
+		if len(seen) == 0 {
+			err = noRole(want, item)
+			return
+		}
+		// The roles kept for restore, at both, as the grant has them.
 		both := rolesIn(now, subs)
 		if f.state == tree.ItemTombstoned {
 			both = intersect(both, s.frozenRolesFor(pl, subs))
-		}
-		if len(counting(cfg, key, both, "read")) == 0 {
-			err = noRole(want, item)
-			return
 		}
 		switch f.state {
 		case tree.ItemPurged:
@@ -1454,15 +1463,33 @@ type organising struct {
 
 // organisingAt is the caller v's organising view at the checkpoint g
 // reflects: for a caller not in catalog-admins, that of the subject set
-// its listings are keyed by (keyedAt), as §B.11.5 judges visibility.
+// its listings are keyed by (visibilityOf), as §B.11.5 judges visibility.
 // Call it under View.
 func (s *Service) organisingAt(g *tree.Graph, v *grant.Verified, admin bool) *organising {
 	o := &organising{g: g, admin: admin, read: map[string]bool{}}
 	if !admin {
-		w, groups := whoOf(s.keyedAt(g, v))
-		o.vis = &visibility{s: s, who: w, groups: groups}
+		o.vis = s.visibilityOf(g, v)
 	}
 	return o
+}
+
+// visibilityOf is the caller v's view of the catalog as §B.11.5 judges
+// visibility, at the checkpoint g reflects: that of the subject set its
+// listings are keyed by (keyedAt), for organising requests, item
+// requests' visibility answers (§B.11.4) and /read-grants alike. Call it
+// under View.
+func (s *Service) visibilityOf(g *tree.Graph, v *grant.Verified) *visibility {
+	w, groups := whoOf(s.keyedAt(g, v))
+	return &visibility{s: s, who: w, groups: groups}
+}
+
+// setOf is xs as a set.
+func setOf(xs []string) map[string]bool {
+	out := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		out[x] = true
+	}
+	return out
 }
 
 // checkpoint is the checkpoint the decision reports (§B.11.4): the
