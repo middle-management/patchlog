@@ -129,6 +129,45 @@ type groups struct {
 	// Counters (tests, benchmarks): groups committed and commits appended
 	// in them.
 	committed, appended atomic.Int64
+	// tips are the tips this instance last committed, by namespace
+	// (startTip): a namespace's next commit chains over them first.
+	tipMu sync.Mutex
+	tips  map[string]tip
+}
+
+// committedTip remembers t as ns's tip after a commit of this instance.
+func (s *Store) committedTip(ns string, t tip) {
+	g := &s.g
+	g.tipMu.Lock()
+	defer g.tipMu.Unlock()
+	if g.tips == nil || len(g.tips) >= 4096 {
+		g.tips = map[string]tip{}
+	}
+	if cur, ok := g.tips[ns]; !ok || t.headPos > cur.headPos {
+		g.tips[ns] = t
+	}
+}
+
+// startTip is the tip a commit of ns chains over first: the newest of
+// the one this instance last committed and those its commits' checks
+// read (Commit.TipPos), nil if neither is known. A check reads the tip
+// before it commits, and another write of this instance may have
+// committed since: chaining over the check's then cancels the
+// transaction, the tip is read and it runs again. The tip's condition
+// decides either way; another instance's commit is found by it.
+func (s *Store) startTip(ns string, cs ...*ddb.Commit) *tip {
+	var t *tip
+	s.g.tipMu.Lock()
+	if cur, ok := s.g.tips[ns]; ok {
+		t = &cur
+	}
+	s.g.tipMu.Unlock()
+	for _, c := range cs {
+		if h := hintedTip(c); h != nil && (t == nil || h.headPos > t.headPos) {
+			t = h
+		}
+	}
+	return t
 }
 
 // GroupStats reports how many groups committed and how many commits they
@@ -256,13 +295,11 @@ func (s *Store) commitGroup(ns string, group []*groupMember, known *tip) *tip {
 	live := group
 	t := known
 	if t == nil {
-		// The newest tip its commits' checks read, a first guess (the
-		// tip's condition decides, a moved one is read again).
-		for _, w := range group {
-			if h := hintedTip(w.c); h != nil && (t == nil || h.headPos > t.headPos) {
-				t = h
-			}
+		cs := make([]*ddb.Commit, len(group))
+		for i, w := range group {
+			cs[i] = w.c
 		}
+		t = s.startTip(ns, cs...)
 	}
 	for attempt := 0; len(live) > 0; attempt++ {
 		if attempt >= maxWriteAttempts {
@@ -297,6 +334,7 @@ func (s *Store) commitGroup(ns string, group []*groupMember, known *tip) *tip {
 				s.OnGroup(len(live))
 			}
 			last := res[len(res)-1]
+			s.committedTip(ns, tip{headPos: last.Pos, headID: last.NSID})
 			return &tip{headPos: last.Pos, headID: last.NSID}
 		}
 		stale, tipMoved, cerr := classifyCancel(err, cs, len(acts))

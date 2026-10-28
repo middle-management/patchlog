@@ -513,3 +513,27 @@ func TestDDBCallsPerRequest(t *testing.T) {
 		}
 	})
 }
+
+// A write whose check read the tip before another write of this instance
+// moved it commits in one transaction: it chains over the tip the other
+// committed, which the store remembers, not the stale one its check read
+// (a transaction cancelled, the tip read, the transaction again). The
+// group commit worker of the other write is gone by then, as a namespace
+// whose writes come one at a time sees after each.
+func TestDDBStaleTipWastesNoCommit(t *testing.T) {
+	e, f, _ := ddbFaultEngine(t, ddbTable(t), Options{})
+	ddbCreateNS(t, e, "busy", `{"read":"public"}`)
+	a := ddbWrite(t, e, "busy", "a", "", `[{"op":"add","path":"","value":{"v":0}}]`)
+	b := ddbWrite(t, e, "busy", "b", "", `[{"op":"add","path":"","value":{"v":0}}]`)
+	f.takeCalls()
+	// b's check reads the tip (its prefetch), then reads b's head
+	// revision: before that, a's write commits, moving the tip.
+	f.hook("GetItem", func() {
+		ddbWrite(t, e, "busy", "a", a.Items[0].IDs[0], `[{"op":"replace","path":"/v","value":1}]`)
+	})
+	ddbWrite(t, e, "busy", "b", b.Items[0].IDs[0], `[{"op":"replace","path":"/v","value":1}]`)
+	by, _ := f.takeCalls()
+	if tx := by["TransactWriteItems"]; tx != 2 {
+		t.Fatalf("%d commit transactions for 2 writes, want 2: b chained over a stale tip (%v)", tx, by)
+	}
+}

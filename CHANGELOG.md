@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.24.0-ddb.3
+
+The third prerelease from the `dynamodb` branch. A write's commit chained over the log tip its
+checks read; under concurrent writes another write of the same server had often committed
+since, so the commit's transaction was cancelled, the tip read, and the transaction run again
+(12% of commits in a CloudShell trace, each a ~25 ms transaction wasted). The store now
+remembers the tip it last committed for each namespace and chains over the newer of that and
+the check's. A purge's collection of blob bytes no longer races an upload naming the same bytes
+(the upload's bytes could be deleted). `deploy/bench.sh` waits out 429s and counts them apart
+from errors; `deploy/spans.py` summarises where requests spend their time from the server's
+console spans (`OTEL_TRACES_EXPORTER=console`).
+
 ## v0.24.0-ddb.2
 
 The second prerelease from the `dynamodb` branch. DynamoDB's latency is per call, so this one
