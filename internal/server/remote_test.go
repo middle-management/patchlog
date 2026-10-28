@@ -50,7 +50,9 @@ func withRemote(rt *route, mod ...func(*core.RemoteOptions)) envOpt {
 			}
 			rt.mu.Lock()
 			defer rt.mu.Unlock()
-			return core.RemoteEndpoint{BaseURL: rt.url, Bearer: rt.bearer, HTTPClient: httpClient}, nil
+			// The test's A is reached at its own URL, so the endpoint is
+			// the origin itself (§G.5.2), proxy or not.
+			return core.RemoteEndpoint{BaseURL: rt.url, OriginURL: rt.url, Bearer: rt.bearer, HTTPClient: httpClient}, nil
 		}}
 		for _, m := range mod {
 			m(&o.Remote)

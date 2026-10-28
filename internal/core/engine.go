@@ -218,6 +218,11 @@ type RemoteEndpoint struct {
 	// Identity unwraps the keys of a sealed base (Addendum E.2) that the
 	// base wraps to the grant's enc (§E.2.3, §G.5). Nil: raw keys only.
 	Identity *ecdh.PrivateKey
+	// OriginURL is where the origin itself answers, for what §G.5.2 reads
+	// only through base.origin: the start times of a source's epochs from
+	// before its e2e raise. "": the origin's own URL. A BaseURL that is
+	// neither may be a mirror or other intermediary.
+	OriginURL string
 }
 
 // Purger purges CDN cache tags.

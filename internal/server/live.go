@@ -350,7 +350,8 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		if lg.Purged && !lg.More {
 			// The namespace is purged and its purge-ns entry, the log's
-			// last, is sent (or was since): the stream ends (§7.3, §8.5).
+			// last, is sent: the stream ends (§7.3, §8.5). A stream from
+			// that entry was 410 purged before it started.
 			return
 		}
 		keepAlive := false

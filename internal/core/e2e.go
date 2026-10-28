@@ -681,14 +681,17 @@ func (t *tx) ownKeyring(n *nsRow, asOf *int64) any {
 // keyEpochs lists n's epochs up to max with when each began, ascending, as
 // the §E.2.3 window reads them at E3: those begun at e2e (e2e_epochs) and,
 // after a raise from sealed, the epochs before it, whose keys the origin
-// holds (epoch_keys), up to the last one before the raise.
+// holds (epoch_keys), up to the last one before the raise. A remote
+// branch's shadow's epochs from before the raise whose start times
+// base.origin hasn't given are left out, so they are in no grant's window,
+// the shadow's own or a branch's base epochs (knownStarts, §G.5.2).
 func (t *tx) keyEpochs(n *nsRow, max int) []epochStart {
 	all := t.epochStarts(`e2e_epochs`, n.id, max)
 	r := t.e2eRaiseOf(n)
 	if r == nil || r.level != levelSealed {
 		return all
 	}
-	return append(t.epochStarts(`epoch_keys`, n.id, min(max, r.epoch)), all...)
+	return append(knownStarts(t.epochStarts(`epoch_keys`, n.id, min(max, r.epoch))), all...)
 }
 
 // epochNow is the epoch base b has in force now (§E.2.3): its document's,

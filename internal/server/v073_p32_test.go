@@ -288,8 +288,8 @@ func TestV073RemoteRestrictsRead(t *testing.T) {
 
 // ENC-45: a raise to e2e seen after at is one Levels refuse the branch
 // (Addendum E Levels, Branches of a raised base): it is recorded, and the
-// branch marked for a rebase, while it keeps serving what it read
-// through, which its base serves as at the level before the raise. A's
+// branch marked for a rebase, raised as far as Levels allow, to sealed
+// (v0.74, §G.5.2), and it keeps serving what it read through. A's
 // document is rewritten in transit here, since this server raises no
 // existing namespace to e2e yet; B reads it only from A (§G.5.2).
 func TestV073RemoteE2ERaiseNeedsRebase(t *testing.T) {
@@ -322,10 +322,12 @@ func TestV073RemoteE2ERaiseNeedsRebase(t *testing.T) {
 	if len(ns) != 1 || ns[0].Kind != "config" || ns[0].Applied || ns[0].ID != raised {
 		t.Fatalf("notices %+v", ns)
 	}
-	if levelOf(b.configOf("r")) != "" {
-		t.Fatal("raised to e2e")
+	if l := levelOf(b.configOf("r")); l != "sealed" {
+		t.Fatalf("level %q, want sealed", l)
 	}
-	expect(t, b.get("/r/r/x/rev/"+x), 200)
+	if g := b.get("/r/r/x/rev/" + x); g.Code != 200 || !isJOSE(g) {
+		t.Fatalf("read-through content: %d %s", g.Code, g.Body)
+	}
 }
 
 // CIS-32, ENC-45: a base whose log B can't open, because A seals it now and

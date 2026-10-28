@@ -28,8 +28,10 @@ import (
 //   - Paged as in §7.1, a page of at most the log page size. The cursor is
 //     "{resource}/{id}" of a page's last entry, sent as X-Log-Next and as
 //     the next page's ?after= (§7.4): ids repeat across resources (§3.3), resource
-//     names never contain "/" (§3.6). The list grows, so the last page is
-//     the one without X-Log-Next, and nothing is cached (no-store).
+//     names never contain "/" (§3.6). An after not of that form is a
+//     request-shape 400 (§6.2); one naming no entry of an unpurged
+//     resource the grant may read is 404. The list grows, so the last page
+//     is the one without X-Log-Next, and nothing is cached (no-store).
 //   - It answers any reader, listing only the entries of resources its
 //     grant may read, so a reader limited to some documents finds its own
 //     gestures and learns nothing of others. It isn't offered in sealed
@@ -52,6 +54,18 @@ type GesturePage struct {
 func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred Credentials) (*GesturePage, error) {
 	if !ValidGesture(gesture) {
 		return nil, badInput("a gesture id is 26 base32 characters")
+	}
+	// An after not of the form {resource}/{id} is a request-shape error,
+	// answered before the namespace is looked up (§6.2, §7.4).
+	var afterName string
+	var afterID ids.ID
+	if since != "" {
+		name, idText, ok := strings.Cut(since, "/")
+		id, perr := ids.Parse(idText)
+		if !ok || perr != nil || !ValidResourceName(name) {
+			return nil, badInput("after is {resource}/{id}, as X-Log-Next gave it (§7.4)")
+		}
+		afterName, afterID = name, id
 	}
 	var out *GesturePage
 	err := e.read(ctx, func(t *tx) error {
@@ -85,13 +99,13 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 		}
 		var after int64
 		if since != "" {
-			name, idText, ok := strings.Cut(since, "/")
-			id, perr := ids.Parse(idText)
-			r := t.resource(n.id, name)
-			if !ok || perr != nil || r == nil || (visible != nil && !visible(name)) {
+			// It names an entry of an unpurged resource the grant may read,
+			// or is 404 (§7.4): purge keeps the rows, not the listing.
+			r := t.resource(n.id, afterName)
+			if r == nil || r.state == statePurged || (visible != nil && !visible(afterName)) {
 				return notFound()
 			}
-			if err := t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND id = ?`, r.id, id[:]).Scan(&after); err != nil {
+			if err := t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND id = ?`, r.id, afterID[:]).Scan(&after); err != nil {
 				return notFound()
 			}
 		}

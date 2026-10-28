@@ -770,6 +770,12 @@ func parseBlobType(ct string) (string, bool) {
 	return mt, blobTypeRe.MatchString(mt)
 }
 
+// preconditionSent is the 428 of an upload or copy that sent a
+// precondition, which neither takes (§7.8).
+func preconditionSent() *Error {
+	return apiErr(428, "precondition_required", "message", "an upload or copy takes no precondition (§7.8)")
+}
+
 // parseBlobURL parses a Blob-From value, /r/{ns}/{name}/blob/{bid}.
 func parseBlobURL(s string) (ns, name string, bid ids.ID, ok bool) {
 	parts := strings.Split(s, "/")
@@ -866,14 +872,18 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 	}
 	size := up.Length
 	if up.From != "" {
-		// A copy: a body or an unparseable Blob-From is 400, before any
-		// body is read; then the same bid; then the source as a read.
+		// A copy: a body or an unparseable Blob-From is 400, then a
+		// precondition 428, before any body is read; then the same bid
+		// (422); then the source as a read (404) (§7.8 Copying).
 		if up.HasBody {
 			return nil, badInput("a copy has an empty body")
 		}
 		sns, sname, sbid, ok := parseBlobURL(up.From)
 		if !ok {
 			return nil, badInput("Blob-From must be /r/{ns}/{name}/blob/{bid}")
+		}
+		if up.Precondition {
+			return nil, preconditionSent()
 		}
 		if sbid != bid {
 			return nil, apiErr(422, "blob", "message", "Blob-From must name the same blob id")
@@ -895,10 +905,11 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 		}
 		g.typ, g.nonce = typ, up.Nonce
 	}
-	// An upload takes no precondition: one sent is 428 at check 4, for a
-	// copy after its source checks (§7.2, §7.8, §12.1).
+	// An upload takes no precondition: one sent is 428 at check 4, after
+	// its 400s and before the E3 415 (§7.2, §7.8, §12.1); a copy's came
+	// above, before its bid and source checks.
 	if up.Precondition {
-		return nil, apiErr(428, "precondition_required", "message", "an upload or copy takes no precondition (§7.8)")
+		return nil, preconditionSent()
 	}
 	if cfg.level == levelE2E && g.typ != SealedBlobType {
 		return nil, apiErr(415, "unsupported_type", "message", "an e2e namespace accepts only "+SealedBlobType+" blobs (§E.3.1)")
