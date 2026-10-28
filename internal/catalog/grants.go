@@ -1899,8 +1899,9 @@ func inPlaceList(doc map[string]any, cat string, subs map[string]bool) bool {
 // parents as decided, which the answer gives as parents (a rule on
 // /patches/0), so it moves the node only from where it was judged: a
 // stale test fails at step 3, a missing or different one the rule. The
-// answer gives the node's head as decided too, and the grant expires
-// within the catalog's maxLag of the decision (§B.11.8).
+// answer gives the node's parents and head as decided, for admins too
+// (§B.11.4 checkpoint), and the grant expires within the catalog's
+// maxLag of the decision (§B.11.8).
 func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, req Request) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	name, ok := tree.Resolve(cat, node)
@@ -1990,8 +1991,11 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 				}
 				return
 			}
-			parents = n.RawParents()
 		}
+		// The answer gives the node's parents as decided for every Move,
+		// an admin's included (§B.11.4 checkpoint); only a non-admin's
+		// grant requires the leading test of them.
+		parents = n.RawParents()
 		head = n.Head
 		// Decided now, at this checkpoint: the grant lives at most the
 		// catalog's maxLag, as of the checkpoint, from here (§B.11.8, §7.4).
@@ -2187,7 +2191,7 @@ func (s *Service) widens(g *tree.Graph, name string, tos []string, incs map[stri
 // non-admin's root or hidden parent (organising.leaves). The grant fixes
 // /doc/parents, the document being deleted, to exactly the parents
 // checked, by href, so the node can't be moved first; the answer gives
-// the node's head as decided.
+// the node's parents and head as decided (§B.11.4 checkpoint).
 func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node string) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	name, ok := tree.Resolve(cat, node)
@@ -2203,6 +2207,7 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 		cp         string
 		checkpoint map[string]string
 		hrefs      []string
+		parents    any
 		head       string
 	)
 	defer func() { err = decidedAt(err, checkpoint) }()
@@ -2233,7 +2238,7 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 				return
 			}
 		}
-		head = n.Head
+		parents, head = n.RawParents(), n.Head
 	})
 	if err != nil {
 		return nil, err
@@ -2243,7 +2248,7 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 		return nil, err
 	}
 	return &plan{ns: cat, resource: name, can: []string{"delete"}, rules: []any{resourceRule(name), parentHrefsRule(hrefs)},
-		cp: cp, checkpoint: checkpoint, key: signer, head: head}, nil
+		cp: cp, checkpoint: checkpoint, key: signer, parents: parents, head: head}, nil
 }
 
 // planRestoreNode answers a request to restore a catalog node, as
