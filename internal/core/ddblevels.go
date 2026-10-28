@@ -1,10 +1,10 @@
 package core
 
-// The reads of Addendum E's Levels and of main's later checks on
+// The reads of Addendum E's Levels and of the later v0.73 checks on
 // DynamoDB: a raise from sealed to e2e, remote branches' names, levels and
 // sources, schema rules, and the prune reads below a horizon. Raising a
-// namespace to e2e isn't built here (ddbRefusals), so no namespace on the
-// table has a raise (ddbRaiseRefused): e2eRaiseOf is nil, and the reads
+// namespace from sealed to e2e is refused here (ddbRaiseRefused), so no
+// namespace on the table has a raise: e2eRaiseOf is nil, and the reads
 // that only run for a raise answer 501.
 
 import (
@@ -20,7 +20,7 @@ import (
 )
 
 // ddbRaiseRefused refuses a config change raising a namespace to e2e,
-// which isn't built here (501): the table records no raise.
+// which this backend refuses (501): the table records no raise.
 func ddbRaiseRefused(old, cfg *Config) *Error {
 	if cfg.level == levelE2E && old.level != levelE2E {
 		return ddbUnsupported("raising a namespace to e2e")
@@ -125,12 +125,6 @@ func (r *ddbReads) remoteShadow(n *nsRow) *nsRow {
 	return nil
 }
 
-// recordedLevel: following a base's raise to e2e isn't built here.
-func (r *ddbReads) recordedLevel(bn *nsRow) int { return levelNone }
-
-// lostRemote: no remote level is recorded as lacking here.
-func (r *ddbReads) lostRemote(n *nsRow) (*nsRow, string, bool) { return nil, "", false }
-
 // remoteSourceFor: as SQL's, over the write's context (withRemoteSource).
 func (r *ddbReads) remoteSourceFor(n *nsRow, withAt bool) *remoteSourceDoc {
 	rb, err := r.s.RemoteBaseOf(r.ctx, n.name)
@@ -142,10 +136,10 @@ func (r *ddbReads) remoteSourceFor(n *nsRow, withAt bool) *remoteSourceDoc {
 	if h == nil {
 		return &remoteSourceDoc{origin: rb.Origin, ns: rb.NS, err: fmt.Errorf("not read for this write"), down: true}
 	}
-	if d := h.docs[n.id]; d != nil && (d.withAt || !withAt) {
+	if d := h.docs[n.name]; d != nil && (d.withAt || !withAt) {
 		return d
 	}
-	panic(&errNeedSource{branch: n.id, origin: rb.Origin, ns: rb.NS, at: rb.At, withAt: withAt})
+	panic(&errNeedSource{branch: n.name, origin: rb.Origin, ns: rb.NS, at: rb.At, withAt: withAt})
 }
 
 // --- epochs ---

@@ -1,6 +1,6 @@
 package core
 
-// Engine-level tests of the DynamoDB backend (docs/DYNAMODB.md phase 1):
+// Engine-level tests of the DynamoDB backend (docs/DYNAMODB.md §13):
 // the seam's delegations, the thin gate's answers, and the 501s, end to
 // end through Open with a dynamodb:// URL against DynamoDB Local
 // (DDB_ENDPOINT; skipped without it).
@@ -16,13 +16,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
-	"github.com/middle-management/patchlog/internal/ddb"
+	"github.com/middle-management/patchlog/internal/ddbstore"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/keystore"
 )
 
 // ddbEngine opens an engine on a fresh table of DynamoDB Local, in -dev
-// mode as phase 1 requires.
+// mode, so writes need no grants.
 func ddbEngine(t *testing.T) *Engine {
 	t.Helper()
 	endpoint := os.Getenv("DDB_ENDPOINT")
@@ -30,10 +30,10 @@ func ddbEngine(t *testing.T) *Engine {
 		t.Skip("DDB_ENDPOINT not set: skipping DynamoDB Local integration test")
 	}
 	url := fmt.Sprintf("dynamodb://coretest-%d?region=us-east-1&endpoint=%s", time.Now().UnixNano(), endpoint)
-	if err := ddb.CreateTable(context.Background(), url); err != nil {
+	if err := ddbstore.CreateTable(context.Background(), url); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ddb.DeleteTable(context.Background(), url) })
+	t.Cleanup(func() { ddbstore.DeleteTable(context.Background(), url) })
 	e, err := Open(Options{
 		Path:         url,
 		AuthDisabled: true,
@@ -171,10 +171,10 @@ func TestDDBAtRest(t *testing.T) {
 		t.Fatal(err)
 	}
 	url := fmt.Sprintf("dynamodb://coretest-%d?region=us-east-1&endpoint=%s", time.Now().UnixNano(), endpoint)
-	if err := ddb.CreateTable(context.Background(), url); err != nil {
+	if err := ddbstore.CreateTable(context.Background(), url); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ddb.DeleteTable(context.Background(), url) })
+	t.Cleanup(func() { ddbstore.DeleteTable(context.Background(), url) })
 	e, err := Open(Options{Path: url, AuthDisabled: true, KeyStore: ks})
 	if err != nil {
 		t.Fatal(err)
@@ -200,11 +200,11 @@ func TestDDBAtRest(t *testing.T) {
 	if err != nil || cur.Status != 201 {
 		t.Fatalf("raising later: %+v %v", cur, err)
 	}
-	be := e.be.(*ddbBackend)
+	store := e.be.(*ddbBackend).store.(*ddbstore.Store)
 	for _, ns := range []string{"enc", "later"} {
 		n := 0
-		out, qerr := be.store.Client.Query(ctx, &dynamodb.QueryInput{
-			TableName:                 &be.store.Table,
+		out, qerr := store.Client.Query(ctx, &dynamodb.QueryInput{
+			TableName:                 &store.Table,
 			KeyConditionExpression:    strptrT("PK = :pk"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberS{Value: "NS#" + ns}},
 		})

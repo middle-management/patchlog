@@ -1,13 +1,13 @@
 # A DynamoDB backend — design exploration
 
-Status: exploration on branch `dynamodb`, off `main` (v0.22.x). Phase 1 is
-spiked and green in [internal/ddb](../internal/ddb) (keys, namespace
-create, the single-resource write transaction, head and log reads, against
-DynamoDB Local); its findings are folded into §3, §11 and §12 and listed
-in its README. The rest of this document stands as written: it maps what a
-DynamoDB storage backend for the core (`internal/core`) would have to do,
-proposes a concrete table and key design, and names the hard problems
-before any code commits to them.
+Status: implemented on branch `dynamodb` for one instance — the full
+API of the SQL backends but the gaps §13 lists, the store in
+[internal/ddbstore](../internal/ddbstore) behind the
+contract of `internal/ddb`, the backend in `internal/core/ddb*.go`
+(§13). Sections 1–12 are the design as it was explored before the code,
+from a first spike whose findings are folded into §3, §11 and §12; they
+stand as written, as the reasoning behind the code. What changed in the
+building is §13.
 
 References are to the code on this branch: `internal/core/db.go` (SQLite
 schema, Addendum D.2), `internal/core/pgschema.go` and `pglock.go` (D.8),
@@ -476,18 +476,17 @@ large patch sets and documents (§3).
   the spike: first page `begins_with`, later pages `SK > cursor` stopping
   at the prefix boundary.
 
-## 13. Status: phase 1 integrated
+## 13. Status: integrated
 
-Phase 1 of §10's path C is implemented and wired in, behind the `-db`
-URL scheme:
+§10's path C is implemented and wired in, behind the `-db` URL scheme:
 
 ```sh
 patchlog -db 'dynamodb://patchlog?region=eu-west-1'          # AWS
-patchlog -db 'dynamodb://spike?region=us-east-1&endpoint=http://localhost:8000'
+patchlog -db 'dynamodb://patchlog?region=us-east-1&endpoint=http://localhost:8000'
 ```
 
 The table is pre-created (PAY_PER_REQUEST is fine) with the key schema of
-§3 and GSI1 (`G1PK`, project ALL); phase 1 does not create it for you.
+§3 and GSI1 (`G1PK`, project ALL); the server does not create it for you.
 
 What landed, beyond the spike:
 
@@ -505,7 +504,7 @@ What landed, beyond the spike:
   are the reads', not hand-written checks. `gate_test.go` guards the
   embedding that makes this work on SQL (a read missing on `*tx` would
   compile and recurse).
-- **The store commits the gate's decision** (`internal/ddb/commit.go`):
+- **The store commits the gate's decision** (`internal/ddbstore/commit.go`):
   `ddb.Commit` — the items' steps on the heads the checks read (so
   multi-step items work), an optional config change, the namespace entry
   — as one `TransactWriteItems`, conditioned on every item's head and on
@@ -579,17 +578,20 @@ What landed, beyond the spike:
 - **The backend interface** (`internal/core/backend.go`). The Engine
   holds its storage as a `backend`: the gate's reads (`gateRead`), the
   commits of writes, config writes and uploads, the blob sweeps and
-  statistics, ping, close, and `lacks(feature)`. `sqlBackend` implements
+  statistics, ping and close. `sqlBackend` implements
   it with the existing transactions; `ddbBackend` (`ddb.go`) with the
   table, registering itself for `dynamodb://` paths (`registerBackend`),
   so core proper names neither the store nor its package. `checkReads`
   is grouped by what it reads (namespaces, configurations, the log,
-  resources, grants, blobs, schemas, branches, sealed). A feature the
-  backend lacks is its `lacks` 501, asked by the Engine method before
-  anything else; everything the server can reach so answers 501 rather
-  than falling through to SQL. What remains refused is the SQL write
-  path's hooks (at Open) and mirroring a schema revision a remote base
-  pruned.
+  resources, grants, blobs, schemas, branches, sealed). A read the
+  backend can't answer panics with a 501 from inside the gate, so
+  everything the server can reach answers 501 rather than falling
+  through to SQL. What remains refused is the SQL write path's hooks (at
+  Open), mirroring a schema revision a remote base pruned, raising a
+  namespace from sealed to e2e (Addendum E Levels: `ddbRaiseRefused`,
+  so no namespace on the table has a raise and the pre-raise reads
+  answer 501), and a value larger than DynamoDB's 400 KB item, which
+  the design moves to S3 (§3) and the store doesn't yet.
 - **One read path.** The serving reads (`ResourceHead/Raw/Rev/Log`,
   `NamespaceHead/Rev/Log/Heads`, the events and the long-poll) are the
   SQL path's own code on the gate, as the writes' checks are, over a few
@@ -772,8 +774,8 @@ What landed, beyond the spike:
   sealings.
 - **E2E namespaces** (§E.3). The gate's checks (sealed ops, kids,
   declared blobs, the keyring, blind rules) and the keys relay are the
-  SQL path's, over the reads `e2eEpochOK`, `declaredAt`, `e2eSnapshot`
-  and `e2eFoldSince`. An epoch's start is an `EPOCHKEY#` item without
+  SQL path's, over the reads `declaredAt`, `e2eSnapshot` and
+  `e2eFoldSince`. An epoch's start is an `EPOCHKEY#` item without
   a key, written by the commit that begins it, as a sealed one's. An
   e2e revision keeps its sealed patch set and its declared blobs (REV
   `declared`, standing in for `blob_refs`), and its resource no head
@@ -781,7 +783,19 @@ What landed, beyond the spike:
   `pruneToE2E`) archives first and records the client-sealed snapshot
   (`E2ESNAP#`) in its commit; the patch sets below, earlier snapshots
   and the attachments no declared list keeps go after it.
-- **Group commit (§4, phase 2).** `internal/ddb/group.go`, on with
+- **Due rotations and remote levels** (§E.2.4, §G.5.2). A config
+  change that revokes access under `-rotate-on-revoke` records a
+  rotation due for the namespace and the sealed branches it reaches in
+  its own transaction (`Commit.RotationsDue`, `#ROTDUE` items); a commit
+  beginning an epoch clears its namespace's, and `RetryRotations`
+  retries the rest. Following a remote base's config changes raises a
+  remote branch's level and restricts its read as SQL's `followConfig`
+  does, by config writes of the server's own (`serverConfig`,
+  `writeConfigAs`), one namespace at a time, leaves first; a raise it
+  can't follow is a `#REMLEVEL` item (`RemoteLevels`), and one this
+  server lacks a key store for makes what the branch read through
+  answer 502 upstream (`lostRemote`).
+- **Group commit (§4, phase 2).** `internal/ddbstore/group.go`, on with
   `-group-commit` (default 32) as on Postgres: each write is checked on
   its own, then its commit queues; a worker per namespace takes the
   queued commits that fit one transaction (distinct resources, one
@@ -826,37 +840,49 @@ differently are its **known divergences**,
 `internal/testenv/known_dynamodb.txt`, each with the failure seen,
 skipped until fixed (`PATCHLOG_TEST_KNOWN=run` runs them) — the
 backend's to-do list. At the time of writing, of the repository's
-1,320 top-level tests (pure unit tests included): 1,278 pass on
-DynamoDB and 42 skip — 5 as unsupported (the SQL write path's hooks),
-the rest on their own conditions (Postgres-only tests, mostly).
-The known list is empty: no test answers differently from the SQL
-backends. A test that skips partway has asserted everything before
-its skip, so the covered surface reaches beyond the 1,278.
+2,093 top-level tests (pure unit tests included): 2,008 pass on
+DynamoDB and 85 skip — 37 as unsupported (30 raising a namespace to
+e2e or mirroring a base raised to it, 6 the SQL write path's hooks, 1 a
+value over the 400 KB item), the rest on their own conditions
+(Postgres-only tests, mostly). The known list is empty: no test answers
+differently from the SQL backends. A test that skips partway has
+asserted everything before its skip, so the covered surface reaches
+beyond the 2,008.
 
-`internal/ddb`'s and `internal/core/ddb_test.go`'s own tests (the store's
+`internal/ddbstore`'s and `internal/core/ddb_test.go`'s own tests (the store's
 transactions, races and group commit; the engine seam) stay gated on
 `DDB_ENDPOINT`, and the full suite passes with and without it — the SQL
-backends are untouched when `e.ddb` is nil.
+backends don't reach the DynamoDB backend's code.
 
 ### Toward a separate module
 
-The goal is a core that doesn't import the AWS SDK: the DynamoDB backend
-becomes its own Go module, which a build links in to serve
-`dynamodb://`. Until then the work keeps to the shape that move needs:
+The goal is a core that doesn't import the AWS SDK, so the DynamoDB
+store can be a module a build links in to serve `dynamodb://`. Done:
 
-- AWS-specific code lives only in `internal/ddb`, `internal/s3blobs`
+- `internal/ddb` is the contract and imports no AWS package: the
+  `Store` interface core's backend calls, the data its methods take and
+  return (`Commit`, `RevInfo`, the row types), the errors (`Error`,
+  `ErrStale`, `PrunedError`) and limits, and a registry: `ddb.Open`
+  opens a `dynamodb://` URL with the store registered (`ddb.Register`),
+  and says so when none is linked in.
+- `internal/ddbstore` is the store, the only AWS code: the table's keys
+  and items, the transactions, the reads. It registers itself in its
+  `init`; `cmd/patchlog` and `internal/testenv` import it, and
+  `internal/core` and `internal/server` don't (`go list -deps` shows no
+  AWS package). Its code names the contract's types through aliases.
+- Core's adapter (`internal/core/ddb*.go`) stays in core: it is the gate's
+  reads and commits over `ddb.Store`, and it needs core's unexported
+  gate, rows and caches, which a package outside core would make core
+  export wholesale.
+- Blob bytes in S3 are AWS code too, outside both: `internal/s3blobs`
   (which, like `internal/fsblobs`, doesn't import core: it satisfies
-  `core.BlobStore` with standard library types, and `internal/blobstores`
-  opens either from a URL) and core's adapter files (`ddb.go`,
-  `ddbreads.go`, `ddbwrite.go`, `ddbblobs.go`); the rest of core depends
-  on the `backend` interface and the gate's `checkReads`, and refers to
-  neither the adapter nor `internal/ddb` nor any blob store (done:
-  `registerBackend` replaced Open's branch, `backend` the Engine's
-  dispatches).
-- The move takes the adapter files into the module, so core exports what
-  they use: `backend`, `registerBackend` and `checkReads` (with the row
-  types it returns, or narrower ones), the gate's entry points
-  (`checkItems`, `planConfig`, `planCreate`, `gateBlob`, the readers),
-  the write plan, the read cache's bracket (`rc.begin`, `invalidate`),
-  and the error shape.
+  `core.BlobStore` with standard library types), opened from a URL by
+  `internal/blobstores`, which `cmd/patchlog` and `internal/testenv`
+  import. Core refers to no blob store.
 
+What a `go.mod` of its own for `internal/ddbstore` still has to decide
+is where the binary that serves `dynamodb://` lives: while
+`cmd/patchlog` and `internal/testenv` import the store, the main
+module requires it, and with it the AWS SDK. Moving that import into a
+binary of the store's module (and DynamoDB test runs with it) keeps the
+SDK out of the main module's requirements.

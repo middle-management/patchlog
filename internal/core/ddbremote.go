@@ -271,7 +271,7 @@ type shadowHead struct {
 func (b *ddbBackend) shadowImport(ctx context.Context, name, read string, lv *remoteLevel, base string, baseAt uint64, heads map[*remoteRes]shadowHead, now time.Time, level int) (*ddb.ShadowImport, error) {
 	if lv.raise >= 0 {
 		// A level raised to e2e before at mirrors its pre-raise history
-		// and keys (Addendum E Levels), which isn't built here.
+		// and keys (Addendum E Levels), which this backend doesn't mirror.
 		return nil, ddbUnsupported("mirroring a base raised to e2e")
 	}
 	cdoc := map[string]any{"read": read}
@@ -726,20 +726,24 @@ func (b *ddbBackend) remoteBases(ctx context.Context, name string) ([]*remoteBas
 	return out, nil
 }
 
-// followed is sqlFollowed on DynamoDB: each purge's notice, the purge
-// applied to the branch as one in it would be (propagatePurge: its own
-// entry, its branches', and the shadows' copies), then the checkpoint,
-// moved from the one read — a follow that finds it moved does nothing.
-//
-// The base's config changes (docs) and the catch-up aren't followed here
-// yet: levels and epochs a base raises to stay as at creation.
+// followed is sqlFollowed on DynamoDB: the catch-up and each config
+// change's epoch, level and read (followEpoch, followConfig); then each
+// purge's notice, the purge applied to the branch as one in it would be
+// (propagatePurge: its own entry, its branches', and the shadows'
+// copies), then the checkpoint, moved from the one read — a follow that
+// finds it moved does nothing.
 func (b *ddbBackend) followed(ctx context.Context, rb *remoteBase, entries []client.NSEntry, head string, docs map[string]sourceDoc, catchUp *sourceDoc, catchErr error) error {
 	// The epochs the base's config changes began, in the shadow mirroring
 	// it, at the entries' times (followEpoch).
+	// Then each config change's level and read (followConfig).
 	var errs []error
+	if catchUp != nil {
+		errs = append(errs, b.followConfig(ctx, rb.branchName, rb.checkpoint, *catchUp))
+	}
 	for _, en := range entries {
 		if d, ok := docs[en.ID]; ok {
-			errs = append(errs, b.followEpoch(ctx, shadowName(rb.branchName), d, parseCreated(en.Created, b.e.now())))
+			errs = append(errs, b.followEpoch(ctx, shadowName(rb.branchName), d, parseCreated(en.Created, b.e.now())),
+				b.followConfig(ctx, rb.branchName, en.ID, d))
 		}
 	}
 	return errors.Join(append(errs, b.followPurges(ctx, rb, entries, head), catchErr)...)
@@ -833,10 +837,17 @@ func (b *ddbBackend) followPurges(ctx context.Context, rb *remoteBase, entries [
 // (purgeResource of nsops.go): entries recording no grant, the shadows'
 // copies with them.
 func (b *ddbBackend) purgeAsServer(ctx context.Context, ns, name, author string) error {
-	for _, br := range append([]string{ns}, b.branchNames(ctx, ns)...) {
-		if err := b.propagatePurge(ctx, br, name, author, false); err != nil {
+	all := append([]string{ns}, b.branchNames(ctx, ns)...)
+	reach, err := newDDBReads(b, ctx).purgeReach(all, name)
+	if err != nil {
+		return err
+	}
+	for _, bp := range reach {
+		if err := b.propagatePurge(ctx, bp, name, author, false); err != nil {
 			return err
 		}
+	}
+	for _, br := range all {
 		if err := b.purgeShadows(ctx, br, name); err != nil {
 			return err
 		}

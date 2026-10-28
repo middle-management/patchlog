@@ -117,6 +117,11 @@ func (b *ddbBackend) writeItems1(ctx context.Context, req Request, items []Item,
 			}
 		}
 		c.Repurge = b.repurgeOf(g.now, tags)
+		if p.cplan != nil && b.revokes(old, cfg) {
+			if c.RotationsDue, err = b.rotationReach(g, p.n); err != nil {
+				return nil, err
+			}
+		}
 		cres, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
 			continue
@@ -321,6 +326,13 @@ func (b *ddbBackend) writeConfig(ctx context.Context, req Request, cc ConfigChan
 }
 
 func (b *ddbBackend) writeConfig1(ctx context.Context, req Request, cc ConfigChange) (res *WriteResult, err error) {
+	return b.writeConfigAs(ctx, req, cc, nil)
+}
+
+// writeConfigAs is writeConfig1 by server, when set: a config write of
+// this deployment's own (serverConfig of remote_branch.go), checked as one
+// under a * key is.
+func (b *ddbBackend) writeConfigAs(ctx context.Context, req Request, cc ConfigChange, server *actor) (res *WriteResult, err error) {
 	e := b.e
 	ctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
@@ -340,13 +352,18 @@ func (b *ddbBackend) writeConfig1(ctx context.Context, req Request, cc ConfigCha
 				return planned{err: g.absentNS(req.NS, req.Cred)}
 			}
 			cur := g.config(n.configSeq)
-			a, aerr := g.authenticate(n.name, n, cur, req.Cred, nil)
-			if aerr != nil {
-				return planned{err: aerr}
-			}
-			g.reqCreds = req.anyCreds()
-			if err := checkConfigGestures(&cc); err != nil {
-				return planned{err: err}
+			a := server
+			if a == nil {
+				var aerr *Error
+				if a, aerr = g.authenticate(n.name, n, cur, req.Cred, nil); aerr != nil {
+					return planned{err: aerr}
+				}
+				g.reqCreds = req.anyCreds()
+				if err := checkConfigGestures(&cc); err != nil {
+					return planned{err: err}
+				}
+			} else {
+				cc.IfMatch = g.configID(n.configSeq).String()
 			}
 			p, err := g.planConfig(n, cur, a, &cc, false)
 			return planned{n, cur, a, p, err}
@@ -385,6 +402,11 @@ func (b *ddbBackend) writeConfig1(ctx context.Context, req Request, cc ConfigCha
 			tags = append(tags, "ns:"+req.NS)
 		}
 		c.Repurge = b.repurgeOf(g.now, tags)
+		if b.revokes(out.cur, p.cfg) {
+			if c.RotationsDue, err = b.rotationReach(g, n); err != nil {
+				return nil, err
+			}
+		}
 		cres, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
 			continue
@@ -417,11 +439,12 @@ func (b *ddbBackend) createNamespace(ctx context.Context, req Request, cc Config
 	}
 	out, perr := ddbCheck(func() planned {
 		if n := g.nsForWrite(req.NS); n != nil {
-			// The name is taken (writeConfig): 412 to whoever may know.
+			// The name is taken, also by a purged namespace (writeConfig):
+			// 412 without config to whoever may know.
 			if err := g.authorizeTaken(n, req); err != nil {
 				return planned{err: err}
 			}
-			return planned{err: apiErr(412, "stale", "config", g.configID(n.configSeq).String())}
+			return planned{err: apiErr(412, "stale", "message", "the name is taken")}
 		}
 		a, _, cfg, err := g.planCreate(req, cc)
 		if err == nil {

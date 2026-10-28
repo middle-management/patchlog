@@ -1930,9 +1930,11 @@ func (t *tx) purgeShadowNS(sh *nsRow) {
 type remoteSourcesKey struct{}
 
 // remoteSources are the base documents read for one write, by the remote
-// branch's ns.
+// branch's name: they outlive the check that asked for them, so they are
+// keyed by what every retry names the same, not a row id (on DynamoDB, a
+// check's handle).
 type remoteSources struct {
-	docs map[int64]*remoteSourceDoc
+	docs map[string]*remoteSourceDoc
 }
 
 // remoteSourceDoc is a remote branch's base's current namespace document,
@@ -1953,7 +1955,7 @@ type remoteSourceDoc struct {
 // errNeedSource rolls back a write that needs the current namespace
 // document of the base of remote branch branch (remoteSourceFor).
 type errNeedSource struct {
-	branch         int64
+	branch         string // the remote branch's name
 	origin, ns, at string
 	withAt         bool
 }
@@ -1967,7 +1969,7 @@ func (e *errNeedSource) Error() string {
 // of f finds missing is read from the base, outside any transaction, and f
 // runs again.
 func (e *Engine) withRemoteSource(ctx context.Context, f func(context.Context) error) error {
-	h := &remoteSources{docs: map[int64]*remoteSourceDoc{}}
+	h := &remoteSources{docs: map[string]*remoteSourceDoc{}}
 	ctx = context.WithValue(ctx, remoteSourcesKey{}, h)
 	for tries := 0; ; tries++ {
 		err := f(ctx)
@@ -2023,10 +2025,10 @@ func (t *tx) remoteSourceFor(n *nsRow, withAt bool) *remoteSourceDoc {
 	if h == nil {
 		return &remoteSourceDoc{origin: origin, ns: ns, err: errors.New("not read for this write"), down: true}
 	}
-	if d := h.docs[n.id]; d != nil && (d.withAt || !withAt) {
+	if d := h.docs[n.name]; d != nil && (d.withAt || !withAt) {
 		return d
 	}
-	panic(&errNeedSource{branch: n.id, origin: origin, ns: ns, at: at, withAt: withAt})
+	panic(&errNeedSource{branch: n.name, origin: origin, ns: ns, at: at, withAt: withAt})
 }
 
 // checkRemoteSource is the §7.4 validation of remote branch n's namespace
@@ -2183,9 +2185,11 @@ type RemoteLevel struct {
 // RemoteLevels lists the remote branches ("" = all) whose base's level is
 // above their own.
 func (e *Engine) RemoteLevels(ctx context.Context, ns string) ([]RemoteLevel, error) {
-	if err := e.be.lacks("following a remote base's level"); err != nil {
-		return nil, err
-	}
+	return e.be.remoteLevels(ctx, ns)
+}
+
+// sqlRemoteLevels is RemoteLevels on SQL.
+func (e *Engine) sqlRemoteLevels(ctx context.Context, ns string) ([]RemoteLevel, error) {
 	var out []RemoteLevel
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT n.name, l.level, l.lacks, l.rebase, l.id, l.created FROM remote_levels l JOIN namespaces n ON n.ns = l.branch
@@ -2626,9 +2630,11 @@ func sealedAt(ctx context.Context, ep RemoteEndpoint, baseURL, path string) bool
 // the base names, which isn't verified. The checkpoint stays: nothing else
 // of the log is followed.
 func (e *Engine) followSealed(ctx context.Context, b *remoteBase, head string) error {
-	if e.be.lacks("following a remote base's level") != nil {
-		return nil // the backend follows purges only
-	}
+	return e.be.followSealed(ctx, b, head)
+}
+
+// sqlFollowSealed is followSealed on SQL.
+func (e *Engine) sqlFollowSealed(ctx context.Context, b *remoteBase, head string) error {
 	return e.update(ctx, func(t *tx) error {
 		bn := t.nsByIDLocked(b.branch, lockExclusive)
 		if !bn.purged {

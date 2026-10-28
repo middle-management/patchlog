@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
@@ -196,9 +197,55 @@ func (r *ddbReads) epochStarts(table string, ns int64, max int) []epochStart {
 	return out
 }
 
-// rotationDue: the table records no due rotations yet; a rotation after a
-// revocation runs as it did before (rotations_due of sealed.go).
-func (r *ddbReads) rotationDue(n *nsRow) bool { return true }
+// rotationDue: n's #ROTDUE item (ddb/rotations.go).
+func (r *ddbReads) rotationDue(n *nsRow) bool {
+	due, err := r.s.RotationDue(r.ctx, r.nsName(n.id))
+	r.must(err)
+	return due
+}
+
+// rotationReach lists the namespaces a revocation in n reaches, each to
+// rotate: n and the sealed branches below it (markRotationDue of
+// sealed.go), recorded with the revocation's commit.
+func (b *ddbBackend) rotationReach(g *gate, n *nsRow) ([]string, error) {
+	return ddbCheck(func() []string {
+		var out []string
+		var walk func(*nsRow)
+		walk = func(x *nsRow) {
+			if g.isSealedNS(x) {
+				out = append(out, x.name)
+			}
+			for _, br := range g.allBranchesOf(x) {
+				walk(br)
+			}
+		}
+		walk(n)
+		return out
+	})
+}
+
+func (b *ddbBackend) rotationsDue(ctx context.Context) ([]string, error) {
+	out, err := b.store.RotationsDue(ctx)
+	if err != nil {
+		return nil, ddbAsErr(err)
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// dropRotation: as SQL's, nothing is left to rotate in a namespace purged
+// or no longer sealed.
+func (b *ddbBackend) dropRotation(ctx context.Context, ns string) (bool, error) {
+	r := newDDBReads(b, ctx)
+	drop, perr := ddbCheck(func() bool {
+		n := r.nsByName(ns)
+		return n == nil || n.purged || r.config(n.configSeq).level != levelSealed
+	})
+	if perr != nil || !drop {
+		return false, asErrOrNil(perr)
+	}
+	return true, asErrOrNil(b.store.ClearRotationDue(ctx, ns))
+}
 
 // --- writes ---
 

@@ -91,6 +91,15 @@ func (b *ddbBackend) purgeWith(ctx context.Context, req Request, name string, pl
 				c.Copies = append(c.Copies, cp)
 			}
 		}
+		// The branches the purge reaches, as they read name before it
+		// (purgeResource's branches first): one that sees no resource, or
+		// a purged one, records nothing.
+		var reach []branchPurge
+		if name != "" {
+			if reach, err = r.purgeReach(b.branchNames(ctx, req.NS), name); err != nil {
+				return "", err
+			}
+		}
 		res, err := b.commit(ctx, c)
 		if errors.Is(err, ddb.ErrStale) {
 			continue
@@ -105,8 +114,8 @@ func (b *ddbBackend) purgeWith(ctx context.Context, req Request, name string, pl
 		b.purgedContent(ctx, req.NS, name)
 		if name != "" {
 			// Every branch the purge reaches records its own (§8.3).
-			for _, br := range b.branchNames(ctx, req.NS) {
-				if err := b.propagatePurge(ctx, br, name, p.a.id(), p.forced); err != nil {
+			for _, bp := range reach {
+				if err := b.propagatePurge(ctx, bp, name, p.a.id(), p.forced); err != nil {
 					return "", err
 				}
 			}
@@ -158,6 +167,35 @@ func (b *ddbBackend) finishPurge(ctx context.Context, ns, name string) error {
 }
 
 // branchNames lists the unpurged branches of ns, and theirs, depth first.
+// purgeReach is what each of branches reads name at, before a purge
+// (purgeResource's branches first): one that sees no resource, or a
+// purged one, records nothing.
+func (r *ddbReads) purgeReach(branches []string, name string) ([]branchPurge, error) {
+	var reach []branchPurge
+	for _, br := range branches {
+		bn := r.nsByName(br)
+		if bn == nil || bn.purged {
+			continue
+		}
+		v, perr := ddbCheck(func() *view { return r.resolve(bn, name, nil) })
+		if perr != nil {
+			return nil, perr
+		}
+		if v.state == NotFound || v.state == Purged || v.head == nil {
+			continue
+		}
+		k := r.revs[v.head.seq].key
+		reach = append(reach, branchPurge{branch: br, headNS: k.ns, headPos: k.pos, headID: v.head.id.String()})
+	}
+	return reach, nil
+}
+
+// branchPurge is a branch a purge reaches and the head it read name at.
+type branchPurge struct {
+	branch, headNS, headID string
+	headPos                uint64
+}
+
 func (b *ddbBackend) branchNames(ctx context.Context, ns string) []string {
 	var out []string
 	var walk func(string)
@@ -179,8 +217,9 @@ func (b *ddbBackend) branchNames(ctx context.Context, ns string) []string {
 // nsops.go): the server's entry, which records no grant (§7.4), and the
 // branch's own chain purged with it if it has one. A branch reading the
 // resource through already answers 410: the base's is purged at every
-// entry.
-func (b *ddbBackend) propagatePurge(ctx context.Context, branch, name, author string, forced bool) error {
+// entry. bp is what the branch read before the base's purge.
+func (b *ddbBackend) propagatePurge(ctx context.Context, bp branchPurge, name, author string, forced bool) error {
+	branch := bp.branch
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
 		r := newDDBReads(b, ctx)
 		n := r.nsByName(branch)
@@ -191,26 +230,28 @@ func (b *ddbBackend) propagatePurge(ctx context.Context, branch, name, author st
 		if err != nil {
 			return ddbAsErr(err)
 		}
-		v, perr := ddbCheck(func() *view { return r.resolve(n, name, nil) })
-		if perr != nil {
-			return perr
-		}
-		if v.head == nil || own != nil && own.Purged {
+		if own != nil && own.Purged {
 			return nil
 		}
+		target := bp.headID
 		c := &ddb.Commit{
 			NS: branch, Author: author, Created: b.e.now().UnixMilli(),
 			CfgPos: r.cfgs[n.configSeq].pos, CfgID: r.cfgRow(n.configSeq).ID,
-			Entry: map[string]any{"resource": name, "kind": "purge", "target": v.head.id.String()}, Kind: "purge",
+			Kind: "purge",
 		}
 		if own != nil {
+			target = own.HeadID
 			c.Purge = &ddb.CommitPurge{Name: name, HeadPos: own.HeadPos, HeadID: own.HeadID}
 		} else {
-			// Read through: the branch's own item, purged on the base's
-			// head, as SQL inserts its row.
-			k := r.revs[v.head.seq].key
-			c.Purge = &ddb.CommitPurge{Name: name, HeadPos: k.pos, HeadID: v.head.id.String(), HeadNS: k.ns}
+			// Read through: the branch's own item, purged on the head it
+			// read, as SQL inserts its row.
+			hns := bp.headNS
+			if hns == branch {
+				hns = ""
+			}
+			c.Purge = &ddb.CommitPurge{Name: name, HeadPos: bp.headPos, HeadID: bp.headID, HeadNS: hns}
 		}
+		c.Entry = map[string]any{"resource": name, "kind": "purge", "target": target}
 		if forced {
 			c.Entry["forced"] = true
 		}

@@ -1,27 +1,26 @@
 package core
 
-// The DynamoDB backend (docs/DYNAMODB.md), phase 1 of §10's path C:
-// plain namespaces and local branches, one instance. ddbBackend implements the Engine's
-// backend (backend.go) for -db dynamodb:// URLs (registerBackend): the
-// gate's reads over the table (ddbreads.go), the commits of what the gate
-// decided (ddbwrite.go, ddbblobs.go). Reads and the write checks are
-// core's own code on the gate.
+// The DynamoDB backend (docs/DYNAMODB.md), §10's path C, one instance.
+// ddbBackend implements the Engine's backend (backend.go) for -db
+// dynamodb:// URLs (registerBackend): the gate's reads over the table
+// (ddbreads.go), the commits of what the gate decided (ddbwrite.go,
+// ddbblobs.go and the rest). Reads and the write checks are core's own
+// code on the gate.
 //
-// Deliberate gaps, surfaced as 501 "unsupported" (lacks, or a read that
-// panics with it): the SQL write path's hooks, and mirroring a schema
-// revision the remote base pruned. Intermediate snapshots aren't built
-// (revisions fold from the genesis, or from a pruning horizon). Grants,
-// edge grants, blobs, $schema validation and schemaReads, purges,
-// pruning, retention and archives, gestures listing, author signatures,
-// nonce-required namespaces, encryption at rest, sealed and e2e
-// namespaces, local and remote branches and their drafts and merges,
-// tombstones and restores, multi-step items and batches (§7.5, bounded by
-// the transaction's 100 actions) work.
+// Deliberate gaps, surfaced as 501 "unsupported" (ddbUnsupported, or a
+// read that panics with it): the SQL write path's hooks; mirroring a
+// schema revision the remote base pruned; raising a namespace from
+// sealed to e2e, and mirroring a base raised so (ddblevels.go); a value
+// over DynamoDB's 400 KB item (ddbAsErr). Intermediate snapshots aren't
+// kept (revisions fold from the genesis, or from a pruning horizon).
+// Everything else the SQL backends serve works here, multi-step items
+// and batches bounded by the transaction's 100 actions (§7.5).
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,7 +32,7 @@ import (
 // engine keeps of it.
 type ddbBackend struct {
 	e     *Engine
-	store *ddb.Store
+	store ddb.Store
 	cfgMu sync.Mutex
 	// byID are the configurations the gate's reads parsed, by namespace
 	// and id (ddbReads.config): a configuration never changes.
@@ -84,22 +83,30 @@ func openDDB(opt Options) (*Engine, error) {
 	if opt.BeforeWriteLock != nil || opt.BeforeCommit != nil {
 		return nil, fmt.Errorf("core: the SQL write path's hooks (BeforeWriteLock, BeforeCommit): %w (DynamoDB)", ErrUnsupported)
 	}
-	store, err := ddb.Open(context.Background(), opt.Path)
+	b := &ddbBackend{byID: map[string]*Config{}}
+	store, err := ddb.Open(context.Background(), opt.Path, ddb.Options{
+		// Group commit (docs/DYNAMODB.md §4): resource writes queue per
+		// namespace; GroupCommitWait doesn't apply — a group forms from
+		// the writes queued while the one before it commits.
+		GroupCommit: opt.GroupCommit,
+		// The engine's clock stamps what the store writes (created
+		// times), as the SQL write path's opt.Now does: Last-Modified and
+		// /heads' created are the revision's own time on the instance's
+		// clock (§7.1).
+		Now: opt.Now,
+		// What core encrypted at rest, opened for the store's own folds.
+		OpenValue: func(ctx context.Context, ns, name, kind, key, raw string) (string, error) {
+			return b.openValue(ctx, ns, name, kind, key, raw)
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
-	// Group commit (docs/DYNAMODB.md §4): resource writes queue per
-	// namespace; GroupCommitWait doesn't apply — a group forms from the
-	// writes queued while the one before it commits.
-	store.GroupCommit = opt.GroupCommit
-	// The engine's clock stamps what the store writes (created times),
-	// as the SQL write path's opt.Now does: Last-Modified and /heads'
-	// created are the revision's own time on the instance's clock (§7.1).
-	store.Now = opt.Now
+	b.store = store
 	// The deployment's batch maximum, lowered to what one transaction
 	// holds (docs/DYNAMODB.md §10): namespaces learn it from their limits,
 	// and a batch over it is §6.6's 413 itemsPerBatch, not the action cap.
-	opt.Maximums.ItemsPerBatch = min(opt.Maximums.ItemsPerBatch, ddb.MaxBatchItems)
+	opt.Maximums.ItemsPerBatch = min(opt.Maximums.ItemsPerBatch, store.MaxBatchItems())
 	opt.Limits.ItemsPerBatch = min(opt.Limits.ItemsPerBatch, opt.Maximums.ItemsPerBatch)
 	// Blob bytes go to the blob store (S3 for several instances; a
 	// directory for one), or else into their items, which bounds blobSize
@@ -129,9 +136,8 @@ func openDDB(opt Options) (*Engine, error) {
 	if e.opt.Remote.RenewBefore == 0 {
 		e.opt.Remote.RenewBefore = 7 * 24 * time.Hour
 	}
-	b := &ddbBackend{e: e, store: store, byID: map[string]*Config{}}
+	b.e = e
 	e.be = b
-	store.Open = b.openValue
 	if err := b.checkKeyStore(context.Background()); err != nil {
 		return nil, err
 	}
@@ -176,12 +182,9 @@ func (b *ddbBackend) ping(ctx context.Context) error { return b.store.Ping(ctx) 
 func (b *ddbBackend) close() error                   { return nil }
 func (b *ddbBackend) dbSystem() string               { return "aws.dynamodb" }
 
-// lacks: the features phase 1 doesn't build answer 501 (ddbUnsupported).
-func (b *ddbBackend) lacks(feature string) *Error { return ddbUnsupported(feature) }
-
 // ddbUnsupported answers for an Engine method the phase doesn't cover.
 func ddbUnsupported(what string) *Error {
-	return apiErr(501, "unsupported", "message", what+" is not implemented on the DynamoDB backend (docs/DYNAMODB.md phase 1)")
+	return apiErr(501, "unsupported", "message", what+" is not implemented on the DynamoDB backend (docs/DYNAMODB.md §13)")
 }
 
 // ddbAsErr maps the store's *ddb.Error onto *core.Error (same body
@@ -194,6 +197,11 @@ func ddbAsErr(err error) *Error {
 	var ce *Error
 	if errors.As(err, &ce) {
 		return ce
+	}
+	if strings.Contains(err.Error(), "Item size has exceeded the maximum allowed size") {
+		// Values over DynamoDB's 400 KB item limit go to S3 in the
+		// design (docs/DYNAMODB.md §3), which the store doesn't do.
+		return ddbUnsupported("a value larger than DynamoDB's 400 KB item")
 	}
 	return apiErr(500, "internal", "message", err.Error())
 }

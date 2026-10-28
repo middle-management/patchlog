@@ -982,9 +982,10 @@ func (e *Engine) rotateAfterRevoke(names []string) {
 // RotationsDue lists the namespaces whose rotation after a revocation is
 // due: recorded with the revocation, and no new epoch begun since.
 func (e *Engine) RotationsDue(ctx context.Context) ([]string, error) {
-	if e.be.lacks("recording due rotations") != nil {
-		return nil, nil // none recorded: a rotation after a revocation isn't retried
-	}
+	return e.be.rotationsDue(ctx)
+}
+
+func (e *Engine) sqlRotationsDue(ctx context.Context) ([]string, error) {
 	var out []string
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT n.name FROM rotations_due d JOIN namespaces n ON n.ns = d.ns ORDER BY n.name`)
@@ -1000,6 +1001,22 @@ func (e *Engine) RotationsDue(ctx context.Context) ([]string, error) {
 	return out, err
 }
 
+func (e *Engine) sqlDropRotation(ctx context.Context, ns string) (bool, error) {
+	var drop bool
+	if err := e.read(ctx, func(t *tx) error {
+		n := t.nsByName(ns)
+		drop = n == nil || n.purged || t.config(n.configSeq).level != levelSealed
+		return nil
+	}); err != nil || !drop {
+		return false, err
+	}
+	return true, e.update(ctx, func(t *tx) error {
+		_, err := t.Exec(`DELETE FROM rotations_due WHERE ns IN (SELECT ns FROM namespaces WHERE name = ?)`, ns)
+		t.must(err)
+		return nil
+	})
+}
+
 // RetryRotations retries the rotations RotationsDue lists and returns the
 // namespaces rotated. One whose namespace was purged, or is no longer
 // sealed, is dropped: nothing is left to rotate.
@@ -1013,22 +1030,9 @@ func (e *Engine) RetryRotations(ctx context.Context) ([]string, error) {
 		if err := e.jobStep(ctx); err != nil {
 			return done, err
 		}
-		var drop bool
-		if err := e.read(ctx, func(t *tx) error {
-			n := t.nsByName(ns)
-			drop = n == nil || n.purged || t.config(n.configSeq).level != levelSealed
-			return nil
-		}); err != nil {
+		if drop, err := e.be.dropRotation(ctx, ns); err != nil {
 			return done, err
-		}
-		if drop {
-			if err := e.update(ctx, func(t *tx) error {
-				_, err := t.Exec(`DELETE FROM rotations_due WHERE ns IN (SELECT ns FROM namespaces WHERE name = ?)`, ns)
-				t.must(err)
-				return nil
-			}); err != nil {
-				return done, err
-			}
+		} else if drop {
 			continue
 		}
 		_, rotated, err := e.be.rotateEpoch(ctx, ns, RotateAuthor, true)
