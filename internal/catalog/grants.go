@@ -960,7 +960,7 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 			if f.node != nil {
 				at = Effective(g, pl, nil)
 			}
-			if vis := s.visibilityOf(g, v); len(vis.itemRoles(vis.roles(g, ns), at, name)) == 0 {
+			if vis := s.itemVisibilityOf(v); len(vis.itemRoles(vis.roles(g, ns), at, name)) == 0 {
 				err = noRole(want, item)
 			} else {
 				err = errf(410, "gone", "%s was purged", item)
@@ -1140,7 +1140,7 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 		// A role that makes the item visible (§B.11.5), its own and the
 		// key's scope rules passing for a read of it, at its placement
 		// now and, for a deleted item, in its frozen rows too (§B.11.7).
-		vis := s.visibilityOf(g, v)
+		vis := s.itemVisibilityOf(v)
 		rr := vis.roles(g, ns)
 		seen := setOf(vis.itemRoles(rr, now, name))
 		if f.state == tree.ItemTombstoned {
@@ -1475,11 +1475,27 @@ func (s *Service) organisingAt(g *tree.Graph, v *grant.Verified, admin bool) *or
 
 // visibilityOf is the caller v's view of the catalog as §B.11.5 judges
 // visibility, at the checkpoint g reflects: that of the subject set its
-// listings are keyed by (keyedAt), for organising requests, item
-// requests' visibility answers (§B.11.4) and /read-grants alike. Call it
+// listings are keyed by (keyedAt), for organising requests and
+// /read-grants, which judge live rows of the current graph. Call it
 // under View.
 func (s *Service) visibilityOf(g *tree.Graph, v *grant.Verified) *visibility {
 	w, groups := whoOf(s.keyedAt(g, v))
+	return &visibility{s: s, who: w, groups: groups}
+}
+
+// itemVisibilityOf is the caller v's view for an item request's
+// visibility answers (§B.11.4: a role that makes the item visible,
+// §B.11.5): that of the grant's own subjects (§B.11.2), user:{sub}
+// always among them, as the roles kept are collected. A deleted item's
+// frozen rows (§B.11.7) may hold a direct entry the current graph no
+// longer names, which keyedAt would drop.
+func (s *Service) itemVisibilityOf(v *grant.Verified) *visibility {
+	subjects := make([]string, 0, len(v.Principal.Groups)+1)
+	for subj := range Subjects(v) {
+		subjects = append(subjects, subj)
+	}
+	sort.Strings(subjects)
+	w, groups := whoOf(subjects)
 	return &visibility{s: s, who: w, groups: groups}
 }
 

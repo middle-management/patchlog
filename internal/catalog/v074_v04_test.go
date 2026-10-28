@@ -208,3 +208,27 @@ func TestNoVisibleParentIsRootV074(t *testing.T) {
 		t.Errorf("unfiltered roots %v list the orphan", got)
 	}
 }
+
+// TestRestoreFrozenUserRowV074: Restore's visibility check judges the
+// item's frozen rows (§B.11.7) with the caller's own subjects (§B.11.2),
+// user:{sub} among them, not with the subject set its listings are keyed
+// by: zed's role in the frozen rows came through user:zed, a direct
+// entry no node of the current graph names any more, and at the
+// placement now zed holds the same role through a group (§B.11.4
+// Restore).
+func TestRestoreFrozenUserRowV074(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.doc("matches", "zgone", map[string]any{"title": "zgone"})
+	w.doc("cat", "matches.zgone", map[string]any{"parents": parents("rumours"), "$access": acc("user:zed", "desk")})
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	must(w.ops.Delete(ctx, "matches", "zgone", must(w.ops.Head(ctx, "matches", "zgone")).ID))
+	w.caughtUp()
+	w.patch("cat", "matches.zgone", map[string]any{"op": "replace", "path": "/$access", "value": acc("group:zgroup", "desk")})
+	w.caughtUp()
+	zed := w.caller("user:zed", "zgroup", "catalog-admins")
+	w.issue(zed, map[string]any{"item": "/r/matches/zgone", "want": toAny("restore")}, 200)
+}
