@@ -715,11 +715,12 @@ func (t *tx) epochNow(b *nsRow) int {
 // block has nbf, or authentication is disabled, the epoch b has in force
 // now (epochNow), so none once b has moved past its epoch at at; and no
 // more than b's historyEpochs at at before its epoch there. Those are b's
-// keyring epochs; after a raise from sealed, the epochs before it, whose
-// keys the origin gives as at E2 (preRaiseKeys), are given only where
-// preRaiseWindow gives them too, judged against b's current epoch
-// (Addendum E Levels): both windows bound them. A base at at that isn't
-// e2e gives none.
+// keyring epochs and, after a raise from sealed, the epochs before it,
+// whose keys the origin gives as at E2 (preRaiseKeys): a branch gets those
+// "for the base epochs §E.2.3 selects" (Addendum E Levels), so this rule
+// alone bounds them, not preRaiseWindow, which judges the raised
+// namespace's own grants against its current epoch and document. A base
+// at at that isn't e2e gives none.
 func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 	var cseq, created int64
 	if err := t.QueryRow(`SELECT config_seq, created FROM ns_log WHERE seq = ?`, at).Scan(&cseq, &created); err != nil {
@@ -760,7 +761,7 @@ func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 			out = append(out, x.e)
 		}
 	}
-	return t.withPreRaise(b, out, a)
+	return out
 }
 
 // preRaiseWindow lists the epochs of owner from before its raise from
@@ -769,38 +770,18 @@ func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 // current epoch (epochNow) and namespace document, of which those up to
 // the raise's, so a grant without nbf, or any request while
 // authentication is disabled, gets none, and the current historyEpochs
-// caps the rest. /keys (preRaiseKeys, through the window over every
-// epoch, or withPreRaise for a base) and the server's own key checks for
-// content from before the raise (preRaiseKeysOpen: schema resolution,
-// blob copies, a batch's local source) both take it from here, so neither
-// is looser or tighter than the other (§2.1 Protection).
+// caps the rest. Owner's own /keys (preRaiseKeys, through the window over
+// every epoch) and the server's own key checks for content from before the
+// raise read in owner (preRaiseKeysOpen: schema resolution, blob copies, a
+// batch's local source) both take it from here, so neither is looser or
+// tighter than the other (§2.1 Protection); in a branch of owner both take
+// the base epochs instead (baseEpochs, preRaiseKeyWindow).
 func (t *tx) preRaiseWindow(owner *nsRow, raise *e2eRaise, a *actor) []int {
 	cfg := *t.config(owner.configSeq)
 	cfg.Epoch = t.epochNow(owner)
 	var out []int
 	for _, e := range t.grantEpochsOf(t.keyEpochs(owner, cfg.Epoch), &cfg, a) {
 		if e <= raise.epoch {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-// withPreRaise keeps, of epochs, a window over owner's epochs, those from
-// before owner's raise from sealed only where preRaiseWindow gives them
-// to a too; epochs unchanged for an owner that wasn't raised from sealed.
-func (t *tx) withPreRaise(owner *nsRow, epochs []int, a *actor) []int {
-	r := t.e2eRaiseOf(owner)
-	if r == nil || r.level != levelSealed {
-		return epochs
-	}
-	pre := map[int]bool{}
-	for _, e := range t.preRaiseWindow(owner, r, a) {
-		pre[e] = true
-	}
-	var out []int
-	for _, e := range epochs {
-		if e > r.epoch || pre[e] {
 			out = append(out, e)
 		}
 	}

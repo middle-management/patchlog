@@ -164,3 +164,81 @@ func TestV074V01PreRaisePruneStoresSealing(t *testing.T) {
 		t.Fatalf("/rev/{H} after the prune: %v %+v, want the stored sealing", err, r)
 	}
 }
+
+// v0.74 Addendum E Levels, Branches of a raised base, and §E.2.3 At E3: a
+// branch's /keys gives the raised base's pre-raise keys "for the base
+// epochs §E.2.3 selects", which no more than the base's historyEpochs at
+// at caps, so the base lowering historyEpochs, or rotating, after the
+// branch's at withholds none of them, as it withholds none of the base's
+// keyring epochs; the raised namespace's own window still follows its
+// current epoch and document. The server's own key checks for pre-raise
+// content read through the branch (preRaiseKeysOpen: blob copies, a
+// batch's local source, schema resolution) take the same epochs.
+func TestV074V01BranchPreRaiseKeysHistoryAtAt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	e := p36NewEnv(t)
+	e.create(t, "s", map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}})
+	e.advance(time.Hour)
+	e.config(t, "s", p29Add("/encryption/epoch", 2.0))
+	e.advance(time.Hour)
+	e.config(t, "s", map[string]any{"op": "replace", "path": "/encryption", "value": map[string]any{"level": "e2e", "epoch": 3.0, "historyEpochs": 2.0}})
+	e.advance(10 * time.Minute)
+	jwk, priv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := func(name string) {
+		t.Helper()
+		if _, err := e.CreateBranch(ctx, e.star(t, "s", name), BranchRequest{Name: name, IfNoneMatch: true}); err != nil {
+			t.Fatal(err)
+		}
+		e.advance(10 * time.Minute)
+	}
+	reader := func(ns string) Credentials {
+		return e.mint(t, "user:r", []string{ns}, []string{"read"}, map[string]any{"enc": jwk, "nbf": p36T0.Add(-time.Hour).Format(time.RFC3339)})
+	}
+	keys := func(ns string) string {
+		t.Helper()
+		got, _ := p36Keys(t, e, ns, reader(ns), KeysRequest{}, priv)
+		return got
+	}
+	// z's at: epoch 3, historyEpochs 2, so from epoch 1.
+	branch("z")
+	// y's at: epoch 3, historyEpochs 1, so from epoch 2.
+	e.config(t, "s", map[string]any{"op": "replace", "path": "/encryption/historyEpochs", "value": 1.0})
+	branch("y")
+	for ns, want := range map[string]string{"s": "s#2", "z": "s#1,s#2", "y": "s#2"} {
+		if got := keys(ns); got != want {
+			t.Errorf("before the base changes: /keys of %s %q, want %q", ns, got, want)
+		}
+	}
+	// The base drops its history, then rotates: its own readers lose the
+	// pre-raise epochs, a branch's keep what the base had at at.
+	e.config(t, "s", map[string]any{"op": "replace", "path": "/encryption/historyEpochs", "value": 0.0})
+	e.advance(10 * time.Minute)
+	e.config(t, "s", map[string]any{"op": "replace", "path": "/encryption/epoch", "value": 4.0})
+	e.advance(10 * time.Minute)
+	for ns, want := range map[string]string{"s": "", "z": "s#1,s#2", "y": "s#2"} {
+		if got := keys(ns); got != want {
+			t.Errorf("after historyEpochs 0 and epoch 4: /keys of %s %q, want %q", ns, got, want)
+		}
+	}
+	if err := e.read(ctx, func(t2 *tx) error {
+		s := t2.nsByName("s")
+		p := &preRaise{m: s, raise: t2.e2eRaiseOf(s)}
+		for _, c := range []struct {
+			ns    string
+			epoch int
+			want  bool
+		}{{"s", 2, false}, {"z", 1, true}, {"z", 2, true}, {"y", 1, false}, {"y", 2, true}} {
+			n := t2.nsByName(c.ns)
+			if got := t2.preRaiseKeysOpen(n, p, "doc", map[int]bool{c.epoch: true}, []Credentials{reader(c.ns)}); got != c.want {
+				t.Errorf("pre-raise key check in %s for epoch %d: %v, want %v", c.ns, c.epoch, got, c.want)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
