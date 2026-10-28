@@ -42,3 +42,39 @@ func TestV074V01VerifiedGrantWithoutReadIs403(t *testing.T) {
 	_, r = x.keysOf("e", nil, x.grant(x.writer, "user:r", []string{"e"}, []string{"read", "append"}, map[string]any{"enc": x.readerJWK, "rules": []any{map[string]any{"op": "test", "path": "/action", "value": "append"}}}))
 	expectCode(t, r, 403, "forbidden")
 }
+
+// v0.74 §C.5.2 Refusals (GRANTS-3, Open 82): a grant's block and key
+// rules may refer to /resource in other forms where it fixes /resource,
+// and they must pass now with /resource set to each name it fixes.
+func TestV074V01EdgeGrantRulesPerFixedName(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil)
+	e := f.tenv
+	test := func(v string) map[string]any { return map[string]any{"op": "test", "path": "/resource", "value": v} }
+	not := func(r any) map[string]any { return map[string]any{"not": r} }
+	enumAB := map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"a", "b"}}}
+	issue := func(k keyPair, ns string, rules ...any) *resp {
+		return e.do(req{method: "POST", path: "/edge-grants", bearer: e.grant(k, "user:bob", []string{ns}, []string{"read"}, map[string]any{"rules": rules})})
+	}
+	r := issue(f.issuer, "sec", enumAB, not(test("c")))
+	expect(t, r, 200)
+	if got := prefixesOf(t, r); got != "/r/sec/a /r/sec/b" {
+		t.Errorf("a fixing rule beside a rule referring to /resource otherwise: %q, want /r/sec/a /r/sec/b", got)
+	}
+	// The second rule fails for b, one of the names fixed.
+	expectCode(t, issue(f.issuer, "sec", enumAB, not(test("b"))), 403, "forbidden")
+	// Without a fixing rule, such a rule is still refused.
+	expectCode(t, issue(f.issuer, "sec", not(test("c"))), 403, "forbidden")
+
+	// A key-scope rule that passes for b alone.
+	scoped := newKey("scoped")
+	entry := scoped.entry("read")
+	entry["rules"] = []any{not(test("a"))}
+	e.mkNS("kr", map[string]any{"read": "grant", "keys": []any{f.admin.entry("*"), entry}})
+	expectCode(t, issue(scoped, "kr", enumAB), 403, "forbidden")
+	r = issue(scoped, "kr", test("b"))
+	expect(t, r, 200)
+	if got := prefixesOf(t, r); got != "/r/kr/b" {
+		t.Errorf("key rule passing for the one name fixed: %q", got)
+	}
+}
