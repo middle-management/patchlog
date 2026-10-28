@@ -127,3 +127,40 @@ func TestV074V03ForeignMinStrict(t *testing.T) {
 		t.Errorf("a min of matches: %d %v", r.status, r.body)
 	}
 }
+
+// SERVICES-4 (§A.4): a redirect to another at keeps an after naming a
+// resource, applied to the new result, and drops an opaque one (a q or
+// sort query's position), starting again. A redirect to the same at, or
+// the head pointer's, passes the query on whole.
+func TestV074V03RedirectDropsOpaqueAfter(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}})
+	w.doc(t, "a1", w.match, map[string]any{"title": "word one"})
+	w.doc(t, "a2", w.match, map[string]any{"title": "word two"})
+	old := s.caughtUp("matches")
+	w.doc(t, "a3", w.match, map[string]any{"title": "word three"})
+	cur := s.caughtUp("matches")
+	if old == cur {
+		t.Fatal("the checkpoint didn't move")
+	}
+	for _, c := range []struct{ url, want string }{
+		// Opaque: q, or sort, pages by position.
+		{"/matches/at/" + old + "?after=1&limit=1&q=word", "/matches/at/" + cur + "?limit=1&q=word"},
+		{"/matches/at/" + old + "?after=1&limit=1&sort=%2Ftitle", "/matches/at/" + cur + "?limit=1&sort=%2Ftitle"},
+		// By name: kept.
+		{"/matches/at/" + old + "?after=a1&limit=1", "/matches/at/" + cur + "?after=a1&limit=1"},
+		// The head pointer names no at: the query passes whole.
+		{"/matches?after=1&limit=1&q=word", "/matches/at/" + cur + "?after=1&limit=1&q=word"},
+	} {
+		r := s.raw(c.url, "")
+		if r.status != 302 || r.header.Get("Location") != c.want {
+			t.Errorf("%s: %d %s, want %s", c.url, r.status, r.header.Get("Location"), c.want)
+		}
+	}
+	// The redirect's target answers the first page of the new result.
+	b := s.search("/matches/at/"+old+"?after=1&limit=1&q=word", "")
+	if b["at"] != cur || len(resources(b)) != 1 {
+		t.Errorf("restarted: %v", b)
+	}
+}

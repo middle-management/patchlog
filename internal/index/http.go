@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -420,7 +421,24 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	// target is the canonical URL of this query's result at an ns_id (§A.5):
 	// what redirects name, what results are kept under, and in a sealed or
 	// e2e namespace the view a result is bound to (§E.2.6).
-	target := func(id string) string { return base(a, ns) + "/at/" + id + derived.CanonicalQuery(vals, "min") }
+	targetOf := func(v url.Values, id string) string {
+		return base(a, ns) + "/at/" + id + derived.CanonicalQuery(v, "min")
+	}
+	target := func(id string) string { return targetOf(vals, id) }
+	// elsewhere is the query a redirect to another at sends (§A.4): an
+	// after naming a resource is kept, applied to the new result, and an
+	// opaque one, a position in this at's result, is dropped, starting
+	// again.
+	elsewhere := func() (url.Values, *Query) {
+		if q.ByName() || !vals.Has("after") {
+			return vals, q
+		}
+		ev := maps.Clone(vals)
+		delete(ev, "after")
+		eq := *q
+		eq.After = 0
+		return ev, &eq
+	}
 	if !ix.waitMins(ctx, q.Mins) {
 		writeBehind(w, "the index has not reached min yet")
 		return
@@ -483,12 +501,18 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// resolved as redirect, as §A.4 shows; §A.5), with the result
 		// computed there and kept, so the redirect is answered even if the
 		// checkpoint moves on before it is followed. If it can't be
-		// computed, the at URL says why.
+		// computed, the at URL says why. From an at URL to another at, an
+		// opaque after is dropped (elsewhere); the head pointer names no
+		// at, and passes the query on whole.
+		rv, rq := vals, q
+		if isAt && at != cur {
+			rv, rq = elsewhere()
+		}
 		to := cur
-		if _, _, ok := ix.kept.Get(target(cur)); !ok {
+		if _, _, ok := ix.kept.Get(targetOf(rv, cur)); !ok {
 			if info, _, err := ix.keys.Current(ctx, ns); err == nil {
 				var fe *FieldError
-				if _, got, err := ix.answer(ctx, a, ns, vals, q, info); err == nil {
+				if _, got, err := ix.answer(ctx, a, ns, rv, rq, info); err == nil {
 					to = got
 				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) {
 					ix.opt.Logf("index: query %s: %v", r.URL, err)
@@ -496,7 +520,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			}
 		}
 		setPtrHeaders()
-		redirect(w, target(to))
+		redirect(w, targetOf(rv, to))
 		return
 	}
 	if !canonical {
@@ -544,9 +568,16 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	}
 	if got != at {
 		// The checkpoint moved between the check and the read transaction;
-		// the result is kept at the new one.
+		// the result is kept at the new one, or, with an opaque after,
+		// computed there afresh without it (elsewhere).
+		rv, rq := elsewhere()
+		if len(rv) != len(vals) {
+			if _, g, err := ix.answer(ctx, a, ns, rv, rq, info); err == nil {
+				got = g
+			}
+		}
 		setPtrHeaders()
-		redirect(w, target(got))
+		redirect(w, targetOf(rv, got))
 		return
 	}
 	ix.writeStored(w, r, a, at, st)
