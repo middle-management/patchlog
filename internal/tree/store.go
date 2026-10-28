@@ -30,7 +30,10 @@ import (
 //	                                 it isn't read yet (bornVal); epoch, the epoch head is
 //	                                 served under in a sealed or e2e catalog (§E.2.6), which
 //	                                 meta "epochs" marks pending for rows from before it
-//	                                 (backfillEpochs, as for items.file's epoch)
+//	                                 (backfillEpochs, as for items.file's epoch); born_epoch,
+//	                                 the epoch the first revision is served under, which
+//	                                 seals born where it isn't epoch (§E.2.6), filled in
+//	                                 the same way
 //	edges(child, pos, parent, ord, state)
 //	                                 one row per declared parents entry (hrefs), with its state
 //	items(ns, name, state, head, title, created, file)
@@ -144,14 +147,17 @@ func (s *Service) persistNode(ctx context.Context, tx *sql.Tx, g *Graph, name st
 			access = canonJSON(n.rawAccess)
 		}
 	}
-	var epoch any
+	var epoch, bornEpoch any
 	if n.Epoch > 0 {
 		epoch = n.Epoch
 	}
+	if n.BornEpoch > 0 {
+		bornEpoch = n.BornEpoch
+	}
 	_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO nodes (href, name, kind, item, item_head, title, state, self, head, parents, access,
-		dangling, cyclic, deep, depth, item_state, born, epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		dangling, cyclic, deep, depth, item_state, born, epoch, born_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		href, name, n.Kind, item, itemHead, title, n.State, b2i(n.Self), head, parents, access,
-		dangling, b2i(n.Cyclic), b2i(n.Deep), n.Depth, n.ItemState, born, epoch)
+		dangling, b2i(n.Cyclic), b2i(n.Deep), n.Depth, n.ItemState, born, epoch, bornEpoch)
 	if err != nil {
 		return err
 	}
@@ -222,7 +228,7 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 	if err := crows.Err(); err != nil {
 		return nil, err
 	}
-	rows, err := q.QueryContext(ctx, `SELECT name, self, head, title, parents, access, state, dangling, cyclic, deep, item_state, item_head, born, epoch FROM nodes`)
+	rows, err := q.QueryContext(ctx, `SELECT name, self, head, title, parents, access, state, dangling, cyclic, deep, item_state, item_head, born, epoch, born_epoch FROM nodes`)
 	if err != nil {
 		return nil, err
 	}
@@ -235,13 +241,13 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 		dangling                sql.NullString
 		cyclic, deep, itemState int
 		itemHead, born          sql.NullString
-		epoch                   sql.NullInt64
+		epoch, bornEpoch        sql.NullInt64
 	}
 	var all []rowT
 	for rows.Next() {
 		var r rowT
 		var self int
-		if err := rows.Scan(&r.name, &self, &r.head, &r.title, &r.parents, &r.access, &r.state, &r.dangling, &r.cyclic, &r.deep, &r.itemState, &r.itemHead, &r.born, &r.epoch); err != nil {
+		if err := rows.Scan(&r.name, &self, &r.head, &r.title, &r.parents, &r.access, &r.state, &r.dangling, &r.cyclic, &r.deep, &r.itemState, &r.itemHead, &r.born, &r.epoch, &r.bornEpoch); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -270,7 +276,7 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 		}
 		n := ParseNode(g.Catalog, r.name, r.head.String, doc)
 		n.Born, n.BornUnknown = bornCol(r.born)
-		n.Epoch = int(r.epoch.Int64)
+		n.Epoch, n.BornEpoch = int(r.epoch.Int64), int(r.bornEpoch.Int64)
 		g.setExplicit(n)
 	}
 	// Deleted and purged explicit placements, before the implicit ones

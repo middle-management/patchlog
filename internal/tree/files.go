@@ -488,7 +488,9 @@ func (q *query) file(n *Node) any {
 // epoch each head is served under (§E.2.6), read from the heads as an
 // apply reads them (bornReads at a time): that of each explicit node of
 // a sealed or e2e catalog (Node.Epoch), and that of each item's file
-// metadata in a sealed namespace (FileMeta.Epoch). Until then, and for a
+// metadata in a sealed namespace (FileMeta.Epoch); and, from the first
+// entry of its log, the epoch each explicit node's born is served under
+// (Node.BornEpoch), which migration 005 marks pending again. Until then, and for a
 // head the service can't read for good (lastingKeyErr, gone or not
 // content), listings seal those values under the current epoch, as
 // earlier releases did; any other failure is returned, and the fill made
@@ -507,6 +509,8 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 	type want struct {
 		node, ns, name, head string // node for a catalog node; ns logical for an item
 		file                 *FileMeta
+		born                 bool   // the epoch of the node's born, not of its head
+		bornAt               string // that born
 	}
 	var wants []want
 	s.mu.RLock()
@@ -515,6 +519,9 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 	for name, n := range s.g.explicit {
 		if n.Epoch == 0 && n.Head != "" {
 			wants = append(wants, want{node: name, ns: catNS, name: name, head: n.Head})
+		}
+		if n.BornEpoch == 0 && n.Born != "" && n.Head != "" {
+			wants = append(wants, want{node: name, ns: catNS, name: name, head: n.Head, born: true, bornAt: n.Born})
 		}
 	}
 	s.mu.RUnlock()
@@ -573,6 +580,11 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 			ns = s.actual(w.ns)
 		}
 		eg.Go(func() error {
+			if w.born {
+				_, e, err := s.bornOf(ectx, ns, w.name, w.head)
+				epochs[i] = e
+				return err
+			}
 			doc, err := s.keys.FetchDoc(ectx, ns, w.name, w.head, nil)
 			switch {
 			case err == nil:
@@ -606,6 +618,21 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 	for i, w := range wants {
 		e := epochs[i]
 		if e <= 0 {
+			continue
+		}
+		if w.born {
+			// The born's epoch is its first revision's, whatever the head
+			// (§E.2.6): a head changed since keeps it, and Apply, which
+			// keeps a known born as it is, never reads it again. A born
+			// changed since is another revision's.
+			if n := g.explicit[w.node]; n != nil && n.Born == w.bornAt && n.BornEpoch == 0 {
+				n.BornEpoch, changed = e, true
+				if g.nodes[w.node] == n {
+					if _, err := tx.ExecContext(ctx, `UPDATE nodes SET born_epoch = ? WHERE name = ?`, e, w.node); err != nil {
+						return err
+					}
+				}
+			}
 			continue
 		}
 		if w.file == nil {

@@ -67,7 +67,9 @@ func (s *svc) atURL(path, token string) string {
 // TC-4 (§B.11.5): a visible node whose parents are all hidden is a root
 // for the reader's subject set: roots lists it, and the paths of
 // ancestors and where end at it. A node whose parents are all dangling is
-// an orphan, never a root.
+// an orphan in unfiltered listings, never a root there (§B.5); since
+// v0.74, a visible one is a root for a subject set, which sees no parent
+// of it (Open 101).
 func TestV073RootsForSubjectSet(t *testing.T) {
 	t.Parallel()
 	x, scope, whole := scopedWorld(t)
@@ -75,7 +77,7 @@ func TestV073RootsForSubjectSet(t *testing.T) {
 		t.Errorf("roots for a whole reader: %s", got)
 	}
 	bob := scope("season", "sec.derby", "lost", "derby")
-	if got := names(x.get("/cat/roots", bob)["roots"]); got != "season" {
+	if got := names(x.get("/cat/roots", bob)["roots"]); got != "lost,season" {
 		t.Errorf("roots for a reader who can't see root: %s", got)
 	}
 	b := x.get("/cat/ancestors?of=/r/sec/derby", bob)

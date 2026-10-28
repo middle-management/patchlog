@@ -15,7 +15,7 @@ import (
 
 // moveWith writes a Move grant's change: the patch set begins with the
 // test of /parents the answer gives (§B.11.4 Move), unless the answer
-// gives none (an admin's grant).
+// gives none (a node whose document has no parents member).
 func (w *world) moveWith(answer map[string]any, node string, ops ...any) error {
 	w.t.Helper()
 	ctx := context.Background()
@@ -279,8 +279,9 @@ func TestMoveChangesOtherMembersV073(t *testing.T) {
 // a test of /parents against the node's parents as decided, which the
 // answer gives as parents: a stale test fails at step 3 (422), a missing
 // or different one fails the grant's rule (403). Move and Unplace answers
-// carry head, the node's head as decided; parents goes only with a Move
-// grant that pins them (§B.11.4).
+// carry parents and head, the node's as decided; since v0.74 parents goes
+// with every Move, an admin's included, and every Unplace, not only with
+// a Move grant that pins them (§B.11.4).
 func TestMovePinsParentsV073(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -306,13 +307,18 @@ func TestMovePinsParentsV073(t *testing.T) {
 			t.Errorf("move answer without %s: %v", k, b)
 		}
 	}
-	// An admin's Move pins nothing, but gives head; Unplace gives head;
-	// Place and Create a folder give neither.
+	// An admin's Move pins nothing, but gives parents and head; Unplace
+	// gives both; Place and Create a folder give neither.
 	ab := w.issue(admin, map[string]any{"node": "matches.derby", "want": toAny("move"), "to": toAny("cup")}, 200).body
-	if _, has := ab["parents"]; has || ab["head"] != head {
+	if !reflect.DeepEqual(ab["parents"], derby.Value.(map[string]any)["parents"]) || ab["head"] != head {
 		t.Errorf("admin's move answer: %v", ab)
 	}
-	if u := w.issue(bob, map[string]any{"node": "matches.shared", "want": toAny("delete")}, 200).body; u["head"] != must(w.ops.Head(ctx, "cat", "matches.shared")).ID {
+	_, shared, err := w.ops.Load(ctx, "cat", "matches.shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := w.issue(bob, map[string]any{"node": "matches.shared", "want": toAny("delete")}, 200).body; u["head"] != must(w.ops.Head(ctx, "cat", "matches.shared")).ID ||
+		!reflect.DeepEqual(u["parents"], shared.Value.(map[string]any)["parents"]) {
 		t.Errorf("unplace answer: %v", u)
 	}
 	for _, req := range []map[string]any{
@@ -347,8 +353,8 @@ func TestMovePinsParentsV073(t *testing.T) {
 	if _, err := mc.Append(ctx, "cat", "matches.derby", now, []any{replaceParents("cup")}); !isStatus(err, 403) {
 		t.Errorf("move without the test after the node moved: %v", err)
 	}
-	// An admin's grant needs no test.
-	if err := w.moveWith(ab, "matches.derby", replaceParents("cup")); err != nil {
+	// An admin's grant needs no test, though its answer gives parents.
+	if _, err := w.core(ab["grant"].(string)).Append(ctx, "cat", "matches.derby", now, []any{replaceParents("cup")}); err != nil {
 		t.Errorf("admin's move: %v", err)
 	}
 }

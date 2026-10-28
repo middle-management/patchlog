@@ -544,13 +544,18 @@ var ops = map[string]bool{
 // its own), so the catalog is the one source of what a listing seals
 // whole. Each node's values are sealed under the epoch its head is
 // served under (Node.Epoch; the current one where that isn't known),
-// title and born alike. A g/all listing of a catalog that isn't public,
+// except a born whose revision, the node's first, is served under
+// another (Node.BornEpoch): that one is sealed in place, as a value of
+// another resource is, "born": { "sealed": JWE of { born } } under the
+// node's K_r of its epoch, pl { ns, name, view }, and left out where the
+// service can't have that epoch's key (§E.2.6). A g/all listing of a catalog that isn't public,
 // which every reader its URL admits reads whole, whose nodes' values all
 // come from one epoch, is sealed as one JWE under that epoch's key,
 // Content-Type application/jose, pl { ns, view } where view is the
 // listing's request target (/{catalog}/g/all/at/{at}/{op}?{query}, the
 // canonical form). Any other (a public catalog's, a subject set's, whose
-// readers see nodes only through roles, or one mixing epochs) is JSON in
+// readers see nodes only through roles, or one mixing epochs, a born's
+// included) is JSON in
 // which every node with a title or born carries "sealed": JWE of {
 // title?, born? } under that catalog resource's K_r of its epoch, pl {
 // ns, name, view }, in their place (§E.2.6, viewer.sealsWhole). Sealed listings are produced once per
@@ -794,7 +799,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	keyOf := func(at string) string { return listingKey(canon(at), v) }
 	keep := !perReader(op, v)
 	var cur string
-	s.View(func(g *Graph, curMap map[string]string) { cur, _ = CombinedAt(g, curMap) })
+	s.View(func(g *Graph, curMap map[string]string) { cur, _ = s.combinedAt(g, curMap) })
 	if ns := s.trustedSince(v, at, cur); ns != "" {
 		// A g/all edge grant covers every later at, but not one that
 		// includes a namespace it wasn't checked against (§B.11.5).
@@ -990,8 +995,8 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		whole = key.Epoch
 		missing := map[int]bool{}
 		s.View(func(g *Graph, curMap map[string]string) {
-			l.at, nss = CombinedAt(g, curMap)
-			cps = checkpointsOf(g, curMap)
+			l.at, nss = s.combinedAt(g, curMap)
+			cps = s.checkpointsOf(g, curMap)
 			view = derived.View{NS: cat, Target: canon(l.at)}
 			epochOf := func(name string) int {
 				if n := g.Node(name); n != nil && n.Epoch > 0 {
@@ -1003,25 +1008,40 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				more, serr = nil, nil
 				epochs := map[int]bool{}
 				q := &query{s: s, g: g, cur: curMap, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
+				// sealAt seals vals of node name under its K_r of epoch e,
+				// "" where the key isn't read yet (asked for, and the
+				// listing computed again) or can't be had (lacking).
+				sealAt := func(name string, e int, vals map[string]any) string {
+					k, ok := keys[e]
+					if !ok {
+						if !lacking[e] {
+							missing[e] = true
+						}
+						return ""
+					}
+					jwe, err := derived.SealItem(k, q.view, name, vals)
+					if err != nil && serr == nil {
+						serr = err
+					}
+					return jwe
+				}
+				if info.Protected() {
+					// A born of another epoch than its node's head is a
+					// value of a revision of that epoch (§E.2.6).
+					q.bornApart = func(n *Node) int {
+						if e := n.BornEpoch; e > 0 && e != epochOf(n.Name) {
+							return e
+						}
+						return 0
+					}
+				}
 				switch {
 				case perEntry:
-					q.sealValues = func(name string, vals map[string]any) string {
-						e := epochOf(name)
-						k, ok := keys[e]
-						if !ok {
-							if !lacking[e] {
-								missing[e] = true
-							}
-							return ""
-						}
-						jwe, err := derived.SealItem(k, q.view, name, vals)
-						if err != nil && serr == nil {
-							serr = err
-						}
-						return jwe
-					}
+					q.sealValues = func(name string, vals map[string]any) string { return sealAt(name, epochOf(name), vals) }
+					q.sealIn = sealAt
 				case info.Protected():
 					q.noteValues = func(name string) { epochs[epochOf(name)] = true }
+					q.noteEpoch = func(e int) { epochs[e] = true }
 				}
 				if op == "children" && keep {
 					// The following pages are kept with this one, each at
@@ -1171,18 +1191,27 @@ type atRecord struct {
 	exp time.Time
 }
 
-// checkpointsOf is the checkpoints CombinedAt hashes, keyed as cur is.
-func checkpointsOf(g *Graph, cur map[string]string) map[string]string {
+// checkpointsOf is the checkpoints the service's combined checkpoint
+// hashes (Service.combinedAt), keyed as cur is: purged namespaces left
+// out (§B.5). Call it under View.
+func (s *Service) checkpointsOf(g *Graph, cur map[string]string) map[string]string {
 	cps := map[string]string{}
-	if id := cur[g.Catalog]; id != "" {
+	if id := cur[g.Catalog]; id != "" && !s.purgedLocked(g.Catalog) {
 		cps[g.Catalog] = id
 	}
 	for ns := range g.Trust {
-		if id := cur[ns]; id != "" {
+		if id := cur[ns]; id != "" && !s.purgedLocked(ns) {
 			cps[ns] = id
 		}
 	}
 	return cps
+}
+
+// purgedLocked reports whether the service holds ns as purged. Call it
+// with mu held (View).
+func (s *Service) purgedLocked(ns string) bool {
+	_, ok := s.purged[ns]
+	return ok
 }
 
 // recordAt records the checkpoints behind at, a listing of which was just
@@ -1353,17 +1382,32 @@ func codeFor(status int) string {
 	return "error"
 }
 
-// CombinedAt is the service's combined checkpoint (§B.5):
+// CombinedAt is a combined checkpoint (§B.5):
 // text(trunc160(sha256(canonical({ ns: ns_id, … })))) over the catalog and
-// every content namespace it follows (catalog.trust) that the service has
-// reached, with the namespaces it covers, sorted. Call it under the graph
-// lock (View).
+// every content namespace it follows (catalog.trust) that cur has reached,
+// with the namespaces it covers, sorted. The service's own leaves out the
+// namespaces it holds as purged (Service.combinedAt). Call it under the
+// graph lock (View).
 func CombinedAt(g *Graph, cur map[string]string) (string, []string) {
+	return combinedAt(g, cur, func(string) bool { return false })
+}
+
+// combinedAt is the service's combined checkpoint, purged namespaces left
+// out (§B.5): a purge-ns entry is a namespace's last, so the at a purge
+// moves is the one it would keep forever, and listings, their ns:{ns}
+// tags, the coverage of problems and orphans and what a g/all edge grant
+// is checked against cover only namespaces that still have items. Call
+// it under View.
+func (s *Service) combinedAt(g *Graph, cur map[string]string) (string, []string) {
+	return combinedAt(g, cur, s.purgedLocked)
+}
+
+func combinedAt(g *Graph, cur map[string]string, purged func(string) bool) (string, []string) {
 	m := map[string]any{}
 	nss := []string{}
 	// In a release preview the checkpoint is over the branches (§B.5).
 	add := func(ns string) {
-		if id := cur[ns]; id != "" {
+		if id := cur[ns]; id != "" && !purged(ns) {
 			m[g.Actual(ns)] = id
 			nss = append(nss, g.Actual(ns))
 		}
@@ -1382,7 +1426,7 @@ func CombinedAt(g *Graph, cur map[string]string) (string, []string) {
 // At returns the current combined checkpoint (§B.5): the at of listings.
 func (s *Service) At() string {
 	var at string
-	s.View(func(g *Graph, cur map[string]string) { at, _ = CombinedAt(g, cur) })
+	s.View(func(g *Graph, cur map[string]string) { at, _ = s.combinedAt(g, cur) })
 	return at
 }
 
@@ -1777,6 +1821,16 @@ type query struct {
 	// sealed whole (the epochs they derive from).
 	sealValues func(name string, vals map[string]any) string
 	noteValues func(name string)
+	// bornApart, set for a sealed or e2e catalog, is the epoch an explicit
+	// node's born is served under where it isn't the one its other values
+	// are sealed under, 0 otherwise. Such a born is sealed in place, as a
+	// value of another resource is (§E.2.6): sealIn seals it per entry,
+	// under the node's K_r of that epoch ("" where the service lacks the
+	// key: left out), and noteEpoch counts its epoch for a listing sealed
+	// whole, which it then isn't.
+	bornApart func(n *Node) int
+	sealIn    func(name string, epoch int, vals map[string]any) string
+	noteEpoch func(epoch int)
 	// files says how placements carry file metadata in a file tree
 	// (§H.3), sealed under view; serr records a sealing failure.
 	files *fileSealing
@@ -1895,7 +1949,11 @@ func (q *query) entry(n *Node) map[string]any {
 		vals["title"] = n.Title
 	}
 	if n.Born != "" && !n.Self {
-		vals["born"] = n.Born
+		if e := q.bornEpoch(n); e > 0 {
+			q.bornIn(m, n, e)
+		} else {
+			vals["born"] = n.Born
+		}
 	}
 	if n.Kind == KindPlacement {
 		m["kind"] = "item"
@@ -1930,6 +1988,37 @@ func (q *query) entry(n *Node) map[string]any {
 	}
 	q.values(m, n.Name, vals)
 	return m
+}
+
+// bornEpoch is the epoch n's born is served under where it isn't that of
+// n's other values (bornApart), 0 otherwise.
+func (q *query) bornEpoch(n *Node) int {
+	if q.bornApart == nil {
+		return 0
+	}
+	return q.bornApart(n)
+}
+
+// bornIn sets n's born, a value of a revision of epoch e, another epoch
+// than its other values', on its entry m: per entry, as
+// { "sealed": JWE of { born } } in place of the value, under the catalog
+// resource's K_r of e, pl { ns, name, view }, as a value of another
+// resource is sealed, and left out where the service can't have that key
+// (§E.2.6); otherwise in the clear, its epoch counted (noteEpoch), so the
+// listing isn't sealed whole under another.
+func (q *query) bornIn(m map[string]any, n *Node, e int) {
+	if q.sealValues != nil {
+		if q.sealIn != nil {
+			if jwe := q.sealIn(n.Name, e, map[string]any{"born": n.Born}); jwe != "" {
+				m["born"] = map[string]any{"sealed": jwe}
+			}
+		}
+		return
+	}
+	if q.noteEpoch != nil {
+		q.noteEpoch(e)
+	}
+	m["born"] = n.Born
 }
 
 func (q *query) visibleChildren(parent string) []Child {
@@ -2249,10 +2338,11 @@ func nonNil(a []any) []any {
 // paths returns every walkable path from n up to a root for the viewer
 // through nodes it may see, root first, without n itself, bounded at
 // MaxDepth and maxPaths. A root for the viewer is a node without parents,
-// or a visible one whose parents are all hidden from it, where its paths
-// end (§B.11.5). incomplete counts paths that end below a root (at a node
-// whose parents are all gone, dangling or cyclic), deep those cut at
-// MaxDepth. A path through a node the viewer may not see is left out
+// or, in a subject set's listings, a visible one with no visible parent,
+// none walkable included, where its paths end (§B.11.5, rootFor).
+// incomplete counts paths that end below a root in unfiltered listings
+// (at a node whose parents are all gone, dangling or cyclic, §B.5), deep
+// those cut at MaxDepth. A path through a node the viewer may not see is left out
 // without a trace: listings show only paths through visible folders, and
 // nothing about a hidden node, not even a count (§B.11.5), so limits apply
 // to visible paths only.
@@ -2277,7 +2367,12 @@ func (q *query) paths(n *Node) (paths [][]*Node, incomplete, deep int, truncated
 		}
 		ps := q.g.WalkableParents(x)
 		if len(ps) == 0 {
-			incomplete++
+			if q.filtered() {
+				// No visible parent: x is a root for the subject set.
+				end()
+			} else {
+				incomplete++
+			}
 			return
 		}
 		var visible []*Node
@@ -2418,9 +2513,9 @@ func (q *query) subtree() (any, int, string) {
 	return body, http.StatusOK, ""
 }
 
-// roots lists the roots for the reader's subject set (§B.5, §B.11.5):
-// visible nodes without parents, and visible nodes whose parents are all
-// hidden from it.
+// roots lists the roots for the reader (§B.5, §B.11.5, rootFor): visible
+// nodes without parents, and, for a subject set, visible nodes with no
+// visible parent.
 func (q *query) roots() (any, int, string) {
 	out := []any{}
 	for _, n := range q.rootNodes() {
@@ -2441,9 +2536,10 @@ func (q *query) rootNodes() []*Node {
 }
 
 // rootFor reports whether n, visible to the viewer, is a root for it: it
-// has no parents, or every parent a walk may go up to is hidden from it
-// (§B.11.5). A node whose parents are all gone, dangling or cyclic is an
-// orphan (§B.5), not a root.
+// has no parents, or, in a subject set's listings, no parent a walk may go
+// up to is visible to it, none at all included, so a visible node whose
+// parents are all gone, dangling or cyclic is a root there too (§B.11.5).
+// In unfiltered listings such a node is an orphan (§B.5), not a root.
 func (q *query) rootFor(n *Node) bool {
 	if len(n.Parents) == 0 {
 		return true
@@ -2454,8 +2550,13 @@ func (q *query) rootFor(n *Node) bool {
 			return false
 		}
 	}
-	return len(ps) > 0
+	return len(ps) > 0 || q.filtered()
 }
+
+// filtered reports whether the listing is a subject set's, filtered by
+// what its roles make visible (§B.11.5), not an unfiltered one (g/all or
+// the public URL space), whose roots and orphans are §B.5's.
+func (q *query) filtered() bool { return !q.v.anon && q.v.gs != AllSubjects }
 
 func (q *query) parentsJSON(n *Node) []any {
 	out := []any{}
@@ -2476,11 +2577,11 @@ func (q *query) parentsJSON(n *Node) []any {
 // the combined checkpoint, sorted: what problems and orphans cover
 // (§B.11.5). One the service can't follow has no checkpoint, and shows
 // nothing in listings, as the URL spaces and g/all are judged without it
-// (Service.listed).
+// (Service.listed); nor is one it holds as purged in it (§B.5).
 func (q *query) checkpointed() []string {
 	out := make([]string, 0, len(q.g.Trust))
 	for ns := range q.g.Trust {
-		if q.cur[ns] != "" {
+		if q.cur[ns] != "" && !q.s.purgedLocked(ns) {
 			out = append(out, ns)
 		}
 	}
