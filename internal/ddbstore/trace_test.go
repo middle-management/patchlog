@@ -20,6 +20,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -103,3 +104,27 @@ func TestTracedAttempts(t *testing.T) {
 type roundTrip func(*http.Request) (*http.Response, error)
 
 func (f roundTrip) Do(r *http.Request) (*http.Response, error) { return f(r) }
+
+// Throttling the retries don't outlast is the table over its capacity:
+// a 503 asking the client to come back, not a server failure.
+func TestThrottledPastRetries(t *testing.T) {
+	client := dynamodb.New(dynamodb.Options{
+		Region:      "us-east-1",
+		Credentials: credentials.NewStaticCredentialsProvider("k", "s", ""),
+		Retryer: retry.NewStandard(func(o *retry.StandardOptions) {
+			o.MaxAttempts = 2
+			o.Backoff = retry.BackoffDelayerFunc(func(int, error) (time.Duration, error) { return 0, nil })
+		}),
+		HTTPClient: roundTrip(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 400, Header: http.Header{"Content-Type": {"application/x-amz-json-1.0"}},
+				Body:    io.NopCloser(strings.NewReader(`{"__type":"com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException","message":"slow down"}`)),
+				Request: r}, nil
+		}),
+	})
+	_, err := (tracedAPI{API: client, table: "t"}).GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName: aws.String("t"), Key: map[string]types.AttributeValue{"PK": &types.AttributeValueMemberS{Value: "a"}}})
+	var de *ddb.Error
+	if !errors.As(err, &de) || de.Status != 503 || de.RetryAfter != 1 {
+		t.Fatalf("throttled past its retries: %v, want a 503 with Retry-After 1", err)
+	}
+}

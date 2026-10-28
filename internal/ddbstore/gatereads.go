@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -387,11 +388,28 @@ func (s *Store) rangeOf(ctx context.Context, ns, prefix string, from, to uint64,
 }
 
 // EntryPos resolves ns's entry id to its position (the NSID marker,
-// UNIQUE(ns, id)); 0 when there is none.
+// UNIQUE(ns, id)); 0 when there is none. A marker not found is looked for
+// once more, shortly: an entry's transaction writes its marker and the
+// tip in different partitions, and a reader that saw the tip (a Query or
+// BatchGetItem, read-committed) may ask for the marker before it is there
+// for a GetItem (serializable), as a follower asking for the entries
+// since the head it was just shown does.
 func (s *Store) EntryPos(ctx context.Context, ns, id string) (uint64, error) {
-	it, err := s.getItem(ctx, keyNSID(ns, id))
-	if err != nil || it == nil {
-		return 0, err
+	for attempt := 0; ; attempt++ {
+		it, err := s.getItem(ctx, keyNSID(ns, id))
+		if err != nil {
+			return 0, err
+		}
+		if it != nil {
+			return item(it).n("logPos"), nil
+		}
+		if attempt == 1 {
+			return 0, nil
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(30 * time.Millisecond):
+		}
 	}
-	return item(it).n("logPos"), nil
 }

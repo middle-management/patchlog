@@ -8,7 +8,10 @@ package ddbstore
 // recorded while telemetry is off (telemetry.Instruments.Get is nil).
 //
 // A timeout inside the SDK, while the caller still waits, is DynamoDB not
-// answering (finish): a 503, logged, rather than a cancelled request.
+// answering (done): a 503, logged, rather than a cancelled request. So is
+// throttling the retryer couldn't outlast (open.go): the table is over its
+// capacity for now, and the client is asked to come back (Retry-After),
+// rather than told the server failed.
 //
 // A failed condition is the store's optimistic concurrency at work (the
 // commit finds what its checks read moved: ErrStale, checked again), not
@@ -157,6 +160,10 @@ func (c *call) done(ctx context.Context, err error) error {
 	if err != nil && ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
 		log.Printf("ddbstore: DynamoDB didn't answer: %v", err)
 		return &ddb.Error{Status: 503, Body: map[string]any{"code": "unavailable", "message": "the storage (DynamoDB) didn't answer in time"}}
+	}
+	if err != nil && (throttles.IsErrorThrottle(err).Bool() || throttledOnly(err)) {
+		log.Printf("ddbstore: DynamoDB throttled a call past its retries: %v", err)
+		return &ddb.Error{Status: 503, RetryAfter: 1, Body: map[string]any{"code": "unavailable", "message": "the storage (DynamoDB) is over its capacity for now"}}
 	}
 	return err
 }

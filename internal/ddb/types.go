@@ -81,6 +81,9 @@ type CommitBranch struct {
 type Error struct {
 	Status int
 	Body   map[string]any
+	// RetryAfter is the seconds a client should wait before trying again
+	// (Retry-After), 0 for none: DynamoDB throttling the table.
+	RetryAfter int
 }
 
 func (e *Error) Error() string { return string(jsonv.Canonical(e.Body)) }

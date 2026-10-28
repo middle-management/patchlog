@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -214,7 +215,11 @@ func ddbUnsupported(what string) *Error {
 func ddbAsErr(err error) *Error {
 	var de *ddb.Error
 	if errors.As(err, &de) {
-		return &Error{Status: de.Status, Body: de.Body}
+		e := &Error{Status: de.Status, Body: de.Body}
+		if de.RetryAfter > 0 {
+			e.Header = map[string][]string{"Retry-After": {strconv.Itoa(de.RetryAfter)}}
+		}
+		return e
 	}
 	var ce *Error
 	if errors.As(err, &ce) {
