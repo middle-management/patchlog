@@ -10,8 +10,16 @@ import (
 	"github.com/middle-management/patchlog/internal/schema"
 )
 
-// Schema rules markers (§6.1: "A schema stored under an earlier version is
-// compiled as that version did").
+// Schema rules markers: metadata only since v0.74.
+//
+// Every schema compiles under this version, whatever version stored it
+// (§6.1, SPEC-CHANGELOG v0.74 Core), so the markers below select nothing:
+// schema.Validator.ValidateMarked ignores them, a schema document is
+// checked in write mode, and each revision of a closure compiles under
+// current rules, a stored revision only an earlier version accepted being
+// an invalid schema (a write pinning it is 422 invalid). They are still
+// recorded and served, unchanged, so a database or a remote mirror keeps
+// the same rows either side of the upgrade:
 //
 // Each revision row records, in revisions.rules, the rules its document was
 // written under (schema.Rules): V073 for those written now, Legacy for a
@@ -20,37 +28,26 @@ import (
 // part of the revision id.
 //
 // A schema revision read in the clear carries its marker in
-// schema.RulesHeader (Rev.SchemaRules), so clients validating at E3 and
-// other deployments compile it as this one does. The rows a remote branch
-// mirrors from another deployment (§G.3) keep the marker the base serves
-// each schema revision with (fetchRules, F-S1), and are NULL where it
-// serves none: a base from before markers compiles every schema as
-// Legacy, and a sealed one sends none.
-//
-// A schema document's marker selects how it is checked when written (V073:
-// write mode; Legacy: the stored mode, as v0.55 checked it) and how it
-// compiles; a document typed by $schema is validated against the revision
-// it names, each revision of whose $ref closure compiles under its own
-// marker, however it is reached (schema.Validator.ValidateMarked), and
-// compiled validators are cached by path with the markers their closure
-// compiled under.
+// schema.RulesHeader (Rev.SchemaRules). The rows a remote branch mirrors
+// from another deployment (§G.3) keep the marker the base serves each
+// schema revision with (fetchRules, F-S1), and are NULL where it serves
+// none.
 //
 // A revision whose document is a schema document and whose id other rows
 // already have is a content-addressed copy of them (§3.3): a fast-forward
 // merge, a same-deployment import or a branch's replay of its base's
-// revision. It inherits their marker, Legacy if any is, so one id compiles
-// one way (F-S1). Only rows the write may take content from count: in the
-// namespace written and its local bases, and in a batch's local source,
-// read unrestricted, and its bases (copiesIn), so the marker reveals
-// nothing about namespaces the writer can't read. Anything else is new
-// content, judged by today's rules (§G.4.4): an import from another
-// deployment too, whose source marker isn't carried.
+// revision. It inherits their marker, Legacy if any is. Only rows the
+// write may take content from count: in the namespace written and its
+// local bases, and in a batch's local source, read unrestricted, and its
+// bases (copiesIn), so the marker reveals nothing about namespaces the
+// writer can't read.
 
 // validateStep is step 5 for one step (§6.1, §6.2): it fixes the rules
 // marker of the revision the step writes (docRules), which step 7 stores,
-// and validates the resulting document: a schema document under that
-// marker, any other against the schema revision it names, each revision
-// of its closure under its own marker.
+// and validates the resulting document under this version's rules (§6.1):
+// a schema document in write mode, any other against the schema revision
+// it names, each revision of its closure compiled under current rules;
+// the markers select nothing (ValidateMarked).
 func (t *tx) validateStep(step *stepState, sc *schemaCtx, pending map[string]any) (string, *Error) {
 	rules := t.docRules(step.id, step.doc, sc)
 	step.legacy = rules == schema.Legacy
@@ -223,11 +220,10 @@ func (t *tx) validateDoc(doc any, rules schema.Rules, sc *schemaCtx, pending map
 			queue = append(queue, t.schemaRefs(r, d, sc, pending)...)
 		}
 	}
-	// Each revision of the closure compiles under its own marker, wherever
-	// it is reached from: named by $schema, or through the $ref of a
-	// schema written under other rules (§6.1). Every revision was resolved
-	// above, so its marker is known (t.schemas); loading again only finds
-	// it there.
+	// Each revision of the closure compiles under this version's rules,
+	// whatever its marker (§6.1): ValidateMarked never calls rulesOf, kept
+	// for its signature. Every revision was resolved above, so its marker
+	// is known (t.schemas); loading again only finds it there.
 	rulesOf := func(r schema.Ref) schema.Rules {
 		_, _ = load(r)
 		return t.schemaRules(r, sc, pending)
@@ -588,8 +584,8 @@ func (t *tx) prefetchSchemas(refs []schema.Ref) {
 			}
 		}
 	}
-	// The heads' rules markers, which each compiles under wherever it is
-	// reached from (schemaRules).
+	// The heads' rules markers (schemaRules), metadata only since v0.74
+	// (§6.1).
 	t.prefetchRules(heads)
 }
 

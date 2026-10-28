@@ -154,8 +154,9 @@ type e2eSchemas struct {
 	drafts map[string]any  // schema revision path -> document drafted in a branch (§6.1)
 	branch map[string]bool // namespace -> is a branch
 	// rules and draftRules are the markers the server served m's and
-	// drafts' revisions with (Doc.Rules): each compiles under its own, as
-	// the core compiles it (§6.1).
+	// drafts' revisions with (Doc.Rules), metadata only since v0.74: every
+	// revision compiles under this version's rules, as the core compiles
+	// it (§6.1).
 	rules, draftRules map[string]schema.Rules
 }
 
@@ -1870,11 +1871,12 @@ func (e *errSchemaLoad) Unwrap() error { return e.err }
 // through the client. It returns a message for an invalid document, or an
 // error when a schema couldn't be fetched. A typed document validates
 // against the revision it names, each revision of whose $ref closure
-// compiles under the marker its server serves it with (Doc.Rules: Legacy
-// where it sends none), as the core validates it (§6.1). stored is for a
-// revision a fold re-validates, which is held to the rules it was written
-// under: a schema document there is checked as stored (Legacy), since its
-// own marker isn't known, so one an earlier version accepted still folds.
+// compiles under this version's rules, as the core validates it: every
+// schema compiles under this version, whatever version stored it (§6.1,
+// v0.74). The markers servers send (Doc.Rules) and stored, which a fold
+// passes for a revision it re-validates, are still handed to the
+// validator but select nothing, so a stored revision only an earlier
+// version accepted, or one typed by such a schema, is flagged.
 func (x *E2E) validate(ctx context.Context, target string, doc any, stored bool) (string, error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
