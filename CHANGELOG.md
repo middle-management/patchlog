@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.24.0
 
 Implements spec **v0.74**. `GET /` answers `"spec": "0.74"`. The upgrade was done in five
 packages: core keys, epochs, E3 gate checks and grant answers; core remote branches, reads, live
