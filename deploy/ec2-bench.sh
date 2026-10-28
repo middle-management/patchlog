@@ -180,6 +180,8 @@ for _ in \$(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8080/ && break; 
 ${READS:+READS=$READS }${LOGS:+LOGS=$LOGS }${NAMESPACES:+NAMESPACES=$NAMESPACES }./bench.sh "\$1" "\$2" || echo "bench failed: \$?"
 kill \$server; wait \$server || true
 echo; ./spans.py --sample $SAMPLE spans.jsonl
+echo; echo "server log (last 30 lines that aren't spans):"
+grep -v '^{' spans.jsonl | grep -v 'listening on\\|playground:' | tail -30
 RUN
 chmod +x run.sh
 touch ready
