@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
@@ -48,7 +49,7 @@ func patches(v string) any { return jsonv.MustParse([]byte(v)) }
 
 func mustCreateNS(t testing.TB, s *Store, ns string) (cfgID, nsID string) {
 	t.Helper()
-	cfgID, nsID, err := s.CreateNamespace(context.Background(), &Create{NS: ns, Author: "test", Patches: patches(`[{"op":"add","path":"","value":{}}]`)})
+	cfgID, nsID, err := s.CreateNamespace(context.Background(), &ddb.Create{NS: ns, Author: "test", Patches: patches(`[{"op":"add","path":"","value":{}}]`)})
 	if err != nil {
 		t.Fatalf("CreateNamespace: %v", err)
 	}
@@ -61,14 +62,14 @@ type written struct{ ID, NSID string }
 // testCommit builds the commit core's gate would for one step on name: a
 // write of patch set p, or a tombstone when p is "", on the head ifMatch
 // names ("" for a create), against the state read now.
-func testCommit(t testing.TB, s *Store, ns, name, ifMatch, p string) *Commit {
+func testCommit(t testing.TB, s *Store, ns, name, ifMatch, p string) *ddb.Commit {
 	t.Helper()
 	ctx := context.Background()
 	n, err := s.Namespace(ctx, ns)
 	if err != nil || n == nil {
 		t.Fatalf("namespace %s: %+v %v", ns, n, err)
 	}
-	it := CommitItem{Name: name}
+	it := ddb.CommitItem{Name: name}
 	res, err := s.Resource(ctx, ns, name)
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +91,7 @@ func testCommit(t testing.TB, s *Store, ns, name, ifMatch, p string) *Commit {
 		}
 		parent = &pid
 	}
-	st := CommitStep{ParentID: ifMatch}
+	st := ddb.CommitStep{ParentID: ifMatch}
 	kind := "head"
 	if p == "" {
 		st.Tombstone, kind = true, "tombstone"
@@ -104,10 +105,10 @@ func testCommit(t testing.TB, s *Store, ns, name, ifMatch, p string) *Commit {
 		}
 		st.ID, st.Patches, st.Doc = ids.Revision(parent, canon).String(), string(canon), string(jsonv.Canonical(out))
 	}
-	it.Steps = []CommitStep{st}
-	return &Commit{
+	it.Steps = []ddb.CommitStep{st}
+	return &ddb.Commit{
 		NS: ns, Author: "alice", Created: time.Now().UnixMilli(), CfgPos: n.ConfigPos, CfgID: n.ConfigID,
-		Items: []CommitItem{it}, Entry: map[string]any{"resource": name, "kind": kind, "target": st.ID}, Kind: kind,
+		Items: []ddb.CommitItem{it}, Entry: map[string]any{"resource": name, "kind": kind, "target": st.ID}, Kind: kind,
 	}
 }
 
@@ -139,8 +140,8 @@ func checkChain(t testing.TB, s *Store, ns string, want int) map[string]bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var entries []*EntryRow
-	if err := s.EntriesBetween(ctx, ns, 0, n.TipPos, 0, func(e *EntryRow) bool {
+	var entries []*ddb.EntryRow
+	if err := s.EntriesBetween(ctx, ns, 0, n.TipPos, 0, func(e *ddb.EntryRow) bool {
 		entries = append(entries, e)
 		return true
 	}); err != nil {
@@ -222,7 +223,7 @@ func testConcurrentResource(t *testing.T, group int) {
 	mustCreateNS(t, s, "demo")
 	w1 := mustWrite(t, s, "demo", "doc1", "", `[{"op":"add","path":"","value":{"a":1}}]`)
 	const racers = 6
-	cs := make([]*Commit, racers)
+	cs := make([]*ddb.Commit, racers)
 	for i := range racers {
 		cs[i] = testCommit(t, s, "demo", "doc1", w1.ID, fmt.Sprintf(`[{"op":"add","path":"/w%d","value":true}]`, i))
 	}
@@ -241,7 +242,7 @@ func testConcurrentResource(t *testing.T, group int) {
 		switch {
 		case err == nil:
 			won++
-		case errors.Is(err, ErrStale):
+		case errors.Is(err, ddb.ErrStale):
 			stale++
 		default:
 			t.Errorf("racer %d: %v", i, err)
@@ -262,15 +263,15 @@ func TestLocalConfigPinned(t *testing.T) {
 		mustCreateNS(t, s, "demo")
 		c := testCommit(t, s, "demo", "doc", "", `[{"op":"add","path":"","value":{}}]`)
 		n, _ := s.Namespace(context.Background(), "demo")
-		cfg := &Commit{
+		cfg := &ddb.Commit{
 			NS: "demo", Author: "alice", Created: time.Now().UnixMilli(), CfgPos: n.ConfigPos, CfgID: n.ConfigID,
-			Config: &CommitConfig{ID: ids.Of([]byte("next")).String(), Patches: `[]`, Doc: `{"x":1}`},
+			Config: &ddb.CommitConfig{ID: ids.Of([]byte("next")).String(), Patches: `[]`, Doc: `{"x":1}`},
 			Entry:  map[string]any{"kind": "config", "target": ids.Of([]byte("next")).String()}, Kind: "config",
 		}
 		if _, err := s.Commit(context.Background(), cfg); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.Commit(context.Background(), c); !errors.Is(err, ErrStale) {
+		if _, err := s.Commit(context.Background(), c); !errors.Is(err, ddb.ErrStale) {
 			t.Fatalf("group %d: commit under the old configuration: %v, want ErrStale", group, err)
 		}
 	}
@@ -287,23 +288,23 @@ func TestLocalPinnedElsewhere(t *testing.T) {
 		mustCreateNS(t, s, "schemas")
 		ctx := context.Background()
 		sn, _ := s.Namespace(ctx, "schemas")
-		pin := NSPin{NS: "schemas", CfgPos: sn.ConfigPos, CfgID: sn.ConfigID}
+		pin := ddb.NSPin{NS: "schemas", CfgPos: sn.ConfigPos, CfgID: sn.ConfigID}
 		ok := testCommit(t, s, "demo", "a", "", `[{"op":"add","path":"","value":{}}]`)
-		ok.Pins = []NSPin{pin}
+		ok.Pins = []ddb.NSPin{pin}
 		if _, err := s.Commit(ctx, ok); err != nil {
 			t.Fatalf("group %d: %v", group, err)
 		}
 		next := ids.Of([]byte("next")).String()
-		if _, err := s.Commit(ctx, &Commit{
+		if _, err := s.Commit(ctx, &ddb.Commit{
 			NS: "schemas", Author: "alice", Created: time.Now().UnixMilli(), CfgPos: sn.ConfigPos, CfgID: sn.ConfigID,
-			Config: &CommitConfig{ID: next, Patches: `[]`, Doc: `{"read":"grant"}`},
+			Config: &ddb.CommitConfig{ID: next, Patches: `[]`, Doc: `{"read":"grant"}`},
 			Entry:  map[string]any{"kind": "config", "target": next}, Kind: "config",
 		}); err != nil {
 			t.Fatal(err)
 		}
 		stale := testCommit(t, s, "demo", "b", "", `[{"op":"add","path":"","value":{}}]`)
-		stale.Pins = []NSPin{pin}
-		if _, err := s.Commit(ctx, stale); !errors.Is(err, ErrStale) {
+		stale.Pins = []ddb.NSPin{pin}
+		if _, err := s.Commit(ctx, stale); !errors.Is(err, ddb.ErrStale) {
 			t.Fatalf("group %d: commit pinning the old configuration: %v, want ErrStale", group, err)
 		}
 	}
@@ -319,16 +320,16 @@ func TestLocalPurge(t *testing.T) {
 	w := mustWrite(t, s, "p", "a", "", `[{"op":"add","path":"","value":{"v":1}}]`)
 	late := testCommit(t, s, "p", "a", w.ID, `[{"op":"add","path":"/w","value":2}]`)
 	n, _ := s.Namespace(ctx, "p")
-	purge := func(c *Commit) error {
+	purge := func(c *ddb.Commit) error {
 		c.NS, c.Author, c.Created, c.CfgPos, c.CfgID = "p", "alice", time.Now().UnixMilli(), n.ConfigPos, n.ConfigID
 		_, err := s.Commit(ctx, c)
 		return err
 	}
-	if err := purge(&Commit{Purge: &CommitPurge{Name: "a", HeadPos: 1, HeadID: w.ID},
+	if err := purge(&ddb.Commit{Purge: &ddb.CommitPurge{Name: "a", HeadPos: 1, HeadID: w.ID},
 		Entry: map[string]any{"resource": "a", "kind": "purge", "target": w.ID}, Kind: "purge"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Commit(ctx, late); !errors.Is(err, ErrStale) {
+	if _, err := s.Commit(ctx, late); !errors.Is(err, ddb.ErrStale) {
 		t.Fatalf("write checked before the purge: %v, want ErrStale", err)
 	}
 	if r, err := s.Resource(ctx, "p", "a"); err != nil || r == nil || !r.Purged {
@@ -346,10 +347,10 @@ func TestLocalPurge(t *testing.T) {
 	}
 
 	b := testCommit(t, s, "p", "b", "", `[{"op":"add","path":"","value":{}}]`)
-	if err := purge(&Commit{PurgeNS: true, Entry: map[string]any{"kind": "purge-ns"}, Kind: "purge-ns"}); err != nil {
+	if err := purge(&ddb.Commit{PurgeNS: true, Entry: map[string]any{"kind": "purge-ns"}, Kind: "purge-ns"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Commit(ctx, b); !errors.Is(err, ErrStale) {
+	if _, err := s.Commit(ctx, b); !errors.Is(err, ddb.ErrStale) {
 		t.Fatalf("write to a purged namespace: %v, want ErrStale", err)
 	}
 	if nr, _ := s.Namespace(ctx, "p"); nr == nil || !nr.Purged {
@@ -373,10 +374,10 @@ func TestLocalGroupMixed(t *testing.T) {
 		pre[i] = mustWrite(t, a, "demo", fmt.Sprintf("old%d", i), "", `[{"op":"add","path":"","value":{"v":0}}]`)
 	}
 	// retry commits as core does: checked again (rebuilt) while stale.
-	retry := func(s *Store, build func() *Commit) (*CommitResult, error) {
+	retry := func(s *Store, build func() *ddb.Commit) (*ddb.CommitResult, error) {
 		for {
 			res, err := s.Commit(ctx, build())
-			if !errors.Is(err, ErrStale) {
+			if !errors.Is(err, ddb.ErrStale) {
 				return res, err
 			}
 		}
@@ -402,7 +403,7 @@ func TestLocalGroupMixed(t *testing.T) {
 		wg.Add(3)
 		go func() {
 			defer wg.Done()
-			_, err := retry(s, func() *Commit {
+			_, err := retry(s, func() *ddb.Commit {
 				return testCommit(t, s, "demo", fmt.Sprintf("new%d", i), "", fmt.Sprintf(`[{"op":"add","path":"","value":{"n":%d}}]`, i))
 			})
 			record(err)
@@ -413,7 +414,7 @@ func TestLocalGroupMixed(t *testing.T) {
 			if i%2 == 0 {
 				p = "" // a delete
 			}
-			_, err := retry(s, func() *Commit { return testCommit(t, s, "demo", fmt.Sprintf("old%d", i), pre[i].ID, p) })
+			_, err := retry(s, func() *ddb.Commit { return testCommit(t, s, "demo", fmt.Sprintf("old%d", i), pre[i].ID, p) })
 			record(err)
 		}()
 		go func() {
@@ -422,12 +423,12 @@ func TestLocalGroupMixed(t *testing.T) {
 				record(nil)
 				return
 			}
-			_, err := retry(s, func() *Commit {
+			_, err := retry(s, func() *ddb.Commit {
 				n, _ := s.Namespace(ctx, "demo")
 				id := ids.Of([]byte(fmt.Sprintf("cfg%d-%d", i, n.ConfigPos))).String()
-				return &Commit{
+				return &ddb.Commit{
 					NS: "demo", Author: "alice", Created: time.Now().UnixMilli(), CfgPos: n.ConfigPos, CfgID: n.ConfigID,
-					Config: &CommitConfig{ID: id, Patches: `[]`, Doc: `{}`},
+					Config: &ddb.CommitConfig{ID: id, Patches: `[]`, Doc: `{}`},
 					Entry:  map[string]any{"kind": "config", "target": id}, Kind: "config",
 				}
 			})
@@ -484,10 +485,10 @@ func TestLocalPruneHorizon(t *testing.T) {
 		}
 		res, _ := s.Resource(ctx, "p", "doc")
 		n, _ := s.Namespace(ctx, "p")
-		c := &Commit{
+		c := &ddb.Commit{
 			NS: "p", Author: "alice", Created: time.Now().UnixMilli(), CfgPos: n.ConfigPos, CfgID: n.ConfigID,
 			Entry: map[string]any{"resource": "doc", "kind": "prune", "target": revs[horizon-1].ID}, Kind: "prune",
-			Prune: &CommitPrune{Name: "doc", HeadPos: res.HeadPos, HeadID: res.HeadID, OldHorizon: old,
+			Prune: &ddb.CommitPrune{Name: "doc", HeadPos: res.HeadPos, HeadID: res.HeadID, OldHorizon: old,
 				HorizonPos: horizon, HorizonID: revs[horizon-1].ID, Base: horizon, Keep: "[]", Kept: kept},
 		}
 		if _, err := s.Commit(ctx, c); err != nil {
@@ -496,7 +497,7 @@ func TestLocalPruneHorizon(t *testing.T) {
 	}
 	// Horizon at 4, keeping 2.
 	prune(4, 0, []uint64{2, 4}, map[uint64][]byte{2: []byte(`{"n":1}`), 4: []byte(`{"n":3}`)})
-	var pe *PrunedError
+	var pe *ddb.PrunedError
 	if _, err := docAt(1); !errors.As(err, &pe) || pe.Pos != 1 {
 		t.Fatalf("below the horizon: %v", err)
 	}
@@ -512,10 +513,10 @@ func TestLocalPruneHorizon(t *testing.T) {
 	// A stale commit (the horizon moved) is refused.
 	res, _ := s.Resource(ctx, "p", "doc")
 	n, _ := s.Namespace(ctx, "p")
-	_, err := s.Commit(ctx, &Commit{NS: "p", Author: "alice", Created: time.Now().UnixMilli(), CfgPos: n.ConfigPos, CfgID: n.ConfigID,
+	_, err := s.Commit(ctx, &ddb.Commit{NS: "p", Author: "alice", Created: time.Now().UnixMilli(), CfgPos: n.ConfigPos, CfgID: n.ConfigID,
 		Entry: map[string]any{"resource": "doc", "kind": "prune", "target": revs[4].ID}, Kind: "prune",
-		Prune: &CommitPrune{Name: "doc", HeadPos: res.HeadPos, HeadID: res.HeadID, HorizonPos: 5, HorizonID: revs[4].ID, Base: 5, Keep: "[]"}})
-	if !errors.Is(err, ErrStale) {
+		Prune: &ddb.CommitPrune{Name: "doc", HeadPos: res.HeadPos, HeadID: res.HeadID, HorizonPos: 5, HorizonID: revs[4].ID, Base: 5, Keep: "[]"}})
+	if !errors.Is(err, ddb.ErrStale) {
 		t.Fatalf("prune on a moved horizon: %v", err)
 	}
 	// A later prune keeps nothing below 5: 2's snapshot is no longer

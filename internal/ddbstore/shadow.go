@@ -28,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
@@ -40,7 +41,7 @@ func (s *Store) ClearShadow(ctx context.Context, name string) error {
 
 // ImportShadow writes a shadow's content, into a partition ClearShadow
 // cleared, and returns its token.
-func (s *Store) ImportShadow(ctx context.Context, im *ShadowImport) (string, error) {
+func (s *Store) ImportShadow(ctx context.Context, im *ddb.ShadowImport) (string, error) {
 	tok := make([]byte, 16)
 	rand.Read(tok)
 	token := hex.EncodeToString(tok)
@@ -80,7 +81,7 @@ func (s *Store) ImportShadow(ctx context.Context, im *ShadowImport) (string, err
 	return token, s.putAll(ctx, puts)
 }
 
-func (s *Store) shadowRes(ns string, im *ShadowImport, r *ShadowRes, put func(Key, item)) {
+func (s *Store) shadowRes(ns string, im *ddb.ShadowImport, r *ddb.ShadowRes, put func(Key, item)) {
 	entryID, entryPos := "", uint64(0)
 	if r.EntryIdx >= 0 && r.EntryIdx < len(im.Log) {
 		entryID, entryPos = im.Log[r.EntryIdx].ID, uint64(r.EntryIdx+1)
@@ -136,7 +137,7 @@ func (s *Store) shadowRes(ns string, im *ShadowImport, r *ShadowRes, put func(Ke
 		put(keyDocHead(ns, r.Name), item{"revPos": avN(r.LastLivePos), "doc": avS(r.HeadDoc)})
 	}
 	for _, b := range r.Attach {
-		row := &BlobRow{Name: r.Name, Bid: b.Bid, Type: b.Type, Nonce: b.Nonce, Size: b.Size, Hash: b.Hash, Owner: b.Owner, Created: im.Created, RefPos: b.RefPos}
+		row := &ddb.BlobRow{Name: r.Name, Bid: b.Bid, Type: b.Type, Nonce: b.Nonce, Size: b.Size, Hash: b.Hash, Owner: b.Owner, Created: im.Created, RefPos: b.RefPos}
 		put(keyBlob(ns, r.Name, b.Bid), blobItem(row))
 	}
 }
@@ -204,7 +205,7 @@ func (s *Store) deletePartition(ctx context.Context, ns string) error {
 // CreateRemoteBranch creates a remote branch over its imported shadows;
 // 412 if the name is taken, ErrStale if a shadow isn't the import the
 // caller made.
-func (s *Store) CreateRemoteBranch(ctx context.Context, c *RemoteBranchCreate) (cfgID, nsID string, err error) {
+func (s *Store) CreateRemoteBranch(ctx context.Context, c *ddb.RemoteBranchCreate) (cfgID, nsID string, err error) {
 	cfg := ids.Revision(nil, []byte(c.Patches))
 	body := jsonv.Canonical(map[string]any{"kind": "config", "target": cfg.String()})
 	entryID := ids.Hash(nil, body)
@@ -241,7 +242,7 @@ func (s *Store) CreateRemoteBranch(ctx context.Context, c *RemoteBranchCreate) (
 		if r := ce.CancellationReasons; len(r) > 0 && r[0].Code != nil && *r[0].Code == "ConditionalCheckFailed" {
 			return "", "", apiErr(412, "stale")
 		}
-		return "", "", ErrStale
+		return "", "", ddb.ErrStale
 	}
 	if err != nil {
 		return "", "", err
@@ -252,13 +253,13 @@ func (s *Store) CreateRemoteBranch(ctx context.Context, c *RemoteBranchCreate) (
 func keyRemote(ns string) Key { return Key{nsPK(ns), "#REMOTE"} }
 
 // RemoteBaseOf reads branch's base; nil if it isn't a remote branch.
-func (s *Store) RemoteBaseOf(ctx context.Context, branch string) (*RemoteBase, error) {
+func (s *Store) RemoteBaseOf(ctx context.Context, branch string) (*ddb.RemoteBase, error) {
 	it, err := s.getItem(ctx, keyRemote(branch))
 	if it == nil || err != nil {
 		return nil, err
 	}
 	i := item(it)
-	return &RemoteBase{Branch: branch, Shadow: i.s("shadow"), Origin: i.s("origin"), NS: i.s("ns"), At: i.s("at"),
+	return &ddb.RemoteBase{Branch: branch, Shadow: i.s("shadow"), Origin: i.s("origin"), NS: i.s("ns"), At: i.s("at"),
 		Checkpoint: i.s("checkpoint"), RegNSID: i.s("regNsId"), RegExpires: int64(i.n("regExpires"))}, nil
 }
 
@@ -266,14 +267,14 @@ func (s *Store) RemoteBaseOf(ctx context.Context, branch string) (*RemoteBase, e
 func keyRemoteList(ns string) Key { return Key{"#REMOTES", ns} }
 
 // RemoteBases lists every remote branch's base, by branch name.
-func (s *Store) RemoteBases(ctx context.Context) ([]*RemoteBase, error) {
+func (s *Store) RemoteBases(ctx context.Context) ([]*ddb.RemoteBase, error) {
 	in := &dynamodb.QueryInput{
 		TableName:                 &s.Table,
 		KeyConditionExpression:    strptr("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS("#REMOTES")},
 		ConsistentRead:            boolptr(true),
 	}
-	var out []*RemoteBase
+	var out []*ddb.RemoteBase
 	for {
 		q, err := s.Client.Query(ctx, in)
 		if err != nil {
@@ -306,7 +307,7 @@ func (s *Store) SetCheckpoint(ctx context.Context, branch, old, cp string) error
 	})
 	var cf *types.ConditionalCheckFailedException
 	if errors.As(err, &cf) {
-		return ErrStale
+		return ddb.ErrStale
 	}
 	return err
 }
@@ -324,7 +325,7 @@ func (s *Store) SetRegistration(ctx context.Context, branch, nsID string, expire
 }
 
 // PutNotice records a notice, unless one of its id is recorded already.
-func (s *Store) PutNotice(ctx context.Context, branch string, n Notice) error {
+func (s *Store) PutNotice(ctx context.Context, branch string, n ddb.Notice) error {
 	applied := "0"
 	if n.Applied {
 		applied = "1"
@@ -344,10 +345,10 @@ func (s *Store) PutNotice(ctx context.Context, branch string, n Notice) error {
 }
 
 // Notices lists branch's notices in the order they were recorded.
-func (s *Store) Notices(ctx context.Context, branch string) ([]Notice, error) {
-	var out []Notice
+func (s *Store) Notices(ctx context.Context, branch string) ([]ddb.Notice, error) {
+	var out []ddb.Notice
 	err := s.eachItem(ctx, branch, "NOTICE#", func(i item) error {
-		out = append(out, Notice{ID: i.s("id"), Kind: i.s("kind"), Resource: i.s("resource"), Applied: i.s("applied") == "1",
+		out = append(out, ddb.Notice{ID: i.s("id"), Kind: i.s("kind"), Resource: i.s("resource"), Applied: i.s("applied") == "1",
 			Created: int64(i.n("created")), Seq: i.n("seq")})
 		return nil
 	})

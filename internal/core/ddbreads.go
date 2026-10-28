@@ -91,7 +91,7 @@ type ddbRevRef struct {
 	row *revRow // nil until read
 }
 
-func newDDBReads(b *ddbBackend, ctx context.Context) *ddbReads {
+func newDDBReads(ctx context.Context, b *ddbBackend) *ddbReads {
 	return &ddbReads{
 		b: b, e: b.e, s: b.store, ctx: ctx,
 		nss: map[int64]*ddbNS{}, nsNamed: map[string]int64{},
@@ -825,7 +825,7 @@ func (r *ddbReads) nextEntryCreated(ns, seq int64) (int64, bool) {
 // reads, what they panic with returned as errors (ddbCheck).
 func (b *ddbBackend) gateRead(ctx context.Context, f func(t *gate) error) error {
 	e := b.e
-	g := &gate{checkReads: newDDBReads(b, ctx), checkState: &checkState{e: e, now: e.now()}}
+	g := &gate{checkReads: newDDBReads(ctx, b), checkState: &checkState{e: e, now: e.now()}}
 	err, perr := ddbCheck(func() error { return f(g) })
 	if perr != nil {
 		return perr

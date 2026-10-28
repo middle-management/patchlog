@@ -5,6 +5,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/patch"
 )
 
@@ -15,8 +16,8 @@ import (
 
 // apiErr builds an error in the core's body shape (engine.go's apiErr):
 // {"code": …, …members}, so the server serves either backend alike.
-func apiErr(status int, code string, members ...any) *Error {
-	e := &Error{Status: status, Body: map[string]any{"code": code}}
+func apiErr(status int, code string, members ...any) *ddb.Error {
+	e := &ddb.Error{Status: status, Body: map[string]any{"code": code}}
 	for i := 0; i+1 < len(members); i += 2 {
 		e.Body[members[i].(string)] = members[i+1]
 	}
@@ -25,7 +26,7 @@ func apiErr(status int, code string, members ...any) *Error {
 
 // patchErr is a patch set that doesn't apply (patchErr of write.go): 422
 // invalid, naming the operation and pointer that failed.
-func patchErr(err error) *Error {
+func patchErr(err error) *ddb.Error {
 	var pe *patch.Error
 	if errors.As(err, &pe) {
 		return apiErr(422, "invalid", "message", pe.Message, "index", pe.Index, "pointer", pe.Pointer)

@@ -16,6 +16,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 // keyDEK is name's data key in ns, or the deployment's grants key for ns
@@ -28,16 +30,16 @@ func keyDEK(ns, name string) Key {
 }
 
 // DEK reads name's data key in ns (ns "": the grants key); nil when none.
-func (s *Store) DEK(ctx context.Context, ns, name string) (*WrappedDEK, error) {
+func (s *Store) DEK(ctx context.Context, ns, name string) (*ddb.WrappedDEK, error) {
 	it, err := s.getItem(ctx, keyDEK(ns, name))
 	if it == nil || err != nil {
 		return nil, err
 	}
-	return &WrappedDEK{Wrapped: item(it).b("wrapped"), KeyStore: item(it).s("keystore")}, nil
+	return &ddb.WrappedDEK{Wrapped: item(it).b("wrapped"), KeyStore: item(it).s("keystore")}, nil
 }
 
 // PutDEK stores a data key unless one exists, and returns the one stored.
-func (s *Store) PutDEK(ctx context.Context, ns, name string, k WrappedDEK, now int64) (*WrappedDEK, error) {
+func (s *Store) PutDEK(ctx context.Context, ns, name string, k ddb.WrappedDEK, now int64) (*ddb.WrappedDEK, error) {
 	_, err := s.Client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: &s.Table, Item: withKey(keyDEK(ns, name), item{"wrapped": avB(k.Wrapped), "keystore": avS(k.KeyStore), "created": avI(now)}),
 		ConditionExpression: strptr("attribute_not_exists(PK)"),
@@ -65,7 +67,7 @@ func (s *Store) DeleteDEKs(ctx context.Context, ns, name string) error {
 
 // AnyDEK is one stored data key, the grants key if there is one, for
 // checking at start-up that the key store unwraps them; nil for none.
-func (s *Store) AnyDEK(ctx context.Context) (ns, name string, k *WrappedDEK, err error) {
+func (s *Store) AnyDEK(ctx context.Context) (ns, name string, k *ddb.WrappedDEK, err error) {
 	if k, err = s.DEK(ctx, "", ""); k != nil || err != nil {
 		return "", "", k, err
 	}
@@ -81,7 +83,7 @@ func (s *Store) AnyDEK(ctx context.Context) (ns, name string, k *WrappedDEK, err
 		}
 		for _, raw := range out.Items {
 			i := item(raw)
-			return i.s("PK")[len("NS#"):], i.s("SK")[len("DEK#"):], &WrappedDEK{Wrapped: i.b("wrapped"), KeyStore: i.s("keystore")}, nil
+			return i.s("PK")[len("NS#"):], i.s("SK")[len("DEK#"):], &ddb.WrappedDEK{Wrapped: i.b("wrapped"), KeyStore: i.s("keystore")}, nil
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			return "", "", nil, nil
@@ -131,7 +133,7 @@ func (s *Store) DoneEncrypting(ctx context.Context, ns string) error {
 // namespace's entries and revisions were written under, for the caller
 // to encrypt.
 func (s *Store) EncryptContent(ctx context.Context, ns string, seal func(name, kind, key, plain string) (string, error),
-	reown func(*BlobRow) ([]byte, string, error)) (grants []string, err error) {
+	reown func(*ddb.BlobRow) ([]byte, string, error)) (grants []string, err error) {
 	seen := map[string]bool{}
 	grant := func(i item) {
 		if g := i.s("grantId"); g != "" && !seen[g] {
@@ -147,7 +149,7 @@ func (s *Store) EncryptContent(ctx context.Context, ns string, seal func(name, k
 	}
 	replace := func(i item, attr, kind, name, key string) error {
 		old := i.s(attr)
-		if old == "" || strings.HasPrefix(old, Sealed) {
+		if old == "" || strings.HasPrefix(old, ddb.Sealed) {
 			return nil
 		}
 		v, err := seal(name, kind, key, old)

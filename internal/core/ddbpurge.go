@@ -34,7 +34,7 @@ func (b *ddbBackend) purgeWith(ctx context.Context, req Request, name string, pl
 	ctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
-		r := newDDBReads(b, ctx)
+		r := newDDBReads(ctx, b)
 		g := &gate{checkReads: r, checkState: &checkState{e: e, now: e.now(), write: true}}
 		type planned struct {
 			p   *purgePlan
@@ -221,7 +221,7 @@ func (b *ddbBackend) branchNames(ctx context.Context, ns string) []string {
 func (b *ddbBackend) propagatePurge(ctx context.Context, bp branchPurge, name, author string, forced bool) error {
 	branch := bp.branch
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
-		r := newDDBReads(b, ctx)
+		r := newDDBReads(ctx, b)
 		n := r.nsByName(branch)
 		if n == nil || n.purged {
 			return nil // a branch purged since is skipped (§8.5)

@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
@@ -47,7 +48,7 @@ func (s *Store) walkChain(ctx context.Context, ns, name string, fromPos, toPos u
 			last, dead = pos, true
 			return true
 		case !i.has("patches"):
-			ferr = &PrunedError{NS: ns, Name: name, Pos: pos}
+			ferr = &ddb.PrunedError{NS: ns, Name: name, Pos: pos}
 			return false
 		}
 		last = pos
@@ -76,7 +77,7 @@ func (s *Store) walkChain(ctx context.Context, ns, name string, fromPos, toPos u
 // namespace alone doesn't decide which revision an id names, and a read
 // of one twin must not answer the other's (findInAncestry walks the
 // resource's own chain). Absent is nil, not an error.
-func (s *Store) ReadRevOf(ctx context.Context, ns, name, id string) (*RevInfo, error) {
+func (s *Store) ReadRevOf(ctx context.Context, ns, name, id string) (*ddb.RevInfo, error) {
 	in := &dynamodb.QueryInput{
 		TableName:              &s.Table,
 		IndexName:              strptr(gsiName),
@@ -141,7 +142,7 @@ func (s *Store) foldFrom(ctx context.Context, ns, name string, fromPos, toPos ui
 
 // RevsWithID lists every revision of id, in any namespace and resource
 // (GSI1): the copies of a revision.
-func (s *Store) RevsWithID(ctx context.Context, id string) ([]IDRev, error) {
+func (s *Store) RevsWithID(ctx context.Context, id string) ([]ddb.IDRev, error) {
 	in := &dynamodb.QueryInput{
 		TableName:              &s.Table,
 		IndexName:              strptr(gsiName),
@@ -151,7 +152,7 @@ func (s *Store) RevsWithID(ctx context.Context, id string) ([]IDRev, error) {
 			":g": avS(g1RevID(id)), ":pfx": avS("REV#"),
 		},
 	}
-	var out []IDRev
+	var out []ddb.IDRev
 	for {
 		q, err := s.Client.Query(ctx, in)
 		if err != nil {
@@ -159,7 +160,7 @@ func (s *Store) RevsWithID(ctx context.Context, id string) ([]IDRev, error) {
 		}
 		for _, it := range q.Items {
 			i := item(it)
-			out = append(out, IDRev{NS: strings.TrimPrefix(i.s("PK"), "NS#"), Rev: scanRevInfo(i)})
+			out = append(out, ddb.IDRev{NS: strings.TrimPrefix(i.s("PK"), "NS#"), Rev: scanRevInfo(i)})
 		}
 		if q.LastEvaluatedKey == nil {
 			return out, nil

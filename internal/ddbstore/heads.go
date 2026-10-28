@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
@@ -19,7 +20,7 @@ import (
 
 // HeadAt is name's head in ns as of log position atPos (core's resolve
 // at an earlier entry): nil when it had none.
-func (s *Store) HeadAt(ctx context.Context, ns, name string, atPos uint64) (*HeadEntry, error) {
+func (s *Store) HeadAt(ctx context.Context, ns, name string, atPos uint64) (*ddb.HeadEntry, error) {
 	it, err := s.getItem(ctx, keyRes(ns, name))
 	if it == nil || err != nil {
 		return nil, err
@@ -37,7 +38,7 @@ func (s *Store) HeadAt(ctx context.Context, ns, name string, atPos uint64) (*Hea
 // read in one batch for the chunk, so a page at the tip costs no more
 // than its markers. Created, size and digest are the head revision's,
 // created alone a tombstone's (NamespaceHeads's metadata, §7.4).
-func (s *Store) headsAtPos(ctx context.Context, ns string, names []string, rows []*resRow, atPos uint64) ([]*HeadEntry, error) {
+func (s *Store) headsAtPos(ctx context.Context, ns string, names []string, rows []*resRow, atPos uint64) ([]*ddb.HeadEntry, error) {
 	var keys []Key
 	for _, r := range rows {
 		if r.headPos > 0 {
@@ -48,7 +49,7 @@ func (s *Store) headsAtPos(ctx context.Context, ns string, names []string, rows 
 	if err != nil {
 		return nil, err
 	}
-	out := make([]*HeadEntry, len(rows))
+	out := make([]*ddb.HeadEntry, len(rows))
 	var tombs []Key // current tombstones: their created
 	for i, r := range rows {
 		if r.headPos == 0 {
@@ -59,7 +60,7 @@ func (s *Store) headsAtPos(ctx context.Context, ns string, names []string, rows 
 			return nil, apiErr(500, "stored_log", "namespace", ns, "resource", names[i])
 		}
 		if mk.n("logPos") <= atPos {
-			h := &HeadEntry{Name: names[i], ID: r.headID, Tombstoned: r.state == "tombstoned", Pos: r.headPos}
+			h := &ddb.HeadEntry{Name: names[i], ID: r.headID, Tombstoned: r.state == "tombstoned", Pos: r.headPos}
 			if h.Tombstoned {
 				tombs = append(tombs, keyRev(ns, names[i], r.headPos))
 			} else {
@@ -98,7 +99,7 @@ func (s *Store) headsAtPos(ctx context.Context, ns string, names []string, rows 
 // write. When it is a tombstone that isn't the current head, its entry
 // lies between the write's and the restore's, and whether that is at or
 // before atPos takes a look at the log over (write, atPos] for it.
-func (s *Store) headBefore(ctx context.Context, ns, name string, r *resRow, atPos uint64) (*HeadEntry, error) {
+func (s *Store) headBefore(ctx context.Context, ns, name string, r *resRow, atPos uint64) (*ddb.HeadEntry, error) {
 	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
 		TableName:              &s.Table,
 		KeyConditionExpression: strptr("PK = :pk AND SK BETWEEN :lo AND :hi"),
@@ -145,10 +146,10 @@ func (s *Store) headBefore(ctx context.Context, ns, name string, r *resRow, atPo
 			}
 		}
 		if deleted {
-			return &HeadEntry{Name: name, ID: tid, Tombstoned: true, Created: int64(next.n("created")), Pos: revPos + 1}, nil
+			return &ddb.HeadEntry{Name: name, ID: tid, Tombstoned: true, Created: int64(next.n("created")), Pos: revPos + 1}, nil
 		}
 	}
-	return &HeadEntry{
+	return &ddb.HeadEntry{
 		Name: name, ID: live.s("id"), Pos: revPos,
 		Created: int64(live.n("created")), Size: live.n("size"), Digest: live.b("digest"),
 	}, nil

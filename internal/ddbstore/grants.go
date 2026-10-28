@@ -13,6 +13,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 // PutGrant stores grant gid. It is written before the commits that record
@@ -22,7 +24,7 @@ import (
 // its encryption: blocks encrypted at rest (sealed) replace what is
 // stored, plaintext ones are only stored if nothing is, so a grant used
 // in an encrypted namespace stays encrypted.
-func (s *Store) PutGrant(ctx context.Context, gid string, g StoredGrant, sealed bool) error {
+func (s *Store) PutGrant(ctx context.Context, gid string, g ddb.StoredGrant, sealed bool) error {
 	in := &dynamodb.PutItemInput{
 		TableName: &s.Table,
 		Item:      withKey(keyGrant(gid), item{"blocks": avB(g.Blocks), "rootSub": avS(g.Sub), "rootKid": avS(g.Kid)}),
@@ -39,13 +41,13 @@ func (s *Store) PutGrant(ctx context.Context, gid string, g StoredGrant, sealed 
 }
 
 // Grant reads grant gid's stored form; nil when it isn't stored.
-func (s *Store) Grant(ctx context.Context, gid string) (*StoredGrant, error) {
+func (s *Store) Grant(ctx context.Context, gid string) (*ddb.StoredGrant, error) {
 	it, err := s.getItem(ctx, keyGrant(gid))
 	if it == nil || err != nil {
 		return nil, err
 	}
 	i := item(it)
-	return &StoredGrant{Blocks: i.b("blocks"), Sub: i.s("rootSub"), Kid: i.s("rootKid")}, nil
+	return &ddb.StoredGrant{Blocks: i.b("blocks"), Sub: i.s("rootSub"), Kid: i.s("rootKid")}, nil
 }
 
 // RecordsGrant reports whether an entry of ns at or before position upTo

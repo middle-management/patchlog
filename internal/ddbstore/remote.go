@@ -13,11 +13,13 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 func keyReg(ns, origin, name string) Key { return Key{nsPK(ns), "REG#" + origin + "#" + name} }
 
-func (s *Store) registrationActs(c *Commit, entry logRow) []types.TransactWriteItem {
+func (s *Store) registrationActs(c *ddb.Commit, entry logRow) []types.TransactWriteItem {
 	r := c.Registration
 	if r == nil {
 		return nil
@@ -36,12 +38,12 @@ func (s *Store) registrationActs(c *Commit, entry logRow) []types.TransactWriteI
 	return []types.TransactWriteItem{{Put: put}}
 }
 
-func scanRegistration(i item) *Registration {
-	return &Registration{Origin: i.s("origin"), Name: i.s("name"), AtPos: i.n("atPos"), NSPos: i.n("nsPos"), PrevPos: i.n("prevPos"), Expires: int64(i.n("expires"))}
+func scanRegistration(i item) *ddb.Registration {
+	return &ddb.Registration{Origin: i.s("origin"), Name: i.s("name"), AtPos: i.n("atPos"), NSPos: i.n("nsPos"), PrevPos: i.n("prevPos"), Expires: int64(i.n("expires"))}
 }
 
 // RegistrationOf reads ns's registration of origin's name; nil for none.
-func (s *Store) RegistrationOf(ctx context.Context, ns, origin, name string) (*Registration, error) {
+func (s *Store) RegistrationOf(ctx context.Context, ns, origin, name string) (*ddb.Registration, error) {
 	it, err := s.getItem(ctx, keyReg(ns, origin, name))
 	if it == nil || err != nil {
 		return nil, err
@@ -51,8 +53,8 @@ func (s *Store) RegistrationOf(ctx context.Context, ns, origin, name string) (*R
 
 // Registrations lists ns's registrations unexpired at now (milliseconds),
 // by origin, then name.
-func (s *Store) Registrations(ctx context.Context, ns string, now int64) ([]*Registration, error) {
-	var out []*Registration
+func (s *Store) Registrations(ctx context.Context, ns string, now int64) ([]*ddb.Registration, error) {
+	var out []*ddb.Registration
 	err := s.eachItem(ctx, ns, "REG#", func(i item) error {
 		if r := scanRegistration(i); r.Expires > now {
 			out = append(out, r)
@@ -63,7 +65,7 @@ func (s *Store) Registrations(ctx context.Context, ns string, now int64) ([]*Reg
 	return out, err
 }
 
-func less(a, b *Registration) bool {
+func less(a, b *ddb.Registration) bool {
 	if c := strings.Compare(a.Origin, b.Origin); c != 0 {
 		return c < 0
 	}

@@ -11,6 +11,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 // rotDuePK is the partition listing the rotations due, one item per
@@ -21,7 +23,7 @@ func keyRotDue(ns string) Key { return Key{rotDuePK, ns} }
 
 // rotDueActs are a commit's due rotations: put if absent (the first
 // revocation's time stays), and its own cleared when it begins an epoch.
-func (s *Store) rotDueActs(c *Commit) []types.TransactWriteItem {
+func (s *Store) rotDueActs(c *ddb.Commit) []types.TransactWriteItem {
 	var out []types.TransactWriteItem
 	for _, ns := range c.RotationsDue {
 		if c.EpochKey != nil && ns == c.NS {
@@ -40,7 +42,7 @@ func (s *Store) rotDueActs(c *Commit) []types.TransactWriteItem {
 }
 
 // rotDueActions counts rotDueActs's actions.
-func rotDueActions(c *Commit) int {
+func rotDueActions(c *ddb.Commit) int {
 	n := len(c.RotationsDue)
 	if c.EpochKey != nil {
 		n++

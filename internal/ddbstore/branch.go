@@ -17,6 +17,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
@@ -30,7 +31,7 @@ func keyBranch(base, name string) Key { return Key{nsPK(base), "BRANCH#" + name}
 
 // branchActs are the branch c creates, created with c's entry in the base
 // (entry): the branch exists exactly when the base records it.
-func (s *Store) branchActs(c *Commit, entry logRow) []types.TransactWriteItem {
+func (s *Store) branchActs(c *ddb.Commit, entry logRow) []types.TransactWriteItem {
 	b := c.Branch
 	if b == nil {
 		return nil
@@ -57,20 +58,20 @@ func (s *Store) branchActs(c *Commit, entry logRow) []types.TransactWriteItem {
 }
 
 // Branches lists base's branches, in byte order of name.
-func (s *Store) Branches(ctx context.Context, base string) ([]BranchRow, error) {
-	var out []BranchRow
+func (s *Store) Branches(ctx context.Context, base string) ([]ddb.BranchRow, error) {
+	var out []ddb.BranchRow
 	err := s.eachItem(ctx, base, "BRANCH#", func(i item) error {
-		out = append(out, BranchRow{Name: i.s("name"), EntryPos: i.n("entryPos")})
+		out = append(out, ddb.BranchRow{Name: i.s("name"), EntryPos: i.n("entryPos")})
 		return nil
 	})
 	return out, err
 }
 
 // Branch reads base's branch name; nil when it has none of that name.
-func (s *Store) Branch(ctx context.Context, base, name string) (*BranchRow, error) {
+func (s *Store) Branch(ctx context.Context, base, name string) (*ddb.BranchRow, error) {
 	it, err := s.getItem(ctx, keyBranch(base, name))
 	if it == nil || err != nil {
 		return nil, err
 	}
-	return &BranchRow{Name: name, EntryPos: item(it).n("entryPos")}, nil
+	return &ddb.BranchRow{Name: name, EntryPos: item(it).n("entryPos")}, nil
 }

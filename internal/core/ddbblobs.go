@@ -65,7 +65,7 @@ func (b *ddbBackend) uploadBlob(ctx context.Context, req Request, name string, b
 				return err
 			}
 		}
-		r := newDDBReads(b, ctx)
+		r := newDDBReads(ctx, b)
 		t := &gate{checkReads: r, checkState: &checkState{e: e, now: e.now(), write: true}}
 		type checked struct {
 			g   *blobGate

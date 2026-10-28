@@ -33,6 +33,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 func keyBlob(ns, name, bid string) Key { return Key{nsPK(ns), "BLOB#" + name + "#" + bid} }
@@ -51,7 +53,7 @@ func keyUploader(ns, uploader string) Key {
 func pendingPrefix(name, bid string) string { return "PEND#" + name + "#" + bid + "#" }
 func keyBytes(hash []byte) Key              { return Key{"BYTES#" + hex.EncodeToString(hash), "#"} }
 
-func blobItem(b *BlobRow) item {
+func blobItem(b *ddb.BlobRow) item {
 	it := item{"name": avS(b.Name), "bid": avS(b.Bid), "type": avS(b.Type), "size": avI(b.Size), "hash": avB(b.Hash), "created": avI(b.Created)}
 	if b.Nonce != "" {
 		it["nonce"] = avS(b.Nonce)
@@ -68,8 +70,8 @@ func blobItem(b *BlobRow) item {
 	return it
 }
 
-func scanBlob(i item) *BlobRow {
-	return &BlobRow{
+func scanBlob(i item) *ddb.BlobRow {
+	return &ddb.BlobRow{
 		Name: i.s("name"), Bid: i.s("bid"), Type: i.s("type"), Nonce: i.s("nonce"), Size: int64(i.n("size")),
 		Hash: i.b("hash"), Created: int64(i.n("created")), Uploader: i.s("uploader"), RefPos: i.n("refPos"),
 		Attachment: strings.HasPrefix(i.s("SK"), "BLOB#"), Pruned: i.n("pruned") != 0, Owner: i.s("owner"),
@@ -96,13 +98,13 @@ func (s *Store) EndAttachment(ctx context.Context, ns, name, bid string, headPos
 	}})
 	var ce *types.TransactionCanceledException
 	if errors.As(err, &ce) {
-		return ErrStale
+		return ddb.ErrStale
 	}
 	return err
 }
 
 // Attachment reads name's attachment of bid in ns; nil when there is none.
-func (s *Store) Attachment(ctx context.Context, ns, name, bid string) (*BlobRow, error) {
+func (s *Store) Attachment(ctx context.Context, ns, name, bid string) (*ddb.BlobRow, error) {
 	it, err := s.getItem(ctx, keyBlob(ns, name, bid))
 	if it == nil || err != nil {
 		return nil, err
@@ -112,7 +114,7 @@ func (s *Store) Attachment(ctx context.Context, ns, name, bid string) (*BlobRow,
 
 // Pending reads uploader's pending entry of bid for name in ns; nil when
 // there is none (expired or not: the caller compares Created).
-func (s *Store) Pending(ctx context.Context, ns, name, bid, uploader string) (*BlobRow, error) {
+func (s *Store) Pending(ctx context.Context, ns, name, bid, uploader string) (*ddb.BlobRow, error) {
 	it, err := s.getItem(ctx, keyPending(ns, name, bid, uploader))
 	if it == nil || err != nil {
 		return nil, err
@@ -124,8 +126,8 @@ func (s *Store) Pending(ctx context.Context, ns, name, bid, uploader string) (*B
 // caller filters): an upload sums an uploader's, an attaching commit
 // deletes a blob's. Pending entries are short-lived, so the partition's
 // PEND# range stays small.
-func (s *Store) PendingOf(ctx context.Context, ns string) ([]*BlobRow, error) {
-	var out []*BlobRow
+func (s *Store) PendingOf(ctx context.Context, ns string) ([]*ddb.BlobRow, error) {
+	var out []*ddb.BlobRow
 	in := &dynamodb.QueryInput{
 		TableName:                 &s.Table,
 		KeyConditionExpression:    strptr("PK = :pk AND begins_with(SK, :p)"),
@@ -163,7 +165,7 @@ func (s *Store) UploaderVersion(ctx context.Context, ns, uploader string) (uint6
 // was read at, and on its bytes being stored (a purge collects the bytes
 // nothing names, which these may be until the entry is written):
 // ErrStale when any of them moved.
-func (s *Store) PutPending(ctx context.Context, ns string, cfgPos uint64, cfgID string, ver uint64, p *BlobRow) error {
+func (s *Store) PutPending(ctx context.Context, ns string, cfgPos uint64, cfgID string, ver uint64, p *ddb.BlobRow) error {
 	cond, vals := "ver = :old", map[string]types.AttributeValue{":old": avN(ver), ":new": avN(ver + 1)}
 	if ver == 0 {
 		cond = "attribute_not_exists(PK)"
@@ -187,7 +189,7 @@ func (s *Store) PutPending(ctx context.Context, ns string, cfgPos uint64, cfgID 
 	}})
 	var ce *types.TransactionCanceledException
 	if errors.As(err, &ce) {
-		return ErrStale
+		return ddb.ErrStale
 	}
 	return err
 }
@@ -232,10 +234,10 @@ func (s *Store) Bytes(ctx context.Context, hash []byte) (data []byte, file strin
 
 // attachActs are an item's attachments (BLOB items) and the deletions of
 // the pending entries it ends.
-func (s *Store) attachActs(c *Commit, it *CommitItem) []types.TransactWriteItem {
+func (s *Store) attachActs(c *ddb.Commit, it *ddb.CommitItem) []types.TransactWriteItem {
 	var out []types.TransactWriteItem
 	for _, a := range it.Attach {
-		b := &BlobRow{Name: it.Name, Bid: a.Bid, Type: a.Type, Nonce: a.Nonce, Size: a.Size, Hash: a.Hash, Owner: a.Owner,
+		b := &ddb.BlobRow{Name: it.Name, Bid: a.Bid, Type: a.Type, Nonce: a.Nonce, Size: a.Size, Hash: a.Hash, Owner: a.Owner,
 			Created: c.Created, RefPos: it.HeadPos + uint64(a.Step) + 1}
 		out = append(out, types.TransactWriteItem{Put: &types.Put{TableName: &s.Table, Item: withKey(keyBlob(c.NS, it.Name, a.Bid), blobItem(b))}})
 	}
@@ -245,12 +247,12 @@ func (s *Store) attachActs(c *Commit, it *CommitItem) []types.TransactWriteItem 
 	return out
 }
 
-func attachActions(it *CommitItem) int { return len(it.Attach) + len(it.EndPending) }
+func attachActions(it *ddb.CommitItem) int { return len(it.Attach) + len(it.EndPending) }
 
 // ScanBlobs lists every attachment, pending entry and bytes item of the
 // table — a scan: operators' statistics and the sweep, never a request.
 // NS is set on the attachments and pending entries.
-func (s *Store) ScanBlobs(ctx context.Context) (blobs []*BlobRow, nss []string, bytes []*BytesRow, err error) {
+func (s *Store) ScanBlobs(ctx context.Context) (blobs []*ddb.BlobRow, nss []string, bytes []*ddb.BytesRow, err error) {
 	in := &dynamodb.ScanInput{
 		TableName:        &s.Table,
 		FilterExpression: strptr("begins_with(SK, :b) OR begins_with(SK, :p) OR begins_with(PK, :y)"),
@@ -268,7 +270,7 @@ func (s *Store) ScanBlobs(ctx context.Context) (blobs []*BlobRow, nss []string, 
 			i := item(raw)
 			if pk := i.s("PK"); strings.HasPrefix(pk, "BYTES#") {
 				h, _ := hex.DecodeString(strings.TrimPrefix(pk, "BYTES#"))
-				bytes = append(bytes, &BytesRow{Hash: h, File: i.s("file"), Size: int64(i.n("size")), Touched: int64(i.n("touched"))})
+				bytes = append(bytes, &ddb.BytesRow{Hash: h, File: i.s("file"), Size: int64(i.n("size")), Touched: int64(i.n("touched"))})
 				continue
 			}
 			blobs = append(blobs, scanBlob(i))
@@ -283,7 +285,7 @@ func (s *Store) ScanBlobs(ctx context.Context) (blobs []*BlobRow, nss []string, 
 
 // DeletePending deletes a pending entry of ns if it was created before
 // cutoff (one renewed since stays); it reports whether it did.
-func (s *Store) DeletePending(ctx context.Context, ns string, p *BlobRow, cutoff int64) (bool, error) {
+func (s *Store) DeletePending(ctx context.Context, ns string, p *ddb.BlobRow, cutoff int64) (bool, error) {
 	_, err := s.Client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: &s.Table, Key: keyAV(keyPending(ns, p.Name, p.Bid, p.Uploader)),
 		ConditionExpression:       strptr("created < :c"),
@@ -330,7 +332,7 @@ func (s *Store) CollectBytes(ctx context.Context, hashes [][]byte) (files []stri
 			named[string(b.Hash)] = true
 		}
 	}
-	stored := map[string]*BytesRow{}
+	stored := map[string]*ddb.BytesRow{}
 	for _, b := range bytes {
 		stored[string(b.Hash)] = b
 	}

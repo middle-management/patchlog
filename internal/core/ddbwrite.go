@@ -46,7 +46,7 @@ func (b *ddbBackend) writeItems1(ctx context.Context, req Request, items []Item,
 	defer func() { endDBSpan(span, err) }()
 	drawn := false
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
-		r := newDDBReads(b, ctx)
+		r := newDDBReads(ctx, b)
 		g := &gate{checkReads: r, checkState: &checkState{e: e, now: e.now(), write: true, rateDrawn: &drawn}}
 		type checked struct {
 			p   *writePlan
@@ -337,7 +337,7 @@ func (b *ddbBackend) writeConfigAs(ctx context.Context, req Request, cc ConfigCh
 	ctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
-		r := newDDBReads(b, ctx)
+		r := newDDBReads(ctx, b)
 		g := &gate{checkReads: r, checkState: &checkState{e: e, now: e.now(), write: true}}
 		type planned struct {
 			n   *nsRow
@@ -431,7 +431,7 @@ func (b *ddbBackend) writeConfigAs(ctx context.Context, req Request, cc ConfigCh
 // what this backend refuses, then the store's creation transaction.
 func (b *ddbBackend) createNamespace(ctx context.Context, req Request, cc ConfigChange) (res *WriteResult, err error) {
 	e := b.e
-	g := &gate{checkReads: newDDBReads(b, ctx), checkState: &checkState{e: e, now: e.now(), write: true}}
+	g := &gate{checkReads: newDDBReads(ctx, b), checkState: &checkState{e: e, now: e.now(), write: true}}
 	type planned struct {
 		a   *actor
 		cfg *Config

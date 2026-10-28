@@ -865,7 +865,7 @@ store can be a module a build links in to serve `dynamodb://`. Done:
   and items, the transactions, the reads. It registers itself in its
   `init`; `cmd/patchlog` and `internal/testenv` import it, and
   `internal/core` and `internal/server` don't (`go list -deps` shows no
-  AWS package). Its code names the contract's types through aliases.
+  AWS package).
 - Core's adapter (`internal/core/ddb*.go`) stays in core: it is the gate's
   reads and commits over `ddb.Store`, and it needs core's unexported
   gate, rows and caches, which a package outside core would make core

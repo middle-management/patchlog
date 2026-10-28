@@ -19,7 +19,7 @@ func (b *ddbBackend) createBranch(ctx context.Context, req Request, br BranchReq
 	ctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
-		r := newDDBReads(b, ctx)
+		r := newDDBReads(ctx, b)
 		g := &gate{checkReads: r, checkState: &checkState{e: e, now: e.now(), write: true}}
 		type planned struct {
 			p      *branchPlan
