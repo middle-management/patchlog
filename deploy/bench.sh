@@ -18,7 +18,10 @@
 # to 1,000 entries) a CDN would serve. The bench runs in one-second
 # slices, each reading since the head at its start.
 #
-# A write creates a resource (If-None-Match: *), a randomly named one: an
+# A write creates a resource (If-None-Match: *), a randomly named one, with
+# its author's content: resources created with the same patches share
+# their first revision's id (genesis twins), and so its GSI1 key, which
+# DynamoDB holds to ~1,000 writes a second (docs/DYNAMODB.md §3). An
 # append needs the head its writer last saw (If-Match), which a load tool
 # firing fixed requests can't chain, and a create goes through the same
 # commit, onto the namespace log, as an append. Rates are open loop: oha
@@ -115,7 +118,7 @@ for n in $(seq 1 "$NAMESPACES"); do
     r=$(( rate / k + (a <= rate % k ? 1 : 0) ))
     authors=$(( authors + 1 ))
     load "write.$n.$a" "$r" -r 0 -m PATCH -H "$CT" -H "X-Author: bench$n-$a" -H 'If-None-Match: *' \
-      -d '[{"op":"add","path":"","value":{"v":1}}]' --rand-regex-url "$BASE/r/($ns)/w[a-z0-9]{16}" &
+      -d "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"by\":\"bench$n-$a\"}}]" --rand-regex-url "$BASE/r/($ns)/w[a-z0-9]{16}" &
   done
   follow "$ns" "$(share "$LOGS" "$n")" &
 done

@@ -324,7 +324,8 @@ func (s *Store) commitGroup(ns string, group []*groupMember, known *tip) *tip {
 			return fail(live, err)
 		}
 		_, err = s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: acts})
-		if err == nil {
+		stale, tipMoved, cerr := classifyCancel(err, cs, len(acts))
+		if err == nil || cerr != nil && s.landed(ctx, ns, res[len(res)-1], cerr) {
 			for i, w := range live {
 				w.res = res[i]
 			}
@@ -337,10 +338,10 @@ func (s *Store) commitGroup(ns string, group []*groupMember, known *tip) *tip {
 			s.committedTip(ns, tip{headPos: last.Pos, headID: last.NSID})
 			return &tip{headPos: last.Pos, headID: last.NSID}
 		}
-		stale, tipMoved, cerr := classifyCancel(err, cs, len(acts))
 		if cerr != nil {
-			// Not a cancellation (throughput, the network): committed or
-			// not, unknown. A retried request finds out (its retry lookup).
+			// Not a cancellation (throughput, the network), and not landed
+			// as far as landed could see: a retried request finds out (its
+			// retry lookup).
 			return fail(live, cerr)
 		}
 		var keep []*groupMember

@@ -2,6 +2,7 @@ package ddbstore
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -12,6 +13,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 // A retry waits up to 25 ms, doubling to at most 1 s, over ten attempts:
@@ -103,5 +106,32 @@ func TestPrefetchUnprocessed(t *testing.T) {
 	row, _, err := s.Prefetch(context.Background(), "n", nil)
 	if err != nil || row == nil || row.TipPos != 1 || calls != 2 {
 		t.Fatalf("prefetch: %+v, %v after %d calls; want the namespace, its tip at 1, after 2", row, err, calls)
+	}
+}
+
+// A commit whose error leaves its outcome unknown (a 503: throttled, an
+// attempt still in progress) landed if its last entry's marker is there;
+// one refused outright isn't looked into.
+func TestLanded(t *testing.T) {
+	calls := 0
+	client := dynamodb.New(dynamodb.Options{
+		Region:      "us-east-1",
+		Credentials: credentials.NewStaticCredentialsProvider("k", "s", ""),
+		Retryer:     newRetryer(),
+		HTTPClient: roundTrip(func(r *http.Request) (*http.Response, error) {
+			calls++
+			body := `{"Item":{"PK":{"S":"NSID#n#e"},"SK":{"S":"#"},"logPos":{"N":"7"}}}`
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/x-amz-json-1.0"}},
+				Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+		}),
+	})
+	s := &Store{Client: client, Table: "t"}
+	last := &ddb.CommitResult{NSID: "e", Pos: 7}
+	if !s.landed(context.Background(), "n", last, &ddb.Error{Status: 503}) || calls != 1 {
+		t.Fatalf("after a 503 with the marker there: not landed (%d reads)", calls)
+	}
+	calls = 0
+	if s.landed(context.Background(), "n", last, errors.New("ValidationException")) || calls != 0 {
+		t.Fatalf("after a refusal: landed, or looked (%d reads)", calls)
 	}
 }

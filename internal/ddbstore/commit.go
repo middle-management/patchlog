@@ -102,6 +102,9 @@ func (s *Store) Commit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResult, e
 		}
 		stale, tipMoved, cerr := classifyCancel(err, []*ddb.Commit{c}, len(acts))
 		switch {
+		case cerr != nil && s.landed(ctx, c.NS, res[0], cerr):
+			s.committedTip(c.NS, tip{headPos: res[0].Pos, headID: res[0].NSID})
+			return res[0], nil
 		case cerr != nil:
 			return nil, cerr
 		case stale[0]:
@@ -496,6 +499,34 @@ func headDoc(it *ddb.CommitItem) (live *ddb.CommitStep, small bool) {
 		return nil, false
 	}
 	return live, len(live.Doc) <= inlineDocMax
+}
+
+// landed reports whether a transaction whose outcome its error leaves
+// unknown committed: whether the marker of its last entry is there. An
+// attempt DynamoDB is still applying answers a retry of it (the same
+// idempotency token) TransactionInProgressException, and the retryer can
+// give up on it before it completes; so does throttling, or the network,
+// after DynamoDB took it (the 503s of the traced client, done). The
+// marker is looked for over about a second, while such an attempt
+// finishes; an error that refused the call outright isn't looked into.
+func (s *Store) landed(ctx context.Context, ns string, last *ddb.CommitResult, err error) bool {
+	var de *ddb.Error
+	var ie *types.InternalServerError
+	if !(errors.As(err, &de) && de.Status == 503 || errors.As(err, &ie)) {
+		return false // refused outright: nothing was written
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		it, err := s.getItem(ctx, keyNSID(ns, last.NSID))
+		if err == nil && it != nil && item(it).n("logPos") == last.Pos {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	return false
 }
 
 // classifyCancel sorts a cancelled transaction of commits cs (built by

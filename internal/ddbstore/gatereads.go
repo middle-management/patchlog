@@ -312,7 +312,7 @@ func (s *Store) docBelow(ctx context.Context, ns, name string, res *resRow, pos 
 
 // EntryAt reads ns's log entry at pos; nil when there is none.
 func (s *Store) EntryAt(ctx context.Context, ns string, pos uint64) (*ddb.EntryRow, error) {
-	it, err := s.getItem(ctx, keyLog(ns, pos))
+	it, err := s.getItemSettled(ctx, keyLog(ns, pos))
 	if err != nil || it == nil {
 		return nil, err
 	}
@@ -388,28 +388,31 @@ func (s *Store) rangeOf(ctx context.Context, ns, prefix string, from, to uint64,
 }
 
 // EntryPos resolves ns's entry id to its position (the NSID marker,
-// UNIQUE(ns, id)); 0 when there is none. A marker not found is looked for
-// once more, shortly: an entry's transaction writes its marker and the
-// tip in different partitions, and a reader that saw the tip (a Query or
-// BatchGetItem, read-committed) may ask for the marker before it is there
-// for a GetItem (serializable), as a follower asking for the entries
-// since the head it was just shown does.
+// UNIQUE(ns, id)); 0 when there is none, after a second look
+// (getItemSettled): a follower asks for the entries since the head it was
+// just shown.
 func (s *Store) EntryPos(ctx context.Context, ns, id string) (uint64, error) {
-	for attempt := 0; ; attempt++ {
-		it, err := s.getItem(ctx, keyNSID(ns, id))
-		if err != nil {
-			return 0, err
-		}
-		if it != nil {
-			return item(it).n("logPos"), nil
-		}
-		if attempt == 1 {
-			return 0, nil
-		}
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-time.After(30 * time.Millisecond):
-		}
+	it, err := s.getItemSettled(ctx, keyNSID(ns, id))
+	if err != nil || it == nil {
+		return 0, err
 	}
+	return item(it).n("logPos"), nil
+}
+
+// getItemSettled reads k as getItem does, and once more, shortly, when it
+// isn't there: for an item of an entry's transaction a reader learned of
+// from another item of it. A BatchGetItem or Query (read-committed) can
+// see the tip of a transaction still applying, and a GetItem
+// (serializable) of its other items then answers as before it.
+func (s *Store) getItemSettled(ctx context.Context, k Key) (map[string]types.AttributeValue, error) {
+	it, err := s.getItem(ctx, k)
+	if err != nil || it != nil {
+		return it, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(30 * time.Millisecond):
+	}
+	return s.getItem(ctx, k)
 }
