@@ -2230,7 +2230,7 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	if err != nil {
 		return err
 	}
-	return errors.Join(e.followLog(ctx, c, ep, b), e.followChainEpochs(ctx, c, ep, b))
+	return errors.Join(e.followLog(ctx, c, ep, b), e.retryLevel(ctx, b), e.followChainEpochs(ctx, c, ep, b))
 }
 
 // followChainEpochs follows, for a remote branch of a branch, the epoch
@@ -2339,7 +2339,6 @@ func (e *Engine) followLog(ctx context.Context, c *client.Client, ep RemoteEndpo
 	// The base's namespace document after each config change, which this
 	// deployment reads only from the base itself (§G.5.2).
 	docs := map[string]sourceDoc{}
-	e2eSeen := catchUp != nil && catchUp.level == levelE2E
 	for _, en := range entries {
 		if !configChanged(en) {
 			continue
@@ -2349,39 +2348,6 @@ func (e *Engine) followLog(ctx context.Context, c *client.Client, ep RemoteEndpo
 			return err
 		}
 		docs[en.ID] = d
-		e2eSeen = e2eSeen || d.level == levelE2E
-	}
-	// A raise to e2e is followed as far as Levels allow (followLevel): to
-	// the level the base had before it, once, while the branch is below
-	// e2e and hasn't recorded it.
-	if e2eSeen {
-		var below bool
-		if err := e.read(ctx, func(t *tx) error {
-			bn := t.nsByID(b.branch)
-			var recorded int
-			if err := t.QueryRow(`SELECT level FROM remote_levels WHERE branch = ?`, bn.id).Scan(&recorded); err != nil && !errors.Is(err, sql.ErrNoRows) {
-				t.must(err)
-			}
-			below = t.config(bn.configSeq).level < levelE2E && recorded < levelE2E
-			return nil
-		}); err != nil {
-			return err
-		}
-		if below {
-			pre, err := preRaiseLevel(ctx, c, ep, b)
-			if err != nil && noAnswer(err) {
-				return err
-			}
-			for id, d := range docs {
-				if d.level == levelE2E {
-					d.pre = pre
-					docs[id] = d
-				}
-			}
-			if catchUp != nil && catchUp.level == levelE2E {
-				catchUp.pre = pre
-			}
-		}
 	}
 	return errors.Join(e.update(ctx, func(t *tx) error {
 		// The branch's lock first: the checkpoint is read as of it.
@@ -2472,13 +2438,11 @@ func configChanged(en client.NSEntry) bool {
 // sourceDoc is what a remote branch follows of its base's namespace
 // document after a config change (§G.5.2): its level, and its read, ""
 // where the document is sealed and this deployment can't open it. At e2e,
-// epoch is its encryption.epoch, and pre the level the base had before its
-// raise to e2e, where the follower read it (preRaiseLevel).
+// epoch is its encryption.epoch.
 type sourceDoc struct {
 	level int
 	read  string
 	epoch int
-	pre   int
 }
 
 // fetchSourceDoc reads the base's namespace document as of nsID. One the
@@ -2500,36 +2464,6 @@ func fetchSourceDoc(ctx context.Context, c *client.Client, ep RemoteEndpoint, ns
 		return sourceDoc{level: levelSealed}, nil
 	}
 	return sourceDoc{}, fmt.Errorf("/ns/%s/rev/%s: %w", ns, nsID, err)
-}
-
-// preRaiseLevel is the level b's base had before its raise to e2e, from
-// its namespace documents from the branch's at on: the branch was created
-// below e2e, so the raise lies after at (Addendum E Levels). This
-// deployment reads them only from the base itself (§G.5.2).
-func preRaiseLevel(ctx context.Context, c *client.Client, ep RemoteEndpoint, b *remoteBase) (int, error) {
-	d, err := fetchSourceDoc(ctx, c, ep, b.ns, b.at)
-	if err != nil {
-		return levelNone, err
-	}
-	level := d.level
-	entries, _, err := verify.Namespace(ctx, c, b.ns, b.at)
-	if err != nil {
-		return levelNone, err
-	}
-	for _, en := range entries {
-		if !configChanged(en) {
-			continue
-		}
-		d, err := fetchSourceDoc(ctx, c, ep, b.ns, en.ID)
-		if err != nil {
-			return levelNone, err
-		}
-		if d.level == levelE2E {
-			break
-		}
-		level = d.level
-	}
-	return level, nil
 }
 
 // followEpoch records an epoch of an e2e base seen at a config change in
@@ -2605,7 +2539,7 @@ func (t *tx) followConfig(bn *nsRow, id string, d sourceDoc) {
 	}
 	applied := true
 	if raise {
-		applied = t.followLevel(bn, id, d.level, d.pre)
+		applied = t.followLevel(bn, id, d.level)
 	}
 	if restrict {
 		applied = t.restrictRead(bn) && applied
@@ -2616,66 +2550,119 @@ func (t *tx) followConfig(bn *nsRow, id string, d sourceDoc) {
 }
 
 // followLevel follows a raise of the base's level to level, above the
-// branch's own, seen at the base's entry id (§G.5.2): the branch raises
-// its local dependents, leaves first, then itself, by config writes of
-// this deployment (RemoteAuthor, serverConfig), which seal what they read
-// through as a local raise does (insertConfig, encryptNamespace). It
-// reports whether it raised. Otherwise it records in remote_levels why it
-// couldn't:
+// branch's own, seen at the base's entry id (§G.5.2): as far as Levels
+// allow, the branch raises its local dependents, leaves first, then
+// itself, by config writes of this deployment (RemoteAuthor,
+// serverConfig), which seal what they read through as a local raise does
+// (insertConfig, encryptNamespace). That is to level itself, but to
+// sealed for a raise to e2e, which Levels refuse a branch whose at is
+// before its base's e2e raise, as the raise seen after at is (followTarget).
+// It reports whether it followed all of the raise. Otherwise it records in
+// remote_levels why it couldn't:
 //
-//   - a level this server lacks: without a key store it holds none
-//     (checkEncryption), and the resources the base had at at then answer
-//     502 upstream (§1, upstreamRefusal); or a raise that failed, so they
-//     do too rather than be served below the base's level (Levels);
-//   - e2e, which Levels refuse a branch whose at is before its base's e2e
-//     raise, as the raise seen after at is: the branch needs a rebase. It
-//     follows as far as Levels allow: to pre, the level the base had
-//     before the raise, at which the base goes on serving what the branch
-//     reads through (Addendum E Levels, After a raise), where the branch
-//     missed it, as a follower that skipped config entries did.
-func (t *tx) followLevel(bn *nsRow, id string, level, pre int) bool {
-	lacks, rebase := false, false
-	switch {
-	case t.e.opt.KeyStore == nil:
+//   - lacks: a level this server lacks, as without a key store it holds
+//     none (checkEncryption); only then do the resources the base had at
+//     at answer 502 upstream (§1, upstreamRefusal);
+//   - rebase: a raise to e2e, or one whose config writes failed (a
+//     dependent's document holding a member the level refuses that a
+//     server write can't remove, say): Levels refuse it, so the branch
+//     needs a rebase (§G.5.2). A failed raise is tried again at every sync
+//     (retryLevel), while the branch goes on serving at its own level.
+func (t *tx) followLevel(bn *nsRow, id string, level int) bool {
+	lacks, rebase := false, level == levelE2E
+	if t.e.opt.KeyStore == nil {
 		lacks = true
-	case level == levelE2E:
-		rebase = true
-		if pre > t.config(bn.configSeq).level {
-			if err := t.raiseLeavesFirst(bn, pre); err != nil {
-				log.Printf("remote branch %s: following its base's level before its raise to e2e, %s: %v", bn.name, levelNames[pre], err)
-				lacks = true
-			}
-		}
-	default:
-		if err := t.raiseLeavesFirst(bn, level); err != nil {
-			log.Printf("remote branch %s: following its base's raise to %s: %v", bn.name, levelNames[level], err)
-			lacks, rebase = true, true
+	} else if target := followTarget(level); target > t.config(bn.configSeq).level {
+		if err := t.raiseLeavesFirst(bn, target); err != nil {
+			log.Printf("remote branch %s: following its base's raise to %s, as far as %s: %v; tried again at the next sync", bn.name, levelNames[level], levelNames[target], err)
+			rebase = true
 		}
 	}
-	if !lacks && !rebase {
-		return true
-	}
-	var wasLacks, wasRebase bool
-	if err := t.QueryRow(`SELECT lacks, rebase FROM remote_levels WHERE branch = ?`, bn.id).Scan(&wasLacks, &wasRebase); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	var wasLacks bool
+	if err := t.QueryRow(`SELECT lacks FROM remote_levels WHERE branch = ?`, bn.id).Scan(&wasLacks); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		t.must(err)
 	}
 	_, err := t.Exec(`DELETE FROM remote_levels WHERE branch = ?`, bn.id)
 	t.must(err)
+	if lacks != wasLacks {
+		// Copies of its resources, at the edge and in the read cache, go:
+		// they answer 502 now, or again as before (§9).
+		t.lostChanged(bn)
+	}
+	if !lacks && !rebase {
+		return true
+	}
 	_, err = t.Exec(`INSERT INTO remote_levels (branch, level, lacks, rebase, id, created) VALUES (?,?,?,?,?,?)`,
-		bn.id, level, lacks || wasLacks, rebase || wasRebase, id, t.now.UnixMilli())
+		bn.id, level, lacks, rebase, id, t.now.UnixMilli())
 	t.must(err)
 	if lacks {
-		// Copies of its resources, at the edge and in the read cache, go:
-		// they answer 502 now (§9).
-		t.metaChanged = true
-		for _, n := range t.leavesFirst(bn) {
-			t.tags = append(t.tags, "ns:"+n.name)
-		}
 		log.Printf("remote branch %s: its base was raised to %s, which this server lacks: what it had at at answers 502 upstream (§1)", bn.name, levelNames[level])
 	} else {
-		log.Printf("remote branch %s: its base was raised to %s, which Levels refuse a branch whose at is before the raise: rebase it (§G.5.2)", bn.name, levelNames[level])
+		log.Printf("remote branch %s: its base was raised to %s, which Levels refuse it as it stands: rebase it (§G.5.2)", bn.name, levelNames[level])
 	}
 	return false
+}
+
+// followTarget is the level a remote branch raises to when its base is
+// raised to level: level itself, or sealed for e2e, which Levels refuse a
+// branch whose at is before the base's e2e raise (§G.5.2).
+func followTarget(level int) int {
+	return min(level, levelSealed)
+}
+
+// lostChanged drops the copies of bn's resources and its dependents', at
+// the edge and in the read cache, when whether they answer 502 upstream
+// changes (§1, §9, followLevel).
+func (t *tx) lostChanged(bn *nsRow) {
+	t.metaChanged = true
+	for _, n := range t.leavesFirst(bn) {
+		t.tags = append(t.tags, "ns:"+n.name)
+	}
+}
+
+// retryLevel tries again, once per sync, a raise followLevel recorded but
+// couldn't make on a server with a key store (§G.5.2): one whose config
+// writes failed, or one recorded while the server lacked every level.
+func (e *Engine) retryLevel(ctx context.Context, b *remoteBase) error {
+	if e.opt.KeyStore == nil {
+		return nil
+	}
+	due := false
+	if err := e.read(ctx, func(t *tx) error {
+		due = t.levelDue(b.branch)
+		return nil
+	}); err != nil || !due {
+		return err
+	}
+	return e.update(ctx, func(t *tx) error {
+		bn := t.nsByIDLocked(b.branch, lockExclusive)
+		if !t.levelDue(b.branch) {
+			return nil
+		}
+		var level int
+		var id string
+		t.must(t.QueryRow(`SELECT level, id FROM remote_levels WHERE branch = ?`, bn.id).Scan(&level, &id))
+		t.followLevel(bn, id, level)
+		return nil
+	})
+}
+
+// levelDue reports whether the remote branch's recorded raise is one it
+// hasn't followed as far as Levels allow (retryLevel).
+func (t *tx) levelDue(branch int64) bool {
+	bn := t.nsByID(branch)
+	if bn == nil || bn.purged {
+		return false
+	}
+	var level int
+	var lacks bool
+	switch err := t.QueryRow(`SELECT level, lacks FROM remote_levels WHERE branch = ?`, branch).Scan(&level, &lacks); {
+	case errors.Is(err, sql.ErrNoRows):
+		return false
+	default:
+		t.must(err)
+	}
+	return lacks || followTarget(level) > t.config(bn.configSeq).level
 }
 
 // leavesFirst lists n and the branches of it that aren't purged, at any
