@@ -70,6 +70,7 @@ package core
 //     thumbprint of the grant's enc, with their from (§E.2.3).
 
 import (
+	"bytes"
 	"crypto/ecdh"
 	"database/sql"
 	"errors"
@@ -188,7 +189,8 @@ func (t *tx) preRaiseHead(raise *e2eRaise, res int64) int64 {
 }
 
 // checkSealedHeader checks a JWE's protected header without a key (§E.3.1,
-// step 3): no zip (§E.2.2), kid "{ns}#{epoch}" naming n and the given
+// step 3): canonical JSON with no members but alg, enc, kid and pl, so no
+// zip (§E.2.2), kid "{ns}#{epoch}" naming n and the given
 // epoch, and pl exactly want. A write's sealed op names the epoch in force
 // (invariant 6): cfg's, which for a batch's items is the configuration its
 // config change produces (§7.5). why says where the epoch comes from, for
@@ -208,6 +210,9 @@ func (t *tx) checkSealedKid(jwe string, want seal.PL, what, kns string, epoch in
 	if h.Zip != "" {
 		return invalid(fmt.Sprintf("the %s's protected header has zip: sealed payloads are never compressed (§E.2.2)", what))
 	}
+	if !canonicalE3Header(h.Raw) {
+		return invalid(fmt.Sprintf("the %s's protected header must be canonical JSON with no members but alg, enc, kid and pl (§E.2.2, §E.3.1)", what))
+	}
 	ns, e, err := seal.ParseKid(h.Kid)
 	if err != nil || ns != kns {
 		return invalid(fmt.Sprintf("the %s's kid must be %q#{epoch}", what, kns))
@@ -219,6 +224,28 @@ func (t *tx) checkSealedKid(jwe string, want seal.PL, what, kns string, epoch in
 		return apiErr(422, "invalid", "message", fmt.Sprintf("the %s's pl must bind this write exactly", what), "pl", jsonv.FromGo(map[string]any(want)))
 	}
 	return nil
+}
+
+// canonicalE3Header reports whether raw, a decoded protected header, is
+// canonical JSON (§3.1) of an object with no members but alg, enc, kid and
+// pl, as a sealed op's and a prune snapshot's must be (§E.2.2, §E.3.1).
+func canonicalE3Header(raw []byte) bool {
+	v, err := jsonv.Parse(raw)
+	if err != nil {
+		return false
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return false
+	}
+	for k := range m {
+		switch k {
+		case "alg", "enc", "kid", "pl":
+		default:
+			return false
+		}
+	}
+	return bytes.Equal(jsonv.Canonical(v), raw)
 }
 
 // checkSnapshot checks the header of snapshot, a prune's sealed snapshot of
@@ -990,9 +1017,19 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	// sealed op isn't the server's to keep.
 	keepDocs := map[int64]*revRow{}
 	var keptDoc []byte
-	if ll := t.lastLive(h); ll.res == own.id && t.e2eRaiseOf(n) != nil {
+	ll := t.lastLive(h)
+	if ll.res == own.id && t.e2eRaiseOf(n) != nil {
 		if doc, err := t.docBytesAt(ll); err == nil {
 			keepDocs[ll.seq], keptDoc = ll, doc
+		}
+	}
+	// After a raise from sealed the prune doesn't change how /rev/{h} is
+	// served: the server first stores the sealing of the document it
+	// serves there, if none is stored (Addendum E Levels, §E.2.2), under
+	// the raised namespace, as a read would.
+	if pre := t.preRaiseOf(n, ll); pre != nil && pre.sealed() {
+		if doc, err := t.docBytesAt(ll); err == nil {
+			t.storePreRaiseSealing(pre, name, ll, doc)
 		}
 	}
 	from := own.horizonSeq.Int64
@@ -1035,6 +1072,21 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	_, nsID := t.appendNS(n, map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, &own.id, &target, n.configSeq, author)
 	res.NSID = nsID.String()
 	return res, nil
+}
+
+// storePreRaiseSealing stores the sealing of row's document from before
+// p's raise from sealed, as /rev serves it under name (preRaiseResJob),
+// unless one is stored: in this transaction, where a read stores it
+// after its own (finishSeal), the first stored winning either way.
+func (t *tx) storePreRaiseSealing(p *preRaise, name string, row *revRow, doc []byte) {
+	j := t.preRaiseResJob(p, name, row, sealDoc, func() []byte { return doc })
+	if j.jwe != "" {
+		return
+	}
+	t.must(j.sealNow())
+	_, err := t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
+		p.m.id, j.kind, j.key, j.name, j.revSeq, j.jwe, t.now.UnixMilli())
+	t.must(err)
 }
 
 // pruneBlobsE2E ends the attachments of res that neither kept, the
