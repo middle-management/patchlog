@@ -3,10 +3,14 @@ package ddbstore
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -57,7 +61,7 @@ func Open(ctx context.Context, rawurl string) (*Store, error) {
 	httpClient := awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
 		tr.MaxIdleConns, tr.MaxIdleConnsPerHost = maxIdleConns, maxIdleConns
 	})
-	opts := []func(*config.LoadOptions) error{config.WithHTTPClient(httpClient)}
+	opts := []func(*config.LoadOptions) error{config.WithHTTPClient(httpClient), config.WithRetryer(newRetryer)}
 	if region != "" {
 		opts = append(opts, config.WithRegion(region))
 	}
@@ -79,4 +83,35 @@ func Open(ctx context.Context, rawurl string) (*Store, error) {
 		client = dynamodb.NewFromConfig(cfg)
 	}
 	return &Store{Client: tracedAPI{client, table}, Table: table}, nil
+}
+
+// The SDK's default retries suit a service whose refusals last seconds:
+// three attempts, the first retry after up to 2 s, and a client-wide
+// budget a burst of throttling drains, after which calls fail unretried.
+// DynamoDB's throttling clears in tens of milliseconds, and a namespace's
+// commits run one after another (group.go): one commit backing off for a
+// second stalls every write of its namespace that long. So: ten attempts,
+// full jitter from 25 ms doubling up to 1 s, and no budget.
+const (
+	retryAttempts = 10
+	retryBase     = 25 * time.Millisecond
+	retryMax      = time.Second
+)
+
+func newRetryer() aws.Retryer {
+	return retry.NewStandard(func(o *retry.StandardOptions) {
+		o.MaxAttempts = retryAttempts
+		o.MaxBackoff = retryMax
+		o.Backoff = retry.BackoffDelayerFunc(retryDelay)
+		o.RateLimiter = ratelimit.None
+	})
+}
+
+// retryDelay is attempt's wait: uniform in [0, min(retryMax, retryBase·2^(attempt-1))].
+func retryDelay(attempt int, _ error) (time.Duration, error) {
+	ceil := retryMax
+	if attempt >= 1 && attempt < 7 {
+		ceil = min(retryMax, retryBase<<(attempt-1))
+	}
+	return time.Duration(rand.Int64N(int64(ceil) + 1)), nil
 }
