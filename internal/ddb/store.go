@@ -127,6 +127,7 @@ type Store interface {
 	// reads.go
 	ReadRevOf(ctx context.Context, ns, name, id string) (*RevInfo, error)
 	Ping(ctx context.Context) error
+	CheckLayout(ctx context.Context) error
 	FoldResource(ctx context.Context, ns, name string, toPos uint64) (doc any, canon []byte, err error)
 	RevsWithID(ctx context.Context, id string) ([]IDRev, error)
 

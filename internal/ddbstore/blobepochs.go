@@ -19,7 +19,7 @@ import (
 
 func blobEpochPrefix(name, bid string) string { return "BLOBEPOCH#" + name + "#" + bid + "#" }
 func keyBlobEpoch(ns, name, bid string, epoch int) Key {
-	return Key{nsPK(ns), blobEpochPrefix(name, bid) + padPos(uint64(epoch))}
+	return Key{resPK(ns, name), blobEpochPrefix(name, bid) + padPos(uint64(epoch))}
 }
 
 // BlobEpoch reads name's sealing of bid in ns under epoch: its bytes or

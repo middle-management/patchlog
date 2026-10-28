@@ -26,7 +26,7 @@ func keyDEK(ns, name string) Key {
 	if ns == "" {
 		return Key{"#DEPLOY", "DEK"}
 	}
-	return Key{nsPK(ns), "DEK#" + name}
+	return Key{resPK(ns, name), "DEK#" + name}
 }
 
 // DEK reads name's data key in ns (ns "": the grants key); nil when none.
@@ -83,7 +83,7 @@ func (s *Store) AnyDEK(ctx context.Context) (ns, name string, k *ddb.WrappedDEK,
 		}
 		for _, raw := range out.Items {
 			i := item(raw)
-			return i.s("PK")[len("NS#"):], i.s("SK")[len("DEK#"):], &ddb.WrappedDEK{Wrapped: i.b("wrapped"), KeyStore: i.s("keystore")}, nil
+			return nsOfPK(i.s("PK")), i.s("SK")[len("DEK#"):], &ddb.WrappedDEK{Wrapped: i.b("wrapped"), KeyStore: i.s("keystore")}, nil
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			return "", "", nil, nil
@@ -141,11 +141,9 @@ func (s *Store) EncryptContent(ctx context.Context, ns string, seal func(name, k
 			grants = append(grants, g)
 		}
 	}
-	in := &dynamodb.QueryInput{
-		TableName:                 &s.Table,
-		KeyConditionExpression:    strptr("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(nsPK(ns))},
-		ConsistentRead:            boolptr(true),
+	pks, err := s.partitions(ctx, ns)
+	if err != nil {
+		return nil, err
 	}
 	replace := func(i item, attr, kind, name, key string) error {
 		old := i.s(attr)
@@ -169,13 +167,8 @@ func (s *Store) EncryptContent(ctx context.Context, ns string, seal func(name, k
 		}
 		return err
 	}
-	for {
-		q, err := s.Client.Query(ctx, in)
-		if err != nil {
-			return nil, err
-		}
-		for _, raw := range q.Items {
-			i := item(raw)
+	for _, pk := range pks {
+		if err := s.eachInPartition(ctx, pk, "", func(i item) (err error) {
 			sk := i.s("SK")
 			switch {
 			case strings.HasPrefix(sk, "LOG#"):
@@ -192,12 +185,12 @@ func (s *Store) EncryptContent(ctx context.Context, ns string, seal func(name, k
 			case strings.HasPrefix(sk, "BLOB#") || strings.HasPrefix(sk, "PEND#"):
 				b := scanBlob(i)
 				if b.Owner != "" || b.Pruned {
-					continue
+					return nil
 				}
 				var hash []byte
 				var owner string
 				if hash, owner, err = reown(b); err != nil {
-					return nil, err
+					return err
 				}
 				_, err = s.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 					TableName: &s.Table, Key: keyAV(Key{i.s("PK"), sk}),
@@ -211,13 +204,10 @@ func (s *Store) EncryptContent(ctx context.Context, ns string, seal func(name, k
 					err = nil
 				}
 			}
-			if err != nil {
-				return nil, err
-			}
+			return err
+		}); err != nil {
+			return nil, err
 		}
-		if len(q.LastEvaluatedKey) == 0 {
-			return grants, nil
-		}
-		in.ExclusiveStartKey = q.LastEvaluatedKey
 	}
+	return grants, nil
 }

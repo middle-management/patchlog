@@ -103,7 +103,17 @@ multi-instance deployment must share them); schema/data migrations
 ## 3. Table and key design
 
 One table, `patchlog`, with generic `PK`/`SK` (string keys), one stream
-(NEW_IMAGE), and two GSIs. Single-table because the write path's transactions
+(NEW_IMAGE), and two GSIs. Two kinds of partition key hold a namespace:
+`NS#<ns>` its registry, chains, log and resource items, and what is keyed
+across its resources; `R#<ns>#<name>` each resource's own items. DynamoDB
+gives one partition key ~1,000 write and ~3,000 read units a second
+whatever the table's capacity, and a write's transaction is several items
+(a revision, the head document, a history row, the log entry, the resource
+item; twice the units, as a transaction): with all of them under the
+namespace's key, a namespace took ~70 writes a second (measured, §11).
+Apart, a write puts its log entry and resource item under the namespace's
+key, the rest under its resource's, and reads of different resources go
+to different keys. The log can't be split: it is one chain. Single-table because the write path's transactions
 are confined to one namespace's items, one stream then feeds all
 cross-instance invalidation (§6), and GSIs are shared by every entity.
 Multi-table is viable (DynamoDB transactions span tables) and is noted where
@@ -124,29 +134,30 @@ NS#<ns>                     CFG#<pos12>                         config chain ent
 NS#<ns>                     LOG#<pos12>                         ns_log entry: id, prevPos, kind, res?, body|bodyRef, cfgPos,
                                                                 author, created, grantId, noAuth, gestures
 NS#<ns>                     RES#<name>                          resource: headPos, headId, state, horizonPos/Id/Base, keep, kept, snapRevs/Bytes
-NS#<ns>                     REV#<name>#<pos12>                  revision: id, parent (pos | {ns,name,pos} foreign), kind, first,
+R#<ns>#<name>               REV#<name>#<pos12>                  revision: id, parent (pos | {ns,name,pos} foreign), kind, first,
                                                                 patches|patchesRef, author, created, grantId, schemaRef,
                                                                 gesture?, undoes?, signature?, size?, digest?, epoch?
-NS#<ns>                     DOC#<name>#HEAD                     head snapshot: revPos, doc|docRef
-NS#<ns>                     SNAP#<name>#<pos12>                 kept snapshot below a horizon (§8.6); intermediate (D.4) not built
+R#<ns>#<name>               DOC#<name>#HEAD                     head snapshot: revPos, doc|docRef
+R#<ns>#<name>               SNAP#<name>#<pos12>                 kept snapshot below a horizon (§8.6); intermediate (D.4) not built
 NS#<ns>                     PRUNING#<name>                      a prune whose content is still to go: horizonPos, kept positions
-NS#<ns>                     HIST#<name>#<logPos12>              head_history row: revPos
-NS#<ns>                     BLOB#<name>#<bid>                   blob attachment: type, nonce, size, hash, owner, refPos, pruned
-NS#<ns>                     BREF#<name>#<bid>#<fromPos12>       blob reference interval: toPos?
+R#<ns>#<name>               HIST#<name>#<logPos12>              head_history row: revPos
+R#<ns>#<name>               BLOB#<name>#<bid>                   blob attachment: type, nonce, size, hash, owner, refPos, pruned
+R#<ns>#<name>               BREF#<name>#<bid>#<fromPos12>       blob reference interval: toPos?
 NS#<ns>                     PEND#<bid>#<uploader>               pending blob upload (GSI2 on created for the sweep)
-NS#<ns>                     DEK#<name>                          resource data key (wrapped, keystore), at rest and sealed
+R#<ns>#<name>               DEK#<name>                          resource data key (wrapped, keystore), at rest and sealed
 NS#<ns>                     #ENCRYPTING                         an encryption of existing content still to finish
 NS#<ns>                     EPOCHKEY#<n12>                      epoch start (created); a sealed namespace's key, wrapped (e2e: none)
 NS#<ns>                     SEALED#<kind>#<key>                 sealed response (JWE), first stored wins; name, revPos
-NS#<ns>                     E2ESNAP#<name>#<pos12>              e2e client-sealed snapshot at a pruning horizon (JWE)
-NS#<ns>                     BLOBEPOCH#<name>#<bid>#<n12>        sealed blob form per epoch: data | file (e/…), neither = 410 pruned
-NS#<ns>                     ARCH#<name>#<from12>#<to12>         pruning archive record (§8.6): key, url, created, bids
+R#<ns>#<name>               E2ESNAP#<name>#<pos12>              e2e client-sealed snapshot at a pruning horizon (JWE)
+R#<ns>#<name>               BLOBEPOCH#<name>#<bid>#<n12>        sealed blob form per epoch: data | file (e/…), neither = 410 pruned
+R#<ns>#<name>               ARCH#<name>#<from12>#<to12>         pruning archive record (§8.6): key, url, created, bids
 NS#<ns>                     REG#<origin>#<branch>               registered remote branch (source side): atPos, nsPos, prevPos, expires
 NS#<branch>                 #REMOTE                             remote base (branch side): shadow, origin, ns, at, checkpoint, registration
 NS#<branch>                 NOTICE#<nsId>                       purge notice: kind, resource, applied, created, seq
 #REMOTES                    <branch>                            the remote branches (SyncRemotes)
 GRANT#<id32>                #                                   grant: blocks, rootSub, rootKid
 #DEPLOY                     DEK                                 the deployment's grants key (wrapped)
+#DEPLOY                     LAYOUT                              the table's key layout: version (2)
 BLOB#<owner>#<hash64>       #                                   blob bytes pointer: S3 key (or inline ≤ ~350 KB)
 BUCKET#<hash>               #                                   shared rate bucket (multi-instance)
 JOB#REPURGE#<logId>         #                                    second CDN purge: tags, due (GSI2 on due)
@@ -174,9 +185,18 @@ Why this shape for the SQL reader:
 - `/heads` in byte order: `Query(PK=NS#demo, begins_with(SK,"RES#"), SK > cursor)` —
   DynamoDB sorts SK by bytes; §3.6 names are ASCII, so this is the byte order
   of `reads.go`. Revisions sort under `REV#`, never interleaved.
-- A resource's chain, in order: `Query(PK, begins_with(SK,"REV#<name>#"))`.
-  Same partition as the resource, its snapshots, history and blobs: one
-  partition key holds everything a fold, purge or prune touches.
+- A resource's chain, in order: `Query(PK=R#<ns>#<name>, begins_with(SK,"REV#<name>#"))`.
+  Its snapshots, history and blobs share the resource's key: one
+  partition key holds everything a fold or a prune touches. What spans a
+  namespace's resources (its purge, encryption of existing content, a
+  shadow's removal) lists them (`RES#`) and visits each one's key.
+- The table records its key layout (`#DEPLOY`/`LAYOUT`, version 2, the
+  layout above): a server gives a table with no namespace this one at
+  start-up, and refuses a table of namespaces without the record, which
+  is of the earlier layout (v0.24.0-ddb.3 and before, where the resources'
+  items were under the namespace's key), rather than serve it as if its
+  resources had no history. There is no migration: such a table is served
+  by that release, or this one is given a new table.
 - A namespace log page: `Query(PK, SK BETWEEN LOG#a AND LOG#b)` — one page
   per 1 MiB of DynamoDB read, chained exactly like `X-Log-Next`.
 - The grants/authors tables lose their raison d'être: grants key by id

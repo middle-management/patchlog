@@ -30,13 +30,22 @@ func TestKeyOrder(t *testing.T) {
 	if keyRev("d", "a", 1).SK < keyRes("d", "a").SK {
 		t.Fatal("REV# sorts before RES#: resource listings would match revisions")
 	}
-	// The namespace's items share one partition.
-	for _, k := range []Key{
-		keyMeta("d"), keyTip("d"), keyCfg("d", 1), keyLog("d", 1),
-		keyRes("d", "a"), keyRev("d", "a", 1), keyDocHead("d", "a"), keyHist("d", "a", 1),
-	} {
+	// The namespace's registry, chains, log and resource items share its
+	// partition; a resource's own items are under its key.
+	for _, k := range []Key{keyMeta("d"), keyTip("d"), keyCfg("d", 1), keyLog("d", 1), keyRes("d", "a")} {
 		if k.PK != "NS#d" {
 			t.Fatalf("key %+v outside the namespace's partition", k)
+		}
+	}
+	for _, k := range []Key{
+		keyRev("d", "a", 1), keyDocHead("d", "a"), keyHist("d", "a", 1), keySnap("d", "a", 1),
+		keyBlob("d", "a", "b"), keyDEK("d", "a"), keyE2ESnap("d", "a", 1), keyBlobEpoch("d", "a", "b", 1), keyArch("d", "a", 1, 2),
+	} {
+		if k.PK != "R#d#a" {
+			t.Fatalf("key %+v outside the resource's partition", k)
+		}
+		if pk, every := partitionOf("d", k.SK); pk != k.PK || every {
+			t.Fatalf("partitionOf(%q) = %q, %v, want %q", k.SK, pk, every, k.PK)
 		}
 	}
 	// Log entries sort in chain order.
@@ -58,5 +67,32 @@ func TestNSIDKey(t *testing.T) {
 	// part of the marker's key.
 	if keyNSID("a", "1abc").PK == keyNSID("b", "1abc").PK {
 		t.Fatal("NSID markers of two namespaces share a key")
+	}
+}
+
+// A prefix names the partition of its items: a resource type with a name
+// its resource's, without one every resource's, the rest the namespace's.
+func TestPartitionOf(t *testing.T) {
+	for _, c := range []struct {
+		prefix, pk string
+		every      bool
+	}{
+		{"REV#a#", "R#d#a", false},
+		{"BLOBEPOCH#a.b#x#", "R#d#a.b", false},
+		{"DEK#", "", true},
+		{"SNAP#", "", true},
+		{"LOG#", "NS#d", false},
+		{"RES#", "NS#d", false},
+		{"PEND#a#", "NS#d", false},
+		{"GEST#g#", "NS#d", false},
+	} {
+		if pk, every := partitionOf("d", c.prefix); pk != c.pk || every != c.every {
+			t.Errorf("partitionOf(%q) = %q, %v, want %q, %v", c.prefix, pk, every, c.pk, c.every)
+		}
+	}
+	for pk, ns := range map[string]string{"NS#d": "d", "R#d#a": "d", "R#d-1#a.b": "d-1"} {
+		if got := nsOfPK(pk); got != ns {
+			t.Errorf("nsOfPK(%q) = %q, want %q", pk, got, ns)
+		}
 	}
 }

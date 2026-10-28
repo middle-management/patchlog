@@ -13,7 +13,6 @@ package ddbstore
 import (
 	"context"
 	"errors"
-	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -81,7 +80,7 @@ func (s *Store) AnyEpochKey(ctx context.Context) (string, *ddb.EpochKey, error) 
 		}
 		for _, raw := range out.Items {
 			i := item(raw)
-			return strings.TrimPrefix(i.s("PK"), "NS#"), scanEpochKey(i), nil
+			return nsOfPK(i.s("PK")), scanEpochKey(i), nil
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			return "", nil, nil

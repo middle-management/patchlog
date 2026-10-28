@@ -18,7 +18,7 @@ import (
 
 func e2eSnapPrefix(name string) string { return "E2ESNAP#" + name + "#" }
 func keyE2ESnap(ns, name string, pos uint64) Key {
-	return Key{nsPK(ns), e2eSnapPrefix(name) + padPos(pos)}
+	return Key{resPK(ns, name), e2eSnapPrefix(name) + padPos(pos)}
 }
 
 // E2ESnapshot reads name's client-sealed snapshot at pos; "" for none.
@@ -37,7 +37,7 @@ func (s *Store) LatestE2ESnapshot(ctx context.Context, ns, name string, pos uint
 		TableName:              &s.Table,
 		KeyConditionExpression: strptr("PK = :pk AND SK BETWEEN :lo AND :hi"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": avS(nsPK(ns)), ":lo": avS(e2eSnapPrefix(name)), ":hi": avS(e2eSnapPrefix(name) + padPos(pos)),
+			":pk": avS(resPK(ns, name)), ":lo": avS(e2eSnapPrefix(name)), ":hi": avS(e2eSnapPrefix(name) + padPos(pos)),
 		},
 		ScanIndexForward: boolptr(false),
 		Limit:            int32ptr(1),

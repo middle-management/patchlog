@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"os"
 	"strings"
 	"sync"
@@ -551,5 +552,72 @@ func TestLocalPruneHorizon(t *testing.T) {
 	}
 	if ok, err := s.PruneContent(ctx, "p", "doc"); err != nil || ok {
 		t.Fatalf("PruneContent after done: %v %v", ok, err)
+	}
+}
+
+// A table records its key layout at start-up when it has no namespace; a
+// table of the earlier layout (namespaces, no record) or of another
+// version is refused.
+func TestLocalLayout(t *testing.T) {
+	ctx := context.Background()
+	s := newLocalStore(t)
+	for i := 0; i < 2; i++ {
+		if err := s.CheckLayout(ctx); err != nil {
+			t.Fatalf("check %d of a new table: %v", i+1, err)
+		}
+	}
+	mustCreateNS(t, s, "kept")
+	if err := s.CheckLayout(ctx); err != nil {
+		t.Fatalf("a table of this layout with a namespace: %v", err)
+	}
+	if err := s.deleteKey(ctx, keyLayout()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckLayout(ctx); err == nil || !strings.Contains(err.Error(), "key layout 1") {
+		t.Fatalf("a table of namespaces without a layout record: %v, want refused as layout 1", err)
+	}
+	if _, err := s.Client.PutItem(ctx, &dynamodb.PutItemInput{TableName: &s.Table, Item: withKey(keyLayout(), item{"version": avN(9)})}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckLayout(ctx); err == nil || !strings.Contains(err.Error(), "layout 9") {
+		t.Fatalf("a table of layout 9: %v, want refused", err)
+	}
+}
+
+// A write puts its log entry and resource item under the namespace's key
+// and its revision, head document and head history under its resource's
+// (resPK): the namespace's partition takes ~1,000 write units a second,
+// and resources share it only through these.
+func TestLocalWritePartitions(t *testing.T) {
+	ctx := context.Background()
+	s := newLocalStore(t)
+	mustCreateNS(t, s, "p")
+	w := mustWrite(t, s, "p", "a", "", `[{"op":"add","path":"","value":{"v":0}}]`)
+	mustWrite(t, s, "p", "a", w.ID, `[{"op":"replace","path":"/v","value":1}]`)
+	mustWrite(t, s, "p", "b", "", `[{"op":"add","path":"","value":{"v":0}}]`)
+	types := func(pk string) map[string]int {
+		n := map[string]int{}
+		if err := s.eachInPartition(ctx, pk, "", func(i item) error {
+			typ, _, _ := strings.Cut(strings.TrimPrefix(i.s("SK"), "#"), "#")
+			n[typ]++
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	ns := types(nsPK("p"))
+	for typ := range ns {
+		switch typ {
+		case "META", "TIP", "CFG", "LOG", "RES":
+		default:
+			t.Errorf("the namespace's partition holds %s items: %v", typ, ns)
+		}
+	}
+	if ns["LOG"] != 4 || ns["RES"] != 2 {
+		t.Errorf("the namespace's partition: %v, want 4 log entries (config, 3 writes) and 2 resources", ns)
+	}
+	if a := types(resPK("p", "a")); a["REV"] != 2 || a["DOC"] != 1 || a["HIST"] != 2 || len(a) != 3 {
+		t.Errorf("a's partition: %v, want 2 revisions, its head document, 2 history rows", a)
 	}
 }

@@ -115,7 +115,7 @@ func (s *Store) RevsByID(ctx context.Context, id, name string) ([]ddb.RevCopy, e
 			if !strings.HasPrefix(i.s("SK"), "REV#") || resNameFromRev(i.s("SK")) != name {
 				continue
 			}
-			out = append(out, ddb.RevCopy{NS: strings.TrimPrefix(i.s("PK"), "NS#"), RevInfo: scanRevInfo(i)})
+			out = append(out, ddb.RevCopy{NS: nsOfPK(i.s("PK")), RevInfo: scanRevInfo(i)})
 		}
 		if len(q.LastEvaluatedKey) == 0 {
 			return out, nil

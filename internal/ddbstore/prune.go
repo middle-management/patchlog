@@ -24,7 +24,6 @@ package ddbstore
 import (
 	"context"
 	"strconv"
-	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -34,7 +33,7 @@ import (
 )
 
 func keySnap(ns, name string, pos uint64) Key {
-	return Key{nsPK(ns), "SNAP#" + name + "#" + padPos(pos)}
+	return Key{resPK(ns, name), "SNAP#" + name + "#" + padPos(pos)}
 }
 
 // keyPruning marks a prune of name whose content is still to go.
@@ -200,7 +199,7 @@ func (s *Store) Pruning(ctx context.Context) (nss, names []string, err error) {
 		}
 		for _, raw := range out.Items {
 			i := item(raw)
-			nss = append(nss, strings.TrimPrefix(i.s("PK"), "NS#"))
+			nss = append(nss, nsOfPK(i.s("PK")))
 			names = append(names, i.s("name"))
 		}
 		if len(out.LastEvaluatedKey) == 0 {
@@ -292,7 +291,7 @@ func (s *Store) newestFirst(ctx context.Context, ns, name string, from, to uint6
 		TableName:              &s.Table,
 		KeyConditionExpression: strptr("PK = :pk AND SK BETWEEN :lo AND :hi"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": avS(nsPK(ns)), ":lo": avS(prefix + padPos(from+1)), ":hi": avS(prefix + padPos(to)),
+			":pk": avS(resPK(ns, name)), ":lo": avS(prefix + padPos(from+1)), ":hi": avS(prefix + padPos(to)),
 		},
 		ScanIndexForward: boolptr(false),
 		ConsistentRead:   boolptr(true),

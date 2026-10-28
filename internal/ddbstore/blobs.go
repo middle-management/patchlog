@@ -37,7 +37,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ddb"
 )
 
-func keyBlob(ns, name, bid string) Key { return Key{nsPK(ns), "BLOB#" + name + "#" + bid} }
+func keyBlob(ns, name, bid string) Key { return Key{resPK(ns, name), "BLOB#" + name + "#" + bid} }
 func keyPending(ns, name, bid, uploader string) Key {
 	return Key{nsPK(ns), pendingPrefix(name, bid) + base64.RawURLEncoding.EncodeToString([]byte(uploader))}
 }
@@ -281,7 +281,7 @@ func (s *Store) ScanBlobs(ctx context.Context) (blobs []*ddb.BlobRow, nss []stri
 				continue
 			}
 			blobs = append(blobs, scanBlob(i))
-			nss = append(nss, strings.TrimPrefix(i.s("PK"), "NS#"))
+			nss = append(nss, nsOfPK(i.s("PK")))
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			return blobs, nss, bytes, nil

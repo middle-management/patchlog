@@ -16,7 +16,6 @@ package ddbstore
 
 import (
 	"context"
-	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -204,7 +203,7 @@ func (s *Store) Purging(ctx context.Context) (nss, names []string, err error) {
 		}
 		for _, raw := range out.Items {
 			i := item(raw)
-			nss = append(nss, strings.TrimPrefix(i.s("PK"), "NS#"))
+			nss = append(nss, nsOfPK(i.s("PK")))
 			names = append(names, i.s("name"))
 		}
 		if len(out.LastEvaluatedKey) == 0 {
@@ -224,13 +223,52 @@ func (s *Store) resourceNames(ctx context.Context, ns string) ([]string, error) 
 	return out, err
 }
 
-// eachItem visits ns's items whose sort keys begin with prefix.
+// partitions are ns's partition keys: the namespace's, then each of its
+// resources'.
+func (s *Store) partitions(ctx context.Context, ns string) ([]string, error) {
+	names, err := s.resourceNames(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	pks := []string{nsPK(ns)}
+	for _, name := range names {
+		pks = append(pks, resPK(ns, name))
+	}
+	return pks, nil
+}
+
+// eachItem visits ns's items whose sort keys begin with prefix, in the
+// partition holding them (partitionOf): a resource type without a name
+// visits each resource's.
 func (s *Store) eachItem(ctx context.Context, ns, prefix string, visit func(item) error) error {
+	pk, every := partitionOf(ns, prefix)
+	if every {
+		names, err := s.resourceNames(ctx, ns)
+		if err != nil {
+			return err
+		}
+		for _, name := range names {
+			if err := s.eachInPartition(ctx, resPK(ns, name), prefix, visit); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return s.eachInPartition(ctx, pk, prefix, visit)
+}
+
+// eachInPartition visits partition pk's items whose sort keys begin with
+// prefix ("": all of them).
+func (s *Store) eachInPartition(ctx context.Context, pk, prefix string, visit func(item) error) error {
 	in := &dynamodb.QueryInput{
 		TableName:                 &s.Table,
 		KeyConditionExpression:    strptr("PK = :pk AND begins_with(SK, :p)"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(nsPK(ns)), ":p": avS(prefix)},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(pk), ":p": avS(prefix)},
 		ConsistentRead:            boolptr(true),
+	}
+	if prefix == "" {
+		in.KeyConditionExpression = strptr("PK = :pk")
+		delete(in.ExpressionAttributeValues, ":p")
 	}
 	for {
 		q, err := s.Client.Query(ctx, in)

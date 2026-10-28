@@ -31,8 +31,52 @@ func padPos(n uint64) string { return fmt.Sprintf("%0*d", posDigits, n) }
 // parsePos is padPos's inverse.
 func parsePos(s string) (uint64, error) { return strconv.ParseUint(s, 10, 64) }
 
-// nsPK is the partition holding everything of one namespace.
+// nsPK is the partition of one namespace: its registry, chains and log,
+// its resources' items (RES#, listed by name), and what is keyed across
+// its resources (gestures, pending uploads, sealed values, schema
+// references).
 func nsPK(ns string) string { return "NS#" + ns }
+
+// resPK is the partition of one resource's own items: its revisions, head
+// document, head history, kept snapshots, attachments, data key, epoch
+// forms and archives (resourceTypes). A namespace's partition key takes
+// what DynamoDB gives one key, ~1,000 write and ~3,000 read units a
+// second; with these apart, a write puts its log entry and resource item
+// there and the rest under its resource's key (docs/DYNAMODB.md §3).
+// Names have no "#" (§3.6), so the key is unambiguous.
+func resPK(ns, name string) string { return "R#" + ns + "#" + name }
+
+// nsOfPK is the namespace of a namespace's or a resource's partition key.
+func nsOfPK(pk string) string {
+	if rest, ok := strings.CutPrefix(pk, "R#"); ok {
+		ns, _, _ := strings.Cut(rest, "#")
+		return ns
+	}
+	return strings.TrimPrefix(pk, "NS#")
+}
+
+// resourceTypes are the sort-key types kept under a resource's key, each
+// "TYPE#<name>…".
+var resourceTypes = map[string]bool{
+	"REV": true, "DOC": true, "HIST": true, "SNAP": true, "BLOB": true,
+	"DEK": true, "E2ESNAP": true, "BLOBEPOCH": true, "ARCH": true,
+}
+
+// partitionOf is the partition of ns's items whose sort keys begin with
+// prefix: a resource's, for a resource type with its name, the
+// namespace's for the rest. every reports a resource type without a name
+// ("DEK#"): its items are in each resource's partition.
+func partitionOf(ns, prefix string) (pk string, every bool) {
+	typ, rest, _ := strings.Cut(prefix, "#")
+	if !resourceTypes[typ] {
+		return nsPK(ns), false
+	}
+	name, _, _ := strings.Cut(rest, "#")
+	if name == "" {
+		return "", true
+	}
+	return resPK(ns, name), false
+}
 
 // Namespace registry and chains.
 func keyMeta(ns string) Key            { return Key{nsPK(ns), "#META"} }
@@ -44,11 +88,11 @@ func keyLog(ns string, pos uint64) Key { return Key{nsPK(ns), "LOG#" + padPos(po
 // a begins_with(RES#) query lists resources only — /heads in byte order.
 func keyRes(ns, name string) Key { return Key{nsPK(ns), "RES#" + name} }
 func keyRev(ns, name string, pos uint64) Key {
-	return Key{nsPK(ns), "REV#" + name + "#" + padPos(pos)}
+	return Key{resPK(ns, name), "REV#" + name + "#" + padPos(pos)}
 }
-func keyDocHead(ns, name string) Key { return Key{nsPK(ns), "DOC#" + name + "#HEAD"} }
+func keyDocHead(ns, name string) Key { return Key{resPK(ns, name), "DOC#" + name + "#HEAD"} }
 func keyHist(ns, name string, logPos uint64) Key {
-	return Key{nsPK(ns), "HIST#" + name + "#" + padPos(logPos)}
+	return Key{resPK(ns, name), "HIST#" + name + "#" + padPos(logPos)}
 }
 
 // keyNSGrant marks that an entry of ns records grant gid (recordsGrant

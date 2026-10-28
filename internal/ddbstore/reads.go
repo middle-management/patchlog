@@ -2,6 +2,8 @@ package ddbstore
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -84,7 +86,7 @@ func (s *Store) ReadRevOf(ctx context.Context, ns, name, id string) (*ddb.RevInf
 		KeyConditionExpression: strptr("G1PK = :g"),
 		FilterExpression:       strptr("PK = :pk AND begins_with(SK, :pfx)"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":g": avS(g1RevID(id)), ":pk": avS(nsPK(ns)), ":pfx": avS("REV#" + name + "#"),
+			":g": avS(g1RevID(id)), ":pk": avS(resPK(ns, name)), ":pfx": avS("REV#" + name + "#"),
 		},
 	}
 	for {
@@ -105,6 +107,52 @@ func (s *Store) ReadRevOf(ctx context.Context, ns, name, id string) (*ddb.RevInf
 		}
 		in.ExclusiveStartKey = q.LastEvaluatedKey
 	}
+}
+
+// layout is the version of the table's key layout: 2 since a resource's
+// own items have their own partition key (resPK). Version 1 kept them
+// under the namespace's, where this layout doesn't look: a table of it is
+// refused, not served as if its resources had no history.
+const layout = 2
+
+func keyLayout() Key { return Key{"#DEPLOY", "LAYOUT"} }
+
+// CheckLayout checks, at start-up, that the table's items are of this
+// layout: a table with no namespace yet is given it.
+func (s *Store) CheckLayout(ctx context.Context) error {
+	it, err := s.getItem(ctx, keyLayout())
+	if err != nil {
+		return err
+	}
+	if it != nil {
+		if v := item(it).n("version"); v != layout {
+			return fmt.Errorf("ddbstore: table %s has key layout %d, this server reads layout %d", s.Table, v, layout)
+		}
+		return nil
+	}
+	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
+		TableName:                 &s.Table,
+		KeyConditionExpression:    strptr("PK = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS("#NAMESPACES")},
+		Limit:                     int32ptr(1),
+		ConsistentRead:            boolptr(true),
+	})
+	if err != nil {
+		return err
+	}
+	if len(q.Items) > 0 {
+		return fmt.Errorf("ddbstore: table %s holds namespaces of key layout 1 (v0.24.0-ddb.3 and earlier), which this server can't read: "+
+			"serve it with that release, or give this one a new table (docs/DYNAMODB.md §3)", s.Table)
+	}
+	_, err = s.Client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: &s.Table, Item: withKey(keyLayout(), item{"version": avN(layout)}),
+		ConditionExpression: strptr("attribute_not_exists(PK)"),
+	})
+	var cf *types.ConditionalCheckFailedException
+	if errors.As(err, &cf) {
+		return s.CheckLayout(ctx) // another instance's, at the same moment
+	}
+	return err
 }
 
 // Ping checks the table is reachable (the /_ready check, Engine.Ping).
@@ -160,7 +208,7 @@ func (s *Store) RevsWithID(ctx context.Context, id string) ([]ddb.IDRev, error) 
 		}
 		for _, it := range q.Items {
 			i := item(it)
-			out = append(out, ddb.IDRev{NS: strings.TrimPrefix(i.s("PK"), "NS#"), Rev: scanRevInfo(i)})
+			out = append(out, ddb.IDRev{NS: nsOfPK(i.s("PK")), Rev: scanRevInfo(i)})
 		}
 		if q.LastEvaluatedKey == nil {
 			return out, nil

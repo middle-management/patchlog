@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased (dynamodb)
+
+**The DynamoDB table's key layout changes (version 2): a table written by v0.24.0-ddb.3 or earlier
+is refused at start-up; serve it with that release, or give this one a new table.** A resource's own
+items (revisions, head document, head history, kept snapshots, attachments, data key, epoch forms,
+archives) move from the namespace's partition key to their resource's, `R#<ns>#<name>`. DynamoDB holds
+one key to ~1,000 write units a second, and a write's transaction put all its items under the
+namespace's: a namespace took ~70 writes a second on AWS. Now a write puts only its log entry and
+resource item there. A creation no longer looks its revision id up (every resource created with the
+same patches shares it, and the lookup read them all). DynamoDB spans record the units each call
+consumed, its attempts, throttles and the store function making it; `deploy/spans.py` reports them.
+`deploy/bench.sh` runs on oha at fixed rates, follows logs since a recent entry, and spreads over
+`NAMESPACES`; `deploy/ec2-bench.sh` runs it on an EC2 instance next to the table, with the server built
+from the checkout.
+
 ## v0.24.0-ddb.3
 
 The third prerelease from the `dynamodb` branch. A write's commit chained over the log tip its

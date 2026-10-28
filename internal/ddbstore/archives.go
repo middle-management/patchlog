@@ -23,7 +23,7 @@ import (
 )
 
 func keyArch(ns, name string, from, to uint64) Key {
-	return Key{nsPK(ns), "ARCH#" + name + "#" + padPos(from) + "#" + padPos(to)}
+	return Key{resPK(ns, name), "ARCH#" + name + "#" + padPos(from) + "#" + padPos(to)}
 }
 
 func archiveItem(a *ddb.ArchiveRow, name string) item {

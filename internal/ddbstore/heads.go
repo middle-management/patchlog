@@ -104,7 +104,7 @@ func (s *Store) headBefore(ctx context.Context, ns, name string, r *resRow, atPo
 		TableName:              &s.Table,
 		KeyConditionExpression: strptr("PK = :pk AND SK BETWEEN :lo AND :hi"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": avS(nsPK(ns)), ":lo": avS("HIST#" + name + "#"), ":hi": avS("HIST#" + name + "#" + padPos(atPos)),
+			":pk": avS(resPK(ns, name)), ":lo": avS("HIST#" + name + "#"), ":hi": avS("HIST#" + name + "#" + padPos(atPos)),
 		},
 		ScanIndexForward: boolptr(false),
 		Limit:            int32ptr(1),

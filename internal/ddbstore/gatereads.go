@@ -8,6 +8,7 @@ package ddbstore
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -338,17 +339,22 @@ func (s *Store) RevsBetween(ctx context.Context, ns, name string, from, to uint6
 	})
 }
 
-// rangeOf visits the items prefix+pos of ns's partition for positions in
-// (from, to], in order, at most limit (0: all), while visit returns true.
+// rangeOf visits ns's items prefix+pos for positions in (from, to], in
+// order, at most limit (0: all), while visit returns true; prefix names
+// one partition (partitionOf): a resource's chain, or the namespace's log.
 func (s *Store) rangeOf(ctx context.Context, ns, prefix string, from, to uint64, limit int, visit func(item) bool) error {
 	if to <= from {
 		return nil
+	}
+	pk, every := partitionOf(ns, prefix)
+	if every {
+		return fmt.Errorf("ddbstore: range %q names no resource", prefix)
 	}
 	in := &dynamodb.QueryInput{
 		TableName:              &s.Table,
 		KeyConditionExpression: strptr("PK = :pk AND SK BETWEEN :lo AND :hi"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk": avS(nsPK(ns)), ":lo": avS(prefix + padPos(from+1)), ":hi": avS(prefix + padPos(to)),
+			":pk": avS(pk), ":lo": avS(prefix + padPos(from+1)), ":hi": avS(prefix + padPos(to)),
 		},
 		ConsistentRead: boolptr(true),
 	}

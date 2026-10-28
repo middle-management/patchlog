@@ -170,29 +170,21 @@ func (s *Store) putAll(ctx context.Context, items []map[string]types.AttributeVa
 	return nil
 }
 
-// deletePartition deletes every item of ns's partition, and its entry in
-// the namespace list.
+// deletePartition deletes every item of ns's partitions, its resources'
+// with its own, and its entry in the namespace list.
 func (s *Store) deletePartition(ctx context.Context, ns string) error {
-	var keys []Key
-	in := &dynamodb.QueryInput{
-		TableName:                 &s.Table,
-		KeyConditionExpression:    strptr("PK = :pk"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(nsPK(ns))},
-		ProjectionExpression:      strptr("PK, SK"),
-		ConsistentRead:            boolptr(true),
+	pks, err := s.partitions(ctx, ns)
+	if err != nil {
+		return err
 	}
-	for {
-		q, err := s.Client.Query(ctx, in)
-		if err != nil {
+	var keys []Key
+	for _, pk := range pks {
+		if err := s.eachInPartition(ctx, pk, "", func(i item) error {
+			keys = append(keys, Key{i.s("PK"), i.s("SK")})
+			return nil
+		}); err != nil {
 			return err
 		}
-		for _, it := range q.Items {
-			keys = append(keys, Key{item(it).s("PK"), item(it).s("SK")})
-		}
-		if len(q.LastEvaluatedKey) == 0 {
-			break
-		}
-		in.ExclusiveStartKey = q.LastEvaluatedKey
 	}
 	for _, k := range keys {
 		if err := s.deleteKey(ctx, k); err != nil {
