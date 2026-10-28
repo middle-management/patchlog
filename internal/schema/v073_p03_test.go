@@ -138,9 +138,11 @@ func TestV073RevisionAnchors(t *testing.T) {
 	}
 }
 
-// CIS-15: a format draft 2020-12 doesn't define makes a written schema
-// invalid; V073 asserts exactly that set, idn-email and idn-hostname with
-// UTS 46, and Legacy keeps the library's behaviour (§6.2 step 5).
+// CIS-15: a format draft 2020-12 doesn't define makes a schema invalid;
+// V073 asserts exactly that set, idn-email and idn-hostname by RFC 5890
+// (§6.2 step 5). Since v0.74 every schema compiles so, whatever its
+// marker (§6.1): Legacy selects nothing, and a stored revision naming
+// another format is invalid.
 func TestV073Formats(t *testing.T) {
 	for f := range formats2020 {
 		doc := `{` + d073 + `,"format":"` + f + `"}`
@@ -161,8 +163,7 @@ func TestV073Formats(t *testing.T) {
 	p := "/r/schemas/formats/rev/" + rev('j')
 	s := newStore()
 	s.docs[p] = j(`{` + d073 + `,"properties":{
-		"e":{"format":"idn-email"},"h":{"format":"idn-hostname"},
-		"v":{"format":"semver"},"p":{"format":"period"},"x":{"format":"x-unknown"}}}`)
+		"e":{"format":"idn-email"},"h":{"format":"idn-hostname"}}}`)
 	v := NewValidator()
 	check := func(rules Rules, member, value string, ok bool) {
 		t.Helper()
@@ -197,21 +198,23 @@ func TestV073Formats(t *testing.T) {
 		{"h", "xn--X", false},
 		{"h", "", false},
 		{"h", strings.Repeat("a", 64) + ".example", false},
-		{"v", "not semver", true},
-		{"p", "not a period", true},
-		{"x", "anything", true},
 	} {
 		check(V073, c.member, c.value, c.ok)
+		check(Legacy, c.member, c.value, c.ok)
 	}
-	// Legacy, as every stored revision loads for now: semver and period
-	// asserted, idn-* not.
-	check(Legacy, "e", "not an email", true)
-	check(Legacy, "h", "ex ample.com", true)
-	check(Legacy, "v", "not semver", false)
-	check(Legacy, "p", "not a period", false)
-	check(Legacy, "x", "anything", true)
-	if err := v.Validate(map[string]any{"$schema": p, "v": "not semver"}, s.load); err == nil {
-		t.Error("Validate compiles stored revisions under V073")
+	if err := v.Validate(map[string]any{"$schema": p, "e": "not an email"}, s.load); err == nil {
+		t.Error("Validate doesn't assert idn-email")
+	}
+	// A stored revision naming a format outside the set is an invalid
+	// schema, under either marker.
+	for i, f := range []string{"semver", "period", "x-unknown"} {
+		q := "/r/schemas/formats" + f + "/rev/" + rev(byte('a'+i))
+		s.docs[q] = j(`{` + d073 + `,"properties":{"v":{"format":"` + f + `"}}}`)
+		for _, rules := range []Rules{Legacy, V073} {
+			if err := v.ValidateRules(map[string]any{"$schema": q, "v": "x"}, s.load, rules); !isSchemaErr(err) {
+				t.Errorf("%v: stored format %s: got %v, want SchemaError", rules, f, err)
+			}
+		}
 	}
 }
 
@@ -257,70 +260,63 @@ func TestV073Patterns(t *testing.T) {
 	if err := writeCheck(`{` + d073 + `,"pattern":"^\\\\u0041$"}`); err != nil {
 		t.Errorf("escaped backslash: %v", err)
 	}
-	// A pattern RE2 took as written compiles as it did, though the
-	// translation refuses it.
+	// A stored pattern RE2 took as written but the translation refuses
+	// makes the schema invalid: every schema compiles under this version
+	// (§6.1, v0.74).
 	s.docs[p] = j(`{` + d073 + `,"properties":{"a":{"pattern":"^a\\x{D800}?$"}}}`)
-	if err := CheckSchemaDocument(s.docs[p], p); err != nil {
+	if err := CheckSchemaDocument(s.docs[p], p); !isSchemaErr(err) {
 		t.Errorf("stored: %v", err)
 	}
-	if err := NewValidator().Validate(j(`{"$schema":"`+p+`","a":"a"}`), s.load); err != nil {
+	if err := NewValidator().Validate(j(`{"$schema":"`+p+`","a":"a"}`), s.load); !isSchemaErr(err) {
 		t.Errorf("stored: %v", err)
 	}
 }
 
-// CIS-17: stored revisions are checked in stored mode, by v0.55's rules,
-// and compile under their marker, cached by path and marker (§6.1).
+// CIS-17, as v0.74 has it: a stored revision is checked as one written
+// now, whatever its marker, so what v0.55 accepted (a root $id equal to
+// its own path, a nested dialect $schema, a format such as semver) makes
+// it invalid (§6.1: every schema compiles under this version).
 func TestV073StoredModeAndMarker(t *testing.T) {
 	p := "/r/schemas/old/rev/" + rev('l')
-	doc := j(`{` + d073 + `,"$id":"` + p + `","properties":{
-		"n":{` + d073 + `,"type":"string"},"v":{"format":"semver"},"x":{"format":"x-mine"}}}`)
-	if err := CheckSchemaDocument(doc, p); err != nil {
-		t.Fatalf("stored mode: %v", err)
-	}
-	if err := checkStoredSchema(doc, p); err != nil {
-		t.Fatalf("checkStoredSchema: %v", err)
-	}
-	if err := CheckSchemaDocument(doc, ""); !isSchemaErr(err) {
-		t.Fatalf("write mode: %v", err)
-	}
-	s := newStore()
-	s.docs[p] = doc
-	v := NewValidator()
-	bad := map[string]any{"$schema": p, "v": "x"}
-	if err := v.ValidateRules(bad, s.load, Legacy); err == nil {
-		t.Error("Legacy: semver not asserted")
-	}
-	if err := v.ValidateRules(bad, s.load, V073); err != nil {
-		t.Errorf("V073: %v", err)
-	}
-	for _, r := range []Rules{Legacy, V073} {
-		if _, ok := v.compiled.Get(compiledKey{p, r}); !ok {
-			t.Errorf("%v not cached", r)
+	for _, doc := range []string{
+		`{` + d073 + `,"$id":"` + p + `"}`,
+		`{` + d073 + `,"properties":{"n":{` + d073 + `,"type":"string"}}}`,
+		`{` + d073 + `,"properties":{"v":{"format":"semver"}}}`,
+		`{` + d073 + `,"properties":{"x":{"format":"x-mine"}}}`,
+	} {
+		if err := CheckSchemaDocument(j(doc), p); !isSchemaErr(err) {
+			t.Errorf("%s: stored check %v, want SchemaError", doc, err)
 		}
-	}
-	if s.calls[p] != 1 {
-		t.Errorf("loaded %d times", s.calls[p])
+		if err := checkStoredSchema(j(doc), p); !isSchemaErr(err) {
+			t.Errorf("%s: checkStoredSchema %v, want SchemaError", doc, err)
+		}
+		s := newStore()
+		s.docs[p] = j(doc)
+		v := NewValidator()
+		for _, r := range []Rules{Legacy, V073} {
+			if err := v.ValidateRules(map[string]any{"$schema": p, "v": "x"}, s.load, r); !isSchemaErr(err) {
+				t.Errorf("%s: %v: %v, want SchemaError", doc, r, err)
+			}
+		}
+		if _, ok := v.compiled.Get(p); ok {
+			t.Errorf("%s: an invalid schema cached", doc)
+		}
 	}
 }
 
-// Invariant 3: a schema stored before the upgrade, with a format semver, a
-// nested $schema and a root $id equal to its own path, validates its
-// documents exactly as before.
+// Invariant 3 against v0.74's "every schema compiles under this version"
+// (§6.1): a schema stored before the upgrade with a format semver, a
+// nested $schema and a root $id equal to its own path is now an invalid
+// schema; validating against it is refused rather than run as v0.55 ran
+// it.
 func TestV073StoredBeforeUpgrade(t *testing.T) {
 	p := "/r/schemas/before/rev/" + rev('m')
 	s := newStore()
 	s.docs[p] = j(`{` + d073 + `,"$id":"` + p + `","type":"object","properties":{
 		"v":{"format":"semver"},"n":{` + d073 + `,"type":"string"}},"required":["v"]}`)
 	v := NewValidator()
-	if err := v.Validate(j(`{"$schema":"`+p+`","v":"1.2.3","n":"x"}`), s.load); err != nil {
-		t.Fatalf("valid: %v", err)
-	}
-	var ve *ValidationError
-	if err := v.Validate(j(`{"$schema":"`+p+`","v":"1.2","n":1}`), s.load); !errors.As(err, &ve) || len(ve.Errors) != 2 {
-		t.Fatalf("got %v, want errors at /n and /v", err)
-	}
-	if ve.Errors[0].Pointer != "/n" || ve.Errors[1].Pointer != "/v" {
-		t.Errorf("errors %+v", ve.Errors)
+	if err := v.Validate(j(`{"$schema":"`+p+`","v":"1.2.3","n":"x"}`), s.load); !isSchemaErr(err) {
+		t.Fatalf("got %v, want SchemaError", err)
 	}
 }
 
@@ -517,28 +513,29 @@ func TestV073RefsFailClosed(t *testing.T) {
 	}
 }
 
-// Invariant 3: a schema written now may $ref a revision stored before the
-// upgrade whose pattern RE2 took as written though the translation refuses
-// it; the revisions of a written schema's closure compile as they did
-// (§6.1), while its own patterns are read as §6.6 says.
+// A schema written now may not $ref a revision stored before the upgrade
+// whose pattern RE2 took as written though the translation refuses it:
+// since v0.74 every revision of the closure compiles under this version
+// (§6.1, §6.6), so the closure is invalid, as the schema's own pattern
+// is.
 func TestV073WriteRefsStoredPattern(t *testing.T) {
 	p := "/r/schemas/oldpat/rev/" + rev('r')
 	s := newStore()
 	s.docs[p] = j(`{` + d073 + `,"type":"string","pattern":"^a\\x{D800}?$"}`)
 	v := NewValidator()
 	doc := j(`{` + d073 + `,"type":"object","properties":{"a":{"$ref":"` + p + `"}}}`)
-	if err := v.Validate(doc, s.load); err != nil {
-		t.Fatalf("referencing it: %v", err)
+	if err := v.Validate(doc, s.load); !isInvalid(err) {
+		t.Fatalf("referencing it: got %v, want invalid", err)
 	}
 	if err := v.Validate(j(`{`+d073+`,"properties":{"a":{"$ref":"`+p+`"},"b":{"pattern":"^a\\x{D800}?$"}}}`), s.load); !isInvalid(err) {
 		t.Errorf("its own pattern: got %v, want invalid", err)
 	}
 }
 
-// CIS-17, INV-2: re-validating a schema document under the marker it was
-// written under gives the answer its write got. Under Legacy it is held
-// to v0.55's rules (stored mode, no revision path); under V073, and in a
-// write (Validate), to today's (§6.1).
+// CIS-17, INV-2, as v0.74 has it: a schema document is held to today's
+// rules whatever marker it was written under (§6.1: every schema compiles
+// under this version), so re-validating one v0.55 accepted under Legacy
+// gives the answer a write now gets.
 func TestV073RevalidateStoredSchemaDocument(t *testing.T) {
 	old := `{` + d073 + `,"type":"object","properties":{
 		"v":{"type":"string","format":"semver"},
@@ -546,31 +543,18 @@ func TestV073RevalidateStoredSchemaDocument(t *testing.T) {
 		"p":{"type":"string","pattern":"^a\\x{D800}?$"},
 		"n":{` + d073 + `,"type":"string"}}}`
 	v, s := NewValidator(), newStore()
-	if err := v.ValidateRules(j(old), s.load, Legacy); err != nil {
-		t.Errorf("Legacy: %v", err)
-	}
-	if err := v.ValidateRules(j(old), s.load, V073); !isInvalid(err) {
-		t.Errorf("V073: got %v, want invalid", err)
+	for _, r := range []Rules{Legacy, V073} {
+		if err := v.ValidateRules(j(old), s.load, r); !isInvalid(err) {
+			t.Errorf("%v: got %v, want invalid", r, err)
+		}
 	}
 	if err := v.Validate(j(old), s.load); !isInvalid(err) {
 		t.Errorf("written now: got %v, want invalid", err)
 	}
-	// What v0.55 refused, Legacy still refuses, as v0.55 did.
-	var re *RefError
 	for _, doc := range []string{
 		`{` + d073 + `,"$id":"` + pathPerson + `"}`,
 		`{` + d073 + `,"$id":""}`,
 		`{` + d073 + `,"$ref":"` + pathAddress + `#/nope"}`,
-	} {
-		err := v.ValidateRules(j(doc), s.load, Legacy)
-		if strings.Contains(doc, "$id") && !errors.As(err, &re) {
-			t.Errorf("%s: got %T %v, want RefError", doc, err, err)
-		}
-		if err == nil {
-			t.Errorf("%s: Legacy accepts", doc)
-		}
-	}
-	for _, doc := range []string{
 		`{` + d073 + `,"foo":1}`,
 		`{` + d073 + `,"pattern":"(?=a)"}`,
 		`{` + d073 + `,"type":"nope"}`,

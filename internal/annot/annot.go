@@ -153,7 +153,7 @@ func newCollector(load schema.Loader, keywords []string) *collector {
 		}
 	}
 	comp := jsonschema.NewCompiler()
-	schema.Legacy.Configure(comp) // as stored revisions compile (§6.1)
+	schema.V073.Configure(comp) // as every schema compiles (§6.1)
 	comp.UseLoader(urlLoader(func(u string) (any, error) { return c.doc(u) }))
 	c.comp = comp
 	return c
@@ -453,7 +453,7 @@ func (c *collector) regexp(re string) (*regexp.Regexp, error) {
 	if r, ok := c.regexps[re]; ok {
 		return r, nil
 	}
-	r, err := schema.Legacy.CompileRegexp(re)
+	r, err := schema.V073.CompileRegexp(re)
 	if err != nil {
 		return nil, &schema.SchemaError{Msg: fmt.Sprintf("patternProperties %q: %v", re, err)}
 	}

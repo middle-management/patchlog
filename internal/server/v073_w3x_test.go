@@ -106,9 +106,9 @@ func TestW3XRemoteMirrorKeepsRulesMarker(t *testing.T) {
 
 // W3X: a base that serves a schema revision as Legacy, or sends no
 // marker, as a server from before markers compiles every schema as
-// Legacy, is mirrored as Legacy: B then validates under the revision as
-// such a base does (idn-email not asserted), and serves the mirror as
-// legacy.
+// Legacy, is mirrored as Legacy, and B serves the mirror as legacy. Since
+// v0.74 the marker selects nothing: B validates under the revision as
+// every schema compiles now, idn-email asserted (§6.1).
 func TestW3XRemoteMirrorLegacyMarker(t *testing.T) {
 	t.Parallel()
 	for _, served := range []string{"legacy", ""} {
@@ -142,8 +142,8 @@ func TestW3XRemoteMirrorLegacyMarker(t *testing.T) {
 			a.create("main", "x", map[string]any{"$schema": "/r/schemas/mail/rev/" + s, "e": "a@b.example"})
 			expect(t, b.mkRemote("rel", remoteGenesis("main", a.nsHead("main"), nil)), 201)
 			r := b.write("PATCH", "rel", "y", "", addRoot(map[string]any{"$schema": "/r/schemas/mail/rev/" + s, "e": "not an email"}))
-			if r.Code != 201 {
-				t.Errorf("B under a revision its base serves as %q: %d %s, want 201 (idn-email not asserted, as under Legacy)", served, r.Code, r.Body)
+			if r.Code != 422 || r.Str("code") != "invalid" {
+				t.Errorf("B under a revision its base serves as %q: %d %s, want 422 invalid (idn-email asserted whatever the marker)", served, r.Code, r.Body)
 			}
 			if r := b.get("/r/schemas/mail/rev/" + s); r.H.Get(schema.RulesHeader) != "legacy" {
 				t.Errorf("B's mirror: %s %q, want legacy", schema.RulesHeader, r.H.Get(schema.RulesHeader))
