@@ -46,27 +46,21 @@ func (s *Store) Prefetch(ctx context.Context, ns string, names []string) (*ddb.N
 		}
 	}
 	names = uniq
-	keys := []map[string]types.AttributeValue{keyAV(keyMeta(ns)), keyAV(keyTip(ns))}
+	keys := []Key{keyMeta(ns), keyTip(ns)}
 	for _, n := range names {
-		keys = append(keys, keyAV(keyRes(ns, n)), keyAV(keyDocHead(ns, n)))
+		keys = append(keys, keyRes(ns, n), keyDocHead(ns, n))
 	}
-	out, err := s.Client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
-		RequestItems: map[string]types.KeysAndAttributes{
-			s.Table: {Keys: keys, ConsistentRead: boolptr(true)},
-		},
-	})
+	// Keys DynamoDB leaves unprocessed (part of a batch throttled) are
+	// asked for again: none is taken as absent.
+	got, err := s.batchGet(ctx, keys)
 	if err != nil {
 		return nil, nil, err
-	}
-	if len(out.UnprocessedKeys) > 0 {
-		return nil, nil, apiErr(503, "throughput", "detail", "unprocessed keys")
 	}
 	var r *ddb.NSRow
 	var t *tip
 	res := map[string]*resRow{}
 	docs := map[string]item{}
-	for _, it := range out.Responses[s.Table] {
-		i := item(it)
+	for _, i := range got {
 		switch sk := i.s("SK"); {
 		case sk == "#META":
 			m := scanNSMeta(i)

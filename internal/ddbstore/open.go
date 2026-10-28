@@ -2,10 +2,12 @@ package ddbstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -15,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/middle-management/patchlog/internal/ddb"
 )
@@ -104,7 +107,60 @@ func newRetryer() aws.Retryer {
 		o.MaxBackoff = retryMax
 		o.Backoff = retry.BackoffDelayerFunc(retryDelay)
 		o.RateLimiter = ratelimit.None
+		// A transaction cancelled for throttling alone wrote nothing, and
+		// its conditions are evaluated again: DynamoDB answers it as a
+		// cancellation, which the SDK doesn't retry, failing every write
+		// of a group commit at once.
+		o.Retryables = append([]retry.IsErrorRetryable{retry.IsErrorRetryableFunc(func(err error) aws.Ternary {
+			if throttledOnly(err) {
+				return aws.TrueTernary
+			}
+			return aws.UnknownTernary
+		})}, o.Retryables...)
+		o.Throttles = append(o.Throttles, retry.IsErrorThrottleFunc(func(err error) aws.Ternary {
+			if throttledOnly(err) {
+				return aws.TrueTernary
+			}
+			return aws.UnknownTernary
+		}))
 	})
+}
+
+// throttledOnly reports a transaction cancelled for throttling on some
+// item and for nothing else: a failed condition or a conflict means what
+// it read moved, ErrStale's check again, not the same call again.
+func throttledOnly(err error) bool {
+	var tc *types.TransactionCanceledException
+	if !errors.As(err, &tc) {
+		return false
+	}
+	throttled := false
+	for _, r := range tc.CancellationReasons {
+		switch deref(r.Code) {
+		case "", "None":
+		case "ThrottlingError":
+			throttled = true
+		default:
+			return false
+		}
+	}
+	return throttled
+}
+
+// backOff waits before attempt+1 at what a batch call left unprocessed,
+// DynamoDB's throttling of part of a batch, as the retryer waits before a
+// throttled call's: past retryAttempts, it is a 503.
+func (s *Store) backOff(ctx context.Context, attempt int, what string) error {
+	if attempt >= retryAttempts {
+		return apiErr(503, "unavailable", "message", "DynamoDB left "+what+" after "+strconv.Itoa(attempt)+" attempts")
+	}
+	d, _ := retryDelay(attempt, nil)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
 }
 
 // retryDelay is attempt's wait: uniform in [0, min(retryMax, retryBase·2^(attempt-1))].

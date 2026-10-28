@@ -23,7 +23,6 @@ import (
 	"errors"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -157,12 +156,9 @@ func (s *Store) putAll(ctx context.Context, items []map[string]types.AttributeVa
 			if err != nil {
 				return err
 			}
-			reqs = out.UnprocessedItems[s.Table]
-			if len(reqs) > 0 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(time.Duration(1<<min(attempt, 6)) * 10 * time.Millisecond):
+			if reqs = out.UnprocessedItems[s.Table]; len(reqs) > 0 {
+				if err := s.backOff(ctx, attempt+1, "items unprocessed"); err != nil {
+					return err
 				}
 			}
 		}

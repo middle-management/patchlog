@@ -225,7 +225,7 @@ func (s *Store) batchGet(ctx context.Context, keys []Key) (map[Key]item, error) 
 		}
 		uniq = uniq[n:]
 		pending := map[string]types.KeysAndAttributes{s.Table: {Keys: req, ConsistentRead: boolptr(true)}}
-		for len(pending) > 0 {
+		for attempt := 1; len(pending) > 0; attempt++ {
 			res, err := s.Client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{RequestItems: pending})
 			if err != nil {
 				return nil, err
@@ -234,7 +234,11 @@ func (s *Store) batchGet(ctx context.Context, keys []Key) (map[Key]item, error) 
 				i := item(it)
 				out[Key{i.s("PK"), i.s("SK")}] = i
 			}
-			pending = res.UnprocessedKeys
+			if pending = res.UnprocessedKeys; len(pending) > 0 {
+				if err := s.backOff(ctx, attempt, "keys unprocessed"); err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
 	return out, nil
