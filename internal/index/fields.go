@@ -342,9 +342,10 @@ func (l sloc) id() string { return l.base + "#" + l.ptr.String() }
 // of §6.5, through only the keywords that mark a path (§A.4): at every
 // instance location it considers every subschema that could apply through
 // $ref and $dynamicRef, properties, patternProperties,
-// additionalProperties, dependentSchemas (of members present), items,
-// prefixItems and contains, and every branch of allOf, anyOf, oneOf, if,
-// then and else, whether or not it validates; never not, propertyNames,
+// additionalProperties, dependentSchemas (every entry, whatever members
+// the instance holds), items, prefixItems and contains, and every branch
+// of allOf, anyOf, oneOf, if, then and else, whether or not it validates,
+// as a path is marked whatever the data (§A.4); never not, propertyNames,
 // unevaluated* or contentSchema. A document that doesn't validate gets its
 // rows all the same. Only strings, numbers and booleans are collected, an
 // array's scalars at the array's own path, and text collects strings only:
@@ -388,7 +389,6 @@ type here struct {
 func (w *valueWalk) walk(locs []sloc, inst any, at, field pointer.Pointer) {
 	var hs []here
 	seen := map[string]bool{}
-	obj, _ := inst.(map[string]any)
 	for len(locs) > 0 {
 		l := locs[0]
 		locs = locs[1:]
@@ -421,10 +421,8 @@ func (w *valueWalk) walk(locs []sloc, inst any, at, field pointer.Pointer) {
 			}
 		}
 		deps, _ := s["dependentSchemas"].(map[string]any)
-		for n := range deps {
-			if _, present := obj[n]; present {
-				locs = append(locs, l.child("dependentSchemas", n))
-			}
+		for _, n := range sortedKeys(deps) {
+			locs = append(locs, l.child("dependentSchemas", n))
 		}
 	}
 	for _, h := range hs {

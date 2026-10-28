@@ -79,3 +79,22 @@ func TestV074V03SchemaFinalStatus(t *testing.T) {
 		}
 	}
 }
+
+// CORE-7/SERVICES-3 (§A.2, §A.4, Open 88): a schema marks, and the walk
+// collects, through dependentSchemas whatever the data, so a document
+// without the dependency's member still has its rows there.
+func TestV074V03DependentSchemasWhateverTheData(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := setup(t)
+	dep := must(w.c.CreateDoc(ctx, "schemas", "dep", map[string]any{"$schema": d2020, "type": "object",
+		"dependentSchemas": map[string]any{"a": map[string]any{"properties": map[string]any{"b": map[string]any{"x-index": "facet"}}}}}))
+	must(w.c.CreateDoc(ctx, "matches", "nodep", map[string]any{"$schema": "/r/schemas/dep/rev/" + dep.ID, "b": "x"}))
+	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}})
+	s.caughtUp("matches")
+	body := s.expect("/matches?facet[/b]=x&counts=/b", "nodep")
+	counts, _ := body["counts"].(map[string]any)
+	if got, _ := counts["/b"].(map[string]any); len(got) != 1 || got["x"] != 1.0 {
+		t.Errorf("counts %v, want {/b: {x: 1}}", body["counts"])
+	}
+}
