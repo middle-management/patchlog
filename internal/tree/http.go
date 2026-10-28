@@ -2249,10 +2249,11 @@ func nonNil(a []any) []any {
 // paths returns every walkable path from n up to a root for the viewer
 // through nodes it may see, root first, without n itself, bounded at
 // MaxDepth and maxPaths. A root for the viewer is a node without parents,
-// or a visible one whose parents are all hidden from it, where its paths
-// end (§B.11.5). incomplete counts paths that end below a root (at a node
-// whose parents are all gone, dangling or cyclic), deep those cut at
-// MaxDepth. A path through a node the viewer may not see is left out
+// or, in a subject set's listings, a visible one with no visible parent,
+// none walkable included, where its paths end (§B.11.5, rootFor).
+// incomplete counts paths that end below a root in unfiltered listings
+// (at a node whose parents are all gone, dangling or cyclic, §B.5), deep
+// those cut at MaxDepth. A path through a node the viewer may not see is left out
 // without a trace: listings show only paths through visible folders, and
 // nothing about a hidden node, not even a count (§B.11.5), so limits apply
 // to visible paths only.
@@ -2277,7 +2278,12 @@ func (q *query) paths(n *Node) (paths [][]*Node, incomplete, deep int, truncated
 		}
 		ps := q.g.WalkableParents(x)
 		if len(ps) == 0 {
-			incomplete++
+			if q.filtered() {
+				// No visible parent: x is a root for the subject set.
+				end()
+			} else {
+				incomplete++
+			}
 			return
 		}
 		var visible []*Node
@@ -2418,9 +2424,9 @@ func (q *query) subtree() (any, int, string) {
 	return body, http.StatusOK, ""
 }
 
-// roots lists the roots for the reader's subject set (§B.5, §B.11.5):
-// visible nodes without parents, and visible nodes whose parents are all
-// hidden from it.
+// roots lists the roots for the reader (§B.5, §B.11.5, rootFor): visible
+// nodes without parents, and, for a subject set, visible nodes with no
+// visible parent.
 func (q *query) roots() (any, int, string) {
 	out := []any{}
 	for _, n := range q.rootNodes() {
@@ -2441,9 +2447,10 @@ func (q *query) rootNodes() []*Node {
 }
 
 // rootFor reports whether n, visible to the viewer, is a root for it: it
-// has no parents, or every parent a walk may go up to is hidden from it
-// (§B.11.5). A node whose parents are all gone, dangling or cyclic is an
-// orphan (§B.5), not a root.
+// has no parents, or, in a subject set's listings, no parent a walk may go
+// up to is visible to it, none at all included, so a visible node whose
+// parents are all gone, dangling or cyclic is a root there too (§B.11.5).
+// In unfiltered listings such a node is an orphan (§B.5), not a root.
 func (q *query) rootFor(n *Node) bool {
 	if len(n.Parents) == 0 {
 		return true
@@ -2454,8 +2461,13 @@ func (q *query) rootFor(n *Node) bool {
 			return false
 		}
 	}
-	return len(ps) > 0
+	return len(ps) > 0 || q.filtered()
 }
+
+// filtered reports whether the listing is a subject set's, filtered by
+// what its roles make visible (§B.11.5), not an unfiltered one (g/all or
+// the public URL space), whose roots and orphans are §B.5's.
+func (q *query) filtered() bool { return !q.v.anon && q.v.gs != AllSubjects }
 
 func (q *query) parentsJSON(n *Node) []any {
 	out := []any{}

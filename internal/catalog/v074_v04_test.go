@@ -3,6 +3,7 @@ package catalog_test
 import (
 	"context"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -158,4 +159,52 @@ func TestItemVisibilityWithRulesV074(t *testing.T) {
 		"value": []any{map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}}})
 	w.issue(bob, purged, 403)
 	w.issue(bob, restore, 403)
+}
+
+// TestNoVisibleParentIsRootV074 (Open 101): in a subject set's listings a
+// visible node with no visible parent is a root, none at all included:
+// a placement whose own $access shares it, its only parent a folder
+// since deleted, is listed in roots, and its one path ends at it, not
+// counted incomplete (§B.11.5). Unfiltered listings keep §B.5's roots
+// and orphans.
+func TestNoVisibleParentIsRootV074(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	guest := w.caller("user:guest")
+	rootsOf := func(token string) []string {
+		t.Helper()
+		r, _ := w.follow("/cat/roots", token)
+		if r.status != 200 {
+			t.Fatalf("roots: %d %v", r.status, r.body)
+		}
+		var out []string
+		for _, x := range r.body["roots"].([]any) {
+			out = append(out, x.(map[string]any)["name"].(string))
+		}
+		return out
+	}
+	check := func(when string) {
+		t.Helper()
+		if got := rootsOf(guest); !reflect.DeepEqual(got, []string{"matches.other"}) {
+			t.Errorf("%s: guest's roots %v", when, got)
+		}
+		r, _ := w.follow("/cat/ancestors?of=matches.other", guest)
+		if r.status != 200 || r.body["incomplete"] != nil || !reflect.DeepEqual(r.body["paths"], []any{[]any{}}) {
+			t.Errorf("%s: guest's ancestors of matches.other: %d %v", when, r.status, r.body)
+		}
+	}
+	// derbies is hidden from guest: matches.other is its root.
+	check("under a hidden folder")
+	must(w.ops.Delete(ctx, "cat", "derbies", w.catHead("derbies")))
+	w.caughtUp()
+	check("under a deleted folder")
+	// Unfiltered, it is an orphan, not a root (§B.5).
+	all := w.opsKey.Grant(t, w.s.Now(), "user:r", []string{"cat", "matches"}, []string{"read"})
+	if got := rootsOf(all); slices.Contains(got, "matches.other") {
+		t.Errorf("unfiltered roots %v list the orphan", got)
+	}
 }
