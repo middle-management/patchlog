@@ -2,12 +2,17 @@ package tree_test
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/derived"
+	"github.com/middle-management/patchlog/internal/keystore"
+	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -89,4 +94,105 @@ func contains(xs []string, x string) bool {
 		}
 	}
 	return false
+}
+
+// TestV074BornOfAnotherEpoch (Open 15, §E.2.6): a node's born derives
+// from its first revision, its title from its head. A folder created in
+// epoch 1 and retitled in epoch 2 is listed per entry, its "sealed"
+// under cat#2 holding only its title, and its born sealed in place, as a
+// value of another resource is, "born": { "sealed": JWE } of { born }
+// under its K_r of cat#1, pl { ns, name, view }. A g/all listing whose
+// values come from those two epochs isn't sealed whole. The epoch is kept
+// with the node across a restart, and read in for a database from before
+// it was kept (backfillEpochs).
+func TestV074BornOfAnotherEpoch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "c"))).CreateNamespace(ctx, "c", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"encryption": map[string]any{"level": "sealed"}, "catalog": map[string]any{"trust": []any{"c"}, "mode": "tree"}}))
+	all := []string{"cat", "c"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "append", "config"})), client.WithKeys(client.NewKeys(nil)))
+	createNonced(t, w, "cat", "root", map[string]any{"parents": []any{}})
+	createNonced(t, w, "cat", "old", map[string]any{"title": "Old", "parents": parents("root")})
+	keys := map[string][]byte{}
+	addKeys := func() {
+		for _, e := range must(w.FetchKeys(ctx, "cat", nil, nil)) {
+			keys[e.Kid] = e.Key
+		}
+	}
+	addKeys()
+	must(s.Engine.RotateEpoch(ctx, "cat", "system:rotate"))
+	addKeys()
+	keyOf := func(kid string) []byte { return keys[kid] }
+	h := must(w.Head(ctx, "cat", "old"))
+	must(w.Append(ctx, "cat", "old", h.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": "Older"},
+		map[string]any{"op": "add", "path": "/$nonce", "value": seal.NewNonce()}}))
+
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"},
+		map[string]any{"nbf": s.Now().Add(-24 * time.Hour).Format(time.RFC3339)})), client.WithKeys(client.NewKeys(nil)))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat", "c")
+	full := k.Grant(t, s.Now(), "user:r", all, []string{"read"})
+
+	check := func(when string) bool {
+		t.Helper()
+		f := x.fetch("/cat/children?of=root", full)
+		if f.header.Get("Content-Type") != "application/json" {
+			t.Logf("%s: g/all listing %s, want per entry", when, f.header.Get("Content-Type"))
+			return false
+		}
+		view := derived.View{NS: "cat", Target: f.path}
+		e := entriesOf(t, decode(t, f.body))["old"]
+		jwe, _ := e["sealed"].(string)
+		if jwe == "" || must(seal.ParseHeader(jwe)).Kid != "cat#2" {
+			t.Logf("%s: old sealed %v, want kid cat#2", when, e)
+			return false
+		}
+		vals := decode(t, must(derived.OpenItem(jwe, derived.ItemKey(keyOf, "cat", "old"), view, "cat", "old")))
+		if vals["title"] != "Older" || vals["born"] != nil {
+			t.Logf("%s: old's sealed values %v, want only its title", when, vals)
+			return false
+		}
+		born, _ := e["born"].(map[string]any)
+		bj, _ := born["sealed"].(string)
+		if len(born) != 1 || bj == "" || must(seal.ParseHeader(bj)).Kid != "cat#1" {
+			t.Logf("%s: old's born %v, want { sealed } under cat#1", when, e["born"])
+			return false
+		}
+		bv := decode(t, must(derived.OpenItem(bj, derived.ItemKey(keyOf, "cat", "old"), view, "cat", "old")))
+		if b, _ := bv["born"].(string); len(bv) != 1 || b == "" {
+			t.Logf("%s: old's born opens to %v, want { born }", when, bv)
+			return false
+		}
+		return true
+	}
+	if !check("following") {
+		t.Fatal("a born of another epoch isn't sealed apart")
+	}
+	// Kept with the node: a restart seals it so too, at a new at.
+	x.stop()
+	x = startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	createNonced(t, w, "cat", "later", map[string]any{"parents": parents("old")})
+	x.caughtUp("cat", "c")
+	if !check("restarted") {
+		t.Fatal("after a restart")
+	}
+	// A database from before born_epoch was kept reads it in.
+	x.stop()
+	sq := must(sql.Open("sqlite", db))
+	for _, q := range []string{`UPDATE nodes SET born_epoch = NULL`, `INSERT INTO meta (k, v) VALUES ('epochs', 'pending') ON CONFLICT (k) DO NOTHING`,
+		`DELETE FROM sealed_views`} {
+		if _, err := sq.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sq.Close()
+	x = startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	createNonced(t, w, "cat", "latest", map[string]any{"parents": parents("old")})
+	x.caughtUp("cat", "c")
+	waitFor(t, "the born epochs to be read in", func() bool { return check("backfilled") })
 }

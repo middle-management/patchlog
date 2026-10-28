@@ -544,13 +544,18 @@ var ops = map[string]bool{
 // its own), so the catalog is the one source of what a listing seals
 // whole. Each node's values are sealed under the epoch its head is
 // served under (Node.Epoch; the current one where that isn't known),
-// title and born alike. A g/all listing of a catalog that isn't public,
+// except a born whose revision, the node's first, is served under
+// another (Node.BornEpoch): that one is sealed in place, as a value of
+// another resource is, "born": { "sealed": JWE of { born } } under the
+// node's K_r of its epoch, pl { ns, name, view }, and left out where the
+// service can't have that epoch's key (§E.2.6). A g/all listing of a catalog that isn't public,
 // which every reader its URL admits reads whole, whose nodes' values all
 // come from one epoch, is sealed as one JWE under that epoch's key,
 // Content-Type application/jose, pl { ns, view } where view is the
 // listing's request target (/{catalog}/g/all/at/{at}/{op}?{query}, the
 // canonical form). Any other (a public catalog's, a subject set's, whose
-// readers see nodes only through roles, or one mixing epochs) is JSON in
+// readers see nodes only through roles, or one mixing epochs, a born's
+// included) is JSON in
 // which every node with a title or born carries "sealed": JWE of {
 // title?, born? } under that catalog resource's K_r of its epoch, pl {
 // ns, name, view }, in their place (§E.2.6, viewer.sealsWhole). Sealed listings are produced once per
@@ -1003,25 +1008,40 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				more, serr = nil, nil
 				epochs := map[int]bool{}
 				q := &query{s: s, g: g, cur: curMap, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
+				// sealAt seals vals of node name under its K_r of epoch e,
+				// "" where the key isn't read yet (asked for, and the
+				// listing computed again) or can't be had (lacking).
+				sealAt := func(name string, e int, vals map[string]any) string {
+					k, ok := keys[e]
+					if !ok {
+						if !lacking[e] {
+							missing[e] = true
+						}
+						return ""
+					}
+					jwe, err := derived.SealItem(k, q.view, name, vals)
+					if err != nil && serr == nil {
+						serr = err
+					}
+					return jwe
+				}
+				if info.Protected() {
+					// A born of another epoch than its node's head is a
+					// value of a revision of that epoch (§E.2.6).
+					q.bornApart = func(n *Node) int {
+						if e := n.BornEpoch; e > 0 && e != epochOf(n.Name) {
+							return e
+						}
+						return 0
+					}
+				}
 				switch {
 				case perEntry:
-					q.sealValues = func(name string, vals map[string]any) string {
-						e := epochOf(name)
-						k, ok := keys[e]
-						if !ok {
-							if !lacking[e] {
-								missing[e] = true
-							}
-							return ""
-						}
-						jwe, err := derived.SealItem(k, q.view, name, vals)
-						if err != nil && serr == nil {
-							serr = err
-						}
-						return jwe
-					}
+					q.sealValues = func(name string, vals map[string]any) string { return sealAt(name, epochOf(name), vals) }
+					q.sealIn = sealAt
 				case info.Protected():
 					q.noteValues = func(name string) { epochs[epochOf(name)] = true }
+					q.noteEpoch = func(e int) { epochs[e] = true }
 				}
 				if op == "children" && keep {
 					// The following pages are kept with this one, each at
@@ -1801,6 +1821,16 @@ type query struct {
 	// sealed whole (the epochs they derive from).
 	sealValues func(name string, vals map[string]any) string
 	noteValues func(name string)
+	// bornApart, set for a sealed or e2e catalog, is the epoch an explicit
+	// node's born is served under where it isn't the one its other values
+	// are sealed under, 0 otherwise. Such a born is sealed in place, as a
+	// value of another resource is (§E.2.6): sealIn seals it per entry,
+	// under the node's K_r of that epoch ("" where the service lacks the
+	// key: left out), and noteEpoch counts its epoch for a listing sealed
+	// whole, which it then isn't.
+	bornApart func(n *Node) int
+	sealIn    func(name string, epoch int, vals map[string]any) string
+	noteEpoch func(epoch int)
 	// files says how placements carry file metadata in a file tree
 	// (§H.3), sealed under view; serr records a sealing failure.
 	files *fileSealing
@@ -1919,7 +1949,11 @@ func (q *query) entry(n *Node) map[string]any {
 		vals["title"] = n.Title
 	}
 	if n.Born != "" && !n.Self {
-		vals["born"] = n.Born
+		if e := q.bornEpoch(n); e > 0 {
+			q.bornIn(m, n, e)
+		} else {
+			vals["born"] = n.Born
+		}
 	}
 	if n.Kind == KindPlacement {
 		m["kind"] = "item"
@@ -1954,6 +1988,37 @@ func (q *query) entry(n *Node) map[string]any {
 	}
 	q.values(m, n.Name, vals)
 	return m
+}
+
+// bornEpoch is the epoch n's born is served under where it isn't that of
+// n's other values (bornApart), 0 otherwise.
+func (q *query) bornEpoch(n *Node) int {
+	if q.bornApart == nil {
+		return 0
+	}
+	return q.bornApart(n)
+}
+
+// bornIn sets n's born, a value of a revision of epoch e, another epoch
+// than its other values', on its entry m: per entry, as
+// { "sealed": JWE of { born } } in place of the value, under the catalog
+// resource's K_r of e, pl { ns, name, view }, as a value of another
+// resource is sealed, and left out where the service can't have that key
+// (§E.2.6); otherwise in the clear, its epoch counted (noteEpoch), so the
+// listing isn't sealed whole under another.
+func (q *query) bornIn(m map[string]any, n *Node, e int) {
+	if q.sealValues != nil {
+		if q.sealIn != nil {
+			if jwe := q.sealIn(n.Name, e, map[string]any{"born": n.Born}); jwe != "" {
+				m["born"] = map[string]any{"sealed": jwe}
+			}
+		}
+		return
+	}
+	if q.noteEpoch != nil {
+		q.noteEpoch(e)
+	}
+	m["born"] = n.Born
 }
 
 func (q *query) visibleChildren(parent string) []Child {
