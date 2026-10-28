@@ -159,9 +159,16 @@ func TestAuthReads(t *testing.T) {
 	if x.Code != 404 || y.Code != 404 || string(x.Body) != string(y.Body) {
 		t.Fatalf("existence revealed: %d %s / %d %s", x.Code, x.Body, y.Code, y.Body)
 	}
-	for _, p := range []string{"/r/sec/a/rev/" + a, "/r/sec/a/rev/" + a + "/log", "/ns/sec", "/ns/sec/branches", "/r/sec/a/events", "/ns/sec/events"} {
+	for _, p := range []string{"/r/sec/a/rev/" + a, "/r/sec/a/rev/" + a + "/log", "/r/sec/a/events"} {
 		if r := e.get(p, noRead); r.Code != 404 {
 			t.Errorf("%s without read: %d", p, r.Code)
+		}
+	}
+	// Only resource URLs answer 404 without read: elsewhere a verified
+	// grant without read is 403 (§7, v0.74).
+	for _, p := range []string{"/ns/sec", "/ns/sec/branches", "/ns/sec/events"} {
+		if r := e.get(p, noRead); r.Code != 403 {
+			t.Errorf("%s without read: %d, want 403", p, r.Code)
 		}
 	}
 	// A grant from another namespace's key: 401 (unknown key).
@@ -179,7 +186,7 @@ func TestAuthReads(t *testing.T) {
 	expect(t, e.get("/r/sec/a", onlyA), 302)
 	expect(t, e.get("/r/sec/a/rev/"+a, onlyA), 200)
 	expect(t, e.get("/r/sec/b", onlyA), 404)
-	expect(t, e.get("/ns/sec", onlyA), 404)
+	expect(t, e.get("/ns/sec", onlyA), 403)
 	// Roles grant reads too.
 	tr := e.grant(f.issuer, "user:t", []string{"sec"}, nil, map[string]any{"roles": []any{"translator"}})
 	expect(t, e.get("/r/sec/a", tr), 302)

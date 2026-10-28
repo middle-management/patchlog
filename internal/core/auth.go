@@ -498,7 +498,7 @@ func (t *tx) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
 // access with may. A grant its key's scope doesn't allow (sub, groups,
 // maxTtl, requireAt, readScope …) is 403 there, as for a write: only a
 // read of a resource URL in a private namespace answers 404 (§C.2 item
-// 1, §7). A verified grant that may not read is 404.
+// 1, §7). A verified grant that may not read is 403 too (§7, v0.74).
 func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
 	return t.readerCheckURL(n, cred, may, readNS)
 }
@@ -522,8 +522,9 @@ const (
 )
 
 // readerCheckURL is readerCheck for a kind of read: a public namespace
-// ignores the grant, but at POST /ns/{ns}/keys, and a key-scope failure is
-// 404 at a resource URL.
+// ignores the grant, but at POST /ns/{ns}/keys, and a key-scope failure,
+// or a verified grant that may not read, is 404 at a resource URL and 403
+// elsewhere (§7, §C.2).
 func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, kind readKind) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	var a *actor
@@ -555,6 +556,11 @@ func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, k
 	if !may(a) {
 		if a == nil {
 			return nil, apiErr(401, "unauthenticated", "message", "missing grant")
+		}
+		if kind != readResource {
+			// Only a resource URL hides existence from a verified grant
+			// that may not read (§7, §C.2, §E.2.3).
+			return nil, forbidden("the grant does not allow this read in " + n.name)
 		}
 		return nil, notFound()
 	}

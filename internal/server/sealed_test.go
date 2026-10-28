@@ -326,7 +326,7 @@ func TestSealedReadGrant(t *testing.T) {
 	nr := e.grant(k, "user:x", []string{"s"}, []string{"append"})
 	expect(t, e.get("/r/s/a/rev/"+id), 401)
 	expect(t, e.get("/r/s/a/rev/"+id, nr), 404)
-	expect(t, e.get("/ns/s/rev/"+e.nsHead("s", w)+"/log", nr), 404)
+	expect(t, e.get("/ns/s/rev/"+e.nsHead("s", w)+"/log", nr), 403) // 404 only at resource URLs (§7, v0.74)
 	r := e.get("/r/s/a/rev/"+id, w)
 	expect(t, r, 200)
 	if !isJOSE(r) || r.H.Get("Cache-Control") != "private, max-age=300" || r.H.Get("CDN-Cache-Control") != "no-store" {
@@ -336,8 +336,8 @@ func TestSealedReadGrant(t *testing.T) {
 	if _, r := e.keysOf("s", nil, ""); r.Code != 401 {
 		t.Fatalf("keys without grant %d", r.Code)
 	}
-	if _, r := e.keysOf("s", nil, nr); r.Code != 404 {
-		t.Fatalf("keys without read %d", r.Code)
+	if _, r := e.keysOf("s", nil, nr); r.Code != 403 {
+		t.Fatalf("keys without read %d, want 403 (§E.2.3, v0.74)", r.Code)
 	}
 	// So does a sealed public namespace's.
 	e.mkNS("sp", sealedDoc(map[string]any{"read": "public", "keys": []any{k.entry("*")}}))

@@ -135,12 +135,12 @@ func TestV049PurgedGateOrder(t *testing.T) {
 	expectPurged(t, change(f.issuerG), head)
 	expectCode(t, change(f.issuerG), 429, "rate")
 
-	// /ns/{ns}/keys: 401 without a grant, 404 without read, 403 for a read
+	// /ns/{ns}/keys: 401 without a grant, 403 without read (v0.74), 403 for a read
 	// grant whose rules refuse an unrestricted read (§E.2.3), then 410:
 	// the purge shows only to a grant that passes the read check.
 	keys := func(bearer string) *resp { return e.do(req{method: "POST", path: "/ns/sec/keys", bearer: bearer}) }
 	expectCode(t, keys(""), 401, "unauthenticated")
-	expectCode(t, keys(e.grant(f.issuer, "user:w", []string{"sec"}, []string{"append"})), 404, "not_found")
+	expectCode(t, keys(e.grant(f.issuer, "user:w", []string{"sec"}, []string{"append"})), 403, "forbidden")
 	expectCode(t, keys(e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "append"}, refusesReads)), 403, "forbidden")
 	expectPurged(t, keys(f.adminG), head)
 	if e.nsHead("sec", f.adminG) != head {
@@ -170,7 +170,7 @@ func TestV049PurgedEncrypted(t *testing.T) {
 	expect(t, f.do(req{method: "POST", path: "/ns/e/purge", ifMatch: f.nsHead("e", f.adminG), bearer: f.adminG}), 204)
 	head = f.nsHead("e", f.adminG)
 	keys := func(bearer string) *resp { return f.do(req{method: "POST", path: "/ns/e/keys", bearer: bearer}) }
-	expectCode(t, keys(f.grant(f.writer, "user:r", []string{"e"}, []string{"read", "append"}, refusesReads)), 404, "not_found")
+	expectCode(t, keys(f.grant(f.writer, "user:r", []string{"e"}, []string{"read", "append"}, refusesReads)), 403, "forbidden") // §E.2.3, v0.74
 	expectPurged(t, keys(f.readerG), head)
 }
 

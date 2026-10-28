@@ -267,10 +267,10 @@ func TestV073P17KeyScopeFailureIs403(t *testing.T) {
 			t.Errorf("%s grant, GET /r/q/doc: %v", name, err)
 		}
 	}
-	// A verified grant without read keeps the 404 of a read it may not make.
+	// A verified grant without read is 403 off resource URLs (§7, v0.74).
 	writer := ks.mint(t, map[string]any{"kid": "admin", "sub": "user:w", "ns": []any{"p"}, "can": []any{"create"}})
-	if _, err := e.NamespaceHead(ctx, "p", writer); v073Status(err) != 404 {
-		t.Errorf("grant without read, GET /ns/p: want 404, got %v", err)
+	if _, err := e.NamespaceHead(ctx, "p", writer); v073Status(err) != 403 {
+		t.Errorf("grant without read, GET /ns/p: want 403, got %v", err)
 	}
 }
 

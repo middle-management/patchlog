@@ -108,7 +108,7 @@ func TestV049KeysUnrestricted(t *testing.T) {
 	_, r = e.keysOf("s", nil, e.grant(newKey("k"), "user:x", []string{"s"}, []string{"read"}))
 	expect(t, r, 401)
 	_, r = e.keysOf("s", nil, e.grant(k, "user:x", []string{"s"}, []string{"create"}))
-	expect(t, r, 404)
+	expect(t, r, 403) // a verified grant without read (§E.2.3, v0.74)
 	notNamed := e.grant(ok, "user:x", []string{"other"}, []string{"read"})
 	_, r = e.keysOf("s", nil, notNamed)
 	expectCode(t, r, 403, "forbidden")

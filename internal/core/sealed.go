@@ -536,8 +536,8 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		cfg := t.config(n.configSeq)
 		// Refused as /principal is, in a public namespace too (§7): 401
 		// without a usable grant, 403 for one that doesn't name the
-		// namespace or that its key's scope refuses (§C.2 item 1), and 404
-		// for one that has no read.
+		// namespace or that its key's scope refuses (§C.2 item 1), and 403
+		// for one that has no read (§E.2.3).
 		a, aerr := t.keysReader(n, cred, func(a *actor) bool {
 			return t.e.opt.AuthDisabled || a != nil && a.verified.Can["read"]
 		})
@@ -550,9 +550,10 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			// the namespace gets its own, unrestricted or limited to some
 			// resources: such a writer needs them, and the epoch and pad,
 			// to seal (§E.2.3, §E.3.1). Per-resource keys don't exist at
-			// E3. A grant whose rules refuse every read reads nothing.
+			// E3. A grant whose rules refuse every read reads nothing:
+			// 403, as any other verified grant /keys refuses (§7).
 			if _, refused := t.keysReadScope(a); refused {
-				return notFound()
+				return forbidden("the grant's rules refuse every read in " + ns)
 			}
 			// 410 once the read check passes, as every URL of a
 			// purged namespace (§8.5).
