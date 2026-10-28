@@ -20,6 +20,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/testenv"
 )
 
 // keyEntries returns the entries of a 200 POST /ns/{ns}/keys answer.
@@ -776,10 +777,10 @@ func TestV073HistoryEpochsZero(t *testing.T) {
 // not of a public or plain namespace's.
 func TestV073GrantCachesPurgedOnUpgrade(t *testing.T) {
 	t.Parallel()
-	path, blobs := v073DB(t), t.TempDir()
+	path, blobs := v073DB(t), testenv.FileBlobs(t)
 	ks := newKeyStore(t)
 	p := &recPurger{}
-	at := func(o *core.Options) { o.Path, o.BlobDir, o.Purger = path, blobs, p }
+	at := func(o *core.Options) { o.Path, o.BlobStore, o.Purger = path, blobs, p }
 	e := newEnv(t, withKeyStore(ks), withEncTuning, at)
 	e.mkNS("g", sealedDoc(map[string]any{"read": "grant"}))
 	e.mkNS("x", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})

@@ -14,6 +14,9 @@ package testenv
 // each serves about one request at a time, and the tests' tables are
 // spread over them.
 //
+// Independently, PATCHLOG_TEST_BLOBS (BlobsEnv) moves their blob bytes from
+// a temporary directory to S3.
+//
 // A backend that implements less than the spec (DynamoDB, docs/DYNAMODB.md
 // §13) says so, and the harness turns that into a skip rather than a
 // failure, so tests carry no per-backend annotations:
@@ -54,7 +57,9 @@ import (
 
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/ddbstore"
+	"github.com/middle-management/patchlog/internal/fsblobs"
 	"github.com/middle-management/patchlog/internal/pgtest"
+	"github.com/middle-management/patchlog/internal/s3blobs"
 )
 
 // The backend knobs.
@@ -135,10 +140,65 @@ func newTable(t testing.TB) string {
 	return url
 }
 
-// BlobDir is the blob directory a harness gives the engines it starts by
-// default: the test's temporary directory.
-func BlobDir(t testing.TB) string {
-	return t.TempDir()
+// BlobsEnv picks the blob store the harnesses give the engines they start
+// by default (Blobs): unset, a temporary directory per test; an s3:// URL
+// (internal/s3blobs), a prefix of that bucket per test, emptied when the
+// test ends. The bucket is created if missing, and credentials come from
+// the AWS chain:
+//
+//	AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+//	PATCHLOG_TEST_BLOBS='s3://patchlog-test?region=us-east-1&endpoint=http://localhost:8333' \
+//	    go test ./...
+const BlobsEnv = "PATCHLOG_TEST_BLOBS"
+
+var (
+	s3Once  sync.Once
+	s3Store *s3blobs.Store
+	s3Err   error
+	s3Seq   atomic.Int64
+)
+
+// FileBlobs is a blob store in a temporary directory of the test's.
+func FileBlobs(t testing.TB) core.BlobStore {
+	t.Helper()
+	s, err := fsblobs.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// Blobs sets the blob store of an engine a harness starts (BlobsEnv).
+func Blobs(t testing.TB, o *core.Options) {
+	t.Helper()
+	url := os.Getenv(BlobsEnv)
+	if url == "" {
+		o.BlobStore = FileBlobs(t)
+		return
+	}
+	s3Once.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if s3Store, s3Err = s3blobs.Open(ctx, url); s3Err == nil {
+			s3Err = s3Store.CreateBucket(ctx)
+		}
+	})
+	if s3Err != nil {
+		t.Fatalf("%s: %v", BlobsEnv, s3Err)
+	}
+	s := s3Store.Sub(fmt.Sprintf("test-%d-%d", time.Now().UnixNano(), s3Seq.Add(1)))
+	o.BlobStore = s
+	t.Cleanup(func() {
+		ctx := context.Background()
+		var names []string
+		s.List(ctx, func(name string, _ int64, _ time.Time) error {
+			names = append(names, name)
+			return nil
+		})
+		for _, n := range names {
+			s.Remove(ctx, n)
+		}
+	})
 }
 
 // SkipUnsupported skips the test when core.Open refused an option the

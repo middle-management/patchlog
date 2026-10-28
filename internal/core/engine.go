@@ -152,11 +152,18 @@ type Options struct {
 	// deleted (§7.8, SweepBlobs), and orphan blob files (SweepBlobFiles),
 	// on the leader. Zero means ten minutes; negative disables it.
 	BlobSweepInterval time.Duration
-	// BlobDir is the directory blob bytes are stored in (blobstore.go).
-	// Empty means "<Path>.blobs" for a SQLite file, and the database itself
-	// for ":memory:" and Postgres. Instances sharing a Postgres database
-	// must share the directory too.
-	BlobDir string
+	// BlobStore is where blob bytes are stored (blobstore.go): a directory
+	// (internal/fsblobs) or an object store such as S3 (internal/s3blobs);
+	// internal/blobstores opens either from -blob-store or -blob-dir, and
+	// picks the default (a directory next to a SQLite file). Nil keeps
+	// the bytes in the database (DynamoDB: in the items, at most
+	// ddb.MaxInlineBytes each). Instances sharing a database must share
+	// the store too.
+	BlobStore BlobStore
+	// BlobOrphanGrace is how old a file of the blob store must be before
+	// the orphan sweep deletes it when no row names it (SweepBlobFiles).
+	// Zero means an hour; it must exceed the longest transaction.
+	BlobOrphanGrace time.Duration
 	// TailInterval is how often the tailer polls the namespace logs on
 	// Postgres (tailer.go, default 100 ms): it wakes live readers for
 	// writes of other instances and invalidates in-memory caches.
@@ -240,7 +247,7 @@ type Engine struct {
 	be        backend
 	opt       Options
 	mu        sync.Mutex // serialises write transactions
-	blobs     blobStore
+	blobs     BlobStore  // nil: in the database
 	validator *schema.Validator
 	hub       *hub
 	rate      *rateLimiter
@@ -398,10 +405,9 @@ func Open(opt Options) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	blobs, err := openBlobStore(opt.BlobDir, opt.Path, pg)
-	if err != nil {
-		db.Close()
-		return nil, err
+	blobs := opt.BlobStore
+	if blobs == nil && pg {
+		log.Print("blob bytes are stored in the database: give -blob-store (an s3:// bucket, or a file:// directory every instance shares) to store them outside it")
 	}
 	if opt.RetentionInterval == 0 {
 		opt.RetentionInterval = time.Hour

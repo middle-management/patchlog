@@ -12,6 +12,7 @@ import (
 
 	plclient "github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/testenv"
 )
 
 // P32 REMOTE-LEVELS: a remote branch follows its base's level and read
@@ -498,8 +499,8 @@ func TestV073RemoteConfigPurgedBase(t *testing.T) {
 // this version isn't marked, and the mark goes with the first follow.
 func TestV073RemoteCatchUpAfterUpgrade(t *testing.T) {
 	t.Parallel()
-	path, blobs := v073DB(t), t.TempDir()
-	at := func(o *core.Options) { o.Path, o.BlobDir = path, blobs }
+	path, blobs := v073DB(t), testenv.FileBlobs(t)
+	at := func(o *core.Options) { o.Path, o.BlobStore = path, blobs }
 	a, b, rt := pair(t, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning}, []envOpt{withEncTuning, at})
 	a.mkNS("m", map[string]any{"read": "public"})
 	x1 := a.create("m", "x", map[string]any{"v": 1.0})

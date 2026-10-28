@@ -13,6 +13,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pgtest"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
+	"github.com/middle-management/patchlog/internal/testenv"
 )
 
 // v073DB is a database for a test to open, and inspect, by its path.
@@ -28,8 +29,8 @@ func v073DB(t *testing.T) string {
 // further options: a deployment restarted with other settings.
 func v073Reopenable(t *testing.T, opts ...envOpt) (*tenv, func(more ...envOpt) *tenv) {
 	t.Helper()
-	path, blobs := v073DB(t), t.TempDir()
-	at := func(o *core.Options) { o.Path, o.BlobDir = path, blobs }
+	path, blobs := v073DB(t), testenv.FileBlobs(t)
+	at := func(o *core.Options) { o.Path, o.BlobStore = path, blobs }
 	e := newEnv(t, append(append([]envOpt{}, opts...), at)...)
 	return e, func(more ...envOpt) *tenv {
 		t.Helper()
@@ -561,9 +562,9 @@ func v073Epoch(t *testing.T, path, ns string) float64 {
 // member is still held to it.
 func TestV073EpochRotationNotHeldToValues(t *testing.T) {
 	t.Parallel()
-	path, blobs := v073DB(t), t.TempDir()
+	path, blobs := v073DB(t), testenv.FileBlobs(t)
 	ks := newKeyStore(t)
-	at := func(o *core.Options) { o.Path, o.BlobDir = path, blobs }
+	at := func(o *core.Options) { o.Path, o.BlobStore = path, blobs }
 	e := newEnv(t, withKeyStore(ks), withEncTuning, at)
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
 	e.srv.Close()
@@ -647,9 +648,9 @@ func TestV073RemoteBranchCreationHeldToLimits(t *testing.T) {
 // /heads at rest lists none, even where a row still has them.
 func TestV073AtRestDigestsFromBeforeUpgrade(t *testing.T) {
 	t.Parallel()
-	path, blobs := v073DB(t), t.TempDir()
+	path, blobs := v073DB(t), testenv.FileBlobs(t)
 	ks := newKeyStore(t)
-	at := func(o *core.Options) { o.Path, o.BlobDir = path, blobs }
+	at := func(o *core.Options) { o.Path, o.BlobStore = path, blobs }
 	e := newEnv(t, withKeyStore(ks), withEncTuning, at)
 	e.mkNS("r", atRest(map[string]any{"read": "public"}))
 	e.mkNS("p", map[string]any{"read": "public"})

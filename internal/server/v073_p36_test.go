@@ -12,6 +12,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/testenv"
 )
 
 // P36 LEVELS-KEYS-BRANCHES: keys and remote branches after a raise to e2e
@@ -213,9 +214,9 @@ func TestV073P36RemoteBaseEpochNow(t *testing.T) {
 // v0.73 left it, has its checkpoint at that entry.
 func TestV073P36RemoteE2ERaiseAsFarAsLevelsAllow(t *testing.T) {
 	t.Parallel()
-	path, blobs := v073DB(t), t.TempDir()
+	path, blobs := v073DB(t), testenv.FileBlobs(t)
 	ksB := newKeyStore(t)
-	at := func(o *core.Options) { o.Path, o.BlobDir = path, blobs }
+	at := func(o *core.Options) { o.Path, o.BlobStore = path, blobs }
 	a, b, rt := pair(t, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning}, []envOpt{withKeyStore(ksB), withEncTuning, at})
 	a.mkNS("m", map[string]any{"read": "grant"})
 	x1 := a.create("m", "x", map[string]any{"v": 1.0})
@@ -403,10 +404,10 @@ func TestV073P36PurgedRemoteDropsPreRaiseKeys(t *testing.T) {
 		w.Write(raisedDoc)
 		return true
 	}, "", nil), "")
-	path, blobs := v073DB(t), t.TempDir()
+	path, blobs := v073DB(t), testenv.FileBlobs(t)
 	var bPriv ed25519.PrivateKey
 	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt), withKeyStore(newKeyStore(t)), withEncTuning,
-		func(o *core.Options) { o.Path, o.BlobDir = path, blobs })
+		func(o *core.Options) { o.Path, o.BlobStore = path, blobs })
 	b.opPriv = bPriv
 	b.clock.Advance(3 * time.Hour)
 	kB := newKey("badmin")

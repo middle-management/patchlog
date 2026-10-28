@@ -18,7 +18,7 @@ func replayEngine(tb testing.TB) *Engine {
 	if pgtest.Enabled() {
 		path = pgtest.NewDB(tb)
 	}
-	e, err := Open(Options{Path: path, BlobDir: tb.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: path, BlobStore: fileBlobs(tb), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Limits: lim, Purger: discardPurger{}})
 	if err != nil {
 		tb.Fatal(err)

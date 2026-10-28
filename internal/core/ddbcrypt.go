@@ -299,7 +299,7 @@ func (b *ddbBackend) encryptNamespace(ctx context.Context, ns string) error {
 				return nil, "", err
 			}
 			if file != "" {
-				f, err := b.e.blobs.open(file)
+				f, err := b.e.openStored(ctx, file)
 				if err != nil {
 					return nil, "", err
 				}

@@ -126,7 +126,7 @@ func TestV073P17CatalogsAndMaxLagNeedStarKey(t *testing.T) {
 // entry matches the author's sub alone, so two entries can match (§6.6
 // Allowances).
 func TestV073P17EndedAllowanceDoesNotHideLater(t *testing.T) {
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Limits: p17Fast(), Maximums: p17Fast(), TailInterval: tailEvery, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
@@ -279,7 +279,7 @@ func TestV073P17KeyScopeFailureIs403(t *testing.T) {
 // namespace defaults (maximums fast), and creates namespace n.
 func p17RateEngine(t *testing.T, path, dir string, clock *atomic.Int64, lim Limits, local bool) *Engine {
 	t.Helper()
-	e, err := Open(Options{Path: path, BlobDir: dir, AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: path, BlobStore: dirBlobs(t, dir), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Limits: lim, Maximums: p17Fast(), TailInterval: tailEvery, Purger: discardPurger{}, LocalRateBuckets: local,
 		Now: func() time.Time { return time.UnixMilli(clock.Load()) }})
 	if err != nil {

@@ -33,7 +33,7 @@ func newRefsEnv(t *testing.T) *refsEnv {
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), OperatorKeys: ops, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Limits: lim, TailInterval: authTailEvery, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)

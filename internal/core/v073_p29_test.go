@@ -26,7 +26,7 @@ func p29Engine(t *testing.T) *Engine {
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
 		Remote: RemoteOptions{FollowInterval: -1}, Limits: lim, Purger: discardPurger{}, KeyStore: ks})
 	if err != nil {
 		t.Fatal(err)
@@ -197,7 +197,7 @@ func TestV073P29SnapshotKidBeforeRaise(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := &p29Clock{t: time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)}
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
 		Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}, KeyStore: ks, Archiver: p29Archiver{}, Now: now.Now})
 	if err != nil {
 		t.Fatal(err)

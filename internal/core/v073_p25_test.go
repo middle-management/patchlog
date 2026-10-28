@@ -205,7 +205,7 @@ func p25E2EEngine(t *testing.T, ks *p17Keys) *p25E2E {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, KeyStore: store, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), OperatorKeys: ops, KeyStore: store, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Limits: p17Fast(), Maximums: p17Fast(), TailInterval: authTailEvery, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
@@ -386,7 +386,7 @@ func TestV073P25OperatorCreationGrantRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), OperatorKeys: ops, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Limits: p17Fast(), Maximums: p17Fast(), TailInterval: authTailEvery, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)

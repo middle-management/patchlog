@@ -103,7 +103,7 @@ func p36NewEnv(t *testing.T) *p36Env {
 	now := p36T0
 	env := &p36Env{now: &now, op: opPriv}
 	env.keys.add("admin", map[string]any{"can": []any{"*"}})
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1, BlobSweepInterval: -1,
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), OperatorKeys: ops, RetentionInterval: -1, BlobSweepInterval: -1,
 		Remote: RemoteOptions{FollowInterval: -1}, Limits: p17Fast(), Purger: discardPurger{}, KeyStore: ks,
 		Now: func() time.Time { return *env.now }})
 	if err != nil {
@@ -309,7 +309,7 @@ func TestV073P36PreRaiseHorizon(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := &p29Clock{t: p36T0}
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
 		Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}, KeyStore: ks, Archiver: p29Archiver{}, Now: now.Now})
 	if err != nil {
 		t.Fatal(err)

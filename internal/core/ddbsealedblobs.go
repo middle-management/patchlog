@@ -162,7 +162,7 @@ func (b *ddbBackend) storeSealedBlob(ctx context.Context, job *sealedBlobJob, se
 		return nil, asErrOrNil(perr)
 	}
 	data := sealed
-	mine, err := e.blobs.put(ddb.BlobEpochFile(job.ns, hex.EncodeToString(job.bid[:]), job.epoch), sealed)
+	mine, err := e.putBlob(ctx, ddb.BlobEpochFile(job.ns, hex.EncodeToString(job.bid[:]), job.epoch), sealed)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +179,7 @@ func (b *ddbBackend) storeSealedBlob(ctx context.Context, job *sealedBlobJob, se
 	case sf == mine && mine != "":
 		return sealed, nil
 	case sf != "":
-		f, err := e.blobs.open(sf)
+		f, err := e.openStored(ctx, sf)
 		if err != nil {
 			return nil, err
 		}

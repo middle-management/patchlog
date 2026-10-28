@@ -123,7 +123,7 @@ func v073Engine(t *testing.T, lim, max Limits, doc map[string]any) *v073Env {
 	for _, l := range []*Limits{&lim, &max} {
 		l.RatePerResource, l.RatePerPrincipal, l.RatePerNamespace = fast, fast, fast
 	}
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), OperatorKeys: ops, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Limits: lim, Maximums: max, TailInterval: authTailEvery, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)

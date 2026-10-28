@@ -107,8 +107,9 @@ func New(t testing.TB, opt Options) *Server {
 		opt.Start = time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
 	}
 	testenv.Known(t)
-	o := core.Options{Path: testenv.DB(t), BlobDir: testenv.BlobDir(t), Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}, KeyStore: opt.KeyStore,
+	o := core.Options{Path: testenv.DB(t), Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}, KeyStore: opt.KeyStore,
 		Archiver: opt.Archiver, RetentionInterval: -1}
+	testenv.Blobs(t, &o)
 	if opt.LogPageSize > 0 || opt.LogPageBytes > 0 {
 		o.Maximums = core.DefaultMaximums()
 		if opt.LogPageSize > 0 {

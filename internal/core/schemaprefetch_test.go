@@ -36,7 +36,7 @@ func newSchemaEnv(t *testing.T) *schemaEnv {
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, Limits: lim, Purger: discardPurger{},
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), AuthDisabled: true, Limits: lim, Purger: discardPurger{},
 		Now:               func() time.Time { return time.UnixMilli(s.now.Load()) },
 		RetentionInterval: -1, BlobSweepInterval: -1, RepurgeInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
 	if err != nil {

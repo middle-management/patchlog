@@ -117,11 +117,11 @@ func (b *ddbBackend) putBytes(ctx context.Context, hash, data []byte) error {
 func (b *ddbBackend) putFile(ctx context.Context, prefix string, hash, data []byte) error {
 	e := b.e
 	now := e.now().UnixMilli()
-	if e.blobs.root() == "" {
+	if e.blobs == nil {
 		_, err := b.store.PutBytes(ctx, hash, data, "", now)
 		return asErrOrNil(err)
 	}
-	name, err := e.blobs.put(prefix, data)
+	name, err := e.putBlob(ctx, prefix, data)
 	if err != nil {
 		return err
 	}
@@ -151,7 +151,8 @@ func (b *ddbBackend) blobStats(ctx context.Context) (*BlobStats, error) {
 	if err != nil {
 		return nil, ddbAsErr(err)
 	}
-	s := &BlobStats{Dir: e.blobs.root(), Bytes: len(bytes)}
+	s := e.newBlobStats()
+	s.Bytes = len(bytes)
 	for _, b := range blobs {
 		if b.Attachment && b.Pruned {
 			s.Pruned++

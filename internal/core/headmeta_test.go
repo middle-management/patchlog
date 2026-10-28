@@ -79,7 +79,7 @@ func TestHeadMeta(t *testing.T) {
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Limits: lim, TailInterval: tailEvery, Purger: discardPurger{}, Now: func() time.Time { return time.UnixMilli(clock.Load()) }})
 	if err != nil {
 		t.Fatal(err)

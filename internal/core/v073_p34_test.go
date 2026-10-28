@@ -51,7 +51,7 @@ func TestV073ReadArchiveForms(t *testing.T) {
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
 		Remote: RemoteOptions{FollowInterval: -1}, Limits: lim, Purger: discardPurger{}, KeyStore: ks})
 	if err != nil {
 		t.Fatal(err)

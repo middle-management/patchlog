@@ -41,6 +41,22 @@ import (
 //   - constraint violations (isConflict);
 //   - transactions and write serialisation (engine.go).
 
+// IsSQLiteFile reports whether a database path names a SQLite file: not
+// ":memory:", a Postgres URL or a path a registered backend handles, such
+// as a DynamoDB table (blob stores default to a directory next to such a
+// file, internal/blobstores).
+func IsSQLiteFile(path string) bool {
+	if path == ":memory:" || isPostgresURL(path) {
+		return false
+	}
+	for _, b := range backends {
+		if b.handles(path) {
+			return false
+		}
+	}
+	return true
+}
+
 // isPostgresURL reports whether a database path names a Postgres database.
 func isPostgresURL(path string) bool {
 	return strings.HasPrefix(path, "postgres://") || strings.HasPrefix(path, "postgresql://")

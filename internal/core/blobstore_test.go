@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/middle-management/patchlog/internal/fsblobs"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/pgtest"
 )
@@ -21,7 +22,7 @@ import (
 
 func openBlobEngine(t *testing.T) *Engine {
 	t.Helper()
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1,
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1,
 		BlobSweepInterval: -1, Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +73,7 @@ func checkFilesNamed(t *testing.T, e *Engine) {
 		t.Fatal(err)
 	}
 	for _, f := range files {
-		if _, err := os.Stat(filepath.Join(e.blobs.root(), f)); err != nil {
+		if _, err := os.Stat(filepath.Join(blobRoot(e), f)); err != nil {
 			t.Fatalf("a row names %s: %v", f, err)
 		}
 	}
@@ -95,7 +96,7 @@ func bytesRows(t *testing.T, e *Engine) int {
 func TestBlobFilesTransactions(t *testing.T) {
 	t.Parallel()
 	e := openBlobEngine(t)
-	dir := e.blobs.root()
+	dir := blobRoot(e)
 	ctx := context.Background()
 	data := []byte("transactional bytes")
 	h := sha256.Sum256(data)
@@ -187,7 +188,7 @@ func TestBlobFilesReadAgain(t *testing.T) {
 		t.Fatalf("read again: %d calls, %v", calls, err)
 	}
 	// A file gone for good fails both reads, as an internal error.
-	removeAll(t, e.blobs.root())
+	removeAll(t, blobRoot(e))
 	if _, err := e.ReadBlob(ctx, "r", "a", bid, Credentials{}); !errors.Is(err, errBytesGone) {
 		t.Fatalf("read of a missing file: %v", err)
 	}
@@ -277,8 +278,8 @@ func TestPGBlobFilesShared(t *testing.T) {
 	t.Parallel()
 	a, b := twoInstances(t)
 	ctx := context.Background()
-	dir := a.blobs.root()
-	if dir != b.blobs.root() {
+	dir := blobRoot(a)
+	if dir != blobRoot(b) {
 		t.Fatal("the instances don't share the directory")
 	}
 	mkNS(t, a, "n1", map[string]any{"read": "public"})
@@ -331,4 +332,20 @@ func TestPGBlobFilesShared(t *testing.T) {
 	if n := countFiles(t, dir); n != 1 {
 		t.Fatalf("%d files for one byte string", n)
 	}
+}
+
+// blobRoot is the directory of the engine's file store.
+func blobRoot(e *Engine) string { return e.blobs.(*fsblobs.Store).Dir }
+
+// fileBlobs is a blob store in a temporary directory of the test's.
+func fileBlobs(tb testing.TB) BlobStore { return dirBlobs(tb, tb.TempDir()) }
+
+// dirBlobs is a blob store in dir.
+func dirBlobs(tb testing.TB, dir string) BlobStore {
+	tb.Helper()
+	s, err := fsblobs.Open(dir)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return s
 }

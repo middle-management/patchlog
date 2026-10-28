@@ -18,7 +18,7 @@ import (
 // read there is cut from it.
 func TestSnapshotCounts(t *testing.T) {
 	t.Parallel()
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Purger: discardPurger{}, HeadSnapshotMax: 8, SnapshotEveryRevisions: 3, SnapshotEveryBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
@@ -128,7 +128,7 @@ func TestSnapshotCounts(t *testing.T) {
 // from there; the head moving on writes a heads row again.
 func TestGenesisHead(t *testing.T) {
 	t.Parallel()
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.DB(t), BlobStore: fileBlobs(t), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
