@@ -6,15 +6,17 @@
 # instance.
 #
 #   ./deploy/ec2-bench.sh [-y] [writes/s] [seconds]   (default 100 20)
-#   ./deploy/ec2-bench.sh cleanup                      the IAM role, profile
+#   ./deploy/ec2-bench.sh cleanup                      the role, profile, bucket
 #
-# The arguments, READS, LOGS and NAMESPACES are bench.sh's. The instance runs this
-# checkout's bench.sh and spans.py, and oha's release OHA (default v1.14.0).
+# The arguments, READS, LOGS and NAMESPACES are bench.sh's. The instance runs
+# this checkout's bench.sh and spans.py, oha's release OHA (default v1.14.0),
+# and the server built from this checkout, uncommitted changes included
+# (Go needed here), or the release VERSION.
 #
 # Settings (environment):
 #   REGION   the table's region (default: aws configure's)
 #   TABLE    the table (default patchlog); made, on-demand, if it's missing
-#   VERSION  the release to run (default v0.24.0-ddb.3)
+#   VERSION  a release to run instead of building, e.g. v0.24.0-ddb.3
 #   TYPE     the instance type (default c7g.large, arm64)
 #   SUBNET   a subnet with a route out (default: the default VPC's)
 #
@@ -23,6 +25,9 @@
 #     (`cleanup` deletes them): SSM's managed policy (no SSH, no open
 #     ports) and DynamoDB on this table and its indexes only.
 #   - The table, if it's missing. Never deleted: it holds what you wrote.
+#   - S3 bucket patchlog-bench-<account>-<region> for a built server, kept
+#     for the next run (`cleanup` deletes it); the binary is deleted on
+#     exit, and the instance downloads it by a URL presigned for an hour.
 #   - One instance, terminated on exit, and by itself after 90 minutes
 #     should this script die first.
 #
@@ -31,7 +36,7 @@ set -euo pipefail
 
 REGION=${REGION:-${AWS_REGION:-$(aws configure get region || true)}}
 TABLE=${TABLE:-patchlog}
-VERSION=${VERSION:-v0.24.0-ddb.3}
+VERSION=${VERSION:-}
 TYPE=${TYPE:-c7g.large}
 OHA=${OHA:-v1.14.0}
 READS=${READS:-}; LOGS=${LOGS:-}; NAMESPACES=${NAMESPACES:-}
@@ -46,7 +51,9 @@ if [ "${1:-}" = cleanup ]; then
   aws iam detach-role-policy --role-name $ROLE --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
   aws iam delete-role-policy --role-name $ROLE --policy-name dynamodb 2>/dev/null || true
   aws iam delete-role --role-name $ROLE 2>/dev/null || true
-  echo "ec2-bench: deleted role and instance profile $ROLE (if they existed)"
+  bucket=patchlog-bench-$(aws sts get-caller-identity --query Account --output text)-$REGION
+  aws s3 rb --force "s3://$bucket" >/dev/null 2>&1 || true
+  echo "ec2-bench: deleted role and instance profile $ROLE and bucket $bucket (if they existed)"
   exit 0
 fi
 
@@ -69,12 +76,24 @@ if [ -z "${SUBNET:-}" ]; then
 fi
 ami=$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-$arch \
   --query Parameter.Value --output text)
+root=$(cd "$(dirname "$0")/.." && pwd)
+bucket=patchlog-bench-$account-$REGION
+if [ -n "$VERSION" ]; then
+  server="release $VERSION"
+else
+  command -v go >/dev/null || { echo "ec2-bench: building the server needs Go; or set VERSION to a release" >&2; exit 1; }
+  rev=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)
+  [ -z "$(git -C "$root" status --porcelain -- cmd internal go.mod go.sum 2>/dev/null)" ] || rev=$rev+changes
+  have_bucket=$(aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 && echo 1 || true)
+  server="built from this checkout ($rev, linux/$goarch), through s3://$bucket$([ -n "$have_bucket" ] || echo ', to make')"
+fi
 
 echo "account $account, region $REGION"
 echo "  table $TABLE: $([ -n "$table_arn" ] && echo exists || echo 'to make (on-demand)')"
 echo "  role $ROLE: $([ -n "$have_role" ] && echo 'exists (its DynamoDB policy is set to this table)' || echo 'to make')"
 echo "  instance: $TYPE ($arch, $ami) in $SUBNET, terminated on exit"
-echo "  run: patchlog $VERSION, bench $RATE writes/s for ${SECS}s${READS:+, reads $READS/s}${LOGS:+, logs $LOGS/s}${NAMESPACES:+, over $NAMESPACES namespaces}"
+echo "  server: $server"
+echo "  run: bench $RATE writes/s for ${SECS}s${READS:+, reads $READS/s}${LOGS:+, logs $LOGS/s}${NAMESPACES:+, over $NAMESPACES namespaces}"
 if [ -z "$YES" ]; then
   read -r -p "Go ahead? [y/N] " ok
   [ "$ok" = y ] || [ "$ok" = Y ] || exit 1
@@ -110,18 +129,46 @@ aws iam put-role-policy --role-name $ROLE --policy-name dynamodb --policy-docume
     \"dynamodb:BatchWriteItem\", \"dynamodb:ConditionCheckItem\"],
     \"Resource\": [\"$table_arn\", \"$table_arn/index/*\"]}]}"
 
-# The instance prepares itself (the release, oha, this checkout's bench.sh
+# What's made for this run only goes on exit.
+work=$(mktemp -d); id=""; object=""
+finish() {
+  rm -rf "$work"
+  if [ -n "$id" ]; then echo "terminating $id"; aws ec2 terminate-instances --instance-ids "$id" >/dev/null; fi
+  if [ -n "$object" ]; then aws s3 rm --quiet "$object" || true; fi
+}
+trap finish EXIT
+userdata=$work/userdata
+
+# The server: a release, or built here and handed over through S3.
+if [ -n "$VERSION" ]; then
+  fetch="curl -fsSL https://github.com/$REPO/releases/download/$VERSION/patchlog_${VERSION}_linux_$goarch.tar.gz | tar xz --strip-components=1"
+else
+  echo "building the server (linux/$goarch)"
+  (cd "$root" && CGO_ENABLED=0 GOOS=linux GOARCH=$goarch go build -trimpath -tags grpcnotrace \
+    -ldflags="-s -w -X main.version=bench-$rev" -o "$work/patchlog" ./cmd/patchlog)
+  if [ -z "$have_bucket" ]; then
+    if [ "$REGION" = us-east-1 ]; then
+      aws s3api create-bucket --bucket "$bucket" >/dev/null
+    else
+      aws s3api create-bucket --bucket "$bucket" --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null
+    fi
+    echo "made bucket $bucket"
+  fi
+  object=s3://$bucket/patchlog-$(date +%s)-$RANDOM
+  aws s3 cp --quiet "$work/patchlog" "$object"
+  fetch="curl -fsSL -o patchlog '$(aws s3 presign "$object" --expires-in 3600)'"
+fi
+
+# The instance prepares itself (the server, oha, this checkout's bench.sh
 # and spans.py) and powers off after 90 minutes whatever happens: shutdown
 # terminates it.
-userdata=$(mktemp)
-trap 'rm -f "$userdata"' EXIT
 scripts=$(tar -C "$(dirname "$0")" -cz bench.sh spans.py | base64 | tr -d '\n')
 cat >"$userdata" <<EOF
 #!/bin/bash
 shutdown -h +90
 set -eux
 mkdir -p /opt/bench && cd /opt/bench
-curl -fsSL https://github.com/$REPO/releases/download/$VERSION/patchlog_${VERSION}_linux_$goarch.tar.gz | tar xz --strip-components=1
+$fetch
 curl -fsSL -o oha https://github.com/hatoo/oha/releases/download/$OHA/oha-linux-$goarch
 echo $scripts | base64 -d | tar xz
 chmod +x patchlog oha bench.sh spans.py
@@ -160,7 +207,6 @@ for i in $(seq 1 12); do
   sleep 5
 done
 rm -f "$userdata.err"
-trap 'rm -f "$userdata"; echo "terminating $id"; aws ec2 terminate-instances --instance-ids "$id" >/dev/null' EXIT
 echo "instance $id starting"
 
 # Reachable once its SSM agent checks in.
