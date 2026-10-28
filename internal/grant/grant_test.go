@@ -262,9 +262,10 @@ func TestTampering(t *testing.T) {
 	_, err = Verify(decodeOK(t, b64tok(c.encode())), f.env())
 	wantStatus(t, err, 401)
 
-	// Wrong signature version: the payload differs.
+	// Wrong signature version: only version 1 is accepted (§C.8, v0.74),
+	// so the token is refused as it is decoded.
 	c = &container{blocks: []signedBlock{g.c.blocks[0], {data: g.c.blocks[1].data, nextKey: g.c.blocks[1].nextKey, sig: g.c.blocks[1].sig, version: 0}}, nextSecret: g.c.nextSecret}
-	_, err = Verify(decodeOK(t, b64tok(c.encode())), f.env())
+	_, err = Decode(b64tok(c.encode()), 0)
 	wantStatus(t, err, 401)
 
 	// Missing and wrong proof.

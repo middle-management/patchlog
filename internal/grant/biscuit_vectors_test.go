@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -16,7 +17,9 @@ import (
 // the revocation ids (block signatures) the samples list. Their blocks hold
 // ordinary Datalog, so they are not grants; they check the wire format and
 // signature scheme: v0 and v1 signature payloads, sealing, third-party
-// blocks and non-Ed25519 keys.
+// blocks and non-Ed25519 keys. Since v0.74 only the v1 payload verifies in
+// a bearer (§C.8), so the v0 samples are parsed with parseAnyVersion to
+// check the payload bytes, which stored forms from before v0.74 still use.
 const (
 	sampleRootPub  = "1055c750b1a1505937af1537c626ba3263995c33a64758aaafb1275b0312e284"
 	sampleRootPriv = "99e87b0e9158531eeeb503ff15266e2b23c2a2507b138c9d1b1f2ab458df2d61"
@@ -63,9 +66,13 @@ func TestSpecSamples(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			c, err := parseContainer(data, true)
+			c, err := parseAnyVersion(data)
 			if err == nil {
 				err = c.verify(root)
+			}
+			// A bearer is refused unless every block is v1 (§C.8).
+			if _, berr := parseContainer(data, true); berr == nil && c != nil && c.blocks[0].version != 1 {
+				t.Fatal("a v0 sample parses as a bearer")
 			}
 			if s.ok != (err == nil) {
 				t.Fatalf("ok %v, got %v", s.ok, err)
@@ -89,10 +96,43 @@ func TestSpecSamples(t *testing.T) {
 		})
 	}
 	// test035 uses signature payload v1, the others v0.
-	c, _ := parseContainer(must64(t, specSamples[4].token), true)
-	if !strings.HasPrefix(specSamples[4].name, "test035") || c.blocks[0].version != 1 {
-		t.Fatal("expected a v1 sample")
+	c, err := parseContainer(must64(t, specSamples[4].token), true)
+	if err != nil || !strings.HasPrefix(specSamples[4].name, "test035") || c.blocks[0].version != 1 {
+		t.Fatalf("expected a v1 sample: %v", err)
 	}
+	if _, err := parseContainer(must64(t, specSamples[0].token), true); err == nil || !strings.Contains(err.Error(), "version 1 payload") {
+		t.Fatalf("a v0 sample as a bearer: %v", err)
+	}
+}
+
+// parseAnyVersion parses a bearer as parseContainer does, without §C.8's
+// version 1 requirement, to check the wire format of v0 samples.
+func parseAnyVersion(data []byte) (*container, error) {
+	top, err := schemaBiscuit.parse("Biscuit", data)
+	if err != nil {
+		return nil, err
+	}
+	if len(top[2]) == 0 || len(top[4]) == 0 {
+		return nil, errors.New("incomplete")
+	}
+	c := &container{}
+	for _, f := range append(top[2], top[3]...) {
+		sb, err := parseSignedBlock(f.b)
+		if err != nil {
+			return nil, err
+		}
+		c.blocks = append(c.blocks, sb)
+	}
+	pf, err := schemaProof.parse("Proof", top[4][0].b)
+	if err != nil {
+		return nil, err
+	}
+	if len(pf[1]) == 1 {
+		c.nextSecret = pf[1][0].b
+	} else if len(pf[2]) == 1 {
+		c.finalSig = pf[2][0].b
+	}
+	return c, nil
 }
 
 func must64(t *testing.T, s string) []byte {
@@ -104,47 +144,42 @@ func must64(t *testing.T, s string) []byte {
 	return b
 }
 
-// Tokens built by biscuit-go decode and verify through our parser, can be
-// narrowed by us, and keep the library's signatures as revocation ids.
+// Tokens built by biscuit-go sign over the v0 payload, so since v0.74 they
+// are refused as bearers (§C.8). Their wire format is still read: parsed
+// without that rule, they verify with the library's signatures, and their
+// authority block, as a stored form from before v0.74, still verifies.
 func TestBiscuitGoTokens(t *testing.T) {
 	pub, err := base64.RawURLEncoding.DecodeString(libRootPub)
 	if err != nil {
 		t.Fatal(err)
 	}
-	env := Env{Now: now, NS: "matches", Revoked: map[string]bool{},
-		Keys: []Key{{Kid: "k1", Alg: "Ed25519", Pub: ed25519.PublicKey(pub), Can: []string{"*"}}}}
 	for i, tok := range libTokens {
-		g, err := Decode(tok, 8192)
+		_, err := Decode(tok, 8192)
+		wantStatus(t, err, 401)
+		if !strings.Contains(err.Error(), "version 1 payload") {
+			t.Fatalf("token %d: refused for another reason: %v", i, err)
+		}
+		c, err := parseAnyVersion(must64(t, tok))
 		if err != nil {
 			t.Fatalf("token %d: %v", i, err)
 		}
-		v, err := Verify(g, env)
-		if err != nil {
+		if err := c.verify(ed25519.PublicKey(pub)); err != nil {
 			t.Fatalf("token %d: %v", i, err)
 		}
-		if v.Principal.ID != "user:bob" || !v.Can["read"] || g.Sealed() != (i == 2) {
-			t.Fatalf("token %d: %+v", i, v.Principal)
+		if (c.finalSig != nil) != (i == 2) || len(c.blocks) != min(i+1, 2) {
+			t.Fatalf("token %d: shape", i)
 		}
-		if i > 0 && (len(g.Blocks) != 2 || strings.Join(v.Principal.Via, ",") != "svc:x") {
-			t.Fatalf("token %d: blocks", i)
-		}
-		for j, sb := range g.c.blocks {
-			if hex.EncodeToString(sb.sig) != libSigs[j] {
+		for j, sb := range c.blocks {
+			if sb.version != 0 || hex.EncodeToString(sb.sig) != libSigs[j] {
 				t.Fatalf("token %d block %d: signature", i, j)
 			}
 		}
-		if i < 2 {
-			n, err := g.Narrow(map[string]any{"via": "svc:y", "ns": []string{"matches"}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			d, err := Decode(n.Encode(), 0)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if v, err := Verify(d, env); err != nil || v.Principal.Via[len(v.Principal.Via)-1] != "svc:y" {
-				t.Fatalf("narrowed library token: %v", err)
-			}
+		st, err := ParseStoredBlock(c.blocks[0].encode())
+		if err != nil {
+			t.Fatalf("token %d: stored form: %v", i, err)
+		}
+		if !st.SignedBy(ed25519.PublicKey(pub)) || st.Blocks[0].Sub != "user:bob" {
+			t.Fatalf("token %d: stored form doesn't verify", i)
 		}
 	}
 }

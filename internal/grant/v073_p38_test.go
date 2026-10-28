@@ -186,6 +186,20 @@ func TestVectorBiscuit(t *testing.T) {
 		c := &container{blocks: []signedBlock{p38Signed(p38Next(7), 0, rootData, nil)}, nextSecret: p38Next(0).Seed()}
 		cases = append(cases, tokenCase{"the authority block signed by another key", base64.URLEncoding.EncodeToString(c.encode()), "the signature chain", "bad root signature"})
 	}
+	// A block signed over Biscuit's version 0 payload, a valid signature
+	// for that payload, which doesn't bind the previous signature: only
+	// version 1 verifies (§C.8, v0.74; CONFORMANCE Grant scope 52).
+	{
+		root := p38Signed(p38Root, 0, rootData, nil)
+		nb := signedBlock{data: narrowData, nextKey: p38Next(1).Public().(ed25519.PublicKey)}
+		nb.sig = ed25519.Sign(p38Next(0), nb.payload(root.sig))
+		c := &container{blocks: []signedBlock{root, nb}, nextSecret: p38Next(1).Seed()}
+		cases = append(cases, tokenCase{"a narrowing block signed over the version 0 payload", base64.URLEncoding.EncodeToString(c.encode()), "only Biscuit's version 1 payload", "version 1 payload"})
+		ab := signedBlock{data: rootData, nextKey: p38Next(0).Public().(ed25519.PublicKey)}
+		ab.sig = ed25519.Sign(p38Root, ab.payload(nil))
+		c = &container{blocks: []signedBlock{ab}, nextSecret: p38Next(0).Seed()}
+		cases = append(cases, tokenCase{"the authority block signed over the version 0 payload", base64.URLEncoding.EncodeToString(c.encode()), "only Biscuit's version 1 payload", "version 1 payload"})
+	}
 	// The authority block's signature with S + L in place of S: it
 	// verifies under a lax check (R and S mod L are unchanged), and §C.8's
 	// strict verification refuses it (RFC 8032 §5.1.7, S < L).
@@ -337,7 +351,8 @@ func TestVectorBiscuitCoversC8(t *testing.T) {
 	for _, name := range []string{"a second fact", "a block without a fact", "a rule", "a check", "a scope", "a public key",
 		"a third-party block", "a next key that isn't Ed25519 (P-256)", "a narrowing block whose next key isn't Ed25519 (P-256)",
 		"a signature with S + L (non-canonical S)", "grant_block not canonical (whitespace)",
-		"grant_block with a noncharacter (U+FFFE, raw)", `"*" in can`} {
+		"grant_block with a noncharacter (U+FFFE, raw)", `"*" in can`,
+		"a narrowing block signed over the version 0 payload", "the authority block signed over the version 0 payload"} {
 		if !refused[name] {
 			t.Errorf("no refused token %q", name)
 		}

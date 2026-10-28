@@ -19,9 +19,12 @@ package grant
 //
 // Every block holds the single fact grant_block("<canonical JSON>").
 // Signatures are Ed25519 throughout. Blocks are produced with signature
-// payload version 1; versions 0 and 1 are both verified. Sealing uses the
-// seal payload of the specification (block data ‖ algorithm ‖ next key ‖
-// signature), which has no versioned form.
+// payload version 1, and only version 1 verifies in a bearer (§C.8): the
+// version 0 payload doesn't bind the previous signature. A stored form
+// (§C.3) with a version 0 authority block, stored before v0.74, still
+// parses and verifies. Sealing uses the seal payload of the specification
+// (block data ‖ algorithm ‖ next key ‖ signature), which has no versioned
+// form.
 
 import (
 	"bytes"
@@ -243,9 +246,10 @@ var (
 	schemaPredicate = pbSchema{1: {0, false}, 2: {2, true}}
 )
 
-// parseContainer parses a Biscuit. With bearer, the proof is required;
-// otherwise (a stored row from before v0.73) it must be absent. No
-// signature is checked.
+// parseContainer parses a Biscuit. With bearer, the proof is required and
+// every block must be signed over the version 1 payload (§C.8); otherwise
+// (a stored row from before v0.73) the proof must be absent. No signature
+// is checked.
 func parseContainer(data []byte, bearer bool) (*container, error) {
 	top, err := schemaBiscuit.parse("Biscuit", data)
 	if err != nil {
@@ -271,6 +275,9 @@ func parseContainer(data []byte, bearer bool) (*container, error) {
 			return nil, errors.New("the stored form has no proof")
 		}
 		return c, nil
+	}
+	if err := c.bearerVersions(); err != nil {
+		return nil, err
 	}
 	if len(top[4]) == 0 {
 		return nil, errors.New("no proof")
@@ -334,6 +341,18 @@ func parseSignedBlock(data []byte) (signedBlock, error) {
 		return sb, errors.New("invalid Ed25519 signature")
 	}
 	return sb, nil
+}
+
+// bearerVersions refuses a bearer with a block not signed over Biscuit's
+// version 1 payload (§C.8): version 0 doesn't bind the previous
+// signature. An absent version is 0. The stored form isn't held to it.
+func (c *container) bearerVersions() error {
+	for i, sb := range c.blocks {
+		if sb.version != sigVersion {
+			return fmt.Errorf("block %d: signature not over Biscuit's version 1 payload", i)
+		}
+	}
+	return nil
 }
 
 // blockStrings extracts the grant_block string of every block, applying
