@@ -40,7 +40,7 @@ import (
 // schemaReadsRev reports whether cred may read revision rid of resource
 // name in n by path under n's schemaReads (§6.1). g holds the read cache's
 // counters, loaded before the transaction began.
-func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials, g gens) bool {
+func (t *gate) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials, g gens) bool {
 	if n.purged || n.isBranch() || n.isShadow() {
 		return false
 	}
@@ -62,8 +62,7 @@ func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials,
 		return false
 	}
 	path := "/r/" + n.name + "/" + name + "/rev/" + rid.String()
-	t.noLock++
-	defer func() { t.noLock-- }()
+	defer t.noLocks()()
 	closures := map[string]bool{}
 	if t.openRefers(n, cfg, path, g, closures) {
 		return true
@@ -88,7 +87,7 @@ func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials,
 // schemaReadsListed lists the namespaces whose referrers may open n's
 // schemas under schemaReads: n, and those matching schemaReads.for, which
 // is never matched against a branch (§6.1, §2.1 Referrer).
-func (t *tx) schemaReadsListed(n *nsRow, cfg *Config) []*nsRow {
+func (t *gate) schemaReadsListed(n *nsRow, cfg *Config) []*nsRow {
 	names := map[string]bool{n.name: true}
 	scan := false
 	for _, p := range cfg.SchemaReadsFor {
@@ -99,17 +98,11 @@ func (t *tx) schemaReadsListed(n *nsRow, cfg *Config) []*nsRow {
 		}
 	}
 	if scan {
-		rows, err := t.Query(`SELECT name FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
-		t.must(err)
-		for rows.Next() {
-			var s string
-			t.must(rows.Scan(&s))
+		for _, s := range t.nsNames() {
 			if DraftsMatch(cfg.SchemaReadsFor, s) {
 				names[s] = true
 			}
 		}
-		t.must(rows.Err())
-		rows.Close()
 	}
 	var out []*nsRow
 	for _, s := range sortedKeys(names) {
@@ -127,7 +120,7 @@ func openToAll(c *Config) bool { return c.Read == "public" && c.level < levelSea
 // refersIn reports whether g may read a resource of l that references
 // path (§6.1): see the package comment above. In a namespace open to
 // everyone g is ignored, and may be nil.
-func (t *tx) refersIn(l *nsRow, g *grant.Grant, path string, closures map[string]bool) bool {
+func (t *gate) refersIn(l *nsRow, g *grant.Grant, path string, closures map[string]bool) bool {
 	lcfg := t.config(l.configSeq)
 	var a *actor
 	if !openToAll(lcfg) {
@@ -140,17 +133,7 @@ func (t *tx) refersIn(l *nsRow, g *grant.Grant, path string, closures map[string
 		}
 	}
 	// The schemas pinned in l whose closure reaches path.
-	rows, err := t.Query(`SELECT DISTINCT r.schema_ref FROM revisions r JOIN resources s ON s.res = r.res
-		WHERE s.ns = ? AND s.state <> ? AND r.schema_ref IS NOT NULL`, l.id, statePurged)
-	t.must(err)
-	var pinned []string
-	for rows.Next() {
-		var s string
-		t.must(rows.Scan(&s))
-		pinned = append(pinned, s)
-	}
-	t.must(rows.Err())
-	rows.Close()
+	pinned := t.pinnedRefs(l)
 	sort.Strings(pinned)
 	reaching := map[string]bool{}
 	for _, s := range pinned {
@@ -170,16 +153,7 @@ func (t *tx) refersIn(l *nsRow, g *grant.Grant, path string, closures map[string
 	// Resources of l, unpurged, whose current document pins one of them.
 	var names []string
 	for _, s := range sortedKeys(reaching) {
-		rows, err := t.Query(`SELECT DISTINCT s.name FROM revisions r JOIN resources s ON s.res = r.res
-			WHERE s.ns = ? AND s.state <> ? AND r.schema_ref = ?`, l.id, statePurged, s)
-		t.must(err)
-		for rows.Next() {
-			var nm string
-			t.must(rows.Scan(&nm))
-			names = append(names, nm)
-		}
-		t.must(rows.Err())
-		rows.Close()
+		names = append(names, t.pinningNames(l, s)...)
 	}
 	sort.Strings(names)
 	seen := map[string]bool{}
@@ -191,18 +165,12 @@ func (t *tx) refersIn(l *nsRow, g *grant.Grant, path string, closures map[string
 		if a != nil && t.grantRules(a, "read", nil, t.basicEnvelope("read", nm, a), false) != nil {
 			continue
 		}
-		res := t.resource(l.id, nm)
-		if res == nil {
-			continue
-		}
+		// l's own resource: not one a branch reads through.
 		v := t.resolve(l, nm, nil)
-		if v.head == nil || v.state == Purged || v.state == NotFound {
+		if v.own == nil || v.head == nil || v.state == Purged || v.state == NotFound {
 			continue
 		}
-		ll := t.lastLive(v.head)
-		var ref *string
-		t.must(t.QueryRow(`SELECT schema_ref FROM revisions WHERE seq = ?`, ll.seq).Scan(&ref))
-		if ref != nil && reaching[*ref] {
+		if ref, ok := t.schemaRefOf(t.lastLive(v.head).seq); ok && reaching[ref] {
 			return true
 		}
 	}
@@ -212,7 +180,7 @@ func (t *tx) refersIn(l *nsRow, g *grant.Grant, path string, closures map[string
 // closureReaches reports whether path is start or is reached through the
 // $ref closure of start, resolved as a reference from m would be,
 // structurally (satisfyingCopies).
-func (t *tx) closureReaches(start, path string, m *nsRow) bool {
+func (t *gate) closureReaches(start, path string, m *nsRow) bool {
 	seen := map[string]bool{}
 	queue := []string{start}
 	for len(queue) > 0 {
@@ -246,4 +214,70 @@ func (t *tx) closureReaches(start, path string, m *nsRow) bool {
 		}
 	}
 	return false
+}
+
+// noLocks reads without taking namespace locks (noLock) until the
+// returned function runs.
+func (t *tx) noLocks() func() {
+	t.noLock++
+	return func() { t.noLock-- }
+}
+
+// nsNames lists the unpurged namespaces' names, but the shadows' (~).
+func (t *tx) nsNames() []string {
+	rows, err := t.Query(`SELECT name FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
+	t.must(err)
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		t.must(rows.Scan(&s))
+		out = append(out, s)
+	}
+	t.must(rows.Err())
+	return out
+}
+
+// pinnedRefs lists the schema revision paths revisions of l's unpurged
+// resources were typed by (schema_ref), each once.
+func (t *tx) pinnedRefs(l *nsRow) []string {
+	rows, err := t.Query(`SELECT DISTINCT r.schema_ref FROM revisions r JOIN resources s ON s.res = r.res
+		WHERE s.ns = ? AND s.state <> ? AND r.schema_ref IS NOT NULL`, l.id, statePurged)
+	t.must(err)
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		t.must(rows.Scan(&s))
+		out = append(out, s)
+	}
+	t.must(rows.Err())
+	return out
+}
+
+// pinningNames lists the unpurged resources of l a revision of which was
+// typed by ref, each once.
+func (t *tx) pinningNames(l *nsRow, ref string) []string {
+	rows, err := t.Query(`SELECT DISTINCT s.name FROM revisions r JOIN resources s ON s.res = r.res
+		WHERE s.ns = ? AND s.state <> ? AND r.schema_ref = ?`, l.id, statePurged, ref)
+	t.must(err)
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var nm string
+		t.must(rows.Scan(&nm))
+		out = append(out, nm)
+	}
+	t.must(rows.Err())
+	return out
+}
+
+// schemaRefOf is the schema revision path revision seq was typed by.
+func (t *tx) schemaRefOf(seq int64) (string, bool) {
+	var ref *string
+	t.must(t.QueryRow(`SELECT schema_ref FROM revisions WHERE seq = ?`, seq).Scan(&ref))
+	if ref == nil {
+		return "", false
+	}
+	return *ref, true
 }

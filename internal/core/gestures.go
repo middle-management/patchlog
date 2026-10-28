@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/ids"
@@ -54,7 +55,7 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 		return nil, badInput("a gesture id is 26 base32 characters")
 	}
 	var out *GesturePage
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -83,45 +84,25 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 		if t.nsLevel(n) >= levelSealed {
 			return apiErr(404, "not_offered", "message", "gestures aren't listed in sealed or end-to-end namespaces: their logs carry them (§7.4)")
 		}
-		var after int64
+		var after *gestureRow
 		if since != "" {
 			name, idText, ok := strings.Cut(since, "/")
 			id, perr := ids.Parse(idText)
-			r := t.resource(n.id, name)
-			if !ok || perr != nil || r == nil || (visible != nil && !visible(name)) {
+			if !ok || perr != nil || (visible != nil && !visible(name)) {
 				return notFound()
 			}
-			if err := t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND id = ?`, r.id, id[:]).Scan(&after); err != nil {
+			row := t.revByID(n, name, id)
+			if row == nil {
 				return notFound()
 			}
+			after = &gestureRow{name: name, res: row.res, seq: row.seq, id: row.id, created: row.created}
 		}
 		limit := e.opt.Maximums.LogPageSize
-		type row struct {
-			seq, res        int64
-			name            string
-			id              []byte
-			kind            int
-			gesture, undoes *string
-			author          int64
-		}
 		// Rows the reader may not read are skipped, so a page is filled
 		// from as many batches as it takes.
-		var rs []row
+		var rs []gestureRow
 		for len(rs) <= limit {
-			rows, qerr := t.Query(`SELECT r.seq, r.res, s.name, r.id, r.kind, r.gesture, r.undoes, r.author FROM revisions r JOIN resources s ON s.res = r.res
-				WHERE s.ns = ? AND s.state <> ? AND (r.gesture = ? OR r.undoes = ?) AND r.seq > ? ORDER BY r.seq LIMIT ?`,
-				n.id, statePurged, gesture, gesture, after, limit+1)
-			t.must(qerr)
-			var batch []row
-			for rows.Next() {
-				var r row
-				t.must(rows.Scan(&r.seq, &r.res, &r.name, &r.id, &r.kind, &r.gesture, &r.undoes, &r.author))
-				batch = append(batch, r)
-			}
-			t.must(rows.Err())
-			// Closed before querying again: a Postgres connection runs one
-			// query at a time.
-			rows.Close()
+			batch := t.gestureRows(n, gesture, after, limit+1)
 			for _, r := range batch {
 				if visible == nil || visible(r.name) {
 					rs = append(rs, r)
@@ -130,37 +111,77 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 			if len(batch) <= limit {
 				break
 			}
-			after = batch[len(batch)-1].seq
+			after = &batch[len(batch)-1]
 		}
 		out = &GesturePage{Entries: []map[string]any{}}
 		if len(rs) > limit {
 			rs = rs[:limit]
 			last := rs[limit-1]
-			out.Next = last.name + "/" + ids.FromBytes(last.id).String()
+			out.Next = last.name + "/" + last.id.String()
 		}
 		for _, r := range rs {
 			kind := "rev"
 			if r.kind == kindTombstone {
 				kind = "tombstone"
 			}
-			m := map[string]any{"resource": r.name, "id": ids.FromBytes(r.id).String(), "kind": kind, "author": t.authorName(r.author)}
-			if r.gesture != nil {
-				m["gesture"] = *r.gesture
+			m := map[string]any{"resource": r.name, "id": r.id.String(), "kind": kind, "author": t.authorName(r.author)}
+			if r.gesture.Valid {
+				m["gesture"] = r.gesture.String
 			}
-			if r.undoes != nil {
-				m["undoes"] = *r.undoes
+			if r.undoes.Valid {
+				m["undoes"] = r.undoes.String
 			}
-			// The namespace entry that wrote it: the first that moved the
-			// resource's head to it or past it (a batch records only an
-			// item's last step, §3.5).
-			var nsSeq int64
-			t.must(t.QueryRow(`SELECT COALESCE(MIN(ns_seq), 0) FROM head_history WHERE res = ? AND target_seq >= ?`, r.res, r.seq).Scan(&nsSeq))
-			if nsSeq != 0 {
-				m["ns_id"] = t.nsLogID(nsSeq).String()
+			if seq, ok := t.writingEntry(r.res, r.seq); ok {
+				m["ns_id"] = t.nsLogID(seq).String()
 			}
 			out.Entries = append(out.Entries, m)
 		}
 		return nil
 	})
 	return out, err
+}
+
+// gestureRow is a revision or tombstone a gesture lists.
+type gestureRow struct {
+	name            string
+	res, seq        int64
+	id              ids.ID
+	kind            int
+	gesture, undoes sql.NullString
+	author          int64
+	created         int64
+}
+
+// gestureRows lists up to limit of n's own rows written with gesture or
+// undoing it, after after (nil: from the first), in the order they were
+// written (revision seq), leaving purged resources out.
+func (t *tx) gestureRows(n *nsRow, gesture string, after *gestureRow, limit int) []gestureRow {
+	var from int64
+	if after != nil {
+		from = after.seq
+	}
+	rows, err := t.Query(`SELECT r.seq, r.res, s.name, r.id, r.kind, r.gesture, r.undoes, r.author, r.created FROM revisions r JOIN resources s ON s.res = r.res
+		WHERE s.ns = ? AND s.state <> ? AND (r.gesture = ? OR r.undoes = ?) AND r.seq > ? ORDER BY r.seq LIMIT ?`,
+		n.id, statePurged, gesture, gesture, from, limit)
+	t.must(err)
+	defer rows.Close()
+	var out []gestureRow
+	for rows.Next() {
+		var r gestureRow
+		var id []byte
+		t.must(rows.Scan(&r.seq, &r.res, &r.name, &id, &r.kind, &r.gesture, &r.undoes, &r.author, &r.created))
+		r.id = ids.FromBytes(id)
+		out = append(out, r)
+	}
+	t.must(rows.Err())
+	return out
+}
+
+// writingEntry is the namespace entry that wrote res's revision seq: the
+// first that moved the resource's head to it or past it (a batch records
+// only an item's last step, §3.5).
+func (t *tx) writingEntry(res, seq int64) (int64, bool) {
+	var nsSeq int64
+	t.must(t.QueryRow(`SELECT COALESCE(MIN(ns_seq), 0) FROM head_history WHERE res = ? AND target_seq >= ?`, res, seq).Scan(&nsSeq))
+	return nsSeq, nsSeq != 0
 }

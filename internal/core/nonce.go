@@ -45,7 +45,7 @@ func checkRequiredNonces(s *itemState) *Error {
 // A remote branch's shadow holds what its base required when the branch
 // was created (insertShadow). The refusal is 422 invalid with errors
 // pointing at /nonce, as for the other branch fields (§7.4).
-func (t *tx) checkNonceBase(cur, cfg *Config, base *nsRow) *Error {
+func (t *gate) checkNonceBase(cur, cfg *Config, base *nsRow) *Error {
 	if base != nil && !cfg.NonceRequired && (cur == nil || cur.NonceRequired) && t.config(base.configSeq).NonceRequired {
 		return docInvalid("/nonce", `/nonce: a branch can't turn off the nonce requirement its base has (§7.6, §C.7)`)
 	}
@@ -56,7 +56,7 @@ func (t *tx) checkNonceBase(cur, cfg *Config, base *nsRow) *Error {
 // nonces while a dependent of n, a branch at any depth that isn't purged,
 // doesn't: its history would no longer merge back (§7.4, §C.7). They are
 // listed leaves first, the order to set them in.
-func (t *tx) checkNonceDependents(n *nsRow, cur, cfg *Config) *Error {
+func (t *gate) checkNonceDependents(n *nsRow, cur, cfg *Config) *Error {
 	if !cfg.NonceRequired || cur.NonceRequired {
 		return nil
 	}
@@ -68,7 +68,7 @@ func (t *tx) checkNonceDependents(n *nsRow, cur, cfg *Config) *Error {
 
 // nonceDependents lists the dependents of n that don't require nonces,
 // leaves first.
-func (t *tx) nonceDependents(n *nsRow) []string {
+func (t *gate) nonceDependents(n *nsRow) []string {
 	var out []string
 	for _, b := range t.branchesOf(n) {
 		if b.purged {

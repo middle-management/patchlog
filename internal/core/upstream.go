@@ -44,7 +44,7 @@ func (t *tx) lostRemote(n *nsRow) (branch *nsRow, origin string, ok bool) {
 // at at, which rb's shadows mirror as it was then, live or tombstoned,
 // and which n doesn't see purged. A resource the branches created
 // themselves, or purged since, isn't (410 for a purged one, §8.3).
-func (t *tx) upstreamCovers(rb *nsRow, name string, v *view) bool {
+func (t *gate) upstreamCovers(rb *nsRow, name string, v *view) bool {
 	if v.state == Purged || v.state == NotFound {
 		return false
 	}
@@ -76,7 +76,7 @@ func upstreamLevelErr(origin, name string) *Error {
 // has passed (reader), before any other answer but a purged namespace's
 // 410. nil while no source is followed past a raise: every write goes on
 // to the rest of the gate.
-func (t *tx) upstreamRefusal(n *nsRow, name string) *Error {
+func (t *gate) upstreamRefusal(n *nsRow, name string) *Error {
 	if n.purged {
 		return nil
 	}

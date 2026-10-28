@@ -49,171 +49,214 @@ type PruneResult struct {
 // take (2.5); the horizon, keep and snapshot, and at E3 the archive (4);
 // the *-key guard and the rules (6).
 func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
+	return e.be.prune(ctx, req, name, pr)
+}
+
+// sqlPrune is Prune on SQL.
+func (e *Engine) sqlPrune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
 	var out *PruneResult
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsForWrite(req.NS)
-		if n == nil {
-			return t.absentNS(req.NS, req.Cred)
-		}
-		cfg := t.config(n.configSeq)
-		a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
-		if aerr != nil {
-			return aerr
-		}
-		if err := t.authorize(a, "prune", name); err != nil {
-			return err
-		}
-		// A prune isn't exempt: a token from the principal, namespace and
-		// per-resource buckets, checked last in step 1 (§6.6).
-		if err := t.rateLimit(n, cfg, a, []string{name}, 1); err != nil {
-			return err
-		}
-		// 410 after authorisation and the rate limits, like every write
-		// (§6.2 step 2.1, §8.5); then §1's 502, and a purged resource's
-		// 410 (§8.3).
-		if n.purged {
-			return t.purgedNS(n)
-		}
-		if err := t.upstreamRefusal(n, name); err != nil {
-			return err
-		}
-		v := t.resolve(n, name, nil)
-		if v.state == Purged {
-			return gone()
-		}
-		// A prune takes no precondition: one sent is 428 at step 2.5
-		// (§7.2, §8.6).
-		if pr.Precondition {
-			return apiErr(428, "precondition_required", "message", "a prune takes no precondition (§7.2, §8.6)")
-		}
-		if v.state == NotFound {
-			return notFound()
-		}
-		// Step 4: horizon, keep and snapshot (§6.2, §8.6).
-		hid, err := ids.Parse(pr.Horizon)
-		var h *revRow
-		if err == nil {
-			h = t.findInAncestry(v.head, hid)
-		}
-		if h == nil {
-			return invalid("horizon must be the head or an ancestor of it (§8.6)")
-		}
-		if len(pr.Keep) > cfg.Limits.KeepPerResource {
-			return limitErr(422, "keepPerResource", int64(len(pr.Keep)), int64(cfg.Limits.KeepPerResource), "too many kept revisions")
-		}
-		e2e := t.e2eContent(n, name)
-		switch {
-		case !e2e && pr.Snapshot != "":
-			return invalid("snapshot is only for e2e resources, whose documents the server can't compute (§8.6)")
-		case e2e && len(pr.Keep) > 0:
-			return invalid("keep is not supported for e2e resources: the server can't keep documents it can't compute (protect revisions with retention or a lower horizon)")
-		case e2e && pr.Snapshot == "":
-			return invalid("pruning an e2e resource needs the horizon's document as a sealed snapshot (§8.6)")
-		}
-		// The envelope's doc is { horizon, keep? } as sent (§6.4.1).
-		doc := map[string]any{"horizon": pr.Horizon}
-		if pr.KeepSent {
-			doc["keep"] = anyStrings(pr.Keep)
-		}
-		env := t.basicEnvelope("prune", name, a)
-		env["writes"], env["patches"], env["doc"] = []any{}, []any{}, doc
-		if n.isBranch() {
-			res, err := t.pruneInBranch(n, cfg, a, name, v, hid, pr, env)
-			out = res
-			return err
-		}
-		// Outside a branch, each keep id is a revision of the resource
-		// whose document is still served, whether or not the horizon
-		// moves (§8.6).
-		var keep []*revRow
-		for _, k := range pr.Keep {
-			kid, err := ids.Parse(k)
-			var row *revRow
-			if err == nil {
-				row = t.findInAncestry(v.head, kid)
-			}
-			if row == nil || row.kind != kindRev {
-				return invalid("keep lists a revision that is not in the resource's history")
-			}
-			if _, err := t.docBytesAt(row); err != nil {
-				return invalid(fmt.Sprintf("keep lists revision %s, whose document is no longer served (§8.6)", k))
-			}
-			keep = append(keep, row)
-		}
-		keepStrs := pr.Keep
-		if !pr.KeepSent {
-			// A prune without keep leaves the keep set (§8.6).
-			keep, keepStrs = t.storedKeep(v.own)
-		}
-		h = t.protect(n, cfg, v.own.id, h)
-		rule := cfg.retentionRule(name)
-		dest, hasArchive := t.archiveDest(rule)
-		noArchive := rule != nil && rule.NoArchive
-		if noArchive {
-			// The rule prunes without an archive (§8.6).
-			dest, hasArchive = "", false
-		}
-		if e2e && !hasArchive {
-			return invalid("pruning an e2e resource needs an archive destination (§8.6)")
-		}
-		eff, moves := t.effectiveHorizon(v.own, h)
-		if e2e && moves {
-			// At E3 the snapshot is the requested horizon's document, so
-			// an effective horizon that moves the horizon but isn't it is
-			// 422 naming it, and the snapshot's header is checked, both
-			// at step 4, before the *-key guard (§6.2, §8.6, §E.3.1).
-			// pruneToE2E checks them again as it writes.
-			if eff.id != hid {
-				return apiErr(422, "invalid", "message", "the horizon moves down to a protected revision (§8.6); seal the snapshot for that one", "horizon", eff.id.String())
-			}
-			if err := t.checkSnapshot(n, cfg, name, eff, pr.Snapshot); err != nil {
-				return err
-			}
-		}
-		// Step 6: the *-key guard, then the rules (§6.2).
-		if !a.star {
-			// Applying a rule that says "archive": false, within what it
-			// keeps, needs only prune: the * key was needed to write it.
-			if !hasArchive && !noArchive {
-				return forbidden("pruning where no archive is configured needs a grant chained to a * key")
-			}
-			// Retention keeps everything where no rule matches the
-			// resource, so a prune that moves the horizon there goes
-			// below it (§8.6).
-			if moves && (rule == nil || eff.seq > t.retentionBoundary(rule, v.own)) {
-				return forbidden("going below what retention keeps, everything where no retention rule matches the resource, needs a grant chained to a * key (§8.6)")
-			}
-			// A prune that changes only the keep set drops the documents
-			// below the horizon that it no longer keeps (pruneTo), such as
-			// those an earlier * prune kept; dropping one that retention
-			// keeps goes below it as much as moving the horizon would. A
-			// prune that moves the horizon within what retention keeps
-			// drops only documents below it, and an E3 prune that moves
-			// nothing writes nothing (pruneToE2E).
-			if !e2e && !moves && pr.KeepSent && keepChanged(v.own, keepStrs) {
-				keepSeqs, preserve := t.keptBelow(n, name, v.own, eff, keep)
-				if drop := t.droppedBelow(v.own.id, eff.seq, keepSeqs, preserve); len(drop) > 0 && (rule == nil || drop[len(drop)-1] >= t.retentionBoundary(rule, v.own)) {
-					return forbidden("dropping a kept document that retention keeps, everything where no retention rule matches the resource, needs a grant chained to a * key (§8.6)")
-				}
-			}
-		}
-		if err := t.checkRules(cfg, a, env, false); err != nil {
-			return err
-		}
-		var res *PruneResult
-		var perr error
-		if e2e {
-			res, perr = t.pruneToE2E(n, cfg, name, v.own, h, hid, pr, dest, t.actorID(a))
-		} else {
-			res, perr = t.pruneTo(n, name, v.own, h, keep, keepStrs, pr.KeepSent, dest, hasArchive, t.actorID(a))
-		}
+		p, perr := t.planPrune(req, name, pr)
 		if perr != nil {
 			return perr
+		}
+		if p.branch != nil {
+			out = p.branch
+			return nil
+		}
+		var res *PruneResult
+		var err error
+		if p.e2e {
+			res, err = t.pruneToE2E(p.n, p.cfg, name, p.own, p.h, p.hid, pr, p.dest, t.actorID(p.a))
+		} else {
+			res, err = t.pruneTo(p.n, name, p.own, p.h, p.keep, p.keepStrs, p.keepSent, p.dest, p.hasArchive, t.actorID(p.a))
+		}
+		if err != nil {
+			return err
 		}
 		out = res
 		return nil
 	})
 	return out, err
+}
+
+// prunePlan is a prune the gate allowed (§8.6): of own, to horizon h,
+// keeping keep (keepStrs as sent, keepSent if keep was sent). In a branch,
+// which prunes nothing, it is only the answer, branch.
+type prunePlan struct {
+	n          *nsRow
+	cfg        *Config
+	a          *actor // nil: the retention applier
+	own        *resRow
+	h          *revRow
+	hid        ids.ID
+	keep       []*revRow
+	keepStrs   []string
+	keepSent   bool
+	dest       string
+	hasArchive bool
+	e2e        bool
+	branch     *PruneResult
+}
+
+// planPrune checks a prune (§6.2, §8.6): the verb and the rate limits
+// (step 1); a purged namespace or resource (2.1); a precondition sent
+// (2.5); the horizon, keep and snapshot, and at E3 the archive (4); the
+// *-key guard and the rules (6).
+func (t *gate) planPrune(req Request, name string, pr PruneRequest) (*prunePlan, *Error) {
+	n := t.nsForWrite(req.NS)
+	if n == nil {
+		return nil, t.absentNS(req.NS, req.Cred)
+	}
+	cfg := t.config(n.configSeq)
+	a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if err := t.authorize(a, "prune", name); err != nil {
+		return nil, err
+	}
+	// A prune isn't exempt: a token from the principal, namespace and
+	// per-resource buckets, checked last in step 1 (§6.6).
+	if err := t.rateLimit(n, cfg, a, []string{name}, 1); err != nil {
+		return nil, err
+	}
+	// 410 after authorisation and the rate limits, like every write
+	// (§6.2 step 2.1, §8.5); then §1's 502, and a purged resource's
+	// 410 (§8.3).
+	if n.purged {
+		return nil, t.purgedNS(n)
+	}
+	if err := t.upstreamRefusal(n, name); err != nil {
+		return nil, err
+	}
+	v := t.resolve(n, name, nil)
+	if v.state == Purged {
+		return nil, gone()
+	}
+	// A prune takes no precondition: one sent is 428 at step 2.5
+	// (§7.2, §8.6).
+	if pr.Precondition {
+		return nil, apiErr(428, "precondition_required", "message", "a prune takes no precondition (§7.2, §8.6)")
+	}
+	if v.state == NotFound {
+		return nil, notFound()
+	}
+	// Step 4: horizon, keep and snapshot (§6.2, §8.6).
+	hid, err := ids.Parse(pr.Horizon)
+	var h *revRow
+	if err == nil {
+		h = t.findInAncestry(v.head, hid)
+	}
+	if h == nil {
+		return nil, invalid("horizon must be the head or an ancestor of it (§8.6)")
+	}
+	if len(pr.Keep) > cfg.Limits.KeepPerResource {
+		return nil, limitErr(422, "keepPerResource", int64(len(pr.Keep)), int64(cfg.Limits.KeepPerResource), "too many kept revisions")
+	}
+	e2e := t.e2eContent(n, name)
+	switch {
+	case !e2e && pr.Snapshot != "":
+		return nil, invalid("snapshot is only for e2e resources, whose documents the server can't compute (§8.6)")
+	case e2e && len(pr.Keep) > 0:
+		return nil, invalid("keep is not supported for e2e resources: the server can't keep documents it can't compute (protect revisions with retention or a lower horizon)")
+	case e2e && pr.Snapshot == "":
+		return nil, invalid("pruning an e2e resource needs the horizon's document as a sealed snapshot (§8.6)")
+	}
+	// The envelope's doc is { horizon, keep? } as sent (§6.4.1).
+	doc := map[string]any{"horizon": pr.Horizon}
+	if pr.KeepSent {
+		doc["keep"] = anyStrings(pr.Keep)
+	}
+	env := t.basicEnvelope("prune", name, a)
+	env["writes"], env["patches"], env["doc"] = []any{}, []any{}, doc
+	if n.isBranch() {
+		res, err := t.pruneInBranch(n, cfg, a, name, v, hid, pr, env)
+		if err != nil {
+			return nil, err
+		}
+		return &prunePlan{branch: res}, nil
+	}
+	// Outside a branch, each keep id is a revision of the resource
+	// whose document is still served, whether or not the horizon
+	// moves (§8.6).
+	var keep []*revRow
+	for _, k := range pr.Keep {
+		kid, err := ids.Parse(k)
+		var row *revRow
+		if err == nil {
+			row = t.findInAncestry(v.head, kid)
+		}
+		if row == nil || row.kind != kindRev {
+			return nil, invalid("keep lists a revision that is not in the resource's history")
+		}
+		if _, err := t.docBytesAt(row); err != nil {
+			return nil, invalid(fmt.Sprintf("keep lists revision %s, whose document is no longer served (§8.6)", k))
+		}
+		keep = append(keep, row)
+	}
+	keepStrs := pr.Keep
+	if !pr.KeepSent {
+		// A prune without keep leaves the keep set (§8.6).
+		keep, keepStrs = t.storedKeep(v.own)
+	}
+	h = t.protect(n, cfg, v.own.id, h)
+	rule := cfg.retentionRule(name)
+	dest, hasArchive := t.archiveDest(rule)
+	noArchive := rule != nil && rule.NoArchive
+	if noArchive {
+		// The rule prunes without an archive (§8.6).
+		dest, hasArchive = "", false
+	}
+	if e2e && !hasArchive {
+		return nil, invalid("pruning an e2e resource needs an archive destination (§8.6)")
+	}
+	eff, moves := t.effectiveHorizon(v.own, h)
+	if e2e && moves {
+		// At E3 the snapshot is the requested horizon's document, so
+		// an effective horizon that moves the horizon but isn't it is
+		// 422 naming it, and the snapshot's header is checked, both
+		// at step 4, before the *-key guard (§6.2, §8.6, §E.3.1).
+		// pruneToE2E checks them again as it writes.
+		if eff.id != hid {
+			return nil, apiErr(422, "invalid", "message", "the horizon moves down to a protected revision (§8.6); seal the snapshot for that one", "horizon", eff.id.String())
+		}
+		if err := t.checkSnapshot(n, cfg, name, eff, pr.Snapshot); err != nil {
+			return nil, err
+		}
+	}
+	// Step 6: the *-key guard, then the rules (§6.2).
+	if !a.star {
+		// Applying a rule that says "archive": false, within what it
+		// keeps, needs only prune: the * key was needed to write it.
+		if !hasArchive && !noArchive {
+			return nil, forbidden("pruning where no archive is configured needs a grant chained to a * key")
+		}
+		// Retention keeps everything where no rule matches the
+		// resource, so a prune that moves the horizon there goes
+		// below it (§8.6).
+		if moves && (rule == nil || eff.seq > t.retentionBoundary(rule, v.own)) {
+			return nil, forbidden("going below what retention keeps, everything where no retention rule matches the resource, needs a grant chained to a * key (§8.6)")
+		}
+		// A prune that changes only the keep set drops the documents
+		// below the horizon that it no longer keeps (pruneTo), such as
+		// those an earlier * prune kept; dropping one that retention
+		// keeps goes below it as much as moving the horizon would. A
+		// prune that moves the horizon within what retention keeps
+		// drops only documents below it, and an E3 prune that moves
+		// nothing writes nothing (pruneToE2E).
+		if !e2e && !moves && pr.KeepSent && keepChanged(v.own, keepStrs) {
+			keepSeqs, preserve := t.keptBelow(n, name, v.own, eff, keep)
+			if drop := t.droppedBelow(v.own.id, eff.seq, keepSeqs, preserve); len(drop) > 0 && (rule == nil || drop[len(drop)-1] >= t.retentionBoundary(rule, v.own)) {
+				return nil, forbidden("dropping a kept document that retention keeps, everything where no retention rule matches the resource, needs a grant chained to a * key (§8.6)")
+			}
+		}
+	}
+	if err := t.checkRules(cfg, a, env, false); err != nil {
+		return nil, err
+	}
+	return &prunePlan{n: n, cfg: cfg, a: a, own: v.own, h: h, hid: hid, keep: keep, keepStrs: keepStrs, keepSent: pr.KeepSent,
+		dest: dest, hasArchive: hasArchive, e2e: e2e}, nil
 }
 
 // pruneInBranch finishes a prune in branch n once the checks it shares with
@@ -227,7 +270,7 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 // branch and the epoch snapshotKid gives for the horizon's chain, as outside
 // a branch, but for a base's content from before that base's raise from
 // sealed, which names the base (§13, F-B6, §E.3.1).
-func (t *tx) pruneInBranch(n *nsRow, cfg *Config, a *actor, name string, v *view, hid ids.ID, pr PruneRequest, env map[string]any) (*PruneResult, error) {
+func (t *gate) pruneInBranch(n *nsRow, cfg *Config, a *actor, name string, v *view, hid ids.ID, pr PruneRequest, env map[string]any) (*PruneResult, *Error) {
 	if t.e2eContent(n, name) {
 		if err := t.checkSnapshot(n, cfg, name, t.findInAncestry(v.head, hid), pr.Snapshot); err != nil {
 			return nil, err
@@ -243,21 +286,19 @@ func (t *tx) pruneInBranch(n *nsRow, cfg *Config, a *actor, name string, v *view
 // the newest segment of head's ancestry whose resource has one, a base's
 // the branch reads through, as its pruned revisions' 410 names it (§7.1);
 // otherwise the ancestry's genesis.
-func (t *tx) branchHorizon(head *revRow) string {
+func (t *gate) branchHorizon(head *revRow) string {
 	segs := t.ancestry(head)
 	for _, sg := range segs {
 		if id := t.horizonID(sg.res); id != "" {
 			return id
 		}
 	}
-	var g int64
-	t.must(t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND first = 1`, segs[len(segs)-1].res).Scan(&g))
-	return t.revID(g).String()
+	return t.revID(t.genesisSeq(segs[len(segs)-1].res)).String()
 }
 
 // storedKeep is own's keep set (§8.6): its revisions in the resource's
 // history, and their ids as stored.
-func (t *tx) storedKeep(own *resRow) (keep []*revRow, keepStrs []string) {
+func (t *gate) storedKeep(own *resRow) (keep []*revRow, keepStrs []string) {
 	if !own.keep.Valid || !own.headSeq.Valid {
 		return nil, nil
 	}
@@ -311,24 +352,20 @@ func keepChanged(own *resRow, keep []string) bool {
 // moved down, leaves own at, never below the current one (§8.6), and
 // whether that moves the horizon: a horizon with nothing of its resource's
 // chain below it (a first entry) prunes nothing.
-func (t *tx) effectiveHorizon(own *resRow, h *revRow) (*revRow, bool) {
+func (t *gate) effectiveHorizon(own *resRow, h *revRow) (*revRow, bool) {
 	if cur := own.horizonSeq; cur.Valid && h.seq <= cur.Int64 {
 		return t.rev(cur.Int64), false
 	}
-	var below bool
-	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions WHERE res = ? AND seq < ?)`, own.id, h.seq).Scan(&below))
-	return h, below
+	return h, t.revsBelow(own.id, h.seq)
 }
 
 // protect moves a horizon down past the protected revisions of §8.6: the
 // retry window and the heads as of the at of every live local branch and
 // every unexpired remote branch registration.
-func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
-	var minSeq sql.NullInt64
+func (t *gate) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 	cutoff := t.now.Add(-cfg.Limits.RetryWindow).UnixMilli()
-	t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ? AND created >= ?`, res, cutoff).Scan(&minSeq))
-	if minSeq.Valid && minSeq.Int64 < h.seq {
-		h = t.rev(minSeq.Int64)
+	if seq, ok := t.firstRevSince(res, cutoff); ok && seq < h.seq {
+		h = t.rev(seq)
 	}
 	var ats []int64
 	for _, b := range t.allBranchesOf(n) {
@@ -337,12 +374,81 @@ func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 	// Remote branches whose registration hasn't expired (§G.3).
 	ats = append(ats, t.registeredAts(n)...)
 	for _, at := range ats {
-		var p int64
-		if err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1`, res, at).Scan(&p); err == nil && p < h.seq {
+		if p, ok := t.headAtEntry(res, at); ok && p < h.seq {
 			h = t.rev(p)
 		}
 	}
 	return h
+}
+
+// firstRevSince is res's first revision created at or after cutoff
+// (milliseconds).
+func (t *tx) firstRevSince(res, cutoff int64) (int64, bool) {
+	var seq sql.NullInt64
+	t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ? AND created >= ?`, res, cutoff).Scan(&seq))
+	return seq.Int64, seq.Valid
+}
+
+// headAtEntry is res's head as of its namespace's log entry at.
+func (t *tx) headAtEntry(res, at int64) (int64, bool) {
+	var p int64
+	if err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1`, res, at).Scan(&p); err != nil {
+		return 0, false
+	}
+	return p, true
+}
+
+// genesisSeq is the first revision of res's own chain.
+func (t *tx) genesisSeq(res int64) int64 {
+	var g int64
+	t.must(t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND first = 1`, res).Scan(&g))
+	return g
+}
+
+// revsBelow reports whether res's chain has a revision below seq.
+func (t *tx) revsBelow(res, seq int64) bool {
+	var below bool
+	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions WHERE res = ? AND seq < ?)`, res, seq).Scan(&below))
+	return below
+}
+
+// revBelow is a revision of a resource's chain below a horizon.
+type revBelow struct {
+	seq        int64
+	id         ids.ID
+	hasPatches bool
+}
+
+// liveRevsBelow lists res's revisions (not tombstones) below seq, and
+// whether each still has its patch set.
+func (t *tx) liveRevsBelow(res, seq int64) []revBelow {
+	rows, err := t.Query(`SELECT seq, id, patches IS NOT NULL FROM revisions WHERE res = ? AND seq < ? AND kind = 0`, res, seq)
+	t.must(err)
+	defer rows.Close()
+	var out []revBelow
+	for rows.Next() {
+		var r revBelow
+		var id []byte
+		t.must(rows.Scan(&r.seq, &id, &r.hasPatches))
+		r.id = ids.FromBytes(id)
+		out = append(out, r)
+	}
+	return out
+}
+
+// snapshotsBelow lists the seqs of res's stored documents below seq, in
+// order.
+func (t *tx) snapshotsBelow(res, seq int64) []int64 {
+	rows, err := t.Query(`SELECT seq FROM snapshots WHERE res = ? AND seq < ? ORDER BY seq`, res, seq)
+	t.must(err)
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var s int64
+		t.must(rows.Scan(&s))
+		out = append(out, s)
+	}
+	return out
 }
 
 // keptBelow is what keeps its document below h, the effective horizon of a
@@ -351,7 +457,7 @@ func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 // have their patch sets (nil rows); preserve holds the referenced schema
 // revisions already below an earlier horizon, which keep the snapshot they
 // have.
-func (t *tx) keptBelow(n *nsRow, name string, own *resRow, h *revRow, keep []*revRow) (keepSeqs map[int64]*revRow, preserve map[int64]bool) {
+func (t *gate) keptBelow(n *nsRow, name string, own *resRow, h *revRow, keep []*revRow) (keepSeqs map[int64]*revRow, preserve map[int64]bool) {
 	refs := t.referencedPaths()
 	keepSeqs = map[int64]*revRow{}
 	keepSeqs[t.lastLive(h).seq] = t.lastLive(h)
@@ -359,22 +465,15 @@ func (t *tx) keptBelow(n *nsRow, name string, own *resRow, h *revRow, keep []*re
 		keepSeqs[k.seq] = k
 	}
 	preserve = map[int64]bool{}
-	rows, err := t.Query(`SELECT seq, id, patches IS NOT NULL FROM revisions WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
-	t.must(err)
-	for rows.Next() {
-		var seq int64
-		var id []byte
-		var hasPatches bool
-		t.must(rows.Scan(&seq, &id, &hasPatches))
-		if refs["/r/"+n.name+"/"+name+"/rev/"+ids.FromBytes(id).String()] {
-			if hasPatches {
-				keepSeqs[seq] = nil
+	for _, r := range t.liveRevsBelow(own.id, h.seq) {
+		if refs["/r/"+n.name+"/"+name+"/rev/"+r.id.String()] {
+			if r.hasPatches {
+				keepSeqs[r.seq] = nil
 			} else {
-				preserve[seq] = true
+				preserve[r.seq] = true
 			}
 		}
 	}
-	rows.Close()
 	return keepSeqs, preserve
 }
 
@@ -382,18 +481,13 @@ func (t *tx) keptBelow(n *nsRow, name string, own *resRow, h *revRow, keep []*re
 // that a prune keeping keepSeqs and preserve (keptBelow) drops, in seq
 // order: intermediate snapshots (D.4) and the documents an earlier keep set
 // kept but this one doesn't, or pruned revisions would still be served.
-func (t *tx) droppedBelow(res, hseq int64, keepSeqs map[int64]*revRow, preserve map[int64]bool) []int64 {
-	rows, err := t.Query(`SELECT seq FROM snapshots WHERE res = ? AND seq < ? ORDER BY seq`, res, hseq)
-	t.must(err)
+func (t *gate) droppedBelow(res, hseq int64, keepSeqs map[int64]*revRow, preserve map[int64]bool) []int64 {
 	var drop []int64
-	for rows.Next() {
-		var seq int64
-		t.must(rows.Scan(&seq))
+	for _, seq := range t.snapshotsBelow(res, hseq) {
 		if _, kept := keepSeqs[seq]; !kept && !preserve[seq] {
 			drop = append(drop, seq)
 		}
 	}
-	rows.Close()
 	return drop
 }
 

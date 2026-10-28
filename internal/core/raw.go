@@ -30,7 +30,7 @@ type Raw struct {
 // seen), and then the answers of the document URL.
 func (e *Engine) ResourceRaw(ctx context.Context, ns, name, id string, cred Credentials) (*Raw, error) {
 	out := &Raw{}
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)

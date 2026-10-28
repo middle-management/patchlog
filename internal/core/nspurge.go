@@ -8,80 +8,106 @@ import (
 
 // Purge purges a resource (§8.3). It returns the purge entry's ns_id.
 func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error) {
+	return e.be.purge(ctx, req, name, ifMatch, force)
+}
+
+// sqlPurge is Purge on SQL.
+func (e *Engine) sqlPurge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error) {
 	var out string
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsForWrite(req.NS)
-		if n == nil {
-			return t.absentNSOp(req.NS, req.Cred, force)
-		}
-		cfg := t.config(n.configSeq)
-		a, operator, aerr := t.purger(n, cfg, req, force)
-		if aerr != nil {
-			return aerr
-		}
-		if err := t.authorize(a, "purge", name); err != nil {
-			return err
-		}
-		// ?force=1 under a grant that can't force is 403 at step 1,
-		// whether or not the purge needs it (§6.1).
-		if force {
-			if err := t.mayForce(n, a, operator); err != nil {
-				return err
-			}
-		}
-		// 410 after authorisation, like every write (§6.2).
-		if n.purged {
-			return t.purgedNS(n)
-		}
-		// A purged resource is 410 at step 2.1, before the precondition
-		// (§6.2, §8.3).
-		v := t.resolve(n, name, nil)
-		if v.state == Purged {
-			return gone()
-		}
-		if ifMatch == "" {
-			return apiErr(428, "precondition_required")
-		}
-		if v.state == NotFound {
-			return notFound()
-		}
-		if ifMatch != v.head.id.String() {
-			return apiErr(412, "stale", "head", v.head.id.String())
-		}
-		// The purge reaches n and every branch it propagates to (§8.3),
-		// each locked exclusively before it is read.
-		reached := t.purgeReach(n)
-		gone := func(ns *nsRow, res string) bool { return res == name && reached[ns.id] }
-		forced := false
-		if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
-			if !force {
-				return t.inUse(broken, "the purge would remove the last available copy of a referenced schema revision (§6.1)")
-			}
-			// The grant may force: mayForce passed at step 1.
-			forced = true
-		}
-		env := t.basicEnvelope("purge", name, a)
-		env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
-		if err := t.purgeRules(cfg, a, env, operator && forced); err != nil {
+		p, err := t.planPurge(req, name, ifMatch, force)
+		if err != nil {
 			return err
 		}
 		// Every log the purge appends to, in ascending key order, after
 		// every other lock (D.8).
-		logs := make([]int64, 0, len(reached))
-		for id := range reached {
+		logs := make([]int64, 0, len(p.reached))
+		for id := range p.reached {
 			logs = append(logs, id)
 		}
 		t.lockLogs(logs...)
-		out = t.purgeResource(n, name, t.actorID(a), forced).String()
+		out = t.purgeResource(p.n, name, t.actorID(p.a), p.forced).String()
 		return nil
 	})
 	return out, err
 }
 
+// purgePlan is a purge the gate allowed (§8.3, §8.5): of a resource, the
+// head it purges and every namespace it reaches.
+type purgePlan struct {
+	n       *nsRow
+	a       *actor
+	forced  bool
+	head    *revRow
+	reached map[int64]bool
+}
+
+// planPurge checks a resource purge (§8.3, §6.2): authentication, the
+// verb, ?force=1, the precondition on the head, schema copies (§6.1), the
+// rules.
+func (t *gate) planPurge(req Request, name, ifMatch string, force bool) (*purgePlan, *Error) {
+	n := t.nsForWrite(req.NS)
+	if n == nil {
+		return nil, t.absentNSOp(req.NS, req.Cred, force)
+	}
+	cfg := t.config(n.configSeq)
+	a, operator, aerr := t.purger(n, cfg, req, force)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if err := t.authorize(a, "purge", name); err != nil {
+		return nil, err
+	}
+	// ?force=1 under a grant that can't force is 403 at step 1,
+	// whether or not the purge needs it (§6.1).
+	if force {
+		if err := t.mayForce(n, a, operator); err != nil {
+			return nil, err
+		}
+	}
+	// 410 after authorisation, like every write (§6.2).
+	if n.purged {
+		return nil, t.purgedNS(n)
+	}
+	// A purged resource is 410 at step 2.1, before the precondition
+	// (§6.2, §8.3).
+	v := t.resolve(n, name, nil)
+	if v.state == Purged {
+		return nil, gone()
+	}
+	if ifMatch == "" {
+		return nil, apiErr(428, "precondition_required")
+	}
+	if v.state == NotFound {
+		return nil, notFound()
+	}
+	if ifMatch != v.head.id.String() {
+		return nil, apiErr(412, "stale", "head", v.head.id.String())
+	}
+	// The purge reaches n and every branch it propagates to (§8.3),
+	// each locked exclusively before it is read.
+	reached := t.purgeReach(n)
+	gone := func(ns *nsRow, res string) bool { return res == name && reached[ns.id] }
+	forced := false
+	if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
+		if !force {
+			return nil, t.inUse(broken, "the purge would remove the last available copy of a referenced schema revision (§6.1)")
+		}
+		// The grant may force: mayForce passed at step 1.
+		forced = true
+	}
+	env := t.basicEnvelope("purge", name, a)
+	env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
+	if err := t.purgeRules(cfg, a, env, operator && forced); err != nil {
+		return nil, err
+	}
+	return &purgePlan{n: n, a: a, forced: forced, head: v.head, reached: reached}, nil
+}
+
 // purgeReach locks n and every unpurged branch a resource purge in n
 // propagates to (§8.3) exclusively, in the order purgeResource does, and
 // returns their ids.
-func (t *tx) purgeReach(n *nsRow) map[int64]bool {
+func (t *gate) purgeReach(n *nsRow) map[int64]bool {
 	reached := map[int64]bool{n.id: true}
 	var walk func(x *nsRow)
 	walk = func(x *nsRow) {
@@ -104,7 +130,7 @@ func (t *tx) purgeReach(n *nsRow) map[int64]bool {
 // rules still judge it. A purge forced with a * key of a branch, one the
 // operator forced that needed no forcing, and any purge while
 // authentication is disabled are judged in full.
-func (t *tx) purgeRules(cfg *Config, a *actor, env map[string]any, overridden bool) *Error {
+func (t *gate) purgeRules(cfg *Config, a *actor, env map[string]any, overridden bool) *Error {
 	if overridden {
 		return t.checkGrantRules(a, env, nil)
 	}
@@ -115,7 +141,7 @@ func (t *tx) purgeRules(cfg *Config, a *actor, env map[string]any, overridden bo
 // with a grant chained to a deployment operator key instead of one of the
 // namespace's: then operator is true, and, where the purge is forced past
 // an in_use refusal, the namespace's rules don't judge it (purgeRules).
-func (t *tx) purger(n *nsRow, cfg *Config, req Request, force bool) (a *actor, operator bool, err *Error) {
+func (t *gate) purger(n *nsRow, cfg *Config, req Request, force bool) (a *actor, operator bool, err *Error) {
 	t.reqCreds = req.anyCreds()
 	a, err = t.authenticate(n.name, n, cfg, req.Cred, nil)
 	if err == nil || !force || len(t.operatorKeys()) == 0 {
@@ -133,7 +159,7 @@ func (t *tx) purger(n *nsRow, cfg *Config, req Request, force bool) (a *actor, o
 // key of a namespace that isn't a branch doesn't force. With
 // authentication disabled everyone is the operator. Under any other grant
 // ?force=1 is 403 at step 1 of §6.2, whether or not the purge needs it.
-func (t *tx) mayForce(n *nsRow, a *actor, operator bool) *Error {
+func (t *gate) mayForce(n *nsRow, a *actor, operator bool) *Error {
 	if operator || t.e.opt.AuthDisabled || (n.isBranch() && a.star) {
 		return nil
 	}
@@ -221,65 +247,82 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids
 // operator key, or, for a branch, to a * key of the branch. The purge-ns
 // entry then says forced: true (§3.5). Dependents can't be forced.
 func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error) {
+	return e.be.purgeNamespace(ctx, req, ifMatch, force)
+}
+
+// planPurgeNS checks a namespace purge (§8.5): authentication, the verb,
+// ?force=1, not frozen, the precondition on the log's head, no
+// dependents, schema copies (§6.1), the rules.
+func (t *gate) planPurgeNS(req Request, ifMatch string, force bool) (*purgePlan, *Error) {
+	n := t.nsForWrite(req.NS)
+	if n == nil {
+		return nil, t.absentNSOp(req.NS, req.Cred, force)
+	}
+	cfg := t.config(n.configSeq)
+	a, operator, aerr := t.purger(n, cfg, req, force)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if err := t.authorize(a, "purge-ns", ""); err != nil {
+		return nil, err
+	}
+	// ?force=1 under a grant that can't force is 403 at step 1 (§6.1).
+	if force {
+		if err := t.mayForce(n, a, operator); err != nil {
+			return nil, err
+		}
+	}
+	// In §6.2's order (§8.5): 410 after authorisation, like every
+	// write (step 2.1); not frozen (step 2.4); then the precondition
+	// (step 2.5).
+	if n.purged {
+		return nil, t.purgedNS(n)
+	}
+	if !cfg.Frozen {
+		return nil, apiErr(409, "not_frozen")
+	}
+	if ifMatch == "" {
+		return nil, apiErr(428, "precondition_required")
+	}
+	head := t.nsLogID(n.headSeq.Int64)
+	if ifMatch != head.String() {
+		return nil, apiErr(412, "stale", "head", head.String())
+	}
+	var deps []string
+	for _, b := range t.branchesOf(n) {
+		if !b.purged {
+			deps = append(deps, b.name)
+		}
+	}
+	if len(deps) > 0 {
+		return nil, apiErr(409, "in_use", "dependents", anyStrings(deps))
+	}
+	gone := func(ns *nsRow, _ string) bool { return ns.id == n.id }
+	forced := false
+	if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
+		if !force {
+			return nil, t.inUse(broken, "the namespace holds the last available copy of a schema revision referenced from another namespace (§6.1)")
+		}
+		// The grant may force: mayForce passed at step 1.
+		forced = true
+	}
+	env := t.basicEnvelope("purge-ns", "", a)
+	env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
+	if err := t.purgeRules(cfg, a, env, operator && forced); err != nil {
+		return nil, err
+	}
+	return &purgePlan{n: n, a: a, forced: forced}, nil
+}
+
+// sqlPurgeNamespace is PurgeNamespace on SQL.
+func (e *Engine) sqlPurgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error) {
 	var out string
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsForWrite(req.NS)
-		if n == nil {
-			return t.absentNSOp(req.NS, req.Cred, force)
+		p, perr := t.planPurgeNS(req, ifMatch, force)
+		if perr != nil {
+			return perr
 		}
-		cfg := t.config(n.configSeq)
-		a, operator, aerr := t.purger(n, cfg, req, force)
-		if aerr != nil {
-			return aerr
-		}
-		if err := t.authorize(a, "purge-ns", ""); err != nil {
-			return err
-		}
-		// ?force=1 under a grant that can't force is 403 at step 1 (§6.1).
-		if force {
-			if err := t.mayForce(n, a, operator); err != nil {
-				return err
-			}
-		}
-		// In §6.2's order (§8.5): 410 after authorisation, like every
-		// write (step 2.1); not frozen (step 2.4); then the precondition
-		// (step 2.5).
-		if n.purged {
-			return t.purgedNS(n)
-		}
-		if !cfg.Frozen {
-			return apiErr(409, "not_frozen")
-		}
-		if ifMatch == "" {
-			return apiErr(428, "precondition_required")
-		}
-		head := t.nsLogID(n.headSeq.Int64)
-		if ifMatch != head.String() {
-			return apiErr(412, "stale", "head", head.String())
-		}
-		var deps []string
-		for _, b := range t.branchesOf(n) {
-			if !b.purged {
-				deps = append(deps, b.name)
-			}
-		}
-		if len(deps) > 0 {
-			return apiErr(409, "in_use", "dependents", anyStrings(deps))
-		}
-		gone := func(ns *nsRow, _ string) bool { return ns.id == n.id }
-		forced := false
-		if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
-			if !force {
-				return t.inUse(broken, "the namespace holds the last available copy of a schema revision referenced from another namespace (§6.1)")
-			}
-			// The grant may force: mayForce passed at step 1.
-			forced = true
-		}
-		env := t.basicEnvelope("purge-ns", "", a)
-		env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
-		if err := t.purgeRules(cfg, a, env, operator && forced); err != nil {
-			return err
-		}
+		n, a, forced := p.n, p.a, p.forced
 		t.deleteArchives(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.deleteDEKs(`ns = ?`, n.id)
 		// Sealed bytes and epoch keys go too (§E.2, §8.5).

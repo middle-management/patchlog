@@ -142,7 +142,7 @@ func uploaderOf(a *actor) string {
 }
 
 // blobCutoff is the creation time before which a pending entry has expired.
-func (t *tx) blobCutoff(cfg *Config) int64 { return t.now.Add(-cfg.Limits.BlobGrace).UnixMilli() }
+func (t *gate) blobCutoff(cfg *Config) int64 { return t.now.Add(-cfg.Limits.BlobGrace).UnixMilli() }
 
 // referencedUpTo reports whether a document of res's chain up to seq max
 // references bid.
@@ -156,7 +156,7 @@ func (t *tx) referencedUpTo(res, max int64, bid ids.ID) bool {
 // chains make up the history ending at head (§7.6: crossing foreign
 // parents), skipping res skip, where a document of that history references
 // it. It returns the attachment, or else a pruned one, or nil.
-func (t *tx) historyBlob(head *revRow, skip int64, bid ids.ID) (live, pruned *blobRow) {
+func (t *gate) historyBlob(head *revRow, skip int64, bid ids.ID) (live, pruned *blobRow) {
 	for _, seg := range t.ancestry(head) {
 		if seg.res == skip {
 			continue
@@ -252,7 +252,7 @@ type batchSource struct {
 // under an epoch it is served under there (§2.1 Protection); and none
 // of a resource whose source was raised to a level this server lacks
 // (upstreamRefusal), which the source can't serve.
-func (bs *batchSource) blob(t *tx, name string, bid ids.ID) *blobRow {
+func (bs *batchSource) blob(t *gate, name string, bid ids.ID) *blobRow {
 	if bs == nil || bs.n == nil {
 		return nil
 	}
@@ -278,7 +278,7 @@ func (bs *batchSource) blob(t *tx, name string, bid ids.ID) *blobRow {
 // sourceUnrestricted reports whether a batch may read its local source
 // unrestricted (§7.5): every resource of it, as branch creation requires
 // (§7.6), with the request's own grant or any in Source-Authorization.
-func (t *tx) sourceUnrestricted(n *nsRow, req Request) bool {
+func (t *gate) sourceUnrestricted(n *nsRow, req Request) bool {
 	for _, cred := range req.anyCreds() {
 		if _, err := t.nsReader(n, cred); err == nil {
 			return true
@@ -298,7 +298,7 @@ func (r Request) anyCreds() []Credentials {
 // /r/{ns}/{name} by the rule for other namespaces (§7.5): the request's own
 // grant or any in Source-Authorization that names the namespace, verifies
 // under its keys and allows the read. A public namespace needs none.
-func (t *tx) sourceReadable(n *nsRow, name string, req Request) bool {
+func (t *gate) sourceReadable(n *nsRow, name string, req Request) bool {
 	return t.credsRead(n, name, req.anyCreds())
 }
 
@@ -306,7 +306,7 @@ func (t *tx) sourceReadable(n *nsRow, name string, req Request) bool {
 // reference of every step's resulting document names a blob available to
 // the item's resource and matches its type, size and nonce. It records each
 // step's blobs and where they come from, for step 7.
-func (t *tx) checkBlobs(n *nsRow, s *itemState, a *actor, bs *batchSource) *Error {
+func (t *gate) checkBlobs(n *nsRow, s *itemState, a *actor, bs *batchSource) *Error {
 	cutoff := t.blobCutoff(t.config(n.configSeq))
 	uploader := uploaderOf(a)
 	var lastLive []ids.ID // at E3, the last live document's declared list
@@ -355,7 +355,7 @@ func (t *tx) checkBlobs(n *nsRow, s *itemState, a *actor, bs *batchSource) *Erro
 
 // availableBlob finds where a blob available to an item's resource comes
 // from (§7.8 Availability), or nil.
-func (t *tx) availableBlob(n *nsRow, s *itemState, uploader string, cutoff int64, bid ids.ID, bs *batchSource) *blobRow {
+func (t *gate) availableBlob(n *nsRow, s *itemState, uploader string, cutoff int64, bid ids.ID, bs *batchSource) *blobRow {
 	var own int64
 	if s.view != nil && s.view.own != nil {
 		own = s.view.own.id
@@ -800,7 +800,7 @@ func localSourceRank(cfg *Config) int {
 
 // gateBlob runs an upload's checks in the order of §7.8, as far as they go
 // without the body. With draw, it draws the rate-limit tokens.
-func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw bool) (*blobGate, *Error) {
+func (t *gate) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw bool) (*blobGate, *Error) {
 	n := t.nsByName(req.NS)
 	if n == nil {
 		return nil, t.absentNS(req.NS, req.Cred)
@@ -910,27 +910,35 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 		g.pendMax = int64(cfg.Limits.BlobPending)
 	}
 	var res int64
-	if r := t.resource(n.id, name); r != nil {
-		res = r.id
+	if v := t.resolve(n, name, nil); v.own != nil {
+		res = v.own.id
 	}
-	if t.e.pg && t.write {
-		// The namespace's lock is only shared (D.8): the uploader's row
-		// orders its concurrent uploads, so their pending total is read
-		// after the other's commit (blob_uploaders).
-		_, err := t.Exec(`INSERT INTO blob_uploaders (ns, uploader) VALUES (?, ?)
-			ON CONFLICT (ns, uploader) DO UPDATE SET uploader = excluded.uploader`, n.id, g.uploader)
-		t.must(err)
-	}
-	t.must(t.QueryRow(`SELECT COALESCE(SUM(CASE WHEN p.size < ? THEN ? ELSE p.size END), 0)
-		FROM blob_pending p JOIN resources r ON r.res = p.res
-		WHERE r.ns = ? AND p.uploader = ? AND p.created >= ? AND NOT (p.res = ? AND p.bid = ?)`,
-		pendingMin, pendingMin, n.id, g.uploader, g.cutoff, res, bid[:]).Scan(&g.pendUsed))
+	g.pendUsed = t.pendingUsed(n, g.uploader, g.cutoff, res, bid)
 	if size >= 0 {
 		if err := g.checkSize(size); err != nil {
 			return nil, err
 		}
 	}
 	return g, nil
+}
+
+// pendingUsed is uploader's pending bytes in n (each at least pendingMin)
+// of entries created at or after cutoff, but res's of bid.
+func (t *tx) pendingUsed(n *nsRow, uploader string, cutoff, res int64, bid ids.ID) int64 {
+	if t.e.pg && t.write {
+		// The namespace's lock is only shared (D.8): the uploader's row
+		// orders its concurrent uploads, so their pending total is read
+		// after the other's commit (blob_uploaders).
+		_, err := t.Exec(`INSERT INTO blob_uploaders (ns, uploader) VALUES (?, ?)
+			ON CONFLICT (ns, uploader) DO UPDATE SET uploader = excluded.uploader`, n.id, uploader)
+		t.must(err)
+	}
+	var used int64
+	t.must(t.QueryRow(`SELECT COALESCE(SUM(CASE WHEN p.size < ? THEN ? ELSE p.size END), 0)
+		FROM blob_pending p JOIN resources r ON r.res = p.res
+		WHERE r.ns = ? AND p.uploader = ? AND p.created >= ? AND NOT (p.res = ? AND p.bid = ?)`,
+		pendingMin, pendingMin, n.id, uploader, cutoff, res, bid[:]).Scan(&used))
+	return used
 }
 
 // checkSize is check 5 for a body of size bytes.
@@ -953,7 +961,7 @@ func (g *blobGate) checkSize(size int64) *Error {
 // epoch it is served under there (keywindow.go, preRaiseBlobOpens). Anything else is nil
 // (404), a source whose own source was raised to a level this server lacks
 // included (upstreamRefusal: the read fails).
-func (t *tx) copySource(target *nsRow, req Request, ns, name string, bid ids.ID) *blobRow {
+func (t *gate) copySource(target *nsRow, req Request, ns, name string, bid ids.ID) *blobRow {
 	sn := t.nsByName(ns)
 	if sn == nil || sn.purged {
 		return nil
@@ -984,6 +992,11 @@ func (e *Engine) UploadBlob(ctx context.Context, req Request, name, bidText stri
 	if perr != nil {
 		return badInput("malformed blob id")
 	}
+	return e.be.uploadBlob(ctx, req, name, bid, up)
+}
+
+// sqlUploadBlob is UploadBlob on SQL.
+func (e *Engine) sqlUploadBlob(ctx context.Context, req Request, name string, bid ids.ID, up BlobUpload) error {
 	// The checks that need no body, outside the write lock; the rate-limit
 	// tokens are drawn here, once.
 	var g *blobGate
@@ -995,23 +1008,9 @@ func (e *Engine) UploadBlob(ctx context.Context, req Request, name, bidText stri
 	if err != nil {
 		return err
 	}
-	var data []byte
-	if up.From == "" {
-		data, err = io.ReadAll(io.LimitReader(up.Body, g.maxSize+1))
-		if err != nil {
-			return badInput("could not read the body")
-		}
-		if err := g.checkSize(int64(len(data))); err != nil {
-			return err
-		}
-		if extra := int64(len(data)) - min(max(up.Length, 0), g.maxSize+1); extra > 0 {
-			d := g.rate[len(g.rate)-1]
-			d.cost = float64(extra)
-			e.rate.charge(e.now(), d)
-		}
-		if ids.Blob(g.typ, g.nonce, data) != bid {
-			return apiErr(422, "blob_mismatch", "message", "the body doesn't hash to the blob id (§3.7)")
-		}
+	data, err := e.readUpload(g, &up, bid)
+	if err != nil {
+		return err
 	}
 	return e.update(ctx, func(t *tx) error {
 		g, gerr := t.gateBlob(req, name, bid, &up, false)
@@ -1064,6 +1063,31 @@ func (e *Engine) UploadBlob(ctx context.Context, req Request, name, bidText stri
 	})
 }
 
+// readUpload reads an upload's body (none for a copy) once the checks
+// that need none passed: check 5 on its size, the bytes beyond the
+// declared length charged, the hash checked against the blob id.
+func (e *Engine) readUpload(g *blobGate, up *BlobUpload, bid ids.ID) ([]byte, error) {
+	if up.From != "" {
+		return nil, nil
+	}
+	data, err := io.ReadAll(io.LimitReader(up.Body, g.maxSize+1))
+	if err != nil {
+		return nil, badInput("could not read the body")
+	}
+	if err := g.checkSize(int64(len(data))); err != nil {
+		return nil, err
+	}
+	if extra := int64(len(data)) - min(max(up.Length, 0), g.maxSize+1); extra > 0 {
+		d := g.rate[len(g.rate)-1]
+		d.cost = float64(extra)
+		e.rate.charge(e.now(), d)
+	}
+	if ids.Blob(g.typ, g.nonce, data) != bid {
+		return nil, apiErr(422, "blob_mismatch", "message", "the body doesn't hash to the blob id (§3.7)")
+	}
+	return data, nil
+}
+
 // ensureResource returns name's resource row in n, inserting one without
 // entries if there is none (a pending blob needs a row, D.2).
 func (t *tx) ensureResource(n *nsRow, name string) int64 {
@@ -1094,7 +1118,7 @@ type blobAnswer struct {
 // aside: the blobs attached to the resource and, in a branch, the base's
 // blobs the branch's view references (§7.6). Pending and unknown blobs are
 // 404; a purge, or pruning that ended the attachment, 410.
-func (t *tx) servableBlob(n *nsRow, name string, bid ids.ID) blobAnswer {
+func (t *gate) servableBlob(n *nsRow, name string, bid ids.ID) blobAnswer {
 	if n.purged {
 		return blobAnswer{status: 410}
 	}
@@ -1123,17 +1147,22 @@ func (t *tx) servableBlob(n *nsRow, name string, bid ids.ID) blobAnswer {
 		}
 	}
 	if pruned != nil {
-		ans := blobAnswer{status: 410, pruned: pruned, horizon: t.horizonID(pruned.res)}
-		// The newest archive of a range that references the blob.
-		err := t.QueryRow(`SELECT a.url FROM archives a WHERE a.res = ? AND EXISTS (SELECT 1 FROM blob_refs r
-			WHERE r.res = a.res AND r.bid = ? AND r.from_seq <= a.to_seq AND (r.to_seq IS NULL OR r.to_seq > a.from_seq))
-			ORDER BY a.seq DESC LIMIT 1`, pruned.res, bid[:]).Scan(&ans.archive)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			t.must(err)
-		}
-		return ans
+		return blobAnswer{status: 410, pruned: pruned, horizon: t.horizonID(pruned.res), archive: t.blobArchive(pruned.res, bid)}
 	}
 	return blobAnswer{status: 404}
+}
+
+// blobArchive is the newest archive of a range of res that references
+// bid, or "".
+func (t *tx) blobArchive(res int64, bid ids.ID) string {
+	var url string
+	err := t.QueryRow(`SELECT a.url FROM archives a WHERE a.res = ? AND EXISTS (SELECT 1 FROM blob_refs r
+		WHERE r.res = a.res AND r.bid = ? AND r.from_seq <= a.to_seq AND (r.to_seq IS NULL OR r.to_seq > a.from_seq))
+		ORDER BY a.seq DESC LIMIT 1`, res, bid[:]).Scan(&url)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.must(err)
+	}
+	return url
 }
 
 // Blob is the answer of GET /r/{ns}/{name}/blob/{bid}, or in a sealed
@@ -1219,8 +1248,8 @@ func (e *Engine) OpenBlob(ctx context.Context, ns, name, bidText string, cred Cr
 func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Credentials) (*Blob, error) {
 	var out *Blob
 	var job *sealJob
-	var nsID int64
-	err := e.read(ctx, func(t *tx) error {
+	var nsName string
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -1248,7 +1277,7 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 		if t.isSealedNS(n) {
 			// Sealed namespaces never serve the plaintext: 302 to the blob
 			// sealed under an epoch (§E.2.2, sealedblobs.go).
-			job, nsID = t.sealedBlobHead(n, name, bid, out), n.id
+			job, nsName = t.sealedBlobHead(n, name, bid, out), n.name
 			return nil
 		}
 		// Nor do e2e namespaces for a blob from before a raise from sealed,
@@ -1256,7 +1285,7 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 		if t.isE2E(n) {
 			head := t.resolve(n, name, nil).head
 			if p := t.preRaiseBlob(n, head, bid); p != nil {
-				job, nsID = t.preRaiseBlobHead(p, name, head, bid, out), p.m.id
+				job, nsName = t.preRaiseBlobHead(p, name, head, bid, out), p.m.name
 				return nil
 			}
 		}
@@ -1271,7 +1300,7 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 	if job != nil {
 		// No referencing revision had an epoch yet: the newest is sealed
 		// under the current one first, which fixes its epoch (§E.2.2).
-		if err := e.finishSeal(ctx, nsID, []*sealJob{job}); err != nil {
+		if err := e.finishSeal(ctx, nsName, []*sealJob{job}); err != nil {
 			return nil, err
 		}
 		if ep, ok := jweEpoch(job.jwe); ok {
@@ -1297,7 +1326,10 @@ type BlobStats struct {
 }
 
 // BlobStats counts the rows of blob storage, and sizes their files.
-func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) {
+func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) { return e.be.blobStats(ctx) }
+
+// sqlBlobStats is BlobStats on SQL.
+func (e *Engine) sqlBlobStats(ctx context.Context) (*BlobStats, error) {
 	s := &BlobStats{Dir: e.blobs.root()}
 	var files []string
 	err := e.read(ctx, func(t *tx) error {
@@ -1334,7 +1366,10 @@ func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) {
 // blobGrace, and the bytes nothing names any more (§7.8, D.2). Each
 // namespace is swept in its own write transaction. It returns how many
 // entries it deleted.
-func (e *Engine) SweepBlobs(ctx context.Context) (int, error) {
+func (e *Engine) SweepBlobs(ctx context.Context) (int, error) { return e.be.sweepBlobs(ctx) }
+
+// sqlSweepBlobs is SweepBlobs on SQL.
+func (e *Engine) sqlSweepBlobs(ctx context.Context) (int, error) {
 	var nss []int64
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT DISTINCT r.ns FROM blob_pending p JOIN resources r ON r.res = p.res ORDER BY r.ns`)

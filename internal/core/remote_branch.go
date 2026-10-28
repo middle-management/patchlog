@@ -90,7 +90,7 @@ const RemoteAuthor = "system:remote"
 func shadowName(branch string) string { return "~" + branch }
 
 // remoteShadow returns the shadow n reads through, if n is a remote branch.
-func (t *tx) remoteShadow(n *nsRow) *nsRow {
+func (t *gate) remoteShadow(n *nsRow) *nsRow {
 	if !n.isBranch() {
 		return nil
 	}
@@ -113,6 +113,10 @@ func (t *tx) baseIdentity(n *nsRow) string {
 	}
 	return fmt.Sprint(n.base.Int64)
 }
+
+// localIdentity is local namespace n's baseIdentity as a base of its
+// branches.
+func (t *tx) localIdentity(n *nsRow) string { return fmt.Sprint(n.id) }
 
 // remoteBaseIn reports whether a genesis patch set produces a document whose
 // base names an origin.
@@ -1184,7 +1188,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 
 // checkRemoteGenesis authenticates the operator grant, checks it for
 // config, and checks the genesis of a remote branch (§C.4, §G.3).
-func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[string]any, *actor, *Error) {
+func (t *gate) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[string]any, *actor, *Error) {
 	if !ValidNSName(req.NS) {
 		return nil, nil, nil, badInput("invalid namespace name")
 	}
@@ -1301,34 +1305,8 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 // the genesis checks that need the base (§G.3, §G.5), then runs step 6
 // for a, the operator grant that creates it (checkCreationRules).
 func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc map[string]any, m *remoteMirror, a *actor) (*WriteResult, *Error) {
-	// The obligations of §G.5, which the base can't enforce.
-	if cfg.Read == "public" && m.read != "public" {
-		return nil, invalid("a branch of a non-public namespace cannot be public (§G.5): make it private (read: grant) or sealed")
-	}
-	if cfg.level < m.level {
-		return nil, invalid(fmt.Sprintf("/encryption: a branch cannot have a lower encryption level than its base, which is %s (§G.5)", levelNames[m.level]))
-	}
-	if cfg.level == levelE2E && m.level != levelE2E {
-		return nil, invalid("/encryption: a branch can be e2e only if its base is")
-	}
-	if m.levels[0].nonce && !cfg.NonceRequired {
-		return nil, invalid(`/nonce: the base requires nonces, so a remote branch of it must be created with "nonce": "required" too, or merging it back would fail (§C.7, §G.3)`)
-	}
-	// base.chain records the namespaces followed while verifying (§G.3):
-	// readers of an e2e branch accept read-through ciphertext bound to any
-	// of them. The genesis gives it (checkRemoteGenesis), and must give it
-	// right; its config id is over the genesis as sent.
-	chain := make([]any, len(m.levels))
-	for i, lv := range m.levels {
-		chain[i] = lv.ns
-	}
-	if !jsonv.Equal(anyStrings(cfg.Base.Chain), chain) {
-		return nil, docInvalid("/base/chain", fmt.Sprintf("/base/chain must be %s: the base's namespace, then its base, and so on, as of at (§G.3)", jsonv.Canonical(chain)))
-	}
-	if m.level == levelE2E && slices.Contains(cfg.Base.Chain, req.NS) {
-		// A kid {ns}#{e} names one keyring (§F.8.1).
-		return nil, docInvalid("/base/chain", "/base/chain names "+req.NS+": a remote branch of an e2e base can't have the name of a namespace in its base.chain, "+
-			"since read-through ciphertext keeps their names in pl.ns and kid (§G.5.2, §F.8.1)")
+	if oerr := remoteObligations(req.NS, cfg, m); oerr != nil {
+		return nil, oerr
 	}
 	// Step 6, after the genesis is validated: the creating operator
 	// grant's own rules, as for a namespace's creation (§6.4.3, §C.2).
@@ -1362,6 +1340,41 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 		shadow.id, bid, m.base.Origin, m.base.NS, m.base.At, m.base.At)
 	t.must(err)
 	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: cfgID.String()}, nil
+}
+
+// remoteObligations checks the obligations of §G.5 that the base can't
+// enforce, of a remote branch ns with configuration cfg over m, and its
+// base.chain (§G.3).
+func remoteObligations(ns string, cfg *Config, m *remoteMirror) *Error {
+	if cfg.Read == "public" && m.read != "public" {
+		return invalid("a branch of a non-public namespace cannot be public (§G.5): make it private (read: grant) or sealed")
+	}
+	if cfg.level < m.level {
+		return invalid(fmt.Sprintf("/encryption: a branch cannot have a lower encryption level than its base, which is %s (§G.5)", levelNames[m.level]))
+	}
+	if cfg.level == levelE2E && m.level != levelE2E {
+		return invalid("/encryption: a branch can be e2e only if its base is")
+	}
+	if m.levels[0].nonce && !cfg.NonceRequired {
+		return invalid(`/nonce: the base requires nonces, so a remote branch of it must be created with "nonce": "required" too, or merging it back would fail (§C.7, §G.3)`)
+	}
+	// base.chain records the namespaces followed while verifying (§G.3):
+	// readers of an e2e branch accept read-through ciphertext bound to any
+	// of them. The genesis gives it (checkRemoteGenesis), and must give it
+	// right; its config id is over the genesis as sent.
+	chain := make([]any, len(m.levels))
+	for i, lv := range m.levels {
+		chain[i] = lv.ns
+	}
+	if !jsonv.Equal(anyStrings(cfg.Base.Chain), chain) {
+		return docInvalid("/base/chain", fmt.Sprintf("/base/chain must be %s: the base's namespace, then its base, and so on, as of at (§G.3)", jsonv.Canonical(chain)))
+	}
+	if m.level == levelE2E && slices.Contains(cfg.Base.Chain, ns) {
+		// A kid {ns}#{e} names one keyring (§F.8.1).
+		return docInvalid("/base/chain", "/base/chain names "+ns+": a remote branch of an e2e base can't have the name of a namespace in its base.chain, "+
+			"since read-through ciphertext keeps their names in pl.ns and kid (§G.5.2, §F.8.1)")
+	}
+	return nil
 }
 
 // insertShadows mirrors every level of the base's chain into a shadow of
@@ -1533,7 +1546,7 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 // remoteShadows returns the shadows a remote branch reads through, its
 // base's first, then its bases'; nil if n isn't a remote branch. All of
 // them are the remote side (§7.6).
-func (t *tx) remoteShadows(n *nsRow) []*nsRow {
+func (t *gate) remoteShadows(n *nsRow) []*nsRow {
 	var out []*nsRow
 	for s := t.remoteShadow(n); s != nil; {
 		out = append(out, s)
@@ -1917,9 +1930,11 @@ func (t *tx) purgeShadowNS(sh *nsRow) {
 type remoteSourcesKey struct{}
 
 // remoteSources are the base documents read for one write, by the remote
-// branch's ns.
+// branch's name: they outlive the check that asked for them, so they are
+// keyed by what every retry names the same, not a row id (on DynamoDB, a
+// check's handle).
 type remoteSources struct {
-	docs map[int64]*remoteSourceDoc
+	docs map[string]*remoteSourceDoc
 }
 
 // remoteSourceDoc is a remote branch's base's current namespace document,
@@ -1940,7 +1955,7 @@ type remoteSourceDoc struct {
 // errNeedSource rolls back a write that needs the current namespace
 // document of the base of remote branch branch (remoteSourceFor).
 type errNeedSource struct {
-	branch         int64
+	branch         string // the remote branch's name
 	origin, ns, at string
 	withAt         bool
 }
@@ -1954,7 +1969,7 @@ func (e *errNeedSource) Error() string {
 // of f finds missing is read from the base, outside any transaction, and f
 // runs again.
 func (e *Engine) withRemoteSource(ctx context.Context, f func(context.Context) error) error {
-	h := &remoteSources{docs: map[int64]*remoteSourceDoc{}}
+	h := &remoteSources{docs: map[string]*remoteSourceDoc{}}
 	ctx = context.WithValue(ctx, remoteSourcesKey{}, h)
 	for tries := 0; ; tries++ {
 		err := f(ctx)
@@ -2010,10 +2025,10 @@ func (t *tx) remoteSourceFor(n *nsRow, withAt bool) *remoteSourceDoc {
 	if h == nil {
 		return &remoteSourceDoc{origin: origin, ns: ns, err: errors.New("not read for this write"), down: true}
 	}
-	if d := h.docs[n.id]; d != nil && (d.withAt || !withAt) {
+	if d := h.docs[n.name]; d != nil && (d.withAt || !withAt) {
 		return d
 	}
-	panic(&errNeedSource{branch: n.id, origin: origin, ns: ns, at: at, withAt: withAt})
+	panic(&errNeedSource{branch: n.name, origin: origin, ns: ns, at: at, withAt: withAt})
 }
 
 // checkRemoteSource is the §7.4 validation of remote branch n's namespace
@@ -2027,7 +2042,7 @@ func (t *tx) remoteSourceFor(n *nsRow, withAt bool) *remoteSourceDoc {
 // the base didn't answer or answered 5xx; and 422 otherwise (unknownLevel).
 // Refusals are 422 invalid with errors pointing at the member, as for the
 // other branch fields; nothing is applied.
-func (t *tx) checkRemoteSource(n *nsRow, cur, cfg *Config) *Error {
+func (t *gate) checkRemoteSource(n *nsRow, cur, cfg *Config) *Error {
 	toE2E := cfg.level == levelE2E && cur.level < levelE2E
 	toPublic := cur.Read != "public" && cfg.Read == "public"
 	nonceOff := cur.NonceRequired && !cfg.NonceRequired
@@ -2076,28 +2091,34 @@ func (t *tx) checkRemoteSource(n *nsRow, cur, cfg *Config) *Error {
 // remoteBase is a remote_bases row. catchUp: the follower reads the base's
 // namespace document as of the checkpoint once more (remote_catchup).
 type remoteBase struct {
-	shadow, branch int64
+	shadow, branch int64 // SQL's rows
 	origin, ns, at string
 	checkpoint     string
 	regNSID        sql.NullString
 	regExpires     sql.NullInt64
 	branchName     string
+	purged         bool // the branch is
 	catchUp        bool
 }
 
-func (t *tx) remoteBases(where string, args ...any) []*remoteBase {
-	rows, err := t.Query(`SELECT r.shadow, r.branch, r.origin, r.ns, r.at, r.checkpoint, r.reg_ns_id, r.reg_expires, n.name,
-		EXISTS (SELECT 1 FROM remote_catchup c WHERE c.branch = r.branch)
-		FROM remote_bases r JOIN namespaces n ON n.ns = r.branch WHERE `+where+` ORDER BY n.name`, args...)
-	t.must(err)
-	defer rows.Close()
+// sqlRemoteBases lists the remote branches' bases, by branch name, or the
+// one of branch name.
+func (e *Engine) sqlRemoteBases(ctx context.Context, name string) ([]*remoteBase, error) {
 	var out []*remoteBase
-	for rows.Next() {
-		b := &remoteBase{}
-		t.must(rows.Scan(&b.shadow, &b.branch, &b.origin, &b.ns, &b.at, &b.checkpoint, &b.regNSID, &b.regExpires, &b.branchName, &b.catchUp))
-		out = append(out, b)
-	}
-	return out
+	err := e.read(ctx, func(t *tx) error {
+		rows, err := t.Query(`SELECT r.shadow, r.branch, r.origin, r.ns, r.at, r.checkpoint, r.reg_ns_id, r.reg_expires, n.name, n.purged,
+		EXISTS (SELECT 1 FROM remote_catchup c WHERE c.branch = r.branch)
+		FROM remote_bases r JOIN namespaces n ON n.ns = r.branch WHERE ? = '' OR n.name = ? ORDER BY n.name`, name, name)
+		t.must(err)
+		defer rows.Close()
+		for rows.Next() {
+			b := &remoteBase{}
+			t.must(rows.Scan(&b.shadow, &b.branch, &b.origin, &b.ns, &b.at, &b.checkpoint, &b.regNSID, &b.regExpires, &b.branchName, &b.purged, &b.catchUp))
+			out = append(out, b)
+		}
+		return nil
+	})
+	return out, err
 }
 
 // RemoteNotice is a purge seen in a remote base's log (§G.3), or a config
@@ -2118,6 +2139,11 @@ type RemoteNotice struct {
 // RemoteNotices lists the notices of a remote branch ("" = all), oldest
 // first.
 func (e *Engine) RemoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error) {
+	return e.be.remoteNotices(ctx, ns)
+}
+
+// sqlRemoteNotices is RemoteNotices on SQL.
+func (e *Engine) sqlRemoteNotices(ctx context.Context, ns string) ([]RemoteNotice, error) {
 	var out []RemoteNotice
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT n.name, x.id, x.kind, x.resource, x.applied, x.created FROM remote_notices x JOIN namespaces n ON n.ns = x.branch
@@ -2159,6 +2185,11 @@ type RemoteLevel struct {
 // RemoteLevels lists the remote branches ("" = all) whose base's level is
 // above their own.
 func (e *Engine) RemoteLevels(ctx context.Context, ns string) ([]RemoteLevel, error) {
+	return e.be.remoteLevels(ctx, ns)
+}
+
+// sqlRemoteLevels is RemoteLevels on SQL.
+func (e *Engine) sqlRemoteLevels(ctx context.Context, ns string) ([]RemoteLevel, error) {
 	var out []RemoteLevel
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT n.name, l.level, l.lacks, l.rebase, l.id, l.created FROM remote_levels l JOIN namespaces n ON n.ns = l.branch
@@ -2183,15 +2214,15 @@ func (e *Engine) RemoteLevels(ctx context.Context, ns string) ([]RemoteLevel, er
 // restrictions of its read followed (§G.3, §G.5.2); with Register,
 // registrations are made or renewed.
 func (e *Engine) SyncRemotes(ctx context.Context) error {
-	var bases []*remoteBase
-	if err := e.read(ctx, func(t *tx) error {
-		bases = t.remoteBases(`n.purged = 0`)
-		return nil
-	}); err != nil {
+	bases, err := e.be.remoteBases(ctx, "")
+	if err != nil {
 		return err
 	}
 	var errs []error
 	for _, b := range bases {
+		if b.purged {
+			continue
+		}
 		if err := e.jobStep(ctx); err != nil {
 			errs = append(errs, err)
 			break
@@ -2245,25 +2276,25 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 // its log can't be followed; the error is reported.
 func (e *Engine) followChainEpochs(ctx context.Context, c *client.Client, ep RemoteEndpoint, b *remoteBase) error {
 	type level struct {
-		shadow int64
+		shadow string
 		ns     string
 	}
 	var levels []level
-	if err := e.read(ctx, func(t *tx) error {
-		bn := t.nsByID(b.branch)
+	if err := e.gateRead(ctx, func(t *gate) error {
+		bn := t.nsByName(b.branchName)
 		if bn == nil || bn.purged {
 			return nil
 		}
 		for i, sh := range t.remoteShadows(bn) {
 			if i > 0 && t.config(sh.configSeq).level == levelE2E {
-				levels = append(levels, level{sh.id, t.kidName(sh)})
+				levels = append(levels, level{sh.name, t.kidName(sh)})
 			}
 		}
 		return nil
 	}); err != nil || len(levels) == 0 {
 		return err
 	}
-	docs := map[int64]sourceDoc{}
+	docs := map[string]sourceDoc{}
 	var errs []error
 	for _, lv := range levels {
 		h, err := c.NSHead(ctx, lv.ns)
@@ -2279,14 +2310,24 @@ func (e *Engine) followChainEpochs(ctx context.Context, c *client.Client, ep Rem
 		docs[lv.shadow] = d
 	}
 	if len(docs) > 0 {
-		errs = append(errs, e.update(ctx, func(t *tx) error {
-			for sh, d := range docs {
-				t.followEpoch(sh, d, "")
-			}
-			return nil
-		}))
+		errs = append(errs, e.be.followEpochs(ctx, docs))
 	}
 	return errors.Join(errs...)
+}
+
+// sqlFollowEpochs records the epochs in force at the bases of a chain's
+// levels, in the shadows mirroring them, by shadow name (followEpoch).
+func (e *Engine) sqlFollowEpochs(ctx context.Context, docs map[string]sourceDoc) error {
+	return e.update(ctx, func(t *tx) error {
+		for name, d := range docs {
+			// A shadow, which nsByName never names.
+			var sh int64
+			if t.QueryRow(`SELECT ns FROM namespaces WHERE name = ?`, name).Scan(&sh) == nil {
+				t.followEpoch(sh, d, "")
+			}
+		}
+		return nil
+	})
 }
 
 // followLog follows the base's log after the checkpoint (followRemote).
@@ -2356,13 +2397,9 @@ func (e *Engine) followLog(ctx context.Context, c *client.Client, ep RemoteEndpo
 	// e2e and hasn't recorded it.
 	if e2eSeen {
 		var below bool
-		if err := e.read(ctx, func(t *tx) error {
-			bn := t.nsByID(b.branch)
-			var recorded int
-			if err := t.QueryRow(`SELECT level FROM remote_levels WHERE branch = ?`, bn.id).Scan(&recorded); err != nil && !errors.Is(err, sql.ErrNoRows) {
-				t.must(err)
-			}
-			below = t.config(bn.configSeq).level < levelE2E && recorded < levelE2E
+		if err := e.gateRead(ctx, func(t *gate) error {
+			bn := t.nsByName(b.branchName)
+			below = bn != nil && t.config(bn.configSeq).level < levelE2E && t.recordedLevel(bn) < levelE2E
 			return nil
 		}); err != nil {
 			return err
@@ -2383,6 +2420,13 @@ func (e *Engine) followLog(ctx context.Context, c *client.Client, ep RemoteEndpo
 			}
 		}
 	}
+	return e.be.followed(ctx, b, entries, head, docs, catchUp, catchErr)
+}
+
+// sqlFollowed records what following a base found (followLog): the
+// catch-up, each config change's level and epoch, each purge in entries
+// as a notice, applied, and head as the new checkpoint.
+func (e *Engine) sqlFollowed(ctx context.Context, b *remoteBase, entries []client.NSEntry, head string, docs map[string]sourceDoc, catchUp *sourceDoc, catchErr error) error {
 	return errors.Join(e.update(ctx, func(t *tx) error {
 		// The branch's lock first: the checkpoint is read as of it.
 		bn := t.nsByIDLocked(b.branch, lockExclusive)
@@ -2451,6 +2495,16 @@ func (e *Engine) followLog(ctx context.Context, c *client.Client, ep RemoteEndpo
 		t.must(err)
 		return nil
 	}), catchErr)
+}
+
+// recordedLevel is the level a remote branch recorded following its
+// base's raise to e2e (remote_levels), levelNone for none.
+func (t *tx) recordedLevel(bn *nsRow) int {
+	var recorded int
+	if err := t.QueryRow(`SELECT level FROM remote_levels WHERE branch = ?`, bn.id).Scan(&recorded); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.must(err)
+	}
+	return recorded
 }
 
 // configChanged reports whether a namespace entry changes the namespace
@@ -2576,6 +2630,11 @@ func sealedAt(ctx context.Context, ep RemoteEndpoint, baseURL, path string) bool
 // the base names, which isn't verified. The checkpoint stays: nothing else
 // of the log is followed.
 func (e *Engine) followSealed(ctx context.Context, b *remoteBase, head string) error {
+	return e.be.followSealed(ctx, b, head)
+}
+
+// sqlFollowSealed is followSealed on SQL.
+func (e *Engine) sqlFollowSealed(ctx context.Context, b *remoteBase, head string) error {
 	return e.update(ctx, func(t *tx) error {
 		bn := t.nsByIDLocked(b.branch, lockExclusive)
 		if !bn.purged {
@@ -2756,17 +2815,14 @@ func (t *tx) serverConfig(n *nsRow, patches []any) error {
 // registration (§G.3). It needs unrestricted read and export at the base,
 // through the endpoint's bearer grant.
 func (e *Engine) RegisterRemote(ctx context.Context, ns string) error {
-	var b *remoteBase
-	if err := e.read(ctx, func(t *tx) error {
-		bs := t.remoteBases(`n.name = ?`, ns)
-		if len(bs) == 0 {
-			return notFound()
-		}
-		b = bs[0]
-		return nil
-	}); err != nil {
+	bs, err := e.be.remoteBases(ctx, ns)
+	if err != nil {
 		return err
 	}
+	if len(bs) == 0 {
+		return notFound()
+	}
+	b := bs[0]
 	if !ValidRemoteOrigin(e.opt.Origin) {
 		return fmt.Errorf("this deployment's origin %q is not an https origin (or http on a loopback host)", e.opt.Origin)
 	}
@@ -2794,8 +2850,13 @@ func (e *Engine) RegisterRemote(ctx context.Context, ns string) error {
 	if nsID == "" || perr != nil {
 		return fmt.Errorf("unexpected registration response %v", res)
 	}
+	return e.be.registered(ctx, b, nsID, expT)
+}
+
+// sqlRegistered records a branch's registration with its base.
+func (e *Engine) sqlRegistered(ctx context.Context, b *remoteBase, nsID string, expires time.Time) error {
 	return e.update(ctx, func(t *tx) error {
-		_, err := t.Exec(`UPDATE remote_bases SET reg_ns_id = ?, reg_expires = ? WHERE shadow = ?`, nsID, expT.UnixMilli(), b.shadow)
+		_, err := t.Exec(`UPDATE remote_bases SET reg_ns_id = ?, reg_expires = ? WHERE shadow = ?`, nsID, expires.UnixMilli(), b.shadow)
 		t.must(err)
 		return nil
 	})

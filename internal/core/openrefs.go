@@ -1,6 +1,10 @@
 package core
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/middle-management/patchlog/internal/ids"
+)
 
 // Open referrers, memoised.
 //
@@ -32,8 +36,20 @@ type openRefsEntry struct {
 	ok    bool
 }
 
-// nsHead is a namespace's log head.
-type nsHead struct{ ns, seq int64 }
+// nsHead is a namespace's log head, by name and entry id: what holds
+// across reads (DynamoDB's ids are per read).
+type nsHead struct {
+	ns   string
+	head ids.ID
+}
+
+// logHead is n's log head's entry id.
+func (t *gate) logHead(n *nsRow) ids.ID {
+	if !n.headSeq.Valid {
+		return ids.ID{}
+	}
+	return t.nsLogID(n.headSeq.Int64)
+}
 
 // Past either bound the memo starts over.
 const (
@@ -44,7 +60,7 @@ const (
 // openRefers reports whether a referrer in a namespace n's schemaReads
 // lists that is open to everyone opens path, to every request (§6.1). g
 // holds the read cache's counters, loaded before the transaction began.
-func (t *tx) openRefers(n *nsRow, cfg *Config, path string, g gens, closures map[string]bool) bool {
+func (t *gate) openRefers(n *nsRow, cfg *Config, path string, g gens, closures map[string]bool) bool {
 	if m, ok := t.e.rc.refsFor(g, path); ok && t.headsHold(m.heads) {
 		return m.ok
 	}
@@ -53,7 +69,7 @@ func (t *tx) openRefers(n *nsRow, cfg *Config, path string, g gens, closures map
 		if !openToAll(t.config(l.configSeq)) {
 			continue
 		}
-		m.heads = append(m.heads, nsHead{l.id, l.headSeq.Int64})
+		m.heads = append(m.heads, nsHead{l.name, t.logHead(l)})
 		if m.ok = t.refersIn(l, nil, path, closures); m.ok {
 			break
 		}
@@ -63,9 +79,9 @@ func (t *tx) openRefers(n *nsRow, cfg *Config, path string, g gens, closures map
 }
 
 // headsHold reports whether the namespaces' log heads are still those.
-func (t *tx) headsHold(heads []nsHead) bool {
+func (t *gate) headsHold(heads []nsHead) bool {
 	for _, h := range heads {
-		if t.nsByID(h.ns).headSeq.Int64 != h.seq {
+		if n := t.nsByName(h.ns); n == nil || t.logHead(n) != h.head {
 			return false
 		}
 	}

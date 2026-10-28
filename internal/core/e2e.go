@@ -89,11 +89,11 @@ import (
 const KeyringName = "keyring"
 
 // isE2E reports whether n is an end-to-end namespace.
-func (t *tx) isE2E(n *nsRow) bool { return t.nsLevel(n) == levelE2E }
+func (t *gate) isE2E(n *nsRow) bool { return t.nsLevel(n) == levelE2E }
 
 // e2eContent reports whether resource name of n holds sealed content: any
 // resource of an e2e namespace but its keyring.
-func (t *tx) e2eContent(n *nsRow, name string) bool { return name != KeyringName && t.isE2E(n) }
+func (t *gate) e2eContent(n *nsRow, name string) bool { return name != KeyringName && t.isE2E(n) }
 
 // e2eConfigWritten records the start of an e2e namespace's epoch: its
 // creation (or a branch's), a raise to e2e, and every write that
@@ -193,14 +193,14 @@ func (t *tx) preRaiseHead(raise *e2eRaise, res int64) int64 {
 // (invariant 6): cfg's, which for a batch's items is the configuration its
 // config change produces (§7.5). why says where the epoch comes from, for
 // the refusal.
-func (t *tx) checkSealedHeader(n *nsRow, jwe string, want seal.PL, what string, epoch int, why string) *Error {
+func (t *gate) checkSealedHeader(n *nsRow, jwe string, want seal.PL, what string, epoch int, why string) *Error {
 	return t.checkSealedKid(jwe, want, what, n.name, epoch, why)
 }
 
 // checkSealedKid is checkSealedHeader with the namespace the kid must name,
 // kns: n's own, or for a prune's snapshot of a base's content from before
 // its raise from sealed, that base (checkSnapshot).
-func (t *tx) checkSealedKid(jwe string, want seal.PL, what, kns string, epoch int, why string) *Error {
+func (t *gate) checkSealedKid(jwe string, want seal.PL, what, kns string, epoch int, why string) *Error {
 	h, err := seal.ParseHeader(jwe)
 	if err != nil || strings.Split(jwe, ".")[1] != "" {
 		return invalid(fmt.Sprintf("the %s is not a compact JWE with alg dir and enc A256GCM", what))
@@ -224,7 +224,7 @@ func (t *tx) checkSealedKid(jwe string, want seal.PL, what, kns string, epoch in
 // checkSnapshot checks the header of snapshot, a prune's sealed snapshot of
 // revision h of resource name of n (§8.6, §E.3.1): pl {ns, name, id}
 // naming n, the resource and h, and the kid snapshotKid gives.
-func (t *tx) checkSnapshot(n *nsRow, cfg *Config, name string, h *revRow, snapshot string) *Error {
+func (t *gate) checkSnapshot(n *nsRow, cfg *Config, name string, h *revRow, snapshot string) *Error {
 	kns, epoch, why := t.snapshotKid(n, cfg, h)
 	return t.checkSealedKid(snapshot, seal.SnapshotPL(n.name, name, h.id.String()), "snapshot", kns, epoch, why)
 }
@@ -384,7 +384,7 @@ func (t *tx) preRaiseEpoch(n *nsRow, r *revRow, raise *e2eRaise) int {
 // applyStepsE2E is step 3 for a resource of an e2e namespace (§6.2): each
 // patch step must be one sealed op bound to this write (or [] for a
 // restore); nothing is applied.
-func (t *tx) applyStepsE2E(n *nsRow, cfg *Config, s *itemState) *Error {
+func (t *gate) applyStepsE2E(n *nsRow, cfg *Config, s *itemState) *Error {
 	var parentID *ids.ID
 	tomb := false
 	if s.parent != nil {
@@ -472,7 +472,7 @@ func parseDeclared(list []string) ([]ids.ID, *Error) {
 // last live document's list as it is (keepsList), which may hold plain
 // blobs a document from before a raise to e2e references: only later
 // writes declare sealed blobs alone (Addendum E Levels, Later writes).
-func (t *tx) checkDeclared(n *nsRow, s *itemState, step *stepState, list []ids.ID, uploader string, cutoff int64, bs *batchSource) *Error {
+func (t *gate) checkDeclared(n *nsRow, s *itemState, step *stepState, list []ids.ID, uploader string, cutoff int64, bs *batchSource) *Error {
 	step.blobs = map[ids.ID]*blobRow{}
 	for i, bid := range list {
 		ptr := "/0/blobs/" + strconv.Itoa(i)
@@ -519,7 +519,7 @@ func (t *tx) declaredAt(row *revRow) []ids.ID {
 // kid and to (seal.ParseKeyringV2), whose kids name this namespace and
 // epochs not after encryption.epoch. A keyring in the format before v0.63
 // is refused like any other document: a key holder wraps it again.
-func (t *tx) checkKeyring(n *nsRow, cfg *Config, s *itemState) *Error {
+func (t *gate) checkKeyring(n *nsRow, cfg *Config, s *itemState) *Error {
 	for _, st := range s.steps {
 		if st.del {
 			continue
@@ -583,7 +583,7 @@ func (t *tx) e2eSnapshot(row *revRow) string {
 // branch each base's for the base epochs baseEpochs selects, K_r derived
 // with the base's namespace; a remote branch's shadow holds those its source gave
 // this deployment's grant (fetchPreRaiseKeys).
-func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error) {
+func (t *gate) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error) {
 	enc := recipientOf(a)
 	if enc == nil {
 		return nil, invalid("e2e namespaces relay only wrapped keys: the grant's root block needs enc, an X25519 public key (§E.2.3, §E.3.2)")
@@ -636,7 +636,7 @@ func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[str
 // ownKeyring returns the keyring document of n itself as of asOf (nil:
 // now), nil if n has no live keyring of its own then: one it reads through
 // from a base is that base's.
-func (t *tx) ownKeyring(n *nsRow, asOf *int64) any {
+func (t *gate) ownKeyring(n *nsRow, asOf *int64) any {
 	v := t.resolve(n, KeyringName, asOf)
 	if v.state != Live || v.head == nil || v.src == nil || v.src.ns != n.id {
 		return nil
@@ -652,7 +652,7 @@ func (t *tx) ownKeyring(n *nsRow, asOf *int64) any {
 // the §E.2.3 window reads them at E3: those begun at e2e (e2e_epochs) and,
 // after a raise from sealed, the epochs before it, whose keys the origin
 // holds (epoch_keys), up to the last one before the raise.
-func (t *tx) keyEpochs(n *nsRow, max int) []epochStart {
+func (t *gate) keyEpochs(n *nsRow, max int) []epochStart {
 	all := t.epochStarts(`e2e_epochs`, n.id, max)
 	r := t.e2eRaiseOf(n)
 	if r == nil || r.level != levelSealed {
@@ -689,11 +689,9 @@ func (t *tx) epochNow(b *nsRow) int {
 // the grant instead, whose keys the origin gives as at E2 (preRaiseKeys),
 // whether or not b has moved past its epoch at at. A base at at that isn't
 // e2e gives none.
-func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
-	var cseq, created int64
-	if err := t.QueryRow(`SELECT config_seq, created FROM ns_log WHERE seq = ?`, at).Scan(&cseq, &created); err != nil {
-		return nil
-	}
+func (t *gate) baseEpochs(b *nsRow, at int64, a *actor) []int {
+	cseq, _ := t.entryConfig(at)
+	_, created := t.entryBy(at)
 	acfg := t.config(cseq)
 	if acfg.level != levelE2E {
 		return nil
@@ -744,14 +742,14 @@ func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 // the raise (preRaiseKeysOpen: schema resolution, blob copies, a batch's
 // local source) both take it from here, so neither is looser or tighter
 // than the other (§2.1 Protection). In a branch, a is the branch's grant.
-func (t *tx) preRaiseWindow(owner *nsRow, raise *e2eRaise, a *actor) []int {
+func (t *gate) preRaiseWindow(owner *nsRow, raise *e2eRaise, a *actor) []int {
 	return t.grantEpochsOf(t.epochStarts(`epoch_keys`, owner.id, raise.epoch), t.preRaiseConfig(raise), a)
 }
 
 // withPreRaise replaces, in epochs, a window over owner's epochs (ascending),
 // those from before owner's raise from sealed with the ones preRaiseWindow
 // gives a; epochs unchanged for an owner that wasn't raised from sealed.
-func (t *tx) withPreRaise(owner *nsRow, epochs []int, a *actor) []int {
+func (t *gate) withPreRaise(owner *nsRow, epochs []int, a *actor) []int {
 	r := t.e2eRaiseOf(owner)
 	if r == nil || r.level != levelSealed {
 		return epochs
@@ -779,7 +777,7 @@ func (t *tx) withPreRaise(owner *nsRow, epochs []int, a *actor) []int {
 // origin hands out (§E.2.3), so they carry no from. Nothing for an owner
 // that wasn't raised from sealed: content from before a raise from none or
 // at-rest is in the clear.
-func (t *tx) preRaiseKeys(owner *nsRow, epochs []int, a *actor, kr KeysRequest, enc *ecdh.PublicKey) ([]map[string]any, error) {
+func (t *gate) preRaiseKeys(owner *nsRow, epochs []int, a *actor, kr KeysRequest, enc *ecdh.PublicKey) ([]map[string]any, error) {
 	r := t.e2eRaiseOf(owner)
 	if r == nil || r.level != levelSealed {
 		return nil, nil
@@ -836,7 +834,7 @@ func (t *tx) preRaiseKeys(owner *nsRow, epochs []int, a *actor, kr KeysRequest, 
 // (perResource), or, for rules that fix no name, K_e if a reads the
 // namespace unrestricted; none when a gets no key. Without a grant
 // (authentication disabled), K_e.
-func (t *tx) preRaiseScope(a *actor, kr KeysRequest) (names []string, perResource, none bool) {
+func (t *gate) preRaiseScope(a *actor, kr KeysRequest) (names []string, perResource, none bool) {
 	if a == nil || a.verified == nil {
 		return nil, false, false
 	}
@@ -954,10 +952,7 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	if !below {
 		return &PruneResult{Horizon: h.id.String()}, nil
 	}
-	if h.id != requested {
-		return nil, apiErr(422, "invalid", "message", "the horizon moves down to a protected revision (§8.6); seal the snapshot for that one", "horizon", h.id.String())
-	}
-	if err := t.checkSnapshot(n, cfg, name, h, snapshot); err != nil {
+	if err := t.checkE2EPrune(n, cfg, name, h, requested, snapshot); err != nil {
 		return nil, err
 	}
 	// The snapshot needs no list (§8.6, §E.3.1): the server keeps the
@@ -1018,6 +1013,16 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	_, nsID := t.appendNS(n, map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, &own.id, &target, n.configSeq, author)
 	res.NSID = nsID.String()
 	return res, nil
+}
+
+// checkE2EPrune checks an e2e prune that prunes something (§8.6): h,
+// the horizon after protect, must be the requested one, since snapshot
+// is sealed for it.
+func (t *gate) checkE2EPrune(n *nsRow, cfg *Config, name string, h *revRow, requested ids.ID, snapshot string) *Error {
+	if h.id != requested {
+		return apiErr(422, "invalid", "message", "the horizon moves down to a protected revision (§8.6); seal the snapshot for that one", "horizon", h.id.String())
+	}
+	return t.checkSnapshot(n, cfg, name, h, snapshot)
 }
 
 // pruneBlobsE2E ends the attachments of res that neither kept, the

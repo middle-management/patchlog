@@ -28,7 +28,7 @@ type configPlan struct {
 }
 
 // planConfig runs steps 1–6 of a config write on an existing namespace.
-func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBatch bool) (*configPlan, error) {
+func (t *gate) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBatch bool) (*configPlan, error) {
 	// Step 1.
 	if err := t.authorize(a, "config", ""); err != nil {
 		return nil, err
@@ -76,21 +76,19 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 	// Step 2: idempotent retry, then the precondition. Config writes are
 	// allowed in frozen namespaces.
 	if !inBatch && p.expected != nil {
-		var seq int64
-		var nsSeq sql.NullInt64
-		if t.QueryRow(`SELECT seq FROM ns_config WHERE ns = ? AND id = ?`, n.id, p.expected[:]).Scan(&seq) == nil {
+		var nsSeq int64
+		if seq, _, ok := t.configByID(n, *p.expected); ok {
 			// The entry that wrote it: the first in force with it, a
 			// config entry or a batch with a config change (§7.4).
-			t.QueryRow(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, n.id, seq).Scan(&nsSeq)
+			nsSeq, _ = t.firstEntryOfConfig(n, seq)
 		}
 		// By the same principal: the same root sub and kid (§7.2).
-		if nsSeq.Valid && t.samePrincipal(nsSeq.Int64, a, t.actorID(a)) {
-			r := &WriteResult{Status: 200, Replayed: true, ConfigID: p.expected.String(), NSID: t.nsLogID(nsSeq.Int64).String()}
+		if nsSeq != 0 && t.samePrincipal(nsSeq, a, t.actorID(a)) {
+			r := &WriteResult{Status: 200, Replayed: true, ConfigID: p.expected.String(), NSID: t.nsLogID(nsSeq).String()}
 			// The retry carries what was recorded, gestures included
 			// (§7.2); only a config entry has them (§7.4).
-			var gjson sql.NullString
-			if t.QueryRow(`SELECT gestures FROM ns_log WHERE seq = ? AND kind = ?`, nsSeq.Int64, nsKindCode("config")).Scan(&gjson) == nil && gjson.Valid {
-				if g, ok := jsonv.Parse([]byte(gjson.String)); ok == nil {
+			if gjson, ok := t.configEntryGestures(nsSeq); ok {
+				if g, err := jsonv.Parse([]byte(gjson)); err == nil {
 					if m, ok := g.(map[string]any); ok {
 						r.Entry = &LogEntry{}
 						if s, ok := m["gesture"].(string); ok {
@@ -159,6 +157,33 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 		return nil, err
 	}
 	return p, nil
+}
+
+// configByID is n's configuration id: its seq and author (the config
+// retry lookup's read).
+func (t *tx) configByID(n *nsRow, id ids.ID) (seq, author int64, ok bool) {
+	err := t.QueryRow(`SELECT seq, author FROM ns_config WHERE ns = ? AND id = ?`, n.id, id[:]).Scan(&seq, &author)
+	return seq, author, err == nil
+}
+
+// firstEntryOfConfig is n's first entry with configuration seq in force:
+// the config entry, or the batch with a config change, that wrote it.
+func (t *tx) firstEntryOfConfig(n *nsRow, seq int64) (int64, bool) {
+	var s int64
+	if t.QueryRow(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, n.id, seq).Scan(&s) == nil && s != 0 {
+		return s, true
+	}
+	return 0, false
+}
+
+// configEntryGestures are config entry seq's gesture members as stored,
+// if it is a config entry and has them.
+func (t *tx) configEntryGestures(seq int64) (string, bool) {
+	var g sql.NullString
+	if t.QueryRow(`SELECT gestures FROM ns_log WHERE seq = ? AND kind = ?`, seq, nsKindCode("config")).Scan(&g) == nil && g.Valid {
+		return g.String, true
+	}
+	return "", false
 }
 
 func anyStrings(xs []string) []any {
@@ -331,7 +356,7 @@ func messagePointer(msg string) string {
 // branch fields and the level rules (Addendum E, Levels). Every refusal is
 // 422, invalid with errors pointing at the member, or a limit of newConfig,
 // so it comes before the *-key guard (§7.4, §C.2).
-func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any) (*Config, *Error) {
+func (t *gate) validateConfig(n *nsRow, cur *Config, newDoc any) (*Config, *Error) {
 	cfg, err := t.e.newConfig(newDoc, cur.Doc, nil)
 	if err != nil {
 		return nil, err
@@ -413,7 +438,7 @@ func keepsStarKeys(prev, cfg *Config, b *nsRow, bcfg *Config) *Error {
 // checkSuccessor is the successor rule of §7.4 for a config write to n:
 // only a write that sets or changes successor is checked (successorOK),
 // so a successor purged since it was named blocks no other write.
-func (t *tx) checkSuccessor(n *nsRow, cur, cfg *Config) *Error {
+func (t *gate) checkSuccessor(n *nsRow, cur, cfg *Config) *Error {
 	if cfg.Successor == "" || cfg.Successor == cur.Successor {
 		return nil
 	}
@@ -430,7 +455,7 @@ func (t *tx) checkSuccessor(n *nsRow, cur, cfg *Config) *Error {
 // branch of the same base or of a namespace further up its base chain,
 // whose at may differ, as after a rebase (§F.4, §F.5); for a namespace
 // that isn't a branch (bases nil), another namespace that isn't a branch.
-func (t *tx) successorOK(name string, self int64, bases map[string]bool) *Error {
+func (t *gate) successorOK(name string, self int64, bases map[string]bool) *Error {
 	s := t.nsByName(name)
 	switch {
 	case s == nil || s.isShadow():
@@ -475,7 +500,7 @@ func (t *tx) successorBases(n *nsRow) map[string]bool {
 // branchesPerNamespace live branches: unfreezing makes the branch live
 // again, which counts against its base's limit as creating one does
 // (§6.6, §8.4).
-func (t *tx) unfreezeLimit(n *nsRow, cur, cfg *Config) *Error {
+func (t *gate) unfreezeLimit(n *nsRow, cur, cfg *Config) *Error {
 	if !n.isBranch() || !cur.Frozen || cfg.Frozen {
 		return nil
 	}
@@ -491,7 +516,7 @@ func (t *tx) unfreezeLimit(n *nsRow, cur, cfg *Config) *Error {
 
 // configInUse is a config write's in_use refusals (409), at step 6 after
 // the *-key guard (§6.2, §6.1, §7.4).
-func (t *tx) configInUse(n *nsRow, cur, cfg *Config) *Error {
+func (t *gate) configInUse(n *nsRow, cur, cfg *Config) *Error {
 	if cfg.level >= levelSealed && cur.level < levelSealed {
 		// A remote branch becoming sealed seals its read-through content
 		// under its own keys (§E.2.5). Registered remote branches of n are
@@ -543,7 +568,7 @@ func withPointer(err *Error) *Error {
 	return docInvalid(messagePointer(msg), msg)
 }
 
-func (t *tx) publicDependents(n *nsRow) []string {
+func (t *gate) publicDependents(n *nsRow) []string {
 	var out []string
 	for _, b := range t.branchesOf(n) {
 		if !b.purged && t.config(b.configSeq).Read == "public" {
@@ -555,7 +580,7 @@ func (t *tx) publicDependents(n *nsRow) []string {
 
 // liveBranches counts n's direct branches that are live (§6.6): neither
 // frozen nor purged, leaving out except.
-func (t *tx) liveBranches(n, except *nsRow) int {
+func (t *gate) liveBranches(n, except *nsRow) int {
 	live := 0
 	for _, b := range t.branchesOf(n) {
 		if except != nil && b.id == except.id {
@@ -582,7 +607,7 @@ func (t *tx) branchesOf(n *nsRow) []*nsRow {
 }
 
 // allBranchesOf lists the direct branches of n that aren't purged.
-func (t *tx) allBranchesOf(n *nsRow) []*nsRow {
+func (t *gate) allBranchesOf(n *nsRow) []*nsRow {
 	var out []*nsRow
 	for _, b := range t.branchesOf(n) {
 		if !b.purged {
@@ -590,6 +615,25 @@ func (t *tx) allBranchesOf(n *nsRow) []*nsRow {
 		}
 	}
 	return out
+}
+
+// configGenesis is n's first configuration: its seq, author and id.
+func (t *tx) configGenesis(n *nsRow) (seq, author int64, id ids.ID, ok bool) {
+	var gid []byte
+	if err := t.QueryRow(`SELECT seq, author, id FROM ns_config WHERE ns = ? AND parent_seq IS NULL`, n.id).Scan(&seq, &author, &gid); err != nil {
+		return 0, 0, ids.ID{}, false
+	}
+	return seq, author, ids.FromBytes(gid), true
+}
+
+// branchEntry is base's entry that created the branch whose config
+// genesis is gseq.
+func (t *tx) branchEntry(base *nsRow, gseq int64) (int64, bool) {
+	var seq int64
+	if err := t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND kind = ? AND target_seq = ?`, base.id, nsKindCode("branch"), gseq).Scan(&seq); err != nil {
+		return 0, false
+	}
+	return seq, true
 }
 
 // insertConfig inserts a planned config revision and returns its seq.
@@ -634,6 +678,11 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 // judges reads that document outside the write lock (withRemoteSource,
 // §G.5.2).
 func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error) {
+	return e.be.writeConfig(ctx, req, cc)
+}
+
+// sqlWriteConfig is WriteConfig on SQL.
+func (e *Engine) sqlWriteConfig(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error) {
 	if cc.IfNoneMatch && remoteBaseIn(cc.Patches) {
 		return e.createRemoteBranch(ctx, req, cc)
 	}

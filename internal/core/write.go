@@ -343,15 +343,16 @@ func batchError(fails []itemErr) *Error {
 // WriteResource performs a single-resource write: create, append, restore
 // (PATCH) or delete.
 func (e *Engine) WriteResource(ctx context.Context, req Request, item Item) (*WriteResult, error) {
-	res, err := e.writeOptimistic(ctx, req, []Item{item}, nil, false)
-	if err != nil {
-		return nil, err
-	}
-	return res, nil
+	return e.be.writeItems(ctx, req, []Item{item}, nil, nil, false, false)
 }
 
 // Batch performs an atomic batch (§7.5).
 func (e *Engine) Batch(ctx context.Context, req Request, items []Item, cfg *ConfigChange, source any, dryRun bool) (*WriteResult, error) {
+	return e.be.writeItems(ctx, req, items, cfg, source, true, dryRun)
+}
+
+// sqlBatch is Batch on SQL.
+func (e *Engine) sqlBatch(ctx context.Context, req Request, items []Item, cfg *ConfigChange, source any, dryRun bool) (*WriteResult, error) {
 	if dryRun {
 		// A dry run writes nothing: steps 1–6 in a read transaction. A
 		// config change a remote branch's base judges reads the base's
@@ -387,7 +388,7 @@ func (e *Engine) Batch(ctx context.Context, req Request, items []Item, cfg *Conf
 
 // batchLimits are a principal's batch limits in a configuration: the
 // namespace's, or its allowance's (§6.6).
-func (t *tx) batchLimits(cfg *Config, a *actor) (items, size int) {
+func (t *gate) batchLimits(cfg *Config, a *actor) (items, size int) {
 	items, size = cfg.Limits.ItemsPerBatch, cfg.Limits.BatchSize
 	if al := t.allowanceOf(cfg, a); al != nil {
 		if al.ItemsPerBatch > 0 {
@@ -409,7 +410,7 @@ func (t *tx) batchLimits(cfg *Config, a *actor) (items, size int) {
 // rest, which reveals nothing about any item (§7.5). The batch itself
 // authenticates again.
 func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (bound, batchSize int, err error) {
-	err = e.read(ctx, func(t *tx) error {
+	err = e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(req.NS)
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
@@ -468,7 +469,7 @@ type writePlan struct {
 // checkItems runs steps 1–6 of §6.2 for a resource write or batch. It
 // returns a plan to insert, or a final result (an idempotent retry, a dry
 // run), or an error.
-func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun, rateDrawn bool) (*writePlan, *WriteResult, error) {
+func (t *gate) checkItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun, rateDrawn bool) (*writePlan, *WriteResult, error) {
 	// A config change locks the namespace exclusively; resource writes
 	// alone lock it shared (pglock.go).
 	t.reqCreds = req.anyCreds()
@@ -1095,7 +1096,7 @@ func candidateVerbs(it Item) []string {
 // an item with candidate verbs from the resource's state as the writer sees
 // it (a branch's view, read-through included), and refuses one that isn't
 // a candidate with 403, before the precondition is compared.
-func (t *tx) settle(n *nsRow, s *itemState) *Error {
+func (t *gate) settle(n *nsRow, s *itemState) *Error {
 	if s.cands == nil {
 		return nil
 	}
@@ -1114,7 +1115,7 @@ func (t *tx) settle(n *nsRow, s *itemState) *Error {
 
 // entryVerb is the verb an entry was written with: restore when its parent
 // is a tombstone, append otherwise (§6.2).
-func (t *tx) entryVerb(row *revRow) string {
+func (t *gate) entryVerb(row *revRow) string {
 	if row.parentSeq.Valid && t.rev(row.parentSeq.Int64).kind == kindTombstone {
 		return "restore"
 	}
@@ -1178,7 +1179,7 @@ func expectedIDs(s *itemState) ([]ids.ID, bool) {
 // resource whose source was raised to a level this server lacks
 // (upstreamRefusal, §1), and 410 for each item whose resource is purged,
 // as the writer sees it (§7.6), as every URL of it is (§8.3).
-func (t *tx) purgedItems(n *nsRow, st []*itemState) []itemErr {
+func (t *gate) purgedItems(n *nsRow, st []*itemState) []itemErr {
 	var fs []itemErr
 	for _, s := range st {
 		if err := t.upstreamRefusal(n, s.Resource); err != nil {
@@ -1194,7 +1195,9 @@ func (t *tx) purgedItems(n *nsRow, st []*itemState) []itemErr {
 // this request would have produced, written by the same principal, the
 // same author under the same root sub and kid (sameRoot). Callers answer a
 // purged resource first (purgedItems): the lookup doesn't apply to one.
-func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch bool) *WriteResult {
+// The rules are the gate's; finding the recorded revisions and entries is
+// the store's (revByID, entriesTo, batchEntry, firstEntryWithConfig).
+func (t *gate) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch bool) *WriteResult {
 	author := t.actorID(a)
 	if !isBatch {
 		if len(st) != 1 {
@@ -1205,25 +1208,19 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		if !ok {
 			return nil
 		}
-		own := t.resource(n.id, s.Resource)
-		if own == nil {
-			return nil
-		}
 		last := want[len(want)-1]
-		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, last[:]))
-		if err != nil || row.author != author || !t.sameRoot(row.grantID, a) {
+		row := t.revByID(n, s.Resource, last)
+		if row == nil || row.author != author || !t.sameRoot(row.grantID, a) {
 			return nil
 		}
 		if s.cands != nil && !contains(s.cands, t.entryVerb(row)) {
 			return nil // recorded with a verb this request may not use
 		}
-		var nsSeq int64
-		t.QueryRow(`SELECT ns_seq FROM head_history WHERE res = ? AND target_seq = ?`, own.id, row.seq).Scan(&nsSeq)
 		le := t.logEntry(row)
 		r := &WriteResult{Status: 200, Replayed: true, Entry: &le,
 			Items: []ItemResult{{Resource: s.Resource, IDs: []string{last.String()}}}}
-		if nsSeq != 0 {
-			r.NSID = t.nsLogID(nsSeq).String()
+		if seqs := t.entriesTo(row); len(seqs) > 0 && seqs[0] != 0 {
+			r.NSID = t.nsLogID(seqs[0]).String()
 		}
 		return r
 	}
@@ -1259,42 +1256,25 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 	// which made each batch slower as the log grew.
 	var cands []int64
 	if len(st) > 0 {
-		own := t.resource(n.id, st[0].Resource)
-		if own == nil {
-			return nil
-		}
 		target, err := ids.Parse(items[0].IDs[len(items[0].IDs)-1])
 		if err != nil {
 			return nil
 		}
-		var rseq int64
-		if t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND id = ?`, own.id, target[:]).Scan(&rseq) != nil {
+		row := t.revByID(n, st[0].Resource, target)
+		if row == nil {
 			return nil
 		}
-		rows, err := t.Query(`SELECT ns_seq FROM head_history WHERE res = ? AND target_seq = ?`, own.id, rseq)
-		t.must(err)
-		for rows.Next() {
-			var s int64
-			t.must(rows.Scan(&s))
-			cands = append(cands, s)
-		}
-		// Closed before querying again: a Postgres connection runs one
-		// query at a time.
-		rows.Close()
+		cands = t.entriesTo(row)
 	} else if cp != nil {
-		var cseq, s int64
-		if t.QueryRow(`SELECT seq FROM ns_config WHERE ns = ? AND id = ?`, n.id, cp.expected[:]).Scan(&cseq) != nil {
-			return nil
-		}
-		if t.QueryRow(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, n.id, cseq).Scan(&s) == nil && s != 0 {
-			cands = append(cands, s)
+		if seq, ok := t.firstEntryWithConfig(n, *cp.expected); ok {
+			cands = append(cands, seq)
 		}
 	}
-	var match []byte
+	var match ids.ID
+	found := false
 	for _, seq := range cands {
-		var id, gid []byte
-		var body string
-		if t.QueryRow(`SELECT id, body, grant_id FROM ns_log WHERE seq = ? AND ns = ? AND kind = ? AND author = ?`, seq, n.id, nsKindCode("batch"), author).Scan(&id, &body, &gid) != nil {
+		id, body, gid, ok := t.batchEntry(n, seq, author)
+		if !ok {
 			continue
 		}
 		if !t.sameRoot(gid, a) {
@@ -1302,14 +1282,14 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		}
 		b := jsonv.MustParse([]byte(body)).(map[string]any)
 		if string(jsonv.Canonical(b["entries"])) == want {
-			match = id
+			match, found = id, true
 			break
 		}
 	}
-	if match == nil || !t.candidateVerbsMatch(n, st) {
+	if !found || !t.candidateVerbsMatch(n, st) {
 		return nil
 	}
-	r := &WriteResult{Status: 200, Replayed: true, NSID: ids.FromBytes(match).String(), Items: items}
+	r := &WriteResult{Status: 200, Replayed: true, NSID: match.String(), Items: items}
 	if cp != nil {
 		r.ConfigID = cp.expected.String()
 	}
@@ -1322,7 +1302,7 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 // while authentication was disabled or before grants were recorded
 // (v0.37), and any entry for a request made while it is disabled, match on
 // the author alone. samePrincipal is this for a namespace entry.
-func (t *tx) sameRoot(gid []byte, a *actor) bool {
+func (t *gate) sameRoot(gid []byte, a *actor) bool {
 	if a.grant == nil || gid == nil {
 		return true
 	}
@@ -1335,29 +1315,79 @@ func (t *tx) sameRoot(gid []byte, a *actor) bool {
 
 // candidateVerbsMatch reports whether every item with candidate verbs
 // recorded its first entry with one of them (§7.5 idempotent retry).
-func (t *tx) candidateVerbsMatch(n *nsRow, st []*itemState) bool {
+func (t *gate) candidateVerbsMatch(n *nsRow, st []*itemState) bool {
 	for _, s := range st {
 		if s.cands == nil {
 			continue
 		}
 		want, ok := expectedIDs(s)
-		own := t.resource(n.id, s.Resource)
-		if !ok || own == nil {
+		if !ok {
 			return false
 		}
-		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, want[0][:]))
-		if err != nil || !contains(s.cands, t.entryVerb(row)) {
+		row := t.revByID(n, s.Resource, want[0])
+		if row == nil || !contains(s.cands, t.entryVerb(row)) {
 			return false
 		}
 	}
 	return true
 }
 
+// revByID is resource name's revision id, nil when the resource or the
+// revision isn't there (the retry lookup's read).
+func (t *tx) revByID(n *nsRow, name string, id ids.ID) *revRow {
+	own := t.resource(n.id, name)
+	if own == nil {
+		return nil
+	}
+	row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, id[:]))
+	if err != nil {
+		return nil
+	}
+	return row
+}
+
+// entriesTo are the namespace entries that moved row's resource to row
+// (head_history).
+func (t *tx) entriesTo(row *revRow) []int64 {
+	rows, err := t.Query(`SELECT ns_seq FROM head_history WHERE res = ? AND target_seq = ?`, row.res, row.seq)
+	t.must(err)
+	var out []int64
+	for rows.Next() {
+		var s int64
+		t.must(rows.Scan(&s))
+		out = append(out, s)
+	}
+	// Closed before querying again: a Postgres connection runs one query
+	// at a time.
+	rows.Close()
+	return out
+}
+
+// batchEntry is n's entry seq if it is a batch by author: its id, body
+// and the grant it was written under (nil for none).
+func (t *tx) batchEntry(n *nsRow, seq, author int64) (ids.ID, string, []byte, bool) {
+	var id, gid []byte
+	var body string
+	if t.QueryRow(`SELECT id, body, grant_id FROM ns_log WHERE seq = ? AND ns = ? AND kind = ? AND author = ?`, seq, n.id, nsKindCode("batch"), author).Scan(&id, &body, &gid) != nil {
+		return ids.ID{}, "", nil, false
+	}
+	return ids.FromBytes(id), body, gid, true
+}
+
+// firstEntryWithConfig is n's first entry with configuration id in force.
+func (t *gate) firstEntryWithConfig(n *nsRow, id ids.ID) (int64, bool) {
+	cseq, _, ok := t.configByID(n, id)
+	if !ok {
+		return 0, false
+	}
+	return t.firstEntryOfConfig(n, cseq)
+}
+
 // precondition is step 2.5 for one item (§6.2, §7.2, §7.6 first writes).
 // What the request alone decides comes first: a "delete" step right after
 // another (§7.5), then a "delete" under If-None-Match (428), then the
 // comparison with the resource's state.
-func (t *tx) precondition(n *nsRow, s *itemState) *Error {
+func (t *gate) precondition(n *nsRow, s *itemState) *Error {
 	for j := 1; j < len(s.Steps); j++ {
 		if s.Steps[j].Delete && s.Steps[j-1].Delete {
 			return doubleDelete()
@@ -1434,7 +1464,7 @@ func doubleDelete() *Error {
 // (patch.Options ShareLast): a create's whole-document add copies nothing.
 // Each later step applies to a copy of the document before it; the first
 // applies in place to the parent's, which is parsed for this item alone.
-func (t *tx) applySteps(s *itemState) *Error {
+func (t *gate) applySteps(s *itemState) *Error {
 	var doc any   // a create's: the document null (§6.2 step 3)
 	owned := true // doc is no step's yet: nil, or the parent's parsed here
 	var parentID *ids.ID
@@ -1636,7 +1666,7 @@ func rulesRead(cfg *Config, a *actor, verb, m string) bool {
 // stepEnvelope builds the change envelope of §6.4.1 for one step. Its
 // patches are a copy of the step's, parsed again only if a rule reads them
 // (withPatches); otherwise the member is absent, which no rule sees.
-func (t *tx) stepEnvelope(s *itemState, step *stepState, a *actor, withPatches bool) map[string]any {
+func (t *gate) stepEnvelope(s *itemState, step *stepState, a *actor, withPatches bool) map[string]any {
 	env := t.basicEnvelope(step.action, s.Resource, a)
 	w := make([]any, len(step.writes))
 	for i, x := range step.writes {

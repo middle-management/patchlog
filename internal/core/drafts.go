@@ -1,7 +1,6 @@
 package core
 
 import (
-	"database/sql"
 	"fmt"
 	"regexp"
 	"sort"
@@ -106,7 +105,7 @@ func (t *tx) nsRowUnlocked(id int64) *nsRow {
 // draftRoot is the namespace whose schema paths n's own revisions may serve
 // as drafts: the root of n's chain of local bases. "" if n isn't a local
 // branch (no base, or a remote base's shadow in its chain).
-func (t *tx) draftRoot(n *nsRow) string {
+func (t *gate) draftRoot(n *nsRow) string {
 	if !n.isBranch() || n.isShadow() {
 		return ""
 	}
@@ -121,7 +120,7 @@ func (t *tx) draftRoot(n *nsRow) string {
 }
 
 // cfgOf is n's namespace document, or the one a pending change writes.
-func (t *tx) cfgOf(n *nsRow, over map[int64]*Config) *Config {
+func (t *gate) cfgOf(n *nsRow, over map[int64]*Config) *Config {
 	if c, ok := over[n.id]; ok {
 		return c
 	}
@@ -130,14 +129,14 @@ func (t *tx) cfgOf(n *nsRow, over map[int64]*Config) *Config {
 
 // isDraftCandidate reports whether c may hold drafts for schema paths of
 // namespace root: a local branch of it, not purged, not e2e.
-func (t *tx) isDraftCandidate(c *nsRow, root string, over map[int64]*Config) bool {
+func (t *gate) isDraftCandidate(c *nsRow, root string, over map[int64]*Config) bool {
 	return c.isBranch() && !c.purged && !c.isShadow() && t.cfgOf(c, over).level != levelE2E && t.draftRoot(c) == root
 }
 
 // draftsServe reports whether candidate c, under its namespace document
 // ccfg, serves writes to w: w is c or one of its branches, or w or one of
 // its bases is listed in ccfg's drafts.for (§6.1).
-func (t *tx) draftsServe(c *nsRow, ccfg *Config, w *nsRow) bool {
+func (t *gate) draftsServe(c *nsRow, ccfg *Config, w *nsRow) bool {
 	for x := w; ; {
 		if x.id == c.id || DraftsMatch(ccfg.DraftsFor, x.name) {
 			return true
@@ -157,7 +156,7 @@ func (t *tx) draftsServe(c *nsRow, ccfg *Config, w *nsRow) bool {
 // or a local branch of such a namespace, branches of branches included.
 // schemaReads.for is never matched against a branch: a branch qualifies
 // only through the namespace at the root of its chain of local bases.
-func (t *tx) schemaReadsServe(n *nsRow, w *nsRow) bool {
+func (t *gate) schemaReadsServe(n *nsRow, w *nsRow) bool {
 	cfg := t.config(n.configSeq)
 	if cfg.SchemaReadsFor == nil || cfg.level >= levelSealed || n.isBranch() {
 		return false
@@ -197,7 +196,7 @@ func (t *tx) copyRows(id ids.ID, name string) []copyRow {
 
 // credsRead reports whether any of creds may read resource name of n
 // (§C.2): a grant that names n and verifies under its keys.
-func (t *tx) credsRead(n *nsRow, name string, creds []Credentials) bool {
+func (t *gate) credsRead(n *nsRow, name string, creds []Credentials) bool {
 	if t.e.opt.AuthDisabled || t.config(n.configSeq).Read == "public" {
 		return true
 	}
@@ -215,7 +214,7 @@ func (t *tx) credsRead(n *nsRow, name string, creds []Credentials) bool {
 // credsReadAny reports whether any of creds may read anything in m: some
 // resource of it (the rule for other namespaces, §7.5), for the
 // referencing namespaces an in_use answer lists (§6.1).
-func (t *tx) credsReadAny(m *nsRow, creds []Credentials) bool {
+func (t *gate) credsReadAny(m *nsRow, creds []Credentials) bool {
 	if t.e.opt.AuthDisabled || t.config(m.configSeq).Read == "public" {
 		return true
 	}
@@ -254,7 +253,7 @@ func (t *tx) credsReadAny(m *nsRow, creds []Credentials) bool {
 
 // resourceNames lists up to limit resource names of m and the bases it
 // reads through.
-func (t *tx) resourceNames(m *nsRow, limit int) []string {
+func (t *gate) resourceNames(m *nsRow, limit int) []string {
 	var out []string
 	for _, h := range t.listHeads(m, nil) {
 		if h.state != Purged {
@@ -315,7 +314,7 @@ func (sc *schemaCtx) copiesIn(t *tx) []int64 {
 // write's target (§6.1), and returns it with the row it was read from.
 // Each namespace holding a copy is locked shared and read as of its lock
 // (D.8). A revision the writer can't read there counts as not found.
-func (t *tx) loadDraft(ref schema.Ref, sc *schemaCtx) (any, int64, bool) {
+func (t *gate) loadDraft(ref schema.Ref, sc *schemaCtx) (any, int64, bool) {
 	if sc == nil || sc.target == nil || !sc.target.isBranch() {
 		return nil, 0, false
 	}
@@ -351,7 +350,7 @@ func (t *tx) loadDraft(ref schema.Ref, sc *schemaCtx) (any, int64, bool) {
 // a write's steps write in namespace n may be referenced by later items of
 // the same write (§7.5): n itself, or in a local branch its root, as
 // drafts serving the branch itself (§6.1). "" if none.
-func (t *tx) pendingNS(n *nsRow) string {
+func (t *gate) pendingNS(n *nsRow) string {
 	if !n.isBranch() {
 		return n.name
 	}
@@ -382,7 +381,7 @@ type schemaCopy struct {
 // reference to ref from namespace m: in ref's namespace itself, or, for a
 // branch, in a candidate serving it. over replaces namespace documents a
 // pending config write changes. Structural: nobody's grants are consulted.
-func (t *tx) satisfyingCopies(ref schema.Ref, m *nsRow, over map[int64]*Config, rows []copyRow) []schemaCopy {
+func (t *gate) satisfyingCopies(ref schema.Ref, m *nsRow, over map[int64]*Config, rows []copyRow) []schemaCopy {
 	var out []schemaCopy
 	for _, cr := range rows {
 		if cr.state == statePurged {
@@ -415,22 +414,13 @@ func (t *tx) satisfyingCopies(ref schema.Ref, m *nsRow, over map[int64]*Config, 
 // branch also of every revision it wrote, and the $ref closure of those,
 // resolved as the referencing namespace would. exclude skips referencing
 // resources.
-func (t *tx) schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map[int64]*nsRow {
+func (t *gate) schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map[int64]*nsRow {
 	// Nothing read here is locked (on Postgres, pglock.go): a write that
 	// makes a schema referenced holds the lock of the namespace it resolved
 	// it in shared, and purges hold that lock exclusively, or take it
 	// shared before relying on a copy (brokenReferences).
-	t.noLock++
-	defer func() { t.noLock-- }()
-	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
-	t.must(err)
-	var all []*nsRow
-	for rows.Next() {
-		n, err := scanNS(rows)
-		t.must(err)
-		all = append(all, n)
-	}
-	rows.Close()
+	defer t.noLocks()()
+	all := t.allNamespaces()
 	uses := map[string]map[int64]*nsRow{}
 	copies := map[string][]copyRow{}
 	docs := map[string]any{}
@@ -449,29 +439,14 @@ func (t *tx) schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map
 			if h.state == Purged || h.row == nil || exclude(n, h.name) {
 				continue
 			}
-			var ref sql.NullString
-			ll := t.lastLive(h.row)
-			t.must(t.QueryRow(`SELECT schema_ref FROM revisions WHERE seq = ?`, ll.seq).Scan(&ref))
-			if ref.Valid {
-				add(ref.String)
+			if ref, ok := t.schemaRefOf(t.lastLive(h.row).seq); ok {
+				add(ref)
 			}
 		}
 		if n.isBranch() {
 			// Every revision a branch wrote: a merge replays and validates
 			// every step (§7.5).
-			rr, err := t.Query(`SELECT DISTINCT s.name, r.schema_ref FROM revisions r JOIN resources s ON s.res = r.res
-				WHERE s.ns = ? AND s.state <> ? AND r.schema_ref IS NOT NULL`, n.id, statePurged)
-			t.must(err)
-			type use struct{ name, ref string }
-			var us []use
-			for rr.Next() {
-				var u use
-				t.must(rr.Scan(&u.name, &u.ref))
-				us = append(us, u)
-			}
-			t.must(rr.Err())
-			rr.Close()
-			for _, u := range us {
+			for _, u := range t.schemaPinsIn(n) {
 				if !exclude(n, u.name) {
 					add(u.ref)
 				}
@@ -512,7 +487,7 @@ func (t *tx) schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map
 }
 
 // referencedPaths is the set of referenced schema revision paths (§6.1).
-func (t *tx) referencedPaths() map[string]bool {
+func (t *gate) referencedPaths() map[string]bool {
 	out := map[string]bool{}
 	for p := range t.schemaUses(func(*nsRow, string) bool { return false }) {
 		out[p] = true
@@ -536,7 +511,7 @@ type refChange struct {
 // namespace holding a copy of a revision the change touches is locked
 // shared before its copy is relied on (D.8), so two purges can't each
 // remove one of the last two copies.
-func (t *tx) brokenReferences(ch refChange) []*nsRow {
+func (t *gate) brokenReferences(ch refChange) []*nsRow {
 	none := func(*nsRow, string) bool { return false }
 	if ch.exclude == nil {
 		ch.exclude = none
@@ -606,7 +581,7 @@ func (t *tx) brokenReferences(ch refChange) []*nsRow {
 // without a copy: it lists, as referencing, the referencing namespaces in
 // which the caller may read anything, by the rule for other namespaces
 // (§7.5): with the request's grant or any in Source-Authorization.
-func (t *tx) inUse(broken []*nsRow, msg string) *Error {
+func (t *gate) inUse(broken []*nsRow, msg string) *Error {
 	names := []string{}
 	for _, m := range broken {
 		if t.credsReadAny(m, t.reqCreds) {
@@ -614,4 +589,39 @@ func (t *tx) inUse(broken []*nsRow, msg string) *Error {
 		}
 	}
 	return apiErr(409, "in_use", "message", msg, "referencing", anyStrings(names))
+}
+
+// allNamespaces lists the unpurged namespaces, but the shadows (~).
+func (t *tx) allNamespaces() []*nsRow {
+	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
+	t.must(err)
+	defer rows.Close()
+	var all []*nsRow
+	for rows.Next() {
+		n, err := scanNS(rows)
+		t.must(err)
+		all = append(all, n)
+	}
+	t.must(rows.Err())
+	return all
+}
+
+// schemaUse is a resource a revision of which was typed by ref.
+type schemaUse struct{ name, ref string }
+
+// schemaPinsIn lists the (resource, schema) pairs of n's unpurged
+// resources' revisions typed by a schema, each once.
+func (t *tx) schemaPinsIn(n *nsRow) []schemaUse {
+	rr, err := t.Query(`SELECT DISTINCT s.name, r.schema_ref FROM revisions r JOIN resources s ON s.res = r.res
+		WHERE s.ns = ? AND s.state <> ? AND r.schema_ref IS NOT NULL`, n.id, statePurged)
+	t.must(err)
+	defer rr.Close()
+	var us []schemaUse
+	for rr.Next() {
+		var u schemaUse
+		t.must(rr.Scan(&u.name, &u.ref))
+		us = append(us, u)
+	}
+	t.must(rr.Err())
+	return us
 }

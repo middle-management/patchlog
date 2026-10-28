@@ -60,7 +60,9 @@ func TestV055LimitConfigFields(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("c", map[string]any{})
-	max := core.DefaultMaximums()
+	// The deployment's maximums, whichever backend: DynamoDB's lowers
+	// itemsPerBatch to what one transaction holds.
+	max := e.e.Limits()
 	put := func(v any) *resp { return e.patchNS("c", ops(op("add", "/limits", v)), "") }
 	expectLimit(t, put(map[string]any{"opsPerSet": 5000}), 422, "opsPerSet", 5000, int64(max.OpsPerSet))
 	expectLimit(t, put(map[string]any{"ratePerNamespace": map[string]any{"rate": 1e9, "burst": 1}}), 422, "ratePerNamespace", -1, -1)

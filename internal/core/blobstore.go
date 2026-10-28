@@ -296,11 +296,7 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 	// The candidates, listed before the rows are read: a file older than
 	// the grace whose row isn't visible yet would need a transaction that
 	// old.
-	type group struct {
-		table string // blob_bytes or blob_epochs
-		key   int64  // owner or ns
-	}
-	cands := map[group][]string{}
+	cands := map[fileGroup][]string{}
 	var temps []string
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -326,7 +322,7 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 			return nil
 		}
 		parts := strings.Split(rel, "/")
-		var g group
+		var g fileGroup
 		switch {
 		case len(parts) == 3:
 			g.table = "blob_bytes"
@@ -345,8 +341,36 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	orphans, err := e.be.orphanFiles(ctx, cands)
+	if err != nil {
+		return 0, err
+	}
+	orphans = append(orphans, temps...)
+	n := 0
+	if err := e.jobStep(ctx); err != nil {
+		return 0, err
+	}
+	for _, f := range orphans {
+		if err := e.blobs.remove(f); err != nil {
+			log.Printf("blob sweep: %v", err)
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
+// fileGroup is a blob file's place in the store's layout: the table whose
+// rows name it and their owner or namespace (bytesFile, epochFile).
+type fileGroup struct {
+	table string // blob_bytes or blob_epochs
+	key   int64  // owner or ns
+}
+
+// sqlOrphanFiles are the candidates no row names (SweepBlobFiles, on SQL).
+func (e *Engine) sqlOrphanFiles(ctx context.Context, cands map[fileGroup][]string) ([]string, error) {
 	var orphans []string
-	err = e.read(ctx, func(t *tx) error {
+	err := e.read(ctx, func(t *tx) error {
 		for g, files := range cands {
 			col := "owner"
 			if g.table == "blob_epochs" {
@@ -369,20 +393,5 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 		}
 		return nil
 	})
-	if err != nil {
-		return 0, err
-	}
-	orphans = append(orphans, temps...)
-	n := 0
-	if err := e.jobStep(ctx); err != nil {
-		return 0, err
-	}
-	for _, f := range orphans {
-		if err := e.blobs.remove(f); err != nil {
-			log.Printf("blob sweep: %v", err)
-			continue
-		}
-		n++
-	}
-	return n, nil
+	return orphans, err
 }

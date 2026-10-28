@@ -401,7 +401,7 @@ func (t *tx) ancestry(head *revRow) []segment {
 }
 
 // findInAncestry returns the row with id in the ancestry of head, or nil.
-func (t *tx) findInAncestry(head *revRow, id ids.ID) *revRow {
+func (t *gate) findInAncestry(head *revRow, id ids.ID) *revRow {
 	if head.id == id {
 		return head
 	}
@@ -436,7 +436,7 @@ func (purgedError) Error() string { return "purged" }
 // docAt returns the document at a revision row (for a tombstone: the last
 // live document). exists is false when the chain has no document (a
 // tombstone right after nothing, which cannot happen, or a failed fold).
-func (t *tx) docAt(r *revRow) (any, error) {
+func (t *gate) docAt(r *revRow) (any, error) {
 	b, err := t.docBytesAt(r)
 	if err != nil {
 		return nil, err
@@ -644,7 +644,7 @@ func (e LogEntry) value() map[string]any {
 	return m
 }
 
-func (t *tx) logEntry(r *revRow) LogEntry {
+func (t *gate) logEntry(r *revRow) LogEntry {
 	e := LogEntry{ID: r.id.String(), Author: t.authorName(r.author), Created: formatTime(r.created), row: r}
 	if r.parentSeq.Valid {
 		e.Parent = t.revID(r.parentSeq.Int64).String()
@@ -701,7 +701,7 @@ func parseVia(col sql.NullString) []string {
 // oldest first and only as far as the page goes, and the pruning check
 // looks only below horizons (prunedIn). Walking the parent links from to
 // instead read the whole rest of the range for every page.
-func (t *tx) logBetween(to *revRow, since *ids.ID, limit, maxBytes int, served func(LogEntry) int) (entries []LogEntry, more bool, err error) {
+func (t *gate) logBetween(to *revRow, since *ids.ID, limit, maxBytes int, served func(LogEntry) int) (entries []LogEntry, more bool, err error) {
 	segs := t.ancestry(to)
 	// The range is (lo, max] of the oldest segment it reaches, segs[k],
 	// and the whole of the newer ones. Ids and parent links survive
@@ -741,22 +741,15 @@ func (t *tx) logBetween(to *revRow, since *ids.ID, limit, maxBytes int, served f
 		if i == k {
 			from = lo
 		}
-		q := `SELECT ` + revCols + ` FROM revisions WHERE res = ? AND seq > ? AND seq <= ? ORDER BY seq`
-		args := []any{segs[i].res, from, segs[i].max}
+		n := 0
 		if limit > 0 {
-			q += ` LIMIT ?`
-			args = append(args, limit-len(rows))
+			n = limit - len(rows)
 		}
-		rs, err := t.Query(q, args...)
-		t.must(err)
-		for !full() && rs.Next() {
-			r, err := scanRev(rs)
-			t.must(err)
+		t.revsBetween(segs[i].res, from, segs[i].max, n, func(r *revRow) bool {
 			rows = append(rows, r)
 			scanned += servedAtLeast(r)
-		}
-		t.must(rs.Err())
-		rs.Close()
+			return !full()
+		})
 	}
 	// Each entry's parent is the row before it (a segment's first row's,
 	// the last of the older segment), so its id is known. The schema keeps
@@ -861,9 +854,32 @@ var errNotAncestor = errors.New("not an ancestor")
 
 // lastLive returns the last live revision at or before r (r itself if it is
 // a revision, else the tombstone's parent).
-func (t *tx) lastLive(r *revRow) *revRow {
+func (t *gate) lastLive(r *revRow) *revRow {
 	for r.kind == kindTombstone && r.parentSeq.Valid {
 		r = t.rev(r.parentSeq.Int64)
 	}
 	return r
+}
+
+// revsBetween visits res's revisions after seq from (0: from the first)
+// up to and including seq max, oldest first, at most limit of them (0:
+// all), while visit returns true.
+func (t *tx) revsBetween(res, from, max int64, limit int, visit func(*revRow) bool) {
+	q := `SELECT ` + revCols + ` FROM revisions WHERE res = ? AND seq > ? AND seq <= ? ORDER BY seq`
+	args := []any{res, from, max}
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rs, err := t.Query(q, args...)
+	t.must(err)
+	defer rs.Close()
+	for rs.Next() {
+		r, err := scanRev(rs)
+		t.must(err)
+		if !visit(r) {
+			return
+		}
+	}
+	t.must(rs.Err())
 }

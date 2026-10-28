@@ -40,13 +40,13 @@ func nfNS(public bool) *Error {
 // "purged", with head, the ns_id of its purge-ns entry, the log's last.
 // /ns/{ns} and its log stay readable, except in a sealed namespace
 // (sealedPurged).
-func (t *tx) purgedNS(n *nsRow) *Error {
+func (t *gate) purgedNS(n *nsRow) *Error {
 	return apiErr(410, "purged", "head", t.nsLogID(n.headSeq.Int64).String())
 }
 
 // purgedRead is purgedNS for a cacheable read, which §9 answers with the
 // long class, as any purge; Public is as for nfNS.
-func (t *tx) purgedRead(n *nsRow) *Error {
+func (t *gate) purgedRead(n *nsRow) *Error {
 	e := t.purgedNS(n)
 	public := t.cachePublic(n)
 	e.Public = &public
@@ -59,13 +59,13 @@ func (t *tx) purgedRead(n *nsRow) *Error {
 // rather than in the clear, which would show authors and timing to anyone
 // the keys kept out (§8.5). /ns/{ns} still redirects, to a revision that
 // is 410, and the 410's head tells a consumer of the purge.
-func (t *tx) sealedPurged(n *nsRow) bool { return n.purged && t.isSealedNS(n) }
+func (t *gate) sealedPurged(n *nsRow) bool { return n.purged && t.isSealedNS(n) }
 
 // listHeads lists every resource of n as of asOf (nil = now), including
 // read-through ones, sorted by name in ascending byte order (§7.4), by Go's
 // string order and never by the database's collation, which on Postgres may
 // order punctuation otherwise.
-func (t *tx) listHeads(n *nsRow, asOf *int64) []headItem {
+func (t *gate) listHeads(n *nsRow, asOf *int64) []headItem {
 	var out []headItem
 	for after := ""; ; {
 		page, next := t.pageHeads(n, asOf, after, 1000)
@@ -114,7 +114,7 @@ func (t *tx) namesAfter(n *nsRow, after string, k int) []string {
 // needs, so a page costs its own size, not the namespace's: names are
 // fetched in chunks, skipping those with no head at asOf, until the page
 // is full and one more resource is known to exist.
-func (t *tx) pageHeads(n *nsRow, asOf *int64, after string, limit int) (out []headItem, next string) {
+func (t *gate) pageHeads(n *nsRow, asOf *int64, after string, limit int) (out []headItem, next string) {
 	chunk := limit + 1
 	for {
 		names := t.namesAfter(n, after, chunk)
@@ -159,7 +159,7 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 	g := e.rc.load(ns)
 	var h *Head
 	public, cached := false, false
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -204,7 +204,7 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 // if it has none, another form, or the document can't be read. The row
 // may be a base's (read-through) or a remote base's mirror: its document
 // is read here either way. Whoever wrote the document wrote it (§8.1).
-func (t *tx) successorAt(row *revRow) string {
+func (t *gate) successorAt(row *revRow) string {
 	if row == nil || row.kind != kindRev {
 		return ""
 	}
@@ -277,8 +277,8 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 	public, cached, plain, preRaised := false, false, false, false
 	var out *Rev
 	var job *sealJob
-	var nsRowID int64
-	err := e.read(ctx, func(t *tx) error {
+	var nsRowName string
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -366,9 +366,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		if e2e {
 			if !row.patches.Valid {
-				var state int
-				t.must(t.QueryRow(`SELECT state FROM resources WHERE res = ?`, row.res).Scan(&state))
-				if state == statePurged {
+				if t.resState(row.res) == statePurged {
 					out.Status = 410
 					return nil
 				}
@@ -410,17 +408,17 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		switch {
 		case t.isSealedNS(n):
-			nsRowID = n.id
+			nsRowName = n.name
 			job = t.resJob(n, name, row, sealDoc, func() []byte { return b })
 		case pre != nil && pre.sealed():
 			// Stored under the raised namespace, as it serves it.
-			nsRowID = pre.m.id
+			nsRowName = pre.m.name
 			job = t.preRaiseResJob(pre, name, row, sealDoc, func() []byte { return b })
 		}
 		return nil
 	})
 	if err == nil && job != nil {
-		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
+		if err = e.finishSeal(ctx, nsRowName, []*sealJob{job}); err == nil {
 			out.Doc, out.JWE, out.Digest = nil, job.jwe, nil
 		}
 	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot && !preRaised {
@@ -483,8 +481,8 @@ type Log struct {
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
-	var nsRowID int64
-	err := e.read(ctx, func(t *tx) error {
+	var nsRowName string
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -597,15 +595,15 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		}
 		if sealed {
 			jobs = jobs[:len(entries)]
-			out.Sealed, nsRowID = true, n.id
+			out.Sealed, nsRowName = true, n.name
 			if pre != nil {
-				nsRowID = pre.m.id
+				nsRowName = pre.m.name
 			}
 		}
 		return nil
 	})
 	if err == nil && out != nil && out.Sealed {
-		if err = e.finishSeal(ctx, nsRowID, jobs); err == nil {
+		if err = e.finishSeal(ctx, nsRowName, jobs); err == nil {
 			out.EntryJWEs = make([]string, len(jobs))
 			for i, j := range jobs {
 				out.EntryJWEs[i] = j.jwe
@@ -628,7 +626,7 @@ type NSInfo struct {
 // NamespaceHead returns the namespace head and config ids.
 func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials) (*NSInfo, error) {
 	var out *NSInfo
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -652,8 +650,8 @@ func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials)
 func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credentials) (*NSInfo, error) {
 	var out *NSInfo
 	var job *sealJob
-	var nsRowID int64
-	err := e.read(ctx, func(t *tx) error {
+	var nsRowName string
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -673,14 +671,12 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 		if !ok {
 			return nfNS(t.cachePublic(n))
 		}
-		var cseq int64
-		var doc string
-		t.must(t.QueryRow(`SELECT l.config_seq, c.doc FROM ns_log l JOIN ns_config c ON c.seq = l.config_seq WHERE l.seq = ?`, seq).Scan(&cseq, &doc))
+		cseq, doc := t.entryConfig(seq)
 		out = &NSInfo{Head: nsID, Config: t.configID(cseq).String(), Doc: []byte(doc),
 			Public: t.cachePublic(n)}
 		switch raise := t.nsPreRaise(n, seq); {
 		case t.isSealedNS(n):
-			nsRowID = n.id
+			nsRowName = n.name
 			job = t.configJob(n, seq, nsID, []byte(doc))
 		case raise != nil && raise.level == levelSealed:
 			// From before a raise from sealed: sealed as before (Addendum
@@ -688,13 +684,13 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 			if n.purged {
 				return t.purgedRead(n)
 			}
-			nsRowID = n.id
+			nsRowName = n.name
 			job = t.preRaiseConfigJob(n, raise, seq, nsID, []byte(doc))
 		}
 		return nil
 	})
 	if err == nil && job != nil {
-		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
+		if err = e.finishSeal(ctx, nsRowName, []*sealJob{job}); err == nil {
 			out.Doc, out.JWE = nil, job.jwe
 		}
 	}
@@ -734,8 +730,8 @@ func (e *Engine) ResourceEvents(ctx context.Context, ns, name, since string, lim
 func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials, perEntry bool, resource string, live *liveRead) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
-	var nsRowID int64
-	err := e.read(ctx, func(t *tx) error {
+	var nsRowName string
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		var a *actor
 		var aerr *Error
@@ -792,12 +788,6 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			fromSeq = s
 		}
-		q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures, via FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
-		args := []any{n.id, fromSeq, toSeq}
-		if limit > 0 {
-			q += ` LIMIT ?`
-			args = append(args, limit)
-		}
 		// No page spans an e2e raise (§7.1 Paging, Addendum E Levels): a
 		// page that starts before the raising entry ends before it.
 		var raise *e2eRaise
@@ -806,20 +796,9 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 				raise = r
 			}
 		}
-		rows, err := t.Query(q, args...)
-		t.must(err)
 		type raw struct {
-			seq     int64
-			id      []byte
-			prev    *int64
-			body    string
-			author  int64
-			created int64
-			grantID []byte
-			noAuth  sql.NullInt64
-			meta    sql.NullString
-			via     sql.NullString
-			m       map[string]any // body, parsed
+			nsLogRow
+			m map[string]any // body, parsed
 		}
 		// A page holds at most limit entries, and at most limit resource
 		// entries, a batch entry counting as its items (it carries them):
@@ -828,24 +807,22 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		// 1,000 items each held a million.
 		var rs []raw
 		units := 0
-		for rows.Next() {
-			var r raw
-			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta, &r.via))
-			if raise != nil && len(rs) > 0 && rs[0].seq < raise.seq && r.seq >= raise.seq {
-				break
+		t.nsLogRows(n, fromSeq, toSeq, limit, func(lr nsLogRow) bool {
+			if raise != nil && len(rs) > 0 && rs[0].seq < raise.seq && lr.seq >= raise.seq {
+				return false
 			}
-			r.m = jsonv.MustParse([]byte(r.body)).(map[string]any)
+			r := raw{nsLogRow: lr, m: jsonv.MustParse([]byte(lr.body)).(map[string]any)}
 			u := 1
 			if es, ok := r.m["entries"].([]any); ok && len(es) > 1 {
 				u = len(es)
 			}
 			if limit > 0 && len(rs) > 0 && units+u > limit {
-				break
+				return false
 			}
 			units += u
 			rs = append(rs, r)
-		}
-		rows.Close()
+			return true
+		})
 		// A page from before a raise from sealed is sealed as before,
 		// under the last epoch and pad setting before the raise; a purge,
 		// destroying the epoch keys, ends it, as in a sealed namespace.
@@ -925,7 +902,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			return t.rangeJob(n, since, toSeq, toID, plain)
 		}
 		if t.isSealedNS(n) || preSealed != nil {
-			out.Sealed, nsRowID = true, n.id
+			out.Sealed, nsRowName = true, n.name
 			if perEntry {
 				for i, r := range rs {
 					m := out.Entries[i]
@@ -952,7 +929,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		return nil
 	})
 	if err == nil && out != nil && out.Sealed && resource == "" {
-		if err = e.finishSeal(ctx, nsRowID, jobs); err == nil {
+		if err = e.finishSeal(ctx, nsRowName, jobs); err == nil {
 			if perEntry {
 				out.EntryJWEs = make([]string, len(jobs))
 				for i, j := range jobs {
@@ -986,7 +963,7 @@ type HeadsPage struct {
 // page size (§7.4).
 func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cred Credentials) (*HeadsPage, error) {
 	var out *HeadsPage
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -1052,7 +1029,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]map[string]any, bool, error) {
 	var out []map[string]any
 	var public bool
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -1115,3 +1092,55 @@ func (h *hub) publish(ns string) {
 }
 
 var _ = sort.Strings
+
+// nsLogRow is a namespace log entry as stored: its hashed body, and the
+// members served beside it (§7.4).
+type nsLogRow struct {
+	seq     int64
+	id      []byte
+	prev    *int64
+	body    string
+	author  int64
+	created int64
+	grantID []byte
+	noAuth  sql.NullInt64
+	meta    sql.NullString // gesture and undoes, or gestures: JSON
+	via     sql.NullString // the grant's delegatees (§7.4)
+}
+
+// nsLogRows visits n's log entries after seq from up to and including seq
+// to, in chain order, at most limit of them (0: all), while visit returns
+// true.
+func (t *tx) nsLogRows(n *nsRow, from, to int64, limit int, visit func(nsLogRow) bool) {
+	q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures, via FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
+	args := []any{n.id, from, to}
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := t.Query(q, args...)
+	t.must(err)
+	defer rows.Close()
+	for rows.Next() {
+		var r nsLogRow
+		t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta, &r.via))
+		if !visit(r) {
+			return
+		}
+	}
+	t.must(rows.Err())
+}
+
+// resState is resource row res's state.
+func (t *tx) resState(res int64) int {
+	var state int
+	t.must(t.QueryRow(`SELECT state FROM resources WHERE res = ?`, res).Scan(&state))
+	return state
+}
+
+// entryConfig is the configuration in force at log entry seq: its seq
+// and document.
+func (t *tx) entryConfig(seq int64) (cseq int64, doc string) {
+	t.must(t.QueryRow(`SELECT l.config_seq, c.doc FROM ns_log l JOIN ns_config c ON c.seq = l.config_seq WHERE l.seq = ?`, seq).Scan(&cseq, &doc))
+	return cseq, doc
+}

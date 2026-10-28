@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.24.0-ddb.3
+
+The third prerelease from the `dynamodb` branch. A write's commit chained over the log tip its
+checks read; under concurrent writes another write of the same server had often committed
+since, so the commit's transaction was cancelled, the tip read, and the transaction run again
+(12% of commits in a CloudShell trace, each a ~25 ms transaction wasted). The store now
+remembers the tip it last committed for each namespace and chains over the newer of that and
+the check's. A purge's collection of blob bytes no longer races an upload naming the same bytes
+(the upload's bytes could be deleted). `deploy/bench.sh` waits out 429s and counts them apart
+from errors; `deploy/spans.py` summarises where requests spend their time from the server's
+console spans (`OTEL_TRACES_EXPORTER=console`).
+
+## v0.24.0-ddb.2
+
+The second prerelease from the `dynamodb` branch. DynamoDB's latency is per call, so this one
+cuts the calls a request waits on: a write makes 4 round trips instead of 8 (its namespace,
+resources and their head documents in one batch; the commit chains over the tip its checks
+read instead of reading it again), and a revision read 4 instead of 5. The client keeps up to
+256 idle connections to DynamoDB (the SDK's default is 10), so concurrent requests don't pay a
+new TLS handshake. `serve` checks at start that its table answers, and fails naming what to
+check (the URL's region, AWS credentials, the table) rather than answering every request with
+an error; a timeout inside the AWS SDK is a logged 503 `unavailable`, no longer "request
+cancelled". `deploy/bench.sh` says why a setup request failed. Tests of lost races, failed
+calls, crash recovery and heads at entries, and a test bounding each request's calls.
+
+## v0.24.0-ddb.1
+
+A prerelease from the `dynamodb` branch: v0.23.0 with a DynamoDB storage backend
+(docs/DYNAMODB.md). `patchlog serve -db 'dynamodb://<table>?region=…'` serves the same API as the
+SQLite and Postgres backends, from one table made beforehand (key design in docs/DYNAMODB.md §3,
+the create-table command in `deploy/bench.sh`). The whole test suite passes on it, against
+DynamoDB Local.
+
+Not yet: running more than one instance on a table (no cache invalidation between instances);
+the background loops (retention, sweeps, second CDN purges, rotation, remote follows) — their
+operations run when called; values over DynamoDB's 400 KB item (501); raising a namespace from
+sealed to e2e (501). The core's storage now goes through a backend interface, and the DynamoDB
+store (`internal/ddbstore`, the only code using the AWS SDK) registers itself where a build links
+it in. Telemetry: a span per DynamoDB call under the database spans, group commit sizes, and
+`patchlog.db.conflicts`. `deploy/bench.sh` is a small load test of a running server.
+
 ## v0.23.0
 
 Implements spec **v0.73**, the whole upgrade from v0.55. v0.56 folds in the reference's notes

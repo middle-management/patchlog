@@ -111,14 +111,14 @@ func epochAAD(ns int64, epoch int) []byte {
 // versions before v0.73, which cached every sealed and e2e namespace
 // publicly, left of those with read "grant" are purged once on upgrade
 // (migration 009_purge_grant_caches, RH-44).
-func (t *tx) cachePublic(n *nsRow) bool { return t.config(n.configSeq).cachePublic() }
+func (t *gate) cachePublic(n *nsRow) bool { return t.config(n.configSeq).cachePublic() }
 
 // cachePublic reports whether a namespace with this document uses the
 // public cache classes (see tx.cachePublic).
 func (c *Config) cachePublic() bool { return c.Read == "public" }
 
 // isSealedNS reports whether n serves sealed content.
-func (t *tx) isSealedNS(n *nsRow) bool { return t.config(n.configSeq).level == levelSealed }
+func (t *gate) isSealedNS(n *nsRow) bool { return t.config(n.configSeq).level == levelSealed }
 
 // --- epoch keys -----------------------------------------------------------
 
@@ -344,6 +344,7 @@ type sealJob struct {
 	kind, key string
 	name      string // resource, for doc and entry
 	revSeq    int64
+	revPos    uint64 // DynamoDB: the revision's position, if the serving namespace's own
 	kid       string
 	k         []byte
 	pl        seal.PL
@@ -402,7 +403,7 @@ func (t *tx) resJob(n *nsRow, name string, row *revRow, kind string, plain func(
 }
 
 // configJob prepares the sealing of n's namespace document at ns_log seq.
-func (t *tx) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
+func (t *gate) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
 	j := &sealJob{kind: sealConfig, key: nsID}
 	if t.stored(n, j) {
 		return j
@@ -418,7 +419,7 @@ func (t *tx) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
 // namespace event is sealed under K_e of the current epoch (§E.2.2), not
 // that of its last entry. A stored range keeps its bytes; one evicted is
 // sealed again under the epoch current then.
-func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain func() []byte) *sealJob {
+func (t *gate) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain func() []byte) *sealJob {
 	j := &sealJob{kind: sealRange, key: since + ":" + toID}
 	if t.stored(n, j) {
 		return j
@@ -434,7 +435,7 @@ func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain fu
 // stored for a namespace or resource purged since the read. In a namespace
 // with encryption.pad, each JWE is padded as a whole and never compressed
 // (§E.2.2); the setting as of sealing counts, and stored bytes never change.
-func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) error {
+func (e *Engine) finishSeal(ctx context.Context, ns string, jobs []*sealJob) error {
 	var todo []*sealJob
 	for _, j := range jobs {
 		if j == nil || j.jwe != "" && !j.fresh {
@@ -448,7 +449,17 @@ func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) erro
 	if len(todo) == 0 {
 		return nil
 	}
+	return e.be.storeSealed(ctx, ns, todo)
+}
+
+// sqlStoreSealed stores sealed values of namespace name (finishSeal).
+func (e *Engine) sqlStoreSealed(ctx context.Context, name string, todo []*sealJob) error {
 	return e.update(ctx, func(t *tx) error {
+		n := t.nsByName(name)
+		if n == nil {
+			return nil
+		}
+		ns := n.id
 		// Shared: purges, which delete sealed rows, lock exclusively.
 		t.lockNS(ns, lockShared)
 		var purged bool
@@ -528,7 +539,7 @@ type KeysAnswer struct {
 func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) (*KeysAnswer, error) {
 	var out []map[string]any
 	var ans *KeysAnswer
-	err := e.read(ctx, func(t *tx) error {
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -628,7 +639,7 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 // drawExchange draws the one token a /keys request takes from the
 // principal's exchangeRate bucket (§E.2.3, §6.6): 429 naming exchangeRate
 // when it is empty.
-func (t *tx) drawExchange(a *actor) *Error {
+func (t *gate) drawExchange(a *actor) *Error {
 	if a == nil || a.bucketKey == "" {
 		return nil
 	}
@@ -661,7 +672,7 @@ func selectEpochs(window, asked []int) []int {
 // if it reads the namespace unrestricted (§2.1), and is 403 otherwise, the
 // names asked being ignored. With authentication disabled, every request
 // gets K_e.
-func (t *tx) keysScope(a *actor, kr KeysRequest) (names []string, perResource bool, err *Error) {
+func (t *gate) keysScope(a *actor, kr KeysRequest) (names []string, perResource bool, err *Error) {
 	if a == nil || a.verified == nil {
 		return nil, false, nil
 	}
@@ -703,7 +714,7 @@ func (t *tx) keysScope(a *actor, kr KeysRequest) (names []string, perResource bo
 // (§2.1): it may read, neither its key's scope nor its rules refer to
 // /resource, and, with roles, a read role without such rules passes its
 // rules against a read envelope.
-func (t *tx) readsUnrestricted(a *actor) bool {
+func (t *gate) readsUnrestricted(a *actor) bool {
 	roles, ok := a.unrestrictedRoles()
 	return ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), false) == nil
 }
@@ -760,7 +771,7 @@ func fixedNames(a *actor) ([]string, bool) {
 // alternatives: if the unrestricted ones fail, a read role that refers to
 // /resource may still pass per resource (perResource); without one, the
 // grant doesn't read the namespace unrestricted (refused).
-func (t *tx) keysReadScope(a *actor) (perResource, refused bool) {
+func (t *gate) keysReadScope(a *actor) (perResource, refused bool) {
 	if a == nil || a.verified == nil {
 		return false, false
 	}
@@ -782,7 +793,7 @@ func recipientOf(a *actor) *ecdh.PublicKey {
 }
 
 // grantEpochs lists the epochs a grant may have keys for, ascending.
-func (t *tx) grantEpochs(n *nsRow, cfg *Config, a *actor) []int {
+func (t *gate) grantEpochs(n *nsRow, cfg *Config, a *actor) []int {
 	return t.grantEpochsOf(t.epochStarts(`epoch_keys`, n.id, cfg.Epoch), cfg, a)
 }
 
@@ -836,7 +847,7 @@ func latestNbf(a *actor) *time.Time {
 // that began at or before it. Epochs that began after the grant's exp are
 // not left out (v0.63). Without a grant (authentication disabled), every
 // epoch, as far as historyEpochs allows.
-func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
+func (t *gate) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 	if len(all) == 0 {
 		return nil
 	}
@@ -872,40 +883,58 @@ func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 // retention's): a new epoch key is created and content written from then on
 // is sealed under it. It returns the new epoch.
 func (e *Engine) RotateEpoch(ctx context.Context, ns, author string) (int, error) {
-	epoch, _, err := e.rotateEpoch(ctx, ns, author, false)
+	epoch, _, err := e.be.rotateEpoch(ctx, ns, author, false)
 	return epoch, err
 }
 
-// rotateEpoch is RotateEpoch; with ifDue, it rotates only while ns has a
-// rotation due (rotations_due), checked under the namespace's lock, so the
-// rotation after a revocation and its retry never both rotate. rotated
-// reports whether it did.
-func (e *Engine) rotateEpoch(ctx context.Context, ns, author string, ifDue bool) (epoch int, rotated bool, err error) {
+// planRotation is RotateEpoch's config change, planned as the server's.
+// With ifDue, nil while ns has no rotation due (rotationDue), checked
+// with the rest, so the rotation after a revocation and its retry never
+// both rotate.
+func (t *gate) planRotation(ns, author string, ifDue bool) (*nsRow, *actor, *configPlan, error) {
+	n := t.nsForWrite(ns)
+	if n == nil {
+		return nil, nil, nil, notFound()
+	}
+	if n.purged {
+		return nil, nil, nil, t.purgedNS(n)
+	}
+	if ifDue && !t.rotationDue(n) {
+		return n, nil, nil, nil
+	}
+	cur := t.config(n.configSeq)
+	if cur.level != levelSealed {
+		return nil, nil, nil, invalid("the namespace is not sealed")
+	}
+	a := &actor{principal: grant.Principal{ID: author}, star: true, bucketKey: author}
+	patches := []any{map[string]any{"op": "add", "path": "/encryption/epoch", "value": float64(cur.Epoch + 1)}}
+	cc := &ConfigChange{IfMatch: t.configID(n.configSeq).String(), Patches: patches}
+	p, err := t.planConfig(n, cur, a, cc, false)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return n, a, p, nil
+}
+
+// rotationDue reports whether n has a rotation due after a revocation
+// (rotations_due).
+func (t *tx) rotationDue(n *nsRow) bool {
+	var due int
+	t.must(t.QueryRow(`SELECT COUNT(*) FROM rotations_due WHERE ns = ?`, n.id).Scan(&due))
+	return due > 0
+}
+
+// sqlRotateEpoch is rotateEpoch on SQL: with ifDue, it rotates only while
+// ns has a rotation due, under the namespace's lock. rotated reports
+// whether it did.
+func (e *Engine) sqlRotateEpoch(ctx context.Context, ns, author string, ifDue bool) (epoch int, rotated bool, err error) {
 	err = e.update(ctx, func(t *tx) error {
-		n := t.nsForWrite(ns)
-		if n == nil {
-			return notFound()
-		}
-		if n.purged {
-			return t.purgedNS(n)
-		}
-		if ifDue {
-			var due int
-			t.must(t.QueryRow(`SELECT COUNT(*) FROM rotations_due WHERE ns = ?`, n.id).Scan(&due))
-			if due == 0 {
-				return nil
-			}
-		}
-		cur := t.config(n.configSeq)
-		if cur.level != levelSealed {
-			return invalid("the namespace is not sealed")
-		}
-		a := &actor{principal: grant.Principal{ID: author}, star: true, bucketKey: author}
-		patches := []any{map[string]any{"op": "add", "path": "/encryption/epoch", "value": float64(cur.Epoch + 1)}}
-		cc := &ConfigChange{IfMatch: t.configID(n.configSeq).String(), Patches: patches}
-		p, err := t.planConfig(n, cur, a, cc, false)
+		n, _, p, err := t.planRotation(ns, author, ifDue)
 		if err != nil {
 			return err
+		}
+		if p == nil {
+			return nil // not due
 		}
 		aid := t.authorID(author)
 		seq := t.insertConfig(n, p, aid)
@@ -934,10 +963,10 @@ func (e *Engine) rotateAfterRevoke(names []string) {
 			continue
 		}
 		seen[ns] = true
-		if _, _, err := e.rotateEpoch(ctx, ns, RotateAuthor, true); err != nil {
+		if _, _, err := e.be.rotateEpoch(ctx, ns, RotateAuthor, true); err != nil {
 			log.Printf("rotate-on-revoke %s: %v (retried until a rotation succeeds)", ns, err)
 		}
-		_ = e.read(ctx, func(t *tx) error {
+		_ = e.gateRead(ctx, func(t *gate) error {
 			if n := t.nsByName(ns); n != nil {
 				for _, b := range t.allBranchesOf(n) {
 					if t.isSealedNS(b) {
@@ -953,6 +982,10 @@ func (e *Engine) rotateAfterRevoke(names []string) {
 // RotationsDue lists the namespaces whose rotation after a revocation is
 // due: recorded with the revocation, and no new epoch begun since.
 func (e *Engine) RotationsDue(ctx context.Context) ([]string, error) {
+	return e.be.rotationsDue(ctx)
+}
+
+func (e *Engine) sqlRotationsDue(ctx context.Context) ([]string, error) {
 	var out []string
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT n.name FROM rotations_due d JOIN namespaces n ON n.ns = d.ns ORDER BY n.name`)
@@ -968,6 +1001,22 @@ func (e *Engine) RotationsDue(ctx context.Context) ([]string, error) {
 	return out, err
 }
 
+func (e *Engine) sqlDropRotation(ctx context.Context, ns string) (bool, error) {
+	var drop bool
+	if err := e.read(ctx, func(t *tx) error {
+		n := t.nsByName(ns)
+		drop = n == nil || n.purged || t.config(n.configSeq).level != levelSealed
+		return nil
+	}); err != nil || !drop {
+		return false, err
+	}
+	return true, e.update(ctx, func(t *tx) error {
+		_, err := t.Exec(`DELETE FROM rotations_due WHERE ns IN (SELECT ns FROM namespaces WHERE name = ?)`, ns)
+		t.must(err)
+		return nil
+	})
+}
+
 // RetryRotations retries the rotations RotationsDue lists and returns the
 // namespaces rotated. One whose namespace was purged, or is no longer
 // sealed, is dropped: nothing is left to rotate.
@@ -981,25 +1030,12 @@ func (e *Engine) RetryRotations(ctx context.Context) ([]string, error) {
 		if err := e.jobStep(ctx); err != nil {
 			return done, err
 		}
-		var drop bool
-		if err := e.read(ctx, func(t *tx) error {
-			n := t.nsByName(ns)
-			drop = n == nil || n.purged || t.config(n.configSeq).level != levelSealed
-			return nil
-		}); err != nil {
+		if drop, err := e.be.dropRotation(ctx, ns); err != nil {
 			return done, err
-		}
-		if drop {
-			if err := e.update(ctx, func(t *tx) error {
-				_, err := t.Exec(`DELETE FROM rotations_due WHERE ns IN (SELECT ns FROM namespaces WHERE name = ?)`, ns)
-				t.must(err)
-				return nil
-			}); err != nil {
-				return done, err
-			}
+		} else if drop {
 			continue
 		}
-		_, rotated, err := e.rotateEpoch(ctx, ns, RotateAuthor, true)
+		_, rotated, err := e.be.rotateEpoch(ctx, ns, RotateAuthor, true)
 		if err != nil {
 			log.Printf("rotate-on-revoke %s: retry: %v", ns, err)
 			continue
@@ -1038,25 +1074,22 @@ func (e *Engine) rotateRetryLoop() {
 // epoch started at least maxAge ago, and returns their names.
 func (e *Engine) RotateDue(ctx context.Context, maxAge time.Duration) ([]string, error) {
 	var due []string
-	err := e.read(ctx, func(t *tx) error {
-		rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%' ORDER BY name`)
-		t.must(err)
-		var all []*nsRow
-		for rows.Next() {
-			n, err := scanNS(rows)
-			t.must(err)
-			all = append(all, n)
-		}
-		rows.Close()
+	err := e.gateRead(ctx, func(t *gate) error {
+		all := t.allNamespaces()
+		sort.Slice(all, func(i, j int) bool { return all[i].name < all[j].name })
 		cutoff := t.now.Add(-maxAge).UnixMilli()
 		for _, n := range all {
+			if n.purged || n.isShadow() {
+				continue
+			}
 			cfg := t.config(n.configSeq)
 			if cfg.level != levelSealed || cfg.Frozen {
 				continue
 			}
-			var created int64
-			if err := t.QueryRow(`SELECT created FROM epoch_keys WHERE ns = ? AND epoch = ?`, n.id, cfg.Epoch).Scan(&created); err == nil && created <= cutoff {
-				due = append(due, n.name)
+			for _, s := range t.epochStarts(`epoch_keys`, n.id, cfg.Epoch) {
+				if s.e == cfg.Epoch && s.created.UnixMilli() <= cutoff {
+					due = append(due, n.name)
+				}
 			}
 		}
 		return nil

@@ -5,7 +5,6 @@ import (
 	"crypto/ecdh"
 	"crypto/hkdf"
 	"crypto/sha256"
-	"database/sql"
 	"errors"
 	"io"
 
@@ -50,7 +49,7 @@ func archiveIdentity(dek []byte) *ecdh.PrivateKey {
 // archiveBundleSealer returns the Seal function of an archive of res, a
 // resource of n: a sealed bundle to res's archive key (§8.6, §G.5.1.1).
 // nil if res is not encrypted, whose archives are plain bundles.
-func (t *tx) archiveBundleSealer(n *nsRow, res int64) func(io.Writer) (io.WriteCloser, error) {
+func (t *gate) archiveBundleSealer(n *nsRow, res int64) func(io.Writer) (io.WriteCloser, error) {
 	if t.resLevel(res) < levelAtRest {
 		return nil
 	}
@@ -89,34 +88,8 @@ func (e *Engine) ArchiveIdentity(ctx context.Context, ns, name string) (*ecdh.Pr
 }
 
 // archiveDEK reads the data key that ns/name's encrypted archives are
-// opened with, in a read transaction of its own; the errors are
+// opened with (the backend's archiveDEK); the errors are
 // ArchiveIdentity's.
 func (e *Engine) archiveDEK(ctx context.Context, ns, name string) ([]byte, error) {
-	var dek []byte
-	err := e.read(ctx, func(t *tx) error {
-		n := t.nsByName(ns)
-		if n == nil {
-			return ErrArchiveKeyDestroyed
-		}
-		own := t.resource(n.id, name)
-		if n.purged || own == nil || own.state == statePurged {
-			return ErrArchiveKeyDestroyed
-		}
-		if t.resLevel(own.id) < levelAtRest {
-			return ErrNotEncrypted
-		}
-		if t.e.opt.KeyStore == nil {
-			return errNoKeyStore
-		}
-		k, err := t.loadDEK(own.id)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrArchiveKeyDestroyed
-		}
-		dek = k
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	return dek, nil
+	return e.be.archiveDEK(ctx, ns, name)
 }

@@ -63,19 +63,16 @@ func (c *grantRootCache) put(id ids.ID, r grantRoot) {
 // decrypted. It is nil if the grant isn't stored or doesn't parse, which a
 // server that stores every grant it records never sees: the entry then
 // serves no grant, and counts for no one's merge.authors.
-func (t *tx) grantRef(id []byte) map[string]any {
+func (t *gate) grantRef(id []byte) map[string]any {
 	gid := ids.FromBytes(id)
 	r, ok := t.e.grantRoots.get(gid)
 	if !ok {
-		var blocks []byte
-		var sub, kid sql.NullString
-		err := t.QueryRow(`SELECT blocks, root_sub, root_kid FROM grants WHERE id = ?`, id).Scan(&blocks, &sub, &kid)
-		if errors.Is(err, sql.ErrNoRows) {
+		blocks, root, found := t.grantRow(id)
+		if !found {
 			return nil
 		}
-		t.must(err)
-		if sub.Valid {
-			r = grantRoot{sub: sub.String, kid: kid.String}
+		if root != nil {
+			r = *root
 		} else {
 			if isSealed(string(blocks)) {
 				// Encrypted at rest under the deployment key of grants
@@ -95,4 +92,20 @@ func (t *tx) grantRef(id []byte) map[string]any {
 		t.e.grantRoots.put(gid, r)
 	}
 	return map[string]any{"id": gid.String(), "sub": r.sub, "kid": r.kid}
+}
+
+// grantRow reads the stored grant id: its blocks as stored (sealed if
+// encrypted at rest) and its root sub and kid, nil if not stored with
+// them (rows from before root_sub).
+func (t *tx) grantRow(id []byte) (blocks []byte, root *grantRoot, ok bool) {
+	var sub, kid sql.NullString
+	err := t.QueryRow(`SELECT blocks, root_sub, root_kid FROM grants WHERE id = ?`, id).Scan(&blocks, &sub, &kid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, false
+	}
+	t.must(err)
+	if sub.Valid {
+		root = &grantRoot{sub: sub.String, kid: kid.String}
+	}
+	return blocks, root, true
 }

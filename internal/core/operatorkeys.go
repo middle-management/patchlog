@@ -40,7 +40,7 @@ type OperatorKeyPeriod struct {
 
 // operatorKeys is Options.OperatorKeys without the keys past their until
 // in the history (§C.4): nil if none are configured, else possibly empty.
-func (t *tx) operatorKeys() []grant.Key {
+func (t *gate) operatorKeys() []grant.Key {
 	keys := t.e.opt.OperatorKeys
 	if len(keys) == 0 || len(t.e.opt.OperatorKeyHistory) == 0 {
 		return keys
@@ -142,9 +142,8 @@ func (e *Engine) firstEntryTime(ctx context.Context) (time.Time, error) {
 		return e.firstEntry, nil
 	}
 	var ms sql.NullInt64
-	err := e.read(ctx, func(t *tx) error {
-		return t.QueryRow(`SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms)
-	})
+	var err error
+	ms.Int64, ms.Valid, err = e.be.firstEntryTime(ctx)
 	if err != nil {
 		return time.Time{}, err
 	}

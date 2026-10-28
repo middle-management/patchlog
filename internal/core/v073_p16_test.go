@@ -16,7 +16,7 @@ func TestV073P16BaseLevelAtCreationAndE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx := &tx{e: &Engine{opt: Options{KeyStore: ks}}}
+	tx := &gate{checkState: &checkState{e: &Engine{opt: Options{KeyStore: ks}}}}
 	cfg := func(s string) *Config {
 		t.Helper()
 		c, err := parseConfig(v073Doc(s), DefaultLimits(), DefaultMaximums())

@@ -82,7 +82,7 @@ func (t *tx) resOwner(n *nsRow, res int64) *nsRow {
 // raised namespace, n or a base n reads it through, and at or before the
 // resource's head as of the entry before the raise. nil otherwise, and in
 // a namespace that isn't e2e.
-func (t *tx) preRaiseOf(n *nsRow, r *revRow) *preRaise {
+func (t *gate) preRaiseOf(n *nsRow, r *revRow) *preRaise {
 	if r == nil || !t.isE2E(n) {
 		return nil
 	}
@@ -103,7 +103,7 @@ func (t *tx) preRaiseOf(n *nsRow, r *revRow) *preRaise {
 // parents, that e2e namespace n serves as content from before an e2e
 // raise, or nil if there is none: where the chain's revisions written end
 // to end begin (§7.1 Paging, Addendum E Levels).
-func (t *tx) preRaiseBoundary(n *nsRow, to *revRow) *revRow {
+func (t *gate) preRaiseBoundary(n *nsRow, to *revRow) *revRow {
 	if !t.isE2E(n) {
 		return nil
 	}
@@ -135,7 +135,7 @@ func (t *tx) preRaiseBoundary(n *nsRow, to *revRow) *revRow {
 // namespace n spans an e2e raise (§7.1 Paging): if so it returns the row
 // its first page ends at, the last one from before the raise, else nil. A
 // since that isn't an ancestor of to is left to logBetween (404).
-func (t *tx) preRaiseRange(n *nsRow, to *revRow, since *ids.ID) *revRow {
+func (t *gate) preRaiseRange(n *nsRow, to *revRow, since *ids.ID) *revRow {
 	b := t.preRaiseBoundary(n, to)
 	if b == nil || b.seq == to.seq {
 		return nil
@@ -156,7 +156,7 @@ func (t *tx) preRaiseRange(n *nsRow, to *revRow, since *ids.ID) *revRow {
 // raise is later, that revision, whose document /rev serves as at the
 // level before: the last live one at or before it where it is a
 // tombstone, the range then holding the tombstone. "" for the genesis.
-func (t *tx) preRaiseFoldSince(n *nsRow, row *revRow) string {
+func (t *gate) preRaiseFoldSince(n *nsRow, row *revRow) string {
 	since := t.e2eFoldSince(row)
 	b := t.preRaiseBoundary(n, row)
 	if b == nil || b.seq == row.seq {
@@ -180,7 +180,7 @@ func (t *tx) preRaiseFoldSince(n *nsRow, row *revRow) string {
 // serves it under name (resJob, §E.2.2): under K_r of the epoch it is
 // served under (preRaiseEpoch), padded as p.m padded before the raise.
 // The job is stored under p.m (finishSeal with p.m.id).
-func (t *tx) preRaiseResJob(p *preRaise, name string, row *revRow, kind string, plain func() []byte) *sealJob {
+func (t *gate) preRaiseResJob(p *preRaise, name string, row *revRow, kind string, plain func() []byte) *sealJob {
 	m := p.m
 	j := &sealJob{kind: kind, key: name + "/" + row.id.String(), name: name, revSeq: row.seq}
 	if t.stored(m, j) {
@@ -218,7 +218,7 @@ func (t *tx) preRaiseEntryEpoch(n *nsRow, raise *e2eRaise, seq int64) int {
 
 // preRaiseConfigJob is configJob for a namespace document of n at ns_log
 // seq, from before its raise from sealed.
-func (t *tx) preRaiseConfigJob(n *nsRow, raise *e2eRaise, seq int64, nsID string, doc []byte) *sealJob {
+func (t *gate) preRaiseConfigJob(n *nsRow, raise *e2eRaise, seq int64, nsID string, doc []byte) *sealJob {
 	j := &sealJob{kind: sealConfig, key: nsID}
 	if t.stored(n, j) {
 		return j
@@ -232,7 +232,7 @@ func (t *tx) preRaiseConfigJob(n *nsRow, raise *e2eRaise, seq int64, nsID string
 // preRaiseRangeJob is rangeJob for a range of n's namespace log from
 // before its raise from sealed: sealed under K_e of the last epoch before
 // the raise, which stands for the current one (§E.2.2).
-func (t *tx) preRaiseRangeJob(n *nsRow, raise *e2eRaise, since, toID string, plain func() []byte) *sealJob {
+func (t *gate) preRaiseRangeJob(n *nsRow, raise *e2eRaise, since, toID string, plain func() []byte) *sealJob {
 	j := &sealJob{kind: sealRange, key: since + ":" + toID}
 	if t.stored(n, j) {
 		return j
@@ -245,7 +245,7 @@ func (t *tx) preRaiseRangeJob(n *nsRow, raise *e2eRaise, since, toID string, pla
 
 // preRaiseResourceEvents is sealResourceEvents for events from before n's
 // raise from sealed: under K_r of the last epoch before the raise.
-func (t *tx) preRaiseResourceEvents(n *nsRow, raise *e2eRaise, name string, es []map[string]any) []string {
+func (t *gate) preRaiseResourceEvents(n *nsRow, raise *e2eRaise, name string, es []map[string]any) []string {
 	if len(es) == 0 {
 		return nil
 	}
@@ -305,7 +305,7 @@ func (t *tx) preRaiseGrant(n *nsRow, id ids.ID) (*nsRow, *e2eRaise, int64) {
 
 // nsPreRaise returns n's raise to e2e if its namespace entry seq is from
 // before it (Addendum E Levels), nil otherwise.
-func (t *tx) nsPreRaise(n *nsRow, seq int64) *e2eRaise {
+func (t *gate) nsPreRaise(n *nsRow, seq int64) *e2eRaise {
 	if !t.isE2E(n) {
 		return nil
 	}
@@ -332,7 +332,7 @@ func (t *tx) preRaiseConfig(raise *e2eRaise) *Config {
 // and namespace document before the raise standing for the current ones;
 // in a branch of the raised namespace, to the branch's grants, as its
 // /keys gives the base's keys for what it reads through.
-func (t *tx) preRaiseKeysOpen(n *nsRow, p *preRaise, name string, epochs map[int]bool, creds []Credentials) bool {
+func (t *gate) preRaiseKeysOpen(n *nsRow, p *preRaise, name string, epochs map[int]bool, creds []Credentials) bool {
 	if len(epochs) == 0 || n.purged || p.m.purged {
 		return false
 	}
@@ -473,7 +473,7 @@ func (t *tx) preRaiseBlobRev(p *preRaise, head *revRow, bid ids.ID) *revRow {
 // of the newest of them under the epoch it is served under, which fixes
 // it once stored (under p.m); without any, 404 (no-store). Never the
 // plaintext.
-func (t *tx) preRaiseBlobHead(p *preRaise, name string, head *revRow, bid ids.ID, out *Blob) *sealJob {
+func (t *gate) preRaiseBlobHead(p *preRaise, name string, head *revRow, bid ids.ID, out *Blob) *sealJob {
 	if e := latestEpoch(t.preRaiseBlobEpochs(p, head, bid)); e > 0 {
 		out.Status, out.Epoch = 302, e
 		return nil
@@ -491,7 +491,7 @@ func (t *tx) preRaiseBlobHead(p *preRaise, name string, head *revRow, bid ids.ID
 // from sealed: the epochs a request for it would be served under, those
 // fixed, or, where none is, the one a request would fix by sealing its
 // newest referencing revision (preRaiseBlobHead).
-func (t *tx) preRaiseBlobKeyEpochs(p *preRaise, head *revRow, bid ids.ID) map[int]bool {
+func (t *gate) preRaiseBlobKeyEpochs(p *preRaise, head *revRow, bid ids.ID) map[int]bool {
 	eps := t.preRaiseBlobEpochs(p, head, bid)
 	if len(eps) == 0 {
 		if r := t.preRaiseBlobRev(p, head, bid); r != nil {
@@ -505,7 +505,7 @@ func (t *tx) preRaiseBlobKeyEpochs(p *preRaise, head *revRow, bid ids.ID) map[in
 // resource name of e2e namespace n where it is a blob from before a raise
 // from sealed, as a copy or a batch's local source from n needs (§2.1
 // Protection, §7.8): true for any other blob, which n serves as uploaded.
-func (t *tx) preRaiseBlobOpens(n *nsRow, name string, bid ids.ID, creds []Credentials) bool {
+func (t *gate) preRaiseBlobOpens(n *nsRow, name string, bid ids.ID, creds []Credentials) bool {
 	head := t.resolve(n, name, nil).head
 	p := t.preRaiseBlob(n, head, bid)
 	if p == nil {

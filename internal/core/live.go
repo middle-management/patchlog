@@ -98,7 +98,7 @@ var testLiveRead func(*Engine)
 var errNotShared = errors.New("core: live read not shared")
 
 // decided records the pass a read check allows (see above).
-func (l *liveRead) decided(t *tx, n *nsRow, cred Credentials, a *actor) {
+func (l *liveRead) decided(t *gate, n *nsRow, cred Credentials, a *actor) {
 	if l.meta%2 != 0 {
 		return
 	}

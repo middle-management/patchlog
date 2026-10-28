@@ -202,7 +202,10 @@ func TestBatchBodyLimit(t *testing.T) {
 	e := f.tenv
 	eve := e.grant(f.issuer, "user:eve", []string{"sec"}, []string{"read", "create", "append"})
 	big := strings.Repeat("x", 60<<10) // valueSize bounds a string, so three per document
-	items := make([]any, 8)            // about 1.6 MB of patch sets
+	// About 1.1 MB of patch sets: over eve's batchSize, under the bound
+	// of what is read (BatchBodyLimit), which a lower itemsPerBatch
+	// maximum (DynamoDB's) lowers.
+	items := make([]any, 6)
 	for i := range items {
 		items[i] = map[string]any{"resource": "big-" + string(rune('a'+i)), "ifNoneMatch": "*",
 			"steps": []any{addRoot(map[string]any{"a": big, "b": big, "c": big})}}

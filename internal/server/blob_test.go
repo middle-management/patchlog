@@ -517,6 +517,43 @@ func TestBlobPrune(t *testing.T) {
 	}
 }
 
+// §8.6: without an archive, pruning ends attachments no kept document
+// references alike, and collects their bytes; a write referencing one
+// again needs it uploaded again.
+func TestBlobPruneUnarchived(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, withBlobTuning, withoutRetentionLoop)
+	e.mkNS("main", map[string]any{"read": "public"})
+	da, db, dk := []byte("old blob A"), []byte("new blob B"), []byte("kept blob K")
+	ba := e.upload("main", "r", "text/plain", da)
+	bk := e.upload("main", "r", "text/plain", dk)
+	revs := []string{e.create("main", "r", map[string]any{"a": ref(ba, "text/plain", len(da), "")})}
+	revs = append(revs, e.appendRev("main", "r", revs[0], ops(op("remove", "/a"), op("add", "/k", ref(bk, "text/plain", len(dk), "")))))
+	revs = append(revs, e.appendRev("main", "r", revs[1], ops(op("remove", "/k"))))
+	bb := e.upload("main", "r", "text/plain", db)
+	revs = append(revs, e.appendRev("main", "r", revs[2], ops(op("add", "/b", ref(bb, "text/plain", len(db), "")))))
+	e.clock.Advance(time.Hour)
+	expect(t, e.prune("main", "r", map[string]any{"horizon": revs[3], "keep": []any{revs[1]}}, "admin"), 200)
+	g := e.get(blobPath("main", "r", ba))
+	expectCode(t, g, 410, "pruned")
+	if g.Str("horizon") != revs[3] || g.Str("archive") != "" {
+		t.Fatalf("pruned blob %s", g.Body)
+	}
+	expect(t, e.get(blobPath("main", "r", bk)), 200) // a kept document references it
+	expect(t, e.get(blobPath("main", "r", bb)), 200)
+	if s := e.blobStats(); s.Attached != 2 || s.Pruned != 1 || s.Bytes != 2 {
+		t.Fatalf("stats %+v", s)
+	}
+	head := revs[3]
+	expectCode(t, e.write("PATCH", "main", "r", head, ops(op("add", "/a", ref(ba, "text/plain", len(da), "")))), 422, "blob")
+	e.upload("main", "r", "text/plain", da)
+	expect(t, e.write("PATCH", "main", "r", head, ops(op("add", "/a", ref(ba, "text/plain", len(da), "")))), 201)
+	expect(t, e.get(blobPath("main", "r", ba)), 200)
+	if s := e.blobStats(); s.Attached != 3 || s.Pruned != 0 || s.Bytes != 3 {
+		t.Fatalf("stats after re-attaching %+v", s)
+	}
+}
+
 // §8.6, §D.4: restoring archives brings back the attachments pruning
 // ended, from their blob lines, once every document is stored again.
 func TestBlobArchiveRestore(t *testing.T) {

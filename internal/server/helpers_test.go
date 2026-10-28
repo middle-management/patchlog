@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -18,7 +17,6 @@ import (
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
-	"github.com/middle-management/patchlog/internal/pgtest"
 	"github.com/middle-management/patchlog/internal/testenv"
 )
 
@@ -50,6 +48,7 @@ type tenv struct {
 	clock  *clock
 	opPriv ed25519.PrivateKey // operator key (auth enabled only)
 	auth   bool
+	owner  uint64 // the goroutine of the test that started it: answers there may skip it
 }
 
 type envOpt func(*core.Options)
@@ -72,13 +71,7 @@ func withLongPoll(d time.Duration) envOpt {
 }
 
 func withFileDB(t *testing.T) envOpt {
-	return func(o *core.Options) {
-		if pgtest.Enabled() {
-			o.Path = pgtest.NewDB(t)
-			return
-		}
-		o.Path = filepath.Join(t.TempDir(), "test.db")
-	}
+	return func(o *core.Options) { o.Path = testenv.NewDB(t) }
 }
 
 // tableBlobs, as BlobDir, keeps blob bytes in the database
@@ -101,23 +94,25 @@ func newEnvWith(t *testing.T, sopts []Option, opts ...envOpt) *tenv {
 	for _, f := range opts {
 		f(&o)
 	}
+	testenv.Known(t)
 	if o.Path == "" {
-		o.Path = pgtest.DB(t)
+		o.Path = testenv.DB(t)
 	}
 	testenv.StoreCompression(&o)
 	switch {
 	case o.BlobDir == tableBlobs:
 		o.BlobDir = ""
-	case o.BlobDir == "" && (o.Path == ":memory:" || strings.HasPrefix(o.Path, "postgres")):
+	case o.BlobDir == "" && (o.Path == ":memory:" || strings.HasPrefix(o.Path, "postgres") || strings.HasPrefix(o.Path, "dynamodb:")):
 		// Blob bytes in files, as a SQLite file has them by default.
 		o.BlobDir = t.TempDir()
 	}
 	e, err := core.Open(o)
 	if err != nil {
+		testenv.SkipUnsupported(t, err)
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(New(e, sopts...))
-	env := &tenv{t: t, e: e, srv: srv, clock: c, auth: !o.AuthDisabled}
+	srv := httptest.NewServer(testenv.RecordUnsupported(t, New(e, sopts...)))
+	env := &tenv{t: t, e: e, srv: srv, clock: c, auth: !o.AuthDisabled, owner: testenv.Goroutine()}
 	t.Cleanup(func() {
 		srv.CloseClientConnections()
 		srv.Close()
@@ -241,6 +236,9 @@ func (e *tenv) do(q req) *resp {
 	}
 	defer r.Body.Close()
 	b, _ := io.ReadAll(r.Body)
+	if testenv.Goroutine() == e.owner {
+		testenv.Unsupported(e.t, r.StatusCode, b)
+	}
 	return &resp{Code: r.StatusCode, H: r.Header, Body: b}
 }
 

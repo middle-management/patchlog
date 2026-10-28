@@ -30,7 +30,7 @@ package core
 
 // keysOpen reports whether any of creds gets from n's /keys (§E.2.3) a key
 // opening resource name's content sealed under one of epochs.
-func (t *tx) keysOpen(n *nsRow, name string, epochs map[int]bool, creds []Credentials) bool {
+func (t *gate) keysOpen(n *nsRow, name string, epochs map[int]bool, creds []Credentials) bool {
 	if len(epochs) == 0 || n.purged {
 		return false
 	}
@@ -68,7 +68,7 @@ func (t *tx) keysOpen(n *nsRow, name string, epochs map[int]bool, creds []Creden
 // resource name (keysScope): K_r of name, if a's rules fix /resource to
 // it and a may read it, or K_e, if they don't fix it and a reads the
 // namespace unrestricted (§2.1, §E.2.3).
-func (t *tx) keysOpenResource(a *actor, name string) bool {
+func (t *gate) keysOpenResource(a *actor, name string) bool {
 	fixed, fixes := fixedNames(a)
 	if !fixes {
 		return t.readsUnrestricted(a)
@@ -84,6 +84,6 @@ func (t *tx) keysOpenResource(a *actor, name string) bool {
 // revKeyOpen reports whether any of creds gets keys opening revision row
 // of resource name as sealed namespace n serves it, under the epoch it is
 // served under there (revEpoch, §6.1 Read permission).
-func (t *tx) revKeyOpen(n *nsRow, name string, row *revRow, creds []Credentials) bool {
+func (t *gate) revKeyOpen(n *nsRow, name string, row *revRow, creds []Credentials) bool {
 	return t.keysOpen(n, name, map[int]bool{t.revEpoch(n, row): true}, creds)
 }

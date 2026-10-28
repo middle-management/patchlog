@@ -51,7 +51,7 @@ import (
 // and validates the resulting document: a schema document under that
 // marker, any other against the schema revision it names, each revision
 // of its closure under its own marker.
-func (t *tx) validateStep(step *stepState, sc *schemaCtx, pending map[string]any) (string, *Error) {
+func (t *gate) validateStep(step *stepState, sc *schemaCtx, pending map[string]any) (string, *Error) {
 	rules := t.docRules(step.id, step.doc, sc)
 	step.legacy = rules == schema.Legacy
 	return t.validateDoc(step.doc, rules, sc, pending)
@@ -110,7 +110,7 @@ func (t *tx) rowRules(seq int64) schema.Rules {
 
 // schemaRulesHeader is Rev.SchemaRules for revision row r served with
 // document b: its marker if b is a schema document, "" otherwise.
-func (t *tx) schemaRulesHeader(r *revRow, b []byte) string {
+func (t *gate) schemaRulesHeader(r *revRow, b []byte) string {
 	if !bytes.Contains(b, schemaDialectMember) {
 		return ""
 	}
@@ -165,7 +165,7 @@ func (t *tx) prefetchRules(seqs []int64) {
 // schemaRules is the rules marker of the schema revision ref resolved to
 // for the writer of sc (loadSchema): an earlier item's of the same write,
 // as docRules fixes it, or that of the row it was read from.
-func (t *tx) schemaRules(ref schema.Ref, sc *schemaCtx, pending map[string]any) schema.Rules {
+func (t *gate) schemaRules(ref schema.Ref, sc *schemaCtx, pending map[string]any) schema.Rules {
 	if d, ok := pending[ref.Path()]; ok {
 		id, err := ids.Parse(ref.Rev)
 		if err != nil {
@@ -183,7 +183,7 @@ func (t *tx) schemaRules(ref schema.Ref, sc *schemaCtx, pending map[string]any) 
 // validateDoc is step 5: resolve $schema and validate (§6.1) under rules,
 // the marker of the revision written, for a schema document. It returns
 // the document's $schema, if typed.
-func (t *tx) validateDoc(doc any, rules schema.Rules, sc *schemaCtx, pending map[string]any) (string, *Error) {
+func (t *gate) validateDoc(doc any, rules schema.Rules, sc *schemaCtx, pending map[string]any) (string, *Error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
 		return "", nil
@@ -318,7 +318,7 @@ func schemaErr(err error, path string) *Error {
 // way for the same writer (sc) every time: the result is kept for the
 // transaction (t.schemas), so a batch's documents typed by the same schemas
 // resolve and parse each once, not once for every document and $ref.
-func (t *tx) loadSchema(ref schema.Ref, sc *schemaCtx, pending map[string]any) (any, error) {
+func (t *gate) loadSchema(ref schema.Ref, sc *schemaCtx, pending map[string]any) (any, error) {
 	if d, ok := pending[ref.Path()]; ok {
 		return d, nil
 	}
@@ -367,7 +367,7 @@ type schemaLoaded struct {
 // schemaRefs is schema.Refs of d, the schema loadSchema resolved ref to,
 // kept with it for the transaction (t.schemas): every document typed by a
 // schema walks its $ref closure (validateDoc).
-func (t *tx) schemaRefs(ref schema.Ref, d any, sc *schemaCtx, pending map[string]any) []schema.Ref {
+func (t *gate) schemaRefs(ref schema.Ref, d any, sc *schemaCtx, pending map[string]any) []schema.Ref {
 	key := schemaKey{sc: sc, path: ref.Path()}
 	l, ok := t.schemas[key]
 	if _, own := pending[key.path]; own || !ok {
@@ -388,7 +388,7 @@ func (t *tx) schemaRefs(ref schema.Ref, d any, sc *schemaCtx, pending map[string
 // the epoch it is served under (schemaKeysOpen). A revision it can't read
 // there is ErrForbidden, which falls through to drafts in a branch
 // (loadSchema), as an absent one does.
-func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, int64, error) {
+func (t *gate) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, int64, error) {
 	n := t.schemaNS(ref.NS)
 	if n == nil || n.purged {
 		return nil, 0, schema.ErrUnavailable
@@ -437,7 +437,7 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, int64, error) {
 // Addendum E Levels). Only revisions written while n was e2e don't. One
 // from before a raise from sealed also takes the keys of the epoch it is
 // served under (§6.1 Read permission, schemaKeysOpen).
-func (t *tx) preRaiseSchema(n *nsRow, ref schema.Ref) bool {
+func (t *gate) preRaiseSchema(n *nsRow, ref schema.Ref) bool {
 	row := t.schemaRevRow(n, ref)
 	return row != nil && t.preRaiseOf(n, row) != nil
 }
@@ -446,7 +446,7 @@ func (t *tx) preRaiseSchema(n *nsRow, ref schema.Ref) bool {
 // of n (§6.1 Read permission): in the namespace written, with the write's
 // own grant; in any other, by the rule for other namespaces (§7.5), with
 // it or a grant in Source-Authorization.
-func (t *tx) schemaReadable(n *nsRow, name string, sc *schemaCtx) bool {
+func (t *gate) schemaReadable(n *nsRow, name string, sc *schemaCtx) bool {
 	if sc.target != nil && n.id == sc.target.id {
 		return t.canRead(n, t.config(n.configSeq), sc.a, name)
 	}
@@ -463,7 +463,7 @@ func (t *tx) schemaReadable(n *nsRow, name string, sc *schemaCtx) bool {
 // served under there, with the keys /keys gives for it as at E2 (Addendum
 // E Levels, preRaiseKeysOpen). Other namespaces need none here
 // (schemaReads is refused in sealed ones, §6.1).
-func (t *tx) schemaKeysOpen(n *nsRow, name string, row *revRow, sc *schemaCtx) bool {
+func (t *gate) schemaKeysOpen(n *nsRow, name string, row *revRow, sc *schemaCtx) bool {
 	if p := t.preRaiseOf(n, row); p != nil && p.sealed() {
 		return t.preRaiseKeysOpen(n, p, name, map[int]bool{t.preRaiseEpoch(p.m, row, p.raise): true}, sc.creds)
 	}
@@ -595,7 +595,7 @@ func (t *tx) prefetchSchemas(refs []schema.Ref) {
 
 // schemaRevRow finds revision ref.Rev of resource ref.Name in n: nil if
 // unknown, purged or a tombstone.
-func (t *tx) schemaRevRow(n *nsRow, ref schema.Ref) *revRow {
+func (t *gate) schemaRevRow(n *nsRow, ref schema.Ref) *revRow {
 	v := t.resolve(n, ref.Name, nil)
 	if v.head == nil || v.state == Purged || v.state == NotFound {
 		return nil
@@ -623,7 +623,7 @@ func (t *tx) schemaRevIn(n *nsRow, ref schema.Ref) (any, error) {
 }
 
 // schemaDocAt is the document of schema revision row.
-func (t *tx) schemaDocAt(row *revRow) (any, error) {
+func (t *gate) schemaDocAt(row *revRow) (any, error) {
 	// A revision with its patch set is the document its id determines:
 	// parsed once, kept apart from the document cache, which a large write
 	// fills with its own (docBytesAt).

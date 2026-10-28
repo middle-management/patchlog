@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/ids"
@@ -123,7 +124,7 @@ func ArchiveKey(ns, name, horizon string) string { return ns + "/" + name + "/" 
 // archiveDest resolves where a prune of a resource under rule archives to.
 // ok is false if there is nowhere to archive: no archiver, no default, or a
 // rule destination the operator doesn't (or no longer does) allow.
-func (t *tx) archiveDest(rule *RetentionRule) (dest string, ok bool) {
+func (t *gate) archiveDest(rule *RetentionRule) (dest string, ok bool) {
 	a := t.e.opt.Archiver
 	if a == nil {
 		return "", false
@@ -140,8 +141,36 @@ func (t *tx) archiveDest(rule *RetentionRule) (dest string, ok bool) {
 // writeArchive writes res's entries from fromSeq up to (excluding) h as an
 // archive and records it. It returns the archive's URL.
 func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *revRow, dest string) (string, error) {
-	var lastSeq int64
-	t.must(t.QueryRow(`SELECT MAX(seq) FROM revisions WHERE res = ? AND seq < ?`, res, h.seq).Scan(&lastSeq))
+	ab := t.archiveBundle(n, name, res, fromSeq, h)
+	ctx := t.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	u, err := t.e.opt.Archiver.Write(ctx, dest, ab.key, ab.b)
+	if err != nil {
+		return "", fmt.Errorf("writing archive %s: %w", ab.key, err)
+	}
+	_, err = t.Exec(`INSERT INTO archives (res, from_seq, to_seq, key, url, created) VALUES (?,?,?,?,?,?)`,
+		res, fromSeq, ab.lastSeq, ab.key, u, t.now.UnixMilli())
+	t.must(err)
+	return u, nil
+}
+
+// builtArchive is an archive to write: its bundle and key, its last
+// entry's seq, and the blobs its blob lines carry.
+type builtArchive struct {
+	b       *ArchiveBundle
+	key     string
+	lastSeq int64
+	bids    []ids.ID
+}
+
+// archiveBundle builds the archive of res's entries from fromSeq up to
+// (excluding) h (§8.6): the bundle streams them, with the grant lines
+// and blob lines they need, from the reads as the archiver writes it.
+func (t *gate) archiveBundle(n *nsRow, name string, res int64, fromSeq int64, h *revRow) *builtArchive {
+	// The chain is linear: the entry before the horizon is its parent.
+	lastSeq := h.parentSeq.Int64
 	first := t.rev(fromSeq)
 	b := &ArchiveBundle{
 		Origin:  t.e.opt.Origin,
@@ -160,16 +189,18 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 	b.Seal = t.archiveBundleSealer(n, res)
 	// The blobs the archived documents reference (§7.8: the archive has
 	// them), each before the first entry whose document references it.
-	blobsAt := map[int64][]ids.ID{}
-	brows, err := t.Query(`SELECT bid, from_seq FROM blob_refs WHERE res = ? AND from_seq <= ? AND (to_seq IS NULL OR to_seq > ?) ORDER BY from_seq, bid`, res, lastSeq, fromSeq)
-	t.must(err)
-	for brows.Next() {
-		var bid []byte
-		var from int64
-		t.must(brows.Scan(&bid, &from))
-		blobsAt[max(from, fromSeq)] = append(blobsAt[max(from, fromSeq)], ids.FromBytes(bid))
+	blobsAt := t.archivedBlobs(res, fromSeq, lastSeq)
+	out := &builtArchive{b: b, key: ArchiveKey(n.name, name, h.id.String()), lastSeq: lastSeq}
+	carried := map[ids.ID]bool{}
+	for _, bids := range blobsAt {
+		for _, bid := range bids {
+			if !carried[bid] {
+				carried[bid] = true
+				out.bids = append(out.bids, bid)
+			}
+		}
 	}
-	brows.Close()
+	slices.SortFunc(out.bids, func(x, y ids.ID) int { return bytes.Compare(x[:], y[:]) })
 	grantLines := map[ids.ID]bool{} // grants named by the archive: carried (true) or not
 	emitted := map[ids.ID]bool{}
 	emitBlobs := func(seq int64, yield func(ArchiveEntry) error) error {
@@ -182,90 +213,103 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 			if br == nil || br.pruned {
 				return fmt.Errorf("blob %s, which the archived range references, is no longer stored", bid)
 			}
-			ab := &ArchiveBlob{ID: bid.String(), Type: br.typ, Nonce: br.nonce, Data: t.readBytes(br.owner, br.hash)}
+			ab := &ArchiveBlob{ID: bid.String(), Type: br.typ, Nonce: br.nonce, Data: t.blobBytes(br)}
 			if err := yield(ArchiveEntry{Blob: ab}); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	b.Entries = func(yield func(ArchiveEntry) error) error {
-		after := fromSeq - 1
-		for {
-			// Batches, so no query is open while yield writes.
-			rows, err := t.Query(`SELECT `+revCols+` FROM revisions WHERE res = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT 256`, res, after, lastSeq)
-			if err != nil {
-				return err
-			}
-			var batch []*revRow
-			for rows.Next() {
-				r, err := scanRev(rows)
-				if err != nil {
-					rows.Close()
-					return err
+	emit := func(r *revRow, yield func(ArchiveEntry) error) error {
+		if err := emitBlobs(r.seq, yield); err != nil {
+			return err
+		}
+		le := t.logEntry(r)
+		if r.kind == kindRev && le.Patches == nil {
+			return fmt.Errorf("revision %s has no patch set to archive", le.ID)
+		}
+		ae := ArchiveEntry{ID: le.ID, Parent: le.Parent, Kind: le.Kind, Patches: le.Patches,
+			Author: le.Author, Created: le.Created, Signature: le.Signature, Gesture: le.Gesture, Undoes: le.Undoes, Via: le.Via}
+		if r.grantID != nil {
+			// The grant line comes before the first entry that names
+			// the grant (§8.6): archives carry them with the authors.
+			gid := ids.FromBytes(r.grantID)
+			carried, seen := grantLines[gid]
+			if !seen {
+				gl := t.archiveGrant(n, gid, time.UnixMilli(r.created))
+				carried = gl != nil
+				grantLines[gid] = carried
+				if carried {
+					if err := yield(ArchiveEntry{GrantLine: gl}); err != nil {
+						return err
+					}
 				}
-				batch = append(batch, r)
 			}
-			rows.Close()
+			if carried {
+				ae.Grant = gid.String()
+			}
+		}
+		return yield(ae)
+	}
+	b.Entries = func(yield func(ArchiveEntry) error) error {
+		if err := emit(first, yield); err != nil {
+			return err
+		}
+		after := fromSeq
+		for after < lastSeq {
+			// Batches, so no read is open while yield writes.
+			var batch []*revRow
+			t.revsBetween(res, after, lastSeq, 256, func(r *revRow) bool {
+				batch = append(batch, r)
+				return true
+			})
 			if len(batch) == 0 {
 				return nil
 			}
 			for _, r := range batch {
-				if err := emitBlobs(r.seq, yield); err != nil {
-					return err
-				}
-				le := t.logEntry(r)
-				if r.kind == kindRev && le.Patches == nil {
-					return fmt.Errorf("revision %s has no patch set to archive", le.ID)
-				}
-				ae := ArchiveEntry{ID: le.ID, Parent: le.Parent, Kind: le.Kind, Patches: le.Patches,
-					Author: le.Author, Created: le.Created, Signature: le.Signature, Gesture: le.Gesture, Undoes: le.Undoes, Via: le.Via}
-				if r.grantID != nil {
-					// The grant line comes before the first entry that names
-					// the grant (§8.6): archives carry them with the authors.
-					gid := ids.FromBytes(r.grantID)
-					carried, seen := grantLines[gid]
-					if !seen {
-						gl := t.archiveGrant(n, gid, time.UnixMilli(r.created))
-						carried = gl != nil
-						grantLines[gid] = carried
-						if carried {
-							if err := yield(ArchiveEntry{GrantLine: gl}); err != nil {
-								return err
-							}
-						}
-					}
-					if carried {
-						ae.Grant = gid.String()
-					}
-				}
-				if err := yield(ae); err != nil {
+				if err := emit(r, yield); err != nil {
 					return err
 				}
 				after = r.seq
 			}
 		}
+		return nil
 	}
-	key := ArchiveKey(n.name, name, h.id.String())
-	ctx := t.ctx
-	if ctx == nil {
-		ctx = context.Background()
+	return out
+}
+
+// blobBytes reads the plaintext bytes of an attachment whole.
+func (t *gate) blobBytes(br *blobRow) []byte {
+	c := t.openBytes(br.owner, br.hash)
+	if c.c != nil {
+		defer c.c.Close()
 	}
-	u, err := t.e.opt.Archiver.Write(ctx, dest, key, b)
-	if err != nil {
-		return "", fmt.Errorf("writing archive %s: %w", key, err)
-	}
-	_, err = t.Exec(`INSERT INTO archives (res, from_seq, to_seq, key, url, created) VALUES (?,?,?,?,?,?)`,
-		res, fromSeq, lastSeq, key, u, t.now.UnixMilli())
+	data, err := io.ReadAll(c.r)
 	t.must(err)
-	return u, nil
+	return data
+}
+
+// archivedBlobs are the blobs res's documents from fromSeq to lastSeq
+// reference, by the seq of the first of them (at least fromSeq) that does.
+func (t *tx) archivedBlobs(res, fromSeq, lastSeq int64) map[int64][]ids.ID {
+	blobsAt := map[int64][]ids.ID{}
+	brows, err := t.Query(`SELECT bid, from_seq FROM blob_refs WHERE res = ? AND from_seq <= ? AND (to_seq IS NULL OR to_seq > ?) ORDER BY from_seq, bid`, res, lastSeq, fromSeq)
+	t.must(err)
+	defer brows.Close()
+	for brows.Next() {
+		var bid []byte
+		var from int64
+		t.must(brows.Scan(&bid, &from))
+		blobsAt[max(from, fromSeq)] = append(blobsAt[max(from, fromSeq)], ids.FromBytes(bid))
+	}
+	return blobsAt
 }
 
 // archiveGrant builds the grant line of grant gid for an archive of
 // namespace n (§8.6, §G.4.1): the stored grant, the namespace whose entry
 // first recorded it, and the candidate keys. created is the time of the
 // first revision naming it. nil if the stored grant is gone.
-func (t *tx) archiveGrant(n *nsRow, gid ids.ID, created time.Time) *ArchiveGrant {
+func (t *gate) archiveGrant(n *nsRow, gid ids.ID, created time.Time) *ArchiveGrant {
 	g, ok := t.storedGrant(gid)
 	if !ok {
 		return nil
@@ -292,17 +336,10 @@ func (t *tx) archiveGrant(n *nsRow, gid ids.ID, created time.Time) *ArchiveGrant
 		cur = t.nsByID(cur.base.Int64)
 	}
 	for i := len(chain) - 1; i >= 0; i-- {
-		var seq, cfg, entryCreated int64
-		var err error
-		if chain[i].bound.Valid {
-			err = t.QueryRow(`SELECT seq, config_seq, created FROM ns_log WHERE grant_id = ? AND ns = ? AND seq <= ? ORDER BY seq LIMIT 1`, gid[:], chain[i].n.id, chain[i].bound.Int64).Scan(&seq, &cfg, &entryCreated)
-		} else {
-			err = t.QueryRow(`SELECT seq, config_seq, created FROM ns_log WHERE grant_id = ? AND ns = ? ORDER BY seq LIMIT 1`, gid[:], chain[i].n.id).Scan(&seq, &cfg, &entryCreated)
-		}
-		if errors.Is(err, sql.ErrNoRows) {
+		cfg, entryCreated, ok := t.grantFirstEntry(chain[i].n, gid, chain[i].bound)
+		if !ok {
 			continue
 		}
-		t.must(err)
 		out.NS = chain[i].n.name
 		for _, k := range t.config(cfg).Keys {
 			out.Keys = append(out.Keys, ArchiveCandidateKey{Kid: k.Kid, Pub: k.Pub})
@@ -310,12 +347,10 @@ func (t *tx) archiveGrant(n *nsRow, gid ids.ID, created time.Time) *ArchiveGrant
 		// Keys follow the base (§C.4): in a branch, the keys its local
 		// bases had at the entry's created are candidates too (§C.3.1).
 		for _, l := range chain[i+1:] {
-			var bcfg int64
-			err := t.QueryRow(`SELECT seq FROM ns_config WHERE ns = ? AND created <= ? ORDER BY seq DESC LIMIT 1`, l.n.id, entryCreated).Scan(&bcfg)
-			if errors.Is(err, sql.ErrNoRows) {
+			bcfg, ok := t.configAtTime(l.n, entryCreated)
+			if !ok {
 				continue
 			}
-			t.must(err)
 			for _, k := range t.config(bcfg).Keys {
 				out.Keys = append(out.Keys, ArchiveCandidateKey{Kid: k.Kid, Pub: k.Pub})
 			}
@@ -326,9 +361,45 @@ func (t *tx) archiveGrant(n *nsRow, gid ids.ID, created time.Time) *ArchiveGrant
 	return out
 }
 
+// grantFirstEntry is the first entry of n, up to bound if valid, that
+// records grant gid: its configuration and created time.
+func (t *tx) grantFirstEntry(n *nsRow, gid ids.ID, bound sql.NullInt64) (cfg, created int64, ok bool) {
+	var seq int64
+	var err error
+	if bound.Valid {
+		err = t.QueryRow(`SELECT seq, config_seq, created FROM ns_log WHERE grant_id = ? AND ns = ? AND seq <= ? ORDER BY seq LIMIT 1`, gid[:], n.id, bound.Int64).Scan(&seq, &cfg, &created)
+	} else {
+		err = t.QueryRow(`SELECT seq, config_seq, created FROM ns_log WHERE grant_id = ? AND ns = ? ORDER BY seq LIMIT 1`, gid[:], n.id).Scan(&seq, &cfg, &created)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, false
+	}
+	t.must(err)
+	return cfg, created, true
+}
+
+// configAtTime is n's configuration in force at created (milliseconds).
+func (t *tx) configAtTime(n *nsRow, created int64) (int64, bool) {
+	var seq int64
+	err := t.QueryRow(`SELECT seq FROM ns_config WHERE ns = ? AND created <= ? ORDER BY seq DESC LIMIT 1`, n.id, created).Scan(&seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false
+	}
+	t.must(err)
+	return seq, true
+}
+
+// firstEntryCreated is the created time of the deployment's first
+// namespace entry.
+func (t *tx) firstEntryCreated() (int64, bool) {
+	var ms sql.NullInt64
+	t.must(t.QueryRow(`SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms))
+	return ms.Int64, ms.Valid
+}
+
 // operatorKeysAt lists the operator keys in force at created (§C.4), as
 // the deployment publishes them (OperatorKeyHistory in a transaction).
-func (t *tx) operatorKeysAt(created time.Time) []ArchiveCandidateKey {
+func (t *gate) operatorKeysAt(created time.Time) []ArchiveCandidateKey {
 	o := &t.e.opt
 	type period struct {
 		kid         string
@@ -349,11 +420,9 @@ func (t *tx) operatorKeysAt(created time.Time) []ArchiveCandidateKey {
 		if first.IsZero() {
 			// In force from the deployment's first namespace entry, as
 			// Engine.OperatorKeyHistory publishes it.
-			var ms sql.NullInt64
-			t.must(t.QueryRow(`SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms))
 			first = t.e.started
-			if ms.Valid {
-				first = time.UnixMilli(ms.Int64).UTC()
+			if ms, ok := t.firstEntryCreated(); ok {
+				first = time.UnixMilli(ms).UTC()
 			}
 		}
 		ps = append(ps, period{k.Kid, k.Pub, first, time.Time{}})
@@ -381,7 +450,7 @@ func (t *tx) archiveURL(res, seq int64) string {
 }
 
 // prunedInfo is the horizon and archive of the 410 of §7.1.
-func (t *tx) prunedInfo(pe *prunedError) (horizon, archive string) {
+func (t *gate) prunedInfo(pe *prunedError) (horizon, archive string) {
 	return t.horizonID(pe.res), t.archiveURL(pe.res, pe.seq)
 }
 
@@ -491,6 +560,11 @@ type ArchiveRecord struct {
 // Archives lists the archives of unpurged resources, optionally only of one
 // namespace or one resource, in chain order per resource.
 func (e *Engine) Archives(ctx context.Context, ns, name string) ([]ArchiveRecord, error) {
+	return e.be.archives(ctx, ns, name)
+}
+
+// sqlArchives is Archives on SQL.
+func (e *Engine) sqlArchives(ctx context.Context, ns, name string) ([]ArchiveRecord, error) {
 	var out []ArchiveRecord
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT n.name, r.name, a.key, a.url, a.from_seq, a.to_seq, a.created
@@ -547,6 +621,11 @@ type RestoreResult struct {
 // entries is called inside the write transaction: once, or again if
 // Postgres rolls the transaction back to run it again (pglock.go).
 func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries func(yield func(ArchiveEntry) error) error) (*RestoreResult, error) {
+	return e.be.restore(ctx, ns, name, entries)
+}
+
+// sqlRestore is RestoreResource on SQL.
+func (e *Engine) sqlRestore(ctx context.Context, ns, name string, entries func(yield func(ArchiveEntry) error) error) (*RestoreResult, error) {
 	out := &RestoreResult{}
 	err := e.update(ctx, func(t *tx) error {
 		*out = RestoreResult{}

@@ -16,6 +16,7 @@ import (
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/pgtest"
+	"github.com/middle-management/patchlog/internal/testenv"
 	"github.com/middle-management/patchlog/internal/verify"
 )
 
@@ -59,6 +60,7 @@ func newShutdownEnv(t *testing.T, lopt lifecycle.Options) *sdEnv {
 	}
 	e, err := core.Open(o)
 	if err != nil {
+		testenv.SkipUnsupported(t, err)
 		t.Fatal(err)
 	}
 	ts := httptest.NewUnstartedServer(New(e))

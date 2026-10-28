@@ -1,0 +1,9 @@
+# Known divergences of the DynamoDB backend (internal/testenv/backend.go):
+# tests that run on it and answer differently from the SQL backends, or
+# fail on a feature it lacks where no skip could reach (a service's own
+# call to the core). One "pkg/TestName why" a line; fixing one means
+# deleting its line. PATCHLOG_TEST_KNOWN=run runs them.
+
+# Divergences: the backend answers differently from the spec.
+
+# Unsupported features met where the harness cannot skip.

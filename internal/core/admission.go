@@ -22,7 +22,7 @@ import (
 // bounds the read: in a public namespace, which reads without a grant
 // (§7), with authentication disabled (§1), and for a grant whose blocks
 // carry no exp.
-func (t *tx) admittedUntil(n *nsRow, cred Credentials, a *actor) time.Time {
+func (t *gate) admittedUntil(n *nsRow, cred Credentials, a *actor) time.Time {
 	switch {
 	case t.cachePublic(n) || t.e.opt.AuthDisabled:
 		return time.Time{}

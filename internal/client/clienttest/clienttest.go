@@ -22,7 +22,6 @@ import (
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
-	"github.com/middle-management/patchlog/internal/pgtest"
 	"github.com/middle-management/patchlog/internal/server"
 	"github.com/middle-management/patchlog/internal/testenv"
 
@@ -97,8 +96,8 @@ type nopPurger struct{}
 
 func (nopPurger) PurgeTags([]string) {}
 
-// New starts a server on an in-memory database (or a fresh Postgres one,
-// see pgtest); it stops with the test.
+// New starts a server on the backend under test (testenv.DB: an in-memory
+// SQLite database by default); it stops with the test.
 func New(t testing.TB, opt Options) *Server {
 	t.Helper()
 	if opt.LongPoll == 0 {
@@ -107,7 +106,8 @@ func New(t testing.TB, opt Options) *Server {
 	if opt.Start.IsZero() {
 		opt.Start = time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
 	}
-	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}, KeyStore: opt.KeyStore,
+	testenv.Known(t)
+	o := core.Options{Path: testenv.DB(t), BlobDir: testenv.BlobDir(t), Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}, KeyStore: opt.KeyStore,
 		Archiver: opt.Archiver, RetentionInterval: -1}
 	if opt.LogPageSize > 0 || opt.LogPageBytes > 0 {
 		o.Maximums = core.DefaultMaximums()
@@ -135,6 +135,7 @@ func New(t testing.TB, opt Options) *Server {
 	}
 	e, err := core.Open(o)
 	if err != nil {
+		testenv.SkipUnsupported(t, err)
 		t.Fatal(err)
 	}
 	s.Engine = e
@@ -142,7 +143,7 @@ func New(t testing.TB, opt Options) *Server {
 	if opt.Wrap != nil {
 		h = opt.Wrap(h)
 	}
-	s.HTTP = httptest.NewServer(CountPages(h))
+	s.HTTP = httptest.NewServer(CountPages(testenv.RecordUnsupported(t, h)))
 	s.URL = s.HTTP.URL
 	t.Cleanup(func() {
 		s.HTTP.CloseClientConnections()
@@ -237,12 +238,46 @@ func (s *Server) AuthProxy(t testing.TB, mode string) string {
 // at GET / that authentication is disabled (§1, client.AuthDisabled).
 func (s *Server) Client(t testing.TB, opts ...client.Option) *client.Client {
 	t.Helper()
+	// A 501 {"code":"unsupported"} skips the test: the backend under test
+	// hasn't built the feature (testenv.Unsupported). First, so a test's
+	// own WithTransport wraps it.
+	opts = append([]client.Option{client.WithTransport(skipUnsupported(t))}, opts...)
 	c, err := client.New(s.URL, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return c
 }
+
+// skipUnsupported wraps a client's transport to skip t on the backend's
+// 501 {"code":"unsupported"} (testenv.Unsupported), when the request runs
+// on the goroutine that made the client — the test's, for its own
+// requests. A skip can't end a test from another goroutine (a service's
+// handler calling the core, say), so there the answer passes on; the
+// server records it (Unsupported) for the test's failure to name.
+func skipUnsupported(t testing.TB) func(http.RoundTripper) http.RoundTripper {
+	owner := testenv.Goroutine()
+	return func(rt http.RoundTripper) http.RoundTripper {
+		return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			resp, err := rt.RoundTrip(r)
+			if err != nil || resp.StatusCode != http.StatusNotImplemented || testenv.Goroutine() != owner {
+				return resp, err
+			}
+			b, rerr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if rerr != nil {
+				return nil, rerr
+			}
+			testenv.Unsupported(t, resp.StatusCode, b)
+			resp.Body = io.NopCloser(bytes.NewReader(b))
+			return resp, nil
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 // OperatorGrant mints a grant with the operator key allowing the creation
 // of namespace ns (§C.4).

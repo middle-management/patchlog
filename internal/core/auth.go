@@ -52,13 +52,9 @@ func (a *actor) envelope() any {
 // authenticate verifies credentials against the configuration in force in
 // namespace n (§C.2 item 1). keysOverride replaces the namespace's keys, for
 // namespace creation with operator keys (then n and cfg may be nil).
-func (t *tx) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials, keysOverride []grant.Key) (*actor, *Error) {
+func (t *gate) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials, keysOverride []grant.Key) (*actor, *Error) {
 	if t.e.opt.AuthDisabled {
-		name := cred.Author
-		if name == "" {
-			name = "anonymous"
-		}
-		return &actor{principal: grant.Principal{ID: name}, star: true, bucketKey: name, noAuth: true}, nil
+		return devActor(cred), nil
 	}
 	g, err := t.decodeGrant(nsName, cred)
 	if err != nil {
@@ -78,7 +74,7 @@ func (t *tx) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials
 // 401 without a parseable grant, one whose rules don't compile included
 // (§6.6), 403 when it doesn't name the namespace, whether or not the
 // namespace exists.
-func (t *tx) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error) {
+func (t *gate) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error) {
 	if cred.Bearer == "" {
 		return nil, apiErr(401, "unauthenticated", "message", "missing grant")
 	}
@@ -186,7 +182,7 @@ func nsNotNamed(ns string) *Error {
 
 // verifyGrant verifies a decoded grant against namespace n's configuration
 // in force, or against keysOverride (operator keys).
-func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, keysOverride []grant.Key) (*actor, *Error) {
+func (t *gate) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, keysOverride []grant.Key) (*actor, *Error) {
 	env := grant.Env{
 		Now:           t.now,
 		NS:            nsName,
@@ -222,13 +218,13 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 // no key of the namespace can verify it. Operator grants authorise only
 // creating namespaces and forcing purges (§C.4): any other request under
 // one is 401, as for an existing namespace whose keys don't list it.
-func (t *tx) absentNS(nsName string, cred Credentials) *Error {
+func (t *gate) absentNS(nsName string, cred Credentials) *Error {
 	return t.absentNSOp(nsName, cred, false)
 }
 
 // absentNSOp is absentNS for a request an operator grant may authorise
 // (operator: a forced purge): a usable operator grant then gets 404.
-func (t *tx) absentNSOp(nsName string, cred Credentials, operator bool) *Error {
+func (t *gate) absentNSOp(nsName string, cred Credentials, operator bool) *Error {
 	if t.e.opt.AuthDisabled {
 		return notFound()
 	}
@@ -292,7 +288,7 @@ func validateAttrs(schema any, attrs map[string]any) error {
 //
 // Keys don't follow a base in another deployment (§7.6, §G.3): a remote
 // branch's keys are its own.
-func (t *tx) effectiveKeys(n *nsRow, cfg *Config) []grant.Key {
+func (t *gate) effectiveKeys(n *nsRow, cfg *Config) []grant.Key {
 	if !n.isBranch() || t.remoteShadow(n) != nil {
 		return cfg.Keys
 	}
@@ -322,7 +318,7 @@ func findKey(ks []grant.Key, kid string) (grant.Key, bool) {
 
 // effectiveRevoked merges the revocations of the namespace and all its
 // bases in this deployment; they stop at a remote base (§7.6, §G.3).
-func (t *tx) effectiveRevoked(n *nsRow, cfg *Config) map[string]bool {
+func (t *gate) effectiveRevoked(n *nsRow, cfg *Config) map[string]bool {
 	if !n.isBranch() || t.remoteShadow(n) != nil {
 		return cfg.Revoked
 	}
@@ -344,7 +340,7 @@ func (t *tx) effectiveRevoked(n *nsRow, cfg *Config) map[string]bool {
 // some point within maxLag before the grant was issued (or later). maxLag
 // is the target namespace's (default 60 seconds), or the key's when that
 // is stricter.
-func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
+func (t *gate) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 	return func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 		target := n
 		if s, ok := requireAt.(string); ok {
@@ -372,8 +368,8 @@ func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxL
 		if !ok {
 			return fmt.Errorf("at is not in the chain of %s", target.name)
 		}
-		var nextMs int64
-		if err := t.QueryRow(`SELECT created FROM ns_log WHERE ns = ? AND prev_seq = ?`, target.id, seq).Scan(&nextMs); err != nil {
+		nextMs, ok := t.nextEntryCreated(target.id, seq)
+		if !ok {
 			return nil // at is still the head
 		}
 		next := time.UnixMilli(nextMs)
@@ -385,8 +381,18 @@ func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxL
 	}
 }
 
+// nextEntryCreated is the created time of the entry of ns after entry
+// seq; false if seq is the head.
+func (t *tx) nextEntryCreated(ns, seq int64) (int64, bool) {
+	var ms int64
+	if err := t.QueryRow(`SELECT created FROM ns_log WHERE ns = ? AND prev_seq = ?`, ns, seq).Scan(&ms); err != nil {
+		return 0, false
+	}
+	return ms, true
+}
+
 // basicEnvelope is the envelope of step 1 and of reads.
-func (t *tx) basicEnvelope(action, resource string, a *actor) map[string]any {
+func (t *gate) basicEnvelope(action, resource string, a *actor) map[string]any {
 	env := map[string]any{"action": action, "now": t.now.Format("2006-01-02T15:04:05.000Z")}
 	if resource != "" {
 		env["resource"] = resource
@@ -399,7 +405,7 @@ func (t *tx) basicEnvelope(action, resource string, a *actor) map[string]any {
 
 // authorize is step 1 of §6.2 for one verb: verbs, and the grant, key and
 // role rules that refer only to the request. It does not rate-limit.
-func (t *tx) authorize(a *actor, verb, resource string) *Error {
+func (t *gate) authorize(a *actor, verb, resource string) *Error {
 	if a.verified == nil {
 		return nil
 	}
@@ -428,7 +434,7 @@ func compileCached(v any) (*rules.Rule, error) {
 
 // canRead decides read access to a namespace, optionally for one resource
 // (§C.2 item 5, §C.5).
-func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
+func (t *gate) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 	if cfg.Read == "public" || t.e.opt.AuthDisabled {
 		return true
 	}
@@ -450,7 +456,7 @@ func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 // nor the namespace's existence is revealed (§7, §C.2 item 1). Past the
 // check, a resource whose source was raised to a level this server lacks
 // answers 502 upstream (upstreamRefusal, §1).
-func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error) {
+func (t *gate) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	var a *actor
 	var err *Error
@@ -469,7 +475,7 @@ func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error
 // listing (anyReader): they need unrestricted read (readsNS, §2.1). A
 // grant that may read only some resources gets the answer of any read it
 // may not make.
-func (t *tx) nsReader(n *nsRow, cred Credentials) (*actor, *Error) {
+func (t *gate) nsReader(n *nsRow, cred Credentials) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
 		return t.edgeReader(n, cred.Edge, "")
@@ -480,7 +486,7 @@ func (t *tx) nsReader(n *nsRow, cred Credentials) (*actor, *Error) {
 // anyReader is reader for a request that answers any reader of the
 // namespace, filtered to what it may read (the gestures listing, §7.4):
 // a grant with read, whatever its rules say about resources.
-func (t *tx) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
+func (t *gate) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
 		return t.edgeReader(n, cred.Edge, "")
@@ -499,7 +505,7 @@ func (t *tx) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
 // maxTtl, requireAt, readScope …) is 403 there, as for a write: only a
 // read of a resource URL in a private namespace answers 404 (§C.2 item
 // 1, §7). A verified grant that may not read is 404.
-func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
+func (t *gate) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
 	return t.readerCheckURL(n, cred, may, readNS)
 }
 
@@ -508,7 +514,7 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 // that doesn't name the namespace is 403, one that can't be used 401, and
 // one its key's scope refuses 403 (§C.2 item 1), as at
 // GET /ns/{ns}/principal.
-func (t *tx) keysReader(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
+func (t *gate) keysReader(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
 	return t.readerCheckURL(n, cred, may, readKeys)
 }
 
@@ -524,7 +530,7 @@ const (
 // readerCheckURL is readerCheck for a kind of read: a public namespace
 // ignores the grant, but at POST /ns/{ns}/keys, and a key-scope failure is
 // 404 at a resource URL.
-func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, kind readKind) (*actor, *Error) {
+func (t *gate) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, kind readKind) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	var a *actor
 	if t.e.opt.AuthDisabled {
@@ -576,7 +582,7 @@ func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, k
 // rules over the rest of the envelope applying to their own write at step
 // 6; a role that counts for read must pass all its rules against the read
 // envelope, as a read does (item 5), whatever they refer to.
-func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
+func (t *gate) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 	if cfg.Read == "public" && !stepOne || t.e.opt.AuthDisabled {
 		return true
 	}
@@ -730,22 +736,25 @@ func (rl *rateLimiter) admit(now time.Time, draws []draw) (time.Duration, string
 
 // rateLimit draws a request's tokens: one per resource from each
 // per-resource bucket, and items from the principal and namespace buckets.
-func (t *tx) rateLimit(n *nsRow, cfg *Config, a *actor, resources []string, items int) *Error {
+func (t *gate) rateLimit(n *nsRow, cfg *Config, a *actor, resources []string, items int) *Error {
 	return t.admit(t.writeDraws(n, cfg, a, resources, items))
 }
 
 // writeDraws are the draws of a write (rateLimit).
-func (t *tx) writeDraws(n *nsRow, cfg *Config, a *actor, resources []string, items int) []draw {
-	l := cfg.Limits
-	// An allowance's own bucket replaces the principal and namespace
-	// buckets; per-resource buckets still apply (§6.6).
-	d := t.principalDraw(n, cfg, a, float64(items))
+func (t *gate) writeDraws(n *nsRow, cfg *Config, a *actor, resources []string, items int) []draw {
+	return writeDraws(n.name, cfg.Limits, principalDraw(n.name, cfg, a, float64(items), t.now), a.bucketKey, resources, items)
+}
+
+// writeDraws are a write's draws given its principal's (principalDraw):
+// an allowance's own bucket replaces the principal and namespace buckets;
+// per-resource buckets still apply (§6.6).
+func writeDraws(ns string, l Limits, d draw, bucketKey string, resources []string, items int) []draw {
 	draws := []draw{d}
 	if d.name != "allowance" {
-		draws = append(draws, draw{"n\x00" + n.name, l.RatePerNamespace, float64(items), "ratePerNamespace"})
+		draws = append(draws, draw{"n\x00" + ns, l.RatePerNamespace, float64(items), "ratePerNamespace"})
 	}
 	for _, r := range resources {
-		draws = append(draws, draw{"r\x00" + n.name + "\x00" + r + "\x00" + a.bucketKey, l.RatePerResource, 1, "ratePerResource"})
+		draws = append(draws, draw{"r\x00" + ns + "\x00" + r + "\x00" + bucketKey, l.RatePerResource, 1, "ratePerResource"})
 	}
 	return draws
 }
@@ -753,9 +762,9 @@ func (t *tx) writeDraws(n *nsRow, cfg *Config, a *actor, resources []string, ite
 // principalDraw is the draw of cost tokens from the principal's bucket in
 // n, lowered to its key's rate, or from its allowance's bucket if that
 // has a rate (§6.6).
-func (t *tx) principalDraw(n *nsRow, cfg *Config, a *actor, cost float64) draw {
-	if al := t.allowanceOf(cfg, a); al != nil && al.Rate.Rate > 0 {
-		return draw{"a\x00" + n.name + "\x00" + al.Sub + "\x00" + al.Kid, al.Rate, cost, "allowance"}
+func principalDraw(ns string, cfg *Config, a *actor, cost float64, now time.Time) draw {
+	if al := allowanceOf(cfg, a, now); al != nil && al.Rate.Rate > 0 {
+		return draw{"a\x00" + ns + "\x00" + al.Sub + "\x00" + al.Kid, al.Rate, cost, "allowance"}
 	}
 	pr := cfg.Limits.RatePerPrincipal
 	if a.keyRate != nil && a.keyRate.Rate < pr.Rate {
@@ -766,7 +775,7 @@ func (t *tx) principalDraw(n *nsRow, cfg *Config, a *actor, cost float64) draw {
 
 // blobDraw is the draw of an upload's bytes from the principal's blobRate
 // bucket, or its allowance's (§6.6, §7.8).
-func (t *tx) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
+func (t *gate) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
 	if al := t.allowanceOf(cfg, a); al != nil && al.BlobRate.Rate > 0 {
 		return draw{"ab\x00" + n.name + "\x00" + al.Sub + "\x00" + al.Kid, al.BlobRate, float64(size), "allowance.blobRate"}
 	}
@@ -777,16 +786,27 @@ func (t *tx) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
 // rounded up, and in the body retryAfter, the wait in seconds as a decimal
 // (rounded up to the millisecond), which a client under a fast allowance
 // waits by instead.
-func (t *tx) admit(draws []draw) *Error {
+func (t *gate) admit(draws []draw) *Error {
+	ctx := t.opCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return t.e.admit(ctx, t.now, draws)
+}
+
+// admit is gate.admit at now, for a backend without transactions (ddb.go):
+// the shared buckets' store if there is one, else this instance's.
+func (e *Engine) admit(ctx context.Context, now time.Time, draws []draw) *Error {
 	var wait time.Duration
 	var hit string
 	var ok bool
-	if s := t.e.rate.store; s != nil {
+	if s := e.rate.store; s != nil {
 		var err error
-		wait, hit, ok, err = s.admit(t.ctx, t.now, draws)
-		t.must(err)
+		if wait, hit, ok, err = s.admit(ctx, now, draws); err != nil {
+			panic(err)
+		}
 	} else {
-		wait, hit, ok = t.e.rate.admit(t.now, draws)
+		wait, hit, ok = e.rate.admit(now, draws)
 	}
 	if !ok {
 		secs := int(math.Ceil(wait.Seconds()))
@@ -828,12 +848,25 @@ func (rl *rateLimiter) charge(now time.Time, d draw) {
 // ended doesn't hide a later one (§6.6 Allowances). Without a verified
 // grant (authentication disabled) there is no signing key, and an entry
 // matches on sub alone.
-func (t *tx) allowanceOf(cfg *Config, a *actor) *Allowance {
+func (t *gate) allowanceOf(cfg *Config, a *actor) *Allowance { return allowanceOf(cfg, a, t.now) }
+
+// allowanceOf is gate.allowanceOf at now.
+func allowanceOf(cfg *Config, a *actor, now time.Time) *Allowance {
 	kid := ""
 	if a.verified != nil {
 		kid = a.verified.Key.Kid
 	}
-	return cfg.allowanceAt(t.now, a.principal.ID, kid)
+	return cfg.allowanceAt(now, a.principal.ID, kid)
+}
+
+// devActor is the principal of a request with authentication disabled
+// (-dev): the X-Author name, a * key, bucketed by name.
+func devActor(cred Credentials) *actor {
+	name := cred.Author
+	if name == "" {
+		name = "anonymous"
+	}
+	return &actor{principal: grant.Principal{ID: name}, star: true, bucketKey: name, noAuth: true}
 }
 
 // guardedPaths need a grant chained to a * key (§7.4, §C.2): a config

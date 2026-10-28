@@ -28,6 +28,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -131,8 +133,10 @@ type Options struct {
 	LockedCheckBytes int
 	// GroupCommit: on Postgres, at most how many checked resource writes
 	// and batches of one namespace one transaction appends and commits at
-	// once (group commit, D.8; groupcommit.go). Zero means 32; 1 or less
-	// turns group commit off, so every write commits on its own.
+	// once (group commit, D.8; groupcommit.go); on DynamoDB, of its
+	// resource writes, further bounded by the transaction's 100 actions
+	// (internal/ddbstore/group.go). Zero means 32; 1 or less turns group
+	// commit off, so every write commits on its own.
 	GroupCommit int
 	// GroupCommitWait is at most how long a group waits for writes of its
 	// namespace still in their check phase (zero means 200µs; negative,
@@ -229,8 +233,11 @@ func (logPurger) PurgeTags(tags []string) { log.Printf("cdn purge %v", tags) }
 
 // Engine is the patch-log service.
 type Engine struct {
-	db        *sql.DB
-	pg        bool // Postgres (Addendum D.8), not SQLite
+	db *sql.DB
+	pg bool // Postgres (Addendum D.8), not SQLite
+	// be is the storage (backend.go): sqlBackend over db, or another
+	// backend, db then nil.
+	be        backend
 	opt       Options
 	mu        sync.Mutex // serialises write transactions
 	blobs     blobStore
@@ -382,6 +389,11 @@ func Open(opt Options) (*Engine, error) {
 	if err := checkStoreCompression(&opt); err != nil {
 		return nil, err
 	}
+	for _, r := range backends {
+		if r.handles(opt.Path) {
+			return r.open(opt)
+		}
+	}
 	db, pg, err := openDB(opt.Path)
 	if err != nil {
 		return nil, err
@@ -409,6 +421,7 @@ func Open(opt Options) (*Engine, error) {
 		stop:       make(chan struct{}),
 		started:    opt.Now().UTC(),
 	}
+	e.be = sqlBackend{e}
 	e.rc.maxBytes = opt.ReadCacheBytes
 	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
 	if err := e.checkKeyStore(); err != nil {
@@ -488,6 +501,11 @@ func Open(opt Options) (*Engine, error) {
 func (e *Engine) Close() error {
 	e.closeOnce.Do(func() { close(e.stop) })
 	e.bg.Wait()
+	return e.be.close()
+}
+
+// sqlClose closes the database (Close, on SQL).
+func (e *Engine) sqlClose() error {
 	e.resign()
 	e.stmts.close()
 	err := e.db.Close()
@@ -497,7 +515,9 @@ func (e *Engine) Close() error {
 }
 
 // Ping checks that the database is reachable (the /_ready check).
-func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) }
+func (e *Engine) Ping(ctx context.Context) error {
+	return e.be.ping(ctx)
+}
 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
@@ -590,10 +610,12 @@ func limitKeyErr(status int, key, msg string) *Error {
 // tx is one database transaction with the engine's helpers.
 type tx struct {
 	*sql.Tx
+	// The write gate's state and logic (gate.go): its fields and methods
+	// resolve on the transaction as they always did, and the gate reads
+	// through the transaction (checkReads).
+	*checkState
+	*gate
 	ctx    context.Context
-	e      *Engine
-	now    time.Time
-	write  bool
 	notify map[string]bool // namespaces whose logs changed
 	tags   []string        // cache tags to purge after commit
 	// lastNS is the seq of the last namespace entry this transaction
@@ -604,23 +626,6 @@ type tx struct {
 	// a namespace's log: its configuration, or a purge (readcache.go).
 	metaChanged bool
 	docPuts     []docPut // documents to cache after commit
-	// reqCreds are the request's grant and those of Source-Authorization,
-	// for an in_use answer's referencing list (§6.1, the rule for other
-	// namespaces of §7.5).
-	reqCreds []Credentials
-	// decoded are bearer grants this transaction already decoded and
-	// hasn't verified (decodeGrant), so a request naming many namespaces
-	// decodes each grant once (POST /edge-grants).
-	decoded map[string]*grant.Grant
-	// deps, when set, records what a write's check phase read that a
-	// concurrent write could change (D.3 re-check).
-	deps *writeDeps
-	// schemas are the schema paths resolved in this transaction, per
-	// writer (loadSchema).
-	schemas map[schemaKey]schemaLoaded
-	// rateDrawn, when set, records that a write drew its rate-limit tokens,
-	// so a transaction run again doesn't draw them twice.
-	rateDrawn *bool
 	// memo and dirty: rows read in this transaction, and whether it has
 	// written (memo.go).
 	memo    memo
@@ -677,9 +682,6 @@ type tx struct {
 	// sharedNS is the namespace a resource write or batch appends to
 	// holding its lock only shared (pglock.go); 0 if none.
 	sharedNS int64
-	// exclusive makes a resource write or batch lock its namespace
-	// exclusively, as other writes do (writeLocked's last attempt).
-	exclusive bool
 	// Blob files (blobstore.go): those this transaction stored, deleted
 	// if it rolls back, and those whose rows it deleted, deleted once it
 	// has committed.
@@ -720,7 +722,7 @@ func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
 		}
 		err = ctxErr(ctx, err)
 	}()
-	return f(&tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now()})
+	return f(newTx(sqlTx, ctx, e, false))
 }
 
 // ctxErr reports a failure after ctx ended as the context's error: database/sql
@@ -735,8 +737,19 @@ func ctxErr(ctx context.Context, err error) error {
 
 // panicErr turns a recovered panic (t.must) into an error, keeping a panicked
 // error wrapped so constraint violations can be recognised (D.3).
+//
+// A runtime fault (a nil dereference, an index out of range) or a panic
+// with something other than an error is a bug, not a failed statement:
+// it is logged with the panicking stack, which the answer's 500 loses.
+// panicErr must be called from the deferred function that recovered p,
+// so the stack still holds the panic's frames.
 func panicErr(p any) error {
-	if pe, ok := p.(error); ok {
+	pe, ok := p.(error)
+	var re runtime.Error
+	if !ok || errors.As(pe, &re) {
+		log.Printf("internal error: %v\n%s", p, debug.Stack())
+	}
+	if ok {
 		return fmt.Errorf("internal error: %w", pe)
 	}
 	return fmt.Errorf("internal error: %v", p)
@@ -786,7 +799,8 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 	if err != nil {
 		return nil, err
 	}
-	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}}
+	t := newTx(sqlTx, ctx, e, true)
+	t.notify = map[string]bool{}
 	committing := false
 	defer func() {
 		if p := recover(); p != nil {
@@ -915,7 +929,7 @@ func (e *Engine) invalidate(inv invalidation, seen bool) {
 	}
 }
 
-func (t *tx) must(err error) {
+func (t *gate) must(err error) {
 	if err != nil {
 		panic(err)
 	}
@@ -1324,6 +1338,15 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 // via (§6.4.1, §C.1) and revisions.via (writtenBy) record them, or NULL
 // when there are none. Served unhashed with the entry (§7.4); entries the
 // server writes itself record none, nor do entries from before the column.
+// viaOf is grantVia of a's grant as the store records it: "" for none.
+func viaOf(a *actor) string {
+	if a == nil || a.grant == nil {
+		return ""
+	}
+	v, _ := grantVia(a.grant).(string)
+	return v
+}
+
 func grantVia(g *grant.Grant) any {
 	var via []any
 	for _, b := range g.Blocks {

@@ -42,7 +42,7 @@ func resourceEvents(es []map[string]any, name string) []map[string]any {
 // sealResourceEvents seals the events' data es of resource name of the
 // sealed namespace n, one JWE each, under K_r of n's current epoch with pl
 // { ns, name, kind } (§E.2.2).
-func (t *tx) sealResourceEvents(n *nsRow, name string, es []map[string]any) []string {
+func (t *gate) sealResourceEvents(n *nsRow, name string, es []map[string]any) []string {
 	if len(es) == 0 {
 		return nil
 	}

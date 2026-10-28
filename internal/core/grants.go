@@ -68,8 +68,8 @@ type GrantDoc struct {
 func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*GrantDoc, error) {
 	var out *GrantDoc
 	var job *sealJob
-	var nsRowID int64
-	err := e.read(ctx, func(t *tx) error {
+	var nsRowName string
+	err := e.gateRead(ctx, func(t *gate) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -92,7 +92,7 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 		out = &GrantDoc{ID: id.String(), Root: g.Blocks[0].Raw, Stored: base64.RawURLEncoding.EncodeToString(g.Stored()), Public: public}
 		switch t.nsLevel(n) {
 		case levelSealed:
-			nsRowID = n.id
+			nsRowName = n.name
 			job = t.grantJob(n, id, func() []byte {
 				return jsonv.Canonical(map[string]any{"id": out.ID, "root": out.Root, "stored": out.Stored})
 			})
@@ -103,7 +103,7 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 			// (Addendum E Levels, preRaiseGrant).
 			out.Private = true
 			if m, raise, seq := t.preRaiseGrant(n, id); m != nil {
-				nsRowID = m.id
+				nsRowName = m.name
 				job = t.preRaiseGrantJob(m, raise, id, seq, func() []byte {
 					return jsonv.Canonical(map[string]any{"id": out.ID, "root": out.Root, "stored": out.Stored})
 				})
@@ -112,7 +112,7 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 		return nil
 	})
 	if err == nil && job != nil {
-		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
+		if err = e.finishSeal(ctx, nsRowName, []*sealJob{job}); err == nil {
 			out.JWE = job.jwe
 		}
 	}
@@ -146,7 +146,7 @@ func (t *tx) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
 // preRaiseGrantJob is grantJob for grant id, first recorded by m's entry
 // seq before m's raise from sealed: sealed under that entry's epoch, as
 // at E2, padded as m padded before the raise (Addendum E Levels).
-func (t *tx) preRaiseGrantJob(m *nsRow, raise *e2eRaise, id ids.ID, seq int64, plain func() []byte) *sealJob {
+func (t *gate) preRaiseGrantJob(m *nsRow, raise *e2eRaise, id ids.ID, seq int64, plain func() []byte) *sealJob {
 	j := &sealJob{kind: sealGrant, key: grantSealKey(id)}
 	if t.stored(m, j) {
 		return j
@@ -184,13 +184,11 @@ func (t *tx) recordsGrant(n *nsRow, id ids.ID) bool {
 
 // storedGrant reads and parses the stored form of grant id, decrypting it
 // if it is stored encrypted at rest (§E.1).
-func (t *tx) storedGrant(id ids.ID) (*grant.Grant, bool) {
-	var blocks []byte
-	err := t.QueryRow(`SELECT blocks FROM grants WHERE id = ?`, id[:]).Scan(&blocks)
-	if errors.Is(err, sql.ErrNoRows) {
+func (t *gate) storedGrant(id ids.ID) (*grant.Grant, bool) {
+	blocks, _, ok := t.grantRow(id[:])
+	if !ok {
 		return nil, false
 	}
-	t.must(err)
 	if isSealed(string(blocks)) {
 		plain, err := openRow(t.dek(grantsDEK, false), grantAAD(id[:]), blocks)
 		if err != nil {

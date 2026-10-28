@@ -10,7 +10,7 @@ import "github.com/middle-management/patchlog/internal/ids"
 // available, so the check reveals nothing about a namespace it can't read.
 // A source.origin that is this deployment's own is 422 source for any
 // caller.
-func (t *tx) checkSource(req Request, v any) (any, *batchSource, *Error) {
+func (t *gate) checkSource(req Request, v any) (any, *batchSource, *Error) {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return nil, nil, invalid("source must be an object")

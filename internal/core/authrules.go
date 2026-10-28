@@ -13,7 +13,7 @@ var stepOneRefs = []string{"action", "resource", "principal", "now"}
 // grantRules evaluates key-scope, block and role rules. With stepOne, only
 // rules that refer solely to action, resource, principal and now are
 // evaluated.
-func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool) *Error {
+func (t *gate) grantRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool) *Error {
 	return t.grantRulesMode(a, verb, roles, env, stepOne, nil)
 }
 
@@ -23,7 +23,7 @@ func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]an
 // block rule refusing the request and a role with one not allowing it;
 // one that passes, or fails, whatever they hold is decided as usual
 // (§6.2, rules.EvalTri).
-func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[string]any, stepOne bool, unknown []string) *Error {
+func (t *gate) grantRulesMode(a *actor, verb string, roles []string, env map[string]any, stepOne bool, unknown []string) *Error {
 	if a.verified == nil {
 		return nil
 	}
@@ -35,7 +35,7 @@ func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[strin
 
 // scopeRules evaluates the key-scope and block rules of a's verified
 // grant, as grantRulesMode does.
-func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []string) *Error {
+func (t *gate) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []string) *Error {
 	for _, src := range [][]any{a.verified.KeyRules, a.verified.BlockRules} {
 		for _, rv := range src {
 			r, err := compileCached(rv)
@@ -60,7 +60,7 @@ func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []st
 // roles, as grantRulesMode does: roles are alternatives (§C.1.1), so the
 // rules evaluated must pass for one of roles, or with roles nil for one of
 // the effective roles that list verb.
-func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool, unknown []string) *Error {
+func (t *gate) roleRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool, unknown []string) *Error {
 	if a.verified.HasRoles() {
 		if roles == nil {
 			_, roles = a.verified.Allows(verb)
@@ -99,7 +99,7 @@ func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any
 // grant, key and role rules (403), then namespace rules (422) (§6.4.3,
 // §C.2 item 4). A batch runs each half for every item before the next
 // (checkItems).
-func (t *tx) checkRules(cfg *Config, a *actor, env map[string]any, isConfig bool) *Error {
+func (t *gate) checkRules(cfg *Config, a *actor, env map[string]any, isConfig bool) *Error {
 	if err := t.checkGrantRules(a, env, nil); err != nil {
 		return err
 	}
@@ -109,7 +109,7 @@ func (t *tx) checkRules(cfg *Config, a *actor, env map[string]any, isConfig bool
 // checkGrantRules is step 6's grant, key and role rules, all of them,
 // against the full envelope with the write's verb (§C.2 item 4): 403. The
 // envelope members unknown names are hidden (grantRulesMode).
-func (t *tx) checkGrantRules(a *actor, env map[string]any, unknown []string) *Error {
+func (t *gate) checkGrantRules(a *actor, env map[string]any, unknown []string) *Error {
 	verb := env["action"].(string)
 	if a.verified != nil {
 		if ok, _ := a.verified.Allows(verb); !ok {
@@ -126,7 +126,7 @@ func (t *tx) checkGrantRules(a *actor, env map[string]any, unknown []string) *Er
 // rules don't judge it (§6.4.3), but its own key-scope and block rules all
 // do, those that read /doc, /writes or /patches included, against the
 // config envelope of the genesis patches (§C.2 item 4, §6.4.1): 403.
-func (t *tx) checkCreationRules(a *actor, patches any) *Error {
+func (t *gate) checkCreationRules(a *actor, patches any) *Error {
 	if a.verified == nil {
 		return nil
 	}
