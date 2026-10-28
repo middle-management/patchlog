@@ -139,7 +139,9 @@ func (u Unit) Changes() []client.NSEntry {
 	return nil
 }
 
-// State is a namespace's lifecycle state, reported via WithOnState.
+// State is a namespace's lifecycle state, reported via WithOnState. A
+// purge reports Purged with Frozen, as only a frozen namespace is purged
+// (§8.5); Successor comes from config changes only.
 type State struct {
 	NS        string
 	Frozen    bool
@@ -273,6 +275,9 @@ type nsFollower struct {
 	// branch bootstrap: the base's branch entry (nil for the root or a
 	// branch found through /branches).
 	branch *client.NSEntry
+	// purging is set while deliverPurged reads the log up to the purge-ns
+	// entry: a 410 meanwhile ends it there.
+	purging bool
 }
 
 func (n *nsFollower) run(ctx context.Context) error {
@@ -489,32 +494,81 @@ func (n *nsFollower) deliverHeads(ctx context.Context, at, after string, genesis
 // log ends with its purge-ns entry, which is how a consumer learns of it
 // otherwise (§10), and nothing is written after it, so the head is that
 // entry. The 410 names it as head; from a core that doesn't, it is read
-// from /ns/{ns}. It is delivered as a synthetic purge-ns unit at the head,
-// unless the checkpoint is there already, and Run ends with ErrPurged. The
-// batch is a Snapshot only in place of a bootstrap's listing: after a
-// checkpoint it follows what was delivered, as the purge-ns entry would,
-// so a consumer marks what it holds as purged rather than dropping it.
+// from /ns/{ns}.
+//
+// A 410 can come after a checkpoint short of that head: the purge came
+// after the head the follower last read (purgedAtHead's check of a
+// checkpoint at the head races it), or after the entries being delivered
+// were read. The entries in between, the freeze every purge follows (§8.5,
+// not_frozen) among them, are delivered from the log first, as catch-up
+// would, so their units are applied and the states they change reported,
+// the purge-ns entry last (deliver). Only where the log is 410 too (a
+// sealed namespace), or in place of a bootstrap's listing, is the purge-ns
+// unit synthetic (purgedAt).
 func (n *nsFollower) deliverPurged(ctx context.Context, gone error) error {
-	var head string
-	if ae, ok := client.AsAPIError(gone); ok {
-		head = ae.Head()
+	head, err := n.purgeHead(ctx, gone)
+	if err != nil {
+		return err
 	}
-	if head == "" {
-		v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.NSHead(ctx, n.ns) })
-		if err != nil {
+	if head != n.cur && n.cur != "" && !n.purging {
+		n.purging = true
+		err := n.pageTo(ctx, head)
+		n.purging = false
+		if err != nil && !client.IsPurged(err) {
+			// ErrPurged once the purge-ns entry is delivered.
 			return err
 		}
-		head = v.(*client.NSHead).ID
+		// The log is 410 too, from where the checkpoint got to, or it
+		// reached the head without a purge-ns entry to report.
 	}
+	return n.purgedAt(ctx, head)
+}
+
+// logPurged is deliverPurged for a 410 of the log range itself, which
+// leaves nothing to read up to the purge-ns entry (§8.5).
+func (n *nsFollower) logPurged(ctx context.Context, gone error) error {
+	head, err := n.purgeHead(ctx, gone)
+	if err != nil {
+		return err
+	}
+	return n.purgedAt(ctx, head)
+}
+
+// purgeHead is the head of a purged namespace, its purge-ns entry: the one
+// gone, its 410, names, else /ns/{ns}'s.
+func (n *nsFollower) purgeHead(ctx context.Context, gone error) (string, error) {
+	if ae, ok := client.AsAPIError(gone); ok && ae.Head() != "" {
+		return ae.Head(), nil
+	}
+	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.NSHead(ctx, n.ns) })
+	if err != nil {
+		return "", err
+	}
+	return v.(*client.NSHead).ID, nil
+}
+
+// purgedAt delivers a synthetic purge-ns unit at head, the purge-ns entry,
+// unless the checkpoint is there already, reports the state, and ends with
+// ErrPurged. The batch is a Snapshot only in place of a bootstrap's
+// listing: after a checkpoint it follows what was delivered, as the
+// purge-ns entry would, so a consumer marks what it holds as purged rather
+// than dropping it.
+func (n *nsFollower) purgedAt(ctx context.Context, head string) error {
 	if head != n.cur {
 		u := Unit{Entry: client.NSEntry{ID: head, Kind: "purge-ns"}, Synthetic: true}
 		if err := n.apply(ctx, &Batch{Origin: n.origin, NS: n.ns, Units: []Unit{u}, From: n.cur, NewCheckpoint: head, Snapshot: n.cur == ""}); err != nil {
 			return err
 		}
 	}
-	n.f.state(State{NS: n.ns, Purged: true})
+	n.f.state(purgedState(n.ns))
 	return ErrPurged
 }
+
+// purgedState is the state a purge reports: frozen too, as only a frozen
+// namespace is purged (§8.5, 409 not_frozen), whether or not the freeze's
+// config entry could be delivered (a sealed namespace's log is 410 once
+// purged).
+func purgedState(ns string) State { return State{NS: ns, Frozen: true, Purged: true} }
 
 // catchUp replays the immutable range from the checkpoint to the head,
 // page by page (§7.1, §10 Catch up): each page is delivered, and the
@@ -531,20 +585,30 @@ func (n *nsFollower) catchUp(ctx context.Context) error {
 			return err
 		}
 	}
-	for n.cur != head.ID {
+	if err := n.pageTo(ctx, head.ID); client.IsPurged(err) {
+		// A sealed namespace's log, once it is purged: the 410's
+		// head stands in for its purge-ns entry (§8.5, §10).
+		return n.logPurged(ctx, err)
+	} else if err != nil {
+		return err
+	}
+	n.f.catchUp(n.ns, head.ID, true)
+	return nil
+}
+
+// pageTo delivers the log from the checkpoint to head, a page at a time,
+// each delivered, and the checkpoint advanced, before the next is fetched.
+// A 410 of the range is returned as it is.
+func (n *nsFollower) pageTo(ctx context.Context, head string) error {
+	for n.cur != head {
 		type page struct {
 			entries []client.NSEntry
 			next    string
 		}
-		v, err = n.f.retryValue(ctx, n.ns, func() (any, error) {
-			es, next, err := n.f.c.NSLogPage(ctx, n.ns, head.ID, n.cur)
+		v, err := n.f.retryValue(ctx, n.ns, func() (any, error) {
+			es, next, err := n.f.c.NSLogPage(ctx, n.ns, head, n.cur)
 			return page{es, next}, err
 		})
-		if client.IsPurged(err) {
-			// A sealed namespace's log, once it is purged: the 410's
-			// head stands in for its purge-ns entry (§8.5, §10).
-			return n.deliverPurged(ctx, err)
-		}
 		if err != nil {
 			return err
 		}
@@ -554,11 +618,10 @@ func (n *nsFollower) catchUp(ctx context.Context) error {
 		}
 		// deliver moved the checkpoint to the page's last entry: the next
 		// page's since (X-Log-Next), or the head.
-		if want := cmp.Or(p.next, head.ID); n.cur != want {
+		if want := cmp.Or(p.next, head); n.cur != want {
 			return fmt.Errorf("follow: %s: caught up to %s, not %s", n.ns, n.cur, want)
 		}
 	}
-	n.f.catchUp(n.ns, head.ID, true)
 	return nil
 }
 
@@ -574,7 +637,9 @@ var lastName = strings.Repeat("z", 128)
 // (§8.5), and a page of it after the last possible name is empty
 // otherwise, which costs a live namespace's follower one small request
 // when it starts. Once purged, it ends with ErrPurged (deliverPurged
-// delivers nothing at the head). Any other error is left to following.
+// delivers nothing at the head). A purge since head was read, after a
+// freeze, is 410 here too, naming a later head: deliverPurged then
+// delivers the log up to it first. Any other error is left to following.
 func (n *nsFollower) purgedAtHead(ctx context.Context, head string) error {
 	_, err := n.f.retryValue(ctx, n.ns, func() (any, error) {
 		_, _, err := n.f.c.HeadsPage(ctx, n.ns, head, lastName)
@@ -711,7 +776,7 @@ func (n *nsFollower) deliver(ctx context.Context, entries []client.NSEntry) erro
 		return err
 	}
 	if purged {
-		n.f.state(State{NS: n.ns, Purged: true})
+		n.f.state(purgedState(n.ns))
 		return ErrPurged
 	}
 	return nil
