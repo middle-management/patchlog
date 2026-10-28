@@ -479,7 +479,7 @@ func TestDDBCallsPerRequest(t *testing.T) {
 	e, f, _ := ddbFaultEngine(t, ddbTable(t), Options{})
 	ctx := context.Background()
 	ddbCreateNS(t, e, "calls", `{"read":"public"}`)
-	measure := func(what string, max int, do func()) {
+	measure := func(what string, max int, do func()) map[string]int {
 		t.Helper()
 		e.FlushCaches()
 		f.takeCalls()
@@ -489,9 +489,21 @@ func TestDDBCallsPerRequest(t *testing.T) {
 		if n > max {
 			t.Errorf("%s makes %d DynamoDB calls, want at most %d: %v", what, n, max, by)
 		}
+		return by
 	}
 	var w *WriteResult
-	measure("create", 4, func() { w = ddbWrite(t, e, "calls", "d", "", `[{"op":"add","path":"","value":{"v":0}}]`) })
+	measure("create", 3, func() { w = ddbWrite(t, e, "calls", "d", "", `[{"op":"add","path":"","value":{"v":0}}]`) })
+	// Resources created with the same patches share their first revision's
+	// id (genesis twins): a creation looks none of them up, as its retry
+	// check would on GSI1, reading every twin.
+	for i := 1; i <= 3; i++ {
+		ddbWrite(t, e, "calls", fmt.Sprintf("twin%d", i), "", `[{"op":"add","path":"","value":{"v":0}}]`)
+	}
+	if by := measure("create of a twin", 3, func() {
+		ddbWrite(t, e, "calls", "twin4", "", `[{"op":"add","path":"","value":{"v":0}}]`)
+	}); by["Query"] != 0 {
+		t.Errorf("a creation queries %d times: %v", by["Query"], by)
+	}
 	for i := 1; i <= 2; i++ {
 		measure(fmt.Sprintf("append %d", i), 4, func() {
 			w = ddbWrite(t, e, "calls", "d", w.Items[0].IDs[0], fmt.Sprintf(`[{"op":"replace","path":"/v","value":%d}]`, i))

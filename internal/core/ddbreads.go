@@ -700,6 +700,13 @@ func (r *ddbReads) revID(seq int64) ids.ID { return r.rev(seq).id }
 
 func (r *ddbReads) revByID(n *nsRow, name string, id ids.ID) *revRow {
 	ns := r.nsName(n.id)
+	// A resource read absent has no revisions (its item is committed with
+	// them): no lookup. Every write asks (replay's retry check), and the
+	// id a creation would get is shared by every resource created with the
+	// same patches (genesis twins): its lookup on GSI1 reads them all.
+	if rr, ok := r.resRows[r.resHandle(ns, name)]; ok && rr == nil {
+		return nil
+	}
 	ri, err := r.s.ReadRevOf(r.ctx, ns, name, id.String())
 	r.must(err)
 	if ri == nil {

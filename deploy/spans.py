@@ -14,7 +14,8 @@ and of the rest (the server's own work, and waiting: for a group commit,
 a rate limit, a lock), and the calls a request made. Then per DynamoDB
 operation: how many, p50 and p95, the capacity units they consumed, the
 calls the SDK retried, the attempts DynamoDB throttled, batch keys left
-unprocessed, and failures. Then the table's units per second: a
+unprocessed, and failures; and by the store function making them, the
+costliest first. Then the table's units per second: a
 namespace is one partition key, which takes about 3,000 read and 1,000
 write units a second (docs/DYNAMODB.md §3), so a load whose namespace
 nears those is throttled whatever the table's capacity. Last, the
@@ -70,6 +71,7 @@ def main(path):
 
     kinds = defaultdict(lambda: {"total": [], "ddb": [], "rest": [], "calls": [], "ru": [], "wu": []})
     ops = defaultdict(lambda: {"dur": [], "units": [], "retried": 0, "throttled": 0, "unprocessed": 0, "failed": 0, "conditions": 0})
+    by_fn = defaultdict(lambda: {"units": [], "items": [], "throttled": 0})
     per_sec = defaultdict(lambda: [0.0, 0.0, 0])  # second -> read units, write units, throttled
     messages = Counter()
     for trace in by_trace.values():
@@ -84,6 +86,10 @@ def main(path):
             o["dur"].append(c["dur"])
             r, w = float(a.get("patchlog.dynamodb.read_units", 0)), float(a.get("patchlog.dynamodb.write_units", 0))
             o["units"].append(r + w)
+            f = by_fn[(c["Name"], a.get("code.function.name", "?"))]
+            f["units"].append(r + w)
+            f["items"].append(int(a.get("patchlog.dynamodb.items", 0)))
+            f["throttled"] += int(a.get("patchlog.dynamodb.throttled", 0))
             ru, wu = ru + r, wu + w
             throttled = int(a.get("patchlog.dynamodb.throttled", 0))
             o["retried"] += int(a.get("patchlog.dynamodb.attempts", 1)) > 1
@@ -121,6 +127,12 @@ def main(path):
         print(f"{name:28} {len(o['dur']):>6}  {ms(pct(o['dur'], .5)):7.1f}  {ms(pct(o['dur'], .95)):7.1f}  "
               f"{pct(o['units'], .5):9.1f}  {sum(o['units']):9.0f}  {o['retried']:>7}  {o['throttled']:>9}  "
               f"{o['unprocessed']:>11}  {o['failed']:>6}  {o['conditions']:>12}")
+
+    if by_fn:
+        print(f"\n{'DynamoDB call, by the store function making it':70} {'n':>6}  {'units':>9}  {'units p50':>9}  {'items p50':>9}  {'throttled':>9}")
+        for (op, fn), f in sorted(by_fn.items(), key=lambda kv: -sum(kv[1]["units"]))[:15]:
+            print(f"{(op[9:] + ' ' + fn)[:70]:70} {len(f['units']):>6}  {sum(f['units']):9.0f}  {pct(f['units'], .5):9.1f}  "
+                  f"{pct(f['items'], .5):>9}  {f['throttled']:>9}")
 
     if per_sec:
         secs = sorted(per_sec)

@@ -25,6 +25,8 @@ import (
 	"context"
 	"errors"
 	"log"
+	"runtime"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -55,6 +57,7 @@ var (
 	attrAttempts       = attribute.Key("patchlog.dynamodb.attempts")
 	attrThrottled      = attribute.Key("patchlog.dynamodb.throttled")
 	attrUnprocessed    = attribute.Key("patchlog.dynamodb.unprocessed")
+	attrFunction       = attribute.Key("code.function.name")
 )
 
 var throttles = retry.IsErrorThrottles(retry.DefaultThrottles)
@@ -81,7 +84,8 @@ func (a tracedAPI) start(ctx context.Context, op string, o []func(*dynamodb.Opti
 	if t == nil || !trace.SpanContextFromContext(ctx).IsValid() {
 		return ctx, nil, o
 	}
-	attrs = append(attrs, attrDBSystem, attrRPCSystem, attrRPCService, attrRPCMethod.String(op), attrTables.StringSlice([]string{a.table}))
+	attrs = append(attrs, attrDBSystem, attrRPCSystem, attrRPCService, attrRPCMethod.String(op), attrTables.StringSlice([]string{a.table}),
+		attrFunction.String(caller()))
 	ctx, span := (*t).Start(ctx, "DynamoDB."+op, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
 	c := &call{span: span}
 	switch op {
@@ -89,6 +93,23 @@ func (a tracedAPI) start(ctx context.Context, op string, o []func(*dynamodb.Opti
 		c.readCall = true
 	}
 	return ctx, c, append(o[:len(o):len(o)], c.count)
+}
+
+// caller is the function that made the call: the first frame above the
+// traced client's own, e.g. "ddbstore.(*Store).Heads", so a span says which
+// of the store's reads or writes it was.
+func caller() string {
+	var pcs [8]uintptr
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(3, pcs[:])])
+	for {
+		f, more := frames.Next()
+		if !strings.Contains(f.Function, "tracedAPI") {
+			return f.Function[strings.LastIndex(f.Function, "/")+1:]
+		}
+		if !more {
+			return ""
+		}
+	}
 }
 
 // count runs a middleware after the retryer's, once per attempt.

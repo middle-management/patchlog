@@ -92,6 +92,9 @@ func TestTracedAttempts(t *testing.T) {
 			}
 		}
 	}
+	if attrs["code.function.name"] != "ddbstore.TestTracedAttempts" {
+		t.Errorf("GetItem span's function %q", attrs["code.function.name"])
+	}
 	if attrs["patchlog.dynamodb.attempts"] != "2" || attrs["patchlog.dynamodb.throttled"] != "1" || attrs["patchlog.dynamodb.read_units"] != "0.5" {
 		t.Fatalf("GetItem span attributes %v", attrs)
 	}
