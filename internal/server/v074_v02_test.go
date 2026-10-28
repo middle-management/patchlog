@@ -36,3 +36,34 @@ func TestV074GesturesAfter(t *testing.T) {
 	expect(t, e.purge("sec", "r", e.head("sec", "r", f.adminG), f.adminG), 204)
 	expectCode(t, e.get("/ns/sec/gestures/"+gA+"?after=r/"+r0, f.adminG), 404, "not_found")
 }
+
+// §7.8 Copying (v0.74, CORE-5): after the copy's 400s comes a sent
+// precondition's 428, before any body is read, so ahead of a different
+// bid's 422 and of the source check's 404.
+func TestV074BlobCopyPreconditionFirst(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil, withBlobTuning)
+	e := f.tenv
+	data := []byte("copy order")
+	bid := blobID("text/plain", "", data)
+	expect(t, e.putBlobAs("sec", "a", bid, "text/plain", "", data, f.adminG), 201)
+	e.create("sec", "a", map[string]any{"b": ref(bid, "text/plain", len(data), "")}, f.adminG)
+	put := func(path string, hdr map[string]string) *resp {
+		return e.do(req{method: "PUT", path: path, bearer: f.issuerG, hdr: hdr})
+	}
+	// A source the caller can't read (another namespace it holds no
+	// grant for), or none at all: 428 with a precondition, else 404.
+	e.mkNS("other", map[string]any{"read": "grant"})
+	for _, src := range []string{blobPath("other", "x", bid), blobPath("sec", "none", bid)} {
+		expectCode(t, put(blobPath("sec", "c", bid), map[string]string{"Blob-From": src, "If-None-Match": "*"}), 428, "precondition_required")
+		expectCode(t, put(blobPath("sec", "c", bid), map[string]string{"Blob-From": src}), 404, "not_found")
+	}
+	// A different bid: 428 with a precondition, 422 without.
+	other := blobID("text/plain", "", []byte("other"))
+	from := blobPath("sec", "a", bid)
+	expectCode(t, put(blobPath("sec", "c", other), map[string]string{"Blob-From": from, "If-Match": `"` + bid + `"`}), 428, "precondition_required")
+	expectCode(t, put(blobPath("sec", "c", other), map[string]string{"Blob-From": from}), 422, "blob")
+	// The 400s still come first.
+	expectCode(t, put(blobPath("sec", "c", bid), map[string]string{"Blob-From": "/nope", "If-None-Match": "*"}), 400, "bad_input")
+	expect(t, put(blobPath("sec", "c", bid), map[string]string{"Blob-From": from}), 201)
+}
