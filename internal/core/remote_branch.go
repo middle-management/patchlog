@@ -2360,7 +2360,7 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	if err != nil {
 		return err
 	}
-	return errors.Join(e.followLog(ctx, c, ep, b), e.retryLevel(ctx, b), e.followChainEpochs(ctx, c, ep, b), e.followPreStarts(ctx, c, ep, b))
+	return errors.Join(e.followLog(ctx, c, ep, b), e.retryLevel(ctx, b.branch), e.followChainEpochs(ctx, c, ep, b), e.followPreStarts(ctx, c, ep, b))
 }
 
 // followPreStarts reads again, for each shadow of a remote branch holding
@@ -2812,23 +2812,24 @@ func (t *tx) lostChanged(bn *nsRow) {
 	}
 }
 
-// retryLevel tries again, once per sync, a raise followLevel recorded but
-// couldn't make on a server with a key store (§G.5.2): one whose config
-// writes failed, or one recorded while the server lacked every level.
-func (e *Engine) retryLevel(ctx context.Context, b *remoteBase) error {
+// retryLevel tries again, once per sync and once at start (catchUpLevels),
+// a raise followLevel recorded but couldn't make on a server with a key
+// store (§G.5.2): one whose config writes failed, or one recorded while
+// the server lacked every level.
+func (e *Engine) retryLevel(ctx context.Context, branch int64) error {
 	if e.opt.KeyStore == nil {
 		return nil
 	}
 	due := false
 	if err := e.read(ctx, func(t *tx) error {
-		due = t.levelDue(b.branch)
+		due = t.levelDue(branch)
 		return nil
 	}); err != nil || !due {
 		return err
 	}
 	return e.update(ctx, func(t *tx) error {
-		bn := t.nsByIDLocked(b.branch, lockExclusive)
-		if !t.levelDue(b.branch) {
+		bn := t.nsByIDLocked(branch, lockExclusive)
+		if !t.levelDue(branch) {
 			return nil
 		}
 		var level int
@@ -2837,6 +2838,51 @@ func (e *Engine) retryLevel(ctx context.Context, b *remoteBase) error {
 		t.followLevel(bn, id, level)
 		return nil
 	})
+}
+
+// catchUpLevels makes, at Open and before anything is served, every raise
+// a remote branch recorded but hasn't followed as far as Levels allow
+// (levelDue, retryLevel). A branch an earlier version left below its
+// source's level is held (remoteHeld) until the raise is made: v0.23
+// followed a source's raise to e2e only as far as the level the source
+// had before it, so a branch of a source raised from none stayed at none,
+// recorded for a rebase, and served in the clear. Without this its
+// resources would answer 503 encryption_unavailable from the upgrade until
+// the first sync, a whole follow interval later; with it they are served
+// sealed from the start (followTarget, Addendum E Levels Invariant). It
+// needs nothing from the branches' sources. A raise that fails again stays
+// recorded, is logged, and is retried at every sync as before.
+func (e *Engine) catchUpLevels(ctx context.Context) {
+	if e.opt.KeyStore == nil {
+		return
+	}
+	var due []int64
+	if err := e.read(ctx, func(t *tx) error {
+		rows, err := t.Query(`SELECT branch FROM remote_levels ORDER BY branch`)
+		t.must(err)
+		var all []int64
+		for rows.Next() {
+			var b int64
+			t.must(rows.Scan(&b))
+			all = append(all, b)
+		}
+		t.must(rows.Err())
+		rows.Close()
+		for _, b := range all {
+			if t.levelDue(b) {
+				due = append(due, b)
+			}
+		}
+		return nil
+	}); err != nil {
+		log.Printf("remote: catching up recorded raises at start: %v", err)
+		return
+	}
+	for _, b := range due {
+		if err := e.retryLevel(ctx, b); err != nil {
+			log.Printf("remote: catching up a recorded raise at start: %v; tried again at every sync", err)
+		}
+	}
 }
 
 // levelDue reports whether the remote branch's recorded raise is one it

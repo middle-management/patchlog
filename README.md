@@ -1949,12 +1949,15 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   (prunes, blob uploads and copies included) get that `502` at step 2.1, before the
   idempotent-retry lookup; a resource purged since stays `410`, and purges still work. A raise
   B could make but whose config writes fail for another reason is no longer `502` (§1, v0.74):
-  B records it for a rebase and retries at every sync, and meanwhile holds those resources
+  B records it for a rebase and retries it when it starts, before serving, and at every sync,
+  and meanwhile holds those resources
   rather than serve them below A's level: reads and writes other than purges answer `503
   encryption_unavailable` with `Retry-After`. Their `/heads` rows, like those of a `502`, leave
   out `created`, `size` and `digest` (§7.4, v0.74). A branch created before v0.73 reads A's document
   once more on the first follow after the upgrade (migration `010_remote_catch_up`),
-  so a raise or a `read` change A made earlier is followed.
+  so a raise or a `read` change A made earlier is followed. A branch v0.23 left at its level
+  after A's raise to `e2e` (recorded for a rebase) is raised to `sealed` on the first start
+  under v0.74, before anything is served.
 - **Config writes are judged by A now** (§G.5.2, v0.73). A config write that makes the branch
   public, raises it to `e2e` or turns off a nonce requirement A has, or a batch with such a
   change, is judged by A's current namespace document, read for that write outside the write

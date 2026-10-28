@@ -482,6 +482,10 @@ func Open(opt Options) (*Engine, error) {
 		e.bg.Add(1)
 		go e.repurgeLoop(e.opt.RepurgeInterval)
 	}
+	// Before anything is served: a raise a remote branch recorded but
+	// hasn't made, as one an earlier version left, is made now rather than
+	// at the first sync (catchUpLevels).
+	e.catchUpLevels(context.Background())
 	if e.opt.Remote.FollowInterval > 0 {
 		e.bg.Add(1)
 		go e.remoteLoop(e.opt.Remote.FollowInterval)

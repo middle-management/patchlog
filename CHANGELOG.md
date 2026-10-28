@@ -85,12 +85,20 @@ reference implements the reading noted here.
   to `e2e` raises itself and its dependents, leaves first, to `sealed`, as far as Levels allow,
   and is marked for a rebase (§G.5.2). `502 upstream` is reserved for a server lacking the level
   (no key store, or a key store that has gone) (§1). A raise the server could make but whose
-  config writes fail for another reason is recorded for a rebase and retried at every sync, and
-  meanwhile the branch holds what it had at `at` rather than serve it below the source's level
+  config writes fail for another reason is recorded for a rebase and retried on start and at every
+  sync, and meanwhile the branch holds what it had at `at` rather than serve it below the source's level
   (Addendum E Levels Invariant): reads and writes of those resources other than purges answer
   `503 encryption_unavailable` with `Retry-After`. `/heads` rows of resources answering `502` or
   so held leave out `created`, `size` and `digest`, at the remote branch and at branches reading
   through it (§7.4).
+- **Remote branches v0.23 left below `sealed` are raised on the first start.** v0.23 followed a
+  source's raise to `e2e` only as far as the source's level before it, so a remote branch of a
+  source raised from `none` to `e2e` stayed at `none`, recorded for a rebase, and served its
+  content in the clear. On a server with a key store, the first start raises such a branch and its
+  dependents, leaves first, to `sealed` before anything is served (§G.5.2, Addendum E Levels), as
+  it does any raise recorded but not yet made: from then on that content is served only sealed,
+  and readers without keys to it lose access to content they could read before. A raise that still
+  fails holds the content, `503 encryption_unavailable`, until a later sync makes it (above).
 - **Remote branches take the start times of a source's epochs before its `e2e` raise only from
   `base.origin` itself** (§G.5.2), never from a mirror the endpoint may be. A `-remote-url` other
   than the origin now counts as a possible intermediary; set `-remote-origin-url ORIGIN=URL`
