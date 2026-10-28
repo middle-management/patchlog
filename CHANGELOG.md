@@ -24,8 +24,15 @@ reference implements the reading noted here.
 - **With authentication disabled, `/keys` gives the current epoch alone** (§E.2.3), and the
   server's own key checks take the same: no earlier epoch, and none from before a raise. A
   `serve -dev` server's playground, and the index, tree and derived services reading it without
-  grants, can no longer open sealed content of earlier epochs after a rotation (the index serves
-  such hits by name only, below).
+  grants, can no longer open sealed content of earlier epochs after a rotation. An index or tree
+  service that already holds such content keeps it, and serves the hits it can't seal by name only
+  (below). One that reads the namespace afresh (a new service, `-rebuild`, or the index's one-time
+  rebuild below) can't read those documents: it leaves them out of its results, and of the
+  catalog's tree, and indexes and lists the rest. Upgrading an auth-disabled deployment whose
+  sealed namespaces were rotated therefore drops their earlier epochs' documents from the index;
+  a service grant with an `nbf` reaching back keeps them. Such a service no longer stops at the
+  namespace's genesis document, sealed under epoch 1: the namespace document at the head stands
+  in for it (§E.2.3, §E.2.6, §A.4).
 - **A branch's `/keys` relays its bases' entries for at most that base's `historyEpochs` at
   `at`** before its epoch there (§E.2.3 At E3). The keys a base had before a raise from sealed
   follow that base-epoch rule alone (Addendum E Levels, Branches of a raised base), not the raised
@@ -109,7 +116,8 @@ reference implements the reading noted here.
 - **Search index:** on a query of one namespace, a `min` naming any other namespace is `400` with
   the body's `min` listing it (before, a readable followed one was waited for and redirected, a
   purged one redirected, and one skipped for keys was `503`) (§A.5). The index database format
-  goes to 2, so existing indexes rebuild from the logs on start.
+  goes to 2, so existing indexes rebuild from the logs on start (with authentication disabled,
+  without documents of a rotated sealed namespace's earlier epochs, above).
 - **Catalog service:** without a merge key, `POST /merge-grants` is `404 not_offered`, whoever
   asks (§F.8); a key's `sub` scope matches only a caller sub starting with `user:`, so `svc:` and
   other subs fail every `sub` scope (§B.11.4 Through the key); item requests other than Place

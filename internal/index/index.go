@@ -879,6 +879,13 @@ func (ix *Index) prepare(ctx context.Context, ns, id string, p *prepared) error 
 		ix.opt.Logf("index: %s/%s: revision %s by %s is flagged and left out: %s", ns, p.resource, f.ID, f.Author, f.Message)
 	})
 	if err != nil {
+		if errors.Is(err, derived.ErrSkip) && follow.LacksKey(ctx, err) {
+			// Sealed under an epoch the index's grant gets no key for
+			// (§E.2.3): it can't be read, so it isn't indexed (§A.4).
+			ix.opt.Logf("index: %s/%s: left out: %v", ns, p.resource, err)
+			p.remove = true
+			return nil
+		}
 		if errors.Is(err, derived.ErrSkip) || errors.Is(err, follow.ErrNotLive) || client.IsGone(err) || client.IsNotFound(err) {
 			// Gone since: a later entry of the log says so too.
 			p.remove = true

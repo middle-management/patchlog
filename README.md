@@ -2575,8 +2575,12 @@ the epoch its head is served under (v0.73); whole listings earlier releases stor
 dropped at start (§E.2.6). After a restart the service needs the keys of older epochs its nodes
 are served under, so its grant needs an `nbf` reaching back (§E.2.3): a node whose epoch key it
 can never get is listed by name only, with no `sealed` values, and one it can't fetch for the
-moment makes the listings that show it `503 behind`. A database from before v0.73 reads in each
-node's epoch on start.
+moment makes the listings that show it `503 behind`. A service that reads the catalog afresh
+(a new database, or `-rebuild`) with no key for an older epoch, as against a core with
+authentication disabled, which gives the current epoch alone (v0.74), leaves out the nodes
+sealed under it, and so does the index for documents: the namespace document at the head stands
+in for an older one it can't open, so the service still reaches the namespace (§E.2.3, §E.2.6).
+A database from before v0.73 reads in each node's epoch on start.
 
 **Edge grants for listings** (v0.51, §B.11.5, §C.5). A listing read with a grant in
 `Authorization` belongs to one credential, so it is never cached at the edge; the catalog

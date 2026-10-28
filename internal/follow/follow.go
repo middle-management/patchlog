@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Checkpoint loads the last fully processed ns_id of a namespace, "" if
@@ -113,7 +114,10 @@ type Unit struct {
 	Synthetic bool
 	// Config is the namespace document in force after this unit, set when
 	// the unit changes the configuration (a config entry, or a batch with
-	// one).
+	// one). Where that document is sealed under an epoch whose key the
+	// follower's client can't have, it is the newest document the client
+	// can open instead, the one at the namespace's head (Config.ID names
+	// it; attachConfig).
 	Config *client.NSDoc
 }
 
@@ -714,6 +718,15 @@ func (n *nsFollower) deliver(ctx context.Context, entries []client.NSEntry) erro
 }
 
 // attachConfig fetches the namespace document after a config change.
+//
+// A document sealed under an epoch whose key the client can't have, as it
+// is configured (LacksKey: the genesis document of a namespace rotated
+// since, read by a service whose grant gets only the current epoch, say,
+// §E.2.3), would stop the follower there for good. The newest document it
+// can open, the one in force at the namespace's head, stands in for it
+// (Unit.Config), so the follower carries on and what it can't open is
+// served by name only (§E.2.6). Only when that can't be opened either is
+// the failure returned.
 func (n *nsFollower) attachConfig(ctx context.Context, u *Unit) error {
 	has := u.Entry.Kind == "config"
 	if u.Entry.Kind == "batch" && len(u.Entry.Entries) > 0 && u.Entry.Entries[0].Kind == "config" {
@@ -722,13 +735,63 @@ func (n *nsFollower) attachConfig(ctx context.Context, u *Unit) error {
 	if !has || u.Entry.ID == "" {
 		return nil
 	}
-	id := u.Entry.ID
-	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.NSDoc(ctx, n.ns, id) })
+	doc, lacking, err := n.nsDoc(ctx, u.Entry.ID)
 	if err != nil {
 		return err
 	}
-	u.Config = v.(*client.NSDoc)
+	if lacking != nil {
+		v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.NSHead(ctx, n.ns) })
+		if err != nil {
+			return err
+		}
+		head := v.(*client.NSHead).ID
+		if doc, _, err = n.nsDoc(ctx, head); err != nil {
+			return err
+		}
+		if doc == nil {
+			return lacking
+		}
+		n.f.report(n.ns, fmt.Errorf("follow: the namespace document at %s stands in for the one at %s: %w", head, u.Entry.ID, lacking))
+	}
+	u.Config = doc
 	return nil
+}
+
+// nsDoc fetches the namespace document at id, retrying what may mend.
+// lacking, with a nil doc, is a failure that won't: the document is
+// sealed under an epoch whose key the client can't have (LacksKey).
+func (n *nsFollower) nsDoc(ctx context.Context, id string) (doc *client.NSDoc, lacking, err error) {
+	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) {
+		d, err := n.f.c.NSDoc(ctx, n.ns, id)
+		if LacksKey(ctx, err) {
+			lacking = err
+			return (*client.NSDoc)(nil), nil
+		}
+		return d, err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if lacking != nil {
+		return nil, lacking, nil
+	}
+	return v.(*client.NSDoc), nil, nil
+}
+
+// LacksKey reports whether err, from opening sealed content, leaves the
+// client lacking the key for good, as its grant and keys are configured
+// (§A.4, §E.2.6): no key for the epoch (ErrNoKeys), none it can unwrap
+// (seal.ErrDecrypt) or will take (ErrUntrustedKey, §E.3.2), or /keys
+// answered a 4xx other than 429. Any other failure, the document's own
+// GET's among them, is not; nor is any once ctx is done.
+func LacksKey(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	if ae, ok := client.AsAPIError(err); ok {
+		return strings.HasSuffix(ae.Path, "/keys") && ae.Status >= 400 && ae.Status < 500 && ae.Status != 429
+	}
+	return errors.Is(err, client.ErrNoKeys) || errors.Is(err, seal.ErrDecrypt) || errors.Is(err, client.ErrUntrustedKey)
 }
 
 // apply calls the handler until it succeeds, then advances and reacts to
