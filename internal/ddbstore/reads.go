@@ -3,7 +3,6 @@ package ddbstore
 import (
 	"context"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -111,12 +110,6 @@ func (s *Store) ReadRevOf(ctx context.Context, ns, name, id string) (*RevInfo, e
 func (s *Store) Ping(ctx context.Context) error {
 	_, err := s.Client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: &s.Table})
 	return err
-}
-
-// FormatTime renders a stored millisecond timestamp the way the API
-// serves it (reads.go's formatTime).
-func FormatTime(ms int64) string {
-	return time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05.000Z")
 }
 
 // FoldResource folds a resource's chain from the genesis up to and
