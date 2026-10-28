@@ -74,8 +74,9 @@
 //     holding a * key, and for no one under "grants". An entry without
 //     "grant" at all (the server's own, or one from before v0.37) counts
 //     for no one.
-//   - a branch with no head, tombstone or batch entry of its own counts as
-//     merged.
+//   - a branch with no head, tombstone or batch entry of its own, other
+//     than for resources purged in it (§F.6), counts as merged: a batch
+//     counts only if it has other items.
 //   - at E3, entries for the branch's keyring resource don't count in any
 //     of these, since the keyring is never merged (§F.8.1); a batch counts
 //     only if it has other items. Everything stays plaintext, so the
@@ -369,7 +370,8 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 
 	enc, _ := doc.Value["encryption"].(map[string]any)
 	b := &branch{j: j, base: base, ns: ns, doc: doc.Value, log: log, e2e: enc["level"] == "e2e",
-		docs: map[string]nsAt{ns: {head.ID, doc.Value}}, keyCache: map[string]map[string]nsKey{}}
+		docs: map[string]nsAt{ns: {head.ID, doc.Value}}, keyCache: map[string]map[string]nsKey{},
+		purged: purges(log)}
 	if b.cfgs, err = b.configDocs(ctx); err != nil {
 		return d, err
 	}
@@ -512,6 +514,43 @@ type branch struct {
 	keyCache map[string]map[string]nsKey
 	// grants holds stored grants by id (signedBy).
 	grants map[string]*grant.Grant
+	// purged holds the resources purged in the branch (purges), which
+	// have nothing left to merge (§F.6).
+	purged map[string]bool
+}
+
+// purges lists the resources a branch's log has a purge entry for: purged
+// in the branch, or in a base and propagated (§8.5). A purged name can't
+// be written again.
+func purges(log []client.NSEntry) map[string]bool {
+	out := map[string]bool{}
+	for _, e := range log {
+		if e.Kind == "purge" && e.Resource != "" {
+			out[e.Resource] = true
+		}
+	}
+	return out
+}
+
+// ownDocEntries reports whether the branch has a head, tombstone or batch
+// entry of its own (isDocEntry), other than for resources purged in it
+// (§F.6): a batch counts only if it has other items.
+func (b *branch) ownDocEntries() bool {
+	for _, e := range b.log {
+		switch e.Kind {
+		case "head", "tombstone":
+			if isDocEntry(e, b.e2e) && !b.purged[e.Resource] {
+				return true
+			}
+		case "batch":
+			for _, s := range e.Entries {
+				if isDocEntry(s, b.e2e) && !b.purged[s.Resource] {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // nsAt is a namespace's head and its document there.
@@ -545,11 +584,12 @@ func (b *branch) current(ctx context.Context, ns string) (map[string]any, error)
 
 // verify checks one claim (§F.6); present is false when the branch
 // doesn't make it. A branch with no head, tombstone or batch entry of its
-// own (its keyring's aside at E3) counts as merged.
+// own (its keyring's aside at E3, and those of resources purged in it)
+// counts as merged.
 func (b *branch) verify(ctx context.Context, claim string, frozeAt time.Time) (present, ok bool, reason string, err error) {
 	switch claim {
 	case "merged":
-		if !hasDocEntries(b.log, -1, b.e2e) {
+		if !b.ownDocEntries() {
 			return true, true, "", nil
 		}
 		if _, has := b.doc["merged"]; !has {
@@ -746,14 +786,8 @@ func (b *branch) closing(ctx context.Context, target string, cov *coverage) (boo
 			}
 		}
 	}
-	purged := map[string]bool{}
-	for _, e := range b.log {
-		if e.Kind == "purge" {
-			purged[e.Resource] = true
-		}
-	}
 	for _, name := range slices.Sorted(maps.Keys(last)) {
-		if purged[name] {
+		if b.purged[name] {
 			continue
 		}
 		if i, ok := cov.at[name]; ok && i >= last[name] {
