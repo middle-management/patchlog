@@ -29,6 +29,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
@@ -40,7 +41,7 @@ func keySnap(ns, name string, pos uint64) Key {
 func keyPruning(ns, name string) Key { return Key{nsPK(ns), "PRUNING#" + name} }
 
 // pruneActs are a prune's actions in its commit's transaction.
-func (s *Store) pruneActs(c *Commit) []types.TransactWriteItem {
+func (s *Store) pruneActs(c *ddb.Commit) []types.TransactWriteItem {
 	p := c.Prune
 	if p == nil {
 		return nil
@@ -82,7 +83,7 @@ func (s *Store) pruneActs(c *Commit) []types.TransactWriteItem {
 
 // actions counts a prune's actions: the RES update, the marker, its
 // archive's record and an e2e snapshot.
-func pruneActions(p *CommitPrune) int {
+func pruneActions(p *ddb.CommitPrune) int {
 	n := 2
 	if p.Archive != nil {
 		n++
@@ -392,8 +393,8 @@ func (s *Store) EachSnapshot(ctx context.Context, ns, name string, visit func(po
 
 // Attachments lists name's attachments in ns: those pruning ended, or
 // those it hasn't.
-func (s *Store) Attachments(ctx context.Context, ns, name string, pruned bool) ([]*BlobRow, error) {
-	var out []*BlobRow
+func (s *Store) Attachments(ctx context.Context, ns, name string, pruned bool) ([]*ddb.BlobRow, error) {
+	var out []*ddb.BlobRow
 	err := s.eachItem(ctx, ns, "BLOB#"+name+"#", func(i item) error {
 		if b := scanBlob(i); b.Name == name && b.Pruned == pruned {
 			out = append(out, b)

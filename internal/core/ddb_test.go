@@ -25,7 +25,7 @@ import (
 // mode, so writes need no grants.
 func ddbEngine(t *testing.T) *Engine {
 	t.Helper()
-	endpoint := os.Getenv("DDB_ENDPOINT")
+	endpoint, _, _ := strings.Cut(os.Getenv("DDB_ENDPOINT"), ",") // the first of a list (testenv)
 	if endpoint == "" {
 		t.Skip("DDB_ENDPOINT not set: skipping DynamoDB Local integration test")
 	}
@@ -162,7 +162,7 @@ func TestDDBDeleteRule(t *testing.T) {
 // documents, a namespace raised to at-rest after its content was written —
 // holds no plaintext, and reads it back.
 func TestDDBAtRest(t *testing.T) {
-	endpoint := os.Getenv("DDB_ENDPOINT")
+	endpoint, _, _ := strings.Cut(os.Getenv("DDB_ENDPOINT"), ",") // the first of a list (testenv)
 	if endpoint == "" {
 		t.Skip("DDB_ENDPOINT not set: skipping DynamoDB Local integration test")
 	}

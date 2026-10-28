@@ -5,6 +5,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
@@ -37,11 +38,11 @@ func cond(a types.TransactWriteItem) string {
 
 var testTip = tip{headPos: 7, headID: ids.Of([]byte("entry7")).String()}
 
-func createCommit(name string) *Commit {
+func createCommit(name string) *ddb.Commit {
 	id := ids.Of([]byte(name)).String()
-	return &Commit{
+	return &ddb.Commit{
 		NS: "demo", Author: "alice", Created: 1000, CfgPos: 1, CfgID: ids.Of([]byte("cfg")).String(),
-		Items: []CommitItem{{Name: name, Steps: []CommitStep{{ID: id, Patches: `[]`, Doc: `{}`}}}},
+		Items: []ddb.CommitItem{{Name: name, Steps: []ddb.CommitStep{{ID: id, Patches: `[]`, Doc: `{}`}}}},
 		Entry: map[string]any{"resource": name, "kind": "head", "target": id}, Kind: "head",
 	}
 }
@@ -53,7 +54,7 @@ func createCommit(name string) *Commit {
 func TestBuildCommitCreate(t *testing.T) {
 	s := &Store{Table: "tbl"}
 	c := createCommit("doc1")
-	acts, res, err := s.buildCommits("demo", []*Commit{c}, testTip)
+	acts, res, err := s.buildCommits("demo", []*ddb.Commit{c}, testTip)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,12 +93,12 @@ func TestBuildCommitDelete(t *testing.T) {
 	s := &Store{Table: "tbl"}
 	live := ids.Of([]byte("live")).String()
 	tomb := ids.Tombstone(ids.Of([]byte("live"))).String()
-	c := &Commit{
+	c := &ddb.Commit{
 		NS: "demo", Author: "alice", CfgPos: 1, CfgID: "c",
-		Items: []CommitItem{{Name: "doc1", HeadPos: 3, HeadID: live, Steps: []CommitStep{{ID: tomb, ParentID: live, Tombstone: true}}}},
+		Items: []ddb.CommitItem{{Name: "doc1", HeadPos: 3, HeadID: live, Steps: []ddb.CommitStep{{ID: tomb, ParentID: live, Tombstone: true}}}},
 		Entry: map[string]any{"resource": "doc1", "kind": "tombstone", "target": tomb}, Kind: "tombstone",
 	}
-	acts, _, err := s.buildCommits("demo", []*Commit{c}, testTip)
+	acts, _, err := s.buildCommits("demo", []*ddb.Commit{c}, testTip)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +117,7 @@ func TestBuildCommitDelete(t *testing.T) {
 // configuration condition — a transaction may touch an item once.
 func TestBuildCommitsGroup(t *testing.T) {
 	s := &Store{Table: "tbl"}
-	cs := []*Commit{createCommit("a"), createCommit("b"), createCommit("c")}
+	cs := []*ddb.Commit{createCommit("a"), createCommit("b"), createCommit("c")}
 	acts, res, err := s.buildCommits("demo", cs, testTip)
 	if err != nil {
 		t.Fatal(err)
@@ -146,12 +147,12 @@ func TestBuildCommitsGroup(t *testing.T) {
 // A config change conditions #META with its update: no separate check.
 func TestBuildCommitConfig(t *testing.T) {
 	s := &Store{Table: "tbl"}
-	c := &Commit{
+	c := &ddb.Commit{
 		NS: "demo", Author: "alice", CfgPos: 4, CfgID: "c4",
-		Config: &CommitConfig{ID: "c5", Patches: `[]`, Doc: `{}`},
+		Config: &ddb.CommitConfig{ID: "c5", Patches: `[]`, Doc: `{}`},
 		Entry:  map[string]any{"kind": "config", "target": "c5"}, Kind: "config",
 	}
-	acts, _, err := s.buildCommits("demo", []*Commit{c}, testTip)
+	acts, _, err := s.buildCommits("demo", []*ddb.Commit{c}, testTip)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +168,7 @@ func TestBuildCommitConfig(t *testing.T) {
 // commit's own condition makes it stale, its entry's makes the tip moved,
 // the shared configuration condition makes every commit stale.
 func TestClassifyCancel(t *testing.T) {
-	cs := []*Commit{createCommit("a"), createCommit("b")}
+	cs := []*ddb.Commit{createCommit("a"), createCommit("b")}
 	k := commitActions(cs[0])
 	n := 2*k + txShared
 	cancel := func(failed ...int) error {
@@ -206,9 +207,9 @@ func TestClassifyCancel(t *testing.T) {
 func TestBuildCommitAttach(t *testing.T) {
 	s := &Store{Table: "tbl"}
 	c := createCommit("doc1")
-	c.Items[0].Attach = []BlobAttach{{Bid: "b1", Type: "text/plain", Size: 3, Hash: []byte{1}}}
-	c.Items[0].EndPending = []BlobPending{{Bid: "b1", Uploader: "u"}, {Bid: "b2", Uploader: "u"}}
-	acts, _, err := s.buildCommits("demo", []*Commit{c}, testTip)
+	c.Items[0].Attach = []ddb.BlobAttach{{Bid: "b1", Type: "text/plain", Size: 3, Hash: []byte{1}}}
+	c.Items[0].EndPending = []ddb.BlobPending{{Bid: "b1", Uploader: "u"}, {Bid: "b2", Uploader: "u"}}
+	acts, _, err := s.buildCommits("demo", []*ddb.Commit{c}, testTip)
 	if err != nil {
 		t.Fatal(err)
 	}

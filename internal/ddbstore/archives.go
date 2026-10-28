@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
@@ -25,7 +26,7 @@ func keyArch(ns, name string, from, to uint64) Key {
 	return Key{nsPK(ns), "ARCH#" + name + "#" + padPos(from) + "#" + padPos(to)}
 }
 
-func archiveItem(a *ArchiveRow, name string) item {
+func archiveItem(a *ddb.ArchiveRow, name string) item {
 	bids := make([]types.AttributeValue, len(a.Bids))
 	for i, b := range a.Bids {
 		bids[i] = avS(b)
@@ -37,8 +38,8 @@ func archiveItem(a *ArchiveRow, name string) item {
 	}
 }
 
-func scanArchive(i item) *ArchiveRow {
-	a := &ArchiveRow{Name: i.s("name"), FromPos: i.n("fromPos"), ToPos: i.n("toPos"), Key: i.s("key"), URL: i.s("url"), Created: int64(i.n("created"))}
+func scanArchive(i item) *ddb.ArchiveRow {
+	a := &ddb.ArchiveRow{Name: i.s("name"), FromPos: i.n("fromPos"), ToPos: i.n("toPos"), Key: i.s("key"), URL: i.s("url"), Created: int64(i.n("created"))}
 	if l, ok := i["bids"].(*types.AttributeValueMemberL); ok {
 		for _, v := range l.Value {
 			a.Bids = append(a.Bids, item{"b": v}.s("b"))
@@ -49,12 +50,12 @@ func scanArchive(i item) *ArchiveRow {
 
 // Archives lists the archives of name in ns ("" for all of ns's), by
 // name, then range.
-func (s *Store) Archives(ctx context.Context, ns, name string) ([]*ArchiveRow, error) {
+func (s *Store) Archives(ctx context.Context, ns, name string) ([]*ddb.ArchiveRow, error) {
 	prefix := "ARCH#"
 	if name != "" {
 		prefix += name + "#"
 	}
-	var out []*ArchiveRow
+	var out []*ddb.ArchiveRow
 	err := s.eachItem(ctx, ns, prefix, func(i item) error {
 		if a := scanArchive(i); name == "" || a.Name == name {
 			out = append(out, a)
@@ -67,13 +68,13 @@ func (s *Store) Archives(ctx context.Context, ns, name string) ([]*ArchiveRow, e
 // ArchiveFor is the URL of the newest archive of name holding position
 // pos, "" for none.
 func (s *Store) ArchiveFor(ctx context.Context, ns, name string, pos uint64) (string, error) {
-	return s.newestArchive(ctx, ns, name, func(a *ArchiveRow) bool { return a.FromPos <= pos && pos <= a.ToPos })
+	return s.newestArchive(ctx, ns, name, func(a *ddb.ArchiveRow) bool { return a.FromPos <= pos && pos <= a.ToPos })
 }
 
 // BlobArchive is the URL of the newest archive of name whose blob lines
 // carry bid, "" for none.
 func (s *Store) BlobArchive(ctx context.Context, ns, name, bid string) (string, error) {
-	return s.newestArchive(ctx, ns, name, func(a *ArchiveRow) bool {
+	return s.newestArchive(ctx, ns, name, func(a *ddb.ArchiveRow) bool {
 		for _, b := range a.Bids {
 			if b == bid {
 				return true
@@ -83,12 +84,12 @@ func (s *Store) BlobArchive(ctx context.Context, ns, name, bid string) (string, 
 	})
 }
 
-func (s *Store) newestArchive(ctx context.Context, ns, name string, match func(*ArchiveRow) bool) (string, error) {
+func (s *Store) newestArchive(ctx context.Context, ns, name string, match func(*ddb.ArchiveRow) bool) (string, error) {
 	as, err := s.Archives(ctx, ns, name)
 	if err != nil {
 		return "", err
 	}
-	var best *ArchiveRow
+	var best *ddb.ArchiveRow
 	for _, a := range as {
 		if match(a) && (best == nil || a.Created >= best.Created) {
 			best = a
@@ -101,7 +102,7 @@ func (s *Store) newestArchive(ctx context.Context, ns, name string, match func(*
 }
 
 // DeleteArchive deletes an archive's record.
-func (s *Store) DeleteArchive(ctx context.Context, ns string, a *ArchiveRow) error {
+func (s *Store) DeleteArchive(ctx context.Context, ns string, a *ddb.ArchiveRow) error {
 	return s.deleteKey(ctx, keyArch(ns, a.Name, a.FromPos, a.ToPos))
 }
 
@@ -230,7 +231,7 @@ func (s *Store) ClearHorizon(ctx context.Context, ns, name string, horizonPos ui
 	})
 	var cf *types.ConditionalCheckFailedException
 	if errors.As(err, &cf) {
-		return ErrStale
+		return ddb.ErrStale
 	}
 	if err != nil {
 		return err

@@ -37,6 +37,12 @@ type ddbBackend struct {
 	// byID are the configurations the gate's reads parsed, by namespace
 	// and id (ddbReads.config): a configuration never changes.
 	byID map[string]*Config
+	// cfgRows are the configuration items read (configAt), by namespace
+	// and position: a configuration never changes.
+	cfgRows map[string]*ddb.ConfigRow
+	// entryPositions are entry ids' positions (entryPos), by namespace
+	// and id: an entry's position never changes.
+	entryPositions map[string]uint64
 	// refsMarked are the schema references marked (schemaRefs).
 	refsMarked markedSet
 	// keys are the data keys unwrapped (ddbcrypt.go); grantsSealed the
@@ -83,7 +89,7 @@ func openDDB(opt Options) (*Engine, error) {
 	if opt.BeforeWriteLock != nil || opt.BeforeCommit != nil {
 		return nil, fmt.Errorf("core: the SQL write path's hooks (BeforeWriteLock, BeforeCommit): %w (DynamoDB)", ErrUnsupported)
 	}
-	b := &ddbBackend{byID: map[string]*Config{}}
+	b := &ddbBackend{byID: map[string]*Config{}, cfgRows: map[string]*ddb.ConfigRow{}, entryPositions: map[string]uint64{}}
 	store, err := ddb.Open(context.Background(), opt.Path, ddb.Options{
 		// Group commit (docs/DYNAMODB.md §4): resource writes queue per
 		// namespace; GroupCommitWait doesn't apply — a group forms from

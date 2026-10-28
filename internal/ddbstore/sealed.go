@@ -17,11 +17,13 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 func keyEpochKey(ns string, epoch int) Key { return Key{nsPK(ns), "EPOCHKEY#" + padPos(uint64(epoch))} }
 
-func epochKeyAct(table, ns string, k *EpochKey, created int64) types.TransactWriteItem {
+func epochKeyAct(table, ns string, k *ddb.EpochKey, created int64) types.TransactWriteItem {
 	return types.TransactWriteItem{Put: &types.Put{
 		TableName:           &table,
 		Item:                withKey(keyEpochKey(ns, k.Epoch), epochKeyItem(k, created)),
@@ -31,7 +33,7 @@ func epochKeyAct(table, ns string, k *EpochKey, created int64) types.TransactWri
 
 // item is k's EPOCHKEY item: an e2e namespace's has no key, only the
 // epoch's start (§E.3).
-func epochKeyItem(k *EpochKey, created int64) item {
+func epochKeyItem(k *ddb.EpochKey, created int64) item {
 	it := item{"epoch": avN(uint64(k.Epoch)), "created": avI(created)}
 	if len(k.Wrapped) > 0 {
 		it["wrapped"], it["keystore"] = avB(k.Wrapped), avS(k.KeyStore)
@@ -39,12 +41,12 @@ func epochKeyItem(k *EpochKey, created int64) item {
 	return it
 }
 
-func scanEpochKey(i item) *EpochKey {
-	return &EpochKey{Epoch: int(i.n("epoch")), Wrapped: i.b("wrapped"), KeyStore: i.s("keystore"), Created: int64(i.n("created"))}
+func scanEpochKey(i item) *ddb.EpochKey {
+	return &ddb.EpochKey{Epoch: int(i.n("epoch")), Wrapped: i.b("wrapped"), KeyStore: i.s("keystore"), Created: int64(i.n("created"))}
 }
 
 // EpochKeyOf reads ns's key of epoch; nil when there is none.
-func (s *Store) EpochKeyOf(ctx context.Context, ns string, epoch int) (*EpochKey, error) {
+func (s *Store) EpochKeyOf(ctx context.Context, ns string, epoch int) (*ddb.EpochKey, error) {
 	it, err := s.getItem(ctx, keyEpochKey(ns, epoch))
 	if it == nil || err != nil {
 		return nil, err
@@ -53,8 +55,8 @@ func (s *Store) EpochKeyOf(ctx context.Context, ns string, epoch int) (*EpochKey
 }
 
 // EpochKeys lists ns's epoch keys, ascending.
-func (s *Store) EpochKeys(ctx context.Context, ns string) ([]*EpochKey, error) {
-	var out []*EpochKey
+func (s *Store) EpochKeys(ctx context.Context, ns string) ([]*ddb.EpochKey, error) {
+	var out []*ddb.EpochKey
 	err := s.eachItem(ctx, ns, "EPOCHKEY#", func(i item) error {
 		out = append(out, scanEpochKey(i))
 		return nil
@@ -65,7 +67,7 @@ func (s *Store) EpochKeys(ctx context.Context, ns string) ([]*EpochKey, error) {
 // AnyEpochKey is one stored epoch key and its namespace, for checking at
 // start-up that the key store unwraps them; nil for none. e2e epochs,
 // which have no key, don't count.
-func (s *Store) AnyEpochKey(ctx context.Context) (string, *EpochKey, error) {
+func (s *Store) AnyEpochKey(ctx context.Context) (string, *ddb.EpochKey, error) {
 	in := &dynamodb.ScanInput{
 		TableName:                 &s.Table,
 		FilterExpression:          strptr("begins_with(SK, :p) AND attribute_exists(#w)"),
@@ -108,7 +110,7 @@ func (s *Store) Sealed(ctx context.Context, ns, kind, key string) (jwe string, c
 
 // PutSealed stores v unless a value of its kind and key is stored, and
 // returns the one stored.
-func (s *Store) PutSealed(ctx context.Context, ns string, v SealedValue, now int64) (string, error) {
+func (s *Store) PutSealed(ctx context.Context, ns string, v ddb.SealedValue, now int64) (string, error) {
 	it := item{"jwe": avS(v.JWE), "created": avI(now), "kind": avS(v.Kind)}
 	if v.Name != "" {
 		it["name"] = avS(v.Name)
@@ -158,7 +160,7 @@ func (s *Store) deletePrunedSealed(ctx context.Context, ns, name string, horizon
 // recorded: a keyless EPOCHKEY item, an e2e epoch's (a remote branch's
 // shadow following its base's epochs).
 func (s *Store) PutEpochStart(ctx context.Context, ns string, epoch int, created int64) error {
-	k := &EpochKey{Epoch: epoch}
+	k := &ddb.EpochKey{Epoch: epoch}
 	_, err := s.Client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: &s.Table, Item: withKey(keyEpochKey(ns, epoch), epochKeyItem(k, created)),
 		ConditionExpression: strptr("attribute_not_exists(PK)"),

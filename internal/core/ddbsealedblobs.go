@@ -149,7 +149,7 @@ func (r *ddbReads) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID
 // is deleted.
 func (b *ddbBackend) storeSealedBlob(ctx context.Context, job *sealedBlobJob, sealed []byte) ([]byte, error) {
 	e := b.e
-	r := newDDBReads(b, ctx)
+	r := newDDBReads(ctx, b)
 	g := &gate{checkReads: r, checkState: &checkState{e: e, now: e.now()}}
 	served, perr := ddbCheck(func() bool {
 		n := g.nsByName(job.ns)
@@ -197,7 +197,7 @@ func (b *ddbBackend) blobEpochsOf(ctx context.Context, ns, name string) (map[ids
 	if err != nil || len(atts) == 0 {
 		return nil, err
 	}
-	r := newDDBReads(b, ctx)
+	r := newDDBReads(ctx, b)
 	g := &gate{checkReads: r, checkState: &checkState{e: b.e, now: b.e.now()}}
 	return ddbCheck(func() map[ids.ID]map[int]bool {
 		out := map[ids.ID]map[int]bool{}

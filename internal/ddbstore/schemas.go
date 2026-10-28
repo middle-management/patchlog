@@ -18,6 +18,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 func keySchemaRef(ns, ref, name string) Key { return Key{nsPK(ns), "SREF#" + ref + "#" + name} }
@@ -25,7 +27,7 @@ func keySchemaRef(ns, ref, name string) Key { return Key{nsPK(ns), "SREF#" + ref
 func keyNSList(ns string) Key { return Key{"#NAMESPACES", ns} }
 
 // PutSchemaRefs marks ns's pins (idempotent).
-func (s *Store) PutSchemaRefs(ctx context.Context, ns string, pins []SchemaPin) error {
+func (s *Store) PutSchemaRefs(ctx context.Context, ns string, pins []ddb.SchemaPin) error {
 	for _, p := range pins {
 		_, err := s.Client.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: &s.Table,
@@ -39,12 +41,12 @@ func (s *Store) PutSchemaRefs(ctx context.Context, ns string, pins []SchemaPin) 
 }
 
 // SchemaRefs lists ns's pins; with ref, only that schema's.
-func (s *Store) SchemaRefs(ctx context.Context, ns, ref string) ([]SchemaPin, error) {
+func (s *Store) SchemaRefs(ctx context.Context, ns, ref string) ([]ddb.SchemaPin, error) {
 	prefix := "SREF#"
 	if ref != "" {
 		prefix += ref + "#"
 	}
-	var out []SchemaPin
+	var out []ddb.SchemaPin
 	in := &dynamodb.QueryInput{
 		TableName:                 &s.Table,
 		KeyConditionExpression:    strptr("PK = :pk AND begins_with(SK, :p)"),
@@ -59,7 +61,7 @@ func (s *Store) SchemaRefs(ctx context.Context, ns, ref string) ([]SchemaPin, er
 		for _, it := range q.Items {
 			i := item(it)
 			if ref == "" || i.s("ref") == ref {
-				out = append(out, SchemaPin{Ref: i.s("ref"), Name: i.s("name")})
+				out = append(out, ddb.SchemaPin{Ref: i.s("ref"), Name: i.s("name")})
 			}
 		}
 		if len(q.LastEvaluatedKey) == 0 {
@@ -95,8 +97,8 @@ func (s *Store) Namespaces(ctx context.Context) ([]string, error) {
 
 // RevsByID lists the revisions with id named name, in every namespace
 // (GSI1; the copies of §6.1).
-func (s *Store) RevsByID(ctx context.Context, id, name string) ([]RevCopy, error) {
-	var out []RevCopy
+func (s *Store) RevsByID(ctx context.Context, id, name string) ([]ddb.RevCopy, error) {
+	var out []ddb.RevCopy
 	in := &dynamodb.QueryInput{
 		TableName:                 &s.Table,
 		IndexName:                 strptr(gsiName),
@@ -113,7 +115,7 @@ func (s *Store) RevsByID(ctx context.Context, id, name string) ([]RevCopy, error
 			if !strings.HasPrefix(i.s("SK"), "REV#") || resNameFromRev(i.s("SK")) != name {
 				continue
 			}
-			out = append(out, RevCopy{NS: strings.TrimPrefix(i.s("PK"), "NS#"), RevInfo: scanRevInfo(i)})
+			out = append(out, ddb.RevCopy{NS: strings.TrimPrefix(i.s("PK"), "NS#"), RevInfo: scanRevInfo(i)})
 		}
 		if len(q.LastEvaluatedKey) == 0 {
 			return out, nil

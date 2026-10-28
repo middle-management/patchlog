@@ -68,7 +68,7 @@ func (b *ddbBackend) followSealed(ctx context.Context, rb *remoteBase, head stri
 // followed as far as Levels allow, a read the base made non-public
 // restricting a public branch's, either recorded as a config notice.
 func (b *ddbBackend) followConfig(ctx context.Context, branch, id string, d sourceDoc) error {
-	r := newDDBReads(b, ctx)
+	r := newDDBReads(ctx, b)
 	type state struct {
 		cur      *Config
 		recorded int
@@ -159,7 +159,7 @@ func (b *ddbBackend) followLevel(ctx context.Context, branch, id string, level, 
 // leavesFirst: branch and the branches of it that aren't purged, at any
 // depth, each after its own branches (leavesFirst of remote_branch.go).
 func (b *ddbBackend) leavesFirst(ctx context.Context, branch string) ([]string, error) {
-	r := newDDBReads(b, ctx)
+	r := newDDBReads(ctx, b)
 	return ddbCheck(func() []string {
 		var walk func(n *nsRow) []string
 		walk = func(n *nsRow) []string {

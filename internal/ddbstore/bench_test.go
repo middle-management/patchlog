@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 // bench runs workers goroutines for d, each looping op, and reports ops/s
@@ -71,7 +73,7 @@ func benchStores(b *testing.B, n int) []*Store {
 	var stores []*Store
 	for i := range n {
 		ns := fmt.Sprintf("ns%d", i)
-		if _, _, err := s.CreateNamespace(context.Background(), &Create{NS: ns, Author: "bench", Patches: patches(`[{"op":"add","path":"","value":{}}]`)}); err != nil {
+		if _, _, err := s.CreateNamespace(context.Background(), &ddb.Create{NS: ns, Author: "bench", Patches: patches(`[{"op":"add","path":"","value":{}}]`)}); err != nil {
 			b.Fatal(err)
 		}
 		stores = append(stores, s)
@@ -175,7 +177,7 @@ func BenchmarkDDB(b *testing.B) {
 			}
 		}
 		bench(b, 1, 3*time.Second, func(i int) error {
-			return s.EntriesBetween(ctx, "ns0", 0, 1<<40, 100, func(*EntryRow) bool { return true })
+			return s.EntriesBetween(ctx, "ns0", 0, 1<<40, 100, func(*ddb.EntryRow) bool { return true })
 		})
 	})
 }

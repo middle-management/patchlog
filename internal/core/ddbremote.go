@@ -33,7 +33,7 @@ func (b *ddbBackend) registerRemote(ctx context.Context, req Request, rr RemoteR
 	defer func() { endDBSpan(span, err) }()
 	drawn := false
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
-		r := newDDBReads(b, ctx)
+		r := newDDBReads(ctx, b)
 		g := &gate{checkReads: r, checkState: &checkState{e: e, now: e.now(), write: true, rateDrawn: &drawn}}
 		type planned struct {
 			p      *regPlan
@@ -660,7 +660,7 @@ func (b *ddbBackend) mirrorInto(ctx context.Context, ns string, schemas []*remot
 // created for a source that requires nonces (requireNonces of nonce.go).
 func (b *ddbBackend) requireNonces(ctx context.Context, ns string, a *actor, gid string) error {
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
-		r := newDDBReads(b, ctx)
+		r := newDDBReads(ctx, b)
 		g := &gate{checkReads: r, checkState: &checkState{e: b.e, now: b.e.now(), write: true}}
 		type planned struct {
 			n *nsRow
@@ -838,7 +838,7 @@ func (b *ddbBackend) followPurges(ctx context.Context, rb *remoteBase, entries [
 // copies with them.
 func (b *ddbBackend) purgeAsServer(ctx context.Context, ns, name, author string) error {
 	all := append([]string{ns}, b.branchNames(ctx, ns)...)
-	reach, err := newDDBReads(b, ctx).purgeReach(all, name)
+	reach, err := newDDBReads(ctx, b).purgeReach(all, name)
 	if err != nil {
 		return err
 	}

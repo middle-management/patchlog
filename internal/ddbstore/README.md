@@ -85,7 +85,7 @@ go test ./internal/ddbstore/            # the hermetic tests (keys, commit layou
 docker run -d --name ddb-local -p 8000:8000 amazon/dynamodb-local
 DDB_ENDPOINT=http://localhost:8000 go test ./internal/ddbstore/   # + the integration tests
 DDB_ENDPOINT=http://localhost:8000 go test -run TestDDB ./internal/core/  # what the API suites can't reach
-DDB_ENDPOINT=http://localhost:8000 go test -run XXX -bench BenchmarkDDB -benchtime 1x ./internal/ddb/
+DDB_ENDPOINT=http://localhost:8000 go test -run XXX -bench BenchmarkDDB -benchtime 1x ./internal/ddbstore/
 PATCHLOG_TEST_BACKEND=dynamodb DDB_ENDPOINT=http://localhost:8000 go test ./...   # the API suites on DynamoDB (internal/testenv)
 ```
 

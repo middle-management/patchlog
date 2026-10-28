@@ -832,7 +832,10 @@ PATCHLOG_TEST_BACKEND=dynamodb DDB_ENDPOINT=http://localhost:8000 go test ./...
 ```
 
 runs them on DynamoDB Local, a fresh table each, as `PATCHLOG_TEST_PG`
-runs them on Postgres; CI's `dynamodb` job does. What the backend hasn't
+runs them on Postgres; CI's `dynamodb` job does. DynamoDB Local serves
+about one request at a time, so `DDB_ENDPOINT` may list several
+instances, comma-separated, and the tests' tables are spread over them:
+four take a full run from 410 s to 277 s on four cores. What the backend hasn't
 built skips without per-test annotations: `core.Open` refusing an option
 with `core.ErrUnsupported` (the SQL write path's hooks), or a `501 {"code":"unsupported"}`
 answer on the test's own goroutine. Tests that run and answer
@@ -869,7 +872,7 @@ store can be a module a build links in to serve `dynamodb://`. Done:
   and items, the transactions, the reads. It registers itself in its
   `init`; `cmd/patchlog` and `internal/testenv` import it, and
   `internal/core` and `internal/server` don't (`go list -deps` shows no
-  AWS package). Its code names the contract's types through aliases.
+  AWS package).
 - Core's adapter (`internal/core/ddb*.go`) stays in core: it is the gate's
   reads and commits over `ddb.Store`, and it needs core's unexported
   gate, rows and caches, which a package outside core would make core
@@ -880,9 +883,10 @@ store can be a module a build links in to serve `dynamodb://`. Done:
   `internal/blobstores`, which `cmd/patchlog` and `internal/testenv`
   import. Core refers to no blob store.
 
-What a `go.mod` of its own for `internal/ddbstore` still has to decide
-is where the binary that serves `dynamodb://` lives: while
-`cmd/patchlog` and `internal/testenv` import the store, the main
-module requires it, and with it the AWS SDK. Moving that import into a
-binary of the store's module (and DynamoDB test runs with it) keeps the
-SDK out of the main module's requirements.
+The store stays in the main module for now, by choice: `cmd/patchlog`
+serves `dynamodb://` as it serves SQLite and Postgres, and the AWS SDK
+is in the main module's requirements, linked into that binary and the
+test harness only. A `go.mod` of the store's own would keep the SDK out
+of those requirements only if the binary that serves `dynamodb://` (and
+DynamoDB test runs) moved into the store's module, or linked it behind
+a build tag; the split above is what either would start from.

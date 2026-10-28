@@ -10,14 +10,16 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 const remLevelPK = "#REMLEVEL"
 
 func keyRemLevel(branch string) Key { return Key{remLevelPK, branch} }
 
-func scanRemoteLevel(i item) RemoteLevel {
-	return RemoteLevel{Branch: i.s("SK"), Level: int(i.n("level")), Lacks: i.s("lacks") == "1", Rebase: i.s("rebase") == "1", ID: i.s("id"), Created: int64(i.n("created"))}
+func scanRemoteLevel(i item) ddb.RemoteLevel {
+	return ddb.RemoteLevel{Branch: i.s("SK"), Level: int(i.n("level")), Lacks: i.s("lacks") == "1", Rebase: i.s("rebase") == "1", ID: i.s("id"), Created: int64(i.n("created"))}
 }
 
 func flag(b bool) types.AttributeValue {
@@ -28,7 +30,7 @@ func flag(b bool) types.AttributeValue {
 }
 
 // PutRemoteLevel records l, replacing the branch's earlier record.
-func (s *Store) PutRemoteLevel(ctx context.Context, l RemoteLevel) error {
+func (s *Store) PutRemoteLevel(ctx context.Context, l ddb.RemoteLevel) error {
 	_, err := s.Client.PutItem(ctx, &dynamodb.PutItemInput{TableName: &s.Table, Item: withKey(keyRemLevel(l.Branch), item{
 		"level": avN(uint64(l.Level)), "lacks": flag(l.Lacks), "rebase": flag(l.Rebase), "id": avS(l.ID), "created": avI(l.Created),
 	})})
@@ -36,7 +38,7 @@ func (s *Store) PutRemoteLevel(ctx context.Context, l RemoteLevel) error {
 }
 
 // RemoteLevelOf is branch's record, nil for none.
-func (s *Store) RemoteLevelOf(ctx context.Context, branch string) (*RemoteLevel, error) {
+func (s *Store) RemoteLevelOf(ctx context.Context, branch string) (*ddb.RemoteLevel, error) {
 	it, err := s.getItem(ctx, keyRemLevel(branch))
 	if it == nil || err != nil {
 		return nil, err
@@ -46,14 +48,14 @@ func (s *Store) RemoteLevelOf(ctx context.Context, branch string) (*RemoteLevel,
 }
 
 // RemoteLevels lists every branch's record, by branch name.
-func (s *Store) RemoteLevels(ctx context.Context) ([]RemoteLevel, error) {
+func (s *Store) RemoteLevels(ctx context.Context) ([]ddb.RemoteLevel, error) {
 	in := &dynamodb.QueryInput{
 		TableName:                 &s.Table,
 		KeyConditionExpression:    strptr("PK = :pk"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": avS(remLevelPK)},
 		ConsistentRead:            boolptr(true),
 	}
-	var out []RemoteLevel
+	var out []ddb.RemoteLevel
 	for {
 		q, err := s.Client.Query(ctx, in)
 		if err != nil {

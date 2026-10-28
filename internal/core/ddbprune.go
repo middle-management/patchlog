@@ -28,7 +28,7 @@ func (b *ddbBackend) prune(ctx context.Context, req Request, name string, pr Pru
 	ctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
-		r := newDDBReads(b, ctx)
+		r := newDDBReads(ctx, b)
 		g := &gate{checkReads: r, checkState: &checkState{e: e, now: e.now(), write: true}}
 		type planned struct {
 			p   *prunePlan
@@ -68,7 +68,7 @@ func (b *ddbBackend) prune(ctx context.Context, req Request, name string, pr Pru
 func (b *ddbBackend) retain(ctx context.Context, ns, name string) (checked, pruned bool, err error) {
 	e := b.e
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
-		r := newDDBReads(b, ctx)
+		r := newDDBReads(ctx, b)
 		g := &gate{checkReads: r, checkState: &checkState{e: e, now: e.now(), write: true}}
 		type planned struct {
 			p       *prunePlan

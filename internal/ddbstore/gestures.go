@@ -23,15 +23,17 @@ import (
 	"sort"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
-func keyGesture(ns string, m GestureMark) Key {
+func keyGesture(ns string, m ddb.GestureMark) Key {
 	return Key{nsPK(ns), fmt.Sprintf("GEST#%s#%s#%s#%013d", m.Gesture, m.Name, padPos(m.Pos), m.Created)}
 }
 
 // PutGestureMarks writes markers in ns, before the commit of their
 // revisions.
-func (s *Store) PutGestureMarks(ctx context.Context, ns string, ms []GestureMark) error {
+func (s *Store) PutGestureMarks(ctx context.Context, ns string, ms []ddb.GestureMark) error {
 	for _, m := range ms {
 		_, err := s.Client.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: &s.Table,
@@ -49,7 +51,7 @@ func (s *Store) PutGestureMarks(ctx context.Context, ns string, ms []GestureMark
 // GestureRevs lists ns's revisions written with gesture or undoing it,
 // in the order they were written: by the entry that wrote them, then
 // their item and step in it.
-func (s *Store) GestureRevs(ctx context.Context, ns, gesture string) ([]GestureRev, error) {
+func (s *Store) GestureRevs(ctx context.Context, ns, gesture string) ([]ddb.GestureRev, error) {
 	var marks []item
 	if err := s.eachItem(ctx, ns, "GEST#"+gesture+"#", func(i item) error {
 		marks = append(marks, i)
@@ -65,7 +67,7 @@ func (s *Store) GestureRevs(ctx context.Context, ns, gesture string) ([]GestureR
 	if err != nil {
 		return nil, err
 	}
-	var out []GestureRev
+	var out []ddb.GestureRev
 	for i, m := range marks {
 		it, ok := revs[keys[i]]
 		if !ok {
@@ -75,14 +77,14 @@ func (s *Store) GestureRevs(ctx context.Context, ns, gesture string) ([]GestureR
 		if ri.ID != m.s("revId") || ri.Created != int64(m.n("created")) || ri.Gesture != gesture && ri.Undoes != gesture {
 			continue // a commit that didn't happen as marked
 		}
-		out = append(out, GestureRev{Name: m.s("name"), Item: int(m.n("item")), Rev: &ri})
+		out = append(out, ddb.GestureRev{Name: m.s("name"), Item: int(m.n("item")), Rev: &ri})
 	}
 	sort.Slice(out, func(i, j int) bool { return gestureBefore(out[i], out[j]) })
 	return out, nil
 }
 
 // gestureBefore orders revisions as they were written.
-func gestureBefore(g, o GestureRev) bool {
+func gestureBefore(g, o ddb.GestureRev) bool {
 	if g.Rev.LogPos != o.Rev.LogPos {
 		return g.Rev.LogPos < o.Rev.LogPos
 	}

@@ -10,6 +10,10 @@ package testenv
 //	PATCHLOG_TEST_BACKEND=dynamodb DDB_ENDPOINT=http://localhost:8000 \
 //	    go test ./internal/server/ ./internal/client/...  # DynamoDB Local
 //
+// DDB_ENDPOINT may list several DynamoDB Local instances, comma-separated:
+// each serves about one request at a time, and the tests' tables are
+// spread over them.
+//
 // Independently, PATCHLOG_TEST_BLOBS (BlobsEnv) moves their blob bytes from
 // a temporary directory to S3.
 //
@@ -61,7 +65,7 @@ import (
 // The backend knobs.
 const (
 	BackendEnv = "PATCHLOG_TEST_BACKEND" // "sqlite" (default), "postgres", "dynamodb"
-	DDBEnv     = "DDB_ENDPOINT"          // DynamoDB Local's URL, for "dynamodb"
+	DDBEnv     = "DDB_ENDPOINT"          // DynamoDB Local's URL, for "dynamodb"; several, comma-separated, are used in turn
 	KnownEnv   = "PATCHLOG_TEST_KNOWN"   // "run": don't skip known divergences
 )
 
@@ -118,11 +122,15 @@ func NewDB(t testing.TB) string {
 
 func newTable(t testing.TB) string {
 	t.Helper()
-	ep := os.Getenv(DDBEnv)
-	if ep == "" {
+	eps := strings.Split(os.Getenv(DDBEnv), ",")
+	if eps[0] == "" {
 		t.Fatalf("%s=%s needs %s (DynamoDB Local's URL)", BackendEnv, DynamoDB, DDBEnv)
 	}
-	url := fmt.Sprintf("dynamodb://test-%d-%d?region=us-east-1&endpoint=%s", time.Now().UnixNano(), tables.Add(1), ep)
+	// DynamoDB Local serves about one request at a time, so with several
+	// instances the tests' tables go to each in turn.
+	n := tables.Add(1)
+	ep := strings.TrimSpace(eps[int(n)%len(eps)])
+	url := fmt.Sprintf("dynamodb://test-%d-%d?region=us-east-1&endpoint=%s", time.Now().UnixNano(), n, ep)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := ddbstore.CreateTable(ctx, url); err != nil {

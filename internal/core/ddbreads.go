@@ -9,6 +9,7 @@ import (
 	"io"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/ddb"
@@ -91,7 +92,7 @@ type ddbRevRef struct {
 	row *revRow // nil until read
 }
 
-func newDDBReads(b *ddbBackend, ctx context.Context) *ddbReads {
+func newDDBReads(ctx context.Context, b *ddbBackend) *ddbReads {
 	return &ddbReads{
 		b: b, e: b.e, s: b.store, ctx: ctx,
 		nss: map[int64]*ddbNS{}, nsNamed: map[string]int64{},
@@ -396,10 +397,69 @@ func (r *ddbReads) cfgRow(seq int64) *ddb.ConfigRow {
 	if !ok {
 		panic(fmt.Errorf("ddb: unknown configuration handle %d", seq))
 	}
-	c, err := r.s.ConfigAt(r.ctx, ref.ns, ref.pos)
-	r.must(err)
+	c := r.b.configAt(r.ctx, ref.ns, ref.pos)
 	if c == nil {
 		panic(fmt.Errorf("ddb: configuration %s/%d missing", ref.ns, ref.pos))
+	}
+	return c
+}
+
+// entryPos is the position of ns's entry id, 0 for none: once found,
+// remembered, since an entry's position never changes (an id absent now
+// may be written later, so absence is read each time). A shadow's import
+// may be cleared and redone, so it is read each time too (configAt).
+func (b *ddbBackend) entryPos(ctx context.Context, ns, id string) uint64 {
+	key := ns + "\x00" + id
+	shadow := strings.HasPrefix(ns, "~")
+	if !shadow {
+		b.cfgMu.Lock()
+		pos, ok := b.entryPositions[key]
+		b.cfgMu.Unlock()
+		if ok {
+			return pos
+		}
+	}
+	pos, err := b.store.EntryPos(ctx, ns, id)
+	if err != nil {
+		panic(err)
+	}
+	if pos > 0 && !shadow {
+		b.cfgMu.Lock()
+		if len(b.entryPositions) >= 1<<16 {
+			b.entryPositions = map[string]uint64{}
+		}
+		b.entryPositions[key] = pos
+		b.cfgMu.Unlock()
+	}
+	return pos
+}
+
+// configAt is ns's configuration item at pos, read once per backend: a
+// configuration, once committed, never changes, and a namespace's name
+// is never reused. A remote branch's shadow ("~") is the exception — its
+// import may be cleared and redone — so it is read each time.
+func (b *ddbBackend) configAt(ctx context.Context, ns string, pos uint64) *ddb.ConfigRow {
+	key := ns + "\x00" + strconv.FormatUint(pos, 10)
+	shadow := strings.HasPrefix(ns, "~")
+	if !shadow {
+		b.cfgMu.Lock()
+		c, ok := b.cfgRows[key]
+		b.cfgMu.Unlock()
+		if ok {
+			return c
+		}
+	}
+	c, err := b.store.ConfigAt(ctx, ns, pos)
+	if err != nil {
+		panic(err)
+	}
+	if c != nil && !shadow {
+		b.cfgMu.Lock()
+		if len(b.cfgRows) >= 4096 {
+			b.cfgRows = map[string]*ddb.ConfigRow{}
+		}
+		b.cfgRows[key] = c
+		b.cfgMu.Unlock()
 	}
 	return c
 }
@@ -475,8 +535,7 @@ func (r *ddbReads) nsLogID(seq int64) ids.ID {
 
 func (r *ddbReads) nsLogSeq(ns int64, id ids.ID) (int64, bool) {
 	name := r.nsName(ns)
-	pos, err := r.s.EntryPos(r.ctx, name, id.String())
-	r.must(err)
+	pos := r.b.entryPos(r.ctx, name, id.String())
 	if pos == 0 {
 		return 0, false
 	}
@@ -509,9 +568,8 @@ func (r *ddbReads) batchEntry(n *nsRow, seq, author int64) (ids.ID, string, []by
 func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 	ns := r.nsName(n.id)
 	v := &view{ns: n, name: name}
-	rr, err := r.s.Resource(r.ctx, ns, name)
-	r.must(err)
 	rh := r.resHandle(ns, name)
+	rr := r.resItem(rh)
 	if rr == nil {
 		// No entries: a handle still, for the resource's pending blobs
 		// (an upload precedes the create that references it), as the
@@ -519,7 +577,6 @@ func (r *ddbReads) resolve(n *nsRow, name string, asOf *int64) *view {
 		v.own = &resRow{id: rh, ns: n.id, name: name}
 		return r.readThrough(n, v)
 	}
-	r.resRows[rh] = rr
 	own := &resRow{id: rh, ns: n.id, name: name, state: stateLive}
 	v.own, v.src = own, own
 	headPos := rr.HeadPos
@@ -825,7 +882,7 @@ func (r *ddbReads) nextEntryCreated(ns, seq int64) (int64, bool) {
 // reads, what they panic with returned as errors (ddbCheck).
 func (b *ddbBackend) gateRead(ctx context.Context, f func(t *gate) error) error {
 	e := b.e
-	g := &gate{checkReads: newDDBReads(b, ctx), checkState: &checkState{e: e, now: e.now()}}
+	g := &gate{checkReads: newDDBReads(ctx, b), checkState: &checkState{e: e, now: e.now()}}
 	err, perr := ddbCheck(func() error { return f(g) })
 	if perr != nil {
 		return perr

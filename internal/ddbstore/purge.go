@@ -20,6 +20,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 // keyPurging marks a purge whose content is still to go: of resource
@@ -27,7 +29,7 @@ import (
 func keyPurging(ns, name string) Key { return Key{nsPK(ns), "PURGING#" + name} }
 
 // purgeActs are a purge's actions in its commit's transaction.
-func (s *Store) purgeActs(c *Commit) []types.TransactWriteItem {
+func (s *Store) purgeActs(c *ddb.Commit) []types.TransactWriteItem {
 	table, ns := &s.Table, c.NS
 	switch {
 	case c.Purge != nil && c.Purge.HeadNS != "":

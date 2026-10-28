@@ -21,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
@@ -55,7 +56,7 @@ func metaVals(pos uint64, id string) map[string]types.AttributeValue {
 // Commit commits c, re-chaining over the tip as other writes move it, or
 // returns ErrStale. With group commit, a write without a config change
 // commits in its namespace's group (group.go).
-func (s *Store) Commit(ctx context.Context, c *Commit) (*CommitResult, error) {
+func (s *Store) Commit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResult, error) {
 	if acts := commitTxActions(c) + txShared; acts > maxTxActions {
 		return nil, apiErr(413, "limit", "limit", "itemsPerBatch", "measured", acts, "max", maxTxActions,
 			"message", "the batch's transaction exceeds 100 actions")
@@ -78,11 +79,11 @@ func (s *Store) Commit(ctx context.Context, c *Commit) (*CommitResult, error) {
 				return nil, err
 			}
 			if cur == nil {
-				return nil, ErrStale // the namespace is gone
+				return nil, ddb.ErrStale // the namespace is gone
 			}
 			t = cur
 		}
-		acts, res, err := s.buildCommits(c.NS, []*Commit{c}, *t)
+		acts, res, err := s.buildCommits(c.NS, []*ddb.Commit{c}, *t)
 		if err != nil {
 			return nil, err
 		}
@@ -90,12 +91,12 @@ func (s *Store) Commit(ctx context.Context, c *Commit) (*CommitResult, error) {
 		if err == nil {
 			return res[0], nil
 		}
-		stale, tipMoved, cerr := classifyCancel(err, []*Commit{c}, len(acts))
+		stale, tipMoved, cerr := classifyCancel(err, []*ddb.Commit{c}, len(acts))
 		switch {
 		case cerr != nil:
 			return nil, cerr
 		case stale[0]:
-			return nil, ErrStale
+			return nil, ddb.ErrStale
 		case tipMoved:
 			known = nil
 			continue
@@ -112,7 +113,7 @@ func (s *Store) Commit(ctx context.Context, c *Commit) (*CommitResult, error) {
 
 // actions counts c's own actions: its config change's, its items', the
 // entry and its marker (not the transaction's tip move and condition).
-func commitActions(c *Commit) int {
+func commitActions(c *ddb.Commit) int {
 	n := commitShared - 1 // entry, marker
 	if c.Config != nil {
 		n += 2 // the META update, the CFG put
@@ -163,7 +164,7 @@ func commitActions(c *Commit) int {
 // txActions counts the actions c adds to a transaction: its own, and the
 // grant's namespace marker, which a transaction writes once however many
 // of its commits record the grant (grantMarks).
-func commitTxActions(c *Commit) int {
+func commitTxActions(c *ddb.Commit) int {
 	n := commitActions(c) + len(c.Pins)
 	if c.Grant != "" {
 		n++
@@ -173,8 +174,8 @@ func commitTxActions(c *Commit) int {
 
 // groupPins are cs's pins, one per namespace (a transaction can't touch
 // an item twice; take groups only commits whose pins agree), in order.
-func groupPins(cs []*Commit) []NSPin {
-	var out []NSPin
+func groupPins(cs []*ddb.Commit) []ddb.NSPin {
+	var out []ddb.NSPin
 	seen := map[string]bool{}
 	for _, c := range cs {
 		for _, p := range c.Pins {
@@ -188,7 +189,7 @@ func groupPins(cs []*Commit) []NSPin {
 }
 
 // lastLive is the item's last revision step, nil if all are tombstones.
-func lastLive(it *CommitItem) *CommitStep {
+func lastLive(it *ddb.CommitItem) *ddb.CommitStep {
 	for i := len(it.Steps) - 1; i >= 0; i-- {
 		if !it.Steps[i].Tombstone {
 			return &it.Steps[i]
@@ -197,7 +198,7 @@ func lastLive(it *CommitItem) *CommitStep {
 	return nil
 }
 
-func commitBytes(c *Commit) int {
+func commitBytes(c *ddb.Commit) int {
 	n := 0
 	for _, it := range c.Items {
 		for _, st := range it.Steps {
@@ -213,9 +214,9 @@ func commitBytes(c *Commit) int {
 // update conditions itself — one condition that the configuration is
 // still the one they were all checked under (a transaction can't touch
 // an item twice). It returns each commit's result.
-func (s *Store) buildCommits(ns string, cs []*Commit, t tip) ([]types.TransactWriteItem, []*CommitResult, error) {
+func (s *Store) buildCommits(ns string, cs []*ddb.Commit, t tip) ([]types.TransactWriteItem, []*ddb.CommitResult, error) {
 	var out []types.TransactWriteItem
-	var res []*CommitResult
+	var res []*ddb.CommitResult
 	prev := t
 	for _, c := range cs {
 		var prevID *ids.ID
@@ -240,7 +241,7 @@ func (s *Store) buildCommits(ns string, cs []*Commit, t tip) ([]types.TransactWr
 			entry.cfgPos = c.CfgPos + 1
 		}
 		out = append(out, s.commitActs(c, entry)...)
-		res = append(res, &CommitResult{NSID: entry.id, Pos: entry.pos, Created: c.Created})
+		res = append(res, &ddb.CommitResult{NSID: entry.id, Pos: entry.pos, Created: c.Created})
 		prev = tip{headPos: entry.pos, headID: entry.id}
 	}
 	out = append(out, s.grantMarks(ns, cs, res)...)
@@ -280,7 +281,7 @@ func (s *Store) buildCommits(ns string, cs []*Commit, t tip) ([]types.TransactWr
 // grant (a transaction can't touch an item twice), each keeping the first
 // entry that records it. Unconditional: they never cancel a transaction,
 // so classifyCancel's layout ignores them.
-func (s *Store) grantMarks(ns string, cs []*Commit, res []*CommitResult) []types.TransactWriteItem {
+func (s *Store) grantMarks(ns string, cs []*ddb.Commit, res []*ddb.CommitResult) []types.TransactWriteItem {
 	var out []types.TransactWriteItem
 	seen := map[string]bool{}
 	for i, c := range cs {
@@ -305,7 +306,7 @@ func grantMark(table, ns, gid string, pos uint64) types.TransactWriteItem {
 // touchesMeta reports whether one of cs updates #META — a config change
 // or a namespace purge, which conditions the update itself (and commits on
 // its own).
-func touchesMeta(cs []*Commit) bool {
+func touchesMeta(cs []*ddb.Commit) bool {
 	for _, c := range cs {
 		if c.Config != nil || c.PurgeNS {
 			return true
@@ -316,7 +317,7 @@ func touchesMeta(cs []*Commit) bool {
 
 // alone reports whether c commits on its own, outside group commit: one
 // that updates #META, purges, prunes or branches.
-func commitAlone(c *Commit) bool {
+func commitAlone(c *ddb.Commit) bool {
 	return c.Config != nil || c.PurgeNS || c.Purge != nil || c.Branch != nil || c.Prune != nil || c.Registration != nil || c.EpochKey != nil || len(c.RotationsDue) > 0
 }
 
@@ -324,7 +325,7 @@ func commitAlone(c *Commit) bool {
 // classifyCancel reads: a config change's META update and CFG put; each
 // item's revisions, head, document and history row; the entry; the
 // marker (last).
-func (s *Store) commitActs(c *Commit, entry logRow) []types.TransactWriteItem {
+func (s *Store) commitActs(c *ddb.Commit, entry logRow) []types.TransactWriteItem {
 	table, ns := &s.Table, c.NS
 	var out []types.TransactWriteItem
 	if cc := c.Config; cc != nil {
@@ -389,7 +390,7 @@ func (s *Store) commitActs(c *Commit, entry logRow) []types.TransactWriteItem {
 // parent: attribute_not_exists), the head moved from the one the checks
 // read, the head document (the last live one, which a tombstone keeps)
 // and, for a live head, its history row.
-func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.TransactWriteItem {
+func (s *Store) itemActs(c *ddb.Commit, it *ddb.CommitItem, entry logRow) []types.TransactWriteItem {
 	table, ns := &s.Table, c.NS
 	var out []types.TransactWriteItem
 	pos := it.HeadPos
@@ -466,7 +467,7 @@ func (s *Store) itemActs(c *Commit, it *CommitItem, entry logRow) []types.Transa
 // condition did (every commit's), tipMoved when the tip's or an entry's
 // did (another write took the position). err is a failure that isn't a
 // cancellation, which nothing here can retry.
-func classifyCancel(err error, cs []*Commit, n int) (stale []bool, tipMoved bool, outErr error) {
+func classifyCancel(err error, cs []*ddb.Commit, n int) (stale []bool, tipMoved bool, outErr error) {
 	stale = make([]bool, len(cs))
 	var xe *types.TransactionConflictException
 	if errors.As(err, &xe) {
@@ -525,7 +526,7 @@ func classifyCancel(err error, cs []*Commit, n int) (stale []bool, tipMoved bool
 }
 
 // seal is Seal, for a commit that has one.
-func commitSeal(c *Commit, name, kind, key, plain string) string {
+func commitSeal(c *ddb.Commit, name, kind, key, plain string) string {
 	if c.Seal == nil {
 		return plain
 	}

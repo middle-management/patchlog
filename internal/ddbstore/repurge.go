@@ -12,13 +12,15 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 const repurgePK = "#REPURGE"
 
 // repurgeAct queues c's second purge, keyed by when it is due and by the
 // entry, which is unique in its namespace.
-func (s *Store) repurgeAct(c *Commit, entry logRow) []types.TransactWriteItem {
+func (s *Store) repurgeAct(c *ddb.Commit, entry logRow) []types.TransactWriteItem {
 	if c.Repurge == nil {
 		return nil
 	}
@@ -29,7 +31,7 @@ func (s *Store) repurgeAct(c *Commit, entry logRow) []types.TransactWriteItem {
 
 // DueRepurges lists up to limit second purges due at now (milliseconds),
 // the earliest first.
-func (s *Store) DueRepurges(ctx context.Context, now int64, limit int) ([]Repurge, error) {
+func (s *Store) DueRepurges(ctx context.Context, now int64, limit int) ([]ddb.Repurge, error) {
 	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
 		TableName:              &s.Table,
 		KeyConditionExpression: strptr("PK = :pk AND SK < :hi"),
@@ -42,12 +44,12 @@ func (s *Store) DueRepurges(ctx context.Context, now int64, limit int) ([]Repurg
 	if err != nil {
 		return nil, err
 	}
-	var out []Repurge
+	var out []ddb.Repurge
 	for _, it := range q.Items {
 		i := item(it)
 		sk := i.s("SK")
 		due, _ := parsePos(sk[:strings.IndexByte(sk, '#')])
-		r := Repurge{Key: sk, Due: int64(due)}
+		r := ddb.Repurge{Key: sk, Due: int64(due)}
 		if json.Unmarshal([]byte(i.s("tags")), &r.Tags) != nil {
 			r.Tags = nil // unreadable: dropped
 		}

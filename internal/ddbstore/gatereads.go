@@ -13,11 +13,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // Namespace reads ns's meta and tip; nil when it doesn't exist.
-func (s *Store) Namespace(ctx context.Context, ns string) (*NSRow, error) {
+func (s *Store) Namespace(ctx context.Context, ns string) (*ddb.NSRow, error) {
 	out, err := s.Client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
 		RequestItems: map[string]types.KeysAndAttributes{
 			s.Table: {Keys: []map[string]types.AttributeValue{keyAV(keyMeta(ns)), keyAV(keyTip(ns))}, ConsistentRead: boolptr(true)},
@@ -29,13 +30,13 @@ func (s *Store) Namespace(ctx context.Context, ns string) (*NSRow, error) {
 	if len(out.UnprocessedKeys) > 0 {
 		return nil, apiErr(503, "throughput", "detail", "unprocessed keys")
 	}
-	var r *NSRow
+	var r *ddb.NSRow
 	var t *tip
 	for _, it := range out.Responses[s.Table] {
 		switch i := item(it); i.s("SK") {
 		case "#META":
 			m := scanNSMeta(i)
-			r = &NSRow{Frozen: m.frozen, Purged: m.purged, ConfigPos: m.configPos, ConfigID: m.configID,
+			r = &ddb.NSRow{Frozen: m.frozen, Purged: m.purged, ConfigPos: m.configPos, ConfigID: m.configID,
 				Base: m.base, BaseAt: m.baseAt, BaseCfgPos: m.baseCfgPos}
 		case "#TIP":
 			t = scanTip(i)
@@ -59,16 +60,16 @@ func (s *Store) Namespace(ctx context.Context, ns string) (*NSRow, error) {
 	return r, nil
 }
 
-func scanConfigRow(i item) (*ConfigRow, error) {
+func scanConfigRow(i item) (*ddb.ConfigRow, error) {
 	doc, err := jsonv.Parse([]byte(i.s("doc")))
 	if err != nil {
 		return nil, err
 	}
-	return &ConfigRow{Pos: i.n("pos"), ID: i.s("id"), Doc: doc, Author: i.s("author"), LogPos: i.n("logPos")}, nil
+	return &ddb.ConfigRow{Pos: i.n("pos"), ID: i.s("id"), Doc: doc, Author: i.s("author"), LogPos: i.n("logPos")}, nil
 }
 
 // ConfigAt reads ns's configuration at pos; nil when there is none.
-func (s *Store) ConfigAt(ctx context.Context, ns string, pos uint64) (*ConfigRow, error) {
+func (s *Store) ConfigAt(ctx context.Context, ns string, pos uint64) (*ddb.ConfigRow, error) {
 	it, err := s.getItem(ctx, keyCfg(ns, pos))
 	if err != nil || it == nil {
 		return nil, err
@@ -77,7 +78,7 @@ func (s *Store) ConfigAt(ctx context.Context, ns string, pos uint64) (*ConfigRow
 }
 
 // ConfigByID finds ns's configuration id (GSI1); nil when there is none.
-func (s *Store) ConfigByID(ctx context.Context, ns, id string) (*ConfigRow, error) {
+func (s *Store) ConfigByID(ctx context.Context, ns, id string) (*ddb.ConfigRow, error) {
 	q, err := s.Client.Query(ctx, &dynamodb.QueryInput{
 		TableName:              &s.Table,
 		IndexName:              strptr(gsiName),
@@ -97,17 +98,17 @@ func (s *Store) ConfigByID(ctx context.Context, ns, id string) (*ConfigRow, erro
 }
 
 // Resource reads ns's resource name; nil when it has none.
-func (s *Store) Resource(ctx context.Context, ns, name string) (*ResRow, error) {
+func (s *Store) Resource(ctx context.Context, ns, name string) (*ddb.ResRow, error) {
 	r, err := s.getRes(ctx, ns, name)
 	if err != nil || r == nil || r.headPos == 0 {
 		return nil, err
 	}
-	return &ResRow{HeadPos: r.headPos, HeadID: r.headID, HeadNS: r.headNS, Tombstoned: r.state == "tombstoned", Purged: r.state == "purged", EntryID: r.entryID, LastID: r.lastID, LastPos: r.lastPos,
+	return &ddb.ResRow{HeadPos: r.headPos, HeadID: r.headID, HeadNS: r.headNS, Tombstoned: r.state == "tombstoned", Purged: r.state == "purged", EntryID: r.entryID, LastID: r.lastID, LastPos: r.lastPos,
 		HorizonPos: r.horizonPos, HorizonID: r.horizonID, Keep: r.keep}, nil
 }
 
 // RevAt reads resource name's chain at pos; nil when there is none.
-func (s *Store) RevAt(ctx context.Context, ns, name string, pos uint64) (*RevInfo, error) {
+func (s *Store) RevAt(ctx context.Context, ns, name string, pos uint64) (*ddb.RevInfo, error) {
 	it, err := s.getItem(ctx, keyRev(ns, name, pos))
 	if err != nil || it == nil {
 		return nil, err
@@ -211,7 +212,7 @@ func (s *Store) docBelow(ctx context.Context, ns, name string, res *resRow, pos 
 	}
 	if p, err := s.newestPruned(ctx, ns, name, from, pos, res.horizonPos); err != nil || p > 0 {
 		if err == nil {
-			err = &PrunedError{NS: ns, Name: name, Pos: p}
+			err = &ddb.PrunedError{NS: ns, Name: name, Pos: p}
 		}
 		return nil, err
 	}
@@ -223,7 +224,7 @@ func (s *Store) docBelow(ctx context.Context, ns, name string, res *resRow, pos 
 			return nil, err
 		}
 		if !ok {
-			return nil, &PrunedError{NS: ns, Name: name, Pos: pos}
+			return nil, &ddb.PrunedError{NS: ns, Name: name, Pos: pos}
 		}
 		if start, err = jsonv.Parse(b); err != nil {
 			return nil, err
@@ -235,7 +236,7 @@ func (s *Store) docBelow(ctx context.Context, ns, name string, res *resRow, pos 
 }
 
 // EntryAt reads ns's log entry at pos; nil when there is none.
-func (s *Store) EntryAt(ctx context.Context, ns string, pos uint64) (*EntryRow, error) {
+func (s *Store) EntryAt(ctx context.Context, ns string, pos uint64) (*ddb.EntryRow, error) {
 	it, err := s.getItem(ctx, keyLog(ns, pos))
 	if err != nil || it == nil {
 		return nil, err
@@ -243,8 +244,8 @@ func (s *Store) EntryAt(ctx context.Context, ns string, pos uint64) (*EntryRow, 
 	return scanEntry(item(it)), nil
 }
 
-func scanEntry(i item) *EntryRow {
-	return &EntryRow{
+func scanEntry(i item) *ddb.EntryRow {
+	return &ddb.EntryRow{
 		Pos: i.n("pos"), PrevPos: i.n("prevPos"), ID: i.s("id"), Kind: i.s("kind"), Body: i.s("body"), Author: i.s("author"),
 		Created: int64(i.n("created")), Gesture: i.s("gesture"), Undoes: i.s("undoes"), Gestures: i.s("gestures"),
 		CfgPos: i.n("cfgPos"), GrantID: i.s("grantId"), NoAuth: i.n("noAuth") != 0, Via: i.s("via"),
@@ -254,14 +255,14 @@ func scanEntry(i item) *EntryRow {
 // EntriesBetween visits ns's log entries after position from up to and
 // including position to, in chain order, at most limit of them (0: all),
 // while visit returns true.
-func (s *Store) EntriesBetween(ctx context.Context, ns string, from, to uint64, limit int, visit func(*EntryRow) bool) error {
+func (s *Store) EntriesBetween(ctx context.Context, ns string, from, to uint64, limit int, visit func(*ddb.EntryRow) bool) error {
 	return s.rangeOf(ctx, ns, "LOG#", from, to, limit, func(i item) bool { return visit(scanEntry(i)) })
 }
 
 // RevsBetween visits name's revisions after position from up to and
 // including position to, oldest first, at most limit of them (0: all),
 // while visit returns true.
-func (s *Store) RevsBetween(ctx context.Context, ns, name string, from, to uint64, limit int, visit func(*RevInfo) bool) error {
+func (s *Store) RevsBetween(ctx context.Context, ns, name string, from, to uint64, limit int, visit func(*ddb.RevInfo) bool) error {
 	return s.rangeOf(ctx, ns, "REV#"+name+"#", from, to, limit, func(i item) bool {
 		ri := scanRevInfo(i)
 		return visit(&ri)

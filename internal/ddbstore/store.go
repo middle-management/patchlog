@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
@@ -59,7 +60,7 @@ func (s *Store) now() time.Time {
 // CreateNamespace bootstraps a namespace with its config genesis and first
 // log entry (insertNamespace of nsops.go).
 
-func (s *Store) CreateNamespace(ctx context.Context, c *Create) (cfgID, nsID string, err error) {
+func (s *Store) CreateNamespace(ctx context.Context, c *ddb.Create) (cfgID, nsID string, err error) {
 	ns, author, patches := c.NS, c.Author, c.Patches
 	doc, _, err := applyPatches(nil, false, patches)
 	if err != nil {
@@ -114,7 +115,7 @@ func (s *Store) CreateNamespace(ctx context.Context, c *Create) (cfgID, nsID str
 // first page uses begins_with(RES#); later pages use SK > the cursor,
 // which can run past RES# into REV# — the loop stops at the prefix
 // boundary, as ReadLog's does.
-func (s *Store) ListHeads(ctx context.Context, ns, after string, limit int) ([]HeadEntry, string, error) {
+func (s *Store) ListHeads(ctx context.Context, ns, after string, limit int) ([]ddb.HeadEntry, string, error) {
 	cond := "PK = :pk AND begins_with(SK, :pfx)"
 	vals := map[string]types.AttributeValue{":pk": avS(nsPK(ns)), ":pfx": avS("RES#")}
 	if after != "" {
@@ -133,7 +134,7 @@ func (s *Store) ListHeads(ctx context.Context, ns, after string, limit int) ([]H
 	if err != nil {
 		return nil, "", err
 	}
-	var out []HeadEntry
+	var out []ddb.HeadEntry
 	var next string
 	for _, it := range q.Items {
 		i := item(it)
@@ -144,7 +145,7 @@ func (s *Store) ListHeads(ctx context.Context, ns, after string, limit int) ([]H
 			next = out[len(out)-1].Name
 			break
 		}
-		out = append(out, HeadEntry{
+		out = append(out, ddb.HeadEntry{
 			Name: resName(i.s("SK")), ID: i.s("headId"), Tombstoned: i.s("state") == "tombstoned",
 			Created: int64(i.n("headCreated")), Size: i.n("headSize"), Digest: i.b("headDigest"),
 		})
@@ -209,8 +210,8 @@ func boolptr(b bool) *bool    { return &b }
 func int32ptr(n int32) *int32 { return &n }
 
 // scanRevInfo reads a REV# item (a revision or a tombstone) as served.
-func scanRevInfo(i item) RevInfo {
-	return RevInfo{
+func scanRevInfo(i item) ddb.RevInfo {
+	return ddb.RevInfo{
 		Name:      resNameFromRev(i.s("SK")),
 		ID:        i.s("id"),
 		Pos:       i.n("pos"),
@@ -238,7 +239,7 @@ func scanRevInfo(i item) RevInfo {
 
 // open is Open for a stored value, which a plaintext one needs not.
 func (s *Store) open(ctx context.Context, ns, name, kind, key, raw string) (string, error) {
-	if s.Open == nil || !strings.HasPrefix(raw, Sealed) {
+	if s.Open == nil || !strings.HasPrefix(raw, ddb.Sealed) {
 		return raw, nil
 	}
 	return s.Open(ctx, ns, name, kind, key, raw)

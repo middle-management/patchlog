@@ -43,6 +43,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+
+	"github.com/middle-management/patchlog/internal/ddb"
 )
 
 // groupBytes bounds a group's bytes (documents and patch sets), under
@@ -53,9 +55,9 @@ const groupBytes = 3 << 20
 // groupMember is a commit waiting in its namespace's queue.
 type groupMember struct {
 	ctx context.Context
-	c   *Commit
+	c   *ddb.Commit
 	// Set by the worker before done is closed.
-	res  *CommitResult
+	res  *ddb.CommitResult
 	err  error
 	done chan struct{}
 }
@@ -138,7 +140,7 @@ func (s *Store) GroupStats() (groups, writes int64) {
 func (s *Store) grouping() bool { return s.GroupCommit > 1 }
 
 // commitGrouped queues a commit and waits for its group.
-func (s *Store) commitGrouped(ctx context.Context, c *Commit) (*CommitResult, error) {
+func (s *Store) commitGrouped(ctx context.Context, c *ddb.Commit) (*ddb.CommitResult, error) {
 	w := &groupMember{ctx: ctx, c: c, done: make(chan struct{})}
 	g := &s.g
 	g.mu.Lock()
@@ -207,7 +209,7 @@ func (q *nsQueue) take(limit int) []*groupMember {
 	for _, n := range first.names() {
 		names[n] = true
 	}
-	pins := map[string]NSPin{}
+	pins := map[string]ddb.NSPin{}
 	for _, p := range first.c.Pins {
 		pins[p.NS] = p
 	}
@@ -263,11 +265,11 @@ func (s *Store) commitGroup(ns string, group []*groupMember, known *tip) *tip {
 				return fail(live, err)
 			}
 			if cur == nil {
-				return fail(live, ErrStale)
+				return fail(live, ddb.ErrStale)
 			}
 			t = cur
 		}
-		cs := make([]*Commit, len(live))
+		cs := make([]*ddb.Commit, len(live))
 		for i, w := range live {
 			cs[i] = w.c
 		}
@@ -294,7 +296,7 @@ func (s *Store) commitGroup(ns string, group []*groupMember, known *tip) *tip {
 		var keep []*groupMember
 		for i, w := range live {
 			if stale[i] {
-				w.err = ErrStale
+				w.err = ddb.ErrStale
 			} else {
 				keep = append(keep, w)
 			}
@@ -320,7 +322,7 @@ func (s *Store) commitGroup(ns string, group []*groupMember, known *tip) *tip {
 
 // pinsAgree reports whether a commit's pins agree with a group's: the
 // group checks each namespace's configuration once.
-func pinsAgree(group map[string]NSPin, pins []NSPin) bool {
+func pinsAgree(group map[string]ddb.NSPin, pins []ddb.NSPin) bool {
 	for _, p := range pins {
 		if g, ok := group[p.NS]; ok && g != p {
 			return false

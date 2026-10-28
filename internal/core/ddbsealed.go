@@ -236,7 +236,7 @@ func (b *ddbBackend) rotationsDue(ctx context.Context) ([]string, error) {
 // dropRotation: as SQL's, nothing is left to rotate in a namespace purged
 // or no longer sealed.
 func (b *ddbBackend) dropRotation(ctx context.Context, ns string) (bool, error) {
-	r := newDDBReads(b, ctx)
+	r := newDDBReads(ctx, b)
 	drop, perr := ddbCheck(func() bool {
 		n := r.nsByName(ns)
 		return n == nil || n.purged || r.config(n.configSeq).level != levelSealed
@@ -280,7 +280,7 @@ func (b *ddbBackend) storeSealed(ctx context.Context, ns string, jobs []*sealJob
 // committed with its epoch's key.
 func (b *ddbBackend) rotateEpoch(ctx context.Context, ns, author string, ifDue bool) (int, bool, error) {
 	for attempt := 0; attempt < ddbAttempts; attempt++ {
-		r := newDDBReads(b, ctx)
+		r := newDDBReads(ctx, b)
 		g := &gate{checkReads: r, checkState: &checkState{e: b.e, now: b.e.now(), write: true}}
 		type planned struct {
 			n   *nsRow
