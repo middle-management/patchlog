@@ -211,7 +211,9 @@ func Unseal(r io.Reader, identity *ecdh.PrivateKey) (plain io.Reader, sealed boo
 	if err != nil && err != io.EOF {
 		return nil, false, err
 	}
-	env, ok, err := seal.ParseBundleEnvelope(bytes.TrimSpace(first))
+	// The envelope is followed by exactly one 0x0A, nothing else
+	// (§G.5.1.1): only that is taken off.
+	env, ok, err := seal.ParseBundleEnvelope(bytes.TrimSuffix(first, []byte("\n")))
 	if err != nil {
 		return nil, true, sealedErr(err)
 	}

@@ -1,6 +1,6 @@
 {
   "section": "§G.5.1.1",
-  "about": "sealed bundles to the recipient seq(0x20) (keywrap.json): the envelope line, then each bundle line as a JWE under K_b with pl {bundle, line, last?}; the digest is the plain bundle's (§G.4.1). The stored bundles were drawn under a fixed seed and are decrypt vectors; the rejection cases reuse their envelope and lines, or seal a line under the same K_b with the IV seq(0xc0)[:12]; each rejected case names the rule it breaks, and the informative ones, which the spec leaves open, give the reference's verdict only",
+  "about": "sealed bundles to the recipient seq(0x20) (keywrap.json): the envelope line, then each bundle line as a JWE under K_b with pl {bundle, line, last?}; the digest is the plain bundle's (§G.4.1). The stored bundles were drawn under a fixed seed and are decrypt vectors; the rejection cases reuse their envelope and lines, or seal a line under the same K_b with the IV seq(0xc0)[:12]; each rejected case names the rule it breaks",
   "recipient_private": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
   "K_b": "dbe5882e2579683432c1bfc525454add0cd87274d67084caaf0e0d36c8496db7",
   "vectors": [
@@ -92,31 +92,53 @@
       "verdict": "reject"
     },
     {
-      "name": "last beside pl (before v0.73)",
+      "name": "last beside pl (as written before v0.73)",
       "fn": "built from the sealed bundle's lines (opened by seal.OpenBundle, read by bundle.NewReader)",
       "sealed": "{\"id\":\"auZ4P0-96RtuuItzpI7SRw\",\"recipients\":[{\"kid\":\"5_RYhfysTyU1BDBnv9LSpAGNHJ_A1_UesBCKoRG370E\",\"suite\":\"hpke-base-0x0020-0x0001-0x0002\",\"wrapped\":\"qOEsrFfQ5Y0IhiuiliORWAQzhGlJcMKuQw90ZdV851fEb8UlPgrdP1U8de6PBjNaodTtMiXXXGFcMBEQ3tDUBPy8Q4SkD88eVuu5cHhiB_U\"}],\"sealedBundle\":1}\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxpbmUiOjB9fQ..wMHCw8TFxsfIycrL.1je8ZLgmKvpMeTKrLgCJ05X8EQ90VOQZzDfKd_G44F8s447Lg4nQR2L15MIsXCMJ7kOxd5Gemct1xnl2Am1xliMOJPBDLI9rS9lsxq1fpIACqgW_iIxjAYeJID8TwQ94JB5-8T0tIPh1kiMEJxPvQ9YUsGx75mk782mhJIqPxnyyajFmfPJkmSHjempHWykjkTDaAdHLqnl3Wb1uRvp0S45Lzc9wVosy73et42OMg6LgMcBxIfRfD1d5cgY4Il3IWNFM_huXMXL8apf_F0h8FSYKA3dHCNPa0N8hhqjM367mCczTFQkNPZyH5k4.oV3Yapz3OajZuNUJKd0sJA\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwibGFzdCI6dHJ1ZSwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxpbmUiOjF9fQ..wMHCw8TFxsfIycrL.1je0dLgmc-lNKiGhdA2SnJyoVEgnCvlDlSvbNPi3o0s1-t7Hx5POWDq988IiXiFbrBeuMJqQl4huwTMjUnMy2CYHLfAELI95X8VtxLxfpJMMpES9jJl0DIbYOCd6ih8heQ10_mx9EOtrimNVaUv9I9Yavipi5HZsrDC5MsmPzGC7fDw4O8hjjG-2I2QNSCEixHnaCo2EsE1pE6dmBuN1Dt9CnMc9R4gx_WX-7g.rttYP30AkOni182VuPf3ZA\n",
-      "informative": "the reference still reads last beside pl, as written before v0.73; §G.5.1.1 doesn't say whether a reader must",
-      "verdict": "accept",
-      "plain": "{\"at\":{\"matches\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\"},\"authors\":false,\"bundle\":1,\"created\":\"2026-10-04T12:00:00Z\",\"docs\":{\"matches/derby\":{\"head\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"history\":\"full\"}},\"origin\":\"https://staging.example\"}\n{\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"ns\":\"matches\",\"parent\":\"\",\"patches\":[{\"op\":\"add\",\"path\":\"\",\"value\":{\"title\":\"Hello\",\"views\":0}}],\"resource\":\"derby\"}\n",
-      "digest": "1sux75eakfxstck6w44vs3zyxrkbjgtlq"
+      "rule": "the protected header, pl included, has no other members (§G.5.1.1)",
+      "verdict": "reject"
+    },
+    {
+      "name": "an extra pl member",
+      "fn": "built from the sealed bundle's lines (opened by seal.OpenBundle, read by bundle.NewReader)",
+      "sealed": "{\"id\":\"auZ4P0-96RtuuItzpI7SRw\",\"recipients\":[{\"kid\":\"5_RYhfysTyU1BDBnv9LSpAGNHJ_A1_UesBCKoRG370E\",\"suite\":\"hpke-base-0x0020-0x0001-0x0002\",\"wrapped\":\"qOEsrFfQ5Y0IhiuiliORWAQzhGlJcMKuQw90ZdV851fEb8UlPgrdP1U8de6PBjNaodTtMiXXXGFcMBEQ3tDUBPy8Q4SkD88eVuu5cHhiB_U\"}],\"sealedBundle\":1}\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxpbmUiOjB9fQ..7mNazKih4tdnZmPz.0DND-H26XyvcQrGN4nsM0nolsvYijItiFjk8glKnDXO18jILSvcmVmwTIWdQP7r47aytiIzEu5b0j5wthWQshvZaVrlPFC_NvO7jUTQZlFjWto4zSunO2gXaL7Wiv-ZFsn4q0pkB1N2tzHRuEZL2j1atXXAmozTn-sZ0E3pqdZYrychnykAbtuIFucgG6H4xzy8kowDNMgaNylteiyaRrykyqC4-IlNJh2hv6Y1IX2ssEv0LhZXIa7dyD8ajFWqP_rNgIIy5aEya0JG_LmMDDev3iF0n7L6zZVg9c8IaiagbZ9-7PwP8i-Ofy6c.ACxZvYRprKW-gkkMmsnl0g\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxhc3QiOnRydWUsImxpbmUiOjEsIngiOiIxIn19..wMHCw8TFxsfIycrL.1je0dLgmc-lNKiGhdA2SnJyoVEgnCvlDlSvbNPi3o0s1-t7Hx5POWDq988IiXiFbrBeuMJqQl4huwTMjUnMy2CYHLfAELI95X8VtxLxfpJMMpES9jJl0DIbYOCd6ih8heQ10_mx9EOtrimNVaUv9I9Yavipi5HZsrDC5MsmPzGC7fDw4O8hjjG-2I2QNSCEixHnaCo2EsE1pE6dmBuN1Dt9CnMc9R4gx_WX-7g.rI-yC2N6WPcuSIY1CUDNAA\n",
+      "rule": "the protected header, pl included, has no other members (§G.5.1.1)",
+      "verdict": "reject"
+    },
+    {
+      "name": "protected header not canonical",
+      "fn": "built from the sealed bundle's lines (opened by seal.OpenBundle, read by bundle.NewReader)",
+      "sealed": "{\"id\":\"auZ4P0-96RtuuItzpI7SRw\",\"recipients\":[{\"kid\":\"5_RYhfysTyU1BDBnv9LSpAGNHJ_A1_UesBCKoRG370E\",\"suite\":\"hpke-base-0x0020-0x0001-0x0002\",\"wrapped\":\"qOEsrFfQ5Y0IhiuiliORWAQzhGlJcMKuQw90ZdV851fEb8UlPgrdP1U8de6PBjNaodTtMiXXXGFcMBEQ3tDUBPy8Q4SkD88eVuu5cHhiB_U\"}],\"sealedBundle\":1}\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxpbmUiOjB9fQ..7mNazKih4tdnZmPz.0DND-H26XyvcQrGN4nsM0nolsvYijItiFjk8glKnDXO18jILSvcmVmwTIWdQP7r47aytiIzEu5b0j5wthWQshvZaVrlPFC_NvO7jUTQZlFjWto4zSunO2gXaL7Wiv-ZFsn4q0pkB1N2tzHRuEZL2j1atXXAmozTn-sZ0E3pqdZYrychnykAbtuIFucgG6H4xzy8kowDNMgaNylteiyaRrykyqC4-IlNJh2hv6Y1IX2ssEv0LhZXIa7dyD8ajFWqP_rNgIIy5aEya0JG_LmMDDev3iF0n7L6zZVg9c8IaiagbZ9-7PwP8i-Ofy6c.ACxZvYRprKW-gkkMmsnl0g\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsibGluZSI6MSwibGFzdCI6dHJ1ZSwiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyJ9fQ..wMHCw8TFxsfIycrL.1je0dLgmc-lNKiGhdA2SnJyoVEgnCvlDlSvbNPi3o0s1-t7Hx5POWDq988IiXiFbrBeuMJqQl4huwTMjUnMy2CYHLfAELI95X8VtxLxfpJMMpES9jJl0DIbYOCd6ih8heQ10_mx9EOtrimNVaUv9I9Yavipi5HZsrDC5MsmPzGC7fDw4O8hjjG-2I2QNSCEixHnaCo2EsE1pE6dmBuN1Dt9CnMc9R4gx_WX-7g.825zi7geBYYjRuK2yrlTNQ\n",
+      "rule": "the protected header is canonical JSON (§G.5.1.1)",
+      "verdict": "reject"
     },
     {
       "name": "a blank line between sealed lines",
       "fn": "built from the sealed bundle's lines (opened by seal.OpenBundle, read by bundle.NewReader)",
       "sealed": "{\"id\":\"auZ4P0-96RtuuItzpI7SRw\",\"recipients\":[{\"kid\":\"5_RYhfysTyU1BDBnv9LSpAGNHJ_A1_UesBCKoRG370E\",\"suite\":\"hpke-base-0x0020-0x0001-0x0002\",\"wrapped\":\"qOEsrFfQ5Y0IhiuiliORWAQzhGlJcMKuQw90ZdV851fEb8UlPgrdP1U8de6PBjNaodTtMiXXXGFcMBEQ3tDUBPy8Q4SkD88eVuu5cHhiB_U\"}],\"sealedBundle\":1}\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxpbmUiOjB9fQ..7mNazKih4tdnZmPz.0DND-H26XyvcQrGN4nsM0nolsvYijItiFjk8glKnDXO18jILSvcmVmwTIWdQP7r47aytiIzEu5b0j5wthWQshvZaVrlPFC_NvO7jUTQZlFjWto4zSunO2gXaL7Wiv-ZFsn4q0pkB1N2tzHRuEZL2j1atXXAmozTn-sZ0E3pqdZYrychnykAbtuIFucgG6H4xzy8kowDNMgaNylteiyaRrykyqC4-IlNJh2hv6Y1IX2ssEv0LhZXIa7dyD8ajFWqP_rNgIIy5aEya0JG_LmMDDev3iF0n7L6zZVg9c8IaiagbZ9-7PwP8i-Ofy6c.ACxZvYRprKW-gkkMmsnl0g\n\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxhc3QiOnRydWUsImxpbmUiOjF9fQ..1BVyRzoxHehbzbMg.ehrh-EB1KtAWbE22knoAUCUVrokS-79GiPsZESssVWdOYr0KFE1LH2WrFa511DW8KHMh_fu2BGkBz9TmlhfE7Fhk68lnfIcQXkrbdAeFsjQ4Y5LjPTdw5HcwxiVUcJrNCpdXs52CuRnK5UKNnbNGkkj1QeOYDyy01fRDFdrdyN-JJG2JbrQcnEeJh0oWZ4LIYISlTxgjfj99LTUWGEaBWy1UDncb45C81K7d7A.qyNnldoemKpqdbiuDwhQdg\n",
-      "informative": "the reference skips a blank line; open question: may a JWE line be followed by anything but one LF?",
-      "verdict": "accept",
-      "plain": "{\"at\":{\"matches\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\"},\"authors\":false,\"bundle\":1,\"created\":\"2026-10-04T12:00:00Z\",\"docs\":{\"matches/derby\":{\"head\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"history\":\"full\"}},\"origin\":\"https://staging.example\"}\n{\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"ns\":\"matches\",\"parent\":\"\",\"patches\":[{\"op\":\"add\",\"path\":\"\",\"value\":{\"title\":\"Hello\",\"views\":0}}],\"resource\":\"derby\"}\n",
-      "digest": "1sux75eakfxstck6w44vs3zyxrkbjgtlq"
+      "rule": "each line is followed by one 0x0A, and no other line, a blank one included (§G.5.1.1)",
+      "verdict": "reject"
+    },
+    {
+      "name": "CRLF line ends",
+      "fn": "built from the sealed bundle's lines (opened by seal.OpenBundle, read by bundle.NewReader)",
+      "sealed": "{\"id\":\"auZ4P0-96RtuuItzpI7SRw\",\"recipients\":[{\"kid\":\"5_RYhfysTyU1BDBnv9LSpAGNHJ_A1_UesBCKoRG370E\",\"suite\":\"hpke-base-0x0020-0x0001-0x0002\",\"wrapped\":\"qOEsrFfQ5Y0IhiuiliORWAQzhGlJcMKuQw90ZdV851fEb8UlPgrdP1U8de6PBjNaodTtMiXXXGFcMBEQ3tDUBPy8Q4SkD88eVuu5cHhiB_U\"}],\"sealedBundle\":1}\r\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxpbmUiOjB9fQ..7mNazKih4tdnZmPz.0DND-H26XyvcQrGN4nsM0nolsvYijItiFjk8glKnDXO18jILSvcmVmwTIWdQP7r47aytiIzEu5b0j5wthWQshvZaVrlPFC_NvO7jUTQZlFjWto4zSunO2gXaL7Wiv-ZFsn4q0pkB1N2tzHRuEZL2j1atXXAmozTn-sZ0E3pqdZYrychnykAbtuIFucgG6H4xzy8kowDNMgaNylteiyaRrykyqC4-IlNJh2hv6Y1IX2ssEv0LhZXIa7dyD8ajFWqP_rNgIIy5aEya0JG_LmMDDev3iF0n7L6zZVg9c8IaiagbZ9-7PwP8i-Ofy6c.ACxZvYRprKW-gkkMmsnl0g\r\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxhc3QiOnRydWUsImxpbmUiOjF9fQ..1BVyRzoxHehbzbMg.ehrh-EB1KtAWbE22knoAUCUVrokS-79GiPsZESssVWdOYr0KFE1LH2WrFa511DW8KHMh_fu2BGkBz9TmlhfE7Fhk68lnfIcQXkrbdAeFsjQ4Y5LjPTdw5HcwxiVUcJrNCpdXs52CuRnK5UKNnbNGkkj1QeOYDyy01fRDFdrdyN-JJG2JbrQcnEeJh0oWZ4LIYISlTxgjfj99LTUWGEaBWy1UDncb45C81K7d7A.qyNnldoemKpqdbiuDwhQdg\r\n",
+      "rule": "each line is followed by one 0x0A, and no other line, a blank one included (§G.5.1.1)",
+      "verdict": "reject"
+    },
+    {
+      "name": "no 0x0A after the last line",
+      "fn": "built from the sealed bundle's lines (opened by seal.OpenBundle, read by bundle.NewReader)",
+      "sealed": "{\"id\":\"auZ4P0-96RtuuItzpI7SRw\",\"recipients\":[{\"kid\":\"5_RYhfysTyU1BDBnv9LSpAGNHJ_A1_UesBCKoRG370E\",\"suite\":\"hpke-base-0x0020-0x0001-0x0002\",\"wrapped\":\"qOEsrFfQ5Y0IhiuiliORWAQzhGlJcMKuQw90ZdV851fEb8UlPgrdP1U8de6PBjNaodTtMiXXXGFcMBEQ3tDUBPy8Q4SkD88eVuu5cHhiB_U\"}],\"sealedBundle\":1}\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxpbmUiOjB9fQ..7mNazKih4tdnZmPz.0DND-H26XyvcQrGN4nsM0nolsvYijItiFjk8glKnDXO18jILSvcmVmwTIWdQP7r47aytiIzEu5b0j5wthWQshvZaVrlPFC_NvO7jUTQZlFjWto4zSunO2gXaL7Wiv-ZFsn4q0pkB1N2tzHRuEZL2j1atXXAmozTn-sZ0E3pqdZYrychnykAbtuIFucgG6H4xzy8kowDNMgaNylteiyaRrykyqC4-IlNJh2hv6Y1IX2ssEv0LhZXIa7dyD8ajFWqP_rNgIIy5aEya0JG_LmMDDev3iF0n7L6zZVg9c8IaiagbZ9-7PwP8i-Ofy6c.ACxZvYRprKW-gkkMmsnl0g\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxhc3QiOnRydWUsImxpbmUiOjF9fQ..1BVyRzoxHehbzbMg.ehrh-EB1KtAWbE22knoAUCUVrokS-79GiPsZESssVWdOYr0KFE1LH2WrFa511DW8KHMh_fu2BGkBz9TmlhfE7Fhk68lnfIcQXkrbdAeFsjQ4Y5LjPTdw5HcwxiVUcJrNCpdXs52CuRnK5UKNnbNGkkj1QeOYDyy01fRDFdrdyN-JJG2JbrQcnEeJh0oWZ4LIYISlTxgjfj99LTUWGEaBWy1UDncb45C81K7d7A.qyNnldoemKpqdbiuDwhQdg",
+      "rule": "each line is followed by one 0x0A, and no other line, a blank one included (§G.5.1.1)",
+      "verdict": "reject"
     },
     {
       "name": "envelope not canonical",
       "fn": "built from the sealed bundle's lines (opened by seal.OpenBundle, read by bundle.NewReader)",
       "sealed": "{ \"id\":\"auZ4P0-96RtuuItzpI7SRw\",\"recipients\":[{\"kid\":\"5_RYhfysTyU1BDBnv9LSpAGNHJ_A1_UesBCKoRG370E\",\"suite\":\"hpke-base-0x0020-0x0001-0x0002\",\"wrapped\":\"qOEsrFfQ5Y0IhiuiliORWAQzhGlJcMKuQw90ZdV851fEb8UlPgrdP1U8de6PBjNaodTtMiXXXGFcMBEQ3tDUBPy8Q4SkD88eVuu5cHhiB_U\"}],\"sealedBundle\":1}\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxpbmUiOjB9fQ..7mNazKih4tdnZmPz.0DND-H26XyvcQrGN4nsM0nolsvYijItiFjk8glKnDXO18jILSvcmVmwTIWdQP7r47aytiIzEu5b0j5wthWQshvZaVrlPFC_NvO7jUTQZlFjWto4zSunO2gXaL7Wiv-ZFsn4q0pkB1N2tzHRuEZL2j1atXXAmozTn-sZ0E3pqdZYrychnykAbtuIFucgG6H4xzy8kowDNMgaNylteiyaRrykyqC4-IlNJh2hv6Y1IX2ssEv0LhZXIa7dyD8ajFWqP_rNgIIy5aEya0JG_LmMDDev3iF0n7L6zZVg9c8IaiagbZ9-7PwP8i-Ofy6c.ACxZvYRprKW-gkkMmsnl0g\neyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxhc3QiOnRydWUsImxpbmUiOjF9fQ..1BVyRzoxHehbzbMg.ehrh-EB1KtAWbE22knoAUCUVrokS-79GiPsZESssVWdOYr0KFE1LH2WrFa511DW8KHMh_fu2BGkBz9TmlhfE7Fhk68lnfIcQXkrbdAeFsjQ4Y5LjPTdw5HcwxiVUcJrNCpdXs52CuRnK5UKNnbNGkkj1QeOYDyy01fRDFdrdyN-JJG2JbrQcnEeJh0oWZ4LIYISlTxgjfj99LTUWGEaBWy1UDncb45C81K7d7A.qyNnldoemKpqdbiuDwhQdg\n",
-      "informative": "the reference accepts it; open question: must the envelope line be canonical?",
-      "verdict": "accept",
-      "plain": "{\"at\":{\"matches\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\"},\"authors\":false,\"bundle\":1,\"created\":\"2026-10-04T12:00:00Z\",\"docs\":{\"matches/derby\":{\"head\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"history\":\"full\"}},\"origin\":\"https://staging.example\"}\n{\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"ns\":\"matches\",\"parent\":\"\",\"patches\":[{\"op\":\"add\",\"path\":\"\",\"value\":{\"title\":\"Hello\",\"views\":0}}],\"resource\":\"derby\"}\n",
-      "digest": "1sux75eakfxstck6w44vs3zyxrkbjgtlq"
+      "rule": "the envelope is canonical JSON (§G.5.1.1)",
+      "verdict": "reject"
     }
   ]
 }
