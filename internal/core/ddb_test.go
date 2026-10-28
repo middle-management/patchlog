@@ -345,3 +345,21 @@ func spanNames(ss []sdktrace.ReadOnlySpan) []string {
 	}
 	return out
 }
+
+// A table that doesn't answer fails Open, by name, as a SQL database
+// that doesn't open does, rather than every request.
+func TestDDBOpenChecksTable(t *testing.T) {
+	endpoint, _, _ := strings.Cut(os.Getenv("DDB_ENDPOINT"), ",") // the first of a list (testenv)
+	if endpoint == "" {
+		t.Skip("DDB_ENDPOINT not set: skipping DynamoDB Local integration test")
+	}
+	url := fmt.Sprintf("dynamodb://missing-%d?region=us-east-1&endpoint=%s", time.Now().UnixNano(), endpoint)
+	e, err := Open(Options{Path: url, AuthDisabled: true})
+	if err == nil {
+		e.Close()
+		t.Fatal("opened a table that doesn't exist")
+	}
+	if !strings.Contains(err.Error(), "doesn't answer") {
+		t.Fatalf("error %v", err)
+	}
+}

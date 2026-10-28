@@ -7,6 +7,9 @@ package ddbstore
 // background jobs would otherwise start a root trace per call. Nothing is
 // recorded while telemetry is off (telemetry.Instruments.Get is nil).
 //
+// A timeout inside the SDK, while the caller still waits, is DynamoDB not
+// answering (finish): a 503, logged, rather than a cancelled request.
+//
 // A failed condition is the store's optimistic concurrency at work (the
 // commit finds what its checks read moved: ErrStale, checked again), not
 // a failure: it is an attribute, and the span's status stays unset.
@@ -14,6 +17,7 @@ package ddbstore
 import (
 	"context"
 	"errors"
+	"log"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -22,6 +26,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/middle-management/patchlog/internal/ddb"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -53,6 +58,19 @@ func (a tracedAPI) span(ctx context.Context, op string, attrs ...attribute.KeyVa
 	}
 	attrs = append(attrs, attrDBSystem, attrRPCSystem, attrRPCService, attrRPCMethod.String(op), attrTables.StringSlice([]string{a.table}))
 	return (*t).Start(ctx, "DynamoDB."+op, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
+}
+
+// finish ends span with err, and returns err as the store answers it: a
+// timeout of the SDK's own (resolving credentials, a region, a connection)
+// while the caller's context is still live is DynamoDB not answering, a
+// 503, not the caller going away; the cause is logged, not served.
+func finish(ctx context.Context, span trace.Span, err error) error {
+	end(span, err)
+	if err != nil && ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+		log.Printf("ddbstore: DynamoDB didn't answer: %v", err)
+		return &ddb.Error{Status: 503, Body: map[string]any{"code": "unavailable", "message": "the storage (DynamoDB) didn't answer in time"}}
+	}
+	return err
 }
 
 // end ends span with err: a failed condition is an outcome (above).
@@ -105,7 +123,7 @@ func deref(s *string) string {
 
 func (a tracedAPI) GetItem(ctx context.Context, in *dynamodb.GetItemInput, o ...func(*dynamodb.Options)) (out *dynamodb.GetItemOutput, err error) {
 	ctx, span := a.span(ctx, "GetItem")
-	defer func() { end(span, err) }()
+	defer func() { err = finish(ctx, span, err) }()
 	return a.API.GetItem(ctx, in, o...)
 }
 
@@ -115,7 +133,7 @@ func (a tracedAPI) BatchGetItem(ctx context.Context, in *dynamodb.BatchGetItemIn
 		n += len(ka.Keys)
 	}
 	ctx, span := a.span(ctx, "BatchGetItem", attrItems.Int(n))
-	defer func() { end(span, err) }()
+	defer func() { err = finish(ctx, span, err) }()
 	return a.API.BatchGetItem(ctx, in, o...)
 }
 
@@ -125,31 +143,31 @@ func (a tracedAPI) Query(ctx context.Context, in *dynamodb.QueryInput, o ...func
 		attrs = append(attrs, attrIndex.String(*in.IndexName))
 	}
 	ctx, span := a.span(ctx, "Query", attrs...)
-	defer func() { end(span, err) }()
+	defer func() { err = finish(ctx, span, err) }()
 	return a.API.Query(ctx, in, o...)
 }
 
 func (a tracedAPI) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, o ...func(*dynamodb.Options)) (out *dynamodb.UpdateItemOutput, err error) {
 	ctx, span := a.span(ctx, "UpdateItem")
-	defer func() { end(span, err) }()
+	defer func() { err = finish(ctx, span, err) }()
 	return a.API.UpdateItem(ctx, in, o...)
 }
 
 func (a tracedAPI) DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInput, o ...func(*dynamodb.Options)) (out *dynamodb.DeleteItemOutput, err error) {
 	ctx, span := a.span(ctx, "DeleteItem")
-	defer func() { end(span, err) }()
+	defer func() { err = finish(ctx, span, err) }()
 	return a.API.DeleteItem(ctx, in, o...)
 }
 
 func (a tracedAPI) Scan(ctx context.Context, in *dynamodb.ScanInput, o ...func(*dynamodb.Options)) (out *dynamodb.ScanOutput, err error) {
 	ctx, span := a.span(ctx, "Scan")
-	defer func() { end(span, err) }()
+	defer func() { err = finish(ctx, span, err) }()
 	return a.API.Scan(ctx, in, o...)
 }
 
 func (a tracedAPI) PutItem(ctx context.Context, in *dynamodb.PutItemInput, o ...func(*dynamodb.Options)) (out *dynamodb.PutItemOutput, err error) {
 	ctx, span := a.span(ctx, "PutItem")
-	defer func() { end(span, err) }()
+	defer func() { err = finish(ctx, span, err) }()
 	return a.API.PutItem(ctx, in, o...)
 }
 
@@ -159,18 +177,18 @@ func (a tracedAPI) BatchWriteItem(ctx context.Context, in *dynamodb.BatchWriteIt
 		n += len(ws)
 	}
 	ctx, span := a.span(ctx, "BatchWriteItem", attrItems.Int(n))
-	defer func() { end(span, err) }()
+	defer func() { err = finish(ctx, span, err) }()
 	return a.API.BatchWriteItem(ctx, in, o...)
 }
 
 func (a tracedAPI) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, o ...func(*dynamodb.Options)) (out *dynamodb.TransactWriteItemsOutput, err error) {
 	ctx, span := a.span(ctx, "TransactWriteItems", attrItems.Int(len(in.TransactItems)))
-	defer func() { end(span, err) }()
+	defer func() { err = finish(ctx, span, err) }()
 	return a.API.TransactWriteItems(ctx, in, o...)
 }
 
 func (a tracedAPI) DescribeTable(ctx context.Context, in *dynamodb.DescribeTableInput, o ...func(*dynamodb.Options)) (out *dynamodb.DescribeTableOutput, err error) {
 	ctx, span := a.span(ctx, "DescribeTable")
-	defer func() { end(span, err) }()
+	defer func() { err = finish(ctx, span, err) }()
 	return a.API.DescribeTable(ctx, in, o...)
 }

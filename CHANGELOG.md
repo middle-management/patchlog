@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.24.0-ddb.1
+
+A prerelease from the `dynamodb` branch: v0.23.0 with a DynamoDB storage backend
+(docs/DYNAMODB.md). `patchlog serve -db 'dynamodb://<table>?region=…'` serves the same API as the
+SQLite and Postgres backends, from one table made beforehand (key design in docs/DYNAMODB.md §3,
+the create-table command in `deploy/bench.sh`). The whole test suite passes on it, against
+DynamoDB Local.
+
+Not yet: running more than one instance on a table (no cache invalidation between instances);
+the background loops (retention, sweeps, second CDN purges, rotation, remote follows) — their
+operations run when called; values over DynamoDB's 400 KB item (501); raising a namespace from
+sealed to e2e (501). The core's storage now goes through a backend interface, and the DynamoDB
+store (`internal/ddbstore`, the only code using the AWS SDK) registers itself where a build links
+it in. Telemetry: a span per DynamoDB call under the database spans, group commit sizes, and
+`patchlog.db.conflicts`. `deploy/bench.sh` is a small load test of a running server.
+
 ## v0.23.0
 
 Implements spec **v0.73**, the whole upgrade from v0.55. v0.56 folds in the reference's notes

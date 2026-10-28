@@ -110,6 +110,15 @@ func openDDB(opt Options) (*Engine, error) {
 		return nil, err
 	}
 	b.store = store
+	// The table must answer before the server starts, as a SQL database
+	// must open: a region, credentials or a table that is missing fail
+	// here, by name, rather than as every request's error.
+	pctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	err = store.Ping(pctx)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("dynamodb: the table of %s doesn't answer (does the URL name its region, are AWS credentials available, does the table exist?): %w", opt.Path, err)
+	}
 	// The deployment's batch maximum, lowered to what one transaction
 	// holds (docs/DYNAMODB.md §10): namespaces learn it from their limits,
 	// and a batch over it is §6.6's 413 itemsPerBatch, not the action cap.
