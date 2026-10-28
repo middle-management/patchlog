@@ -794,7 +794,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	keyOf := func(at string) string { return listingKey(canon(at), v) }
 	keep := !perReader(op, v)
 	var cur string
-	s.View(func(g *Graph, curMap map[string]string) { cur, _ = CombinedAt(g, curMap) })
+	s.View(func(g *Graph, curMap map[string]string) { cur, _ = s.combinedAt(g, curMap) })
 	if ns := s.trustedSince(v, at, cur); ns != "" {
 		// A g/all edge grant covers every later at, but not one that
 		// includes a namespace it wasn't checked against (§B.11.5).
@@ -990,8 +990,8 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		whole = key.Epoch
 		missing := map[int]bool{}
 		s.View(func(g *Graph, curMap map[string]string) {
-			l.at, nss = CombinedAt(g, curMap)
-			cps = checkpointsOf(g, curMap)
+			l.at, nss = s.combinedAt(g, curMap)
+			cps = s.checkpointsOf(g, curMap)
 			view = derived.View{NS: cat, Target: canon(l.at)}
 			epochOf := func(name string) int {
 				if n := g.Node(name); n != nil && n.Epoch > 0 {
@@ -1171,18 +1171,27 @@ type atRecord struct {
 	exp time.Time
 }
 
-// checkpointsOf is the checkpoints CombinedAt hashes, keyed as cur is.
-func checkpointsOf(g *Graph, cur map[string]string) map[string]string {
+// checkpointsOf is the checkpoints the service's combined checkpoint
+// hashes (Service.combinedAt), keyed as cur is: purged namespaces left
+// out (§B.5). Call it under View.
+func (s *Service) checkpointsOf(g *Graph, cur map[string]string) map[string]string {
 	cps := map[string]string{}
-	if id := cur[g.Catalog]; id != "" {
+	if id := cur[g.Catalog]; id != "" && !s.purgedLocked(g.Catalog) {
 		cps[g.Catalog] = id
 	}
 	for ns := range g.Trust {
-		if id := cur[ns]; id != "" {
+		if id := cur[ns]; id != "" && !s.purgedLocked(ns) {
 			cps[ns] = id
 		}
 	}
 	return cps
+}
+
+// purgedLocked reports whether the service holds ns as purged. Call it
+// with mu held (View).
+func (s *Service) purgedLocked(ns string) bool {
+	_, ok := s.purged[ns]
+	return ok
 }
 
 // recordAt records the checkpoints behind at, a listing of which was just
@@ -1353,17 +1362,32 @@ func codeFor(status int) string {
 	return "error"
 }
 
-// CombinedAt is the service's combined checkpoint (§B.5):
+// CombinedAt is a combined checkpoint (§B.5):
 // text(trunc160(sha256(canonical({ ns: ns_id, … })))) over the catalog and
-// every content namespace it follows (catalog.trust) that the service has
-// reached, with the namespaces it covers, sorted. Call it under the graph
-// lock (View).
+// every content namespace it follows (catalog.trust) that cur has reached,
+// with the namespaces it covers, sorted. The service's own leaves out the
+// namespaces it holds as purged (Service.combinedAt). Call it under the
+// graph lock (View).
 func CombinedAt(g *Graph, cur map[string]string) (string, []string) {
+	return combinedAt(g, cur, func(string) bool { return false })
+}
+
+// combinedAt is the service's combined checkpoint, purged namespaces left
+// out (§B.5): a purge-ns entry is a namespace's last, so the at a purge
+// moves is the one it would keep forever, and listings, their ns:{ns}
+// tags, the coverage of problems and orphans and what a g/all edge grant
+// is checked against cover only namespaces that still have items. Call
+// it under View.
+func (s *Service) combinedAt(g *Graph, cur map[string]string) (string, []string) {
+	return combinedAt(g, cur, s.purgedLocked)
+}
+
+func combinedAt(g *Graph, cur map[string]string, purged func(string) bool) (string, []string) {
 	m := map[string]any{}
 	nss := []string{}
 	// In a release preview the checkpoint is over the branches (§B.5).
 	add := func(ns string) {
-		if id := cur[ns]; id != "" {
+		if id := cur[ns]; id != "" && !purged(ns) {
 			m[g.Actual(ns)] = id
 			nss = append(nss, g.Actual(ns))
 		}
@@ -1382,7 +1406,7 @@ func CombinedAt(g *Graph, cur map[string]string) (string, []string) {
 // At returns the current combined checkpoint (§B.5): the at of listings.
 func (s *Service) At() string {
 	var at string
-	s.View(func(g *Graph, cur map[string]string) { at, _ = CombinedAt(g, cur) })
+	s.View(func(g *Graph, cur map[string]string) { at, _ = s.combinedAt(g, cur) })
 	return at
 }
 
@@ -2488,11 +2512,11 @@ func (q *query) parentsJSON(n *Node) []any {
 // the combined checkpoint, sorted: what problems and orphans cover
 // (§B.11.5). One the service can't follow has no checkpoint, and shows
 // nothing in listings, as the URL spaces and g/all are judged without it
-// (Service.listed).
+// (Service.listed); nor is one it holds as purged in it (§B.5).
 func (q *query) checkpointed() []string {
 	out := make([]string, 0, len(q.g.Trust))
 	for ns := range q.g.Trust {
-		if q.cur[ns] != "" {
+		if q.cur[ns] != "" && !q.s.purgedLocked(ns) {
 			out = append(out, ns)
 		}
 	}
