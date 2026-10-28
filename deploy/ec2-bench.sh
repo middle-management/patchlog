@@ -6,12 +6,14 @@
 # instance.
 #
 #   ./deploy/ec2-bench.sh [-y] [writes/s] [seconds]   (default 100 20)
-#   ./deploy/ec2-bench.sh cleanup                      the role, profile, bucket
+#   ./deploy/ec2-bench.sh cleanup                      the IAM role, profile
 #
 # The arguments, READS, LOGS and NAMESPACES are bench.sh's. The instance runs
 # this checkout's bench.sh and spans.py, oha's release OHA (default v1.14.0),
-# and the server built from this checkout, uncommitted changes included
-# (Go needed here), or the release VERSION.
+# and the server built from this checkout, uncommitted changes included,
+# or the release VERSION. A built server is copied over SSH through SSM:
+# no open port, and the key is a throwaway one EC2 Instance Connect lets in
+# for 60 seconds. That needs Go, ssh and AWS's session-manager-plugin here.
 #
 # Settings (environment):
 #   REGION   the table's region (default: aws configure's)
@@ -25,9 +27,6 @@
 #     (`cleanup` deletes them): SSM's managed policy (no SSH, no open
 #     ports) and DynamoDB on this table and its indexes only.
 #   - The table, if it's missing. Never deleted: it holds what you wrote.
-#   - S3 bucket patchlog-bench-<account>-<region> for a built server, kept
-#     for the next run (`cleanup` deletes it); the binary is deleted on
-#     exit, and the instance downloads it by a URL presigned for an hour.
 #   - One instance, terminated on exit, and by itself after 90 minutes
 #     should this script die first.
 #
@@ -51,9 +50,7 @@ if [ "${1:-}" = cleanup ]; then
   aws iam detach-role-policy --role-name $ROLE --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
   aws iam delete-role-policy --role-name $ROLE --policy-name dynamodb 2>/dev/null || true
   aws iam delete-role --role-name $ROLE 2>/dev/null || true
-  bucket=patchlog-bench-$(aws sts get-caller-identity --query Account --output text)-$REGION
-  aws s3 rb --force "s3://$bucket" >/dev/null 2>&1 || true
-  echo "ec2-bench: deleted role and instance profile $ROLE and bucket $bucket (if they existed)"
+  echo "ec2-bench: deleted role and instance profile $ROLE (if they existed)"
   exit 0
 fi
 
@@ -77,15 +74,15 @@ fi
 ami=$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-$arch \
   --query Parameter.Value --output text)
 root=$(cd "$(dirname "$0")/.." && pwd)
-bucket=patchlog-bench-$account-$REGION
 if [ -n "$VERSION" ]; then
   server="release $VERSION"
 else
-  command -v go >/dev/null || { echo "ec2-bench: building the server needs Go; or set VERSION to a release" >&2; exit 1; }
+  for tool in go ssh scp ssh-keygen session-manager-plugin; do
+    command -v $tool >/dev/null || { echo "ec2-bench: building and copying the server needs $tool; or set VERSION to a release" >&2; exit 1; }
+  done
   rev=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unknown)
   [ -z "$(git -C "$root" status --porcelain -- cmd internal go.mod go.sum 2>/dev/null)" ] || rev=$rev+changes
-  have_bucket=$(aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 && echo 1 || true)
-  server="built from this checkout ($rev, linux/$goarch), through s3://$bucket$([ -n "$have_bucket" ] || echo ', to make')"
+  server="built from this checkout ($rev, linux/$goarch), copied over SSH through SSM"
 fi
 
 echo "account $account, region $REGION"
@@ -130,33 +127,24 @@ aws iam put-role-policy --role-name $ROLE --policy-name dynamodb --policy-docume
     \"Resource\": [\"$table_arn\", \"$table_arn/index/*\"]}]}"
 
 # What's made for this run only goes on exit.
-work=$(mktemp -d); id=""; object=""
+work=$(mktemp -d); id=""
 finish() {
   rm -rf "$work"
   if [ -n "$id" ]; then echo "terminating $id"; aws ec2 terminate-instances --instance-ids "$id" >/dev/null; fi
-  if [ -n "$object" ]; then aws s3 rm --quiet "$object" || true; fi
 }
 trap finish EXIT
 userdata=$work/userdata
 
-# The server: a release, or built here and handed over through S3.
+# The server: a release the instance downloads, or built here and copied
+# once the instance is up (below).
 if [ -n "$VERSION" ]; then
   fetch="curl -fsSL https://github.com/$REPO/releases/download/$VERSION/patchlog_${VERSION}_linux_$goarch.tar.gz | tar xz --strip-components=1"
 else
   echo "building the server (linux/$goarch)"
   (cd "$root" && CGO_ENABLED=0 GOOS=linux GOARCH=$goarch go build -trimpath -tags grpcnotrace \
     -ldflags="-s -w -X main.version=bench-$rev" -o "$work/patchlog" ./cmd/patchlog)
-  if [ -z "$have_bucket" ]; then
-    if [ "$REGION" = us-east-1 ]; then
-      aws s3api create-bucket --bucket "$bucket" >/dev/null
-    else
-      aws s3api create-bucket --bucket "$bucket" --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null
-    fi
-    echo "made bucket $bucket"
-  fi
-  object=s3://$bucket/patchlog-$(date +%s)-$RANDOM
-  aws s3 cp --quiet "$work/patchlog" "$object"
-  fetch="curl -fsSL -o patchlog '$(aws s3 presign "$object" --expires-in 3600)'"
+  ssh-keygen -q -t ed25519 -N '' -C patchlog-bench -f "$work/key"
+  fetch=": the server is copied in"
 fi
 
 # The instance prepares itself (the server, oha, this checkout's bench.sh
@@ -171,7 +159,7 @@ mkdir -p /opt/bench && cd /opt/bench
 $fetch
 curl -fsSL -o oha https://github.com/hatoo/oha/releases/download/$OHA/oha-linux-$goarch
 echo $scripts | base64 -d | tar xz
-chmod +x patchlog oha bench.sh spans.py
+chmod +x oha bench.sh spans.py
 cat >run.sh <<'RUN'
 #!/bin/bash
 # run.sh RATE SECS: the server with its spans on stderr, the bench, the summary.
@@ -215,8 +203,26 @@ for _ in $(seq 1 60); do
     --query 'length(InstanceInformationList)' --output text)" = 1 ] && break
   sleep 5
 done
+
+# A built server goes over SSH through an SSM session, the key let in by
+# EC2 Instance Connect for 60 seconds; sshd may still be starting.
+if [ -z "$VERSION" ]; then
+  echo "copying the server"
+  for i in $(seq 1 6); do
+    aws ec2-instance-connect send-ssh-public-key --instance-id "$id" --instance-os-user ec2-user \
+      --ssh-public-key "file://$work/key.pub" >/dev/null
+    if scp -q -i "$work/key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR -o ConnectTimeout=20 \
+        -o ProxyCommand="aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p" \
+        "$work/patchlog" "ec2-user@$id:/tmp/patchlog"; then
+      break
+    fi
+    [ "$i" -lt 6 ] || { echo "ec2-bench: couldn't copy the server to $id" >&2; exit 1; }
+    sleep 10
+  done
+fi
 cmd=$(aws ssm send-command --instance-ids "$id" --document-name AWS-RunShellScript \
-  --parameters "{\"commands\": [\"for i in \$(seq 1 120); do [ -f /opt/bench/ready ] && break; sleep 2; done; /opt/bench/run.sh $RATE $SECS\"], \"executionTimeout\": [\"3600\"]}" \
+  --parameters "{\"commands\": [\"for i in \$(seq 1 120); do [ -f /opt/bench/ready ] && break; sleep 2; done; if [ -f /tmp/patchlog ]; then install -m 755 /tmp/patchlog /opt/bench/patchlog; fi; /opt/bench/run.sh $RATE $SECS\"], \"executionTimeout\": [\"3600\"]}" \
   --query Command.CommandId --output text)
 echo "running the bench ($cmd)"
 while :; do
