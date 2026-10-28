@@ -365,10 +365,10 @@ type ReleaseOptions struct {
 	// (it changes $access, restores a folder, or widens) is submitted,
 	// narrowed to exactly that batch with Via (§F.8). The catalog service
 	// judges such a batch, which only an approver in catalog-admins gets
-	// through, with this admin as the caller too (F-T4); for an end-to-end
-	// catalog, which it checks no batch of, the merge service judges
-	// whether a batch needs catalog-admins itself. Via is the merge
-	// service's sub (default: Who).
+	// through, with this admin as the caller too (F-T4). Every catalog
+	// batch of an end-to-end catalog, which it checks no batch of, goes
+	// under it, whatever the batch changes; its root groups must list
+	// catalog-admins. Via is the merge service's sub (default: Who).
 	AdminGrant string
 	Via        string
 	// Digest, if set, is the digest the approving person reviewed:
