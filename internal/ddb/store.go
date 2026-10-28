@@ -79,6 +79,7 @@ type Store interface {
 
 	// gatereads.go
 	Namespace(ctx context.Context, ns string) (*NSRow, error)
+	Prefetch(ctx context.Context, ns string, names []string) (*NSRow, map[string]Prefetched, error)
 	ConfigAt(ctx context.Context, ns string, pos uint64) (*ConfigRow, error)
 	ConfigByID(ctx context.Context, ns, id string) (*ConfigRow, error)
 	Resource(ctx context.Context, ns, name string) (*ResRow, error)

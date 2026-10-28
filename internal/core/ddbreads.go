@@ -63,6 +63,9 @@ type ddbReads struct {
 	// copies are the resources copyRows answered with: a purge's commit
 	// pins them (Commit.Copies).
 	copies []ddb.ResourceRef
+	// docHeads are the head documents prefetch read, by namespace and
+	// name: docBytesAt's at their position.
+	docHeads map[ddbResRef]ddb.Prefetched
 }
 
 type ddbNS struct {
@@ -102,7 +105,31 @@ func newDDBReads(ctx context.Context, b *ddbBackend) *ddbReads {
 		authors: map[int64]string{}, authorN: map[string]int64{},
 		logs: map[int64]ddbPosKey{}, logAt: map[ddbPosKey]int64{}, logKeys: map[string]int64{},
 		resRows: map[int64]*ddb.ResRow{}, schemaRefs: map[int64]string{},
+		docHeads: map[ddbResRef]ddb.Prefetched{},
 	}
+}
+
+// prefetch reads, in one round trip, what a write's checks read first of
+// ns and names (ddb.Store.Prefetch): ns as nsByName reads it, each name's
+// resource item as resItem does and its head document as docBytesAt
+// does, so those reads cost none of their own.
+func (r *ddbReads) prefetch(ns string, names []string) error {
+	if _, ok := r.nsNamed[ns]; ok {
+		return nil
+	}
+	row, pre, err := r.s.Prefetch(r.ctx, ns, names)
+	if err != nil || row == nil {
+		return err
+	}
+	h := r.handle()
+	r.nsNamed[ns], r.nss[h] = h, &ddbNS{name: ns, row: row}
+	for name, p := range pre {
+		r.resRows[r.resHandle(ns, name)] = p.Res
+		if p.DocPos > 0 {
+			r.docHeads[ddbResRef{ns: ns, name: name}] = p
+		}
+	}
+	return nil
 }
 
 var _ checkReads = (*ddbReads)(nil)
@@ -247,6 +274,15 @@ func (r *ddbReads) nsByName(name string) *nsRow {
 	h := r.handle()
 	r.nsNamed[name], r.nss[h] = h, &ddbNS{name: name, row: row}
 	return r.nsRowOf(h)
+}
+
+// tipOf is ns's log tip as this check read it, for the commit to chain
+// over first (ddb.Commit.TipPos); 0, "" if the check didn't read ns.
+func (r *ddbReads) tipOf(ns string) (uint64, string) {
+	if h, ok := r.nsNamed[ns]; ok {
+		return r.nss[h].row.TipPos, r.nss[h].row.TipID
+	}
+	return 0, ""
 }
 
 func (r *ddbReads) nsRowOf(h int64) *nsRow {
@@ -684,6 +720,9 @@ func (r *ddbReads) entriesTo(row *revRow) []int64 {
 
 func (r *ddbReads) docBytesAt(row *revRow) ([]byte, error) {
 	ref := r.revs[row.seq]
+	if p, ok := r.docHeads[ddbResRef{ns: ref.key.ns, name: ref.key.name}]; ok && p.DocPos == ref.key.pos {
+		return p.Doc, nil
+	}
 	b, err := r.s.DocAt(r.ctx, ref.key.ns, ref.key.name, ref.key.pos)
 	var pe *ddb.PrunedError
 	if errors.As(err, &pe) {

@@ -56,6 +56,14 @@ func metaVals(pos uint64, id string) map[string]types.AttributeValue {
 // Commit commits c, re-chaining over the tip as other writes move it, or
 // returns ErrStale. With group commit, a write without a config change
 // commits in its namespace's group (group.go).
+// hintedTip is the tip c's checks read, nil if unknown (Commit.TipPos).
+func hintedTip(c *ddb.Commit) *tip {
+	if c.TipID == "" {
+		return nil
+	}
+	return &tip{headPos: c.TipPos, headID: c.TipID}
+}
+
 func (s *Store) Commit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResult, error) {
 	if acts := commitTxActions(c) + txShared; acts > maxTxActions {
 		return nil, apiErr(413, "limit", "limit", "itemsPerBatch", "measured", acts, "max", maxTxActions,
@@ -70,7 +78,7 @@ func (s *Store) Commit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResult, e
 	if s.grouping() {
 		defer release(s.serialize(c.NS))
 	}
-	var known *tip
+	known := s.startTip(c.NS, c)
 	for attempt := 0; attempt < maxWriteAttempts; attempt++ {
 		t := known
 		if t == nil {
@@ -89,6 +97,7 @@ func (s *Store) Commit(ctx context.Context, c *ddb.Commit) (*ddb.CommitResult, e
 		}
 		_, err = s.Client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: acts})
 		if err == nil {
+			s.committedTip(c.NS, tip{headPos: res[0].Pos, headID: res[0].NSID})
 			return res[0], nil
 		}
 		stale, tipMoved, cerr := classifyCancel(err, []*ddb.Commit{c}, len(acts))

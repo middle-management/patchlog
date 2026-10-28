@@ -2,8 +2,13 @@
 # A small load test of a running server: W resources made first, then W
 # writers, each appending N revisions to its own resource chained on
 # If-Match, while two readers read a resource's head and the namespace
-# log. Prints p50, p95 and max latency (ms) and the rate of each kind, and
-# the count of errors.
+# log. Prints p50, p95 and max latency (ms) and the rate of each kind, the
+# writes rate limited, and the count of errors.
+#
+# A namespace's writes to one resource are limited (limits.ratePerResource,
+# 10/s with a burst of 20 by default, §6.6): a writer faster than that is
+# answered 429. It waits the Retry-After and writes again; those writes
+# count as limited, and their wait isn't in the write latencies.
 #
 #   ./deploy/bench.sh [writers] [writes-per-writer]     (default 8 50)
 #
@@ -56,17 +61,32 @@ done
 
 writer() { # writer I: appends N revisions to r$I, each on the last's ETag
   set -euo pipefail
-  local name=r$1 tag t0
+  local name=r$1 tag t0 hdrs status next
   tag=$(cat "$TAGS/$1")
   for i in $(seq 1 "$N"); do
-    t0=$(date +%s%N)
-    if tag=$(curl -sf -D - -o /dev/null -X PATCH "$BASE/r/$NS/$name" -H "$CT" -H "$AU" -H "If-Match: $tag" \
-      -d "[{\"op\":\"replace\",\"path\":\"/v\",\"value\":$i}]" | etag) && [ -n "$tag" ]; then
-      echo "write $(( ($(date +%s%N) - t0) / 1000000 ))"
-    else
-      echo "error write"
-      return 1
-    fi
+    while :; do
+      t0=$(date +%s%N)
+      hdrs=$(curl -s -D - -o /dev/null -X PATCH "$BASE/r/$NS/$name" -H "$CT" -H "$AU" -H "If-Match: $tag" \
+        -d "[{\"op\":\"replace\",\"path\":\"/v\",\"value\":$i}]" | tr -d '\r') || hdrs=""
+      status=$(printf '%s\n' "$hdrs" | awk 'NR == 1 {print $2}')
+      case "$status" in
+      201)
+        next=$(printf '%s\n' "$hdrs" | etag)
+        [ -n "$next" ] || { echo "error write"; return 1; }
+        tag=$next
+        echo "write $(( ($(date +%s%N) - t0) / 1000000 ))"
+        break
+        ;;
+      429) # rate limited: wait as told, then the same write again
+        echo "limited write"
+        sleep "$(printf '%s\n' "$hdrs" | awk 'tolower($1) == "retry-after:" {print $2}' | grep . || echo 1)"
+        ;;
+      *)
+        echo "error write ${status:-no answer}"
+        return 1
+        ;;
+      esac
+    done
   done
 }
 
@@ -102,4 +122,6 @@ for k in write read log; do
     END { if (NR) printf "%-5s n=%-5d p50=%-5d p95=%-5d max=%-6d (%.1f/s)\n",
       k, NR, a[int(NR * .5) + 1], a[int(NR * .95) + 1], a[NR], NR / s }'
 done
+echo "limited: $(grep -c '^limited' "$OUT" || true) (429, waited out and written again)"
 echo "errors: $(grep -c '^error' "$OUT" || true)"
+grep '^error' "$OUT" | sort | uniq -c | sed 's/^/  /' || true

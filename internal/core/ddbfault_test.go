@@ -34,6 +34,20 @@ type faultAPI struct {
 	mu     sync.Mutex
 	fails  map[string]func(in any) bool // the calls to fail, once
 	before map[string]func()
+	calls  map[string]int // the calls made, by operation (takeCalls)
+}
+
+// takeCalls returns the calls made since the last take, by operation, and
+// their total.
+func (f *faultAPI) takeCalls() (map[string]int, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out, n := f.calls, 0
+	for _, c := range out {
+		n += c
+	}
+	f.calls = map[string]int{}
+	return out, n
 }
 
 var errInjected = errors.New("injected failure")
@@ -67,6 +81,7 @@ func (f *faultAPI) hook(op string, h func()) {
 // matches it.
 func (f *faultAPI) call(op string, in any) error {
 	f.mu.Lock()
+	f.calls[op]++
 	h := f.before[op]
 	delete(f.before, op)
 	var err error
@@ -149,7 +164,7 @@ func ddbFaultEngine(t *testing.T, url string, opt Options) (*Engine, *faultAPI, 
 	}
 	t.Cleanup(func() { e.Close() })
 	s := e.be.(*ddbBackend).store.(*ddbstore.Store)
-	f := &faultAPI{API: s.Client, fails: map[string]func(any) bool{}, before: map[string]func(){}}
+	f := &faultAPI{API: s.Client, fails: map[string]func(any) bool{}, before: map[string]func(){}, calls: map[string]int{}}
 	s.Client = f
 	return e, f, s
 }
@@ -452,5 +467,73 @@ func TestDDBHeadsAtEntries(t *testing.T) {
 		if got == nil || got["kind"] != st.kind || got["target"] != st.target {
 			t.Fatalf("step %d: heads at %s list d as %v, want %s %s", i, st.nsID, got, st.kind, st.target)
 		}
+	}
+}
+
+// The DynamoDB calls a request makes, each a round trip it waits on: a
+// write's and a read's, bounded so a change that adds round trips shows.
+// DynamoDB's latency is per call (docs/DYNAMODB.md §11). A write is four:
+// the namespace, its resources and their head documents in one batch
+// (prefetch), the head revision, the retry lookup, the commit.
+func TestDDBCallsPerRequest(t *testing.T) {
+	e, f, _ := ddbFaultEngine(t, ddbTable(t), Options{})
+	ctx := context.Background()
+	ddbCreateNS(t, e, "calls", `{"read":"public"}`)
+	measure := func(what string, max int, do func()) {
+		t.Helper()
+		e.FlushCaches()
+		f.takeCalls()
+		do()
+		by, n := f.takeCalls()
+		t.Logf("%s: %d calls %v", what, n, by)
+		if n > max {
+			t.Errorf("%s makes %d DynamoDB calls, want at most %d: %v", what, n, max, by)
+		}
+	}
+	var w *WriteResult
+	measure("create", 4, func() { w = ddbWrite(t, e, "calls", "d", "", `[{"op":"add","path":"","value":{"v":0}}]`) })
+	for i := 1; i <= 2; i++ {
+		measure(fmt.Sprintf("append %d", i), 4, func() {
+			w = ddbWrite(t, e, "calls", "d", w.Items[0].IDs[0], fmt.Sprintf(`[{"op":"replace","path":"/v","value":%d}]`, i))
+		})
+	}
+	measure("head read", 3, func() {
+		if _, err := e.ResourceHead(ctx, "calls", "d", Credentials{}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	measure("revision read", 4, func() {
+		if _, err := e.ResourceRev(ctx, "calls", "d", w.Items[0].IDs[0], Credentials{}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	measure("log read", 2, func() {
+		if _, err := e.NamespaceLog(ctx, "calls", "", "", 0, Credentials{}); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// A write whose check read the tip before another write of this instance
+// moved it commits in one transaction: it chains over the tip the other
+// committed, which the store remembers, not the stale one its check read
+// (a transaction cancelled, the tip read, the transaction again). The
+// group commit worker of the other write is gone by then, as a namespace
+// whose writes come one at a time sees after each.
+func TestDDBStaleTipWastesNoCommit(t *testing.T) {
+	e, f, _ := ddbFaultEngine(t, ddbTable(t), Options{})
+	ddbCreateNS(t, e, "busy", `{"read":"public"}`)
+	a := ddbWrite(t, e, "busy", "a", "", `[{"op":"add","path":"","value":{"v":0}}]`)
+	b := ddbWrite(t, e, "busy", "b", "", `[{"op":"add","path":"","value":{"v":0}}]`)
+	f.takeCalls()
+	// b's check reads the tip (its prefetch), then reads b's head
+	// revision: before that, a's write commits, moving the tip.
+	f.hook("GetItem", func() {
+		ddbWrite(t, e, "busy", "a", a.Items[0].IDs[0], `[{"op":"replace","path":"/v","value":1}]`)
+	})
+	ddbWrite(t, e, "busy", "b", b.Items[0].IDs[0], `[{"op":"replace","path":"/v","value":1}]`)
+	by, _ := f.takeCalls()
+	if tx := by["TransactWriteItems"]; tx != 2 {
+		t.Fatalf("%d commit transactions for 2 writes, want 2: b chained over a stale tip (%v)", tx, by)
 	}
 }

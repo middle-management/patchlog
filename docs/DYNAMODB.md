@@ -795,6 +795,16 @@ What landed, beyond the spike:
   can't follow is a `#REMLEVEL` item (`RemoteLevels`), and one this
   server lacks a key store for makes what the branch read through
   answer 502 upstream (`lostRemote`).
+- **Round trips.** DynamoDB's latency is per call (in-region, ~5–10
+  ms each from a client, of which 2–3 ms network), so a request costs
+  about its sequential calls. A write makes four: its namespace's
+  `#META` and `#TIP`, its resources' items and head documents in one
+  `BatchGetItem` (`Store.Prefetch`), the head revision, the retry
+  lookup, and the commit, which chains over the tip the checks read
+  (`Commit.TipPos`) and reads it again only if it moved. A head read
+  makes three, a revision read four. Configurations and entry positions,
+  which never change, are read once per instance (`configAt`,
+  `entryPos`). `TestDDBCallsPerRequest` bounds these counts.
 - **Telemetry** (README's OpenTelemetry section). Reads and writes are
   core's `core.db.read` and `core.db.update` spans, with a client span
   per DynamoDB call under them (`ddbstore/trace.go`, a wrapper of the
