@@ -137,7 +137,7 @@ func writtenFormat(name string) string {
 // markers registers (compileMarked): under Legacy, semver and period as
 // the library asserts them and regex as Legacy reads patterns, idn-email
 // and idn-hostname not at all, as v0.55 asserted them; under V073,
-// idn-email and idn-hostname with UTS 46 processing and regex as §6.6
+// idn-email and idn-hostname by RFC 5890 unmapped and regex as §6.6
 // reads patterns, semver and period not at all (Configure).
 var markedFormats = sync.OnceValue(func() []*jsonschema.Format {
 	return []*jsonschema.Format{

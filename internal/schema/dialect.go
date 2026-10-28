@@ -27,7 +27,7 @@ const (
 	// load as Legacy.
 	Legacy Rules = iota
 	// V073 asserts exactly the format set of draft 2020-12 (§6.2 step 5),
-	// idn-email and idn-hostname with UTS 46 processing, and reads
+	// idn-email and idn-hostname by RFC 5890 without UTS 46 mapping, and reads
 	// patterns as §6.6 says. Schemas written now compile under it.
 	V073
 )
@@ -150,22 +150,55 @@ type sourced struct {
 
 func (s sourced) String() string { return s.src }
 
-// idnHost processes host names as UTS 46 does for lookup (RFC 5891 §5),
-// nontransitional, with the Bidi rule and DNS's lengths.
-var idnHost = idna.New(idna.MapForLookup(), idna.BidiRule(), idna.VerifyDNSLength(true), idna.Transitional(false))
+// idnHost checks host names as RFC 5890 defines them, without UTS 46
+// mapping (§6.2 step 5): IDNA2008's registration rules (RFC 5891 §4),
+// which refuse any code point UTS 46 would map (an uppercase or fullwidth
+// letter in a U-label), with the Bidi rule (RFC 5893), the contextual
+// rules and DNS's lengths.
+var idnHost = idna.New(idna.ValidateForRegistration())
 
-// validateIDNHostname asserts idn-hostname: an internationalised host
-// name (RFC 5890 §2.3.2.3), or an ASCII one (RFC 1123), which UTS 46
-// processing accepts as well.
+// validateIDNHostname asserts idn-hostname: a host name of labels that are
+// each a U-label or an A-label (RFC 5890 §2.3.2.1), checked as they are,
+// never mapped first, or an NR-LDH label (§2.3.1). An all-ASCII label is
+// judged as LDH, case-insensitively as DNS compares it, so EXAMPLE.com
+// passes as example.com does, and an A-label in any case must decode to a
+// valid U-label; a label with any other code point must be a U-label as
+// written.
 func validateIDNHostname(v any) error {
 	s, ok := v.(string)
 	if !ok {
 		return nil
 	}
-	if _, err := idnHost.ToASCII(s); err != nil {
+	if _, err := idnHost.ToASCII(foldLDH(s)); err != nil {
 		return jsonschema.LocalizableError("%v", err)
 	}
 	return nil
+}
+
+// foldLDH returns s with each all-ASCII label in lowercase, the case LDH
+// labels are compared in (RFC 5890 §2.3.1); labels holding anything else
+// are left as written, for the registration rules to judge unmapped.
+func foldLDH(s string) string {
+	labels := strings.Split(s, ".")
+	changed := false
+	for i, l := range labels {
+		if isASCII(l) && strings.ToLower(l) != l {
+			labels[i], changed = strings.ToLower(l), true
+		}
+	}
+	if !changed {
+		return s
+	}
+	return strings.Join(labels, ".")
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
 }
 
 // validateIDNEmail asserts idn-email (RFC 6531): an address whose local
