@@ -183,8 +183,15 @@ func (s *Store) PutPending(ctx context.Context, ns string, cfgPos uint64, cfgID 
 			ExpressionAttributeValues: metaVals(cfgPos, cfgID),
 		}},
 		{Put: &types.Put{TableName: &s.Table, Item: withKey(keyPending(ns, p.Name, p.Bid, p.Uploader), blobItem(p))}},
-		{ConditionCheck: &types.ConditionCheck{
-			TableName: &s.Table, Key: keyAV(keyBytes(p.Hash)), ConditionExpression: strptr("attribute_exists(PK)"),
+		// The bytes stay while the entry names them: their version moves,
+		// so a collection that scanned them before this commit doesn't
+		// delete them after it (CollectBytes); one that deleted them first
+		// fails this condition, and the upload stores them again.
+		{Update: &types.Update{
+			TableName: &s.Table, Key: keyAV(keyBytes(p.Hash)),
+			UpdateExpression:          strptr("ADD ver :one"),
+			ConditionExpression:       strptr("attribute_exists(PK)"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":one": avI(1)},
 		}},
 	}})
 	var ce *types.TransactionCanceledException
@@ -270,7 +277,7 @@ func (s *Store) ScanBlobs(ctx context.Context) (blobs []*ddb.BlobRow, nss []stri
 			i := item(raw)
 			if pk := i.s("PK"); strings.HasPrefix(pk, "BYTES#") {
 				h, _ := hex.DecodeString(strings.TrimPrefix(pk, "BYTES#"))
-				bytes = append(bytes, &ddb.BytesRow{Hash: h, File: i.s("file"), Size: int64(i.n("size")), Touched: int64(i.n("touched"))})
+				bytes = append(bytes, &ddb.BytesRow{Hash: h, File: i.s("file"), Size: int64(i.n("size")), Touched: int64(i.n("touched")), Ver: int64(i.n("ver"))})
 				continue
 			}
 			blobs = append(blobs, scanBlob(i))
@@ -342,7 +349,20 @@ func (s *Store) CollectBytes(ctx context.Context, hashes [][]byte) (files []stri
 			continue
 		}
 		delete(stored, string(h))
-		if err := s.deleteKey(ctx, keyBytes(h)); err != nil {
+		// Only while no pending entry named them since the scan
+		// (PutPending moves the version): that one keeps them.
+		cond, vals := "attribute_not_exists(ver)", map[string]types.AttributeValue(nil)
+		if b.Ver > 0 {
+			cond, vals = "ver = :v", map[string]types.AttributeValue{":v": avI(b.Ver)}
+		}
+		_, err := s.Client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+			TableName: &s.Table, Key: keyAV(keyBytes(h)), ConditionExpression: &cond, ExpressionAttributeValues: vals,
+		})
+		var cf *types.ConditionalCheckFailedException
+		if errors.As(err, &cf) {
+			continue
+		}
+		if err != nil {
 			return files, err
 		}
 		if b.File != "" {

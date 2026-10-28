@@ -634,6 +634,9 @@ type BytesRow struct {
 	File    string
 	Size    int64
 	Touched int64
+	// Ver counts the pending entries that have named the bytes (PutPending):
+	// a collection deletes them only while it is what its scan read.
+	Ver int64
 }
 
 // BranchRow is a branch as its base lists it.
