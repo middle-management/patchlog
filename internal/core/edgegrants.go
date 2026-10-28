@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
@@ -18,7 +17,7 @@ import (
 // allows: /r/{ns}/{name}, one per name, when its read rules fix /resource
 // to a finite set of names, else /r/{ns} and /ns/{ns}. The edge evaluates
 // no rules, so the grant's blocks and its key's scope may refer to
-// /resource only to fix it, and never to /now. A grant with roles needs a
+// /resource only where they fix it, and never to /now. A grant with roles needs a
 // qualifying role (§2.1): one that lists read, whose rules don't refer to
 // /now, refer to /resource only if the grant fixes it, and pass now for
 // each name fixed, or once if none is. Roles are alternatives, so one is
@@ -322,17 +321,34 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 	}
 	// The blocks, the key scope and one qualifying role must pass now, for
 	// the principal and each name fixed: they decide every read under the
-	// prefix alike. The roles in roles passed for every name (qualifies).
-	// Of the blocks and key scope, only the rules fixing /resource refer
-	// to it, and each name fixed passes every one of them, so the first
-	// stands for all: testing each would cost the square of their number,
-	// which the cap, coming after, no longer bounds (§C.5).
+	// prefix alike (§C.5.2). The roles in roles passed for every name
+	// (qualifies). The rest pass once with /resource set to the first
+	// name, and then, for each other name, the block and key-scope rules
+	// that refer to /resource, as the rest give the same for every name.
 	first := ""
 	if names != nil {
 		first = names[0]
 	}
 	if t.grantRules(a, "read", roles, t.basicEnvelope("read", first, a), false) != nil {
 		return nil, forbidden("the grant's rules refuse reading " + ns)
+	}
+	if len(names) > 1 {
+		var each []*rules.Rule
+		for _, src := range [][]any{a.verified.KeyRules, a.verified.BlockRules} {
+			for _, rv := range src {
+				if r, err := compileCached(rv); err == nil && r.Refs()["resource"] {
+					each = append(each, r)
+				}
+			}
+		}
+		for _, name := range names[1:] {
+			env := t.basicEnvelope("read", name, a)
+			for _, r := range each {
+				if !r.Eval(env) {
+					return nil, forbidden("the grant's rules refuse reading " + name + " in " + ns + ", a name they fix (§C.5.2)")
+				}
+			}
+		}
 	}
 	// A purged namespace is decided last, once the grant verifies and may
 	// read there, as its URLs answer 410 after the read check (§8.5). Its
@@ -390,56 +406,32 @@ func (t *tx) qualifies(a *actor, rs []any, names []string) bool {
 
 // edgeReadScope classifies the rules of a's blocks and key scope, which
 // apply on top of its roles (§C.5.2). It returns the names they fix
-// /resource to (§2.1), those every fixing rule allows, in the order of the first
-// fixing rule, or nil if none fixes it; and false if a rule refers to /now
-// or to the whole envelope, or to /resource other than by fixing it, at
-// top level or inside all, or if the names are none or one isn't valid
-// (§3.6).
+// /resource to (§2.1, fixedNames), those every fixing rule allows, in the
+// order of the first fixing rule, or nil if none fixes it; and false if a
+// rule refers to /now or to the whole envelope, or to /resource where the
+// rules don't fix it: rules that refer to /resource otherwise (not, any,
+// compare ne, ...) are run per fixed name (edgeGrant), but fix nothing,
+// even alongside a fixing rule inside an any or a not.
 func edgeReadScope(a *actor) ([]string, bool) {
-	var names []string
-	fixed := false
-	var walk func(rules []any) bool
-	walk = func(rules []any) bool {
-		for _, rv := range rules {
+	refers := false
+	for _, src := range [][]any{a.verified.KeyRules, a.verified.BlockRules} {
+		for _, rv := range src {
 			r, err := compileCached(rv)
 			if err != nil {
-				return false
+				return nil, false
 			}
 			refs := r.Refs()
 			if refs["now"] || refs["*"] {
-				return false
+				return nil, false
 			}
-			if !refs["resource"] {
-				continue
-			}
-			if m, ok := rv.(map[string]any); ok && len(m) == 1 {
-				if all, ok := m["all"].([]any); ok {
-					if !walk(all) {
-						return false
-					}
-					continue
-				}
-			}
-			set, ok := fixesResource(rv)
-			if !ok {
-				return false
-			}
-			if !fixed {
-				names, fixed = set, true
-				continue
-			}
-			in := make(map[string]bool, len(set))
-			for _, n := range set {
-				in[n] = true
-			}
-			names = slices.DeleteFunc(names, func(n string) bool { return !in[n] })
+			refers = refers || refs["resource"]
 		}
-		return true
 	}
-	if !walk(a.verified.KeyRules) || !walk(a.verified.BlockRules) {
-		return nil, false
+	if !refers {
+		return nil, true
 	}
-	if fixed && len(names) == 0 {
+	names, fixed := fixedNames(a)
+	if !fixed {
 		return nil, false
 	}
 	return names, true

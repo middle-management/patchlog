@@ -219,16 +219,17 @@ func TestV050PurgedReadCheck(t *testing.T) {
 		{"/r/sec/a/rev/" + a0, onlyA, 0},
 		{"/r/sec/a/rev/" + unknown, onlyA, 0},
 		{"/r/sec/a/rev/" + a0 + "/log", onlyA, 0},
-		// /heads and grants: unrestricted read, then 410 for unknown ids too.
-		{"/ns/sec/rev/" + at + "/heads", onlyA, 404},
+		// /heads and grants: unrestricted read (403 otherwise, v0.74), then
+		// 410 for unknown ids too.
+		{"/ns/sec/rev/" + at + "/heads", onlyA, 403},
 		{"/ns/sec/rev/" + at + "/heads", f.adminG, 0},
 		{"/ns/sec/rev/" + unknown + "/heads", f.adminG, 0},
-		{"/ns/sec/grants/" + gid, onlyA, 404},
+		{"/ns/sec/grants/" + gid, onlyA, 403},
 		{"/ns/sec/grants/" + gid, f.adminG, 0},
 		{"/ns/sec/grants/" + grantIDOf(t, appendOnly), f.adminG, 0},
 		// The gestures listing: any read.
 		{"/ns/sec/gestures/" + gA, "", 401},
-		{"/ns/sec/gestures/" + gA, appendOnly, 404},
+		{"/ns/sec/gestures/" + gA, appendOnly, 403},
 		{"/ns/sec/gestures/" + gA, onlyA, 0},
 		// Not well-formed: the request's shape comes first.
 		{"/r/sec/a?bogus=1", onlyA, 400},

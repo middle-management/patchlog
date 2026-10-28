@@ -495,8 +495,8 @@ func TestV073RemoteSchemaMirrorPurgedResource(t *testing.T) {
 }
 
 // A registration entry that records no grant, written while authentication
-// was disabled, matches a retry on its author once authentication is on, as
-// write retries do (§7.2, §G.3).
+// was disabled, matches no one once authentication is on, a retry by its
+// author included, as write retries do (§7.2, §G.3, v0.74).
 func TestV073RegistrationNoGrantEntry(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "a.db")
@@ -511,8 +511,8 @@ func TestV073RegistrationNoGrantEntry(t *testing.T) {
 
 	a = newAuthEnv(t, withOrigin(originA), withPath(path))
 	g := a.grant(k, "svc:b", []string{"main"}, []string{"read", "export"})
-	if r := a.register("main", "rel", at, "", g); r.Code != 200 || r.Str("ns_id") != reg1 {
-		t.Fatalf("retry by its author: %d %s, want 200 with %s", r.Code, r.Body, reg1)
+	if r := a.register("main", "rel", at, "", g); r.Code != 412 {
+		t.Fatalf("retry by its author: %d %s, want 412 (the entry %s records no grant)", r.Code, r.Body, reg1)
 	}
 	expectCode(t, a.register("main", "rel", at, "", a.grant(k, "svc:c", []string{"main"}, []string{"read", "export"})), 412, "stale")
 }

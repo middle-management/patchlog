@@ -1318,13 +1318,17 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 
 // sameRoot reports whether an entry recorded under grant gid (nil for
 // none), whose author matched, was written by the principal of a: the same
-// root sub and kid (§7.2, §7.5). An entry that records no grant, written
-// while authentication was disabled or before grants were recorded
-// (v0.37), and any entry for a request made while it is disabled, match on
-// the author alone. samePrincipal is this for a namespace entry.
+// root sub and kid (§7.2, §7.5). A request made while authentication is
+// disabled matches on the author alone; under grants, an entry that
+// records no grant, written while authentication was disabled or before
+// grants were recorded (v0.37), matches no one (§7.2, §1).
+// samePrincipal is this for a namespace entry.
 func (t *tx) sameRoot(gid []byte, a *actor) bool {
-	if a.grant == nil || gid == nil {
+	if a.grant == nil {
 		return true
+	}
+	if gid == nil {
+		return false
 	}
 	if len(a.grant.Blocks) == 0 {
 		return false

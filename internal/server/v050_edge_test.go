@@ -353,7 +353,8 @@ func TestV050EdgeGrantsFiniteSets(t *testing.T) {
 		{"inside any", []any{map[string]any{"any": []any{enum("a", "b")}}}, ""},
 		{"inside not", []any{map[string]any{"not": test("a")}}, ""},
 		{"inside if", []any{map[string]any{"if": []any{bob}, "then": []any{test("a")}}}, ""},
-		{"all beside a fixing rule refers otherwise", []any{all(enum("a"), map[string]any{"not": test("b")})}, ""},
+		// Rules referring to /resource otherwise run per fixed name (v0.74).
+		{"all beside a fixing rule refers otherwise", []any{all(enum("a"), map[string]any{"not": test("b")})}, "/r/sec/a"},
 		// An invalid literal is 403 however many names the rest give.
 		{"101 names and an invalid one", []any{enum(append(names("n", 101), "no/slash")...)}, ""},
 		{"101 names, an invalid one intersected away", []any{enum(names("n", 101)...), enum(append(names("n", 101), "..")...)}, ""},

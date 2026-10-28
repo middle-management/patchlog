@@ -315,29 +315,19 @@ func (t *tx) nsPreRaise(n *nsRow, seq int64) *e2eRaise {
 	return nil
 }
 
-// preRaiseConfig is the namespace document in force just before raise,
-// the one the raising configuration replaced.
-func (t *tx) preRaiseConfig(raise *e2eRaise) *Config {
-	var parent sql.NullInt64
-	t.must(t.QueryRow(`SELECT parent_seq FROM ns_config WHERE seq = ?`, raise.configSeq).Scan(&parent))
-	return t.config(parent.Int64)
-}
-
 // preRaiseKeysOpen is keysOpen for content of resource name that n serves
 // from before p's raise from sealed (keywindow.go): whether any of creds
 // gets from n's /keys the keys it gives as at E2 for the epochs before the
 // raise (Addendum E Levels, §E.2.3), K_r of name or K_e as
-// keysOpenResource decides, for one of epochs. The §E.2.3 window is
-// applied to the raised namespace's epochs as at E2, with the last epoch
-// and namespace document before the raise standing for the current ones;
-// in a branch of the raised namespace, to the branch's grants, as its
-// /keys gives the base's keys for what it reads through.
+// keysOpenResource decides, for one of epochs: those preRaiseKeyWindow
+// gives, judged against the current epoch, so none to a grant without nbf
+// or while authentication is disabled.
 func (t *tx) preRaiseKeysOpen(n *nsRow, p *preRaise, name string, epochs map[int]bool, creds []Credentials) bool {
 	if len(epochs) == 0 || n.purged || p.m.purged {
 		return false
 	}
 	within := func(a *actor) bool {
-		for _, e := range t.preRaiseWindow(p.m, p.raise, a) {
+		for _, e := range t.preRaiseKeyWindow(n, p, a) {
 			if epochs[e] {
 				return true
 			}
@@ -361,6 +351,35 @@ func (t *tx) preRaiseKeysOpen(n *nsRow, p *preRaise, name string, epochs map[int
 		}
 	}
 	return false
+}
+
+// preRaiseKeyWindow lists the epochs from before p's raise from sealed
+// whose keys n's /keys gives grant a (Addendum E Levels, §E.2.3): where n
+// is the raised namespace, its window over every epoch, judged against
+// its current epoch (preRaiseWindow); in a branch of it, those the base
+// epochs give from it as of the at of the branch reading it through
+// (baseEpochs). None where p's namespace is neither.
+func (t *tx) preRaiseKeyWindow(n *nsRow, p *preRaise, a *actor) []int {
+	if n.id == p.m.id {
+		return t.preRaiseWindow(p.m, p.raise, a)
+	}
+	for child := n; child.isBranch(); {
+		b := t.nsByID(child.base.Int64)
+		if b == nil {
+			return nil
+		}
+		if b.id == p.m.id {
+			var out []int
+			for _, e := range t.baseEpochs(b, child.baseAt.Int64, a) {
+				if e <= p.raise.epoch {
+					out = append(out, e)
+				}
+			}
+			return out
+		}
+		child = b
+	}
+	return nil
 }
 
 // --- blobs ----------------------------------------------------------------

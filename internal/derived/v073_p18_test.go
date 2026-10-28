@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
@@ -13,7 +14,9 @@ import (
 
 // P18, ENC-14 (§E.2.3): with historyEpochs h, a reader gets keys for the
 // current epoch and the h before it, so the per-resource keys a service
-// hands out (catalog /read-grants) cover h+1 epochs.
+// hands out (catalog /read-grants) cover h+1 epochs. The service's grant
+// has an nbf before the first epoch: without one, or with authentication
+// disabled, /keys gives the current epoch alone (§E.2.3, v0.74).
 func TestV073ResourceKeysHistoryEpochs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -21,11 +24,13 @@ func TestV073ResourceKeysHistoryEpochs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := clienttest.New(t, clienttest.Options{KeyStore: ks})
-	c := s.Client(t, client.WithAuthor("admin"), client.WithKeys(client.NewKeys(nil)))
-	if _, err := c.CreateNamespace(ctx, "sec", map[string]any{"read": "public", "encryption": map[string]any{"level": "sealed", "historyEpochs": 1}}); err != nil {
+	s := clienttest.New(t, clienttest.Options{KeyStore: ks, Auth: true})
+	k := clienttest.NewKey("k")
+	if _, err := s.Client(t, client.WithBearer(s.OperatorGrant(t, "sec"))).CreateNamespace(ctx, "sec", map[string]any{"read": "public", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed", "historyEpochs": 1}}); err != nil {
 		t.Fatal(err)
 	}
+	g := k.Grant(t, s.Now(), "svc:derived", []string{"sec"}, []string{"read", "config"}, map[string]any{"nbf": s.Now().Add(-time.Hour).Format(time.RFC3339)})
+	c := s.Client(t, client.WithBearer(g), client.WithKeys(client.NewKeys(nil)))
 	for _, e := range []float64{2, 3} {
 		h, err := c.NSHead(ctx, "sec")
 		if err != nil {

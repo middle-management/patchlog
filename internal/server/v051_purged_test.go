@@ -90,7 +90,7 @@ func TestV051PurgedSealed(t *testing.T) {
 
 // v0.51 §8.5: the 410 comes after the full read check, so the purge of a
 // sealed namespace shows only to a grant that may read its log: 401
-// without a grant, 404 without read, then 410 at any revision.
+// without a grant, 403 without read (v0.74), then 410 at any revision.
 func TestV051PurgedSealedReadCheck(t *testing.T) {
 	t.Parallel()
 	f := newAuthFixture(t, map[string]any{"encryption": map[string]any{"level": "sealed"}}, withKeyStore(newKeyStore(t)), withEncTuning)
@@ -102,7 +102,7 @@ func TestV051PurgedSealedReadCheck(t *testing.T) {
 	reader := e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read"})
 	for _, p := range []string{"/ns/sec/rev/" + before, "/ns/sec/rev/" + head + "/log", "/ns/sec/log?live=long-poll", "/ns/sec/events"} {
 		expectCode(t, e.get(p), 401, "unauthenticated")
-		expectCode(t, e.get(p, writer), 404, "not_found")
+		expectCode(t, e.get(p, writer), 403, "forbidden")
 		expectPurged(t, e.get(p, reader), head)
 	}
 	r := e.get("/ns/sec", reader)

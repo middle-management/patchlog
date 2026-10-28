@@ -48,9 +48,10 @@ func TestV047UnrestrictedRead(t *testing.T) {
 		expect(t, e.get("/r/sec/a", g), 302)
 		expect(t, e.get("/r/sec/b", g), 404)
 		for _, p := range nsURLs {
-			// The answer of any other read it may not make.
-			if c := status(p, g); c != 404 {
-				t.Errorf("%s: %d", p, c)
+			// A verified grant that may not read: 403 off resource URLs
+			// (§7, v0.74; CONFORMANCE Grant scope 2).
+			if c := status(p, g); c != 403 {
+				t.Errorf("%s: %d, want 403", p, c)
 			}
 		}
 		// The gestures listing answers it, filtered to what it reads.
@@ -195,7 +196,7 @@ func TestV047PurgedNamespace(t *testing.T) {
 	fixed := ae.grant(f.issuer, "user:x", []string{"sec"}, []string{"read"},
 		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
 	expect(t, ae.get(heads), 401)
-	expect(t, ae.get(heads, fixed), 404)
+	expect(t, ae.get(heads, fixed), 403)
 	expectCode(t, ae.get(heads, f.adminG), 410, "purged")
 	expectCode(t, ae.get("/r/sec/a", fixed), 410, "purged")
 }

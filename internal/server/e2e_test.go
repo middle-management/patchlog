@@ -233,7 +233,7 @@ func TestE2EGateAndReads(t *testing.T) {
 	_, r = e.keysOf("e", nil, e.grant(f.writer, "user:noenc", []string{"e"}, []string{"read"}))
 	expectCode(t, r, 422, "invalid")
 	_, r = e.keysOf("e", nil, e.grant(f.writer, "user:nonreader", []string{"e"}, []string{"create"}, map[string]any{"enc": f.readerJWK}))
-	expect(t, r, 404)
+	expect(t, r, 403) // a verified grant without read (§E.2.3, v0.74)
 
 	// Sealed create, append, delete, restore; ids over ciphertext.
 	s0 := sealed(t, f.k1, "e#1", "e", "d", "", addRoot(map[string]any{"title": encMarker, "n": 0.0}))

@@ -264,7 +264,7 @@ func TestV039GesturesEndpoint(t *testing.T) {
 	// A cursor naming a resource the reader can't read is unknown.
 	expectCode(t, e.get("/ns/sec/gestures/"+gA+"?after=b/"+b0, only), 404, "not_found")
 	noRead := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"append"})
-	expectCode(t, e.get("/ns/sec/gestures/"+gA, noRead), 404, "not_found")
+	expectCode(t, e.get("/ns/sec/gestures/"+gA, noRead), 403, "forbidden") // §7, v0.74
 	expect(t, e.get("/ns/sec/gestures/"+gA), 401)
 
 	// Pruning keeps gestures (§8.6), and the listing still finds them.

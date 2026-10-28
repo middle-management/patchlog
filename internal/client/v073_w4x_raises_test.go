@@ -11,13 +11,13 @@ import (
 )
 
 // w4x (raises lens), Addendum E Levels, §E.2.3, F-E1: after a raise from
-// sealed to e2e, a grant without nbf, the usual grant, which read and wrote
-// the namespace at E2, keeps reading and appending to what existed before
-// the raise. /keys gives the keys of epochs before the raise as at E2, the
-// last epoch before the raise standing for the current one, so it still
-// gets that epoch's key; the fold of every revision of such a resource,
-// written end to end after the raise too, starts at its last revision from
-// before it, served sealed under that epoch.
+// sealed to e2e, /keys gives the keys of epochs before the raise with its
+// window judged against the current epoch (v0.74), so a grant without
+// nbf, which read and wrote the namespace at E2, gets none of them and
+// can't open what existed before the raise; one whose nbf reaches back
+// keeps reading and appending to it, the fold of a revision written end
+// to end after the raise starting at its last revision from before it,
+// served sealed under that epoch.
 func TestV073W4xNoNbfReaderAfterRaiseFromSealed(t *testing.T) {
 	ctx := context.Background()
 	v := newP29Env(t, map[string]any{"level": "sealed"})
@@ -28,22 +28,27 @@ func TestV073W4xNoNbfReaderAfterRaiseFromSealed(t *testing.T) {
 		t.Fatalf("at E2 /keys: %+v", ks)
 	}
 	v.p35Raise(t, map[string]any{"level": "e2e", "epoch": 2.0})
-	w, err := v.x.AppendSealed(ctx, "e", "d", r1, ops(op("replace", "/n", 2.0)))
+	for _, k := range must(v.c.FetchKeys(ctx, "e", nil, nil)) {
+		if k.Kid == "e#1" {
+			t.Fatalf("/keys after the raise for a grant without nbf gives e#1")
+		}
+	}
+	if _, err := v.c.E2E(v.priv).DocE2E(ctx, "e", "d", r1); err == nil {
+		t.Errorf("revision from before the raise, fresh view, grant without nbf: opened, want no key")
+	}
+	// The same key pair under a grant whose nbf precedes e#1.
+	early := v.k.Grant(t, v.s.Now(), "user:a", []string{"e"}, p29Verbs, map[string]any{"enc": seal.RecipientJWK(v.priv.PublicKey()), "nbf": v.s.Now().Add(-time.Hour).Format(time.RFC3339)})
+	ce := v.s.Client(t, client.WithBearer(early))
+	w, err := ce.E2E(v.priv).AppendSealed(ctx, "e", "d", r1, ops(op("replace", "/n", 2.0)))
 	if err != nil {
-		t.Fatalf("the writer that wrote d at E2 appends to it after the raise: %v", err)
+		t.Fatalf("a writer whose nbf reaches back appends to d after the raise: %v", err)
 	}
-	r2 := w.ID
-	after := must(v.c.FetchKeys(ctx, "e", nil, nil))
-	t.Logf("/keys after the raise: %d entries", len(after))
-	for _, k := range after {
-		t.Logf("  %s", k.Kid)
-	}
-	fresh := v.c.E2E(v.priv) // a new view: keys only from /keys
+	fresh := ce.E2E(v.priv) // a new view: keys only from /keys
 	if _, err := fresh.DocE2E(ctx, "e", "d", r1); err != nil {
-		t.Errorf("revision from before the raise, fresh view, grant without nbf: %v", err)
+		t.Errorf("revision from before the raise, fresh view, grant with nbf: %v", err)
 	}
-	if _, err := fresh.DocE2E(ctx, "e", "d", r2); err != nil {
-		t.Errorf("revision written end to end (fold starts before the raise), fresh view, grant without nbf: %v", err)
+	if _, err := fresh.DocE2E(ctx, "e", "d", w.ID); err != nil {
+		t.Errorf("revision written end to end (fold starts before the raise), fresh view, grant with nbf: %v", err)
 	}
 }
 
@@ -52,10 +57,10 @@ func TestV073W4xNoNbfReaderAfterRaiseFromSealed(t *testing.T) {
 // Protection: "keys that §E.2.3 gives there") applies the window /keys
 // applies to the epochs before the raise (Addendum E Levels: "as at E2"),
 // in both directions. With two epochs before the raise, a grant without
-// nbf gets the last of them from /keys and nothing of the first, and a
-// schema revision sealed under the first is schema_unavailable for it
-// while one under the last resolves; a grant whose nbf reaches back gets
-// both and resolves both.
+// nbf gets none of them from /keys (v0.74: the window is judged against
+// the current epoch), and a schema revision sealed under either is
+// schema_unavailable for it; a grant whose nbf reaches back gets both and
+// resolves both.
 func TestV073W4xPreRaiseKeyCheckAgreesWithKeys(t *testing.T) {
 	ctx := context.Background()
 	v := newP29Env(t, map[string]any{"level": "sealed"})
@@ -83,17 +88,14 @@ func TestV073W4xPreRaiseKeyCheckAgreesWithKeys(t *testing.T) {
 	}
 	g := v.k.Grant(t, v.s.Now(), "user:a", []string{"e", "p"}, p29Verbs, map[string]any{"enc": must(jwkOf(t))})
 	c := v.s.Client(t, client.WithBearer(g))
-	if ks := kids(c); ks["e#1"] || !ks["e#2"] {
-		t.Fatalf("/keys of e for a grant without nbf: %v, want e#2 (the last epoch before the raise, as at E2) and not e#1", ks)
+	if ks := kids(c); ks["e#1"] || ks["e#2"] {
+		t.Fatalf("/keys of e for a grant without nbf: %v, want neither e#1 nor e#2 (v0.74)", ks)
 	}
 	if _, err := c.CreateDoc(ctx, "p", "x", map[string]any{"$schema": "/r/e/m/rev/" + s1, "n": 1.0}); !unavailable(err) {
 		t.Errorf("a schema sealed under e#1, which /keys doesn't give the grant: %v, want schema_unavailable", err)
 	}
-	if _, err := c.CreateDoc(ctx, "p", "y", map[string]any{"$schema": "/r/e/m2/rev/" + s2, "n": 1.0}); err != nil {
-		t.Errorf("a schema sealed under e#2, which /keys gives the grant: %v", err)
-	}
-	if _, err := c.CreateDoc(ctx, "p", "y2", map[string]any{"$schema": "/r/e/m2/rev/" + s2, "n": "x"}); err == nil || unavailable(err) {
-		t.Errorf("an invalid document under the e#2 schema: %v, want it refused by the schema", err)
+	if _, err := c.CreateDoc(ctx, "p", "y", map[string]any{"$schema": "/r/e/m2/rev/" + s2, "n": 1.0}); !unavailable(err) {
+		t.Errorf("a schema sealed under e#2, which /keys doesn't give the grant: %v, want schema_unavailable", err)
 	}
 	early := v.k.Grant(t, v.s.Now(), "user:b", []string{"e", "p"}, p29Verbs, map[string]any{"enc": must(jwkOf(t)), "nbf": v.s.Now().Add(-time.Hour).Format(time.RFC3339)})
 	ce := v.s.Client(t, client.WithBearer(early))
@@ -102,6 +104,12 @@ func TestV073W4xPreRaiseKeyCheckAgreesWithKeys(t *testing.T) {
 	}
 	if _, err := ce.CreateDoc(ctx, "p", "z", map[string]any{"$schema": "/r/e/m/rev/" + s1, "n": 1.0}); err != nil {
 		t.Errorf("a schema sealed under e#1, for a grant /keys gives e#1: %v", err)
+	}
+	if _, err := ce.CreateDoc(ctx, "p", "z2", map[string]any{"$schema": "/r/e/m2/rev/" + s2, "n": 1.0}); err != nil {
+		t.Errorf("a schema sealed under e#2, for a grant /keys gives e#2: %v", err)
+	}
+	if _, err := ce.CreateDoc(ctx, "p", "z3", map[string]any{"$schema": "/r/e/m2/rev/" + s2, "n": "x"}); err == nil || unavailable(err) {
+		t.Errorf("an invalid document under the e#2 schema: %v, want it refused by the schema", err)
 	}
 }
 

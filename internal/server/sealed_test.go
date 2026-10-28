@@ -326,7 +326,7 @@ func TestSealedReadGrant(t *testing.T) {
 	nr := e.grant(k, "user:x", []string{"s"}, []string{"append"})
 	expect(t, e.get("/r/s/a/rev/"+id), 401)
 	expect(t, e.get("/r/s/a/rev/"+id, nr), 404)
-	expect(t, e.get("/ns/s/rev/"+e.nsHead("s", w)+"/log", nr), 404)
+	expect(t, e.get("/ns/s/rev/"+e.nsHead("s", w)+"/log", nr), 403) // 404 only at resource URLs (§7, v0.74)
 	r := e.get("/r/s/a/rev/"+id, w)
 	expect(t, r, 200)
 	if !isJOSE(r) || r.H.Get("Cache-Control") != "private, max-age=300" || r.H.Get("CDN-Cache-Control") != "no-store" {
@@ -336,8 +336,8 @@ func TestSealedReadGrant(t *testing.T) {
 	if _, r := e.keysOf("s", nil, ""); r.Code != 401 {
 		t.Fatalf("keys without grant %d", r.Code)
 	}
-	if _, r := e.keysOf("s", nil, nr); r.Code != 404 {
-		t.Fatalf("keys without read %d", r.Code)
+	if _, r := e.keysOf("s", nil, nr); r.Code != 403 {
+		t.Fatalf("keys without read %d, want 403 (§E.2.3, v0.74)", r.Code)
 	}
 	// So does a sealed public namespace's.
 	e.mkNS("sp", sealedDoc(map[string]any{"read": "public", "keys": []any{k.entry("*")}}))
@@ -536,11 +536,14 @@ func TestSealedRotation(t *testing.T) {
 	a1 := e.wr("s", "a", "", withNonce(addRoot(map[string]any{"v": 1.0})))
 	before := string(e.get("/r/s/a/rev/" + a1).Body)
 	beforeLog := string(e.get("/r/s/a/rev/" + a1 + "/log").Body)
+	keys1, _ := e.keysOf("s", nil, "")
 	expect(t, e.patchNS("s", ops(op("add", "/encryption/epoch", 2.0)), ""), 201)
 	a2 := e.wr("s", "a", a1, withNonce(ops(op("replace", "/v", 2.0))))
+	// With authentication disabled, /keys gives the current epoch's key
+	// alone, as to a grant without nbf (§E.2.3, v0.74).
 	keys, _ := e.keysOf("s", nil, "")
-	if keys["s#1"] == nil || keys["s#2"] == nil || string(keys["s#1"]) == string(keys["s#2"]) {
-		t.Fatalf("keys %v", keys)
+	if len(keys) != 1 || keys1["s#1"] == nil || keys["s#2"] == nil || string(keys1["s#1"]) == string(keys["s#2"]) {
+		t.Fatalf("keys %v, before the rotation %v", keys, keys1)
 	}
 	if got := string(e.get("/r/s/a/rev/" + a1).Body); got != before {
 		t.Fatal("an old revision's bytes changed after rotation")
