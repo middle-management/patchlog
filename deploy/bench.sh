@@ -62,9 +62,11 @@ OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
 # The setup's requests say why they failed: the server's answer, or
-# curl's (not listening, wrong port).
-setup() { # setup URL BODY
-  if ! curl -sS --fail-with-body -o "$OUT/body" -X PATCH "$1" -H "$CT" -H 'X-Author: bench' -H 'If-None-Match: *' -d "$2"; then
+# curl's (not listening, wrong port). Each namespace's are an author's
+# own: one author's writes are limited (50/s, a burst of 100), and a fast
+# backend makes eight namespaces' 136 in well under a second.
+setup() { # setup URL BODY AUTHOR
+  if ! curl -sS --fail-with-body -o "$OUT/body" -X PATCH "$1" -H "$CT" -H "X-Author: $3" -H 'If-None-Match: *' -d "$2"; then
     echo "bench: PATCH $1 failed: $(cat "$OUT/body" 2>/dev/null)" >&2
     exit 1
   fi
@@ -80,9 +82,9 @@ for n in $(seq 1 "$NAMESPACES"); do
   if [ "$(share "$WRITES" "$n")" -gt 400 ]; then
     config="{\"read\":\"public\",\"limits\":{\"ratePerNamespace\":{\"rate\":$(( WRITES * 2 )),\"burst\":$(( WRITES * 4 ))}}}"
   fi
-  setup "$BASE/ns/$ns" "[{\"op\":\"add\",\"path\":\"\",\"value\":$config}]"
+  setup "$BASE/ns/$ns" "[{\"op\":\"add\",\"path\":\"\",\"value\":$config}]" "setup$n"
   for i in $(seq 1 "$RESOURCES"); do
-    setup "$BASE/r/$ns/r$i" '[{"op":"add","path":"","value":{"v":0}}]'
+    setup "$BASE/r/$ns/r$i" '[{"op":"add","path":"","value":{"v":0}}]' "setup$n"
   done
   nss="$nss${nss:+|}$ns"
 done

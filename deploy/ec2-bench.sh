@@ -253,7 +253,7 @@ OTEL_TRACES_EXPORTER=console OTEL_METRICS_EXPORTER=none OTEL_TRACES_SAMPLER=trac
     $dbarg 2>spans.jsonl &
 server=\$!
 for _ in \$(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8080/ && break; kill -0 \$server || { grep -v '^{' spans.jsonl; exit 1; }; sleep 1; done
-${READS:+READS=$READS }${LOGS:+LOGS=$LOGS }${NAMESPACES:+NAMESPACES=$NAMESPACES }./bench.sh "\$1" "\$2" || echo "bench failed: \$?"
+${READS:+READS=$READS }${LOGS:+LOGS=$LOGS }${NAMESPACES:+NAMESPACES=$NAMESPACES }./bench.sh "\$1" "\$2" 2>&1 || echo "bench failed: \$?"
 kill \$server; wait \$server || true
 echo; ./spans.py --sample $SAMPLE spans.jsonl
 echo; echo "server log (last 30 lines that aren't spans):"
