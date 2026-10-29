@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Runs deploy/bench.sh against a real DynamoDB table from an EC2 instance in
-# the table's region: the server and the bench on one machine of their own,
-# not CloudShell's shared one. Prints the bench's numbers and deploy/spans.py's
-# summary of where the requests spent their time, then terminates the
-# instance.
+# Runs deploy/bench.sh against a backend in AWS from an EC2 instance in its
+# region: a DynamoDB table, an RDS Postgres instance, or SQLite on the
+# instance's own disk, with the server and the bench on one machine of their
+# own, not CloudShell's shared one. Prints the bench's numbers and
+# deploy/spans.py's summary of where the requests spent their time, then
+# terminates the instance.
 #
 #   ./deploy/ec2-bench.sh [-y] [writes/s] [seconds]   (default 100 20)
-#   ./deploy/ec2-bench.sh cleanup                      the IAM role, profile
+#   ./deploy/ec2-bench.sh cleanup                      the IAM role, profile, RDS instance
 #
 # The arguments, READS, LOGS and NAMESPACES are bench.sh's. The instance runs
 # this checkout's bench.sh and spans.py, oha's release OHA (default v1.14.0),
@@ -16,21 +17,32 @@
 # for 60 seconds. That needs Go, ssh and AWS's session-manager-plugin here.
 #
 # Settings (environment):
-#   REGION   the table's region (default: aws configure's)
-#   TABLE    the table (default patchlog); made, on-demand, if it's missing
+#   BACKEND  dynamodb (default), postgres (RDS) or sqlite
+#   REGION   the region (default: aws configure's)
+#   TABLE    the DynamoDB table (default patchlog); made, on-demand, if it's
+#            missing
+#   DB_CLASS the RDS instance class (default db.m7g.large: 2 vCPU, 8 GiB)
 #   VERSION  a release to run instead of building, e.g. v0.24.0-ddb.3
 #   TYPE     the instance type (default c7g.xlarge, arm64: 4 cores for the
 #            server, oha and the server's console spans)
 #   SAMPLE   the share of requests traced (default 1, 0.1 above 300 writes/s:
 #            every request's spans would cost the server and spans.py more
 #            than they tell); spans.py scales its units per second back up
-#   SUBNET   a subnet with a route out (default: the default VPC's)
+#   SUBNET   a subnet with a route out (default: the default VPC's); for
+#            postgres, one in the RDS instance's VPC
 #
 # What it makes, after asking (-y doesn't ask):
 #   - IAM role and instance profile patchlog-bench, kept for the next run
 #     (`cleanup` deletes them): SSM's managed policy (no SSH, no open
 #     ports) and DynamoDB on this table and its indexes only.
-#   - The table, if it's missing. Never deleted: it holds what you wrote.
+#   - For dynamodb, the table, if it's missing. Never deleted: it holds what
+#     you wrote.
+#   - For postgres, RDS instance patchlog-bench, if it's missing (5–10
+#     minutes; billed by the hour while it exists, `cleanup` deletes it):
+#     Postgres, single-AZ, 20 GiB gp3, no backups, not publicly accessible,
+#     in the default VPC with its default security group, which the
+#     instance shares; its URL, with a generated password, is SecureString
+#     parameter /patchlog-bench/db-url, which only the role may read.
 #   - One instance, terminated on exit, and by itself after 90 minutes
 #     should this script die first.
 #
@@ -38,7 +50,11 @@
 set -euo pipefail
 
 REGION=${REGION:-${AWS_REGION:-$(aws configure get region || true)}}
+BACKEND=${BACKEND:-dynamodb}
 TABLE=${TABLE:-patchlog}
+DB_CLASS=${DB_CLASS:-db.m7g.large}
+DB=patchlog-bench
+DB_PARAM=/patchlog-bench/db-url
 VERSION=${VERSION:-}
 TYPE=${TYPE:-c7g.xlarge}
 OHA=${OHA:-v1.14.0}
@@ -47,14 +63,21 @@ ROLE=patchlog-bench
 REPO=middle-management/patchlog
 [ -n "$REGION" ] || { echo "ec2-bench: set REGION (or aws configure set region …)" >&2; exit 1; }
 export AWS_REGION=$REGION AWS_PAGER=""
+case $BACKEND in dynamodb|postgres|sqlite) ;; *) echo "ec2-bench: BACKEND is dynamodb, postgres or sqlite" >&2; exit 2 ;; esac
 
 if [ "${1:-}" = cleanup ]; then
   aws iam remove-role-from-instance-profile --instance-profile-name $ROLE --role-name $ROLE 2>/dev/null || true
   aws iam delete-instance-profile --instance-profile-name $ROLE 2>/dev/null || true
   aws iam detach-role-policy --role-name $ROLE --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
   aws iam delete-role-policy --role-name $ROLE --policy-name dynamodb 2>/dev/null || true
+  aws iam delete-role-policy --role-name $ROLE --policy-name dbparam 2>/dev/null || true
   aws iam delete-role --role-name $ROLE 2>/dev/null || true
   echo "ec2-bench: deleted role and instance profile $ROLE (if they existed)"
+  if aws rds describe-db-instances --db-instance-identifier $DB >/dev/null 2>&1; then
+    aws rds delete-db-instance --db-instance-identifier $DB --skip-final-snapshot --delete-automated-backups >/dev/null
+    echo "ec2-bench: deleting RDS instance $DB (it stops billing once gone, in a few minutes)"
+  fi
+  aws ssm delete-parameter --name $DB_PARAM 2>/dev/null || true
   exit 0
 fi
 
@@ -67,7 +90,11 @@ case "$RATE$SECS$READS$LOGS$NAMESPACES" in *[!0-9]*) echo "usage: $0 [-y] [write
 
 # What's there, and what would be made.
 account=$(aws sts get-caller-identity --query Account --output text)
-table_arn=$(aws dynamodb describe-table --table-name "$TABLE" --query Table.TableArn --output text 2>/dev/null || true)
+table_arn=""
+[ "$BACKEND" != dynamodb ] || table_arn=$(aws dynamodb describe-table --table-name "$TABLE" --query Table.TableArn --output text 2>/dev/null || true)
+db_state=""
+[ "$BACKEND" != postgres ] || db_state=$(aws rds describe-db-instances --db-instance-identifier $DB \
+  --query 'DBInstances[0].[DBInstanceStatus,DBInstanceClass]' --output text 2>/dev/null || true)
 have_role=$(aws iam get-role --role-name $ROLE --query Role.Arn --output text 2>/dev/null || true)
 arch=$(aws ec2 describe-instance-types --instance-types "$TYPE" \
   --query 'InstanceTypes[0].ProcessorInfo.SupportedArchitectures[0]' --output text)
@@ -76,6 +103,13 @@ if [ -z "${SUBNET:-}" ]; then
   SUBNET=$(aws ec2 describe-subnets --filters Name=default-for-az,Values=true \
     --query 'Subnets[0].SubnetId' --output text)
   [ "$SUBNET" != None ] || { echo "ec2-bench: no default VPC here; set SUBNET to one with a route out" >&2; exit 1; }
+fi
+if [ -n "$db_state" ]; then
+  # The instance reaches the database over the VPC's default security
+  # group, which lets its members in: both must be in the one VPC.
+  db_vpc=$(aws rds describe-db-instances --db-instance-identifier $DB --query 'DBInstances[0].DBSubnetGroup.VpcId' --output text)
+  sub_vpc=$(aws ec2 describe-subnets --subnet-ids "$SUBNET" --query 'Subnets[0].VpcId' --output text)
+  [ "$db_vpc" = "$sub_vpc" ] || { echo "ec2-bench: RDS instance $DB is in $db_vpc, subnet $SUBNET in $sub_vpc; set SUBNET to one of $db_vpc" >&2; exit 1; }
 fi
 ami=$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-$arch \
   --query Parameter.Value --output text)
@@ -91,9 +125,13 @@ else
   server="built from this checkout ($rev, linux/$goarch), copied over SSH through SSM"
 fi
 
-echo "account $account, region $REGION"
-echo "  table $TABLE: $([ -n "$table_arn" ] && echo exists || echo 'to make (on-demand)')"
-echo "  role $ROLE: $([ -n "$have_role" ] && echo 'exists (its DynamoDB policy is set to this table)' || echo 'to make')"
+echo "account $account, region $REGION, backend $BACKEND"
+case $BACKEND in
+dynamodb) echo "  table $TABLE: $([ -n "$table_arn" ] && echo exists || echo 'to make (on-demand)')" ;;
+postgres) echo "  RDS instance $DB: $([ -n "$db_state" ] && echo "exists ($db_state)" || echo "to make ($DB_CLASS, 5–10 minutes; billed hourly until cleanup)")" ;;
+sqlite) echo "  SQLite: a file on the instance's disk" ;;
+esac
+echo "  role $ROLE: $([ -n "$have_role" ] && echo exists || echo 'to make')"
 echo "  instance: $TYPE ($arch, $ami) in $SUBNET, terminated on exit"
 echo "  server: $server"
 echo "  run: bench $RATE writes/s for ${SECS}s${READS:+, reads $READS/s}${LOGS:+, logs $LOGS/s}${NAMESPACES:+, over $NAMESPACES namespaces}, tracing $SAMPLE of requests"
@@ -103,7 +141,7 @@ if [ -z "$YES" ]; then
 fi
 
 # The table, as docs/DYNAMODB.md §3 has it.
-if [ -z "$table_arn" ]; then
+if [ "$BACKEND" = dynamodb ] && [ -z "$table_arn" ]; then
   aws dynamodb create-table --table-name "$TABLE" --billing-mode PAY_PER_REQUEST \
     --attribute-definitions AttributeName=PK,AttributeType=S AttributeName=SK,AttributeType=S \
       AttributeName=G1PK,AttributeType=S \
@@ -124,13 +162,47 @@ if [ -z "$have_role" ]; then
   aws iam add-role-to-instance-profile --instance-profile-name $ROLE --role-name $ROLE
   echo "made role and instance profile $ROLE"
 fi
-aws iam put-role-policy --role-name $ROLE --policy-name dynamodb --policy-document "{
-  \"Version\": \"2012-10-17\",
-  \"Statement\": [{\"Effect\": \"Allow\", \"Action\": [
-    \"dynamodb:DescribeTable\", \"dynamodb:GetItem\", \"dynamodb:BatchGetItem\", \"dynamodb:Query\",
-    \"dynamodb:Scan\", \"dynamodb:PutItem\", \"dynamodb:UpdateItem\", \"dynamodb:DeleteItem\",
-    \"dynamodb:BatchWriteItem\", \"dynamodb:ConditionCheckItem\"],
-    \"Resource\": [\"$table_arn\", \"$table_arn/index/*\"]}]}"
+if [ "$BACKEND" = dynamodb ]; then
+  aws iam put-role-policy --role-name $ROLE --policy-name dynamodb --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{\"Effect\": \"Allow\", \"Action\": [
+      \"dynamodb:DescribeTable\", \"dynamodb:GetItem\", \"dynamodb:BatchGetItem\", \"dynamodb:Query\",
+      \"dynamodb:Scan\", \"dynamodb:PutItem\", \"dynamodb:UpdateItem\", \"dynamodb:DeleteItem\",
+      \"dynamodb:BatchWriteItem\", \"dynamodb:ConditionCheckItem\"],
+      \"Resource\": [\"$table_arn\", \"$table_arn/index/*\"]}]}"
+fi
+
+# The RDS instance, and its URL where only the role reads it.
+if [ "$BACKEND" = postgres ]; then
+  if [ -z "$db_state" ]; then
+    pw=$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)
+    aws rds create-db-instance --db-instance-identifier $DB --engine postgres \
+      --db-instance-class "$DB_CLASS" --allocated-storage 20 --storage-type gp3 \
+      --master-username patchlog --master-user-password "$pw" --db-name patchlog \
+      --no-publicly-accessible --no-multi-az --backup-retention-period 0 \
+      --tags Key=Name,Value=patchlog-bench >/dev/null
+    echo "making RDS instance $DB ($DB_CLASS): 5–10 minutes"
+    aws rds wait db-instance-available --db-instance-identifier $DB
+    host=$(aws rds describe-db-instances --db-instance-identifier $DB --query 'DBInstances[0].Endpoint.Address' --output text)
+    aws ssm put-parameter --name $DB_PARAM --type SecureString --overwrite \
+      --value "postgres://patchlog:$pw@$host:5432/patchlog?sslmode=require" >/dev/null
+    unset pw
+    db_vpc=$(aws rds describe-db-instances --db-instance-identifier $DB --query 'DBInstances[0].DBSubnetGroup.VpcId' --output text)
+    sub_vpc=$(aws ec2 describe-subnets --subnet-ids "$SUBNET" --query 'Subnets[0].VpcId' --output text)
+    [ "$db_vpc" = "$sub_vpc" ] || { echo "ec2-bench: RDS instance $DB was made in $db_vpc, subnet $SUBNET is in $sub_vpc; set SUBNET to one of $db_vpc" >&2; exit 1; }
+  else
+    aws rds wait db-instance-available --db-instance-identifier $DB
+  fi
+  aws iam put-role-policy --role-name $ROLE --policy-name dbparam --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{\"Effect\": \"Allow\", \"Action\": \"ssm:GetParameter\",
+      \"Resource\": \"arn:aws:ssm:$REGION:$account:parameter$DB_PARAM\"}]}"
+fi
+case $BACKEND in
+dynamodb) dbarg="-db 'dynamodb://$TABLE?region=$REGION'" ;;
+postgres) dbarg="" ;; # PATCHLOG_DB, read from the parameter on the instance
+sqlite) dbarg="-db /opt/bench/bench.db" ;;
+esac
 
 # What's made for this run only goes on exit.
 work=$(mktemp -d); id=""
@@ -172,9 +244,13 @@ cat >run.sh <<'RUN'
 set -eu
 cd /opt/bench
 export PATH=/opt/bench:\$PATH
+if [ $BACKEND = postgres ]; then
+  PATCHLOG_DB=\$(aws ssm get-parameter --region $REGION --name $DB_PARAM --with-decryption --query Parameter.Value --output text)
+  export PATCHLOG_DB
+fi
 OTEL_TRACES_EXPORTER=console OTEL_METRICS_EXPORTER=none OTEL_TRACES_SAMPLER=traceidratio OTEL_TRACES_SAMPLER_ARG=$SAMPLE \\
   ./patchlog serve -dev -addr 127.0.0.1:8080 -max-rate-per-namespace 100000,1000000 \\
-    -db 'dynamodb://$TABLE?region=$REGION' 2>spans.jsonl &
+    $dbarg 2>spans.jsonl &
 server=\$!
 for _ in \$(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8080/ && break; kill -0 \$server || { grep -v '^{' spans.jsonl; exit 1; }; sleep 1; done
 ${READS:+READS=$READS }${LOGS:+LOGS=$LOGS }${NAMESPACES:+NAMESPACES=$NAMESPACES }./bench.sh "\$1" "\$2" || echo "bench failed: \$?"
