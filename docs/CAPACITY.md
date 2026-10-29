@@ -63,6 +63,63 @@ the large namespace from 32):
 - Write throughput into one namespace doesn't depend on the core's size here: the namespace's
   log (one append at a time, grouped) and Postgres set it.
 
+## Three backends on AWS
+
+`deploy/ec2-bench.sh` runs `deploy/bench.sh` against each backend from one EC2 instance in the
+backend's region, measured on 2026-10-28 and 29 in eu-north-1:
+
+- **The machine:** the core and the load generator (oha) on one **c7g.2xlarge** (8 vCPU arm64,
+  16 GB): SQLite on its own gp3 disk, Postgres on RDS **db.m7g.large** (2 vCPU, 8 GB, gp3,
+  single-AZ), DynamoDB an on-demand table pre-warmed to 15,000 write and 20,000 read units a
+  second.
+- **The load:** for 30 s, open-loop at fixed rates (oha's latency correction: a slow server shows
+  as latency, not as a lower rate), over **8 namespaces**: creates of small documents (`-dev`, no
+  grants), each of 16–64 authors its own content; reads of resources' heads at the write rate;
+  followers reading each namespace's log since a recent entry at half the write rate. One run
+  each, 10% of requests traced.
+
+Writes answered a second, and latency at the client (ms, p50 / p95 / p99):
+
+| Asked | | SQLite | Postgres (RDS) | DynamoDB |
+|---|---|---|---|---|
+| 600/s | writes | 600/s · 1 / 12 / 16 | 600/s · 43 / 208 / 578 | 594/s · 45 / 574 / 677 |
+| | head reads | 0 / 1 / 1 | 9 / 56 / 324 | 6 / 9 / 24 |
+| | log reads | 1 / 3 / 4 | 31 / 70 / 80 | 13 / 21 / 24 |
+| 1,200/s | writes | **942/s** · 937 / 6,277 / 6,860 | **795/s** · 7,947 / 10,153 / 10,571 | **1,154/s** · 42 / 1,053 / 1,404 |
+| | head reads | 0 / 1 / 2 | 380 / 1,830 / 2,214 | 6 / 9 / 16 |
+| | log reads | 1 / 3 / 5 | 193 / 454 / 617 (562/s) | 13 / 19 / 22 |
+| 2,400/s | writes | **885/s** · 7,073 / 18,793 / 19,842 | **819/s** · 11,067 / 19,671 / 20,458 | — |
+| | head reads | 0 / 1 / 4 | 6,270 / 9,358 / 9,878 (1,664/s) | — |
+| | log reads | 1 / 4 / 6 | 250 / 572 / 799 (1,017/s) | — |
+
+Where a backend answers fewer writes than asked, the rest queue: their latency is the queue's.
+
+- **SQLite: ~900 writes a second, reads untouched.** One writer at a time, whatever the
+  namespaces; past it writes queue, and reads, beside the write-ahead log, stay under 4 ms at
+  p99 with 2,400 reads and 1,200 log reads a second. Lowest latency below its ceiling, one
+  machine.
+- **Postgres on a 2-vCPU RDS instance: ~800 writes a second, and reads fall with it.** At its
+  write ceiling head reads go from 9 ms to 380 ms (p50), then seconds: the database instance is
+  the limit for both, as on server X; a larger instance class raises it.
+- **DynamoDB: as far as the table's capacity.** 1,154 writes a second with head reads at 6 ms,
+  writes ~40 ms (a transaction, ~22 ms, and the wait for a group commit). Its limits are
+  different in kind:
+  - **~11 write units a write** (five items in one transaction, at two units each, and a GSI
+    entry), so the table's capacity: 1,200 writes a second is ~13,000 units, and this run's
+    bursts reached 21,000 against the 15,000 pre-warmed, throttled (a 503 with `Retry-After`
+    when it outlasts the retries) and retried. A new on-demand table starts at 4,000 write units
+    a second and grows with use; pre-warming (`update-table --warm-throughput`) is a one-time
+    charge.
+  - **~150 writes a second a namespace.** A namespace's log entries and resource items share its
+    partition key, which DynamoDB holds to ~1,000 write units a second (docs/DYNAMODB.md §3):
+    one namespace measured 147/s at 300 asked. Throughput grows with namespaces, not within one.
+  - Physical partitions split under sustained load, so a young table's first runs throttle more
+    than later ones.
+
+On the same machine, then: SQLite for one machine below ~900 writes a second; Postgres for
+heavy writes into few namespaces, sized by its instance; DynamoDB for many namespaces and
+instances with no database server to run, sized by the table's capacity and paid by the request.
+
 ## Long-poll followers and the CDN
 
 Many followers (devices, not consumer services) are meant to long-poll (§7.7) through the CDN:
@@ -191,3 +248,13 @@ go build -o patchlog ./cmd/patchlog && go build -o capacity ./cmd/capacity
 - **Once seeded**, `-only scans,reads,writes,bootstrap,large,live` measures again without seeding,
   e.g. after resizing the core.
 - Sizes: `-docs`, `-revs`, `-namespaces`, `-doc-size`, `-append-batch`; `-help` lists the rest.
+
+The comparison of [Three backends on AWS](#three-backends-on-aws), from a checkout with the AWS
+CLI, Go and AWS's session-manager-plugin (the script says what it makes, and asks):
+
+```sh
+BACKEND=postgres NAMESPACES=8 TYPE=c7g.2xlarge ./deploy/ec2-bench.sh 1200 30   # RDS, made on first use
+BACKEND=sqlite   NAMESPACES=8 TYPE=c7g.2xlarge ./deploy/ec2-bench.sh 1200 30
+TABLE=patchlog   NAMESPACES=8 TYPE=c7g.2xlarge ./deploy/ec2-bench.sh 1200 30   # DynamoDB
+./deploy/ec2-bench.sh cleanup   # the RDS instance (billed by the hour), the IAM role
+```
