@@ -586,6 +586,22 @@ impl Namespace {
                 let v = self.view_at(at, name).await?;
                 http::json(200, Headers::new(), &v)
             }
+            ("internal", ["log", at, name, id]) => {
+                let q = http::query(&url, &["since"])?;
+                let since = q.get("since").map(String::as_str).unwrap_or("");
+                let at_seq = self.ns_seq_of(at)?.ok_or_else(Err::not_found)?.seq;
+                match self.log_range(name, id, since, Some(at_seq)).await? {
+                    Some((out, more)) => http::json(
+                        200,
+                        Headers::new(),
+                        &obj(vec![
+                            ("entries", Value::Array(out)),
+                            ("more", Value::Bool(more)),
+                        ]),
+                    ),
+                    None => Err(Err::not_found()),
+                }
+            }
             ("internal", ["rev", at, name, id]) => match self.rev_at(at, name, id).await? {
                 Some(v) => http::json(200, Headers::new(), &v),
                 None => Err(Err::not_found()),
@@ -646,6 +662,7 @@ impl Namespace {
                     id,
                     q.get("since").map(String::as_str).unwrap_or(""),
                 )
+                .await
             }
             _ => Err(Err::not_offered(
                 "this server doesn't offer that endpoint yet",
@@ -833,8 +850,12 @@ impl Namespace {
                     (Some(name), Some(head)) => {
                         format!("/r/{}/{}/rev/{}/log{qs}", ctx.ns, name, head.id)
                     }
-                    // A resource with no entries: 404, cached as short.
-                    (Some(_), None) => return Err(Err::not_found()),
+                    // In a branch, a resource read through: its base's log.
+                    (Some(name), None) => match self.view(name) {
+                        Some(f) => format!("/r/{}/{}/rev/{}/log{qs}", ctx.ns, name, f.id),
+                        // A resource with no entries: 404, cached as short.
+                        None => return Err(Err::not_found()),
+                    },
                 };
                 hd.set("Location", &location)?;
                 return http::respond(302, hd, vec![]);
@@ -1866,24 +1887,12 @@ impl Namespace {
         http::json(200, hd, &Value::Array(page))
     }
 
-    fn get_log_range(&self, ctx: &Ctx, name: &str, id: &str, since: &str) -> Res<Response> {
+    async fn get_log_range(&self, ctx: &Ctx, name: &str, id: &str, since: &str) -> Res<Response> {
         let ns = self.existing()?;
-        let Some(id) = Id::parse(id) else {
-            return Err(Err::bad("malformed id"));
-        };
-        let upto = self.entry_by_id(name, &id)?.ok_or_else(Err::not_found)?;
-        let after = if since.is_empty() {
-            0
-        } else {
-            let Some(a) = Id::parse(since) else {
-                return Err(Err::bad("malformed since"));
-            };
-            match self.entry_by_id(name, &a)? {
-                Some(e) if e.seq <= upto.seq => e.seq,
-                _ => return Err(Err::not_found()),
-            }
-        };
-        let (out, more) = self.res_page(name, after, upto.seq, &ns.limits)?;
+        let (out, more) = self
+            .log_range(name, id, since, None)
+            .await?
+            .ok_or_else(Err::not_found)?;
         let hd = Headers::new();
         cache_headers(&hd, Class::Immutable, ns.public)?;
         tags(&hd, &ctx.ns, Some(name))?;

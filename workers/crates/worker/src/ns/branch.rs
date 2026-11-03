@@ -510,6 +510,72 @@ impl Namespace {
         }
     }
 
+    /// A page of `name`'s log up to revision `upto`, after `since`, crossing
+    /// a foreign parent into the base (§7.6 History): the base's entries
+    /// first, a page at a time, then this namespace's. `at_seq` bounds what
+    /// a branch of this namespace may see. `None` if `upto` or `since` isn't
+    /// in the resource's history.
+    pub(super) async fn log_range(
+        &self,
+        name: &str,
+        upto: &str,
+        since: &str,
+        at_seq: Option<i64>,
+    ) -> Res<Option<(Vec<Value>, bool)>> {
+        let ns = self.existing()?;
+        let Some(upto_id) = Id::parse(upto) else {
+            return Err(Err::bad("malformed id"));
+        };
+        let base = base_of(&ns);
+        let Some(top) = self.entry_by_id(name, &upto_id)? else {
+            // A base revision, in a branch.
+            return match base {
+                Some((b, bat)) => fetch_log(&self.env, &b, &bat, name, upto, since).await,
+                None => Ok(None),
+            };
+        };
+        if at_seq.is_some_and(|a| top.seq > a) {
+            return Ok(None);
+        }
+        // The foreign parent: the first entry's parent, if not an entry here.
+        let first: Option<EntryRow> = self.one(
+            "SELECT *, 0 AS ns_seq FROM res_log WHERE resource = ? ORDER BY seq LIMIT 1",
+            vec![name.into()],
+        )?;
+        let fp = first.and_then(|f| f.parent).filter(|p| {
+            Id::parse(p).is_some_and(|p| self.entry_by_id(name, &p).ok().flatten().is_none())
+        });
+        let after = if since.is_empty() {
+            match (&fp, &base) {
+                (Some(fp), Some((b, bat))) => {
+                    // Everything up to the foreign parent comes first.
+                    return Ok(fetch_log(&self.env, b, bat, name, fp, "")
+                        .await?
+                        .map(|(p, _)| (p, true)));
+                }
+                _ => 0,
+            }
+        } else {
+            let Some(sid) = Id::parse(since) else {
+                return Err(Err::bad("malformed since"));
+            };
+            match self.entry_by_id(name, &sid)? {
+                Some(e) if e.seq <= top.seq => e.seq,
+                Some(_) => return Ok(None),
+                None if fp.as_deref() == Some(since) => 0,
+                None => match (&fp, &base) {
+                    (Some(fp), Some((b, bat))) => {
+                        return Ok(fetch_log(&self.env, b, bat, name, fp, since)
+                            .await?
+                            .map(|(p, _)| (p, true)));
+                    }
+                    _ => return Ok(None),
+                },
+            }
+        };
+        Ok(Some(self.res_page(name, after, top.seq, &ns.limits)?))
+    }
+
     // ---------------------------------------------------------- branch side
 
     /// Creates this namespace as a branch: its genesis config entry, with the
@@ -793,6 +859,39 @@ async fn fetch_view(env: &Env, base: &str, at: &str, name: &str) -> Res<Option<F
             .map(|a| a.iter().filter_map(blob_from_json).collect())
             .unwrap_or_default(),
     }))
+}
+
+async fn fetch_log(
+    env: &Env,
+    base: &str,
+    at: &str,
+    name: &str,
+    upto: &str,
+    since: &str,
+) -> Res<Option<(Vec<Value>, bool)>> {
+    let url = internal_url(base, &format!("log/{at}/{name}/{upto}?since={since}"));
+    let (status, text) = call(env, base, &url, None).await?;
+    match status {
+        200 => {
+            let v = json::parse(text.as_bytes())
+                .map_err(|e| Err::new(500, "internal", e.to_string()))?;
+            let entries = v
+                .get("entries")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            Ok(Some((
+                entries,
+                matches!(v.get("more"), Some(Value::Bool(true))),
+            )))
+        }
+        404 => Ok(None),
+        _ => Err(Err::new(
+            502,
+            "internal",
+            format!("the base's log: {status}"),
+        )),
+    }
 }
 
 async fn fetch_rev(env: &Env, base: &str, at: &str, name: &str, id: &str) -> Res<Option<Value>> {
