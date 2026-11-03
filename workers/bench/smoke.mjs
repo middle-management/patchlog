@@ -35,8 +35,8 @@ check("create namespace 201", r.status === 201, r);
 const config = r.h.get("x-config-revision");
 r = await req("PATCH", `/ns/${ns}`, { body: [{ op: "add", path: "", value: {} }], headers: { "If-None-Match": "*" } });
 check("namespace name taken 412", r.status === 412, r);
-r = await req("PATCH", `/ns/${ns}`, { body: [{ op: "add", path: "/rules", value: [] }], headers: { "If-Match": `"${config}"` } });
-check("unimplemented member 422", r.status === 422 && r.json.errors?.[0]?.pointer === "/rules", r.json);
+r = await req("PATCH", `/ns/${ns}`, { body: [{ op: "add", path: "/keys", value: [] }], headers: { "If-Match": `"${config}"` } });
+check("unimplemented member 422", r.status === 422 && r.json.errors?.[0]?.pointer === "/keys", r.json);
 
 r = await req("PATCH", `/r/${ns}/derby`, { body: p1 });
 check("no precondition 428", r.status === 428, r);
@@ -139,6 +139,58 @@ for (const [what, bad] of [["$id", { $id: "x" }], ["an unknown keyword", { frob:
   r = await req("PATCH", `/r/${ns}/bad-schema`, { body: [{ op: "add", path: "", value: { $schema: D, ...bad } }], headers: { "If-None-Match": "*" } });
   check(`schema with ${what} 422 invalid`, r.status === 422 && r.json.code === "invalid", r.json);
 }
+
+// A catalog namespace with the rules of §B.6.
+const cat = `${ns}-cat`;
+const catDoc = {
+  read: "public",
+  catalog: { trust: [ns], mode: "tree" },
+  rules: [
+    { op: "test", path: "/resource", schema: { pattern: `^([a-z0-9][a-z0-9_-]*|(${ns})\\.[a-z0-9][a-z0-9._-]*)$` } },
+    { if: [{ op: "test", path: "/action", schema: { enum: ["create", "append", "restore"] } }, { op: "test", path: "/doc/parents", exists: true }],
+      then: [{ op: "test", path: "/doc/parents", schema: { type: "array", maxItems: 1, items: { type: "object", required: ["href"], additionalProperties: false, properties: { href: { type: "string", pattern: `^/r/${cat}/[a-z0-9][a-z0-9_-]{0,127}$` }, order: { type: "string", pattern: "^[0-9A-Za-z]{1,64}$" } } } } }] },
+    { if: [{ op: "test", path: "/action", value: "create" }], then: [{ op: "test", path: "/doc/parents", schema: { minItems: 1 } }] },
+  ],
+};
+r = await req("PATCH", `/ns/${cat}`, { body: [{ op: "add", path: "", value: catDoc }], headers: { "If-None-Match": "*" } });
+check("catalog namespace with rules created", r.status === 201, r.json);
+r = await req("PATCH", `/r/${cat}/root`, { body: [{ op: "add", path: "", value: { title: "Root" } }], headers: { "If-None-Match": "*" } });
+check("a new node without parents 422 rule", r.status === 422 && r.json.code === "rule" && r.json.path === "/rules/2/then/0", r.json);
+r = await req("PATCH", `/r/${cat}/season`, { body: [{ op: "add", path: "", value: { title: "Season", parents: [{ href: `/r/${cat}/root`, order: "a0" }] } }], headers: { "If-None-Match": "*" } });
+check("folder with one parent 201", r.status === 201, r.json);
+r = await req("PATCH", `/r/${cat}/${ns}.post-1`, { body: [{ op: "add", path: "", value: { parents: [{ href: `/r/${cat}/season` }, { href: `/r/${cat}/root` }] } }], headers: { "If-None-Match": "*" } });
+check("placement with two parents in a tree 422 rule", r.status === 422 && r.json.code === "rule" && r.json.rule === 1, r.json);
+r = await req("PATCH", `/r/${cat}/elsewhere.post-1`, { body: [{ op: "add", path: "", value: { parents: [{ href: `/r/${cat}/season` }] } }], headers: { "If-None-Match": "*" } });
+check("placement of an untrusted namespace's item 422 rule", r.status === 422 && r.json.rule === 0, r.json);
+r = await req("PATCH", `/r/${cat}/${ns}.post-1`, { body: [{ op: "add", path: "", value: { parents: [{ href: `/r/${cat}/season`, order: "a1" }] } }], headers: { "If-None-Match": "*", Gesture: "abcdefghijklmnopqrstuvwxyz" } });
+check("placement 201", r.status === 201, r.json);
+const placement = r.h.get("etag").slice(1, -1);
+r = await req("PATCH", `/ns/${cat}`, { body: [{ op: "add", path: "/rules/-", value: { op: "test", path: "/doc", schema: { $id: "x" } } }], headers: { "If-Match": `"${r.h.get("x-namespace-revision") && (await req("GET", `/ns/${cat}`)).h.get("x-config-revision")}"` } });
+check("a rule with an invalid schema 422 invalid", r.status === 422 && r.json.code === "invalid", r.json);
+
+// Resource logs (§7.1, §7.7), heads at a revision and gestures (§7.4).
+r = await req("GET", `/r/${cat}/${ns}.post-1/log`);
+check("resource log redirects to its range", r.status === 302 && r.h.get("location") === `/r/${cat}/${ns}.post-1/rev/${placement}/log`, [r.status, r.h.get("location")]);
+r = await req("GET", `/r/${cat}/nothing-here/log`);
+check("log of a resource with no entries 404", r.status === 404, r.status);
+{
+  const first = await req("GET", `/r/${cat}/season/log?since=&live=long-poll`);
+  const since = first.h.get("x-revision"), cur = first.h.get("x-cursor");
+  check("resource long-poll answers at once with entries", first.status === 200 && first.json.length === 1 && !!since, [first.status, first.json]);
+  const poll = req("GET", `/r/${cat}/season/log?since=${since}&live=long-poll&cursor=${cur}`);
+  await new Promise((res) => setTimeout(res, 300));
+  await req("PATCH", `/r/${cat}/season`, { body: [{ op: "replace", path: "/title", value: "Season 2026" }], headers: { "If-Match": `"${since}"` } });
+  const woke = await poll;
+  check("a write to the resource wakes its long-poll", woke.status === 200 && woke.json.length === 1 && woke.json[0].patches?.[0]?.path === "/title", [woke.status, woke.json]);
+}
+r = await req("GET", `/ns/${cat}`);
+const catRev = r.h.get("location");
+r = await req("GET", `${catRev}/heads`);
+check("heads at a revision", r.status === 200 && r.json.heads?.map((h) => h.resource).join() === ["season", `${ns}.post-1`].sort().join() && r.json.heads.find((h) => h.resource === `${ns}.post-1`)?.target === placement, r.json);
+r = await req("GET", `/ns/${cat}/gestures/abcdefghijklmnopqrstuvwxyz`);
+check("gesture listing", r.status === 200 && r.json.length === 1 && r.json[0].resource === `${ns}.post-1` && r.json[0].id === placement, r.json);
+r = await req("GET", `/ns/${cat}/gestures/not-a-gesture`);
+check("malformed gesture 400", r.status === 400, r.status);
 
 console.log(failed ? `\n${failed} failed` : "\nall passed");
 process.exit(failed ? 1 : 0);

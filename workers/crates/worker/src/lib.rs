@@ -6,6 +6,7 @@
 
 mod http;
 mod ns;
+mod nsdoc;
 
 use futures_util::StreamExt;
 use http::Err;
@@ -96,7 +97,8 @@ async fn front(req: Request, env: Env, ctx: Context) -> std::result::Result<Resp
     }
     let stub = env.durable_object("NAMESPACE")?.get_by_name(ns)?;
     if req.method() == Method::Get
-        && segs.as_slice() == ["ns", ns, "log"]
+        && (segs.as_slice() == ["ns", ns, "log"]
+            || (segs.len() == 4 && segs[0] == "r" && segs[3] == "log"))
         && url
             .query_pairs()
             .any(|(k, v)| k == "live" && v == "long-poll")
@@ -176,6 +178,8 @@ struct Armed {
     public: bool,
     since: String,
     ns_tag: String,
+    /// The resource whose log is followed, if not the namespace log.
+    resource: Option<String>,
 }
 
 impl Armed {
@@ -200,6 +204,7 @@ impl Armed {
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string(),
+            resource: v.get("resource").and_then(|s| s.as_str()).map(String::from),
         })
     }
 
@@ -209,9 +214,14 @@ impl Armed {
         let now = (Date::now().as_millis() as i64).div_euclid(http::LONG_POLL_INTERVAL_MS);
         let h = Headers::new();
         http::cache_headers(&h, http::Class::LongPollEmpty, self.public)?;
-        http::tags(&h, &self.ns_tag, None)?;
+        http::tags(&h, &self.ns_tag, self.resource.as_deref())?;
         if !self.since.is_empty() {
-            h.set("X-Namespace-Revision", &self.since)?;
+            let header = if self.resource.is_some() {
+                "X-Revision"
+            } else {
+                "X-Namespace-Revision"
+            };
+            h.set(header, &self.since)?;
         }
         h.set("X-Cursor", &now.max(self.cursor + 1).to_string())?;
         http::respond(204, h, vec![])

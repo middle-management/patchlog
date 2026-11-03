@@ -57,6 +57,12 @@ with authentication disabled (§1, `"auth": "disabled"`). Everything else is lis
   are translated for the `regex` crate, which shares RE2's semantics but spells `\uXXXX`,
   surrogate pairs, `\Q…\E` and the ASCII classes `\d \w \s \b` differently. It adds about
   1.2 MB to the gzipped bundle (1.5 MB in all; startup 5 ms).
+- **Namespace rules (§6.4)** are enforced on resource writes (step 6 of §6.2) against the
+  change envelope of §6.4.1, compiled once per namespace-document revision; a failure is
+  `422 rule` with `rule` and `path`. With authentication disabled, config writes skip them
+  (§1). `catalog`, `catalogs`, `allowances` and Addendum F's `merge`, `merged`, `cleanup`
+  and `abandoned` are accepted in namespace documents and checked for shape (§12.3);
+  allowances change nothing while authentication is disabled.
 - **Caching (§9)**: responses carry the spec's `Cache-Control` and `Cache-Tag`. The front
   Worker serves immutable public responses from the Cache API and answers
   `If-None-Match` itself. Private namespaces are `CDN-Cache-Control: no-store`, since
@@ -93,14 +99,15 @@ append writes 4: past that, writes answer `503` with `Retry-After` until 00:00 U
 
 - `GET /`; URL and query-parameter checks (§7); `400`, `404`, `405`, `410`, `412`, `413`, `415`, `422` and `428` with §12.1 bodies.
 - Namespaces: creation and config writes (`PATCH /ns/{ns}`) with idempotent retries; `GET /ns/{ns}`, `/rev/{ns_id}`, `/rev/{ns_id}/log`, and `/log` with `live=long-poll`. Namespace documents accept `read`, `frozen`, the six patch-set and document `limits` and `x-` members, and check the Values rule of §6.6. Other members are `422`.
-- Resources: create, append, restore and delete with preconditions, idempotent retries (§7.2), `Gesture`/`Undoes`, the frozen check, JSON Patch, the `writes` of §6.4.1 and the limits of §6.6. `GET`/`HEAD` of heads (`302`, or `410` once tombstoned), revisions (`ETag`, `Last-Modified`, `Repr-Digest`, `304`), and log ranges with paging.
+- Resources: create, append, restore and delete with preconditions, idempotent retries (§7.2), `Gesture`/`Undoes`, the frozen check, JSON Patch, the `writes` of §6.4.1, the limits of §6.6, typed documents (§6.1) and namespace rules (§6.4). `GET`/`HEAD` of heads (`302`, or `410` once tombstoned), revisions (`ETag`, `Last-Modified`, `Repr-Digest`, `304`), log ranges with paging, and `/r/{ns}/{name}/log` (the redirect to its range, and long-poll, §7.7).
+- `GET /ns/{ns}/rev/{ns_id}/heads` (§7.4) and the gesture listing `GET /ns/{ns}/gestures/{gesture}`.
 - The vectors of Addendum I.1 (canonical JSON), I.2 (ids) and I.3 (blob ids).
 
 ## Not yet
 
 Roughly in order of how much they change the design:
 
-- **Addendum C** (grants, Biscuit, edge grants) and so private reads; rules (§6.4); rate limits (§6.6).
+- **Addendum C** (grants, Biscuit, edge grants) and so private reads, roles and key scopes; rate limits (§6.6).
 - **Schemas, beyond the core** (§6.1): `schemaReads`, drafts in branches, read permission on schema revisions (with authentication off, every revision is readable), and the `in_use` refusals (there is no purge yet). `idn-hostname` and `idn-email` are checked as the `jsonschema` crate does, which may differ from RFC 5890 without UTS 46 mapping in edge cases.
 - **Branches** (§7.6), purge (§8.3, §8.5), pruning (§8.6), batches (§7.5), blobs (§7.8; a blob reference is `422` because no blob is available), SSE (§7.3), `/heads`, gestures, `/principal`, `/branches`, CORS.
 - Addenda A, B, E, F, G and H.

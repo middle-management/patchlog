@@ -39,6 +39,7 @@ const UNIT = {
   // which then stays awake (HIBERNATING_WAITERS_MAX in ns.rs).
   hibernatingWaitersMax: 200,
   bytesPerPoll: 500, // a 204 with its headers, as served
+  bytesPerRead: 2_000, // a small document with its headers, for reads a CDN serves
 };
 
 const SECONDS_PER_MONTH = 30 * 24 * 3600;
@@ -61,8 +62,10 @@ function usage(s) {
   const awakeNamespaces = s.waitsInObject || perNs > UNIT.hibernatingWaitersMax ? (s.followedNamespaces ?? 0) : 0;
   const pollsAtWorker = s.pollsBypassWorker ? 0 : s.cdn ? misses : polls;
   const doReads = s.reads * (1 - (s.cachedShare ?? 0));
+  // Behind another CDN, the cached reads are its, not the Worker's.
+  const cdnReads = s.cdn ? s.reads * (s.cachedShare ?? 0) : 0;
   return {
-    workerRequests: s.writes + s.reads + pollsAtWorker,
+    workerRequests: s.writes + s.reads - cdnReads + pollsAtWorker,
     // Cache hits are billed as Worker requests, but run no code.
     workerCpuMs: (s.writes + s.reads + (s.workersCache ? misses : pollsAtWorker)) * UNIT.workerCpuMs,
     doRequests:
@@ -76,8 +79,8 @@ function usage(s) {
     rowsRead: s.writes * UNIT.rowsReadPerWrite + doReads * UNIT.rowsReadPerRead,
     rowsWritten: s.writes * (s.rowsWrittenPerWrite ?? UNIT.rowsWrittenPerWrite),
     storageGbMonth: s.storedGb ?? 0,
-    cdnRequests: s.cdn ? polls : 0,
-    cdnGb: s.cdn ? (polls * UNIT.bytesPerPoll) / 1e9 : 0,
+    cdnRequests: s.cdn ? polls + cdnReads : 0,
+    cdnGb: s.cdn ? (polls * UNIT.bytesPerPoll + cdnReads * UNIT.bytesPerRead) / 1e9 : 0,
     cdn: s.cdn,
   };
 }
@@ -121,6 +124,20 @@ const SCENARIOS = [
     about: "The same, with long-polls waiting inside the namespace's object, as first built: an object with a waiting follower is billed all month",
     writes: 30 * M, reads: 300 * M, cachedShare: 0.5, storedGb: 50,
     followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2, waitsInObject: true,
+  },
+  {
+    name: "Collaborative SaaS behind Bunny",
+    about: "The collaborative scenario with Bunny in front: a document's followers share one miss per interval, cached reads are Bunny's (bandwidth only)",
+    writes: 30 * M, reads: 300 * M, cachedShare: 0.5, storedGb: 50,
+    followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2,
+    cdn: { name: "Bunny", perMillion: 0, perGb: 0.01 },
+  },
+  {
+    name: "Collaborative SaaS behind Fastly",
+    about: "The same with Fastly in front, at about $0.75 per million requests and $0.12/GB (third-party figures, unconfirmed)",
+    writes: 30 * M, reads: 300 * M, cachedShare: 0.5, storedGb: 50,
+    followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2,
+    cdn: { name: "Fastly", perMillion: 0.75, perGb: 0.12 },
   },
   {
     name: "Device fleet, long-poll through the Worker, all waits inside the object (as first built)",

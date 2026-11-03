@@ -315,6 +315,8 @@ pub struct Refs {
     pub paths: BTreeSet<String>,
     /// Every `$ref` with a fragment: (path, or "" for this document; fragment).
     pub fragments: Vec<(String, String)>,
+    /// Where (JSON Pointers into the schema) `$ref`s name another document.
+    pub external: Vec<String>,
 }
 
 /// The checks of §6.1 and §6.5 on a document whose `$schema` is the dialect
@@ -403,6 +405,7 @@ fn walk(v: &Value, ptr: &str, root: bool, refs: &mut Refs) -> Result<(), SchemaE
                         )));
                     }
                     refs.paths.insert(path.to_string());
+                    refs.external.push(p.clone());
                 }
                 if let Some(f) = frag {
                     refs.fragments.push((path.to_string(), percent_decode(f)));
@@ -637,6 +640,83 @@ impl Compiled {
         } else {
             Err(SchemaError::Invalid(errors))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fragments (§6.4.2): the `schema` of a rule, and a key scope's `attrs` (§C.4)
+
+/// The checks §6.4.2 puts on a rule's `schema`: a draft 2020-12 schema held
+/// to §6.1's `$id` ban and §6.5's keyword rules, with no `$schema` in any
+/// subschema and only same-document `$ref` and `$dynamicRef`. Every refusal
+/// is `invalid` (never `schema_ref`), with pointers relative to the fragment.
+pub fn check_fragment(schema: &Value) -> Result<(), SchemaError> {
+    let mut refs = Refs::default();
+    walk(schema, "", false, &mut refs).map_err(|e| match e {
+        SchemaError::Ref(m) => SchemaError::invalid("", m),
+        e => e,
+    })?;
+    if let Some(p) = refs.external.first() {
+        return Err(SchemaError::invalid(
+            p,
+            "a rule's schema may $ref only same-document fragments",
+        ));
+    }
+    if let Err(e) = jsonschema::meta::validate(&to_json(schema)) {
+        return Err(SchemaError::invalid(
+            e.instance_path().as_str(),
+            format!("not a valid 2020-12 schema: {e}"),
+        ));
+    }
+    for (_, frag) in &refs.fragments {
+        if !fragment_resolves(schema, frag) {
+            return Err(SchemaError::invalid(
+                "",
+                format!("$ref #{frag} names nothing in this schema"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A compiled schema fragment.
+pub struct Fragment {
+    validator: jsonschema::Validator,
+}
+
+impl std::fmt::Debug for Fragment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Fragment")
+    }
+}
+
+/// Checks ([`check_fragment`]) and compiles a fragment, with format
+/// assertions as at step 5 of §6.2 and patterns translated from RE2.
+pub fn compile_fragment(schema: &Value) -> Result<Fragment, SchemaError> {
+    check_fragment(schema)?;
+    let validator = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .with_base_uri(format!("{BASE}/fragment"))
+        .with_retriever(Known(HashMap::new()))
+        .should_validate_formats(true)
+        .should_ignore_unknown_formats(false)
+        .with_pattern_options(jsonschema::PatternOptions::regex())
+        .with_format("regex", |s: &str| re2(s).is_ok())
+        .build(&to_json(&translate_patterns(schema)))
+        .map_err(|e| SchemaError::invalid("", format!("schema doesn't compile: {e}")))?;
+    Ok(Fragment { validator })
+}
+
+impl Fragment {
+    /// Validates `v` as it is (nothing left out); the first error as
+    /// (JSON Pointer into `v`, message).
+    pub fn check(&self, v: &Value) -> Result<(), (String, String)> {
+        let instance = to_json(v);
+        let result = self
+            .validator
+            .validate(&instance)
+            .map_err(|e| (e.instance_path().as_str().to_string(), e.to_string()));
+        result
     }
 }
 

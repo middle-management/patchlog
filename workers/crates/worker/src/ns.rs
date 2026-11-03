@@ -14,6 +14,7 @@ use patchlog_core::id::{ns_id, revision_id, tombstone_id};
 use patchlog_core::json::{self, canonical, canonical_string, Value};
 use patchlog_core::limits::{self, measure, settable_limit_max, Limits};
 use patchlog_core::patch::{apply, parse_patch_set};
+use patchlog_core::rules;
 use patchlog_core::schema::{self, SchemaError};
 use patchlog_core::Id;
 use serde::Deserialize;
@@ -47,6 +48,10 @@ const SCHEMA: &[&str] = &[
     // range of the primary key. `seq` is the `ns_log` entry that records it.
     "CREATE TABLE IF NOT EXISTS res_log (resource TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL, parent TEXT, kind INTEGER NOT NULL, patches TEXT, author TEXT NOT NULL, created INTEGER NOT NULL, gesture TEXT, undoes TEXT, depth INTEGER NOT NULL, PRIMARY KEY (resource, seq)) WITHOUT ROWID",
     "CREATE UNIQUE INDEX IF NOT EXISTS res_log_by_id ON res_log(resource, id)",
+    // The gesture listing (§7.4): only entries written with `Gesture` or
+    // `Undoes` are indexed, so other writes pay nothing for it.
+    "CREATE INDEX IF NOT EXISTS res_log_by_gesture ON res_log(gesture, seq) WHERE gesture IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS res_log_by_undoes ON res_log(undoes, seq) WHERE undoes IS NOT NULL",
     // A canonical document every SNAPSHOT_EVERY entries of a resource.
     "CREATE TABLE IF NOT EXISTS res_snapshots (resource TEXT NOT NULL, seq INTEGER NOT NULL, doc TEXT NOT NULL, PRIMARY KEY (resource, seq)) WITHOUT ROWID",
 ];
@@ -54,6 +59,9 @@ const SCHEMA: &[&str] = &[
 /// Long-polls that wait on hibernatable WebSockets before the rest wait in
 /// the object itself.
 const HIBERNATING_WAITERS_MAX: usize = 200;
+
+/// `rulesPerNamespace` (§12.2): the default, and this deployment's maximum.
+const RULES_PER_NAMESPACE: u64 = 256;
 
 const REV: i64 = 0;
 const TOMBSTONE: i64 = 1;
@@ -68,6 +76,15 @@ struct NsHead {
     limits: Limits,
     frozen: bool,
     public: bool,
+    /// The namespace's rules (§6.4), compiled once per config revision.
+    rules: Option<Rules>,
+}
+
+#[derive(Clone)]
+enum Rules {
+    Compiled(std::rc::Rc<rules::CompiledRules>),
+    /// Rules that no longer compile: evaluating them fails closed.
+    Raw(Value),
 }
 
 #[derive(Deserialize)]
@@ -340,20 +357,26 @@ impl Namespace {
         }
         let now = Date::now().as_millis() as i64;
         let cursor_out = now.div_euclid(http::LONG_POLL_INTERVAL_MS);
-        let mut messages: HashMap<i64, Option<String>> = HashMap::new();
+        let mut messages: HashMap<(Option<String>, i64), Option<String>> = HashMap::new();
         for ws in sockets {
             let Ok(Some(w)) = ws.deserialize_attachment::<Waiter>() else {
                 let _ = ws.close(Some(1011), Some("no attachment"));
                 continue;
             };
             let msg = messages
-                .entry(w.after)
-                .or_insert_with(
-                    || match self.long_poll_answer(&w.ns, h, w.after, cursor_out) {
+                .entry((w.resource.clone(), w.after))
+                .or_insert_with(|| {
+                    match self.long_poll_answer(
+                        &w.ns,
+                        h,
+                        w.resource.as_deref(),
+                        w.after,
+                        cursor_out,
+                    ) {
                         Ok(Some((hd, body))) => Some(waiter_message(200, &hd, &body)),
                         _ => None,
-                    },
-                )
+                    }
+                })
                 .clone();
             if let Some(m) = msg {
                 let _ = ws.send_with_str(&m);
@@ -362,25 +385,69 @@ impl Namespace {
         }
     }
 
-    /// The `200` answer to a long-poll after `after`, if there are entries.
+    /// The `200` answer to a long-poll after `after`, if there are entries:
+    /// of the namespace log, or of `resource`'s log (§7.7).
     fn long_poll_answer(
         &self,
         ns: &str,
         h: &NsHead,
+        resource: Option<&str>,
         after: i64,
         cursor_out: i64,
     ) -> Res<Option<(Headers, Vec<u8>)>> {
         if h.seq <= after {
             return Ok(None);
         }
-        let (rows, _) = self.ns_page(h, after, h.seq)?;
         let hd = Headers::new();
         cache_headers(&hd, Class::LongPollOk, h.public)?;
-        tags(&hd, ns, None)?;
+        tags(&hd, ns, resource)?;
         hd.set("Content-Type", "application/json")?;
-        hd.set("X-Namespace-Revision", &rows.last().unwrap().id)?;
         hd.set("X-Cursor", &cursor_out.to_string())?;
-        Ok(Some((hd, self.ns_page_body(&rows)?)))
+        let body = match resource {
+            None => {
+                let (rows, _) = self.ns_page(h, after, h.seq)?;
+                hd.set("X-Namespace-Revision", &rows.last().unwrap().id)?;
+                self.ns_page_body(&rows)?
+            }
+            Some(name) => {
+                let (out, _) = self.res_page(name, after, i64::MAX, &h.limits)?;
+                let Some(Value::Object(last)) = out.last() else {
+                    return Ok(None);
+                };
+                hd.set("X-Revision", last["id"].as_str().unwrap_or_default())?;
+                canonical(&Value::Array(out))
+            }
+        };
+        Ok(Some((hd, body)))
+    }
+
+    /// One page of `name`'s log after entry `after`, up to entry `upto`
+    /// (§7.1 Paging), and whether more follow.
+    fn res_page(
+        &self,
+        name: &str,
+        after: i64,
+        upto: i64,
+        limits: &Limits,
+    ) -> Res<(Vec<Value>, bool)> {
+        let n = limits.log_page_size as i64;
+        let rows: Vec<EntryRow> = self.rows(
+            "SELECT *, seq AS ns_seq FROM res_log WHERE resource = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT ?",
+            vec![name.into(), after.into(), upto.into(), (n + 1).into()],
+        )?;
+        let mut out = Vec::new();
+        let mut bytes = 0u64;
+        let mut more = false;
+        for (i, r) in rows.iter().enumerate() {
+            let plen = r.patches.as_ref().map(|p| p.len() as u64).unwrap_or(0);
+            if i as i64 == n || (i > 0 && bytes + plen > limits.log_page_bytes) {
+                more = true;
+                break;
+            }
+            bytes += plen;
+            out.push(entry_json(r)?);
+        }
+        Ok((out, more))
     }
 
     fn existing(&self) -> Res<NsHead> {
@@ -447,13 +514,21 @@ impl Namespace {
                 let q = http::query(&url, &["since"])?;
                 self.get_ns_log_range(&ctx, id, q.get("since").map(String::as_str).unwrap_or(""))
             }
+            ("ns", ["rev", id, "heads"]) if m == Method::Get => {
+                let q = http::query(&url, &["after"])?;
+                self.get_heads(&ctx, id, q.get("after").map(String::as_str).unwrap_or(""))
+            }
+            ("ns", ["gestures", gesture]) if m == Method::Get => {
+                let q = http::query(&url, &["after"])?;
+                self.get_gestures(&ctx, gesture, q.get("after").map(String::as_str))
+            }
             ("ns", ["log"]) if m == Method::Get => {
                 let q = http::query(&url, &["since", "live", "cursor"])?;
                 let upgrade = req
                     .headers()
                     .get("Upgrade")?
                     .is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
-                self.get_ns_log_live(&ctx, &q, upgrade).await
+                self.get_log_live(&ctx, &q, upgrade, None).await
             }
             ("r", [name]) => match m {
                 Method::Get | Method::Head => {
@@ -470,6 +545,14 @@ impl Namespace {
             ("r", [name, "rev", id]) if m == Method::Get || m == Method::Head => {
                 http::query(&url, &[])?;
                 self.get_rev(&ctx, name, id, req.headers()).await
+            }
+            ("r", [name, "log"]) if m == Method::Get => {
+                let q = http::query(&url, &["since", "live", "cursor"])?;
+                let upgrade = req
+                    .headers()
+                    .get("Upgrade")?
+                    .is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
+                self.get_log_live(&ctx, &q, upgrade, Some(name)).await
             }
             ("r", [name, "rev", id, "log"]) if m == Method::Get => {
                 let q = http::query(&url, &["since"])?;
@@ -591,14 +674,27 @@ impl Namespace {
     }
 
     /// §7.7, for the namespace log.
-    async fn get_ns_log_live(
+    /// §7.7 for the namespace log, or with `resource` for that resource's
+    /// log; without `live`, the redirect to the immutable range (§7.7 Answer).
+    async fn get_log_live(
         &self,
         ctx: &Ctx,
         q: &std::collections::BTreeMap<String, String>,
         upgrade: bool,
+        resource: Option<&str>,
     ) -> Res<Response> {
         let h = self.existing()?;
         let since = q.get("since").map(String::as_str).unwrap_or("");
+        let rev_header = if resource.is_some() {
+            "X-Revision"
+        } else {
+            "X-Namespace-Revision"
+        };
+        // The resource's head, for its redirect; and where `since` is in its log.
+        let res_head = match resource {
+            Some(name) => self.resource(name)?,
+            None => None,
+        };
         match q.get("live").map(String::as_str) {
             None => {
                 if q.contains_key("cursor")
@@ -608,13 +704,21 @@ impl Namespace {
                 }
                 let hd = Headers::new();
                 cache_headers(&hd, Class::HeadPointer, h.public)?;
-                tags(&hd, &ctx.ns, None)?;
+                tags(&hd, &ctx.ns, resource)?;
                 let qs = if since.is_empty() {
                     String::new()
                 } else {
                     format!("?since={since}")
                 };
-                hd.set("Location", &format!("/ns/{}/rev/{}/log{qs}", ctx.ns, h.id))?;
+                let location = match (resource, &res_head) {
+                    (None, _) => format!("/ns/{}/rev/{}/log{qs}", ctx.ns, h.id),
+                    (Some(name), Some(head)) => {
+                        format!("/r/{}/{}/rev/{}/log{qs}", ctx.ns, name, head.id)
+                    }
+                    // A resource with no entries: 404, cached as short.
+                    (Some(_), None) => return Err(Err::not_found()),
+                };
+                hd.set("Location", &location)?;
                 return http::respond(302, hd, vec![]);
             }
             Some("long-poll") => {}
@@ -638,9 +742,19 @@ impl Namespace {
                 Some(c)
             }
         };
-        let after = self.since_seq(since)?.ok_or_else(Err::not_found)?;
+        let after = match resource {
+            None => self.since_seq(since)?.ok_or_else(Err::not_found)?,
+            // A resource with no entries waits as for an empty `since`.
+            Some(_) if since.is_empty() => 0,
+            Some(name) => {
+                let Some(id) = Id::parse(since) else {
+                    return Err(Err::bad("malformed since"));
+                };
+                self.entry_by_id(name, &id)?.ok_or_else(Err::not_found)?.seq
+            }
+        };
         let answer = |h: &NsHead, cursor_out: i64| -> Res<Option<Response>> {
-            match self.long_poll_answer(&ctx.ns, h, after, cursor_out)? {
+            match self.long_poll_answer(&ctx.ns, h, resource, after, cursor_out)? {
                 Some((hd, body)) => Ok(Some(http::respond(200, hd, body)?)),
                 None => Ok(None),
             }
@@ -648,9 +762,9 @@ impl Namespace {
         let empty = |public: bool, cursor_out: i64| -> Res<Response> {
             let hd = Headers::new();
             cache_headers(&hd, Class::LongPollEmpty, public)?;
-            tags(&hd, &ctx.ns, None)?;
+            tags(&hd, &ctx.ns, resource)?;
             if !since.is_empty() {
-                hd.set("X-Namespace-Revision", since)?;
+                hd.set(rev_header, since)?;
             }
             hd.set("X-Cursor", &cursor_out.to_string())?;
             http::respond(204, hd, vec![])
@@ -675,6 +789,7 @@ impl Namespace {
                 .accept_websocket_with_tags(&pair.server, &["long-poll"]);
             pair.server.serialize_attachment(Waiter {
                 ns: ctx.ns.clone(),
+                resource: resource.map(String::from),
                 after,
             })?;
             let armed = obj(vec![
@@ -684,6 +799,7 @@ impl Namespace {
                 ("public", Value::Bool(h.public)),
                 ("since", s(since)),
                 ("ns", s(ctx.ns.clone())),
+                ("resource", resource.map(s).unwrap_or(Value::Null)),
             ]);
             pair.server.send_with_str(canonical_string(&armed))?;
             return Ok(Response::from_websocket(pair.client)?);
@@ -1146,6 +1262,16 @@ impl Namespace {
         if let Some(remote) = self.check_typed(ctx, &p.doc)? {
             return Ok(Step::NeedSchemas(remote));
         }
+        // Step 6: namespace rules (§6.4), against the change envelope.
+        let action = match kind {
+            WriteKind::Create => "create",
+            WriteKind::Append => "append",
+            WriteKind::Restore => "restore",
+        };
+        check_rules(
+            &ns,
+            &envelope(ctx, action, name, &p.writes, &p.doc, &body.value),
+        )?;
         // Step 7: hash and insert. The resource entry takes its namespace
         // entry's sequence number.
         let entry = obj(vec![
@@ -1253,6 +1379,14 @@ impl Namespace {
         }
         if head.id != parent.text() {
             return Err(Err::new(412, "stale", "the head moved").with("head", s(head.id)));
+        }
+        // Step 6: rules see the document being deleted, with no writes (§6.4.1).
+        if ns.rules.is_some() {
+            let doc = self.doc_at(name, head.seq, false)?;
+            check_rules(
+                &ns,
+                &envelope(ctx, "delete", name, &[], &doc, &Value::Array(vec![])),
+            )?;
         }
         let entry = obj(vec![
             ("resource", s(name)),
@@ -1379,6 +1513,136 @@ impl Namespace {
         http::respond(200, hd, bytes)
     }
 
+    /// `GET /ns/{ns}/rev/{ns_id}/heads` (§7.4): each resource's newest
+    /// entry as of that revision, by name, after `after`, a page at a time.
+    fn get_heads(&self, ctx: &Ctx, id: &str, after: &str) -> Res<Response> {
+        let h = self.existing()?;
+        let at = self.ns_seq_of(id)?.ok_or_else(Err::not_found)?;
+        let n = h.limits.log_page_size as i64;
+        #[derive(Deserialize)]
+        struct HeadRow {
+            resource: String,
+            id: String,
+            kind: i64,
+            created: i64,
+        }
+        let rows: Vec<HeadRow> = self.rows(
+            "SELECT r.resource AS resource, r.id AS id, r.kind AS kind, r.created AS created FROM (SELECT resource, MAX(seq) AS m FROM res_log WHERE seq <= ?1 AND resource > ?2 GROUP BY resource ORDER BY resource LIMIT ?3) g JOIN res_log r ON r.resource = g.resource AND r.seq = g.m ORDER BY r.resource",
+            vec![at.seq.into(), after.into(), (n + 1).into()],
+        )?;
+        let more = rows.len() as i64 > n;
+        let page: Vec<Value> = rows
+            .iter()
+            .take(n as usize)
+            .map(|r| {
+                obj(vec![
+                    ("resource", s(r.resource.clone())),
+                    (
+                        "kind",
+                        s(if r.kind == TOMBSTONE {
+                            "tombstone"
+                        } else {
+                            "head"
+                        }),
+                    ),
+                    ("target", s(r.id.clone())),
+                    ("created", s(rfc3339_ms(r.created))),
+                ])
+            })
+            .collect();
+        let mut body = vec![("heads", Value::Array(page))];
+        if more {
+            body.push(("next", s(rows[n as usize - 1].resource.clone())));
+        }
+        let hd = Headers::new();
+        cache_headers(&hd, Class::Immutable, h.public)?;
+        hd.set("Cache-Tag", &format!("ns:{0},heads:{0}", ctx.ns))?;
+        hd.set("Surrogate-Key", &format!("ns:{0} heads:{0}", ctx.ns))?;
+        http::json(200, hd, &obj(body))
+    }
+
+    /// `GET /ns/{ns}/gestures/{gesture}` (§7.4): the entries written with a
+    /// gesture or undoing it, oldest first, a page at a time.
+    fn get_gestures(&self, ctx: &Ctx, gesture: &str, after: Option<&str>) -> Res<Response> {
+        if !patchlog_core::names::is_base32_26(gesture) {
+            return Err(Err::bad("a gesture is 26 base32 characters"));
+        }
+        let h = self.existing()?;
+        let after_seq = match after {
+            None => 0,
+            Some(a) => {
+                let Some((name, id)) = a.split_once('/') else {
+                    return Err(Err::bad("after is {resource}/{id}"));
+                };
+                let (Some(id), true) =
+                    (Id::parse(id), patchlog_core::names::is_resource_name(name))
+                else {
+                    return Err(Err::bad("after is {resource}/{id}"));
+                };
+                match self.entry_by_id(name, &id)? {
+                    Some(e)
+                        if e.gesture.as_deref() == Some(gesture)
+                            || e.undoes.as_deref() == Some(gesture) =>
+                    {
+                        e.seq
+                    }
+                    _ => return Err(Err::not_found()),
+                }
+            }
+        };
+        let n = h.limits.log_page_size as i64;
+        #[derive(Deserialize)]
+        struct Row {
+            resource: String,
+            id: String,
+            kind: i64,
+            gesture: Option<String>,
+            undoes: Option<String>,
+            author: String,
+            ns_id: String,
+        }
+        let rows: Vec<Row> = self.rows(
+            "SELECT r.resource AS resource, r.id AS id, r.kind AS kind, r.gesture AS gesture, r.undoes AS undoes, r.author AS author, n.id AS ns_id FROM res_log r JOIN ns_log n ON n.seq = r.seq WHERE (r.gesture = ?1 OR r.undoes = ?1) AND r.seq > ?2 ORDER BY r.seq LIMIT ?3",
+            vec![gesture.into(), after_seq.into(), (n + 1).into()],
+        )?;
+        let more = rows.len() as i64 > n;
+        let page: Vec<Value> = rows
+            .iter()
+            .take(n as usize)
+            .map(|r| {
+                let mut m = vec![
+                    ("resource", s(r.resource.clone())),
+                    ("id", s(r.id.clone())),
+                    (
+                        "kind",
+                        s(if r.kind == TOMBSTONE {
+                            "tombstone"
+                        } else {
+                            "rev"
+                        }),
+                    ),
+                    ("author", s(r.author.clone())),
+                    ("ns_id", s(r.ns_id.clone())),
+                ];
+                if let Some(g) = &r.gesture {
+                    m.push(("gesture", s(g.clone())));
+                }
+                if let Some(u) = &r.undoes {
+                    m.push(("undoes", s(u.clone())));
+                }
+                obj(m)
+            })
+            .collect();
+        let hd = Headers::new();
+        cache_headers(&hd, Class::NoStore, h.public)?;
+        tags(&hd, &ctx.ns, None)?;
+        if more {
+            let last = &rows[n as usize - 1];
+            hd.set("X-Log-Next", &format!("{}/{}", last.resource, last.id))?;
+        }
+        http::json(200, hd, &Value::Array(page))
+    }
+
     fn get_log_range(&self, ctx: &Ctx, name: &str, id: &str, since: &str) -> Res<Response> {
         let ns = self.existing()?;
         let Some(id) = Id::parse(id) else {
@@ -1396,23 +1660,7 @@ impl Namespace {
                 _ => return Err(Err::not_found()),
             }
         };
-        let n = ns.limits.log_page_size as i64;
-        let rows: Vec<EntryRow> = self.rows(
-            "SELECT *, seq AS ns_seq FROM res_log WHERE resource = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT ?",
-            vec![name.into(), after.into(), upto.seq.into(), (n + 1).into()],
-        )?;
-        let mut out = Vec::new();
-        let mut bytes = 0u64;
-        let mut more = false;
-        for (i, r) in rows.iter().enumerate() {
-            let plen = r.patches.as_ref().map(|p| p.len() as u64).unwrap_or(0);
-            if i as i64 == n || (i > 0 && bytes + plen > ns.limits.log_page_bytes) {
-                more = true;
-                break;
-            }
-            bytes += plen;
-            out.push(entry_json(r)?);
-        }
+        let (out, more) = self.res_page(name, after, upto.seq, &ns.limits)?;
         let hd = Headers::new();
         cache_headers(&hd, Class::Immutable, ns.public)?;
         tags(&hd, &ctx.ns, Some(name))?;
@@ -1430,6 +1678,9 @@ impl Namespace {
 #[derive(serde::Serialize, Deserialize)]
 struct Waiter {
     ns: String,
+    /// The resource whose log is followed, or none for the namespace log.
+    #[serde(default)]
+    resource: Option<String>,
     after: i64,
 }
 
@@ -1487,6 +1738,15 @@ fn make_head(seq: i64, id: Id, config_seq: i64, config_id: Id, config: Value) ->
     let limits = Limits::from_config(&config);
     let frozen = matches!(config.get("frozen"), Some(Value::Bool(true)));
     let public = config.get("read").and_then(Value::as_str) == Some("public");
+    // Stored rules were validated when written. Ones that don't compile now
+    // (a later build's stricter checks) stay raw and fail closed.
+    let rules = config
+        .get("rules")
+        .filter(|r| r.as_array().is_some_and(|a| !a.is_empty()))
+        .map(|r| match rules::CompiledRules::new(r) {
+            Ok(c) => Rules::Compiled(std::rc::Rc::new(c)),
+            Err(_) => Rules::Raw(r.clone()),
+        });
     NsHead {
         seq,
         id,
@@ -1496,6 +1756,7 @@ fn make_head(seq: i64, id: Id, config_seq: i64, config_id: Id, config: Value) ->
         limits,
         frozen,
         public,
+        rules,
     }
 }
 
@@ -1574,12 +1835,50 @@ fn limit_err(status: u16, limit: &str, measured: u64, max: u64) -> Err {
         "valueSize" => "valueSize",
         "pathSize" => "pathSize",
         "nestingDepth" => "nestingDepth",
+        "rulesPerNamespace" => "rulesPerNamespace",
         _ => "limit",
     };
     Err::new(status, "limit", format!("{limit} exceeded"))
         .with("limit", s(limit))
         .with("measured", Value::Number(measured as f64))
         .with("max", Value::Number(max as f64))
+}
+
+/// The change envelope of §6.4.1. Authentication is disabled (§1), so it
+/// has no `principal`.
+fn envelope(
+    ctx: &Ctx,
+    action: &str,
+    resource: &str,
+    writes: &[String],
+    doc: &Value,
+    patches: &Value,
+) -> Value {
+    obj(vec![
+        ("action", s(action)),
+        ("resource", s(resource)),
+        ("now", s(rfc3339_ms(ctx.now))),
+        (
+            "writes",
+            Value::Array(writes.iter().map(|w| s(w.clone())).collect()),
+        ),
+        ("doc", doc.clone()),
+        ("patches", patches.clone()),
+    ])
+}
+
+/// Step 6 of §6.2: the namespace's rules; a failure is `422 rule` (§12.1).
+fn check_rules(ns: &NsHead, envelope: &Value) -> Res<()> {
+    let result = match &ns.rules {
+        None => return Ok(()),
+        Some(Rules::Compiled(c)) => c.evaluate(envelope),
+        Some(Rules::Raw(v)) => rules::evaluate(v, envelope),
+    };
+    result.map_err(|f| {
+        Err::new(422, "rule", f.message)
+            .with("rule", Value::Number(f.rule as f64))
+            .with("path", s(f.path))
+    })
 }
 
 fn schema_err(e: SchemaError) -> Err {
@@ -1670,10 +1969,44 @@ fn validate_config(doc: &Value) -> Res<()> {
                 }
             }
             k if k.starts_with("x-") => {}
-            "keys" | "roles" | "revoked" | "rules" | "allowances" | "retention" | "encryption"
-            | "maxLag" | "base" | "successor" | "drafts" | "signatures" | "nonce"
-            | "schemaReads" | "catalog" | "catalogs" | "merge" | "merged" | "cleanup"
-            | "abandoned" => {
+            "catalog" | "catalogs" | "allowances" | "merge" | "merged" | "cleanup"
+            | "abandoned" | "rules" => {
+                let checked = match k.as_str() {
+                    "catalog" => crate::nsdoc::catalog(v, &p),
+                    "catalogs" => crate::nsdoc::catalogs(v, &p),
+                    "allowances" => crate::nsdoc::allowances(v, &p),
+                    "merge" => crate::nsdoc::merge(v, &p),
+                    "merged" => crate::nsdoc::merged(v, &p),
+                    "cleanup" => crate::nsdoc::cleanup(v, &p),
+                    "abandoned" => match v {
+                        Value::Bool(_) => Ok(()),
+                        _ => Err((p.clone(), "abandoned is a boolean".to_string())),
+                    },
+                    // §6.4.2, and at most rulesPerNamespace forms (§12.2).
+                    _ => match rules::validate(v, RULES_PER_NAMESPACE) {
+                        Ok(()) => Ok(()),
+                        Err(rules::RulesError::Invalid(errs)) => {
+                            let errors = Value::Array(
+                                errs.into_iter()
+                                    .map(|(pointer, message)| {
+                                        obj(vec![("pointer", s(pointer)), ("message", s(message))])
+                                    })
+                                    .collect(),
+                            );
+                            return Err(Err::new(422, "invalid", "invalid namespace document")
+                                .with("errors", errors));
+                        }
+                        Err(rules::RulesError::Limit { measured, max }) => {
+                            return Err(limit_err(422, "rulesPerNamespace", measured, max));
+                        }
+                    },
+                };
+                if let Err((pointer, message)) = checked {
+                    return Err(invalid_config(&pointer, &message));
+                }
+            }
+            "keys" | "roles" | "revoked" | "retention" | "encryption" | "maxLag" | "base"
+            | "successor" | "drafts" | "signatures" | "nonce" | "schemaReads" => {
                 return Err(invalid_config(
                     &p,
                     "this server doesn't implement that member yet",
