@@ -1,7 +1,7 @@
 //! The patch-set and document limits of §6.6 (defaults from §12.2), measured
 //! in one walk of the resulting document.
 
-use crate::json::{string_len, write_number, Value};
+use crate::json::{number_len, string_len, Value};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Limits {
@@ -148,11 +148,7 @@ fn walk(v: &Value, depth: u64, path: u64, l: &Limits, m: &mut Measure) -> u64 {
     match v {
         Value::Null | Value::Bool(true) => 4,
         Value::Bool(false) => 5,
-        Value::Number(n) => {
-            let mut o = Vec::new();
-            write_number(*n, &mut o);
-            o.len() as u64
-        }
+        Value::Number(n) => number_len(*n) as u64,
         Value::String(s) => check_str(s, m),
         Value::Array(a) => {
             m.depth = m.depth.max(depth + 1);

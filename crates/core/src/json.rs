@@ -407,15 +407,22 @@ pub fn write_canonical(v: &Value, out: &mut Vec<u8>) {
         }
         Value::Object(m) => {
             out.push(b'{');
-            let mut first = true;
-            for (k, x) in sorted_members(m) {
-                if !first {
+            let member = |i: usize, k: &String, x: &Value, out: &mut Vec<u8>| {
+                if i > 0 {
                     out.push(b',');
                 }
-                first = false;
                 write_string(k, out);
                 out.push(b':');
                 write_canonical(x, out);
+            };
+            if needs_utf16_sort(m) {
+                for (i, (k, x)) in sorted_members(m).into_iter().enumerate() {
+                    member(i, k, x, out);
+                }
+            } else {
+                for (i, (k, x)) in m.iter().enumerate() {
+                    member(i, k, x, out);
+                }
             }
             out.push(b'}');
         }
@@ -427,20 +434,53 @@ pub fn write_canonical(v: &Value, out: &mut Vec<u8>) {
 /// U+E000–U+FFFF at the same position, so the common case needs no re-sort.
 pub fn sorted_members(m: &BTreeMap<String, Value>) -> Vec<(&String, &Value)> {
     let mut v: Vec<(&String, &Value)> = m.iter().collect();
-    let needs = m.keys().any(|k| k.chars().any(|c| c as u32 > 0xFFFF));
-    if needs {
+    if needs_utf16_sort(m) {
         v.sort_by(|a, b| a.0.encode_utf16().cmp(b.0.encode_utf16()));
     }
     v
 }
 
+/// Whether any key holds a character above U+FFFF (a 4-byte UTF-8 sequence).
+fn needs_utf16_sort(m: &BTreeMap<String, Value>) -> bool {
+    m.keys().any(|k| k.bytes().any(|b| b >= 0xF0))
+}
+
 pub fn write_number(n: f64, out: &mut Vec<u8>) {
-    if n == 0.0 {
-        out.push(b'0');
+    if n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0 {
+        // Safe integers print as plain digits; skip the shortest-round-trip search.
+        let mut buf = [0u8; 20];
+        let mut i = buf.len();
+        let mut v = n.abs() as u64;
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        if n < 0.0 {
+            out.push(b'-');
+        }
+        out.extend_from_slice(&buf[i..]);
         return;
     }
     let mut b = ryu_js::Buffer::new();
     out.extend_from_slice(b.format_finite(n).as_bytes());
+}
+
+/// Length of a number as canonical JSON.
+pub fn number_len(n: f64) -> usize {
+    if n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0 {
+        let mut v = n.abs() as u64;
+        let mut len = usize::from(n < 0.0) + 1;
+        while v >= 10 {
+            v /= 10;
+            len += 1;
+        }
+        return len;
+    }
+    ryu_js::Buffer::new().format_finite(n).len()
 }
 
 pub fn write_string(s: &str, out: &mut Vec<u8>) {
@@ -481,11 +521,7 @@ pub fn canonical_len(v: &Value) -> usize {
         Value::Null => 4,
         Value::Bool(true) => 4,
         Value::Bool(false) => 5,
-        Value::Number(n) => {
-            let mut o = Vec::new();
-            write_number(*n, &mut o);
-            o.len()
-        }
+        Value::Number(n) => number_len(*n),
         Value::String(s) => string_len(s),
         Value::Array(a) => {
             2 + a.len().saturating_sub(1) + a.iter().map(canonical_len).sum::<usize>()

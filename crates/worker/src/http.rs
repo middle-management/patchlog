@@ -208,3 +208,29 @@ pub fn query(url: &worker::Url, allowed: &[&str]) -> Res<BTreeMap<String, String
     }
     Ok(out)
 }
+
+/// SHA-256 by WebCrypto: native code, several times faster than hashing in wasm.
+pub async fn sha256(bytes: &[u8]) -> Res<Vec<u8>> {
+    use worker::js_sys::{global, Function, Promise, Reflect, Uint8Array};
+    use worker::wasm_bindgen::{JsCast, JsValue};
+    let fail = |_| Err::new(500, "internal", "WebCrypto unavailable");
+    let crypto = Reflect::get(&global(), &JsValue::from_str("crypto")).map_err(fail)?;
+    let subtle = Reflect::get(&crypto, &JsValue::from_str("subtle")).map_err(fail)?;
+    let digest: Function = Reflect::get(&subtle, &JsValue::from_str("digest"))
+        .map_err(fail)?
+        .dyn_into()
+        .map_err(fail)?;
+    let p: Promise = digest
+        .call2(
+            &subtle,
+            &JsValue::from_str("SHA-256"),
+            &Uint8Array::from(bytes),
+        )
+        .map_err(fail)?
+        .dyn_into()
+        .map_err(fail)?;
+    let ab = worker::wasm_bindgen_futures::JsFuture::from(p)
+        .await
+        .map_err(fail)?;
+    Ok(Uint8Array::new(&ab).to_vec())
+}

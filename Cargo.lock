@@ -357,6 +357,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "patchlog-bench"
+version = "0.1.0"
+dependencies = [
+ "patchlog-core",
+]
+
+[[package]]
 name = "patchlog-core"
 version = "0.1.0"
 dependencies = [

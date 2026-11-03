@@ -1,0 +1,79 @@
+# patchlog on Cloudflare Workers
+
+A from-scratch implementation of [docs/SPEC.md](docs/SPEC.md) (draft v0.74) for Cloudflare
+Workers and Durable Objects. It shares no code with the Go implementation on `main`: this
+branch started from the spec alone, to find out whether the spec fits Workers and what it
+costs there. [bench/RESULTS.md](bench/RESULTS.md) has the measurements.
+
+**Status: a skeleton.** It implements the core write and read path for one namespace,
+with authentication disabled (§1, `"auth": "disabled"`). Everything else is listed under
+[Not yet](#not-yet).
+
+## Layout
+
+| Path | What |
+|---|---|
+| `crates/core` | Platform-neutral Rust, with no I/O: I-JSON input and canonical JSON (§3.1), ids (§3.2–§3.5, §3.7), names (§3.6), JSON Patch with the `writes` of §6.4.1, the limits of §6.6, and the storage-free steps of a write (§6.2). It builds natively for tests and to wasm for the Worker. |
+| `crates/worker` | The Worker ([workers-rs](https://github.com/cloudflare/workers-rs)). `lib.rs` is the front Worker: `GET /`, URL checks (§7), the Cache API for immutable reads, and routing to the Durable Object of the namespace named in the URL. `ns.rs` is that Durable Object: one per namespace, on SQLite storage. |
+| `crates/bench` | Measures the CPU cost of the write and read paths, natively and as wasm on V8. |
+| `bench/` | `smoke.mjs` (end-to-end checks), `load.mjs` and `overhead.mjs` (load and CPU per request), `workerd.capnp` (runs the build on plain workerd), `baseline/` (a JavaScript Durable Object doing the same SQL, for comparison). |
+
+## Design
+
+- **One Durable Object per namespace.** The object owns the namespace chain, the namespace
+  document chain and every resource log in its namespace. It runs one event at a time, and
+  each write's checks and inserts run with no `await` between them, inside
+  `transactionSync`. That gives §5 its atomicity (invariants 2, 5 and 6) and the single
+  linear namespace chain of §3.5 without locks.
+- **Storage** is the object's SQLite: `nslog` (the namespace chain), `config` (the
+  namespace document chain), `entries` (resource log entries holding canonical patch sets),
+  `resources` (heads) and `snapshots` (a canonical document every 16 entries of a
+  resource, so any revision is a fold of at most 15 patch sets).
+- **Memory.** The namespace head, every resource's head and the head documents (up to
+  32 MiB, parsed) stay in the object's memory. A hot append issues no SQL reads, only its
+  three inserts.
+- **`documentSize` is capped at 1.5 MiB** (the default is 1 MiB, as in §12.2). A SQLite
+  value in a Durable Object can't exceed 2 MB, and a 4 MiB maximum would need snapshots
+  split across rows.
+- **Long-poll (§7.7)**: waiters hold a shared promise, which the next write resolves.
+  Otherwise they time out at the interval boundary.
+- **Caching (§9)**: responses carry the spec's `Cache-Control` and `Cache-Tag`. The front
+  Worker serves immutable public responses from the Cache API and answers
+  `If-None-Match` itself. Private namespaces are `CDN-Cache-Control: no-store`, since
+  there are no edge grants yet.
+- **`Repr-Digest`** is hashed by WebCrypto, because SHA-256 in wasm costs more than
+  serialising the document.
+
+## Running
+
+Needs Rust with the `wasm32-unknown-unknown` target, `cargo install worker-build`, and
+Node 22.
+
+```sh
+npm install
+cargo test -p patchlog-core               # unit tests and the vectors of Addendum I.1–I.3
+npm run dev                               # wrangler dev on :8787 (builds first)
+node bench/smoke.mjs                      # end-to-end checks against it
+
+npm run build && npm run workerd          # plain workerd on :8788, without wrangler's proxy
+node bench/load.mjs http://127.0.0.1:8788 --pid "$(pgrep -f '^workerd serve bench')"
+```
+
+`npm run deploy` deploys with wrangler. The Cache API works only on a custom domain,
+not on `workers.dev`.
+
+## Implemented
+
+- `GET /`; URL and query-parameter checks (§7); `400`, `404`, `405`, `410`, `412`, `413`, `415`, `422` and `428` with §12.1 bodies.
+- Namespaces: creation and config writes (`PATCH /ns/{ns}`) with idempotent retries; `GET /ns/{ns}`, `/rev/{ns_id}`, `/rev/{ns_id}/log`, and `/log` with `live=long-poll`. Namespace documents accept `read`, `frozen`, the six patch-set and document `limits` and `x-` members, and check the Values rule of §6.6. Other members are `422`.
+- Resources: create, append, restore and delete with preconditions, idempotent retries (§7.2), `Gesture`/`Undoes`, the frozen check, JSON Patch, the `writes` of §6.4.1 and the limits of §6.6. `GET`/`HEAD` of heads (`302`, or `410` once tombstoned), revisions (`ETag`, `Last-Modified`, `Repr-Digest`, `304`), and log ranges with paging.
+- The vectors of Addendum I.1 (canonical JSON), I.2 (ids) and I.3 (blob ids).
+
+## Not yet
+
+Roughly in order of how much they change the design:
+
+- **Addendum C** (grants, Biscuit, edge grants) and so private reads; rules (§6.4); rate limits (§6.6).
+- **Schemas** (§6.1): JSON Schema 2020-12 validation needs an interpreting validator (Ajv compiles with `new Function`, which Workers forbid) and RE2 regular expressions (§6.6). A document with `$schema` is refused with `422`.
+- **Branches** (§7.6), purge (§8.3, §8.5), pruning (§8.6), batches (§7.5), blobs (§7.8; a blob reference is `422` because no blob is available), SSE (§7.3), `/heads`, gestures, `/principal`, `/branches`, CORS.
+- Addenda A, B, E, F, G and H.

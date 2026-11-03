@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use patchlog_core::fmt::{http_date, repr_digest, rfc3339_ms};
+use patchlog_core::fmt::{base64, http_date, rfc3339_ms};
 use patchlog_core::gate::{self, Body, GateError, WriteKind};
 use patchlog_core::id::{ns_id, revision_id, tombstone_id};
 use patchlog_core::json::{self, canonical, canonical_string, Value};
@@ -88,13 +88,8 @@ struct EntryRow {
     gesture: Option<String>,
     undoes: Option<String>,
     ns_seq: i64,
+    #[allow(dead_code)]
     depth: i64,
-}
-
-#[derive(Deserialize)]
-struct ResRow {
-    head: i64,
-    live: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -113,9 +108,25 @@ struct IdRow {
     id: String,
 }
 
+/// A resource's head, as `resources` and its head entry record it.
+#[derive(Deserialize, Clone)]
+struct Head {
+    seq: i64,
+    id: String,
+    kind: i64,
+    depth: i64,
+    live: Option<i64>,
+}
+
+/// Resource heads kept in memory; only this object writes them.
+const HEADS_CACHED: usize = 100_000;
+
 struct Inner {
     loaded: bool,
     head: Option<NsHead>,
+    /// resource → its head, or `None` for a name with no entries
+    heads: HashMap<String, Option<Head>>,
+    next_seq: Option<i64>,
     /// resource → (entry seq, document at it)
     docs: HashMap<String, (i64, Value, u64)>,
     docs_bytes: u64,
@@ -149,6 +160,8 @@ impl DurableObject for Namespace {
             inner: RefCell::new(Inner {
                 loaded: false,
                 head: None,
+                heads: HashMap::new(),
+                next_seq: None,
                 docs: HashMap::new(),
                 docs_bytes: 0,
             }),
@@ -330,7 +343,7 @@ impl Namespace {
             },
             ("r", [name, "rev", id]) if m == Method::Get || m == Method::Head => {
                 http::query(&url, &[])?;
-                self.get_rev(&ctx, name, id, req.headers())
+                self.get_rev(&ctx, name, id, req.headers()).await
             }
             ("r", [name, "rev", id, "log"]) if m == Method::Get => {
                 let q = http::query(&url, &["since"])?;
@@ -461,10 +474,10 @@ impl Namespace {
         let since = q.get("since").map(String::as_str).unwrap_or("");
         match q.get("live").map(String::as_str) {
             None => {
-                if q.contains_key("cursor") {
-                    if !q["cursor"].bytes().all(|b| b.is_ascii_digit()) || q["cursor"].is_empty() {
-                        return Err(Err::bad("cursor is a decimal number"));
-                    }
+                if q.contains_key("cursor")
+                    && (!q["cursor"].bytes().all(|b| b.is_ascii_digit()) || q["cursor"].is_empty())
+                {
+                    return Err(Err::bad("cursor is a decimal number"));
                 }
                 let hd = Headers::new();
                 cache_headers(&hd, Class::HeadPointer, h.public)?;
@@ -651,16 +664,24 @@ impl Namespace {
 
     // ---------------------------------------------------------------- resources
 
-    fn resource(&self, name: &str) -> Res<Option<(ResRow, EntryRow)>> {
-        let Some(r) = self.one::<ResRow>(
-            "SELECT head, live FROM resources WHERE name = ?",
+    fn resource(&self, name: &str) -> Res<Option<Head>> {
+        if let Some(h) = self.inner.borrow().heads.get(name) {
+            return Ok(h.clone());
+        }
+        let h: Option<Head> = self.one(
+            "SELECT e.seq AS seq, e.id AS id, e.kind AS kind, e.depth AS depth, r.live AS live FROM resources r JOIN entries e ON e.seq = r.head WHERE r.name = ?",
             vec![name.into()],
-        )?
-        else {
-            return Ok(None);
-        };
-        let e = self.entry_by_seq(r.head)?;
-        Ok(Some((r, e)))
+        )?;
+        self.remember(name, h.clone());
+        Ok(h)
+    }
+
+    fn remember(&self, name: &str, h: Option<Head>) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.heads.len() >= HEADS_CACHED {
+            inner.heads.clear();
+        }
+        inner.heads.insert(name.to_string(), h);
     }
 
     fn entry_by_seq(&self, seq: i64) -> Res<EntryRow> {
@@ -736,7 +757,14 @@ impl Namespace {
             Precondition::NoneMatchStar => None,
         };
         let id = gate::id_for(parent.as_ref(), &body);
-        if cur.is_some() {
+        // The entry a retry would find exists only if the head moved past the
+        // parent, so the lookup is needed only when the precondition fails.
+        let pre_holds = match (&parent, &cur) {
+            (None, None) => true,
+            (Some(p), Some(h)) => p.text() == h.id,
+            _ => false,
+        };
+        if !pre_holds && cur.is_some() {
             if let Some(e) = self.entry_by_id(name, &id)? {
                 if e.author == author && e.parent.as_deref().and_then(Id::parse) == parent {
                     return self.written(ctx, name, &e, 200);
@@ -746,19 +774,19 @@ impl Namespace {
         // Step 2.2: settle the verb; 2.4 frozen; then the precondition.
         let kind = match (&pre, &cur) {
             (Precondition::NoneMatchStar, _) => WriteKind::Create,
-            (Precondition::Match(_), Some((_, e))) if e.kind == TOMBSTONE => WriteKind::Restore,
+            (Precondition::Match(_), Some(e)) if e.kind == TOMBSTONE => WriteKind::Restore,
             (Precondition::Match(_), _) => WriteKind::Append,
         };
         if ns.frozen {
             return Err(Err::new(409, "frozen", "the namespace is frozen"));
         }
         match (&pre, &cur) {
-            (Precondition::NoneMatchStar, Some((_, e))) if e.kind == TOMBSTONE => {
+            (Precondition::NoneMatchStar, Some(e)) if e.kind == TOMBSTONE => {
                 return Err(
                     Err::new(410, "gone", "the resource is deleted").with("head", s(e.id.clone()))
                 );
             }
-            (Precondition::NoneMatchStar, Some((_, e))) => {
+            (Precondition::NoneMatchStar, Some(e)) => {
                 return Err(
                     Err::new(412, "stale", "the resource exists").with("head", s(e.id.clone()))
                 );
@@ -766,7 +794,7 @@ impl Namespace {
             (Precondition::Match(_), None) => {
                 return Err(Err::new(412, "stale", "no such resource"))
             }
-            (Precondition::Match(p), Some((_, e))) if p.text() != e.id => {
+            (Precondition::Match(p), Some(e)) if p.text() != e.id => {
                 if e.kind == TOMBSTONE {
                     return Err(Err::new(410, "gone", "the resource is deleted")
                         .with("head", s(e.id.clone())));
@@ -778,9 +806,9 @@ impl Namespace {
         // Step 3: the parent's document.
         let (doc, depth) = match (&kind, &cur) {
             (WriteKind::Create, _) => (Value::Null, 0),
-            (WriteKind::Append, Some((_, e))) => (self.doc_at(name, e.seq, true)?, e.depth + 1),
-            (WriteKind::Restore, Some((r, e))) => {
-                let live = r.live.ok_or_else(|| {
+            (WriteKind::Append, Some(e)) => (self.doc_at(name, e.seq, true)?, e.depth + 1),
+            (WriteKind::Restore, Some(e)) => {
+                let live = e.live.ok_or_else(|| {
                     Err::new(500, "internal", "tombstone without a live revision")
                 })?;
                 (self.doc_at(name, live, true)?, e.depth + 1)
@@ -829,6 +857,17 @@ impl Namespace {
             ));
         }
         self.commit(stmts)?;
+        self.inner.borrow_mut().next_seq = Some(seq + 1);
+        self.remember(
+            name,
+            Some(Head {
+                seq,
+                id: p.id.text(),
+                kind: REV,
+                depth,
+                live: Some(seq),
+            }),
+        );
         self.cache_doc(name, seq, p.doc, p.doc_size);
         self.set_head(NsHead {
             seq: ns_seq,
@@ -852,6 +891,9 @@ impl Namespace {
     }
 
     fn next_entry_seq(&self) -> Res<i64> {
+        if let Some(n) = self.inner.borrow().next_seq {
+            return Ok(n);
+        }
         #[derive(Deserialize)]
         struct M {
             m: Option<i64>,
@@ -884,7 +926,7 @@ impl Namespace {
         let ns = self.existing()?;
         let tomb = tombstone_id(&parent);
         let cur = self.resource(name)?;
-        if cur.is_some() {
+        if cur.as_ref().is_some_and(|h| h.id != parent.text()) {
             if let Some(e) = self.entry_by_id(name, &tomb)? {
                 if e.author == author {
                     return self.written(ctx, name, &e, 200);
@@ -894,7 +936,7 @@ impl Namespace {
         if ns.frozen {
             return Err(Err::new(409, "frozen", "the namespace is frozen"));
         }
-        let Some((r, head)) = cur else {
+        let Some(head) = cur else {
             return Err(Err::new(412, "stale", "no such resource"));
         };
         if head.kind == TOMBSTONE {
@@ -928,8 +970,19 @@ impl Namespace {
                     (head.depth + 1).into(),
                 ],
             ),
-            ("UPDATE resources SET head = ?, live = ? WHERE name = ?", vec![seq.into(), r.live.or(Some(head.seq)).into(), name.into()]),
+            ("UPDATE resources SET head = ?, live = ? WHERE name = ?", vec![seq.into(), head.live.or(Some(head.seq)).into(), name.into()]),
         ])?;
+        self.inner.borrow_mut().next_seq = Some(seq + 1);
+        self.remember(
+            name,
+            Some(Head {
+                seq,
+                id: tomb.text(),
+                kind: TOMBSTONE,
+                depth: head.depth + 1,
+                live: head.live.or(Some(head.seq)),
+            }),
+        );
         self.set_head(NsHead {
             seq: ns_seq,
             id: ns_id_new,
@@ -953,7 +1006,7 @@ impl Namespace {
 
     fn get_head(&self, ctx: &Ctx, name: &str) -> Res<Response> {
         let ns = self.existing()?;
-        let Some((r, head)) = self.resource(name)? else {
+        let Some(head) = self.resource(name)? else {
             return Err(Err::not_found());
         };
         let hd = Headers::new();
@@ -961,7 +1014,7 @@ impl Namespace {
         tags(&hd, &ctx.ns, Some(name))?;
         hd.set("ETag", &format!("\"{}\"", head.id))?;
         if head.kind == TOMBSTONE {
-            let last = r
+            let last = head
                 .live
                 .map(|l| self.entry_by_seq(l))
                 .transpose()?
@@ -981,7 +1034,7 @@ impl Namespace {
         http::respond(302, hd, vec![])
     }
 
-    fn get_rev(&self, ctx: &Ctx, name: &str, id: &str, req: &Headers) -> Res<Response> {
+    async fn get_rev(&self, ctx: &Ctx, name: &str, id: &str, req: &Headers) -> Res<Response> {
         let ns = self.existing()?;
         let Some(id) = Id::parse(id) else {
             return Err(Err::bad("malformed id"));
@@ -1014,7 +1067,8 @@ impl Namespace {
         }
         let doc = self.doc_at(name, e.seq, false)?;
         let bytes = canonical(&doc);
-        hd.set("Repr-Digest", &repr_digest(&bytes))?;
+        let digest = http::sha256(&bytes).await?;
+        hd.set("Repr-Digest", &format!("sha-256=:{}:", base64(&digest)))?;
         hd.set("Content-Type", "application/json")?;
         http::respond(200, hd, bytes)
     }

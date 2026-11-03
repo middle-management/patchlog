@@ -64,7 +64,8 @@ async fn front(req: Request, env: Env, ctx: Context) -> std::result::Result<Resp
     let cacheable = req.method() == Method::Get && segs.contains(&"rev");
     let cache = Cache::default();
     if cacheable {
-        if let Some(hit) = cache.get(url.as_str(), false).await? {
+        // A deployment without a cache (plain workerd) just misses.
+        if let Ok(Some(hit)) = cache.get(url.as_str(), false).await {
             // The Cache API matches by URL alone; answer conditionals here (§7.1).
             let inm = req.headers().get("If-None-Match")?;
             let etag = hit.headers().get("ETag")?;

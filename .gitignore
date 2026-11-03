@@ -3,3 +3,5 @@ node_modules/
 crates/worker/build/
 .wrangler/
 crates/worker/.wrangler/
+.workerd-data/
+.workerd-base/
