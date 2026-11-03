@@ -17,10 +17,41 @@ pub use ns::Namespace;
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    match front(req, env, ctx).await {
-        Ok(r) => Ok(r),
-        Err(e) => e.into_response(false),
+    if req.method() == Method::Options {
+        return preflight();
     }
+    let resp = match front(req, env, ctx).await {
+        Ok(r) => r,
+        Err(e) => e.into_response(false)?,
+    };
+    with_cors(resp)
+}
+
+/// §7, browsers: every origin is allowed and none is credentialed (there
+/// are no edge grants, §C.5.2), so every response carries
+/// `Access-Control-Allow-Origin: *` and the exposed headers, `Origin` or not.
+const CORS_METHODS: &str = "GET, HEAD, PATCH, PUT, POST, DELETE";
+const CORS_ALLOW_HEADERS: &str = "Authorization, If-Match, Source-Authorization, Signature, Content-Type, Gesture, Undoes, Blob-Nonce, Blob-From, X-Author, If-None-Match, If-Modified-Since, Range, If-Range, Last-Event-ID";
+const CORS_EXPOSE_HEADERS: &str = "ETag, Location, Repr-Digest, Retry-After, Content-Range, Gesture, Undoes, X-Revision, X-Namespace-Revision, X-Config-Revision, X-Cursor, X-Log-Next";
+
+fn with_cors(resp: Response) -> Result<Response> {
+    // Headers of a fetched or cached response are immutable: copy them.
+    let h = resp.headers().clone();
+    h.set("Access-Control-Allow-Origin", "*")?;
+    h.set("Access-Control-Expose-Headers", CORS_EXPOSE_HEADERS)?;
+    let (builder, body) = resp.into_parts();
+    Ok(builder.with_headers(h).body(body))
+}
+
+/// A preflight, the same for every URL, so browsers and caches keep it.
+fn preflight() -> Result<Response> {
+    let h = Headers::new();
+    h.set("Access-Control-Allow-Origin", "*")?;
+    h.set("Access-Control-Allow-Methods", CORS_METHODS)?;
+    h.set("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS)?;
+    h.set("Access-Control-Max-Age", "86400")?;
+    h.set("Cache-Control", "public, max-age=86400")?;
+    Ok(ResponseBuilder::new().with_status(204).with_headers(h).empty())
 }
 
 async fn front(req: Request, env: Env, ctx: Context) -> std::result::Result<Response, Err> {

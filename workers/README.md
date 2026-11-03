@@ -104,7 +104,12 @@ append writes 4: past that, writes answer `503` with `Retry-After` until 00:00 U
 - Batches (`POST /ns/{ns}/batch`, §7.5): items with several steps (patch sets, `"delete"`, restores), an optional `config` change, `source`, per-step gestures, idempotent retries and dry runs. Every step is checked as §6.2 says (schemas written by earlier items resolve for later ones), and the batch commits all or nothing as one `batch` entry. A batch's resource entries each take their own sequence number, and the `batch` entry the last of them.
 - Blobs (§7.8) on R2 (`BLOBS`, bucket `patchlog-blobs`), stored once per id under `b/{id}`: uploads checked against the id over the body, pending entries per uploader (`blobPending`, `blobGrace` of 24 h), attachment by the write that references them (in single writes and batches), `Blob-From` copies within a namespace, reads of attached blobs with ranges, `nosniff` and `sandbox`, and `GET …/raw` redirecting raw documents to their blob. Uploads are held in memory while hashed, so `blobSize` is 32 MiB here.
 - Branches (§7.6): `POST /ns/{base}/branches` (the branch's document, the base's rules on a `branch` envelope, `branchDepth`, `branchesPerNamespace`, retries, taken names) and `GET /ns/{ns}/branches`. A branch reads resources without entries of its own through its base as of `at`, recursively: heads, revisions, `/raw`, blobs, `/heads` pages and resource logs, which cross the foreign parent. First writes, deletes and batch steps take the base's head as their foreign parent. A batch with a local `source` may reference the source's blobs, so merges carry them. Each namespace is its own Durable Object, so a branch asks its base's object over internal requests (`/internal/…`, never forwarded by the front Worker) and keeps the answers, which never change.
+- CORS (§7, browsers): every origin allowed, none credentialed. Preflights answer from the front Worker with the methods and headers §7 lists and `Access-Control-Max-Age`; every response, errors and cache hits included, carries `Access-Control-Allow-Origin: *` and the exposed headers.
 - The vectors of Addendum I.1 (canonical JSON), I.2 (ids) and I.3 (blob ids).
+
+## Client
+
+`client/patchlog.mjs` is a small `fetch`-based client (browsers and Node) with `load`, `loadRevision` and `save`. `save` does the rebase of §11: on `412` it takes the head the server names and resends the same patch set, then reads the result by its pinned revision URL. Head pointers may be up to a second stale behind a CDN (§9), so an editor that saves with `If-Match` on a head it just read will sometimes get `412` right after someone else's write; the rebase turns that into one extra round trip. Revision URLs are immutable, so no cache can serve a stale one. Start a patch set with `test` ops of the values it relies on, and a rebase onto changed data fails with `422` instead of overwriting.
 
 ## Not yet
 
@@ -112,7 +117,7 @@ Roughly in order of how much they change the design:
 
 - **Addendum C** (grants, Biscuit, edge grants) and so private reads, roles and key scopes; rate limits (§6.6).
 - **Schemas, beyond the core** (§6.1): `schemaReads`, drafts in branches, read permission on schema revisions (with authentication off, every revision is readable), and the `in_use` refusals (there is no purge yet). `idn-hostname` and `idn-email` are checked as the `jsonschema` crate does, which may differ from RFC 5890 without UTS 46 mapping in edge cases.
-- Purge (§8.3, §8.5) and pruning (§8.6), and so removing unreferenced blob bytes from R2; SSE (§7.3), `/principal`, CORS.
+- Purge (§8.3, §8.5) and pruning (§8.6), and so removing unreferenced blob bytes from R2; SSE (§7.3), `/principal`, credentialed CORS (edge grants, §C.5.2).
 - Branches beyond the local core: remote branches (§G.3), `drafts`, checking that `successor` names a namespace and the branch limit on unfreezing. Creating a branch writes in two objects; a retry completes one that failed half-way.
 - Blobs beyond the core: copies across namespaces, `blobRate`, uploads above 32 MiB.
 - Addenda A, B, E, F, G and H.

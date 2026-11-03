@@ -5,6 +5,7 @@
 // long-poll that a write wakes.
 
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
+import { load, save } from "../client/patchlog.mjs";
 
 if (process.env.HTTPS_PROXY) setGlobalDispatcher(new EnvHttpProxyAgent());
 
@@ -88,7 +89,17 @@ check("long-poll without cursor answers at once", r.status === 200 && r.h.get("x
 const cursor = r.h.get("x-cursor");
 const head = r.h.get("x-namespace-revision");
 const t0 = Date.now();
-const poll = req("GET", `/ns/${ns}/log?since=${head}&live=long-poll&cursor=${cursor}`);
+// A poll sent after the interval rolled over is answered 204 at once (§7.7);
+// a client polls again with the cursor it got, as this does.
+const poll = (async () => {
+  let cur = cursor, p;
+  for (let i = 0; i < 3; i++) {
+    p = await req("GET", `/ns/${ns}/log?since=${head}&live=long-poll&cursor=${cur}`);
+    if (p.status !== 204) return p;
+    cur = p.h.get("x-cursor");
+  }
+  return p;
+})();
 await new Promise((res) => setTimeout(res, 300));
 r = await req("DELETE", `/r/${ns}/derby`, { headers: { "If-Match": `"${c}"` } });
 check("delete 200 with the tombstone of I.2", r.status === 200 && r.json.tombstone === t, r.json);
@@ -456,6 +467,31 @@ check("a namespace can't be created with base 422", r.status === 422, r.json);
   items[0].resource = "bad";
   r = await req("POST", `/ns/${tn}/batch`, { headers: { "Content-Type": "application/json" }, raw: JSON.stringify({ items: [items[0]] }) });
   check("and still validates against them", r.status === 422 && r.json?.items?.[0]?.code === "invalid", r.json);
+}
+
+// CORS (§7, browsers), and the client's rebase over a stale head (§11).
+{
+  r = await fetch(`${base}/r/${ns}/x`, { method: "OPTIONS", headers: { Origin: "https://studio.example", "Access-Control-Request-Method": "PATCH", "Access-Control-Request-Headers": "if-match, content-type, x-author" } });
+  check("preflight", r.status === 204 && r.headers.get("access-control-allow-origin") === "*" && /PATCH/.test(r.headers.get("access-control-allow-methods")) && /If-Match/.test(r.headers.get("access-control-allow-headers")) && r.headers.get("access-control-max-age"), [r.status, [...r.headers]]);
+  const cn = `${ns}-cors`;
+  r = await req("PATCH", `/ns/${cn}`, { body: [{ op: "add", path: "", value: { read: "public" } }], headers: { "If-None-Match": "*", Origin: "https://studio.example" } });
+  check("CORS on a write", r.h.get("access-control-allow-origin") === "*" && /X-Namespace-Revision/.test(r.h.get("access-control-expose-headers") ?? ""), [...r.h]);
+  r = await req("GET", `/r/${cn}/missing`);
+  check("CORS on an error, without Origin", r.status === 404 && r.h.get("access-control-allow-origin") === "*", [...r.h]);
+  const first = await save(base, cn, "page", { head: null }, [{ op: "add", path: "", value: { title: "A", body: "x" } }], { author: "studio" });
+  for (let i = 0; i < 2; i++) {
+    r = await req("GET", `/r/${cn}/page/rev/${first.head}`);
+    check(`CORS on a revision read ${i ? "(cached)" : ""}`, r.status === 200 && r.h.get("access-control-allow-origin") === "*" && /ETag/.test(r.h.get("access-control-expose-headers") ?? ""), [...r.h]);
+  }
+  const loaded = await load(base, cn, "page");
+  check("client load", loaded.head === first.head && loaded.doc.title === "A", loaded);
+  // Someone else writes; the studio still holds the old head, as after a stale CDN read.
+  await save(base, cn, "page", loaded, [{ op: "replace", path: "/body", value: "theirs" }], { author: "other" });
+  const mine = await save(base, cn, "page", loaded, [{ op: "replace", path: "/title", value: "B" }], { author: "studio" });
+  check("save from a stale head rebases and keeps both changes", mine.rebased === 1 && mine.doc.title === "B" && mine.doc.body === "theirs", mine);
+  let err;
+  try { await save(base, cn, "page", loaded, [{ op: "test", path: "/body", value: "x" }, { op: "replace", path: "/body", value: "mine" }], { author: "studio" }); } catch (e) { err = e; }
+  check("a test op stops a rebase onto changed data with 422", err?.status === 422, err?.body);
 }
 
 console.log(failed ? `\n${failed} failed` : "\nall passed");
