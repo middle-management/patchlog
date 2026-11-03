@@ -23,6 +23,8 @@ use worker::wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use worker::wasm_bindgen_futures::JsFuture;
 use worker::*;
 
+mod batch;
+
 use crate::http::{self, cache_headers, obj, quoted, s, tags, Class, Err, Precondition, Res};
 
 /// A snapshot of the document is stored every `SNAPSHOT_EVERY` entries of a
@@ -181,6 +183,9 @@ pub struct Namespace {
     /// cache), up to SCHEMAS_CACHED entries.
     schemas: RefCell<HashMap<String, Value>>,
     validators: RefCell<HashMap<String, std::rc::Rc<schema::Compiled>>>,
+    /// Schema revisions written by earlier items of the batch being checked
+    /// (§7.5): seen only by that batch, never cached.
+    pending_schemas: RefCell<HashMap<String, Value>>,
 }
 
 const SCHEMAS_CACHED: usize = 1024;
@@ -237,6 +242,7 @@ impl DurableObject for Namespace {
             env,
             schemas: RefCell::new(HashMap::new()),
             validators: RefCell::new(HashMap::new()),
+            pending_schemas: RefCell::new(HashMap::new()),
         }
     }
 
@@ -432,7 +438,7 @@ impl Namespace {
     ) -> Res<(Vec<Value>, bool)> {
         let n = limits.log_page_size as i64;
         let rows: Vec<EntryRow> = self.rows(
-            "SELECT *, seq AS ns_seq FROM res_log WHERE resource = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT ?",
+            "SELECT *, (SELECT MIN(n.seq) FROM ns_log n WHERE n.seq >= res_log.seq) AS ns_seq FROM res_log WHERE resource = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT ?",
             vec![name.into(), after.into(), upto.into(), (n + 1).into()],
         )?;
         let mut out = Vec::new();
@@ -521,6 +527,16 @@ impl Namespace {
             ("ns", ["gestures", gesture]) if m == Method::Get => {
                 let q = http::query(&url, &["after"])?;
                 self.get_gestures(&ctx, gesture, q.get("after").map(String::as_str))
+            }
+            ("ns", ["batch"]) if m == Method::Post => {
+                let q = http::query(&url, &["dry-run"])?;
+                let dry = match q.get("dry-run").map(String::as_str) {
+                    None => false,
+                    Some("1") => true,
+                    Some(_) => return Err(Err::bad("dry-run takes only 1")),
+                };
+                let body = req.bytes().await?;
+                self.post_batch(&ctx, req.headers(), &body, dry).await
             }
             ("ns", ["log"]) if m == Method::Get => {
                 let q = http::query(&url, &["since", "live", "cursor"])?;
@@ -623,6 +639,40 @@ impl Namespace {
             }
             if let Some(u) = &r.undoes {
                 m.insert("undoes".into(), s(u.clone()));
+            }
+            // A batch's gestures, per resource and step (§7.4).
+            if m.get("kind").and_then(Value::as_str) == Some("batch") {
+                #[derive(Deserialize)]
+                struct G {
+                    resource: String,
+                    gesture: Option<String>,
+                    undoes: Option<String>,
+                }
+                let rows: Vec<G> = self.rows(
+                    "SELECT resource, gesture, undoes FROM res_log WHERE seq > COALESCE((SELECT MAX(seq) FROM ns_log WHERE seq < ?1), 0) AND seq <= ?1 ORDER BY seq",
+                    vec![r.seq.into()],
+                )?;
+                if rows
+                    .iter()
+                    .any(|g| g.gesture.is_some() || g.undoes.is_some())
+                {
+                    let mut by: std::collections::BTreeMap<String, Value> = Default::default();
+                    for g in rows {
+                        let mut step = vec![];
+                        if let Some(x) = g.gesture {
+                            step.push(("gesture", s(x)));
+                        }
+                        if let Some(x) = g.undoes {
+                            step.push(("undoes", s(x)));
+                        }
+                        if let Value::Array(a) =
+                            by.entry(g.resource).or_insert(Value::Array(vec![]))
+                        {
+                            a.push(obj(step));
+                        }
+                    }
+                    m.insert("gestures".into(), Value::Object(by));
+                }
             }
         }
         Ok(v)
@@ -830,59 +880,13 @@ impl Namespace {
         let pre = http::precondition(hd)?;
         let g = Gesture::from(hd)?;
         let author = author(hd)?;
-        let deployment = Limits::default();
         let body = gate::read_body(body, &Limits::deployment_max()).map_err(gate_err)?;
         let head = self.head()?;
-        let (parent_id, parent_doc, limits) = match (&pre, &head) {
-            (Precondition::NoneMatchStar, None) => (None, Value::Null, deployment),
-            (Precondition::NoneMatchStar, Some(_)) => {
-                return Err(Err::new(412, "stale", "a namespace of that name exists"));
-            }
-            (Precondition::Match(_), None) => return Err(Err::not_found()),
-            (Precondition::Match(want), Some(h)) => {
-                if *want != h.config_id {
-                    // Idempotent retry (§7.2).
-                    let id = revision_id(Some(want), &body.canonical);
-                    if let Some(c) = self.one::<ConfigRow>(
-                        "SELECT * FROM ns_config WHERE id = ?",
-                        vec![id.text().into()],
-                    )? {
-                        if c.author == author {
-                            let ns: IdRow = self
-                                .one("SELECT id FROM ns_log WHERE seq = ?", vec![c.ns_seq.into()])?
-                                .ok_or_else(|| Err::new(500, "internal", "missing entry"))?;
-                            return config_written(ctx, 200, &c.id, &ns.id);
-                        }
-                    }
-                    return Err(Err::new(412, "stale", "config moved")
-                        .with("config", s(h.config_id.text())));
-                }
-                (Some(h.config_id), h.config.clone(), h.limits.clone())
-            }
+        let plan = match self.prepare_config(ctx, &pre, &body, &head, &author)? {
+            ConfigStep::Retry(r) => return Ok(r),
+            ConfigStep::Plan(p) => p,
         };
-        // Steps 3–4: apply, then the patch-set and document limits.
-        let ops =
-            parse_patch_set(&body.value).map_err(|e| Err::new(422, "invalid", e.to_string()))?;
-        let mut doc = parent_doc;
-        let writes = apply(&mut doc, &ops).map_err(|e| Err::new(422, "invalid", e.to_string()))?;
-        if parent_id.is_none() && writes.is_empty() {
-            return Err(Err::new(422, "invalid", "a create must write something"));
-        }
-        if body.canonical.len() as u64 > limits.document_size {
-            return Err(limit_err(
-                422,
-                "documentSize",
-                body.canonical.len() as u64,
-                limits.document_size,
-            ));
-        }
-        validate_config(&doc)?;
-        let new_limits = Limits::from_config(&doc);
-        measure(&doc, &new_limits)
-            .check(&new_limits)
-            .map_err(|e| limit_err(422, e.limit, e.measured.unwrap_or(0), e.max))?;
-        let config_id = revision_id(parent_id.as_ref(), &body.canonical);
-        let entry = obj(vec![("kind", s("config")), ("target", s(config_id.text()))]);
+        let entry = obj(vec![("kind", s("config")), ("target", s(plan.id.text()))]);
         let prev = head
             .clone()
             .unwrap_or_else(|| make_head(0, Id([0; 20]), 0, Id([0; 20]), Value::Null));
@@ -904,23 +908,77 @@ impl Namespace {
             self.ns_entry(ctx, &prev, &entry, &author, &g, prev.config_seq + 1)
         };
         let config_seq = prev.config_seq + 1;
-        self.commit(vec![
-            ns_stmt,
-            (
-                "INSERT INTO ns_config (seq, id, parent, patches, doc, author, ns_seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                vec![
-                    config_seq.into(),
-                    config_id.text().into(),
-                    parent_id.map(|p| p.text()).into(),
-                    String::from_utf8(body.canonical.clone()).unwrap().into(),
-                    canonical_string(&doc).into(),
-                    author.into(),
-                    seq.into(),
-                ],
-            ),
-        ])?;
-        self.set_head(make_head(seq, ns_id_new, config_seq, config_id, doc));
-        config_written(ctx, 201, &config_id.text(), &ns_id_new.text())
+        self.commit(vec![ns_stmt, plan.insert(config_seq, &author, seq)])?;
+        self.set_head(make_head(seq, ns_id_new, config_seq, plan.id, plan.doc));
+        config_written(ctx, 201, &plan.id.text(), &ns_id_new.text())
+    }
+
+    /// Steps 2–4 of a config write (§7.4), alone or as a batch's `config`
+    /// change (§7.5): the precondition (with its idempotent retry), the
+    /// patches, the patch-set and document limits, and the namespace
+    /// document's validation. Rules are skipped: authentication is disabled,
+    /// so every config write is a `*`-key one (§1, §6.4.3).
+    fn prepare_config(
+        &self,
+        ctx: &Ctx,
+        pre: &Precondition,
+        body: &Body,
+        head: &Option<NsHead>,
+        author: &str,
+    ) -> Res<ConfigStep> {
+        let (parent_id, parent_doc, limits) = match (pre, head) {
+            (Precondition::NoneMatchStar, None) => (None, Value::Null, Limits::default()),
+            (Precondition::NoneMatchStar, Some(_)) => {
+                return Err(Err::new(412, "stale", "a namespace of that name exists"));
+            }
+            (Precondition::Match(_), None) => return Err(Err::not_found()),
+            (Precondition::Match(want), Some(h)) => {
+                if *want != h.config_id {
+                    // Idempotent retry (§7.2).
+                    let id = revision_id(Some(want), &body.canonical);
+                    if let Some(c) = self.one::<ConfigRow>(
+                        "SELECT * FROM ns_config WHERE id = ?",
+                        vec![id.text().into()],
+                    )? {
+                        if c.author == author {
+                            let ns: IdRow = self
+                                .one("SELECT id FROM ns_log WHERE seq = ?", vec![c.ns_seq.into()])?
+                                .ok_or_else(|| Err::new(500, "internal", "missing entry"))?;
+                            return Ok(ConfigStep::Retry(config_written(ctx, 200, &c.id, &ns.id)?));
+                        }
+                    }
+                    return Err(Err::new(412, "stale", "config moved")
+                        .with("config", s(h.config_id.text())));
+                }
+                (Some(h.config_id), h.config.clone(), h.limits.clone())
+            }
+        };
+        let ops =
+            parse_patch_set(&body.value).map_err(|e| Err::new(422, "invalid", e.to_string()))?;
+        let mut doc = parent_doc;
+        let writes = apply(&mut doc, &ops).map_err(|e| Err::new(422, "invalid", e.to_string()))?;
+        if parent_id.is_none() && writes.is_empty() {
+            return Err(Err::new(422, "invalid", "a create must write something"));
+        }
+        if body.canonical.len() as u64 > limits.document_size {
+            return Err(limit_err(
+                422,
+                "documentSize",
+                body.canonical.len() as u64,
+                limits.document_size,
+            ));
+        }
+        validate_config(&doc)?;
+        let new_limits = Limits::from_config(&doc);
+        measure(&doc, &new_limits)
+            .check(&new_limits)
+            .map_err(|e| limit_err(422, e.limit, e.measured.unwrap_or(0), e.max))?;
+        Ok(ConfigStep::Plan(ConfigPlan {
+            id: revision_id(parent_id.as_ref(), &body.canonical),
+            parent: parent_id,
+            patches: String::from_utf8(body.canonical.clone()).unwrap(),
+            doc,
+        }))
     }
 
     // ---------------------------------------------------------------- resources
@@ -981,7 +1039,7 @@ impl Namespace {
 
     fn entry_by_seq(&self, name: &str, seq: i64) -> Res<EntryRow> {
         self.one(
-            "SELECT *, seq AS ns_seq FROM res_log WHERE resource = ? AND seq = ?",
+            "SELECT *, (SELECT MIN(n.seq) FROM ns_log n WHERE n.seq >= res_log.seq) AS ns_seq FROM res_log WHERE resource = ? AND seq = ?",
             vec![name.into(), seq.into()],
         )?
         .ok_or_else(|| Err::new(500, "internal", "missing entry"))
@@ -989,7 +1047,7 @@ impl Namespace {
 
     fn entry_by_id(&self, name: &str, id: &Id) -> Res<Option<EntryRow>> {
         self.one(
-            "SELECT *, seq AS ns_seq FROM res_log WHERE resource = ? AND id = ?",
+            "SELECT *, (SELECT MIN(n.seq) FROM ns_log n WHERE n.seq >= res_log.seq) AS ns_seq FROM res_log WHERE resource = ? AND id = ?",
             vec![name.into(), id.text().into()],
         )
     }
@@ -1102,7 +1160,13 @@ impl Namespace {
         roots: &[String],
     ) -> Res<std::result::Result<HashMap<String, Value>, Vec<String>>> {
         loop {
-            let known = self.schemas.borrow().clone();
+            let mut known = self.schemas.borrow().clone();
+            known.extend(
+                self.pending_schemas
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
             let mut missing = std::collections::BTreeSet::new();
             for r in roots {
                 missing.extend(schema::closure(r, &known).1);
@@ -1174,7 +1238,10 @@ impl Namespace {
                     None => {
                         let v =
                             std::rc::Rc::new(schema::compile(&path, &known).map_err(schema_err)?);
-                        self.validators.borrow_mut().insert(path.clone(), v.clone());
+                        // Not from a batch's uncommitted schemas.
+                        if self.pending_schemas.borrow().is_empty() {
+                            self.validators.borrow_mut().insert(path.clone(), v.clone());
+                        }
                         v
                     }
                 };
@@ -1602,7 +1669,7 @@ impl Namespace {
             ns_id: String,
         }
         let rows: Vec<Row> = self.rows(
-            "SELECT r.resource AS resource, r.id AS id, r.kind AS kind, r.gesture AS gesture, r.undoes AS undoes, r.author AS author, n.id AS ns_id FROM res_log r JOIN ns_log n ON n.seq = r.seq WHERE (r.gesture = ?1 OR r.undoes = ?1) AND r.seq > ?2 ORDER BY r.seq LIMIT ?3",
+            "SELECT r.resource AS resource, r.id AS id, r.kind AS kind, r.gesture AS gesture, r.undoes AS undoes, r.author AS author, n.id AS ns_id FROM res_log r JOIN ns_log n ON n.seq = (SELECT MIN(seq) FROM ns_log WHERE seq >= r.seq) WHERE (r.gesture = ?1 OR r.undoes = ?1) AND r.seq > ?2 ORDER BY r.seq LIMIT ?3",
             vec![gesture.into(), after_seq.into(), (n + 1).into()],
         )?;
         let more = rows.len() as i64 > n;
@@ -1671,6 +1738,37 @@ impl Namespace {
             }
         }
         http::respond(200, hd, canonical(&Value::Array(out)))
+    }
+}
+
+/// A config change ready to record, or the answer to an idempotent retry.
+enum ConfigStep {
+    Plan(ConfigPlan),
+    Retry(Response),
+}
+
+struct ConfigPlan {
+    id: Id,
+    parent: Option<Id>,
+    patches: String,
+    doc: Value,
+}
+
+impl ConfigPlan {
+    /// The `ns_config` row, recorded by the namespace entry `ns_seq`.
+    fn insert(&self, config_seq: i64, author: &str, ns_seq: i64) -> Stmt {
+        (
+            "INSERT INTO ns_config (seq, id, parent, patches, doc, author, ns_seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                config_seq.into(),
+                self.id.text().into(),
+                self.parent.map(|p| p.text()).into(),
+                self.patches.clone().into(),
+                canonical_string(&self.doc).into(),
+                author.into(),
+                ns_seq.into(),
+            ],
+        )
     }
 }
 

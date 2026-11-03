@@ -12,9 +12,9 @@ const base = process.argv[2] ?? "http://127.0.0.1:8787";
 const ns = `smoke-${Date.now().toString(36)}`;
 let failed = 0;
 
-async function req(method, path, { body, headers = {} } = {}) {
+async function req(method, path, { body, headers = {}, raw } = {}) {
   const h = { "X-Author": "smoke", ...(body !== undefined ? { "Content-Type": "application/json-patch+json" } : {}), ...headers };
-  const r = await fetch(base + path, { method, headers: h, body: body === undefined ? undefined : JSON.stringify(body), redirect: "manual" });
+  const r = await fetch(base + path, { method, headers: h, body: raw ?? (body === undefined ? undefined : JSON.stringify(body)), redirect: "manual" });
   const text = await r.text();
   let json;
   try { json = text ? JSON.parse(text) : undefined; } catch { json = text; }
@@ -191,6 +191,68 @@ r = await req("GET", `/ns/${cat}/gestures/abcdefghijklmnopqrstuvwxyz`);
 check("gesture listing", r.status === 200 && r.json.length === 1 && r.json[0].resource === `${ns}.post-1` && r.json[0].id === placement, r.json);
 r = await req("GET", `/ns/${cat}/gestures/not-a-gesture`);
 check("malformed gesture 400", r.status === 400, r.status);
+
+// Batches (§7.5).
+const bns = `${ns}-b`;
+await req("PATCH", `/ns/${bns}`, { body: [{ op: "add", path: "", value: { read: "public" } }], headers: { "If-None-Match": "*" } });
+const batch = (body, extra = "", headers = {}) => req("POST", `/ns/${bns}/batch${extra}`, { body: undefined, headers: { "Content-Type": "application/json", ...headers }, raw: JSON.stringify(body) });
+r = await req("PATCH", `/r/${bns}/a`, { body: [{ op: "add", path: "", value: { n: 0 } }], headers: { "If-None-Match": "*" } });
+const a0 = r.h.get("etag").slice(1, -1);
+const g1 = "bcdefghijklmnopqrstuvwxyza";
+const b1 = { gesture: g1, items: [
+  { resource: "a", ifMatch: a0, steps: [[{ op: "replace", path: "/n", value: 1 }], [{ op: "replace", path: "/n", value: 2 }]] },
+  { resource: "b", ifNoneMatch: "*", steps: [[{ op: "add", path: "", value: { n: 10 } }]] },
+] };
+r = await batch(b1, "?dry-run=1");
+check("batch dry run reports, writes nothing", r.status === 200 && r.json.items?.every((i) => i.status === 201) && (await req("GET", `/r/${bns}/b`)).status === 404, r.json);
+r = await batch(b1);
+check("batch 201 with each item's ids", r.status === 201 && r.json.items?.[0]?.ids?.length === 2 && r.json.items?.[1]?.ids?.length === 1 && r.h.get("x-namespace-revision") === r.json.ns_id, r.json);
+const b1ns = r.json.ns_id, aIds = r.json.items[0].ids;
+r = await req("GET", `/r/${bns}/a/rev/${aIds[1]}`);
+check("batch revisions readable", r.status === 200 && r.json.n === 2, r.json);
+r = await batch(b1);
+check("batch retry 200 with the same entry", r.status === 200 && r.json.ns_id === b1ns, r.json);
+r = await req("GET", `/ns/${bns}/log?live=long-poll&since=`);
+const bentry = r.json.find((e) => e.id === b1ns);
+check("one batch entry in the namespace log, with gestures", bentry?.kind === "batch" && bentry.entries.length === 2 && bentry.gestures?.a?.length === 2 && bentry.gestures.a[0].gesture === g1, bentry);
+r = await req("GET", `/r/${bns}/a/rev/${aIds[1]}/log`);
+check("batch steps in the resource log", r.status === 200 && r.json.length === 3 && r.json[1].id === aIds[0], r.json.map((e) => e.id));
+r = await batch({ items: [
+  { resource: "a", ifMatch: aIds[1], steps: [[{ op: "replace", path: "/n", value: 3 }]] },
+  { resource: "b", ifMatch: a0, steps: [[{ op: "replace", path: "/n", value: 11 }]] },
+] });
+check("a stale item fails the batch with 412", r.status === 412 && r.json.code === "batch" && r.json.items?.length === 1 && r.json.items[0].index === 1, r.json);
+r = await req("GET", `/r/${bns}/a`);
+check("nothing written by a failed batch", r.h.get("location")?.endsWith(aIds[1]), r.h.get("location"));
+r = await batch({ items: [{ resource: "a", ifMatch: aIds[1], steps: [[{ op: "replace", path: "/n", value: 4 }], "delete", [{ op: "replace", path: "/n", value: 5 }]] }] });
+check("append, delete and restore in one item", r.status === 201 && r.json.items[0].ids.length === 3, r.json);
+r = await req("GET", `/r/${bns}/a/rev/${r.json?.items?.[0]?.ids?.[2]}`);
+check("restored document", r.json?.n === 5, r.json);
+r = await req("GET", `/ns/${bns}`);
+const bcfg = r.h.get("x-config-revision");
+r = await batch({ config: { ifMatch: bcfg, patches: [{ op: "add", path: "/x-note", value: "batched" }] }, items: [
+  { resource: "schema-1", ifNoneMatch: "*", steps: [[{ op: "add", path: "", value: { $schema: D, type: "object", required: ["n"] } }]] },
+] });
+check("config change with items", r.status === 201 && r.json.config && r.h.get("x-config-revision") === r.json.config, r.json);
+const schemaRev = `/r/${bns}/schema-1/rev/${r.json.items[0].ids[0]}`;
+r = await batch({ items: [
+  { resource: "schema-2", ifNoneMatch: "*", steps: [[{ op: "add", path: "", value: { $schema: D, type: "object", required: ["m"] } }]] },
+  { resource: "typed", ifNoneMatch: "*", steps: [[{ op: "add", path: "", value: { $schema: schemaRev, n: 1 } }]] },
+] });
+check("typed item in a batch", r.status === 201, r.json);
+const s2 = `/r/${bns}/schema-2/rev/${(await req("GET", `/r/${bns}/schema-2`)).h.get("location")?.split("/").pop()}`;
+r = await batch({ items: [
+  { resource: "schema-3", ifNoneMatch: "*", steps: [[{ op: "add", path: "", value: { $schema: D, type: "object", required: ["q"] } }]] },
+  { resource: "typed-2", ifNoneMatch: "*", steps: [[{ op: "add", path: "", value: { $schema: s2, m: 1 } }]] },
+  { resource: "typed-3", ifNoneMatch: "*", steps: [[{ op: "add", path: "", value: { $schema: s2, x: 1 } }]] },
+] });
+check("an invalid item fails the batch with 422", r.status === 422 && r.json.code === "batch" && r.json.items?.[0]?.index === 2 && r.json.items[0].code === "invalid", r.json);
+r = await req("POST", `/ns/${cat}/batch`, { headers: { "Content-Type": "application/json" }, raw: JSON.stringify({ items: [{ resource: `${ns}.post-2`, ifNoneMatch: "*", steps: [[{ op: "add", path: "", value: { parents: [{ href: `/r/${cat}/season` }, { href: `/r/${cat}/root` }] } }]] }] }) });
+check("a rule failing in a batch 422", r.status === 422 && r.json.items?.[0]?.code === "rule", r.json);
+r = await batch({ items: [{ resource: "a", steps: [["x"]] }] });
+check("item without a precondition 428", r.status === 428, r.status);
+r = await batch({ items: [] });
+check("a batch with neither items nor config 400", r.status === 400, r.status);
 
 console.log(failed ? `\n${failed} failed` : "\nall passed");
 process.exit(failed ? 1 : 0);
