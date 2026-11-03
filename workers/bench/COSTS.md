@@ -47,8 +47,8 @@ inside a Worker is still a Worker request: on Workers, the Worker runs before th
 | Scenario | Per month | Main cost |
 |---|---|---|
 | **Small team CMS**: 50 namespaces, 10,000 saves and 100,000 reads a day (half cached), 2 GB | **$5** | Within the included usage |
-| **Collaborative SaaS**: 5,000 namespaces, 1M saves and 10M reads a day (half cached), 2,000 open documents with 5 followers each, 50 GB | **~$1,150** | Worker and Durable Object requests, $945 |
-| The same behind Workers Cache | **~$800** | Worker requests, $507; a document's followers share one miss |
+| **Collaborative SaaS**: 5,000 namespaces, 1M saves and 10M reads a day (half cached), 2,000 open documents with 5 followers each, 50 GB | **~$1,060** | Worker and Durable Object requests, $945 |
+| The same behind Workers Cache | **~$710** | Worker requests, $507; a document's followers share one miss |
 | The same, with waits inside the object, as first built | ~$9,200 | Durable Object duration, $8,300: each followed namespace is active all month |
 | **Device fleet through the Worker**: 100,000 devices long-polling 10 public namespaces, 100 writes a day | **~$6,200** | Requests: 13 billion polls a month, $5,880 |
 | The same fleet behind Workers Cache (measured collapse) | **~$3,900** | Worker requests, $3,890: cache hits are billed as requests |
