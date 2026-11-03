@@ -48,9 +48,11 @@ inside a Worker is still a Worker request: on Workers, the Worker runs before th
 |---|---|---|
 | **Small team CMS**: 50 namespaces, 10,000 saves and 100,000 reads a day (half cached), 2 GB | **$5** | Within the included usage |
 | **Collaborative SaaS**: 5,000 namespaces, 1M saves and 10M reads a day (half cached), 2,000 open documents with 5 followers each, 50 GB | **~$1,150** | Worker and Durable Object requests, $945 |
+| The same behind Workers Cache | **~$800** | Worker requests, $507; a document's followers share one miss |
 | The same, with waits inside the object, as first built | ~$9,200 | Durable Object duration, $8,300: each followed namespace is active all month |
 | **Device fleet through the Worker**: 100,000 devices long-polling 10 public namespaces, 100 writes a day | **~$6,200** | Requests: 13 billion polls a month, $5,880 |
-| The same fleet, long-poll answered by Cloudflare's CDN | **~$220** | The CDN's misses, per namespace, interval and location (less with Tiered Cache) |
+| The same fleet behind Workers Cache (measured collapse) | **~$3,900** | Worker requests, $3,890: cache hits are billed as requests |
+| The same fleet, cached by a CDN that never runs the Worker (untested) | ~$220 | The CDN's misses |
 | **Write-heavy ingest**: 1,000 namespaces, 10M writes a day, 150 GB added a month | **~$2,200** | Rows written, $2,050 |
 | The same at 4 rows per append | **~$1,300** | Rows written, $1,150 |
 
@@ -66,12 +68,14 @@ inside a Worker is still a Worker request: on Workers, the Worker runs before th
    59.8 s to 0.35 s a minute. Each poll now wakes the object twice (connect and close)
    instead of once, so past about 200 waiters on one namespace, where an always-awake
    object becomes cheaper, further polls wait in the object again.
-2. **Fleets need the spec's CDN-first long-poll in front of the Worker.** §7.7's long-poll
-   URLs are designed to be collapsed by a CDN. On Workers, a cached answer still costs a
-   Worker request, so 100,000 devices polling every 20 s cost ~$6,200 a month in requests.
-   Served by Cloudflare's cache on a route that doesn't run the Worker, with the Worker as
-   origin, the same fleet costs ~$220. That needs a custom domain (the Cache API and cache
-   rules don't apply on `workers.dev`) and is untested.
+2. **Turn on Workers Cache.** §7.7's long-poll URLs are built to be collapsed by a cache,
+   and Workers Cache does it: measured, 100 or 500 followers of one URL cost one miss.
+   That removes nearly all Durable Object and Worker CPU cost of followers. Each poll is
+   still billed as a Worker request, though, so a 100,000-device fleet polling every 20 s
+   costs ~$3,900 a month, nearly all of it requests. Getting below that needs a cache
+   that doesn't bill per request: the zone's own CDN in front of the Worker on another
+   hostname (zone rules this deployment's login couldn't change; untested, ~$220), or a
+   longer interval, which divides the cost.
 3. **Rows written are the cost of writes.** About 7 rows per append, at $1 per million,
    is $7 per million writes: more than everything else a write costs put together (Worker
    and Durable Object requests $0.45 per million, CPU $0.02). Dropping the `resources`

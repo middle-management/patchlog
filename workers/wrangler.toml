@@ -17,3 +17,8 @@ new_sqlite_classes = ["Namespace"]
 [observability]
 enabled = true
 head_sampling_rate = 1
+
+# Workers Cache: a cache in front of the Worker, controlled by the
+# responses' Cache-Control (§9). A hit doesn't run the Worker.
+[cache]
+enabled = true

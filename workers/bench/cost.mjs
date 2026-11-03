@@ -48,16 +48,20 @@ function usage(s) {
   // Each write answers every waiting follower of its namespace, which polls again.
   const wakePolls = (s.followers ?? 0) * (s.writesToFollowedNs ?? 0);
   const polls = followerPolls + wakePolls;
-  const pollsAtObject = s.collapsePolls ? 0 : polls;
+  // Behind Workers Cache, the followers of a namespace collapse into about one
+  // miss per interval and per write (measured: 100 followers, 1 miss).
+  const misses = (s.followedNamespaces ?? 0) * (SECONDS_PER_MONTH / UNIT.pollIntervalS + (s.writesToFollowedNs ?? 0));
+  const pollsAtObject = s.collapsePolls ? 0 : s.workersCache ? misses : polls;
   // Followers per followed namespace decide where polls wait.
-  const perNs = (s.followers ?? 0) / Math.max(1, s.followedNamespaces ?? 1);
+  const perNs = s.workersCache ? 1 : (s.followers ?? 0) / Math.max(1, s.followedNamespaces ?? 1);
   const hibernatingShare = s.waitsInObject ? 0 : Math.min(1, UNIT.hibernatingWaitersMax / Math.max(1, perNs));
   const awakeNamespaces = s.waitsInObject || perNs > UNIT.hibernatingWaitersMax ? (s.followedNamespaces ?? 0) : 0;
   const pollsAtWorker = s.pollsBypassWorker ? 0 : polls;
   const doReads = s.reads * (1 - (s.cachedShare ?? 0));
   return {
     workerRequests: s.writes + s.reads + pollsAtWorker,
-    workerCpuMs: (s.writes + s.reads + pollsAtWorker) * UNIT.workerCpuMs,
+    // Cache hits are billed as Worker requests, but run no code.
+    workerCpuMs: (s.writes + s.reads + (s.workersCache ? misses : pollsAtWorker)) * UNIT.workerCpuMs,
     doRequests:
       s.writes + doReads + pollsAtObject * (1 + hibernatingShare * (UNIT.doRequestsPerPoll - 1)),
     doGbSeconds:
@@ -119,7 +123,19 @@ const SCENARIOS = [
     followers: 100_000, followedNamespaces: 10, writesToFollowedNs: 3_000 / 10,
   },
   {
-    name: "Device fleet, long-poll collapsed by the CDN",
+    name: "Device fleet behind Workers Cache",
+    about: "The same fleet, with Workers Cache on (wrangler.toml [cache]): every poll is still a billed Worker request, but hits run nothing, and each namespace's followers collapse into one miss per interval",
+    writes: 3_000, reads: 0, storedGb: 0.1,
+    followers: 100_000, followedNamespaces: 10, writesToFollowedNs: 3_000 / 10, workersCache: true,
+  },
+  {
+    name: "Collaborative SaaS behind Workers Cache",
+    about: "The collaborative scenario with Workers Cache on: a document's 5 followers share one miss; reads hit the cache as before",
+    writes: 30 * M, reads: 300 * M, cachedShare: 0.5, storedGb: 50,
+    followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2, workersCache: true,
+  },
+  {
+    name: "Device fleet, long-poll collapsed by the CDN without the Worker",
     about: "The same fleet, with §7.7's long-poll URLs on a route Cloudflare's cache serves without running the Worker (the Worker as origin)",
     writes: 3_000, reads: 0, storedGb: 0.1,
     followers: 100_000, followedNamespaces: 10, writesToFollowedNs: 3_000 / 10,

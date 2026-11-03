@@ -158,6 +158,22 @@ object, past the 200-waiter threshold) in 0.66 s. Ending expired waits with one 
 interval instead of the Worker closing each socket was tried and reverted: the object
 still saw a close event per socket, and it used more active time (0.46 s a minute).
 
+**Behind Cloudflare's cache** (Workers Cache, `[cache] enabled = true` in
+`wrangler.toml`, on the custom domain `patchlog.middlemanagement.se`), measured with
+`bench/cdn.mjs` and `bench/idle-followers.mjs`:
+
+| | Result |
+|---|---|
+| Revision reads, 30 in a row | 1 `MISS` (747 ms, the first read of the revision), 29 `HIT` (p50 59 ms, the same as `GET /`) |
+| 100 followers polling one URL, one write | 1 `MISS`, 99 `HIT`; all had the write in 0.22 s (0.49–0.53 s without the cache) |
+| 500 followers, one write | 1 `MISS`, 499 `HIT`; all had the write, p50 1.0 s (client-limited) |
+| 100 idle followers, 3 minutes | 4–9 Worker runs and 6 Durable Object invocations a minute, for ~300 polls a minute (without the cache: 300 and 600) |
+
+The cache collapses concurrent misses on one URL, which is what §7.7's cursor is for: a
+namespace's followers cost about one miss per interval and per write, however many there
+are. Cache hits don't run the Worker but, per Cloudflare's pricing, are still billed as
+Worker requests. `bench/smoke.mjs` passes through the cache.
+
 A client must take the long-poll cursor from the server (`X-Cursor`): with a cursor from
 its own clock, a few seconds behind Cloudflare's, every poll was answered at once.
 

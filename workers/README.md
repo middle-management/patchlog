@@ -64,6 +64,11 @@ npm run build && npm run workerd          # plain workerd on :8788, without wran
 node bench/load.mjs http://127.0.0.1:8788 --pid "$(pgrep -f '^workerd serve bench')"
 ```
 
+Workers Cache is on (`[cache]` in `wrangler.toml`): responses are cached by their
+`Cache-Control` (§9) in front of the Worker, and concurrent long-polls on one URL
+collapse into one miss. Deploy to a custom domain with
+`npx wrangler deploy --domain patchlog.example.com`.
+
 `npm run deploy` deploys with wrangler (`npx wrangler login --device` signs in from a
 headless machine). The Cache API works only on a custom domain, not on `workers.dev`.
 On the Workers free plan, Durable Objects may write 100,000 SQLite rows a day, and an
