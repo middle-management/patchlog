@@ -27,7 +27,11 @@ async fn front(req: Request, env: Env, ctx: Context) -> std::result::Result<Resp
         if req.method() != Method::Get && req.method() != Method::Head {
             return Err(Err::new(405, "bad_input", "method not allowed"));
         }
-        let origin = env.var("ORIGIN").map(|v| v.to_string()).unwrap_or_default();
+        // The canonical origin (§C.3): ORIGIN if the deployment sets it, else the request's.
+        let origin = match env.var("ORIGIN") {
+            Ok(v) => v.to_string(),
+            Err(_) => req.url()?.origin().ascii_serialization(),
+        };
         let h = Headers::new();
         http::cache_headers(&h, http::Class::Short, true)?;
         let body = http::obj(vec![

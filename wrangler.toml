@@ -5,8 +5,6 @@ compatibility_date = "2025-10-01"
 [build]
 command = "worker-build --release crates/worker"
 
-[vars]
-ORIGIN = "https://patchlog.domains-358.workers.dev"
 
 [[durable_objects.bindings]]
 name = "NAMESPACE"

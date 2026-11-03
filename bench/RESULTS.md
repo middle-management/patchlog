@@ -136,8 +136,21 @@ requests, and every write then failed until the daily reset (00:00 UTC). Droppin
 `resources` table (a head is the last entry of its resource) and an index would bring it
 to about 4–5.
 
-Not measured on Cloudflare yet, because the account ran out of rows written: long-poll
-followers.
+**Long-poll followers**, measured later on a second account on Workers Paid
+(`patchlog.robert-cac.workers.dev`):
+
+- **Delivery.** 100 followers of one namespace all had a write 0.5 s after it was sent,
+  including the write's own round trip. Larger counts couldn't be measured from here: past
+  about 1,000 connections, the client's proxy timed out opening them.
+- **Idle cost.** 100 followers polling a namespace nobody wrote to, for 4 minutes: 300
+  Durable Object requests a minute (one per follower per 20-second interval, as §7.7
+  intends), about 0.57 ms of object CPU each, and the object **billed as active for 59.8 s
+  of every minute** (7.66 GB-s a minute). A namespace with a waiting follower is billed
+  all the time, whatever the number of followers: about $4.14 a month. `bench/COSTS.md`
+  has what that means.
+
+A client must take the long-poll cursor from the server (`X-Cursor`): with a cursor from
+its own clock, a few seconds behind Cloudflare's, every poll was answered at once.
 
 ## What it suggests for Cloudflare
 

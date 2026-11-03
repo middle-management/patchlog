@@ -3,7 +3,8 @@
 A from-scratch implementation of [docs/SPEC.md](docs/SPEC.md) (draft v0.74) for Cloudflare
 Workers and Durable Objects. It shares no code with the Go implementation on `main`: this
 branch started from the spec alone, to find out whether the spec fits Workers and what it
-costs there. [bench/RESULTS.md](bench/RESULTS.md) has the measurements.
+costs there. [bench/RESULTS.md](bench/RESULTS.md) has the measurements, locally and on
+Cloudflare, and [bench/COSTS.md](bench/COSTS.md) what they cost by scenario.
 
 **Status: a skeleton.** It implements the core write and read path for one namespace,
 with authentication disabled (§1, `"auth": "disabled"`). Everything else is listed under
