@@ -643,6 +643,7 @@ impl Namespace {
         let limits = rules_head.limits.clone();
         let mut planned: Vec<Planned> = Vec::new();
         let mut item_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut blob_stmts: Vec<Stmt> = Vec::new();
         for (i, it) in req.items.iter().enumerate() {
             let begin = planned.len();
             let Some(st0) = starts[i].take() else {
@@ -683,6 +684,13 @@ impl Namespace {
                                 break;
                             }
                         };
+                        match self.check_blob_refs(&it.resource, &p.doc, author) {
+                            Ok(b) => blob_stmts.extend(b),
+                            Err(e) => {
+                                failed = Some((4, e));
+                                break;
+                            }
+                        }
                         match self.check_typed(ctx, &p.doc) {
                             Ok(Some(remote)) => return Ok(Step::NeedSchemas(remote)),
                             Ok(None) => {}
@@ -870,6 +878,7 @@ impl Namespace {
                 ));
             }
         }
+        stmts.extend(blob_stmts);
         self.commit(stmts)?;
 
         // The caches: each resource's head, and its document if live.

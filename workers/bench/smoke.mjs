@@ -254,5 +254,67 @@ check("item without a precondition 428", r.status === 428, r.status);
 r = await batch({ items: [] });
 check("a batch with neither items nor config 400", r.status === 400, r.status);
 
+// Blobs (§7.8): upload, attach by reference, read, ranges, raw documents.
+import { createHash } from "node:crypto";
+function blobId(type, nonce, bytes) {
+  const d = createHash("sha256").update(`patchlog-blob-v1\n${type}\n${nonce}\n`).update(bytes).digest().subarray(0, 20);
+  const A = "abcdefghijklmnopqrstuvwxyz234567";
+  let s = "1", acc = 0n, bits = 0;
+  for (const b of d) { acc = (acc << 8n) | BigInt(b); bits += 8; while (bits >= 5) { bits -= 5; s += A[Number((acc >> BigInt(bits)) & 31n)]; } }
+  return s;
+}
+const blns = `${ns}-blob`;
+await req("PATCH", `/ns/${blns}`, { body: [{ op: "add", path: "", value: { read: "public" } }], headers: { "Content-Type": "application/json-patch+json", "If-None-Match": "*" } });
+const bytes = Buffer.from("hello, blob world\n".repeat(100));
+const bid = blobId("text/plain", "", bytes);
+const put = (name, id, body, type = "text/plain", headers = {}) => req("PUT", `/r/${blns}/${name}/blob/${id}`, { raw: body, headers: { "Content-Type": type, ...headers } });
+r = await put("doc", bid, Buffer.from("wrong bytes"));
+check("upload with the wrong id 422 blob_mismatch", r.status === 422 && r.json?.code === "blob_mismatch" && r.h.get("x-content-type-options") === "nosniff", r.json);
+r = await put("doc", bid, bytes, "text/plain", { "If-Match": "\"x\"" });
+check("upload with a precondition 428", r.status === 428, r.status);
+r = await put("doc", bid, bytes, "Text/Plain; charset=utf-8");
+check("upload 201 with the blob's ETag", r.status === 201 && r.h.get("etag") === `"${bid}"`, r.json);
+r = await req("GET", `/r/${blns}/doc/blob/${bid}`);
+check("a pending blob isn't served", r.status === 404, r.status);
+const ref = { $blob: bid, type: "text/plain", size: bytes.length };
+r = await req("PATCH", `/r/${blns}/doc`, { body: [{ op: "add", path: "", value: { body: ref } }], headers: { "If-None-Match": "*" } });
+check("a write referencing a pending blob attaches it", r.status === 201, r.json);
+r = await req("PATCH", `/r/${blns}/other`, { body: [{ op: "add", path: "", value: { body: ref } }], headers: { "If-None-Match": "*" } });
+check("another resource can't reference it", r.status === 422 && r.json?.code === "blob", r.json);
+r = await req("PATCH", `/r/${blns}/other`, { body: [{ op: "add", path: "", value: { body: { ...ref, size: 1 } } }], headers: { "If-None-Match": "*" } });
+check("a reference with the wrong size 422 blob", r.status === 422 && r.json?.code === "blob", r.json);
+r = await req("GET", `/r/${blns}/doc/blob/${bid}`);
+check("attached blob served", r.status === 200 && r.text === bytes.toString() && r.h.get("content-type") === "text/plain; charset=utf-8" && r.h.get("content-security-policy") === "sandbox" && /immutable/.test(r.h.get("cache-control") ?? ""), [r.status, r.h.get("content-type"), r.h.get("cache-control")]);
+r = await req("GET", `/r/${blns}/doc/blob/${bid}`, { headers: { Range: "bytes=7-10" } });
+check("range read 206", r.status === 206 && r.text === "blob" && r.h.get("content-range") === `bytes 7-10/${bytes.length}`, [r.status, r.text, r.h.get("content-range")]);
+r = await req("GET", `/r/${blns}/doc/blob/${bid}`, { headers: { Range: `bytes=${bytes.length}-` } });
+check("unsatisfiable range 416", r.status === 416, r.status);
+r = await req("PUT", `/r/${blns}/other/blob/${bid}`, { raw: "", headers: { "Blob-From": `/r/${blns}/doc/blob/${bid}` } });
+check("copy from another resource 201", r.status === 201, r.json);
+r = await req("PATCH", `/r/${blns}/other`, { body: [{ op: "add", path: "", value: { body: ref } }], headers: { "If-None-Match": "*" } });
+check("the copy can be referenced", r.status === 201, r.json);
+const font = Buffer.from([0x77, 0x4f, 0x46, 0x32, 1, 2, 3]);
+const nonce = "abcdefghijklmnopqrstuvwxyz";
+const fid = blobId("font/woff2", nonce, font);
+r = await put("font", fid, font, "font/woff2", { "Blob-Nonce": nonce });
+check("upload with a nonce", r.status === 201, r.json);
+r = await req("PATCH", `/r/${blns}/font`, { body: [{ op: "add", path: "", value: { $blob: fid, type: "font/woff2", size: font.length, nonce } }], headers: { "If-None-Match": "*" } });
+check("a raw document", r.status === 201, r.json);
+r = await req("GET", `/r/${blns}/font/raw`);
+check("raw redirects to the blob", r.status === 302 && r.h.get("location") === `/r/${blns}/font/blob/${fid}`, [r.status, r.h.get("location")]);
+r = await req("GET", `/r/${blns}/doc/raw`);
+check("raw of a non-raw document 404", r.status === 404, r.status);
+r = await req("GET", `/r/${blns}/font/blob/${fid}`);
+check("font served", r.status === 200 && r.h.get("content-type") === "font/woff2" && r.h.get("content-length") === String(font.length), [r.status, r.h.get("content-type")]);
+r = await req("PATCH", `/r/${blns}/bad`, { body: [{ op: "add", path: "", value: { x: { $blob: bid, type: "text/plain" } } }], headers: { "If-None-Match": "*" } });
+check("malformed reference 422 blob", r.status === 422 && r.json?.code === "blob", r.json);
+const b2 = Buffer.from("batched blob");
+const b2id = blobId("text/plain", "", b2);
+await put("batched", b2id, b2);
+r = await req("POST", `/ns/${blns}/batch`, { headers: { "Content-Type": "application/json" }, raw: JSON.stringify({ items: [{ resource: "batched", ifNoneMatch: "*", steps: [[{ op: "add", path: "", value: { f: { $blob: b2id, type: "text/plain", size: b2.length } } }]] }] }) });
+check("a batch attaches a blob", r.status === 201, r.json);
+r = await req("GET", `/r/${blns}/batched/blob/${b2id}`);
+check("batched blob served", r.status === 200 && r.text === "batched blob", r.status);
+
 console.log(failed ? `\n${failed} failed` : "\nall passed");
 process.exit(failed ? 1 : 0);

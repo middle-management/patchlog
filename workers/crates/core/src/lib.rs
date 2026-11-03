@@ -4,6 +4,7 @@
 //! that need no storage (§6.2). No I/O, so it builds natively for tests and
 //! benchmarks and to wasm32 for the Worker.
 
+pub mod blob;
 pub mod fmt;
 pub mod gate;
 pub mod id;

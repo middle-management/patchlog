@@ -67,7 +67,12 @@ async fn front(req: Request, env: Env, ctx: Context) -> std::result::Result<Resp
         _ => return Err(Err::not_found()),
     };
     let url = req.url()?;
-    let cacheable = req.method() == Method::Get && segs.contains(&"rev");
+    // Revisions and blobs are immutable; a range read of a blob goes to the
+    // object, which reads that range from R2.
+    let cacheable = req.method() == Method::Get
+        && (segs.contains(&"rev") || (segs.len() == 5 && segs[3] == "blob"))
+        && !segs.ends_with(&["raw"])
+        && req.headers().get("Range")?.is_none();
     let cache = Cache::default();
     if cacheable {
         // A deployment without a cache (plain workerd) just misses.

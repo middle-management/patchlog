@@ -10,6 +10,11 @@ command = "worker-build --release crates/worker"
 name = "NAMESPACE"
 class_name = "Namespace"
 
+# Blob bytes (§7.8), stored once per id under b/{id}.
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "patchlog-blobs"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Namespace"]

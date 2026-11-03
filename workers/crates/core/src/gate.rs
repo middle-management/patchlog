@@ -152,12 +152,6 @@ pub fn apply_and_check(
     let m = measure(&doc, limits);
     m.check(limits)
         .map_err(|err| GateError::Limit { status: 422, err })?;
-    if m.blob_refs > 0 {
-        // No blob is available to any resource yet (§7.8 isn't implemented).
-        return Err(GateError::Blob(
-            "the document references a blob that isn't available".into(),
-        ));
-    }
     Ok(Prepared {
         id: revision_id(parent, &body.canonical),
         doc,
@@ -212,13 +206,11 @@ mod tests {
         )
         .unwrap();
         apply_and_check(None, doc.clone(), &b, WriteKind::Append, &l).unwrap();
-        // Blob references and $schema.
+        // Blob references are counted here; whether they are well formed
+        // and available is the caller's check (blob::refs, §7.8).
         let b = read_body(br#"[{"op":"add","path":"/f","value":{"$blob":"x"}}]"#, &l).unwrap();
         let d = Limits::default();
-        assert!(matches!(
-            apply_and_check(None, doc.clone(), &b, WriteKind::Append, &d),
-            Err(GateError::Blob(_))
-        ));
+        apply_and_check(None, doc.clone(), &b, WriteKind::Append, &d).unwrap();
         // Not I-JSON.
         assert!(matches!(
             read_body(br#"[{"op":"add","op":"x"}]"#, &l),

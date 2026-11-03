@@ -24,6 +24,7 @@ use worker::wasm_bindgen_futures::JsFuture;
 use worker::*;
 
 mod batch;
+mod blob;
 
 use crate::http::{self, cache_headers, obj, quoted, s, tags, Class, Err, Precondition, Res};
 
@@ -56,6 +57,8 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS res_log_by_undoes ON res_log(undoes, seq) WHERE undoes IS NOT NULL",
     // A canonical document every SNAPSHOT_EVERY entries of a resource.
     "CREATE TABLE IF NOT EXISTS res_snapshots (resource TEXT NOT NULL, seq INTEGER NOT NULL, doc TEXT NOT NULL, PRIMARY KEY (resource, seq)) WITHOUT ROWID",
+    // Blob attachments and pending uploads (§7.8); see `ns/blob.rs`.
+    blob::SCHEMA,
 ];
 
 /// Long-polls that wait on hibernatable WebSockets before the rest wait in
@@ -558,6 +561,22 @@ impl Namespace {
                 Method::Delete => self.delete_resource(&ctx, name, req.headers()),
                 _ => Err(Err::new(405, "bad_input", "method not allowed")),
             },
+            ("r", [name, "blob", bid]) => match m {
+                Method::Put => self.put_blob(&ctx, name, bid, &mut req).await,
+                Method::Get | Method::Head => {
+                    http::query(&url, &[])?;
+                    self.get_blob(&ctx, name, bid, req.headers()).await
+                }
+                _ => Err(Err::new(405, "bad_input", "method not allowed")),
+            },
+            ("r", [name, "raw"]) if m == Method::Get || m == Method::Head => {
+                http::query(&url, &[])?;
+                self.get_raw(&ctx, name, None)
+            }
+            ("r", [name, "rev", id, "raw"]) if m == Method::Get || m == Method::Head => {
+                http::query(&url, &[])?;
+                self.get_raw(&ctx, name, Some(id))
+            }
             ("r", [name, "rev", id]) if m == Method::Get || m == Method::Head => {
                 http::query(&url, &[])?;
                 self.get_rev(&ctx, name, id, req.headers()).await
@@ -1325,6 +1344,8 @@ impl Namespace {
         };
         let p = gate::apply_and_check(parent.as_ref(), doc, &body, kind, &ns.limits)
             .map_err(gate_err)?;
+        // Step 4, blob references: each available to the resource.
+        let blob_stmts = self.check_blob_refs(name, &p.doc, &author)?;
         // Step 5: the resulting document against its schema.
         if let Some(remote) = self.check_typed(ctx, &p.doc)? {
             return Ok(Step::NeedSchemas(remote));
@@ -1374,6 +1395,7 @@ impl Namespace {
                 vec![name.into(), seq.into(), canonical_string(&p.doc).into()],
             ));
         }
+        stmts.extend(blob_stmts);
         self.commit(stmts)?;
         self.remember(
             name,
