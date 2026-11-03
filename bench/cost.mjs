@@ -28,6 +28,16 @@ const UNIT = {
   bytesPerWrite: 512, // local SQLite, 0.5 KiB documents, snapshots every 16 entries
   pollIntervalS: 20, // §7.7's default interval
   objectGb: 0.128, // duration is billed at 128 MB per object: 7.66 GB-s per active minute measured
+  // Long-poll as built: the wait is held in the front Worker, on a hibernatable
+  // WebSocket to the object. Measured with 100 idle followers: 600 object
+  // invocations a minute for 300 polls (the socket's connect and its close
+  // event; a close may be billed as an incoming WebSocket message, at 1/20,
+  // but is counted here as a request) and 0.35 s of activity a minute.
+  doRequestsPerPoll: 2,
+  activeMsPerPoll: 1.2,
+  // Past this many waiters on a namespace, further polls wait in the object,
+  // which then stays awake (HIBERNATING_WAITERS_MAX in ns.rs).
+  hibernatingWaitersMax: 200,
 };
 
 const SECONDS_PER_MONTH = 30 * 24 * 3600;
@@ -39,17 +49,23 @@ function usage(s) {
   const wakePolls = (s.followers ?? 0) * (s.writesToFollowedNs ?? 0);
   const polls = followerPolls + wakePolls;
   const pollsAtObject = s.collapsePolls ? 0 : polls;
+  // Followers per followed namespace decide where polls wait.
+  const perNs = (s.followers ?? 0) / Math.max(1, s.followedNamespaces ?? 1);
+  const hibernatingShare = s.waitsInObject ? 0 : Math.min(1, UNIT.hibernatingWaitersMax / Math.max(1, perNs));
+  const awakeNamespaces = s.waitsInObject || perNs > UNIT.hibernatingWaitersMax ? (s.followedNamespaces ?? 0) : 0;
   const pollsAtWorker = s.pollsBypassWorker ? 0 : polls;
   const doReads = s.reads * (1 - (s.cachedShare ?? 0));
   return {
     workerRequests: s.writes + s.reads + pollsAtWorker,
     workerCpuMs: (s.writes + s.reads + pollsAtWorker) * UNIT.workerCpuMs,
-    doRequests: s.writes + doReads + pollsAtObject,
+    doRequests:
+      s.writes + doReads + pollsAtObject * (1 + hibernatingShare * (UNIT.doRequestsPerPoll - 1)),
     doGbSeconds:
       UNIT.objectGb *
       ((s.writes * (busy ? UNIT.activeMsPerWriteBusy : UNIT.activeMsPerWriteSparse) + doReads * UNIT.activeMsPerRead) / 1000 +
-        // An object with a waiting follower is active all month (measured: 59.8 s of every minute).
-        (s.followedNamespaces ?? 0) * SECONDS_PER_MONTH),
+        // Waits held inside an object keep it active all month (measured: 59.8 s of every minute).
+        awakeNamespaces * SECONDS_PER_MONTH +
+        (awakeNamespaces ? 0 : (pollsAtObject * UNIT.activeMsPerPoll) / 1000)),
     rowsRead: s.writes * UNIT.rowsReadPerWrite + doReads * UNIT.rowsReadPerRead,
     rowsWritten: s.writes * (s.rowsWrittenPerWrite ?? UNIT.rowsWrittenPerWrite),
     storageGbMonth: s.storedGb ?? 0,
@@ -85,14 +101,20 @@ const SCENARIOS = [
     followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2,
   },
   {
-    name: "Collaborative SaaS, waits held without keeping objects awake",
-    about: "The same, if each long-poll waited in the front Worker on a hibernatable WebSocket to the object instead of inside it (not built yet): the object isn't billed for duration while followers wait",
+    name: "Collaborative SaaS, waits inside the object (before e4120ec)",
+    about: "The same, with long-polls waiting inside the namespace's object, as first built: an object with a waiting follower is billed all month",
     writes: 30 * M, reads: 300 * M, cachedShare: 0.5, storedGb: 50,
-    followers: 10_000, followedNamespaces: 0, writesToFollowedNs: 30 * M / 2_000 / 2,
+    followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2, waitsInObject: true,
+  },
+  {
+    name: "Device fleet, long-poll through the Worker, all waits inside the object (before e4120ec)",
+    about: "The same fleet as below, as first built",
+    writes: 3_000, reads: 0, storedGb: 0.1,
+    followers: 100_000, followedNamespaces: 10, writesToFollowedNs: 3_000 / 10, waitsInObject: true,
   },
   {
     name: "Device fleet, long-poll through the Worker",
-    about: "100,000 devices each long-polling one of 10 public namespaces; 100 writes a day; polls answered by the Worker and the object",
+    about: "100,000 devices each long-polling one of 10 public namespaces; 100 writes a day; polls answered by the Worker and the object (200 waiters a namespace hibernating, the rest waiting in the object)",
     writes: 3_000, reads: 0, storedGb: 0.1,
     followers: 100_000, followedNamespaces: 10, writesToFollowedNs: 3_000 / 10,
   },

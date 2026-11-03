@@ -36,8 +36,12 @@ with authentication disabled (§1, `"auth": "disabled"`). Everything else is lis
 - **`documentSize` is capped at 1.5 MiB** (the default is 1 MiB, as in §12.2). A SQLite
   value in a Durable Object can't exceed 2 MB, and a 4 MiB maximum would need snapshots
   split across rows.
-- **Long-poll (§7.7)**: waiters hold a shared promise, which the next write resolves.
-  Otherwise they time out at the interval boundary.
+- **Long-poll (§7.7)** waits in the front Worker, not in the namespace's object, which would
+  keep the object awake and billed. The Worker opens a WebSocket to the object; the object
+  answers at once when it can, and otherwise accepts the socket with the hibernation API
+  and can sleep until the next write, when it sends the answer down every waiting socket.
+  The Worker answers `204` at the interval's end. Past 200 waiters on a namespace, further
+  polls wait in the object itself, which is cheaper there (`bench/COSTS.md`).
 - **Caching (§9)**: responses carry the spec's `Cache-Control` and `Cache-Tag`. The front
   Worker serves immutable public responses from the Cache API and answers
   `If-None-Match` itself. Private namespaces are `CDN-Cache-Control: no-store`, since

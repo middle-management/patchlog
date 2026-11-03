@@ -149,6 +149,15 @@ to about 4–5.
   all the time, whatever the number of followers: about $4.14 a month. `bench/COSTS.md`
   has what that means.
 
+**Long-poll on hibernating WebSockets** (commit e4120ec and after): the front Worker holds
+each poll and waits on a WebSocket the object accepts with the hibernation API. The same
+4-minute test with 100 idle followers: the object active **0.35 s a minute** (0.045 GB-s,
+from 59.8 s and 7.66 GB-s), 600 invocations a minute (each poll's connect and close).
+Delivery is unchanged: 100 followers had a write in 0.49–0.53 s, 250 (some waiting in the
+object, past the 200-waiter threshold) in 0.66 s. Ending expired waits with one alarm per
+interval instead of the Worker closing each socket was tried and reverted: the object
+still saw a close event per socket, and it used more active time (0.46 s a minute).
+
 A client must take the long-poll cursor from the server (`X-Cursor`): with a cursor from
 its own clock, a few seconds behind Cloudflare's, every poll was answered at once.
 
