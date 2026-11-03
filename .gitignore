@@ -1,0 +1,5 @@
+target/
+node_modules/
+crates/worker/build/
+.wrangler/
+crates/worker/.wrangler/

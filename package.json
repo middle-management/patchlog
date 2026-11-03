@@ -1,0 +1,14 @@
+{
+  "name": "patchlog-workers",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "smoke": "node bench/smoke.mjs",
+    "bench": "node bench/load.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.156.2"
+  }
+}
