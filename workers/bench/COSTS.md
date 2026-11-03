@@ -44,6 +44,16 @@ inside a Worker is still a Worker request: on Workers, the Worker runs before th
 
 ## Scenarios
 
+The scenarios are illustrations, not requirements from the spec. The **device fleet** is a
+mostly idle, read-only fleet:
+
+- 100,000 devices, each long-polling one of 10 public namespaces (about 10,000 followers a
+  namespace);
+- 100 writes a day across those namespaces, so nearly every poll ends in a `204`;
+- one poll per device every 20 seconds, the spec's default interval (§7.7): 3 a minute, about
+  13 billion a month;
+- about 500 bytes per answer, about 6.5 TB a month.
+
 | Scenario | Per month | Main cost |
 |---|---|---|
 | **Small team CMS**: 50 namespaces, 10,000 saves and 100,000 reads a day (half cached), 2 GB | **$5** | Within the included usage |
