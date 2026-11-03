@@ -80,6 +80,36 @@ export async function save(base, ns, name, state, patches, opts = {}) {
   }
 }
 
+/**
+ * Lists the heads as of namespace revision `rev` (§7.4) whose names start
+ * with `prefix`, following pages. `/heads` takes only `after` (§7), but
+ * names come in byte order, so starting after the prefix less its last
+ * character reaches the first match, and the first name past the prefix
+ * ends the listing. Yields `{ resource, kind, target, … }`.
+ */
+export async function* listHeads(base, ns, rev, { prefix = "", fetch: f = fetch } = {}) {
+  // Every name with the prefix sorts after any proper prefix of it.
+  let after = prefix.slice(0, -1);
+  for (;;) {
+    const r = await f(`${base}/ns/${ns}/rev/${rev}/heads?after=${encodeURIComponent(after)}`);
+    if (!r.ok) throw await problem(r);
+    const page = await r.json();
+    for (const h of page.heads) {
+      if (h.resource.startsWith(prefix)) yield h;
+      else if (h.resource > prefix) return;
+    }
+    if (!page.next) return;
+    after = page.next;
+  }
+}
+
+/** The namespace's current revision: `X-Namespace-Revision` of `GET /ns/{ns}`. */
+export async function namespaceRevision(base, ns, { fetch: f = fetch } = {}) {
+  const r = await f(`${base}/ns/${ns}`, { redirect: "manual" });
+  if (r.status !== 302 && !r.ok) throw await problem(r);
+  return unquote(r.headers.get("etag"));
+}
+
 function unquote(etag) {
   return etag?.replace(/^W\//, "").replace(/^"|"$/g, "") ?? null;
 }

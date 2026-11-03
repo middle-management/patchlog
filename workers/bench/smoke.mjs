@@ -5,7 +5,7 @@
 // long-poll that a write wakes.
 
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
-import { load, save } from "../client/patchlog.mjs";
+import { load, save, listHeads } from "../client/patchlog.mjs";
 
 if (process.env.HTTPS_PROXY) setGlobalDispatcher(new EnvHttpProxyAgent());
 
@@ -36,8 +36,8 @@ check("create namespace 201", r.status === 201, r);
 const config = r.h.get("x-config-revision");
 r = await req("PATCH", `/ns/${ns}`, { body: [{ op: "add", path: "", value: {} }], headers: { "If-None-Match": "*" } });
 check("namespace name taken 412", r.status === 412, r);
-r = await req("PATCH", `/ns/${ns}`, { body: [{ op: "add", path: "/keys", value: [] }], headers: { "If-Match": `"${config}"` } });
-check("unimplemented member 422", r.status === 422 && r.json.errors?.[0]?.pointer === "/keys", r.json);
+r = await req("PATCH", `/ns/${ns}`, { body: [{ op: "add", path: "/retention", value: {} }], headers: { "If-Match": `"${config}"` } });
+check("unimplemented member 422", r.status === 422 && r.json.errors?.[0]?.pointer === "/retention", r.json);
 
 r = await req("PATCH", `/r/${ns}/derby`, { body: p1 });
 check("no precondition 428", r.status === 428, r);
@@ -188,7 +188,16 @@ check("log of a resource with no entries 404", r.status === 404, r.status);
   const first = await req("GET", `/r/${cat}/season/log?since=&live=long-poll`);
   const since = first.h.get("x-revision"), cur = first.h.get("x-cursor");
   check("resource long-poll answers at once with entries", first.status === 200 && first.json.length === 1 && !!since, [first.status, first.json]);
-  const poll = req("GET", `/r/${cat}/season/log?since=${since}&live=long-poll&cursor=${cur}`);
+  // Polls again on a 204: the interval may roll over first (§7.7).
+  const poll = (async () => {
+    let c = cur, p;
+    for (let i = 0; i < 3; i++) {
+      p = await req("GET", `/r/${cat}/season/log?since=${since}&live=long-poll&cursor=${c}`);
+      if (p.status !== 204) return p;
+      c = p.h.get("x-cursor");
+    }
+    return p;
+  })();
   await new Promise((res) => setTimeout(res, 300));
   await req("PATCH", `/r/${cat}/season`, { body: [{ op: "replace", path: "/title", value: "Season 2026" }], headers: { "If-Match": `"${since}"` } });
   const woke = await poll;
@@ -492,6 +501,22 @@ check("a namespace can't be created with base 422", r.status === 422, r.json);
   let err;
   try { await save(base, cn, "page", loaded, [{ op: "test", path: "/body", value: "x" }, { op: "replace", path: "/body", value: "mine" }], { author: "studio" }); } catch (e) { err = e; }
   check("a test op stops a rebase onto changed data with 422", err?.status === 422, err?.body);
+}
+
+// Listing heads by prefix with `after` alone (§7.4), as the client does.
+{
+  const pn = `${ns}-prefix`;
+  await req("PATCH", `/ns/${pn}`, { body: [{ op: "add", path: "", value: { read: "public" } }], headers: { "If-None-Match": "*" } });
+  let at;
+  for (const n of ["canvas", "canvas-x", "canvas.a", "canvas.b", "canvas.c", "canvasz", "other"]) {
+    r = await req("PATCH", `/r/${pn}/${n}`, { body: [{ op: "add", path: "", value: { n } }], headers: { "If-None-Match": "*" } });
+    at = r.h.get("x-namespace-revision");
+  }
+  const names = [];
+  for await (const h of listHeads(base, pn, at, { prefix: "canvas." })) names.push(h.resource);
+  check("heads by prefix", JSON.stringify(names) === JSON.stringify(["canvas.a", "canvas.b", "canvas.c"]), names);
+  r = await req("GET", `/ns/${pn}/rev/${at}/heads?prefix=canvas.`);
+  check("heads takes only after (§7)", r.status === 400, r.status);
 }
 
 console.log(failed ? `\n${failed} failed` : "\nall passed");
