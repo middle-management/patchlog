@@ -460,9 +460,26 @@ impl Namespace {
                 }
             }
         }
+        let names: Vec<&str> = req.items.iter().map(|it| it.resource.as_str()).collect();
+        self.prefetch(&names).await?;
+        let mut source_blobs = HashMap::new();
+        if let Some(src) = &req.source {
+            if let (None, Some(sns), Some(at)) = (
+                src.get("origin"),
+                src.get("ns").and_then(Value::as_str),
+                src.get("at").and_then(Value::as_str),
+            ) {
+                if sns != ctx.ns {
+                    source_blobs = self.load_source_blobs(sns, at, &names).await?;
+                }
+            }
+        }
         for _ in 0..4 {
+            // Set and cleared with no await between, so no other request sees them.
+            *self.extra_blobs.borrow_mut() = source_blobs.clone();
             let step = self.batch_sync(ctx, &req, &author, dry);
             self.pending_schemas.borrow_mut().clear();
+            self.extra_blobs.borrow_mut().clear();
             match step? {
                 Step::Done(r) => return Ok(r),
                 Step::NeedSchemas(paths) => {
@@ -511,7 +528,7 @@ impl Namespace {
         }
         let mut starts: Vec<Option<Start>> = Vec::new();
         for (i, it) in req.items.iter().enumerate() {
-            let cur = self.resource(&it.resource)?;
+            let (cur, foreign) = self.head_or_foreign(&it.resource)?;
             let fail = |err: Err| Failure {
                 index: i,
                 step: 2,
@@ -567,7 +584,8 @@ impl Namespace {
                 (Precondition::Match(_), Some(h)) => {
                     let live = match h.live {
                         Some(l) => Some(self.doc_at(&it.resource, l, false)?),
-                        None => None,
+                        // In a branch, the base's document (§7.6 First write).
+                        None => foreign.as_ref().and_then(|f| f.doc.clone()),
                     };
                     let tombstoned = h.kind == TOMBSTONE;
                     Ok(Start {
@@ -761,7 +779,9 @@ impl Namespace {
                             parent: Some(parent),
                             kind: TOMBSTONE,
                             patches: None,
-                            doc: None,
+                            // Deleting a resource read through keeps the base's
+                            // document here, as a snapshot, for a restore.
+                            doc: (depth == 0).then(|| deleted.clone()),
                             doc_size: 0,
                             depth,
                             gesture: st.gesture.clone(),
@@ -890,7 +910,10 @@ impl Namespace {
             let live_k = range.clone().rev().find(|&k| planned[k].kind == REV);
             let live = match live_k {
                 Some(k) => Some(start + k as i64),
-                None => self.resource(&last.resource)?.and_then(|h| h.live),
+                None => {
+                    self.inner.borrow_mut().heads.remove(&last.resource);
+                    self.resource(&last.resource)?.and_then(|h| h.live)
+                }
             };
             let seq = start + last_k as i64;
             self.remember(

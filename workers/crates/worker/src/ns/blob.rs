@@ -83,6 +83,15 @@ impl Namespace {
                 .find(|x| x.uploader.is_empty())
                 .or_else(|| rows.first());
             let Some(row) = row else {
+                // In a branch, a base's blob in the resource's history; in a
+                // batch, one its local source makes available (§7.8).
+                if self.available_elsewhere(name, &r) {
+                    stmts.push((
+                        "INSERT OR IGNORE INTO res_blobs (resource, bid, uploader, type, nonce, size, created) VALUES (?, ?, '', ?, ?, ?, ?)",
+                        vec![name.into(), r.bid.text().into(), r.media_type.clone().into(), r.nonce.clone().into(), (r.size as i64).into(), (Date::now().as_millis() as i64).into()],
+                    ));
+                    continue;
+                }
                 return Err(Err::new(
                     422,
                     "blob",
@@ -112,6 +121,16 @@ impl Namespace {
             }
         }
         Ok(stmts)
+    }
+
+    fn available_elsewhere(&self, name: &str, r: &BlobRef) -> bool {
+        let same = |b: &BlobRef| b == r;
+        self.view(name).is_some_and(|f| f.blobs.iter().any(same))
+            || self
+                .extra_blobs
+                .borrow()
+                .get(name)
+                .is_some_and(|v| v.iter().any(same))
     }
 
     /// `PUT /r/{ns}/{name}/blob/{bid}`, in the order of checks §7.8 gives.
@@ -354,6 +373,17 @@ impl Namespace {
             vec![name.into(), bid.text().into()],
         )?;
         // Pending and unknown blobs are 404.
+        // A resource read through serves its base's blobs (§7.6 History).
+        let row = row.or_else(|| {
+            self.view(name).and_then(|f| {
+                f.blobs.iter().find(|b| b.bid == bid).map(|b| BlobRow {
+                    uploader: String::new(),
+                    media_type: b.media_type.clone(),
+                    nonce: b.nonce.clone(),
+                    size: b.size as i64,
+                })
+            })
+        });
         let Some(row) = row else {
             return Err(Err::not_found());
         };
@@ -426,7 +456,15 @@ impl Namespace {
                 )
             }
             None => {
-                let head = self.resource(name)?.ok_or_else(Err::not_found)?;
+                let Some(head) = self.resource(name)? else {
+                    // A resource read through in a branch (§7.6).
+                    let f = self.view(name).ok_or_else(Err::not_found)?;
+                    if f.kind == TOMBSTONE {
+                        return Err(Err::new(410, "gone", "the resource is deleted"));
+                    }
+                    let doc = f.doc.clone().unwrap_or(Value::Null);
+                    return self.raw_redirect(ctx, &ns, name, &doc, Class::HeadPointer);
+                };
                 (self.entry_by_seq(name, head.seq)?, Class::HeadPointer)
             }
         };
@@ -434,7 +472,18 @@ impl Namespace {
             return Err(Err::new(410, "gone", "the resource is deleted").class(class));
         }
         let doc = self.doc_at(name, entry.seq, false)?;
-        let Some(BlobRef { bid, .. }) = blob::raw(&doc) else {
+        self.raw_redirect(ctx, &ns, name, &doc, class)
+    }
+
+    fn raw_redirect(
+        &self,
+        ctx: &Ctx,
+        ns: &NsHead,
+        name: &str,
+        doc: &Value,
+        class: Class,
+    ) -> Res<Response> {
+        let Some(BlobRef { bid, .. }) = blob::raw(doc) else {
             return Err(Err::not_found().with("message", s("not a raw document")));
         };
         let hd = Headers::new();

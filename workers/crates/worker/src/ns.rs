@@ -25,6 +25,7 @@ use worker::*;
 
 mod batch;
 mod blob;
+mod branch;
 
 use crate::http::{self, cache_headers, obj, quoted, s, tags, Class, Err, Precondition, Res};
 
@@ -189,6 +190,12 @@ pub struct Namespace {
     /// Schema revisions written by earlier items of the batch being checked
     /// (§7.5): seen only by that batch, never cached.
     pending_schemas: RefCell<HashMap<String, Value>>,
+    /// In a branch, resources as the bases saw them at `at` (§7.6); fixed,
+    /// so kept for good. `None`: absent then.
+    foreign: RefCell<HashMap<String, Option<std::rc::Rc<branch::Foreign>>>>,
+    /// Blobs a batch's local `source` makes available, by resource (§7.8),
+    /// for that batch only.
+    extra_blobs: RefCell<HashMap<String, Vec<patchlog_core::blob::BlobRef>>>,
 }
 
 const SCHEMAS_CACHED: usize = 1024;
@@ -246,6 +253,8 @@ impl DurableObject for Namespace {
             schemas: RefCell::new(HashMap::new()),
             validators: RefCell::new(HashMap::new()),
             pending_schemas: RefCell::new(HashMap::new()),
+            foreign: RefCell::new(HashMap::new()),
+            extra_blobs: RefCell::new(HashMap::new()),
         }
     }
 
@@ -277,7 +286,7 @@ impl DurableObject for Namespace {
 impl Namespace {
     fn ensure_schema(&self) -> Res<()> {
         if !self.schema_ready.get() {
-            for q in SCHEMA {
+            for q in SCHEMA.iter().chain(branch::SCHEMA) {
                 self.sql.exec(q, None)?;
             }
             self.schema_ready.set(true);
@@ -503,6 +512,10 @@ impl Namespace {
             now: Date::now().as_millis() as i64,
         };
         let m = req.method();
+        // A branch reads resources without entries of its own through its base.
+        if segs[0] == "r" && segs.len() > 2 {
+            self.prefetch(&[segs[2]]).await?;
+        }
         match (segs[0], &segs[2..]) {
             ("ns", []) => match m {
                 Method::Get | Method::Head => {
@@ -511,7 +524,10 @@ impl Namespace {
                 }
                 Method::Patch => {
                     let body = req.bytes().await?;
-                    self.write_config(&ctx, req.headers(), &body)
+                    let before = self.freeze_state()?;
+                    let r = self.write_config(&ctx, req.headers(), &body)?;
+                    self.report_to_base(&ctx, before).await?;
+                    Ok(r)
                 }
                 _ => Err(Err::new(405, "bad_input", "method not allowed")),
             },
@@ -526,6 +542,7 @@ impl Namespace {
             ("ns", ["rev", id, "heads"]) if m == Method::Get => {
                 let q = http::query(&url, &["after"])?;
                 self.get_heads(&ctx, id, q.get("after").map(String::as_str).unwrap_or(""))
+                    .await
             }
             ("ns", ["gestures", gesture]) if m == Method::Get => {
                 let q = http::query(&url, &["after"])?;
@@ -539,8 +556,40 @@ impl Namespace {
                     Some(_) => return Err(Err::bad("dry-run takes only 1")),
                 };
                 let body = req.bytes().await?;
-                self.post_batch(&ctx, req.headers(), &body, dry).await
+                let before = self.freeze_state()?;
+                let r = self.post_batch(&ctx, req.headers(), &body, dry).await?;
+                self.report_to_base(&ctx, before).await?;
+                Ok(r)
             }
+            ("ns", ["branches"]) => match m {
+                Method::Post => {
+                    let body = req.bytes().await?;
+                    self.create_branch(&ctx, req.headers(), &body).await
+                }
+                Method::Get | Method::Head => {
+                    http::query(&url, &[])?;
+                    self.get_branches(&ctx)
+                }
+                _ => Err(Err::new(405, "bad_input", "method not allowed")),
+            },
+            // Internal requests from other namespaces' objects; the front
+            // Worker forwards only /r/… and /ns/… (§7.6).
+            ("internal", ["init"]) => {
+                let body = req.bytes().await?;
+                self.init_branch(&ctx, &body)
+            }
+            ("internal", ["branch-state"]) => {
+                let body = req.bytes().await?;
+                self.branch_state(&body)
+            }
+            ("internal", ["view", at, name]) => {
+                let v = self.view_at(at, name).await?;
+                http::json(200, Headers::new(), &v)
+            }
+            ("internal", ["rev", at, name, id]) => match self.rev_at(at, name, id).await? {
+                Some(v) => http::json(200, Headers::new(), &v),
+                None => Err(Err::not_found()),
+            },
             ("ns", ["log"]) if m == Method::Get => {
                 let q = http::query(&url, &["since", "live", "cursor"])?;
                 let upgrade = req
@@ -974,6 +1023,7 @@ impl Namespace {
         };
         let ops =
             parse_patch_set(&body.value).map_err(|e| Err::new(422, "invalid", e.to_string()))?;
+        let prev_doc = parent_doc.clone();
         let mut doc = parent_doc;
         let writes = apply(&mut doc, &ops).map_err(|e| Err::new(422, "invalid", e.to_string()))?;
         if parent_id.is_none() && writes.is_empty() {
@@ -988,6 +1038,8 @@ impl Namespace {
             ));
         }
         validate_config(&doc)?;
+        let base_public = self.meta("base_public")?.is_none_or(|v| v == "1");
+        branch::check_branch_fields(&prev_doc, &doc, false, base_public)?;
         let new_limits = Limits::from_config(&doc);
         measure(&doc, &new_limits)
             .check(&new_limits)
@@ -1023,15 +1075,17 @@ impl Namespace {
                 // The last live revision: the head, or for a tombstone the
                 // newest revision before it.
                 let live = if n.kind == TOMBSTONE {
+                    // A branch's tombstone over a foreign parent keeps the
+                    // deleted document as a snapshot at its own seq.
                     #[derive(Deserialize)]
                     struct Seq {
-                        seq: i64,
+                        seq: Option<i64>,
                     }
                     self.one::<Seq>(
-                        "SELECT seq FROM res_log WHERE resource = ? AND kind = 0 ORDER BY seq DESC LIMIT 1",
+                        "SELECT MAX(seq) AS seq FROM (SELECT seq FROM res_log WHERE resource = ?1 AND kind = 0 UNION ALL SELECT seq FROM res_snapshots WHERE resource = ?1)",
                         vec![name.into()],
                     )?
-                    .map(|r| r.seq)
+                    .and_then(|r| r.seq)
                 } else {
                     Some(n.seq)
                 };
@@ -1046,6 +1100,29 @@ impl Namespace {
         };
         self.remember(name, h.clone());
         Ok(h)
+    }
+
+    /// The resource's own head, or in a branch, for a resource without
+    /// entries here, the base's head as of `at` (§7.6 First write) with
+    /// depth -1, so the first entry here has depth 0 and is snapshotted.
+    fn head_or_foreign(
+        &self,
+        name: &str,
+    ) -> Res<(Option<Head>, Option<std::rc::Rc<branch::Foreign>>)> {
+        if let Some(h) = self.resource(name)? {
+            return Ok((Some(h), None));
+        }
+        let Some(f) = self.view(name) else {
+            return Ok((None, None));
+        };
+        let h = Head {
+            seq: -1,
+            id: f.id.text(),
+            kind: f.kind,
+            depth: -1,
+            live: None,
+        };
+        Ok((Some(h), Some(f)))
     }
 
     fn remember(&self, name: &str, h: Option<Head>) {
@@ -1277,7 +1354,7 @@ impl Namespace {
         let author = author(hd)?;
         let body: Body = gate::read_body(raw, &Limits::deployment_max()).map_err(gate_err)?;
         let ns = self.existing()?;
-        let cur = self.resource(name)?;
+        let (cur, foreign) = self.head_or_foreign(name)?;
         // Step 2.1: idempotent retry.
         let parent = match &pre {
             Precondition::Match(p) => Some(*p),
@@ -1333,6 +1410,15 @@ impl Namespace {
         // Step 3: the parent's document.
         let (doc, depth) = match (&kind, &cur) {
             (WriteKind::Create, _) => (Value::Null, 0),
+            // A first write in a branch builds on the base's document; its
+            // entry is snapshotted (depth 0), having no parent here.
+            (_, Some(_)) if foreign.is_some() => (
+                foreign
+                    .as_ref()
+                    .and_then(|f| f.doc.clone())
+                    .unwrap_or(Value::Null),
+                0,
+            ),
             (WriteKind::Append, Some(e)) => (self.doc_at(name, e.seq, true)?, e.depth + 1),
             (WriteKind::Restore, Some(e)) => {
                 let live = e.live.ok_or_else(|| {
@@ -1449,7 +1535,7 @@ impl Namespace {
         };
         let ns = self.existing()?;
         let tomb = tombstone_id(&parent);
-        let cur = self.resource(name)?;
+        let (cur, foreign) = self.head_or_foreign(name)?;
         if cur.as_ref().is_some_and(|h| h.id != parent.text()) {
             if let Some(e) = self.entry_by_id(name, &tomb)? {
                 if e.author == author {
@@ -1470,11 +1556,15 @@ impl Namespace {
             return Err(Err::new(412, "stale", "the head moved").with("head", s(head.id)));
         }
         // Step 6: rules see the document being deleted, with no writes (§6.4.1).
-        if ns.rules.is_some() {
-            let doc = self.doc_at(name, head.seq, false)?;
+        let deleted = match &foreign {
+            Some(f) => Some(f.doc.clone().unwrap_or(Value::Null)),
+            None if ns.rules.is_some() => Some(self.doc_at(name, head.seq, false)?),
+            None => None,
+        };
+        if let (true, Some(doc)) = (ns.rules.is_some(), &deleted) {
             check_rules(
                 &ns,
-                &envelope(ctx, "delete", name, &[], &doc, &Value::Array(vec![])),
+                &envelope(ctx, "delete", name, &[], doc, &Value::Array(vec![])),
             )?;
         }
         let entry = obj(vec![
@@ -1485,7 +1575,15 @@ impl Namespace {
         let (ns_seq, ns_id_new, ns_stmt) =
             self.ns_entry(ctx, &ns, &entry, &author, &g, ns.config_seq);
         let seq = ns_seq;
-        self.commit(vec![
+        let mut stmts = Vec::new();
+        if let (Some(_), Some(doc)) = (&foreign, &deleted) {
+            // The deleted document is the base's: kept here for a restore.
+            stmts.push((
+                "INSERT INTO res_snapshots (resource, seq, doc) VALUES (?, ?, ?)",
+                vec![name.into(), seq.into(), canonical_string(doc).into()],
+            ));
+        }
+        stmts.extend([
             ns_stmt,
             (
                 "INSERT INTO res_log (resource, seq, id, parent, kind, patches, author, created, gesture, undoes, depth) VALUES (?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?)",
@@ -1501,7 +1599,8 @@ impl Namespace {
                     (head.depth + 1).into(),
                 ],
             ),
-        ])?;
+        ]);
+        self.commit(stmts)?;
         self.remember(
             name,
             Some(Head {
@@ -1509,7 +1608,11 @@ impl Namespace {
                 id: tomb.text(),
                 kind: TOMBSTONE,
                 depth: head.depth + 1,
-                live: head.live.or(Some(head.seq)),
+                live: if foreign.is_some() {
+                    Some(seq)
+                } else {
+                    head.live.or(Some(head.seq))
+                },
             }),
         );
         self.set_head(NsHead {
@@ -1536,7 +1639,7 @@ impl Namespace {
     fn get_head(&self, ctx: &Ctx, name: &str) -> Res<Response> {
         let ns = self.existing()?;
         let Some(head) = self.resource(name)? else {
-            return Err(Err::not_found());
+            return self.get_head_foreign(ctx, &ns, name);
         };
         let hd = Headers::new();
         cache_headers(&hd, Class::HeadPointer, ns.public)?;
@@ -1568,7 +1671,9 @@ impl Namespace {
         let Some(id) = Id::parse(id) else {
             return Err(Err::bad("malformed id"));
         };
-        let e = self.entry_by_id(name, &id)?.ok_or_else(Err::not_found)?;
+        let Some(e) = self.entry_by_id(name, &id)? else {
+            return self.get_rev_foreign(ctx, &ns, name, &id, req).await;
+        };
         let hd = Headers::new();
         cache_headers(&hd, Class::Immutable, ns.public)?;
         tags(&hd, &ctx.ns, Some(name))?;
@@ -1604,10 +1709,10 @@ impl Namespace {
 
     /// `GET /ns/{ns}/rev/{ns_id}/heads` (§7.4): each resource's newest
     /// entry as of that revision, by name, after `after`, a page at a time.
-    fn get_heads(&self, ctx: &Ctx, id: &str, after: &str) -> Res<Response> {
+    async fn get_heads(&self, ctx: &Ctx, id: &str, after: &str) -> Res<Response> {
         let h = self.existing()?;
         let at = self.ns_seq_of(id)?.ok_or_else(Err::not_found)?;
-        let n = h.limits.log_page_size as i64;
+        let n = h.limits.log_page_size as usize;
         #[derive(Deserialize)]
         struct HeadRow {
             resource: String,
@@ -1617,14 +1722,14 @@ impl Namespace {
         }
         let rows: Vec<HeadRow> = self.rows(
             "SELECT r.resource AS resource, r.id AS id, r.kind AS kind, r.created AS created FROM (SELECT resource, MAX(seq) AS m FROM res_log WHERE seq <= ?1 AND resource > ?2 GROUP BY resource ORDER BY resource LIMIT ?3) g JOIN res_log r ON r.resource = g.resource AND r.seq = g.m ORDER BY r.resource",
-            vec![at.seq.into(), after.into(), (n + 1).into()],
+            vec![at.seq.into(), after.into(), (n as i64 + 1).into()],
         )?;
-        let more = rows.len() as i64 > n;
-        let page: Vec<Value> = rows
-            .iter()
-            .take(n as usize)
+        let own_more = rows.len() > n;
+        let own: Vec<(String, Value)> = rows
+            .into_iter()
+            .take(n)
             .map(|r| {
-                obj(vec![
+                let v = obj(vec![
                     ("resource", s(r.resource.clone())),
                     (
                         "kind",
@@ -1634,14 +1739,43 @@ impl Namespace {
                             "head"
                         }),
                     ),
-                    ("target", s(r.id.clone())),
+                    ("target", s(r.id)),
                     ("created", s(rfc3339_ms(r.created))),
-                ])
+                ]);
+                (r.resource, v)
             })
             .collect();
-        let mut body = vec![("heads", Value::Array(page))];
-        if more {
-            body.push(("next", s(rows[n as usize - 1].resource.clone())));
+        // In a branch, the resources read through: the base's page at `at`,
+        // merged by name, ours winning; a page ends where either source's did.
+        let mut bound = own_more
+            .then(|| own.last().map(|(k, _)| k.clone()))
+            .flatten();
+        let mut merged: std::collections::BTreeMap<String, Value> = Default::default();
+        if let Some((base, base_next)) = self.base_heads(&h, after).await? {
+            for v in base {
+                if let Some(k) = v.get("resource").and_then(Value::as_str) {
+                    merged.insert(k.to_string(), v.clone());
+                }
+            }
+            bound = match (bound, base_next) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        merged.extend(own);
+        let mut page: Vec<(String, Value)> = merged
+            .into_iter()
+            .filter(|(k, _)| bound.as_ref().is_none_or(|b| k <= b))
+            .collect();
+        let more = bound.is_some() || page.len() > n;
+        page.truncate(n);
+        let next = page.last().map(|(k, _)| k.clone()).filter(|_| more);
+        let mut body = vec![(
+            "heads",
+            Value::Array(page.into_iter().map(|(_, v)| v).collect()),
+        )];
+        if let Some(k) = next {
+            body.push(("next", s(k)));
         }
         let hd = Headers::new();
         cache_headers(&hd, Class::Immutable, h.public)?;
@@ -2125,8 +2259,10 @@ fn validate_config(doc: &Value) -> Res<()> {
                     return Err(invalid_config(&pointer, &message));
                 }
             }
-            "keys" | "roles" | "revoked" | "retention" | "encryption" | "maxLag" | "base"
-            | "successor" | "drafts" | "signatures" | "nonce" | "schemaReads" => {
+            // Checked against the previous document by `check_branch_fields`.
+            "base" | "successor" => {}
+            "keys" | "roles" | "revoked" | "retention" | "encryption" | "maxLag" | "drafts"
+            | "signatures" | "nonce" | "schemaReads" => {
                 return Err(invalid_config(
                     &p,
                     "this server doesn't implement that member yet",
