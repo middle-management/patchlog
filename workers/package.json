@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --var AUTH:disabled",
+    "dev:grants": "wrangler dev --port 8788 --var \"OPERATOR_JWKS:$(node bench/auth-smoke.mjs --jwks)\"",
     "deploy": "wrangler deploy",
     "smoke": "node bench/smoke.mjs",
     "bench": "node bench/load.mjs",

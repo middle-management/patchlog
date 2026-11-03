@@ -21,9 +21,15 @@ new_sqlite_classes = ["Namespace"]
 
 # Authentication (§1): "grants" verifies grants (Addendum C) against each
 # namespace's keys and the operator keys in OPERATOR_JWKS (a JWK Set of public
-# keys); anything else leaves it disabled, with authors named by X-Author.
+# keys, published at /.well-known/patchlog-keys); anything else leaves it
+# disabled, with authors named by X-Author. Locally, `wrangler dev --var
+# AUTH:disabled` runs bench/smoke.mjs; bench/auth-smoke.mjs has its own keys.
+#
+# The operator key history is append-only (§C.4): end a key's period with
+# "until" rather than removing it, and never reuse a kid.
 [vars]
-AUTH = "disabled"
+AUTH = "grants"
+OPERATOR_JWKS = '{"keys":[{"crv":"Ed25519","kid":"operator-1","kty":"OKP","patchlog":{"from":"2026-11-03T18:24:00Z"},"use":"sig","x":"14dSZUgwsDGi_83nXsr5ENsMVkNjlt1UAwDJmw-OEnQ"}]}'
 
 [observability]
 enabled = true

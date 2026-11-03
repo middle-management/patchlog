@@ -1,4 +1,5 @@
-// End-to-end checks against a running deployment (default: wrangler dev).
+// End-to-end checks against a deployment with authentication off
+// (default: `npm run dev`, which passes AUTH:disabled).
 //   node bench/smoke.mjs [base-url]
 // Exercises namespace creation, create/append/delete/restore with the ids of
 // Addendum I.2, preconditions, idempotent retries, reads, log ranges and a

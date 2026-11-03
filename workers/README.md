@@ -78,8 +78,10 @@ Node 22. Commands run from this directory.
 ```sh
 npm install
 cargo test -p patchlog-core               # unit tests and the vectors of Addendum I.1–I.3
-npm run dev                               # wrangler dev on :8787 (builds first)
+npm run dev                               # wrangler dev on :8787 with auth off (builds first)
 node bench/smoke.mjs                      # end-to-end checks against it
+cargo build -p patchlog-grant && npm run dev:grants   # grants on, with development keys, on :8788
+node bench/auth-smoke.mjs http://127.0.0.1:8788      # grant checks against it
 
 npm run build && npm run workerd          # plain workerd on :8788, without wrangler's proxy
 node bench/load.mjs http://127.0.0.1:8788 --pid "$(pgrep -f '^workerd serve bench')"
@@ -119,7 +121,7 @@ append writes 4: past that, writes answer `503` with `Retry-After` until 00:00 U
 
 ## Authentication
 
-Authentication is off unless `AUTH = "grants"` (§1): with it off, writes name their author in `X-Author`. To turn it on, set `AUTH = "grants"` and give the deployment's operator public keys in `OPERATOR_JWKS`, a JWK Set (§C.4: OKP Ed25519 keys with `kid`, `use: "sig"` and `patchlog: { from, until? }`). Only public keys are configured. Namespaces are then created with an operator grant whose genesis document lists the namespace's own `keys`, and everything else uses grants signed by those.
+The deployment in `wrangler.toml` runs with `AUTH = "grants"` and one operator key, `operator-1`, whose seed its owner keeps. With `AUTH` anything else, authentication is off (§1) and writes name their author in `X-Author`. A deployment turns it on by setting `AUTH = "grants"` and giving the deployment's operator public keys in `OPERATOR_JWKS`, a JWK Set (§C.4: OKP Ed25519 keys with `kid`, `use: "sig"` and `patchlog: { from, until? }`). Only public keys are configured. Namespaces are then created with an operator grant whose genesis document lists the namespace's own `keys`, and everything else uses grants signed by those.
 
 `crates/grant` is a command-line tool for development and issuers:
 - `patchlog-grant keygen` makes a key pair;
