@@ -143,8 +143,7 @@ async fn long_poll(stub: &Stub, url: &Url) -> std::result::Result<Response, Err>
         let wait = match &armed {
             // Until the object says how long to wait, a short guard.
             None => 10_000,
-            // The object ends the wait at the deadline; this is only a guard.
-            Some(a) => (a.deadline + 3_000 - Date::now().as_millis() as i64).max(0) as u64,
+            Some(a) => (a.deadline - Date::now().as_millis() as i64).max(0) as u64,
         };
         let next = Box::pin(events.next());
         let timeout = Box::pin(Delay::from(std::time::Duration::from_millis(wait)));
@@ -155,15 +154,12 @@ async fn long_poll(stub: &Stub, url: &Url) -> std::result::Result<Response, Err>
                     armed = Some(Armed::parse(&text)?);
                     continue;
                 }
-                // The object closes the socket after it answers; closing it
-                // here too would wake the object again.
-                if text.starts_with(r#"{"timeout""#) {
-                    return armed.unwrap().empty();
-                }
+                let _ = ws.close(Some(1000), Some("done"));
                 return answer_from(&text);
             }
-            // Closed without an answer (the object restarted), or the guard expired.
+            // Closed without an answer (the object restarted), or timed out.
             _ => {
+                let _ = ws.close(Some(1000), Some("interval over"));
                 return match armed {
                     Some(a) => a.empty(),
                     None => Err(Err::new(502, "internal", "the namespace didn't answer")),

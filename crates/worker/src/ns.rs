@@ -140,8 +140,6 @@ pub struct Namespace {
     /// constructor, which can't report an error (storage can refuse writes,
     /// e.g. over a plan's quota).
     schema_ready: std::cell::Cell<bool>,
-    /// The alarm that ends waiting long-polls, if one is set (lost on hibernation; then read back).
-    alarm_at: std::cell::Cell<Option<i64>>,
     inner: RefCell<Inner>,
     /// Long-poll waiters share one promise, resolved by the next write.
     wake: RefCell<Option<(js_sys::Promise, js_sys::Function)>>,
@@ -155,30 +153,6 @@ struct Ctx {
 }
 
 impl DurableObject for Namespace {
-    /// The interval ended: answer every wait that reached its deadline with
-    /// a timeout, which the front Worker turns into `204` (§7.7).
-    async fn alarm(&self) -> Result<Response> {
-        self.alarm_at.set(None);
-        let now = Date::now().as_millis() as i64;
-        let mut next: Option<i64> = None;
-        for ws in self.state.get_websockets() {
-            match ws.deserialize_attachment::<Waiter>() {
-                Ok(Some(w)) if w.deadline > now + 50 => {
-                    next = Some(next.map_or(w.deadline, |n| n.min(w.deadline)));
-                }
-                _ => {
-                    let _ = ws.send_with_str(r#"{"timeout":true}"#);
-                    let _ = ws.close(Some(1000), Some("interval over"));
-                }
-            }
-        }
-        if let Some(t) = next {
-            self.state.storage().set_alarm(t - now).await?;
-            self.alarm_at.set(Some(t));
-        }
-        Response::ok("")
-    }
-
     async fn websocket_message(&self, _ws: WebSocket, _m: WebSocketIncomingMessage) -> Result<()> {
         Ok(())
     }
@@ -205,7 +179,6 @@ impl DurableObject for Namespace {
             state,
             sql,
             schema_ready: std::cell::Cell::new(false),
-            alarm_at: std::cell::Cell::new(None),
             inner: RefCell::new(Inner {
                 loaded: false,
                 head: None,
@@ -667,20 +640,7 @@ impl Namespace {
             pair.server.serialize_attachment(Waiter {
                 ns: ctx.ns.clone(),
                 after,
-                deadline,
             })?;
-            // One alarm per interval ends every wait that reaches it, so the
-            // front Worker never has to close a socket (each close would wake
-            // this object once per follower).
-            let storage = self.state.storage();
-            let set = match self.alarm_at.get() {
-                Some(t) => t > deadline,
-                None => storage.get_alarm().await?.is_none_or(|t| t > deadline),
-            };
-            if set {
-                storage.set_alarm(deadline - ctx.now).await?;
-                self.alarm_at.set(Some(deadline));
-            }
             let armed = obj(vec![
                 ("armed", Value::Bool(true)),
                 ("deadline", Value::Number(deadline as f64)),
@@ -1274,8 +1234,6 @@ impl Namespace {
 struct Waiter {
     ns: String,
     after: i64,
-    /// The end of the wait's interval, in ms since the epoch.
-    deadline: i64,
 }
 
 /// A long-poll answer for the front Worker: its status and headers as JSON
