@@ -144,14 +144,15 @@ if (run("reads")) {
 }
 
 if (run("followers")) {
-  for (const n of [100, 1000, 3000]) {
-    const ns = `bf-${tag}-${n}`;
+  const counts = args.includes("--followers") ? args[args.indexOf("--followers") + 1].split(",").map(Number) : [100, 1000, 3000];
+  for (const [i, n] of counts.entries()) {
+    const ns = `bf-${tag}-${i}-${n}`;
     await mkns(ns);
     const first = await call("GET", `/ns/${ns}/log?since=&live=long-poll`);
     const since = first.h.get("x-namespace-revision"), cursor = first.h.get("x-cursor");
     // Take the cursor from the server (§7.7), whose clock may differ from
     // ours, and start well before the interval ends, which would answer the polls.
-    const probe = async () => { const r = await call("GET", `/ns/${ns}/log?since=&live=long-poll`); return { cur: r.h.get("x-cursor"), ms: Date.parse(r.h.get("date")) }; };
+    const probe = async () => { const r = await call("GET", `/ns/${ns}/log?since=&live=long-poll`); const d = r.h.get("date"); return { cur: r.h.get("x-cursor"), ms: d ? Date.parse(d) : Date.now() }; };
     let p = await probe();
     const left = 20_000 - (p.ms % 20_000);
     if (left < 8_000) { await new Promise((r) => setTimeout(r, left + 1_500)); p = await probe(); }

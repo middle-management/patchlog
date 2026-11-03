@@ -39,6 +39,10 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS snapshots (seq INTEGER PRIMARY KEY, doc TEXT NOT NULL)",
 ];
 
+/// Long-polls that wait on hibernatable WebSockets before the rest wait in
+/// the object itself.
+const HIBERNATING_WAITERS_MAX: usize = 200;
+
 const REV: i64 = 0;
 const TOMBSTONE: i64 = 1;
 
@@ -631,7 +635,11 @@ impl Namespace {
         };
         // Wait for the next write or the end of the current interval.
         let deadline = (current + 1) * http::LONG_POLL_INTERVAL_MS;
-        if upgrade {
+        // Hibernating costs a close event per poll; an object that stays awake
+        // costs its duration whatever the number of waiters. Past about 200
+        // waiters on one namespace staying awake is cheaper (bench/COSTS.md),
+        // so further polls wait in here, as plain HTTP.
+        if upgrade && self.state.get_websockets().len() < HIBERNATING_WAITERS_MAX {
             // Through the front Worker: wait on a hibernatable WebSocket, so
             // this object can sleep, and isn't billed, until a write.
             let pair = WebSocketPair::new()?;
