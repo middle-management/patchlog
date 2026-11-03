@@ -132,7 +132,7 @@ struct Inner {
     docs_bytes: u64,
 }
 
-#[durable_object(fetch)]
+#[durable_object]
 pub struct Namespace {
     state: State,
     sql: SqlStorage,
@@ -153,6 +153,26 @@ struct Ctx {
 }
 
 impl DurableObject for Namespace {
+    async fn websocket_message(&self, _ws: WebSocket, _m: WebSocketIncomingMessage) -> Result<()> {
+        Ok(())
+    }
+
+    async fn websocket_close(
+        &self,
+        ws: WebSocket,
+        _code: usize,
+        _reason: String,
+        _clean: bool,
+    ) -> Result<()> {
+        // The front Worker gave up at the interval's end; nothing to answer.
+        let _ = ws.close(Some(1000), Some("closed"));
+        Ok(())
+    }
+
+    async fn websocket_error(&self, _ws: WebSocket, _e: Error) -> Result<()> {
+        Ok(())
+    }
+
     fn new(state: State, _env: Env) -> Self {
         let sql = state.storage().sql();
         Namespace {
@@ -271,10 +291,64 @@ impl Namespace {
     }
 
     fn set_head(&self, h: NsHead) {
-        self.inner.borrow_mut().head = Some(h);
+        self.inner.borrow_mut().head = Some(h.clone());
         if let Some((_, resolve)) = self.wake.borrow_mut().take() {
             let _ = resolve.call0(&JsValue::NULL);
         }
+        self.answer_waiters(&h);
+    }
+
+    /// Answers the long-polls waiting on hibernatable WebSockets (§7.7): one
+    /// log read per distinct `since`, sent to each socket, which is then
+    /// closed. The front Worker turns the message into the HTTP answer.
+    fn answer_waiters(&self, h: &NsHead) {
+        let sockets = self.state.get_websockets();
+        if sockets.is_empty() {
+            return;
+        }
+        let now = Date::now().as_millis() as i64;
+        let cursor_out = now.div_euclid(http::LONG_POLL_INTERVAL_MS);
+        let mut messages: HashMap<i64, Option<String>> = HashMap::new();
+        for ws in sockets {
+            let Ok(Some(w)) = ws.deserialize_attachment::<Waiter>() else {
+                let _ = ws.close(Some(1011), Some("no attachment"));
+                continue;
+            };
+            let msg = messages
+                .entry(w.after)
+                .or_insert_with(
+                    || match self.long_poll_answer(&w.ns, h, w.after, cursor_out) {
+                        Ok(Some((hd, body))) => Some(waiter_message(200, &hd, &body)),
+                        _ => None,
+                    },
+                )
+                .clone();
+            if let Some(m) = msg {
+                let _ = ws.send_with_str(&m);
+                let _ = ws.close(Some(1000), Some("answered"));
+            }
+        }
+    }
+
+    /// The `200` answer to a long-poll after `after`, if there are entries.
+    fn long_poll_answer(
+        &self,
+        ns: &str,
+        h: &NsHead,
+        after: i64,
+        cursor_out: i64,
+    ) -> Res<Option<(Headers, Vec<u8>)>> {
+        if h.seq <= after {
+            return Ok(None);
+        }
+        let (rows, _) = self.ns_page(h, after, h.seq)?;
+        let hd = Headers::new();
+        cache_headers(&hd, Class::LongPollOk, h.public)?;
+        tags(&hd, ns, None)?;
+        hd.set("Content-Type", "application/json")?;
+        hd.set("X-Namespace-Revision", &rows.last().unwrap().id)?;
+        hd.set("X-Cursor", &cursor_out.to_string())?;
+        Ok(Some((hd, self.ns_page_body(&rows)?)))
     }
 
     fn existing(&self) -> Res<NsHead> {
@@ -343,7 +417,11 @@ impl Namespace {
             }
             ("ns", ["log"]) if m == Method::Get => {
                 let q = http::query(&url, &["since", "live", "cursor"])?;
-                self.get_ns_log_live(&ctx, &q).await
+                let upgrade = req
+                    .headers()
+                    .get("Upgrade")?
+                    .is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
+                self.get_ns_log_live(&ctx, &q, upgrade).await
             }
             ("r", [name]) => match m {
                 Method::Get | Method::Head => {
@@ -485,6 +563,7 @@ impl Namespace {
         &self,
         ctx: &Ctx,
         q: &std::collections::BTreeMap<String, String>,
+        upgrade: bool,
     ) -> Res<Response> {
         let h = self.existing()?;
         let since = q.get("since").map(String::as_str).unwrap_or("");
@@ -529,17 +608,10 @@ impl Namespace {
         };
         let after = self.since_seq(since)?.ok_or_else(Err::not_found)?;
         let answer = |h: &NsHead, cursor_out: i64| -> Res<Option<Response>> {
-            if h.seq <= after {
-                return Ok(None);
+            match self.long_poll_answer(&ctx.ns, h, after, cursor_out)? {
+                Some((hd, body)) => Ok(Some(http::respond(200, hd, body)?)),
+                None => Ok(None),
             }
-            let (rows, _) = self.ns_page(h, after, h.seq)?;
-            let hd = Headers::new();
-            cache_headers(&hd, Class::LongPollOk, h.public)?;
-            tags(&hd, &ctx.ns, None)?;
-            hd.set("Content-Type", "application/json")?;
-            hd.set("X-Namespace-Revision", &rows.last().unwrap().id)?;
-            hd.set("X-Cursor", &cursor_out.to_string())?;
-            Ok(Some(http::respond(200, hd, self.ns_page_body(&rows)?)?))
         };
         let empty = |public: bool, cursor_out: i64| -> Res<Response> {
             let hd = Headers::new();
@@ -559,6 +631,27 @@ impl Namespace {
         };
         // Wait for the next write or the end of the current interval.
         let deadline = (current + 1) * http::LONG_POLL_INTERVAL_MS;
+        if upgrade {
+            // Through the front Worker: wait on a hibernatable WebSocket, so
+            // this object can sleep, and isn't billed, until a write.
+            let pair = WebSocketPair::new()?;
+            self.state
+                .accept_websocket_with_tags(&pair.server, &["long-poll"]);
+            pair.server.serialize_attachment(Waiter {
+                ns: ctx.ns.clone(),
+                after,
+            })?;
+            let armed = obj(vec![
+                ("armed", Value::Bool(true)),
+                ("deadline", Value::Number(deadline as f64)),
+                ("cursor", Value::Number(cursor as f64)),
+                ("public", Value::Bool(h.public)),
+                ("since", s(since)),
+                ("ns", s(ctx.ns.clone())),
+            ]);
+            pair.server.send_with_str(canonical_string(&armed))?;
+            return Ok(Response::from_websocket(pair.client)?);
+        }
         let wait = (deadline - ctx.now).max(0) as u64;
         let promise = {
             let mut w = self.wake.borrow_mut();
@@ -1134,6 +1227,31 @@ impl Namespace {
         }
         http::respond(200, hd, canonical(&Value::Array(out)))
     }
+}
+
+/// What a long-poll waiting on a hibernatable WebSocket needs to be answered.
+#[derive(serde::Serialize, Deserialize)]
+struct Waiter {
+    ns: String,
+    after: i64,
+}
+
+/// A long-poll answer for the front Worker: its status and headers as JSON
+/// on the first line, then the body.
+fn waiter_message(status: u16, hd: &Headers, body: &[u8]) -> String {
+    let headers: Vec<Value> = hd
+        .entries()
+        .map(|(k, v)| Value::Array(vec![s(k), s(v)]))
+        .collect();
+    let head = obj(vec![
+        ("status", Value::Number(status as f64)),
+        ("headers", Value::Array(headers)),
+    ]);
+    format!(
+        "{}\n{}",
+        canonical_string(&head),
+        String::from_utf8_lossy(body)
+    )
 }
 
 struct Gesture {

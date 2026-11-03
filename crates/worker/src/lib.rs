@@ -7,6 +7,7 @@
 mod http;
 mod ns;
 
+use futures_util::StreamExt;
 use http::Err;
 use patchlog_core::names::{is_namespace_name, is_resource_name};
 use worker::*;
@@ -94,6 +95,14 @@ async fn front(req: Request, env: Env, ctx: Context) -> std::result::Result<Resp
         }
     }
     let stub = env.durable_object("NAMESPACE")?.get_by_name(ns)?;
+    if req.method() == Method::Get
+        && segs.as_slice() == ["ns", ns, "log"]
+        && url
+            .query_pairs()
+            .any(|(k, v)| k == "live" && v == "long-poll")
+    {
+        return long_poll(&stub, &url).await;
+    }
     let mut resp = stub.fetch_with_request(req).await?;
     if cacheable && resp.status_code() == 200 {
         let cc = resp.headers().get("Cache-Control")?.unwrap_or_default();
@@ -106,4 +115,130 @@ async fn front(req: Request, env: Env, ctx: Context) -> std::result::Result<Resp
         }
     }
     Ok(resp)
+}
+
+/// §7.7 long-poll. The wait is held here, where it costs nothing while
+/// nothing happens, not in the namespace's Durable Object: the object answers
+/// at once if it can, and otherwise accepts a hibernatable WebSocket, which
+/// lets it sleep until a write, when it sends the answer down the socket. At
+/// the interval's end this Worker answers `204` itself.
+async fn long_poll(stub: &Stub, url: &Url) -> std::result::Result<Response, Err> {
+    let h = Headers::new();
+    h.set("Upgrade", "websocket")?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Get).with_headers(h);
+    let resp = stub
+        .fetch_with_request(Request::new_with_init(url.as_str(), &init)?)
+        .await?;
+    if resp.status_code() != 101 {
+        return Ok(resp); // answered at once, or an error
+    }
+    let ws = resp
+        .websocket()
+        .ok_or_else(|| Err::new(500, "internal", "no WebSocket in a 101"))?;
+    ws.accept()?;
+    let mut events = ws.events()?;
+    let mut armed: Option<Armed> = None;
+    loop {
+        let wait = match &armed {
+            // Until the object says how long to wait, a short guard.
+            None => 10_000,
+            Some(a) => (a.deadline - Date::now().as_millis() as i64).max(0) as u64,
+        };
+        let next = Box::pin(events.next());
+        let timeout = Box::pin(Delay::from(std::time::Duration::from_millis(wait)));
+        match futures_util::future::select(next, timeout).await {
+            futures_util::future::Either::Left((Some(Ok(WebsocketEvent::Message(m))), _)) => {
+                let text = m.text().unwrap_or_default();
+                if armed.is_none() {
+                    armed = Some(Armed::parse(&text)?);
+                    continue;
+                }
+                let _ = ws.close(Some(1000), Some("done"));
+                return answer_from(&text);
+            }
+            // Closed without an answer (the object restarted), or timed out.
+            _ => {
+                let _ = ws.close(Some(1000), Some("interval over"));
+                return match armed {
+                    Some(a) => a.empty(),
+                    None => Err(Err::new(502, "internal", "the namespace didn't answer")),
+                };
+            }
+        }
+    }
+}
+
+/// What the Durable Object sends when a long-poll starts waiting.
+struct Armed {
+    deadline: i64,
+    cursor: i64,
+    public: bool,
+    since: String,
+    ns_tag: String,
+}
+
+impl Armed {
+    fn parse(text: &str) -> std::result::Result<Armed, Err> {
+        let v = patchlog_core::json::parse(text.as_bytes())
+            .map_err(|e| Err::new(500, "internal", e.to_string()))?;
+        let num = |k: &str| match v.get(k) {
+            Some(patchlog_core::Value::Number(n)) => *n as i64,
+            _ => 0,
+        };
+        Ok(Armed {
+            deadline: num("deadline"),
+            cursor: num("cursor"),
+            public: matches!(v.get("public"), Some(patchlog_core::Value::Bool(true))),
+            since: v
+                .get("since")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            ns_tag: v
+                .get("ns")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
+
+    /// The timeout answer of §7.7: `204`, the cursor the greater of the
+    /// current interval and the request's plus one.
+    fn empty(&self) -> std::result::Result<Response, Err> {
+        let now = (Date::now().as_millis() as i64).div_euclid(http::LONG_POLL_INTERVAL_MS);
+        let h = Headers::new();
+        http::cache_headers(&h, http::Class::LongPollEmpty, self.public)?;
+        http::tags(&h, &self.ns_tag, None)?;
+        if !self.since.is_empty() {
+            h.set("X-Namespace-Revision", &self.since)?;
+        }
+        h.set("X-Cursor", &now.max(self.cursor + 1).to_string())?;
+        http::respond(204, h, vec![])
+    }
+}
+
+/// An answer the Durable Object sent: status and headers as JSON, a newline, the body.
+fn answer_from(text: &str) -> std::result::Result<Response, Err> {
+    let (head, body) = text.split_once('\n').unwrap_or((text, ""));
+    let v = patchlog_core::json::parse(head.as_bytes())
+        .map_err(|e| Err::new(500, "internal", e.to_string()))?;
+    let status = match v.get("status") {
+        Some(patchlog_core::Value::Number(n)) => *n as u16,
+        _ => 500,
+    };
+    let h = Headers::new();
+    for pair in v
+        .get("headers")
+        .and_then(|a| a.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some([k, val]) = pair.as_array().map(|a| a.as_slice()) {
+            if let (Some(k), Some(val)) = (k.as_str(), val.as_str()) {
+                h.set(k, val)?;
+            }
+        }
+    }
+    http::respond(status, h, body.as_bytes().to_vec())
 }
