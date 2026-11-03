@@ -157,7 +157,9 @@ impl Namespace {
         let Some(bid) = Id::parse(bid) else {
             return Err(Err::bad("malformed blob id"));
         };
-        let author = author(req.headers())?;
+        let author = ctx.uploader()?;
+        // Step 1 (§C.2): an upload may be any of these writes.
+        ctx.step1(&["create", "append", "restore"], Some(name))?;
         // Checks 2 and 3: the namespace, frozen.
         let ns = self.existing()?;
         if ns.frozen {

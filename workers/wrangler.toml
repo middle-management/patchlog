@@ -19,6 +19,12 @@ bucket_name = "patchlog-blobs"
 tag = "v1"
 new_sqlite_classes = ["Namespace"]
 
+# Authentication (§1): "grants" verifies grants (Addendum C) against each
+# namespace's keys and the operator keys in OPERATOR_JWKS (a JWK Set of public
+# keys); anything else leaves it disabled, with authors named by X-Author.
+[vars]
+AUTH = "disabled"
+
 [observability]
 enabled = true
 head_sampling_rate = 1

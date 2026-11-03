@@ -264,6 +264,177 @@ fn is_rfc3339(s: &str) -> bool {
         })
 }
 
+/// The verbs of grants and roles (§C.1); `*` is for keys only.
+pub const VERBS: &[&str] = &[
+    "read", "create", "append", "restore", "delete", "purge", "config", "branch", "purge-ns",
+    "export", "prune",
+];
+
+fn verbs(v: &Value, p: &str, star: bool) -> Result<(), Problem> {
+    for (i, x) in str_array(v, p, "can")?.into_iter().enumerate() {
+        if !(VERBS.contains(&x) || (star && x == "*")) {
+            return bad(&format!("{p}/{i}"), "a verb (§C.1)");
+        }
+    }
+    Ok(())
+}
+
+fn rule_forms(v: &Value, p: &str) -> Result<(), Problem> {
+    match patchlog_core::rules::validate(v, u64::MAX) {
+        Ok(()) => Ok(()),
+        Err(patchlog_core::rules::RulesError::Invalid(errs)) => {
+            let (ptr, m) = errs.into_iter().next().unwrap_or_default();
+            Err((format!("{p}{ptr}"), m))
+        }
+        Err(patchlog_core::rules::RulesError::Limit { .. }) => bad(p, "too many rules"),
+    }
+}
+
+fn allow_deny(v: &Value, p: &str) -> Result<(), Problem> {
+    let m = obj(v, p, "an allow or deny list")?;
+    if m.len() != 1 || !(m.contains_key("allow") || m.contains_key("deny")) {
+        return bad(p, "exactly one of allow and deny");
+    }
+    let (k, list) = m.iter().next().unwrap();
+    str_array(list, &format!("{p}/{k}"), k)?;
+    Ok(())
+}
+
+/// A 43-character base64url Ed25519 public key, without padding.
+pub fn is_pub_key(s: &str) -> bool {
+    s.len() == 43
+        && s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        // The last character carries 4 bits and 2 zero bits.
+        && b"AEIMQUYcgkosw048".contains(&s.as_bytes()[42])
+}
+
+/// `keys` (§C.4): strict key entries, with their scope fields.
+pub fn keys(v: &Value, p: &str) -> Result<(), Problem> {
+    let a = v
+        .as_array()
+        .ok_or_else(|| (p.to_string(), "keys is an array".to_string()))?;
+    let mut kids = std::collections::BTreeSet::new();
+    for (i, e) in a.iter().enumerate() {
+        let ep = format!("{p}/{i}");
+        let m = obj(e, &ep, "a key entry")?;
+        only(
+            m,
+            &ep,
+            &[
+                "kid",
+                "alg",
+                "pub",
+                "can",
+                "maxTtl",
+                "maxLag",
+                "sub",
+                "groups",
+                "roles",
+                "attrs",
+                "rules",
+                "readScope",
+                "rate",
+                "requireAt",
+            ],
+            false,
+        )?;
+        match m.get("kid").and_then(Value::as_str) {
+            Some(k) if !k.is_empty() => {
+                if !kids.insert(k) {
+                    return bad(&format!("{ep}/kid"), "kids are unique within keys");
+                }
+            }
+            _ => return bad(&format!("{ep}/kid"), "a non-empty string"),
+        }
+        if m.get("alg").and_then(Value::as_str) != Some("Ed25519") {
+            return bad(&format!("{ep}/alg"), "alg is \"Ed25519\"");
+        }
+        if !m.get("pub").and_then(Value::as_str).is_some_and(is_pub_key) {
+            return bad(
+                &format!("{ep}/pub"),
+                "an Ed25519 public key, 43 characters of base64url",
+            );
+        }
+        if let Some(c) = m.get("can") {
+            verbs(c, &format!("{ep}/can"), true)?;
+        }
+        for k in ["maxTtl", "maxLag"] {
+            if let Some(x) = m.get(k) {
+                if !x.as_str().is_some_and(is_duration) {
+                    return bad(&format!("{ep}/{k}"), "an ISO 8601 duration");
+                }
+            }
+        }
+        if let Some(x) = m.get("sub") {
+            if !x
+                .as_str()
+                .is_some_and(|s| patchlog_core::schema::re2(s).is_ok())
+            {
+                return bad(&format!("{ep}/sub"), "a regular expression (§6.6)");
+            }
+        }
+        for k in ["groups", "roles"] {
+            if let Some(x) = m.get(k) {
+                allow_deny(x, &format!("{ep}/{k}"))?;
+            }
+        }
+        if let Some(x) = m.get("attrs") {
+            if patchlog_core::schema::compile_fragment(x).is_err() {
+                return bad(&format!("{ep}/attrs"), "a JSON Schema, as a rule's schema");
+            }
+        }
+        if let Some(x) = m.get("rules") {
+            rule_forms(x, &format!("{ep}/rules"))?;
+        }
+        if let Some(x) = m.get("readScope") {
+            if x.as_str() != Some("resource") {
+                return bad(&format!("{ep}/readScope"), "readScope is \"resource\"");
+            }
+        }
+        if let Some(x) = m.get("rate") {
+            rate(x, &format!("{ep}/rate"))?;
+        }
+        if let Some(x) = m.get("requireAt") {
+            let ok = matches!(x, Value::Bool(true)) || x.as_str().is_some_and(is_namespace_name);
+            if !ok {
+                return bad(&format!("{ep}/requireAt"), "true or a namespace name");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `roles` (§C.1.1): open entries, of which `can` and `rules` are checked.
+pub fn roles(v: &Value, p: &str) -> Result<(), Problem> {
+    let m = obj(v, p, "roles")?;
+    for (name, r) in m {
+        let rp = format!("{p}/{}", escape_token(name));
+        if name.is_empty() {
+            return bad(&rp, "a role has a name");
+        }
+        let rm = obj(r, &rp, "a role")?;
+        if let Some(c) = rm.get("can") {
+            verbs(c, &format!("{rp}/can"), false)?;
+        }
+        if let Some(x) = rm.get("rules") {
+            rule_forms(x, &format!("{rp}/rules"))?;
+        }
+    }
+    Ok(())
+}
+
+/// `revoked` (§C.4): revocation ids.
+pub fn revoked(v: &Value, p: &str) -> Result<(), Problem> {
+    for (i, s) in str_array(v, p, "revoked")?.into_iter().enumerate() {
+        if Id::parse(s).is_none() {
+            return bad(&format!("{p}/{i}"), "a revocation id");
+        }
+    }
+    Ok(())
+}
+
 /// `merge` (§F.3): `{ "authors": [{ "sub", "kid" }] }`.
 pub fn merge(v: &Value, p: &str) -> Result<(), Problem> {
     let m = obj(v, p, "merge")?;

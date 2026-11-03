@@ -431,7 +431,7 @@ impl Namespace {
         dry: bool,
     ) -> Res<Response> {
         http::content_type_is(hd, "application/json")?;
-        let author = author(hd)?;
+        let author = ctx.author()?;
         let req = parse(raw, hd)?;
         self.existing()?;
         // A local source must be in its namespace's chain (§7.5 source),
@@ -447,9 +447,9 @@ impl Namespace {
                 } else {
                     let stub = self.env.durable_object("NAMESPACE")?.get_by_name(sns)?;
                     let r = stub
-                        .fetch_with_str(&format!("https://namespace/ns/{sns}/rev/{at}"))
+                        .fetch_with_str(&format!("https://namespace/internal/{sns}/has/{at}"))
                         .await?;
-                    r.status_code() == 200
+                    r.status_code() == 204
                 };
                 if !ok {
                     return Err(Err::new(
@@ -491,6 +491,7 @@ impl Namespace {
     /// The batch's checks and its commit, with no `await` between them.
     fn batch_sync(&self, ctx: &Ctx, req: &BatchIn, author: &str, dry: bool) -> Res<Step> {
         let ns = self.existing()?;
+        let uploader = ctx.uploader()?;
         if !req.items.is_empty() && ns.frozen {
             return Err(Err::new(409, "frozen", "the namespace is frozen"));
         }
@@ -524,7 +525,28 @@ impl Namespace {
             tombstoned: bool,
         }
         let mut starts: Vec<Option<Start>> = Vec::new();
+        // Each item's candidate verbs for its first step (§C.2, several verbs).
+        let mut candidates: Vec<Vec<&'static str>> = Vec::new();
         for (i, it) in req.items.iter().enumerate() {
+            let verbs: &[&'static str] = match (&it.pre, &it.steps[0].op) {
+                (_, Op::Delete) => &["delete"],
+                (Precondition::NoneMatchStar, _) => &["create"],
+                (Precondition::Match(_), _) => &["append", "restore"],
+            };
+            match ctx.step1(verbs, Some(&it.resource)) {
+                Ok(c) => candidates.push(c),
+                Err(e) if e.status == 401 => return Err(e),
+                Err(e) => {
+                    failures.push(Failure {
+                        index: i,
+                        step: 1,
+                        err: e,
+                    });
+                    candidates.push(vec![]);
+                    starts.push(None);
+                    continue;
+                }
+            }
             let (cur, foreign) = self.head_or_foreign(&it.resource)?;
             let fail = |err: Err| Failure {
                 index: i,
@@ -615,8 +637,8 @@ impl Namespace {
                     req.source.as_ref(),
                 ));
                 if let Some(row) = self.one::<IdRow>(
-                    "SELECT id FROM ns_log WHERE entry = ?1 AND author = ?2 AND seq > ?3 ORDER BY seq DESC LIMIT 1",
-                    vec![entry.into(), author.into(), (ns.seq - 100_000).into()],
+                    "SELECT id FROM ns_log WHERE entry = ?1 AND author = ?2 AND seq > ?3 AND IFNULL(json_extract(grant_ref, '$.kid'), '') = ?4 ORDER BY seq DESC LIMIT 1",
+                    vec![entry.into(), author.into(), (ns.seq - 100_000).into(), ctx.kid().unwrap_or_default().into()],
                 )? {
                     let body = success_body(&req.items, &ids, &row.id, config_id.as_ref());
                     return batch_response(200, &body, &row.id, config_id.as_ref()).map(Step::Done);
@@ -671,7 +693,7 @@ impl Namespace {
                 Precondition::NoneMatchStar => None,
             };
             let mut failed = None;
-            for st in &it.steps {
+            for (k, st) in it.steps.iter().enumerate() {
                 match &st.op {
                     Op::Patch(body) => {
                         let kind = if tombstoned {
@@ -699,7 +721,7 @@ impl Namespace {
                                 break;
                             }
                         };
-                        match self.check_blob_refs(&it.resource, &p.doc, author) {
+                        match self.check_blob_refs(&it.resource, &p.doc, &uploader) {
                             Ok(b) => blob_stmts.extend(b),
                             Err(e) => {
                                 failed = Some((4, e));
@@ -721,10 +743,22 @@ impl Namespace {
                             WriteKind::Append => "append",
                             WriteKind::Restore => "restore",
                         };
-                        if let Err(e) = check_rules(
-                            &rules_head,
-                            &envelope(ctx, action, &it.resource, &p.writes, &p.doc, &body.value),
-                        ) {
+                        // The first step's verb settles among its candidates.
+                        if k == 0 && !candidates[i].contains(&action) {
+                            failed = Some((
+                                2,
+                                crate::auth::forbidden(format!(
+                                    "the grant doesn't allow {action} here"
+                                )),
+                            ));
+                            break;
+                        }
+                        let env =
+                            envelope(ctx, action, &it.resource, &p.writes, &p.doc, &body.value);
+                        if let Err(e) = ctx
+                            .step6(action, &env)
+                            .and_then(|()| check_rules(&rules_head, &env))
+                        {
                             failed = Some((6, e));
                             break;
                         }
@@ -756,17 +790,18 @@ impl Namespace {
                     Op::Delete => {
                         let parent = prev.expect("a delete under ifMatch, or after a step");
                         let deleted = doc.clone().unwrap_or(Value::Null);
-                        if let Err(e) = check_rules(
-                            &rules_head,
-                            &envelope(
-                                ctx,
-                                "delete",
-                                &it.resource,
-                                &[],
-                                &deleted,
-                                &Value::Array(vec![]),
-                            ),
-                        ) {
+                        let env = envelope(
+                            ctx,
+                            "delete",
+                            &it.resource,
+                            &[],
+                            &deleted,
+                            &Value::Array(vec![]),
+                        );
+                        if let Err(e) = ctx
+                            .step6("delete", &env)
+                            .and_then(|()| check_rules(&rules_head, &env))
+                        {
                             failed = Some((6, e));
                             break;
                         }
@@ -857,7 +892,7 @@ impl Namespace {
             ns.config_seq
         };
         let mut stmts: Vec<Stmt> = vec![(
-            "INSERT INTO ns_log (seq, id, prev, entry, author, created, gesture, undoes, config_seq) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+            "INSERT INTO ns_log (seq, id, prev, entry, author, created, gesture, undoes, config_seq, grant_ref, via) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)",
             vec![
                 ns_seq.into(),
                 ns_id_new.text().into(),
@@ -866,6 +901,8 @@ impl Namespace {
                 author.into(),
                 ctx.now.into(),
                 config_seq.into(),
+                ctx.grant_cols().0,
+                ctx.grant_cols().1,
             ],
         )];
         if let Some(p) = &config_plan {
@@ -874,7 +911,7 @@ impl Namespace {
         for (k, e) in planned.iter().enumerate() {
             let seq = start + k as i64;
             stmts.push((
-                "INSERT INTO res_log (resource, seq, id, parent, kind, patches, author, created, gesture, undoes, depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO res_log (resource, seq, id, parent, kind, patches, author, created, gesture, undoes, depth, kid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 vec![
                     e.resource.clone().into(),
                     seq.into(),
@@ -887,6 +924,7 @@ impl Namespace {
                     e.gesture.clone().into(),
                     e.undoes.clone().into(),
                     e.depth.into(),
+                    ctx.kid().into(),
                 ],
             ));
             if let (Some(doc), true) = (&e.doc, e.depth % SNAPSHOT_EVERY == 0) {
@@ -901,6 +939,7 @@ impl Namespace {
             }
         }
         stmts.extend(blob_stmts);
+        stmts.extend(ctx.grant_stmt());
         self.commit(stmts)?;
 
         // The caches: each resource's head, and its document if live.

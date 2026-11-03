@@ -77,6 +77,13 @@ fn blob_from_json(v: &Value) -> Option<BlobRef> {
     })
 }
 
+fn grant_col(v: Option<&Value>) -> SqlStorageValue {
+    match v {
+        None | Some(Value::Null) => SqlStorageValue::Null,
+        Some(x) => canonical_string(x).into(),
+    }
+}
+
 fn kind_name(kind: i64) -> &'static str {
     if kind == TOMBSTONE {
         "tombstone"
@@ -167,7 +174,7 @@ impl Namespace {
     /// `POST /ns/{base}/branches` (§7.6).
     pub(super) async fn create_branch(&self, ctx: &Ctx, hd: &Headers, raw: &[u8]) -> Res<Response> {
         http::content_type_is(hd, "application/json")?;
-        let author = author(hd)?;
+        let author = ctx.author()?;
         match http::precondition(hd)? {
             Precondition::NoneMatchStar => {}
             Precondition::Match(_) => {
@@ -204,10 +211,22 @@ impl Namespace {
         let ops = parse_patch_set(&patches).map_err(|e| Err::bad(e.to_string()))?;
         let patches_canon = canonical_string(&patches);
         let ns = self.existing()?;
+        // Step 1 (§C.2 item 2): `branch` on the base, with unrestricted
+        // `read` of it, with what's known before the document.
+        ctx.step1(&["branch"], Some(&name))?;
+        if let Some(c) = ctx.grant() {
+            let env = crate::auth::read_envelope(c, None, &rfc3339_ms(ctx.now));
+            if !c.unrestricted_read() || c.allow("read", &env, true).is_err() {
+                return Err(crate::auth::forbidden(
+                    "branching needs unrestricted read of the base",
+                ));
+            }
+        }
 
         // A taken name; a retry by the same author gets 200.
         let retry = |row: &BranchRow| -> Res<Option<Response>> {
             let same = row.author == author
+                && self.entry_kid(row.ns_seq)? == ctx.kid()
                 && at_given.as_deref().is_none_or(|a| a == row.at)
                 && row.patches == patches_canon;
             if !same {
@@ -300,11 +319,19 @@ impl Namespace {
         measure(&doc, &lim)
             .check(&lim)
             .map_err(|e| limit_err(422, e.limit, e.measured.unwrap_or(0), e.max))?;
-        // The base's rules see a `branch` envelope.
-        check_rules(
-            &ns,
-            &envelope(ctx, "branch", &name, &writes, &doc, &patches),
-        )?;
+        // Step 6: the `*`-key guard on `patches`, with a key of the base,
+        // then grant rules, then the base's rules, on a `branch` envelope.
+        let mut copied = ns.config.clone();
+        if let Value::Object(m) = &mut copied {
+            m.insert(
+                "read".into(),
+                doc.get("read").cloned().unwrap_or(Value::Null),
+            );
+        }
+        ctx.star_guard(&writes, &copied, &doc)?;
+        let env = envelope(ctx, "branch", &name, &writes, &doc, &patches);
+        ctx.step6("branch", &env)?;
+        check_rules(&ns, &env)?;
         let genesis = Value::Array(vec![obj(vec![
             ("op", s("add")),
             ("path", s("")),
@@ -317,6 +344,14 @@ impl Namespace {
             ("author", s(author.clone())),
             ("depth", Value::Number(depth as f64)),
             ("base_public", Value::Bool(ns.public)),
+            // The creator's grant is recorded on both entries (§7.4).
+            ("grant_ref", crate::auth::grant_ref(&ctx.caller)),
+            (
+                "via",
+                ctx.principal()
+                    .and_then(|p| p.get("via").cloned())
+                    .unwrap_or(Value::Null),
+            ),
         ]);
         let (status, text) = call(
             &self.env,
@@ -359,13 +394,15 @@ impl Namespace {
         };
         let (ns_seq, ns_id_new, ns_stmt) =
             self.ns_entry(ctx, &ns, &entry, &author, &g, ns.config_seq);
-        self.commit(vec![
+        let mut stmts = vec![
             ns_stmt,
             (
                 "INSERT INTO branches (name, at, author, patches, target, ns_seq) VALUES (?, ?, ?, ?, ?, ?)",
                 vec![name.as_str().into(), at.into(), author.into(), patches_canon.into(), target.text().into(), ns_seq.into()],
             ),
-        ])?;
+        ];
+        stmts.extend(ctx.grant_stmt());
+        self.commit(stmts)?;
         self.set_head(NsHead {
             seq: ns_seq,
             id: ns_id_new,
@@ -624,8 +661,15 @@ impl Namespace {
         };
         self.commit(vec![
             (
-                "INSERT INTO ns_log (seq, id, prev, entry, author, created, gesture, undoes, config_seq) VALUES (1, ?, NULL, ?, ?, ?, NULL, NULL, 1)",
-                vec![ns_id_new.text().into(), canonical_string(&entry).into(), author.as_str().into(), ctx.now.into()],
+                "INSERT INTO ns_log (seq, id, prev, entry, author, created, gesture, undoes, config_seq, grant_ref, via) VALUES (1, ?, NULL, ?, ?, ?, NULL, NULL, 1, ?, ?)",
+                vec![
+                    ns_id_new.text().into(),
+                    canonical_string(&entry).into(),
+                    author.as_str().into(),
+                    ctx.now.into(),
+                    grant_col(v.get("grant_ref")),
+                    grant_col(v.get("via")),
+                ],
             ),
             plan.insert(1, &author, 1),
             (
@@ -767,7 +811,7 @@ impl Namespace {
         let Some((base, at)) = base_of(ns) else {
             return Ok(None);
         };
-        let url = format!("https://namespace/ns/{base}/rev/{at}/heads?after={after}");
+        let url = internal_url(&base, &format!("heads/{at}?after={after}"));
         let (status, text) = call(&self.env, &base, &url, None).await?;
         if status != 200 {
             return Err(Err::new(

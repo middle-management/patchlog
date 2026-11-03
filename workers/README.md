@@ -104,8 +104,30 @@ append writes 4: past that, writes answer `503` with `Retry-After` until 00:00 U
 - Batches (`POST /ns/{ns}/batch`, §7.5): items with several steps (patch sets, `"delete"`, restores), an optional `config` change, `source`, per-step gestures, idempotent retries and dry runs. Every step is checked as §6.2 says (schemas written by earlier items resolve for later ones), and the batch commits all or nothing as one `batch` entry. A batch's resource entries each take their own sequence number, and the `batch` entry the last of them.
 - Blobs (§7.8) on R2 (`BLOBS`, bucket `patchlog-blobs`), stored once per id under `b/{id}`: uploads checked against the id over the body, pending entries per uploader (`blobPending`, `blobGrace` of 24 h), attachment by the write that references them (in single writes and batches), `Blob-From` copies within a namespace, reads of attached blobs with ranges, `nosniff` and `sandbox`, and `GET …/raw` redirecting raw documents to their blob. Uploads are held in memory while hashed, so `blobSize` is 32 MiB here.
 - Branches (§7.6): `POST /ns/{base}/branches` (the branch's document, the base's rules on a `branch` envelope, `branchDepth`, `branchesPerNamespace`, retries, taken names) and `GET /ns/{ns}/branches`. A branch reads resources without entries of its own through its base as of `at`, recursively: heads, revisions, `/raw`, blobs, `/heads` pages and resource logs, which cross the foreign parent. First writes, deletes and batch steps take the base's head as their foreign parent. A batch with a local `source` may reference the source's blobs, so merges carry them. Each namespace is its own Durable Object, so a branch asks its base's object over internal requests (`/internal/…`, never forwarded by the front Worker) and keeps the answers, which never change.
+- Grants (Addendum C), with `AUTH = "grants"` (see Authentication below):
+  - **Tokens:** Biscuit v3 grants are verified per §C.8 against all the Addendum I.14 vectors (`crates/core/src/grant.rs`, Ed25519 verified strictly).
+  - **The order of §7 and §C.2:** `grantSize` and `rulesPerGrant`, then the `ns` check (`403`), then verification against the namespace's `keys` or the deployment's operator keys. Verification covers times, `revoked` and the key scope (`can`, `maxTtl`, `sub`, `groups`, `roles`, `attrs`, `rules`, `readScope`).
+  - **Writes:** verbs are checked at gate step 1, with candidate verbs for `PATCH`, batch items and blob uploads. All key, block and role rules are checked at step 6, before the namespace rules.
+  - **The `*`-key guard** applies to config writes and to a branch's `patches`. Namespace rules also judge config writes made without a `*` key.
+  - **Reads of a namespace that isn't public:** `/ns/…` needs unrestricted `read`; a resource is `404` without `read`. Reads of public namespaces ignore grants.
+  - **Creating a namespace** takes an operator grant.
+  - **Log entries** record `grant: { id, sub, kid }` and `via`. Retries must come from the same `sub` and `kid`.
+  - **Endpoints:** `GET /ns/{ns}/grants/{gid}` and `GET /ns/{ns}/principal`. Operator keys are published at `/.well-known/patchlog-keys` and named by `GET /`.
+  - **Namespace documents** accept `keys`, `roles` and `revoked`.
 - CORS (§7, browsers): every origin allowed, none credentialed. Preflights answer from the front Worker with the methods and headers §7 lists and `Access-Control-Max-Age`; every response, errors and cache hits included, carries `Access-Control-Allow-Origin: *` and the exposed headers.
 - The vectors of Addendum I.1 (canonical JSON), I.2 (ids) and I.3 (blob ids).
+
+## Authentication
+
+Authentication is off unless `AUTH = "grants"` (§1): with it off, writes name their author in `X-Author`. To turn it on, set `AUTH = "grants"` and give the deployment's operator public keys in `OPERATOR_JWKS`, a JWK Set (§C.4: OKP Ed25519 keys with `kid`, `use: "sig"` and `patchlog: { from, until? }`). Only public keys are configured. Namespaces are then created with an operator grant whose genesis document lists the namespace's own `keys`, and everything else uses grants signed by those.
+
+`crates/grant` is a command-line tool for development and issuers:
+- `patchlog-grant keygen` makes a key pair;
+- `patchlog-grant mint --seed … --root '<json>' [--block '<json>']` signs a grant;
+- `patchlog-grant attenuate` adds a narrowing block;
+- `patchlog-grant inspect` shows a token's blocks, grant id and revocation ids.
+
+`bench/auth-smoke.mjs` runs the grant checks against a local deployment with fixed development keys (its header has the command).
 
 ## Client
 
@@ -115,7 +137,15 @@ append writes 4: past that, writes answer `503` with `Retry-After` until 00:00 U
 
 Roughly in order of how much they change the design:
 
-- **Addendum C** (grants, Biscuit, edge grants) and so private reads, roles and key scopes; rate limits (§6.6).
+- **Grants beyond the core:**
+  - author signatures and `signatures: "required"` (§C.3.1);
+  - edge grants (§C.5.2–§C.5.4), so private reads aren't cached at the edge;
+  - `requireAt` and `maxLag` (keys with `requireAt` are refused);
+  - rate limits and `allowances` (§6.6);
+  - keys and revocations that follow a branch's base (§C.4): a branch has the keys copied at its creation;
+  - the per-resource filtering of the gesture listing (it needs unrestricted `read`);
+  - grants recorded by a branch's bases in `/grants/{gid}`;
+  - read permission on schema revisions in other namespaces (§6.1).
 - **Schemas, beyond the core** (§6.1): `schemaReads`, drafts in branches, read permission on schema revisions (with authentication off, every revision is readable), and the `in_use` refusals (there is no purge yet). `idn-hostname` and `idn-email` are checked as the `jsonschema` crate does, which may differ from RFC 5890 without UTS 46 mapping in edge cases.
 - Purge (§8.3, §8.5) and pruning (§8.6), and so removing unreferenced blob bytes from R2; SSE (§7.3), `/principal`, credentialed CORS (edge grants, §C.5.2).
 - Branches beyond the local core: remote branches (§G.3), `drafts`, checking that `successor` names a namespace and the branch limit on unfreezing. Creating a branch writes in two objects; a retry completes one that failed half-way.

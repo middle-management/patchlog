@@ -12,3 +12,5 @@ patchlog-core = { path = "../core" }
 worker = "0.8"
 serde = { version = "1", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false }
+regex = "1"
+sha2 = "0.10"

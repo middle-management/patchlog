@@ -4,6 +4,7 @@
 //! immutable responses from the Cache API, and forwards everything else to
 //! the namespace's Durable Object (`ns.rs`), addressed by the namespace name.
 
+mod auth;
 mod http;
 mod ns;
 mod nsdoc;
@@ -51,7 +52,10 @@ fn preflight() -> Result<Response> {
     h.set("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS)?;
     h.set("Access-Control-Max-Age", "86400")?;
     h.set("Cache-Control", "public, max-age=86400")?;
-    Ok(ResponseBuilder::new().with_status(204).with_headers(h).empty())
+    Ok(ResponseBuilder::new()
+        .with_status(204)
+        .with_headers(h)
+        .empty())
 }
 
 async fn front(req: Request, env: Env, ctx: Context) -> std::result::Result<Response, Err> {
@@ -67,12 +71,27 @@ async fn front(req: Request, env: Env, ctx: Context) -> std::result::Result<Resp
         };
         let h = Headers::new();
         http::cache_headers(&h, http::Class::Short, true)?;
-        let body = http::obj(vec![
+        let grants = auth::enabled(&env);
+        let mut body = vec![
             ("origin", http::s(origin)),
             ("spec", http::s("0.74")),
-            ("auth", http::s("disabled")),
-        ]);
-        return http::json(200, h, &body);
+            ("auth", http::s(if grants { "grants" } else { "disabled" })),
+        ];
+        if grants {
+            body.push(("jwks_uri", http::s(auth::JWKS_PATH)));
+        }
+        return http::json(200, h, &http::obj(body));
+    }
+    // §C.4: the deployment's operator key history, as a JWK Set.
+    if path == auth::JWKS_PATH {
+        if req.method() != Method::Get && req.method() != Method::Head {
+            return Err(Err::new(405, "bad_input", "method not allowed"));
+        }
+        let h = Headers::new();
+        h.set("Content-Type", "application/jwk-set+json")?;
+        h.set("Cache-Control", "public, max-age=300")?;
+        let set = auth::operator_jwks(&env)?;
+        return http::respond(200, h, patchlog_core::json::canonical(&set));
     }
     // §7: empty, `.` and `..` segments, a trailing `/` and percent-escapes are 400.
     if path.contains('%') || path.ends_with('/') || path.contains("//") {

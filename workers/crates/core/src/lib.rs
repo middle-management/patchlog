@@ -7,6 +7,7 @@
 pub mod blob;
 pub mod fmt;
 pub mod gate;
+pub mod grant;
 pub mod id;
 pub mod json;
 pub mod limits;

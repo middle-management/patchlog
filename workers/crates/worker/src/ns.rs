@@ -23,6 +23,7 @@ use worker::wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use worker::wasm_bindgen_futures::JsFuture;
 use worker::*;
 
+mod access;
 mod batch;
 mod blob;
 mod branch;
@@ -60,6 +61,21 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS res_snapshots (resource TEXT NOT NULL, seq INTEGER NOT NULL, doc TEXT NOT NULL, PRIMARY KEY (resource, seq)) WITHOUT ROWID",
     // Blob attachments and pending uploads (§7.8); see `ns/blob.rs`.
     blob::SCHEMA,
+    // Grants writes were made under (§C.3): the root block and the stored,
+    // non-bearer form, by grant id.
+    "CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, root TEXT NOT NULL, stored TEXT NOT NULL) WITHOUT ROWID",
+];
+
+/// Columns added since the tables were first created: each `ALTER` fails
+/// harmlessly where the column exists.
+const COLUMNS: &[&str] = &[
+    // `grant` ({ id, sub, kid }, null while authentication is disabled) and
+    // `via` of a namespace entry (§7.4).
+    "ALTER TABLE ns_log ADD COLUMN grant_ref TEXT",
+    "ALTER TABLE ns_log ADD COLUMN via TEXT",
+    // The root kid a resource entry was written under: with `author`, the
+    // principal a retry must match (§7.2).
+    "ALTER TABLE res_log ADD COLUMN kid TEXT",
 ];
 
 /// Long-polls that wait on hibernatable WebSockets before the rest wait in
@@ -104,6 +120,10 @@ struct NsRow {
     gesture: Option<String>,
     undoes: Option<String>,
     config_seq: i64,
+    #[serde(default)]
+    grant_ref: Option<String>,
+    #[serde(default)]
+    via: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +149,9 @@ struct EntryRow {
     ns_seq: i64,
     #[allow(dead_code)]
     depth: i64,
+    /// The root kid of the grant it was written under (§7.2 same principal).
+    #[serde(default)]
+    kid: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -212,6 +235,7 @@ type Stmt = (&'static str, Vec<SqlStorageValue>);
 struct Ctx {
     ns: String,
     now: i64,
+    caller: crate::auth::Caller,
 }
 
 impl DurableObject for Namespace {
@@ -288,6 +312,9 @@ impl Namespace {
         if !self.schema_ready.get() {
             for q in SCHEMA.iter().chain(branch::SCHEMA) {
                 self.sql.exec(q, None)?;
+            }
+            for q in COLUMNS {
+                let _ = self.sql.exec(q, None);
             }
             self.schema_ready.set(true);
         }
@@ -486,7 +513,7 @@ impl Namespace {
         let id = ns_id(Some(&h.id), &canonical(entry));
         let seq = h.seq + 1;
         let stmt: Stmt = (
-            "INSERT INTO ns_log (seq, id, prev, entry, author, created, gesture, undoes, config_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO ns_log (seq, id, prev, entry, author, created, gesture, undoes, config_seq, grant_ref, via) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 seq.into(),
                 id.text().into(),
@@ -497,6 +524,8 @@ impl Namespace {
                 g.gesture.clone().into(),
                 g.undoes.clone().into(),
                 config_seq.into(),
+                ctx.grant_cols().0,
+                ctx.grant_cols().1,
             ],
         );
         (seq, id, stmt)
@@ -507,11 +536,26 @@ impl Namespace {
         let url = req.url()?;
         let segs: Vec<String> = path[1..].split('/').map(String::from).collect();
         let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+        let now = Date::now().as_millis() as i64;
+        let m = req.method();
+        // Object-to-object requests carry no grant; the front Worker never
+        // forwards `/internal/…`.
+        let read = matches!(m, Method::Get | Method::Head)
+            && !(segs[0] == "ns" && segs.get(2) == Some(&"principal"));
+        let caller = if segs[0] == "internal" {
+            crate::auth::Caller::Disabled(None)
+        } else {
+            self.caller(segs[1], req.headers(), read, now)?
+        };
         let ctx = Ctx {
             ns: segs[1].to_string(),
-            now: Date::now().as_millis() as i64,
+            now,
+            caller,
         };
-        let m = req.method();
+        if read && segs[0] != "internal" {
+            let resource = (segs[0] == "r").then(|| segs[2]);
+            self.gate_read(&ctx, resource)?;
+        }
         // A branch reads resources without entries of its own through its base.
         if segs[0] == "r" && segs.len() > 2 {
             self.prefetch(&[segs[2]]).await?;
@@ -561,6 +605,14 @@ impl Namespace {
                 self.report_to_base(&ctx, before).await?;
                 Ok(r)
             }
+            ("ns", ["grants", gid]) if m == Method::Get || m == Method::Head => {
+                http::query(&url, &[])?;
+                self.get_grant(&ctx, gid)
+            }
+            ("ns", ["principal"]) if m == Method::Get || m == Method::Head => {
+                http::query(&url, &[])?;
+                self.get_principal(&ctx)
+            }
             ("ns", ["branches"]) => match m {
                 Method::Post => {
                     let body = req.bytes().await?;
@@ -602,6 +654,18 @@ impl Namespace {
                     None => Err(Err::not_found()),
                 }
             }
+            ("internal", ["schema", name, "rev", id]) => {
+                self.get_rev(&ctx, name, id, &Headers::new()).await
+            }
+            ("internal", ["heads", at]) => {
+                let q = http::query(&url, &["after"])?;
+                self.get_heads(&ctx, at, q.get("after").map(String::as_str).unwrap_or(""))
+                    .await
+            }
+            ("internal", ["has", at]) => match self.ns_seq_of(at)? {
+                Some(_) => http::respond(204, Headers::new(), vec![]),
+                None => Err(Err::not_found()),
+            },
             ("internal", ["rev", at, name, id]) => match self.rev_at(at, name, id).await? {
                 Some(v) => http::json(200, Headers::new(), &v),
                 None => Err(Err::not_found()),
@@ -717,7 +781,18 @@ impl Namespace {
                 r.prev.clone().map(Value::String).unwrap_or(Value::Null),
             );
             m.insert("author".into(), s(r.author.clone()));
-            m.insert("grant".into(), Value::Null);
+            // `{ id, sub, kid }`, or null while authentication is disabled.
+            let grant = match &r.grant_ref {
+                Some(g) => parse_stored(g)?,
+                None => Value::Null,
+            };
+            m.insert("grant".into(), grant);
+            if let Some(v) = &r.via {
+                let v = parse_stored(v)?;
+                if v.as_array().is_some_and(|a| !a.is_empty()) {
+                    m.insert("via".into(), v);
+                }
+            }
             m.insert("created".into(), s(rfc3339_ms(r.created)));
             if let Some(g) = &r.gesture {
                 m.insert("gesture".into(), s(g.clone()));
@@ -968,7 +1043,7 @@ impl Namespace {
         http::content_type_is(hd, "application/json-patch+json")?;
         let pre = http::precondition(hd)?;
         let g = Gesture::from(hd)?;
-        let author = author(hd)?;
+        let author = ctx.author()?;
         let body = gate::read_body(body, &Limits::deployment_max()).map_err(gate_err)?;
         let head = self.head()?;
         let plan = match self.prepare_config(ctx, &pre, &body, &head, &author)? {
@@ -982,7 +1057,7 @@ impl Namespace {
         let (seq, ns_id_new, ns_stmt) = if head.is_none() {
             let id = ns_id(None, &canonical(&entry));
             let stmt: Stmt = (
-                "INSERT INTO ns_log (seq, id, prev, entry, author, created, gesture, undoes, config_seq) VALUES (1, ?, NULL, ?, ?, ?, ?, ?, 1)",
+                "INSERT INTO ns_log (seq, id, prev, entry, author, created, gesture, undoes, config_seq, grant_ref, via) VALUES (1, ?, NULL, ?, ?, ?, ?, ?, 1, ?, ?)",
                 vec![
                     id.text().into(),
                     canonical_string(&entry).into(),
@@ -990,6 +1065,8 @@ impl Namespace {
                     ctx.now.into(),
                     g.gesture.clone().into(),
                     g.undoes.clone().into(),
+                    ctx.grant_cols().0,
+                    ctx.grant_cols().1,
                 ],
             );
             (1, id, stmt)
@@ -997,7 +1074,9 @@ impl Namespace {
             self.ns_entry(ctx, &prev, &entry, &author, &g, prev.config_seq + 1)
         };
         let config_seq = prev.config_seq + 1;
-        self.commit(vec![ns_stmt, plan.insert(config_seq, &author, seq)])?;
+        let mut stmts = vec![ns_stmt, plan.insert(config_seq, &author, seq)];
+        stmts.extend(ctx.grant_stmt());
+        self.commit(stmts)?;
         self.set_head(make_head(seq, ns_id_new, config_seq, plan.id, plan.doc));
         config_written(ctx, 201, &plan.id.text(), &ns_id_new.text())
     }
@@ -1015,6 +1094,26 @@ impl Namespace {
         head: &Option<NsHead>,
         author: &str,
     ) -> Res<ConfigStep> {
+        // Step 1 (§C.2): creating a namespace takes the operator grant that
+        // creates it; any other config write, a namespace grant with `config`.
+        match (ctx.grant(), head) {
+            (Some(c), None) if c.operator => {
+                if !c.can.contains("config") {
+                    return Err(crate::auth::forbidden(
+                        "the operator grant doesn't allow config",
+                    ));
+                }
+            }
+            (Some(_), None) => {
+                return Err(crate::auth::unauthorized(
+                    "creating a namespace takes an operator grant",
+                ))
+            }
+            (Some(_), Some(_)) => {
+                ctx.step1(&["config"], None)?;
+            }
+            (None, _) => {}
+        }
         let (parent_id, parent_doc, limits) = match (pre, head) {
             (Precondition::NoneMatchStar, None) => (None, Value::Null, Limits::default()),
             (Precondition::NoneMatchStar, Some(_)) => {
@@ -1029,7 +1128,7 @@ impl Namespace {
                         "SELECT * FROM ns_config WHERE id = ?",
                         vec![id.text().into()],
                     )? {
-                        if c.author == author {
+                        if c.author == author && self.entry_kid(c.ns_seq)? == ctx.kid() {
                             let ns: IdRow = self
                                 .one("SELECT id FROM ns_log WHERE seq = ?", vec![c.ns_seq.into()])?
                                 .ok_or_else(|| Err::new(500, "internal", "missing entry"))?;
@@ -1061,6 +1160,19 @@ impl Namespace {
         validate_config(&doc)?;
         let base_public = self.meta("base_public")?.is_none_or(|v| v == "1");
         branch::check_branch_fields(&prev_doc, &doc, false, base_public)?;
+        // Step 6: the `*`-key guard first, then grant rules, then the
+        // namespace rules in force, which `*` keys skip (§C.2, §6.4.3).
+        if let Some(h) = head {
+            ctx.star_guard(&writes, &prev_doc, &doc)?;
+            let mut env = envelope(ctx, "config", "", &writes, &doc, &body.value);
+            if let Value::Object(m) = &mut env {
+                m.remove("resource");
+            }
+            ctx.step6("config", &env)?;
+            if ctx.config_rules_apply() {
+                check_rules(h, &env)?;
+            }
+        }
         let new_limits = Limits::from_config(&doc);
         measure(&doc, &new_limits)
             .check(&new_limits)
@@ -1144,6 +1256,22 @@ impl Namespace {
             live: None,
         };
         Ok((Some(h), Some(f)))
+    }
+
+    /// The root kid recorded with a namespace entry (§7.4 `grant`).
+    fn entry_kid(&self, ns_seq: i64) -> Res<Option<String>> {
+        #[derive(Deserialize)]
+        struct G {
+            grant_ref: Option<String>,
+        }
+        Ok(self
+            .one::<G>(
+                "SELECT grant_ref FROM ns_log WHERE seq = ?",
+                vec![ns_seq.into()],
+            )?
+            .and_then(|g| g.grant_ref)
+            .and_then(|g| json::parse(g.as_bytes()).ok())
+            .and_then(|g| g.get("kid").and_then(Value::as_str).map(String::from)))
     }
 
     fn remember(&self, name: &str, h: Option<Head>) {
@@ -1266,7 +1394,14 @@ impl Namespace {
         };
         let stub = self.env.durable_object("NAMESPACE")?.get_by_name(ns)?;
         let mut r = stub
-            .fetch_with_str(&format!("https://namespace{path}"))
+            // `/r/{ns}/{name}/rev/{id}` as an internal request: schema
+            // revisions resolve for writes whatever the namespace's read mode.
+            .fetch_with_str(&format!(
+                "https://namespace/internal/{}",
+                path.strip_prefix("/r/")
+                    .unwrap_or(path)
+                    .replacen('/', "/schema/", 1)
+            ))
             .await?;
         if r.status_code() != 200 {
             return Err(unavailable(match r.status_code() {
@@ -1402,7 +1537,13 @@ impl Namespace {
         http::content_type_is(hd, "application/json-patch+json")?;
         let pre = http::precondition(hd)?;
         let g = Gesture::from(hd)?;
-        let author = author(hd)?;
+        let author = ctx.author()?;
+        // Step 1: the verbs this write may be (§C.2, several verbs).
+        let verbs: &[&'static str] = match &pre {
+            Precondition::NoneMatchStar => &["create"],
+            Precondition::Match(_) => &["append", "restore"],
+        };
+        let candidates = ctx.step1(verbs, Some(name))?;
         let body: Body = gate::read_body(raw, &Limits::deployment_max()).map_err(gate_err)?;
         let ns = self.existing()?;
         let (cur, foreign) = self.head_or_foreign(name)?;
@@ -1421,7 +1562,10 @@ impl Namespace {
         };
         if !pre_holds && cur.is_some() {
             if let Some(e) = self.entry_by_id(name, &id)? {
-                if e.author == author && e.parent.as_deref().and_then(Id::parse) == parent {
+                if e.author == author
+                    && e.kid == ctx.kid()
+                    && e.parent.as_deref().and_then(Id::parse) == parent
+                {
                     return self.written(ctx, name, &e, 200).map(Step::Done);
                 }
             }
@@ -1432,6 +1576,16 @@ impl Namespace {
             (Precondition::Match(_), Some(e)) if e.kind == TOMBSTONE => WriteKind::Restore,
             (Precondition::Match(_), _) => WriteKind::Append,
         };
+        let verb = match kind {
+            WriteKind::Create => "create",
+            WriteKind::Append => "append",
+            WriteKind::Restore => "restore",
+        };
+        if !candidates.contains(&verb) {
+            return Err(crate::auth::forbidden(format!(
+                "the grant doesn't allow {verb} here"
+            )));
+        }
         if ns.frozen {
             return Err(Err::new(409, "frozen", "the namespace is frozen"));
         }
@@ -1482,7 +1636,7 @@ impl Namespace {
         let p = gate::apply_and_check(parent.as_ref(), doc, &body, kind, &ns.limits)
             .map_err(gate_err)?;
         // Step 4, blob references: each available to the resource.
-        let blob_stmts = self.check_blob_refs(name, &p.doc, &author)?;
+        let blob_stmts = self.check_blob_refs(name, &p.doc, &ctx.uploader()?)?;
         // Step 5: the resulting document against its schema.
         if let Some(remote) = self.check_typed(ctx, &p.doc)? {
             return Ok(Step::NeedSchemas(remote));
@@ -1493,10 +1647,9 @@ impl Namespace {
             WriteKind::Append => "append",
             WriteKind::Restore => "restore",
         };
-        check_rules(
-            &ns,
-            &envelope(ctx, action, name, &p.writes, &p.doc, &body.value),
-        )?;
+        let env = envelope(ctx, action, name, &p.writes, &p.doc, &body.value);
+        ctx.step6(action, &env)?;
+        check_rules(&ns, &env)?;
         // Step 7: hash and insert. The resource entry takes its namespace
         // entry's sequence number.
         let entry = obj(vec![
@@ -1511,7 +1664,7 @@ impl Namespace {
         let mut stmts = vec![
             ns_stmt,
             (
-                "INSERT INTO res_log (resource, seq, id, parent, kind, patches, author, created, gesture, undoes, depth) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO res_log (resource, seq, id, parent, kind, patches, author, created, gesture, undoes, depth, kid) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
                 vec![
                     name.into(),
                     seq.into(),
@@ -1523,6 +1676,7 @@ impl Namespace {
                     g.gesture.clone().into(),
                     g.undoes.clone().into(),
                     depth.into(),
+                    ctx.kid().into(),
                 ],
             ),
         ];
@@ -1533,6 +1687,7 @@ impl Namespace {
             ));
         }
         stmts.extend(blob_stmts);
+        stmts.extend(ctx.grant_stmt());
         self.commit(stmts)?;
         self.remember(
             name,
@@ -1562,6 +1717,7 @@ impl Namespace {
             undoes: g.undoes,
             ns_seq,
             depth,
+            kid: ctx.kid(),
         };
         written_response(ctx, name, &e, &ns_id_new.text(), 201).map(Step::Done)
     }
@@ -1576,7 +1732,7 @@ impl Namespace {
     fn delete_resource(&self, ctx: &Ctx, name: &str, hd: &Headers) -> Res<Response> {
         let pre = http::precondition(hd)?;
         let g = Gesture::from(hd)?;
-        let author = author(hd)?;
+        let author = ctx.author()?;
         let Precondition::Match(parent) = pre else {
             return Err(Err::new(
                 428,
@@ -1584,12 +1740,13 @@ impl Namespace {
                 "DELETE takes If-Match",
             ));
         };
+        ctx.step1(&["delete"], Some(name))?;
         let ns = self.existing()?;
         let tomb = tombstone_id(&parent);
         let (cur, foreign) = self.head_or_foreign(name)?;
         if cur.as_ref().is_some_and(|h| h.id != parent.text()) {
             if let Some(e) = self.entry_by_id(name, &tomb)? {
-                if e.author == author {
+                if e.author == author && e.kid == ctx.kid() {
                     return self.written(ctx, name, &e, 200);
                 }
             }
@@ -1609,14 +1766,15 @@ impl Namespace {
         // Step 6: rules see the document being deleted, with no writes (§6.4.1).
         let deleted = match &foreign {
             Some(f) => Some(f.doc.clone().unwrap_or(Value::Null)),
-            None if ns.rules.is_some() => Some(self.doc_at(name, head.seq, false)?),
+            None if ns.rules.is_some() || ctx.grant().is_some() => {
+                Some(self.doc_at(name, head.seq, false)?)
+            }
             None => None,
         };
-        if let (true, Some(doc)) = (ns.rules.is_some(), &deleted) {
-            check_rules(
-                &ns,
-                &envelope(ctx, "delete", name, &[], doc, &Value::Array(vec![])),
-            )?;
+        if let Some(doc) = &deleted {
+            let env = envelope(ctx, "delete", name, &[], doc, &Value::Array(vec![]));
+            ctx.step6("delete", &env)?;
+            check_rules(&ns, &env)?;
         }
         let entry = obj(vec![
             ("resource", s(name)),
@@ -1637,7 +1795,7 @@ impl Namespace {
         stmts.extend([
             ns_stmt,
             (
-                "INSERT INTO res_log (resource, seq, id, parent, kind, patches, author, created, gesture, undoes, depth) VALUES (?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?)",
+                "INSERT INTO res_log (resource, seq, id, parent, kind, patches, author, created, gesture, undoes, depth, kid) VALUES (?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?, ?)",
                 vec![
                     name.into(),
                     seq.into(),
@@ -1648,9 +1806,11 @@ impl Namespace {
                     g.gesture.clone().into(),
                     g.undoes.clone().into(),
                     (head.depth + 1).into(),
+                    ctx.kid().into(),
                 ],
             ),
         ]);
+        stmts.extend(ctx.grant_stmt());
         self.commit(stmts)?;
         self.remember(
             name,
@@ -1683,6 +1843,7 @@ impl Namespace {
             undoes: g.undoes,
             ns_seq,
             depth: head.depth + 1,
+            kid: ctx.kid(),
         };
         written_response(ctx, name, &e, &ns_id_new.text(), 200)
     }
@@ -2009,16 +2170,6 @@ impl Gesture {
     }
 }
 
-/// With authentication disabled, `X-Author` names the author (§7.2).
-fn author(h: &Headers) -> Res<String> {
-    match h.get("X-Author")? {
-        Some(a) if !a.is_empty() => Ok(a),
-        _ => Err(Err::bad(
-            "with authentication disabled, a write names its author in X-Author",
-        )),
-    }
-}
-
 fn parse_id(s: &str) -> Res<Id> {
     Id::parse(s).ok_or_else(|| Err::new(500, "internal", "stored id malformed"))
 }
@@ -2147,7 +2298,7 @@ fn envelope(
     doc: &Value,
     patches: &Value,
 ) -> Value {
-    obj(vec![
+    let mut m = vec![
         ("action", s(action)),
         ("resource", s(resource)),
         ("now", s(rfc3339_ms(ctx.now))),
@@ -2157,7 +2308,12 @@ fn envelope(
         ),
         ("doc", doc.clone()),
         ("patches", patches.clone()),
-    ])
+    ];
+    // Absent while authentication is disabled (§6.4.1).
+    if let Some(p) = ctx.principal() {
+        m.push(("principal", p));
+    }
+    obj(m)
 }
 
 /// Step 6 of §6.2: the namespace's rules; a failure is `422 rule` (§12.1).
@@ -2263,8 +2419,11 @@ fn validate_config(doc: &Value) -> Res<()> {
             }
             k if k.starts_with("x-") => {}
             "catalog" | "catalogs" | "allowances" | "merge" | "merged" | "cleanup"
-            | "abandoned" | "rules" => {
+            | "abandoned" | "rules" | "keys" | "roles" | "revoked" => {
                 let checked = match k.as_str() {
+                    "keys" => crate::nsdoc::keys(v, &p),
+                    "roles" => crate::nsdoc::roles(v, &p),
+                    "revoked" => crate::nsdoc::revoked(v, &p),
                     "catalog" => crate::nsdoc::catalog(v, &p),
                     "catalogs" => crate::nsdoc::catalogs(v, &p),
                     "allowances" => crate::nsdoc::allowances(v, &p),
@@ -2300,8 +2459,8 @@ fn validate_config(doc: &Value) -> Res<()> {
             }
             // Checked against the previous document by `check_branch_fields`.
             "base" | "successor" => {}
-            "keys" | "roles" | "revoked" | "retention" | "encryption" | "maxLag" | "drafts"
-            | "signatures" | "nonce" | "schemaReads" => {
+            "retention" | "encryption" | "maxLag" | "drafts" | "signatures" | "nonce"
+            | "schemaReads" => {
                 return Err(invalid_config(
                     &p,
                     "this server doesn't implement that member yet",
