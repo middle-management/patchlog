@@ -1,0 +1,19 @@
+name = "patchlog"
+main = "crates/worker/build/worker/shim.mjs"
+compatibility_date = "2025-10-01"
+
+[build]
+command = "worker-build --release crates/worker"
+
+
+[[durable_objects.bindings]]
+name = "NAMESPACE"
+class_name = "Namespace"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Namespace"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1
