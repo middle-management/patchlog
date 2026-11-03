@@ -52,7 +52,8 @@ inside a Worker is still a Worker request: on Workers, the Worker runs before th
 | The same, with waits inside the object, as first built | ~$9,200 | Durable Object duration, $8,300: each followed namespace is active all month |
 | **Device fleet through the Worker**: 100,000 devices long-polling 10 public namespaces, 100 writes a day | **~$6,200** | Requests: 13 billion polls a month, $5,880 |
 | The same fleet behind Workers Cache (measured collapse) | **~$3,900** | Worker requests, $3,890: cache hits are billed as requests |
-| The same fleet, cached by a CDN that never runs the Worker (untested) | ~$220 | The CDN's misses |
+| The same fleet behind Fastly (collapse measured; prices third-party, unconfirmed) | ~$10,500 | Fastly's requests, ~$9,700 at ~$0.75 per million |
+| The same fleet behind a CDN that charges bandwidth only | ~$70 | ~6.5 TB of `204`s at ~$0.01/GB |
 | **Write-heavy ingest**: 1,000 namespaces, 10M writes a day, 150 GB added a month | **~$2,200** | Rows written, $2,050 |
 | The same at 4 rows per append | **~$1,300** | Rows written, $1,150 |
 
@@ -68,14 +69,15 @@ inside a Worker is still a Worker request: on Workers, the Worker runs before th
    59.8 s to 0.35 s a minute. Each poll now wakes the object twice (connect and close)
    instead of once, so past about 200 waiters on one namespace, where an always-awake
    object becomes cheaper, further polls wait in the object again.
-2. **Turn on Workers Cache.** §7.7's long-poll URLs are built to be collapsed by a cache,
-   and Workers Cache does it: measured, 100 or 500 followers of one URL cost one miss.
-   That removes nearly all Durable Object and Worker CPU cost of followers. Each poll is
-   still billed as a Worker request, though, so a 100,000-device fleet polling every 20 s
-   costs ~$3,900 a month, nearly all of it requests. Getting below that needs a cache
-   that doesn't bill per request: the zone's own CDN in front of the Worker on another
-   hostname (zone rules this deployment's login couldn't change; untested, ~$220), or a
-   longer interval, which divides the cost.
+2. **Turn on Workers Cache; for fleets, pick a CDN by its request price.** §7.7's long-poll
+   URLs are built to be collapsed by a cache, and both Workers Cache and Fastly do it:
+   measured, hundreds of followers of one URL cost one request to the Worker. What remains
+   is the price of each poll, and a 100,000-device fleet polling every 20 s makes about 13
+   billion a month: Workers Cache bills each hit as a Worker request ($0.30 per million,
+   ~$3,900 a month), Fastly charges more per request (~$0.75 per million, ~$10,500), and a
+   CDN that charges only for bandwidth would cost ~$70. A longer interval divides all of
+   these. Any CDN in front must cache the long-poll `204` (§9) and wait longer than the
+   interval for the origin (`RESULTS.md` has Fastly's settings).
 3. **Rows written are the cost of writes.** About 7 rows per append, at $1 per million,
    is $7 per million writes: more than everything else a write costs put together (Worker
    and Durable Object requests $0.45 per million, CPU $0.02). Dropping the `resources`

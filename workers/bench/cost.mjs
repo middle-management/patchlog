@@ -38,6 +38,7 @@ const UNIT = {
   // Past this many waiters on a namespace, further polls wait in the object,
   // which then stays awake (HIBERNATING_WAITERS_MAX in ns.rs).
   hibernatingWaitersMax: 200,
+  bytesPerPoll: 500, // a 204 with its headers, as served
 };
 
 const SECONDS_PER_MONTH = 30 * 24 * 3600;
@@ -51,12 +52,14 @@ function usage(s) {
   // Behind Workers Cache, the followers of a namespace collapse into about one
   // miss per interval and per write (measured: 100 followers, 1 miss).
   const misses = (s.followedNamespaces ?? 0) * (SECONDS_PER_MONTH / UNIT.pollIntervalS + (s.writesToFollowedNs ?? 0));
-  const pollsAtObject = s.collapsePolls ? 0 : s.workersCache ? misses : polls;
+  // Behind another CDN (s.cdn), only its misses reach Cloudflare at all.
+  const collapsed = s.workersCache || s.cdn;
+  const pollsAtObject = s.collapsePolls ? 0 : collapsed ? misses : polls;
   // Followers per followed namespace decide where polls wait.
-  const perNs = s.workersCache ? 1 : (s.followers ?? 0) / Math.max(1, s.followedNamespaces ?? 1);
+  const perNs = collapsed ? 1 : (s.followers ?? 0) / Math.max(1, s.followedNamespaces ?? 1);
   const hibernatingShare = s.waitsInObject ? 0 : Math.min(1, UNIT.hibernatingWaitersMax / Math.max(1, perNs));
   const awakeNamespaces = s.waitsInObject || perNs > UNIT.hibernatingWaitersMax ? (s.followedNamespaces ?? 0) : 0;
-  const pollsAtWorker = s.pollsBypassWorker ? 0 : polls;
+  const pollsAtWorker = s.pollsBypassWorker ? 0 : s.cdn ? misses : polls;
   const doReads = s.reads * (1 - (s.cachedShare ?? 0));
   return {
     workerRequests: s.writes + s.reads + pollsAtWorker,
@@ -73,6 +76,9 @@ function usage(s) {
     rowsRead: s.writes * UNIT.rowsReadPerWrite + doReads * UNIT.rowsReadPerRead,
     rowsWritten: s.writes * (s.rowsWrittenPerWrite ?? UNIT.rowsWrittenPerWrite),
     storageGbMonth: s.storedGb ?? 0,
+    cdnRequests: s.cdn ? polls : 0,
+    cdnGb: s.cdn ? (polls * UNIT.bytesPerPoll) / 1e9 : 0,
+    cdn: s.cdn,
   };
 }
 
@@ -87,6 +93,12 @@ function cost(u) {
     "SQLite rows read": over(u.rowsRead, PRICE.rowsRead),
     "SQLite rows written": over(u.rowsWritten, PRICE.rowsWritten),
     "SQLite storage": Math.max(0, u.storageGbMonth - PRICE.storageGbMonth.included) * PRICE.storageGbMonth.perUnit,
+    ...(u.cdn
+      ? {
+          [`${u.cdn.name} requests`]: (u.cdnRequests / 1e6) * u.cdn.perMillion,
+          [`${u.cdn.name} bandwidth`]: u.cdnGb * u.cdn.perGb,
+        }
+      : {}),
   };
   return { lines, total: Object.values(lines).reduce((a, b) => a + b, 0) };
 }
@@ -133,6 +145,20 @@ const SCENARIOS = [
     about: "The collaborative scenario with Workers Cache on: a document's 5 followers share one miss; reads hit the cache as before",
     writes: 30 * M, reads: 300 * M, cachedShare: 0.5, storedGb: 50,
     followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2, workersCache: true,
+  },
+  {
+    name: "Device fleet behind Fastly",
+    about: "The same fleet with a Fastly service in front of the Worker that caches the long-poll 204 (measured: 15 of 707 idle polls reached Cloudflare); Fastly at about $0.0075 per 10,000 requests and $0.12/GB in North America and Europe (third-party figures, unconfirmed)",
+    writes: 3_000, reads: 0, storedGb: 0.1,
+    followers: 100_000, followedNamespaces: 10, writesToFollowedNs: 3_000 / 10,
+    cdn: { name: "Fastly", perMillion: 0.75, perGb: 0.12 },
+  },
+  {
+    name: "Device fleet behind a CDN without request fees",
+    about: "The same, behind a CDN that charges bandwidth only (some do, at about $0.01/GB): the cost is the bytes of the polls",
+    writes: 3_000, reads: 0, storedGb: 0.1,
+    followers: 100_000, followedNamespaces: 10, writesToFollowedNs: 3_000 / 10,
+    cdn: { name: "CDN", perMillion: 0, perGb: 0.01 },
   },
   {
     name: "Device fleet, long-poll collapsed by the CDN without the Worker",

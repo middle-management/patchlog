@@ -174,6 +174,29 @@ namespace's followers cost about one miss per interval and per write, however ma
 are. Cache hits don't run the Worker but, per Cloudflare's pricing, are still billed as
 Worker requests. `bench/smoke.mjs` passes through the cache.
 
+**Behind Fastly** (a Fastly service on `cdn.middlemanagement.se`, its backend the Worker's
+custom domain with the Host header overridden), measured with `bench/cdn.mjs`,
+`bench/idle-followers.mjs` and Fastly's `Fastly-Debug` headers:
+
+| | Result |
+|---|---|
+| Revision reads, 30 in a row | 1 miss, 29 Fastly hits (p50 42 ms) |
+| 100 / 300 / 500 followers polling one URL, one write | 1 request to the Worker each time; all had the write (300: 0.04–2.3 s after it; past ~300 connections this client's proxy delays everything) |
+| 100 idle followers, 2 minutes, before caching `204`s | 704 of 708 polls reached Cloudflare: Fastly doesn't cache `204` by default (§9 asks for it) |
+| The same, with a `fetch` VCL snippet caching the long-poll `204` for its 2 s | **15 of 707** reached Cloudflare; 8 of them were Fastly `503`s, its default 15 s first-byte timeout being shorter than a long-poll's wait |
+
+The snippet, and the backend timeouts a long-poll needs (first byte and between bytes
+above the 20 s interval, e.g. 25 s):
+
+```vcl
+if (beresp.status == 204 && req.url ~ "[?&]live=long-poll") {
+  set beresp.cacheable = true;
+  set beresp.ttl = 2s;
+  set beresp.grace = 0s;   # §9: long-poll answers are never served stale
+  return(deliver);
+}
+```
+
 A client must take the long-poll cursor from the server (`X-Cursor`): with a cursor from
 its own clock, a few seconds behind Cloudflare's, every poll was answered at once.
 
