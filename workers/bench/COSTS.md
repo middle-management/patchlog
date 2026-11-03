@@ -53,7 +53,7 @@ inside a Worker is still a Worker request: on Workers, the Worker runs before th
 | **Device fleet through the Worker**: 100,000 devices long-polling 10 public namespaces, 100 writes a day | **~$6,200** | Requests: 13 billion polls a month, $5,880 |
 | The same fleet behind Workers Cache (measured collapse) | **~$3,900** | Worker requests, $3,890: cache hits are billed as requests |
 | The same fleet behind Fastly (collapse measured; prices third-party, unconfirmed) | ~$10,500 | Fastly's requests, ~$9,700 at ~$0.75 per million |
-| The same fleet behind a CDN that charges bandwidth only | ~$70 | ~6.5 TB of `204`s at ~$0.01/GB |
+| **The same fleet behind Bunny** (collapse measured; no request fees) | **~$70** | ~6.5 TB of `204`s at $0.01/GB |
 | **Write-heavy ingest**: 1,000 namespaces, 10M writes a day, 150 GB added a month | **~$2,200** | Rows written, $2,050 |
 | The same at 4 rows per append | **~$1,300** | Rows written, $1,150 |
 
@@ -74,10 +74,12 @@ inside a Worker is still a Worker request: on Workers, the Worker runs before th
    measured, hundreds of followers of one URL cost one request to the Worker. What remains
    is the price of each poll, and a 100,000-device fleet polling every 20 s makes about 13
    billion a month: Workers Cache bills each hit as a Worker request ($0.30 per million,
-   ~$3,900 a month), Fastly charges more per request (~$0.75 per million, ~$10,500), and a
-   CDN that charges only for bandwidth would cost ~$70. A longer interval divides all of
+   ~$3,900 a month), Fastly charges more per request (~$0.75 per million, ~$10,500), and
+   Bunny, which charges only for bandwidth, ~$70 (measured: the Worker ran about once
+   per interval for 100 idle followers). A longer interval divides all of
    these. Any CDN in front must cache the long-poll `204` (§9) and wait longer than the
-   interval for the origin (`RESULTS.md` has Fastly's settings).
+   interval for the origin, and Bunny must be told to key its cache on the query string
+   (`RESULTS.md` has both CDNs' settings).
 3. **Rows written are the cost of writes.** About 7 rows per append, at $1 per million,
    is $7 per million writes: more than everything else a write costs put together (Worker
    and Durable Object requests $0.45 per million, CPU $0.02). Dropping the `resources`

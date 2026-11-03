@@ -154,11 +154,11 @@ const SCENARIOS = [
     cdn: { name: "Fastly", perMillion: 0.75, perGb: 0.12 },
   },
   {
-    name: "Device fleet behind a CDN without request fees",
-    about: "The same, behind a CDN that charges bandwidth only (some do, at about $0.01/GB): the cost is the bytes of the polls",
+    name: "Device fleet behind Bunny",
+    about: "The same, behind Bunny (measured: the Worker ran about once per interval for 100 idle followers), which charges no request fees and $0.01/GB in Europe and North America (bunny.net/pricing/cdn, 2026-11-03)",
     writes: 3_000, reads: 0, storedGb: 0.1,
     followers: 100_000, followedNamespaces: 10, writesToFollowedNs: 3_000 / 10,
-    cdn: { name: "CDN", perMillion: 0, perGb: 0.01 },
+    cdn: { name: "Bunny", perMillion: 0, perGb: 0.01 },
   },
   {
     name: "Device fleet, long-poll collapsed by the CDN without the Worker",

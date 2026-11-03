@@ -12,8 +12,8 @@ const first = await fetch(`${base}/ns/${ns}/log?since=&live=long-poll`);
 await first.arrayBuffer();
 const since = first.headers.get("x-namespace-revision");
 const end = Date.now() + Number(secs) * 1000;
-// Answers by status and by each cache's verdict: Fastly's x-cache (its last
-// word) when a Fastly service is in front, Cloudflare's cf-cache-status.
+// Answers by status and by each cache's verdict: Bunny's cdn-cache or Fastly's
+// x-cache (its last word) when one is in front, Cloudflare's cf-cache-status.
 const stats = {};
 let polls = 0, toOrigin = 0, failed = 0;
 console.log(JSON.stringify({ ns, start: new Date().toISOString() }));
@@ -29,11 +29,13 @@ await Promise.all(Array.from({ length: Number(n) }, async () => {
       continue;
     }
     polls++;
+    const bunny = r.headers.get("cdn-cache") ?? "";
     const fastly = (r.headers.get("x-cache") ?? "").split(",").pop().trim();
-    const k = `${r.status}${fastly ? " fastly=" + fastly : ""} cf=${r.headers.get("cf-cache-status") ?? "-"}`;
+    const front = bunny ? "bunny=" + bunny : fastly ? "fastly=" + fastly : "";
+    const k = `${r.status}${front ? " " + front : ""} cf=${r.headers.get("cf-cache-status") ?? "-"}`;
     stats[k] = (stats[k] ?? 0) + 1;
-    if (fastly && fastly !== "HIT") toOrigin++;
+    if (front && !front.endsWith("=HIT")) toOrigin++;
     cursor = r.headers.get("x-cursor") ?? cursor;
   }
 }));
-console.log(JSON.stringify({ end: new Date().toISOString(), followers: Number(n), polls, failed, ...(toOrigin ? { past_fastly: toOrigin } : {}), stats }));
+console.log(JSON.stringify({ end: new Date().toISOString(), followers: Number(n), polls, failed, ...(toOrigin ? { past_cdn: toOrigin } : {}), stats }));

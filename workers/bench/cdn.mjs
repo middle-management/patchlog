@@ -11,9 +11,11 @@ const counts = rest.length ? rest.map(Number) : [100, 500];
 const H = { "X-Author": "cdn", "Content-Type": "application/json-patch+json" };
 const tag = Date.now().toString(36);
 const out = (o) => console.log(JSON.stringify(o));
-// The outermost cache's verdict: Fastly's x-cache if a Fastly service is in
-// front (its last word), else Cloudflare's cf-cache-status.
+// The outermost cache's verdict: Bunny's cdn-cache or Fastly's x-cache (its
+// last word) if one is in front, else Cloudflare's cf-cache-status.
 const cacheStatus = (r) => {
+  const bunny = r.headers.get("cdn-cache");
+  if (bunny) return "bunny " + bunny;
   const fastly = r.headers.get("x-cache");
   if (fastly) return "fastly " + fastly.split(",").pop().trim();
   return r.headers.get("cf-cache-status") ?? "none";
@@ -49,10 +51,15 @@ async function write(path, body, headers) {
 for (const n of counts) {
   const ns = `cdn-f-${tag}-${n}`;
   await write(`/ns/${ns}`, [{ op: "add", path: "", value: { read: "public" } }], { "If-None-Match": "*" });
+  // The cursor and the time come from the server (§7.7), through a URL no
+  // cache has seen: a fresh write's revision as `since`, which answers 204 at once.
+  let k = 0;
   const probe = async () => {
-    const r = await fetch(`${base}/ns/${ns}/log?since=&live=long-poll`);
+    const w = await write(`/r/${ns}/probe-${k++}`, [{ op: "add", path: "", value: {} }], { "If-None-Match": "*" });
+    const since = w.headers.get("x-namespace-revision");
+    const r = await fetch(`${base}/ns/${ns}/log?since=${since}&live=long-poll`);
     await r.arrayBuffer();
-    return { since: r.headers.get("x-namespace-revision"), cur: r.headers.get("x-cursor"), ms: Date.parse(r.headers.get("date") ?? "") || Date.now() };
+    return { since, cur: r.headers.get("x-cursor"), ms: Date.parse(r.headers.get("date") ?? "") || Date.now() };
   };
   let p = await probe();
   const left = 20_000 - (p.ms % 20_000);

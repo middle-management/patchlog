@@ -197,6 +197,22 @@ if (beresp.status == 204 && req.url ~ "[?&]live=long-poll") {
 }
 ```
 
+**Behind Bunny** (a pull zone at `patchlog.b-cdn.net`, origin the Worker's custom domain):
+
+| | Result |
+|---|---|
+| With Bunny's defaults | **wrong answers**: its cache key ignores the query string, so every poll of a namespace got whatever was cached first for `/ns/{ns}/log` |
+| `bench/smoke.mjs`, after the settings below | passes |
+| Revision reads, 30 in a row | 1 miss, 29 hits (p50 51 ms) |
+| 100 / 300 followers polling one URL, one write | all had the write, p50 0.26 / 0.37 s |
+| 100 idle followers, 2 minutes | 700 polls; Cloudflare ran the Worker **2–3 times a minute** (one request per interval) |
+
+Bunny reports the requests it merged into one origin request as `MISS`, so its header
+can't count origin requests; Cloudflare's analytics did. It caches the long-poll `204`
+without further configuration. The pull zone needs, under Caching: the cache to vary on
+the URL query string, request coalescing on, an origin response timeout above the 20 s
+interval, and expiry from the origin's `Cache-Control`.
+
 A client must take the long-poll cursor from the server (`X-Cursor`): with a cursor from
 its own clock, a few seconds behind Cloudflare's, every poll was answered at once.
 
