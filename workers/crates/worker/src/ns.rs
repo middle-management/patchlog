@@ -1220,17 +1220,41 @@ impl Namespace {
     /// other namespaces. The write itself runs without an `await`, so it
     /// starts again from the top once the schemas are here.
     async fn write_typed(&self, ctx: &Ctx, name: &str, hd: &Headers, raw: &[u8]) -> Res<Response> {
-        for _ in 0..4 {
+        let mut fetched = std::collections::HashSet::new();
+        loop {
             match self.write_resource(ctx, name, hd, raw)? {
                 Step::Done(r) => return Ok(r),
-                Step::NeedSchemas(paths) => {
-                    for p in paths {
-                        self.fetch_schema(&p).await?;
-                    }
-                }
+                Step::NeedSchemas(paths) => self.fetch_schemas(paths, &mut fetched).await?,
             }
         }
-        Err(Err::new(500, "internal", "schema references kept changing"))
+    }
+
+    /// Fetches schema revisions from other namespaces, in parallel. Each
+    /// round of a write's checks must ask for at least one revision not
+    /// fetched before: revisions are immutable, so a closure needs at most
+    /// one round per level of `$ref`s. Asking again for one already fetched
+    /// means it fell out of the cache meanwhile, which only a write whose
+    /// closure outgrows the cache can cause.
+    async fn fetch_schemas(
+        &self,
+        paths: Vec<String>,
+        fetched: &mut std::collections::HashSet<String>,
+    ) -> Res<()> {
+        let new: Vec<String> = paths
+            .into_iter()
+            .filter(|p| fetched.insert(p.clone()))
+            .collect();
+        if new.is_empty() {
+            return Err(Err::new(
+                503,
+                "internal",
+                "the schemas this write uses don't fit in the server's cache",
+            ));
+        }
+        for r in futures_util::future::join_all(new.iter().map(|p| self.fetch_schema(p))).await {
+            r?;
+        }
+        Ok(())
     }
 
     /// Reads a schema revision from another namespace's object (§6.1): it
@@ -1345,6 +1369,12 @@ impl Namespace {
                 }
             }
             schema::Typed::Instance(path) => {
+                // A compiled validator had its whole closure: revisions are
+                // immutable, so it needs nothing loaded again.
+                if let Some(v) = self.validators.borrow().get(&path).cloned() {
+                    v.validate(doc).map_err(schema_err)?;
+                    return Ok(None);
+                }
                 let known = match self.schema_closure(ctx, std::slice::from_ref(&path))? {
                     Err(remote) => return Ok(Some(remote)),
                     Ok(k) => k,

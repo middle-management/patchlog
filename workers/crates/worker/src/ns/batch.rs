@@ -474,7 +474,8 @@ impl Namespace {
                 }
             }
         }
-        for _ in 0..4 {
+        let mut fetched = std::collections::HashSet::new();
+        loop {
             // Set and cleared with no await between, so no other request sees them.
             *self.extra_blobs.borrow_mut() = source_blobs.clone();
             let step = self.batch_sync(ctx, &req, &author, dry);
@@ -482,14 +483,9 @@ impl Namespace {
             self.extra_blobs.borrow_mut().clear();
             match step? {
                 Step::Done(r) => return Ok(r),
-                Step::NeedSchemas(paths) => {
-                    for p in paths {
-                        self.fetch_schema(&p).await?;
-                    }
-                }
+                Step::NeedSchemas(paths) => self.fetch_schemas(paths, &mut fetched).await?,
             }
         }
-        Err(Err::new(500, "internal", "schema references kept changing"))
     }
 
     /// The batch's checks and its commit, with no `await` between them.
@@ -503,6 +499,7 @@ impl Namespace {
         // The config change first, as a config write (§7.4); the items are
         // checked against the configuration it produces.
         let mut failures: Vec<Failure> = Vec::new();
+        let mut missing_schemas = std::collections::BTreeSet::new();
         let mut config_plan: Option<ConfigPlan> = None;
         let mut config_stale = false;
         if let Some((pre, body)) = &req.config {
@@ -710,7 +707,9 @@ impl Namespace {
                             }
                         }
                         match self.check_typed(ctx, &p.doc) {
-                            Ok(Some(remote)) => return Ok(Step::NeedSchemas(remote)),
+                            // Gather every item's missing schemas, so one
+                            // round of fetches serves the whole batch.
+                            Ok(Some(remote)) => missing_schemas.extend(remote),
                             Ok(None) => {}
                             Err(e) => {
                                 failed = Some((5, e));
@@ -803,6 +802,9 @@ impl Namespace {
             item_ranges.push(begin..planned.len());
         }
 
+        if !missing_schemas.is_empty() {
+            return Ok(Step::NeedSchemas(missing_schemas.into_iter().collect()));
+        }
         if dry {
             let items = req
                 .items

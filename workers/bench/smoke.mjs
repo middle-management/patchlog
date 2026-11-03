@@ -429,5 +429,34 @@ r = await req("PATCH", `/ns/${ns}-plain`, { body: [{ op: "add", path: "", value:
 check("a namespace can't be created with base 422", r.status === 422, r.json);
 }
 
+// A batch on a fresh object using many schemas from another namespace, and
+// a $ref chain, at once: every missing schema is fetched in a few rounds.
+{
+  const D = "https://json-schema.org/draft/2020-12/schema";
+  const sn = `${ns}-many-s`, tn = `${ns}-many`;
+  await req("PATCH", `/ns/${sn}`, { body: [{ op: "add", path: "", value: { read: "public" } }], headers: { "If-None-Match": "*" } });
+  await req("PATCH", `/ns/${tn}`, { body: [{ op: "add", path: "", value: {} }], headers: { "If-None-Match": "*" } });
+  let prev = null;
+  const paths = [];
+  for (let i = 0; i < 12; i++) {
+    // Each schema refers to the one before: a chain 12 deep.
+    const value = { $schema: D, type: "object", properties: { [`f${i}`]: { type: "integer" } }, ...(prev ? { allOf: [{ $ref: prev }] } : {}) };
+    const w = await req("PATCH", `/r/${sn}/s${i}`, { body: [{ op: "add", path: "", value }], headers: { "If-None-Match": "*" } });
+    prev = `/r/${sn}/s${i}/rev/${w.h.get("etag").slice(1, -1)}`;
+    paths.push(prev);
+  }
+  const items = [];
+  for (let k = 0; k < 168; k++) {
+    const i = k % paths.length;
+    items.push({ resource: `doc-${k}`, ifNoneMatch: "*", steps: [[{ op: "add", path: "", value: { $schema: paths[i], [`f${i}`]: k } }]] });
+  }
+  r = await req("POST", `/ns/${tn}/batch`, { headers: { "Content-Type": "application/json" }, raw: JSON.stringify({ items }) });
+  check("a fresh object's batch of 168 documents over 12 chained schemas", r.status === 201 && r.json?.items?.length === 168, [r.status, r.json?.message]);
+  items[0].steps[0][0].value.f0 = "not an integer";
+  items[0].resource = "bad";
+  r = await req("POST", `/ns/${tn}/batch`, { headers: { "Content-Type": "application/json" }, raw: JSON.stringify({ items: [items[0]] }) });
+  check("and still validates against them", r.status === 422 && r.json?.items?.[0]?.code === "invalid", r.json);
+}
+
 console.log(failed ? `\n${failed} failed` : "\nall passed");
 process.exit(failed ? 1 : 0);
