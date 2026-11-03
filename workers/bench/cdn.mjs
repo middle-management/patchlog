@@ -11,6 +11,13 @@ const counts = rest.length ? rest.map(Number) : [100, 500];
 const H = { "X-Author": "cdn", "Content-Type": "application/json-patch+json" };
 const tag = Date.now().toString(36);
 const out = (o) => console.log(JSON.stringify(o));
+// The outermost cache's verdict: Fastly's x-cache if a Fastly service is in
+// front (its last word), else Cloudflare's cf-cache-status.
+const cacheStatus = (r) => {
+  const fastly = r.headers.get("x-cache");
+  if (fastly) return "fastly " + fastly.split(",").pop().trim();
+  return r.headers.get("cf-cache-status") ?? "none";
+};
 const pct = (xs, p) => (xs.length ? Math.round([...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(p * xs.length))]) : null);
 
 async function write(path, body, headers) {
@@ -31,9 +38,9 @@ async function write(path, body, headers) {
     const t = performance.now();
     const g = await fetch(`${base}/r/${ns}/doc/rev/${id}`);
     await g.arrayBuffer();
-    const st = g.headers.get("cf-cache-status") ?? "none";
+    const st = cacheStatus(g);
     seen[st] = (seen[st] ?? 0) + 1;
-    (st === "HIT" ? ms.HIT : ms.other).push(performance.now() - t);
+    (st.endsWith("HIT") ? ms.HIT : ms.other).push(performance.now() - t);
   }
   out({ test: "revision read, 30 in a row", cache: seen, hit_p50_ms: pct(ms.HIT, 0.5), miss_p50_ms: pct(ms.other, 0.5) });
 }
@@ -57,7 +64,7 @@ for (const n of counts) {
     fetch(`${base}/ns/${ns}/log?since=${p.since}&live=long-poll&cursor=${p.cur}`)
       .then(async (r) => {
         await r.arrayBuffer();
-        const st = r.headers.get("cf-cache-status") ?? "none";
+        const st = cacheStatus(r);
         cache[st] = (cache[st] ?? 0) + 1;
         status[r.status] = (status[r.status] ?? 0) + 1;
         if (r.status === 200 && tw) got.push(performance.now() - tw);
