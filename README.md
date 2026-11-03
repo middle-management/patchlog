@@ -59,8 +59,10 @@ npm run build && npm run workerd          # plain workerd on :8788, without wran
 node bench/load.mjs http://127.0.0.1:8788 --pid "$(pgrep -f '^workerd serve bench')"
 ```
 
-`npm run deploy` deploys with wrangler. The Cache API works only on a custom domain,
-not on `workers.dev`.
+`npm run deploy` deploys with wrangler (`npx wrangler login --device` signs in from a
+headless machine). The Cache API works only on a custom domain, not on `workers.dev`.
+On the Workers free plan, Durable Objects may write 100,000 SQLite rows a day, and an
+append writes about 7: past that, writes answer `503` with `Retry-After` until 00:00 UTC.
 
 ## Implemented
 

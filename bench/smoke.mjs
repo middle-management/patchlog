@@ -4,6 +4,10 @@
 // Addendum I.2, preconditions, idempotent retries, reads, log ranges and a
 // long-poll that a write wakes.
 
+import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
+
+if (process.env.HTTPS_PROXY) setGlobalDispatcher(new EnvHttpProxyAgent());
+
 const base = process.argv[2] ?? "http://127.0.0.1:8787";
 const ns = `smoke-${Date.now().toString(36)}`;
 let failed = 0;

@@ -81,9 +81,67 @@ over machines; one namespace stays on one object, which runs one event at a time
 Through `wrangler dev`, every request costs about 7 ms more (its dev proxy), so its numbers
 are not useful for this.
 
+## On Cloudflare
+
+Deployed to `patchlog.domains-358.workers.dev` on 2026-11-03, on an account on the
+**Workers free plan**. The load ran from a cloud container whose nearest Cloudflare
+location is IAD (Ashburn), through that container's HTTPS proxy, which adds most of the
+~50 ms base latency below. CPU and rows come from Cloudflare's GraphQL analytics
+(`workersInvocationsAdaptive`, `durableObjectsInvocationsAdaptiveGroups`,
+`durableObjectsPeriodicGroups`), per minute. `bench/smoke.mjs` passes against the
+deployment.
+
+**Latency**, one request at a time (`bench/latency.mjs`, 50 each):
+
+| Request | p50 | p90 |
+|---|---|---|
+| `GET /` (front Worker only) | 52 ms | 70 ms |
+| Head read (front Worker, then the object, from memory) | 60 ms | 83 ms |
+| Append (the object, durable commit) | 82 ms | 96 ms |
+
+So the hop to the object costs about 8 ms here, and an append's commit, replicated before
+the object answers, about 20 ms more than a read.
+
+**Throughput** (`bench/load.mjs`; writers each append to their own 0.5 KiB document):
+
+| Scenario | Rate | p50 | p99 |
+|---|---|---|---|
+| One namespace, 1 / 8 / 32 writers | 11 / 88 / 361/s | 88 / 81 / 80 ms | 131 / 472 / 435 ms |
+| One namespace, 64 / 128 / 256 writers | 477 / 661 / 573/s | 121 / 189 / 405 ms | 669 / 707 / 1,453 ms |
+| 100 namespaces, 32 / 256 writers | 381 / 1,049/s | 82 / 171 ms | 127 / 2,888 ms |
+| Appends to a 16 KiB / 256 KiB / 1 MiB document, 1 writer | 12 / 13 / 12/s | 82 / 75 / 84 ms | |
+| Head reads, 8 readers | 135/s | 54 ms | 130 ms |
+
+- **One namespace tops out at about 600–660 appends/s.** Up to 32 writers, the rate is just
+  writers ÷ round trip and p50 stays at 80 ms. Past 64, the rate stops rising and latency
+  grows, which is the object's single thread. The same client reached 1,049/s spread over
+  100 namespaces, so the client didn't cause the ceiling. At 256 writers over 100
+  namespaces the client and its proxy were the limit (p99 2.9 s with ~2.5 writers per
+  namespace), not Cloudflare.
+- **Large documents didn't slow single writes**, within the noise of the 80 ms round trip.
+
+**CPU and storage per request** (Cloudflare analytics, minutes of append load):
+
+| | |
+|---|---|
+| Durable Object CPU per request | 0.55–0.86 ms |
+| Front Worker CPU per request | p50 0.9–1.0 ms, p99 3.6 ms |
+| Rows written per append | ~7 (6.0–7.7 per object request in write minutes) |
+| Rows read per append | ~3.5–4 |
+
+Seven rows per append are the `nslog`, `entries` and `resources` rows plus their indexes
+(`nslog.id`, `entries_by_id`, `entries_by_resource`, the `resources` key). Rows written are
+billed, and capped on the free plan at 100,000 a day: this run hit the cap after ~40,000
+requests, and every write then failed until the daily reset (00:00 UTC). Dropping the
+`resources` table (a head is the last entry of its resource) and an index would bring it
+to about 4–5.
+
+Not measured on Cloudflare yet, because the account ran out of rows written: long-poll
+followers.
+
 ## What it suggests for Cloudflare
 
-These are estimates from the numbers above, not measurements on Cloudflare.
+The local numbers above, read against the Cloudflare measurements.
 
 - **One namespace.** The object's single thread runs at about 1.4–2.3 ms of CPU per small
   append, so roughly 450–700 appends/s per namespace, and fewer for large documents

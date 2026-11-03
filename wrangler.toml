@@ -6,7 +6,7 @@ compatibility_date = "2025-10-01"
 command = "worker-build --release crates/worker"
 
 [vars]
-ORIGIN = "http://localhost:8787"
+ORIGIN = "https://patchlog.domains-358.workers.dev"
 
 [[durable_objects.bindings]]
 name = "NAMESPACE"
@@ -15,3 +15,7 @@ class_name = "Namespace"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Namespace"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1

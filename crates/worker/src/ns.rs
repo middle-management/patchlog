@@ -136,6 +136,10 @@ struct Inner {
 pub struct Namespace {
     state: State,
     sql: SqlStorage,
+    /// Tables are created on the first request rather than in the
+    /// constructor, which can't report an error (storage can refuse writes,
+    /// e.g. over a plan's quota).
+    schema_ready: std::cell::Cell<bool>,
     inner: RefCell<Inner>,
     /// Long-poll waiters share one promise, resolved by the next write.
     wake: RefCell<Option<(js_sys::Promise, js_sys::Function)>>,
@@ -151,12 +155,10 @@ struct Ctx {
 impl DurableObject for Namespace {
     fn new(state: State, _env: Env) -> Self {
         let sql = state.storage().sql();
-        for q in SCHEMA {
-            sql.exec(q, None).expect("schema");
-        }
         Namespace {
             state,
             sql,
+            schema_ready: std::cell::Cell::new(false),
             inner: RefCell::new(Inner {
                 loaded: false,
                 head: None,
@@ -178,7 +180,11 @@ impl DurableObject for Namespace {
                 .map(|h| h.public)
                 .unwrap_or(false)
         };
-        match self.route(req).await {
+        let result = match self.ensure_schema() {
+            Ok(()) => self.route(req).await,
+            Err(e) => Err(e),
+        };
+        match result {
             Ok(r) => Ok(r),
             Err(e) => {
                 if e.status >= 500 {
@@ -191,6 +197,16 @@ impl DurableObject for Namespace {
 }
 
 impl Namespace {
+    fn ensure_schema(&self) -> Res<()> {
+        if !self.schema_ready.get() {
+            for q in SCHEMA {
+                self.sql.exec(q, None)?;
+            }
+            self.schema_ready.set(true);
+        }
+        Ok(())
+    }
+
     fn rows<T: for<'de> Deserialize<'de>>(&self, q: &str, b: Vec<SqlStorageValue>) -> Res<Vec<T>> {
         Ok(self.sql.exec(q, b)?.to_array::<T>()?)
     }
@@ -220,7 +236,7 @@ impl Namespace {
             Ok(JsValue::UNDEFINED)
         });
         f.call1(raw, &cb)
-            .map_err(|e| Err::new(500, "internal", format!("commit failed: {e:?}")))?;
+            .map_err(|e| http::storage_err(format!("commit failed: {e:?}")))?;
         Ok(())
     }
 

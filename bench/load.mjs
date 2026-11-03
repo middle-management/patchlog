@@ -5,9 +5,11 @@
 // are what the code costs, not what Cloudflare's network adds.
 
 import { readFileSync } from "node:fs";
-import { Agent, setGlobalDispatcher } from "undici";
+import { Agent, EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
 
-setGlobalDispatcher(new Agent({ connections: 4096, pipelining: 1, keepAliveTimeout: 60_000 }));
+// Through HTTPS_PROXY where one is set (it isn't used for 127.0.0.1).
+const pool = { connections: 4096, pipelining: 1, keepAliveTimeout: 60_000 };
+setGlobalDispatcher(process.env.HTTPS_PROXY ? new EnvHttpProxyAgent(pool) : new Agent(pool));
 
 const args = process.argv.slice(2);
 const base = args.find((a) => a.startsWith("http")) ?? "http://127.0.0.1:8787";
@@ -98,7 +100,8 @@ async function appenders(nsOf, concurrency, seconds, size = 500) {
 const out = (name, o) => console.log(JSON.stringify({ scenario: name, ...o }));
 
 if (run("writes")) {
-  for (const c of [1, 8, 32]) {
+  const writers = args.includes("--writers") ? args[args.indexOf("--writers") + 1].split(",").map(Number) : [1, 8, 32];
+  for (const c of writers) {
     const ns = `bw-${tag}-${c}`;
     await mkns(ns);
     out("writes, one namespace", { writers: c, ...(await appenders(() => ns, c, secs)) });
@@ -108,7 +111,8 @@ if (run("writes")) {
 if (run("many")) {
   const N = 100;
   for (let i = 0; i < N; i++) await mkns(`bm-${tag}-${i}`);
-  out("writes, 100 namespaces", { writers: 32, ...(await appenders((i) => `bm-${tag}-${i % N}`, 32, secs)) });
+  const w = args.includes("--many-writers") ? Number(args[args.indexOf("--many-writers") + 1]) : 32;
+  out("writes, 100 namespaces", { writers: w, ...(await appenders((i) => `bm-${tag}-${i % N}`, w, secs)) });
 }
 
 if (run("large")) {

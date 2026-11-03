@@ -83,6 +83,7 @@ pub struct Err {
     pub message: String,
     pub extra: Vec<(&'static str, Value)>,
     pub class: Class,
+    pub retry_after: Option<u32>,
 }
 
 impl Err {
@@ -93,6 +94,7 @@ impl Err {
             message: message.into(),
             extra: vec![],
             class: Class::NoStore,
+            retry_after: None,
         }
     }
     pub fn with(mut self, k: &'static str, v: Value) -> Err {
@@ -115,6 +117,9 @@ impl Err {
     pub fn into_response(self, public: bool) -> Result<Response> {
         let h = Headers::new();
         cache_headers(&h, self.class, public)?;
+        if let Some(s) = self.retry_after {
+            h.set("Retry-After", &s.to_string())?;
+        }
         let mut members = vec![("code", s(self.code)), ("message", s(self.message))];
         members.extend(self.extra);
         json(self.status, h, &obj(members)).map_err(|e| worker::Error::RustError(e.message))
@@ -123,7 +128,20 @@ impl Err {
 
 impl From<worker::Error> for Err {
     fn from(e: worker::Error) -> Self {
-        Err::new(500, "internal", e.to_string())
+        storage_err(e.to_string())
+    }
+}
+
+/// A storage failure: `503` with `Retry-After` when the platform refuses
+/// writes over a quota (such as the free tier's daily rows written), `500`
+/// otherwise.
+pub fn storage_err(message: String) -> Err {
+    if message.contains("Exceeded allowed") {
+        let mut e = Err::new(503, "unavailable", message);
+        e.retry_after = Some(3600);
+        e
+    } else {
+        Err::new(500, "internal", message)
     }
 }
 
