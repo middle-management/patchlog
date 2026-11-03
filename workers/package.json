@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --var AUTH:disabled",
-    "dev:grants": "wrangler dev --port 8788 --var \"OPERATOR_JWKS:$(node bench/auth-smoke.mjs --jwks)\"",
+    "dev:grants": "node bench/auth-smoke.mjs --serve",
     "deploy": "wrangler deploy",
     "smoke": "node bench/smoke.mjs",
     "bench": "node bench/load.mjs",

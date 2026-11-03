@@ -545,7 +545,7 @@ impl Namespace {
         let caller = if segs[0] == "internal" {
             crate::auth::Caller::Disabled(None)
         } else {
-            self.caller(segs[1], req.headers(), read, now)?
+            self.caller(segs[1], &path, req.headers(), read, now)?
         };
         let ctx = Ctx {
             ns: segs[1].to_string(),
@@ -662,6 +662,7 @@ impl Namespace {
                 self.get_heads(&ctx, at, q.get("after").map(String::as_str).unwrap_or(""))
                     .await
             }
+            ("internal", ["edge-check"]) => self.edge_check(&ctx, req.headers()),
             ("internal", ["has", at]) => match self.ns_seq_of(at)? {
                 Some(_) => http::respond(204, Headers::new(), vec![]),
                 None => Err(Err::not_found()),

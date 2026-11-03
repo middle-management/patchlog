@@ -27,7 +27,14 @@ const STAR_MEMBERS: &[&str] = &[
 impl Namespace {
     /// The caller (§C.2 item 1, §7): with authentication disabled, its
     /// `X-Author`; reads of a public namespace ignore any grant.
-    pub(super) fn caller(&self, ns: &str, hd: &Headers, read: bool, now: i64) -> Res<Caller> {
+    pub(super) fn caller(
+        &self,
+        ns: &str,
+        path: &str,
+        hd: &Headers,
+        read: bool,
+        now: i64,
+    ) -> Res<Caller> {
         if !auth::enabled(&self.env) {
             return Ok(Caller::Disabled(
                 hd.get("X-Author")?.filter(|a| !a.is_empty()),
@@ -38,6 +45,16 @@ impl Namespace {
             return Ok(Caller::Anonymous);
         }
         let Some(token) = auth::bearer(hd)? else {
+            // An edge-grant cookie counts only on a GET or HEAD without
+            // Authorization (§C.5.3).
+            if read {
+                if let Some(cookie) = hd.get("Cookie")? {
+                    let keys = crate::edge::edge_keys(&self.env);
+                    if let Some((p, _)) = crate::edge::from_cookies(&cookie, path, &keys, now) {
+                        return Ok(Caller::Edge(p));
+                    }
+                }
+            }
             return Ok(Caller::Anonymous);
         };
         let u = auth::decode(&token, ns)?;
@@ -52,6 +69,8 @@ impl Namespace {
     pub(super) fn gate_read(&self, ctx: &Ctx, resource: Option<&str>) -> Res<()> {
         let c = match &ctx.caller {
             Caller::Disabled(_) => return Ok(()),
+            // The cookie's prefix covers the path: checked when it was read.
+            Caller::Edge(_) => return Ok(()),
             Caller::Anonymous => {
                 if self.head()?.is_some_and(|h| h.public) {
                     return Ok(());
@@ -96,7 +115,7 @@ impl Ctx {
             Caller::Disabled(None) => Err(Err::bad(
                 "with authentication disabled, a write names its author in X-Author",
             )),
-            Caller::Anonymous => Err(auth::unauthorized("a write needs a grant")),
+            Caller::Anonymous | Caller::Edge(_) => Err(auth::unauthorized("a write needs a grant")),
             Caller::Grant(c) => Ok(c.sub.clone()),
         }
     }
@@ -132,7 +151,7 @@ impl Ctx {
                 self.author()?;
                 Ok(verbs.to_vec())
             }
-            Caller::Anonymous => Err(auth::unauthorized("a write needs a grant")),
+            Caller::Anonymous | Caller::Edge(_) => Err(auth::unauthorized("a write needs a grant")),
             Caller::Grant(c) => {
                 if c.operator {
                     return Err(auth::unauthorized(
@@ -269,7 +288,9 @@ impl Namespace {
         let mut body: Vec<(&str, Value)> = Vec::new();
         let verbs = |v: &mut dyn Iterator<Item = String>| Value::Array(v.map(s).collect());
         match &ctx.caller {
-            Caller::Anonymous => return Err(auth::unauthorized("principal describes a grant")),
+            Caller::Anonymous | Caller::Edge(_) => {
+                return Err(auth::unauthorized("principal describes a grant"))
+            }
             Caller::Disabled(_) => {
                 if head.is_none() {
                     return Err(Err::not_found());
@@ -368,4 +389,86 @@ fn limits_json(l: &Limits) -> Value {
         ("grantSize", n(auth::GRANT_SIZE)),
         ("rulesPerGrant", n(auth::RULES_PER_GRANT)),
     ])
+}
+
+impl Namespace {
+    /// What `POST /edge-grants` may issue here for the grant in
+    /// `Authorization` (§C.5.2): `{ prefixes, exp }`, or the refusal.
+    pub(super) fn edge_check(&self, ctx: &Ctx, hd: &Headers) -> Res<Response> {
+        let Some(token) = auth::bearer(hd)? else {
+            return Err(auth::unauthorized("no grant"));
+        };
+        let u = auth::decode(&token, &ctx.ns)?;
+        let head = self.head()?;
+        let ops = auth::operator_keys(&self.env)?;
+        let c = auth::check(&u, head.as_ref().map(|h| &h.config), &ops, ctx.now)?;
+        if c.operator {
+            return Err(auth::unauthorized(
+                "an operator grant doesn't read namespaces",
+            ));
+        }
+        if !c.can.contains("read") {
+            return Err(auth::forbidden("the grant has no read here"));
+        }
+        let fixed = auth::fixed_resources(&c.rules);
+        // Rules on /resource where the grant doesn't fix it, or on /now: an
+        // edge serves what it can't re-check.
+        if c.rules.iter().any(|r| auth::refers(r, "/now"))
+            || (fixed.is_none() && c.rules.iter().any(|r| auth::refers(r, "/resource")))
+        {
+            return Err(auth::forbidden(
+                "the grant's rules refer to /now, or to /resource without fixing it",
+            ));
+        }
+        let now = rfc3339_ms(ctx.now);
+        let names: Vec<Option<String>> = match &fixed {
+            Some(f) => f.iter().cloned().map(Some).collect(),
+            None => vec![None],
+        };
+        let pass = |rules: &[Value]| {
+            names.iter().all(|n| {
+                patchlog_core::rules::evaluate(
+                    &Value::Array(rules.to_vec()),
+                    &auth::read_envelope(&c, n.as_deref(), &now),
+                )
+                .is_ok()
+            })
+        };
+        if c.carries_roles {
+            let qualifying = c.roles.iter().any(|(_, e)| {
+                let rules: Vec<Value> = e
+                    .get("rules")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                e.get("can")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("read")))
+                    && !rules.iter().any(|r| auth::refers(r, "/now"))
+                    && (fixed.is_some() || !rules.iter().any(|r| auth::refers(r, "/resource")))
+                    && pass(&rules)
+            });
+            if !qualifying {
+                return Err(auth::forbidden("no role qualifies for read"));
+            }
+        }
+        if !pass(&c.rules) {
+            return Err(auth::forbidden("the grant's rules don't pass for read now"));
+        }
+        let prefixes: Vec<Value> = match &fixed {
+            Some(f) => f
+                .iter()
+                .map(|n| s(format!("/r/{}/{}", ctx.ns, n)))
+                .collect(),
+            None => vec![s(format!("/r/{}", ctx.ns)), s(format!("/ns/{}", ctx.ns))],
+        };
+        http::json(
+            200,
+            Headers::new(),
+            &obj(vec![
+                ("prefixes", Value::Array(prefixes)),
+                ("exp", Value::Number(c.grant.exp_ms() as f64)),
+            ]),
+        )
+    }
 }

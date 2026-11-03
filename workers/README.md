@@ -80,7 +80,7 @@ npm install
 cargo test -p patchlog-core               # unit tests and the vectors of Addendum I.1–I.3
 npm run dev                               # wrangler dev on :8787 with auth off (builds first)
 node bench/smoke.mjs                      # end-to-end checks against it
-cargo build -p patchlog-grant && npm run dev:grants   # grants on, with development keys, on :8788
+cargo build -p patchlog-grant && npm run dev:grants   # grants and edge grants on, with development keys, on :8788
 node bench/auth-smoke.mjs http://127.0.0.1:8788      # grant checks against it
 
 npm run build && npm run workerd          # plain workerd on :8788, without wrangler's proxy
@@ -116,12 +116,17 @@ append writes 4: past that, writes answer `503` with `Retry-After` until 00:00 U
   - **Log entries** record `grant: { id, sub, kid }` and `via`. Retries must come from the same `sub` and `kid`.
   - **Endpoints:** `GET /ns/{ns}/grants/{gid}` and `GET /ns/{ns}/principal`. Operator keys are published at `/.well-known/patchlog-keys` and named by `GET /`.
   - **Namespace documents** accept `keys`, `roles` and `revoked`.
-- CORS (§7, browsers): every origin allowed, none credentialed. Preflights answer from the front Worker with the methods and headers §7 lists and `Access-Control-Max-Age`; every response, errors and cache hits included, carries `Access-Control-Allow-Origin: *` and the exposed headers.
+- Edge grants (§C.5.2–§C.5.4): `POST /edge-grants` exchanges grants for cookies, one per smallest edge prefix the grant allows. The cookies are in §C.5.3's default format, HMAC-SHA256 with `EDGE_KEYS`, and match the Addendum I.5 vector. The origin verifies them on `GET` and `HEAD` without `Authorization`, long-polls included. `DELETE /edge-grants` withdraws them.
+- CORS (§7, browsers): origins in `CREDENTIALED_ORIGINS` are named, with `Access-Control-Allow-Credentials: true` and `Vary: Origin`. Every other origin gets `*`, except that `/edge-grants` preflights are allowed only for listed origins. Preflights answer from the front Worker with the methods and headers §7 lists and `Access-Control-Max-Age`; every response, errors and cache hits included, carries `Access-Control-Allow-Origin: *` and the exposed headers.
 - The vectors of Addendum I.1 (canonical JSON), I.2 (ids) and I.3 (blob ids).
 
 ## Authentication
 
 The deployment in `wrangler.toml` runs with `AUTH = "grants"` and one operator key, `operator-1`, whose seed its owner keeps. With `AUTH` anything else, authentication is off (§1) and writes name their author in `X-Author`. A deployment turns it on by setting `AUTH = "grants"` and giving the deployment's operator public keys in `OPERATOR_JWKS`, a JWK Set (§C.4: OKP Ed25519 keys with `kid`, `use: "sig"` and `patchlog: { from, until? }`). Only public keys are configured. Namespaces are then created with an operator grant whose genesis document lists the namespace's own `keys`, and everything else uses grants signed by those.
+
+Edge grants need `EDGE_KEYS`, a secret JSON array `[{ "kid", "key" }]` of HMAC keys in hex, newest last (`npx wrangler secret put EDGE_KEYS`). Pages that send cookies need their origin in `CREDENTIALED_ORIGINS`, a JSON array. Without keys, `/edge-grants` answers `404 not_offered`.
+
+Behind a CDN that ignores `Vary: Origin`, as Bunny does, a cached public response keeps the CORS headers of the request that filled it. Pages on credentialed origins should read public namespaces without credentials, or the CDN's cache key should include `Origin`. The CDN must also forward `Cookie` and pass `Set-Cookie` through.
 
 `crates/grant` is a command-line tool for development and issuers:
 - `patchlog-grant keygen` makes a key pair;
@@ -141,7 +146,8 @@ Roughly in order of how much they change the design:
 
 - **Grants beyond the core:**
   - author signatures and `signatures: "required"` (§C.3.1);
-  - edge grants (§C.5.2–§C.5.4), so private reads aren't cached at the edge;
+  - a verifying edge (§C.5.3, §9): private reads are `no-store` at CDNs, and edge-grant cookies are checked by the origin;
+  - the `exchangeRate` limit on `POST /edge-grants`;
   - `requireAt` and `maxLag` (keys with `requireAt` are refused);
   - rate limits and `allowances` (§6.6);
   - keys and revocations that follow a branch's base (§C.4): a branch has the keys copied at its creation;

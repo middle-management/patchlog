@@ -1,14 +1,14 @@
-// End-to-end checks of grants (Addendum C) against a deployment running with
-// AUTH=grants and the dev operator key below:
+// End-to-end checks of grants (Addendum C) and edge grants (§C.5) against a
+// deployment running with AUTH=grants and the development keys below:
 //
 //   cargo build -p patchlog-grant
-//   npx wrangler dev --var AUTH:grants --var "OPERATOR_JWKS:$(node bench/auth-smoke.mjs --jwks)"
+//   node bench/auth-smoke.mjs --serve        # wrangler dev on :8788 with them
 //   node bench/auth-smoke.mjs [base-url]
 //
 // Every seed here is a fixed, public, development-only key: never configure
 // these keys in a deployment that holds anything.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
 
@@ -21,10 +21,15 @@ const key = (b) => ({ seed: seed(b), pub: JSON.parse(cli("keygen", "--seed", see
 
 const OP = key(1);
 const jwks = { keys: [{ kty: "OKP", crv: "Ed25519", x: OP.pub, kid: "dev-operator", use: "sig", patchlog: { from: "2026-01-01T00:00:00Z" } }] };
-if (process.argv[2] === "--jwks") {
-  console.log(JSON.stringify(jwks));
-  process.exit(0);
-}
+// Development-only HMAC key for edge-grant cookies, and the page origin
+// allowed to send them.
+const EDGE_KEYS = [{ kid: "dev-edge", key: "11".repeat(32) }];
+const STUDIO = "https://studio.example";
+if (process.argv[2] === "--serve") {
+  const vars = { AUTH: "grants", OPERATOR_JWKS: JSON.stringify(jwks), EDGE_KEYS: JSON.stringify(EDGE_KEYS), CREDENTIALED_ORIGINS: JSON.stringify([STUDIO]) };
+  const args = ["wrangler", "dev", "--port", "8788", ...Object.entries(vars).flatMap(([k, v]) => ["--var", `${k}:${v}`])];
+  spawn("npx", args, { stdio: "inherit" }).on("exit", (c) => process.exit(c ?? 0));
+} else {
 
 const base = process.argv[2] ?? "http://127.0.0.1:8787";
 const ns = `auth-${Date.now().toString(36)}`;
@@ -257,5 +262,76 @@ function blobId(type, bytes) {
   check("the branch is private too 401", r.status === 401, r.status);
 }
 
+
+// Long-polls carry the grant to the namespace's object (§7.7).
+{
+  r = await req("GET", `/ns/${ns}/log?since=&live=long-poll`);
+  check("a long-poll without a grant 401", r.status === 401, r.status);
+  r = await req("GET", `/ns/${ns}/log?since=&live=long-poll`, { grant: star });
+  check("a long-poll with a grant answers", r.status === 200 && Array.isArray(r.json) && r.h.get("x-cursor"), [r.status, r.json]);
+  const since = r.h.get("x-namespace-revision"), cursor = r.h.get("x-cursor");
+  const poll = (async () => {
+    let c = cursor, p;
+    for (let i = 0; i < 3; i++) {
+      p = await req("GET", `/ns/${ns}/log?since=${since}&live=long-poll&cursor=${c}`, { grant: star });
+      if (p.status !== 204) return p;
+      c = p.h.get("x-cursor");
+    }
+    return p;
+  })();
+  await new Promise((res) => setTimeout(res, 300));
+  await req("PATCH", `/r/${ns}/woken`, { grant: bob, body: [{ op: "add", path: "", value: {} }], headers: { "If-None-Match": "*" } });
+  r = await poll;
+  check("a write wakes a long-poll with a grant", r.status === 200 && r.json?.[0]?.resource === "woken" && /private/.test(r.h.get("cache-control")), [r.status, r.json]);
+  r = await req("GET", `/r/${ns}/doc/log?since=&live=long-poll`, { grant: one });
+  check("a resource long-poll with a grant fixed to it", r.status === 200, r.status);
+}
+
+// Edge grants (§C.5.2–§C.5.4) and credentialed CORS.
+{
+  const eg = (grant, extra = {}) => req("POST", "/edge-grants", { grant, headers: { Origin: STUDIO, ...extra.headers }, raw: extra.raw });
+  const cookies = (r) => r.h.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+  r = await fetch(`${base}/edge-grants`, { method: "OPTIONS", headers: { Origin: STUDIO, "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "authorization" } });
+  check("preflight from the credentialed origin", r.status === 204 && r.headers.get("access-control-allow-origin") === STUDIO && r.headers.get("access-control-allow-credentials") === "true" && /Origin/.test(r.headers.get("vary") ?? ""), [...r.headers]);
+  r = await fetch(`${base}/edge-grants`, { method: "OPTIONS", headers: { Origin: "https://evil.example", "Access-Control-Request-Method": "POST" } });
+  check("preflight for /edge-grants from another origin isn't allowed", !r.headers.get("access-control-allow-origin"), [...r.headers]);
+  r = await req("GET", "/", { headers: { Origin: "https://elsewhere.example" } });
+  check("other origins get *", r.h.get("access-control-allow-origin") === "*" && !r.h.get("access-control-allow-credentials"), [...r.h]);
+
+  r = await eg();
+  check("edge grants without a grant 401", r.status === 401, r.json);
+  r = await eg(one, { headers: { "Content-Type": "application/json" }, raw: "{}" });
+  check("Authorization together with a body 400", r.status === 400, r.json);
+  r = await eg(undefined, { headers: { "Content-Type": "text/plain" }, raw: "x" });
+  check("a body that isn't JSON 415", r.status === 415, r.json);
+  const timed = mint(ED, { kid: "editors", sub: "user:tim", ns: [ns], can: ["read"], exp, rules: [{ op: "compare", path: "/now", lt: { value: exp } }] });
+  r = await eg(timed);
+  check("rules on /now can't go to an edge 403", r.status === 403, r.json);
+
+  r = await eg(one);
+  const docCookies = cookies(r);
+  check("a grant fixed to a resource gets one cookie", r.status === 200 && JSON.stringify(r.json?.prefixes) === JSON.stringify([`/r/${ns}/doc`]) && r.h.getSetCookie().length === 1 && /^__Secure-pl-eg-[0-9a-f]{16}=/.test(docCookies) && /Path=\/r\//.test(r.h.getSetCookie()[0]) && /HttpOnly/.test(r.h.getSetCookie()[0]) && /SameSite=None/.test(r.h.getSetCookie()[0]) && r.h.get("access-control-allow-origin") === STUDIO, [r.status, r.json, r.h.getSetCookie()]);
+  r = await req("GET", `/r/${ns}/doc`, { headers: { Cookie: docCookies } });
+  check("the cookie reads its resource", r.status === 302, r.status);
+  r = await req("GET", `/r/${ns}/logo`, { headers: { Cookie: docCookies } });
+  check("but nothing outside its prefix 401", r.status === 401, r.status);
+  r = await req("PATCH", `/r/${ns}/doc`, { headers: { Cookie: docCookies }, body: [], });
+  check("and never writes", r.status === 401 || r.status === 428, r.status);
+
+  r = await eg(undefined, { headers: { "Content-Type": "application/json" }, raw: JSON.stringify({ grants: [star, one] }) });
+  const nsCookies = cookies(r);
+  check("several grants in the body", r.status === 200 && r.json?.prefixes?.length === 3 && r.json.prefixes.includes(`/ns/${ns}`) && r.json.prefixes.includes(`/r/${ns}`), r.json);
+  r = await req("GET", `/ns/${ns}/log?since=&live=long-poll`, { headers: { Cookie: nsCookies } });
+  check("a namespace cookie follows by long-poll", r.status === 200, r.status);
+  const tampered = nsCookies.replace(/=([^.;]+)\./, (_, b) => `=${b.slice(0, -2)}AA.`);
+  r = await req("GET", `/ns/${ns}`, { headers: { Cookie: tampered } });
+  check("a tampered cookie counts for nothing 401", r.status === 401, r.status);
+  r = await req("DELETE", `/edge-grants?prefix=/r/${ns}/doc&prefix=/r/${ns}/doc`, { headers: { Origin: STUDIO } });
+  check("withdrawing", r.status === 204 && r.h.getSetCookie().length === 1 && /Max-Age=0/.test(r.h.getSetCookie()[0]), [r.status, r.h.getSetCookie()]);
+  r = await req("DELETE", `/edge-grants?prefix=/elsewhere`);
+  check("withdrawing a non-prefix 400", r.status === 400, r.status);
+}
+
 console.log(failed ? `\n${failed} failed` : "\nall passed");
 process.exit(failed ? 1 : 0);
+}

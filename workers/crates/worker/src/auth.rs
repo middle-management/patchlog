@@ -90,6 +90,9 @@ pub enum Caller {
     Disabled(Option<String>),
     /// No `Authorization`.
     Anonymous,
+    /// An edge-grant cookie for this prefix, on a `GET` or `HEAD` without
+    /// `Authorization` (§C.5.3): reads under it, with no principal.
+    Edge(#[allow(dead_code)] String),
     Grant(Rc<Checked>),
 }
 
@@ -580,7 +583,7 @@ fn under(p: &str, top: &str) -> bool {
     p == top || p.starts_with(&format!("{top}/"))
 }
 
-fn refers(r: &Value, top: &str) -> bool {
+pub fn refers(r: &Value, top: &str) -> bool {
     let mut ps = Vec::new();
     pointers(r, &mut ps);
     ps.iter().any(|p| under(p, top))
