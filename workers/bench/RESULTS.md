@@ -126,11 +126,18 @@ the object answers, about 20 ms more than a read.
 |---|---|
 | Durable Object CPU per request | 0.55–0.86 ms |
 | Front Worker CPU per request | p50 0.9–1.0 ms, p99 3.6 ms |
-| Rows written per append | ~7 (6.0–7.7 per object request in write minutes) |
+| Rows written per append | ~7 (6.0–7.7 per object request in write minutes); **4** since the storage change below |
 | Rows read per append | ~3.5–4 |
 
-Seven rows per append are the `nslog`, `entries` and `resources` rows plus their indexes
-(`nslog.id`, `entries_by_id`, `entries_by_resource`, the `resources` key). Rows written are
+Seven rows per append were the `nslog`, `entries` and `resources` rows plus their indexes
+(`nslog.id`, `entries_by_id`, `entries_by_resource`, the `resources` key). Storage now
+keeps resource entries clustered by `(resource, seq)` with one index by id, and no
+`resources` table (a head is a resource's newest entry): an append writes **4** rows, the
+namespace entry and its `id` index and the resource entry and its `id` index. Measured with
+workerd's `rowsWritten` (the counter Cloudflare bills), for the same statements under each
+layout: 7 then 6 per append before (7 when a resource's `resources` row is created), 4
+after. Cloudflare's analytics hadn't reported the storage metrics for the minute of a
+600-append check after half an hour, so the 4 is workerd's count. Rows written are
 billed, and capped on the free plan at 100,000 a day: this run hit the cap after ~40,000
 requests, and every write then failed until the daily reset (00:00 UTC). Dropping the
 `resources` table (a head is the last entry of its resource) and an index would bring it

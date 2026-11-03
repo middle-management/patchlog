@@ -102,8 +102,8 @@ pub fn id_for(parent: Option<&Id>, body: &Body) -> Id {
 
 /// Steps 3 and 4 of §6.2 for a create, append or restore: apply the patches
 /// to `doc` (consumed; `Value::Null` for a create) and check the result.
-/// Schema validation (step 5) and rules (step 6) are not implemented: a
-/// resulting document with `$schema` is refused.
+/// Schema validation (step 5) needs schema revisions resolved, so it is the
+/// caller's (`schema`); rules (step 6) are not implemented.
 pub fn apply_and_check(
     parent: Option<&Id>,
     mut doc: Value,
@@ -156,12 +156,6 @@ pub fn apply_and_check(
         // No blob is available to any resource yet (§7.8 isn't implemented).
         return Err(GateError::Blob(
             "the document references a blob that isn't available".into(),
-        ));
-    }
-    // Step 5.
-    if doc.get("$schema").is_some() {
-        return Err(GateError::Invalid(
-            "typed documents ($schema) aren't supported by this server yet".into(),
         ));
     }
     Ok(Prepared {

@@ -112,5 +112,33 @@ check("namespace log", r.status === 200 && r.json.map((e) => e.kind).join() === 
 r = await req("GET", nsHead);
 check("namespace document", r.status === 200 && r.json.read === "public", r.json);
 
+// Typed documents (§6.1, §6.2 step 5).
+const D = "https://json-schema.org/draft/2020-12/schema";
+const sns = `${ns}-s`;
+await req("PATCH", `/ns/${sns}`, { body: [{ op: "add", path: "", value: { read: "public" } }], headers: { "If-None-Match": "*" } });
+r = await req("PATCH", `/r/${sns}/name`, { body: [{ op: "add", path: "", value: { $schema: D, type: "string", minLength: 2, pattern: "^\\u00c5?[A-Za-z]" } }], headers: { "If-None-Match": "*" } });
+check("schema document created", r.status === 201, r.json);
+const nameRev = `/r/${sns}/name/rev/${r.h.get("etag").slice(1, -1)}`;
+r = await req("PATCH", `/r/${ns}/post-schema`, { body: [{ op: "add", path: "", value: { $schema: D, type: "object", required: ["title"], properties: { title: { $ref: nameRev }, tags: { type: "array", items: { type: "string" } } }, additionalProperties: false, "x-index": { by: "title" } } }], headers: { "If-None-Match": "*" } });
+check("schema referring to another namespace's schema", r.status === 201, r.json);
+const postRev = `/r/${ns}/post-schema/rev/${r.h.get("etag").slice(1, -1)}`;
+r = await req("PATCH", `/r/${ns}/post-1`, { body: [{ op: "add", path: "", value: { $schema: postRev, title: "Åsa", tags: ["a"] } }], headers: { "If-None-Match": "*" } });
+check("typed document valid", r.status === 201, r.json);
+const postHead = r.h.get("etag");
+r = await req("PATCH", `/r/${ns}/post-1`, { body: [{ op: "replace", path: "/title", value: "x" }], headers: { "If-Match": postHead } });
+check("append that breaks the schema 422 invalid", r.status === 422 && r.json.code === "invalid" && r.json.errors?.[0]?.pointer === "/title", r.json);
+r = await req("PATCH", `/r/${ns}/post-2`, { body: [{ op: "add", path: "", value: { $schema: postRev, title: "Hi", extra: 1 } }], headers: { "If-None-Match": "*" } });
+check("additional property 422 invalid", r.status === 422 && r.json.errors?.some((e) => e.pointer === "" || e.pointer === "/extra"), r.json);
+r = await req("PATCH", `/r/${ns}/post-3`, { body: [{ op: "add", path: "", value: { $schema: "https://example.com/s", title: "Hi" } }], headers: { "If-None-Match": "*" } });
+check("foreign $schema 422 schema_ref", r.status === 422 && r.json.code === "schema_ref", r.json);
+r = await req("PATCH", `/r/${ns}/post-4`, { body: [{ op: "add", path: "", value: { $schema: `/r/${ns}/nope/rev/${c}`, title: "Hi" } }], headers: { "If-None-Match": "*" } });
+check("unknown schema revision 422 schema_unavailable", r.status === 422 && r.json.code === "schema_unavailable" && r.json.path === `/r/${ns}/nope/rev/${c}`, r.json);
+r = await req("PATCH", `/r/${ns}/post-5`, { body: [{ op: "add", path: "", value: { $schema: `/r/${ns}/derby/rev/${c}`, title: "Hi" } }], headers: { "If-None-Match": "*" } });
+check("a non-schema document 422 schema_unavailable", r.status === 422 && r.json.code === "schema_unavailable", r.json);
+for (const [what, bad] of [["$id", { $id: "x" }], ["an unknown keyword", { frob: 1 }], ["an unknown format", { format: "phone" }], ["a non-RE2 pattern", { pattern: "(a)\\1" }]]) {
+  r = await req("PATCH", `/r/${ns}/bad-schema`, { body: [{ op: "add", path: "", value: { $schema: D, ...bad } }], headers: { "If-None-Match": "*" } });
+  check(`schema with ${what} 422 invalid`, r.status === 422 && r.json.code === "invalid", r.json);
+}
+
 console.log(failed ? `\n${failed} failed` : "\nall passed");
 process.exit(failed ? 1 : 0);

@@ -19,7 +19,7 @@ const PRICE = {
 // Measured on Cloudflare unless marked.
 const UNIT = {
   workerCpuMs: 1.0, // front Worker CPU per request, p50 0.9–1.0 ms
-  rowsWrittenPerWrite: 7, // 6.0–7.7 observed; nslog, entries, resources and their indexes
+  rowsWrittenPerWrite: 4, // ns_log and res_log rows and their id indexes (workerd's rowsWritten); 6.0–7.7 before
   rowsReadPerWrite: 4,
   rowsReadPerRead: 2, // head reads come from memory; a revision read folds up to 16 entries
   activeMsPerWriteSparse: 20, // an object woken for one write stays active through its commit
@@ -175,9 +175,9 @@ const SCENARIOS = [
     writes: 300 * M, reads: 0, storedGb: 150,
   },
   {
-    name: "Write-heavy ingest, 4 rows a write",
-    about: "The same, after dropping the resources table and one index (about 4 rows written per append)",
-    writes: 300 * M, reads: 0, storedGb: 150, rowsWrittenPerWrite: 4,
+    name: "Write-heavy ingest, 7 rows a write (as first built)",
+    about: "The same, with the first storage layout's resources table and extra index (about 7 rows written per append)",
+    writes: 300 * M, reads: 0, storedGb: 150, rowsWrittenPerWrite: 7,
   },
 ];
 

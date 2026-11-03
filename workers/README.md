@@ -26,13 +26,16 @@ with authentication disabled (§1, `"auth": "disabled"`). Everything else is lis
   each write's checks and inserts run with no `await` between them, inside
   `transactionSync`. That gives §5 its atomicity (invariants 2, 5 and 6) and the single
   linear namespace chain of §3.5 without locks.
-- **Storage** is the object's SQLite: `nslog` (the namespace chain), `config` (the
-  namespace document chain), `entries` (resource log entries holding canonical patch sets),
-  `resources` (heads) and `snapshots` (a canonical document every 16 entries of a
-  resource, so any revision is a fold of at most 15 patch sets).
+- **Storage** is the object's SQLite: `ns_log` (the namespace chain), `ns_config` (the
+  namespace document chain), `res_log` (resource log entries holding canonical patch sets,
+  clustered by resource, so a log range or a head is one range of its key) and
+  `res_snapshots` (a canonical document every 16 entries of a resource, so any revision is a
+  fold of at most 15 patch sets). A resource entry takes the sequence number of the
+  namespace entry that records it, and a resource's head is its newest entry. Every row and
+  index entry written is billed, and an append writes 4: two tables, one index each.
 - **Memory.** The namespace head, every resource's head and the head documents (up to
   32 MiB, parsed) stay in the object's memory. A hot append issues no SQL reads, only its
-  three inserts.
+  two inserts.
 - **`documentSize` is capped at 1.5 MiB** (the default is 1 MiB, as in §12.2). A SQLite
   value in a Durable Object can't exceed 2 MB, and a 4 MiB maximum would need snapshots
   split across rows.
@@ -42,6 +45,18 @@ with authentication disabled (§1, `"auth": "disabled"`). Everything else is lis
   and can sleep until the next write, when it sends the answer down every waiting socket.
   The Worker answers `204` at the interval's end. Past 200 waiters on a namespace, further
   polls wait in the object itself, which is cheaper there (`bench/COSTS.md`).
+- **Typed documents (§6.1, §6.2 step 5)** are validated with the `jsonschema` crate
+  (draft 2020-12, formats asserted) against the schema revision and its `$ref` closure, which
+  may live in other namespaces: a write whose closure isn't in the object's memory or its
+  own storage stops before its checks commit to anything, fetches the revisions from the
+  other namespaces' objects, and runs again from the start, so the write itself still has no
+  `await`. Revisions are immutable, so schema documents and compiled validators are cached
+  for good. Schema documents get §6.1's checks: no `$id`, `$schema` only at the root, no
+  unknown keywords but `x-*`, only defined formats, `$ref` to fragments or revision paths,
+  references that resolve. Regular expressions follow RE2 (§6.6, Addendum I.11): patterns
+  are translated for the `regex` crate, which shares RE2's semantics but spells `\uXXXX`,
+  surrogate pairs, `\Q…\E` and the ASCII classes `\d \w \s \b` differently. It adds about
+  1.2 MB to the gzipped bundle (1.5 MB in all; startup 5 ms).
 - **Caching (§9)**: responses carry the spec's `Cache-Control` and `Cache-Tag`. The front
   Worker serves immutable public responses from the Cache API and answers
   `If-None-Match` itself. Private namespaces are `CDN-Cache-Control: no-store`, since
@@ -72,7 +87,7 @@ collapse into one miss. Deploy to a custom domain with
 `npm run deploy` deploys with wrangler (`npx wrangler login --device` signs in from a
 headless machine). The Cache API works only on a custom domain, not on `workers.dev`.
 On the Workers free plan, Durable Objects may write 100,000 SQLite rows a day, and an
-append writes about 7: past that, writes answer `503` with `Retry-After` until 00:00 UTC.
+append writes 4: past that, writes answer `503` with `Retry-After` until 00:00 UTC.
 
 ## Implemented
 
@@ -86,6 +101,6 @@ append writes about 7: past that, writes answer `503` with `Retry-After` until 0
 Roughly in order of how much they change the design:
 
 - **Addendum C** (grants, Biscuit, edge grants) and so private reads; rules (§6.4); rate limits (§6.6).
-- **Schemas** (§6.1): JSON Schema 2020-12 validation needs an interpreting validator (Ajv compiles with `new Function`, which Workers forbid) and RE2 regular expressions (§6.6). A document with `$schema` is refused with `422`.
+- **Schemas, beyond the core** (§6.1): `schemaReads`, drafts in branches, read permission on schema revisions (with authentication off, every revision is readable), and the `in_use` refusals (there is no purge yet). `idn-hostname` and `idn-email` are checked as the `jsonschema` crate does, which may differ from RFC 5890 without UTS 46 mapping in edge cases.
 - **Branches** (§7.6), purge (§8.3, §8.5), pruning (§8.6), batches (§7.5), blobs (§7.8; a blob reference is `422` because no blob is available), SSE (§7.3), `/heads`, gestures, `/principal`, `/branches`, CORS.
 - Addenda A, B, E, F, G and H.

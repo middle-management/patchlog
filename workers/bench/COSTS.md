@@ -32,7 +32,7 @@ inside a Worker is still a Worker request: on Workers, the Worker runs before th
 | Worker requests | API request | 1 |
 | Worker CPU | API request | p50 0.9–1.0 ms, p99 3.6 ms |
 | Durable Object requests | write, uncached read, long-poll | 1 |
-| Rows written | append | ~7 |
+| Rows written | append | 4 (6.0–7.7 as first built) |
 | Rows read | append | ~4 |
 | Storage | small append (0.5 KiB document) | ~512 bytes (local SQLite) |
 | Active time | write to a quiet namespace | ~15–25 ms |
@@ -54,8 +54,8 @@ inside a Worker is still a Worker request: on Workers, the Worker runs before th
 | The same fleet behind Workers Cache (measured collapse) | **~$3,900** | Worker requests, $3,890: cache hits are billed as requests |
 | The same fleet behind Fastly (collapse measured; prices third-party, unconfirmed) | ~$10,500 | Fastly's requests, ~$9,700 at ~$0.75 per million |
 | **The same fleet behind Bunny** (collapse measured; no request fees) | **~$70** | ~6.5 TB of `204`s at $0.01/GB |
-| **Write-heavy ingest**: 1,000 namespaces, 10M writes a day, 150 GB added a month | **~$2,200** | Rows written, $2,050 |
-| The same at 4 rows per append | **~$1,300** | Rows written, $1,150 |
+| **Write-heavy ingest**: 1,000 namespaces, 10M writes a day, 150 GB added a month | **~$1,300** | Rows written, $1,150 |
+| The same at 7 rows per append, as first built | ~$2,200 | Rows written, $2,050 |
 
 ## What the costs say about the design
 
@@ -80,12 +80,12 @@ inside a Worker is still a Worker request: on Workers, the Worker runs before th
    these. Any CDN in front must cache the long-poll `204` (§9) and wait longer than the
    interval for the origin, and Bunny must be told to key its cache on the query string
    (`RESULTS.md` has both CDNs' settings).
-3. **Rows written are the cost of writes.** About 7 rows per append, at $1 per million,
-   is $7 per million writes: more than everything else a write costs put together (Worker
-   and Durable Object requests $0.45 per million, CPU $0.02). Dropping the `resources`
-   table (a resource's head is its last entry) and one index brings it to about 4.
+3. **Rows written are the cost of writes.** Every row and index entry counts. An append
+   writes 4 (it wrote 7 as first built, before the `resources` table and an index went), at
+   $1 per million: $4 per million writes, still more than everything else a write costs put
+   together (Worker and Durable Object requests $0.45 per million, CPU $0.02).
 4. **Small deployments cost the $5 base.** The included usage covers 10 million Worker
-   requests, 1 million Durable Object requests and the rows of about 7 million appends a
-   month. Past that, a million writes cost about $7.50.
+   requests, 1 million Durable Object requests and the rows of 12.5 million appends a
+   month. Past that, a million writes cost about $4.50.
 5. **Storage is cheap but grows.** About 0.5 KB per small append, $0.20 per GB-month.
    Pruning (§8.6), not implemented, bounds it.

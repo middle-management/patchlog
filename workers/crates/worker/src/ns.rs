@@ -14,6 +14,7 @@ use patchlog_core::id::{ns_id, revision_id, tombstone_id};
 use patchlog_core::json::{self, canonical, canonical_string, Value};
 use patchlog_core::limits::{self, measure, settable_limit_max, Limits};
 use patchlog_core::patch::{apply, parse_patch_set};
+use patchlog_core::schema::{self, SchemaError};
 use patchlog_core::Id;
 use serde::Deserialize;
 use worker::js_sys;
@@ -29,14 +30,25 @@ const SNAPSHOT_EVERY: i64 = 16;
 /// Head documents kept parsed in memory, by canonical size.
 const DOC_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Every row and every index entry written counts as a billed "row written",
+/// so a resource write costs 4: its namespace entry and that entry's `id`
+/// index, and its resource entry and that entry's `id` index. A resource's
+/// head is its newest entry, so nothing else is kept per resource.
+///
+/// The tables are named for this layout (earlier builds used `nslog`,
+/// `config`, `resources`, `entries` and `snapshots`); objects created by
+/// those builds keep their old tables, which this build doesn't read.
 const SCHEMA: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS nslog (seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, prev TEXT, entry TEXT NOT NULL, author TEXT NOT NULL, created INTEGER NOT NULL, gesture TEXT, undoes TEXT, config_seq INTEGER NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS config (seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, parent TEXT, patches TEXT NOT NULL, doc TEXT NOT NULL, author TEXT NOT NULL, ns_seq INTEGER NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS resources (name TEXT PRIMARY KEY, head INTEGER NOT NULL, live INTEGER)",
-    "CREATE TABLE IF NOT EXISTS entries (seq INTEGER PRIMARY KEY, resource TEXT NOT NULL, id TEXT NOT NULL, parent TEXT, kind INTEGER NOT NULL, patches TEXT, author TEXT NOT NULL, created INTEGER NOT NULL, gesture TEXT, undoes TEXT, ns_seq INTEGER NOT NULL, depth INTEGER NOT NULL)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS entries_by_id ON entries(resource, id)",
-    "CREATE INDEX IF NOT EXISTS entries_by_resource ON entries(resource, seq)",
-    "CREATE TABLE IF NOT EXISTS snapshots (seq INTEGER PRIMARY KEY, doc TEXT NOT NULL)",
+    // The namespace chain (§3.5). `seq` is the rowid.
+    "CREATE TABLE IF NOT EXISTS ns_log (seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, prev TEXT, entry TEXT NOT NULL, author TEXT NOT NULL, created INTEGER NOT NULL, gesture TEXT, undoes TEXT, config_seq INTEGER NOT NULL)",
+    // The namespace document chain.
+    "CREATE TABLE IF NOT EXISTS ns_config (seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, parent TEXT, patches TEXT NOT NULL, doc TEXT NOT NULL, author TEXT NOT NULL, ns_seq INTEGER NOT NULL)",
+    // Resource logs, clustered by resource: a log range or a head is one
+    // range of the primary key. `seq` is the `ns_log` entry that records it.
+    "CREATE TABLE IF NOT EXISTS res_log (resource TEXT NOT NULL, seq INTEGER NOT NULL, id TEXT NOT NULL, parent TEXT, kind INTEGER NOT NULL, patches TEXT, author TEXT NOT NULL, created INTEGER NOT NULL, gesture TEXT, undoes TEXT, depth INTEGER NOT NULL, PRIMARY KEY (resource, seq)) WITHOUT ROWID",
+    "CREATE UNIQUE INDEX IF NOT EXISTS res_log_by_id ON res_log(resource, id)",
+    // A canonical document every SNAPSHOT_EVERY entries of a resource.
+    "CREATE TABLE IF NOT EXISTS res_snapshots (resource TEXT NOT NULL, seq INTEGER NOT NULL, doc TEXT NOT NULL, PRIMARY KEY (resource, seq)) WITHOUT ROWID",
 ];
 
 /// Long-polls that wait on hibernatable WebSockets before the rest wait in
@@ -113,7 +125,7 @@ struct IdRow {
 }
 
 /// A resource's head, as `resources` and its head entry record it.
-#[derive(Deserialize, Clone)]
+#[derive(Clone)]
 struct Head {
     seq: i64,
     id: String,
@@ -130,7 +142,6 @@ struct Inner {
     head: Option<NsHead>,
     /// resource → its head, or `None` for a name with no entries
     heads: HashMap<String, Option<Head>>,
-    next_seq: Option<i64>,
     /// resource → (entry seq, document at it)
     docs: HashMap<String, (i64, Value, u64)>,
     docs_bytes: u64,
@@ -147,6 +158,21 @@ pub struct Namespace {
     inner: RefCell<Inner>,
     /// Long-poll waiters share one promise, resolved by the next write.
     wake: RefCell<Option<(js_sys::Promise, js_sys::Function)>>,
+    env: Env,
+    /// Schema documents by revision path, and validators compiled from them:
+    /// revisions are immutable, so both are kept for good (§6.1, Validator
+    /// cache), up to SCHEMAS_CACHED entries.
+    schemas: RefCell<HashMap<String, Value>>,
+    validators: RefCell<HashMap<String, std::rc::Rc<schema::Compiled>>>,
+}
+
+const SCHEMAS_CACHED: usize = 1024;
+
+/// A write that needs schema revisions this object doesn't hold: they are
+/// fetched, and the write runs again from the start.
+enum Step {
+    Done(Response),
+    NeedSchemas(Vec<String>),
 }
 
 type Stmt = (&'static str, Vec<SqlStorageValue>);
@@ -177,7 +203,7 @@ impl DurableObject for Namespace {
         Ok(())
     }
 
-    fn new(state: State, _env: Env) -> Self {
+    fn new(state: State, env: Env) -> Self {
         let sql = state.storage().sql();
         Namespace {
             state,
@@ -187,11 +213,13 @@ impl DurableObject for Namespace {
                 loaded: false,
                 head: None,
                 heads: HashMap::new(),
-                next_seq: None,
                 docs: HashMap::new(),
                 docs_bytes: 0,
             }),
             wake: RefCell::new(None),
+            env,
+            schemas: RefCell::new(HashMap::new()),
+            validators: RefCell::new(HashMap::new()),
         }
     }
 
@@ -269,13 +297,13 @@ impl Namespace {
             return Ok(self.inner.borrow().head.clone());
         }
         let last: Option<NsRow> =
-            self.one("SELECT * FROM nslog ORDER BY seq DESC LIMIT 1", vec![])?;
+            self.one("SELECT * FROM ns_log ORDER BY seq DESC LIMIT 1", vec![])?;
         let head = match last {
             None => None,
             Some(r) => {
                 let c: ConfigRow = self
                     .one(
-                        "SELECT * FROM config WHERE seq = ?",
+                        "SELECT * FROM ns_config WHERE seq = ?",
                         vec![r.config_seq.into()],
                     )?
                     .ok_or_else(|| Err::new(500, "internal", "missing config"))?;
@@ -373,7 +401,7 @@ impl Namespace {
         let id = ns_id(Some(&h.id), &canonical(entry));
         let seq = h.seq + 1;
         let stmt: Stmt = (
-            "INSERT INTO nslog (seq, id, prev, entry, author, created, gesture, undoes, config_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO ns_log (seq, id, prev, entry, author, created, gesture, undoes, config_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 seq.into(),
                 id.text().into(),
@@ -434,7 +462,7 @@ impl Namespace {
                 }
                 Method::Patch => {
                     let body = req.bytes().await?;
-                    self.write_resource(&ctx, name, req.headers(), &body)
+                    self.write_typed(&ctx, name, req.headers(), &body).await
                 }
                 Method::Delete => self.delete_resource(&ctx, name, req.headers()),
                 _ => Err(Err::new(405, "bad_input", "method not allowed")),
@@ -475,7 +503,7 @@ impl Namespace {
         let Some(id) = Id::parse(id) else {
             return Err(Err::bad("malformed id"));
         };
-        self.one("SELECT * FROM nslog WHERE id = ?", vec![id.text().into()])
+        self.one("SELECT * FROM ns_log WHERE id = ?", vec![id.text().into()])
     }
 
     fn get_ns_rev(&self, ctx: &Ctx, id: &str) -> Res<Response> {
@@ -483,7 +511,7 @@ impl Namespace {
         let row = self.ns_seq_of(id)?.ok_or_else(Err::not_found)?;
         let c: ConfigRow = self
             .one(
-                "SELECT * FROM config WHERE seq = ?",
+                "SELECT * FROM ns_config WHERE seq = ?",
                 vec![row.config_seq.into()],
             )?
             .ok_or_else(|| Err::new(500, "internal", "missing config"))?;
@@ -521,7 +549,7 @@ impl Namespace {
     fn ns_page(&self, h: &NsHead, after_seq: i64, upto_seq: i64) -> Res<(Vec<NsRow>, bool)> {
         let n = h.limits.log_page_size as i64;
         let mut rows: Vec<NsRow> = self.rows(
-            "SELECT * FROM nslog WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?",
+            "SELECT * FROM ns_log WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?",
             vec![after_seq.into(), upto_seq.into(), (n + 1).into()],
         )?;
         let more = rows.len() as i64 > n;
@@ -700,12 +728,12 @@ impl Namespace {
                     // Idempotent retry (§7.2).
                     let id = revision_id(Some(want), &body.canonical);
                     if let Some(c) = self.one::<ConfigRow>(
-                        "SELECT * FROM config WHERE id = ?",
+                        "SELECT * FROM ns_config WHERE id = ?",
                         vec![id.text().into()],
                     )? {
                         if c.author == author {
                             let ns: IdRow = self
-                                .one("SELECT id FROM nslog WHERE seq = ?", vec![c.ns_seq.into()])?
+                                .one("SELECT id FROM ns_log WHERE seq = ?", vec![c.ns_seq.into()])?
                                 .ok_or_else(|| Err::new(500, "internal", "missing entry"))?;
                             return config_written(ctx, 200, &c.id, &ns.id);
                         }
@@ -745,7 +773,7 @@ impl Namespace {
         let (seq, ns_id_new, ns_stmt) = if head.is_none() {
             let id = ns_id(None, &canonical(&entry));
             let stmt: Stmt = (
-                "INSERT INTO nslog (seq, id, prev, entry, author, created, gesture, undoes, config_seq) VALUES (1, ?, NULL, ?, ?, ?, ?, ?, 1)",
+                "INSERT INTO ns_log (seq, id, prev, entry, author, created, gesture, undoes, config_seq) VALUES (1, ?, NULL, ?, ?, ?, ?, ?, 1)",
                 vec![
                     id.text().into(),
                     canonical_string(&entry).into(),
@@ -763,7 +791,7 @@ impl Namespace {
         self.commit(vec![
             ns_stmt,
             (
-                "INSERT INTO config (seq, id, parent, patches, doc, author, ns_seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO ns_config (seq, id, parent, patches, doc, author, ns_seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 vec![
                     config_seq.into(),
                     config_id.text().into(),
@@ -785,10 +813,44 @@ impl Namespace {
         if let Some(h) = self.inner.borrow().heads.get(name) {
             return Ok(h.clone());
         }
-        let h: Option<Head> = self.one(
-            "SELECT e.seq AS seq, e.id AS id, e.kind AS kind, e.depth AS depth, r.live AS live FROM resources r JOIN entries e ON e.seq = r.head WHERE r.name = ?",
+        #[derive(Deserialize)]
+        struct Newest {
+            seq: i64,
+            id: String,
+            kind: i64,
+            depth: i64,
+        }
+        let newest: Option<Newest> = self.one(
+            "SELECT seq, id, kind, depth FROM res_log WHERE resource = ? ORDER BY seq DESC LIMIT 1",
             vec![name.into()],
         )?;
+        let h = match newest {
+            None => None,
+            Some(n) => {
+                // The last live revision: the head, or for a tombstone the
+                // newest revision before it.
+                let live = if n.kind == TOMBSTONE {
+                    #[derive(Deserialize)]
+                    struct Seq {
+                        seq: i64,
+                    }
+                    self.one::<Seq>(
+                        "SELECT seq FROM res_log WHERE resource = ? AND kind = 0 ORDER BY seq DESC LIMIT 1",
+                        vec![name.into()],
+                    )?
+                    .map(|r| r.seq)
+                } else {
+                    Some(n.seq)
+                };
+                Some(Head {
+                    seq: n.seq,
+                    id: n.id,
+                    kind: n.kind,
+                    depth: n.depth,
+                    live,
+                })
+            }
+        };
         self.remember(name, h.clone());
         Ok(h)
     }
@@ -801,14 +863,17 @@ impl Namespace {
         inner.heads.insert(name.to_string(), h);
     }
 
-    fn entry_by_seq(&self, seq: i64) -> Res<EntryRow> {
-        self.one("SELECT * FROM entries WHERE seq = ?", vec![seq.into()])?
-            .ok_or_else(|| Err::new(500, "internal", "missing entry"))
+    fn entry_by_seq(&self, name: &str, seq: i64) -> Res<EntryRow> {
+        self.one(
+            "SELECT *, seq AS ns_seq FROM res_log WHERE resource = ? AND seq = ?",
+            vec![name.into(), seq.into()],
+        )?
+        .ok_or_else(|| Err::new(500, "internal", "missing entry"))
     }
 
     fn entry_by_id(&self, name: &str, id: &Id) -> Res<Option<EntryRow>> {
         self.one(
-            "SELECT * FROM entries WHERE resource = ? AND id = ?",
+            "SELECT *, seq AS ns_seq FROM res_log WHERE resource = ? AND id = ?",
             vec![name.into(), id.text().into()],
         )
     }
@@ -831,13 +896,13 @@ impl Namespace {
         }
         let snap: SnapRow = self
             .one(
-                "SELECT e.seq AS seq, s.doc AS doc FROM entries e JOIN snapshots s ON s.seq = e.seq WHERE e.resource = ? AND e.seq <= ? ORDER BY e.seq DESC LIMIT 1",
+                "SELECT seq, doc FROM res_snapshots WHERE resource = ? AND seq <= ? ORDER BY seq DESC LIMIT 1",
                 vec![name.into(), seq.into()],
             )?
             .ok_or_else(|| Err::new(500, "internal", "no snapshot"))?;
         let mut doc = parse_stored(&snap.doc)?;
         let rows: Vec<PatchRow> = self.rows(
-            "SELECT patches FROM entries WHERE resource = ? AND seq > ? AND seq <= ? AND kind = 0 ORDER BY seq",
+            "SELECT patches FROM res_log WHERE resource = ? AND seq > ? AND seq <= ? AND kind = 0 ORDER BY seq",
             vec![name.into(), snap.seq.into(), seq.into()],
         )?;
         for r in rows {
@@ -860,7 +925,150 @@ impl Namespace {
         inner.docs_bytes += size;
     }
 
-    fn write_resource(&self, ctx: &Ctx, name: &str, hd: &Headers, raw: &[u8]) -> Res<Response> {
+    /// A resource write, after fetching any schema revision it needs from
+    /// other namespaces. The write itself runs without an `await`, so it
+    /// starts again from the top once the schemas are here.
+    async fn write_typed(&self, ctx: &Ctx, name: &str, hd: &Headers, raw: &[u8]) -> Res<Response> {
+        for _ in 0..4 {
+            match self.write_resource(ctx, name, hd, raw)? {
+                Step::Done(r) => return Ok(r),
+                Step::NeedSchemas(paths) => {
+                    for p in paths {
+                        self.fetch_schema(&p).await?;
+                    }
+                }
+            }
+        }
+        Err(Err::new(500, "internal", "schema references kept changing"))
+    }
+
+    /// Reads a schema revision from another namespace's object (§6.1): it
+    /// must exist, not be a tombstone, and be a schema document.
+    async fn fetch_schema(&self, path: &str) -> Res<()> {
+        let ns = path.split('/').nth(2).unwrap_or_default();
+        let unavailable = |m: &str| {
+            Err::new(422, "schema_unavailable", format!("{path}: {m}")).with("path", s(path))
+        };
+        let stub = self.env.durable_object("NAMESPACE")?.get_by_name(ns)?;
+        let mut r = stub
+            .fetch_with_str(&format!("https://namespace{path}"))
+            .await?;
+        if r.status_code() != 200 {
+            return Err(unavailable(match r.status_code() {
+                410 => "a tombstone, or purged",
+                _ => "no such revision",
+            }));
+        }
+        let doc =
+            json::parse(&r.bytes().await?).map_err(|e| Err::new(500, "internal", e.to_string()))?;
+        if schema::typed(&doc) != Ok(schema::Typed::Schema) {
+            return Err(unavailable("not a schema document"));
+        }
+        self.remember_schema(path, doc);
+        Ok(())
+    }
+
+    fn remember_schema(&self, path: &str, doc: Value) {
+        let mut m = self.schemas.borrow_mut();
+        if m.len() >= SCHEMAS_CACHED {
+            m.clear();
+            self.validators.borrow_mut().clear();
+        }
+        m.insert(path.to_string(), doc);
+    }
+
+    /// The schema documents of `roots`' `$ref` closure: from memory, or this
+    /// namespace's storage; `Err(paths)` names those in other namespaces to
+    /// fetch first.
+    fn schema_closure(
+        &self,
+        ctx: &Ctx,
+        roots: &[String],
+    ) -> Res<std::result::Result<HashMap<String, Value>, Vec<String>>> {
+        loop {
+            let known = self.schemas.borrow().clone();
+            let mut missing = std::collections::BTreeSet::new();
+            for r in roots {
+                missing.extend(schema::closure(r, &known).1);
+            }
+            if missing.is_empty() {
+                return Ok(Ok(known));
+            }
+            let mut remote = Vec::new();
+            for path in missing {
+                let mut parts = path.split('/').skip(2);
+                let (ns, name, id) = (
+                    parts.next().unwrap_or_default(),
+                    parts.next().unwrap_or_default(),
+                    parts.nth(1).unwrap_or_default(),
+                );
+                if ns != ctx.ns {
+                    remote.push(path);
+                    continue;
+                }
+                let unavailable = |m: &str| {
+                    Err::new(422, "schema_unavailable", format!("{path}: {m}"))
+                        .with("path", s(path.clone()))
+                };
+                let Some(id) = Id::parse(id) else {
+                    return Err(unavailable("not a revision id"));
+                };
+                let Some(e) = self.entry_by_id(name, &id)? else {
+                    return Err(unavailable("no such revision"));
+                };
+                if e.kind == TOMBSTONE {
+                    return Err(unavailable("a tombstone"));
+                }
+                let doc = self.doc_at(name, e.seq, false)?;
+                if schema::typed(&doc) != Ok(schema::Typed::Schema) {
+                    return Err(unavailable("not a schema document"));
+                }
+                self.remember_schema(&path, doc);
+            }
+            if !remote.is_empty() {
+                return Ok(Err(remote));
+            }
+        }
+    }
+
+    /// Step 5 of §6.2 on the resulting document.
+    fn check_typed(&self, ctx: &Ctx, doc: &Value) -> Res<Option<Vec<String>>> {
+        match schema::typed(doc).map_err(schema_err)? {
+            schema::Typed::Untyped => Ok(None),
+            schema::Typed::Schema => {
+                // A schema: its own checks, and its references resolve now.
+                let refs = schema::check_schema(doc).map_err(schema_err)?;
+                let roots: Vec<String> = refs.paths.iter().cloned().collect();
+                match self.schema_closure(ctx, &roots)? {
+                    Err(remote) => Ok(Some(remote)),
+                    Ok(known) => {
+                        schema::check_fragments(&refs, &known).map_err(schema_err)?;
+                        Ok(None)
+                    }
+                }
+            }
+            schema::Typed::Instance(path) => {
+                let known = match self.schema_closure(ctx, std::slice::from_ref(&path))? {
+                    Err(remote) => return Ok(Some(remote)),
+                    Ok(k) => k,
+                };
+                let cached = self.validators.borrow().get(&path).cloned();
+                let v = match cached {
+                    Some(v) => v,
+                    None => {
+                        let v =
+                            std::rc::Rc::new(schema::compile(&path, &known).map_err(schema_err)?);
+                        self.validators.borrow_mut().insert(path.clone(), v.clone());
+                        v
+                    }
+                };
+                v.validate(doc).map_err(schema_err)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn write_resource(&self, ctx: &Ctx, name: &str, hd: &Headers, raw: &[u8]) -> Res<Step> {
         http::content_type_is(hd, "application/json-patch+json")?;
         let pre = http::precondition(hd)?;
         let g = Gesture::from(hd)?;
@@ -884,7 +1092,7 @@ impl Namespace {
         if !pre_holds && cur.is_some() {
             if let Some(e) = self.entry_by_id(name, &id)? {
                 if e.author == author && e.parent.as_deref().and_then(Id::parse) == parent {
-                    return self.written(ctx, name, &e, 200);
+                    return self.written(ctx, name, &e, 200).map(Step::Done);
                 }
             }
         }
@@ -934,8 +1142,12 @@ impl Namespace {
         };
         let p = gate::apply_and_check(parent.as_ref(), doc, &body, kind, &ns.limits)
             .map_err(gate_err)?;
-        // Step 7: hash and insert.
-        let seq = self.next_entry_seq()?;
+        // Step 5: the resulting document against its schema.
+        if let Some(remote) = self.check_typed(ctx, &p.doc)? {
+            return Ok(Step::NeedSchemas(remote));
+        }
+        // Step 7: hash and insert. The resource entry takes its namespace
+        // entry's sequence number.
         let entry = obj(vec![
             ("resource", s(name)),
             ("kind", s("head")),
@@ -943,14 +1155,15 @@ impl Namespace {
         ]);
         let (ns_seq, ns_id_new, ns_stmt) =
             self.ns_entry(ctx, &ns, &entry, &author, &g, ns.config_seq);
+        let seq = ns_seq;
         let canon_patches = String::from_utf8(body.canonical).unwrap();
         let mut stmts = vec![
             ns_stmt,
             (
-                "INSERT INTO entries (seq, resource, id, parent, kind, patches, author, created, gesture, undoes, ns_seq, depth) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO res_log (resource, seq, id, parent, kind, patches, author, created, gesture, undoes, depth) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
                 vec![
-                    seq.into(),
                     name.into(),
+                    seq.into(),
                     p.id.text().into(),
                     parent.map(|p| p.text()).into(),
                     canon_patches.into(),
@@ -958,23 +1171,17 @@ impl Namespace {
                     ctx.now.into(),
                     g.gesture.clone().into(),
                     g.undoes.clone().into(),
-                    ns_seq.into(),
                     depth.into(),
                 ],
-            ),
-            (
-                "INSERT INTO resources (name, head, live) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET head = excluded.head, live = excluded.live",
-                vec![name.into(), seq.into(), seq.into()],
             ),
         ];
         if depth % SNAPSHOT_EVERY == 0 {
             stmts.push((
-                "INSERT INTO snapshots (seq, doc) VALUES (?, ?)",
-                vec![seq.into(), canonical_string(&p.doc).into()],
+                "INSERT INTO res_snapshots (resource, seq, doc) VALUES (?, ?, ?)",
+                vec![name.into(), seq.into(), canonical_string(&p.doc).into()],
             ));
         }
         self.commit(stmts)?;
-        self.inner.borrow_mut().next_seq = Some(seq + 1);
         self.remember(
             name,
             Some(Head {
@@ -1004,27 +1211,12 @@ impl Namespace {
             ns_seq,
             depth,
         };
-        written_response(ctx, name, &e, &ns_id_new.text(), 201)
-    }
-
-    fn next_entry_seq(&self) -> Res<i64> {
-        if let Some(n) = self.inner.borrow().next_seq {
-            return Ok(n);
-        }
-        #[derive(Deserialize)]
-        struct M {
-            m: Option<i64>,
-        }
-        Ok(self
-            .one::<M>("SELECT MAX(seq) AS m FROM entries", vec![])?
-            .and_then(|m| m.m)
-            .unwrap_or(0)
-            + 1)
+        written_response(ctx, name, &e, &ns_id_new.text(), 201).map(Step::Done)
     }
 
     fn written(&self, ctx: &Ctx, name: &str, e: &EntryRow, status: u16) -> Res<Response> {
         let ns: IdRow = self
-            .one("SELECT id FROM nslog WHERE seq = ?", vec![e.ns_seq.into()])?
+            .one("SELECT id FROM ns_log WHERE seq = ?", vec![e.ns_seq.into()])?
             .ok_or_else(|| Err::new(500, "internal", "missing entry"))?;
         written_response(ctx, name, e, &ns.id, status)
     }
@@ -1062,7 +1254,6 @@ impl Namespace {
         if head.id != parent.text() {
             return Err(Err::new(412, "stale", "the head moved").with("head", s(head.id)));
         }
-        let seq = self.next_entry_seq()?;
         let entry = obj(vec![
             ("resource", s(name)),
             ("kind", s("tombstone")),
@@ -1070,26 +1261,24 @@ impl Namespace {
         ]);
         let (ns_seq, ns_id_new, ns_stmt) =
             self.ns_entry(ctx, &ns, &entry, &author, &g, ns.config_seq);
+        let seq = ns_seq;
         self.commit(vec![
             ns_stmt,
             (
-                "INSERT INTO entries (seq, resource, id, parent, kind, patches, author, created, gesture, undoes, ns_seq, depth) VALUES (?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO res_log (resource, seq, id, parent, kind, patches, author, created, gesture, undoes, depth) VALUES (?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?)",
                 vec![
-                    seq.into(),
                     name.into(),
+                    seq.into(),
                     tomb.text().into(),
                     parent.text().into(),
                     author.clone().into(),
                     ctx.now.into(),
                     g.gesture.clone().into(),
                     g.undoes.clone().into(),
-                    ns_seq.into(),
                     (head.depth + 1).into(),
                 ],
             ),
-            ("UPDATE resources SET head = ?, live = ? WHERE name = ?", vec![seq.into(), head.live.or(Some(head.seq)).into(), name.into()]),
         ])?;
-        self.inner.borrow_mut().next_seq = Some(seq + 1);
         self.remember(
             name,
             Some(Head {
@@ -1133,7 +1322,7 @@ impl Namespace {
         if head.kind == TOMBSTONE {
             let last = head
                 .live
-                .map(|l| self.entry_by_seq(l))
+                .map(|l| self.entry_by_seq(name, l))
                 .transpose()?
                 .map(|e| s(e.id))
                 .unwrap_or(Value::Null);
@@ -1209,7 +1398,7 @@ impl Namespace {
         };
         let n = ns.limits.log_page_size as i64;
         let rows: Vec<EntryRow> = self.rows(
-            "SELECT * FROM entries WHERE resource = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT ?",
+            "SELECT *, seq AS ns_seq FROM res_log WHERE resource = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT ?",
             vec![name.into(), after.into(), upto.seq.into(), (n + 1).into()],
         )?;
         let mut out = Vec::new();
@@ -1391,6 +1580,29 @@ fn limit_err(status: u16, limit: &str, measured: u64, max: u64) -> Err {
         .with("limit", s(limit))
         .with("measured", Value::Number(measured as f64))
         .with("max", Value::Number(max as f64))
+}
+
+fn schema_err(e: SchemaError) -> Err {
+    match e {
+        SchemaError::Ref(m) => Err::new(422, "schema_ref", m),
+        SchemaError::Unavailable { path, message } => {
+            Err::new(422, "schema_unavailable", format!("{path}: {message}")).with("path", s(path))
+        }
+        SchemaError::Invalid(errors) => {
+            let message = errors.first().map(|(_, m)| m.clone()).unwrap_or_default();
+            Err::new(422, "invalid", message).with(
+                "errors",
+                Value::Array(
+                    errors
+                        .into_iter()
+                        .map(|(pointer, message)| {
+                            obj(vec![("pointer", s(pointer)), ("message", s(message))])
+                        })
+                        .collect(),
+                ),
+            )
+        }
+    }
 }
 
 fn gate_err(e: GateError) -> Err {

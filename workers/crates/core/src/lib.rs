@@ -11,6 +11,7 @@ pub mod json;
 pub mod limits;
 pub mod names;
 pub mod patch;
+pub mod schema;
 
 pub use id::Id;
 pub use json::Value;
