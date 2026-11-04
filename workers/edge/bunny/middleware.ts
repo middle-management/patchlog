@@ -15,16 +15,18 @@
 // On every request, before the cache:
 //   - X-Edge-Verified and X-Edge-Prefix from the client are removed.
 //   - A GET or HEAD without Authorization whose edge-grant cookie verifies
-//     (MAC, expiry, the prefix covering the path) gets a cache key of its
-//     own, `pl-edge=1` added to the URL, so only verified requests share
-//     cached private responses.
-// On a miss, the marker is removed and the request goes to the origin with
-// X-Edge-Verified and X-Edge-Prefix. The origin answers verified reads with
-// an edge lifetime in CDN-Cache-Control, which this script makes Bunny's
-// Cache-Control, keeping the client's (private) aside.
+//     (MAC, expiry, the prefix covering the path) is marked, `pl-edge=1`
+//     in the URL.
+// On a miss, the marker is removed and a marked request goes to the origin
+// with X-Edge-Verified and X-Edge-Prefix. The origin answers verified reads
+// with an edge lifetime in CDN-Cache-Control, which this script makes
+// Bunny's Cache-Control, keeping the client's (private) aside.
 // On every response, hits included: a response cached for verified reads
 // goes only to a request whose cookie verifies now, with its client
-// Cache-Control restored; any other request gets 401.
+// Cache-Control restored. Bunny keys its cache on the URL the client sent,
+// not the marked one (measured), so verified and other requests share
+// entries: any other request is fetched from the origin directly, as if
+// the cache weren't there.
 
 export const MARK = "pl-edge";
 const COOKIE = "__Secure-pl-eg-";
@@ -128,7 +130,7 @@ function rebuild(req: Request, url: URL, headers: Headers): Request {
   return new Request(url.toString(), init);
 }
 
-export function hooks(keys: Key[], secret: string, now = () => Date.now()) {
+export function hooks(keys: Key[], secret: string, origin: string, now = () => Date.now(), fetcher: typeof fetch = fetch) {
   return {
     async onClientRequest(ctx: { request: Request }): Promise<Request | Response> {
       const req = ctx.request;
@@ -175,10 +177,13 @@ export function hooks(keys: Key[], secret: string, now = () => Date.now()) {
       // Cached for verified reads: only for a cookie that verifies now.
       const req = new Request(ctx.request.url, { method: ctx.request.method, headers: ctx.request.headers });
       if (!(await verify(req, keys, now()))) {
-        return new Response(JSON.stringify({ code: "unauthorized", message: "this response needs a valid edge-grant cookie" }), {
-          status: 401,
-          headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
-        });
+        // Not for this request: ask the origin, without the cache.
+        const url = new URL(ctx.request.url);
+        url.searchParams.delete(MARK);
+        const headers = new Headers(ctx.request.headers);
+        headers.delete("X-Edge-Verified");
+        headers.delete("X-Edge-Prefix");
+        return fetcher(origin + url.pathname + url.search, { method: ctx.request.method, headers, redirect: "manual" });
       }
       const headers = new Headers(res.headers);
       headers.set("Cache-Control", res.headers.get(SAVED_CC) ?? "private, max-age=0");
@@ -191,9 +196,10 @@ export function hooks(keys: Key[], secret: string, now = () => Date.now()) {
 // Registered on Bunny; imported without side effects by the tests.
 if (!(globalThis as any).__PATCHLOG_TEST__) {
   const BunnySDK = await import("@bunny.net/edgescript-sdk@0.13.0");
-  const h = hooks(keysFrom(env("EDGE_KEYS")), env("EDGE_VERIFY_SECRET") ?? "");
+  const origin = env("ORIGIN_URL") ?? "https://patchlog.middlemanagement.se";
+  const h = hooks(keysFrom(env("EDGE_KEYS")), env("EDGE_VERIFY_SECRET") ?? "", origin);
   BunnySDK.net.http
-    .servePullZone({ url: env("ORIGIN_URL") ?? "https://patchlog.middlemanagement.se" })
+    .servePullZone({ url: origin })
     .onClientRequest(h.onClientRequest)
     .onOriginRequest(h.onOriginRequest)
     .onOriginResponse(h.onOriginResponse)

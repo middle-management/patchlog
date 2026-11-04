@@ -128,7 +128,7 @@ Edge grants need `EDGE_KEYS`, a secret JSON array `[{ "kid", "key" }]` of HMAC k
 
 **A verifying edge** (§C.5.3, §9) lets a CDN cache private namespaces. `edge/bunny/middleware.ts` is one for Bunny, an Edge Scripting middleware:
 - It checks the edge-grant cookie on every request, cache hits included.
-- It gives verified reads a cache key of their own.
+- Bunny keys its cache on the URL the client sent, so verified and other reads share entries. A cached private response goes only to a request whose cookie verifies; any other request is fetched from the origin directly.
 - On a miss, it forwards them with `X-Edge-Verified` (the secret it shares with the origin, `EDGE_VERIFY_SECRET`) and `X-Edge-Prefix`.
 
 The origin answers such reads with the public lifetimes in `CDN-Cache-Control`. Clients still see `private`, and Cloudflare's own cache gets `no-store`. Without `EDGE_VERIFY_SECRET`, no read counts as verified. `node edge/bunny/test.mjs` tests the script against `npm run dev:grants`.

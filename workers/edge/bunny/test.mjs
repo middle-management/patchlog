@@ -41,16 +41,17 @@ const pub = (b) => JSON.parse(cli("keygen", "--seed", seed(b))).pub;
 const exp = new Date(Date.now() + 3600_000).toISOString().replace(/\.\d+Z$/, "Z");
 const mint = (b, root) => cli("mint", "--seed", seed(b), "--root", JSON.stringify(root));
 const keys = keysFrom(JSON.stringify([{ kid: "dev-edge", key: "11".repeat(32) }]));
-const h = hooks(keys, "dev-edge-verify-secret");
+const h = hooks(keys, "dev-edge-verify-secret", origin);
 
-// The simulated pull zone: Bunny's cache keyed by URL, query included.
+// The simulated pull zone: Bunny's cache keyed by the URL the client sent,
+// query included, as measured (not by the URL onClientRequest returns).
 const cache = new Map();
 let originCalls = 0;
 async function viaBunny(url, headers = {}) {
   const client = new Request(url.replace(origin, "https://cdn.example"), { headers });
   const r1 = await h.onClientRequest({ request: client });
   if (r1 instanceof Response) return r1;
-  const key = r1.url;
+  const key = client.url;
   let res;
   const hit = cache.get(key);
   if (hit && hit.until > Date.now()) {
@@ -91,26 +92,20 @@ check("cookies issued", r.status === 200 && cookie.includes("__Secure-pl-eg-"), 
 
 const rev = `${origin}/r/${ns}/doc/rev/${id}`;
 r = await viaBunny(rev, { Cookie: cookie });
-check("a verified read reaches the origin once, keyed on its own", r.status === 200 && !r.hit && r.key.includes(`${MARK}=1`), [r.status, r.key]);
+check("a verified read reaches the origin once", r.status === 200 && !r.hit, [r.status, r.key]);
 check("the client sees private, with no edge headers", /^private/.test(r.headers.get("Cache-Control")) && !r.headers.get("CDN-Cache-Control") && !r.headers.get("X-Patchlog-Edge"), [...r.headers]);
 const calls = originCalls;
 r = await viaBunny(rev, { Cookie: cookie });
 check("the next verified read is a hit", r.status === 200 && r.hit && originCalls === calls && /^private/.test(r.headers.get("Cache-Control")), [r.status, r.hit]);
 r = await viaBunny(rev);
-check("without a cookie: another key, and the origin refuses", r.status === 401 && !r.hit, [r.status, r.key]);
+check("without a cookie, on the same cache entry: fetched from the origin, which refuses", r.status === 401 && r.hit, [r.status, r.hit]);
 r = await viaBunny(rev, { "X-Edge-Verified": "dev-edge-verify-secret", "X-Edge-Prefix": `/r/${ns}` });
 check("forged edge headers are stripped", r.status === 401, r.status);
 r = await viaBunny(rev, { Cookie: cookie, Authorization: `Bearer ${grant}` });
-check("with Authorization: not the verified key, and not cached", r.status === 200 && !r.key.includes(MARK) && /no-store/.test(r.headers.get("CDN-Cache-Control") ?? ""), [r.status, r.key]);
-
-// The safety net, if Bunny's cache key ignored the marker: a response cached
-// for verified reads never reaches a request without a valid cookie.
-{
-  const entry = [...cache.values()][0];
-  const res = new Response(entry.body, { status: entry.status, headers: entry.headers });
-  const out = await h.onClientResponse({ request: new Request(rev.replace(origin, "https://cdn.example")), response: res });
-  check("a verified cache entry, served to a request without a cookie: 401", out.status === 401, out.status);
-}
+check("with Authorization, on the same entry: fetched from the origin, as for no cache", r.status === 200 && r.hit && /no-store/.test(r.headers.get("CDN-Cache-Control") ?? ""), [r.status, r.hit, r.headers.get("CDN-Cache-Control")]);
+const other = `${origin}/r/${ns}/elsewhere`;
+r = await viaBunny(other, { Cookie: cookie });
+check("a cookie for the namespace reads another resource", r.status === 404 || r.status === 302, r.status);
 
 // The origin's side alone.
 r = await fetch(rev, { headers: { Cookie: cookie, "X-Edge-Verified": "dev-edge-verify-secret", "X-Edge-Prefix": `/r/${ns}` } });
