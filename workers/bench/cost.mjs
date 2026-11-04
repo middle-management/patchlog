@@ -40,6 +40,9 @@ const UNIT = {
   hibernatingWaitersMax: 200,
   bytesPerPoll: 500, // a 204 with its headers, as served
   bytesPerRead: 2_000, // a small document with its headers, for reads a CDN serves
+  // Verifying a grant in the namespace's object (bench/grant-overhead.mjs:
+  // +0.34–0.53 ms of CPU a request on workerd), counted as active time.
+  grantMsPerRequest: 0.45,
 };
 
 const SECONDS_PER_MONTH = 30 * 24 * 3600;
@@ -53,21 +56,27 @@ function usage(s) {
   // Behind Workers Cache, the followers of a namespace collapse into about one
   // miss per interval and per write (measured: 100 followers, 1 miss).
   const misses = (s.followedNamespaces ?? 0) * (SECONDS_PER_MONTH / UNIT.pollIntervalS + (s.writesToFollowedNs ?? 0));
+  // Private namespaces (s.private) are read with grants: their responses are
+  // no-store at every CDN (§9, no verifying edge), so nothing collapses or
+  // is cached, and a CDN in front only relays.
+  const priv = s.private ?? false;
   // Behind another CDN (s.cdn), only its misses reach Cloudflare at all.
-  const collapsed = s.workersCache || s.cdn;
+  const collapsed = !priv && (s.workersCache || s.cdn);
   const pollsAtObject = s.collapsePolls ? 0 : collapsed ? misses : polls;
   // Followers per followed namespace decide where polls wait.
   const perNs = collapsed ? 1 : (s.followers ?? 0) / Math.max(1, s.followedNamespaces ?? 1);
   const hibernatingShare = s.waitsInObject ? 0 : Math.min(1, UNIT.hibernatingWaitersMax / Math.max(1, perNs));
   const awakeNamespaces = s.waitsInObject || perNs > UNIT.hibernatingWaitersMax ? (s.followedNamespaces ?? 0) : 0;
-  const pollsAtWorker = s.pollsBypassWorker ? 0 : s.cdn ? misses : polls;
-  const doReads = s.reads * (1 - (s.cachedShare ?? 0));
+  const pollsAtWorker = s.pollsBypassWorker ? 0 : collapsed && s.cdn ? misses : polls;
+  const cachedShare = priv ? 0 : (s.cachedShare ?? 0);
+  const doReads = s.reads * (1 - cachedShare);
   // Behind another CDN, the cached reads are its, not the Worker's.
-  const cdnReads = s.cdn ? s.reads * (s.cachedShare ?? 0) : 0;
+  const cdnReads = s.cdn ? s.reads * cachedShare : 0;
+  const grantMs = priv || s.grants ? UNIT.grantMsPerRequest : 0;
   return {
     workerRequests: s.writes + s.reads - cdnReads + pollsAtWorker,
     // Cache hits are billed as Worker requests, but run no code.
-    workerCpuMs: (s.writes + s.reads + (s.workersCache ? misses : pollsAtWorker)) * UNIT.workerCpuMs,
+    workerCpuMs: (s.writes + s.reads + (s.workersCache && !priv ? misses : pollsAtWorker)) * UNIT.workerCpuMs,
     doRequests:
       s.writes + doReads + pollsAtObject * (1 + hibernatingShare * (UNIT.doRequestsPerPoll - 1)),
     doGbSeconds:
@@ -75,12 +84,14 @@ function usage(s) {
       ((s.writes * (busy ? UNIT.activeMsPerWriteBusy : UNIT.activeMsPerWriteSparse) + doReads * UNIT.activeMsPerRead) / 1000 +
         // Waits held inside an object keep it active all month (measured: 59.8 s of every minute).
         awakeNamespaces * SECONDS_PER_MONTH +
-        (awakeNamespaces ? 0 : (pollsAtObject * UNIT.activeMsPerPoll) / 1000)),
+        (awakeNamespaces ? 0 : (pollsAtObject * UNIT.activeMsPerPoll) / 1000) +
+        ((s.writes + doReads + pollsAtObject) * grantMs) / 1000),
     rowsRead: s.writes * UNIT.rowsReadPerWrite + doReads * UNIT.rowsReadPerRead,
     rowsWritten: s.writes * (s.rowsWrittenPerWrite ?? UNIT.rowsWrittenPerWrite),
     storageGbMonth: s.storedGb ?? 0,
-    cdnRequests: s.cdn ? polls + cdnReads : 0,
-    cdnGb: s.cdn ? (polls * UNIT.bytesPerPoll + cdnReads * UNIT.bytesPerRead) / 1e9 : 0,
+    // A CDN in front of private namespaces relays every read as well.
+    cdnRequests: s.cdn ? polls + (priv ? s.reads : cdnReads) : 0,
+    cdnGb: s.cdn ? (polls * UNIT.bytesPerPoll + (priv ? s.reads : cdnReads) * UNIT.bytesPerRead) / 1e9 : 0,
     cdn: s.cdn,
   };
 }
@@ -138,6 +149,26 @@ const SCENARIOS = [
     writes: 30 * M, reads: 300 * M, cachedShare: 0.5, storedGb: 50,
     followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2,
     cdn: { name: "Fastly", perMillion: 0.75, perGb: 0.12 },
+  },
+  {
+    name: "Collaborative SaaS with grants, public namespaces",
+    about: "The collaborative scenario behind Bunny, with every write made under a grant: public reads ignore grants, so only writes pay for verification",
+    writes: 30 * M, reads: 300 * M, cachedShare: 0.5, storedGb: 50,
+    followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2,
+    cdn: { name: "Bunny", perMillion: 0, perGb: 0.01 }, grants: true,
+  },
+  {
+    name: "Collaborative SaaS, private namespaces",
+    about: "The collaborative scenario with every namespace read with grants: no CDN can cache a response, so every read and every follower's poll reaches the Worker and the object",
+    writes: 30 * M, reads: 300 * M, cachedShare: 0.5, storedGb: 50,
+    followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2, private: true,
+  },
+  {
+    name: "Collaborative SaaS, private namespaces, behind Bunny",
+    about: "The same behind Bunny, which relays everything and bills its bandwidth",
+    writes: 30 * M, reads: 300 * M, cachedShare: 0.5, storedGb: 50,
+    followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2, private: true,
+    cdn: { name: "Bunny", perMillion: 0, perGb: 0.01 },
   },
   {
     name: "Device fleet, long-poll through the Worker, all waits inside the object (as first built)",

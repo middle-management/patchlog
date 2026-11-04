@@ -40,6 +40,7 @@ inside a Worker is still a Worker request: on Workers, the Worker runs before th
 | Long-poll polls | idle follower | one per 20-second interval (100 followers: 300 a minute), each a Worker request |
 | Active time, waits **inside** the object (first design) | namespace with a waiting follower | **the whole time**: 59.8 s of every minute, 7.66 GB-s a minute, for 100 idle followers |
 | Active time, waits on **hibernating WebSockets** (as built) | namespace with 100 idle followers | **0.35 s a minute** (0.045 GB-s), about 170× less |
+| Grant verification | request with a grant (namespace object) | +0.34–0.53 ms of CPU on workerd, all three request types (`bench/grant-overhead.mjs`) |
 | Durable Object invocations, hibernating | idle poll | 2: the socket's connect and its close event (counted here as full requests; a close may be billed at 1/20 as an incoming WebSocket message) |
 
 ## Scenarios
@@ -61,6 +62,9 @@ mostly idle, read-only fleet:
 | The same behind Workers Cache | **~$710** | Worker requests, $507; a document's followers share one miss |
 | The same behind Bunny (collapse measured; no request fees) | **~$350** | Worker and Durable Object requests, $242: only misses reach the Worker; Bunny's bandwidth is ~$10 |
 | The same behind Fastly (prices third-party, unconfirmed) | ~$1,600 | Fastly's requests, ~$1,140 at ~$0.75 per million |
+| The same behind Bunny, every write under a grant | **~$350** | Unchanged: public reads ignore grants, and verifying writes stays within the included duration |
+| The same with every namespace private (grants on reads) | **~$1,090** | Worker and Durable Object requests, $968: nothing is cached or collapsed |
+| The same, private, behind Bunny | ~$1,100 | As above, plus ~$13 of Bunny bandwidth for relaying |
 | The same, with waits inside the object, as first built | ~$9,200 | Durable Object duration, $8,300: each followed namespace is active all month |
 | **Device fleet through the Worker**: 100,000 devices long-polling 10 public namespaces, 100 writes a day | **~$6,200** | Requests: 13 billion polls a month, $5,880 |
 | The same fleet behind Workers Cache (measured collapse) | **~$3,900** | Worker requests, $3,890: cache hits are billed as requests |
@@ -68,6 +72,57 @@ mostly idle, read-only fleet:
 | **The same fleet behind Bunny** (collapse measured; no request fees) | **~$70** | ~6.5 TB of `204`s at $0.01/GB |
 | **Write-heavy ingest**: 1,000 namespaces, 10M writes a day, 150 GB added a month | **~$1,300** | Rows written, $1,150 |
 | The same at 7 rows per append, as first built | ~$2,200 | Rows written, $2,050 |
+
+## Grants
+
+Grants (Addendum C) change costs in two ways.
+
+- **Verification is cheap.** It adds 0.34–0.53 ms of CPU per request in the namespace's object, measured on workerd for a namespace head, a resource head and an append. It is mostly one Ed25519 signature check. Objects are billed for duration, not CPU, so this is cents a month even for the collaborative scenario. Caching verified grants in the object would remove most of it.
+- **Private reads can't be cached.** A namespace whose `read` isn't `public` answers with `Cache-Control: private` and `CDN-Cache-Control: no-store` (§9), because no edge in front verifies grants. Edge-grant cookies are checked by the origin. So no CDN caches its reads or collapses its long-polls. Every reader's request, and every follower's poll every 20 seconds, reaches the Worker and the object.
+  - For the collaborative scenario that is ~$1,090 a month instead of ~$350 behind Bunny.
+  - A private device fleet would cost what the fleet costs through the Worker, ~$6,200, whatever CDN is in front.
+  - Keeping widely followed or widely read data in public namespaces, and only the sensitive documents private (§C.5), keeps the cheap path. A verifying edge (§C.5.3) would restore caching, but this implementation doesn't have one.
+
+Writes are unaffected beyond verification, apart from a `grants` row the first time a grant writes in a namespace.
+
+## Off Cloudflare: the Go server on SQLite, on EKS (estimate)
+
+**Not measured.** These are AWS list prices (us-east-1, approximate) applied to the same scenarios, with the Go server (`internal/`) on one SQLite file, backed up continuously with Litestream to S3, behind Bunny.
+
+**Load.** One pod covers every scenario's origin load. The Go server on Postgres measured ~590 writes/s and 1,000+ reads/s on one modest machine.
+
+- Collaborative SaaS: ~12 writes, ~60 uncached reads and ~100 poll misses a second.
+- Private SaaS: ~630 requests a second.
+- Ingest: ~115 writes a second.
+
+| Item | Price |
+|---|---|
+| EKS control plane | $0.10/hour, ~$73/month per cluster (shared if the cluster exists) |
+| Node | 2 vCPU / 8 GB Graviton, ~$50–60/month; patchlog needs a share of one |
+| Disk | EBS gp3, $0.08/GB-month |
+| Litestream to S3 | WAL uploaded every second while writes arrive: ~2.6M PUTs a month at $0.005 per 1,000, ~$13. Plus S3 storage at $0.023/GB-month for snapshots and 1–2 days of WAL. Uploads through an S3 gateway endpoint cost nothing more. |
+| Egress to Bunny | $0.09/GB |
+| Load balancer | ALB, ~$20/month, or a share of an existing ingress |
+
+| Scenario | On an existing cluster, per month | Main costs |
+|---|---|---|
+| Small team CMS | ~$25–40 | Pod share; Litestream ~$1–2 |
+| Collaborative SaaS, behind Bunny | **~$100–120** | Pod ~$30, egress ~$40 (~440 GB of misses), Litestream ~$15–20, disk ~$5, Bunny ~$10 |
+| The same, private namespaces | **~$185–210** | Egress ~$113 (~1.25 TB: every read and poll), pod ~$40–60, Litestream ~$15–20, Bunny relaying ~$13 |
+| Write-heavy ingest | ~$85 in the first month, then ~$15 more each month | Pod ~$40, Litestream ~$25 rising with snapshot size, disk +150 GB/month (~$12), egress ~$8 |
+| Device fleet behind Bunny | ~$90 | Bunny ~$70; the origin sees ~1 request per namespace per interval |
+
+**A dedicated cluster** adds about $120–150 a month: the control plane, a whole node and an ALB. **A NAT gateway** on the egress path adds ~$33 a month plus $0.045/GB.
+
+**Against Workers:**
+- EKS is about 3× cheaper where the origin does real work: ~$100–120 against ~$350 for collaborative SaaS behind Bunny, and ~$85 and up against ~$1,300 for ingest.
+- For a public fleet behind Bunny the two are about even. The CDN is the bill either way.
+
+**The trade-off:**
+- SQLite is one pod with one EBS volume in one zone, so there is no hot failover. A crash means minutes of downtime while the pod reschedules, or a restore from S3 that can lose about the last second of writes.
+- Writes scale only as far as one node does; past that, namespaces must be sharded across pods by hand.
+- Backups, upgrades and the cluster are ours to run.
+- On Workers, each namespace is its own Durable Object, which scales and fails over by itself.
 
 ## What the costs say about the design
 
