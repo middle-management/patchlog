@@ -59,6 +59,8 @@ mostly idle, read-only fleet:
 | **Small team CMS**: 50 namespaces, 10,000 saves and 100,000 reads a day (half cached), 2 GB | **$5** | Within the included usage |
 | **Collaborative SaaS**: 5,000 namespaces, 1M saves and 10M reads a day (half cached), 2,000 open documents with 5 followers each, 50 GB | **~$1,060** | Worker and Durable Object requests, $945 |
 | The same behind Workers Cache | **~$710** | Worker requests, $507; a document's followers share one miss |
+| The same behind Bunny (collapse measured; no request fees) | **~$350** | Worker and Durable Object requests, $242: only misses reach the Worker; Bunny's bandwidth is ~$10 |
+| The same behind Fastly (prices third-party, unconfirmed) | ~$1,600 | Fastly's requests, ~$1,140 at ~$0.75 per million |
 | The same, with waits inside the object, as first built | ~$9,200 | Durable Object duration, $8,300: each followed namespace is active all month |
 | **Device fleet through the Worker**: 100,000 devices long-polling 10 public namespaces, 100 writes a day | **~$6,200** | Requests: 13 billion polls a month, $5,880 |
 | The same fleet behind Workers Cache (measured collapse) | **~$3,900** | Worker requests, $3,890: cache hits are billed as requests |
