@@ -65,11 +65,14 @@ mostly idle, read-only fleet:
 | The same behind Bunny, every write under a grant | **~$350** | Unchanged: public reads ignore grants, and verifying writes stays within the included duration |
 | The same with every namespace private (grants on reads) | **~$1,090** | Worker and Durable Object requests, $968: nothing is cached or collapsed |
 | The same, private, behind Bunny | ~$1,100 | As above, plus ~$13 of Bunny bandwidth for relaying |
+| The same, private, behind a verifying Bunny edge (`edge/bunny/middleware.ts`) | **~$700** | Bunny's edge scripting on every request, $351; the rest as for public namespaces behind Bunny |
 | The same, with waits inside the object, as first built | ~$9,200 | Durable Object duration, $8,300: each followed namespace is active all month |
 | **Device fleet through the Worker**: 100,000 devices long-polling 10 public namespaces, 100 writes a day | **~$6,200** | Requests: 13 billion polls a month, $5,880 |
 | The same fleet behind Workers Cache (measured collapse) | **~$3,900** | Worker requests, $3,890: cache hits are billed as requests |
 | The same fleet behind Fastly (collapse measured; prices third-party, unconfirmed) | ~$10,500 | Fastly's requests, ~$9,700 at ~$0.75 per million |
 | **The same fleet behind Bunny** (collapse measured; no request fees) | **~$70** | ~6.5 TB of `204`s at $0.01/GB |
+| The fleet with private namespaces | **~$6,200** | Worker and Durable Object requests: no CDN can cache or collapse a private poll |
+| The private fleet behind a verifying Bunny edge | **~$2,800** | Bunny's edge scripting, $2,728: 13 billion polls at ~$0.21 per million |
 | **Write-heavy ingest**: 1,000 namespaces, 10M writes a day, 150 GB added a month | **~$1,300** | Rows written, $1,150 |
 | The same at 7 rows per append, as first built | ~$2,200 | Rows written, $2,050 |
 
@@ -78,10 +81,10 @@ mostly idle, read-only fleet:
 Grants (Addendum C) change costs in two ways.
 
 - **Verification is cheap.** It adds 0.34–0.53 ms of CPU per request in the namespace's object, measured on workerd for a namespace head, a resource head and an append. It is mostly one Ed25519 signature check. Objects are billed for duration, not CPU, so this is cents a month even for the collaborative scenario. Caching verified grants in the object would remove most of it.
-- **Private reads can't be cached.** A namespace whose `read` isn't `public` answers with `Cache-Control: private` and `CDN-Cache-Control: no-store` (§9), because no edge in front verifies grants. Edge-grant cookies are checked by the origin. So no CDN caches its reads or collapses its long-polls. Every reader's request, and every follower's poll every 20 seconds, reaches the Worker and the object.
-  - For the collaborative scenario that is ~$1,090 a month instead of ~$350 behind Bunny.
-  - A private device fleet would cost what the fleet costs through the Worker, ~$6,200, whatever CDN is in front.
-  - Keeping widely followed or widely read data in public namespaces, and only the sensitive documents private (§C.5), keeps the cheap path. A verifying edge (§C.5.3) would restore caching, but this implementation doesn't have one.
+- **Private reads need a verifying edge to be cached.** A namespace whose `read` isn't `public` answers with `Cache-Control: private` and `CDN-Cache-Control: no-store` (§9). The exception is a read that an edge verified, by checking its edge-grant cookie (§C.5.3).
+  - **Without such an edge, nothing private is cached or collapsed.** Every reader's request, and every follower's poll every 20 seconds, reaches the Worker and the object. That's ~$1,090 a month for the collaborative scenario instead of ~$350, and ~$6,200 for a private fleet, whatever CDN is in front.
+  - **With one,** `edge/bunny/middleware.ts` on Bunny (verified end to end on the deployment), private namespaces cache and collapse like public ones. Bunny's edge scripting then runs on every request, at $0.20 per million plus CPU, about $0.21 per million for a sub-millisecond check. That's ~$700 for the collaborative scenario and ~$2,800 for the private fleet, where 13 billion polls make the script the bill.
+  - **Keeping widely followed or widely read data public,** and only the sensitive documents private (§C.5), stays the cheapest path. So does polling less often: the script's cost is per request.
 
 Writes are unaffected beyond verification, apart from a `grants` row the first time a grant writes in a namespace.
 
@@ -111,12 +114,15 @@ Writes are unaffected beyond verification, apart from a `grants` row the first t
 | The same, private namespaces | **~$185–210** | Egress ~$113 (~1.25 TB: every read and poll), pod ~$40–60, Litestream ~$15–20, Bunny relaying ~$13 |
 | Write-heavy ingest | ~$85 in the first month, then ~$15 more each month | Pod ~$40, Litestream ~$25 rising with snapshot size, disk +150 GB/month (~$12), egress ~$8 |
 | Device fleet behind Bunny | ~$90 | Bunny ~$70; the origin sees ~1 request per namespace per interval |
+| Device fleet, private namespaces | **~$1,000** | Every poll reaches the pod: ~5,000 requests a second, ~100,000 polls held at once. Egress ~$585 (~6.5 TB), ALB ~$200 (active connections), pod ~$100–200 (a few vCPUs), Bunny relaying ~$65. Holding that many polls on one pod is untested. |
+| The same behind a verifying Bunny edge | ~$2,800 | Bunny's edge scripting, ~$2,700; the origin as for the public fleet. The script doesn't pay on EKS, where the uncached traffic is cheaper than scripting it. |
 
 **A dedicated cluster** adds about $120–150 a month: the control plane, a whole node and an ALB. **A NAT gateway** on the egress path adds ~$33 a month plus $0.045/GB.
 
 **Against Workers:**
 - EKS is about 3× cheaper where the origin does real work: ~$100–120 against ~$350 for collaborative SaaS behind Bunny, and ~$85 and up against ~$1,300 for ingest.
 - For a public fleet behind Bunny the two are about even. The CDN is the bill either way.
+- For a private fleet, EKS without an edge script (~$1,000) beats both Workers options: ~$6,200 without the script, ~$2,800 with it.
 
 **The trade-off:**
 - SQLite is one pod with one EBS volume in one zone, so there is no hot failover. A crash means minutes of downtime while the pod reschedules, or a restore from S3 that can lose about the last second of writes.

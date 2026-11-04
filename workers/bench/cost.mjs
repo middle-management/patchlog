@@ -59,7 +59,10 @@ function usage(s) {
   // Private namespaces (s.private) are read with grants: their responses are
   // no-store at every CDN (§9, no verifying edge), so nothing collapses or
   // is cached, and a CDN in front only relays.
-  const priv = s.private ?? false;
+  // With a verifying edge (s.verifiedEdge, edge/bunny/middleware.ts), the
+  // edge checks each request's cookie and then caches and collapses private
+  // namespaces like public ones, for its script's price per request.
+  const priv = (s.private ?? false) && !s.verifiedEdge;
   // Behind another CDN (s.cdn), only its misses reach Cloudflare at all.
   const collapsed = !priv && (s.workersCache || s.cdn);
   const pollsAtObject = s.collapsePolls ? 0 : collapsed ? misses : polls;
@@ -72,7 +75,7 @@ function usage(s) {
   const doReads = s.reads * (1 - cachedShare);
   // Behind another CDN, the cached reads are its, not the Worker's.
   const cdnReads = s.cdn ? s.reads * cachedShare : 0;
-  const grantMs = priv || s.grants ? UNIT.grantMsPerRequest : 0;
+  const grantMs = priv || s.grants || s.verifiedEdge ? UNIT.grantMsPerRequest : 0;
   return {
     workerRequests: s.writes + s.reads - cdnReads + pollsAtWorker,
     // Cache hits are billed as Worker requests, but run no code.
@@ -93,6 +96,8 @@ function usage(s) {
     cdnRequests: s.cdn ? polls + (priv ? s.reads : cdnReads) : 0,
     cdnGb: s.cdn ? (polls * UNIT.bytesPerPoll + (priv ? s.reads : cdnReads) * UNIT.bytesPerRead) / 1e9 : 0,
     cdn: s.cdn,
+    // Edge scripting: every request the CDN takes runs the script.
+    scriptRequests: s.verifiedEdge && s.cdn ? polls + s.reads : 0,
   };
 }
 
@@ -111,6 +116,9 @@ function cost(u) {
       ? {
           [`${u.cdn.name} requests`]: (u.cdnRequests / 1e6) * u.cdn.perMillion,
           [`${u.cdn.name} bandwidth`]: u.cdnGb * u.cdn.perGb,
+          ...(u.scriptRequests
+            ? { [`${u.cdn.name} edge scripting`]: (u.scriptRequests / 1e6) * (u.cdn.scriptPerMillion ?? 0) }
+            : {}),
         }
       : {}),
   };
@@ -169,6 +177,26 @@ const SCENARIOS = [
     writes: 30 * M, reads: 300 * M, cachedShare: 0.5, storedGb: 50,
     followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2, private: true,
     cdn: { name: "Bunny", perMillion: 0, perGb: 0.01 },
+  },
+  {
+    name: "Collaborative SaaS, private namespaces, behind a verifying Bunny edge",
+    about: "The same behind Bunny with edge/bunny/middleware.ts: Bunny checks each request's edge-grant cookie, then caches and collapses as for public namespaces; edge scripting costs $0.20 per million requests and $0.02 per 1,000 CPU seconds, ~$0.21 per million for a sub-millisecond check",
+    writes: 30 * M, reads: 300 * M, cachedShare: 0.5, storedGb: 50,
+    followers: 10_000, followedNamespaces: 2_000, writesToFollowedNs: 30 * M / 2_000 / 2, private: true, verifiedEdge: true,
+    cdn: { name: "Bunny", perMillion: 0, perGb: 0.01, scriptPerMillion: 0.21 },
+  },
+  {
+    name: "Device fleet, private namespaces",
+    about: "The fleet with its namespaces read with grants (edge-grant cookies): no CDN can cache or collapse, so every poll reaches the Worker and the object",
+    writes: 3_000, reads: 0, storedGb: 0.1,
+    followers: 100_000, followedNamespaces: 10, writesToFollowedNs: 3_000 / 10, private: true,
+  },
+  {
+    name: "Device fleet, private namespaces, behind a verifying Bunny edge",
+    about: "The private fleet behind Bunny with edge/bunny/middleware.ts: polls collapse as for public namespaces, and every poll runs the edge script",
+    writes: 3_000, reads: 0, storedGb: 0.1,
+    followers: 100_000, followedNamespaces: 10, writesToFollowedNs: 3_000 / 10, private: true, verifiedEdge: true,
+    cdn: { name: "Bunny", perMillion: 0, perGb: 0.01, scriptPerMillion: 0.21 },
   },
   {
     name: "Device fleet, long-poll through the Worker, all waits inside the object (as first built)",
