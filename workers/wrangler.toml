@@ -1,0 +1,44 @@
+name = "patchlog"
+main = "crates/worker/build/worker/shim.mjs"
+compatibility_date = "2025-10-01"
+
+[build]
+command = "worker-build --release crates/worker"
+
+
+[[durable_objects.bindings]]
+name = "NAMESPACE"
+class_name = "Namespace"
+
+# Blob bytes (§7.8), stored once per id under b/{id}.
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "patchlog-blobs"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Namespace"]
+
+# Authentication (§1): "grants" verifies grants (Addendum C) against each
+# namespace's keys and the operator keys in OPERATOR_JWKS (a JWK Set of public
+# keys, published at /.well-known/patchlog-keys); anything else leaves it
+# disabled, with authors named by X-Author. Locally, `wrangler dev --var
+# AUTH:disabled` runs bench/smoke.mjs; bench/auth-smoke.mjs has its own keys.
+#
+# The operator key history is append-only (§C.4): end a key's period with
+# "until" rather than removing it, and never reuse a kid.
+[vars]
+AUTH = "grants"
+# Pages that may send edge-grant cookies (§C.5.2, §7 browsers). The HMAC
+# keys that sign them are the EDGE_KEYS secret (`wrangler secret put`).
+CREDENTIALED_ORIGINS = '["http://localhost:3300","https://studio-prototype-pr-18902-doors-dev.doors.services"]'
+OPERATOR_JWKS = '{"keys":[{"crv":"Ed25519","kid":"operator-1","kty":"OKP","patchlog":{"from":"2026-11-03T18:24:00Z"},"use":"sig","x":"14dSZUgwsDGi_83nXsr5ENsMVkNjlt1UAwDJmw-OEnQ"},{"crv":"Ed25519","kid":"operator","kty":"OKP","patchlog":{"from":"2026-11-03T18:35:00Z"},"use":"sig","x":"tt2okzafuNJGOoI_ZIrpw0oJBhJTb5SEKYlfGNZgy7o"}]}'
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+# Workers Cache: a cache in front of the Worker, controlled by the
+# responses' Cache-Control (§9). A hit doesn't run the Worker.
+[cache]
+enabled = true
