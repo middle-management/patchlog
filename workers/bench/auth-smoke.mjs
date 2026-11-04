@@ -310,7 +310,7 @@ function blobId(type, bytes) {
 
   r = await eg(one);
   const docCookies = cookies(r);
-  check("a grant fixed to a resource gets one cookie", r.status === 200 && JSON.stringify(r.json?.prefixes) === JSON.stringify([`/r/${ns}/doc`]) && r.h.getSetCookie().length === 1 && /^__Secure-pl-eg-[0-9a-f]{16}=/.test(docCookies) && /Path=\/r\//.test(r.h.getSetCookie()[0]) && /HttpOnly/.test(r.h.getSetCookie()[0]) && /SameSite=None/.test(r.h.getSetCookie()[0]) && r.h.get("access-control-allow-origin") === STUDIO, [r.status, r.json, r.h.getSetCookie()]);
+  check("a grant fixed to a resource gets one cookie", r.status === 200 && JSON.stringify(r.json?.prefixes) === JSON.stringify([`/r/${ns}/doc`]) && r.h.getSetCookie().length === 1 && /^__Secure-pl-eg-[0-9a-f]{16}=/.test(docCookies) && /Path=\/r\//.test(r.h.getSetCookie()[0]) && /HttpOnly/.test(r.h.getSetCookie()[0]) && /SameSite=None; Partitioned/.test(r.h.getSetCookie()[0]) && r.h.get("access-control-allow-origin") === STUDIO, [r.status, r.json, r.h.getSetCookie()]);
   r = await req("GET", `/r/${ns}/doc`, { headers: { Cookie: docCookies } });
   check("the cookie reads its resource", r.status === 302, r.status);
   r = await req("GET", `/r/${ns}/logo`, { headers: { Cookie: docCookies } });

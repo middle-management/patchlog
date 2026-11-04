@@ -186,8 +186,10 @@ pub fn is_edge_prefix(p: &str) -> bool {
 pub fn set_cookie(name: &str, value: &str, prefix: &str, exp_s: i64, credentialed: bool) -> String {
     let max_age = (exp_s - worker::Date::now().as_millis() as i64 / 1000).max(0);
     format!(
-        "{name}={value}; Path={prefix}; Max-Age={max_age}; Secure; HttpOnly; SameSite={}",
-        if credentialed { "None" } else { "Lax" }
+        "{name}={value}; Path={prefix}; Max-Age={max_age}; Secure; HttpOnly; {}",
+        // A page on another site sends them as third-party cookies, which
+        // browsers keep only partitioned by that site (CHIPS).
+        if credentialed { "SameSite=None; Partitioned" } else { "SameSite=Lax" }
     )
 }
 

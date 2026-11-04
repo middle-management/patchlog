@@ -124,7 +124,7 @@ append writes 4: past that, writes answer `503` with `Retry-After` until 00:00 U
 
 The deployment in `wrangler.toml` runs with `AUTH = "grants"` and one operator key, `operator-1`, whose seed its owner keeps. With `AUTH` anything else, authentication is off (§1) and writes name their author in `X-Author`. A deployment turns it on by setting `AUTH = "grants"` and giving the deployment's operator public keys in `OPERATOR_JWKS`, a JWK Set (§C.4: OKP Ed25519 keys with `kid`, `use: "sig"` and `patchlog: { from, until? }`). Only public keys are configured. Namespaces are then created with an operator grant whose genesis document lists the namespace's own `keys`, and everything else uses grants signed by those.
 
-Edge grants need `EDGE_KEYS`, a secret JSON array `[{ "kid", "key" }]` of HMAC keys in hex, newest last (`npx wrangler secret put EDGE_KEYS`). Pages that send cookies need their origin in `CREDENTIALED_ORIGINS`, a JSON array. Without keys, `/edge-grants` answers `404 not_offered`.
+Edge grants need `EDGE_KEYS`, a secret JSON array `[{ "kid", "key" }]` of HMAC keys in hex, newest last (`npx wrangler secret put EDGE_KEYS`). Pages that send cookies need their origin in `CREDENTIALED_ORIGINS`, a JSON array. With origins listed, cookies are `SameSite=None; Partitioned` (CHIPS), since a page on another site sends them as third-party cookies. Without keys, `/edge-grants` answers `404 not_offered`.
 
 Behind a CDN that ignores `Vary: Origin`, as Bunny does, a cached public response keeps the CORS headers of the request that filled it. Pages on credentialed origins should read public namespaces without credentials, or the CDN's cache key should include `Origin`. The CDN must also forward `Cookie` and pass `Set-Cookie` through.
 
