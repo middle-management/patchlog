@@ -257,6 +257,58 @@ mod tests {
     }
 }
 
+/// A read an edge verified (§C.5.3 Forwarding, §9): both headers present,
+/// each one line without a comma, the secret (`EDGE_VERIFY_SECRET`)
+/// matching, the prefix an edge prefix covering the path, no other
+/// credential, and a cookie for that prefix that verifies here too. Returns
+/// the prefix.
+pub fn verified_read(req: &worker::Request, env: &Env) -> worker::Result<Option<String>> {
+    use worker::Method;
+    if !matches!(req.method(), Method::Get | Method::Head) {
+        return Ok(None);
+    }
+    let h = req.headers();
+    let (Some(secret), Some(prefix)) = (h.get("X-Edge-Verified")?, h.get("X-Edge-Prefix")?) else {
+        return Ok(None);
+    };
+    if secret.contains(',') || prefix.contains(',') {
+        return Ok(None);
+    }
+    if h.get("Authorization")?.is_some() || h.get("Source-Authorization")?.is_some() {
+        return Ok(None);
+    }
+    let Some(ours) = env.secret("EDGE_VERIFY_SECRET").ok().map(|s| s.to_string()) else {
+        return Ok(None);
+    };
+    let (a, b) = (secret.as_bytes(), ours.as_bytes());
+    if ours.is_empty() || a.len() != b.len() || a.iter().zip(b).fold(0u8, |x, (p, q)| x | (p ^ q)) != 0 {
+        return Ok(None);
+    }
+    let path = req.path();
+    if !is_edge_prefix(&prefix) || !covers(&prefix, &path) {
+        return Ok(None);
+    }
+    let cookie = h.get("Cookie")?.unwrap_or_default();
+    let now = worker::Date::now().as_millis() as i64;
+    Ok(from_cookies(&cookie, &path, &edge_keys(env), now).map(|(p, _)| p))
+}
+
+/// Edge lifetimes for a private response to a verified read (§9): the
+/// public class's values in `CDN-Cache-Control` and `Surrogate-Control`,
+/// for the edge that verified it; downstream it stays `private`. Cloudflare's
+/// own cache in front of this Worker gets `no-store`: it doesn't verify,
+/// and requests reach it directly.
+pub fn lifetimes(h: &Headers, verified: bool) -> worker::Result<()> {
+    let class = h.get(crate::http::CLASS_HEADER)?;
+    h.delete(crate::http::CLASS_HEADER)?;
+    if let (true, Some(life)) = (verified, class.as_deref().and_then(crate::http::Class::edge_lifetime)) {
+        h.set("CDN-Cache-Control", life)?;
+        h.set("Surrogate-Control", life)?;
+        h.set("Cloudflare-CDN-Cache-Control", "no-store")?;
+    }
+    Ok(())
+}
+
 pub fn not_offered() -> Err {
     Err::not_offered("edge grants need authentication on and EDGE_KEYS set")
 }

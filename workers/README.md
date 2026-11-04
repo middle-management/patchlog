@@ -126,6 +126,13 @@ The deployment in `wrangler.toml` runs with `AUTH = "grants"` and one operator k
 
 Edge grants need `EDGE_KEYS`, a secret JSON array `[{ "kid", "key" }]` of HMAC keys in hex, newest last (`npx wrangler secret put EDGE_KEYS`). Pages that send cookies need their origin in `CREDENTIALED_ORIGINS`, a JSON array. With origins listed, cookies are `SameSite=None; Partitioned` (CHIPS), since a page on another site sends them as third-party cookies. Without keys, `/edge-grants` answers `404 not_offered`.
 
+**A verifying edge** (§C.5.3, §9) lets a CDN cache private namespaces. `edge/bunny/middleware.ts` is one for Bunny, an Edge Scripting middleware:
+- It checks the edge-grant cookie on every request, cache hits included.
+- It gives verified reads a cache key of their own.
+- On a miss, it forwards them with `X-Edge-Verified` (the secret it shares with the origin, `EDGE_VERIFY_SECRET`) and `X-Edge-Prefix`.
+
+The origin answers such reads with the public lifetimes in `CDN-Cache-Control`. Clients still see `private`, and Cloudflare's own cache gets `no-store`. Without `EDGE_VERIFY_SECRET`, no read counts as verified. `node edge/bunny/test.mjs` tests the script against `npm run dev:grants`.
+
 Behind a CDN that ignores `Vary: Origin`, as Bunny does, a cached public response keeps the CORS headers of the request that filled it. Pages on credentialed origins should read public namespaces without credentials, or the CDN's cache key should include `Origin`. The CDN must also forward `Cookie` and pass `Set-Cookie` through.
 
 `crates/grant` is a command-line tool for development and issuers:

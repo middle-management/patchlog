@@ -24,11 +24,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     if req.method() == Method::Options {
         return preflight(&req.path(), origin.as_deref(), &listed);
     }
+    let verified = edge::verified_read(&req, &env)?;
     let resp = match front(req, env, ctx).await {
         Ok(r) => r,
         Err(e) => e.into_response(false)?,
     };
-    with_cors(resp, origin.as_deref(), &listed)
+    with_cors(resp, origin.as_deref(), &listed, verified.is_some())
 }
 
 /// §7, browsers: a page on a credentialed origin (§C.5.2) is named, with
@@ -38,9 +39,15 @@ const CORS_METHODS: &str = "GET, HEAD, PATCH, PUT, POST, DELETE";
 const CORS_ALLOW_HEADERS: &str = "Authorization, If-Match, Source-Authorization, Signature, Content-Type, Gesture, Undoes, Blob-Nonce, Blob-From, X-Author, If-None-Match, If-Modified-Since, Range, If-Range, Last-Event-ID";
 const CORS_EXPOSE_HEADERS: &str = "ETag, Location, Repr-Digest, Retry-After, Content-Range, Gesture, Undoes, X-Revision, X-Namespace-Revision, X-Config-Revision, X-Cursor, X-Log-Next";
 
-fn with_cors(resp: Response, origin: Option<&str>, listed: &[String]) -> Result<Response> {
+fn with_cors(
+    resp: Response,
+    origin: Option<&str>,
+    listed: &[String],
+    edge_verified: bool,
+) -> Result<Response> {
     // Headers of a fetched or cached response are immutable: copy them.
     let h = resp.headers().clone();
+    edge::lifetimes(&h, edge_verified)?;
     edge::cors(&h, origin, listed).map_err(|e| worker::Error::RustError(e.message))?;
     h.set("Access-Control-Expose-Headers", CORS_EXPOSE_HEADERS)?;
     no_transform(&h)?;

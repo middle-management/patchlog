@@ -25,8 +25,10 @@ const jwks = { keys: [{ kty: "OKP", crv: "Ed25519", x: OP.pub, kid: "dev-operato
 // allowed to send them.
 const EDGE_KEYS = [{ kid: "dev-edge", key: "11".repeat(32) }];
 const STUDIO = "https://studio.example";
+// Development-only secret a verifying edge shares with the origin (§9).
+export const EDGE_SECRET = "dev-edge-verify-secret";
 if (process.argv[2] === "--serve") {
-  const vars = { AUTH: "grants", OPERATOR_JWKS: JSON.stringify(jwks), EDGE_KEYS: JSON.stringify(EDGE_KEYS), CREDENTIALED_ORIGINS: JSON.stringify([STUDIO]) };
+  const vars = { AUTH: "grants", OPERATOR_JWKS: JSON.stringify(jwks), EDGE_KEYS: JSON.stringify(EDGE_KEYS), CREDENTIALED_ORIGINS: JSON.stringify([STUDIO]), EDGE_VERIFY_SECRET: EDGE_SECRET };
   const args = ["wrangler", "dev", "--port", "8788", ...Object.entries(vars).flatMap(([k, v]) => ["--var", `${k}:${v}`])];
   spawn("npx", args, { stdio: "inherit" }).on("exit", (c) => process.exit(c ?? 0));
 } else {

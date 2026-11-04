@@ -33,12 +33,45 @@ pub fn cache_headers(h: &Headers, class: Class, public: bool) -> Result<()> {
     if public {
         h.set("Cache-Control", cc)?;
     } else {
-        // §9: no verifying edge yet, so every private response is no-store at the CDN.
+        // §9: private responses are no-store at every CDN, unless the front
+        // Worker finds the read verified by an edge (edge.rs), which takes
+        // its edge lifetime from the class noted here.
         h.set("Cache-Control", &format!("private, max-age={private_max}"))?;
         h.set("CDN-Cache-Control", "no-store")?;
         h.set("Surrogate-Control", "no-store")?;
+        h.set(CLASS_HEADER, class.name())?;
     }
     Ok(())
+}
+
+/// The cache class of a private response, from the namespace's object to
+/// the front Worker, which removes it.
+pub const CLASS_HEADER: &str = "X-Patchlog-Class";
+
+impl Class {
+    pub fn name(self) -> &'static str {
+        match self {
+            Class::HeadPointer => "head",
+            Class::Immutable => "immutable",
+            Class::Short => "short",
+            Class::LongPollOk => "long-poll",
+            Class::LongPollEmpty => "long-poll-empty",
+            Class::NoStore => "no-store",
+        }
+    }
+
+    /// The edge lifetime of the class, for `CDN-Cache-Control`: the public
+    /// class's shared-cache values (§9).
+    pub fn edge_lifetime(name: &str) -> Option<&'static str> {
+        Some(match name {
+            "head" => "max-age=1, stale-while-revalidate=5",
+            "immutable" => "max-age=31536000, immutable",
+            "short" => "max-age=5",
+            "long-poll" => "max-age=20",
+            "long-poll-empty" => "max-age=2",
+            _ => return None,
+        })
+    }
 }
 
 pub fn tags(h: &Headers, ns: &str, resource: Option<&str>) -> Result<()> {
