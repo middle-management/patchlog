@@ -55,9 +55,14 @@ export function keysFrom(json: string | undefined): Key[] {
 }
 
 function b64urlDecode(s: string): Uint8Array | null {
-  if (!/^[A-Za-z0-9_-]*$/.test(s)) return null;
-  const b = atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4));
-  return Uint8Array.from(b, (c) => c.charCodeAt(0));
+  // A length of 1 mod 4 is never base64.
+  if (!/^[A-Za-z0-9_-]*$/.test(s) || s.length % 4 === 1) return null;
+  try {
+    const b = atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4));
+    return Uint8Array.from(b, (c) => c.charCodeAt(0));
+  } catch {
+    return null;
+  }
 }
 
 function b64url(bytes: Uint8Array): string {
@@ -87,8 +92,17 @@ export function covers(p: string, path: string): boolean {
   return path === p || path.startsWith(p + "/");
 }
 
-/** §C.5.3's checks on one request; the prefix of a cookie that passes. */
+/** §C.5.3's checks on one request; the prefix of a cookie that passes. A
+ * malformed cookie is one that doesn't pass, never an error. */
 export async function verify(req: Request, keys: Key[], nowMs = Date.now()): Promise<string | null> {
+  try {
+    return await verifyUnsafe(req, keys, nowMs);
+  } catch {
+    return null;
+  }
+}
+
+async function verifyUnsafe(req: Request, keys: Key[], nowMs: number): Promise<string | null> {
   if (req.method !== "GET" && req.method !== "HEAD") return null;
   if (req.headers.has("Authorization") || req.headers.has("Source-Authorization")) return null;
   const path = new URL(req.url).pathname;
@@ -103,7 +117,8 @@ export async function verify(req: Request, keys: Key[], nowMs = Date.now()): Pro
     const body = value.slice(0, dot), mac = b64urlDecode(value.slice(dot + 1));
     const raw = b64urlDecode(body);
     if (!raw || !mac) continue;
-    const text = new TextDecoder().decode(raw);
+    let text: string;
+    try { text = new TextDecoder("utf-8", { fatal: true }).decode(raw); } catch { continue; }
     let claims: any;
     try { claims = JSON.parse(text); } catch { continue; }
     if (!claims || typeof claims !== "object" || Object.keys(claims).length !== 3) continue;
@@ -131,7 +146,24 @@ function rebuild(req: Request, url: URL, headers: Headers): Request {
 }
 
 export function hooks(keys: Key[], secret: string, origin: string, now = () => Date.now(), fetcher: typeof fetch = fetch) {
-  return {
+  // A request as it is, less the edge's own marker and headers.
+  const plain = (req: Request): Request => {
+    const url = new URL(req.url);
+    url.searchParams.delete(MARK);
+    const headers = new Headers(req.headers);
+    headers.delete("X-Edge-Verified");
+    headers.delete("X-Edge-Prefix");
+    return rebuild(req, url, headers);
+  };
+  const fromOrigin = (req: Request): Promise<Response> => {
+    const url = new URL(req.url);
+    url.searchParams.delete(MARK);
+    const headers = new Headers(req.headers);
+    headers.delete("X-Edge-Verified");
+    headers.delete("X-Edge-Prefix");
+    return fetcher(origin + url.pathname + url.search, { method: req.method, headers, redirect: "manual" });
+  };
+  const h = {
     async onClientRequest(ctx: { request: Request }): Promise<Request | Response> {
       const req = ctx.request;
       const url = new URL(req.url);
@@ -178,17 +210,32 @@ export function hooks(keys: Key[], secret: string, origin: string, now = () => D
       const req = new Request(ctx.request.url, { method: ctx.request.method, headers: ctx.request.headers });
       if (!(await verify(req, keys, now()))) {
         // Not for this request: ask the origin, without the cache.
-        const url = new URL(ctx.request.url);
-        url.searchParams.delete(MARK);
-        const headers = new Headers(ctx.request.headers);
-        headers.delete("X-Edge-Verified");
-        headers.delete("X-Edge-Prefix");
-        return fetcher(origin + url.pathname + url.search, { method: ctx.request.method, headers, redirect: "manual" });
+        return fromOrigin(ctx.request);
       }
       const headers = new Headers(res.headers);
       headers.set("Cache-Control", res.headers.get(SAVED_CC) ?? "private, max-age=0");
       for (const h of [SAVED_CC, VERIFIED, "CDN-Cache-Control", "Surrogate-Control", "Cloudflare-CDN-Cache-Control"]) headers.delete(h);
       return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+    },
+  };
+  // Should a hook fail, the request goes on as without this script: never
+  // verified, and a response cached for verified reads never served.
+  return {
+    async onClientRequest(ctx: { request: Request }): Promise<Request | Response> {
+      try { return await h.onClientRequest(ctx); } catch { return plain(ctx.request); }
+    },
+    async onOriginRequest(ctx: { request: Request }): Promise<Request | Response> {
+      try { return await h.onOriginRequest(ctx); } catch { return plain(ctx.request); }
+    },
+    async onOriginResponse(ctx: { request: Request; response: Response }): Promise<Response> {
+      try { return await h.onOriginResponse(ctx); } catch { return ctx.response; }
+    },
+    async onClientResponse(ctx: { request: Request; response: Response }): Promise<Response> {
+      try {
+        return await h.onClientResponse(ctx);
+      } catch {
+        return ctx.response.headers.has(VERIFIED) ? fromOrigin(ctx.request) : ctx.response;
+      }
     },
   };
 }
