@@ -43,8 +43,23 @@ fn with_cors(resp: Response, origin: Option<&str>, listed: &[String]) -> Result<
     let h = resp.headers().clone();
     edge::cors(&h, origin, listed).map_err(|e| worker::Error::RustError(e.message))?;
     h.set("Access-Control-Expose-Headers", CORS_EXPOSE_HEADERS)?;
+    no_transform(&h)?;
     let (builder, body) = resp.into_parts();
     Ok(builder.with_headers(h).body(body))
+}
+
+/// A response with an `ETag` says `no-transform`, so that no cache or CDN
+/// re-encodes the bytes the tag names (and their `Repr-Digest`).
+fn no_transform(h: &Headers) -> Result<()> {
+    if h.get("ETag")?.is_none() {
+        return Ok(());
+    }
+    match h.get("Cache-Control")? {
+        Some(cc) if cc.split(',').any(|d| d.trim().eq_ignore_ascii_case("no-transform")) => {}
+        Some(cc) if !cc.trim().is_empty() => h.set("Cache-Control", &format!("{cc}, no-transform"))?,
+        _ => h.set("Cache-Control", "no-transform")?,
+    }
+    Ok(())
 }
 
 /// A preflight. `/edge-grants` is allowed only for credentialed origins

@@ -520,5 +520,26 @@ check("a namespace can't be created with base 422", r.status === 422, r.json);
   check("heads takes only after (§7)", r.status === 400, r.status);
 }
 
+// Responses with an ETag say no-transform.
+{
+  const tn = `${ns}-nt`;
+  r = await req("PATCH", `/ns/${tn}`, { body: [{ op: "add", path: "", value: { read: "public" } }], headers: { "If-None-Match": "*" } });
+  r = await req("PATCH", `/r/${tn}/d`, { body: [{ op: "add", path: "", value: { a: 1 } }], headers: { "If-None-Match": "*" } });
+  const wrote = r;
+  const id = wrote.h.get("etag").slice(1, -1);
+  const nt = (x) => /(^|,)\s*no-transform\s*(,|$)/.test(x.h.get("cache-control") ?? "");
+  check("a write's answer: no-store, no-transform", nt(wrote) && /no-store/.test(wrote.h.get("cache-control")), wrote.h.get("cache-control"));
+  r = await req("GET", `/r/${tn}/d`);
+  check("a head pointer", r.status === 302 && nt(r) && /s-maxage=1/.test(r.h.get("cache-control")), r.h.get("cache-control"));
+  for (const k of [0, 1]) {
+    r = await req("GET", `/r/${tn}/d/rev/${id}`);
+    check(`a revision${k ? " (cached)" : ""}`, r.status === 200 && nt(r) && (r.h.get("cache-control").match(/no-transform/g) ?? []).length === 1 && /immutable/.test(r.h.get("cache-control")), r.h.get("cache-control"));
+  }
+  r = await req("GET", `/r/${tn}/d/rev/${id}`, { headers: { "If-None-Match": `"${id}"` } });
+  check("a 304", r.status === 304 && nt(r), [r.status, r.h.get("cache-control")]);
+  r = await req("GET", `/r/${tn}/missing`);
+  check("no ETag, no change", r.status === 404 && !nt(r), r.h.get("cache-control"));
+}
+
 console.log(failed ? `\n${failed} failed` : "\nall passed");
 process.exit(failed ? 1 : 0);
