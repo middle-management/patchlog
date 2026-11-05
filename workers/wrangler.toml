@@ -32,7 +32,7 @@ AUTH = "grants"
 # Pages that may send edge-grant cookies (§C.5.2, §7 browsers). The HMAC
 # keys that sign them are the EDGE_KEYS secret (`wrangler secret put`).
 CREDENTIALED_ORIGINS = '["http://localhost:3300","https://studio-prototype-pr-18902-doors-dev.doors.services"]'
-OPERATOR_JWKS = '{"keys":[{"crv":"Ed25519","kid":"operator-1","kty":"OKP","patchlog":{"from":"2026-11-03T18:24:00Z"},"use":"sig","x":"14dSZUgwsDGi_83nXsr5ENsMVkNjlt1UAwDJmw-OEnQ"},{"crv":"Ed25519","kid":"operator","kty":"OKP","patchlog":{"from":"2026-11-03T18:35:00Z"},"use":"sig","x":"tt2okzafuNJGOoI_ZIrpw0oJBhJTb5SEKYlfGNZgy7o"}]}'
+OPERATOR_JWKS = '{"keys":[{"crv":"Ed25519","kid":"operator-1","kty":"OKP","patchlog":{"from":"2026-11-03T18:24:00Z"},"use":"sig","x":"14dSZUgwsDGi_83nXsr5ENsMVkNjlt1UAwDJmw-OEnQ"},{"crv":"Ed25519","kid":"operator","kty":"OKP","patchlog":{"from":"2026-11-03T18:35:00Z"},"use":"sig","x":"tt2okzafuNJGOoI_ZIrpw0oJBhJTb5SEKYlfGNZgy7o"},{"crv":"Ed25519","kid":"operator-2","kty":"OKP","patchlog":{"from":"2026-11-05T10:30:00Z"},"use":"sig","x":"NYr8boRyxdOx10qdn2Us-WmwxO9O5PvMCi3TtF64A00"}]}'
 
 [observability]
 enabled = true
