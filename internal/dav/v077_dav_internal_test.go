@@ -13,7 +13,8 @@ import (
 
 // OTHER-2 (§H.4 "The base"): a failed read is no answer, a timeout, or the
 // core's 408, 429 or 5xx, also wrapped by a key fetch; a refusal and no
-// keys here are not. upstream answers 408 and 429 with 503, 5xx with 502.
+// keys here are not. upstream answers 408, 429 and a timeout with 503 and
+// Retry-After, 5xx with 502.
 func TestV077FailedRead(t *testing.T) {
 	t.Parallel()
 	api := func(status int) error { return &client.APIError{Status: status, Code: "x"} }
@@ -45,6 +46,9 @@ func TestV077FailedRead(t *testing.T) {
 		var de *davError
 		if !errors.As(upstream(c.err), &de) || de.status != c.upstream {
 			t.Errorf("upstream(%v) = %v, want %d", c.err, upstream(c.err), c.upstream)
+		} else if de.status == http.StatusServiceUnavailable && de.header.Get("Retry-After") == "" {
+			// §H.4 Answers: "503 with Retry-After".
+			t.Errorf("upstream(%v) = 503 without Retry-After", c.err)
 		}
 	}
 }

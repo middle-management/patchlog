@@ -11,8 +11,9 @@ import (
 	"github.com/middle-management/patchlog/internal/dav"
 )
 
-// failRT answers the core requests match picks with status while armed,
-// and passes every other request through.
+// failRT answers the core requests match picks with status while armed
+// (status 0: a transport timeout, as an http.Client's Timeout gives), and
+// passes every other request through.
 type failRT struct {
 	armed  atomic.Bool
 	match  atomic.Value // func(*http.Request) bool
@@ -21,11 +22,21 @@ type failRT struct {
 
 func (f *failRT) RoundTrip(r *http.Request) (*http.Response, error) {
 	if m, _ := f.match.Load().(func(*http.Request) bool); f.armed.Load() && m != nil && m(r) {
+		if f.status == 0 {
+			return nil, timeoutErr{}
+		}
 		return &http.Response{StatusCode: f.status, Header: http.Header{"Retry-After": {"5"}, "Content-Type": {"application/json"}},
 			Body: io.NopCloser(strings.NewReader(`{"code":"unavailable","message":"try later"}`)), Request: r}, nil
 	}
 	return http.DefaultTransport.RoundTrip(r)
 }
+
+// timeoutErr is a net.Error that timed out.
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
 
 // failingEnv is newEnv's flat docs, served by a WebDAV server whose core
 // requests go through a failRT answering status.
@@ -43,10 +54,10 @@ func failingEnv(t *testing.T, status int) (*env, *failRT) {
 
 // OTHER-2 (§H.4 "The base", "The reload", Answers; §H.6): a save with a
 // base over someone else's delete reads the file's last revision to find
-// out whether it moved; a failed read of it (408, 429, 5xx) fails the
-// save, 503 or 502, rather than taking it as a revision the gateway can't
-// read (409). Nothing is written. A refusal of the read (403) still
-// leaves the 409.
+// out whether it moved; a failed read of it (408, 429, a timeout, 5xx)
+// fails the save, 503 (with Retry-After) or 502, rather than taking it as
+// a revision the gateway can't read (409). Nothing is written. A refusal
+// of the read (403) still leaves the 409.
 func TestV077SaveOverDeleteFailedRead(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
@@ -57,6 +68,7 @@ func TestV077SaveOverDeleteFailedRead(t *testing.T) {
 		{500, 502, "a 500"},
 		{429, 503, "a 429"},
 		{408, 503, "a 408"},
+		{0, 503, "a timeout"},
 		{403, 409, "a refusal (not a failed read)"},
 	} {
 		e, rt := failingEnv(t, c.status)

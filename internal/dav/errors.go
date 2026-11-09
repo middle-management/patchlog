@@ -128,7 +128,9 @@ func upstream(err error) error {
 	}
 	var ne net.Error
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &ne) && ne.Timeout() {
-		return &davError{status: http.StatusServiceUnavailable, msg: "the request was canceled or timed out", cause: err}
+		// 503 with Retry-After, like a 429 or 408 waited out (§H.4 Answers).
+		return &davError{status: http.StatusServiceUnavailable, msg: "the request was canceled or timed out", cause: err,
+			header: http.Header{"Retry-After": {"5"}}}
 	}
 	ae, ok := client.AsAPIError(err)
 	if !ok {
