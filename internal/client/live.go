@@ -16,9 +16,17 @@ import (
 // LongPollResult is one answer of a long-poll read (§7.7).
 type LongPollResult struct {
 	Entries []NSEntry // oldest first; empty on timeout
-	Since   string    // the next since: the last entry returned, or the request's since on timeout
-	Cursor  string    // X-Cursor, to echo in the next request
-	Timeout bool      // 204: no entry arrived within the interval
+	// Since is the next since: X-Namespace-Revision, the last entry
+	// returned, or the request's since on timeout. In a filtered log
+	// (§B.11.9) it names the newest entry scanned, visible or not, on a
+	// timeout too, so a follower moves past hidden entries.
+	Since   string
+	Cursor  string // X-Cursor, to echo in the next request
+	Timeout bool   // 204: no entry arrived within the interval
+	// GS is the gs of the filtered log the answer came from (§B.11.9),
+	// "" for the unfiltered log: a partial reader that LongPoll was
+	// redirected for follows FilteredLongPoll(ns, GS, …) from then on.
+	GS string
 }
 
 // LongPoll waits for namespace entries after since (§7.7). Echo the
@@ -29,15 +37,60 @@ type LongPollResult struct {
 // an hour's worth of intervals behind or ahead of the server's, after a
 // long pause or a clock change, is 400 bad_input (IsBadInput): poll again
 // once without it, as a follower does.
+//
+// A partial reader of a namespace the origin filters (§B.11.9) is
+// redirected to the filtered log /ns/{ns}/g/{gs}/log, which LongPoll
+// follows, setting GS; FilteredLongPoll reads it directly.
 func (c *Client) LongPoll(ctx context.Context, ns, since, cursor string) (*LongPollResult, error) {
 	if err := checkNS(ns); err != nil {
 		return nil, err
 	}
-	r, err := c.longPoll(ctx, "/ns/"+ns+"/log", since, cursor)
+	path, gs := "/ns/"+ns+"/log", ""
+	r, err := c.longPoll(ctx, path, since, cursor, true)
 	if err != nil {
 		return nil, err
 	}
-	res := &LongPollResult{Since: r.header.Get("X-Namespace-Revision"), Cursor: r.header.Get("X-Cursor")}
+	if r.status == 302 {
+		// Only a redirect into the filtered log of ns is followed; any
+		// other is the error it was before v0.75.
+		if gs, _, err = c.filteredRedirect(r, ns, "log", false); err != nil {
+			return nil, r.apiError()
+		}
+		if r, err = c.longPoll(ctx, "/ns/"+ns+"/g/"+gs+"/log", since, cursor, false); err != nil {
+			return nil, err
+		}
+	}
+	return c.nsLongPollResult(ctx, ns, gs, since, r)
+}
+
+// FilteredLongPoll waits, as LongPoll does, for entries after since in
+// the filtered log of gs, /ns/{ns}/g/{gs}/log?live=long-poll (§B.11.9
+// Long-poll, §7.7): only visible entries answer 200 or end a wait, so an
+// interval with none ends 204, whose X-Namespace-Revision, the newest
+// entry scanned, becomes Since even when it is hidden; a since naming a
+// hidden entry is accepted. Filtered logs carry no branch entries, and a
+// change of visibility writes no entry: a follower learns of branches
+// from Branches, and of visibility from the catalogs' logs or by listing
+// /heads again (§10).
+func (c *Client) FilteredLongPoll(ctx context.Context, ns, gs, since, cursor string) (*LongPollResult, error) {
+	if err := checkNS(ns); err != nil {
+		return nil, err
+	}
+	if err := checkID("gs", gs); err != nil {
+		return nil, err
+	}
+	r, err := c.longPoll(ctx, "/ns/"+ns+"/g/"+gs+"/log", since, cursor, false)
+	if err != nil {
+		return nil, err
+	}
+	return c.nsLongPollResult(ctx, ns, gs, since, r)
+}
+
+// nsLongPollResult reads a namespace long-poll answer r (200 or 204) to
+// since, of the filtered log of gs, or the unfiltered one for "".
+func (c *Client) nsLongPollResult(ctx context.Context, ns, gs, since string, r *response) (*LongPollResult, error) {
+	var err error
+	res := &LongPollResult{Since: r.header.Get("X-Namespace-Revision"), Cursor: r.header.Get("X-Cursor"), GS: gs}
 	if r.status == 204 {
 		res.Timeout = true
 		if res.Since == "" {
@@ -75,7 +128,7 @@ func (c *Client) ResourceLongPoll(ctx context.Context, ns, name, since, cursor s
 	if err := checkRes(ns, name); err != nil {
 		return nil, err
 	}
-	r, err := c.longPoll(ctx, "/r/"+ns+"/"+name+"/log", since, cursor)
+	r, err := c.longPoll(ctx, "/r/"+ns+"/"+name+"/log", since, cursor, false)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +156,9 @@ func (c *Client) ResourceLongPoll(ctx context.Context, ns, name, since, cursor s
 // the cursor.
 func IsBadInput(err error) bool { return statusIs(err, 400, "bad_input") }
 
-func (c *Client) longPoll(ctx context.Context, path, since, cursor string) (*response, error) {
+// longPoll asks path?live=long-poll with since and cursor, answered 200
+// or 204, or, with redirect, also a 302 the caller follows.
+func (c *Client) longPoll(ctx context.Context, path, since, cursor string, redirect bool) (*response, error) {
 	if err := checkOptID("since", since); err != nil {
 		return nil, err
 	}
@@ -118,7 +173,7 @@ func (c *Client) longPoll(ctx context.Context, path, since, cursor string) (*res
 	if err != nil {
 		return nil, err
 	}
-	if r.status != 200 && r.status != 204 {
+	if r.status != 200 && r.status != 204 && (r.status != 302 || !redirect) {
 		return nil, r.apiError()
 	}
 	return r, nil
@@ -139,12 +194,41 @@ type Event struct {
 // fn for each, in order, until ctx is done, the stream ends, or fn returns
 // an error (which NSEvents returns). A clean end of stream returns nil;
 // callers usually reconnect from the last id they processed.
+//
+// A partial reader of a namespace the origin filters (§B.11.9) is
+// redirected to /ns/{ns}/g/{gs}/events, which NSEvents follows; there it
+// streams as FilteredNSEvents does.
 func (c *Client) NSEvents(ctx context.Context, ns, since string, fn func(NSEntry) error) error {
 	if err := checkNS(ns); err != nil {
 		return err
 	}
+	follow := func(r *response) (string, bool) {
+		gs, _, err := c.filteredRedirect(r, ns, "events", false)
+		return "/ns/" + ns + "/g/" + gs + "/events", err == nil
+	}
+	return c.nsEvents(ctx, ns, "/ns/"+ns+"/events", since, follow, fn)
+}
+
+// FilteredNSEvents streams, as NSEvents does, the entries after since of
+// the filtered log of gs, /ns/{ns}/g/{gs}/events (§B.11.9 Events, §7.3):
+// only visible entries, judged again with each read check the stream
+// repeats; since may name a hidden entry. As for FilteredLongPoll, branch
+// entries never appear, and a change of visibility writes no entry (§10).
+func (c *Client) FilteredNSEvents(ctx context.Context, ns, gs, since string, fn func(NSEntry) error) error {
+	if err := checkNS(ns); err != nil {
+		return err
+	}
+	if err := checkID("gs", gs); err != nil {
+		return err
+	}
+	return c.nsEvents(ctx, ns, "/ns/"+ns+"/g/"+gs+"/events", since, nil, fn)
+}
+
+// nsEvents streams the namespace events at path, following a redirect by
+// follow when it is set.
+func (c *Client) nsEvents(ctx context.Context, ns, path, since string, follow func(*response) (string, bool), fn func(NSEntry) error) error {
 	prev := since
-	return c.events(ctx, "/ns/"+ns+"/events", since, func(ev Event) error {
+	return c.eventsFollow(ctx, path, since, follow, func(ev Event) error {
 		if ev.JWE != "" {
 			// One entry per event, sealed as the range (prev, id] (§E.2.2).
 			v, err := c.openRange(ctx, ns, prev, ev.ID, ev.JWE)
@@ -285,29 +369,47 @@ func withoutIDPrev(m map[string]any) map[string]any {
 }
 
 func (c *Client) events(ctx context.Context, path, since string, fn func(Event) error) error {
+	return c.eventsFollow(ctx, path, since, nil, fn)
+}
+
+// eventsFollow streams the events at path after since. A 302 is followed
+// once to the path follow reads from it, with the same since; one follow
+// refuses, or any without follow, is an error.
+func (c *Client) eventsFollow(ctx context.Context, path, since string, follow func(*response) (string, bool), fn func(Event) error) error {
 	if err := checkOptID("since", since); err != nil {
 		return err
 	}
-	u := c.base + path
-	if since != "" {
-		u += "?since=" + since
-	}
-	hr, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-	if err != nil {
-		return err
-	}
-	hr.Header.Set("Accept", "text/event-stream")
-	c.setAuth(hr)
-	res, err := c.hc.Do(hr)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
+	var res *http.Response
+	for {
+		u := c.base + path
+		if since != "" {
+			u += "?since=" + since
+		}
+		hr, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return err
+		}
+		hr.Header.Set("Accept", "text/event-stream")
+		c.setAuth(hr)
+		if res, err = c.hc.Do(hr); err != nil {
+			return err
+		}
+		if res.StatusCode == 200 {
+			break
+		}
 		r := &response{status: res.StatusCode, header: res.Header, method: "GET", path: path}
 		r.body, _ = io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		return r.apiError()
+		res.Body.Close()
+		if res.StatusCode != 302 || follow == nil {
+			return r.apiError()
+		}
+		next, ok := follow(r)
+		if !ok {
+			return r.apiError()
+		}
+		path, follow = next, nil
 	}
+	defer res.Body.Close()
 	sc := bufio.NewScanner(res.Body)
 	sc.Buffer(make([]byte, 64<<10), 64<<20)
 	var ev Event
