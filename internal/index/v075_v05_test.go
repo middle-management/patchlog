@@ -533,3 +533,49 @@ func TestV075IndexCatalog(t *testing.T) {
 		t.Errorf("unrestricted reader sees %v", got)
 	}
 }
+
+// TestV075IndexCookieKeepsAll (§B.11.5, §B.11.9 gs): a cookie whose
+// subjects leave out some of the reader's groups ("partial") is 403 at a
+// checkpoint where a deciding rule tests /principal/groups otherwise than
+// by naming groups, so every group decides, while a cookie whose subjects
+// keep every group is still served.
+func TestV075IndexCookieKeepsAll(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := newV75X(t, false)
+	exchange := func(tok string) (string, []*http.Cookie) {
+		r := p37Do(t, w.x, "POST", "/edge-grants", tok, "", nil, "")
+		if r.status != 200 {
+			t.Fatalf("exchange: %d %v", r.status, r.body)
+		}
+		for _, p := range r.body["prefixes"].([]any) {
+			if strings.HasPrefix(p.(string), "/matches/") {
+				return p.(string), r.cookies
+			}
+		}
+		t.Fatalf("no prefix for matches: %v", r.body)
+		return "", nil
+	}
+	ip, ic := exchange(w.reader("user:intern", []any{"fans", "interns"}))
+	fp, fc := exchange(w.reader("user:fan", []any{"fans"}))
+	for _, c := range []struct {
+		prefix  string
+		cookies []*http.Cookie
+	}{{ip, ic}, {fp, fc}} {
+		if got, _ := p37Follow(t, w.x, c.prefix, c.cookies, ""); got.status != 200 {
+			t.Fatalf("%s: %d %v", c.prefix, got.status, got.body)
+		}
+	}
+	// A role neither grant carries, whose rule tests the groups by a
+	// negation: every group decides.
+	must(w.admin.PatchConfig(ctx, "matches", must(w.admin.NSHead(ctx, "matches")).Config, []any{map[string]any{"op": "add", "path": "/roles/outsider",
+		"value": map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/principal/groups",
+			"schema": map[string]any{"contains": map[string]any{"const": "chiefs"}}}}}}}}))
+	w.x.caughtUp("matches")
+	if got, _ := p37Follow(t, w.x, ip, ic, ""); got.status != 403 {
+		t.Errorf("a partial subject set where every group decides: %d %v", got.status, got.body)
+	}
+	if got, _ := p37Follow(t, w.x, fp, fc, ""); got.status != 200 || strings.Join(p37Hits(got.body), ",") != "derby,shared" {
+		t.Errorf("a whole subject set: %d %v", got.status, got.body)
+	}
+}
