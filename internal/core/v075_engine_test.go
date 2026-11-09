@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/catvis"
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -949,5 +950,17 @@ func TestV075Exchange(t *testing.T) {
 	w2 := newV75World(t, v75Opts{engine: func(o *Options) { o.NoFilteredReads = true }})
 	if _, err := w2.e.IssueEdgeGrants(ctx, []string{w2.li().Bearer}); v75Status(err) != 403 {
 		t.Fatalf("NoFilteredReads: %v", err)
+	}
+}
+
+// §3.6: the core's name rules are the client's, which internal/edge's
+// tests check its prefix grammar against (they can't import the core,
+// which imports internal/tree and so internal/edge).
+func TestV075NameRulesAreClients(t *testing.T) {
+	t.Parallel()
+	for _, n := range []string{"a", "demo", "a-b_c", "a.b", "-a", "_a", ".a", "A", "a b", "", strings.Repeat("a", 64), strings.Repeat("a", 65), strings.Repeat("a", 128), strings.Repeat("a", 129)} {
+		if ValidNSName(n) != client.ValidNSName(n) || ValidResourceName(n) != client.ValidResourceName(n) {
+			t.Errorf("name %q judged otherwise than by the client", n)
+		}
 	}
 }

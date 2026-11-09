@@ -1,10 +1,10 @@
 package core
 
-import (
-	"time"
+import "time"
 
-	"github.com/middle-management/patchlog/internal/edge"
-)
+// maxEdgeTTL is the longest an edge grant lives (§C.5.2), edge.MaxGrantTTL,
+// which the core can't import (internal/edge's tests import the core).
+const maxEdgeTTL = 15 * time.Minute
 
 // filteredEdgeGrant is edgeGrant for a partial reader of a covered
 // namespace whose grant doesn't fix /resource (§B.11.9 Edge grants): its
@@ -41,7 +41,7 @@ func (t *tx) filteredEdgeGrant(n *nsRow, fs *fscope, a *actor, exp time.Time) (*
 		pe.Body["ns"] = n.name
 		return nil, pe
 	}
-	until := t.now.Add(edge.MaxGrantTTL)
+	until := t.now.Add(maxEdgeTTL)
 	if !exp.IsZero() && exp.Before(until) {
 		until = exp
 	}

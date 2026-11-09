@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/client"
 )
 
 var testKey = []byte("0123456789abcdef0123456789abcdef")
@@ -283,9 +283,11 @@ func TestParsePrefix(t *testing.T) {
 			t.Errorf("%q: %q %q %v", tc.p, ns, res, ok)
 		}
 	}
-	// The name rules are core's.
+	// The name rules are §3.6's, as core and client (which core's agree
+	// with) have them. The core can't be imported here: it imports
+	// internal/tree, which imports this package.
 	for _, n := range []string{"a", "demo", "a-b_c", "a.b", "-a", "_a", ".a", "A", "a b", "", strings.Repeat("a", 64), strings.Repeat("a", 65), strings.Repeat("a", 128), strings.Repeat("a", 129)} {
-		if nsNameRe.MatchString(n) != core.ValidNSName(n) || resNameRe.MatchString(n) != core.ValidResourceName(n) {
+		if nsNameRe.MatchString(n) != client.ValidNSName(n) || resNameRe.MatchString(n) != client.ValidResourceName(n) {
 			t.Errorf("name %q judged otherwise than by core", n)
 		}
 	}
