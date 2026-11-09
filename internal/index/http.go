@@ -723,11 +723,12 @@ func (ix *Index) afterPurge(w http.ResponseWriter, r *http.Request, a *access, n
 			writeBehind(w, "the index is applying a purge of the namespace: try again")
 			return
 		}
-		w.Header().Set("Cache-Control", ccPrivatePtr)
+		// The headers of serve's pointers (setPtrHeaders).
 		if a.public {
 			w.Header().Set("Cache-Control", ccHeadPointer)
 			w.Header().Set("Cache-Tag", "ns:"+ns)
 		} else {
+			w.Header().Set("Cache-Control", ccPrivatePtr)
 			w.Header().Set("CDN-Cache-Control", "no-store")
 			w.Header().Set("Surrogate-Control", "no-store")
 			w.Header().Add("Vary", "Authorization")
@@ -903,10 +904,10 @@ var errLackCounts = errors.New("counts over documents served under an epoch the 
 var errEpochKey = errors.New("the index cannot obtain the key of an epoch a hit is served under")
 
 // lacksKey reports whether err, from fetching the key of an epoch, leaves
-// the service lacking that key as its grant and keys are configured
-// (§A.4, §E.2.6): /keys answered a 4xx other than 408 and 429, or gave
-// no key for the epoch (ErrNoKeys) or none the service can unwrap
-// (seal.ErrDecrypt) or will take (ErrUntrustedKey, §E.3.2). Any other failure, the reader's
+// the service lacking that key as its grant and keys are configured (§A.4,
+// §E.2.6): /keys answered a 4xx other than 408 and 429, or gave no key for
+// the epoch (ErrNoKeys) or none the service can unwrap (seal.ErrDecrypt)
+// or will take (ErrUntrustedKey, §E.3.2). Any other failure, the reader's
 // request ending while the key is read among them, is for now. So is any
 // failure once ctx is done, which may be why it failed.
 func lacksKey(ctx context.Context, err error) bool {
@@ -923,15 +924,15 @@ func lacksKey(ctx context.Context, err error) bool {
 // its result, sealed in a sealed or e2e namespace, keeps it (and stores a
 // sealed one), and returns the result kept with the checkpoint it is at.
 //
-// Each sealed value is sealed under the epoch the revision it derives
-// from is served under (§E.2.6; derived.EpochOf, docs.epoch), and where
-// that is pending, the epoch judged once, by the first answer that seals
-// a value derived from it (judgeEpochs: the one current then): a hit
-// under that epoch's K_r of its resource. A result is sealed whole only when its source isn't public,
-// every reader its URL admits reads it whole, under reads:{ns}, and every
-// value derives from revisions served under one epoch, under that
-// epoch's K_e (§E.2.6 Whole-response sealing); otherwise it is sealed per
-// entry, and counts, which have no entry, are 400.
+// Each sealed value is sealed under the epoch the revision it derives from
+// is served under (§E.2.6; derived.EpochOf, docs.epoch), and where that is
+// pending, the epoch judged once, by the first answer that seals a value
+// derived from it (judgeEpochs: the one current then): a hit under that
+// epoch's K_r of its resource. A result is sealed whole only when its
+// source isn't public, every reader its URL admits reads it whole, under
+// reads:{ns}, and every value derives from revisions served under one
+// epoch, under that epoch's K_e (§E.2.6 Whole-response sealing); otherwise
+// it is sealed per entry, and counts, which have no entry, are 400.
 func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Values, q *Query, info derived.Info) (derived.Stored, string, error) {
 	// A public sealed namespace's results, which anyone reads, and a
 	// limited reader's, are sealed per entry whatever their epochs.

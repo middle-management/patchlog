@@ -34,8 +34,8 @@ func NewSchemaCache(c *client.Client) *SchemaCache {
 // own namespaces only. A revision that answers a 4xx other than 408 and
 // 429, a 401 to the service's own grant included, or that can't be opened
 // for want of keys (unavailable), is schema.ErrUnavailable; any other
-// failure (network, 5xx, 408, 429) is recorded in *transient so the caller can retry
-// instead of indexing the document without its fields (§A.1).
+// failure (network, 5xx, 408, 429) is recorded in *transient so the caller
+// can retry instead of indexing the document without its fields (§A.1).
 func (s *SchemaCache) Loader(ctx context.Context, transient *error) schema.Loader {
 	return s.LoaderFor(ctx, "", transient)
 }

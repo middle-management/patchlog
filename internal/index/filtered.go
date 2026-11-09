@@ -643,15 +643,15 @@ func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, []fsCat, err
 // document bdoc as of the branch's baseAt and cur at its head, stays
 // covered (§B.11.9 Branches: "only while the namespace that trusts the
 // catalog still trusts it, at its head, through every key item 1 counts,
-// each unchanged (§C.4)"): for each catalog cats counts from that isn't dark, from
-// bdoc, cur still trusts it (its catalogs names it, and its catalog.trust,
-// as of the catalog's own head, lists root), and for each kid counted
-// there cur holds a key whose requireAt names it, its entries under that
-// kid equal, as canonical JSON, to bdoc's (the whole entry: any edit, a
-// pub rotated under the same kid among them, uncovers the branch). Keys
-// cur adds are not counted. An e2e or purged catalog (dark) makes nothing
-// visible either way, and is skipped (open question: should a root that
-// stops trusting it uncover the branch instead?).
+// each unchanged (§C.4)"): for each catalog cats counts from bdoc that
+// isn't dark (fsCat.dark), cur still trusts it (its catalogs names it, and
+// its catalog.trust, as of the catalog's own head, lists root), and for
+// each kid counted there cur holds a key whose requireAt names it, its
+// entries under that kid equal, as canonical JSON, to bdoc's (the whole
+// entry: any edit, a pub rotated under the same kid among them, uncovers
+// the branch). Keys cur adds are not counted. An e2e or purged catalog
+// (dark) makes nothing visible either way, and is skipped (open question:
+// should a root that stops trusting it uncover the branch instead?).
 func branchTrustHolds(root string, bdoc, cur map[string]any, cats []fsCat) bool {
 	for _, c := range cats {
 		if c.dark() {

@@ -71,9 +71,9 @@ import (
 // with that marker; for reads:{ns}:g:{gs} (§B.11.9), also its subjects,
 // from which item 1 is judged; and for either, from an exchange, the key
 // its grant came from (gsKey), recorded beside those of the marker's
-// other cookies (storedFview and scopeKeysHold judge them all). A rule referring to /now gives no
-// marker, so the filter judges a read as the grant's read check does,
-// without a clock.
+// other cookies (storedFview and scopeKeysHold judge them all). A rule
+// referring to /now gives no marker, so the filter judges a read as the
+// grant's read check does, without a clock.
 type markerRec struct {
 	f        *grantcheck.ReadFilter
 	subjects []string // g: markers only
@@ -125,6 +125,7 @@ func scopeMarker(ns, d, kid, pub string) string {
 	return "reads:" + ns + ":scope:" + scopeKeyDigest(d, kid, pub)
 }
 
+// scopeKeyDigest is scopeMarker's digest: of d and the key's key: string.
 func scopeKeyDigest(d, kid, pub string) string {
 	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo([]any{d, catvis.KeySubject(kid, pub)})))
 	return ids.FromBytes(sum[:ids.Size]).String()
@@ -460,10 +461,10 @@ var errCoveredNow = &grant.AuthError{Status: 403, Msg: "the namespace is read fi
 // stillUncovered checks that §B.11.9 doesn't cover ns at the index's
 // committed checkpoint, as when a scope marker of it was issued: else
 // errCoveredNow; and that ns isn't one a partial reader has no marker in
-// (catalogShaped): else errNoMarker. Before the index's first checkpoint of a namespace that
-// may be covered once it has, its coverage can't be told: errNotReached,
-// as for a grant (grantAccess). A purged one passes, answered 410 past
-// the read check (§8.5).
+// (catalogShaped): else errNoMarker. Before the index's first checkpoint
+// of a namespace that may be covered once it has, its coverage can't be
+// told: errNotReached, as for a grant (grantAccess). A purged one passes,
+// answered 410 past the read check (§8.5).
 func (ix *Index) stillUncovered(ctx context.Context, ns string) error {
 	id, purged, err := ix.committed(ctx, ns)
 	switch {
