@@ -2466,7 +2466,8 @@ func (e *Engine) followPreStarts(ctx context.Context, c *client.Client, ep Remot
 // base's keyring entries or pre-raise keys, and keeps no last-seen epoch
 // for it (baseEpochs, chainReadable), until a later read succeeds; the
 // error is reported. It runs at creation too (createRemoteBranch), so
-// those keys are relayed from the start where B can read them.
+// those keys are relayed from the start where B can read them, and as the
+// follower starts for a branch never read (catchUpChainReads).
 func (e *Engine) followChainEpochs(ctx context.Context, c *client.Client, ep RemoteEndpoint, b *remoteBase) error {
 	type level struct {
 		shadow int64
@@ -3100,9 +3101,11 @@ func (e *Engine) RegisterRemote(ctx context.Context, ns string) error {
 	})
 }
 
-// remoteLoop follows remote bases every interval until Close.
+// remoteLoop follows remote bases every interval until Close. It first
+// reads, as soon as it starts, the chains not yet read (catchUpChainReads).
 func (e *Engine) remoteLoop(interval time.Duration) {
 	defer e.bg.Done()
+	e.remoteJob(e.catchUpChainReads)
 	tk := time.NewTicker(interval)
 	defer tk.Stop()
 	for {
@@ -3110,24 +3113,77 @@ func (e *Engine) remoteLoop(interval time.Duration) {
 		case <-e.stop:
 			return
 		case <-tk.C:
-			ctx, cancel := context.WithCancel(context.Background())
-			go func() {
-				select {
-				case <-e.stop:
-				case <-ctx.Done():
-				}
-				cancel()
-			}()
-			if !e.leader(ctx) {
-				cancel()
-				continue // another instance follows them (pglock.go)
-			}
-			if err := e.SyncRemotes(leaderJob(ctx)); err != nil {
-				log.Printf("remote: %v", err)
-			}
-			cancel()
+			e.remoteJob(e.SyncRemotes)
 		}
 	}
+}
+
+// remoteJob runs f as a background job of remoteLoop, cancelled at Close,
+// on the leader only (pglock.go), and logs its error.
+func (e *Engine) remoteJob(f func(context.Context) error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-e.stop:
+		case <-ctx.Done():
+		}
+		cancel()
+	}()
+	if !e.leader(ctx) {
+		return // another instance follows them (pglock.go)
+	}
+	if err := f(leaderJob(ctx)); err != nil {
+		log.Printf("remote: %v", err)
+	}
+}
+
+// catchUpChainReads runs followChainEpochs, in the background as the
+// follower starts, for each remote branch with a deeper e2e base never
+// read (no remote_chain_read row): one created before migration
+// 013_remote_chain_read, whose /keys otherwise relays none of that base's
+// keyring entries or pre-raise keys until the first sync, a whole follow
+// interval later (chainReadable, §G.5.2 E3 sources). A read that fails
+// leaves them withheld, as at a sync.
+func (e *Engine) catchUpChainReads(ctx context.Context) error {
+	var due []*remoteBase
+	if err := e.read(ctx, func(t *tx) error {
+		for _, b := range t.remoteBases(`n.purged = 0`) {
+			bn := t.nsByID(b.branch)
+			if bn == nil || bn.purged {
+				continue
+			}
+			for i, sh := range t.remoteShadows(bn) {
+				if i == 0 || t.config(sh.configSeq).level != levelE2E {
+					continue
+				}
+				var read bool
+				t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM remote_chain_read WHERE shadow = ?)`, sh.id).Scan(&read))
+				if !read {
+					due = append(due, b)
+					break
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	var errs []error
+	for _, b := range due {
+		if err := e.jobStep(ctx); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		c, ep, err := e.remoteClient(b.origin)
+		if err == nil {
+			err = e.followChainEpochs(ctx, c, ep, b)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("remote branch %s: reading the chain of %s/ns/%s at start: %w", b.branchName, b.origin, b.ns, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func mustID(s string) ids.ID {

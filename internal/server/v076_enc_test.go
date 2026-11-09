@@ -257,3 +257,77 @@ func TestV076EncPreRaiseSealingsAreAs(t *testing.T) {
 		t.Fatalf("z's document: %d %.120s, want A's bytes", rb.Code, rb.Body)
 	}
 }
+
+// §G.5.2 E3 sources (v0.76): an E3 remote branch created before migration
+// 013_remote_chain_read has no record of a read of its deeper bases, so
+// its /keys withholds their keyring entries; as the follower starts, it
+// reads them at once, not a follow interval later, and relays them again.
+// A's eb is a branch of e, both e2e, mirrored by B's rel as in
+// TestV076EncDeeperBaseUnreadable.
+func TestV076EncChainReadAtStart(t *testing.T) {
+	t.Parallel()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning)
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("e", e2eDoc(map[string]any{"keys": []any{kA.entry("*")}}))
+	g := a.grant(kA, "user:admin", []string{"e", "eb"}, allVerbs)
+	readerJWK, readerPriv, _ := seal.GenerateRecipient()
+	kre, _ := seal.BuildKeyringV2(readerPriv, "e", 1, seal.NewKey(), []*ecdh.PublicKey{readerPriv.PublicKey()})
+	krHead := a.create("e", "keyring", kre.Value(), g)
+	expect(t, a.branch("e", map[string]any{"name": "eb"}, g), 201)
+	krb, _ := seal.BuildKeyringV2(readerPriv, "eb", 1, seal.NewKey(), []*ecdh.PublicKey{readerPriv.PublicKey()})
+	a.appendRev("eb", "keyring", krHead, ops(op("replace", "", krb.Value())), g)
+	at := a.nsHead("eb", g)
+
+	rt := &route{url: a.srv.URL, bearer: a.grant(kA, "svc:b", []string{"e", "eb"}, []string{"read"})}
+	var bPriv ed25519.PrivateKey
+	path, blobs := v073DB(t), t.TempDir()
+	ks := newKeyStore(t)
+	open := func(more ...envOpt) *tenv {
+		at := func(o *core.Options) { o.Path, o.BlobDir = path, blobs }
+		return newEnv(t, append([]envOpt{withOrigin(originB), withAuth(&bPriv), withRemote(rt), withKeyStore(ks), withEncTuning}, append(more, at)...)...)
+	}
+	b := open()
+	b.opPriv = bPriv
+	kB := newKey("badmin")
+	doc := e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}})
+	doc["base"] = map[string]any{"origin": originA, "ns": "eb", "at": at, "chain": []any{"eb", "e"}}
+	expect(t, b.mkRemote("rel", addRoot(doc)), 201)
+	readerG := b.grant(kB, "user:reader", []string{"rel"}, []string{"read"}, map[string]any{"enc": readerJWK})
+	relayed := func() map[string]bool {
+		t.Helper()
+		keys, r := b.keysOf("rel", nil, readerG)
+		expect(t, r, 200)
+		out := map[string]bool{}
+		for k := range keys {
+			out[k] = true
+		}
+		return out
+	}
+	if k := relayed(); !k["e#1"] || !k["eb#1"] {
+		t.Fatalf("after creation: relayed %v, want e#1 and eb#1", k)
+	}
+	// As a branch from before migration 013: no read recorded.
+	db, q := v073SQL(t, path)
+	if _, err := db.Exec(q(`DELETE FROM remote_chain_read`)); err != nil {
+		t.Fatal(err)
+	}
+	if k := relayed(); k["e#1"] || !k["eb#1"] {
+		t.Fatalf("no read recorded: relayed %v, want eb#1 alone", k)
+	}
+	// Restarted with a follower whose first sync is an hour away.
+	b.srv.Close()
+	b.e.Close()
+	b = open(withRemote(rt, func(o *core.RemoteOptions) { o.FollowInterval = time.Hour }))
+	for deadline := time.Now().Add(20 * time.Second); ; {
+		k := relayed()
+		if k["e#1"] && k["eb#1"] {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after the restart: relayed %v, want e#1 and eb#1 before the first sync", k)
+		}
+		time.Sleep(200 * time.Millisecond) // under the exchange rate
+	}
+}
