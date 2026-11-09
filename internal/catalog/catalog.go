@@ -962,7 +962,7 @@ func (s *Service) configAt(g *tree.Graph, ns string, latest *grantcheck.Config) 
 
 func (s *Service) readRoles(cfg *grantcheck.Config) *readRoles {
 	out := &readRoles{roles: map[string]*readRole{}}
-	key := s.contentKey(cfg.Keys)
+	key := s.contentKey(cfg)
 	if key == nil || !key.IsStar() && !contains(key.Can, "read") {
 		return out
 	}
@@ -1043,10 +1043,10 @@ type visEntry struct {
 // that the service and the origin's filtered reads share (§B.11.9). Its
 // content namespaces are those g trusts, with their documents as of the
 // checkpoint (Graph.Content), parsed (parsed), and the catalog's key where
-// it is one (contentKey) and the document's catalogs names the catalog. The
-// graph changes in place, so it is built again after each of the hook's
-// calls (gen) and when a document is replaced. Call it under View; don't
-// keep it past it.
+// it is one (contentKey: its requireAt and the document's catalogs name
+// the catalog). The graph changes in place, so it is built again after
+// each of the hook's calls (gen) and when a document is replaced. Call it
+// under View; don't keep it past it.
 func (s *Service) catalogOf(g *tree.Graph) *catvis.Catalog {
 	gen := s.gen.Load()
 	s.rrMu.Lock()
@@ -1062,12 +1062,13 @@ func (s *Service) catalogOf(g *tree.Graph) *catvis.Catalog {
 			content[ns] = c
 			cfg := s.parsed(c).cfg
 			// The catalog's key counts only in a member that trusts the
-			// catalog back, through a key whose requireAt names it
-			// (contentKey; §B.11.3, §B.11.9 Where): only such members'
-			// roles count, for its folders too. Every member's roles and
-			// keys still decide its subjects (Profile).
+			// catalog back, naming it in catalogs, through a key whose
+			// requireAt names it (contentKey; §B.11.3, §B.11.9 Where):
+			// only such members' roles count, for its folders too, as
+			// readRoles counts them. Every member's roles and keys still
+			// decide its subjects (Profile).
 			var kids []string
-			if cfg != nil && namesCatalog(c.Doc, g.Catalog) && s.contentKey(cfg.Keys) != nil {
+			if cfg != nil && s.contentKey(cfg) != nil {
 				kids = []string{s.opt.Kid}
 			}
 			contents[ns] = &catvis.Content{NS: ns, Cfg: cfg, Kids: kids}

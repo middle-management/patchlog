@@ -856,15 +856,20 @@ func untrusted(ns, cat string) error {
 	return forbidden("namespace %s is not trusted by catalog %s", ns, cat)
 }
 
-// contentKey is the catalog's key among a content namespace's keys ks:
+// contentKey is the catalog's key in a content namespace's document cfg:
 // the entry for the service's kid, only where its requireAt names the
-// catalog (§B.11.3 Scoped keys bound the catalog service, §B.11.9 Where).
-// One without requireAt, or naming another namespace, is no catalog key:
-// nil, as for a namespace that doesn't list the kid (noContentKey), so
-// the grants it signs always carry an at the core checks (checkLag).
-func (s *Service) contentKey(ks []grant.Key) *grant.Key {
-	k := findKey(ks, s.opt.Kid)
-	if k == nil {
+// catalog and the document's catalogs names it too, so the namespace
+// trusts the catalog back (§B.11.3 Scoped keys bound the catalog service,
+// §B.11.9 Where). One without requireAt, or naming another namespace, or
+// in a document whose catalogs doesn't name the catalog, is no catalog
+// key: nil, as for a namespace that doesn't list the kid (noContentKey).
+// Listings (catalogOf), the roles /read-grants and POST /grants count
+// (readRoles) and the grants it signs all take it, so they can't
+// disagree, and those grants always carry an at the core checks
+// (checkLag).
+func (s *Service) contentKey(cfg *grantcheck.Config) *grant.Key {
+	k := findKey(cfg.Keys, s.opt.Kid)
+	if k == nil || !namesCatalog(cfg.Doc, s.t.Catalog()) {
 		return nil
 	}
 	if at, _ := k.RequireAt.(string); at != s.t.Catalog() {
@@ -874,7 +879,8 @@ func (s *Service) contentKey(ks []grant.Key) *grant.Key {
 }
 
 func (s *Service) noContentKey(ns string) error {
-	return forbidden("namespace %s does not list the catalog's key %q with requireAt %q", ns, s.opt.Kid, s.t.Catalog())
+	cat := s.t.Catalog()
+	return forbidden("namespace %s does not list the catalog's key %q with requireAt %q, or its catalogs doesn't name %s", ns, s.opt.Kid, cat, cat)
 }
 
 // planContent decides content verbs (read, append, create, …) on an item
@@ -958,7 +964,7 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 			return
 		}
 		cfg = s.configAt(g, ns, latest)
-		key = s.contentKey(cfg.Keys)
+		key = s.contentKey(cfg)
 		// Roles count only through subjects the catalog's key in the
 		// content namespace may grant through: its sub and groups scopes
 		// (§B.11.2 Through the key, §B.11.4 Resolve).
@@ -1069,7 +1075,7 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 // checkpoint, so it clears the checkpoint (decidedAt); it comes after the
 // decision's own answers, as signer's does for organising grants.
 func (s *Service) contentSigner(latest *grantcheck.Config, checkpoint *map[string]string) (*grant.Key, error) {
-	key := s.contentKey(latest.Keys)
+	key := s.contentKey(latest)
 	if key == nil {
 		*checkpoint = nil
 		return nil, s.noContentKey(latest.NS)
@@ -1145,7 +1151,7 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 			return
 		}
 		cfg := s.configAt(g, ns, latest)
-		key := s.contentKey(cfg.Keys)
+		key := s.contentKey(cfg)
 		if key == nil {
 			err = s.noContentKey(ns)
 			return
