@@ -1,11 +1,17 @@
 package catalog_test
 
 import (
+	"context"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // startEdge starts the seeded world's service with edge grants of its own
@@ -235,5 +241,79 @@ func TestGrantReadsAtItsOwnGSV075(t *testing.T) {
 	}
 	if r = w.do("GET", strings.Replace(loc2, gsOf(loc2), gsOf(loc1), 1), zed, nil); r.status != 403 {
 		t.Errorf("zed's grant at at1's gs at at2: %d %v", r.status, r.body)
+	}
+}
+
+// TestVisibilityIsCatvisV075 (VIS-4): the service's listings show what
+// catvis's node test, which the origin's filtered reads use (§B.11.9),
+// shows a subject set over a graph built from the same documents, with
+// the catalog's key as the content namespace's only kid (§B.11.5): one
+// implementation, so they can't drift.
+func TestVisibilityIsCatvisV075(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	// A role whose rule tests the groups positively, and one reading the
+	// resource: the folder and item rules of the node test.
+	w.patchMatches(map[string]any{"op": "add", "path": "/roles/steward", "value": map[string]any{"can": toAny("read"),
+		"rules": []any{map[string]any{"op": "test", "path": "/principal/groups", "schema": map[string]any{"contains": map[string]any{"const": "stewards"}}}}}},
+		map[string]any{"op": "add", "path": "/roles/derbyonly", "value": map[string]any{"can": toAny("read"),
+			"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "derby"}}}})
+	w.patch("cat", "derbies", map[string]any{"op": "add", "path": "/$access/group:stewards", "value": toAny("steward")})
+	w.patch("cat", "rumours", map[string]any{"op": "add", "path": "/$access/group:fan-club", "value": toAny("derbyonly")})
+	w.caughtUp()
+
+	ctx := context.Background()
+	nsDoc := func(ns string) map[string]any {
+		return must(w.ops.NSDoc(ctx, ns, must(w.ops.NSHead(ctx, ns)).ID)).Value
+	}
+	folders := []string{"root", "season", "rumours", "derbies"}
+	docs := map[string]any{}
+	for _, name := range append(slices.Clone(folders), "matches.derby", "matches.shared", "matches.rumour1", "matches.other") {
+		docs[name] = must(w.ops.Doc(ctx, "cat", name, must(w.ops.Head(ctx, "cat", name)).ID)).Value
+	}
+	g := tree.BuildGraph("cat", nsDoc("cat"), docs)
+	cfg := must(grantcheck.ParseConfig("matches", "", nsDoc("matches")))
+	c := catvis.NewCatalog(g, map[string]*catvis.Content{"matches": {NS: "matches", Cfg: cfg, Kids: []string{"catalog-01"}}})
+
+	shown := 0
+	for _, who := range []struct {
+		sub    string
+		groups []string
+	}{
+		{"user:fred", []string{"fan-club"}}, {"user:li", nil}, {"user:guest", nil}, {"user:eve", []string{"editors-in-chief"}},
+		{"user:sam", []string{"stewards", "interns"}}, {"user:md", []string{"match-desk", "translators"}}, {"user:x", []string{"ops", "fan-club"}},
+	} {
+		token := w.caller(who.sub, who.groups...)
+		v := c.View(catvis.ListingSubjects(c.Profile(), grant.Principal{ID: who.sub, Groups: who.groups}))
+		for _, f := range folders {
+			want := "404"
+			if v.Node(g.Node(f)) {
+				var kids []string
+				for _, name := range g.Names() {
+					n := g.Node(name)
+					if v.Node(n) && slices.ContainsFunc(n.Parents, func(p tree.Parent) bool { return p.Name == f }) {
+						kids = append(kids, name)
+					}
+				}
+				want = strings.Join(kids, ",")
+			}
+			r, _ := w.follow("/cat/children?of="+f, token)
+			got := strconv.Itoa(r.status)
+			if r.status == 200 {
+				got = childNames(r.body)
+			}
+			if got != want {
+				t.Errorf("%s %v, children of %s: service %q, catvis %q", who.sub, who.groups, f, got, want)
+			}
+			if want != "404" && want != "" {
+				shown++
+			}
+		}
+	}
+	if shown < 6 {
+		t.Errorf("only %d listings show anything", shown)
 	}
 }
