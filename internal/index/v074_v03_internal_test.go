@@ -3,7 +3,6 @@ package index
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"testing"
 
@@ -29,12 +28,13 @@ func TestV074V03LacksKey(t *testing.T) {
 		{&client.APIError{Status: 400}, true},
 		{fmt.Errorf("derived: unwrapping sec#1: %w", seal.ErrDecrypt), true},
 		{fmt.Errorf("%w: sec#1 from x", client.ErrUntrustedKey), true},
+		// Since v0.76 a key no recipient key opens is lacking (ENC-5).
+		{fmt.Errorf("%w: sec#1 is wrapped to the grant's enc and no recipient key is configured", client.ErrNoKeys), true},
 		{&client.APIError{Status: 429}, false},
 		{&client.APIError{Status: 503}, false},
 		{context.Canceled, false},
 		{context.DeadlineExceeded, false},
 		{json.Unmarshal([]byte("{"), new(any)), false},
-		{errors.New("derived: sec#1 is wrapped to the grant's enc and no recipient key is configured"), false},
 		{nil, false},
 	} {
 		if got := lacksKey(context.Background(), x.err); got != x.want {

@@ -272,7 +272,8 @@ func (k *Keys) plainEpochKey(ctx context.Context, ns, kid string, epoch int) ([]
 		key = e.Key
 		if key == nil {
 			if k.recipient == nil {
-				return nil, fmt.Errorf("derived: %s is wrapped to the grant's enc and no recipient key is configured", kid)
+				// Lacking, as no key is (§A.4, §E.2.6).
+				return nil, fmt.Errorf("%w: %s is wrapped to the grant's enc and no recipient key is configured", client.ErrNoKeys, kid)
 			}
 			if key, err = seal.UnwrapKey(k.recipient, e.Wrapped); err != nil {
 				return nil, fmt.Errorf("derived: unwrapping %s: %w", kid, err)
