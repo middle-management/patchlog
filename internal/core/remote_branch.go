@@ -82,9 +82,12 @@ import (
 //     began, from its configuration history. History the base pruned can't
 //     be mirrored: its horizon is a sealed snapshot. Content from before a
 //     raise from sealed is mirrored with the base's sealings of it,
-//     verbatim, each keeping its epoch (fetchPreSealings, §G.5.2), checked
-//     with the base's keys of those epochs, which the branch hands out by
-//     start times read only from base.origin itself (originStarts).
+//     byte for byte, each keeping its epoch (fetchPreSealings, §G.5.2),
+//     checked with the base's keys of those epochs where B holds them and
+//     by their shape where it doesn't; B hands those keys out by start
+//     times read only from base.origin itself (originStarts). B never
+//     seals that content itself: a sealing the base didn't serve it
+//     answers 502 upstream, as for a failed fetch (preRaiseUnfetched).
 
 // RemoteAuthor is the author of entries this deployment writes on behalf of
 // a remote base: purges followed from its log, and mirrored horizons whose

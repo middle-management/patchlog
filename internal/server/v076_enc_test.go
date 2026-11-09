@@ -1,9 +1,16 @@
 package server
 
 import (
+	"bytes"
 	"crypto/ecdh"
 	"crypto/ed25519"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -165,4 +172,88 @@ func TestV076EncDeeperBaseUnreadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	relayed("e#1", "eb#1")
+}
+
+// §G.5.2 E3 sources (v0.76): B mirrors A's sealings of content from before
+// its raise byte for byte and never seals that content itself. A's m,
+// sealed, is raised to e2e; B's grant at A is refused (403) the document
+// of x, the log of w and the epoch URL of z's blob from before the raise,
+// as A might refuse them. B's remote branch r answers each of those 502
+// upstream naming A, never a sealing of its own, while what A served it,
+// y's document, is A's bytes.
+func TestV076EncPreRaiseSealingsAreAs(t *testing.T) {
+	t.Parallel()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("m", sealedDoc(map[string]any{"read": "grant", "keys": []any{kA.entry("*")}}))
+	root := func() string { return a.grant(kA, "user:root", []string{"m"}, allVerbs) }
+	x1 := a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})), root())
+	y1 := a.wr("m", "y", "", withNonce(addRoot(map[string]any{"v": 2.0})), root())
+	w1 := a.wr("m", "w", "", withNonce(addRoot(map[string]any{"v": 3.0})), root())
+	data := []byte("z's blob from before the raise")
+	bid := a.upload("m", "z", "text/plain", data, root())
+	z1 := a.wr("m", "z", "", withNonce(addRoot(map[string]any{"b": ref(bid, "text/plain", len(data), "")})), root())
+	a.clock.Advance(time.Hour)
+	expect(t, a.patchNS("m", ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 2.0})), root()), 201)
+	raised := a.nsHead("m", root())
+
+	// Refused from the n-th request on: w's log is read once to mirror its
+	// chain (fetchChain), then again for A's sealings of its entries, and
+	// z's blob once with it (fetchBlobs), then for A's sealing.
+	blocked := map[string]int{
+		"/r/m/x/rev/" + x1:               1,
+		"/r/m/w/rev/" + w1 + "/log":      2,
+		blobPath("m", "z", bid) + "/e/1": 2,
+	}
+	var seenMu sync.Mutex
+	seen := map[string]int{}
+	target, _ := url.Parse(a.srv.URL)
+	rp := httputil.NewSingleHostReverseProxy(target)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMu.Lock()
+		seen[r.URL.Path]++
+		n := seen[r.URL.Path]
+		seenMu.Unlock()
+		if from := blocked[r.URL.Path]; from > 0 && n >= from {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"code":"forbidden","message":"not for this grant"}`))
+			return
+		}
+		rp.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+
+	bJWK, bID, _ := seal.GenerateRecipient()
+	var mu sync.Mutex
+	id := bID
+	rt := &route{url: proxy.URL, bearer: a.grant(kA, "svc:b", []string{"m"}, []string{"read", "export"}, map[string]any{"enc": bJWK, "nbf": t0.Add(-time.Hour).Format(time.RFC3339)})}
+	var bPriv ed25519.PrivateKey
+	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt, withRemoteIdentity(&mu, &id)), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+	b.opPriv = bPriv
+	b.clock.Advance(3 * time.Hour)
+	kB := newKey("badmin")
+	expect(t, b.mkRemote("r", remoteGenesis("m", raised, e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}}))), 201)
+	g := b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+
+	for _, p := range []string{"/r/r/x/rev/" + x1, "/r/r/w/rev/" + w1 + "/log", blobPath("r", "z", bid) + "/e/1"} {
+		r := b.get(p, g)
+		expectCode(t, r, 502, "upstream")
+		if r.Str("origin") != originA {
+			t.Fatalf("%s: %s, want origin %s", p, r.Body, originA)
+		}
+	}
+	ra, rb := a.get("/r/m/y/rev/"+y1, root()), b.get("/r/r/y/rev/"+y1, g)
+	expect(t, ra, 200)
+	if rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {
+		t.Fatalf("y's document: %d %.120s, want A's bytes %.120s", rb.Code, rb.Body, ra.Body)
+	}
+	// z's document A served: A's bytes, and its blob's head points at the
+	// epoch A serves it under.
+	ra, rb = a.get("/r/m/z/rev/"+z1, root()), b.get("/r/r/z/rev/"+z1, g)
+	if rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {
+		t.Fatalf("z's document: %d %.120s, want A's bytes", rb.Code, rb.Body)
+	}
 }
