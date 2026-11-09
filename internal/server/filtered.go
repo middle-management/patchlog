@@ -89,6 +89,20 @@ func filteredTags(info *core.FilteredInfo, tags ...string) []string {
 	return tags
 }
 
+// filteredHeadsTags are a filtered /heads answer's tags: filteredTags of
+// the unfiltered /heads' with heads:{x} too for every other namespace in
+// at, so that a resource purge in a deciding catalog, which purges its
+// own /heads (heads:{x}, §8.3), reaches the pages it decided.
+func filteredHeadsTags(info *core.FilteredInfo, ns string) []string {
+	tags := filteredTags(info, "ns:"+ns, "heads:"+ns)
+	if info != nil {
+		for _, x := range info.Others {
+			tags = append(tags, "heads:"+x)
+		}
+	}
+	return tags
+}
+
 // setFilteredAt sets X-Namespace-Revision, {ns}'s ns_id in the answer's at
 // (§B.11.9 Log ranges).
 func setFilteredAt(w http.ResponseWriter, info *core.FilteredInfo) {
@@ -127,7 +141,8 @@ func (s *Server) gHeadsCurrent(w http.ResponseWriter, r *http.Request) {
 // gHeads is GET /ns/{ns}/g/{gs}/at/{at}/heads?after&prefix (§B.11.9
 // /heads): the visible rows, in pages filled to the log page size, next on
 // every full page. It is cached as the unfiltered /heads, immutable, with
-// its tags plus ns:{x} for the rest of at, and carries X-Namespace-Revision.
+// its tags plus ns:{x} and heads:{x} for the rest of at, and carries
+// X-Namespace-Revision.
 func (s *Server) gHeads(w http.ResponseWriter, r *http.Request) {
 	ns, gs, at := r.PathValue("ns"), r.PathValue("gs"), r.PathValue("at")
 	if err := validNames(ns, ""); err != nil {
@@ -146,14 +161,14 @@ func (s *Server) gHeads(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setFilteredAt(w, info)
-		if info != nil && s.writeErrShort(w, r, err, filteredTags(info, "ns:"+ns, "heads:"+ns)...) {
+		if info != nil && s.writeErrShort(w, r, err, filteredHeadsTags(info, ns)...) {
 			return
 		}
 		writeErr(w, err)
 		return
 	}
 	setFilteredAt(w, info)
-	s.cache(w, r, ccImmutable, page.Public, filteredTags(info, "ns:"+ns, "heads:"+ns)...)
+	s.cache(w, r, ccImmutable, page.Public, filteredHeadsTags(info, ns)...)
 	out := map[string]any{"heads": page.Items}
 	if page.Next != "" {
 		out["next"] = page.Next

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	plclient "github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -365,7 +366,7 @@ func TestV075FilteredHeads(t *testing.T) {
 			t.Fatalf("X-Namespace-Revision %q, want %q", r.H.Get("X-Namespace-Revision"), head)
 		}
 		tags := strings.Split(r.H.Get("Cache-Tag"), ",")
-		for _, want := range []string{"ns:matches", "heads:matches", "ns:cat-season"} {
+		for _, want := range []string{"ns:matches", "heads:matches", "ns:cat-season", "heads:cat-season"} {
 			if !strings.Contains(","+r.H.Get("Cache-Tag")+",", ","+want+",") {
 				t.Fatalf("Cache-Tag %v lacks %s", tags, want)
 			}
@@ -714,6 +715,20 @@ func TestV075FilteredEvents(t *testing.T) {
 	if !ok || !strings.Contains(ev.data, `"resource":"shared"`) {
 		t.Fatalf("after the move %+v %v", ev, ok)
 	}
+	// Once the rules its gs digests change, the next read check fails
+	// and the stream ends, sending nothing more.
+	expect(t, w.patchNS("matches", ops(op("add", "/roles/reader/rules", []any{map[string]any{"op": "test", "path": "/action", "value": "read"}})), w.admin), 201)
+	w.put("matches", "shared", map[string]any{"v": 3})
+	select {
+	case ev, ok := <-ch:
+		if ok {
+			t.Fatalf("after the rules changed %+v", ev)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream outlived its read check")
+	}
+	li = w.li()
+	gs, _ = w.filtered(li)
 	// Last-Event-ID may name a hidden entry.
 	w.put("matches", "h99", map[string]any{})
 	hid := w.nsHead("matches", w.admin)
@@ -790,4 +805,59 @@ func TestV075FilteredPurged(t *testing.T) {
 	}
 	expectCode(t, w.get("/ns/matches/g/"+gs+"/events?since="+purgeNS, li), 410, "purged")
 	expectCode(t, w.get("/ns/matches/g/"+gs+"/log?live=long-poll&since="+purgeNS, li), 410, "purged")
+}
+
+// §B.11.9 with the client of V75-02: a partial reader's FilteredHeads,
+// FilteredLog and FilteredLongPoll follow this server's redirects and read
+// what is visible; LongPoll names the filtered form without following it.
+func TestV075ClientFiltered(t *testing.T) {
+	t.Parallel()
+	w := newV75s(t, v75sOpts{env: []envOpt{withLogPageSize(2)}})
+	w.seed([]string{"derby", "shared"}, []string{"secret"}, []string{"derby", "secret", "shared", "opener"})
+	ctx := context.Background()
+	c, err := plclient.New(w.srv.URL, plclient.WithHTTPClient(&http.Client{Transport: transport}), plclient.WithBearer(w.li()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := w.nsHead("matches", w.admin)
+	items, fa, err := c.FilteredHeads(ctx, "matches", head, "")
+	if err != nil || !fa.Filtered() || fa.End != head {
+		t.Fatalf("FilteredHeads: %v %+v", err, fa)
+	}
+	var names []string
+	for _, it := range items {
+		names = append(names, it.Resource)
+	}
+	if !reflect.DeepEqual(names, []string{"derby", "shared"}) {
+		t.Fatalf("heads %v", names)
+	}
+	if items, _, err = c.FilteredHeads(ctx, "matches", head, "s"); err != nil || len(items) != 1 || items[0].Resource != "shared" {
+		t.Fatalf("FilteredHeads with prefix: %v %v", items, err)
+	}
+	entries, fa, err := c.FilteredLog(ctx, "matches", "")
+	if err != nil || fa.End != head {
+		t.Fatalf("FilteredLog: %v %+v", err, fa)
+	}
+	seen := map[string]bool{}
+	for _, e := range entries {
+		seen[e.Resource] = true
+	}
+	if !seen["derby"] || !seen["shared"] || seen["secret"] || seen["opener"] {
+		t.Fatalf("log resources %v", seen)
+	}
+	if _, err := c.LongPoll(ctx, "matches", head, ""); err == nil {
+		t.Fatal("LongPoll followed the filtered form")
+	} else if fe, ok := plclient.AsFiltered(err); !ok || fe.GS != fa.GS {
+		t.Fatalf("LongPoll: %v", err)
+	}
+	lp, err := c.FilteredLongPoll(ctx, "matches", fa.GS, head, "")
+	if err != nil || lp == nil {
+		t.Fatalf("FilteredLongPoll: %+v %v", lp, err)
+	}
+	// An unrestricted reader's HeadsPrefix.
+	ac, _ := plclient.New(w.srv.URL, plclient.WithHTTPClient(&http.Client{Transport: transport}), plclient.WithBearer(w.admin))
+	all, err := ac.HeadsPrefix(ctx, "matches", head, "s")
+	if err != nil || len(all) != 2 {
+		t.Fatalf("HeadsPrefix: %v %v", all, err)
+	}
 }
