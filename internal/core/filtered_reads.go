@@ -59,7 +59,11 @@ func (t *tx) nsReaderOrRedirect(n *nsRow, cred Credentials) (*actor, error) {
 // filteredOpen is the covered namespace a filtered URL names, or the
 // answer for one that isn't covered (§B.11.9 Where): its credentials are
 // judged as at its unfiltered URLs (401 without, 403 for a /ns/{ns}/g/{gs}
-// cookie), then 403, as no filtered URL serves it.
+// cookie), then 401 for a request that carries neither a grant that
+// verifies in {ns} nor a cookie the origin verifies, as in a public
+// namespace, whose unfiltered URLs ignore an unusable grant, then 403, as
+// no filtered URL serves it (§B.11.9 Purged namespaces: "403, or 401 as
+// §B.11.5 says").
 func (t *tx) filteredOpen(ns string, cred Credentials) (*nsRow, *fscope, error) {
 	n := t.nsByName(ns)
 	if n == nil {
@@ -70,9 +74,28 @@ func (t *tx) filteredOpen(ns string, cred Credentials) (*nsRow, *fscope, error) 
 		if _, _, _, err := t.nsAccess(n, cred); err != nil {
 			return nil, nil, err
 		}
+		if !t.e.opt.AuthDisabled && cred.Edge == nil && !t.grantVerifiesIn(n, cred) {
+			return nil, nil, apiErr(401, "unauthenticated", "message",
+				"no grant that verifies in "+ns+" and no cookie: "+ns+" isn't read filtered here (§B.11.9 Where, §B.11.5)")
+		}
 		return nil, nil, forbidden(ns + " isn't read filtered here (§B.11.9 Where)")
 	}
 	return n, fs, nil
+}
+
+// grantVerifiesIn reports whether the grant in Authorization verifies in
+// n (§C.2 item 1, its key's scope included), whatever n's read mode: a
+// public namespace's reads ignore a grant that doesn't (readerCheckURL).
+func (t *tx) grantVerifiesIn(n *nsRow, cred Credentials) bool {
+	if cred.Bearer == "" {
+		return false
+	}
+	g, err := t.decodeGrant(n.name, cred)
+	if err != nil {
+		return false
+	}
+	_, err = t.verifyGrant(g, n.name, n, t.config(n.configSeq), nil)
+	return err == nil
 }
 
 // filteredAtView admits a request at /ns/{ns}/g/{gs}/at/{at}/… and returns

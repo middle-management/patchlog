@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
 // V76-01 (v0.76): origin filtered reads (§B.11.9): a branch stays covered
@@ -221,5 +222,51 @@ func TestV076OriginBranchBaseKeyRemoved(t *testing.T) {
 	}
 	if _, err := w.e.IssueEdgeGrants(ctx, []string{fan.Bearer}); v75Status(err) != 401 {
 		t.Fatalf("exchange after the key went: %v, want 401", err)
+	}
+}
+
+// §B.11.9 Purged namespaces, §B.11.5: an uncovered namespace's filtered
+// URLs are 401 for a request with neither a grant that verifies there nor
+// a cookie, a public namespace's included, and 403 otherwise.
+func TestV076OriginUncoveredFiltered401(t *testing.T) {
+	t.Parallel()
+	w := newV75World(t, v75Opts{})
+	w.mkNS("pub", map[string]any{"read": "public", "keys": []any{w.kEntry()}})
+	w.mkNS("priv", map[string]any{"read": "grant", "keys": []any{w.kEntry()}})
+	ctx := context.Background()
+	gs := grantcheck.SubjectSetID([]string{"group:editors"})
+	at := grantcheck.CombinedAt(map[string]string{"pub": w.head("pub")})
+	k := func(ns string, can ...any) Credentials {
+		return w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:r", "ns": []any{ns}, "can": can})
+	}
+	badSig := k("pub", "read")
+	badSig.Bearer = badSig.Bearer[:len(badSig.Bearer)-4] + "AAAA"
+	exp := w.now().Add(10 * time.Minute)
+	for name, c := range map[string]struct {
+		ns   string
+		cred Credentials
+		want int
+	}{
+		"public, no credentials":                  {"pub", Credentials{}, 401},
+		"public, a grant for another namespace":   {"pub", k("matches", "read"), 401},
+		"public, a grant that doesn't verify":     {"pub", badSig, 401},
+		"public, a grant that verifies there":     {"pub", k("pub", "read"), 403},
+		"public, a verified cookie":               {"pub", Credentials{Edge: &EdgeGrant{NS: "pub", Prefix: "/ns/pub", Exp: exp}}, 403},
+		"private, no credentials":                 {"priv", Credentials{}, 401},
+		"private, a grant that reads there":       {"priv", k("priv", "read"), 403},
+		"private, a grant for another namespace":  {"priv", k("matches", "read"), 403},
+		"private, a grant that doesn't read here": {"priv", k("priv", "create"), 403},
+	} {
+		st := v75Status(w.e.FilteredCurrent(ctx, c.ns, gs, c.cred))
+		_, _, herr := w.e.FilteredHeads(ctx, c.ns, gs, at, "", "", c.cred)
+		_, _, lerr := w.e.FilteredLog(ctx, c.ns, gs, at, "", 0, c.cred)
+		if st != c.want || v75Status(herr) != c.want || v75Status(lerr) != c.want {
+			t.Errorf("%s: FilteredCurrent %d, FilteredHeads %v, FilteredLog %v, want %d", name, st, herr, lerr, c.want)
+		}
+		if c.want == 401 {
+			if e, _ := herr.(*Error); e == nil || e.Body["code"] != "unauthenticated" {
+				t.Errorf("%s: %v, want unauthenticated", name, herr)
+			}
+		}
 	}
 }
