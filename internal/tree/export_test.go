@@ -78,3 +78,18 @@ func (s *Service) BeforeJudge(f func()) {
 	}
 	s.beforeJudge.Store(&f)
 }
+
+// AfterGeneration sets f to run as each listing has taken its kept
+// generation, before it reads the graph (tests: a purge applied
+// meanwhile); nil unsets it.
+func (s *Service) AfterGeneration(f func()) {
+	if f == nil {
+		s.afterGeneration.Store(nil)
+		return
+	}
+	s.afterGeneration.Store(&f)
+}
+
+// PurgeKept purges the catalog's kept listings that carry any of tags, as
+// an apply that purges them does (tests).
+func (s *Service) PurgeKept(tags ...string) { s.kept.Purge(s.opt.Catalog, tags) }

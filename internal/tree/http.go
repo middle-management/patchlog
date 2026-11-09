@@ -1031,11 +1031,9 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		rkeyOf := func(at string) string { return listingKey(rcanon(at), v) }
 		to := cur
 		if _, _, ok := s.kept.Get(rkeyOf(cur)); keep && !ok {
-			if info, key, err := s.keys.Current(ctx, cat); err == nil {
-				if l, err := s.listing(ctx, v, op, rvals, rcanon, rkeyOf, info, key); err == nil && l.status == http.StatusOK {
-					to = l.at
-					s.rekeyAs(v, l.prof)
-				}
+			if l, err := s.currentListing(ctx, v, op, rvals, rcanon, rkeyOf); err == nil && l.status == http.StatusOK {
+				to = l.at
+				s.rekeyAs(v, l.prof)
 			}
 		}
 		if to != at {
@@ -1052,18 +1050,21 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 
-	info, key, err := s.keys.Current(ctx, cat)
-	if err != nil {
-		s.opt.Logf("tree: keys of %s: %v", cat, err)
+	l, err := s.currentListing(ctx, v, op, vals, canon, keyOf)
+	switch {
+	case errors.Is(err, errCurrentKey):
+		s.opt.Logf("tree: %v", err)
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "5")
 		// Keys it can't fetch yet are a view it hasn't caught up with
 		// (§12.1 behind, §E.2.6).
 		WriteError(w, http.StatusServiceUnavailable, "behind", "the service cannot obtain the key that seals listings of the catalog yet")
-		return
-	}
-	l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key)
-	switch {
+	case errors.Is(err, errPurgedSince):
+		// Every try lost to a purge: nothing computed before one is
+		// served (§A.1).
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "1")
+		WriteError(w, http.StatusServiceUnavailable, "behind", "the service is applying purges of the catalog: try again")
 	case errors.Is(err, errFileKeys):
 		s.opt.Logf("tree: %v", err)
 		w.Header().Set("Cache-Control", "no-store")
@@ -1146,12 +1147,53 @@ func refusePartial(l *computed) *computed {
 	return l
 }
 
+// errCurrentKey is the catalog's encryption, or the key that seals its
+// listings now, that the service can't obtain for now: 503 behind.
+var errCurrentKey = errors.New("the key that seals listings of the catalog")
+
+// errPurgedSince is a listing computed from what was read before a purge
+// that carried one of its tags (kept.PurgedSince): it is neither kept nor
+// served (§A.1, §B.5), and computed again with what is current
+// (currentListing).
+var errPurgedSince = errors.New("the listing was computed before a purge of what it shows")
+
+// errInfoChanged is a listing that would be computed under the catalog's
+// encryption as read before its kept generation, which has changed since:
+// a raise to sealed or e2e purges what it narrows (§9), counted before
+// that generation, so it is errPurgedSince, computed again with what is
+// current.
+var errInfoChanged = fmt.Errorf("%w: the catalog's encryption changed", errPurgedSince)
+
+// currentListing is listing with the catalog's encryption and key as they
+// are now, read again, and the listing computed again, up to twice more,
+// while it loses to a purge (errPurgedSince), as the index's afterPurge
+// does: a listing computed before a purge, or under the encryption a
+// raise replaced, is never served or kept.
+func (s *Service) currentListing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string) (*computed, error) {
+	cat := s.opt.Catalog
+	var err error
+	for range 3 {
+		info, key, kerr := s.keys.Current(ctx, cat)
+		if kerr != nil {
+			return nil, fmt.Errorf("%w (%s): %w", errCurrentKey, cat, kerr)
+		}
+		var l *computed
+		if l, err = s.listing(ctx, v, op, vals, canon, keyOf, info, key); !errors.Is(err, errPurgedSince) {
+			return l, err
+		}
+	}
+	return nil, err
+}
+
 // listing computes the listing of op for v at the current at, sealed in a
 // sealed or e2e catalog, stores a sealed one and keeps it (unless
 // perReader), and returns it with the at it is at. canon gives its URL at
 // an at, the view it is bound to, and keyOf what it is stored and kept
 // under: the URL and the reader's shape, since a namespace that turns
-// private moves no URL (viewer.shape).
+// private moves no URL (viewer.shape). info is the catalog's encryption
+// as read before; one that has changed by the time the kept generation is
+// taken is errInfoChanged, and a listing a purge since then may have
+// changed errPurgedSince: neither is served (currentListing).
 func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string, info derived.Info, key derived.Key) (*computed, error) {
 	if f := s.beforeListing.Load(); f != nil {
 		(*f)()
@@ -1159,6 +1201,20 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	cat := s.opt.Catalog
 	keep := !perReader(op, v)
 	gen, sgen := s.kept.Generation(cat), s.sealed.Generation()
+	// info was read before gen: a config change since (a raise to sealed
+	// or e2e, a rotation), which apply observes before it purges what it
+	// narrows (§9, §A.1), would have this listing computed under what it
+	// replaced and kept, its purge counted before gen. Read again now:
+	// what changed is errInfoChanged; what changes later purges after gen
+	// (errPurgedSince). The file metadata's sealing is read after gen.
+	if now, err := s.keys.Info(ctx, cat); err != nil {
+		return nil, fmt.Errorf("%w (%s): %w", errCurrentKey, cat, err)
+	} else if now != info {
+		return nil, errInfoChanged
+	}
+	if f := s.afterGeneration.Load(); f != nil {
+		(*f)()
+	}
 	fs, err := s.fileSealing(ctx)
 	if err != nil {
 		return nil, err
@@ -1190,7 +1246,10 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			if prof != nil && !prof.Admits(v.subjects) {
 				return refusePartial(&computed{at: at, prof: prof}), nil
 			}
-			st, _ = s.kept.Put(keyOf(at), cat, gen, true, st)
+			st, o := s.kept.PutOutcome(keyOf(at), cat, gen, true, st)
+			if o == kept.PurgedSince {
+				return nil, errPurgedSince
+			}
 			s.recordAt(at, cps, prof)
 			return &computed{st: st, at: at, status: http.StatusOK, prof: prof}, nil
 		}
@@ -1419,7 +1478,14 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	}
 	if !keep {
 		// Neither stored nor kept: whether it may be served depends on
-		// the reader.
+		// the reader. No kept generation guards it, so the encryption is
+		// read again: a raise applied while it was computed, its graph
+		// read after the raise, is computed again under the new one.
+		if now, err := s.keys.Info(ctx, cat); err != nil {
+			return nil, fmt.Errorf("%w (%s): %w", errCurrentKey, cat, err)
+		} else if now != info {
+			return nil, errInfoChanged
+		}
 		return l, nil
 	}
 	type page struct {
@@ -1454,7 +1520,13 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		}
 	}
 	for i := range pages {
-		pages[i].st, _ = s.kept.Put(pages[i].key, cat, gen, sealed, pages[i].st)
+		var o kept.Outcome
+		pages[i].st, o = s.kept.PutOutcome(pages[i].key, cat, gen, sealed, pages[i].st)
+		if i == 0 && o == kept.PurgedSince {
+			// Read before a purge of what it shows: not served, nor its
+			// following pages kept (§A.1).
+			return nil, errPurgedSince
+		}
 	}
 	l.st, l.prof = pages[0].st, prof
 	s.recordAt(l.at, cps, prof)

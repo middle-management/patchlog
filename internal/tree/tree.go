@@ -208,6 +208,10 @@ type Service struct {
 	// beforeListing, if set, runs as a listing starts, outside the
 	// graph's lock (tests: a checkpoint that moves meanwhile).
 	beforeListing atomic.Pointer[func()]
+	// afterGeneration, if set, runs as a listing has taken its kept
+	// generation, before it reads the graph, outside the graph's lock
+	// (tests: a purge applied meanwhile).
+	afterGeneration atomic.Pointer[func()]
 	// beforeJudge, if set, runs as a listing records what it judged
 	// (judgeEpochs), outside the graph's lock (tests: a head applied
 	// meanwhile).
