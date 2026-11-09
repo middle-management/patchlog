@@ -38,6 +38,10 @@ type actor struct {
 	// noAuth: a request made while authentication is disabled (§1). The
 	// namespace entries written for it record "grant": null (§7.4).
 	noAuth bool
+	// gs is the subject set of a filtered read's edge grant (§B.11.9,
+	// filteredAdmit): such an actor never reads unrestricted (readsNS,
+	// canRead).
+	gs string
 }
 
 func (a *actor) id() string { return a.principal.ID }
@@ -432,7 +436,7 @@ func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 	if cfg.Read == "public" || t.e.opt.AuthDisabled {
 		return true
 	}
-	if a == nil || a.verified == nil {
+	if a == nil || a.verified == nil || a.gs != "" {
 		return false
 	}
 	if !a.verified.Can["read"] {
@@ -475,6 +479,55 @@ func (t *tx) nsReader(n *nsRow, cred Credentials) (*actor, *Error) {
 		return t.edgeReader(n, cred.Edge, "")
 	}
 	return t.readerCheck(n, cred, func(a *actor) bool { return t.readsNS(n, cfg, a, false) })
+}
+
+// accessKind classifies a reader of a namespace (§B.11.9 Partial reader).
+type accessKind int
+
+const (
+	accessNone         accessKind = iota
+	accessUnrestricted            // reads the namespace unrestricted (readsNS, §2.1)
+	accessPartial                 // a partial reader of a covered namespace
+)
+
+// nsAccess authenticates a read of n's /ns/{ns} URLs as nsReader does,
+// and classifies the reader: unrestricted where nsReader admits it;
+// partial where n is covered (filteredScope, returned then) and the grant
+// verifies there, its key's scope included (§C.2 item 1), and allows read
+// through its verbs and effective roles (item 2), without reading n
+// unrestricted. Anything else is nsReader's refusal. An edge grant for a
+// filtered read (GS) is none: filteredAdmit judges it at filtered URLs.
+func (t *tx) nsAccess(n *nsRow, cred Credentials) (*actor, accessKind, *fscope, *Error) {
+	cfg := t.config(n.configSeq)
+	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
+		a, err := t.edgeReader(n, cred.Edge, "")
+		if err != nil {
+			return nil, accessNone, nil, err
+		}
+		return a, accessUnrestricted, nil, nil
+	}
+	kind, fs := accessNone, (*fscope)(nil)
+	a, err := t.readerCheck(n, cred, func(a *actor) bool {
+		if t.readsNS(n, cfg, a, false) {
+			kind = accessUnrestricted
+			return true
+		}
+		if a == nil || a.verified == nil {
+			return false
+		}
+		if ok, _ := a.verified.Allows("read"); !ok {
+			return false
+		}
+		if fs = t.filteredScope(n); fs != nil {
+			kind = accessPartial
+			return true
+		}
+		return false
+	})
+	if err != nil {
+		return nil, accessNone, nil, err
+	}
+	return a, kind, fs, nil
 }
 
 // anyReader is reader for a request that answers any reader of the
@@ -590,7 +643,9 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 		return false
 	}
 	if a.verified == nil {
-		return true // a namespace's edge grant (edgeReader)
+		// A namespace's edge grant (edgeReader), but not a filtered
+		// read's (§B.11.9).
+		return a.gs == ""
 	}
 	roles, ok := a.unrestrictedRoles()
 	if !ok {

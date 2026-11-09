@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -192,7 +194,15 @@ type Config struct {
 	// append and restore must result in a document with a fresh $nonce
 	// that differs from its parent's. False for "optional", the default.
 	NonceRequired bool
-	level         int
+	// Catalogs are the names of the catalogs a content namespace's
+	// catalogs member names (§B.11.3), sorted. IsCatalog reports a catalog
+	// namespace (a catalog member, §B.6), and CatalogTrust is its
+	// catalog.trust, the namespaces it trusts, sorted.
+	// Filtered reads read them (§B.11.9 Where, filtered_scope.go).
+	Catalogs     []string
+	IsCatalog    bool
+	CatalogTrust []string
+	level        int
 	// ruleForms counts the rule forms of rules, roles and key scopes,
 	// nested ones included, which rulesPerNamespace bounds (§12.2).
 	ruleForms int
@@ -905,6 +915,28 @@ func parseConfigIn(doc any, defaults, max Limits, md configMode) (*Config, error
 				return nil, fmt.Errorf("/base must be { ns, at } or { origin, ns, at }")
 			}
 			c.Base = &BaseRef{NS: ns, At: at}
+		case "catalogs":
+			// Checked as a member (checkCatalogs): its keys are catalog
+			// names.
+			if m, ok := v.(map[string]any); ok {
+				for cat := range m {
+					if ValidNSName(cat) {
+						c.Catalogs = append(c.Catalogs, cat)
+					}
+				}
+				sort.Strings(c.Catalogs)
+			}
+		case "catalog":
+			c.IsCatalog = true
+			if m, ok := v.(map[string]any); ok {
+				arr, _ := m["trust"].([]any)
+				for _, x := range arr {
+					if s, ok := x.(string); ok && ValidNSName(s) && !slices.Contains(c.CatalogTrust, s) {
+						c.CatalogTrust = append(c.CatalogTrust, s)
+					}
+				}
+				sort.Strings(c.CatalogTrust)
+			}
 		case "signatures":
 			switch v {
 			case "optional":
