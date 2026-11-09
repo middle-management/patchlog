@@ -697,7 +697,9 @@ func (t *tx) keyEpochs(n *nsRow, max int) []epochStart {
 // epochNow is the epoch base b has in force now (§E.2.3): its document's,
 // or for a remote branch's shadow, whose document stays as the remote base's
 // was at at, the latest of the source's epochs the follower has seen
-// (followRemote), if later.
+// (followRemote), if later. A deeper shadow whose current document B can't
+// read has no epoch now that a branch's keys go by: baseEpochs gives none
+// of its epochs before asking (chainReadable).
 func (t *tx) epochNow(b *nsRow) int {
 	cur := t.config(b.configSeq).Epoch
 	if !b.isShadow() {
@@ -723,8 +725,14 @@ func (t *tx) epochNow(b *nsRow) int {
 // "for the base epochs §E.2.3 selects" (Addendum E Levels), so this rule
 // alone bounds them, not preRaiseWindow, which judges the raised
 // namespace's own grants against its current epoch and document. A base
-// at at that isn't e2e gives none.
+// at at that isn't e2e gives none, and nor does a remote branch's deeper
+// base whose current namespace document B can't read (chainReadable,
+// §G.5.2 E3 sources): neither its keyring entries nor its pre-raise keys
+// are relayed, and its last-seen epoch isn't used.
 func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
+	if !t.chainReadable(b) {
+		return nil
+	}
 	var cseq, created int64
 	if err := t.QueryRow(`SELECT config_seq, created FROM ns_log WHERE seq = ?`, at).Scan(&cseq, &created); err != nil {
 		return nil

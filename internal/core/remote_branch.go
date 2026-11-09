@@ -1409,12 +1409,38 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 	if err != nil {
 		return nil, err
 	}
+	if res.Status == 201 && cfg != nil {
+		// The deeper bases' current namespace documents, read once now, so
+		// the branch relays their keys from the start where it can read
+		// them (§G.5.2 E3 sources, chainReadable); a failure leaves them
+		// withheld until a sync reads them, and doesn't fail creation.
+		if err := e.readChainAtCreation(ctx, req.NS, cfg.Base.Origin); err != nil {
+			log.Printf("remote branch %s: reading the current namespace documents of its deeper bases at %s: %v; their keys are relayed once a sync reads them", req.NS, cfg.Base.Origin, err)
+		}
+	}
 	if res.Status == 201 && cfg != nil && e.opt.Remote.Register {
 		if err := e.RegisterRemote(ctx, req.NS); err != nil {
 			log.Printf("remote branch %s: registering with %s: %v", req.NS, cfg.Base.Origin, err)
 		}
 	}
 	return res, nil
+}
+
+// readChainAtCreation runs followChainEpochs for remote branch ns, just
+// created with base origin.
+func (e *Engine) readChainAtCreation(ctx context.Context, ns, origin string) error {
+	var bases []*remoteBase
+	if err := e.read(ctx, func(t *tx) error {
+		bases = t.remoteBases(`n.name = ?`, ns)
+		return nil
+	}); err != nil || len(bases) == 0 {
+		return err
+	}
+	c, ep, err := e.remoteClient(origin)
+	if err != nil {
+		return err
+	}
+	return e.followChainEpochs(ctx, c, ep, bases[0])
 }
 
 // insertRemoteBranch inserts the shadow, the mirrored schemas and the
@@ -2430,9 +2456,14 @@ func (e *Engine) followPreStarts(ctx context.Context, c *client.Client, ep Remot
 // keyring entries to a grant without nbf only while that base's epoch now
 // is its epoch at at (§E.2.3, epochNow), and the follower of the base's
 // own log sees only the base's. An epoch later than the one at at is read
-// by epochNow alone, so its start time is when it was seen. A base that
-// can't be read keeps the epoch last seen, as the base itself does when
-// its log can't be followed; the error is reported.
+// by epochNow alone, so its start time is when it was seen. Whether each
+// read succeeded is recorded (remote_chain_read): B relays a deeper base's
+// keys only while it can read its current namespace document (§G.5.2 E3
+// sources), so after a failed read the branch's /keys gives none of that
+// base's keyring entries or pre-raise keys, and keeps no last-seen epoch
+// for it (baseEpochs, chainReadable), until a later read succeeds; the
+// error is reported. It runs at creation too (createRemoteBranch), so
+// those keys are relayed from the start where B can read them.
 func (e *Engine) followChainEpochs(ctx context.Context, c *client.Client, ep RemoteEndpoint, b *remoteBase) error {
 	type level struct {
 		shadow int64
@@ -2454,29 +2485,68 @@ func (e *Engine) followChainEpochs(ctx context.Context, c *client.Client, ep Rem
 		return err
 	}
 	docs := map[int64]sourceDoc{}
+	failed := map[int64]bool{}
 	var errs []error
 	for _, lv := range levels {
 		h, err := c.NSHead(ctx, lv.ns)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("/ns/%s: %w", lv.ns, err))
+			failed[lv.shadow] = true
 			continue
 		}
 		d, err := fetchSourceDoc(ctx, c, ep, lv.ns, h.ID)
 		if err != nil {
 			errs = append(errs, err)
+			failed[lv.shadow] = true
 			continue
 		}
 		docs[lv.shadow] = d
 	}
-	if len(docs) > 0 {
-		errs = append(errs, e.update(ctx, func(t *tx) error {
-			for sh, d := range docs {
-				t.followEpoch(sh, d, "")
-			}
-			return nil
-		}))
-	}
+	errs = append(errs, e.update(ctx, func(t *tx) error {
+		for sh, d := range docs {
+			t.followEpoch(sh, d, "")
+			t.chainRead(sh, true)
+		}
+		for sh := range failed {
+			t.chainRead(sh, false)
+		}
+		return nil
+	}))
 	return errors.Join(errs...)
+}
+
+// chainRead records whether the latest read of the current namespace
+// document of the deeper base shadow sh mirrors succeeded
+// (followChainEpochs, remote_chain_read).
+func (t *tx) chainRead(sh int64, ok bool) {
+	_, err := t.Exec(`INSERT INTO remote_chain_read (shadow, ok, at) VALUES (?,?,?) ON CONFLICT (shadow) DO UPDATE SET ok = excluded.ok, at = excluded.at`,
+		sh, ok, t.now.UnixMilli())
+	t.must(err)
+}
+
+// chainReadable reports whether a branch's /keys may relay keys of base b
+// (§G.5.2 E3 sources, baseEpochs): any base but a remote branch's deeper
+// shadow, one below its first (remoteShadows), whose namespace B mirrors
+// from further up A's chain; that one only while the follower's latest
+// read of its current namespace document succeeded, and not before the
+// first success after creation (remote_chain_read).
+func (t *tx) chainReadable(b *nsRow) bool {
+	if !b.isShadow() {
+		return true
+	}
+	var first bool
+	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM remote_bases WHERE shadow = ?)`, b.id).Scan(&first))
+	if first {
+		// The source itself, which the log follower covers.
+		return true
+	}
+	var ok bool
+	err := t.QueryRow(`SELECT ok FROM remote_chain_read WHERE shadow = ?`, b.id).Scan(&ok)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false
+	}
+	t.must(err)
+	return ok
 }
 
 // followLog follows the base's log after the checkpoint (followRemote).

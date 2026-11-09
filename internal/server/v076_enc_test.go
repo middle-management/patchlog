@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/ecdh"
+	"crypto/ed25519"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/core"
@@ -105,4 +106,63 @@ func TestV076EncCheckFixesRevEpoch(t *testing.T) {
 	if want := `"` + x + `.1"`; g.H.Get("ETag") != want {
 		t.Fatalf("ETag %s, want %s: the epoch the write's check fixed", g.H.Get("ETag"), want)
 	}
+}
+
+// §G.5.2 E3 sources (v0.76, B-65): B relays the keys of a namespace
+// further up A's chain only while it can read its current namespace
+// document. A's eb is a branch of e, both e2e; B's E3 remote branch rel of
+// eb mirrors e's keyring too. Once B's grant at A can't read e (403) and a
+// sync has tried, POST /ns/rel/keys relays none of e's entries, though eb's
+// still; once a sync reads e again, they are relayed again.
+func TestV076EncDeeperBaseUnreadable(t *testing.T) {
+	t.Parallel()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning)
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("e", e2eDoc(map[string]any{"keys": []any{kA.entry("*")}}))
+	g := a.grant(kA, "user:admin", []string{"e", "eb"}, allVerbs)
+	readerJWK, readerPriv, _ := seal.GenerateRecipient()
+	kre, _ := seal.BuildKeyringV2(readerPriv, "e", 1, seal.NewKey(), []*ecdh.PublicKey{readerPriv.PublicKey()})
+	krHead := a.create("e", "keyring", kre.Value(), g)
+	expect(t, a.branch("e", map[string]any{"name": "eb"}, g), 201)
+	krb, _ := seal.BuildKeyringV2(readerPriv, "eb", 1, seal.NewKey(), []*ecdh.PublicKey{readerPriv.PublicKey()})
+	a.appendRev("eb", "keyring", krHead, ops(op("replace", "", krb.Value())), g)
+	at := a.nsHead("eb", g)
+
+	both := a.grant(kA, "svc:b", []string{"e", "eb"}, []string{"read"})
+	rt := &route{url: a.srv.URL, bearer: both}
+	var bPriv ed25519.PrivateKey
+	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt), withKeyStore(newKeyStore(t)), withEncTuning)
+	b.opPriv = bPriv
+	kB := newKey("badmin")
+	doc := e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}})
+	doc["base"] = map[string]any{"origin": originA, "ns": "eb", "at": at, "chain": []any{"eb", "e"}}
+	expect(t, b.mkRemote("rel", addRoot(doc)), 201)
+	readerG := b.grant(kB, "user:reader", []string{"rel"}, []string{"read"}, map[string]any{"enc": readerJWK})
+	relayed := func(want ...string) {
+		t.Helper()
+		keys, r := b.keysOf("rel", nil, readerG)
+		expect(t, r, 200)
+		if len(keys) != len(want) {
+			t.Fatalf("relayed %v, want %v", keys, want)
+		}
+		for _, k := range want {
+			if _, ok := keys[k]; !ok {
+				t.Fatalf("relayed %v, want %v", keys, want)
+			}
+		}
+	}
+	// Creation read e's current document: both keyrings are relayed.
+	relayed("e#1", "eb#1")
+	// B's grant at A no longer reads e: /ns/e is 403 to it.
+	expectCode(t, a.get("/ns/e", a.grant(kA, "svc:b", []string{"eb"}, []string{"read"})), 403, "forbidden")
+	rt.set(a.srv.URL, a.grant(kA, "svc:b", []string{"eb"}, []string{"read"}))
+	_ = syncRemotes(t, b) // reports e's failed read
+	relayed("eb#1")
+	rt.set(a.srv.URL, both)
+	if err := syncRemotes(t, b); err != nil {
+		t.Fatal(err)
+	}
+	relayed("e#1", "eb#1")
 }
