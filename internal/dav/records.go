@@ -261,23 +261,31 @@ func (st *reqState) knowUser(ctx context.Context, ns string) {
 
 // ownHead reports whether head h of ns/name, a tombstone, is the user's
 // own (ownLogEntry), reading its log entry where this server didn't
-// record it writing it; one that can't be read counts as someone else's.
-func (st *reqState) ownHead(ctx context.Context, ns, name string, h *client.Head) bool {
+// record it writing it; one that can't be read counts as someone else's,
+// but a failed read (failedRead) of it, or of who the user is, is the
+// error, which fails the save (§H.4 "The base": 503, 502, never 409).
+func (st *reqState) ownHead(ctx context.Context, ns, name string, h *client.Head) (bool, error) {
 	if st.s.ownEntry(st.p, ns, name, h.ID) {
-		return true
+		return true, nil
 	}
 	st.knowUser(ctx, ns)
 	st.p.mu.Lock()
 	known := st.p.sub != "" || st.p.author != ""
 	st.p.mu.Unlock()
 	if !known {
-		return false
+		if _, err := st.s.nsInfoErr(ctx, st.tk, ns); failedRead(err) {
+			return false, err
+		}
+		return false, nil
 	}
 	es, err := st.tk.c.Log(ctx, ns, name, h.ID, h.Last)
-	if err != nil || len(es) == 0 || es[len(es)-1].ID != h.ID {
-		return false
+	switch {
+	case failedRead(err):
+		return false, err
+	case err != nil || len(es) == 0 || es[len(es)-1].ID != h.ID:
+		return false, nil
 	}
-	return st.wroteAs(ctx, ns, es[len(es)-1])
+	return st.wroteAs(ctx, ns, es[len(es)-1]), nil
 }
 
 // recordsOf returns p's records of ns/name. Records the bounds dropped

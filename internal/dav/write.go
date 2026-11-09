@@ -262,8 +262,11 @@ func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name stri
 // reload"), though a MOVE of a live file there does, a rename back
 // included (moving); a 409 when the principal has a base from before
 // someone else's delete (§11.3), whose reload (a GET finding the file
-// gone) lets the write make a new file; else nil: a new file, but not by
-// a token refused a save of it that hasn't read it since (refusedSave).
+// gone) lets the write make a new file; a failed read (failedRead) of
+// the last revision, or of whether the delete is the user's own, as the
+// error, which fails the save (503, 502), never 409 (§H.4 "The base",
+// "The reload"); else nil: a new file, but not by a token refused a save
+// of it that hasn't read it since (refusedSave).
 func (st *reqState) tombBase(ctx context.Context, ns, name string, h *client.Head) (*docEntry, error) {
 	last, err := st.tombLast(ctx, ns, name, h)
 	if err == nil && last == nil {
@@ -277,7 +280,13 @@ func (st *reqState) tombBase(ctx context.Context, ns, name string, h *client.Hea
 // tombLast is tombBase but for refusedSave.
 func (st *reqState) tombLast(ctx context.Context, ns, name string, h *client.Head) (*docEntry, error) {
 	own := st.p.deletedOwn(ns, name, h.ID, st.s.opt.Now())
-	mine := own || st.ownHead(ctx, ns, name, h)
+	mine := own
+	if !mine {
+		var err error
+		if mine, err = st.ownHead(ctx, ns, name, h); err != nil {
+			return nil, err
+		}
+	}
 	// A save from a version the principal had, over someone else's
 	// delete (§11.3): refused, the refusal naming where the file went if
 	// it moved, so that the reload it asks for isn't followed by another.
@@ -287,6 +296,10 @@ func (st *reqState) tombLast(ctx context.Context, ns, name string, h *client.Hea
 		var err error
 		last, err = st.s.doc(ctx, st.tk, ns, name, h.Last)
 		switch {
+		case failedRead(err):
+			// A failed read fails the save (503, 502), never 409 (§H.4
+			// "The base", "The reload", §H.6).
+			return nil, err
 		case pruned(err), err != nil && theirs:
 			// Refused either way: moved away as far as the head says.
 			last = nil

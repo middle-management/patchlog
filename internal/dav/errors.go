@@ -7,9 +7,12 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/middle-management/patchlog/internal/client"
 )
@@ -101,10 +104,10 @@ func limitRefusal(ae *client.APIError, more string) *davError {
 // lock that may go), 410 purged stays (§8.5) and another 410 (deleted
 // meanwhile, pruned) is a 409 asking for a reload, a limit refused (413,
 // or 422 code limit) is 413 with the limit and sizes the core gave
-// (limitRefusal, §6.6), the other 422s keep their errors, 429 is 503 with
-// Retry-After, and anything else the core failed with is 502. A failure
-// to reach the core is 502 too, its details (the core's address) only
-// logged. Writes map 412 and patch failures themselves. The text is the
+// (limitRefusal, §6.6), the other 422s keep their errors, 429 and 408 are
+// 503 with Retry-After, as is a timeout, and anything else the core
+// failed with (a 5xx among them) is 502. A failure to reach the core is
+// 502 too, its details (the core's address) only logged. Writes map 412 and patch failures themselves. The text is the
 // core's code and message: the status is the answer's own, and the core's
 // is named only where it differs.
 func upstream(err error) error {
@@ -123,7 +126,8 @@ func upstream(err error) error {
 	if errors.Is(err, client.ErrNoKeys) {
 		return fail(http.StatusNotFound, "the content is sealed (Addendum E), and this server holds no keys, so it doesn't offer it (§H.7)")
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	var ne net.Error
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &ne) && ne.Timeout() {
 		return &davError{status: http.StatusServiceUnavailable, msg: "the request was canceled or timed out", cause: err}
 	}
 	ae, ok := client.AsAPIError(err)
@@ -159,15 +163,16 @@ func upstream(err error) error {
 		e := fail(http.StatusUnprocessableEntity, "%s", msg)
 		e.refresh = ae.Code == "nonce"
 		return e
-	case ae.Status == 429:
+	case ae.Status == 429, ae.Status == 408:
 		return busy(ae)
 	}
 	return fail(http.StatusBadGateway, "the core answered %d: %s", ae.Status, msg)
 }
 
-// busy is the 503 a 429 turns into once waiting is no longer brief (§6.6).
+// busy is the 503 a 429 or a 408 turns into once waiting is no longer
+// brief (§6.6, §H.4 "Answers").
 func busy(ae *client.APIError) *davError {
-	e := fail(http.StatusServiceUnavailable, "the core answered 429: %s", apiText(ae))
+	e := fail(http.StatusServiceUnavailable, "the core answered %d: %s", ae.Status, apiText(ae))
 	secs := int(math.Ceil(ae.RetryAfter.Seconds()))
 	if secs < 1 {
 		secs = 1
@@ -292,4 +297,26 @@ func (w *errWriter) Write(b []byte) (int, error) {
 		return len(b), nil
 	}
 	return w.ResponseWriter.Write(b)
+}
+
+// failedRead reports a read that failed for now (§H.4 "The base", "The
+// reload", §H.6): no answer from the core (a transport error, a timeout),
+// or its 408, 429 or 5xx, also where fetching keys wrapped it
+// (client.ErrKeyFetch). Such a read fails the save (503 or 502, upstream)
+// rather than being taken as a revision the gateway can't read, which is
+// 409; anything else, a refusal (403) or no keys here (client.ErrNoKeys)
+// among them, is no failed read.
+func failedRead(err error) bool {
+	if err == nil || errors.Is(err, client.ErrNoKeys) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if ae, ok := client.AsAPIError(err); ok {
+		return ae.Status == http.StatusRequestTimeout || ae.Status == http.StatusTooManyRequests || ae.Status >= 500
+	}
+	var ue *url.Error
+	var ne net.Error
+	return errors.As(err, &ue) || errors.As(err, &ne) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
 }
