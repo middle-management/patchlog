@@ -48,7 +48,8 @@ import (
 // the reads and the /principal values they refer to (edge_filters,
 // markerRec), from which it filters hits per resource as for any grant
 // with that marker, and for a marker reads:{ns}:g:{gs} (§B.11.9) also its
-// subjects and the kid and role names its digest covers (edge_gs). They
+// subjects, the kid and role names its digest covers and its kid's pub
+// (edge_gs). They
 // are kept across restarts and -rebuild until the last such cookie
 // expires; a gs or marker the service doesn't know,
 // minted by another instance with its own database, is 401, and the
@@ -64,28 +65,39 @@ import (
 // carries roles, each effective role that lists read, and its
 // /principal), from which hits are filtered per resource as for any grant
 // with that marker; for reads:{ns}:g:{gs} (§B.11.9), also its subjects,
-// from which item 1 is judged, and its kid and the names of its read
-// roles, whose rules as of a checkpoint must still digest to its scope
-// subject (storedFview). A rule referring to /now gives no marker, so the
-// filter judges a read as the grant's read check does, without a clock.
+// from which item 1 is judged, its kid and the names of its read roles,
+// whose rules as of a checkpoint must still digest to its scope subject,
+// and the pub its kid had, which the key with that kid must still have
+// (§B.11.9 gs, §C.4; storedFview). A rule referring to /now gives no
+// marker, so the filter judges a read as the grant's read check does,
+// without a clock.
 type markerRec struct {
 	f        *grantcheck.ReadFilter
 	subjects []string // g: markers only
 	kid      string
 	roles    []string
+	pub      string // the key's pub member, as its namespace document gives it
 }
 
 // markerRecOf is what a's marker stands for, a's grant being v.
 func markerRecOf(a *access, v *grant.Verified) *markerRec {
 	rec := &markerRec{f: a.filter}
 	if a.cov != nil {
-		rec.subjects, rec.kid = a.cov.subjects, v.Key.Kid
+		rec.subjects, rec.kid, rec.pub = a.cov.subjects, v.Key.Kid, keyPub(*v.Key)
 		for r := range grantcheck.ScopeInputOf(v).Roles {
 			rec.roles = append(rec.roles, r)
 		}
 		slices.Sort(rec.roles)
 	}
 	return rec
+}
+
+// keyPub is k's pub member as the namespace document gives it, "" if it
+// has none (§B.11.9 gs: "accepted only while the base has it with the
+// same pub", §C.4), compared as given.
+func keyPub(k grant.Key) string {
+	pub, _ := k.Raw["pub"].(string)
+	return pub
 }
 
 // keptFilter is a markerRec the service holds in memory (Index.filters),
@@ -126,9 +138,9 @@ func (ix *Index) recordFilters(ctx context.Context, filters map[string]*markerRe
 		if f.subjects == nil {
 			continue
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO edge_gs (marker, subjects, kid, roles, exp) VALUES (?, ?, ?, ?, ?)
-			ON CONFLICT (marker) DO UPDATE SET subjects = excluded.subjects, kid = excluded.kid, roles = excluded.roles, exp = max(exp, excluded.exp)`,
-			m, enc(f.subjects), f.kid, enc(f.roles), exp.Unix()); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO edge_gs (marker, subjects, kid, roles, pub, exp) VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT (marker) DO UPDATE SET subjects = excluded.subjects, kid = excluded.kid, roles = excluded.roles, pub = excluded.pub, exp = max(exp, excluded.exp)`,
+			m, enc(f.subjects), f.kid, enc(f.roles), f.pub, exp.Unix()); err != nil {
 			return err
 		}
 	}
@@ -150,7 +162,8 @@ func (ix *Index) recordFilters(ctx context.Context, filters map[string]*markerRe
 
 // filter is what marker m stands for, recorded when an edge grant for it
 // was minted, by this instance or another on the database. A g: marker
-// without its subjects is unknown.
+// without its subjects is unknown; one recorded before edge_gs kept pub
+// (migration 006) has pub "", which no key has, so storedFview refuses it.
 func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 	ix.fmu.Lock()
 	k, ok := ix.filters[m]
@@ -162,9 +175,10 @@ func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 		s                    string
 		exp                  int64
 		subjects, kid, roles sql.NullString
+		pub                  sql.NullString
 	)
-	if err := ix.db.QueryRowContext(ctx, `SELECT f.filter, f.exp, g.subjects, g.kid, g.roles FROM edge_filters f
-		LEFT JOIN edge_gs g ON g.marker = f.marker WHERE f.marker = ?`, m).Scan(&s, &exp, &subjects, &kid, &roles); err != nil {
+	if err := ix.db.QueryRowContext(ctx, `SELECT f.filter, f.exp, g.subjects, g.kid, g.roles, g.pub FROM edge_filters f
+		LEFT JOIN edge_gs g ON g.marker = f.marker WHERE f.marker = ?`, m).Scan(&s, &exp, &subjects, &kid, &roles, &pub); err != nil {
 		return nil, false
 	}
 	f, err := grantcheck.DecodeReadFilter(s)
@@ -179,7 +193,7 @@ func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 		if !ok1 || !ok2 {
 			return nil, false
 		}
-		rec.kid = kid.String
+		rec.kid, rec.pub = kid.String, pub.String
 	} else if isGMarker(m) {
 		return nil, false
 	}

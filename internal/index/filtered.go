@@ -952,7 +952,11 @@ var (
 // scope rules and its roles' definitions, read from ns's document as of
 // cp (a branch's keys follow its base, §C.4), with its block rules and
 // principal, differs from the one its subjects carry (a kid or role gone,
-// or no longer listing read, counts as differing), and where its subjects
+// or no longer listing read, counts as differing), where the key with
+// rec's kid no longer has the pub it had (§B.11.9 gs: a key "no longer
+// accepted" as §C.4 judges a base's keys, "only while the base has it with
+// the same pub"; a record without one, from before migration 006, never
+// does), and where its subjects
 // leave out some of the reader's groups and some deciding catalog keeps
 // all groups (§B.11.5); otherwise item 1 from rec's subjects and item 2
 // from its filter.
@@ -974,7 +978,7 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, rec *markerRec) (*fvi
 		keys = eff.Keys
 	}
 	i := slices.IndexFunc(keys, func(k grant.Key) bool { return k.Kid == rec.kid })
-	if i < 0 || !keys[i].Lists("read") {
+	if i < 0 || !keys[i].Lists("read") || rec.pub == "" || keyPub(keys[i]) != rec.pub {
 		return nil, errRulesChanged
 	}
 	in := grantcheck.ScopeInput{ReadScopeResource: keys[i].ReadScopeResource, KeyRules: keys[i].Rules,
