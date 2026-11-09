@@ -182,12 +182,23 @@ func (t *tx) filteredCurrentRedirect(n *nsRow, fs *fscope, gs string, cred Crede
 // FilteredCurrent answers a URL under /ns/{ns}/g/{gs} without at, suffix
 // "/heads" or "/log" (without live): a *FilteredRedirect to its form at
 // the current at, recorded first, once the request is admitted there
-// (§B.11.9 URLs). It never returns nil.
+// (§B.11.9 URLs). A covered purged namespace's /heads, once admitted at
+// the current checkpoint, is 410 purged with head, as §8.5 answers its
+// unfiltered /heads, never a redirect (§B.11.9 Purged namespaces: "/heads
+// without at as /heads"); its /log keeps the redirect, a purged range
+// staying readable. It never returns nil.
 func (e *Engine) FilteredCurrent(ctx context.Context, ns, gs, suffix string, cred Credentials) error {
 	return e.filteredRead(ctx, func(t *tx) error {
-		n, fs, err := t.filteredOpen(ns, fform{heads: suffix == "/heads"}, cred)
+		heads := suffix == "/heads"
+		n, fs, err := t.filteredOpen(ns, fform{heads: heads}, cred)
 		if err != nil {
 			return err
+		}
+		if heads && n.purged {
+			if _, aerr := t.filteredAdmit(n, fs, gs, t.filteredCurrent(fs), cred); aerr != nil {
+				return aerr
+			}
+			return t.purgedRead(n)
 		}
 		return t.filteredCurrentRedirect(n, fs, gs, cred)
 	})
