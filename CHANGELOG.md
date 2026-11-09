@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.26.0
 
 Implements spec **v0.77**: its answers to the reference's notes on v0.76. `GET /` answers
 `"spec": "0.77"`. The upgrade was done in five packages: the origin's filtered reads and remote
