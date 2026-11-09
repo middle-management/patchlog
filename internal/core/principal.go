@@ -123,8 +123,15 @@ func (t *tx) principalBody(v *grant.Verified, cfg *Config) map[string]any {
 				can = append(can, verb)
 			}
 		}
-		for _, r := range v.EffectiveRoles {
-			roles = append(roles, r)
+		// Its effective roles only, each { name, can, rules } as cfg, the
+		// configuration of X-Config-Revision, defines it, rules [] if
+		// none (§7.4), so a /read-grants grant shows what it may do
+		// (§B.11.5). An operator grant's are [] (§C.4). principal.roles
+		// in the envelope stays the names (§6.4.1).
+		if !v.Operator {
+			for _, r := range v.EffectiveRoles {
+				roles = append(roles, principalRole(r, cfg.Roles[r]))
+			}
 		}
 	}
 	sort.Slice(can, func(i, j int) bool { return can[i].(string) < can[j].(string) })
@@ -146,6 +153,21 @@ func (t *tx) principalBody(v *grant.Verified, cfg *Config) map[string]any {
 	}
 	out["writer"] = w
 	return out
+}
+
+// principalRole is one role of /principal's roles (§7.4): name, and can
+// and rules as the namespace document defines them, in its order, [] for
+// none.
+func principalRole(name string, d grant.RoleDef) map[string]any {
+	can := make([]any, 0, len(d.Can))
+	for _, c := range d.Can {
+		can = append(can, c)
+	}
+	rules := []any{}
+	if len(d.Rules) > 0 {
+		rules = jsonv.Clone(d.Rules).([]any)
+	}
+	return map[string]any{"name": name, "can": can, "rules": rules}
 }
 
 // keyThumbprint is /principal's key (§7.4, §H.7): the RFC 7638 SHA-256

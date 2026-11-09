@@ -112,7 +112,11 @@ func TestV055Principal(t *testing.T) {
 	if got := strsOf(r.Obj()["can"]); !reflect.DeepEqual(got, []string{"append", "read"}) {
 		t.Fatalf("roled can %v", got)
 	}
-	if got := strsOf(r.Obj()["roles"]); !reflect.DeepEqual(got, []string{"translator"}) {
+	// Each effective role is { name, can, rules } as the configuration
+	// defines it (§7.4, v0.75); the envelope keeps the names (§6.4.1).
+	wantRoles := []any{map[string]any{"name": "translator", "can": []any{"read", "append"},
+		"rules": []any{map[string]any{"op": "writes", "within": []any{"/i18n"}}}}}
+	if got := r.Obj()["roles"]; !reflect.DeepEqual(got, wantRoles) {
 		t.Fatalf("roled roles %v", got)
 	}
 	if p, _ := r.Obj()["principal"].(map[string]any); !reflect.DeepEqual(strsOf(p["roles"]), []string{"translator"}) {
