@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/edge"
@@ -315,5 +316,56 @@ func TestVisibilityIsCatvisV075(t *testing.T) {
 	}
 	if shown < 6 {
 		t.Errorf("only %d listings show anything", shown)
+	}
+}
+
+// TestGrantReadsAtItsOwnGSSealedV075 (MUST-6, SVC-3): in a sealed catalog,
+// a listing served from the sealed store and kept again is recorded again
+// with its at's profile, so a grant still reads it at its own gs as of
+// that at once the at moves on, after its first record has expired and
+// after a restart, where no record outlasts the service (§B.11.5).
+func TestGrantReadsAtItsOwnGSSealedV075(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run("restart="+strconv.FormatBool(restart), func(t *testing.T) {
+			t.Parallel()
+			w := setupWith(t, true)
+			w.seed()
+			w.start()
+			w.caughtUp()
+			zed := w.caller("user:zed", "fan-club")
+			r, loc1 := w.follow("/cat/children?of=season", zed)
+			if r.status != 200 || gsOf(loc1) != grantcheck.SubjectSetID([]string{"group:fan-club"}) {
+				t.Fatalf("zed at at1: %d %s %v", r.status, loc1, r.body)
+			}
+			if restart {
+				w.stop()
+				w.start()
+				w.caughtUp()
+			} else {
+				// The kept listing and its at's record expire; the
+				// sealed one stays stored at the current at.
+				w.s.Clock.Advance(61 * time.Second)
+			}
+			zed = w.caller("user:zed", "fan-club")
+			// at1 is still current: its listing comes from the sealed
+			// store, and is kept again.
+			if r, loc := w.follow("/cat/children?of=season", zed); r.status != 200 || loc != loc1 {
+				t.Fatalf("zed at at1 again: %d %s %v", r.status, loc, r.body)
+			}
+			// derbies gets a direct entry for zed: his sub decides from
+			// now on.
+			w.patch("cat", "derbies", map[string]any{"op": "add", "path": "/$access/user:zed", "value": toAny("reader")})
+			w.caughtUp()
+			_, loc2 := w.follow("/cat/children?of=season", zed)
+			if gsOf(loc2) != grantcheck.SubjectSetID([]string{"group:fan-club", "user:zed"}) || atOf(loc2) == atOf(loc1) {
+				t.Fatalf("zed at at2: %s", loc2)
+			}
+			if r = w.do("GET", loc1, zed, nil); r.status != 200 || childNames(r.body) != "matches.derby,matches.shared" {
+				t.Errorf("zed's grant at its gs of at1, kept again: %d %v", r.status, r.body)
+			}
+			if r = w.do("GET", strings.Replace(loc1, gsOf(loc1), gsOf(loc2), 1), zed, nil); r.status != 403 {
+				t.Errorf("zed's grant at at2's gs at at1: %d %v", r.status, r.body)
+			}
+		})
 	}
 }

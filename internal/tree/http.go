@@ -490,6 +490,16 @@ func (s *Service) keyAt(v *viewer, at string) {
 	}
 }
 
+// rekeyAs keys v, a subject set's reader by the grant in Authorization,
+// by its subjects in prof, the profile of the at a listing was computed
+// at (computed.prof): the checkpoint may have moved since keyAt, and a
+// redirect to that at names the grant's gs there (§B.11.5).
+func (s *Service) rekeyAs(v *viewer, prof Profile) {
+	if v.grant != nil && prof != nil {
+		s.rekey(v, prof.Subjects(v.grant))
+	}
+}
+
 // rekey keys v by subjects.
 func (s *Service) rekey(v *viewer, subjects []string) {
 	if gs := grantcheck.SubjectSetID(subjects); gs != v.gs {
@@ -944,6 +954,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			if info, key, err := s.keys.Current(ctx, cat); err == nil {
 				if l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key); err == nil && l.status == http.StatusOK {
 					to = l.at
+					s.rekeyAs(v, l.prof)
 				}
 			}
 		}
@@ -993,7 +1004,8 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		WriteError(w, l.status, code, l.msg)
 	case l.at != at:
 		// The checkpoint moved since the check: the listing is kept at
-		// the new one.
+		// the new one, and the redirect names the grant's gs there.
+		s.rekeyAs(v, l.prof)
 		setPtr()
 		redirect(w, canon(l.at))
 	default:
@@ -1036,6 +1048,18 @@ type computed struct {
 	msg    string
 	// noStore: the refusal holds only until the reader exchanges again.
 	noStore bool
+	// prof is the RoleView's profile at at (Profiler), the one recorded
+	// with it (recordAt), nil without one.
+	prof Profile
+}
+
+// refusePartial makes l the refusal of a subject set that leaves out
+// groups: no listing of one is computed, or kept, at an at where every
+// group is kept (§B.11.5).
+func refusePartial(l *computed) *computed {
+	l.status, l.code, l.noStore = http.StatusForbidden, "forbidden", true
+	l.msg = "the subject set leaves out groups that decide what this checkpoint shows: exchange the grants again"
+	return l
 }
 
 // listing computes the listing of op for v at the current at, sealed in a
@@ -1045,6 +1069,9 @@ type computed struct {
 // under: the URL and the reader's shape, since a namespace that turns
 // private moves no URL (viewer.shape).
 func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string, info derived.Info, key derived.Key) (*computed, error) {
+	if f := s.beforeListing.Load(); f != nil {
+		(*f)()
+	}
 	cat := s.opt.Catalog
 	keep := !perReader(op, v)
 	gen := s.kept.Generation(cat)
@@ -1062,10 +1089,26 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	// metadata, is sealed once and then served unchanged (§E.2.6).
 	sealed := info.Protected() || fs.seals()
 	if sealed && keep {
-		at := s.At()
+		// Kept again, it is recorded again with its at's checkpoints and
+		// profile, as one computed is, so a grant is still keyed as of
+		// its at, and a subject set judged there, while it is kept
+		// (§B.11.5; keyAt, profileAt, atIncludes), after a restart too.
+		var (
+			at   string
+			cps  map[string]string
+			prof Profile
+		)
+		s.View(func(g *Graph, curMap map[string]string) {
+			at, _ = s.combinedAt(g, curMap)
+			cps, prof = s.checkpointsOf(g, curMap), s.profileOf(g)
+		})
 		if st, ok := s.sealed.Get(ctx, keyOf(at)); ok {
+			if prof != nil && !prof.Admits(v.subjects) {
+				return refusePartial(&computed{at: at, prof: prof}), nil
+			}
 			st, _ = s.kept.Put(keyOf(at), cat, gen, true, st)
-			return &computed{st: st, at: at, status: http.StatusOK}, nil
+			s.recordAt(at, cps, prof)
+			return &computed{st: st, at: at, status: http.StatusOK, prof: prof}, nil
 		}
 	}
 	var (
@@ -1104,11 +1147,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			l.at, nss = s.combinedAt(g, curMap)
 			cps = s.checkpointsOf(g, curMap)
 			if prof = s.profileOf(g); prof != nil && !prof.Admits(v.subjects) {
-				// No listing of a subject set leaving out groups is
-				// computed, or kept, at an at where every group is kept
-				// (§B.11.5).
-				l.status, l.code, l.noStore = http.StatusForbidden, "forbidden", true
-				l.msg = "the subject set leaves out groups that decide what this checkpoint shows: exchange the grants again"
+				refusePartial(l)
 				return
 			}
 			view = derived.View{NS: cat, Target: canon(l.at)}
@@ -1258,7 +1297,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	for i := range pages {
 		pages[i].st, _ = s.kept.Put(pages[i].key, cat, gen, sealed, pages[i].st)
 	}
-	l.st = pages[0].st
+	l.st, l.prof = pages[0].st, prof
 	s.recordAt(l.at, cps, prof)
 	return l, nil
 }
