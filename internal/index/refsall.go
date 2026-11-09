@@ -814,7 +814,8 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		nss = append(nss, ns)
 	}
 	sort.Strings(nss)
-	if cps, err = refsMerge(cps, rd); err != nil {
+	before := func(ns, a, b string) bool { return ix.chainBefore(ctx, ns, a, b) }
+	if cps, err = refsMerge(cps, rd, before); err != nil {
 		return derived.Stored{}, "", false, err
 	}
 	at := combinedAt(cps)
@@ -1004,7 +1005,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		if now, err := ix.refsCheckpoints(ctx, ix.db, rd.nss); err == nil {
 			// A covered namespace's checkpoint moved meanwhile: the next
 			// answer retires these.
-			if merged, err := refsMerge(now, rd); err == nil {
+			if merged, err := refsMerge(now, rd, before); err == nil {
 				if err := ix.sealed.Retire(ctx, ix.db, scope, combinedAt(merged)); err != nil {
 					ix.opt.Logf("index: retiring sealed results of %s: %v", scope, err)
 				}
@@ -1023,8 +1024,10 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 // onlyBase), is left to the base's checkpoint where the answer has one
 // (the base itself, or another view's member): a namespace read at its
 // head is listed at it (§A.4 Answers, one ns_id per namespace), and the
-// branch's stands for its base.
-func refsMerge(cps map[string]string, rd *refsReader) (map[string]string, error) {
+// branch's stands for its base; a base that branches read only as of
+// different ats is listed at the earliest in its chain (§A.4 Answers;
+// before, the first by bytes), as before tells.
+func refsMerge(cps map[string]string, rd *refsReader, before func(ns, a, b string) bool) (map[string]string, error) {
 	if len(rd.covs) == 0 {
 		return cps, nil
 	}
@@ -1046,13 +1049,53 @@ func refsMerge(cps map[string]string, rd *refsReader) (map[string]string, error)
 			out[m] = id
 		}
 	}
+	// In a fixed order, so that ats no comparison tells apart give one
+	// answer.
 	slices.SortFunc(bases, func(a, b fsBase) int { return strings.Compare(a.ns+"\x00"+a.at, b.ns+"\x00"+b.at) })
+	earliest := map[string]string{}
 	for _, b := range bases {
-		if _, ok := out[b.ns]; !ok {
-			out[b.ns] = b.at
+		if _, ok := out[b.ns]; ok {
+			continue
+		}
+		if cur, ok := earliest[b.ns]; !ok || before(b.ns, b.at, cur) {
+			earliest[b.ns] = b.at
 		}
 	}
+	maps.Copy(out, earliest)
 	return out, nil
+}
+
+// chainBefore reports whether ns_id a comes before b in ns's chain (§A.4
+// Answers: a base "that branches read only as of different ats at the
+// earliest"), as grantcheck tells an at in a chain: ns's log up to b
+// after a is found only where a is in b's chain. What it tells is kept
+// (a chain never changes); a read that fails otherwise than with 404
+// tells nothing, and is logged: the answer lists the first by bytes.
+func (ix *Index) chainBefore(ctx context.Context, ns, a, b string) bool {
+	if a == b {
+		return false
+	}
+	k := ns + "\x00" + a + "\x00" + b
+	ix.fs.mu.Lock()
+	v, ok := ix.fs.order.Get(k)
+	ix.fs.mu.Unlock()
+	if ok {
+		return v
+	}
+	_, _, err := ix.c.NSLogPage(ctx, ns, b, a)
+	switch {
+	case err == nil:
+		v = true
+	case client.IsNotFound(err):
+		v = false
+	default:
+		ix.opt.Logf("index: whether %s comes before %s in %s's chain: %v", a, b, ns, err)
+		return false
+	}
+	ix.fs.mu.Lock()
+	ix.fs.order.Put(k, v, 1)
+	ix.fs.mu.Unlock()
+	return v
 }
 
 // queryer runs queries (a *sql.DB or *sql.Tx).

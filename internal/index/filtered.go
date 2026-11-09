@@ -238,6 +238,7 @@ type fstate struct {
 	cps     lru.Cache[string, *fcp]            // ns \0 at → checkpoint, for URLs at older ats
 	nodes   map[string]map[string]catNode      // catalog → its node documents last read
 	deleted lru.Cache[string, map[string]any]  // catalog \0 name \0 tombstone → last live document
+	order   lru.Cache[string, bool]            // ns \0 a \0 b → a comes before b in ns's chain (chainBefore)
 	flight  singleflight.Group
 	// gen counts the purges fsForget dropped a namespace's state for
 	// (fsGeneration), and purged holds the namespaces of the last ones,
@@ -268,7 +269,7 @@ const (
 
 func (st *fstate) init() {
 	st.docs.MaxEntries, st.live.MaxEntries, st.cats.MaxEntries = fsDocsMax, fsLiveMax, fsCatsMax
-	st.cps.MaxEntries, st.deleted.MaxEntries = fsCPsMax, fsDeletedMax
+	st.cps.MaxEntries, st.deleted.MaxEntries, st.order.MaxEntries = fsCPsMax, fsDeletedMax, fsDeletedMax
 	st.nodes = map[string]map[string]catNode{}
 }
 
