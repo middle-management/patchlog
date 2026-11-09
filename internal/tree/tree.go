@@ -208,6 +208,10 @@ type Service struct {
 	// beforeListing, if set, runs as a listing starts, outside the
 	// graph's lock (tests: a checkpoint that moves meanwhile).
 	beforeListing atomic.Pointer[func()]
+	// beforeJudge, if set, runs as a listing records what it judged
+	// (judgeEpochs), outside the graph's lock (tests: a head applied
+	// meanwhile).
+	beforeJudge atomic.Pointer[func()]
 	// verifyHook, if set, fails the verification of a grant in each
 	// namespace it returns an error for (tests: a requireAt chain the
 	// checker can't read).
@@ -1688,9 +1692,9 @@ func carryBornEpoch(old *Node, p prep) int {
 
 // judgement is what a listing judged of a node's pending epochs in an e2e
 // catalog (§E.2.6, §E.3.1), for the node's head and born as it read them:
-// epoch, the head's (0 none); bornEpoch, the born's on its own
-// (bornPending; 0 none); withHead, that the born, the head's revision
-// (bornWithHead), was sealed with the head's values, under its epoch.
+// epoch, the head's (0 none); bornEpoch, the born's (0 none), on its own
+// (bornPending) or, withHead, as the head's revision (bornWithHead),
+// sealed with the head's values under the head's epoch.
 type judgement struct {
 	head, born       string
 	epoch, bornEpoch int
@@ -1705,8 +1709,10 @@ type judgement struct {
 // judgement. The first writer wins, another listing of this service or
 // of another on its database; lost reports that one recorded first
 // differs from judged, so the listing must be computed again with it. A
-// node whose head or born moved on meanwhile records nothing: its
-// listing is of an at that is no longer the current one.
+// head's judgement is of that head: one that moved on meanwhile records
+// none, its listing being of an at that is no longer the current one. A
+// born's is of its revision, whatever the head: a head applied meanwhile
+// carries a pending born over (carryBornEpoch), which takes it.
 func (s *Service) judgeEpochs(ctx context.Context, judged map[string]*judgement) (lost bool, err error) {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
@@ -1718,8 +1724,8 @@ func (s *Service) judgeEpochs(ctx context.Context, judged map[string]*judgement)
 	}
 	defer tx.Rollback()
 	type stored struct {
-		epoch, born int
-		ok          bool
+		head, born       string
+		epoch, bornEpoch int
 	}
 	got := map[string]stored{}
 	for name, j := range judged {
@@ -1729,25 +1735,28 @@ func (s *Service) judgeEpochs(ctx context.Context, judged map[string]*judgement)
 				return false, err
 			}
 		}
-		if j.bornEpoch > 0 {
-			if _, err := tx.ExecContext(ctx, `UPDATE nodes SET born_epoch = ? WHERE name = ? AND head = ? AND self = 0 AND born = ? AND born_epoch = ?`,
-				j.bornEpoch, name, j.head, j.born, bornPending); err != nil {
+		// A born of the head's revision takes the head's judgement, this
+		// one or one recorded before.
+		if j.withHead {
+			if _, err := tx.ExecContext(ctx, `UPDATE nodes SET born_epoch = epoch WHERE name = ? AND head = ? AND self = 0 AND born_epoch = ? AND epoch > 0`,
+				name, j.head, bornWithHead); err != nil {
 				return false, err
 			}
 		}
-		// A born of the head's revision takes the head's judgement, this
-		// one or one recorded before.
-		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET born_epoch = epoch WHERE name = ? AND head = ? AND self = 0 AND born_epoch = ? AND epoch > 0`,
-			name, j.head, bornWithHead); err != nil {
-			return false, err
+		if j.bornEpoch > 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE nodes SET born_epoch = ? WHERE name = ? AND self = 0 AND born = ? AND born_epoch = ?`,
+				j.bornEpoch, name, j.born, bornPending); err != nil {
+				return false, err
+			}
 		}
-		var e, b sql.NullInt64
-		switch err := tx.QueryRowContext(ctx, `SELECT epoch, born_epoch FROM nodes WHERE name = ? AND head = ? AND self = 0`, name, j.head).Scan(&e, &b); {
+		var h, b sql.NullString
+		var e, be sql.NullInt64
+		switch err := tx.QueryRowContext(ctx, `SELECT head, born, epoch, born_epoch FROM nodes WHERE name = ? AND self = 0`, name).Scan(&h, &b, &e, &be); {
 		case errors.Is(err, sql.ErrNoRows):
 		case err != nil:
 			return false, err
 		default:
-			got[name] = stored{int(e.Int64), int(b.Int64), true}
+			got[name] = stored{h.String, b.String, int(e.Int64), int(be.Int64)}
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -1755,31 +1764,32 @@ func (s *Service) judgeEpochs(ctx context.Context, judged map[string]*judgement)
 	}
 	for name, j := range judged {
 		n := s.g.explicit[name]
-		if n == nil || n.Head != j.head || n.Born != j.born {
+		if n == nil {
 			continue
 		}
+		sameHead, sameBorn := n.Head == j.head, n.Born == j.born
 		st, ok := got[name]
-		if !ok {
+		if !ok || st.head != n.Head || st.born != n.Born {
 			// Not stored as this node (the graph holds what the table
 			// will): kept in the graph alone, as judged.
-			st = stored{epoch: n.Epoch, born: n.BornEpoch}
-			if st.epoch <= 0 && j.epoch > 0 {
+			st = stored{epoch: n.Epoch, bornEpoch: n.BornEpoch}
+			if sameHead && st.epoch <= 0 && j.epoch > 0 {
 				st.epoch = j.epoch
 			}
 			switch {
-			case st.born == bornPending && j.bornEpoch > 0:
-				st.born = j.bornEpoch
-			case st.born == bornWithHead && st.epoch > 0:
-				st.born = st.epoch
+			case st.bornEpoch == bornWithHead && sameHead && st.epoch > 0:
+				st.bornEpoch = st.epoch
+			case st.bornEpoch == bornPending && sameBorn && j.bornEpoch > 0:
+				st.bornEpoch = j.bornEpoch
 			}
 		}
-		if n.Epoch <= 0 && st.epoch > 0 {
+		if sameHead && n.Epoch <= 0 && st.epoch > 0 {
 			n.Epoch = st.epoch
 		}
-		if (n.BornEpoch == bornPending || n.BornEpoch == bornWithHead) && st.born > 0 {
-			n.BornEpoch = st.born
+		if sameBorn && (n.BornEpoch == bornPending || n.BornEpoch == bornWithHead) && st.bornEpoch > 0 {
+			n.BornEpoch = st.bornEpoch
 		}
-		if j.epoch > 0 && n.Epoch != j.epoch || j.bornEpoch > 0 && n.BornEpoch != j.bornEpoch {
+		if sameHead && j.epoch > 0 && n.Epoch > 0 && n.Epoch != j.epoch || sameBorn && j.bornEpoch > 0 && n.BornEpoch > 0 && n.BornEpoch != j.bornEpoch {
 			lost = true
 		}
 	}

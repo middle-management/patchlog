@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -340,5 +341,78 @@ func TestV077V04BackfillDropsUnjudged(t *testing.T) {
 	}
 	if e, b := v077Epochs(t, db, "n"); e != 1 || b != 1 {
 		t.Errorf("after the fill: n's epochs %d, %d stored, want 1 judged for both", e, b)
+	}
+}
+
+// §E.2.6, §E.3.1 (v0.77): a born is judged once, as its revision, whatever
+// the head. In a release preview of e2e catalog cat through its branch
+// catb, node n's born is cat's op, read through (pending), and its head
+// catb's own op. A listing judges the born under epoch 1, and a new head
+// of n is applied before the listing records it: the born's revision is
+// unchanged, so the judgement stands, and later listings keep it.
+// (Before, it was dropped with the head's, and the born left pending, to
+// be judged again, under whatever epoch is current then.)
+func TestV077V04BornJudgedAcrossHeads(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"encryption": map[string]any{"level": "e2e"}, "catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	svcJWK, svcPriv := must2(seal.GenerateRecipient())
+	wJWK, wPriv := must2(seal.GenerateRecipient())
+	both := []string{"cat", "catb"}
+	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "append", "config", "branch"},
+		map[string]any{"enc": wJWK})), client.WithKeys(client.NewKeys(wPriv)))
+	x2 := wr.E2E(wPriv)
+	must(x2.InitKeyring(ctx, "cat", svcPriv.PublicKey()))
+	must(x2.CreateDocSealed(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(x2.CreateDocSealed(ctx, "cat", "n", map[string]any{"title": "N", "parents": parents("root@a0")}))
+	must(wr.CreateBranch(ctx, "cat", client.BranchRequest{Name: "catb"}))
+	must(x2.InitKeyring(ctx, "catb", svcPriv.PublicKey()))
+	retitle := func(title string) {
+		h := must(wr.Head(ctx, "catb", "n"))
+		must(x2.AppendSealed(ctx, "catb", "n", h.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": title}}))
+	}
+	retitle("N1")
+
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"}, map[string]any{"enc": svcJWK})),
+		client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey()))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	preview := func(o *tree.Options) { o.Recipient = svcPriv; o.Branches = map[string]string{"cat": "catb"} }
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db}, preview)
+	reached := func() {
+		t.Helper()
+		waitFor(t, "the preview to reach catb", func() bool {
+			h, err := wr.NSHead(ctx, "catb")
+			return err == nil && x.s.Checkpoint("cat") == h.ID
+		})
+	}
+	reached()
+	if e, b := v077Epochs(t, db, "n"); e != 1 || b >= 0 {
+		t.Fatalf("n's epochs %d, %d before any listing, want 1 (its head's own op) and its born pending", e, b)
+	}
+	var once sync.Once
+	x.s.BeforeJudge(func() {
+		once.Do(func() {
+			retitle("N2")
+			reached()
+		})
+	})
+	rd := k.Grant(t, s.Now(), "user:r", both, []string{"read"})
+	if r := x.listingAs("/cat/children?of=root", rd); r.status != http.StatusOK {
+		t.Fatalf("children: %d %v", r.status, r.body)
+	}
+	x.s.BeforeJudge(nil)
+	if _, b := v077Epochs(t, db, "n"); b != 1 {
+		t.Errorf("n's born epoch %d once listed, want 1 recorded though its head moved on", b)
+	}
+	retitle("N3")
+	reached()
+	if r := x.listingAs("/cat/children?of=root", rd); r.status != http.StatusOK {
+		t.Fatalf("children: %d %v", r.status, r.body)
+	}
+	if _, b := v077Epochs(t, db, "n"); b != 1 {
+		t.Errorf("n's born epoch %d after another listing, want 1, judged once", b)
 	}
 }

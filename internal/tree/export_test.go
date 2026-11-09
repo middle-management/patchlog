@@ -67,3 +67,14 @@ func (s *Service) FailVerify(f func(ns string) error) {
 	}
 	s.verifyHook.Store(&f)
 }
+
+// BeforeJudge sets f to run as a listing records the epochs it judged,
+// outside the graph's lock (tests: a head applied meanwhile); nil unsets
+// it.
+func (s *Service) BeforeJudge(f func()) {
+	if f == nil {
+		s.beforeJudge.Store(nil)
+		return
+	}
+	s.beforeJudge.Store(&f)
+}

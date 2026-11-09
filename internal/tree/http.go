@@ -1307,8 +1307,14 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 						switch e := n.BornEpoch; {
 						case e == bornWithHead && e3:
 							// Its revision is the head's: sealed with
-							// the head's values, under its judgement.
-							judge(n).withHead = true
+							// the head's values, under its judgement,
+							// which the born keeps should the head move
+							// on before it is recorded. Not judged while
+							// the head isn't (epochsPending).
+							if n.Epoch > 0 || !s.epochsPending {
+								j := judge(n)
+								j.withHead, j.bornEpoch = true, peekEpoch(n.Name)
+							}
 							return 0
 						case e == bornPending && e3:
 							// Judged now, as the epoch in force.
@@ -1362,6 +1368,9 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		if l.status == http.StatusOK && len(missing) == 0 && serr == nil && len(judged) > 0 {
 			// Recorded before the listing is stored or served; one that
 			// lost to another's computes it again (§E.2.6).
+			if f := s.beforeJudge.Load(); f != nil {
+				(*f)()
+			}
 			lost, err := s.judgeEpochs(ctx, judged)
 			if err != nil {
 				return nil, err
