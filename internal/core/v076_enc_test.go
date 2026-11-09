@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -62,29 +63,43 @@ func TestV076EncChainReadable(t *testing.T) {
 	}
 }
 
-// §G.5.2 E3 sources (v0.76): a sealing of A's that B can't open is kept on
-// its shape alone: a compact JWE whose kid and pl are the ones A serves
-// that content under.
+// §G.5.2 E3 sources (v0.77): B keeps a sealing of A's only once it opens,
+// under the key of the epoch its kid names, as one under that kid for that
+// content, to the content B mirrored; a JWE of the right shape that B
+// can't open, or that opens to other content, is never kept (before v0.77
+// one B had no key for was kept on its shape alone).
 func TestV076EncPreSealingShape(t *testing.T) {
 	t.Parallel()
-	pl := seal.ResourcePL("m", "x", "1abc", seal.KindDoc)
-	jwe, err := seal.Seal(seal.NewKey(), "m#1", pl, []byte(`{"v":1}`))
+	k := seal.NewKey()
+	kr, err := seal.ResourceKey(k, "m", "x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !preSealingShape(jwe, "m#1", pl) {
+	pl := seal.ResourcePL("m", "x", "1abc", seal.KindDoc)
+	doc := map[string]any{"v": 1.0}
+	jwe, err := seal.Seal(kr, "m#1", pl, jsonv.Canonical(jsonv.FromGo(doc)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := contentDigest(jsonv.FromGo(doc))
+	if !openPreSealing(jwe, kr, "m#1", pl, want) {
 		t.Fatal("A's JWE under m#1 for the content: refused")
 	}
+	other, _ := seal.ResourceKey(seal.NewKey(), "m", "x")
 	for what, c := range map[string]struct {
 		jwe, kid string
+		kr       []byte
 		pl       seal.PL
+		want     [32]byte
 	}{
-		"another epoch":   {jwe, "m#2", pl},
-		"another content": {jwe, "m#1", seal.ResourcePL("m", "y", "1abc", seal.KindDoc)},
-		"not a JWE":       {"not.a.jwe", "m#1", pl},
-		"JSON":            {`{"v":1}`, "m#1", pl},
+		"a key that doesn't open it": {jwe, "m#1", other, pl, want},
+		"another epoch":              {jwe, "m#2", kr, pl, want},
+		"another content":            {jwe, "m#1", kr, seal.ResourcePL("m", "y", "1abc", seal.KindDoc), want},
+		"another document":           {jwe, "m#1", kr, pl, contentDigest(jsonv.FromGo(map[string]any{"v": 2.0}))},
+		"not a JWE":                  {"not.a.jwe", "m#1", kr, pl, want},
+		"JSON":                       {`{"v":1}`, "m#1", kr, pl, want},
 	} {
-		if preSealingShape(c.jwe, c.kid, c.pl) {
+		if openPreSealing(c.jwe, c.kr, c.kid, c.pl, c.want) {
 			t.Errorf("%s: accepted", what)
 		}
 	}

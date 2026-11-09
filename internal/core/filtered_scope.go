@@ -51,8 +51,9 @@ type fscope struct {
 	// chain are a branch's bases, from its own base up to root, each with
 	// the ns_log seq its branch reads it at (baseAt).
 	chain []fsBase
-	// cats are the catalogs root trusts, sorted by name, e2e ones
-	// included (they make nothing visible); for catalog kind, n itself.
+	// cats are the catalogs root trusts, sorted by name, dark ones (e2e
+	// or purged) included: they keep root covered but make nothing
+	// visible (§B.11.9 Where); for catalog kind, n itself.
 	cats []fsCat
 }
 
@@ -71,19 +72,26 @@ type fsCat struct {
 	kids []string
 }
 
+// dark reports whether c makes nothing visible: e2e, which the origin
+// can't read, or purged (§B.11.9 Where). A dark catalog still covers the
+// namespaces it trusts, but no checkpoint lists it (filteredCurrent).
+func (c fsCat) dark() bool { return c.e2e || c.n.purged }
+
 // filteredScope is n's coverage by §B.11.9, nil if it isn't covered:
 //
 //   - content kind: a local namespace, not a shadow or a remote branch,
 //     neither public nor sealed nor e2e (nsLevel below sealed), that
 //     trusts some catalog through a requireAt key (catvis.TrustedCatalogs
-//     over its current document and those of its local, unpurged
-//     catalogs);
+//     over its current document and those of its local catalogs, a
+//     purged one's last stored document included: an e2e or purged
+//     catalog keeps it covered and makes nothing visible, §B.11.9 Where);
 //   - branch kind: a local branch of such a namespace, recursively, itself
 //     neither public nor sealed; the root's trust and keys are read from
 //     its document as of the seq the chain fixes (its baseAt), and the
 //     branch stays covered only while the root, at its head, still trusts
 //     each of those catalogs that isn't e2e through every key counted
-//     there, each entry unchanged (fsHeadTrusts, §B.11.9 Branches, §C.4);
+//     there, each entry unchanged (fsHeadTrusts, §B.11.9 Branches, §C.4),
+//     dark catalogs (e2e or purged) excepted;
 //   - catalog kind: a catalog, neither public nor sealed, that some local
 //     namespace of its catalog.trust trusts as content kind.
 //
@@ -157,12 +165,16 @@ func (t *tx) fsLocal(name string) *nsRow {
 }
 
 // fsTrust are the catalogs root trusts with document doc, read from their
-// current documents: local, unpurged namespaces only (catvis.TrustedCatalogs).
+// current documents: local namespaces only (catvis.TrustedCatalogs). A
+// purged catalog is read from its last stored document, which the purge
+// keeps, and is dark like an e2e one: it still covers root, its
+// catalog.trust still deciding, but makes nothing visible (§B.11.9 Where:
+// "an end-to-end catalog ... or a purged one, makes nothing visible").
 func (t *tx) fsTrust(root *nsRow, doc map[string]any) []fsCat {
 	rows := map[string]*nsRow{}
 	trusts := catvis.TrustedCatalogs(root.name, doc, func(cat string) map[string]any {
 		c := t.fsLocal(cat)
-		if c == nil || c.purged {
+		if c == nil {
 			return nil
 		}
 		rows[cat] = c
@@ -178,7 +190,8 @@ func (t *tx) fsTrust(root *nsRow, doc map[string]any) []fsCat {
 
 // fsHeadTrusts reports whether root, at its head, still trusts every
 // catalog of cats (read from its document as of a branch's baseAt,
-// baseDoc) that isn't e2e, through every key counted there, each entry
+// baseDoc) that isn't dark (e2e or purged, which make nothing visible
+// whatever root trusts), through every key counted there, each entry
 // unchanged: root's current document names the catalog in catalogs, the
 // catalog's current catalog.trust lists root (fsTrust), and for each kid
 // counted at baseAt the head document has the same key entry, byte for
@@ -197,7 +210,7 @@ func (t *tx) fsHeadTrusts(root *nsRow, cats []fsCat, baseDoc map[string]any) boo
 		}
 	}
 	for _, c := range cats {
-		if c.e2e {
+		if c.dark() {
 			continue
 		}
 		for _, kid := range c.kids {

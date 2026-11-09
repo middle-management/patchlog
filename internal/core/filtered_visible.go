@@ -72,7 +72,8 @@ func (t *tx) newFview(fs *fscope, cp *fcp, gs string, subjects []string, filter 
 //     its namespace as of cp, never one that doesn't exist or is
 //     tombstoned. A purged node, whose documents are gone, is hidden.
 //
-// e2e catalogs aren't in the view: they make nothing visible.
+// Dark catalogs, e2e or purged, aren't in the view (fcp.cats): they make
+// nothing visible (§B.11.9 Where).
 func (fv *fview) visible(t *tx, name string) bool {
 	fv.mu.Lock()
 	v, ok := fv.memo[name]

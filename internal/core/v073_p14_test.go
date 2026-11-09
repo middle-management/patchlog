@@ -14,8 +14,8 @@ import (
 // §G.5.2).
 
 // A failed fetch from the base at creation: what A answers is a base B
-// can't read (422), but for its 410s; only no answer, or a 5xx, is 502
-// upstream (§G.3, §12.1).
+// can't read (422), but for its 410s; only no answer, or a 5xx, 408 or
+// 429 (transient, v0.77), is 502 upstream (§G.3, §12.1, §A.4).
 func TestV073FetchErr(t *testing.T) {
 	t.Parallel()
 	api := func(status int, code string) error {
@@ -29,7 +29,8 @@ func TestV073FetchErr(t *testing.T) {
 		{api(401, "unauthenticated"), 422, "invalid"},
 		{api(403, "forbidden"), 422, "invalid"},
 		{api(404, "not_found"), 422, "invalid"},
-		{api(429, "rate"), 422, "invalid"},
+		{api(408, ""), 502, "upstream"},
+		{api(429, "rate"), 502, "upstream"},
 		{api(410, "pruned"), 410, "pruned"},
 		{api(410, "gone"), 410, "gone"},
 		{api(500, ""), 502, "upstream"},

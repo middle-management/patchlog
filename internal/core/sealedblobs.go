@@ -341,10 +341,12 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 		}
 		if sm.isShadow() {
 			// A remote branch's shadow serves only its source's own
-			// sealing of a blob from before the raise, stored at creation
-			// (storePreSealings), and never seals one itself: 502
-			// upstream, as for a failed fetch (§G.5.2 E3 sources, §G.3).
-			return t.preRaiseUnfetched(sm, "the blob "+bid.String()+" of "+name+" under epoch "+epochText)
+			// sealing of a blob from before the raise, stored once opened
+			// and verified (storePreSealings, retryPreSealings), and never
+			// seals one itself: 502 upstream, as for a failed fetch, or
+			// 410 pruned where its source answered that (§G.5.2 E3
+			// sources, §G.3).
+			return t.preRaiseUnfetched(sm, pendBlob, name, bid.String(), "the blob "+bid.String()+" of "+name+" under epoch "+epochText)
 		}
 		kns := t.kidName(sm)
 		k, err := seal.ResourceKey(t.epochKey(sm.id, ep), kns, name)
