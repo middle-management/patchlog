@@ -225,6 +225,111 @@ func TestV076OriginBranchBaseKeyRemoved(t *testing.T) {
 	}
 }
 
+// §B.11.9 URLs, §A.4 Answers: a branch's filtered at lists its root, a
+// catalog.trust member read at its head, at its head, while item 1 still
+// reads the root's roles as of the branch's baseAt; the at round-trips;
+// an at recorded with the root at baseAt instead isn't answered (302).
+func TestV076OriginBranchAtLayout(t *testing.T) {
+	t.Parallel()
+	w := newV75World(t, v75Opts{})
+	w.seed()
+	ctx := context.Background()
+	w.put("matches", "final", map[string]any{"title": "final"})
+	w.put("cat-season", "matches.final", map[string]any{"parents": v75Parents("season")})
+	if _, err := w.e.CreateBranch(ctx, Request{NS: "matches", Cred: w.admin}, BranchRequest{Name: "matches-r7", IfNoneMatch: true}); err != nil {
+		t.Fatal(err)
+	}
+	var baseAtID string
+	w.inTx(func(t2 *tx) { baseAtID = t2.nsLogID(t2.nsByName("matches-r7").baseAt.Int64).String() })
+	// matches moves past the branch's baseAt: reader no longer reads final
+	// there, at its head.
+	w.patchConfig("matches", map[string]any{"op": "add", "path": "/roles/reader/rules",
+		"value": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/resource", "value": "final"}}}})
+	head := w.head("matches")
+	if head == baseAtID {
+		t.Fatal("matches didn't move")
+	}
+	li := w.li(map[string]any{"ns": []any{"matches-r7"}})
+	red, st := v76fRedirect(t, w, "matches-r7", "", li)
+	if red == nil {
+		t.Fatalf("li on matches-r7: %d", st)
+	}
+	if got := red.CP.nsID("matches"); got != head {
+		t.Fatalf("matches listed at %s, want its head %s (baseAt %s)", got, head, baseAtID)
+	}
+	if got := red.CP.nsID("cat-season"); got != w.head("cat-season") || red.CP.nsID("matches-r7") != w.head("matches-r7") {
+		t.Fatalf("at %v", red.CP.ids)
+	}
+	// Visibility in the branch: matches's trust, keys and roles as of
+	// baseAt, so final stays visible.
+	names, st := v76fHeads(t, w, "matches-r7", red.GS, red.At, li)
+	if st != 0 || !v76fHas(names, "final") || !v76fHas(names, "derby") || v76fHas(names, "opener") {
+		t.Fatalf("heads at the current at: %v %d", names, st)
+	}
+	// A catalog write: a new at; the recorded one still answers.
+	w.put("cat-season", "matches.shared", map[string]any{"parents": v75Parents("root")})
+	red2, _ := v76fRedirect(t, w, "matches-r7", red.GS, li)
+	if red2 == nil || red2.At == red.At {
+		t.Fatalf("after a catalog write: %+v", red2)
+	}
+	if names, st := v76fHeads(t, w, "matches-r7", red.GS, red.At, li); st != 0 || !v76fHas(names, "final") {
+		t.Fatalf("heads at the recorded at: %v %d", names, st)
+	}
+	// An at recorded before v0.76, matches at baseAt, still computes the
+	// same answer, as visibility reads matches at baseAt either way: it
+	// is answered (§B.11.9 URLs, "wherever the origin can compute that
+	// exact answer again").
+	old := &fcp{ids: map[string]string{}}
+	for k, v := range red.CP.ids {
+		old.ids[k] = v
+	}
+	old.ids["matches"] = baseAtID
+	old.at = grantcheck.CombinedAt(old.ids)
+	if err := w.e.recordFilteredAt(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if names, st := v76fHeads(t, w, "matches-r7", red.GS, old.at, li); st != 0 || !v76fHas(names, "final") {
+		t.Fatalf("an at recorded before v0.76: %v %d", names, st)
+	}
+	// A base read only as a base stays at its baseAt: a branch of the
+	// branch lists matches-r7 so.
+	if _, err := w.e.CreateBranch(ctx, Request{NS: "matches-r7", Cred: w.admin}, BranchRequest{Name: "matches-r7a", IfNoneMatch: true}); err != nil {
+		t.Fatal(err)
+	}
+	w.put("matches-r7", "shared", map[string]any{"title": "moved"})
+	var moved *fcp
+	w.inTx(func(t2 *tx) {
+		b, r7 := t2.nsByName("matches-r7a"), t2.nsByName("matches-r7")
+		fs := t2.filteredScope(b)
+		if fs == nil {
+			t.Fatal("matches-r7a not covered")
+		}
+		cp := t2.filteredCurrent(fs)
+		if cp.seqs["matches-r7"] != b.baseAt.Int64 || cp.seqs["matches-r7"] == r7.headSeq.Int64 || cp.nsID("matches") != head {
+			t.Fatalf("matches-r7a's at: %v", cp.ids)
+		}
+		if got, ok := t2.filteredAt(fs, cp.at); !ok || got.readSeq("matches") != fs.chain[1].at || got.readSeq("matches-r7") != b.baseAt.Int64 {
+			t.Fatalf("matches-r7a's at doesn't resolve: %v", ok)
+		}
+		// One listing matches-r7, read only as a base, elsewhere isn't
+		// answered.
+		ids := map[string]string{}
+		for k, v := range cp.ids {
+			ids[k] = v
+		}
+		ids["matches-r7"] = t2.nsLogID(r7.headSeq.Int64).String()
+		moved = &fcp{ids: ids, at: grantcheck.CombinedAt(ids)}
+	})
+	if err := w.e.recordFilteredAt(ctx, moved); err != nil {
+		t.Fatal(err)
+	}
+	w.inTx(func(t2 *tx) {
+		if _, ok := t2.filteredAt(t2.filteredScope(t2.nsByName("matches-r7a")), moved.at); ok {
+			t.Fatal("an at listing a base read only as a base past its baseAt resolved")
+		}
+	})
+}
+
 // §B.11.9 gs, §C.4: a stored subject set is bound to its key's pub: a
 // cookie is 403 once matches replaces that kid's pub, keeping its scope
 // and roles, until the reader exchanges again; an empty stored pub is 403
