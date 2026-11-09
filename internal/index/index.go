@@ -237,6 +237,9 @@ type Index struct {
 	// testRefsRead, if set, is called once a /_refs answer's transaction
 	// has read its hits (tests: refsCompute).
 	testRefsRead func()
+	// testAnswerRead, if set, is called once a query's answer has read
+	// its rows, before it is built and kept (tests: answer).
+	testAnswerRead func()
 	// testMemberBootstrap, if set, is called before a member's follower
 	// gives it its first checkpoint (tests: bootstrapMember).
 	testMemberBootstrap func(ctx context.Context, m string)

@@ -494,3 +494,84 @@ func TestV077RefsBaseEarliest(t *testing.T) {
 		t.Errorf("namespaces %v, want matches-r7 at %s (r7a's), not %s (r7b's)", ns, x, y)
 	}
 }
+
+// TestV077PurgeBeforeServe (FSVC-9; §A.1: a purge drops kept results,
+// "serving or keeping none computed from what was read before it";
+// scenario 117): a result computed at its at from rows read before derby's
+// purge commits is neither served nor kept: the request is redirected to
+// the at after the purge, whose answer doesn't show derby, and the old at
+// URL is redirected too. Before v0.77 that page was served once.
+func TestV077PurgeBeforeServe(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := newV75X(t, false)
+	whole := w.k.Grant(t, w.s.Now(), "user:whole", []string{"matches"}, []string{"read"})
+	_, gs, at := w.pointer("/matches?q=shared", whole)
+	var once atomic.Bool
+	w.x.ix.OnAnswerRead(func() {
+		if once.CompareAndSwap(false, true) {
+			must(w.admin.Purge(ctx, "matches", "derby", must(w.admin.Head(ctx, "matches", "derby")).ID, false))
+			w.x.caughtUp("matches")
+		}
+	})
+	old := "/matches/g/" + gs + "/at/" + at + "?q=derby"
+	r := w.x.raw(old, whole)
+	if !once.Load() {
+		t.Fatal("the answer was never computed")
+	}
+	if r.status == 200 {
+		t.Fatalf("GET %s: served the page read before the purge: %v", old, r.body)
+	}
+	if r.status != 302 || strings.Contains(r.header.Get("Location"), "/at/"+at+"?") {
+		t.Errorf("GET %s: %d %q, want a redirect to the at after the purge", old, r.status, r.header.Get("Location"))
+	}
+	if b := w.x.search(r.header.Get("Location"), whole); len(resources(b)) != 0 {
+		t.Errorf("after the purge: %v", b)
+	}
+	if r := w.x.raw(old, whole); r.status != 302 {
+		t.Errorf("GET %s again: %d %v, want a redirect: nothing kept there", old, r.status, r.body)
+	}
+}
+
+// TestV077RefsPurgeBeforeServe (FSVC-9 at /_refs; scenario 117): li's
+// /_refs answer, read before matches.derby's placement in cat-season is
+// purged, is computed again with her views after the purge, never served
+// as read: it shows shared alone. Before v0.77 it was retried with the
+// views read before the purge, and served on the last try.
+func TestV077RefsPurgeBeforeServe(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := newV75X(t, false)
+	li := w.reader("user:li", []any{"fans"})
+	refs := "/_refs?to=" + url.QueryEscape("/r/target/x")
+	if got := refsAllHits(w.x.follow(refs, li).body); got != "matches/derby matches/shared" {
+		t.Fatalf("before the purge: %s", got)
+	}
+	// The at URL of another query, whose answer isn't kept: computed and
+	// served at once, were it not for the purge.
+	p := w.x.raw(refs, li)
+	loc := p.header.Get("Location")
+	if p.status != 302 {
+		t.Fatalf("pointer: %d %v", p.status, p.body)
+	}
+	at := strings.SplitN(loc, "?", 2)[0] + "?limit=7&to=" + url.QueryEscape("/r/target/x")
+	var once atomic.Bool
+	w.x.ix.OnRefsRead(func() {
+		if once.CompareAndSwap(false, true) {
+			must(w.admin.Purge(ctx, "cat-season", "matches.derby", must(w.admin.Head(ctx, "cat-season", "matches.derby")).ID, false))
+			waitFor(t, "the purge in cat-season to be applied", func() bool {
+				return w.x.ix.Members()["cat-season"] == w.head("cat-season")
+			})
+		}
+	})
+	r := w.x.raw(at, li)
+	if !once.Load() {
+		t.Fatalf("the answer was never computed: %d %v", r.status, r.body)
+	}
+	if r.status == 200 && refsAllHits(r.body) != "matches/shared" {
+		t.Fatalf("GET %s: served the answer read before the purge: %v", at, r.body)
+	}
+	if r = w.x.follow(at, li); r.status != 200 || refsAllHits(r.body) != "matches/shared" {
+		t.Errorf("after the purge: %d %v", r.status, r.body)
+	}
+}

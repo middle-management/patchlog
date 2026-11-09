@@ -20,6 +20,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -556,6 +557,10 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 			ix.writeCoverErr(w, "_refs", err)
 			return
 		}
+		if errors.Is(err, errPurgedSince) {
+			writeBehind(w, "the index is applying purges of a namespace asked: try again")
+			return
+		}
 		ix.opt.Logf("index: query %s: %v", r.URL, err)
 		writeErr(w, http.StatusInternalServerError, "internal", "query failed")
 		return
@@ -749,7 +754,10 @@ func (ix *Index) refsStored(ctx context.Context, rd *refsReader, url string) (de
 // refsAnswer computes the answer at the current combined checkpoint, keeps
 // it, and returns it with that checkpoint and whether it is bound to its
 // URL. An answer read before a purge of what it shows, which is then not
-// kept, is computed again.
+// kept, is never served (§A.1): it is computed again, the views of the
+// namespaces §B.11.9 covers first (recover), which read what the purge
+// may have changed; one that keeps losing to purges is errPurgedSince
+// (503 behind).
 //
 // A partial reader's view of a namespace §B.11.9 covers is computed at
 // its checkpoint: where an apply moved it meanwhile, the views are
@@ -779,8 +787,15 @@ func (ix *Index) refsAnswer(ctx context.Context, rd *refsReader, rq *refsQuery, 
 				gen = min(gen, a.cov.cp.gens.refs)
 			}
 		}
-		if st, ok := ix.refs.Put(target(at), refsScope, gen, bound, st); ok || try == 2 {
+		st, o := ix.refs.PutOutcome(target(at), refsScope, gen, bound, st)
+		switch {
+		case o != kept.PurgedSince:
 			return st, at, bound, nil
+		case try == 2:
+			return derived.Stored{}, "", false, errPurgedSince
+		}
+		if err := ix.recover(ctx, rd, true); err != nil {
+			return derived.Stored{}, "", false, err
 		}
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/svcedge"
@@ -604,7 +605,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 				}
 				if _, got, err := ix.answer(ctx, a, ns, rv, rq, info); err == nil {
 					to = got
-				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) && !errors.Is(err, errLackCounts) {
+				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) && !errors.Is(err, errLackCounts) && !errors.Is(err, errPurgedSince) {
 					ix.opt.Logf("index: query %s: %v", r.URL, err)
 				}
 			}
@@ -630,12 +631,21 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	if info.Protected() {
 		gen := ix.kept.Generation(ns)
 		if st, ok := ix.sealed.Get(ctx, target(at)); ok {
-			st, _ = ix.kept.Put(target(at), ns, gen, true, st)
-			ix.writeStored(w, r, a, at, st)
-			return
+			// One a purge dropped since it was read is computed again
+			// below (§A.1).
+			if st, o := ix.kept.PutOutcome(target(at), ns, gen, true, st); o != kept.PurgedSince {
+				ix.writeStored(w, r, a, at, st)
+				return
+			}
 		}
 	}
 	st, got, err := ix.answer(ctx, a, ns, vals, q, info)
+	if errors.Is(err, errPurgedSince) {
+		// Never the bytes computed before the purge: the current at,
+		// computed again after it (its views too), redirected to.
+		ix.afterPurge(w, r, a, ns, vals, q, info, targetOf)
+		return
+	}
 	var fe *FieldError
 	switch {
 	case errors.As(err, &fe):
@@ -674,6 +684,58 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		return
 	}
 	ix.writeStored(w, r, a, at, st)
+}
+
+// afterPurge answers a query whose result at its at was computed before a
+// purge (errPurgedSince): the result is computed again at the committed
+// checkpoint after it, a partial reader's view too, up to twice more, and
+// the query redirected there, an opaque after dropped as for any other at
+// (§A.4); one that keeps losing to purges is 503 behind. Nothing computed
+// before the purge is served (§A.1).
+func (ix *Index) afterPurge(w http.ResponseWriter, r *http.Request, a *access, ns string, vals url.Values, q *Query, info derived.Info, targetOf func(url.Values, string) string) {
+	ctx := r.Context()
+	rv := vals
+	if !q.ByName() && vals.Has("after") {
+		rv = maps.Clone(vals)
+		delete(rv, "after")
+	}
+	for range 2 {
+		if a.cov != nil {
+			a.cov = nil
+			if err := ix.cover(ctx, a, ns, ""); err != nil {
+				ix.writeCoverErr(w, ns, err)
+				return
+			}
+		}
+		// Parsed afresh: a Query keeps what a read transaction made of
+		// it (its tokens), which another one doesn't hold.
+		rq, err := ParseQuery(rv)
+		if err != nil {
+			writeQueryErr(w, err)
+			return
+		}
+		_, got, err := ix.answer(ctx, a, ns, rv, rq, info)
+		if errors.Is(err, errPurgedSince) {
+			continue
+		}
+		if err != nil {
+			ix.opt.Logf("index: query %s after a purge: %v", r.URL, err)
+			writeBehind(w, "the index is applying a purge of the namespace: try again")
+			return
+		}
+		w.Header().Set("Cache-Control", ccPrivatePtr)
+		if a.public {
+			w.Header().Set("Cache-Control", ccHeadPointer)
+			w.Header().Set("Cache-Tag", "ns:"+ns)
+		} else {
+			w.Header().Set("CDN-Cache-Control", "no-store")
+			w.Header().Set("Surrogate-Control", "no-store")
+			w.Header().Add("Vary", "Authorization")
+		}
+		redirect(w, targetOf(rv, got))
+		return
+	}
+	writeBehind(w, "the index is applying purges of the namespace: try again")
 }
 
 // errMoving is a namespace whose checkpoint moved each time a partial
@@ -909,7 +971,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	if !a.all {
 		allow = a.allow
 	}
-	gen := ix.kept.Generation(ns)
+	gen, sgen := ix.kept.Generation(ns), ix.sealed.Generation()
 	q.epochs = info.Protected()
 	res, at, err := ix.query(ctx, ns, q, allow)
 	if err != nil {
@@ -926,7 +988,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 				// The view read other namespaces before gen was taken
 				// (serve's cover): kept only if no purge since carried
 				// its tags (fcp.gens).
-				gen = min(gen, g.kept)
+				gen, sgen = min(gen, g.kept), min(sgen, g.sealed)
 			}
 			break
 		}
@@ -1065,8 +1127,13 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		// The reader went away: keep nothing built meanwhile.
 		return derived.Stored{}, "", err
 	}
+	if ix.testAnswerRead != nil {
+		ix.testAnswerRead()
+	}
 	if info.Protected() {
-		if st, err = ix.sealed.Put(ctx, view.Target, ns, at, st); err != nil {
+		// Not stored if a purge since sgen carried one of its tags
+		// (§A.1); then not kept either, below.
+		if st, err = ix.sealed.PutSince(ctx, view.Target, ns, at, sgen, st); err != nil {
 			ix.opt.Logf("index: storing a sealed result: %v", err)
 		}
 		if now, _, err := ix.committed(ctx, ns); err == nil && now != at {
@@ -1077,9 +1144,22 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 			}
 		}
 	}
-	st, _ = ix.kept.Put(view.Target, ns, gen, info.Protected(), st)
+	st, o := ix.kept.PutOutcome(view.Target, ns, gen, info.Protected(), st)
+	if o == kept.PurgedSince {
+		// Computed from what was read before a purge: neither kept nor
+		// served (§A.1, scenario 117).
+		return derived.Stored{}, "", errPurgedSince
+	}
 	return st, at, nil
 }
+
+// errPurgedSince is a result computed from what was read before a purge
+// that carried one of its tags (kept.PurgedSince): it is never served
+// (§A.1: "serving or keeping none computed from what was read before
+// it"). The query is computed again at the checkpoint after the purge,
+// and redirected to, or, where that keeps losing to purges, answered 503
+// behind.
+var errPurgedSince = errors.New("the result was computed before a purge of what it shows")
 
 // setResultHeaders sets a result's headers: a private one gets edge
 // lifetimes only for a read the verifying edge verified (§9).
