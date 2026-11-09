@@ -93,44 +93,10 @@ func foldWrites(start docState, steps []client.Step, countCopyFrom bool) (*sideC
 	return sc, nil
 }
 
-// widen applies the array rule to w if its last segment addresses an
-// array element in either document.
+// widen applies the array rule of §F.3 to w, judged in the document
+// before the op and after it (pointer.WidenArray, which undo shares).
 func widen(pre, post any, w pointer.Pointer) pointer.Pointer {
-	if a := arrayRule(pre, w); len(a) < len(w) {
-		return a
-	}
-	return arrayRule(post, w)
-}
-
-// arrayRule widens a write whose last segment addresses an array element
-// in doc (an index or "-", so its parent is an array there) to the whole
-// outermost array holding it (§F.3): the shortest proper prefix of w whose
-// value in doc is an array. /a/0/b/1, with a and a[0].b arrays, is a write
-// to /a. A write whose last segment is an object key inside an element
-// (/a/0/k), even one named "-", is not widened. An add that appends with
-// "-" has an array parent in the document before it (widen checks both).
-func arrayRule(doc any, w pointer.Pointer) pointer.Pointer {
-	if len(w) == 0 {
-		return w
-	}
-	parent := w[:len(w)-1]
-	if !isArray(doc, parent) {
-		return w
-	}
-	for i := range len(parent) {
-		if isArray(doc, w[:i]) {
-			return append(pointer.Pointer{}, w[:i]...)
-		}
-	}
-	// The parent itself: the outermost array.
-	return append(pointer.Pointer{}, parent...)
-}
-
-// isArray reports whether p's value in doc is an array.
-func isArray(doc any, p pointer.Pointer) bool {
-	v, ok := pointer.Get(doc, p)
-	_, arr := v.([]any)
-	return ok && arr
+	return pointer.WidenArray(pre, post, w)
 }
 
 func dedupe(ws []pointer.Pointer) []pointer.Pointer {

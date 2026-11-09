@@ -29,9 +29,11 @@ package client
 //     starts at a pruning horizon is impossible (UndoResources).
 //   - The inverse. For each resource, the gesture's own entries, newest
 //     first, become steps of one batch item (§7.5): a revision the patch
-//     set that sets the paths it wrote (§6.4.1, widened to the whole array
-//     when the last segment addresses an array element, as merges do,
-//     §F.3) back to its parent's values; a revision made only of moves
+//     set that sets the paths it wrote (§6.4.1, widened as in §F.3: a
+//     write whose last segment indexes an array, judged before or after
+//     its op, counts as one to the whole outermost array holding it, while
+//     an object member named "-" stays as written; pointer.WidenArray,
+//     which merges share) back to its parent's values; a revision made only of moves
 //     whose ends are unchanged since is inverted by moves back instead; a
 //     tombstone a restore with []; a restore the inverse of its patches,
 //     then "delete"; a genesis "delete". Consecutive patch sets are joined
@@ -41,11 +43,12 @@ package client
 //     can't read, so it doesn't know the setting, a tombstone's restore
 //     then being a lone fresh $nonce, and where the current document has
 //     one (§C.7), if the document it results in is an object.
-//   - The guard. The log after the gesture's last entry in each resource is
-//     compared with the paths the gesture wrote: an overlapping write, a
-//     delete, a restore or an undo of the gesture is a conflict
-//     (ConflictError). The batch names the heads that were checked in
-//     ifMatch; a 412 re-plans and retries (UndoRetries).
+//   - The guard. The writes of the log after the gesture's last entry in
+//     each resource, widened the same way, are compared with the paths the
+//     gesture wrote: an overlapping write, a delete, a restore or an undo
+//     of the gesture is a conflict (ConflictError). The batch names the
+//     heads that were checked in ifMatch; a 412 re-plans and retries
+//     (UndoRetries).
 //   - Writing. One batch for every resource, with a fresh Gesture and
 //     Undoes naming the gesture. A pruned revision (410), a missing blob
 //     (422 blob) or a document that no longer validates (422 invalid,
@@ -1156,16 +1159,13 @@ func fold(start undoState, log []LogEntry, flags []string, firstGesture int) ([]
 					return nil, st, fmt.Errorf("client: entry %s op %d: %w", e.ID, j, err)
 				}
 				st.doc, st.exists = nd, true
-				// A write is widened where its parent is an array, before
-				// the op (a removed element) or after it (an added one);
-				// a move's writes, and the arrays an op shifts (§6.4.1),
-				// may be either.
+				// A write is widened as in §F.3 where its parent is an
+				// array, before the op (a removed element, an append) or
+				// after it (an added one), to the outermost array holding
+				// it; a move's writes, and the arrays an op shifts
+				// (§6.4.1), may be either.
 				for _, w := range ws {
-					if v := widen(pre, w); len(v) < len(w) {
-						fe.writes = append(fe.writes, v)
-					} else {
-						fe.writes = append(fe.writes, widen(nd, w))
-					}
+					fe.writes = append(fe.writes, pointer.WidenArray(pre, nd, w))
 				}
 			}
 			fe.writes = dropNonce(fe.writes)
@@ -1174,24 +1174,6 @@ func fold(start undoState, log []LogEntry, flags []string, firstGesture int) ([]
 		out[i] = fe
 	}
 	return out, st, nil
-}
-
-// widen widens a write whose last segment addresses an array element (an
-// index, or "-") to the whole array (§11.2, as §F.3).
-func widen(doc any, w pointer.Pointer) pointer.Pointer {
-	if len(w) == 0 {
-		return w
-	}
-	parent := w[:len(w)-1]
-	if w[len(w)-1] == "-" {
-		return append(pointer.Pointer{}, parent...)
-	}
-	if v, ok := pointer.Get(doc, parent); ok {
-		if _, isArr := v.([]any); isArr {
-			return append(pointer.Pointer{}, parent...)
-		}
-	}
-	return append(pointer.Pointer{}, w...)
 }
 
 // dropNonce leaves out writes at or below /$nonce: an undo never restores
