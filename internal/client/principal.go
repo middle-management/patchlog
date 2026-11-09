@@ -26,14 +26,28 @@ type PrincipalInfo struct {
 	// blocks' verbs and Roles empty.
 	Operator bool
 	// Can are the verbs the grant's blocks allow, with roles only those an
-	// effective role lists; Roles its effective roles.
+	// effective role lists; Roles the names of its effective roles.
 	Can, Roles []string
-	Writer     WriterInfo
+	// RoleDefs are its effective roles as the configuration of Config
+	// defines them (§7.4, v0.75), in the order of Roles, so a grant from
+	// /read-grants (§B.11.5) learns what it may do. A server before v0.75
+	// sends names only: each then has Name alone, Can and Rules nil.
+	RoleDefs []RoleInfo
+	Writer   WriterInfo
 	// Catalog is the catalog member of a catalog namespace (§7.4, §B.6,
 	// §H.2), nil for any other namespace and from servers before v0.56.
 	Catalog *CatalogInfo
 	Config  string // the config revision in force (X-Config-Revision)
 	Raw     map[string]any
+}
+
+// RoleInfo is one effective role of /principal (§7.4): its name, and its
+// can and rules as the namespace document defines them (Rules empty for
+// none).
+type RoleInfo struct {
+	Name  string
+	Can   []string
+	Rules []any
 }
 
 // CatalogInfo is what /principal says of a catalog namespace's catalog
@@ -112,8 +126,9 @@ func (c *Client) NSPrincipal(ctx context.Context, ns string) (*PrincipalInfo, er
 		return nil, r.apiError()
 	}
 	obj := r.obj()
-	p := &PrincipalInfo{Kid: str(obj, "kid"), Key: str(obj, "key"), Can: strList(obj["can"]), Roles: strList(obj["roles"]),
+	p := &PrincipalInfo{Kid: str(obj, "kid"), Key: str(obj, "key"), Can: strList(obj["can"]),
 		Config: r.header.Get("X-Config-Revision"), Raw: obj}
+	p.Roles, p.RoleDefs = parseRoles(obj["roles"])
 	p.Operator, _ = obj["operator"].(bool)
 	if cm, ok := obj["catalog"].(map[string]any); ok {
 		c := &CatalogInfo{}
@@ -137,6 +152,33 @@ func (c *Client) NSPrincipal(ctx context.Context, ns string) (*PrincipalInfo, er
 	p.Writer.Level = str(w, "level")
 	p.Writer.Limits, _ = w["limits"].(map[string]any)
 	return p, nil
+}
+
+// parseRoles reads /principal's roles (§7.4): objects { name, can, rules }
+// from v0.75 servers, names from older ones. An entry of neither form, or
+// an object without a name, is skipped.
+func parseRoles(v any) (names []string, defs []RoleInfo) {
+	names, defs = []string{}, []RoleInfo{}
+	arr, _ := v.([]any)
+	for _, x := range arr {
+		var ri RoleInfo
+		switch e := x.(type) {
+		case string:
+			ri.Name = e
+		case map[string]any:
+			ri.Name = str(e, "name")
+			ri.Can = strList(e["can"])
+			ri.Rules, _ = e["rules"].([]any)
+			if ri.Rules == nil {
+				ri.Rules = []any{}
+			}
+		}
+		if ri.Name == "" {
+			continue
+		}
+		names, defs = append(names, ri.Name), append(defs, ri)
+	}
+	return names, defs
 }
 
 var isoDurRe = regexp.MustCompile(`^P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$`)
