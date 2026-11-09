@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -314,23 +315,84 @@ type HeadItem struct {
 // HeadsPage fetches one page of GET /ns/{ns}/rev/{nsID}/heads after the
 // resource name after ("" = first page). next is "" on the last page.
 func (c *Client) HeadsPage(ctx context.Context, ns, nsID, after string) (items []HeadItem, next string, err error) {
+	return c.HeadsPrefixPage(ctx, ns, nsID, "", after)
+}
+
+// HeadsPrefixPage is HeadsPage with ?prefix= (§7.4, §12.4): only the
+// resources whose names start with prefix, a resource name (§3.6), or
+// every resource for "". A server before v0.75 refuses the parameter
+// (400, IsBadInput), and a row outside prefix is an error.
+func (c *Client) HeadsPrefixPage(ctx context.Context, ns, nsID, prefix, after string) (items []HeadItem, next string, err error) {
 	if err := checkNS(ns); err != nil {
 		return nil, "", err
 	}
 	if err := checkID("namespace revision", nsID); err != nil {
 		return nil, "", err
 	}
-	var q url.Values
-	if after != "" {
-		q = url.Values{"after": {after}}
+	if err := checkPrefix(ns, prefix); err != nil {
+		return nil, "", err
 	}
-	r, err := c.do(ctx, "GET", "/ns/"+ns+"/rev/"+nsID+"/heads", q, nil)
+	r, err := c.do(ctx, "GET", "/ns/"+ns+"/rev/"+nsID+"/heads", headsQuery(prefix, after), nil)
 	if err != nil {
 		return nil, "", err
 	}
 	if r.status != 200 {
 		return nil, "", r.apiError()
 	}
+	return parseHeads(r, prefix)
+}
+
+// Heads lists every resource as of nsID (including read-through ones in a
+// branch), iterating all pages.
+func (c *Client) Heads(ctx context.Context, ns, nsID string) ([]HeadItem, error) {
+	return c.HeadsPrefix(ctx, ns, nsID, "")
+}
+
+// HeadsPrefix lists, as Heads does, the resources as of nsID whose names
+// start with prefix (§7.4), iterating all pages.
+func (c *Client) HeadsPrefix(ctx context.Context, ns, nsID, prefix string) ([]HeadItem, error) {
+	var all []HeadItem
+	after := ""
+	for {
+		items, next, err := c.HeadsPrefixPage(ctx, ns, nsID, prefix, after)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, items...)
+		if next == "" {
+			return all, nil
+		}
+		after = next
+	}
+}
+
+// checkPrefix checks a /heads prefix: "" for none, else a resource name
+// (§3.6, §7.4), which holds no "/".
+func checkPrefix(ns, prefix string) error {
+	if prefix == "" {
+		return nil
+	}
+	if !ValidResourceName(prefix) {
+		return fmt.Errorf("client: invalid /heads prefix %q in %s: not a resource name (§3.6)", prefix, ns)
+	}
+	return nil
+}
+
+// headsQuery is a /heads page's query: after and prefix, each if set.
+func headsQuery(prefix, after string) url.Values {
+	q := url.Values{}
+	if after != "" {
+		q.Set("after", after)
+	}
+	if prefix != "" {
+		q.Set("prefix", prefix)
+	}
+	return q
+}
+
+// parseHeads reads a /heads page (§7.4): its rows, each of whose names
+// must start with prefix, and next.
+func parseHeads(r *response, prefix string) (items []HeadItem, next string, err error) {
 	m := r.obj()
 	// { heads, next? } (§7.4); servers before v0.65 answer { items, next? },
 	// and a remote branch reads its base's pages from whatever version its
@@ -345,27 +407,12 @@ func (c *Client) HeadsPage(ctx context.Context, ns, nsID, after string) (items [
 		if n, ok := o["size"].(float64); ok {
 			it.Size = int64(n)
 		}
+		if !strings.HasPrefix(it.Resource, prefix) {
+			return nil, "", fmt.Errorf("client: %s: row %q outside prefix %q (§7.4)", r.path, it.Resource, prefix)
+		}
 		items = append(items, it)
 	}
 	return items, str(m, "next"), nil
-}
-
-// Heads lists every resource as of nsID (including read-through ones in a
-// branch), iterating all pages.
-func (c *Client) Heads(ctx context.Context, ns, nsID string) ([]HeadItem, error) {
-	var all []HeadItem
-	after := ""
-	for {
-		items, next, err := c.HeadsPage(ctx, ns, nsID, after)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, items...)
-		if next == "" {
-			return all, nil
-		}
-		after = next
-	}
 }
 
 // Branch is one entry of GET /ns/{ns}/branches.

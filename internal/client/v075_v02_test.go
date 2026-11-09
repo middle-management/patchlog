@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -79,6 +80,53 @@ func TestV075NSPrincipalRoles(t *testing.T) {
 	if !reflect.DeepEqual(p.Roles, []string{"translator"}) || len(p.RoleDefs) != 1 ||
 		!reflect.DeepEqual(p.RoleDefs[0].Can, []string{"read", "append"}) || len(p.RoleDefs[0].Rules) != 1 {
 		t.Fatalf("server roles %v defs %+v", p.Roles, p.RoleDefs)
+	}
+}
+
+// /heads takes ?prefix=, a resource name (§7.4, §12.4): HeadsPrefix sends
+// it and reads every page; an invalid prefix is refused before any
+// request, and a row outside it is an error (MUST-8, SVC-9).
+func TestV075HeadsPrefix(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	nsID := v075ID("h")
+	var asked atomic.Int32
+	var stray atomic.Bool
+	c := v075Fake(t, func(w http.ResponseWriter, r *http.Request) {
+		asked.Add(1)
+		q := r.URL.Query()
+		if r.URL.Path != "/ns/n/rev/"+nsID+"/heads" || q.Get("prefix") != "pub-" {
+			http.Error(w, "want prefix=pub-: "+r.URL.String(), 400)
+			return
+		}
+		row := func(n string) any { return map[string]any{"resource": n, "kind": "head", "target": v075ID(n)} }
+		switch q.Get("after") {
+		case "":
+			v075JSON(w, nil, map[string]any{"heads": []any{row("pub-a")}, "next": "pub-a"})
+		case "pub-a":
+			rows := []any{row("pub-b")}
+			if stray.Load() {
+				rows = append(rows, row("x"))
+			}
+			v075JSON(w, nil, map[string]any{"heads": rows})
+		}
+	})
+	got := must(c.HeadsPrefix(ctx, "n", nsID, "pub-"))
+	if len(got) != 2 || got[0].Resource != "pub-a" || got[1].Resource != "pub-b" {
+		t.Fatalf("heads %+v", got)
+	}
+	n := asked.Load()
+	for _, bad := range []string{".x", "a/b", "-a", "A", strings.Repeat("a", 129)} {
+		if _, _, err := c.HeadsPrefixPage(ctx, "n", nsID, bad, ""); err == nil {
+			t.Fatalf("prefix %q accepted", bad)
+		}
+	}
+	if asked.Load() != n {
+		t.Fatal("an invalid prefix was sent")
+	}
+	stray.Store(true)
+	if _, err := c.HeadsPrefix(ctx, "n", nsID, "pub-"); err == nil || !strings.Contains(err.Error(), "outside prefix") {
+		t.Fatalf("stray row: %v", err)
 	}
 }
 
