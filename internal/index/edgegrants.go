@@ -459,7 +459,8 @@ var errCoveredNow = &grant.AuthError{Status: 403, Msg: "the namespace is read fi
 
 // stillUncovered checks that §B.11.9 doesn't cover ns at the index's
 // committed checkpoint, as when a scope marker of it was issued: else
-// errCoveredNow. Before the index's first checkpoint of a namespace that
+// errCoveredNow; and that ns isn't one a partial reader has no marker in
+// (catalogShaped): else errNoMarker. Before the index's first checkpoint of a namespace that
 // may be covered once it has, its coverage can't be told: errNotReached,
 // as for a grant (grantAccess). A purged one passes, answered 410 past
 // the read check (§8.5).
@@ -482,6 +483,13 @@ func (ix *Index) stillUncovered(ctx context.Context, ns string) error {
 		return err
 	case cp != nil:
 		return errCoveredNow
+	}
+	// One that could be covered by its shape gives a partial reader no
+	// marker (§A.4), so no cookie of one reads it.
+	if shaped, err := ix.catalogShaped(ctx, ns); err != nil {
+		return err
+	} else if shaped {
+		return errNoMarker
 	}
 	return nil
 }

@@ -28,10 +28,12 @@ import (
 //
 // A followed namespace is covered, as the origin decides it, from the
 // namespace documents alone (§B.11.9 Where), whether or not the origin
-// implements filtered reads:
+// implements filtered reads, and only while the core's authentication is
+// on (authOff):
 //
 //   - content kind: not public, sealed or e2e, and it trusts some catalog
-//     through a key whose requireAt names it (catvis.TrustedCatalogs);
+//     through a key whose requireAt names it (catvis.TrustedCatalogs), a
+//     purged or e2e one among them, which makes nothing visible (dark);
 //   - branch kind: a local branch, recursively, of a content-kind
 //     namespace, itself neither public nor sealed; the root's trust and
 //     keys are read from its document as of the baseAt the chain fixes,
@@ -72,7 +74,9 @@ import (
 // checkpoint. The Client's grant must read them: a covered namespace one
 // of whose catalogs or members it can't read is 502 to partial readers.
 // Unrestricted readers, and every reader of a namespace that isn't
-// covered, are answered as before.
+// covered, are answered as before, but a partial reader of one that isn't
+// covered and is a catalog, or whose catalogs, or a local base's, names
+// one, which has no marker (§A.4, catalogShaped).
 
 // Kinds of covered namespace (fcp.kind).
 const (
@@ -86,15 +90,23 @@ const (
 type fsBase struct{ ns, at string }
 
 // fsCat is a catalog a covered namespace trusts, with its document as of
-// id (its ns_id in the checkpoint), whether it is e2e (it then makes
-// nothing visible and stays out of at) and the kids of the root's keys
-// whose requireAt names it.
+// id (its ns_id in the checkpoint), whether it is e2e or purged (gone: no
+// document, no id), either of which makes nothing visible and keeps it
+// out of at (dark), and the kids of the root's keys whose requireAt names
+// it.
 type fsCat struct {
 	ns, id string
 	doc    map[string]any
 	e2e    bool
+	gone   bool
 	kids   []string
 }
+
+// dark reports whether c makes nothing visible (§B.11.9 Where: "an
+// end-to-end catalog, which the origin can't read, or a purged one, makes
+// nothing visible"): it still counts for coverage, but decides no view and
+// stays out of at and its ids.
+func (c fsCat) dark() bool { return c.e2e || c.gone }
 
 // fcp is a covered namespace's combined checkpoint (§B.11.9 URLs, §A.4):
 // at is grantcheck.CombinedAt over ids, and cats the deciding catalogs'
@@ -404,29 +416,38 @@ func (ix *Index) liveAt(ctx context.Context, ns, id string) (map[string]bool, er
 // readers). Callers depend on that contract alone, not on where the
 // position comes from.
 func (ix *Index) memberAt(ctx context.Context, m string) (id string, ok bool, err error) {
+	id, ok, _, err = ix.memberAtGone(ctx, m)
+	return id, ok, err
+}
+
+// memberAtGone is memberAt, telling a purged namespace (purged) from one
+// that doesn't exist or is a remote branch.
+func (ix *Index) memberAtGone(ctx context.Context, m string) (id string, ok, purged bool, err error) {
 	if !client.ValidNSName(m) {
-		return "", false, nil
+		return "", false, false, nil
 	}
 	if ix.known(m) {
 		id, purged, err := ix.committed(ctx, m)
 		switch {
 		case err != nil:
-			return "", false, err
+			return "", false, false, err
 		case purged:
-			return "", false, nil
+			return "", false, true, nil
 		case id != "":
 			ix.noteGens(ctx)
-			return id, true, nil
+			return id, true, false, nil
 		}
 	}
 	cfg, err := ix.checker.Config(ctx, m)
 	switch {
-	case client.IsPurged(err), client.IsNotFound(err):
-		return "", false, nil
+	case client.IsPurged(err):
+		return "", false, true, nil
+	case client.IsNotFound(err):
+		return "", false, false, nil
 	case err != nil:
-		return "", false, lacksRead(m, fmt.Errorf("the head of %s: %w", m, err))
+		return "", false, false, lacksRead(m, fmt.Errorf("the head of %s: %w", m, err))
 	case remoteBranch(cfg.Doc):
-		return "", false, nil
+		return "", false, false, nil
 	}
 	ix.seedDoc(cfg)
 	return ix.memberCP(ctx, m, cfg.Head)
@@ -468,15 +489,26 @@ func isCatalog(doc map[string]any) bool {
 
 // fsTrust are the catalogs root trusts with document doc (§B.11.9 Where,
 // catvis.TrustedCatalogs), each with its document as of the id it is
-// taken at (memberAt): local, unpurged namespaces only.
+// taken at (memberAt): local, unpurged namespaces, and purged ones (gone),
+// which make nothing visible and still count for coverage, as at the
+// origin (§B.11.9 Where: "a purged one makes nothing visible"). A purged
+// catalog's document is 410, so whether its catalog.trust listed root
+// can't be read: it counts where root names it in catalogs through a
+// requireAt key, which is all TrustedCatalogs asks of root's side (open
+// question; the most a dark catalog can do is cover root with nothing
+// visible).
 func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) ([]fsCat, error) {
 	var ferr error
-	ids, docs := map[string]string{}, map[string]map[string]any{}
+	ids, docs, gone := map[string]string{}, map[string]map[string]any{}, map[string]bool{}
 	trusts := catvis.TrustedCatalogs(root, doc, func(cat string) map[string]any {
 		if ferr != nil {
 			return nil
 		}
-		id, ok, err := ix.memberAt(ctx, cat)
+		id, ok, purged, err := ix.memberAtGone(ctx, cat)
+		if purged && err == nil {
+			gone[cat] = true
+			return map[string]any{"catalog": map[string]any{"trust": []any{root}}}
+		}
 		if err != nil || !ok {
 			ferr = err
 			return nil
@@ -494,6 +526,10 @@ func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) (
 	}
 	out := make([]fsCat, 0, len(trusts))
 	for _, tr := range trusts {
+		if gone[tr.Catalog] {
+			out = append(out, fsCat{ns: tr.Catalog, gone: true, kids: tr.Kids})
+			continue
+		}
 		out = append(out, fsCat{ns: tr.Catalog, id: ids[tr.Catalog], doc: docs[tr.Catalog],
 			e2e: derived.InfoOf(docs[tr.Catalog]).Level == derived.LevelE2E, kids: tr.Kids})
 	}
@@ -505,8 +541,14 @@ func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) (
 const maxChain = 32
 
 // coverage is ns's coverage at its checkpoint z (§B.11.9 Where): its
-// kind, root, chain and trusted catalogs, nil if it isn't covered.
+// kind, root, chain and trusted catalogs, nil if it isn't covered, as
+// nothing is while the core's authentication is off.
 func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, []fsCat, error) {
+	// Nothing is covered while the core's authentication is off (§B.11.9
+	// Where: "only while authentication is on (§1)").
+	if off, err := ix.authOff(ctx); err != nil || off {
+		return nil, nil, err
+	}
 	if cfg, err := ix.checker.Config(ctx, ns); err == nil {
 		ix.seedDoc(cfg) // read by the read check already, as a rule
 	}
@@ -600,17 +642,18 @@ func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, []fsCat, err
 // document bdoc as of the branch's baseAt and cur at its head, stays
 // covered (§B.11.9 Branches: "only while the namespace that trusts the
 // catalog still trusts it, at its head, through every key item 1 counts,
-// each unchanged (§C.4)"): for each non-e2e catalog cats counts from
+// each unchanged (§C.4)"): for each catalog cats counts from that isn't dark, from
 // bdoc, cur still trusts it (its catalogs names it, and its catalog.trust,
 // as of the catalog's own head, lists root), and for each kid counted
 // there cur holds a key whose requireAt names it, its entries under that
 // kid equal, as canonical JSON, to bdoc's (the whole entry: any edit, a
 // pub rotated under the same kid among them, uncovers the branch). Keys
-// cur adds are not counted. An e2e catalog makes nothing visible either
-// way.
+// cur adds are not counted. An e2e or purged catalog (dark) makes nothing
+// visible either way, and is skipped (open question: should a root that
+// stops trusting it uncover the branch instead?).
 func branchTrustHolds(root string, bdoc, cur map[string]any, cats []fsCat) bool {
 	for _, c := range cats {
-		if c.e2e {
+		if c.dark() {
 			continue
 		}
 		head := catvis.TrustedCatalogs(root, cur, func(name string) map[string]any {
@@ -667,7 +710,7 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 	add(ns, z)
 	var deciding []fsCat
 	for _, c := range cats {
-		if c.e2e {
+		if c.dark() {
 			continue
 		}
 		deciding = append(deciding, c)
@@ -1225,6 +1268,99 @@ func (ix *Index) mayBeCovered(ctx context.Context, ns string) (bool, error) {
 	}
 	cats, _ := cfg.Doc["catalogs"].(map[string]any)
 	return len(cats) > 0, nil
+}
+
+// authOff reports whether the core runs with authentication disabled
+// (§1), as its root says, read again once CheckerTTL has passed since it
+// was last read.
+func (ix *Index) authOff(ctx context.Context) (bool, error) {
+	a := &ix.auth
+	a.mu.Lock()
+	if !a.at.IsZero() && time.Since(a.at) < ix.opt.CheckerTTL {
+		off := a.off
+		a.mu.Unlock()
+		return off, nil
+	}
+	a.mu.Unlock()
+	off, err := ix.c.AuthDisabled(ctx)
+	if err != nil {
+		return false, fmt.Errorf("the core's root: %w", err)
+	}
+	a.mu.Lock()
+	a.at, a.off = time.Now(), off
+	a.mu.Unlock()
+	return off, nil
+}
+
+// errNoMarker refuses a partial reader of a namespace §B.11.9 doesn't
+// cover that could be covered by its shape (catalogShaped): it has no
+// marker there, so no hits judged by rules alone (§A.4).
+var errNoMarker = &grant.AuthError{Status: 403, Msg: "the namespace is not read filtered now, and a reader of it in part reads none of it (§A.4, §B.11.9)"}
+
+// catalogShaped reports whether a partial reader of ns, which §B.11.9
+// doesn't cover, has no marker there (§A.4: "where it doesn't but {ns}
+// is neither sealed nor end-to-end and is a catalog (§B.6) or its
+// catalogs, or a local base's, names one, a partial reader has none"):
+// ns's document at its head, or at the index's checkpoint of it, is a
+// catalog, or names a catalog in catalogs, or a local base up its chain
+// does, read as of the at its branch reads it at and at its head (open
+// question: which of the two is meant; either counts here), unless ns is
+// sealed or e2e by each of those documents. A base purged or gone counts
+// as naming one: what it named can't be read.
+func (ix *Index) catalogShaped(ctx context.Context, ns string) (bool, error) {
+	cfg, err := ix.checker.Config(ctx, ns)
+	if err != nil {
+		return false, err
+	}
+	docs := []map[string]any{cfg.Doc}
+	if z, purged, err := ix.committed(ctx, ns); err != nil {
+		return false, err
+	} else if !purged && z != "" {
+		d, err := ix.docAt(ctx, ns, z)
+		if err != nil {
+			return false, err
+		}
+		docs = append(docs, d)
+	}
+	if !slices.ContainsFunc(docs, func(d map[string]any) bool { return !derived.Protected(derived.InfoOf(d).Level) }) {
+		return false, nil
+	}
+	for _, d := range docs {
+		if namesCatalog(d) {
+			return true, nil
+		}
+		b, at, ok := localBase(d)
+		for n := 0; ok; n++ {
+			if n == maxChain {
+				return true, nil
+			}
+			heads, err := ix.checker.Config(ctx, b)
+			if client.IsPurged(err) || client.IsNotFound(err) {
+				return true, nil
+			}
+			if err != nil {
+				return false, lacksRead(b, fmt.Errorf("the head of %s: %w", b, err))
+			}
+			bdoc, err := ix.docAt(ctx, b, at)
+			if client.IsPurged(err) || client.IsGone(err) || client.IsNotFound(err) {
+				return true, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			if namesCatalog(heads.Doc) || namesCatalog(bdoc) {
+				return true, nil
+			}
+			b, at, ok = localBase(bdoc)
+		}
+	}
+	return false, nil
+}
+
+// namesCatalog reports whether doc is a catalog or its catalogs names one.
+func namesCatalog(doc map[string]any) bool {
+	cats, _ := doc["catalogs"].(map[string]any)
+	return isCatalog(doc) || len(cats) > 0
 }
 
 // members are the namespaces cp's at covers but ns, sorted.

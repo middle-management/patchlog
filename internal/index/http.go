@@ -316,7 +316,15 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 		if may, err := ix.mayBeCovered(ctx, ns); err != nil || may {
 			return nil, errors.Join(errNotReached, err)
 		}
-	case errors.Is(err, errUncovered), errors.Is(err, errPurgedNS):
+	case errors.Is(err, errUncovered):
+		// One that could be covered by its shape but isn't gives a
+		// partial reader no marker (§A.4): never hits by rules alone.
+		if shaped, err := ix.catalogShaped(ctx, ns); err != nil {
+			return nil, err
+		} else if shaped {
+			return nil, errNoMarker
+		}
+	case errors.Is(err, errPurgedNS):
 	default:
 		return nil, err
 	}

@@ -214,6 +214,13 @@ type Index struct {
 
 	fs  fstate  // the state of namespaces §B.11.9 covers (filtered.go)
 	mem members // the namespaces visibility reads there that the index doesn't serve (members.go)
+	// auth is the core's authentication mode as last read (authOff),
+	// kept for CheckerTTL.
+	auth struct {
+		mu  sync.Mutex
+		at  time.Time
+		off bool
+	}
 
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers

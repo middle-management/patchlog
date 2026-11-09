@@ -113,10 +113,12 @@ func TestV075XrevUncoveredScopedReader(t *testing.T) {
 	wide := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"sec", "cat"}, []string{"read"})))
 	x = startSvc(t, wide, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, untyped: true, now: s.Now})
 	x.caughtUp("sec")
-	if r := x.follow("/sec?q=secret", onlyA); r.status != 200 || strings.Join(resources(r.body), ",") != "a" {
+	// Since v0.77 sec, uncovered but naming a catalog, gives a partial
+	// reader no marker (§A.4): 403, never its rules' hits.
+	if r := x.follow("/sec?q=secret", onlyA); r.status != 403 {
 		t.Errorf("with cat readable: %d %v", r.status, r.body)
 	}
-	if r := x.follow("/_refs?to=/r/sec/schema", onlyA); r.status != 200 {
+	if r := x.follow("/_refs?to=/r/sec/schema", onlyA); r.status != 403 {
 		t.Errorf("/_refs with cat readable: %d %v", r.status, r.body)
 	}
 }
@@ -125,7 +127,7 @@ func TestV075XrevUncoveredScopedReader(t *testing.T) {
 // cat, which trusts sec, whose keys name no catalog in requireAt, so
 // §B.11.9 covers neither. To tell, the index must read sec: with a grant
 // for cat alone a scoped reader of cat is 502, the log naming sec; with
-// sec readable too, it gets its resource. The other catalogs sec names
+// sec readable too, it gets no marker in cat, a catalog (v0.77, §A.4). The other catalogs sec names
 // are no part of cat's coverage, and the index doesn't need them.
 func TestV075XrevUncoveredCatalogScopedReader(t *testing.T) {
 	t.Parallel()
@@ -164,7 +166,9 @@ func TestV075XrevUncoveredCatalogScopedReader(t *testing.T) {
 	wide := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"cat", "sec"}, []string{"read"})))
 	x = startSvc(t, wide, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"cat"}, untyped: true, now: s.Now})
 	x.caughtUp("cat")
-	if r := x.follow("/cat?q=secret", onlyA); r.status != 200 || strings.Join(resources(r.body), ",") != "a" {
+	// Since v0.77 cat, an uncovered catalog, gives a partial reader no
+	// marker (§A.4): 403, never its rules' hits.
+	if r := x.follow("/cat?q=secret", onlyA); r.status != 403 {
 		t.Errorf("with sec readable: %d %v", r.status, r.body)
 	}
 }

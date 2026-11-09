@@ -213,10 +213,10 @@ func noteNeed(ctx context.Context, m string) {
 // memberCP is the committed checkpoint of m, a member read at its head
 // (memberAt), once its follower has reached head, the head the grant
 // checker read ("" for any checkpoint), waiting up to MinWait for it; at
-// the end of the wait, the checkpoint it holds. ok is false once m's
-// purge-ns is applied. Before the first checkpoint it is errMemberBehind.
-// The follower is started if it isn't running.
-func (ix *Index) memberCP(ctx context.Context, m, head string) (id string, ok bool, err error) {
+// the end of the wait, the checkpoint it holds. ok is false, and purged
+// true, once m's purge-ns is applied. Before the first checkpoint it is
+// errMemberBehind. The follower is started if it isn't running.
+func (ix *Index) memberCP(ctx context.Context, m, head string) (id string, ok, purged bool, err error) {
 	noteNeed(ctx, m)
 	ix.wantMember(m)
 	ix.mu.Lock()
@@ -232,25 +232,25 @@ func (ix *Index) memberCP(ctx context.Context, m, head string) (id string, ok bo
 		ix.mem.mu.Unlock()
 		switch {
 		case purged:
-			return "", false, nil
+			return "", false, true, nil
 		case reached:
 			ix.noteGens(ctx)
-			return cur, true, nil
+			return cur, true, false, nil
 		}
 		select {
 		case <-changed:
 			continue
 		case <-ctx.Done():
-			return "", false, ctx.Err()
+			return "", false, false, ctx.Err()
 		case <-timer.C:
 		case <-lifecycle.Stopping(ctx):
 			// Shutting down: answer now, as if the wait had run out.
 		}
 		if cur == "" {
-			return "", false, fmt.Errorf("%w: %s (§A.4)", errMemberBehind, m)
+			return "", false, false, fmt.Errorf("%w: %s (§A.4)", errMemberBehind, m)
 		}
 		ix.noteGens(ctx)
-		return cur, true, nil
+		return cur, true, false, nil
 	}
 }
 
@@ -262,7 +262,7 @@ func (ix *Index) baseFollowed(ctx context.Context, ns string) error {
 	if !client.ValidNSName(ns) || ix.known(ns) {
 		return nil
 	}
-	_, _, err := ix.memberCP(ctx, ns, "")
+	_, _, _, err := ix.memberCP(ctx, ns, "")
 	return err
 }
 
