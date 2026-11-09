@@ -1,6 +1,6 @@
 # Patch Log — Conformance checklist
 
-Status: against spec v0.74. Items restate spec requirements as checkable statements; parentheses name the passages restated (bold lead-ins of the section's bullets, or "table"). The spec's text governs: an item that says more or less than its passage, or seems to disagree, is an error here. Ids are never renumbered or reused; a dropped item keeps its id, marked "retired in v0.NN". **[vectors]** items are byte-exact, covered by Addendum I.
+Status: against spec v0.75. Items restate spec requirements as checkable statements; parentheses name the passages restated (bold lead-ins of the section's bullets, or "table"). The spec's text governs: an item that says more or less than its passage, or seems to disagree, is an error here. Ids are never renumbered or reused; a dropped item keeps its id, marked "retired in v0.NN". **[vectors]** items are byte-exact, covered by Addendum I.
 
 Suggested conformance profiles (not in the spec; proposed):
 
@@ -18,7 +18,7 @@ Suggested conformance profiles (not in the spec; proposed):
 - [ ] **CONF-1** (Conformance: Addendum C) `"auth": "grants"` implements all of Addendum C. Otherwise (`"disabled"`): every request counts as a `*` key; config writes skip namespace rules, resource writes are still checked; entries record `"grant": null`, earlier grant references still served; `merge.authors` checks (§F.3, §F.6) match such an entry on its author's `sub` alone, and janitor's `*`-key checks for `abandoned`/`superseded` accept it. Under `grants`, entries with `grant: null` or no `grant` count for no one.
 - [ ] **CONF-2** (Conformance: Addendum E) Without Addendum E, `encryption` in namespace documents: `422` (`invalid`); likewise a level the server lacks. A remote branch whose raise (§G.5.2) needs a missing level, and each branch whose base chain reaches it, answer `502` (`upstream`) for resources read through or written on since (remote: those its source had at `at`, not purged since, §8.3); writes to them other than purges likewise (step 2.1 of §6.2; check 2 of §7.8). A batch's local `source` takes no blobs from them.
 - [ ] **CONF-3** (Conformance: Branches) A server refusing local branches answers `branch` `403` after verification (§C.2), never lists it in `/principal`'s `can`, finds no candidate in §6.1's draft lookup; remote registration (§G.3) is unaffected.
-- [ ] **CONF-4** (Conformance: Addenda A, B, F, G and H) A core server has hooks for these addenda: `remote` branch entries, `export`, batch `source`, `GET /`, pruning's archive bundles (§G.4.1; §G.5.1.1 encrypted), their namespace-document members (§12.3), `/principal`'s `catalog`. Without remote branches, a remote `base` is `422`.
+- [ ] **CONF-4** (Conformance: Addenda A, B, F, G and H) A core server has hooks for these addenda: `remote` branch entries, `export`, batch `source`, `GET /`, pruning's archive bundles (§G.4.1; §G.5.1.1 encrypted), their namespace-document members (§12.3), `/principal`'s `catalog`. An origin MAY implement §B.11.9. Without remote branches, a remote `base` is `422`.
 - [ ] **CONF-5** (Conformance: Byte-exact definitions) Ids (§3), blob ids (§3.7), bundle digests (§G.4.1), plan digests (§F.9) and padding buckets (§E.2.2) agree across implementations; each implemented part reproduces Addendum I. **[vectors I]**
 
 ## §2 Terminology
@@ -26,7 +26,7 @@ Suggested conformance profiles (not in the spec; proposed):
 ### §2.1 Defined terms
 
 - [ ] **TERM-1** (Dependents) A namespace's dependents: unpurged namespaces whose `base` it is.
-- [ ] **TERM-2** (Edge prefix) `/r/{ns}/{name}`, `/r/{ns}` or `/ns/{ns}` (names per §3.6); covers its URL and all below, segment-wise as RFC 6265 path matching; likewise a service's prefix under its root.
+- [ ] **TERM-2** (Edge prefix) `/r/{ns}/{name}`, `/r/{ns}`, `/ns/{ns}` or `/ns/{ns}/g/{gs}` (§B.11.9) (names per §3.6, `gs` an id in text form, §3.2); covers its URL and all below, segment-wise as RFC 6265 path matching; likewise a service's prefix under its root.
 - [ ] **TERM-3** (Effective roles) A grant carries roles when a block lists `roles`. Effective roles: those its root block lists that every narrowing block listing `roles` keeps and configuration in force defines.
 - [ ] **TERM-4** (Encryption level) `encryption.level`: none < `at-rest` < `sealed` < `e2e`. Sealed means `sealed` (E2) only; `e2e` (E3) is end-to-end.
 - [ ] **TERM-5** (Protection) Moving content never makes it readable to anyone who couldn't read it at its source, unless a caller who can read it there writes it itself or an operator overrides one import. Allowed moves work within a namespace, between equal ranks and upward; only a key holder seals into `e2e`; an import keeps an `e2e` source's lines under its own name. Ranks `public` < `private` = `sealed` < `e2e`: source is `e2e` at E3, `sealed` at E2 whatever `read`, else `public`/`private` by `read` (unknown: `private`); target is the same but sealed with `read` `public` is `public`. A blob copy, remote branch schema mirror, rebase replay into its successor and (barring operator override) an import never move content to a lower-ranked namespace. Nothing else is ranked (branches: §7.4; batch local `source`; a writer's own writes).
@@ -178,7 +178,7 @@ Suggested conformance profiles (not in the spec; proposed):
 - [ ] **HTTP-16** (table) Raw document (§7.8): `GET …/raw`, `GET …/rev/{id}/raw` `302` to `…/blob/{bid}`. Unknown, pruned, purged, tombstoned ids and heads answer as the document URL; non-raw `404` (`not_found`); sealed or end-to-end `404` `code: "not_offered"`, after the document's read check.
 - [ ] **HTTP-17** (table) `GET …/blob/{bid}`: `200`, `206` for a range; pending or unknown `404`; pruned or purged `410` (§7.8); sealed namespaces and E3 blobs from before a raise from `sealed`: `302` to `…/blob/{bid}/e/{e}` (§E.2.2). `GET …/blob/{bid}/e/{e}` serves only those: `200` sealed under epoch `e`, `206` for a range; `404` for an epoch not served; `410` per §E.2.2. Elsewhere, and other E3 blobs: `404` `code: "not_offered"`, after the resource's read check. Epoch `404`: `no-store`.
 - [ ] **HTTP-18** (table) `GET …/rev/{id}/log?since={a}`: `200`, entries after `a` (exclusive) up to `id` (inclusive); empty or omitted `since` from genesis; `since={id}` empty. `404` if `id` unknown or `a` neither `id` nor an ancestor. `410`, as below the horizon, if any revision after `a` up to `id` has its patch set pruned and not restored from an archive (`a` itself may lie below it).
-- [ ] **HTTP-5** (Paging) A log range answers its first page only if longer than the log page size (§6.6; a batch entry counts as its items), over `logPageBytes` of patch sets, or spanning an `e2e` raise. A page ends before an entry that would pass a bound or cross the raise, but holds at least one. At E2, `logPageBytes` counts each entry's sealed bytes as served. Oldest first, `X-Log-Next: {id}` (last entry returned = next `since`); a page reaching the URL's `id` needs none. `404`, `410` are judged over the whole range.
+- [ ] **HTTP-5** (Paging) A log range answers its first page only if longer than the log page size (§6.6; a batch entry counts as its items), over `logPageBytes` of patch sets, or spanning an `e2e` raise. A page ends before an entry that would pass a bound or cross the raise, but holds at least one; filtered ranges (§B.11.9) may hold empty pages, and end as that section says. At E2, `logPageBytes` counts each entry's sealed bytes as served. Oldest first, `X-Log-Next: {id}` (last entry returned = next `since`); a page reaching the URL's `id` needs none. `404`, `410` are judged over the whole range.
 - [ ] **HTTP-19** (Paging, Continuations) Every paged answer names how to continue: log ranges in `X-Log-Next` (next `since`), `/heads` in body's `next` (next `after`), gestures listing in `X-Log-Next` (next `after`). Long-poll answers (§7.7) use the same page limits and carry no `X-Log-Next`. An E3 prune's sealed snapshot (§8.6) is served as `/rev/{H}`, never as a log entry, unless `H` is from before a raise to `e2e`.
 - [ ] **HTTP-20** (Log entry shape) Resource log entry `{ "id", "parent", "kind": "rev", "patches", "author", "via"?, "created", "grant"?, "signature"?, "gesture"?, "undoes"? }`, `patches` canonical; a tombstone entry has `kind: "tombstone"`, no `patches`. `grant` `{ "id", "sub", "kid" }`, absent where none recorded (auth-disabled writes included). `created` RFC 3339 UTC, millisecond precision (namespace entries too). `via` the grant's delegatees in order, absent when none.
 
@@ -209,7 +209,7 @@ Suggested conformance profiles (not in the spec; proposed):
 - [ ] **HTTP-9** (Events) `GET /r/{ns}/{name}/events?since={id}`, `GET /ns/{ns}/events?since={ns_id}` replay entries after `since`, one log page (§7.1) per fetch, then stream live.
   - `Last-Event-ID` wins over `since`. Neither, or empty `since`: from genesis; no entries yet: waits for the first.
   - Replay judged as its log range, before any event: `since` not in the log `404`; a revision to replay with pruned patch set `410`. A prune reaching a page not yet sent ends the stream.
-  - `Cache-Control: no-store`. Requires `read`, unrestricted for a namespace stream (§2.1), re-judged before each log page fetched and each keep-alive; the stream ends if it fails, and when the grant or cookie it was admitted under expires.
+  - `Cache-Control: no-store`. Requires `read`, unrestricted for a namespace stream (§2.1) except as §B.11.9 allows, re-judged before each log page fetched and each keep-alive; the stream ends if it fails, and when the grant or cookie it was admitted under expires.
 - [ ] **HTTP-24** (Events) Resource stream event types: `revision`, `tombstone` (data the resource log entry (§7.1), `id:` its id); `purge`, `prune` (data the recording namespace entry (§7.4) without `id`, `prev`; no `id:`). Ends after its `purge` event. A namespace purge sends no `purge` event and ends the resource's streams. Replay carries only `revision`, `tombstone`. Namespace stream events: its log entries as §7.4 serves them, `id:` the entry's `id`; ends after its `purge-ns` event, or without it where log ranges are sealed; a `since` naming that entry `410`.
 
 ### §7.4 Namespace
@@ -219,18 +219,18 @@ Suggested conformance profiles (not in the spec; proposed):
   - `grant` recorded for: local branch creation (creator's, both entries); namespace genesis (operator's); janitor prune (janitor's); schema namespaces a remote branch mirrors at creation (creating operator's).
   - `grant`, `via` absent from server-written entries (propagated purges, purges applied from a remote base, its own prunes); `grant` also absent before v0.37 unless recoverable from revisions; `null` while authentication is disabled.
   - Empty or omitted `since`: from the chain's first entry; `404` if `a` is neither `ns_id` nor earlier in its chain.
-- [ ] **HTTP-26** (table) `GET …/rev/{ns_id}/heads?after={name}`: `200`, immutable, `{ "heads": [ … ], "next"? }`, page of `{ resource, kind, target, created?, size?, digest? }`: one row per resource as of that revision, read-through ones included; `kind`, `target` of its latest `head`, `tombstone` or `purge` entry, or `purge` with that `target` if purged since (§8.3); ascending byte order of name, strictly after `after` (needn't name a resource). `next` names the following page, absent on the last. Neither sealed nor end-to-end, judged by the serving namespace: `created` the target entry's; for a live head of an unpurged resource, `size` canonical document byte length, `digest` its uncoded `Repr-Digest` value (`sha-256=:…:`). At E2, E3, and for a resource §1 answers `502` for: all three absent. Readers MUST NOT rely on them. `410` once purged (§8.5).
+- [ ] **HTTP-26** (table) `GET …/rev/{ns_id}/heads?after={name}`: `200`, immutable, `{ "heads": [ … ], "next"? }`, page of `{ resource, kind, target, created?, size?, digest? }`: one row per resource as of that revision, read-through ones included; `kind`, `target` of its latest `head`, `tombstone` or `purge` entry, or `purge` with that `target` if purged since (§8.3); ascending byte order of name, strictly after `after` (needn't name a resource); with `prefix` (a resource name, §3.6), only names starting with it. `next` names the following page, absent on the last. Neither sealed nor end-to-end, judged by the serving namespace: `created` the target entry's; for a live head of an unpurged resource, `size` canonical document byte length, `digest` its uncoded `Repr-Digest` value (`sha-256=:…:`). At E2, E3, and for a resource §1 answers `502` for: all three absent. Readers MUST NOT rely on them. `410` once purged (§8.5).
 - [ ] **HTTP-27** (table) `GET /ns/{ns}/principal`: `200`, `no-store`, `X-Config-Revision`, `{ "principal", "kid", "key", "operator", "can", "roles", "writer": { "frozen", "successor"?, "nonce", "signatures", "level"?, "limits" }, "catalog"?: { "trust", "files"? } }`, for the grant in `Authorization`:
   - `principal` per §6.4.1; `kid` the key that verified the root block; `key` the RFC 7638 SHA-256 thumbprint, base64url unpadded, of that key as JWK `{"crv":"Ed25519","kty":"OKP","x":<pub>}` (namespace key) or the published JWK (operator key).
-  - `operator` true for an operator grant: `can` its blocks' verbs, `roles` `[]`. Otherwise `can` the verbs its blocks and key allow (role-carried: only those an effective role lists), `roles` its effective roles. `can` never lists `branch` where local branches are refused.
+  - `operator` true for an operator grant: `can` its blocks' verbs, `roles` `[]`. Otherwise `can` the verbs its blocks and key allow (role-carried: only those an effective role lists), `roles` its effective roles only, each `{ "name", "can", "rules" }` as configuration of `X-Config-Revision` defines it (`rules` `[]` if none). `can` never lists `branch` where local branches are refused.
   - `writer`: `frozen`, `successor`; `nonce` `required` where the document requires nonces or the namespace is sealed at E2, else `optional`; `signatures` `optional`/`required`; `level` `at-rest`/`sealed`/`e2e`, absent without `encryption`; `limits` every §6.6 limit in force (namespace value, else deployment default), without allowances or a key scope's `rate`.
   - Document has `catalog`: `trust` (`[]` when absent), `files` (§B.6, §H.2). Grant without unrestricted `read` of the catalog: `files` without `x-` members, and `trusted` (whether `files.ns` is trusted; `false` without `files`) in place of `trust`.
 
   **[vectors I.12]**
 - [ ] **HTTP-28** (table) `GET /ns/{ns}/principal` applies only the `ns` check (§7) and verification (§C.2 item 1, key scope included); no verb check, no rule. Operator grant, nonexistent namespace `404`; grant failing `ns` check `403`; grant unusable or none `401`, even in a public namespace; authentication disabled `200` without `principal`, `kid`, `key`, with `operator: false`, `can` every verb the server allows, `roles` `[]`, nonexistent namespace `404`; purged namespace `410` once the grant verifies (§8.5). Draws no rate token.
-- [ ] **HTTP-29** (table) `GET /ns/{ns}/gestures/{gesture}`: `400` (`bad_input`), request-shape, for `{gesture}` not of §7.2's form or `after` not `{resource}/{id}`. Sealed or end-to-end namespaces: `404` `code: "not_offered"`, after the `read` check. `200`, `no-store`, `[{ resource, id, kind, gesture?, undoes?, author, ns_id }]`, one per revision or tombstone written with or undoing that gesture, oldest first, omitting purged resources and resources the grant can't read. Paged by `logPageSize`: a full page carries `X-Log-Next: {resource}/{id}` (its last row), the next page is `?after=` that; `after` naming no such entry of an unpurged readable resource `404`; no `X-Log-Next` is the last page.
+- [ ] **HTTP-29** (table) `GET /ns/{ns}/gestures/{gesture}`: `400` (`bad_input`), request-shape, for `{gesture}` not of §7.2's form or `after` not `{resource}/{id}`. Sealed or end-to-end namespaces: `404` `code: "not_offered"`, after the `read` check. `200`, `no-store`, `[{ resource, id, kind, gesture?, undoes?, author, ns_id }]`, one per revision or tombstone written with or undoing that gesture, oldest first, omitting purged resources, listing only entries for resources the grant may read, or, to partial reader where §B.11.9 applies, those visible to it. Paged by `logPageSize`: a full page carries `X-Log-Next: {resource}/{id}` (its last row), the next page is `?after=` that; `after` naming no row this listing would give the caller `404`; no `X-Log-Next` is the last page.
 - [ ] **HTTP-30** (table) `GET /ns/{ns}/grants/{gid}`: `200` `{ id, root, stored }` for a grant recorded by an entry of this namespace, or, in a local branch, of its bases up to their `at`, in non-bearer form (§C.3.1); else `404`. Needs unrestricted `read` (§2.1). Sealed in sealed namespaces, `private` in end-to-end ones; cached immutable (`private` at E3).
-- [ ] **HTTP-31** (table) `GET /ns/{ns}/branches`: `200` (head pointer), `[{ name, at, frozen, purged, successor?, drafts? }]` for direct branches, `{ remote, at, ns_id, expires }` for remote branches with unexpired registration (§G.3). Needs unrestricted `read` (§2.1); `410` once purged (§8.5).
+- [ ] **HTTP-31** (table) `GET /ns/{ns}/branches`: `200` (head pointer), `[{ name, at, frozen, purged, successor?, drafts? }]` for direct branches, `{ remote, at, ns_id, expires }` for remote branches with unexpired registration (§G.3). Needs unrestricted `read` (§2.1), except as §B.11.9 allows; `410` once purged (§8.5).
 - [ ] **HTTP-11** (Namespace writes, table, Content types) `PATCH /ns/{ns}`, `application/json-patch+json`; precondition `If-Match: "{config_id}"` or `If-None-Match: *` to create. Success `201`, `X-Config-Revision: {new config_id}`, `X-Namespace-Revision: {ns_id}`, `Location: /ns/{ns}/rev/{ns_id}`, body `{ "config": new config_id, "ns_id" }`. Idempotent retry (§7.2) `200`, same headers and body (config change written by a batch: `ns_id` the batch's entry). Failure `412` `{ config }` (no `config` for creation under a taken name); `422`; `428`; `401`; `403`. Other content types `415`.
 - [ ] **HTTP-32** (Envelope) Config writes are checked with a `config` envelope (§6.4.1); key-scope and grant rules apply.
 - [ ] **HTTP-33** (Keys, roles, revocations, limits and exposure) Need a `*` key (§C.2): writes covering/overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/allowances`, `/merge`, `/retention`, `/encryption`, `/signatures`, `/nonce`, `/schemaReads`, `/catalogs`, `/maxLag`; writes setting `read` to `public`. Making `read` stricter: none.
@@ -294,7 +294,7 @@ Suggested conformance profiles (not in the spec; proposed):
   - Entries after `since` (empty or missing: from the beginning): `200` at once, up to one log page (§7.1), in §7.1, §7.4 shapes; `X-Namespace-Revision` (resource logs: `X-Revision`) names the last entry returned.
   - Else waits for an entry or the end of the current interval; timeout `204`, same header naming `since` (omitted when `since` is empty); both answers carry `X-Cursor`.
   - `since` not in the chain `404`; pruned range `410` (§7.1). A resource with no entries waits as for empty `since`.
-  - Namespace log needs unrestricted `read` (§2.1); resource log `read` on the resource.
+  - Namespace log needs unrestricted `read` (§2.1), except as §B.11.9 allows; resource log `read` on the resource.
   - Without `live`: `302` (head pointer) to `…/rev/{head}/log?since=…`; a resource with no entries `404` (short).
 - [ ] **HTTP-14** (Intervals and cursors, Clients)
   - Fixed intervals (default 20 seconds) from a fixed epoch; cursor is the decimal interval number.
@@ -471,7 +471,7 @@ Suggested conformance profiles (not in the spec; proposed):
 
   Pruned revision (`410` `pruned`): fetch head; if pruned too, treat resource as absent until later entry. Advance checkpoint only after entries are durably processed; processing idempotent.
 - [ ] **CONS-3** (Verifying grants) A consumer verifying grants presented to it MUST check keys and revocations as of namespace head (in branch, its local bases' heads too), not checkpoint. Grants recorded with entries verified as §C.3.1.
-- [ ] **CONS-4** (Branches: Discovery, Contents, Access) Branches: from `branch` entries with `name` in followed logs, recursively; if started from `/heads`, earlier ones from `GET /ns/{ns}/branches`. For such a branch, or one told to follow: start from its `/heads` listing at its first `ns_id` (read-through resources included), then its own log. Needs unrestricted `read` on branch (§2.1); skip one it may not read.
+- [ ] **CONS-4** (Branches: Discovery, Contents, Access) Branches: from `branch` entries with `name` in followed logs, recursively; if started from `/heads`, earlier ones from `GET /ns/{ns}/branches`. For such a branch, or one told to follow: start from its `/heads` listing at its first `ns_id` (read-through resources included), then its own log. Needs unrestricted `read` on branch (§2.1), except as §B.11.9 allows; skip one it may not read.
 
 
 ## §12 Registries
@@ -518,11 +518,11 @@ Suggested conformance profiles (not in the spec; proposed):
   Order: `sort` if given; else with `q` descending `score` (from documents of `{ns}` reader may see only); else resource name; ties by resource name. Paging as `/_refs`: `after` a bare resource name, or with `q` or `sort` opaque `next`. Redirect to another `at` (here, `/_refs`, tree listings §B.5) keeps an `after` naming a resource, applied to new result; drops opaque one, starting again.
 
   Branch preview index: `ref` matches targets as written, naming base; hits are branch's versions of referrers.
-- [ ] **SVC-8** (Across namespaces, `gs`, `min`) `GET /_refs?to=<reference>` → redirect to `/_refs/g/{gs}/at/{at}?to=…`; `at` combined checkpoint (§B.5) over only followed namespaces reader may see; path always has `/g/{gs}`.
-  - `gs` computed, URLs served, as §B.11.5, over markers: `reads:{ns}` for each followed non-public namespace where reader's grant would be issued a namespace-wide edge grant (§C.5.2); `reads:{ns}:scope:{digest}` where grant allows `read` otherwise, `digest` covering rules limiting it there (its blocks', key scope's, each effective role listing `read`) and the `/principal` values they refer to. Rules referring to `/now`: namespace unreadable. No marker, or neither grant nor cookie: empty set's `gs`.
+- [ ] **SVC-8** (Across namespaces, `gs`, `min`) `GET /_refs?to=<reference>` → redirect to `/_refs/g/{gs}/at/{at}?to=…`; `at` combined checkpoint (§B.5) over only followed namespaces reader may see and, for those §B.11.9 covers, every namespace it reads there (§B.11.9 URLs), which `min` may also name; path always has `/g/{gs}`.
+  - `gs` computed, URLs served, as §B.11.5, over markers: `reads:{ns}` for each followed non-public namespace where reader's grant would be issued a namespace-wide edge grant (§C.5.2); `reads:{ns}:scope:{digest}` where grant allows `read` otherwise, `digest` covering rules limiting it there (its blocks', key scope's, each effective role listing `read`) and the `/principal` values they refer to; where §B.11.9 covers `{ns}`, marker `reads:{ns}:g:{gs}`, with its `gs` there. Rules referring to `/now`: namespace unreadable. No marker, or neither grant nor cookie: empty set's `gs`.
   - `?min={ns}:{ns_id}`, repeatable, as SVC-1; namespace reader can't see or service doesn't follow: `400`, purged excepted.
 - [ ] **SVC-9** (Answers, Coverage, tags) `/_refs` answer `{ "at", "namespaces": { ns: ns_id, … }, "hits": [ … ], "next"? }`, `namespaces` listing what `at` covers.
-  - Hits carry `ns` beside a `ref` hit's fields, filtered per item as catalog listings are (§B.11.5), in byte order of `ns`, then resource name.
+  - Hits carry `ns` beside a `ref` hit's fields, filtered per item as catalog listings are (§B.11.5), or, for partial reader where §B.11.9 covers `{ns}`, by visibility (what reader may see, here and below), in byte order of `ns`, then resource name.
   - At most `limit` hits per page; `limit` above maximum: `400`. Hits strictly after `after` (`{ns}/{name}`, compared as pair (`ns`, name) split at first `/`); `next` is next page's `after`, absent on last.
   - Hits from sealed/end-to-end namespaces sealed per entry (§E.2.6), never as whole response.
   - Includes branch previews; omits namespaces not yet reached, purged, and sealed/end-to-end without keys; a `min` naming one of those, purged excepted: `400`.
@@ -534,7 +534,7 @@ Suggested conformance profiles (not in the spec; proposed):
   - `400`: `fields` path no schema indexed in `{ns}` for document reader may see marks with `x-index`; `facet[…]` or `counts` path none marks `facet`; `sort` path none marks `sort`.
   - Path marked when `x-index` is reachable from schema root along it, whatever data, via `$ref`, `$dynamicRef`, applicators (`properties`, `patternProperties`, `additionalProperties`, `dependentSchemas`, `items`, `prefixItems`, `contains`, branches of `allOf`, `anyOf`, `oneOf`, `if`, `then`, `else`), never `not`, `propertyNames`, `unevaluated*`; array items count at array's path.
   - Marked path with no values at hit: left out of it.
-- [ ] **SVC-11** (Private namespaces, Sealed and end-to-end namespaces) Private: served at `/{ns}/g/{gs}/at/{ns_id}?…`, `gs` and URLs as `/_refs`, hits filtered as there over `{ns}` alone; reader with no marker for `{ns}`: `401`/`403`. Sealed and end-to-end: sealed as §E.2.6.
+- [ ] **SVC-11** (Private namespaces, Sealed and end-to-end namespaces) Private: served at `/{ns}/g/{gs}/at/{ns_id}?…`, `gs` and URLs as `/_refs`, hits filtered as there over `{ns}` alone; reader with no marker for `{ns}`: `401`/`403`. Where §B.11.9 covers `{ns}`: service follows namespaces visibility reads, as §B.5 does; `at`, in place of `ns_id` (§A.5), is §B.11.9's combined checkpoint, which answers list as `namespaces` and `min` may name as `{ns}:{ns_id}`; every page but last holds `limit` hits. Sealed and end-to-end: sealed as §E.2.6.
 
 ### §A.5 Consistency
 
@@ -589,7 +589,7 @@ Suggested conformance profiles (not in the spec; proposed):
 
 ### §B.7 Lifecycle
 
-- [ ] **SVC-26** (Create and place, Deleting content, Deleting a placement, Deleting a folder, Restoring) Placement of not-yet-existing item dangles until it exists. Deleted item's placements dangle, drop out of listings and access immediately, reported for cleanup. Deleting a placement removes item from this catalog only. Deleting a folder doesn't cascade: children appear under `/orphans`. Restoring a folder or placement re-attaches everything that pointed at it.
+- [ ] **SVC-26** (Create and place, Deleting content, Deleting a placement, Deleting a folder, Restoring) Placement of not-yet-existing item dangles until it exists, granting `create` until removed (§B.11.2); tooling SHOULD unplace stale ones, which `problems` reports. Deleted item's placements dangle, drop out of listings and access immediately, reported for cleanup. Deleting a placement removes item from this catalog only. Deleting a folder doesn't cascade: children appear under `/orphans`. Restoring a folder or placement re-attaches everything that pointed at it.
 
 ### §B.9 Self-placing documents (optional shortcut)
 
@@ -650,9 +650,10 @@ Suggested conformance profiles (not in the spec; proposed):
 
 - [ ] **SVC-40** (Listing URLs carry the subject set)
   - Combined checkpoint with only public namespaces: served unfiltered at `/{catalog}/at/{at}/…` while they stay public. Any other listing: `/{catalog}/g/{gs}/at/{at}/…`.
-  - `gs` is `all`, or `text(trunc160(sha256(canonical(subjects))))`, `subjects` caller's `group:` entries, no duplicates, UTF-8 byte order, adding its `sub` only if catalog has direct entries for that user or catalog's key in content namespace it trusts has a `sub` scope.
+  - `gs` is `all`, or `text(trunc160(sha256(canonical(subjects))))`, `subjects` caller's **deciding** subjects, no duplicates, UTF-8 byte order: its `group:` entries that catalog's `$access`, or a role or key rule of a content namespace it trusts, names, plus its `sub` only if catalog has direct entries for that user or catalog's key in content namespace it trusts has a `sub` scope.
+  - Group left out only where every such rule refers to `/principal/groups` solely by positive tests, outside `not` and `if`, that it holds a group named by value; one referring otherwise (position, count, pattern, negated test): all caller's groups kept. Leaving out a group adds `"partial"` to `subjects`; such `gs` is `403` at an `at` where `subjects` keeps all groups, until reader exchanges again (as `g/all`); at any other, a later checkpoint naming a dropped group shows it less, never more.
   - Listing URL without `at` is under prefix too, with the `gs` exchange's `prefixes` gives; grant in `Authorization` redirects one without `/g/{gs}` to its `…/g/{gs}/at/{at}/…` URL, `private, no-store`.
-  - A grant in `Authorization` reads only at its own `gs`, or `all` where it qualifies; `403` elsewhere. Needing `/g/{gs}` with neither a grant verifying in followed namespace nor cookie service verifies: `401`. Tree service without §B.11 serves only `all` (`403` otherwise).
+  - A grant in `Authorization` reads only at its own `gs` as of URL's `at`, or `all` where it qualifies; `403` elsewhere. Needing `/g/{gs}` with neither a grant verifying in followed namespace nor cookie service verifies: `401`. Tree service without §B.11 serves only `all` (`403` otherwise).
   - Edge admits request only with edge grant bound to that exact `gs`: cookie minted with service's own key for prefix `/{catalog}/g/{gs}` at its own exchange endpoint, following §C.5's issuance rules (`application/json`, `415`, credentialed CORS). Service applies §9 to its own origin, keeps which subjects each `gs` stands for, and applies `exchangeRate` (§6.6) to its exchanges, buckets shared across instances.
   - `gs` cookie other than `all` authorises listings of that subject set only; `problems`, `orphans`, manifests `403` under it. Listings cached per (listing, subject set, `at`). **[vectors I.8]**
 - [ ] **SVC-41** (Listings are filtered by their subject set)
@@ -686,6 +687,48 @@ Suggested conformance profiles (not in the spec; proposed):
 ### §B.11.8 Staleness and revocation
 
 - [ ] **SVC-46** (Overtaken decisions) A Move grant's `exp` is at most catalog's `maxLag` (§7.4) after its decision.
+
+### §B.11.9 Filtered namespace reads
+
+- [ ] **SVC-47** (B.11.9, Where, Partial reader) Optional. Origin implementing it serves partial readers a namespace's own reads, filtered; one that doesn't answers them as §C.5 says.
+  - Covers a namespace that trusts a catalog, its branches and that catalog, each neither public, sealed nor end-to-end; applies in those where origin implements it. A namespace trusts each catalog its `catalogs` names whose `catalog.trust` lists it, through its keys whose `requireAt` names that catalog (§B.11.3). End-to-end catalog makes nothing visible.
+  - Partial reader: grant verifies in `{ns}` and allows `read` there (§C.2 items 1, 2), without unrestricted `read` (§2.1).
+  - Unrestricted readers keep unfiltered answers and URLs. At filtered URLs: grant in `Authorization` `403`; `/ns/{ns}` cookie served as that `gs`'s cookie would be.
+- [ ] **SVC-48** (Visible, Placement, Deleted resources, Branches, Catalogs) Resource visible to partial reader when both hold, at the answer's one combined checkpoint (SVC-53):
+  1. a catalog `{ns}` trusts makes it visible: §B.11.5's item visibility for subject set of its `gs`, at item's placement there;
+  2. grant its `gs` stands for allows it: blocks and key scope allow `read` of `/r/{ns}/{name}` as §C.2 judges that read, roles counting only as §B.11.5 counts them.
+  - Only live placement makes visible: never placed, or placement deleted: hidden.
+  - Tombstoned or purged resource judged at its placement as if live (§B.11.5).
+  - Branch resource visible when its name has live document in its base as of branch's `at`, and so in each base up to the namespace trusting the catalog, where item 1 makes it visible, and item 2 allows it in the branch. Document new in branch, or never placed in base: hidden.
+  - Catalogs show node only if item 2 allows it and §B.11.5's node test makes it visible; never placement whose item doesn't exist or is tombstoned. Node's own tombstone or purge judged as for deleted resources.
+- [ ] **SVC-49** (Answers, table) To partial reader; other reads answered as without §B.11.9:
+  - `GET /ns/{ns}`: head pointer of §7.4. `GET /ns/{ns}/rev/{ns_id}`, `/ns/{ns}/grants/{gid}`: `403`, unchanged.
+  - `/heads`, log ranges, long-poll, events: filtered (SVC-50–SVC-52).
+  - `GET /ns/{ns}/branches`: `private, no-store`, listing only local branches in which its grant verifies and allows `read`.
+  - Gestures listing (§7.4), index queries (§A.4): filtered by visibility, index as §A.4 says.
+- [ ] **SVC-50** (Log entries) Entries keep their shapes; only the set changes.
+  - `head`, `tombstone`, `purge`, `prune` shown when their resource is visible; `config`, `purge-ns` always; `branch` never.
+  - `batch` shows only visible `entries`, and `gestures`, `source.ids` without hidden names. No visible item: dropped, or kept as `config`-only batch if it has a config entry.
+- [ ] **SVC-51** (Log ranges, `/heads`)
+  - Log ranges paged as §7.1, batch counting as its visible items, hidden entry as one; each page serves its visible entries, possibly none. Long-poll and event pages count alike.
+  - Range ends at `ns_id` of `{ns}` in its `at`, which answers at an `at` carry as `X-Namespace-Revision`. Every page but last carries `X-Log-Next` naming its last entry, visible or not.
+  - `/heads`: only visible rows, as §7.4 gives them, pages filled to `logPageSize`; `next` (last row returned) on every full page and no other.
+- [ ] **SVC-52** (Long-poll, Events, Cost)
+  - Long-poll: only visible entries answer `200` or end a wait; interval with none ends `204`. `X-Namespace-Revision` names newest entry scanned; `since` naming a hidden one accepted. `X-Cursor` unchanged.
+  - Events carry only visible entries, visibility judged again, at a current checkpoint, with each read check §7.3 repeats; `Last-Event-ID` may name a hidden entry.
+  - SHOULD: on each wake, each new entry's visibility evaluated at most once per `gs` with waiting followers, who share the answer.
+- [ ] **SVC-53** (URLs, Purged namespaces)
+  - Ranges at `/ns/{ns}/g/{gs}/at/{at}/heads` and `…/log`. `at` = combined checkpoint (§B.5) of every namespace whose state visibility reads, as §B.11.4's `checkpoint` lists them: `{ns}`, each catalog deciding it, each content namespace whose roles or keys those decisions read, branch's bases included; base's documents read as of the `at` its branch reads it at. Cache key: `gs` and that checkpoint, never catalog head alone.
+  - Answered at an `at` as §B.5 says, immutable, tagged as unfiltered forms plus `ns:{…}` per other namespace in `at`.
+  - Long-poll at `/ns/{ns}/g/{gs}/log`, events at `/ns/{ns}/g/{gs}/events`.
+  - URL under that prefix without `at` (`…/g/{gs}/heads`, or `…/g/{gs}/log` without `live`): `302` to its form at current `at`, `private, no-store`, under the cookie (§B.11.5). Partial reader at unfiltered URL: `302` to filtered form (ranges at current `at`), `private, no-store`, by grant in `Authorization`.
+  - Otherwise served as §B.11.5 serves listing URLs, except as SVC-54.
+  - Purged namespaces answer these URLs as §8.5 answers their unfiltered forms.
+- [ ] **SVC-54** (`gs`, Edge grants)
+  - `gs` is §B.11.5's, never `all`; `subjects` the deciding subjects for every catalog `{ns}` trusts together (branch: its bases'; catalog: itself), plus string `scope:{digest}` of §A.4's marker for `{ns}`.
+  - Rules referring to `/now`: `{ns}` unreadable this way (`403`), as §A.4.
+  - Origin keeps per `gs` its subjects and the rules and `/principal` values its marker digests; judges item 2 (SVC-48) under a cookie, a miss included, from those, never from a grant the request doesn't carry. Beyond §B.11.5's deciding-groups rule, `gs` cookie `403` at an `at` where those rules differ, until reader exchanges again.
+  - Origin's exchange (§C.5.2) gives partial reader whose grant doesn't fix `/resource` prefix `/ns/{ns}/g/{gs}`, after resolving its subjects; cookie never outlasts that grant. For that prefix §C.5.2's refusals concerning `/resource` rules and qualifying roles don't apply; its rules-pass-now check covers only block and key-scope rules not referring to `/resource` (item 2 judges per resource); refusals for no `read` and for `/now` still apply.
 
 ## Addendum C — Capabilities and access
 
@@ -798,15 +841,15 @@ Suggested conformance profiles (not in the spec; proposed):
 
 ### §C.5 Reading
 
-- [ ] **AUTH-21** (Read modes, Public, Grant, The stream is metadata, Three exceptions) Namespace document `"read": "public" | "grant"` (default `"grant"`).
+- [ ] **AUTH-21** (Read modes, Public, Grant, The stream is metadata, Four exceptions) Namespace document `"read": "public" | "grant"` (default `"grant"`).
   - Public: cached publicly. `grant`: served with grant in `Authorization`, or via edge grants issued for verified grant with `read` (not in cache key; downstream caching `private`).
   - `/ns/{ns}` and everything under it (events stream and long-poll included) need unrestricted `read` (§2.1); resource's own URLs (events included) need `read` on that resource.
-  - Origin answers with grant in `Authorization`, `no-store`: gestures listing (filtered per resource), `GET /ns/{ns}/principal`, `POST /ns/{ns}/keys`.
+  - Exceptions: filtered reads (§B.11.9); and, answered by origin with grant in `Authorization`, `no-store`: gestures listing (filtered per resource), `GET /ns/{ns}/principal`, `POST /ns/{ns}/keys`.
 
 ### §C.5.2 Issuing edge grants
 
 - [ ] **AUTH-7** (Scope, Request, Answer, Browsers, What a cookie authorises) `POST /edge-grants` on origin takes grant in `Authorization`, or `{ "grants": [ … ] }` with `Content-Type: application/json`; issues per grant for every namespace all its `ns`-carrying blocks name.
-  - **Scope.** Smallest edge prefix grant allows: `/r/{ns}/{name}` (one per name) when its rules fix `/resource` (§2.1); else `/r/{ns}` and `/ns/{ns}`.
+  - **Scope.** Smallest edge prefix grant allows: `/r/{ns}/{name}` (one per name) when its rules fix `/resource` (§2.1); else `/r/{ns}` and `/ns/{ns}`, or, to partial reader where §B.11.9 applies, `/ns/{ns}/g/{gs}` in their place.
   - **Answer.** `200`, `{ "prefixes": [ … ], "exp" }`, one `Set-Cookie` per prefix (named per §C.5.3): no `Domain`, `Path` = prefix, `Secure`, `HttpOnly`, `SameSite=None` when deployment names credentialed origins else `Lax`.
   - **Lifetime.** Earliest `exp` among grant's blocks or 15 minutes, whichever sooner. A prefix given by several grants: one cookie, as long as longest; body `exp` = earliest, RFC 3339.
   - **Browsers.** Credentialed responses name calling origin from deployment's list, `Access-Control-Allow-Credentials: true`, `Vary: Origin`; never `*` or echoed `Origin`.
@@ -852,7 +895,7 @@ Suggested conformance profiles (not in the spec; proposed):
 - [ ] **AUTH-25** (Least privilege) A service gets `read` for what it follows; one that writes back gets narrowing block with `writes within` its own paths, without `restore`, `delete`, `purge`, `config`, `branch`, `purge-ns`, `export`, `prune`.
 - [ ] **AUTH-26** (Services verify as the origin does, Filtering proxies, Services that re-publish content MUST enforce reader permissions)
   - Local grant verification applies keys, scopes (`readScope` included), revocations, `grantSize`, `rulesPerGrant` as §C.2 does.
-  - A filtering proxy serving namespace's `/ns/{ns}/…` view per document pages and derives cursors itself, never passing upstream ones on.
+  - Where origin doesn't filter itself (§B.11.9), a filtering proxy serving namespace's `/ns/{ns}/…` view per document pages and derives cursors itself, never passing upstream ones on.
   - A re-publishing service MUST filter search, tree and catalog results by reader's verified grant; private results cached per `gs`, never with embedded bearer URLs.
 
 ### §C.7 Private content and guessable hashes
@@ -1064,6 +1107,7 @@ Suggested conformance profiles (not in the spec; proposed):
   - Grant allows exactly batch's `/resource` and `/action` pairs, expires within minutes, and is signed with dedicated key that can neither assert admin groups nor write `$access`; root `sub` merge service's, `attrs.approvedBy` approver. It is handed only to merge service, which submits exactly batch checked.
   - Batch changing `$access`, or moving or re-placing so as to widen (§B.11.4), and any end-to-end catalog batch, goes only with approver in `catalog-admins`: dry-run checked (except end-to-end) with that admin as caller, submitted under their grant through merge service, which adds narrowing block with its own `via`.
   - Catalog base lists in `merge.authors` merge service's `sub` with merge key's `kid`, and each such admin.
+  - Under filtered reads (§B.11.9), partial readers of content branch see only documents visible to them in base. Collaborators get unrestricted `read` on every branch of release; draft placements live in catalog branch listed with content branch in release (§F.9), never in catalog base. Branch only editing existing documents needs none; one adding documents (a rename included) or moving or re-placing them places them in catalog branch, which can join release later from catalog's current head.
 - [ ] **MRG-11** (Editors limited to some documents, Indexes) A service branching base for editors limited to some documents records creation with `via`, creates branch with `read: "grant"`, and issues grants fixed to resources their base grants cover. The main index follows only base; search over branch is a separate preview index.
 
 ### §F.8.1 Merging and rebasing at E3
@@ -1077,7 +1121,7 @@ Suggested conformance profiles (not in the spec; proposed):
 
 ### §F.9 Releases across namespaces
 
-- [ ] **MRG-15** (Where it lives, Starting, Cleanup) Every tool acting on release document checks for itself, under its own authority, what it is about to do. Branch's own `at` overrides document's. Janitor purges release's draft branch after its other branches; release document never authorises purge.
+- [ ] **MRG-15** (Where it lives, Starting, Cleanup) Every tool acting on release document checks for itself, under its own authority, what it is about to do. Branch's own `at` overrides document's; branches SHOULD start at heads current together (e.g. `ns_id`s in catalog service's combined checkpoint, §B.5), except catalog branch added later (§F.8). Janitor purges release's draft branch after its other branches; release document never authorises purge.
 - [ ] **MRG-16** (Reading) Release previews follow listed branches, refuse viewers (`403`) as §B.5 says, never show base's versions.
 - [ ] **MRG-5** (Merging) A release merges as one batch per branch.
   - Before approval: each listed branch's `base` is namespace it is keyed by (or, for release built on another, that release's branch for key) and it is not frozen or purged; on resuming, its own approval's freeze is accepted.
@@ -1284,7 +1328,7 @@ Suggested conformance profiles (not in the spec; proposed):
 - [ ] **FILE-21** (What a user's tokens share, Re-checking) Guards, user's own deletes, move-aside marks and records are per user. Scratch files, placeholders, locks with owners and dead properties are kept per user and scope (root block without `kid`, `sub`, `nbf`, `exp`, `at`, `enc`, `signers`; narrowing blocks without `nbf`, `exp`; `ns`, `can`, `roles`, `groups` compared as sets), served only to token of that scope whose grant names namespace. Read caches are per token.
   - Per-user state is bounded; new scope when content scopes are full: `503` with `Retry-After`, never dropping one holding content.
   - Gateway creates state for grant only after core accepted it, bounds the users it keeps state for, re-checks grant at least every five minutes, relies on `writer` block 30 seconds at most (re-read after `409 frozen`, `422 nonce` or a limit refusal), and stops serving token core refuses, keeping user's state for other tokens, each re-checked at its next request.
-- [ ] **FILE-22** (Limited grants, Catalog writes, Sealed and end-to-end namespaces) A grant limited to some resources lists only in tree with tree-derived access, via tree service; gateway learns what it needs to write, and tree's settings, from `GET /ns/{ns}/principal`. Catalog writes carry fresh `$nonce` where catalog requires nonces or is sealed. Gateway without keys doesn't offer sealed or end-to-end namespaces and never shows their files as writable empty files.
+- [ ] **FILE-22** (Limited grants, Catalog writes, Sealed and end-to-end namespaces) A grant limited to some resources lists in tree with tree-derived access via tree service (filtering by reader, §B.11.5), or a flat view from namespace's filtered `/heads` where origin offers them (§B.11.9); elsewhere it can't list, as `/heads` needs unrestricted read (§2.1, §B.5). Gateway learns what it needs to write, and tree's settings, from `GET /ns/{ns}/principal`. Catalog writes carry fresh `$nonce` where catalog requires nonces or is sealed. Gateway without keys doesn't offer sealed or end-to-end namespaces and never shows their files as writable empty files.
 
 ## Addendum I — Test vectors
 
@@ -1439,6 +1483,7 @@ Personas and folders are those of the §B.11 worked example:
 - **Folders:** `season-2026` (`match-desk: desk`, `translators: translator`, `fan-club` and `user:li`: `reader`), and TR, the "Transfer rumours" folder (`inherit: false`, `editors-in-chief: desk`).
 - **Content:** `matches.derby` is placed in `season-2026`.
 - **Roles:** `desk` lists `create` and `restore`.
+- **Filtered reads (59–92):** private, unsealed `matches` trusts `cat-season`, which is also private and unsealed: `matches`'s `catalogs` names it, its `catalog.trust` lists `matches`, and `catalog-01` in `matches` has `requireAt: "cat-season"`. The origin implements §B.11.9. li's grant verifies in `matches` and allows `read` there, with a `/resource` rule, so li is a partial reader.
 
 1. desk (bob) → Create a folder `previews`, `to: [season-2026]` → grant: the new name is exempt from the `404`, and bob has `move` at `season-2026`. The same with `to: [TR]` → `404`, since TR is hidden from him (§B.11.4 Create a folder)
 2. Folder F without `$access`, parents P1 (`group:a: desk`) and P2 (`group:b: desk`), a caller only in `a` → Place into F → `403`, since powers are judged per subject (§B.11.2 Tree powers)
@@ -1498,6 +1543,40 @@ Personas and folders are those of the §B.11 worked example:
 56. A grant that verifies in none of the namespaces a tree service follows → a listing at any `/g/{gs}` → `401`, as with no credential, never `403` (§B.11.5)
 57. End-to-end catalog `cat-season`; release step 2 unplaces `matches.derby`, and the plan's approver isn't in `catalog-admins` → no merge grant (`404`, `not_offered`) and no admin path, so the step waits. With an approver in `catalog-admins` → submitted unchecked under a `catalog-admins` member's grant, through the merge service (§F.8)
 58. File gateway on its own grant, narrowed per user, that isn't configured for a tree → the tree isn't served, whether or not it has tree-derived access (§H.7 Grants)
+59. li's grant, narrowed by a block to `derby` → `GET /ns/matches/rev/{ns_id}/heads` → `302`, `private, no-store`, to `/ns/matches/g/{gs}/at/{at}/heads`, which lists only `derby` (§B.11.9 Visible, URLs, `/heads`)
+60. `opener` created in `matches` with no placement in `cat-season` → li → filtered `/heads`, log ranges, long-poll and index → `opener` and its entries never appear (§B.11.9 Placement, Answers, §A.4 Answers)
+61. `derby`, visible to li, is deleted → filtered logs → its `tombstone` reaches li, and not a partial reader whose block rule excludes `derby`, who couldn't see it live (§B.11.9 Deleted resources, Visible, §B.11.5)
+62. `derby`'s placement is deleted → li → every later filtered answer leaves out `derby`'s row and its entries, earlier ones included (§B.11.9 Placement, Visible, URLs, §A.4 Private namespaces)
+63. `final` created only in branch `matches-r7` → a partial reader of the branch → its filtered `/heads` and log leave `final` out. A reader with unrestricted `read` on `matches-r7` → sees it, unfiltered (§B.11.9 Branches, Partial reader)
+64. li → `GET /ns/matches/rev/{ns_id}` → `403`. `GET /ns/matches/principal` → `200`, with `roles` only its effective roles, each `{ name, can, rules }`, never the namespace's whole `roles` (§B.11.9 Answers, §7.4)
+65. Placement `matches.final` in `cat-season`, whose item doesn't exist yet → a partial reader of `cat-season` → its filtered `/heads` and log leave the placement out (§B.11.9 Catalogs)
+66. li, filtered `/heads` with rows `a` and `c` visible and `b` and `d` hidden → `next`, where present, is the last row returned, never `b` or `d`, whichever row the scan ended on (§B.11.9 `/heads`)
+67. One batch writes visible `derby` and hidden `secret`, each with a gesture, and its `source.ids` name both → li's filtered log → its `entries`, `gestures` and `source.ids` name only `derby` (§B.11.9 Log entries)
+68. li's grant names only `matches` in `ns`, and `matches` has branch `matches-r7` → `GET /ns/matches/branches` → `200`, `private, no-store`, without `matches-r7`, since the grant fails the `ns` check there. Its `branch` entry is left out of filtered logs too (§B.11.9 Answers, Log entries, §7 step 2)
+69. No `$access`, role or key rule names `group:interns`, so li's `gs` leaves it out. Then a folder's `$access` names `group:interns: reader` → li, on her old `gs` cookie → listings and filtered reads at a later `at` → nothing more through `interns`, and less where the folder now needs it; her `gs` holds `"partial"` (§B.11.5, §B.11.9 `gs`)
+70. `matches` sealed (E2), still trusting `cat-season` → li → `/heads`, a log range or long-poll → `403`, unchanged, with no filtered URL (§B.11.9 Where, §C.5)
+71. Two partial readers with the same subjects, one with a block rule limiting it to `^pub-` → filtered `/heads` → different `gs`, so they share no cached page (§B.11.9 `gs`, §A.4)
+72. Twenty writes to documents hidden from li during one interval → li's long-poll → no `200`, and `204` at the interval's end, `X-Namespace-Revision` naming the newest of them. Her next poll with that `since` is accepted (§B.11.9 Long-poll)
+73. A batch with a `config` change that writes only hidden `secret` → li's filtered log → a `batch` holding only its config entry. Without the `config` change → dropped (§B.11.9 Log entries)
+74. li's grant in `Authorization` at another subject set's `/ns/matches/g/{gs}/…` → `403`. A filtered URL with neither a grant nor a verified cookie → `401` (§B.11.9 URLs, §B.11.5)
+75. A partial reader whose only read role tests `/resource` by pattern, and whose grant fixes no `/resource` → `POST /edge-grants` → `200` with only `/ns/matches/g/{gs}`, never `/r/matches` or `/ns/matches`. With a block rule on `/now` → `403` (§C.5.2 Scope, §B.11.9 Edge grants, `gs`)
+76. A reader with unrestricted `read` on `matches` → `GET /ns/matches/rev/{ns_id}/heads` and `…/log` → `200`, unfiltered, at those URLs; at a filtered URL with the grant in `Authorization` → `403`; with a `/ns/matches` cookie → served as that `gs`'s cookie would be (§B.11.9 Partial reader)
+77. Gesture `G` wrote visible `derby` and unplaced `opener` → li → `GET /ns/matches/gestures/G` → only `derby`'s entries (§7.4, §B.11.9 Answers)
+78. As in 69, but `matches` adds to `reader` a rule `not /principal/groups contains const "contractors"`, and li is in `contractors`, which her `gs` dropped → li, on her old `gs` cookie, at the new `at` → `403` until she exchanges again, never what the rule now denies her. Her old `gs` holds `"partial"` and her new one doesn't, so no reader shares a cache entry across the change (§B.11.5 deciding subjects, §B.11.9 `gs`)
+79. A role rule `{ "op": "test", "path": "/principal/groups/0", "value": "fan-club" }`; li's first group is `interns` → li's `gs` → all her groups kept, since the rule tests a position, so it is judged against her real first group (§B.11.5)
+80. The catalog moves `derby` into TR and `matches` doesn't change → a partial reader in `fan-club` → index query on `matches` → a redirect to a new `at`, whose hits, facets and `counts` leave out `derby` (§A.4 Private namespaces, §B.11.9 URLs)
+81. li's `/ns/matches/g/{gs}/events` is open, and `derby`'s placement moves into TR → later `derby` entries → not sent (§B.11.9 Events)
+82. li, filtered `/heads` with exactly `logPageSize` visible rows after `after`, followed only by hidden rows → `next` present, and the next page empty, without `next`. With no rows at all after them → the same first page (§B.11.9 `/heads`)
+83. A batch writes one visible item and 999 hidden ones → li's filtered log range → pages cut as if the batch had one item (§B.11.9 Log ranges)
+84. `matches` trusts only `cat-e2e`, an end-to-end catalog → li → filtered `/heads` and log → no resource rows or entries, only `config` and `purge-ns` entries, never unfiltered (§B.11.9 Where)
+85. `matches` trusts `cat-a`, which has a direct entry for li, and `cat-b`; bo has li's groups and no direct entry → their filtered `gs` differ, since `subjects` joins every catalog's deciding subjects (§B.11.9 `gs`)
+86. li's own rules allow `opener`, which has no placement in `cat-season`; gesture `G` wrote `derby` and `opener`, and li knows the id `X` of `opener`'s entry → `GET /ns/matches/gestures/G?after=opener/X` → `404`, as for an entry that doesn't exist (§7.4, §B.11.9 Answers)
+87. `matches` tombstones `derby` after branch `matches-r7` was created, and `cat-season` doesn't change → a partial reader of the branch → `derby` as visible as before, the base being judged as of the branch's `at`. Once `derby`'s placement is deleted → hidden from the next filtered answer on, at a new `at` (§B.11.9 Branches, URLs)
+88. Placements in `cat-season` unchanged; `matches` adds a rule `not /resource = "final"` to role `reader`, and `final` exists → a partial reader of `cat-season` reading through `reader` → its filtered `/heads` redirects to a new `at`, as `at` covers `matches`, which leaves out `matches.final` (§B.11.9 URLs, Catalogs, §B.11.5)
+89. li holding only the `/ns/matches/g/{gs}` cookie → `GET /ns/matches/rev/{ns_id}/heads` → `401`. `GET /ns/matches/g/{gs}/heads` → `302`, `private, no-store`, to the current `at`. `…/g/{gs}/log?since=…` without `live` → `302` to the range at the current `at`, whose pages she reads until one without `X-Log-Next`, each with `X-Namespace-Revision` naming the `ns_id` of `matches` it ends at (§B.11.9 URLs, Log ranges, §C.5.3)
+90. A partial reader narrowed by a block rule, or a key-scope rule, `/resource` matching `^pub-`, fixing no name → `POST /edge-grants` → `200` with only `/ns/matches/g/{gs}`; its filtered `/heads` lists only visible `pub-` documents (§C.5.2 Scope, §B.11.9 Edge grants, Visible)
+91. `matches` has a registered remote branch → li → `GET /ns/matches/branches` → no `remote` row (§B.11.9 Answers)
+92. A placement that a partial reader of `cat-season` saw live is deleted → its filtered `cat-season` log → the `tombstone` reaches it. A placement whose item doesn't exist yet → neither it nor its entries appear (§B.11.9 Catalogs, Deleted resources)
 
 ### Encryption levels and epochs
 
@@ -1564,7 +1643,7 @@ Personas and folders are those of the §B.11 worked example:
 
 ### Grant scope
 
-**Invariant.** A request is allowed only through what every block, the key's scope and at least one effective role allow together. No role, value or block a narrowing step dropped counts. "Unrestricted", "qualifying" and "fixes `/resource`" are judged so that nothing reads more than its rules permit. Members that widen exposure or touch keys move only under a `*` key, or the operator grant that creates the namespace.
+**Invariant.** A request is allowed only through what every block, the key's scope and at least one effective role allow together. No role, value or block a narrowing step dropped counts. "Unrestricted", "qualifying" and "fixes `/resource`" are judged so that nothing reads more than its rules permit. Members that widen exposure or touch keys move only under a `*` key, or the operator grant that creates the namespace. Unless a line says otherwise, its namespace trusts no catalog, so §B.11.9 doesn't apply.
 
 1. Root `roles: ["reader", "scoped"]` (`scoped` has a `/resource` rule), narrowed to `["scoped"]` → branch the namespace, or `POST /edge-grants` → `403`: only effective roles count, so there is no unrestricted `read` and no qualifying role for `/r/{ns}` (§2.1)
 2. Roles `B` (a `/now` office-hours rule, no `/resource` rule) and `A` (`not /resource = "secret"`), out of hours → `GET /ns/{ns}/log` → `403`. Only roles without `/resource` rules count where unrestricted `read` is needed, and `B` fails (§2.1 Unrestricted read)
@@ -1622,3 +1701,6 @@ Personas and folders are those of the §B.11 worked example:
 54. An entry recorded with `grant: null` while authentication was disabled. Under `grants`, a retry of it by a grant whose root `sub` equals its `author` → `412`, not `200` (§7.2, §1 Conformance)
 55. A reader on `GET /r/matches/derby/events`, past replay and waiting for live entries; the grant is revoked, then `derby` gets a revision before the next keep-alive → the revision is not sent, and the stream ends: live entries are log pages fetched, judged again first. Grant scope 48's live case (§7.3)
 56. A caller with `purge` and without `read` → purge of a name that never existed, with `If-Match` → `404`, with no `head`, never `412`. Without a precondition → `428` (§6.2 step 2.5, §7.2)
+57. A grant limited by a `/resource` rule in a namespace that trusts no catalog → `GET /ns/{ns}/gestures/G` → the entries of resources its grant may read, as before (§7.4)
+58. Line 1's grant (`scoped` only, a `/resource` rule, no fixed name) in `matches` where §B.11.9 applies (Tree-derived access 59–92) → `POST /edge-grants` → `200` with only `/ns/matches/g/{gs}`, never `/r/matches` or `/ns/matches`; its filtered `/heads` lists only documents both visible and allowed by `scoped`'s rules. Branching `matches` → `403` (§C.5.2 Scope, §B.11.9 Edge grants, Visible, §7.6)
+59. Fifty `/read-grants` grants, each fixed to one name in `matches`, where §B.11.9 applies → `POST /edge-grants` → `200` with their fifty `/r/matches/{name}` prefixes and no `/ns/matches/g/{gs}` (§C.5.2 Scope)
