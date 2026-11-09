@@ -353,7 +353,7 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 	// refuses it (catErr): g/all needs none there (§B.11.5). A grant over
 	// grantSize or rulesPerGrant is 413 wherever it is presented, before
 	// any ns check (§C.8).
-	vg, catErr := s.checker.Verify(ctx, cat, token)
+	vg, catErr := s.verify(ctx, cat, token)
 	var le *grantcheck.LimitError
 	var ae *grant.AuthError
 	switch {
@@ -391,7 +391,14 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 		case c.Read == "public":
 			public[ns], unres[ns], wide[ns] = true, true, true
 		default:
-			if cv, err := s.checker.Verify(ctx, real, token); err == nil {
+			cv, err := s.verify(ctx, real, token)
+			if _, ok := chainErr(err); ok {
+				// A requireAt chain it can't read is no refusal there:
+				// the listing is 503 or 502, never served as if the grant
+				// didn't verify (§C.4).
+				return nil, err
+			}
+			if err == nil {
 				unres[ns], wide[ns] = s.checker.ReadsUnrestricted(cv), s.checker.NamespaceWide(cv)
 				exp = grantExp(cv, exp)
 				if v.bucket == "" {
@@ -739,11 +746,25 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 // WriteAuthError writes a grant failure (401/403) or an upstream error. A
 // grant over grantSize or rulesPerGrant is 413, code limit, naming the
 // limit, as the origin answers it (§C.8): services verify as the origin
-// does (§C.6).
+// does (§C.6). A verifier that can't read the chain a key's requireAt
+// names is 503 behind, with Retry-After, while the cause is transient
+// (§A.1), and 502 upstream otherwise, naming no namespace, never 403
+// (§C.4, §12.1).
 func WriteAuthError(w http.ResponseWriter, err error, logf func(string, ...any)) {
 	var le *grantcheck.LimitError
 	if errors.As(err, &le) {
 		svcedge.Limit(le.Limit, le.Measured, le.Max).Write(w)
+		return
+	}
+	if transient, ok := chainErr(err); ok {
+		logf("tree: reading a requireAt chain: %v", err)
+		w.Header().Set("Cache-Control", "no-store")
+		if transient {
+			w.Header().Set("Retry-After", "5")
+			WriteError(w, http.StatusServiceUnavailable, "behind", msgChainBehind)
+			return
+		}
+		WriteError(w, http.StatusBadGateway, "upstream", msgChainUpstream)
 		return
 	}
 	var ae *grant.AuthError
@@ -760,6 +781,40 @@ func WriteAuthError(w http.ResponseWriter, err error, logf func(string, ...any))
 	logf("tree: access check: %v", err)
 	WriteError(w, http.StatusBadGateway, "upstream", "cannot read a namespace configuration")
 }
+
+// verify verifies token for ns with the checker, or with verifyHook where
+// one is set and fails it (tests).
+func (s *Service) verify(ctx context.Context, ns, token string) (*grant.Verified, error) {
+	if f := s.verifyHook.Load(); f != nil {
+		if err := (*f)(ns); err != nil {
+			return nil, err
+		}
+	}
+	return s.checker.Verify(ctx, ns, token)
+}
+
+// chainUnreadable is the error of a verifier that can't read the chain a
+// key's requireAt names (§C.4): grantcheck's, which grant.Verify passes on
+// as it is, joined by this method alone. transient is whether the cause
+// is (§A.1): a transport error, deadline, 5xx, 408 or 429.
+type chainUnreadable interface{ ChainUnreadable() (transient bool) }
+
+// chainErr reports whether err is a chainUnreadable (ok), and if so
+// whether its cause is transient.
+func chainErr(err error) (transient, ok bool) {
+	var cu chainUnreadable
+	if !errors.As(err, &cu) {
+		return false, false
+	}
+	return cu.ChainUnreadable(), true
+}
+
+// The fixed bodies of a requireAt chain that can't be read: they name no
+// namespace, the chain's or the grant's (§C.4).
+const (
+	msgChainBehind   = "the service cannot read the chain a key's requireAt names yet"
+	msgChainUpstream = "cannot read the chain a key's requireAt names"
+)
 
 func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs string, isAt bool) {
 	ctx := r.Context()
@@ -1722,6 +1777,14 @@ func (s *Service) awaitMins(ctx context.Context, vals []string, token string) mi
 		}
 		switch ok, err := o.sees(ctx, m.ns, token); {
 		case err != nil:
+			if transient, ok := chainErr(err); ok {
+				// As WriteAuthError answers it (§C.4).
+				s.opt.Logf("tree: access check for %s: %v", m.ns, err)
+				if transient {
+					return minAnswer{status: http.StatusServiceUnavailable, code: "behind", msg: msgChainBehind}
+				}
+				return minAnswer{status: http.StatusBadGateway, code: "upstream", msg: msgChainUpstream}
+			}
 			s.opt.Logf("tree: access check for %s: %v", m.ns, err)
 			return minAnswer{status: http.StatusBadGateway, code: "upstream", msg: "cannot read a namespace configuration"}
 		case !ok:
@@ -1817,7 +1880,7 @@ func (s *Service) sees(ctx context.Context, ns, token string) (bool, error) {
 	if token == "" {
 		return false, nil
 	}
-	v, err := s.checker.Verify(ctx, s.actual(ns), token)
+	v, err := s.verify(ctx, s.actual(ns), token)
 	var ae *grant.AuthError
 	switch {
 	case errors.As(err, &ae):

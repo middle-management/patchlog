@@ -285,9 +285,23 @@ type plan struct {
 	expBy        time.Time
 }
 
-// Authenticate verifies a caller's grant for the catalog namespace.
+// Authenticate verifies a caller's grant for the catalog namespace. An
+// error is answered by tree.WriteAuthError as it is: a requireAt chain
+// the checker can't read is 503 behind or 502 upstream there, never 403
+// (§C.4).
 func (s *Service) Authenticate(ctx context.Context, r *http.Request) (*grant.Verified, error) {
-	return s.t.Checker().Verify(ctx, s.t.Catalog(), tree.Bearer(r))
+	return s.verify(ctx, tree.Bearer(r))
+}
+
+// verify verifies tok for the catalog namespace, failing as verifyHook
+// says where one is set (tests).
+func (s *Service) verify(ctx context.Context, tok string) (*grant.Verified, error) {
+	if f := s.verifyHook.Load(); f != nil {
+		if err := (*f)(); err != nil {
+			return nil, err
+		}
+	}
+	return s.t.Checker().Verify(ctx, s.t.Catalog(), tok)
 }
 
 func (s *Service) serveGrants(w http.ResponseWriter, r *http.Request) {

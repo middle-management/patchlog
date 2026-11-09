@@ -57,3 +57,13 @@ func (s *Service) BeforeListing(f func()) {
 	}
 	s.beforeListing.Store(&f)
 }
+
+// FailVerify sets f to fail the verification of a grant in each
+// namespace it returns an error for (tests); nil unsets it.
+func (s *Service) FailVerify(f func(ns string) error) {
+	if f == nil {
+		s.verifyHook.Store(nil)
+		return
+	}
+	s.verifyHook.Store(&f)
+}

@@ -208,6 +208,10 @@ type Service struct {
 	// beforeListing, if set, runs as a listing starts, outside the
 	// graph's lock (tests: a checkpoint that moves meanwhile).
 	beforeListing atomic.Pointer[func()]
+	// verifyHook, if set, fails the verification of a grant in each
+	// namespace it returns an error for (tests: a requireAt chain the
+	// checker can't read).
+	verifyHook atomic.Pointer[func(ns string) error]
 
 	wmu     sync.Mutex // serialises applies across followers
 	pmu     sync.Mutex

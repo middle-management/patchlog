@@ -211,7 +211,7 @@ func (s *Service) verifyHeader(ctx context.Context, h string) (*grant.Verified, 
 	if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
 		tok = strings.TrimSpace(h[7:])
 	}
-	return s.t.Checker().Verify(ctx, s.t.Catalog(), tok)
+	return s.verify(ctx, tok)
 }
 
 type mergeItem struct {
