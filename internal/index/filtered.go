@@ -946,21 +946,33 @@ var (
 	errUncovered    = &grant.AuthError{Status: 403, Msg: "the namespace is no longer read filtered: exchange the grant again (§B.11.9)"}
 )
 
-// storedFview is the view of a cookie for marker reads:{ns}:g:{gs} at cp,
-// judged from what the exchange recorded alone (rec), never from a grant
-// the request doesn't carry: 403 where the scope digest of rec's kid's
-// scope rules and its roles' definitions, read from ns's document as of
-// cp (a branch's keys follow its base, §C.4), with its block rules and
-// principal, differs from the one its subjects carry (a kid or role gone,
-// or no longer listing read, counts as differing), where the key with
-// rec's kid no longer has the pub it had (§B.11.9 gs: a key "no longer
-// accepted" as §C.4 judges a base's keys, "only while the base has it with
-// the same pub"; a record without one, from before migration 006, never
-// does), and where its subjects
-// leave out some of the reader's groups and some deciding catalog keeps
-// all groups (§B.11.5); otherwise item 1 from rec's subjects and item 2
-// from its filter.
-func (ix *Index) storedFview(ctx context.Context, cp *fcp, rec *markerRec) (*fview, error) {
+// storedFview is the view of a cookie for marker m, reads:{ns}:g:{gs}, at
+// cp, judged from what the exchanges recorded alone (rec, gsKeys), never
+// from a grant the request doesn't carry: 403 where, for any key a live
+// cookie of m came from (gsKeys: the cookie doesn't say which is its
+// own, so each must hold), the scope digest of its kid's scope rules and
+// its roles' definitions, read from ns's document as of cp (a branch's
+// keys follow its base, §C.4), with rec's block rules and principal,
+// differs from the one rec's subjects carry (a kid or role gone, or no
+// longer listing read, counts as differing), or the key with its kid no
+// longer has the pub it had (§B.11.9 gs: a key "no longer accepted" as
+// §C.4 judges a base's keys, "only while the base has it with the same
+// pub"; a record without one, from before migration 006, never does),
+// where m has no such key recorded (from before migration 007), and where
+// its subjects leave out some of the reader's groups and some deciding
+// catalog keeps all groups (§B.11.5); otherwise item 1 from rec's
+// subjects and item 2 from its filter. Readers with the same subjects
+// and rules share m, so once a key one came from is replaced, the
+// others' cookies are 403 too, until the replaced key's last cookie
+// expires: never a cookie read under a key no longer accepted.
+func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *markerRec) (*fview, error) {
+	recorded, err := ix.gsKeys(ctx, m, ix.opt.Now())
+	if err != nil {
+		return nil, err
+	}
+	if len(recorded) == 0 {
+		return nil, errRulesChanged
+	}
 	doc, err := ix.docAt(ctx, cp.ns, cp.reads[cp.ns])
 	if err != nil {
 		return nil, err
@@ -977,25 +989,10 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, rec *markerRec) (*fvi
 		}
 		keys = eff.Keys
 	}
-	i := slices.IndexFunc(keys, func(k grant.Key) bool { return k.Kid == rec.kid })
-	if i < 0 || !keys[i].Lists("read") || rec.pub == "" || keyPub(keys[i]) != rec.pub {
-		return nil, errRulesChanged
-	}
-	in := grantcheck.ScopeInput{ReadScopeResource: keys[i].ReadScopeResource, KeyRules: keys[i].Rules,
-		BlockRules: rec.f.BlockRules, Roles: map[string][]any{}, Principal: rec.f.Principal}
-	for _, r := range rec.roles {
-		// A role that no longer lists read counts as gone, as at the
-		// origin (core gsDigestHolds): a cookie never reads where its
-		// grant couldn't (§2.1, §A.4).
-		def, ok := cfg.Roles[r]
-		if !ok || !def.Lists("read") {
+	for _, k := range recorded {
+		if !gsKeyHolds(cfg, keys, rec, k) {
 			return nil, errRulesChanged
 		}
-		in.Roles[r] = def.Rules
-	}
-	d, ok := grantcheck.ScopeDigest(in)
-	if !ok || !slices.Contains(rec.subjects, catvis.ScopePrefix+d) {
-		return nil, errRulesChanged
 	}
 	if slices.Contains(rec.subjects, catvis.Partial) {
 		for _, c := range cp.cats {
@@ -1005,6 +1002,32 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, rec *markerRec) (*fvi
 		}
 	}
 	return newFview(cp, rec.subjects, rec.f), nil
+}
+
+// gsKeyHolds reports whether k, a key a cookie of rec's marker came from,
+// is still accepted with the pub it had, among keys (cfg's, or for a
+// branch its effective ones, §C.4), and its scope rules and its roles'
+// definitions in cfg, with rec's block rules and principal, still digest
+// to the scope subject rec's subjects carry (storedFview).
+func gsKeyHolds(cfg *grantcheck.Config, keys []grant.Key, rec *markerRec, k gsKey) bool {
+	i := slices.IndexFunc(keys, func(key grant.Key) bool { return key.Kid == k.kid })
+	if i < 0 || !keys[i].Lists("read") || k.pub == "" || keyPub(keys[i]) != k.pub {
+		return false
+	}
+	in := grantcheck.ScopeInput{ReadScopeResource: keys[i].ReadScopeResource, KeyRules: keys[i].Rules,
+		BlockRules: rec.f.BlockRules, Roles: map[string][]any{}, Principal: rec.f.Principal}
+	for _, r := range k.roles {
+		// A role that no longer lists read counts as gone, as at the
+		// origin (core gsDigestHolds): a cookie never reads where its
+		// grant couldn't (§2.1, §A.4).
+		def, ok := cfg.Roles[r]
+		if !ok || !def.Lists("read") {
+			return false
+		}
+		in.Roles[r] = def.Rules
+	}
+	d, ok := grantcheck.ScopeDigest(in)
+	return ok && slices.Contains(rec.subjects, catvis.ScopePrefix+d)
 }
 
 // gMarker is the marker of a partial reader of covered ns with §B.11.9

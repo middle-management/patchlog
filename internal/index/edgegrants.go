@@ -48,9 +48,10 @@ import (
 // the reads and the /principal values they refer to (edge_filters,
 // markerRec), from which it filters hits per resource as for any grant
 // with that marker, and for a marker reads:{ns}:g:{gs} (§B.11.9) also its
-// subjects, the kid and role names its digest covers and its kid's pub
-// (edge_gs). They are kept across restarts and -rebuild until the last
-// such cookie expires; a gs or marker the service doesn't know, minted by
+// subjects (edge_gs) and every key it was minted under, its kid, the role
+// names its digest covers and its kid's pub (edge_gs_keys, gsKey), each
+// until the last cookie minted under it expires. They are kept across
+// restarts and -rebuild until the last such cookie expires; a gs or marker the service doesn't know, minted by
 // another instance with its own database, is 401, and the reader
 // exchanges again. Instances on one database share them, and share
 // the exchangeRate buckets too (§B.11.5). A reader of a whole namespace
@@ -64,29 +65,41 @@ import (
 // carries roles, each effective role that lists read, and its
 // /principal), from which hits are filtered per resource as for any grant
 // with that marker; for reads:{ns}:g:{gs} (§B.11.9), also its subjects,
-// from which item 1 is judged, its kid and the names of its read roles,
-// whose rules as of a checkpoint must still digest to its scope subject,
-// and the pub its kid had, which the key with that kid must still have
-// (§B.11.9 gs, §C.4; storedFview). A rule referring to /now gives no
+// from which item 1 is judged, and, from an exchange, the key its grant
+// came from (gsKey), recorded beside those of the marker's other cookies
+// (storedFview judges them all). A rule referring to /now gives no
 // marker, so the filter judges a read as the grant's read check does,
 // without a clock.
 type markerRec struct {
 	f        *grantcheck.ReadFilter
 	subjects []string // g: markers only
-	kid      string
-	roles    []string
-	pub      string // the key's pub member, as its namespace document gives it
+	key      gsKey    // g: markers from an exchange only
+}
+
+// gsKey is a key a g: marker's cookies came from: its kid and the names
+// of its grant's read roles, whose rules as of a checkpoint must still
+// digest to the marker's scope subject, and the pub its kid had, which the
+// key with that kid must still have (§B.11.9 gs, §C.4; storedFview). The
+// marker's gs digests only subjects and rules, so readers whose grants
+// come from different keys, or from one key before and after its pub
+// changes, share it and one cookie prefix, and a cookie doesn't say which
+// key it came from: every gsKey the marker's live cookies were minted
+// under is kept (edge_gs_keys), and each must still hold.
+type gsKey struct {
+	kid   string
+	roles []string
+	pub   string // the key's pub member, as its namespace document gives it
 }
 
 // markerRecOf is what a's marker stands for, a's grant being v.
 func markerRecOf(a *access, v *grant.Verified) *markerRec {
 	rec := &markerRec{f: a.filter}
 	if a.cov != nil {
-		rec.subjects, rec.kid, rec.pub = a.cov.subjects, v.Key.Kid, keyPub(*v.Key)
+		rec.subjects, rec.key.kid, rec.key.pub = a.cov.subjects, v.Key.Kid, keyPub(*v.Key)
 		for r := range grantcheck.ScopeInputOf(v).Roles {
-			rec.roles = append(rec.roles, r)
+			rec.key.roles = append(rec.key.roles, r)
 		}
-		slices.Sort(rec.roles)
+		slices.Sort(rec.key.roles)
 	}
 	return rec
 }
@@ -108,16 +121,17 @@ type keptFilter struct {
 
 // recordFilters records what the markers of edge grants minted at now
 // that expire by exp stand for (edge_filters, and for g: markers
-// edge_gs), and drops those whose last edge grant has expired, from the
-// database and from memory, as svcedge.Store.Record does for subject
-// sets.
+// edge_gs, and edge_gs_keys beside the keys the marker's earlier cookies
+// came from, never in their place), and drops those whose last edge
+// grant has expired, from the database and from memory, as
+// svcedge.Store.Record does for subject sets.
 func (ix *Index) recordFilters(ctx context.Context, filters map[string]*markerRec, exp, now time.Time) error {
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	for _, q := range []string{`DELETE FROM edge_filters WHERE exp <= ?`, `DELETE FROM edge_gs WHERE exp <= ?`} {
+	for _, q := range []string{`DELETE FROM edge_filters WHERE exp <= ?`, `DELETE FROM edge_gs WHERE exp <= ?`, `DELETE FROM edge_gs_keys WHERE exp <= ?`} {
 		if _, err := tx.ExecContext(ctx, q, now.Unix()); err != nil {
 			return err
 		}
@@ -137,9 +151,17 @@ func (ix *Index) recordFilters(ctx context.Context, filters map[string]*markerRe
 		if f.subjects == nil {
 			continue
 		}
+		// edge_gs's kid, roles and pub (migrations 005, 006) are the
+		// latest exchange's, kept only because they are NOT NULL: a
+		// cookie is judged by every key in edge_gs_keys (migration 007).
 		if _, err := tx.ExecContext(ctx, `INSERT INTO edge_gs (marker, subjects, kid, roles, pub, exp) VALUES (?, ?, ?, ?, ?, ?)
 			ON CONFLICT (marker) DO UPDATE SET subjects = excluded.subjects, kid = excluded.kid, roles = excluded.roles, pub = excluded.pub, exp = max(exp, excluded.exp)`,
-			m, enc(f.subjects), f.kid, enc(f.roles), f.pub, exp.Unix()); err != nil {
+			m, enc(f.subjects), f.key.kid, enc(f.key.roles), f.key.pub, exp.Unix()); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO edge_gs_keys (marker, kid, roles, pub, exp) VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (marker, kid, roles, pub) DO UPDATE SET exp = max(exp, excluded.exp)`,
+			m, f.key.kid, enc(f.key.roles), f.key.pub, exp.Unix()); err != nil {
 			return err
 		}
 	}
@@ -161,8 +183,9 @@ func (ix *Index) recordFilters(ctx context.Context, filters map[string]*markerRe
 
 // filter is what marker m stands for, recorded when an edge grant for it
 // was minted, by this instance or another on the database. A g: marker
-// without its subjects is unknown; one recorded before edge_gs kept pub
-// (migration 006) has pub "", which no key has, so storedFview refuses it.
+// without its subjects is unknown. The keys a g: marker's cookies came
+// from are read by gsKeys, never from memory: an exchange at another
+// instance adds to them.
 func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 	ix.fmu.Lock()
 	k, ok := ix.filters[m]
@@ -171,13 +194,12 @@ func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 		return k.f, true
 	}
 	var (
-		s                    string
-		exp                  int64
-		subjects, kid, roles sql.NullString
-		pub                  sql.NullString
+		s        string
+		exp      int64
+		subjects sql.NullString
 	)
-	if err := ix.db.QueryRowContext(ctx, `SELECT f.filter, f.exp, g.subjects, g.kid, g.roles, g.pub FROM edge_filters f
-		LEFT JOIN edge_gs g ON g.marker = f.marker WHERE f.marker = ?`, m).Scan(&s, &exp, &subjects, &kid, &roles, &pub); err != nil {
+	if err := ix.db.QueryRowContext(ctx, `SELECT f.filter, f.exp, g.subjects FROM edge_filters f
+		LEFT JOIN edge_gs g ON g.marker = f.marker WHERE f.marker = ?`, m).Scan(&s, &exp, &subjects); err != nil {
 		return nil, false
 	}
 	f, err := grantcheck.DecodeReadFilter(s)
@@ -186,13 +208,10 @@ func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 	}
 	rec := &markerRec{f: f}
 	if subjects.Valid {
-		var ok1, ok2 bool
-		rec.subjects, ok1 = decodeStrings(subjects.String)
-		rec.roles, ok2 = decodeStrings(roles.String)
-		if !ok1 || !ok2 {
+		var ok bool
+		if rec.subjects, ok = decodeStrings(subjects.String); !ok {
 			return nil, false
 		}
-		rec.kid, rec.pub = kid.String, pub.String
 	} else if isGMarker(m) {
 		return nil, false
 	}
@@ -200,6 +219,35 @@ func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 	ix.filters[m] = keptFilter{f: rec, exp: exp}
 	ix.fmu.Unlock()
 	return rec, true
+}
+
+// gsKeys is every key the live cookies of g: marker m came from at now
+// (edge_gs_keys), recorded by any instance on the database. A marker
+// recorded before migration 007 has none, and one whose key's pub was
+// recorded before migration 006 has pub "", which no key has: storedFview
+// refuses both, until the reader exchanges again.
+func (ix *Index) gsKeys(ctx context.Context, m string, now time.Time) ([]gsKey, error) {
+	rows, err := ix.db.QueryContext(ctx, `SELECT kid, roles, pub FROM edge_gs_keys WHERE marker = ? AND exp > ? ORDER BY kid, roles, pub`, m, now.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []gsKey
+	for rows.Next() {
+		var (
+			k     gsKey
+			roles string
+		)
+		if err := rows.Scan(&k.kid, &roles, &k.pub); err != nil {
+			return nil, err
+		}
+		var ok bool
+		if k.roles, ok = decodeStrings(roles); !ok {
+			return nil, errors.New("edge_gs_keys: roles of " + m + " aren't a JSON array of strings")
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
 }
 
 // decodeStrings reads a JSON array of strings, as recordFilters writes it.
@@ -320,7 +368,7 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string) (*access, error
 			return nil, errUnknownSet
 		}
 		a := &access{marker: m, filter: f.f, cookie: true,
-			derive: func(ctx context.Context, cp *fcp) (*fview, error) { return ix.storedFview(ctx, cp, f) }}
+			derive: func(ctx context.Context, cp *fcp) (*fview, error) { return ix.storedFview(ctx, cp, m, f) }}
 		switch err := ix.cover(ctx, a, ns, ""); {
 		case errors.Is(err, errPurgedNS):
 			// Answered 410 once past the read check (§8.5): it reads
