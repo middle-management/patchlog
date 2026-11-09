@@ -906,21 +906,36 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 // come from, with the combined checkpoint of each namespace §B.11.9 covers
 // that rd reads in part (§A.4 Across namespaces): errMoved if a view was
 // computed at another checkpoint of one of them than cps holds, or two
-// views take a member at two.
+// views take a member at two. A branch's base at its baseAt, which the
+// branch's own ns_id fixes, is left to the base's checkpoint where the
+// answer has one (the base itself, or another view's member): a map holds
+// one ns_id per namespace (§B.5), and the branch's stands for it.
 func refsMerge(cps map[string]string, rd *refsReader) (map[string]string, error) {
 	if len(rd.covs) == 0 {
 		return cps, nil
 	}
 	out := maps.Clone(cps)
+	var bases []fsBase
 	for ns, a := range rd.covs {
-		if id, ok := cps[ns]; ok && id != a.cov.cp.ids[ns] {
+		cp := a.cov.cp
+		if id, ok := cps[ns]; ok && id != cp.ids[ns] {
 			return nil, errMoved
 		}
-		for m, id := range a.cov.cp.ids {
+		for m, id := range cp.ids {
+			if slices.ContainsFunc(cp.chain, func(b fsBase) bool { return b.ns == m }) {
+				bases = append(bases, fsBase{ns: m, at: id})
+				continue
+			}
 			if got, ok := out[m]; ok && got != id {
 				return nil, errMoved
 			}
 			out[m] = id
+		}
+	}
+	slices.SortFunc(bases, func(a, b fsBase) int { return strings.Compare(a.ns+"\x00"+a.at, b.ns+"\x00"+b.at) })
+	for _, b := range bases {
+		if _, ok := out[b.ns]; !ok {
+			out[b.ns] = b.at
 		}
 	}
 	return out, nil

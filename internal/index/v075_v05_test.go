@@ -474,6 +474,17 @@ func TestV075IndexBranch(t *testing.T) {
 	if got := resources(w.x.search("/matches-r7", all)); !slices.Contains(got, "final") {
 		t.Errorf("unrestricted reader sees %v in the branch", got)
 	}
+	// Across the base and the branch: one ns_id for matches, its own
+	// checkpoint, the branch's standing for the base at baseAt.
+	both := w.reader("user:fan", []any{"fans"}, "matches", "matches-r7")
+	_, _, rloc := w.x.refsPointer("?to=/r/target/x", both)
+	rb := w.x.search(rloc, both)
+	if got := refsAllHits(rb); got != "matches/derby matches/shared matches-r7/derby matches-r7/shared" {
+		t.Errorf("/_refs across the base and the branch: %s", got)
+	}
+	if ns := v75Namespaces(t, rb); ns["matches"] != w.x.ix.Checkpoint("matches") || ns["matches-r7"] == "" || ns["cat-season"] == "" || len(ns) != 3 {
+		t.Errorf("/_refs namespaces %v", ns)
+	}
 }
 
 // TestV075IndexUncovered: a namespace whose catalog doesn't trust it is
