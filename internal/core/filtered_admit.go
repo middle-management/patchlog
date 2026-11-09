@@ -43,7 +43,7 @@ func gsRecordOf(fv *fview, exp int64) *gsRecord {
 	}
 	slices.Sort(roles)
 	return &gsRecord{gs: fv.gs, ns: fv.fs.n.name, subjects: fv.subjects, partial: slices.Contains(fv.subjects, catvis.Partial),
-		kid: v.Key.Kid, roles: roles, blockRules: v.BlockRules, readScope: v.Key.ReadScopeResource, principal: in.Principal,
+		kid: v.Key.Kid, pub: keyPub(*v.Key), roles: roles, blockRules: v.BlockRules, readScope: v.Key.ReadScopeResource, principal: in.Principal,
 		digest: digest, filter: fv.filter.Encode(), exp: exp}
 }
 
@@ -59,7 +59,8 @@ func gsRecordOf(fv *fview, exp int64) *gsRecord {
 //     scope digest of its stored kid's scope rules and stored roles'
 //     definitions, read from {ns}'s document at cp, with its stored block
 //     rules and principal, differs from the stored one (a kid or role
-//     gone, or no longer listing read, counts as differing); 403 where
+//     gone, or no longer listing read, or the kid's key with another pub
+//     than the stored one, counts as differing); 403 where
 //     it is partial and some deciding catalog's Profile at cp keeps all
 //     groups; otherwise item 1 from the stored subjects and item 2 from
 //     the stored filter;
@@ -125,12 +126,22 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 	return t.newFview(fs, cp, urlGS, rec.subjects, filter, a), nil
 }
 
+// keyPub is k's pub member as its entry has it ("" if it has none).
+func keyPub(k grant.Key) string {
+	s, _ := k.Raw["pub"].(string)
+	return s
+}
+
 // gsDigestHolds reports whether rec's scope digest is the same with its
 // kid's scope rules and its roles' definitions as of n's document at cp
 // (§B.11.9 gs: "a gs cookie is 403 at an at where those rules differ"),
 // its kid and each of its roles still listing read there, so that a
 // cookie never reads where its grant couldn't. Keys follow the base
-// (§C.4).
+// (§C.4), and the key with rec's kid must still have rec's pub: a kid
+// whose pub was replaced is no longer the key the cookie came from
+// (§B.11.9 gs, "no longer accepted"; §C.4, a shared kid "accepted only
+// while the base has it with the same pub"). An empty stored pub, from a
+// row recorded before pubs were kept, never holds.
 func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	seq, ok := cp.seqs[n.name]
 	if !ok {
@@ -138,7 +149,7 @@ func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	}
 	cfg := t.fconfigAt(seq)
 	key, ok := findKey(t.effectiveKeys(n, cfg), rec.kid)
-	if !ok || !key.Lists("read") {
+	if !ok || !key.Lists("read") || rec.pub == "" || keyPub(key) != rec.pub {
 		return false
 	}
 	in := grantcheck.ScopeInput{ReadScopeResource: key.ReadScopeResource, KeyRules: key.Rules, BlockRules: rec.blockRules,

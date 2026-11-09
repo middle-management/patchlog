@@ -225,6 +225,94 @@ func TestV076OriginBranchBaseKeyRemoved(t *testing.T) {
 	}
 }
 
+// §B.11.9 gs, §C.4: a stored subject set is bound to its key's pub: a
+// cookie is 403 once matches replaces that kid's pub, keeping its scope
+// and roles, until the reader exchanges again; an empty stored pub is 403
+// too. In a branch, the base key's pub decides.
+func TestV076OriginGSBoundToPub(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	newPub, newPriv := grant.GenerateKey()
+	for _, c := range []struct {
+		name, ns string
+		kid      int // index of the key in matches's keys
+	}{{"matches, catalog-01", "matches", 1}, {"matches-r7, base key fan", "matches-r7", 2}} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			w := newV76fWorld(t, c.ns != "matches")
+			grantOf := func(priv ed25519.PrivateKey) Credentials {
+				if c.kid == 1 {
+					return w.catGrant("user:li", []any{"editors", "interns"})
+				}
+				return w.fan(c.ns, priv)
+			}
+			cred := grantOf(w.fanPriv)
+			res, err := w.e.IssueEdgeGrants(ctx, []string{cred.Bearer})
+			if err != nil || len(res.Grants) != 1 || res.Grants[0].GS == "" {
+				t.Fatalf("exchange: %+v %v", res, err)
+			}
+			gs := res.Grants[0].GS
+			cookie := Credentials{Edge: &EdgeGrant{NS: c.ns, GS: gs, Prefix: "/ns/" + c.ns + "/g/" + gs, Exp: w.now().Add(10 * time.Minute)}}
+			wantPub := w.catPub
+			if c.kid == 2 {
+				wantPub = w.fanPub
+			}
+			w.inTx(func(t2 *tx) {
+				if r := t2.loadGS(c.ns, gs); r == nil || r.pub != wantPub {
+					t.Fatalf("stored row %+v, want pub %s", r, wantPub)
+				}
+			})
+			red, st := v76fRedirect(t, w.v75World, c.ns, gs, cookie)
+			if red == nil {
+				t.Fatalf("cookie before: %d", st)
+			}
+			if names, st := v76fHeads(t, w.v75World, c.ns, gs, red.At, cookie); st != 0 || !v76fHas(names, "derby") {
+				t.Fatalf("cookie before: %v %d", names, st)
+			}
+			// An empty stored pub, as a row from before the migration has.
+			if err := w.e.update(ctx, func(t2 *tx) error {
+				_, err := t2.Exec(`UPDATE filtered_gs SET pub = '' WHERE ns = ? AND gs = ?`, c.ns, gs)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, st := v76fHeads(t, w.v75World, c.ns, gs, red.At, cookie); st != 403 {
+				t.Fatalf("an empty stored pub: %d, want 403", st)
+			}
+			if _, err := w.e.IssueEdgeGrants(ctx, []string{cred.Bearer}); err != nil {
+				t.Fatal(err)
+			}
+			if _, st := v76fHeads(t, w.v75World, c.ns, gs, red.At, cookie); st != 0 {
+				t.Fatalf("exchanged again: %d", st)
+			}
+			// The kid's pub is replaced, its scope and roles kept.
+			w.patchConfig("matches", map[string]any{"op": "replace", "path": "/keys/" + string(rune('0'+c.kid)) + "/pub", "value": newPub})
+			if c.kid == 1 {
+				w.catPub, w.catPriv = newPub, newPriv
+			}
+			red2, st := v76fRedirect(t, w.v75World, c.ns, gs, cookie)
+			if st != 403 {
+				t.Fatalf("cookie after the pub changed: %+v %d, want 403", red2, st)
+			}
+			if _, err := w.e.IssueEdgeGrants(ctx, []string{cred.Bearer}); v75Status(err) != 401 {
+				t.Fatalf("the old grant's exchange: %v, want 401", err)
+			}
+			fresh := grantOf(newPriv)
+			res, err = w.e.IssueEdgeGrants(ctx, []string{fresh.Bearer})
+			if err != nil || len(res.Grants) != 1 || res.Grants[0].GS != gs {
+				t.Fatalf("exchange with the new key: %+v %v", res, err)
+			}
+			red3, st := v76fRedirect(t, w.v75World, c.ns, gs, cookie)
+			if red3 == nil {
+				t.Fatalf("cookie after exchanging again: %d", st)
+			}
+			if names, st := v76fHeads(t, w.v75World, c.ns, gs, red3.At, cookie); st != 0 || !v76fHas(names, "derby") {
+				t.Fatalf("cookie after exchanging again: %v %d", names, st)
+			}
+		})
+	}
+}
+
 // §B.11.9 Purged namespaces, §B.11.5: an uncovered namespace's filtered
 // URLs are 401 for a request with neither a grant that verifies there nor
 // a cookie, a public namespace's included, and 403 otherwise.
