@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
@@ -176,6 +177,29 @@ func (ix *Index) docAt(ctx context.Context, ns, id string) (map[string]any, erro
 	return doc.Value, nil
 }
 
+// sharedReadTimeout bounds a read that shared serves to every request
+// that joined it.
+const sharedReadTimeout = 30 * time.Second
+
+// shared runs f once for every concurrent caller with key, as the core's
+// shared live reads do: f runs under a context that no caller's
+// cancellation ends, bounded by sharedReadTimeout, so a request that goes
+// away doesn't fail the others that joined its read; each caller stops
+// waiting when its own ctx ends.
+func (ix *Index) shared(ctx context.Context, key string, f func(ctx context.Context) (any, error)) (any, error) {
+	ch := ix.fs.flight.DoChan(key, func() (any, error) {
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedReadTimeout)
+		defer cancel()
+		return f(sctx)
+	})
+	select {
+	case r := <-ch:
+		return r.Val, r.Err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // liveAt are the names live in ns as of ns_id id (immutable).
 func (ix *Index) liveAt(ctx context.Context, ns, id string) (map[string]bool, error) {
 	k := ns + "\x00" + id
@@ -185,7 +209,7 @@ func (ix *Index) liveAt(ctx context.Context, ns, id string) (map[string]bool, er
 	if ok {
 		return l, nil
 	}
-	v, err, _ := ix.fs.flight.Do("live\x00"+k, func() (any, error) {
+	v, err := ix.shared(ctx, "live\x00"+k, func(ctx context.Context) (any, error) {
 		items, err := ix.c.Heads(ctx, ns, id)
 		if err != nil {
 			return nil, fmt.Errorf("the heads of %s at %s: %w", ns, id, err)
@@ -535,7 +559,7 @@ func (ix *Index) catalogAt(ctx context.Context, c fsCat, ids map[string]string) 
 	if ok {
 		return cv, nil
 	}
-	v, err, _ := ix.fs.flight.Do("cat\x00"+k, func() (any, error) {
+	v, err := ix.shared(ctx, "cat\x00"+k, func(ctx context.Context) (any, error) {
 		g, deleted, err := ix.catalogGraph(ctx, c.ns, ids[c.ns], c.doc)
 		if err != nil {
 			return nil, err
