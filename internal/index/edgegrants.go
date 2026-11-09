@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -16,7 +15,6 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
-	"github.com/middle-management/patchlog/internal/rules"
 	"github.com/middle-management/patchlog/internal/svcedge"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
@@ -48,9 +46,11 @@ import (
 // cookie for (svcedge.Store: edge_subjects), and, for a marker
 // reads:{ns}:scope:{digest}, what its digest covers, the rules that limit
 // the reads and the /principal values they refer to (edge_filters,
-// readFilter), from which it filters hits per resource as for any grant
-// with that marker. Both are kept across restarts and -rebuild until the
-// last such cookie expires; a gs or marker the service doesn't know,
+// markerRec), from which it filters hits per resource as for any grant
+// with that marker, and for a marker reads:{ns}:g:{gs} (§B.11.9) also its
+// subjects and the kid and role names its digest covers (edge_gs). They
+// are kept across restarts and -rebuild until the last such cookie
+// expires; a gs or marker the service doesn't know,
 // minted by another instance with its own database, is 401, and the
 // reader exchanges again. Instances on one database share them, and share
 // the exchangeRate buckets too (§B.11.5). A reader of a whole namespace
@@ -58,132 +58,77 @@ import (
 // as under a grant revoked since: the cookie's lifetime is the revocation
 // latency (§C.5).
 
-// readFilter is what a marker reads:{ns}:scope:{digest} stands for: the
-// rules a grant's reads in ns are judged by, those of its key's scope, its
-// blocks and, if it carries roles, each effective role that lists read
-// (any one passing), and its /principal (readsScope digests the values
-// the rules refer to). A rule referring to /now gives no marker, so the
+// markerRec is what a marker of a cookie stands for: for
+// reads:{ns}:scope:{digest}, the read filter of the rules its digest
+// covers (grantcheck.ReadFilter: its key's scope, its blocks and, if it
+// carries roles, each effective role that lists read, and its
+// /principal), from which hits are filtered per resource as for any grant
+// with that marker; for reads:{ns}:g:{gs} (§B.11.9), also its subjects,
+// from which item 1 is judged, and its kid and the names of its read
+// roles, whose rules as of a checkpoint must still digest to its scope
+// subject (storedFview). A rule referring to /now gives no marker, so the
 // filter judges a read as the grant's read check does, without a clock.
-type readFilter struct {
-	keyRules, blockRules []any
-	roles                [][]any // nil: the grant carries no roles
-	principal            map[string]any
-
-	once     sync.Once
-	compiled [][]*rules.Rule // keyRules, blockRules, then each role's
-	err      error
+type markerRec struct {
+	f        *grantcheck.ReadFilter
+	subjects []string // g: markers only
+	kid      string
+	roles    []string
 }
 
-// filterOf is the readFilter of v's reads.
-func filterOf(v *grant.Verified) *readFilter {
-	f := &readFilter{keyRules: v.KeyRules, blockRules: v.BlockRules, principal: v.Principal.Envelope()}
-	if v.HasRoles() {
-		f.roles = [][]any{}
-		_, readers := v.Allows("read")
-		for _, role := range readers {
-			f.roles = append(f.roles, v.RoleRules(role))
+// markerRecOf is what a's marker stands for, a's grant being v.
+func markerRecOf(a *access, v *grant.Verified) *markerRec {
+	rec := &markerRec{f: a.filter}
+	if a.cov != nil {
+		rec.subjects, rec.kid = a.cov.subjects, v.Key.Kid
+		for r := range grantcheck.ScopeInputOf(v).Roles {
+			rec.roles = append(rec.roles, r)
 		}
+		slices.Sort(rec.roles)
 	}
-	return f
+	return rec
 }
 
-// encode is f as edge_filters keeps it: canonical JSON.
-func (f *readFilter) encode() string {
-	m := map[string]any{"keyRules": f.keyRules, "blockRules": f.blockRules, "principal": f.principal}
-	if f.roles != nil {
-		roles := make([]any, len(f.roles))
-		for i, r := range f.roles {
-			roles[i] = r
-		}
-		m["roles"] = roles
-	}
-	return string(jsonv.Canonical(jsonv.FromGo(m)))
-}
-
-// decodeFilter reads what encode wrote.
-func decodeFilter(s string) (*readFilter, error) {
-	v, err := jsonv.Parse([]byte(s))
-	if err != nil {
-		return nil, err
-	}
-	m, _ := v.(map[string]any)
-	f := &readFilter{}
-	f.keyRules, _ = m["keyRules"].([]any)
-	f.blockRules, _ = m["blockRules"].([]any)
-	f.principal, _ = m["principal"].(map[string]any)
-	if roles, ok := m["roles"].([]any); ok {
-		f.roles = [][]any{}
-		for _, r := range roles {
-			l, _ := r.([]any)
-			f.roles = append(f.roles, l)
-		}
-	}
-	return f, nil
-}
-
-// allows reports whether the reads f stands for may read resource: every
-// key-scope and block rule passes against the read envelope (§6.4.1) and,
-// with roles, every rule of some role does (§C.1.1).
-func (f *readFilter) allows(resource string) bool {
-	f.once.Do(func() {
-		lists := append([][]any{f.keyRules, f.blockRules}, f.roles...)
-		for _, l := range lists {
-			var rs []*rules.Rule
-			for _, rv := range l {
-				r, err := rules.Compile(rv)
-				if err != nil {
-					f.err = err
-					return
-				}
-				rs = append(rs, r)
-			}
-			f.compiled = append(f.compiled, rs)
-		}
-	})
-	if f.err != nil {
-		return false
-	}
-	env := map[string]any{"action": "read", "resource": resource, "principal": f.principal}
-	pass := func(rs []*rules.Rule) bool {
-		for _, r := range rs {
-			if !r.Eval(env) {
-				return false
-			}
-		}
-		return true
-	}
-	if !pass(f.compiled[0]) || !pass(f.compiled[1]) {
-		return false
-	}
-	if f.roles == nil {
-		return true
-	}
-	return slices.ContainsFunc(f.compiled[2:], pass)
-}
-
-// keptFilter is a readFilter the service holds in memory (Index.filters),
+// keptFilter is a markerRec the service holds in memory (Index.filters),
 // with the Unix time its last edge grant known here expires.
 type keptFilter struct {
-	f   *readFilter
+	f   *markerRec
 	exp int64
 }
 
-// recordFilters records the filters behind scope markers, for edge grants
-// minted at now that expire by exp, and drops those whose last edge grant
-// has expired, from the database and from memory, as svcedge.Store.Record
-// does for subject sets.
-func (ix *Index) recordFilters(ctx context.Context, filters map[string]*readFilter, exp, now time.Time) error {
+// recordFilters records what the markers of edge grants minted at now
+// that expire by exp stand for (edge_filters, and for g: markers
+// edge_gs), and drops those whose last edge grant has expired, from the
+// database and from memory, as svcedge.Store.Record does for subject
+// sets.
+func (ix *Index) recordFilters(ctx context.Context, filters map[string]*markerRec, exp, now time.Time) error {
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM edge_filters WHERE exp <= ?`, now.Unix()); err != nil {
-		return err
+	for _, q := range []string{`DELETE FROM edge_filters WHERE exp <= ?`, `DELETE FROM edge_gs WHERE exp <= ?`} {
+		if _, err := tx.ExecContext(ctx, q, now.Unix()); err != nil {
+			return err
+		}
+	}
+	enc := func(xs []string) string {
+		l := make([]any, len(xs))
+		for i, x := range xs {
+			l[i] = x
+		}
+		return string(jsonv.Canonical(l))
 	}
 	for m, f := range filters {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO edge_filters (marker, filter, exp) VALUES (?, ?, ?)
-			ON CONFLICT (marker) DO UPDATE SET filter = excluded.filter, exp = max(exp, excluded.exp)`, m, f.encode(), exp.Unix()); err != nil {
+			ON CONFLICT (marker) DO UPDATE SET filter = excluded.filter, exp = max(exp, excluded.exp)`, m, f.f.Encode(), exp.Unix()); err != nil {
+			return err
+		}
+		if f.subjects == nil {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO edge_gs (marker, subjects, kid, roles, exp) VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (marker) DO UPDATE SET subjects = excluded.subjects, kid = excluded.kid, roles = excluded.roles, exp = max(exp, excluded.exp)`,
+			m, enc(f.subjects), f.kid, enc(f.roles), exp.Unix()); err != nil {
 			return err
 		}
 	}
@@ -203,9 +148,10 @@ func (ix *Index) recordFilters(ctx context.Context, filters map[string]*readFilt
 	return nil
 }
 
-// filter is the readFilter behind scope marker m, recorded when an edge
-// grant for it was minted, by this instance or another on the database.
-func (ix *Index) filter(ctx context.Context, m string) (*readFilter, bool) {
+// filter is what marker m stands for, recorded when an edge grant for it
+// was minted, by this instance or another on the database. A g: marker
+// without its subjects is unknown.
+func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 	ix.fmu.Lock()
 	k, ok := ix.filters[m]
 	ix.fmu.Unlock()
@@ -213,20 +159,62 @@ func (ix *Index) filter(ctx context.Context, m string) (*readFilter, bool) {
 		return k.f, true
 	}
 	var (
-		s   string
-		exp int64
+		s                    string
+		exp                  int64
+		subjects, kid, roles sql.NullString
 	)
-	if err := ix.db.QueryRowContext(ctx, `SELECT filter, exp FROM edge_filters WHERE marker = ?`, m).Scan(&s, &exp); err != nil {
+	if err := ix.db.QueryRowContext(ctx, `SELECT f.filter, f.exp, g.subjects, g.kid, g.roles FROM edge_filters f
+		LEFT JOIN edge_gs g ON g.marker = f.marker WHERE f.marker = ?`, m).Scan(&s, &exp, &subjects, &kid, &roles); err != nil {
 		return nil, false
 	}
-	f, err := decodeFilter(s)
+	f, err := grantcheck.DecodeReadFilter(s)
 	if err != nil {
 		return nil, false
 	}
+	rec := &markerRec{f: f}
+	if subjects.Valid {
+		var ok1, ok2 bool
+		rec.subjects, ok1 = decodeStrings(subjects.String)
+		rec.roles, ok2 = decodeStrings(roles.String)
+		if !ok1 || !ok2 {
+			return nil, false
+		}
+		rec.kid = kid.String
+	} else if isGMarker(m) {
+		return nil, false
+	}
 	ix.fmu.Lock()
-	ix.filters[m] = keptFilter{f: f, exp: exp}
+	ix.filters[m] = keptFilter{f: rec, exp: exp}
 	ix.fmu.Unlock()
-	return f, true
+	return rec, true
+}
+
+// decodeStrings reads a JSON array of strings, as recordFilters writes it.
+func decodeStrings(s string) ([]string, bool) {
+	v, err := jsonv.Parse([]byte(s))
+	arr, ok := v.([]any)
+	if err != nil || !ok {
+		return nil, false
+	}
+	out := make([]string, 0, len(arr))
+	for _, x := range arr {
+		str, ok := x.(string)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, str)
+	}
+	return out, true
+}
+
+// isGMarker reports whether m is a marker reads:{ns}:g:{gs} (§A.4).
+func isGMarker(m string) bool {
+	rest, ok := strings.CutPrefix(m, "reads:")
+	if !ok {
+		return false
+	}
+	_, gs, ok := strings.Cut(rest, ":g:")
+	return ok && !strings.Contains(gs, ":")
 }
 
 // nsPrefix is the prefix of a subject set's results of ns, refsPrefix of
@@ -296,7 +284,10 @@ func (ix *Index) cookieAccess(ctx context.Context, ns string, r *http.Request) (
 
 // markerAccess is access to private namespace ns of a reader with marker m
 // under an edge grant: reads:{ns} reads it whole, reads:{ns}:scope:… as
-// its filter allows; any other marker reads none of it.
+// its filter allows while ns is still uncovered (stillUncovered),
+// reads:{ns}:g:… as its subjects and filter see ns at its current
+// checkpoint, which must still be covered (§B.11.9, storedFview); any
+// other marker reads none of it.
 func (ix *Index) markerAccess(ctx context.Context, ns, m string) (*access, error) {
 	switch {
 	case m == "reads:"+ns:
@@ -306,9 +297,62 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string) (*access, error
 		if !ok {
 			return nil, errUnknownSet
 		}
-		return &access{marker: m, filter: f, allow: f.allows, cookie: true}, nil
+		if err := ix.stillUncovered(ctx, ns); err != nil {
+			return nil, err
+		}
+		return &access{marker: m, filter: f.f, allow: f.f.Allows, cookie: true}, nil
+	case strings.HasPrefix(m, "reads:"+ns+":g:"):
+		f, ok := ix.filter(ctx, m)
+		if !ok {
+			return nil, errUnknownSet
+		}
+		a := &access{marker: m, filter: f.f, cookie: true,
+			derive: func(ctx context.Context, cp *fcp) (*fview, error) { return ix.storedFview(ctx, cp, f) }}
+		switch err := ix.cover(ctx, a, ns, ""); {
+		case errors.Is(err, errPurgedNS):
+			// Answered 410 once past the read check (§8.5): it reads
+			// nothing.
+			a.derive, a.allow = nil, func(string) bool { return false }
+		case err != nil:
+			return nil, err
+		}
+		return a, nil
 	}
 	return nil, &grant.AuthError{Status: 403, Msg: "the edge grant doesn't read this namespace"}
+}
+
+// errCoveredNow refuses a cookie for marker reads:{ns}:scope:… once
+// §B.11.9 covers ns: a partial reader's marker there is reads:{ns}:g:{gs},
+// its hits filtered by visibility (§A.4), which rules alone don't do.
+var errCoveredNow = &grant.AuthError{Status: 403, Msg: "the namespace is read filtered now: exchange the grant again (§B.11.9)"}
+
+// stillUncovered checks that §B.11.9 doesn't cover ns at the index's
+// committed checkpoint, as when a scope marker of it was issued: else
+// errCoveredNow. Before the index's first checkpoint of a namespace that
+// may be covered once it has, its coverage can't be told: errNotReached,
+// as for a grant (grantAccess). A purged one passes, answered 410 past
+// the read check (§8.5).
+func (ix *Index) stillUncovered(ctx context.Context, ns string) error {
+	id, purged, err := ix.committed(ctx, ns)
+	switch {
+	case err != nil:
+		return err
+	case purged:
+		return nil
+	case id == "":
+		if may, err := ix.mayBeCovered(ctx, ns); err != nil || may {
+			return errors.Join(errNotReached, err)
+		}
+		return nil
+	}
+	cp, err := ix.checkpoint(ctx, ns, id)
+	switch {
+	case err != nil:
+		return err
+	case cp != nil:
+		return errCoveredNow
+	}
+	return nil
 }
 
 // refsCookieReader is the reader of /_refs under one of the service's
@@ -330,12 +374,14 @@ func (ix *Index) refsCookieReader(ctx context.Context, r *http.Request, reached 
 	if !ok {
 		return nil, true, errUnknownSet
 	}
-	rd := &refsReader{gs: gs, public: true, allow: map[string]func(string) bool{}}
+	rd := &refsReader{gs: gs, public: true, allow: map[string]func(string) bool{}, covs: map[string]*access{}}
 	for _, ns := range ix.refsNamespaces() {
 		if _, ok := reached[ns]; !ok || ix.keys.Skipped(ns) != "" {
 			continue
 		}
-		i := slices.IndexFunc(subs, func(m string) bool { return m == "reads:"+ns || strings.HasPrefix(m, "reads:"+ns+":scope:") })
+		i := slices.IndexFunc(subs, func(m string) bool {
+			return m == "reads:"+ns || strings.HasPrefix(m, "reads:"+ns+":scope:") || strings.HasPrefix(m, "reads:"+ns+":g:")
+		})
 		cfg, err := ix.checker.Config(ctx, ns)
 		switch {
 		case client.IsPurged(err):
@@ -356,6 +402,9 @@ func (ix *Index) refsCookieReader(ctx context.Context, r *http.Request, reached 
 		}
 		if !a.all {
 			rd.allow[ns] = a.allow
+		}
+		if a.cov != nil {
+			rd.covs[ns] = a
 		}
 		rd.public = false
 		rd.nss = append(rd.nss, ns)
@@ -414,7 +463,7 @@ const maxPrefixes = 100
 type exchanged struct {
 	issues   []svcedge.Issue
 	subjects map[string][]string
-	filters  map[string]*readFilter
+	filters  map[string]*markerRec
 	bucket   string
 }
 
@@ -528,7 +577,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	}
 	var issues []svcedge.Issue
 	subjects := map[string][]string{}
-	filters := map[string]*readFilter{}
+	filters := map[string]*markerRec{}
 	var keys []string
 	for _, ex := range exs {
 		issues = append(issues, ex.issues...)
@@ -607,7 +656,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		}
 		return nil, nil, &grant.AuthError{Status: 401, Msg: "the grant can't be decoded"}
 	}
-	ex = &exchanged{subjects: map[string][]string{}, filters: map[string]*readFilter{}}
+	ex = &exchanged{subjects: map[string][]string{}, filters: map[string]*markerRec{}}
 	var (
 		markers []string
 		refsExp time.Time
@@ -653,7 +702,11 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		}
 		var a *access
 		if cfg.Read != "public" {
-			if a, err = ix.grantAccess(ns, v); err == nil && a.filter != nil && !readsFixed(v, a.allow) {
+			a, err = ix.grantAccess(ctx, ns, v)
+			if errors.Is(err, errNotReached) {
+				continue // its coverage, so its marker, can't be told yet
+			}
+			if err == nil && a.filter != nil && !readsFixed(v, a.allow) {
 				err = &grant.AuthError{Status: 403, Msg: "the grant's rules pass for none of the names they fix /resource to in " + ns + " (§C.5.2)"}
 			}
 			if err != nil {
@@ -673,7 +726,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			ex.bucket = v.Principal.ID + "\x00" + v.Key.Kid
 		}
 		if a.filter != nil {
-			ex.filters[a.marker] = a.filter
+			ex.filters[a.marker] = markerRecOf(a, v)
 		}
 		if _, _, ok := edgeGS(nsPrefix(ns, a.gs)); ok {
 			ex.issues = append(ex.issues, svcedge.Issue{Prefix: nsPrefix(ns, a.gs), Exp: exp})
