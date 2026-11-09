@@ -509,12 +509,12 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 
 // decideRead decides a /read-grants item of content namespace ns into e
 // (decideReads), and returns the keys its answer carries. Every name of a
-// purged namespace the catalog trusts is 410 purged first; one of an
-// untrusted namespace is never 410, but answered as below, 403 if it
-// isn't public (planRead), as item requests answer 403 before 410 there
-// (§B.11.4); an item in a public
-// namespace that isn't sealed is "public": true, with no grant and no
-// check; any other is decided by planRead, and then gets a grant if its
+// namespace the catalog doesn't trust is 403 untrusted first, even a
+// public one's, before "public": true (§B.11.4, §B.11.5 Every item at
+// once), as item requests answer 403 before 410 there; every name of a
+// purged namespace the catalog trusts is then 410 purged; an item in a
+// public namespace that isn't sealed is "public": true, with no grant and
+// no check; any other is decided by planRead, and then gets a grant if its
 // namespace is private, or, if it is public, its keys alone where it is
 // sealed and "public": true where it is end-to-end, since the keyring,
 // not K_r, opens its revisions (§E.3.2) and no grant is needed to read
@@ -522,9 +522,10 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 func (s *Service) decideRead(ctx context.Context, v *grant.Verified, vis *visibility, e map[string]any, ns, name, item string, lagOK map[string]bool) ([]keyOf, error) {
 	var err error
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
-		if g.Trust[ns] {
-			err = s.purgedIn(g, cur, ns)
+		if err = s.untrustedIn(g, cur, ns); err != nil {
+			return
 		}
+		err = s.purgedIn(g, cur, ns)
 	})
 	if err != nil {
 		return nil, err
