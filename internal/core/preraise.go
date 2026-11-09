@@ -178,12 +178,22 @@ func (t *tx) preRaiseFoldSince(n *nsRow, row *revRow) string {
 // log entry (kind entry) of row, from before p's raise from sealed, as p.m
 // serves it under name (resJob, §E.2.2): under K_r of the epoch it is
 // served under (preRaiseEpoch), padded as p.m padded before the raise.
-// The job is stored under p.m (finishSeal with p.m.id).
+// The job is stored under p.m (finishSeal with p.m.id). A remote branch's
+// shadow serves only its source's own sealing, stored at creation
+// (storePreSealings): without one, the content answers 502 upstream
+// (preRaiseUnfetched), never a sealing of B's (§G.5.2 E3 sources).
 func (t *tx) preRaiseResJob(p *preRaise, name string, row *revRow, kind string, plain func() []byte) *sealJob {
 	m := p.m
 	j := &sealJob{kind: kind, key: name + "/" + row.id.String(), name: name, revSeq: row.seq}
 	if t.stored(m, j) {
 		return j
+	}
+	if m.isShadow() {
+		what := "the document of " + name + " at " + row.id.String()
+		if kind == sealEntry {
+			what = "the log entry " + row.id.String() + " of " + name
+		}
+		panic(t.preRaiseUnfetched(m, what))
 	}
 	plKind := seal.KindDoc
 	if kind == sealEntry {
@@ -222,6 +232,10 @@ func (t *tx) preRaiseConfigJob(n *nsRow, raise *e2eRaise, seq int64, nsID string
 	if t.stored(n, j) {
 		return j
 	}
+	if n.isShadow() {
+		// Never served from a shadow; were it, never sealed by B (§G.5.2).
+		panic(t.preRaiseUnfetched(n, "the namespace document "+nsID))
+	}
 	e := t.preRaiseEntryEpoch(n, raise, seq)
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.NamespaceDocPL(n.name, nsID), doc
 	j.pad = raise.pad
@@ -235,6 +249,10 @@ func (t *tx) preRaiseRangeJob(n *nsRow, raise *e2eRaise, since, toID string, pla
 	j := &sealJob{kind: sealRange, key: since + ":" + toID}
 	if t.stored(n, j) {
 		return j
+	}
+	if n.isShadow() {
+		// As preRaiseConfigJob.
+		panic(t.preRaiseUnfetched(n, "the namespace log range up to "+toID))
 	}
 	e := raise.epoch
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.RangePL(n.name, since, toID), plain()
@@ -487,7 +505,9 @@ func (t *tx) preRaiseBlobRev(p *preRaise, head *revRow, bid ids.ID) *revRow {
 // under; where none of its referencing revisions has one yet, the sealing
 // of the newest of them under the epoch it is served under, which fixes
 // it once stored (under p.m); without any, 404 (no-store). Never the
-// plaintext.
+// plaintext. A remote branch's shadow fixes no epoch of its own: its
+// revisions carry their source's (rev_epochs), and one without is 502
+// upstream (preRaiseResJob, §G.5.2).
 func (t *tx) preRaiseBlobHead(p *preRaise, name string, head *revRow, bid ids.ID, out *Blob) *sealJob {
 	if e := latestEpoch(t.preRaiseBlobEpochs(p, head, bid)); e > 0 {
 		out.Status, out.Epoch = 302, e
@@ -505,7 +525,11 @@ func (t *tx) preRaiseBlobHead(p *preRaise, name string, head *revRow, bid ids.ID
 // preRaiseBlobKeyEpochs is blobKeyEpochs for a blob from before p's raise
 // from sealed: the epochs a request for it would be served under, those
 // fixed, or, where none is, the one a request would fix by sealing its
-// newest referencing revision (preRaiseBlobHead).
+// newest referencing revision (preRaiseBlobHead). Unlike blobKeyEpochs the
+// check needn't store that sealing to fix the epoch (§E.2.2): the one it
+// judges by is the last before the raise, which never changes, and a
+// remote branch's shadow has its source's epochs of what it mirrored
+// (rev_epochs).
 func (t *tx) preRaiseBlobKeyEpochs(p *preRaise, head *revRow, bid ids.ID) map[int]bool {
 	eps := t.preRaiseBlobEpochs(p, head, bid)
 	if len(eps) == 0 {

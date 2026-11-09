@@ -1,0 +1,29 @@
+-- Migration: edge gs keys
+-- Created: 2026-11-09T10:59:56Z
+-- Checksum: 0bb0120e59d039c6710fad96f259409b3d92c8f9c7d026070b07256eca78f14f
+-- Chain: 7ff73d063df881df51bb588867e8c59ec6417c03b54a154386b3a825d706628a
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- edge_gs_keys: every key the edge grants (cookies) of a marker
+-- reads:{ns}:g:{gs} (§A.4, §B.11.9) came from, its kid, read roles (a JSON
+-- array of strings) and pub, as the namespace document gives it (for a
+-- branch, its base's, §C.4), until the last cookie minted under it
+-- expires. Readers whose grants come from different keys share the marker
+-- and its cookies, so each exchange adds its key beside the others, and a
+-- cookie is accepted only while every one of them still holds (§B.11.9
+-- gs); edge_gs's kid, roles and pub, which the latest exchange overwrote,
+-- are no longer read, and a marker recorded before this has no row here,
+-- refused until the reader exchanges again.
+CREATE TABLE IF NOT EXISTS edge_gs_keys (marker TEXT NOT NULL, kid TEXT NOT NULL, roles TEXT NOT NULL, pub TEXT NOT NULL, exp INTEGER NOT NULL, PRIMARY KEY (marker, kid, roles, pub));

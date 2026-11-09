@@ -23,7 +23,15 @@
 //	edge_subjects, edge_buckets      the markers of each subject set the service minted edge
 //	                                 grants for, until the last of them expires, and its
 //	                                 exchangeRate buckets (svcedge.Store, edgegrants.go)
-//	edge_filters(marker, filter, exp) what each scope marker of those stands for (readFilter)
+//	edge_filters(marker, filter, exp) what each scope or g: marker of those stands for (markerRec)
+//	edge_gs(marker, subjects, kid, roles, pub, exp)  and, for a g: marker (§B.11.9), its subjects;
+//	                                      its kid, roles and pub are no longer read (edge_gs_keys)
+//	edge_gs_keys(marker, kid, roles, pub, exp)  every key a g: marker's live cookies came from,
+//	                                      with the read roles its scope digest covers (gsKey)
+//	member_checkpoints(origin, ns, ns_id)  follow.SQLCheckpoints of the namespaces visibility reads
+//	                                      that the index follows without serving them, while it
+//	                                      follows them (members.go)
+//	member_conf(ns, public, level)        as ns_conf, for those
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
@@ -61,6 +69,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -90,7 +99,18 @@ type Options struct {
 	// Client reads the core API; with a private namespace it needs a grant
 	// with read on it (§C.6 least privilege). For sealed namespaces build it
 	// WithKeys (client.NewKeys(Recipient)); its grant must get epoch keys
-	// (read on the whole namespace), which seal the results.
+	// (read on the whole namespace), which seal the results. Where §B.11.9
+	// covers a namespace, its grant must also read the namespaces
+	// visibility reads there, which the index follows without serving them
+	// (filtered.go, members.go): the trusted catalogs, their catalog.trust members and
+	// a branch's bases. To tell whether §B.11.9 covers a namespace at all,
+	// for readers it doesn't let read the namespace whole, it must read,
+	// whether or not they turn out to cover it, every catalog a followed
+	// namespace's catalogs names through a key whose requireAt names it,
+	// every namespace a followed catalog's catalog.trust lists, and a
+	// followed branch's bases; where it can't, such readers are answered
+	// 502 and the log names the namespace (errGrantLacks), never as if the
+	// namespace weren't covered.
 	Client *client.Client
 	// Recipient is the service's X25519 private key: it unwraps keys
 	// POST /keys wraps to the grant's enc, and makes e2e namespaces
@@ -113,7 +133,9 @@ type Options struct {
 	NoFTS bool
 	// Rebuild drops the index and replays from "" (§A.6).
 	Rebuild bool
-	// MinWait bounds how long ?min= waits (§A.5); default 2s.
+	// MinWait bounds how long ?min= waits (§A.5), and how long a query
+	// waits for a namespace visibility reads to be followed up to its head
+	// (members.go); default 2s.
 	MinWait time.Duration
 	// Purger receives cache tag purges; default: log.
 	Purger Purger
@@ -188,7 +210,10 @@ type Index struct {
 	edge    *svcedge.Store // the service's edge grants (EdgeGrants)
 
 	fmu     sync.Mutex
-	filters map[string]keptFilter // scope marker -> what it stands for (edge_filters)
+	filters map[string]keptFilter // scope or g: marker -> what it stands for (edge_filters, edge_gs)
+
+	fs  fstate  // the state of namespaces §B.11.9 covers (filtered.go)
+	mem members // the namespaces visibility reads there that the index doesn't serve (members.go)
 
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers
@@ -201,6 +226,17 @@ type Index struct {
 	// which Apply does once a config change leaves the service without
 	// its keys (derived.Keys.Recheck).
 	runs map[string]context.CancelFunc
+
+	// testRefsRead, if set, is called once a /_refs answer's transaction
+	// has read its hits (tests: refsCompute).
+	testRefsRead func()
+	// testMemberBootstrap, if set, is called before a member's follower
+	// gives it its first checkpoint (tests: bootstrapMember).
+	testMemberBootstrap func(ctx context.Context, m string)
+	// testBeforeAnswer, if set, is called once a reader's views are
+	// computed, before the answer is (tests: serve's head pointer,
+	// /_refs).
+	testBeforeAnswer func()
 }
 
 // Open opens (creating or, with Rebuild, recreating) the index database and
@@ -252,6 +288,8 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		fetches: semaphore.NewWeighted(int64(opt.FetchConcurrency)),
 		roots:   map[string]bool{}, cur: map[string]string{}, purged: map[string]bool{}, changed: make(chan struct{}),
 	}
+	ix.fs.init()
+	ix.mem.init()
 	ix.repurge = repurge.New(db, opt.Purger, repurge.Options{Delay: opt.RepurgeDelay, Interval: opt.RepurgeInterval,
 		Now: opt.Now, Lock: &ix.wmu, Name: "index", Logf: opt.Logf})
 	for _, ns := range opt.Namespaces {
@@ -266,6 +304,10 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		return nil, err
 	}
 	if err := ix.loadState(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ix.loadMembers(ctx); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -296,7 +338,10 @@ func (ix *Index) Origin() string { return ix.origin }
 var migrations embed.FS
 
 // resetStmts empty what a rebuild replays (cdn_repurge stays, and so do
-// the edge grants' tables, edge_filters and svcedge.Store's), in one
+// the edge grants' tables, edge_filters, edge_gs and svcedge.Store's, and
+// member_checkpoints and member_conf, whose followers derive no rows: one
+// still needed resumes where it stopped, one no longer needed is forgotten
+// with a purge of idx:{m}, so no purge is missed, members.go), in one
 // transaction. checkpoints_bootstrap too: a snapshot left part-way would
 // otherwise be resumed, not replayed from its first page. text, made by
 // initSchema rather than a migration, is dropped, so a rebuild decides
@@ -510,8 +555,15 @@ func (ix *Index) known(ns string) bool {
 
 // Run follows every namespace until ctx is done. A follower that stops on a
 // permanent error is restarted after a pause; a purged namespace is not.
+// It also follows, without serving them, the namespaces visibility reads
+// for those §B.11.9 covers (members.go).
 func (ix *Index) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ix.runMembers(ctx)
+	}()
 	for ns := range ix.roots {
 		wg.Add(1)
 		go func() {
@@ -731,7 +783,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// or raising it to sealed or e2e: results computed before it, public
 	// or in the clear, must go. Kept results, stored sealed ones (in this
 	// transaction) and /_refs answers go by the same tags.
-	narrowed, err := ix.narrowed(ctx, tx, b)
+	narrowed, err := ix.narrowed(ctx, tx, "ns_conf", b)
 	if err != nil {
 		return err
 	}
@@ -747,12 +799,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if co.PurgedNS {
 		tags = append(tags, "ns:"+b.NS)
 	}
-	if err := ix.sealed.Purge(ctx, tx, tags); err != nil {
-		return err
-	}
-	// The second purge of the tags, durable with the commit (package
-	// repurge): a read before the commit may reach the CDN after the first.
-	if err := ix.repurge.Add(ctx, tx, tags); err != nil {
+	if err := ix.purgeTx(ctx, tx, tags); err != nil {
 		return err
 	}
 	if err := ix.cps.SaveBatch(ctx, tx, b.Origin, b.NS, b); err != nil {
@@ -761,7 +808,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	ix.refsPurged(ctx, b.NS, tags, co.PurgedNS)
+	ix.purgeStored(ctx, b.NS, tags, co.PurgedNS)
 	if b.Partial() {
 		// A page of a snapshot later pages complete: the index doesn't
 		// reflect the namespace as of b.NewCheckpoint yet, so the
@@ -773,17 +820,13 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		return nil
 	}
 	// Purge before the new checkpoint is out, so nobody who learns of it
-	// can still be served what it removed. Purgers don't block. Kept
-	// results go first, after the commit: one read before it that carries
-	// a tag it purges is then not kept (kept.Store.Generation).
-	ix.kept.Purge(b.NS, tags)
-	if len(tags) > 0 {
-		ix.opt.Purger.PurgeTags(tags)
-	}
+	// can still be served what it removed.
+	ix.purgeKept(b.NS, tags)
 	// Publish the checkpoint before any other work, waking ?min= waiters.
 	// Redirects go by the committed checkpoint (Index.committed), so the
 	// gap between the commit and this doesn't make them alternate.
 	ix.mu.Lock()
+	first := ix.cur[b.NS] == ""
 	ix.cur[b.NS] = b.NewCheckpoint
 	if co.PurgedNS {
 		ix.purged[b.NS] = true
@@ -817,18 +860,75 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 			break
 		}
 	}
+	if config || co.PurgedNS || first {
+		// What coverage reads may have changed: which namespaces the
+		// index follows for it (members.go) is judged again.
+		ix.kickMembers()
+	}
 	return nil
+}
+
+// purgeTx purges tags, in tx, from the stored sealed results, and queues
+// their second purge, durable with the commit (package repurge): a read
+// before the commit may reach the CDN after the first (§A.1, D.8).
+func (ix *Index) purgeTx(ctx context.Context, tx *sql.Tx, tags []string) error {
+	if err := ix.sealed.Purge(ctx, tx, tags); err != nil {
+		return err
+	}
+	return ix.repurge.Add(ctx, tx, tags)
+}
+
+// purgeStored drops, once the apply that purges tags in ns has committed,
+// what fstate keeps of ns (fsForget) where tags purge idx:{ns}, first, then
+// the sealed results stored since its own purge of them (purgeTx), and the
+// /_refs answers they remove (refsPurged). fstate goes first: a view of
+// another namespace that read ns's state before is then computed before
+// any store counts the purge, and its answer isn't kept (fcp.gens).
+func (ix *Index) purgeStored(ctx context.Context, ns string, tags []string, purgedNS bool) {
+	if slices.Contains(tags, "idx:"+ns) {
+		ix.fsForget(ns)
+	}
+	ix.sealed.Purged(tags)
+	ix.refsPurged(ctx, ns, tags, purgedNS)
+}
+
+// purgeKept drops, once the apply that purges tags in ns has committed and
+// before its checkpoint is published, the kept results they remove, and
+// purges them from the service's cache (§A.1). Kept results go first: one
+// read before the commit that carries a tag it purges is then not kept
+// (kept.Store.Generation). Results at a combined checkpoint of another
+// namespace that lists ns (§A.4, filtered.go) carry idx:{ns} too, whether
+// ns is one the index serves or one it follows only for visibility
+// (members.go); what fstate keeps of ns went before (purgeStored).
+// Purgers don't block.
+func (ix *Index) purgeKept(ns string, tags []string) {
+	ix.kept.Purge(ns, tags)
+	if slices.Contains(tags, "idx:"+ns) {
+		for _, other := range ix.refsNamespaces() {
+			if other != ns {
+				ix.kept.Purge(other, []string{"idx:" + ns})
+			}
+		}
+	}
+	if len(tags) > 0 {
+		ix.opt.Purger.PurgeTags(tags)
+	}
 }
 
 // narrowed reports whether a config unit of b makes its namespace private
 // or raises it to sealed or e2e (§9), against the read mode and level the
-// index last applied (ns_conf), and records the last unit's, in tx. Before
+// index last applied (table: ns_conf, or member_conf for a namespace it
+// follows only for visibility, members.go), and records the last unit's,
+// in tx. Before
 // the first it records, the namespace counts as public and unsealed, so
 // the first private or sealed document it applies counts too: once, at
 // the genesis of a namespace followed from the start, when nothing is
 // cached yet, and after an upgrade from a database without ns_conf, when
 // there may be.
-func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, b *follow.Batch) (bool, error) {
+func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, table string, b *follow.Batch) (bool, error) {
+	if table != "ns_conf" && table != "member_conf" {
+		return false, fmt.Errorf("index: no table %q", table)
+	}
 	public, level, known := true, "", false
 	narrowed := false
 	for _, u := range b.Units {
@@ -836,7 +936,7 @@ func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, b *follow.Batch) (boo
 			continue
 		}
 		if !known {
-			err := tx.QueryRowContext(ctx, `SELECT public, level FROM ns_conf WHERE ns = ?`, b.NS).Scan(&public, &level)
+			err := tx.QueryRowContext(ctx, `SELECT public, level FROM `+table+` WHERE ns = ?`, b.NS).Scan(&public, &level)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return false, err
 			}
@@ -852,7 +952,7 @@ func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, b *follow.Batch) (boo
 	if !known {
 		return false, nil
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO ns_conf (ns, public, level) VALUES (?, ?, ?) ON CONFLICT (ns) DO UPDATE SET public = excluded.public, level = excluded.level`, b.NS, public, level)
+	_, err := tx.ExecContext(ctx, `INSERT INTO `+table+` (ns, public, level) VALUES (?, ?, ?) ON CONFLICT (ns) DO UPDATE SET public = excluded.public, level = excluded.level`, b.NS, public, level)
 	return narrowed, err
 }
 

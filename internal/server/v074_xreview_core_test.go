@@ -12,7 +12,8 @@ import (
 // a source raised from none to e2e (recorded for a rebase, the branch still
 // at none), is made when the server starts, before anything is served, not
 // at the first sync a whole follow interval later: right after the restart
-// the branch's resources answer 200, sealed, not 503 encryption_unavailable.
+// the branch's resources answer 200, sealed, not 502 upstream (v0.76; 503
+// encryption_unavailable before).
 func TestV074RemoteRecordedRaiseMadeAtStart(t *testing.T) {
 	t.Parallel()
 	a := newEnv(t, withOrigin(originA), withKeyStore(newKeyStore(t)), withEncTuning)
@@ -35,7 +36,7 @@ func TestV074RemoteRecordedRaiseMadeAtStart(t *testing.T) {
 	if l := levelOf(b.configOf("r")); l != "" {
 		t.Fatalf("raised to %q although its config writes fail", l)
 	}
-	expectCode(t, b.get("/r/r/x/rev/"+x), 503, "encryption_unavailable")
+	expectCode(t, b.get("/r/r/x/rev/"+x), 502, "upstream")
 	// Restarted with the maximum back, and no sync: the raise is made at
 	// start, leaves first.
 	b = reopen()

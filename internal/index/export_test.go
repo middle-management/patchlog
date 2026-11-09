@@ -73,3 +73,7 @@ func (ix *Index) QueuedRepurges() [][]string {
 	}
 	return out
 }
+
+// OnRefsRead calls f each time a /_refs answer's transaction has read its
+// hits, before the answer is sealed and stored (tests).
+func (ix *Index) OnRefsRead(f func()) { ix.testRefsRead = f }

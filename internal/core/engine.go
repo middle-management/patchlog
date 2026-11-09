@@ -186,6 +186,10 @@ type Options struct {
 	// least an eighth smaller. Negative compresses every patch set, even
 	// if it doesn't shrink, for tests of the compressed form.
 	StoreCompressMin int
+	// NoFilteredReads turns off filtered namespace reads (§B.11.9, an
+	// origin MAY): no namespace is covered, and partial readers get
+	// §C.5's answers (403) as before v0.75. The zero value serves them.
+	NoFilteredReads bool
 }
 
 // RemoteOptions configure the branch side of remote branches (§G.3): how
@@ -511,7 +515,7 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.74"
+const SpecVersion = "0.76"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a

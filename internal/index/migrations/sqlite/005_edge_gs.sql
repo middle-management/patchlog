@@ -1,0 +1,25 @@
+-- Migration: edge gs
+-- Created: 2026-11-09T06:16:59Z
+-- Checksum: 1837ee807874badb7c7481f4cc6898087d3773126af5565ad13c3b5e339a4832
+-- Chain: 918d21c2ccfa30460772baf63915fc37aa6e4758af734e660f5f7cd98c8847c3
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- edge_gs: for each marker reads:{ns}:g:{gs} (§A.4, §B.11.9) the service
+-- minted an edge grant (a cookie) for, beside its read filter in
+-- edge_filters, its subjects, from which item 1 of visibility is judged,
+-- and the kid and read roles (JSON arrays of strings) whose rules its
+-- scope digest covers, until the last of them expires (edgegrants.go,
+-- markerRec).
+CREATE TABLE IF NOT EXISTS edge_gs (marker TEXT PRIMARY KEY, subjects TEXT NOT NULL, kid TEXT NOT NULL, roles TEXT NOT NULL, exp INTEGER NOT NULL);

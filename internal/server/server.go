@@ -85,6 +85,11 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("GET /ns/{ns}/rev/{id}/heads", s.nsHeads)
 	m.HandleFunc("GET /ns/{ns}/log", s.nsLive)
 	m.HandleFunc("GET /ns/{ns}/events", s.nsEvents)
+	m.HandleFunc("GET /ns/{ns}/g/{gs}/at/{at}/heads", s.gHeads)
+	m.HandleFunc("GET /ns/{ns}/g/{gs}/at/{at}/log", s.gLog)
+	m.HandleFunc("GET /ns/{ns}/g/{gs}/heads", s.gHeadsCurrent)
+	m.HandleFunc("GET /ns/{ns}/g/{gs}/log", s.gLive)
+	m.HandleFunc("GET /ns/{ns}/g/{gs}/events", s.gEvents)
 	m.HandleFunc("GET /ns/{ns}/gestures/{gesture}", s.nsGestures)
 	m.HandleFunc("GET /ns/{ns}/principal", s.nsPrincipal)
 	m.HandleFunc("GET /ns/{ns}/grants/{gid}", s.nsGrant)
@@ -141,19 +146,24 @@ const flag = "1"
 // Signed-URL grant parameters (§C.5) never reach the origin: the edge that
 // verifies them strips them before forwarding.
 var queryParams = map[string]map[string]string{
-	"GET /r/{ns}/{name}/rev/{id}/log": {"since": ""},                           // §7.1
-	"GET /r/{ns}/{name}/log":          {"since": "", "live": "", "cursor": ""}, // §7.7 (longPoll checks live)
-	"GET /r/{ns}/{name}/events":       {"since": ""},                           // §7.3
-	"POST /r/{ns}/{name}/purge":       {"force": flag},                         // §6.1, §8.3
-	"GET /ns/{ns}/rev/{id}/log":       {"since": ""},                           // §7.4
-	"GET /ns/{ns}/rev/{id}/heads":     {"after": ""},                           // §7.4
-	"GET /ns/{ns}/log":                {"since": "", "live": "", "cursor": ""}, // §7.7
-	"GET /ns/{ns}/events":             {"since": ""},                           // §7.4
-	"GET /ns/{ns}/gestures/{gesture}": {"after": ""},                           // §7.4
-	"POST /ns/{ns}/batch":             {"dry-run": flag},                       // §7.5
-	"POST /ns/{ns}/purge":             {"force": flag},                         // §8.5
-	"GET " + core.DefaultJWKSPath:     nil,                                     // §C.4: not checked
-	"DELETE /edge-grants":             nil,                                     // §C.5.4: prefix repeats; withdrawPrefixes checks it
+	"GET /r/{ns}/{name}/rev/{id}/log":   {"since": ""},                           // §7.1
+	"GET /r/{ns}/{name}/log":            {"since": "", "live": "", "cursor": ""}, // §7.7 (longPoll checks live)
+	"GET /r/{ns}/{name}/events":         {"since": ""},                           // §7.3
+	"POST /r/{ns}/{name}/purge":         {"force": flag},                         // §6.1, §8.3
+	"GET /ns/{ns}/rev/{id}/log":         {"since": ""},                           // §7.4
+	"GET /ns/{ns}/rev/{id}/heads":       {"after": "", "prefix": ""},             // §7.4 (headsPrefix checks prefix)
+	"GET /ns/{ns}/log":                  {"since": "", "live": "", "cursor": ""}, // §7.7
+	"GET /ns/{ns}/events":               {"since": ""},                           // §7.4
+	"GET /ns/{ns}/g/{gs}/at/{at}/heads": {"after": "", "prefix": ""},             // §B.11.9
+	"GET /ns/{ns}/g/{gs}/at/{at}/log":   {"since": ""},                           // §B.11.9
+	"GET /ns/{ns}/g/{gs}/heads":         {"after": "", "prefix": ""},             // §B.11.9
+	"GET /ns/{ns}/g/{gs}/log":           {"since": "", "live": "", "cursor": ""}, // §B.11.9, §7.7
+	"GET /ns/{ns}/g/{gs}/events":        {"since": ""},                           // §B.11.9, §7.3
+	"GET /ns/{ns}/gestures/{gesture}":   {"after": ""},                           // §7.4
+	"POST /ns/{ns}/batch":               {"dry-run": flag},                       // §7.5
+	"POST /ns/{ns}/purge":               {"force": flag},                         // §8.5
+	"GET " + core.DefaultJWKSPath:       nil,                                     // §C.4: not checked
+	"DELETE /edge-grants":               nil,                                     // §C.5.4: prefix repeats; withdrawPrefixes checks it
 }
 
 // checkQuery answers 400 bad_input for a query parameter the route doesn't

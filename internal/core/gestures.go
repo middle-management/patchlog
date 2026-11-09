@@ -29,15 +29,17 @@ import (
 //     "{resource}/{id}" of a page's last entry, sent as X-Log-Next and as
 //     the next page's ?after= (§7.4): ids repeat across resources (§3.3), resource
 //     names never contain "/" (§3.6). An after not of that form is a
-//     request-shape 400 (§6.2); one naming no entry of an unpurged
-//     resource the grant may read is 404. The list grows, so the last page
+//     request-shape 400 (§6.2); one naming no row this listing would give
+//     the caller, written with the gesture or undoing it, of an unpurged
+//     resource the reader may see, is 404. The list grows, so the last page
 //     is the one without X-Log-Next, and nothing is cached (no-store).
 //   - It answers any reader, listing only the entries of resources its
 //     grant may read, so a reader limited to some documents finds its own
-//     gestures and learns nothing of others. It isn't offered in sealed
-//     or e2e namespaces: 404 with code
-//     "not_offered", after authorisation, as a deployment without the
-//     endpoint answers 404. Their logs are the place to look (§11.2). A
+//     gestures and learns nothing of others; a partial reader of a
+//     namespace §B.11.9 covers, only those visible to it at the current
+//     checkpoint (§B.11.9 Answers). It isn't offered in sealed or e2e
+//     namespaces: 404 with code "not_offered", after authorisation, as a
+//     deployment without the endpoint answers 404. Their logs are the place to look (§11.2). A
 //     purged namespace answers 410 before it (§8.5).
 
 // GesturePage is a page of GET /ns/{ns}/gestures/{gesture} (§7.4).
@@ -77,35 +79,52 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 		if err != nil {
 			return err
 		}
-		// A reader limited to some resources gets only theirs (§7.4).
-		cfg := t.config(n.configSeq)
-		var visible func(name string) bool
-		if !t.readsNS(n, cfg, a, false) {
-			seen := map[string]bool{}
-			visible = func(name string) bool {
-				v, ok := seen[name]
-				if !ok {
-					v = t.canRead(n, cfg, a, name)
-					seen[name] = v
-				}
-				return v
-			}
-		}
 		if n.purged {
 			return t.purgedNS(n)
 		}
 		if t.nsLevel(n) >= levelSealed {
 			return apiErr(404, "not_offered", "message", "gestures aren't listed in sealed or end-to-end namespaces: their logs carry them (§7.4)")
 		}
+		// A reader limited to some resources gets only theirs (§7.4), or,
+		// a partial reader of a namespace §B.11.9 covers, those visible to
+		// it at the current checkpoint, as its filtered reads would show
+		// them (§B.11.9 Answers): never an unplaced document. It is built
+		// after the 410 and not_offered answers, which come as soon as the
+		// read check passes (§8.5), so a grant grantView refuses (/now)
+		// still learns a purge.
+		cfg := t.config(n.configSeq)
+		var visible func(name string) bool
+		if !t.readsNS(n, cfg, a, false) {
+			if fs := t.filteredScope(n); fs != nil && a != nil && a.verified != nil {
+				fv, err := t.grantView(fs, t.filteredCurrent(fs), a)
+				if err != nil {
+					return err
+				}
+				visible = func(name string) bool { return fv.visible(t, name) }
+			} else {
+				seen := map[string]bool{}
+				visible = func(name string) bool {
+					v, ok := seen[name]
+					if !ok {
+						v = t.canRead(n, cfg, a, name)
+						seen[name] = v
+					}
+					return v
+				}
+			}
+		}
 		var after int64
 		if since != "" {
-			// It names an entry of an unpurged resource the grant may read,
-			// or is 404 (§7.4): purge keeps the rows, not the listing.
+			// It names a row this listing would give the caller, or is 404
+			// (§7.4): one written with the gesture or undoing it, of an
+			// unpurged resource the reader may see; purge keeps the rows,
+			// not the listing.
 			r := t.resource(n.id, afterName)
 			if r == nil || r.state == statePurged || (visible != nil && !visible(afterName)) {
 				return notFound()
 			}
-			if err := t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND id = ?`, r.id, afterID[:]).Scan(&after); err != nil {
+			if err := t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND id = ? AND (gesture = ? OR undoes = ?)`,
+				r.id, afterID[:], gesture, gesture).Scan(&after); err != nil {
 				return notFound()
 			}
 		}

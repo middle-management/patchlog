@@ -79,6 +79,30 @@ type RoleView interface {
 	ForSubjects(subjects []string) Visibility
 }
 
+// Profiler is a RoleView whose subject sets depend on the checkpoint, as
+// the catalog's deciding subjects do (§B.11.5). With one, a grant in
+// Authorization reads at its own gs as of the URL's at (keyAt), and an
+// edge grant's subject set is refused at an at whose profile doesn't
+// admit it (Profile.Admits).
+type Profiler interface {
+	// Profile is the profile as of the checkpoint g reflects. It is called
+	// under the graph lock, and must not change afterwards: it is kept
+	// with the at's record (recordAt).
+	Profile(g *Graph) Profile
+}
+
+// Profile is what keys readers' listings at one checkpoint (§B.11.5).
+type Profile interface {
+	// Subjects are the subjects that key the listings of the reader whose
+	// grant v verified for the catalog, as Resolve's would at that
+	// checkpoint.
+	Subjects(v *grant.Verified) []string
+	// Admits reports whether a subject set keyed at another checkpoint,
+	// such as an edge grant's, may read at this one: one that leaves out
+	// some of the reader's groups may not where every group is kept.
+	Admits(subjects []string) bool
+}
+
 // Visibility decides, under the graph lock, what a reader may see.
 type Visibility interface {
 	// Node reports whether the reader may list the node.
@@ -126,6 +150,10 @@ type viewer struct {
 	wideGrant map[string]bool // namespaces read namespace-wide through a grant, not because they are public ("" the catalog)
 	wideExp   time.Time
 	priv      bool
+	// grant is the grant in Authorization verified for the catalog, that
+	// of a subject set's reader (RoleView): keyAt keys it as of the URL's
+	// at.
+	grant *grant.Verified
 	// For an edge grant (edgegrants.go): subjects are what gs is over, as
 	// RoleView.Resolve keyed them, and idExp the expiry of the grant
 	// verified for the catalog namespace. notBefore, set for a read under
@@ -217,7 +245,7 @@ func (s *Service) viewer(ctx context.Context, r *http.Request, want string) (*vi
 	if cl := s.edgeClaims(r); cl != nil {
 		return s.edgeViewer(ctx, cl)
 	}
-	return s.grantViewer(ctx, Bearer(r), want, false)
+	return s.grantViewer(ctx, Bearer(r), want)
 }
 
 // edgeClaims is the edge grant the service minted that a GET or HEAD
@@ -290,12 +318,12 @@ func (s *Service) listed() map[string]bool {
 //     those grants (§B.11.5), unless want names another subject set. A
 //     public catalog needs no grant: one that doesn't verify for it still
 //     qualifies through the content namespaces alone, drawing from the
-//     exchangeRate bucket of its principal there. For an edge grant
-//     (forCookie), which covers every later at, every namespace the
-//     catalog trusts counts, those the service doesn't follow too: a
-//     g/all cookie is refused at an at including one trusted since its
-//     issue (trustedSince), and the service knows when each became
-//     trusted, not when it came into the checkpoint;
+//     exchangeRate bucket of its principal there. An edge grant, which
+//     covers every later at, is judged the same way, against the
+//     combined checkpoint only (§B.11.5, v0.76): a trusted namespace the
+//     service holds no checkpoint of doesn't count, and a g/all cookie is
+//     refused at an at including one that entered the checkpoint since
+//     its issue (trustedSince, entered);
 //   - with a RoleView (a catalog service), any other reader whose grant
 //     verifies for the catalog reads the listings of its subject set
 //     under /g/{gs}/, filtered by what its roles make visible (§B.11.5),
@@ -307,7 +335,7 @@ func (s *Service) listed() map[string]bool {
 //     any other reader is 403 (§B.11.5).
 //
 // A request at a want other than the viewer's gs is 403 (serve).
-func (s *Service) grantViewer(ctx context.Context, token, want string, forCookie bool) (*viewer, error) {
+func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer, error) {
 	// In a release preview every check is on the branch read in place of
 	// a namespace: a viewer sees only branches it can read (§B.5).
 	cat := s.actual(s.opt.Catalog)
@@ -373,7 +401,7 @@ func (s *Service) grantViewer(ctx context.Context, token, want string, forCookie
 				}
 			}
 		}
-		if forCookie || listed[ns] {
+		if listed[ns] {
 			all = all && wide[ns]
 		}
 	}
@@ -411,8 +439,72 @@ func (s *Service) grantViewer(ctx context.Context, token, want string, forCookie
 	if err != nil {
 		return nil, err
 	}
-	v.gs = grantcheck.SubjectSetID(v.subjects)
+	v.gs, v.grant = grantcheck.SubjectSetID(v.subjects), vg
 	return v, nil
+}
+
+// profileOf is the RoleView's profile as of the checkpoint g reflects, nil
+// without a Profiler. Call it under View.
+func (s *Service) profileOf(g *Graph) Profile {
+	if pf, ok := s.opt.RoleView.(Profiler); ok {
+		return pf.Profile(g)
+	}
+	return nil
+}
+
+// profileAt is the profile of a listing at at: curProf, the current one,
+// at the current at, cur, and at one without a record, which is redirected
+// to it; at a kept one, the one recorded with it (recordAt), as atTrust
+// judges an at. nil without a Profiler.
+func (s *Service) profileAt(at, cur string, curProf Profile) Profile {
+	if at == "" || at == cur {
+		return curProf
+	}
+	s.amu.Lock()
+	rec, ok := s.ats[at]
+	s.amu.Unlock()
+	if !ok {
+		return curProf
+	}
+	return rec.prof
+}
+
+// keyAt keys v, a subject set's reader by the grant in Authorization, by
+// its subjects as of at (§B.11.5: a grant reads only at its own gs as of
+// the URL's at): those of the current profile at the current at, and at
+// an at without a record, which is redirected to the current one; those
+// of the profile recorded with a kept listing at an older one (profileAt).
+func (s *Service) keyAt(v *viewer, at string) {
+	if v.grant == nil {
+		return
+	}
+	var cur string
+	var curProf Profile
+	s.View(func(g *Graph, curMap map[string]string) {
+		if curProf = s.profileOf(g); curProf != nil {
+			cur, _ = s.combinedAt(g, curMap)
+		}
+	})
+	if p := s.profileAt(at, cur, curProf); p != nil {
+		s.rekey(v, p.Subjects(v.grant))
+	}
+}
+
+// rekeyAs keys v, a subject set's reader by the grant in Authorization,
+// by its subjects in prof, the profile of the at a listing was computed
+// at (computed.prof): the checkpoint may have moved since keyAt, and a
+// redirect to that at names the grant's gs there (§B.11.5).
+func (s *Service) rekeyAs(v *viewer, prof Profile) {
+	if v.grant != nil && prof != nil {
+		s.rekey(v, prof.Subjects(v.grant))
+	}
+}
+
+// rekey keys v by subjects.
+func (s *Service) rekey(v *viewer, subjects []string) {
+	if gs := grantcheck.SubjectSetID(subjects); gs != v.gs {
+		v.subjects, v.gs, v.vis = subjects, gs, s.opt.RoleView.ForSubjects(subjects)
+	}
 }
 
 // trustList is every content namespace the catalog trusts, sorted, and
@@ -549,7 +641,10 @@ var ops = map[string]bool{
 // another (Node.BornEpoch): that one is sealed in place, as a value of
 // another resource is, "born": { "sealed": JWE of { born } } under the
 // node's K_r of its epoch, pl { ns, name, view }, and left out where the
-// service can't have that epoch's key (§E.2.6). A g/all listing of a catalog that isn't public,
+// service can't have that epoch's key, or where the epoch isn't known: a
+// born is never sealed under the head's epoch for want of its own
+// (§E.2.6; at E3 its epoch is its snapshot's, §E.3.1, bornOf). A g/all
+// listing of a catalog that isn't public,
 // which every reader its URL admits reads whole, whose nodes' values all
 // come from one epoch, is sealed as one JWE under that epoch's key,
 // Content-Type application/jose, pl { ns, view } where view is the
@@ -707,6 +802,10 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		WriteAuthError(w, err, s.opt.Logf)
 		return
 	}
+	if isAt {
+		// Its gs as of the URL's at (§B.11.5).
+		s.keyAt(v, at)
+	}
 	if !v.anon && gs != "" && gs != v.gs {
 		// A grant reads only at its own subject set, or at all where it
 		// qualifies (grantViewer), and is 403 at any other, never
@@ -800,12 +899,21 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	keyOf := func(at string) string { return listingKey(canon(at), v) }
 	keep := !perReader(op, v)
 	var cur string
-	s.View(func(g *Graph, curMap map[string]string) { cur, _ = s.combinedAt(g, curMap) })
+	var curProf Profile
+	s.View(func(g *Graph, curMap map[string]string) { cur, _ = s.combinedAt(g, curMap); curProf = s.profileOf(g) })
 	if ns := s.trustedSince(v, at, cur); ns != "" {
 		// A g/all edge grant covers every later at, but not one that
 		// includes a namespace it wasn't checked against (§B.11.5).
 		w.Header().Set("Cache-Control", "no-store")
-		WriteError(w, http.StatusForbidden, "forbidden", "the edge grant for all predates the catalog's trust in "+ns+": exchange the grants again")
+		WriteError(w, http.StatusForbidden, "forbidden", "the edge grant for all predates "+ns+" in the combined checkpoint: exchange the grants again")
+		return
+	}
+	if p := s.profileAt(at, cur, curProf); v.cookie && p != nil && !p.Admits(v.subjects) {
+		// A subject set that leaves out groups ("partial") is 403 at an at
+		// where every group is kept, its head pointer at the current one,
+		// until the reader exchanges again, as for g/all (§B.11.5).
+		w.Header().Set("Cache-Control", "no-store")
+		WriteError(w, http.StatusForbidden, "forbidden", "the edge grant's subject set leaves out groups that decide what this checkpoint shows: exchange the grants again")
 		return
 	}
 	v.noEdge = s.edgeHold(v, at, cur)
@@ -839,12 +947,17 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		// kept, or a min waited for (§A.5): redirect to the current at,
 		// with the listing computed there and kept, so the redirect is
 		// answered even if the checkpoint moves on before it is followed.
-		// If it can't be computed, the at URL says why.
+		// If it can't be computed, the at URL says why. A grant's gs there
+		// is as of the current at (keyAt).
+		if v.grant != nil && curProf != nil {
+			s.rekey(v, curProf.Subjects(v.grant))
+		}
 		to := cur
 		if _, _, ok := s.kept.Get(keyOf(cur)); keep && !ok {
 			if info, key, err := s.keys.Current(ctx, cat); err == nil {
 				if l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key); err == nil && l.status == http.StatusOK {
 					to = l.at
+					s.rekeyAs(v, l.prof)
 				}
 			}
 		}
@@ -888,10 +1001,14 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		if code == "" {
 			code = codeFor(l.status)
 		}
+		if l.noStore {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		WriteError(w, l.status, code, l.msg)
 	case l.at != at:
 		// The checkpoint moved since the check: the listing is kept at
-		// the new one.
+		// the new one, and the redirect names the grant's gs there.
+		s.rekeyAs(v, l.prof)
 		setPtr()
 		redirect(w, canon(l.at))
 	default:
@@ -932,6 +1049,20 @@ type computed struct {
 	status int
 	code   string
 	msg    string
+	// noStore: the refusal holds only until the reader exchanges again.
+	noStore bool
+	// prof is the RoleView's profile at at (Profiler), the one recorded
+	// with it (recordAt), nil without one.
+	prof Profile
+}
+
+// refusePartial makes l the refusal of a subject set that leaves out
+// groups: no listing of one is computed, or kept, at an at where every
+// group is kept (§B.11.5).
+func refusePartial(l *computed) *computed {
+	l.status, l.code, l.noStore = http.StatusForbidden, "forbidden", true
+	l.msg = "the subject set leaves out groups that decide what this checkpoint shows: exchange the grants again"
+	return l
 }
 
 // listing computes the listing of op for v at the current at, sealed in a
@@ -941,9 +1072,12 @@ type computed struct {
 // under: the URL and the reader's shape, since a namespace that turns
 // private moves no URL (viewer.shape).
 func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string, info derived.Info, key derived.Key) (*computed, error) {
+	if f := s.beforeListing.Load(); f != nil {
+		(*f)()
+	}
 	cat := s.opt.Catalog
 	keep := !perReader(op, v)
-	gen := s.kept.Generation(cat)
+	gen, sgen := s.kept.Generation(cat), s.sealed.Generation()
 	fs, err := s.fileSealing(ctx)
 	if err != nil {
 		return nil, err
@@ -958,10 +1092,26 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	// metadata, is sealed once and then served unchanged (§E.2.6).
 	sealed := info.Protected() || fs.seals()
 	if sealed && keep {
-		at := s.At()
+		// Kept again, it is recorded again with its at's checkpoints and
+		// profile, as one computed is, so a grant is still keyed as of
+		// its at, and a subject set judged there, while it is kept
+		// (§B.11.5; keyAt, profileAt, atIncludes), after a restart too.
+		var (
+			at   string
+			cps  map[string]string
+			prof Profile
+		)
+		s.View(func(g *Graph, curMap map[string]string) {
+			at, _ = s.combinedAt(g, curMap)
+			cps, prof = s.checkpointsOf(g, curMap), s.profileOf(g)
+		})
 		if st, ok := s.sealed.Get(ctx, keyOf(at)); ok {
+			if prof != nil && !prof.Admits(v.subjects) {
+				return refusePartial(&computed{at: at, prof: prof}), nil
+			}
 			st, _ = s.kept.Put(keyOf(at), cat, gen, true, st)
-			return &computed{st: st, at: at, status: http.StatusOK}, nil
+			s.recordAt(at, cps, prof)
+			return &computed{st: st, at: at, status: http.StatusOK, prof: prof}, nil
 		}
 	}
 	var (
@@ -985,6 +1135,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		perEntry bool
 		whole    int
 		cps      map[string]string
+		prof     Profile
 		more     []keptPage
 	)
 	for {
@@ -998,6 +1149,10 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		s.View(func(g *Graph, curMap map[string]string) {
 			l.at, nss = s.combinedAt(g, curMap)
 			cps = s.checkpointsOf(g, curMap)
+			if prof = s.profileOf(g); prof != nil && !prof.Admits(v.subjects) {
+				refusePartial(l)
+				return
+			}
 			view = derived.View{NS: cat, Target: canon(l.at)}
 			epochOf := func(name string) int {
 				if n := g.Node(name); n != nil && n.Epoch > 0 {
@@ -1028,9 +1183,14 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				}
 				if info.Protected() {
 					// A born of another epoch than its node's head is a
-					// value of a revision of that epoch (§E.2.6).
+					// value of a revision of that epoch (§E.2.6); one
+					// whose epoch isn't known is left out, never sealed
+					// under the head's.
 					q.bornApart = func(n *Node) int {
-						if e := n.BornEpoch; e > 0 && e != epochOf(n.Name) {
+						switch e := n.BornEpoch; {
+						case e <= 0:
+							return bornLeftOut
+						case e != epochOf(n.Name):
 							return e
 						}
 						return 0
@@ -1130,7 +1290,9 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	if sealed {
 		for i := range pages {
 			var err error
-			if pages[i].st, err = s.sealed.Put(ctx, pages[i].key, cat, l.at, pages[i].st); err != nil {
+			// Not stored if a purge since it was read may have changed it,
+			// as a backfill does at an unchanged at.
+			if pages[i].st, err = s.sealed.PutSince(ctx, pages[i].key, cat, l.at, sgen, pages[i].st); err != nil {
 				s.opt.Logf("tree: storing a sealed listing: %v", err)
 			}
 		}
@@ -1145,8 +1307,8 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	for i := range pages {
 		pages[i].st, _ = s.kept.Put(pages[i].key, cat, gen, sealed, pages[i].st)
 	}
-	l.st = pages[0].st
-	s.recordAt(l.at, cps)
+	l.st, l.prof = pages[0].st, prof
+	s.recordAt(l.at, cps, prof)
 	return l, nil
 }
 
@@ -1189,7 +1351,9 @@ func listingKey(url string, v *viewer) string { return url + "\n" + v.shape() }
 // the name listings and min use (in a release preview, the base's).
 type atRecord struct {
 	cps map[string]string
-	exp time.Time
+	// prof is the RoleView's profile there (Profiler), nil without one.
+	prof Profile
+	exp  time.Time
 }
 
 // checkpointsOf is the checkpoints the service's combined checkpoint
@@ -1218,7 +1382,7 @@ func (s *Service) purgedLocked(ns string) bool {
 // recordAt records the checkpoints behind at, a listing of which was just
 // kept, for as long as kept listings are (kept.For), so atIncludes can
 // judge a min on an older at.
-func (s *Service) recordAt(at string, cps map[string]string) {
+func (s *Service) recordAt(at string, cps map[string]string, prof Profile) {
 	now := s.opt.Now()
 	s.amu.Lock()
 	defer s.amu.Unlock()
@@ -1232,7 +1396,7 @@ func (s *Service) recordAt(at string, cps map[string]string) {
 			}
 		}
 	}
-	s.ats[at] = atRecord{cps: cps, exp: now.Add(kept.For)}
+	s.ats[at] = atRecord{cps: cps, prof: prof, exp: now.Add(kept.For)}
 }
 
 // atIncludes reports whether the listing at an older at already includes
@@ -1824,7 +1988,10 @@ type query struct {
 	noteValues func(name string)
 	// bornApart, set for a sealed or e2e catalog, is the epoch an explicit
 	// node's born is served under where it isn't the one its other values
-	// are sealed under, 0 otherwise. Such a born is sealed in place, as a
+	// are sealed under, 0 where it is, and bornLeftOut where it isn't
+	// known (Node.BornEpoch 0): such a born is left out, never sealed with
+	// the node's other values under the head's epoch (§E.2.6, §E.3.1).
+	// A born of another epoch is sealed in place, as a
 	// value of another resource is (§E.2.6): sealIn seals it per entry,
 	// under the node's K_r of that epoch ("" where the service lacks the
 	// key: left out), and noteEpoch counts its epoch for a listing sealed
@@ -1950,9 +2117,10 @@ func (q *query) entry(n *Node) map[string]any {
 		vals["title"] = n.Title
 	}
 	if n.Born != "" && !n.Self {
-		if e := q.bornEpoch(n); e > 0 {
+		switch e := q.bornEpoch(n); {
+		case e > 0:
 			q.bornIn(m, n, e)
-		} else {
+		case e == 0:
 			vals["born"] = n.Born
 		}
 	}
@@ -1991,8 +2159,12 @@ func (q *query) entry(n *Node) map[string]any {
 	return m
 }
 
+// bornLeftOut is bornApart's answer for a born whose epoch isn't known.
+const bornLeftOut = -1
+
 // bornEpoch is the epoch n's born is served under where it isn't that of
-// n's other values (bornApart), 0 otherwise.
+// n's other values (bornApart), bornLeftOut where it isn't known in a
+// sealed or e2e catalog, 0 otherwise.
 func (q *query) bornEpoch(n *Node) int {
 	if q.bornApart == nil {
 		return 0

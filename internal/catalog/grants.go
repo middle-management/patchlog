@@ -509,12 +509,12 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 
 // decideRead decides a /read-grants item of content namespace ns into e
 // (decideReads), and returns the keys its answer carries. Every name of a
-// purged namespace the catalog trusts is 410 purged first; one of an
-// untrusted namespace is never 410, but answered as below, 403 if it
-// isn't public (planRead), as item requests answer 403 before 410 there
-// (§B.11.4); an item in a public
-// namespace that isn't sealed is "public": true, with no grant and no
-// check; any other is decided by planRead, and then gets a grant if its
+// namespace the catalog doesn't trust is 403 untrusted first, even a
+// public one's, before "public": true (§B.11.4, §B.11.5 Every item at
+// once), as item requests answer 403 before 410 there; every name of a
+// purged namespace the catalog trusts is then 410 purged; an item in a
+// public namespace that isn't sealed is "public": true, with no grant and
+// no check; any other is decided by planRead, and then gets a grant if its
 // namespace is private, or, if it is public, its keys alone where it is
 // sealed and "public": true where it is end-to-end, since the keyring,
 // not K_r, opens its revisions (§E.3.2) and no grant is needed to read
@@ -522,9 +522,10 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 func (s *Service) decideRead(ctx context.Context, v *grant.Verified, vis *visibility, e map[string]any, ns, name, item string, lagOK map[string]bool) ([]keyOf, error) {
 	var err error
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
-		if g.Trust[ns] {
-			err = s.purgedIn(g, cur, ns)
+		if err = s.untrustedIn(g, cur, ns); err != nil {
+			return
 		}
+		err = s.purgedIn(g, cur, ns)
 	})
 	if err != nil {
 		return nil, err
@@ -855,8 +856,31 @@ func untrusted(ns, cat string) error {
 	return forbidden("namespace %s is not trusted by catalog %s", ns, cat)
 }
 
+// contentKey is the catalog's key in a content namespace's document cfg:
+// the entry for the service's kid, only where its requireAt names the
+// catalog and the document's catalogs names it too, so the namespace
+// trusts the catalog back (§B.11.3 Scoped keys bound the catalog service,
+// §B.11.9 Where). One without requireAt, or naming another namespace, or
+// in a document whose catalogs doesn't name the catalog, is no catalog
+// key: nil, as for a namespace that doesn't list the kid (noContentKey).
+// Listings (catalogOf), the roles /read-grants and POST /grants count
+// (readRoles) and the grants it signs all take it, so they can't
+// disagree, and those grants always carry an at the core checks
+// (checkLag).
+func (s *Service) contentKey(cfg *grantcheck.Config) *grant.Key {
+	k := findKey(cfg.Keys, s.opt.Kid)
+	if k == nil || !namesCatalog(cfg.Doc, s.t.Catalog()) {
+		return nil
+	}
+	if at, _ := k.RequireAt.(string); at != s.t.Catalog() {
+		return nil
+	}
+	return k
+}
+
 func (s *Service) noContentKey(ns string) error {
-	return forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
+	cat := s.t.Catalog()
+	return forbidden("namespace %s does not list the catalog's key %q with requireAt %q, or its catalogs doesn't name %s", ns, s.opt.Kid, cat, cat)
 }
 
 // planContent decides content verbs (read, append, create, …) on an item
@@ -940,7 +964,7 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 			return
 		}
 		cfg = s.configAt(g, ns, latest)
-		key = findKey(cfg.Keys, s.opt.Kid)
+		key = s.contentKey(cfg)
 		// Roles count only through subjects the catalog's key in the
 		// content namespace may grant through: its sub and groups scopes
 		// (§B.11.2 Through the key, §B.11.4 Resolve).
@@ -1046,12 +1070,12 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 }
 
 // contentSigner is the catalog's key in latest, a content namespace's
-// document at the head, which signs a grant for its items (plan.key). A
-// head without it is a 403 decided at the head, not at the checkpoint, so
-// it clears the checkpoint (decidedAt); it comes after the decision's own
-// answers, as signer's does for organising grants.
+// document at the head, which signs a grant for its items (plan.key;
+// contentKey). A head without it is a 403 decided at the head, not at the
+// checkpoint, so it clears the checkpoint (decidedAt); it comes after the
+// decision's own answers, as signer's does for organising grants.
 func (s *Service) contentSigner(latest *grantcheck.Config, checkpoint *map[string]string) (*grant.Key, error) {
-	key := findKey(latest.Keys, s.opt.Kid)
+	key := s.contentKey(latest)
 	if key == nil {
 		*checkpoint = nil
 		return nil, s.noContentKey(latest.NS)
@@ -1127,7 +1151,7 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 			return
 		}
 		cfg := s.configAt(g, ns, latest)
-		key := findKey(cfg.Keys, s.opt.Kid)
+		key := s.contentKey(cfg)
 		if key == nil {
 			err = s.noContentKey(ns)
 			return
@@ -2358,7 +2382,8 @@ func (s *Service) planRestoreNode(ctx context.Context, v *grant.Verified, node s
 
 // checkLag refuses to issue from a checkpoint older than the catalog's
 // maxLag (or the key's), since the core would reject the grant's at
-// anyway (§B.11.8, §C.4 requireAt).
+// anyway (§B.11.8, §C.4 requireAt). A content key always has requireAt
+// (contentKey); only the catalog's own key may lack it.
 func (s *Service) checkLag(ctx context.Context, cp string, key *grant.Key) error {
 	cat := s.t.Catalog()
 	if cp == "" {

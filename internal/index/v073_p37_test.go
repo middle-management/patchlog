@@ -556,12 +556,14 @@ func p37CoreExchange(t *testing.T, s *clienttest.Server, token string) (int, map
 }
 
 // TestV073P37ExchangePurged (IX-18, §C.5.2 refusals and All or nothing,
-// §8.5): an exchange naming a purged namespace the grant verifies in is
-// 410 purged, with ns and head naming the first refused one in the order
-// the grant's root block lists them, as the core answers it. The index
-// decides by its own purged state, as its queries do, so an unsealed
-// namespace it has purged, whose document the core still serves, is 410
-// too and gives no cookie.
+// §8.5): an exchange naming only purged namespaces the grant verifies in
+// is 410 purged, with ns and head naming the first refused one in the
+// order the grant's root block lists them, as the core answers it. The
+// index decides by its own purged state, as its queries do, so an
+// unsealed namespace it has purged, whose document the core still serves,
+// is 410 too and gives no cookie. Since v0.76 a purged namespace is left
+// out where another gives an edge grant (§A.4 Coverage, "leaves out ...
+// purged ones"; TestV076AccessExchangePurged).
 func TestV073P37ExchangePurged(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -586,8 +588,13 @@ func TestV073P37ExchangePurged(t *testing.T) {
 	}
 	applied("pb", amy)
 	r := p37Do(t, w.x, "POST", "/edge-grants", amy, "", nil, "")
+	if r.status != 200 || len(r.body["prefixes"].([]any)) != 2 || !strings.HasPrefix(r.body["prefixes"].([]any)[0].(string), "/pa/g/") {
+		t.Errorf("index exchange naming a purged namespace and pa: %d %v (%d cookies)", r.status, r.body, len(r.cookies))
+	}
+	onlyPB := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"pb"}, []string{"read"})
+	r = p37Do(t, w.x, "POST", "/edge-grants", onlyPB, "", nil, "")
 	if r.status != 410 || r.body["code"] != "purged" || r.body["head"] != heads["pb"] || r.body["ns"] != "pb" || len(r.cookies) != 0 {
-		t.Errorf("index exchange naming a purged namespace: %d %v (%d cookies)", r.status, r.body, len(r.cookies))
+		t.Errorf("index exchange naming only a purged namespace: %d %v (%d cookies)", r.status, r.body, len(r.cookies))
 	}
 
 	// Both purged: the first the root block names.

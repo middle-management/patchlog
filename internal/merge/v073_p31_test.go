@@ -20,13 +20,15 @@ func (w *relWorld) bobBearer() string {
 		map[string]any{"groups": sAny("match-desk"), "exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})
 }
 
-// catalogKeyInMatches lists the catalog's key in matches, through which a
-// non-admin's roles count for read, so the catalog's nodes are visible to
-// them (§B.11.3, §B.11.5).
+// catalogKeyInMatches lists the catalog's key in matches, with requireAt
+// naming the catalog, through which a non-admin's roles count for read,
+// so the catalog's nodes are visible to them (§B.11.3, §B.11.5, §B.11.9
+// Where: only such a key is the catalog's, v0.76).
 func (w *relWorld) catalogKeyInMatches() {
 	w.t.Helper()
 	e := w.catKey.Entry("read", "create", "append", "restore")
 	e["roles"] = map[string]any{"allow": sAny("desk", "reader")}
+	e["requireAt"] = "cat-season"
 	must(w.ops.PatchConfig(ctx, "matches", must(w.ops.NSHead(ctx, "matches")).Config, ops(op("add", "/keys/-", e))))
 }
 

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
 // TestV073P37EpochColumnUpgrade (ENC-32, IX-25): a database whose docs rows
@@ -49,16 +51,16 @@ func TestV073P37FiltersForgotten(t *testing.T) {
 	ix := openBare(t, filepath.Join(t.TempDir(), "i.db"))
 	ix.filters = map[string]keptFilter{}
 	t0 := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
-	f := func() *readFilter { return &readFilter{principal: map[string]any{}} }
+	f := func() *markerRec { return &markerRec{f: &grantcheck.ReadFilter{Principal: map[string]any{}}} }
 	must := func(err error) {
 		t.Helper()
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	must(ix.recordFilters(ctx, map[string]*readFilter{"reads:a:scope:1": f(), "reads:a:scope:2": f()}, t0.Add(15*time.Minute), t0))
-	must(ix.recordFilters(ctx, map[string]*readFilter{"reads:a:scope:2": f()}, t0.Add(25*time.Minute), t0.Add(10*time.Minute)))
-	must(ix.recordFilters(ctx, map[string]*readFilter{"reads:a:scope:3": f()}, t0.Add(35*time.Minute), t0.Add(20*time.Minute)))
+	must(ix.recordFilters(ctx, map[string]*markerRec{"reads:a:scope:1": f(), "reads:a:scope:2": f()}, t0.Add(15*time.Minute), t0))
+	must(ix.recordFilters(ctx, map[string]*markerRec{"reads:a:scope:2": f()}, t0.Add(25*time.Minute), t0.Add(10*time.Minute)))
+	must(ix.recordFilters(ctx, map[string]*markerRec{"reads:a:scope:3": f()}, t0.Add(35*time.Minute), t0.Add(20*time.Minute)))
 	if _, ok := ix.filters["reads:a:scope:1"]; ok || len(ix.filters) != 2 {
 		t.Errorf("filters held after the first expired: %v", ix.filters)
 	}

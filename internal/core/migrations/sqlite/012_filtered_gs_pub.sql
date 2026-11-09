@@ -1,0 +1,24 @@
+-- Migration: filtered gs pub
+-- Created: 2026-11-09T09:40:36Z
+-- Checksum: 8684c6c4c2fd276196083a662b127a7305771f860ca098fccdb6c488d37f51d6
+-- Chain: cc2e0cde92676fc88741fc3be4d6c0754da87aa8824b8686afa0b673cf60f57f
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;-- Filtered namespace reads (§B.11.9 gs, §C.4, filtered_state.go): each
+-- filtered_gs row also keeps the pub of the key its kid named, the key
+-- entry's pub member as the namespace document has it, so a cookie for it
+-- is 403 once that kid has another pub. Rows from before this migration
+-- keep '', which never matches: their cookies are 403 until the reader
+-- exchanges again.
+ALTER TABLE filtered_gs ADD COLUMN pub TEXT NOT NULL DEFAULT '';

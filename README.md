@@ -36,17 +36,18 @@ and serves immutable, CDN-cacheable revisions.
 | Releases across namespaces: release documents, the four-step release merge (plan, approve, resume), release rebases, release previews, janitor ordering; catalog merge grants | §F.9, §F.8, §B.5 | ✅ (`patchlog merge release`, `tree -release`, `POST /merge-grants`; see [Releases across namespaces](#releases-across-namespaces-f9)) |
 | Change envelopes, rule engine (`test`, `writes`, `compare`, `all`/`any`/`not`/`if`) | §6.4 | ✅ |
 | Limits (configurable, deployment maximums) and token-bucket rate limits; a refusal names the limit (`limit`) and, for sizes and counts, `measured` and `max` | §6.6, §12 | ✅ (see [Limit refusals](#design-notes)) |
-| `GET /ns/{ns}/principal`: what the grant in `Authorization` is in a namespace (principal, `kid`, the verifying key's thumbprint `key`, `operator`, verbs, roles, and a catalog namespace's `catalog` settings) and what a writer needs from the namespace document (frozen, successor, nonce, signatures, level, limits in force), to a grant limited to some resources or without `read` too | §7.4, §C.5, §C.7, §8.5 | ✅ (client `NSPrincipal`; see [Design notes](#design-notes)) |
+| `GET /ns/{ns}/principal`: what the grant in `Authorization` is in a namespace (principal, `kid`, the verifying key's thumbprint `key`, `operator`, verbs, roles as `{ name, can, rules }`, and a catalog namespace's `catalog` settings) and what a writer needs from the namespace document (frozen, successor, nonce, signatures, level, limits in force), to a grant limited to some resources or without `read` too | §7.4, §C.5, §C.7, §8.5 | ✅ (client `NSPrincipal`; see [Design notes](#design-notes)) |
 | File trees: `catalog.files` in catalog namespace documents, file metadata (`file: { size, type, modified }`) on placements in tree listings, sealed per entry for items of sealed namespaces, and the rendering of a JSON file shared by tools (`internal/files`) | §7.4, §H.1–§H.3, §E.2.6 | ✅ (tree service; see [File trees](#file-trees-h2-h3)) |
 | Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`, bounded by entries and by `logPageBytes`) | §6.2, §7.1–§7.2 | ✅ (`serve -log-page-size`, `-log-page-bytes`; see [Design notes](#design-notes)) |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
-| Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name), `/branches` | §7.4 | ✅ |
+| Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name, `?prefix=`), `/branches` | §7.4 | ✅ |
 | Files and sync clients: `Last-Modified`, `Repr-Digest` and `If-Modified-Since` on `…/rev/{id}`, and `created`, `size` and `digest` on `/heads` entries, outside E2 and E3; raw documents at `…/raw`; moves recorded as `$successor`, named by the head's `410`; whole-document appends up to `documentSize` | §6.2, §6.6, §7.1, §7.4, §7.8, §8.1 | ✅ (see [Files and sync clients](#files-and-sync-clients-71-74-78-81)) |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
+| Filtered namespace reads: in a namespace that trusts a catalog, its local branches and that catalog, a reader limited by its grant reads `/heads`, log ranges, long-poll and events filtered to what the catalog shows it, at `/ns/{ns}/g/{gs}/…` pinned to a combined checkpoint; `/branches`, the gestures listing and the search index filter alike | §B.11.9, §A.4 | ✅ (on unless `core.Options.NoFilteredReads`; client `FilteredHeads`, `FilteredLog`, `FilteredLongPoll`, `FilteredNSEvents`) |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
-| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), at most 100 distinct prefixes, drawing on each principal's `exchangeRate` bucket once a request, keys rotated (`-edge-grant-key KID=FILE`, repeatable), withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`); the catalog service mints its own for its listings, bound to a subject set (`/{catalog}/g/{gs}`) | §C.5, §9, §B.11.5 | ✅ |
+| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), at most 100 distinct prefixes, drawing on each principal's `exchangeRate` bucket once a request, keys rotated (`-edge-grant-key KID=FILE`, repeatable), withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`), `/ns/{ns}/g/{gs}` for a filtered reader (§B.11.9); the catalog service mints its own for its listings, bound to a subject set (`/{catalog}/g/{gs}`) | §C.5, §9, §B.11.5 | ✅ |
 | Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces (`GET /ns/{ns}/principal` tells one that asks) | §C.7, §7.4 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge (a sealed namespace's documents, log, long-polls and events then answer `410 purged` with `head`, which followers, services, the janitor and remote branches take as the purge) | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
@@ -1365,11 +1366,13 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   origin exchanges grants for cookies the index mints under its own key (`-edge-grant-key
   [KID=]FILE`, kid `-edge-grant-kid`, default `index`; without a key file a random key of the
   process), for `/{ns}/g/{gs}` of each private namespace it follows that the grant reads and for
-  `/_refs/g/{gs}` of the reader's subject set, as the core issues them: `application/json` or
-  `415`, all or nothing, the first refusal in the order of the grants' root blocks (`401`, then
-  `403`, then others, then `410 purged` with `ns` and `head`, for the index's own purged
-  namespaces too), `403` for a grant whose rules fix `/resource` to names no read check passes
-  for, at most 100 prefixes, and a token from `exchangeRate` (`-exchange-rate RATE,BURST`, buckets
+  `/_refs/g/{gs}` of the reader's subject set: `application/json` or `415`, judged per
+  namespace (v0.76, §A.4 Coverage). A namespace where the grant gets no marker, one whose rules
+  fix `/resource` to names no read check passes for included, is left out, and so is a purged
+  one where another namespace gives an edge grant; only a grant left with none is refused, `401`
+  if any refusal was `401`, else `403`, and `410 purged` with `ns` and `head` (for the index's
+  own purged namespaces too) only where every refusal is a purge; a named namespace whose
+  document can't be read is `502`. At most 100 prefixes, and a token from `exchangeRate` (`-exchange-rate RATE,BURST`, buckets
   shared by the instances on one `-db`). `DELETE /edge-grants` withdraws them. A GET with only
   such a cookie is authorised from it: for a `reads:{ns}:scope:{digest}` marker the index keeps the
   rules and principal behind it until its last cookie expires, so hits are filtered as under the
@@ -1448,6 +1451,17 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   limit, wherever the grant isn't ignored, as the origin answers it (§C.8, §C.6). The URLs
   before v0.51, `/g/{subject-set}/{ns}[/at/{ns_id}]`, are moved permanently (`301`) to the new
   ones.
+- Where §B.11.9 covers `{ns}` (v0.75), a partial reader's marker is `reads:{ns}:g:{gs}`, `gs` the
+  origin's subject set, and its hits are filtered by visibility, at the combined checkpoint over
+  `{ns}`, a branch's bases, the trusted catalogs and their `catalog.trust` members, which answers
+  list as `namespaces` and `min` may name, each once (a branch's root at its head, v0.76). The
+  index's grant must read those too (`502` otherwise, `503 behind` while only a sealed one's
+  keys can't be fetched yet), and the index follows them without serving them, so their purges
+  reach its kept answers (index migration `008_member_checkpoints`, `Index.Members`); until a
+  follower has its first checkpoint, partial readers covered through it get `503 behind`
+  (v0.76). `gs` also binds the grant's key (`key:{…}` of its `kid` and `pub`, v0.76), so a
+  cookie from a key whose `pub` was replaced is `403`. Unrestricted readers keep the answers
+  above.
 
 ### Merge, rebase and cleanup (Addendum F)
 
@@ -1468,10 +1482,14 @@ patchlog janitor -ns matches                     # purge merged/superseded/aband
   the successor's keyring lacks, and with `-switch` the rebase stops before replaying
   (`merge.ErrReadersDropped`), the old branch still in use, until it is run again with them
   named (§F.8.1, §E.3.2). A branch whose own keyring is still in the format before v0.63 is
-  refused, naming the namespace to migrate (`patchlog e2e migrate-keyring`).
+  refused, naming the namespace to migrate (`patchlog e2e migrate-keyring`). With `-switch` a
+  first replay that leaves a resource unmerged (below) stops before the switch too
+  (`merge.ErrLeftOut`, `RebaseResult.LeftOut`), unless `RebaseOptions.LeaveOut`, since the
+  frozen old branch would be the only place holding that change (§F.5, v0.76).
 
 - Resources are classified by ancestry, using ids only (§F.3). A fast-forward reproduces the
-  branch's ids exactly. A replay reports overlapping `writes` under the array rule, and the
+  branch's ids exactly. A replay reports overlapping `writes` under the array rule, a write to
+  an array element counting for the whole outermost array (v0.76), and the
   delete-versus-change cases always go to a person.
 - Fast-forwarded and replayed steps carry each branch revision's `gesture` and `undoes` (§F.3,
   step objects of §7.5), so history views and undo keep their grouping in the base; rebases do
@@ -1480,7 +1498,9 @@ patchlog janitor -ns matches                     # purge merged/superseded/aband
   resolution is still recorded in the batch with an empty step `[]` (in a sealed namespace or
   one that requires nonces, a patch set that only adds a fresh `$nonce`), so the batch holds the
   resource's pair, but only when the base's head is live. On a tombstone or an absent resource it
-  gets no item, stays unmerged, and is offered again by the next merge. In such namespaces
+  gets no item, stays unmerged, and is offered again by the next merge; at E3 so does a
+  replayed or re-sealed item whose document references a blob a sealed op can't declare, the
+  rest of the batch committing (§F.3, v0.76). In such namespaces
   resolution and squash sets get a fresh `$nonce` too, and squash diffs leave `$nonce` out.
 - The batch's `source.at` is the branch revision the plan was classified from. A `412` retry
   re-classifies against the base's new head but keeps that revision; work the branch got
@@ -1520,9 +1540,10 @@ patchlog janitor -ns matches                     # purge merged/superseded/aband
   its log, and a superseded claim through the old branch's `*` key then counts only with a
   grant the janitor read from the successor's `/grants` before the purge (kept while it runs,
   at most 4096, least recently used dropped first), never from the successor's base or the old
-  branch (§F.6, §8.5, v0.74). A branch whose only own entries are for resources purged in it
-  (or, at E3, its keyring) counts as merged; a batch carrying a config change counts as its own
-  work, at E3 too, except an epoch bump (config and keyring) with nothing else (§F.6, v0.74). A purged namespace's `/branches` is `410` (§7.4, §8.5): the janitor and namespace
+  branch (§F.6, §8.5, v0.74). A batch counts only through its head and tombstone items, not a
+  config entry or, at E3, the keyring (§F.6, v0.76): a branch whose only own entries are
+  config-only batches or are for resources purged in it counts as merged, and a config-only
+  batch after `source.at` doesn't fail `merged` or `superseded`. A purged namespace's `/branches` is `410` (§7.4, §8.5): the janitor and namespace
   followers take it as having no branches. An entry with `"grant": null`
   counts, on its author alone for `merged` and `superseded` and as a `*`-key write for
   `abandoned`, only while `GET /` says `"auth": "disabled"` (asked on each check, so a janitor
@@ -1915,7 +1936,12 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   from its `/keys` as at E2, named for A, and serves that history as A does: A's own sealings
   of those revisions, log entries and blobs, mirrored byte for byte and checked against the
   mirrored content, each under the epoch A serves it under, `kid` and `pl` naming A (v0.74),
-  deeper bases of `base.chain` included. `-remote-origin-url ORIGIN=URL` says where `ORIGIN`
+  deeper bases of `base.chain` included. B never seals that content itself (v0.76): where it
+  lacks the epoch key it stores A's bytes after checking their `kid` and `pl`, it asks A's
+  `…/blob/{bid}` so that A fixes a blob's epoch, and where A serves it no sealing (`403`, `404`)
+  it answers `502 upstream`. It relays no keys of a deeper base, and uses no last-seen epoch for
+  it, while its latest read of that base's namespace document failed (read at creation, at
+  start and at every sync; core migration `013_remote_chain_read`). `-remote-origin-url ORIGIN=URL` says where `ORIGIN`
   itself answers (an internal address given with `-remote-url`, say); without it a
   `-remote-url` other than `ORIGIN` counts as a possible intermediary, and the times are read
   from `ORIGIN`'s own URL. Where the origin can't be read, B still holds those keys and serves
@@ -1948,11 +1974,11 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   the branch and every local branch reading through it, and writes to them other than purges
   (prunes, blob uploads and copies included) get that `502` at step 2.1, before the
   idempotent-retry lookup; a resource purged since stays `410`, and purges still work. A raise
-  B could make but whose config writes fail for another reason is no longer `502` (§1, v0.74):
-  B records it for a rebase and retries it when it starts, before serving, and at every sync,
-  and meanwhile holds those resources
-  rather than serve them below A's level: reads and writes other than purges answer `503
-  encryption_unavailable` with `Retry-After`. Their `/heads` rows, like those of a `502`, leave
+  B could make but whose config writes fail for another reason is held the same way (§1,
+  v0.76): B records it for a rebase and retries it when it starts, before serving, and at every
+  sync, and meanwhile answers those resources `502 upstream` rather than serve them below A's
+  level, without `Retry-After` (it was `503 encryption_unavailable`). Their
+  `/heads` rows, like those of a `502`, leave
   out `created`, `size` and `digest` (§7.4, v0.74). A branch created before v0.73 reads A's document
   once more on the first follow after the upgrade (migration `010_remote_catch_up`),
   so a raise or a `read` change A made earlier is followed. A branch v0.23 left at its level
@@ -2247,7 +2273,8 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   each entry an epoch key wrapped in HPKE auth mode under the admin's X25519 key (`from`) to a
   recipient (`to`), both named by RFC 7638 thumbprint (`seal.Thumbprint`), under the info
   `"patchlog-key-v1"` LF kid LF name (v0.63). It is the only plaintext resource, written by key
-  holders with ordinary writes; nothing else but `$nonce`, entries of exactly those members, no
+  holders with ordinary writes; nothing else but a `$nonce` of the fresh form (v0.76; stored and
+  mirrored keyrings with another form are still relayed and read), entries of exactly those members, no
   two for one `kid` and `to`, kids of this namespace and no epoch after `encryption.epoch`.
   Anything else, a keyring in the format before v0.63 (`seal.Keyring`) included, is `422
   invalid` (v0.73). An auth-mode entry opens only with its sender's public key, so a reader must
@@ -2353,8 +2380,9 @@ unfiltered and to everyone (a grant is ignored), while the catalog and every nam
 combined checkpoint are public; any other listing only under `/{catalog}/g/{gs}/at/{at}/…`, the
 subject set before the checkpoint (v0.51, §B.11.5), where a request with neither a grant nor a
 cookie the service verifies is `401` (v0.73: the anonymous filtered listing of a public catalog
-that trusts a private namespace is gone). A grant in `Authorization` reads only at its own `gs`,
-or at `all` where it qualifies; at another `gs` it is `403`, never redirected. URLs without
+that trusts a private namespace is gone). A grant in `Authorization` reads only at its own `gs` as
+of the URL's `at` (v0.75), or at `all` where it qualifies; at another `gs` it is `403`, never
+redirected. URLs without
 `/g/{gs}` redirect into the reader's, `Cache-Control: private, no-store`, and
 `/{catalog}/g/{gs}/{op}` is a head pointer under an edge grant's prefix, redirecting to
 `/{catalog}/g/{gs}/at/{cur}/{op}` (`403` at another reader's `gs`). The old
@@ -2398,7 +2426,10 @@ per entry with the title in sealed and end-to-end catalogs, or, where that first
 served under another epoch than the head, sealed apart in place as `"born": {"sealed": JWE}`
 under that epoch's `K_r` (left out when that key can't be had), so such a listing is no longer
 sealed whole (§E.2.6, v0.74; stored in `nodes.born_epoch`, tree migration 005, backfilled on
-start); an implicit placement's (§B.9) is
+start). At E3 that epoch is the one a prune's `snapshot` of the first revision would carry, and
+a `born` whose epoch can't be told is left out, never sealed under the head's (§E.3.1, v0.76;
+the first start after upgrading refills borns stored without an epoch once, `meta`
+`bornsnap`); an implicit placement's (§B.9) is
 shown only with its item, and never for items of sealed or end-to-end namespaces; it is left out
 where a prune cut the chain. Sibling `order` keys compare by UTF-8 bytes (§B.2), and an explicit
 placement wins over `$parents` whether live, deleted or purged (§B.9). A visible node with no
@@ -2490,10 +2521,13 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
   `403` when no role is kept, with one message whether the item is unplaced, its placement
   dangles or no role counts. A Create answers `410 purged`, then `409` for a name that exists or
   existed, placed or not, then `403`. An item of a namespace the catalog doesn't trust is `403`
-  first, before a purge's `410`, `/read-grants` items too, without the service reading that
-  namespace (v0.74). A purged item's read check and Restore judge "a role that makes it
+  first, before a purge's `410`, `/read-grants` items too (before `"public": true`, v0.76),
+  without the service reading that namespace (v0.74). A purged item's read check and Restore judge "a role that makes it
   visible" as listings do, role and key-scope rules evaluated for the item (a rule on `/now`
-  never counts), with the grant's own subjects, `user:{sub}` always among them (v0.74). The catalog key's entry in content namespaces
+  never counts), with the grant's own subjects, `user:{sub}` always among them (v0.74). The
+  catalog key is the entry for `-kid` only where its `requireAt` names the catalog and the
+  namespace's `catalogs` names it too; otherwise item grants are `403` after a purge's `410`,
+  and its roles show nothing (§B.11.3, §B.11.9 Where, v0.76). That entry in content namespaces
   lists `restore` for this (§B.11.3):
   `"can": ["read", "create", "append", "restore"]`.
 - `POST /read-grants` returns resource-scoped read grants, and the keys of catalog nodes (and of an
@@ -2533,7 +2567,13 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
 
 Listings are filtered by the caller's subject set (§B.11.2, §B.11.5): its sub if it starts with
 `user:` (any other sub is no subject), and `group:{g}` for each of its groups, only the exact
-admin group counting as `catalog-admins`. A node is visible when the walk up collects, through a
+admin group counting as `catalog-admins`. Since v0.75 only deciding groups count: those the
+catalog's `$access` or a role or key rule of a trusted content namespace names (every key's,
+v0.76), every group where such a rule tests `/principal/groups` other than by positive tests of
+named groups (exactly `contains` of a `const` or `enum`, optionally with `"type": "array"`, or
+an `allOf` of those, through `all` and `any`, v0.76), and
+`"partial"` joins a set that leaves one out; such a set is `403` at an `at` that keeps every group.
+A node is visible when the walk up collects, through a
 subject the catalog key may assert, a role granting `read` without conditions: for an item, a
 role its content namespace defines with `read` and the catalog key there may grant (its
 `roles`, `groups` and `sub` scope), whose rules, and the key's scope `rules`, pass as a read of
@@ -2639,11 +2679,13 @@ restarts and `-rebuild`, until the last such cookie expires); a `gs` it doesn't 
 one another instance with its own database minted, is `401`, and the reader exchanges again
 there. A user's direct `$access` entries count as they were at the exchange.
 
-A `g/all` cookie was checked against the content namespaces the catalog trusted when it was
-issued, and covers every later `at`, so the service answers `403` at an `at` that includes a
-namespace trusted since, until the reader exchanges again (a kept listing from before is still
-served). The service records when it came to trust each namespace (`meta` `trusted:{ns}`; a new
-or rebuilt database records its start). A cookie carries only `kid`, `p` and `exp`, so every
+A `g/all` cookie was checked against the namespaces in the combined checkpoint when it was
+issued (v0.76: not every trusted one, so one the service doesn't follow withholds no `g/all`),
+and covers every later `at`, so the service answers `403` at an `at` that includes a namespace
+that entered it since, until the reader exchanges again (a kept listing from before is still
+served). The service records when each namespace entered the combined checkpoint while trusted
+(`meta` `inckpt:{ns}`, replacing v0.24.0's `trusted:{ns}`; a new or rebuilt database records its
+start, and a namespace that leaves trust or is purged and comes back counts as new). A cookie carries only `kid`, `p` and `exp`, so every
 `g/all` cookie with one `exp` is the same bytes, and when one was issued can be known only where
 nothing else holds the key: with a random key (no `-edge-grant-key`), the service records when
 it first issued a `g/all` cookie with each `exp` and refuses a namespace trusted no earlier than
@@ -4528,7 +4570,9 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `PrincipalInfo.Key`, `Operator` and `Catalog`): the principal of §6.4.1 (`{ id, groups,
   roles, attrs, via, grant }`),
   the root block's `kid`, the verbs its blocks allow, sorted (with roles, only those an
-  effective role lists), its effective roles, and what a writer needs from the namespace
+  effective role lists), its effective roles, each `{ name, can, rules }` as the configuration of
+  `X-Config-Revision` defines it (v0.75; `principal.roles` keeps the names, the client's
+  `PrincipalInfo.RoleDefs`), and what a writer needs from the namespace
   document, which a grant limited to some resources can't read: `frozen`, `successor` if set,
   `nonce` and `signatures` (`"required"` or `"optional"`; a sealed namespace says `"required"`,
   as §E.2.5 holds every patch set there to a fresh `$nonce`), `level` (`at-rest`, `sealed`,
@@ -4581,7 +4625,7 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   bound, as §6.6 says, not only to the deployment's maximums; a document an earlier release
   stored over its own `rulesPerNamespace` takes other writes, a freeze among them. The client reads them with `APIError.Limit` and
   `client.IsLimit`.
-- **`GET /`** answers `{ "spec": "0.74", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
+- **`GET /`** answers `{ "spec": "0.76", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace

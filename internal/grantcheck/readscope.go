@@ -1,0 +1,241 @@
+package grantcheck
+
+import (
+	"crypto/sha256"
+	"slices"
+	"sync"
+
+	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/pointer"
+	"github.com/middle-management/patchlog/internal/rules"
+)
+
+// What a grant that reads a namespace only in part reads there, shared by
+// the index (§A.4's scope marker) and the origin's filtered reads
+// (§B.11.9's scope:{digest} subject and item 2).
+
+// ScopeInput is what §A.4's scope marker digests: the rules a grant's
+// reads in a namespace are judged by, those of its key's scope, its blocks
+// and its effective roles that list read, by name, and its /principal
+// envelope, of which only the values those rules refer to are digested.
+type ScopeInput struct {
+	ReadScopeResource bool
+	KeyRules          []any
+	BlockRules        []any
+	Roles             map[string][]any
+	Principal         map[string]any
+}
+
+// ScopeInputOf is the ScopeInput of v's reads.
+func ScopeInputOf(v *grant.Verified) ScopeInput {
+	in := ScopeInput{ReadScopeResource: v.Key.ReadScopeResource, KeyRules: v.KeyRules, BlockRules: v.BlockRules,
+		Roles: map[string][]any{}, Principal: v.Principal.Envelope()}
+	_, readers := v.Allows("read")
+	for _, role := range readers {
+		in.Roles[role] = v.RoleRules(role)
+	}
+	return in
+}
+
+// ReadsScope digests what the reads of a grant that reads a namespace only
+// in part depend on (§A.4, §B.11.9): the rules they are judged by there
+// (its key's scope, its blocks' and those of its roles that grant read,
+// §C.5) and the /principal values those refer to, so readers with the same
+// rules and values share answers. It reports false if a rule refers to
+// /now (or the whole envelope): the namespace then counts as unreadable,
+// since an answer at a given at can't change. The digest is the index's
+// marker reads:{ns}:scope:{digest}, byte for byte.
+func ReadsScope(v *grant.Verified) (digest string, ok bool) { return ScopeDigest(ScopeInputOf(v)) }
+
+// ScopeDigest is ReadsScope over its inputs, so that the origin can digest
+// a stored gs's rules again as of another checkpoint (§B.11.9: a gs cookie
+// is 403 at an at where those rules differ).
+func ScopeDigest(in ScopeInput) (string, bool) {
+	lists := [][]any{in.KeyRules, in.BlockRules}
+	roles := map[string]any{}
+	names := make([]string, 0, len(in.Roles))
+	for role := range in.Roles {
+		names = append(names, role)
+	}
+	slices.Sort(names)
+	for _, role := range names {
+		roles[role] = in.Roles[role]
+		lists = append(lists, in.Roles[role])
+	}
+	env := map[string]any{"principal": in.Principal}
+	principal := map[string]any{}
+	for _, l := range lists {
+		for _, rv := range l {
+			r, err := rules.Compile(rv)
+			if err != nil {
+				return "", false // it refuses every read anyway
+			}
+			for _, p := range r.RefPaths() {
+				switch {
+				case len(p) == 0 || p[0] == "now":
+					return "", false
+				case p[0] == "principal":
+					if x, ok := pointer.Get(env, p); ok {
+						principal[p.String()] = x
+					}
+				}
+			}
+		}
+	}
+	x := map[string]any{
+		"readScope": in.ReadScopeResource, "keyRules": in.KeyRules, "blockRules": in.BlockRules,
+		"roles": roles, "principal": principal,
+	}
+	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo(x)))
+	return ids.FromBytes(sum[:ids.Size]).String(), true
+}
+
+// CombinedAt is the combined checkpoint of §B.5 over cps (ns → ns_id
+// text): the same bytes as the tree service's and the index's.
+func CombinedAt(cps map[string]string) string {
+	m := make(map[string]any, len(cps))
+	for ns, id := range cps {
+		m[ns] = id
+	}
+	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo(m)))
+	return ids.FromBytes(sum[:ids.Size]).String()
+}
+
+// ReadFilter is what a scope marker, or a filtered-read gs (§B.11.9 item
+// 2), stands for: the rules a grant's reads in a namespace are judged by,
+// those of its key's scope, its blocks and, if it carries roles, each
+// effective role that lists read (any one passing), and its /principal
+// envelope. A rule referring to /now gives no marker (ReadsScope), so the
+// filter judges a read as the grant's read check does, without a clock.
+// Fields must not change once Allows or AllowsItem has been called.
+type ReadFilter struct {
+	KeyRules, BlockRules []any
+	Roles                [][]any // nil: the grant carries no roles
+	Principal            map[string]any
+
+	once     sync.Once
+	compiled [][]*rules.Rule // KeyRules, BlockRules, then each role's
+	item     []bool          // per role: it counts for AllowsItem
+	err      error
+}
+
+// FilterOf is the ReadFilter of v's reads.
+func FilterOf(v *grant.Verified) *ReadFilter {
+	f := &ReadFilter{KeyRules: v.KeyRules, BlockRules: v.BlockRules, Principal: v.Principal.Envelope()}
+	if v.HasRoles() {
+		f.Roles = [][]any{}
+		_, readers := v.Allows("read")
+		for _, role := range readers {
+			f.Roles = append(f.Roles, v.RoleRules(role))
+		}
+	}
+	return f
+}
+
+// Encode is f as it is kept (the index's edge_filters, the origin's
+// filtered_gs): canonical JSON.
+func (f *ReadFilter) Encode() string {
+	m := map[string]any{"keyRules": f.KeyRules, "blockRules": f.BlockRules, "principal": f.Principal}
+	if f.Roles != nil {
+		roles := make([]any, len(f.Roles))
+		for i, r := range f.Roles {
+			roles[i] = r
+		}
+		m["roles"] = roles
+	}
+	return string(jsonv.Canonical(jsonv.FromGo(m)))
+}
+
+// DecodeReadFilter reads what Encode wrote.
+func DecodeReadFilter(s string) (*ReadFilter, error) {
+	v, err := jsonv.Parse([]byte(s))
+	if err != nil {
+		return nil, err
+	}
+	m, _ := v.(map[string]any)
+	f := &ReadFilter{}
+	f.KeyRules, _ = m["keyRules"].([]any)
+	f.BlockRules, _ = m["blockRules"].([]any)
+	f.Principal, _ = m["principal"].(map[string]any)
+	if roles, ok := m["roles"].([]any); ok {
+		f.Roles = [][]any{}
+		for _, r := range roles {
+			l, _ := r.([]any)
+			f.Roles = append(f.Roles, l)
+		}
+	}
+	return f, nil
+}
+
+var (
+	ptrPrincipal       = pointer.Pointer{"principal"}
+	ptrPrincipalGroups = pointer.Pointer{"principal", "groups"}
+	ptrPrincipalRoles  = pointer.Pointer{"principal", "roles"}
+)
+
+func (f *ReadFilter) compile() {
+	f.once.Do(func() {
+		lists := append([][]any{f.KeyRules, f.BlockRules}, f.Roles...)
+		for i, l := range lists {
+			var rs []*rules.Rule
+			item := true
+			for _, rv := range l {
+				r, err := rules.Compile(rv)
+				if err != nil {
+					f.err = err
+					return
+				}
+				for _, p := range r.RefPaths() {
+					if p.Overlaps(ptrPrincipal) && !p.HasPrefix(ptrPrincipalGroups) && !p.HasPrefix(ptrPrincipalRoles) {
+						item = false
+					}
+				}
+				rs = append(rs, r)
+			}
+			f.compiled = append(f.compiled, rs)
+			if i >= 2 {
+				f.item = append(f.item, item)
+			}
+		}
+	})
+}
+
+// Allows reports whether the reads f stands for may read resource: every
+// key-scope and block rule passes against the read envelope (§6.4.1) and,
+// with roles, every rule of some role does (§C.1.1).
+func (f *ReadFilter) Allows(resource string) bool { return f.allows(resource, false) }
+
+// AllowsItem is §B.11.9's item 2: Allows, but a role counts only as
+// §B.11.5 counts roles, so one with a rule that refers to anything in
+// /principal but /principal/groups and /principal/roles never allows.
+func (f *ReadFilter) AllowsItem(resource string) bool { return f.allows(resource, true) }
+
+func (f *ReadFilter) allows(resource string, item bool) bool {
+	f.compile()
+	if f.err != nil {
+		return false
+	}
+	env := map[string]any{"action": "read", "resource": resource, "principal": f.Principal}
+	pass := func(rs []*rules.Rule) bool {
+		for _, r := range rs {
+			if !r.Eval(env) {
+				return false
+			}
+		}
+		return true
+	}
+	if !pass(f.compiled[0]) || !pass(f.compiled[1]) {
+		return false
+	}
+	if f.Roles == nil {
+		return true
+	}
+	for i, rs := range f.compiled[2:] {
+		if (!item || f.item[i]) && pass(rs) {
+			return true
+		}
+	}
+	return false
+}
