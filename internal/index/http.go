@@ -691,7 +691,9 @@ var errVisibility = errors.New("visibility")
 // writeCoverErr answers a failure to compute a partial reader's view of a
 // namespace §B.11.9 covers (Index.cover): a refusal as such, no-store;
 // one of a namespace not reached yet, or purged meanwhile, behind; and a
-// namespace whose state visibility reads the service can't read, 502.
+// namespace whose state visibility reads the service can't read, 502, or
+// 503 behind while only the keys to open a sealed one's documents can't be
+// fetched yet (writeUpstreamErr).
 func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 	var ae *grant.AuthError
 	switch {
@@ -713,9 +715,21 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 // writeUpstreamErr answers err, a failure to read upstream what answering
 // needs, 502 upstream with msg, or msgGrantLacks where the index's own
 // grant can't read a namespace that decides §B.11.9 coverage
-// (errGrantLacks); the log names it.
+// (errGrantLacks); the log names it. A failure to fetch the key that opens
+// a sealed namespace's documents (client.ErrKeyFetch) that leaves the
+// service lacking it as configured (lacksKey: a 4xx from /keys other than
+// 429) is 502 too (§A.4 Private namespaces: "502 while it ... lacks the
+// keys"), and one for now (a 5xx, a 429, the core unreachable) is 503
+// behind, with Retry-After (scenario 100: "While those keys only can't
+// yet be fetched → 503 behind", §12.1). Every read check and view this
+// service answers 502 for passes through here, so each gets the same
+// answer.
 func (ix *Index) writeUpstreamErr(w http.ResponseWriter, what string, err error, msg string) {
 	ix.opt.Logf("index: %s: %v", what, err)
+	if errors.Is(err, client.ErrKeyFetch) && !lacksKey(context.Background(), err) {
+		writeBehind(w, "the index cannot fetch the keys of a sealed namespace it reads yet (§A.4)")
+		return
+	}
 	var gl *errGrantLacks
 	if errors.As(err, &gl) {
 		msg = msgGrantLacks
