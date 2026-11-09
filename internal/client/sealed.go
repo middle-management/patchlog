@@ -37,7 +37,7 @@ var ErrNoKeys = errors.New("client: the content is sealed and no key is availabl
 // ErrKeyFetch wraps a failure to fetch keys from POST /ns/{ns}/keys: the
 // request failed, or /keys answered an error, which the wrapped error
 // gives (an *APIError for an answer, AsAPIError). Whether the keys are
-// lacking for good (a 4xx other than 429, §A.4, §E.2.6) or can't be had
+// lacking for good (a 4xx other than 408 and 429, §A.4, §E.2.6) or can't be had
 // for now (503 behind, §12.1) is the wrapped error's to tell.
 var ErrKeyFetch = errors.New("client: fetching keys failed")
 
@@ -381,7 +381,7 @@ func (c *Client) readThrough(ctx context.Context, ns, kns string) (bool, error) 
 
 // readThroughBases lists the bases ns reads through, nil if ns isn't an e2e
 // branch or its document can't be read (readThrough). A transport error, or
-// an answer that may change on retry (429, 5xx), is an error: the chain is
+// an answer that may change on retry (408, 429, 5xx), is an error: the chain is
 // then unknown, not empty.
 func (c *Client) readThroughBases(ctx context.Context, ns string) (map[string]bool, error) {
 	var out map[string]bool
@@ -434,10 +434,11 @@ func (c *Client) readThroughBases(ctx context.Context, ns string) (map[string]bo
 }
 
 // transient is err if retrying may give another answer (a transport error,
-// 429 or 5xx), else nil: a document the reader can't read ends the chain.
+// 408, 429 or 5xx, §A.4), else nil: a document the reader can't read ends
+// the chain.
 func transient(err error) error {
 	var ae *APIError
-	if errors.As(err, &ae) && ae.Status != 429 && ae.Status < 500 {
+	if errors.As(err, &ae) && ae.Status != 408 && ae.Status != 429 && ae.Status < 500 {
 		return nil
 	}
 	return err

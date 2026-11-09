@@ -228,15 +228,15 @@ func Horizon(err error) string {
 }
 
 // Transient reports a failure that asking again may mend: no answer (the
-// core unreachable, the connection cut, the request timed out) or a 5xx
-// or 429. Not a refusal (another status), nor what an answer held (a
-// document that doesn't parse).
+// core unreachable, the connection cut, the request timed out) or a 5xx,
+// 408 or 429 (§A.4, §12.1). Not a refusal (another status), nor what an
+// answer held (a document that doesn't parse).
 func Transient(err error) bool {
 	if err == nil {
 		return false
 	}
 	if ae, ok := AsAPIError(err); ok {
-		return ae.Status >= 500 || ae.Status == 429
+		return ae.Status >= 500 || ae.Status == 408 || ae.Status == 429
 	}
 	var ue *url.Error
 	var ne net.Error
