@@ -191,16 +191,24 @@ func (ch *Checker) Config(ctx context.Context, ns string) (*Config, error) {
 }
 
 func (ch *Checker) state(ctx context.Context, ns string) (*nsState, error) {
+	st, _, err := ch.stateWithin(ctx, ns, ch.ttl)
+	return st, err
+}
+
+// stateWithin is state with ttl for the checker's: a ttl of zero re-reads
+// the heads now. checked is when the heads of the state returned were
+// last read.
+func (ch *Checker) stateWithin(ctx context.Context, ns string, ttl time.Duration) (st *nsState, checked time.Time, err error) {
 	now := time.Now()
 	ch.mu.Lock()
-	st := ch.states[ns]
+	st = ch.states[ns]
 	var checkedAt time.Time
 	if st != nil {
 		checkedAt = st.checkedAt
 	}
 	ch.mu.Unlock()
-	if st != nil && now.Sub(checkedAt) < ch.ttl {
-		return st, nil
+	if st != nil && now.Sub(checkedAt) < ttl {
+		return st, checkedAt, nil
 	}
 	if st != nil {
 		// Refresh only if a head in the chain moved.
@@ -208,7 +216,7 @@ func (ch *Checker) state(ctx context.Context, ns string) (*nsState, error) {
 		for _, c := range st.chain {
 			h, err := ch.c.NSHead(ctx, c.NS)
 			if err != nil {
-				return nil, err
+				return nil, time.Time{}, err
 			}
 			if h.ID != c.Head {
 				same = false
@@ -219,18 +227,18 @@ func (ch *Checker) state(ctx context.Context, ns string) (*nsState, error) {
 			ch.mu.Lock()
 			st.checkedAt = now
 			ch.mu.Unlock()
-			return st, nil
+			return st, now, nil
 		}
 	}
-	st, err := ch.load(ctx, ns, 0)
+	st, err = ch.load(ctx, ns, 0)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	st.checkedAt = now
 	ch.mu.Lock()
 	ch.states[ns] = st
 	ch.mu.Unlock()
-	return st, nil
+	return st, now, nil
 }
 
 // maxDepth bounds base chains (the deployment's branch depth is 8 by default).
@@ -349,7 +357,8 @@ func findKey(ks []grant.Key, kid string) (grant.Key, bool) {
 // there is no usable grant (malformed, unknown key, bad signature, revoked,
 // expired or not yet valid, or a namespace that doesn't exist); 403 when a
 // valid grant's key scope refuses it. Grant failures are *grant.AuthError;
-// other errors are fetch failures.
+// other errors are fetch failures, a *ChainError among them where the chain
+// a requireAt key names can't be read (§C.4).
 func (ch *Checker) Verify(ctx context.Context, ns, token string) (*grant.Verified, error) {
 	if token == "" {
 		return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
@@ -472,12 +481,42 @@ func ValidateAttrs(schema any, attrs map[string]any) error {
 	return nil
 }
 
+// ChainError is a failure to read the chain a requireAt key names (§C.4
+// requireAt): its state, keys, document or log couldn't be fetched or
+// opened, or the namespace itself answered 404 (or refused the checker).
+// It is no refusal of the grant: grant.Verify returns it as is, and so do
+// Verify and CheckRead, as an error that is not a *grant.AuthError. Its
+// verifier answers 503 behind while Transient (§A.1: a transport error,
+// a deadline, a 5xx, 408 or 429, also within client.ErrKeyFetch), 502
+// upstream otherwise, naming no namespace, never 403 (§12.1). Its text
+// names none; Err, which it unwraps to, may, for logs.
+type ChainError struct {
+	Transient bool
+	Err       error
+}
+
+func (e *ChainError) Error() string { return "cannot read the chain a requireAt key names" }
+
+// Unwrap returns the failure the chain couldn't be read for.
+func (e *ChainError) Unwrap() error { return e.Err }
+
+// ChainUnreadable reports whether the failure is transient (§A.1): it is
+// the method callers match (errors.As) to answer 503 or 502.
+func (e *ChainError) ChainUnreadable() (transient bool) { return e.Transient }
+
+func chainError(err error) *ChainError {
+	return &ChainError{Transient: client.Transient(err), Err: err}
+}
+
 // checkAt resolves a key's requireAt (§C.4) against the public API, as the
 // core does: at must be an ns_id in the named chain (ns itself for
 // requireAt true), and must have been its head at some point within maxLag
 // before the grant was issued: its successor, if any, was written no
 // earlier than issued − maxLag. maxLag is the target namespace's (default
-// 60 seconds), or the key's when stricter.
+// 60 seconds), or the key's when stricter. An at the cached head doesn't
+// reach (the log answers 404) may be newer than it: the heads are read
+// again at once, bypassing the TTL, before at is refused as not in the
+// chain. A chain it can't read is a *ChainError.
 func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 	return func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 		target := ns
@@ -497,26 +536,30 @@ func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at an
 		if _, err := ids.Parse(idText); err != nil {
 			return fmt.Errorf("malformed at")
 		}
-		tst, err := ch.state(ctx, target)
+		begun := time.Now()
+		tst, checked, err := ch.stateWithin(ctx, target, ch.ttl)
 		if err != nil {
-			return fmt.Errorf("namespace %s: %v", target, err)
+			return chainError(err)
 		}
-		if idText == tst.cfg.Head {
-			return nil
-		}
-		entries, err := ch.c.NSLog(ctx, target, tst.cfg.Head, idText)
-		if err != nil {
-			if client.IsNotFound(err) {
-				return fmt.Errorf("at is not in the chain of %s", target)
+		entries, err := ch.chainAfter(ctx, target, tst, idText)
+		if client.IsNotFound(err) && checked.Before(begun) {
+			// The cached head may be older than at: read it again.
+			if tst, _, err = ch.stateWithin(ctx, target, 0); err != nil {
+				return chainError(err)
 			}
-			return err
+			entries, err = ch.chainAfter(ctx, target, tst, idText)
 		}
-		if len(entries) == 0 {
+		switch {
+		case client.IsNotFound(err):
+			return fmt.Errorf("at is not in the chain of %s", target)
+		case err != nil:
+			return chainError(err)
+		case len(entries) == 0:
 			return nil
 		}
 		next, err := time.Parse(time.RFC3339Nano, entries[0].Created)
 		if err != nil {
-			return fmt.Errorf("namespace %s: bad log entry time", target)
+			return chainError(fmt.Errorf("grantcheck: namespace %s: bad log entry time", target))
 		}
 		lag := grant.EffectiveMaxLag(tst.cfg.MaxLag, keyMaxLag)
 		if !grant.HeadWithin(&next, issued, lag) {
@@ -524,6 +567,15 @@ func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at an
 		}
 		return nil
 	}
+}
+
+// chainAfter is the log of target after at up to the head of tst, none
+// when at is that head; a 404 when at is not in that chain.
+func (ch *Checker) chainAfter(ctx context.Context, target string, tst *nsState, at string) ([]client.NSEntry, error) {
+	if at == tst.cfg.Head {
+		return nil, nil
+	}
+	return ch.c.NSLog(ctx, target, tst.cfg.Head, at)
 }
 
 // Decision is the outcome of a read check.
@@ -539,7 +591,8 @@ type Decision struct {
 // /resource pass). Public namespaces allow everyone; a token presented to a
 // public namespace is still verified (an invalid one is an error), matching
 // services that attribute reads. Grant failures are returned as a Decision
-// with Allowed false and the *grant.AuthError as the error.
+// with Allowed false and the *grant.AuthError as the error; a *ChainError
+// (§C.4 requireAt), like any other fetch failure, with a nil Decision.
 func (ch *Checker) CheckRead(ctx context.Context, ns, token, resource string) (*Decision, error) {
 	st, err := ch.state(ctx, ns)
 	if token != "" {
