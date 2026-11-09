@@ -1,5 +1,178 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.75**, filtered namespace reads for readers a catalog limits (§B.11.9).
+`GET /` answers `"spec": "0.75"`. The upgrade was done in five packages: the visibility engine
+of filtered reads and the edge grants for them; `GET /ns/{ns}/principal` roles and the Go
+client; the origin's filtered routes, `?prefix=` on `/heads`, the gestures listing and
+`/branches`; the tree and catalog services; and the search index. The schema changes are the
+core's migration `011_filtered_reads` (SQLite and Postgres: `filtered_gs`, the subject sets edge
+grants were issued for, and `filtered_ats`, the checkpoints filtered URLs were minted at, kept 7
+days) and the index's `005_edge_gs`; the tree service's schema is unchanged. Where the spec
+leaves a question open, the reference implements the reading noted here and in
+[docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.75").
+
+**Changes to check before upgrading:**
+- **Filtered namespace reads are on by default** (§B.11.9). They cover a namespace that is
+  neither public, sealed nor end-to-end and trusts a catalog (its `catalogs` names the catalog,
+  whose `catalog.trust` lists it, through a key whose `requireAt` names it), its local branches,
+  and that catalog (Where). A partial reader there, a grant that verifies and allows `read`
+  without unrestricted read (one whose key scope tests `/resource` without fixing it, say), is
+  no longer `403` at `/heads`, log ranges, long-poll and events: it is redirected `302`,
+  `private, no-store`, `Vary: Authorization`, to their filtered forms under `/ns/{ns}/g/{gs}`.
+  There it sees only what a trusted catalog shows its subject set and its grant may read
+  (Visible). `GET /ns/{ns}` answers it the head pointer, and `/rev/{ns_id}` and `/grants` stay
+  `403`. `core.Options.NoFilteredReads` restores the v0.74 answers (there is no `serve` flag).
+  Nothing is covered with authentication disabled, where every reader reads unrestricted (§1),
+  nor are a catalog's own branches or remote branches. The WebDAV gateway counts the core's
+  `302` to a filtered read as the `403` it was.
+- **Place before create** (§B.11.9 Placement, Branches, Catalogs). Only a live placement makes a
+  document visible to a partial reader. A document never placed, one whose placement was
+  deleted, and in a branch one without a live base document of its name as of the branch's
+  `at` (a document new in the branch) are hidden. A filtered catalog read shows no placement
+  whose item doesn't exist or is tombstoned. Tools that create before placing leave documents
+  hidden from partial readers until the placement lands.
+- **`GET /ns/{ns}/principal` gives `roles` as objects** `{ "name", "can", "rules" }`, each
+  effective role as the configuration of `X-Config-Revision` defines it, `rules` `[]` if none
+  (§7.4). Operator grants and auth-disabled answers keep `[]`, and `principal.roles` in the
+  envelope stays the names (§6.4.1). Clients that read `roles` as strings must change; the Go
+  client takes both forms (below).
+- **Catalog listings' `gs` covers the caller's deciding subjects only** (§B.11.5 Listing URLs
+  carry the subject set): the groups the catalog's `$access`, or a role or catalog-key rule of a
+  trusted content namespace, names, plus its user subject as before. Every group is kept where
+  such a rule tests `/principal/groups` otherwise than by positive tests of named groups (a
+  position, a negation, a pattern). When a group is left out, the subjects also hold `"partial"`.
+  So private listing URLs and the prefixes `POST /edge-grants` gives change once for readers
+  with groups nothing names, who now share listings. Edge grants issued before carry full
+  subject sets and stay valid. A `"partial"` subject set is `403`, `no-store`, at an `at` where
+  every group is kept, its head pointer included, until the reader exchanges again, as for
+  `g/all`; at other `at`s a newly named group only shows it less.
+- **The search index answers a covered namespace at §B.11.9's combined checkpoint** (§A.4
+  Private namespaces, §B.11.9). There a partial reader's marker is `reads:{ns}:g:{gs}`, `gs`
+  being the origin's subject set. Its hits, facets, counts and the schemas fields are judged by
+  follow visibility, and its results are at the combined checkpoint over `{ns}`, a branch's
+  bases at `baseAt`, the trusted non-e2e catalogs and their `catalog.trust` members. Answers
+  list it as `namespaces`, `?min={ns}:{ns_id}` may name any of them, and they are tagged
+  `idx:{m}` for each. Coverage is decided from the namespace documents alone. The index's own
+  grant must also read those catalogs, members and bases, or partial readers get `502`.
+  Unrestricted readers and uncovered namespaces are answered as before. Result URLs of partial
+  readers change once, and their index cookies for `reads:{ns}:scope:{digest}`, issued while
+  `{ns}` wasn't covered, are `403` on `/{ns}/…` and `/_refs/…` once it is, until they exchange
+  again.
+- **`POST /edge-grants` gives a partial reader of a covered namespace** whose grant doesn't fix
+  `/resource` an edge grant for `/ns/{ns}/g/{gs}` alone, instead of `403` (§B.11.9 Edge grants,
+  §C.5.2). §C.5.2's `/resource` and qualifying-role refusals are skipped for it, and the refusals
+  for no `read` and for `/now` still apply. `/ns/{ns}/g/{gs}` is a core edge prefix (§2.1 Edge
+  prefix): the origin's key vouches for it, `DELETE /edge-grants?prefix=/ns/{ns}/g/{gs}`
+  withdraws it (§C.5.4), and `g/all` or a malformed id is `400`. Such a cookie authorises no
+  unfiltered read (`403`). An edge that checks the origin's cookies must accept the new prefix
+  form (`edge.ParseCorePrefix`). A grant that fixes `/resource` gets its `/r/{ns}/{name}`
+  prefixes as before.
+- **Gestures listing** (§7.4): an `after` must name a row the listing would give the caller,
+  one written with the gesture or undoing it; one of another gesture is `404`. A partial reader
+  of a covered namespace lists only resources visible to it at the current combined checkpoint,
+  rows and `after` alike (§B.11.9 Answers), and is `403` if its grant has rules on `/now`
+  (before, a `200` filtered per resource). In a
+  purged namespace the `410 purged` comes as soon as the read check passes (§8.5).
+
+**New:**
+- Filtered namespace reads at the origin (§B.11.9 URLs):
+  - Routes `/ns/{ns}/g/{gs}/at/{at}/heads` and `…/log`, immutable; `/ns/{ns}/g/{gs}/heads` and
+    `…/log` without `live`, which redirect `302` to the current `at`, `private, no-store`;
+    `/ns/{ns}/g/{gs}/log?live=long-poll`; and `/ns/{ns}/g/{gs}/events`. `{gs}` and `{at}` are
+    ids, `all` is `400`.
+  - `at` is the combined checkpoint of `{ns}`, a branch's bases at `baseAt`, the trusted
+    non-e2e catalogs and their `catalog.trust` members. An `at` that is neither the current one
+    nor one the origin minted a URL for in the last 7 days is `302` to the current one.
+    Answers carry `X-Namespace-Revision` and `Cache-Tag` `ns:{x}` for every other member of
+    `at`; `/heads` also carry `heads:{x}`.
+  - At an unfiltered URL, by the grant in `Authorization`: `/rev/{id}/heads` (`after` and
+    `prefix` kept) and log ranges redirect to the filtered form at the current `at`, recorded
+    first, and `/ns/{ns}/log?live=long-poll` and `/events` to their `/g/{gs}` forms.
+  - `gs` joins every trusted catalog's deciding subjects, `"partial"` where one leaves a group
+    out, and `scope:{digest}` of §A.4's marker; rules on `/now` are `403`. A grant in
+    `Authorization` reads at its own `gs` as of the URL's `at` and is `403` at another, an
+    unrestricted reader's is `403` at every filtered URL, and a `/ns/{ns}` cookie is served as
+    the URL's `gs`'s cookie would be. A `gs` cookie is judged from its stored row alone. It is
+    `401` without one, and `403` where the rules its digest covers differ at `at` (a kid or role
+    gone included) or where a `"partial"` set meets a catalog that keeps every group.
+- Filtered `/heads` list only visible rows, in pages filled to `logPageSize`, with `next` on
+  every full page (§B.11.9 /heads).
+- Filtered log ranges (§B.11.9 Log entries, Log ranges):
+  - `config` and `purge-ns` entries are always shown, `branch` entries never.
+  - A batch keeps its visible entries, `gestures` and `source.ids` (an emptied member is left
+    out), stays as a config-only batch if only its config entry is visible, and is dropped if
+    nothing is.
+  - A batch counts as its visible items and every other entry as one, so pages can be empty;
+    `X-Log-Next` names the last entry scanned, and the range ends at `X-Namespace-Revision`.
+- Filtered long-poll waits past hidden entries: a `204` names the newest entry scanned, and a
+  `since` naming a hidden entry is accepted (§B.11.9 Long-poll). Filtered events re-admit and
+  judge visibility again at the current checkpoint on every page and keep-alive, and end when
+  the check fails, a changed `gs` included (§B.11.9 Events, §7.3). Waiters of one `gs` share
+  each page and each entry's judgement per checkpoint (§B.11.9 Cost).
+- Purged namespaces answer the filtered URLs as their unfiltered forms (§B.11.9, §8.5):
+  filtered `/heads` are `410` after admission, ranges end with `purge-ns`, and long-poll and
+  events from `purge-ns` are `410`; an event stream sends `purge-ns` before it ends.
+- `GET /ns/{ns}/branches` to a partial reader of a covered namespace lists only the local
+  branches in which its grant verifies and allows `read`, without remote registrations,
+  `private, no-store` (§B.11.9 Answers).
+- `?prefix=` on `GET /ns/{ns}/rev/{ns_id}/heads`, for every reader: only names starting with it,
+  read-through names of a branch included, `next` absent on the last page. A prefix that isn't
+  a resource name (§3.6), the empty one included, is `400 bad_input` before authorisation; an
+  `after` below the prefix starts at it (§7.4, §12.4).
+- Client:
+  - `PrincipalInfo.RoleDefs` gives each effective role's `can` and `rules`. `Roles` keeps the
+    names, from v0.75's objects or the strings older servers send (§7.4).
+  - `HeadsPrefixPage` and `HeadsPrefix` send `?prefix=`, checked as a resource name before
+    sending (§7.4). A server before v0.75 answers `400`, which is returned as is.
+  - `FilteredHeadsPage`, `FilteredHeadsAt` and `FilteredHeads` follow a partial reader's
+    redirect to `/ns/{ns}/g/{gs}/at/{at}/heads` (`FilteredAt` says which `gs` and `at`, and a
+    `200` means an unrestricted reader). A page whose `next` isn't its last row, or whose rows
+    don't ascend after `after`, is refused. `FilteredHeads` restarts up to 3 times if the `at`
+    moves.
+  - `FilteredLog`, `FilteredLogAt` and `FilteredLogPage` read filtered ranges, empty pages and
+    an `X-Log-Next` naming a hidden entry included, and refuse a range whose end changes
+    between pages. `FilteredLongPoll` and `FilteredNSEvents` read `/ns/{ns}/g/{gs}/log` and
+    `/events`.
+  - `LongPoll` and `NSEvents` don't follow a redirect into a filtered log, which isn't
+    chain-verifiable (§B.11.9 Log entries, §10). They return it as a `*FilteredError` naming
+    `gs` (`AsFiltered`), still an `*APIError` with status `302` that isn't retryable, so
+    followers stop rather than apply filtered batches as whole ones. The unfiltered `NSLog`,
+    `NSLogPage`, `HeadsPage` and `Heads` are unchanged.
+- Tree and catalog services (§B.11.5):
+  - A grant in `Authorization` reads at its own `gs` as of the URL's `at`. A listing kept at an
+    older `at` stays readable to it under the `gs` it had there, also once served again from a
+    sealed or file-sealing catalog's store and after a restart. Redirects to the current `at`,
+    a checkpoint that moved during the computation included, name the grant's `gs` there. At an
+    `at` whose deciding inputs the service no longer holds, the grant is judged at the current
+    one.
+  - The listing and `/read-grants` node test is now `internal/catvis`, the implementation the
+    origin's filtered reads and the index use. Answers are unchanged.
+- Search index (§A.4, §B.11.9):
+  - In a covered branch's preview index, a partial reader sees a document only where its base
+    had a live one as of the branch's `at` (§B.11.9 Branches). A covered catalog shows it only
+    the nodes the node test shows, never a placement whose item isn't live (§B.11.9 Catalogs).
+  - `/_refs` takes each covered namespace's checkpoint into its `at` and `namespaces`, and
+    accepts `min` for those namespaces (§A.4 Across namespaces).
+  - Its edge grants for a `g:` marker record the subject set's subjects, kid and read roles
+    (`edge_gs`, migration 005). A cookie is judged from that record alone: `403` where the
+    rules its digest covers have changed, where a `"partial"` set meets a catalog in which every
+    group decides, or where the namespace is no longer covered (§B.11.9 gs).
+  - `/{ns}/g/{gs}/at/{at}` and `/_refs/g/{gs}/at/{at}` under the `gs` a grant had as of an older
+    `at` the index still holds are answered as that reader's older `at`s are: its kept result,
+    a redirect to the canonical form or from a `min` it includes, otherwise `302` to the current
+    `at` (§B.11.5). Only the kept canonical URL used to be answered; the rest were `403`.
+
+**Fixes:**
+- Tree service, sealed catalogs: a listing sealed under an old epoch could be
+  served for good after the epoch backfill a start runs (`nodes.born_epoch`, v0.24.0), or
+  another backfill or reload that changes listings at an unchanged `at`. A sealed view read
+  from the database, or computed, while a purge of its tags was committing outlived the purge.
+  Sealed views are now kept only if no purge carrying one of their tags came since they were
+  read, and the tree service and the index drop them from memory again once a purging
+  transaction commits (`internal/derived`). v0.24.0 is affected too.
+
 ## v0.24.0
 
 Implements spec **v0.74**. `GET /` answers `"spec": "0.74"`. The upgrade was done in five

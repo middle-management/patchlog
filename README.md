@@ -36,17 +36,18 @@ and serves immutable, CDN-cacheable revisions.
 | Releases across namespaces: release documents, the four-step release merge (plan, approve, resume), release rebases, release previews, janitor ordering; catalog merge grants | §F.9, §F.8, §B.5 | ✅ (`patchlog merge release`, `tree -release`, `POST /merge-grants`; see [Releases across namespaces](#releases-across-namespaces-f9)) |
 | Change envelopes, rule engine (`test`, `writes`, `compare`, `all`/`any`/`not`/`if`) | §6.4 | ✅ |
 | Limits (configurable, deployment maximums) and token-bucket rate limits; a refusal names the limit (`limit`) and, for sizes and counts, `measured` and `max` | §6.6, §12 | ✅ (see [Limit refusals](#design-notes)) |
-| `GET /ns/{ns}/principal`: what the grant in `Authorization` is in a namespace (principal, `kid`, the verifying key's thumbprint `key`, `operator`, verbs, roles, and a catalog namespace's `catalog` settings) and what a writer needs from the namespace document (frozen, successor, nonce, signatures, level, limits in force), to a grant limited to some resources or without `read` too | §7.4, §C.5, §C.7, §8.5 | ✅ (client `NSPrincipal`; see [Design notes](#design-notes)) |
+| `GET /ns/{ns}/principal`: what the grant in `Authorization` is in a namespace (principal, `kid`, the verifying key's thumbprint `key`, `operator`, verbs, roles as `{ name, can, rules }`, and a catalog namespace's `catalog` settings) and what a writer needs from the namespace document (frozen, successor, nonce, signatures, level, limits in force), to a grant limited to some resources or without `read` too | §7.4, §C.5, §C.7, §8.5 | ✅ (client `NSPrincipal`; see [Design notes](#design-notes)) |
 | File trees: `catalog.files` in catalog namespace documents, file metadata (`file: { size, type, modified }`) on placements in tree listings, sealed per entry for items of sealed namespaces, and the rendering of a JSON file shared by tools (`internal/files`) | §7.4, §H.1–§H.3, §E.2.6 | ✅ (tree service; see [File trees](#file-trees-h2-h3)) |
 | Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`, bounded by entries and by `logPageBytes`) | §6.2, §7.1–§7.2 | ✅ (`serve -log-page-size`, `-log-page-bytes`; see [Design notes](#design-notes)) |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
-| Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name), `/branches` | §7.4 | ✅ |
+| Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name, `?prefix=`), `/branches` | §7.4 | ✅ |
 | Files and sync clients: `Last-Modified`, `Repr-Digest` and `If-Modified-Since` on `…/rev/{id}`, and `created`, `size` and `digest` on `/heads` entries, outside E2 and E3; raw documents at `…/raw`; moves recorded as `$successor`, named by the head's `410`; whole-document appends up to `documentSize` | §6.2, §6.6, §7.1, §7.4, §7.8, §8.1 | ✅ (see [Files and sync clients](#files-and-sync-clients-71-74-78-81)) |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
+| Filtered namespace reads: in a namespace that trusts a catalog, its local branches and that catalog, a reader limited by its grant reads `/heads`, log ranges, long-poll and events filtered to what the catalog shows it, at `/ns/{ns}/g/{gs}/…` pinned to a combined checkpoint; `/branches`, the gestures listing and the search index filter alike | §B.11.9, §A.4 | ✅ (on unless `core.Options.NoFilteredReads`; client `FilteredHeads`, `FilteredLog`, `FilteredLongPoll`, `FilteredNSEvents`) |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
-| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), at most 100 distinct prefixes, drawing on each principal's `exchangeRate` bucket once a request, keys rotated (`-edge-grant-key KID=FILE`, repeatable), withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`); the catalog service mints its own for its listings, bound to a subject set (`/{catalog}/g/{gs}`) | §C.5, §9, §B.11.5 | ✅ |
+| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), at most 100 distinct prefixes, drawing on each principal's `exchangeRate` bucket once a request, keys rotated (`-edge-grant-key KID=FILE`, repeatable), withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`), `/ns/{ns}/g/{gs}` for a filtered reader (§B.11.9); the catalog service mints its own for its listings, bound to a subject set (`/{catalog}/g/{gs}`) | §C.5, §9, §B.11.5 | ✅ |
 | Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces (`GET /ns/{ns}/principal` tells one that asks) | §C.7, §7.4 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge (a sealed namespace's documents, log, long-polls and events then answer `410 purged` with `head`, which followers, services, the janitor and remote branches take as the purge) | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
@@ -1448,6 +1449,11 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   limit, wherever the grant isn't ignored, as the origin answers it (§C.8, §C.6). The URLs
   before v0.51, `/g/{subject-set}/{ns}[/at/{ns_id}]`, are moved permanently (`301`) to the new
   ones.
+- Where §B.11.9 covers `{ns}` (v0.75), a partial reader's marker is `reads:{ns}:g:{gs}`, `gs` the
+  origin's subject set, and its hits are filtered by visibility, at the combined checkpoint over
+  `{ns}`, a branch's bases, the trusted catalogs and their `catalog.trust` members, which answers
+  list as `namespaces` and `min` may name. The index's grant must read those too (`502`
+  otherwise). Unrestricted readers keep the answers above.
 
 ### Merge, rebase and cleanup (Addendum F)
 
@@ -2353,8 +2359,9 @@ unfiltered and to everyone (a grant is ignored), while the catalog and every nam
 combined checkpoint are public; any other listing only under `/{catalog}/g/{gs}/at/{at}/…`, the
 subject set before the checkpoint (v0.51, §B.11.5), where a request with neither a grant nor a
 cookie the service verifies is `401` (v0.73: the anonymous filtered listing of a public catalog
-that trusts a private namespace is gone). A grant in `Authorization` reads only at its own `gs`,
-or at `all` where it qualifies; at another `gs` it is `403`, never redirected. URLs without
+that trusts a private namespace is gone). A grant in `Authorization` reads only at its own `gs` as
+of the URL's `at` (v0.75), or at `all` where it qualifies; at another `gs` it is `403`, never
+redirected. URLs without
 `/g/{gs}` redirect into the reader's, `Cache-Control: private, no-store`, and
 `/{catalog}/g/{gs}/{op}` is a head pointer under an edge grant's prefix, redirecting to
 `/{catalog}/g/{gs}/at/{cur}/{op}` (`403` at another reader's `gs`). The old
@@ -2533,7 +2540,11 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
 
 Listings are filtered by the caller's subject set (§B.11.2, §B.11.5): its sub if it starts with
 `user:` (any other sub is no subject), and `group:{g}` for each of its groups, only the exact
-admin group counting as `catalog-admins`. A node is visible when the walk up collects, through a
+admin group counting as `catalog-admins`. Since v0.75 only deciding groups count: those the
+catalog's `$access` or a role or catalog-key rule of a trusted content namespace names, every group
+where such a rule tests `/principal/groups` other than by positive tests of named groups, and
+`"partial"` joins a set that leaves one out; such a set is `403` at an `at` that keeps every group.
+A node is visible when the walk up collects, through a
 subject the catalog key may assert, a role granting `read` without conditions: for an item, a
 role its content namespace defines with `read` and the catalog key there may grant (its
 `roles`, `groups` and `sub` scope), whose rules, and the key's scope `rules`, pass as a read of
@@ -4528,7 +4539,9 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `PrincipalInfo.Key`, `Operator` and `Catalog`): the principal of §6.4.1 (`{ id, groups,
   roles, attrs, via, grant }`),
   the root block's `kid`, the verbs its blocks allow, sorted (with roles, only those an
-  effective role lists), its effective roles, and what a writer needs from the namespace
+  effective role lists), its effective roles, each `{ name, can, rules }` as the configuration of
+  `X-Config-Revision` defines it (v0.75; `principal.roles` keeps the names, the client's
+  `PrincipalInfo.RoleDefs`), and what a writer needs from the namespace
   document, which a grant limited to some resources can't read: `frozen`, `successor` if set,
   `nonce` and `signatures` (`"required"` or `"optional"`; a sealed namespace says `"required"`,
   as §E.2.5 holds every patch set there to a fresh `$nonce`), `level` (`at-rest`, `sealed`,

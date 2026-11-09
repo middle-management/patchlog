@@ -1,9 +1,320 @@
 # Reference-implementation notes for the spec writer
 
-`docs/SPEC.md` mirrors the canonical specification, now at **v0.74**. This file collects what
-the reference does that the text doesn't yet describe.
+`docs/SPEC.md` mirrors the canonical specification, now at **v0.75**. This file collects what
+the reference does that the text doesn't yet describe. Open notes come in two lists, those from
+v0.75 first; cite them as "v0.75 Open n" and "v0.74 Open n".
 
-## Open
+## Open from v0.75
+
+From implementing v0.75 (branch `spec-v075`), filtered namespace reads (§B.11.9) and the changes
+around them. Numbered afresh; cite these as "v0.75 Open n". Each entry gives the section, what
+v0.75 says, what the reference does (the reading it chose, the conservative one where it had a
+choice) and the question. The analysts' questions from before the work and the implementers'
+notes are merged here, each case once.
+
+The four with the widest reach come first.
+
+1. **Does §A.4's covered form bind a service whose origin doesn't filter?** (§B.11.9 Where,
+   §A.4 Private namespaces, §1). Where says §B.11.9 "applies in those where the origin implements
+   it". Yet §A.4 changes the index's marker, `at` and filter wherever §B.11.9 covers `{ns}`, and
+   the namespace documents alone decide that. Nothing says whether an origin implements it:
+   `GET /` has no member for it, and a service's grant reads unrestricted, so it never sees the
+   `302` into `/g/{gs}`. The reference index decides coverage from the documents
+   (`internal/index/filtered.go` `coverage`). So against an origin started with
+   `NoFilteredReads`, or one before v0.75, it still gives partial readers `reads:{ns}:g:{gs}`
+   markers at the combined checkpoint, filtered by visibility. Its `gs` equals the origin's byte
+   for byte (`grantcheck.ReadsScope`, `CombinedAt`; `TestV075IndexSubjectSets` compares them).
+   *Question:* does §A.4's covered form depend on the origin? If so, how does a service learn it:
+   a `GET /` member such as `"filteredReads": true`, a `/principal` member, or configuration?
+   And must a service's `gs` equal the origin's byte for byte, which makes the scope marker's
+   canonical input normative, or only stand for the same subjects?
+2. **Deciding groups: which rules, and which tests are positive** (§B.11.5 Listing URLs carry
+   the subject set, §B.11.9 gs). The deciding groups are those "the catalog's `$access`, or a
+   role or key rule of a content namespace it trusts, names". A group is left out only where
+   every such rule tests it "solely by positive tests … that it holds a group named by value".
+   The text doesn't say whether "role" means every role or only those that list `read`, whether
+   "key" means every key or the catalog's (`requireAt`) keys, or whether a key's `groups` scope
+   names a group. Nor are the positive tests listed, though implementations must agree on them
+   for `gs` to match. The reference takes the rules of every role, those of each key whose
+   `requireAt` names the catalog, and `$access` of explicit nodes. That is a superset, which is
+   safe. A key's `groups` scope names none (`internal/catvis/profile.go` `computeProfile`). It
+   accepts exactly `{ "op": "test", "path": "/principal/groups", "schema": { "contains": {
+   "const": S } } }` and the same with `"enum": [S, …]`, optionally with `"type": "array"` or
+   `allOf` of such schemas, reached through `all` and `any` only. Anything else that reads
+   `/principal/groups` keeps every group: a `value` or `exists` test, a path below or above it,
+   another keyword, a `compare` (`internal/rules/grouptests.go`). *Propose:* list the accepted
+   forms in §B.11.5, and say "every role it defines and every key whose `requireAt` names the
+   catalog".
+3. **Deleted resources: as of when, and whose `$access`** (§B.11.9 Deleted resources, Catalogs,
+   §B.11.5, §B.11.7). A deleted resource "is judged at its placement as if it were live … so its
+   tombstone or purge reaches exactly those who could see it live". Four cases aren't settled.
+   (a) The moment. The reference reads the placement's item state at the answer's checkpoint,
+   not at the deletion. So a reader who saw a placement live never sees its tombstone if the item
+   was deleted first. And a tombstone whose placement was removed afterwards is hidden from
+   everyone: "only a live placement makes a resource visible" implies that, "exactly those who
+   could see it live" contradicts it. (b) A purged catalog node has no last live document, so it
+   can't be judged from its own parents; the reference hides it. (c) Roles are recomputed from
+   the graph as organising requests do (`catvis.View.AsIfLive`), not taken from §B.11.7's frozen
+   rows; the two differ after `$access` changes made after the delete. (d) The origin and the
+   index count `$access` of tombstoned nodes among the deciding subjects
+   (`catvis.NewCatalogDeleted`), or a node's tombstone couldn't reach the readers who saw it; so
+   those subjects keep deciding until the purge. The tree service's listings show live nodes
+   only and count live nodes only (`internal/catalog/catalog.go`), so one reader's `gs` can
+   differ between the two. *Question:* which moment; how a purge reaches anyone; frozen rows or
+   recomputed roles; and does a deleted node's `$access` decide subjects everywhere, or only
+   where tombstones are shown?
+4. **A branch's `at`: base documents at `baseAt`, keys at the head** (§B.11.9 URLs, Branches,
+   §C.4). URLs says "a base's documents are read as of the `at` its branch reads it at", yet the
+   base is in `at` for "roles or keys", and §C.4 makes a branch's keys follow its base's head. The
+   reference reads the root's document (`catalogs`, `requireAt` keys, roles) at the branch's
+   `baseAt`, and puts the base in `at` at that `ns_id` (`internal/core/filtered_scope.go`,
+   `filtered_state.go`). Catalogs are at their heads. So a read-through resource tombstoned in
+   the base after the branch's `at` is judged by its live base document as of `baseAt` and its
+   placement at the catalog's current checkpoint. The digest check of a branch cookie, at the
+   origin and at the index, takes keys from the base's head (§C.4) and roles from the document
+   at the checkpoint, so `at` doesn't pin the keys. Trust and keys are the root's, never the
+   branch's own document's. *Question:* are a base's roles, decider keys and trust read at
+   `baseAt` or at its head? If at the head, `at` needs both. Do a branch's own `catalogs` and
+   keys count?
+
+Admission and subject sets.
+
+5. **A grant in `Authorization` at filtered URLs** (§B.11.9 Partial reader, URLs). "Unrestricted
+   readers keep the unfiltered answers and URLs; at filtered ones a grant in `Authorization` is
+   `403`" can be read as covering every grant. But URLs serves those URLs otherwise "as §B.11.5
+   serves listing URLs", where a grant reads at its own `gs`. The reference applies the `403` to
+   unrestricted readers only. A partial reader's grant reads at its own `gs` as of the URL's
+   `at`, and is `403` at another `gs` (`internal/core/filtered_admit.go` `filteredAdmit`).
+   CONFORMANCE SVC-47 drops the context. *Propose:* "at filtered ones an unrestricted reader's
+   grant in `Authorization` is `403`".
+6. **A `gs` with no stored row, and `/ns/{ns}` cookies** (§B.11.9 Partial reader, gs). A
+   `/ns/{ns}` cookie "is served as that `gs`'s cookie would be", and the origin keeps what each
+   `gs` stands for. Nothing says what a cookie gets for a `gs` the origin has no row for (never
+   exchanged, or swept), or past the row's expiry. The reference answers `401` ("unknown subject
+   set: exchange the grant again") in both cases. A `/ns/{ns}` cookie takes the URL's `gs` and is
+   judged from its row, the digest check included (`filteredAdmit`). Rows are kept per namespace
+   and `gs` (core migration 011, `filtered_gs`): a `gs` names no namespace, and one grant can
+   have the same `gs` in two namespaces whose keys and rules differ. *Propose:* say a miss is
+   `401`, and that a subject set is scoped to its namespace, as `/ns/{ns}/g/{gs}` implies.
+7. **Which rules can "differ"** (§B.11.9 gs: "a `gs` cookie is `403` at an `at` where those
+   rules differ"). The reference recomputes the scope digest as of `{ns}`'s document at the URL's
+   `at`. It takes the stored kid's scope rules and the stored effective read roles' definitions,
+   with the stored block rules and principal. A kid or role that is gone counts as differing, so
+   `403` (`gsDigestHolds`). *Propose:* say so, and whether a removed role is a difference or a
+   narrowing.
+8. **`"partial"` with several catalogs, and when it is `403`** (§B.11.5, §B.11.9 gs). With
+   several trusted catalogs the origin joins their deciding subjects. It adds `"partial"` if any
+   of the caller's groups is missing from the union. A `"partial"` cookie is `403` at an `at`
+   where any deciding catalog keeps every group (`catvis.FilteredSubjects`, `filteredAdmit`).
+   "Keeps all groups" is read as a property of the `at`, true where some rule tests groups
+   otherwise than positively. It doesn't depend on the caller, so a `"partial"` set is refused
+   there even when that rule names a group the reader lacks. A newly named group alone is no
+   reason for a `403`: an old `"partial"` set just lacks it. A grant in `Authorization` is keyed
+   again at each `at`, so the `403` bites cookies and stored URLs only. A grant at an old
+   `"partial"` URL whose `at` didn't keep every group still reads. *Propose:* confirm each, in
+   particular that `"partial"` is joint and that any catalog keeping all groups refuses.
+9. **Several `requireAt` keys, and folder roles** (§B.11.9 Where, §B.11.5, §B.11.3). A namespace
+   may have several keys whose `requireAt` names a catalog (during a rotation, say), while
+   §B.11.5 speaks of "the catalog's key". The reference judges each such key alone (its `sub`,
+   `groups` and `roles` scopes and its scope rules). A resource is visible if any of them makes
+   it so (`internal/catvis/catvis.go` `judge`). The catalog service still uses its one
+   configured `-kid`. If that isn't a `requireAt` key, its listings and the origin's filtered
+   reads disagree. For a catalog's own filtered reads, folder visibility counts the roles only
+   of `catalog.trust` members that trust it back (name it in `catalogs` and hold a `requireAt`
+   key for it). Other members contribute none. *Question:* union over keys or one key? Must the
+   catalog service's key be one whose `requireAt` names the catalog? Which members count for
+   folders?
+10. **Item 2's roles, and what the digest covers** (§B.11.9 Visible, §A.4). Item 2 counts roles
+    "only as §B.11.5 counts them", which excludes roles with rules on `/principal` other than
+    `groups` and `roles`. §A.4's marker digests every `/principal` value referred to. The
+    reference's item 2 never lets such a role allow, though its rules still enter the digest
+    (`grantcheck.ReadFilter.AllowsItem`). So a read role testing `/principal/sub` gives no access
+    through filtered reads. *Question:* intended? Do the reader's own role rules filter at all,
+    or only the catalog's effective roles? CONFORMANCE scenario 75 depends on it.
+11. **Cookies across a change of coverage** (§B.11.9 gs, §A.4). The text doesn't say what happens
+    to a cookie when its namespace's coverage changes. The reference index refuses a `g:` cookie
+    `403` once its namespace is no longer covered. It likewise refuses a cookie for
+    `reads:{ns}:scope:{digest}`, issued while `{ns}` wasn't covered, once it is, on `/{ns}/…` and
+    `/_refs/…`; otherwise that cookie would keep reading documents no placement shows
+    (`internal/index/edgegrants.go` `stillUncovered`). Either way the reader exchanges again.
+    *Propose:* a sentence for each direction.
+12. **The exchange's prefixes** (§B.11.9 Edge grants, §C.5.2). The exchange gives
+    `/ns/{ns}/g/{gs}` "in their place". So a partial reader that doesn't fix `/resource` gets no
+    `/r/{ns}` cookie, and reads resource URLs with its grant or through `/read-grants`. A grant
+    that fixes `/resource` gets its `/r/{ns}/{name}` prefixes as before and no `/g/` prefix,
+    also with a non-fixing `/resource` rule beside the fixing one (v0.74 Open 20)
+    (`internal/core/edgegrants.go` `edgeGrant`). *Question:* confirm both, and say whether a
+    fixing grant may also get `/ns/{ns}/g/{gs}`.
+
+URLs and checkpoints.
+
+13. **An older `at` under a `gs` the server can't confirm** (§B.11.5 "a grant in
+    `Authorization` reads only at its own `gs` as of the URL's `at`", §B.11.9 URLs, §A.4). A
+    server can compute a grant's `gs` only at `at`s whose deciding inputs it still holds. The
+    reference fails closed in three places. The origin admits the redirect from an `at` it
+    can't answer at the current checkpoint, with the URL's `gs`. So a grant whose `gs` changed
+    meanwhile gets `403`, not a redirect to its own new `gs` (`filteredCurrentRedirect`). The
+    tree service judges a grant at an `at` it no longer holds (not kept, or after a restart) by
+    the current one: `403` if the `gs` differs, a redirect if it matches (`internal/tree/http.go`).
+    And the index can't recover the per-namespace checkpoints from a `/_refs` combined `at` it
+    no longer keeps, so the grant's old `gs` there is `403`. Also unspecified: may a grant whose
+    current `gs` is gs2 read `/g/{gs2}/at/{older}`, where it had gs1? The index serves a kept
+    result there. *Propose:* "at an `at` whose inputs it no longer holds, a server MAY judge the
+    grant as at the current checkpoint", or require a `302` to the current `at`, under the
+    grant's `gs` there, whenever the grant verifies.
+14. **Which namespaces `at` holds** (§B.11.9 URLs). Deciding subjects read the roles and keys of
+    every content namespace a catalog trusts. "Each content namespace whose roles or keys those
+    decisions read" can be read as `{ns}` alone. The reference puts every local, unpurged
+    `catalog.trust` member of each deciding catalog in `at`, at its head, so `gs` and the
+    `"partial"` check are judged at a pinned state (`internal/core/filtered_state.go`
+    `filteredCurrent`). The index does the same. *Propose:* name them in URLs.
+15. **Redirects drop the URL's `ns_id`** (§B.11.9 URLs). A partial reader at
+    `/ns/{ns}/rev/{id}/log?since=…` or `/rev/{id}/heads` is redirected to the filtered form "at
+    the current `at`". So the range may run past `{id}`, and `/heads` lists as of now. The
+    reference does exactly that. *Question:* intended, or should the redirect pick an `at` whose
+    `{ns}` member is `{id}`?
+16. **Which `at`s are answered, and the redirect's class** (§B.11.9 URLs, §B.5). "Answered at an
+    `at` as §B.5 says" would move partial readers off their `at` with every write to `{ns}`, so
+    paging a long range would be redirected again and again. The reference answers `200` at the
+    current `at`, and at any `at` it minted a URL for in the last 7 days (`filtered_ats`) whose
+    members are still unpurged and still include every catalog the namespace trusts,
+    recomputing the answer from history. Others are `302` to the current `at`. Every such
+    redirect is `private, no-store`, `Vary: Authorization` (`internal/server/filtered.go`
+    `writeFilteredRedirect`).
+    *Propose:* allow answering a recorded `at` that can be recomputed exactly, and give the
+    stale-`at` redirect a class: §B.5's head pointer, or §B.11.9's `private, no-store`.
+17. **What is covered** (§B.11.9 Where, §1). "Its branches" and authentication disabled are
+    open. The reference covers only local branches of a trusting namespace, recursively. A
+    catalog's own branches aren't covered, though §F.8 puts draft placements there, so their
+    partial readers get `403`. Nor are remote branches, whose base or catalog may be elsewhere.
+    Nothing is covered with authentication disabled. A purged catalog is no longer trusted, so
+    a namespace trusting only it stops being covered, while a purged `{ns}` stays in its `at` at
+    its `purge-ns` entry. A sealed catalog decides like any other at the origin, which can read
+    it (`filteredScope`, `fsTrust`). *Question:* confirm each, catalog branches above all.
+18. **Filtered URLs where §B.11.9 doesn't apply, and malformed ids** (§B.11.9 URLs, §7). The text
+    doesn't say what `/ns/{ns}/g/{gs}/…` answers for a namespace that isn't covered (or is
+    public, or with `NoFilteredReads`), or for a malformed `{gs}` or `{at}`. The reference runs
+    the unfiltered credential check first (`401` without credentials, `403` for a `g` cookie),
+    then answers `403` (`internal/core/filtered_reads.go` `filteredOpen`); `404 not_offered`
+    would also fit. A malformed id is `400 bad_input` like other ids (§7), and so is `all` as
+    `gs`. *Propose:* say both.
+19. **The head pointer into a `403`** (§B.11.9 Answers). `GET /ns/{ns}` answers a partial reader
+    the head pointer, `/ns/{ns}/rev/{head}`, which stays `403` for it. The reference does as
+    written. *Question:* deliberate, or should it point partial readers at `…/g/{gs}/heads`?
+
+Pages, logs and live reads.
+
+20. **`/heads` pages and `prefix`** (§B.11.9 /heads, §7.4, §12.4). Filtered `/heads` carry `next`
+    "on every full page and no other", so a full last page carries `next` and the client then
+    reads an empty page; unfiltered §7.4 has `next` "absent on the last". A client can't tell a
+    full page without knowing `logPageSize`. The reference's origin fills pages and sets `next`
+    on every full one; `?prefix=` on unfiltered `/heads` keeps §7.4's rule. Its client checks
+    only that `next` is the last row and that rows ascend after `after`, so it accepts a short
+    page with `next`. A `prefix` that isn't a resource name (§3.6), the empty one included, is
+    `400 bad_input` before authorisation. An `after` below the prefix starts at it, and one past
+    every prefixed name gives an empty page (`internal/core/reads.go` `namesIn`). *Question:* is
+    the divergence intended, is a short page with `next` malformed, and is a bad `prefix` a
+    request-shape `400`?
+21. **Log entries: emptied members and other kinds** (§B.11.9 Log entries). A batch keeps
+    `gestures` and `source.ids` "without hidden names", but the text doesn't say whether an
+    emptied member stays, and its list of kinds doesn't say "and no other". The reference
+    removes an emptied `gestures` or `source.ids`, which reveals less. It drops kinds other than
+    `head`, `tombstone`, `purge`, `prune`, `config`, `purge-ns` and `batch`, and batch members
+    that aren't config or resource entries (`internal/core/filtered_log.go` `filterEntry`).
+    *Propose:* say both.
+22. **Ranges across a moving `at`, and client libraries** (§B.11.9 Log ranges, §10, §7.7). Every
+    page of a range carries the range's `X-Namespace-Revision`. The reference's client refuses a
+    range whose end changes between pages. It treats a `302` partway through (an `at` no longer
+    answered) as an error, so the reader starts again rather than resume from its `since` at the
+    new `at`. When it follows a redirect into a filtered form, it takes `gs` and `at` from the
+    `Location` path and sends its own `since`, `prefix` and `after`, not the `Location`'s query.
+    Its `LongPoll` and `NSEvents` don't follow a redirect
+    into a filtered log at all; they return it as an error, and filtered reads are opt-in
+    (`internal/client/filtered.go`, `live.go`), since a filtered log isn't chain-verifiable.
+    *Question:* may a client resume at the new `at` from its `since`, and is the redirect's query
+    authoritative? *Propose:* "a client library MUST NOT hand a filtered log to a caller that
+    expects the unfiltered one".
+23. **Long-poll: how far to scan, and Cost** (§B.11.9 Long-poll, Cost). An answer given at once
+    (no `since`, or one far behind) must scan past hidden entries before it can answer `204`,
+    and nothing bounds how far. The reference scans from the `since`, or from the chain's first
+    entry without one, through the whole log at once while it finds nothing visible
+    (`internal/core/filtered_live.go`). Its shared answer is keyed by `gs` and `at`, so a commit
+    to any member of `at`, a catalog say, starts a new key and judges entries again. That is
+    correct, but costs more than "once per wake" where catalogs change often. *Question:* may a
+    server answer `204` after a bounded scan (one page?), naming the newest entry scanned? Does
+    Cost mean per `gs`, or per `gs` and `at`?
+24. **Live reads when the reader's `gs` changes** (§B.11.9 Events, Long-poll, URLs, §7.3). The URL
+    fixes `gs`, but under a grant the reader's `gs` at the current checkpoint can change: a newly
+    named group, a changed rule, a sub-scoped key. The reference ends the event stream at its
+    next read check (`403`) and answers a long-poll `403`. A cookie's stream likewise ends where
+    the digested rules differ from those stored for its `gs`. A partial reader's unfiltered
+    long-poll and events are redirected `302` to their `/g/{gs}` forms by the grant in
+    `Authorization`; `EventSource` sends none, so in practice cookies apply. *Propose:* confirm
+    that the stream ends, rather than keep the URL's `gs`.
+25. **Tags** (§B.11.9 URLs, §9, §12.8). Filtered answers are "tagged as their unfiltered forms
+    plus `ns:{…}`". A resource purge in a catalog emits `heads:{cat}` and `r:{cat}/{name}`, not
+    `ns:{cat}`, so the reference's filtered `/heads` also carry `heads:{x}` for every other member
+    of `at` (`internal/server/filtered.go` `filteredHeadsTags`). Index answers for a covered
+    namespace carry `idx:{m}` for every member. But for a catalog the index only reads, nothing
+    ever purges `idx:{cat}`; its answers move to a new `at` instead. *Question:* is `ns:{x}` all
+    a cache needs? Which tag should index answers carry for a catalog, so that its purge reaches
+    them: `ns:{cat}` or `idx:{cat}`?
+
+Other answers.
+
+26. **The gestures listing and `/branches`** (§B.11.9 Answers, §7.4, §8.5). Neither has an `at`.
+    The reference judges visibility at the current combined checkpoint, so these answers aren't
+    pinned and can disagree with a filtered page at another `at`. This narrows today's answer:
+    unplaced documents drop out of partial readers' gestures listings once an origin implements
+    §B.11.9. A partial reader whose grant has rules on `/now` gets `403` on the gestures listing
+    of an unpurged namespace, as at filtered URLs; before v0.75 it got a listing filtered per
+    resource. A sealed or e2e namespace's `404 not_offered` comes before that refusal, and a
+    purged namespace's `410` as soon as the read check passes. `/branches` lists frozen branches
+    and those with a `successor` like any other in which the grant verifies
+    (`internal/core/gestures.go`, `reads.go` `BranchList`). *Question:* is the current checkpoint
+    meant, is the narrowing intended, and should a `/now` grant keep its per-resource listing?
+27. **`/branches` where §B.11.9 doesn't apply** (§B.11.9 Answers, §10). A partial reader of an
+    uncovered namespace still gets `403` at `/ns/{ns}/branches`. A reader holding only a
+    `/ns/{ns}/g/{gs}` cookie has no credential there, since the prefix doesn't cover that URL,
+    and gets `401`; it needs its grant. Yet §10 says partial readers learn of branches there.
+    *Question:* intended, or should a `/ns/{ns}/g/{gs}/branches` exist?
+28. **`/principal` `roles`** (§7.4: "each effective role as the configuration of
+    `X-Config-Revision` defines it"). The reference gives `can` as the configuration lists it, in
+    its order, not narrowed to the verbs the key and blocks allow, and leaves out `includes` and
+    other members of a role entry. An operator grant gets `[]` whatever it carries
+    (`internal/core/principal.go` `principalRole`). *Question:* configured or effective `can`,
+    and should other members appear?
+
+The search index.
+
+29. **Unrestricted readers at the index** (§A.4, §B.11.9 Partial reader). §A.4 doesn't say
+    whether the combined `at` applies to an unrestricted reader of a covered namespace. The
+    reference applies it to partial readers only. Unrestricted readers keep `{ns}`'s `ns_id` and
+    get no `namespaces`, following "unrestricted readers keep the unfiltered answers". The index
+    classes readers by its namespace-wide test (one read role without `/resource` rules), while
+    §B.11.9 uses unrestricted `read` (§2.1). A grant with rules on `/now` that reads
+    unrestricted still gets `403` from the index, where the origin may class it otherwise.
+    *Question:* confirm, and should both use §2.1's test?
+30. **`/_refs` and a base twice** (§A.4 Across namespaces). One answer can include a branch's
+    base at its own checkpoint and at `baseAt` as a member of the branch's view, while
+    `namespaces` holds one `ns_id` per namespace. The reference lets the branch's `ns_id` stand
+    for the base at `baseAt`, since the branch fixes it (`internal/index/refsall.go`
+    `refsMerge`). *Question:* how is such a member merged?
+31. **What the index reads, and how fresh** (§A.4, §A.5, §B.11.9 Branches). The index takes
+    catalogs and `catalog.trust` members it doesn't follow at their heads as its grant checker
+    last read them (`CheckerTTL`, 30 s by default), so a catalog move reaches its answers within
+    that time; a `min` naming them reads the head afresh. Where its grant can't read a catalog, a
+    member or a base, or a sealed catalog's documents through its plain client, partial readers
+    get `502`. It implements visibility in covered branches as of the branch's `at`.
+    *Question:* should §A.5 bound the lag? Must the service's grant read those namespaces, or
+    may it leave the namespace out, or answer partial readers `403`, also on covered branches it
+    can't yet judge? What should an index do with a sealed catalog?
+
+## Open from v0.74
+
+v0.75 settles none of these 45 notes. Where it touches a section they cite (§2.1 Edge prefix,
+§7.4, §A.4, §C.5, §C.5.2), the change concerns filtered reads only, so they stay open as
+written.
 
 From implementing v0.74 (branch `spec-v074`). Numbering restarts. Each entry gives the section,
 what v0.74 says, what the reference does (the reading it chose) and the question. "Was Open n"
