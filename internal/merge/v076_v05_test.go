@@ -1,6 +1,8 @@
 package merge_test
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -81,6 +83,85 @@ func TestV076MergeDashMemberNotWidened(t *testing.T) {
 	r := e.plan("matches", "r7", merge.Options{}).Resource("grid")
 	if r.Class != merge.Replay || len(r.Conflicts) > 0 {
 		t.Fatalf("grid: %+v", r)
+	}
+}
+
+// Review V76-05 (§F.3 kept bullet, §F.5): a rebase with Switch whose first
+// replay leaves a resource out (here derby, re-sealed over an E2 blob)
+// stops before the switch with ErrLeftOut: frozen, the old branch would be
+// the only place holding derby's change, and its editors would move to a
+// successor without it. The rest is replayed; LeaveOut switches anyway.
+func TestV076RebaseSwitchStopsOnLeftOut(t *testing.T) {
+	t.Parallel()
+	c, x, b := v05RaisedBase(t)
+	body := must(x.SealPatches(ctx, "r7", "derby", b, ops(op("replace", "/score", "1-0"))))
+	must(c.Append(ctx, "r7", "derby", b, body))
+	opt := merge.RebaseOptions{Branch: "r7", New: "r7b", Switch: true, Plan: merge.Options{E2E: x}}
+	res, err := merge.Rebase(ctx, c, opt)
+	if !errors.Is(err, merge.ErrLeftOut) || res.Switched || !reflect.DeepEqual(res.LeftOut, []string{"derby"}) {
+		t.Fatalf("rebase: %v, %+v", err, res)
+	}
+	if frozen, _ := must(c.NSDoc(ctx, "r7", must(c.NSHead(ctx, "r7")).ID)).Value["frozen"].(bool); frozen {
+		t.Fatal("r7 frozen although derby was left out")
+	}
+	_, d := must2(x.LoadE2E(ctx, "r7b", "cup"))
+	if d.Value.(map[string]any)["score"] != "2-0" {
+		t.Fatalf("r7b cup %v", d.Value)
+	}
+	// Without Switch the rebase only reports it.
+	res = must(merge.Rebase(ctx, c, merge.RebaseOptions{Branch: "r7", New: "r7b", Plan: merge.Options{E2E: x}}))
+	if res.Switched || res.First.Resource("derby").HasItem() {
+		t.Fatalf("rebase without switch: %+v", res)
+	}
+	opt.LeaveOut = true
+	res = must(merge.Rebase(ctx, c, opt))
+	if !res.Switched || !reflect.DeepEqual(res.LeftOut, []string{"derby"}) {
+		t.Fatalf("rebase with LeaveOut: %+v", res)
+	}
+}
+
+// Review V76-05: a resource kept over a tombstone in a rebase can't be
+// recorded either (§F.3), so Switch stops on it too unless LeaveOut.
+func TestV076RebaseSwitchStopsOnKeptOverTombstone(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.branch("matches", "r7")
+	e.append("r7", "cup", op("replace", "/score", "1-0"))
+	e.del("matches", "cup")
+	keep := func(ctx context.Context, p *merge.Plan) error { return p.Resolve("cup") }
+	opt := merge.RebaseOptions{Branch: "r7", New: "r7b", Switch: true, Prepare: keep}
+	res, err := merge.Rebase(ctx, e.c, opt)
+	if !errors.Is(err, merge.ErrLeftOut) || res.Switched || !reflect.DeepEqual(res.LeftOut, []string{"cup"}) {
+		t.Fatalf("rebase: %v, %+v", err, res)
+	}
+	opt.LeaveOut = true
+	if res = must(merge.Rebase(ctx, e.c, opt)); !res.Switched {
+		t.Fatalf("rebase with LeaveOut: %+v", res)
+	}
+}
+
+// Review V76-05: a catch-up that leaves a resource out reports it with
+// ErrLeftOut; the switch is done by then. derby's change reaches r7 while
+// the first replay is prepared, so only the catch-up holds it.
+func TestV076RebaseCatchUpReportsLeftOut(t *testing.T) {
+	t.Parallel()
+	c, x, b := v05RaisedBase(t)
+	first := true
+	prepare := func(ctx context.Context, p *merge.Plan) error {
+		if first {
+			first = false
+			body, err := x.SealPatches(ctx, "r7", "derby", b, ops(op("replace", "/score", "1-0")))
+			if err != nil {
+				return err
+			}
+			_, err = c.Append(ctx, "r7", "derby", b, body)
+			return err
+		}
+		return nil
+	}
+	res, err := merge.Rebase(ctx, c, merge.RebaseOptions{Branch: "r7", New: "r7b", Switch: true, Plan: merge.Options{E2E: x}, Prepare: prepare})
+	if !errors.Is(err, merge.ErrLeftOut) || !res.Switched || res.CatchUp == nil || !reflect.DeepEqual(res.LeftOut, []string{"derby"}) {
+		t.Fatalf("rebase: %v, %+v", err, res)
 	}
 }
 

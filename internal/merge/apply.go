@@ -42,6 +42,20 @@ func (p *Plan) Conflicting() []*Resource {
 	return out
 }
 
+// LeftOut returns the names of the resources the branch changed that get
+// no item although they need no person: kept over a tombstone or absence,
+// or at E3 over, or into, a document referencing a blob a sealed op can't
+// declare (noItem). They stay unmerged (§F.3 kept bullet).
+func (p *Plan) LeftOut() []string {
+	var out []string
+	for _, r := range p.Resources {
+		if (r.Class == FastForward || r.Class == Replay) && !r.HasItem() && !r.NeedsPerson() {
+			out = append(out, r.Name)
+		}
+	}
+	return out
+}
+
 // Resource returns the named resource of the plan, or nil.
 func (p *Plan) Resource(name string) *Resource {
 	for _, r := range p.Resources {
