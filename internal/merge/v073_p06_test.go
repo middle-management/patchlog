@@ -63,7 +63,8 @@ func TestV073BranchCopyFromConflicts(t *testing.T) {
 
 // §6.4.1 (v0.67) in the merge tools: an insertion or removal that shifts
 // an array's elements writes the array itself, which under the array rule
-// (§F.3) is an element of its parent array when arrays nest.
+// (§F.3) is an element of its parent array when arrays nest, and so (v0.76)
+// a write to the whole outermost array.
 func TestV073MergeWritesShiftedArray(t *testing.T) {
 	t.Parallel()
 	doc := map[string]any{"rows": []any{[]any{"a", "b"}, []any{"c"}}}
@@ -71,10 +72,10 @@ func TestV073MergeWritesShiftedArray(t *testing.T) {
 		patch map[string]any
 		want  []string
 	}{
-		{op("add", "/rows/0/0", "z"), []string{"/rows", "/rows/0"}},
-		{rm("/rows/0/0"), []string{"/rows", "/rows/0"}},
-		{op("add", "/rows/0/-", "z"), []string{"/rows/0"}},
-		{rm("/rows/1/0"), []string{"/rows/1"}},
+		{op("add", "/rows/0/0", "z"), []string{"/rows"}},
+		{rm("/rows/0/0"), []string{"/rows"}},
+		{op("add", "/rows/0/-", "z"), []string{"/rows"}},
+		{rm("/rows/1/0"), []string{"/rows"}},
 	} {
 		w := must(merge.Writes(doc, true, []client.Step{client.PatchStep(ops(c.patch))}))
 		if !reflect.DeepEqual(w, c.want) {

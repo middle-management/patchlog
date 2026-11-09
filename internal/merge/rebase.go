@@ -25,8 +25,8 @@ type RebaseOptions struct {
 	// may be its successor (§7.4).
 	Onto string
 	// Switch freezes the old branch with successor: New once the first
-	// replay is clean and applied, then replays what the old branch got
-	// meanwhile.
+	// replay is clean, applied and leaves nothing out (LeaveOut), then
+	// replays what the old branch got meanwhile.
 	Switch bool
 	// CopyConfig lists top-level keys of the old branch's namespace document
 	// copied into the successor when it is created. Default: "read" and
@@ -43,6 +43,10 @@ type RebaseOptions struct {
 	// catch-up) before it is checked and applied, e.g. to resolve
 	// resources by squashing them (§F.9 Rebasing).
 	Prepare func(ctx context.Context, p *Plan) error
+	// LeaveOut lets Switch go ahead although a replay leaves resources
+	// out (Plan.LeftOut, ErrLeftOut): their changes stay only in the
+	// frozen old branch.
+	LeaveOut bool
 	// Plan options for the replays (Squash is ignored: a rebase keeps ids).
 	// An e2e branch needs Plan.E2E.
 	Plan Options
@@ -65,6 +69,18 @@ type RebaseOptions struct {
 // old branch first by rotating its epoch (§E.3.2).
 var ErrReadersDropped = errors.New("merge: the successor's keyring drops readers of the old branch")
 
+// ErrLeftOut reports that a replay of a rebase with Switch leaves
+// resources out (RebaseResult.LeftOut, Plan.LeftOut): they stay unmerged,
+// which a later merge offers again (§F.3), but once the old branch is
+// frozen with the successor nothing merges it again, and its editors move
+// to a successor without those changes (§F.5). After the first replay,
+// Rebase stops before the switch; after the catch-up the switch is done
+// and the error reports what only the old branch holds. Change those
+// resources in the old branch so they can be recorded (or in the
+// successor by hand) and run Rebase again, which resumes, or set
+// RebaseOptions.LeaveOut.
+var ErrLeftOut = errors.New("merge: the replay leaves resources out of the successor")
+
 // RebaseResult reports what Rebase did.
 type RebaseResult struct {
 	New     string `json:"new"`
@@ -82,6 +98,9 @@ type RebaseResult struct {
 	// old branch's newest epoch, in its own keyring, that the successor's
 	// keyring holds no key for (ErrReadersDropped).
 	DroppedReaders []string `json:"droppedReaders,omitempty"`
+	// LeftOut lists the resources the first replay, or after the switch
+	// the catch-up, left out (Plan.LeftOut, ErrLeftOut).
+	LeftOut []string `json:"leftOut,omitempty"`
 }
 
 // Rebase creates a successor of a branch from its base's current head and
@@ -97,10 +116,12 @@ type RebaseResult struct {
 // An e2e branch (§F.8) needs Plan.E2E. The successor gets its own keyring
 // first (successorKeyring), and the replays re-encrypt under it, so no id
 // is kept. With Switch, a successor whose keyring would drop readers of
-// the old branch gets no replay (ErrReadersDropped). Every merge batch of the branch in the successor counts as a
-// merge point, merge.authors or not (they are the rebase, as the janitor's
-// superseded check assumes, §F.6), so a resumed rebase and the catch-up
-// replay exactly what is new.
+// the old branch gets no replay (ErrReadersDropped). With Switch, a first
+// replay that leaves resources out stops before the switch (ErrLeftOut,
+// unless LeaveOut). Every merge batch of the branch in the successor
+// counts as a merge point, merge.authors or not (they are the rebase, as
+// the janitor's superseded check assumes, §F.6), so a resumed rebase and
+// the catch-up replay exactly what is new.
 func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseResult, error) {
 	opt.Plan.Squash = false
 	if opt.Branch == "" || opt.New == "" {
@@ -247,6 +268,11 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 	if !opt.Switch {
 		return out, nil
 	}
+	// A resource the replay leaves out would stay only in the frozen
+	// generation: no switch then (§F.3 kept bullet, §F.5).
+	if out.LeftOut = first.LeftOut(); len(out.LeftOut) > 0 && !opt.LeaveOut {
+		return out, leftOutErr(opt, out.LeftOut, false)
+	}
 	if _, err := configWrite(ctx, c, opt.Branch, []any{
 		map[string]any{"op": "add", "path": "/frozen", "value": true},
 		map[string]any{"op": "add", "path": "/successor", "value": opt.New},
@@ -283,8 +309,27 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 	if !catch.Clean() {
 		return out, ErrConflicts
 	}
-	out.CatchUpResult, err = catch.Apply(ctx)
-	return out, err
+	if out.CatchUpResult, err = catch.Apply(ctx); err != nil {
+		return out, err
+	}
+	if left := catch.LeftOut(); len(left) > 0 {
+		out.LeftOut = left
+		if !opt.LeaveOut {
+			return out, leftOutErr(opt, left, true)
+		}
+	}
+	return out, nil
+}
+
+// leftOutErr is ErrLeftOut naming the resources, before the switch or
+// (switched) after it.
+func leftOutErr(opt RebaseOptions, names []string, switched bool) error {
+	if switched {
+		return fmt.Errorf("%w: %s get no item in the catch-up into %s and are only in the frozen %s (see their notes)",
+			ErrLeftOut, strings.Join(names, ", "), opt.New, opt.Branch)
+	}
+	return fmt.Errorf("%w: %s get no item in %s (see their notes), so %s is not switched; change them in %s and rebase again, or leave them out",
+		ErrLeftOut, strings.Join(names, ", "), opt.New, opt.Branch, opt.Branch)
 }
 
 // baseChain lists ns and the namespaces up its base chain, nearest first
