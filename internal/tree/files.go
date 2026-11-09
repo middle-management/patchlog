@@ -350,8 +350,9 @@ var errFileKeys = errors.New("the key that seals file metadata")
 // lastingKeyErr reports a failure to get a key that lasts until the
 // configuration changes: a key lacking for good (follow.LacksKey: no keys
 // for the service's grant, none it can unwrap, a keyring entry whose from
-// it doesn't trust, or /keys answering a 4xx other than 429; §A.4,
-// §E.2.6, §E.3.2), or a namespace it can't read, absent or gone.
+// it doesn't trust, or /keys answering a 4xx other than 408 and 429;
+// §A.4, §E.2.6, §E.3.2), or a namespace it can't read, absent or gone.
+// A 408, like a 429, is transient: the listing is 503 behind (v0.77).
 func lastingKeyErr(err error) bool {
 	return follow.LacksKey(context.Background(), err) || client.IsNotFound(err) || client.IsAuth(err) || client.IsGone(err)
 }

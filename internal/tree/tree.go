@@ -804,7 +804,7 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		// Skipped for its keys as configured, it isn't waited for (behind)
 		// until its keys come and the core serves its head again
 		// (onCatchUp). Skipped because its epoch key couldn't be fetched
-		// for the moment (the core briefly unreachable, a 5xx, a 429:
+		// for the moment (the core briefly unreachable, a 5xx, a 408 or 429:
 		// retry), it is still waited for, as a namespace being caught up
 		// with is: listings are 503 behind, never short of its items, and
 		// a ?min= naming it waits.
