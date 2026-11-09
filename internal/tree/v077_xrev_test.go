@@ -133,3 +133,46 @@ func TestV077XrevTreePurgedSinceListing(t *testing.T) {
 		t.Errorf("a listing that lost to one purge: %d after %d tries, want 200 computed twice", r.StatusCode, tries)
 	}
 }
+
+// Cross-review (conformance lens), Tree-derived access 116 (§B.11.5):
+// matches leaves cat's catalog.trust and returns while a reader's g/all
+// cookie is live -> a listing at an at that includes matches -> 403 until
+// she exchanges again.
+func TestV077XconfScenario116(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	p := newP24World(t, "grant", "grant").start(withEdgeGrants)
+	p.s.Clock.Advance(2 * time.Second)
+	amy := p.grant("user:amy", []string{"cat", "matches"})
+	prefix, cookie := p.exchange(amy)
+	if prefix != "/cat/g/all" {
+		t.Fatalf("prefix %s", prefix)
+	}
+	if r := p.do("GET", "/cat/g/all/at/"+p.x.s.At()+"/children?of=root", "", "", cookie); r.status != 200 {
+		t.Fatalf("before: %d %v", r.status, r.body)
+	}
+	trust := func(list []any) {
+		h := must(p.w.NSHead(ctx, "cat"))
+		adm := p.s.Client(t, client.WithBearer(p.admin.Grant(t, p.s.Now(), "user:w", []string{"cat"}, []string{"config"})))
+		must(adm.PatchConfig(ctx, "cat", h.Config, []any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": list}}))
+	}
+	before := p.x.s.At()
+	trust([]any{})
+	waitFor(t, "the service drops matches", func() bool { return p.x.s.At() != before })
+	mid := p.x.s.At()
+	p.s.Clock.Advance(2 * time.Second)
+	trust([]any{"matches"})
+	waitFor(t, "the service trusts matches again", func() bool { return p.x.s.At() != mid })
+	time.Sleep(10 * time.Millisecond)
+	p.x.caughtUp("cat", "matches")
+	at := p.x.s.At()
+	r := p.do("GET", "/cat/g/all/at/"+at+"/children?of=root", "", "", cookie)
+	if r.status != 403 {
+		t.Errorf("g/all cookie at an at including matches after it left and returned: %d %v", r.status, r.body)
+	}
+	p.s.Clock.Advance(2 * time.Second)
+	_, again := p.exchange(p.grant("user:amy", []string{"cat", "matches"}))
+	if r := p.do("GET", "/cat/g/all/at/"+at+"/children?of=root", "", "", again); r.status != 200 {
+		t.Errorf("after exchanging again: %d %v", r.status, r.body)
+	}
+}
