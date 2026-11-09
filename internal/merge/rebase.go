@@ -5,6 +5,7 @@ import (
 	"crypto/ecdh"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -304,10 +305,24 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 	if err != nil {
 		return out, err
 	}
-	if len(Collect(newer)) == 0 {
+	news := Collect(newer)
+	if len(news) == 0 {
 		return out, nil
 	}
-	catch, err := NewPlan(ctx, c, opt.New, opt.Branch, opt.Plan)
+	// The catch-up replays whatever the old branch received after the
+	// first replay (§F.5 Switch): the gate counted every resource, so a
+	// replay limited by Plan.Resources is widened by the resources changed
+	// since, or one outside the limit would stay only in the frozen branch.
+	co := opt.Plan
+	if len(co.Resources) > 0 {
+		co.Resources = append([]string(nil), co.Resources...)
+		for _, ch := range news {
+			if !slices.Contains(co.Resources, ch.Resource) {
+				co.Resources = append(co.Resources, ch.Resource)
+			}
+		}
+	}
+	catch, err := NewPlan(ctx, c, opt.New, opt.Branch, co)
 	if err != nil {
 		return out, err
 	}
