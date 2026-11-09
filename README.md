@@ -1237,7 +1237,7 @@ st, err  := c.UndoStack(ctx, "docs", "alice")   // st.Done / st.Undone, each ite
   e2e undo is then refused (`client.ErrUndoE2ELimited`). Other `/keys` errors are returned.
 - **The inverse**, per resource, the gesture's own entries newest first: a revision becomes the patch
   set that sets the paths it wrote back to its parent's values (writes to array elements widened to
-  the whole array, as merges do; a revision of moves only is moved back when both ends are unchanged);
+  the whole outermost array, as merges do, and the guard's later writes too, v0.77; a revision of moves only is moved back when both ends are unchanged);
   a tombstone a restore with `[]`; a restore the inverse of its patches, then `"delete"`; a genesis
   `"delete"`. Edits others made to other paths, also between the gesture's saves, are kept. `$nonce`
   is never restored: each patch set gets a fresh one in sealed namespaces, in namespaces that
@@ -1374,8 +1374,9 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   fix `/resource` to names no read check passes for included, is left out, and so is a purged
   one where another namespace gives an edge grant; only a grant left with none is refused, `401`
   if any refusal was `401`, else `403`, and `410 purged` with `ns` and `head` (for the index's
-  own purged namespaces too) only where every refusal is a purge; a named namespace whose
-  document can't be read is `502`. At most 100 prefixes, and a token from `exchangeRate` (`-exchange-rate RATE,BURST`, buckets
+  own purged namespaces too) only where every namespace the grant names is followed, purged and
+  verifies the grant (v0.77; `/_refs` the same where the grant would see no namespace at all); a
+  named namespace whose document can't be read is `502`. At most 100 prefixes, and a token from `exchangeRate` (`-exchange-rate RATE,BURST`, buckets
   shared by the instances on one `-db`). `DELETE /edge-grants` withdraws them. A GET with only
   such a cookie is authorised from it: for a `reads:{ns}:scope:{digest}` marker the index keeps the
   rules and principal behind it until its last cookie expires, so hits are filtered as under the
@@ -1463,7 +1464,15 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   reach its kept answers (index migration `008_member_checkpoints`, `Index.Members`); until a
   follower has its first checkpoint, partial readers covered through it get `503 behind`
   (v0.76). `gs` also binds the grant's key (`key:{…}` of its `kid` and `pub`, v0.76), so a
-  cookie from a key whose `pub` was replaced is `403`. Unrestricted readers keep the answers
+  cookie from a key whose `pub` was replaced is `403`; since v0.77 so does a
+  `reads:{ns}:scope:{digest}` marker's digest, and such a cookie is `403` once its key is gone,
+  no longer lists `read` or has another `pub`, or a role it digested is gone. A namespace
+  §B.11.9 doesn't cover that is a catalog, or whose `catalogs` (or a local base's) names one,
+  gives a partial reader no marker (`403`, no hits at `/_refs`), nothing is covered while the
+  core's root says authentication is disabled (a root the index can't read is `503 behind`, or
+  `502`, only for namespaces that could be covered), and a purged catalog keeps its namespaces
+  covered but makes nothing visible. A result computed from rows read before a purge is never
+  served or kept: it is computed again, or `503 behind`. Unrestricted readers keep the answers
   above.
 
 ### Merge, rebase and cleanup (Addendum F)
@@ -1488,11 +1497,17 @@ patchlog janitor -ns matches                     # purge merged/superseded/aband
   refused, naming the namespace to migrate (`patchlog e2e migrate-keyring`). With `-switch` a
   first replay that leaves a resource unmerged (below) stops before the switch too
   (`merge.ErrLeftOut`, `RebaseResult.LeftOut`), unless `RebaseOptions.LeaveOut`, since the
-  frozen old branch would be the only place holding that change (§F.5, v0.76).
+  frozen old branch would be the only place holding that change (§F.5, v0.76). Since v0.77 the
+  switch also waits until every resource the old branch changed is recorded in the successor,
+  apart from §F.6's exceptions, a resource purged only in the successor and, under a limit to
+  some resources, every one outside it included; `patchlog rebase -switch -leave-out` and
+  `patchlog merge release rebase -leave-out` give the rest up and print it, and the catch-up
+  after the freeze replays every resource changed since the first replay.
 
 - Resources are classified by ancestry, using ids only (§F.3). A fast-forward reproduces the
   branch's ids exactly. A replay reports overlapping `writes` under the array rule, a write to
-  an array element counting for the whole outermost array (v0.76), and the
+  an array element counting for the whole outermost array (v0.76; v0.77: only a write whose last
+  segment indexes an array, or appends with `-`, widens, an object member named `-` doesn't), and the
   delete-versus-change cases always go to a person.
 - Fast-forwarded and replayed steps carry each branch revision's `gesture` and `undoes` (§F.3,
   step objects of §7.5), so history views and undo keep their grouping in the base; rebases do
@@ -1942,7 +1957,11 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   deeper bases of `base.chain` included. B never seals that content itself (v0.76): where it
   lacks the epoch key it stores A's bytes after checking their `kid` and `pl`, it asks A's
   `…/blob/{bid}` so that A fixes a blob's epoch, and where A serves it no sealing (`403`, `404`)
-  it answers `502 upstream`. It relays no keys of a deeper base, and uses no last-seen epoch for
+  it answers `502 upstream`. Since v0.77 B stores a sealing only once it has opened and verified
+  it, creation is `422` where the grant gets no key of an epoch such content is sealed under,
+  and a sealing A doesn't serve at creation is kept as pending (migration
+  `014_remote_pending_sealings`) and fetched again at every sync, the URLs needing it `502`, or
+  `410 pruned` once A says so. It relays no keys of a deeper base, and uses no last-seen epoch for
   it, while its latest read of that base's namespace document failed (read at creation, at
   start and at every sync; core migration `013_remote_chain_read`). `-remote-origin-url ORIGIN=URL` says where `ORIGIN`
   itself answers (an internal address given with `-remote-url`, say); without it a
@@ -3166,7 +3185,10 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   (§H.2, §H.4); a MOVE of a live file onto the name still makes it anew, so a rename back works.
   Where the gateway can't read that last revision (served sealed), the save is a `409` too
   (v0.74, no sealed exception): naming the new path where the head gives it, else saying it
-  can't tell whether the file moved; it never makes a new file over it (§H.4, §H.6).
+  can't tell whether the file moved; it never makes a new file over it (§H.4, §H.6). A read that
+  fails (a timeout, `408`, `429`, `5xx`, an unreachable core) is no such answer: a save over
+  someone else's delete then fails `503` with `Retry-After` (`408`, `429`, timeouts) or `502`
+  and writes nothing, never `409` (v0.77; the core's `408` and timeouts are `503` everywhere).
   A raw file over a JSON document's, or the
   other way round, replaces its root. A purged one is `410`, as is any name of a purged
   namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
@@ -4112,7 +4134,11 @@ the grant was issued, issuance taken as `max(nbf, exp − maxTtl)` of the root b
 the key sets no `maxTtl`); a grant with neither fails the key scope (`403`), since issuance
 can't be told (§C.4). `maxTtl` is judged on the root block alone, `exp − max(now, nbf)`. `maxLag` is the
 namespace document's (default 60 seconds), or the key's when stricter. A grant issued in time
-stays valid after the head moves on, until it expires.
+stays valid after the head moves on, until it expires. Since v0.77 a service that can't read the
+chain (`/keys` or the namespace failing, the namespace unknown or refusing the service, an
+unreadable log, a purge in it) answers `503 behind` while that is transient and `502 upstream`
+otherwise, naming no namespace, never `403`; a grant whose `at` is newer than the service's
+cached head makes it read the head again first.
 
 ```sh
 # A root grant signed by a key listed in the namespace document (kid "ops-2026")…
@@ -4628,7 +4654,7 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   bound, as §6.6 says, not only to the deployment's maximums; a document an earlier release
   stored over its own `rulesPerNamespace` takes other writes, a freeze among them. The client reads them with `APIError.Limit` and
   `client.IsLimit`.
-- **`GET /`** answers `{ "spec": "0.76", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
+- **`GET /`** answers `{ "spec": "0.77", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace
