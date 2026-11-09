@@ -721,8 +721,9 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 // (errGrantLacks); the log names it. A failure to fetch the key that opens
 // a sealed namespace's documents (client.ErrKeyFetch) that leaves the
 // service lacking it as configured (lacksKey: a 4xx from /keys other than
-// 429) is 502 too (§A.4 Private namespaces: "502 while it ... lacks the
-// keys"), and one for now (a 5xx, a 429, the core unreachable) is 503
+// 408 and 429) is 502 too (§A.4 Private namespaces: "502 while it ...
+// lacks the keys"), and one for now (a 5xx, a 408, a 429, the core
+// unreachable) is 503
 // behind, with Retry-After (scenario 100: "While those keys only can't
 // yet be fetched → 503 behind", §12.1), as is a namespace visibility reads
 // whose follower holds no checkpoint yet (errMemberBehind, members.go).
@@ -768,9 +769,9 @@ var errEpochKey = errors.New("the index cannot obtain the key of an epoch a hit 
 
 // lacksKey reports whether err, from fetching the key of an epoch, leaves
 // the service lacking that key as its grant and keys are configured
-// (§A.4, §E.2.6): /keys answered a 4xx other than 429, or gave no key for
-// the epoch (ErrNoKeys) or none the service can unwrap (seal.ErrDecrypt)
-// or will take (ErrUntrustedKey, §E.3.2). Any other failure, the reader's
+// (§A.4, §E.2.6): /keys answered a 4xx other than 408 and 429, or gave
+// no key for the epoch (ErrNoKeys) or none the service can unwrap
+// (seal.ErrDecrypt) or will take (ErrUntrustedKey, §E.3.2). Any other failure, the reader's
 // request ending while the key is read among them, is for now. So is any
 // failure once ctx is done, which may be why it failed.
 func lacksKey(ctx context.Context, err error) bool {
@@ -778,7 +779,7 @@ func lacksKey(ctx context.Context, err error) bool {
 		return false
 	}
 	if ae, ok := client.AsAPIError(err); ok {
-		return ae.Status >= 400 && ae.Status < 500 && ae.Status != 429
+		return ae.Status >= 400 && ae.Status < 500 && ae.Status != 408 && ae.Status != 429
 	}
 	return errors.Is(err, client.ErrNoKeys) || errors.Is(err, seal.ErrDecrypt) || errors.Is(err, client.ErrUntrustedKey)
 }

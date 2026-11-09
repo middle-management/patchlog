@@ -16,7 +16,8 @@ import (
 	"github.com/middle-management/patchlog/internal/schema"
 )
 
-// errSchemas is a schema that can't be read for now (network, 5xx, 429):
+// errSchemas is a schema that can't be read for now (network, 5xx, 408,
+// 429):
 // the fields can't be checked (502).
 var errSchemas = errors.New("cannot read a schema of the namespace's documents")
 
