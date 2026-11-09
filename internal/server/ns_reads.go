@@ -111,6 +111,11 @@ func (s *Server) nsRevLog(w http.ResponseWriter, r *http.Request) {
 	}
 	lg, err := s.e.NamespaceLog(r.Context(), ns, id, r.URL.Query().Get("since"), s.e.Limits().LogPageSize, creds(r))
 	if err != nil {
+		// A partial reader's range is the filtered one at the current at
+		// (§B.11.9 URLs).
+		if s.writeFilteredRedirect(w, err, "/log", keep(r.URL.Query(), "since")) {
+			return
+		}
 		// A purged sealed namespace's 410 is long, as any purge (§8.5, §9).
 		if s.writeErrShort(w, r, err, "ns:"+ns) {
 			return
@@ -169,14 +174,26 @@ func (s *Server) nsPrincipal(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, ans.Body)
 }
 
+// nsHeads is GET /ns/{ns}/rev/{id}/heads?after&prefix (§7.4), its prefix
+// a resource name (400 otherwise, before authorisation). A partial
+// reader's is the filtered /heads at the current at (§B.11.9 URLs).
 func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
 	ns, id := r.PathValue("ns"), r.PathValue("id")
 	if err := validNames(ns, ""); err != nil {
 		writeErr(w, err)
 		return
 	}
-	page, err := s.e.NamespaceHeads(r.Context(), ns, id, r.URL.Query().Get("after"), creds(r))
+	q := r.URL.Query()
+	prefix, err := headsPrefix(q)
 	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	page, err := s.e.NamespaceHeadsPrefix(r.Context(), ns, id, q.Get("after"), prefix, creds(r))
+	if err != nil {
+		if s.writeFilteredRedirect(w, err, "/heads", keep(q, "after", "prefix")) {
+			return
+		}
 		if s.writeErrShort(w, r, err, "ns:"+ns) {
 			return
 		}
@@ -202,7 +219,7 @@ func (s *Server) nsBranches(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	list, public, err := s.e.Branches(r.Context(), ns, creds(r))
+	bl, err := s.e.BranchList(r.Context(), ns, creds(r))
 	if err != nil {
 		// Once the namespace is purged, 410 purged, long (§7.4, §8.5).
 		if s.writeErrShort(w, r, err, "ns:"+ns) {
@@ -211,8 +228,13 @@ func (s *Server) nsBranches(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	s.cache(w, r, ccHead, public, "ns:"+ns)
-	writeJSON(w, 200, list)
+	if bl.Private {
+		// Filtered for a partial reader by its grant (§B.11.9 Answers).
+		privateNoStore(w)
+	} else {
+		s.cache(w, r, ccHead, bl.Public, "ns:"+ns)
+	}
+	writeJSON(w, 200, bl.List)
 }
 
 // nsKeys answers POST /ns/{ns}/keys (§E.2.3): { "epochs"?: [e…],
