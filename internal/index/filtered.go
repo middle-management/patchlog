@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -544,12 +545,35 @@ const maxChain = 32
 // coverage is ns's coverage at its checkpoint z (§B.11.9 Where): its
 // kind, root, chain and trusted catalogs, nil if it isn't covered, as
 // nothing is while the core's authentication is off.
+//
+// The core's root (authOff) is read only for a namespace the documents
+// would cover, or whose coverage they fail to decide: one they can never
+// cover (a private namespace that is no catalog and names none) is
+// uncovered whatever the root says, and its readers don't depend on it.
+// While authentication is off, an error deciding coverage is moot: nothing
+// is covered.
 func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, []fsCat, error) {
+	cp, cats, err := ix.coverageOf(ctx, ns, z)
+	if cp == nil && err == nil {
+		return nil, nil, nil
+	}
 	// Nothing is covered while the core's authentication is off (§B.11.9
 	// Where: "only while authentication is on (§1)").
-	if off, err := ix.authOff(ctx); err != nil || off {
+	off, aerr := ix.authOff(ctx)
+	switch {
+	case aerr == nil && off:
+		return nil, nil, nil
+	case err != nil:
 		return nil, nil, err
+	case aerr != nil:
+		return nil, nil, aerr
 	}
+	return cp, cats, nil
+}
+
+// coverageOf is coverage as ns's documents decide it, whatever the core's
+// authentication mode.
+func (ix *Index) coverageOf(ctx context.Context, ns, z string) (*fcp, []fsCat, error) {
 	if cfg, err := ix.checker.Config(ctx, ns); err == nil {
 		ix.seedDoc(cfg) // read by the read check already, as a rule
 	}
@@ -1285,12 +1309,29 @@ func (ix *Index) authOff(ctx context.Context) (bool, error) {
 	a.mu.Unlock()
 	off, err := ix.c.AuthDisabled(ctx)
 	if err != nil {
-		return false, fmt.Errorf("the core's root: %w", err)
+		return false, &rootErr{err}
 	}
 	a.mu.Lock()
 	a.at, a.off = time.Now(), off
 	a.mu.Unlock()
 	return off, nil
+}
+
+// rootErr is a failure to read the core's root (authOff). One for now (a
+// transport error, a deadline, a 5xx, 408 or 429) is 503 behind, with
+// Retry-After; any other is 502 upstream (writeUpstreamErr). Neither names
+// a namespace.
+type rootErr struct{ err error }
+
+func (e *rootErr) Error() string { return "the core's root: " + e.err.Error() }
+func (e *rootErr) Unwrap() error { return e.err }
+
+// transient reports whether the root couldn't be read for now.
+func (e *rootErr) transient() bool {
+	if ae, ok := client.AsAPIError(e.err); ok && ae.Status == http.StatusRequestTimeout {
+		return true
+	}
+	return client.Transient(e.err)
 }
 
 // errNoMarker refuses a partial reader of a namespace §B.11.9 doesn't

@@ -843,6 +843,9 @@ const (
 	msgChainBehind   = "the chain a requireAt key names cannot be read yet (§C.4)"
 	msgChainUpstream = "cannot read the chain a requireAt key names (§C.4)"
 	msgMemberBehind  = "a namespace visibility reads is not reached yet (§A.4)"
+	// The core's root, which says whether authentication is on (§B.11.9
+	// Where), for now (rootErr).
+	msgRootBehind = "the index cannot read the core's configuration yet (§B.11.9)"
 )
 
 // writeCoverErr answers a failure to compute a partial reader's view of a
@@ -902,6 +905,11 @@ func (ix *Index) writeUpstreamErr(w http.ResponseWriter, what string, err error,
 	if errors.Is(err, errMemberBehind) {
 		// A namespace visibility reads not followed yet (members.go).
 		writeBehind(w, msgMemberBehind)
+		return
+	}
+	if re := (*rootErr)(nil); errors.As(err, &re) && re.transient() {
+		// The core's root, read for coverage (authOff), for now.
+		writeBehind(w, msgRootBehind)
 		return
 	}
 	if errors.Is(err, client.ErrKeyFetch) && !lacksKey(context.Background(), err) {

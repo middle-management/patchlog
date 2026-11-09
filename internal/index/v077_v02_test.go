@@ -719,3 +719,102 @@ func TestV077BeforeAnswerRaisedToSealed(t *testing.T) {
 	}
 	v77AllSealed(t, "GET "+f.path, f.body)
 }
+
+// TestV077RootFailureUncovered (FSVC-5 review; §B.11.9 Where; §A.4): docs
+// names no catalog and is none, so §B.11.9 can never cover it, and its
+// partial readers read it by their rules (scope marker) whatever the
+// core's root says. While GET / fails, they are answered at /docs and at
+// /_refs as before. Before, coverage read the root first, and they got 502.
+func TestV077RootFailureUncovered(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	var down atomic.Bool
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond, Wrap: func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/" && down.Load() {
+				rw.Header().Set("Content-Type", "application/json")
+				rw.WriteHeader(503)
+				rw.Write([]byte(`{"code":"unavailable","message":"down"}`))
+				return
+			}
+			h.ServeHTTP(rw, r)
+		})
+	}})
+	admin, k1 := clienttest.NewKey("admin"), clienttest.NewKey("k1")
+	e := k1.Entry("read")
+	e["rules"] = []any{v77TypeRule}
+	op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "docs")))
+	must(op.CreateNamespace(ctx, "docs", map[string]any{"read": "grant", "keys": []any{admin.Entry("*"), e}}))
+	w := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:root", []string{"docs"}, []string{"read", "create"})))
+	sch := must(w.CreateDoc(ctx, "docs", "schema", map[string]any{"$schema": d2020, "type": "object",
+		"properties": map[string]any{"title": map[string]any{"type": "string", "x-index": "text"}}}))
+	must(w.CreateDoc(ctx, "docs", "a", map[string]any{"$schema": "/r/docs/schema/rev/" + sch.ID, "title": "word a"}))
+	ev := must(edge.New([]byte("s3cret"), "", ""))
+	x := startSvcWith(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"docs"}, []string{"read"}))),
+		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"docs"}, untyped: true, now: s.Now},
+		func(o *indexOpts) {
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+		})
+	x.caughtUp("docs")
+	g := k1.Grant(t, s.Now(), "user:li", []string{"docs"}, []string{"read"})
+	if got := resources(x.search("/docs?q=word", g)); len(got) != 1 {
+		t.Fatalf("before: %v", got)
+	}
+	down.Store(true)
+	time.Sleep(5 * time.Millisecond) // CheckerTTL
+	x.ix.ExpireGrantChecks()
+	if r := x.raw("/docs?q=word&limit=3", g); r.status != 302 {
+		t.Errorf("/docs, uncovered, while GET / fails: %d %v", r.status, r.body)
+	}
+	if r := x.raw("/_refs?to="+url.QueryEscape("/r/docs/schema"), g); r.status != 302 {
+		t.Errorf("/_refs while GET / fails: %d %v", r.status, r.body)
+	}
+	if r := p37Do(t, x, "POST", "/edge-grants", g, "", nil, ""); r.status != 200 {
+		t.Errorf("exchange while GET / fails: %d %v", r.status, r.body)
+	}
+}
+
+// TestV077RootFailureCovered (FSVC-5 review; §B.11.9 Where; transient as
+// §A.1 and §12.1 answer it): matches, which §B.11.9 covers while the
+// core's authentication is on, can't be judged while GET / fails: a
+// partial reader is 503 behind, with Retry-After, while the failure is for
+// now (a 503, a 408), and 502 upstream otherwise; neither names a
+// namespace. Before, each was 502.
+func TestV077RootFailureCovered(t *testing.T) {
+	t.Parallel()
+	var status atomic.Int32
+	w := newV75XOn(t, clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond, Wrap: func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			if st := int(status.Load()); r.URL.Path == "/" && st != 0 {
+				rw.Header().Set("Content-Type", "application/json")
+				rw.WriteHeader(st)
+				rw.Write([]byte(`{"code":"x","message":"x"}`))
+				return
+			}
+			h.ServeHTTP(rw, r)
+		})
+	}}))
+	w.x = w.start(false, "matches")
+	li := w.reader("user:li", []any{"fans"})
+	if r := w.x.raw("/matches", li); r.status != 302 || !strings.Contains(r.header.Get("Location"), "/g/") {
+		t.Fatalf("li: %d %s %v", r.status, r.header.Get("Location"), r.body)
+	}
+	for _, c := range []struct {
+		root, want int
+		code       string
+	}{{503, 503, "behind"}, {408, 503, "behind"}, {404, 502, "upstream"}} {
+		status.Store(int32(c.root))
+		time.Sleep(5 * time.Millisecond) // the index's CheckerTTL
+		w.x.ix.ExpireGrantChecks()
+		r := w.x.raw("/matches", li)
+		if r.status != c.want || r.body["code"] != c.code {
+			t.Errorf("GET / %d: %d %v, want %d %s", c.root, r.status, r.body, c.want, c.code)
+		}
+		if c.want == 503 && r.header.Get("Retry-After") == "" {
+			t.Errorf("GET / %d: no Retry-After", c.root)
+		}
+		if m, _ := r.body["message"].(string); strings.Contains(m, "matches") || strings.Contains(m, "cat-season") {
+			t.Errorf("GET / %d: names a namespace: %q", c.root, m)
+		}
+	}
+}
