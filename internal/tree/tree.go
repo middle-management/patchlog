@@ -74,6 +74,7 @@ import (
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/repurge"
+	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
 	"github.com/middle-management/patchlog/internal/svcedge"
 	"golang.org/x/sync/errgroup"
@@ -1649,9 +1650,11 @@ func (s *Service) nodeBorn(ctx context.Context, ns, name, head string, self, pur
 // apply is made again; otherwise, as for a resource gone since or a chain
 // a prune cut (410 pruned, §7.1), the born is unknown (""), and only
 // failures other than those are logged. epoch is the epoch that revision
-// is served under in a sealed or e2e namespace (derived.EpochOf of the
-// entry's kid; at E3 the kid a prune's snapshot of it would carry, as
-// for heads, §E.3.1), 0 if not known.
+// is served under in a sealed or e2e namespace (§E.2.6): at E2 its served
+// kid's where that names ns (derived.EpochOf); at E3 the one a prune's
+// snapshot of it would carry (snapshotBornEpoch, §E.3.1), never the
+// served kid of an entry the log gives in the clear; 0 if not known,
+// which leaves born out of a sealed listing (Service.serve).
 func (s *Service) bornOf(ctx context.Context, ns, name, head string) (born string, epoch int, err error) {
 	es, _, err := s.c.LogPage(ctx, ns, name, head, "")
 	switch {
@@ -1667,7 +1670,45 @@ func (s *Service) bornOf(ctx context.Context, ns, name, head string) (born strin
 	if len(es) == 0 {
 		return "", 0, nil
 	}
-	return es[0].Created, derived.EpochOf(ns, es[0].Kid), nil
+	in, err := s.keys.Info(ctx, ns)
+	switch {
+	case err == nil && in.Level == derived.LevelE2E:
+		return es[0].Created, snapshotBornEpoch(ns, in.Epoch, es[0]), nil
+	case err == nil || lastingKeyErr(err):
+		return es[0].Created, derived.EpochOf(ns, es[0].Kid), nil
+	default:
+		return "", 0, fmt.Errorf("tree: the encryption of %s: %w", ns, err)
+	}
+}
+
+// snapshotBornEpoch is the epoch of e2e namespace ns that a prune's
+// snapshot of e, the first revision of a chain, would carry (§E.3.1), the
+// epoch a value derived from it is sealed under (§E.2.6): a revision from
+// before a raise from sealed, served sealed as at E2, its served kid's
+// where that names ns; one whose sealed op is ns's own (its pl.ns names
+// ns), the epoch its kid names; one whose op is a base's, read through, or
+// in the clear from before a raise from none or at-rest, current, ns's
+// epoch in force. 0, not known, for one without its patch set (pruned or
+// purged) or whose own op's kid doesn't name an epoch of ns.
+func snapshotBornEpoch(ns string, current int, e client.LogEntry) int {
+	if e.Kid != "" {
+		return derived.EpochOf(ns, e.Kid)
+	}
+	if !e.HasPatches {
+		return 0
+	}
+	jwe, ok := seal.SealedJWE(e.Patches)
+	if !ok {
+		return current
+	}
+	h, err := seal.ParseHeader(jwe)
+	if err != nil {
+		return 0
+	}
+	if pns, _ := h.PL["ns"].(string); pns != ns {
+		return current
+	}
+	return derived.EpochOf(ns, h.Kid)
 }
 
 // bornReads bounds the logs backfillNodes reads at once.

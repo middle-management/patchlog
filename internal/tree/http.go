@@ -641,7 +641,10 @@ var ops = map[string]bool{
 // another (Node.BornEpoch): that one is sealed in place, as a value of
 // another resource is, "born": { "sealed": JWE of { born } } under the
 // node's K_r of its epoch, pl { ns, name, view }, and left out where the
-// service can't have that epoch's key (§E.2.6). A g/all listing of a catalog that isn't public,
+// service can't have that epoch's key, or where the epoch isn't known: a
+// born is never sealed under the head's epoch for want of its own
+// (§E.2.6; at E3 its epoch is its snapshot's, §E.3.1, bornOf). A g/all
+// listing of a catalog that isn't public,
 // which every reader its URL admits reads whole, whose nodes' values all
 // come from one epoch, is sealed as one JWE under that epoch's key,
 // Content-Type application/jose, pl { ns, view } where view is the
@@ -1180,9 +1183,14 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				}
 				if info.Protected() {
 					// A born of another epoch than its node's head is a
-					// value of a revision of that epoch (§E.2.6).
+					// value of a revision of that epoch (§E.2.6); one
+					// whose epoch isn't known is left out, never sealed
+					// under the head's.
 					q.bornApart = func(n *Node) int {
-						if e := n.BornEpoch; e > 0 && e != epochOf(n.Name) {
+						switch e := n.BornEpoch; {
+						case e <= 0:
+							return bornLeftOut
+						case e != epochOf(n.Name):
 							return e
 						}
 						return 0
@@ -1980,7 +1988,10 @@ type query struct {
 	noteValues func(name string)
 	// bornApart, set for a sealed or e2e catalog, is the epoch an explicit
 	// node's born is served under where it isn't the one its other values
-	// are sealed under, 0 otherwise. Such a born is sealed in place, as a
+	// are sealed under, 0 where it is, and bornLeftOut where it isn't
+	// known (Node.BornEpoch 0): such a born is left out, never sealed with
+	// the node's other values under the head's epoch (§E.2.6, §E.3.1).
+	// A born of another epoch is sealed in place, as a
 	// value of another resource is (§E.2.6): sealIn seals it per entry,
 	// under the node's K_r of that epoch ("" where the service lacks the
 	// key: left out), and noteEpoch counts its epoch for a listing sealed
@@ -2106,9 +2117,10 @@ func (q *query) entry(n *Node) map[string]any {
 		vals["title"] = n.Title
 	}
 	if n.Born != "" && !n.Self {
-		if e := q.bornEpoch(n); e > 0 {
+		switch e := q.bornEpoch(n); {
+		case e > 0:
 			q.bornIn(m, n, e)
-		} else {
+		case e == 0:
 			vals["born"] = n.Born
 		}
 	}
@@ -2147,8 +2159,12 @@ func (q *query) entry(n *Node) map[string]any {
 	return m
 }
 
+// bornLeftOut is bornApart's answer for a born whose epoch isn't known.
+const bornLeftOut = -1
+
 // bornEpoch is the epoch n's born is served under where it isn't that of
-// n's other values (bornApart), 0 otherwise.
+// n's other values (bornApart), bornLeftOut where it isn't known in a
+// sealed or e2e catalog, 0 otherwise.
 func (q *query) bornEpoch(n *Node) int {
 	if q.bornApart == nil {
 		return 0

@@ -3,6 +3,7 @@ package tree_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/tree"
@@ -96,4 +98,107 @@ func TestV076V03ListingUnwrappableKey(t *testing.T) {
 	if jwe, _ := es["new"]["sealed"].(string); jwe == "" || must(seal.ParseHeader(jwe)).Kid != "cat#2" {
 		t.Errorf("new: %v", es["new"])
 	}
+}
+
+// §E.2.6 Per-entry sealing, §E.3.1 snapshot kid (v0.76, B-67): at E3 a
+// node's born takes the epoch a prune's snapshot of its first revision
+// would carry, the epoch of its own sealed op, never the served kid of
+// a log the server gives in the clear. n, created in epoch 1 and retitled
+// in epoch 2, is listed per entry under cat#2 with only its title, its
+// born sealed apart under cat#1. A born whose epoch isn't known is left
+// out, never sealed with the head's values.
+func TestV076V03BornEpochE3(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"encryption": map[string]any{"level": "e2e"}, "catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	svcJWK, svcPriv := must2(seal.GenerateRecipient())
+	wJWK, wPriv := must2(seal.GenerateRecipient())
+	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "append", "config"},
+		map[string]any{"enc": wJWK})), client.WithKeys(client.NewKeys(wPriv)))
+	x2 := wr.E2E(wPriv)
+	must(x2.InitKeyring(ctx, "cat", svcPriv.PublicKey()))
+	must(x2.CreateDocSealed(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(x2.CreateDocSealed(ctx, "cat", "n", map[string]any{"title": "N", "parents": parents("root@a0")}))
+	must(x2.RotateEpoch(ctx, "cat", svcPriv.PublicKey()))
+	h := must(wr.Head(ctx, "cat", "n"))
+	must(x2.AppendSealed(ctx, "cat", "n", h.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": "Newer"}}))
+	keyOf := func(kid string) []byte { return must(x2.SealKey(ctx, kid)) }
+
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"}, map[string]any{"enc": svcJWK})),
+		client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey()))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	withRecipient := func(o *tree.Options) { o.Recipient = svcPriv }
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db}, withRecipient)
+	x.caughtUp("cat")
+	rd := k.Grant(t, s.Now(), "user:r", []string{"cat"}, []string{"read"})
+
+	// n's entry: its title under cat#2; its born per bornWant ("cat#1":
+	// sealed apart under that epoch, "": absent).
+	check := func(when, bornWant string) {
+		t.Helper()
+		var f fetched
+		waitFor(t, when+": a listing", func() bool {
+			r := x.listingAs("/cat/children?of=root", rd)
+			return r.status == http.StatusOK
+		})
+		f = x.fetch("/cat/children?of=root", rd)
+		view := derived.View{NS: "cat", Target: f.path}
+		if f.header.Get("Content-Type") == seal.ContentType && bornWant == "" {
+			// Every value shown is of cat#2: sealed whole.
+			if kid := must(seal.ParseHeader(string(f.body))).Kid; kid != "cat#2" {
+				t.Fatalf("%s: listing sealed whole under %s", when, kid)
+			}
+			e := entriesOf(t, decode(t, must(derived.OpenView(string(f.body), keyOf, view))))["n"]
+			if e["title"] != "Newer" || e["born"] != nil {
+				t.Errorf("%s: n %v, want its title and no born", when, e)
+			}
+			return
+		}
+		if f.header.Get("Content-Type") != "application/json" {
+			t.Fatalf("%s: listing %s, want per entry", when, f.header.Get("Content-Type"))
+		}
+		e := entriesOf(t, decode(t, f.body))["n"]
+		jwe, _ := e["sealed"].(string)
+		if jwe == "" || must(seal.ParseHeader(jwe)).Kid != "cat#2" {
+			t.Fatalf("%s: n sealed %v, want kid cat#2", when, e)
+		}
+		vals := decode(t, must(derived.OpenItem(jwe, derived.ItemKey(keyOf, "cat", "n"), view, "cat", "n")))
+		if vals["title"] != "Newer" || vals["born"] != nil {
+			t.Errorf("%s: n's values under cat#2 %v, want its title only", when, vals)
+		}
+		if bornWant == "" {
+			if e["born"] != nil {
+				t.Errorf("%s: n's born %v, want none", when, e["born"])
+			}
+			return
+		}
+		born, _ := e["born"].(map[string]any)
+		bj, _ := born["sealed"].(string)
+		if bj == "" || must(seal.ParseHeader(bj)).Kid != bornWant {
+			t.Fatalf("%s: n's born %v, want sealed under %s", when, e["born"], bornWant)
+		}
+		bv := decode(t, must(derived.OpenItem(bj, derived.ItemKey(keyOf, "cat", "n"), view, "cat", "n")))
+		if b, _ := bv["born"].(string); len(bv) != 1 || b == "" {
+			t.Errorf("%s: n's born opens to %v", when, bv)
+		}
+	}
+	check("following", "cat#1")
+
+	// A born whose epoch isn't known (a record without it, not pending
+	// a fill) is left out.
+	x.stop()
+	sq := must(sql.Open("sqlite", db))
+	for _, q := range []string{`UPDATE nodes SET born_epoch = NULL WHERE name = 'n'`, `DELETE FROM meta WHERE k = 'epochs'`, `DELETE FROM sealed_views`} {
+		if _, err := sq.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sq.Close()
+	x = startSvc(t, sc, svcOpts{now: s.Now, db: db}, withRecipient)
+	must(x2.CreateDocSealed(ctx, "cat", "later", map[string]any{"title": "Later", "parents": parents("root@a2")}))
+	x.caughtUp("cat")
+	check("unknown", "")
 }
