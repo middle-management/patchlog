@@ -832,7 +832,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 	v, err := s.viewer(ctx, r, gs)
-	if client.IsPurged(err) {
+	if _, chain := chainErr(err); !chain && client.IsPurged(err) {
 		// A purged sealed catalog's document is 410 too (§8.5): the core
 		// makes the read check before answering it, as below. An edge
 		// grant that passed the service's checks stands for the grant it
@@ -841,6 +841,9 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		// gets head; a subject set's may not have (RoleView issues one to
 		// any grant verifying for the catalog), and gets none, since the
 		// core shows a sealed purged catalog's head only to its readers.
+		// A requireAt chain that can't be read because a namespace it
+		// names is purged is not the catalog's purge: WriteAuthError
+		// answers it, 502 upstream, never 403 (§C.4).
 		var head string
 		if cl := s.edgeClaims(r); cl != nil {
 			if gs, _ := s.edgeGS(cl.Prefix); gs != AllSubjects {
