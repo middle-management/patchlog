@@ -82,20 +82,47 @@ func (k *Store) Get(url string) (derived.Stored, bool, bool) {
 	return e.st, e.bound, true
 }
 
+// Outcome is what PutOutcome made of a result.
+type Outcome int
+
+const (
+	// Kept: st is kept as url's result.
+	Kept Outcome = iota
+	// Existing: a result was kept for url already, and is returned.
+	Existing
+	// PurgedSince: a purge of scope since the generation taken before st
+	// was read purged one of its tags, or may have. st was computed from
+	// what was read before that purge, and is neither kept nor served
+	// (§A.1: "serving or keeping none computed from what was read before
+	// it").
+	PurgedSince
+	// Evicted: st was kept, and dropped at once to stay within the size;
+	// it may be served, as nothing purged it.
+	Evicted
+)
+
 // Put keeps st as url's result unless one is kept already, or a purge of
 // scope since generation gen purged one of st's tags, and returns the
 // result kept for url (st if none) and whether one is: the first writer
 // wins, so every reader of url gets the same bytes.
 func (k *Store) Put(url, scope string, gen uint64, bound bool, st derived.Stored) (derived.Stored, bool) {
+	st, o := k.PutOutcome(url, scope, gen, bound, st)
+	return st, o == Kept || o == Existing
+}
+
+// PutOutcome is Put, telling apart why a result isn't kept: a caller that
+// gets PurgedSince must not serve st, which predates a purge (§A.1), and
+// computes it again or redirects.
+func (k *Store) PutOutcome(url, scope string, gen uint64, bound bool, st derived.Stored) (derived.Stored, Outcome) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.expire()
 	if el, ok := k.m[url]; ok {
-		return el.Value.(*entry).st, true
+		return el.Value.(*entry).st, Existing
 	}
 	tags := splitTags(st.Tags)
 	if k.purgedSince(scope, gen, tags) {
-		return st, false
+		return st, PurgedSince
 	}
 	e := &entry{url: url, scope: scope, tags: tags, exp: k.now().Add(For), bound: bound, st: st}
 	k.m[url] = k.order.PushBack(e)
@@ -103,7 +130,10 @@ func (k *Store) Put(url, scope string, gen uint64, bound bool, st derived.Stored
 	for k.size > k.maxSize {
 		k.remove(k.order.Front())
 	}
-	return st, k.m[url] != nil
+	if k.m[url] == nil {
+		return st, Evicted
+	}
+	return st, Kept
 }
 
 // Purge drops scope's results carrying any of tags, after the apply that

@@ -46,8 +46,9 @@ func (w *v75x) patchKeys(edit func(keys []any) []any) {
 // rotates catalog-01's pub under the same kid, replaces catalog-01 by
 // catalog-02, or edits catalog-01's entry otherwise, the index's cookie
 // for a partial reader of matches-r7 is 403 "no longer read filtered", and
-// a grant that still verifies there gets the uncovered scope marker, at
-// matches-r7's own ns_id, not reads:matches-r7:g:…. A key added at the
+// a grant that still verifies there gets no marker (since v0.77 a base
+// naming a catalog gives an uncovered partial reader none, §A.4), not
+// reads:matches-r7:g:…. A key added at the
 // head leaves the branch covered. Before v0.76 the branch stayed covered,
 // judged through catalog-01 as of baseAt.
 func TestV076CoverBranchRootKeys(t *testing.T) {
@@ -92,14 +93,11 @@ func TestV076CoverBranchRootKeys(t *testing.T) {
 			if c.name != "maxTtl edited" {
 				return
 			}
-			// The grant still verifies: it reads matches-r7 as an
-			// uncovered namespace's partial reader.
-			_, ngs, at := w.pointer("/matches-r7", fan)
-			if ngs == gs || at != w.x.ix.Checkpoint("matches-r7") {
-				t.Errorf("the grant once uncovered: gs %s (was %s), at %s, want matches-r7's own %s", ngs, gs, at, w.x.ix.Checkpoint("matches-r7"))
-			}
-			if b := w.x.search("/matches-r7", fan); b["namespaces"] != nil {
-				t.Errorf("an uncovered answer lists %v", b["namespaces"])
+			// The grant still verifies, but matches-r7's base names a
+			// catalog: an uncovered partial reader has no marker there
+			// (v0.77, §A.4; scenarios 113, 119): 403.
+			if r := w.x.raw("/matches-r7", fan); r.status != 403 {
+				t.Errorf("the grant once uncovered: %d %v", r.status, r.body)
 			}
 		})
 	}

@@ -144,10 +144,13 @@ func TestReferenceQueries(t *testing.T) {
 	if b := x.expect("/pages?ref="+enc(live)+"&after=a&counts=/kind", "d"); fmt.Sprint(b["counts"]) != "map[/kind:map[x:2]]" {
 		t.Errorf("counts after a: %v", b["counts"])
 	}
-	if b := x.expect(route4+"&sort=/title&limit=1", "a"); b["next"] != "1" {
+	b = x.expect(route4+"&sort=/title&limit=1", "a")
+	if b["next"] != "1" {
 		t.Errorf("next with sort %v", b["next"])
 	}
-	x.expect(route4+"&sort=/title&after=1", "b")
+	// At the page's at: the head pointer drops an opaque after (v0.77,
+	// §A.4).
+	x.expect("/pages/at/"+b["at"].(string)+"?ref="+enc("/r/logic/route-4")+"&sort=/title&after=1", "b")
 	for _, q := range []string{route4 + "&sort=/title&after=a", route4 + "&q=B&after=a", route4 + "&after=a&after=b"} {
 		if r := x.raw(q, ""); r.status != 400 {
 			t.Errorf("%s: %d", q, r.status)

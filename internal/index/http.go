@@ -16,6 +16,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/svcedge"
@@ -279,9 +280,10 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 	// be issued a namespace-wide edge grant (§C.5.2), which reads every
 	// resource, so all such readers share results whatever their subjects;
 	// reads:{ns}:scope:{digest} for one that reads only what its rules
-	// allow, digest covering those rules and the /principal values they
-	// refer to (grantcheck.ReadsScope), so readers limited alike share
-	// them; and where §B.11.9 covers ns, reads:{ns}:g:{gs} for such a
+	// allow, digest covering those rules, the /principal values they
+	// refer to (grantcheck.ReadsScope) and its key's key: string
+	// (scopeMarker), so readers limited alike through one key share them;
+	// and where §B.11.9 covers ns, reads:{ns}:g:{gs} for such a
 	// partial reader, gs being the origin's, its hits filtered by
 	// visibility (filtered.go). Where those rules refer to /now the
 	// namespace counts as unreadable: a result at an at can't change with
@@ -315,12 +317,20 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 		if may, err := ix.mayBeCovered(ctx, ns); err != nil || may {
 			return nil, errors.Join(errNotReached, err)
 		}
-	case errors.Is(err, errUncovered), errors.Is(err, errPurgedNS):
+	case errors.Is(err, errUncovered):
+		// One that could be covered by its shape but isn't gives a
+		// partial reader no marker (§A.4): never hits by rules alone.
+		if shaped, err := ix.catalogShaped(ctx, ns); err != nil {
+			return nil, err
+		} else if shaped {
+			return nil, errNoMarker
+		}
+	case errors.Is(err, errPurgedNS):
 	default:
 		return nil, err
 	}
 	a.derive = nil
-	a.marker = "reads:" + ns + ":scope:" + digest
+	a.marker = scopeMarker(ns, digest, v.Key.Kid, keyPub(*v.Key))
 	a.allow = func(resource string) bool { return ix.checker.AllowsRead(v, resource) }
 	return marked(a), nil
 }
@@ -377,25 +387,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		}
 	}
 	if err != nil {
-		if writeLimit(w, err) {
-			return
-		}
-		var ae *grant.AuthError
-		if errors.As(err, &ae) {
-			code := "forbidden"
-			if ae.Status == 401 {
-				code = "unauthenticated"
-				w.Header().Set("WWW-Authenticate", "Bearer")
-			}
-			w.Header().Set("Cache-Control", "no-store")
-			writeErr(w, ae.Status, code, ae.Msg)
-			return
-		}
-		if errors.Is(err, errNotReached) {
-			writeBehind(w, errNotReached.Error())
-			return
-		}
-		ix.writeUpstreamErr(w, "access check for "+ns, err, "cannot read the namespace configuration")
+		ix.writeAccessErr(w, "access check for "+ns, err, "cannot read the namespace configuration")
 		return
 	}
 	// A purged namespace answers as the core's URLs of it do, after the
@@ -507,10 +499,10 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	if old != nil {
 		atA, atTarget = old, base(old, ns)+"/at/"+at+derived.CanonicalQuery(vals, "min")
 	}
-	// elsewhere is the query a redirect to another at sends (§A.4): an
-	// after naming a resource is kept, applied to the new result, and an
-	// opaque one, a position in this at's result, is dropped, starting
-	// again.
+	// elsewhere is the query a redirect from the head pointer or to
+	// another at sends (§A.4): an after naming a resource is kept, applied
+	// to the new result, and an opaque one, a position in some at's
+	// result, is dropped, starting again.
 	elsewhere := func() (url.Values, *Query) {
 		if q.ByName() || !vals.Has("after") {
 			return vals, q
@@ -595,11 +587,13 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// resolved as redirect, as §A.4 shows; §A.5), with the result
 		// computed there and kept, so the redirect is answered even if the
 		// checkpoint moves on before it is followed. If it can't be
-		// computed, the at URL says why. From an at URL to another at, an
-		// opaque after is dropped (elsewhere); the head pointer names no
-		// at, and passes the query on whole.
+		// computed, the at URL says why. From the head pointer, or from an
+		// at URL to another at, an opaque after is dropped (elsewhere,
+		// §A.4: "A redirect from a head pointer or to another at ...
+		// drops an opaque one, starting again"); a redirect to the same at
+		// keeps it.
 		rv, rq := vals, q
-		if isAt && at != cur {
+		if !isAt || at != cur {
 			rv, rq = elsewhere()
 		}
 		to := cur
@@ -611,7 +605,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 				}
 				if _, got, err := ix.answer(ctx, a, ns, rv, rq, info); err == nil {
 					to = got
-				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) && !errors.Is(err, errLackCounts) {
+				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) && !errors.Is(err, errLackCounts) && !errors.Is(err, errPurgedSince) {
 					ix.opt.Logf("index: query %s: %v", r.URL, err)
 				}
 			}
@@ -637,12 +631,21 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	if info.Protected() {
 		gen := ix.kept.Generation(ns)
 		if st, ok := ix.sealed.Get(ctx, target(at)); ok {
-			st, _ = ix.kept.Put(target(at), ns, gen, true, st)
-			ix.writeStored(w, r, a, at, st)
-			return
+			// One a purge dropped since it was read is computed again
+			// below (§A.1).
+			if st, o := ix.kept.PutOutcome(target(at), ns, gen, true, st); o != kept.PurgedSince {
+				ix.writeStored(w, r, a, at, st)
+				return
+			}
 		}
 	}
 	st, got, err := ix.answer(ctx, a, ns, vals, q, info)
+	if errors.Is(err, errPurgedSince) {
+		// Never the bytes computed before the purge: the current at,
+		// computed again after it (its views too), redirected to.
+		ix.afterPurge(w, r, ns, vals, q)
+		return
+	}
 	var fe *FieldError
 	switch {
 	case errors.As(err, &fe):
@@ -683,6 +686,91 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	ix.writeStored(w, r, a, at, st)
 }
 
+// afterPurge answers a query whose result at its at was computed before a
+// purge (errPurgedSince): the result is computed again at the committed
+// checkpoint after it, up to twice more, and the query redirected there,
+// an opaque after dropped as for any other at (§A.4); one that keeps
+// losing to purges is 503 behind. Nothing computed before the purge is
+// served (§A.1), nor with what serve read before it: each try makes the
+// read check, reads the checkpoint and the namespace's encryption again
+// (a raise to sealed or e2e purges, §9) and a partial reader's view, so
+// the result kept at the at redirected to is the one a query there
+// computes afresh.
+func (ix *Index) afterPurge(w http.ResponseWriter, r *http.Request, ns string, vals url.Values, q *Query) {
+	ctx := r.Context()
+	rv := vals
+	if !q.ByName() && vals.Has("after") {
+		rv = maps.Clone(vals)
+		delete(rv, "after")
+	}
+	for range 2 {
+		a, err := ix.access(ctx, ns, r)
+		if client.IsPurged(err) {
+			var head string
+			if head, err = ix.purgedRead(ctx, ns, r, err); err == nil {
+				writePurged(w, head)
+				return
+			}
+		}
+		if err != nil {
+			ix.writeAccessErr(w, "access check for "+ns, err, "cannot read the namespace configuration")
+			return
+		}
+		head, purged, err := ix.committed(ctx, ns)
+		if err != nil {
+			ix.opt.Logf("index: checkpoint of %s: %v", ns, err)
+			writeErr(w, http.StatusInternalServerError, "internal", "cannot read the checkpoint")
+			return
+		}
+		if purged {
+			writePurged(w, head)
+			return
+		}
+		info, _, err := ix.keys.Current(ctx, ns)
+		if err != nil {
+			ix.opt.Logf("index: keys of %s: %v", ns, err)
+			writeBehind(w, "the index cannot obtain the key that seals results of this namespace yet")
+			return
+		}
+		if a.cov != nil {
+			a.cov = nil
+			if err := ix.cover(ctx, a, ns, head); err != nil {
+				ix.writeCoverErr(w, ns, err)
+				return
+			}
+		}
+		// Parsed afresh: a Query keeps what a read transaction made of
+		// it (its tokens), which another one doesn't hold.
+		rq, err := ParseQuery(rv)
+		if err != nil {
+			writeQueryErr(w, err)
+			return
+		}
+		_, got, err := ix.answer(ctx, a, ns, rv, rq, info)
+		if errors.Is(err, errPurgedSince) {
+			continue
+		}
+		if err != nil {
+			ix.opt.Logf("index: query %s after a purge: %v", r.URL, err)
+			writeBehind(w, "the index is applying a purge of the namespace: try again")
+			return
+		}
+		// The headers of serve's pointers (setPtrHeaders).
+		if a.public {
+			w.Header().Set("Cache-Control", ccHeadPointer)
+			w.Header().Set("Cache-Tag", "ns:"+ns)
+		} else {
+			w.Header().Set("Cache-Control", ccPrivatePtr)
+			w.Header().Set("CDN-Cache-Control", "no-store")
+			w.Header().Set("Surrogate-Control", "no-store")
+			w.Header().Add("Vary", "Authorization")
+		}
+		redirect(w, base(a, ns)+"/at/"+got+derived.CanonicalQuery(rv, "min"))
+		return
+	}
+	writeBehind(w, "the index is applying purges of the namespace: try again")
+}
+
 // errMoving is a namespace whose checkpoint moved each time a partial
 // reader's view was computed for it (§B.11.9, answer): behind, for now.
 var errMoving = errors.New("the index is applying the namespace's log: try again")
@@ -690,6 +778,75 @@ var errMoving = errors.New("the index is applying the namespace's log: try again
 // errVisibility wraps a failure to compute a partial reader's view
 // (writeCoverErr).
 var errVisibility = errors.New("visibility")
+
+// writeAccessErr answers err, a failed read check (Index.access,
+// refsReader): 413 for a grant over a limit (writeLimit); a requireAt
+// chain the verifier can't read, whatever else err is, as
+// writeUpstreamErr answers it (§C.4: "never 403"); a grant every
+// namespace of which it names is purged 410 (purgedNS); a refusal as such,
+// no-store; a namespace not reached yet behind; anything else as
+// writeUpstreamErr answers it, with msg.
+func (ix *Index) writeAccessErr(w http.ResponseWriter, what string, err error, msg string) {
+	if writeLimit(w, err) {
+		return
+	}
+	if _, ok := chainErr(err); ok {
+		ix.writeUpstreamErr(w, what, err, msg)
+		return
+	}
+	var pn *purgedNS
+	if errors.As(err, &pn) {
+		pn.write(w)
+		return
+	}
+	var ae *grant.AuthError
+	if errors.As(err, &ae) {
+		code := "forbidden"
+		if ae.Status == 401 {
+			code = "unauthenticated"
+			w.Header().Set("WWW-Authenticate", "Bearer")
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeErr(w, ae.Status, code, ae.Msg)
+		return
+	}
+	if errors.Is(err, errNotReached) {
+		writeBehind(w, errNotReached.Error())
+		return
+	}
+	ix.writeUpstreamErr(w, what, err, msg)
+}
+
+// chainUnreadable is an error of a grant check that couldn't read the
+// chain a requireAt key names (§C.4 requireAt), its ChainUnreadable
+// telling whether the cause is transient (a transport error, a deadline,
+// a 5xx, 408 or 429). grantcheck's chain error has this method; the index
+// matches it by the method alone.
+type chainUnreadable interface{ ChainUnreadable() bool }
+
+// chainErr reports whether err is a requireAt chain the verifier couldn't
+// read (ok), and whether for now (transient).
+func chainErr(err error) (transient, ok bool) {
+	var c chainUnreadable
+	if !errors.As(err, &c) {
+		return false, false
+	}
+	return c.ChainUnreadable(), true
+}
+
+// Answers to a requireAt chain the verifier can't read (§C.4: "503
+// (behind) while the cause is transient (§A.1), and 502 (upstream)
+// otherwise, naming no namespace, never 403"), and to a namespace
+// visibility reads not followed yet (§A.4 Private namespaces: 503 behind;
+// /principal hides catalog.trust, §7.4, so it names none either).
+const (
+	msgChainBehind   = "the chain a requireAt key names cannot be read yet (§C.4)"
+	msgChainUpstream = "cannot read the chain a requireAt key names (§C.4)"
+	msgMemberBehind  = "a namespace visibility reads is not reached yet (§A.4)"
+	// The core's root, which says whether authentication is on (§B.11.9
+	// Where), for now (rootErr).
+	msgRootBehind = "the index cannot read the core's configuration yet (§B.11.9)"
+)
 
 // writeCoverErr answers a failure to compute a partial reader's view of a
 // namespace §B.11.9 covers (Index.cover): a refusal as such, no-store;
@@ -699,7 +856,10 @@ var errVisibility = errors.New("visibility")
 // fetched yet (writeUpstreamErr).
 func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 	var ae *grant.AuthError
+	_, chain := chainErr(err)
 	switch {
+	case chain:
+		ix.writeUpstreamErr(w, "visibility in "+ns, err, "cannot read a namespace visibility reads (§B.11.9)")
 	case errors.As(err, &ae):
 		code := "forbidden"
 		if ae.Status == 401 {
@@ -721,18 +881,35 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 // (errGrantLacks); the log names it. A failure to fetch the key that opens
 // a sealed namespace's documents (client.ErrKeyFetch) that leaves the
 // service lacking it as configured (lacksKey: a 4xx from /keys other than
-// 429) is 502 too (§A.4 Private namespaces: "502 while it ... lacks the
-// keys"), and one for now (a 5xx, a 429, the core unreachable) is 503
+// 408 and 429) is 502 too (§A.4 Private namespaces: "502 while it ...
+// lacks the keys"), and one for now (a 5xx, a 408, a 429, the core
+// unreachable) is 503
 // behind, with Retry-After (scenario 100: "While those keys only can't
 // yet be fetched → 503 behind", §12.1), as is a namespace visibility reads
-// whose follower holds no checkpoint yet (errMemberBehind, members.go).
-// Every read check and view this service answers 502 for passes through
-// here, so each gets the same answer.
+// whose follower holds no checkpoint yet (errMemberBehind, members.go),
+// whose name only the log gives (msgMemberBehind). A requireAt chain the
+// verifier can't read (chainErr) is 503 behind while the cause is
+// transient, else 502 upstream, each with a fixed message naming no
+// namespace (§C.4). Every read check and view this service answers 502
+// for passes through here, so each gets the same answer.
 func (ix *Index) writeUpstreamErr(w http.ResponseWriter, what string, err error, msg string) {
 	ix.opt.Logf("index: %s: %v", what, err)
+	if transient, ok := chainErr(err); ok {
+		if transient {
+			writeBehind(w, msgChainBehind)
+		} else {
+			writeErr(w, http.StatusBadGateway, "upstream", msgChainUpstream)
+		}
+		return
+	}
 	if errors.Is(err, errMemberBehind) {
 		// A namespace visibility reads not followed yet (members.go).
-		writeBehind(w, err.Error())
+		writeBehind(w, msgMemberBehind)
+		return
+	}
+	if re := (*rootErr)(nil); errors.As(err, &re) && re.transient() {
+		// The core's root, read for coverage (authOff), for now.
+		writeBehind(w, msgRootBehind)
 		return
 	}
 	if errors.Is(err, client.ErrKeyFetch) && !lacksKey(context.Background(), err) {
@@ -767,8 +944,8 @@ var errLackCounts = errors.New("counts over documents served under an epoch the 
 var errEpochKey = errors.New("the index cannot obtain the key of an epoch a hit is served under")
 
 // lacksKey reports whether err, from fetching the key of an epoch, leaves
-// the service lacking that key as its grant and keys are configured
-// (§A.4, §E.2.6): /keys answered a 4xx other than 429, or gave no key for
+// the service lacking that key as its grant and keys are configured (§A.4,
+// §E.2.6): /keys answered a 4xx other than 408 and 429, or gave no key for
 // the epoch (ErrNoKeys) or none the service can unwrap (seal.ErrDecrypt)
 // or will take (ErrUntrustedKey, §E.3.2). Any other failure, the reader's
 // request ending while the key is read among them, is for now. So is any
@@ -778,7 +955,7 @@ func lacksKey(ctx context.Context, err error) bool {
 		return false
 	}
 	if ae, ok := client.AsAPIError(err); ok {
-		return ae.Status >= 400 && ae.Status < 500 && ae.Status != 429
+		return ae.Status >= 400 && ae.Status < 500 && ae.Status != 408 && ae.Status != 429
 	}
 	return errors.Is(err, client.ErrNoKeys) || errors.Is(err, seal.ErrDecrypt) || errors.Is(err, client.ErrUntrustedKey)
 }
@@ -787,14 +964,15 @@ func lacksKey(ctx context.Context, err error) bool {
 // its result, sealed in a sealed or e2e namespace, keeps it (and stores a
 // sealed one), and returns the result kept with the checkpoint it is at.
 //
-// Each sealed value is sealed under the epoch the revision it derives
-// from is served under (§E.2.6; derived.EpochOf, docs.epoch), the epoch
-// current now where that isn't known: a hit under that epoch's K_r of its
-// resource. A result is sealed whole only when its source isn't public,
-// every reader its URL admits reads it whole, under reads:{ns}, and every
-// value derives from revisions served under one epoch, under that
-// epoch's K_e (§E.2.6 Whole-response sealing); otherwise it is sealed per
-// entry, and counts, which have no entry, are 400.
+// Each sealed value is sealed under the epoch the revision it derives from
+// is served under (§E.2.6; derived.EpochOf, docs.epoch), and where that is
+// pending, the epoch judged once, by the first answer that seals a value
+// derived from it (judgeEpochs: the one current then): a hit under that
+// epoch's K_r of its resource. A result is sealed whole only when its
+// source isn't public, every reader its URL admits reads it whole, under
+// reads:{ns}, and every value derives from revisions served under one
+// epoch, under that epoch's K_e (§E.2.6 Whole-response sealing); otherwise
+// it is sealed per entry, and counts, which have no entry, are 400.
 func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Values, q *Query, info derived.Info) (derived.Stored, string, error) {
 	// A public sealed namespace's results, which anyone reads, and a
 	// limited reader's, are sealed per entry whatever their epochs.
@@ -835,7 +1013,19 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	if !a.all {
 		allow = a.allow
 	}
-	gen := ix.kept.Generation(ns)
+	gen, sgen := ix.kept.Generation(ns), ix.sealed.Generation()
+	// info was read before gen: a config change since (a raise to sealed
+	// or e2e, a rotation), which Apply observes before it purges what it
+	// narrows (§9, §A.1), would have this result computed under what it
+	// replaced and kept, its purge counted before gen. Read again now: what
+	// changed is errInfoChanged, computed again with what is current
+	// (afterPurge); what changes later purges after gen (PurgedSince).
+	if now, err := ix.keys.Info(ctx, ns); err != nil {
+		ix.opt.Logf("index: encryption of %s: %v", ns, err)
+		return derived.Stored{}, "", fmt.Errorf("%w (%s)", errEpochKey, ns)
+	} else if now != info {
+		return derived.Stored{}, "", errInfoChanged
+	}
 	q.epochs = info.Protected()
 	res, at, err := ix.query(ctx, ns, q, allow)
 	if err != nil {
@@ -852,7 +1042,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 				// The view read other namespaces before gen was taken
 				// (serve's cover): kept only if no purge since carried
 				// its tags (fcp.gens).
-				gen = min(gen, g.kept)
+				gen, sgen = min(gen, g.kept), min(sgen, g.sealed)
 			}
 			break
 		}
@@ -863,6 +1053,14 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 			return derived.Stored{}, "", fmt.Errorf("%w: %w", errVisibility, err)
 		}
 		if res, at, err = ix.query(ctx, ns, q, a.allow); err != nil {
+			return derived.Stored{}, "", err
+		}
+	}
+	// A revision whose epoch is pending is judged now, as this answer
+	// seals values derived from it, unless an earlier answer did (§E.2.6,
+	// judgeEpochs).
+	if info.Protected() {
+		if err := ix.judgeResult(ctx, res, info.Epoch); err != nil {
 			return derived.Stored{}, "", err
 		}
 	}
@@ -991,8 +1189,13 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		// The reader went away: keep nothing built meanwhile.
 		return derived.Stored{}, "", err
 	}
+	if ix.testAnswerRead != nil {
+		ix.testAnswerRead()
+	}
 	if info.Protected() {
-		if st, err = ix.sealed.Put(ctx, view.Target, ns, at, st); err != nil {
+		// Not stored if a purge since sgen carried one of its tags
+		// (§A.1); then not kept either, below.
+		if st, err = ix.sealed.PutSince(ctx, view.Target, ns, at, sgen, st); err != nil {
 			ix.opt.Logf("index: storing a sealed result: %v", err)
 		}
 		if now, _, err := ix.committed(ctx, ns); err == nil && now != at {
@@ -1003,9 +1206,28 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 			}
 		}
 	}
-	st, _ = ix.kept.Put(view.Target, ns, gen, info.Protected(), st)
+	st, o := ix.kept.PutOutcome(view.Target, ns, gen, info.Protected(), st)
+	if o == kept.PurgedSince {
+		// Computed from what was read before a purge: neither kept nor
+		// served (§A.1, scenario 117).
+		return derived.Stored{}, "", errPurgedSince
+	}
 	return st, at, nil
 }
+
+// errPurgedSince is a result computed from what was read before a purge
+// that carried one of its tags (kept.PurgedSince): it is never served
+// (§A.1: "serving or keeping none computed from what was read before
+// it"). The query is computed again at the checkpoint after the purge,
+// and redirected to, or, where that keeps losing to purges, answered 503
+// behind.
+var errPurgedSince = errors.New("the result was computed before a purge of what it shows")
+
+// errInfoChanged is a result answer would compute under the namespace's
+// encryption as it was before a config change (answer). It is answered as
+// errPurgedSince, computed again with what is current: a raise purges what
+// the result shows (§9), and nothing read before it is kept (§A.1).
+var errInfoChanged = fmt.Errorf("%w: the namespace's encryption changed", errPurgedSince)
 
 // setResultHeaders sets a result's headers: a private one gets edge
 // lifetimes only for a read the verifying edge verified (§9).

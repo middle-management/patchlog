@@ -12,7 +12,8 @@
 //	docs(docid, ns, resource, head, schema, epoch) one row per live resource (untyped too, see
 //	                                      UntypedListing); epoch, in a sealed or e2e namespace, the
 //	                                      epoch its head is served under (derived.EpochOf), NULL or 0
-//	                                      where not known
+//	                                      while pending, until the first answer sealing a value
+//	                                      derived from it judges it (judgeEpochs)
 //	text  fts5(ns, resource, schema, path, body)  rowid = docid<<20 | n, so a resource's rows are a rowid range
 //	facet(ns, resource, schema, path, value, raw)  value: the string form (§A.2), raw: canonical JSON
 //	sort (ns, resource, schema, path, value, raw)  value: the least value (sortColumn), raw: all, a JSON array
@@ -214,6 +215,13 @@ type Index struct {
 
 	fs  fstate  // the state of namespaces §B.11.9 covers (filtered.go)
 	mem members // the namespaces visibility reads there that the index doesn't serve (members.go)
+	// auth is the core's authentication mode as last read (authOff),
+	// kept for CheckerTTL.
+	auth struct {
+		mu  sync.Mutex
+		at  time.Time
+		off bool
+	}
 
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers
@@ -230,6 +238,9 @@ type Index struct {
 	// testRefsRead, if set, is called once a /_refs answer's transaction
 	// has read its hits (tests: refsCompute).
 	testRefsRead func()
+	// testAnswerRead, if set, is called once a query's answer has read
+	// its rows, before it is built and kept (tests: answer).
+	testAnswerRead func()
 	// testMemberBootstrap, if set, is called before a member's follower
 	// gives it its first checkpoint (tests: bootstrapMember).
 	testMemberBootstrap func(ctx context.Context, m string)
@@ -673,7 +684,7 @@ type prepared struct {
 	resource string
 	remove   bool
 	head     string
-	epoch    int    // the epoch head is served under, 0 if not known or not sealed (derived.EpochOf)
+	epoch    int    // the epoch head is served under, 0 if pending or not sealed (derived.EpochOf; judgeEpochs)
 	schema   string // "" = untyped
 	typed    bool
 	rows     *docRows
@@ -1055,7 +1066,10 @@ func (ix *Index) write(ctx context.Context, tx *sql.Tx, ns string, p prepared) e
 		epochCol = p.epoch
 	}
 	if found {
-		_, err = tx.ExecContext(ctx, `UPDATE docs SET head = ?, schema = ?, epoch = ? WHERE docid = ?`, p.head, schemaCol, epochCol, docid)
+		// A head whose epoch is pending (NULL) keeps the epoch an answer
+		// judged for it, where the row holds that head already (§E.2.6,
+		// judgeEpochs): judged once.
+		_, err = tx.ExecContext(ctx, `UPDATE docs SET epoch = CASE WHEN head = ?1 AND ?3 IS NULL THEN epoch ELSE ?3 END, head = ?1, schema = ?2 WHERE docid = ?4`, p.head, schemaCol, epochCol, docid)
 	} else {
 		var res sql.Result
 		res, err = tx.ExecContext(ctx, `INSERT INTO docs (ns, resource, head, schema, epoch) VALUES (?, ?, ?, ?, ?)`, ns, p.resource, p.head, schemaCol, epochCol)

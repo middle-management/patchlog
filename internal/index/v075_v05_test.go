@@ -495,15 +495,23 @@ func TestV075IndexBranch(t *testing.T) {
 	}
 }
 
-// TestV075IndexUncovered: a namespace whose catalog doesn't trust it is
-// read as before v0.75: the scope marker, matches' own ns_id, every hit
-// the grant's rules allow.
+// TestV075IndexUncovered: a namespace whose catalog doesn't trust it,
+// though its catalogs names one, gives a partial reader no marker (v0.77,
+// §A.4): 403, never every hit the grant's rules allow; one that names no
+// catalog is read as before v0.75: the scope marker, matches' own ns_id,
+// every hit the grant's rules allow.
 func TestV075IndexUncovered(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	w := newV75X(t, false)
 	must(w.admin.PatchConfig(ctx, "cat-season", must(w.admin.NSHead(ctx, "cat-season")).Config, []any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": []any{}}}))
 	fan := w.reader("user:fan", []any{"fans"})
+	if r := w.x.raw("/matches", fan); r.status != 403 {
+		t.Errorf("uncovered, naming cat-season: %d %v", r.status, r.body)
+	}
+	must(w.admin.PatchConfig(ctx, "matches", must(w.admin.NSHead(ctx, "matches")).Config, []any{map[string]any{"op": "remove", "path": "/catalogs"}}))
+	w.x.caughtUp("matches")
+	w.x.ix.ExpireGrantChecks()
 	_, _, at := w.pointer("/matches", fan)
 	b := w.x.search("/matches", fan)
 	if at != w.x.ix.Checkpoint("matches") || b["namespaces"] != nil || strings.Join(resources(b), ",") != "derby,opener,secret,shared" {
