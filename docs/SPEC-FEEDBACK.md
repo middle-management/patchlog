@@ -177,6 +177,10 @@ remains (10, 12, 18, 24, 29, 32).
     pre-raise content, as the fallback epoch never changes and shadows carry A's epochs, which
     is harmless. *Question:* must a check store one where that changes nothing observable?
 25. **Item 2's roles and the digest** (§B.11.9 Visible, §A.4; was v0.76 Open 8, v0.75 Open 10). A read role
+    testing `/principal/sub` never allows anything through filtered reads, as item 2 counts roles
+    "only as §B.11.5 counts them", yet its rules enter the scope digest
+    (`grantcheck.ReadFilter.AllowsItem`); CONFORMANCE scenario 75 depends on this. *Question:*
+    intended? Do the reader's own role rules filter at all?
 26. **Authentication disabled gets the current epoch only** (§E.2.3, §E.2.6, §A.4; was v0.76 Open 27, v0.74
     Open 4). A playground, and services without grants, can't open older epochs after a
     rotation, and a fresh index or tree service leaves those documents out. *Question:*
