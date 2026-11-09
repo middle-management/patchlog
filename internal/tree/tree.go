@@ -60,6 +60,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -202,6 +203,10 @@ type Service struct {
 
 	amu sync.Mutex
 	ats map[string]atRecord // the checkpoints behind the ats of kept listings (atIncludes)
+
+	// beforeListing, if set, runs as a listing starts, outside the
+	// graph's lock (tests: a checkpoint that moves meanwhile).
+	beforeListing atomic.Pointer[func()]
 
 	wmu     sync.Mutex // serialises applies across followers
 	pmu     sync.Mutex

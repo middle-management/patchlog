@@ -88,12 +88,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/dbmigrate"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
@@ -140,8 +141,7 @@ type Service struct {
 
 	// Guarded by the tree service's lock (hook calls hold it for writing,
 	// View for reading).
-	eff   map[string]map[string][]string // node -> subject -> roles (sorted)
-	users map[string]bool                // user: subjects with direct $access entries
+	eff map[string]map[string][]string // node -> subject -> roles (sorted)
 	// Placements whose item is tombstoned, with the effective roles frozen
 	// when the tombstone was seen (§B.11.7): restores are resolved from
 	// them (§B.11.4). tomb holds every such name, frozen only those with
@@ -162,6 +162,12 @@ type Service struct {
 	// derived from (readRolesOf).
 	rrMu    sync.Mutex
 	rrCache map[string]rrEntry
+	// vc is the visibility test's catvis.Catalog of the graph as the hook
+	// last left it (catalogOf), guarded by rrMu. gen counts the hook's
+	// calls: the graph changes in place, so an entry of an earlier gen is
+	// stale.
+	vc  *visEntry
+	gen atomic.Uint64
 
 	// afterDecide, if set (tests), runs after each try of POST
 	// /read-grants decides its items, before the checkpoint is checked.
@@ -192,7 +198,7 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 	if opt.MergeTTL == 0 {
 		opt.MergeTTL = 5 * time.Minute
 	}
-	s := &Service{opt: opt, eff: map[string]map[string][]string{}, users: map[string]bool{},
+	s := &Service{opt: opt, eff: map[string]map[string][]string{},
 		tomb: map[string]bool{}, frozen: map[string]map[string][]string{},
 		unplaced: map[string]map[string][]string{}, placed: map[string]bool{}, rrCache: map[string]rrEntry{}}
 	s.now = opt.Tree.Now
@@ -295,7 +301,7 @@ func (s *Service) Rebuild(ctx context.Context, tx *sql.Tx, g *tree.Graph) error 
 	if err := s.sweepKept(ctx, tx, g); err != nil {
 		return err
 	}
-	s.users = directUsers(g)
+	s.gen.Add(1)
 	return nil
 }
 
@@ -317,7 +323,7 @@ func (s *Service) Update(ctx context.Context, tx *sql.Tx, g *tree.Graph, changed
 	if err := s.sweepKept(ctx, tx, g); err != nil {
 		return err
 	}
-	s.users = directUsers(g)
+	s.gen.Add(1)
 	return nil
 }
 
@@ -631,22 +637,6 @@ func b2i(b bool) int {
 	return 0
 }
 
-func directUsers(g *tree.Graph) map[string]bool {
-	out := map[string]bool{}
-	for _, name := range g.Names() {
-		n := g.Node(name)
-		if n.Self {
-			continue
-		}
-		for subj := range n.Access {
-			if strings.HasPrefix(subj, "user:") {
-				out[subj] = true
-			}
-		}
-	}
-	return out
-}
-
 func sameEff(a, b map[string][]string) bool {
 	if len(a) != len(b) {
 		return false
@@ -667,62 +657,10 @@ func sameEff(a, b map[string][]string) bool {
 
 // Effective computes a node's effective roles per subject (§B.11.2).
 // override replaces the walkable parents of named nodes (to simulate a
-// move). Implicit placements and cyclic nodes get nothing.
+// move). Implicit placements and cyclic nodes get nothing. It is
+// catvis.Effective, which the origin's filtered reads share (§B.11.9).
 func Effective(g *tree.Graph, name string, override map[string][]string) map[string][]string {
-	start := g.Node(name)
-	if start == nil || start.Self || start.Cyclic {
-		return nil
-	}
-	type item struct {
-		n *tree.Node
-		d int
-	}
-	acc := map[string]map[string]bool{}
-	visited := map[string]bool{name: true}
-	queue := []item{{start, 0}}
-	for len(queue) > 0 {
-		it := queue[0]
-		queue = queue[1:]
-		for subj, roles := range it.n.Access {
-			m := acc[subj]
-			if m == nil {
-				m = map[string]bool{}
-				acc[subj] = m
-			}
-			for _, r := range roles {
-				m[r] = true
-			}
-		}
-		if !it.n.Inherit || it.d >= tree.MaxDepth {
-			continue
-		}
-		ps, ok := override[it.n.Name]
-		if !ok {
-			ps = g.WalkableParents(it.n)
-		}
-		for _, p := range ps {
-			if visited[p] {
-				continue
-			}
-			pn := g.Node(p)
-			if pn == nil || pn.Kind != tree.KindFolder || pn.Cyclic {
-				continue
-			}
-			visited[p] = true
-			queue = append(queue, item{pn, it.d + 1})
-		}
-	}
-	if len(acc) == 0 {
-		return nil
-	}
-	out := map[string][]string{}
-	for subj, m := range acc {
-		for r := range m {
-			out[subj] = append(out[subj], r)
-		}
-		sort.Strings(out[subj])
-	}
-	return out
+	return catvis.Effective(g, name, override)
 }
 
 // --- subjects and visibility (tree.RoleView) --------------------------------
@@ -746,16 +684,7 @@ func UserSubject(sub string) string {
 // subject is never that of the unprefixed group, whose $access entries,
 // key scope (groups deny lists name groups unprefixed) and admin
 // membership it would otherwise take.
-func groupSubjects(groups []string) []string {
-	out := make([]string, 0, len(groups))
-	for _, g := range groups {
-		if subj := grantcheck.GroupPrefix + g; !contains(out, subj) {
-			out = append(out, subj)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
+func groupSubjects(groups []string) []string { return catvis.GroupSubjects(groups) }
 
 // Subjects is a caller's subject set (§B.11.2): its root sub if it starts
 // with "user:", plus group:{g} for each group of its grant's root block.
@@ -794,15 +723,18 @@ func callerOf(v *grant.Verified) who {
 }
 
 // whoOf is a subject set's caller (§B.11.5), and the groups among its
-// subjects, as the grant had them (for /principal/groups).
+// subjects, as the grant had them (for /principal/groups). Subjects other
+// than group: and user: ones, such as "partial", are ignored, as catvis
+// ignores them.
 func whoOf(subjects []string) (who, []string) {
 	w := who{subs: map[string]bool{}}
 	var groups []string
 	for _, subj := range subjects {
-		w.subs[subj] = true
 		if g, ok := strings.CutPrefix(subj, grantcheck.GroupPrefix); ok {
+			w.subs[subj] = true
 			groups = append(groups, g)
 		} else if strings.HasPrefix(subj, userPrefix) {
+			w.subs[subj] = true
 			w.sub, w.hasSub = subj, true
 		}
 	}
@@ -861,11 +793,14 @@ func (s *Service) frozenRolesFor(name string, subs map[string]bool) map[string]b
 }
 
 // Resolve implements tree.RoleView: listings are keyed by the caller's
-// group subjects, plus its user subject only if the catalog has direct
-// entries for that user, or its key in a content namespace it trusts has
-// a sub scope (§B.11.5), and filtered by the visibility test of that
-// subject set alone (ForSubjects), since every reader with it shares the
-// listing.
+// deciding subjects (§B.11.5, keyedAt): its group subjects that the
+// catalog's $access, or a role or key rule of a content namespace it
+// trusts, names (all of them where such a rule tests /principal/groups
+// otherwise than positively by value), plus "partial" if that left one
+// out, and its user subject only if the catalog has direct entries for
+// that user, or its key in a content namespace it trusts has a sub scope.
+// They are filtered by the visibility test of that subject set alone
+// (ForSubjects), since every reader with it shares the listing.
 //
 // What a role means, and the catalog's key, are read from the trusted
 // content namespaces' documents as of the content namespaces' ns_ids in
@@ -881,31 +816,38 @@ func (s *Service) Resolve(ctx context.Context, v *grant.Verified) ([]string, tre
 }
 
 // keyedAt is the subject set Resolve keys v's listings by, as of the
-// checkpoint g reflects. Call it under View.
+// checkpoint g reflects (catvis.ListingSubjects). A group it leaves out
+// can't change what the set sees there: no $access entry names it, and
+// rules test it only by positive tests of other groups. Call it under
+// View.
 func (s *Service) keyedAt(g *tree.Graph, v *grant.Verified) []string {
-	keyed := groupSubjects(v.Principal.Groups)
-	if user := UserSubject(v.Principal.ID); user != "" && (s.users[user] || s.subScoped(g)) {
-		keyed = append(keyed, user)
-		sort.Strings(keyed)
-	}
-	return keyed
+	return s.Profile(g).Subjects(v)
 }
 
-// subScoped reports whether the catalog's key has a sub scope in some
-// content namespace the catalog trusts, as of the checkpoint g reflects:
-// then a reader's sub decides what it sees, and is part of its subject
-// set (§B.11.2, §B.11.5). Call it under View.
-func (s *Service) subScoped(g *tree.Graph) bool {
-	for ns := range g.Trust {
-		if c := g.Content[ns]; c != nil {
-			if cfg := s.parsed(c).cfg; cfg != nil {
-				if k := findKey(cfg.Keys, s.opt.Kid); k != nil && k.SubPattern != nil {
-					return true
-				}
-			}
-		}
-	}
-	return false
+// Profile implements tree.Profiler: the catalog's deciding inputs as of
+// the checkpoint g reflects (catvis.Profile), which key listings there
+// (§B.11.5). Call it under View.
+func (s *Service) Profile(g *tree.Graph) tree.Profile {
+	return listingProfile{s.catalogOf(g).Profile()}
+}
+
+// listingProfile is a catvis.Profile as tree.Profile.
+type listingProfile struct{ p catvis.Profile }
+
+// Subjects is v's deciding subjects, with "partial" if they leave out a
+// group (catvis.ListingSubjects).
+func (l listingProfile) Subjects(v *grant.Verified) []string {
+	return catvis.ListingSubjects(l.p, v.Principal)
+}
+
+// Admits refuses a subject set holding "partial" where every group is
+// kept: a group it left out may now decide, through a rule testing the
+// groups otherwise than positively by value, so the set could see what
+// the reader's groups hide from it. It is 403 there until the reader
+// exchanges again (§B.11.5). Elsewhere a group named since it was keyed
+// only shows the set less, never more.
+func (l listingProfile) Admits(subjects []string) bool {
+	return !l.p.KeepAll || !slices.Contains(subjects, catvis.Partial)
 }
 
 // ForSubjects implements tree.RoleView for a reader whose edge grant is
@@ -1087,16 +1029,71 @@ func onlyRoleRefs(rs []*rules.Rule) bool {
 	return true
 }
 
-// visibility is a subject set's view of the catalog (§B.11.5).
+// visEntry is the catvis.Catalog of a graph (catalogOf), built from the
+// graph g as the hook left it at gen and the trusted content namespaces'
+// documents content (Graph.Content).
+type visEntry struct {
+	g       *tree.Graph
+	gen     uint64
+	content map[string]*tree.NSConfig
+	c       *catvis.Catalog
+}
+
+// catalogOf is g's catvis.Catalog: the one visibility test (§B.11.5)
+// that the service and the origin's filtered reads share (§B.11.9). Its
+// content namespaces are those g trusts, with their documents as of the
+// checkpoint (Graph.Content), parsed (parsed), and the catalog's key. The
+// graph changes in place, so it is built again after each of the hook's
+// calls (gen) and when a document is replaced. Call it under View; don't
+// keep it past it.
+func (s *Service) catalogOf(g *tree.Graph) *catvis.Catalog {
+	gen := s.gen.Load()
+	s.rrMu.Lock()
+	e := s.vc
+	s.rrMu.Unlock()
+	if e != nil && e.g == g && e.gen == gen && sameContent(e.content, g) {
+		return e.c
+	}
+	content := map[string]*tree.NSConfig{}
+	contents := map[string]*catvis.Content{}
+	for ns := range g.Trust {
+		if c := g.Content[ns]; c != nil {
+			content[ns] = c
+			contents[ns] = &catvis.Content{NS: ns, Cfg: s.parsed(c).cfg, Kids: []string{s.opt.Kid}}
+		}
+	}
+	e = &visEntry{g: g, gen: gen, content: content, c: catvis.NewCatalog(g, contents)}
+	s.rrMu.Lock()
+	s.vc = e
+	s.rrMu.Unlock()
+	return e.c
+}
+
+// sameContent reports whether content holds exactly the documents of the
+// namespaces g trusts as of the checkpoint (catalogOf).
+func sameContent(content map[string]*tree.NSConfig, g *tree.Graph) bool {
+	n := 0
+	for ns := range g.Trust {
+		if c := g.Content[ns]; c != nil {
+			if content[ns] != c {
+				return false
+			}
+			n++
+		}
+	}
+	return n == len(content)
+}
+
+// visibility is a subject set's view of the catalog (§B.11.5): catvis's,
+// with live nodes' roles the stored effective rows.
 type visibility struct {
 	s      *Service
 	who    who
 	groups []string // the groups among the subjects, as the grant has them (for /principal/groups)
 
-	// folder caches, per namespace's readRoles, whether a role counts for
-	// folders: that depends on the subject set and the role alone.
-	mu     sync.Mutex
-	folder map[*readRoles]map[string]bool
+	mu   sync.Mutex
+	cat  *catvis.Catalog
+	view *catvis.View
 }
 
 // roles is the readRoles of a trusted content namespace as of the
@@ -1109,118 +1106,52 @@ func (v *visibility) roles(g *tree.Graph, ns string) *readRoles {
 	return v.s.readRolesOf(c)
 }
 
-// Node is the visibility test of §B.11.5, the one test listings and
-// /read-grants (for catalog nodes and their keys) use. A node is visible
-// when the walk up from it (effective) collects, through a subject the
-// catalog's key may grant through (who.through: its sub and groups
-// scopes), a role that counts for read: one its content namespace defines
-// with read, within the key's roles scope, whose own rules and the key's
-// scope rules pass as a read would evaluate them, with /principal holding
-// only the groups the key may assert and, as roles, that role. For an
-// item, that is a role of its own content namespace, with /resource its
-// name. For a folder, it is a role of some trusted content namespace whose
-// rules don't refer to /resource, through a key whose scope rules refer
-// only to /principal/groups and /principal/roles. Roles, their
-// definitions and keys are those as of the combined checkpoint. Only live
-// nodes are visible: a dangling placement, a deleted item's included,
-// grants nothing, and cyclic and implicit nodes collect nothing (§B.11.2).
-func (v *visibility) Node(g *tree.Graph, n *tree.Node) bool {
-	if n == nil || n.Self || !n.Live() {
-		return false
-	}
-	eff := v.s.eff[n.Name]
-	if n.Kind == tree.KindFolder {
-		for ns := range g.Trust {
-			if v.counts(v.roles(g, ns), eff, "", false) {
-				return true
-			}
-		}
-		return false
-	}
-	return v.counts(v.roles(g, n.ItemNS), eff, n.ItemName, true)
-}
-
-// Organising is Node as organising requests judge a node (§B.11.4,
-// §B.11.5): a dangling placement is judged as if its item were live,
-// from the roles at it computed from the graph as a live item's are
-// (Effective; a deleted item's frozen rows aren't its roles at the node),
-// through its item's content namespace, which must still be trusted. A
-// cyclic or implicit node stays hidden: it collects nothing (§B.5
-// Cycles, §B.9).
-func (v *visibility) Organising(g *tree.Graph, n *tree.Node) bool {
-	switch {
-	case n == nil || n.Self || n.Cyclic:
-		return false
-	case n.Kind == tree.KindFolder || n.Live():
-		return v.Node(g, n)
-	}
-	return v.counts(v.roles(g, n.ItemNS), Effective(g, n.Name, nil), n.ItemName, true)
-}
-
-// counts reports whether a role of eff (a node's roles per subject)
-// counts for read through rr's key (Node): for an item, named resource;
-// otherwise for a folder.
-func (v *visibility) counts(rr *readRoles, eff map[string][]string, resource string, item bool) bool {
-	if rr == nil || rr.key == nil || !item && !rr.keyFolders {
-		return false
-	}
-	subs := v.who.through(rr.key)
-	if len(subs) == 0 {
-		return false
-	}
-	// The read envelope as the gate would build it for a grant the catalog
-	// signs carrying that role (§6.4.1, mint): action read, the resource
-	// for an item, and a principal holding the caller's groups the key may
-	// assert and the role. No writes, doc or patches, so within is true
-	// and covers and overlaps are false (§6.4.2); no now, since rules
-	// reading it never count.
-	var groups []any
-	for _, gr := range v.groups {
-		if ok, _ := rr.key.Groups.Permits([]string{gr}); ok {
-			groups = append(groups, gr)
-		}
-	}
-	for subj, roles := range eff {
-		if !subs[subj] {
-			continue
-		}
-		for _, r := range roles {
-			def := rr.roles[r]
-			switch {
-			case def == nil, !item && def.resource:
-			case len(def.rules) == 0 && len(rr.keyRules) == 0:
-				return true
-			case item:
-				if passes(rr, def, r, resource, groups) {
-					return true
-				}
-			case v.folderRole(rr, def, r, groups):
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// folderRole is passes for a folder, cached per subject set.
-func (v *visibility) folderRole(rr *readRoles, def *readRole, r string, groups []any) bool {
+// viewOf is v's catvis.View of g (catalogOf), its subjects v's groups and
+// user subject, and live nodes' roles the stored effective rows, which
+// the hook keeps as Effective computes them (§B.11.7). Call it under View.
+func (v *visibility) viewOf(g *tree.Graph) *catvis.View {
+	c := v.s.catalogOf(g)
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	m := v.folder[rr]
-	if m == nil {
-		if v.folder == nil {
-			v.folder = map[*readRoles]map[string]bool{}
+	if v.cat != c {
+		subjects := make([]string, 0, len(v.groups)+1)
+		for _, gr := range v.groups {
+			subjects = append(subjects, grantcheck.GroupPrefix+gr)
 		}
-		m = map[string]bool{}
-		v.folder[rr] = m
+		if v.who.hasSub {
+			subjects = append(subjects, v.who.sub)
+		}
+		v.cat, v.view = c, c.ViewWith(subjects, func(name string) map[string][]string { return v.s.eff[name] })
 	}
-	ok, done := m[r]
-	if !done {
-		ok = passes(rr, def, r, "", groups)
-		m[r] = ok
-	}
-	return ok
+	return v.view
 }
+
+// Node is the visibility test of §B.11.5, the one test listings and
+// /read-grants (for catalog nodes and their keys) use, catvis.View.Node.
+// A node is visible when the walk up from it (effective) collects,
+// through a subject the catalog's key may grant through (its sub and
+// groups scopes), a role that counts for read: one its content namespace
+// defines with read, within the key's roles scope, whose own rules and
+// the key's scope rules pass as a read would evaluate them, with
+// /principal holding only the groups the key may assert and, as roles,
+// that role. For an item, that is a role of its own content namespace,
+// with /resource its name. For a folder, it is a role of some trusted
+// content namespace whose rules don't refer to /resource, through a key
+// whose scope rules refer only to /principal/groups and /principal/roles.
+// Roles, their definitions and keys are those as of the combined
+// checkpoint. Only live nodes are visible: a dangling placement, a
+// deleted item's included, grants nothing, and cyclic and implicit nodes
+// collect nothing (§B.11.2).
+func (v *visibility) Node(g *tree.Graph, n *tree.Node) bool { return v.viewOf(g).Node(n) }
+
+// Organising is Node as organising requests judge a node (§B.11.4,
+// §B.11.5), catvis.View.AsIfLive: a dangling placement is judged as if
+// its item were live, from the roles at it computed from the graph as a
+// live item's are (Effective; a deleted item's frozen rows aren't its
+// roles at the node), through its item's content namespace, which must
+// still be trusted. A cyclic or implicit node stays hidden: it collects
+// nothing (§B.5 Cycles, §B.9).
+func (v *visibility) Organising(g *tree.Graph, n *tree.Node) bool { return v.viewOf(g).AsIfLive(n) }
 
 // passes evaluates role r's rules and the key's scope rules against the
 // read envelope (counts), with /resource resource unless it is "".

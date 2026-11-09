@@ -47,3 +47,13 @@ func (s *Service) EpochsPending() bool {
 	var v string
 	return s.db.QueryRow(`SELECT v FROM meta WHERE k = 'epochs'`).Scan(&v) == nil
 }
+
+// BeforeListing sets f to run as each listing starts, outside the graph's
+// lock (tests: a checkpoint that moves meanwhile); nil unsets it.
+func (s *Service) BeforeListing(f func()) {
+	if f == nil {
+		s.beforeListing.Store(nil)
+		return
+	}
+	s.beforeListing.Store(&f)
+}
