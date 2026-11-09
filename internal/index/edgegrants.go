@@ -599,11 +599,16 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		ex, pn, err := ix.exchangeGrant(ctx, b, reached, now)
 		var le *grantcheck.LimitError
 		var ae *grant.AuthError
+		_, chain := chainErr(err)
 		switch {
 		case errors.As(err, &le):
 			if limit == nil {
 				limit = le
 			}
+		case chain:
+			// A requireAt chain the verifier can't read: 503 or 502,
+			// never a refusal (§C.4, writeUpstreamErr).
+			upErr = err
 		case errors.As(err, &ae):
 			if denied == nil || ae.Status == http.StatusUnauthorized && denied.Status != http.StatusUnauthorized {
 				denied = ae
@@ -737,7 +742,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 	// first 401 answering if nothing is left, else the first 403.
 	deny := func(err error) bool {
 		var ae *grant.AuthError
-		if !errors.As(err, &ae) {
+		if _, chain := chainErr(err); chain || !errors.As(err, &ae) {
 			return false
 		}
 		if denied == nil || ae.Status == http.StatusUnauthorized && denied.Status != http.StatusUnauthorized {

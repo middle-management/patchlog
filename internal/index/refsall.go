@@ -275,6 +275,11 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			// its document is 410 (§8.5), and it is left out as above.
 			continue
 		}
+		// A requireAt chain the verifier can't read is 503 or 502 for the
+		// whole answer, never a refusal (§C.4, writeUpstreamErr).
+		if _, ok := chainErr(err); ok {
+			return nil, err
+		}
 		// A private namespace the grant names verifies it (access): a
 		// refusal there is 401 if it doesn't verify, 403 once it does.
 		var ae *grant.AuthError
@@ -426,21 +431,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	}
 	rd, err := ix.refsReader(ctx, r, reached)
 	if err != nil {
-		if writeLimit(w, err) {
-			return
-		}
-		var ae *grant.AuthError
-		if errors.As(err, &ae) {
-			code := "forbidden"
-			if ae.Status == 401 {
-				code = "unauthenticated"
-				w.Header().Set("WWW-Authenticate", "Bearer")
-			}
-			w.Header().Set("Cache-Control", "no-store")
-			writeErr(w, ae.Status, code, ae.Msg)
-			return
-		}
-		ix.writeUpstreamErr(w, "access check for /_refs", err, "cannot read a namespace configuration")
+		ix.writeAccessErr(w, "access check for /_refs", err, "cannot read a namespace configuration")
 		return
 	}
 	setPtr := func() {

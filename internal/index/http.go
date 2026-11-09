@@ -377,25 +377,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		}
 	}
 	if err != nil {
-		if writeLimit(w, err) {
-			return
-		}
-		var ae *grant.AuthError
-		if errors.As(err, &ae) {
-			code := "forbidden"
-			if ae.Status == 401 {
-				code = "unauthenticated"
-				w.Header().Set("WWW-Authenticate", "Bearer")
-			}
-			w.Header().Set("Cache-Control", "no-store")
-			writeErr(w, ae.Status, code, ae.Msg)
-			return
-		}
-		if errors.Is(err, errNotReached) {
-			writeBehind(w, errNotReached.Error())
-			return
-		}
-		ix.writeUpstreamErr(w, "access check for "+ns, err, "cannot read the namespace configuration")
+		ix.writeAccessErr(w, "access check for "+ns, err, "cannot read the namespace configuration")
 		return
 	}
 	// A purged namespace answers as the core's URLs of it do, after the
@@ -691,6 +673,66 @@ var errMoving = errors.New("the index is applying the namespace's log: try again
 // (writeCoverErr).
 var errVisibility = errors.New("visibility")
 
+// writeAccessErr answers err, a failed read check (Index.access,
+// refsReader): 413 for a grant over a limit (writeLimit); a requireAt
+// chain the verifier can't read, whatever else err is, as
+// writeUpstreamErr answers it (§C.4: "never 403"); a refusal as such,
+// no-store; a namespace not reached yet behind; anything else as
+// writeUpstreamErr answers it, with msg.
+func (ix *Index) writeAccessErr(w http.ResponseWriter, what string, err error, msg string) {
+	if writeLimit(w, err) {
+		return
+	}
+	if _, ok := chainErr(err); ok {
+		ix.writeUpstreamErr(w, what, err, msg)
+		return
+	}
+	var ae *grant.AuthError
+	if errors.As(err, &ae) {
+		code := "forbidden"
+		if ae.Status == 401 {
+			code = "unauthenticated"
+			w.Header().Set("WWW-Authenticate", "Bearer")
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeErr(w, ae.Status, code, ae.Msg)
+		return
+	}
+	if errors.Is(err, errNotReached) {
+		writeBehind(w, errNotReached.Error())
+		return
+	}
+	ix.writeUpstreamErr(w, what, err, msg)
+}
+
+// chainUnreadable is an error of a grant check that couldn't read the
+// chain a requireAt key names (§C.4 requireAt), its ChainUnreadable
+// telling whether the cause is transient (a transport error, a deadline,
+// a 5xx, 408 or 429). grantcheck's chain error has this method; the index
+// matches it by the method alone.
+type chainUnreadable interface{ ChainUnreadable() bool }
+
+// chainErr reports whether err is a requireAt chain the verifier couldn't
+// read (ok), and whether for now (transient).
+func chainErr(err error) (transient, ok bool) {
+	var c chainUnreadable
+	if !errors.As(err, &c) {
+		return false, false
+	}
+	return c.ChainUnreadable(), true
+}
+
+// Answers to a requireAt chain the verifier can't read (§C.4: "503
+// (behind) while the cause is transient (§A.1), and 502 (upstream)
+// otherwise, naming no namespace, never 403"), and to a namespace
+// visibility reads not followed yet (§A.4 Private namespaces: 503 behind;
+// /principal hides catalog.trust, §7.4, so it names none either).
+const (
+	msgChainBehind   = "the chain a requireAt key names cannot be read yet (§C.4)"
+	msgChainUpstream = "cannot read the chain a requireAt key names (§C.4)"
+	msgMemberBehind  = "a namespace visibility reads is not reached yet (§A.4)"
+)
+
 // writeCoverErr answers a failure to compute a partial reader's view of a
 // namespace §B.11.9 covers (Index.cover): a refusal as such, no-store;
 // one of a namespace not reached yet, or purged meanwhile, behind; and a
@@ -699,7 +741,10 @@ var errVisibility = errors.New("visibility")
 // fetched yet (writeUpstreamErr).
 func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 	var ae *grant.AuthError
+	_, chain := chainErr(err)
 	switch {
+	case chain:
+		ix.writeUpstreamErr(w, "visibility in "+ns, err, "cannot read a namespace visibility reads (§B.11.9)")
 	case errors.As(err, &ae):
 		code := "forbidden"
 		if ae.Status == 401 {
@@ -726,14 +771,25 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 // unreachable) is 503
 // behind, with Retry-After (scenario 100: "While those keys only can't
 // yet be fetched → 503 behind", §12.1), as is a namespace visibility reads
-// whose follower holds no checkpoint yet (errMemberBehind, members.go).
-// Every read check and view this service answers 502 for passes through
-// here, so each gets the same answer.
+// whose follower holds no checkpoint yet (errMemberBehind, members.go),
+// whose name only the log gives (msgMemberBehind). A requireAt chain the
+// verifier can't read (chainErr) is 503 behind while the cause is
+// transient, else 502 upstream, each with a fixed message naming no
+// namespace (§C.4). Every read check and view this service answers 502
+// for passes through here, so each gets the same answer.
 func (ix *Index) writeUpstreamErr(w http.ResponseWriter, what string, err error, msg string) {
 	ix.opt.Logf("index: %s: %v", what, err)
+	if transient, ok := chainErr(err); ok {
+		if transient {
+			writeBehind(w, msgChainBehind)
+		} else {
+			writeErr(w, http.StatusBadGateway, "upstream", msgChainUpstream)
+		}
+		return
+	}
 	if errors.Is(err, errMemberBehind) {
 		// A namespace visibility reads not followed yet (members.go).
-		writeBehind(w, err.Error())
+		writeBehind(w, msgMemberBehind)
 		return
 	}
 	if errors.Is(err, client.ErrKeyFetch) && !lacksKey(context.Background(), err) {
