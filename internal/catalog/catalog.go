@@ -962,7 +962,7 @@ func (s *Service) configAt(g *tree.Graph, ns string, latest *grantcheck.Config) 
 
 func (s *Service) readRoles(cfg *grantcheck.Config) *readRoles {
 	out := &readRoles{roles: map[string]*readRole{}}
-	key := findKey(cfg.Keys, s.opt.Kid)
+	key := s.contentKey(cfg.Keys)
 	if key == nil || !key.IsStar() && !contains(key.Can, "read") {
 		return out
 	}
@@ -1042,7 +1042,8 @@ type visEntry struct {
 // catalogOf is g's catvis.Catalog: the one visibility test (§B.11.5)
 // that the service and the origin's filtered reads share (§B.11.9). Its
 // content namespaces are those g trusts, with their documents as of the
-// checkpoint (Graph.Content), parsed (parsed), and the catalog's key. The
+// checkpoint (Graph.Content), parsed (parsed), and the catalog's key where
+// it is one (contentKey) and the document's catalogs names the catalog. The
 // graph changes in place, so it is built again after each of the hook's
 // calls (gen) and when a document is replaced. Call it under View; don't
 // keep it past it.
@@ -1059,7 +1060,17 @@ func (s *Service) catalogOf(g *tree.Graph) *catvis.Catalog {
 	for ns := range g.Trust {
 		if c := g.Content[ns]; c != nil {
 			content[ns] = c
-			contents[ns] = &catvis.Content{NS: ns, Cfg: s.parsed(c).cfg, Kids: []string{s.opt.Kid}}
+			cfg := s.parsed(c).cfg
+			// The catalog's key counts only in a member that trusts the
+			// catalog back, through a key whose requireAt names it
+			// (contentKey; §B.11.3, §B.11.9 Where): only such members'
+			// roles count, for its folders too. Every member's roles and
+			// keys still decide its subjects (Profile).
+			var kids []string
+			if cfg != nil && namesCatalog(c.Doc, g.Catalog) && s.contentKey(cfg.Keys) != nil {
+				kids = []string{s.opt.Kid}
+			}
+			contents[ns] = &catvis.Content{NS: ns, Cfg: cfg, Kids: kids}
 		}
 	}
 	e = &visEntry{g: g, gen: gen, content: content, c: catvis.NewCatalog(g, contents)}
@@ -1176,6 +1187,14 @@ func nonNilAny(xs []any) []any {
 		return []any{}
 	}
 	return xs
+}
+
+// namesCatalog reports whether a content namespace's document's catalogs
+// names cat (§B.11.9 Where).
+func namesCatalog(doc map[string]any, cat string) bool {
+	cs, _ := doc["catalogs"].(map[string]any)
+	_, ok := cs[cat]
+	return ok
 }
 
 func findKey(ks []grant.Key, kid string) *grant.Key {
