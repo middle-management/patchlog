@@ -43,8 +43,9 @@ type KeyringEntry struct {
 const wrappedLen = hpkeNenc + KeySize + 16
 
 // ParseKeyringV2 parses a keyring document (a model value or JSON text) and
-// checks its shape (§E.3.2): an object with `keys` and at most a string
-// `$nonce` besides; entries that are objects of exactly kid, to, from and
+// checks its shape (§E.3.2): an object with `keys` and at most a fresh
+// `$nonce` (§C.7: 26 lowercase base32 characters, ValidNonce) besides;
+// entries that are objects of exactly kid, to, from and
 // wrapped; a kid "{ns}#{e}", thumbprints of 43 base64url characters, a
 // wrapped of base64url decoding to enc ‖ ct of a 32-byte key; and no two
 // entries for one kid and to. Errors wrap ErrFormat. Whether kid names the
@@ -69,8 +70,8 @@ func ParseKeyringV2(v any) (*KeyringV2, error) {
 		switch k {
 		case "keys":
 		case "$nonce":
-			if kr.Nonce, ok = x.(string); !ok {
-				return bad("$nonce is not a string")
+			if kr.Nonce, ok = x.(string); !ok || !ValidNonce(kr.Nonce) {
+				return bad("$nonce is not of the fresh form (§C.7)")
 			}
 		default:
 			return bad("member %q: a keyring has only keys and $nonce", k)

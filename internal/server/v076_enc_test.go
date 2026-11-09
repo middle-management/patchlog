@@ -1,9 +1,11 @@
 package server
 
 import (
+	"crypto/ecdh"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // §1 Conformance, §G.5.2, §12.1 (v0.76, B-63): remote branch R of A's N,
@@ -44,4 +46,22 @@ func TestV076EncFailedRaiseIs502(t *testing.T) {
 	upstream("read through rx", b.get("/r/rx/x/rev/"+x))
 	upstream("PATCH with a test op", b.write("PATCH", "r", "x", x, ops(op("test", "/v", 1.0))))
 	expect(t, b.purge("r", "y", y, "admin"), 204)
+}
+
+// §E.3.2, §C.7 (v0.76): in an e2e namespace, a keyring write whose
+// document carries a $nonce that isn't of the fresh form is 422 invalid;
+// a fresh one is written.
+func TestV076EncKeyringNonceFresh(t *testing.T) {
+	t.Parallel()
+	f := newE2E(t)
+	e := f.tenv
+	_, admin, _ := seal.GenerateRecipient()
+	readerPub, _ := seal.ParseRecipientJWK(f.readerJWK)
+	kr, err := seal.BuildKeyringV2(admin, "e", 1, seal.NewKey(), []*ecdh.PublicKey{admin.PublicKey(), readerPub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := kr.Value()["keys"]
+	expectCode(t, e.write("PATCH", "e", "keyring", "", addRoot(map[string]any{"keys": keys, "$nonce": "not-a-nonce"}), f.adminG), 422, "invalid")
+	e.create("e", "keyring", map[string]any{"keys": keys, "$nonce": seal.NewNonce()}, f.adminG)
 }
