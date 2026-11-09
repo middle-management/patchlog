@@ -489,10 +489,10 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	if old != nil {
 		atA, atTarget = old, base(old, ns)+"/at/"+at+derived.CanonicalQuery(vals, "min")
 	}
-	// elsewhere is the query a redirect to another at sends (§A.4): an
-	// after naming a resource is kept, applied to the new result, and an
-	// opaque one, a position in this at's result, is dropped, starting
-	// again.
+	// elsewhere is the query a redirect from the head pointer or to
+	// another at sends (§A.4): an after naming a resource is kept, applied
+	// to the new result, and an opaque one, a position in some at's
+	// result, is dropped, starting again.
 	elsewhere := func() (url.Values, *Query) {
 		if q.ByName() || !vals.Has("after") {
 			return vals, q
@@ -577,11 +577,13 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// resolved as redirect, as §A.4 shows; §A.5), with the result
 		// computed there and kept, so the redirect is answered even if the
 		// checkpoint moves on before it is followed. If it can't be
-		// computed, the at URL says why. From an at URL to another at, an
-		// opaque after is dropped (elsewhere); the head pointer names no
-		// at, and passes the query on whole.
+		// computed, the at URL says why. From the head pointer, or from an
+		// at URL to another at, an opaque after is dropped (elsewhere,
+		// §A.4: "A redirect from a head pointer or to another at ...
+		// drops an opaque one, starting again"); a redirect to the same at
+		// keeps it.
 		rv, rq := vals, q
-		if isAt && at != cur {
+		if !isAt || at != cur {
 			rv, rq = elsewhere()
 		}
 		to := cur

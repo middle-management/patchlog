@@ -138,8 +138,8 @@ func TestV074V03ForeignMinStrict(t *testing.T) {
 
 // SERVICES-4 (§A.4): a redirect to another at keeps an after naming a
 // resource, applied to the new result, and drops an opaque one (a q or
-// sort query's position), starting again. A redirect to the same at, or
-// the head pointer's, passes the query on whole.
+// sort query's position), starting again, as the head pointer's does
+// since v0.77. A redirect to the same at passes the query on whole.
 func TestV074V03RedirectDropsOpaqueAfter(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -158,8 +158,11 @@ func TestV074V03RedirectDropsOpaqueAfter(t *testing.T) {
 		{"/matches/at/" + old + "?after=1&limit=1&sort=%2Ftitle", "/matches/at/" + cur + "?limit=1&sort=%2Ftitle"},
 		// By name: kept.
 		{"/matches/at/" + old + "?after=a1&limit=1", "/matches/at/" + cur + "?after=a1&limit=1"},
-		// The head pointer names no at: the query passes whole.
-		{"/matches?after=1&limit=1&q=word", "/matches/at/" + cur + "?after=1&limit=1&q=word"},
+		// The head pointer drops it too (v0.77, §A.4: "A redirect from a
+		// head pointer or to another at ... drops an opaque one").
+		{"/matches?after=1&limit=1&q=word", "/matches/at/" + cur + "?limit=1&q=word"},
+		// And keeps one naming a resource.
+		{"/matches?after=a1&limit=1", "/matches/at/" + cur + "?after=a1&limit=1"},
 	} {
 		r := s.raw(c.url, "")
 		if r.status != 302 || r.header.Get("Location") != c.want {

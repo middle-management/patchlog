@@ -401,7 +401,9 @@ func TestV073Paging(t *testing.T) {
 		if next == "" || strings.ContainsAny(next, "/?") {
 			t.Fatalf("%s: next is not a position: %v", q, b["next"])
 		}
-		b = x.expect("/items?after="+url.QueryEscape(next)+"&limit=2&"+q, rest)
+		// The next page is asked at the page's at: the head pointer drops
+		// an opaque after (v0.77, §A.4).
+		b = x.expect("/items/at/"+b["at"].(string)+"?after="+url.QueryEscape(next)+"&limit=2&"+q, rest)
 		if _, ok := b["next"]; ok {
 			t.Errorf("%s: next on the last page: %v", q, b["next"])
 		}
