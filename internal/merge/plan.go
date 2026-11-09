@@ -347,6 +347,9 @@ type Plan struct {
 	// available (name/bid).
 	unrestricted *bool
 	copied       map[string]bool
+	// applied: Apply wrote the batch, so its items are recorded in the
+	// target (Unrecorded).
+	applied bool
 }
 
 // Pair is a common ancestor from an earlier merge batch (§F.3): the branch

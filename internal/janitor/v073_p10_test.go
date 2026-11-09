@@ -410,11 +410,12 @@ func TestV073EveryChangeMerged(t *testing.T) {
 	mergeOnly(e.s.Client(t, client.WithAuthor("bob")), "r9", "mug")
 	must(e.c.Append(ctx, "matches", "mug", must(e.c.Head(ctx, "matches", "mug")).ID, []any{op("replace", "/n", 3)}))
 	must(merge.Freeze(ctx, e.c, "r9", mergeOnly(e.c, "r9")))
-	// r10's replay into its successor leaves pot out.
+	// r10's replay into its successor leaves pot out, which a person
+	// gives up for the switch (LeaveOut, §F.5 since v0.77).
 	e.branch("matches", "r10", map[string]any{"superseded": "P1D"})
 	doc("r10", "pan")
 	doc("r10", "pot")
-	must(merge.Rebase(ctx, e.c, merge.RebaseOptions{Branch: "r10", New: "r10-b", Switch: true, Plan: merge.Options{Resources: []string{"pan"}}}))
+	must(merge.Rebase(ctx, e.c, merge.RebaseOptions{Branch: "r10", New: "r10-b", Switch: true, LeaveOut: true, Plan: merge.Options{Resources: []string{"pan"}}}))
 
 	e.s.Clock.Advance(2 * day)
 	ds := e.sweep(false)

@@ -47,7 +47,7 @@ const releaseUsage = `usage:
   patchlog merge release plan|approve|apply|status -api URL [-bearer T] [-author A] [-state-ns NS]
           [-catalog-service CAT=URL]... [-merge-bearer G] [-split KEY/NODE=narrow.json]... [-accept-placement NS.NAME]...
           [-resolve KEY/NAME=file.json]... [-source-grant G]... [-digest D] [-dry-run] [-json] /r/{ns}/{release}
-  patchlog merge release rebase -api URL -suffix SUFFIX [-at ID] [-identity key.jwk]... [-reader pub.jwk]... [-bearer T] [-author A] [-json] /r/{ns}/{release}
+  patchlog merge release rebase -api URL -suffix SUFFIX [-at ID] [-leave-out] [-identity key.jwk]... [-reader pub.jwk]... [-bearer T] [-author A] [-json] /r/{ns}/{release}
   patchlog merge release abandon -api URL [-bearer T] [-author A] [-state-ns NS] /r/{ns}/{release}`
 
 func releaseCmd(args []string) {
@@ -68,6 +68,7 @@ func releaseCmd(args []string) {
 	dry := fs.Bool("dry-run", false, "plan: report only, store nothing")
 	suffix := fs.String("suffix", "", "rebase: successor names are each branch's name plus this suffix")
 	at := fs.String("at", "", "rebase: the new release document's combined checkpoint (§B.5), if known")
+	leaveOut := fs.Bool("leave-out", false, "rebase: each branch's switch, "+strings.TrimPrefix(leaveOutHelp, "with -switch: "))
 	digest := fs.String("digest", "", "approve: the plan digest you reviewed (plan prints it); approval fails unless planning again gives it (§F.9)")
 	mergeBearer := fs.String("merge-bearer", "", "the merge service's own grant for catalogs, sent to catalog services as Authorization (§F.8); its root sub is the via of narrowed admin grants")
 	var catSvcs, splits, accepts, resolves, srcGrants, identities, readers multi
@@ -99,7 +100,7 @@ func releaseCmd(args []string) {
 		if err != nil {
 			toolFatal(err)
 		}
-		res, err := merge.RebaseRelease(ctx, c, merge.RebaseReleaseOptions{Release: link, Suffix: *suffix, At: *at, SuccessorReaders: succReaders,
+		res, err := merge.RebaseRelease(ctx, c, merge.RebaseReleaseOptions{Release: link, Suffix: *suffix, At: *at, LeaveOut: *leaveOut, SuccessorReaders: succReaders,
 			Plan: merge.Options{E2E: e2eView(c, identities), Signer: tf.signer()}})
 		if *tf.asJSON {
 			out := map[string]any{"result": res}
@@ -115,6 +116,7 @@ func releaseCmd(args []string) {
 						if !r.First.Clean() {
 							printPlan(r.First)
 						}
+						printLeftOut(r, br)
 					}
 				}
 			}
@@ -134,6 +136,10 @@ func releaseCmd(args []string) {
 		}
 		if errors.Is(err, merge.ErrConflicts) {
 			fmt.Fprintln(os.Stderr, "stopped on conflicts: resolve them with `patchlog merge apply -base SUCCESSOR -branch OLD -resolve …`, then run rebase again")
+			os.Exit(1)
+		}
+		if errors.Is(err, merge.ErrLeftOut) {
+			fmt.Fprintf(os.Stderr, "error: %v\nrecord them in the successor and run rebase again, or give them up with -leave-out (§F.5)\n", err)
 			os.Exit(1)
 		}
 		if err != nil {

@@ -35,6 +35,10 @@ type RebaseReleaseOptions struct {
 	// doesn't know, which a switch would otherwise drop
 	// (ErrReadersDropped, §F.8.1, §E.3.2).
 	SuccessorReaders []*ecdh.PublicKey
+	// LeaveOut is passed to each Rebase (RebaseOptions.LeaveOut): a
+	// person gives up the resources a replay leaves unrecorded in a
+	// successor, which then switches all the same (§F.5).
+	LeaveOut bool
 }
 
 // RebaseReleaseResult reports what RebaseRelease did.
@@ -118,7 +122,7 @@ func RebaseRelease(ctx context.Context, c *client.Client, opt RebaseReleaseOptio
 		sort.Slice(others, func(i, j int) bool { return others[i].(string) < others[j].(string) })
 		br := rel.Doc.Branches[k].NS
 		out.Order = append(out.Order, br)
-		res, err := Rebase(ctx, c, RebaseOptions{Branch: br, New: succ[k], Switch: true, Plan: popt, SuccessorReaders: opt.SuccessorReaders,
+		res, err := Rebase(ctx, c, RebaseOptions{Branch: br, New: succ[k], Switch: true, LeaveOut: opt.LeaveOut, Plan: popt, SuccessorReaders: opt.SuccessorReaders,
 			Patches: []any{map[string]any{"op": "add", "path": "/drafts", "value": map[string]any{"for": others}}},
 			Prepare: func(ctx context.Context, p *Plan) error { return squashDrafts(ctx, c, p, out.Drafts, out.Squashed, k) },
 		})
@@ -136,7 +140,7 @@ func RebaseRelease(ctx context.Context, c *client.Client, opt RebaseReleaseOptio
 	for _, k := range otherKeys {
 		br := rel.Doc.Branches[k].NS
 		out.Order = append(out.Order, br)
-		res, err := Rebase(ctx, c, RebaseOptions{Branch: br, New: succ[k], Switch: true, Plan: popt, SuccessorReaders: opt.SuccessorReaders,
+		res, err := Rebase(ctx, c, RebaseOptions{Branch: br, New: succ[k], Switch: true, LeaveOut: opt.LeaveOut, Plan: popt, SuccessorReaders: opt.SuccessorReaders,
 			Prepare: func(ctx context.Context, p *Plan) error { return squashDrafts(ctx, c, p, out.Drafts, out.Squashed, k) },
 		})
 		out.Rebases[k] = res
