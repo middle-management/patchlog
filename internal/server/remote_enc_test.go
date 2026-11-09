@@ -68,9 +68,12 @@ func TestRemoteBranchSealed(t *testing.T) {
 	b := newEnv(t, withOrigin(originB), withRemote(rt, withRemoteIdentity(&mu, &id)), withKeyStore(newKeyStore(t)), withEncTuning, withPath(path))
 
 	sealed := map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}}
-	// Without the identity, the wrapped keys can't be opened.
+	// Without the identity, the wrapped keys can't be opened: B lacks
+	// them (v0.76: a wrapped key no recipient key opens is lacking, as
+	// client.ErrNoKeys), so it can't read the source's namespace
+	// document, 422 (§G.5.2).
 	r := b.mkRemote("rel", remoteGenesis("s", at, sealed))
-	expectCode(t, r, 502, "upstream")
+	expectCode(t, r, 422, "invalid")
 	expect(t, b.get("/ns/rel"), 404)
 	mu.Lock()
 	id = bPriv
