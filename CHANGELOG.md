@@ -5,9 +5,10 @@
 Implements spec **v0.77**: its answers to the reference's notes on v0.76. `GET /` answers
 `"spec": "0.77"`. The upgrade was done in five packages: the origin's filtered reads and remote
 branches; the search index; the grant checker and the shared client and follow libraries; the
-tree and catalog services; and undo, rebase and the WebDAV gateway. The one schema change is the
+tree and catalog services; and undo, rebase and the WebDAV gateway. The schema changes are the
 core's migration `014_remote_pending_sealings` (sealings of pre-raise content a remote branch
-still has to fetch from its base), on SQLite and Postgres. Where the spec leaves a question open,
+still has to fetch from its base), on SQLite and Postgres, and the index's migration
+`009_catalog_trust` (the last `catalog.trust` it applied for each catalog). Where the spec leaves a question open,
 the reference implements the reading noted here and in
 [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.77").
 
@@ -70,6 +71,10 @@ the reference implements the reading noted here and in
   timeouts) or `502` (`5xx`, core unreachable) and writes nothing. The core's `408` and request
   timeouts now map to `503` instead of `502` in every answer.
 
+- **`gs` values change** (§B.11.9 gs). The `scope:{digest}` subject of a filtered read's `gs`
+  is now §A.4's marker digest, which includes the key's `key:` string, at the origin and the
+  index alike. A `g:` cookie the index issued before is `403` until the reader exchanges again.
+
 **New:**
 - Remote branches of end-to-end sources raised from sealed (§G.3 Creating one, §G.5.2):
   - B no longer stores a source sealing of pre-raise content it hasn't opened and verified.
@@ -122,6 +127,15 @@ the reference implements the reading noted here and in
   left only in the frozen branch with `merge.ErrLeftOut`.
 - WebDAV gateway: a core request that times out or is cancelled is answered `503` with
   `Retry-After` (§H.4 Answers).
+- Tree service: a listing is never computed, kept or served under the catalog's encryption as
+  it was before a raise to sealed or end-to-end that applied while the listing was being
+  computed. Before (also in v0.25.0), such a listing could show titles, born dates and nodes
+  written after the raise in the clear, and keep them, immutable in a public catalog. A listing
+  read before a purge of what it shows (§A.1) is no longer served either: it is computed again,
+  and if it keeps losing to purges the answer is `503 behind`.
+- Index: a purged catalog counts for a namespace's coverage only if the last `catalog.trust`
+  the index applied for it listed that namespace, as at the origin (§B.11.9 Where); a catalog
+  whose documents the index never applied counts as no catalog.
 
 ## v0.25.0
 

@@ -20,12 +20,13 @@ remains (10, 12, 18, 24, 29, 32).
 
 1. **A purged catalog's coverage** (§B.11.9 Where; was v0.76 Open 6). A purged catalog keeps
    the namespaces that trust it covered, with nothing visible. The origin reads the catalog's
-   last stored `catalog.trust`; the index keeps no last document of it, so it counts a catalog a
-   namespace names in `catalogs` through a `requireAt` key as trusted (and dark), which can cover
-   a namespace the catalog's trust never listed, showing no more than `403` would. A catalog
+   last stored `catalog.trust`; the index now keeps the last `catalog.trust` it applied for each
+   catalog (migration `009_catalog_trust`) and uses that, and counts a purged catalog whose
+   documents it never applied as no catalog (uncovered). A catalog
    whose only trusting member is purged, and a branch whose root is purged, are still uncovered
-   (the catalog-kind branch skips a purged `catalog.trust` member). *Question:* does coverage
-   read the purged catalog's last document, or is naming it through a key enough? Does a purged
+   (the catalog-kind branch skips a purged `catalog.trust` member). *Question:* must a service
+   keep the last `catalog.trust` of each catalog it follows, or may it treat a purged catalog it
+   never read as no catalog? Does a purged
    member still count for a catalog's coverage? Can a `requireAt` chain whose namespace is
    purged still be read (a grant of such a key now fails `502`, so a purged catalog's coverage
    may never be reached)?
@@ -239,6 +240,14 @@ remains (10, 12, 18, 24, 29, 32).
 42. **The index's range filters** (§A.4; was v0.76 Open 53, v0.74 Open 44). `gt`, `ge`, `lt` and `le` with a
     `sort` mark remain the reference's own (`internal/index/query.go`). *Propose:* specify or
     drop them.
+43. **`scope:{digest}` in a `gs`** (§B.11.9 gs, §A.4). "of §A.4's marker" is read as the
+    marker digest, which covers the key's `key:` string, though `key:` is also its own subject;
+    the origin and index both use it, so `gs` values changed this release. *Question:* or did
+    the authors mean the rules-only digest?
+44. **How many recomputes before `503 behind`** (§A.1, §B.5). A tree listing or index result
+    that keeps losing to purges, or to a raise between reading the encryption and computing, is
+    computed again up to three times, then `503 behind` with `Retry-After: 1`, `no-store`.
+    *Propose:* say a service may answer `behind` after a bounded number of tries.
 
 ## Settled in v0.77
 
