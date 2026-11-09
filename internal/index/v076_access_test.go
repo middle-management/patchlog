@@ -126,3 +126,43 @@ func TestV076AccessForeignRefsVerified(t *testing.T) {
 		}
 	}
 }
+
+// TestV076AccessExchangePurged (§A.4 Across namespaces: the exchange
+// refuses "only as Coverage says", and Coverage "leaves out ... purged
+// ones"; "Only a reader who may see none of the namespaces gets 401 or
+// 403"): a grant naming pa, which it reads, and pb, purged, is exchanged
+// for pa's prefixes alone, as one naming an unreadable pb is; once pa is
+// unreadable too, nothing is left but the purge and a 403, and the
+// answer is 403, the purged namespace left out as at /_refs. Only a
+// grant whose refusals are all purges is 410 (TestV073P37ExchangePurged).
+// Before, the purge refused the whole exchange with 410.
+func TestV076AccessExchangePurged(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	op := w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "user:root", []string{"pa", "pb"}, []string{"read", "config", "purge-ns"})))
+	cfg := must(op.NSHead(ctx, "pb")).Config
+	must(op.PatchConfig(ctx, "pb", cfg, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	must(op.PurgeNamespace(ctx, "pb", must(op.NSHead(ctx, "pb")).ID))
+	amy := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"pa", "pb"}, []string{"read"})
+	waitFor(t, "the index to apply the purge of pb", func() bool {
+		w.x.ix.ExpireGrantChecks()
+		return w.x.raw("/pb?limit=5", amy).status == 410
+	})
+	prefixes, cookies := w.exchange(t, w.x, amy)
+	if _, ok := prefixes["pb"]; ok || prefixes["pa"] != "/pa/g/"+w.x.gsOf("pa", amy) || len(prefixes) != 2 {
+		t.Fatalf("prefixes %v, want /pa/g/%s and /_refs/g/… alone", prefixes, w.x.gsOf("pa", amy))
+	}
+	if prefixes["_refs"] != "/_refs/g/"+grantcheck.SubjectSetID([]string{"reads:pa"}) {
+		t.Errorf("/_refs prefix %s, want the gs over pa's marker alone", prefixes["_refs"])
+	}
+	if got, _ := p37Follow(t, w.x, prefixes["pa"], cookies, ""); got.status != 200 || strings.Join(p37Hits(got.body), ",") != "a,b" {
+		t.Errorf("pa under the cookie: %d %v", got.status, got.body)
+	}
+	must(op.PatchConfig(ctx, "pa", must(op.NSHead(ctx, "pa")).Config, []any{map[string]any{"op": "replace", "path": "/keys/1", "value": w.issuer.Entry("append")}}))
+	w.x.caughtUp("pa")
+	w.x.ix.ExpireGrantChecks()
+	if r := p37Do(t, w.x, "POST", "/edge-grants", amy, "", nil, ""); r.status != 403 || r.body["code"] != "forbidden" || len(r.cookies) != 0 {
+		t.Errorf("pa unreadable, pb purged: %d %v (%d cookies)", r.status, r.body, len(r.cookies))
+	}
+}

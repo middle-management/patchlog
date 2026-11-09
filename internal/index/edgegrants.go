@@ -543,9 +543,10 @@ type exchanged struct {
 // it answers all or nothing (§C.5.2): a grant over grantSize or
 // rulesPerGrant is 413 limit (§C.8); a grant left with no edge grant is
 // refused 401 if any such is 401, else 403, and 502 if a namespace
-// document a grant names can't be read; once none is, a purged namespace
-// a grant names and verifies in is 410 purged, with ns and head naming the
-// first in the order the grants and their root blocks list them (§8.5).
+// document a grant names can't be read; once none is, a grant left with
+// no edge grant whose only refusals are purges is 410 purged, with ns and
+// head naming the first in the order the grants and their root blocks
+// list them (§8.5).
 // More than maxPrefixes prefixes is 400.
 // Once nothing is refused, it draws one token from the exchangeRate
 // bucket of each distinct principal among the grants (ExchangeRate,
@@ -709,10 +710,12 @@ type purgedNS struct{ ns, head string }
 // else 403 (Coverage: "Only a reader who may see none of the namespaces
 // gets 401 or 403"). A namespace whose document the service can't read
 // refuses the whole exchange (502, err), the first in the order the
-// grant's root block names them (§C.5.2); otherwise a purged namespace
-// the grant passes the read check of, the service's own purged state
+// grant's root block names them (§C.5.2). A purged namespace the grant
+// passes the read check of, by the service's own purged state
 // (Index.committed, as its queries answer) or the core's 410 of a sealed
-// one's document (§8.5), refuses it as pn names, the first such.
+// one's document (§8.5), is left out too (Coverage "leaves out ...
+// purged ones"); a grant left with no edge grant and no 401 or 403
+// refusal, only purged ones, is refused as pn names, the first such.
 func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[string]string, now time.Time) (ex *exchanged, pn *purgedNS, err error) {
 	g, err := ix.checker.Decode(token)
 	if err != nil {
@@ -815,11 +818,8 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			}
 		}
 	}
-	switch {
-	case upErr != nil:
+	if upErr != nil {
 		return nil, nil, upErr
-	case pn != nil:
-		return nil, pn, nil
 	}
 	if len(markers) > 0 {
 		gs := grantcheck.SubjectSetID(markers)
@@ -832,6 +832,8 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		return ex, nil, nil
 	case denied != nil:
 		return nil, nil, denied
+	case pn != nil:
+		return nil, pn, nil
 	}
 	return nil, nil, &grant.AuthError{Status: 403, Msg: "the grant reads no private namespace this service follows"}
 }
