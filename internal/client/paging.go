@@ -24,6 +24,23 @@ import (
 // entry ("" for none). next is the since of the following page, or "" when
 // the page ends at to.
 func (c *Client) logPage(ctx context.Context, path, since, to string, decode func(r *response, end string) (last string, err error)) (next string, err error) {
+	return c.logPageMode(ctx, path, since, to, false, decode)
+}
+
+// filteredLogPage fetches one page of a filtered range (§B.11.9 Log
+// ranges), whose end the client learns from the answer's
+// X-Namespace-Revision rather than the URL: a page holds only the visible
+// entries among those it scanned, possibly none, and X-Log-Next names the
+// last entry scanned, visible or not, on every page but the last. So the
+// page's last entry needn't be X-Log-Next, an empty page may name one,
+// and a page without it ends the range. decode's end is X-Log-Next, ""
+// on the last page. X-Log-Next must still be an id, and must move past
+// since.
+func (c *Client) filteredLogPage(ctx context.Context, path, since string, decode func(r *response, end string) (last string, err error)) (next string, err error) {
+	return c.logPageMode(ctx, path, since, "", true, decode)
+}
+
+func (c *Client) logPageMode(ctx context.Context, path, since, to string, filtered bool, decode func(r *response, end string) (last string, err error)) (next string, err error) {
 	var q url.Values
 	if since != "" {
 		q = url.Values{"since": {since}}
@@ -48,6 +65,12 @@ func (c *Client) logPage(ctx context.Context, path, since, to string, decode fun
 	last, err := decode(r, end)
 	if err != nil {
 		return "", err
+	}
+	if filtered {
+		if next == since && next != "" {
+			return "", fmt.Errorf("client: %s: X-Log-Next %s doesn't move past since (§B.11.9)", r.path, next)
+		}
+		return next, nil
 	}
 	if last == "" {
 		last = since
