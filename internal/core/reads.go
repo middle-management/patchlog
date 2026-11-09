@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,22 +79,41 @@ func (t *tx) listHeads(n *nsRow, asOf *int64) []headItem {
 
 // namesAfter returns up to k distinct names of n's resources, including
 // those of its bases (read-through), greater than after in ascending byte
-// order. Each level answers its own k smallest from the (ns, name) index,
-// and the union's k smallest are the answer. Postgres compares and orders
-// under the "C" collation, which is byte order, as SQLite's BINARY is.
-func (t *tx) namesAfter(n *nsRow, after string, k int) []string {
-	q := `SELECT name FROM resources WHERE ns = ? AND name > ? ORDER BY name LIMIT ?`
+// order: namesIn without a prefix.
+func (t *tx) namesAfter(n *nsRow, after string, k int) []string { return t.namesIn(n, after, "", k) }
+
+// namesIn returns up to k distinct names of n's resources, including those
+// of its bases (read-through), greater than after and, if prefix isn't "",
+// starting with it (§7.4 ?prefix=), in ascending byte order. Each level
+// answers its own k smallest from the (ns, name) index, bounded below by
+// the larger of after and prefix and above by prefixEnd, and the union's k
+// smallest are the answer. Postgres compares and orders under the "C"
+// collation, which is byte order, as SQLite's BINARY is.
+func (t *tx) namesIn(n *nsRow, after, prefix string, k int) []string {
+	col := "name"
 	if t.e.pg {
-		q = `SELECT name FROM resources WHERE ns = ? AND name COLLATE "C" > ? ORDER BY name COLLATE "C" LIMIT ?`
+		col = `name COLLATE "C"`
 	}
+	q, args := `SELECT name FROM resources WHERE ns = ? AND `+col+` > ?`, []any{after}
+	if prefix != "" {
+		if prefix > after {
+			// An after below the prefix starts at it (§7.4).
+			q, args = `SELECT name FROM resources WHERE ns = ? AND `+col+` >= ?`, []any{prefix}
+		}
+		q += ` AND ` + col + ` < ?`
+		args = append(args, prefixEnd(prefix))
+	}
+	q += ` ORDER BY ` + col + ` LIMIT ?`
 	names := map[string]bool{}
 	for m := n; ; m = t.nsByID(m.base.Int64) {
-		rows, err := t.Query(q, m.id, after, k)
+		rows, err := t.Query(q, append(append([]any{m.id}, args...), k)...)
 		t.must(err)
 		for rows.Next() {
 			var s string
 			t.must(rows.Scan(&s))
-			names[s] = true
+			if strings.HasPrefix(s, prefix) {
+				names[s] = true
+			}
 		}
 		rows.Close()
 		if !m.isBranch() {
@@ -108,16 +127,30 @@ func (t *tx) namesAfter(n *nsRow, after string, k int) []string {
 	return sorted
 }
 
+// prefixEnd is the least string above every string starting with prefix,
+// a resource name (§3.6): its last byte incremented, which stays ASCII.
+func prefixEnd(prefix string) string {
+	b := []byte(prefix)
+	b[len(b)-1]++
+	return string(b)
+}
+
 // pageHeads lists at most limit resources of n as of asOf (nil = now)
 // with names after after, in ascending byte order, and the name to resume
-// after when more follow (§7.4). It resolves only the names the page
-// needs, so a page costs its own size, not the namespace's: names are
-// fetched in chunks, skipping those with no head at asOf, until the page
-// is full and one more resource is known to exist.
+// after when more follow (§7.4): pageHeadsIn without a prefix.
 func (t *tx) pageHeads(n *nsRow, asOf *int64, after string, limit int) (out []headItem, next string) {
+	return t.pageHeadsIn(n, asOf, after, "", limit)
+}
+
+// pageHeadsIn is pageHeads of the names starting with prefix ("" for all,
+// §7.4 ?prefix=). It resolves only the names the page needs, so a page
+// costs its own size, not the namespace's: names are fetched in chunks,
+// skipping those with no head at asOf, until the page is full and one more
+// resource is known to exist, so next stays absent on the last page.
+func (t *tx) pageHeadsIn(n *nsRow, asOf *int64, after, prefix string, limit int) (out []headItem, next string) {
 	chunk := limit + 1
 	for {
-		names := t.namesAfter(n, after, chunk)
+		names := t.namesIn(n, after, prefix, chunk)
 		t.prefetchHeads(n, names, asOf)
 		for _, name := range names {
 			v := t.resolve(n, name, asOf)
@@ -625,15 +658,33 @@ type NSInfo struct {
 	JWE    string // sealed namespaces (Addendum E.2): the sealed document
 }
 
-// NamespaceHead returns the namespace head and config ids.
+// NamespaceHead returns the namespace head and config ids. A partial
+// reader of a namespace §B.11.9 covers gets them too, the head pointer of
+// §7.4, though the revision it names stays 403 to it (§B.11.9 Answers).
 func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials) (*NSInfo, error) {
+	return e.namespaceHead(ctx, ns, cred, false)
+}
+
+// NamespaceLogHead is NamespaceHead for GET /ns/{ns}/log without live,
+// redirected to the range /ns/{ns}/rev/{head}/log: a partial reader of a
+// namespace §B.11.9 covers gets a *FilteredRedirect to the filtered range
+// at the current at instead (§B.11.9 URLs).
+func (e *Engine) NamespaceLogHead(ctx context.Context, ns string, cred Credentials) (*NSInfo, error) {
+	return e.namespaceHead(ctx, ns, cred, true)
+}
+
+func (e *Engine) namespaceHead(ctx context.Context, ns string, cred Credentials, redirect bool) (*NSInfo, error) {
 	var out *NSInfo
-	err := e.read(ctx, func(t *tx) error {
+	err := e.filteredRead(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.nsReader(n, cred); err != nil {
+		if redirect {
+			if _, err := t.nsReaderOrRedirect(n, cred); err != nil {
+				return err
+			}
+		} else if _, _, _, err := t.nsAccess(n, cred); err != nil {
 			return err
 		}
 		out = &NSInfo{
@@ -735,7 +786,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 	var out *Log
 	var jobs []*sealJob
 	var nsRowID int64
-	err := e.read(ctx, func(t *tx) error {
+	err := e.filteredRead(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		var a *actor
 		var aerr *Error
@@ -752,8 +803,16 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 				return aerr
 			}
 		default:
-			if a, aerr = t.nsReader(n, cred); aerr != nil {
-				return aerr
+			// A partial reader is redirected to the filtered form: a range
+			// at the current at, events and long-poll without one (§B.11.9
+			// URLs).
+			var err error
+			if a, err = t.nsReaderOrRedirect(n, cred); err != nil {
+				var fr *FilteredRedirect
+				if errors.As(err, &fr) && (perEntry || live != nil) {
+					fr.At, fr.CP = "", nil
+				}
+				return err
 			}
 			if live != nil {
 				live.decided(t, n, cred, a)
@@ -798,7 +857,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		if n.purged && resource == "" && (perEntry || live != nil) && since != "" && fromSeq == n.headSeq.Int64 {
 			return t.purgedRead(n)
 		}
-		q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures, via FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
+		q := `SELECT ` + nsLogCols + ` FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
 		args := []any{n.id, fromSeq, toSeq}
 		if limit > 0 {
 			q += ` LIMIT ?`
@@ -814,33 +873,18 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		}
 		rows, err := t.Query(q, args...)
 		t.must(err)
-		type raw struct {
-			seq     int64
-			id      []byte
-			prev    *int64
-			body    string
-			author  int64
-			created int64
-			grantID []byte
-			noAuth  sql.NullInt64
-			meta    sql.NullString
-			via     sql.NullString
-			m       map[string]any // body, parsed
-		}
 		// A page holds at most limit entries, and at most limit resource
 		// entries, a batch entry counting as its items (it carries them):
 		// it ends before an entry that would take it past, though it
 		// always holds one. Without that, a page of 1,000 batch entries of
 		// 1,000 items each held a million.
-		var rs []raw
+		var rs []nsLogRow
 		units := 0
 		for rows.Next() {
-			var r raw
-			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta, &r.via))
+			r := t.scanNSLogRow(rows)
 			if raise != nil && len(rs) > 0 && rs[0].seq < raise.seq && r.seq >= raise.seq {
 				break
 			}
-			r.m = jsonv.MustParse([]byte(r.body)).(map[string]any)
 			u := 1
 			if es, ok := r.m["entries"].([]any); ok && len(es) > 1 {
 				u = len(es)
@@ -867,44 +911,17 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		// An entry's prev is the row before it in the page, but for the
 		// first entry's: a query for each made a page N+1.
 		pageIDs := make(map[int64]string, len(rs))
-		for _, r := range rs {
-			m := r.m
-			m["id"] = ids.FromBytes(r.id).String()
-			pageIDs[r.seq] = m["id"].(string)
+		for i := range rs {
+			r := &rs[i]
+			prev := ""
 			if r.prev != nil {
-				prev, ok := pageIDs[*r.prev]
-				if !ok {
+				var ok bool
+				if prev, ok = pageIDs[*r.prev]; !ok {
 					prev = t.nsLogID(*r.prev).String()
 				}
-				m["prev"] = prev
 			}
-			m["author"] = t.authorName(r.author)
-			m["created"] = formatTime(r.created)
-			if via := parseVia(r.via); via != nil {
-				// The grant's delegatees, unhashed like author (§7.4);
-				// sealed with the entry in a sealed namespace.
-				m["via"] = anyStrings(via)
-			}
-			switch {
-			case r.grantID != nil:
-				// Not part of the hashed entry, like author and created
-				// (§7.4, grantref.go).
-				if g := t.grantRef(r.grantID); g != nil {
-					m["grant"] = g
-				}
-			case r.noAuth.Valid && r.noAuth.Int64 != 0:
-				// Written while authentication was disabled (§1): null,
-				// unlike the server's own entries, which have none.
-				m["grant"] = nil
-			}
-			if r.meta.Valid {
-				// gesture and undoes of a single write, gestures of a
-				// batch: not part of the hashed entry either (§7.4). In a
-				// sealed namespace they are sealed with it (§E.4).
-				for k, v := range jsonv.MustParse([]byte(r.meta.String)).(map[string]any) {
-					m[k] = v
-				}
-			}
+			m := t.decorateNSEntry(r, prev)
+			pageIDs[r.seq] = m["id"].(string)
 			out.Entries = append(out.Entries, m)
 			out.Last = m["id"].(string)
 		}
@@ -989,15 +1006,25 @@ type HeadsPage struct {
 // NamespaceHeads lists every resource as of a namespace revision, including
 // those a branch reads through, in ascending byte order of name after after
 // (a byte-order bound, not necessarily a name), a page of at most the log
-// page size (§7.4).
+// page size (§7.4): NamespaceHeadsPrefix without a prefix.
 func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cred Credentials) (*HeadsPage, error) {
+	return e.NamespaceHeadsPrefix(ctx, ns, nsID, after, "", cred)
+}
+
+// NamespaceHeadsPrefix is NamespaceHeads of the names starting with prefix
+// ("" for all), a resource name the caller checked (§7.4 ?prefix=, §12.4);
+// next stays absent on the last page. A partial reader of a namespace
+// §B.11.9 covers, by the grant in Authorization, gets a *FilteredRedirect
+// to the filtered form at the current at instead, which is recorded first
+// (§B.11.9 URLs).
+func (e *Engine) NamespaceHeadsPrefix(ctx context.Context, ns, nsID, after, prefix string, cred Credentials) (*HeadsPage, error) {
 	var out *HeadsPage
-	err := e.read(ctx, func(t *tx) error {
+	err := e.filteredRead(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.nsReader(n, cred); err != nil {
+		if _, err := t.nsReaderOrRedirect(n, cred); err != nil {
 			return err
 		}
 		// At any revision, once its resources are gone (§8.5).
@@ -1009,75 +1036,104 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		if perr != nil || !ok {
 			return nfNS(t.cachePublic(n))
 		}
-		out = &HeadsPage{Items: []map[string]any{}, Public: t.cachePublic(n)}
-		page, next := t.pageHeads(n, &seq, after, e.opt.Maximums.LogPageSize)
-		out.Next = next
-		// created, size and digest show what sealed and e2e namespaces
-		// hide: created times, which their logs seal, lengths, which their
-		// padding exists for, and a hash of content (§7.4, §E.2.2). Judged
-		// by the namespace serving the page when it is listed, so pages at
-		// ns_ids from before a raise to sealed list none either. Nor do
-		// size and digest show at rest, where none are stored (§E.1 Stored
-		// digests; migration 008_clear_at_rest_digests, encryptNamespace).
-		level := t.nsLevel(n)
-		plain := level < levelSealed
-		// Nor for a resource §1 answers 502 for, read through a remote
-		// branch whose source was raised to a level this server lacks, or
-		// one held back while the branch's raise fails (503, remoteHeld):
-		// its source hides them now (§1, §7.4).
-		rb, _, _, lost := t.lostRemote(n)
-		for _, h := range page {
-			kind := "head"
-			switch h.state {
-			case Tombstoned:
-				kind = "tombstone"
-			case Purged:
-				kind = "purge"
-			}
-			item := map[string]any{"resource": h.name, "kind": kind}
-			if h.row != nil {
-				item["target"] = h.row.id.String()
-			}
-			// created, the target's created time as log entries give it,
-			// but not a purged one's, which a remote branch's mirror
-			// doesn't know; and a live head's document's size and digest,
-			// as GET …/rev/{target} serves it uncoded, where the write
-			// stored them (headMeta). A pruned head keeps them, as it
-			// keeps its target.
-			if plain && h.row != nil && h.state != Purged && !(lost && t.upstreamCovers(rb, h.name, &view{state: h.state})) {
-				item["created"] = formatTime(h.row.created)
-				if h.state == Live && level < levelAtRest && h.row.size.Valid && len(h.row.digest) == sha256.Size {
-					item["size"] = float64(h.row.size.Int64)
-					item["digest"] = ReprDigest(h.row.digest)
-				}
-			}
-			out.Items = append(out.Items, item)
-		}
+		out = &HeadsPage{Public: t.cachePublic(n)}
+		page, next := t.pageHeadsIn(n, &seq, after, prefix, e.opt.Maximums.LogPageSize)
+		out.Items, out.Next = t.headRows(n, page), next
 		return nil
 	})
 	return out, err
 }
 
+// headRows are page's rows of /heads (§7.4), filtered or not (§B.11.9).
+func (t *tx) headRows(n *nsRow, page []headItem) []map[string]any {
+	out := []map[string]any{}
+	// created, size and digest show what sealed and e2e namespaces hide:
+	// created times, which their logs seal, lengths, which their padding
+	// exists for, and a hash of content (§7.4, §E.2.2). Judged by the
+	// namespace serving the page when it is listed, so pages at ns_ids
+	// from before a raise to sealed list none either. Nor do size and
+	// digest show at rest, where none are stored (§E.1 Stored digests;
+	// migration 008_clear_at_rest_digests, encryptNamespace).
+	level := t.nsLevel(n)
+	plain := level < levelSealed
+	// Nor for a resource §1 answers 502 for, read through a remote branch
+	// whose source was raised to a level this server lacks, or one held
+	// back while the branch's raise fails (503, remoteHeld): its source
+	// hides them now (§1, §7.4).
+	rb, _, _, lost := t.lostRemote(n)
+	for _, h := range page {
+		kind := "head"
+		switch h.state {
+		case Tombstoned:
+			kind = "tombstone"
+		case Purged:
+			kind = "purge"
+		}
+		item := map[string]any{"resource": h.name, "kind": kind}
+		if h.row != nil {
+			item["target"] = h.row.id.String()
+		}
+		// created, the target's created time as log entries give it, but
+		// not a purged one's, which a remote branch's mirror doesn't know;
+		// and a live head's document's size and digest, as GET
+		// …/rev/{target} serves it uncoded, where the write stored them
+		// (headMeta). A pruned head keeps them, as it keeps its target.
+		if plain && h.row != nil && h.state != Purged && !(lost && t.upstreamCovers(rb, h.name, &view{state: h.state})) {
+			item["created"] = formatTime(h.row.created)
+			if h.state == Live && level < levelAtRest && h.row.size.Valid && len(h.row.digest) == sha256.Size {
+				item["size"] = float64(h.row.size.Int64)
+				item["digest"] = ReprDigest(h.row.digest)
+			}
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
 // Branches lists a namespace's direct branches (§7.4): once the namespace
-// is purged, 410 purged, after the unrestricted-read check (§8.5).
+// is purged, 410 purged, after the unrestricted-read check (§8.5). public
+// is the namespace's cache visibility (BranchList).
 func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]map[string]any, bool, error) {
-	var out []map[string]any
-	var public bool
+	bl, err := e.BranchList(ctx, ns, cred)
+	if err != nil {
+		return nil, false, err
+	}
+	return bl.List, bl.Public, nil
+}
+
+// Branches is the answer of GET /ns/{ns}/branches (§7.4): Public its cache
+// visibility, and Private set where it was filtered for a partial reader
+// (§B.11.9 Answers), which no cache may keep (private, no-store).
+type Branches struct {
+	List    []map[string]any
+	Public  bool
+	Private bool
+}
+
+// BranchList is Branches with the answer's caching. A partial reader of a
+// namespace §B.11.9 covers, by the grant in Authorization, gets only the
+// local branches in which that grant verifies and allows read, and no
+// remote registrations (§B.11.9 Answers), Private.
+func (e *Engine) BranchList(ctx context.Context, ns string, cred Credentials) (*Branches, error) {
+	var out *Branches
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.nsReader(n, cred); err != nil {
+		a, kind, _, err := t.nsAccess(n, cred)
+		if err != nil {
 			return err
 		}
 		if n.purged {
 			return t.purgedRead(n)
 		}
-		public = t.cachePublic(n)
-		out = []map[string]any{}
+		out = &Branches{List: []map[string]any{}, Public: t.cachePublic(n), Private: kind == accessPartial}
 		for _, b := range t.branchesOf(n) {
 			cfg := t.config(b.configSeq)
+			if out.Private && !t.branchReadable(a, b, cfg) {
+				continue
+			}
 			m := map[string]any{"name": b.name, "at": t.nsLogID(b.baseAt.Int64).String(), "frozen": cfg.Frozen, "purged": b.purged}
 			if cfg.Successor != "" {
 				m["successor"] = cfg.Successor
@@ -1085,13 +1141,29 @@ func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]m
 			if d, ok := cfg.Doc["drafts"]; ok && cfg.DraftsFor != nil {
 				m["drafts"] = d // §7.4: clients apply drafts.for (§6.1)
 			}
-			out = append(out, m)
+			out.List = append(out.List, m)
 		}
-		// Remote branches whose registration hasn't expired (§G.3).
-		out = append(out, t.liveRegistrations(n)...)
+		if !out.Private {
+			// Remote branches whose registration hasn't expired (§G.3).
+			out.List = append(out.List, t.liveRegistrations(n)...)
+		}
 		return nil
 	})
-	return out, public, err
+	return out, err
+}
+
+// branchReadable reports whether partial reader a's grant verifies in
+// branch b, with b's document cfg, and allows read there (§B.11.9 Answers).
+func (t *tx) branchReadable(a *actor, b *nsRow, cfg *Config) bool {
+	if a == nil || a.grant == nil {
+		return false
+	}
+	ba, err := t.verifyGrant(a.grant, b.name, b, cfg, nil)
+	if err != nil || ba == nil || ba.verified == nil {
+		return false
+	}
+	ok, _ := ba.verified.Allows("read")
+	return ok
 }
 
 // Wait returns a channel closed on the next change to a namespace's log.
