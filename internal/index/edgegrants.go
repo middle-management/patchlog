@@ -49,11 +49,10 @@ import (
 // markerRec), from which it filters hits per resource as for any grant
 // with that marker, and for a marker reads:{ns}:g:{gs} (§B.11.9) also its
 // subjects, the kid and role names its digest covers and its kid's pub
-// (edge_gs). They
-// are kept across restarts and -rebuild until the last such cookie
-// expires; a gs or marker the service doesn't know,
-// minted by another instance with its own database, is 401, and the
-// reader exchanges again. Instances on one database share them, and share
+// (edge_gs). They are kept across restarts and -rebuild until the last
+// such cookie expires; a gs or marker the service doesn't know, minted by
+// another instance with its own database, is 401, and the reader
+// exchanges again. Instances on one database share them, and share
 // the exchangeRate buckets too (§B.11.5). A reader of a whole namespace
 // at issue (reads:{ns}) reads it whole under the cookie until it expires,
 // as under a grant revoked since: the cookie's lifetime is the revocation
