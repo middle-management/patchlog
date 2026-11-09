@@ -140,3 +140,43 @@ func TestV075RedirectRecordsAt(t *testing.T) {
 		t.Fatalf("at the recorded at: %+v %+v %v", page, info, err)
 	}
 }
+
+// §7.3, §8.5: a namespace stream ends after its purge-ns event. A filtered
+// live read's page runs to its admission's checkpoint; a purge committed
+// between the admission and the page's read is past it, so that page
+// isn't marked Purged (which ends a stream without the purge-ns), and the
+// next fetch gives the purge-ns entry. Not parallel: it sets
+// testFilteredLiveRead.
+func TestV075FilteredLivePurgeAfterAdmission(t *testing.T) {
+	w := newV75World(t, v75Opts{})
+	w.seed()
+	ctx := context.Background()
+	li := w.li()
+	gs := v075GS(t, w, li)
+	since := w.head("matches")
+	w.patchConfig("matches", map[string]any{"op": "add", "path": "/frozen", "value": true})
+	op := w.cred(w.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"matches"}, "can": []any{"purge-ns"}})
+	var once sync.Once
+	testFilteredLiveRead = func() {
+		once.Do(func() {
+			if _, err := w.e.PurgeNamespace(ctx, Request{NS: "matches", Cred: op}, w.head("matches"), true); err != nil {
+				t.Errorf("purge: %v", err)
+			}
+		})
+	}
+	t.Cleanup(func() { testFilteredLiveRead = nil })
+	lg, _, err := w.e.FilteredLiveLog(ctx, "matches", gs, since, 100, li)
+	if err != nil || lg.Status != 200 || len(lg.Entries) != 1 || lg.Entries[0]["kind"] != "config" {
+		t.Fatalf("first page: %+v %v", lg, err)
+	}
+	if lg.Purged || lg.More {
+		t.Fatalf("a page before the purge-ns is Purged %v, More %v", lg.Purged, lg.More)
+	}
+	lg, _, err = w.e.FilteredLiveLog(ctx, "matches", gs, lg.Last, 100, li)
+	if err != nil || lg.Status != 200 || len(lg.Entries) != 1 || lg.Entries[0]["kind"] != "purge-ns" || !lg.Purged || lg.More {
+		t.Fatalf("next page: %+v %v", lg, err)
+	}
+	if _, _, err = w.e.FilteredLiveLog(ctx, "matches", gs, lg.Last, 100, li); v75Status(err) != 410 {
+		t.Fatalf("from the purge-ns: %v", err)
+	}
+}

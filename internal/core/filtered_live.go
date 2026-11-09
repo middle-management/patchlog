@@ -42,6 +42,10 @@ var filteredLiveDone struct {
 
 const filteredLiveMax = 1024
 
+// testFilteredLiveRead, if set, is called by a filtered live read between
+// its admission and the read of its page, for tests of what commits there.
+var testFilteredLiveRead func()
+
 // filteredLiveKey is the share key of a filtered live read: never an
 // unfiltered one's, whose keys start with a namespace name.
 func filteredLiveKey(e *Engine, ns, gs, since string, limit int, at string) string {
@@ -109,6 +113,9 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, gs, since string, limi
 			// cancellation doesn't end it.
 			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
+			if testFilteredLiveRead != nil {
+				testFilteredLiveRead()
+			}
 			var lg *Log
 			err := e.read(sctx, func(t *tx) error {
 				n := t.nsByName(ns)

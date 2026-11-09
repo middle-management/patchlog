@@ -87,10 +87,13 @@ const filteredLogChunk = 256
 // (0: no bound) but scanning at least one; Last is the last entry scanned,
 // visible or not, and More whether the range goes on past it, so the next
 // page's since is Last. An entry's prev is the entry before it in the
-// chain, hidden or not. Covered namespaces are neither sealed nor e2e, so
-// nothing is sealed.
+// chain, hidden or not. Purged is whether the range ends with n's purge-ns
+// entry, not whether n is purged now: a live read's toSeq is its
+// admission's checkpoint, and a purge committed since is past it, so its
+// page doesn't end the stream (§7.3, §8.5). Covered namespaces are neither
+// sealed nor e2e, so nothing is sealed.
 func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit int) *Log {
-	out := &Log{Public: t.cachePublic(n), Purged: n.purged}
+	out := &Log{Public: t.cachePublic(n), Purged: n.purged && n.headSeq.Valid && toSeq == n.headSeq.Int64}
 	var fromSeq int64
 	if since != "" {
 		id, err := ids.Parse(since)
