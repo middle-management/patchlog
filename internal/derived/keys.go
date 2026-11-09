@@ -342,9 +342,10 @@ func (k *Keys) KeyAt(ctx context.Context, ns string, epoch int) (Key, error) {
 // or op as served (client.Doc.Kid): the epoch the revision is served
 // under, which views derived from it are sealed under (§E.2.2, §E.2.6).
 // It is 0, not known, for a kid that doesn't parse, for "" (a document
-// served in the clear, or by a server from before the kid was kept) and
-// for one naming another namespace than ns: a base's, for content a
-// branch reads through, whose epochs aren't ns's. Views take the epoch
+// served in the clear, or by a server from before the kid was kept, or at
+// E3 one whose sealed op is a base's, its pl.ns naming the base: §E.3.1,
+// client.E2EDoc.Kid) and for one naming another namespace than ns: a
+// base's, for content a branch reads through, whose epochs aren't ns's. Views take the epoch
 // current when they are sealed for those (Keys.KeyAt), as a prune
 // snapshot of such a revision takes the epoch in force (§E.3.1).
 func EpochOf(ns, kid string) int {

@@ -805,6 +805,9 @@ type E2EDoc struct {
 	log             []LogEntry
 	since, sinceKid string
 	sincePre        bool
+	// ns is the namespace the document was read from, whose own ops are
+	// those whose pl.ns names it (Kid, snapshotEpoch, §E.3.1).
+	ns string
 }
 
 // LoadE2E reads the head and, if live, folds the document at it.
@@ -854,7 +857,7 @@ func (x *E2E) DocE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) 
 		if err != nil {
 			return nil, err
 		}
-		return &E2EDoc{ID: id, Value: doc, ValidID: id, since: id, sinceKid: kid}, nil
+		return &E2EDoc{ID: id, Value: doc, ValidID: id, since: id, sinceKid: kid, ns: ns}, nil
 	case r.status == 200 && name != KeyringName && x.isE2E(ctx, ns):
 		// A revision from before a raise to e2e, served as at the level
 		// before (Addendum E Levels).
@@ -862,13 +865,13 @@ func (x *E2E) DocE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) 
 		if err != nil {
 			return nil, err
 		}
-		return &E2EDoc{ID: id, Value: doc, ValidID: id, PreRaise: true, since: id, sinceKid: kid, sincePre: true}, nil
+		return &E2EDoc{ID: id, Value: doc, ValidID: id, PreRaise: true, since: id, sinceKid: kid, sincePre: true, ns: ns}, nil
 	case r.status == 200:
 		d, err := x.c.Doc(ctx, ns, name, id)
 		if err != nil {
 			return nil, err
 		}
-		return &E2EDoc{ID: id, Value: d.Value, ValidID: id, Plain: true}, nil
+		return &E2EDoc{ID: id, Value: d.Value, ValidID: id, Plain: true, ns: ns}, nil
 	case r.status == 302 && r.header.Get("X-E2E") == "fold":
 	default:
 		return nil, r.apiError()
@@ -1744,7 +1747,7 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 		entries[i], ids[i] = e, e.ID
 	}
 	nsOK := x.inChainOf(ctx, ns, name, since, ids)
-	out := &E2EDoc{ID: id, log: entries, since: since}
+	out := &E2EDoc{ID: id, log: entries, since: since, ns: ns}
 	var doc any
 	exists := false
 	prev := ""
@@ -2106,7 +2109,14 @@ func foldedOp(d *E2EDoc) bool {
 }
 
 // snapshotEpoch is snapshotKid's epoch of ns for everything but content
-// from before a raise from sealed.
+// from before a raise from sealed: that of the newest such revision's
+// sealed op where the op is ns's own, its pl.ns naming ns, not a base's
+// read through (§E.3.1), whatever namespace its kid names; current, the
+// epoch in force, for a base's op. An own op whose kid names another
+// namespace has no epoch of ns: it gives 0, not known, as the tree's
+// born does, so the prune fails rather than seal under a guess. A
+// snapshot's pl.ns is its kid's namespace (openSnapshotJWE), so below an
+// earlier horizon the rule goes by its kid.
 func snapshotEpoch(ns string, current int, d *E2EDoc) int {
 	for i := len(d.log) - 1; i >= 0; i-- {
 		e := d.log[i]
@@ -2116,14 +2126,14 @@ func snapshotEpoch(ns string, current int, d *E2EDoc) int {
 		if a, ok := e.Patches.([]any); ok && len(a) == 0 {
 			continue
 		}
-		if jwe, ok := seal.SealedJWE(e.Patches); ok {
-			if h, err := seal.ParseHeader(jwe); err == nil {
-				if kns, ep, err := seal.ParseKid(h.Kid); err == nil && kns == ns {
-					return ep
-				}
-			}
+		kid, plNS, ok := opKid(e.Patches)
+		if !ok || plNS != ns {
+			return current
 		}
-		return current
+		if kns, ep, err := seal.ParseKid(kid); err == nil && kns == ns {
+			return ep
+		}
+		return 0
 	}
 	if kns, ep, err := seal.ParseKid(d.sinceKid); err == nil && kns == ns && d.since != "" {
 		return ep
