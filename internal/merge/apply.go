@@ -56,6 +56,29 @@ func (p *Plan) LeftOut() []string {
 	return out
 }
 
+// Unrecorded returns the names of the resources the branch changed up to
+// BranchAt that the target doesn't record (§F.5 Switch): neither merged
+// there nor behind, nor recorded by an item of this plan once Apply has
+// written it. §F.6's exceptions are left out: resources purged in the
+// branch, and at E3 its keyring, which the plan never holds. So it holds
+// every resource LeftOut names, one purged only in the target (which
+// can't be recorded there), and, in a plan not yet applied, every
+// resource that has an item or needs a person. A rebase switches only
+// once it is empty, or a person gives the rest up (RebaseOptions.LeaveOut).
+func (p *Plan) Unrecorded() []string {
+	var out []string
+	for _, r := range p.Resources {
+		switch {
+		case r.Class == Merged, r.Class == Behind:
+		case r.Class == Purged && r.branchPurged:
+		case p.applied && r.HasItem():
+		default:
+			out = append(out, r.Name)
+		}
+	}
+	return out
+}
+
 // Resource returns the named resource of the plan, or nil.
 func (p *Plan) Resource(name string) *Resource {
 	for _, r := range p.Resources {
@@ -384,6 +407,7 @@ func (p *Plan) Apply(ctx context.Context) (*Result, error) {
 			return nil, err
 		}
 		if p.empty(req) {
+			p.applied = true
 			return &Result{Noop: true, Attempts: attempt}, nil
 		}
 		if err := p.copyBlobs(ctx); err != nil {
@@ -391,6 +415,7 @@ func (p *Plan) Apply(ctx context.Context) (*Result, error) {
 		}
 		res, err := p.batchClient().Batch(ctx, p.Target, req, false)
 		if err == nil {
+			p.applied = true
 			out := &Result{NSID: res.NSID, Items: res.Items, Attempts: attempt, IDs: map[string][]string{}}
 			for _, it := range res.Items {
 				out.IDs[it.Resource] = it.IDs
