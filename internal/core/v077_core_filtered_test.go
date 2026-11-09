@@ -123,6 +123,10 @@ func TestV077OriginPurgedCoveredHeads(t *testing.T) {
 	ctx := context.Background()
 	li := w.li()
 	gs := v075GS(t, w, li)
+	red, st := v76fRedirect(t, w, "matches", gs, li)
+	if red == nil {
+		t.Fatalf("matches before its purge: %d", st)
+	}
 	head := v077Purge(t, w, "matches")
 	w.inTx(func(t2 *tx) {
 		if fs := t2.filteredScope(t2.nsByName("matches")); fs == nil {
@@ -136,9 +140,71 @@ func TestV077OriginPurgedCoveredHeads(t *testing.T) {
 	if err := w.e.FilteredCurrent(ctx, "matches", gs, "/heads", Credentials{}); v75Status(err) != 401 {
 		t.Fatalf("without credentials: %v, want 401", err)
 	}
+	// An unrestricted reader passes §8.5's read check too: its unfiltered
+	// /heads is 410, and so is this URL, not the 403 a filtered URL that
+	// serves rows gives it ("reads unrestricted"), with or without at.
+	v077PurgedHeads(t, w, "matches", gs, red.At, head, w.admin, true)
+	v077PurgedHeads(t, w, "matches", gs, red.At, head, li, false)
 	// /log without at keeps the redirect: the range stays readable (§8.5).
 	var fr *FilteredRedirect
 	if err := w.e.FilteredCurrent(ctx, "matches", gs, "/log", li); !errors.As(err, &fr) {
 		t.Fatalf("FilteredCurrent /log: %v, want a redirect", err)
+	}
+}
+
+// v077PurgedHeads checks that purged ns's filtered /heads for gs, without
+// at and at at, are each 410 purged with head for cred, and so is its
+// unfiltered /heads where cred reads ns unrestricted (a partial reader is
+// redirected from there to the filtered form, §B.11.9 URLs) (§8.5,
+// §B.11.9 Purged namespaces).
+func v077PurgedHeads(t *testing.T, w *v75World, ns, gs, at, head string, cred Credentials, unrestricted bool) {
+	t.Helper()
+	ctx := context.Background()
+	purged := func(what string, err error) {
+		t.Helper()
+		if e, _ := err.(*Error); e == nil || e.Status != 410 || e.Body["code"] != "purged" || e.Body["head"] != head {
+			t.Fatalf("%s of purged %s: %v, want 410 purged with head %s", what, ns, err, head)
+		}
+	}
+	if unrestricted {
+		_, err := w.e.NamespaceHeadsPrefix(ctx, ns, head, "", "", cred)
+		purged("/heads", err)
+	}
+	purged("/g/{gs}/heads", w.e.FilteredCurrent(ctx, ns, gs, "/heads", cred))
+	_, info, err := w.e.FilteredHeads(ctx, ns, gs, at, "", "", cred)
+	purged("/g/{gs}/at/{at}/heads", err)
+	if info == nil || info.GS != gs || info.At == "" {
+		t.Fatalf("/g/{gs}/at/{at}/heads of purged %s: info %+v, want the checkpoint", ns, info)
+	}
+}
+
+// §B.11.9 Purged namespaces, §8.5: purged cat-season stays covered as a
+// catalog; its filtered /heads answers as its /heads, 410 purged once the
+// read check passes, for its unrestricted reader as for a partial one
+// (before v0.77 a purged catalog was uncovered, and filteredOpen answered
+// this 410 too). Without credentials it is 401.
+func TestV077OriginPurgedCatalogHeads(t *testing.T) {
+	t.Parallel()
+	w := newV75World(t, v75Opts{})
+	w.seed()
+	ctx := context.Background()
+	cr := w.catReader("user:li", "editors")
+	red, st := v76fRedirect(t, w, "cat-season", "", cr)
+	if red == nil {
+		t.Fatalf("cat-season: %d", st)
+	}
+	head := v077Purge(t, w, "cat-season")
+	v077PurgedHeads(t, w, "cat-season", red.GS, red.At, head, w.admin, true)
+	// The purge leaves cat-season out of its own deciding views, so its
+	// partial reader's subject set changes: it is redirected to its own
+	// (§B.11.9 gs), where it gets 410 as well.
+	_, err := v76fUnfiltered(ctx, w.e, "cat-season", cr)
+	now, _ := err.(*FilteredRedirect)
+	if now == nil {
+		t.Fatalf("purged cat-season's unfiltered URL for its partial reader: %v, want a redirect", err)
+	}
+	v077PurgedHeads(t, w, "cat-season", now.GS, now.At, head, cr, false)
+	if err := w.e.FilteredCurrent(ctx, "cat-season", red.GS, "/heads", Credentials{}); v75Status(err) != 401 {
+		t.Fatalf("without credentials: %v, want 401", err)
 	}
 }

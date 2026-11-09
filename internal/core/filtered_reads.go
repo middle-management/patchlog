@@ -195,7 +195,7 @@ func (e *Engine) FilteredCurrent(ctx context.Context, ns, gs, suffix string, cre
 			return err
 		}
 		if heads && n.purged {
-			if _, aerr := t.filteredAdmit(n, fs, gs, t.filteredCurrent(fs), cred); aerr != nil {
+			if aerr := t.purgedHeadsCheck(n, fs, gs, t.filteredCurrent(fs), cred); aerr != nil {
 				return aerr
 			}
 			return t.purgedRead(n)
@@ -215,14 +215,15 @@ func (e *Engine) FilteredCurrent(ctx context.Context, ns, gs, suffix string, cre
 // included, for the answer's tags.
 func (e *Engine) FilteredHeads(ctx context.Context, ns, gs, at, after, prefix string, cred Credentials) (page *HeadsPage, info *FilteredInfo, err error) {
 	err = e.filteredRead(ctx, func(t *tx) error {
-		n, fv, err := t.filteredHeadsView(ns, gs, at, cred)
+		n, fv, cp, err := t.filteredHeadsView(ns, gs, at, cred)
 		if err != nil {
 			return err
 		}
-		info = filteredInfo(n, fv)
 		if n.purged {
+			info = &FilteredInfo{GS: gs, At: cp.at, NSID: cp.nsID(n.name), Others: cp.others(n.name)}
 			return t.purgedRead(n)
 		}
+		info = filteredInfo(n, fv)
 		asOf := fv.CP().seqs[n.name]
 		limit := e.opt.Maximums.LogPageSize
 		var rows []headItem
@@ -245,28 +246,58 @@ func (e *Engine) FilteredHeads(ctx context.Context, ns, gs, at, after, prefix st
 }
 
 // filteredHeadsView is filteredAtView for /heads, except that a purged
-// namespace's request at an at filteredAt can't answer is admitted at the
+// namespace's request at an at filteredAt can't answer is judged at the
 // current checkpoint instead of redirected there, so that it answers 410
 // as soon as the read check passes, as the unfiltered /heads of a purged
 // namespace does at any revision (§8.5, §B.11.9 Purged namespaces). Log
-// ranges keep the redirect: a purged namespace's range stays readable.
-func (t *tx) filteredHeadsView(ns, gs, at string, cred Credentials) (*nsRow, *fview, error) {
+// ranges keep the redirect: a purged namespace's range stays readable. For
+// a purged namespace it returns the checkpoint judged at and no view: the
+// read check is purgedHeadsCheck's, and the answer 410.
+func (t *tx) filteredHeadsView(ns, gs, at string, cred Credentials) (*nsRow, *fview, *fcp, error) {
 	n, fs, err := t.filteredOpen(ns, fform{heads: true}, cred)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	cp, ok := t.filteredAt(fs, at)
 	if !ok {
 		if !n.purged {
-			return nil, nil, t.filteredCurrentRedirect(n, fs, gs, cred)
+			return nil, nil, nil, t.filteredCurrentRedirect(n, fs, gs, cred)
 		}
 		cp = t.filteredCurrent(fs)
 	}
+	if n.purged {
+		if aerr := t.purgedHeadsCheck(n, fs, gs, cp, cred); aerr != nil {
+			return nil, nil, nil, aerr
+		}
+		return n, nil, cp, nil
+	}
 	fv, aerr := t.filteredAdmit(n, fs, gs, cp, cred)
 	if aerr != nil {
-		return nil, nil, aerr
+		return nil, nil, nil, aerr
 	}
-	return n, fv, nil
+	return n, fv, cp, nil
+}
+
+// purgedHeadsCheck is the read check §8.5 names for a filtered /heads of
+// purged covered n at cp, which then answers 410 purged: "the full read
+// check for that URL", as at its unfiltered /heads (§B.11.9 Purged
+// namespaces: "/heads without at as /heads"). A grant in Authorization
+// that reads n unrestricted passes it, as there, rather than the 403
+// filteredAdmit gives it at a filtered URL that would serve rows; a
+// partial reader's grant and a cookie are admitted as filteredAdmit
+// admits them, its own gs included.
+func (t *tx) purgedHeadsCheck(n *nsRow, fs *fscope, gs string, cp *fcp, cred Credentials) *Error {
+	if cred.Bearer != "" {
+		_, kind, _, err := t.nsAccess(n, cred)
+		if err != nil {
+			return err
+		}
+		if kind == accessUnrestricted {
+			return nil
+		}
+	}
+	_, err := t.filteredAdmit(n, fs, gs, cp, cred)
+	return err
 }
 
 // testFilteredJudge, if set, is called with each name a filtered read
