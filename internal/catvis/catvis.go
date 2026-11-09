@@ -134,6 +134,9 @@ type Catalog struct {
 	// namespaces in G.Trust that contents names.
 	rr       map[string][]*readRoles
 	contents map[string]*Content
+	// deleted are the catalog's tombstoned nodes, each parsed from its
+	// last live document (NewCatalogDeleted).
+	deleted map[string]*tree.Node
 
 	mu  sync.Mutex
 	eff map[string]map[string][]string // Effective per name, computed lazily
@@ -145,7 +148,23 @@ type Catalog struct {
 // NewCatalog builds a Catalog of g, contents keyed by g's catalog.trust
 // members.
 func NewCatalog(g *tree.Graph, contents map[string]*Content) *Catalog {
-	c := &Catalog{G: g, rr: map[string][]*readRoles{}, contents: map[string]*Content{}, eff: map[string]map[string][]string{}}
+	return NewCatalogDeleted(g, contents, nil)
+}
+
+// NewCatalogDeleted is NewCatalog with the catalog's tombstoned nodes,
+// each parsed from its last live document (tree.ParseNode), as §B.11.9
+// judges them: their own $access keeps deciding (Profile), so a deleted
+// node's tombstone reaches exactly those who could see it live (Deleted
+// resources), and Deleted returns them. Implicit nodes, and those of g's
+// explicit names, are ignored.
+func NewCatalogDeleted(g *tree.Graph, contents map[string]*Content, deleted []*tree.Node) *Catalog {
+	c := &Catalog{G: g, rr: map[string][]*readRoles{}, contents: map[string]*Content{}, eff: map[string]map[string][]string{},
+		deleted: map[string]*tree.Node{}}
+	for _, n := range deleted {
+		if n != nil && !n.Self && !g.Explicit(n.Name) {
+			c.deleted[n.Name] = n
+		}
+	}
 	for ns, ct := range contents {
 		if ct == nil || !g.Trust[ns] {
 			continue
@@ -160,6 +179,10 @@ func NewCatalog(g *tree.Graph, contents map[string]*Content) *Catalog {
 	}
 	return c
 }
+
+// Deleted is the tombstoned node name as NewCatalogDeleted was given it,
+// nil if there is none: View.AsIfLive judges it.
+func (c *Catalog) Deleted(name string) *tree.Node { return c.deleted[name] }
 
 // effective is Effective of a node of c.G, memoised.
 func (c *Catalog) effective(name string) map[string][]string {

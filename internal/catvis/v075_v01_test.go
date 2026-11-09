@@ -308,3 +308,35 @@ func TestV075TrustedCatalogs(t *testing.T) {
 		t.Errorf("TrustedCatalogs %+v", got)
 	}
 }
+
+// §B.11.9 Deleted resources: a tombstoned node is judged by its last live
+// document, its own $access included, so the groups and users only that
+// $access names keep deciding (Profile) and Deleted returns the node.
+func TestV075ProfileOfDeletedNodes(t *testing.T) {
+	t.Parallel()
+	docs := map[string]any{
+		"root":          map[string]any{"parents": []any{}, "$access": acc("group:editors", "reader")},
+		"matches.derby": map[string]any{"parents": parents("root")},
+	}
+	g := tree.BuildGraph("cat", catConfig, docs)
+	audit := tree.ParseNode("cat", "audit", "", map[string]any{"parents": parents("root"),
+		"$access": acc("group:auditors", "reader", "user:bo", "reader")})
+	// A node of the graph passed as deleted is ignored.
+	derby := tree.ParseNode("cat", "matches.derby", "", map[string]any{"parents": parents("root"), "$access": acc("group:x", "reader")})
+	contents := map[string]*catvis.Content{"matches": {NS: "matches", Cfg: matchesDoc(t, `{"reader":{"can":["read"]}}`, ""), Kids: []string{"catalog-01"}}}
+	c := catvis.NewCatalogDeleted(g, contents, []*tree.Node{audit, derby})
+	p := c.Profile()
+	if !p.Groups["auditors"] || !p.Users["user:bo"] || !p.Groups["editors"] || p.Groups["x"] {
+		t.Fatalf("profile %+v", p)
+	}
+	if c.Deleted("audit") != audit || c.Deleted("matches.derby") != nil || c.Deleted("root") != nil {
+		t.Fatal("Deleted")
+	}
+	if !c.View([]string{"group:auditors"}).AsIfLive(c.Deleted("audit")) {
+		t.Error("the deleted node, as if live, to auditors")
+	}
+	// Without it, the group decides nothing.
+	if p := catvis.NewCatalog(g, contents).Profile(); p.Groups["auditors"] || p.Users["user:bo"] {
+		t.Errorf("profile without deleted nodes %+v", p)
+	}
+}

@@ -98,8 +98,8 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 	if eg.GS != "" && eg.GS != urlGS {
 		return nil, forbidden("the edge grant is for another subject set (§B.11.9)")
 	}
-	rec := t.loadGS(urlGS)
-	if rec == nil || rec.ns != n.name {
+	rec := t.loadGS(n.name, urlGS)
+	if rec == nil {
 		return nil, apiErr(401, "unauthenticated", "message", "unknown subject set: exchange the grant again (§B.11.9)")
 	}
 	if !t.gsDigestHolds(n, cp, rec) {

@@ -526,13 +526,15 @@ func TestV075VisibleCatalog(t *testing.T) {
 		t.Fatalf("li sees %v, want %v", got, want)
 	}
 	// An item tombstoned hides its live placement; a deleted node that was
-	// visible live is visible as a tombstone, a hidden one stays hidden.
+	// visible live is visible as a tombstone, a hidden one stays hidden,
+	// a placement whose item never existed included (Catalogs).
 	w.del("matches", "shared")
 	w.del("cat-season", "old")
 	w.del("cat-season", "matches.derby")
 	w.del("cat-season", "embargo")
-	got = v075Visible(t, w, "cat-season", li, "matches.shared", "old", "matches.derby", "embargo")
-	if want := map[string]bool{"matches.shared": false, "old": true, "matches.derby": true, "embargo": false}; !reflect.DeepEqual(got, want) {
+	w.del("cat-season", "matches.gone")
+	got = v075Visible(t, w, "cat-season", li, "matches.shared", "old", "matches.derby", "embargo", "matches.gone")
+	if want := map[string]bool{"matches.shared": false, "old": true, "matches.derby": true, "embargo": false, "matches.gone": false}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("after deletes li sees %v, want %v", got, want)
 	}
 	w.inTx(func(t2 *tx) {
@@ -751,19 +753,22 @@ func TestV075State(t *testing.T) {
 	w.e.Close()
 	w.open(nil)
 	w.inTx(func(t2 *tx) {
-		got := t2.loadGS(rec.gs)
+		got := t2.loadGS("matches", rec.gs)
 		if got == nil || got.exp != rec.exp || !reflect.DeepEqual(got.subjects, rec.subjects) || got.kid != "catalog-01" ||
 			!reflect.DeepEqual(got.roles, []string{"reader"}) || got.digest != rec.digest || got.filter != rec.filter || !got.partial {
 			t.Fatalf("after a restart: %+v, want %+v", got, rec)
 		}
-		if t2.loadGS(grantcheck.SubjectSetID([]string{"x"})) != nil {
+		if t2.loadGS("matches", grantcheck.SubjectSetID([]string{"x"})) != nil {
 			t.Fatal("a gs never recorded")
+		}
+		if t2.loadGS("cat-season", rec.gs) != nil {
+			t.Fatal("a gs recorded in another namespace")
 		}
 	})
 	// Past its exp the row is a miss.
 	w.clock.Add((11 * time.Minute).Milliseconds())
 	w.inTx(func(t2 *tx) {
-		if t2.loadGS(rec.gs) != nil {
+		if t2.loadGS("matches", rec.gs) != nil {
 			t.Fatal("an expired row")
 		}
 	})
@@ -911,7 +916,7 @@ func TestV075Exchange(t *testing.T) {
 		t.Fatalf("prefixes %v", got)
 	}
 	w.inTx(func(t2 *tx) {
-		if r := t2.loadGS(gs); r == nil || r.ns != "matches" || !r.partial || r.exp > w.now().Add(10*time.Minute).Unix() {
+		if r := t2.loadGS("matches", gs); r == nil || r.ns != "matches" || !r.partial || r.exp > w.now().Add(10*time.Minute).Unix() {
 			t.Fatalf("filtered_gs row %+v", r)
 		}
 	})

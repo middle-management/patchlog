@@ -7,6 +7,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/rules"
+	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // Profile holds a catalog's deciding inputs at one checkpoint (§B.11.5
@@ -14,8 +15,10 @@ import (
 // can depend on.
 type Profile struct {
 	// Groups are the groups (without the group: prefix) named in $access
-	// of every explicit, non-implicit node, and by the rules of every role
-	// and every catalog key (Kids) of every trusted content namespace.
+	// of every explicit, non-implicit node, a deleted node's last live
+	// document included (NewCatalogDeleted: a tombstone is judged by its
+	// own $access, §B.11.9 Deleted resources), and by the rules of every
+	// role and every catalog key (Kids) of every trusted content namespace.
 	// Taking every role, not only those that list read, is a superset,
 	// which is always safe. A key's groups allow or deny scope names no
 	// group.
@@ -24,7 +27,8 @@ type Profile struct {
 	// by positive tests of named groups (rules.GroupTests), so every
 	// group of the caller decides.
 	KeepAll bool
-	// Users are the user: subjects with direct $access entries.
+	// Users are the user: subjects with direct $access entries,
+	// deleted nodes' included.
 	Users map[string]bool
 	// SubScoped: some catalog key in a trusted content namespace has a
 	// sub scope, so the caller's sub decides.
@@ -39,11 +43,16 @@ func (c *Catalog) Profile() Profile {
 
 func (c *Catalog) computeProfile() Profile {
 	p := Profile{Groups: map[string]bool{}, Users: map[string]bool{}}
+	nodes := make([]*tree.Node, 0, len(c.deleted))
 	for _, name := range c.G.Names() {
-		if !c.G.Explicit(name) {
-			continue
+		if c.G.Explicit(name) {
+			nodes = append(nodes, c.G.Node(name))
 		}
-		n := c.G.Node(name)
+	}
+	for _, n := range c.deleted {
+		nodes = append(nodes, n)
+	}
+	for _, n := range nodes {
 		if n == nil || n.Self {
 			continue
 		}

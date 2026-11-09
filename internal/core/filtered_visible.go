@@ -66,11 +66,11 @@ func (t *tx) newFview(fs *fscope, cp *fcp, gs string, subjects []string, filter 
 //     2 with the filter of the grant verified in the branch: a name new in
 //     the branch is hidden (Branches);
 //   - in a catalog: item 2 allows the node, and either it is live and the
-//     catalog's node test passes (catvis.View.Node), a placement's item
-//     being live in its namespace as of cp, never one whose item doesn't
-//     exist or is tombstoned; or it is tombstoned and its last live
-//     document passes as if live (catvis.View.AsIfLive, Deleted
-//     resources). A purged node, whose documents are gone, is hidden.
+//     catalog's node test passes (catvis.View.Node), or it is tombstoned
+//     and its last live document passes as if live (catvis.View.AsIfLive,
+//     Deleted resources); either way a placement's item must be live in
+//     its namespace as of cp, never one that doesn't exist or is
+//     tombstoned. A purged node, whose documents are gone, is hidden.
 //
 // e2e catalogs aren't in the view: they make nothing visible.
 func (fv *fview) visible(t *tx, name string) bool {
@@ -118,29 +118,30 @@ func (fv *fview) judgeNode(t *tx, name string) bool {
 	}
 	c, v := fv.cats[0], fv.views[0]
 	if n := c.G.Node(name); n != nil && c.G.Explicit(name) {
-		if !v.Node(n) {
-			return false
-		}
-		if n.Kind != tree.KindPlacement {
-			return true
-		}
-		seq, ok := fv.cp.seqs[n.ItemNS]
-		m := t.fsLocal(n.ItemNS)
-		if !ok || m == nil {
-			return false
-		}
-		return t.resolve(m, n.ItemName, &seq).state == Live
+		return v.Node(n) && fv.itemLive(t, n)
 	}
-	seq := fv.cp.seqs[fv.fs.n.name]
-	r := t.resolve(fv.fs.n, name, &seq)
-	if r.state != Tombstoned || r.head == nil {
+	// A tombstone: its last live document, as catalogAt parsed it, judged
+	// as if live, so it reaches exactly those who could see it live
+	// (Deleted resources), a placement's never where its item doesn't
+	// exist or is tombstoned (Catalogs).
+	n := c.Deleted(name)
+	return n != nil && v.AsIfLive(n) && fv.itemLive(t, n)
+}
+
+// itemLive reports, for a placement n, whether its item is live in its
+// namespace as of cp: a catalog never shows a placement whose item doesn't
+// exist or is tombstoned, nor so its tombstone (§B.11.9 Catalogs). It is
+// true for a folder.
+func (fv *fview) itemLive(t *tx, n *tree.Node) bool {
+	if n.Kind != tree.KindPlacement {
+		return true
+	}
+	seq, ok := fv.cp.seqs[n.ItemNS]
+	m := t.fsLocal(n.ItemNS)
+	if !ok || m == nil {
 		return false
 	}
-	doc, err := t.docAt(r.head)
-	if err != nil {
-		return false
-	}
-	return v.AsIfLive(tree.ParseNode(c.G.Catalog, name, "", doc))
+	return t.resolve(m, n.ItemName, &seq).state == Live
 }
 
 // candidates calls fn, in ascending byte order, with every name after

@@ -13,12 +13,13 @@ import (
 
 // Catalog graphs as of a checkpoint (§B.11.9 Visible, D): the catalog's
 // document and its live node documents at the catalog's seq in the
-// checkpoint, read through the core's own decode paths (docAt, so
-// compression, at-rest and sealed encryption are handled), and built with
-// tree.BuildGraph, which counts every item as live, as judging a deleted
-// resource as if live needs. Its trusted content namespaces are the
-// catalog.trust members in the checkpoint, each as of its own seq, with
-// the kids of its keys whose requireAt names the catalog.
+// checkpoint, and its tombstoned nodes' last live documents, read through
+// the core's own decode paths (docAt, so compression, at-rest and sealed
+// encryption are handled), and built with tree.BuildGraph, which counts
+// every item as live, as judging a deleted resource as if live needs. Its
+// trusted content namespaces are the catalog.trust members in the
+// checkpoint, each as of its own seq, with the kids of its keys whose
+// requireAt names the catalog.
 
 // filteredCatalogs caches built catalogs. The Engine has no field for it,
 // so the cache is the process's, and its key names what a catalog is
@@ -66,16 +67,27 @@ func (t *tx) catalogAt(c *fsCat, cp *fcp) *catvis.Catalog {
 	if ok {
 		return cv
 	}
-	docs := map[string]any{}
+	docs, last := map[string]any{}, map[string]any{}
 	for _, h := range t.listHeads(cat, &seq) {
-		if h.state != Live || h.row == nil {
+		if (h.state != Live && h.state != Tombstoned) || h.row == nil {
 			continue
 		}
 		doc, err := t.docAt(h.row)
 		t.must(err)
-		docs[h.name] = doc
+		if h.state == Live {
+			docs[h.name] = doc
+		} else {
+			last[h.name] = doc
+		}
 	}
 	g := tree.BuildGraph(cat.name, catCfg.Doc, docs)
+	// Tombstoned nodes, from their last live documents, are judged as if
+	// live, and their own $access keeps deciding (§B.11.9 Deleted
+	// resources). A purged node has no documents: it stays hidden.
+	deleted := make([]*tree.Node, 0, len(last))
+	for name, doc := range last {
+		deleted = append(deleted, tree.ParseNode(g.Catalog, name, "", doc))
+	}
 	contents := map[string]*catvis.Content{}
 	for _, m := range inCP {
 		mcfg := t.fconfigAt(cp.seqs[m])
@@ -90,7 +102,7 @@ func (t *tx) catalogAt(c *fsCat, cp *fcp) *catvis.Catalog {
 		}
 		contents[m] = ct
 	}
-	cv = catvis.NewCatalog(g, contents)
+	cv = catvis.NewCatalogDeleted(g, contents, deleted)
 	filteredCatalogs.mu.Lock()
 	if filteredCatalogs.lru.MaxEntries == 0 {
 		filteredCatalogs.lru.MaxEntries = filteredCatalogsMax
