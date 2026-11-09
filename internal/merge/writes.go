@@ -34,9 +34,9 @@ type sideChange struct {
 // foldWrites folds entries (log entries or steps) onto start and computes
 // the writes of §6.4.1 under the merge array rule of §F.3: a write whose
 // last segment addresses an array element (an index, or "-") counts as a
-// write to the whole array. countCopyFrom adds the from of every copy
-// (under the same rule): the branch side of a replay counts it, the
-// target side doesn't (§F.3, §11.3).
+// write to the whole outermost array holding it. countCopyFrom adds the
+// from of every copy (under the same rule): the branch side of a replay
+// counts it, the target side doesn't (§F.3, §11.3).
 //
 // A patch set on an absent resource is a create, and applies to the
 // document null (§6.2 step 3).
@@ -93,8 +93,8 @@ func foldWrites(start docState, steps []client.Step, countCopyFrom bool) (*sideC
 	return sc, nil
 }
 
-// widen applies the array rule to w if its parent is an array in
-// either document.
+// widen applies the array rule to w if its last segment addresses an
+// array element in either document.
 func widen(pre, post any, w pointer.Pointer) pointer.Pointer {
 	if a := arrayRule(pre, w); len(a) < len(w) {
 		return a
@@ -102,21 +102,34 @@ func widen(pre, post any, w pointer.Pointer) pointer.Pointer {
 	return arrayRule(post, w)
 }
 
-// arrayRule widens a write whose parent is an array to the whole array.
+// arrayRule widens a write whose last segment addresses an array element
+// in doc (it is "-", or its parent is an array) to the whole outermost
+// array holding it (§F.3): the shortest proper prefix of w whose value in
+// doc is an array. /a/0/b/1, with a and a[0].b arrays, is a write to /a.
+// A write whose last segment is an object key inside an element (/a/0/k)
+// is not widened.
 func arrayRule(doc any, w pointer.Pointer) pointer.Pointer {
 	if len(w) == 0 {
 		return w
 	}
 	parent := w[:len(w)-1]
-	if w[len(w)-1] == "-" {
-		return append(pointer.Pointer{}, parent...)
+	if w[len(w)-1] != "-" && !isArray(doc, parent) {
+		return w
 	}
-	if v, ok := pointer.Get(doc, parent); ok {
-		if _, isArr := v.([]any); isArr {
-			return append(pointer.Pointer{}, parent...)
+	for i := range len(parent) {
+		if isArray(doc, w[:i]) {
+			return append(pointer.Pointer{}, w[:i]...)
 		}
 	}
-	return w
+	// The parent itself: the array, or (for "-") what will be one.
+	return append(pointer.Pointer{}, parent...)
+}
+
+// isArray reports whether p's value in doc is an array.
+func isArray(doc any, p pointer.Pointer) bool {
+	v, ok := pointer.Get(doc, p)
+	_, arr := v.([]any)
+	return ok && arr
 }
 
 func dedupe(ws []pointer.Pointer) []pointer.Pointer {
