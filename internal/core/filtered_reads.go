@@ -133,7 +133,7 @@ func (e *Engine) FilteredCurrent(ctx context.Context, ns, gs string, cred Creden
 // included, for the answer's tags.
 func (e *Engine) FilteredHeads(ctx context.Context, ns, gs, at, after, prefix string, cred Credentials) (page *HeadsPage, info *FilteredInfo, err error) {
 	err = e.filteredRead(ctx, func(t *tx) error {
-		n, fv, err := t.filteredAtView(ns, gs, at, cred)
+		n, fv, err := t.filteredHeadsView(ns, gs, at, cred)
 		if err != nil {
 			return err
 		}
@@ -160,6 +160,31 @@ func (e *Engine) FilteredHeads(ctx context.Context, ns, gs, at, after, prefix st
 		return nil
 	})
 	return page, info, err
+}
+
+// filteredHeadsView is filteredAtView for /heads, except that a purged
+// namespace's request at an at filteredAt can't answer is admitted at the
+// current checkpoint instead of redirected there, so that it answers 410
+// as soon as the read check passes, as the unfiltered /heads of a purged
+// namespace does at any revision (§8.5, §B.11.9 Purged namespaces). Log
+// ranges keep the redirect: a purged namespace's range stays readable.
+func (t *tx) filteredHeadsView(ns, gs, at string, cred Credentials) (*nsRow, *fview, error) {
+	n, fs, err := t.filteredOpen(ns, cred)
+	if err != nil {
+		return nil, nil, err
+	}
+	cp, ok := t.filteredAt(fs, at)
+	if !ok {
+		if !n.purged {
+			return nil, nil, t.filteredCurrentRedirect(n, fs, gs, cred)
+		}
+		cp = t.filteredCurrent(fs)
+	}
+	fv, aerr := t.filteredAdmit(n, fs, gs, cp, cred)
+	if aerr != nil {
+		return nil, nil, aerr
+	}
+	return n, fv, nil
 }
 
 // testFilteredJudge, if set, is called with each name a filtered read
