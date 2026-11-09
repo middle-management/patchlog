@@ -55,11 +55,26 @@ leaves a question open, the reference implements the reading noted here and in
   bases at `baseAt`, the trusted non-e2e catalogs and their `catalog.trust` members. Answers
   list it as `namespaces`, `?min={ns}:{ns_id}` may name any of them, and they are tagged
   `idx:{m}` for each. Coverage is decided from the namespace documents alone. The index's own
-  grant must also read those catalogs, members and bases, or partial readers get `502`.
-  Unrestricted readers and uncovered namespaces are answered as before. Result URLs of partial
+  grant must read what decides coverage, or partial readers get `502` (the next item).
+  Unrestricted readers are answered as before, and so are partial readers of a namespace
+  §B.11.9 doesn't cover, where the index's grant can read what decides it. Result URLs of partial
   readers change once, and their index cookies for `reads:{ns}:scope:{digest}`, issued while
   `{ns}` wasn't covered, are `403` on `/{ns}/…` and `/_refs/…` once it is, until they exchange
   again.
+- **The search index's grant must read the namespaces that decide coverage** (§B.11.9 Where,
+  §A.4 Private namespaces, §C.6). To tell whether §B.11.9 covers a namespace it follows, for a
+  reader it doesn't let read the namespace whole, the index reads other namespaces through its own
+  grant (`index.Options.Client`): every catalog the followed namespace's `catalogs` names through
+  a key whose `requireAt` names it, every namespace a followed catalog's `catalog.trust` lists
+  (their documents only, not the catalogs they name), and a followed branch's bases. It needs this
+  whether or not the namespace turns out to be covered, so scoped readers of an uncovered
+  namespace depend on it too. Where the grant can't read one, such readers get `502` `upstream`
+  with a message saying the index's grant lacks a namespace that decides how this one is read, and
+  the index's log names it (the answer doesn't, as `/principal` hides `catalog.trust` from readers
+  who can't read the catalog whole). Before, they got a generic 'cannot read the namespace
+  configuration'. **Widen the indexer's
+  grant before scoped readers use the index** when upgrading from v0.24.0; unrestricted readers
+  are unaffected.
 - **`POST /edge-grants` gives a partial reader of a covered namespace** whose grant doesn't fix
   `/resource` an edge grant for `/ns/{ns}/g/{gs}` alone, instead of `403` (§B.11.9 Edge grants,
   §C.5.2). §C.5.2's `/resource` and qualifying-role refusals are skipped for it, and the refusals
@@ -96,7 +111,8 @@ leaves a question open, the reference implements the reading noted here and in
     unrestricted reader's is `403` at every filtered URL, and a `/ns/{ns}` cookie is served as
     the URL's `gs`'s cookie would be. A `gs` cookie is judged from its stored row alone. It is
     `401` without one, and `403` where the rules its digest covers differ at `at` (a kid or role
-    gone included) or where a `"partial"` set meets a catalog that keeps every group.
+    gone included, or one that no longer lists `read`: a cookie never reads where its grant
+    couldn't) or where a `"partial"` set meets a catalog that keeps every group.
 - Filtered `/heads` list only visible rows, in pages filled to `logPageSize`, with `next` on
   every full page (§B.11.9 /heads).
 - Filtered log ranges (§B.11.9 Log entries, Log ranges):
@@ -112,7 +128,8 @@ leaves a question open, the reference implements the reading noted here and in
   the check fails, a changed `gs` included (§B.11.9 Events, §7.3). Waiters of one `gs` share
   each page and each entry's judgement per checkpoint (§B.11.9 Cost).
 - Purged namespaces answer the filtered URLs as their unfiltered forms (§B.11.9, §8.5):
-  filtered `/heads` are `410` after admission, ranges end with `purge-ns`, and long-poll and
+  filtered `/heads` are `410` after admission at any `at`, the current one or not, with no
+  redirect first, ranges end with `purge-ns`, and long-poll and
   events from `purge-ns` are `410`; an event stream sends `purge-ns` before it ends.
 - `GET /ns/{ns}/branches` to a partial reader of a covered namespace lists only the local
   branches in which its grant verifies and allows `read`, without remote registrations,
@@ -154,10 +171,12 @@ leaves a question open, the reference implements the reading noted here and in
     had a live one as of the branch's `at` (§B.11.9 Branches). A covered catalog shows it only
     the nodes the node test shows, never a placement whose item isn't live (§B.11.9 Catalogs).
   - `/_refs` takes each covered namespace's checkpoint into its `at` and `namespaces`, and
-    accepts `min` for those namespaces (§A.4 Across namespaces).
+    accepts `min` for those namespaces (§A.4 Across namespaces). An answer read before a purge is
+    never stored after it.
   - Its edge grants for a `g:` marker record the subject set's subjects, kid and read roles
     (`edge_gs`, migration 005). A cookie is judged from that record alone: `403` where the
-    rules its digest covers have changed, where a `"partial"` set meets a catalog in which every
+    rules its digest covers have changed (a role or the key no longer listing `read` included),
+    where a `"partial"` set meets a catalog in which every
     group decides, or where the namespace is no longer covered (§B.11.9 gs).
   - `/{ns}/g/{gs}/at/{at}` and `/_refs/g/{gs}/at/{at}` under the `gs` a grant had as of an older
     `at` the index still holds are answered as that reader's older `at`s are: its kept result,

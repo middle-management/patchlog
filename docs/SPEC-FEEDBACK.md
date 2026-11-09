@@ -12,7 +12,7 @@ v0.75 says, what the reference does (the reading it chose, the conservative one 
 choice) and the question. The analysts' questions from before the work and the implementers'
 notes are merged here, each case once.
 
-The four with the widest reach come first.
+The four with the widest reach come first; 32 are open.
 
 1. **Does §A.4's covered form bind a service whose origin doesn't filter?** (§B.11.9 Where,
    §A.4 Private namespaces, §1). Where says §B.11.9 "applies in those where the origin implements
@@ -100,8 +100,10 @@ Admission and subject sets.
    rules differ"). The reference recomputes the scope digest as of `{ns}`'s document at the URL's
    `at`. It takes the stored kid's scope rules and the stored effective read roles' definitions,
    with the stored block rules and principal. A kid or role that is gone counts as differing, so
-   `403` (`gsDigestHolds`). *Propose:* say so, and whether a removed role is a difference or a
-   narrowing.
+   `403` (`gsDigestHolds`). A role that stays but stops listing `read`, or a key whose `can` stops
+   listing it, counts as gone too, though the digest covers no verbs: otherwise a cookie would
+   read where its grant couldn't (`403` in core and index). *Propose:* say so, verbs included,
+   and whether a removed role is a difference or a narrowing.
 8. **`"partial"` with several catalogs, and when it is `403`** (§B.11.5, §B.11.9 gs). With
    several trusted catalogs the origin joins their deciding subjects. It adds `"partial"` if any
    of the caller's groups is missing from the union. A `"partial"` cookie is `403` at an `at`
@@ -300,15 +302,30 @@ The search index.
     `namespaces` holds one `ns_id` per namespace. The reference lets the branch's `ns_id` stand
     for the base at `baseAt`, since the branch fixes it (`internal/index/refsall.go`
     `refsMerge`). *Question:* how is such a member merged?
-31. **What the index reads, and how fresh** (§A.4, §A.5, §B.11.9 Branches). The index takes
-    catalogs and `catalog.trust` members it doesn't follow at their heads as its grant checker
-    last read them (`CheckerTTL`, 30 s by default), so a catalog move reaches its answers within
-    that time; a `min` naming them reads the head afresh. Where its grant can't read a catalog, a
-    member or a base, or a sealed catalog's documents through its plain client, partial readers
-    get `502`. It implements visibility in covered branches as of the branch's `at`.
-    *Question:* should §A.5 bound the lag? Must the service's grant read those namespaces, or
-    may it leave the namespace out, or answer partial readers `403`, also on covered branches it
-    can't yet judge? What should an index do with a sealed catalog?
+31. **What the index reads, how fresh, and what it answers where its grant can't read**
+    (§A.4 Private namespaces, §A.5, §B.11.9 Where and Branches, §C.6). To tell whether §B.11.9
+    covers a namespace it follows, for a reader it doesn't let read the namespace whole, the index
+    reads other namespaces through its own grant: the catalogs a followed namespace names through
+    `requireAt` keys, the `catalog.trust` members of a followed catalog, and a followed branch's
+    bases. §A.4 Coverage says only "`502` if the service can't read the namespace document of one
+    the grant names"; nothing says a service's grant must read these. The reference refuses
+    partial readers with `502` `upstream` where it can't, rather than answer as if the namespace
+    weren't covered, because rule-filtered hits could show what visibility hides. That holds for
+    uncovered namespaces too, as coverage can't be told without the read, and for a sealed
+    catalog the plain client can't read. The index takes catalogs and `catalog.trust` members it
+    doesn't follow at their heads as its grant checker last read them (`CheckerTTL`, 30 s by
+    default), so a catalog move reaches its answers within that time; a `min` naming them reads
+    the head afresh. Visibility in covered branches is as of the branch's `at`. *Question:* what
+    should a service answer when its grant can't read a namespace that decides coverage: `502`
+    to partial readers, as here, `403`, or the answer as if uncovered? *Propose:* §A.4 and §C.6
+    say a service's grant must read these namespaces, and partial readers get `502` where it
+    can't. Should §A.5 bound the lag, and what should an index do with a sealed catalog?
+32. **Naming the namespace in that `502`** (§7.4, §A.4). `/principal` hides `catalog.trust` from
+    readers who can't read the catalog whole, so a `502` naming the namespace the grant lacks
+    would tell a partial reader what it may not read. The reference answers `502` `upstream`
+    saying the index's grant lacks a namespace that decides how this one is read, and names the
+    namespace only in the index's log (`errGrantLacks`). *Question:* may the answer name it, or
+    must it not? *Propose:* say the answer states the cause without naming the namespace.
 
 ## Open from v0.74
 
