@@ -349,16 +349,17 @@ func testTreeListings(t *testing.T) {
 			t.Errorf("min=%s: %d", m, r.status)
 		}
 	}
-	// Pagination with ?after and next links.
+	// Pagination with ?after and next links, followed at the page's at:
+	// the head pointer drops a position (§A.4, v0.77).
 	b = x.get("/cat/children?of=season&limit=1", "")
 	if names(b["children"]) != "matches.opener" || b["next"] == nil {
 		t.Fatalf("page 1: %v", b)
 	}
-	b = x.get("/cat/children"+b["next"].(string), "")
+	b = x.get("/cat/at/"+b["at"].(string)+"/children"+b["next"].(string), "")
 	if names(b["children"]) != "matches.derby" {
 		t.Fatalf("page 2: %v", b)
 	}
-	b = x.get("/cat/children"+b["next"].(string), "")
+	b = x.get("/cat/at/"+b["at"].(string)+"/children"+b["next"].(string), "")
 	if names(b["children"]) != "matches.cup" || b["next"] != nil {
 		t.Fatalf("page 3: %v", b)
 	}

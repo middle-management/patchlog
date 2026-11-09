@@ -950,8 +950,17 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	// reader's shape, keyOf), and in a sealed or e2e catalog the view a
 	// listing is bound to (§E.2.6). Only it is answered 200: another form
 	// of it, or one with min, is redirected.
-	canon := func(at string) string { return target(at) + derived.CanonicalQuery(vals, "min") }
+	canonOf := func(vals url.Values) func(string) string {
+		return func(at string) string { return target(at) + derived.CanonicalQuery(vals, "min") }
+	}
+	canon := canonOf(vals)
 	keyOf := func(at string) string { return listingKey(canon(at), v) }
+	// moved is canon of a redirect from the head pointer or to another at
+	// than the URL's: a children listing's position (an opaque after)
+	// says nothing of where a page starts there, so it is dropped and the
+	// folder starts again, as a legacy cursor naming an order isn't
+	// (§A.4, §B.5).
+	moved := canonOf(withoutOpaqueAfter(vals))
 	keep := !perReader(op, v)
 	var cur string
 	var curProf Profile
@@ -1007,17 +1016,28 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		if v.grant != nil && curProf != nil {
 			s.rekey(v, curProf.Subjects(v.grant))
 		}
+		// The URL redirected to, and the query its listing is computed
+		// with: without an opaque after unless it stays at the URL's at.
+		rvals, rcanon := vals, canon
+		if at != cur {
+			rvals, rcanon = withoutOpaqueAfter(vals), moved
+		}
+		rkeyOf := func(at string) string { return listingKey(rcanon(at), v) }
 		to := cur
-		if _, _, ok := s.kept.Get(keyOf(cur)); keep && !ok {
+		if _, _, ok := s.kept.Get(rkeyOf(cur)); keep && !ok {
 			if info, key, err := s.keys.Current(ctx, cat); err == nil {
-				if l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key); err == nil && l.status == http.StatusOK {
+				if l, err := s.listing(ctx, v, op, rvals, rcanon, rkeyOf, info, key); err == nil && l.status == http.StatusOK {
 					to = l.at
 					s.rekeyAs(v, l.prof)
 				}
 			}
 		}
+		if to != at {
+			// The checkpoint moved on while the listing was computed.
+			rcanon = moved
+		}
 		setPtr()
-		redirect(w, canon(to))
+		redirect(w, rcanon(to))
 		return
 	}
 	if !canonical {
@@ -1065,7 +1085,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		// the new one, and the redirect names the grant's gs there.
 		s.rekeyAs(v, l.prof)
 		setPtr()
-		redirect(w, canon(l.at))
+		redirect(w, moved(l.at))
 	default:
 		s.writeListing(w, r, v, at, l.st)
 	}
@@ -2407,6 +2427,29 @@ func (q *query) childPage(n *Node, kids []Child, start, limit int, vals url.Valu
 	nv.Set("after", childCursor{pos: end, at: q.at, last: kids[end-1].Node.Name}.String())
 	body["next"] = derived.CanonicalQuery(nv)
 	return body, end, nv
+}
+
+// withoutOpaqueAfter is vals less an after that is a children listing's
+// position (childCursor), or a next carrying one, as a redirect from the
+// head pointer or to another at drops it (§A.4, §B.5). An after naming an
+// order, the cursor of earlier releases (children), is kept, as is one
+// with a childCursor's shape that isn't one (400 where it is listed).
+func withoutOpaqueAfter(vals url.Values) url.Values {
+	pv := pagingParams(vals)
+	after, ok := pv["after"]
+	if !ok || pv.Has("name") || pv.Has("unordered") {
+		return vals
+	}
+	if _, ok := parseCursor(after[0]); !ok {
+		return vals
+	}
+	out := url.Values{}
+	for k, v := range vals {
+		if k != "after" {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // childCursor is the position after a page of children (§A.4, §E.2.6):
