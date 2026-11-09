@@ -505,7 +505,11 @@ func (t *tx) preRaiseBlobHead(p *preRaise, name string, head *revRow, bid ids.ID
 // preRaiseBlobKeyEpochs is blobKeyEpochs for a blob from before p's raise
 // from sealed: the epochs a request for it would be served under, those
 // fixed, or, where none is, the one a request would fix by sealing its
-// newest referencing revision (preRaiseBlobHead).
+// newest referencing revision (preRaiseBlobHead). Unlike blobKeyEpochs the
+// check needn't store that sealing to fix the epoch (§E.2.2): the one it
+// judges by is the last before the raise, which never changes, and a
+// remote branch's shadow has its source's epochs of what it mirrored
+// (rev_epochs).
 func (t *tx) preRaiseBlobKeyEpochs(p *preRaise, head *revRow, bid ids.ID) map[int]bool {
 	eps := t.preRaiseBlobEpochs(p, head, bid)
 	if len(eps) == 0 {

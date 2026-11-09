@@ -304,12 +304,20 @@ func (t *tx) deletePrunedSealed(res, hseq int64, keep map[int64]*revRow) {
 // revEpoch is the epoch that seals a revision or tombstone row as served by
 // n: the epoch it was written in, if it is n's own; otherwise n's current.
 func (t *tx) revEpoch(n *nsRow, r *revRow) int {
+	e, _ := t.revEpochFixed(n, r)
+	return e
+}
+
+// revEpochFixed is revEpoch, and whether that epoch is fixed: written in
+// it, or fixed by a stored sealing (§E.2.2). Otherwise it is n's current,
+// under which the first sealing stored would fix it.
+func (t *tx) revEpochFixed(n *nsRow, r *revRow) (int, bool) {
 	var ns int64
 	t.must(t.QueryRow(`SELECT ns FROM resources WHERE res = ?`, r.res).Scan(&ns))
 	if ns == n.id {
 		var e int
 		if err := t.QueryRow(`SELECT epoch FROM rev_epochs WHERE seq = ?`, r.seq).Scan(&e); err == nil {
-			return e
+			return e, true
 		}
 	}
 	// Content without an epoch of its own keeps the one its first stored
@@ -318,12 +326,35 @@ func (t *tx) revEpoch(n *nsRow, r *revRow) int {
 	err := t.QueryRow(`SELECT substr(jwe, 1, 4096) FROM sealed WHERE ns = ? AND rev_seq = ? AND kind IN ('doc', 'entry') ORDER BY created LIMIT 1`, n.id, r.seq).Scan(&prefix)
 	if err == nil {
 		if e, ok := jweEpoch(prefix); ok {
-			return e
+			return e, true
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		t.must(err)
 	}
-	return t.config(n.configSeq).Epoch
+	return t.config(n.configSeq).Epoch, false
+}
+
+// fixRevEpoch is the epoch a check judges revision row of resource name,
+// as n serves it, by (§2.1, §6.1, keywindow.go): revEpoch, where that is
+// fixed; otherwise the check fixes it as a read would (§E.2.2: "when it is
+// first served or a check first judges by its epoch"), storing the
+// document's sealing under n's current epoch in this write transaction
+// (storeSeal), the first stored winning. A read transaction, as a write's
+// check phase before its write lock, stores nothing and judges by the
+// epoch the write would fix; so does content whose document can't be had.
+func (t *tx) fixRevEpoch(n *nsRow, name string, row *revRow) int {
+	e, fixed := t.revEpochFixed(n, row)
+	if fixed || !t.write {
+		return e
+	}
+	b, err := t.docBytesAt(row)
+	if err != nil {
+		return e
+	}
+	if se, ok := t.storeSeal(n.id, t.resJob(n, name, row, sealDoc, func() []byte { return b })); ok {
+		return se
+	}
+	return e
 }
 
 // entryEpoch is the epoch that seals n's namespace entry seq: the one in
@@ -427,6 +458,43 @@ func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain fu
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.RangePL(n.name, since, toID), plain()
 	j.pad = t.config(n.configSeq).Pad
 	return j
+}
+
+// storeSeal is finishSeal for one job inside this write transaction: it
+// seals j if it isn't stored yet and stores it under namespace ns (INSERT
+// ON CONFLICT DO NOTHING, then re-read, so the first stored wins), so that
+// a check fixing an epoch fixes it with its request, and a refused request
+// rolls it back (§E.2.2). It returns the epoch of the stored bytes; false
+// for a namespace or resource purged, where nothing is stored.
+func (t *tx) storeSeal(ns int64, j *sealJob) (int, bool) {
+	if j == nil {
+		return 0, false
+	}
+	if j.jwe == "" || j.fresh {
+		t.must(j.sealNow())
+		t.lockNS(ns, lockShared)
+		var purged bool
+		if err := t.QueryRow(`SELECT purged FROM namespaces WHERE ns = ?`, ns).Scan(&purged); err != nil || purged {
+			return 0, false
+		}
+		var name, rev any
+		if j.name != "" {
+			var st int
+			if err := t.QueryRow(`SELECT state FROM resources WHERE ns = ? AND name = ?`, ns, j.name).Scan(&st); err == nil && st == statePurged {
+				return 0, false
+			}
+			name = j.name
+		}
+		if j.revSeq != 0 {
+			rev = j.revSeq
+		}
+		_, err := t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
+			ns, j.kind, j.key, name, rev, j.jwe, t.now.UnixMilli())
+		t.must(err)
+		t.must(t.QueryRow(`SELECT jwe FROM sealed WHERE ns = ? AND kind = ? AND key = ?`, ns, j.kind, j.key).Scan(&j.jwe))
+		j.fresh = false
+	}
+	return jweEpoch(j.jwe)
 }
 
 // finishSeal seals the jobs not stored yet and stores them (INSERT ON
