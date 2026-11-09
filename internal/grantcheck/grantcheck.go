@@ -542,7 +542,7 @@ func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at an
 			return chainError(err)
 		}
 		entries, err := ch.chainAfter(ctx, target, tst, idText)
-		if client.IsNotFound(err) && checked.Before(begun) {
+		if notInChain(err) && checked.Before(begun) {
 			// The cached head may be older than at: read it again.
 			if tst, _, err = ch.stateWithin(ctx, target, 0); err != nil {
 				return chainError(err)
@@ -550,7 +550,7 @@ func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at an
 			entries, err = ch.chainAfter(ctx, target, tst, idText)
 		}
 		switch {
-		case client.IsNotFound(err):
+		case notInChain(err):
 			return fmt.Errorf("at is not in the chain of %s", target)
 		case err != nil:
 			return chainError(err)
@@ -567,6 +567,13 @@ func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at an
 		}
 		return nil
 	}
+}
+
+// notInChain reports a 404 from the log itself: at is not in the chain. A
+// 404 from /keys, met opening a log range sealed under an older epoch, is
+// a chain the checker can't read (§C.4), not a refusal.
+func notInChain(err error) bool {
+	return client.IsNotFound(err) && !errors.Is(err, client.ErrKeyFetch)
 }
 
 // chainAfter is the log of target after at up to the head of tst, none

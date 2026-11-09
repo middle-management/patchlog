@@ -173,3 +173,81 @@ func TestV077ChainAtPastCachedHead(t *testing.T) {
 		t.Fatalf("at not in the chain: %v, want 403", err)
 	}
 }
+
+// §C.4 requireAt: a /keys failure met while reading the target's log (a
+// stored range sealed under an older epoch than the head's, §E.2.2) is a
+// chain the checker can't read, as when loading its state: a lasting 404
+// is 502 upstream and a 503 is 503 behind, never "at is not in the chain"
+// (403) naming the namespace.
+func TestV077ChainKeysFailInLog(t *testing.T) {
+	ctx := context.Background()
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, atKey := clienttest.NewKey("admin"), clienttest.NewKey("at")
+	var fail atomic.Int32
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LogPageSize: 1, Wrap: func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if st := int(fail.Load()); st != 0 && strings.HasPrefix(r.URL.Path, "/ns/cat-season/keys") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(st)
+				w.Write([]byte(`{"code":"not_found","message":"injected"}`))
+				return
+			}
+			h.ServeHTTP(w, r)
+		})
+	}})
+	atEntry := atKey.Entry("read")
+	atEntry["requireAt"] = "cat-season"
+	for ns, cfg := range map[string]map[string]any{
+		"cat-season": {"read": "grant", "keys": []any{admin.Entry("*")}, "encryption": map[string]any{"level": "sealed"}},
+		"sec":        {"read": "grant", "keys": []any{admin.Entry("*"), atEntry}},
+	} {
+		op := s.Client(t, client.WithBearer(s.OperatorGrant(t, ns)))
+		must(op.CreateNamespace(ctx, ns, cfg))
+	}
+	adminC := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:root", []string{"sec", "cat-season"}, []string{"read", "create", "append", "config"})), client.WithKeys(client.NewKeys(nil)))
+	h0 := must(adminC.NSHead(ctx, "cat-season"))
+	must(adminC.PatchConfig(ctx, "cat-season", h0.Config, []any{map[string]any{"op": "add", "path": "/maxLag", "value": "PT90S"}}))
+	h1 := must(adminC.NSHead(ctx, "cat-season"))
+	// The range (h0, h1] is read, so stored, under epoch 1 (§E.2.2).
+	must(adminC.NSLog(ctx, "cat-season", h1.ID, h0.ID))
+	must(adminC.PatchConfig(ctx, "cat-season", h1.Config, []any{map[string]any{"op": "add", "path": "/encryption/epoch", "value": 2.0}}))
+	h2 := must(adminC.NSHead(ctx, "cat-season"))
+
+	g := admin.Grant(t, s.Now(), "svc:index", []string{"sec", "cat-season"}, []string{"read"})
+	ch := grantcheck.New(s.Client(t, client.WithBearer(g), client.WithKeys(client.NewKeys(nil))), grantcheck.WithClock(s.Now), grantcheck.WithTTL(time.Hour))
+	grantAt := func(at string) string {
+		return atKey.Grant(t, s.Now(), "user:li", []string{"sec"}, []string{"read"}, map[string]any{"at": map[string]any{"ns": "cat-season", "id": at}, "nbf": s.Now().Format(time.RFC3339)})
+	}
+	// The checker loads cat-season at h2, with epoch 2's key only.
+	if _, err := ch.Verify(ctx, "sec", grantAt(h2.ID)); err != nil {
+		t.Fatalf("at the head: %v", err)
+	}
+	for _, tc := range []struct {
+		status    int32
+		transient bool
+	}{{404, false}, {503, true}} {
+		fail.Store(tc.status)
+		_, err := ch.Verify(ctx, "sec", grantAt(h0.ID))
+		var ae *grant.AuthError
+		if errors.As(err, &ae) {
+			t.Fatalf("/keys %d: a chain that can't be read refused as %d %q", tc.status, ae.Status, ae.Msg)
+		}
+		var ce *grantcheck.ChainError
+		if !errors.As(err, &ce) || ce.ChainUnreadable() != tc.transient {
+			t.Fatalf("/keys %d: %v, want a ChainError, transient %v", tc.status, err, tc.transient)
+		}
+		if strings.Contains(err.Error(), "cat-season") {
+			t.Errorf("/keys %d: %q names the namespace", tc.status, err)
+		}
+	}
+	// With /keys answering again, whatever it gives, h0 is no refusal
+	// naming the namespace either.
+	fail.Store(0)
+	_, err = ch.Verify(ctx, "sec", grantAt(h0.ID))
+	if err != nil && (authStatus(err) != 0 || strings.Contains(err.Error(), "cat-season")) {
+		t.Fatalf("at h0, keys answering: %v", err)
+	}
+}
