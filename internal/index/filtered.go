@@ -212,7 +212,12 @@ func lacksRead(ns string, err error) error {
 
 // fstate is what the index keeps to compute checkpoints: caches only, of
 // state that never changes once read (namespace documents, /heads and
-// documents at an ns_id, graphs at a checkpoint).
+// documents at an ns_id, graphs at a checkpoint) but for a purge, which
+// drops what it changes (fsForget). A purge can commit while a request
+// reads the origin, and that request's result must not be kept past the
+// purge, as kept.Store and derived.Cache have it (§A.1: "drop kept
+// results"): what is read of a namespace after fsGeneration is stored
+// (fsPutSince) only if no fsForget of it ran since.
 type fstate struct {
 	mu      sync.Mutex
 	docs    lru.Cache[string, map[string]any]  // ns \0 ns_id → namespace document
@@ -222,6 +227,14 @@ type fstate struct {
 	nodes   map[string]map[string]catNode      // catalog → its node documents last read
 	deleted lru.Cache[string, map[string]any]  // catalog \0 name \0 tombstone → last live document
 	flight  singleflight.Group
+	// gen counts the purges fsForget dropped a namespace's state for
+	// (fsGeneration), and purged holds the namespaces of the last ones,
+	// oldest first, at most fsMaxPurges.
+	gen    uint64
+	purged []string
+	// beforeStore, set by tests only, runs between an origin read and
+	// storing what it read (fsPutSince), with what is stored.
+	beforeStore func(what string)
 }
 
 // catNode is a catalog node's document as last read, at revision id.
@@ -236,12 +249,56 @@ const (
 	fsCatsMax    = 64
 	fsCPsMax     = 256
 	fsDeletedMax = 4096
+	// fsMaxPurges is how many purges fstate recalls the namespace of: a
+	// read from before more purges than that counts as purged.
+	fsMaxPurges = 1024
 )
 
 func (st *fstate) init() {
 	st.docs.MaxEntries, st.live.MaxEntries, st.cats.MaxEntries = fsDocsMax, fsLiveMax, fsCatsMax
 	st.cps.MaxEntries, st.deleted.MaxEntries = fsCPsMax, fsDeletedMax
 	st.nodes = map[string]map[string]catNode{}
+}
+
+// fsGeneration is the number of purges fsForget has counted so far. Take
+// it before reading from the origin what fstate keeps, and store what was
+// read with fsPutSince.
+func (ix *Index) fsGeneration() uint64 {
+	ix.fs.mu.Lock()
+	defer ix.fs.mu.Unlock()
+	return ix.fs.gen
+}
+
+// fsPutSince runs put, which stores in fstate what was read of nss after
+// gen (fsGeneration), with fs.mu held, unless a purge in one of nss has
+// dropped fstate's state of it (fsForget) since: what was read may predate
+// the purge's commit, and is served as it is, once, but not kept (§A.1).
+func (ix *Index) fsPutSince(what string, gen uint64, put func(), nss ...string) {
+	if h := ix.fs.beforeStore; h != nil {
+		h(what)
+	}
+	ix.fs.mu.Lock()
+	defer ix.fs.mu.Unlock()
+	if ix.fs.purgedSinceLocked(gen, nss) {
+		return
+	}
+	put()
+}
+
+// purgedSinceLocked reports whether fsForget dropped the state of one of
+// nss since generation gen, or may have: a purge no longer recalled
+// (fsMaxPurges) is taken to. Called with mu held.
+func (st *fstate) purgedSinceLocked(gen uint64, nss []string) bool {
+	n := st.gen - gen
+	if n > uint64(len(st.purged)) {
+		return true
+	}
+	for _, p := range st.purged[uint64(len(st.purged))-n:] {
+		if slices.Contains(nss, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // seedDoc keeps cfg's document as its namespace's at the ns_id the grant
@@ -312,6 +369,7 @@ func (ix *Index) liveAt(ctx context.Context, ns, id string) (map[string]bool, er
 		return l, nil
 	}
 	v, err := ix.shared(ctx, "live\x00"+k, func(ctx context.Context) (any, error) {
+		gen := ix.fsGeneration()
 		items, err := ix.c.Heads(ctx, ns, id)
 		if err != nil {
 			return nil, lacksRead(ns, fmt.Errorf("the heads of %s at %s: %w", ns, id, err))
@@ -322,9 +380,7 @@ func (ix *Index) liveAt(ctx context.Context, ns, id string) (map[string]bool, er
 				l[it.Resource] = true
 			}
 		}
-		ix.fs.mu.Lock()
-		ix.fs.live.Put(k, l, 1)
-		ix.fs.mu.Unlock()
+		ix.fsPutSince("live", gen, func() { ix.fs.live.Put(k, l, 1) }, ns)
 		return l, nil
 	})
 	if err != nil {
@@ -741,7 +797,8 @@ func (ix *Index) catalogAt(ctx context.Context, c fsCat, ids map[string]string) 
 		return cv, nil
 	}
 	v, err := ix.shared(ctx, "cat\x00"+k, func(ctx context.Context) (any, error) {
-		g, deleted, err := ix.catalogGraph(ctx, c.ns, ids[c.ns], c.doc)
+		gen := ix.fsGeneration()
+		g, deleted, err := ix.catalogGraph(ctx, gen, c.ns, ids[c.ns], c.doc)
 		if err != nil {
 			return nil, err
 		}
@@ -766,9 +823,8 @@ func (ix *Index) catalogAt(ctx context.Context, c fsCat, ids map[string]string) 
 			contents[m] = ct
 		}
 		cv := catvis.NewCatalogDeleted(g, contents, deleted)
-		ix.fs.mu.Lock()
-		ix.fs.cats.Put(k, cv, 1)
-		ix.fs.mu.Unlock()
+		// The key names c.ns and inCP, whose purges each drop it (fsForget).
+		ix.fsPutSince("cat", gen, func() { ix.fs.cats.Put(k, cv, 1) }, append([]string{c.ns}, inCP...)...)
 		return cv, nil
 	})
 	if err != nil {
@@ -782,8 +838,9 @@ func (ix *Index) catalogAt(ctx context.Context, c fsCat, ids map[string]string) 
 // (the revision its tombstone follows), as the origin builds them. A
 // document already read at the same revision is not read again; a
 // tombstoned node whose last live document is gone (pruned or purged) is
-// left out, as one purged is.
-func (ix *Index) catalogGraph(ctx context.Context, cat, id string, doc map[string]any) (*tree.Graph, []*tree.Node, error) {
+// left out, as one purged is. gen is the fsGeneration taken before any of
+// it was read.
+func (ix *Index) catalogGraph(ctx context.Context, gen uint64, cat, id string, doc map[string]any) (*tree.Graph, []*tree.Node, error) {
 	items, err := ix.c.Heads(ctx, cat, id)
 	if err != nil {
 		return nil, nil, lacksRead(cat, fmt.Errorf("the heads of %s at %s: %w", cat, id, err))
@@ -836,9 +893,7 @@ func (ix *Index) catalogGraph(ctx context.Context, cat, id string, doc map[strin
 	if err := g.Wait(); err != nil {
 		return nil, nil, err
 	}
-	ix.fs.mu.Lock()
-	ix.fs.nodes[cat] = nodes
-	ix.fs.mu.Unlock()
+	ix.fsPutSince("nodes", gen, func() { ix.fs.nodes[cat] = nodes }, cat)
 	gr := tree.BuildGraph(cat, doc, docs)
 	deleted := make([]*tree.Node, 0, len(lastLive))
 	for name, d := range lastLive {
@@ -858,6 +913,7 @@ func (ix *Index) lastLive(ctx context.Context, cat, name, tombstone string) (map
 		return d, nil
 	}
 	gone := func(err error) bool { return client.IsGone(err) || client.IsNotFound(err) }
+	gen := ix.fsGeneration()
 	entries, err := ix.c.Log(ctx, cat, name, tombstone, "")
 	if err != nil && !gone(err) {
 		return nil, fmt.Errorf("the log of %s/%s: %w", cat, name, err)
@@ -875,9 +931,7 @@ func (ix *Index) lastLive(ctx context.Context, cat, name, tombstone string) (map
 			return nil, fmt.Errorf("%s/%s at %s: %w", cat, name, parent, err)
 		}
 	}
-	ix.fs.mu.Lock()
-	ix.fs.deleted.Put(k, d, 1)
-	ix.fs.mu.Unlock()
+	ix.fsPutSince("deleted", gen, func() { ix.fs.deleted.Put(k, d, 1) }, cat)
 	return d, nil
 }
 
