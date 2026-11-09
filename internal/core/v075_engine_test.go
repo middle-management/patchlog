@@ -644,7 +644,7 @@ func TestV075GS(t *testing.T) {
 			digest = d
 		}
 	}
-	if want := []string{"group:editors", "partial", "scope:" + digest, "user:li"}; digest == "" || !reflect.DeepEqual(liSubs, want) {
+	if want := []string{"group:editors", catvis.KeySubject("catalog-01", w.catPub), "partial", "scope:" + digest, "user:li"}; digest == "" || !reflect.DeepEqual(liSubs, want) {
 		t.Fatalf("li's subjects %v", liSubs)
 	}
 	if liGS == "all" || liGS != grantcheck.SubjectSetID(liSubs) {
@@ -679,7 +679,7 @@ func TestV075GS(t *testing.T) {
 	// no partial.
 	w.patchConfig("matches", map[string]any{"op": "add", "path": "/roles/reader/rules",
 		"value": []any{map[string]any{"op": "test", "path": "/principal/groups/0", "exists": true}}})
-	if subs, _ := subjects(w.li()); !reflect.DeepEqual(subs[:3], []string{"group:editors", "group:interns", "scope:" + subs[2][6:]}) || slices.Contains(subs, "partial") {
+	if subs, _ := subjects(w.li()); !reflect.DeepEqual(subs[:4], []string{"group:editors", "group:interns", catvis.KeySubject("catalog-01", w.catPub), "scope:" + subs[3][6:]}) || slices.Contains(subs, "partial") {
 		t.Fatalf("all groups kept: %v", subs)
 	}
 }

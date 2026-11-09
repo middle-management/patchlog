@@ -12,9 +12,11 @@ import (
 // grantView is the view of a partial reader's grant at cp (§B.11.9 gs):
 // its subjects are catvis.FilteredSubjects over the deciding subjects of
 // every deciding catalog's Profile at cp, the grant's groups and its
-// ReadsScope digest, and its gs their grantcheck.SubjectSetID, never
-// "all". A grant whose read rules refer to /now (or the whole envelope)
-// can't read the namespace this way: 403.
+// ReadsScope digest, with catvis.KeySubject of the grant's key (so that
+// readers through different keys never share a gs), and its gs
+// their grantcheck.SubjectSetID, never "all". A grant whose read rules
+// refer to /now (or the whole envelope) can't read the namespace this
+// way: 403.
 func (t *tx) grantView(fs *fscope, cp *fcp, a *actor) (*fview, *Error) {
 	digest, ok := grantcheck.ReadsScope(a.verified)
 	if !ok {
@@ -27,7 +29,8 @@ func (t *tx) grantView(fs *fscope, cp *fcp, a *actor) (*fview, *Error) {
 		subs, _ := cats[i].Profile().Deciding(a.principal)
 		deciding = append(deciding, subs)
 	}
-	subjects := catvis.FilteredSubjects(deciding, a.principal.Groups, digest)
+	subjects := append(catvis.FilteredSubjects(deciding, a.principal.Groups, digest), catvis.KeySubject(a.verified.Key.Kid, keyPub(*a.verified.Key)))
+	slices.Sort(subjects)
 	return t.newFview(fs, cp, grantcheck.SubjectSetID(subjects), subjects, grantcheck.FilterOf(a.verified), a), nil
 }
 
@@ -141,7 +144,9 @@ func keyPub(k grant.Key) string {
 // whose pub was replaced is no longer the key the cookie came from
 // (§B.11.9 gs, "no longer accepted"; §C.4, a shared kid "accepted only
 // while the base has it with the same pub"). An empty stored pub, from a
-// row recorded before pubs were kept, never holds.
+// row recorded before pubs were kept, never holds, nor does a row whose
+// subjects don't bind its kid and pub (catvis.KeySubject), so that no row is
+// shared by readers through different keys.
 func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	seq, ok := cp.seqs[n.name]
 	if !ok {
@@ -149,7 +154,8 @@ func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	}
 	cfg := t.fconfigAt(seq)
 	key, ok := findKey(t.effectiveKeys(n, cfg), rec.kid)
-	if !ok || !key.Lists("read") || rec.pub == "" || keyPub(key) != rec.pub {
+	if !ok || !key.Lists("read") || rec.pub == "" || keyPub(key) != rec.pub ||
+		!slices.Contains(rec.subjects, catvis.KeySubject(rec.kid, rec.pub)) {
 		return false
 	}
 	in := grantcheck.ScopeInput{ReadScopeResource: key.ReadScopeResource, KeyRules: key.Rules, BlockRules: rec.blockRules,

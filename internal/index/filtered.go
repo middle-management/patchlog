@@ -39,7 +39,8 @@ import (
 // there without a namespace-wide edge grant, §C.5.2) reads it filtered by
 // visibility (§B.11.9 Visible): its marker is reads:{ns}:g:{gs}, gs being
 // the origin's (catvis.FilteredSubjects over every deciding catalog's
-// Profile, its groups and grantcheck.ReadsScope's digest), and its
+// Profile, its groups and grantcheck.ReadsScope's digest, with
+// catvis.KeySubject of its key), and its
 // answers are at the combined checkpoint (grantcheck.CombinedAt) of every
 // namespace visibility reads, which they list as namespaces:
 //
@@ -831,7 +832,8 @@ func (fv *fview) itemLive(n *tree.Node) bool {
 // grantFview is a partial reader's view at cp (§B.11.9 gs): its subjects
 // are catvis.FilteredSubjects over the deciding subjects of every
 // deciding catalog's Profile there, the grant's groups and its ReadsScope
-// digest; its filter the grant's (grantcheck.FilterOf). A grant whose
+// digest, with catvis.KeySubject of its key, as the origin's; its filter
+// the grant's (grantcheck.FilterOf). A grant whose
 // read rules refer to /now can't read this way: 403.
 func grantFview(cp *fcp, v *grant.Verified) (*fview, error) {
 	digest, ok := grantcheck.ReadsScope(v)
@@ -843,7 +845,9 @@ func grantFview(cp *fcp, v *grant.Verified) (*fview, error) {
 		subs, _ := c.Profile().Deciding(v.Principal)
 		deciding = append(deciding, subs)
 	}
-	subjects := catvis.FilteredSubjects(deciding, v.Principal.Groups, digest)
+	pub, _ := v.Key.Raw["pub"].(string)
+	subjects := append(catvis.FilteredSubjects(deciding, v.Principal.Groups, digest), catvis.KeySubject(v.Key.Kid, pub))
+	slices.Sort(subjects)
 	return newFview(cp, subjects, grantcheck.FilterOf(v)), nil
 }
 

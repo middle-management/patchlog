@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"crypto/ed25519"
+	"fmt"
 	"testing"
 	"time"
 
@@ -72,7 +73,7 @@ func v76fRedirect(t *testing.T, w *v75World, ns, gs string, cred Credentials) (*
 			return nil, v75Status(err)
 		}
 	}
-	err := w.e.FilteredCurrent(ctx, ns, gs, cred)
+	err := w.e.FilteredCurrent(ctx, ns, gs, "/heads", cred)
 	if r, ok := err.(*FilteredRedirect); ok {
 		return r, 0
 	}
@@ -402,16 +403,23 @@ func TestV076OriginGSBoundToPub(t *testing.T) {
 			if _, err := w.e.IssueEdgeGrants(ctx, []string{cred.Bearer}); v75Status(err) != 401 {
 				t.Fatalf("the old grant's exchange: %v, want 401", err)
 			}
+			// A grant of the new key exchanges for a gs of its own, bound
+			// to the new pub (catvis.KeySubject); the old gs stays 403.
 			fresh := grantOf(newPriv)
 			res, err = w.e.IssueEdgeGrants(ctx, []string{fresh.Bearer})
-			if err != nil || len(res.Grants) != 1 || res.Grants[0].GS != gs {
-				t.Fatalf("exchange with the new key: %+v %v", res, err)
+			if err != nil || len(res.Grants) != 1 || res.Grants[0].GS == "" || res.Grants[0].GS == gs {
+				t.Fatalf("exchange with the new key: %+v %v (old gs %s)", res, err, gs)
 			}
-			red3, st := v76fRedirect(t, w.v75World, c.ns, gs, cookie)
+			if _, st := v76fRedirect(t, w.v75World, c.ns, gs, cookie); st != 403 {
+				t.Fatalf("the old cookie after exchanging again: %d, want 403", st)
+			}
+			gs2 := res.Grants[0].GS
+			cookie2 := Credentials{Edge: &EdgeGrant{NS: c.ns, GS: gs2, Prefix: "/ns/" + c.ns + "/g/" + gs2, Exp: w.now().Add(10 * time.Minute)}}
+			red3, st := v76fRedirect(t, w.v75World, c.ns, gs2, cookie2)
 			if red3 == nil {
 				t.Fatalf("cookie after exchanging again: %d", st)
 			}
-			if names, st := v76fHeads(t, w.v75World, c.ns, gs, red3.At, cookie); st != 0 || !v76fHas(names, "derby") {
+			if names, st := v76fHeads(t, w.v75World, c.ns, gs2, red3.At, cookie2); st != 0 || !v76fHas(names, "derby") {
 				t.Fatalf("cookie after exchanging again: %v %d", names, st)
 			}
 		})
@@ -450,16 +458,154 @@ func TestV076OriginUncoveredFiltered401(t *testing.T) {
 		"private, a grant for another namespace":  {"priv", k("matches", "read"), 403},
 		"private, a grant that doesn't read here": {"priv", k("priv", "create"), 403},
 	} {
-		st := v75Status(w.e.FilteredCurrent(ctx, c.ns, gs, c.cred))
+		st := v75Status(w.e.FilteredCurrent(ctx, c.ns, gs, "/heads", c.cred))
+		lst := v75Status(w.e.FilteredCurrent(ctx, c.ns, gs, "/log", c.cred))
 		_, _, herr := w.e.FilteredHeads(ctx, c.ns, gs, at, "", "", c.cred)
 		_, _, lerr := w.e.FilteredLog(ctx, c.ns, gs, at, "", 0, c.cred)
-		if st != c.want || v75Status(herr) != c.want || v75Status(lerr) != c.want {
-			t.Errorf("%s: FilteredCurrent %d, FilteredHeads %v, FilteredLog %v, want %d", name, st, herr, lerr, c.want)
+		if st != c.want || lst != c.want || v75Status(herr) != c.want || v75Status(lerr) != c.want {
+			t.Errorf("%s: FilteredCurrent %d %d, FilteredHeads %v, FilteredLog %v, want %d", name, st, lst, herr, lerr, c.want)
 		}
 		if c.want == 401 {
 			if e, _ := herr.(*Error); e == nil || e.Body["code"] != "unauthenticated" {
 				t.Errorf("%s: %v, want unauthenticated", name, herr)
 			}
 		}
+	}
+}
+
+// §B.11.9 Purged namespaces, §8.5: a purged namespace this section doesn't
+// cover answers its filtered URLs as §8.5 answers their unfiltered forms
+// once the read check passes: /heads, at an at or without, is 410, as are
+// long-poll and events from the purge-ns entry; the forms §8.5 serves as
+// before keep the uncovered answer, 401 without credentials. A private
+// purged namespace is still 401 before any 410.
+func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
+	t.Parallel()
+	w := newV75World(t, v75Opts{})
+	ctx := context.Background()
+	for _, ns := range []string{"pub", "priv"} {
+		read := "grant"
+		if ns == "pub" {
+			read = "public"
+		}
+		w.mkNS(ns, map[string]any{"read": read, "keys": []any{w.kEntry()}})
+		w.admin = w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:r", "ns": []any{ns}, "can": []any{"config", "read"}})
+		w.patchConfig(ns, map[string]any{"op": "add", "path": "/frozen", "value": true})
+		op := w.cred(w.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{ns}, "can": []any{"purge-ns"}})
+		if _, err := w.e.PurgeNamespace(ctx, Request{NS: ns, Cred: op}, w.head(ns), true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gs := grantcheck.SubjectSetID([]string{"group:editors"})
+	reader := func(ns string) Credentials {
+		return w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:r", "ns": []any{ns}, "can": []any{"read"}})
+	}
+	for _, c := range []struct {
+		name, ns   string
+		cred       Credentials
+		heads, log int // /heads forms; log ranges and live from elsewhere
+	}{
+		{"public, no credentials", "pub", Credentials{}, 410, 401},
+		{"public, a grant that verifies there", "pub", reader("pub"), 410, 403},
+		{"private, no credentials", "priv", Credentials{}, 401, 401},
+		{"private, a grant that reads there", "priv", reader("priv"), 410, 403},
+	} {
+		w.admin = w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:r", "ns": []any{c.ns}, "can": []any{"read"}})
+		purge := w.head(c.ns)
+		_, uerr := w.e.NamespaceHeads(ctx, c.ns, purge, "", c.cred)
+		if v75Status(uerr) != c.heads {
+			t.Fatalf("%s: unfiltered /heads %v, want %d", c.name, uerr, c.heads)
+		}
+		at := grantcheck.CombinedAt(map[string]string{c.ns: purge})
+		_, _, herr := w.e.FilteredHeads(ctx, c.ns, gs, at, "", "", c.cred)
+		hcur := w.e.FilteredCurrent(ctx, c.ns, gs, "/heads", c.cred)
+		_, _, pollPurge := w.e.FilteredLiveLog(ctx, c.ns, gs, purge, 10, c.cred)
+		if v75Status(herr) != c.heads || v75Status(hcur) != c.heads || v75Status(pollPurge) != c.heads {
+			t.Errorf("%s: FilteredHeads %v, FilteredCurrent /heads %v, live from the purge-ns entry %v, want %d", c.name, herr, hcur, pollPurge, c.heads)
+		}
+		if c.heads == 410 {
+			if e, _ := herr.(*Error); e == nil || e.Body["code"] != "purged" || e.Body["head"] != purge {
+				t.Errorf("%s: %v, want purged with head %s", c.name, herr, purge)
+			}
+		}
+		_, _, lerr := w.e.FilteredLog(ctx, c.ns, gs, at, "", 10, c.cred)
+		lcur := w.e.FilteredCurrent(ctx, c.ns, gs, "/log", c.cred)
+		_, _, poll := w.e.FilteredLiveLog(ctx, c.ns, gs, "", 10, c.cred)
+		if v75Status(lerr) != c.log || v75Status(lcur) != c.log || v75Status(poll) != c.log {
+			t.Errorf("%s: FilteredLog %v, FilteredCurrent /log %v, live %v, want %d", c.name, lerr, lcur, poll, c.log)
+		}
+	}
+}
+
+// §B.11.9 gs, §C.4: readers whose grants come from two keys with the same
+// scope rules never share a gs, so neither's filtered_gs row judges the
+// other's cookies: once fan's pub is replaced, a cookie from fan's grant
+// is 403 whatever is exchanged through fan2, before or after, and fan2's
+// cookie reads on. Before catvis.KeySubject both got one gs, whose row
+// kept the kid and pub of the last exchange.
+func TestV076OriginGSPerKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, rotateFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rotate first %v", rotateFirst), func(t *testing.T) {
+			t.Parallel()
+			w := newV76fWorld(t, false)
+			pub2, priv2 := grant.GenerateKey()
+			e2 := v76fFanEntry(pub2)
+			e2["kid"] = "fan2"
+			w.patchConfig("matches", map[string]any{"op": "add", "path": "/keys/-", "value": e2})
+			a := w.fan("matches", w.fanPriv)
+			b := w.cred(priv2, map[string]any{"kid": "fan2", "sub": "user:other", "groups": []any{"fan-club"}, "ns": []any{"matches"}, "can": []any{"read"},
+				"exp": w.now().Add(10 * time.Minute).UTC().Format(time.RFC3339)})
+			exchange := func(c Credentials) (string, Credentials) {
+				t.Helper()
+				res, err := w.e.IssueEdgeGrants(ctx, []string{c.Bearer})
+				if err != nil || len(res.Grants) != 1 || res.Grants[0].GS == "" {
+					t.Fatalf("exchange: %+v %v", res, err)
+				}
+				gs := res.Grants[0].GS
+				return gs, Credentials{Edge: &EdgeGrant{NS: "matches", GS: gs, Prefix: "/ns/matches/g/" + gs, Exp: w.now().Add(10 * time.Minute)}}
+			}
+			rotate := func() {
+				np, _ := grant.GenerateKey()
+				w.patchConfig("matches", map[string]any{"op": "replace", "path": "/keys/2/pub", "value": np})
+			}
+			gsA, cookieA := exchange(a)
+			if rotateFirst {
+				rotate()
+				if _, st := v76fRedirect(t, w.v75World, "matches", gsA, cookieA); st != 403 {
+					t.Fatalf("fan's cookie after the rotation: %d, want 403", st)
+				}
+			}
+			gsB, cookieB := exchange(b)
+			if gsA == gsB {
+				t.Fatalf("grants of fan and fan2 share gs %s", gsA)
+			}
+			w.inTx(func(t2 *tx) {
+				if r := t2.loadGS("matches", gsA); r == nil || r.kid != "fan" || r.pub != w.fanPub {
+					t.Fatalf("fan's row %+v", r)
+				}
+				if r := t2.loadGS("matches", gsB); r == nil || r.kid != "fan2" || r.pub != pub2 {
+					t.Fatalf("fan2's row %+v", r)
+				}
+			})
+			if !rotateFirst {
+				rotate()
+			}
+			if red, st := v76fRedirect(t, w.v75World, "matches", gsA, cookieA); red != nil || st != 403 {
+				names := []string(nil)
+				if red != nil {
+					names, _ = v76fHeads(t, w.v75World, "matches", gsA, red.At, cookieA)
+				}
+				t.Fatalf("fan's cookie after fan's pub was replaced: %d %v, want 403", st, names)
+			}
+			red, st := v76fRedirect(t, w.v75World, "matches", gsB, cookieB)
+			if red == nil {
+				t.Fatalf("fan2's cookie: %d", st)
+			}
+			if names, st := v76fHeads(t, w.v75World, "matches", gsB, red.At, cookieB); st != 0 || !v76fHas(names, "derby") {
+				t.Fatalf("fan2's cookie: %v %d", names, st)
+			}
+		})
 	}
 }

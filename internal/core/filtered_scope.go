@@ -14,7 +14,7 @@ import (
 // long-poll and events filtered to what it may see, at URLs under
 // /ns/{ns}/g/{gs}, where gs is its subject set: the deciding subjects of
 // every catalog the namespace trusts, plus scope:{digest} of its read
-// rules (§A.4).
+// rules (§A.4) and a subject binding it to its grant's key (catvis.KeySubject).
 //
 // The files of this feature, each read inside one read transaction:
 //
