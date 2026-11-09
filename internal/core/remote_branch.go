@@ -83,11 +83,15 @@ import (
 //     be mirrored: its horizon is a sealed snapshot. Content from before a
 //     raise from sealed is mirrored with the base's sealings of it,
 //     byte for byte, each keeping its epoch (fetchPreSealings, §G.5.2),
-//     checked with the base's keys of those epochs where B holds them and
-//     by their shape where it doesn't; B hands those keys out by start
-//     times read only from base.origin itself (originStarts). B never
-//     seals that content itself: a sealing the base didn't serve it
-//     answers 502 upstream, as for a failed fetch (preRaiseUnfetched).
+//     each stored only once opened with the base's key of its epoch and
+//     verified: creation is 422 where the endpoint's grant gets no key of
+//     an epoch such content is sealed under, as for a base B can't read
+//     (§G.3 Creating one); B hands those keys out by start times read
+//     only from base.origin itself (originStarts). B never seals that
+//     content itself: a sealing the base didn't serve it is pending
+//     (preraise_pending.go), fetched again at each sync until it opens
+//     and verifies, and answers 502 upstream until then, or 410 pruned
+//     once the base answered that (preRaiseUnfetched).
 
 // RemoteAuthor is the author of entries this deployment writes on behalf of
 // a remote base: purges followed from its log, and mirrored horizons whose
@@ -984,8 +988,11 @@ func originCreated(ctx context.Context, ep RemoteEndpoint, url string, lv *remot
 // with start times only from the source's own log (§G.5.2), and none while
 // those are unknown (originStarts), though it still holds them to check and
 // serve the source's sealings. Keys the source gives this grant none of, it
-// relays none of; keyring entries (from) are the mirrored keyring's. Only
-// no answer, or a 5xx, fails creation.
+// relays none of, and content sealed under one makes creation 422
+// (fetchPreSealings, §G.3 Creating one); keyring entries (from) are the
+// mirrored keyring's. No answer, or a 5xx, 408 or 429 (noAnswer), fails
+// creation 502: without A's answer, B can't tell whether its grant gets
+// those keys.
 func fetchPreRaiseKeys(ctx context.Context, c *client.Client, ep RemoteEndpoint, lv *remoteLevel) *Error {
 	if lv.raise < 0 || len(lv.preEpochs) == 0 {
 		return nil
@@ -999,7 +1006,9 @@ func fetchPreRaiseKeys(ctx context.Context, c *client.Client, ep RemoteEndpoint,
 		if noAnswer(err) {
 			return upstreamErr("/ns/%s/keys: %v", lv.ns, err)
 		}
-		log.Printf("remote base %s: its keys of the epochs before its raise to e2e: %v; the branch gives none of them", lv.ns, err)
+		// Refused: none of them. Content sealed under one of those epochs
+		// is 422 (fetchPreSealings).
+		log.Printf("remote base %s: its keys of the epochs before its raise to e2e: %v; the branch gets none of them", lv.ns, err)
 		return nil
 	}
 	lv.preKeys = map[int][]byte{}
@@ -2393,14 +2402,18 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 // follows the base's document as of the checkpoint, once, whether or not
 // the log has moved since: the entries before it were followed only for
 // their purges. The epochs the e2e bases below the base have in force now
-// are followed too (followChainEpochs), and start times base.origin
-// couldn't give at creation are read from it again (followPreStarts).
+// are followed too (followChainEpochs), start times base.origin couldn't
+// give at creation are read from it again (followPreStarts), and the
+// base's sealings of content from before its raise that the branch still
+// lacks are fetched again, and stored once opened and verified
+// (retryPreSealings, §G.5.2 E3 sources).
 func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	c, ep, err := e.remoteClient(b.origin)
 	if err != nil {
 		return err
 	}
-	return errors.Join(e.followLog(ctx, c, ep, b), e.retryLevel(ctx, b.branch), e.followChainEpochs(ctx, c, ep, b), e.followPreStarts(ctx, c, ep, b))
+	return errors.Join(e.followLog(ctx, c, ep, b), e.retryLevel(ctx, b.branch), e.followChainEpochs(ctx, c, ep, b), e.followPreStarts(ctx, c, ep, b),
+		e.retryPreSealings(ctx, ep, c.BaseURL(), b))
 }
 
 // followPreStarts reads again, for each shadow of a remote branch holding

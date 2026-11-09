@@ -9,7 +9,9 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 )
 
-// V77-01 (v0.77): 408 and 429 are transient (§A.4, §12.1).
+// V77-01 (v0.77): 408 and 429 are transient (§A.4, §12.1), and a
+// pre-raise sealing A doesn't serve B is pending with A's answer (§G.5.2
+// E3 sources).
 
 // §A.4 ("a schema or key fetch that fails transiently (transport error,
 // 5xx, 408, 429) is retried"), §G.3 Creating one: a 408 or 429 from A,
@@ -41,5 +43,30 @@ func TestV077EncNoAnswerTransient(t *testing.T) {
 	}
 	if e := fetchErr("/ns/m/keys", &client.APIError{Status: 403}); e.Status != 422 {
 		t.Errorf("fetchErr of a 403: %v, want 422", e)
+	}
+}
+
+// §G.5.2 E3 sources: A's answers to a sealing B asks for, as recorded.
+func TestV077EncPendingAnswer(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		st            int
+		body          string
+		err           error
+		answer, horiz string
+	}{
+		{0, "", context.DeadlineExceeded, pendTransient, ""},
+		{503, "", nil, pendTransient, ""},
+		{408, "", nil, pendTransient, ""},
+		{429, "", nil, pendTransient, ""},
+		{403, `{"code":"forbidden"}`, nil, pendRefused, ""},
+		{404, "", nil, pendRefused, ""},
+		{410, `{"code":"gone"}`, nil, pendRefused, ""},
+		{410, `{"code":"pruned","horizon":"1abc"}`, nil, pendPruned, "1abc"},
+	} {
+		a, h := pendingAnswer(c.st, []byte(c.body), c.err)
+		if a != c.answer || h != c.horiz {
+			t.Errorf("%d %s %v: %s %q, want %s %q", c.st, c.body, c.err, a, h, c.answer, c.horiz)
+		}
 	}
 }
