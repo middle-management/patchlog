@@ -25,3 +25,13 @@ func KeySubject(kid, pub string) string {
 	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo([]any{kid, pub})))
 	return KeyPrefix + ids.FromBytes(sum[:ids.Size]).String()
 }
+
+// ScopeKeyDigest is the digest of §A.4's scope marker
+// reads:{ns}:scope:{digest}, which covers the rules that limit a reader's
+// reads, d (grantcheck.ReadsScope), and its key's key: string
+// (KeySubject): the digest of canonical([d, key:…]). §B.11.9's gs carries
+// the same, scope:{digest} "of §A.4's marker for {ns}" (FilteredSubjects).
+func ScopeKeyDigest(d, kid, pub string) string {
+	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo([]any{d, KeySubject(kid, pub)})))
+	return ids.FromBytes(sum[:ids.Size]).String()
+}

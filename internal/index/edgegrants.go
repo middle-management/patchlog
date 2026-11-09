@@ -2,7 +2,6 @@ package index
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"net/http"
@@ -119,17 +118,15 @@ func markerRecOf(a *access, v *grant.Verified) *markerRec {
 // through the key with kid and pub (§A.4): its digest covers d and the
 // key's key: string (catvis.KeySubject, §B.11.9 gs), so readers through
 // two keys with the same rules never share a marker, its gs, its edge
-// filter or its cookie prefix. grantcheck's digest, which the origin's
-// scope: subject is, stays as it is.
+// filter or its cookie prefix. A gs's scope: subject is the same digest
+// (§B.11.9 gs: "scope:{digest} of §A.4's marker"), at the origin too.
 func scopeMarker(ns, d, kid, pub string) string {
 	return "reads:" + ns + ":scope:" + scopeKeyDigest(d, kid, pub)
 }
 
-// scopeKeyDigest is scopeMarker's digest: of d and the key's key: string.
-func scopeKeyDigest(d, kid, pub string) string {
-	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo([]any{d, catvis.KeySubject(kid, pub)})))
-	return ids.FromBytes(sum[:ids.Size]).String()
-}
+// scopeKeyDigest is scopeMarker's digest: of d and the key's key: string
+// (catvis.ScopeKeyDigest).
+func scopeKeyDigest(d, kid, pub string) string { return catvis.ScopeKeyDigest(d, kid, pub) }
 
 // keyPub is k's pub member as the namespace document gives it, "" if it
 // has none (§B.11.9 gs: "accepted only while the base has it with the

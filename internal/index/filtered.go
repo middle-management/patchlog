@@ -1105,8 +1105,9 @@ func (fv *fview) itemLive(n *tree.Node) bool {
 
 // grantFview is a partial reader's view at cp (§B.11.9 gs): its subjects
 // are catvis.FilteredSubjects over the deciding subjects of every
-// deciding catalog's Profile there, the grant's groups and its ReadsScope
-// digest, with catvis.KeySubject of its key, as the origin's; its filter
+// deciding catalog's Profile there, the grant's groups and §A.4's marker
+// digest (its ReadsScope digest with its key, scopeKeyDigest), with
+// catvis.KeySubject of its key, as the origin's; its filter
 // the grant's (grantcheck.FilterOf). A grant whose
 // read rules refer to /now can't read this way: 403.
 func grantFview(cp *fcp, v *grant.Verified) (*fview, error) {
@@ -1120,7 +1121,7 @@ func grantFview(cp *fcp, v *grant.Verified) (*fview, error) {
 		deciding = append(deciding, subs)
 	}
 	pub, _ := v.Key.Raw["pub"].(string)
-	subjects := append(catvis.FilteredSubjects(deciding, v.Principal.Groups, digest), catvis.KeySubject(v.Key.Kid, pub))
+	subjects := append(catvis.FilteredSubjects(deciding, v.Principal.Groups, scopeKeyDigest(digest, v.Key.Kid, pub)), catvis.KeySubject(v.Key.Kid, pub))
 	slices.Sort(subjects)
 	return newFview(cp, subjects, grantcheck.FilterOf(v)), nil
 }
@@ -1178,7 +1179,13 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *marker
 		keys = eff.Keys
 	}
 	for _, k := range recorded {
-		if !gsKeyHolds(cfg, keys, rec.f, k, func(d string) bool { return slices.Contains(rec.subjects, catvis.ScopePrefix+d) }) {
+		// §A.4's marker digest, as grantFview has it. A marker recorded
+		// with the rules' digest alone (before this release) never holds:
+		// its cookies are 403 until the reader exchanges again.
+		holds := func(d string) bool {
+			return slices.Contains(rec.subjects, catvis.ScopePrefix+scopeKeyDigest(d, k.kid, k.pub))
+		}
+		if !gsKeyHolds(cfg, keys, rec.f, k, holds) {
 			return nil, errRulesChanged
 		}
 	}

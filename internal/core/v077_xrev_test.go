@@ -2,10 +2,13 @@ package core
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
 // Cross-review (conformance lens): scenario tests for the v0.77 scenarios
@@ -203,4 +206,34 @@ func TestV077XconfScenario118(t *testing.T) {
 	if len(r) != 3 || r["name"] != "reader" || r["can"] == nil || r["rules"] == nil {
 		t.Errorf("role entry %v, want exactly name, can, rules", r)
 	}
+}
+
+// Cross-review (conformance lens), §B.11.9 gs: a gs's subjects carry "the
+// string scope:{digest} of §A.4's marker for {ns}", whose digest covers
+// the rules and the key's key: string (catvis.ScopeKeyDigest), not the
+// rules' digest alone.
+func TestV077XrevGSScopeSubjectIsMarkerDigest(t *testing.T) {
+	t.Parallel()
+	w := newV75World(t, v75Opts{})
+	w.seed()
+	li := w.li()
+	w.inTx(func(t2 *tx) {
+		n := t2.nsByName("matches")
+		a, _, _, err := t2.nsAccess(n, li)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, ok := grantcheck.ReadsScope(a.verified)
+		if !ok {
+			t.Fatal("li's reads refer to /now")
+		}
+		fv := v075View(t, t2, "matches", li)
+		want := catvis.ScopePrefix + catvis.ScopeKeyDigest(d, a.verified.Key.Kid, keyPub(*a.verified.Key))
+		if !slices.Contains(fv.subjects, want) {
+			t.Errorf("subjects %v, want %s, §A.4's marker digest", fv.subjects, want)
+		}
+		if slices.Contains(fv.subjects, catvis.ScopePrefix+d) {
+			t.Errorf("subjects %v carry the rules' digest alone", fv.subjects)
+		}
+	})
 }

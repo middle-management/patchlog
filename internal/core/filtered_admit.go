@@ -11,8 +11,9 @@ import (
 
 // grantView is the view of a partial reader's grant at cp (§B.11.9 gs):
 // its subjects are catvis.FilteredSubjects over the deciding subjects of
-// every deciding catalog's Profile at cp, the grant's groups and its
-// ReadsScope digest, with catvis.KeySubject of the grant's key (so that
+// every deciding catalog's Profile at cp, the grant's groups and §A.4's
+// marker digest, catvis.ScopeKeyDigest of its ReadsScope digest and its
+// key, with catvis.KeySubject of the grant's key (so that
 // readers through different keys never share a gs), and its gs
 // their grantcheck.SubjectSetID, never "all". A grant whose read rules
 // refer to /now (or the whole envelope) can't read the namespace this
@@ -29,7 +30,8 @@ func (t *tx) grantView(fs *fscope, cp *fcp, a *actor) (*fview, *Error) {
 		subs, _ := cats[i].Profile().Deciding(a.principal)
 		deciding = append(deciding, subs)
 	}
-	subjects := append(catvis.FilteredSubjects(deciding, a.principal.Groups, digest), catvis.KeySubject(a.verified.Key.Kid, keyPub(*a.verified.Key)))
+	kid, pub := a.verified.Key.Kid, keyPub(*a.verified.Key)
+	subjects := append(catvis.FilteredSubjects(deciding, a.principal.Groups, catvis.ScopeKeyDigest(digest, kid, pub)), catvis.KeySubject(kid, pub))
 	slices.Sort(subjects)
 	return t.newFview(fs, cp, grantcheck.SubjectSetID(subjects), subjects, grantcheck.FilterOf(a.verified), a), nil
 }
