@@ -717,8 +717,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		ix.writeUpstreamErr(w, "exchange", upErr, "cannot read a namespace configuration")
 		return
 	case purged != nil:
-		w.Header().Set("Cache-Control", "no-store")
-		writeJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "namespace purged", "ns": purged.ns, "head": purged.head})
+		purged.write(w)
 		return
 	}
 	var issues []svcedge.Issue
@@ -798,8 +797,9 @@ type purgedNS struct{ ns, head string }
 // (Index.committed, as its queries answer) or the core's 410 of a sealed
 // one's document (§8.5), is left out too (Coverage "leaves out ...
 // purged ones"); a grant left with no edge grant and no 401 or 403
-// refusal, only purged ones, is refused as pn names, the first such.
-func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[string]string, now time.Time) (ex *exchanged, pn *purgedNS, err error) {
+// refusal is 410 only where every namespace it names is purged and it
+// verifies in each (purgedOnly), naming the first; otherwise 403.
+func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[string]string, now time.Time) (*exchanged, *purgedNS, error) {
 	g, err := ix.checker.Decode(token)
 	if err != nil {
 		var le *grantcheck.LimitError
@@ -809,7 +809,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		}
 		return nil, nil, &grant.AuthError{Status: 401, Msg: "the grant can't be decoded"}
 	}
-	ex = &exchanged{subjects: map[string][]string{}, filters: map[string]*markerRec{}}
+	ex := &exchanged{subjects: map[string][]string{}, filters: map[string]*markerRec{}}
 	var (
 		markers []string
 		refsExp time.Time
@@ -837,17 +837,15 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		if _, lacks := ix.keys.Skip(ns); lacks {
 			continue // one the service doesn't follow (§A.4)
 		}
-		head, purged, err := ix.committed(ctx, ns)
+		_, purged, err := ix.committed(ctx, ns)
 		if err != nil {
 			fail(err)
 			continue
 		}
 		cfg, err := ix.checker.Config(ctx, ns)
 		if client.IsPurged(err) {
-			if head, err = ix.checker.PurgedRead(ctx, ns, token); err != nil {
+			if _, err = ix.checker.PurgedRead(ctx, ns, token); err != nil {
 				fail(err)
-			} else if pn == nil {
-				pn = &purgedNS{ns: ns, head: head}
 			}
 			continue
 		}
@@ -875,10 +873,8 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			}
 		}
 		if purged {
-			// Its queries answer 410 once the read check passes (§8.5).
-			if pn == nil {
-				pn = &purgedNS{ns: ns, head: head}
-			}
+			// Its queries answer 410 once the read check passes (§8.5):
+			// left out, and judged by purgedOnly below.
 			continue
 		}
 		exp := ix.opt.EdgeGrants.Lifetime(now, grantExp(v))
@@ -914,14 +910,84 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 	case len(ex.issues) > 0:
 		return ex, nil, nil
 	case denied != nil:
+		// A refusal means some namespace it names isn't purged or the
+		// grant doesn't verify there: never 410.
 		return nil, nil, denied
-	case pn != nil:
+	}
+	if pn := ix.purgedOnly(ctx, token, g); pn != nil {
 		return nil, pn, nil
 	}
 	return nil, nil, &grant.AuthError{Status: 403, Msg: "the grant reads no private namespace this service follows"}
 }
 
+// purgedOnly is the purge an exchange, or /_refs, answers 410 for a grant
+// left with nothing to read (§A.4 Coverage: "where every namespace its
+// grant names is purged and the grant verifies in each, 410 as §C.5.2
+// gives it"; §C.5.2: "410 only when every namespace refused is purged and
+// the grant verifies in each"), the first in the order its root block
+// names them; nil unless every namespace g names is one the service
+// follows, whose keys it doesn't lack, that is purged, and whose read
+// check token passes (the core's PurgedRead for one whose document is
+// 410, else Verify and grantAccess, as its queries' read check). A grant
+// naming "*" in every block that names namespaces names no set of them,
+// and never qualifies; nor does one naming a namespace the service
+// doesn't follow, or one it can't read.
+func (ix *Index) purgedOnly(ctx context.Context, token string, g *grant.Grant) *purgedNS {
+	var named []string
+	for _, b := range g.Blocks {
+		if b.HasNS && !slices.Contains(b.NS, "*") {
+			named = b.NS
+			break
+		}
+	}
+	named = slices.DeleteFunc(slices.Clone(named), func(ns string) bool { return !g.NamesNS(ns) })
+	if len(named) == 0 {
+		return nil
+	}
+	followed := ix.refsNamespaces()
+	var first *purgedNS
+	for _, ns := range named {
+		if !slices.Contains(followed, ns) {
+			return nil
+		}
+		if _, lacks := ix.keys.Skip(ns); lacks {
+			return nil
+		}
+		head, purged, err := ix.committed(ctx, ns)
+		if err != nil {
+			return nil
+		}
+		_, cerr := ix.checker.Config(ctx, ns)
+		switch {
+		case client.IsPurged(cerr):
+			if head, err = ix.checker.PurgedRead(ctx, ns, token); err != nil {
+				return nil
+			}
+		case cerr != nil, !purged:
+			return nil
+		default:
+			v, err := ix.checker.Verify(ctx, ns, token)
+			if err != nil {
+				return nil
+			}
+			if _, err := ix.grantAccess(ctx, ns, v); err != nil {
+				return nil
+			}
+		}
+		if first == nil {
+			first = &purgedNS{ns: ns, head: head}
+		}
+	}
+	return first
+}
+
 func (p *purgedNS) Error() string { return p.ns + " was purged" }
+
+// write answers p: 410 purged, with ns and head (§8.5, §C.5.2).
+func (p *purgedNS) write(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "namespace purged", "ns": p.ns, "head": p.head})
+}
 
 // namedInOrder is those of followed that g names, in the order g's root
 // block lists them (§C.5.2); one it reaches only through "*" comes where

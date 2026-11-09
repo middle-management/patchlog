@@ -238,7 +238,9 @@ func (ix *Index) refsNamespaces() []string {
 // ones out) and not skipped: a namespace the reader may not read is left
 // out, and if that leaves none, the answer is a refusal that names none of
 // them (one the reader can't see is like one the service doesn't follow):
-// 401 if any refusal is, else 403. Otherwise it notes whether the grant
+// 401 if any refusal is, else 403; or, for a grant every namespace of
+// which it names is purged, and that verifies in each, the purge, 410
+// (*purgedNS, purgedOnly). Otherwise it notes whether the grant
 // verified (unverified), which decides the refusal at another gs's URL.
 func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[string]string) (*refsReader, error) {
 	if bearer(r) == "" {
@@ -308,6 +310,14 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			rd.markers[ns] = a.marker
 		}
 		rd.nss = append(rd.nss, ns)
+	}
+	// A grant every namespace of which it names is purged, and verifies
+	// in each, is 410 (§A.4 Coverage), never an empty answer: purged
+	// namespaces are left out of reached.
+	if len(rd.nss) == 0 && g != nil {
+		if pn := ix.purgedOnly(ctx, bearer(r), g); pn != nil {
+			return nil, pn
+		}
 	}
 	switch {
 	case len(rd.nss) > 0 || refused == 0:

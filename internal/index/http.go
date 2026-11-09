@@ -687,7 +687,8 @@ var errVisibility = errors.New("visibility")
 // writeAccessErr answers err, a failed read check (Index.access,
 // refsReader): 413 for a grant over a limit (writeLimit); a requireAt
 // chain the verifier can't read, whatever else err is, as
-// writeUpstreamErr answers it (§C.4: "never 403"); a refusal as such,
+// writeUpstreamErr answers it (§C.4: "never 403"); a grant every
+// namespace of which it names is purged 410 (purgedNS); a refusal as such,
 // no-store; a namespace not reached yet behind; anything else as
 // writeUpstreamErr answers it, with msg.
 func (ix *Index) writeAccessErr(w http.ResponseWriter, what string, err error, msg string) {
@@ -696,6 +697,11 @@ func (ix *Index) writeAccessErr(w http.ResponseWriter, what string, err error, m
 	}
 	if _, ok := chainErr(err); ok {
 		ix.writeUpstreamErr(w, what, err, msg)
+		return
+	}
+	var pn *purgedNS
+	if errors.As(err, &pn) {
+		pn.write(w)
 		return
 	}
 	var ae *grant.AuthError

@@ -395,3 +395,53 @@ func TestV077NoMarkerCookie(t *testing.T) {
 		t.Errorf("the grant once docs names cat: %d %v", r.status, r.body)
 	}
 }
+
+// TestV077ExchangePurgedOnly (FSVC-6; §A.4 Coverage: "Only a reader who
+// may see none of the namespaces gets 401 or 403, or, where every
+// namespace its grant names is purged and the grant verifies in each,
+// 410 as §C.5.2 gives it"): once pb is purged, a grant naming pb and the
+// public pub, or pb and schemas, which the index doesn't follow, is
+// refused 403 at the exchange, not 410; one naming pb alone is 410 with
+// ns and head, at the exchange and, where the index follows no public
+// namespace every reader sees, at /_refs. Before v0.77 the first two were
+// 410, and /_refs answered 200 with nothing.
+func TestV077ExchangePurgedOnly(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	op := w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "user:root", []string{"pb"}, []string{"read", "config", "purge-ns"})))
+	must(op.PatchConfig(ctx, "pb", must(op.NSHead(ctx, "pb")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	head := must(op.PurgeNamespace(ctx, "pb", must(op.NSHead(ctx, "pb")).ID))
+	onlyPB := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"pb"}, []string{"read"})
+	waitFor(t, "the index to apply the purge of pb", func() bool {
+		w.x.ix.ExpireGrantChecks()
+		return w.x.raw("/pb", onlyPB).status == 410
+	})
+	for _, nss := range [][]string{{"pb", "pub"}, {"pb", "schemas"}} {
+		g := w.issuer.Grant(t, w.s.Now(), "user:amy", nss, []string{"read"})
+		if r := p37Do(t, w.x, "POST", "/edge-grants", g, "", nil, ""); r.status != 403 || len(r.cookies) != 0 {
+			t.Errorf("exchange naming %v: %d %v", nss, r.status, r.body)
+		}
+	}
+	if r := p37Do(t, w.x, "POST", "/edge-grants", onlyPB, "", nil, ""); r.status != 410 || r.body["ns"] != "pb" || r.body["head"] != head {
+		t.Errorf("exchange naming pb alone: %d %v", r.status, r.body)
+	}
+	// /_refs: every reader sees the public pub there, so the answer is
+	// pub's; an index following pa and pb alone answers 410.
+	if r := w.x.raw("/_refs?to="+url.QueryEscape("/r/target/x"), onlyPB); r.status != 302 {
+		t.Errorf("/_refs naming pb alone, pub followed: %d %v", r.status, r.body)
+	}
+	x := startSvc(t, w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "svc:indexer", []string{"pa", "pb"}, []string{"read"}))),
+		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"pa", "pb"}, untyped: true, now: w.s.Now})
+	x.caughtUp("pa")
+	waitFor(t, "the second index to reach pb's purge", func() bool { x.ix.ExpireGrantChecks(); return x.raw("/pb", onlyPB).status == 410 })
+	if r := x.raw("/_refs?to="+url.QueryEscape("/r/target/x"), onlyPB); r.status != 410 || r.body["code"] != "purged" || r.body["ns"] != "pb" || r.body["head"] != head {
+		t.Errorf("/_refs naming pb alone: %d %v", r.status, r.body)
+	}
+	// A grant naming every namespace ("*") names no set of them: never 410.
+	star := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"*"}, []string{"read"}, map[string]any{
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "none"}}})
+	if r := p37Do(t, w.x, "POST", "/edge-grants", star, "", nil, ""); r.status == 410 {
+		t.Errorf("exchange naming *: %d %v", r.status, r.body)
+	}
+}
