@@ -54,9 +54,8 @@ import (
 //   - {ns} at the index's checkpoint;
 //   - each trusted, non-e2e, unpurged catalog, and each local, unpurged
 //     member of those catalogs' catalog.trust, a branch's root among
-//     them, at its head (memberAt): the index's checkpoint if the index
-//     follows it, otherwise its head as the grant checker last read it
-//     (CheckerTTL);
+//     them, at its head (memberAt): the index's checkpoint of it, whether
+//     it serves it or follows it only for this (members.go);
 //   - for a branch, each base read only as a base, at the baseAt its
 //     branch reads it at, which the branch's entry fixes.
 //
@@ -64,8 +63,9 @@ import (
 // (fcp.reads): a branch's bases, the root among them, are read as of the
 // baseAt its branch reads them at, whatever ns_id they are listed at.
 //
-// The index follows those catalogs and members without serving them: it
-// reads each one's state as of the id in the checkpoint, which never
+// The index follows those catalogs, members and bases without serving them
+// (members.go), so that their purges reach idx:{m} and kept results (§A.1):
+// it reads each one's state as of the id in the checkpoint, which never
 // changes, through the core's API (its namespace document, /heads and
 // documents), and keeps a catalog's graph (tree.BuildGraph, with its
 // tombstoned nodes' last live documents, catvis.NewCatalogDeleted) per
@@ -126,6 +126,45 @@ type fcp struct {
 	// and in a catalog's members (whose placements a catalog shows only
 	// where their items are live).
 	live map[string]map[string]bool
+	// gens are the generations of the stores answers are kept in, taken
+	// as the checkpoint first read another namespace's position (memberAt,
+	// baseFollowed: noteGens), before it read that namespace's state; nil
+	// where it read none. An answer whose view was computed here isn't kept
+	// where a purge since, in a namespace it read, carried one of its tags
+	// (§A.1: "drop kept results"; answer, refsAnswer): such a purge drops
+	// what fstate keeps of that namespace (fsForget) before it counts in
+	// any store (purgeStored), so a view that read the namespace's state
+	// before that drop took its generations before the purge too.
+	gens *fcpGens
+}
+
+// fcpGens are the kept results' generation of the checkpoint's namespace
+// (kept.Store.Generation), /_refs answers' and stored sealed results'.
+type fcpGens struct{ kept, refs, sealed uint64 }
+
+// gensKey carries a gensSet, the generations a computation of a
+// checkpoint of ns noted (fcp.gens).
+type gensKey struct{}
+
+type gensSet struct {
+	mu sync.Mutex
+	ns string
+	g  *fcpGens
+}
+
+// noteGens notes, for the checkpoint ctx computes, the stores' generations
+// now, as it reads another namespace's position: the first note, the
+// earliest, holds.
+func (ix *Index) noteGens(ctx context.Context) {
+	s, _ := ctx.Value(gensKey{}).(*gensSet)
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.g == nil {
+		s.g = &fcpGens{kept: ix.kept.Generation(s.ns), refs: ix.refs.Generation(refsScope), sealed: ix.sealed.Generation()}
+	}
 }
 
 // errNotReached is a namespace the index hasn't reached yet whose
@@ -297,12 +336,17 @@ func (ix *Index) liveAt(ctx context.Context, ns, id string) (map[string]bool, er
 // memberAt is the ns_id a namespace read at its head is taken at, as a
 // member of a checkpoint (a catalog, a catalog.trust member) or as a
 // branch's root judged at its head (coverage): its committed position,
-// the index's checkpoint if it follows m and has reached it, otherwise
-// m's head as the grant checker read it; its document there is
+// the index's checkpoint if it serves m and has reached it, otherwise the
+// checkpoint its follower for visibility committed (members.go, memberCP:
+// "the service follows the namespaces visibility reads", §A.4), once it
+// has reached the head the grant checker read, waiting for it up to
+// MinWait, never a head no follower has applied; its document there is
 // docAt(m, id), which never changes. ok is false for a namespace that is
 // purged, doesn't exist or is a remote branch (§B.11.9: local, unpurged
-// members only); err is a document the index can't read. Callers depend on
-// that contract alone, not on where the position comes from.
+// members only); err is a document the index can't read, or errMemberBehind
+// before m's follower holds its first checkpoint (503 behind to partial
+// readers). Callers depend on that contract alone, not on where the
+// position comes from.
 func (ix *Index) memberAt(ctx context.Context, m string) (id string, ok bool, err error) {
 	if !client.ValidNSName(m) {
 		return "", false, nil
@@ -315,6 +359,7 @@ func (ix *Index) memberAt(ctx context.Context, m string) (id string, ok bool, er
 		case purged:
 			return "", false, nil
 		case id != "":
+			ix.noteGens(ctx)
 			return id, true, nil
 		}
 	}
@@ -328,7 +373,7 @@ func (ix *Index) memberAt(ctx context.Context, m string) (id string, ok bool, er
 		return "", false, nil
 	}
 	ix.seedDoc(cfg)
-	return cfg.Head, true, nil
+	return ix.memberCP(ctx, m, cfg.Head)
 }
 
 // fsOpen reports whether a namespace with document doc can be covered:
@@ -548,6 +593,8 @@ func keyEntries(doc map[string]any, kid string) []byte {
 // checkpoint of it, nil if ns isn't covered (§B.11.9 URLs, §A.4). It
 // reads every member's state it needs and keeps the result by at.
 func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
+	gens := &gensSet{ns: ns}
+	ctx = context.WithValue(ctx, gensKey{}, gens)
 	cp, cats, err := ix.coverage(ctx, ns, z)
 	if err != nil || cp == nil {
 		return nil, err
@@ -581,6 +628,10 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 	}
 	cp.reads = maps.Clone(cp.ids)
 	for _, b := range cp.chain {
+		// A base the index doesn't serve has a follower (members.go).
+		if err := ix.baseFollowed(ctx, b.ns); err != nil {
+			return nil, err
+		}
 		if _, ok := cp.ids[b.ns]; !ok {
 			cp.ids[b.ns], cp.onlyBase[b.ns] = b.at, true
 		}
@@ -615,6 +666,9 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 		}
 		cp.live[m] = l
 	}
+	gens.mu.Lock()
+	cp.gens = gens.g
+	gens.mu.Unlock()
 	ix.fs.mu.Lock()
 	ix.fs.cps.Put(cp.ns+"\x00"+cp.at, cp, 1)
 	ix.fs.mu.Unlock()

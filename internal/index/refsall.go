@@ -542,6 +542,9 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	}
 	// Any other at, one kept answers no longer cover, isn't judged: with
 	// or without min, it is redirected to the current one.
+	if ix.testBeforeAnswer != nil {
+		ix.testBeforeAnswer()
+	}
 	st, cur, _, err := ix.refsAnswer(ctx, rd, rq, target)
 	if err != nil {
 		if errors.Is(err, errRefsKeys) {
@@ -767,6 +770,14 @@ func (ix *Index) refsAnswer(ctx context.Context, rd *refsReader, rq *refsQuery, 
 		if err != nil {
 			return st, at, bound, err
 		}
+		// The views read other namespaces before gen was taken
+		// (refsReader, recover): kept only if no purge since carried
+		// their tags (fcp.gens).
+		for _, a := range rd.covs {
+			if a.cov != nil && a.cov.cp.gens != nil {
+				gen = min(gen, a.cov.cp.gens.refs)
+			}
+		}
 		if st, ok := ix.refs.Put(target(at), refsScope, gen, bound, st); ok || try == 2 {
 			return st, at, bound, nil
 		}
@@ -778,6 +789,12 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 	// read keeps a bound answer from being stored below (PutSince), as
 	// its Retire may not run (a covered namespace that moved, refsMerge).
 	sgen := ix.sealed.Generation()
+	for _, a := range rd.covs {
+		// The views were computed before (fcp.gens).
+		if a.cov != nil && a.cov.cp.gens != nil {
+			sgen = min(sgen, a.cov.cp.gens.sealed)
+		}
+	}
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
 		return derived.Stored{}, "", false, err
