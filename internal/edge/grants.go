@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
@@ -196,7 +197,7 @@ func (v *Verifier) CookieKey() []byte {
 // not under /r/ or /ns/, for a service's.
 func (c *Cookies) VouchesFor(p string) bool {
 	if c.Vouches == nil {
-		_, _, ok := ParsePrefix(p)
+		_, ok := ParseCorePrefix(p)
 		return ok
 	}
 	return !Covers("/r", p) && !Covers("/ns", p) && c.Vouches(p)
@@ -334,6 +335,31 @@ func ParsePrefix(p string) (ns, resource string, ok bool) {
 		return s[2], s[3], true
 	}
 	return "", "", false
+}
+
+// Prefix is a core prefix (§2.1 Edge prefix): /r/{ns}/{name} (Resource
+// set), /r/{ns} or /ns/{ns}, or /ns/{ns}/g/{gs} (GS set), a filtered
+// namespace's prefix (§B.11.9).
+type Prefix struct{ NS, Resource, GS string }
+
+// ParseCorePrefix parses every core prefix the origin's key vouches for:
+// ParsePrefix's, and /ns/{ns}/g/{gs} with gs an id in its canonical text
+// (§3.2), so g/all, which is a service's (§B.11.5), is refused. Only
+// callers that tell a GS prefix from /ns/{ns} use it: ParsePrefix keeps
+// refusing the g form, so no older caller takes it for the namespace's.
+func ParseCorePrefix(p string) (Prefix, bool) {
+	if ns, res, ok := ParsePrefix(p); ok {
+		return Prefix{NS: ns, Resource: res}, true
+	}
+	s := strings.Split(p, "/")
+	if len(s) != 5 || s[0] != "" || s[1] != "ns" || !nsNameRe.MatchString(s[2]) || s[3] != "g" {
+		return Prefix{}, false
+	}
+	id, err := ids.Parse(s[4])
+	if err != nil || id.String() != s[4] {
+		return Prefix{}, false
+	}
+	return Prefix{NS: s[2], GS: s[4]}, true
 }
 
 // Covers reports whether a request path lies under prefix: the prefix

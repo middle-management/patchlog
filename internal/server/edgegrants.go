@@ -28,7 +28,9 @@ type edgeGrantKey struct{}
 // edgeCred is the edge grant a GET or HEAD carries in a cookie covering
 // its path, checked as an edge checks it (edge.Cookies.Check), when it
 // carries no Authorization, not even an empty one (§C.5.3). Writes, POST /edge-grants included,
-// never get one. Its namespace and resource are those of its prefix.
+// never get one. Its namespace and resource are those of its prefix, and
+// for a filtered namespace's prefix /ns/{ns}/g/{gs} its GS (§B.11.9); a
+// cookie for a prefix the origin doesn't issue is ignored.
 func (s *Server) edgeCred(r *http.Request) *http.Request {
 	if s.cookies == nil || len(r.Header.Values("Authorization")) > 0 {
 		return r
@@ -37,8 +39,11 @@ func (s *Server) edgeCred(r *http.Request) *http.Request {
 	if cl == nil {
 		return r
 	}
-	ns, res, _ := edge.ParsePrefix(cl.Prefix)
-	eg := &core.EdgeGrant{NS: ns, Resource: res, Prefix: cl.Prefix, Exp: time.Unix(cl.Exp, 0)}
+	p, ok := edge.ParseCorePrefix(cl.Prefix)
+	if !ok {
+		return r
+	}
+	eg := &core.EdgeGrant{NS: p.NS, Resource: p.Resource, GS: p.GS, Prefix: cl.Prefix, Exp: time.Unix(cl.Exp, 0)}
 	return r.WithContext(context.WithValue(r.Context(), edgeGrantKey{}, eg))
 }
 

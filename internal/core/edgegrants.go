@@ -58,10 +58,15 @@ const MaxEdgeGrants = 50
 const maxEdgePrefixes = 100
 
 // EdgeGrant is one namespace's edge grant: reads of NS, fixed to Resource
-// if set. It names no principal (§C.5.3).
+// if set, or to NS's filtered reads for the subject set GS if that is set
+// (§B.11.9). It names no principal (§C.5.3).
 type EdgeGrant struct {
 	NS       string
 	Resource string
+	// GS is a partial reader's subject set, whose edge grant covers
+	// /ns/{NS}/g/{GS} alone (§B.11.9 Edge grants). Only the filtered
+	// entry points admit it (filteredAdmit); edgeReader refuses it.
+	GS string
 	// Prefix is a verified edge grant's prefix (empty when issuing).
 	Prefix string
 	// Exp is a verified edge grant's expiry, or when issuing the
@@ -72,6 +77,9 @@ type EdgeGrant struct {
 // Prefixes are the URL prefixes the edge grant covers (edge prefixes,
 // §2.1).
 func (g EdgeGrant) Prefixes() []string {
+	if g.GS != "" {
+		return []string{"/ns/" + g.NS + "/g/" + g.GS}
+	}
 	if g.Resource != "" {
 		return []string{"/r/" + g.NS + "/" + g.Resource}
 	}
@@ -475,6 +483,11 @@ func (t *tx) edgeReader(n *nsRow, eg *EdgeGrant, resource string) (*actor, *Erro
 	}
 	if eg.NS != n.name {
 		return nil, nsNotNamed(n.name)
+	}
+	if eg.GS != "" {
+		// A partial reader's edge grant authorises its filtered reads
+		// only, admitted by filteredAdmit (§B.11.9).
+		return nil, forbidden("this edge grant reads " + n.name + " filtered only: exchange or read under /ns/" + n.name + "/g/" + eg.GS + " (§B.11.9)")
 	}
 	if eg.Resource != "" && eg.Resource != resource {
 		return nil, notFound()
