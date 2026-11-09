@@ -51,6 +51,39 @@ func TestV076MergeWritesOutermostArray(t *testing.T) {
 	}
 }
 
+// Review V76-05 (§F.3 "(an index or `-`)"): a write whose last segment is
+// an object member, even one named "-", addresses no array element and is
+// not widened; neither is a root member "/-" of an object document. An
+// add appending with "-" still widens to the outermost array.
+func TestV076MergeDashMemberNotWidened(t *testing.T) {
+	t.Parallel()
+	doc := map[string]any{"-": 0.0, "a": []any{map[string]any{"b": map[string]any{"-": 1.0}, "l": []any{}}, map[string]any{"x": 1.0}}}
+	for _, c := range []struct {
+		patch map[string]any
+		want  []string
+	}{
+		{op("replace", "/a/0/b/-", 2), []string{"/a/0/b/-"}},
+		{op("replace", "/-", 2), []string{"/-"}},
+		{op("add", "/a/0/l/-", 2), []string{"/a"}},
+	} {
+		w := must(merge.Writes(doc, true, []client.Step{client.PatchStep(ops(c.patch))}))
+		if !reflect.DeepEqual(w, c.want) {
+			t.Errorf("%v: writes %v want %v", c.patch, w, c.want)
+		}
+	}
+
+	// The branch changes a[0].b's member "-", the base a[1].x: no overlap.
+	e := newEnv(t)
+	e.create("matches", "grid", doc)
+	e.branch("matches", "r7")
+	e.append("r7", "grid", op("replace", "/a/0/b/-", 2))
+	e.append("matches", "grid", op("replace", "/a/1/x", 2))
+	r := e.plan("matches", "r7", merge.Options{}).Resource("grid")
+	if r.Class != merge.Replay || len(r.Conflicts) > 0 {
+		t.Fatalf("grid: %+v", r)
+	}
+}
+
 // v05RaisedBase returns a client and key holder over "m", raised from
 // sealed to e2e, whose derby's head is from before the raise and
 // references a blob uploaded at E2 (with a nonce, which a sealed op can't

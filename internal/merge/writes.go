@@ -103,17 +103,18 @@ func widen(pre, post any, w pointer.Pointer) pointer.Pointer {
 }
 
 // arrayRule widens a write whose last segment addresses an array element
-// in doc (it is "-", or its parent is an array) to the whole outermost
-// array holding it (§F.3): the shortest proper prefix of w whose value in
-// doc is an array. /a/0/b/1, with a and a[0].b arrays, is a write to /a.
-// A write whose last segment is an object key inside an element (/a/0/k)
-// is not widened.
+// in doc (an index or "-", so its parent is an array there) to the whole
+// outermost array holding it (§F.3): the shortest proper prefix of w whose
+// value in doc is an array. /a/0/b/1, with a and a[0].b arrays, is a write
+// to /a. A write whose last segment is an object key inside an element
+// (/a/0/k), even one named "-", is not widened. An add that appends with
+// "-" has an array parent in the document before it (widen checks both).
 func arrayRule(doc any, w pointer.Pointer) pointer.Pointer {
 	if len(w) == 0 {
 		return w
 	}
 	parent := w[:len(w)-1]
-	if w[len(w)-1] != "-" && !isArray(doc, parent) {
+	if !isArray(doc, parent) {
 		return w
 	}
 	for i := range len(parent) {
@@ -121,7 +122,7 @@ func arrayRule(doc any, w pointer.Pointer) pointer.Pointer {
 			return append(pointer.Pointer{}, w[:i]...)
 		}
 	}
-	// The parent itself: the array, or (for "-") what will be one.
+	// The parent itself: the outermost array.
 	return append(pointer.Pointer{}, parent...)
 }
 
