@@ -32,7 +32,7 @@ package core
 //     in HPKE auth mode, each entry naming its recipient (to) and the
 //     admin key that wrapped it (from) by thumbprint. Key-holding admin
 //     clients write it with ordinary plaintext writes, which the gate
-//     checks as outside E3 plus seal.ParseKeyringV2, kids naming the
+//     checks as outside E3 plus seal.CheckKeyringV2, kids naming the
 //     namespace and epochs not after encryption.epoch (checkKeyring). It is
 //     the only plaintext resource of an e2e namespace.
 //   - Epochs. encryption.epoch works as at E2, but the server holds no key:
@@ -542,16 +542,17 @@ func (t *tx) declaredAt(row *revRow) []ids.ID {
 
 // checkKeyring checks the keyring resource's documents in an e2e
 // namespace (§E.3.2): the keyring document, { "keys": [{ kid, to, from,
-// wrapped }] } with nothing else but a $nonce and no two entries for one
-// kid and to (seal.ParseKeyringV2), whose kids name this namespace and
-// epochs not after encryption.epoch. A keyring in the format before v0.63
-// is refused like any other document: a key holder wraps it again.
+// wrapped }] } with nothing else but a fresh $nonce (§C.7) and no two
+// entries for one kid and to (seal.CheckKeyringV2), whose kids name this
+// namespace and epochs not after encryption.epoch. A keyring in the format
+// before v0.63 is refused like any other document: a key holder wraps it
+// again.
 func (t *tx) checkKeyring(n *nsRow, cfg *Config, s *itemState) *Error {
 	for _, st := range s.steps {
 		if st.del {
 			continue
 		}
-		kr, err := seal.ParseKeyringV2(st.doc)
+		kr, err := seal.CheckKeyringV2(st.doc)
 		if err != nil {
 			msg := "the keyring resource of an e2e namespace must be a keyring document, { \"keys\": [{ \"kid\", \"to\", \"from\", \"wrapped\" }] } (§E.3.2): " + err.Error()
 			if _, lerr := seal.ParseKeyring(st.doc); lerr == nil {
@@ -948,7 +949,8 @@ func (t *tx) kidName(b *nsRow) string {
 // the keyring's owner, checked when it was written; for a remote branch's
 // shadow, the remote base (§G.5). A keyring stored in the format before
 // v0.63 (seal.Keyring), which the gate refuses to write now, is relayed as
-// stored, without from, until a key holder wraps it again.
+// stored, without from, until a key holder wraps it again; so is one whose
+// $nonce, written before v0.76, isn't of the fresh form (seal.ParseKeyringV2).
 func keyringEntries(d any, enc *ecdh.PublicKey, epochs []int) []map[string]any {
 	want := make(map[int]bool, len(epochs))
 	for _, e := range epochs {

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"crypto/ecdh"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -115,5 +116,24 @@ func TestV076EncBlobHeadEpoch(t *testing.T) {
 	defer gone.Close()
 	if e, err := blobHeadEpoch(context.Background(), RemoteEndpoint{HTTPClient: gone.Client()}, gone.URL, path); err != nil || e != 0 {
 		t.Fatalf("a 404: %d %v, want none", e, err)
+	}
+}
+
+// §E.3.2, §C.7 (v0.76): only a keyring write needs a fresh $nonce. One
+// stored before v0.76, when the gate took a $nonce of any form, or mirrored
+// from such a remote base, is still relayed by /keys (keyringEntries).
+func TestV076EncStoredKeyringNonceRelayed(t *testing.T) {
+	_, admin, _ := seal.GenerateRecipient()
+	_, reader, _ := seal.GenerateRecipient()
+	kr, err := seal.BuildKeyringV2(admin, "e", 1, seal.NewKey(), []*ecdh.PublicKey{reader.PublicKey()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{seal.NewNonce(), "x", ""} {
+		d := kr.Value()
+		d["$nonce"] = n
+		if got := keyringEntries(d, reader.PublicKey(), []int{1}); len(got) != 1 {
+			t.Fatalf("stored keyring with $nonce %q: relayed %v, want the one entry it wraps to the reader", n, got)
+		}
 	}
 }

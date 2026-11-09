@@ -106,7 +106,7 @@ func (im *importer) e2eEpochs(ctx context.Context, ns string) (lo, hi int, probl
 				// to an e2e namespace, a bundle's history included, as the
 				// keyring document (§E.3.2), and refuses the format before
 				// v0.63 (ENC-11): refused here, before anything is written.
-				kr, kerr := seal.ParseKeyringV2(doc)
+				kr, kerr := seal.CheckKeyringV2(doc)
 				if kerr != nil {
 					if _, lerr := seal.ParseKeyring(doc); lerr == nil {
 						problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s is a keyring in the format before v0.63, which an e2e target refuses to have written, history included (§E.3.2): "+

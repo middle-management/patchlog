@@ -43,14 +43,24 @@ type KeyringEntry struct {
 const wrappedLen = hpkeNenc + KeySize + 16
 
 // ParseKeyringV2 parses a keyring document (a model value or JSON text) and
-// checks its shape (§E.3.2): an object with `keys` and at most a fresh
-// `$nonce` (§C.7: 26 lowercase base32 characters, ValidNonce) besides;
-// entries that are objects of exactly kid, to, from and
+// checks its shape (§E.3.2): an object with `keys` and at most a string
+// `$nonce` besides; entries that are objects of exactly kid, to, from and
 // wrapped; a kid "{ns}#{e}", thumbprints of 43 base64url characters, a
 // wrapped of base64url decoding to enc ‖ ct of a 32-byte key; and no two
 // entries for one kid and to. Errors wrap ErrFormat. Whether kid names the
 // keyring's own namespace and an epoch it has is the caller's to check.
-func ParseKeyringV2(v any) (*KeyringV2, error) {
+//
+// It reads stored keyrings, so it takes a $nonce of any form: until v0.76
+// a keyring was written with one, and its entries stay readable and
+// relayed. A write is checked with CheckKeyringV2.
+func ParseKeyringV2(v any) (*KeyringV2, error) { return parseKeyringV2(v, false) }
+
+// CheckKeyringV2 is ParseKeyringV2 for a keyring being written (§E.3.2):
+// besides the shape, a $nonce must be fresh (§C.7: 26 lowercase base32
+// characters, ValidNonce). Errors wrap ErrFormat.
+func CheckKeyringV2(v any) (*KeyringV2, error) { return parseKeyringV2(v, true) }
+
+func parseKeyringV2(v any, fresh bool) (*KeyringV2, error) {
 	if b, ok := v.([]byte); ok {
 		p, err := jsonv.Parse(b)
 		if err != nil {
@@ -70,7 +80,10 @@ func ParseKeyringV2(v any) (*KeyringV2, error) {
 		switch k {
 		case "keys":
 		case "$nonce":
-			if kr.Nonce, ok = x.(string); !ok || !ValidNonce(kr.Nonce) {
+			if kr.Nonce, ok = x.(string); !ok {
+				return bad("$nonce is not a string")
+			}
+			if fresh && !ValidNonce(kr.Nonce) {
 				return bad("$nonce is not of the fresh form (§C.7)")
 			}
 		default:
