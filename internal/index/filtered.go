@@ -1,9 +1,11 @@
 package index
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/tree"
 )
@@ -31,7 +34,10 @@ import (
 //     through a key whose requireAt names it (catvis.TrustedCatalogs);
 //   - branch kind: a local branch, recursively, of a content-kind
 //     namespace, itself neither public nor sealed; the root's trust and
-//     keys are read from its document as of the baseAt the chain fixes;
+//     keys are read from its document as of the baseAt the chain fixes,
+//     and the branch stays covered only while the root, at its head,
+//     still trusts each deciding catalog through every key counted there,
+//     each unchanged (§B.11.9 Branches, §C.4; branchTrustHolds);
 //   - catalog kind: a catalog, neither public nor sealed, that some local
 //     namespace of its catalog.trust trusts as content kind.
 //
@@ -41,14 +47,21 @@ import (
 // the origin's (catvis.FilteredSubjects over every deciding catalog's
 // Profile, its groups and grantcheck.ReadsScope's digest), and its
 // answers are at the combined checkpoint (grantcheck.CombinedAt) of every
-// namespace visibility reads, which they list as namespaces:
+// namespace visibility reads, which they list as namespaces, one ns_id per
+// namespace (§B.11.9 URLs, §A.4 Answers; fcp.ids):
 //
 //   - {ns} at the index's checkpoint;
-//   - for a branch, each base at the baseAt its branch reads it at;
 //   - each trusted, non-e2e, unpurged catalog, and each local, unpurged
-//     member of those catalogs' catalog.trust, at the index's checkpoint
-//     if the index follows it, otherwise at its head as the grant checker
-//     last read it (CheckerTTL).
+//     member of those catalogs' catalog.trust, a branch's root among
+//     them, at its head (memberAt): the index's checkpoint if the index
+//     follows it, otherwise its head as the grant checker last read it
+//     (CheckerTTL);
+//   - for a branch, each base read only as a base, at the baseAt its
+//     branch reads it at, which the branch's entry fixes.
+//
+// Where visibility reads each namespace is kept apart from what is listed
+// (fcp.reads): a branch's bases, the root among them, are read as of the
+// baseAt its branch reads them at, whatever ns_id they are listed at.
 //
 // The index follows those catalogs and members without serving them: it
 // reads each one's state as of the id in the checkpoint, which never
@@ -83,16 +96,31 @@ type fsCat struct {
 }
 
 // fcp is a covered namespace's combined checkpoint (§B.11.9 URLs, §A.4):
-// at is grantcheck.CombinedAt over ids, each member's ns_id, and cats the
-// deciding catalogs' visibility there. It is immutable.
+// at is grantcheck.CombinedAt over ids, and cats the deciding catalogs'
+// visibility as of reads. It is immutable.
 type fcp struct {
 	ns    string
 	kind  int
 	root  string   // the content namespace whose catalogs decide; "" for catalog kind
 	chain []fsBase // a branch's bases, from its own up to root
 	at    string
-	ids   map[string]string
-	cats  []*catvis.Catalog
+	// ids are the namespaces the checkpoint lists, one ns_id each (§A.4
+	// Answers, §B.11.9 URLs), which at, answers' namespaces, idx: tags
+	// (coverTags) and min judge by: a namespace read at its head ({ns},
+	// each deciding catalog, each member of their catalog.trust, a
+	// branch's root among them) at that head, a base read only as a base
+	// (onlyBase) at the baseAt its branch reads it at.
+	ids map[string]string
+	// reads are where visibility reads each namespace in ids, never what is
+	// listed: ids' ns_ids, but every base of a branch's chain at the baseAt
+	// its branch reads it at (its live names, and for the root its trust,
+	// keys and roles, catalogAt).
+	reads map[string]string
+	// onlyBase are the bases ids lists at their baseAt because nothing
+	// reads them at their head: an answer across namespaces lists each at
+	// its own checkpoint instead where it has one (refsMerge, keptCPsIn).
+	onlyBase map[string]bool
+	cats     []*catvis.Catalog
 	// live are the names live, as of ids, in a branch's bases (Branches)
 	// and in a catalog's members (whose placements a catalog shows only
 	// where their items are live).
@@ -265,11 +293,15 @@ func (ix *Index) liveAt(ctx context.Context, ns, id string) (map[string]bool, er
 	return v.(map[string]bool), nil
 }
 
-// memberAt is the ns_id a member of a checkpoint is taken at: the index's
-// checkpoint if it follows m and has reached it, otherwise m's head as
-// the grant checker read it. ok is false for a namespace that is purged,
-// doesn't exist or is a remote branch (§B.11.9: local, unpurged members
-// only); err is a document the index can't read.
+// memberAt is the ns_id a namespace read at its head is taken at, as a
+// member of a checkpoint (a catalog, a catalog.trust member) or as a
+// branch's root judged at its head (coverage): its committed position,
+// the index's checkpoint if it follows m and has reached it, otherwise
+// m's head as the grant checker read it; its document there is
+// docAt(m, id), which never changes. ok is false for a namespace that is
+// purged, doesn't exist or is a remote branch (§B.11.9: local, unpurged
+// members only); err is a document the index can't read. Callers depend on
+// that contract alone, not on where the position comes from.
 func (ix *Index) memberAt(ctx context.Context, m string) (id string, ok bool, err error) {
 	if !client.ValidNSName(m) {
 		return "", false, nil
@@ -402,7 +434,7 @@ func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, []fsCat, err
 			b, at, ok = localBase(bdoc)
 		}
 		// bdoc is the root's document as of the baseAt the chain fixes;
-		// the root must also be open, and unpurged, now.
+		// the root must also be open, and unpurged, now, at its head.
 		id, ok, err := ix.memberAt(ctx, cp.root)
 		if err != nil || !ok {
 			return nil, nil, err
@@ -415,7 +447,7 @@ func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, []fsCat, err
 			return nil, nil, nil
 		}
 		cats, err := ix.fsTrust(ctx, cp.root, bdoc)
-		if err != nil || len(cats) == 0 {
+		if err != nil || len(cats) == 0 || !branchTrustHolds(cp.root, bdoc, cur, cats) {
 			return nil, nil, err
 		}
 		return cp, cats, nil
@@ -462,6 +494,55 @@ func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, []fsCat, err
 	return nil, nil, nil
 }
 
+// branchTrustHolds reports whether a branch whose root is root, with
+// document bdoc as of the branch's baseAt and cur at its head, stays
+// covered (§B.11.9 Branches: "only while the namespace that trusts the
+// catalog still trusts it, at its head, through every key item 1 counts,
+// each unchanged (§C.4)"): for each non-e2e catalog cats counts from
+// bdoc, cur still trusts it (its catalogs names it, and its catalog.trust,
+// as of the catalog's own head, lists root), and for each kid counted
+// there cur holds a key whose requireAt names it, its entries under that
+// kid equal, as canonical JSON, to bdoc's (the whole entry: any edit, a
+// pub rotated under the same kid among them, uncovers the branch). Keys
+// cur adds are not counted. An e2e catalog makes nothing visible either
+// way.
+func branchTrustHolds(root string, bdoc, cur map[string]any, cats []fsCat) bool {
+	for _, c := range cats {
+		if c.e2e {
+			continue
+		}
+		head := catvis.TrustedCatalogs(root, cur, func(name string) map[string]any {
+			if name == c.ns {
+				return c.doc
+			}
+			return nil
+		})
+		i := slices.IndexFunc(head, func(tr catvis.Trust) bool { return tr.Catalog == c.ns })
+		if i < 0 {
+			return false
+		}
+		for _, kid := range c.kids {
+			if !slices.Contains(head[i].Kids, kid) || !bytes.Equal(keyEntries(bdoc, kid), keyEntries(cur, kid)) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// keyEntries are the entries of doc's keys with kid, in order, as
+// canonical JSON.
+func keyEntries(doc map[string]any, kid string) []byte {
+	keys, _ := doc["keys"].([]any)
+	var out []any
+	for _, k := range keys {
+		if m, _ := k.(map[string]any); m != nil && m["kid"] == kid {
+			out = append(out, m)
+		}
+	}
+	return jsonv.Canonical(out)
+}
+
 // checkpoint is ns's combined checkpoint with ns at z, the index's
 // checkpoint of it, nil if ns isn't covered (§B.11.9 URLs, §A.4). It
 // reads every member's state it needs and keeps the result by at.
@@ -470,16 +551,16 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 	if err != nil || cp == nil {
 		return nil, err
 	}
-	cp.ids = map[string]string{}
+	// Listed once each (§A.4 Answers): a namespace read at its head at
+	// it, a base read only as a base at its baseAt; read where visibility
+	// reads it.
+	cp.ids, cp.onlyBase = map[string]string{}, map[string]bool{}
 	add := func(m, id string) {
 		if _, ok := cp.ids[m]; !ok {
 			cp.ids[m] = id
 		}
 	}
 	add(ns, z)
-	for _, b := range cp.chain {
-		add(b.ns, b.at)
-	}
 	var deciding []fsCat
 	for _, c := range cats {
 		if c.e2e {
@@ -497,9 +578,16 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 			}
 		}
 	}
+	cp.reads = maps.Clone(cp.ids)
+	for _, b := range cp.chain {
+		if _, ok := cp.ids[b.ns]; !ok {
+			cp.ids[b.ns], cp.onlyBase[b.ns] = b.at, true
+		}
+		cp.reads[b.ns] = b.at
+	}
 	cp.at = grantcheck.CombinedAt(cp.ids)
 	for _, c := range deciding {
-		cv, err := ix.catalogAt(ctx, c, cp.ids)
+		cv, err := ix.catalogAt(ctx, c, cp.reads)
 		if err != nil {
 			return nil, err
 		}
@@ -520,7 +608,7 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 		}
 	}
 	for _, m := range lives {
-		l, err := ix.liveAt(ctx, m, cp.ids[m])
+		l, err := ix.liveAt(ctx, m, cp.reads[m])
 		if err != nil {
 			return nil, err
 		}
@@ -546,8 +634,9 @@ func (ix *Index) keptCP(ns, at string) *fcp {
 
 // keptCPsIn are the checkpoints of ns the index holds that an answer
 // across namespaces at ids (its namespaces, refsMerge) was read at: ns
-// and each of their members at its id in ids, but a branch's bases, which
-// ids may hold at their own checkpoints instead (§A.4 Across namespaces).
+// and each of their members at its id in ids, but a base listed only as
+// a base (onlyBase), which ids may hold at its own checkpoint instead
+// (§A.4 Across namespaces).
 func (ix *Index) keptCPsIn(ns string, ids map[string]string) []*fcp {
 	ix.fs.mu.Lock()
 	defer ix.fs.mu.Unlock()
@@ -560,8 +649,7 @@ func (ix *Index) keptCPsIn(ns string, ids map[string]string) []*fcp {
 		in := true
 		for m, id := range cp.ids {
 			got, ok := ids[m]
-			base := slices.ContainsFunc(cp.chain, func(b fsBase) bool { return b.ns == m })
-			if !ok || (!base && got != id) {
+			if !ok || (!cp.onlyBase[m] && got != id) {
 				in = false
 				break
 			}
@@ -573,11 +661,13 @@ func (ix *Index) keptCPsIn(ns string, ids map[string]string) []*fcp {
 	return out
 }
 
-// catalogAt is catalog c's visibility as of ids (§B.11.9 Visible): its
-// graph from its documents at ids[c.ns], its tombstoned nodes from their
-// last live documents, and its catalog.trust members in ids as its
-// content namespaces, each with its document as of its id and the kids
-// of its keys whose requireAt names c.
+// catalogAt is catalog c's visibility as of ids, where visibility reads
+// each namespace (fcp.reads, §B.11.9 Visible): its graph from its
+// documents at ids[c.ns], its tombstoned nodes from their last live
+// documents, and its catalog.trust members in ids as its content
+// namespaces, each with its document as of its id (for a branch's root,
+// as of the branch's baseAt) and the kids of its keys whose requireAt
+// names c.
 func (ix *Index) catalogAt(ctx context.Context, c fsCat, ids map[string]string) (*catvis.Catalog, error) {
 	var key strings.Builder
 	key.WriteString(c.ns + "\x00" + ids[c.ns])
@@ -867,7 +957,7 @@ var (
 // all groups (§B.11.5); otherwise item 1 from rec's subjects and item 2
 // from its filter.
 func (ix *Index) storedFview(ctx context.Context, cp *fcp, rec *markerRec) (*fview, error) {
-	doc, err := ix.docAt(ctx, cp.ns, cp.ids[cp.ns])
+	doc, err := ix.docAt(ctx, cp.ns, cp.reads[cp.ns])
 	if err != nil {
 		return nil, err
 	}
@@ -1007,7 +1097,7 @@ func (cp *fcp) members() []string {
 }
 
 // coverTags are the Cache-Tags of an answer at cp besides its hits':
-// idx:{m} for every namespace in at (§A.4).
+// idx:{m} for every namespace in at, as listed (ids, §A.4).
 func coverTags(cp *fcp) []string {
 	tags := []string{"idx:" + cp.ns}
 	for _, m := range cp.members() {

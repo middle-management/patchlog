@@ -1000,10 +1000,12 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 // come from, with the combined checkpoint of each namespace §B.11.9 covers
 // that rd reads in part (§A.4 Across namespaces): errMoved if a view was
 // computed at another checkpoint of one of them than cps holds, or two
-// views take a member at two. A branch's base at its baseAt, which the
-// branch's own ns_id fixes, is left to the base's checkpoint where the
-// answer has one (the base itself, or another view's member): a map holds
-// one ns_id per namespace (§B.5), and the branch's stands for it.
+// views take a namespace they read at its head at two. A base listed only
+// as a base, at its baseAt, which the branch's own ns_id fixes (fcp.
+// onlyBase), is left to the base's checkpoint where the answer has one
+// (the base itself, or another view's member): a namespace read at its
+// head is listed at it (§A.4 Answers, one ns_id per namespace), and the
+// branch's stands for its base.
 func refsMerge(cps map[string]string, rd *refsReader) (map[string]string, error) {
 	if len(rd.covs) == 0 {
 		return cps, nil
@@ -1016,7 +1018,7 @@ func refsMerge(cps map[string]string, rd *refsReader) (map[string]string, error)
 			return nil, errMoved
 		}
 		for m, id := range cp.ids {
-			if slices.ContainsFunc(cp.chain, func(b fsBase) bool { return b.ns == m }) {
+			if cp.onlyBase[m] {
 				bases = append(bases, fsBase{ns: m, at: id})
 				continue
 			}
