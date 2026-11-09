@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -76,6 +77,42 @@ func (c *Client) filteredRedirect(r *response, ns, tail string, withAt bool) (gs
 	return m[2], m[3], nil
 }
 
+// FilteredError is the 302 by which an origin sends a partial reader from
+// a namespace's unfiltered long-poll or events to the filtered log of GS
+// (§B.11.9 URLs), which LongPoll and NSEvents don't follow: it isn't
+// chain-verifiable, and its batches hold only visible items (§10). A
+// caller that accepts that reads it with FilteredLongPoll or
+// FilteredNSEvents. It unwraps to the 302's *APIError, so a caller that
+// doesn't is stopped as by any other redirect.
+type FilteredError struct {
+	NS, GS string
+	Err    *APIError
+}
+
+func (e *FilteredError) Error() string {
+	return fmt.Sprintf("%v: the filtered log of gs %s (§B.11.9)", e.Err, e.GS)
+}
+
+func (e *FilteredError) Unwrap() error { return e.Err }
+
+// AsFiltered returns err as a *FilteredError, if it is one.
+func AsFiltered(err error) (*FilteredError, bool) {
+	var fe *FilteredError
+	ok := errors.As(err, &fe)
+	return fe, ok
+}
+
+// filteredError is the error for a 302 r from the unfiltered long-poll or
+// events of ns: a *FilteredError when it names their filtered form, tail
+// being log or events, else the API error it was before v0.75.
+func (c *Client) filteredError(r *response, ns, tail string) error {
+	gs, _, err := c.filteredRedirect(r, ns, tail, false)
+	if err != nil {
+		return r.apiError()
+	}
+	return &FilteredError{NS: ns, GS: gs, Err: r.apiError()}
+}
+
 // filteredPath is the filtered URL of fa ending in tail (§B.11.9 URLs):
 // with /at/{at} when fa has one.
 func filteredPath(fa FilteredAt, tail string) string {
@@ -112,7 +149,8 @@ func endOf(r *response) (string, error) {
 // follows once with the same prefix and after (§B.11.9 URLs): only the
 // rows visible to the reader, in pages filled to the log page size, with
 // next, the last row returned, on every full page, so the page after the
-// last full one may be empty. fa names the answer; read further pages
+// last full one may be empty; a filtered page whose next isn't its last
+// row is an error. fa names the answer; read further pages
 // with FilteredHeadsAt(fa, …). An unrestricted reader gets the unfiltered
 // page, next absent on the last, and fa without GS and At.
 func (c *Client) FilteredHeadsPage(ctx context.Context, ns, nsID, prefix, after string) (items []HeadItem, next string, fa FilteredAt, err error) {
@@ -174,6 +212,9 @@ func (c *Client) filteredHeads(ctx context.Context, fa FilteredAt, prefix, after
 				return nil, "", FilteredAt{}, err
 			}
 			items, next, err := parseHeads(r, prefix)
+			if err == nil {
+				err = checkFilteredHeads(r, items, next, after)
+			}
 			if err != nil {
 				return nil, "", FilteredAt{}, err
 			}
@@ -193,6 +234,24 @@ func (c *Client) filteredHeads(ctx context.Context, fa FilteredAt, prefix, after
 		}
 		return nil, "", FilteredAt{}, r.apiError()
 	}
+}
+
+// checkFilteredHeads refuses a filtered /heads page whose rows aren't in
+// ascending byte order strictly after after (§7.4), or whose next isn't
+// its last row (§B.11.9 /heads), as on an empty page naming one: each
+// next then moves past after, so a listing can't repeat a page forever.
+func checkFilteredHeads(r *response, items []HeadItem, next, after string) error {
+	last := after
+	for _, it := range items {
+		if it.Resource <= last {
+			return fmt.Errorf("client: %s: row %q not after %q (§7.4)", r.path, it.Resource, last)
+		}
+		last = it.Resource
+	}
+	if next != "" && (len(items) == 0 || next != last) {
+		return fmt.Errorf("client: %s: next %q is not the page's last row (§B.11.9)", r.path, next)
+	}
+	return nil
 }
 
 // FilteredHeads lists, as HeadsPrefix does, every resource whose name

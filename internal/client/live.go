@@ -24,8 +24,7 @@ type LongPollResult struct {
 	Cursor  string // X-Cursor, to echo in the next request
 	Timeout bool   // 204: no entry arrived within the interval
 	// GS is the gs of the filtered log the answer came from (§B.11.9),
-	// "" for the unfiltered log: a partial reader that LongPoll was
-	// redirected for follows FilteredLongPoll(ns, GS, …) from then on.
+	// FilteredLongPoll's, "" for LongPoll's unfiltered log.
 	GS string
 }
 
@@ -40,27 +39,22 @@ type LongPollResult struct {
 //
 // A partial reader of a namespace the origin filters (§B.11.9) is
 // redirected to the filtered log /ns/{ns}/g/{gs}/log, which LongPoll
-// follows, setting GS; FilteredLongPoll reads it directly.
+// doesn't follow: that log isn't chain-verifiable and its batches hold
+// only visible items (§10), so it returns the 302 as a *FilteredError
+// (AsFiltered) naming gs, and a caller that accepts a filtered log reads
+// it with FilteredLongPoll.
 func (c *Client) LongPoll(ctx context.Context, ns, since, cursor string) (*LongPollResult, error) {
 	if err := checkNS(ns); err != nil {
 		return nil, err
 	}
-	path, gs := "/ns/"+ns+"/log", ""
-	r, err := c.longPoll(ctx, path, since, cursor, true)
+	r, err := c.longPoll(ctx, "/ns/"+ns+"/log", since, cursor, true)
 	if err != nil {
 		return nil, err
 	}
 	if r.status == 302 {
-		// Only a redirect into the filtered log of ns is followed; any
-		// other is the error it was before v0.75.
-		if gs, _, err = c.filteredRedirect(r, ns, "log", false); err != nil {
-			return nil, r.apiError()
-		}
-		if r, err = c.longPoll(ctx, "/ns/"+ns+"/g/"+gs+"/log", since, cursor, false); err != nil {
-			return nil, err
-		}
+		return nil, c.filteredError(r, ns, "log")
 	}
-	return c.nsLongPollResult(ctx, ns, gs, since, r)
+	return c.nsLongPollResult(ctx, ns, "", since, r)
 }
 
 // FilteredLongPoll waits, as LongPoll does, for entries after since in
@@ -157,7 +151,7 @@ func (c *Client) ResourceLongPoll(ctx context.Context, ns, name, since, cursor s
 func IsBadInput(err error) bool { return statusIs(err, 400, "bad_input") }
 
 // longPoll asks path?live=long-poll with since and cursor, answered 200
-// or 204, or, with redirect, also a 302 the caller follows.
+// or 204, or, with redirect, also a 302 the caller reads.
 func (c *Client) longPoll(ctx context.Context, path, since, cursor string, redirect bool) (*response, error) {
 	if err := checkOptID("since", since); err != nil {
 		return nil, err
@@ -196,17 +190,15 @@ type Event struct {
 // callers usually reconnect from the last id they processed.
 //
 // A partial reader of a namespace the origin filters (§B.11.9) is
-// redirected to /ns/{ns}/g/{gs}/events, which NSEvents follows; there it
-// streams as FilteredNSEvents does.
+// redirected to /ns/{ns}/g/{gs}/events, which NSEvents doesn't follow, as
+// LongPoll doesn't: it returns the 302 as a *FilteredError naming gs, and
+// a caller that accepts a filtered log streams it with FilteredNSEvents.
 func (c *Client) NSEvents(ctx context.Context, ns, since string, fn func(NSEntry) error) error {
 	if err := checkNS(ns); err != nil {
 		return err
 	}
-	follow := func(r *response) (string, bool) {
-		gs, _, err := c.filteredRedirect(r, ns, "events", false)
-		return "/ns/" + ns + "/g/" + gs + "/events", err == nil
-	}
-	return c.nsEvents(ctx, ns, "/ns/"+ns+"/events", since, follow, fn)
+	redirected := func(r *response) error { return c.filteredError(r, ns, "events") }
+	return c.nsEvents(ctx, ns, "/ns/"+ns+"/events", since, redirected, fn)
 }
 
 // FilteredNSEvents streams, as NSEvents does, the entries after since of
@@ -224,11 +216,11 @@ func (c *Client) FilteredNSEvents(ctx context.Context, ns, gs, since string, fn 
 	return c.nsEvents(ctx, ns, "/ns/"+ns+"/g/"+gs+"/events", since, nil, fn)
 }
 
-// nsEvents streams the namespace events at path, following a redirect by
-// follow when it is set.
-func (c *Client) nsEvents(ctx context.Context, ns, path, since string, follow func(*response) (string, bool), fn func(NSEntry) error) error {
+// nsEvents streams the namespace events at path, a 302 being the error
+// redirected gives when it is set.
+func (c *Client) nsEvents(ctx context.Context, ns, path, since string, redirected func(*response) error, fn func(NSEntry) error) error {
 	prev := since
-	return c.eventsFollow(ctx, path, since, follow, func(ev Event) error {
+	return c.eventsAt(ctx, path, since, redirected, func(ev Event) error {
 		if ev.JWE != "" {
 			// One entry per event, sealed as the range (prev, id] (§E.2.2).
 			v, err := c.openRange(ctx, ns, prev, ev.ID, ev.JWE)
@@ -369,45 +361,37 @@ func withoutIDPrev(m map[string]any) map[string]any {
 }
 
 func (c *Client) events(ctx context.Context, path, since string, fn func(Event) error) error {
-	return c.eventsFollow(ctx, path, since, nil, fn)
+	return c.eventsAt(ctx, path, since, nil, fn)
 }
 
-// eventsFollow streams the events at path after since. A 302 is followed
-// once to the path follow reads from it, with the same since; one follow
-// refuses, or any without follow, is an error.
-func (c *Client) eventsFollow(ctx context.Context, path, since string, follow func(*response) (string, bool), fn func(Event) error) error {
+// eventsAt streams the events at path after since. Any answer but 200 is
+// an API error, or, for a 302 with redirected set, the error it gives.
+func (c *Client) eventsAt(ctx context.Context, path, since string, redirected func(*response) error, fn func(Event) error) error {
 	if err := checkOptID("since", since); err != nil {
 		return err
 	}
-	var res *http.Response
-	for {
-		u := c.base + path
-		if since != "" {
-			u += "?since=" + since
-		}
-		hr, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-		if err != nil {
-			return err
-		}
-		hr.Header.Set("Accept", "text/event-stream")
-		c.setAuth(hr)
-		if res, err = c.hc.Do(hr); err != nil {
-			return err
-		}
-		if res.StatusCode == 200 {
-			break
-		}
+	u := c.base + path
+	if since != "" {
+		u += "?since=" + since
+	}
+	hr, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return err
+	}
+	hr.Header.Set("Accept", "text/event-stream")
+	c.setAuth(hr)
+	res, err := c.hc.Do(hr)
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != 200 {
 		r := &response{status: res.StatusCode, header: res.Header, method: "GET", path: path}
 		r.body, _ = io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		res.Body.Close()
-		if res.StatusCode != 302 || follow == nil {
-			return r.apiError()
+		if res.StatusCode == 302 && redirected != nil {
+			return redirected(r)
 		}
-		next, ok := follow(r)
-		if !ok {
-			return r.apiError()
-		}
-		path, follow = next, nil
+		return r.apiError()
 	}
 	defer res.Body.Close()
 	sc := bufio.NewScanner(res.Body)
