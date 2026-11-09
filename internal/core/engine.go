@@ -186,6 +186,10 @@ type Options struct {
 	// least an eighth smaller. Negative compresses every patch set, even
 	// if it doesn't shrink, for tests of the compressed form.
 	StoreCompressMin int
+	// NoFilteredReads turns off filtered namespace reads (§B.11.9, an
+	// origin MAY): no namespace is covered, and partial readers get
+	// §C.5's answers (403) as before v0.75. The zero value serves them.
+	NoFilteredReads bool
 }
 
 // RemoteOptions configure the branch side of remote branches (§G.3): how

@@ -58,10 +58,15 @@ const MaxEdgeGrants = 50
 const maxEdgePrefixes = 100
 
 // EdgeGrant is one namespace's edge grant: reads of NS, fixed to Resource
-// if set. It names no principal (§C.5.3).
+// if set, or to NS's filtered reads for the subject set GS if that is set
+// (§B.11.9). It names no principal (§C.5.3).
 type EdgeGrant struct {
 	NS       string
 	Resource string
+	// GS is a partial reader's subject set, whose edge grant covers
+	// /ns/{NS}/g/{GS} alone (§B.11.9 Edge grants). Only the filtered
+	// entry points admit it (filteredAdmit); edgeReader refuses it.
+	GS string
 	// Prefix is a verified edge grant's prefix (empty when issuing).
 	Prefix string
 	// Exp is a verified edge grant's expiry, or when issuing the
@@ -72,6 +77,9 @@ type EdgeGrant struct {
 // Prefixes are the URL prefixes the edge grant covers (edge prefixes,
 // §2.1).
 func (g EdgeGrant) Prefixes() []string {
+	if g.GS != "" {
+		return []string{"/ns/" + g.NS + "/g/" + g.GS}
+	}
 	if g.Resource != "" {
 		return []string{"/r/" + g.NS + "/" + g.Resource}
 	}
@@ -177,6 +185,13 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 	if err != nil {
 		return nil, err
 	}
+	// A partial reader's subject sets are recorded before their cookies
+	// are set, so every instance judges them (§B.11.9 gs).
+	for _, rec := range col.recs {
+		if err := e.recordFilteredGS(ctx, rec); err != nil {
+			return nil, err
+		}
+	}
 	return out, nil
 }
 
@@ -189,6 +204,8 @@ type edgeCollect struct {
 	grants []EdgeGrant
 	seen   map[string]bool // the prefixes of grants
 	over   bool
+	// recs are the filtered_gs rows of the GS edge grants (§B.11.9).
+	recs []*gsRecord
 }
 
 // add adds eg, unless its prefixes would exceed the cap; it reports
@@ -215,12 +232,7 @@ func (c *edgeCollect) add(eg EdgeGrant) bool {
 // each with g's exp. It returns the key of g's principal's buckets, as a
 // write's are keyed (§6.6), and the first refusal of the lowest rank.
 func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) (string, *Error) {
-	var exp time.Time
-	for _, b := range g.Blocks {
-		if b.Exp != nil && (exp.IsZero() || b.Exp.Before(exp)) {
-			exp = *b.Exp
-		}
-	}
+	exp := grantExp(g)
 	var bucket string
 	var refused *Error
 	issued := false
@@ -247,6 +259,12 @@ func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) (s
 			continue
 		}
 		bucket, issued = iss.bucket, true
+		if iss.gs != "" {
+			if col.add(EdgeGrant{NS: ns, GS: iss.gs, Exp: exp}) {
+				col.recs = append(col.recs, iss.rec)
+			}
+			continue
+		}
 		if iss.names == nil {
 			col.add(EdgeGrant{NS: ns, Exp: exp})
 		}
@@ -278,10 +296,14 @@ func refusalRank(err *Error) int {
 }
 
 // edgeIssue is a grant's edge grants in one namespace: one per name its
-// rules fix /resource to, else (names nil) one namespace-wide; and the
-// key of its principal's buckets (actor.bucketKey).
+// rules fix /resource to, else (names nil) one namespace-wide, or, for a
+// partial reader of a covered namespace, one for its subject set gs, with
+// rec its filtered_gs row (§B.11.9); and the key of its principal's
+// buckets (actor.bucketKey).
 type edgeIssue struct {
 	names  []string
+	gs     string
+	rec    *gsRecord
 	bucket string
 }
 
@@ -301,6 +323,13 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 		return nil, forbidden("the grant does not allow read in " + ns)
 	}
 	names, safe := edgeReadScope(a)
+	if names == nil && !t.readsNS(n, cfg, a, false) {
+		// A partial reader whose rules fix no names reads a covered
+		// namespace filtered (§B.11.9 Edge grants).
+		if fs := t.filteredScope(n); fs != nil {
+			return t.filteredEdgeGrant(n, fs, a, grantExp(g))
+		}
+	}
 	if !safe {
 		return nil, forbidden("the grant's read rules refer to /resource without fixing it to a finite set of valid names, or to /now, which an edge can't evaluate (§2.1, §C.5.2): " + ns)
 	}
@@ -475,6 +504,11 @@ func (t *tx) edgeReader(n *nsRow, eg *EdgeGrant, resource string) (*actor, *Erro
 	}
 	if eg.NS != n.name {
 		return nil, nsNotNamed(n.name)
+	}
+	if eg.GS != "" {
+		// A partial reader's edge grant authorises its filtered reads
+		// only, admitted by filteredAdmit (§B.11.9).
+		return nil, forbidden("this edge grant reads " + n.name + " filtered only: exchange or read under /ns/" + n.name + "/g/" + eg.GS + " (§B.11.9)")
 	}
 	if eg.Resource != "" && eg.Resource != resource {
 		return nil, notFound()
