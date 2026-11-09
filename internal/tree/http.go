@@ -650,7 +650,10 @@ var ops = map[string]bool{
 // node's K_r of its epoch, pl { ns, name, view }, and left out where the
 // service can't have that epoch's key, or where the epoch isn't known: a
 // born is never sealed under the head's epoch for want of its own
-// (§E.2.6; at E3 its epoch is its snapshot's, §E.3.1, bornOf). A g/all
+// (§E.2.6; at E3 its epoch is its snapshot's, §E.3.1, bornOf). At E3 an
+// epoch that is the one in force is judged once, by the first listing
+// that seals a value of that revision, and recorded (judgeEpochs): head
+// and born values of one revision share it. A g/all
 // listing of a catalog that isn't public,
 // which every reader its URL admits reads whole, whose nodes' values all
 // come from one epoch, is sealed as one JWE under that epoch's key,
@@ -1199,6 +1202,11 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	)
 	// Each node's values are sealed under the epoch its head is served
 	// under (Node.Epoch; §E.2.6), the current one where that isn't known.
+	// In an e2e catalog that is a pending judgement, of the head's
+	// revision or the born's, made once: the epoch a listing first seals
+	// it under is recorded (judged, judgeEpochs) before the listing is
+	// stored or served, and used from then on; one another listing
+	// recorded first wins, and the listing is computed again with it.
 	// The keys of older epochs are read, outside the graph's lock, only
 	// once a listing shows a node they seal, and the listing computed
 	// again with them. An epoch whose key the service can't have
@@ -1206,12 +1214,14 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	// shown by name only, as for a reader without it (§E.2.6).
 	keys := map[int]derived.Key{key.Epoch: key}
 	lacking := map[int]bool{}
+	e3 := info.Level == derived.LevelE2E
 	var (
 		perEntry bool
 		whole    int
 		cps      map[string]string
 		prof     Profile
 		more     []keptPage
+		judged   map[string]*judgement
 	)
 	for {
 		// Sealed whole only where every reader the URL admits reads the
@@ -1229,14 +1239,36 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				return
 			}
 			view = derived.View{NS: cat, Target: canon(l.at)}
-			epochOf := func(name string) int {
+			// epochOf is the epoch node name's values are sealed under,
+			// a pending one judged (judge) as they are; peekEpoch the
+			// same, judging nothing.
+			peekEpoch := func(name string) int {
 				if n := g.Node(name); n != nil && n.Epoch > 0 {
 					return n.Epoch
 				}
 				return key.Epoch
 			}
+			judge := func(n *Node) *judgement {
+				j := judged[n.Name]
+				if j == nil {
+					j = &judgement{head: n.Head, born: n.Born}
+					judged[n.Name] = j
+				}
+				return j
+			}
+			epochOf := func(name string) int {
+				n := g.Node(name)
+				if n != nil && n.Epoch > 0 {
+					return n.Epoch
+				}
+				if e3 && n != nil && n.Head != "" && !n.Self {
+					judge(n).epoch = key.Epoch
+				}
+				return key.Epoch
+			}
 			run := func() map[int]bool {
 				more, serr = nil, nil
+				judged = map[string]*judgement{}
 				epochs := map[int]bool{}
 				q := &query{s: s, g: g, cur: curMap, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
 				// sealAt seals vals of node name under its K_r of epoch e,
@@ -1263,9 +1295,21 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 					// under the head's.
 					q.bornApart = func(n *Node) int {
 						switch e := n.BornEpoch; {
+						case e == bornWithHead && e3:
+							// Its revision is the head's: sealed with
+							// the head's values, under its judgement.
+							judge(n).withHead = true
+							return 0
+						case e == bornPending && e3:
+							// Judged now, as the epoch in force.
+							judge(n).bornEpoch = key.Epoch
+							if key.Epoch != peekEpoch(n.Name) {
+								return key.Epoch
+							}
+							return 0
 						case e <= 0:
 							return bornLeftOut
-						case e != epochOf(n.Name):
+						case e != peekEpoch(n.Name):
 							return e
 						}
 						return 0
@@ -1305,6 +1349,17 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				run()
 			}
 		})
+		if l.status == http.StatusOK && len(missing) == 0 && serr == nil && len(judged) > 0 {
+			// Recorded before the listing is stored or served; one that
+			// lost to another's computes it again (§E.2.6).
+			lost, err := s.judgeEpochs(ctx, judged)
+			if err != nil {
+				return nil, err
+			}
+			if lost {
+				continue
+			}
+		}
 		if l.status != http.StatusOK || len(missing) == 0 {
 			break
 		}

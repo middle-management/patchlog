@@ -649,15 +649,17 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 	changed := false
 	for i, w := range wants {
 		e := epochs[i]
-		if e <= 0 {
+		if e == 0 || e < 0 && !w.born {
 			continue
 		}
 		if w.born {
 			// The born's epoch is its first revision's, whatever the head
 			// (§E.2.6): a head changed since keeps it, and Apply, which
 			// keeps a known born as it is, never reads it again. A born
-			// changed since is another revision's.
-			if n := g.explicit[w.node]; n != nil && n.Born == w.bornAt && n.BornEpoch == 0 {
+			// changed since is another revision's. A pending one is
+			// judged by a listing (bornPending), with the head it was
+			// read at where it is that head's revision (bornWithHead).
+			if n := g.explicit[w.node]; n != nil && n.Born == w.bornAt && n.BornEpoch == 0 && (e != bornWithHead || n.Head == w.head) {
 				n.BornEpoch, changed = e, true
 				if g.nodes[w.node] == n {
 					if _, err := tx.ExecContext(ctx, `UPDATE nodes SET born_epoch = ? WHERE name = ?`, e, w.node); err != nil {

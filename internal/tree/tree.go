@@ -1287,7 +1287,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			changed[p.name] = true
 			if p.kind == "head" && p.doc != nil {
 				n := ParseNode(cat, p.name, p.head, p.doc)
-				n.Born, n.BornUnknown, n.Epoch, n.BornEpoch = p.born, p.bornUnknown, p.epoch, p.bornEpoch
+				n.Born, n.BornUnknown, n.Epoch, n.BornEpoch = p.born, p.bornUnknown, p.epoch, carryBornEpoch(g.explicit[p.name], p)
 				if g.explicitGone[p.name] {
 					if err := saveGone(ctx, tx, p.name, false); err != nil {
 						return nil, err
@@ -1651,6 +1651,125 @@ func (s *Service) nodeBorn(ctx context.Context, ns, name, head string, self, pur
 	return born, err == nil && born == "", epoch, err
 }
 
+// carryBornEpoch is the BornEpoch of p's node, old the node as it was
+// (nil for none): p's where its born was read again (bornOf); otherwise
+// old's as it stands now, which a listing may have judged since p was
+// read (judgeEpochs), and where it was its head's revision's judgement
+// (bornWithHead) and the head moved on, that head's epoch, or pending on
+// its own while that wasn't judged either (§E.2.6, §E.3.1).
+func carryBornEpoch(old *Node, p prep) int {
+	if old == nil || p.purged || old.Born != p.born || old.Born == "" {
+		return p.bornEpoch
+	}
+	switch {
+	case old.BornEpoch != bornWithHead || old.Head == p.head:
+		return old.BornEpoch
+	case old.Epoch > 0:
+		return old.Epoch
+	}
+	return bornPending
+}
+
+// judgement is what a listing judged of a node's pending epochs in an e2e
+// catalog (§E.2.6, §E.3.1), for the node's head and born as it read them:
+// epoch, the head's (0 none); bornEpoch, the born's on its own
+// (bornPending; 0 none); withHead, that the born, the head's revision
+// (bornWithHead), was sealed with the head's values, under its epoch.
+type judgement struct {
+	head, born       string
+	epoch, bornEpoch int
+	withHead         bool
+}
+
+// judgeEpochs records judged, by node name, in the nodes table and the
+// graph: a value derived from a revision whose snapshot would carry the
+// epoch in force is sealed under the epoch it was first sealed under,
+// "judged once, when the service first seals a value derived from it"
+// (§E.2.6), and born and head values from one revision share that
+// judgement. The first writer wins, another listing of this service or
+// of another on its database; lost reports that one recorded first
+// differs from judged, so the listing must be computed again with it. A
+// node whose head or born moved on meanwhile records nothing: its
+// listing is of an at that is no longer the current one.
+func (s *Service) judgeEpochs(ctx context.Context, judged map[string]*judgement) (lost bool, err error) {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	type stored struct {
+		epoch, born int
+		ok          bool
+	}
+	got := map[string]stored{}
+	for name, j := range judged {
+		if j.epoch > 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE nodes SET epoch = ? WHERE name = ? AND head = ? AND self = 0 AND (epoch IS NULL OR epoch <= 0)`,
+				j.epoch, name, j.head); err != nil {
+				return false, err
+			}
+		}
+		if j.bornEpoch > 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE nodes SET born_epoch = ? WHERE name = ? AND head = ? AND self = 0 AND born = ? AND born_epoch = ?`,
+				j.bornEpoch, name, j.head, j.born, bornPending); err != nil {
+				return false, err
+			}
+		}
+		// A born of the head's revision takes the head's judgement, this
+		// one or one recorded before.
+		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET born_epoch = epoch WHERE name = ? AND head = ? AND self = 0 AND born_epoch = ? AND epoch > 0`,
+			name, j.head, bornWithHead); err != nil {
+			return false, err
+		}
+		var e, b sql.NullInt64
+		switch err := tx.QueryRowContext(ctx, `SELECT epoch, born_epoch FROM nodes WHERE name = ? AND head = ? AND self = 0`, name, j.head).Scan(&e, &b); {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return false, err
+		default:
+			got[name] = stored{int(e.Int64), int(b.Int64), true}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	for name, j := range judged {
+		n := s.g.explicit[name]
+		if n == nil || n.Head != j.head || n.Born != j.born {
+			continue
+		}
+		st, ok := got[name]
+		if !ok {
+			// Not stored as this node (the graph holds what the table
+			// will): kept in the graph alone, as judged.
+			st = stored{epoch: n.Epoch, born: n.BornEpoch}
+			if st.epoch <= 0 && j.epoch > 0 {
+				st.epoch = j.epoch
+			}
+			switch {
+			case st.born == bornPending && j.bornEpoch > 0:
+				st.born = j.bornEpoch
+			case st.born == bornWithHead && st.epoch > 0:
+				st.born = st.epoch
+			}
+		}
+		if n.Epoch <= 0 && st.epoch > 0 {
+			n.Epoch = st.epoch
+		}
+		if (n.BornEpoch == bornPending || n.BornEpoch == bornWithHead) && st.born > 0 {
+			n.BornEpoch = st.born
+		}
+		if j.epoch > 0 && n.Epoch != j.epoch || j.bornEpoch > 0 && n.BornEpoch != j.bornEpoch {
+			lost = true
+		}
+	}
+	return lost, nil
+}
+
 // bornOf is when ns/name was created (§B.5 born): the created of the first
 // revision of its chain up to head, the first its log gives from genesis.
 // A log that can't be read for the moment (Transient) is an error, so the
@@ -1660,8 +1779,10 @@ func (s *Service) nodeBorn(ctx context.Context, ns, name, head string, self, pur
 // is served under in a sealed or e2e namespace (§E.2.6): at E2 its served
 // kid's where that names ns (derived.EpochOf); at E3 the one a prune's
 // snapshot of it would carry (snapshotBornEpoch, §E.3.1), never the
-// served kid of an entry the log gives in the clear; 0 if not known,
-// which leaves born out of a sealed listing (Service.serve).
+// served kid of an entry the log gives in the clear, and where that is
+// the epoch in force, pending, judged once when a listing first seals it
+// (bornPending, or bornWithHead where that revision is head); 0 if not
+// known, which leaves born out of a sealed listing (Service.serve).
 func (s *Service) bornOf(ctx context.Context, ns, name, head string) (born string, epoch int, err error) {
 	es, _, err := s.c.LogPage(ctx, ns, name, head, "")
 	switch {
@@ -1680,7 +1801,11 @@ func (s *Service) bornOf(ctx context.Context, ns, name, head string) (born strin
 	in, err := s.keys.Info(ctx, ns)
 	switch {
 	case err == nil && in.Level == derived.LevelE2E:
-		return es[0].Created, snapshotBornEpoch(ns, in.Epoch, es[0]), nil
+		e := snapshotBornEpoch(ns, es[0])
+		if e == bornPending && es[0].ID == head {
+			e = bornWithHead
+		}
+		return es[0].Created, e, nil
 	case err == nil || lastingKeyErr(err):
 		return es[0].Created, derived.EpochOf(ns, es[0].Kid), nil
 	default:
@@ -1694,10 +1819,12 @@ func (s *Service) bornOf(ctx context.Context, ns, name, head string) (born strin
 // before a raise from sealed, served sealed as at E2, its served kid's
 // where that names ns; one whose sealed op is ns's own (its pl.ns names
 // ns), the epoch its kid names; one whose op is a base's, read through, or
-// in the clear from before a raise from none or at-rest, current, ns's
-// epoch in force. 0, not known, for one without its patch set (pruned or
-// purged) or whose own op's kid doesn't name an epoch of ns.
-func snapshotBornEpoch(ns string, current int, e client.LogEntry) int {
+// in the clear from before a raise from none or at-rest, ns's epoch in
+// force, judged once, when a value derived from it is first sealed
+// (§E.2.6): bornPending, never the epoch current as it is applied. 0, not
+// known, for one without its patch set (pruned or purged) or whose own
+// op's kid doesn't name an epoch of ns.
+func snapshotBornEpoch(ns string, e client.LogEntry) int {
 	if e.Kid != "" {
 		return derived.EpochOf(ns, e.Kid)
 	}
@@ -1706,14 +1833,14 @@ func snapshotBornEpoch(ns string, current int, e client.LogEntry) int {
 	}
 	jwe, ok := seal.SealedJWE(e.Patches)
 	if !ok {
-		return current
+		return bornPending
 	}
 	h, err := seal.ParseHeader(jwe)
 	if err != nil {
 		return 0
 	}
 	if pns, _ := h.PL["ns"].(string); pns != ns {
-		return current
+		return bornPending
 	}
 	return derived.EpochOf(ns, h.Kid)
 }
