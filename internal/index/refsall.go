@@ -2,11 +2,11 @@ package index
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -20,9 +20,6 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
-	"github.com/middle-management/patchlog/internal/jsonv"
-	"github.com/middle-management/patchlog/internal/pointer"
-	"github.com/middle-management/patchlog/internal/rules"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -158,12 +155,62 @@ type refsReader struct {
 	public bool                         // reads no private namespace: the answer is public
 	nss    []string                     // the namespaces asked, sorted
 	allow  map[string]func(string) bool // namespaces it reads only in part
+	// covs are the namespaces §B.11.9 covers that it reads as a partial
+	// reader, whose views decide allow there and whose combined
+	// checkpoints join at (§A.4 Across namespaces); markers, with a
+	// grant, its marker in each namespace, which gs is over, nil under a
+	// cookie, whose gs is fixed.
+	covs    map[string]*access
+	markers map[string]string
 	// unverified: the request carries no grant the service verified in a
 	// private namespace it names (§B.11.5): none, one that doesn't decode,
 	// or one refused 401 wherever it was checked (malformed, badly signed,
 	// revoked, expired or not yet valid, §C.2, §12.1).
 	unverified bool
 }
+
+// covered reports whether ns is in the combined checkpoint of a namespace
+// §B.11.9 covers that rd reads in part (§A.4: min may name it too).
+func (rd *refsReader) covered(ns string) bool {
+	for _, a := range rd.covs {
+		if _, ok := a.cov.cp.ids[ns]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// recover computes rd's views of the namespaces §B.11.9 covers again at
+// their committed checkpoints, after an apply moved one (errMoved), or,
+// with force, after a wait for min that may have moved the heads of the
+// namespaces they read; with a grant, its gs is over the markers they
+// give.
+func (ix *Index) recover(ctx context.Context, rd *refsReader, force bool) error {
+	for ns, a := range rd.covs {
+		if force {
+			a.cov = nil
+		}
+		if err := ix.cover(ctx, a, ns, ""); err != nil {
+			return fmt.Errorf("%w: %w", errVisibility, err)
+		}
+		rd.allow[ns] = a.allow
+		if rd.markers != nil {
+			rd.markers[ns] = a.marker
+		}
+	}
+	if rd.markers != nil {
+		ms := make([]string, 0, len(rd.markers))
+		for _, m := range rd.markers {
+			ms = append(ms, m)
+		}
+		rd.gs = grantcheck.SubjectSetID(ms)
+	}
+	return nil
+}
+
+// errMoved is a checkpoint of a namespace §B.11.9 covers that moved
+// between computing a view of it and reading its rows (refsCompute).
+var errMoved = errors.New("a checkpoint moved")
 
 // refsNamespaces lists the namespaces the index serves (known), sorted.
 func (ix *Index) refsNamespaces() []string {
@@ -199,7 +246,7 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			return rd, err
 		}
 	}
-	rd := &refsReader{public: true, allow: map[string]func(string) bool{}}
+	rd := &refsReader{public: true, allow: map[string]func(string) bool{}, covs: map[string]*access{}, markers: map[string]string{}}
 	var (
 		markers  []string
 		refused  int
@@ -247,7 +294,11 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			if !a.all {
 				rd.allow[ns] = a.allow
 			}
+			if a.cov != nil {
+				rd.covs[ns] = a
+			}
 			rd.public, markers = false, append(markers, a.marker)
+			rd.markers[ns] = a.marker
 		}
 		rd.nss = append(rd.nss, ns)
 	}
@@ -285,58 +336,8 @@ func (ix *Index) refsAccess(ctx context.Context, ns string, r *http.Request, g *
 	return ix.access(ctx, ns, r)
 }
 
-// readsScope digests what the reads of a grant that reads a namespace only
-// in part depend on (§A.4): the rules they are judged by there (its key's
-// scope, its blocks' and those of its roles that grant read, §C.5) and the
-// /principal values those refer to, so readers with the same rules and
-// values share answers. It reports false if a rule refers to /now (or the
-// whole envelope): the namespace then counts as unreadable, since an answer
-// at a given at can't change.
-func readsScope(v *grant.Verified) (string, bool) {
-	lists := [][]any{v.KeyRules, v.BlockRules}
-	roles := map[string]any{}
-	_, readers := v.Allows("read")
-	for _, role := range readers {
-		roles[role] = v.RoleRules(role)
-		lists = append(lists, v.RoleRules(role))
-	}
-	env := map[string]any{"principal": v.Principal.Envelope()}
-	principal := map[string]any{}
-	for _, l := range lists {
-		for _, rv := range l {
-			r, err := rules.Compile(rv)
-			if err != nil {
-				return "", false // it refuses every read anyway
-			}
-			for _, p := range r.RefPaths() {
-				switch {
-				case len(p) == 0 || p[0] == "now":
-					return "", false
-				case p[0] == "principal":
-					if x, ok := pointer.Get(env, p); ok {
-						principal[p.String()] = x
-					}
-				}
-			}
-		}
-	}
-	x := map[string]any{
-		"readScope": v.Key.ReadScopeResource, "keyRules": v.KeyRules, "blockRules": v.BlockRules,
-		"roles": roles, "principal": principal,
-	}
-	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo(x)))
-	return ids.FromBytes(sum[:ids.Size]).String(), true
-}
-
 // combinedAt is the combined checkpoint of §B.5 over cps (ns → ns_id).
-func combinedAt(cps map[string]string) string {
-	m := make(map[string]any, len(cps))
-	for ns, id := range cps {
-		m[ns] = id
-	}
-	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo(m)))
-	return ids.FromBytes(sum[:ids.Size]).String()
-}
+var combinedAt = grantcheck.CombinedAt
 
 // serveRefs answers /_refs and /_refs/g/{gs}/at/{at} (segs, from "_refs"),
 // the subject set before the checkpoint (§A.4). The form before v0.51,
@@ -473,6 +474,14 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached min yet")
 		return
 	}
+	if len(rq.mins) > 0 && len(rd.covs) > 0 {
+		// A min may have moved what the views of namespaces §B.11.9
+		// covers read (waitMember): they are computed again.
+		if err := ix.recover(ctx, rd, true); err != nil {
+			ix.writeCoverErr(w, "_refs", err)
+			return
+		}
+	}
 	if at != "" && !purged {
 		if st, _, ok := ix.refsStored(ctx, rd, target(at)); ok && ix.refsIncludes(ctx, st, rq.mins) {
 			// A kept answer, whose at already includes every min:
@@ -492,6 +501,10 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	if err != nil {
 		if errors.Is(err, errRefsKeys) {
 			writeBehind(w, err.Error()) // §12.1: no code of its own
+			return
+		}
+		if errors.Is(err, errVisibility) || errors.Is(err, errMoving) {
+			ix.writeCoverErr(w, "_refs", err)
 			return
 		}
 		ix.opt.Logf("index: query %s: %v", r.URL, err)
@@ -540,7 +553,7 @@ func (ix *Index) refsMins(ctx context.Context, r *http.Request, rd *refsReader, 
 		decoded bool
 	)
 	for _, m := range mins {
-		if slices.Contains(rd.nss, m.NS) {
+		if slices.Contains(rd.nss, m.NS) || rd.covered(m.NS) {
 			keep = append(keep, m)
 			continue
 		}
@@ -635,7 +648,7 @@ func (ix *Index) refsStored(ctx context.Context, rd *refsReader, url string) (de
 		bound = true
 	}
 	for _, t := range strings.Split(st.Tags, ",") {
-		if ns, ok := strings.CutPrefix(t, "idx:"); ok && !slices.Contains(rd.nss, ns) {
+		if ns, ok := strings.CutPrefix(t, "idx:"); ok && !slices.Contains(rd.nss, ns) && !rd.covered(ns) {
 			return derived.Stored{}, false, false
 		}
 	}
@@ -646,10 +659,24 @@ func (ix *Index) refsStored(ctx context.Context, rd *refsReader, url string) (de
 // it, and returns it with that checkpoint and whether it is bound to its
 // URL. An answer read before a purge of what it shows, which is then not
 // kept, is computed again.
+//
+// A partial reader's view of a namespace §B.11.9 covers is computed at
+// its checkpoint: where an apply moved it meanwhile, the views are
+// computed again (recover), and rd's gs may change with them.
 func (ix *Index) refsAnswer(ctx context.Context, rd *refsReader, rq *refsQuery, target func(string) string) (derived.Stored, string, bool, error) {
-	for try := 0; ; try++ {
+	for try, moved := 0, 0; ; try++ {
 		gen := ix.refs.Generation(refsScope)
 		st, at, bound, err := ix.refsCompute(ctx, rd, rq, target)
+		if errors.Is(err, errMoved) && moved < 2 {
+			moved, try = moved+1, try-1
+			if err := ix.recover(ctx, rd, false); err != nil {
+				return st, at, bound, err
+			}
+			continue
+		}
+		if errors.Is(err, errMoved) {
+			return st, at, bound, errMoving
+		}
 		if err != nil {
 			return st, at, bound, err
 		}
@@ -669,16 +696,23 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 	if err != nil {
 		return derived.Stored{}, "", false, err
 	}
-	at := combinedAt(cps)
-	view := target(at)
-	if st, bound, ok := ix.refsStored(ctx, rd, view); ok {
-		return st, at, bound, nil
-	}
+	// The namespaces whose hits the answer holds: those reached; and the
+	// combined checkpoint over them and, for those §B.11.9 covers that
+	// the reader reads in part, every namespace visibility reads there,
+	// each view's checkpoint being the one this transaction holds (§A.4).
 	nss := make([]string, 0, len(cps))
 	for ns := range cps {
 		nss = append(nss, ns)
 	}
 	sort.Strings(nss)
+	if cps, err = refsMerge(cps, rd); err != nil {
+		return derived.Stored{}, "", false, err
+	}
+	at := combinedAt(cps)
+	view := target(at)
+	if st, bound, ok := ix.refsStored(ctx, rd, view); ok {
+		return st, at, bound, nil
+	}
 
 	// The page: each namespace's referrers in resource order (refs_t,
 	// as ?ref= reads them) from after on, the reader's per-resource filter
@@ -786,8 +820,9 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		return key, false, nil
 	}
 
-	tags := make([]string, 0, len(nss)+len(hits))
-	for _, ns := range nss {
+	// idx:{ns} for every namespace in at (§A.4).
+	tags := make([]string, 0, len(cps)+len(hits))
+	for _, ns := range slices.Sorted(maps.Keys(cps)) {
 		tags = append(tags, "idx:"+ns)
 	}
 	out := make([]any, 0, len(hits))
@@ -855,12 +890,40 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 			ix.opt.Logf("index: storing a sealed result: %v", err)
 		}
 		if now, err := ix.refsCheckpoints(ctx, ix.db, rd.nss); err == nil {
-			if err := ix.sealed.Retire(ctx, ix.db, scope, combinedAt(now)); err != nil {
-				ix.opt.Logf("index: retiring sealed results of %s: %v", scope, err)
+			// A covered namespace's checkpoint moved meanwhile: the next
+			// answer retires these.
+			if merged, err := refsMerge(now, rd); err == nil {
+				if err := ix.sealed.Retire(ctx, ix.db, scope, combinedAt(merged)); err != nil {
+					ix.opt.Logf("index: retiring sealed results of %s: %v", scope, err)
+				}
 			}
 		}
 	}
 	return st, at, len(keys) > 0, nil
+}
+
+// refsMerge is cps, the checkpoints of the namespaces an answer's hits
+// come from, with the combined checkpoint of each namespace §B.11.9 covers
+// that rd reads in part (§A.4 Across namespaces): errMoved if a view was
+// computed at another checkpoint of one of them than cps holds, or two
+// views take a member at two.
+func refsMerge(cps map[string]string, rd *refsReader) (map[string]string, error) {
+	if len(rd.covs) == 0 {
+		return cps, nil
+	}
+	out := maps.Clone(cps)
+	for ns, a := range rd.covs {
+		if id, ok := cps[ns]; ok && id != a.cov.cp.ids[ns] {
+			return nil, errMoved
+		}
+		for m, id := range a.cov.cp.ids {
+			if got, ok := out[m]; ok && got != id {
+				return nil, errMoved
+			}
+			out[m] = id
+		}
+	}
+	return out, nil
 }
 
 // queryer runs queries (a *sql.DB or *sql.Tx).

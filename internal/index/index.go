@@ -23,7 +23,9 @@
 //	edge_subjects, edge_buckets      the markers of each subject set the service minted edge
 //	                                 grants for, until the last of them expires, and its
 //	                                 exchangeRate buckets (svcedge.Store, edgegrants.go)
-//	edge_filters(marker, filter, exp) what each scope marker of those stands for (readFilter)
+//	edge_filters(marker, filter, exp) what each scope or g: marker of those stands for (markerRec)
+//	edge_gs(marker, subjects, kid, roles, exp)  and, for a g: marker (§B.11.9), its subjects and
+//	                                      the kid and read roles its scope digest covers
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
@@ -61,6 +63,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -90,7 +93,11 @@ type Options struct {
 	// Client reads the core API; with a private namespace it needs a grant
 	// with read on it (§C.6 least privilege). For sealed namespaces build it
 	// WithKeys (client.NewKeys(Recipient)); its grant must get epoch keys
-	// (read on the whole namespace), which seal the results.
+	// (read on the whole namespace), which seal the results. Where §B.11.9
+	// covers a namespace, its grant must also read the namespaces
+	// visibility reads there, which the index follows without serving them
+	// (filtered.go): the trusted catalogs, their catalog.trust members and
+	// a branch's bases.
 	Client *client.Client
 	// Recipient is the service's X25519 private key: it unwraps keys
 	// POST /keys wraps to the grant's enc, and makes e2e namespaces
@@ -188,7 +195,9 @@ type Index struct {
 	edge    *svcedge.Store // the service's edge grants (EdgeGrants)
 
 	fmu     sync.Mutex
-	filters map[string]keptFilter // scope marker -> what it stands for (edge_filters)
+	filters map[string]keptFilter // scope or g: marker -> what it stands for (edge_filters, edge_gs)
+
+	fs fstate // the state of namespaces §B.11.9 covers (filtered.go)
 
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers
@@ -252,6 +261,7 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		fetches: semaphore.NewWeighted(int64(opt.FetchConcurrency)),
 		roots:   map[string]bool{}, cur: map[string]string{}, purged: map[string]bool{}, changed: make(chan struct{}),
 	}
+	ix.fs.init()
 	ix.repurge = repurge.New(db, opt.Purger, repurge.Options{Delay: opt.RepurgeDelay, Interval: opt.RepurgeInterval,
 		Now: opt.Now, Lock: &ix.wmu, Name: "index", Logf: opt.Logf})
 	for _, ns := range opt.Namespaces {
@@ -296,7 +306,7 @@ func (ix *Index) Origin() string { return ix.origin }
 var migrations embed.FS
 
 // resetStmts empty what a rebuild replays (cdn_repurge stays, and so do
-// the edge grants' tables, edge_filters and svcedge.Store's), in one
+// the edge grants' tables, edge_filters, edge_gs and svcedge.Store's), in one
 // transaction. checkpoints_bootstrap too: a snapshot left part-way would
 // otherwise be resumed, not replayed from its first page. text, made by
 // initSchema rather than a migration, is dropped, so a rebuild decides
@@ -777,6 +787,15 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// results go first, after the commit: one read before it that carries
 	// a tag it purges is then not kept (kept.Store.Generation).
 	ix.kept.Purge(b.NS, tags)
+	if slices.Contains(tags, "idx:"+b.NS) {
+		// Results at a combined checkpoint of another namespace that
+		// covers this one carry its idx: tag too (§A.4, filtered.go).
+		for _, ns := range ix.refsNamespaces() {
+			if ns != b.NS {
+				ix.kept.Purge(ns, []string{"idx:" + b.NS})
+			}
+		}
+	}
 	if len(tags) > 0 {
 		ix.opt.Purger.PurgeTags(tags)
 	}
