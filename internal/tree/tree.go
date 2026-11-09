@@ -475,6 +475,7 @@ func (s *Service) reload(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.sealed.Purged(tags)
 	s.kept.Purge(s.opt.Catalog, tags)
 	if len(tags) > 0 {
 		s.opt.Purger.PurgeTags(tags)
@@ -1089,7 +1090,9 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	// Purge before the new checkpoint is out, so nobody who learns of it
 	// can still be served what it removed. Purgers don't block. Kept
 	// listings go first: one read before it that carries a tag it purges
-	// is then not kept (kept.Store.Generation).
+	// is then not kept (kept.Store.Generation). Stored sealed ones read
+	// meanwhile go again (derived.Cache.Purged).
+	s.sealed.Purged(res.tags)
 	s.kept.Purge(s.opt.Catalog, res.tags)
 	if len(res.tags) > 0 {
 		s.opt.Purger.PurgeTags(res.tags)
@@ -1849,6 +1852,7 @@ func (s *Service) backfillNodes(ctx context.Context) error {
 		return err
 	}
 	if len(tags) > 0 {
+		s.sealed.Purged(tags)
 		s.kept.Purge(cat, tags)
 		s.opt.Purger.PurgeTags(tags)
 	}

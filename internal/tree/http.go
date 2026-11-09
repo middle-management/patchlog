@@ -943,7 +943,7 @@ type computed struct {
 func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string, info derived.Info, key derived.Key) (*computed, error) {
 	cat := s.opt.Catalog
 	keep := !perReader(op, v)
-	gen := s.kept.Generation(cat)
+	gen, sgen := s.kept.Generation(cat), s.sealed.Generation()
 	fs, err := s.fileSealing(ctx)
 	if err != nil {
 		return nil, err
@@ -1130,7 +1130,9 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	if sealed {
 		for i := range pages {
 			var err error
-			if pages[i].st, err = s.sealed.Put(ctx, pages[i].key, cat, l.at, pages[i].st); err != nil {
+			// Not stored if a purge since it was read may have changed it,
+			// as a backfill does at an unchanged at.
+			if pages[i].st, err = s.sealed.PutSince(ctx, pages[i].key, cat, l.at, sgen, pages[i].st); err != nil {
 				s.opt.Logf("tree: storing a sealed listing: %v", err)
 			}
 		}

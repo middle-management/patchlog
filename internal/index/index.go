@@ -761,6 +761,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	ix.sealed.Purged(tags)
 	ix.refsPurged(ctx, b.NS, tags, co.PurgedNS)
 	if b.Partial() {
 		// A page of a snapshot later pages complete: the index doesn't

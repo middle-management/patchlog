@@ -289,6 +289,7 @@ func (s *Service) backfillFiles(ctx context.Context) error {
 		}
 		return err
 	}
+	s.sealed.Purged(tags)
 	s.kept.Purge(s.opt.Catalog, tags)
 	s.opt.Purger.PurgeTags(tags)
 	return nil
@@ -686,6 +687,7 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 		return err
 	}
 	if len(tags) > 0 {
+		s.sealed.Purged(tags)
 		s.kept.Purge(cat, tags)
 		s.opt.Purger.PurgeTags(tags)
 	}
