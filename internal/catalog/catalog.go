@@ -172,6 +172,10 @@ type Service struct {
 	// afterDecide, if set (tests), runs after each try of POST
 	// /read-grants decides its items, before the checkpoint is checked.
 	afterDecide atomic.Pointer[func(try int)]
+	// verifyHook, if set (tests), fails the verification of a caller's
+	// grant for the catalog with the error it returns, if any: a
+	// requireAt chain the checker can't read.
+	verifyHook atomic.Pointer[func() error]
 }
 
 // Open opens the catalog service.

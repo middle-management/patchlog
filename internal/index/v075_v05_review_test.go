@@ -42,11 +42,17 @@ func TestV075IndexScopeCookieCovered(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	w := newV75X(t, false)
-	trust := func(v []any) {
-		cfg := must(w.admin.NSHead(ctx, "cat-season")).Config
-		must(w.admin.PatchConfig(ctx, "cat-season", cfg, []any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": v}}))
+	// Since v0.77 a namespace whose catalogs names a catalog that doesn't
+	// trust it gives a partial reader no marker (§A.4), so matches is
+	// left uncovered by naming no catalog, and covered by naming
+	// cat-season again.
+	catalogs := func(v map[string]any) {
+		cfg := must(w.admin.NSHead(ctx, "matches")).Config
+		must(w.admin.PatchConfig(ctx, "matches", cfg, []any{map[string]any{"op": "replace", "path": "/catalogs", "value": v}}))
+		w.x.caughtUp("matches")
+		w.x.ix.ExpireGrantChecks()
 	}
-	trust([]any{})
+	catalogs(map[string]any{})
 	fan := w.reader("user:fan", []any{"fans"})
 	prefix, refs, cookies := w.exchange(fan)
 	if got, _ := p37Follow(t, w.x, prefix, cookies, ""); got.status != 200 || strings.Join(p37Hits(got.body), ",") != "derby,opener,secret,shared" {
@@ -55,7 +61,7 @@ func TestV075IndexScopeCookieCovered(t *testing.T) {
 	if got, _ := p37Follow(t, w.x, refs+"?to=/r/target/x", cookies, ""); got.status != 200 || len(p37Hits(got.body)) != 4 {
 		t.Fatalf("uncovered, /_refs under the cookie: %d %v", got.status, got.body)
 	}
-	trust([]any{"matches"})
+	catalogs(map[string]any{"cat-season": map[string]any{"place": []any{}}})
 	if _, _, at := w.pointer("/matches", fan); at == w.x.ix.Checkpoint("matches") {
 		t.Fatal("matches is not covered again")
 	}

@@ -223,13 +223,16 @@ func TestV073ChildrenOrderAndCursor(t *testing.T) {
 	if got := names(b["children"]); got != "plain,fw,emoji,un" {
 		t.Errorf("children by UTF-8 bytes: %s", got)
 	}
+	// Each next is followed at its page's at: the head pointer drops a
+	// position (§A.4, v0.77).
 	var seen []string
-	next := "?limit=1&of=root"
+	next, path := "?limit=1&of=root", "/cat/children"
 	for i := 0; next != ""; i++ {
 		if i > 5 {
 			t.Fatal("too many pages")
 		}
-		b = x.get("/cat/children"+next, "")
+		b = x.get(path+next, "")
+		path = "/cat/at/" + b["at"].(string) + "/children"
 		seen = append(seen, names(b["children"]))
 		if b["total"] != float64(4) {
 			t.Errorf("page %d total %v", i, b["total"])

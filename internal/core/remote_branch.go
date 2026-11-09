@@ -83,11 +83,15 @@ import (
 //     be mirrored: its horizon is a sealed snapshot. Content from before a
 //     raise from sealed is mirrored with the base's sealings of it,
 //     byte for byte, each keeping its epoch (fetchPreSealings, §G.5.2),
-//     checked with the base's keys of those epochs where B holds them and
-//     by their shape where it doesn't; B hands those keys out by start
-//     times read only from base.origin itself (originStarts). B never
-//     seals that content itself: a sealing the base didn't serve it
-//     answers 502 upstream, as for a failed fetch (preRaiseUnfetched).
+//     each stored only once opened with the base's key of its epoch and
+//     verified: creation is 422 where the endpoint's grant gets no key of
+//     an epoch such content is sealed under, as for a base B can't read
+//     (§G.3 Creating one); B hands those keys out by start times read
+//     only from base.origin itself (originStarts). B never seals that
+//     content itself: a sealing the base didn't serve it is pending
+//     (preraise_pending.go), fetched again at each sync until it opens
+//     and verifies, and answers 502 upstream until then, or 410 pruned
+//     once the base answered that (preRaiseUnfetched).
 
 // RemoteAuthor is the author of entries this deployment writes on behalf of
 // a remote base: purges followed from its log, and mirrored horizons whose
@@ -152,14 +156,24 @@ func unverified(format string, a ...any) *Error {
 }
 
 // noAnswer reports a failed fetch where the base's deployment didn't
-// answer, or answered 5xx: only that is 502 upstream at creation (§G.3).
+// answer, or failed transiently: a transport error, a deadline, or a 5xx,
+// 408 or 429 (§A.4, §12.1, transientStatus). Only that is 502 upstream at
+// creation (§G.3); every other answer is the base's.
 func noAnswer(err error) bool {
 	if ae, ok := client.AsAPIError(err); ok {
-		return ae.Status >= 500
+		return transientStatus(ae.Status)
 	}
 	var ue *url.Error
 	var ne net.Error
 	return errors.As(err, &ue) || errors.As(err, &ne) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// transientStatus reports an HTTP status that fails a fetch transiently,
+// which a later fetch may not: a 5xx, 408 or 429 (§A.4: "a schema or key
+// fetch that fails transiently (transport error, 5xx, 408, 429) is
+// retried"). No other 4xx is.
+func transientStatus(st int) bool {
+	return st >= 500 || st == http.StatusRequestTimeout || st == http.StatusTooManyRequests
 }
 
 // endpoint resolves how an origin is reached.
@@ -197,8 +211,9 @@ func (e *Engine) remoteClient(origin string) (*client.Client, RemoteEndpoint, er
 
 // fetchErr maps a failed fetch from the base (§G.3, §G.5.2). What the base
 // answers is a base this deployment can't read, 422, but for its 410s
-// (pruned, gone or purged, levelErr); only no answer, or a 5xx, is 502
-// upstream. Keys this deployment can't get leave the base unreadable too.
+// (pruned, gone or purged, levelErr); only no answer, or a 5xx, 408 or
+// 429, is 502 upstream (noAnswer). Keys this deployment can't get leave
+// the base unreadable too.
 func fetchErr(what string, err error) *Error {
 	if ae, ok := client.AsAPIError(err); ok {
 		switch {
@@ -211,7 +226,7 @@ func fetchErr(what string, err error) *Error {
 			return apiErr(410, "pruned", "message", what+": history needed at at was pruned at the base", "horizon", ae.Horizon())
 		case ae.Status == 410:
 			return gone("message", what+": gone at the base")
-		case ae.Status >= 500:
+		case transientStatus(ae.Status):
 			return upstreamErr("%s: %d from the base", what, ae.Status)
 		}
 		return invalid(fmt.Sprintf("%s: the base answered %d, so this deployment can't read it (§G.3)", what, ae.Status))
@@ -759,7 +774,7 @@ func fetchLevel(ctx context.Context, c *client.Client, origin, ns, at string, ma
 
 // unknownLevel refuses a remote branch whose base's current namespace
 // document can't be read: without it, B can't tell how protected the base
-// is (§G.5.2). No answer, or a 5xx, stays a 502; anything else the base
+// is (§G.5.2). No answer, or a 5xx, 408 or 429, stays a 502; anything else the base
 // answered, or a document B can't open, is 422.
 func unknownLevel(base *BaseRef, err error) *Error {
 	what := "/ns/" + base.NS
@@ -973,8 +988,11 @@ func originCreated(ctx context.Context, ep RemoteEndpoint, url string, lv *remot
 // with start times only from the source's own log (§G.5.2), and none while
 // those are unknown (originStarts), though it still holds them to check and
 // serve the source's sealings. Keys the source gives this grant none of, it
-// relays none of; keyring entries (from) are the mirrored keyring's. Only
-// no answer, or a 5xx, fails creation.
+// relays none of, and content sealed under one makes creation 422
+// (fetchPreSealings, §G.3 Creating one); keyring entries (from) are the
+// mirrored keyring's. No answer, or a 5xx, 408 or 429 (noAnswer), fails
+// creation 502: without A's answer, B can't tell whether its grant gets
+// those keys.
 func fetchPreRaiseKeys(ctx context.Context, c *client.Client, ep RemoteEndpoint, lv *remoteLevel) *Error {
 	if lv.raise < 0 || len(lv.preEpochs) == 0 {
 		return nil
@@ -988,7 +1006,9 @@ func fetchPreRaiseKeys(ctx context.Context, c *client.Client, ep RemoteEndpoint,
 		if noAnswer(err) {
 			return upstreamErr("/ns/%s/keys: %v", lv.ns, err)
 		}
-		log.Printf("remote base %s: its keys of the epochs before its raise to e2e: %v; the branch gives none of them", lv.ns, err)
+		// Refused: none of them. Content sealed under one of those epochs
+		// is 422 (fetchPreSealings).
+		log.Printf("remote base %s: its keys of the epochs before its raise to e2e: %v; the branch gets none of them", lv.ns, err)
 		return nil
 	}
 	lv.preKeys = map[int][]byte{}
@@ -2382,14 +2402,18 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 // follows the base's document as of the checkpoint, once, whether or not
 // the log has moved since: the entries before it were followed only for
 // their purges. The epochs the e2e bases below the base have in force now
-// are followed too (followChainEpochs), and start times base.origin
-// couldn't give at creation are read from it again (followPreStarts).
+// are followed too (followChainEpochs), start times base.origin couldn't
+// give at creation are read from it again (followPreStarts), and the
+// base's sealings of content from before its raise that the branch still
+// lacks are fetched again, and stored once opened and verified
+// (retryPreSealings, §G.5.2 E3 sources).
 func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	c, ep, err := e.remoteClient(b.origin)
 	if err != nil {
 		return err
 	}
-	return errors.Join(e.followLog(ctx, c, ep, b), e.retryLevel(ctx, b.branch), e.followChainEpochs(ctx, c, ep, b), e.followPreStarts(ctx, c, ep, b))
+	return errors.Join(e.followLog(ctx, c, ep, b), e.retryLevel(ctx, b.branch), e.followChainEpochs(ctx, c, ep, b), e.followPreStarts(ctx, c, ep, b),
+		e.retryPreSealings(ctx, ep, c.BaseURL(), b))
 }
 
 // followPreStarts reads again, for each shadow of a remote branch holding

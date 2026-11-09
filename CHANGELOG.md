@@ -1,5 +1,142 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.77**: its answers to the reference's notes on v0.76. `GET /` answers
+`"spec": "0.77"`. The upgrade was done in five packages: the origin's filtered reads and remote
+branches; the search index; the grant checker and the shared client and follow libraries; the
+tree and catalog services; and undo, rebase and the WebDAV gateway. The schema changes are the
+core's migration `014_remote_pending_sealings` (sealings of pre-raise content a remote branch
+still has to fetch from its base), on SQLite and Postgres, and the index's migration
+`009_catalog_trust` (the last `catalog.trust` it applied for each catalog). Where the spec leaves a question open,
+the reference implements the reading noted here and in
+[docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.77").
+
+**Changes to check before upgrading:**
+- **A `requireAt` chain a service can't read is an outage, not a refusal** (§C.4 requireAt,
+  §12.1). The index, tree and catalog services, and the grant checker they share, answer
+  `503 behind` (with `Retry-After`) while the cause is transient and `502 upstream` otherwise,
+  with a fixed message that names no namespace, instead of `403 "at rejected: namespace …"`. It
+  covers a failing `/keys` or namespace fetch, a target namespace answering `404` or refusing the
+  service, an unreadable log (a stored range sealed under an epoch whose key `/keys` doesn't
+  give the checker, say), and a purged namespace in the chain, for listings, `POST
+  /edge-grants` and the catalog's `POST /grants`, `/read-grants` and `/merge-grants` alike. The
+  chain is reported even where a later check would have refused. A grant whose `at` is newer than
+  the service's cached head of the `requireAt` namespace makes it read the head again, instead
+  of being refused as "not in the chain".
+- **`408` is transient everywhere** (§A.4, §12.1). The shared client, read-through chains, key
+  fetches, the index, the tree and the catalog retry a `408` from the origin or from `/keys`; it
+  no longer leaves keys lacking for good or a namespace skipped.
+- **A purged catalog keeps its namespaces covered** (§B.11.9 Where). Like an end-to-end catalog
+  it makes nothing visible, so partial readers keep their `/g/` URLs and edge-grant prefix and
+  see only config and purge entries, instead of `403`. A branch's head-trust check skips such
+  catalogs as it skips end-to-end ones. `/ns/{ns}/g/{gs}/heads`, with or without `at`, of a
+  covered purged namespace answers `410 purged` with `head` to a grant that reads it
+  unrestricted, as §8.5 answers `/heads`, where it answered `302`, or `403` for a purged catalog.
+- **Index scope cookies bind their key** (§A.4 Across namespaces gs). A
+  `reads:{ns}:scope:{digest}` marker digests the key's `key:` string too, so readers through two
+  keys with the same rules get different `gs`, cookies and prefixes. Older scope cookies are
+  `403` until the reader exchanges again, as is one whose key is gone, no longer lists `read`
+  or has another `pub`, or whose role is gone or no longer lists `read`.
+- **The index gives no marker where §B.11.9 doesn't cover a catalog** (§A.4). A namespace that
+  is not sealed or end-to-end and is a catalog, or whose `catalogs`, or a local base's, names
+  one, gives a partial reader no marker: `403` there and no hits at `/_refs`, never hits
+  filtered by rules alone, and its scope cookies are `403`. Nothing is covered while the core's
+  root says authentication is disabled.
+- **Edge-grant exchange at the index answers `410` more strictly** (§A.4 Coverage, §C.5.2).
+  `410 purged` only where every namespace the grant names is followed, purged and verifies the
+  grant; otherwise `403`, or `401` if a refusal was. `/_refs` answers `410` the same way when the
+  grant would see no namespace at all.
+- **Redirects drop an opaque `after`** (§A.4, §B.5). A redirect from the head pointer, or to
+  another `at`, drops a position (`q`, a sort position, a children listing's `after` or a
+  `next` carrying one), and the listing starts again; a redirect at the same `at` keeps it.
+  Clients follow `next` at the page's `at` URL.
+- **Undo widens as merges do** (§11.2 The inverse, The guard; §F.3). A gesture's writes and the
+  later writes the guard compares are widened to the whole outermost array holding a write whose
+  last segment indexes an array, or appends with `-`, judged before or after its op; undo cut to
+  the immediate parent array before. An object member named `-` is no longer widened, in merges
+  either (`pointer.WidenArray`).
+- **Rebase Switch waits for every change** (§F.5 Switch, §F.6). Switch stops until every resource
+  the old branch changed is recorded in the successor, apart from §F.6's exceptions (resources
+  purged in the old branch, the keyring at E3), or a person gives the rest up. That includes a
+  resource purged only in the successor and, under a limit to some resources
+  (`RebaseOptions.Plan.Resources`), every resource outside it; the catch-up after the freeze
+  replays all resources changed since the first replay, not only the limited ones, and reports
+  what it leaves unrecorded on the same terms (`merge.Plan.Unrecorded()`). A stopped switch names
+  the resources and the flag below.
+- **WebDAV gateway: a failed read is never a `409`** (§H.4, §H.6). A save over someone else's
+  delete that can't read the file's last revision, or the tombstone's log entry, because the
+  read failed (a timeout, `408`, `429`, `5xx`, a failing key fetch, or the identity read that
+  decides whether the delete was the user's) answers `503` with `Retry-After` (`408`, `429`,
+  timeouts) or `502` (`5xx`, core unreachable) and writes nothing. The core's `408` and request
+  timeouts now map to `503` instead of `502` in every answer.
+
+- **`gs` values change** (§B.11.9 gs). The `scope:{digest}` subject of a filtered read's `gs`
+  is now §A.4's marker digest, which includes the key's `key:` string, at the origin and the
+  index alike. A `g:` cookie the index issued before is `403` until the reader exchanges again.
+
+**New:**
+- Remote branches of end-to-end sources raised from sealed (§G.3 Creating one, §G.5.2):
+  - B no longer stores a source sealing of pre-raise content it hasn't opened and verified.
+  - Creation is `422 invalid` where the endpoint's grant gets no key of an epoch such content is
+    sealed under, whether A's `/keys` refuses or omits it. A `408` or `429` from the base,
+    from its `/keys` too, is no refusal: `502 upstream` at creation, retried by the follower.
+  - A sealing A doesn't serve at creation (refused, `410`, or a transient failure) no longer
+    fails creation or stays `502` for good: it is recorded as pending and fetched again at every
+    sync. Once it opens and verifies, B stores and serves A's bytes; until then the URLs needing
+    it answer `502 upstream`, or `410 pruned` with A's horizon once A says so.
+  - A resource log A answers `410 pruned` from genesis no longer marks every pending entry
+    pruned: B asks for each entry in its own range (`…/rev/{id}/log?since={parent}`) and records
+    it as pruned only if A answers that range `410`, at creation and at every sync.
+- Tooling: `patchlog rebase -switch -leave-out` and `patchlog merge release rebase -leave-out`
+  (`RebaseReleaseOptions.LeaveOut`) switch anyway and print what was given up.
+- Index, §B.11.9 and §A.4:
+  - A purged catalog that a namespace names through a `requireAt` key keeps it covered with
+    nothing visible, so partial readers get a `g:` marker and no hits.
+  - A base that branches read only as of different `at`s is listed in `/_refs` `namespaces` at
+    the earliest in its chain.
+  - A namespace raised to sealed while a query of it was being computed no longer has a cleartext
+    result kept and served after the raise, and the head pointer no longer keeps a result
+    computed under the encryption a raise replaced (§A.1, §9, §E.2.6).
+  - The core's root (`GET /`, which says whether authentication is on) is read only for
+    namespaces §B.11.9 could cover. A transient failure is `503 behind` with `Retry-After`,
+    others `502`; neither names a namespace.
+- End-to-end epochs (§E.2.6, §E.3.1): where a value's snapshot would carry the epoch in force
+  (a base's op read through, a revision in the clear from before a raise), the first listing or
+  answer that seals it judges the epoch once, which is stored and kept across rotations and
+  restarts, at the tree service and the index alike; a node's `born` and head from the same
+  revision share it. Whether a revision's op is the namespace's own is told by the op's `pl.ns`,
+  not by its kid's namespace; a base's op read through is "not known" for derived views, and
+  the client gives no epoch for an own op whose kid names another namespace.
+
+**Fixes:**
+- Index: a query whose result lost to a purge is computed again, with the read check,
+  checkpoint and encryption read after it, or answered `503 behind`; `/_refs` computes its views
+  again before retrying (§A.1). A `503 behind` for a namespace visibility reads but hasn't
+  reached yet no longer names it.
+- Index: a `/keys` or schema-revision `408` is transient (`503 behind`, retried), no longer a
+  missing key or an untyped document.
+- Tree service: a grant whose `requireAt` chain can't be read because a namespace in it is
+  purged gets `502 upstream` for a listing and for `POST /edge-grants`; a sealed or end-to-end
+  catalog answered `403`, taking the chain's purge for the catalog's own.
+- Tree service, end-to-end catalogs: while a database's head epochs are still being read in,
+  listings judge no epoch and listings stored meanwhile are dropped when the fill finishes; a
+  pending `born`'s epoch is judged once even if the node's head changes while it is recorded.
+  An own op's value is no longer kept under the epoch in force instead of its own kid's.
+- Rebase: a change outside a resource limit that lands just before the freeze is no longer
+  left only in the frozen branch with `merge.ErrLeftOut`.
+- WebDAV gateway: a core request that times out or is cancelled is answered `503` with
+  `Retry-After` (§H.4 Answers).
+- Tree service: a listing is never computed, kept or served under the catalog's encryption as
+  it was before a raise to sealed or end-to-end that applied while the listing was being
+  computed. Before (also in v0.25.0), such a listing could show titles, born dates and nodes
+  written after the raise in the clear, and keep them, immutable in a public catalog. A listing
+  read before a purge of what it shows (§A.1) is no longer served either: it is computed again,
+  and if it keeps losing to purges the answer is `503 behind`.
+- Index: a purged catalog counts for a namespace's coverage only if the last `catalog.trust`
+  the index applied for it listed that namespace, as at the origin (§B.11.9 Where); a catalog
+  whose documents the index never applied counts as no catalog.
+
 ## v0.25.0
 
 Implements spec **v0.76**: v0.75's filtered namespace reads for readers a catalog limits

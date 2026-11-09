@@ -65,7 +65,11 @@ type Node struct {
 	Head string // the catalog revision of the node's document ("" for implicit)
 	// Epoch is the epoch Head is served under in a sealed or e2e catalog
 	// (derived.EpochOf), which the node's entries are sealed under
-	// (§E.2.6); 0 where not known, or for an implicit placement.
+	// (§E.2.6); 0 where not known, or for an implicit placement. In an e2e
+	// catalog 0 is pending: Head's snapshot would carry the epoch in force
+	// (a base's op read through, or one in the clear, §E.3.1), judged
+	// once, by the first listing that seals a value derived from it, and
+	// kept from then on (judgeEpochs).
 	Epoch     int
 	Title     string
 	Parents   []Parent
@@ -95,7 +99,10 @@ type Node struct {
 	// BornEpoch is the epoch the first revision of an explicit node's
 	// document is served under in a sealed or e2e catalog (derived.EpochOf
 	// of its log's kid), which born is sealed under apart from the node's
-	// other values where it isn't Epoch (§E.2.6); 0 where not known.
+	// other values where it isn't Epoch (§E.2.6); 0 where not known. In an
+	// e2e catalog, bornPending where that revision's snapshot would carry
+	// the epoch in force, judged as Epoch is, and bornWithHead where that
+	// revision is Head and Epoch pending: one revision, one judgement.
 	BornEpoch int
 
 	// Derived by analyze.
@@ -108,6 +115,16 @@ type Node struct {
 
 	rawParents, rawAccess any // as in the document, for storage
 }
+
+// The pending values of Node.BornEpoch in an e2e catalog (§E.2.6, §E.3.1):
+// a born judged once, when a listing first seals it, on its own
+// (bornPending) or as the head's own revision (bornWithHead), whose
+// judgement it takes. Stored as they are in nodes.born_epoch, where NULL
+// is not known.
+const (
+	bornPending  = -2
+	bornWithHead = -3
+)
 
 type savedRow struct {
 	state      int

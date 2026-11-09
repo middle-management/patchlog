@@ -7,7 +7,7 @@ package main
 //	patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
 //	        [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]...
 //	        [-source-grant G]... [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
-//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]...
+//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch [-leave-out]] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]...
 //	        [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
 //	patchlog janitor -api URL -ns base1,base2 [-release LINK]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
 
@@ -36,7 +36,7 @@ const mergeUsage = `usage:
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
           [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]...
           [-source-grant G]... [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
-  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]...
+  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch [-leave-out]] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]...
           [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
   patchlog janitor -api URL -ns base1,base2 [-release /r/{ns}/{release}]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]`
 
@@ -512,6 +512,7 @@ func rebaseCmd(args []string) {
 	newName := fs.String("new", "", "name of the successor branch (resumes if it exists)")
 	onto := fs.String("onto", "", "namespace to create the successor from (default: the branch's base)")
 	sw := fs.Bool("switch", false, "freeze the old branch with successor: NEW, then replay what it got meanwhile")
+	leaveOut := fs.Bool("leave-out", false, leaveOutHelp)
 	var identities, readers multi
 	fs.Var(&identities, "identity", identityHelp)
 	fs.Var(&readers, "reader", "e2e: file with the X25519 public key (a JWK {kty, crv, x}, or base64url x) of a reader the successor's keyring wraps its key for, besides those of the old branch's readers the identities know (repeatable, §F.8.1)")
@@ -526,7 +527,7 @@ func rebaseCmd(args []string) {
 	}
 	ctx := context.Background()
 	c := tf.client()
-	res, err := merge.Rebase(ctx, c, merge.RebaseOptions{Branch: *branch, New: *newName, Onto: *onto, Switch: *sw, SuccessorReaders: succReaders,
+	res, err := merge.Rebase(ctx, c, merge.RebaseOptions{Branch: *branch, New: *newName, Onto: *onto, Switch: *sw, LeaveOut: *leaveOut, SuccessorReaders: succReaders,
 		Plan: merge.Options{E2E: e2eView(c, identities), Signer: tf.signer()}})
 	if *tf.asJSON {
 		out := map[string]any{"result": res}
@@ -560,6 +561,7 @@ func rebaseCmd(args []string) {
 		if res.CatchUpResult != nil && !res.CatchUpResult.Noop {
 			fmt.Printf("caught up as batch %s\n", res.CatchUpResult.NSID)
 		}
+		printLeftOut(res, *branch)
 		if len(res.DroppedReaders) > 0 && err == nil {
 			fmt.Printf("%s's keyring holds no key for these readers of %s: %s\n", res.New, *branch, strings.Join(res.DroppedReaders, ", "))
 		}
@@ -572,8 +574,28 @@ func rebaseCmd(args []string) {
 		fmt.Fprintf(os.Stderr, "stopped on conflicts: resolve them with `patchlog merge apply -base %s -branch %s -resolve …`, then run rebase again\n", *newName, *branch)
 		os.Exit(1)
 	}
+	if errors.Is(err, merge.ErrLeftOut) && res != nil && !res.Switched {
+		fmt.Fprintf(os.Stderr, "error: %v\nrecord them in %s and run rebase again, or give them up with -leave-out (§F.5)\n", err, *newName)
+		os.Exit(1)
+	}
 	if err != nil {
 		toolFatal(err)
+	}
+}
+
+// leaveOutHelp describes -leave-out for rebase and merge release rebase.
+const leaveOutHelp = "with -switch: switch although the replay leaves resources the old branch changed unrecorded in the successor (left out of an item, purged in the successor only), giving them up (§F.5): their changes stay only in the frozen old branch"
+
+// printLeftOut prints the resources a rebase of branch left unrecorded in
+// its successor (§F.5): given up when it switched, else holding it up.
+func printLeftOut(res *merge.RebaseResult, branch string) {
+	if len(res.LeftOut) == 0 {
+		return
+	}
+	if res.Switched {
+		fmt.Printf("left out, only in the frozen %s: %s\n", branch, strings.Join(res.LeftOut, ", "))
+	} else {
+		fmt.Printf("not recorded in %s, so %s isn't switched: %s\n", res.New, branch, strings.Join(res.LeftOut, ", "))
 	}
 }
 

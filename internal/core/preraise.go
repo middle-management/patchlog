@@ -179,9 +179,11 @@ func (t *tx) preRaiseFoldSince(n *nsRow, row *revRow) string {
 // serves it under name (resJob, §E.2.2): under K_r of the epoch it is
 // served under (preRaiseEpoch), padded as p.m padded before the raise.
 // The job is stored under p.m (finishSeal with p.m.id). A remote branch's
-// shadow serves only its source's own sealing, stored at creation
-// (storePreSealings): without one, the content answers 502 upstream
-// (preRaiseUnfetched), never a sealing of B's (§G.5.2 E3 sources).
+// shadow serves only its source's own sealing, stored once opened and
+// verified, at creation (storePreSealings) or a later sync
+// (retryPreSealings): without one, the content answers 502 upstream, or
+// 410 pruned where its source answered that (preRaiseUnfetched), never a
+// sealing of B's (§G.5.2 E3 sources).
 func (t *tx) preRaiseResJob(p *preRaise, name string, row *revRow, kind string, plain func() []byte) *sealJob {
 	m := p.m
 	j := &sealJob{kind: kind, key: name + "/" + row.id.String(), name: name, revSeq: row.seq}
@@ -193,7 +195,7 @@ func (t *tx) preRaiseResJob(p *preRaise, name string, row *revRow, kind string, 
 		if kind == sealEntry {
 			what = "the log entry " + row.id.String() + " of " + name
 		}
-		panic(t.preRaiseUnfetched(m, what))
+		panic(t.preRaiseUnfetched(m, kind, name, row.id.String(), what))
 	}
 	plKind := seal.KindDoc
 	if kind == sealEntry {
@@ -234,7 +236,7 @@ func (t *tx) preRaiseConfigJob(n *nsRow, raise *e2eRaise, seq int64, nsID string
 	}
 	if n.isShadow() {
 		// Never served from a shadow; were it, never sealed by B (§G.5.2).
-		panic(t.preRaiseUnfetched(n, "the namespace document "+nsID))
+		panic(t.preRaiseUnfetched(n, "", "", "", "the namespace document "+nsID))
 	}
 	e := t.preRaiseEntryEpoch(n, raise, seq)
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.NamespaceDocPL(n.name, nsID), doc
@@ -252,7 +254,7 @@ func (t *tx) preRaiseRangeJob(n *nsRow, raise *e2eRaise, since, toID string, pla
 	}
 	if n.isShadow() {
 		// As preRaiseConfigJob.
-		panic(t.preRaiseUnfetched(n, "the namespace log range up to "+toID))
+		panic(t.preRaiseUnfetched(n, "", "", "", "the namespace log range up to "+toID))
 	}
 	e := raise.epoch
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.RangePL(n.name, since, toID), plain()

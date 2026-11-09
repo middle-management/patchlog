@@ -15,7 +15,8 @@ import (
 // documents are 410 purged once it is purged, with head its purge-ns
 // entry. An indexer following it takes that as the purge, at that head,
 // and so does one started after the purge; both then answer the purge's
-// 410 as for any purged namespace.
+// 410 as for any purged namespace, at /_refs too for a grant naming it
+// alone (v0.77).
 func TestSealedPurged(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -64,8 +65,10 @@ func TestSealedPurged(t *testing.T) {
 				t.Errorf("%s: token %.10q: %d %v, want %d", name, tok, r.status, r.body, want)
 			}
 		}
-		// Left out of /_refs, as any purged namespace.
-		if r := x.raw("/_refs?to=%2Fr%2Fsec%2Fa", reader); r.status != 302 {
+		// Left out of /_refs, as any purged namespace; a grant naming it
+		// alone, which verifies there, is 410 there (v0.77, §A.4
+		// Coverage).
+		if r := x.raw("/_refs?to=%2Fr%2Fsec%2Fa", reader); r.status != 410 || r.body["ns"] != "sec" || r.body["head"] != purged {
 			t.Errorf("%s: /_refs: %d %v", name, r.status, r.body)
 		}
 	}

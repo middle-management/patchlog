@@ -57,3 +57,39 @@ func (s *Service) BeforeListing(f func()) {
 	}
 	s.beforeListing.Store(&f)
 }
+
+// FailVerify sets f to fail the verification of a grant in each
+// namespace it returns an error for (tests); nil unsets it.
+func (s *Service) FailVerify(f func(ns string) error) {
+	if f == nil {
+		s.verifyHook.Store(nil)
+		return
+	}
+	s.verifyHook.Store(&f)
+}
+
+// BeforeJudge sets f to run as a listing records the epochs it judged,
+// outside the graph's lock (tests: a head applied meanwhile); nil unsets
+// it.
+func (s *Service) BeforeJudge(f func()) {
+	if f == nil {
+		s.beforeJudge.Store(nil)
+		return
+	}
+	s.beforeJudge.Store(&f)
+}
+
+// AfterGeneration sets f to run as each listing has taken its kept
+// generation, before it reads the graph (tests: a purge applied
+// meanwhile); nil unsets it.
+func (s *Service) AfterGeneration(f func()) {
+	if f == nil {
+		s.afterGeneration.Store(nil)
+		return
+	}
+	s.afterGeneration.Store(&f)
+}
+
+// PurgeKept purges the catalog's kept listings that carry any of tags, as
+// an apply that purges them does (tests).
+func (s *Service) PurgeKept(tags ...string) { s.kept.Purge(s.opt.Catalog, tags) }

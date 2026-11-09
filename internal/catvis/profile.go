@@ -135,8 +135,9 @@ const ScopePrefix = "scope:"
 // FilteredSubjects are §B.11.9's subjects for a gs: the union of the
 // deciding subjects of every catalog (deciding, one list per catalog);
 // "partial" if some of the caller's groups (callerGroups, as the grant
-// has them) is missing from it; and scope:{scopeDigest}, ReadsScope's
-// digest. Its gs is grantcheck.SubjectSetID of the result.
+// has them) is missing from it; and scope:{scopeDigest}, §A.4's marker
+// digest (ScopeKeyDigest of ReadsScope's digest and the grant's key). Its
+// gs is grantcheck.SubjectSetID of the result.
 func FilteredSubjects(deciding [][]string, callerGroups []string, scopeDigest string) []string {
 	set := map[string]bool{}
 	for _, l := range deciding {

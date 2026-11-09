@@ -20,6 +20,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -238,7 +239,9 @@ func (ix *Index) refsNamespaces() []string {
 // ones out) and not skipped: a namespace the reader may not read is left
 // out, and if that leaves none, the answer is a refusal that names none of
 // them (one the reader can't see is like one the service doesn't follow):
-// 401 if any refusal is, else 403. Otherwise it notes whether the grant
+// 401 if any refusal is, else 403; or, for a grant every namespace of
+// which it names is purged, and that verifies in each, the purge, 410
+// (*purgedNS, purgedOnly). Otherwise it notes whether the grant
 // verified (unverified), which decides the refusal at another gs's URL.
 func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[string]string) (*refsReader, error) {
 	if bearer(r) == "" {
@@ -275,6 +278,11 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			// its document is 410 (§8.5), and it is left out as above.
 			continue
 		}
+		// A requireAt chain the verifier can't read is 503 or 502 for the
+		// whole answer, never a refusal (§C.4, writeUpstreamErr).
+		if _, ok := chainErr(err); ok {
+			return nil, err
+		}
 		// A private namespace the grant names verifies it (access): a
 		// refusal there is 401 if it doesn't verify, 403 once it does.
 		var ae *grant.AuthError
@@ -303,6 +311,14 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			rd.markers[ns] = a.marker
 		}
 		rd.nss = append(rd.nss, ns)
+	}
+	// A grant every namespace of which it names is purged, and verifies
+	// in each, is 410 (§A.4 Coverage), never an empty answer: purged
+	// namespaces are left out of reached.
+	if len(rd.nss) == 0 && g != nil {
+		if pn := ix.purgedOnly(ctx, bearer(r), g); pn != nil {
+			return nil, pn
+		}
 	}
 	switch {
 	case len(rd.nss) > 0 || refused == 0:
@@ -426,21 +442,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	}
 	rd, err := ix.refsReader(ctx, r, reached)
 	if err != nil {
-		if writeLimit(w, err) {
-			return
-		}
-		var ae *grant.AuthError
-		if errors.As(err, &ae) {
-			code := "forbidden"
-			if ae.Status == 401 {
-				code = "unauthenticated"
-				w.Header().Set("WWW-Authenticate", "Bearer")
-			}
-			w.Header().Set("Cache-Control", "no-store")
-			writeErr(w, ae.Status, code, ae.Msg)
-			return
-		}
-		ix.writeUpstreamErr(w, "access check for /_refs", err, "cannot read a namespace configuration")
+		ix.writeAccessErr(w, "access check for /_refs", err, "cannot read a namespace configuration")
 		return
 	}
 	setPtr := func() {
@@ -553,6 +555,10 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		}
 		if errors.Is(err, errVisibility) || errors.Is(err, errMoving) {
 			ix.writeCoverErr(w, "_refs", err)
+			return
+		}
+		if errors.Is(err, errPurgedSince) {
+			writeBehind(w, "the index is applying purges of a namespace asked: try again")
 			return
 		}
 		ix.opt.Logf("index: query %s: %v", r.URL, err)
@@ -748,7 +754,10 @@ func (ix *Index) refsStored(ctx context.Context, rd *refsReader, url string) (de
 // refsAnswer computes the answer at the current combined checkpoint, keeps
 // it, and returns it with that checkpoint and whether it is bound to its
 // URL. An answer read before a purge of what it shows, which is then not
-// kept, is computed again.
+// kept, is never served (§A.1): it is computed again, the views of the
+// namespaces §B.11.9 covers first (recover), which read what the purge
+// may have changed; one that keeps losing to purges is errPurgedSince
+// (503 behind).
 //
 // A partial reader's view of a namespace §B.11.9 covers is computed at
 // its checkpoint: where an apply moved it meanwhile, the views are
@@ -778,8 +787,15 @@ func (ix *Index) refsAnswer(ctx context.Context, rd *refsReader, rq *refsQuery, 
 				gen = min(gen, a.cov.cp.gens.refs)
 			}
 		}
-		if st, ok := ix.refs.Put(target(at), refsScope, gen, bound, st); ok || try == 2 {
+		st, o := ix.refs.PutOutcome(target(at), refsScope, gen, bound, st)
+		switch {
+		case o != kept.PurgedSince:
 			return st, at, bound, nil
+		case try == 2:
+			return derived.Stored{}, "", false, errPurgedSince
+		}
+		if err := ix.recover(ctx, rd, true); err != nil {
+			return derived.Stored{}, "", false, err
 		}
 	}
 }
@@ -813,7 +829,8 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		nss = append(nss, ns)
 	}
 	sort.Strings(nss)
-	if cps, err = refsMerge(cps, rd); err != nil {
+	before := func(ns, a, b string) bool { return ix.chainBefore(ctx, ns, a, b) }
+	if cps, err = refsMerge(cps, rd, before); err != nil {
 		return derived.Stored{}, "", false, err
 	}
 	at := combinedAt(cps)
@@ -902,6 +919,26 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 			return derived.Stored{}, "", false, errRefsKeys
 		}
 		protected[ns] = info.Protected()
+		if !info.Protected() {
+			continue
+		}
+		// Pending epochs are judged once, as an answer first seals a
+		// value derived from them (§E.2.6, judgeEpochs).
+		var docs []docHead
+		for i, h := range hits {
+			if hitNS[i] == ns && h.epoch == 0 {
+				docs = append(docs, docHead{docid: h.docid, head: h.ID})
+			}
+		}
+		judged, err := ix.judgeEpochs(ctx, docs, info.Epoch)
+		if err != nil {
+			return derived.Stored{}, "", false, err
+		}
+		for i, h := range hits {
+			if e, ok := judged[h.docid]; ok && hitNS[i] == ns && h.epoch == 0 {
+				hits[i].epoch = e
+			}
+		}
 	}
 	// An epoch whose key the service's grant gets none of, for good (a 4xx
 	// from /keys, no key for it, one it can't unwrap: lacksKey),
@@ -1003,7 +1040,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		if now, err := ix.refsCheckpoints(ctx, ix.db, rd.nss); err == nil {
 			// A covered namespace's checkpoint moved meanwhile: the next
 			// answer retires these.
-			if merged, err := refsMerge(now, rd); err == nil {
+			if merged, err := refsMerge(now, rd, before); err == nil {
 				if err := ix.sealed.Retire(ctx, ix.db, scope, combinedAt(merged)); err != nil {
 					ix.opt.Logf("index: retiring sealed results of %s: %v", scope, err)
 				}
@@ -1022,8 +1059,10 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 // onlyBase), is left to the base's checkpoint where the answer has one
 // (the base itself, or another view's member): a namespace read at its
 // head is listed at it (§A.4 Answers, one ns_id per namespace), and the
-// branch's stands for its base.
-func refsMerge(cps map[string]string, rd *refsReader) (map[string]string, error) {
+// branch's stands for its base; a base that branches read only as of
+// different ats is listed at the earliest in its chain (§A.4 Answers;
+// before, the first by bytes), as before tells.
+func refsMerge(cps map[string]string, rd *refsReader, before func(ns, a, b string) bool) (map[string]string, error) {
 	if len(rd.covs) == 0 {
 		return cps, nil
 	}
@@ -1045,13 +1084,53 @@ func refsMerge(cps map[string]string, rd *refsReader) (map[string]string, error)
 			out[m] = id
 		}
 	}
+	// In a fixed order, so that ats no comparison tells apart give one
+	// answer.
 	slices.SortFunc(bases, func(a, b fsBase) int { return strings.Compare(a.ns+"\x00"+a.at, b.ns+"\x00"+b.at) })
+	earliest := map[string]string{}
 	for _, b := range bases {
-		if _, ok := out[b.ns]; !ok {
-			out[b.ns] = b.at
+		if _, ok := out[b.ns]; ok {
+			continue
+		}
+		if cur, ok := earliest[b.ns]; !ok || before(b.ns, b.at, cur) {
+			earliest[b.ns] = b.at
 		}
 	}
+	maps.Copy(out, earliest)
 	return out, nil
+}
+
+// chainBefore reports whether ns_id a comes before b in ns's chain (§A.4
+// Answers: a base "that branches read only as of different ats at the
+// earliest"), as grantcheck tells an at in a chain: ns's log up to b
+// after a is found only where a is in b's chain. What it tells is kept
+// (a chain never changes); a read that fails otherwise than with 404
+// tells nothing, and is logged: the answer lists the first by bytes.
+func (ix *Index) chainBefore(ctx context.Context, ns, a, b string) bool {
+	if a == b {
+		return false
+	}
+	k := ns + "\x00" + a + "\x00" + b
+	ix.fs.mu.Lock()
+	v, ok := ix.fs.order.Get(k)
+	ix.fs.mu.Unlock()
+	if ok {
+		return v
+	}
+	_, _, err := ix.c.NSLogPage(ctx, ns, b, a)
+	switch {
+	case err == nil:
+		v = true
+	case client.IsNotFound(err):
+		v = false
+	default:
+		ix.opt.Logf("index: whether %s comes before %s in %s's chain: %v", a, b, ns, err)
+		return false
+	}
+	ix.fs.mu.Lock()
+	ix.fs.order.Put(k, v, 1)
+	ix.fs.mu.Unlock()
+	return v
 }
 
 // queryer runs queries (a *sql.DB or *sql.Tx).

@@ -12,7 +12,8 @@
 //	docs(docid, ns, resource, head, schema, epoch) one row per live resource (untyped too, see
 //	                                      UntypedListing); epoch, in a sealed or e2e namespace, the
 //	                                      epoch its head is served under (derived.EpochOf), NULL or 0
-//	                                      where not known
+//	                                      while pending, until the first answer sealing a value
+//	                                      derived from it judges it (judgeEpochs)
 //	text  fts5(ns, resource, schema, path, body)  rowid = docid<<20 | n, so a resource's rows are a rowid range
 //	facet(ns, resource, schema, path, value, raw)  value: the string form (§A.2), raw: canonical JSON
 //	sort (ns, resource, schema, path, value, raw)  value: the least value (sortColumn), raw: all, a JSON array
@@ -32,6 +33,8 @@
 //	                                      that the index follows without serving them, while it
 //	                                      follows them (members.go)
 //	member_conf(ns, public, level)        as ns_conf, for those
+//	catalog_trust(ns, trust)              the catalog.trust last applied, of either, kept past a
+//	                                      purge-ns and a rebuild (recordTrust, fsTrust)
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
@@ -66,6 +69,7 @@ import (
 	"crypto/ecdh"
 	"database/sql"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -214,6 +218,13 @@ type Index struct {
 
 	fs  fstate  // the state of namespaces §B.11.9 covers (filtered.go)
 	mem members // the namespaces visibility reads there that the index doesn't serve (members.go)
+	// auth is the core's authentication mode as last read (authOff),
+	// kept for CheckerTTL.
+	auth struct {
+		mu  sync.Mutex
+		at  time.Time
+		off bool
+	}
 
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers
@@ -230,6 +241,9 @@ type Index struct {
 	// testRefsRead, if set, is called once a /_refs answer's transaction
 	// has read its hits (tests: refsCompute).
 	testRefsRead func()
+	// testAnswerRead, if set, is called once a query's answer has read
+	// its rows, before it is built and kept (tests: answer).
+	testAnswerRead func()
 	// testMemberBootstrap, if set, is called before a member's follower
 	// gives it its first checkpoint (tests: bootstrapMember).
 	testMemberBootstrap func(ctx context.Context, m string)
@@ -600,6 +614,11 @@ func (ix *Index) follow(ctx context.Context, ns string) {
 			}
 			err = fmt.Errorf("skipped: %s", reason)
 		} else {
+			if z, purged, cerr := ix.committed(ctx, ns); cerr == nil && !purged && z != "" {
+				// Resumed from a checkpoint committed before catalog_trust
+				// was (migration 009), or without a config entry since.
+				ix.trustAt(ctx, ns, z)
+			}
 			err = ix.runFollower(ctx, ns, opts)
 			if _, lacks := ix.keys.Skip(ns); lacks && ctx.Err() == nil {
 				// Apply stopped it: a config change (a raise to e2e, an
@@ -673,7 +692,7 @@ type prepared struct {
 	resource string
 	remove   bool
 	head     string
-	epoch    int    // the epoch head is served under, 0 if not known or not sealed (derived.EpochOf)
+	epoch    int    // the epoch head is served under, 0 if pending or not sealed (derived.EpochOf; judgeEpochs)
 	schema   string // "" = untyped
 	typed    bool
 	rows     *docRows
@@ -919,7 +938,7 @@ func (ix *Index) purgeKept(ns string, tags []string) {
 // or raises it to sealed or e2e (§9), against the read mode and level the
 // index last applied (table: ns_conf, or member_conf for a namespace it
 // follows only for visibility, members.go), and records the last unit's,
-// in tx. Before
+// in tx, with its catalog.trust (recordTrust). Before
 // the first it records, the namespace counts as public and unsealed, so
 // the first private or sealed document it applies counts too: once, at
 // the genesis of a namespace followed from the start, when nothing is
@@ -931,10 +950,12 @@ func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, table string, b *foll
 	}
 	public, level, known := true, "", false
 	narrowed := false
+	var last map[string]any
 	for _, u := range b.Units {
 		if u.Config == nil {
 			continue
 		}
+		last = u.Config.Value
 		if !known {
 			err := tx.QueryRowContext(ctx, `SELECT public, level FROM `+table+` WHERE ns = ?`, b.NS).Scan(&public, &level)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -952,8 +973,41 @@ func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, table string, b *foll
 	if !known {
 		return false, nil
 	}
+	if err := recordTrust(ctx, tx, b.NS, last); err != nil {
+		return false, err
+	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO `+table+` (ns, public, level) VALUES (?, ?, ?) ON CONFLICT (ns) DO UPDATE SET public = excluded.public, level = excluded.level`, b.NS, public, level)
 	return narrowed, err
+}
+
+// recordTrust records, in tx, ns's catalog.trust as its document doc
+// gives it (null for a namespace that is no catalog), the one fsTrust
+// reads once ns is purged and its document 410 (catalog_trust).
+func recordTrust(ctx context.Context, tx *sql.Tx, ns string, doc map[string]any) error {
+	c, _ := doc["catalog"].(map[string]any)
+	trust, err := json.Marshal(c["trust"])
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO catalog_trust (ns, trust) VALUES (?, ?) ON CONFLICT (ns) DO UPDATE SET trust = excluded.trust`, ns, string(trust))
+	return err
+}
+
+// lastTrust is ns's catalog.trust as the namespace document last applied
+// gave it (recordTrust), ok false if the index applied none of ns's
+// documents, nil for one that is no catalog.
+func (ix *Index) lastTrust(ctx context.Context, ns string) (trust []any, ok bool, err error) {
+	var s string
+	switch err := ix.db.QueryRowContext(ctx, `SELECT trust FROM catalog_trust WHERE ns = ?`, ns).Scan(&s); {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, err
+	}
+	if err := json.Unmarshal([]byte(s), &trust); err != nil {
+		return nil, false, err
+	}
+	return trust, true, nil
 }
 
 // levelRank orders encryption levels as raises go (Addendum E): at rest
@@ -1055,7 +1109,10 @@ func (ix *Index) write(ctx context.Context, tx *sql.Tx, ns string, p prepared) e
 		epochCol = p.epoch
 	}
 	if found {
-		_, err = tx.ExecContext(ctx, `UPDATE docs SET head = ?, schema = ?, epoch = ? WHERE docid = ?`, p.head, schemaCol, epochCol, docid)
+		// A head whose epoch is pending (NULL) keeps the epoch an answer
+		// judged for it, where the row holds that head already (§E.2.6,
+		// judgeEpochs): judged once.
+		_, err = tx.ExecContext(ctx, `UPDATE docs SET epoch = CASE WHEN head = ?1 AND ?3 IS NULL THEN epoch ELSE ?3 END, head = ?1, schema = ?2 WHERE docid = ?4`, p.head, schemaCol, epochCol, docid)
 	} else {
 		var res sql.Result
 		res, err = tx.ExecContext(ctx, `INSERT INTO docs (ns, resource, head, schema, epoch) VALUES (?, ?, ?, ?, ?)`, ns, p.resource, p.head, schemaCol, epochCol)

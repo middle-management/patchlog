@@ -2,6 +2,7 @@ package grant
 
 import (
 	"crypto/ed25519"
+	"errors"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -56,8 +57,20 @@ type Env struct {
 	// namespace's head at some point within maxLag before issued, the
 	// grant's issuance (see Issued). maxLag is the namespace document's
 	// (DefaultMaxLag when absent), or keyMaxLag when that is stricter (see
-	// EffectiveMaxLag). A non-nil error refuses the grant (403).
+	// EffectiveMaxLag). A non-nil error refuses the grant (403), except a
+	// ChainUnreadableError, which Verify returns as is (§C.4 requireAt).
 	CheckAt func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error
+}
+
+// ChainUnreadableError is a CheckAt error that couldn't read the chain a
+// requireAt key names, which is no refusal (§C.4 requireAt): its verifier
+// answers 503 behind while the cause is transient (§A.1), 502 upstream
+// otherwise, naming no namespace, never 403. ChainUnreadable reports
+// which. internal/grantcheck's ChainError is one; callers match it with
+// errors.As against an interface with that one method.
+type ChainUnreadableError interface {
+	error
+	ChainUnreadable() (transient bool)
 }
 
 // DefaultMaxLag is a namespace's maxLag when its document sets none (§C.4).
@@ -128,7 +141,9 @@ type Verified struct {
 // env.NS (403, before anything is verified), then the signature chain,
 // times, revocation and "*" in ns outside an operator grant (401: no usable
 // grant), then the key scope (403), readScope included, so the core and the
-// services that verify grants (grantcheck) refuse the same grants.
+// services that verify grants (grantcheck) refuse the same grants. A
+// requireAt chain env.CheckAt can't read is its ChainUnreadableError, not
+// a refusal (§C.4).
 func Verify(g *Grant, env Env) (*Verified, error) {
 	if g == nil || len(g.Blocks) == 0 {
 		return nil, unauth("missing grant")
@@ -232,6 +247,10 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 			return nil, forbid("cannot check at")
 		}
 		if err := env.CheckAt(key.RequireAt, root.At, issued, key.MaxLag); err != nil {
+			var cu ChainUnreadableError
+			if errors.As(err, &cu) {
+				return nil, err
+			}
 			return nil, forbid("at rejected: %v", err)
 		}
 	}

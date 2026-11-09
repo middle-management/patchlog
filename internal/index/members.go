@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -213,10 +214,10 @@ func noteNeed(ctx context.Context, m string) {
 // memberCP is the committed checkpoint of m, a member read at its head
 // (memberAt), once its follower has reached head, the head the grant
 // checker read ("" for any checkpoint), waiting up to MinWait for it; at
-// the end of the wait, the checkpoint it holds. ok is false once m's
-// purge-ns is applied. Before the first checkpoint it is errMemberBehind.
-// The follower is started if it isn't running.
-func (ix *Index) memberCP(ctx context.Context, m, head string) (id string, ok bool, err error) {
+// the end of the wait, the checkpoint it holds. ok is false, and purged
+// true, once m's purge-ns is applied. Before the first checkpoint it is
+// errMemberBehind. The follower is started if it isn't running.
+func (ix *Index) memberCP(ctx context.Context, m, head string) (id string, ok, purged bool, err error) {
 	noteNeed(ctx, m)
 	ix.wantMember(m)
 	ix.mu.Lock()
@@ -232,25 +233,25 @@ func (ix *Index) memberCP(ctx context.Context, m, head string) (id string, ok bo
 		ix.mem.mu.Unlock()
 		switch {
 		case purged:
-			return "", false, nil
+			return "", false, true, nil
 		case reached:
 			ix.noteGens(ctx)
-			return cur, true, nil
+			return cur, true, false, nil
 		}
 		select {
 		case <-changed:
 			continue
 		case <-ctx.Done():
-			return "", false, ctx.Err()
+			return "", false, false, ctx.Err()
 		case <-timer.C:
 		case <-lifecycle.Stopping(ctx):
 			// Shutting down: answer now, as if the wait had run out.
 		}
 		if cur == "" {
-			return "", false, fmt.Errorf("%w: %s (§A.4)", errMemberBehind, m)
+			return "", false, false, fmt.Errorf("%w: %s (§A.4)", errMemberBehind, m)
 		}
 		ix.noteGens(ctx)
-		return cur, true, nil
+		return cur, true, false, nil
 	}
 }
 
@@ -262,7 +263,7 @@ func (ix *Index) baseFollowed(ctx context.Context, ns string) error {
 	if !client.ValidNSName(ns) || ix.known(ns) {
 		return nil
 	}
-	_, _, err := ix.memberCP(ctx, ns, "")
+	_, _, _, err := ix.memberCP(ctx, ns, "")
 	return err
 }
 
@@ -360,6 +361,8 @@ func (ix *Index) runMember(ctx context.Context, m string, done chan struct{}) er
 		if err := ix.bootstrapMember(ctx, m, done); err != nil {
 			return err
 		}
+	} else {
+		ix.trustAt(ctx, m, cur)
 	}
 	opts := []follow.Option{
 		follow.WithMaxUnits(0),
@@ -367,6 +370,33 @@ func (ix *Index) runMember(ctx context.Context, m string, done chan struct{}) er
 	}
 	opts = append(opts, ix.opt.FollowOptions...)
 	return follow.New(ix.c, m, memberCPs{ix.memberCheckpoints()}, memberHandler{ix, done}, opts...).Run(ctx)
+}
+
+// trustAt records m's catalog.trust as of its checkpoint cur where none is
+// recorded yet: a namespace the index follows, or a member, resumed from a
+// checkpoint committed before catalog_trust was (migration 009). Best effort: one it can't read, a
+// purged m's 410 among them, is left without one, and counts as no
+// catalog once m is purged (fsTrust); later config entries record it.
+func (ix *Index) trustAt(ctx context.Context, m, cur string) {
+	if _, ok, err := ix.lastTrust(ctx, m); err != nil || ok {
+		return
+	}
+	doc, err := ix.docAt(ctx, m, cur)
+	if err != nil {
+		ix.opt.Logf("index: the catalog.trust of %s at %s: %v", m, cur, err)
+		return
+	}
+	c, _ := doc["catalog"].(map[string]any)
+	trust, err := json.Marshal(c["trust"])
+	if err != nil {
+		return
+	}
+	ix.wmu.Lock()
+	defer ix.wmu.Unlock()
+	// One recorded meanwhile, by an apply, is newer.
+	if _, err := ix.db.ExecContext(ctx, `INSERT INTO catalog_trust (ns, trust) VALUES (?, ?) ON CONFLICT (ns) DO NOTHING`, m, string(trust)); err != nil {
+		ix.opt.Logf("index: recording the catalog.trust of %s: %v", m, err)
+	}
 }
 
 // errMemberStopped is a member's follower that was stopped (current).
@@ -405,6 +435,9 @@ func (ix *Index) bootstrapMember(ctx context.Context, m string, done chan struct
 	read, _ := doc["read"].(string)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO member_conf (ns, public, level) VALUES (?, ?, ?) ON CONFLICT (ns) DO UPDATE SET public = excluded.public, level = excluded.level`,
 		m, read == "public", derived.InfoOf(doc).Level); err != nil {
+		return err
+	}
+	if err := recordTrust(ctx, tx, m, doc); err != nil {
 		return err
 	}
 	if err := ix.purgeTx(ctx, tx, tags); err != nil {
@@ -594,13 +627,21 @@ func (ix *Index) reconcile(ctx context.Context) {
 }
 
 // forgetMember purges idx:{m}, by the path a purge in m takes, once m's
-// follower stopped: nothing purges it after. Its checkpoint and read mode
-// are forgotten with it, in the same transaction (reconcile forgot the
+// follower stopped: nothing purges it after. Its checkpoint, read mode
+// and, unless m is purged, catalog.trust are forgotten with it, in the same transaction (reconcile forgot the
 // checkpoint in memory already), unless a follower started again since,
 // which bootstraps them afresh: a follower started later starts at the
 // head, and a restart doesn't resume from them (§B.5 Behind).
 func (ix *Index) forgetMember(ctx context.Context, m string) error {
 	tags := []string{"idx:" + m}
+	// Purged, as the follower applied or the grant checker reads it.
+	ix.mem.mu.Lock()
+	purged := ix.mem.get(m).purged
+	ix.mem.mu.Unlock()
+	if !purged {
+		_, err := ix.checker.Config(ctx, m)
+		purged = client.IsPurged(err)
+	}
 	ix.wmu.Lock()
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -616,6 +657,11 @@ func (ix *Index) forgetMember(ctx context.Context, m string) error {
 	}
 	if err == nil && !again {
 		_, err = tx.ExecContext(ctx, `DELETE FROM member_conf WHERE ns = ?`, m)
+	}
+	if err == nil && !again && !purged {
+		// Of a live m, forgotten too: what it trusts may change unseen
+		// from now on. A purged m's stays, its last (fsTrust).
+		_, err = tx.ExecContext(ctx, `DELETE FROM catalog_trust WHERE ns = ?`, m)
 	}
 	if err == nil {
 		err = tx.Commit()

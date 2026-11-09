@@ -353,7 +353,7 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 	// refuses it (catErr): g/all needs none there (§B.11.5). A grant over
 	// grantSize or rulesPerGrant is 413 wherever it is presented, before
 	// any ns check (§C.8).
-	vg, catErr := s.checker.Verify(ctx, cat, token)
+	vg, catErr := s.verify(ctx, cat, token)
 	var le *grantcheck.LimitError
 	var ae *grant.AuthError
 	switch {
@@ -391,7 +391,14 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 		case c.Read == "public":
 			public[ns], unres[ns], wide[ns] = true, true, true
 		default:
-			if cv, err := s.checker.Verify(ctx, real, token); err == nil {
+			cv, err := s.verify(ctx, real, token)
+			if _, ok := chainErr(err); ok {
+				// A requireAt chain it can't read is no refusal there:
+				// the listing is 503 or 502, never served as if the grant
+				// didn't verify (§C.4).
+				return nil, err
+			}
+			if err == nil {
 				unres[ns], wide[ns] = s.checker.ReadsUnrestricted(cv), s.checker.NamespaceWide(cv)
 				exp = grantExp(cv, exp)
 				if v.bucket == "" {
@@ -643,7 +650,10 @@ var ops = map[string]bool{
 // node's K_r of its epoch, pl { ns, name, view }, and left out where the
 // service can't have that epoch's key, or where the epoch isn't known: a
 // born is never sealed under the head's epoch for want of its own
-// (§E.2.6; at E3 its epoch is its snapshot's, §E.3.1, bornOf). A g/all
+// (§E.2.6; at E3 its epoch is its snapshot's, §E.3.1, bornOf). At E3 an
+// epoch that is the one in force is judged once, by the first listing
+// that seals a value of that revision, and recorded (judgeEpochs): head
+// and born values of one revision share it. A g/all
 // listing of a catalog that isn't public,
 // which every reader its URL admits reads whole, whose nodes' values all
 // come from one epoch, is sealed as one JWE under that epoch's key,
@@ -739,11 +749,25 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 // WriteAuthError writes a grant failure (401/403) or an upstream error. A
 // grant over grantSize or rulesPerGrant is 413, code limit, naming the
 // limit, as the origin answers it (§C.8): services verify as the origin
-// does (§C.6).
+// does (§C.6). A verifier that can't read the chain a key's requireAt
+// names is 503 behind, with Retry-After, while the cause is transient
+// (§A.1), and 502 upstream otherwise, naming no namespace, never 403
+// (§C.4, §12.1).
 func WriteAuthError(w http.ResponseWriter, err error, logf func(string, ...any)) {
 	var le *grantcheck.LimitError
 	if errors.As(err, &le) {
 		svcedge.Limit(le.Limit, le.Measured, le.Max).Write(w)
+		return
+	}
+	if transient, ok := chainErr(err); ok {
+		logf("tree: reading a requireAt chain: %v", err)
+		w.Header().Set("Cache-Control", "no-store")
+		if transient {
+			w.Header().Set("Retry-After", "5")
+			WriteError(w, http.StatusServiceUnavailable, "behind", msgChainBehind)
+			return
+		}
+		WriteError(w, http.StatusBadGateway, "upstream", msgChainUpstream)
 		return
 	}
 	var ae *grant.AuthError
@@ -761,6 +785,40 @@ func WriteAuthError(w http.ResponseWriter, err error, logf func(string, ...any))
 	WriteError(w, http.StatusBadGateway, "upstream", "cannot read a namespace configuration")
 }
 
+// verify verifies token for ns with the checker, or with verifyHook where
+// one is set and fails it (tests).
+func (s *Service) verify(ctx context.Context, ns, token string) (*grant.Verified, error) {
+	if f := s.verifyHook.Load(); f != nil {
+		if err := (*f)(ns); err != nil {
+			return nil, err
+		}
+	}
+	return s.checker.Verify(ctx, ns, token)
+}
+
+// chainUnreadable is the error of a verifier that can't read the chain a
+// key's requireAt names (§C.4): grantcheck's, which grant.Verify passes on
+// as it is, joined by this method alone. transient is whether the cause
+// is (§A.1): a transport error, deadline, 5xx, 408 or 429.
+type chainUnreadable interface{ ChainUnreadable() (transient bool) }
+
+// chainErr reports whether err is a chainUnreadable (ok), and if so
+// whether its cause is transient.
+func chainErr(err error) (transient, ok bool) {
+	var cu chainUnreadable
+	if !errors.As(err, &cu) {
+		return false, false
+	}
+	return cu.ChainUnreadable(), true
+}
+
+// The fixed bodies of a requireAt chain that can't be read: they name no
+// namespace, the chain's or the grant's (§C.4).
+const (
+	msgChainBehind   = "the service cannot read the chain a key's requireAt names yet"
+	msgChainUpstream = "cannot read the chain a key's requireAt names"
+)
+
 func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs string, isAt bool) {
 	ctx := r.Context()
 	cat := s.opt.Catalog
@@ -774,7 +832,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 	v, err := s.viewer(ctx, r, gs)
-	if client.IsPurged(err) {
+	if _, chain := chainErr(err); !chain && client.IsPurged(err) {
 		// A purged sealed catalog's document is 410 too (§8.5): the core
 		// makes the read check before answering it, as below. An edge
 		// grant that passed the service's checks stands for the grant it
@@ -783,6 +841,9 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		// gets head; a subject set's may not have (RoleView issues one to
 		// any grant verifying for the catalog), and gets none, since the
 		// core shows a sealed purged catalog's head only to its readers.
+		// A requireAt chain that can't be read because a namespace it
+		// names is purged is not the catalog's purge: WriteAuthError
+		// answers it, 502 upstream, never 403 (§C.4).
 		var head string
 		if cl := s.edgeClaims(r); cl != nil {
 			if gs, _ := s.edgeGS(cl.Prefix); gs != AllSubjects {
@@ -895,8 +956,17 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	// reader's shape, keyOf), and in a sealed or e2e catalog the view a
 	// listing is bound to (§E.2.6). Only it is answered 200: another form
 	// of it, or one with min, is redirected.
-	canon := func(at string) string { return target(at) + derived.CanonicalQuery(vals, "min") }
+	canonOf := func(vals url.Values) func(string) string {
+		return func(at string) string { return target(at) + derived.CanonicalQuery(vals, "min") }
+	}
+	canon := canonOf(vals)
 	keyOf := func(at string) string { return listingKey(canon(at), v) }
+	// moved is canon of a redirect from the head pointer or to another at
+	// than the URL's: a children listing's position (an opaque after)
+	// says nothing of where a page starts there, so it is dropped and the
+	// folder starts again, as a legacy cursor naming an order isn't
+	// (§A.4, §B.5).
+	moved := canonOf(withoutOpaqueAfter(vals))
 	keep := !perReader(op, v)
 	var cur string
 	var curProf Profile
@@ -952,17 +1022,26 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		if v.grant != nil && curProf != nil {
 			s.rekey(v, curProf.Subjects(v.grant))
 		}
+		// The URL redirected to, and the query its listing is computed
+		// with: without an opaque after unless it stays at the URL's at.
+		rvals, rcanon := vals, canon
+		if at != cur {
+			rvals, rcanon = withoutOpaqueAfter(vals), moved
+		}
+		rkeyOf := func(at string) string { return listingKey(rcanon(at), v) }
 		to := cur
-		if _, _, ok := s.kept.Get(keyOf(cur)); keep && !ok {
-			if info, key, err := s.keys.Current(ctx, cat); err == nil {
-				if l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key); err == nil && l.status == http.StatusOK {
-					to = l.at
-					s.rekeyAs(v, l.prof)
-				}
+		if _, _, ok := s.kept.Get(rkeyOf(cur)); keep && !ok {
+			if l, err := s.currentListing(ctx, v, op, rvals, rcanon, rkeyOf); err == nil && l.status == http.StatusOK {
+				to = l.at
+				s.rekeyAs(v, l.prof)
 			}
 		}
+		if to != at {
+			// The checkpoint moved on while the listing was computed.
+			rcanon = moved
+		}
 		setPtr()
-		redirect(w, canon(to))
+		redirect(w, rcanon(to))
 		return
 	}
 	if !canonical {
@@ -971,18 +1050,21 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 
-	info, key, err := s.keys.Current(ctx, cat)
-	if err != nil {
-		s.opt.Logf("tree: keys of %s: %v", cat, err)
+	l, err := s.currentListing(ctx, v, op, vals, canon, keyOf)
+	switch {
+	case errors.Is(err, errCurrentKey):
+		s.opt.Logf("tree: %v", err)
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "5")
 		// Keys it can't fetch yet are a view it hasn't caught up with
 		// (§12.1 behind, §E.2.6).
 		WriteError(w, http.StatusServiceUnavailable, "behind", "the service cannot obtain the key that seals listings of the catalog yet")
-		return
-	}
-	l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key)
-	switch {
+	case errors.Is(err, errPurgedSince):
+		// Every try lost to a purge: nothing computed before one is
+		// served (§A.1).
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "1")
+		WriteError(w, http.StatusServiceUnavailable, "behind", "the service is applying purges of the catalog: try again")
 	case errors.Is(err, errFileKeys):
 		s.opt.Logf("tree: %v", err)
 		w.Header().Set("Cache-Control", "no-store")
@@ -1010,7 +1092,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		// the new one, and the redirect names the grant's gs there.
 		s.rekeyAs(v, l.prof)
 		setPtr()
-		redirect(w, canon(l.at))
+		redirect(w, moved(l.at))
 	default:
 		s.writeListing(w, r, v, at, l.st)
 	}
@@ -1065,12 +1147,53 @@ func refusePartial(l *computed) *computed {
 	return l
 }
 
+// errCurrentKey is the catalog's encryption, or the key that seals its
+// listings now, that the service can't obtain for now: 503 behind.
+var errCurrentKey = errors.New("the key that seals listings of the catalog")
+
+// errPurgedSince is a listing computed from what was read before a purge
+// that carried one of its tags (kept.PurgedSince): it is neither kept nor
+// served (§A.1, §B.5), and computed again with what is current
+// (currentListing).
+var errPurgedSince = errors.New("the listing was computed before a purge of what it shows")
+
+// errInfoChanged is a listing that would be computed under the catalog's
+// encryption as read before its kept generation, which has changed since:
+// a raise to sealed or e2e purges what it narrows (§9), counted before
+// that generation, so it is errPurgedSince, computed again with what is
+// current.
+var errInfoChanged = fmt.Errorf("%w: the catalog's encryption changed", errPurgedSince)
+
+// currentListing is listing with the catalog's encryption and key as they
+// are now, read again, and the listing computed again, up to twice more,
+// while it loses to a purge (errPurgedSince), as the index's afterPurge
+// does: a listing computed before a purge, or under the encryption a
+// raise replaced, is never served or kept.
+func (s *Service) currentListing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string) (*computed, error) {
+	cat := s.opt.Catalog
+	var err error
+	for range 3 {
+		info, key, kerr := s.keys.Current(ctx, cat)
+		if kerr != nil {
+			return nil, fmt.Errorf("%w (%s): %w", errCurrentKey, cat, kerr)
+		}
+		var l *computed
+		if l, err = s.listing(ctx, v, op, vals, canon, keyOf, info, key); !errors.Is(err, errPurgedSince) {
+			return l, err
+		}
+	}
+	return nil, err
+}
+
 // listing computes the listing of op for v at the current at, sealed in a
 // sealed or e2e catalog, stores a sealed one and keeps it (unless
 // perReader), and returns it with the at it is at. canon gives its URL at
 // an at, the view it is bound to, and keyOf what it is stored and kept
 // under: the URL and the reader's shape, since a namespace that turns
-// private moves no URL (viewer.shape).
+// private moves no URL (viewer.shape). info is the catalog's encryption
+// as read before; one that has changed by the time the kept generation is
+// taken is errInfoChanged, and a listing a purge since then may have
+// changed errPurgedSince: neither is served (currentListing).
 func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string, info derived.Info, key derived.Key) (*computed, error) {
 	if f := s.beforeListing.Load(); f != nil {
 		(*f)()
@@ -1078,6 +1201,20 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	cat := s.opt.Catalog
 	keep := !perReader(op, v)
 	gen, sgen := s.kept.Generation(cat), s.sealed.Generation()
+	// info was read before gen: a config change since (a raise to sealed
+	// or e2e, a rotation), which apply observes before it purges what it
+	// narrows (§9, §A.1), would have this listing computed under what it
+	// replaced and kept, its purge counted before gen. Read again now:
+	// what changed is errInfoChanged; what changes later purges after gen
+	// (errPurgedSince). The file metadata's sealing is read after gen.
+	if now, err := s.keys.Info(ctx, cat); err != nil {
+		return nil, fmt.Errorf("%w (%s): %w", errCurrentKey, cat, err)
+	} else if now != info {
+		return nil, errInfoChanged
+	}
+	if f := s.afterGeneration.Load(); f != nil {
+		(*f)()
+	}
 	fs, err := s.fileSealing(ctx)
 	if err != nil {
 		return nil, err
@@ -1109,7 +1246,10 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			if prof != nil && !prof.Admits(v.subjects) {
 				return refusePartial(&computed{at: at, prof: prof}), nil
 			}
-			st, _ = s.kept.Put(keyOf(at), cat, gen, true, st)
+			st, o := s.kept.PutOutcome(keyOf(at), cat, gen, true, st)
+			if o == kept.PurgedSince {
+				return nil, errPurgedSince
+			}
 			s.recordAt(at, cps, prof)
 			return &computed{st: st, at: at, status: http.StatusOK, prof: prof}, nil
 		}
@@ -1124,6 +1264,11 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	)
 	// Each node's values are sealed under the epoch its head is served
 	// under (Node.Epoch; §E.2.6), the current one where that isn't known.
+	// In an e2e catalog that is a pending judgement, of the head's
+	// revision or the born's, made once: the epoch a listing first seals
+	// it under is recorded (judged, judgeEpochs) before the listing is
+	// stored or served, and used from then on; one another listing
+	// recorded first wins, and the listing is computed again with it.
 	// The keys of older epochs are read, outside the graph's lock, only
 	// once a listing shows a node they seal, and the listing computed
 	// again with them. An epoch whose key the service can't have
@@ -1131,12 +1276,14 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	// shown by name only, as for a reader without it (§E.2.6).
 	keys := map[int]derived.Key{key.Epoch: key}
 	lacking := map[int]bool{}
+	e3 := info.Level == derived.LevelE2E
 	var (
 		perEntry bool
 		whole    int
 		cps      map[string]string
 		prof     Profile
 		more     []keptPage
+		judged   map[string]*judgement
 	)
 	for {
 		// Sealed whole only where every reader the URL admits reads the
@@ -1154,14 +1301,43 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				return
 			}
 			view = derived.View{NS: cat, Target: canon(l.at)}
-			epochOf := func(name string) int {
+			// epochOf is the epoch node name's values are sealed under,
+			// a pending one judged (judge) as they are; peekEpoch the
+			// same, judging nothing.
+			peekEpoch := func(name string) int {
 				if n := g.Node(name); n != nil && n.Epoch > 0 {
 					return n.Epoch
 				}
 				return key.Epoch
 			}
+			judge := func(n *Node) *judgement {
+				j := judged[n.Name]
+				if j == nil {
+					j = &judgement{head: n.Head, born: n.Born}
+					judged[n.Name] = j
+				}
+				return j
+			}
+			epochOf := func(name string) int {
+				n := g.Node(name)
+				if n != nil && n.Epoch > 0 {
+					return n.Epoch
+				}
+				if e3 && n != nil && n.Head != "" && !n.Self {
+					if !s.epochsPending {
+						judge(n).epoch = key.Epoch
+					} else {
+						// Its epoch may not be read in yet (an own
+						// op's kid): not judged, and the fill drops
+						// the stored listings (backfillEpochs).
+						s.unjudged.Store(true)
+					}
+				}
+				return key.Epoch
+			}
 			run := func() map[int]bool {
 				more, serr = nil, nil
+				judged = map[string]*judgement{}
 				epochs := map[int]bool{}
 				q := &query{s: s, g: g, cur: curMap, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
 				// sealAt seals vals of node name under its K_r of epoch e,
@@ -1188,9 +1364,27 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 					// under the head's.
 					q.bornApart = func(n *Node) int {
 						switch e := n.BornEpoch; {
+						case e == bornWithHead && e3:
+							// Its revision is the head's: sealed with
+							// the head's values, under its judgement,
+							// which the born keeps should the head move
+							// on before it is recorded. Not judged while
+							// the head isn't (epochsPending).
+							if n.Epoch > 0 || !s.epochsPending {
+								j := judge(n)
+								j.withHead, j.bornEpoch = true, peekEpoch(n.Name)
+							}
+							return 0
+						case e == bornPending && e3:
+							// Judged now, as the epoch in force.
+							judge(n).bornEpoch = key.Epoch
+							if key.Epoch != peekEpoch(n.Name) {
+								return key.Epoch
+							}
+							return 0
 						case e <= 0:
 							return bornLeftOut
-						case e != epochOf(n.Name):
+						case e != peekEpoch(n.Name):
 							return e
 						}
 						return 0
@@ -1230,6 +1424,20 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				run()
 			}
 		})
+		if l.status == http.StatusOK && len(missing) == 0 && serr == nil && len(judged) > 0 {
+			// Recorded before the listing is stored or served; one that
+			// lost to another's computes it again (§E.2.6).
+			if f := s.beforeJudge.Load(); f != nil {
+				(*f)()
+			}
+			lost, err := s.judgeEpochs(ctx, judged)
+			if err != nil {
+				return nil, err
+			}
+			if lost {
+				continue
+			}
+		}
 		if l.status != http.StatusOK || len(missing) == 0 {
 			break
 		}
@@ -1270,7 +1478,14 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	}
 	if !keep {
 		// Neither stored nor kept: whether it may be served depends on
-		// the reader.
+		// the reader. No kept generation guards it, so the encryption is
+		// read again: a raise applied while it was computed, its graph
+		// read after the raise, is computed again under the new one.
+		if now, err := s.keys.Info(ctx, cat); err != nil {
+			return nil, fmt.Errorf("%w (%s): %w", errCurrentKey, cat, err)
+		} else if now != info {
+			return nil, errInfoChanged
+		}
 		return l, nil
 	}
 	type page struct {
@@ -1305,7 +1520,13 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		}
 	}
 	for i := range pages {
-		pages[i].st, _ = s.kept.Put(pages[i].key, cat, gen, sealed, pages[i].st)
+		var o kept.Outcome
+		pages[i].st, o = s.kept.PutOutcome(pages[i].key, cat, gen, sealed, pages[i].st)
+		if i == 0 && o == kept.PurgedSince {
+			// Read before a purge of what it shows: not served, nor its
+			// following pages kept (§A.1).
+			return nil, errPurgedSince
+		}
 	}
 	l.st, l.prof = pages[0].st, prof
 	s.recordAt(l.at, cps, prof)
@@ -1722,6 +1943,14 @@ func (s *Service) awaitMins(ctx context.Context, vals []string, token string) mi
 		}
 		switch ok, err := o.sees(ctx, m.ns, token); {
 		case err != nil:
+			if transient, ok := chainErr(err); ok {
+				// As WriteAuthError answers it (§C.4).
+				s.opt.Logf("tree: access check for %s: %v", m.ns, err)
+				if transient {
+					return minAnswer{status: http.StatusServiceUnavailable, code: "behind", msg: msgChainBehind}
+				}
+				return minAnswer{status: http.StatusBadGateway, code: "upstream", msg: msgChainUpstream}
+			}
 			s.opt.Logf("tree: access check for %s: %v", m.ns, err)
 			return minAnswer{status: http.StatusBadGateway, code: "upstream", msg: "cannot read a namespace configuration"}
 		case !ok:
@@ -1817,7 +2046,7 @@ func (s *Service) sees(ctx context.Context, ns, token string) (bool, error) {
 	if token == "" {
 		return false, nil
 	}
-	v, err := s.checker.Verify(ctx, s.actual(ns), token)
+	v, err := s.verify(ctx, s.actual(ns), token)
 	var ae *grant.AuthError
 	switch {
 	case errors.As(err, &ae):
@@ -2344,6 +2573,29 @@ func (q *query) childPage(n *Node, kids []Child, start, limit int, vals url.Valu
 	nv.Set("after", childCursor{pos: end, at: q.at, last: kids[end-1].Node.Name}.String())
 	body["next"] = derived.CanonicalQuery(nv)
 	return body, end, nv
+}
+
+// withoutOpaqueAfter is vals less an after that is a children listing's
+// position (childCursor), or a next carrying one, as a redirect from the
+// head pointer or to another at drops it (§A.4, §B.5). An after naming an
+// order, the cursor of earlier releases (children), is kept, as is one
+// with a childCursor's shape that isn't one (400 where it is listed).
+func withoutOpaqueAfter(vals url.Values) url.Values {
+	pv := pagingParams(vals)
+	after, ok := pv["after"]
+	if !ok || pv.Has("name") || pv.Has("unordered") {
+		return vals
+	}
+	if _, ok := parseCursor(after[0]); !ok {
+		return vals
+	}
+	out := url.Values{}
+	for k, v := range vals {
+		if k != "after" {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // childCursor is the position after a page of children (§A.4, §E.2.6):

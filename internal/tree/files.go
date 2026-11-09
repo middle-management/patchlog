@@ -350,8 +350,9 @@ var errFileKeys = errors.New("the key that seals file metadata")
 // lastingKeyErr reports a failure to get a key that lasts until the
 // configuration changes: a key lacking for good (follow.LacksKey: no keys
 // for the service's grant, none it can unwrap, a keyring entry whose from
-// it doesn't trust, or /keys answering a 4xx other than 429; §A.4,
-// §E.2.6, §E.3.2), or a namespace it can't read, absent or gone.
+// it doesn't trust, or /keys answering a 4xx other than 408 and 429;
+// §A.4, §E.2.6, §E.3.2), or a namespace it can't read, absent or gone.
+// A 408, like a 429, is transient: the listing is 503 behind (v0.77).
 func lastingKeyErr(err error) bool {
 	return follow.LacksKey(context.Background(), err) || client.IsNotFound(err) || client.IsAuth(err) || client.IsGone(err)
 }
@@ -496,7 +497,8 @@ func (q *query) file(n *Node) any {
 // (Node.BornEpoch), which migration 005 and markBornEpochs mark pending
 // again. Until then, and for a head the service can't read for good
 // (lastingKeyErr, gone or not content), a head's epoch defaults to the
-// current one, and a born whose epoch isn't known is left out of sealed
+// current one (in an e2e catalog not judged while the fill runs, and the
+// listings stored meanwhile dropped, §E.2.6: epochsPending), and a born whose epoch isn't known is left out of sealed
 // and e2e listings, never sealed with the head's values (§E.2.6); any
 // other failure is returned, and the fill made again (retryBackfill).
 // Listings change at an unchanged combined checkpoint, so the catalog's
@@ -531,6 +533,10 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 	var pending string
 	err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'epochs'`).Scan(&pending)
 	if errors.Is(err, sql.ErrNoRows) {
+		// Filled by another service on the database.
+		s.mu.Lock()
+		s.epochsPending = false
+		s.mu.Unlock()
 		return nil
 	}
 	if err != nil {
@@ -648,15 +654,17 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 	changed := false
 	for i, w := range wants {
 		e := epochs[i]
-		if e <= 0 {
+		if e == 0 || e < 0 && !w.born {
 			continue
 		}
 		if w.born {
 			// The born's epoch is its first revision's, whatever the head
 			// (§E.2.6): a head changed since keeps it, and Apply, which
 			// keeps a known born as it is, never reads it again. A born
-			// changed since is another revision's.
-			if n := g.explicit[w.node]; n != nil && n.Born == w.bornAt && n.BornEpoch == 0 {
+			// changed since is another revision's. A pending one is
+			// judged by a listing (bornPending), with the head it was
+			// read at where it is that head's revision (bornWithHead).
+			if n := g.explicit[w.node]; n != nil && n.Born == w.bornAt && n.BornEpoch == 0 && (e != bornWithHead || n.Head == w.head) {
 				n.BornEpoch, changed = e, true
 				if g.nodes[w.node] == n {
 					if _, err := tx.ExecContext(ctx, `UPDATE nodes SET born_epoch = ? WHERE name = ?`, e, w.node); err != nil {
@@ -700,6 +708,13 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k = 'epochs'`); err != nil {
 		return err
 	}
+	// A listing served meanwhile sealed heads not read in yet under the
+	// current epoch, judging none (epochsPending): stored, it would keep
+	// a value under an epoch that is neither its revision's nor the one
+	// a listing now judges (§E.2.6, §E.3.1).
+	if s.unjudged.Load() {
+		changed = true
+	}
 	var tags []string
 	if changed {
 		tags = []string{"ns:" + catNS}
@@ -716,6 +731,8 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 		}
 		return err
 	}
+	s.epochsPending = false
+	s.unjudged.Store(false)
 	if len(tags) > 0 {
 		s.sealed.Purged(tags)
 		s.kept.Purge(cat, tags)
