@@ -34,6 +34,13 @@ import (
 // resource.
 var ErrNoKeys = errors.New("client: the content is sealed and no key is available")
 
+// ErrKeyFetch wraps a failure to fetch keys from POST /ns/{ns}/keys: the
+// request failed, or /keys answered an error, which the wrapped error
+// gives (an *APIError for an answer, AsAPIError). Whether the keys are
+// lacking for good (a 4xx other than 429, §A.4, §E.2.6) or can't be had
+// for now (503 behind, §12.1) is the wrapped error's to tell.
+var ErrKeyFetch = errors.New("client: fetching keys failed")
+
 // Keys caches the keys of sealed namespaces and fetches missing ones with
 // POST /ns/{ns}/keys. It is safe for concurrent use and may be shared by
 // clients with the same grant.
@@ -146,7 +153,7 @@ func (k *Keys) fetch(ctx context.Context, c *Client, ns string, epoch int, resou
 	}
 	got, err := c.FetchKeys(ctx, ns, []int{epoch}, res)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %s epoch %d: %w", ErrKeyFetch, ns, epoch, err)
 	}
 	for _, e := range got {
 		if e.From != "" {
@@ -157,7 +164,9 @@ func (k *Keys) fetch(ctx context.Context, c *Client, ns string, epoch int, resou
 		key := e.Key
 		if key == nil {
 			if k.recipient == nil {
-				return fmt.Errorf("client: keys are wrapped to the grant's enc; NewKeys needs the recipient private key")
+				// No recipient key opens it: lacking, as no key is
+				// (§A.4, §E.2.6), not a failure for now.
+				return fmt.Errorf("%w: keys are wrapped to the grant's enc; NewKeys needs the recipient private key", ErrNoKeys)
 			}
 			if key, err = seal.UnwrapKey(k.recipient, e.Wrapped); err != nil {
 				return fmt.Errorf("client: unwrapping %s: %w", e.Kid, err)

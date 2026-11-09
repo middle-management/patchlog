@@ -261,7 +261,15 @@ func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*acces
 }
 
 // grantAccess is access to private namespace ns for v, a grant verified
-// there.
+// there: whether the grant gets a marker in ns, and which (§A.4 Across
+// namespaces). It is the one place that decides it, for a query of ns,
+// for /_refs (refsReader, through access) and for an exchange
+// (exchangeGrant), so each namespace is judged alone: a grant gets a
+// marker where it allows read, its read rules don't refer to /now, and,
+// if they fix /resource, they pass now for a name they fix (readsFixed).
+// A refusal (*grant.AuthError, 403) leaves ns without a marker, which a
+// query of ns answers 403 and /_refs and the exchange leave ns out for,
+// refusing only where no namespace is left (§A.4 Coverage).
 func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) (*access, error) {
 	if ok, _ := v.Allows("read"); !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
@@ -289,6 +297,12 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 	// read the namespace whole now, reads none of it.
 	if !ix.checker.ReadsPerResource(v) {
 		return nil, &grant.AuthError{Status: 403, Msg: "a grant or key rule refuses the read"}
+	}
+	// One whose rules fix /resource and pass for none of the names they
+	// fix reads none of ns either: its rules, not what visibility shows
+	// (§A.4: "its rules passing now for a name it fixes").
+	if !readsFixed(v, func(name string) bool { return ix.checker.AllowsRead(v, name) }) {
+		return nil, &grant.AuthError{Status: 403, Msg: "the grant's rules pass for none of the names they fix /resource to in " + ns + " (§A.4, §C.5.2)"}
 	}
 	a := &access{v: v, filter: grantcheck.FilterOf(v),
 		derive: func(_ context.Context, cp *fcp) (*fview, error) { return grantFview(cp, v) }}
@@ -677,7 +691,9 @@ var errVisibility = errors.New("visibility")
 // writeCoverErr answers a failure to compute a partial reader's view of a
 // namespace §B.11.9 covers (Index.cover): a refusal as such, no-store;
 // one of a namespace not reached yet, or purged meanwhile, behind; and a
-// namespace whose state visibility reads the service can't read, 502.
+// namespace whose state visibility reads the service can't read, 502, or
+// 503 behind while only the keys to open a sealed one's documents can't be
+// fetched yet (writeUpstreamErr).
 func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 	var ae *grant.AuthError
 	switch {
@@ -699,9 +715,21 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 // writeUpstreamErr answers err, a failure to read upstream what answering
 // needs, 502 upstream with msg, or msgGrantLacks where the index's own
 // grant can't read a namespace that decides §B.11.9 coverage
-// (errGrantLacks); the log names it.
+// (errGrantLacks); the log names it. A failure to fetch the key that opens
+// a sealed namespace's documents (client.ErrKeyFetch) that leaves the
+// service lacking it as configured (lacksKey: a 4xx from /keys other than
+// 429) is 502 too (§A.4 Private namespaces: "502 while it ... lacks the
+// keys"), and one for now (a 5xx, a 429, the core unreachable) is 503
+// behind, with Retry-After (scenario 100: "While those keys only can't
+// yet be fetched → 503 behind", §12.1). Every read check and view this
+// service answers 502 for passes through here, so each gets the same
+// answer.
 func (ix *Index) writeUpstreamErr(w http.ResponseWriter, what string, err error, msg string) {
 	ix.opt.Logf("index: %s: %v", what, err)
+	if errors.Is(err, client.ErrKeyFetch) && !lacksKey(context.Background(), err) {
+		writeBehind(w, "the index cannot fetch the keys of a sealed namespace it reads yet (§A.4)")
+		return
+	}
 	var gl *errGrantLacks
 	if errors.As(err, &gl) {
 		msg = msgGrantLacks

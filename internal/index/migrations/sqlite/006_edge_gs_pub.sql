@@ -1,0 +1,24 @@
+-- Migration: edge gs pub
+-- Created: 2026-11-09T09:42:22Z
+-- Checksum: d51d65b818ced52c88d52018cd4e4bf00df874bb0227ac5deb51c48968535ae1
+-- Chain: 79e17101ea29d4438812ac0f81161feaa20aba8593afe75da182149fd8fdc723
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- edge_gs.pub: the pub member of the key the marker reads:{ns}:g:{gs}
+-- came from, as the namespace document gives it (for a branch, its
+-- base's, §C.4): a cookie is accepted only while the key with its kid
+-- still has that pub (§B.11.9 gs); a row from before has none, and is
+-- refused until the reader exchanges again.
+ALTER TABLE edge_gs ADD COLUMN pub TEXT NOT NULL DEFAULT '';
