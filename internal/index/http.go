@@ -643,7 +643,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	if errors.Is(err, errPurgedSince) {
 		// Never the bytes computed before the purge: the current at,
 		// computed again after it (its views too), redirected to.
-		ix.afterPurge(w, r, a, ns, vals, q, info, targetOf)
+		ix.afterPurge(w, r, ns, vals, q)
 		return
 	}
 	var fe *FieldError
@@ -688,11 +688,15 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 
 // afterPurge answers a query whose result at its at was computed before a
 // purge (errPurgedSince): the result is computed again at the committed
-// checkpoint after it, a partial reader's view too, up to twice more, and
-// the query redirected there, an opaque after dropped as for any other at
-// (§A.4); one that keeps losing to purges is 503 behind. Nothing computed
-// before the purge is served (§A.1).
-func (ix *Index) afterPurge(w http.ResponseWriter, r *http.Request, a *access, ns string, vals url.Values, q *Query, info derived.Info, targetOf func(url.Values, string) string) {
+// checkpoint after it, up to twice more, and the query redirected there,
+// an opaque after dropped as for any other at (§A.4); one that keeps
+// losing to purges is 503 behind. Nothing computed before the purge is
+// served (§A.1), nor with what serve read before it: each try makes the
+// read check, reads the checkpoint and the namespace's encryption again
+// (a raise to sealed or e2e purges, §9) and a partial reader's view, so
+// the result kept at the at redirected to is the one a query there
+// computes afresh.
+func (ix *Index) afterPurge(w http.ResponseWriter, r *http.Request, ns string, vals url.Values, q *Query) {
 	ctx := r.Context()
 	rv := vals
 	if !q.ByName() && vals.Has("after") {
@@ -700,9 +704,37 @@ func (ix *Index) afterPurge(w http.ResponseWriter, r *http.Request, a *access, n
 		delete(rv, "after")
 	}
 	for range 2 {
+		a, err := ix.access(ctx, ns, r)
+		if client.IsPurged(err) {
+			var head string
+			if head, err = ix.purgedRead(ctx, ns, r, err); err == nil {
+				writePurged(w, head)
+				return
+			}
+		}
+		if err != nil {
+			ix.writeAccessErr(w, "access check for "+ns, err, "cannot read the namespace configuration")
+			return
+		}
+		head, purged, err := ix.committed(ctx, ns)
+		if err != nil {
+			ix.opt.Logf("index: checkpoint of %s: %v", ns, err)
+			writeErr(w, http.StatusInternalServerError, "internal", "cannot read the checkpoint")
+			return
+		}
+		if purged {
+			writePurged(w, head)
+			return
+		}
+		info, _, err := ix.keys.Current(ctx, ns)
+		if err != nil {
+			ix.opt.Logf("index: keys of %s: %v", ns, err)
+			writeBehind(w, "the index cannot obtain the key that seals results of this namespace yet")
+			return
+		}
 		if a.cov != nil {
 			a.cov = nil
-			if err := ix.cover(ctx, a, ns, ""); err != nil {
+			if err := ix.cover(ctx, a, ns, head); err != nil {
 				ix.writeCoverErr(w, ns, err)
 				return
 			}
@@ -733,7 +765,7 @@ func (ix *Index) afterPurge(w http.ResponseWriter, r *http.Request, a *access, n
 			w.Header().Set("Surrogate-Control", "no-store")
 			w.Header().Add("Vary", "Authorization")
 		}
-		redirect(w, targetOf(rv, got))
+		redirect(w, base(a, ns)+"/at/"+got+derived.CanonicalQuery(rv, "min"))
 		return
 	}
 	writeBehind(w, "the index is applying purges of the namespace: try again")
@@ -974,6 +1006,18 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		allow = a.allow
 	}
 	gen, sgen := ix.kept.Generation(ns), ix.sealed.Generation()
+	// info was read before gen: a config change since (a raise to sealed
+	// or e2e, a rotation), which Apply observes before it purges what it
+	// narrows (§9, §A.1), would have this result computed under what it
+	// replaced and kept, its purge counted before gen. Read again now: what
+	// changed is errInfoChanged, computed again with what is current
+	// (afterPurge); what changes later purges after gen (PurgedSince).
+	if now, err := ix.keys.Info(ctx, ns); err != nil {
+		ix.opt.Logf("index: encryption of %s: %v", ns, err)
+		return derived.Stored{}, "", fmt.Errorf("%w (%s)", errEpochKey, ns)
+	} else if now != info {
+		return derived.Stored{}, "", errInfoChanged
+	}
 	q.epochs = info.Protected()
 	res, at, err := ix.query(ctx, ns, q, allow)
 	if err != nil {
@@ -1170,6 +1214,12 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 // and redirected to, or, where that keeps losing to purges, answered 503
 // behind.
 var errPurgedSince = errors.New("the result was computed before a purge of what it shows")
+
+// errInfoChanged is a result answer would compute under the namespace's
+// encryption as it was before a config change (answer). It is answered as
+// errPurgedSince, computed again with what is current: a raise purges what
+// the result shows (§9), and nothing read before it is kept (§A.1).
+var errInfoChanged = fmt.Errorf("%w: the namespace's encryption changed", errPurgedSince)
 
 // setResultHeaders sets a result's headers: a private one gets edge
 // lifetimes only for a read the verifying edge verified (§9).

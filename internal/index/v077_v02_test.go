@@ -629,3 +629,93 @@ func TestV077EpochJudgedOnce(t *testing.T) {
 		t.Errorf("/_refs: e-b/r under %s after the rotation, want %s", got, before)
 	}
 }
+
+// v77RaisedPR is pr, public and in the clear, with one document, and an
+// index of it whose grant gets pr's keys once it is sealed; raise raises
+// pr to sealed and waits until the index applied it (§9: a raise purges
+// idx:pr, §A.1).
+func v77RaisedPR(t *testing.T) (x *svc, raise func()) {
+	t.Helper()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "pr"))).CreateNamespace(ctx, "pr", map[string]any{"read": "public", "keys": []any{k.Entry("*")}}))
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"pr"}, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "pr", "a", map[string]any{"title": "secret"}))
+	jwk, priv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", []string{"pr"}, []string{"read"}, map[string]any{"enc": jwk})), client.WithKeys(client.NewKeys(priv)))
+	x = startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"pr"}, untyped: true, now: s.Now}, func(o *indexOpts) { o.Recipient = priv })
+	x.caughtUp("pr")
+	return x, func() {
+		must(w.PatchConfig(ctx, "pr", must(w.NSHead(ctx, "pr")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}}}))
+		x.appliedUpTo(x.caughtUp("pr"))
+	}
+}
+
+// v77AllSealed fails t for each hit of a result of pr in the clear.
+func v77AllSealed(t *testing.T, what string, body []byte) {
+	t.Helper()
+	hits, _ := decodeJSON(t, body)["hits"].([]any)
+	if len(hits) == 0 {
+		t.Errorf("%s: no hits: %s", what, body)
+	}
+	for _, h := range hits {
+		if jwe, _ := h.(map[string]any)["sealed"].(string); jwe == "" {
+			t.Errorf("%s: a hit of pr, sealed now, in the clear: %v", what, h)
+		}
+	}
+}
+
+// TestV077AfterPurgeRaisedToSealed (FSVC-9 review; §A.1: "serving or
+// keeping none computed from what was read before it", §9, §E.2.6): pr is
+// raised to sealed while a query of it at its at is computed. The raise
+// purges idx:pr, so the result is computed again at the at after it, and
+// with pr's encryption as it is then: sealed per entry, as the same at
+// computed afresh is. Before, it was computed again with what was read
+// before the raise, in the clear, kept, and served there to everyone.
+func TestV077AfterPurgeRaisedToSealed(t *testing.T) {
+	t.Parallel()
+	x, raise := v77RaisedPR(t)
+	cur := x.caughtUp("pr")
+	var once atomic.Bool
+	x.ix.OnAnswerRead(func() {
+		if once.CompareAndSwap(false, true) {
+			raise()
+		}
+	})
+	r := x.raw("/pr/at/"+cur+"?limit=5", "")
+	if !once.Load() {
+		t.Fatalf("never computed: %d %v", r.status, r.body)
+	}
+	loc := r.header.Get("Location")
+	if r.status != 302 || loc == "" {
+		t.Fatalf("after the raise: %d %v", r.status, r.body)
+	}
+	v77AllSealed(t, "GET "+loc, x.fetch(loc, "").body)
+	v77AllSealed(t, "control /pr?limit=6", x.fetch("/pr?limit=6", "").body)
+}
+
+// TestV077BeforeAnswerRaisedToSealed (FSVC-9 review; §A.1, §9, §E.2.6): pr
+// is raised to sealed, and the raise applied with its purge, between the
+// head pointer's read of pr's encryption and its answer. The answer isn't
+// computed under what the raise replaced: the redirect's result is sealed
+// per entry. Before, it was computed in the clear and kept, the purge
+// having counted before it began.
+func TestV077BeforeAnswerRaisedToSealed(t *testing.T) {
+	t.Parallel()
+	x, raise := v77RaisedPR(t)
+	var once atomic.Bool
+	x.ix.OnBeforeAnswer(func() {
+		if once.CompareAndSwap(false, true) {
+			raise()
+		}
+	})
+	f := x.fetch("/pr?limit=7", "")
+	if !once.Load() {
+		t.Fatalf("never computed: %s %s", f.path, f.body)
+	}
+	v77AllSealed(t, "GET "+f.path, f.body)
+}
