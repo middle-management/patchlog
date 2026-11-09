@@ -84,6 +84,13 @@ const minOther = "min names a namespace other than the one queried"
 // minted for the gs of its URL (Options.EdgeGrants), and is read as that
 // subject set; one with neither is 401.
 //
+// Where §B.11.9 covers a namespace (filtered.go), a partial reader's
+// marker is reads:{ns}:g:{gs}, gs the origin's subject set; its hits are
+// those visible to it (§B.11.9 Visible); and at is the combined
+// checkpoint of every namespace visibility reads there, which its answers
+// list as namespaces and min may name ({ns}:{ns_id}). Its pages are filled
+// to limit, as every reader's are.
+//
 // Sealed and e2e namespaces (§E.2.5, §E.2.6; package derived). Every
 // value is sealed under the epoch the revision it derives from is served
 // under (docs.epoch; the current one where that isn't known). A result

@@ -131,7 +131,7 @@ const (
 	fsDocsMax    = 4096
 	fsLiveMax    = 64
 	fsCatsMax    = 64
-	fsCPsMax     = 1024
+	fsCPsMax     = 256
 	fsDeletedMax = 4096
 )
 
@@ -139,6 +139,19 @@ func (st *fstate) init() {
 	st.docs.MaxEntries, st.live.MaxEntries, st.cats.MaxEntries = fsDocsMax, fsLiveMax, fsCatsMax
 	st.cps.MaxEntries, st.deleted.MaxEntries = fsCPsMax, fsDeletedMax
 	st.nodes = map[string]map[string]catNode{}
+}
+
+// seedDoc keeps cfg's document as its namespace's at the ns_id the grant
+// checker read it at, so docAt needn't read it again.
+func (ix *Index) seedDoc(cfg *grantcheck.Config) {
+	if cfg.Head == "" || cfg.Doc == nil {
+		return
+	}
+	ix.fs.mu.Lock()
+	if _, ok := ix.fs.docs.Get(cfg.NS + "\x00" + cfg.Head); !ok {
+		ix.fs.docs.Put(cfg.NS+"\x00"+cfg.Head, cfg.Doc, 1)
+	}
+	ix.fs.mu.Unlock()
 }
 
 // docAt is ns's namespace document in force at ns_id id (immutable).
@@ -223,6 +236,7 @@ func (ix *Index) memberAt(ctx context.Context, m string) (id string, ok bool, er
 	case remoteBranch(cfg.Doc):
 		return "", false, nil
 	}
+	ix.seedDoc(cfg)
 	return cfg.Head, true, nil
 }
 
@@ -301,6 +315,9 @@ const maxChain = 32
 // coverage is ns's coverage at its checkpoint z (§B.11.9 Where): its
 // kind, root, chain and trusted catalogs, nil if it isn't covered.
 func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, []fsCat, error) {
+	if cfg, err := ix.checker.Config(ctx, ns); err == nil {
+		ix.seedDoc(cfg) // read by the read check already, as a rule
+	}
 	doc, err := ix.docAt(ctx, ns, z)
 	if err != nil {
 		return nil, nil, err
