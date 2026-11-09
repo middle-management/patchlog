@@ -1265,7 +1265,14 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 					return n.Epoch
 				}
 				if e3 && n != nil && n.Head != "" && !n.Self {
-					judge(n).epoch = key.Epoch
+					if !s.epochsPending {
+						judge(n).epoch = key.Epoch
+					} else {
+						// Its epoch may not be read in yet (an own
+						// op's kid): not judged, and the fill drops
+						// the stored listings (backfillEpochs).
+						s.unjudged.Store(true)
+					}
 				}
 				return key.Epoch
 			}

@@ -235,6 +235,15 @@ type Service struct {
 	// (behind), nor ?min= naming them (awaitMins). Cleared once the core
 	// serves the namespace's head to its follower again.
 	unfollowed map[string]string
+	// epochsPending is whether the heads' epochs are still being read in
+	// (meta "epochs", backfillEpochs): until then a Node.Epoch of 0 may be
+	// one not read in yet rather than a pending judgement, so a listing
+	// judges none (unjudged; §E.2.6, §E.3.1).
+	epochsPending bool
+	// unjudged is whether a listing sealed a head under the current epoch
+	// without judging it while epochsPending: the fill then drops the
+	// stored listings, as for an epoch it changes.
+	unjudged atomic.Bool
 
 	// entered is when each namespace in the combined checkpoint entered
 	// it while trusted, as far as the service knows (meta "inckpt:{ns}"),
@@ -369,6 +378,13 @@ func (s *Service) init(ctx context.Context) error {
 	}
 	if err := s.markBornEpochs(ctx); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
+	}
+	var epochs string
+	switch err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'epochs'`).Scan(&epochs); {
+	case err == nil:
+		s.epochsPending = true
+	case !errors.Is(err, sql.ErrNoRows):
+		return err
 	}
 	if s.opt.Hook != nil {
 		if err := s.opt.Hook.Init(ctx, s.db); err != nil {

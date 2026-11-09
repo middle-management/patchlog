@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -172,5 +173,172 @@ func TestV077V04JudgedOnceBornWithHead(t *testing.T) {
 		}
 		x.stop()
 		x = startSvc(t, sc(), svcOpts{now: s.Now, db: db}, preview)
+	}
+}
+
+// v077Unfill makes db's a database from before nodes.epoch was kept: the
+// heads' epochs not known, to be read in (meta "epochs"), and no sealed
+// listing stored.
+func v077Unfill(t *testing.T, db string) {
+	t.Helper()
+	sq := must(sql.Open("sqlite", db))
+	defer sq.Close()
+	for _, q := range []string{`UPDATE nodes SET epoch = NULL`, `INSERT INTO meta (k, v) VALUES ('epochs', 'pending') ON CONFLICT (k) DO NOTHING`,
+		`DELETE FROM sealed_views`} {
+		if _, err := sq.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// v077Blocking is a transport that holds every request whose path starts
+// with prefix until release is closed.
+func v077Blocking(prefix string, release chan struct{}) client.Option {
+	return client.WithTransport(func(rt http.RoundTripper) http.RoundTripper {
+		return roundTrip(func(r *http.Request) (*http.Response, error) {
+			if strings.HasPrefix(r.URL.Path, prefix) {
+				<-release
+			}
+			return rt.RoundTrip(r)
+		})
+	})
+}
+
+// §E.2.6, §E.3.1 (v0.77): an own sealed op's snapshot carries its own
+// kid's epoch, never the one in force. While a database's head epochs are
+// still being read in (meta "epochs"), a Node.Epoch of 0 may be one not
+// read in yet: a listing served meanwhile seals it under the current
+// epoch but judges nothing, and the fill gives it its own. Here n, an own
+// op of epoch 1, is listed during the fill (cat#2, the current epoch),
+// then under cat#1, its own, with 1 stored. (Before, the listing recorded
+// 2 as n's judgement, and the fill, which reads in only epochs still 0,
+// kept it.)
+func TestV077V04NotJudgedDuringBackfill(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"encryption": map[string]any{"level": "e2e"}, "catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	svcJWK, svcPriv := must2(seal.GenerateRecipient())
+	wJWK, wPriv := must2(seal.GenerateRecipient())
+	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "append", "config"},
+		map[string]any{"enc": wJWK})), client.WithKeys(client.NewKeys(wPriv)))
+	x2 := wr.E2E(wPriv)
+	must(x2.InitKeyring(ctx, "cat", svcPriv.PublicKey()))
+	must(x2.CreateDocSealed(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(x2.CreateDocSealed(ctx, "cat", "n", map[string]any{"title": "N", "parents": parents("root@a0")}))
+	must(x2.RotateEpoch(ctx, "cat", svcPriv.PublicKey()))
+	keyOf := func(kid string) []byte { return must(x2.SealKey(ctx, kid)) }
+
+	release := make(chan struct{})
+	sc := func(block bool) *client.Client {
+		opts := []client.Option{client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"}, map[string]any{"enc": svcJWK})),
+			client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey())}
+		if block {
+			opts = append(opts, v077Blocking("/r/cat/n", release))
+		}
+		return s.Client(t, opts...)
+	}
+	db := filepath.Join(t.TempDir(), "tree.db")
+	withRecipient := func(o *tree.Options) { o.Recipient = svcPriv }
+	x := startSvc(t, sc(false), svcOpts{now: s.Now, db: db}, withRecipient)
+	x.caughtUp("cat")
+	if e, _ := v077Epochs(t, db, "n"); e != 1 {
+		t.Fatalf("n's epoch %d, want 1 (its own op's kid)", e)
+	}
+	x.stop()
+	v077Unfill(t, db)
+	x = startSvc(t, sc(true), svcOpts{now: s.Now, db: db}, withRecipient)
+	rd := k.Grant(t, s.Now(), "user:r", []string{"cat"}, []string{"read"})
+	if kid, _, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", keyOf); kid != "cat#2" {
+		t.Errorf("during the fill: n under %s, want cat#2, the current epoch", kid)
+	}
+	if e, _ := v077Epochs(t, db, "n"); e != 0 {
+		t.Errorf("during the fill: n's epoch %d stored, want none judged", e)
+	}
+	close(release)
+	waitFor(t, "the epochs backfill", func() bool { return !x.s.EpochsPending() })
+	must(x2.CreateDocSealed(ctx, "cat", "later", map[string]any{"title": "Later", "parents": parents("root@a1")}))
+	x.caughtUp("cat")
+	if kid, vals, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", keyOf); kid != "cat#1" || vals["title"] != "N" {
+		t.Errorf("after the fill: n %v under %s, want under cat#1, its revision's epoch", vals, kid)
+	}
+	if e, _ := v077Epochs(t, db, "n"); e != 1 {
+		t.Errorf("n's epoch %d stored after the fill, want 1", e)
+	}
+}
+
+// §E.2.6 (v0.77): a listing served while the head epochs are read in
+// seals a head whose epoch is pending (here n's in a release preview of
+// e2e catalog cat through its branch catb: cat's op, read through) under
+// the current epoch without judging it; the fill, which changes no epoch,
+// still drops the stored listings, and the first listing after it judges
+// n.
+func TestV077V04BackfillDropsUnjudged(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"encryption": map[string]any{"level": "e2e"}, "catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	svcJWK, svcPriv := must2(seal.GenerateRecipient())
+	wJWK, wPriv := must2(seal.GenerateRecipient())
+	both := []string{"cat", "catb"}
+	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "append", "config", "branch"},
+		map[string]any{"enc": wJWK})), client.WithKeys(client.NewKeys(wPriv)))
+	x2 := wr.E2E(wPriv)
+	must(x2.InitKeyring(ctx, "cat", svcPriv.PublicKey()))
+	must(x2.CreateDocSealed(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(x2.CreateDocSealed(ctx, "cat", "n", map[string]any{"title": "N", "parents": parents("root@a0")}))
+	must(wr.CreateBranch(ctx, "cat", client.BranchRequest{Name: "catb"}))
+	must(x2.InitKeyring(ctx, "catb", svcPriv.PublicKey()))
+	keyOf := func(kid string) []byte { return must(x2.SealKey(ctx, kid)) }
+
+	release := make(chan struct{})
+	sc := func(block bool) *client.Client {
+		opts := []client.Option{client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"}, map[string]any{"enc": svcJWK})),
+			client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey())}
+		if block {
+			opts = append(opts, v077Blocking("/r/catb/n", release))
+		}
+		return s.Client(t, opts...)
+	}
+	db := filepath.Join(t.TempDir(), "tree.db")
+	preview := func(o *tree.Options) { o.Recipient = svcPriv; o.Branches = map[string]string{"cat": "catb"} }
+	x := startSvc(t, sc(false), svcOpts{now: s.Now, db: db}, preview)
+	waitFor(t, "the preview to reach catb", func() bool {
+		h, err := wr.NSHead(ctx, "catb")
+		return err == nil && x.s.Checkpoint("cat") == h.ID
+	})
+	x.stop()
+	v077Unfill(t, db)
+	x = startSvc(t, sc(true), svcOpts{now: s.Now, db: db}, preview)
+	rd := k.Grant(t, s.Now(), "user:r", both, []string{"read"})
+	if kid, _, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", keyOf); kid != "cat#1" {
+		t.Errorf("during the fill: n under %s, want cat#1", kid)
+	}
+	stored := func() int {
+		sq := must(sql.Open("sqlite", db))
+		defer sq.Close()
+		var c int
+		if err := sq.QueryRow(`SELECT count(*) FROM sealed_views`).Scan(&c); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	if e, _ := v077Epochs(t, db, "n"); e != 0 || stored() == 0 {
+		t.Fatalf("during the fill: n's epoch %d stored, %d listings stored; want none judged, the listing stored", e, stored())
+	}
+	close(release)
+	waitFor(t, "the epochs backfill", func() bool { return !x.s.EpochsPending() })
+	if c := stored(); c != 0 {
+		t.Errorf("after the fill: %d listings stored, want those sealed unjudged dropped", c)
+	}
+	if kid, _, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", keyOf); kid != "cat#1" {
+		t.Errorf("after the fill: n under %s, want cat#1", kid)
+	}
+	if e, b := v077Epochs(t, db, "n"); e != 1 || b != 1 {
+		t.Errorf("after the fill: n's epochs %d, %d stored, want 1 judged for both", e, b)
 	}
 }
