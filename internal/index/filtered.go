@@ -108,6 +108,40 @@ var (
 	errPurgedNS   = errors.New("the namespace is purged")
 )
 
+// errGrantLacks is a namespace the index's own grant (Options.Client)
+// can't read, 401 or 403, that it reads only to tell whether §B.11.9
+// covers a namespace it follows, or what visibility reads there: a
+// catalog that namespace's catalogs names through a requireAt key, each
+// namespace a followed catalog's catalog.trust lists, a branch's bases,
+// and their state at a checkpoint. Its coverage can't be told, so a
+// partial reader is refused (502) rather than answered as by an
+// uncovered namespace's rules, which could show what visibility hides
+// (§B.11.9 Visible). Its Error names the namespace, for the operator's
+// log; answers don't, as /principal doesn't name a catalog's trust to
+// one who can't read the catalog whole (§7.4).
+type errGrantLacks struct {
+	ns  string
+	err error
+}
+
+func (e *errGrantLacks) Error() string {
+	return "the index's grant cannot read " + e.ns + ", which tells whether §B.11.9 covers a namespace the index follows, or what visibility reads there (widen Options.Client's grant to it): " + e.err.Error()
+}
+
+func (e *errGrantLacks) Unwrap() error { return e.err }
+
+// msgGrantLacks answers errGrantLacks.
+const msgGrantLacks = "the index's grant cannot read a namespace that decides how this one is read (§B.11.9): see the index's log"
+
+// lacksRead is err, an upstream read of ns, as errGrantLacks where it is
+// 401 or 403.
+func lacksRead(ns string, err error) error {
+	if ae, ok := client.AsAPIError(err); ok && (ae.Status == 401 || ae.Status == 403) {
+		return &errGrantLacks{ns: ns, err: err}
+	}
+	return err
+}
+
 // fstate is what the index keeps to compute checkpoints: caches only, of
 // state that never changes once read (namespace documents, /heads and
 // documents at an ns_id, graphs at a checkpoint).
@@ -166,7 +200,7 @@ func (ix *Index) docAt(ctx context.Context, ns, id string) (map[string]any, erro
 	}
 	doc, err := ix.c.NSDoc(ctx, ns, id)
 	if err != nil {
-		return nil, fmt.Errorf("the document of %s at %s: %w", ns, id, err)
+		return nil, lacksRead(ns, fmt.Errorf("the document of %s at %s: %w", ns, id, err))
 	}
 	if doc.Value == nil {
 		doc.Value = map[string]any{}
@@ -212,7 +246,7 @@ func (ix *Index) liveAt(ctx context.Context, ns, id string) (map[string]bool, er
 	v, err := ix.shared(ctx, "live\x00"+k, func(ctx context.Context) (any, error) {
 		items, err := ix.c.Heads(ctx, ns, id)
 		if err != nil {
-			return nil, fmt.Errorf("the heads of %s at %s: %w", ns, id, err)
+			return nil, lacksRead(ns, fmt.Errorf("the heads of %s at %s: %w", ns, id, err))
 		}
 		l := make(map[string]bool, len(items))
 		for _, it := range items {
@@ -256,7 +290,7 @@ func (ix *Index) memberAt(ctx context.Context, m string) (id string, ok bool, er
 	case client.IsPurged(err), client.IsNotFound(err):
 		return "", false, nil
 	case err != nil:
-		return "", false, fmt.Errorf("the head of %s: %w", m, err)
+		return "", false, lacksRead(m, fmt.Errorf("the head of %s: %w", m, err))
 	case remoteBranch(cfg.Doc):
 		return "", false, nil
 	}
@@ -412,15 +446,17 @@ func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, []fsCat, err
 		if _, _, branch := localBase(mdoc); branch || !fsOpen(mdoc) {
 			continue
 		}
-		trusts, err := ix.fsTrust(ctx, m, mdoc)
-		if err != nil {
-			return nil, nil, err
-		}
-		for _, c := range trusts {
-			if c.ns == ns {
-				cp.kind = fsCatalog
-				return cp, []fsCat{{ns: ns, id: z, doc: doc}}, nil
+		// Whether m trusts ns, ns's document alone deciding: the other
+		// catalogs m names are none of this one's coverage, and aren't
+		// read (errGrantLacks).
+		if len(catvis.TrustedCatalogs(m, mdoc, func(c string) map[string]any {
+			if c == ns {
+				return doc
 			}
+			return nil
+		})) > 0 {
+			cp.kind = fsCatalog
+			return cp, []fsCat{{ns: ns, id: z, doc: doc}}, nil
 		}
 	}
 	return nil, nil, nil
@@ -605,7 +641,7 @@ func (ix *Index) catalogAt(ctx context.Context, c fsCat, ids map[string]string) 
 func (ix *Index) catalogGraph(ctx context.Context, cat, id string, doc map[string]any) (*tree.Graph, []*tree.Node, error) {
 	items, err := ix.c.Heads(ctx, cat, id)
 	if err != nil {
-		return nil, nil, fmt.Errorf("the heads of %s at %s: %w", cat, id, err)
+		return nil, nil, lacksRead(cat, fmt.Errorf("the heads of %s at %s: %w", cat, id, err))
 	}
 	ix.fs.mu.Lock()
 	prev := ix.fs.nodes[cat]

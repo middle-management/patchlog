@@ -97,7 +97,14 @@ type Options struct {
 	// covers a namespace, its grant must also read the namespaces
 	// visibility reads there, which the index follows without serving them
 	// (filtered.go): the trusted catalogs, their catalog.trust members and
-	// a branch's bases.
+	// a branch's bases. To tell whether §B.11.9 covers a namespace at all,
+	// for readers it doesn't let read the namespace whole, it must read,
+	// whether or not they turn out to cover it, every catalog a followed
+	// namespace's catalogs names through a key whose requireAt names it,
+	// every namespace a followed catalog's catalog.trust lists, and a
+	// followed branch's bases; where it can't, such readers are answered
+	// 502 and the log names the namespace (errGrantLacks), never as if the
+	// namespace weren't covered.
 	Client *client.Client
 	// Recipient is the service's X25519 private key: it unwraps keys
 	// POST /keys wraps to the grant's enc, and makes e2e namespaces

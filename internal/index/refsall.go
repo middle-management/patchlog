@@ -412,8 +412,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 			writeErr(w, ae.Status, code, ae.Msg)
 			return
 		}
-		ix.opt.Logf("index: access check for /_refs: %v", err)
-		writeErr(w, http.StatusBadGateway, "upstream", "cannot read a namespace configuration")
+		ix.writeUpstreamErr(w, "access check for /_refs", err, "cannot read a namespace configuration")
 		return
 	}
 	setPtr := func() {
@@ -459,9 +458,8 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	mins, purged, refused, behind, err := ix.refsMins(ctx, r, rd, rq.mins)
 	switch {
 	case err != nil:
-		ix.opt.Logf("index: access check for a min of /_refs: %v", err)
 		w.Header().Set("Cache-Control", "no-store")
-		writeErr(w, http.StatusBadGateway, "upstream", "cannot read a namespace configuration")
+		ix.writeUpstreamErr(w, "access check for a min of /_refs", err, "cannot read a namespace configuration")
 		return
 	case len(refused) > 0:
 		writeMinRefused(w, refused)

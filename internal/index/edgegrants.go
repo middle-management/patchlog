@@ -567,8 +567,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, denied.Status, code, denied.Msg)
 		return
 	case upErr != nil:
-		ix.opt.Logf("index: exchange: %v", upErr)
-		writeErr(w, http.StatusBadGateway, "upstream", "cannot read a namespace configuration")
+		ix.writeUpstreamErr(w, "exchange", upErr, "cannot read a namespace configuration")
 		return
 	case purged != nil:
 		w.Header().Set("Cache-Control", "no-store")

@@ -381,8 +381,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			writeBehind(w, errNotReached.Error())
 			return
 		}
-		ix.opt.Logf("index: access check for %s: %v", ns, err)
-		writeErr(w, http.StatusBadGateway, "upstream", "cannot read the namespace configuration")
+		ix.writeUpstreamErr(w, "access check for "+ns, err, "cannot read the namespace configuration")
 		return
 	}
 	// A purged namespace answers as the core's URLs of it do, after the
@@ -693,9 +692,21 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 	case errors.Is(err, errNotReached), errors.Is(err, errPurgedNS), errors.Is(err, errMoving):
 		writeBehind(w, "the index has not reached the namespace's checkpoint yet")
 	default:
-		ix.opt.Logf("index: visibility in %s: %v", ns, err)
-		writeErr(w, http.StatusBadGateway, "upstream", "cannot read a namespace visibility reads (§B.11.9)")
+		ix.writeUpstreamErr(w, "visibility in "+ns, err, "cannot read a namespace visibility reads (§B.11.9)")
 	}
+}
+
+// writeUpstreamErr answers err, a failure to read upstream what answering
+// needs, 502 upstream with msg, or msgGrantLacks where the index's own
+// grant can't read a namespace that decides §B.11.9 coverage
+// (errGrantLacks); the log names it.
+func (ix *Index) writeUpstreamErr(w http.ResponseWriter, what string, err error, msg string) {
+	ix.opt.Logf("index: %s: %v", what, err)
+	var gl *errGrantLacks
+	if errors.As(err, &gl) {
+		msg = msgGrantLacks
+	}
+	writeErr(w, http.StatusBadGateway, "upstream", msg)
 }
 
 // errCounts refuses counts over a sealed namespace to a reader whose

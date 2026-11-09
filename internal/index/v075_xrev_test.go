@@ -2,6 +2,7 @@ package index_test
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,34 @@ import (
 
 // Cross-package review of v0.75 (§B.11.9, §A.4): regressions.
 
+// logged collects what an index logs, for a test to look for.
+type logged struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *logged) mod(t *testing.T) func(*indexOpts) {
+	return func(o *indexOpts) {
+		o.Logf = func(f string, a ...any) {
+			l.mu.Lock()
+			l.lines = append(l.lines, fmt.Sprintf(f, a...))
+			l.mu.Unlock()
+			t.Logf(f, a...)
+		}
+	}
+}
+
+func (l *logged) has(sub string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, s := range l.lines {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
 // follow asks path with token, following redirects.
 func (s *svc) follow(path, token string) resp {
 	s.t.Helper()
@@ -25,6 +54,119 @@ func (s *svc) follow(path, token string) resp {
 		r = s.raw(r.header.Get("Location"), token)
 	}
 	return r
+}
+
+// wantGrantLacks checks r is the 502 of an index whose grant can't read a
+// namespace that decides §B.11.9 coverage, named in its log only.
+func wantGrantLacks(t *testing.T, what string, r resp, logs *logged, ns string) {
+	t.Helper()
+	msg, _ := r.body["message"].(string)
+	if r.status != 502 || r.body["code"] != "upstream" || !strings.Contains(msg, "decides how this one is read") {
+		t.Errorf("%s: %d %v, want 502 upstream naming the index's grant", what, r.status, r.body)
+	}
+	if strings.Contains(msg, ns) {
+		t.Errorf("%s: the answer names %s: %q", what, ns, msg)
+	}
+	if !logs.has("the index's grant cannot read " + ns) {
+		t.Errorf("%s: the log doesn't name %s", what, ns)
+	}
+}
+
+// TestV075XrevUncoveredScopedReader (§B.11.9 Where, §C.6): sec names the
+// catalog cat with a requireAt key, but cat's catalog.trust doesn't list
+// sec, so §B.11.9 doesn't cover sec. To tell, the index must read cat:
+// with a grant for sec alone (as v0.24.0 needed), a scoped reader is
+// refused 502 with an answer that says why, never answered as if sec
+// weren't covered, which could show what visibility hides were it
+// covered; the log names cat (index.Options.Client). With cat readable
+// too, it gets its resource, as in v0.24.0.
+func TestV075XrevUncoveredScopedReader(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	admin, issuer, catKey := clienttest.NewKey("admin"), clienttest.NewKey("issuer"), clienttest.NewKey("catalog-01")
+	op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat")))
+	must(op.CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{admin.Entry("*")}, "catalog": map[string]any{"trust": []any{}}}))
+	op = s.Client(t, client.WithBearer(s.OperatorGrant(t, "sec")))
+	ck := catKey.Entry("read")
+	ck["requireAt"] = "cat"
+	must(op.CreateNamespace(ctx, "sec", map[string]any{"read": "grant", "keys": []any{admin.Entry("*"), issuer.Entry("read"), ck},
+		"catalogs": map[string]any{"cat": map[string]any{"place": []any{}}}}))
+	writer := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:root", []string{"sec"}, []string{"read", "create", "append"})))
+	sch := must(writer.CreateDoc(ctx, "sec", "schema", map[string]any{"$schema": d2020, "type": "object",
+		"properties": map[string]any{"title": map[string]any{"type": "string", "x-index": "text"}}}))
+	ref := "/r/sec/schema/rev/" + sch.ID
+	for _, n := range []string{"a", "b", "c"} {
+		must(writer.CreateDoc(ctx, "sec", n, map[string]any{"$schema": ref, "title": "secret " + n}))
+	}
+	onlyA := issuer.Grant(t, s.Now(), "user:bob", []string{"sec"}, []string{"read"},
+		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
+
+	var logs logged
+	narrow := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"sec"}, []string{"read"})))
+	x := startSvcWith(t, narrow, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, untyped: true, now: s.Now}, logs.mod(t))
+	x.caughtUp("sec")
+	wantGrantLacks(t, "/sec", x.follow("/sec?q=secret", onlyA), &logs, "cat")
+	wantGrantLacks(t, "/_refs", x.follow("/_refs?to=/r/sec/schema", onlyA), &logs, "cat")
+	x.stop()
+
+	wide := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"sec", "cat"}, []string{"read"})))
+	x = startSvc(t, wide, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, untyped: true, now: s.Now})
+	x.caughtUp("sec")
+	if r := x.follow("/sec?q=secret", onlyA); r.status != 200 || strings.Join(resources(r.body), ",") != "a" {
+		t.Errorf("with cat readable: %d %v", r.status, r.body)
+	}
+	if r := x.follow("/_refs?to=/r/sec/schema", onlyA); r.status != 200 {
+		t.Errorf("/_refs with cat readable: %d %v", r.status, r.body)
+	}
+}
+
+// TestV075XrevUncoveredCatalogScopedReader: the index follows the catalog
+// cat, which trusts sec, whose keys name no catalog in requireAt, so
+// §B.11.9 covers neither. To tell, the index must read sec: with a grant
+// for cat alone a scoped reader of cat is 502, the log naming sec; with
+// sec readable too, it gets its resource. The other catalogs sec names
+// are no part of cat's coverage, and the index doesn't need them.
+func TestV075XrevUncoveredCatalogScopedReader(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	admin, issuer, other := clienttest.NewKey("admin"), clienttest.NewKey("issuer"), clienttest.NewKey("other-01")
+	op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "other")))
+	must(op.CreateNamespace(ctx, "other", map[string]any{"read": "grant", "keys": []any{admin.Entry("*")}, "catalog": map[string]any{"trust": []any{"sec"}}}))
+	op = s.Client(t, client.WithBearer(s.OperatorGrant(t, "sec")))
+	ok := other.Entry("read")
+	ok["requireAt"] = "other"
+	must(op.CreateNamespace(ctx, "sec", map[string]any{"read": "grant", "keys": []any{admin.Entry("*"), ok},
+		"catalogs": map[string]any{"cat": map[string]any{"place": []any{}}, "other": map[string]any{"place": []any{}}}}))
+	op = s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat")))
+	must(op.CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{admin.Entry("*"), issuer.Entry("read")},
+		"catalog": map[string]any{"trust": []any{"sec"}}}))
+	writer := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:root", []string{"cat"}, []string{"read", "create", "append"})))
+	sch := must(writer.CreateDoc(ctx, "cat", "schema", map[string]any{"$schema": d2020, "type": "object",
+		"properties": map[string]any{"title": map[string]any{"type": "string", "x-index": "text"}}}))
+	ref := "/r/cat/schema/rev/" + sch.ID
+	for _, n := range []string{"a", "b"} {
+		must(writer.CreateDoc(ctx, "cat", n, map[string]any{"$schema": ref, "title": "secret " + n}))
+	}
+	onlyA := issuer.Grant(t, s.Now(), "user:bob", []string{"cat"}, []string{"read"},
+		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
+
+	var logs logged
+	narrow := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"cat"}, []string{"read"})))
+	x := startSvcWith(t, narrow, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"cat"}, untyped: true, now: s.Now}, logs.mod(t))
+	x.caughtUp("cat")
+	wantGrantLacks(t, "/cat", x.follow("/cat?q=secret", onlyA), &logs, "sec")
+	x.stop()
+
+	// sec readable, other (which sec trusts, and which doesn't decide cat's
+	// coverage) not.
+	wide := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"cat", "sec"}, []string{"read"})))
+	x = startSvc(t, wide, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"cat"}, untyped: true, now: s.Now})
+	x.caughtUp("cat")
+	if r := x.follow("/cat?q=secret", onlyA); r.status != 200 || strings.Join(resources(r.body), ",") != "a" {
+		t.Errorf("with sec readable: %d %v", r.status, r.body)
+	}
 }
 
 // TestV075XrevIndexCookieAfterRoleLosesRead (§B.11.9 gs, §A.4, §2.1): the
