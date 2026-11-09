@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.25.0
 
 Implements spec **v0.76**: v0.75's filtered namespace reads for readers a catalog limits
 (§B.11.9), and v0.76's answers to the reference's notes on v0.75 and v0.74. `GET /` answers
