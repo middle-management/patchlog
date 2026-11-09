@@ -2,11 +2,30 @@ package index_test
 
 import (
 	"context"
+	"net/url"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Cross-package review of v0.75 (§B.11.9, §A.4): regressions.
+
+// follow asks path with token, following redirects.
+func (s *svc) follow(path, token string) resp {
+	s.t.Helper()
+	r := s.raw(path, token)
+	for i := 0; r.status == 302 && i < 5; i++ {
+		r = s.raw(r.header.Get("Location"), token)
+	}
+	return r
+}
 
 // TestV075XrevIndexCookieAfterRoleLosesRead (§B.11.9 gs, §A.4, §2.1): the
 // index's cookie for reads:matches:g:{gs} is judged from what the exchange
@@ -96,5 +115,72 @@ func TestV075XrevCheckpointSharedAt(t *testing.T) {
 	old := "/matches/g/" + gs1 + "/at/" + at1 + "?limit=1"
 	if r := x.raw(old, fan); r.status != 302 || r.header.Get("Location") != loc2 {
 		t.Errorf("GET %s: %d %q %v (want 302 to %s, as TestV075IndexOldGsAt)", old, r.status, r.header.Get("Location"), r.body, loc2)
+	}
+}
+
+// TestV075XrevRefsPurgeBeforeStore (§E.2.6, §8.5, §A.4): a /_refs answer
+// with a sealed hit is bound to its URL and stored. One read before a
+// purge in a covered namespace it reads in part commits, and stored after
+// it, would outlive the purge: the namespace moved, so the store's own
+// Retire doesn't run, and the purge's tags were dropped before it was
+// stored. It is served to the request that read it alone, and not stored:
+// its URL serves the answer after the purge.
+func TestV075XrevRefsPurgeBeforeStore(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	w := newV75XOn(t, s)
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "sec"))).CreateNamespace(ctx, "sec",
+		map[string]any{"read": "public", "keys": []any{w.k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}}))
+	sw := s.Client(t, client.WithBearer(w.k.Grant(t, s.Now(), "user:root", []string{"sec"}, []string{"read", "create"})))
+	must(createNonced(sw, "sec", "s", w.page("s", "cup")))
+
+	iJWK, iPriv, _ := seal.GenerateRecipient()
+	all := []string{"schemas", "cat-season", "matches", "sec"}
+	ic := s.Client(t, client.WithBearer(w.k.Grant(t, s.Now(), "svc:indexer", all, []string{"read"}, map[string]any{"enc": iJWK})),
+		client.WithKeys(client.NewKeys(iPriv)))
+	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "sec"}, untyped: true, now: s.Now},
+		func(o *indexOpts) { o.Recipient = iPriv })
+	x.caughtUp("matches")
+	x.caughtUp("sec")
+	w.x = x
+
+	fan := w.reader("user:fan", []any{"fans"})
+	var once atomic.Bool
+	var mu sync.Mutex
+	var stale []string
+	staleViews := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for v, tags := range x.ix.SealedViews() {
+			if strings.Contains(tags, "r:matches/derby") {
+				stale = append(stale, v)
+			}
+		}
+	}
+	x.ix.OnRefsRead(func() {
+		if !once.CompareAndSwap(false, true) {
+			// The answer computed again once matches moved (refsAnswer):
+			// until it is stored, the one read before the purge would be
+			// served at its URL, were it stored.
+			staleViews()
+			return
+		}
+		// derby is purged after the answer has read it, before it is
+		// stored.
+		must(w.admin.Purge(ctx, "matches", "derby", must(w.admin.Head(ctx, "matches", "derby")).ID, false))
+		x.caughtUp("matches")
+	})
+	p := x.raw("/_refs?to="+url.QueryEscape("/r/target/x"), fan)
+	loc := p.header.Get("Location")
+	if p.status != 302 || !once.Load() {
+		t.Fatalf("pointer: %d %q %v (computed: %v)", p.status, loc, p.body, once.Load())
+	}
+	staleViews()
+	if len(stale) > 0 {
+		t.Errorf("an answer read before derby's purge was stored at %v", stale)
+	}
+	if r := x.follow(loc, fan); r.status != 200 || refsAllHits(r.body) != "matches/shared sec/s" {
+		t.Errorf("GET %s after the purge: %d %v", loc, r.status, r.body)
 	}
 }

@@ -210,6 +210,10 @@ type Index struct {
 	// which Apply does once a config change leaves the service without
 	// its keys (derived.Keys.Recheck).
 	runs map[string]context.CancelFunc
+
+	// testRefsRead, if set, is called once a /_refs answer's transaction
+	// has read its hits (tests: refsCompute).
+	testRefsRead func()
 }
 
 // Open opens (creating or, with Rebuild, recreating) the index database and

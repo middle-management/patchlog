@@ -744,6 +744,10 @@ func (ix *Index) refsAnswer(ctx context.Context, rd *refsReader, rq *refsQuery, 
 }
 
 func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery, target func(string) string) (derived.Stored, string, bool, error) {
+	// Taken before the transaction reads: a purge that commits after the
+	// read keeps a bound answer from being stored below (PutSince), as
+	// its Retire may not run (a covered namespace that moved, refsMerge).
+	sgen := ix.sealed.Generation()
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
 		return derived.Stored{}, "", false, err
@@ -837,6 +841,9 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		return derived.Stored{}, "", false, err
 	}
 	tx.Rollback()
+	if ix.testRefsRead != nil {
+		ix.testRefsRead()
+	}
 	// Hits of sealed and e2e namespaces are sealed under the epoch their
 	// document's head is served under (§E.2.6, docs.epoch), the current
 	// one where that isn't known; its key can't be had for now: behind.
@@ -943,7 +950,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		// Sealed once (§E.2.6): stored while at is current, as sealed
 		// results of one namespace are.
 		scope := "/_refs/g/" + rd.gs
-		if st, err = ix.sealed.Put(ctx, view, scope, at, st); err != nil {
+		if st, err = ix.sealed.PutSince(ctx, view, scope, at, sgen, st); err != nil {
 			ix.opt.Logf("index: storing a sealed result: %v", err)
 		}
 		if now, err := ix.refsCheckpoints(ctx, ix.db, rd.nss); err == nil {

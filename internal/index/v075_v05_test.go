@@ -45,8 +45,15 @@ type v75x struct {
 
 func newV75X(t *testing.T, branches bool) *v75x {
 	t.Helper()
+	w := newV75XOn(t, clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}))
+	w.x = w.start(branches, "matches")
+	return w
+}
+
+// newV75XOn is newV75X's setup on s, with no index started.
+func newV75XOn(t *testing.T, s *clienttest.Server) *v75x {
+	t.Helper()
 	ctx := context.Background()
-	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
 	w := &v75x{t: t, s: s, k: clienttest.NewKey("k"), cat: clienttest.NewKey("catalog-01")}
 	mk := func(ns string, doc map[string]any) {
 		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
@@ -77,7 +84,6 @@ func newV75X(t *testing.T, branches bool) *v75x {
 	for n, kind := range map[string]string{"derby": "cup", "shared": "league", "secret": "cup", "opener": "cup"} {
 		w.put("matches", n, w.page(n, kind))
 	}
-	w.x = w.start(branches, "matches")
 	return w
 }
 
