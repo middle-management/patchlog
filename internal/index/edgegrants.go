@@ -284,9 +284,10 @@ func (ix *Index) cookieAccess(ctx context.Context, ns string, r *http.Request) (
 
 // markerAccess is access to private namespace ns of a reader with marker m
 // under an edge grant: reads:{ns} reads it whole, reads:{ns}:scope:… as
-// its filter allows, reads:{ns}:g:… as its subjects and filter see ns at
-// its current checkpoint, which must still be covered (§B.11.9,
-// storedFview); any other marker reads none of it.
+// its filter allows while ns is still uncovered (stillUncovered),
+// reads:{ns}:g:… as its subjects and filter see ns at its current
+// checkpoint, which must still be covered (§B.11.9, storedFview); any
+// other marker reads none of it.
 func (ix *Index) markerAccess(ctx context.Context, ns, m string) (*access, error) {
 	switch {
 	case m == "reads:"+ns:
@@ -295,6 +296,9 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string) (*access, error
 		f, ok := ix.filter(ctx, m)
 		if !ok {
 			return nil, errUnknownSet
+		}
+		if err := ix.stillUncovered(ctx, ns); err != nil {
+			return nil, err
 		}
 		return &access{marker: m, filter: f.f, allow: f.f.Allows, cookie: true}, nil
 	case strings.HasPrefix(m, "reads:"+ns+":g:"):
@@ -315,6 +319,40 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string) (*access, error
 		return a, nil
 	}
 	return nil, &grant.AuthError{Status: 403, Msg: "the edge grant doesn't read this namespace"}
+}
+
+// errCoveredNow refuses a cookie for marker reads:{ns}:scope:… once
+// §B.11.9 covers ns: a partial reader's marker there is reads:{ns}:g:{gs},
+// its hits filtered by visibility (§A.4), which rules alone don't do.
+var errCoveredNow = &grant.AuthError{Status: 403, Msg: "the namespace is read filtered now: exchange the grant again (§B.11.9)"}
+
+// stillUncovered checks that §B.11.9 doesn't cover ns at the index's
+// committed checkpoint, as when a scope marker of it was issued: else
+// errCoveredNow. Before the index's first checkpoint of a namespace that
+// may be covered once it has, its coverage can't be told: errNotReached,
+// as for a grant (grantAccess). A purged one passes, answered 410 past
+// the read check (§8.5).
+func (ix *Index) stillUncovered(ctx context.Context, ns string) error {
+	id, purged, err := ix.committed(ctx, ns)
+	switch {
+	case err != nil:
+		return err
+	case purged:
+		return nil
+	case id == "":
+		if may, err := ix.mayBeCovered(ctx, ns); err != nil || may {
+			return errors.Join(errNotReached, err)
+		}
+		return nil
+	}
+	cp, err := ix.checkpoint(ctx, ns, id)
+	switch {
+	case err != nil:
+		return err
+	case cp != nil:
+		return errCoveredNow
+	}
+	return nil
 }
 
 // refsCookieReader is the reader of /_refs under one of the service's

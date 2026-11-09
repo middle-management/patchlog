@@ -435,24 +435,25 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			w.Header().Add("Vary", "Authorization")
 		}
 	}
-	// An older at whose checkpoint the index still holds, and whose result
-	// it keeps, is read at the reader's gs as of that at (§B.11.9: a
-	// grant reads at its own gs as of the URL's at).
-	if isAt && a.cov != nil && gs != "" && gs != a.gs && len(q.Mins) == 0 && at != a.cov.cp.at {
+	// An older at whose checkpoint the index still holds is read at the
+	// reader's gs as of that at (§B.11.9, §B.11.5: a grant reads at its own
+	// gs as of the URL's at): where that is the URL's gs, old is the
+	// reader's view there, and the URL is the reader's own, answered as
+	// any older at is below: its kept result, else a redirect to the
+	// current at.
+	var old *access
+	if isAt && a.cov != nil && gs != "" && gs != a.gs && at != a.cov.cp.at {
 		if cp := ix.keptCP(ns, at); cp != nil {
 			if b := a.at(ctx, ns, cp); b != nil && b.gs == gs {
-				url := base(b, ns) + "/at/" + at + derived.CanonicalQuery(vals, "min")
-				if st, _, ok := ix.kept.Get(url); ok && r.URL.RequestURI() == url {
-					ix.writeStored(w, r, b, at, st)
-					return
-				}
+				old = b
 			}
 		}
 	}
 	// The reader's URL space: public, or keyed by its subject set. The
 	// head pointer /{ns} is everyone's, and redirects there below. A grant
-	// reads only at its own gs (§A.4, §B.11.5): an at URL of another
-	// subject set is 403, with or without min, never redirected. An at URL
+	// reads only at its own gs (§A.4, §B.11.5), as of the URL's at (old):
+	// an at URL of another subject set is 403, with or without min, never
+	// redirected. An at URL
 	// without /g/{gs} of a private namespace, or one with it of a public
 	// one, which no grant decides, is redirected to the same at in the
 	// reader's space; with min, the redirects below land there, without
@@ -463,7 +464,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
 		return
 	}
-	if isAt && gs != a.gs {
+	if isAt && gs != a.gs && old == nil {
 		if gs != "" && !a.public {
 			w.Header().Set("Cache-Control", "no-store")
 			writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
@@ -486,6 +487,13 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		return base(a, ns) + "/at/" + id + derived.CanonicalQuery(v, "min")
 	}
 	target := func(id string) string { return targetOf(vals, id) }
+	// atA and atTarget are the reader's view at the URL's at and this
+	// query's canonical URL there: old's where the reader's gs there
+	// differs from its current one.
+	atA, atTarget := a, target(at)
+	if old != nil {
+		atA, atTarget = old, base(old, ns)+"/at/"+at+derived.CanonicalQuery(vals, "min")
+	}
 	// elsewhere is the query a redirect to another at sends (§A.4): an
 	// after naming a resource is kept, applied to the new result, and an
 	// opaque one, a position in this at's result, is dropped, starting
@@ -547,24 +555,24 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	// includes every min to itself without min. The current at needs no
 	// judging: the redirect to the current checkpoint below names the same
 	// URL, with the result computed and kept there first.
-	if isAt && len(q.Mins) > 0 && at != cur && ix.atIncludes(ctx, a, ns, at, q.Mins, target(at)) {
+	if isAt && len(q.Mins) > 0 && at != cur && ix.atIncludes(ctx, atA, ns, at, q.Mins, atTarget) {
 		setPtrHeaders()
-		redirect(w, target(at))
+		redirect(w, atTarget)
 		return
 	}
 	// Only the canonical form of an at URL is answered (§A.5), and never
 	// one with min.
-	canonical := r.URL.RequestURI() == target(at)
+	canonical := r.URL.RequestURI() == atTarget
 	if isAt && len(q.Mins) == 0 {
 		// A kept result answers its at however far the checkpoint has
 		// moved since (B9).
-		if st, _, ok := ix.kept.Get(target(at)); ok {
+		if st, _, ok := ix.kept.Get(atTarget); ok {
 			if !canonical {
 				setPtrHeaders()
-				redirect(w, target(at))
+				redirect(w, atTarget)
 				return
 			}
-			ix.writeStored(w, r, a, at, st)
+			ix.writeStored(w, r, atA, at, st)
 			return
 		}
 	}

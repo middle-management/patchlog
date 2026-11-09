@@ -432,11 +432,21 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		}
 	}
 	// Another subject set's URL space: a grant reads only at its own gs
-	// (§A.4, §B.11.5), so it is 403 there, with or without min, never
-	// redirected; a request without one the service verifies, which needs
-	// one for that gs, is 401, as a query of one namespace answers it
-	// (§B.11.5, §12.1). Only the pointer redirects into the reader's.
-	if gs != "" && gs != rd.gs {
+	// (§A.4, §B.11.5), as of the URL's at, so it is 403 there, with or
+	// without min, never redirected; a request without one the service
+	// verifies, which needs one for that gs, is 401, as a query of one
+	// namespace answers it (§B.11.5, §12.1). Only the pointer redirects
+	// into the reader's. The grant's gs as of an older at differs from its
+	// current one where its marker in a namespace §B.11.9 covers does
+	// (gMarker): where the URL is a kept answer at the gs the grant had
+	// there (refsOwnAt), it is the grant's own.
+	var oldURL string
+	if gs != "" && gs != rd.gs && at != "" {
+		if url := "/_refs/g/" + gs + "/at/" + at + derived.CanonicalQuery(vals, "min"); ix.refsOwnAt(ctx, rd, gs, url) {
+			oldURL = url
+		}
+	}
+	if gs != "" && gs != rd.gs && oldURL == "" {
 		w.Header().Set("Cache-Control", "no-store")
 		if rd.unverified {
 			w.Header().Set("WWW-Authenticate", "Bearer")
@@ -483,12 +493,17 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		}
 	}
 	if at != "" && !purged {
-		if st, _, ok := ix.refsStored(ctx, rd, target(at)); ok && ix.refsIncludes(ctx, st, rq.mins) {
+		// The answer at the URL's at, at the grant's gs there.
+		atTarget := target(at)
+		if oldURL != "" {
+			atTarget = oldURL
+		}
+		if st, _, ok := ix.refsStored(ctx, rd, atTarget); ok && ix.refsIncludes(ctx, st, rq.mins) {
 			// A kept answer, whose at already includes every min:
 			// answered there, at its canonical URL without min (§A.5).
-			if r.URL.RequestURI() != target(at) {
+			if r.URL.RequestURI() != atTarget {
 				setPtr()
-				redirect(w, target(at))
+				redirect(w, atTarget)
 				return
 			}
 			ix.writeRefs(w, r, rd, at, st)
@@ -517,6 +532,48 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		return
 	}
 	ix.writeRefs(w, r, rd, cur, st)
+}
+
+// refsOwnAt reports whether url, a kept answer at gs, is rd's own though
+// rd's gs is not gs now: rd is a grant's (its markers known), and its
+// markers, those in the namespaces §B.11.9 covers that it reads in part
+// as of the checkpoints of them the answer was read at (keptCPsIn, each
+// one the index still holds), make gs (§A.4, §B.11.5: a grant reads at
+// its own gs as of the URL's at). A namespace whose checkpoint there
+// isn't held, or isn't told apart, is not.
+func (ix *Index) refsOwnAt(ctx context.Context, rd *refsReader, gs, url string) bool {
+	if rd.markers == nil || len(rd.covs) == 0 {
+		return false
+	}
+	st, _, ok := ix.refsStored(ctx, rd, url)
+	if !ok {
+		return false
+	}
+	var body struct {
+		Namespaces map[string]string `json:"namespaces"`
+	}
+	if err := json.Unmarshal(st.Body, &body); err != nil {
+		return false
+	}
+	markers := maps.Clone(rd.markers)
+	for ns, a := range rd.covs {
+		cps := ix.keptCPsIn(ns, body.Namespaces)
+		if len(cps) == 0 {
+			return false
+		}
+		for i, cp := range cps {
+			b := a.at(ctx, ns, cp)
+			if b == nil || (i > 0 && b.marker != markers[ns]) {
+				return false
+			}
+			markers[ns] = b.marker
+		}
+	}
+	ms := make([]string, 0, len(markers))
+	for _, m := range markers {
+		ms = append(ms, m)
+	}
+	return grantcheck.SubjectSetID(ms) == gs
 }
 
 // refsBadMins answers a /_refs request with mins refused as given (bad,

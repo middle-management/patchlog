@@ -484,6 +484,35 @@ func (ix *Index) keptCP(ns, at string) *fcp {
 	return nil
 }
 
+// keptCPsIn are the checkpoints of ns the index holds that an answer
+// across namespaces at ids (its namespaces, refsMerge) was read at: ns
+// and each of their members at its id in ids, but a branch's bases, which
+// ids may hold at their own checkpoints instead (§A.4 Across namespaces).
+func (ix *Index) keptCPsIn(ns string, ids map[string]string) []*fcp {
+	ix.fs.mu.Lock()
+	defer ix.fs.mu.Unlock()
+	var out []*fcp
+	for _, at := range ix.fs.cps.Keys() {
+		cp, ok := ix.fs.cps.Get(at)
+		if !ok || cp.ns != ns {
+			continue
+		}
+		in := true
+		for m, id := range cp.ids {
+			got, ok := ids[m]
+			base := slices.ContainsFunc(cp.chain, func(b fsBase) bool { return b.ns == m })
+			if !ok || (!base && got != id) {
+				in = false
+				break
+			}
+		}
+		if in {
+			out = append(out, cp)
+		}
+	}
+	return out
+}
+
 // catalogAt is catalog c's visibility as of ids (§B.11.9 Visible): its
 // graph from its documents at ids[c.ns], its tombstoned nodes from their
 // last live documents, and its catalog.trust members in ids as its
