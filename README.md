@@ -837,8 +837,11 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   Postgres.
 - **Tests.** `PATCHLOG_TEST_PG=postgres://postgres@localhost:5432/postgres make test-pg` runs
   the storage-dependent tests with a fresh database per test (`internal/pgtest`), whose URL
-  bounds the engines' pools (`pool_max_conns=8&pool_max_conn_idle_time=1s`) so a run fits a
-  stock server's 100 connections; CI does the same against a `postgres:16` service container.
+  bounds the engines' pools (`pool_max_conns=8&pool_max_conn_idle_time=1s`). A run still
+  needs more than a stock server's 100 connections: at 4 CPUs it peaks above 110, and its
+  demand grows with the packages and tests run at once. Give the server
+  `max_connections=300`, or run fewer packages at once (`go test -p 2`); CI starts its
+  `postgres:16` service container with `max_connections=300`.
 
 ### Blob storage
 
