@@ -1,6 +1,7 @@
 package index_test
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 )
 
@@ -61,4 +63,38 @@ func TestV077XconfChainUnreadableEndToEnd(t *testing.T) {
 		}
 	}
 	fail.Store(0)
+}
+
+// Cross-review (conformance lens), §B.11.9 Where ("as their documents
+// alone decide"): a purged catalog counts for coverage only if its last
+// catalog.trust listed the namespace, as at the origin. cat-season stops
+// trusting matches, which is then uncovered (a partial reader: 403, no
+// marker, §A.4), and is purged: matches stays uncovered. Before, the
+// index counted a purged catalog wherever the namespace named it through
+// a requireAt key, and li got a g: marker and empty answers.
+func TestV077XrevPurgedCatalogLastTrust(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := newV75X(t, false)
+	li := w.reader("user:li", []any{"fans"})
+	if r := w.x.raw("/matches", li); r.status != 302 || !strings.Contains(r.header.Get("Location"), "/g/") {
+		t.Fatalf("li while cat-season trusts matches: %d %s %v", r.status, r.header.Get("Location"), r.body)
+	}
+	must(w.admin.PatchConfig(ctx, "cat-season", must(w.admin.NSHead(ctx, "cat-season")).Config,
+		[]any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": []any{}}}))
+	waitFor(t, "matches uncovered", func() bool {
+		w.x.ix.ExpireGrantChecks()
+		return w.x.raw("/matches", li).status == 403
+	})
+	purger := w.s.Client(t, client.WithBearer(w.k.Grant(t, w.s.Now(), "user:root", []string{"cat-season"}, []string{"purge-ns"})))
+	must(w.admin.PatchConfig(ctx, "cat-season", must(w.admin.NSHead(ctx, "cat-season")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	must(purger.PurgeNamespace(ctx, "cat-season", w.head("cat-season")))
+	waitFor(t, "the index learns cat-season is purged", func() bool {
+		_, following := w.x.ix.Members()["cat-season"]
+		return !following
+	})
+	w.x.ix.ExpireGrantChecks()
+	if r := w.x.raw("/matches", li); r.status != 403 {
+		t.Errorf("li once cat-season, which no longer trusted matches, is purged: %d %s %v, want 403 with no marker", r.status, r.header.Get("Location"), r.body)
+	}
 }

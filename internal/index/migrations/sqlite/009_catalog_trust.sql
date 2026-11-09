@@ -1,0 +1,26 @@
+-- Migration: catalog trust
+-- Created: 2026-11-09T17:32:21Z
+-- Checksum: 341f76d175c3193b362104ed86c1f9b96cde6c4512928479a5e32ef2cb329617
+-- Chain: e9dd6168eebf65bc0ae030aed3f81308ae899c9f72b0264e33f3e5be27976465
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- catalog_trust: the catalog.trust (a JSON array, or null for a namespace
+-- that is no catalog) of the namespace document last applied for each
+-- namespace the index follows, as a namespace of its own or one visibility
+-- reads (members.go): at a purge-ns the document is 410, and a purged
+-- catalog still counts for coverage only if its last catalog.trust listed
+-- the namespace (§B.11.9 Where, "as their documents alone decide"). Kept
+-- across a rebuild and, for a purged namespace, for good.
+CREATE TABLE IF NOT EXISTS catalog_trust (ns TEXT PRIMARY KEY, trust TEXT NOT NULL);

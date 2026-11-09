@@ -494,11 +494,11 @@ func isCatalog(doc map[string]any) bool {
 // taken at (memberAt): local, unpurged namespaces, and purged ones (gone),
 // which make nothing visible and still count for coverage, as at the
 // origin (§B.11.9 Where: "a purged one makes nothing visible"). A purged
-// catalog's document is 410, so whether its catalog.trust listed root
-// can't be read: it counts where root names it in catalogs through a
-// requireAt key, which is all TrustedCatalogs asks of root's side (open
-// question; the most a dark catalog can do is cover root with nothing
-// visible).
+// catalog's document is 410: its catalog.trust is the one the index last
+// applied (catalog_trust), as the origin reads its last stored document
+// ("as their documents alone decide"). One the index never applied a
+// document of counts as no catalog: root is not covered through it, the
+// reading that shows least (§A.4: no marker, 403).
 func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) ([]fsCat, error) {
 	var ferr error
 	ids, docs, gone := map[string]string{}, map[string]map[string]any{}, map[string]bool{}
@@ -508,8 +508,16 @@ func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) (
 		}
 		id, ok, purged, err := ix.memberAtGone(ctx, cat)
 		if purged && err == nil {
+			trust, known, err := ix.lastTrust(ctx, cat)
+			if err != nil {
+				ferr = err
+				return nil
+			}
+			if !known {
+				return nil
+			}
 			gone[cat] = true
-			return map[string]any{"catalog": map[string]any{"trust": []any{root}}}
+			return map[string]any{"catalog": map[string]any{"trust": trust}}
 		}
 		if err != nil || !ok {
 			ferr = err
