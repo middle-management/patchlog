@@ -43,6 +43,9 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_PASSWORD: postgres
+          # A run of every package at 4 CPUs peaks above a stock server's
+          # 100 connections (internal/pgtest PoolParams).
+          POSTGRES_INITDB_ARGS: -c max_connections=300
         ports:
           - 5432:5432
         options: >-
@@ -67,6 +70,9 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_PASSWORD: postgres
+          # A run of every package at 4 CPUs peaks above a stock server's
+          # 100 connections (internal/pgtest PoolParams).
+          POSTGRES_INITDB_ARGS: -c max_connections=300
         ports:
           - 5432:5432
         options: >-

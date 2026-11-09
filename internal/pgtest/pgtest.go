@@ -76,12 +76,16 @@ func NewDB(t testing.TB) string {
 // pools of the engines opened on them (core's pgpool.go): a test run
 // starts hundreds of engines, dozens at once across the packages tested
 // in parallel, and with the default pools, which grow with the CPUs and
-// keep every connection they opened, they need more connections than a
-// stock server's max_connections of 100. Eight each leaves room for the
-// leader lock, the tailer, and the transactions and locks a test holds
-// open on an engine's pool while its writes wait (TestV073P39*); an
-// engine idle for a second, as most are once their test moved on to the
-// next, gives its connections back.
+// keep every connection they opened, they need far more connections than
+// a stock server's max_connections of 100. Even bounded, a run peaks above
+// 100 at 4 CPUs (an engine's main pool and its rate buckets' pool, 10
+// connections, for each of the engines of the tests running at once, up to
+// GOMAXPROCS packages × GOMAXPROCS tests): the server needs more (CI's has
+// 300), or a run fewer packages at once (go test -p). Eight each leaves
+// room for the leader lock, the tailer, and the transactions and locks a
+// test holds open on an engine's pool while its writes wait
+// (TestV073P39*); an engine idle for a second, as most are once their test
+// moved on to the next, gives its connections back.
 var PoolParams = map[string]string{
 	"pool_max_conns":          "8",
 	"pool_max_conn_idle_time": "1s",
