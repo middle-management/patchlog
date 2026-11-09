@@ -261,7 +261,15 @@ func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*acces
 }
 
 // grantAccess is access to private namespace ns for v, a grant verified
-// there.
+// there: whether the grant gets a marker in ns, and which (§A.4 Across
+// namespaces). It is the one place that decides it, for a query of ns,
+// for /_refs (refsReader, through access) and for an exchange
+// (exchangeGrant), so each namespace is judged alone: a grant gets a
+// marker where it allows read, its read rules don't refer to /now, and,
+// if they fix /resource, they pass now for a name they fix (readsFixed).
+// A refusal (*grant.AuthError, 403) leaves ns without a marker, which a
+// query of ns answers 403 and /_refs and the exchange leave ns out for,
+// refusing only where no namespace is left (§A.4 Coverage).
 func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) (*access, error) {
 	if ok, _ := v.Allows("read"); !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
@@ -289,6 +297,12 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 	// read the namespace whole now, reads none of it.
 	if !ix.checker.ReadsPerResource(v) {
 		return nil, &grant.AuthError{Status: 403, Msg: "a grant or key rule refuses the read"}
+	}
+	// One whose rules fix /resource and pass for none of the names they
+	// fix reads none of ns either: its rules, not what visibility shows
+	// (§A.4: "its rules passing now for a name it fixes").
+	if !readsFixed(v, func(name string) bool { return ix.checker.AllowsRead(v, name) }) {
+		return nil, &grant.AuthError{Status: 403, Msg: "the grant's rules pass for none of the names they fix /resource to in " + ns + " (§A.4, §C.5.2)"}
 	}
 	a := &access{v: v, filter: grantcheck.FilterOf(v),
 		derive: func(_ context.Context, cp *fcp) (*fview, error) { return grantFview(cp, v) }}

@@ -165,7 +165,9 @@ type refsReader struct {
 	// unverified: the request carries no grant the service verified in a
 	// private namespace it names (§B.11.5): none, one that doesn't decode,
 	// or one refused 401 wherever it was checked (malformed, badly signed,
-	// revoked, expired or not yet valid, §C.2, §12.1).
+	// revoked, expired or not yet valid, §C.2, §12.1). At another gs's URL
+	// such a request is 401 only if its grant verifies in no namespace the
+	// service follows either (verifiesFollowed), else 403.
 	unverified bool
 }
 
@@ -314,6 +316,32 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 	return rd, nil
 }
 
+// verifiesFollowed reports whether token is a grant that verifies (§C.2
+// item 1: signed by a key of the namespace document, valid now, not
+// revoked) in some namespace the service follows that it names, whatever
+// the namespace's read and whether the service has reached it or skips
+// it: Verify passes, or refuses it only once it has verified (403). It
+// decides 401 against 403 at another gs's /_refs URL for a request
+// refsReader found no such grant in (refsReader.unverified), so it runs
+// only there.
+func (ix *Index) verifiesFollowed(ctx context.Context, token string) bool {
+	g, err := ix.checker.Decode(token)
+	if token == "" || err != nil {
+		return false
+	}
+	for _, ns := range ix.refsNamespaces() {
+		if !g.NamesNS(ns) {
+			continue
+		}
+		_, err := ix.checker.Verify(ctx, ns, token)
+		var ae *grant.AuthError
+		if err == nil || errors.As(err, &ae) && ae.Status != http.StatusUnauthorized {
+			return true
+		}
+	}
+	return false
+}
+
 // refsAccess is access to ns with the bearer decoded once (g; nil if there
 // is none or it doesn't decode): a private namespace is refused without
 // verifying a grant that doesn't name it, which §C.2 refuses first anyway.
@@ -432,13 +460,17 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	}
 	// Another subject set's URL space: a grant reads only at its own gs
 	// (§A.4, §B.11.5), as of the URL's at, so it is 403 there, with or
-	// without min, never redirected; a request without one the service
-	// verifies, which needs one for that gs, is 401, as a query of one
-	// namespace answers it (§B.11.5, §12.1). Only the pointer redirects
-	// into the reader's. The grant's gs as of an older at differs from its
-	// current one where its marker in a namespace §B.11.9 covers does
-	// (gMarker): where the URL is a kept answer at the gs the grant had
-	// there (refsOwnAt), it is the grant's own.
+	// without min, never redirected (changelog v0.76: "a grant at another
+	// gs's /_refs URL is 403, not 401"), wherever in the namespaces the
+	// service follows it verifies, public, unreached and skipped ones
+	// among them (verifiesFollowed); a request with no grant, one that
+	// doesn't decode, or one that verifies in no namespace the service
+	// follows, is 401, as §B.11.5 answers a request without a grant that
+	// verifies, and a query of one namespace does (§12.1). Only the
+	// pointer redirects into the reader's. The grant's gs as of an older at
+	// differs from its current one where its marker in a namespace §B.11.9
+	// covers does (gMarker): where the URL is a kept answer at the gs the
+	// grant had there (refsOwnAt), it is the grant's own.
 	var oldURL string
 	if gs != "" && gs != rd.gs && at != "" {
 		if url := "/_refs/g/" + gs + "/at/" + at + derived.CanonicalQuery(vals, "min"); ix.refsOwnAt(ctx, rd, gs, url) {
@@ -447,7 +479,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	}
 	if gs != "" && gs != rd.gs && oldURL == "" {
 		w.Header().Set("Cache-Control", "no-store")
-		if rd.unverified {
+		if rd.unverified && !ix.verifiesFollowed(ctx, bearer(r)) {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeErr(w, http.StatusUnauthorized, "unauthenticated", "missing or unverifiable grant")
 			return

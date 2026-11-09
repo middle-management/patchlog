@@ -477,13 +477,15 @@ type exchanged struct {
 // the service has reached, each lasting until the grant's exp or the
 // cookies' TTL (15 minutes at most), whichever is sooner. A prefix
 // several grants give gets one cookie, lasting as long as the longest,
-// and exp is the earliest. It answers all or nothing: a grant over
-// grantSize or rulesPerGrant is 413 limit (§C.8); any other refusal is
-// 401 if any is 401, else 403, and 502 if a namespace document can't be
-// read; once none is, a purged namespace a grant names and verifies in is
-// 410 purged, with ns and head naming the first in the order the grants
-// and their root blocks list them (§8.5, exchangeGrant). More than
-// maxPrefixes prefixes is 400.
+// and exp is the earliest. Within a grant each namespace is judged alone,
+// one it gets no marker in left out (exchangeGrant, §A.4); across grants
+// it answers all or nothing (§C.5.2): a grant over grantSize or
+// rulesPerGrant is 413 limit (§C.8); a grant left with no edge grant is
+// refused 401 if any such is 401, else 403, and 502 if a namespace
+// document a grant names can't be read; once none is, a purged namespace
+// a grant names and verifies in is 410 purged, with ns and head naming the
+// first in the order the grants and their root blocks list them (§8.5).
+// More than maxPrefixes prefixes is 400.
 // Once nothing is refused, it draws one token from the exchangeRate
 // bucket of each distinct principal among the grants (ExchangeRate,
 // §6.6), shared with the instances on its database (svcedge.Store), and
@@ -633,18 +635,23 @@ type purgedNS struct{ ns, head string }
 // exchangeGrant is what token gives at an exchange (issueEdgeGrants): for
 // every namespace the service follows that the grant names, and whose
 // keys the service doesn't lack, the read check of a query of it
-// (Index.access): a private one gives /{ns}/g/{gs} of the reader's marker
-// there, and the markers of those reached and not skipped give
-// /_refs/g/{gs} over them, as refsReader computes it. A public namespace
-// needs no edge grant. A grant whose rules fix /resource (§2.1) and pass
-// for none of the names they fix reads nothing there, and is 403, as at
-// the core's issuance. The namespaces are taken in the order the grant's
-// root block names them (§C.5.2), and the refusal is the first of the
-// lowest rank among them: 401, then 403, then any other, then a purged
-// namespace the grant passes the read check of, the service's own purged
-// state (Index.committed, as its queries answer) or the core's 410 of a
-// sealed one's document (§8.5), which pn names. A grant that gives no edge
-// grant at all, naming no private namespace the service follows, is 403.
+// (Index.access, grantAccess): a private one where the grant gets a
+// marker gives /{ns}/g/{gs} of the reader's marker there, and the markers
+// of those reached and not skipped give /_refs/g/{gs} over them, as
+// refsReader computes it. A public namespace needs no edge grant. Each
+// namespace is judged alone (§A.4 Across namespaces: "the service's
+// exchange refusing only as Coverage says"): one the grant gets no marker
+// in (a refusal of its read check, 401 or 403, among them a grant whose
+// rules fix /resource and pass for none of the names they fix) is left
+// out, with no prefix and no marker in the /_refs set, and only a grant
+// left with no edge grant at all is refused: 401 if a refusal was 401,
+// else 403 (Coverage: "Only a reader who may see none of the namespaces
+// gets 401 or 403"). A namespace whose document the service can't read
+// refuses the whole exchange (502, err), the first in the order the
+// grant's root block names them (§C.5.2); otherwise a purged namespace
+// the grant passes the read check of, the service's own purged state
+// (Index.committed, as its queries answer) or the core's 410 of a sealed
+// one's document (§8.5), refuses it as pn names, the first such.
 func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[string]string, now time.Time) (ex *exchanged, pn *purgedNS, err error) {
 	g, err := ix.checker.Decode(token)
 	if err != nil {
@@ -659,36 +666,46 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 	var (
 		markers []string
 		refsExp time.Time
-		refused error
+		upErr   error
+		denied  *grant.AuthError
 	)
-	refuse := func(err error) {
-		if refused == nil || refusalRank(err) < refusalRank(refused) {
-			refused = err
+	// deny notes a namespace the grant gets no marker in: left out, the
+	// first 401 answering if nothing is left, else the first 403.
+	deny := func(err error) bool {
+		var ae *grant.AuthError
+		if !errors.As(err, &ae) {
+			return false
+		}
+		if denied == nil || ae.Status == http.StatusUnauthorized && denied.Status != http.StatusUnauthorized {
+			denied = ae
+		}
+		return true
+	}
+	fail := func(err error) {
+		if !deny(err) && upErr == nil {
+			upErr = err
 		}
 	}
 	for _, ns := range namedInOrder(g, ix.refsNamespaces()) {
-		if refused != nil && refusalRank(refused) == 0 {
-			break // 401 ranks first: nothing after it changes the answer
-		}
 		if _, lacks := ix.keys.Skip(ns); lacks {
 			continue // one the service doesn't follow (§A.4)
 		}
 		head, purged, err := ix.committed(ctx, ns)
 		if err != nil {
-			refuse(err)
+			fail(err)
 			continue
 		}
 		cfg, err := ix.checker.Config(ctx, ns)
 		if client.IsPurged(err) {
 			if head, err = ix.checker.PurgedRead(ctx, ns, token); err != nil {
-				refuse(err)
-			} else {
-				refuse(&purgedNS{ns: ns, head: head})
+				fail(err)
+			} else if pn == nil {
+				pn = &purgedNS{ns: ns, head: head}
 			}
 			continue
 		}
 		if err != nil {
-			refuse(err)
+			fail(err)
 			continue
 		}
 		if cfg.Read == "public" && !purged {
@@ -696,7 +713,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		}
 		v, err := ix.checker.Verify(ctx, ns, token)
 		if err != nil {
-			refuse(err)
+			fail(err)
 			continue
 		}
 		var a *access
@@ -705,17 +722,16 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			if errors.Is(err, errNotReached) {
 				continue // its coverage, so its marker, can't be told yet
 			}
-			if err == nil && a.filter != nil && !readsFixed(v, a.allow) {
-				err = &grant.AuthError{Status: 403, Msg: "the grant's rules pass for none of the names they fix /resource to in " + ns + " (§C.5.2)"}
-			}
 			if err != nil {
-				refuse(err)
+				fail(err)
 				continue
 			}
 		}
 		if purged {
 			// Its queries answer 410 once the read check passes (§8.5).
-			refuse(&purgedNS{ns: ns, head: head})
+			if pn == nil {
+				pn = &purgedNS{ns: ns, head: head}
+			}
 			continue
 		}
 		exp := ix.opt.EdgeGrants.Lifetime(now, grantExp(v))
@@ -738,11 +754,11 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			}
 		}
 	}
-	if p, ok := refused.(*purgedNS); ok {
-		return nil, p, nil
-	}
-	if refused != nil {
-		return nil, nil, refused
+	switch {
+	case upErr != nil:
+		return nil, nil, upErr
+	case pn != nil:
+		return nil, pn, nil
 	}
 	if len(markers) > 0 {
 		gs := grantcheck.SubjectSetID(markers)
@@ -750,30 +766,16 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		ex.issues = append(ex.issues, svcedge.Issue{Prefix: refsPrefix(gs), Exp: refsExp})
 		ex.subjects[gs] = markers
 	}
-	if len(ex.issues) == 0 {
-		return nil, nil, &grant.AuthError{Status: 403, Msg: "the grant reads no private namespace this service follows"}
+	switch {
+	case len(ex.issues) > 0:
+		return ex, nil, nil
+	case denied != nil:
+		return nil, nil, denied
 	}
-	return ex, nil, nil
+	return nil, nil, &grant.AuthError{Status: 403, Msg: "the grant reads no private namespace this service follows"}
 }
 
 func (p *purgedNS) Error() string { return p.ns + " was purged" }
-
-// refusalRank orders an exchange's refusals (§C.5.2, All or nothing): 401,
-// then 403, then any other (a namespace document the service can't read,
-// 502), and a purged namespace last, answered only when every refusal is.
-func refusalRank(err error) int {
-	var ae *grant.AuthError
-	var pn *purgedNS
-	switch {
-	case errors.As(err, &ae) && ae.Status == http.StatusUnauthorized:
-		return 0
-	case errors.As(err, &ae):
-		return 1
-	case errors.As(err, &pn):
-		return 3
-	}
-	return 2
-}
 
 // namedInOrder is those of followed that g names, in the order g's root
 // block lists them (§C.5.2); one it reaches only through "*" comes where
