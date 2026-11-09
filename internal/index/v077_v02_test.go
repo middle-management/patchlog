@@ -14,6 +14,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
@@ -573,5 +574,58 @@ func TestV077RefsPurgeBeforeServe(t *testing.T) {
 	}
 	if r = w.x.follow(at, li); r.status != 200 || refsAllHits(r.body) != "matches/shared" {
 		t.Errorf("after the purge: %d %v", r.status, r.body)
+	}
+}
+
+// TestV077EpochJudgedOnce (ENC-5; §E.2.6 Per-entry sealing: kid "naming
+// the epoch the revision it derives from is served under (§E.2.2), at E3
+// the one a prune's snapshot of that revision would carry (§E.3.1),
+// judged once, when the service first seals a value derived from it"): in
+// e-b, an e2e branch of the e2e namespace e, r's head is e's op read
+// through, whose kid names no epoch of e-b (pending). The first answer
+// that seals it judges it under e-b's epoch then; after e-b rotates and
+// moves on, a new answer still seals r under that epoch, beside s,
+// written after the rotation, under the new one. Before v0.77 r took the
+// epoch current at each answer.
+func TestV077EpochJudgedOnce(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	admin := clienttest.NewKey("admin")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "e"))).CreateNamespace(ctx, "e", map[string]any{"read": "public", "keys": []any{admin.Entry("*")},
+		"encryption": map[string]any{"level": "e2e"}}))
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "schemas"))).CreateNamespace(ctx, "schemas", map[string]any{"read": "public", "keys": []any{admin.Entry("*")}}))
+	adminJWK, adminPriv, _ := seal.GenerateRecipient()
+	idxJWK, idxPriv, _ := seal.GenerateRecipient()
+	nss := []string{"e", "e-b", "schemas"}
+	ac := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:admin", nss, []string{"read", "create", "append", "config", "branch"}, map[string]any{"enc": adminJWK})))
+	ad := ac.E2E(adminPriv)
+	sch := must(ac.CreateDoc(ctx, "schemas", "item", pageSchemaWith(map[string]any{"title": map[string]any{"type": "string", "x-index": "text"}})))
+	ref := "/r/schemas/item/rev/" + sch.ID
+	must(ad.InitKeyring(ctx, "e", idxPriv.PublicKey()))
+	must(ad.CreateDocSealed(ctx, "e", "r", map[string]any{"$schema": ref, "title": "zq r", "related": []any{"/r/target/x"}}))
+	must(ac.CreateBranch(ctx, "e", client.BranchRequest{Name: "e-b"}))
+	must(ad.InitKeyring(ctx, "e-b", idxPriv.PublicKey()))
+	ic := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", nss, []string{"read"}, map[string]any{"enc": idxJWK})),
+		client.WithKeyringSenders(adminPriv.PublicKey()))
+	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"e"}, branches: true, untyped: true, now: s.Now},
+		func(o *indexOpts) { o.Recipient = idxPriv })
+	x.caughtUp("e")
+	x.caughtUp("e-b")
+	// Judged first by a /_refs answer, read back by every later one.
+	refs := "/_refs?to=" + url.QueryEscape("/r/target/x")
+	before := p37Kids(t, x.fetch(refs, "").body)["e-b/r"]
+	if before != "e-b#1" {
+		t.Fatalf("e-b/r's kid before the rotation: %q", before)
+	}
+	e := must(ad.RotateEpoch(ctx, "e-b", idxPriv.PublicKey()))
+	must(ad.CreateDocSealed(ctx, "e-b", "s", map[string]any{"$schema": ref, "title": "zq s"}))
+	x.caughtUp("e-b")
+	after := p37Kids(t, x.fetch("/e-b?q=zq", "").body)
+	if after["r"] != before || after["s"] != fmt.Sprintf("e-b#%d", e) {
+		t.Errorf("kids after e-b rotated to %d: %v, want r still under %s", e, after, before)
+	}
+	if got := p37Kids(t, x.fetch(refs, "").body)["e-b/r"]; got != before {
+		t.Errorf("/_refs: e-b/r under %s after the rotation, want %s", got, before)
 	}
 }

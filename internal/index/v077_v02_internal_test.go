@@ -2,10 +2,12 @@ package index
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -109,5 +111,54 @@ func TestV077MemberBehindNamesNone(t *testing.T) {
 	}
 	if len(logged) != 1 || !strings.Contains(logged[0], "cat-season") {
 		t.Errorf("the log %q doesn't name cat-season", logged)
+	}
+}
+
+// TestV077JudgeEpochs (ENC-5; §E.2.6: the epoch of a revision a hit
+// derives from is "judged once, when the service first seals a value
+// derived from it"): a pending docs.epoch is judged by the first answer,
+// and a later one under another epoch reads that back; a row that holds
+// another head now isn't judged; rewriting the row with the same head and
+// a pending epoch (an apply again) keeps the judgement, and a new head
+// is pending again.
+func TestV077JudgeEpochs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ix := openBare(t, filepath.Join(t.TempDir(), "i.db"))
+	res := must(ix.db.Exec(`INSERT INTO docs (ns, resource, head, schema, epoch) VALUES ('n', 'r', 'h1', NULL, NULL)`))
+	id := must(res.LastInsertId())
+	if got := must(ix.judgeEpochs(ctx, []docHead{{id, "h1"}}, 5)); got[id] != 5 {
+		t.Fatalf("first judgement: %v", got)
+	}
+	if got := must(ix.judgeEpochs(ctx, []docHead{{id, "h1"}}, 6)); got[id] != 5 {
+		t.Errorf("second judgement: %v, want the first's 5", got)
+	}
+	if got := must(ix.judgeEpochs(ctx, []docHead{{id, "h0"}}, 6)); len(got) != 0 {
+		t.Errorf("a head the row no longer holds: %v", got)
+	}
+	epoch := func() int {
+		var e sql.NullInt64
+		if err := ix.db.QueryRow(`SELECT epoch FROM docs WHERE docid = ?`, id).Scan(&e); err != nil {
+			t.Fatal(err)
+		}
+		return int(e.Int64)
+	}
+	write := func(head string) {
+		tx := must(ix.db.Begin())
+		defer tx.Rollback()
+		if err := ix.write(ctx, tx, "n", prepared{resource: "r", head: head, typed: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("h1")
+	if e := epoch(); e != 5 {
+		t.Errorf("after the same head is written again: epoch %d, want 5", e)
+	}
+	write("h2")
+	if e := epoch(); e != 0 {
+		t.Errorf("after a new head: epoch %d, want pending", e)
 	}
 }

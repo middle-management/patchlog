@@ -924,9 +924,10 @@ func lacksKey(ctx context.Context, err error) bool {
 // sealed one), and returns the result kept with the checkpoint it is at.
 //
 // Each sealed value is sealed under the epoch the revision it derives
-// from is served under (§E.2.6; derived.EpochOf, docs.epoch), the epoch
-// current now where that isn't known: a hit under that epoch's K_r of its
-// resource. A result is sealed whole only when its source isn't public,
+// from is served under (§E.2.6; derived.EpochOf, docs.epoch), and where
+// that is pending, the epoch judged once, by the first answer that seals
+// a value derived from it (judgeEpochs: the one current then): a hit
+// under that epoch's K_r of its resource. A result is sealed whole only when its source isn't public,
 // every reader its URL admits reads it whole, under reads:{ns}, and every
 // value derives from revisions served under one epoch, under that
 // epoch's K_e (§E.2.6 Whole-response sealing); otherwise it is sealed per
@@ -999,6 +1000,14 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 			return derived.Stored{}, "", fmt.Errorf("%w: %w", errVisibility, err)
 		}
 		if res, at, err = ix.query(ctx, ns, q, a.allow); err != nil {
+			return derived.Stored{}, "", err
+		}
+	}
+	// A revision whose epoch is pending is judged now, as this answer
+	// seals values derived from it, unless an earlier answer did (§E.2.6,
+	// judgeEpochs).
+	if info.Protected() {
+		if err := ix.judgeResult(ctx, res, info.Epoch); err != nil {
 			return derived.Stored{}, "", err
 		}
 	}

@@ -919,6 +919,26 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 			return derived.Stored{}, "", false, errRefsKeys
 		}
 		protected[ns] = info.Protected()
+		if !info.Protected() {
+			continue
+		}
+		// Pending epochs are judged once, as an answer first seals a
+		// value derived from them (§E.2.6, judgeEpochs).
+		var docs []docHead
+		for i, h := range hits {
+			if hitNS[i] == ns && h.epoch == 0 {
+				docs = append(docs, docHead{docid: h.docid, head: h.ID})
+			}
+		}
+		judged, err := ix.judgeEpochs(ctx, docs, info.Epoch)
+		if err != nil {
+			return derived.Stored{}, "", false, err
+		}
+		for i, h := range hits {
+			if e, ok := judged[h.docid]; ok && hitNS[i] == ns && h.epoch == 0 {
+				hits[i].epoch = e
+			}
+		}
 	}
 	// An epoch whose key the service's grant gets none of, for good (a 4xx
 	// from /keys, no key for it, one it can't unwrap: lacksKey),

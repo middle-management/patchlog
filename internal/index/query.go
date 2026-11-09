@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"slices"
 	"sort"
@@ -447,6 +449,16 @@ type Result struct {
 	// values come from: the page's hits, and with counts every hit
 	// counted (§E.2.6 whole-response sealing).
 	Epochs []int
+	// pending are, with Epochs, the counted documents whose epoch is
+	// pending (0), with their heads, which an answer sealing them judges
+	// (judgeEpochs); the page's own are its hits with epoch 0.
+	pending []docHead
+}
+
+// docHead is a document's row and the head it holds.
+type docHead struct {
+	docid int64
+	head  string
 }
 
 // filter is the ?ref= filter, a ?facet= path or a range: a condition on
@@ -911,17 +923,21 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 	}
 	if len(q.Counts) > 0 {
 		ids, _ := json.Marshal(allIDs)
-		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT coalesce(d.epoch, 0) FROM json_each(?) j CROSS JOIN docs d WHERE d.docid = j.value`, string(ids))
+		rows, err := tx.QueryContext(ctx, `SELECT d.docid, d.head, coalesce(d.epoch, 0) FROM json_each(?) j CROSS JOIN docs d WHERE d.docid = j.value`, string(ids))
 		if err != nil {
 			return nil, err
 		}
 		for rows.Next() {
 			var e int
-			if err := rows.Scan(&e); err != nil {
+			var d docHead
+			if err := rows.Scan(&d.docid, &d.head, &e); err != nil {
 				rows.Close()
 				return nil, err
 			}
 			epochs[e] = true
+			if e == 0 {
+				res.pending = append(res.pending, d)
+			}
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -936,7 +952,7 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 }
 
 // attachEpochs gives each hit the epoch its document's head is served
-// under (docs.epoch).
+// under (docs.epoch), 0 while pending (judgeEpochs).
 func attachEpochs(ctx context.Context, tx *sql.Tx, hits []Hit) error {
 	if len(hits) == 0 {
 		return nil
@@ -964,6 +980,80 @@ func attachEpochs(ctx context.Context, tx *sql.Tx, hits []Hit) error {
 		}
 	}
 	return rows.Err()
+}
+
+// judgeEpochs judges, once, the epoch of each of docs, documents of a
+// sealed or e2e namespace whose head's epoch is pending (docs.epoch 0: a
+// revision whose kid names no epoch of the namespace, such as a base's op
+// a branch reads through, whose snapshot rule falls to the epoch in
+// force, §E.3.1), as the service first seals a value derived from it
+// (§E.2.6: "judged once, when the service first seals a value derived
+// from it"): current, the epoch in force now, is written to docs.epoch
+// for that head unless another answer judged it first, whose epoch then
+// stands; every later answer reads it back. A document whose row holds
+// another head now is left out (its revision is no longer the row's,
+// and is sealed under current, unjudged). It returns the epoch judged
+// for each document it judged.
+func (ix *Index) judgeEpochs(ctx context.Context, docs []docHead, current int) (map[int64]int, error) {
+	out := map[int64]int{}
+	if len(docs) == 0 || current < 1 {
+		return out, nil
+	}
+	tx, err := ix.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	for _, d := range docs {
+		if _, err := tx.ExecContext(ctx, `UPDATE docs SET epoch = ? WHERE docid = ? AND head = ? AND coalesce(epoch, 0) = 0`, current, d.docid, d.head); err != nil {
+			return nil, err
+		}
+		var e int
+		switch err := tx.QueryRowContext(ctx, `SELECT coalesce(epoch, 0) FROM docs WHERE docid = ? AND head = ?`, d.docid, d.head).Scan(&e); {
+		case errors.Is(err, sql.ErrNoRows):
+			continue
+		case err != nil:
+			return nil, err
+		}
+		out[d.docid] = e
+	}
+	return out, tx.Commit()
+}
+
+// judgeResult judges the pending epochs of res's hits and counted
+// documents (judgeEpochs) under current, and gives the hits and Epochs
+// what was judged.
+func (ix *Index) judgeResult(ctx context.Context, res *Result, current int) error {
+	docs := slices.Clone(res.pending)
+	for _, h := range res.Hits {
+		if h.epoch == 0 {
+			docs = append(docs, docHead{docid: h.docid, head: h.ID})
+		}
+	}
+	if len(docs) == 0 {
+		return nil
+	}
+	judged, err := ix.judgeEpochs(ctx, docs, current)
+	if err != nil {
+		return err
+	}
+	epochs := map[int]bool{}
+	for _, e := range res.Epochs {
+		if e != 0 {
+			epochs[e] = true
+		}
+	}
+	for i, h := range res.Hits {
+		if e, ok := judged[h.docid]; ok && h.epoch == 0 {
+			res.Hits[i].epoch = e
+		}
+		epochs[res.Hits[i].epoch] = true
+	}
+	for _, d := range res.pending {
+		epochs[judged[d.docid]] = true // 0 if it wasn't judged
+	}
+	res.Epochs = slices.Sorted(maps.Keys(epochs))
+	return nil
 }
 
 // FieldError is a path of a query that no schema indexed in the namespace
