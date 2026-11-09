@@ -160,6 +160,8 @@ type pendingRow struct {
 	shadow       int64
 	ns, name     string
 	revSeq       int64
+	parent       string // the mirrored revision's parent's id, "" for genesis
+	parentKnown  bool
 	s            pendingSealing
 	kr           []byte
 	jwe          string // fetched: an entry's or document's sealing
@@ -172,7 +174,8 @@ type pendingRow struct {
 // retryPreSealings asks A again, at each sync of remote branch b
 // (followRemote), for each pre-raise sealing a shadow of b lacks that A
 // hasn't answered 410 pruned for: a resource's log entries from its log
-// up to the latest pending one, documents at /rev/{id} and blobs at their
+// up to the latest pending one (fetchPreEntries: an entry is pruned only
+// where its own range is 410 pruned), documents at /rev/{id} and blobs at their
 // epoch URLs, with the endpoint's grant. Each that opens, under the key of
 // its epoch the shadow holds, to the mirrored content is stored, the first
 // stored winning, and its row deleted; otherwise A's answer is recorded,
@@ -214,15 +217,16 @@ func (e *Engine) retryPreSealings(ctx context.Context, ep RemoteEndpoint, baseUR
 				last = r
 			}
 		}
-		path := "/r/" + last.ns + "/" + last.name + "/rev/" + last.s.ref + "/log"
-		got, ans, hz := fetchSealedLog(ctx, ep, baseURL, path)
+		entries := make([]preEntry, len(rs))
+		for i, r := range rs {
+			entries[i] = preEntry{id: r.s.ref, parent: r.parent, parentKnown: r.parentKnown}
+		}
+		got, answers := fetchPreEntries(ctx, ep, baseURL, "/r/"+last.ns+"/"+last.name, last.s.ref, entries)
 		for _, r := range rs {
 			if jwe, ok := got[r.s.ref]; ok {
 				r.jwe, r.fetchedOK = jwe, true
-			} else if ans != "" {
-				r.fetchAnswer, r.fetchHorizon = ans, hz
 			} else {
-				r.fetchAnswer = pendRefused
+				r.fetchAnswer, r.fetchHorizon = answers[r.s.ref][0], answers[r.s.ref][1]
 			}
 		}
 	}
@@ -276,8 +280,10 @@ func (t *tx) pendingRows(sh *nsRow, dropped *[][2]any) []*pendingRow {
 	if sh.purged {
 		return nil
 	}
-	q, err := t.Query(`SELECT p.name, p.kind, p.ref, p.epoch, p.rev_seq, p.kid, p.pl, p.want, p.answer, COALESCE(r.state, ?)
+	q, err := t.Query(`SELECT p.name, p.kind, p.ref, p.epoch, p.rev_seq, p.kid, p.pl, p.want, p.answer, COALESCE(r.state, ?),
+			rv.seq IS NOT NULL AND (rv.parent_seq IS NULL OR pv.seq IS NOT NULL), pv.id
 		FROM remote_pending_sealings p LEFT JOIN resources r ON r.ns = p.shadow AND r.name = p.name
+		LEFT JOIN revisions rv ON rv.seq = p.rev_seq LEFT JOIN revisions pv ON pv.seq = rv.parent_seq
 		WHERE p.shadow = ? AND p.answer <> ? ORDER BY p.name, p.rev_seq, p.kind, p.ref, p.epoch`, statePurged, sh.id, pendPruned)
 	t.must(err)
 	var out []*pendingRow
@@ -285,9 +291,12 @@ func (t *tx) pendingRows(sh *nsRow, dropped *[][2]any) []*pendingRow {
 	for q.Next() {
 		r := &pendingRow{shadow: sh.id}
 		var pl string
-		var want []byte
+		var want, parent []byte
 		var state int
-		t.must(q.Scan(&r.name, &r.s.kind, &r.s.ref, &r.s.epoch, &r.revSeq, &r.s.kid, &pl, &want, &r.s.answer, &state))
+		t.must(q.Scan(&r.name, &r.s.kind, &r.s.ref, &r.s.epoch, &r.revSeq, &r.s.kid, &pl, &want, &r.s.answer, &state, &r.parentKnown, &parent))
+		if parent != nil {
+			r.parent = ids.FromBytes(parent).String()
+		}
 		if state == statePurged {
 			if !seenDrop[r.name] {
 				seenDrop[r.name] = true
@@ -368,12 +377,13 @@ func (t *tx) settlePending(r *pendingRow) {
 }
 
 // fetchSealedLog reads the log of a resource at path, …/rev/{id}/log, as
-// A serves it sealed, every page (§7.1 Paging), and returns each entry's
-// JWE by id; or, where a page isn't a 200 array, A's answer (pendingAnswer)
-// with the entries of the pages before.
-func fetchSealedLog(ctx context.Context, ep RemoteEndpoint, baseURL, path string) (map[string]string, string, string) {
+// A serves it sealed, after from ("" for genesis), every page (§7.1
+// Paging), and returns each entry's JWE by id; or, where a page isn't a
+// 200 array, A's answer (pendingAnswer) with the entries of the pages
+// before.
+func fetchSealedLog(ctx context.Context, ep RemoteEndpoint, baseURL, path, from string) (map[string]string, string, string) {
 	out := map[string]string{}
-	for since := ""; ; {
+	for since := from; ; {
 		var q url.Values
 		if since != "" {
 			q = url.Values{"since": {since}}
@@ -404,6 +414,55 @@ func fetchSealedLog(ctx context.Context, ep RemoteEndpoint, baseURL, path string
 		}
 		since = next
 	}
+}
+
+// preEntry is a log entry from before its source's raise whose sealing B
+// asks A for (fetchPreEntries): its id, and its parent's, "" for genesis,
+// where parentKnown.
+type preEntry struct {
+	id, parent  string
+	parentKnown bool
+}
+
+// fetchPreEntries fetches A's sealings of entries, log entries from before
+// its raise of resource what (/r/{ns}/{name}), from its log up to last,
+// …/rev/{last}/log, every page (fetchSealedLog). It returns the sealings
+// it got, by id, and for each entry it didn't get A's answer for it and
+// the horizon A named. A range is 410 pruned where any revision in it has
+// its patch set pruned (§7.1), which says nothing of a later entry in it,
+// so an entry the range is 410 pruned for is asked for again in a range of
+// its own, …/rev/{id}/log?since={parent} (since may lie below the
+// horizon), and is pruned only if A answers that 410 pruned too: §G.5.2
+// answers 410 only "where A has pruned it". One whose parent isn't known
+// isn't asked again, and is refused, which isn't final.
+func fetchPreEntries(ctx context.Context, ep RemoteEndpoint, baseURL, what, last string, entries []preEntry) (map[string]string, map[string][2]string) {
+	got, ans, hz := fetchSealedLog(ctx, ep, baseURL, what+"/rev/"+last+"/log", "")
+	if ans == "" {
+		ans = pendRefused // served, but without the entry
+	}
+	answers := map[string][2]string{}
+	for _, e := range entries {
+		if _, ok := got[e.id]; ok {
+			continue
+		}
+		switch {
+		case ans != pendPruned:
+			answers[e.id] = [2]string{ans, hz}
+		case !e.parentKnown:
+			answers[e.id] = [2]string{pendRefused, ""}
+		default:
+			one, a, h := fetchSealedLog(ctx, ep, baseURL, what+"/rev/"+e.id+"/log", e.parent)
+			if jwe, ok := one[e.id]; ok {
+				got[e.id] = jwe
+				continue
+			}
+			if a == "" {
+				a = pendRefused
+			}
+			answers[e.id] = [2]string{a, h}
+		}
+	}
+	return got, answers
 }
 
 // logPending logs what creation left pending for resource what.

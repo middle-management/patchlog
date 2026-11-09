@@ -336,13 +336,19 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 		pending: map[string][]pendingSealing{}, blobAnswers: map[ids.ID]map[int][2]string{}, blobWant: map[ids.ID][32]byte{}}
 	// The log entries, from pages entirely from before the raise (§7.1
 	// Paging): each a JWE. Where a page isn't served, the entries not had
-	// stay pending with A's answer.
-	got, logAnswer, logHorizon := fetchSealedLog(ctx, ep, baseURL, what+"/rev/"+ch.entries[last].ID+"/log")
-	if logAnswer == pendUnverified {
-		return unverified("%s: a log page that isn't an array", what+"/rev/"+ch.entries[last].ID+"/log")
+	// stay pending with A's answer, pruned only where A answers an entry's
+	// own range so (fetchPreEntries).
+	var entries []preEntry
+	for i := 0; i <= last; i++ {
+		if ch.entries[i].Kid != "" {
+			entries = append(entries, preEntry{id: ch.entries[i].ID, parent: ch.entries[i].Parent, parentKnown: true})
+		}
 	}
-	if logAnswer == "" {
-		logAnswer = pendRefused // served, but without the entry
+	got, answers := fetchPreEntries(ctx, ep, baseURL, what, ch.entries[last].ID, entries)
+	for _, a := range answers {
+		if a[0] == pendUnverified {
+			return unverified("%s: a log page that isn't an array", what+"/rev/"+ch.entries[last].ID+"/log")
+		}
 	}
 	docs := map[int]any{}
 	if err := ch.fold(func(i int, e client.LogEntry, doc any) error {
@@ -373,7 +379,7 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			ps.entries[e.ID] = jwe
 		} else {
 			ps.pending[e.ID] = append(ps.pending[e.ID], pendingSealing{kind: sealEntry, ref: e.ID, epoch: epoch, kid: e.Kid, pl: pl, want: want,
-				answer: logAnswer, horizon: logHorizon})
+				answer: answers[e.ID][0], horizon: answers[e.ID][1]})
 		}
 		if e.Kind != "rev" {
 			continue

@@ -216,3 +216,135 @@ func TestV077EncPreRaiseSealingsAfterCreation(t *testing.T) {
 		t.Fatalf("y's document: %d %.120s, want A's bytes", rb.Code, rb.Body)
 	}
 }
+
+// v077PrunedW is A, with namespace m sealed and w's entries w1 and w2
+// written before its raise to e2e, behind a proxy that answers the ranges
+// of w's log from genesis, from the from-th such request on, with status
+// (0: as A does): 403, or 410 pruned with horizon w2, as A would once it
+// pruned w1's patch set (§7.1). Every other request, a range since w1
+// included, goes to A, which serves it.
+type v077PrunedW struct {
+	a                  *tenv
+	kA                 keyPair
+	root               func() string
+	w1, w2, raised     string
+	proxy              *httptest.Server
+	mu                 sync.Mutex
+	status, from, seen int
+}
+
+func newV077PrunedW(t *testing.T) *v077PrunedW {
+	t.Helper()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+	a.opPriv = aPriv
+	x := &v077PrunedW{a: a, kA: newKey("admin")}
+	a.mkNS("m", sealedDoc(map[string]any{"read": "grant", "keys": []any{x.kA.entry("*")}}))
+	x.root = func() string { return a.grant(x.kA, "user:root", []string{"m"}, allVerbs) }
+	x.w1 = a.wr("m", "w", "", withNonce(addRoot(map[string]any{"v": 1.0})), x.root())
+	x.w2 = a.wr("m", "w", x.w1, withNonce([]any{op("replace", "/v", 2.0)}), x.root())
+	a.clock.Advance(time.Hour)
+	expect(t, a.patchNS("m", ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 2.0})), x.root()), 201)
+	x.raised = a.nsHead("m", x.root())
+	target, _ := url.Parse(a.srv.URL)
+	rp := httputil.NewSingleHostReverseProxy(target)
+	x.proxy = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && (r.URL.Path == "/r/m/w/rev/"+x.w1+"/log" || r.URL.Path == "/r/m/w/rev/"+x.w2+"/log") &&
+			r.URL.Query().Get("since") == "" {
+			x.mu.Lock()
+			x.seen++
+			st := x.status
+			if x.seen < x.from {
+				st = 0
+			}
+			x.mu.Unlock()
+			body := v077Forbidden
+			if st == http.StatusGone {
+				body = `{"code":"pruned","horizon":"` + x.w2 + `","message":"pruned"}`
+			}
+			if st != 0 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(st)
+				w.Write([]byte(body))
+				return
+			}
+		}
+		rp.ServeHTTP(w, r)
+	}))
+	t.Cleanup(x.proxy.Close)
+	return x
+}
+
+// answer sets the proxy's answer for w's ranges from genesis.
+func (x *v077PrunedW) answer(status, from int) {
+	x.mu.Lock()
+	x.status, x.from, x.seen = status, from, 0
+	x.mu.Unlock()
+}
+
+// b is B, created from A through the proxy, and a reader's grant there.
+func (x *v077PrunedW) b(t *testing.T) (*tenv, string) {
+	t.Helper()
+	bJWK, bID, _ := seal.GenerateRecipient()
+	var mu sync.Mutex
+	id := bID
+	rt := &route{url: x.proxy.URL, bearer: x.a.grant(x.kA, "svc:b", []string{"m"}, []string{"read", "export"},
+		map[string]any{"enc": bJWK, "nbf": t0.Add(-time.Hour).Format(time.RFC3339)})}
+	var bPriv ed25519.PrivateKey
+	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt, withRemoteIdentity(&mu, &id)), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+	b.opPriv = bPriv
+	b.clock.Advance(3 * time.Hour)
+	kB := newKey("badmin")
+	expect(t, b.mkRemote("r", remoteGenesis("m", x.raised, e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}}))), 201)
+	return b, b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+}
+
+// check is B's answers once A has pruned w1 alone: w2's own range is A's
+// bytes, and w1's 410 pruned with A's horizon.
+func (x *v077PrunedW) check(t *testing.T, b *tenv, g string) {
+	t.Helper()
+	w2Only := "/rev/" + x.w2 + "/log?since=" + x.w1
+	ra, rb := x.a.get("/r/m/w"+w2Only, x.root()), b.get("/r/r/w"+w2Only, g)
+	expect(t, ra, 200)
+	if rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {
+		t.Fatalf("w2's own range on B: %d %.200s, want A's bytes, which A still serves", rb.Code, rb.Body)
+	}
+	res := b.get("/r/r/w/rev/"+x.w1+"/log", g)
+	expectCode(t, res, 410, "pruned")
+	if res.Str("horizon") != x.w2 {
+		t.Fatalf("w1's range on B: %s, want A's horizon %s", res.Body, x.w2)
+	}
+}
+
+// §G.5.2 E3 sources ("410 where A has pruned it"), §7.1: once A has pruned
+// w1's patch set, its log of w from genesis is 410 pruned, though its
+// range since w1 still serves w2's entry. A sync asks for each entry that
+// 410 leaves pending again, in a range of its own: w1's is 410, so w1 is
+// pruned on B for good; w2's is served, so B stores A's sealing of it once
+// it has opened and verified it. Before, the whole range's 410 marked w2
+// pruned too, and B answered w2's own range 410 though A served it.
+func TestV077EncPreRaisePrunedRangeAfterCreation(t *testing.T) {
+	t.Parallel()
+	x := newV077PrunedW(t)
+	// Creation reads w's log from genesis twice, to mirror its chain and
+	// for A's sealings; the second is refused, so both entries are pending.
+	x.answer(http.StatusForbidden, 2)
+	b, g := x.b(t)
+	expectCode(t, b.get("/r/r/w/rev/"+x.w2+"/log?since="+x.w1, g), 502, "upstream")
+	x.answer(http.StatusGone, 1)
+	if err := b.e.SyncRemotes(context.Background()); err != nil {
+		t.Logf("sync: %v", err)
+	}
+	x.check(t, b, g)
+}
+
+// The same at creation (§G.3 Creating one, §G.5.2): A's log of w from
+// genesis is 410 pruned when B asks for A's sealings; w2's own range is
+// served, so B stores its sealing at once, and only w1 is pruned.
+func TestV077EncPreRaisePrunedRangeAtCreation(t *testing.T) {
+	t.Parallel()
+	x := newV077PrunedW(t)
+	x.answer(http.StatusGone, 2)
+	b, g := x.b(t)
+	x.check(t, b, g)
+}
