@@ -15,24 +15,53 @@ import (
 
 // fcp is a filtered answer's combined checkpoint (§B.11.9 URLs, §B.5): at
 // is grantcheck.CombinedAt over ids, the ns_id text of each member, and
-// seqs the members' ns_log seqs. The members are
+// seqs the members' ns_log seqs. Each namespace is listed once, a
+// namespace read at its head at its head (§B.11.9 URLs, "one ns_id per
+// namespace as in §A.4 Answers"). The members are
 //
 //   - {ns} at its head (a purged {ns} stays, at its purge-ns entry);
-//   - for a branch, each base at its baseAt: its documents, document,
-//     roles and keys are read as of that seq;
 //   - each trusted, non-e2e, unpurged catalog at its head (for catalog
 //     kind, {ns} itself);
 //   - each local, unpurged member of those catalogs' catalog.trust at its
-//     head, whose roles and keys visibility reads.
+//     head, whose roles and keys visibility reads, a branch's root among
+//     them, which coverage reads at its head too (fsHeadTrusts);
+//   - for a branch, each base not already listed, at its baseAt.
 //
-// Taking more members is safe and fewer is a leak. cats are the catalogs
-// that decide visibility at the checkpoint, read from root's document as
-// of its seq here (non-e2e, all members).
+// Where visibility reads a base is never taken from seqs: bases holds,
+// for a branch, each base's baseAt (fs.chain), at which its documents
+// and, for the root, its document, trust, roles and keys are read
+// (readSeq). Taking more members is safe and fewer is a leak. cats are
+// the catalogs that decide visibility at the checkpoint, read from root's
+// document as of its read seq (non-e2e, all members).
 type fcp struct {
-	at   string
-	seqs map[string]int64
-	ids  map[string]string
-	cats []fsCat
+	at    string
+	seqs  map[string]int64
+	ids   map[string]string
+	bases map[string]int64
+	cats  []fsCat
+}
+
+// readSeq is the ns_log seq at which visibility reads member ns: a
+// branch's base at its baseAt, whatever seq lists it, and any other
+// member at the seq that lists it (§B.11.9 Branches, URLs).
+func (cp *fcp) readSeq(ns string) int64 {
+	if seq, ok := cp.bases[ns]; ok {
+		return seq
+	}
+	return cp.seqs[ns]
+}
+
+// fcpBases are fs's bases, each at the seq its branch reads it at
+// (fs.chain), nil for a namespace that isn't a branch.
+func fcpBases(fs *fscope) map[string]int64 {
+	if len(fs.chain) == 0 {
+		return nil
+	}
+	out := make(map[string]int64, len(fs.chain))
+	for _, b := range fs.chain {
+		out[b.n.name] = b.at
+	}
+	return out
 }
 
 // nsID is ns's ns_id text in cp ("" if it isn't a member), which answers
@@ -55,7 +84,7 @@ func (cp *fcp) others(ns string) []string {
 // filteredCurrent is fs's checkpoint now, in the read snapshot. It isn't
 // recorded: a URL naming its at needs recordFilteredAt first (§B.11.9 at).
 func (t *tx) filteredCurrent(fs *fscope) *fcp {
-	cp := &fcp{seqs: map[string]int64{}, ids: map[string]string{}}
+	cp := &fcp{seqs: map[string]int64{}, ids: map[string]string{}, bases: fcpBases(fs)}
 	add := func(m *nsRow, seq int64) {
 		if _, ok := cp.seqs[m.name]; ok {
 			return
@@ -63,9 +92,6 @@ func (t *tx) filteredCurrent(fs *fscope) *fcp {
 		cp.seqs[m.name], cp.ids[m.name] = seq, t.nsLogID(seq).String()
 	}
 	add(fs.n, fs.n.headSeq.Int64)
-	for _, b := range fs.chain {
-		add(b.n, b.at)
-	}
 	for _, c := range fs.cats {
 		if c.e2e || c.n.purged {
 			continue
@@ -78,17 +104,25 @@ func (t *tx) filteredCurrent(fs *fscope) *fcp {
 			}
 		}
 	}
+	// A base read only as a base is listed at its baseAt; one read at its
+	// head too, as a catalog.trust member, is listed there (above).
+	for _, b := range fs.chain {
+		add(b.n, b.at)
+	}
 	cp.at = grantcheck.CombinedAt(cp.ids)
 	return cp
 }
 
 // filteredAt is fs's checkpoint named at: the current one, or one
 // recorded in filtered_ats whose members all still exist, are unpurged
-// ({ns} excepted) and have the recorded ns_id in their chains, a branch's
-// bases at the baseAt the branch fixes, and whose deciding catalogs are
-// all members. The answer at it is recomputed from history, which for an
-// append-only log is as if stored (§B.11.9 at). ok is false otherwise:
-// the caller answers 302 to the current at.
+// ({ns} excepted) and have the recorded ns_id in their chains, whose
+// deciding catalogs are all members, and that lists each of a branch's
+// bases, at the baseAt the branch fixes unless it is a catalog.trust
+// member of a deciding catalog there (filteredCurrent's layout). The
+// bases are read at their baseAt whatever lists them (readSeq). The
+// answer at it is recomputed from history, which for an append-only log
+// is as if stored (§B.11.9 at). ok is false otherwise, an at recorded in
+// another layout included: the caller answers 302 to the current at.
 func (t *tx) filteredAt(fs *fscope, at string) (*fcp, bool) {
 	cur := t.filteredCurrent(fs)
 	if at == cur.at {
@@ -105,7 +139,7 @@ func (t *tx) filteredAt(fs *fscope, at string) (*fcp, bool) {
 	if err != nil || m == nil {
 		return nil, false
 	}
-	cp := &fcp{seqs: map[string]int64{}, ids: map[string]string{}}
+	cp := &fcp{seqs: map[string]int64{}, ids: map[string]string{}, bases: fcpBases(fs)}
 	rows := map[string]*nsRow{}
 	for name, x := range m {
 		s, _ := x.(string)
@@ -129,22 +163,17 @@ func (t *tx) filteredAt(fs *fscope, at string) (*fcp, bool) {
 	if _, ok := cp.seqs[fs.n.name]; !ok || grantcheck.CombinedAt(cp.ids) != at {
 		return nil, false
 	}
-	for _, b := range fs.chain {
-		if cp.seqs[b.n.name] != b.at {
-			return nil, false
-		}
-	}
 	cp.at = at
 	if fs.kind == fsCatalog {
 		cp.cats = []fsCat{{n: fs.n}}
 		return cp, true
 	}
-	// The catalogs root trusts as of its seq here, with their documents
+	// The catalogs root trusts as of its read seq, with their documents
 	// as of theirs: each must be a member, unless it was e2e then.
-	rootSeq, ok := cp.seqs[fs.root.name]
-	if !ok {
+	if _, ok := cp.seqs[fs.root.name]; !ok {
 		return nil, false
 	}
+	rootSeq := cp.readSeq(fs.root.name)
 	missing := false
 	trusts := catvis.TrustedCatalogs(fs.root.name, t.fconfigAt(rootSeq).Doc, func(cat string) map[string]any {
 		r := rows[cat]
@@ -165,6 +194,20 @@ func (t *tx) filteredAt(fs *fscope, at string) (*fcp, bool) {
 			continue
 		}
 		cp.cats = append(cp.cats, fsCat{n: c, kids: tr.Kids})
+	}
+	// A base is listed at its head where it is a catalog.trust member of
+	// a deciding catalog (as of that catalog's seq here), and otherwise at
+	// the baseAt its branch fixes.
+	members := map[string]bool{}
+	for _, c := range cp.cats {
+		for _, m := range t.fconfigAt(cp.seqs[c.n.name]).CatalogTrust {
+			members[m] = true
+		}
+	}
+	for _, b := range fs.chain {
+		if _, ok := cp.seqs[b.n.name]; !ok || !members[b.n.name] && cp.seqs[b.n.name] != b.at {
+			return nil, false
+		}
 	}
 	return cp, true
 }
@@ -203,7 +246,12 @@ type gsRecord struct {
 	partial  bool
 	// kid, roles (the grant's effective roles that list read), blockRules,
 	// readScope and principal are the inputs of digest (ScopeDigest).
-	kid        string
+	kid string
+	// pub is the pub member of kid's key entry as the grant was verified
+	// against it: a cookie is accepted only while the key with that kid
+	// has the same pub (§B.11.9 gs, §C.4). "" (a row from before it was
+	// kept) never matches.
+	pub        string
 	roles      []string
 	blockRules []any
 	readScope  bool
@@ -228,10 +276,10 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 		roles[i] = s
 	}
 	enc := func(v any) string { return string(jsonv.Canonical(jsonv.FromGo(v))) }
-	q := `INSERT INTO filtered_gs (gs, ns, subjects, partial, kid, roles, block_rules, read_scope, principal, digest, filter, exp)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	q := `INSERT INTO filtered_gs (gs, ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, filter, exp)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (ns, gs) DO UPDATE SET subjects = excluded.subjects, partial = excluded.partial,
-			kid = excluded.kid, roles = excluded.roles, block_rules = excluded.block_rules, read_scope = excluded.read_scope,
+			kid = excluded.kid, pub = excluded.pub, roles = excluded.roles, block_rules = excluded.block_rules, read_scope = excluded.read_scope,
 			principal = excluded.principal, digest = excluded.digest, filter = excluded.filter, exp = `
 	if e.pg {
 		q += `GREATEST(filtered_gs.exp, excluded.exp)`
@@ -242,7 +290,7 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 		if _, err := t.Exec(`DELETE FROM filtered_gs WHERE exp <= ? OR ns IN (SELECT name FROM namespaces WHERE purged <> 0)`, t.now.Unix()); err != nil {
 			return err
 		}
-		_, err := t.Exec(q, r.gs, r.ns, enc(subjects), boolInt(r.partial), r.kid, enc(roles), enc(nonNilRules(r.blockRules)),
+		_, err := t.Exec(q, r.gs, r.ns, enc(subjects), boolInt(r.partial), r.kid, r.pub, enc(roles), enc(nonNilRules(r.blockRules)),
 			boolInt(r.readScope), enc(r.principal), r.digest, r.filter, r.exp)
 		return err
 	})
@@ -270,8 +318,8 @@ func (t *tx) loadGS(ns, gs string) *gsRecord {
 	r := &gsRecord{gs: gs}
 	var subjects, roles, blockRules, principal string
 	var partial, readScope int64
-	err := t.QueryRow(`SELECT ns, subjects, partial, kid, roles, block_rules, read_scope, principal, digest, filter, exp FROM filtered_gs WHERE ns = ? AND gs = ?`, ns, gs).
-		Scan(&r.ns, &subjects, &partial, &r.kid, &roles, &blockRules, &readScope, &principal, &r.digest, &r.filter, &r.exp)
+	err := t.QueryRow(`SELECT ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, filter, exp FROM filtered_gs WHERE ns = ? AND gs = ?`, ns, gs).
+		Scan(&r.ns, &subjects, &partial, &r.kid, &r.pub, &roles, &blockRules, &readScope, &principal, &r.digest, &r.filter, &r.exp)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}

@@ -119,7 +119,7 @@ func (s *Server) filteredCurrent(w http.ResponseWriter, r *http.Request, suffix 
 		writeErr(w, err)
 		return
 	}
-	err := s.e.FilteredCurrent(r.Context(), ns, gs, creds(r))
+	err := s.e.FilteredCurrent(r.Context(), ns, gs, suffix, creds(r))
 	if s.writeFilteredRedirect(w, err, suffix, q) {
 		return
 	}

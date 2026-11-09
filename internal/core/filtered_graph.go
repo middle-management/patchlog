@@ -45,7 +45,10 @@ const (
 	filteredContentsMax = 1024
 )
 
-// catalogAt is catalog c's graph and contents as of cp (cp.seqs[c]).
+// catalogAt is catalog c's graph and contents as of cp (cp.seqs[c]), each
+// content member's document as of its read seq: a branch's root as of
+// the branch's baseAt, though listed at its head (cp.readSeq, §B.11.9
+// Branches).
 func (t *tx) catalogAt(c *fsCat, cp *fcp) *catvis.Catalog {
 	cat := c.n
 	seq := cp.seqs[cat.name]
@@ -57,7 +60,11 @@ func (t *tx) catalogAt(c *fsCat, cp *fcp) *catvis.Catalog {
 	for _, m := range members {
 		if _, ok := cp.seqs[m]; ok {
 			inCP = append(inCP, m)
-			key.WriteString("\x00" + m + "\x00" + cp.ids[m])
+			id := cp.ids[m]
+			if _, ok := cp.bases[m]; ok {
+				id = t.nsLogID(cp.readSeq(m)).String()
+			}
+			key.WriteString("\x00" + m + "\x00" + id)
 		}
 	}
 	k := key.String()
@@ -90,7 +97,7 @@ func (t *tx) catalogAt(c *fsCat, cp *fcp) *catvis.Catalog {
 	}
 	contents := map[string]*catvis.Content{}
 	for _, m := range inCP {
-		mcfg := t.fconfigAt(cp.seqs[m])
+		mcfg := t.fconfigAt(cp.readSeq(m))
 		ct := &catvis.Content{NS: m, Cfg: grantCheckConfig(m, mcfg)}
 		for _, tr := range catvis.TrustedCatalogs(m, mcfg.Doc, func(name string) map[string]any {
 			if name == cat.name {

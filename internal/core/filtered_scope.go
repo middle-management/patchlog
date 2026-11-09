@@ -1,7 +1,10 @@
 package core
 
 import (
+	"bytes"
+
 	"github.com/middle-management/patchlog/internal/catvis"
+	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // Filtered namespace reads (§B.11.9), an origin MAY that this one
@@ -11,7 +14,7 @@ import (
 // long-poll and events filtered to what it may see, at URLs under
 // /ns/{ns}/g/{gs}, where gs is its subject set: the deciding subjects of
 // every catalog the namespace trusts, plus scope:{digest} of its read
-// rules (§A.4).
+// rules (§A.4) and a subject binding it to its grant's key (catvis.KeySubject).
 //
 // The files of this feature, each read inside one read transaction:
 //
@@ -77,7 +80,10 @@ type fsCat struct {
 //     catalogs);
 //   - branch kind: a local branch of such a namespace, recursively, itself
 //     neither public nor sealed; the root's trust and keys are read from
-//     its document as of the seq the chain fixes (its baseAt);
+//     its document as of the seq the chain fixes (its baseAt), and the
+//     branch stays covered only while the root, at its head, still trusts
+//     each of those catalogs that isn't e2e through every key counted
+//     there, each entry unchanged (fsHeadTrusts, §B.11.9 Branches, §C.4);
 //   - catalog kind: a catalog, neither public nor sealed, that some local
 //     namespace of its catalog.trust trusts as content kind.
 //
@@ -108,7 +114,7 @@ func (t *tx) filteredScope(n *nsRow) *fscope {
 			return nil
 		}
 		fs.root, fs.cats = root, t.fsTrust(root, rootCfg.Doc)
-		if len(fs.cats) == 0 {
+		if len(fs.cats) == 0 || !t.fsHeadTrusts(root, fs.cats, rootCfg.Doc) {
 			return nil
 		}
 		return fs
@@ -168,6 +174,54 @@ func (t *tx) fsTrust(root *nsRow, doc map[string]any) []fsCat {
 		out = append(out, fsCat{n: c, e2e: t.nsLevel(c) == levelE2E, kids: tr.Kids})
 	}
 	return out
+}
+
+// fsHeadTrusts reports whether root, at its head, still trusts every
+// catalog of cats (read from its document as of a branch's baseAt,
+// baseDoc) that isn't e2e, through every key counted there, each entry
+// unchanged: root's current document names the catalog in catalogs, the
+// catalog's current catalog.trust lists root (fsTrust), and for each kid
+// counted at baseAt the head document has the same key entry, byte for
+// byte under canonical JSON, requireAt included (§B.11.9 Branches: "only
+// while the namespace that trusts the catalog still trusts it, at its
+// head, through every key item 1 counts, each unchanged (§C.4)"). The
+// whole entry is compared, so any edit of a counted key, its pub, scope
+// or roles alike, uncovers the branch; keys added at the head don't
+// count. Item 1 still reads root as of baseAt (fview).
+func (t *tx) fsHeadTrusts(root *nsRow, cats []fsCat, baseDoc map[string]any) bool {
+	headDoc := t.config(root.configSeq).Doc
+	head := map[string]bool{}
+	for _, c := range t.fsTrust(root, headDoc) {
+		for _, kid := range c.kids {
+			head[c.n.name+"\x00"+kid] = true
+		}
+	}
+	for _, c := range cats {
+		if c.e2e {
+			continue
+		}
+		for _, kid := range c.kids {
+			if !head[c.n.name+"\x00"+kid] {
+				return false
+			}
+			b, h := keyEntry(baseDoc, kid), keyEntry(headDoc, kid)
+			if b == nil || h == nil || !bytes.Equal(jsonv.Canonical(b), jsonv.Canonical(h)) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// keyEntry is the entry of doc's keys with kid kid, nil for none.
+func keyEntry(doc map[string]any, kid string) map[string]any {
+	keys, _ := doc["keys"].([]any)
+	for _, k := range keys {
+		if m, _ := k.(map[string]any); m != nil && m["kid"] == kid {
+			return m
+		}
+	}
+	return nil
 }
 
 // fconfigAt is the namespace document in force after the ns_log entry seq.

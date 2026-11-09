@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/lru"
 )
 
@@ -81,7 +80,7 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, gs, since string, limi
 	var info *FilteredInfo
 	var until time.Time
 	err := e.read(ctx, func(t *tx) error {
-		n, fs, err := t.filteredOpen(ns, cred)
+		n, fs, err := t.filteredOpen(ns, fform{live: true, since: since}, cred)
 		if err != nil {
 			return err
 		}
@@ -89,12 +88,8 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, gs, since string, limi
 		if aerr != nil {
 			return aerr
 		}
-		if n.purged && since != "" {
-			if id, err := ids.Parse(since); err == nil {
-				if s, ok := t.nsLogSeq(n.id, id); ok && s == n.headSeq.Int64 {
-					return t.purgedRead(n)
-				}
-			}
+		if t.fromPurgeEntry(n, since) {
+			return t.purgedRead(n)
 		}
 		fv, info, until = v, filteredInfo(n, v), t.admittedUntil(n, cred, v.a)
 		return nil

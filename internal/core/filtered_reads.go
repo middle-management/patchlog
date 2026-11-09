@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"errors"
+
+	"github.com/middle-management/patchlog/internal/ids"
 )
 
 // The read paths of filtered namespace reads (§B.11.9 Answers, URLs): a
@@ -56,11 +58,26 @@ func (t *tx) nsReaderOrRedirect(n *nsRow, cred Credentials) (*actor, error) {
 	return a, nil
 }
 
-// filteredOpen is the covered namespace a filtered URL names, or the
-// answer for one that isn't covered (§B.11.9 Where): its credentials are
-// judged as at its unfiltered URLs (401 without, 403 for a /ns/{ns}/g/{gs}
-// cookie), then 403, as no filtered URL serves it.
-func (t *tx) filteredOpen(ns string, cred Credentials) (*nsRow, *fscope, error) {
+// fform is the form of a filtered URL, which decides what a purged
+// namespace this section doesn't cover answers there (§B.11.9 Purged
+// namespaces, §8.5): /heads, at an at or without; a log range; or
+// long-poll and events (live), from since.
+type fform struct {
+	heads, live bool
+	since       string
+}
+
+// filteredOpen is the covered namespace a filtered URL of form f names, or
+// the answer for one that isn't covered (§B.11.9 Where): its credentials
+// are judged as at its unfiltered URLs (401 without, 403 for a
+// /ns/{ns}/g/{gs} cookie); then a purged namespace answers 410 where §8.5
+// answers the unfiltered form so (purgedFiltered); then 401 for a request
+// that carries neither a grant that verifies in {ns} nor a cookie the
+// origin verifies, as in a public namespace, whose unfiltered URLs ignore
+// an unusable grant; then 403, as no filtered URL serves it (§B.11.9
+// Purged namespaces: "answer these URLs as §8.5 answers their unfiltered
+// forms; other namespaces ... 403, or 401 as §B.11.5 says").
+func (t *tx) filteredOpen(ns string, f fform, cred Credentials) (*nsRow, *fscope, error) {
 	n := t.nsByName(ns)
 	if n == nil {
 		return nil, nil, t.absentNS(ns, cred)
@@ -70,9 +87,63 @@ func (t *tx) filteredOpen(ns string, cred Credentials) (*nsRow, *fscope, error) 
 		if _, _, _, err := t.nsAccess(n, cred); err != nil {
 			return nil, nil, err
 		}
+		if t.purgedFiltered(n, f) {
+			return nil, nil, t.purgedRead(n)
+		}
+		if !t.e.opt.AuthDisabled && cred.Edge == nil && !t.grantVerifiesIn(n, cred) {
+			return nil, nil, apiErr(401, "unauthenticated", "message",
+				"no grant that verifies in "+ns+" and no cookie: "+ns+" isn't read filtered here (§B.11.9 Where, §B.11.5)")
+		}
 		return nil, nil, forbidden(ns + " isn't read filtered here (§B.11.9 Where)")
 	}
 	return n, fs, nil
+}
+
+// purgedFiltered reports whether §8.5 answers the unfiltered form of f in
+// n 410: n is purged, and f is /heads (at any revision), or long-poll or
+// events from the purge-ns entry, or n is sealed, where log ranges, events
+// and long-poll are 410 too. A purged namespace's other forms are "served
+// as before" (§8.5), which for a namespace this section doesn't cover is
+// its 403 or 401 (§B.11.9 Purged namespaces).
+func (t *tx) purgedFiltered(n *nsRow, f fform) bool {
+	switch {
+	case !n.purged:
+		return false
+	case f.heads || t.sealedPurged(n):
+		return true
+	case f.live:
+		return t.fromPurgeEntry(n, f.since)
+	}
+	return false
+}
+
+// fromPurgeEntry reports whether since names purged n's purge-ns entry,
+// the log's last: events and long-poll from it are 410 (§8.5).
+func (t *tx) fromPurgeEntry(n *nsRow, since string) bool {
+	if !n.purged || since == "" {
+		return false
+	}
+	id, err := ids.Parse(since)
+	if err != nil {
+		return false
+	}
+	s, ok := t.nsLogSeq(n.id, id)
+	return ok && s == n.headSeq.Int64
+}
+
+// grantVerifiesIn reports whether the grant in Authorization verifies in
+// n (§C.2 item 1, its key's scope included), whatever n's read mode: a
+// public namespace's reads ignore a grant that doesn't (readerCheckURL).
+func (t *tx) grantVerifiesIn(n *nsRow, cred Credentials) bool {
+	if cred.Bearer == "" {
+		return false
+	}
+	g, err := t.decodeGrant(n.name, cred)
+	if err != nil {
+		return false
+	}
+	_, err = t.verifyGrant(g, n.name, n, t.config(n.configSeq), nil)
+	return err == nil
 }
 
 // filteredAtView admits a request at /ns/{ns}/g/{gs}/at/{at}/… and returns
@@ -80,7 +151,7 @@ func (t *tx) filteredOpen(ns string, cred Credentials) (*nsRow, *fscope, error) 
 // *FilteredRedirect to the current one, after admission there (§B.11.9
 // URLs, at).
 func (t *tx) filteredAtView(ns, gs, at string, cred Credentials) (*nsRow, *fview, error) {
-	n, fs, err := t.filteredOpen(ns, cred)
+	n, fs, err := t.filteredOpen(ns, fform{}, cred)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -108,13 +179,13 @@ func (t *tx) filteredCurrentRedirect(n *nsRow, fs *fscope, gs string, cred Crede
 	return &FilteredRedirect{NS: n.name, GS: fv.GS(), At: cp.at, CP: cp}
 }
 
-// FilteredCurrent answers a URL under /ns/{ns}/g/{gs} without at, such as
-// …/g/{gs}/heads or …/g/{gs}/log without live: a *FilteredRedirect to its
-// form at the current at, recorded first, once the request is admitted
-// there (§B.11.9 URLs). It never returns nil.
-func (e *Engine) FilteredCurrent(ctx context.Context, ns, gs string, cred Credentials) error {
+// FilteredCurrent answers a URL under /ns/{ns}/g/{gs} without at, suffix
+// "/heads" or "/log" (without live): a *FilteredRedirect to its form at
+// the current at, recorded first, once the request is admitted there
+// (§B.11.9 URLs). It never returns nil.
+func (e *Engine) FilteredCurrent(ctx context.Context, ns, gs, suffix string, cred Credentials) error {
 	return e.filteredRead(ctx, func(t *tx) error {
-		n, fs, err := t.filteredOpen(ns, cred)
+		n, fs, err := t.filteredOpen(ns, fform{heads: suffix == "/heads"}, cred)
 		if err != nil {
 			return err
 		}
@@ -169,7 +240,7 @@ func (e *Engine) FilteredHeads(ctx context.Context, ns, gs, at, after, prefix st
 // namespace does at any revision (§8.5, §B.11.9 Purged namespaces). Log
 // ranges keep the redirect: a purged namespace's range stays readable.
 func (t *tx) filteredHeadsView(ns, gs, at string, cred Credentials) (*nsRow, *fview, error) {
-	n, fs, err := t.filteredOpen(ns, cred)
+	n, fs, err := t.filteredOpen(ns, fform{heads: true}, cred)
 	if err != nil {
 		return nil, nil, err
 	}
