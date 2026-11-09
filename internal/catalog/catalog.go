@@ -88,7 +88,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -793,11 +792,14 @@ func (s *Service) frozenRolesFor(name string, subs map[string]bool) map[string]b
 }
 
 // Resolve implements tree.RoleView: listings are keyed by the caller's
-// group subjects, plus its user subject only if the catalog has direct
-// entries for that user, or its key in a content namespace it trusts has
-// a sub scope (§B.11.5), and filtered by the visibility test of that
-// subject set alone (ForSubjects), since every reader with it shares the
-// listing.
+// deciding subjects (§B.11.5, keyedAt): its group subjects that the
+// catalog's $access, or a role or key rule of a content namespace it
+// trusts, names (all of them where such a rule tests /principal/groups
+// otherwise than positively by value), plus "partial" if that left one
+// out, and its user subject only if the catalog has direct entries for
+// that user, or its key in a content namespace it trusts has a sub scope.
+// They are filtered by the visibility test of that subject set alone
+// (ForSubjects), since every reader with it shares the listing.
 //
 // What a role means, and the catalog's key, are read from the trusted
 // content namespaces' documents as of the content namespaces' ns_ids in
@@ -813,15 +815,12 @@ func (s *Service) Resolve(ctx context.Context, v *grant.Verified) ([]string, tre
 }
 
 // keyedAt is the subject set Resolve keys v's listings by, as of the
-// checkpoint g reflects. Call it under View.
+// checkpoint g reflects (catvis.ListingSubjects). A group it leaves out
+// can't change what the set sees there: no $access entry names it, and
+// rules test it only by positive tests of other groups. Call it under
+// View.
 func (s *Service) keyedAt(g *tree.Graph, v *grant.Verified) []string {
-	p := s.catalogOf(g).Profile()
-	keyed := groupSubjects(v.Principal.Groups)
-	if user := UserSubject(v.Principal.ID); user != "" && (p.Users[user] || p.SubScoped) {
-		keyed = append(keyed, user)
-		sort.Strings(keyed)
-	}
-	return keyed
+	return catvis.ListingSubjects(s.catalogOf(g).Profile(), v.Principal)
 }
 
 // ForSubjects implements tree.RoleView for a reader whose edge grant is
