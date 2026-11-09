@@ -613,24 +613,18 @@ func (b *branch) ownDocEntries() bool {
 }
 
 // ownBatch reports whether batch entry e is one of the branch's own for
-// §F.6: it has an item for a resource other than one purged in the branch
-// and, at E3, its keyring; or it changes the config (§7.5: items may be
-// empty then), which is work of its own too, unless it has a keyring item
-// at E3, as such a batch counts only if it has other items (an epoch bump
-// goes with its keyring entry, §E.2.1, §E.3.2).
+// §F.6: a batch counts only through its items, so it needs a counting
+// item (countingItem) for a resource not purged in the branch. A batch
+// that only changes the config (§7.5: items may be empty then), or whose
+// only items are its keyring's at E3 (an epoch bump, §E.2.1, §E.3.2) or
+// for resources purged in it, is not.
 func (b *branch) ownBatch(e client.NSEntry) bool {
-	config, keyring := len(e.Entries) == 0, false
 	for _, s := range e.Entries {
-		switch {
-		case s.Kind != "head" && s.Kind != "tombstone":
-			config = true
-		case b.e2e && s.Resource == client.KeyringName:
-			keyring = true
-		case !b.purged[s.Resource]:
+		if countingItem(s, b.e2e) && !b.purged[s.Resource] {
 			return true
 		}
 	}
-	return config && !keyring
+	return false
 }
 
 // nsAt is a namespace's head and its document there.
@@ -733,24 +727,30 @@ func purgedSince(d Decision, gone error) Decision {
 }
 
 // isDocEntry reports head, tombstone and batch entries: the ones that change
-// documents. Config, prune and (propagated) purge entries don't count. In
-// an e2e branch (e2e) neither do entries for its keyring resource, which is
-// never merged (§F.8.1): a batch counts only if it has other items.
+// documents. Config, prune and (propagated) purge entries don't count. A
+// batch counts only through its items (§F.6): one with a counting item
+// (countingItem), so a config-only batch doesn't. In an e2e branch (e2e)
+// entries for its keyring resource, which is never merged (§F.8.1), don't
+// count either: a batch counts only if it has other items.
 func isDocEntry(e client.NSEntry, e2e bool) bool {
 	switch e.Kind {
 	case "head", "tombstone":
-		return !e2e || e.Resource != client.KeyringName
+		return countingItem(e, e2e)
 	case "batch":
-		if !e2e {
-			return true
-		}
 		for _, s := range e.Entries {
-			if isDocEntry(s, e2e) {
+			if countingItem(s, e2e) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// countingItem reports whether s, an entry or a batch's item, is one a
+// batch counts through for §F.6: a head or tombstone entry other than, in
+// an e2e branch (e2e), one for its keyring resource.
+func countingItem(s client.NSEntry, e2e bool) bool {
+	return (s.Kind == "head" || s.Kind == "tombstone") && !(e2e && s.Resource == client.KeyringName)
 }
 
 // hasDocEntries reports a document entry in log after index i.

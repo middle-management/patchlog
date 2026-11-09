@@ -65,9 +65,9 @@ func TestV074SupersededGrantReadBeforePurge(t *testing.T) {
 
 // A batch of the branch's own that changes only its config (§7.5: items
 // may be empty when config is present), or its config and resources purged
-// in it, is a batch entry of its own: the branch doesn't count as merged
-// by the no-own-entries rule (§F.6), and its unmerged config change isn't
-// purged.
+// in it, is not a batch entry of its own, as a batch counts only through
+// its items (§F.6, v0.76): the branch counts as merged by the
+// no-own-entries rule.
 func TestV074ConfigBatchIsOwnEntry(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, nil)
@@ -88,8 +88,8 @@ func TestV074ConfigBatchIsOwnEntry(t *testing.T) {
 
 	ds := e.sweep(false)
 	for _, ns := range []string{"scratch", "drafts"} {
-		if d := ds[ns]; d.Action == janitor.ActionPurged || e.purged(ns) {
-			t.Errorf("%s: decision %+v, a branch with a config batch of its own purged as merged", ns, d)
+		if d := ds[ns]; d.Action != janitor.ActionPurged || d.Claim != "merged" || !e.purged(ns) {
+			t.Errorf("%s: decision %+v, want purged as merged", ns, d)
 		}
 	}
 }
@@ -117,7 +117,8 @@ func newE3Branch(t *testing.T) (*env, *client.E2E) {
 // At E3 the keyring is excepted (§F.6), and a batch with a keyring item
 // counts only if it has other items: an epoch bump, config and keyring in
 // one batch, leaves a branch with nothing else of its own merged. A batch
-// with only a config change counts, as at other levels.
+// with only a config change doesn't count either, as at other levels
+// (§F.6, v0.76: a batch counts only through its items).
 func TestV074E3ConfigBatchIsOwnEntry(t *testing.T) {
 	t.Parallel()
 	t.Run("epoch bump", func(t *testing.T) {
@@ -139,8 +140,8 @@ func TestV074E3ConfigBatchIsOwnEntry(t *testing.T) {
 			Patches: []any{op("add", "/merge", map[string]any{"authors": []any{map[string]any{"sub": "bob", "kid": "dev"}}})}}}, false))
 		e.config("r7", op("add", "/frozen", true))
 		e.s.Clock.Advance(2 * day)
-		if d := e.sweep(false)["r7"]; d.Action == janitor.ActionPurged || e.purged("r7") {
-			t.Fatalf("decision %+v, a branch with a config batch of its own purged as merged", d)
+		if d := e.sweep(false)["r7"]; d.Action != janitor.ActionPurged || d.Claim != "merged" || !e.purged("r7") {
+			t.Fatalf("decision %+v, want purged as merged", d)
 		}
 	})
 }
