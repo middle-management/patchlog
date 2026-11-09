@@ -106,18 +106,23 @@ func (p *Plan) applyResolution(r *Resource, steps []client.Step) {
 		case r.BaseState == client.Live.String() && r.keepBlock != "":
 			// At E3 the sealed empty set repeats B's declared blobs, and a
 			// sealed op can't declare this one (§E.3.1).
-			r.IfMatch, r.IfNoneMatch = "", false
-			r.Note = "kept as in the target, whose head references " + r.keepBlock + ", which a sealed op can't declare: this can't be recorded in the batch, so the resource stays unmerged and is offered again (§F.3, §E.3.1)"
+			r.noItem("kept as in the target, whose head references " + r.keepBlock + ", which a sealed op can't declare: this can't be recorded in the batch, so the resource stays unmerged and is offered again (§F.3, §E.3.1)")
 		case r.BaseState == client.Live.String():
 			r.Kept, r.Steps = true, []client.Step{p.keepStep()}
 		default:
-			r.IfMatch, r.IfNoneMatch = "", false
-			r.Note = "kept as in the target, whose head is " + map[bool]string{true: "a tombstone", false: "absent"}[r.BaseState == client.Tombstoned.String()] + ": this can't be recorded in the batch, so the resource stays unmerged and is offered again (§F.3)"
+			r.noItem("kept as in the target, whose head is " + map[bool]string{true: "a tombstone", false: "absent"}[r.BaseState == client.Tombstoned.String()] + ": this can't be recorded in the batch, so the resource stays unmerged and is offered again (§F.3)")
 		}
 		return
 	}
 	r.Steps = p.withNonces(steps)
 	r.Resolved = true
+}
+
+// noItem gives r no item in the batch, with note saying why: the resource
+// stays unmerged, so the next merge offers it again (§F.3 kept bullet).
+func (r *Resource) noItem(note string) {
+	r.IfMatch, r.IfNoneMatch, r.Steps, r.Expected, r.Kept = "", false, nil, nil, false
+	r.Note = note
 }
 
 // squash replaces r's steps with one set with the same effect (§F.3).
