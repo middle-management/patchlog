@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
@@ -47,10 +49,12 @@ import (
 // reads:{ns}:scope:{digest}, what its digest covers, the rules that limit
 // the reads and the /principal values they refer to (edge_filters,
 // markerRec), from which it filters hits per resource as for any grant
-// with that marker, and for a marker reads:{ns}:g:{gs} (§B.11.9) also its
-// subjects (edge_gs) and every key it was minted under, its kid, the role
-// names its digest covers and its kid's pub (edge_gs_keys, gsKey), each
-// until the last cookie minted under it expires. They are kept across
+// with that marker, for a marker reads:{ns}:g:{gs} (§B.11.9) also its
+// subjects (edge_gs), and for either every key it was minted under, its
+// kid, the role names its digest covers and its kid's pub (edge_gs_keys,
+// gsKey), each until the last cookie minted under it expires: a cookie
+// of either is 403 once one of those keys or roles would end a gs cookie
+// (§A.4, §B.11.9 gs; storedFview, scopeKeysHold). They are kept across
 // restarts and -rebuild until the last such cookie expires; a gs or marker the service doesn't know, minted by
 // another instance with its own database, is 401, and the reader
 // exchanges again. Instances on one database share them, and share
@@ -65,43 +69,65 @@ import (
 // carries roles, each effective role that lists read, and its
 // /principal), from which hits are filtered per resource as for any grant
 // with that marker; for reads:{ns}:g:{gs} (§B.11.9), also its subjects,
-// from which item 1 is judged, and, from an exchange, the key its grant
-// came from (gsKey), recorded beside those of the marker's other cookies
-// (storedFview judges them all). A rule referring to /now gives no
+// from which item 1 is judged; and for either, from an exchange, the key
+// its grant came from (gsKey), recorded beside those of the marker's
+// other cookies (storedFview and scopeKeysHold judge them all). A rule referring to /now gives no
 // marker, so the filter judges a read as the grant's read check does,
 // without a clock.
 type markerRec struct {
 	f        *grantcheck.ReadFilter
 	subjects []string // g: markers only
-	key      gsKey    // g: markers from an exchange only
+	key      gsKey    // from an exchange only
 }
 
-// gsKey is a key a g: marker's cookies came from: its kid and the names
-// of its grant's read roles, whose rules as of a checkpoint must still
-// digest to the marker's scope subject, and the pub its kid had, which the
-// key with that kid must still have (§B.11.9 gs, §C.4; storedFview). The
-// marker's gs digests only subjects and rules, so readers whose grants
-// come from different keys, or from one key before and after its pub
-// changes, share it and one cookie prefix, and a cookie doesn't say which
-// key it came from: every gsKey the marker's live cookies were minted
-// under is kept (edge_gs_keys), and each must still hold.
+// gsKey is a key a g: or scope marker's cookies came from: its kid and
+// the names of its grant's read roles, whose rules as of a checkpoint
+// must still digest to the marker's scope subject (g:) or its digest
+// (scope:), and the pub its kid had, which the key with that kid must
+// still have (§B.11.9 gs, §C.4, §A.4; storedFview, scopeKeysHold). A g:
+// marker's gs digests the key too (catvis.KeySubject), but readers whose
+// grants come from one kid before and after its pub changes may still
+// share a marker until the older cookies expire, and a cookie doesn't say
+// which key it came from: every gsKey the marker's live cookies were
+// minted under is kept (edge_gs_keys, which needs no new migration for
+// scope markers), and each must still hold.
 type gsKey struct {
 	kid   string
 	roles []string
 	pub   string // the key's pub member, as its namespace document gives it
 }
 
-// markerRecOf is what a's marker stands for, a's grant being v.
+// markerRecOf is what a's marker stands for, a's grant being v: its
+// filter, the key it came from, for a scope marker as for a g: one (§A.4:
+// a cookie is 403 "where a marker's key, rules or roles would end a gs
+// cookie"), and a g: marker's subjects.
 func markerRecOf(a *access, v *grant.Verified) *markerRec {
 	rec := &markerRec{f: a.filter}
+	rec.key.kid, rec.key.pub = v.Key.Kid, keyPub(*v.Key)
+	for r := range grantcheck.ScopeInputOf(v).Roles {
+		rec.key.roles = append(rec.key.roles, r)
+	}
+	slices.Sort(rec.key.roles)
 	if a.cov != nil {
-		rec.subjects, rec.key.kid, rec.key.pub = a.cov.subjects, v.Key.Kid, keyPub(*v.Key)
-		for r := range grantcheck.ScopeInputOf(v).Roles {
-			rec.key.roles = append(rec.key.roles, r)
-		}
-		slices.Sort(rec.key.roles)
+		rec.subjects = a.cov.subjects
 	}
 	return rec
+}
+
+// scopeMarker is the marker reads:{ns}:scope:{digest} of a reader of
+// uncovered ns whose reads there have grantcheck.ReadsScope digest d,
+// through the key with kid and pub (§A.4): its digest covers d and the
+// key's key: string (catvis.KeySubject, §B.11.9 gs), so readers through
+// two keys with the same rules never share a marker, its gs, its edge
+// filter or its cookie prefix. grantcheck's digest, which the origin's
+// scope: subject is, stays as it is.
+func scopeMarker(ns, d, kid, pub string) string {
+	return "reads:" + ns + ":scope:" + scopeKeyDigest(d, kid, pub)
+}
+
+func scopeKeyDigest(d, kid, pub string) string {
+	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo([]any{d, catvis.KeySubject(kid, pub)})))
+	return ids.FromBytes(sum[:ids.Size]).String()
 }
 
 // keyPub is k's pub member as the namespace document gives it, "" if it
@@ -148,17 +174,21 @@ func (ix *Index) recordFilters(ctx context.Context, filters map[string]*markerRe
 			ON CONFLICT (marker) DO UPDATE SET filter = excluded.filter, exp = max(exp, excluded.exp)`, m, f.f.Encode(), exp.Unix()); err != nil {
 			return err
 		}
-		if f.subjects == nil {
+		if f.subjects != nil {
+			// edge_gs's kid, roles and pub (migrations 005, 006) are the
+			// latest exchange's, kept only because they are NOT NULL: a
+			// cookie is judged by every key in edge_gs_keys (migration
+			// 007).
+			if _, err := tx.ExecContext(ctx, `INSERT INTO edge_gs (marker, subjects, kid, roles, pub, exp) VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT (marker) DO UPDATE SET subjects = excluded.subjects, kid = excluded.kid, roles = excluded.roles, pub = excluded.pub, exp = max(exp, excluded.exp)`,
+				m, enc(f.subjects), f.key.kid, enc(f.key.roles), f.key.pub, exp.Unix()); err != nil {
+				return err
+			}
+		}
+		if f.key.kid == "" {
 			continue
 		}
-		// edge_gs's kid, roles and pub (migrations 005, 006) are the
-		// latest exchange's, kept only because they are NOT NULL: a
-		// cookie is judged by every key in edge_gs_keys (migration 007).
-		if _, err := tx.ExecContext(ctx, `INSERT INTO edge_gs (marker, subjects, kid, roles, pub, exp) VALUES (?, ?, ?, ?, ?, ?)
-			ON CONFLICT (marker) DO UPDATE SET subjects = excluded.subjects, kid = excluded.kid, roles = excluded.roles, pub = excluded.pub, exp = max(exp, excluded.exp)`,
-			m, enc(f.subjects), f.key.kid, enc(f.key.roles), f.key.pub, exp.Unix()); err != nil {
-			return err
-		}
+		// Every key a g: or scope marker's cookies came from (gsKeys).
 		if _, err := tx.ExecContext(ctx, `INSERT INTO edge_gs_keys (marker, kid, roles, pub, exp) VALUES (?, ?, ?, ?, ?)
 			ON CONFLICT (marker, kid, roles, pub) DO UPDATE SET exp = max(exp, excluded.exp)`,
 			m, f.key.kid, enc(f.key.roles), f.key.pub, exp.Unix()); err != nil {
@@ -361,6 +391,9 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string) (*access, error
 		if err := ix.stillUncovered(ctx, ns); err != nil {
 			return nil, err
 		}
+		if err := ix.scopeKeysHold(ctx, ns, m, f); err != nil {
+			return nil, err
+		}
 		return &access{marker: m, filter: f.f, allow: f.f.Allows, cookie: true}, nil
 	case strings.HasPrefix(m, "reads:"+ns+":g:"):
 		f, ok := ix.filter(ctx, m)
@@ -380,6 +413,43 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string) (*access, error
 		return a, nil
 	}
 	return nil, &grant.AuthError{Status: 403, Msg: "the edge grant doesn't read this namespace"}
+}
+
+// scopeKeysHold checks a cookie for scope marker m of ns, whose record is
+// rec, against ns's document at its head (its effective keys, §C.4), as
+// §B.11.9 gs ends a gs cookie (§A.4: "a cookie is 403 until the reader
+// exchanges again ... where a marker's key, rules or roles would end a gs
+// cookie"): errRulesChanged unless every key m's live cookies came from
+// (gsKeys) is still there with the pub it had and lists read, each role
+// it digested still exists and lists read, and the scope digest over the
+// current rules, with rec's block rules and principal and the key's key:
+// string, is still m's (scopeMarker). A marker recorded with no key, from
+// before v0.77, is refused too: its marker names no key, so the reader
+// exchanges again.
+func (ix *Index) scopeKeysHold(ctx context.Context, ns, m string, rec *markerRec) error {
+	if _, purged, err := ix.committed(ctx, ns); err != nil || purged {
+		return err // a purged one is answered 410 past the read check (§8.5)
+	}
+	recorded, err := ix.gsKeys(ctx, m, ix.opt.Now())
+	if err != nil {
+		return err
+	}
+	if len(recorded) == 0 {
+		return errRulesChanged
+	}
+	cfg, err := ix.checker.Config(ctx, ns)
+	if client.IsPurged(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, k := range recorded {
+		if !gsKeyHolds(cfg, cfg.Keys, rec.f, k, func(d string) bool { return scopeMarker(ns, d, k.kid, k.pub) == m }) {
+			return errRulesChanged
+		}
+	}
+	return nil
 }
 
 // errCoveredNow refuses a cookie for marker reads:{ns}:scope:… once

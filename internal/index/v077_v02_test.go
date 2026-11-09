@@ -2,13 +2,17 @@ package index_test
 
 import (
 	"context"
+	"net/http"
 	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // V77-02 (v0.77): the index's markers, scope cookies, coverage, exchange
@@ -74,5 +78,157 @@ func TestV077HeadPointerDropsOpaqueAfter(t *testing.T) {
 	r = s.raw("/matches?after=a1&limit=1", "")
 	if loc := r.header.Get("Location"); r.status != 302 || loc != "/matches/at/"+cur+"?after=a1&limit=1" {
 		t.Errorf("head pointer with an after naming a resource: %d %s", r.status, loc)
+	}
+}
+
+// v77docs is an uncovered private namespace docs (it names no catalog and
+// is none) whose keys k1 and k2 have the same scope rules, testing
+// /resource by type, so their grants read docs in part; its role reader
+// lists read. docs holds a, b and secret. One index follows it, minting
+// edge grants of its own.
+type v77docs struct {
+	t             *testing.T
+	s             *clienttest.Server
+	admin, k1, k2 clienttest.Key
+	w             *client.Client
+	x             *svc
+}
+
+var v77TypeRule = map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}
+
+func newV77Docs(t *testing.T) *v77docs {
+	t.Helper()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	d := &v77docs{t: t, s: s, admin: clienttest.NewKey("admin"), k1: clienttest.NewKey("k1"), k2: clienttest.NewKey("k2")}
+	entry := func(k clienttest.Key) map[string]any {
+		e := k.Entry("read")
+		e["rules"] = []any{v77TypeRule}
+		return e
+	}
+	op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "docs")))
+	must(op.CreateNamespace(ctx, "docs", map[string]any{"read": "grant", "keys": []any{d.admin.Entry("*"), entry(d.k1), entry(d.k2)},
+		"roles": map[string]any{"reader": map[string]any{"can": []any{"read"}}}}))
+	d.w = s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "user:root", []string{"docs"}, []string{"read", "create", "append", "config"})))
+	sch := must(d.w.CreateDoc(ctx, "docs", "schema", map[string]any{"$schema": d2020, "type": "object",
+		"properties": map[string]any{"title": map[string]any{"type": "string", "x-index": "text"}}}))
+	for _, n := range []string{"a", "b", "secret"} {
+		must(d.w.CreateDoc(ctx, "docs", n, map[string]any{"$schema": "/r/docs/schema/rev/" + sch.ID, "title": "word " + n}))
+	}
+	ev := must(edge.New([]byte("s3cret"), "", ""))
+	d.x = startSvcWith(t, s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "svc:indexer", []string{"docs"}, []string{"read"}))),
+		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"docs"}, untyped: true, now: s.Now},
+		func(o *indexOpts) {
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+		})
+	d.x.caughtUp("docs")
+	return d
+}
+
+// reader is k's grant for user:li with the role reader.
+func (d *v77docs) reader(k clienttest.Key) string {
+	return k.Grant(d.t, d.s.Now(), "user:li", []string{"docs"}, []string{"read"}, map[string]any{"roles": []any{"reader"}})
+}
+
+// patch applies ops to docs' document and waits for the index.
+func (d *v77docs) patch(ops ...any) {
+	d.t.Helper()
+	ctx := context.Background()
+	must(d.w.PatchConfig(ctx, "docs", must(d.w.NSHead(ctx, "docs")).Config, ops))
+	d.x.caughtUp("docs")
+	d.x.ix.ExpireGrantChecks()
+}
+
+// exchange exchanges token and returns its prefixes, by kind (the
+// namespace, or "_refs"), and its cookies.
+func (d *v77docs) exchange(token string) (map[string]string, []*http.Cookie) {
+	d.t.Helper()
+	r := p37Do(d.t, d.x, "POST", "/edge-grants", token, "", nil, "")
+	if r.status != 200 {
+		d.t.Fatalf("exchange: %d %v", r.status, r.body)
+	}
+	prefixes := map[string]string{}
+	for _, p := range r.body["prefixes"].([]any) {
+		prefixes[strings.Split(p.(string), "/")[1]] = p.(string)
+	}
+	return prefixes, r.cookies
+}
+
+// TestV077ScopeMarkerKey (FSVC-1; §A.4 Across namespaces: the scope
+// marker's "digest covering the rules that limit it there ..., the
+// /principal values they refer to and its key's key: string (§B.11.9
+// gs)"; CONFORMANCE Grant scope 66): grants through k1 and k2, whose
+// rules are the same, are redirected to different /docs/g/{gs}, and the
+// exchange gives them different prefixes. Before v0.77 both shared one.
+func TestV077ScopeMarkerKey(t *testing.T) {
+	t.Parallel()
+	d := newV77Docs(t)
+	g1, g2 := d.reader(d.k1), d.reader(d.k2)
+	loc1, loc2 := d.x.raw("/docs?q=word", g1).header.Get("Location"), d.x.raw("/docs?q=word", g2).header.Get("Location")
+	if !strings.HasPrefix(loc1, "/docs/g/") || !strings.HasPrefix(loc2, "/docs/g/") || strings.Split(loc1, "/")[3] == strings.Split(loc2, "/")[3] {
+		t.Errorf("k1's and k2's readers: %s and %s, want different gs", loc1, loc2)
+	}
+	for _, g := range []string{g1, g2} {
+		if got := strings.Join(resources(d.x.search("/docs?q=word", g)), ","); got != "a,b,secret" {
+			t.Errorf("hits %s", got)
+		}
+	}
+	p1, _ := d.exchange(g1)
+	p2, _ := d.exchange(g2)
+	if p1["docs"] == "" || p1["docs"] == p2["docs"] || p1["_refs"] == p2["_refs"] {
+		t.Errorf("prefixes %v and %v, want different", p1, p2)
+	}
+}
+
+// TestV077ScopeCookieEnds (FSVC-2; §A.4: "a cookie is 403 until the
+// reader exchanges again ... where a marker's key, rules or roles would
+// end a gs cookie (§B.11.9 gs)"; scenarios 66 and 121): li's cookie for
+// its scope marker in docs, through k1 with the role reader, is 403 at
+// /docs/g/{gs} and at /_refs once docs (a) removes k1, (b) changes k1's
+// pub, (c) narrows reader's rules, or (d) drops read from reader; a
+// change to an unrelated role leaves it read. Before v0.77 it read on
+// under the old rules until it expired.
+func TestV077ScopeCookieEnds(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name  string
+		op    func(d *v77docs) map[string]any
+		holds bool
+	}{
+		{"k1 removed", func(d *v77docs) map[string]any {
+			return map[string]any{"op": "remove", "path": "/keys/1"}
+		}, false},
+		{"k1's pub changed", func(d *v77docs) map[string]any {
+			return map[string]any{"op": "replace", "path": "/keys/1/pub", "value": clienttest.NewKey("k1").Pub}
+		}, false},
+		{"reader narrowed", func(d *v77docs) map[string]any {
+			return map[string]any{"op": "add", "path": "/roles/reader/rules", "value": []any{
+				map[string]any{"not": map[string]any{"op": "test", "path": "/resource", "value": "secret"}}}}
+		}, false},
+		{"reader without read", func(d *v77docs) map[string]any {
+			return map[string]any{"op": "replace", "path": "/roles/reader/can", "value": []any{"create"}}
+		}, false},
+		{"another role added", func(d *v77docs) map[string]any {
+			return map[string]any{"op": "add", "path": "/roles/other", "value": map[string]any{"can": []any{"read"}}}
+		}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			d := newV77Docs(t)
+			prefixes, cookies := d.exchange(d.reader(d.k1))
+			refs := prefixes["_refs"] + "?to=" + url.QueryEscape("/r/docs/schema")
+			for _, p := range []string{prefixes["docs"] + "?q=word", refs} {
+				if got, _ := p37Follow(t, d.x, p, cookies, ""); got.status != 200 {
+					t.Fatalf("%s under the cookie: %d %v", p, got.status, got.body)
+				}
+			}
+			d.patch(c.op(d))
+			for _, p := range []string{prefixes["docs"] + "?q=word", refs} {
+				got, _ := p37Follow(t, d.x, p, cookies, "")
+				if c.holds && got.status != 200 || !c.holds && got.status != 403 {
+					t.Errorf("%s under the cookie after the change: %d %v", p, got.status, got.body)
+				}
+			}
+		})
 	}
 }

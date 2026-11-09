@@ -1102,7 +1102,7 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *marker
 		keys = eff.Keys
 	}
 	for _, k := range recorded {
-		if !gsKeyHolds(cfg, keys, rec, k) {
+		if !gsKeyHolds(cfg, keys, rec.f, k, func(d string) bool { return slices.Contains(rec.subjects, catvis.ScopePrefix+d) }) {
 			return nil, errRulesChanged
 		}
 	}
@@ -1116,18 +1116,22 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *marker
 	return newFview(cp, rec.subjects, rec.f), nil
 }
 
-// gsKeyHolds reports whether k, a key a cookie of rec's marker came from,
-// is still accepted with the pub it had, among keys (cfg's, or for a
-// branch its effective ones, §C.4), and its scope rules and its roles'
-// definitions in cfg, with rec's block rules and principal, still digest
-// to the scope subject rec's subjects carry (storedFview).
-func gsKeyHolds(cfg *grantcheck.Config, keys []grant.Key, rec *markerRec, k gsKey) bool {
+// gsKeyHolds reports whether k, a key a cookie of a marker came from, is
+// still accepted with the pub it had, among keys (cfg's, or for a branch
+// its effective ones, §C.4), and lists read, and whether its scope rules
+// and its roles' definitions in cfg, each role still listing read, with
+// f's block rules and principal, still digest to what the marker stands
+// for (holds: for a g: marker, the scope subject its subjects carry,
+// storedFview; for a scope marker, the marker's own digest,
+// scopeKeysHold). §B.11.9 gs ends a gs cookie so, and §A.4 a scope cookie
+// "where a marker's key, rules or roles would end a gs cookie".
+func gsKeyHolds(cfg *grantcheck.Config, keys []grant.Key, f *grantcheck.ReadFilter, k gsKey, holds func(digest string) bool) bool {
 	i := slices.IndexFunc(keys, func(key grant.Key) bool { return key.Kid == k.kid })
 	if i < 0 || !keys[i].Lists("read") || k.pub == "" || keyPub(keys[i]) != k.pub {
 		return false
 	}
 	in := grantcheck.ScopeInput{ReadScopeResource: keys[i].ReadScopeResource, KeyRules: keys[i].Rules,
-		BlockRules: rec.f.BlockRules, Roles: map[string][]any{}, Principal: rec.f.Principal}
+		BlockRules: f.BlockRules, Roles: map[string][]any{}, Principal: f.Principal}
 	for _, r := range k.roles {
 		// A role that no longer lists read counts as gone, as at the
 		// origin (core gsDigestHolds): a cookie never reads where its
@@ -1139,7 +1143,7 @@ func gsKeyHolds(cfg *grantcheck.Config, keys []grant.Key, rec *markerRec, k gsKe
 		in.Roles[r] = def.Rules
 	}
 	d, ok := grantcheck.ScopeDigest(in)
-	return ok && slices.Contains(rec.subjects, catvis.ScopePrefix+d)
+	return ok && holds(d)
 }
 
 // gMarker is the marker of a partial reader of covered ns with §B.11.9

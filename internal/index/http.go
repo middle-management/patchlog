@@ -279,9 +279,10 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 	// be issued a namespace-wide edge grant (§C.5.2), which reads every
 	// resource, so all such readers share results whatever their subjects;
 	// reads:{ns}:scope:{digest} for one that reads only what its rules
-	// allow, digest covering those rules and the /principal values they
-	// refer to (grantcheck.ReadsScope), so readers limited alike share
-	// them; and where §B.11.9 covers ns, reads:{ns}:g:{gs} for such a
+	// allow, digest covering those rules, the /principal values they
+	// refer to (grantcheck.ReadsScope) and its key's key: string
+	// (scopeMarker), so readers limited alike through one key share them;
+	// and where §B.11.9 covers ns, reads:{ns}:g:{gs} for such a
 	// partial reader, gs being the origin's, its hits filtered by
 	// visibility (filtered.go). Where those rules refer to /now the
 	// namespace counts as unreadable: a result at an at can't change with
@@ -320,7 +321,7 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 		return nil, err
 	}
 	a.derive = nil
-	a.marker = "reads:" + ns + ":scope:" + digest
+	a.marker = scopeMarker(ns, digest, v.Key.Kid, keyPub(*v.Key))
 	a.allow = func(resource string) bool { return ix.checker.AllowsRead(v, resource) }
 	return marked(a), nil
 }
