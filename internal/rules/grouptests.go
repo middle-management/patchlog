@@ -23,13 +23,15 @@ var ptrPrincipalGroups = pointer.Pointer{"principal", "groups"}
 //	{ "op": "test", "path": "/principal/groups", "schema": { "contains": { "const": S } } }
 //	{ "op": "test", "path": "/principal/groups", "schema": { "contains": { "enum": [S, …] } } }
 //
-// with S strings, the schema optionally also holding "type": "array", and
-// allOf of such schemas, reached through all and any only, never inside
-// not, if or then. Anything else that can read /principal/groups makes
+// with S strings, the schema optionally also holding "type": "array", or
+// a schema that is only an allOf, a non-empty array of such schemas
+// (§B.11.5, v0.76), reached through all and any only, never inside not,
+// if or then. Anything else that can read /principal/groups makes
 // onlyPositive false: a value or exists test, a path below it
 // (/principal/groups/0) or above it (/principal, the whole envelope ""),
-// any other schema keyword (minItems, pattern, items, not …), and a
-// compare whose path or operand path names it. A rule that isn't
+// any other schema keyword (minItems, pattern, items, not …), contains
+// or type beside allOf, an allOf element without contains, nested allOf,
+// and a compare whose path or operand path names it. A rule that isn't
 // well-formed is false too: when unsure, the answer is false, which keeps
 // all the caller's groups (§B.11.5).
 func GroupTests(rule any) (named []string, onlyPositive bool) {
@@ -151,56 +153,68 @@ func groupTest(m map[string]any, negated bool, set map[string]bool) bool {
 	return true
 }
 
-// groupSchema reads a test's schema of the accepted forms (GroupTests):
-// contains with const or enum of strings, optionally type "array", and
-// allOf of such schemas. It returns the groups named.
+// groupSchema reads a test's schema of the accepted forms (GroupTests,
+// §B.11.5): exactly a containsSchema, or exactly {"allOf": [...]}, a
+// non-empty array of containsSchemas. contains beside allOf, type beside
+// allOf, an allOf element without contains and nested allOf are refused.
+// It returns the groups named.
 func groupSchema(v any) ([]string, bool) {
 	m, ok := v.(map[string]any)
-	if !ok || len(m) == 0 {
+	if !ok {
+		return nil, false
+	}
+	if !has(m, "allOf") {
+		return containsSchema(m)
+	}
+	arr, ok := m["allOf"].([]any)
+	if len(m) != 1 || !ok || len(arr) == 0 {
 		return nil, false
 	}
 	var out []string
-	for k, x := range m {
-		switch k {
-		case "type":
-			if x != "array" {
-				return nil, false
-			}
-		case "contains":
-			c, ok := x.(map[string]any)
-			if !ok || len(c) != 1 {
-				return nil, false
-			}
-			if s, ok := c["const"].(string); ok {
-				out = append(out, s)
-				continue
-			}
-			arr, ok := c["enum"].([]any)
-			if !ok || len(arr) == 0 {
-				return nil, false
-			}
-			for _, e := range arr {
-				s, ok := e.(string)
-				if !ok {
-					return nil, false
-				}
-				out = append(out, s)
-			}
-		case "allOf":
-			arr, ok := x.([]any)
-			if !ok || len(arr) == 0 {
-				return nil, false
-			}
-			for _, sub := range arr {
-				names, ok := groupSchema(sub)
-				if !ok {
-					return nil, false
-				}
-				out = append(out, names...)
-			}
-		default:
+	for _, sub := range arr {
+		sm, ok := sub.(map[string]any)
+		if !ok {
 			return nil, false
 		}
+		names, ok := containsSchema(sm)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, names...)
+	}
+	return out, true
+}
+
+// containsSchema reads a schema whose only keys are contains, which is
+// exactly {"const": S} or {"enum": [S, …]} with S strings, and optionally
+// "type": "array" (§B.11.5). It returns the groups named.
+func containsSchema(m map[string]any) ([]string, bool) {
+	if !has(m, "contains") {
+		return nil, false
+	}
+	for k, x := range m {
+		if k != "contains" && (k != "type" || x != "array") {
+			return nil, false
+		}
+	}
+	c, ok := m["contains"].(map[string]any)
+	if !ok || len(c) != 1 {
+		return nil, false
+	}
+	if s, ok := c["const"].(string); ok {
+		return []string{s}, true
+	}
+	arr, ok := c["enum"].([]any)
+	if !ok || len(arr) == 0 {
+		return nil, false
+	}
+	out := make([]string, 0, len(arr))
+	for _, e := range arr {
+		s, ok := e.(string)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, s)
 	}
 	return out, true
 }

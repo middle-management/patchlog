@@ -18,10 +18,10 @@ type Profile struct {
 	// of every explicit, non-implicit node, a deleted node's last live
 	// document included (NewCatalogDeleted: a tombstone is judged by its
 	// own $access, §B.11.9 Deleted resources), and by the rules of every
-	// role and every catalog key (Kids) of every trusted content namespace.
-	// Taking every role, not only those that list read, is a superset,
-	// which is always safe. A key's groups allow or deny scope names no
-	// group.
+	// role and every key of every trusted content namespace, not only the
+	// catalog's keys (Kids) (§B.11.5 deciding subjects). Taking every role,
+	// not only those that list read, is a superset, which is always safe.
+	// A key's groups allow or deny scope names no group.
 	Groups map[string]bool
 	// KeepAll: some such rule refers to /principal/groups otherwise than
 	// by positive tests of named groups (rules.GroupTests), so every
@@ -80,12 +80,14 @@ func (c *Catalog) computeProfile() Profile {
 		for _, def := range ct.Cfg.Roles {
 			addRules(def.Rules)
 		}
+		for i := range ct.Cfg.Keys {
+			addRules(ct.Cfg.Keys[i].Rules)
+		}
+		// The sub decides only where the catalog's own key has a sub
+		// scope ("its key ... has a sub scope", §B.11.5).
 		for _, kid := range ct.Kids {
-			if k := findKey(ct.Cfg.Keys, kid); k != nil {
-				addRules(k.Rules)
-				if k.SubPattern != nil {
-					p.SubScoped = true
-				}
+			if k := findKey(ct.Cfg.Keys, kid); k != nil && k.SubPattern != nil {
+				p.SubScoped = true
 			}
 		}
 	}
