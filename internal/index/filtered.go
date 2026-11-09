@@ -116,7 +116,7 @@ type fstate struct {
 	docs    lru.Cache[string, map[string]any]  // ns \0 ns_id → namespace document
 	live    lru.Cache[string, map[string]bool] // ns \0 ns_id → names live there
 	cats    lru.Cache[string, *catvis.Catalog] // catalogKey → catalog
-	cps     lru.Cache[string, *fcp]            // at → checkpoint, for URLs at older ats
+	cps     lru.Cache[string, *fcp]            // ns \0 at → checkpoint, for URLs at older ats
 	nodes   map[string]map[string]catNode      // catalog → its node documents last read
 	deleted lru.Cache[string, map[string]any]  // catalog \0 name \0 tombstone → last live document
 	flight  singleflight.Group
@@ -491,7 +491,7 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 		cp.live[m] = l
 	}
 	ix.fs.mu.Lock()
-	ix.fs.cps.Put(cp.at, cp, 1)
+	ix.fs.cps.Put(cp.ns+"\x00"+cp.at, cp, 1)
 	ix.fs.mu.Unlock()
 	return cp, nil
 }
@@ -502,7 +502,7 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 func (ix *Index) keptCP(ns, at string) *fcp {
 	ix.fs.mu.Lock()
 	defer ix.fs.mu.Unlock()
-	if cp, ok := ix.fs.cps.Get(at); ok && cp.ns == ns {
+	if cp, ok := ix.fs.cps.Get(ns + "\x00" + at); ok {
 		return cp
 	}
 	return nil
@@ -516,8 +516,8 @@ func (ix *Index) keptCPsIn(ns string, ids map[string]string) []*fcp {
 	ix.fs.mu.Lock()
 	defer ix.fs.mu.Unlock()
 	var out []*fcp
-	for _, at := range ix.fs.cps.Keys() {
-		cp, ok := ix.fs.cps.Get(at)
+	for _, k := range ix.fs.cps.Keys() {
+		cp, ok := ix.fs.cps.Get(k)
 		if !ok || cp.ns != ns {
 			continue
 		}

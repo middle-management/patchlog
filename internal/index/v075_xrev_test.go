@@ -63,3 +63,38 @@ func v75xCookieLosesRead(t *testing.T, path string) {
 		t.Errorf("under the cookie once %s lost read: %d %v", path, got.status, p37Hits(got.body))
 	}
 }
+
+// TestV075XrevCheckpointSharedAt (§B.11.9 gs, §B.11.5): a grant reads at
+// its own gs as of the URL's at, which the index judges from the
+// checkpoint it holds for that at. Where it follows both a covered content
+// namespace and the catalog that decides it, their combined checkpoints
+// are over the same members at the same ns_ids, so they share an at: the
+// catalog's checkpoint, computed for one of its readers, must not stand in
+// for the content namespace's, so that TestV075IndexOldGsAt's older-at
+// redirect still holds.
+func TestV075XrevCheckpointSharedAt(t *testing.T) {
+	t.Parallel()
+	w := newV75X(t, false)
+	x := w.start(false, "cat-season", "matches")
+	w.x = x
+	fan := w.reader("user:fan", []any{"fans"})
+	_, gs1, at1 := w.pointer("/matches?limit=3", fan)
+	r := x.raw("/cat-season", w.catReader("user:fan", "fans"))
+	loc := r.header.Get("Location")
+	if r.status != 302 || !strings.HasPrefix(loc, "/cat-season/g/") {
+		t.Fatalf("pointer: %d %s %v", r.status, loc, r.body)
+	}
+	if p := strings.Split(strings.SplitN(loc, "?", 2)[0], "/"); p[5] != at1 {
+		t.Fatalf("cat-season's at %s, matches' %s: not shared", p[5], at1)
+	}
+	w.put("cat-season", "fanclub", map[string]any{"parents": v75Parents("root"), "$access": map[string]any{"user:fan": []any{"reader"}}})
+	x.caughtUp("cat-season")
+	loc2, gs2, at2 := w.pointer("/matches?limit=1", fan)
+	if gs1 == gs2 || at1 == at2 {
+		t.Fatalf("gs %s at %s unchanged", gs2, at2)
+	}
+	old := "/matches/g/" + gs1 + "/at/" + at1 + "?limit=1"
+	if r := x.raw(old, fan); r.status != 302 || r.header.Get("Location") != loc2 {
+		t.Errorf("GET %s: %d %q %v (want 302 to %s, as TestV075IndexOldGsAt)", old, r.status, r.header.Get("Location"), r.body, loc2)
+	}
+}
