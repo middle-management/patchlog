@@ -247,7 +247,7 @@ func (ix *Index) wantMember(m string) {
 // follower stopped before ends first. ix.mem.mu is held.
 func (ix *Index) startMember(m string) bool {
 	mb := ix.mem.get(m)
-	if mb.stop != nil || mb.purged || ix.mem.run == nil || ix.mem.run.Err() != nil {
+	if mb.stop != nil || mb.purged || ix.mem.run == nil {
 		return false
 	}
 	ctx, cancel := context.WithCancel(ix.mem.run)
@@ -455,6 +455,11 @@ func (ix *Index) runMembers(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// No follower starts once run is nil (startMember), so none
+			// is added while this waits.
+			ix.mem.mu.Lock()
+			ix.mem.run = nil
+			ix.mem.mu.Unlock()
 			ix.mem.wg.Wait()
 			return
 		case <-ix.mem.kick:
