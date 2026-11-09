@@ -493,12 +493,40 @@ func (q *query) file(n *Node) any {
 // a sealed or e2e catalog (Node.Epoch), and that of each item's file
 // metadata in a sealed namespace (FileMeta.Epoch); and, from the first
 // entry of its log, the epoch each explicit node's born is served under
-// (Node.BornEpoch), which migration 005 marks pending again. Until then, and for a
-// head the service can't read for good (lastingKeyErr, gone or not
-// content), listings seal those values under the current epoch, as
-// earlier releases did; any other failure is returned, and the fill made
-// again (retryBackfill). Listings change at an unchanged combined
-// checkpoint, so the catalog's cached listings go, as backfillFiles does.
+// (Node.BornEpoch), which migration 005 and markBornEpochs mark pending
+// again. Until then, and for a head the service can't read for good
+// (lastingKeyErr, gone or not content), a head's epoch defaults to the
+// current one, and a born whose epoch isn't known is left out of sealed
+// and e2e listings, never sealed with the head's values (§E.2.6); any
+// other failure is returned, and the fill made again (retryBackfill).
+// Listings change at an unchanged combined checkpoint, so the catalog's
+// cached listings go, as backfillFiles does.
+// markBornEpochs marks, once per database (meta "bornsnap"), the borns
+// whose epoch isn't known for backfillEpochs to read in again (meta
+// "epochs"). Before v0.76 a born's epoch was that of its first entry's
+// served kid, which at E3 the log gives own sealed ops without, so an e2e
+// catalog's borns were stored with none and the fill recorded done; it is
+// now its snapshot's (snapshotBornEpoch, §E.3.1), and a born without one
+// is left out of listings (§E.2.6). A new or rebuilt database has no
+// such borns: it is only marked.
+func (s *Service) markBornEpochs(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO meta (k, v) SELECT 'epochs', 'pending'
+WHERE NOT EXISTS (SELECT 1 FROM meta WHERE k = 'bornsnap')
+AND EXISTS (SELECT 1 FROM nodes WHERE born IS NOT NULL AND born <> '' AND born_epoch IS NULL)
+ON CONFLICT (k) DO NOTHING`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO meta (k, v) VALUES ('bornsnap', 'done') ON CONFLICT (k) DO NOTHING`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Service) backfillEpochs(ctx context.Context) error {
 	var pending string
 	err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'epochs'`).Scan(&pending)

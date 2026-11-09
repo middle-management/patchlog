@@ -106,7 +106,8 @@ func TestV076V03ListingUnwrappableKey(t *testing.T) {
 // a log the server gives in the clear. n, created in epoch 1 and retitled
 // in epoch 2, is listed per entry under cat#2 with only its title, its
 // born sealed apart under cat#1. A born whose epoch isn't known is left
-// out, never sealed with the head's values.
+// out, never sealed with the head's values; one a database from before
+// v0.76 stored without it is read in again on start.
 func TestV076V03BornEpochE3(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -201,4 +202,23 @@ func TestV076V03BornEpochE3(t *testing.T) {
 	must(x2.CreateDocSealed(ctx, "cat", "later", map[string]any{"title": "Later", "parents": parents("root@a2")}))
 	x.caughtUp("cat")
 	check("unknown", "")
+
+	// A database from before v0.76, which stored an E3 born's epoch from
+	// its first entry's served kid, none for an own sealed op, and
+	// recorded the fill done: its borns are read in again, once
+	// (markBornEpochs), under their snapshot's epoch.
+	x.stop()
+	sq = must(sql.Open("sqlite", db))
+	for _, q := range []string{`UPDATE nodes SET born_epoch = NULL WHERE name = 'n'`, `DELETE FROM meta WHERE k IN ('epochs', 'bornsnap')`, `DELETE FROM sealed_views`} {
+		if _, err := sq.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sq.Close()
+	x = startSvc(t, sc, svcOpts{now: s.Now, db: db}, withRecipient)
+	x.caughtUp("cat")
+	waitFor(t, "the borns read in again", func() bool {
+		return x.listingAs("/cat/children?of=root", rd).header.Get("Content-Type") == "application/json"
+	})
+	check("upgraded", "cat#1")
 }

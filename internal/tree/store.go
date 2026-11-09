@@ -33,7 +33,8 @@ import (
 //	                                 (backfillEpochs, as for items.file's epoch); born_epoch,
 //	                                 the epoch the first revision is served under, which
 //	                                 seals born where it isn't epoch (§E.2.6), filled in
-//	                                 the same way
+//	                                 the same way, and once more for a database from before
+//	                                 v0.76 (markBornEpochs, meta "bornsnap")
 //	edges(child, pos, parent, ord, state)
 //	                                 one row per declared parents entry (hrefs), with its state
 //	items(ns, name, state, head, title, created, file)
@@ -53,7 +54,9 @@ import (
 //	edge_subjects, edge_buckets      the subjects of each subject set the service minted edge
 //	                                 grants for, until the last of them expires, and its
 //	                                 exchangeRate buckets (svcedge.Store, edgegrants.go); meta
-//	                                 "trusted:{ns}" is when it came to trust ns
+//	                                 "inckpt:{ns}" is when ns entered the combined checkpoint
+//	                                 while trusted (§B.11.5 g/all); "trusted:{ns}" rows from
+//	                                 before v0.76 are dropped on start (loadTrusted)
 //	cdn_repurge(id, tags, due)       second CDN purges (package repurge), kept by a rebuild
 //
 // The tables are migrations (migrations/, package dbmigrate), applied under

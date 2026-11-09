@@ -363,6 +363,9 @@ func (s *Service) init(ctx context.Context) error {
 			return fmt.Errorf("tree: rebuild: %w", err)
 		}
 	}
+	if err := s.markBornEpochs(ctx); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
+	}
 	if s.opt.Hook != nil {
 		if err := s.opt.Hook.Init(ctx, s.db); err != nil {
 			return err
