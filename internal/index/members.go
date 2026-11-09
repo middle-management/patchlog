@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"slices"
@@ -33,25 +34,40 @@ import (
 // namespace the index serves (purgeTx, purgeStored, purgeKept). The
 // checkpoint is committed with that purge's second purge in
 // member_checkpoints, and the read mode and level last applied in
-// member_conf (migration 008), so a restart resumes where the follower
-// stopped and purges made meanwhile still reach the cache. A new follower
-// starts at the member's head, purging idx:{m} once: what was cached
-// before had no follower behind it.
+// member_conf (migration 008), so a restart on the same store resumes
+// where the follower stopped and purges made meanwhile still reach the
+// cache (§B.5 Behind: "a restart on the same store doesn't wait again").
+// A new follower starts at the member's head, purging idx:{m} once: what
+// was cached before had no follower behind it.
 //
 // memberAt takes a member at its follower's committed checkpoint, never at
 // a head no follower has applied, so every purge after the position an
-// answer was computed at drops it (kept.Store.Generation sees the purges
-// that race its read). It waits, up to MinWait, for the follower to reach
-// the head the grant checker read, so answers are no staler than the
-// checker's; until the follower holds its first checkpoint, a member's
+// answer was computed at drops it (kept.Store.Generation, taken as the
+// view reads the member's position, before its state, sees the purges
+// that race its read: fcp.gens). It waits, up to MinWait, for the
+// follower to reach the head the grant checker read, so answers are no
+// staler than the checker's; until the follower holds its first checkpoint, a member's
 // state can't be read, and a partial reader of a namespace covered through
-// it is answered 503 behind (errNotReached). A follower starts when
+// it is answered 503 behind (errMemberBehind). A follower starts when
 // coverage first reads its member (memberAt, baseFollowed). The reconciler
 // (Run, reconcile) stops it once no namespace the index serves reads it
-// for its coverage, purging idx:{m} once more, as nothing purges it after;
-// it judges that again whenever a namespace document coverage reads may
-// have changed: a config or purge-ns entry applied, or a member's first
-// checkpoint.
+// for its coverage, purging idx:{m} once more, as nothing purges it after,
+// and forgets its checkpoint (forgetMember): a follower started again
+// later is a new catch-up, which starts at the head as any new one, never
+// from a checkpoint nothing followed since (§B.5 Behind), and a stopped
+// follower still ending commits and publishes nothing more (current). The
+// reconciler judges that again whenever a namespace document coverage
+// reads may have changed: a config or purge-ns entry applied, or a
+// member's first checkpoint.
+
+// errMemberBehind is a member whose follower holds no checkpoint yet
+// (memberCP): 503 behind, with Retry-After (writeUpstreamErr). It is never
+// errNotReached, a namespace the index itself hasn't reached, whose
+// coverage can't be told yet and which grantAccess reads by rules alone
+// where its current document says it can't be covered: a namespace the
+// index has reached, and covers at its checkpoint, is never read by rules
+// alone for want of a member's checkpoint (§A.4, §B.11.9).
+var errMemberBehind = errors.New("a namespace visibility reads is not followed yet")
 
 // members are the index's members and their followers.
 type members struct {
@@ -94,6 +110,22 @@ func (ms *members) get(m string) *member {
 		ms.m[m] = mb
 	}
 	return mb
+}
+
+// reset forgets m's checkpoint, as before its first, and wakes memberAt's
+// waiters (forgetMember); ix.mem.mu is held.
+func (mb *member) reset() {
+	mb.cur, mb.applied, mb.order = "", map[string]bool{}, nil
+	close(mb.changed)
+	mb.changed = make(chan struct{})
+}
+
+// current reports whether done is that of m's running follower: one
+// stopped since commits and publishes nothing more (forgetMember);
+// ix.mem.mu is held.
+func (ms *members) current(m string, done chan struct{}) bool {
+	mb := ms.m[m]
+	return mb != nil && mb.stop != nil && mb.done == done
 }
 
 // reach records that m's follower reached ids, the last its checkpoint
@@ -182,7 +214,7 @@ func noteNeed(ctx context.Context, m string) {
 // (memberAt), once its follower has reached head, the head the grant
 // checker read ("" for any checkpoint), waiting up to MinWait for it; at
 // the end of the wait, the checkpoint it holds. ok is false once m's
-// purge-ns is applied. Before the first checkpoint it is errNotReached.
+// purge-ns is applied. Before the first checkpoint it is errMemberBehind.
 // The follower is started if it isn't running.
 func (ix *Index) memberCP(ctx context.Context, m, head string) (id string, ok bool, err error) {
 	noteNeed(ctx, m)
@@ -202,6 +234,7 @@ func (ix *Index) memberCP(ctx context.Context, m, head string) (id string, ok bo
 		case purged:
 			return "", false, nil
 		case reached:
+			ix.noteGens(ctx)
 			return cur, true, nil
 		}
 		select {
@@ -214,8 +247,9 @@ func (ix *Index) memberCP(ctx context.Context, m, head string) (id string, ok bo
 			// Shutting down: answer now, as if the wait had run out.
 		}
 		if cur == "" {
-			return "", false, fmt.Errorf("%w: %s, which visibility reads, is not followed yet (§A.4)", errNotReached, m)
+			return "", false, fmt.Errorf("%w: %s (§A.4)", errMemberBehind, m)
 		}
+		ix.noteGens(ctx)
 		return cur, true, nil
 	}
 }
@@ -265,7 +299,7 @@ func (ix *Index) startMember(m string) bool {
 				return
 			}
 		}
-		ix.followMember(ctx, m)
+		ix.followMember(ctx, m, done)
 		ix.mem.mu.Lock()
 		if mb.done == done {
 			mb.stop = nil
@@ -277,10 +311,10 @@ func (ix *Index) startMember(m string) bool {
 
 // followMember follows m until ctx is done or m is purged. A follower that
 // stops on an error is restarted after a pause, as Index.follow does.
-func (ix *Index) followMember(ctx context.Context, m string) {
+func (ix *Index) followMember(ctx context.Context, m string, done chan struct{}) {
 	pause := time.Second
 	for {
-		err := ix.runMember(ctx, m)
+		err := ix.runMember(ctx, m, done)
 		if ctx.Err() != nil {
 			return
 		}
@@ -316,14 +350,14 @@ func (ix *Index) memberCheckpoints() follow.SQLCheckpoints {
 	return follow.SQLCheckpoints{DB: ix.db, Table: "member_checkpoints"}
 }
 
-// runMember runs one follower of m, from the head where it has no
-// checkpoint yet (bootstrapMember).
-func (ix *Index) runMember(ctx context.Context, m string) error {
+// runMember runs one follower of m, the one done ends, from the head
+// where it has no checkpoint yet (bootstrapMember).
+func (ix *Index) runMember(ctx context.Context, m string, done chan struct{}) error {
 	ix.mem.mu.Lock()
 	cur := ix.mem.get(m).cur
 	ix.mem.mu.Unlock()
 	if cur == "" {
-		if err := ix.bootstrapMember(ctx, m); err != nil {
+		if err := ix.bootstrapMember(ctx, m, done); err != nil {
 			return err
 		}
 	}
@@ -332,19 +366,24 @@ func (ix *Index) runMember(ctx context.Context, m string) error {
 		follow.WithOnError(func(n string, err error) { ix.opt.Logf("index: %s, which visibility reads: %v", n, err) }),
 	}
 	opts = append(opts, ix.opt.FollowOptions...)
-	return follow.New(ix.c, m, memberCPs{ix.memberCheckpoints()}, memberHandler{ix}, opts...).Run(ctx)
+	return follow.New(ix.c, m, memberCPs{ix.memberCheckpoints()}, memberHandler{ix, done}, opts...).Run(ctx)
 }
+
+// errMemberStopped is a member's follower that was stopped (current).
+var errMemberStopped = errors.New("the follower was stopped")
 
 // bootstrapMember gives m its first checkpoint, its head, with the read
 // mode and level of its document there, and purges idx:{m} (above).
-func (ix *Index) bootstrapMember(ctx context.Context, m string) error {
+func (ix *Index) bootstrapMember(ctx context.Context, m string, done chan struct{}) error {
 	if ix.testMemberBootstrap != nil {
 		ix.testMemberBootstrap(ctx, m)
 	}
 	h, err := ix.c.NSHead(ctx, m)
 	if client.IsPurged(err) {
 		ix.mem.mu.Lock()
-		ix.mem.get(m).reach("", true)
+		if ix.mem.current(m, done) {
+			ix.mem.get(m).reach("", true)
+		}
 		ix.mem.mu.Unlock()
 		return follow.ErrPurged
 	}
@@ -374,21 +413,40 @@ func (ix *Index) bootstrapMember(ctx context.Context, m string) error {
 	if err := ix.memberCheckpoints().Save(ctx, tx, ix.origin, m, h.ID); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := ix.commitMember(tx, m, done); err != nil {
 		return err
 	}
 	ix.purgeStored(ctx, m, tags, false)
 	ix.purgeKept(m, tags)
 	ix.mem.mu.Lock()
-	ix.mem.get(m).reach(h.ID, false)
+	if ix.mem.current(m, done) {
+		ix.mem.get(m).reach(h.ID, false)
+	}
 	ix.mem.mu.Unlock()
 	ix.checker.Observe(m, h.ID)
 	ix.kickMembers()
 	return nil
 }
 
-// memberHandler applies a member's batches (above).
-type memberHandler struct{ ix *Index }
+// commitMember commits tx, which saves m's checkpoint, unless the
+// follower done ends was stopped (current): its checkpoint is forgotten
+// (forgetMember). ix.wmu is held, which forgetMember takes too.
+func (ix *Index) commitMember(tx *sql.Tx, m string, done chan struct{}) error {
+	ix.mem.mu.Lock()
+	ok := ix.mem.current(m, done)
+	ix.mem.mu.Unlock()
+	if !ok {
+		return errMemberStopped
+	}
+	return tx.Commit()
+}
+
+// memberHandler applies a member's batches (above), for the follower done
+// ends.
+type memberHandler struct {
+	ix   *Index
+	done chan struct{}
+}
 
 // Apply implements follow.Handler: of b it applies only the checkpoint,
 // purges and config entries (§A.1), in one transaction.
@@ -421,7 +479,7 @@ func (h memberHandler) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := ix.memberCheckpoints().Save(ctx, tx, b.Origin, b.NS, b.NewCheckpoint); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := ix.commitMember(tx, b.NS, h.done); err != nil {
 		return err
 	}
 	// As Apply: purged before the checkpoint is out.
@@ -432,7 +490,9 @@ func (h memberHandler) Apply(ctx context.Context, b *follow.Batch) error {
 		ids = append(ids, u.Entry.ID)
 	}
 	ix.mem.mu.Lock()
-	ix.mem.get(b.NS).reach(b.NewCheckpoint, co.PurgedNS, ids...)
+	if ix.mem.current(b.NS, h.done) {
+		ix.mem.get(b.NS).reach(b.NewCheckpoint, co.PurgedNS, ids...)
+	}
 	ix.mem.mu.Unlock()
 	// The checker reads the member's head again, toward which memberAt
 	// waits.
@@ -508,11 +568,17 @@ func (ix *Index) reconcile(ctx context.Context) {
 	ix.mem.mu.Lock()
 	ix.mem.needs = needs
 	for m, mb := range ix.mem.m {
-		if !want[m] && mb.stop != nil {
+		if want[m] || mb.stop == nil && mb.cur == "" {
+			continue
+		}
+		// Running, or holding a checkpoint (loadMembers) nothing follows
+		// on from.
+		if mb.stop != nil {
 			mb.stop()
 			mb.stop = nil
-			stopped = append(stopped, m)
 		}
+		mb.reset()
+		stopped = append(stopped, m)
 	}
 	for m := range want {
 		ix.startMember(m)
@@ -521,15 +587,19 @@ func (ix *Index) reconcile(ctx context.Context) {
 	sort.Strings(stopped)
 	for _, m := range stopped {
 		ix.opt.Logf("index: %s is no longer read by the coverage of a namespace the index serves; not following it", m)
-		if err := ix.purgeMember(ctx, m); err != nil {
+		if err := ix.forgetMember(ctx, m); err != nil {
 			ix.opt.Logf("index: purging idx:%s: %v", m, err)
 		}
 	}
 }
 
-// purgeMember purges idx:{m}, by the path a purge in m takes, once m's
-// follower stopped: nothing purges it after.
-func (ix *Index) purgeMember(ctx context.Context, m string) error {
+// forgetMember purges idx:{m}, by the path a purge in m takes, once m's
+// follower stopped: nothing purges it after. Its checkpoint and read mode
+// are forgotten with it, in the same transaction (reconcile forgot the
+// checkpoint in memory already), unless a follower started again since,
+// which bootstraps them afresh: a follower started later starts at the
+// head, and a restart doesn't resume from them (§B.5 Behind).
+func (ix *Index) forgetMember(ctx context.Context, m string) error {
 	tags := []string{"idx:" + m}
 	ix.wmu.Lock()
 	tx, err := ix.db.BeginTx(ctx, nil)
@@ -538,6 +608,15 @@ func (ix *Index) purgeMember(ctx context.Context, m string) error {
 		return err
 	}
 	err = ix.purgeTx(ctx, tx, tags)
+	ix.mem.mu.Lock()
+	again := ix.mem.get(m).stop != nil
+	ix.mem.mu.Unlock()
+	if err == nil && !again {
+		_, err = tx.ExecContext(ctx, `DELETE FROM member_checkpoints WHERE origin = ? AND ns = ?`, ix.origin, m)
+	}
+	if err == nil && !again {
+		_, err = tx.ExecContext(ctx, `DELETE FROM member_conf WHERE ns = ?`, m)
+	}
 	if err == nil {
 		err = tx.Commit()
 	}

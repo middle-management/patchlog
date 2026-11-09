@@ -606,6 +606,9 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		if _, _, ok := ix.kept.Get(targetOf(rv, cur)); !ok {
 			if info, _, err := ix.keys.Current(ctx, ns); err == nil {
 				var fe *FieldError
+				if ix.testBeforeAnswer != nil {
+					ix.testBeforeAnswer()
+				}
 				if _, got, err := ix.answer(ctx, a, ns, rv, rq, info); err == nil {
 					to = got
 				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) && !errors.Is(err, errLackCounts) {
@@ -722,12 +725,12 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 // keys"), and one for now (a 5xx, a 429, the core unreachable) is 503
 // behind, with Retry-After (scenario 100: "While those keys only can't
 // yet be fetched → 503 behind", §12.1), as is a namespace visibility reads
-// whose follower holds no checkpoint yet (errNotReached, members.go). Every read check and view this
-// service answers 502 for passes through here, so each gets the same
-// answer.
+// whose follower holds no checkpoint yet (errMemberBehind, members.go).
+// Every read check and view this service answers 502 for passes through
+// here, so each gets the same answer.
 func (ix *Index) writeUpstreamErr(w http.ResponseWriter, what string, err error, msg string) {
 	ix.opt.Logf("index: %s: %v", what, err)
-	if errors.Is(err, errNotReached) {
+	if errors.Is(err, errMemberBehind) {
 		// A namespace visibility reads not followed yet (members.go).
 		writeBehind(w, err.Error())
 		return
@@ -845,6 +848,12 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	for try := 0; a.cov != nil; try++ {
 		if at == a.cov.cp.ids[ns] {
 			cp, at = a.cov.cp, a.cov.cp.at
+			if g := cp.gens; g != nil {
+				// The view read other namespaces before gen was taken
+				// (serve's cover): kept only if no purge since carried
+				// its tags (fcp.gens).
+				gen = min(gen, g.kept)
+			}
 			break
 		}
 		if try == 2 {

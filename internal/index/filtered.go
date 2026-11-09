@@ -126,6 +126,45 @@ type fcp struct {
 	// and in a catalog's members (whose placements a catalog shows only
 	// where their items are live).
 	live map[string]map[string]bool
+	// gens are the generations of the stores answers are kept in, taken
+	// as the checkpoint first read another namespace's position (memberAt,
+	// baseFollowed: noteGens), before it read that namespace's state; nil
+	// where it read none. An answer whose view was computed here isn't kept
+	// where a purge since, in a namespace it read, carried one of its tags
+	// (§A.1: "drop kept results"; answer, refsAnswer): such a purge drops
+	// what fstate keeps of that namespace (fsForget) before it counts in
+	// any store (purgeStored), so a view that read the namespace's state
+	// before that drop took its generations before the purge too.
+	gens *fcpGens
+}
+
+// fcpGens are the kept results' generation of the checkpoint's namespace
+// (kept.Store.Generation), /_refs answers' and stored sealed results'.
+type fcpGens struct{ kept, refs, sealed uint64 }
+
+// gensKey carries a gensSet, the generations a computation of a
+// checkpoint of ns noted (fcp.gens).
+type gensKey struct{}
+
+type gensSet struct {
+	mu sync.Mutex
+	ns string
+	g  *fcpGens
+}
+
+// noteGens notes, for the checkpoint ctx computes, the stores' generations
+// now, as it reads another namespace's position: the first note, the
+// earliest, holds.
+func (ix *Index) noteGens(ctx context.Context) {
+	s, _ := ctx.Value(gensKey{}).(*gensSet)
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.g == nil {
+		s.g = &fcpGens{kept: ix.kept.Generation(s.ns), refs: ix.refs.Generation(refsScope), sealed: ix.sealed.Generation()}
+	}
 }
 
 // errNotReached is a namespace the index hasn't reached yet whose
@@ -304,7 +343,7 @@ func (ix *Index) liveAt(ctx context.Context, ns, id string) (map[string]bool, er
 // MinWait, never a head no follower has applied; its document there is
 // docAt(m, id), which never changes. ok is false for a namespace that is
 // purged, doesn't exist or is a remote branch (§B.11.9: local, unpurged
-// members only); err is a document the index can't read, or errNotReached
+// members only); err is a document the index can't read, or errMemberBehind
 // before m's follower holds its first checkpoint (503 behind to partial
 // readers). Callers depend on that contract alone, not on where the
 // position comes from.
@@ -320,6 +359,7 @@ func (ix *Index) memberAt(ctx context.Context, m string) (id string, ok bool, er
 		case purged:
 			return "", false, nil
 		case id != "":
+			ix.noteGens(ctx)
 			return id, true, nil
 		}
 	}
@@ -553,6 +593,8 @@ func keyEntries(doc map[string]any, kid string) []byte {
 // checkpoint of it, nil if ns isn't covered (§B.11.9 URLs, §A.4). It
 // reads every member's state it needs and keeps the result by at.
 func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
+	gens := &gensSet{ns: ns}
+	ctx = context.WithValue(ctx, gensKey{}, gens)
 	cp, cats, err := ix.coverage(ctx, ns, z)
 	if err != nil || cp == nil {
 		return nil, err
@@ -624,6 +666,9 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 		}
 		cp.live[m] = l
 	}
+	gens.mu.Lock()
+	cp.gens = gens.g
+	gens.mu.Unlock()
 	ix.fs.mu.Lock()
 	ix.fs.cps.Put(cp.ns+"\x00"+cp.at, cp, 1)
 	ix.fs.mu.Unlock()

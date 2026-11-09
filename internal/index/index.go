@@ -29,7 +29,8 @@
 //	edge_gs_keys(marker, kid, roles, pub, exp)  every key a g: marker's live cookies came from,
 //	                                      with the read roles its scope digest covers (gsKey)
 //	member_checkpoints(origin, ns, ns_id)  follow.SQLCheckpoints of the namespaces visibility reads
-//	                                      that the index follows without serving them (members.go)
+//	                                      that the index follows without serving them, while it
+//	                                      follows them (members.go)
 //	member_conf(ns, public, level)        as ns_conf, for those
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
@@ -232,6 +233,10 @@ type Index struct {
 	// testMemberBootstrap, if set, is called before a member's follower
 	// gives it its first checkpoint (tests: bootstrapMember).
 	testMemberBootstrap func(ctx context.Context, m string)
+	// testBeforeAnswer, if set, is called once a reader's views are
+	// computed, before the answer is (tests: serve's head pointer,
+	// /_refs).
+	testBeforeAnswer func()
 }
 
 // Open opens (creating or, with Rebuild, recreating) the index database and
@@ -334,8 +339,9 @@ var migrations embed.FS
 
 // resetStmts empty what a rebuild replays (cdn_repurge stays, and so do
 // the edge grants' tables, edge_filters, edge_gs and svcedge.Store's, and
-// member_checkpoints and member_conf, whose followers derive no rows and
-// resume where they stopped, so no purge is missed, members.go), in one
+// member_checkpoints and member_conf, whose followers derive no rows: one
+// still needed resumes where it stopped, one no longer needed is forgotten
+// with a purge of idx:{m}, so no purge is missed, members.go), in one
 // transaction. checkpoints_bootstrap too: a snapshot left part-way would
 // otherwise be resumed, not replayed from its first page. text, made by
 // initSchema rather than a migration, is dropped, so a rebuild decides
@@ -873,9 +879,15 @@ func (ix *Index) purgeTx(ctx context.Context, tx *sql.Tx, tags []string) error {
 }
 
 // purgeStored drops, once the apply that purges tags in ns has committed,
+// what fstate keeps of ns (fsForget) where tags purge idx:{ns}, first, then
 // the sealed results stored since its own purge of them (purgeTx), and the
-// /_refs answers they remove (refsPurged).
+// /_refs answers they remove (refsPurged). fstate goes first: a view of
+// another namespace that read ns's state before is then computed before
+// any store counts the purge, and its answer isn't kept (fcp.gens).
 func (ix *Index) purgeStored(ctx context.Context, ns string, tags []string, purgedNS bool) {
+	if slices.Contains(tags, "idx:"+ns) {
+		ix.fsForget(ns)
+	}
 	ix.sealed.Purged(tags)
 	ix.refsPurged(ctx, ns, tags, purgedNS)
 }
@@ -887,8 +899,8 @@ func (ix *Index) purgeStored(ctx context.Context, ns string, tags []string, purg
 // (kept.Store.Generation). Results at a combined checkpoint of another
 // namespace that lists ns (§A.4, filtered.go) carry idx:{ns} too, whether
 // ns is one the index serves or one it follows only for visibility
-// (members.go), and so does what fstate keeps of ns (fsForget). Purgers
-// don't block.
+// (members.go); what fstate keeps of ns went before (purgeStored).
+// Purgers don't block.
 func (ix *Index) purgeKept(ns string, tags []string) {
 	ix.kept.Purge(ns, tags)
 	if slices.Contains(tags, "idx:"+ns) {
@@ -897,7 +909,6 @@ func (ix *Index) purgeKept(ns string, tags []string) {
 				ix.kept.Purge(other, []string{"idx:" + ns})
 			}
 		}
-		ix.fsForget(ns)
 	}
 	if len(tags) > 0 {
 		ix.opt.Purger.PurgeTags(tags)
