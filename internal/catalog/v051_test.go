@@ -19,8 +19,9 @@ import (
 // doesn't follow, read at the head, having none. A catalog node, 400 in a
 // catalog that is neither sealed nor end-to-end, reads only the catalog's
 // level (in a sealed one, a folder's visibility reads every trusted
-// namespace, v0.56 note 4). Every item but the node comes back with a
-// grant or "public": true, so the reader may read them all.
+// namespace, v0.56 note 4). The matches item comes back with a grant;
+// the public item of the untrusted namespace is 403 first, never
+// "public": true (§B.11.5 Every item at once, v0.76).
 func TestCheckpointNamesItsNamespaces(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -63,7 +64,7 @@ func TestCheckpointNamesItsNamespaces(t *testing.T) {
 		}
 		for i := range items {
 			e := entry(rg, i)
-			if e == nil || e["status"] != nil || e["checkpoint"] != nil || (i == 0) != (e["grant"] != nil) || (i == 1) != (e["public"] == true) {
+			if e == nil || e["checkpoint"] != nil || e["public"] != nil || (i == 0) != (e["grant"] != nil) || (i == 1) != (e["status"] == 403.0) {
 				t.Errorf("%s: entry %d: %v", when, i, e)
 			}
 		}

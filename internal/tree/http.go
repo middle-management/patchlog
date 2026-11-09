@@ -245,7 +245,7 @@ func (s *Service) viewer(ctx context.Context, r *http.Request, want string) (*vi
 	if cl := s.edgeClaims(r); cl != nil {
 		return s.edgeViewer(ctx, cl)
 	}
-	return s.grantViewer(ctx, Bearer(r), want, false)
+	return s.grantViewer(ctx, Bearer(r), want)
 }
 
 // edgeClaims is the edge grant the service minted that a GET or HEAD
@@ -318,12 +318,12 @@ func (s *Service) listed() map[string]bool {
 //     those grants (§B.11.5), unless want names another subject set. A
 //     public catalog needs no grant: one that doesn't verify for it still
 //     qualifies through the content namespaces alone, drawing from the
-//     exchangeRate bucket of its principal there. For an edge grant
-//     (forCookie), which covers every later at, every namespace the
-//     catalog trusts counts, those the service doesn't follow too: a
-//     g/all cookie is refused at an at including one trusted since its
-//     issue (trustedSince), and the service knows when each became
-//     trusted, not when it came into the checkpoint;
+//     exchangeRate bucket of its principal there. An edge grant, which
+//     covers every later at, is judged the same way, against the
+//     combined checkpoint only (§B.11.5, v0.76): a trusted namespace the
+//     service holds no checkpoint of doesn't count, and a g/all cookie is
+//     refused at an at including one that entered the checkpoint since
+//     its issue (trustedSince, entered);
 //   - with a RoleView (a catalog service), any other reader whose grant
 //     verifies for the catalog reads the listings of its subject set
 //     under /g/{gs}/, filtered by what its roles make visible (§B.11.5),
@@ -335,7 +335,7 @@ func (s *Service) listed() map[string]bool {
 //     any other reader is 403 (§B.11.5).
 //
 // A request at a want other than the viewer's gs is 403 (serve).
-func (s *Service) grantViewer(ctx context.Context, token, want string, forCookie bool) (*viewer, error) {
+func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer, error) {
 	// In a release preview every check is on the branch read in place of
 	// a namespace: a viewer sees only branches it can read (§B.5).
 	cat := s.actual(s.opt.Catalog)
@@ -401,7 +401,7 @@ func (s *Service) grantViewer(ctx context.Context, token, want string, forCookie
 				}
 			}
 		}
-		if forCookie || listed[ns] {
+		if listed[ns] {
 			all = all && wide[ns]
 		}
 	}
@@ -641,7 +641,10 @@ var ops = map[string]bool{
 // another (Node.BornEpoch): that one is sealed in place, as a value of
 // another resource is, "born": { "sealed": JWE of { born } } under the
 // node's K_r of its epoch, pl { ns, name, view }, and left out where the
-// service can't have that epoch's key (§E.2.6). A g/all listing of a catalog that isn't public,
+// service can't have that epoch's key, or where the epoch isn't known: a
+// born is never sealed under the head's epoch for want of its own
+// (§E.2.6; at E3 its epoch is its snapshot's, §E.3.1, bornOf). A g/all
+// listing of a catalog that isn't public,
 // which every reader its URL admits reads whole, whose nodes' values all
 // come from one epoch, is sealed as one JWE under that epoch's key,
 // Content-Type application/jose, pl { ns, view } where view is the
@@ -902,7 +905,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		// A g/all edge grant covers every later at, but not one that
 		// includes a namespace it wasn't checked against (§B.11.5).
 		w.Header().Set("Cache-Control", "no-store")
-		WriteError(w, http.StatusForbidden, "forbidden", "the edge grant for all predates the catalog's trust in "+ns+": exchange the grants again")
+		WriteError(w, http.StatusForbidden, "forbidden", "the edge grant for all predates "+ns+" in the combined checkpoint: exchange the grants again")
 		return
 	}
 	if p := s.profileAt(at, cur, curProf); v.cookie && p != nil && !p.Admits(v.subjects) {
@@ -1180,9 +1183,14 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				}
 				if info.Protected() {
 					// A born of another epoch than its node's head is a
-					// value of a revision of that epoch (§E.2.6).
+					// value of a revision of that epoch (§E.2.6); one
+					// whose epoch isn't known is left out, never sealed
+					// under the head's.
 					q.bornApart = func(n *Node) int {
-						if e := n.BornEpoch; e > 0 && e != epochOf(n.Name) {
+						switch e := n.BornEpoch; {
+						case e <= 0:
+							return bornLeftOut
+						case e != epochOf(n.Name):
 							return e
 						}
 						return 0
@@ -1980,7 +1988,10 @@ type query struct {
 	noteValues func(name string)
 	// bornApart, set for a sealed or e2e catalog, is the epoch an explicit
 	// node's born is served under where it isn't the one its other values
-	// are sealed under, 0 otherwise. Such a born is sealed in place, as a
+	// are sealed under, 0 where it is, and bornLeftOut where it isn't
+	// known (Node.BornEpoch 0): such a born is left out, never sealed with
+	// the node's other values under the head's epoch (§E.2.6, §E.3.1).
+	// A born of another epoch is sealed in place, as a
 	// value of another resource is (§E.2.6): sealIn seals it per entry,
 	// under the node's K_r of that epoch ("" where the service lacks the
 	// key: left out), and noteEpoch counts its epoch for a listing sealed
@@ -2106,9 +2117,10 @@ func (q *query) entry(n *Node) map[string]any {
 		vals["title"] = n.Title
 	}
 	if n.Born != "" && !n.Self {
-		if e := q.bornEpoch(n); e > 0 {
+		switch e := q.bornEpoch(n); {
+		case e > 0:
 			q.bornIn(m, n, e)
-		} else {
+		case e == 0:
 			vals["born"] = n.Born
 		}
 	}
@@ -2147,8 +2159,12 @@ func (q *query) entry(n *Node) map[string]any {
 	return m
 }
 
+// bornLeftOut is bornApart's answer for a born whose epoch isn't known.
+const bornLeftOut = -1
+
 // bornEpoch is the epoch n's born is served under where it isn't that of
-// n's other values (bornApart), 0 otherwise.
+// n's other values (bornApart), bornLeftOut where it isn't known in a
+// sealed or e2e catalog, 0 otherwise.
 func (q *query) bornEpoch(n *Node) int {
 	if q.bornApart == nil {
 		return 0
