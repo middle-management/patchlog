@@ -801,10 +801,11 @@ var (
 // the request doesn't carry: 403 where the scope digest of rec's kid's
 // scope rules and its roles' definitions, read from ns's document as of
 // cp (a branch's keys follow its base, §C.4), with its block rules and
-// principal, differs from the one its subjects carry (a kid or role gone
-// counts as differing), and where its subjects leave out some of the
-// reader's groups and some deciding catalog keeps all groups (§B.11.5);
-// otherwise item 1 from rec's subjects and item 2 from its filter.
+// principal, differs from the one its subjects carry (a kid or role gone,
+// or no longer listing read, counts as differing), and where its subjects
+// leave out some of the reader's groups and some deciding catalog keeps
+// all groups (§B.11.5); otherwise item 1 from rec's subjects and item 2
+// from its filter.
 func (ix *Index) storedFview(ctx context.Context, cp *fcp, rec *markerRec) (*fview, error) {
 	doc, err := ix.docAt(ctx, cp.ns, cp.ids[cp.ns])
 	if err != nil {
@@ -823,14 +824,17 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, rec *markerRec) (*fvi
 		keys = eff.Keys
 	}
 	i := slices.IndexFunc(keys, func(k grant.Key) bool { return k.Kid == rec.kid })
-	if i < 0 {
+	if i < 0 || !keys[i].Lists("read") {
 		return nil, errRulesChanged
 	}
 	in := grantcheck.ScopeInput{ReadScopeResource: keys[i].ReadScopeResource, KeyRules: keys[i].Rules,
 		BlockRules: rec.f.BlockRules, Roles: map[string][]any{}, Principal: rec.f.Principal}
 	for _, r := range rec.roles {
+		// A role that no longer lists read counts as gone, as at the
+		// origin (core gsDigestHolds): a cookie never reads where its
+		// grant couldn't (§2.1, §A.4).
 		def, ok := cfg.Roles[r]
-		if !ok {
+		if !ok || !def.Lists("read") {
 			return nil, errRulesChanged
 		}
 		in.Roles[r] = def.Rules

@@ -62,6 +62,9 @@ type Rate struct{ Rate, Burst float64 }
 // IsStar reports whether the key's can contains "*".
 func (k Key) IsStar() bool { return contains(k.Can, "*") }
 
+// Lists reports whether the key's can allows verb: lists it, or "*".
+func (k Key) Lists(verb string) bool { return k.IsStar() || contains(k.Can, verb) }
+
 func contains(xs []string, s string) bool {
 	for _, x := range xs {
 		if x == s {
@@ -356,6 +359,9 @@ type RoleDef struct {
 	Can   []string
 	Rules []any
 }
+
+// Lists reports whether the role's can lists verb.
+func (d RoleDef) Lists(verb string) bool { return contains(d.Can, verb) }
 
 // ParseRoles parses the namespace document's "roles" value.
 func ParseRoles(v any) (Roles, error) {

@@ -59,9 +59,10 @@ func gsRecordOf(fv *fview, exp int64) *gsRecord {
 //     scope digest of its stored kid's scope rules and stored roles'
 //     definitions, read from {ns}'s document at cp, with its stored block
 //     rules and principal, differs from the stored one (a kid or role
-//     gone counts as differing); 403 where it is partial and some
-//     deciding catalog's Profile at cp keeps all groups; otherwise item 1
-//     from the stored subjects and item 2 from the stored filter;
+//     gone, or no longer listing read, counts as differing); 403 where
+//     it is partial and some deciding catalog's Profile at cp keeps all
+//     groups; otherwise item 1 from the stored subjects and item 2 from
+//     the stored filter;
 //   - a cookie for /ns/{ns}, which covers these URLs too, is judged as a
 //     cookie for urlGS would be;
 //   - no credentials, or an expired cookie, are 401.
@@ -126,8 +127,10 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 
 // gsDigestHolds reports whether rec's scope digest is the same with its
 // kid's scope rules and its roles' definitions as of n's document at cp
-// (§B.11.9 gs: "a gs cookie is 403 at an at where those rules differ").
-// Keys follow the base (§C.4).
+// (§B.11.9 gs: "a gs cookie is 403 at an at where those rules differ"),
+// its kid and each of its roles still listing read there, so that a
+// cookie never reads where its grant couldn't. Keys follow the base
+// (§C.4).
 func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	seq, ok := cp.seqs[n.name]
 	if !ok {
@@ -135,14 +138,16 @@ func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	}
 	cfg := t.fconfigAt(seq)
 	key, ok := findKey(t.effectiveKeys(n, cfg), rec.kid)
-	if !ok {
+	if !ok || !key.Lists("read") {
 		return false
 	}
 	in := grantcheck.ScopeInput{ReadScopeResource: key.ReadScopeResource, KeyRules: key.Rules, BlockRules: rec.blockRules,
 		Roles: map[string][]any{}, Principal: rec.principal}
 	for _, r := range rec.roles {
+		// A role that no longer lists read counts as gone: the grant
+		// doesn't read through it there (§2.1, §A.4's marker digest).
 		def, ok := cfg.Roles[r]
-		if !ok {
+		if !ok || !def.Lists("read") {
 			return false
 		}
 		in.Roles[r] = def.Rules
