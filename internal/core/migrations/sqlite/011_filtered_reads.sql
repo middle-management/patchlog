@@ -1,0 +1,46 @@
+-- Migration: filtered reads
+-- Created: 2026-11-09T05:02:36Z
+-- Checksum: 4f6d017aea562392dd013a8f947067727b1e9b24e1aec7faf27b84ae3f658d66
+-- Chain: e5e03336cbe7a07899abbb1bb8f2cf86f8971c07e32b697e383ee9d20ccd83f2
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- Filtered namespace reads (§B.11.9, filtered_state.go). filtered_gs keeps,
+-- for each subject set an edge grant was issued for, what a cookie for it
+-- is judged by: its subjects, and the rules and /principal values its
+-- scope digest covers (kid, read roles, block rules, readScope, principal,
+-- digest, the encoded grantcheck.ReadFilter), until exp, the latest of its
+-- cookies' expiries. filtered_ats records each combined checkpoint a
+-- filtered URL was minted at, ns → ns_id as JSON, swept after 7 days.
+CREATE TABLE IF NOT EXISTS filtered_gs (
+  gs          TEXT    PRIMARY KEY,
+  ns          TEXT    NOT NULL,
+  subjects    TEXT    NOT NULL,
+  partial     INTEGER NOT NULL,
+  kid         TEXT    NOT NULL,
+  roles       TEXT    NOT NULL,
+  block_rules TEXT    NOT NULL,
+  read_scope  INTEGER NOT NULL,
+  principal   TEXT    NOT NULL,
+  digest      TEXT    NOT NULL,
+  filter      TEXT    NOT NULL,
+  exp         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS filtered_gs_exp ON filtered_gs (exp);
+CREATE TABLE IF NOT EXISTS filtered_ats (
+  at          TEXT    PRIMARY KEY,
+  cps         TEXT    NOT NULL,
+  created     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS filtered_ats_created ON filtered_ats (created);
