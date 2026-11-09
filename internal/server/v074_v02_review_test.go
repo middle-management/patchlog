@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -100,8 +99,9 @@ func TestV074RemoteUnknownStartsKeepKeys(t *testing.T) {
 // Addendum E Levels, Invariant; §1, §G.5.2 (v0.74 review of LEVELS-5):
 // once B sees its source raised to sealed and its own raise fails for a
 // reason other than a lacking level, it serves none of what it had at at
-// below that level: reads and writes of those resources answer 503 with
-// Retry-After (not §1's 502), and their /heads rows lack created, size and
+// below that level: reads and writes of those resources answer 502
+// upstream naming the origin, without Retry-After (v0.76: §1's "or hasn't
+// succeeded", no longer 503), and their /heads rows lack created, size and
 // digest; resources created on the branch are unaffected.
 func TestV074RemoteFailedRaiseHeld(t *testing.T) {
 	t.Parallel()
@@ -125,9 +125,9 @@ func TestV074RemoteFailedRaiseHeld(t *testing.T) {
 		t.Fatalf("A serves %d %s, want sealed", ra.Code, ra.Body)
 	}
 	for _, r := range []*resp{b.get("/r/r/x/rev/" + x), b.get("/r/r/x"), b.write("PATCH", "r", "x", x, ops(op("replace", "/v", 2.0)))} {
-		expectCode(t, r, 503, "encryption_unavailable")
-		if r.H.Get("Retry-After") != "90" || !strings.Contains(string(r.Body), originA) {
-			t.Fatalf("held answer %v %s, want Retry-After 90 naming %s", r.H, r.Body, originA)
+		expectCode(t, r, 502, "upstream")
+		if r.H.Get("Retry-After") != "" || r.Str("origin") != originA {
+			t.Fatalf("held answer %v %s, want no Retry-After and origin %s", r.H, r.Body, originA)
 		}
 	}
 	rows := headRows(t, b.get("/ns/r/rev/"+b.nsHead("r")+"/heads"))

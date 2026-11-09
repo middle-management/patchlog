@@ -32,7 +32,7 @@ package core
 //     in HPKE auth mode, each entry naming its recipient (to) and the
 //     admin key that wrapped it (from) by thumbprint. Key-holding admin
 //     clients write it with ordinary plaintext writes, which the gate
-//     checks as outside E3 plus seal.ParseKeyringV2, kids naming the
+//     checks as outside E3 plus seal.CheckKeyringV2, kids naming the
 //     namespace and epochs not after encryption.epoch (checkKeyring). It is
 //     the only plaintext resource of an e2e namespace.
 //   - Epochs. encryption.epoch works as at E2, but the server holds no key:
@@ -542,16 +542,17 @@ func (t *tx) declaredAt(row *revRow) []ids.ID {
 
 // checkKeyring checks the keyring resource's documents in an e2e
 // namespace (§E.3.2): the keyring document, { "keys": [{ kid, to, from,
-// wrapped }] } with nothing else but a $nonce and no two entries for one
-// kid and to (seal.ParseKeyringV2), whose kids name this namespace and
-// epochs not after encryption.epoch. A keyring in the format before v0.63
-// is refused like any other document: a key holder wraps it again.
+// wrapped }] } with nothing else but a fresh $nonce (§C.7) and no two
+// entries for one kid and to (seal.CheckKeyringV2), whose kids name this
+// namespace and epochs not after encryption.epoch. A keyring in the format
+// before v0.63 is refused like any other document: a key holder wraps it
+// again.
 func (t *tx) checkKeyring(n *nsRow, cfg *Config, s *itemState) *Error {
 	for _, st := range s.steps {
 		if st.del {
 			continue
 		}
-		kr, err := seal.ParseKeyringV2(st.doc)
+		kr, err := seal.CheckKeyringV2(st.doc)
 		if err != nil {
 			msg := "the keyring resource of an e2e namespace must be a keyring document, { \"keys\": [{ \"kid\", \"to\", \"from\", \"wrapped\" }] } (§E.3.2): " + err.Error()
 			if _, lerr := seal.ParseKeyring(st.doc); lerr == nil {
@@ -697,7 +698,9 @@ func (t *tx) keyEpochs(n *nsRow, max int) []epochStart {
 // epochNow is the epoch base b has in force now (§E.2.3): its document's,
 // or for a remote branch's shadow, whose document stays as the remote base's
 // was at at, the latest of the source's epochs the follower has seen
-// (followRemote), if later.
+// (followRemote), if later. A deeper shadow whose current document B can't
+// read has no epoch now that a branch's keys go by: baseEpochs gives none
+// of its epochs before asking (chainReadable).
 func (t *tx) epochNow(b *nsRow) int {
 	cur := t.config(b.configSeq).Epoch
 	if !b.isShadow() {
@@ -723,8 +726,14 @@ func (t *tx) epochNow(b *nsRow) int {
 // "for the base epochs §E.2.3 selects" (Addendum E Levels), so this rule
 // alone bounds them, not preRaiseWindow, which judges the raised
 // namespace's own grants against its current epoch and document. A base
-// at at that isn't e2e gives none.
+// at at that isn't e2e gives none, and nor does a remote branch's deeper
+// base whose current namespace document B can't read (chainReadable,
+// §G.5.2 E3 sources): neither its keyring entries nor its pre-raise keys
+// are relayed, and its last-seen epoch isn't used.
 func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
+	if !t.chainReadable(b) {
+		return nil
+	}
 	var cseq, created int64
 	if err := t.QueryRow(`SELECT config_seq, created FROM ns_log WHERE seq = ?`, at).Scan(&cseq, &created); err != nil {
 		return nil
@@ -940,7 +949,8 @@ func (t *tx) kidName(b *nsRow) string {
 // the keyring's owner, checked when it was written; for a remote branch's
 // shadow, the remote base (§G.5). A keyring stored in the format before
 // v0.63 (seal.Keyring), which the gate refuses to write now, is relayed as
-// stored, without from, until a key holder wraps it again.
+// stored, without from, until a key holder wraps it again; so is one whose
+// $nonce, written before v0.76, isn't of the fresh form (seal.ParseKeyringV2).
 func keyringEntries(d any, enc *ecdh.PublicKey, epochs []int) []map[string]any {
 	want := make(map[int]bool, len(epochs))
 	for _, e := range epochs {

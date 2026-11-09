@@ -65,8 +65,8 @@ import (
 // its base's current document judges (checkRemoteSource), and by raising
 // its level when the base's rises (followLevel), or, on a server that
 // lacks the level, answering 502 upstream for what it mirrored (§1,
-// upstream.go), and 503 while a raise it could make fails. The shadows follow the branch's level (at rest, and for
-// sealing and e2e).
+// upstream.go), as it does while a raise it could make fails. The shadows
+// follow the branch's level (at rest, and for sealing and e2e).
 //
 //   - E2. B fetches with keys: the endpoint's grant gets them from the
 //     base's POST /ns/{ns}/keys, unwrapped with the endpoint's Identity
@@ -82,9 +82,12 @@ import (
 //     began, from its configuration history. History the base pruned can't
 //     be mirrored: its horizon is a sealed snapshot. Content from before a
 //     raise from sealed is mirrored with the base's sealings of it,
-//     verbatim, each keeping its epoch (fetchPreSealings, §G.5.2), checked
-//     with the base's keys of those epochs, which the branch hands out by
-//     start times read only from base.origin itself (originStarts).
+//     byte for byte, each keeping its epoch (fetchPreSealings, §G.5.2),
+//     checked with the base's keys of those epochs where B holds them and
+//     by their shape where it doesn't; B hands those keys out by start
+//     times read only from base.origin itself (originStarts). B never
+//     seals that content itself: a sealing the base didn't serve it
+//     answers 502 upstream, as for a failed fetch (preRaiseUnfetched).
 
 // RemoteAuthor is the author of entries this deployment writes on behalf of
 // a remote base: purges followed from its log, and mirrored horizons whose
@@ -1409,12 +1412,38 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 	if err != nil {
 		return nil, err
 	}
+	if res.Status == 201 && cfg != nil {
+		// The deeper bases' current namespace documents, read once now, so
+		// the branch relays their keys from the start where it can read
+		// them (§G.5.2 E3 sources, chainReadable); a failure leaves them
+		// withheld until a sync reads them, and doesn't fail creation.
+		if err := e.readChainAtCreation(ctx, req.NS, cfg.Base.Origin); err != nil {
+			log.Printf("remote branch %s: reading the current namespace documents of its deeper bases at %s: %v; their keys are relayed once a sync reads them", req.NS, cfg.Base.Origin, err)
+		}
+	}
 	if res.Status == 201 && cfg != nil && e.opt.Remote.Register {
 		if err := e.RegisterRemote(ctx, req.NS); err != nil {
 			log.Printf("remote branch %s: registering with %s: %v", req.NS, cfg.Base.Origin, err)
 		}
 	}
 	return res, nil
+}
+
+// readChainAtCreation runs followChainEpochs for remote branch ns, just
+// created with base origin.
+func (e *Engine) readChainAtCreation(ctx context.Context, ns, origin string) error {
+	var bases []*remoteBase
+	if err := e.read(ctx, func(t *tx) error {
+		bases = t.remoteBases(`n.name = ?`, ns)
+		return nil
+	}); err != nil || len(bases) == 0 {
+		return err
+	}
+	c, ep, err := e.remoteClient(origin)
+	if err != nil {
+		return err
+	}
+	return e.followChainEpochs(ctx, c, ep, bases[0])
 }
 
 // insertRemoteBranch inserts the shadow, the mirrored schemas and the
@@ -2430,9 +2459,15 @@ func (e *Engine) followPreStarts(ctx context.Context, c *client.Client, ep Remot
 // keyring entries to a grant without nbf only while that base's epoch now
 // is its epoch at at (§E.2.3, epochNow), and the follower of the base's
 // own log sees only the base's. An epoch later than the one at at is read
-// by epochNow alone, so its start time is when it was seen. A base that
-// can't be read keeps the epoch last seen, as the base itself does when
-// its log can't be followed; the error is reported.
+// by epochNow alone, so its start time is when it was seen. Whether each
+// read succeeded is recorded (remote_chain_read): B relays a deeper base's
+// keys only while it can read its current namespace document (§G.5.2 E3
+// sources), so after a failed read the branch's /keys gives none of that
+// base's keyring entries or pre-raise keys, and keeps no last-seen epoch
+// for it (baseEpochs, chainReadable), until a later read succeeds; the
+// error is reported. It runs at creation too (createRemoteBranch), so
+// those keys are relayed from the start where B can read them, and as the
+// follower starts for a branch never read (catchUpChainReads).
 func (e *Engine) followChainEpochs(ctx context.Context, c *client.Client, ep RemoteEndpoint, b *remoteBase) error {
 	type level struct {
 		shadow int64
@@ -2454,29 +2489,68 @@ func (e *Engine) followChainEpochs(ctx context.Context, c *client.Client, ep Rem
 		return err
 	}
 	docs := map[int64]sourceDoc{}
+	failed := map[int64]bool{}
 	var errs []error
 	for _, lv := range levels {
 		h, err := c.NSHead(ctx, lv.ns)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("/ns/%s: %w", lv.ns, err))
+			failed[lv.shadow] = true
 			continue
 		}
 		d, err := fetchSourceDoc(ctx, c, ep, lv.ns, h.ID)
 		if err != nil {
 			errs = append(errs, err)
+			failed[lv.shadow] = true
 			continue
 		}
 		docs[lv.shadow] = d
 	}
-	if len(docs) > 0 {
-		errs = append(errs, e.update(ctx, func(t *tx) error {
-			for sh, d := range docs {
-				t.followEpoch(sh, d, "")
-			}
-			return nil
-		}))
-	}
+	errs = append(errs, e.update(ctx, func(t *tx) error {
+		for sh, d := range docs {
+			t.followEpoch(sh, d, "")
+			t.chainRead(sh, true)
+		}
+		for sh := range failed {
+			t.chainRead(sh, false)
+		}
+		return nil
+	}))
 	return errors.Join(errs...)
+}
+
+// chainRead records whether the latest read of the current namespace
+// document of the deeper base shadow sh mirrors succeeded
+// (followChainEpochs, remote_chain_read).
+func (t *tx) chainRead(sh int64, ok bool) {
+	_, err := t.Exec(`INSERT INTO remote_chain_read (shadow, ok, at) VALUES (?,?,?) ON CONFLICT (shadow) DO UPDATE SET ok = excluded.ok, at = excluded.at`,
+		sh, ok, t.now.UnixMilli())
+	t.must(err)
+}
+
+// chainReadable reports whether a branch's /keys may relay keys of base b
+// (§G.5.2 E3 sources, baseEpochs): any base but a remote branch's deeper
+// shadow, one below its first (remoteShadows), whose namespace B mirrors
+// from further up A's chain; that one only while the follower's latest
+// read of its current namespace document succeeded, and not before the
+// first success after creation (remote_chain_read).
+func (t *tx) chainReadable(b *nsRow) bool {
+	if !b.isShadow() {
+		return true
+	}
+	var first bool
+	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM remote_bases WHERE shadow = ?)`, b.id).Scan(&first))
+	if first {
+		// The source itself, which the log follower covers.
+		return true
+	}
+	var ok bool
+	err := t.QueryRow(`SELECT ok FROM remote_chain_read WHERE shadow = ?`, b.id).Scan(&ok)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false
+	}
+	t.must(err)
+	return ok
 }
 
 // followLog follows the base's log after the checkpoint (followRemote).
@@ -2758,8 +2832,9 @@ func (t *tx) followConfig(bn *nsRow, id string, d sourceDoc) {
 //     server write can't remove, say): Levels refuse it, so the branch
 //     needs a rebase (§G.5.2). A failed raise is tried again at every sync
 //     (retryLevel); until it is made, the resources the base had at at
-//     answer 503 rather than be served below the base's level (Addendum E
-//     Levels, Invariant; remoteHeld, upstreamRefusal).
+//     answer 502 upstream, as for a lacking level (§1), rather than be
+//     served below the base's level (Addendum E Levels, Invariant;
+//     remoteHeld, upstreamRefusal).
 func (t *tx) followLevel(bn *nsRow, id string, level int) bool {
 	lacks, rebase := false, level == levelE2E
 	if t.e.opt.KeyStore == nil {
@@ -2784,7 +2859,7 @@ func (t *tx) followLevel(bn *nsRow, id string, level int) bool {
 	t.must(err)
 	if _, nowLacks, held := t.remoteHeld(t.nsByID(bn.id)); held != wasHeld || nowLacks != wasLacks {
 		// Copies of its resources, at the edge and in the read cache, go:
-		// they answer 502 or 503 now, or again as before (§9).
+		// they answer 502 now, or again as before (§9).
 		t.lostChanged(bn)
 	}
 	if lacks {
@@ -2803,8 +2878,8 @@ func followTarget(level int) int {
 }
 
 // lostChanged drops the copies of bn's resources and its dependents', at
-// the edge and in the read cache, when whether they answer 502 upstream,
-// or 503 while a raise is held (remoteHeld), changes (§1, §9, followLevel).
+// the edge and in the read cache, when whether they answer 502 upstream
+// (remoteHeld) changes (§1, §9, followLevel).
 func (t *tx) lostChanged(bn *nsRow) {
 	t.metaChanged = true
 	for _, n := range t.leavesFirst(bn) {
@@ -2847,7 +2922,7 @@ func (e *Engine) retryLevel(ctx context.Context, branch int64) error {
 // followed a source's raise to e2e only as far as the level the source
 // had before it, so a branch of a source raised from none stayed at none,
 // recorded for a rebase, and served in the clear. Without this its
-// resources would answer 503 encryption_unavailable from the upgrade until
+// resources would answer 502 upstream from the upgrade until
 // the first sync, a whole follow interval later; with it they are served
 // sealed from the start (followTarget, Addendum E Levels Invariant). It
 // needs nothing from the branches' sources. A raise that fails again stays
@@ -3026,9 +3101,11 @@ func (e *Engine) RegisterRemote(ctx context.Context, ns string) error {
 	})
 }
 
-// remoteLoop follows remote bases every interval until Close.
+// remoteLoop follows remote bases every interval until Close. It first
+// reads, as soon as it starts, the chains not yet read (catchUpChainReads).
 func (e *Engine) remoteLoop(interval time.Duration) {
 	defer e.bg.Done()
+	e.remoteJob(e.catchUpChainReads)
 	tk := time.NewTicker(interval)
 	defer tk.Stop()
 	for {
@@ -3036,24 +3113,77 @@ func (e *Engine) remoteLoop(interval time.Duration) {
 		case <-e.stop:
 			return
 		case <-tk.C:
-			ctx, cancel := context.WithCancel(context.Background())
-			go func() {
-				select {
-				case <-e.stop:
-				case <-ctx.Done():
-				}
-				cancel()
-			}()
-			if !e.leader(ctx) {
-				cancel()
-				continue // another instance follows them (pglock.go)
-			}
-			if err := e.SyncRemotes(leaderJob(ctx)); err != nil {
-				log.Printf("remote: %v", err)
-			}
-			cancel()
+			e.remoteJob(e.SyncRemotes)
 		}
 	}
+}
+
+// remoteJob runs f as a background job of remoteLoop, cancelled at Close,
+// on the leader only (pglock.go), and logs its error.
+func (e *Engine) remoteJob(f func(context.Context) error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-e.stop:
+		case <-ctx.Done():
+		}
+		cancel()
+	}()
+	if !e.leader(ctx) {
+		return // another instance follows them (pglock.go)
+	}
+	if err := f(leaderJob(ctx)); err != nil {
+		log.Printf("remote: %v", err)
+	}
+}
+
+// catchUpChainReads runs followChainEpochs, in the background as the
+// follower starts, for each remote branch with a deeper e2e base never
+// read (no remote_chain_read row): one created before migration
+// 013_remote_chain_read, whose /keys otherwise relays none of that base's
+// keyring entries or pre-raise keys until the first sync, a whole follow
+// interval later (chainReadable, §G.5.2 E3 sources). A read that fails
+// leaves them withheld, as at a sync.
+func (e *Engine) catchUpChainReads(ctx context.Context) error {
+	var due []*remoteBase
+	if err := e.read(ctx, func(t *tx) error {
+		for _, b := range t.remoteBases(`n.purged = 0`) {
+			bn := t.nsByID(b.branch)
+			if bn == nil || bn.purged {
+				continue
+			}
+			for i, sh := range t.remoteShadows(bn) {
+				if i == 0 || t.config(sh.configSeq).level != levelE2E {
+					continue
+				}
+				var read bool
+				t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM remote_chain_read WHERE shadow = ?)`, sh.id).Scan(&read))
+				if !read {
+					due = append(due, b)
+					break
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	var errs []error
+	for _, b := range due {
+		if err := e.jobStep(ctx); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		c, ep, err := e.remoteClient(b.origin)
+		if err == nil {
+			err = e.followChainEpochs(ctx, c, ep, b)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("remote branch %s: reading the chain of %s/ns/%s at start: %w", b.branchName, b.origin, b.ns, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func mustID(s string) ids.ID {

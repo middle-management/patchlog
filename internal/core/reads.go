@@ -1058,7 +1058,7 @@ func (t *tx) headRows(n *nsRow, page []headItem) []map[string]any {
 	plain := level < levelSealed
 	// Nor for a resource §1 answers 502 for, read through a remote branch
 	// whose source was raised to a level this server lacks, or one held
-	// back while the branch's raise fails (503, remoteHeld): its source
+	// back while the branch's raise fails (remoteHeld): its source
 	// hides them now (§1, §7.4).
 	rb, _, _, lost := t.lostRemote(n)
 	for _, h := range page {

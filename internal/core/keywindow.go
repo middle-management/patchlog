@@ -19,10 +19,16 @@ package core
 //     the current one, capped by historyEpochs;
 //   - against which epochs: those the content is served under, fixed as a
 //     request for it would fix one (§E.2.2): a revision's own (revEpoch),
-//     a blob's those of its referencing revisions (blobKeyEpochs), and for
-//     content no stored sealing has fixed yet, the current epoch, under
-//     which a read would fix it now. The check doesn't store that sealing:
-//     the request that next reads the content does.
+//     a blob's those of its referencing revisions (blobKeyEpochs). Content
+//     no stored sealing has fixed yet is fixed by the check, as a read
+//     would fix it (§E.2.2: "when it is first served or a check first
+//     judges by its epoch"): the check stores, in the request's own write
+//     transaction, the sealing of the revision's document, or for a blob
+//     that of its newest referencing revision, under the current epoch
+//     (fixRevEpoch, storeSeal), the first stored winning, and judges by
+//     that epoch. A refused request rolls the fixing back with the rest;
+//     a write's check phase in a read transaction stores nothing and
+//     judges by the epoch its write would fix.
 //
 // With authentication disabled every request gets K_e of the current
 // epoch only, as /keys gives it: a request is judged as a grant without
@@ -84,7 +90,8 @@ func (t *tx) keysOpenResource(a *actor, name string) bool {
 
 // revKeyOpen reports whether any of creds gets keys opening revision row
 // of resource name as sealed namespace n serves it, under the epoch it is
-// served under there (revEpoch, §6.1 Read permission).
+// served under there, which the check fixes where nothing has yet
+// (fixRevEpoch, §6.1 Read permission, §E.2.2).
 func (t *tx) revKeyOpen(n *nsRow, name string, row *revRow, creds []Credentials) bool {
-	return t.keysOpen(n, name, map[int]bool{t.revEpoch(n, row): true}, creds)
+	return t.keysOpen(n, name, map[int]bool{t.fixRevEpoch(n, name, row): true}, creds)
 }

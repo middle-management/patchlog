@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -221,16 +223,21 @@ func (t *tx) attachFetched(res int64, ch *remoteChain, bids []ids.ID, seq int64)
 // --- A's sealings from before its raise ---------------------------------------
 
 // E3 sources raised from sealed (§G.5.2, Addendum E Levels). B mirrors
-// A's sealings of content from before the raise verbatim: the JWEs A
+// A's sealings of content from before the raise byte for byte: the JWEs A
 // serves for those revisions' documents and log entries, and the sealed
-// blobs at their epoch URLs. They are fetched as A serves them, checked to
-// open under the keys of the epoch their kid names (the source's, which B
-// holds for its own /keys, fetchPreRaiseKeys) to the content the chain
-// verified, and stored under the shadow where B would store its own
-// sealing of them (the sealed table, blob_epochs), so B serves A's bytes
-// and never seals them again (preRaiseResJob, openSealedBlob). A sealing B
-// can't check, for want of its epoch's key, is left out: B seals it, as
-// before, under the same kid, pl and K_r.
+// blobs at their epoch URLs, those A names by redirecting …/blob/{bid}
+// included, so A fixes an epoch it hadn't yet. They are fetched as A
+// serves them and stored under the shadow where B would store its own
+// sealing of them (the sealed table, blob_epochs), so B serves A's bytes.
+// Each is checked to open, under the key of the epoch its kid names (the
+// source's, which B holds for its own /keys, fetchPreRaiseKeys), to the
+// content the chain verified; where B lacks that key it is stored after a
+// structural check alone: a compact JWE, or a sealed blob, whose kid names
+// the epoch A serves the revision under and whose pl names the content.
+// B never seals that content itself (preRaiseResJob, openSealedBlob):
+// what A didn't serve it (a 403, 404 or other answer that isn't a 5xx) is
+// left out, and B answers for it as for a failed fetch (502 upstream,
+// §G.3, preRaiseUnfetched).
 
 // preSealings are the sealings of an opaque chain's entries from before
 // its raise, as the base served them: by entry id, the log entry's and the
@@ -276,8 +283,10 @@ const maxPreSealing = 1 << 30
 // name of base namespace ns, checks them, and keeps them in ch.sealings,
 // which prefixes share. keys are the source's epoch keys from before each
 // raise, by namespace (remoteLevel.preKeys). Only no answer, or a 5xx,
-// fails creation, and a sealing that opens to other content than the
-// chain verified is unverified.
+// fails creation; a sealing that opens to other content than the chain
+// verified, or, where B lacks its epoch's key, isn't shaped as one of that
+// content under the kid A serves it with, is unverified. Any other answer
+// leaves that sealing out, to be answered 502 upstream (preRaiseUnfetched).
 func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name string, ch *remoteChain, keys map[string]map[int][]byte) *Error {
 	last := -1
 	for i := 0; i < ch.plain; i++ {
@@ -312,8 +321,10 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			return fail(&url.Error{Op: "GET", URL: path, Err: err})
 		}
 		if st != 200 {
-			log.Printf("remote base %s: its sealed log entries from before its raise: %d; the branch seals them itself", what, st)
-			return nil
+			// None of these entries is had: B answers them 502 upstream,
+			// never its own sealing (preRaiseUnfetched).
+			log.Printf("remote base %s: its sealed log entries from before its raise: %d; the branch answers them 502 upstream", what, st)
+			break
 		}
 		var page []any
 		if json.Unmarshal(body, &page) != nil {
@@ -352,25 +363,34 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			continue
 		}
 		kns, epoch, err := seal.ParseKid(e.Kid)
-		key := keys[kns][epoch]
-		if err != nil || key == nil {
-			delete(ps.entries, e.ID)
-			continue
-		}
-		kr, err := seal.ResourceKey(key, kns, name)
 		if err != nil {
 			delete(ps.entries, e.ID)
 			continue
+		}
+		// Without the epoch's key, A's bytes are kept unchecked but for
+		// their shape (preSealingShape).
+		var kr []byte
+		if key := keys[kns][epoch]; key != nil {
+			if kr, err = seal.ResourceKey(key, kns, name); err != nil {
+				kr = nil
+			}
 		}
 		if jwe, ok := ps.entries[e.ID]; ok {
 			kind := seal.KindRev
 			if e.Kind == "tombstone" {
 				kind = seal.KindTombstone
 			}
-			pt, err := seal.OpenExpect(jwe, kr, e.Kid, seal.ResourcePL(kns, name, e.ID, kind))
-			v, perr := jsonv.Parse(pt)
-			if err != nil || perr != nil || !bytes.Equal(jsonv.Canonical(v), jsonv.Canonical(e.Raw)) {
-				return unverified("%s: its sealing of the log entry %s doesn't open to the entry its log gives", what, e.ID)
+			pl := seal.ResourcePL(kns, name, e.ID, kind)
+			if kr == nil {
+				if !preSealingShape(jwe, e.Kid, pl) {
+					return unverified("%s: its sealing of the log entry %s isn't a JWE under %s for it", what, e.ID, e.Kid)
+				}
+			} else {
+				pt, err := seal.OpenExpect(jwe, kr, e.Kid, pl)
+				v, perr := jsonv.Parse(pt)
+				if err != nil || perr != nil || !bytes.Equal(jsonv.Canonical(v), jsonv.Canonical(e.Raw)) {
+					return unverified("%s: its sealing of the log entry %s doesn't open to the entry its log gives", what, e.ID)
+				}
 			}
 		}
 		if e.Kind != "rev" {
@@ -387,12 +407,23 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			}
 		case st == 200:
 			jwe := string(bytes.TrimSpace(body))
-			pt, err := seal.OpenExpect(jwe, kr, e.Kid, seal.ResourcePL(kns, name, e.ID, seal.KindDoc))
-			v, perr := jsonv.Parse(pt)
-			if err != nil || perr != nil || !bytes.Equal(jsonv.Canonical(v), jsonv.Canonical(docs[i])) {
-				return unverified("%s: its sealing of the document of %s doesn't open to the document its log gives", what, e.ID)
+			pl := seal.ResourcePL(kns, name, e.ID, seal.KindDoc)
+			if kr == nil {
+				if !preSealingShape(jwe, e.Kid, pl) {
+					return unverified("%s: its sealing of the document of %s isn't a JWE under %s for it", what, e.ID, e.Kid)
+				}
+			} else {
+				pt, err := seal.OpenExpect(jwe, kr, e.Kid, pl)
+				v, perr := jsonv.Parse(pt)
+				if err != nil || perr != nil || !bytes.Equal(jsonv.Canonical(v), jsonv.Canonical(docs[i])) {
+					return unverified("%s: its sealing of the document of %s doesn't open to the document its log gives", what, e.ID)
+				}
 			}
 			ps.docs[e.ID] = string(body)
+		default:
+			// Not served to B (403, 404): left out, so B answers it 502
+			// upstream (preRaiseUnfetched), never with its own sealing.
+			log.Printf("remote base %s: its sealing of the document of %s from before its raise: %d; the branch answers it 502 upstream", what, e.ID, st)
 		}
 		for _, r := range blobRefsOf(docs[i]) {
 			if blobEpochs[r.bid] == nil {
@@ -402,11 +433,21 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 		}
 	}
 	// The sealed blobs at the epoch URLs of the revisions that reference
-	// them (§E.2.2, Levels).
+	// them (§E.2.2, Levels), and at the one A redirects …/blob/{bid} to,
+	// which fixes an epoch where none of them had one at A yet.
 	for bid, eps := range blobEpochs {
 		b := ch.blobs[bid]
 		if b == nil {
 			continue
+		}
+		e, herr := blobHeadEpoch(ctx, ep, baseURL, what+"/blob/"+bid.String())
+		if herr != nil {
+			if ferr := fail(herr); ferr != nil {
+				return ferr
+			}
+		}
+		if e > 0 {
+			eps[e] = true
 		}
 		for epoch := range eps {
 			p := what + "/blob/" + bid.String() + "/e/" + strconv.Itoa(epoch)
@@ -421,6 +462,7 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 				continue
 			}
 			if st != 200 {
+				// Left out: B answers that epoch URL 502 upstream.
 				continue
 			}
 			h, err := seal.ParseBlobHeader(body)
@@ -428,18 +470,22 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 				return unverified("%s: %v", p, err)
 			}
 			kns, e, err := seal.ParseKid(h.Kid)
-			key := keys[kns][e]
-			if err != nil || key == nil || e != epoch {
-				continue
+			if err != nil || e != epoch {
+				return unverified("%s isn't sealed under that epoch", p)
 			}
-			kr, err := seal.ResourceKey(key, kns, name)
-			if err != nil {
-				continue
-			}
-			_, pt, err := seal.OpenBlob(body, kr)
 			want := seal.BlobPL(kns, name, bid.String())
-			if err != nil || !bytes.Equal(pt, b.data) || !bytes.Equal(jsonv.Canonical(map[string]any(h.PL)), jsonv.Canonical(map[string]any(want))) {
-				return unverified("%s doesn't open to the blob its reference names", p)
+			if !bytes.Equal(jsonv.Canonical(map[string]any(h.PL)), jsonv.Canonical(map[string]any(want))) {
+				return unverified("%s doesn't name the blob its reference names", p)
+			}
+			// Without the epoch's key, A's bytes are kept on their shape.
+			if key := keys[kns][e]; key != nil {
+				kr, err := seal.ResourceKey(key, kns, name)
+				if err != nil {
+					continue
+				}
+				if _, pt, err := seal.OpenBlob(body, kr); err != nil || !bytes.Equal(pt, b.data) {
+					return unverified("%s doesn't open to the blob its reference names", p)
+				}
 			}
 			if ps.blobs[bid] == nil {
 				ps.blobs[bid] = map[int][]byte{}
@@ -449,6 +495,54 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 	}
 	ch.sealings = ps
 	return nil
+}
+
+// preSealingShape is the check of a sealing of A's B can't open (§G.5.2):
+// a compact JWE whose protected header's kid is kid and whose pl is pl.
+func preSealingShape(jwe, kid string, pl seal.PL) bool {
+	h, err := seal.ParseHeader(jwe)
+	return err == nil && h.Expect(kid, pl) == nil
+}
+
+// blobHeadEpoch asks the base for path, a blob's …/blob/{bid} URL, without
+// following its redirect, and returns the epoch the 302 names (§E.2.2),
+// fixed by A if none was: 0 for any other answer but no answer or a 5xx,
+// which is an error.
+func blobHeadEpoch(ctx context.Context, ep RemoteEndpoint, baseURL, path string) (int, error) {
+	hr, err := http.NewRequestWithContext(ctx, "GET", baseURL+path, nil)
+	if err != nil {
+		return 0, err
+	}
+	if ep.Bearer != "" {
+		hr.Header.Set("Authorization", "Bearer "+ep.Bearer)
+	}
+	nc := *ep.HTTPClient
+	nc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	res, err := nc.Do(hr)
+	if err != nil {
+		return 0, &url.Error{Op: "GET", URL: path, Err: err}
+	}
+	defer res.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))
+	if res.StatusCode >= 500 {
+		return 0, &url.Error{Op: "GET", URL: path, Err: fmt.Errorf("%d", res.StatusCode)}
+	}
+	if res.StatusCode != http.StatusFound {
+		return 0, nil
+	}
+	loc := res.Header.Get("Location")
+	if u, err := url.Parse(loc); err == nil {
+		loc = u.Path
+	}
+	rest, ok := strings.CutPrefix(loc, path+"/e/")
+	if !ok {
+		return 0, nil
+	}
+	e, err := strconv.Atoi(rest)
+	if err != nil || e < 1 {
+		return 0, nil
+	}
+	return e, nil
 }
 
 // storePreSealings stores the base's sealings of mirrored entry e of
@@ -496,4 +590,38 @@ func (t *tx) storePreSealings(res int64, kidNS string, ps *preSealings, e client
 			sh, name, bid[:], epoch, stored, file, t.now.UnixMilli())
 		t.must(err)
 	}
+}
+
+// preRaiseUnfetched is the answer for content from before its source's
+// raise from sealed that remote branch shadow sh mirrors without A's
+// sealing of it (fetchPreSealings): as for a failed fetch, 502 upstream
+// naming the source's deployment (§G.3, §12.1), since B never seals an E3
+// source's content itself (§G.5.2). It is panicked by the sealing builders
+// (preRaiseResJob, openSealedBlob), as encUnavailable is, so no caller can
+// go on to serve that content another way.
+func (t *tx) preRaiseUnfetched(sh *nsRow, what string) *Error {
+	return apiErr(502, "upstream", "origin", t.shadowOrigin(sh), "message",
+		what+" is from before its source's raise from sealed, and this deployment doesn't hold the source's own sealing of it, "+
+			"which it serves byte for byte and never seals itself (§G.5.2, §G.3)")
+}
+
+// shadowOrigin is the origin of the remote base whose chain shadow sh
+// mirrors, found from the first shadow up ("" if none).
+func (t *tx) shadowOrigin(sh *nsRow) string {
+	cur := sh.id
+	for range 64 {
+		var origin string
+		err := t.QueryRow(`SELECT origin FROM remote_bases WHERE shadow = ?`, cur).Scan(&origin)
+		if err == nil {
+			return origin
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.must(err)
+		}
+		// The shadow above reads through this one (kidName).
+		if t.QueryRow(`SELECT ns FROM namespaces WHERE base = ? AND name LIKE '~%'`, cur).Scan(&cur) != nil {
+			return ""
+		}
+	}
+	return ""
 }

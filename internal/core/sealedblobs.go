@@ -151,13 +151,22 @@ func (t *tx) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJ
 // blobKeyEpochs lists the epochs a request for blob bid of resource name
 // of sealed namespace n would be served under (§E.2.2), for the key window
 // of a copy or a batch's local source (keywindow.go): those fixed, or,
-// when none of its referencing revisions has an epoch yet, the current
-// one, under which such a request would fix the newest of them
-// (sealedBlobHead). None if no still served revision references it.
+// when none of its referencing revisions has an epoch yet, the one the
+// check fixes as such a request would (sealedBlobHead): in a write
+// transaction it stores the sealing of the newest of them under the
+// current epoch (storeSeal), the first stored winning; in a read one, a
+// write's check phase, it stores nothing and gives the current epoch.
+// None if no still served revision references it.
 func (t *tx) blobKeyEpochs(n *nsRow, name string, bid ids.ID) map[int]bool {
 	v := t.resolve(n, name, nil)
 	eps := t.blobEpochs(n, v.head, bid)
 	if len(eps) == 0 && v.head != nil && t.blobRevServed(v.head, bid) {
+		if t.write {
+			if e, ok := t.storeSeal(n.id, t.newestBlobRev(n, name, v.head, bid)); ok {
+				eps[e] = true
+				return eps
+			}
+		}
 		eps[t.config(n.configSeq).Epoch] = true
 	}
 	return eps
@@ -330,8 +339,13 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			out.setContent(memContent(data))
 			return nil
 		}
-		// A remote branch's shadow seals under its source's name
-		// (kidName), as the source serves the blob (MF-37).
+		if sm.isShadow() {
+			// A remote branch's shadow serves only its source's own
+			// sealing of a blob from before the raise, stored at creation
+			// (storePreSealings), and never seals one itself: 502
+			// upstream, as for a failed fetch (§G.5.2 E3 sources, §G.3).
+			return t.preRaiseUnfetched(sm, "the blob "+bid.String()+" of "+name+" under epoch "+epochText)
+		}
 		kns := t.kidName(sm)
 		k, err := seal.ResourceKey(t.epochKey(sm.id, ep), kns, name)
 		t.must(err)
