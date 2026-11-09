@@ -1,7 +1,7 @@
 -- Migration: remote chain read
 -- Created: 2026-11-09T10:15:56Z
 -- Checksum: 961db2852c566010d6d64d2ecf1d4ea964b88d040614601ab0dec42f6674313f
--- Chain: 6f4eb15aaecd021af081559ae437b78a3e8604989d4810695986118bb8809eac
+-- Chain: e2dc2f6dd0d526b185e8d24b35c5ccb92aabc481dd592ba478cd064a3444debf
 --
 -- IMPORTANT: Do not modify this file after commit. The checksum above
 -- tracks the integrity of this migration. Any changes will be detected

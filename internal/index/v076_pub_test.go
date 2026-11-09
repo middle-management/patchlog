@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"net/http"
-	"slices"
 	"strings"
 	"testing"
 
@@ -113,16 +112,16 @@ func TestV076PubNoneStored(t *testing.T) {
 	}
 }
 
-// TestV076PubSharedMarker (§B.11.9 gs, §C.4): readers with the same
-// subjects and rules share one marker reads:matches:g:{gs}, and one
-// cookie prefix, whatever key their grants came from, and a cookie doesn't
-// say which. Reader A's cookie came from catalog-01's old pub; once matches
+// TestV076PubSharedMarker (§B.11.9 gs, §C.4): a g: marker's subjects
+// include catvis.KeySubject(kid, pub), so readers whose grants come from
+// different keys, or from one kid under different pubs, never share a
+// marker. Reader A's cookie came from catalog-01's old pub; once matches
 // gives catalog-01 another pub, A's cookie is 403, and stays 403 after
-// reader B exchanges a grant signed under the new pub: B's exchange adds
-// its key beside A's, never in its place (edge_gs_keys). B's cookie is 403
-// too while A's lives (no cookie of the marker reads under a key no
-// longer accepted), and B's grant still reads in Authorization. Before,
-// B's exchange overwrote the marker's pub and A's cookie was served again.
+// reader B, with the same subjects and rules, exchanges a grant signed under
+// the new pub: B gets a marker of its own, which reads. Before v0.76, B's
+// exchange overwrote the shared marker's pub and A's cookie was served
+// again. edge_gs_keys still keeps every key of a marker, for readers who
+// share one key.
 func TestV076PubSharedMarker(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -151,14 +150,20 @@ func TestV076PubSharedMarker(t *testing.T) {
 	if r.status != 200 {
 		t.Fatalf("B's exchange: %d %v", r.status, r.body)
 	}
-	if !slices.Contains(r.body["prefixes"].([]any), any(prefix)) {
-		t.Fatalf("B's prefixes %v, want A's %s among them", r.body["prefixes"], prefix)
+	var bp string
+	for _, p := range r.body["prefixes"].([]any) {
+		if strings.HasPrefix(p.(string), "/matches/g/") {
+			bp = p.(string)
+		}
+	}
+	if bp == "" || bp == prefix {
+		t.Fatalf("B's prefixes %v: want a /matches/g/ prefix other than A's %s", r.body["prefixes"], prefix)
 	}
 	if got, _ := p37Follow(t, w.x, prefix, cookies, ""); got.status != 403 || !strings.Contains(got.body["message"].(string), "exchange the grant again") {
 		t.Errorf("A under its cookie (from the replaced pub) after B exchanged: %d %v", got.status, got.body)
 	}
-	if got, _ := p37Follow(t, w.x, prefix, r.cookies, ""); got.status != 403 {
-		t.Errorf("B under its cookie while A's lives: %d %v", got.status, got.body)
+	if got, _ := p37Follow(t, w.x, bp, r.cookies, ""); got.status != 200 {
+		t.Errorf("B under its own cookie: %d %v", got.status, got.body)
 	}
 	if got := p37Do(t, w.x, "GET", "/matches?q=derby", b, "", nil, ""); got.status != 302 {
 		t.Errorf("B's grant in Authorization: %d %v", got.status, got.body)
