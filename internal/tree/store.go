@@ -34,7 +34,10 @@ import (
 //	                                 the epoch the first revision is served under, which
 //	                                 seals born where it isn't epoch (§E.2.6), filled in
 //	                                 the same way, and once more for a database from before
-//	                                 v0.76 (markBornEpochs, meta "bornsnap")
+//	                                 v0.76 (markBornEpochs, meta "bornsnap"); in an e2e
+//	                                 catalog an epoch NULL, or a born_epoch bornPending or
+//	                                 bornWithHead, is pending: judged by the first listing
+//	                                 that seals a value of that revision (judgeEpochs)
 //	edges(child, pos, parent, ord, state)
 //	                                 one row per declared parents entry (hrefs), with its state
 //	items(ns, name, state, head, title, created, file)
@@ -154,7 +157,8 @@ func (s *Service) persistNode(ctx context.Context, tx *sql.Tx, g *Graph, name st
 	if n.Epoch > 0 {
 		epoch = n.Epoch
 	}
-	if n.BornEpoch > 0 {
+	if n.BornEpoch != 0 {
+		// Pending ones too (bornPending, bornWithHead).
 		bornEpoch = n.BornEpoch
 	}
 	_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO nodes (href, name, kind, item, item_head, title, state, self, head, parents, access,
