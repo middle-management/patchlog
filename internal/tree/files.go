@@ -348,10 +348,12 @@ func (fs *fileSealing) seals() bool { return fs != nil && len(fs.keys) > 0 }
 var errFileKeys = errors.New("the key that seals file metadata")
 
 // lastingKeyErr reports a failure to get a key that lasts until the
-// configuration changes: no keys for the service's grant, a namespace it
-// can't read, absent or gone.
+// configuration changes: a key lacking for good (follow.LacksKey: no keys
+// for the service's grant, none it can unwrap, a keyring entry whose from
+// it doesn't trust, or /keys answering a 4xx other than 429; §A.4,
+// §E.2.6, §E.3.2), or a namespace it can't read, absent or gone.
 func lastingKeyErr(err error) bool {
-	return errors.Is(err, client.ErrNoKeys) || client.IsNotFound(err) || client.IsAuth(err) || client.IsGone(err)
+	return follow.LacksKey(context.Background(), err) || client.IsNotFound(err) || client.IsAuth(err) || client.IsGone(err)
 }
 
 // fileSealing reads what listings need now to give file metadata. Only
