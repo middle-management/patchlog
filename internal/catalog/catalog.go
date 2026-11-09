@@ -88,6 +88,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -820,7 +821,33 @@ func (s *Service) Resolve(ctx context.Context, v *grant.Verified) ([]string, tre
 // rules test it only by positive tests of other groups. Call it under
 // View.
 func (s *Service) keyedAt(g *tree.Graph, v *grant.Verified) []string {
-	return catvis.ListingSubjects(s.catalogOf(g).Profile(), v.Principal)
+	return s.Profile(g).Subjects(v)
+}
+
+// Profile implements tree.Profiler: the catalog's deciding inputs as of
+// the checkpoint g reflects (catvis.Profile), which key listings there
+// (§B.11.5). Call it under View.
+func (s *Service) Profile(g *tree.Graph) tree.Profile {
+	return listingProfile{s.catalogOf(g).Profile()}
+}
+
+// listingProfile is a catvis.Profile as tree.Profile.
+type listingProfile struct{ p catvis.Profile }
+
+// Subjects is v's deciding subjects, with "partial" if they leave out a
+// group (catvis.ListingSubjects).
+func (l listingProfile) Subjects(v *grant.Verified) []string {
+	return catvis.ListingSubjects(l.p, v.Principal)
+}
+
+// Admits refuses a subject set holding "partial" where every group is
+// kept: a group it left out may now decide, through a rule testing the
+// groups otherwise than positively by value, so the set could see what
+// the reader's groups hide from it. It is 403 there until the reader
+// exchanges again (§B.11.5). Elsewhere a group named since it was keyed
+// only shows the set less, never more.
+func (l listingProfile) Admits(subjects []string) bool {
+	return !l.p.KeepAll || !slices.Contains(subjects, catvis.Partial)
 }
 
 // ForSubjects implements tree.RoleView for a reader whose edge grant is
