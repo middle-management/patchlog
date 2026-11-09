@@ -3,8 +3,6 @@ package core
 import (
 	"database/sql"
 	"errors"
-	"math"
-	"strconv"
 )
 
 // A remote branch whose source is raised to a level this server lacks
@@ -23,11 +21,12 @@ import (
 //
 // A raise the server could make but whose config writes failed (followLevel
 // records it for a rebase, and retryLevel tries it again at every sync) is
-// held the same way, for the same resources, but answered 503
-// encryption_unavailable with Retry-After rather than 502, which §1 keeps
-// for a lacking level: a branch never serves what it reads through at a
-// weaker level than its base serves it, once it sees the raise (Addendum E
-// Levels, Invariant), so until the raise is made it serves none of it.
+// held the same way, for the same resources, and answered the same 502
+// upstream, without Retry-After (§1: a raise that "needs a level its server
+// lacks, or hasn't succeeded"): a branch never serves what it reads through
+// at a weaker level than its base serves it, once it sees the raise
+// (Addendum E Levels, Invariant), so until the raise is made it serves none
+// of it.
 
 // lostRemote is the remote branch in n's chain, n itself or a base of it,
 // whose source was raised to a level it hasn't followed (remoteHeld): the
@@ -66,7 +65,7 @@ func (t *tx) remoteHeld(b *nsRow) (origin string, lacks, held bool) {
 }
 
 // upstreamCovers reports whether name, as n sees it (v), is one of the
-// resources the lost remote branch rb answers 502 (or 503) for: one its source had
+// resources the lost remote branch rb answers 502 for: one its source had
 // at at, which rb's shadows mirror as it was then, live or tombstoned,
 // and which n doesn't see purged. A resource the branches created
 // themselves, or purged since, isn't (410 for a purged one, §8.3).
@@ -91,19 +90,15 @@ func upstreamLevelErr(origin, name string) *Error {
 			"so it isn't served or written here below that level (§1, §G.5.2); a purge still works")
 }
 
-// levelHeldErr is the 503 of a resource read through a remote branch whose
-// source's raise it hasn't been able to make (remoteHeld): retried at every
-// sync (retryLevel), so Retry-After is the follow interval.
-func (t *tx) levelHeldErr(origin, name string) *Error {
-	secs := int64(math.Ceil(t.e.opt.Remote.FollowInterval.Seconds()))
-	if secs <= 0 {
-		secs = 60
-	}
-	e := apiErr(503, "encryption_unavailable", "origin", origin, "message",
-		name+" is read through a remote branch whose source at "+origin+" was raised to an encryption level this server hasn't raised the branch to yet, "+
-			"so it isn't served or written here below that level (Addendum E Levels, §G.5.2); the raise is tried again at every sync, or rebase the branch")
-	e.Header = map[string][]string{"Retry-After": {strconv.FormatInt(secs, 10)}}
-	return e
+// levelHeldErr is the 502 upstream of a resource read through a remote
+// branch whose source's raise it hasn't been able to make (remoteHeld): the
+// same answer as a lacking level (§1, §12.1), without Retry-After; the raise
+// is still tried again at every sync (retryLevel) and at start
+// (catchUpLevels).
+func levelHeldErr(origin, name string) *Error {
+	return apiErr(502, "upstream", "origin", origin, "message",
+		name+" is read through a remote branch whose source at "+origin+" was raised to an encryption level this server hasn't raised the branch to, "+
+			"so it isn't served or written here below that level (§1, §G.5.2); the raise is tried again at every sync, or rebase the branch; a purge still works")
 }
 
 // upstreamRefusal is the 502 upstream of §1 for a write, other than a
@@ -112,7 +107,7 @@ func (t *tx) levelHeldErr(origin, name string) *Error {
 // chain reaches one, answers 502 { code: "upstream", origin } for every
 // resource its source had at `at`, read through or written since and not
 // purged since (§1, §6.2 step 2.1, §12.1); one whose raise failed
-// otherwise, 503 (levelHeldErr). For a write it comes at step 2.1, after
+// otherwise, the same 502 (levelHeldErr). For a write it comes at step 2.1, after
 // the purged-namespace check and before a purged resource's 410 and the
 // idempotent-retry lookup; for a read, once the read check has passed
 // (reader), before any other answer but a purged namespace's 410. nil
@@ -127,7 +122,7 @@ func (t *tx) upstreamRefusal(n *nsRow, name string) *Error {
 		return nil
 	}
 	if !lacks {
-		return t.levelHeldErr(origin, name)
+		return levelHeldErr(origin, name)
 	}
 	return upstreamLevelErr(origin, name)
 }

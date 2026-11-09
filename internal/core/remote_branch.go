@@ -65,8 +65,8 @@ import (
 // its base's current document judges (checkRemoteSource), and by raising
 // its level when the base's rises (followLevel), or, on a server that
 // lacks the level, answering 502 upstream for what it mirrored (§1,
-// upstream.go), and 503 while a raise it could make fails. The shadows follow the branch's level (at rest, and for
-// sealing and e2e).
+// upstream.go), as it does while a raise it could make fails. The shadows
+// follow the branch's level (at rest, and for sealing and e2e).
 //
 //   - E2. B fetches with keys: the endpoint's grant gets them from the
 //     base's POST /ns/{ns}/keys, unwrapped with the endpoint's Identity
@@ -2758,8 +2758,9 @@ func (t *tx) followConfig(bn *nsRow, id string, d sourceDoc) {
 //     server write can't remove, say): Levels refuse it, so the branch
 //     needs a rebase (§G.5.2). A failed raise is tried again at every sync
 //     (retryLevel); until it is made, the resources the base had at at
-//     answer 503 rather than be served below the base's level (Addendum E
-//     Levels, Invariant; remoteHeld, upstreamRefusal).
+//     answer 502 upstream, as for a lacking level (§1), rather than be
+//     served below the base's level (Addendum E Levels, Invariant;
+//     remoteHeld, upstreamRefusal).
 func (t *tx) followLevel(bn *nsRow, id string, level int) bool {
 	lacks, rebase := false, level == levelE2E
 	if t.e.opt.KeyStore == nil {
@@ -2784,7 +2785,7 @@ func (t *tx) followLevel(bn *nsRow, id string, level int) bool {
 	t.must(err)
 	if _, nowLacks, held := t.remoteHeld(t.nsByID(bn.id)); held != wasHeld || nowLacks != wasLacks {
 		// Copies of its resources, at the edge and in the read cache, go:
-		// they answer 502 or 503 now, or again as before (§9).
+		// they answer 502 now, or again as before (§9).
 		t.lostChanged(bn)
 	}
 	if lacks {
@@ -2803,8 +2804,8 @@ func followTarget(level int) int {
 }
 
 // lostChanged drops the copies of bn's resources and its dependents', at
-// the edge and in the read cache, when whether they answer 502 upstream,
-// or 503 while a raise is held (remoteHeld), changes (§1, §9, followLevel).
+// the edge and in the read cache, when whether they answer 502 upstream
+// (remoteHeld) changes (§1, §9, followLevel).
 func (t *tx) lostChanged(bn *nsRow) {
 	t.metaChanged = true
 	for _, n := range t.leavesFirst(bn) {
@@ -2847,7 +2848,7 @@ func (e *Engine) retryLevel(ctx context.Context, branch int64) error {
 // followed a source's raise to e2e only as far as the level the source
 // had before it, so a branch of a source raised from none stayed at none,
 // recorded for a rebase, and served in the clear. Without this its
-// resources would answer 503 encryption_unavailable from the upgrade until
+// resources would answer 502 upstream from the upgrade until
 // the first sync, a whole follow interval later; with it they are served
 // sealed from the start (followTarget, Addendum E Levels Invariant). It
 // needs nothing from the branches' sources. A raise that fails again stays
