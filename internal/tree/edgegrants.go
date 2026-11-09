@@ -48,12 +48,16 @@ import (
 // minted by another instance with its own database, is 401, and the
 // reader exchanges again here. Instances on one database share it, and
 // share the exchangeRate buckets too (§B.11.5). A g/all cookie is checked
-// against every content namespace the
-// catalog trusts at issue, and covers every later at, so a read at an at
-// that includes a namespace trusted since is 403 (trustedSince). The
+// against every content namespace in the combined checkpoint at issue
+// (§B.11.5, §B.5), and covers every later at, so a read at an at that
+// includes a namespace that entered the checkpoint since is 403
+// (trustedSince): one the catalog trusts but the service doesn't follow
+// isn't checked, and joins the checkpoint only once followed. The
+// service records when each trusted namespace entered the checkpoint
+// (entered), forgetting it once it leaves trust or the checkpoint. The
 // edge can't make that check, and serves a cached listing to every g/all
 // cookie, so no shared cache keeps a g/all listing at such an at until
-// every cookie issued before that namespace was trusted has expired
+// every cookie issued before that namespace entered has expired
 // (edgeHold). The other way round, a g/all cookie issued after the
 // catalog stops trusting a namespace isn't checked against it, so the
 // service purges ns:{catalog}, the tag of every listing of the catalog
@@ -123,8 +127,9 @@ func (s *Service) serveEdgeGrants(w http.ResponseWriter, r *http.Request) {
 // subject set, lasting until that grant's exp or the cookies' TTL (15
 // minutes at most), whichever is sooner, or /{catalog}/g/all for a
 // reader whose grants would be issued a namespace-wide edge grant on
-// every namespace it trusts that isn't public, the catalog included
-// (§C.5.2), lasting until the earliest of those grants. A prefix several
+// every namespace in the combined checkpoint that isn't public, the
+// catalog included (§B.11.5, §C.5.2), lasting until the earliest of those
+// grants. A prefix several
 // grants give gets one cookie, lasting as long as the longest, and exp
 // is the earliest. It answers all or nothing: if any grant is over
 // grantSize or rulesPerGrant, the request is 413 limit, as the origin
@@ -167,9 +172,9 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusUnauthorized, "unauthenticated", "missing grant")
 		return
 	}
-	// Taken before any viewer reads the trust list, so a g/all cookie's
-	// earliest issue (allNotBefore) is never after the trust it was
-	// checked against.
+	// Taken before any viewer reads the combined checkpoint, so a g/all
+	// cookie's earliest issue (allNotBefore) is never after a namespace's
+	// entry it was checked against.
 	now := s.opt.Now()
 	var (
 		vs     []*viewer
@@ -179,7 +184,7 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		purged string
 	)
 	for _, b := range bearers {
-		v, err := s.grantViewer(ctx, b, "", true)
+		v, err := s.grantViewer(ctx, b, "")
 		if client.IsPurged(err) {
 			// A purged sealed catalog's document is 410 (§8.5): the core
 			// makes the read check, as for a listing (serve).
@@ -275,10 +280,11 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 // its prefix, read as a listing for any grant resolving to it would be,
 // with no grant at all. So it authorises that subject set's listings
 // only, and problems, orphans and manifests are 403 under it
-// (query.unfiltered, §B.11.5). Under g/all, the catalog and every trusted
-// content namespace are read whole, and listings are kept no longer than
-// the cookie; at an at including a namespace trusted since its issue the
-// read is 403 (serve, trustedSince). A namespace that was public at issue
+// (query.unfiltered, §B.11.5). Under g/all, the catalog and every content
+// namespace in the combined checkpoint before its issue are read whole,
+// and listings are kept no longer than the cookie; at an at including a
+// namespace that entered the checkpoint since its issue the read is 403
+// (serve, trustedSince). A namespace that was public at issue
 // and has turned private since is still read whole under it until it
 // expires, as under a grant revoked since: the cookie's lifetime is the
 // revocation latency (§C.5). A purged namespace is read whole by every
@@ -309,7 +315,7 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 	trust, gone := s.trustList()
 	s.mu.RLock()
 	for _, ns := range trust {
-		if since, ok := s.trusted[ns]; ok && since.Before(notBefore) {
+		if since, ok := s.entered[ns]; ok && since.Before(notBefore) {
 			checked = append(checked, ns)
 		}
 	}
@@ -322,9 +328,9 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 	}
 	if gs == AllSubjects {
 		// What the cookie was checked against: the catalog, and every
-		// namespace trusted before its issue. A listing at an at
-		// including another is refused (trustedSince), and one kept
-		// from before the catalog trusted it is served.
+		// namespace in the combined checkpoint before its issue. A
+		// listing at an at including another is refused (trustedSince),
+		// and one kept from before it entered is served.
 		v.catAll, v.wideCat = true, true
 		for _, ns := range checked {
 			v.contentAll[ns], v.wideNS[ns] = true, true
@@ -348,8 +354,8 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 // allExp is the exp of a g/all edge grant issued at now to last until exp,
 // recorded so a read under it can tell when it was issued (allNotBefore).
 // Two cookies with the same prefix and exp are the same bytes, so while
-// one with exp was issued no later than a namespace the catalog trusts
-// now became trusted, a new one would be refused with it: it gets the
+// one with exp was issued no later than a namespace now in the combined
+// checkpoint entered it, a new one would be refused with it: it gets the
 // second before instead. Without EdgeGrantsOwnKey nothing is recorded,
 // since a record wouldn't be relied on.
 func (s *Service) allExp(now, exp time.Time) time.Time {
@@ -358,7 +364,7 @@ func (s *Service) allExp(now, exp time.Time) time.Time {
 	}
 	s.mu.RLock()
 	var latest time.Time
-	for _, t := range s.trusted {
+	for _, t := range s.entered {
 		if t.After(latest) {
 			latest = t
 		}
@@ -395,9 +401,9 @@ func (s *Service) allExp(now, exp time.Time) time.Time {
 // Open or by another instance. Otherwise, and without a record, it is exp
 // less the cookies' longest lifetime. That is conservative: a cookie
 // capped by an earlier grant's exp counts as issued earlier than it was,
-// so it is refused at an at that includes a namespace trusted in the last
-// minutes before its issue too, and its reader exchanges again once the
-// namespace has been trusted that long.
+// so it is refused at an at that includes a namespace that entered the
+// combined checkpoint in the last minutes before its issue too, and its
+// reader exchanges again once the namespace has been in it that long.
 func (s *Service) allNotBefore(exp int64) time.Time {
 	if s.opt.EdgeGrantsOwnKey {
 		s.emu.Lock()
@@ -410,12 +416,12 @@ func (s *Service) allNotBefore(exp int64) time.Time {
 	return time.Unix(exp, 0).Add(-s.opt.EdgeGrants.MaxTTL())
 }
 
-// atTrust is when the catalog came to trust each content namespace that a
-// listing at at includes (ok false for one without a record): those of
-// the current at, cur, or those recorded for a kept one (recordAt); any
-// other at is redirected to cur. A namespace at includes that the catalog
-// no longer trusts has no record: when it became trusted is no longer
-// known.
+// atTrust is when each content namespace that a listing at at includes
+// entered the combined checkpoint while trusted (entered; ok false for
+// one without a record): those in the current at's, cur, or those
+// recorded for a kept one (recordAt); any other at is redirected to cur.
+// A namespace at includes that has left trust or the checkpoint since has
+// no record: when it entered is no longer known (§B.11.5).
 func (s *Service) atTrust(at, cur string) []trustTime {
 	var nss []string
 	s.amu.Lock()
@@ -430,10 +436,11 @@ func (s *Service) atTrust(at, cur string) []trustTime {
 			}
 		}
 	} else {
-		// The current at leaves out the namespaces the service holds as
-		// purged (combinedAt, §B.5).
-		for ns := range s.g.Trust {
-			if !s.purgedLocked(ns) {
+		// The current at's checkpoint: the trusted namespaces the
+		// service holds a checkpoint of, those it holds as purged left
+		// out (combinedAt, checkpointsOf, §B.5).
+		for ns := range s.checkpointsOf(s.g, s.cur) {
+			if ns != s.opt.Catalog {
 				nss = append(nss, ns)
 			}
 		}
@@ -441,13 +448,13 @@ func (s *Service) atTrust(at, cur string) []trustTime {
 	sort.Strings(nss)
 	out := make([]trustTime, len(nss))
 	for i, ns := range nss {
-		since, ok := s.trusted[ns]
+		since, ok := s.entered[ns]
 		out[i] = trustTime{ns, since, ok}
 	}
 	return out
 }
 
-// trustTime is when the catalog came to trust ns, if ok.
+// trustTime is when ns entered the combined checkpoint, if ok.
 type trustTime struct {
 	ns    string
 	since time.Time
@@ -456,7 +463,7 @@ type trustTime struct {
 
 // trustedSince names a content namespace that a listing at at, for v
 // under a g/all edge grant, would include but that grant wasn't checked
-// against, because the catalog came to trust it no earlier than
+// against, because it entered the combined checkpoint no earlier than
 // v.notBefore (§B.11.5), or "" if there is none or v isn't under a g/all
 // edge grant. At the very instant of its issue, it can't be told whether
 // the exchange read the trust list before or after: that counts as after.
@@ -474,8 +481,9 @@ func (s *Service) trustedSince(v *viewer, at, cur string) string {
 }
 
 // edgeHold reports whether no shared cache may keep v's listing at at,
-// because at includes a namespace the catalog came to trust so recently
-// that a g/all edge grant issued before it may still be live (§B.11.5).
+// because at includes a namespace that entered the combined checkpoint so
+// recently that a g/all edge grant issued before it may still be live
+// (§B.11.5).
 // The service refuses such a cookie there (trustedSince), but an edge
 // serves a listing it holds to every cookie passing its six checks, and
 // can't tell a cookie checked against that namespace from one that
@@ -484,11 +492,11 @@ func (s *Service) trustedSince(v *viewer, at, cur string) string {
 // including the namespace is no-store at the edge, whoever reads it.
 // With EdgeGrantsOwnKey the service knows every g/all cookie it issued
 // (allExp), and holds only while one issued no later than the namespace
-// became trusted is live; otherwise, for the cookies' longest lifetime
-// after it. A namespace without a record (atTrust) counts as just
-// trusted. A namespace the catalog stopped trusting needs no hold here: a
-// g/all cookie is refused at every at including it (trustedSince), and
-// what an edge holds from before is purged (Apply) or expires (cdnAll).
+// entered is live; otherwise, for the cookies' longest lifetime after it.
+// A namespace without a record (atTrust) counts as just entered. A
+// namespace the catalog stopped trusting needs no hold here: a g/all
+// cookie is refused at every at including it (trustedSince), and what an
+// edge holds from before is purged (Apply) or expires (cdnAll).
 func (s *Service) edgeHold(v *viewer, at, cur string) bool {
 	if s.opt.EdgeGrants == nil || v.gs != AllSubjects {
 		return false
@@ -523,18 +531,23 @@ func (s *Service) edgeHold(v *viewer, at, cur string) bool {
 	return false
 }
 
-// loadTrusted reads when the catalog came to trust each namespace (meta
-// "trusted:{ns}", Unix nanoseconds), and records now for any it trusts
-// without a record: a new database, or one rebuilt.
+// loadTrusted reads when each namespace entered the combined checkpoint
+// while trusted (meta "inckpt:{ns}", Unix nanoseconds), and records now
+// for any in it without a record: a new database, one rebuilt, or one
+// that recorded when the catalog came to trust each namespace instead
+// (meta "trusted:{ns}", before v0.76), whose rows it drops.
 func (s *Service) loadTrusted(ctx context.Context) error {
 	if s.opt.EdgeGrants == nil {
 		return nil
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT substr(k, 9), v FROM meta WHERE k LIKE 'trusted:%'`)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM meta WHERE k LIKE 'trusted:%'`); err != nil {
+		return err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT substr(k, 8), v FROM meta WHERE k LIKE 'inckpt:%'`)
 	if err != nil {
 		return err
 	}
-	s.trusted = map[string]time.Time{}
+	s.entered = map[string]time.Time{}
 	for rows.Next() {
 		var ns, v string
 		if err := rows.Scan(&ns, &v); err != nil {
@@ -542,48 +555,54 @@ func (s *Service) loadTrusted(ctx context.Context) error {
 			return err
 		}
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			s.trusted[ns] = time.Unix(0, n)
+			s.entered[ns] = time.Unix(0, n)
 		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	s.mu.Lock()
 	s.noteTrust(ctx)
+	s.mu.Unlock()
 	return nil
 }
 
-// noteTrust brings the record of when each namespace became trusted in
-// line with the graph's trust list: now for one newly trusted, nothing
-// for one no longer trusted. Called with mu held for writing, in the
-// same critical section as the graph that changed the list is published,
-// so an exchange that read the old list (allExp) sees the old record.
+// noteTrust brings the record of when each namespace entered the
+// combined checkpoint (entered) in line with the graph's trust list and
+// the checkpoints held (checkpointsOf, §B.5): now for one that is in it
+// without a record, nothing for one no longer in it, whether it left
+// trust, was purged or never had a checkpoint. Called with mu held for
+// writing, in the same critical section as the graph or checkpoint that
+// changed it is published, so an exchange that read the old checkpoint
+// (allExp) sees the old record.
 func (s *Service) noteTrust(ctx context.Context) {
 	if s.opt.EdgeGrants == nil {
 		return
 	}
-	if s.trusted == nil {
-		s.trusted = map[string]time.Time{}
+	if s.entered == nil {
+		s.entered = map[string]time.Time{}
 	}
+	in := s.checkpointsOf(s.g, s.cur)
 	now := s.opt.Now()
-	for ns := range s.trusted {
-		if !s.g.Trust[ns] {
-			delete(s.trusted, ns)
-			if _, err := s.db.ExecContext(ctx, `DELETE FROM meta WHERE k = ?`, "trusted:"+ns); err != nil {
-				s.opt.Logf("tree: forgetting when %s became trusted: %v", ns, err)
+	for ns := range s.entered {
+		if _, ok := in[ns]; !ok || ns == s.opt.Catalog {
+			delete(s.entered, ns)
+			if _, err := s.db.ExecContext(ctx, `DELETE FROM meta WHERE k = ?`, "inckpt:"+ns); err != nil {
+				s.opt.Logf("tree: forgetting when %s entered the combined checkpoint: %v", ns, err)
 			}
 		}
 	}
-	for ns := range s.g.Trust {
-		if _, ok := s.trusted[ns]; ok {
+	for ns := range in {
+		if _, ok := s.entered[ns]; ok || ns == s.opt.Catalog {
 			continue
 		}
-		s.trusted[ns] = now
+		s.entered[ns] = now
 		// Unrecorded, a restart records a later time: more refusals,
 		// never fewer.
 		if _, err := s.db.ExecContext(ctx, `INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v`,
-			"trusted:"+ns, strconv.FormatInt(now.UnixNano(), 10)); err != nil {
-			s.opt.Logf("tree: recording when %s became trusted: %v", ns, err)
+			"inckpt:"+ns, strconv.FormatInt(now.UnixNano(), 10)); err != nil {
+			s.opt.Logf("tree: recording when %s entered the combined checkpoint: %v", ns, err)
 		}
 	}
 }

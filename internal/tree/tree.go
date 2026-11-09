@@ -231,10 +231,11 @@ type Service struct {
 	// serves the namespace's head to its follower again.
 	unfollowed map[string]string
 
-	// trusted is when each namespace the catalog trusts became trusted,
-	// as far as the service knows (meta "trusted:{ns}"), guarded by mu;
-	// kept with EdgeGrants only (edgegrants.go).
-	trusted map[string]time.Time
+	// entered is when each namespace in the combined checkpoint entered
+	// it while trusted, as far as the service knows (meta "inckpt:{ns}"),
+	// guarded by mu; kept with EdgeGrants only (edgegrants.go, §B.11.5
+	// g/all).
+	entered map[string]time.Time
 
 	// edge keeps the subjects behind each gs the service minted edge
 	// grants for, and the exchangeRate buckets, shared with the instances
@@ -1112,9 +1113,12 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	if co.PurgedNS {
 		s.purged[b.NS] = res.purgedAt
 	}
+	// A namespace enters the combined checkpoint with its first
+	// checkpoint while trusted, or when trusted again holding one, and
+	// leaves it when untrusted or purged (noteTrust).
+	s.noteTrust(context.WithoutCancel(ctx))
 	trustChanged := !sameSet(oldTrust, s.g.Trust)
 	if trustChanged {
-		s.noteTrust(context.WithoutCancel(ctx))
 		s.forgetUntrusted(context.WithoutCancel(ctx))
 	}
 	s.mu.Unlock()

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/edge"
 )
 
 // v076V03Public creates public namespace ns, which cat's catalog.trust
@@ -111,5 +113,70 @@ func TestV076V03ContentKeyRequireAt(t *testing.T) {
 		if e := entry(rg, i); e["status"] != 403.0 || e["grant"] != nil {
 			t.Errorf("read-grants entry %d: %v", i, e)
 		}
+	}
+}
+
+// §B.11.5 g/all (v0.76): the exchange checks only the namespaces in the
+// combined checkpoint. cat trusts matches, which the service follows, and
+// pz, whose document doesn't list the service's key, so it has no
+// checkpoint: a grant reading cat and matches namespace-wide gets a g/all
+// cookie. Once pz lists the key and joins the checkpoint, that cookie is
+// 403 at an at including it, and still reads at the at from before.
+func TestV076V03EdgeGrantForAllCombinedCheckpoint(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	ctx := context.Background()
+	adm := clienttest.NewKey("adm")
+	must(w.s.Client(t, client.WithBearer(w.s.OperatorGrant(t, "pz"))).CreateNamespace(ctx, "pz",
+		map[string]any{"read": "grant", "keys": []any{adm.Entry("*")}}))
+	opz := w.s.Client(t, client.WithBearer(adm.Grant(t, w.s.Now(), "user:adm", []string{"pz"}, []string{"read", "config"})))
+	opc := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"cat"}, []string{"config"})))
+	must(opc.PatchConfig(ctx, "cat", must(w.ops.NSHead(ctx, "cat")).Config,
+		[]any{map[string]any{"op": "add", "path": "/catalog/trust/-", "value": "pz"}}))
+	w.svcClient = w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "svc:catalog", []string{"cat", "matches", "pz"}, []string{"read"},
+		map[string]any{"exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))
+	w.edgeGrants = edge.NewCookies("catalog-cat", edgeKey)
+	w.edgeOwnKey = true
+	w.start()
+	w.caughtUp()
+	if cp := w.svc.Tree().Checkpoint("pz"); cp != "" {
+		t.Fatalf("pz followed before it lists the service's key: %s", cp)
+	}
+	w.s.Clock.Advance(time.Second)
+
+	wide := w.opsKey.Grant(t, w.s.Now(), "user:nw", []string{"cat", "matches"}, []string{"read"},
+		map[string]any{"exp": w.s.Now().Add(time.Hour).Format(time.RFC3339)})
+	r, cks := w.exchange(wide, nil, "")
+	if r.status != 200 || prefixes(r) != "/cat/g/all" || len(cks) != 1 {
+		t.Fatalf("a reader wide on the combined checkpoint: %d %v", r.status, r.body)
+	}
+	all := cks[0]
+	_, loc := w.follow("/cat/children?of=season", wide)
+	if !strings.HasPrefix(loc, "/cat/g/all/at/") {
+		t.Fatalf("listing %s", loc)
+	}
+	if r := w.withCookie(loc, all, nil); r.status != 200 {
+		t.Fatalf("g/all under the cookie: %d %v", r.status, r.body)
+	}
+
+	// pz lists the service's key: followed, it joins the checkpoint.
+	w.s.Clock.Advance(time.Second)
+	must(opz.PatchConfig(ctx, "pz", must(opz.NSHead(ctx, "pz")).Config,
+		[]any{map[string]any{"op": "add", "path": "/keys/-", "value": w.opsKey.Entry("*")}}))
+	waitFor(t, "pz to be followed", func() bool { return w.svc.Tree().Checkpoint("pz") != "" })
+	cur := strings.Replace(loc, "/at/"+gsAt(loc)+"/", "/at/"+w.svc.Tree().At()+"/", 1)
+	if cur == loc {
+		t.Fatal("the at didn't move")
+	}
+	if r := w.withCookie(cur, all, nil); r.status != 403 || r.header.Get("Cache-Control") != "no-store" {
+		t.Errorf("an at including pz: %d %v", r.status, r.body)
+	}
+	if r := w.withCookie(loc, all, nil); r.status != 200 {
+		t.Errorf("the at before pz: %d %v", r.status, r.body)
+	}
+	// The grant doesn't read pz: exchanged again, it no longer gets all.
+	if r, _ := w.exchange(wide, nil, ""); r.status != 200 || prefixes(r) == "/cat/g/all" {
+		t.Errorf("exchanged again with pz in the checkpoint: %d %v", r.status, r.body)
 	}
 }

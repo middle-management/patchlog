@@ -245,7 +245,7 @@ func (s *Service) viewer(ctx context.Context, r *http.Request, want string) (*vi
 	if cl := s.edgeClaims(r); cl != nil {
 		return s.edgeViewer(ctx, cl)
 	}
-	return s.grantViewer(ctx, Bearer(r), want, false)
+	return s.grantViewer(ctx, Bearer(r), want)
 }
 
 // edgeClaims is the edge grant the service minted that a GET or HEAD
@@ -318,12 +318,12 @@ func (s *Service) listed() map[string]bool {
 //     those grants (§B.11.5), unless want names another subject set. A
 //     public catalog needs no grant: one that doesn't verify for it still
 //     qualifies through the content namespaces alone, drawing from the
-//     exchangeRate bucket of its principal there. For an edge grant
-//     (forCookie), which covers every later at, every namespace the
-//     catalog trusts counts, those the service doesn't follow too: a
-//     g/all cookie is refused at an at including one trusted since its
-//     issue (trustedSince), and the service knows when each became
-//     trusted, not when it came into the checkpoint;
+//     exchangeRate bucket of its principal there. An edge grant, which
+//     covers every later at, is judged the same way, against the
+//     combined checkpoint only (§B.11.5, v0.76): a trusted namespace the
+//     service holds no checkpoint of doesn't count, and a g/all cookie is
+//     refused at an at including one that entered the checkpoint since
+//     its issue (trustedSince, entered);
 //   - with a RoleView (a catalog service), any other reader whose grant
 //     verifies for the catalog reads the listings of its subject set
 //     under /g/{gs}/, filtered by what its roles make visible (§B.11.5),
@@ -335,7 +335,7 @@ func (s *Service) listed() map[string]bool {
 //     any other reader is 403 (§B.11.5).
 //
 // A request at a want other than the viewer's gs is 403 (serve).
-func (s *Service) grantViewer(ctx context.Context, token, want string, forCookie bool) (*viewer, error) {
+func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer, error) {
 	// In a release preview every check is on the branch read in place of
 	// a namespace: a viewer sees only branches it can read (§B.5).
 	cat := s.actual(s.opt.Catalog)
@@ -401,7 +401,7 @@ func (s *Service) grantViewer(ctx context.Context, token, want string, forCookie
 				}
 			}
 		}
-		if forCookie || listed[ns] {
+		if listed[ns] {
 			all = all && wide[ns]
 		}
 	}
@@ -902,7 +902,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		// A g/all edge grant covers every later at, but not one that
 		// includes a namespace it wasn't checked against (§B.11.5).
 		w.Header().Set("Cache-Control", "no-store")
-		WriteError(w, http.StatusForbidden, "forbidden", "the edge grant for all predates the catalog's trust in "+ns+": exchange the grants again")
+		WriteError(w, http.StatusForbidden, "forbidden", "the edge grant for all predates "+ns+" in the combined checkpoint: exchange the grants again")
 		return
 	}
 	if p := s.profileAt(at, cur, curProf); v.cookie && p != nil && !p.Admits(v.subjects) {
