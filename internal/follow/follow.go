@@ -847,14 +847,14 @@ func (n *nsFollower) nsDoc(ctx context.Context, id string) (doc *client.NSDoc, l
 // client lacking the key for good, as its grant and keys are configured
 // (§A.4, §E.2.6): no key for the epoch (ErrNoKeys), none it can unwrap
 // (seal.ErrDecrypt) or will take (ErrUntrustedKey, §E.3.2), or /keys
-// answered a 4xx other than 429. Any other failure, the document's own
+// answered a 4xx other than 408 and 429. Any other failure, the document's own
 // GET's among them, is not; nor is any once ctx is done.
 func LacksKey(ctx context.Context, err error) bool {
 	if err == nil || ctx.Err() != nil {
 		return false
 	}
 	if ae, ok := client.AsAPIError(err); ok {
-		return strings.HasSuffix(ae.Path, "/keys") && ae.Status >= 400 && ae.Status < 500 && ae.Status != 429
+		return strings.HasSuffix(ae.Path, "/keys") && ae.Status >= 400 && ae.Status < 500 && ae.Status != 408 && ae.Status != 429
 	}
 	return errors.Is(err, client.ErrNoKeys) || errors.Is(err, seal.ErrDecrypt) || errors.Is(err, client.ErrUntrustedKey)
 }

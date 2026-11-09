@@ -399,12 +399,12 @@ func (k *Keys) ResourceKeys(ctx context.Context, ns, name string) ([]ResourceKey
 // can, else why not; permanent means retrying won't help without a new
 // configuration (an e2e namespace and no recipient key), and retry that
 // the epoch key couldn't be fetched for a reason asking again may mend
-// (Retryable: the core unreachable, a 5xx, a 429), rather than the
+// (Retryable: the core unreachable, a 5xx, a 408, a 429), rather than the
 // service's keys as configured: ns is skipped all the same (nothing is
 // consumed that can't be decrypted or sealed), but a consumer waiting for
 // it keeps waiting. A skip without retry is for want of keys (Skip):
-// client.ErrNoKeys, an e2e namespace and no recipient key, a 4xx from
-// /keys, or a key the service can't unwrap. partial (an e2e namespace
+// client.ErrNoKeys, an e2e namespace and no recipient key, a 4xx other
+// than 408 and 429 from /keys, or a key the service can't unwrap. partial (an e2e namespace
 // whose documents can't be read, which a tree service may still follow
 // for heads) is reported when allowPartial and is not a skip. A purged
 // namespace is consumed: its follower learns of the purge.
@@ -478,8 +478,8 @@ func (k *Keys) Recheck(ctx context.Context, ns string, allowPartial bool) (reaso
 
 // Retryable reports a failure to fetch keys that asking again may mend:
 // the core unreachable or the connection cut (a transport error), or its
-// 5xx or 429. Not the service's configuration: no key for its grant
-// (client.ErrNoKeys), none to unwrap one with, or a 4xx refusal.
+// 5xx, 408 or 429 (§A.4). Not the service's configuration: no key for its
+// grant (client.ErrNoKeys), none to unwrap one with, or another 4xx.
 func Retryable(err error) bool {
 	return !errors.Is(err, client.ErrNoKeys) && client.Transient(err)
 }
