@@ -635,12 +635,19 @@ func (ix *Index) forgetMember(ctx context.Context, m string) error {
 // documents, and its tombstoned nodes' last live documents, which a purge
 // changes or removes. Namespace documents stay, which no resource purge
 // changes, and so do checkpoints computed before (fs.cps), which only
-// tell a reader's gs at an older at.
+// tell a reader's gs at an older at. It counts the purge (fsGeneration),
+// so that what a request read of ns before the purge committed, and
+// stores after this, isn't kept (fsPutSince).
 func (ix *Index) fsForget(ns string) {
 	st := &ix.fs
 	pre := ns + "\x00"
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	st.gen++
+	st.purged = append(st.purged, ns)
+	if len(st.purged) > fsMaxPurges {
+		st.purged = slices.Delete(st.purged, 0, len(st.purged)-fsMaxPurges)
+	}
 	for _, k := range st.live.Keys() {
 		if strings.HasPrefix(k, pre) {
 			st.live.Remove(k)
