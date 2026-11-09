@@ -79,10 +79,19 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 		if err != nil {
 			return err
 		}
+		if n.purged {
+			return t.purgedNS(n)
+		}
+		if t.nsLevel(n) >= levelSealed {
+			return apiErr(404, "not_offered", "message", "gestures aren't listed in sealed or end-to-end namespaces: their logs carry them (§7.4)")
+		}
 		// A reader limited to some resources gets only theirs (§7.4), or,
 		// a partial reader of a namespace §B.11.9 covers, those visible to
 		// it at the current checkpoint, as its filtered reads would show
-		// them (§B.11.9 Answers): never an unplaced document.
+		// them (§B.11.9 Answers): never an unplaced document. It is built
+		// after the 410 and not_offered answers, which come as soon as the
+		// read check passes (§8.5), so a grant grantView refuses (/now)
+		// still learns a purge.
 		cfg := t.config(n.configSeq)
 		var visible func(name string) bool
 		if !t.readsNS(n, cfg, a, false) {
@@ -103,12 +112,6 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 					return v
 				}
 			}
-		}
-		if n.purged {
-			return t.purgedNS(n)
-		}
-		if t.nsLevel(n) >= levelSealed {
-			return apiErr(404, "not_offered", "message", "gestures aren't listed in sealed or end-to-end namespaces: their logs carry them (§7.4)")
 		}
 		var after int64
 		if since != "" {

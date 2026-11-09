@@ -1,6 +1,9 @@
 package server
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // V75-03 (v0.75): the gestures listing's after test (§7.4) and its
 // filtering for partial readers (§B.11.9 Answers).
@@ -46,4 +49,22 @@ func TestV075GesturesFiltered(t *testing.T) {
 	}
 	expectCode(t, w.get("/ns/matches/gestures/"+gA+"?after=opener/"+op, w.li()), 404, "not_found")
 	expect(t, w.get("/ns/matches/gestures/"+gA+"?after=opener/"+op, w.admin), 200)
+}
+
+// §8.5's table: the gestures listing of a purged namespace is 410 as soon
+// as the read check passes, before any other answer. A partial reader
+// whose grant has a rule on /now passes it (anyReader), so it gets the 410
+// too, not the 403 its filtered reads get (§B.11.9).
+func TestV075GesturesPurgedBeforeFilteredView(t *testing.T) {
+	t.Parallel()
+	w := newV75s(t, v75sOpts{})
+	w.seed([]string{"derby"}, nil, []string{"derby"})
+	now := w.li(map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}}})
+	expectCode(t, w.get("/ns/matches/gestures/"+gA, now), 403, "forbidden")
+	opg := mint(t, w.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"matches"}, "can": []any{"purge-ns"},
+		"exp": w.clock.Now().Add(time.Hour).Format(time.RFC3339)})
+	expect(t, w.patchNS("matches", ops(op("add", "/frozen", true)), w.admin), 201)
+	expect(t, w.do(req{method: "POST", path: "/ns/matches/purge?force=1", ifMatch: w.nsHead("matches", w.admin), bearer: opg}), 204)
+	expectCode(t, w.get("/ns/matches/gestures/"+gA, w.li()), 410, "purged")
+	expectCode(t, w.get("/ns/matches/gestures/"+gA, now), 410, "purged")
 }
