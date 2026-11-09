@@ -721,11 +721,17 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 // 429) is 502 too (§A.4 Private namespaces: "502 while it ... lacks the
 // keys"), and one for now (a 5xx, a 429, the core unreachable) is 503
 // behind, with Retry-After (scenario 100: "While those keys only can't
-// yet be fetched → 503 behind", §12.1). Every read check and view this
+// yet be fetched → 503 behind", §12.1), as is a namespace visibility reads
+// whose follower holds no checkpoint yet (errNotReached, members.go). Every read check and view this
 // service answers 502 for passes through here, so each gets the same
 // answer.
 func (ix *Index) writeUpstreamErr(w http.ResponseWriter, what string, err error, msg string) {
 	ix.opt.Logf("index: %s: %v", what, err)
+	if errors.Is(err, errNotReached) {
+		// A namespace visibility reads not followed yet (members.go).
+		writeBehind(w, err.Error())
+		return
+	}
 	if errors.Is(err, client.ErrKeyFetch) && !lacksKey(context.Background(), err) {
 		writeBehind(w, "the index cannot fetch the keys of a sealed namespace it reads yet (§A.4)")
 		return

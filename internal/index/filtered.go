@@ -54,9 +54,8 @@ import (
 //   - {ns} at the index's checkpoint;
 //   - each trusted, non-e2e, unpurged catalog, and each local, unpurged
 //     member of those catalogs' catalog.trust, a branch's root among
-//     them, at its head (memberAt): the index's checkpoint if the index
-//     follows it, otherwise its head as the grant checker last read it
-//     (CheckerTTL);
+//     them, at its head (memberAt): the index's checkpoint of it, whether
+//     it serves it or follows it only for this (members.go);
 //   - for a branch, each base read only as a base, at the baseAt its
 //     branch reads it at, which the branch's entry fixes.
 //
@@ -64,8 +63,9 @@ import (
 // (fcp.reads): a branch's bases, the root among them, are read as of the
 // baseAt its branch reads them at, whatever ns_id they are listed at.
 //
-// The index follows those catalogs and members without serving them: it
-// reads each one's state as of the id in the checkpoint, which never
+// The index follows those catalogs, members and bases without serving them
+// (members.go), so that their purges reach idx:{m} and kept results (§A.1):
+// it reads each one's state as of the id in the checkpoint, which never
 // changes, through the core's API (its namespace document, /heads and
 // documents), and keeps a catalog's graph (tree.BuildGraph, with its
 // tombstoned nodes' last live documents, catvis.NewCatalogDeleted) per
@@ -297,12 +297,17 @@ func (ix *Index) liveAt(ctx context.Context, ns, id string) (map[string]bool, er
 // memberAt is the ns_id a namespace read at its head is taken at, as a
 // member of a checkpoint (a catalog, a catalog.trust member) or as a
 // branch's root judged at its head (coverage): its committed position,
-// the index's checkpoint if it follows m and has reached it, otherwise
-// m's head as the grant checker read it; its document there is
+// the index's checkpoint if it serves m and has reached it, otherwise the
+// checkpoint its follower for visibility committed (members.go, memberCP:
+// "the service follows the namespaces visibility reads", §A.4), once it
+// has reached the head the grant checker read, waiting for it up to
+// MinWait, never a head no follower has applied; its document there is
 // docAt(m, id), which never changes. ok is false for a namespace that is
 // purged, doesn't exist or is a remote branch (§B.11.9: local, unpurged
-// members only); err is a document the index can't read. Callers depend on
-// that contract alone, not on where the position comes from.
+// members only); err is a document the index can't read, or errNotReached
+// before m's follower holds its first checkpoint (503 behind to partial
+// readers). Callers depend on that contract alone, not on where the
+// position comes from.
 func (ix *Index) memberAt(ctx context.Context, m string) (id string, ok bool, err error) {
 	if !client.ValidNSName(m) {
 		return "", false, nil
@@ -328,7 +333,7 @@ func (ix *Index) memberAt(ctx context.Context, m string) (id string, ok bool, er
 		return "", false, nil
 	}
 	ix.seedDoc(cfg)
-	return cfg.Head, true, nil
+	return ix.memberCP(ctx, m, cfg.Head)
 }
 
 // fsOpen reports whether a namespace with document doc can be covered:
@@ -581,6 +586,10 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 	}
 	cp.reads = maps.Clone(cp.ids)
 	for _, b := range cp.chain {
+		// A base the index doesn't serve has a follower (members.go).
+		if err := ix.baseFollowed(ctx, b.ns); err != nil {
+			return nil, err
+		}
 		if _, ok := cp.ids[b.ns]; !ok {
 			cp.ids[b.ns], cp.onlyBase[b.ns] = b.at, true
 		}
