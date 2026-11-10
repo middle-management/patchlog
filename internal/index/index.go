@@ -33,6 +33,9 @@
 //	                                      that the index follows without serving them, while it
 //	                                      follows them (members.go)
 //	member_conf(ns, public, level)        as ns_conf, for those
+//	ns_stopped(ns, ns_id)                 a namespace the index stopped following, or can't follow
+//	                                      past an entry, and the checkpoint it was stopped at
+//	                                      (purgeStopped)
 //	catalog_trust(ns, trust)              the catalog.trust last applied, of either, kept past a
 //	                                      purge-ns and a rebuild (recordTrust, fsTrust), read again
 //	                                      at a snapshot, forgotten once ns is neither served nor
@@ -75,6 +78,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -231,9 +235,13 @@ type Index struct {
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers
 
-	mu      sync.Mutex
-	cur     map[string]string // ns -> checkpoint
-	purged  map[string]bool
+	mu     sync.Mutex
+	cur    map[string]string // ns -> checkpoint
+	purged map[string]bool
+	// stopped are the namespaces the index stopped following, or can't
+	// follow past an entry, each with the checkpoint it was stopped at
+	// (purgeStopped, ns_stopped). ix.mu guards it.
+	stopped map[string]string
 	changed chan struct{} // closed and replaced after every commit
 	// runs stops the running follower of a followed namespace (runFollower),
 	// which Apply does once a config change leaves the service without
@@ -312,7 +320,7 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
 		schemas: NewSchemaCache(opt.Client),
 		fetches: semaphore.NewWeighted(int64(opt.FetchConcurrency)),
-		roots:   map[string]bool{}, cur: map[string]string{}, purged: map[string]bool{}, changed: make(chan struct{}),
+		roots:   map[string]bool{}, cur: map[string]string{}, purged: map[string]bool{}, stopped: map[string]string{}, changed: make(chan struct{}),
 	}
 	ix.fs.init()
 	ix.mem.init()
@@ -373,7 +381,7 @@ var migrations embed.FS
 // initSchema rather than a migration, is dropped, so a rebuild decides
 // between FTS5 and the LIKE fallback again.
 var resetStmts = []string{
-	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM ns_state`, `DELETE FROM ns_conf`,
+	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM ns_state`, `DELETE FROM ns_conf`, `DELETE FROM ns_stopped`,
 	`DELETE FROM docs`, `DROP TABLE IF EXISTS "text"`, `DELETE FROM facet`, `DELETE FROM "sort"`, `DELETE FROM refs`,
 	derived.CacheResetStmts[0], derived.CacheResetStmts[1],
 }
@@ -540,6 +548,22 @@ func (ix *Index) loadState(ctx context.Context) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	rows, err = ix.db.QueryContext(ctx, `SELECT ns, ns_id FROM ns_stopped`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var ns, id string
+		if err := rows.Scan(&ns, &id); err != nil {
+			rows.Close()
+			return err
+		}
+		ix.stopped[ns] = id
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	rows, err = ix.db.QueryContext(ctx, `SELECT ns FROM ns_state WHERE purged = 1`)
 	if err != nil {
 		return err
@@ -610,9 +634,24 @@ func (ix *Index) follow(ctx context.Context, ns string) {
 		ix.opt.Logf("index: %s was purged; not following", ns)
 		return
 	}
+	// A namespace it stops following, or can't follow past an entry, for
+	// keys it lacks or a refusal (401, 403, 404), at a start or meanwhile,
+	// is stopped (purgeStopped): the config entry that took the keys or
+	// the read away is never applied, so never purges what it narrows.
+	stop := func(n string) { ix.purgeStopped(context.WithoutCancel(ctx), n) }
 	opts := []follow.Option{
 		follow.WithMaxUnits(0),
-		follow.WithOnError(func(n string, err error) { ix.opt.Logf("index: %s: %v", n, err) }),
+		follow.WithOnError(func(n string, err error) {
+			ix.opt.Logf("index: %s: %v", n, err)
+			if ix.known(n) && follow.LacksKey(ctx, err) {
+				stop(n)
+			}
+		}),
+		follow.WithOnCatchUp(func(n, head string, done bool) {
+			if done {
+				ix.unstopAt(context.WithoutCancel(ctx), n, head)
+			}
+		}),
 	}
 	if ix.opt.Branches {
 		opts = append(opts, follow.WithBranches())
@@ -623,7 +662,10 @@ func (ix *Index) follow(ctx context.Context, ns string) {
 		var err error
 		// Addendum E: never consume what can't be decrypted (or whose
 		// results can't be sealed); skip it and say why.
-		if reason, permanent, _ := ix.keys.Check(ctx, ns, false); reason != "" {
+		if reason, permanent, retry := ix.keys.Check(ctx, ns, false); reason != "" {
+			if !retry {
+				stop(ns)
+			}
 			if permanent {
 				ix.opt.Logf("index: skipping %s: %s", ns, reason)
 				return
@@ -649,6 +691,25 @@ func (ix *Index) follow(ctx context.Context, ns string) {
 		if errors.Is(err, follow.ErrPurged) {
 			ix.opt.Logf("index: %s was purged", ns)
 			return
+		}
+		if ae, ok := client.AsAPIError(err); ok && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden || ae.Status == http.StatusNotFound) {
+			refused := ae.Status != http.StatusNotFound || ae.Path == "/ns/"+ns
+			if !refused {
+				// A 404 of a log range or a document may be a stale head
+				// pointer's (a CDN's, §9); one the namespace's own head
+				// answers alike is a refusal (§7 answers a namespace the
+				// reader can't read as one that doesn't exist).
+				_, herr := ix.c.NSHead(ctx, ns)
+				he, ok := client.AsAPIError(herr)
+				refused = ok && (he.Status == http.StatusUnauthorized || he.Status == http.StatusForbidden || he.Status == http.StatusNotFound)
+			}
+			if refused {
+				stop(ns)
+			}
+		} else if follow.LacksKey(ctx, err) {
+			// Its log can't be read past an entry whose keys the service
+			// lacks: retried, but what that entry narrows is purged now.
+			stop(ns)
 		}
 		ix.opt.Logf("index: following %s stopped: %v; restarting in %s", ns, err, pause)
 		t := time.NewTimer(pause)
@@ -750,9 +811,11 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		switch {
 		case lacks && root && ix.stopRun(b.NS):
 			ix.opt.Logf("index: skipping %s: %s", b.NS, reason)
+			ix.purgeStopped(context.WithoutCancel(ctx), b.NS)
 			return fmt.Errorf("index: %s skipped: %s", b.NS, reason)
 		case lacks && !root:
 			ix.opt.Logf("index: skipping branch %s: %s", b.NS, reason)
+			ix.purgeStopped(context.WithoutCancel(ctx), b.NS)
 			return nil
 		}
 	}
@@ -882,8 +945,23 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := ix.cps.SaveBatch(ctx, tx, b.Origin, b.NS, b); err != nil {
 		return err
 	}
+	// A batch of ns applied ends a stop (purgeStopped): what it couldn't
+	// apply is applied now, its narrowing with it.
+	ix.mu.Lock()
+	_, wasStopped := ix.stopped[b.NS]
+	ix.mu.Unlock()
+	if wasStopped {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM ns_stopped WHERE ns = ?`, b.NS); err != nil {
+			return err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	if wasStopped {
+		ix.mu.Lock()
+		delete(ix.stopped, b.NS)
+		ix.mu.Unlock()
 	}
 	if config || snapDoc != nil {
 		// Keys, revocations or the read mode may have changed: the grant
@@ -949,6 +1027,86 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		ix.kickMembers()
 	}
 	return nil
+}
+
+// purgeStopped stops ns, a namespace the index serves, when it stops
+// following it, or can't follow it past an entry, for keys it lacks (a
+// raise to e2e without a keyring recipient key, an epoch it can't have)
+// or a refusal (made private with the index's grant no longer verifying):
+// that entry is never applied, so never purges what it narrows (§9,
+// §A.1), and the read mode the index applied predates it. It marks ns
+// stopped at the checkpoint the index holds (ns_stopped), so it reads
+// public to no one (appliedPublic), and has the grant checker drop what
+// it holds of ns; then it purges idx:{ns}, as an apply of a config entry
+// that narrows does: kept, stored and cached results (its Purger), with
+// the second purge queued. Once per checkpoint: stopped again at the one
+// it was stopped at, after a restart too, it purges nothing more. A batch
+// of ns applied (Apply), or its follower catching up with that checkpoint
+// (unstopAt), ends the stop. As the tree service's purgeStopped.
+func (ix *Index) purgeStopped(ctx context.Context, ns string) {
+	cp, purged, err := ix.committed(ctx, ns)
+	if err != nil || purged {
+		return
+	}
+	ix.mu.Lock()
+	was, marked := ix.stopped[ns]
+	ix.stopped[ns] = cp
+	ix.mu.Unlock()
+	ix.checker.Observe(ns, "")
+	if marked && was == cp {
+		return
+	}
+	ix.opt.Logf("index: %s can't be followed past %q: purging idx:%s, read as private until it is", ns, cp, ns)
+	tags := []string{"idx:" + ns}
+	err = func() error {
+		ix.wmu.Lock()
+		defer ix.wmu.Unlock()
+		tx, err := ix.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO ns_stopped (ns, ns_id) VALUES (?, ?) ON CONFLICT (ns) DO UPDATE SET ns_id = excluded.ns_id`, ns, cp); err != nil {
+			return err
+		}
+		if err := ix.purgeTx(ctx, tx, tags); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}()
+	if err != nil {
+		ix.opt.Logf("index: purging %v for %s, no longer followed: %v", tags, ns, err)
+	}
+	ix.purgeStored(ctx, ns, tags, false)
+	ix.purgeKept(ns, tags)
+}
+
+// isStopped reports whether ns is stopped (purgeStopped).
+func (ix *Index) isStopped(ns string) bool {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	_, ok := ix.stopped[ns]
+	return ok
+}
+
+// unstopAt ends ns's stop once its follower caught up with head at the
+// checkpoint it was stopped at: nothing it couldn't follow is left
+// unapplied (a refusal or a key that has passed, a stale head pointer).
+func (ix *Index) unstopAt(ctx context.Context, ns, head string) {
+	ix.mu.Lock()
+	was, ok := ix.stopped[ns]
+	unstop := ok && head != "" && was == head && ix.cur[ns] == head
+	if unstop {
+		delete(ix.stopped, ns)
+	}
+	ix.mu.Unlock()
+	if !unstop {
+		return
+	}
+	ix.checker.Observe(ns, "")
+	if _, err := ix.db.ExecContext(ctx, `DELETE FROM ns_stopped WHERE ns = ?`, ns); err != nil {
+		ix.opt.Logf("index: ending the stop of %s: %v", ns, err)
+	}
 }
 
 // purgeTx purges tags, in tx, from the stored sealed results, and queues

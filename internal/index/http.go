@@ -325,7 +325,12 @@ func (ix *Index) publicFor(ctx context.Context, ns string, cfg *grantcheck.Confi
 // database whose namespace had no config entry applied since ns_conf was
 // added, migration 002), the record is seeded from the namespace
 // document at that checkpoint (seedConf); until it is, ns isn't public.
+// Stopped (purgeStopped), it isn't public until the stop ends.
 func (ix *Index) appliedPublic(ctx context.Context, ns string) bool {
+	if ix.isStopped(ns) {
+		// Stopped short of an entry it can't apply (purgeStopped).
+		return false
+	}
 	var cp string
 	var public sql.NullBool
 	err := ix.db.QueryRowContext(ctx, `SELECT coalesce((SELECT ns_id FROM checkpoints WHERE origin = ? AND ns = ?), ''),
