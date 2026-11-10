@@ -529,6 +529,7 @@ func (ix *Index) refsCookieReader(ctx context.Context, r *http.Request, reached 
 			continue
 		case cfg.Read == "public":
 			rd.nss = append(rd.nss, ns)
+			rd.pub = append(rd.pub, ns)
 			continue
 		case i < 0:
 			continue

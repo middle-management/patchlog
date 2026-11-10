@@ -81,3 +81,6 @@ func (ix *Index) OnRefsRead(f func()) { ix.testRefsRead = f }
 // OnAnswerRead calls f each time a query's answer has read its rows,
 // before it is built and kept (tests).
 func (ix *Index) OnAnswerRead(f func()) { ix.testAnswerRead = f }
+
+// KeptHas reports whether a result is kept under url (tests).
+func (ix *Index) KeptHas(url string) bool { _, _, ok := ix.kept.Get(url); return ok }

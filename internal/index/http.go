@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -221,6 +222,10 @@ type access struct {
 	// stands for. Both are nil for any other reader.
 	cov    *fview
 	derive func(ctx context.Context, cp *fcp) (*fview, error)
+	// token is the grant v was verified from in Authorization, which
+	// answer verifies again once gen is taken (accessChanged); "" under
+	// a cookie and where access didn't verify one.
+	token string
 }
 
 // writeLimit answers a grant over grantSize or rulesPerGrant, which the
@@ -258,7 +263,56 @@ func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*acces
 	if err != nil {
 		return nil, err
 	}
-	return ix.grantAccess(ctx, ns, v)
+	a, err := ix.grantAccess(ctx, ns, v)
+	if a != nil {
+		a.token = token
+	}
+	return a, err
+}
+
+// accessChanged reports whether what a's read check of ns decided may no
+// longer hold, asked once a result's gen is taken (answer): a config
+// entry that makes ns private purges idx:{ns} (§9, §A.1), but a read
+// check made before it on the document the grant checker cached may
+// pass after the purge, and a result computed then would be kept and
+// served at a URL its read no longer admits. Changed, the query is
+// computed again with a fresh read check (errAccessChanged, afterPurge).
+//
+// A public reader's: ns is still public as the read mode the index last
+// applied records it (ns_conf, committed before the purge, so a gen
+// taken after it sees it) and as the grant checker reads it now (it
+// observes the change before the purge, Apply). A grant's: it still
+// verifies and allows read as the checker reads ns now (a revocation, a
+// key or role removed: §C.4, which purge nothing). A cookie's edge grant
+// is the service's own, checked by the marker it carries (edgegrants.go).
+func (ix *Index) accessChanged(ctx context.Context, ns string, a *access) bool {
+	if a.public {
+		return !ix.stillPublic(ctx, ns)
+	}
+	if a.v != nil && a.token != "" {
+		v, err := ix.checker.Verify(ctx, ns, a.token)
+		if err != nil {
+			return true
+		}
+		ok, _ := v.Allows("read")
+		return !ok
+	}
+	return false
+}
+
+// stillPublic reports whether ns is public both as the read mode the
+// index last applied records it (ns_conf; with none applied yet, the
+// checker alone decides) and as the grant checker reads it now
+// (accessChanged).
+func (ix *Index) stillPublic(ctx context.Context, ns string) bool {
+	var public bool
+	switch err := ix.db.QueryRowContext(ctx, `SELECT public FROM ns_conf WHERE ns = ?`, ns).Scan(&public); {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil || !public:
+		return false
+	}
+	cfg, err := ix.checker.Config(ctx, ns)
+	return err == nil && cfg.Read == "public"
 }
 
 // grantAccess is access to private namespace ns for v, a grant verified
@@ -605,6 +659,12 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 				}
 				if _, got, err := ix.answer(ctx, a, ns, rv, rq, info); err == nil {
 					to = got
+				} else if errors.Is(err, errAccessChanged) {
+					// Not redirected with what the read check of before
+					// decided (its headers, its URL space): checked
+					// again, and computed again if it still passes.
+					ix.afterPurge(w, r, ns, rv, rq)
+					return
 				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) && !errors.Is(err, errEpochCounts) && !errors.Is(err, errLackCounts) && !errors.Is(err, errPurgedSince) {
 					ix.opt.Logf("index: query %s: %v", r.URL, err)
 				}
@@ -1014,6 +1074,13 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		allow = a.allow
 	}
 	gen, sgen := ix.kept.Generation(ns), ix.sealed.Generation()
+	// a was decided before gen: a config change since that narrows ns's
+	// read (§9) purges before a gen taken after it, so what a decided is
+	// checked again now, or a result over ns made private would be kept
+	// and served at its public URL.
+	if ix.accessChanged(ctx, ns, a) {
+		return derived.Stored{}, "", errAccessChanged
+	}
 	// info was read before gen: a config change since (a raise to sealed
 	// or e2e, a rotation), which Apply observes before it purges what it
 	// narrows (§9, §A.1), would have this result computed under what it
@@ -1228,6 +1295,12 @@ var errPurgedSince = errors.New("the result was computed before a purge of what 
 // errPurgedSince, computed again with what is current: a raise purges what
 // the result shows (§9), and nothing read before it is kept (§A.1).
 var errInfoChanged = fmt.Errorf("%w: the namespace's encryption changed", errPurgedSince)
+
+// errAccessChanged is a result answer would compute for a reader whose
+// read check passed on what a config change since replaced
+// (accessChanged): answered as errPurgedSince, with a fresh read check
+// (afterPurge), which refuses a reader the change refuses.
+var errAccessChanged = fmt.Errorf("%w: the reader's read access changed", errPurgedSince)
 
 // setResultHeaders sets a result's headers: a private one gets edge
 // lifetimes only for a read the verifying edge verified (§9).

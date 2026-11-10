@@ -827,6 +827,17 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	if config {
+		// Keys, revocations or the read mode may have changed: the grant
+		// checker reads the namespace's document again before anything
+		// is purged or the checkpoint published. Told later, it would
+		// pass read checks on the document it cached meanwhile (for up to
+		// CheckerTTL), a namespace made private still public there, and a
+		// result computed at the new checkpoint after the purge would be
+		// kept and served in the public URL space (answer re-checks the
+		// read once gen is taken, accessChanged).
+		ix.checker.Observe(b.NS, b.NewCheckpoint)
+	}
 	ix.purgeStored(ctx, b.NS, tags, co.PurgedNS)
 	if b.Partial() {
 		// A page of a snapshot later pages complete: the index doesn't
@@ -871,13 +882,6 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	}
 	if co.PurgedNS {
 		ix.keys.Forget(b.NS)
-	}
-	for _, u := range b.Units {
-		if u.Config != nil {
-			// Keys, revocations or the read mode may have changed.
-			ix.checker.Observe(b.NS, b.NewCheckpoint)
-			break
-		}
 	}
 	if config || co.PurgedNS || first {
 		// What coverage reads may have changed: which namespaces the
