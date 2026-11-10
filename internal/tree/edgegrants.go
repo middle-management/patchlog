@@ -301,6 +301,13 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 		if subs, ok = s.edge.Subjects(ctx, gs); !ok {
 			return nil, &grant.AuthError{Status: 401, Msg: "an edge grant for a subject set this service doesn't know: exchange the grant again"}
 		}
+		if slices.Contains(subs, legacyPartial) {
+			// A set stored under an earlier draft that left out some of
+			// the reader's groups: no gs leaves a group out (§B.11.5,
+			// v0.78), and served as it is it would show what a group it
+			// left out hides. 403 until the reader exchanges again.
+			return nil, &grant.AuthError{Status: 403, Msg: "the edge grant's subject set leaves out groups: exchange the grants again (§B.11.5)"}
+		}
 	}
 	// As grantViewer; a catalog service is never a release preview (Open),
 	// so actual is the namespace itself.

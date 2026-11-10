@@ -56,6 +56,19 @@ func readRoles(v *grant.Verified) []string {
 	return out
 }
 
+// RefusedByNow reports whether rules on /now refuse v every read (§C.2
+// item 5): a key-scope or block rule fails for a read (FailsRead), or v
+// carries roles, some listing read, and every one of those has a rule
+// that fails for a read, so none counts. A grant that allows no read at
+// all is not this case.
+func RefusedByNow(v *grant.Verified) bool {
+	if failsRead(v.KeyRules) || failsRead(v.BlockRules) {
+		return true
+	}
+	ok, readers := v.Allows("read")
+	return ok && v.HasRoles() && len(readers) > 0 && len(readRoles(v)) == 0
+}
+
 // failsRead reports whether some rule of rs fails for a read (FailsRead).
 func failsRead(rs []any) bool {
 	for _, rv := range rs {

@@ -2112,19 +2112,17 @@ func (s *Service) bornOf(ctx context.Context, ns, name, head string) (born strin
 
 // snapshotBornEpoch is the epoch of e2e namespace ns that a prune's
 // snapshot of e, the first revision of a chain, would carry (§E.3.1), the
-// epoch a value derived from it is sealed under (§E.2.6): a revision from
-// before a raise from sealed, served sealed as at E2, its served kid's
-// where that names ns; one whose sealed op is ns's own (its pl.ns names
-// ns), the epoch its kid names; one whose op is a base's, read through, or
-// in the clear from before a raise from none or at-rest, ns's epoch in
-// force, judged once, when a value derived from it is first sealed
-// (§E.2.6): bornPending, never the epoch current as it is applied. 0, not
-// known, for one without its patch set (pruned or purged) or whose own
-// op's kid doesn't name an epoch of ns.
+// epoch a value derived from it is sealed under (§E.2.6): one whose sealed
+// op is ns's own (its pl.ns names ns), the epoch its kid names; one whose
+// op is a base's, read through, ns's epoch in force, judged once, when a
+// value derived from it is first sealed (§E.2.6): bornPending, never the
+// epoch current as it is applied. 0, not known, for one without its patch
+// set (pruned or purged) or whose own op's kid doesn't name an epoch of
+// ns. A served kid (e.Kid) is ignored: a namespace is e2e only from its
+// creation (v0.78), so only a revision sealed before a raise, which no
+// longer exists, was served sealed as at E2, and an origin that serves
+// one a kid names no epoch the service may trust for it (§E.2.6).
 func snapshotBornEpoch(ns string, e client.LogEntry) int {
-	if e.Kid != "" {
-		return derived.EpochOf(ns, e.Kid)
-	}
 	if !e.HasPatches {
 		return 0
 	}

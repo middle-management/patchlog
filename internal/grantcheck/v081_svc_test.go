@@ -57,6 +57,12 @@ func TestV081SvcReadNow(t *testing.T) {
 		if err != nil || d.Allowed != c.reads {
 			t.Errorf("%s: CheckRead %+v %v", c.name, d, err)
 		}
+		// Refused by /now: each case but the reader beside a /now role
+		// and prefixed beside one (which reads pub- names).
+		wantRefused := !c.reads && c.name != "role on /now beside prefixed"
+		if got := grantcheck.RefusedByNow(v); got != wantRefused {
+			t.Errorf("%s: RefusedByNow %v", c.name, got)
+		}
 	}
 	// The envelope itself carries no now.
 	if env := grantcheck.ReadEnvelope(nil, "a", f.s.Now()); env["now"] != nil {
