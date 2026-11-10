@@ -575,14 +575,9 @@ func (t *tx) insertSealed(ns int64, j *sealJob, name, rev any) {
 // (§E.2.2); the setting as of sealing counts, and stored bytes never change.
 func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) error {
 	var todo []*sealJob
-	var count []sealKey
-	for _, j := range jobs {
-		if j != nil && j.jwe == "" {
-			count = append(count, jobSealKey(ns, j))
-		}
-	}
-	// Counted before any is sealed: past the bound, none is (§E.2.1).
-	if err := e.countSeals(ctx, count); err != nil {
+	// Counted before any is sealed, a revision's document or entry from
+	// what its write reserved: past the bound, none is (§E.2.1).
+	if err := e.countJobSeals(ctx, ns, jobs); err != nil {
 		return err
 	}
 	for _, j := range jobs {
@@ -624,13 +619,7 @@ func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) erro
 			if j.name != "" {
 				name = j.name
 			}
-			mine := j.jwe
 			t.insertSealed(ns, j, name, rev)
-			if (j.kind == sealDoc || j.kind == sealEntry) && j.jwe == mine {
-				// Counted from a block (countSeals): what its write
-				// reserved for it is released.
-				t.releaseReserve(jobSealKey(ns, j))
-			}
 			ranges = ranges || j.kind == sealRange
 		}
 		if ranges {

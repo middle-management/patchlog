@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/core"
@@ -109,4 +110,64 @@ func TestV081SealBoundShared(t *testing.T) {
 	expect(t, a.get("/ns/s/rev/"+head+"/log?since="+ids[2]), 200)
 	expectCode(t, a.get("/ns/s/rev/"+ids[1]+"/log"), 503, "behind")
 	expectCode(t, b.get("/ns/s/rev/"+ids[1]+"/log"), 503, "behind")
+}
+
+// KEYS-9 (§E.2.1 "reserving what may still be sealed under an epoch after
+// it ends"): a read sealing a revision's document or log entry counts it
+// from what its write reserved, moved to sealed, so reservations filling
+// K_r never make their own revisions unreadable. With a bound of 4, two
+// revisions of a reserve all 4; their documents and the two-entry log
+// read, and end at 4 sealed, none reserved (5 and 6 leave room).
+func TestV081ReservedRoomServesReads(t *testing.T) {
+	t.Parallel()
+	for _, bound := range []int64{6, 5, 4} {
+		t.Run(fmt.Sprint(bound), func(t *testing.T) {
+			t.Parallel()
+			var path string
+			e := newSealedEnv(t, withFileDB(t), func(o *core.Options) { path = o.Path }, withSealBound(bound, 1<<30, 1))
+			e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
+			id1 := e.wr("s", "a", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+			id2 := e.wr("s", "a", id1, withNonce([]any{op("replace", "/v", 2.0)}))
+			expect(t, e.get("/r/s/a/rev/"+id1), 200)
+			expect(t, e.get("/r/s/a/rev/"+id2), 200)
+			expect(t, e.get("/r/s/a/rev/"+id2+"/log"), 200)
+			db, pg := v0261DB(t, path)
+			sealed := v0261Count(t, db, pg, `SELECT sealed FROM seal_counts WHERE name = 'a'`)
+			reserved := v0261Count(t, db, pg, `SELECT reserved FROM seal_counts WHERE name = 'a'`)
+			if sealed != 4 || reserved != 0 {
+				t.Fatalf("K_r(a): %d sealed, %d reserved; want 4 and 0", sealed, reserved)
+			}
+		})
+	}
+}
+
+// KEYS-9 (§E.2.1): counting a read's sealings is all or none. With K_r(a)
+// at 3 sealed and 1 reserved of a bound of 4, the two-entry log needs one
+// count past the bound: 503 behind, and the reservation it could have
+// used stays reserved, so a retry burns nothing. A document read then
+// uses it.
+func TestV081ReservedRoomAllOrNone(t *testing.T) {
+	t.Parallel()
+	var path string
+	e := newSealedEnv(t, withFileDB(t), func(o *core.Options) { path = o.Path }, withSealBound(4, 1<<30, 1))
+	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
+	id1 := e.wr("s", "a", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+	id2 := e.wr("s", "a", id1, withNonce([]any{op("replace", "/v", 2.0)}))
+	db, pg := v0261DB(t, path)
+	if _, err := db.Exec(`UPDATE seal_counts SET sealed = 3, reserved = 1 WHERE name = 'a'`); err != nil {
+		t.Fatal(err)
+	}
+	counts := func() (int, int) {
+		return v0261Count(t, db, pg, `SELECT sealed FROM seal_counts WHERE name = 'a'`), v0261Count(t, db, pg, `SELECT reserved FROM seal_counts WHERE name = 'a'`)
+	}
+	for range 2 {
+		expectCode(t, e.get("/r/s/a/rev/"+id2+"/log"), 503, "behind")
+		if s, r := counts(); s != 3 || r != 1 {
+			t.Fatalf("after a refused log: %d sealed, %d reserved; want 3 and 1", s, r)
+		}
+	}
+	expect(t, e.get("/r/s/a/rev/"+id1), 200)
+	if s, r := counts(); s != 4 || r != 0 {
+		t.Fatalf("after a document read: %d sealed, %d reserved; want 4 and 0", s, r)
+	}
 }

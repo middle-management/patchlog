@@ -27,7 +27,10 @@ import (
 // in it (countIn), otherwise from blocks of Options.SealBlock counts an
 // instance takes per key in a short transaction of its own and hands out
 // from memory (sealCounter.take), an unused remainder staying counted. On
-// SQLite a block is never taken inside a held transaction.
+// SQLite a block is never taken inside a held transaction. A revision's
+// document or log entry sealed on read is counted from what its write
+// reserved, moved to sealed (countJobSeals), so reservations filling a key
+// never make the revisions they were made for unreadable.
 
 // sealKey names a key the origin seals under: K_n (name "") or K_r of
 // resource name, of epoch epoch of namespace ns.
@@ -75,12 +78,75 @@ func errBehind() *Error {
 // outside any transaction, from this instance's blocks (sealCounter.take).
 // It returns errBehind where a key has no room left.
 func (e *Engine) countSeals(ctx context.Context, keys []sealKey) error {
-	for _, k := range keys {
+	for i, k := range keys {
 		if err := e.takeSeal(ctx, k); err != nil {
+			// None is sealed: what was taken goes back.
+			e.seals.giveBack(keys[:i])
 			return err
 		}
 	}
 	return nil
+}
+
+// countJobSeals counts the sealings finishSeal is to make for jobs not
+// stored yet in namespace ns, before any is made, all or none: those of a
+// revision's document or entry by moving a count of their key from
+// reserved to sealed (§E.2.1, §E.2.2: their write reserved it), or where
+// none is reserved (a race loser's sealing took it, or the revision is
+// from before v0.81) by drawing one, in one short transaction of its own
+// that rolls back on errBehind, keys in sorted order as reserveWrite takes
+// them; the others from this instance's blocks (countSeals), given back if
+// that transaction fails.
+func (e *Engine) countJobSeals(ctx context.Context, ns int64, jobs []*sealJob) error {
+	var block, own []sealKey
+	for _, j := range jobs {
+		if j == nil || j.jwe != "" {
+			continue
+		}
+		if k := jobSealKey(ns, j); j.kind == sealDoc || j.kind == sealEntry {
+			own = append(own, k)
+		} else {
+			block = append(block, k)
+		}
+	}
+	if err := e.countSeals(ctx, block); err != nil {
+		return err
+	}
+	if len(own) == 0 {
+		return nil
+	}
+	sort.Slice(own, func(a, b int) bool {
+		x, y := own[a], own[b]
+		if x.epoch != y.epoch {
+			return x.epoch < y.epoch
+		}
+		return x.name < y.name
+	})
+	err := e.update(ctx, func(t *tx) error {
+		for _, k := range own {
+			if !t.sealedFromReserve(k) {
+				t.countIn(k, 1, false)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		e.seals.giveBack(block)
+	}
+	return err
+}
+
+// giveBack returns one count of each of keys to this instance's blocks,
+// for sealings taken (takeSeal) but not made.
+func (c *sealCounter) giveBack(keys []sealKey) {
+	if len(keys) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, k := range keys {
+		c.left[k]++
+	}
 }
 
 func (e *Engine) takeSeal(ctx context.Context, k sealKey) error {
@@ -174,13 +240,6 @@ func (t *tx) sealedFromReserve(k sealKey) bool {
 	n, err := res.RowsAffected()
 	t.must(err)
 	return n > 0
-}
-
-// releaseReserve releases one count k's write reserved, for a value
-// counted as sealed when it was sealed (finishSeal).
-func (t *tx) releaseReserve(k sealKey) {
-	_, err := t.Exec(`UPDATE seal_counts SET reserved = reserved - 1 WHERE ns = ? AND epoch = ? AND name = ? AND reserved > 0`, k.ns, k.epoch, k.name)
-	t.must(err)
 }
 
 // seedSealCounts completes, once, at the first Open after migration 016,
