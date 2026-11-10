@@ -11,14 +11,10 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
-// V76-01 (v0.76): origin filtered reads (§B.11.9): a branch stays covered
-// only while its root, at its head, still trusts the catalog through every
-// key item 1 counts, unchanged (FCORE-1); an uncovered namespace's
-// filtered URLs are 401 without a grant that verifies there or a cookie
-// (FCORE-3); a filtered at lists a namespace read at its head at its
-// head, a branch's root included, while visibility reads the base at its
-// baseAt (FSVC-6); and a stored subject set is bound to its key's pub
-// (FSVC-7).
+// V76-01 (v0.76): origin filtered reads (§B.11.9): an uncovered
+// namespace's filtered URLs are 401 without a grant that verifies there or
+// a cookie (FCORE-3), a branch among them since v0.78; and a stored
+// subject set is bound to its key's pub (FSVC-7).
 
 // v76fWorld is a v75World whose matches also has key fan, without
 // requireAt and with a scope rule testing /resource by type, so its grants
@@ -119,230 +115,64 @@ func v76fHas(names []string, name string) bool {
 	return false
 }
 
-// §B.11.9 Branches, Where, §C.4 (conformance 105): a branch stays covered
-// only while matches, at its head, trusts cat-season through every key
-// item 1 counted at the branch's baseAt, each entry unchanged.
-func TestV076OriginBranchUncoveredByKeyRotation(t *testing.T) {
-	t.Parallel()
-	newPub, _ := grant.GenerateKey()
-	for name, c := range map[string]struct {
-		ops     []any
-		covered bool
-	}{
-		// Scenario 105: catalog-02 replaces catalog-01, its roles scope
-		// without reader.
-		"catalog-02 replaces catalog-01": {ops: []any{
-			map[string]any{"op": "add", "path": "/keys/-", "value": map[string]any{"kid": "catalog-02", "alg": "ed25519", "pub": newPub,
-				"can": []any{"read"}, "requireAt": "cat-season", "roles": map[string]any{"allow": []any{"editor"}}}},
-			map[string]any{"op": "remove", "path": "/keys/1"},
-		}},
-		"catalog-01's scope rules changed": {ops: []any{map[string]any{"op": "replace", "path": "/keys/1/rules",
-			"value": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string", "minLength": 1}}}}}},
-		"catalog-01's pub rotated":       {ops: []any{map[string]any{"op": "replace", "path": "/keys/1/pub", "value": newPub}}},
-		"catalog-01's maxTtl edited":     {ops: []any{map[string]any{"op": "replace", "path": "/keys/1/maxTtl", "value": "PT10M"}}},
-		"catalog-01's requireAt dropped": {ops: []any{map[string]any{"op": "remove", "path": "/keys/1/requireAt"}}},
-		"cat-season left catalogs":       {ops: []any{map[string]any{"op": "remove", "path": "/catalogs/cat-season"}}},
-		// Keys added at the head don't count; nor do roles.
-		"an unrelated key added": {ops: []any{map[string]any{"op": "add", "path": "/keys/-", "value": map[string]any{"kid": "extra",
-			"alg": "ed25519", "pub": newPub, "can": []any{"read"}}}}, covered: true},
-		"a key requireAt cat-season added": {ops: []any{map[string]any{"op": "add", "path": "/keys/-", "value": map[string]any{"kid": "catalog-03",
-			"alg": "ed25519", "pub": newPub, "can": []any{"read"}, "requireAt": "cat-season"}}}, covered: true},
-		"reader's rules changed": {ops: []any{map[string]any{"op": "add", "path": "/roles/reader/rules",
-			"value": []any{map[string]any{"op": "test", "path": "/action", "value": "read"}}}}, covered: true},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			w := newV76fWorld(t, true)
-			ctx := context.Background()
-			fan := w.fan("matches-r7", w.fanPriv)
-			red, st := v76fRedirect(t, w.v75World, "matches-r7", "", fan)
-			if red == nil {
-				t.Fatalf("before: %d", st)
-			}
-			gs := red.GS
-			if names, st := v76fHeads(t, w.v75World, "matches-r7", gs, red.At, fan); st != 0 || !v76fHas(names, "derby") {
-				t.Fatalf("before: %v %d", names, st)
-			}
-			res, err := w.e.IssueEdgeGrants(ctx, []string{fan.Bearer})
-			if err != nil || len(res.Grants) != 1 || res.Grants[0].GS != gs {
-				t.Fatalf("exchange before: %+v %v", res, err)
-			}
-			w.patchConfig("matches", c.ops...)
-			red2, st := v76fRedirect(t, w.v75World, "matches-r7", gs, fan)
-			names, hst := v76fHeads(t, w.v75World, "matches-r7", gs, red.At, fan)
-			_, _, lerr := w.e.FilteredLog(ctx, "matches-r7", gs, red.At, "", 0, fan)
-			res, xerr := w.e.IssueEdgeGrants(ctx, []string{fan.Bearer})
-			w.inTx(func(t2 *tx) {
-				if got := t2.filteredScope(t2.nsByName("matches-r7")) != nil; got != c.covered {
-					t.Errorf("covered %v, want %v", got, c.covered)
-				}
-			})
-			if c.covered {
-				if red2 == nil {
-					t.Fatalf("still covered: FilteredCurrent %d", st)
-				}
-				if names, st := v76fHeads(t, w.v75World, "matches-r7", gs, red2.At, fan); st != 0 || !v76fHas(names, "derby") {
-					t.Fatalf("still covered: heads %v %d", names, st)
-				}
-				if xerr != nil || len(res.Grants) != 1 || res.Grants[0].GS != gs {
-					t.Fatalf("still covered: exchange %+v %v", res, xerr)
-				}
-				return
-			}
-			if st != 403 || hst != 403 || v75Status(lerr) != 403 || v76fHas(names, "derby") {
-				t.Fatalf("uncovered: FilteredCurrent %d, FilteredHeads %d %v, FilteredLog %v", st, hst, names, lerr)
-			}
-			if v75Status(xerr) != 403 {
-				t.Fatalf("uncovered: exchange %+v %v, want 403", res, xerr)
-			}
-		})
-	}
-}
-
-// §B.11.9 gs, §C.4 (conformance 106): a partial reader of matches-r7
-// whose grant is signed by a base key that matches then removes: her
-// cookie is 403 at a later at, and her exchange then 401.
-func TestV076OriginBranchBaseKeyRemoved(t *testing.T) {
+// §B.11.9 Where (v0.78: "Filtered reads cover no branch"; conformance
+// TDA 63, 105, 106): a partial reader of matches-r7 gets no redirect, its
+// filtered URLs are 403 and its exchange 403 with no g prefix, whatever
+// matches trusts; once the base key that signed its grant is gone, the
+// grant no longer verifies and the exchange is 401. Before v0.78 the
+// branch was covered while matches still trusted cat-season through every
+// key counted at baseAt.
+func TestV076OriginBranchUncovered(t *testing.T) {
 	t.Parallel()
 	w := newV76fWorld(t, true)
 	ctx := context.Background()
 	fan := w.fan("matches-r7", w.fanPriv)
-	res, err := w.e.IssueEdgeGrants(ctx, []string{fan.Bearer})
-	if err != nil || len(res.Grants) != 1 || res.Grants[0].GS == "" {
-		t.Fatalf("exchange: %+v %v", res, err)
+	li := w.li(map[string]any{"ns": []any{"matches-r7"}})
+	gs := grantcheck.SubjectSetID([]string{"group:fan-club"})
+	at := grantcheck.CombinedAt(map[string]string{"matches-r7": w.head("matches-r7")})
+	for name, cred := range map[string]Credentials{"fan": fan, "li": li} {
+		if _, err := v76fUnfiltered(ctx, w.e, "matches-r7", cred); v75Status(err) != 403 {
+			t.Errorf("%s: unfiltered URL %v, want 403 and no redirect", name, err)
+		}
+		if _, st := v76fRedirect(t, w.v75World, "matches-r7", gs, cred); st != 403 {
+			t.Errorf("%s: FilteredCurrent %d, want 403", name, st)
+		}
+		if _, st := v76fHeads(t, w.v75World, "matches-r7", gs, at, cred); st != 403 {
+			t.Errorf("%s: FilteredHeads %d, want 403", name, st)
+		}
+		if _, _, err := w.e.FilteredLog(ctx, "matches-r7", gs, at, "", 0, cred); v75Status(err) != 403 {
+			t.Errorf("%s: FilteredLog %v, want 403", name, err)
+		}
+		if res, err := w.e.IssueEdgeGrants(ctx, []string{cred.Bearer}); v75Status(err) != 403 {
+			t.Errorf("%s: exchange %+v %v, want 403", name, res, err)
+		}
 	}
-	gs := res.Grants[0].GS
+	if _, st := v76fHeads(t, w.v75World, "matches-r7", gs, at, Credentials{}); st != 401 {
+		t.Errorf("no credentials: %d, want 401", st)
+	}
 	cookie := Credentials{Edge: &EdgeGrant{NS: "matches-r7", GS: gs, Prefix: "/ns/matches-r7/g/" + gs, Exp: w.now().Add(10 * time.Minute)}}
-	red, st := v76fRedirect(t, w.v75World, "matches-r7", gs, cookie)
-	if red == nil {
-		t.Fatalf("cookie before: %d", st)
+	if _, st := v76fRedirect(t, w.v75World, "matches-r7", gs, cookie); st != 403 {
+		t.Errorf("a g cookie: %d, want 403", st)
 	}
 	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/2"})
-	if _, st := v76fRedirect(t, w.v75World, "matches-r7", gs, cookie); st != 403 {
-		t.Fatalf("cookie at a later at: %d, want 403", st)
-	}
 	if _, err := w.e.IssueEdgeGrants(ctx, []string{fan.Bearer}); v75Status(err) != 401 {
 		t.Fatalf("exchange after the key went: %v, want 401", err)
 	}
 }
 
-// §B.11.9 URLs, §A.4 Answers: a branch's filtered at lists its root, a
-// catalog.trust member read at its head, at its head, while item 1 still
-// reads the root's roles as of the branch's baseAt; the at round-trips;
-// an at recorded with the root at baseAt instead isn't answered (302).
-func TestV076OriginBranchAtLayout(t *testing.T) {
-	t.Parallel()
-	w := newV75World(t, v75Opts{})
-	w.seed()
-	ctx := context.Background()
-	w.put("matches", "final", map[string]any{"title": "final"})
-	w.put("cat-season", "matches.final", map[string]any{"parents": v75Parents("season")})
-	if _, err := w.e.CreateBranch(ctx, Request{NS: "matches", Cred: w.admin}, BranchRequest{Name: "matches-r7", IfNoneMatch: true}); err != nil {
-		t.Fatal(err)
-	}
-	var baseAtID string
-	w.inTx(func(t2 *tx) { baseAtID = t2.nsLogID(t2.nsByName("matches-r7").baseAt.Int64).String() })
-	// matches moves past the branch's baseAt: reader no longer reads final
-	// there, at its head.
-	w.patchConfig("matches", map[string]any{"op": "add", "path": "/roles/reader/rules",
-		"value": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/resource", "value": "final"}}}})
-	head := w.head("matches")
-	if head == baseAtID {
-		t.Fatal("matches didn't move")
-	}
-	li := w.li(map[string]any{"ns": []any{"matches-r7"}})
-	red, st := v76fRedirect(t, w, "matches-r7", "", li)
-	if red == nil {
-		t.Fatalf("li on matches-r7: %d", st)
-	}
-	if got := red.CP.nsID("matches"); got != head {
-		t.Fatalf("matches listed at %s, want its head %s (baseAt %s)", got, head, baseAtID)
-	}
-	if got := red.CP.nsID("cat-season"); got != w.head("cat-season") || red.CP.nsID("matches-r7") != w.head("matches-r7") {
-		t.Fatalf("at %v", red.CP.ids)
-	}
-	// Visibility in the branch: matches's trust, keys and roles as of
-	// baseAt, so final stays visible.
-	names, st := v76fHeads(t, w, "matches-r7", red.GS, red.At, li)
-	if st != 0 || !v76fHas(names, "final") || !v76fHas(names, "derby") || v76fHas(names, "opener") {
-		t.Fatalf("heads at the current at: %v %d", names, st)
-	}
-	// A catalog write: a new at; the recorded one still answers.
-	w.put("cat-season", "matches.shared", map[string]any{"parents": v75Parents("root")})
-	red2, _ := v76fRedirect(t, w, "matches-r7", red.GS, li)
-	if red2 == nil || red2.At == red.At {
-		t.Fatalf("after a catalog write: %+v", red2)
-	}
-	if names, st := v76fHeads(t, w, "matches-r7", red.GS, red.At, li); st != 0 || !v76fHas(names, "final") {
-		t.Fatalf("heads at the recorded at: %v %d", names, st)
-	}
-	// An at recorded before v0.76, matches at baseAt, still computes the
-	// same answer, as visibility reads matches at baseAt either way: it
-	// is answered (§B.11.9 URLs, "wherever the origin can compute that
-	// exact answer again").
-	old := &fcp{ids: map[string]string{}}
-	for k, v := range red.CP.ids {
-		old.ids[k] = v
-	}
-	old.ids["matches"] = baseAtID
-	old.at = grantcheck.CombinedAt(old.ids)
-	if err := w.e.recordFilteredAt(ctx, old); err != nil {
-		t.Fatal(err)
-	}
-	if names, st := v76fHeads(t, w, "matches-r7", red.GS, old.at, li); st != 0 || !v76fHas(names, "final") {
-		t.Fatalf("an at recorded before v0.76: %v %d", names, st)
-	}
-	// A base read only as a base stays at its baseAt: a branch of the
-	// branch lists matches-r7 so.
-	if _, err := w.e.CreateBranch(ctx, Request{NS: "matches-r7", Cred: w.admin}, BranchRequest{Name: "matches-r7a", IfNoneMatch: true}); err != nil {
-		t.Fatal(err)
-	}
-	w.put("matches-r7", "shared", map[string]any{"title": "moved"})
-	var moved *fcp
-	w.inTx(func(t2 *tx) {
-		b, r7 := t2.nsByName("matches-r7a"), t2.nsByName("matches-r7")
-		fs := t2.filteredScope(b)
-		if fs == nil {
-			t.Fatal("matches-r7a not covered")
-		}
-		cp := t2.filteredCurrent(fs)
-		if cp.seqs["matches-r7"] != b.baseAt.Int64 || cp.seqs["matches-r7"] == r7.headSeq.Int64 || cp.nsID("matches") != head {
-			t.Fatalf("matches-r7a's at: %v", cp.ids)
-		}
-		if got, ok := t2.filteredAt(fs, cp.at); !ok || got.readSeq("matches") != fs.chain[1].at || got.readSeq("matches-r7") != b.baseAt.Int64 {
-			t.Fatalf("matches-r7a's at doesn't resolve: %v", ok)
-		}
-		// One listing matches-r7, read only as a base, elsewhere isn't
-		// answered.
-		ids := map[string]string{}
-		for k, v := range cp.ids {
-			ids[k] = v
-		}
-		ids["matches-r7"] = t2.nsLogID(r7.headSeq.Int64).String()
-		moved = &fcp{ids: ids, at: grantcheck.CombinedAt(ids)}
-	})
-	if err := w.e.recordFilteredAt(ctx, moved); err != nil {
-		t.Fatal(err)
-	}
-	w.inTx(func(t2 *tx) {
-		if _, ok := t2.filteredAt(t2.filteredScope(t2.nsByName("matches-r7a")), moved.at); ok {
-			t.Fatal("an at listing a base read only as a base past its baseAt resolved")
-		}
-	})
-}
-
 // §B.11.9 gs, §C.4: a stored subject set is bound to its key's pub: a
 // cookie is 403 once matches replaces that kid's pub, keeping its scope
 // and roles, until the reader exchanges again; an empty stored pub is 403
-// too. In a branch, the base key's pub decides.
+// too.
 func TestV076OriginGSBoundToPub(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	newPub, newPriv := grant.GenerateKey()
+	// Branches aren't covered (v0.78), so the base key's case is gone.
 	for _, c := range []struct {
 		name, ns string
 		kid      int // index of the key in matches's keys
-	}{{"matches, catalog-01", "matches", 1}, {"matches-r7, base key fan", "matches-r7", 2}} {
+	}{{"matches, catalog-01", "matches", 1}} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			w := newV76fWorld(t, c.ns != "matches")

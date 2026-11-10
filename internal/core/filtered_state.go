@@ -15,53 +15,24 @@ import (
 
 // fcp is a filtered answer's combined checkpoint (§B.11.9 URLs, §B.5): at
 // is grantcheck.CombinedAt over ids, the ns_id text of each member, and
-// seqs the members' ns_log seqs. Each namespace is listed once, a
-// namespace read at its head at its head (§B.11.9 URLs, "one ns_id per
-// namespace as in §A.4 Answers"). The members are
+// seqs the members' ns_log seqs. Each namespace is listed once, at its
+// head (§B.11.9 URLs, "one ns_id per namespace as in §A.4 Answers"). The
+// members are
 //
 //   - {ns} at its head (a purged {ns} stays, at its purge-ns entry);
-//   - each trusted, non-e2e, unpurged catalog at its head (for catalog
-//     kind, {ns} itself);
+//   - each trusted catalog that isn't dark (e2e, purged or a branch) at
+//     its head (for catalog kind, {ns} itself);
 //   - each local, unpurged member of those catalogs' catalog.trust at its
-//     head, whose roles and keys visibility reads, a branch's root among
-//     them, which coverage reads at its head too (fsHeadTrusts);
-//   - for a branch, each base not already listed, at its baseAt.
+//     head, whose roles and keys visibility reads.
 //
-// Where visibility reads a base is never taken from seqs: bases holds,
-// for a branch, each base's baseAt (fs.chain), at which its documents
-// and, for the root, its document, trust, roles and keys are read
-// (readSeq). Taking more members is safe and fewer is a leak. cats are
-// the catalogs that decide visibility at the checkpoint, read from root's
-// document as of its read seq (non-e2e, all members).
+// Taking more members is safe and fewer is a leak. cats are the catalogs
+// that decide visibility at the checkpoint, read from {ns}'s document as
+// of its seq (none dark, all members).
 type fcp struct {
-	at    string
-	seqs  map[string]int64
-	ids   map[string]string
-	bases map[string]int64
-	cats  []fsCat
-}
-
-// readSeq is the ns_log seq at which visibility reads member ns: a
-// branch's base at its baseAt, whatever seq lists it, and any other
-// member at the seq that lists it (§B.11.9 Branches, URLs).
-func (cp *fcp) readSeq(ns string) int64 {
-	if seq, ok := cp.bases[ns]; ok {
-		return seq
-	}
-	return cp.seqs[ns]
-}
-
-// fcpBases are fs's bases, each at the seq its branch reads it at
-// (fs.chain), nil for a namespace that isn't a branch.
-func fcpBases(fs *fscope) map[string]int64 {
-	if len(fs.chain) == 0 {
-		return nil
-	}
-	out := make(map[string]int64, len(fs.chain))
-	for _, b := range fs.chain {
-		out[b.n.name] = b.at
-	}
-	return out
+	at   string
+	seqs map[string]int64
+	ids  map[string]string
+	cats []fsCat
 }
 
 // nsID is ns's ns_id text in cp ("" if it isn't a member), which answers
@@ -84,7 +55,7 @@ func (cp *fcp) others(ns string) []string {
 // filteredCurrent is fs's checkpoint now, in the read snapshot. It isn't
 // recorded: a URL naming its at needs recordFilteredAt first (§B.11.9 at).
 func (t *tx) filteredCurrent(fs *fscope) *fcp {
-	cp := &fcp{seqs: map[string]int64{}, ids: map[string]string{}, bases: fcpBases(fs)}
+	cp := &fcp{seqs: map[string]int64{}, ids: map[string]string{}}
 	add := func(m *nsRow, seq int64) {
 		if _, ok := cp.seqs[m.name]; ok {
 			return
@@ -93,7 +64,7 @@ func (t *tx) filteredCurrent(fs *fscope) *fcp {
 	}
 	add(fs.n, fs.n.headSeq.Int64)
 	for _, c := range fs.cats {
-		if c.e2e || c.n.purged {
+		if c.dark() {
 			continue
 		}
 		cp.cats = append(cp.cats, c)
@@ -104,25 +75,18 @@ func (t *tx) filteredCurrent(fs *fscope) *fcp {
 			}
 		}
 	}
-	// A base read only as a base is listed at its baseAt; one read at its
-	// head too, as a catalog.trust member, is listed there (above).
-	for _, b := range fs.chain {
-		add(b.n, b.at)
-	}
 	cp.at = grantcheck.CombinedAt(cp.ids)
 	return cp
 }
 
 // filteredAt is fs's checkpoint named at: the current one, or one
 // recorded in filtered_ats whose members all still exist, are unpurged
-// ({ns} excepted) and have the recorded ns_id in their chains, whose
-// deciding catalogs are all members, and that lists each of a branch's
-// bases, at the baseAt the branch fixes unless it is a catalog.trust
-// member of a deciding catalog there (filteredCurrent's layout). The
-// bases are read at their baseAt whatever lists them (readSeq). The
-// answer at it is recomputed from history, which for an append-only log
-// is as if stored (§B.11.9 at). ok is false otherwise, an at recorded in
-// another layout included: the caller answers 302 to the current at.
+// ({ns} excepted) and have the recorded ns_id in their chains, and whose
+// deciding catalogs are all members. A catalog that is dark now, a local
+// branch among them, decides nothing there even where an at recorded
+// before v0.78 lists it (§B.11.9 Where). The answer at it is recomputed
+// from history, which for an append-only log is as if stored (§B.11.9
+// at). ok is false otherwise: the caller answers 302 to the current at.
 func (t *tx) filteredAt(fs *fscope, at string) (*fcp, bool) {
 	cur := t.filteredCurrent(fs)
 	if at == cur.at {
@@ -139,7 +103,7 @@ func (t *tx) filteredAt(fs *fscope, at string) (*fcp, bool) {
 	if err != nil || m == nil {
 		return nil, false
 	}
-	cp := &fcp{seqs: map[string]int64{}, ids: map[string]string{}, bases: fcpBases(fs)}
+	cp := &fcp{seqs: map[string]int64{}, ids: map[string]string{}}
 	rows := map[string]*nsRow{}
 	for name, x := range m {
 		s, _ := x.(string)
@@ -168,17 +132,13 @@ func (t *tx) filteredAt(fs *fscope, at string) (*fcp, bool) {
 		cp.cats = []fsCat{{n: fs.n}}
 		return cp, true
 	}
-	// The catalogs root trusts as of its read seq, with their documents
-	// as of theirs: each must be a member, unless it was e2e then.
-	if _, ok := cp.seqs[fs.root.name]; !ok {
-		return nil, false
-	}
-	rootSeq := cp.readSeq(fs.root.name)
+	// The catalogs root trusts as of its seq, with their documents as of
+	// theirs: each must be a member, unless it was e2e then or is a branch.
 	missing := false
-	trusts := catvis.TrustedCatalogs(fs.root.name, t.fconfigAt(rootSeq).Doc, func(cat string) map[string]any {
+	trusts := catvis.TrustedCatalogs(fs.root.name, t.fconfigAt(cp.seqs[fs.root.name]).Doc, func(cat string) map[string]any {
 		r := rows[cat]
 		if r == nil {
-			if c := t.fsLocal(cat); c != nil && !c.purged && t.nsLevel(c) != levelE2E {
+			if c := t.fsLocal(cat); c != nil && !c.purged && !c.isBranch() && t.nsLevel(c) != levelE2E {
 				missing = true
 			}
 			return nil
@@ -190,24 +150,10 @@ func (t *tx) filteredAt(fs *fscope, at string) (*fcp, bool) {
 	}
 	for _, tr := range trusts {
 		c := rows[tr.Catalog]
-		if t.fconfigAt(cp.seqs[tr.Catalog]).level == levelE2E {
+		if c.isBranch() || t.fconfigAt(cp.seqs[tr.Catalog]).level == levelE2E {
 			continue
 		}
 		cp.cats = append(cp.cats, fsCat{n: c, kids: tr.Kids})
-	}
-	// A base is listed at its head where it is a catalog.trust member of
-	// a deciding catalog (as of that catalog's seq here), and otherwise at
-	// the baseAt its branch fixes.
-	members := map[string]bool{}
-	for _, c := range cp.cats {
-		for _, m := range t.fconfigAt(cp.seqs[c.n.name]).CatalogTrust {
-			members[m] = true
-		}
-	}
-	for _, b := range fs.chain {
-		if _, ok := cp.seqs[b.n.name]; !ok || !members[b.n.name] && cp.seqs[b.n.name] != b.at {
-			return nil, false
-		}
 	}
 	return cp, true
 }
