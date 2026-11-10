@@ -2374,20 +2374,36 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 			errs = append(errs, err)
 			break
 		}
-		if err := e.followRemote(ctx, b); err != nil {
-			errs = append(errs, fmt.Errorf("remote branch %s: following %s/ns/%s: %w", b.branchName, b.origin, b.ns, err))
-		}
-		if !e.opt.Remote.Register {
-			continue
-		}
-		if b.regNSID.Valid && e.now().Before(time.UnixMilli(b.regExpires.Int64).Add(-e.opt.Remote.RenewBefore)) {
-			continue
-		}
-		if err := e.RegisterRemote(ctx, b.branchName); err != nil {
-			errs = append(errs, fmt.Errorf("remote branch %s: registering with %s: %w", b.branchName, b.origin, err))
-		}
+		errs = append(errs, e.baseStep(ctx, func(ctx context.Context) error {
+			var errs []error
+			if err := e.followRemote(ctx, b); err != nil {
+				errs = append(errs, fmt.Errorf("remote branch %s: following %s/ns/%s: %w", b.branchName, b.origin, b.ns, err))
+			}
+			if !e.opt.Remote.Register {
+				return errors.Join(errs...)
+			}
+			if b.regNSID.Valid && e.now().Before(time.UnixMilli(b.regExpires.Int64).Add(-e.opt.Remote.RenewBefore)) {
+				return errors.Join(errs...)
+			}
+			if err := e.RegisterRemote(ctx, b.branchName); err != nil {
+				errs = append(errs, fmt.Errorf("remote branch %s: registering with %s: %w", b.branchName, b.origin, err))
+			}
+			return errors.Join(errs...)
+		}))
 	}
 	return errors.Join(errs...)
+}
+
+// baseStep runs f, one base's step of a background job (SyncRemotes,
+// catchUpChainReads), under the deadline RemoteOptions.FollowTimeout
+// sets: the job's own context has none, nor has production's HTTP client
+// a timeout, and bases are followed one after another, so a base that
+// doesn't answer, or keeps answering, would otherwise hold up every base
+// after it for ever.
+func (e *Engine) baseStep(ctx context.Context, f func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(ctx, e.opt.Remote.FollowTimeout)
+	defer cancel()
+	return f(ctx)
 }
 
 // followRemote follows a base's log after the checkpoint. On purge or
@@ -3201,7 +3217,7 @@ func (e *Engine) catchUpChainReads(ctx context.Context) error {
 		}
 		c, ep, err := e.remoteClient(b.origin)
 		if err == nil {
-			err = e.followChainEpochs(ctx, c, ep, b)
+			err = e.baseStep(ctx, func(ctx context.Context) error { return e.followChainEpochs(ctx, c, ep, b) })
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("remote branch %s: reading the chain of %s/ns/%s at start: %w", b.branchName, b.origin, b.ns, err))
