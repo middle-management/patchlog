@@ -34,11 +34,11 @@ func (t *tx) grantView(fs *fscope, cp *fcp, a *actor) (*fview, *Error) {
 // gsSubjects are §B.11.9's subjects of a gs: every group: entry of the
 // caller's (deduped), its user: subject where §B.11.5 would add it for one
 // of cats (a direct entry for it, or a sub-scoped catalog key:
-// catvis.Profile.Deciding), scope:{scopeKeyDigest}, §A.4's marker digest,
-// and keySubject, sorted. No gs leaves a group out, so it never holds
-// "partial" (§B.11.5, v0.78). catvis.FilteredSubjects is given every group
-// as deciding, which yields the same whether it reads its deciding
-// argument or not.
+// catvis.Profile's Users and SubScoped), scope:{scopeKeyDigest}, §A.4's
+// marker digest, and keySubject, sorted. No gs leaves a group out, so it
+// never holds "partial" (§B.11.5, v0.78). catvis.FilteredSubjects is
+// given every group as deciding, which yields the same whether it reads
+// its deciding argument or not.
 func gsSubjects(cats []*catvis.Catalog, pr grant.Principal, scopeKeyDigest, keySubject string) []string {
 	var all []string
 	for _, g := range pr.Groups {
@@ -49,7 +49,7 @@ func gsSubjects(cats []*catvis.Catalog, pr grant.Principal, scopeKeyDigest, keyS
 	var users []string
 	if u := catvis.UserSubject(pr.ID); u != "" {
 		for _, c := range cats {
-			if subs, _ := c.Profile().Deciding(pr); slices.Contains(subs, u) {
+			if p := c.Profile(); p.Users[u] || p.SubScoped {
 				users = append(users, u)
 				break
 			}

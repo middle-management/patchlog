@@ -160,6 +160,37 @@ func TestV076OriginBranchUncovered(t *testing.T) {
 	}
 }
 
+// §B.11.9 gs, §C.4 (conformance 106, ported from the branch case before
+// v0.78): a partial reader of matches whose grant is signed by key fan,
+// which matches then removes: her cookie is 403 at a later at, and her
+// exchange then 401.
+func TestV076OriginGSKeyRemoved(t *testing.T) {
+	t.Parallel()
+	w := newV76fWorld(t, false)
+	ctx := context.Background()
+	fan := w.fan("matches", w.fanPriv)
+	res, err := w.e.IssueEdgeGrants(ctx, []string{fan.Bearer})
+	if err != nil || len(res.Grants) != 1 || res.Grants[0].GS == "" {
+		t.Fatalf("exchange: %+v %v", res, err)
+	}
+	gs := res.Grants[0].GS
+	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", GS: gs, Prefix: "/ns/matches/g/" + gs, Exp: w.now().Add(10 * time.Minute)}}
+	red, st := v76fRedirect(t, w.v75World, "matches", gs, cookie)
+	if red == nil {
+		t.Fatalf("cookie before: %d", st)
+	}
+	if names, st := v76fHeads(t, w.v75World, "matches", gs, red.At, cookie); st != 0 || !v76fHas(names, "derby") {
+		t.Fatalf("cookie before: %v %d", names, st)
+	}
+	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/2"})
+	if _, st := v76fRedirect(t, w.v75World, "matches", gs, cookie); st != 403 {
+		t.Fatalf("cookie at a later at: %d, want 403", st)
+	}
+	if _, err := w.e.IssueEdgeGrants(ctx, []string{fan.Bearer}); v75Status(err) != 401 {
+		t.Fatalf("exchange after the key went: %v, want 401", err)
+	}
+}
+
 // §B.11.9 gs, §C.4: a stored subject set is bound to its key's pub: a
 // cookie is 403 once matches replaces that kid's pub, keeping its scope
 // and roles, until the reader exchanges again; an empty stored pub is 403

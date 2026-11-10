@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // V81-02 (v0.78, v0.81): access in the core. A rule referring to /now
@@ -195,7 +196,7 @@ func TestV081AccessGSAllGroups(t *testing.T) {
 // subjects hold "partial" without the column.
 func TestV081AccessStoredPartialRefused(t *testing.T) {
 	t.Parallel()
-	for _, set := range []string{`partial = 1`, `subjects = '["group:editors","partial"]'`} {
+	for _, withMarker := range []bool{false, true} {
 		w := newV75World(t, v75Opts{})
 		w.seed()
 		ctx := context.Background()
@@ -210,12 +211,26 @@ func TestV081AccessStoredPartialRefused(t *testing.T) {
 		if red == nil {
 			t.Fatalf("cookie before: %d", st)
 		}
+		// The row as stored, but marked partial: by its column, or by its
+		// subjects holding "partial" beside every other one.
+		set := "partial = 1"
+		if withMarker {
+			var subs []string
+			w.inTx(func(t2 *tx) { subs = t2.loadGS("matches", gs).subjects })
+			subs = append(subs, "partial")
+			set = "subjects = '" + string(jsonv.Canonical(jsonv.FromGo(subs))) + "'"
+		}
 		if err := w.e.update(ctx, func(t2 *tx) error {
 			_, err := t2.Exec(`UPDATE filtered_gs SET `+set+` WHERE ns = ? AND gs = ?`, "matches", gs)
 			return err
 		}); err != nil {
 			t.Fatal(err)
 		}
+		w.inTx(func(t2 *tx) {
+			if r := t2.loadGS("matches", gs); r == nil || !t2.gsDigestHolds(t2.nsByName("matches"), t2.filteredCurrent(t2.filteredScope(t2.nsByName("matches"))), r) {
+				t.Fatalf("%s: the row no longer holds otherwise: %+v", set, r)
+			}
+		})
 		_, _, err = w.e.FilteredHeads(ctx, "matches", gs, red.At, "", "", cookie)
 		var e *Error
 		if !errors.As(err, &e) || e.Status != 403 {
