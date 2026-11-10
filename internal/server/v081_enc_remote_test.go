@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/ed25519"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -355,36 +357,108 @@ func TestV081RemoteRaisedSourceRefused(t *testing.T) {
 }
 
 // v0.26.1 C1, C3 (formerly TestV0261FetchSealedLogBounds, whose pre-raise
-// log paging v0.78 cut): a hostile A that pages the log B mirrors from its
-// horizon for ever, an empty page with a fresh X-Log-Next each time,
-// doesn't hold creation: it ends within FollowTimeout, 502 upstream.
+// log paging v0.78 cut): B pages the log it mirrors from A's horizon only
+// as far as §7.1 Paging lets it. A hostile A that pages it for ever, each
+// page well formed (fresh ids chaining from its since, X-Log-Next its last
+// entry), doesn't hold creation: it ends within FollowTimeout, 502
+// upstream, nothing stored on B. An X-Log-Next that isn't the page's last
+// entry, goes back before since or names since again is refused within
+// two pages.
 func TestV081RemoteSnapshotLogPagingBounded(t *testing.T) {
 	t.Parallel()
 	s, x2, x3, _ := newV081Pruned(t)
-	var pages atomic.Int64
-	tg, _ := url.Parse(s.a.srv.URL)
-	rp := httputil.NewSingleHostReverseProxy(tg)
-	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "GET" && r.URL.Path == "/r/m/x/rev/"+x3+"/log" && r.URL.Query().Get("since") != "" {
-			n := pages.Add(1)
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("X-Log-Next", fmt.Sprintf("%s%d", x2, n))
-			w.Write([]byte("[]"))
-			return
-		}
-		rp.ServeHTTP(w, r)
-	}))
-	t.Cleanup(front.Close)
-	b := newV081B(t, s, front.URL, func(o *core.Options) { o.Remote.FollowTimeout = 2 * time.Second })
-	kB := newKey("badmin")
-	start := time.Now()
-	r := b.mkRemote("r", remoteGenesis("m", s.at, e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}})))
-	el := time.Since(start)
-	t.Logf("creation after %v and %d pages: %d %.200s", el, pages.Load(), r.Code, r.Body)
-	if el > 4*time.Second || pages.Load() == 0 {
-		t.Fatalf("creation took %v over %d pages", el, pages.Load())
+	// A's own entry after x2, whose shape the hostile pages copy.
+	real := s.a.get("/r/m/x/rev/"+x3+"/log?since="+x2, s.root())
+	var proto map[string]any
+	if arr, ok := real.JSON().([]any); !ok || len(arr) != 1 {
+		t.Fatalf("A's log after x2: %d %s", real.Code, real.Body)
+	} else {
+		proto = arr[0].(map[string]any)
 	}
-	if r.Code != 502 {
-		t.Fatalf("creation: %d %s, want 502", r.Code, r.Body)
+	var seq atomic.Int64
+	entry := func(parent string) map[string]any {
+		e := map[string]any{}
+		for k, v := range proto {
+			e[k] = v
+		}
+		e["id"] = ids.Of([]byte(fmt.Sprintf("hostile %d", seq.Add(1)))).String()
+		e["parent"] = parent
+		return e
+	}
+	// chain is n fresh entries after since.
+	chain := func(since string, n int) []any {
+		var out []any
+		for range n {
+			e := entry(since)
+			out = append(out, e)
+			since = e["id"].(string)
+		}
+		return out
+	}
+	last := func(page []any) string { return page[len(page)-1].(map[string]any)["id"].(string) }
+	for _, c := range []struct {
+		name string
+		page func(since string, n int64) ([]any, string)
+	}{
+		{"endless", func(since string, _ int64) ([]any, string) {
+			p := chain(since, 2)
+			return p, last(p)
+		}},
+		// A fresh id, not on the page.
+		{"not on page", func(since string, _ int64) ([]any, string) {
+			return chain(since, 2), entry(since)["id"].(string)
+		}},
+		// Back to x2, before since.
+		{"backwards", func(since string, n int64) ([]any, string) {
+			if n == 1 {
+				p := chain(since, 2)
+				return p, last(p)
+			}
+			return chain(since, 1), x2
+		}},
+		// The same since again.
+		{"stuck", func(since string, n int64) ([]any, string) {
+			if n == 1 {
+				p := chain(since, 2)
+				return p, last(p)
+			}
+			return []any{}, since
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var pages atomic.Int64
+			tg, _ := url.Parse(s.a.srv.URL)
+			rp := httputil.NewSingleHostReverseProxy(tg)
+			front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if since := r.URL.Query().Get("since"); r.Method == "GET" && r.URL.Path == "/r/m/x/rev/"+x3+"/log" && since != "" {
+					page, next := c.page(since, pages.Add(1))
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("X-Log-Next", next)
+					json.NewEncoder(w).Encode(page)
+					return
+				}
+				rp.ServeHTTP(w, r)
+			}))
+			t.Cleanup(front.Close)
+			const follow = 2 * time.Second
+			var path string
+			b := newV081B(t, s, front.URL, withFileDB(t), func(o *core.Options) { path = o.Path; o.Remote.FollowTimeout = follow })
+			kB := newKey("badmin")
+			start := time.Now()
+			r := b.mkRemote("r", remoteGenesis("m", s.at, e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}})))
+			el := time.Since(start)
+			t.Logf("creation after %v and %d pages: %d %.200s", el, pages.Load(), r.Code, r.Body)
+			expectCode(t, r, 502, "upstream")
+			if el > follow+2*time.Second {
+				t.Fatalf("creation took %v, FollowTimeout %v", el, follow)
+			}
+			if n := pages.Load(); c.name == "endless" && n <= 2 || c.name != "endless" && (n == 0 || n > 2) {
+				t.Fatalf("%d pages", n)
+			}
+			db, pg := v0261DB(t, path)
+			if n := v0261Count(t, db, pg, `SELECT COUNT(*) FROM namespaces WHERE name = 'r' OR name LIKE '~r%'`); n != 0 {
+				t.Fatalf("%d namespaces stored on B", n)
+			}
+		})
 	}
 }
