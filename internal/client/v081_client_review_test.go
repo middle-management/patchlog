@@ -137,7 +137,9 @@ func TestV081FreshViewPruneCountsTheLog(t *testing.T) {
 }
 
 // KEYS-11: a log a view can't read for another reason than the grant
-// (§C.5) fails the first sealing rather than seal uncounted.
+// (§C.5) fails the first sealing rather than seal uncounted; one that
+// doesn't verify (an entry that doesn't chain) leaves the count partial,
+// and the view seals.
 func TestV081SealFailsClosedOnUnreadableLog(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -150,6 +152,14 @@ func TestV081SealFailsClosedOnUnreadableLog(t *testing.T) {
 	st.routes["/r/e/d/rev/"+H+"/log"] = st.json(500, map[string]any{"error": "broken", "code": "internal"})
 	if _, err := st.view().SealPatches(ctx, "e", "d", H, ops(op("add", "/a", 1))); err == nil {
 		t.Fatal("sealed though the log couldn't be counted")
+	}
+	g := st.rev(st.kr, "", []any{map[string]any{"op": "add", "path": "", "value": map[string]any{}}})
+	stray := st.rev(st.kr, H, []any{map[string]any{"op": "add", "path": "/a", "value": 1.0}})
+	st.routes["/r/e/d/rev/"+H+"/log"] = st.json(200, []any{g, stray})
+	x := st.view()
+	must(x.SealPatches(ctx, "e", "d", H, ops(op("add", "/a", 1))))
+	if s := must(x.WithSealBound(0, 0).SealStatus(ctx, "e", "d")); !s.Partial {
+		t.Fatalf("a log that doesn't chain counted in full: %+v", s)
 	}
 }
 

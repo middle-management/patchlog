@@ -751,9 +751,11 @@ func (x *E2E) sealCount(ns, name string) *sealCount {
 // countOnce counts the log of ns/name (countLog) where the view hasn't
 // yet, so that a view's first sealing under a K_r, every CLI run's among
 // them, is judged against the sealings the log shows (§E.2.1), not only
-// against those this view made. A grant that can't read the log (§C.5)
-// counts what the view sealed; any other failure to read it fails the
-// sealing.
+// against those this view made. A grant that can't read the log (§C.5),
+// and a log answer that doesn't verify (seal.ErrMismatch: an entry that
+// doesn't chain, as a server splicing one in serves it), leave the count
+// partial, counting what the view sealed, as SealStatus reports; a log
+// that can't be read for another reason fails the sealing.
 func (x *E2E) countOnce(ctx context.Context, ns, name string) error {
 	x.seals.mu.Lock()
 	counted := x.sealCount(ns, name).counted
@@ -802,7 +804,8 @@ type SealStatus struct {
 	// show, a refused write or a prune snapshot among them.
 	Sealed int64
 	// Partial is set where some of the log couldn't be counted: below a
-	// pruning horizon, or for a grant that can't read the log (§C.5).
+	// pruning horizon, for a grant that can't read the log (§C.5), or where
+	// its answer didn't verify.
 	// The margin stands for what it misses.
 	Partial bool
 	Bound   int64
@@ -845,7 +848,8 @@ func (x *E2E) SealStatus(ctx context.Context, ns, name string) (*SealStatus, err
 // moves from its local count to the log's. Ops a branch reads through are
 // its base's, under the base's keys, and aren't counted. A log pruned
 // past what was counted is read from the horizon, and one the grant can't
-// read not at all; both leave the count partial. A resource purged and
+// read, or whose answer doesn't verify (an entry that doesn't chain), not
+// at all; each leaves the count partial. A resource purged and
 // created again is counted from its new genesis on, keeping the old
 // counts: its K_r is the same.
 func (x *E2E) countLog(ctx context.Context, ns, name string) error {
@@ -872,7 +876,10 @@ func (x *E2E) countLog(ctx context.Context, ns, name string) error {
 		sc.counted = true
 		x.seals.mu.Unlock()
 		return nil
-	case IsAuth(err):
+	case IsAuth(err), errors.Is(err, seal.ErrMismatch):
+		// A grant that can't read the log (§C.5), or a log answer that
+		// doesn't verify: what the view sealed is counted, and the margin
+		// stands for the rest.
 		x.seals.mu.Lock()
 		sc.partial, sc.counted = true, true
 		x.seals.mu.Unlock()
