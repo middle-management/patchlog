@@ -104,3 +104,11 @@ func (s *Service) AfterFileSealing(f func()) {
 // PurgeKept purges the catalog's kept listings that carry any of tags, as
 // an apply that purges them does (tests).
 func (s *Service) PurgeKept(tags ...string) { s.kept.Purge(s.opt.Catalog, tags) }
+
+// CaughtUp reports whether the service has caught up with ns since it last
+// started following it (what behind() waits for).
+func (s *Service) CaughtUp(ns string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.caught[ns]
+}
