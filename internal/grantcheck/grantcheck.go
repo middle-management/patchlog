@@ -60,6 +60,15 @@ type Checker struct {
 	copied map[string]map[string]grant.Key // branch -> keys copied from its base at creation (immutable)
 	rules  sync.Map                        // canonical rule -> *rules.Rule
 
+	// seq counts Observe and Invalidate calls; observed is the seq of the
+	// last Observe of each namespace, invalidated that of the last
+	// Invalidate. A state loaded by a read that began before one that
+	// concerns its chain is not stored (stateWithin): it may hold what the
+	// Observe said is gone, fresh for the TTL.
+	seq         uint64
+	observed    map[string]uint64
+	invalidated uint64
+
 	// The heads of a requireAt chain read again at once for an at the
 	// cached ones don't reach (checkAt, forcedState): one read per
 	// namespace at a time (forcing), at least minForced after the one
@@ -98,7 +107,7 @@ func WithMaxGrantRules(n int) Option { return func(ch *Checker) { ch.maxRules = 
 // New returns a Checker that reads namespace documents with c.
 func New(c *client.Client, opts ...Option) *Checker {
 	ch := &Checker{c: c, ttl: 30 * time.Second, now: time.Now, maxGrant: 8 << 10, maxRules: 32,
-		states: map[string]*nsState{}, copied: map[string]map[string]grant.Key{},
+		states: map[string]*nsState{}, copied: map[string]map[string]grant.Key{}, observed: map[string]uint64{},
 		minForced: minForcedInterval, forcing: map[string]*forcedRead{}, lastForced: map[string]time.Time{}}
 	for _, o := range opts {
 		o(ch)
@@ -176,6 +185,8 @@ type nsState struct {
 func (ch *Checker) Observe(ns, nsID string) {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
+	ch.seq++
+	ch.observed[ns] = ch.seq
 	for name, st := range ch.states {
 		for _, c := range st.chain {
 			if c.NS == ns && c.Head != nsID {
@@ -190,7 +201,23 @@ func (ch *Checker) Observe(ns, nsID string) {
 func (ch *Checker) Invalidate() {
 	ch.mu.Lock()
 	ch.states = map[string]*nsState{}
+	ch.seq++
+	ch.invalidated = ch.seq
 	ch.mu.Unlock()
+}
+
+// overtaken reports whether an Observe of a namespace in chain, or an
+// Invalidate, came since seq start. ch.mu is held.
+func (ch *Checker) overtaken(chain []*Config, start uint64) bool {
+	if ch.invalidated > start {
+		return true
+	}
+	for _, c := range chain {
+		if ch.observed[c.NS] > start {
+			return true
+		}
+	}
+	return false
 }
 
 // Config returns the namespace document at the head (cached), with the
@@ -217,6 +244,7 @@ func (ch *Checker) state(ctx context.Context, ns string) (*nsState, error) {
 func (ch *Checker) stateWithin(ctx context.Context, ns string, ttl time.Duration) (st *nsState, checked time.Time, err error) {
 	now := time.Now()
 	ch.mu.Lock()
+	start := ch.seq
 	st = ch.states[ns]
 	var checkedAt time.Time
 	if st != nil {
@@ -241,7 +269,9 @@ func (ch *Checker) stateWithin(ctx context.Context, ns string, ttl time.Duration
 		}
 		if same {
 			ch.mu.Lock()
-			st.checkedAt = now
+			if !ch.overtaken(st.chain, start) {
+				st.checkedAt = now
+			}
 			ch.mu.Unlock()
 			return st, now, nil
 		}
@@ -252,7 +282,11 @@ func (ch *Checker) stateWithin(ctx context.Context, ns string, ttl time.Duration
 	}
 	st.checkedAt = now
 	ch.mu.Lock()
-	ch.states[ns] = st
+	if !ch.overtaken(st.chain, start) {
+		// Not one an Observe since it began overtook: that one holds
+		// for this call, which began before it, and the next reads again.
+		ch.states[ns] = st
+	}
 	ch.mu.Unlock()
 	return st, now, nil
 }
