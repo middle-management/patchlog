@@ -107,10 +107,11 @@ func TestV073P28ResourcePurgePruneEvents(t *testing.T) {
 
 // §7.3, §E.2.2 (RH-33; review): a server older than v0.73 sends a resource
 // stream's purge and prune events with the namespace entry's id as their
-// id: and, sealed, as the namespace range [prev, id] of that one entry
-// under K_e. ResourceEvents still opens that form for a K_e holder, checks
-// the entry against the range, and delivers the events as a current
-// server sends them: no ID, data without id and prev.
+// id: and, sealed, as the namespace range [prev, id] of that one entry.
+// Plain, ResourceEvents delivers them as a current server sends them: no
+// ID, data without id and prev. Sealed, that form is refused, under K_n as
+// under K_e: no reader opens data written under earlier drafts (v0.78
+// "Legacy"; KEYS-6), and the event's pl is a resource event's (§E.2.2).
 func TestV073P28OlderServerPurgePruneEvents(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -154,6 +155,7 @@ func TestV073P28OlderServerPurgePruneEvents(t *testing.T) {
 
 	// The older form of one event: its entry sealed as the range
 	// [prev, id], the entry's id as id: (unless lie names another).
+	underKe := false
 	event := func(kind, prev, id, lie string, sealed bool) string {
 		t.Helper()
 		entry := map[string]any{"id": id, "prev": prev, "kind": kind, "resource": "a", "target": r2.ID, "author": "user:w", "created": "2026-10-04T12:00:00.000Z"}
@@ -164,10 +166,14 @@ func TestV073P28OlderServerPurgePruneEvents(t *testing.T) {
 		if !sealed {
 			return "event: " + kind + "\nid: " + line + "\ndata: " + string(jsonv.Canonical(jsonv.FromGo(entry))) + "\n\n"
 		}
-		// Under K_n, as namespace content is sealed since v0.81 (§E.2.1).
+		// Under K_n, as namespace content is sealed since v0.81 (§E.2.1),
+		// or K_e where underKe is set, as such a server sealed it.
 		kn, err := seal.NamespaceKey(ke, "s")
 		if err != nil {
 			t.Fatal(err)
+		}
+		if underKe {
+			kn = ke
 		}
 		jwe, err := seal.Seal(kn, ka.Keys[0].Kid, seal.RangePL("s", prev, line), jsonv.Canonical(jsonv.FromGo([]any{entry})))
 		if err != nil {
@@ -201,12 +207,23 @@ func TestV073P28OlderServerPurgePruneEvents(t *testing.T) {
 		}
 	}
 
-	// Sealed: a prune, then a purge.
-	got, err := stream(event("prune", n1, r1.ID, "", true) + event("purge", r1.ID, r2.ID, "", true))
-	if err != nil {
-		t.Fatalf("sealed older events: %v", err)
+	refused := func(what string, got []client.Event, err error) {
+		t.Helper()
+		if !errors.Is(err, seal.ErrMismatch) && !errors.Is(err, seal.ErrDecrypt) {
+			t.Fatalf("%s: %v, want the older sealed form refused", what, err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("%s: delivered %+v", what, got)
+		}
 	}
-	check("sealed", got, "prune", "purge")
+
+	// Sealed: a prune, then a purge, both refused, nothing delivered.
+	got, err := stream(event("prune", n1, r1.ID, "", true) + event("purge", r1.ID, r2.ID, "", true))
+	refused("sealed older events", got, err)
+	underKe = true
+	got, err = stream(event("prune", n1, r1.ID, "", true) + event("purge", r1.ID, r2.ID, "", true))
+	refused("sealed older events under K_e", got, err)
+	underKe = false
 
 	// Plain: delivered as a current server sends them.
 	got, err = stream(event("prune", n1, r1.ID, "", false) + event("purge", r1.ID, r2.ID, "", false))
@@ -215,13 +232,11 @@ func TestV073P28OlderServerPurgePruneEvents(t *testing.T) {
 	}
 	check("plain", got, "prune", "purge")
 
-	// An entry that is not the one its range names is refused.
-	if _, err := stream(event("purge", n1, r1.ID, r2.ID, true)); !errors.Is(err, seal.ErrMismatch) {
-		t.Fatalf("sealed older event whose entry is another: %v", err)
-	}
-	// A range form without an id: line can't be bound.
+	// So is one whose entry is another than its range names, and one
+	// without an id: line.
+	got, err = stream(event("purge", n1, r1.ID, r2.ID, true))
+	refused("sealed older event whose entry is another", got, err)
 	b := strings.Replace(event("purge", n1, r1.ID, "", true), "id: "+r1.ID+"\n", "", 1)
-	if _, err := stream(b); !errors.Is(err, seal.ErrMismatch) {
-		t.Fatalf("sealed older event without id: %v", err)
-	}
+	got, err = stream(b)
+	refused("sealed older event without id", got, err)
 }
