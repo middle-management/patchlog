@@ -725,3 +725,51 @@ func TestV0261FollowDeadline(t *testing.T) {
 		}
 	}
 }
+
+// C2: rows that v0.26.0 recorded 410 pruned (due 0) with any horizon A
+// named. One whose horizon isn't a revision of the chain at or after its
+// own is served 502, never with that horizon, and is asked for again
+// (pendingFixes); one whose horizon is stays 410 pruned for good.
+func TestV0261PreRaiseLegacyPrunedRows(t *testing.T) {
+	t.Parallel()
+	r := newV077Raised(t)
+	xDoc, yDoc := "/r/m/x/rev/"+r.x1, "/r/m/y/rev/"+r.y1
+	p := newV077Proxy(t, r.a, map[string]v077Answer{
+		"GET " + xDoc: {1, http.StatusForbidden, v077Forbidden},
+		"GET " + yDoc: {1, http.StatusForbidden, v077Forbidden},
+	})
+	var path string
+	b := newV0261B(t, r, p.srv.URL, withFileDB(t), func(o *core.Options) { path = o.Path })
+	_, g := v0261Remote(t, b, r, "r")
+	db, _ := v0261DB(t, path)
+	for name, hz := range map[string]string{"x": strings.Repeat("A", 1<<10), "y": r.y1} {
+		res, err := db.Exec(`UPDATE remote_pending_sealings SET answer = 'pruned', horizon = '` + hz + `', due = 0, tries = 0 WHERE name = '` + name + `' AND kind = 'doc'`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			t.Fatalf("%s: %d pending rows of its document", name, n)
+		}
+	}
+	expectCode(t, b.get("/r/r/x/rev/"+r.x1, g), 502, "upstream")
+	res := b.get("/r/r/y/rev/"+r.y1, g)
+	expectCode(t, res, 410, "pruned")
+	if res.Str("horizon") != r.y1 {
+		t.Fatalf("y's document: %s, want horizon %s", res.Body, r.y1)
+	}
+	// A serves both now: x's is asked for again and stored, y's isn't.
+	p.set(nil)
+	for range 2 {
+		if err := b.e.SyncRemotes(context.Background()); err != nil {
+			t.Logf("sync: %v", err)
+		}
+	}
+	ra, rb := r.a.get(xDoc, r.root()), b.get("/r/r/x/rev/"+r.x1, g)
+	if rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {
+		t.Fatalf("x's document: %d %.160s, want A's bytes", rb.Code, rb.Body)
+	}
+	if p.count("GET "+yDoc) != 1 {
+		t.Fatalf("y's document, pruned for good, was asked for %d times", p.count("GET "+yDoc))
+	}
+	expectCode(t, b.get("/r/r/y/rev/"+r.y1, g), 410, "pruned")
+}
