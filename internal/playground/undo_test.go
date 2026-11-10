@@ -19,10 +19,10 @@ import (
 )
 
 // undoPrelude runs app.js's undo procedure (extracted, with api over fetch,
-// sending input.bearer if given, and the sealed-content key stubbed with
-// the namespace's epoch key, input.key or input.nsKeys[ns]) against a live
-// server; the scenarios follow
-// it (undoHarness, undoLimitedHarness).
+// sending input.bearer if given, and app.js's contentKey and nsInfo over
+// K_e stubbed as the namespace's epoch key, input.key or input.nsKeys[ns],
+// whatever the epoch) against a live server; the scenarios follow it
+// (undoHarness, undoLimitedHarness).
 const undoPrelude = `
 const fs = require('fs');
 require(process.argv[2]);
@@ -48,10 +48,10 @@ async function api(method, path, o = {}) {
     jose: /^application\/jose\b/i.test(res.headers.get('Content-Type') || ''), hdr: (k) => res.headers.get(k),
     etag() { const v = res.headers.get('ETag'); return v ? v.replace(/^"|"$/g, '') : ''; } };
 }
-async function contentKey(kid, resource) {
-  const ns = Z.parseKid(kid).ns, key = NS_KEYS[ns] || KEY;
-  return resource ? Z.resourceKey(key, ns, resource) : key;
-}
+const KEYS = { epoch: new Map(), res: new Map(), pending: new Map() };
+async function fetchKeyFor(kid) { const ns = Z.parseKid(kid).ns; KEYS.epoch.set(kid, NS_KEYS[ns] || KEY); }
+function holdRes(kid, resource, key) { KEYS.res.set(kid + '\n' + resource, key); }
+const nsInfoCache = new Map();
 async function decrypted(r, ns, resource, want) {
   try { const d = await openSealed(ns, r.text.trim(), resource, want); return { value: d.value, kid: d.kid }; }
   catch (err) { return { value: null, error: err.message }; }
@@ -355,7 +355,7 @@ func runUndoHarness(t *testing.T, node, harness string, input map[string]any) []
 		t.Fatal(err)
 	}
 	var fns []string
-	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "nsLogRead", "openEntries", "openSealed", "readDoc", "foldTarget",
+	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "nsLogRead", "openEntries", "openSealed", "readDoc", "revTarget", "notOffered", "contentKey", "nsInfo",
 		"undoPtr", "undoPtrStr", "ptrGet", "sameAt", "hasPrefix", "widenWrite", "coverPaths", "pathsOverlap", "foldUndo", "moveBack", "invertRev",
 		"planUndoResource", "undoSites", "undoStackFrom", "undoGestureList", "undoNSLog", "undoNSLogOr", "undoReadRes", "undoKeysLevel", "undoPlan", "undoImpossible", "undoHeadMoved", "undoRun",
 		"undoLatest", "needsNonce"} {

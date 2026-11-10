@@ -21,7 +21,8 @@ import (
 // legacyZipJWE seals plaintext as JWEs were sealed before v0.65 when they
 // were compressed: raw DEFLATE under the protected header canonical({alg,
 // enc, kid, pl, zip: "DEF"}) (RFC 7516 §5.1). Seal never compresses now
-// (§E.2.2), but readers still open such stored bytes.
+// (§E.2.2), and readers refuse such stored bytes (v0.78: drafts promise
+// no compatibility with data written under an earlier draft).
 func legacyZipJWE(key []byte, kid string, pl seal.PL, plaintext []byte) (string, error) {
 	var z bytes.Buffer
 	w, _ := flate.NewWriter(&z, flate.BestCompression)
@@ -69,9 +70,11 @@ FUNCTIONS
 `
 
 // ENC-1: a sealed namespace document is bound to pl {ns, id, kind: "doc"}
-// (§E.2.2), and bytes sealed before v0.63 to kind "config". The catalog
-// tab reads namespace documents through nsHeadDoc, which opens both, like
-// refreshNS (both take nsDocPL), and nothing else.
+// (§E.2.2). Bytes sealed before v0.63 with kind "config" don't open (v0.78,
+// "Reading this spec": no compatibility with data written under an earlier
+// draft; since v0.81 they would be under K_e, which seals nothing). The
+// catalog tab reads namespace documents through nsHeadDoc, like refreshNS
+// (both take nsDocPL).
 func TestNSHeadDocPLWithNode(t *testing.T) {
 	t.Parallel()
 	node, err := exec.LookPath("node")
@@ -102,11 +105,11 @@ func TestNSHeadDocPLWithNode(t *testing.T) {
 	}
 	cases := []nsCase{
 		sealed("cat", "1abc", seal.NamespaceDocPL("cat", "1abc")),                            // v0.63: kind "doc"
-		sealed("cat", "1abc", seal.PL{"ns": "cat", "id": "1abc", "kind": seal.KindConfig}),   // stored before v0.63
+		sealed("cat", "1abc", seal.PL{"ns": "cat", "id": "1abc", "kind": seal.KindConfig}),   // stored before v0.63: refused
 		sealed("cat", "1abc", seal.PL{"ns": "cat", "id": "1abc", "kind": seal.KindSnapshot}), // another payload's kind
 		sealed("cat", "1abc", seal.NamespaceDocPL("cat", "1abd")),                            // another revision
 	}
-	want := []bool{true, true, false, false}
+	want := []bool{true, false, false, false}
 	dir := t.TempDir()
 	h := filepath.Join(dir, "harness.js")
 	if err := os.WriteFile(h, []byte(strings.Replace(nsDocHarness, "FUNCTIONS", strings.Join(fns, "\n"), 1)), 0o644); err != nil {

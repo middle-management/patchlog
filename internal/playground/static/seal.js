@@ -2,8 +2,10 @@
  *
  * Mirrors internal/seal (and the folding of internal/client/e2e.go):
  *   - JWE compact, alg "dir", enc "A256GCM", protected header
- *     {alg, enc, kid: "{ns}#{e}", pl, zip?: "DEF"}, AAD = the base64url header (§E.2.2)
- *   - K_r = HKDF-SHA256(ikm K_e, salt "patchlog-e2", info ns ‖ 0x0A ‖ name) (§E.2.1)
+ *     {alg, enc, kid: "{ns}#{e}", pl}, AAD = the base64url header (§E.2.2); never compressed: a zip member is refused
+ *   - K_r = HKDF-SHA256(ikm K_e, salt "patchlog-e2", info ns ‖ 0x0A ‖ name) and
+ *     K_n = HKDF-SHA256(ikm K_e, salt "patchlog-e2", info ns ‖ 0x0A) (§E.2.1); K_e itself seals nothing
+ *   - view keys HKDF-SHA256(ikm K_n or K_r, salt "patchlog-view", info view) (SERVICES.md §E.2.6)
  *   - HPKE base and auth mode (RFC 9180), DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-256-GCM,
  *     single shot, empty AAD, wire form enc ‖ ct, info "patchlog-key-v1\n" ‖ kid ‖ "\n" ‖ resource, resource "" for K_e (§E.2.3)
  *   - RFC 7638 thumbprints of X25519 keys (§E.2.3)
@@ -26,6 +28,7 @@ const td = new TextDecoder('utf-8', { fatal: true });
 const SUITE = 'hpke-base-0x0020-0x0001-0x0002';
 const WRAP_INFO_PREFIX = 'patchlog-key-v1\n';
 const RESOURCE_KEY_SALT = 'patchlog-e2';
+const VIEW_KEY_SALT = 'patchlog-view';
 
 /* ---------------- bytes ---------------- */
 function concat(...parts) {
@@ -120,7 +123,22 @@ async function hkdf(ikm, salt, info, len) { return hkdfExpand(await hkdfExtract(
 /* K_r = HKDF-SHA256(K_e, "patchlog-e2", ns ‖ "\n" ‖ name) */
 function resourceKey(epochKey, ns, name) {
   if (epochKey.length !== 32) throw new Error('epoch key must be 32 bytes');
+  if (!name) throw new Error('a resource name is never empty (§3.6)');
   return hkdf(epochKey, utf8(RESOURCE_KEY_SALT), utf8(ns + '\n' + name), 32);
+}
+
+/* K_n = HKDF-SHA256(K_e, "patchlog-e2", ns ‖ "\n"): namespace documents, log ranges, events and grants (§E.2.1). */
+function namespaceKey(epochKey, ns) {
+  if (epochKey.length !== 32) throw new Error('epoch key must be 32 bytes');
+  return hkdf(epochKey, utf8(RESOURCE_KEY_SALT), utf8(ns + '\n'), 32);
+}
+
+/* viewKey = HKDF-SHA256(K_n or K_r, "patchlog-view", view): a derived view's key (SERVICES.md §E.2.6), view the
+ * request target, path and query, exactly as the service's redirect gave it. */
+function viewKey(key, view) {
+  if (key.length !== 32) throw new Error('key must be 32 bytes');
+  if (typeof view !== 'string' || !view) throw new Error('a view key needs the view');
+  return hkdf(key, utf8(VIEW_KEY_SALT), utf8(view), 32);
 }
 
 /* ---------------- AES-256-GCM ---------------- */
@@ -306,14 +324,10 @@ function parseJWE(jwe) {
   if (!hdr || hdr.alg !== 'dir' || hdr.enc !== 'A256GCM') throw new Error('unsupported alg/enc');
   if (!hdr.kid) throw new Error('missing kid');
   if ('crit' in hdr) throw new Error('unsupported crit');
-  if ('zip' in hdr && hdr.zip !== 'DEF') throw new Error('unsupported zip');
+  // Sealed payloads are never compressed (§E.2.2): bytes sealed before v0.65 with zip "DEF" don't open (v0.78).
+  if ('zip' in hdr) throw new Error('zip: sealed payloads are never compressed (§E.2.2)');
   if (!hdr.pl || typeof hdr.pl !== 'object' || Array.isArray(hdr.pl)) throw new Error('missing pl');
   return { header: hdr, raw, parts };
-}
-async function inflateRaw(bytes) {
-  if (typeof DecompressionStream === 'undefined') throw new Error('this browser cannot inflate zip "DEF" content');
-  const s = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
-  return new Uint8Array(await new Response(s).arrayBuffer());
 }
 /* openJWE -> { header, plaintext (Uint8Array), text } */
 async function openJWE(jwe, key) {
@@ -321,8 +335,7 @@ async function openJWE(jwe, key) {
   if (parts[1] !== '') throw new Error('dir JWE must have an empty encrypted key');
   const iv = unb64u(parts[2]), ct = unb64u(parts[3]), tag = unb64u(parts[4]);
   if (iv.length !== 12 || tag.length !== 16) throw new Error('malformed IV or tag');
-  let pt = await gcmOpen(key, iv, concat(ct, tag), utf8(parts[0]));
-  if (header.zip === 'DEF') pt = await inflateRaw(pt);
+  const pt = await gcmOpen(key, iv, concat(ct, tag), utf8(parts[0]));
   return { header, plaintext: pt, text: td.decode(pt) };
 }
 async function sealJWE(key, kidStr, pl, plaintext, iv) {
@@ -698,9 +711,8 @@ async function selfTest(fx) {
     const d = plDiff(o.header.pl, fx.jwe.pl);
     return (o.text === fx.jwe.plaintext && o.header.kid === fx.jwe.kid && !d.length) || 'mismatch ' + d.join(',');
   });
-  await check('open a Go-sealed compressed (zip DEF) JWE', async () => {
-    const o = await openJWE(fx.jweZip.jwe, unb64u(fx.jweZip.key));
-    return (o.header.zip === 'DEF' && o.text === fx.jweZip.plaintext) || 'mismatch';
+  await check('a Go-sealed compressed (zip DEF) JWE is refused (§E.2.2)', async () => {
+    try { await openJWE(fx.jweZip.jwe, unb64u(fx.jweZip.key)); return 'opened'; } catch (e) { return /zip/.test(e.message) || e.message; }
   });
   await check('tampered JWE is refused', async () => {
     const p = fx.jwe.jwe.split('.'); p[3] = (p[3][0] === 'A' ? 'B' : 'A') + p[3].slice(1);
@@ -759,7 +771,7 @@ async function selfTest(fx) {
 root.PLSeal = {
   SUITE, b64u, unb64u, b32, hex, unhex, utf8, equalBytes, randomBytes, newNonce, canonical, padLen,
   sha256, chainID, revisionID, tombstoneID, idBytes,
-  hkdf, resourceKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, thumbprint, parseJWK,
+  hkdf, resourceKey, namespaceKey, viewKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, thumbprint, parseJWK,
   hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapStoredKey, unwrapRelayedKey, checkRelayedEntry, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
   sealPatchSet, sealedJWE, sealedBlobs, BLOB_TYPE, blobType, blobID, blobIDs, sameBlobs, parseBlob, openBlob, sealBlob, encryptBlob, decryptBlob,
   isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,

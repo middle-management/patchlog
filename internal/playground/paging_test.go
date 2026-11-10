@@ -58,7 +58,11 @@ const Z = globalThis.PLSeal;
 const ID_RE = /^1[a-z2-7]{32}$/;
 const short = (id) => id || '';
 const S = { ns: '', nsLogErr: '' };
-const KEY = Z.unb64u(input.key);
+// app.js's own contentKey, openSealed and decrypted open the sealed pages, from K_e as /keys gives it (§E.2.3).
+const KEYS = { epoch: new Map([[input.kid, Z.unb64u(input.key)]]), res: new Map(), pending: new Map() };
+function holdRes(kid, resource, key) { KEYS.res.set(kid + '\n' + resource, key); }
+async function fetchKeyFor(kid) { throw new Error('no key for ' + kid); }
+function renderEntry() {}
 let requests = 0;
 async function api(method, path, o) {
   requests++;
@@ -67,16 +71,8 @@ async function api(method, path, o) {
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch (_) { /* not JSON */ }
   const u = new URL(res.url);
-  return { status: res.status, json, text, finalPath: u.pathname + u.search,
+  return { status: res.status, json, text, finalPath: u.pathname + u.search, entry: {},
     jose: /^application\/jose\b/i.test(res.headers.get('Content-Type') || ''), hdr: (k) => res.headers.get(k) };
-}
-async function decrypted(r, ns, resource, want) {
-  try {
-    const jwe = r.text.trim();
-    const pl = Z.parseJWE(jwe).header.pl;
-    if (JSON.stringify(pl) !== JSON.stringify(want)) throw new Error('bound to ' + JSON.stringify(pl) + ', not ' + JSON.stringify(want));
-    return { value: JSON.parse((await Z.openJWE(jwe, KEY)).text) };
-  } catch (err) { return { value: null, error: err.message }; }
 }
 const noNext = (r) => Object.assign({}, r, { hdr: (k) => (k === 'X-Log-Next' ? null : r.hdr(k)) });
 const ids = (arr) => arr.map((x) => (typeof x === 'string' ? jweID(x) : x.id));
@@ -170,7 +166,7 @@ func TestLogPagesWithNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	var fns []string
-	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "nsLogRead"} {
+	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "nsLogRead", "contentKey", "openSealed", "decrypted"} {
 		fns = append(fns, jsFunction(t, js, f))
 	}
 	dir := t.TempDir()
@@ -178,7 +174,7 @@ func TestLogPagesWithNode(t *testing.T) {
 	if err := os.WriteFile(h, []byte(strings.Replace(pagingHarness, "FUNCTIONS", strings.Join(fns, "\n"), 1)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	in, _ := json.Marshal(map[string]any{"base": s.URL, "key": base64.RawURLEncoding.EncodeToString(keys[0].Key),
+	in, _ := json.Marshal(map[string]any{"base": s.URL, "key": base64.RawURLEncoding.EncodeToString(keys[0].Key), "kid": keys[0].Kid,
 		"resPath": "/r/docs/x/rev/" + resIDs[4] + "/log", "sealedResPath": "/r/s/x/rev/" + sealedIDs[4] + "/log"})
 	inPath := filepath.Join(dir, "input.json")
 	if err := os.WriteFile(inPath, in, 0o644); err != nil {
@@ -233,8 +229,7 @@ func newTestKeyStore(t *testing.T) *keystore.Local {
 
 // Every log range app.js fetches is read through the paged readers: each
 // api('GET', …/log…) call sits in a function that hands its answer to
-// nsLogRead or readLogRange (and the fold redirect's answer, which readDoc
-// gets from its callers, too).
+// nsLogRead or readLogRange (the range readDoc folds at E3 too).
 func TestLogReadersUsed(t *testing.T) {
 	t.Parallel()
 	js, err := assets.ReadFile("static/app.js")
@@ -415,8 +410,8 @@ func TestLogPageFromSnapshotWithNode(t *testing.T) {
 }
 
 // foldHarness reads e2e documents with app.js's readDoc (and so
-// readLogRange, foldLog and openSnapshot) against a live server, with keys
-// given by kid and no $schema validation.
+// readLogRange, foldLog, openSnapshot and contentKey) against a live
+// server, with K_e given by kid and no $schema validation.
 const foldHarness = `
 const fs = require('fs');
 require(process.argv[2]);
@@ -436,12 +431,11 @@ async function api(method, path, o) {
   return { status: res.status, json, text, finalPath: u.pathname + u.search,
     jose: /^application\/jose\b/i.test(res.headers.get('Content-Type') || ''), hdr: (k) => res.headers.get(k) };
 }
-async function nsInfo(ns) { return { doc: { encryption: { level: 'e2e' } } }; }
-async function contentKey(kid, resource) {
-  if (!input.keys[kid]) throw new Error('no key for ' + kid);
-  const ke = Z.unb64u(input.keys[kid]);
-  return resource ? Z.resourceKey(ke, Z.parseKid(kid).ns, resource) : ke; // K_r for E3 patch sets (§E.3.1), as app.js
-}
+async function nsInfo(ns) { return { level: 'e2e', doc: { encryption: { level: 'e2e' } } }; }
+// app.js's own contentKey derives K_r (§E.3.1) from K_e as the keyring gives it.
+const KEYS = { epoch: new Map(Object.entries(input.keys).map(([kid, k]) => [kid, Z.unb64u(k)])), res: new Map(), pending: new Map() };
+function holdRes(kid, resource, key) { KEYS.res.set(kid + '\n' + resource, key); }
+async function fetchKeyFor(kid) { throw new Error('no key for ' + kid); }
 async function validateDoc(doc) { return { errors: [] }; }
 const paddedLength = (n) => Z.padLen(n);
 FUNCTIONS
@@ -458,8 +452,9 @@ FUNCTIONS
 
 // The playground folds a pruned e2e resource from its horizon's snapshot,
 // which /rev/{H} serves, plus the range after it, which never holds the
-// snapshot (§7.1 Paging, §8.6): across pages and on a single page, and at
-// the horizon itself from /rev/{H} alone.
+// snapshot (§7.1, §8.6): across pages and on a single page, and at the
+// horizon itself from /rev/{H} alone. A later revision's /rev is 404
+// not_offered naming the horizon; the server never folds (v0.81).
 func TestE2EFoldFromHorizonWithNode(t *testing.T) {
 	t.Parallel()
 	node, err := exec.LookPath("node")
@@ -516,7 +511,7 @@ func testE2EFoldFromHorizonWithNode(t *testing.T, node string, size int) {
 		t.Fatal(err)
 	}
 	var fns []string
-	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "foldTarget", "readDoc", "nsChainOK", "openSealed", "openSnapshot", "foldLog"} {
+	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "revTarget", "notOffered", "readDoc", "nsChainOK", "contentKey", "openSealed", "openSnapshot", "foldLog"} {
 		fns = append(fns, jsFunction(t, js, f))
 	}
 	dir := t.TempDir()
@@ -572,9 +567,10 @@ func testE2EFoldFromHorizonWithNode(t *testing.T, node string, size int) {
 			t.Fatalf("fold at %s: %v (%q, %d flagged), want n %v; requests %v", id, o.Doc, o.Err, o.Flagged, want, o.Paths)
 		}
 	}
-	// After the horizon: the fold redirect's range from H (one or more
-	// pages, the first one through the redirect), and /rev/{H}.
-	if o := out[revs[6]]; o.Since != hz || !has(o.Paths, "/r/e/p/rev/"+hz) || logPages(o.Paths) != (4+size-1)/size-1 {
+	// After the horizon: /rev/{id}'s not_offered names H, then the range
+	// from H, every page of it fetched by the reader (no redirect), and
+	// /rev/{H}.
+	if o := out[revs[6]]; o.Since != hz || !has(o.Paths, "/r/e/p/rev/"+hz) || !has(o.Paths, "/r/e/p/rev/"+revs[6]+"/log?since="+hz) || logPages(o.Paths) != (4+size-1)/size {
 		t.Fatalf("fold at the head from %q: requests %v", o.Since, o.Paths)
 	}
 	// At the horizon: /rev/{H} alone.
