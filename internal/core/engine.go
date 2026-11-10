@@ -26,6 +26,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"strings"
@@ -190,6 +191,34 @@ type Options struct {
 	// origin MAY): no namespace is covered, and partial readers get
 	// §C.5's answers (403) as before v0.75. The zero value serves them.
 	NoFilteredReads bool
+	// SealBound is the message bound of every key the origin seals under
+	// (§E.2.1): a request that would need a sealing past it is 503
+	// (behind). Zero means 2³². SealRotateAt is the count at which a
+	// key of the current epoch makes its namespace's rotation due (zero
+	// means 2³¹), and SealBlock the counts an instance takes at once per
+	// key (zero means 256; sealcount.go).
+	SealBound    int64
+	SealRotateAt int64
+	SealBlock    int64
+	// PurgeRaisedE2E purges, at Open, the namespaces a pre-v0.78
+	// deployment raised to e2e and the remote branches that mirror a
+	// raised source, which Open otherwise refuses to serve
+	// (legacy_e2e.go): they then answer 410 purged.
+	PurgeRaisedE2E bool
+	// LegacyE2ERaiseForTests lets a config write raise a namespace to e2e
+	// and only records the new configuration, as a pre-v0.78 source did
+	// (tests of remote branches following one). Never set in production:
+	// a namespace is end-to-end from its creation or never (Addendum E
+	// Levels).
+	LegacyE2ERaiseForTests bool
+	// LegacyKeyringNonceForTests lets a keyring write in an e2e namespace
+	// carry a $nonce of any form, as the gate took it before v0.76 (tests
+	// of keyrings stored then). Never set in production: a keyring write
+	// carries a fresh $nonce or none (§E.3.2, §C.7).
+	LegacyKeyringNonceForTests bool
+	// migrations, if not nil, replaces the embedded migrations (tests of
+	// a database an earlier version left).
+	migrations fs.FS
 }
 
 // RemoteOptions configure the branch side of remote branches (§G.3): how
@@ -229,11 +258,6 @@ type RemoteEndpoint struct {
 	// Identity unwraps the keys of a sealed base (Addendum E.2) that the
 	// base wraps to the grant's enc (§E.2.3, §G.5). Nil: raw keys only.
 	Identity *ecdh.PrivateKey
-	// OriginURL is where the origin itself answers, for what §G.5.2 reads
-	// only through base.origin: the start times of a source's epochs from
-	// before its e2e raise. "": the origin's own URL. A BaseURL that is
-	// neither may be a mirror or other intermediary.
-	OriginURL string
 }
 
 // Purger purges CDN cache tags.
@@ -245,6 +269,8 @@ func (logPurger) PurgeTags(tags []string) { log.Printf("cdn purge %v", tags) }
 
 // Engine is the patch-log service.
 type Engine struct {
+	// seals are the sealing counts this instance took (sealcount.go).
+	seals     sealCounter
 	db        *sql.DB
 	pg        bool // Postgres (Addendum D.8), not SQLite
 	opt       Options
@@ -398,7 +424,26 @@ func Open(opt Options) (*Engine, error) {
 	if err := checkStoreCompression(&opt); err != nil {
 		return nil, err
 	}
-	db, pg, err := openDB(opt.Path)
+	// Before migrating: a database holding namespaces raised to e2e
+	// under an earlier version is refused, or with PurgeRaisedE2E they are
+	// recorded for purging once migrated (legacy_e2e.go).
+	var legacy *legacyE2E
+	db, pg, err := openDB(opt.Path, opt.migrations, func(db *sql.DB, pg bool) error {
+		l, err := checkLegacyE2E(db, pg)
+		if err != nil {
+			return fmt.Errorf("checking for namespaces raised to e2e: %w", err)
+		}
+		if !l.empty() && !opt.PurgeRaisedE2E {
+			return errLegacyE2E(l)
+		}
+		legacy = l
+		// Durable before 016 drops the marker tables: a start failing
+		// before the purges leaves the record, and the next refuses.
+		if err := recordLegacyE2E(db, pg, l); err != nil {
+			return fmt.Errorf("recording namespaces raised to e2e for purging: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -436,6 +481,18 @@ func Open(opt Options) (*Engine, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := e.purgeRaisedE2E(context.Background(), legacy); err != nil {
+		e.comp.close()
+		db.Close()
+		return nil, fmt.Errorf("purging namespaces raised to e2e (-purge-raised-e2e): %w", err)
+	}
+	// (Not on a schema of an earlier version that tests open.)
+	if err := e.seedSealCountsAt016(context.Background()); err != nil {
+		e.comp.close()
+		db.Close()
+		return nil, fmt.Errorf("seeding the sealing counts (§E.2.1): %w", err)
+	}
+	e.warnLegacyE2E(context.Background(), legacy)
 	if pg && !opt.LocalRateBuckets {
 		// The buckets of every instance on the database (ratebuckets.go).
 		if e.rate.store, err = openBucketStore(opt.Path); err != nil {
@@ -482,10 +539,10 @@ func Open(opt Options) (*Engine, error) {
 		e.bg.Add(1)
 		go e.rotateLoop(opt.RotateEpochs)
 	}
-	if opt.RotateOnRevoke {
-		e.bg.Add(1)
-		go e.rotateRetryLoop()
-	}
+	// Rotations due after a revocation (RotateOnRevoke records them) and
+	// at the message bound (sealcount.go).
+	e.bg.Add(1)
+	go e.rotateRetryLoop()
 	if e.opt.RepurgeDelay == 0 {
 		e.opt.RepurgeDelay = 3*e.opt.TailInterval + 2*time.Minute
 	}
@@ -525,7 +582,7 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.77"
+const SpecVersion = "0.81"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a
@@ -1176,6 +1233,10 @@ func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targ
 		via = grantVia(g)
 	}
 	noAuth := t.noAuth(author)
+	if entry["kind"] != "purge-ns" {
+		// A purge destroys the keys and their counts (purgeNSNow).
+		t.reserveEntries(n, configSeq, 1)
+	}
 	rs, ts := make([]int64, len(hist)), make([]int64, len(hist))
 	for i, h := range hist {
 		rs[i], ts[i] = h.res, h.target
@@ -1264,6 +1325,7 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 		t.lockNS(n.id, lockExclusive)
 	}
 	k := len(as)
+	t.reserveEntries(n, configSeq, int64(k))
 	bodies := make([]string, k)
 	kinds, authors := make([]int64, k), make([]int64, k)
 	res, targets := make([]*int64, k), make([]*int64, k)

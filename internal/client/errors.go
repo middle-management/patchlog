@@ -70,8 +70,14 @@ func (e *APIError) Head() string { return str(e.Body, "head") }
 // Config is the current config id named by a 412 on a config write.
 func (e *APIError) Config() string { return str(e.Body, "config") }
 
-// Horizon is the pruning horizon of a 410 pruned (§8.6).
+// Horizon is the pruning horizon of a 410 pruned (§8.6), or of an E3
+// /rev/{id} that is 404 not_offered (§7.1).
 func (e *APIError) Horizon() string { return str(e.Body, "horizon") }
+
+// Last is the last live revision a body names: a tombstoned head's (§8.1),
+// or, at E3, the parent of a tombstone horizon in a not_offered /rev/{id}
+// (§7.1), from which readers fold.
+func (e *APIError) Last() string { return str(e.Body, "last") }
 
 // Successor is the successor namespace of a 409 frozen (§8.4).
 func (e *APIError) Successor() string { return str(e.Body, "successor") }

@@ -48,12 +48,13 @@ func TestV076FilteredUncovered401(t *testing.T) {
 	}
 }
 
-// §B.11.9 Branches, Where, §C.4 (conformance 105): after matches-r7 is
-// cut, matches adds catalog-02 (roles scope without reader) and removes
-// catalog-01: a partial reader of the branch in fan-club, through another
-// key, gets 403 at its filtered /heads and log, and its exchange no
-// /ns/matches-r7/g/{gs}; derby is never listed through catalog-01's
-// reader.
+// §B.11.9 Where (v0.78: "Filtered reads cover no branch"; TDA 63): a
+// partial reader of matches-r7 in fan-club, through another key, gets 403
+// at the branch's unfiltered /heads, with no redirect, and at its filtered
+// /heads and log, 401 there without credentials, and its exchange no
+// /ns/matches-r7/g/{gs}; derby is never listed. Before v0.78 the branch
+// was covered until matches stopped trusting cat-season through
+// catalog-01.
 func TestV076FilteredBranchUncovered(t *testing.T) {
 	t.Parallel()
 	fan := newKey("fan")
@@ -68,47 +69,26 @@ func TestV076FilteredBranchUncovered(t *testing.T) {
 		body: map[string]any{"name": "matches-r7", "at": w.nsHead("matches", w.admin), "patches": []any{}}}), 201)
 	reader := w.grant(fan, "user:fan", []string{"matches-r7"}, []string{"read"}, map[string]any{"groups": []any{"fan-club"},
 		"exp": w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)})
-	r := w.get("/ns/matches-r7/rev/"+w.nsHead("matches-r7", w.admin)+"/heads", reader)
-	expect(t, r, 302)
-	parts := strings.Split(strings.SplitN(r.H.Get("Location"), "?", 2)[0], "/")
-	if len(parts) != 8 || parts[3] != "g" {
-		t.Fatalf("Location %q", r.H.Get("Location"))
+	head := w.nsHead("matches-r7", w.admin)
+	r := w.get("/ns/matches-r7/rev/"+head+"/heads", reader)
+	expect(t, r, 403)
+	if r.H.Get("Location") != "" {
+		t.Fatalf("a redirect to %q", r.H.Get("Location"))
 	}
-	gs, at := parts[4], parts[6]
+	gs, at := w.filtered(w.li())
 	base := "/ns/matches-r7/g/" + gs
-	r = w.get(base+"/at/"+at+"/heads", reader)
-	expect(t, r, 200)
-	if names := headNames(t, r); len(names) != 1 || names[0] != "derby" {
-		t.Fatalf("before: %v", names)
-	}
-	exchangeG := func() bool {
-		t.Helper()
-		r := w.do(req{method: "POST", path: "/edge-grants", bearer: reader})
-		if r.Code != 200 {
-			return false
-		}
-		for p := range edgeCookies(t, r) {
-			if strings.HasPrefix(p, "/ns/matches-r7/g/") {
-				return true
-			}
-		}
-		return false
-	}
-	if !exchangeG() {
-		t.Fatal("no g prefix before")
-	}
-	cat2 := newKey("catalog-02")
-	expect(t, w.patchNS("matches", ops(
-		op("add", "/keys/-", map[string]any{"kid": "catalog-02", "alg": "ed25519", "pub": cat2.pub, "can": []any{"read"},
-			"requireAt": "cat-season", "roles": map[string]any{"allow": []any{"editor"}}}),
-		op("remove", "/keys/1")), w.admin), 201)
-	for _, path := range []string{base + "/at/" + at + "/heads", base + "/heads", base + "/at/" + at + "/log?since=" + at, base + "/log?since=" + at} {
+	for _, path := range []string{base + "/at/" + at + "/heads", base + "/heads", base + "/at/" + at + "/log?since=" + head, base + "/log?since=" + head} {
 		r := w.get(path, reader)
 		if r.Code != http.StatusForbidden || strings.Contains(string(r.Body), "derby") {
 			t.Errorf("%s: %d %s, want 403", path, r.Code, r.Body)
 		}
+		if r := w.get(path, ""); r.Code != http.StatusUnauthorized {
+			t.Errorf("%s without credentials: %d, want 401", path, r.Code)
+		}
 	}
-	if exchangeG() {
-		t.Fatal("the exchange still gives /ns/matches-r7/g/{gs}")
+	r = w.do(req{method: "POST", path: "/edge-grants", bearer: reader})
+	expect(t, r, 403)
+	if r.H.Get("Set-Cookie") != "" {
+		t.Fatalf("the exchange set %q", r.H.Get("Set-Cookie"))
 	}
 }

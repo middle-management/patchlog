@@ -16,12 +16,14 @@ import (
 // the target and to the id the step before produces (the batch writes
 // them in order). A document that doesn't validate makes the resource an
 // "invalid" conflict (a resolution that produced it no longer counts). A
-// document that references a blob a sealed op can't declare, such as one
-// from before a raise to e2e, gives the resource no item: it stays
-// unmerged and is offered again, and the rest of the batch goes ahead
-// (§F.3 kept bullet, §E.3.1). Sealed steps are kept while the item stays
-// the same, so a resubmission sends the same bytes and ids (§E.3.1); a
-// re-classification or a new resolution seals again.
+// document that references a blob a sealed op can't declare (§E.3.1: the
+// target refuses one of another type or with a nonce, 422), which no
+// writer of a namespace e2e from its creation should produce, gives the
+// resource no item: it stays unmerged and is offered again, as an
+// unrecordable kept resource is (§F.3), and the rest of the batch goes
+// ahead instead of failing with 422 blob. Sealed steps are kept while the
+// item stays the same, so a resubmission sends the same bytes and ids
+// (§E.3.1); a re-classification or a new resolution seals again.
 func (p *Plan) sealItems(ctx context.Context) error {
 	if p.TargetLevel != "e2e" {
 		return nil
@@ -116,8 +118,8 @@ func (p *Plan) sealSteps(ctx context.Context, r *Resource) (steps []client.Step,
 			return nil, fmt.Sprintf("step %d doesn't apply: %v", i, err), "", nil
 		}
 		// The re-sealed op would declare every blob nd references
-		// (below), and the target refuses one from before a raise to e2e
-		// (§E.3.1): no item then (§F.3).
+		// (below), and the target refuses one a sealed op can't declare
+		// (§E.3.1): no item then (sealItems).
 		if b := undeclarableBlob(nd); b != "" {
 			return nil, "", b, nil
 		}

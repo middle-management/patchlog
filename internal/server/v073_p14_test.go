@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -308,9 +309,10 @@ func TestV073RemoteCurrentSourceDocument(t *testing.T) {
 	}
 	expect(t, b.mkRemote("rel", remoteGenesis("main", at, map[string]any{"read": "grant"})), 201)
 
-	// e2e now, but not at at: at is before the raise, whatever the
-	// branch's level. (A's deployment is made to claim the raise; this
-	// server raises nothing to e2e.)
+	// e2e now, but not at at: A was raised to e2e, which v0.78 refuses a
+	// source as unverifiable, whatever the branch's level: 502 upstream
+	// (Addendum E Levels, §G.3). (A's deployment is made to claim the
+	// raise; this server raises nothing to e2e.)
 	a.mkNS("m", map[string]any{"read": "public"})
 	a.create("m", "p", map[string]any{"v": 1.0})
 	atM := a.nsHead("m")
@@ -324,9 +326,9 @@ func TestV073RemoteCurrentSourceDocument(t *testing.T) {
 		"e2e":     e2eDoc(map[string]any{"read": "grant"}),
 	} {
 		r := b.mkRemote("relm", remoteGenesis("m", atM, doc))
-		expectCode(t, r, 422, "invalid")
-		if errs, _ := r.Obj()["errors"].([]any); len(errs) != 1 || errs[0].(map[string]any)["pointer"] != "/base/at" {
-			t.Fatalf("%s: %s, want an error at /base/at", name, r.Body)
+		expectCode(t, r, 502, "upstream")
+		if !strings.Contains(r.Str("message"), "isn't e2e from its creation") {
+			t.Fatalf("%s: %s, want the raise named", name, r.Body)
 		}
 		expect(t, b.get("/ns/relm"), 404)
 	}

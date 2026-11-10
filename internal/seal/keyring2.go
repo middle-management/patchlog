@@ -22,8 +22,8 @@ import (
 // distribute keys, configured out of band: anyone can wrap to a
 // thumbprint, the server included.
 //
-// The format before v0.63 is Keyring (ParseKeyring); it is kept to read
-// stored keyrings and migrate them.
+// The format before v0.63 is Keyring (ParseKeyring), kept only to detect
+// and refuse it.
 type KeyringV2 struct {
 	Entries []KeyringEntry
 	// Nonce is the document's `$nonce` (§C.7), "" when absent.
@@ -51,8 +51,10 @@ const wrappedLen = hpkeNenc + KeySize + 16
 // keyring's own namespace and an epoch it has is the caller's to check.
 //
 // It reads stored keyrings, so it takes a $nonce of any form: until v0.76
-// a keyring was written with one, and its entries stay readable and
-// relayed. A write is checked with CheckKeyringV2.
+// a keyring was written with one. Its entries stay readable by a key
+// holder, but /keys relays none of them (CheckKeyringV2) until a keyring
+// write replaces the $nonce with a fresh one. A write is checked with
+// CheckKeyringV2.
 func ParseKeyringV2(v any) (*KeyringV2, error) { return parseKeyringV2(v, false) }
 
 // CheckKeyringV2 is ParseKeyringV2 for a keyring being written (§E.3.2):
@@ -246,17 +248,13 @@ func (kr *KeyringV2) Current(ns string) int {
 // UnwrapRelayed opens a key /keys relays (§E.2.3) with priv: a keyring
 // entry, which names its sender's thumbprint in From, in auth mode under
 // the one of senders it names, failing unless senders holds it (anyone
-// can wrap to a thumbprint, §E.3.2); a key without From in base mode, under
-// the HPKE info of v0.63 or, for an entry of a keyring stored before
-// (Keyring) relayed as stored, the info of that time. Every info binds the
-// kid (and a K_r's name), so a key can't be presented as another epoch's.
+// can wrap to a thumbprint, §E.3.2); a key without From, as at E2, in base
+// mode under the HPKE info of §E.2.3 (UnwrapKey), which binds the kid (and
+// a K_r's name), so a key can't be presented as another epoch's. The info
+// of keyrings stored before v0.63 isn't tried.
 func UnwrapRelayed(priv *ecdh.PrivateKey, w WrappedKey, senders []*ecdh.PublicKey) ([]byte, error) {
 	if w.From == "" {
-		k, err := UnwrapKey(priv, w)
-		if err != nil {
-			k, err = UnwrapKeyLegacy(priv, w)
-		}
-		return k, err
+		return UnwrapKey(priv, w)
 	}
 	for _, s := range senders {
 		if s != nil && Thumbprint(s) == w.From {

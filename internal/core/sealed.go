@@ -44,6 +44,7 @@ import (
 	"log"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -217,25 +218,6 @@ func (t *tx) createEpochKey(ns int64, epoch int) {
 	t.newEpochKeys[epochRef{ns, epoch}] = k
 }
 
-// storeEpochKey stores key as the epoch key of (ns, epoch), which began at
-// created, if none is stored: a remote branch's shadow keeps the keys its
-// source gave of the epochs before its raise to e2e (fetchPreRaiseKeys).
-func (t *tx) storeEpochKey(ns int64, epoch int, key []byte, created time.Time) {
-	if t.hasEpochKey(ns, epoch) {
-		return
-	}
-	ks := t.e.opt.KeyStore
-	if ks == nil {
-		panic(errNoKeyStore)
-	}
-	w, err := ks.Wrap(t.context(), key, epochAAD(ns, epoch))
-	if err != nil {
-		panic(encUnavailable(fmt.Sprintf("wrapping an epoch key with key store %s: %v", ks.Name(), err)))
-	}
-	_, err = t.Exec(`INSERT INTO epoch_keys (ns, epoch, wrapped, keystore, created) VALUES (?,?,?,?,?)`, ns, epoch, w, ks.Name(), created.UnixMilli())
-	t.must(err)
-}
-
 // epochKey returns the epoch key of (ns, epoch), panicking with a 500 when
 // it can't be had.
 func (t *tx) epochKey(ns int64, epoch int) []byte {
@@ -269,6 +251,7 @@ func (t *tx) epochKey(ns int64, epoch int) []byte {
 func (t *tx) deleteEpochKeys(ns int64) {
 	_, err := t.Exec(`DELETE FROM epoch_keys WHERE ns = ?`, ns)
 	t.must(err)
+	t.deleteSealCounts(ns)
 	t.flushEpochKeys = true
 }
 
@@ -382,11 +365,36 @@ type sealJob struct {
 	pad       bool   // the namespace pads (§E.2.2)
 	jwe       string // the stored value once known
 	fresh     bool   // jwe was sealed by sealNow and isn't stored yet
+	// reseal marks a namespace document or grant whose stored row is from
+	// before v0.81, sealed under K_e (kver 0): it is sealed again under
+	// K_n of the stored row's epoch and replaces that row (storedNS).
+	reseal bool
+	// unzip holds the stored bytes of a resource document or log entry
+	// sealed before v0.65 with zip "DEF", which no reader opens: j seals it
+	// again, uncompressed, under the same key, and replaces the row only
+	// while it still holds these bytes (storedRes).
+	unzip string
 }
 
-// sealNow seals a job not stored yet, so the length of what will be
-// served is known before finishSeal stores it (a sealed resource log
-// page's logPageBytes, ResourceLog).
+// sealKver is the kver of the rows this version stores (migration 016):
+// namespace documents and grants under K_n, the rest under K_r. Rows of
+// kver 0, from before, hold namespace documents and grants under K_e.
+const sealKver = 1
+
+// servedLen is the length of what j serves: its stored JWE's, or one
+// sealed under a throwaway key, of the same length, so a sealed resource
+// log page's logPageBytes (ResourceLog) is judged without sealing under
+// the namespace's key before the sealing is counted (sealcount.go).
+func (j *sealJob) servedLen() (int, error) {
+	if j.jwe != "" {
+		return len(j.jwe), nil
+	}
+	s, err := seal.SealMaybePadded(make([]byte, seal.KeySize), j.kid, j.pl, j.plain, j.pad)
+	return len(s), err
+}
+
+// sealNow seals a job not stored yet, once its sealing is counted
+// (storeSeal, finishSeal).
 func (j *sealJob) sealNow() error {
 	if j.jwe != "" {
 		return nil
@@ -414,7 +422,8 @@ func (t *tx) stored(n *nsRow, j *sealJob) bool {
 // if the value isn't stored yet.
 func (t *tx) resJob(n *nsRow, name string, row *revRow, kind string, plain func() []byte) *sealJob {
 	j := &sealJob{kind: kind, key: name + "/" + row.id.String(), name: name, revSeq: row.seq}
-	if t.stored(n, j) {
+	ok, e := t.storedRes(n, j)
+	if ok {
 		return j
 	}
 	plKind := seal.KindDoc
@@ -424,7 +433,9 @@ func (t *tx) resJob(n *nsRow, name string, row *revRow, kind string, plain func(
 			plKind = seal.KindTombstone
 		}
 	}
-	e := t.revEpoch(n, row)
+	if j.unzip == "" {
+		e = t.revEpoch(n, row)
+	}
 	kr, err := seal.ResourceKey(t.epochKey(n.id, e), n.name, name)
 	t.must(err)
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), kr, seal.ResourcePL(n.name, name, row.id.String(), plKind), plain()
@@ -432,32 +443,135 @@ func (t *tx) resJob(n *nsRow, name string, row *revRow, kind string, plain func(
 	return j
 }
 
-// configJob prepares the sealing of n's namespace document at ns_log seq.
+// storedRes is stored for a resource document or log entry: true if j's
+// row holds a sealing a reader opens. A row stored before v0.65 with zip
+// "DEF" in its header (stored.md item 5), which no reader opens (§E.2.2:
+// sealed payloads are never compressed), is never served again: it
+// reports the epoch the row's kid fixed, under whose K_r j is sealed
+// again, uncompressed, with the plaintext computed as for a new row, and
+// replaces the row while it still holds those bytes (unzip, finishSeal),
+// the first stored winning. The ETag "{id}.{e}" names the same epoch, and
+// the old bytes are never opened. If that epoch's key is gone, or the kid
+// can't be read or names another namespace, the answer is 500, as
+// storedNS's. Rows stored since v0.81 (kver 1) are never compressed.
+// Content sealed by clients (E3) is never in this table.
+func (t *tx) storedRes(n *nsRow, j *sealJob) (bool, int) {
+	var jwe string
+	var kver int
+	err := t.QueryRow(`SELECT jwe, kver FROM sealed WHERE ns = ? AND kind = ? AND key = ?`, n.id, j.kind, j.key).Scan(&jwe, &kver)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, 0
+	}
+	t.must(err)
+	if kver >= sealKver {
+		j.jwe = jwe
+		return true, 0
+	}
+	if h, err := seal.ParseHeader(jwe); err == nil && h.Zip == "" {
+		j.jwe = jwe
+		return true, 0
+	}
+	kns, e, ok := jweKid(jwe)
+	if !ok || kns != n.name || !t.hasEpochKey(n.id, e) {
+		panic(apiErr(500, "internal", "message", fmt.Sprintf("namespace %s: the %s %s was sealed compressed under an earlier draft, and the key of its epoch is gone; it can't be served (§E.2.2, v0.81)", n.name, j.kind, j.key)))
+	}
+	j.unzip = jwe
+	return false, e
+}
+
+// jweKid reads the namespace and epoch of a stored JWE's kid "{ns}#{e}"
+// from its header, without a key (jweEpoch).
+func jweKid(jwe string) (string, int, bool) {
+	seg, _, _ := strings.Cut(jwe, ".")
+	raw, err := base64.RawURLEncoding.DecodeString(seg)
+	if err != nil {
+		return "", 0, false
+	}
+	v, err := jsonv.Parse(raw)
+	if err != nil {
+		return "", 0, false
+	}
+	m, _ := v.(map[string]any)
+	kid, _ := m["kid"].(string)
+	ns, e, err := seal.ParseKid(kid)
+	return ns, e, err == nil
+}
+
+// namespaceKey is K_n of n's epoch e (§E.2.1): what is sealed for the
+// namespace rather than for a resource, as K_e itself seals nothing.
+func (t *tx) namespaceKey(n *nsRow, e int) []byte {
+	k, err := seal.NamespaceKey(t.epochKey(n.id, e), n.name)
+	t.must(err)
+	return k
+}
+
+// storedNS is stored for a namespace document or grant: true if j's row
+// holds its sealing under K_n. A row stored before v0.81 under K_e (kver
+// 0) is never served again (stored.md item 7): it reports the epoch the
+// row's kid fixed, under whose K_n j is sealed again with the plaintext
+// computed as for a new row, and replaces the row (reseal, finishSeal),
+// the first stored winning. Its old bytes are never opened. If that
+// epoch's key is gone, or the kid can't be read, the answer is 500.
+func (t *tx) storedNS(n *nsRow, j *sealJob) (bool, int) {
+	var jwe string
+	var kver int
+	err := t.QueryRow(`SELECT jwe, kver FROM sealed WHERE ns = ? AND kind = ? AND key = ?`, n.id, j.kind, j.key).Scan(&jwe, &kver)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, 0
+	}
+	t.must(err)
+	if kver >= sealKver {
+		j.jwe = jwe
+		return true, 0
+	}
+	e, ok := jweEpoch(jwe)
+	if !ok || !t.hasEpochKey(n.id, e) {
+		panic(apiErr(500, "internal", "message", fmt.Sprintf("namespace %s: the %s %s was sealed under an earlier draft's key, and the key of its epoch is gone; it can't be served (§E.2.1, v0.81)", n.name, j.kind, j.key)))
+	}
+	j.reseal = true
+	return false, e
+}
+
+// configJob prepares the sealing of n's namespace document at ns_log seq,
+// under K_n of the epoch in force there (§E.2.2).
 func (t *tx) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
 	j := &sealJob{kind: sealConfig, key: nsID}
-	if t.stored(n, j) {
+	ok, e := t.storedNS(n, j)
+	if ok {
 		return j
 	}
-	e := t.entryEpoch(n, seq)
-	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.NamespaceDocPL(n.name, nsID), doc
+	if !j.reseal {
+		e = t.entryEpoch(n, seq)
+	}
+	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.namespaceKey(n, e), seal.NamespaceDocPL(n.name, nsID), doc
 	j.pad = t.config(n.configSeq).Pad
 	return j
 }
 
 // rangeJob prepares the sealing of n's namespace log range (since, to],
-// where to is ns_log seq toSeq with id toID: a range, long-poll answer or
-// namespace event is sealed under K_e of the current epoch (§E.2.2), not
-// that of its last entry. A stored range keeps its bytes; one evicted is
-// sealed again under the epoch current then.
+// where to is ns_log seq toSeq with id toID: a range or long-poll answer
+// is sealed under K_n of the current epoch (§E.2.2), not that of its last
+// entry. A stored range keeps its bytes; one evicted is sealed again
+// under the epoch current then.
 func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain func() []byte) *sealJob {
 	j := &sealJob{kind: sealRange, key: since + ":" + toID}
 	if t.stored(n, j) {
 		return j
 	}
 	e := t.config(n.configSeq).Epoch
-	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.RangePL(n.name, since, toID), plain()
+	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.namespaceKey(n, e), seal.RangePL(n.name, since, toID), plain()
 	j.pad = t.config(n.configSeq).Pad
 	return j
+}
+
+// eventJob prepares the sealing of n's namespace event for entry id after
+// prev: its plaintext is the entry itself (canonical JSON), under K_n of
+// the current epoch with pl {ns, range: [prev, id]} (§E.2.2). It is
+// sealed at each serve and never stored: it would share its row with the
+// one-entry range (prev, id], whose plaintext is [entry].
+func (t *tx) eventJob(n *nsRow, prev, id string, entry []byte) *sealJob {
+	e := t.config(n.configSeq).Epoch
+	return &sealJob{kid: seal.Kid(n.name, e), k: t.namespaceKey(n, e), pl: seal.RangePL(n.name, prev, id), plain: entry, pad: t.config(n.configSeq).Pad}
 }
 
 // storeSeal is finishSeal for one job inside this write transaction: it
@@ -471,6 +585,14 @@ func (t *tx) storeSeal(ns int64, j *sealJob) (int, bool) {
 		return 0, false
 	}
 	if j.jwe == "" || j.fresh {
+		if j.jwe == "" {
+			// Counted with the write it is stored in (§E.2.1): a
+			// revision's document or entry from what its write reserved,
+			// unless it replaces one stored compressed (unzip).
+			if k := jobSealKey(ns, j); j.unzip != "" || !(j.kind == sealDoc || j.kind == sealEntry) || !t.sealedFromReserve(k) {
+				t.countIn(k, 1, false)
+			}
+		}
 		t.must(j.sealNow())
 		t.lockNS(ns, lockShared)
 		var purged bool
@@ -488,13 +610,34 @@ func (t *tx) storeSeal(ns int64, j *sealJob) (int, bool) {
 		if j.revSeq != 0 {
 			rev = j.revSeq
 		}
-		_, err := t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
-			ns, j.kind, j.key, name, rev, j.jwe, t.now.UnixMilli())
-		t.must(err)
-		t.must(t.QueryRow(`SELECT jwe FROM sealed WHERE ns = ? AND kind = ? AND key = ?`, ns, j.kind, j.key).Scan(&j.jwe))
+		t.insertSealed(ns, j, name, rev)
 		j.fresh = false
 	}
 	return jweEpoch(j.jwe)
+}
+
+// insertSealed stores j's sealing under namespace ns unless one is stored
+// (INSERT ON CONFLICT DO NOTHING; for a reseal, an UPDATE of the kver-0
+// row; for an unzip, an UPDATE of the row still holding the compressed
+// bytes, keeping its created, by which revEpochFixed finds the first
+// sealing, and an INSERT should a prune have deleted it since), then reads
+// back the stored bytes, so the first stored wins.
+func (t *tx) insertSealed(ns int64, j *sealJob, name, rev any) {
+	var err error
+	if j.reseal {
+		_, err = t.Exec(`UPDATE sealed SET jwe = ?, kver = ?, created = ? WHERE ns = ? AND kind = ? AND key = ? AND kver < ?`,
+			j.jwe, sealKver, t.now.UnixMilli(), ns, j.kind, j.key, sealKver)
+	} else {
+		if j.unzip != "" {
+			_, err = t.Exec(`UPDATE sealed SET jwe = ?, kver = ? WHERE ns = ? AND kind = ? AND key = ? AND jwe = ?`,
+				j.jwe, sealKver, ns, j.kind, j.key, j.unzip)
+			t.must(err)
+		}
+		_, err = t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created, kver) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
+			ns, j.kind, j.key, name, rev, j.jwe, t.now.UnixMilli(), sealKver)
+	}
+	t.must(err)
+	t.must(t.QueryRow(`SELECT jwe FROM sealed WHERE ns = ? AND kind = ? AND key = ?`, ns, j.kind, j.key).Scan(&j.jwe))
 }
 
 // finishSeal seals the jobs not stored yet and stores them (INSERT ON
@@ -504,12 +647,21 @@ func (t *tx) storeSeal(ns int64, j *sealJob) (int, bool) {
 // (§E.2.2); the setting as of sealing counts, and stored bytes never change.
 func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) error {
 	var todo []*sealJob
+	// Counted before any is sealed, a revision's document or entry from
+	// what its write reserved: past the bound, none is (§E.2.1).
+	if err := e.countJobSeals(ctx, ns, jobs); err != nil {
+		return err
+	}
 	for _, j := range jobs {
 		if j == nil || j.jwe != "" && !j.fresh {
 			continue
 		}
 		if err := j.sealNow(); err != nil {
 			return err
+		}
+		if j.kind == "" {
+			// Sealed at each serve, never stored (eventJob).
+			continue
 		}
 		todo = append(todo, j)
 	}
@@ -539,10 +691,7 @@ func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) erro
 			if j.name != "" {
 				name = j.name
 			}
-			_, err := t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
-				ns, j.kind, j.key, name, rev, j.jwe, t.now.UnixMilli())
-			t.must(err)
-			t.must(t.QueryRow(`SELECT jwe FROM sealed WHERE ns = ? AND kind = ? AND key = ?`, ns, j.kind, j.key).Scan(&j.jwe))
+			t.insertSealed(ns, j, name, rev)
 			ranges = ranges || j.kind == sealRange
 		}
 		if ranges {

@@ -2,8 +2,10 @@
  *
  * Mirrors internal/seal (and the folding of internal/client/e2e.go):
  *   - JWE compact, alg "dir", enc "A256GCM", protected header
- *     {alg, enc, kid: "{ns}#{e}", pl, zip?: "DEF"}, AAD = the base64url header (§E.2.2)
- *   - K_r = HKDF-SHA256(ikm K_e, salt "patchlog-e2", info ns ‖ 0x0A ‖ name) (§E.2.1)
+ *     {alg, enc, kid: "{ns}#{e}", pl}, AAD = the base64url header (§E.2.2); never compressed: a zip member is refused
+ *   - K_r = HKDF-SHA256(ikm K_e, salt "patchlog-e2", info ns ‖ 0x0A ‖ name) and
+ *     K_n = HKDF-SHA256(ikm K_e, salt "patchlog-e2", info ns ‖ 0x0A) (§E.2.1); K_e itself seals nothing
+ *   - view keys HKDF-SHA256(ikm K_n or K_r, salt "patchlog-view", info view) (SERVICES.md §E.2.6)
  *   - HPKE base and auth mode (RFC 9180), DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-256-GCM,
  *     single shot, empty AAD, wire form enc ‖ ct, info "patchlog-key-v1\n" ‖ kid ‖ "\n" ‖ resource, resource "" for K_e (§E.2.3)
  *   - RFC 7638 thumbprints of X25519 keys (§E.2.3)
@@ -26,6 +28,7 @@ const td = new TextDecoder('utf-8', { fatal: true });
 const SUITE = 'hpke-base-0x0020-0x0001-0x0002';
 const WRAP_INFO_PREFIX = 'patchlog-key-v1\n';
 const RESOURCE_KEY_SALT = 'patchlog-e2';
+const VIEW_KEY_SALT = 'patchlog-view';
 
 /* ---------------- bytes ---------------- */
 function concat(...parts) {
@@ -120,7 +123,22 @@ async function hkdf(ikm, salt, info, len) { return hkdfExpand(await hkdfExtract(
 /* K_r = HKDF-SHA256(K_e, "patchlog-e2", ns ‖ "\n" ‖ name) */
 function resourceKey(epochKey, ns, name) {
   if (epochKey.length !== 32) throw new Error('epoch key must be 32 bytes');
+  if (!name) throw new Error('a resource name is never empty (§3.6)');
   return hkdf(epochKey, utf8(RESOURCE_KEY_SALT), utf8(ns + '\n' + name), 32);
+}
+
+/* K_n = HKDF-SHA256(K_e, "patchlog-e2", ns ‖ "\n"): namespace documents, log ranges, events and grants (§E.2.1). */
+function namespaceKey(epochKey, ns) {
+  if (epochKey.length !== 32) throw new Error('epoch key must be 32 bytes');
+  return hkdf(epochKey, utf8(RESOURCE_KEY_SALT), utf8(ns + '\n'), 32);
+}
+
+/* viewKey = HKDF-SHA256(K_n or K_r, "patchlog-view", view): a derived view's key (SERVICES.md §E.2.6), view the
+ * request target, path and query, exactly as the service's redirect gave it. */
+function viewKey(key, view) {
+  if (key.length !== 32) throw new Error('key must be 32 bytes');
+  if (typeof view !== 'string' || !view) throw new Error('a view key needs the view');
+  return hkdf(key, utf8(VIEW_KEY_SALT), utf8(view), 32);
 }
 
 /* ---------------- AES-256-GCM ---------------- */
@@ -232,21 +250,6 @@ async function unwrapKey(identity, kid, resource, wrapped) {
   if (k.length !== 32) throw new Error('unwrapped key is not 32 bytes');
   return k;
 }
-/* Keyrings stored before v0.63 wrapped their keys under the info of that time, "patchlog-keys-v1\n" ‖ kid, then
- * "\n" ‖ resource for a K_r only; /keys relays such entries as stored. Like the current info it binds kid and resource. */
-function legacyWrapContext(kid, resource) { return utf8('patchlog-keys-v1\n' + kid + (resource ? '\n' + resource : '')); }
-/* unwrapStoredKey opens a keyring entry, read in the keyring or relayed by /keys (§E.3.2), under the current info or,
- * failing that, the legacy one (internal/seal's Keyring.EpochKey and the client's relayed entries do the same). */
-async function unwrapStoredKey(identity, kid, resource, wrapped) {
-  try {
-    return await unwrapKey(identity, kid, resource, wrapped);
-  } catch (e) {
-    let k;
-    try { k = await hpkeOpen(identity, legacyWrapContext(kid, resource), wrapped); } catch (_) { throw e; }
-    if (k.length !== 32) throw e;
-    return k;
-  }
-}
 
 /* checkRelayedEntry reads a /keys entry as internal/seal's ParseWrappedKey does (wrappedkeys.json's rejected entries):
  * a non-empty kid; name and resource (before v0.73), each a non-empty string, naming one resource where both are
@@ -274,11 +277,11 @@ function checkRelayedEntry(entry) {
 
 /* unwrapRelayedKey opens an entry of a POST /ns/{ns}/keys answer, { kid, name?, from?, wrapped } (§E.2.3): a keyring
  * entry relayed at E3 names its sender's thumbprint in from and opens in auth mode only with that sender's public key,
- * one of senders (x values this browser knows): anyone can wrap to a thumbprint (§E.3.2). Without from (an E2 key, or
- * an entry of a keyring stored before v0.63 relayed as stored), base mode under either info (unwrapStoredKey). */
+ * one of senders (x values this browser knows): anyone can wrap to a thumbprint (§E.3.2). Without from (an E2 key),
+ * base mode under the info of v0.63; the info of keyrings stored before v0.63 isn't tried (seal.UnwrapRelayed). */
 async function unwrapRelayedKey(identity, entry, senders) {
   const { res, wrapped } = checkRelayedEntry(entry);
-  if (!('from' in entry)) return unwrapStoredKey(identity, entry.kid, res, wrapped);
+  if (!('from' in entry)) return unwrapKey(identity, entry.kid, res, wrapped);
   for (const x of senders || []) {
     if ((await thumbprint(x)) !== entry.from) continue;
     const k = await hpkeOpen(identity, wrapContext(entry.kid, res), wrapped, unb64u(x));
@@ -306,14 +309,10 @@ function parseJWE(jwe) {
   if (!hdr || hdr.alg !== 'dir' || hdr.enc !== 'A256GCM') throw new Error('unsupported alg/enc');
   if (!hdr.kid) throw new Error('missing kid');
   if ('crit' in hdr) throw new Error('unsupported crit');
-  if ('zip' in hdr && hdr.zip !== 'DEF') throw new Error('unsupported zip');
+  // Sealed payloads are never compressed (§E.2.2): bytes sealed before v0.65 with zip "DEF" don't open (v0.78).
+  if ('zip' in hdr) throw new Error('zip: sealed payloads are never compressed (§E.2.2)');
   if (!hdr.pl || typeof hdr.pl !== 'object' || Array.isArray(hdr.pl)) throw new Error('missing pl');
   return { header: hdr, raw, parts };
-}
-async function inflateRaw(bytes) {
-  if (typeof DecompressionStream === 'undefined') throw new Error('this browser cannot inflate zip "DEF" content');
-  const s = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
-  return new Uint8Array(await new Response(s).arrayBuffer());
 }
 /* openJWE -> { header, plaintext (Uint8Array), text } */
 async function openJWE(jwe, key) {
@@ -321,8 +320,7 @@ async function openJWE(jwe, key) {
   if (parts[1] !== '') throw new Error('dir JWE must have an empty encrypted key');
   const iv = unb64u(parts[2]), ct = unb64u(parts[3]), tag = unb64u(parts[4]);
   if (iv.length !== 12 || tag.length !== 16) throw new Error('malformed IV or tag');
-  let pt = await gcmOpen(key, iv, concat(ct, tag), utf8(parts[0]));
-  if (header.zip === 'DEF') pt = await inflateRaw(pt);
+  const pt = await gcmOpen(key, iv, concat(ct, tag), utf8(parts[0]));
   return { header, plaintext: pt, text: td.decode(pt) };
 }
 async function sealJWE(key, kidStr, pl, plaintext, iv) {
@@ -475,6 +473,14 @@ function parseKeyringV2(doc) {
   return doc;
 }
 function buildKeyringV2() { return { keys: [] }; }
+/* keyringV2ForWrite copies kr for a keyring write: a keyring has no member but a fresh $nonce (§E.3.2, §C.7), so one
+ * read with it is replaced by a fresh one, never copied (one stored before v0.76 may have another form, which servers
+ * refuse); a keyring without one stays without, as client.E2E writes it. */
+function keyringV2ForWrite(kr) {
+  const out = JSON.parse(JSON.stringify(kr));
+  if ('$nonce' in out) out.$nonce = newNonce();
+  return out;
+}
 /* keyringV2Add wraps epochKey, the K_e of kidStr, for recipientX in auth mode under admin (an identity) and puts the
  * entry, replacing the one for the same kid and recipient. */
 async function keyringV2Add(kr, admin, recipientX, kidStr, epochKey) {
@@ -501,7 +507,8 @@ function keyringV2Epochs(kr, ns) {
   return [...out].sort((a, b) => a - b);
 }
 
-/* The format before v0.63 (seal.Keyring), which servers no longer take as the keyring: read to open and migrate. */
+/* The format before v0.63 (seal.Keyring), which servers no longer take as the keyring and from which the app opens
+ * nothing (v0.78 Legacy): parseKeyring detects it, and the self-test checks the HPKE wrap against Go's fixture. */
 function parseKeyring(doc) {
   const bad = (w) => { throw new Error('keyring: ' + w); };
   if (!doc || typeof doc !== 'object' || doc.keyring !== 1) bad('version');
@@ -525,7 +532,7 @@ async function keyringEpochKey(kr, identity, epoch) {
   const rid = await recipientID(identity.x);
   const w = (kr.epochs[String(epoch)] || {})[rid];
   if (!w) throw new Error(`the keyring has no key for this identity in epoch ${epoch}`);
-  return unwrapStoredKey(identity, kid(kr.ns, epoch), '', unb64u(w));
+  return unwrapKey(identity, kid(kr.ns, epoch), '', unb64u(w));
 }
 
 /* ---------------- JSON Patch (RFC 6902) ---------------- */
@@ -698,9 +705,8 @@ async function selfTest(fx) {
     const d = plDiff(o.header.pl, fx.jwe.pl);
     return (o.text === fx.jwe.plaintext && o.header.kid === fx.jwe.kid && !d.length) || 'mismatch ' + d.join(',');
   });
-  await check('open a Go-sealed compressed (zip DEF) JWE', async () => {
-    const o = await openJWE(fx.jweZip.jwe, unb64u(fx.jweZip.key));
-    return (o.header.zip === 'DEF' && o.text === fx.jweZip.plaintext) || 'mismatch';
+  await check('a Go-sealed compressed (zip DEF) JWE is refused (§E.2.2)', async () => {
+    try { await openJWE(fx.jweZip.jwe, unb64u(fx.jweZip.key)); return 'opened'; } catch (e) { return /zip/.test(e.message) || e.message; }
   });
   await check('tampered JWE is refused', async () => {
     const p = fx.jwe.jwe.split('.'); p[3] = (p[3][0] === 'A' ? 'B' : 'A') + p[3].slice(1);
@@ -759,10 +765,10 @@ async function selfTest(fx) {
 root.PLSeal = {
   SUITE, b64u, unb64u, b32, hex, unhex, utf8, equalBytes, randomBytes, newNonce, canonical, padLen,
   sha256, chainID, revisionID, tombstoneID, idBytes,
-  hkdf, resourceKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, thumbprint, parseJWK,
-  hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapStoredKey, unwrapRelayedKey, checkRelayedEntry, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
+  hkdf, resourceKey, namespaceKey, viewKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, thumbprint, parseJWK,
+  hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapRelayedKey, checkRelayedEntry, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
   sealPatchSet, sealedJWE, sealedBlobs, BLOB_TYPE, blobType, blobID, blobIDs, sameBlobs, parseBlob, openBlob, sealBlob, encryptBlob, decryptBlob,
-  isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,
+  isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2ForWrite, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,
   parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,
   applyPatch, validate, selfTest,
 };

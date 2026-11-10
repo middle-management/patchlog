@@ -254,13 +254,13 @@ func TestSealedLogPaging(t *testing.T) {
 		if p.next != "" {
 			last = p.next
 		}
-		pt := open(t, string(p.body), ke, "s#1", seal.RangePL("s", p.since, last))
+		pt := open(t, string(p.body), nsKey(t, ke, "s"), "s#1", seal.RangePL("s", p.since, last))
 		arr := jsonv.MustParse(pt).([]any)
 		if len(arr) != 2 || arr[1].(map[string]any)["id"] != last {
 			t.Fatalf("page %d: %s", i, pt)
 		}
 		// The page isn't bound to the whole range.
-		if _, err := seal.OpenExpect(string(p.body), ke, "s#1", seal.RangePL("s", p.since, head)); p.next != "" && err == nil {
+		if _, err := seal.OpenExpect(string(p.body), nsKey(t, ke, "s"), "s#1", seal.RangePL("s", p.since, head)); p.next != "" && err == nil {
 			t.Fatalf("page %d opens as the whole range", i)
 		}
 		got = append(got, arr...)
@@ -564,7 +564,7 @@ func TestE2ELogPageFromSnapshot(t *testing.T) {
 	// The snapshot is the horizon's revision: immutable and conditional.
 	r = e.get("/r/e/p/rev/"+revs[1], f.readerG)
 	expect(t, r, 200)
-	if string(r.Body) != snap || r.H.Get("Content-Type") != seal.ContentType || r.H.Get("X-E2E") != "snapshot" || r.H.Get("X-Revision") != revs[1] {
+	if string(r.Body) != snap || r.H.Get("Content-Type") != seal.ContentType || r.H.Get("X-E2E") != "" || r.H.Get("X-Revision") != revs[1] {
 		t.Fatalf("/rev/{H}: %v %s", r.H, r.Body)
 	}
 	expect(t, e.do(req{method: "GET", path: "/r/e/p/rev/" + revs[1], bearer: f.readerG, ifNoneMatch: `"` + revs[1] + `"`}), 304)
@@ -572,10 +572,11 @@ func TestE2ELogPageFromSnapshot(t *testing.T) {
 	mustEqual(t, f.fold("e", "p", revs[5], keys, f.readerG), map[string]any{"n": 5.0})
 	mustEqual(t, f.fold("e", "p", revs[3], keys, f.readerG), map[string]any{"n": 3.0})
 	mustEqual(t, f.fold("e", "p", revs[1], keys, f.readerG), map[string]any{"n": 1.0})
-	// Other revisions still redirect to the fold from the horizon (§13).
+	// Other revisions are not_offered, naming the horizon to fold from
+	// (v0.81 §7.1: the server never folds).
 	r = e.get("/r/e/p/rev/"+revs[4], f.readerG)
-	if r.Code != 302 || r.H.Get("Location") != "/r/e/p/rev/"+revs[4]+"/log?since="+revs[1] {
-		t.Fatalf("/rev/%s: %d %v", revs[4], r.Code, r.H)
+	if r.Code != 404 || r.Str("code") != "not_offered" || r.Str("horizon") != revs[1] || r.Obj()["last"] != nil {
+		t.Fatalf("/rev/%s: %d %v %s", revs[4], r.Code, r.H, r.Body)
 	}
 }
 

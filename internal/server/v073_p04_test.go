@@ -60,7 +60,7 @@ func TestV073P04NamespaceDocPL(t *testing.T) {
 	if got, want := string(jsonv.Canonical(map[string]any(h.PL))), `{"id":"`+head+`","kind":"doc","ns":"s"}`; got != want {
 		t.Fatalf("namespace document pl %s, want %s", got, want)
 	}
-	open(t, string(nr.Body), keys["s#1"], "s#1", seal.NamespaceDocPL("s", head))
+	open(t, string(nr.Body), nsKey(t, keys["s#1"], "s"), "s#1", seal.NamespaceDocPL("s", head))
 }
 
 // An E3 prune's snapshot is bound to pl {ns, name, id}, with no kind

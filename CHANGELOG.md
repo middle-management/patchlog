@@ -1,5 +1,285 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.81** (previously **v0.77**). v0.78 cut four features and the special cases
+for data written under earlier drafts: a namespace is end-to-end from its creation or never, a
+`gs` holds all the caller's groups, filtered reads cover no branch, and a rule on `/now` never
+passes for a read. v0.79 and v0.80 restructured and split the text with no rule changes. v0.81
+settles the open items: a namespace key `K_n` and view keys, a message bound per key, and E3
+reads the server never folds. `GET /` answers `"spec": "0.81"`. The upgrade was done in six
+packages: encryption, end-to-end and remote branches in the core; access at the origin; the
+grant checker, the tree service and the index; bundles, merges and the WebDAV gateway; the
+`seal` package and the client; and derived views with the candidate vectors. A cross-review
+then ported the playground, and a last package re-seals compressed sealings and takes the
+playground's keys as the Go client does. The schema changes are the core's migration
+`016_v081_encryption`, on SQLite and Postgres, and the derived-view cache's `002_v081_view_keys`
+(SQLite, the cache of the tree service and the index). The tree service and the index have no
+migration. Where the spec leaves a question open, the reference implements the reading noted
+here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.81").
+
+**Upgrading.** Do these in order.
+
+1. **Before upgrading, find namespaces raised to end-to-end by a config write**, and remote
+   branches whose source was raised before their `at` (Addendum E Levels, v0.78). Their
+   content from before the raise has no read path any more, and the E3 paths would serve it in
+   the clear, so the server refuses to start on such a database and names each one.
+   - No reference tool makes that content end-to-end: the bundle importer (v0.26.1 and this
+     release) takes an e2e namespace only under its own name and no plaintext into one, and no
+     reference client re-seals an import (§G.5.1's re-sealing import is a MAY).
+   - To keep a copy, export each with the v0.26.1 tools. To keep it end-to-end, a key holder
+     writes it into a new e2e namespace, with a third-party importer that re-seals it or by
+     recreating the current documents with a client (`CreateDocSealed`). Then purge it, its
+     local branches first. A remote branch is purged and created again against a source that
+     is e2e from its creation.
+   - Or start once with `patchlog serve -purge-raised-e2e` (`core.Options.PurgeRaisedE2E`).
+     It purges them and their local branches at start, destroying their keys and content, and
+     they answer `410 purged`. It records what it will purge before migration 016 drops the
+     marker tables; a start that fails in between leaves the record, and the next start refuses
+     until one with the flag finishes the purges.
+   - Prune archives written for such namespaces hold plaintext revisions from before the raise,
+     which a restore into an e2e namespace skips and an importer refuses for an e2e target. The
+     files are the operator's and stay as they are.
+2. **Before upgrading, migrate E3 keyrings in the format before v0.63** with the v0.26.1 client's
+   `patchlog e2e migrate-keyring`. This release removes that command. `/keys` relays nothing
+   from a keyring that isn't of the §E.3.2 form with a fresh `$nonce` or none, so its readers
+   get no keys; the server lists such keyrings as warnings at start (§E.3.2, v0.78 Legacy).
+   That includes a keyring of the §E.3.2 form whose `$nonce` was written before v0.76, which
+   `migrate-keyring` doesn't rewrite. **After upgrading**, the next keyring write by a v0.81
+   client mends one: `client.E2E` and the playground write a fresh `$nonce` in place of a
+   stored one, so a key holder adds a reader (`AddReader`, even of a reader the keyring has) or
+   rotates (`RotateEpoch`).
+3. **Before upgrading, check rules on `/now` that apply to reads** (office hours, deadlines;
+   §C.2 item 5). Read envelopes carry no `now`. A grant whose block or key-scope rule refers to
+   `/now`, or to the whole envelope, is refused every read (`403`, or `404` at a resource URL
+   of a private namespace). A role with such a rule doesn't count for `read`, and branching
+   under such a grant is `403`. Writes are unchanged. Partial readers also lose filtered access
+   to branches, and `/branches` is `403` for them (below).
+4. **Before upgrading, note stored release plans** whose steps hold a `test` at `""` with a
+   fresh `$nonce`: their digest changes, so they fail closed with `ErrPlanChanged`; plan and
+   approve them again (TOOLS §F.9).
+5. **At upgrade, migrations run.** Core `016_v081_encryption`:
+   - drops `e2e_raises` and `remote_pending_sealings`;
+   - deletes `sealed`, `blob_epochs` and `rev_epochs` rows of end-to-end namespaces (the server
+     seals nothing at E3), and plaintext `snapshots` rows of purged namespaces;
+   - deletes stored namespace log ranges, which were sealed under `K_e` and are sealed again
+     on request under `K_n`, and grant rows keyed `{gid}` (before v0.73, already not served);
+   - adds `kver` to `sealed`, `seal_counts` (the message bound, seeded from the stored
+     sealings and reservations for unsealed revisions; the first start completes it), and a
+     `reason` to `rotations_due`.
+
+   Derived `002_v081_view_keys` deletes the stored sealed views, which are sealed again on
+   demand, so a view at an unchanged `…/at/{at}/…` URL gets new bytes once.
+6. **At upgrade, purge the CDN once:** `ns:{ns}` for every sealed or end-to-end namespace
+   (namespace documents and grants were cached immutable under `K_e` bytes, and E3 fold
+   redirects and `410`s carrying a snapshot were cached long); `r:{ns}/{name}` for E3
+   resources, and for sealed namespaces' resources whose documents or log entries were stored
+   compressed before v0.65 (sealed again, below); `idx:{ns}` for sealed sources' index views;
+   and `ns:{branch}` for branches of covered namespaces (filtered branch ranges, at most 15
+   minutes). Copies of namespace documents and of compressed sealings in browsers
+   and private caches revalidate to `304` on their unchanged `ETag` and then fail closed in
+   v0.81 readers (SPEC-FEEDBACK, Open from v0.81).
+7. **After the first start, read its warnings:** keyrings `/keys` no longer relays (2 above);
+   E3 prune snapshots answered `410 pruned` instead (below); and namespaces purged with
+   `-purge-raised-e2e`, whose schema revisions other namespaces' `$schema` pins now resolve as
+   purged (`422 schema_unavailable` for a write pinning one).
+8. **Upgrade sources before their readers.** A v0.81 remote branch, client or tool can't open a
+   v0.26.1 sealed source's namespace documents, ranges and grants, which v0.26.1 sealed under
+   `K_e`: it fails closed with a decryption error (`seal: decryption failed`,
+   `errors.Is(err, seal.ErrDecrypt)`).
+9. **Expect the tree service's `at` to move once at deploy**, as stopped namespaces leave its
+   combined checkpoint (Services, below): kept listings are judged again, and `g/all` cookies
+   are `403` until exchanged again.
+
+**Security fixes:**
+- **Tree service: a listing's cache key counts only the namespaces its reader reads whole**
+  (§A.4, §B.11.5). Between a namespace's stop and the purge of its listings, a `g/all` reader
+  without `read` on it could be served listings kept from before the stop, with its items,
+  heads and URLs; that window is new with this release's stopped-namespace rule (Services,
+  below). A subject set's reader could be served the same way once a public namespace stopped,
+  as already in v0.26.1. Kept and stored listings of the readers concerned are now computed
+  again under their new keys, and are still purged by tag.
+- **Catalog service: a grant on `/now` gets no read grants or keys** (§C.2 item 5, §B.11.5).
+  `POST /read-grants` (read grants, and keys in a sealed catalog) and `POST /grants` refuse a
+  grant whose block or key-scope rules refer to `/now`, or whose read roles all do: `403
+  forbidden`, `no-store`, before `?min` and body errors, as the tree service refuses its
+  listings. The catalog's API checked only the grant's identity, ignoring its block and key
+  rules, as in v0.26.1; since a rule on `/now` no longer passes any read, ignoring it handed out
+  what every other read refuses. `POST /merge-grants`, which issues write grants only, is
+  unchanged.
+
+**Keys and the message bound** (§E.2.1, §E.2.2, §E.2.6):
+- `K_e` is only HKDF input. Namespace documents, namespace log ranges, long-poll answers,
+  namespace events and grants are sealed under `K_n = HKDF-SHA256(K_e, "patchlog-e2", ns ‖ LF)`
+  (`seal.NamespaceKey`); clients and bundle export derive it. `/keys` still hands out `K_e`
+  or `K_r` only.
+- Namespace documents and grants stored before v0.81 under `K_e` are sealed again under `K_n`
+  of their stored epoch when first served, with the plaintext computed again; the old bytes are
+  never served, and the `ETag` `"{id}.{e}"` stays the same. If that epoch's key is gone, the
+  answer is `500`, saying the row was sealed under an earlier draft's key. Revision documents
+  and log entries (`K_r`) keep their bytes, except those below.
+- A sealed namespace's revision documents and log entries stored compressed (`zip: "DEF"`,
+  before v0.65), which no v0.81 reader opens, are sealed again without compression at first
+  read, under the same `K_r` and with the same `ETag`, the plaintext computed as for a new row
+  (so a genesis entry gains `"parent": ""`). The re-seal counts against the bound. If their
+  epoch's key is gone the answer is `500`, never the compressed bytes.
+- The origin counts its sealings per key (`K_n` of an epoch, each `K_r`), reserving room for
+  what a revision or namespace entry may still have sealed after its epoch ends. A request that
+  would seal past the bound (2³²) is `503 behind` with `Retry-After: 60`, and nothing is
+  sealed. A key of the current epoch reaching 2³¹ makes the namespace's rotation due, which
+  the leader makes as `system:rotate`, frozen namespaces included. The thresholds are
+  `core.Options.SealBound`, `SealRotateAt` and `SealBlock`; `serve` has no flags for them.
+  Reading a sealed revision's document or entry draws on what its write reserved, so filled
+  reservations never make it unreadable.
+- Derived views (tree, catalog and index) are sealed under view keys,
+  `HKDF-SHA256(K_n or K_r, "patchlog-view", view)`: a whole response under `K_n`, an entry or a
+  value of another resource under that resource's `K_r`, `view` the request target exactly as
+  the service's redirect gave it. Services take no key `/keys` relays without a keyring sender
+  they trust, for any epoch of an e2e namespace (§E.2.6 Getting keys).
+- A namespace event's sealed plaintext is the entry object itself, sealed at each serve and
+  never stored.
+
+**End-to-end namespaces** (Addendum E Levels, §7.1, §E.3.1, §G.5.2):
+- A config write raising a namespace to `e2e` is `422 invalid`, by `PATCH`, batch or remote
+  branch; a remote branch's raise is refused before its source is read. Raises to at-rest and
+  sealed are unchanged. Everything for content from before a raise to e2e is gone, at E3 and in
+  remote branches, and `…/blob/{bid}/e/{e}` at E3 is `404 not_offered`.
+- **The server never folds.** `GET /r/{ns}/{name}/rev/{id}` serves a prune's stored snapshot
+  (`200 application/jose`, immutable), and at a tombstone horizon serves it at the tombstone's
+  parent. Any other revision that would be `200` is `404 not_offered` with `horizon`, and with
+  `last` at a tombstone horizon, in the short cache class, for the reader to fold the log from
+  `last`, else `horizon`, else genesis. The `302` with `X-E2E: fold`, the `410` carrying a
+  snapshot and the `X-E2E` header are gone (CORS no longer exposes it).
+- A prune at a tombstone horizon takes a snapshot bound to the tombstone's parent. A stored
+  snapshot bound to the tombstone, or with a pre-v0.63 `pl` kind or `zip`, is never served: its
+  revision answers `410 pruned` with `horizon` and `archive`.
+- `/keys` relays only keyrings of the §E.3.2 form with a fresh `$nonce` or none (Upgrading 2).
+- A remote branch of an E3 source pruned before `at` mirrors the source's stored snapshot
+  verbatim (a strict compact JWE, size-capped, no redirect followed, `pl` and `kid` checked)
+  and answers `/rev` from it; creation was `410`. Where that horizon is a tombstone that is the
+  resource's head at `at`, whose parent the source names nowhere, creation is still `410 pruned`.
+  A source raised to e2e rather than e2e from its
+  creation is `502 upstream` at creation. A source's later raise to e2e is still followed only
+  as far as sealed, recorded for a rebase.
+- Export of an e2e namespace refuses a rev line that is neither the keyring's, one sealed op
+  nor a restore's `[]`, naming it, and e2e namespaces no longer count as protected plaintext
+  (§G.5.1 step 1).
+
+**Access** (§C.2 item 5, §B.11.5, §B.11.9, §A.4):
+- **`/now` for reads** (Upgrading 3). The refusal is part of the read check, so it comes before
+  a purged namespace's `410`, `not_offered` and a partial reader's `302`, and it covers `/keys`.
+  `POST /ns/{ns}/keys` is `403` for a grant whose read roles all have a rule on `/now`. The
+  gestures listing's and the exchange's per-endpoint `/now` cases are gone; the gestures
+  listing is `403` for a grant none of whose roles counts for `read`. In a public namespace the
+  origin still ignores the grant, except at `/keys`.
+- **A `gs` holds every `group:` of the caller**, its `sub` where a trusted catalog has a direct
+  entry for it or the key is sub-scoped, the scope digest and the key subject; "deciding"
+  groups and `"partial"` are gone, at the origin, the index and the tree service alike. So
+  readers with groups no rule named get new subject sets, filtered URLs and prefixes once. A
+  stored subject set holding `"partial"` is `403`: exchange the grants again (core
+  `filtered_gs`, the tree's `edge_subjects`, the index's `g:` markers). The index's scope
+  markers come only from roles that count for `read`.
+- **Filtered reads cover no branch.** A branch's `/ns/{ns}/g/…` URLs answer `403` (`401`
+  without credentials), a partial reader of a branch gets `403` at its unfiltered URLs with no
+  redirect, `POST /edge-grants` issues no `/ns/{branch}/g/` prefix, and a partial reader's
+  `/ns/{ns}/branches` is `403`. A trusted catalog that is a local branch makes nothing visible
+  and is in no checkpoint, an `at` recorded earlier included. The index covers no branch either:
+  a partial reader of one is `403`, and `/_refs` leaves it out.
+
+**Services** (§B.5, §B.7, §B.11.5, §A.4, §E.2.6):
+- Tree service: a grant whose block or key-scope rules refer to `/now`, or whose read roles all
+  do, is refused (`403`) for listings, problems, orphans, manifests and the edge-grant exchange,
+  in public catalogs too; anonymous public URLs are unchanged.
+- Tree service: a namespace it stopped following (keys it lacks, a refusal) is out of the
+  combined checkpoint, so a public catalog's listings stay anonymous-readable without it. Its
+  self-placed nodes leave the graph meanwhile, and explicit placements of its items dangle as
+  `"unfollowed"`; `problems`, `orphans` and `where` don't name them to readers without `read`
+  on it. `at` moves on a stop and when following resumes, and a `g/all` cookie is `403` at an
+  `at` the namespace re-entered.
+- Tree service: an e2e namespace's `born` epoch ignores a `kid` the core serves.
+- Index: a namespace raised to sealed whose keys the index lacks as configured answers `404`
+  and shows as skipped in `/_status` at once, as after a restart, instead of `502`.
+- Index and tree service: a namespace rotated between the service reading its encryption and
+  asking `/keys` for that epoch's key is no longer judged to lack keys. Before, that stopped
+  following it, purged its kept results and stored views, and could leave it unfollowed (`404`)
+  until a restart; the check now reads the encryption again and judges by the current epoch
+  (§E.2.3, §E.2.4, §A.4, §E.2.6). This was so before v0.26.1 too.
+- Catalog service: the `/now` refusal at `POST /grants` and `POST /read-grants` (Security
+  fixes, above).
+
+**Bytes and tools** (§7.1, §7.4, TOOLS §F.3, §F.9, §H.5):
+- A resource log entry always carries `parent` (`""` at genesis) and a namespace entry `prev`
+  (`""` first), in clear pages, events and sealed plaintext. Genesis entries sealed before v0.81
+  without `parent` are served as stored, and readers take an absent `parent` as `""`.
+- A release plan's digest strips a fresh top-level `$nonce` only from an `add` or `replace` at
+  `""` (Upgrading 4).
+- Merge: a document referencing a blob a sealed op can't declare still gets no item and is
+  offered again, now as a defensive check, as no e2e writer should produce one.
+- Rebase: a keyring not in the §E.3.2 form, the namespace's own or its base's, is an error
+  naming the namespace.
+- WebDAV gateway: a folder that carries, sits under or holds `$access` is copied, and may be
+  moved to another tree, each new folder made without `$access`; a move within a tree that
+  widens access is still refused by the catalog service (§B.11.4 Copies). A reader who lists a
+  tree through the tree service can copy a folder too; the copy is refused (`403`) into the
+  folder itself or below it as that reader sees the tree, `403` when the service's `ancestors`
+  answer is cut short, and `503` while the service hasn't caught up with the user's writes.
+  Such a reader still can't delete a folder or move one to another tree (`403`).
+- Already as v0.81 fixes them, now pinned by tests or vectors: every production IV is random;
+  prune archives carry no closure and no `external`; a bundle with authorship members and
+  without `"authors": true` is rejected; Biscuit symbols are judged unused per block; A-labels
+  match in any case; a plan digest's `release` is `/r/{ns}/{name}/rev/{id}`.
+- Test vectors: every candidate in `docs/VECTORS-PROPOSED.md` (P.1–P.7) is confirmed through
+  the reference's code; `docs/TESTVECTORS.md` gains I.7's `K_n` and I.13's grant under `K_n`.
+
+**Client and playground** (§7.1, §E.2.1, §E.2.2, §E.3.1, §E.3.2):
+- E3 reads: `client.E2E` opens `/rev/{id}`'s `200 application/jose` as the stored snapshot of
+  `id`, and on `404 not_offered` folds the log up to `id` from `last`, else `horizon`, else
+  genesis. It no longer follows a fold redirect or reads a snapshot from a `410` body. Any
+  other `200` for a resource of an e2e namespace is refused (`seal.ErrMismatch`).
+- `PruneE2E` at a tombstone horizon, mid-chain included, binds the snapshot to the tombstone's
+  parent, checked against the tombstone however it was learned, and re-pruning at the current
+  tombstone horizon works. Snapshots are sealed under a trusted key of the pruned namespace.
+- No compatibility with earlier drafts (v0.78): `pl` must match exactly, so the pre-v0.63
+  snapshot and namespace-document `pl`s are refused; a JWE with a `zip` header doesn't open
+  (`ErrFormat`), though its header still parses for `ETag`s and detectors; patch sets and
+  snapshots open under `K_r` only, so one sealed under `K_e` (or with `zip`) is flagged and
+  folded as `[]`; keys wrapped under the pre-v0.63 info, keyrings in the format before v0.63
+  and keys relayed without a sender no longer open. Namespace events are opened as the entry
+  object; the pre-v0.73 sealed `purge` and `prune` event form is refused.
+- Keyring writes (`InitKeyring`, `AddReader`, `RotateEpoch`, and the playground's Add reader
+  and Rotate) carry a fresh `$nonce` where the keyring read has one, never the stored one, and
+  none where it has none (§E.3.2, §C.7). A keyring whose `$nonce` was written before v0.76 was
+  copied with it and refused (`422`), so such a namespace could neither add a reader nor
+  rotate (Upgrading 2).
+- Message bound: the client counts sealings under each resource's `K_r` per epoch, from the log
+  (read once per process, on its first sealing for the resource) and its own writes. It
+  reports when rotation is due (`E2E.SealStatus`) and refuses a sealing past the bound
+  (`ErrSealBound`). A count it can't complete (below a pruning horizon, a log it can't read or
+  verify) is marked partial, and a margin of 2³¹ stands for what it can't see.
+- Playground (the browser client `patchlog serve` hosts): opens namespace documents and log
+  ranges under `K_n` and views under view keys; at E3 reads a prune's stored snapshot or folds
+  the log on `404 not_offered`, without `X-E2E`; refuses an e2e document served in the clear
+  (where it knows the namespace is e2e), `zip` JWEs and namespace documents sealed with the
+  pre-v0.63 kind `"config"`; flags patch sets not sealed under `K_r`; and wraps `K_e`, never a
+  derived key, when adding a keyring reader.
+  The History tab reads a pruned resource's log from its horizon, at E3 from the fold's start.
+- Playground: keys are taken from `/keys` and the keyring as the Go client takes them: at E3
+  only keyring entries from a known sender, nothing from a keyring in the format before v0.63 or
+  under the pre-v0.63 wrap info; at E2 no relayed keyring entry. A grant that can't read the
+  namespace document uses the level `/keys` names.
+
+**CLI:**
+- `patchlog serve -purge-raised-e2e` (Upgrading 1).
+- `patchlog e2e migrate-keyring` is removed: it exits with an error pointing to the v0.26.1
+  client. Error messages (the core's `422` for a keyring in the format before v0.63, the bundle
+  importer's refusal of one) no longer advise it as if this version had it.
+- `patchlog e2e seal-status -api URL -ns NS -name NAME [-bearer T] [-json]` reports a
+  resource's `K_r` count, whether it is partial, and whether rotation is due.
+- `patchlog serve -remote-origin-url` no longer has any effect: it only told where to read the
+  start times of a source's epochs from before its raise to e2e. It is still accepted, so
+  command lines keep working, and a start with it logs a warning. `core.RemoteEndpoint.OriginURL`
+  is removed.
+
 ## v0.26.1
 
 Security release. A review of v0.26.0 found leaks in the tree service and the search index

@@ -14,6 +14,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
+	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -502,6 +503,13 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			writePurged(w, head)
 			return
 		}
+	}
+	if err != nil && follow.LacksKey(ctx, err) && ix.lacksKeys(ctx, ns) {
+		// Its document is sealed under keys the index lacks as configured
+		// (a raise to sealed it hasn't applied yet): 404 as once skipped,
+		// never 502 (§A.4 Unavailable namespaces, §E.2.6).
+		writeErr(w, http.StatusNotFound, "not_found", "namespace not indexed")
+		return
 	}
 	if err != nil {
 		ix.writeAccessErr(w, "access check for "+ns, err, "cannot read the namespace configuration")

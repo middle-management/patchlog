@@ -42,11 +42,7 @@ import (
 // epoch, the first time it is read, and served from then on. End-to-end
 // namespaces serve it in the clear, as their logs are, but marked Private:
 // Cache-Control private instead of the immutable class (§9), since a grant
-// shows more than a log entry does; but one first recorded before a raise
-// from sealed stays sealed as before, under the epoch of the entry that
-// first recorded it and the pad setting before the raise, and a branch of
-// the raised namespace serves it as the raised namespace does (Addendum E
-// Levels, preraise.go).
+// shows more than a log entry does.
 
 // GrantDoc is the answer of GET /ns/{ns}/grants/{gid}.
 type GrantDoc struct {
@@ -97,17 +93,9 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 				return jsonv.Canonical(map[string]any{"id": out.ID, "root": out.Root, "stored": out.Stored})
 			})
 		case levelE2E:
-			// Private and no-store for shared caches in either form
-			// (§C.3.1, §9). One first recorded before a raise from sealed
-			// stays sealed, as the namespace that recorded it serves it
-			// (Addendum E Levels, preRaiseGrant).
+			// In the clear, private and no-store for shared caches
+			// (§C.3.1, §9).
 			out.Private = true
-			if m, raise, seq := t.preRaiseGrant(n, id); m != nil {
-				nsRowID = m.id
-				job = t.preRaiseGrantJob(m, raise, id, seq, func() []byte {
-					return jsonv.Canonical(map[string]any{"id": out.ID, "root": out.Root, "stored": out.Stored})
-				})
-			}
 		}
 		return nil
 	})
@@ -125,35 +113,26 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 // longer served.
 func grantSealKey(id ids.ID) string { return id.String() + "/v0.73" }
 
-// grantJob prepares the sealing of grant id as n serves it (§E.2.2).
+// grantJob prepares the sealing of grant id as n serves it, under K_n of
+// the epoch in force at the first entry of n recording it, else the
+// current one (§E.2.2).
 func (t *tx) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
 	j := &sealJob{kind: sealGrant, key: grantSealKey(id)}
-	if t.stored(n, j) {
+	ok, e := t.storedNS(n, j)
+	if ok {
 		return j
 	}
-	e := t.config(n.configSeq).Epoch
-	var seq int64
-	if err := t.QueryRow(`SELECT seq FROM ns_log WHERE grant_id = ? AND ns = ? ORDER BY seq LIMIT 1`, id[:], n.id).Scan(&seq); err == nil {
-		e = t.entryEpoch(n, seq)
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		t.must(err)
+	if !j.reseal { // else fixed by the row stored before v0.81
+		e = t.config(n.configSeq).Epoch
+		var seq int64
+		if err := t.QueryRow(`SELECT seq FROM ns_log WHERE grant_id = ? AND ns = ? ORDER BY seq LIMIT 1`, id[:], n.id).Scan(&seq); err == nil {
+			e = t.entryEpoch(n, seq)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			t.must(err)
+		}
 	}
-	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.GrantPL(n.name, id.String()), plain()
+	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.namespaceKey(n, e), seal.GrantPL(n.name, id.String()), plain()
 	j.pad = t.config(n.configSeq).Pad
-	return j
-}
-
-// preRaiseGrantJob is grantJob for grant id, first recorded by m's entry
-// seq before m's raise from sealed: sealed under that entry's epoch, as
-// at E2, padded as m padded before the raise (Addendum E Levels).
-func (t *tx) preRaiseGrantJob(m *nsRow, raise *e2eRaise, id ids.ID, seq int64, plain func() []byte) *sealJob {
-	j := &sealJob{kind: sealGrant, key: grantSealKey(id)}
-	if t.stored(m, j) {
-		return j
-	}
-	e := t.preRaiseEntryEpoch(m, raise, seq)
-	j.kid, j.k, j.pl, j.plain = seal.Kid(m.name, e), t.epochKey(m.id, e), seal.GrantPL(m.name, id.String()), plain()
-	j.pad = raise.pad
 	return j
 }
 

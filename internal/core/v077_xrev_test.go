@@ -81,6 +81,7 @@ func TestV077XconfScenario112Key(t *testing.T) {
 // Tree-derived access 113 (origin half): after matches-r7 is created,
 // matches edits only catalog-01's maxTtl -> a partial reader of the branch
 // -> filtered /heads 403; the exchange gives no /ns/matches-r7/g/{gs}.
+// Since v0.78 no branch is covered (§B.11.9 Where), before the edit too.
 func TestV077XconfScenario113(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -90,12 +91,12 @@ func TestV077XconfScenario113(t *testing.T) {
 		t.Fatal(err)
 	}
 	r7 := w.li(map[string]any{"ns": []any{"matches-r7"}})
-	red, st := v76fRedirect(t, w, "matches-r7", "", r7)
-	if red == nil {
-		t.Fatalf("branch before: %d", st)
+	if _, st := v76fRedirect(t, w, "matches-r7", "", r7); st != 403 {
+		t.Fatalf("branch before: %d, want 403", st)
 	}
+	gs := v075GS(t, w, w.li())
 	w.patchConfig("matches", map[string]any{"op": "replace", "path": "/keys/1/maxTtl", "value": "PT14M"})
-	if st := v75Status(w.e.FilteredCurrent(ctx, "matches-r7", red.GS, "/heads", r7)); st != 403 {
+	if st := v75Status(w.e.FilteredCurrent(ctx, "matches-r7", gs, "/heads", r7)); st != 403 {
 		t.Errorf("branch after maxTtl edit: %d, want 403", st)
 	}
 	res, err := w.e.IssueEdgeGrants(ctx, []string{r7.Bearer})

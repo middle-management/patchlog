@@ -179,7 +179,7 @@ func TestRemoteBranchE2E(t *testing.T) {
 	k1, k2 := seal.NewKey(), seal.NewKey()
 	kr, _ := seal.BuildKeyringV2(readerPriv, "e", 1, k1, []*ecdh.PublicKey{readerPub})
 	krHead := a.create("e", "keyring", kr.Value(), adminG)
-	d0 := etagOf(a.writeRaw("e", "d", "", sealed(t, k1, "e#1", "e", "d", "", addRoot(map[string]any{"n": 0.0, "t": encMarker})), adminG))
+	d0 := etagOf(a.writeRaw("e", "d", "", sealed(t, resKey(t, k1, "e", "d"), "e#1", "e", "d", "", addRoot(map[string]any{"n": 0.0, "t": encMarker})), adminG))
 	// Rotate: keyring and epoch in one batch.
 	if err := kr.Add(readerPriv, readerPub, "e#2", k2); err != nil {
 		t.Fatal(err)
@@ -188,7 +188,7 @@ func TestRemoteBranchE2E(t *testing.T) {
 		"config": map[string]any{"ifMatch": a.configID("e", adminG), "patches": ops(op("add", "/encryption/epoch", 2.0))},
 		"items":  []any{map[string]any{"resource": "keyring", "ifMatch": krHead, "steps": []any{ops(op("replace", "", kr.Value()))}}}}})
 	expect(t, r, 201)
-	d1 := etagOf(a.writeRaw("e", "d", d0, sealed(t, k2, "e#2", "e", "d", d0, ops(op("replace", "/n", 1.0))), adminG))
+	d1 := etagOf(a.writeRaw("e", "d", d0, sealed(t, resKey(t, k2, "e", "d"), "e#2", "e", "d", d0, ops(op("replace", "/n", 1.0))), adminG))
 	at := a.nsHead("e", adminG)
 
 	var bPriv ed25519.PrivateKey
@@ -221,8 +221,9 @@ func TestRemoteBranchE2E(t *testing.T) {
 			t.Fatalf("entry %d differs", i)
 		}
 	}
-	if r := b.get("/r/rel/d/rev/"+d1, bAdmin); r.Code != 302 || r.H.Get("X-E2E") != "fold" {
-		t.Fatalf("read-through %d %v", r.Code, r.H)
+	// B answers /rev itself, never folding (§7.1, §G.5.2).
+	if r := b.get("/r/rel/d/rev/"+d1, bAdmin); r.Code != 404 || r.Str("code") != "not_offered" {
+		t.Fatalf("read-through %d %v %s", r.Code, r.H, r.Body)
 	}
 	// The keyring reads as a document, and its wrapped keys are relayed
 	// under the base's kids to the grant's enc.
@@ -251,8 +252,8 @@ func TestRemoteBranchE2E(t *testing.T) {
 	}
 	// The branch's own writes are sealed under its own keys and name.
 	kb := seal.NewKey()
-	expect(t, b.writeRaw("rel", "d", d1, sealed(t, kb, "e#2", "e", "d", d1, ops(op("add", "/x", 1.0))), bAdmin), 422)
-	w := b.writeRaw("rel", "d", d1, sealed(t, kb, "rel#1", "rel", "d", d1, ops(op("add", "/x", 1.0))), bAdmin)
+	expect(t, b.writeRaw("rel", "d", d1, sealed(t, resKey(t, kb, "e", "d"), "e#2", "e", "d", d1, ops(op("add", "/x", 1.0))), bAdmin), 422)
+	w := b.writeRaw("rel", "d", d1, sealed(t, resKey(t, kb, "rel", "d"), "rel#1", "rel", "d", d1, ops(op("add", "/x", 1.0))), bAdmin)
 	expect(t, w, 201)
 	if lg := b.get("/r/rel/d/rev/"+etagOf(w)+"/log", bAdmin).Arr(); len(lg) != 3 {
 		t.Fatalf("log after the branch's write %v", lg)
@@ -294,8 +295,9 @@ func TestRemoteBranchE2E(t *testing.T) {
 	}
 }
 
-// History an e2e base pruned can't be mirrored: its horizon is a sealed
-// snapshot.
+// History an e2e base pruned is mirrored from its horizon, with the base's
+// sealed snapshot there, which B serves itself (v0.81 §G.5.2 E3 sources,
+// scenario 66; before v0.81 creation was 410 pruned).
 func TestRemoteBranchE2EPruned(t *testing.T) {
 	t.Parallel()
 	f := newE2E(t, withOrigin(originA), withArchive(t, t.TempDir()))
@@ -311,7 +313,14 @@ func TestRemoteBranchE2EPruned(t *testing.T) {
 	expect(t, a.prune("e", "d", map[string]any{"horizon": d1, "snapshot": snap}, f.adminG), 200) // no retention rule: a * key (§8.6)
 	rt := &route{url: a.srv.URL, bearer: f.readerG}
 	b := newEnv(t, withOrigin(originB), withRemote(rt), withKeyStore(newKeyStore(t)))
-	expectCode(t, b.mkRemote("rel", remoteGenesis("e", a.nsHead("e", f.readerG), e2eDoc(map[string]any{"read": "grant"}))), 410, "pruned")
+	expect(t, b.mkRemote("rel", remoteGenesis("e", a.nsHead("e", f.readerG), e2eDoc(map[string]any{"read": "grant"}))), 201)
+	r := b.get("/r/rel/d/rev/" + d1)
+	if r.Code != 200 || string(r.Body) != snap || r.H.Get("Content-Type") != seal.ContentType {
+		t.Fatalf("B's /rev at A's horizon: %d %v %s", r.Code, r.H, r.Body)
+	}
+	// History below A's horizon isn't mirrored: B never learns its ids,
+	// as for a base that isn't e2e (§G.3).
+	expect(t, b.get("/r/rel/d/rev/"+d0), 404)
 }
 
 // If B can read A's logs but not A's namespace document at at, it can't
@@ -371,14 +380,14 @@ func TestRemoteBranchE2EChain(t *testing.T) {
 	ke, kb := seal.NewKey(), seal.NewKey()
 	kre, _ := seal.BuildKeyringV2(readerPriv, "e", 1, ke, []*ecdh.PublicKey{readerPriv.PublicKey()})
 	krHead := a.create("e", "keyring", kre.Value(), g)
-	d0 := etagOf(a.writeRaw("e", "d", "", sealed(t, ke, "e#1", "e", "d", "", addRoot(map[string]any{"d": encMarker})), g))
-	g0 := etagOf(a.writeRaw("e", "g", "", sealed(t, ke, "e#1", "e", "g", "", addRoot(map[string]any{"g": 0.0})), g))
+	d0 := etagOf(a.writeRaw("e", "d", "", sealed(t, resKey(t, ke, "e", "d"), "e#1", "e", "d", "", addRoot(map[string]any{"d": encMarker})), g))
+	g0 := etagOf(a.writeRaw("e", "g", "", sealed(t, resKey(t, ke, "e", "g"), "e#1", "e", "g", "", addRoot(map[string]any{"g": 0.0})), g))
 	expect(t, a.branch("e", map[string]any{"name": "eb"}, g), 201)
 	// The branch's own keyring (on the base's as a foreign parent) and a
 	// write of its own on top of the base's content.
 	krb, _ := seal.BuildKeyringV2(readerPriv, "eb", 1, kb, []*ecdh.PublicKey{readerPriv.PublicKey()})
 	a.appendRev("eb", "keyring", krHead, ops(op("replace", "", krb.Value())), g)
-	g1 := etagOf(a.writeRaw("eb", "g", g0, sealed(t, kb, "eb#1", "eb", "g", g0, ops(op("add", "/b", true))), g))
+	g1 := etagOf(a.writeRaw("eb", "g", g0, sealed(t, resKey(t, kb, "eb", "g"), "eb#1", "eb", "g", g0, ops(op("add", "/b", true))), g))
 	at := a.nsHead("eb", g)
 
 	var bPriv ed25519.PrivateKey

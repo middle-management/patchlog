@@ -3,11 +3,8 @@ package catvis_test
 import (
 	"crypto/ed25519"
 	"encoding/base64"
-	"reflect"
 	"testing"
 
-	"github.com/middle-management/patchlog/internal/catvis"
-	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
@@ -32,41 +29,4 @@ func v076V03Matches(t *testing.T, edRules string) *grantcheck.Config {
 		t.Fatal(err)
 	}
 	return cfg
-}
-
-// §B.11.5 deciding subjects: "a rule of any role or key of a content
-// namespace it trusts", not only the catalog's keys (v0.76).
-func TestV076V03ProfileEveryKey(t *testing.T) {
-	t.Parallel()
-	docs := map[string]any{
-		"root":          map[string]any{"parents": []any{}, "$access": acc("group:editors", "reader")},
-		"matches.derby": map[string]any{"parents": parents("root")},
-	}
-	li := grant.Principal{ID: "user:li", Groups: []string{"editors", "staff"}}
-
-	pos := `[{"op":"test","path":"/principal/groups","schema":{"contains":{"const":"staff"}}}]`
-	p := seedCatalog(t, v076V03Matches(t, pos), docs).Profile()
-	if !p.Groups["staff"] || p.KeepAll || p.SubScoped {
-		t.Fatalf("positive key rule: %+v", p)
-	}
-	if got := catvis.ListingSubjects(p, li); !reflect.DeepEqual(got, []string{"group:editors", "group:staff"}) {
-		t.Errorf("ListingSubjects %v", got)
-	}
-
-	// A negated test of the other key keeps every group.
-	neg := `[{"not":{"op":"test","path":"/principal/groups","schema":{"contains":{"const":"staff"}}}}]`
-	p = seedCatalog(t, v076V03Matches(t, neg), docs).Profile()
-	if !p.KeepAll {
-		t.Fatalf("negated key rule: %+v", p)
-	}
-	bo := grant.Principal{ID: "user:bo", Groups: []string{"editors", "interns"}}
-	if got := catvis.ListingSubjects(p, bo); !reflect.DeepEqual(got, []string{"group:editors", "group:interns"}) {
-		t.Errorf("KeepAll ListingSubjects %v", got)
-	}
-
-	// A sub scope decides only on the catalog's own key.
-	sub := `[],"sub":"user:.*"`
-	if p := seedCatalog(t, v076V03Matches(t, sub), docs).Profile(); p.SubScoped {
-		t.Errorf("another key's sub scope: %+v", p)
-	}
 }

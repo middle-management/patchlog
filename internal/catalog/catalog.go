@@ -48,7 +48,11 @@
 // revocations and scopes as of the catalog's head). Its root sub and groups
 // are the caller's identity (§B.11.6: groups come from the caller's grant,
 // the identity provider's; there is no groups namespace). The grant's verbs
-// don't matter for the catalog's API: it is only proof of identity.
+// don't matter for the catalog's API: it is only proof of identity. But
+// POST /grants and POST /read-grants hand out read decisions and read
+// grants, so a grant whose rules refer to /now, which no read passes, is
+// refused there (403), as the tree service refuses it its listings (§C.2
+// item 5, authenticateRead); POST /merge-grants issues write grants only.
 //
 // Decisions (POST /grants, POST /read-grants, POST /merge-grants) are
 // taken at one checkpoint, which answers carry beside the grant, and a
@@ -88,7 +92,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -728,8 +731,8 @@ func callerOf(v *grant.Verified) who {
 
 // whoOf is a subject set's caller (§B.11.5), and the groups among its
 // subjects, as the grant had them (for /principal/groups). Subjects other
-// than group: and user: ones, such as "partial", are ignored, as catvis
-// ignores them.
+// than group: and user: ones are ignored, as catvis ignores them (a
+// stored set holding "partial" is refused before, by the tree service).
 func whoOf(subjects []string) (who, []string) {
 	w := who{subs: map[string]bool{}}
 	var groups []string
@@ -797,12 +800,9 @@ func (s *Service) frozenRolesFor(name string, subs map[string]bool) map[string]b
 }
 
 // Resolve implements tree.RoleView: listings are keyed by the caller's
-// deciding subjects (§B.11.5, keyedAt): its group subjects that the
-// catalog's $access, or a role or key rule of a content namespace it
-// trusts, names (all of them where such a rule tests /principal/groups
-// otherwise than positively by value), plus "partial" if that left one
-// out, and its user subject only if the catalog has direct entries for
-// that user, or its key in a content namespace it trusts has a sub scope.
+// subject set (§B.11.5, keyedAt): every one of its group subjects, and its
+// user subject only if the catalog has direct entries for that user, or
+// its key in a content namespace it trusts has a sub scope.
 // They are filtered by the visibility test of that subject set alone
 // (ForSubjects), since every reader with it shares the listing.
 //
@@ -820,17 +820,17 @@ func (s *Service) Resolve(ctx context.Context, v *grant.Verified) ([]string, tre
 }
 
 // keyedAt is the subject set Resolve keys v's listings by, as of the
-// checkpoint g reflects (catvis.ListingSubjects). A group it leaves out
-// can't change what the set sees there: no $access entry names it, and
-// rules test it only by positive tests of other groups. Call it under
-// View.
+// checkpoint g reflects (catvis.ListingSubjects): no group is left out,
+// and the sub is in it only where that checkpoint's direct entries or
+// sub-scoped key put it. Call it under View.
 func (s *Service) keyedAt(g *tree.Graph, v *grant.Verified) []string {
 	return s.Profile(g).Subjects(v)
 }
 
-// Profile implements tree.Profiler: the catalog's deciding inputs as of
-// the checkpoint g reflects (catvis.Profile), which key listings there
-// (§B.11.5). Call it under View.
+// Profile implements tree.Profiler: what of a caller beyond its groups
+// keys listings as of the checkpoint g reflects (catvis.Profile: its sub
+// where direct entries or a sub-scoped key make it count, §B.11.5). Call
+// it under View.
 func (s *Service) Profile(g *tree.Graph) tree.Profile {
 	return listingProfile{s.catalogOf(g).Profile()}
 }
@@ -838,20 +838,10 @@ func (s *Service) Profile(g *tree.Graph) tree.Profile {
 // listingProfile is a catvis.Profile as tree.Profile.
 type listingProfile struct{ p catvis.Profile }
 
-// Subjects is v's deciding subjects, with "partial" if they leave out a
-// group (catvis.ListingSubjects).
+// Subjects is v's subject set at that checkpoint
+// (catvis.ListingSubjects).
 func (l listingProfile) Subjects(v *grant.Verified) []string {
 	return catvis.ListingSubjects(l.p, v.Principal)
-}
-
-// Admits refuses a subject set holding "partial" where every group is
-// kept: a group it left out may now decide, through a rule testing the
-// groups otherwise than positively by value, so the set could see what
-// the reader's groups hide from it. It is 403 there until the reader
-// exchanges again (§B.11.5). Elsewhere a group named since it was keyed
-// only shows the set less, never more.
-func (l listingProfile) Admits(subjects []string) bool {
-	return !l.p.KeepAll || !slices.Contains(subjects, catvis.Partial)
 }
 
 // ForSubjects implements tree.RoleView for a reader whose edge grant is

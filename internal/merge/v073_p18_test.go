@@ -99,11 +99,12 @@ func legacyKeyringTransport(body []byte, nss ...string) http.RoundTripper {
 	})
 }
 
-// P18 review: a base whose keyring is still in the format before v0.63
-// doesn't block rebasing an e2e branch with a keyring of its own: the
-// keyring a namespace reads through from its base isn't its own, legacy
-// or not. A branch whose own keyring is in that format is refused with
-// the namespace to migrate named.
+// P18 review, v0.78 ("Reading this spec": no compatibility with data from
+// earlier drafts): a keyring in the format before v0.63 isn't read at all,
+// so a rebase is refused whether the keyring is the branch's own or one a
+// namespace reads through from its base, naming the namespace and the
+// remedy (wrap it again with the v0.26.1 client before upgrading).
+// Formerly a base's legacy keyring counted as none.
 func TestV073RebaseUnderLegacyKeyrings(t *testing.T) {
 	t.Parallel()
 	ks, err := keystore.New(keystore.Generate())
@@ -125,22 +126,21 @@ func TestV073RebaseUnderLegacyKeyrings(t *testing.T) {
 	}
 	legacy, _ := json.Marshal(must(seal.BuildKeyring("m", 1, km, []*ecdh.PublicKey{priv.PublicKey()})).Value())
 
-	// m's keyring, and so the one r7b reads through when created, legacy.
+	// m's keyring, and so the one r7b reads through when created, legacy:
+	// refused, naming r7b, which reads it through.
 	c2 := s.Client(t, client.WithAuthor("alice"), client.WithHTTPClient(&http.Client{Transport: legacyKeyringTransport(legacy, "m", "r7b")}))
 	x2 := c2.E2E(priv)
-	res, err := merge.Rebase(ctx, c2, merge.RebaseOptions{Branch: "r7", New: "r7b", Switch: true, Plan: merge.Options{E2E: x2}})
-	noErr(t, err)
-	if !res.Switched {
-		t.Fatalf("rebase under a legacy base keyring: %+v", res)
+	_, err = merge.Rebase(ctx, c2, merge.RebaseOptions{Branch: "r7", New: "r7b", Switch: true, Plan: merge.Options{E2E: x2}})
+	if err == nil || !errors.Is(err, seal.ErrFormat) || !strings.Contains(err.Error(), "keyring of r7b is not in the §E.3.2 form") || !strings.Contains(err.Error(), "v0.26.1") {
+		t.Fatalf("rebase under a legacy base keyring: %v", err)
 	}
-	sameDoc(t, (&e3env{t: t, c: c, x: x, priv: priv}).doc("r7b", "derby"), map[string]any{"title": "Derby", "score": "1-0"})
 
 	// r8's own keyring legacy: refused, naming r8.
 	k8 := must(x.Key(ctx, "r8#1"))
 	legacy8, _ := json.Marshal(must(seal.BuildKeyring("r8", 1, k8, []*ecdh.PublicKey{priv.PublicKey()})).Value())
 	c3 := s.Client(t, client.WithAuthor("alice"), client.WithHTTPClient(&http.Client{Transport: legacyKeyringTransport(legacy8, "r8")}))
 	_, err = merge.Rebase(ctx, c3, merge.RebaseOptions{Branch: "r8", New: "r8b", Plan: merge.Options{E2E: c3.E2E(priv)}})
-	if err == nil || !strings.Contains(err.Error(), "migrate-keyring -ns r8") {
+	if err == nil || !errors.Is(err, seal.ErrFormat) || !strings.Contains(err.Error(), "keyring of r8 is not in the §E.3.2 form") || !strings.Contains(err.Error(), "v0.26.1") {
 		t.Fatalf("rebase of a branch whose own keyring is legacy: %v", err)
 	}
 }

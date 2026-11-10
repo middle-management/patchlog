@@ -802,7 +802,7 @@ func (st *reqState) svcEntry(ctx context.Context, cat string, e svcItem) (treeEn
 }
 
 // svcAnswer is a listing page (children, with total; roots; a lookup's
-// node), or the tree service's error (§12).
+// node; a node's ancestors), or the tree service's error (§12).
 type svcAnswer struct {
 	At       string    `json:"at"`
 	Children []svcItem `json:"children"`
@@ -812,6 +812,12 @@ type svcAnswer struct {
 	Next     string    `json:"next"`
 	Code     string    `json:"code"`
 	Message  string    `json:"message"`
+
+	// An ancestors answer's paths, root first, and whether it was cut
+	// (§B.5 "Shared nodes in DAGs"; notCopiedInto).
+	Paths     [][]svcItem `json:"paths"`
+	Truncated bool        `json:"truncated"`
+	TooDeep   int         `json:"tooDeep"`
 }
 
 // svcList reads the children of folder in catalog cat from its tree

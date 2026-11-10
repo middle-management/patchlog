@@ -666,8 +666,9 @@ async function refreshRes() {
   const r = await api('GET', rpath(), { auto: true });
   if (ns !== S.ns || res !== S.res) return;
   let st;
-  if (r.status === 200) {
-    st = { kind: 'live', head: r.hdr('X-Revision') || r.etag() || foldTarget(r.finalPath), via: r.finalPath };
+  if (r.status === 200 || notOffered(r)) {
+    // At E3 the head redirects to /rev/{head}, which is not_offered unless a prune stored its snapshot (§7.1).
+    st = { kind: 'live', head: r.hdr('X-Revision') || r.etag() || revTarget(r.finalPath), via: r.finalPath };
     Object.assign(st, await readDoc(ns, res, st.head, r));
   } else if (r.status === 410 && r.json && r.json.tombstone) st = { kind: 'tomb', head: r.json.tombstone, last: r.json.last };
   else if (r.status === 410) st = { kind: 'purged' };
@@ -678,7 +679,7 @@ async function refreshRes() {
   if (st.kind === 'tomb' && st.last) {
     const lr = await api('GET', rpath(`/rev/${st.last}`), { auto: true });
     if (ns !== S.ns || res !== S.res) return;
-    if (lr.status === 200) { const d = await readDoc(ns, res, st.last, lr); st.lastDoc = d.doc; st.seal = d.seal; st.fold = d.fold; st.foldErr = d.foldErr; }
+    if (lr.status === 200 || notOffered(lr)) { const d = await readDoc(ns, res, st.last, lr); st.lastDoc = d.doc; st.seal = d.seal; st.fold = d.fold; st.foldErr = d.foldErr; }
   }
   renderResAll();
   if (!S.ifDirty) $('ifMatch').value = st.head || '';
@@ -811,8 +812,15 @@ async function loadHistory() {
   const st = S.resState;
   if (!st || !st.head) { S.hist = []; renderHistory(); return; }
   const { ns, res } = S;
-  const r = await api('GET', rpath(`/rev/${st.head}/log`), { auto: true });
+  let r = await api('GET', rpath(`/rev/${st.head}/log`), { auto: true });
   if (ns !== S.ns || res !== S.res) return;
+  // Below a pruning horizon the range from genesis is 410 pruned (§7.1): read it from the horizon, or at E3 from
+  // where the head's fold started, which at a tombstone horizon is last, its parent, whose snapshot /rev serves.
+  if (r.status === 410 && r.json && r.json.code === 'pruned' && ID_RE.test(r.json.horizon || '')) {
+    const since = (st.fold && st.fold.since) || r.json.horizon;
+    r = await api('GET', rpath(`/rev/${st.head}/log?since=${since}`), { auto: true });
+    if (ns !== S.ns || res !== S.res) return;
+  }
   // Every page of the range (§7.1 Paging).
   const L = r.status === 200 && Array.isArray(r.json) ? await readLogRange(r, { auto: true }) : { arr: [], since: '', err: '' };
   if (ns !== S.ns || res !== S.res) return;
@@ -886,7 +894,7 @@ async function selectRev(id) {
   if (entry._plain) parts.push(h('h3', {}, 'Patches (decrypted in this browser)'), jsonPre(entry._plain), h('details', {}, h('summary', { class: 'muted small' }, 'sealed patch set as stored (ids are over this ciphertext)'), jsonPre(entry.patches)));
   else if (entry.patches) parts.push(h('h3', {}, 'Patches'), jsonPre(entry.patches));
   if (entry._raw) parts.push(h('details', {}, h('summary', { class: 'muted small' }, 'log entry as served (JWE)'), jsonPre(entry._raw)));
-  if (r.status === 200) {
+  if (r.status === 200 || notOffered(r)) {
     const d = await readDoc(S.ns, S.res, id, r);
     if (S.selRev !== id) return;
     if (d.fold) parts.push(h('h3', { style: 'margin-top:8px' }, 'Document at this revision (folded in this browser)'), foldSummary(d.fold), jsonPre(d.doc), blobsPanel(d.doc));
@@ -1204,8 +1212,8 @@ async function undoReadRes(ns, site) {
   const name = site.resource;
   const hr = await api('GET', `/r/${ns}/${name}`, { auto: true, label: 'undo' });
   let head, headKind;
-  // An e2e head redirects to its log (§E.3), whose target is the head.
-  if (hr.status === 200) { head = hr.hdr('X-Revision') || hr.etag() || foldTarget(hr.finalPath); headKind = 'live'; }
+  // An e2e head redirects to /rev/{head}, not_offered unless a prune stored its snapshot (§7.1).
+  if (hr.status === 200 || notOffered(hr)) { head = hr.hdr('X-Revision') || hr.etag() || revTarget(hr.finalPath); headKind = 'live'; }
   else if (hr.status === 410 && hr.json && hr.json.tombstone) { head = hr.json.tombstone; headKind = 'tomb'; }
   else if (hr.status === 410) throw Object.assign(new Error(name + ' is purged'), { impossible: 'purged', resource: name });
   else throw new Error(`reading ${name} answered ${hr.status}`);
@@ -1232,7 +1240,7 @@ async function undoReadRes(ns, site) {
   if (since) {
     const r = await api('GET', `/r/${ns}/${name}/rev/${since}`, { auto: true, label: 'undo' });
     if (r.status === 410) throw Object.assign(new Error(`the document at ${short(since)} is gone`), { impossible: 'pruned', resource: name });
-    if (r.status !== 200) throw new Error(`the document at ${short(since)} answered ${r.status}`);
+    if (r.status !== 200 && !notOffered(r)) throw new Error(`the document at ${short(since)} answered ${r.status}`);
     const d = await readDoc(ns, name, since, r);
     if (d.doc == null) throw new Error(`the document at ${short(since)} did not open` + (d.seal && d.seal.error ? ': ' + d.seal.error : ''));
     start = { doc: d.doc, exists: true, deleted: false };
@@ -1652,22 +1660,29 @@ async function nsInfo(ns) {
 }
 
 /* takeKeys stores the entries of a POST /ns/{ns}/keys answer, { kid, name?, from?, wrapped } or { kid, name?, key }
- * (§E.2.3; servers before v0.63 said resource for name): raw keys, or keys wrapped to the grant's enc. An e2e relay
- * passes on keyring entries with their from, which open only with a sender this browser knows (knownKeys), and those
- * of a keyring stored before v0.63 as stored; an entry that doesn't open is skipped (anyone can wrap to a thumbprint,
- * §E.3.2), leaving the keyring. */
-async function takeKeys(arr) {
+ * (§E.2.3; servers before v0.63 said resource for name, which internal/client reads too), of a namespace at level, as
+ * internal/client takes them. At E3 (client.E2E) only the keyring entries the server relays, each naming its sender in
+ * from, which open only with a sender this browser knows (knownKeys): a key in the clear or one wrapped without from
+ * has no sender, so the server can have made it up, and E3 has no per-resource keys; those are skipped, for reads
+ * too (§E.3.2, v0.78: a namespace is e2e from its creation, so no epoch of it was ever served as at E2). At E2
+ * (client.Keys) raw keys and keys wrapped to the grant's enc in base mode, and no relayed keyring entry. At a level
+ * neither the namespace document nor the answer names, nothing: the two rules don't overlap. An entry that doesn't
+ * open is skipped (anyone can wrap to a thumbprint, §E.3.2), leaving the keyring. */
+async function takeKeys(arr, level) {
+  const e2e = level === 'e2e';
+  if (!e2e && level !== 'sealed') return 0;
   let n = 0;
   for (const e of arr || []) {
     if (!e || typeof e.kid !== 'string') continue;
     const res = e.name || e.resource || '';
+    if (e2e ? res || typeof e.key === 'string' || typeof e.from !== 'string' || !e.from : typeof e.key !== 'string' && 'from' in e) continue;
     let key, from = 'POST /keys (raw)';
     if (typeof e.key === 'string') key = Z.unb64u(e.key);
     else if (typeof e.wrapped === 'string') {
       if (e.suite && e.suite !== Z.SUITE) continue;
       if (!ID) throw new Error('the keys are wrapped to the grant\'s enc: import that identity in the Keys tab');
-      try { key = await Z.unwrapRelayedKey(ID, e, e.from ? knownKeys() : []); } catch (_) { continue; }
-      from = 'POST /keys (HPKE-wrapped)';
+      try { key = await Z.unwrapRelayedKey(ID, e, e2e ? knownKeys() : []); } catch (_) { continue; }
+      from = e2e ? 'POST /keys (keyring entry)' : 'POST /keys (HPKE-wrapped)';
     } else continue;
     if (key.length !== 32) continue;
     if (res) holdRes(e.kid, res, key, from); else holdEpoch(e.kid, key, from);
@@ -1676,14 +1691,14 @@ async function takeKeys(arr) {
   return n;
 }
 
-/* keyringKey unwraps an e2e epoch key from the namespace's keyring with this identity (§E.3.2). */
+/* keyringKey unwraps an e2e epoch key from the namespace's keyring with this identity, from a sender this browser
+ * knows (§E.3.2). Nothing opens from a keyring in the format before v0.63, as in internal/client (v0.78 Legacy). */
 async function keyringKey(ns, epoch) {
   if (!ID) throw new Error('no identity: generate or import one in the Keys tab');
   const r = await api('GET', `/r/${ns}/keyring`, { auto: true, label: 'keyring' });
   if (r.status !== 200 || !r.json) throw new Error(`no keyring in ${ns} (GET answered ${r.status})`);
-  const key = Z.isKeyringV2(r.json)
-    ? await Z.keyringV2EpochKey(Z.parseKeyringV2(r.json), ID, Z.kid(ns, epoch), knownKeys())
-    : await Z.keyringEpochKey(Z.parseKeyring(r.json), ID, epoch);
+  if (!Z.isKeyringV2(r.json)) throw new Error(`the keyring of ${ns} is not in the §E.3.2 form: nothing opens from it (a key holder wraps it again with the v0.26.1 client's patchlog e2e migrate-keyring; v0.81 has no such tool)`);
+  const key = await Z.keyringV2EpochKey(Z.parseKeyringV2(r.json), ID, Z.kid(ns, epoch), knownKeys());
   holdEpoch(Z.kid(ns, epoch), key, 'keyring (HPKE-wrapped)');
   return key;
 }
@@ -1696,14 +1711,31 @@ async function fetchKeyFor(kid, resource) {
     const body = { epochs: [epoch] };
     if (resource && info.level !== 'e2e') body.resources = [resource];
     const r = await api('POST', `/ns/${ns}/keys`, { body, auto: true, label: 'keys' });
-    if (r.ok && r.json) await takeKeys(r.json.keys);
+    // A grant that can't read the namespace document (§C.5) learns the level from the answer (§E.2.3).
+    const level = info.level || (r.json && typeof r.json.level === 'string' ? r.json.level : '');
+    if (r.ok && r.json) await takeKeys(r.json.keys, level);
     if (KEYS.epoch.has(kid) || (resource && KEYS.res.has(kid + '\n' + resource))) return;
-    if (info.level !== 'e2e') throw new Error(`POST /ns/${ns}/keys gave no key for ${kid}${resource ? ' / ' + resource : ''} (HTTP ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''})`);
+    if (level !== 'e2e') throw new Error(`POST /ns/${ns}/keys gave no key for ${kid}${resource ? ' / ' + resource : ''} (HTTP ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''})`);
   }
   await keyringKey(ns, epoch);
 }
 
-/* contentKey returns K_e (resource "") or K_r for kid, fetching it once if needed. */
+/* epochKey returns K_e of kid, fetching it once if needed. K_e itself seals nothing (§E.2.1): it is the input of
+ * K_n and K_r, and what a keyring entry wraps (§E.3.2). Content is opened with contentKey. */
+async function epochKey(kid) {
+  if (!KEYS.epoch.has(kid)) {
+    const rk = kid + '\n';
+    if (!KEYS.pending.has(rk)) KEYS.pending.set(rk, fetchKeyFor(kid, '').finally(() => KEYS.pending.delete(rk)));
+    await KEYS.pending.get(rk);
+  }
+  const ke = KEYS.epoch.get(kid);
+  if (!ke) throw new Error('no key for ' + kid);
+  return ke;
+}
+
+/* contentKey returns the key content of kid is sealed under (§E.2.1): for resource "" the namespace key
+ * K_n = HKDF(K_e, "patchlog-e2", ns ‖ "\n") (namespace documents, log ranges, events and grants), else the
+ * resource's K_r, fetching K_e or K_r once if needed. */
 async function contentKey(kid, resource) {
   const rk = kid + '\n' + (resource || '');
   if (resource && KEYS.res.has(rk)) return KEYS.res.get(rk);
@@ -1714,19 +1746,22 @@ async function contentKey(kid, resource) {
   }
   const ke = KEYS.epoch.get(kid);
   if (!ke) throw new Error('no key for ' + kid);
-  if (!resource) return ke;
-  const kr = await Z.resourceKey(ke, Z.parseKid(kid).ns, resource);
+  const ns = Z.parseKid(kid).ns;
+  if (!resource) return Z.namespaceKey(ke, ns);
+  const kr = await Z.resourceKey(ke, ns, resource);
   holdRes(kid, resource, kr, 'derived from ' + kid);
   return kr;
 }
 
-/* nsDocPL is the pl wanted of namespace ns's sealed document id: { ns, id, kind: "doc" } (§E.2.2), or for bytes
- * sealed before v0.63, which readers still accept, kind "config". Every reader of a namespace document uses it. */
+/* nsDocPL is the pl wanted of namespace ns's sealed document id: { ns, id, kind: "doc" } (§E.2.2). Bytes sealed
+ * under earlier drafts (kind "config", before v0.63) don't open (v0.78). Every reader of a namespace document uses it. */
 function nsDocPL(ns, id) {
-  return (hd) => ({ ns, id, kind: hd.pl && hd.pl.kind === 'config' ? 'config' : 'doc' });
+  return { ns, id, kind: 'doc' };
 }
 
-/* openSealed decrypts a JWE of namespace ns after checking its kid and pl against what was asked for. */
+/* openSealed decrypts a JWE of namespace ns after checking its kid and pl against what was asked for: under the
+ * resource's K_r, or for resource "" the namespace's K_n, or where pl names a view (SERVICES.md §E.2.6), under that
+ * key's view key for the view asked for. */
 async function openSealed(ns, jwe, resource, wantPL) {
   const { header } = Z.parseJWE(jwe);
   const k = Z.parseKid(header.kid);
@@ -1737,9 +1772,12 @@ async function openSealed(ns, jwe, resource, wantPL) {
     { ok: !diff.length, what: diff.length ? `pl differs from the request in ${diff.join(', ')}: got ${Z.canonical(header.pl)}, want ${Z.canonical(want)}` : `pl ${Z.canonical(header.pl)} matches the request` },
   ];
   if (checks.some((c) => !c.ok)) throw Object.assign(new Error(checks.filter((c) => !c.ok).map((c) => c.what).join('; ')), { checks, header });
-  const key = await contentKey(header.kid, resource);
+  const view = want && typeof want.view === 'string' ? want.view : null;
+  let key = await contentKey(header.kid, resource);
+  if (view !== null) key = await Z.viewKey(key, view);
   const o = await Z.openJWE(jwe, key);
-  checks.push({ ok: true, what: `decrypted with ${resource ? 'K_r(' + k.ns + ', ' + resource + ')' : 'K_e'} of ${header.kid}` + (header.zip ? ', inflated' : '') + (/ +$/.test(o.text) ? ', padded' : '') });
+  const kname = resource ? 'K_r(' + k.ns + ', ' + resource + ')' : 'K_n(' + k.ns + ')';
+  checks.push({ ok: true, what: `decrypted with ${view !== null ? 'the view key of ' + kname : kname} of ${header.kid}` + (/ +$/.test(o.text) ? ', padded' : '') });
   let value = o.text;
   try { value = JSON.parse(o.text); } catch (_) { /* not JSON */ }
   return { header, kid: header.kid, text: o.text, value, checks };
@@ -1868,27 +1906,50 @@ async function openEntries(ns, name, arr, last, since) {
   return out;
 }
 
-/* ---- e2e (E3) folding, as internal/client/e2e.go ---- */
-function foldTarget(path) { return (/\/rev\/(1[a-z2-7]{32})\/log(?:\?|$)/.exec(path || '') || [])[1] || ''; }
+/* ---- e2e (E3) reads and folding, as internal/client/e2e.go (DocE2E) ---- */
+/* revTarget is the id of a …/rev/{id} path, such as a head's redirect target, '' for any other. */
+function revTarget(path) { return (/\/rev\/(1[a-z2-7]{32})(?:\?|$)/.exec(path || '') || [])[1] || ''; }
 
-/* readDoc turns a 200 answer for a document into { doc, seal?, fold?, foldErr?, raw? }. */
-async function readDoc(ns, name, id, r) {
-  if (foldTarget(r.finalPath) && Array.isArray(r.json)) {
-    // The fold redirect's range, page by page (§7.1).
-    const L = await readLogRange(r, { auto: true });
+/* notOffered reports the E3 answer for a document the server would have to fold: 404 not_offered at …/rev/{id},
+ * naming the resource's horizon and, where that is a tombstone, last, its parent (§7.1). A plain 404 isn't one. */
+function notOffered(r) { return !!r && r.status === 404 && !!r.json && r.json.code === 'not_offered' && !!revTarget(r.finalPath); }
+
+/* readDoc turns the answer r for the document at id, a 200 or at E3 a 404 not_offered, into { doc, seal?, fold?,
+ * foldErr?, raw? }. At E3 the server never folds (§7.1): /rev/{id} serves a prune's stored snapshot (200
+ * application/jose), and is otherwise not_offered, and the reader folds the log up to id from last, else horizon,
+ * whose snapshot /rev/{start} serves, else from genesis. A 200 in the clear for a resource of an e2e namespace (its
+ * keyring aside) is refused, never shown as the document. */
+async function readDoc(ns, name, id, r, retried) {
+  if (notOffered(r)) {
+    const since = r.json.last || r.json.horizon || '';
     try {
+      if (since && (typeof since !== 'string' || !ID_RE.test(since))) throw new Error(`not_offered names ${JSON.stringify(since)} to fold from, which is no revision id`);
+      // The range up to id after since, page by page (§7.1).
+      const lr = await api('GET', `/r/${ns}/${name}/rev/${id}/log` + (since ? '?since=' + since : ''), { auto: true, label: 'fold' });
+      if (lr.status === 410 && lr.json && lr.json.code === 'pruned' && !retried) {
+        // A prune moved the horizon past the range meanwhile: ask /rev/{id} again, once.
+        return readDoc(ns, name, id, await api('GET', `/r/${ns}/${name}/rev/${id}`, { auto: true, label: 'fold' }), true);
+      }
+      if (lr.status !== 200) throw new Error(`the log to fold after ${since ? short(since) : 'genesis'} answered ${lr.status}`);
+      const L = await readLogRange(lr, { auto: true });
       if (L.err) throw new Error(L.err);
-      const f = await foldLog(ns, name, id, L.since, L.arr);
+      const f = await foldLog(ns, name, id, since, L.arr);
       return { doc: f.value, fold: f };
     } catch (err) { return { doc: null, foldErr: err.message, raw: r.text }; }
   }
-  if (r.hdr('X-E2E') === 'snapshot') {
-    // An E3 pruning horizon: /rev/{H} serves the prune's sealed snapshot (§7.1 Paging, §8.6).
+  if (r.status !== 200) return { doc: null, foldErr: `HTTP ${r.status}` + (r.json && r.json.code ? ' ' + r.json.code : ''), raw: r.text };
+  const e2e = name !== 'keyring' && (await nsInfo(ns)).level === 'e2e';
+  let pl = null;
+  if (r.jose) { try { pl = Z.parseJWE(r.text.trim()).header.pl; } catch (_) { /* reported when it is opened */ } }
+  if (r.jose && (e2e || (name !== 'keyring' && pl && pl.kind === undefined))) {
+    // A prune's stored snapshot (pl { ns, name, id }, no kind): the document of id, at the horizon or at a
+    // tombstone horizon's parent (§8.6, §E.3.1). A grant that can't read the namespace document tells it by its pl.
     try {
       const d = await openSnapshot(ns, name, id, r);
       return { doc: d.value, seal: d, raw: r.text };
     } catch (err) { return { doc: null, foldErr: err.message, raw: r.text }; }
   }
+  if (e2e) return { doc: null, foldErr: `${ns}/${name}@${short(id)}: the server answered 200 ${r.hdr('Content-Type') || ''}, not a sealed snapshot; the server never folds, and never serves an e2e document in the clear (§7.1)`, raw: r.text };
   if (r.jose) { const d = await decrypted(r, ns, name, { ns, name, id, kind: 'doc' }); return { doc: d.value, seal: d, raw: r.text }; }
   return { doc: r.json };
 }
@@ -1921,7 +1982,7 @@ async function validateDoc(doc) {
   let schema = schemaCache.get(doc.$schema);
   if (schema === undefined) {
     const r = await api('GET', doc.$schema, { auto: true, label: 'schema' });
-    if (r.status === 200) schema = (await readDoc(m[1], m[2], m[3], r)).doc;
+    if (r.status === 200 || notOffered(r)) schema = (await readDoc(m[1], m[2], m[3], r)).doc;
     else if (r.status === 404 || r.status === 410) schema = null;
     else throw new Error(`fetching the schema ${doc.$schema} answered ${r.status}`);
     schemaCache.set(doc.$schema, schema);
@@ -1933,51 +1994,33 @@ async function validateDoc(doc) {
 
 const paddedLength = (n) => Z.padLen(n);
 
-/* openSnapshot opens the sealed snapshot of the pruning horizon h that r, the answer of /rev/{h} with
- * X-E2E: snapshot, serves: its body (200 application/jose), or for a tombstone horizon the "snapshot" member
- * of its 410 (the last live document). It is sealed under ns or one of its bases, bound to { name, h }. */
+/* openSnapshot opens the sealed snapshot of h that r, the 200 application/jose answer of /rev/{h}, serves (§7.1): a
+ * prune's, at the horizon or at a tombstone horizon's parent. It is sealed under the resource's K_r of ns or one of
+ * its bases (a branch reads its base's snapshot as it sees it, §7.6), bound to exactly { ns, name, id: h } (§E.3.1). */
 async function openSnapshot(ns, name, h, r) {
-  const jwe = r.status === 410 ? (r.json && r.json.snapshot) : (r.jose ? (r.text || '').trim() : '');
-  if (typeof jwe !== 'string' || !jwe) throw new Error(`e2e snapshot of ${ns}/${name} at ${h}: no sealed snapshot in the answer`);
+  const jwe = r.status === 200 && r.jose ? (r.text || '').trim() : '';
+  if (!jwe) throw new Error(`e2e snapshot of ${ns}/${name} at ${h}: no sealed snapshot in the answer (HTTP ${r.status})`);
   const hdr = Z.parseJWE(jwe).header;
   const kns = Z.parseKid(hdr.kid).ns;
   if (!(await nsChainOK(ns, kns))) throw new Error(`e2e snapshot of ${ns}/${name} at ${h}: sealed under ${hdr.kid}`);
-  // pl { ns, name, id } (§E.3.1); snapshots stored before v0.63 also carry kind "snapshot".
-  // Under the resource's K_r (§E.3.1, v0.65), or K_e, which sealed snapshots before.
-  const want = (hd) => (hd.pl && hd.pl.kind === 'snapshot' ? { ns: kns, name, id: h, kind: 'snapshot' } : { ns: kns, name, id: h });
-  try { return await openSealed(kns, jwe, name, want); } catch (err) {
-    if (err.checks) throw err;
-    return openSealed(kns, jwe, '', want);
-  }
+  return openSealed(kns, jwe, name, { ns: kns, name, id: h });
 }
 
 /* foldLog verifies and folds an e2e log answer that ends at id and starts after since. A fold from a pruning
- * horizon (since set) starts from its sealed snapshot, which /rev/{since} serves (never the log, §7.1 Paging). */
+ * horizon, or a tombstone horizon's parent (since set), starts from its sealed snapshot, which /rev/{since} serves
+ * (never the log, §7.1). */
 async function foldLog(ns, name, id, since, arr) {
   const out = { id, since, entries: [], flagged: [], validID: '', value: undefined, notes: [] };
   const bad = (msg) => { throw new Error(`e2e log of ${ns}/${name}: ${msg}`); };
   let doc, exists = false, prev = '';
   const cfg = ((await nsInfo(ns)).doc || {}).encryption || {};
   if (since) {
+    // A namespace is end-to-end from its creation or never (Addendum E Levels): the start is always a snapshot.
     const r = await api('GET', `/r/${ns}/${name}/rev/${since}`, { auto: true, label: 'fold start' });
-    if (r.status === 200 && !r.hdr('X-E2E')) {
-      // A revision from before a raise to e2e, served as at the level before (Addendum E Levels): in
-      // the clear, or sealed as at E2 under K_r of its epoch, kid and pl naming this namespace or the
-      // base a branch reads it through (F-E1: the fold starts at the last one before the raise).
-      let d = { value: r.json, kid: '' };
-      if (r.jose) {
-        const kns = Z.parseKid(Z.parseJWE(r.text.trim()).header.kid).ns;
-        if (!(await nsChainOK(ns, kns))) bad(`/rev/${since} is sealed under ${kns}, not this namespace or a base`);
-        d = await openSealed(kns, r.text.trim(), name, { ns: kns, name, id: since, kind: 'doc' });
-      } else if (r.json === null) bad(`/rev/${since} serves no document`);
-      doc = d.value; exists = true; prev = since; out.validID = since;
-      out.entries.push({ id: since, kind: 'pre-raise', _sealed: d.kid, _note: 'the document from before the raise to e2e the fold starts from, served as /rev/' + since, _doc: doc });
-    } else {
-      if ((r.status !== 200 && r.status !== 410) || r.hdr('X-E2E') !== 'snapshot') bad(`/rev/${since} does not serve the snapshot the fold starts from (HTTP ${r.status})`);
-      const d = await openSnapshot(ns, name, since, r);
-      doc = d.value; exists = true; prev = since; out.validID = since;
-      out.entries.push({ id: since, kind: 'snapshot', _sealed: d.kid, _note: 'the prune snapshot the fold starts from, served as /rev/' + since, _doc: doc });
-    }
+    if (r.status !== 200 || !r.jose) bad(`/rev/${since} does not serve the snapshot the fold starts from (HTTP ${r.status})`);
+    const d = await openSnapshot(ns, name, since, r);
+    doc = d.value; exists = true; prev = since; out.validID = since;
+    out.entries.push({ id: since, kind: 'snapshot', _sealed: d.kid, _note: 'the prune snapshot the fold starts from, served as /rev/' + since, _doc: doc });
   }
   for (let i = 0; i < arr.length; i++) {
     const e = Object.assign({}, arr[i]);
@@ -2001,11 +2044,9 @@ async function foldLog(ns, name, id, since, arr) {
     try { hdr = Z.parseJWE(jwe).header; kns = Z.parseKid(hdr.kid).ns; } catch (err) { flag('sealed patch set: ' + err.message); continue; }
     if (!(await nsChainOK(ns, kns))) { flag('sealed under another namespace\'s key ' + hdr.kid); continue; }
     e._sealed = hdr.kid;
-    // Under the resource's K_r (§E.3.1, v0.65), or K_e, which sealed E3 patch sets before.
+    // Under the resource's K_r only (§E.3.1): one sealed otherwise, as under K_e before v0.65, is flagged (v0.78).
     let o;
-    try { o = await Z.openJWE(jwe, await contentKey(hdr.kid, name)); } catch (_) {
-      try { o = await Z.openJWE(jwe, await contentKey(hdr.kid, '')); } catch (err) { flag('sealed patch set: ' + err.message); continue; }
-    }
+    try { o = await Z.openJWE(jwe, await contentKey(hdr.kid, name)); } catch (err) { flag('sealed patch set: ' + err.message); continue; }
     const diff = Z.plDiff(hdr.pl, { ns: kns, name, parent: e.parent || '' });
     if (diff.length) { flag('sealed patch set bound to another ' + diff.join(', ')); continue; }
     let plain;
@@ -2082,7 +2123,7 @@ async function writeSealed(kind, patchText) {
       const at = kind === 'restore' ? (S.resState && S.resState.last) : parent;
       if (!at) return fail('no last live revision to restore onto');
       const r = await api('GET', `/r/${ns}/${res}/rev/${at}`, { auto: true });
-      const d = r.status === 200 ? await readDoc(ns, res, at, r) : { foldErr: 'HTTP ' + r.status };
+      const d = r.status === 200 || notOffered(r) ? await readDoc(ns, res, at, r) : { foldErr: 'HTTP ' + r.status };
       if (d.foldErr || d.doc === undefined) return fail('could not fold the base document: ' + (d.foldErr || 'no document'));
       base = d.doc; exists = true;
     }
@@ -2359,7 +2400,7 @@ async function fetchKeysForm() {
   if (rs.length) body.resources = rs;
   const r = await api('POST', `/ns/${ns}/keys`, { body });
   if (r.ok && r.json) {
-    try { toast(`${await takeKeys(r.json.keys)} key(s) stored`); } catch (err) { toast(err.message); }
+    try { toast(`${await takeKeys(r.json.keys, (await nsInfo(ns)).level || r.json.level)} key(s) stored`); } catch (err) { toast(err.message); }
   }
 }
 
@@ -2381,8 +2422,9 @@ async function importIdentity() {
 
 /* ---- E3 keyring administration (client.E2E InitKeyring / AddReader / RotateEpoch) ---- */
 /* The keyring document (§E.3.2): entries wrapped in HPKE auth mode under this identity, the admin key their from
- * names. A keyring stored in the format before v0.63 is shown, but servers refuse writing it: a key holder wraps it
- * again (patchlog e2e migrate-keyring). */
+ * names. A keyring stored in the format before v0.63 is shown, but servers refuse writing it, /keys relays none of its
+ * entries and nothing opens from it (v0.78 Legacy): a key holder wraps it again with the v0.26.1 client's patchlog e2e
+ * migrate-keyring, which v0.81 removed. */
 const KR = { ns: '', doc: null, legacy: null, head: '', status: 0 };
 async function loadKeyring() {
   KR.ns = S.ns; KR.doc = null; KR.legacy = null; KR.head = ''; KR.status = 0; KR.err = '';
@@ -2413,7 +2455,7 @@ async function renderKeyring() {
   box.className = '';
   if (KR.legacy) {
     box.replaceChildren(h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'badge warn' }, 'keyring format before v0.63'), h('span', { class: 'muted' }, `current epoch ${KR.legacy.current}`)),
-      h('p', { class: 'note' }, 'Servers no longer take this format as the keyring (§E.3.2): a key holder wraps it again with patchlog e2e migrate-keyring. Its entries still open here.'));
+      h('p', { class: 'note' }, 'Servers no longer take this format as the keyring (§E.3.2): /keys relays none of its entries, and nothing opens from it, here or in any v0.81 client. A key holder wraps it again with the v0.26.1 client\'s patchlog e2e migrate-keyring; v0.81 has no such tool.'));
     return;
   }
   if (!KR.doc) {
@@ -2452,7 +2494,7 @@ function krKnow() {
     rememberKey(x); toast('Key remembered: its keyring entries open here, and it can be kept in a rotation'); renderKeyring();
   } catch (err) { toast(err.message); }
 }
-function krLegacyRefused() { if (KR.legacy) { toast('The keyring is in the format before v0.63: wrap it again (patchlog e2e migrate-keyring)'); return true; } return false; }
+function krLegacyRefused() { if (KR.legacy) { toast('The keyring is in the format before v0.63, which nothing opens: a key holder wraps it again with the v0.26.1 client (v0.81 has no migrate-keyring)'); return true; } return false; }
 async function krInit() {
   if (!ID) return toast('Generate or import an identity first');
   try {
@@ -2477,13 +2519,13 @@ async function krAdd() {
     await loadKeyring();
     if (krLegacyRefused()) return;
     if (!KR.doc) return toast('No keyring');
-    const kr = JSON.parse(JSON.stringify(KR.doc));
+    const kr = Z.keyringV2ForWrite(KR.doc);
     const eps = Z.keyringV2Epochs(kr, S.ns), cur = eps[eps.length - 1];
     if (cur === undefined) return toast('The keyring holds no key of ' + S.ns);
     for (const e of eps) {
       if (e !== cur && !$('krHistory').checked) continue;
       let key;
-      try { key = await contentKey(Z.kid(S.ns, e), ''); } catch (err) { if (e === cur) throw err; continue; }
+      try { key = await epochKey(Z.kid(S.ns, e)); } catch (err) { if (e === cur) throw err; continue; } // K_e: what entries wrap (§E.3.2)
       await Z.keyringV2Add(kr, ID, x, Z.kid(S.ns, e), key);
     }
     const r = await api('PATCH', `/r/${S.ns}/keyring`, { ct: PJ, headers: { 'If-Match': quoteId(KR.head) }, body: [{ op: 'replace', path: '', value: kr }], label: 'keyring' });
@@ -2502,7 +2544,7 @@ async function krRotate() {
     const keep = new Set([...document.querySelectorAll('.kr-keep')].filter((c) => c.checked && c.dataset.x).map((c) => c.dataset.x));
     keep.add(ID.x);
     if (!confirm(`Rotate ${S.ns} to epoch ${epoch + 1} for ${keep.size} recipient(s)? Recipients left out cannot read anything written afterwards.`)) return;
-    const kr = JSON.parse(JSON.stringify(KR.doc));
+    const kr = Z.keyringV2ForWrite(KR.doc);
     const e = cur + 1, key = Z.randomBytes(32);
     for (const x of keep) await Z.keyringV2Add(kr, ID, x, Z.kid(S.ns, e), key);
     const r = await api('POST', `/ns/${S.ns}/batch`, { label: 'rotate', body: {
@@ -2518,7 +2560,8 @@ async function decryptPasted() {
   if (!jwe) return;
   try {
     const { header } = Z.parseJWE(jwe);
-    const res = $('jweRes').value.trim() || (header.pl && header.pl.name && header.pl.kind && header.pl.kind !== 'snapshot' ? header.pl.name : '');
+    // A pl naming a resource is under its K_r (revisions, entries, snapshots, blobs, per-entry views), else K_n (§E.2.1).
+    const res = $('jweRes').value.trim() || (header.pl && typeof header.pl.name === 'string' ? header.pl.name : '');
     const d = await openSealed('', jwe, res, header.pl);
     d.checks.splice(1, 1, { ok: true, what: 'pl ' + Z.canonical(header.pl) + ' (not compared: no request to compare with)' });
     out.replaceChildren(decView(d));
@@ -2650,7 +2693,7 @@ async function loadCatalog() {
   const heads = (await allHeads(ns, x.head)).filter((e) => e.kind === 'head');
   const docs = await mapLimit(heads.slice(0, 500), 6, async (e) => {
     const r = await api('GET', `/r/${ns}/${e.resource}/rev/${e.target}`, { auto: true, label: 'catalog' });
-    if (r.status !== 200) return null;
+    if (r.status !== 200 && !notOffered(r)) return null;
     const d = await readDoc(ns, e.resource, e.target, r);
     return { name: e.resource, head: e.target, doc: d.doc && typeof d.doc === 'object' ? d.doc : {}, kind: e.resource.includes('.') ? 'item' : 'folder', sealed: !!d.seal };
   });
@@ -2730,12 +2773,12 @@ async function openSealedEntries(v, view) {
     try {
       const hdr = Z.parseJWE(v.sealed).header;
       const ens = Z.parseKid(hdr.kid).ns;
-      // The entry's resource key K_r (what the tree service and the index use), else the epoch key K_e.
-      // (The tree service names its entries "name", the index its hits "resource".)
-      const rname = v.name !== undefined ? v.name : v.resource;
-      const want = { ns: ens, name: rname, view };
-      let d;
-      try { d = await openSealed(ens, v.sealed, rname, want); } catch (err) { if (err.checks) throw err; d = await openSealed(ens, v.sealed, '', want); }
+      // The view key of the entry's resource's K_r (SERVICES.md §E.2.6). The tree service names its entries "name",
+      // the index its hits "resource"; a value of another resource, { "sealed" } alone, names that one in its pl.
+      const other = Object.keys(v).length === 1;
+      const rname = other ? (hdr.pl || {}).name : v.name !== undefined ? v.name : v.resource;
+      if (typeof rname !== 'string' || !rname) throw new Error('a sealed value that names no resource');
+      const d = await openSealed(ens, v.sealed, rname, { ns: ens, name: rname, view });
       if (d.value && typeof d.value === 'object') Object.assign(v, d.value);
       v._opened = hdr.kid;
     } catch (err) { v._sealedErr = err.message; }

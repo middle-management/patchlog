@@ -643,7 +643,7 @@ func (ix *Index) follow(ctx context.Context, ns string) {
 		follow.WithMaxUnits(0),
 		follow.WithOnError(func(n string, err error) {
 			ix.opt.Logf("index: %s: %v", n, err)
-			if ix.known(n) && follow.LacksKey(ctx, err) {
+			if ix.known(n) && follow.LacksKey(ctx, err) && (n != ns || !ix.lacksKeys(ctx, n)) {
 				stop(n)
 			}
 		}),
@@ -750,6 +750,31 @@ func (ix *Index) runFollower(ctx context.Context, ns string, opts []follow.Optio
 		ix.mu.Unlock()
 	}()
 	return follow.New(ix.c, ns, ix.cps, ix, opts...).Run(ctx)
+}
+
+// lacksKeys decides again, as when its follower starts (Keys.Check), its
+// encryption read anew, whether the index lacks the keys of ns, a
+// namespace it follows, as configured, after a read of it failed for want
+// of a key: an entry of its log, such as the config entry of a raise to
+// sealed whose keys it can't have, which Apply never sees, or its
+// document in a read check. Its encryption is read anew only where the
+// index holds it as neither sealed nor e2e: a change of a protected one's
+// level or epoch is Apply's to recheck. Lacking them, ns is skipped
+// (Keys.Skip): its queries are 404 as one the index doesn't follow,
+// before the read check, and /_status says why (§A.4 Unavailable
+// namespaces, §E.2.6), as after a restart; it is stopped (purgeStopped)
+// and its follower too, so that it is checked again as at a start
+// (follow). It reports whether it lacks them.
+func (ix *Index) lacksKeys(ctx context.Context, ns string) bool {
+	if in, err := ix.keys.Info(ctx, ns); err == nil && !in.Protected() {
+		ix.keys.Forget(ns)
+	}
+	if _, lacks := ix.keys.Recheck(ctx, ns, false); !lacks {
+		return false
+	}
+	ix.purgeStopped(context.WithoutCancel(ctx), ns)
+	ix.stopRun(ns)
+	return true
 }
 
 // stopRun stops the running follower of ns, reporting whether ns has one

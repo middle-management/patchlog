@@ -52,10 +52,13 @@ FUNCTIONS
 `
 
 // W1X: keyrings stored before v0.63 wrap their keys under the info of
-// that time, and /keys relays their entries as stored (§E.2.3, §E.3.2).
-// The playground opens them under either info, from the relay and from
-// the keyring, and a relayed entry it can't open leaves the keyring.
-func TestW1XRelayedLegacyKeyringEntriesWithNode(t *testing.T) {
+// that time, and servers before v0.81 relayed their entries as stored
+// (§E.2.3, §E.3.2). Since v0.78 nothing opens from them (Legacy), as in
+// internal/client: a relayed entry without from has no sender and is
+// skipped, and a keyring in the format before v0.63 opens nothing, so
+// fetchKeyFor ends with the keyring's error and holds no key. Inverted
+// from TestW1XRelayedLegacyKeyringEntriesWithNode, which opened both.
+func TestW1XRelayedLegacyKeyringEntriesRefusedWithNode(t *testing.T) {
 	t.Parallel()
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -116,10 +119,9 @@ func TestW1XRelayedLegacyKeyringEntriesWithNode(t *testing.T) {
 	if err := json.Unmarshal(out, &got); err != nil || len(got) != 2 {
 		t.Fatalf("node output %s: %v", out, err)
 	}
-	want := []string{"POST /keys (HPKE-wrapped)", "keyring (HPKE-wrapped)"}
 	for i, g := range got {
-		if g.Err != "" || g.Key != b64.EncodeToString(key) || g.From != want[i] {
-			t.Errorf("case %d: %+v, want the key from %s", i, g, want[i])
+		if g.Key != "" || g.From != "" || !strings.Contains(g.Err, "not in the §E.3.2 form") {
+			t.Errorf("case %d: %+v, want no key and the keyring's refusal", i, g)
 		}
 	}
 }

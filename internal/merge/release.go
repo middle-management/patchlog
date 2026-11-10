@@ -2175,7 +2175,8 @@ func orderItems(st *ReleaseStep, items []any) []any {
 // plaintext patch set, before any sealing, without fresh $nonce ops (an
 // add or replace at exactly /$nonce of the fresh form, as §6.4.1 leaves
 // out of writes) and without a fresh top-level $nonce in the value of a
-// root operation, or "delete". Gestures, undoes and signatures are left
+// root operation, an add or replace whose path is "" (a test at "" keeps
+// its value whole), or "delete". Gestures, undoes and signatures are left
 // out, so fresh nonces, signatures and re-sealing don't change it.
 func digestSteps(steps []client.Step) []any {
 	out := []any{}
@@ -2205,7 +2206,7 @@ func digestSteps(steps []client.Step) []any {
 			switch {
 			case path == "/$nonce" && (name == "add" || name == "replace") && freshNonce(m["value"]):
 				continue
-			case path == "":
+			case path == "" && (name == "add" || name == "replace"):
 				if val, ok := m["value"].(map[string]any); ok && freshNonce(val["$nonce"]) {
 					nm := make(map[string]any, len(m))
 					for k, x := range m {

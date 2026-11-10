@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -452,49 +451,6 @@ func TestV075IndexRefs(t *testing.T) {
 	}
 }
 
-// TestV075IndexBranch (SVC-15, §B.11.9 Branches): in a covered branch's
-// preview index a partial reader sees a document only where its base had
-// a live one as of the branch's at, and its root's catalog places it: so
-// final, created only in matches-r7, is never its hit, though placed,
-// while an unrestricted reader sees it. The base joins at, listed at its
-// head, being a catalog.trust member read there (v0.76, §A.4 Answers;
-// before v0.76 at baseAt).
-func TestV075IndexBranch(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	w := newV75X(t, true)
-	base := w.head("matches")
-	must(w.admin.CreateBranch(ctx, "matches", client.BranchRequest{Name: "matches-r7"}))
-	w.put("matches-r7", "final", w.page("final", "cup"))
-	w.put("cat-season", "matches.final", map[string]any{"parents": v75Parents("season")})
-	w.x.caughtUp("matches-r7")
-	fan := w.reader("user:fan", []any{"fans"}, "matches-r7")
-	loc, _, at := w.pointer("/matches-r7", fan)
-	b := w.x.search(loc, fan)
-	if got := strings.Join(resources(b), ","); got != "derby,shared" {
-		t.Errorf("fan sees %s in the branch, want derby,shared", got)
-	}
-	ns := v75Namespaces(t, b)
-	if ns["matches"] != w.x.ix.Checkpoint("matches") || ns["matches-r7"] != w.x.ix.Checkpoint("matches-r7") || ns["cat-season"] != w.head("cat-season") || at != grantcheck.CombinedAt(ns) {
-		t.Errorf("namespaces %v at %s (base at %s)", ns, at, base)
-	}
-	all := w.k.Grant(t, w.s.Now(), "user:root", []string{"matches-r7"}, []string{"read"})
-	if got := resources(w.x.search("/matches-r7", all)); !slices.Contains(got, "final") {
-		t.Errorf("unrestricted reader sees %v in the branch", got)
-	}
-	// Across the base and the branch: one ns_id for matches, its own
-	// checkpoint, the branch's standing for the base at baseAt.
-	both := w.reader("user:fan", []any{"fans"}, "matches", "matches-r7")
-	_, _, rloc := w.x.refsPointer("?to=/r/target/x", both)
-	rb := w.x.search(rloc, both)
-	if got := refsAllHits(rb); got != "matches/derby matches/shared matches-r7/derby matches-r7/shared" {
-		t.Errorf("/_refs across the base and the branch: %s", got)
-	}
-	if ns := v75Namespaces(t, rb); ns["matches"] != w.x.ix.Checkpoint("matches") || ns["matches-r7"] == "" || ns["cat-season"] == "" || len(ns) != 3 {
-		t.Errorf("/_refs namespaces %v", ns)
-	}
-}
-
 // TestV075IndexUncovered: a namespace whose catalog doesn't trust it,
 // though its catalogs names one, gives a partial reader no marker (v0.77,
 // §A.4): 403, never every hit the grant's rules allow; one that names no
@@ -547,51 +503,5 @@ func TestV075IndexCatalog(t *testing.T) {
 	all := w.k.Grant(t, w.s.Now(), "user:root", []string{"cat-season"}, []string{"read"})
 	if got := resources(x.search("/cat-season", all)); len(got) != 7 {
 		t.Errorf("unrestricted reader sees %v", got)
-	}
-}
-
-// TestV075IndexCookieKeepsAll (§B.11.5, §B.11.9 gs): a cookie whose
-// subjects leave out some of the reader's groups ("partial") is 403 at a
-// checkpoint where a deciding rule tests /principal/groups otherwise than
-// by naming groups, so every group decides, while a cookie whose subjects
-// keep every group is still served.
-func TestV075IndexCookieKeepsAll(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	w := newV75X(t, false)
-	exchange := func(tok string) (string, []*http.Cookie) {
-		r := p37Do(t, w.x, "POST", "/edge-grants", tok, "", nil, "")
-		if r.status != 200 {
-			t.Fatalf("exchange: %d %v", r.status, r.body)
-		}
-		for _, p := range r.body["prefixes"].([]any) {
-			if strings.HasPrefix(p.(string), "/matches/") {
-				return p.(string), r.cookies
-			}
-		}
-		t.Fatalf("no prefix for matches: %v", r.body)
-		return "", nil
-	}
-	ip, ic := exchange(w.reader("user:intern", []any{"fans", "interns"}))
-	fp, fc := exchange(w.reader("user:fan", []any{"fans"}))
-	for _, c := range []struct {
-		prefix  string
-		cookies []*http.Cookie
-	}{{ip, ic}, {fp, fc}} {
-		if got, _ := p37Follow(t, w.x, c.prefix, c.cookies, ""); got.status != 200 {
-			t.Fatalf("%s: %d %v", c.prefix, got.status, got.body)
-		}
-	}
-	// A role neither grant carries, whose rule tests the groups by a
-	// negation: every group decides.
-	must(w.admin.PatchConfig(ctx, "matches", must(w.admin.NSHead(ctx, "matches")).Config, []any{map[string]any{"op": "add", "path": "/roles/outsider",
-		"value": map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/principal/groups",
-			"schema": map[string]any{"contains": map[string]any{"const": "chiefs"}}}}}}}}))
-	w.x.caughtUp("matches")
-	if got, _ := p37Follow(t, w.x, ip, ic, ""); got.status != 403 {
-		t.Errorf("a partial subject set where every group decides: %d %v", got.status, got.body)
-	}
-	if got, _ := p37Follow(t, w.x, fp, fc, ""); got.status != 200 || strings.Join(p37Hits(got.body), ",") != "derby,shared" {
-		t.Errorf("a whole subject set: %d %v", got.status, got.body)
 	}
 }

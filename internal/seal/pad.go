@@ -52,8 +52,8 @@ func Padded(plaintext []byte) bool {
 }
 
 // IsPadded reports whether a JWE opened as (h, plaintext) is padded as
-// §E.2.2 requires: no zip header (which only legacy bytes carry), and
-// plaintext padded to its bucket.
+// §E.2.2 requires: no zip header (which Open refuses), and plaintext
+// padded to its bucket.
 func IsPadded(h *Header, plaintext []byte) bool {
 	return h.Zip == "" && Padded(plaintext)
 }

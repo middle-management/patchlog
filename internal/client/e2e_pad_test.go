@@ -65,8 +65,9 @@ func TestE2EPadding(t *testing.T) {
 	if !patchSetPadded(t, c, x, "e", "d", p1.ID) {
 		t.Fatal("not padded with pad")
 	}
-	// An unpadded patch set written behind the client's back is flagged.
-	body := must(seal.SealPatchSet(must(x.Key(ctx, "e#1")), "e#1", "e", "d", p1.ID, ops(op("replace", "/n", 2))))
+	// An unpadded patch set written behind the client's back, under the
+	// resource's K_r (§E.3.1), is flagged.
+	body := must(seal.SealPatchSet(must(seal.ResourceKey(must(x.Key(ctx, "e#1")), "e", "d")), "e#1", "e", "d", p1.ID, ops(op("replace", "/n", 2))))
 	bad := must(c.Append(ctx, "e", "d", p1.ID, body))
 	d := must(x.DocE2E(ctx, "e", "d", bad.ID))
 	if len(d.Flagged) != 1 || d.Flagged[0].ID != bad.ID || !strings.Contains(d.Flagged[0].Message, "padded") || d.ValidID != p1.ID {

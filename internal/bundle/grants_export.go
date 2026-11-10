@@ -331,9 +331,14 @@ func (g *grantExporter) fetchSealed(ctx context.Context, ns, gid string) (*clien
 		if err != nil {
 			return nil, fmt.Errorf("export: sealed grant %s of %s: %w", gid, ns, err)
 		}
-		key, err := g.epochKey(ctx, ns, h.Kid)
+		ke, err := g.epochKey(ctx, ns, h.Kid)
 		if err != nil {
 			return nil, err
+		}
+		// A grant is sealed under K_n, derived from K_e (§E.2.1, §E.2.2).
+		key, err := seal.NamespaceKey(ke, ns)
+		if err != nil {
+			return nil, fmt.Errorf("export: sealed grant %s of %s: %w", gid, ns, err)
 		}
 		pt, err = seal.OpenExpect(jwe, key, h.Kid, seal.PL{"ns": ns, "grant": gid})
 		if err != nil {

@@ -221,6 +221,10 @@ type Service struct {
 	// (judgeEpochs), outside the graph's lock (tests: a head applied
 	// meanwhile).
 	beforeJudge atomic.Pointer[func()]
+	// afterStop, if set, runs as purgeStopped has marked a namespace
+	// stopped and left the graph's lock, before the purges it then makes
+	// (tests: a reader meanwhile).
+	afterStop atomic.Pointer[func(ns string)]
 	// verifyHook, if set, fails the verification of a grant in each
 	// namespace it returns an error for (tests: a requireAt chain the
 	// checker can't read).
@@ -689,17 +693,12 @@ func (s *Service) onCatchUp(ctx context.Context, ns, head string, done bool) {
 	// passed, a stale head pointer), so the stop ends (purgeStopped).
 	_, stopped := s.g.stopped[ns]
 	unstop := stopped && head != "" && s.cur[ns] == head
-	if unstop {
-		delete(s.g.stopped, ns)
-	}
 	s.mu.Unlock()
 	if mark {
 		s.recordCaught(ctx, ns, head)
 	}
 	if unstop {
-		if _, err := s.db.ExecContext(context.WithoutCancel(ctx), `DELETE FROM meta WHERE k = ?`, "stopped:"+ns); err != nil {
-			s.opt.Logf("tree: ending the stop of %s: %v", ns, err)
-		}
+		s.unstop(ctx, ns, head)
 	}
 }
 
@@ -1593,6 +1592,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			return nil, err
 		}
 		delete(g.stopped, b.NS)
+		g.refreshSelf(b.NS)
 	}
 	narrowed = narrowed && (s.cur[b.NS] != "" || recorded || s.opt.Rebuild) && (b.NS == cat || g.Trust[b.NS] || oldTrust[b.NS])
 	if co.PurgedNS || narrowed {
@@ -1700,47 +1700,128 @@ func (s *Service) purgeStopped(ctx context.Context, ns string) {
 		// and report comes here).
 		return
 	}
+	ctx = context.WithoutCancel(ctx)
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
 	s.mu.Lock()
 	shown := ns == s.opt.Catalog || s.g.Trust[ns]
 	cp := s.cur[ns]
 	was, marked = s.g.stopped[ns]
-	if shown {
-		s.g.stopped[ns] = cp
-	}
-	s.mu.Unlock()
 	if !shown {
+		s.mu.Unlock()
 		return
+	}
+	s.g.stopped[ns] = cp
+	tags := []string{"ns:" + s.actual(ns)}
+	if !marked || was != cp {
+		// Its placements dangle from now on (Graph.isStopped), in the same
+		// critical section as the stop: no listing shows them meanwhile.
+		if err := s.restop(ctx, ns, func(tx *sql.Tx) error {
+			if err := saveMeta(ctx, tx, "stopped:"+ns, cp); err != nil {
+				return err
+			}
+			if err := s.sealed.Purge(ctx, tx, tags); err != nil {
+				return err
+			}
+			return s.repurge.Add(ctx, tx, tags)
+		}); err != nil {
+			s.opt.Logf("tree: purging %v for %s, no longer followed: %v", tags, ns, err)
+			// The graph was reloaded from a database without the stop:
+			// it holds in memory all the same, its placements dangling,
+			// as before the write was tried (restarted, the service stops
+			// ns again when it fails to follow it).
+			s.g.stopped[ns] = cp
+			s.g.refreshSelf(ns)
+			s.g.analyze()
+		}
+	}
+	// It leaves the combined checkpoint (noteTrust: entered again once
+	// followed, so a g/all cookie from before is 403 at an at with it).
+	s.noteTrust(ctx)
+	s.mu.Unlock()
+	if f := s.afterStop.Load(); f != nil {
+		(*f)(ns)
 	}
 	s.checker.Observe(s.actual(ns), "")
 	if marked && was == cp {
 		return
 	}
-	tags := []string{"ns:" + s.actual(ns)}
+	s.sealed.Purged(tags)
+	s.kept.Purge(s.opt.Catalog, tags)
+	s.opt.Purger.PurgeTags(tags)
+	s.mu.Lock()
+	close(s.changed)
+	s.changed = make(chan struct{})
+	s.mu.Unlock()
+}
+
+// restop derives again, in one transaction with what record writes, the
+// nodes a stop or its end changes (Graph.analyze: placements of a stopped
+// namespace dangle, "unfollowed"), persisting them and letting the hook
+// see them. Called with wmu and mu held for writing; on a failure the
+// graph is reloaded from the database.
+func (s *Service) restop(ctx context.Context, ns string, record func(tx *sql.Tx) error) error {
 	err := func() error {
-		s.wmu.Lock()
-		defer s.wmu.Unlock()
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
-		if err := saveMeta(ctx, tx, "stopped:"+ns, cp); err != nil {
+		if err := record(tx); err != nil {
 			return err
 		}
-		if err := s.sealed.Purge(ctx, tx, tags); err != nil {
-			return err
+		// Its implicit placements leave the graph while it is stopped and
+		// enter it again once followed (Graph.refresh).
+		s.g.refreshSelf(ns)
+		changed := s.g.analyze()
+		names := make([]string, 0, len(changed))
+		for name := range changed {
+			names = append(names, name)
 		}
-		if err := s.repurge.Add(ctx, tx, tags); err != nil {
-			return err
+		sort.Strings(names)
+		for _, name := range names {
+			if err := s.persistNode(ctx, tx, s.g, name); err != nil {
+				return err
+			}
+		}
+		if s.opt.Hook != nil && len(changed) > 0 {
+			if err := s.opt.Hook.Update(ctx, tx, s.g, changed); err != nil {
+				return err
+			}
 		}
 		return tx.Commit()
 	}()
 	if err != nil {
-		s.opt.Logf("tree: purging %v for %s, no longer followed: %v", tags, ns, err)
+		if rerr := s.reload(ctx); rerr != nil {
+			s.opt.Logf("tree: reloading after %s's stop changed: %v", ns, rerr)
+		}
 	}
-	s.sealed.Purged(tags)
-	s.kept.Purge(s.opt.Catalog, tags)
-	s.opt.Purger.PurgeTags(tags)
+	return err
+}
+
+// unstop ends ns's stop, once the service has caught up with its head at
+// the checkpoint it was stopped at (onCatchUp): its placements are derived
+// again (restop) and it enters the combined checkpoint again (noteTrust).
+// A stop at another checkpoint meanwhile stays.
+func (s *Service) unstop(ctx context.Context, ns, head string) {
+	ctx = context.WithoutCancel(ctx)
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, stopped := s.g.stopped[ns]; !stopped || head == "" || s.cur[ns] != head {
+		return
+	}
+	delete(s.g.stopped, ns)
+	if err := s.restop(ctx, ns, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k = ?`, "stopped:"+ns)
+		return err
+	}); err != nil {
+		s.opt.Logf("tree: ending the stop of %s: %v", ns, err)
+	}
+	s.noteTrust(ctx)
+	close(s.changed)
+	s.changed = make(chan struct{})
 }
 
 // isStopped reports whether the service stopped following ns
@@ -2112,19 +2193,17 @@ func (s *Service) bornOf(ctx context.Context, ns, name, head string) (born strin
 
 // snapshotBornEpoch is the epoch of e2e namespace ns that a prune's
 // snapshot of e, the first revision of a chain, would carry (§E.3.1), the
-// epoch a value derived from it is sealed under (§E.2.6): a revision from
-// before a raise from sealed, served sealed as at E2, its served kid's
-// where that names ns; one whose sealed op is ns's own (its pl.ns names
-// ns), the epoch its kid names; one whose op is a base's, read through, or
-// in the clear from before a raise from none or at-rest, ns's epoch in
-// force, judged once, when a value derived from it is first sealed
-// (§E.2.6): bornPending, never the epoch current as it is applied. 0, not
-// known, for one without its patch set (pruned or purged) or whose own
-// op's kid doesn't name an epoch of ns.
+// epoch a value derived from it is sealed under (§E.2.6): one whose sealed
+// op is ns's own (its pl.ns names ns), the epoch its kid names; one whose
+// op is a base's, read through, ns's epoch in force, judged once, when a
+// value derived from it is first sealed (§E.2.6): bornPending, never the
+// epoch current as it is applied. 0, not known, for one without its patch
+// set (pruned or purged) or whose own op's kid doesn't name an epoch of
+// ns. A served kid (e.Kid) is ignored: a namespace is e2e only from its
+// creation (v0.78), so only a revision sealed before a raise, which no
+// longer exists, was served sealed as at E2, and an origin that serves
+// one a kid names no epoch the service may trust for it (§E.2.6).
 func snapshotBornEpoch(ns string, e client.LogEntry) int {
-	if e.Kid != "" {
-		return derived.EpochOf(ns, e.Kid)
-	}
 	if !e.HasPatches {
 		return 0
 	}

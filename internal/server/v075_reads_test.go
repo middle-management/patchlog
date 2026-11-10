@@ -744,32 +744,24 @@ func TestV075FilteredEvents(t *testing.T) {
 	r2.Body.Close()
 }
 
-// §B.11.9 Answers (scenarios 68, 91): /branches to a partial reader lists
-// only local branches in which its grant verifies and allows read,
-// private, no-store.
+// §B.11.9 Answers (TDA 68; v0.78: "a partial reader's /branches is 403"):
+// /branches to a partial reader is 403, a grant also naming the branch
+// included. Before v0.78 it listed, private, no-store, the local branches
+// its grant verified in. It passes once ACCESS-9's reads.go change is in
+// (V81-01).
 func TestV075BranchesPartial(t *testing.T) {
 	t.Parallel()
 	w := newV75s(t, v75sOpts{})
 	w.seed([]string{"derby"}, nil, []string{"derby"})
 	expect(t, w.do(req{method: "POST", path: "/ns/matches/branches", ifNoneMatch: "*", bearer: w.admin,
 		body: map[string]any{"name": "matches-r7", "at": w.nsHead("matches", w.admin), "patches": []any{}}}), 201)
-	r := w.get("/ns/matches/branches", w.li())
-	expect(t, r, 200)
-	expectPrivateNoStore(t, r)
-	if len(r.Arr()) != 0 {
-		t.Fatalf("li's branches %s", r.Body)
-	}
+	expect(t, w.get("/ns/matches/branches", w.li()), 403)
 	both := w.grant(w.cat, "user:li", []string{"matches", "matches-r7"}, []string{"read"}, map[string]any{"groups": []any{"editors"},
 		"roles": []any{"reader"}, "at": map[string]any{"ns": "cat-season", "id": w.nsHead("cat-season", w.admin)},
 		"exp": w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)})
-	r = w.get("/ns/matches/branches", both)
-	expect(t, r, 200)
-	if len(r.Arr()) != 1 || r.Arr()[0].(map[string]any)["name"] != "matches-r7" {
-		t.Fatalf("branches naming matches-r7 %s", r.Body)
-	}
-	expectPrivateNoStore(t, r)
+	expect(t, w.get("/ns/matches/branches", both), 403)
 	// Unrestricted: the head pointer class, as before.
-	r = w.get("/ns/matches/branches", w.admin)
+	r := w.get("/ns/matches/branches", w.admin)
 	expect(t, r, 200)
 	if r.H.Get("Cache-Control") != "private, max-age=0" || len(r.Arr()) != 1 {
 		t.Fatalf("admin %v %s", r.H, r.Body)

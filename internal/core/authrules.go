@@ -42,6 +42,11 @@ func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []st
 			if err != nil {
 				return forbidden("invalid grant rule")
 			}
+			if forRead(env) && refersToNow(r) {
+				// It fails as a whole for a read, branching's check
+				// included (§C.2 item 5, Unrestricted read).
+				return forbidden("a grant or key rule refers to /now, which no read passes (§C.2 item 5): a read's time window is its grant's nbf and exp")
+			}
 			if stepOne && !r.OnlyRefs(stepOneRefs...) {
 				continue
 			}
@@ -54,6 +59,57 @@ func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []st
 		}
 	}
 	return nil
+}
+
+// forRead reports whether env is a read envelope (§6.4.1), which has no
+// now: wherever rules are evaluated for a read, one that refers to /now,
+// at any depth, fails as a whole (§C.2 item 5). Dropping the member alone
+// isn't enough, since a not or an any around a missing /now would pass.
+func forRead(env map[string]any) bool { return env["action"] == "read" }
+
+// refersToNow reports whether r refers to /now, or to the whole envelope,
+// which counts as referring to it (the conservative reading).
+func refersToNow(r *rules.Rule) bool {
+	refs := r.Refs()
+	return refs["now"] || refs["*"]
+}
+
+// rulesReferToNow reports whether a rule of rs refers to /now or to the
+// whole envelope (refersToNow). A rule that doesn't compile counts: it
+// refuses every read anyway.
+func rulesReferToNow(rs []any) bool {
+	for _, rv := range rs {
+		r, err := compileCached(rv)
+		if err != nil || refersToNow(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// scopeReferToNow reports whether a rule of a's blocks or key scope refers
+// to /now (rulesReferToNow): such a grant is refused every read (§C.2
+// item 5), and is no partial reader (§B.11.9).
+func scopeReferToNow(a *actor) bool {
+	return a.verified != nil && (rulesReferToNow(a.verified.KeyRules) || rulesReferToNow(a.verified.BlockRules))
+}
+
+// readRoles are the effective roles of a's grant that count for read: those
+// that list read and have no rule referring to /now (§C.2 item 5). ok
+// reports whether the grant allows read through them, roles nil for a
+// grant without roles.
+func readRoles(a *actor) (roles []string, ok bool) {
+	v := a.verified
+	ok, all := v.Allows("read")
+	if !ok || !v.HasRoles() {
+		return nil, ok
+	}
+	for _, r := range all {
+		if !rulesReferToNow(v.RoleRules(r)) {
+			roles = append(roles, r)
+		}
+	}
+	return roles, len(roles) > 0
 }
 
 // roleRules evaluates the role rules of a's verified grant, if it carries
@@ -70,7 +126,9 @@ func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any
 			ok := true
 			for _, rv := range a.verified.RoleRules(role) {
 				r, err := compileCached(rv)
-				if err != nil {
+				if err != nil || forRead(env) && refersToNow(r) {
+					// A role with a rule on /now doesn't count for read
+					// (§C.2 item 5).
 					ok = false
 					break
 				}

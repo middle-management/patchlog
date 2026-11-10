@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -28,66 +27,9 @@ func hasKid(kids, kid string) bool {
 	return false
 }
 
-// v0.74 Addendum E Levels (LEVELS-1): after a raise from sealed, a grant
-// without nbf gets none of the epochs before the raise, at /keys and for
-// a copy of a blob from before it; one whose nbf precedes them gets them,
-// as far as the current historyEpochs, counted back from the current
-// epoch, allows.
-func TestV074V01PreRaiseKeysJudgedAgainstCurrentEpoch(t *testing.T) {
-	t.Parallel()
-	p := newProtectionEnv(t, map[string]map[string]any{
-		"m":   sealedDoc(map[string]any{"read": "grant"}),
-		"dst": e2eDoc(map[string]any{"read": "grant"}),
-	})
-	// Blobs of the sealed type, which an e2e namespace can copy (§E.3.1).
-	blobIn := func(name string, data []byte) string {
-		bid := p.upload("m", name, core.SealedBlobType, data, p.star)
-		p.wr("m", name, "", withNonce(addRoot(map[string]any{"b": ref(bid, core.SealedBlobType, len(data), "")})), p.star)
-		return bid
-	}
-	b1 := blobIn("a", []byte("epoch one bytes"))
-	p.rotate("m", 2)
-	b2 := blobIn("b", []byte("epoch two bytes"))
-	p.clock.Advance(time.Hour)
-	expect(t, p.patchNS("m", ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 3.0})), p.star), 201)
-	jwk, _, err := seal.GenerateRecipient()
-	if err != nil {
-		t.Fatal(err)
-	}
-	enc := map[string]any{"enc": jwk}
-	kids := func(g string) string {
-		t.Helper()
-		_, r := p.keysOf("m", nil, g)
-		return kidsOf(t, r)
-	}
-	noNbf := p.grant(p.k, "user:r", []string{"m"}, []string{"read"}, p.long, enc)
-	if got := kids(noNbf); hasKid(got, "m#1") || hasKid(got, "m#2") {
-		t.Errorf("/keys for a grant without nbf after the raise: %q, want no epoch before it", got)
-	}
-	w := p.grant(p.k, "user:w", []string{"dst"}, []string{"read", "create", "append"}, p.long)
-	expectCode(t, p.copyBlob("dst", "x", b2, blobPath("m", "b", b2), noNbf, w), 404, "not_found")
-
-	early := p.grant(p.k, "user:r", []string{"m"}, []string{"read"}, p.nbf0, enc)
-	if got := kids(early); got != "m#1,m#2" {
-		t.Errorf("/keys for a grant whose nbf precedes epoch 1: %q, want m#1,m#2", got)
-	}
-	expect(t, p.copyBlob("dst", "y", b2, blobPath("m", "b", b2), early, w), 201)
-
-	// The current historyEpochs caps them, counted back from the current
-	// epoch (3): epoch 2 alone.
-	expect(t, p.patchNS("m", ops(op("add", "/encryption/historyEpochs", 1.0)), p.star), 201)
-	early = p.grant(p.k, "user:r", []string{"m"}, []string{"read"}, p.nbf0, enc)
-	if got := kids(early); got != "m#2" {
-		t.Errorf("/keys with historyEpochs 1 at epoch 3: %q, want m#2", got)
-	}
-	expectCode(t, p.copyBlob("dst", "z", b1, blobPath("m", "a", b1), early, w), 404, "not_found")
-	expect(t, p.copyBlob("dst", "z", b2, blobPath("m", "b", b2), early, w), 201)
-}
-
 // v0.74 §E.2.3 Which epochs (LEVELS-2): with authentication disabled a
 // request is judged as a grant without nbf: /keys gives the current
-// epoch's key alone, and a copy takes only a blob that opens under it,
-// none from before a raise from sealed.
+// epoch's key alone, and a copy takes only a blob that opens under it.
 func TestV074V01AuthDisabledCurrentEpochOnly(t *testing.T) {
 	t.Parallel()
 	e := newSealedEnv(t, withBlobTuning)
@@ -105,14 +47,6 @@ func TestV074V01AuthDisabledCurrentEpochOnly(t *testing.T) {
 		t.Errorf("/keys with authentication disabled at epoch 3: %s, want s#3 alone", r.Body)
 	}
 	expectCode(t, e.copyBlob("dst", "x", bid, blobPath("s", "a", bid), "", "alice"), 404, "not_found")
-
-	// After a raise from sealed, none of the epochs before it.
-	e.mkNS("m", sealedDoc(map[string]any{"read": "grant"}))
-	mbid := e.upload("m", "a", core.SealedBlobType, data, "alice")
-	e.wr("m", "a", "", withNonce(addRoot(map[string]any{"b": ref(mbid, core.SealedBlobType, len(data), "")})), "alice")
-	expect(t, e.copyBlob("e3", "y", mbid, blobPath("m", "a", mbid), "", "alice"), 201) // epoch 1 is current
-	e.p35Raise("m", map[string]any{"level": "e2e", "epoch": 2.0})
-	expectCode(t, e.copyBlob("e3", "z", mbid, blobPath("m", "a", mbid), "", "alice"), 404, "not_found")
 }
 
 // v0.74 §E.2.3 At E3 (LEVELS-3): a branch's /keys relays its base's

@@ -280,40 +280,48 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		if err := t.purgeRules(cfg, a, env, operator && forced); err != nil {
 			return err
 		}
-		t.deleteArchives(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
-		t.deleteDEKs(`ns = ?`, n.id)
-		// Sealed bytes and epoch keys go too (§E.2, §8.5).
-		t.deleteSealed(`ns = ?`, n.id)
-		t.deleteBlobEpochs(`ns = ?`, n.id)
-		t.deleteEpochKeys(n.id)
-		_, err := t.Exec(`UPDATE revisions SET patches = NULL, size = NULL, digest = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
-		t.must(err)
-		_, err = t.Exec(`DELETE FROM heads WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
-		t.must(err)
-		_, err = t.Exec(`DELETE FROM snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
-		t.must(err)
-		_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
-		t.must(err)
-		t.purgeBlobs(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
-		_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE ns = ?`, statePurged, n.id)
-		t.must(err)
-		t.metaChanged = true
-		_, err = t.Exec(`UPDATE namespaces SET purged = 1 WHERE ns = ?`, n.id)
-		t.must(err)
-		// A remote branch's mirrored copy of its base goes too; nothing
-		// reaches the base (§G.3).
-		for _, sh := range t.remoteShadows(n) {
-			t.purgeShadowNS(sh)
-		}
-		entry := map[string]any{"kind": "purge-ns"}
-		if forced {
-			entry["forced"] = true
-		}
-		_, nsID := t.appendNS(n, entry, nil, nil, n.configSeq, t.actorID(a))
-		out = nsID.String()
-		t.tags = append(t.tags, "ns:"+n.name)
-		t.flushDocs = true
+		out = t.purgeNSNow(n, forced, t.actorID(a))
 		return nil
 	})
 	return out, err
+}
+
+// purgeNSNow purges namespace n, its checks passed (PurgeNamespace), or
+// at Open (purgeRaisedE2E), as author: its content, sealed bytes and epoch
+// keys go, with its remote shadows', and a purge-ns entry is appended. It
+// returns the entry's ns_id.
+func (t *tx) purgeNSNow(n *nsRow, forced bool, author int64) string {
+	t.deleteArchives(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+	t.deleteDEKs(`ns = ?`, n.id)
+	// Sealed bytes and epoch keys go too (§E.2, §8.5).
+	t.deleteSealed(`ns = ?`, n.id)
+	t.deleteBlobEpochs(`ns = ?`, n.id)
+	t.deleteEpochKeys(n.id)
+	_, err := t.Exec(`UPDATE revisions SET patches = NULL, size = NULL, digest = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+	t.must(err)
+	_, err = t.Exec(`DELETE FROM heads WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+	t.must(err)
+	_, err = t.Exec(`DELETE FROM snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+	t.must(err)
+	_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+	t.must(err)
+	t.purgeBlobs(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+	_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE ns = ?`, statePurged, n.id)
+	t.must(err)
+	t.metaChanged = true
+	_, err = t.Exec(`UPDATE namespaces SET purged = 1 WHERE ns = ?`, n.id)
+	t.must(err)
+	// A remote branch's mirrored copy of its base goes too; nothing
+	// reaches the base (§G.3).
+	for _, sh := range t.remoteShadows(n) {
+		t.purgeShadowNS(sh)
+	}
+	entry := map[string]any{"kind": "purge-ns"}
+	if forced {
+		entry["forced"] = true
+	}
+	_, nsID := t.appendNS(n, entry, nil, nil, n.configSeq, author)
+	t.tags = append(t.tags, "ns:"+n.name)
+	t.flushDocs = true
+	return nsID.String()
 }

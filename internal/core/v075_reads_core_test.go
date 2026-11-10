@@ -70,9 +70,11 @@ func TestV075FilteredLiveCost(t *testing.T) {
 	}
 }
 
-// §B.11.9 Answers (scenario 91): /branches to a partial reader lists only
-// local branches in which its grant verifies and allows read: no remote
-// registrations, Private.
+// §B.11.9 Answers (TDA 68; v0.78: "a partial reader's /branches is 403"):
+// /branches to a partial reader is 403, as for any reader without
+// unrestricted read, a grant that also names a branch included. Before
+// v0.78 it listed, Private, the local branches its grant verified in.
+// It passes once ACCESS-9's reads.go change is in (V81-01).
 func TestV075BranchListPartial(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -90,17 +92,15 @@ func TestV075BranchListPartial(t *testing.T) {
 		t.Fatal(err)
 	}
 	all, err := w.e.BranchList(ctx, "matches", w.admin)
-	if err != nil || all.Private || len(all.List) != 2 {
+	if err != nil || len(all.List) != 2 {
 		t.Fatalf("admin: %+v %v", all, err)
 	}
-	bl, err := w.e.BranchList(ctx, "matches", w.li())
-	if err != nil || !bl.Private || len(bl.List) != 0 {
-		t.Fatalf("li: %+v %v", bl, err)
+	if bl, err := w.e.BranchList(ctx, "matches", w.li()); v75Status(err) != 403 {
+		t.Fatalf("li: %+v %v, want 403", bl, err)
 	}
 	both := w.li(map[string]any{"ns": []any{"matches", "matches-r7"}})
-	bl, err = w.e.BranchList(ctx, "matches", both)
-	if err != nil || !bl.Private || len(bl.List) != 1 || bl.List[0]["name"] != "matches-r7" {
-		t.Fatalf("li in both: %+v %v", bl, err)
+	if bl, err := w.e.BranchList(ctx, "matches", both); v75Status(err) != 403 {
+		t.Fatalf("li in both: %+v %v, want 403", bl, err)
 	}
 	// Uncovered: 403, as before v0.75.
 	w2 := newV75World(t, v75Opts{engine: func(o *Options) { o.NoFilteredReads = true }})

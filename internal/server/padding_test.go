@@ -56,11 +56,11 @@ func TestSealedPadding(t *testing.T) {
 		}
 	}
 	head := e.nsHead("s")
-	if ok, _ := openPadded(t, string(e.get("/ns/s/rev/"+head).Body), ke, "s#1", seal.NamespaceDocPL("s", head)); !ok {
+	if ok, _ := openPadded(t, string(e.get("/ns/s/rev/"+head).Body), nsKey(t, ke, "s"), "s#1", seal.NamespaceDocPL("s", head)); !ok {
 		t.Fatal("namespace document isn't padded")
 	}
 	rng := string(e.get("/ns/s/rev/" + head + "/log").Body)
-	if ok, pt := openPadded(t, rng, ke, "s#1", seal.RangePL("s", "", head)); !ok || !bytes.Contains(pt, []byte(a1)) {
+	if ok, pt := openPadded(t, rng, nsKey(t, ke, "s"), "s#1", seal.RangePL("s", "", head)); !ok || !bytes.Contains(pt, []byte(a1)) {
 		t.Fatal("log range isn't padded as a whole")
 	}
 

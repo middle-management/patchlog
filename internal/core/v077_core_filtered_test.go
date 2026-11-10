@@ -93,8 +93,9 @@ func TestV077OriginPurgedCatalogStaysCovered(t *testing.T) {
 	}
 }
 
-// §B.11.9 Branches: a dark catalog is skipped by the head-trust check, as
-// an e2e one is, so a branch of a namespace whose catalog is purged stays
+// §B.11.9 Where (v0.78: "Filtered reads cover no branch"): a branch of a
+// namespace whose catalog is purged isn't covered either. Before v0.78 a
+// dark catalog was skipped by the head-trust check and the branch stayed
 // covered.
 func TestV077OriginPurgedCatalogBranchCovered(t *testing.T) {
 	t.Parallel()
@@ -106,9 +107,11 @@ func TestV077OriginPurgedCatalogBranchCovered(t *testing.T) {
 	}
 	v077Purge(t, w, "cat-season")
 	w.inTx(func(t2 *tx) {
-		fs := t2.filteredScope(t2.nsByName("matches-r7"))
-		if fs == nil || fs.kind != fsBranch || len(fs.cats) != 1 || !fs.cats[0].dark() {
+		if fs := t2.filteredScope(t2.nsByName("matches-r7")); fs != nil {
 			t.Fatalf("matches-r7 after its root's catalog's purge: %+v", fs)
+		}
+		if fs := t2.filteredScope(t2.nsByName("matches")); fs == nil || !fs.cats[0].dark() {
+			t.Fatalf("matches after its catalog's purge: %+v", fs)
 		}
 	})
 }

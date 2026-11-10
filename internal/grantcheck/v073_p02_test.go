@@ -121,10 +121,11 @@ func TestV073NamespaceWide(t *testing.T) {
 		unrestricted, wide bool
 	}{
 		{"read", []string{"read"}, nil, true, true},
-		{"block rule on /now", []string{"read"}, map[string]any{"rules": []any{clock}}, true, false},
+		// A rule on /now fails every read (§C.2 item 5, v0.78).
+		{"block rule on /now", []string{"read"}, map[string]any{"rules": []any{clock}}, false, false},
 		{"fixed resource", []string{"read"}, map[string]any{"rules": []any{fixed}}, false, false},
 		{"reader role", nil, map[string]any{"roles": []any{"reader"}}, true, true},
-		{"role on /now", nil, map[string]any{"roles": []any{"clock"}}, true, false},
+		{"role on /now", nil, map[string]any{"roles": []any{"clock"}}, false, false},
 		{"role on /now beside a qualifying one", nil, map[string]any{"roles": []any{"clock", "reader"}}, true, true},
 		{"role on /resource", nil, map[string]any{"roles": []any{"prefixed"}}, false, false},
 		{"no read", []string{"append"}, nil, false, false},

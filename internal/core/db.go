@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"io/fs"
 	"runtime"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -22,23 +23,28 @@ import (
 var migrations embed.FS
 
 // openDB opens the database: a Postgres URL (openPG), or a SQLite
-// file or ":memory:".
+// file or ":memory:", migrated with fsys (nil: migrations). before, if
+// not nil, runs before its schema is migrated (checkLegacyE2E); an error
+// closes it.
 //
 // In SQLite, secure_delete zeroes deleted and overwritten content, so a
 // purge (and turning encryption at rest on, which rewrites rows) leaves no
 // plaintext in free pages once the WAL is checkpointed. Postgres has no
 // equivalent: deleted and overwritten tuples stay in the table's files
 // until VACUUM reclaims them (and in WAL and backups until those expire).
-func openDB(path string) (db *sql.DB, pg bool, err error) {
+func openDB(path string, fsys fs.FS, before func(db *sql.DB, pg bool) error) (db *sql.DB, pg bool, err error) {
+	if fsys == nil {
+		fsys = migrations
+	}
 	if isPostgresURL(path) {
-		db, err := openPG(path)
+		db, err := openPG(path, fsys, before)
 		return db, true, err
 	}
-	db, err = openSQLite(path)
+	db, err = openSQLite(path, fsys, before)
 	return db, false, err
 }
 
-func openSQLite(path string) (*sql.DB, error) {
+func openSQLite(path string, fsys fs.FS, before func(db *sql.DB, pg bool) error) (*sql.DB, error) {
 	// A database that an earlier release kept under another name (see
 	// sqlitedsn.Legacy) must be moved first: opened here it would be an
 	// empty one, and the blob sweep would delete its blob files.
@@ -67,7 +73,13 @@ func openSQLite(path string) (*sql.DB, error) {
 		db.SetMaxOpenConns(n)
 		db.SetMaxIdleConns(n)
 	}
-	if err := dbmigrate.Migrate(context.Background(), db, migrations, "patchlog"); err != nil {
+	if before != nil {
+		if err := before(db, false); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	if err := dbmigrate.Migrate(context.Background(), db, fsys, "patchlog"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}
@@ -75,7 +87,7 @@ func openSQLite(path string) (*sql.DB, error) {
 }
 
 // openPG opens a Postgres database and creates or migrates its schema.
-func openPG(url string) (*sql.DB, error) {
+func openPG(url string, fsys fs.FS, before func(db *sql.DB, pg bool) error) (*sql.DB, error) {
 	url, pool, err := parsePGPool(url)
 	if err != nil {
 		return nil, err
@@ -85,7 +97,13 @@ func openPG(url string) (*sql.DB, error) {
 		return nil, err
 	}
 	pool.sizeMain(db)
-	if err := dbmigrate.Migrate(context.Background(), db, migrations, "patchlog"); err != nil {
+	if before != nil {
+		if err := before(db, true); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	if err := dbmigrate.Migrate(context.Background(), db, fsys, "patchlog"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}

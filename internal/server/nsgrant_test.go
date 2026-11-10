@@ -161,7 +161,7 @@ func TestNSLogGrantSealed(t *testing.T) {
 	if keys == nil {
 		t.Fatalf("keys %d %s", kr.Code, kr.Body)
 	}
-	pt := open(t, string(r.Body), keys["s#1"], "s#1", seal.RangePL("s", "", head))
+	pt := open(t, string(r.Body), nsKey(t, keys["s#1"], "s"), "s#1", seal.RangePL("s", "", head))
 	v, err := jsonv.Parse(pt)
 	if err != nil {
 		t.Fatal(err)

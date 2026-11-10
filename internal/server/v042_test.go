@@ -191,7 +191,7 @@ func TestV042Grants(t *testing.T) {
 	if kr != nil && kr.Code != 200 {
 		t.Fatalf("keys %d %s", kr.Code, kr.Body)
 	}
-	pt := open(t, string(r.Body), keys["s#1"], "s#1", seal.GrantPL("s", gid))
+	pt := open(t, string(r.Body), nsKey(t, keys["s#1"], "s"), "s#1", seal.GrantPL("s", gid))
 	m := jsonv.MustParse(pt).(map[string]any)
 	if root, _ := m["root"].(map[string]any); m["id"] != gid || root["sub"] != "user:w" || m["stored"] == "" || m["stored"] == nil {
 		t.Fatalf("sealed grant %s", pt)

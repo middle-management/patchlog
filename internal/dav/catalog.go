@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"slices"
 	"sort"
 	"strconv"
@@ -168,7 +169,8 @@ func (st *reqState) tree(ctx context.Context, cat string) (*catGraph, *treeFiles
 // and what the write needs of the nodes is read from the node's own
 // document where the grant reads it, or, with tree-derived access, given
 // by the catalog's answer (catgrants.go); such a grant deletes no folder
-// (403, noFolderDelete).
+// nor moves one to another tree (403, noFolderDelete), and copies one
+// checked against the tree service's ancestors (notCopiedInto).
 func (st *reqState) writeTree(ctx context.Context, cat string) (*catGraph, *treeFiles, error) {
 	c, err := st.treeConf(ctx, cat)
 	if err != nil {
@@ -188,13 +190,13 @@ func (st *reqState) writeTree(ctx context.Context, cat string) (*catGraph, *tree
 	return st.tree(ctx, cat)
 }
 
-// noFolderDelete is the refusal of a folder's delete, a copy or a move to
-// another tree, by a grant that doesn't read catalog cat's node
-// documents (writeTree): a folder's emptiness is taken only from them,
-// and a grant that can't read them deletes no folder (§H.4 "Names before
-// writes"), nor copies one, which reads its $access and children there.
+// noFolderDelete is the refusal of a folder's delete, or its move to
+// another tree, which deletes it once empty, by a grant that doesn't read
+// catalog cat's node documents (writeTree): a folder's emptiness is taken
+// only from them, and a grant that can't read them deletes no folder
+// (§H.4 "Names before writes", §H.5 Delete a folder).
 func noFolderDelete(cat, p string) error {
-	return fail(http.StatusForbidden, "%s isn't deleted, copied or moved to another tree: your grant doesn't read catalog %s's node documents, which a folder's emptiness and access settings are taken from (§H.4 \"Names before writes\", §H.5); a grant that can't read them deletes no folder", p, cat)
+	return fail(http.StatusForbidden, "%s isn't deleted or moved to another tree: your grant doesn't read catalog %s's node documents, which a folder's emptiness is taken from (§H.4 \"Names before writes\", §H.5); a grant that can't read them deletes no folder", p, cat)
 }
 
 // nodeDocFor is a new node's document (nodeDoc) in folder of catalog
@@ -1770,42 +1772,6 @@ func (st *reqState) moveFolder(ctx context.Context, src, dst target) error {
 	return fail(http.StatusForbidden, "%s can't be moved to %s", src.path, dst.path)
 }
 
-// accessRefused refuses (403) to copy folder src, or move it to another
-// tree, where it carries $access or sits under a folder that does
-// (§B.11.1), as the node documents of catalog graph cg have it: the copy
-// is made without it (§H.5), which only catalog-admins set (§B.11.3), and
-// whether a copy may so widen who reads what is copied is open (§B.12).
-// Until that is settled the gateway refuses (F-H12); $access means
-// something only in a tree with tree-derived access (§B.11), so a tree
-// whose folders carry it is taken for one.
-func (st *reqState) accessRefused(cg *catGraph, src target) error {
-	seen := map[string]bool{}
-	var carrier func(n *tree.Node) *tree.Node
-	carrier = func(n *tree.Node) *tree.Node {
-		if n == nil || seen[n.Name] {
-			return nil
-		}
-		seen[n.Name] = true
-		if n.HasAccess {
-			return n
-		}
-		for _, p := range cg.g.WalkableParents(n) {
-			if c := carrier(cg.g.Node(p)); c != nil {
-				return c
-			}
-		}
-		return nil
-	}
-	c := carrier(cg.g.Node(src.node))
-	switch {
-	case c == nil:
-		return nil
-	case c.Name == src.node:
-		return fail(http.StatusForbidden, "folder %s carries access settings ($access, §B.11.1), which its copy wouldn't (§H.5): whether a copy may widen who reads what is in it is open (§B.12), so this server doesn't copy it, nor move it to another tree", src.path)
-	}
-	return fail(http.StatusForbidden, "folder %s is in a folder that carries access settings ($access, §B.11.1), which its copy wouldn't have (§H.5): whether a copy may widen who reads what is in it is open (§B.12), so this server doesn't copy it, nor move it to another tree", src.path)
-}
-
 // copyFolder makes t, the copy of a folder a COPY makes (§H.5 "Copy"),
 // before x/net/webdav copies the folder's visible children (its listing,
 // dirFile) into it one by one, unless Depth: 0 asks for the folder alone;
@@ -1813,11 +1779,15 @@ func (st *reqState) accessRefused(cg *catGraph, src target) error {
 // answered as that child's copy would be. The folder copied is the one
 // at t's place below the COPY's source: a tree's folder, copied to a new
 // name of a tree as a new folder node titled with that name and without
-// the source's $access (mkFolder), not into itself or a folder in it,
-// and not where it carries $access or sits under a folder that does
-// (accessRefused). Onto an existing folder or file it is 403 (412 with
-// Overwrite: F, x/net/webdav's), and to another case of a sibling's name
-// 409 (§H.2 "Siblings"), either setting a guard (§H.6); a namespace's
+// the source's $access (mkFolder), not into itself or a folder in it
+// (from the node documents where the grant reads them, else from the
+// tree service, notCopiedInto). One that carries $access or sits under
+// a folder that does is copied too: the copier reads what it copies,
+// which Protection allows, and the catalog service sees no content
+// (§B.11.4 Copies, §2.1); what bounds where it goes is who may read it.
+// Onto an existing folder or file it is 403 (412 with Overwrite: F,
+// x/net/webdav's), and to another case of a sibling's name 409 (§H.2
+// "Siblings"), either setting a guard (§H.6); a namespace's
 // directory, a tree's top level and a scratch directory aren't copied,
 // but an app's scratch directory in the folder copied, which its listing
 // shows, is copied as one, with what is in it (§H.6), as a move to
@@ -1865,21 +1835,106 @@ func (st *reqState) copyFolder(ctx context.Context, t target) error {
 	default:
 		return fail(http.StatusForbidden, "folder %s is copied only into a file tree: %s isn't a new name in one, and a namespace's directory (the flat view) has no folders (§H.2)", src.path, t.path)
 	}
-	cg, _, err := st.writeTree(ctx, src.ns)
-	if err != nil {
+	cg, f, err := st.writeTree(ctx, src.ns)
+	switch {
+	case err != nil:
 		return err
-	}
-	if cg == nil {
-		return noFolderDelete(src.ns, src.path)
-	}
-	if t.ns == src.ns && (t.parent == src.node || cg.g.Descendants([]string{src.node})[t.parent]) {
-		return fail(http.StatusForbidden, "folder %s can't be copied into itself or a folder in it (§H.5)", src.path)
-	}
-	if err := st.accessRefused(cg, src); err != nil {
-		return err
+	case t.ns != src.ns:
+		// Another catalog: src isn't above it.
+	case cg == nil:
+		if err := st.notCopiedInto(ctx, f, src, t); err != nil {
+			return err
+		}
+	case t.parent == src.node || cg.g.Descendants([]string{src.node})[t.parent]:
+		return copiedIntoItself(src)
 	}
 	_, err = st.makeFolder(ctx, t)
 	return err
+}
+
+// copiedIntoItself refuses to copy folder src into itself or a folder in
+// it (403, §H.5), which the copy of its children, folder by folder, would
+// reach again.
+func copiedIntoItself(src target) error {
+	return fail(http.StatusForbidden, "folder %s can't be copied into itself or a folder in it (§H.5)", src.path)
+}
+
+// notCopiedInto refuses to copy folder src to dst, a new name in src's
+// tree, for a grant that lists it through the tree service and doesn't
+// read its node documents (writeTree's nil graph), where dst's new parent
+// is src or below it: a path below src's, or src on a path of the tree
+// service's ancestors of dst.parent (§B.5), read with the user's catalog
+// writes it is to wait for (?min), as a listing is (serviceDir). Those
+// paths run through the folders the reader sees only, which are all the
+// copy of src's children lists (dirFile), so a folder that only a hidden
+// one leads to from src is no loop, and refusing over it would show the
+// hidden one; an answer cut short (truncated, tooDeep), or without
+// paths, leaves it unchecked, refused too (403), and a tree service
+// behind the user's writes is 503, try again. Nothing is read of the
+// node documents, so no $access either (§B.11.4 Copies).
+func (st *reqState) notCopiedInto(ctx context.Context, f *treeFiles, src, dst target) error {
+	if dst.parent == src.node || strings.HasPrefix(dst.path, strings.TrimSuffix(src.path, "/")+"/") {
+		return copiedIntoItself(src)
+	}
+	if dst.parent == f.root {
+		// The tree's top: src, below it, is above it only on a cycle,
+		// which no traversal follows (§B.5).
+		return nil
+	}
+	now := st.s.opt.Now()
+	behind := func() error {
+		e := fail(http.StatusServiceUnavailable, "folder %s isn't copied yet: catalog %s's tree service hasn't caught up with your latest writes, so that %s isn't in it can't be checked, and your grant doesn't read the catalog's nodes otherwise; try again in a moment (§H.5, §H.7 \"Limited grants\")", src.path, src.ns, dst.dir)
+		e.header = http.Header{"Retry-After": {"1"}}
+		return e
+	}
+	// Folders' parents are the catalog's alone.
+	mins, _ := st.p.ts.mins([]string{src.ns}, now)
+	q := url.Values{"of": {dst.parent}}
+	parent := ctx
+	if len(mins) > 0 {
+		if st.p.ts.isSlow(src.ns, now) {
+			return behind()
+		}
+		q["min"] = mins
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, st.s.opt.TreeWait)
+		defer cancel()
+	}
+	u, err := url.Parse(st.s.treeURL(src.ns) + "/" + src.ns + "/ancestors?" + q.Encode())
+	if err != nil {
+		return err
+	}
+	var a *svcAnswer
+	for hops := 0; a == nil; hops++ {
+		if hops > 4 {
+			return fail(http.StatusBadGateway, "catalog %s's tree service redirected the ancestors of %s more than 4 times", src.ns, dst.dir)
+		}
+		var loc *url.URL
+		a, loc, err = st.svcGet(ctx, src.ns, u, len(mins) > 0)
+		switch {
+		case errors.Is(err, errBehind), errors.Is(err, errMinsRefused), err != nil && len(mins) > 0 && ctx.Err() != nil && parent.Err() == nil:
+			if errors.Is(err, errBehind) {
+				st.p.ts.setSlow(src.ns, now.Add(slowFor))
+			}
+			return behind()
+		case err != nil:
+			return err
+		case loc != nil:
+			u = loc
+		}
+	}
+	st.p.ts.reached(mins)
+	if a.Paths == nil || a.Truncated || a.TooDeep > 0 {
+		return fail(http.StatusForbidden, "folder %s isn't copied: catalog %s's tree service didn't list every path above %s (more folders than it lists at once), so that none of them is %s can't be checked (§H.5, §B.5)", src.path, src.ns, dst.dir, src.path)
+	}
+	for _, p := range a.Paths {
+		for _, n := range p {
+			if n.Name == src.node {
+				return copiedIntoItself(src)
+			}
+		}
+	}
+	return nil
 }
 
 // moveFolderAcross moves folder src to dst, a new name in another tree
@@ -1890,11 +1945,11 @@ func (st *reqState) copyFolder(ctx context.Context, t target) error {
 // delete of the source, its item taking $successor where it leaves its
 // namespace), a folder as this, and src deleted once empty (deleteFolder).
 // A failure part-way leaves what was done, with no rollback, and is
-// answered as that child's MOVE would be. Before anything is written: a
-// folder that carries $access or sits under one isn't moved
-// (accessRefused), nor one the grant can't delete, or unlink where it has
-// several parents (allows). The MOVE's If-Match names src's node
-// (srcPrecondition), not its files.
+// answered as that child's MOVE would be. A folder that carries $access
+// or sits under one moves so too, as a copy does (§B.11.4 Copies). Before
+// anything is written: one the grant can't delete, or unlink where it has
+// several parents, isn't moved (allows). The MOVE's If-Match names src's
+// node (srcPrecondition), not its files.
 func (st *reqState) moveFolderAcross(ctx context.Context, src, dst target) error {
 	cg, _, err := st.writeTree(ctx, src.ns)
 	if err != nil {
@@ -1902,9 +1957,6 @@ func (st *reqState) moveFolderAcross(ctx context.Context, src, dst target) error
 	}
 	if cg == nil {
 		return noFolderDelete(src.ns, src.path)
-	}
-	if err := st.accessRefused(cg, src); err != nil {
-		return err
 	}
 	verb := "delete"
 	if n := cg.g.Node(src.node); n != nil && len(cg.g.WalkableParents(n)) > 1 {
@@ -1931,8 +1983,8 @@ func (st *reqState) moveInto(ctx context.Context, src, dst target) error {
 	if err != nil {
 		return err
 	}
-	cg, err := st.freshGraph(ctx, src.ns)
-	if err != nil {
+	// The node documents as they are now, folder made (nodeDir).
+	if _, err := st.freshGraph(ctx, src.ns); err != nil {
 		return err
 	}
 	d, err := st.nodeDir(ctx, src.ns, src.node)
@@ -1949,9 +2001,6 @@ func (st *reqState) moveInto(ctx context.Context, src, dst target) error {
 		to := target{kind: kNewNode, path: dst.path + "/" + e.name, dir: dst.path, base: e.name, ns: dst.ns, parent: node, title: title}
 		if e.node.Kind == kindFolder {
 			from.kind = kFolder
-			if err := st.accessRefused(cg, from); err != nil {
-				return err
-			}
 			if err := st.moveInto(ctx, from, to); err != nil {
 				return err
 			}

@@ -12,9 +12,9 @@ import (
 )
 
 // W3X (P29 ENC-38 x the tree service; §E.2.6, §12.1): the catalog a tree
-// service follows is raised from none to e2e (allowed since P29), and the
-// service has no keyring recipient key, so it lacks the catalog's keys as
-// configured. Running through the raise, it skips the catalog and stops
+// service follows is raised from none to sealed (until v0.81 to e2e,
+// which is 422 since v0.78), and the service holds no keys and fetches
+// none (client.StaticKeys), so it lacks the catalog's keys as configured. Running through the raise, it skips the catalog and stops
 // following it, as it does when it starts: listings answer 404, not 503
 // behind forever, and a restart answers the same.
 func TestW3XTreeCatalogRaisedToE2EWhileFollowed(t *testing.T) {
@@ -29,12 +29,13 @@ func TestW3XTreeCatalogRaisedToE2EWhileFollowed(t *testing.T) {
 	must(c.CreateNamespace(ctx, "cat", map[string]any{"read": "public", "catalog": map[string]any{"trust": []any{"matches"}, "mode": "dag"}}))
 	must(c.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
 	db := filepath.Join(t.TempDir(), "tree.db")
-	x := startSvc(t, c, svcOpts{db: db})
+	sc := s.Client(t, client.WithAuthor("svc"), client.WithKeys(client.StaticKeys()))
+	x := startSvc(t, sc, svcOpts{db: db})
 	x.caughtUp("cat", "matches")
 	x.get("/cat/roots", "")
 	h := must(c.NSHead(ctx, "cat"))
 	must(c.PatchConfig(ctx, "cat", h.Config, []any{map[string]any{"op": "add", "path": "/encryption",
-		"value": map[string]any{"level": "e2e", "epoch": 1}}}))
+		"value": map[string]any{"level": "sealed", "epoch": 1}}}))
 	roots := func(y *svc) resp {
 		r := y.raw("/cat/roots", "")
 		for r.status == 302 {
@@ -52,6 +53,6 @@ func TestW3XTreeCatalogRaisedToE2EWhileFollowed(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	x.stop()
-	y := startSvc(t, c, svcOpts{db: db})
+	y := startSvc(t, sc, svcOpts{db: db})
 	waitFor(t, "404 after a restart", func() bool { return roots(y).status == 404 })
 }

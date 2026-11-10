@@ -223,7 +223,7 @@ func TestV073SealedEntryCarriesVia(t *testing.T) {
 	head := e.nsHead("s")
 	rr := e.get("/ns/s/rev/" + head + "/log")
 	expect(t, rr, 200)
-	pt = open(t, string(rr.Body), ke, "s#1", seal.RangePL("s", "", head))
+	pt = open(t, string(rr.Body), nsKey(t, ke, "s"), "s#1", seal.RangePL("s", "", head))
 	entries := jsonv.MustParse(pt).([]any)
 	if m := entries[len(entries)-1].(map[string]any); !slices.Equal(viaOf(t, m), []string{"svc:a", "svc:b"}) {
 		t.Errorf("sealed namespace entry %v, want via", m)
@@ -669,7 +669,7 @@ func TestV073GrantStoredOneString(t *testing.T) {
 	expect(t, kr, 200)
 	r = s.get("/ns/s/grants/"+sgid, sg)
 	expect(t, r, 200)
-	pt := open(t, string(r.Body), keys["s#1"], "s#1", seal.GrantPL("s", sgid))
+	pt := open(t, string(r.Body), nsKey(t, keys["s#1"], "s"), "s#1", seal.GrantPL("s", sgid))
 	checkStored(t, jsonv.MustParse(pt).(map[string]any), sgid, k.priv.Public().(ed25519.PublicKey))
 }
 
@@ -730,7 +730,7 @@ func TestV073LegacySealedGrantConverted(t *testing.T) {
 	if string(r.Body) == legacy {
 		t.Fatal("the legacy sealed answer is served")
 	}
-	pt := open(t, string(r.Body), keys["s#1"], "s#1", seal.GrantPL("s", sgid))
+	pt := open(t, string(r.Body), nsKey(t, keys["s#1"], "s"), "s#1", seal.GrantPL("s", sgid))
 	checkStored(t, jsonv.MustParse(pt).(map[string]any), sgid, k.priv.Public().(ed25519.PublicKey))
 	if again := s.get("/ns/s/grants/"+sgid, sg); string(again.Body) != string(r.Body) {
 		t.Fatal("the converted answer's bytes differ between reads")

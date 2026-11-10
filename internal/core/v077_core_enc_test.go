@@ -45,28 +45,3 @@ func TestV077EncNoAnswerTransient(t *testing.T) {
 		t.Errorf("fetchErr of a 403: %v, want 422", e)
 	}
 }
-
-// §G.5.2 E3 sources: A's answers to a sealing B asks for, as recorded.
-func TestV077EncPendingAnswer(t *testing.T) {
-	t.Parallel()
-	for _, c := range []struct {
-		st            int
-		body          string
-		err           error
-		answer, horiz string
-	}{
-		{0, "", context.DeadlineExceeded, pendTransient, ""},
-		{503, "", nil, pendTransient, ""},
-		{408, "", nil, pendTransient, ""},
-		{429, "", nil, pendTransient, ""},
-		{403, `{"code":"forbidden"}`, nil, pendRefused, ""},
-		{404, "", nil, pendRefused, ""},
-		{410, `{"code":"gone"}`, nil, pendRefused, ""},
-		{410, `{"code":"pruned","horizon":"1abc"}`, nil, pendPruned, "1abc"},
-	} {
-		a, h := pendingAnswer(c.st, []byte(c.body), c.err)
-		if a != c.answer || h != c.horiz {
-			t.Errorf("%d %s %v: %s %q, want %s %q", c.st, c.body, c.err, a, h, c.answer, c.horiz)
-		}
-	}
-}

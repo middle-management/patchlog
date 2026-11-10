@@ -98,7 +98,9 @@ func TestV073UnwrapRelayed(t *testing.T) {
 	if _, err := UnwrapRelayed(reader, forged, []*ecdh.PublicKey{other.PublicKey()}); !errors.Is(err, ErrDecrypt) {
 		t.Fatalf("forged from: %v", err)
 	}
-	// Base mode: an E2 key, and a legacy entry.
+	// Base mode: an E2 key opens; an entry of a keyring stored before
+	// v0.63, under that time's info, no longer does (v0.78: "Reading this
+	// spec").
 	base, _ := WrapKey(reader.PublicKey(), "e#1", "", ke)
 	if k, err := UnwrapRelayed(reader, base, nil); err != nil || !bytes.Equal(k, ke) {
 		t.Fatalf("base mode: %v", err)
@@ -107,11 +109,11 @@ func TestV073UnwrapRelayed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lw, err := hpke.Seal(pk, hpke.HKDFSHA256(), hpke.AES256GCM(), legacyWrapInfo("e#1", ""), ke)
+	lw, err := hpke.Seal(pk, hpke.HKDFSHA256(), hpke.AES256GCM(), []byte("patchlog-keys-v1\ne#1"), ke)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if k, err := UnwrapRelayed(reader, WrappedKey{Kid: "e#1", Wrapped: lw}, nil); err != nil || !bytes.Equal(k, ke) {
+	if _, err := UnwrapRelayed(reader, WrappedKey{Kid: "e#1", Wrapped: lw}, nil); !errors.Is(err, ErrDecrypt) {
 		t.Fatalf("legacy info: %v", err)
 	}
 }

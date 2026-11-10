@@ -515,14 +515,14 @@ func (t *tx) encryptResource(res int64) {
 // --- configuration checks -----------------------------------------------------
 
 // checkEncryption checks a namespace document's encryption level (§7.4,
-// Addendum E Levels): a key store is needed for any level, a level is
-// never lowered or removed, and a raise to e2e starts a new epoch. cur is
-// nil for a new namespace. baseLevel is
-// the level of a branch's local base, -1 if there is none: a branch is at
-// least at its base's level, and e2e only over an e2e base, which its
-// creation and a raise to e2e are checked against; other config writes
-// don't check it (Addendum E, Branches and dependents). Refusals are 422
-// invalid with errors pointing at the member, as branch fields are (§7.4).
+// Addendum E Levels): a key store is needed for any level, and a level is
+// never lowered or removed, nor raised to e2e (checkNoE2ERaise). cur is
+// nil for a new namespace. baseLevel is the level of a branch's local
+// base, -1 if there is none: a branch is at least at its base's level, and
+// e2e exactly when its base is, which only its creation is checked
+// against; config writes don't check it (Addendum E, Branches and
+// dependents). Refusals are 422 invalid with errors pointing at the
+// member, as branch fields are (§7.4).
 func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 	if cfg.level > levelNone && t.e.opt.KeyStore == nil {
 		return docInvalid("/encryption", "/encryption: no key store configured on this server")
@@ -530,25 +530,16 @@ func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 	if cur != nil && cfg.level < cur.level {
 		return docInvalid("/encryption", "/encryption: the encryption level cannot be lowered or removed")
 	}
-	toE2E := cfg.level == levelE2E && (cur == nil || cur.level < levelE2E)
-	if baseLevel >= 0 && (cur == nil || toE2E) {
+	if err := t.checkNoE2ERaise(cur, cfg); err != nil {
+		return err
+	}
+	if baseLevel >= 0 && cur == nil {
 		if cfg.level < baseLevel {
 			return docInvalid("/encryption", "/encryption: a branch cannot have a lower encryption level than its base")
 		}
 		if cfg.level == levelE2E && baseLevel < levelE2E {
 			return docInvalid("/encryption", "/encryption: a branch can be e2e only if its base is")
 		}
-	}
-	// A raise to e2e (Addendum E Levels, Changing it) starts a new epoch.
-	// From sealed it must be the current one plus one: the origin holds
-	// the earlier epochs' keys, so they mustn't seal anything written end
-	// to end. From none or at-rest, which have no epoch keys, any epoch
-	// from 1 serves (F-E1); an absent one is 1. What was stored before the
-	// raise keeps its level: e2eConfigWritten records the raise, and it is
-	// served as at the level before, from sealed sealed under the last
-	// epoch before the raise (preraise.go).
-	if cur != nil && toE2E && cur.level == levelSealed && cfg.Epoch != cur.Epoch+1 {
-		return docInvalid("/encryption/epoch", fmt.Sprintf("/encryption/epoch must be %d: a raise from sealed to e2e starts a new epoch, since the origin holds the keys of epoch %d and before (Addendum E Levels)", cur.Epoch+1, cur.Epoch))
 	}
 	// Epochs (§E.2.1): in a namespace already at sealed or e2e, the epoch
 	// only moves forward, one at a time. A new namespace or branch, or one
@@ -557,6 +548,22 @@ func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 		return docInvalid("/encryption/epoch", fmt.Sprintf("/encryption/epoch can only stay at %d or be incremented to %d", cur.Epoch, cur.Epoch+1))
 	}
 	return nil
+}
+
+// checkNoE2ERaise refuses a config write that raises an existing
+// namespace to e2e: a namespace is end-to-end from its creation or never
+// (Addendum E Levels, Changing it), whatever its base or source, so a
+// remote branch's is refused before its source is read (§G.5.2). Content
+// that should become end-to-end is written into a new e2e namespace by a
+// key holder (§G.5.1), which no reference tool does: the importer refuses
+// plaintext into an e2e target. Options.LegacyE2ERaiseForTests lets it through, only
+// recording the configuration, as a pre-v0.78 source did.
+func (t *tx) checkNoE2ERaise(cur, cfg *Config) *Error {
+	if cur == nil || cfg.level != levelE2E || cur.level >= levelE2E || t.e.opt.LegacyE2ERaiseForTests {
+		return nil
+	}
+	return docInvalid("/encryption", "/encryption: a namespace is end-to-end from its creation or never, so a write can't raise it to e2e (Addendum E Levels); "+
+		"to make its content end-to-end, a key holder writes it into a new e2e namespace, re-sealing each document (§G.5.1); no reference tool imports plaintext into one")
 }
 
 // lowerDependents lists the unpurged branches of n below level: raising n
