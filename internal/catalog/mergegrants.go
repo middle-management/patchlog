@@ -159,6 +159,11 @@ const ApproverHeader = "Approver-Authorization"
 // one goes under, whose dry run it is (§F.8, F-T4).
 const AdminHeader = "Admin-Authorization"
 
+// serveMergeGrants answers POST /merge-grants. Its grants are write grants
+// only, under the merge key, for the merge service to submit a batch to
+// the catalog (§F.8), and rules on /now for writes are unchanged (§C.2
+// item 5, v0.78), so none of its grants is refused for them, as POST
+// /grants and POST /read-grants refuse them (authenticateRead).
 func (s *Service) serveMergeGrants(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	v, err := s.Authenticate(r.Context(), r)
