@@ -13,24 +13,30 @@ package client
 //     (§E.3.1). Unless WithoutValidation, the resulting document is
 //     validated against its $schema first (§E.3.2: validation moves to
 //     clients); a create applies to the document null (§6.2 step 3).
-//   - Reads (DocE2E, LoadE2E) follow the X-E2E: fold redirect of
-//     /r/{ns}/{name}/rev/{id} to the log, open every sealed patch set
-//     (checking kid, pl {ns, name, parent}, the id chain and each id over the
-//     ciphertext), fold from genesis or, when the redirect's since is a
-//     pruning horizon, from its sealed snapshot, which /rev/{since} serves
-//     (never the log, §7.1 Paging, §8.6), and verify every intermediate
-//     document that has a $schema. /rev/{id} of a horizon answers its
-//     snapshot directly (X-E2E: snapshot).
-//     Patch sets and snapshots open under K_r, or under K_e, which sealed
-//     them before v0.65. A revision that doesn't validate, declares the
-//     wrong blobs or isn't padded is flagged with its author and still
-//     folded; one that doesn't open or apply is flagged and folded as []
-//     (§E.3.2). A base's namespace in pl and kid is accepted only for
-//     entries up to where a branch's chain forked from that base
-//     (chainCheck).
-//   - PruneE2E folds the horizon's document and supplies it sealed as the
-//     prune's snapshot (§8.6) under the epoch the newest content revision
-//     of its chain sets (snapshotEpoch, §E.3.1).
+//   - Reads (DocE2E, LoadE2E) ask /r/{ns}/{name}/rev/{id}. The server never
+//     folds (§7.1): it answers a prune's stored snapshot, 200
+//     application/jose, which is the document, or 404 not_offered naming
+//     the resource's horizon, and last, the parent of a tombstone horizon.
+//     The reader folds the log up to id from last, else horizon, else from
+//     genesis: /rev/{start} serves start's snapshot (never the log, §7.1
+//     Paging, §8.6), and /rev/{id}/log?since={start} the range. It opens
+//     every sealed patch set (checking kid, pl {ns, name, parent}, the id
+//     chain and each id over the ciphertext) and verifies every
+//     intermediate document that has a $schema. Patch sets and snapshots
+//     open under K_r only, bound to pl exactly (§E.2.1, §E.3.1); nothing
+//     sealed under K_e or in an earlier draft's form opens. A revision that
+//     doesn't validate, declares the wrong blobs or isn't padded is flagged
+//     with its author and still folded; one that doesn't open or apply is
+//     flagged and folded as [] (§E.3.2). A base's namespace in pl and kid is
+//     accepted only for entries up to where a branch's chain forked from
+//     that base (chainCheck).
+//   - PruneE2E folds the horizon's document (at a tombstone, the last live
+//     one, its parent's) and supplies it sealed as the prune's snapshot
+//     (§8.6), bound to that revision, under the epoch the newest content
+//     revision of its chain sets (snapshotEpoch, §E.3.1).
+//   - The message bound (§E.2.1): a view counts the sealings under each
+//     resource's K_r of an epoch, refuses one past the bound
+//     (ErrSealBound) and reports rotation due (SealStatus).
 //   - Blobs (§E.3.1, sealedblobs.go). Writes declare the blobs of the
 //     resulting document in the sealed op (BlobIDs), so a write folds the
 //     document even WithoutValidation; folds flag a revision whose list
@@ -39,9 +45,9 @@ package client
 //     the namespace's plaintext "keyring" resource (seal.KeyringV2,
 //     §E.3.2), each entry wrapped in HPKE auth mode under the view's own
 //     recipient key, the admin key its from names; RotateEpoch bumps
-//     encryption.epoch in the same batch. MigrateKeyring wraps a keyring
-//     stored in the format before v0.63 (seal.Keyring) again, which the
-//     server refuses to have written now.
+//     encryption.epoch in the same batch. A keyring in the format before
+//     v0.63 (seal.Keyring) isn't read: a key holder wraps it again with
+//     the v0.26.1 client before upgrading.
 //
 // Epoch keys come from keys added with AddKey, else (with a recipient
 // private key) from POST /ns/{ns}/keys, which relays the keyring entries
@@ -53,11 +59,13 @@ package client
 // WithTrustedKeyringSenders), and skips entries from any other. It seals
 // only under keys whose entry is from a sender it trusts to distribute
 // keys (SealKey): with trusted senders named, those and its own keys;
-// with none, every sender it knows; never a key without a sender, which
-// /keys relays in base mode or in the clear, or a keyring stored before
-// v0.63 holds, since the server can wrap those itself. Where the first key
-// found isn't trusted, SealKey looks on for an entry that is. Reads open
-// keys from any known sender, and keys without one.
+// with none, every sender it knows. Where the first key found isn't
+// trusted, SealKey looks on for an entry that is. Reads open keys from any
+// known sender. A key without a sender, which /keys relays in the clear or
+// in base mode as at E2, is neither opened with nor sealed under: at E3
+// the server relays only keyring entries (§E.3.2), and could have wrapped
+// such a key itself. A keyring in the format before v0.63 isn't read at
+// all (Keyring).
 // Writes seal under the current epoch, with the pad setting, both from the
 // namespace document, or, for a writer limited to some resources that
 // can't read it (§C.5), from what POST /ns/{ns}/keys names beside the keys
@@ -78,11 +86,9 @@ package client
 import (
 	"context"
 	"crypto/ecdh"
+	"crypto/sha256"
 	"errors"
 	"fmt"
-	"net/url"
-	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -111,7 +117,12 @@ type E2E struct {
 	schemas    *e2eSchemas
 	pads       *e2ePads
 	forks      *e2eForks
+	seals      *e2eSeals
 	noValidate bool
+	// sealBound and sealMargin are the message bound this view keeps each
+	// K_r within, and how far below it rotation is due (WithSealBound,
+	// §E.2.1); 0 for the defaults.
+	sealBound, sealMargin int64
 }
 
 // e2eForks caches, per branch and resource, the revisions its chain forked
@@ -138,9 +149,8 @@ type e2eKeys struct {
 	mu sync.Mutex
 	m  map[string][]byte // kid -> K_e
 	// from is, per kid, where its key came from: the thumbprint of the
-	// sender of the keyring entry it was unwrapped from, "" for an entry
-	// without one (a keyring stored before v0.63), or fromSelf for a key
-	// added directly (AddKey) or made by the view (§E.3.2).
+	// sender of the keyring entry it was unwrapped from, or fromSelf for a
+	// key added directly (AddKey) or made by the view (§E.3.2).
 	from map[string]string
 }
 
@@ -173,7 +183,8 @@ func (c *Client) E2E(recipient *ecdh.PrivateKey) *E2E {
 		keys:    &e2eKeys{m: map[string][]byte{}, from: map[string]string{}},
 		schemas: newE2ESchemas(),
 		pads:    &e2ePads{m: map[string]*padHistory{}},
-		forks:   &e2eForks{m: map[string][]string{}}}
+		forks:   &e2eForks{m: map[string][]string{}},
+		seals:   &e2eSeals{m: map[string]*sealCount{}}}
 }
 
 // WithRecipient returns a view that also unwraps keys with priv, sharing
@@ -229,9 +240,8 @@ func WithTrustedKeyringSenders(pubs ...*ecdh.PublicKey) Option {
 
 // ErrUntrustedKey reports an epoch key the view may read with but won't
 // seal under: its keyring entry's from names a sender the view doesn't
-// trust to distribute keys, or it has no sender at all (a keyring stored
-// before v0.63, or a key /keys relays without from), and anyone, the
-// server included, can wrap a key to a thumbprint (§E.3.2).
+// trust to distribute keys, and anyone, the server included, can wrap a
+// key to a thumbprint (§E.3.2).
 var ErrUntrustedKey = errors.New("client: the key's keyring entry is from a sender this view doesn't trust to distribute keys (§E.3.2)")
 
 // knownSenders lists the keyring senders the view opens entries from: its
@@ -252,10 +262,9 @@ func (x *E2E) knownSenders() []*ecdh.PublicKey {
 // entry names from (e2eKeys.from) as its sender: its own recipient keys
 // and keys added directly always; with trusted senders named (WithTrusted,
 // WithTrustedKeyringSenders), those; with none, every known sender, whose
-// public key came out of band too. A key without a sender ("") never: an
-// entry of a keyring stored before v0.63, or one /keys relays in base mode
-// or in the clear (as at E2, for an epoch before a raise to e2e), which
-// anyone, the server included, can have wrapped (§E.3.2).
+// public key came out of band too. A key without a sender ("") never
+// (findKey takes none): anyone, the server included, can have wrapped it
+// (§E.3.2).
 func (x *E2E) trustedFrom(from string) bool {
 	if from == fromSelf {
 		return true
@@ -418,24 +427,24 @@ func (x *E2E) findKey(ctx context.Context, kid, via string, accept func(from str
 			if e.Kid != kid || e.Resource != "" {
 				continue
 			}
-			// A key in the clear, or wrapped in base mode without from,
-			// has no sender: at E3 the server relays only keyring entries
-			// (§E.3.1), and gives such keys only for epochs before a raise
-			// to e2e, as at E2 (Addendum E, Levels). Reads may open with
-			// them; nothing seals under them (trustedFrom).
-			key, from := e.Key, ""
-			if key == nil {
-				if key, err = unwrapRelayed(privs, e.Wrapped, x.knownSenders()); err != nil {
-					// Not the key for us, or from a sender this view
-					// doesn't know (anyone can wrap to a thumbprint,
-					// §E.3.2): the other relay or the keyring may still
-					// hold it.
-					unwrapErr = fmt.Errorf("client: unwrapping %s: %w", kid, err)
-					continue
-				}
-				from = e.Wrapped.From
+			// At E3 the server relays only keyring entries, each naming
+			// its sender (§E.3.2); a namespace is e2e from its creation,
+			// so no epoch of it was ever served as at E2 (v0.78). A key in
+			// the clear, or wrapped in base mode without from, has no
+			// sender: the server can have made it up, so it is skipped,
+			// for reads too.
+			if e.Key != nil || e.Wrapped.From == "" {
+				continue
 			}
-			if take(key, from) {
+			key, err := unwrapRelayed(privs, e.Wrapped, x.knownSenders())
+			if err != nil {
+				// Not the key for us, or from a sender this view doesn't
+				// know (anyone can wrap to a thumbprint, §E.3.2): the
+				// other relay or the keyring may still hold it.
+				unwrapErr = fmt.Errorf("client: unwrapping %s: %w", kid, err)
+				continue
+			}
+			if take(key, e.Wrapped.From) {
 				return key, nil
 			}
 		}
@@ -443,21 +452,20 @@ func (x *E2E) findKey(ctx context.Context, kid, via string, accept func(from str
 	// Then the keyring itself (a key holder may read it directly), if it
 	// is the namespace's own: a branch without one reads its base's
 	// through, whose entries name the base's keys, not "{branch}#{e}".
-	kr, old, _, err := x.keyring(ctx, ns)
+	var ringErr error
+	kr, _, err := x.keyring(ctx, ns)
 	switch {
-	case err == nil && kr != nil:
+	case errors.Is(err, seal.ErrFormat):
+		// Not a keyring document of §E.3.2, such as one in the format
+		// before v0.63: nothing opens from it (keyring).
+		ringErr = err
+	case err == nil:
 		for _, priv := range privs {
 			if key, err := kr.EpochKey(priv, kid, x.knownSenders()); err == nil {
 				e, _ := kr.Entry(kid, seal.Thumbprint(priv.PublicKey()))
 				if take(key, e.From) {
 					return key, nil
 				}
-			}
-		}
-	case err == nil && old.NS == ns:
-		for _, priv := range privs {
-			if key, err := old.EpochKey(priv, epoch); err == nil && take(key, "") {
-				return key, nil
 			}
 		}
 	case Transient(err):
@@ -467,21 +475,20 @@ func (x *E2E) findKey(ctx context.Context, kid, via string, accept func(from str
 		return nil, fmt.Errorf("client: fetching the epoch key %s: %w", kid, failed)
 	}
 	if refused {
-		if untrusted == "" {
-			return nil, fmt.Errorf("%w: %s has no sender (a keyring stored before v0.63, which a key holder migrates with patchlog e2e migrate-keyring, or a key the server wrapped itself)", ErrUntrustedKey, kid)
-		}
 		return nil, fmt.Errorf("%w: %s from %s", ErrUntrustedKey, kid, untrusted)
 	}
 	if unwrapErr != nil {
 		return nil, unwrapErr
+	}
+	if ringErr != nil {
+		return nil, fmt.Errorf("%w: %s: %w", ErrNoKeys, kid, ringErr)
 	}
 	return nil, fmt.Errorf("%w: %s", ErrNoKeys, kid)
 }
 
 // unwrapRelayed opens a K_e that /keys relays from a keyring (§E.3.2) with
 // one of privs (seal.UnwrapRelayed): an entry with from in auth mode under
-// the one of senders it names, one relayed from a keyring stored before
-// v0.63 under the HPKE info of v0.63 or of that time.
+// the one of senders it names.
 func unwrapRelayed(privs []*ecdh.PrivateKey, w seal.WrappedKey, senders []*ecdh.PublicKey) ([]byte, error) {
 	err := fmt.Errorf("client: no recipient key")
 	for _, priv := range privs {
@@ -516,6 +523,9 @@ func (c *Client) EncryptionLevel(ctx context.Context, ns string) (string, error)
 	return lv, nil
 }
 
+// errNotE2E reports a namespace whose document, or /keys, says it isn't e2e.
+var errNotE2E = errors.New("client: not an e2e namespace")
+
 // e2eConfig is what writes need from an e2e namespace document.
 type e2eConfig struct {
 	Config string // config revision id
@@ -540,7 +550,7 @@ func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
 	}
 	enc, _ := d.Value["encryption"].(map[string]any)
 	if lv, _ := enc["level"].(string); lv != "e2e" {
-		return nil, fmt.Errorf("client: namespace %s is not e2e (encryption.level %q)", ns, lv)
+		return nil, fmt.Errorf("%w: namespace %s (encryption.level %q)", errNotE2E, ns, lv)
 	}
 	out := &e2eConfig{Config: h.Config, Epoch: 1}
 	if f, ok := enc["epoch"].(float64); ok {
@@ -578,14 +588,14 @@ func (x *E2E) writeConfig(ctx context.Context, ns string) (*e2eConfig, error) {
 	a, kerr := x.c.FetchKeysAnswer(ctx, ns, nil, nil)
 	switch {
 	case IsNotOffered(kerr):
-		return nil, fmt.Errorf("client: namespace %s is not e2e (it isn't sealed)", ns)
+		return nil, fmt.Errorf("%w: namespace %s (it isn't sealed)", errNotE2E, ns)
 	case kerr != nil:
 		return nil, fmt.Errorf("client: namespace %s: sealing needs the current epoch and pad, which neither its document (%w) nor /keys (%w) gives this grant", ns, err, kerr)
 	case a.Level == "" || a.Epoch < 1:
 		// A deployment before v0.51 names neither (§E.2.3).
 		return nil, fmt.Errorf("client: namespace %s: sealing needs the current epoch and pad, which neither its document (%w) nor /keys gives this grant", ns, err)
 	case a.Level != "e2e":
-		return nil, fmt.Errorf("client: namespace %s is not e2e (encryption.level %q)", ns, a.Level)
+		return nil, fmt.Errorf("%w: namespace %s (encryption.level %q)", errNotE2E, ns, a.Level)
 	}
 	epoch := a.Epoch
 	for _, k := range a.Keys {
@@ -632,11 +642,247 @@ func (x *E2E) SealPatchesBlobs(ctx context.Context, ns, name, parent string, pat
 	if err != nil {
 		return nil, err
 	}
+	done, err := x.reserveSeal(ns, name, kid)
+	if err != nil {
+		return nil, err
+	}
 	body, err := seal.SealPatchSetPad(kr, kid, ns, name, parent, v, cfg.Pad)
+	jwe, _ := seal.SealedJWE(mustValue(body))
+	done(jwe)
 	if err != nil || len(blobs) == 0 {
 		return body, err
 	}
 	return seal.WithBlobs(body, blobs)
+}
+
+// mustValue parses a sealed patch set seal just produced (nil on error).
+func mustValue(body []byte) any {
+	v, err := jsonv.Parse(body)
+	if err != nil {
+		return nil
+	}
+	return v
+}
+
+// --- the message bound (§E.2.1) ---------------------------------------------
+
+// DefaultSealBound is the message bound of a key (§E.2.1): IVs are 96
+// random bits, so no K_r seals 2³² values.
+const DefaultSealBound int64 = 1 << 32
+
+// DefaultSealMargin is how far below the bound a view reports rotation due
+// (SealStatus): half of it, as the origin rotates its own keys
+// (core.Options.SealRotateAt). It also covers what the view can't count:
+// sealings of other writers that never reached the log, and those below a
+// pruning horizon.
+const DefaultSealMargin int64 = 1 << 31
+
+// ErrSealBound reports a sealing the view refuses because the key would
+// pass the message bound (§E.2.1: at E3 only clients seal under K_r, and
+// the key holder that rotates keeps each K_r within the bound). A holder
+// of a * key rotates the epoch (RotateEpoch); sealing under the new one
+// goes on.
+var ErrSealBound = errors.New("client: the resource's key of this epoch has reached the message bound; rotate the epoch (§E.2.1)")
+
+// e2eSeals counts, per resource and kid, the sealings under that K_r the
+// view knows of (SealStatus). Views share it, as they share keys.
+type e2eSeals struct {
+	mu sync.Mutex
+	m  map[string]*sealCount // ns "\n" name
+}
+
+// sealCount is what a view knows of the sealings under one resource's K_r
+// per epoch: the resource's own sealed ops in its log, counted up to head,
+// and the sealings the view made itself that the log doesn't show (yet):
+// refused writes, prune snapshots, writes not yet read back. A retry
+// resends the same ciphertext, one sealing.
+type sealCount struct {
+	head     string // the log is counted up to head; "" none of it yet
+	partial  bool   // some of the log couldn't be counted (pruned, unreadable)
+	logged   map[string]int64
+	local    map[string]map[[32]byte]bool
+	inFlight map[string]int64
+}
+
+func (sc *sealCount) count(kid string) int64 {
+	return sc.logged[kid] + int64(len(sc.local[kid])) + sc.inFlight[kid]
+}
+
+// WithSealBound returns a view that keeps each K_r within bound sealings,
+// reporting rotation due once margin of them are left (SealStatus), and
+// sharing the counts. 0 keeps the default (DefaultSealBound,
+// DefaultSealMargin). Tests inject a small bound.
+func (x *E2E) WithSealBound(bound, margin int64) *E2E {
+	cp := *x
+	cp.sealBound, cp.sealMargin = bound, margin
+	return &cp
+}
+
+func (x *E2E) bounds() (bound, margin int64) {
+	bound, margin = x.sealBound, x.sealMargin
+	if bound <= 0 {
+		bound = DefaultSealBound
+	}
+	if margin <= 0 {
+		margin = DefaultSealMargin
+		if margin >= bound {
+			margin = bound / 2
+		}
+	}
+	return bound, margin
+}
+
+func (x *E2E) sealCount(ns, name string) *sealCount {
+	k := ns + "\n" + name
+	sc := x.seals.m[k]
+	if sc == nil {
+		sc = &sealCount{logged: map[string]int64{}, local: map[string]map[[32]byte]bool{}, inFlight: map[string]int64{}}
+		x.seals.m[k] = sc
+	}
+	return sc
+}
+
+// reserveSeal counts one sealing under the K_r of name and kid before it is
+// made, refusing it with ErrSealBound where the count the view knows
+// (SealStatus) would pass the bound. It makes no request: writes of a
+// grant that can't read the log (§C.5) count what the view sealed. done
+// records the sealing made, its JWE ("" if none was made).
+func (x *E2E) reserveSeal(ns, name, kid string) (done func(jwe string), err error) {
+	bound, _ := x.bounds()
+	x.seals.mu.Lock()
+	defer x.seals.mu.Unlock()
+	sc := x.sealCount(ns, name)
+	if sc.count(kid)+1 > bound {
+		return nil, fmt.Errorf("%w: %s/%s under %s has %d sealings, the bound is %d", ErrSealBound, ns, name, kid, sc.count(kid), bound)
+	}
+	sc.inFlight[kid]++
+	return func(jwe string) {
+		x.seals.mu.Lock()
+		defer x.seals.mu.Unlock()
+		sc.inFlight[kid]--
+		if jwe == "" {
+			return
+		}
+		if sc.local[kid] == nil {
+			sc.local[kid] = map[[32]byte]bool{}
+		}
+		sc.local[kid][sha256.Sum256([]byte(jwe))] = true
+	}, nil
+}
+
+// SealStatus is how near one resource's K_r of the current epoch is to the
+// message bound, as a view counts it (E2E.SealStatus, §E.2.1).
+type SealStatus struct {
+	NS, Name, Kid string
+	// Sealed counts the sealings under that K_r the view knows of: the
+	// resource's own sealed ops in its log (pl.ns and kid naming the
+	// namespace), and the sealings the view made that the log doesn't
+	// show, a refused write or a prune snapshot among them.
+	Sealed int64
+	// Partial is set where some of the log couldn't be counted: below a
+	// pruning horizon, or for a grant that can't read the log (§C.5).
+	// The margin stands for what it misses.
+	Partial bool
+	Bound   int64
+	Margin  int64
+	// RotationDue is set once Sealed is within Margin of Bound: a holder of
+	// a * key rotates the epoch (RotateEpoch) before writes reach Bound,
+	// which the view refuses (ErrSealBound).
+	RotationDue bool
+}
+
+// SealStatus reads the log of ns/name since it last did and reports how
+// near the resource's K_r of the current epoch is to the message bound
+// (§E.2.1: at E3 only clients seal under K_r, and the key holder that
+// rotates keeps each within the bound). Counts the view keeps are shared
+// by its copies; writes refuse past the bound (ErrSealBound).
+func (x *E2E) SealStatus(ctx context.Context, ns, name string) (*SealStatus, error) {
+	if err := checkRes(ns, name); err != nil {
+		return nil, err
+	}
+	cfg, err := x.writeConfig(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	kid := seal.Kid(ns, cfg.Epoch)
+	if err := x.countLog(ctx, ns, name); err != nil {
+		return nil, err
+	}
+	bound, margin := x.bounds()
+	x.seals.mu.Lock()
+	defer x.seals.mu.Unlock()
+	sc := x.sealCount(ns, name)
+	st := &SealStatus{NS: ns, Name: name, Kid: kid, Sealed: sc.count(kid), Partial: sc.partial, Bound: bound, Margin: margin}
+	st.RotationDue = st.Sealed >= bound-margin
+	return st, nil
+}
+
+// countLog counts the resource's own sealed ops in its log after what the
+// view counted last (sealCount): an op whose pl.ns and kid name ns is one
+// sealing under that kid's K_r of name, and one the view made itself
+// moves from its local count to the log's. Ops a branch reads through are
+// its base's, under the base's keys, and aren't counted. A log pruned
+// past what was counted is read from the horizon, and one the grant can't
+// read not at all; both leave the count partial. A resource purged and
+// created again is counted from its new genesis on, keeping the old
+// counts: its K_r is the same.
+func (x *E2E) countLog(ctx context.Context, ns, name string) error {
+	x.seals.mu.Lock()
+	sc := x.sealCount(ns, name)
+	start := sc.head
+	x.seals.mu.Unlock()
+	since, partial := start, false
+	es, err := x.Log(ctx, ns, name, "", since)
+	if IsNotFound(err) && since != "" {
+		since = ""
+		es, err = x.Log(ctx, ns, name, "", since)
+	}
+	if h := Horizon(err); h != "" && h != since {
+		partial = true
+		since = h
+		es, err = x.Log(ctx, ns, name, "", since)
+	}
+	switch {
+	case err == nil:
+	case IsNotFound(err) && since == "":
+		// No resource yet: nothing sealed under it but what the view did.
+		return nil
+	case IsAuth(err):
+		x.seals.mu.Lock()
+		sc.partial = true
+		x.seals.mu.Unlock()
+		return nil
+	default:
+		return err
+	}
+	x.seals.mu.Lock()
+	defer x.seals.mu.Unlock()
+	if sc.head != start {
+		// Another count moved on meanwhile: it counted these.
+		return nil
+	}
+	for _, e := range es {
+		if e.Kind != "rev" || !e.HasPatches {
+			continue
+		}
+		jwe, ok := seal.SealedJWE(e.Patches)
+		if !ok {
+			continue
+		}
+		kid, plNS, ok := opKid(e.Patches)
+		if !ok || plNS != ns || !kidNames(kid, ns) {
+			continue
+		}
+		sc.logged[kid]++
+		delete(sc.local[kid], sha256.Sum256([]byte(jwe)))
+	}
+	if len(es) > 0 {
+		sc.head = es[len(es)-1].ID
+	} else {
+		sc.head = since
+	}
+	sc.partial = sc.partial || partial
+	return nil
 }
 
 // send sends a sealed patch set, resending the same bytes after a
@@ -792,19 +1038,11 @@ type E2EDoc struct {
 	// Plain is set when the server served the document itself (the
 	// keyring, or a namespace that isn't e2e).
 	Plain bool
-	// PreRaise is set when ID is a revision from before a raise to e2e,
-	// whose document the server serves as at the level before: in the
-	// clear, or sealed as at E2 (Addendum E Levels).
-	PreRaise bool
 
 	// log is the range folded, after since, whose snapshot's kid is
-	// sinceKid (PruneE2E's snapshot epoch, §E.3.1); sincePre is set when
-	// since is a revision from before a raise to e2e, served as at the
-	// level before, whose kid ("" in the clear) is the epoch it is served
-	// under and may name a base the namespace reads it through.
+	// sinceKid (PruneE2E's snapshot epoch, §E.3.1).
 	log             []LogEntry
 	since, sinceKid string
-	sincePre        bool
 	// ns is the namespace the document was read from, whose own ops are
 	// those whose pl.ns names it (Kid, snapshotEpoch, §E.3.1).
 	ns string
@@ -836,8 +1074,17 @@ func (x *E2E) Moved(ctx context.Context, ns, name string, h *Head) (string, erro
 	return SuccessorOf(d.Value), nil
 }
 
-// DocE2E folds the document at revision id: it follows the X-E2E fold
-// redirect, opens and verifies the log and folds it (see E2E).
+// DocE2E folds the document at revision id (§7.1 End-to-end namespaces):
+// /r/{ns}/{name}/rev/{id} is a prune's stored snapshot, 200
+// application/jose, opened as the document of id; or 404 not_offered,
+// naming the resource's horizon and, where that is a tombstone, last, its
+// parent; the reader then folds the log up to id from last, else horizon,
+// whose snapshot /rev/{start} serves, else from genesis (see E2E). The
+// keyring, and a namespace that isn't e2e, serve the document itself
+// (Plain). Any other 200 for a resource of an e2e namespace is
+// seal.ErrMismatch: the server never folds, and never serves an e2e
+// document in the clear. A prune that moves the horizon past the range
+// meanwhile (410 pruned) asks /rev/{id} again, once.
 func (x *E2E) DocE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) {
 	if err := checkRes(ns, name); err != nil {
 		return nil, err
@@ -845,62 +1092,98 @@ func (x *E2E) DocE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) 
 	if err := checkID("revision", id); err != nil {
 		return nil, err
 	}
+	for attempt := 0; ; attempt++ {
+		d, err := x.docE2E(ctx, ns, name, id)
+		if attempt == 0 && IsPruned(err) {
+			continue
+		}
+		return d, err
+	}
+}
+
+func (x *E2E) docE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) {
 	path := "/r/" + ns + "/" + name + "/rev/" + id
 	r, err := x.c.do(ctx, "GET", path, nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	switch {
-	case r.status == 200 && r.header.Get("X-E2E") == "snapshot":
-		// A pruning horizon: its sealed snapshot is the document (§8.6).
-		doc, kid, err := x.openSnapshot(ctx, ns, name, id, r, x.inChainOf(ctx, ns, name, id, nil))
-		if err != nil {
-			return nil, err
+	if r.status == 200 {
+		e2e := false
+		if name != KeyringName {
+			if e2e, err = x.isE2E(ctx, ns); err != nil {
+				return nil, err
+			}
 		}
-		return &E2EDoc{ID: id, Value: doc, ValidID: id, since: id, sinceKid: kid, ns: ns}, nil
-	case r.status == 200 && name != KeyringName && x.isE2E(ctx, ns):
-		// A revision from before a raise to e2e, served as at the level
-		// before (Addendum E Levels).
-		doc, kid, err := x.openPreRaise(ctx, ns, name, id, r, x.inChainOf(ctx, ns, name, id, nil))
-		if err != nil {
-			return nil, err
+		switch {
+		case e2e && isJOSE(r):
+			// A prune's stored snapshot: the document of id (§8.6,
+			// §E.3.1), at the horizon or, at a tombstone horizon, at its
+			// parent.
+			doc, kid, err := x.openSnapshot(ctx, ns, name, id, r, x.inChainOf(ctx, ns, name, id, nil))
+			if err != nil {
+				return nil, err
+			}
+			return &E2EDoc{ID: id, Value: doc, ValidID: id, since: id, sinceKid: kid, ns: ns}, nil
+		case e2e:
+			return nil, fmt.Errorf("client: e2e document %s/%s@%s: the server answered 200 %s, not a sealed snapshot (§7.1): %w", ns, name, id, r.header.Get("Content-Type"), seal.ErrMismatch)
 		}
-		return &E2EDoc{ID: id, Value: doc, ValidID: id, PreRaise: true, since: id, sinceKid: kid, sincePre: true, ns: ns}, nil
-	case r.status == 200:
 		d, err := x.c.Doc(ctx, ns, name, id)
 		if err != nil {
 			return nil, err
 		}
 		return &E2EDoc{ID: id, Value: d.Value, ValidID: id, Plain: true, ns: ns}, nil
-	case r.status == 302 && r.header.Get("X-E2E") == "fold":
-	default:
-		return nil, r.apiError()
 	}
-	since := ""
-	if u, err := url.Parse(r.header.Get("Location")); err == nil {
-		since = u.Query().Get("since")
+	aerr := r.apiError()
+	if !IsNotOffered(aerr) {
+		return nil, aerr
+	}
+	// The reader folds (§7.1): from last, else horizon, else genesis.
+	ae, _ := AsAPIError(aerr)
+	since := ae.Last()
+	if since == "" {
+		since = ae.Horizon()
+	}
+	if err := checkOptID("fold start", since); err != nil {
+		return nil, fmt.Errorf("client: e2e document %s/%s@%s: not_offered names %w", ns, name, id, err)
 	}
 	arr, err := x.foldLog(ctx, ns, name, id, since)
 	if err != nil {
-		var ae *APIError
-		// A redirect cached before a prune may name a range that is gone
-		// now: start again from the horizon.
-		if h := Horizon(err); errors.As(err, &ae) && ae.Code == "pruned" && h != "" && h != since {
-			since = h
-			arr, err = x.foldLog(ctx, ns, name, id, since)
-		}
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
 	return x.fold(ctx, ns, name, id, since, arr)
 }
 
+// isE2E reports whether ns is e2e: by its namespace document
+// (EncryptionLevel, a sealed one being E2), or, for a grant that can't read
+// it, such as a writer limited to some resources (§C.5), by what /keys
+// names, as writeConfig does. Where neither tells, it is an error, never
+// taken as not e2e: a document served in the clear by a namespace that is
+// would be believed.
+func (x *E2E) isE2E(ctx context.Context, ns string) (bool, error) {
+	lv, err := x.c.EncryptionLevel(ctx, ns)
+	if nsUnreadable(err) {
+		a, kerr := x.c.FetchKeysAnswer(ctx, ns, nil, nil)
+		switch {
+		case IsNotOffered(kerr):
+			// Neither sealed nor end-to-end (§E.2.3).
+			return false, nil
+		case kerr != nil:
+			return false, fmt.Errorf("client: namespace %s: whether it is e2e neither its document (%w) nor /keys (%w) tells this grant", ns, err, kerr)
+		case a.Level == "":
+			return false, fmt.Errorf("client: namespace %s: whether it is e2e neither its document (%w) nor /keys tells this grant", ns, err)
+		}
+		lv, err = a.Level, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return lv == "e2e", nil
+}
+
 // foldLog fetches the log a fold reads, the range after since up to id,
 // following its pages (§7.1). The range never holds since's snapshot: fold
-// fetches that from /rev/{since}. A page from before a raise from sealed
-// to e2e is an array of entries sealed as at E2 (Addendum E Levels), which
-// it opens (openPreRaiseEntry).
+// fetches that from /rev/{since}. Every entry is plaintext JSON: one
+// served as a JWE, as an e2e namespace never seals its log, is refused.
 func (x *E2E) foldLog(ctx context.Context, ns, name, id, since string) ([]any, error) {
 	if err := checkOptID("since", since); err != nil {
 		return nil, err
@@ -912,13 +1195,9 @@ func (x *E2E) foldLog(ctx context.Context, ns, name, id, since string) ([]any, e
 			if !ok {
 				return "", fmt.Errorf("client: %s: log is not an array", r.path)
 			}
-			for i, v := range page {
-				if jwe, ok := v.(string); ok {
-					e, err := x.openPreRaiseEntry(ctx, ns, name, jwe)
-					if err != nil {
-						return "", err
-					}
-					page[i] = e
+			for _, v := range page {
+				if _, ok := v.(string); ok {
+					return "", fmt.Errorf("client: e2e log of %s/%s: a sealed entry: %w", ns, name, seal.ErrMismatch)
 				}
 			}
 			arr = append(arr, page...)
@@ -1228,38 +1507,26 @@ func (x *E2E) openSealed(ctx context.Context, name string, e LogEntry, nsOK *cha
 
 // openPatchSet opens a sealed patch set of name sealed under the epoch key
 // K_e of kid in namespace kns: under the resource's K_r = HKDF(K_e, kns,
-// name), kns being the pl.ns the open checks (§E.3.1), or failing that
-// under K_e itself, which sealed E3 patch sets before v0.65 and whose
-// ciphertext keeps its ids.
+// name) only, kns being the pl.ns the open checks (§E.3.1). K_e itself
+// seals nothing (§E.2.1): a patch set sealed under it, as before v0.65,
+// doesn't open, and a fold flags it and folds it as [] (§E.3.2).
 func openPatchSet(patchSet any, key []byte, kid, kns, name, parent string) (any, bool, error) {
 	kr, err := resourceKey(key, kns, name)
 	if err != nil {
 		return nil, false, err
 	}
-	plain, padded, err := seal.OpenPatchSetPadded(patchSet, kr, kid, kns, name, parent)
-	if err != nil {
-		if p, pd, lerr := seal.OpenPatchSetPadded(patchSet, key, kid, kns, name, parent); lerr == nil {
-			return p, pd, nil
-		}
-	}
-	return plain, padded, err
+	return seal.OpenPatchSetPadded(patchSet, kr, kid, kns, name, parent)
 }
 
 // openSnapshotJWE opens a prune snapshot of revision h of name sealed under
-// the epoch key K_e of kid in namespace kns: under K_r, then K_e, as
-// openPatchSet.
+// the epoch key K_e of kid in namespace kns: under K_r only, bound to
+// exactly {kns, name, h}, as openPatchSet.
 func openSnapshotJWE(jwe string, key []byte, kid, kns, name, h string) (any, error) {
 	kr, err := resourceKey(key, kns, name)
 	if err != nil {
 		return nil, err
 	}
-	doc, err := seal.OpenSnapshot(jwe, kr, kid, kns, name, h)
-	if err != nil {
-		if d, lerr := seal.OpenSnapshot(jwe, key, kid, kns, name, h); lerr == nil {
-			return d, nil
-		}
-	}
-	return doc, err
+	return seal.OpenSnapshot(jwe, kr, kid, kns, name, h)
 }
 
 // paddedAt reports whether ns padded when revision id was written: the
@@ -1359,18 +1626,15 @@ func (x *E2E) padHistory(ctx context.Context, ns, head string, prev *padHistory)
 }
 
 // nsLogE2E is Client.NSLog for padHistory: the namespace log of ns after
-// since up to nsID, following its pages (§7.1), but for the pages from
-// before a raise from sealed to e2e, served sealed as at E2 (Addendum E
-// Levels), which are skipped unread. No page spans the raise, and those
-// pages name no revision written end to end, whose padding alone a fold
-// judges; the raising entry, the first after them, sets the padding from
-// then on.
+// since up to nsID, following its pages (§7.1). An e2e namespace's log is
+// plaintext (the server seals nothing at E3, §E.3.1): a sealed page is
+// refused.
 func (x *E2E) nsLogE2E(ctx context.Context, ns, nsID, since string) ([]NSEntry, error) {
 	all := []NSEntry{}
 	for {
 		next, err := x.c.logPage(ctx, "/ns/"+ns+"/rev/"+nsID+"/log", since, nsID, func(r *response, end string) (string, error) {
 			if isJOSE(r) {
-				return end, nil
+				return "", fmt.Errorf("client: namespace log of e2e namespace %s served sealed: %w", ns, seal.ErrMismatch)
 			}
 			es, err := parseNSLog(r.value(), r.path)
 			if err != nil {
@@ -1477,96 +1741,28 @@ func (x *E2E) ValidateIn(ctx context.Context, target string, doc any) (string, e
 
 // foldStart fetches the document a fold starts from at since, from
 // /rev/{since}, where it is served instead of being a log entry (§7.1
-// Paging, §8.6): a pruning horizon's sealed snapshot (openSnapshot), or the
-// resource's last revision from before a raise to e2e, served as at the
-// level before (openPreRaise), where the server's fold redirect starts
-// the range written end to end (F-E1, Addendum E Levels). It returns the
-// document and the kid sealing it ("" for one in the clear).
-func (x *E2E) foldStart(ctx context.Context, ns, name, since string, nsOK *chainCheck) (doc any, kid string, preRaise bool, err error) {
+// Paging, §8.6): a prune's stored snapshot, 200 application/jose, bound to
+// since (openSnapshot). Anything else is an error, a mismatch where it
+// isn't one. It returns the document and the kid sealing it.
+func (x *E2E) foldStart(ctx context.Context, ns, name, since string, nsOK *chainCheck) (doc any, kid string, err error) {
 	r, err := x.c.do(ctx, "GET", "/r/"+ns+"/"+name+"/rev/"+since, nil, nil)
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", err
 	}
-	if r.status == 200 && r.header.Get("X-E2E") == "" {
-		doc, kid, err = x.openPreRaise(ctx, ns, name, since, r, nsOK)
-		return doc, kid, true, err
-	}
-	if (r.status != 200 && r.status != 410) || r.header.Get("X-E2E") != "snapshot" {
+	if r.status != 200 || !isJOSE(r) {
 		if r.status >= 400 {
-			return nil, "", false, r.apiError()
+			return nil, "", r.apiError()
 		}
-		return nil, "", false, fmt.Errorf("client: e2e log of %s/%s: /rev/%s doesn't serve the document the fold starts from (status %d): %w", ns, name, since, r.status, seal.ErrMismatch)
+		return nil, "", fmt.Errorf("client: e2e log of %s/%s: /rev/%s doesn't serve the snapshot the fold starts from (status %d): %w", ns, name, since, r.status, seal.ErrMismatch)
 	}
-	doc, kid, err = x.openSnapshot(ctx, ns, name, since, r, nsOK)
-	return doc, kid, false, err
-}
-
-// isE2E reports whether ns's namespace document says it is e2e. One this
-// reader can't read is taken as not.
-func (x *E2E) isE2E(ctx context.Context, ns string) bool {
-	_, err := x.config(ctx, ns)
-	return err == nil
-}
-
-// openPreRaise opens the document of revision id of ns/name that r, the
-// 200 of /rev/{id}, serves as at the level before a raise to e2e (Addendum
-// E Levels): in the clear after a raise from none or at-rest, or as a JWE
-// sealed as at E2 after a raise from sealed, under K_r = HKDF(K_e, kns,
-// name) of its kid's epoch, kns being ns or the base a branch reads it
-// through (whose ns it keeps), with pl {kns, name, id, kind "doc"}. The
-// keys of epochs before the raise come from /keys as at E2. It returns the
-// document and the kid ("" for one in the clear).
-func (x *E2E) openPreRaise(ctx context.Context, ns, name, id string, r *response, nsOK *chainCheck) (any, string, error) {
-	bad := func(format string, args ...any) error {
-		return fmt.Errorf("client: e2e document %s/%s@%s from before the raise: %s: %w", ns, name, id, fmt.Sprintf(format, args...), seal.ErrMismatch)
-	}
-	if !isJOSE(r) {
-		v, err := jsonv.Parse(r.body)
-		if err != nil {
-			return nil, "", bad("%v", err)
-		}
-		return v, "", nil
-	}
-	jwe := strings.TrimSpace(string(r.body))
-	hd, err := seal.ParseHeader(jwe)
-	if err != nil {
-		return nil, "", bad("%v", err)
-	}
-	kns, _, err := seal.ParseKid(hd.Kid)
-	if err != nil {
-		return nil, "", bad("kid: %v", err)
-	}
-	if ok, err := nsOK.ok(kns); err != nil {
-		return nil, "", err
-	} else if !ok {
-		return nil, "", bad("sealed under %s", hd.Kid)
-	}
-	key, err := x.keyVia(ctx, hd.Kid, ns)
-	if err != nil {
-		return nil, "", err
-	}
-	kr, err := resourceKey(key, kns, name)
-	if err != nil {
-		return nil, "", err
-	}
-	pt, err := seal.OpenExpect(jwe, kr, hd.Kid, seal.ResourcePL(kns, name, id, seal.KindDoc))
-	if err != nil {
-		return nil, "", fmt.Errorf("client: e2e document %s/%s@%s from before the raise: %w", ns, name, id, err)
-	}
-	v, err := jsonv.Parse(pt)
-	if err != nil {
-		return nil, "", bad("%v", err)
-	}
-	return v, hd.Kid, nil
+	return x.openSnapshot(ctx, ns, name, since, r, nsOK)
 }
 
 // Log is Client.Log for a resource of an e2e namespace (§7.1): the log
 // range of ns/name after since up to id (its head when ""), following its
-// pages, with the pages from before a raise from sealed to e2e, entries
-// sealed as at E2 (Addendum E Levels), opened with this view's keys
-// (openPreRaiseEntry), the base's ns accepted for content a branch reads
-// through. Entries written end to end keep their sealed patch sets, which
-// OpenLog opens.
+// pages, its entries chained. Entries keep their sealed patch sets, which
+// OpenLog opens; one served as a JWE is refused, as an e2e namespace never
+// seals its log.
 func (x *E2E) Log(ctx context.Context, ns, name, id, since string) ([]LogEntry, error) {
 	if err := checkRes(ns, name); err != nil {
 		return nil, err
@@ -1599,11 +1795,8 @@ func (x *E2E) Log(ctx context.Context, ns, name, id, since string) ([]LogEntry, 
 			}
 			prev := cur
 			for i, v := range arr {
-				if jwe, ok := v.(string); ok {
-					var err error
-					if v, err = x.openPreRaiseEntry(ctx, ns, name, jwe); err != nil {
-						return "", err
-					}
+				if _, ok := v.(string); ok {
+					return "", fmt.Errorf("client: e2e log of %s/%s: a sealed entry: %w", ns, name, seal.ErrMismatch)
 				}
 				e, err := parseLogEntry(v)
 				if err != nil {
@@ -1630,71 +1823,17 @@ func (x *E2E) Log(ctx context.Context, ns, name, id, since string) ([]LogEntry, 
 	}
 }
 
-// openPreRaiseEntry opens a resource log entry of ns/name from before a
-// raise from sealed to e2e, sealed as at E2 (Addendum E Levels): under
-// K_r of its kid's epoch, kns being ns or one of its bases, with pl {kns,
-// name, id, kind} of kind rev or tombstone, which the entry must match.
-func (x *E2E) openPreRaiseEntry(ctx context.Context, ns, name, jwe string) (any, error) {
-	bad := func(format string, args ...any) error {
-		return fmt.Errorf("client: e2e log of %s/%s: an entry from before the raise: %s: %w", ns, name, fmt.Sprintf(format, args...), seal.ErrMismatch)
-	}
-	hd, err := seal.ParseHeader(jwe)
-	if err != nil {
-		return nil, bad("%v", err)
-	}
-	kns, _, err := seal.ParseKid(hd.Kid)
-	if err != nil {
-		return nil, bad("kid: %v", err)
-	}
-	if kns != ns {
-		depth, _, err := x.chain(ctx, ns)
-		if err != nil {
-			return nil, err
-		}
-		if _, ok := depth[kns]; !ok {
-			return nil, bad("sealed under %s", hd.Kid)
-		}
-	}
-	eid, _ := hd.PL["id"].(string)
-	kind, _ := hd.PL["kind"].(string)
-	if kind != seal.KindRev && kind != seal.KindTombstone {
-		return nil, bad("pl kind %q", kind)
-	}
-	key, err := x.keyVia(ctx, hd.Kid, ns)
-	if err != nil {
-		return nil, err
-	}
-	kr, err := resourceKey(key, kns, name)
-	if err != nil {
-		return nil, err
-	}
-	pt, err := seal.OpenExpect(jwe, kr, hd.Kid, seal.ResourcePL(kns, name, eid, kind))
-	if err != nil {
-		return nil, fmt.Errorf("client: e2e log of %s/%s: an entry from before the raise: %w", ns, name, err)
-	}
-	v, err := jsonv.Parse(pt)
-	if err != nil {
-		return nil, bad("%v", err)
-	}
-	if m, _ := v.(map[string]any); str(m, "id") != eid || str(m, "kind") != kind {
-		return nil, bad("entry %s doesn't match its binding", eid)
-	}
-	return v, nil
-}
-
-// openSnapshot opens the sealed snapshot of h that r, the answer of
-// /rev/{h} with X-E2E: snapshot, serves: its body (200 application/jose),
-// or for a tombstone horizon the "snapshot" member of its 410 body (the
-// last live document). The snapshot is sealed under ns or one of its bases
-// (a branch reads its base's ciphertext, §F.8) and bound to {name, h}.
+// openSnapshot opens the sealed snapshot of h that r, the 200
+// application/jose answer of /rev/{h}, serves (§7.1): a prune's, at the
+// horizon or at a tombstone horizon's parent. It is sealed under ns or one
+// of its bases (a branch reads its base's snapshot as it sees it, §7.6)
+// and bound to exactly {kns, name, h} (§E.3.1).
 func (x *E2E) openSnapshot(ctx context.Context, ns, name, h string, r *response, nsOK *chainCheck) (any, string, error) {
 	bad := func(format string, args ...any) error {
 		return fmt.Errorf("client: e2e snapshot of %s/%s at %s: %s: %w", ns, name, h, fmt.Sprintf(format, args...), seal.ErrMismatch)
 	}
 	var jwe string
-	if r.status == 410 {
-		jwe = str(r.obj(), "snapshot")
-	} else if isJOSE(r) {
+	if r.status == 200 && isJOSE(r) {
 		jwe = strings.TrimSpace(string(r.body))
 	}
 	if jwe == "" {
@@ -1725,8 +1864,9 @@ func (x *E2E) openSnapshot(ctx context.Context, ns, name, h string, r *response,
 }
 
 // fold verifies and folds a log answer ending at id and starting after
-// since. A fold that starts at a pruning horizon (since set) starts from
-// its snapshot, fetched from /rev/{since}.
+// since. A fold that starts at a pruning horizon, or at a tombstone
+// horizon's parent (since set, §7.1), starts from its snapshot, fetched
+// from /rev/{since}.
 //
 // A revision that fails validation, whose declared blob list differs from
 // its document, or that isn't padded as its namespace padded is flagged
@@ -1756,7 +1896,7 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 	}
 	if since != "" {
 		var err error
-		if doc, out.sinceKid, out.sincePre, err = x.foldStart(ctx, ns, name, since, nsOK); err != nil {
+		if doc, out.sinceKid, err = x.foldStart(ctx, ns, name, since, nsOK); err != nil {
 			return nil, err
 		}
 		nsOK.at(since)
@@ -1856,8 +1996,9 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 	return out, nil
 }
 
+// arrAt is a[i], nil out of range (an empty page included).
 func arrAt(a []any, i int) any {
-	if i < len(a) {
+	if i >= 0 && i < len(a) {
 		return a[i]
 	}
 	return nil
@@ -1917,19 +2058,6 @@ func (x *E2E) validate(ctx context.Context, target string, doc any, stored bool)
 			return d, nil
 		}
 		r, err := x.c.ResolveSchema(ctx, ref, ResolveOptions{Drafts: drafts, For: target})
-		if errors.Is(err, ErrNoKeys) {
-			// A revision of an e2e namespace from before its raise from
-			// sealed, served sealed as at E2 under keys this view holds
-			// (Addendum E Levels, openPreRaise); no marker is sent with
-			// it, so it compiles as legacy, as for any server that sends
-			// none. The server compiles it under its row's marker (v0.73
-			// for one written by this version), which a sealed answer has
-			// no channel for: the two can differ on formats (one from
-			// before a raise from none or at-rest carries the marker).
-			if d, derr := x.DocE2E(ctx, ref.NS, ref.Name, ref.Rev); derr == nil && d.PreRaise {
-				r, err = &ResolvedSchema{Doc: &Doc{ID: ref.Rev, Value: d.Value, Rules: schema.Legacy}, NS: ref.NS}, nil
-			}
-		}
 		if err != nil {
 			if IsNotFound(err) || IsGone(err) || IsAuth(err) {
 				return nil, schema.ErrUnavailable
@@ -2000,8 +2128,9 @@ func (x *E2E) validate(ctx context.Context, target string, doc any, stored bool)
 // --- prune ----------------------------------------------------------------
 
 // PruneE2E prunes ns/name below horizon (§8.6): it folds the horizon's
-// document (for a tombstone horizon, which must be the head, the last live
-// document), seals it as the snapshot and sends the prune. If the server
+// document (for a tombstone horizon, the last live document, its parent's,
+// to which the snapshot is bound, §E.3.1), seals it as the snapshot and
+// sends the prune. If the server
 // moves the horizon down to a protected revision, it seals for that one
 // and tries once more. The namespace needs an archive destination.
 func (x *E2E) PruneE2E(ctx context.Context, ns, name, horizon string) (*PruneResult, error) {
@@ -2019,13 +2148,9 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 	if err := checkID("horizon", horizon); err != nil {
 		return nil, err
 	}
-	at := horizon
-	h, err := x.c.Head(ctx, ns, name)
+	at, err := x.snapshotAt(ctx, ns, name, horizon)
 	if err != nil {
 		return nil, err
-	}
-	if h.State == Tombstoned && h.ID == horizon {
-		at = h.Last
 	}
 	d, err := x.DocE2E(ctx, ns, name, at)
 	if err != nil {
@@ -2035,35 +2160,26 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 	if err != nil {
 		return nil, err
 	}
-	kid, preRaise := snapshotKid(ns, cfg.Epoch, d)
-	// A snapshot of content from before a raise from sealed is sealed
-	// under the epoch it is served under, a key /keys gives as at E2, with
-	// no sender (Addendum E Levels): the server held that content and its
-	// keys before the raise, so sealing it again under such a key tells it
-	// nothing. Anything else is sealed only under a key from a trusted
-	// sender (SealKey, §E.3.2).
-	var key []byte
-	if preRaise {
-		key, err = x.keyVia(ctx, kid, ns)
-	} else {
-		key, err = x.SealKey(ctx, kid)
-	}
+	// The snapshot is sealed only under a key from a trusted sender
+	// (SealKey, §E.3.2), of this namespace's epoch that the chain sets
+	// (§E.3.1), and pl names this namespace and at, the horizon or, at a
+	// tombstone horizon, its parent, the revision whose document it is
+	// (§7.1). The server checks both (422 invalid).
+	kid := snapshotKid(ns, cfg.Epoch, d)
+	key, err := x.SealKey(ctx, kid)
 	if err != nil {
 		return nil, err
 	}
-	// K_r is derived with the namespace the kid names, the base's for a
-	// base's content a branch reads through, as that content's own sealing
-	// is (openPreRaise); pl names this namespace, as the server checks it
-	// (§E.3.1).
-	kns, _, err := seal.ParseKid(kid)
+	kr, err := resourceKey(key, ns, name)
 	if err != nil {
 		return nil, err
 	}
-	kr, err := resourceKey(key, kns, name)
+	done, err := x.reserveSeal(ns, name, kid)
 	if err != nil {
 		return nil, err
 	}
-	snap, err := seal.SealSnapshotPad(kr, kid, ns, name, horizon, d.Value, cfg.Pad)
+	snap, err := seal.SealSnapshotPad(kr, kid, ns, name, at, d.Value, cfg.Pad)
+	done(snap)
 	if err != nil {
 		return nil, err
 	}
@@ -2072,47 +2188,57 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 	return x.c.Prune(ctx, ns, name, PruneRequest{Horizon: horizon, Snapshot: snap})
 }
 
+// snapshotAt is the revision a prune's snapshot at horizon is the
+// document of (§8.6, §E.3.1): the horizon itself, or, where it is a
+// tombstone, its parent, the last live revision (§7.1). The head
+// tombstone's parent is the head's last; a tombstone further down the
+// chain, as a horizon the server moves a prune to may be, is found in the
+// log, its id checked against its parent's.
+func (x *E2E) snapshotAt(ctx context.Context, ns, name, horizon string) (string, error) {
+	h, err := x.c.Head(ctx, ns, name)
+	if err != nil {
+		return "", err
+	}
+	if h.State == Tombstoned && h.ID == horizon {
+		return h.Last, nil
+	}
+	if h.State != Tombstoned && h.ID == horizon {
+		return horizon, nil
+	}
+	es, err := x.Log(ctx, ns, name, horizon, "")
+	if hz := Horizon(err); IsPruned(err) && hz != "" {
+		es, err = x.Log(ctx, ns, name, horizon, hz)
+	}
+	if err != nil {
+		return "", err
+	}
+	if len(es) == 0 || es[len(es)-1].ID != horizon {
+		// The range is empty: horizon is the current horizon itself, which
+		// a prune doesn't move below; its kind is the server's to judge.
+		return horizon, nil
+	}
+	e := es[len(es)-1]
+	if e.Kind != "tombstone" {
+		return horizon, nil
+	}
+	if want, err := ExpectedTombstone(e.Parent); err != nil || want != horizon {
+		return "", fmt.Errorf("client: prune of %s/%s: tombstone %s has the wrong id: %w", ns, name, horizon, seal.ErrMismatch)
+	}
+	return e.Parent, nil
+}
+
 // snapshotKid is the kid a prune's snapshot of the document d folds is
-// sealed under (§E.3.1), as the server checks it: set by the newest
-// revision of the range d folded that isn't a tombstone and whose patch
-// set isn't [], the epoch of its sealed op where the op is ns's own, not a
-// base's, and otherwise current, ns's epoch in force. Where the range
-// holds no such revision, the document the fold started from stands for
-// those below it: a snapshot's epoch counts where its kid names ns (F-E2);
-// a revision from before a raise from sealed, served sealed as at E2, is
-// sealed under the epoch it is served under, its kid naming ns or the base
-// a branch reads it through (Addendum E Levels), and preRaise is set; one
-// from before a raise from none or at-rest is in the clear and takes
-// current.
-func snapshotKid(ns string, current int, d *E2EDoc) (kid string, preRaise bool) {
-	if d.since != "" && d.sincePre && d.sinceKid != "" && !foldedOp(d) {
-		if _, _, err := seal.ParseKid(d.sinceKid); err == nil {
-			return d.sinceKid, true
-		}
-	}
-	return seal.Kid(ns, snapshotEpoch(ns, current, d)), false
+// sealed under (§E.3.1), as the server checks it: always one of ns, its
+// epoch snapshotEpoch's.
+func snapshotKid(ns string, current int, d *E2EDoc) string {
+	return seal.Kid(ns, snapshotEpoch(ns, current, d))
 }
 
-// foldedOp reports whether the range d folded holds a revision that isn't
-// a tombstone and whose patch set isn't [] (snapshotKid).
-func foldedOp(d *E2EDoc) bool {
-	for _, e := range d.log {
-		if e.Kind == "tombstone" || !e.HasPatches {
-			continue
-		}
-		if a, ok := e.Patches.([]any); ok && len(a) == 0 {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-// snapshotEpoch is snapshotKid's epoch of ns for everything but content
-// from before a raise from sealed: that of the newest such revision's
-// sealed op where the op is ns's own, its pl.ns naming ns, not a base's
-// read through (§E.3.1), whatever namespace its kid names; current, the
-// epoch in force, for a base's op. An own op whose kid names another
+// snapshotEpoch is snapshotKid's epoch of ns: that of the sealed op of the
+// newest revision of the range d folded that isn't a tombstone and whose
+// patch set isn't [], where the op is ns's own, its pl.ns naming ns, not a
+// base's read through (§E.3.1), whatever namespace its kid names; current,
+// the epoch in force, for a base's op. An own op whose kid names another
 // namespace has no epoch of ns: it gives 0, not known, as the tree's
 // born does, so the prune fails rather than seal under a guess. A
 // snapshot's pl.ns is its kid's namespace (openSnapshotJWE), so below an
@@ -2143,50 +2269,31 @@ func snapshotEpoch(ns string, current int, d *E2EDoc) int {
 
 // --- keyring administration -------------------------------------------------
 
-// ErrLegacyKeyring reports a keyring resource stored in the format before
-// v0.63 (seal.Keyring), which servers no longer take as the keyring: a
-// key holder wraps it again with MigrateKeyring.
-var ErrLegacyKeyring = errors.New("client: the keyring is in the format before v0.63; wrap it again with MigrateKeyring")
-
 // keyring reads the keyring resource of ns as ns sees it (its base's, read
-// through, in a branch without one): the keyring document (§E.3.2), or
-// failing that one in the format before v0.63 (old), and its head.
-func (x *E2E) keyring(ctx context.Context, ns string) (kr *seal.KeyringV2, old *seal.Keyring, head string, err error) {
+// through, in a branch without one): the keyring document (§E.3.2), and
+// its head. One that isn't in that form, such as one in the format before
+// v0.63, is an error wrapping seal.ErrFormat: no client reads or migrates
+// it any more (v0.78, "Reading this spec"), and a key holder wraps it
+// again with the v0.26.1 client before upgrading.
+func (x *E2E) keyring(ctx context.Context, ns string) (kr *seal.KeyringV2, head string, err error) {
 	h, d, err := x.c.Load(ctx, ns, KeyringName)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, "", err
 	}
 	if h.State != Live {
-		return nil, nil, "", &APIError{Status: 404, Code: "not_found", Method: "GET", Path: "/r/" + ns + "/" + KeyringName}
+		return nil, "", &APIError{Status: 404, Code: "not_found", Method: "GET", Path: "/r/" + ns + "/" + KeyringName}
 	}
-	if kr, err = seal.ParseKeyringV2(d.Value); err == nil {
-		return kr, nil, h.ID, nil
+	if kr, err = seal.ParseKeyringV2(d.Value); err != nil {
+		return nil, "", fmt.Errorf("client: the keyring of %s is not in the §E.3.2 form; wrap it again with the v0.26.1 client before upgrading: %w", ns, err)
 	}
-	if old, lerr := seal.ParseKeyring(d.Value); lerr == nil {
-		return nil, old, h.ID, nil
-	}
-	return nil, nil, "", err
+	return kr, h.ID, nil
 }
 
 // Keyring reads the keyring resource of ns (§E.3.2) as ns sees it and
-// returns it with its head. One stored in the format before v0.63 is
-// ErrLegacyKeyring (LegacyKeyring reads it).
+// returns it with its head. One not in the §E.3.2 form is an error
+// wrapping seal.ErrFormat.
 func (x *E2E) Keyring(ctx context.Context, ns string) (*seal.KeyringV2, string, error) {
-	kr, _, head, err := x.keyring(ctx, ns)
-	if err == nil && kr == nil {
-		return nil, "", ErrLegacyKeyring
-	}
-	return kr, head, err
-}
-
-// LegacyKeyring reads a keyring resource of ns stored in the format before
-// v0.63 (seal.Keyring), to migrate it, and returns it with its head.
-func (x *E2E) LegacyKeyring(ctx context.Context, ns string) (*seal.Keyring, string, error) {
-	_, old, head, err := x.keyring(ctx, ns)
-	if err == nil && old == nil {
-		return nil, "", fmt.Errorf("client: the keyring of %s is not in the format before v0.63", ns)
-	}
-	return old, head, err
+	return x.keyring(ctx, ns)
 }
 
 // KeyringReaders returns the public keys among those the view knows (its
@@ -2269,9 +2376,9 @@ func (x *E2E) InitKeyring(ctx context.Context, ns string, readers ...*ecdh.Publi
 		return nil, err
 	}
 	var w *WriteResult
-	cur, old, head, err := x.keyring(ctx, ns)
+	cur, head, err := x.keyring(ctx, ns)
 	switch {
-	case err == nil && (cur != nil && cur.Current(ns) > 0 || old != nil && old.NS == ns):
+	case err == nil && cur.Current(ns) > 0:
 		return nil, fmt.Errorf("client: namespace %s already has a keyring", ns)
 	case err == nil:
 		w, err = x.c.Append(ctx, ns, KeyringName, head, replaceRoot(kr.Value()))
@@ -2357,153 +2464,4 @@ func (x *E2E) RotateEpoch(ctx context.Context, ns string, readers ...*ecdh.Publi
 	}
 	x.AddKey(seal.Kid(ns, e), key)
 	return e, nil
-}
-
-// MigrateKeyring wraps the keyring of ns stored in the format before v0.63
-// again as the keyring document (§E.3.2, seal.MigrateKeyring): every
-// epoch's key, which the view opens from its own entry, is wrapped in
-// auth mode under the view's recipient key for the readers given for that
-// epoch, and for the view itself. readers must name every epoch the old
-// keyring holds, and comes from the caller, out of band: the stored
-// recipient lists are untrusted (anyone could write them, and a reader
-// left out of a rotation must not get its key now). It returns the write.
-//
-// On a keyring already in the new format it puts back the epochs that a
-// migration left out (MigrateKeyringOpenable) from the newest earlier
-// revision in the old format (MigrationSource), which readers must name
-// then; with none left out, it writes nothing and returns nil.
-func (x *E2E) MigrateKeyring(ctx context.Context, ns string, readers map[int][]*ecdh.PublicKey) (*WriteResult, error) {
-	w, _, err := x.migrateKeyring(ctx, ns, readers, false)
-	return w, err
-}
-
-// MigrateKeyringOpenable is MigrateKeyring for a key holder that can't open
-// every epoch of the old keyring, such as a reader added at a later epoch,
-// which in v0.55 could rotate: revoking means rotating the epoch (§E.3.2),
-// and RotateEpoch needs the keyring in the new format. It wraps again the
-// epochs of readers the view opens, which must include the old keyring's
-// newest, and leaves out the others, which it returns: their keys are
-// then in the keyring's history only, not in the keyring /keys relays,
-// until a holder of them puts them back with MigrateKeyring.
-func (x *E2E) MigrateKeyringOpenable(ctx context.Context, ns string, readers map[int][]*ecdh.PublicKey) (*WriteResult, []int, error) {
-	return x.migrateKeyring(ctx, ns, readers, true)
-}
-
-// MigrationSource returns the keyring of ns in the format before v0.63 that
-// MigrateKeyring wraps again, and the epochs of it to wrap, ascending: the
-// keyring itself and all its epochs, or, when it is already in the new
-// format, its newest earlier revision in the old format and the epochs the
-// keyring lacks.
-func (x *E2E) MigrationSource(ctx context.Context, ns string) (old *seal.Keyring, epochs []int, err error) {
-	old, _, epochs, _, err = x.migrationSource(ctx, ns)
-	return old, epochs, err
-}
-
-// migrationSource is MigrationSource, with the keyring document to wrap
-// the epochs into (a new one, or the keyring as it is) and its head.
-func (x *E2E) migrationSource(ctx context.Context, ns string) (old *seal.Keyring, dst *seal.KeyringV2, epochs []int, head string, err error) {
-	cur, old, head, err := x.keyring(ctx, ns)
-	if err != nil {
-		return nil, nil, nil, "", err
-	}
-	have := map[int]bool{}
-	switch {
-	case old != nil && old.NS != ns:
-		return nil, nil, nil, "", fmt.Errorf("client: %s reads the keyring of %s through; migrate it there", ns, old.NS)
-	case old != nil:
-		dst = &seal.KeyringV2{}
-	case cur.Current(ns) == 0:
-		return nil, nil, nil, "", fmt.Errorf("client: %s reads its base's keyring through; it has none of its own to migrate", ns)
-	default:
-		dst = cur
-		for _, e := range cur.Epochs(ns) {
-			have[e] = true
-		}
-		es, err := x.c.Log(ctx, ns, KeyringName, head, "")
-		if err != nil {
-			return nil, nil, nil, "", err
-		}
-		for i := len(es) - 1; i >= 0 && old == nil; i-- {
-			if es[i].Kind != "rev" || es[i].ID == head {
-				continue
-			}
-			d, err := x.c.Doc(ctx, ns, KeyringName, es[i].ID)
-			if err != nil {
-				return nil, nil, nil, "", err
-			}
-			if k, err := seal.ParseKeyring(d.Value); err == nil && k.NS == ns {
-				old = k
-			}
-		}
-		if old == nil {
-			return nil, nil, nil, "", fmt.Errorf("client: the keyring of %s is not in the format before v0.63, and has no earlier revision in it", ns)
-		}
-	}
-	for e := range old.Epochs {
-		if !have[e] {
-			epochs = append(epochs, e)
-		}
-	}
-	sort.Ints(epochs)
-	return old, dst, epochs, head, nil
-}
-
-// migrateKeyring is MigrateKeyring, leaving out with skip the epochs the
-// view can't open (MigrateKeyringOpenable).
-func (x *E2E) migrateKeyring(ctx context.Context, ns string, readers map[int][]*ecdh.PublicKey, skip bool) (*WriteResult, []int, error) {
-	admin, err := x.admin()
-	if err != nil {
-		return nil, nil, err
-	}
-	old, kr, epochs, head, err := x.migrationSource(ctx, ns)
-	if err != nil {
-		return nil, nil, err
-	}
-	fresh := len(kr.Entries) == 0
-	for e := range readers {
-		if _, ok := old.Epochs[e]; !ok {
-			return nil, nil, fmt.Errorf("client: migrating the keyring of %s: readers given for epoch %d, which it doesn't hold", ns, e)
-		}
-	}
-	var left []int
-	wrapped := 0
-	for _, e := range epochs {
-		rs, named := readers[e]
-		var key []byte
-		if named {
-			for _, priv := range x.recipients() {
-				if key, err = old.EpochKey(priv, e); err == nil {
-					break
-				}
-			}
-		}
-		if key == nil {
-			switch {
-			case skip:
-				left = append(left, e)
-				continue
-			case !named:
-				return nil, nil, fmt.Errorf("client: migrating the keyring of %s: no readers given for epoch %d", ns, e)
-			default:
-				return nil, nil, fmt.Errorf("client: migrating the keyring of %s: epoch %d: %w", ns, e, err)
-			}
-		}
-		for _, r := range x.withSelf(rs) {
-			if err := kr.Add(admin, r, seal.Kid(ns, e), key); err != nil {
-				return nil, nil, fmt.Errorf("client: migrating the keyring of %s: epoch %d: %w", ns, e, err)
-			}
-		}
-		wrapped++
-	}
-	if fresh && slices.Contains(left, old.Current) {
-		return nil, left, fmt.Errorf("client: migrating the keyring of %s: the view can't open its newest epoch %d, which writes and rotations need; a holder of it migrates", ns, old.Current)
-	}
-	if wrapped == 0 {
-		return nil, left, nil
-	}
-	w, err := x.c.Append(ctx, ns, KeyringName, head, replaceRoot(kr.Value()))
-	if err != nil {
-		return nil, nil, err
-	}
-	return w, left, nil
 }

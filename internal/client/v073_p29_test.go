@@ -92,8 +92,10 @@ func p29Kr(t *testing.T, ke []byte, ns, name string) []byte {
 }
 
 // v0.73 §E.3.1 (ENC-23): E3 patch sets and prune snapshots are sealed under
-// the resource's K_r = HKDF(K_e, ns, name), ns being pl.ns; readers try
-// K_r, then K_e, under which ciphertext stored before v0.65 was sealed.
+// the resource's K_r = HKDF(K_e, ns, name), ns being pl.ns; readers open
+// under K_r only since v0.78 (K_e seals nothing, §E.2.1, "Reading this
+// spec"): a patch set sealed under K_e, as before v0.65, is flagged and
+// folded as [] (§E.3.2).
 func TestV073P29SealsUnderResourceKey(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -108,11 +110,12 @@ func TestV073P29SealsUnderResourceKey(t *testing.T) {
 	if _, err := seal.OpenPatchSet(ps, ke, "e#1", "e", "d", ""); err == nil {
 		t.Fatal("the patch set opens under K_e")
 	}
-	// A patch set sealed under K_e, as before v0.65, still folds.
+	// A patch set sealed under K_e, as before v0.65, is flagged and folded
+	// as [].
 	legacy := must(seal.SealPatchSet(ke, "e#1", "e", "d", w.ID, ops(op("replace", "/n", 2))))
 	l := must(v.c.Append(ctx, "e", "d", w.ID, legacy))
 	d := must(v.x.DocE2E(ctx, "e", "d", l.ID))
-	if len(d.Flagged) != 0 || d.Value.(map[string]any)["n"] != 2.0 {
+	if len(d.Flagged) != 1 || d.Flagged[0].ID != l.ID || d.Value.(map[string]any)["n"] != 1.0 || d.ValidID != w.ID {
 		t.Fatalf("fold over a K_e patch set: %+v", d)
 	}
 	// The snapshot too.
@@ -129,7 +132,7 @@ func TestV073P29SealsUnderResourceKey(t *testing.T) {
 	if _, err := seal.OpenSnapshot(jwe, ke, "e#1", "e", "d", l.ID); err == nil {
 		t.Fatal("the snapshot opens under K_e")
 	}
-	if d := must(v.x.DocE2E(ctx, "e", "d", l.ID)); d.Value.(map[string]any)["n"] != 2.0 {
+	if d := must(v.x.DocE2E(ctx, "e", "d", l.ID)); d.Value.(map[string]any)["n"] != 1.0 {
 		t.Fatalf("fold from the snapshot %+v", d)
 	}
 }
@@ -190,41 +193,42 @@ func TestV073P29SnapshotKid(t *testing.T) {
 	}
 }
 
-// P29 review, P35, Addendum E Levels (Invariant, After a raise): content
-// from before a raise to e2e is never served at a weaker level, so from
-// sealed it is served sealed under the last epoch before the raise. A
-// raise from sealed needs the new epoch (422 invalid without it); after
-// it, the log and the revision from before stay JWEs, never the plaintext.
-// A raise from at-rest goes through too. What such a raise records, and
-// the snapshot kid of content from before it (ENC-22), are tested in
-// internal/core (TestV073P29RaiseToE2E, TestV073P29SnapshotKidBeforeRaise).
-func TestV073P29RaiseFromSealedStaysSealed(t *testing.T) {
+// P29 review, P35, v0.78 (Addendum E Levels: end-to-end from creation, or
+// never): a config write raising a namespace to e2e is 422 invalid, from
+// sealed, with or without a new epoch, and from at-rest alike; the
+// namespace and its content stay as they were. Formerly
+// TestV073P29RaiseFromSealedStaysSealed, which pinned the raise; checked
+// against the v0.81 server only (on the merged tree).
+func TestV073P29RaiseToE2ERefused(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	v := newP29Env(t, map[string]any{"level": "sealed"})
 	w := must(v.c.Create(ctx, "e", "d", ops(op("add", "", map[string]any{"secret": "s3cr3t"}), op("add", "/$nonce", seal.NewNonce()))))
 	h := must(v.c.NSHead(ctx, "e"))
-	_, err := v.c.PatchConfig(ctx, "e", h.Config, ops(op("replace", "/encryption", map[string]any{"level": "e2e"})))
-	var ae *client.APIError
-	if !errors.As(err, &ae) || ae.Status != 422 || ae.Code != "invalid" {
-		t.Fatalf("raise from sealed without a new epoch: %v, want 422 invalid", err)
+	invalid := func(err error) bool {
+		var ae *client.APIError
+		return errors.As(err, &ae) && ae.Status == 422 && ae.Code == "invalid"
 	}
-	must(v.c.PatchConfig(ctx, "e", h.Config, ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 2}))))
-	if lv := must(v.c.EncryptionLevel(ctx, "e")); lv != "e2e" {
+	for _, enc := range []map[string]any{{"level": "e2e"}, {"level": "e2e", "epoch": 2}} {
+		if _, err := v.c.PatchConfig(ctx, "e", h.Config, ops(op("replace", "/encryption", enc))); !invalid(err) {
+			t.Fatalf("raise from sealed to %v: %v, want 422 invalid", enc, err)
+		}
+	}
+	if lv := must(v.c.EncryptionLevel(ctx, "e")); lv != "sealed" {
 		t.Fatalf("level %q", lv)
 	}
 	for _, path := range []string{"/r/e/d/rev/" + w.ID + "/log", "/r/e/d/rev/" + w.ID} {
 		if st, b := v.raw(t, path); st != 200 || bytes.Contains(b, []byte("s3cr3t")) {
-			t.Fatalf("%s after the raise: %d %s", path, st, b)
+			t.Fatalf("%s: %d %s", path, st, b)
 		}
 	}
-	// From at-rest the content was in the clear before, and the raise
-	// goes through.
 	must(v.s.Client(t, client.WithBearer(v.s.OperatorGrant(t, "a"))).CreateNamespace(ctx, "a",
 		map[string]any{"read": "grant", "keys": []any{v.k.Entry("*")}, "encryption": map[string]any{"level": "at-rest"}}))
 	ac := v.s.Client(t, client.WithBearer(v.k.Grant(t, v.s.Now(), "user:a", []string{"a"}, p29Verbs, nil)))
 	ah := must(ac.NSHead(ctx, "a"))
-	must(ac.PatchConfig(ctx, "a", ah.Config, ops(op("replace", "/encryption", map[string]any{"level": "e2e"}))))
+	if _, err := ac.PatchConfig(ctx, "a", ah.Config, ops(op("replace", "/encryption", map[string]any{"level": "e2e"}))); !invalid(err) {
+		t.Fatalf("raise from at-rest to e2e: %v, want 422 invalid", err)
+	}
 }
 
 // v0.73 §E.3.2 (ENC-25): a revision that isn't padded as its namespace
@@ -321,10 +325,11 @@ func TestV073P29BaseNSOnlyUpToFork(t *testing.T) {
 	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.Path {
 		case "/r/eb/d/rev/" + fid:
+			// The server never folds at E3 (§7.1): fold from genesis.
 			h := http.Header{}
-			h.Set("X-E2E", "fold")
-			h.Set("Location", "/r/eb/d/rev/"+fid+"/log")
-			return &http.Response{StatusCode: 302, Header: h, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+			h.Set("Content-Type", "application/json")
+			body := `{"error":"not offered","code":"not_offered"}`
+			return &http.Response{StatusCode: 404, Header: h, Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: req}, nil
 		case "/r/eb/d/rev/" + fid + "/log":
 			r2 := req.Clone(req.Context())
 			r2.URL.Path = "/r/eb/d/rev/" + fork.ID + "/log"
@@ -440,8 +445,10 @@ func p29Injecting(ns string, entry map[string]any, hideKeyring bool) http.RoundT
 // wrapped in base mode without from or given in the clear, is never one:
 // with the keyring readable, the writer seals under the admin's entry for
 // it instead, configured as every tool is by default (known senders only)
-// or with a trusted sender; without it, the write is ErrUntrustedKey.
-// Reads may still open such a key.
+// or with a trusted sender; without it, the write finds no key
+// (ErrNoKeys). Since v0.78 reads don't open such a key either: at E3 the
+// server relays only keyring entries, and a namespace is e2e from its
+// creation, so no epoch of it was served as at E2.
 func TestV073P29RelayedKeyWithoutFromNeverSeals(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -478,21 +485,21 @@ func TestV073P29RelayedKeyWithoutFromNeverSeals(t *testing.T) {
 			// The keyring hidden, the relayed key is all there is.
 			lc := v.s.Client(t, client.WithBearer(grant), client.WithHTTPClient(&http.Client{Transport: p29Injecting("e", entry, true)}))
 			lx := view(lc)
-			if _, err := lx.SealPatches(ctx, "e", "d", w0.ID, ops(op("replace", "/n", 1))); !errors.Is(err, client.ErrUntrustedKey) {
-				t.Fatalf("%s, %s, keyring hidden: %v, want ErrUntrustedKey", what, how, err)
+			if _, err := lx.SealPatches(ctx, "e", "d", w0.ID, ops(op("replace", "/n", 1))); !errors.Is(err, client.ErrNoKeys) {
+				t.Fatalf("%s, %s, keyring hidden: %v, want ErrNoKeys", what, how, err)
 			}
-			if k, err := lx.Key(ctx, "e#1"); err != nil || !bytes.Equal(k, evil) {
+			if k, err := lx.Key(ctx, "e#1"); !errors.Is(err, client.ErrNoKeys) || bytes.Equal(k, evil) {
 				t.Fatalf("%s, %s: reads open the relayed key: %v", what, how, err)
 			}
 		}
 	}
 
-	// A key holder that read with the injected key first doesn't pass it
-	// on: AddReader wraps the admin's key for the new reader.
+	// A key holder doesn't read with the injected key, nor pass it on:
+	// AddReader wraps the admin's key for the new reader.
 	ak := v.s.Client(t, client.WithBearer(grant), client.WithHTTPClient(&http.Client{Transport: p29Injecting("e", entries["base mode without from"], false)})).
 		E2E(wPriv).WithSenders(v.priv.PublicKey())
-	if k := must(ak.Key(ctx, "e#1")); !bytes.Equal(k, evil) {
-		t.Fatal("the view reads with the relayed key first")
+	if k := must(ak.Key(ctx, "e#1")); !bytes.Equal(k, real) {
+		t.Fatal("the view reads with the relayed key")
 	}
 	_, rPriv, _ := seal.GenerateRecipient()
 	must(ak.AddReader(ctx, "e", rPriv.PublicKey(), false))
@@ -507,9 +514,11 @@ func TestV073P29RelayedKeyWithoutFromNeverSeals(t *testing.T) {
 
 // P29 review, §E.3.2 (ENC-12): a keyring stored in the format before
 // v0.63 has no from, so nothing seals under its keys, relayed or read in
-// it, whatever senders the view knows or trusts; reads still open them.
-// The error names the remedy, migrate-keyring. The stored legacy keyring
-// and its relay are played by the transport, as in TestV073E2EMigrateKeyring.
+// it, whatever senders the view knows or trusts; since v0.78 reads don't
+// open them either ("Reading this spec"). The error names the keyring's
+// form and the remedy, the v0.26.1 client. The stored legacy keyring and
+// its relay are played by the transport, as in
+// TestV073E2ELegacyKeyringRefused.
 func TestV073P29LegacyKeyringNeverSeals(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -540,11 +549,11 @@ func TestV073P29LegacyKeyringNeverSeals(t *testing.T) {
 		"trusted sender": c.E2E(v.priv).WithTrusted(v.priv.PublicKey()),
 	} {
 		_, err := x.SealPatches(ctx, "e", "d", w0.ID, ops(op("replace", "/n", 1)))
-		if !errors.Is(err, client.ErrUntrustedKey) || !strings.Contains(err.Error(), "migrate-keyring") {
+		if !errors.Is(err, client.ErrNoKeys) || !errors.Is(err, seal.ErrFormat) || !strings.Contains(err.Error(), "v0.26.1") {
 			t.Fatalf("%s: sealing under a legacy keyring's key: %v", how, err)
 		}
-		if d := must(x.DocE2E(ctx, "e", "d", w0.ID)); d.Value.(map[string]any)["n"] != 0.0 {
-			t.Fatalf("%s: reads open it: %+v", how, d)
+		if _, err := x.Key(ctx, "e#1"); !errors.Is(err, client.ErrNoKeys) {
+			t.Fatalf("%s: reads open it: %v", how, err)
 		}
 	}
 }

@@ -119,11 +119,15 @@ func TestV073E2EKeyringAdmin(t *testing.T) {
 	}
 }
 
-// P18, ENC-11 (CHANGELOG): a keyring stored in the format before v0.63 is
-// refused as a write, so MigrateKeyring wraps it again in the keyring
-// document, for the readers the caller gives each epoch. The stored
-// legacy document is played by the transport.
-func TestV073E2EMigrateKeyring(t *testing.T) {
+// P18, ENC-11 (CHANGELOG), v0.78: a keyring stored in the format before
+// v0.63 isn't read at all since v0.78 ("Reading this spec": the client's
+// MigrateKeyring and LegacyKeyring are gone, and a key holder runs the
+// v0.26.1 client's migrate-keyring before upgrading): Keyring, AddReader
+// and RotateEpoch refuse it as not in the §E.3.2 form, and no key opens
+// from it. The stored legacy document is played by the transport. Ported
+// from TestV073E2EMigrateKeyring; TestV073LaterKeyHolderMigratesAndRotates,
+// which pinned the migration tool, is deleted.
+func TestV073E2ELegacyKeyringRefused(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	v := newE2EAdminEnv(t)
@@ -150,117 +154,20 @@ func TestV073E2EMigrateKeyring(t *testing.T) {
 	aJWK := seal.RecipientJWK(v.adminPriv.PublicKey())
 	old := v.s.Client(t, client.WithBearer(v.k.Grant(t, v.s.Now(), "user:a", []string{"e"}, []string{"read", "create", "append", "config"}, map[string]any{"enc": aJWK})),
 		client.WithHTTPClient(&http.Client{Transport: rt})).E2E(v.adminPriv)
-	if _, _, err := old.Keyring(ctx, "e"); !errors.Is(err, client.ErrLegacyKeyring) {
+	if _, _, err := old.Keyring(ctx, "e"); !errors.Is(err, seal.ErrFormat) || !strings.Contains(err.Error(), "v0.26.1") {
 		t.Fatalf("Keyring of a legacy document: %v", err)
 	}
-	if _, err := old.AddReader(ctx, "e", v.readerPriv.PublicKey(), false); !errors.Is(err, client.ErrLegacyKeyring) {
+	if _, err := old.AddReader(ctx, "e", v.readerPriv.PublicKey(), false); !errors.Is(err, seal.ErrFormat) {
 		t.Fatalf("AddReader on a legacy document: %v", err)
 	}
-	lk, _ := must2(old.LegacyKeyring(ctx, "e"))
-	if lk.NS != "e" || lk.Current != 1 {
-		t.Fatalf("legacy %+v", lk)
+	if _, err := old.RotateEpoch(ctx, "e"); !errors.Is(err, seal.ErrFormat) {
+		t.Fatalf("RotateEpoch on a legacy document: %v", err)
 	}
-	// Epoch 1 for the reader only: the writer in the stored lists is left
-	// out, as the caller decides; the admin keeps its own entry.
-	if _, err := old.MigrateKeyring(ctx, "e", map[int][]*ecdh.PublicKey{}); err == nil {
-		t.Fatal("migrating without readers for epoch 1")
-	}
-	must(old.MigrateKeyring(ctx, "e", map[int][]*ecdh.PublicKey{1: {v.readerPriv.PublicKey()}}))
-	kr, _ := must2(v.ax.Keyring(ctx, "e"))
-	got := kr.Recipients("e#1")
-	want := []string{seal.Thumbprint(v.adminPriv.PublicKey()), seal.Thumbprint(v.readerPriv.PublicKey())}
-	if len(got) != 2 || !(got[0] == want[0] && got[1] == want[1] || got[0] == want[1] && got[1] == want[0]) {
-		t.Fatalf("migrated recipients %v", got)
-	}
-	k, err := kr.EpochKey(v.readerPriv, "e#1", []*ecdh.PublicKey{v.adminPriv.PublicKey()})
-	if err != nil || !bytes.Equal(k, ke) {
-		t.Fatalf("migrated entry: %v", err)
-	}
-}
-
-// P18 review: a key holder that can't open every epoch of a keyring stored
-// before v0.63 (B, a reader added at epoch 2, which could rotate in
-// v0.55) migrates the epochs it opens with MigrateKeyringOpenable, which
-// reports those it left out, and can then rotate (§E.3.2: revoking means
-// rotating the epoch). A holder of a left-out epoch (A) puts it back with
-// MigrateKeyring, from the keyring's last revision in the old format. The
-// stored legacy revision is played by the transport.
-func TestV073LaterKeyHolderMigratesAndRotates(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	v := newE2EAdminEnv(t)
-	must(v.ax.InitKeyring(ctx, "e"))
-	must(v.ax.RotateEpoch(ctx, "e"))
-	k1, k2 := must(v.ax.Key(ctx, "e#1")), must(v.ax.Key(ctx, "e#2"))
-	_, kh := must2(v.ax.Keyring(ctx, "e"))
-	bJWK, bPriv, _ := seal.GenerateRecipient()
-	aPub, bPub := v.adminPriv.PublicKey(), bPriv.PublicKey()
-	legacy, err := seal.BuildKeyring("e", 1, k1, []*ecdh.PublicKey{aPub})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := legacy.Rotate(k2, []*ecdh.PublicKey{aPub, bPub}); err != nil {
-		t.Fatal(err)
-	}
-	body, _ := json.Marshal(legacy.Value())
-	base := http.DefaultTransport.(*http.Transport).Clone()
-	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
-		res, err := base.RoundTrip(req)
-		if err != nil || req.Method != "GET" || req.URL.Path != "/r/e/keyring/rev/"+kh || res.StatusCode != 200 {
-			return res, err
-		}
-		io.Copy(io.Discard, res.Body)
-		res.Body.Close()
-		res.Body = io.NopCloser(bytes.NewReader(body))
-		res.ContentLength = int64(len(body))
-		res.Header.Del("Content-Length")
-		return res, nil
-	})
-	view := func(sub string, jwk map[string]any, priv *ecdh.PrivateKey) *client.E2E {
-		return v.s.Client(t, client.WithBearer(v.k.Grant(t, v.s.Now(), sub, []string{"e"}, []string{"read", "create", "append", "config"}, map[string]any{"enc": jwk})),
-			client.WithHTTPClient(&http.Client{Transport: rt})).E2E(priv)
-	}
-	bx := view("user:b", bJWK, bPriv)
-	if _, err := bx.RotateEpoch(ctx, "e"); !errors.Is(err, client.ErrLegacyKeyring) {
-		t.Fatalf("rotating a legacy keyring: %v", err)
-	}
-	// Strict, MigrateKeyring refuses to leave an epoch out.
-	if _, err := bx.MigrateKeyring(ctx, "e", map[int][]*ecdh.PublicKey{1: nil, 2: nil}); err == nil {
-		t.Fatal("MigrateKeyring left out an epoch the view can't open")
-	}
-	// A view that opens no epoch, the newest included, migrates nothing.
-	cJWK, cPriv, _ := seal.GenerateRecipient()
-	if _, _, err := view("user:c", cJWK, cPriv).MigrateKeyringOpenable(ctx, "e", map[int][]*ecdh.PublicKey{1: nil, 2: nil}); err == nil || !strings.Contains(err.Error(), "newest epoch 2") {
-		t.Fatalf("migrating without the newest epoch: %v", err)
-	}
-	w, left, err := bx.MigrateKeyringOpenable(ctx, "e", map[int][]*ecdh.PublicKey{1: nil, 2: {aPub}})
-	if err != nil || w == nil || len(left) != 1 || left[0] != 1 {
-		t.Fatalf("partial migration: %v, left %v", err, left)
-	}
-	if e := must(bx.RotateEpoch(ctx, "e", aPub)); e != 3 {
-		t.Fatalf("rotation after the migration: epoch %d", e)
-	}
-
-	// A puts epoch 1 back; nothing is left to put back after that.
-	ax := view("user:a", seal.RecipientJWK(aPub), v.adminPriv)
-	old, epochs, err := ax.MigrationSource(ctx, "e")
-	if err != nil || old.Current != 2 || len(epochs) != 1 || epochs[0] != 1 {
-		t.Fatalf("migration source after a partial migration: %v %v", epochs, err)
-	}
-	if w := must(ax.MigrateKeyring(ctx, "e", map[int][]*ecdh.PublicKey{1: nil})); w == nil {
-		t.Fatal("epoch 1 not put back")
-	}
-	if w, err := ax.MigrateKeyring(ctx, "e", map[int][]*ecdh.PublicKey{}); err != nil || w != nil {
-		t.Fatalf("second put-back: %v %v", w, err)
-	}
-	kr, _ := must2(ax.Keyring(ctx, "e"))
-	if got := must(kr.EpochKey(v.adminPriv, "e#1", []*ecdh.PublicKey{aPub})); !bytes.Equal(got, k1) {
-		t.Fatal("epoch 1 put back with another key")
-	}
-	if got := must(kr.EpochKey(v.adminPriv, "e#2", []*ecdh.PublicKey{bPub})); !bytes.Equal(got, k2) {
-		t.Fatal("epoch 2 migrated with another key")
-	}
-	if len(kr.Recipients("e#3")) != 2 || kr.Current("e") != 3 {
-		t.Fatalf("keyring after rotation and put-back: %+v", kr)
+	// A reader whose grant has no enc gets no relay; the legacy keyring
+	// holds its key in base mode, which no client opens any more.
+	rd := v.s.Client(t, client.WithBearer(v.k.Grant(t, v.s.Now(), "user:r", []string{"e"}, []string{"read"}, nil)),
+		client.WithHTTPClient(&http.Client{Transport: rt})).E2E(v.readerPriv)
+	if k, err := rd.Key(ctx, "e#1"); err == nil {
+		t.Fatalf("a key opened from a legacy keyring: %x", k)
 	}
 }
