@@ -47,9 +47,9 @@ import (
 // A partial reader of a covered namespace (one whose grant allows read
 // there without a namespace-wide edge grant, §C.5.2) reads it filtered by
 // visibility (§B.11.9 Visible): its marker is reads:{ns}:g:{gs}, gs being
-// the origin's (catvis.FilteredSubjects over every deciding catalog's
-// Profile, its groups and grantcheck.ReadsScope's digest, with
-// catvis.KeySubject of its key), and its
+// the origin's (catvis.FilteredSubjects of all its groups, its sub where a
+// deciding catalog's Profile adds it, and grantcheck.ReadsScope's digest,
+// with catvis.KeySubject of its key), and its
 // answers are at the combined checkpoint (grantcheck.CombinedAt) of every
 // namespace visibility reads, which they list as namespaces, one ns_id per
 // namespace (§B.11.9 URLs, §A.4 Answers; fcp.ids):
@@ -1104,12 +1104,13 @@ func (fv *fview) itemLive(n *tree.Node) bool {
 }
 
 // grantFview is a partial reader's view at cp (§B.11.9 gs): its subjects
-// are catvis.FilteredSubjects over the deciding subjects of every
-// deciding catalog's Profile there, the grant's groups and §A.4's marker
-// digest (its ReadsScope digest with its key, scopeKeyDigest), with
-// catvis.KeySubject of its key, as the origin's; its filter
-// the grant's (grantcheck.FilterOf). A grant whose
-// read rules refer to /now can't read this way: 403.
+// are catvis.FilteredSubjects of every one of the grant's groups, its sub
+// where some deciding catalog's Profile there adds it (Deciding), and
+// §A.4's marker digest (its ReadsScope digest with its key,
+// scopeKeyDigest), with catvis.KeySubject of its key, as the origin's;
+// its filter the grant's (grantcheck.FilterOf). A grant whose key-scope
+// or block rules refer to /now, or whose roles all do, can't read this
+// way: 403 (§C.2 item 5).
 func grantFview(cp *fcp, v *grant.Verified) (*fview, error) {
 	digest, ok := grantcheck.ReadsScope(v)
 	if !ok {
@@ -1126,12 +1127,14 @@ func grantFview(cp *fcp, v *grant.Verified) (*fview, error) {
 	return newFview(cp, subjects, grantcheck.FilterOf(v)), nil
 }
 
-// errRulesChanged and errKeepsAll refuse a cookie for a marker
+// errRulesChanged and errPartial refuse a cookie for a marker
 // reads:{ns}:g:{gs} at a checkpoint it doesn't stand for (§B.11.9 gs,
-// §B.11.5): the reader exchanges its grant again.
+// §B.11.5): the reader exchanges its grant again. errPartial is a marker
+// whose subjects were recorded holding "partial", under an earlier draft:
+// no gs leaves a group out any more (v0.78), so it stands for nothing.
 var (
 	errRulesChanged = &grant.AuthError{Status: 403, Msg: "the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)"}
-	errKeepsAll     = &grant.AuthError{Status: 403, Msg: "this subject set leaves out groups that decide visibility at this checkpoint: exchange the grant again (§B.11.5, §B.11.9)"}
+	errPartial      = &grant.AuthError{Status: 403, Msg: "this subject set leaves out groups: exchange the grant again (§B.11.5, §B.11.9)"}
 	errUncovered    = &grant.AuthError{Status: 403, Msg: "the namespace is no longer read filtered: exchange the grant again (§B.11.9)"}
 )
 
@@ -1148,13 +1151,16 @@ var (
 // §C.4 judges a base's keys, "only while the base has it with the same
 // pub"; a record without one, from before migration 006, never does),
 // where m has no such key recorded (from before migration 007), and where
-// its subjects leave out some of the reader's groups and some deciding
-// catalog keeps all groups (§B.11.5); otherwise item 1 from rec's
+// its subjects hold "partial", recorded under an earlier draft (§B.11.5,
+// v0.78: no gs leaves a group out); otherwise item 1 from rec's
 // subjects and item 2 from its filter. Readers with the same subjects
 // and rules share m, so once a key one came from is replaced, the
 // others' cookies are 403 too, until the replaced key's last cookie
 // expires: never a cookie read under a key no longer accepted.
 func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *markerRec) (*fview, error) {
+	if slices.Contains(rec.subjects, catvis.Partial) {
+		return nil, errPartial
+	}
 	recorded, err := ix.gsKeys(ctx, m, ix.opt.Now())
 	if err != nil {
 		return nil, err
@@ -1187,13 +1193,6 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *marker
 		}
 		if !gsKeyHolds(cfg, keys, rec.f, k, holds) {
 			return nil, errRulesChanged
-		}
-	}
-	if slices.Contains(rec.subjects, catvis.Partial) {
-		for _, c := range cp.cats {
-			if c.Profile().KeepAll {
-				return nil, errKeepsAll
-			}
 		}
 	}
 	return newFview(cp, rec.subjects, rec.f), nil

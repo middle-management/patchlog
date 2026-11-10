@@ -847,15 +847,16 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 
 // ReadsPerResource reports whether a verified grant's reads may differ
 // between resources of a namespace: its key has a readScope, or a rule of
-// its key scope, its blocks or a role that lists read refers to /resource
-// (or to the whole envelope). A grant whose reads can't differ reads every
+// its key scope, its blocks or a role that counts for read (readRoles: a
+// role with a rule on /now doesn't, §C.2 item 5) refers to /resource (or
+// to the whole envelope). A grant whose reads can't differ reads every
 // resource or none, so one that doesn't read the namespace unrestricted
 // (ReadsUnrestricted) reads none of it.
 func (ch *Checker) ReadsPerResource(v *grant.Verified) bool {
 	if v.Key.ReadScopeResource {
 		return true
 	}
-	_, roles := v.Allows("read")
+	roles := readRoles(v)
 	lists := [][]any{v.KeyRules, v.BlockRules}
 	for _, r := range roles {
 		lists = append(lists, v.RoleRules(r))
