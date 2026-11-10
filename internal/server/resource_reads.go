@@ -135,38 +135,16 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
-	case rev.Fold:
-		// An e2e revision (§E.3): the server has no document, so the
-		// client folds the log from the latest snapshot at or before it.
-		// The target only changes when a prune adds a newer snapshot,
-		// and the old target stays correct (§8.6), so it caches long.
-		loc := "/r/" + ns + "/" + name + "/rev/" + id + "/log"
-		if rev.FoldSince != "" {
-			loc += "?since=" + rev.FoldSince
-		}
-		s.cache(w, r, ccLong, rev.Public, resTags(ns, name)...)
-		w.Header().Set("ETag", quote(id))
-		w.Header().Set("X-Revision", id)
-		w.Header().Set("X-E2E", "fold")
-		w.Header().Set("Location", loc)
-		w.WriteHeader(302)
 	case rev.Snapshot:
-		// An e2e prune's sealed snapshot, served as /rev/{H} and never as
-		// a log entry (§7.1 Paging, §8.6): 200 as the revision's sealed
-		// document, or for a tombstone horizon the tombstone's 410 with
-		// the snapshot (the last live document) in its body. Either is
-		// immutable: the snapshot stays stored until a later prune or a
-		// purge makes the revision 410 for good.
+		// An e2e prune's sealed snapshot (§7.1, §8.6), served at the
+		// horizon or, at a tombstone horizon, at its parent, and never as
+		// a log entry: immutable, as it stays stored until a later prune
+		// or a purge makes the revision 410 for good.
 		s.cache(w, r, ccImmutable, rev.Public, resTags(ns, name)...)
 		w.Header().Set("ETag", quote(id))
 		w.Header().Set("X-Revision", id)
-		w.Header().Set("X-E2E", "snapshot")
 		if s.notModified(r, quote(id), rev) {
 			w.WriteHeader(304)
-			return
-		}
-		if rev.Status == 410 {
-			writeJSON(w, 410, map[string]any{"code": "gone", "snapshot": rev.JWE})
 			return
 		}
 		s.revMeta(w, rev)
@@ -175,6 +153,19 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodHead {
 			w.Write([]byte(rev.JWE))
 		}
+	case rev.Code == "not_offered":
+		// Any other e2e revision that would be 200: the server never folds
+		// (§7.1). The body names where the reader folds the log from;
+		// short, as the next prune moves the horizon (§9).
+		s.cache(w, r, ccShort, rev.Public, resTags(ns, name)...)
+		body := map[string]any{"code": "not_offered", "message": "the server never folds an end-to-end resource: fold its log from last, else horizon, else genesis (§7.1)"}
+		if rev.Horizon != "" {
+			body["horizon"] = rev.Horizon
+		}
+		if rev.Last != "" {
+			body["last"] = rev.Last
+		}
+		writeJSON(w, 404, body)
 	case rev.Status == 200:
 		if rev.Referrer {
 			referrerCache(w)

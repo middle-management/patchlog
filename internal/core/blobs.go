@@ -267,11 +267,6 @@ func (bs *batchSource) blob(t *tx, name string, bid ids.ID) *blobRow {
 	if b != nil && t.isSealedNS(bs.n) && !t.keysOpen(bs.n, name, t.blobKeyEpochs(bs.n, name, bid), bs.creds) {
 		return nil
 	}
-	// So from an e2e source for a blob from before a raise from sealed,
-	// with the keys /keys gives for it as at E2 (§2.1, Addendum E Levels).
-	if b != nil && !t.preRaiseBlobOpens(bs.n, name, bid, bs.creds) {
-		return nil
-	}
 	return b
 }
 
@@ -959,9 +954,8 @@ func (g *blobGate) checkSize(size int64) *Error {
 // request (or its Source-Authorization), of a namespace that ranks no
 // higher as a source than the target does as a target, if it is another
 // (§2.1), one that reading would serve and, from a sealed source, public or
-// not, or an e2e one's blob from before a raise from sealed (Addendum E
-// Levels), within one namespace too, one the request's keys open under an
-// epoch it is served under there (keywindow.go, preRaiseBlobOpens). Anything else is nil
+// not, within one namespace too, one the request's keys open under an
+// epoch it is served under there (keywindow.go). Anything else is nil
 // (404), a source whose own source was raised to a level this server lacks
 // included (upstreamRefusal: the read fails).
 func (t *tx) copySource(target *nsRow, req Request, ns, name string, bid ids.ID) *blobRow {
@@ -980,9 +974,6 @@ func (t *tx) copySource(target *nsRow, req Request, ns, name string, bid ids.ID)
 		return nil
 	}
 	if t.isSealedNS(sn) && !t.keysOpen(sn, name, t.blobKeyEpochs(sn, name, bid), req.anyCreds()) {
-		return nil
-	}
-	if !t.preRaiseBlobOpens(sn, name, bid, req.anyCreds()) {
 		return nil
 	}
 	return ans.row
@@ -1261,15 +1252,6 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 			// sealed under an epoch (§E.2.2, sealedblobs.go).
 			job, nsID = t.sealedBlobHead(n, name, bid, out), n.id
 			return nil
-		}
-		// Nor do e2e namespaces for a blob from before a raise from sealed,
-		// whose epoch URLs it keeps (Addendum E Levels, preraise.go).
-		if t.isE2E(n) {
-			head := t.resolve(n, name, nil).head
-			if p := t.preRaiseBlob(n, head, bid); p != nil {
-				job, nsID = t.preRaiseBlobHead(p, name, head, bid, out), p.m.id
-				return nil
-			}
 		}
 		out.Type = ans.row.typ
 		out.setContent(t.openBytes(ans.row.owner, ans.row.hash))

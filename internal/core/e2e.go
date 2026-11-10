@@ -39,23 +39,21 @@ package core
 //     e2e_epochs records when each epoch began (for POST /keys and kid
 //     checks). A key holder rotates by re-wrapping the keyring and bumping
 //     the epoch, in one batch.
-//   - Raises (Addendum E Levels). A config write, or a batch's config
-//     change, may raise a namespace to e2e from none, at-rest or sealed,
-//     starting a new epoch (from sealed, the current one plus one;
-//     checkEncryption). e2e_raises records the raising configuration and
-//     what was in force before (e2eRaiseOf). Writes from the raising
-//     entry on are sealed ops; what was stored before stays plaintext on
-//     the server.
-//   - Reads. GET /r/{ns}/{name}/rev/{id} answers 302 to
-//     /r/{ns}/{name}/rev/{id}/log?since={s} with X-E2E: fold, where s is
-//     the latest client-supplied snapshot at or before id (omitted if none).
-//     The log serves the stored entries (the ciphertext is inside), never
-//     the snapshot: /rev/{s} itself serves it (200 application/jose, or
-//     for a tombstone horizon a 410 whose body carries it, both with
-//     X-E2E: snapshot; §7.1 Paging). Clients fetch it and fold the range
-//     after it. What /rev/{id} serves for other revisions is open (§13).
+//   - Levels (Addendum E Levels). A namespace is e2e from its creation
+//     or never: a config write raising one to e2e is 422
+//     (checkNoE2ERaise), and a branch is e2e exactly when its base is.
+//   - Reads. The server never folds a resource other than the keyring
+//     (§7.1, e3Rev). GET /r/{ns}/{name}/rev/{id} serves a prune's stored
+//     snapshot (200 application/jose) at the horizon, or at a tombstone
+//     horizon at the tombstone's parent, its last live revision; any
+//     other revision that would be 200 is 404 not_offered with the
+//     resource's horizon, and last, the tombstone's parent, where that
+//     horizon is a tombstone, for the reader to fold the log from. The
+//     log serves the stored entries (the ciphertext is inside), never the
+//     snapshot (§7.1 Paging).
 //   - Prune (§8.6) needs an archive and the horizon's document as a sealed
-//     snapshot (pl {ns, name, id, kind: "snapshot"}); keep isn't supported.
+//     snapshot (pl {ns, name, id}, id the horizon's or, at a tombstone
+//     horizon, its parent's; §E.3.1); keep isn't supported.
 //     Retention isn't applied by the server.
 //   - Blobs (§E.3.1). Clients encrypt blobs under keys of their own, so the
 //     server stores and serves them as uploaded (SealedBlobType only). A
@@ -75,7 +73,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -118,65 +115,6 @@ func (t *tx) e2eConfigWritten(n *nsRow, old, cfg *Config) {
 	t.must(err)
 }
 
-// e2eRaise is a namespace's raise to e2e (Addendum E Levels).
-type e2eRaise struct {
-	// configSeq is the configuration that made the namespace e2e; seq
-	// and id are the namespace entry (config or batch) that wrote it,
-	// before which the raise lies in the log.
-	configSeq, seq int64
-	id             ids.ID
-	// level is the level before the raise; from sealed, epoch and pad are
-	// the last epoch and pad setting before it, which content stored
-	// before the raise keeps (§E.2.2).
-	level int
-	epoch int
-	pad   bool
-}
-
-// e2eRaiseOf returns n's raise to e2e, nil for a namespace that was e2e
-// from its creation or isn't e2e. The raising entry is the first of n's
-// log written under the raising configuration or a later one.
-func (t *tx) e2eRaiseOf(n *nsRow) *e2eRaise {
-	r := &e2eRaise{}
-	var pad int
-	err := t.QueryRow(`SELECT config_seq, level, epoch, pad FROM e2e_raises WHERE ns = ?`, n.id).Scan(&r.configSeq, &r.level, &r.epoch, &pad)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	t.must(err)
-	r.pad = pad != 0
-	var id []byte
-	err = t.QueryRow(`SELECT seq, id FROM ns_log WHERE ns = ? AND config_seq >= ? ORDER BY config_seq, seq LIMIT 1`, n.id, r.configSeq).Scan(&r.seq, &id)
-	if errors.Is(err, sql.ErrNoRows) {
-		// The raising entry is being appended in this transaction.
-		return r
-	}
-	t.must(err)
-	r.id = ids.FromBytes(id)
-	return r
-}
-
-// preRaiseHead is the seq of resource row res's head as of the entry
-// before raise: res's revisions up to it were written before the raise
-// and are stored in the clear, those after it from the raising entry on
-// (Addendum E Levels). 0 when res had no revision then.
-func (t *tx) preRaiseHead(raise *e2eRaise, res int64) int64 {
-	if raise.seq == 0 {
-		// The raising entry is being appended in this transaction: every
-		// stored revision is from before it.
-		var max sql.NullInt64
-		t.must(t.QueryRow(`SELECT MAX(seq) FROM revisions WHERE res = ?`, res).Scan(&max))
-		return max.Int64
-	}
-	var head int64
-	err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq < ? ORDER BY ns_seq DESC LIMIT 1`, res, raise.seq).Scan(&head)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0
-	}
-	t.must(err)
-	return head
-}
-
 // checkSealedHeader checks a JWE's protected header without a key (§E.3.1,
 // step 3): canonical JSON with no members but alg, enc, kid and pl, so no
 // zip (§E.2.2), kid "{ns}#{epoch}" naming n and the given
@@ -189,8 +127,7 @@ func (t *tx) checkSealedHeader(n *nsRow, jwe string, want seal.PL, what string, 
 }
 
 // checkSealedKid is checkSealedHeader with the namespace the kid must name,
-// kns: n's own, or for a prune's snapshot of a base's content from before
-// its raise from sealed, that base (checkSnapshot).
+// kns.
 func (t *tx) checkSealedKid(jwe string, want seal.PL, what, kns string, epoch int, why string) *Error {
 	h, err := seal.ParseHeader(jwe)
 	if err != nil || strings.Split(jwe, ".")[1] != "" {
@@ -237,54 +174,34 @@ func canonicalE3Header(raw []byte) bool {
 	return bytes.Equal(jsonv.Canonical(v), raw)
 }
 
-// checkSnapshot checks the header of snapshot, a prune's sealed snapshot of
-// revision h of resource name of n (§8.6, §E.3.1): pl {ns, name, id}
-// naming n, the resource and h, and the kid snapshotKid gives.
+// checkSnapshot checks the header of snapshot, a prune's sealed snapshot at
+// horizon h of resource name of n (§8.6, §E.3.1): pl {ns, name, id} naming
+// n, the resource and h, or where h is a tombstone, its parent, the last
+// live revision, whose document the snapshot is; and the kid snapshotKid
+// gives, naming n.
 func (t *tx) checkSnapshot(n *nsRow, cfg *Config, name string, h *revRow, snapshot string) *Error {
-	kns, epoch, why := t.snapshotKid(n, cfg, h)
-	return t.checkSealedKid(snapshot, seal.SnapshotPL(n.name, name, h.id.String()), "snapshot", kns, epoch, why)
+	id := h.id.String()
+	if h.kind == kindTombstone {
+		id = ""
+		if h.parentSeq.Valid {
+			id = t.revID(h.parentSeq.Int64).String()
+		}
+	}
+	epoch, why := t.snapshotKid(n, cfg, h)
+	return t.checkSealedKid(snapshot, seal.SnapshotPL(n.name, name, id), "snapshot", n.name, epoch, why)
 }
 
-// snapshotKid is the kid a prune's snapshot of revision h of n must be
-// sealed under (§E.3.1), as the namespace it names and the epoch, and why.
-// It is set by the newest revision in h's chain, crossing foreign parents,
-// that isn't a tombstone and whose patch set isn't []:
-//
-//   - a sealed op of n's own (its kid names n): that op's epoch;
-//   - a patch set from before a raise from sealed, in the clear on the
-//     server: the epoch that revision is served under (Addendum E Levels,
-//     preRaiseEpoch). For n's own, an epoch of n's; for a base's content
-//     that a branch reads through, one of that base's, which the branch
-//     serves it under as the base does, so the kid names the base
-//     (kidName): an epoch of the branch's own would open, to readers of
-//     its later epochs, what Levels keep under the epoch before the raise;
-//   - otherwise, a base's op or content from before a raise from none or
-//     at-rest: n's epoch in force, cfg's.
-//
-// A revision below an earlier horizon has no patch set left; the snapshot
-// kept at that horizon stands for it, its kid counting where it names n,
-// or the base whose horizon it is with an epoch from before that base's
-// raise from sealed (F-E2), as clients, which fold from that snapshot, see
-// it too.
-func (t *tx) snapshotKid(n *nsRow, cfg *Config, h *revRow) (string, int, string) {
+// snapshotKid is the epoch a prune's snapshot of revision h of n must be
+// sealed under (§E.3.1), and why; its kid names n. It is set by the newest
+// revision in h's chain, crossing foreign parents, that isn't a tombstone
+// and whose patch set isn't []: a sealed op of n's own (its kid names n),
+// that op's epoch; otherwise, such as a base's op read through, n's epoch
+// in force, cfg's. A revision below an earlier horizon has no patch set
+// left; the snapshot kept at that horizon stands for it, its epoch
+// counting where its kid names n, as clients, which fold from that
+// snapshot, see it too.
+func (t *tx) snapshotKid(n *nsRow, cfg *Config, h *revRow) (int, string) {
 	inForce := fmt.Sprintf("namespace %s's epoch in force", n.name)
-	// The raise from sealed of the namespace owning a resource row, if any.
-	owners := map[int64]*nsRow{}
-	raises := map[int64]*e2eRaise{}
-	ownerOf := func(res int64) (*nsRow, *e2eRaise) {
-		if o, ok := owners[res]; ok {
-			return o, raises[res]
-		}
-		var ns int64
-		t.must(t.QueryRow(`SELECT ns FROM resources WHERE res = ?`, res).Scan(&ns))
-		o := t.nsByID(ns)
-		r := t.e2eRaiseOf(o)
-		if r != nil && r.level != levelSealed {
-			r = nil
-		}
-		owners[res], raises[res] = o, r
-		return o, r
-	}
 	for _, seg := range t.ancestry(h) {
 		var found *revRow
 		var snap string
@@ -322,16 +239,11 @@ func (t *tx) snapshotKid(n *nsRow, cfg *Config, h *revRow) (string, int, string)
 		if found == nil {
 			continue
 		}
-		at := fmt.Sprintf("set by revision %s of its chain", found.id)
 		if snap != "" {
-			kns, e, err := seal.ParseKid(kidOf(snap))
-			if err == nil && kns == n.name {
-				return n.name, e, fmt.Sprintf("the epoch of the snapshot kept at horizon %s of its chain", found.id)
+			if kns, e, err := seal.ParseKid(kidOf(snap)); err == nil && kns == n.name {
+				return e, fmt.Sprintf("the epoch of the snapshot kept at horizon %s of its chain", found.id)
 			}
-			if o, r := ownerOf(found.res); err == nil && o.id != n.id && r != nil && kns == t.kidName(o) && e <= r.epoch {
-				return kns, e, fmt.Sprintf("the epoch of the snapshot kept at horizon %s of its chain, from before %s's raise from sealed", found.id, kns)
-			}
-			return n.name, cfg.Epoch, inForce
+			return cfg.Epoch, inForce
 		}
 		var canon []byte
 		if found.patches.Valid {
@@ -339,21 +251,12 @@ func (t *tx) snapshotKid(n *nsRow, cfg *Config, h *revRow) (string, int, string)
 		}
 		if jwe, _, ok := seal.SealedOp(canon); ok {
 			if kns, e, err := seal.ParseKid(kidOf(jwe)); err == nil && kns == n.name {
-				return n.name, e, at
+				return e, fmt.Sprintf("set by revision %s of its chain", found.id)
 			}
-			return n.name, cfg.Epoch, inForce
 		}
-		// In the clear on the server: content from before a raise, n's own
-		// or a base's read through.
-		if o, r := ownerOf(found.res); r != nil {
-			kns := t.kidName(o)
-			// Named as the kid names it: a remote branch's shadow isn't a
-			// namespace clients can address.
-			return kns, t.preRaiseEpoch(o, found, r), fmt.Sprintf("%s, from before %s's raise from sealed, served under its epoch", at, kns)
-		}
-		return n.name, cfg.Epoch, inForce
+		return cfg.Epoch, inForce
 	}
-	return n.name, cfg.Epoch, inForce
+	return cfg.Epoch, inForce
 }
 
 // kidOf is the kid of a compact JWE's protected header, "" if it has none.
@@ -370,31 +273,6 @@ func (t *tx) ownRes(n *nsRow, res int64) bool {
 	var ns int64
 	t.must(t.QueryRow(`SELECT ns FROM resources WHERE res = ?`, res).Scan(&ns))
 	return ns == n.id
-}
-
-// preRaiseEpoch is the epoch n serves its revision row r from before its
-// raise from sealed under (Addendum E Levels, §E.2.2): the epoch r was
-// written in (rev_epochs; for a remote branch's shadow, the epoch its
-// source served the mirrored entry under, insertChain), else the one its
-// first stored sealing fixed, else the last epoch before the raise, which
-// stands for the current one for content from before it.
-func (t *tx) preRaiseEpoch(n *nsRow, r *revRow, raise *e2eRaise) int {
-	var e int
-	if err := t.QueryRow(`SELECT epoch FROM rev_epochs WHERE seq = ?`, r.seq).Scan(&e); err == nil {
-		return e
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		t.must(err)
-	}
-	var prefix string
-	err := t.QueryRow(`SELECT substr(jwe, 1, 4096) FROM sealed WHERE ns = ? AND rev_seq = ? AND kind IN ('doc', 'entry') ORDER BY created LIMIT 1`, n.id, r.seq).Scan(&prefix)
-	if err == nil {
-		if e, ok := jweEpoch(prefix); ok {
-			return e
-		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		t.must(err)
-	}
-	return raise.epoch
 }
 
 // applyStepsE2E is step 3 for a resource of an e2e namespace (§6.2): each
@@ -591,15 +469,9 @@ func (t *tx) e2eSnapshot(row *revRow) string {
 // keyring as of at (§F.8.1), whether or not the branch has written its own
 // since, for that base's epochs baseEpochs selects, which the request's
 // epochs don't narrow. A remote branch's shadows are bases like any other:
-// each holds a level of the remote base's chain as of at (§G.5.2).
-//
-// The epochs before an e2e raise from sealed aren't keyring epochs: the
-// origin holds their keys, and gives them as at E2 (Addendum E Levels,
-// preRaiseKeys), n's own for the epochs of the §E.2.3 window, judged
-// against the current epoch, so none without nbf (preRaiseWindow), and in
-// a branch each base's for the base epochs baseEpochs selects, K_r derived
-// with the base's namespace; a remote branch's shadow holds those its source gave
-// this deployment's grant (fetchPreRaiseKeys).
+// each holds a level of the remote base's chain as of at (§G.5.2). Only
+// keyring entries are relayed: the origin holds no key of an e2e
+// namespace (Addendum E Levels).
 func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error) {
 	enc := recipientOf(a)
 	if enc == nil {
@@ -624,18 +496,10 @@ func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[str
 			}
 		}
 	}
-	// One window for every epoch, those from before a raise from sealed
-	// included: it is judged against the current epoch (Addendum E Levels,
-	// §E.2.3), so a grant without nbf gets none of them.
 	window := selectEpochs(t.grantEpochsOf(t.keyEpochs(n, cfg.Epoch), cfg, a), kr.Epochs)
 	if d := t.ownKeyring(n, nil); d != nil {
 		add(keyringEntries(d, enc, window))
 	}
-	keys, err := t.preRaiseKeys(n, window, a, kr, enc)
-	if err != nil {
-		return nil, err
-	}
-	add(keys)
 	for child := n; child.isBranch(); {
 		b := t.nsByID(child.base.Int64)
 		at := child.baseAt.Int64
@@ -643,11 +507,6 @@ func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[str
 		if d := t.ownKeyring(b, &at); d != nil {
 			add(keyringEntries(d, enc, epochs))
 		}
-		keys, err := t.preRaiseKeys(b, epochs, a, kr, enc)
-		if err != nil {
-			return nil, err
-		}
-		add(keys)
 		child = b
 	}
 	return out, nil
@@ -669,19 +528,9 @@ func (t *tx) ownKeyring(n *nsRow, asOf *int64) any {
 }
 
 // keyEpochs lists n's epochs up to max with when each began, ascending, as
-// the §E.2.3 window reads them at E3: those begun at e2e (e2e_epochs) and,
-// after a raise from sealed, the epochs before it, whose keys the origin
-// holds (epoch_keys), up to the last one before the raise. A remote
-// branch's shadow's epochs from before the raise whose start times
-// base.origin hasn't given are left out, so they are in no grant's window,
-// the shadow's own or a branch's base epochs (knownStarts, §G.5.2).
+// the §E.2.3 window reads them at E3 (e2e_epochs).
 func (t *tx) keyEpochs(n *nsRow, max int) []epochStart {
-	all := t.epochStarts(`e2e_epochs`, n.id, max)
-	r := t.e2eRaiseOf(n)
-	if r == nil || r.level != levelSealed {
-		return all
-	}
-	return append(knownStarts(t.epochStarts(`epoch_keys`, n.id, min(max, r.epoch))), all...)
+	return t.epochStarts(`e2e_epochs`, n.id, max)
 }
 
 // epochNow is the epoch base b has in force now (§E.2.3): its document's,
@@ -709,16 +558,11 @@ func (t *tx) epochNow(b *nsRow) int {
 // nbf among the grant's blocks, or at at if that is earlier; where no
 // block has nbf, or authentication is disabled, the epoch b has in force
 // now (epochNow), so none once b has moved past its epoch at at; and no
-// more than b's historyEpochs at at before its epoch there. Those are b's
-// keyring epochs and, after a raise from sealed, the epochs before it,
-// whose keys the origin gives as at E2 (preRaiseKeys): a branch gets those
-// "for the base epochs §E.2.3 selects" (Addendum E Levels), so this rule
-// alone bounds them, not preRaiseWindow, which judges the raised
-// namespace's own grants against its current epoch and document. A base
-// at at that isn't e2e gives none, and nor does a remote branch's deeper
-// base whose current namespace document B can't read (chainReadable,
-// §G.5.2 E3 sources): neither its keyring entries nor its pre-raise keys
-// are relayed, and its last-seen epoch isn't used.
+// more than b's historyEpochs at at before its epoch there: b's keyring
+// epochs. A base at at that isn't e2e gives none, and nor does a remote
+// branch's deeper base whose current namespace document B can't read
+// (chainReadable, §G.5.2 E3 sources): its keyring entries aren't relayed,
+// and its last-seen epoch isn't used.
 func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 	if !t.chainReadable(b) {
 		return nil
@@ -765,133 +609,6 @@ func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 	return out
 }
 
-// preRaiseWindow lists the epochs of owner from before its raise from
-// sealed (raise) whose keys grant a gets as at E2 (Addendum E Levels,
-// §E.2.3): the §E.2.3 window over owner's epochs judged against its
-// current epoch (epochNow) and namespace document, of which those up to
-// the raise's, so a grant without nbf, or any request while
-// authentication is disabled, gets none, and the current historyEpochs
-// caps the rest. Owner's own /keys (preRaiseKeys, through the window over
-// every epoch) and the server's own key checks for content from before the
-// raise read in owner (preRaiseKeysOpen: schema resolution, blob copies, a
-// batch's local source) both take it from here, so neither is looser or
-// tighter than the other (§2.1 Protection); in a branch of owner both take
-// the base epochs instead (baseEpochs, preRaiseKeyWindow).
-func (t *tx) preRaiseWindow(owner *nsRow, raise *e2eRaise, a *actor) []int {
-	cfg := *t.config(owner.configSeq)
-	cfg.Epoch = t.epochNow(owner)
-	var out []int
-	for _, e := range t.grantEpochsOf(t.keyEpochs(owner, cfg.Epoch), &cfg, a) {
-		if e <= raise.epoch {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-// preRaiseKeys gives grant a, asking /keys of an e2e namespace, the keys of
-// owner's epochs from before its raise from sealed among epochs, as /keys
-// gives them at E2 (Addendum E Levels, §E.2.3): owner is that namespace or
-// one of its bases. A grant whose rules fix /resource (§2.1) gets K_r of
-// the names asked, by default every name its rules fix; any other gets K_e
-// if it reads the namespace unrestricted. What E2 would refuse with 403 is
-// left out instead: names the rules don't fix or the grant may not read,
-// and every key for a grant that neither fixes names nor reads
-// unrestricted. Kids, and K_r, name the namespace owner's content is
-// sealed under (kidName): owner itself, or for a remote branch's shadow
-// its source. Keys are wrapped to enc in HPKE base mode, like any key the
-// origin hands out (§E.2.3), so they carry no from. Nothing for an owner
-// that wasn't raised from sealed: content from before a raise from none or
-// at-rest is in the clear.
-func (t *tx) preRaiseKeys(owner *nsRow, epochs []int, a *actor, kr KeysRequest, enc *ecdh.PublicKey) ([]map[string]any, error) {
-	r := t.e2eRaiseOf(owner)
-	if r == nil || r.level != levelSealed {
-		return nil, nil
-	}
-	var pre []int
-	for _, e := range epochs {
-		if e <= r.epoch {
-			pre = append(pre, e)
-		}
-	}
-	if len(pre) == 0 {
-		return nil, nil
-	}
-	names, perResource, none := t.preRaiseScope(a, kr)
-	if none {
-		return nil, nil
-	}
-	kns := t.kidName(owner)
-	var out []map[string]any
-	for _, e := range pre {
-		if !t.hasEpochKey(owner.id, e) {
-			// A remote branch's shadow holds only the keys its source gave
-			// this deployment (fetchPreRaiseKeys).
-			continue
-		}
-		ke := t.epochKey(owner.id, e)
-		kid := seal.Kid(kns, e)
-		if !perResource {
-			w, err := seal.WrapKey(enc, kid, "", ke)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, w.Value())
-			continue
-		}
-		for _, name := range names {
-			k, err := seal.ResourceKey(ke, kns, name)
-			if err != nil {
-				return nil, err
-			}
-			w, err := seal.WrapKey(enc, kid, name, k)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, w.Value())
-		}
-	}
-	return out, nil
-}
-
-// preRaiseScope is keysScope for the keys of epochs from before an e2e
-// raise (preRaiseKeys), which leaves out what keysScope refuses: the names
-// asked, by default every name a's rules fix, that they fix and a may read
-// (perResource), or, for rules that fix no name, K_e if a reads the
-// namespace unrestricted; none when a gets no key. Without a grant
-// (authentication disabled), none: such a request is judged as a grant
-// without nbf, which gets no epoch from before the raise (§E.2.3, Addendum
-// E Levels).
-func (t *tx) preRaiseScope(a *actor, kr KeysRequest) (names []string, perResource, none bool) {
-	if a == nil || a.verified == nil {
-		return nil, false, true
-	}
-	fixed, fixes := fixedNames(a)
-	if !fixes {
-		return nil, false, !t.readsUnrestricted(a)
-	}
-	in := make(map[string]bool, len(fixed))
-	for _, n := range fixed {
-		in[n] = true
-	}
-	want := kr.Resources
-	if want == nil {
-		want = fixed
-	}
-	seen := map[string]bool{}
-	for _, r := range want {
-		if seen[r] || !in[r] {
-			continue
-		}
-		seen[r] = true
-		if t.grantRules(a, "read", nil, t.basicEnvelope("read", r, a), false) == nil {
-			names = append(names, r)
-		}
-	}
-	sort.Strings(names)
-	return names, true, len(names) == 0
-}
-
 // hasEpochKey reports whether the key of (ns, epoch) is stored.
 func (t *tx) hasEpochKey(ns int64, epoch int) bool {
 	var ok bool
@@ -936,31 +653,21 @@ func (t *tx) kidName(b *nsRow) string {
 // recipient enc, of the given epochs, as /keys relays them (§E.2.3): the
 // entries whose to is enc's thumbprint, with from. Each entry's kid names
 // the keyring's owner, checked when it was written; for a remote branch's
-// shadow, the remote base (§G.5). A keyring stored in the format before
-// v0.63 (seal.Keyring), which the gate refuses to write now, is relayed as
-// stored, without from, until a key holder wraps it again; so is one whose
-// $nonce, written before v0.76, isn't of the fresh form (seal.ParseKeyringV2).
+// shadow, the remote base (§G.5). Only a keyring of the §E.3.2 form with a
+// fresh $nonce, as a write checks it (seal.CheckKeyringV2), is relayed: one stored in the format before v0.63,
+// or with a $nonce written before v0.76, relays nothing, failing closed
+// until a key holder wraps it again (v0.78; warnLegacyE2E).
 func keyringEntries(d any, enc *ecdh.PublicKey, epochs []int) []map[string]any {
 	want := make(map[int]bool, len(epochs))
 	for _, e := range epochs {
 		want[e] = true
 	}
 	var out []map[string]any
-	if ring, err := seal.ParseKeyringV2(d); err == nil {
+	if ring, err := seal.CheckKeyringV2(d); err == nil {
 		for _, e := range ring.To(seal.Thumbprint(enc)) {
 			if _, ep, err := seal.ParseKid(e.Kid); err == nil && want[ep] {
 				out = append(out, e.Relayed().Value())
 			}
-		}
-		return out
-	}
-	old, err := seal.ParseKeyring(d)
-	if err != nil {
-		return nil
-	}
-	for _, e := range epochs {
-		if w, err := seal.Lookup(old, enc, e); err == nil {
-			out = append(out, w.Value())
 		}
 	}
 	return out
@@ -992,29 +699,6 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	// (for a tombstone, the last live one's, whose runs a tombstone
 	// doesn't close).
 	kept := t.declaredAt(h)
-	// A horizon whose document is from before a raise to e2e, in the clear
-	// on the server (Addendum E Levels, §8.6): /rev/{h} is served as before
-	// the raise, so the document is kept, as a prune outside E3 keeps it,
-	// and so are its stored sealings after a raise from sealed, which fixed
-	// the epoch it is served under (§E.2.2). A document that folds over a
-	// sealed op isn't the server's to keep.
-	keepDocs := map[int64]*revRow{}
-	var keptDoc []byte
-	ll := t.lastLive(h)
-	if ll.res == own.id && t.e2eRaiseOf(n) != nil {
-		if doc, err := t.docBytesAt(ll); err == nil {
-			keepDocs[ll.seq], keptDoc = ll, doc
-		}
-	}
-	// After a raise from sealed the prune doesn't change how /rev/{h} is
-	// served: the server first stores the sealing of the document it
-	// serves there, if none is stored (Addendum E Levels, §E.2.2), under
-	// the raised namespace, as a read would.
-	if pre := t.preRaiseOf(n, ll); pre != nil && pre.sealed() {
-		if doc, err := t.docBytesAt(ll); err == nil {
-			t.storePreRaiseSealing(pre, name, ll, doc)
-		}
-	}
 	from := own.horizonSeq.Int64
 	if !cur.Valid {
 		t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ?`, own.id).Scan(&from))
@@ -1024,11 +708,13 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 		return nil, err
 	}
 	res := &PruneResult{Horizon: h.id.String(), Archive: u}
+	// Stored at h, a tombstone one included; /rev serves it at h, or at a
+	// tombstone h at its parent (e3Rev).
 	_, err = t.Exec(`INSERT INTO e2e_snapshots (seq, res, jwe) VALUES (?,?,?) ON CONFLICT (seq) DO UPDATE SET res = excluded.res, jwe = excluded.jwe`, h.seq, own.id, snapshot)
 	t.must(err)
-	// /rev/{h} now serves the snapshot (§7.1 Paging) instead of the fold
-	// redirect it may have been cached as: purge the resource's tag, so a
-	// fold that starts at h doesn't get the old redirect from a CDN.
+	// /rev of the revision it stands for now serves it, and every other
+	// not_offered names the new horizon (§7.1): purge the resource's tag,
+	// so a CDN doesn't keep the short 404 it may have cached.
 	t.tags = append(t.tags, "r:"+n.name+"/"+name)
 	// Attachments end unless the snapshot or a revision after the horizon
 	// declares them (§7.8, §E.3.1); the archive written above has them.
@@ -1037,39 +723,12 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	t.must(err)
 	_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res = ? AND seq < ?`, own.id, h.seq)
 	t.must(err)
-	for seq, row := range keepDocs {
-		_, err = t.Exec(`INSERT INTO snapshots (seq, res, doc) VALUES (?,?,?) ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc`, seq, own.id, t.putDoc("snapshots", own.id, row.seq, keptDoc))
-		t.must(err)
-	}
-	// Below the horizon, the documents and sealings of pre-raise content
-	// go but the kept one's (pruneTo).
-	for _, seq := range t.droppedBelow(own.id, h.seq, keepDocs, nil) {
-		_, err = t.Exec(`DELETE FROM snapshots WHERE seq = ?`, seq)
-		t.must(err)
-	}
-	t.flushDocs = true
-	t.deletePrunedSealed(own.id, h.seq, keepDocs)
 	_, err = t.Exec(`UPDATE resources SET horizon_seq = ?, keep = '[]' WHERE res = ?`, h.seq, own.id)
 	t.must(err)
 	target := h.seq
 	_, nsID := t.appendNS(n, map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, &own.id, &target, n.configSeq, author)
 	res.NSID = nsID.String()
 	return res, nil
-}
-
-// storePreRaiseSealing stores the sealing of row's document from before
-// p's raise from sealed, as /rev serves it under name (preRaiseResJob),
-// unless one is stored: in this transaction, where a read stores it
-// after its own (finishSeal), the first stored winning either way.
-func (t *tx) storePreRaiseSealing(p *preRaise, name string, row *revRow, doc []byte) {
-	j := t.preRaiseResJob(p, name, row, sealDoc, func() []byte { return doc })
-	if j.jwe != "" {
-		return
-	}
-	t.must(j.sealNow())
-	_, err := t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
-		p.m.id, j.kind, j.key, j.name, j.revSeq, j.jwe, t.now.UnixMilli())
-	t.must(err)
 }
 
 // pruneBlobsE2E ends the attachments of res that neither kept, the

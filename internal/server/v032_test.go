@@ -280,15 +280,20 @@ func TestBlobE2EDeclaredOrderAndPrune(t *testing.T) {
 	a1 := etagOf(r)
 	tomb := e.del("e", "a", a1)
 	e.clock.Advance(10 * time.Minute)
-	snap, err := seal.SealSnapshot(k, "e#1", "e", "a", tomb, doc)
+	// v0.81 (§E.3.1): at a tombstone horizon the snapshot is the last
+	// live document's, bound to the tombstone's parent.
+	snap, err := seal.SealSnapshot(k, "e#1", "e", "a", a1, doc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	expect(t, e.prune("e", "a", map[string]any{"horizon": tomb, "snapshot": snap}, "admin"), 200)
-	// The tombstone answers its 410 with the snapshot, the last live
-	// document, served as /rev/{H} (§7.1 Paging).
-	if r := e.get("/r/e/a/rev/" + tomb); r.Code != 410 || r.Str("code") != "gone" || r.Str("snapshot") != snap || r.H.Get("X-E2E") != "snapshot" {
+	// The tombstone answers a plain 410; its parent serves the snapshot
+	// (§7.1).
+	if r := e.get("/r/e/a/rev/" + tomb); r.Code != 410 || r.Str("code") != "gone" || r.Obj()["snapshot"] != nil {
 		t.Fatalf("/rev/{tombstone horizon}: %d %v %s", r.Code, r.H, r.Body)
+	}
+	if r := e.get("/r/e/a/rev/" + a1); r.Code != 200 || string(r.Body) != snap || r.H.Get("Content-Type") != seal.ContentType {
+		t.Fatalf("/rev/{its parent}: %d %v %s", r.Code, r.H, r.Body)
 	}
 	// The tombstone's last live document still references both.
 	expect(t, e.get(blobPath("e", "a", b1)), 200)

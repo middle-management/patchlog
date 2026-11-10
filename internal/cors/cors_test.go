@@ -181,10 +181,14 @@ func TestHeaderLists(t *testing.T) {
 		}
 	}
 	exposed := strings.Split(Exposed, ", ")
-	for _, h := range []string{"ETag", "Location", "Retry-After", "Content-Range", "Gesture", "Undoes", "X-Revision", "X-Namespace-Revision", "X-Config-Revision", "X-Cursor", "X-Log-Next", "X-E2E", "Repr-Digest"} {
+	for _, h := range []string{"ETag", "Location", "Retry-After", "Content-Range", "Gesture", "Undoes", "X-Revision", "X-Namespace-Revision", "X-Config-Revision", "X-Cursor", "X-Log-Next", "Repr-Digest"} {
 		if !slices.Contains(exposed, h) {
 			t.Errorf("%s not exposed", h)
 		}
+	}
+	// v0.81: the server never folds at E3 (§7.1), so no X-E2E is sent.
+	if slices.Contains(exposed, "X-E2E") {
+		t.Error("X-E2E exposed")
 	}
 	// No duplicates, no stray spacing: each list is "A, B, C".
 	for name, l := range map[string][]string{"Headers": allowed, "Methods": methods, "Exposed": exposed} {

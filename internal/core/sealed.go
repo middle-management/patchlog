@@ -432,32 +432,51 @@ func (t *tx) resJob(n *nsRow, name string, row *revRow, kind string, plain func(
 	return j
 }
 
-// configJob prepares the sealing of n's namespace document at ns_log seq.
+// namespaceKey is K_n of n's epoch e (§E.2.1): what is sealed for the
+// namespace rather than for a resource, as K_e itself seals nothing.
+func (t *tx) namespaceKey(n *nsRow, e int) []byte {
+	k, err := seal.NamespaceKey(t.epochKey(n.id, e), n.name)
+	t.must(err)
+	return k
+}
+
+// configJob prepares the sealing of n's namespace document at ns_log seq,
+// under K_n of the epoch in force there (§E.2.2).
 func (t *tx) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
 	j := &sealJob{kind: sealConfig, key: nsID}
 	if t.stored(n, j) {
 		return j
 	}
 	e := t.entryEpoch(n, seq)
-	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.NamespaceDocPL(n.name, nsID), doc
+	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.namespaceKey(n, e), seal.NamespaceDocPL(n.name, nsID), doc
 	j.pad = t.config(n.configSeq).Pad
 	return j
 }
 
 // rangeJob prepares the sealing of n's namespace log range (since, to],
-// where to is ns_log seq toSeq with id toID: a range, long-poll answer or
-// namespace event is sealed under K_e of the current epoch (§E.2.2), not
-// that of its last entry. A stored range keeps its bytes; one evicted is
-// sealed again under the epoch current then.
+// where to is ns_log seq toSeq with id toID: a range or long-poll answer
+// is sealed under K_n of the current epoch (§E.2.2), not that of its last
+// entry. A stored range keeps its bytes; one evicted is sealed again
+// under the epoch current then.
 func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain func() []byte) *sealJob {
 	j := &sealJob{kind: sealRange, key: since + ":" + toID}
 	if t.stored(n, j) {
 		return j
 	}
 	e := t.config(n.configSeq).Epoch
-	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.RangePL(n.name, since, toID), plain()
+	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.namespaceKey(n, e), seal.RangePL(n.name, since, toID), plain()
 	j.pad = t.config(n.configSeq).Pad
 	return j
+}
+
+// eventJob prepares the sealing of n's namespace event for entry id after
+// prev: its plaintext is the entry itself (canonical JSON), under K_n of
+// the current epoch with pl {ns, range: [prev, id]} (§E.2.2). It is
+// sealed at each serve and never stored: it would share its row with the
+// one-entry range (prev, id], whose plaintext is [entry].
+func (t *tx) eventJob(n *nsRow, prev, id string, entry []byte) *sealJob {
+	e := t.config(n.configSeq).Epoch
+	return &sealJob{kid: seal.Kid(n.name, e), k: t.namespaceKey(n, e), pl: seal.RangePL(n.name, prev, id), plain: entry, pad: t.config(n.configSeq).Pad}
 }
 
 // storeSeal is finishSeal for one job inside this write transaction: it
@@ -510,6 +529,10 @@ func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) erro
 		}
 		if err := j.sealNow(); err != nil {
 			return err
+		}
+		if j.kind == "" {
+			// Sealed at each serve, never stored (eventJob).
+			continue
 		}
 		todo = append(todo, j)
 	}

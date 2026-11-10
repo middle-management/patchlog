@@ -26,6 +26,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"strings"
@@ -210,6 +211,9 @@ type Options struct {
 	// a namespace is end-to-end from its creation or never (Addendum E
 	// Levels).
 	LegacyE2ERaiseForTests bool
+	// migrations, if not nil, replaces the embedded migrations (tests of
+	// a database an earlier version left).
+	migrations fs.FS
 }
 
 // RemoteOptions configure the branch side of remote branches (§G.3): how
@@ -418,7 +422,21 @@ func Open(opt Options) (*Engine, error) {
 	if err := checkStoreCompression(&opt); err != nil {
 		return nil, err
 	}
-	db, pg, err := openDB(opt.Path)
+	// Before migrating: a database holding namespaces raised to e2e
+	// under an earlier version is refused, or with PurgeRaisedE2E they are
+	// listed for purging once migrated (legacy_e2e.go).
+	var legacy *legacyE2E
+	db, pg, err := openDB(opt.Path, opt.migrations, func(db *sql.DB, pg bool) error {
+		l, err := checkLegacyE2E(db, pg)
+		if err != nil {
+			return fmt.Errorf("checking for namespaces raised to e2e: %w", err)
+		}
+		if !l.empty() && !opt.PurgeRaisedE2E {
+			return errLegacyE2E(l)
+		}
+		legacy = l
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -456,6 +474,12 @@ func Open(opt Options) (*Engine, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := e.purgeRaisedE2E(context.Background(), legacy); err != nil {
+		e.comp.close()
+		db.Close()
+		return nil, fmt.Errorf("purging namespaces raised to e2e (-purge-raised-e2e): %w", err)
+	}
+	e.warnLegacyE2E(context.Background(), legacy)
 	if pg && !opt.LocalRateBuckets {
 		// The buckets of every instance on the database (ratebuckets.go).
 		if e.rate.store, err = openBucketStore(opt.Path); err != nil {

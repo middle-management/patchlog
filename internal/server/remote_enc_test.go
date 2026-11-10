@@ -221,8 +221,9 @@ func TestRemoteBranchE2E(t *testing.T) {
 			t.Fatalf("entry %d differs", i)
 		}
 	}
-	if r := b.get("/r/rel/d/rev/"+d1, bAdmin); r.Code != 302 || r.H.Get("X-E2E") != "fold" {
-		t.Fatalf("read-through %d %v", r.Code, r.H)
+	// B answers /rev itself, never folding (§7.1, §G.5.2).
+	if r := b.get("/r/rel/d/rev/"+d1, bAdmin); r.Code != 404 || r.Str("code") != "not_offered" {
+		t.Fatalf("read-through %d %v %s", r.Code, r.H, r.Body)
 	}
 	// The keyring reads as a document, and its wrapped keys are relayed
 	// under the base's kids to the grant's enc.
@@ -294,8 +295,9 @@ func TestRemoteBranchE2E(t *testing.T) {
 	}
 }
 
-// History an e2e base pruned can't be mirrored: its horizon is a sealed
-// snapshot.
+// History an e2e base pruned is mirrored from its horizon, with the base's
+// sealed snapshot there, which B serves itself (v0.81 §G.5.2 E3 sources,
+// scenario 66; before v0.81 creation was 410 pruned).
 func TestRemoteBranchE2EPruned(t *testing.T) {
 	t.Parallel()
 	f := newE2E(t, withOrigin(originA), withArchive(t, t.TempDir()))
@@ -311,7 +313,14 @@ func TestRemoteBranchE2EPruned(t *testing.T) {
 	expect(t, a.prune("e", "d", map[string]any{"horizon": d1, "snapshot": snap}, f.adminG), 200) // no retention rule: a * key (§8.6)
 	rt := &route{url: a.srv.URL, bearer: f.readerG}
 	b := newEnv(t, withOrigin(originB), withRemote(rt), withKeyStore(newKeyStore(t)))
-	expectCode(t, b.mkRemote("rel", remoteGenesis("e", a.nsHead("e", f.readerG), e2eDoc(map[string]any{"read": "grant"}))), 410, "pruned")
+	expect(t, b.mkRemote("rel", remoteGenesis("e", a.nsHead("e", f.readerG), e2eDoc(map[string]any{"read": "grant"}))), 201)
+	r := b.get("/r/rel/d/rev/" + d1)
+	if r.Code != 200 || string(r.Body) != snap || r.H.Get("Content-Type") != seal.ContentType {
+		t.Fatalf("B's /rev at A's horizon: %d %v %s", r.Code, r.H, r.Body)
+	}
+	// History below A's horizon isn't mirrored: B never learns its ids,
+	// as for a base that isn't e2e (§G.3).
+	expect(t, b.get("/r/rel/d/rev/"+d0), 404)
 }
 
 // If B can read A's logs but not A's namespace document at at, it can't

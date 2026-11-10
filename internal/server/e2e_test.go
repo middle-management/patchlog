@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"crypto/ecdh"
-	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -72,33 +71,37 @@ func (e *tenv) writeRaw(ns, name, parent, raw, bearer string) *resp {
 	return e.do(q)
 }
 
-// fold follows the fold redirect of ns/name@id and folds the log with
-// keys (by kid), returning the document.
+// fold reads ns/name@id as a reader does at E3 (§7.1): the prune snapshot
+// /rev/{id} serves, or, where it answers 404 not_offered, the log folded
+// with keys (by kid) from the snapshot at last, else horizon, else from
+// genesis, returning the document.
 func (f *e2eFixture) fold(ns, name, id string, keys map[string][]byte, bearer string) any {
 	t := f.t
 	t.Helper()
 	r := f.get("/r/"+ns+"/"+name+"/rev/"+id, bearer)
-	if r.Code == 200 && r.H.Get("X-E2E") == "snapshot" {
+	if r.Code == 200 {
 		// A pruning horizon serves its sealed snapshot (§7.1, §8.6).
 		return f.snapshotAt(ns, name, id, keys, r)
 	}
-	expect(t, r, 302)
-	// The fixture's namespaces are read "grant", so cached privately
-	// (v0.63 §E.2.5: by read mode, at E3 as at any level).
-	if r.H.Get("X-E2E") != "fold" || !strings.HasPrefix(r.H.Get("Cache-Control"), "private") {
-		t.Fatalf("fold headers %v", r.H)
+	expectCode(t, r, 404, "not_offered")
+	// The fixture's namespaces are read "grant", so cached privately.
+	if r.H.Get("X-E2E") != "" || !strings.HasPrefix(r.H.Get("Cache-Control"), "private") {
+		t.Fatalf("not_offered headers %v", r.H)
 	}
-	loc := r.H.Get("Location")
-	u, _ := url.Parse(loc)
-	since := u.Query().Get("since")
-	if u.Path != "/r/"+ns+"/"+name+"/rev/"+id+"/log" {
-		t.Fatalf("location %s", loc)
+	since := r.Str("last")
+	if since == "" {
+		since = r.Str("horizon")
+	}
+	path := "/r/" + ns + "/" + name + "/rev/" + id + "/log"
+	loc := path
+	if since != "" {
+		loc += "?since=" + since
 	}
 	r = f.get(loc, bearer)
 	expect(t, r, 200)
 	arr := r.Arr()
 	for next := r.H.Get("X-Log-Next"); next != ""; next = r.H.Get("X-Log-Next") {
-		r = f.get(u.Path+"?since="+next, bearer)
+		r = f.get(path+"?since="+next, bearer)
 		expect(t, r, 200)
 		arr = append(arr, r.Arr()...)
 	}
@@ -151,29 +154,17 @@ func (f *e2eFixture) fold(ns, name, id string, keys map[string][]byte, bearer st
 }
 
 // snapshotAt opens the prune snapshot that r, the answer of
-// /r/{ns}/{name}/rev/{h}, serves: 200 application/jose, or a tombstone
-// horizon's 410 carrying it, both of the immutable class with X-E2E:
-// snapshot.
+// /r/{ns}/{name}/rev/{h}, serves: 200 application/jose, of the immutable
+// class.
 func (f *e2eFixture) snapshotAt(ns, name, h string, keys map[string][]byte, r *resp) any {
 	t := f.t
 	t.Helper()
 	// The immutable class, private for the fixture's read "grant"
 	// namespaces (v0.63 §E.2.5).
-	if r.H.Get("X-E2E") != "snapshot" || r.H.Get("ETag") != `"`+h+`"` || r.H.Get("Cache-Control") != "private, max-age=300" {
+	if r.Code != 200 || r.H.Get("ETag") != `"`+h+`"` || r.H.Get("Cache-Control") != "private, max-age=300" || r.H.Get("Content-Type") != seal.ContentType {
 		t.Fatalf("/rev/%s: %d %v", h, r.Code, r.H)
 	}
-	var jwe string
-	switch r.Code {
-	case 200:
-		if r.H.Get("Content-Type") != seal.ContentType {
-			t.Fatalf("snapshot content type %q", r.H.Get("Content-Type"))
-		}
-		jwe = string(r.Body)
-	case 410:
-		jwe = r.Str("snapshot")
-	default:
-		t.Fatalf("/rev/%s: %d", h, r.Code)
-	}
+	jwe := string(r.Body)
 	hd, err := seal.ParseHeader(jwe)
 	if err != nil {
 		t.Fatal(err)
@@ -482,8 +473,9 @@ func TestE2EEpochsBranchesLevels(t *testing.T) {
 	expect(t, e.writeRaw("eb", "d", d1, sealed(t, k2, "e#2", "e", "d", d1, ops(op("add", "/x", 1.0))), bg), 422)
 	kb := seal.NewKey()
 	b1 := etagOf(e.writeRaw("eb", "d", d1, sealed(t, kb, "eb#2", "eb", "d", d1, ops(op("add", "/x", 1.0))), bg))
-	if r := e.get("/r/eb/d/rev/"+d1, bg); r.Code != 302 || r.H.Get("X-E2E") != "fold" {
-		t.Fatalf("read-through fold %d", r.Code)
+	// Read through, never folded by the server (§7.1).
+	if r := e.get("/r/eb/d/rev/"+d1, bg); r.Code != 404 || r.Str("code") != "not_offered" {
+		t.Fatalf("read-through %d %s", r.Code, r.Body)
 	}
 	r = e.get("/r/eb/d/rev/"+b1+"/log", bg)
 	expect(t, r, 200)
