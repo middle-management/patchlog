@@ -1,5 +1,90 @@
 # Changelog
 
+## Unreleased
+
+Security release. A review of v0.26.0 found leaks in the tree service and the search index
+(most of them also in v0.25.0), a way for a hostile remote base to stall every remote branch
+on a server, and vulnerable dependencies. Still implements spec **v0.77**. The one schema
+change is the core's migration `015_remote_pending_backoff` (backoff for pending pre-raise
+sealings; it also deletes rows earlier purges left), on SQLite and Postgres; it is safe in a
+rolling upgrade.
+
+**After upgrading, purge your CDN.** Listings and query results computed before a narrowing
+(a namespace made private, or raised to sealed or end-to-end) could be served after it with
+`Cache-Control: public, immutable`, and the services never told the CDN. For every catalog
+that was, or trusts a namespace that was, made private or raised while v0.25.0 or v0.26.0 ran,
+purge the tag `ns:{catalog}`; for every namespace made private or raised, purge `idx:{ns}`.
+Do the same by hand when a tree or index database is created from scratch (not `-rebuild`)
+for catalogs an earlier instance served. Copies already in browsers (up to `max-age=86400`)
+can't be recalled. The services' own kept results are in memory and go at the restart.
+
+**Changes to check before upgrading:**
+- **A namespace just made public reads public only once the service has applied the change.**
+  The tree service and the index now take a reader as public only if the namespace is public as
+  they have applied it *and* per its current namespace document (and, in the tree, the service
+  can follow it). Until a widening is applied, anonymous readers get `401`; grant holders read
+  by their grant; an anonymous `/_refs` leaves the namespace out. Databases from v0.26.0 seed
+  their applied read modes from the documents at their checkpoints.
+- **A namespace the tree service can't follow is stopped.** One it lacks keys for, or that
+  refuses it (`401`, `403`, or `404` on both its log and its head), is marked stopped before
+  its listings are purged: it reads public to no one, and a stopped catalog answers `404`
+  until the service follows it again. A stopped trusted namespace makes its catalog
+  non-public meanwhile.
+- **Remote branches:** each remote origin gets one `-remote-follow-timeout` (new flag,
+  `RemoteOptions.FollowTimeout`, default 10 minutes) per sync for all its branches; branches
+  that don't fit wait for the next sync, and branches are followed in a random order. Creating
+  a remote branch is bounded by the same timeout (`502 upstream` if the base doesn't answer in
+  time). No request to a remote base follows redirects; a `3xx` is the base's answer.
+- **A canceled `requireAt` check** answers `503 behind`, not `502 upstream`.
+
+**Security fixes:**
+- **Tree service: a narrowing now purges.** A config entry that makes a catalog, or a namespace
+  it trusts, private, or raises it to sealed or end-to-end, purges `ns:{ns}`: kept and stored
+  listings, the service's CDN purge and the queued second purge. Before (v0.25.0, v0.26.0), a
+  listing computed in the clear before the change was still served at its `at` with
+  `public, immutable` caching, to anonymous readers. The same now holds for a narrowing the
+  service can't apply (keys it lacks, a refusal), one made while it was down followed by
+  `-rebuild`, a snapshot bootstrap, and an untrust (with or without edge grants).
+- **Tree service: a change mid-listing can't leak.** A listing reads the catalog's encryption,
+  its file metadata's sealing and who reads public again once it has read the graph, before it
+  judges, keeps or serves anything. A raise, rotation or narrowing applied meanwhile can no
+  longer have it served in the clear, kept as public, or sealed under the replaced epoch. (The
+  v0.26.0 fix for this only narrowed the window.)
+- **Index: a namespace being made private is no longer served as public.** The index tells its
+  grant checker about a config change before it purges, and checks the reader's access again
+  just before it keeps a result; a result could otherwise be kept and served under the public
+  URL with `public, immutable` caching, including documents written after the change. A
+  revoked grant is refused the same way. After a snapshot restart (`follow.WithSnapshot`), a
+  namespace narrowed while the index was down has `idx:{ns}` purged.
+- **Index:** a key rotation that lands while a query seals its results no longer leaves pending
+  documents sealed for good under the replaced epoch; a purged catalog's outdated
+  `catalog.trust` (after a snapshot rebuild, or for a catalog no longer served) no longer makes
+  a namespace count as covered (an empty answer where `403` is owed; no content was exposed).
+- **Grant checker:** a namespace-document load that a follower's notice overtook is no longer
+  cached for the TTL; a grant whose `requireAt` `at` is in no chain no longer makes every check
+  read the chain's heads again (once per namespace at a time, at most once a second, shared).
+- **Remote branches (a hostile base):**
+  - Log pages for pending pre-raise sealings must advance through the mirrored chain
+    (`X-Log-Next` must name an entry on the page, after its `since`); before, one base could
+    page a sync forever and stop every other remote branch from following its base's purges.
+  - A `410 pruned` horizon is final only if it is a revision of the mirrored chain strictly
+    after the content; one past the branch's `at` is accepted only if the base's log from the
+    branch's head verifies, and is retried with backoff rather than final. Before, any horizon
+    string was stored and served for good. Rows written by other versions are rechecked.
+  - Sealings must be strict compact JWEs, opened and verified, and are bounded by the size of
+    the content mirrored; before, a base could make a branch store and serve copies padded to
+    about 1 GiB. Reads are capped by kind (log page, sealing, blob, error), settled row by row.
+  - No request to a remote base follows redirects (before: a blind SSRF at every sync, and the
+    branch's grant forwarded to other ports on the base's host); a sealed blob's redirect is
+    followed only to `…/blob/{bid}/e/{n}`.
+  - Purging a remote branch's resource or namespace deletes its pending-sealing rows and the
+    shadow's stored copies of the base's sealings. Pending sealings back off (1 minute doubling
+    to 4 hours, at most 64 per branch per sync). A blob pruned under one epoch no longer
+    answers `410` under another.
+- **Dependencies:** `golang.org/x/net` v0.60.0 (GO-2026-6603, -6611, -6612, -6617: HTTP/2
+  server denial of service) and `github.com/klauspost/compress` v1.20.2 (GO-2026-6865: a zstd
+  panic).
+
 ## v0.26.0
 
 Implements spec **v0.77**: its answers to the reference's notes on v0.76. `GET /` answers
