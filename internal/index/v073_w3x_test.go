@@ -11,12 +11,13 @@ import (
 )
 
 // W3X (P29 ENC-38 x the index; §A.4, §E.2.6, §12.1): a namespace the index
-// follows is raised from none to e2e (allowed since P29), and the index
-// has no keyring recipient key, so it lacks the namespace's keys as
-// configured. Running through the raise, it skips the namespace and stops
-// following it, as it does when it starts: queries answer 404 not_found,
-// not 503 behind forever. Other namespaces are served as before, and a
-// restart answers the same.
+// follows is raised from none to sealed (until v0.81 to e2e, which is 422
+// since v0.78), and the index holds no keys and fetches none
+// (client.StaticKeys), so it lacks the namespace's keys as configured.
+// Running through the raise, it skips the namespace and stops following
+// it, as it does when it starts: queries answer 404 not_found, not 503
+// behind forever. Other namespaces are served as before, and a restart
+// answers the same.
 func TestW3XIndexRaisedToE2EWhileFollowed(t *testing.T) {
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond, KeyStore: keyStore(t)})
@@ -26,7 +27,8 @@ func TestW3XIndexRaisedToE2EWhileFollowed(t *testing.T) {
 		must(c.CreateDoc(ctx, ns, "a", map[string]any{"title": "zebra"}))
 	}
 	db := filepath.Join(t.TempDir(), "i.db")
-	x := startSvc(t, c, svcOpts{db: db, ns: []string{"r", "p"}, untyped: true})
+	sc := s.Client(t, client.WithAuthor("svc"), client.WithKeys(client.StaticKeys()))
+	x := startSvc(t, sc, svcOpts{db: db, ns: []string{"r", "p"}, untyped: true})
 	x.caughtUp("r")
 	x.caughtUp("p")
 	if r := x.search("/r", ""); len(resources(r)) != 1 {
@@ -34,7 +36,7 @@ func TestW3XIndexRaisedToE2EWhileFollowed(t *testing.T) {
 	}
 	h := must(c.NSHead(ctx, "r"))
 	must(c.PatchConfig(ctx, "r", h.Config, []any{map[string]any{"op": "add", "path": "/encryption",
-		"value": map[string]any{"level": "e2e", "epoch": 1}}}))
+		"value": map[string]any{"level": "sealed", "epoch": 1}}}))
 	follow := func(y *svc, path string) resp {
 		r := y.raw(path, "")
 		for r.status == 302 {
@@ -43,7 +45,10 @@ func TestW3XIndexRaisedToE2EWhileFollowed(t *testing.T) {
 		return r
 	}
 	// Behind at most while the config entry is being applied, then 404
-	// for good.
+	// for good: running, the index can't read the entry that raised r (or
+	// r's document, in a read check), so it decides r again as when it
+	// starts, and skips it for want of keys, as after a restart (§A.4
+	// Unavailable namespaces).
 	waitFor(t, "404 for the raised namespace", func() bool { return follow(x, "/r").status == 404 })
 	for i := 0; i < 20; i++ {
 		if r := follow(x, "/r"); r.status != 404 {
@@ -60,7 +65,7 @@ func TestW3XIndexRaisedToE2EWhileFollowed(t *testing.T) {
 		t.Errorf("another namespace after r is skipped: %v", r)
 	}
 	x.stop()
-	y := startSvc(t, c, svcOpts{db: db, ns: []string{"r", "p"}, untyped: true})
+	y := startSvc(t, sc, svcOpts{db: db, ns: []string{"r", "p"}, untyped: true})
 	waitFor(t, "skip after restart", func() bool {
 		return y.raw("/_status", "").body["namespaces"].([]any)[1].(map[string]any)["skipped"] == true
 	})

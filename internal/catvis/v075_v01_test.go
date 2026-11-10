@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/catvis"
-	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/tree"
@@ -233,57 +232,12 @@ func TestV075AsIfLive(t *testing.T) {
 	}
 }
 
-// §B.11.5 deciding subjects: Profile.
-func TestV075Profile(t *testing.T) {
-	t.Parallel()
-	docs := map[string]any{
-		"root":          map[string]any{"parents": []any{}, "$access": acc("group:editors", "reader", "user:li", "reader")},
-		"matches.derby": map[string]any{"parents": parents("root")},
-	}
-	li := grant.Principal{ID: "user:li", Groups: []string{"editors", "interns"}}
-	c := seedCatalog(t, matchesDoc(t, `{"reader":{"can":["read"]}}`, ""), docs)
-	p := c.Profile()
-	if !reflect.DeepEqual(p.Groups, map[string]bool{"editors": true}) || p.KeepAll || !p.Users["user:li"] || p.SubScoped {
-		t.Fatalf("profile %+v", p)
-	}
-	if subs, dropped := p.Deciding(li); !reflect.DeepEqual(subs, []string{"group:editors", "user:li"}) || !dropped {
-		t.Errorf("Deciding %v %v", subs, dropped)
-	}
-	if got := catvis.ListingSubjects(p, li); !reflect.DeepEqual(got, []string{"group:editors", "partial", "user:li"}) {
-		t.Errorf("ListingSubjects %v", got)
-	}
-	bo := grant.Principal{ID: "user:bo", Groups: []string{"editors"}}
-	if subs, dropped := p.Deciding(bo); !reflect.DeepEqual(subs, []string{"group:editors"}) || dropped {
-		t.Errorf("bo: %v %v", subs, dropped)
-	}
-	// A role rule naming a group adds it; a negated one keeps every group.
-	pos := `{"reader":{"can":["read"],"rules":[{"op":"test","path":"/principal/groups","schema":{"contains":{"const":"interns"}}}]}}`
-	if p := seedCatalog(t, matchesDoc(t, pos, ""), docs).Profile(); !p.Groups["interns"] || p.KeepAll {
-		t.Errorf("positive role rule: %+v", p)
-	}
-	neg := `{"reader":{"can":["read"]},"x":{"rules":[{"not":{"op":"test","path":"/principal/groups","schema":{"contains":{"const":"interns"}}}}]}}`
-	p = seedCatalog(t, matchesDoc(t, neg, ""), docs).Profile()
-	if !p.KeepAll {
-		t.Fatalf("negated role rule: %+v", p)
-	}
-	if subs, dropped := p.Deciding(li); !reflect.DeepEqual(subs, []string{"group:editors", "group:interns", "user:li"}) || dropped {
-		t.Errorf("KeepAll Deciding %v %v", subs, dropped)
-	}
-	// A key rule counts too, and a sub scope adds every user.
-	kr := `,"sub":"user:.*","rules":[{"op":"test","path":"/principal/groups/0","value":"x"}]`
-	if p := seedCatalog(t, matchesDoc(t, "", kr), docs).Profile(); !p.KeepAll || !p.SubScoped {
-		t.Errorf("key rules: %+v", p)
-	}
-	if subs, _ := (catvis.Profile{SubScoped: true}).Deciding(bo); !reflect.DeepEqual(subs, []string{"user:bo"}) {
-		t.Errorf("SubScoped: %v", subs)
-	}
-}
-
 // §B.11.9 gs: FilteredSubjects.
 func TestV075FilteredSubjects(t *testing.T) {
 	t.Parallel()
-	if got := catvis.FilteredSubjects([][]string{{"group:editors"}}, []string{"editors", "interns"}, "D"); !reflect.DeepEqual(got, []string{"group:editors", "partial", "scope:D"}) {
-		t.Errorf("dropped: %v", got)
+	// Every group counts, never "partial" (v0.78; TestV081SvcSubjects).
+	if got := catvis.FilteredSubjects([][]string{{"group:editors"}}, []string{"editors", "interns"}, "D"); !reflect.DeepEqual(got, []string{"group:editors", "group:interns", "scope:D"}) {
+		t.Errorf("every group: %v", got)
 	}
 	got := catvis.FilteredSubjects([][]string{{"group:editors"}, {"group:interns", "user:li"}}, []string{"editors", "interns"}, "D")
 	if !reflect.DeepEqual(got, []string{"group:editors", "group:interns", "scope:D", "user:li"}) {
@@ -310,8 +264,8 @@ func TestV075TrustedCatalogs(t *testing.T) {
 }
 
 // §B.11.9 Deleted resources: a tombstoned node is judged by its last live
-// document, its own $access included, so the groups and users only that
-// $access names keep deciding (Profile) and Deleted returns the node.
+// document, its own $access included, so the users only that $access
+// names keep deciding (Profile.Users) and Deleted returns the node.
 func TestV075ProfileOfDeletedNodes(t *testing.T) {
 	t.Parallel()
 	docs := map[string]any{
@@ -326,7 +280,7 @@ func TestV075ProfileOfDeletedNodes(t *testing.T) {
 	contents := map[string]*catvis.Content{"matches": {NS: "matches", Cfg: matchesDoc(t, `{"reader":{"can":["read"]}}`, ""), Kids: []string{"catalog-01"}}}
 	c := catvis.NewCatalogDeleted(g, contents, []*tree.Node{audit, derby})
 	p := c.Profile()
-	if !p.Groups["auditors"] || !p.Users["user:bo"] || !p.Groups["editors"] || p.Groups["x"] {
+	if !p.Users["user:bo"] {
 		t.Fatalf("profile %+v", p)
 	}
 	if c.Deleted("audit") != audit || c.Deleted("matches.derby") != nil || c.Deleted("root") != nil {
@@ -335,8 +289,8 @@ func TestV075ProfileOfDeletedNodes(t *testing.T) {
 	if !c.View([]string{"group:auditors"}).AsIfLive(c.Deleted("audit")) {
 		t.Error("the deleted node, as if live, to auditors")
 	}
-	// Without it, the group decides nothing.
-	if p := catvis.NewCatalog(g, contents).Profile(); p.Groups["auditors"] || p.Users["user:bo"] {
+	// Without it, the user decides nothing.
+	if p := catvis.NewCatalog(g, contents).Profile(); p.Users["user:bo"] {
 		t.Errorf("profile without deleted nodes %+v", p)
 	}
 }

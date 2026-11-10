@@ -204,7 +204,10 @@ type Graph struct {
 	// (meta "stopped:{ns}", purgeStopped), until it applies a batch of
 	// one again: what it can't follow is never applied, a narrowing
 	// among it, so none reads public (publicAsApplied), and a stopped
-	// catalog is not served.
+	// catalog is not served. A stopped content namespace is not followed
+	// (isStopped): it is out of the combined checkpoint and listed(), its
+	// explicit placements dangle and its implicit ones leave the graph
+	// (§B.5, §B.7, §B.9; refresh).
 	stopped map[string]string
 	// Aliases maps a namespace to the branch followed in its place in a
 	// release preview (§B.5, §F.9); nil otherwise.
@@ -233,6 +236,19 @@ type Graph struct {
 type NSConfig struct {
 	NS  string
 	Doc map[string]any
+}
+
+// isStopped reports whether the service stopped following content
+// namespace ns (Graph.stopped): it is out of the combined checkpoint and
+// its placements dangle (§B.5 Behind: a namespace it can't follow as
+// configured "isn't waited for, and its placements dangle"). A stopped
+// catalog is not served at all.
+func (g *Graph) isStopped(ns string) bool {
+	if ns == g.Catalog {
+		return false
+	}
+	_, ok := g.stopped[ns]
+	return ok
 }
 
 func newGraph(catalog string) *Graph {
@@ -409,12 +425,19 @@ func (g *Graph) unlink(n *Node) {
 
 // refresh recomputes the merged node for name after explicit or self
 // changed, keeping item state. An explicit placement wins over $parents
-// whether live, deleted or purged (§B.9).
+// whether live, deleted or purged (§B.9). A namespace the service stopped
+// following contributes no implicit placement (§B.5 Behind, §B.9: $parents
+// is accepted for a followed, trusted namespace): it is out of the
+// combined checkpoint that problems and orphans are judged against
+// (§B.11.9), so its nodes, named from its documents, would reach readers
+// without read on it (refreshSelf re-derives them on stop and unstop).
 func (g *Graph) refresh(name string) {
 	old := g.nodes[name]
 	nw := g.explicit[name]
 	if nw == nil && !g.explicitGone[name] {
-		nw = g.self[name]
+		if sn := g.self[name]; sn != nil && !g.isStopped(sn.ItemNS) {
+			nw = sn
+		}
 	}
 	if old == nw {
 		return
@@ -475,6 +498,17 @@ func (g *Graph) setSelf(n *Node) {
 func (g *Graph) removeSelf(name string) {
 	delete(g.self, name)
 	g.refresh(name)
+}
+
+// refreshSelf recomputes the merged nodes of ns's implicit placements
+// after its stop began or ended (refresh); analyze then reports the names
+// that left or entered the graph.
+func (g *Graph) refreshSelf(ns string) {
+	for name, n := range g.self {
+		if n.ItemNS == ns {
+			g.refresh(name)
+		}
+	}
 }
 
 // setItem records what the service holds of an item on the explicit and
@@ -680,6 +714,12 @@ func (g *Graph) analyze() map[string]bool {
 			n.State, n.Dangling = StateDangling, "invalid"
 		case !g.Trust[n.ItemNS]:
 			n.State, n.Dangling = StateDangling, "untrusted"
+		case g.isStopped(n.ItemNS):
+			// A namespace the service stopped following, for keys it
+			// lacks or a refusal, isn't followed: its placements dangle
+			// (§B.5 Behind, §B.7), re-derived on stop and when followed
+			// again.
+			n.State, n.Dangling = StateDangling, "unfollowed"
 		case n.ItemState == ItemLive:
 		case n.ItemState == ItemTombstoned:
 			n.State, n.Dangling = StateDangling, "tombstoned"

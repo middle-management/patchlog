@@ -383,11 +383,9 @@ func TestV073PlainTreeServesOnlyAll(t *testing.T) {
 }
 
 // TC-15 (§B.11.5, §C.5.2): g/all is for readers whose grants would be
-// issued a namespace-wide edge grant, and a rule referring to /now, which
-// an edge can't evaluate, rules one out even while it passes. Such a
-// reader reads its subject set's listings (none, without §B.11), and its
-// unrestricted reads (§2.1), judged on each request, admit problems
-// there, kept by no shared cache.
+// issued a namespace-wide edge grant. A rule referring to /now fails every
+// read (§C.2 item 5, v0.78): such a grant reads no listing at all, with or
+// without §B.11, and is exchanged for nothing (TestV081SvcReadNowTree).
 func TestV073AllNeedsNamespaceWide(t *testing.T) {
 	t.Parallel()
 	clock := map[string]any{"rules": []any{map[string]any{"op": "compare", "path": "/now", "lt": map[string]any{"value": "2999-01-01T00:00:00Z"}}}}
@@ -397,16 +395,8 @@ func TestV073AllNeedsNamespaceWide(t *testing.T) {
 	}
 	q := newP24World(t, "grant", "grant").start(withEdgeGrants)
 	cl := q.grant("user:cl", []string{"cat", "matches"}, clock)
-	loc := q.x.atURL("/cat/children?of=root", cl)
-	if !strings.HasPrefix(loc, "/cat/g/") || strings.HasPrefix(loc, "/cat/g/all/") {
-		t.Errorf("a rule on /now: %s", loc)
-	}
-	if r := q.do("GET", q.x.atURL("/cat/problems", cl), cl, ""); r.status != 200 || r.header.Get("CDN-Cache-Control") != "no-store" ||
-		!strings.HasPrefix(r.header.Get("Cache-Control"), "private") {
-		t.Errorf("problems: %d %v", r.status, r.header)
-	}
-	if prefix, _ := q.exchange(cl); prefix == "/cat/g/all" {
-		t.Errorf("exchanged for %s", prefix)
+	if r := q.do("GET", "/cat/children?of=root", cl, ""); r.status != 403 {
+		t.Errorf("a rule on /now: %d %v", r.status, r.header)
 	}
 	if prefix, _ := q.exchange(q.grant("user:amy", []string{"cat", "matches"})); prefix != "/cat/g/all" {
 		t.Errorf("a namespace-wide reader exchanged for %s", prefix)

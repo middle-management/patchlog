@@ -80,10 +80,10 @@ type RoleView interface {
 }
 
 // Profiler is a RoleView whose subject sets depend on the checkpoint, as
-// the catalog's deciding subjects do (§B.11.5). With one, a grant in
-// Authorization reads at its own gs as of the URL's at (keyAt), and an
-// edge grant's subject set is refused at an at whose profile doesn't
-// admit it (Profile.Admits).
+// the catalog's do, through the caller's sub (§B.11.5: added only where
+// the catalog has direct entries for that user, or its key a sub scope).
+// With one, a grant in Authorization reads at its own gs as of the URL's
+// at (keyAt).
 type Profiler interface {
 	// Profile is the profile as of the checkpoint g reflects. It is called
 	// under the graph lock, and must not change afterwards: it is kept
@@ -97,11 +97,14 @@ type Profile interface {
 	// grant v verified for the catalog, as Resolve's would at that
 	// checkpoint.
 	Subjects(v *grant.Verified) []string
-	// Admits reports whether a subject set keyed at another checkpoint,
-	// such as an edge grant's, may read at this one: one that leaves out
-	// some of the reader's groups may not where every group is kept.
-	Admits(subjects []string) bool
 }
+
+// legacyPartial is the subject that marked, before v0.78, a subject set
+// leaving out some of the reader's groups. No gs leaves a group out any
+// more (§B.11.5), so an edge grant whose stored set holds it is 403 until
+// the reader exchanges again (edgeViewer), never served as a set missing
+// groups.
+const legacyPartial = "partial"
 
 // Visibility decides, under the graph lock, what a reader may see.
 type Visibility interface {
@@ -404,15 +407,16 @@ func (s *Service) stillPublic(ctx context.Context, v *viewer) error {
 }
 
 // listed reports, for each content namespace the catalog trusts, whether
-// the service holds a checkpoint of it, which puts it in the listings'
-// combined checkpoint (§B.5, CombinedAt). One it can't follow (refused,
-// absent, without keys it can have) has none, and shows nothing in
-// listings: its placements dangle.
+// the service holds a checkpoint of it and follows it, which puts it in
+// the listings' combined checkpoint (§B.5, CombinedAt). One it can't
+// follow (refused, absent, without keys it can have, or stopped for one
+// of these, Graph.isStopped) is out of it, and shows nothing in listings:
+// its placements dangle.
 func (s *Service) listed() map[string]bool {
 	listed := map[string]bool{}
 	s.View(func(g *Graph, cur map[string]string) {
 		for ns := range g.Trust {
-			listed[ns] = cur[ns] != ""
+			listed[ns] = cur[ns] != "" && !g.isStopped(ns)
 		}
 	})
 	return listed
@@ -475,6 +479,16 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 		vg = nil
 	default:
 		return nil, catErr
+	}
+	if vg != nil && grantcheck.RefusedByNow(vg) {
+		// A key-scope or block rule on /now, or roles that all have one,
+		// refuse every read of the catalog (§C.2 item 5): its listings
+		// too, filtered or not, and the exchange, whatever the catalog's
+		// read mode. A public catalog's public URL space (publicViewer)
+		// doesn't come here. One verified in a content namespace reads it
+		// neither unrestricted nor namespace-wide (ReadsUnrestricted,
+		// NamespaceWide), so it counts there for nothing.
+		return nil, &grant.AuthError{Status: 403, Msg: "the grant's rules refer to /now, which no read passes (§C.2 item 5)"}
 	}
 	var exp time.Time
 	v := &viewer{byGrant: true, catPublic: catPublic, contentAll: map[string]bool{}}
@@ -1097,14 +1111,6 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		WriteError(w, http.StatusForbidden, "forbidden", "the edge grant for all predates "+ns+" in the combined checkpoint: exchange the grants again")
 		return
 	}
-	if p := s.profileAt(at, cur, curProf); v.cookie && p != nil && !p.Admits(v.subjects) {
-		// A subject set that leaves out groups ("partial") is 403 at an at
-		// where every group is kept, its head pointer at the current one,
-		// until the reader exchanges again, as for g/all (§B.11.5).
-		w.Header().Set("Cache-Control", "no-store")
-		WriteError(w, http.StatusForbidden, "forbidden", "the edge grant's subject set leaves out groups that decide what this checkpoint shows: exchange the grants again")
-		return
-	}
 	v.noEdge = s.edgeHold(v, at, cur)
 	own := isAt && gs == v.gs
 	mins := len(vals["min"]) > 0
@@ -1257,15 +1263,6 @@ type computed struct {
 	prof Profile
 }
 
-// refusePartial makes l the refusal of a subject set that leaves out
-// groups: no listing of one is computed, or kept, at an at where every
-// group is kept (§B.11.5).
-func refusePartial(l *computed) *computed {
-	l.status, l.code, l.noStore = http.StatusForbidden, "forbidden", true
-	l.msg = "the subject set leaves out groups that decide what this checkpoint shows: exchange the grants again"
-	return l
-}
-
 // errCurrentKey is the catalog's encryption, or the key that seals its
 // listings now, that the service can't obtain for now: 503 behind.
 var errCurrentKey = errors.New("the key that seals listings of the catalog")
@@ -1373,9 +1370,6 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			if err := s.unchanged(ctx, v, info, fs); err != nil {
 				return nil, err
 			}
-			if prof != nil && !prof.Admits(v.subjects) {
-				return refusePartial(&computed{at: at, prof: prof}), nil
-			}
 			st, o := s.kept.PutOutcome(keyOf(at), cat, gen, true, st)
 			if o == kept.PurgedSince {
 				return nil, errPurgedSince
@@ -1426,10 +1420,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		s.View(func(g *Graph, curMap map[string]string) {
 			l.at, nss = s.combinedAt(g, curMap)
 			cps = s.checkpointsOf(g, curMap)
-			if prof = s.profileOf(g); prof != nil && !prof.Admits(v.subjects) {
-				refusePartial(l)
-				return
-			}
+			prof = s.profileOf(g)
 			view = derived.View{NS: cat, Target: canon(l.at)}
 			// epochOf is the epoch node name's values are sealed under,
 			// a pending one judged (judge) as they are; peekEpoch the
@@ -1724,15 +1715,15 @@ type atRecord struct {
 }
 
 // checkpointsOf is the checkpoints the service's combined checkpoint
-// hashes (Service.combinedAt), keyed as cur is: purged namespaces left
-// out (§B.5). Call it under View.
+// hashes (Service.combinedAt), keyed as cur is: purged and stopped
+// namespaces left out (§B.5). Call it under View.
 func (s *Service) checkpointsOf(g *Graph, cur map[string]string) map[string]string {
 	cps := map[string]string{}
 	if id := cur[g.Catalog]; id != "" && !s.purgedLocked(g.Catalog) {
 		cps[g.Catalog] = id
 	}
 	for ns := range g.Trust {
-		if id := cur[ns]; id != "" && !s.purgedLocked(ns) {
+		if id := cur[ns]; id != "" && !s.purgedLocked(ns) && !g.isStopped(ns) {
 			cps[ns] = id
 		}
 	}
@@ -1925,7 +1916,10 @@ func CombinedAt(g *Graph, cur map[string]string) (string, []string) {
 }
 
 // combinedAt is the service's combined checkpoint, purged namespaces left
-// out (§B.5): a purge-ns entry is a namespace's last, so the at a purge
+// out (§B.5), and stopped ones (Graph.isStopped), which it doesn't follow:
+// at moves when one stops and when it is followed again, so kept public
+// listings are judged again and a g/all cookie is 403 at an at it has
+// entered since (noteTrust). A purge-ns entry is a namespace's last, so the at a purge
 // moves is the one it would keep forever, and listings, their ns:{ns}
 // tags, the coverage of problems and orphans and what a g/all edge grant
 // is checked against cover only namespaces that still have items. Call
@@ -1939,7 +1933,7 @@ func combinedAt(g *Graph, cur map[string]string, purged func(string) bool) (stri
 	nss := []string{}
 	// In a release preview the checkpoint is over the branches (§B.5).
 	add := func(ns string) {
-		if id := cur[ns]; id != "" && !purged(ns) {
+		if id := cur[ns]; id != "" && !purged(ns) && !g.isStopped(ns) {
 			m[g.Actual(ns)] = id
 			nss = append(nss, g.Actual(ns))
 		}
@@ -3146,13 +3140,14 @@ func (q *query) parentsJSON(n *Node) []any {
 
 // checkpointed is every content namespace the catalog trusts that is in
 // the combined checkpoint, sorted: what problems and orphans cover
-// (§B.11.5). One the service can't follow has no checkpoint, and shows
-// nothing in listings, as the URL spaces and g/all are judged without it
-// (Service.listed); nor is one it holds as purged in it (§B.5).
+// (§B.11.5). One the service can't follow has no checkpoint, or is
+// stopped (Graph.isStopped), and shows nothing in listings, as the URL
+// spaces and g/all are judged without it (Service.listed); nor is one it
+// holds as purged in it (§B.5).
 func (q *query) checkpointed() []string {
 	out := make([]string, 0, len(q.g.Trust))
 	for ns := range q.g.Trust {
-		if q.cur[ns] != "" && !q.s.purgedLocked(ns) {
+		if q.cur[ns] != "" && !q.s.purgedLocked(ns) && !q.g.isStopped(ns) {
 			out = append(out, ns)
 		}
 	}

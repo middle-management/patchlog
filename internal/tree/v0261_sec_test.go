@@ -275,6 +275,10 @@ func TestV0261NarrowingPurges(t *testing.T) {
 // it: the catalog is 404 at the service, and ns:cat is still sent to its
 // Purger, so a CDN copy of a listing kept in the clear before the raise
 // goes too.
+//
+// Since v0.81 the raise is to sealed and private (v081SealedPrivate) for
+// a service that holds no keys and fetches none: a raise to e2e is 422
+// (v0.78), and this is the namespace it can no longer read another way.
 func TestV0261RaiseToE2EWithoutKeys(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -287,7 +291,7 @@ func TestV0261RaiseToE2EWithoutKeys(t *testing.T) {
 		client.WithKeys(client.NewKeys(wPriv)))
 	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
 	must(w.CreateDoc(ctx, "cat", "season", map[string]any{"title": "Secret m4zt", "parents": parents("root@a0")}))
-	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.StaticKeys()))
 	x := startSvc(t, sc, svcOpts{now: s.Now})
 	x.caughtUp("cat")
 	before := x.fetch("/cat/children?of=root", "")
@@ -296,7 +300,7 @@ func TestV0261RaiseToE2EWithoutKeys(t *testing.T) {
 	}
 	_, sent0, _ := v0261Purges(x, "ns:cat")
 
-	must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "e2e"}}}))
+	must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, v081SealedPrivate))
 	waitFor(t, "the raise to e2e", func() bool { return x.raw("/cat/roots", "").status == 404 })
 	waitFor(t, "ns:cat sent to the Purger", func() bool { _, sent, _ := v0261Purges(x, "ns:cat"); return sent > sent0 })
 	if r := x.raw(before.path, ""); r.status == 200 {
@@ -306,33 +310,41 @@ func TestV0261RaiseToE2EWithoutKeys(t *testing.T) {
 
 // §E.2.6, §E.3.1 (v0.26.1): a rotation purges nothing, so a listing reads
 // the catalog's encryption again once its graph is read, before it
-// judges any epoch by it. In e2e catalog cat, node n's head is pending
-// (written in the clear before the raise); a rotation to cat#2 applied
-// after the listing took its kept generation and read the encryption
-// again (AfterGeneration), during fileSealing and the key fetches, has
-// the listing view the graph after it: n is judged by cat#2, the epoch
-// in force, never cat#1, the one it read first.
+// judges any epoch by it. In e2e catalog cat, node n's head is pending:
+// its nodes.epoch NULL, as a head written in the clear before a raise to
+// e2e left it before v0.78 (the raise is 422 since, and a core holding
+// such a namespace no longer starts, so the store is set so instead,
+// v081PendingHead: a constructed state, which exercises the re-read); a
+// rotation to cat#2 applied after the listing took its kept generation
+// and read the encryption again (AfterGeneration), during fileSealing
+// and the key fetches, has the listing view the graph after it: n is
+// judged by cat#2, the epoch in force, never cat#1, the one it read
+// first.
 func TestV0261RotationAfterInfoReread(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
 	k := clienttest.NewKey("k")
 	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
-		"catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+		"encryption": map[string]any{"level": "e2e"}, "catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
 	svcJWK, svcPriv := must2(seal.GenerateRecipient())
 	wJWK, wPriv := must2(seal.GenerateRecipient())
 	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "append", "config"},
 		map[string]any{"enc": wJWK})), client.WithKeys(client.NewKeys(wPriv)))
 	x2 := wr.E2E(wPriv)
-	must(wr.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
-	must(wr.CreateDoc(ctx, "cat", "n", map[string]any{"title": "N", "parents": parents("root@a0")}))
-	must(wr.PatchConfig(ctx, "cat", must(wr.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "e2e"}}}))
 	must(x2.InitKeyring(ctx, "cat", svcPriv.PublicKey()))
+	must(x2.CreateDocSealed(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(x2.CreateDocSealed(ctx, "cat", "n", map[string]any{"title": "N", "parents": parents("root@a0")}))
 	keyOf := func(kid string) []byte { return must(x2.SealKey(ctx, kid)) }
 	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"}, map[string]any{"enc": svcJWK})),
 		client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey()))
 	db := filepath.Join(t.TempDir(), "tree.db")
-	x := startSvc(t, sc, svcOpts{now: s.Now, db: db}, func(o *tree.Options) { o.Recipient = svcPriv })
+	withRecipient := func(o *tree.Options) { o.Recipient = svcPriv }
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db}, withRecipient)
+	x.caughtUp("cat")
+	x.stop()
+	v081PendingHead(t, db, "n")
+	x = startSvc(t, sc, svcOpts{now: s.Now, db: db}, withRecipient)
 	x.caughtUp("cat")
 	if e, _ := v077Epochs(t, db, "n"); e != 0 {
 		t.Fatalf("n's epoch %d before any listing, want it pending", e)
@@ -353,8 +365,8 @@ func TestV0261RotationAfterInfoReread(t *testing.T) {
 	if !ran {
 		t.Fatal("the listing was not computed")
 	}
-	if e, _ := v077Epochs(t, db, "n"); e != 2 {
-		t.Errorf("n judged by cat#%d, want cat#2, the epoch in force as the listing read the graph", e)
+	if e, b := v077Epochs(t, db, "n"); e != 2 || b != 2 {
+		t.Errorf("n judged by cat#%d (born cat#%d), want cat#2, the epoch in force as the listing read the graph", e, b)
 	}
 	if kid, vals, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", keyOf); kid != "cat#2" || vals["title"] != "N" {
 		t.Errorf("n %v sealed under %s, want under cat#2", vals, kid)
@@ -705,6 +717,9 @@ func v0261SawTag(x *svc, tag string) (sent, queued bool) {
 //
 // Fixed in v0.26.1: a namespace follow() skips for lack of keys purges
 // ns:{ns} once (purgeStopped), at a start too.
+//
+// Since v0.81 the raise is to sealed and private (v081SealedPrivate), as
+// in TestV0261RaiseToE2EWithoutKeys.
 func TestV0261RaiseToE2EWhileDown(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -717,7 +732,7 @@ func TestV0261RaiseToE2EWhileDown(t *testing.T) {
 		client.WithKeys(client.NewKeys(wPriv)))
 	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
 	must(w.CreateDoc(ctx, "cat", "season", map[string]any{"title": "Secret m4zt", "parents": parents("root@a0")}))
-	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.StaticKeys()))
 	db := filepath.Join(t.TempDir(), "tree.db")
 	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
 	x.caughtUp("cat")
@@ -727,7 +742,7 @@ func TestV0261RaiseToE2EWhileDown(t *testing.T) {
 	}
 	x.stop()
 
-	must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "e2e"}}}))
+	must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, v081SealedPrivate))
 	y := startSvc(t, sc, svcOpts{now: s.Now, db: db})
 	waitFor(t, "the catalog skipped", func() bool { return y.raw("/cat/roots", "").status == 404 })
 	deadline := time.Now().Add(3 * time.Second)
@@ -1189,6 +1204,9 @@ func v0261Must(t *testing.T, err error) {
 //
 // Fixed in v0.26.1: the stop is recorded per checkpoint (meta
 // "stopped:{ns}"), so it purges once.
+//
+// Since v0.81 the raise is to sealed and private (v081SealedPrivate), as
+// in TestV0261RaiseToE2EWithoutKeys.
 func TestV0261StopPurgeOnce(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1200,12 +1218,12 @@ func TestV0261StopPurgeOnce(t *testing.T) {
 	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "append", "config"}, map[string]any{"enc": wJWK})),
 		client.WithKeys(client.NewKeys(wPriv)))
 	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
-	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.StaticKeys()))
 	db := filepath.Join(t.TempDir(), "tree.db")
 	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
 	x.caughtUp("cat")
 	x.fetch("/cat/children?of=root", "")
-	must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "e2e"}}}))
+	must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, v081SealedPrivate))
 	waitFor(t, "the raise to e2e", func() bool { return x.raw("/cat/roots", "").status == 404 })
 	time.Sleep(500 * time.Millisecond)
 	_, sent, queued := v0261Purges(x, "ns:cat")
@@ -1478,9 +1496,10 @@ func v0261Stopped(t *testing.T, db, ns string) bool {
 // service follows the namespace to the checkpoint it stopped at again:
 // the core refusing the service's reads of the catalog's or sec's log for
 // a while (403) stops it (purgeStopped: ns:{ns} purged, the catalog 404,
-// sec reading public to no one), and once the refusal passes, with
-// nothing written meanwhile, anonymous reads are served again and the
-// stop is no longer recorded.
+// sec reading public to no one and, not followed, out of the listings,
+// v0.81 ACCESS-11), and once the refusal passes, with nothing written
+// meanwhile, its items are listed again and the stop is no longer
+// recorded.
 func TestV0261StopEnds(t *testing.T) {
 	t.Parallel()
 	for _, which := range []string{"cat", "sec"} {
@@ -1522,18 +1541,25 @@ func TestV0261StopEnds(t *testing.T) {
 			}
 			refuse.Store(true)
 			waitFor(t, "ns:"+which+" purged (purgeStopped)", func() bool { sent, _ := v0261SawTag(x, "ns:"+which); return sent })
-			want := 401
-			if which == "cat" {
-				want = 404
-			}
-			if st, _, b, _ := v0261Get(x, "/cat/children?of=root", ""); st != want {
-				t.Errorf("stopped: anonymous GET %d %s, want %d", st, b, want)
+			// A stopped catalog isn't served (404). A stopped content
+			// namespace isn't followed (§B.5 Behind, v0.81 ACCESS-11): the
+			// public catalog's listings are served without it, its
+			// placement dangling, never its item.
+			st, _, b, _ := v0261Get(x, "/cat/children?of=root", "")
+			switch {
+			case which == "cat" && st != 404:
+				t.Errorf("stopped: anonymous GET %d %s, want 404", st, b)
+			case which == "sec" && (st != 200 || strings.Contains(b, "sec.a")):
+				t.Errorf("stopped: anonymous GET %d %s, want 200 without sec.a", st, b)
 			}
 			if !v0261Stopped(t, db, which) {
 				t.Errorf("stopped: no stopped:%s recorded", which)
 			}
 			refuse.Store(false)
-			waitFor(t, "anonymous reads again", func() bool { st, _, _, _ := v0261Get(x, "/cat/children?of=root", ""); return st == 200 })
+			waitFor(t, "anonymous reads again", func() bool {
+				st, _, b, _ := v0261Get(x, "/cat/children?of=root", "")
+				return st == 200 && strings.Contains(b, "sec.a")
+			})
 			if v0261Stopped(t, db, which) {
 				t.Errorf("followed again: stopped:%s still recorded", which)
 			}

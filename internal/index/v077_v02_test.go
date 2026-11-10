@@ -318,8 +318,8 @@ func TestV077AuthDisabledUncovers(t *testing.T) {
 // catalogs, or a local base's, names one, a partial reader has none";
 // scenarios 101, 113, 114, 119, 122): a partial reader gets 403, never the
 // hits its rules allow, and /_refs shows nothing of the namespace, in
-// matches once cat-season no longer trusts it, in the matches-r7 branch
-// once matches edits catalog-01's maxTtl, and in cat-season, followed,
+// matches once cat-season no longer trusts it, in the matches-r7 branch,
+// which no filtered read covers (v0.78), and in cat-season, followed,
 // once nothing trusts it. Before v0.77 each was read by rules alone.
 func TestV077NoMarkerShapes(t *testing.T) {
 	t.Parallel()
@@ -344,14 +344,16 @@ func TestV077NoMarkerShapes(t *testing.T) {
 	})
 	t.Run("matches-r7", func(t *testing.T) {
 		t.Parallel()
+		// No branch is covered (v0.78), so a partial reader of one whose
+		// base names a catalog never has a marker.
 		w := cover76Branch(t)
 		fan := w.reader("user:fan", []any{"fans"}, "matches-r7")
-		if r := w.x.raw("/matches-r7", fan); r.status != 302 {
-			t.Fatalf("covered: %d %v", r.status, r.body)
+		if r := w.x.raw("/matches-r7", fan); r.status != 403 {
+			t.Fatalf("/matches-r7: %d %v", r.status, r.body)
 		}
 		w.patchKeys(func(keys []any) []any { keys[1].(map[string]any)["maxTtl"] = "PT14M"; return keys })
 		if r := w.x.raw("/matches-r7", fan); r.status != 403 {
-			t.Errorf("/matches-r7 once uncovered: %d %v", r.status, r.body)
+			t.Errorf("/matches-r7 once its keys change: %d %v", r.status, r.body)
 		}
 	})
 	t.Run("cat-season", func(t *testing.T) {
@@ -445,54 +447,6 @@ func TestV077ExchangePurgedOnly(t *testing.T) {
 		"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "none"}}})
 	if r := p37Do(t, w.x, "POST", "/edge-grants", star, "", nil, ""); r.status == 410 {
 		t.Errorf("exchange naming *: %d %v", r.status, r.body)
-	}
-}
-
-// TestV077RefsBaseEarliest (FSVC-7; §A.4 Answers: "one that branches read
-// only as of different ats at the earliest"): r7a and r7b are branches of
-// matches-r7 cut at X and at a later Y whose ns_id sorts before X's; a
-// partial reader of both, who doesn't read matches-r7 itself, gets a
-// /_refs answer listing matches-r7 at X, the earliest in its chain.
-// Before v0.77 it was listed at the lower by bytes, Y.
-func TestV077RefsBaseEarliest(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	w := newV75XOn(t, clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}))
-	must(w.admin.CreateBranch(ctx, "matches", client.BranchRequest{Name: "matches-r7"}))
-	var points []string
-	for i := range 6 {
-		w.put("matches-r7", fmt.Sprintf("n%d", i), w.page("new", "cup"))
-		points = append(points, w.head("matches-r7"))
-	}
-	x, y := "", ""
-	for i := 0; i < len(points) && x == ""; i++ {
-		for j := i + 1; j < len(points); j++ {
-			if points[j] < points[i] {
-				x, y = points[i], points[j]
-				break
-			}
-		}
-	}
-	if x == "" {
-		t.Skip("every later point sorts after the earlier ones") // 1 in 720
-	}
-	brancher := w.s.Client(t, client.WithBearer(w.k.Grant(t, w.s.Now(), "user:root", []string{"matches-r7", "r7a", "r7b"}, []string{"read", "branch"})))
-	must(brancher.CreateBranch(ctx, "matches-r7", client.BranchRequest{Name: "r7a", At: x}))
-	must(brancher.CreateBranch(ctx, "matches-r7", client.BranchRequest{Name: "r7b", At: y}))
-	all := []string{"schemas", "cat-season", "matches", "matches-r7", "r7a", "r7b"}
-	w.x = startSvc(t, w.s.Client(t, client.WithBearer(w.k.Grant(t, w.s.Now(), "svc:indexer", all, []string{"read"}))),
-		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, untyped: true, branches: true, now: w.s.Now})
-	for _, ns := range []string{"matches", "matches-r7", "r7a", "r7b"} {
-		w.x.caughtUp(ns)
-	}
-	fan := w.reader("user:fan", []any{"fans"}, "r7a", "r7b")
-	r := w.x.follow("/_refs?to="+url.QueryEscape("/r/target/x"), fan)
-	if r.status != 200 {
-		t.Fatalf("/_refs: %d %v", r.status, r.body)
-	}
-	ns := v75Namespaces(t, r.body)
-	if ns["matches-r7"] != x || ns["r7a"] == "" || ns["r7b"] == "" {
-		t.Errorf("namespaces %v, want matches-r7 at %s (r7a's), not %s (r7b's)", ns, x, y)
 	}
 }
 

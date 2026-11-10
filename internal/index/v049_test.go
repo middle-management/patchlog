@@ -105,12 +105,11 @@ func TestReadsUnrestrictedRoles(t *testing.T) {
 	}{
 		{"reader and writer (B8)", "user:bob", []any{"reader", "writer"}, true, "a,b,draft-1"},
 		{"writer", "user:dee", []any{"writer"}, false, "draft-1"},
-		// Rules on /now in a role that lists read (current passes now,
-		// expired doesn't): no namespace-wide edge grant, and sec counts
-		// as unreadable, here as on /_refs, where it is the only
-		// namespace followed (§A.4, v0.73; IX-15).
-		{"current and writer", "user:cy", []any{"current", "writer"}, false, ""},
-		{"expired and writer", "user:ed", []any{"expired", "writer"}, false, ""},
+		// A role with a rule on /now (current passes now, expired
+		// doesn't) doesn't count for read (§C.2 item 5, v0.78): the grant
+		// reads as through writer alone, here as on /_refs.
+		{"current and writer", "user:cy", []any{"current", "writer"}, false, "draft-1"},
+		{"expired and writer", "user:ed", []any{"expired", "writer"}, false, "draft-1"},
 	} {
 		tok := issuer.Grant(t, s.Now(), tc.sub, []string{"sec"}, nil, map[string]any{"groups": []any{"editors"}, "roles": tc.roles})
 		if tc.hits == "" {
