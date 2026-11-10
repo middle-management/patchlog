@@ -859,3 +859,57 @@ func v0261SealedTrustedWithoutKeys(t *testing.T, refused bool) {
 			sent, queued, x.s.Checkpoint("sec"), before.path, before.header.Get("Cache-Control"))
 	}
 }
+
+// §9, §B.5 ("tagged ... every namespace in the checkpoint (ns:{ns}); a
+// service whose cache the origin's purges don't reach purges these tags
+// itself"): listings at ats whose combined checkpoint held sec carry
+// ns:sec. Once the catalog stops trusting sec, the service stops
+// following it, and without edge grants it purges nothing for the
+// untrust (applyLocked: ns:{catalog} only under EdgeGrants), so sec made
+// private afterwards is never seen: no tag the old listing carries is
+// ever sent to the service's Purger, and a CDN the origin's purges don't
+// reach keeps the listing at the old at, sec's title in the clear, public
+// immutable. (The service itself no longer serves it: the anonymous
+// viewer's shape changed with the trust list, so the kept copy misses.)
+// Pre-existing; not something 5a462d3 claims to cover.
+//
+// Fixed in v0.26.1: every untrust purges ns:{catalog}.
+func TestV0261UntrustedThenPrivate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for _, ns := range []string{"cat", "sec"} {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+		if ns == "cat" {
+			doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag", "title": "/title"}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	both := []string{"cat", "sec"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(w.CreateDoc(ctx, "sec", "a", map[string]any{"title": "Secret vw3k"}))
+	must(w.CreateDoc(ctx, "cat", "sec.a", map[string]any{"parents": parents("root@a0")}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	x := startSvc(t, sc, svcOpts{now: s.Now})
+	x.caughtUp("cat", "sec")
+	before := x.fetch("/cat/children?of=root", "")
+	if !strings.Contains(string(before.body), "vw3k") {
+		t.Fatalf("setup: %s", before.body)
+	}
+	must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": []any{}}}))
+	x.caughtUp("cat")
+	must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
+	time.Sleep(500 * time.Millisecond) // the service would have met it by now, were it following sec
+	purged := false
+	for _, tg := range strings.Split(before.header.Get("Cache-Tag"), ",") {
+		if sent, _ := v0261SawTag(x, strings.TrimSpace(tg)); sent {
+			purged = true
+		}
+	}
+	if !purged {
+		t.Errorf("sec made private after cat stopped trusting it: none of %s's tags %q was ever purged; it was served %q with sec's title in the clear",
+			before.path, before.header.Get("Cache-Tag"), before.header.Get("Cache-Control"))
+	}
+}

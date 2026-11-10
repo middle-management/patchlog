@@ -1571,24 +1571,25 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO seen (ns, ns_id) VALUES (?, ?)`, b.NS, b.NewCheckpoint); err != nil {
 		return nil, err
 	}
+	// A namespace the catalog no longer trusts leaves every cached listing
+	// of the catalog (ns:{catalog}, which every listing carries). Once
+	// untrusted it is no longer followed, so a later config entry making
+	// it private, sealed or e2e is never seen, and the listings showing it
+	// public or in the clear must go now (§9, §B.5). With edge grants
+	// also: a g/all cookie issued from now on isn't checked against it,
+	// and an edge serves the g/all listings it holds to every g/all
+	// cookie (§B.11.5); should the purge not land, their edge lifetime is
+	// capped (cdnAll). Not ns:{ns}, which would evict all every service
+	// caches of the namespace.
+	for ns := range oldTrust {
+		if !g.Trust[ns] {
+			res.tags = append(res.tags, "ns:"+s.actual(cat))
+			break
+		}
+	}
 	// Stored sealed listings go by the same tags as cached copies.
 	if err := s.sealed.Purge(ctx, tx, res.tags); err != nil {
 		return nil, err
-	}
-	// A namespace the catalog no longer trusts leaves every cached listing
-	// of the catalog (ns:{catalog}, which every listing carries), with
-	// edge grants: a g/all cookie issued from now on isn't checked against
-	// it, and an edge serves the g/all listings it holds to every g/all
-	// cookie (§B.11.5). Not ns:{ns}, which would evict all every service
-	// caches of the namespace. Should the purge not land, their edge
-	// lifetime is capped (cdnAll).
-	if s.opt.EdgeGrants != nil {
-		for ns := range oldTrust {
-			if !g.Trust[ns] {
-				res.tags = append(res.tags, "ns:"+s.actual(cat))
-				break
-			}
-		}
 	}
 	// The second purge, durable with the commit (package repurge): a read
 	// before the commit may reach the CDN after the first.
