@@ -15,9 +15,11 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // v0261NarrowPR is pr, public, with one document, and an index of it;
@@ -400,5 +402,82 @@ func TestV0261RotationBeforeJudge(t *testing.T) {
 	}
 	if want := fmt.Sprintf("e-b#%d", e); got != want {
 		t.Errorf("e-b/r, pending, judged after e-b rotated to %d: under %q, want %q", e, got, want)
+	}
+}
+
+// v0261Start starts an index of w following nss on the database db, as
+// v75x.start does; rebuild replays it, snapshot bootstraps each namespace
+// from its /heads listing (follow.WithSnapshot).
+func v0261Start(w *v75x, db string, rebuild, snapshot bool, nss ...string) *svc {
+	w.t.Helper()
+	ev := must(edge.New([]byte("s3cret"), "", ""))
+	all := []string{"schemas", "cat-season", "matches", "matches-r7"}
+	x := startSvcWith(w.t, w.s.Client(w.t, client.WithBearer(w.k.Grant(w.t, w.s.Now(), "svc:indexer", all, []string{"read"}))),
+		svcOpts{db: db, ns: nss, untyped: true, rebuild: rebuild, now: w.s.Now},
+		func(o *indexOpts) {
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+			if snapshot {
+				o.FollowOptions = append(o.FollowOptions, follow.WithSnapshot())
+			}
+		})
+	for _, ns := range nss {
+		x.caughtUp(ns)
+	}
+	return x
+}
+
+// v0261Freeze freezes cat-season, as a purge-ns needs (§8.5), and
+// v0261Purge purges it.
+func v0261Freeze(w *v75x) {
+	w.t.Helper()
+	ctx := context.Background()
+	must(w.admin.PatchConfig(ctx, "cat-season", must(w.admin.NSHead(ctx, "cat-season")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+}
+
+func v0261Purge(w *v75x) {
+	w.t.Helper()
+	purger := w.s.Client(w.t, client.WithBearer(w.k.Grant(w.t, w.s.Now(), "user:root", []string{"cat-season"}, []string{"purge-ns"})))
+	must(purger.PurgeNamespace(context.Background(), "cat-season", w.head("cat-season")))
+}
+
+// TestV0261SnapshotRefreshesTrust (I-L2; §B.11.9 Where, "as their
+// documents alone decide"): the index serves cat-season and matches, and
+// records cat-season's catalog.trust, matches. While it is down,
+// cat-season stops trusting matches and is frozen; the index is rebuilt
+// from snapshots, which carry no config entry, and cat-season is then
+// purged, its purge-ns the only entry after the snapshot. matches is
+// uncovered: li, a partial reader, is 403, with no marker. Before, the
+// trust recorded before the rebuild was read once cat-season was purged,
+// and li got a g: marker and empty answers.
+func TestV0261SnapshotRefreshesTrust(t *testing.T) {
+	t.Parallel()
+	w := newV75XOn(t, clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}))
+	db := filepath.Join(t.TempDir(), "i.db")
+	x1 := v0261Start(w, db, false, false, "matches", "cat-season")
+	li := w.reader("user:li", []any{"fans"})
+	if r := x1.raw("/matches", li); r.status != 302 || !strings.Contains(r.header.Get("Location"), "/g/") {
+		t.Fatalf("li while cat-season trusts matches: %d %s %v", r.status, r.header.Get("Location"), r.body)
+	}
+	x1.stop()
+	ctx := context.Background()
+	must(w.admin.PatchConfig(ctx, "cat-season", must(w.admin.NSHead(ctx, "cat-season")).Config,
+		[]any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": []any{}}}))
+	v0261Freeze(w)
+	x := v0261Start(w, db, true, true, "matches", "cat-season")
+	if r := x.raw("/matches", li); r.status != 403 {
+		t.Fatalf("li once cat-season no longer trusts matches: %d %s %v", r.status, r.header.Get("Location"), r.body)
+	}
+	v0261Purge(w)
+	waitFor(t, "the index applies cat-season's purge", func() bool {
+		for _, b := range x.batches() {
+			if b.NS == "cat-season" && b.Coalesce().PurgedNS {
+				return true
+			}
+		}
+		return false
+	})
+	x.ix.ExpireGrantChecks()
+	if r := x.raw("/matches", li); r.status != 403 {
+		t.Errorf("li once cat-season, which no longer trusted matches as of the snapshot, is purged: %d %s %v, want 403 with no marker", r.status, r.header.Get("Location"), r.body)
 	}
 }

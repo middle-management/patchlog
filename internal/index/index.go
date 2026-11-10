@@ -34,7 +34,9 @@
 //	                                      follows them (members.go)
 //	member_conf(ns, public, level)        as ns_conf, for those
 //	catalog_trust(ns, trust)              the catalog.trust last applied, of either, kept past a
-//	                                      purge-ns and a rebuild (recordTrust, fsTrust)
+//	                                      purge-ns and a rebuild (recordTrust, fsTrust), read again
+//	                                      at a snapshot, forgotten once ns is neither served nor
+//	                                      followed, unless purged (dropUnfollowedTrust, forgetMember)
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
@@ -459,6 +461,10 @@ func (ix *Index) initSchema(ctx context.Context) error {
 	if err := repurge.Init(ctx, ix.db); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
+	// Before a rebuild empties the checkpoints it goes by.
+	if err := ix.dropUnfollowedTrust(ctx); err != nil {
+		return fmt.Errorf("index: catalog trust: %w", err)
+	}
 	if ix.opt.Rebuild {
 		if err := ix.reset(ctx); err != nil {
 			return fmt.Errorf("index: rebuild: %w", err)
@@ -757,6 +763,27 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := g.Wait(); err != nil {
 		return err
 	}
+	// A snapshot carries no config entry (but a new branch's genesis,
+	// which narrowed records), so the namespace document is read at its
+	// checkpoint: the catalog.trust recorded before it (catalog_trust,
+	// which a rebuild keeps) may be one config entries the snapshot
+	// skipped have changed since, and fsTrust reads it once ns is purged.
+	// A purge-ns in place of a listing (a namespace purged before it was
+	// bootstrapped) has no document to read, and keeps it; a sealed one
+	// purged since the listing was read, whose document is 410 too, is
+	// forgotten (unknown: no catalog, which shows least).
+	var snapDoc map[string]any
+	forgetTrust := false
+	if b.Replaces() && !config && !co.PurgedNS {
+		doc, err := ix.docAt(ctx, b.NS, b.NewCheckpoint)
+		switch {
+		case client.IsPurged(err):
+			forgetTrust = true
+		case err != nil:
+			return err
+		}
+		snapDoc = doc
+	}
 
 	ix.wmu.Lock()
 	defer ix.wmu.Unlock()
@@ -770,6 +797,16 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		// first); a purge-ns drops everything (Coalesce keeps only the
 		// changes after it).
 		if err := ix.dropNS(ctx, tx, b.NS); err != nil {
+			return err
+		}
+	}
+	if snapDoc != nil {
+		if err := recordTrust(ctx, tx, b.NS, snapDoc); err != nil {
+			return err
+		}
+	}
+	if forgetTrust {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM catalog_trust WHERE ns = ?`, b.NS); err != nil {
 			return err
 		}
 	}
@@ -998,6 +1035,52 @@ func recordTrust(ctx context.Context, tx *sql.Tx, ns string, doc map[string]any)
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO catalog_trust (ns, trust) VALUES (?, ?) ON CONFLICT (ns) DO UPDATE SET trust = excluded.trust`, ns, string(trust))
 	return err
+}
+
+// dropUnfollowedTrust forgets, at Open, the catalog.trust recorded for a
+// namespace the index served (it holds a checkpoint of it) and no longer
+// does (it isn't among the namespaces it serves now; with Branches, every
+// namespace it holds a checkpoint of is served, known), unless the index
+// applied its purge, whose last trust stays (fsTrust), or follows it as
+// a member (members.go, which records it again at its bootstrap and its
+// config entries): config entries the index no longer applies may change
+// it unseen, and once that namespace is purged, its document 410, fsTrust
+// would read the stale one, and may cover a namespace it no longer
+// trusts. Without one, it counts as no catalog, the reading that shows
+// least, as forgetMember leaves a live member it stops following.
+func (ix *Index) dropUnfollowedTrust(ctx context.Context) error {
+	if ix.opt.Branches {
+		return nil
+	}
+	rows, err := ix.db.QueryContext(ctx, `SELECT t.ns FROM catalog_trust t
+		WHERE EXISTS (SELECT 1 FROM checkpoints c WHERE c.ns = t.ns)
+		AND NOT EXISTS (SELECT 1 FROM ns_state s WHERE s.ns = t.ns AND s.purged = 1)
+		AND NOT EXISTS (SELECT 1 FROM member_checkpoints m WHERE m.ns = t.ns)`)
+	if err != nil {
+		return err
+	}
+	var drop []string
+	for rows.Next() {
+		var ns string
+		if err := rows.Scan(&ns); err != nil {
+			rows.Close()
+			return err
+		}
+		if !ix.roots[ns] {
+			drop = append(drop, ns)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, ns := range drop {
+		ix.opt.Logf("index: %s is no longer served; forgetting its catalog.trust", ns)
+		if _, err := ix.db.ExecContext(ctx, `DELETE FROM catalog_trust WHERE ns = ?`, ns); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // lastTrust is ns's catalog.trust as the namespace document last applied
