@@ -14,9 +14,9 @@
 //
 // Sealing (§E.2.6). Values a view derives from a sealed or e2e namespace's
 // content (scores, facets, titles, …) are sealed in the compact JWE format
-// of §E.2.2 (alg "dir", enc "A256GCM", kid "{ns}#{e}") under the key of
-// the epoch the revision they derive from is served under (EpochOf: the
-// kid of the sealed document fetched at E2, of the sealed op at E3;
+// of §E.2.2 (alg "dir", enc "A256GCM", kid "{ns}#{e}") under a key derived
+// from the epoch the revision they derive from is served under (EpochOf:
+// the kid of the sealed document fetched at E2, of the sealed op at E3;
 // Keys.KeyAt), the epoch current when the view is produced where that
 // isn't known; a whole response only when all its values derive from
 // revisions of one epoch. Names, ids, URLs, heads, structure, at, order
@@ -25,17 +25,25 @@
 // is served at, as the service's redirect gives it, so the ciphertext is
 // bound to one query, subject set and checkpoint:
 //
-//	whole response (SealView):  pl { "ns", "view" }, sealed under K_e,
-//	                            served as Content-Type application/jose
+//	whole response (SealView):  pl { "ns", "view" }, sealed under the view
+//	                            key of K_n = NamespaceKey(K_e, ns), served
+//	                            as Content-Type application/jose
 //	one entry (SealItem):       pl { "ns", "name", "view" }, sealed under
-//	                            K_r = HKDF(K_e, ns, name) of the entry's
-//	                            resource, as { …clear, "sealed": "<JWE>" }
+//	                            the view key of K_r = ResourceKey(K_e, ns,
+//	                            name) of the entry's resource, as
+//	                            { …clear, "sealed": "<JWE>" }
 //
-// Entries use the per-resource key, like the revisions they derive from
-// (§E.2.1), so a reader holding only some per-resource keys opens exactly
-// the entries of those resources. Nothing is compressed (a view mixes
-// content of many resources and authors); a namespace with encryption.pad
-// pads what is sealed for it to its size bucket (§E.2.2).
+// A view key is HKDF-SHA256(ikm = K_n or K_r, salt = "patchlog-view", info
+// = view) (seal.ViewKey), so views count toward no epoch key's message
+// bound (§E.2.1, §E.2.6); a value of another resource nested in an entry
+// is sealed as an entry of that resource is (SealItem with its name). The
+// view key is derived when a value is sealed, from the Key the caller
+// chose, never ahead of it. Entries use the per-resource key, like the
+// revisions they derive from (§E.2.1), so a reader holding only some
+// per-resource keys opens exactly the entries of those resources. Nothing
+// is compressed (a view mixes content of many resources and authors); a
+// namespace with encryption.pad pads what is sealed for it to its size
+// bucket (§E.2.2).
 package derived
 
 import (
@@ -97,7 +105,7 @@ func Marshal(v any) ([]byte, error) {
 type Key struct {
 	NS    string
 	Epoch int
-	K     []byte // K_e
+	K     []byte // K_e: SealView and SealItem derive K_n or K_r and the view key from it
 	Pad   bool
 }
 
@@ -112,36 +120,57 @@ func (k Key) seal(key []byte, pl seal.PL, body any) (string, error) {
 	return seal.SealUncompressed(key, seal.Kid(k.NS, k.Epoch), pl, b)
 }
 
-// SealView seals a whole response body under K_e of k.NS (= v.NS).
+// SealView seals a whole response body under the view key of K_n of k.NS
+// (= v.NS): ViewKey(NamespaceKey(K_e, ns), view) (§E.2.6).
 func SealView(k Key, v View, body any) (string, error) {
 	if k.NS != v.NS {
 		return "", fmt.Errorf("derived: view of %s sealed with a key of %s", v.NS, k.NS)
 	}
-	return k.seal(k.K, v.PL(), body)
+	kv, err := wholeViewKey(k.K, k.NS, v.Target)
+	if err != nil {
+		return "", err
+	}
+	return k.seal(kv, v.PL(), body)
 }
 
 // SealItem seals the sealed values of one entry, derived from k.NS/name,
-// under that resource's K_r.
+// under the view key of that resource's K_r: ViewKey(ResourceKey(K_e, ns,
+// name), view) (§E.2.6). A value of another resource an entry carries is
+// sealed by SealItem with that resource's Key and name.
 func SealItem(k Key, v View, name string, values any) (string, error) {
 	kr, err := seal.ResourceKey(k.K, k.NS, name)
 	if err != nil {
 		return "", err
 	}
-	return k.seal(kr, v.ItemPL(k.NS, name), values)
+	kv, err := seal.ViewKey(kr, v.Target)
+	if err != nil {
+		return "", err
+	}
+	return k.seal(kv, v.ItemPL(k.NS, name), values)
+}
+
+// wholeViewKey is the key a whole response of ns is sealed under:
+// ViewKey(NamespaceKey(K_e, ns), view) (§E.2.6).
+func wholeViewKey(ke []byte, ns, view string) ([]byte, error) {
+	kn, err := seal.NamespaceKey(ke, ns)
+	if err != nil {
+		return nil, err
+	}
+	return seal.ViewKey(kn, view)
 }
 
 // OpenView decrypts a sealed view: keyOf returns the epoch key K_e of the
-// kid the JWE names (nil if the reader has none), and the JWE must be bound
-// to v.
+// kid the JWE names (nil if the reader has none), from which the view key
+// of K_n is derived, and the JWE must be bound to v.
 func OpenView(jwe string, keyOf func(kid string) []byte, v View) ([]byte, error) {
-	return open(jwe, keyOf, v.NS, v.PL())
+	return open(jwe, keyOf, v.NS, v.PL(), func(ke []byte) ([]byte, error) { return wholeViewKey(ke, v.NS, v.Target) })
 }
 
 // OpenItem decrypts one sealed entry derived from ns/name: keyOf returns
 // K_r of that resource for the kid the JWE names (ItemKey derives it from
-// epoch keys).
+// epoch keys), from which the view key is derived.
 func OpenItem(jwe string, keyOf func(kid string) []byte, v View, ns, name string) ([]byte, error) {
-	return open(jwe, keyOf, ns, v.ItemPL(ns, name))
+	return open(jwe, keyOf, ns, v.ItemPL(ns, name), func(kr []byte) ([]byte, error) { return seal.ViewKey(kr, v.Target) })
 }
 
 // ItemKey returns a keyOf for OpenItem that derives K_r of ns/name from
@@ -160,7 +189,9 @@ func ItemKey(epochKeyOf func(kid string) []byte, ns, name string) func(string) [
 	}
 }
 
-func open(jwe string, keyOf func(string) []byte, ns string, pl seal.PL) ([]byte, error) {
+// open opens jwe under view(keyOf(kid)): the view key derived from the K_e
+// or K_r the caller holds for the kid it names.
+func open(jwe string, keyOf func(string) []byte, ns string, pl seal.PL, view func([]byte) ([]byte, error)) ([]byte, error) {
 	h, err := seal.ParseHeader(jwe)
 	if err != nil {
 		return nil, err
@@ -169,14 +200,21 @@ func open(jwe string, keyOf func(string) []byte, ns string, pl seal.PL) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	if kns != ns {
+	// pl is compared with the view fetched before any key is derived from
+	// it (§E.2.6: readers compare pl with the URL they fetched), so a JWE
+	// of another view is ErrMismatch, not a failed decryption.
+	if kns != ns || h.Expect(h.Kid, pl) != nil {
 		return nil, seal.ErrMismatch
 	}
 	k := keyOf(h.Kid)
 	if k == nil {
 		return nil, ErrNoKey
 	}
-	return seal.OpenExpect(jwe, k, h.Kid, pl)
+	kv, err := view(k)
+	if err != nil {
+		return nil, err
+	}
+	return seal.OpenExpect(jwe, kv, h.Kid, pl)
 }
 
 // ErrNoKey reports a sealed view or entry under a kid the caller has no
