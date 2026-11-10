@@ -192,6 +192,14 @@ func (e *Engine) endpoint(origin string) (RemoteEndpoint, error) {
 	if ep.HTTPClient == nil {
 		ep.HTTPClient = telemetry.DefaultClient
 	}
+	// No request to a remote base follows its redirects: every one carries
+	// the endpoint's grant, and the base would pick where it goes (a blind
+	// SSRF, the grant forwarded to other ports of its host). A 3xx is the
+	// base's answer, which each caller reads as such (client.New does the
+	// same for the client).
+	hc := *ep.HTTPClient
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	ep.HTTPClient = &hc
 	return ep, nil
 }
 
