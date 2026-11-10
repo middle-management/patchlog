@@ -251,7 +251,9 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.81").
 - `patchlog e2e seal-status -api URL -ns NS -name NAME [-bearer T] [-json]` reports a
   resource's `K_r` count, whether it is partial, and whether rotation is due.
 - `patchlog serve -remote-origin-url` no longer has any effect: it only told where to read the
-  start times of a source's epochs from before its raise to e2e.
+  start times of a source's epochs from before its raise to e2e. It is still accepted, so
+  command lines keep working, and a start with it logs a warning. `core.RemoteEndpoint.OriginURL`
+  is removed.
 
 ## v0.26.1
 

@@ -177,7 +177,7 @@ func serve(args []string) {
 	fs.Var(&remoteBearers, "remote-bearer", "ORIGIN=GRANT: grant sent to the deployment at ORIGIN for remote branches (read, and export to register) (repeatable, §G.3)")
 	fs.Var(&remoteURLs, "remote-url", "ORIGIN=URL: reach the deployment at ORIGIN through URL instead (repeatable)")
 	var remoteOriginURLs multi
-	fs.Var(&remoteOriginURLs, "remote-origin-url", "ORIGIN=URL: where the deployment at ORIGIN itself answers, when that isn't ORIGIN, such as the -remote-url of an internal address of it; the start times of a source's epochs from before its e2e raise, whose keys a remote branch hands out, are read only there, never through a -remote-url that is a mirror or other intermediary (repeatable, §G.5.2)")
+	fs.Var(&remoteOriginURLs, "remote-origin-url", "ORIGIN=URL (ignored since v0.81; still accepted, with a warning at start, so command lines keep working): it said where the deployment at ORIGIN itself answers, for the start times of a source's epochs from before its e2e raise, which no remote branch reads any more (Addendum E Levels)")
 	var remoteIDs multi
 	fs.Var(&remoteIDs, "remote-identity", "ORIGIN=FILE: X25519 private key (JWK) unwrapping the keys of sealed bases at ORIGIN, named by the -remote-bearer grant's enc (repeatable, §G.5.2)")
 	remoteFollow := fs.Duration("remote-follow-interval", 5*time.Minute, "how often remote bases' logs are followed: their purges applied and their raises of level followed (§G.3, §G.5.2); 0 disables following")
@@ -214,9 +214,12 @@ func serve(args []string) {
 	if len(edgeGrantKeys) > 0 {
 		log.Printf("edge grants: minted under kid %s, accepted under %s", cookies.Kid(), strings.Join(cookies.Kids(), ", "))
 	}
-	remote, err := remoteOptions(remoteBearers, remoteURLs, remoteIDs, remoteOriginURLs)
+	remote, warn, err := remoteOptions(remoteBearers, remoteURLs, remoteIDs, remoteOriginURLs)
 	if err != nil {
 		log.Fatal(err)
+	}
+	for _, w := range warn {
+		log.Print("warning: " + w)
 	}
 	remote.Register, remote.FollowInterval, remote.FollowTimeout = *remoteRegister, *remoteFollow, *remoteFollowTimeout
 	if remote.FollowInterval == 0 {
@@ -677,17 +680,26 @@ func operatorKeyHistory(flags []string) ([]core.OperatorKeyPeriod, error) {
 	return out, nil
 }
 
-// remoteOptions builds the endpoints of remote bases from ORIGIN=VALUE flags.
-func remoteOptions(bearers, urls, identities, originURLs []string) (core.RemoteOptions, error) {
+// remoteOriginURLIgnored is the warning of a start with -remote-origin-url.
+const remoteOriginURLIgnored = "-remote-origin-url is ignored since v0.81: it said where an origin itself answers, for the start times of a source's epochs from before its e2e raise, which no remote branch reads any more (Addendum E Levels); remove it"
+
+// remoteOptions builds the endpoints of remote bases from ORIGIN=VALUE
+// flags. originURLs (-remote-origin-url) are checked as the others but
+// ignored, with a warning: nothing reads them since v0.81.
+func remoteOptions(bearers, urls, identities, originURLs []string) (core.RemoteOptions, []string, error) {
 	eps := map[string]core.RemoteEndpoint{}
 	for _, pair := range [][]string{bearers, urls, identities, originURLs} {
 		for _, kv := range pair {
 			o, v, ok := strings.Cut(kv, "=")
 			if !ok || !core.ValidRemoteOrigin(o) || v == "" {
-				return core.RemoteOptions{}, fmt.Errorf("remote endpoint %q: want ORIGIN=VALUE with an https origin", kv)
+				return core.RemoteOptions{}, nil, fmt.Errorf("remote endpoint %q: want ORIGIN=VALUE with an https origin", kv)
 			}
 			eps[o] = core.RemoteEndpoint{}
 		}
+	}
+	var warn []string
+	if len(originURLs) > 0 {
+		warn = append(warn, remoteOriginURLIgnored)
 	}
 	for _, kv := range bearers {
 		o, v, _ := strings.Cut(kv, "=")
@@ -701,17 +713,11 @@ func remoteOptions(bearers, urls, identities, originURLs []string) (core.RemoteO
 		ep.BaseURL = v
 		eps[o] = ep
 	}
-	for _, kv := range originURLs {
-		o, v, _ := strings.Cut(kv, "=")
-		ep := eps[o]
-		ep.OriginURL = v
-		eps[o] = ep
-	}
 	for _, kv := range identities {
 		o, v, _ := strings.Cut(kv, "=")
 		id, err := bundle.LoadIdentity(v)
 		if err != nil {
-			return core.RemoteOptions{}, fmt.Errorf("-remote-identity %s: %w", o, err)
+			return core.RemoteOptions{}, nil, fmt.Errorf("-remote-identity %s: %w", o, err)
 		}
 		ep := eps[o]
 		ep.Identity = id
@@ -719,7 +725,7 @@ func remoteOptions(bearers, urls, identities, originURLs []string) (core.RemoteO
 	}
 	return core.RemoteOptions{Resolve: func(origin string) (core.RemoteEndpoint, error) {
 		return eps[origin], nil
-	}}, nil
+	}}, warn, nil
 }
 
 // handler routes /playground/ to the web UI and everything else to the API.

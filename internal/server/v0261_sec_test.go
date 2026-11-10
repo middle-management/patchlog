@@ -523,9 +523,9 @@ func TestV0261BudgetChargedForOtherOrigin(t *testing.T) {
 		o.Remote = core.RemoteOptions{FollowInterval: -1, FollowTimeout: timeout, Resolve: func(origin string) (core.RemoteEndpoint, error) {
 			switch origin {
 			case originA:
-				return core.RemoteEndpoint{BaseURL: a.srv.URL, OriginURL: a.srv.URL, HTTPClient: httpClient}, nil
+				return core.RemoteEndpoint{BaseURL: a.srv.URL, HTTPClient: httpClient}, nil
 			case originC:
-				return core.RemoteEndpoint{BaseURL: front.URL, OriginURL: front.URL, HTTPClient: httpClient}, nil
+				return core.RemoteEndpoint{BaseURL: front.URL, HTTPClient: httpClient}, nil
 			}
 			return core.RemoteEndpoint{}, fmt.Errorf("unknown origin %s", origin)
 		}}
