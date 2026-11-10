@@ -1461,3 +1461,130 @@ func TestV0261SnapshotRebuildNarrowPurge(t *testing.T) {
 			sent, queued, before.path, before.header.Get("Cache-Control"))
 	}
 }
+
+// v0261Stopped reports whether db records ns stopped (purgeStopped).
+func v0261Stopped(t *testing.T, db, ns string) bool {
+	t.Helper()
+	sq := must(sql.Open("sqlite", sqlitedsn.DSN(db, "")))
+	defer sq.Close()
+	var n int
+	if err := sq.QueryRow(`SELECT count(*) FROM meta WHERE k = ?`, "stopped:"+ns).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n > 0
+}
+
+// §9, §B.11.5 (v0.26.1): a stop ends without a new entry once the
+// service follows the namespace to the checkpoint it stopped at again:
+// the core refusing the service's reads of the catalog's or sec's log for
+// a while (403) stops it (purgeStopped: ns:{ns} purged, the catalog 404,
+// sec reading public to no one), and once the refusal passes, with
+// nothing written meanwhile, anonymous reads are served again and the
+// stop is no longer recorded.
+func TestV0261StopEnds(t *testing.T) {
+	t.Parallel()
+	for _, which := range []string{"cat", "sec"} {
+		t.Run(which, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			var refuse atomic.Bool
+			s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond,
+				Wrap: func(h http.Handler) http.Handler {
+					return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if refuse.Load() && strings.HasPrefix(r.URL.Path, "/ns/"+which+"/") && strings.HasSuffix(r.URL.Path, "/log") {
+							w.Header().Set("Content-Type", "application/json")
+							w.WriteHeader(403)
+							w.Write([]byte(`{"code":"forbidden","message":"injected"}`))
+							return
+						}
+						h.ServeHTTP(w, r)
+					})
+				}})
+			k := clienttest.NewKey("k")
+			for _, ns := range []string{"cat", "sec"} {
+				doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+				if ns == "cat" {
+					doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag", "title": "/title"}
+				}
+				must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+			}
+			both := []string{"cat", "sec"}
+			w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+			must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+			must(w.CreateDoc(ctx, "sec", "a", map[string]any{"title": "A"}))
+			must(w.CreateDoc(ctx, "cat", "sec.a", map[string]any{"parents": parents("root@a0")}))
+			sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+			db := filepath.Join(t.TempDir(), "tree.db")
+			x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+			x.caughtUp("cat", "sec")
+			if st, _, b, _ := v0261Get(x, "/cat/children?of=root", ""); st != 200 {
+				t.Fatalf("setup: %d %s", st, b)
+			}
+			refuse.Store(true)
+			waitFor(t, "ns:"+which+" purged (purgeStopped)", func() bool { sent, _ := v0261SawTag(x, "ns:"+which); return sent })
+			want := 401
+			if which == "cat" {
+				want = 404
+			}
+			if st, _, b, _ := v0261Get(x, "/cat/children?of=root", ""); st != want {
+				t.Errorf("stopped: anonymous GET %d %s, want %d", st, b, want)
+			}
+			if !v0261Stopped(t, db, which) {
+				t.Errorf("stopped: no stopped:%s recorded", which)
+			}
+			refuse.Store(false)
+			waitFor(t, "anonymous reads again", func() bool { st, _, _, _ := v0261Get(x, "/cat/children?of=root", ""); return st == 200 })
+			if v0261Stopped(t, db, which) {
+				t.Errorf("followed again: stopped:%s still recorded", which)
+			}
+		})
+	}
+}
+
+// §9, §B.11.5 (v0.26.1): a listing whose viewer was judged public before
+// the service stopped a namespace it shows (purgeStopped) isn't served
+// after the stop's purge: the stop moves no at, so the listing would be
+// answered as computed; the read mode is judged again once its graph is
+// read (stillPublic). Here sec is raised to sealed, which a service with
+// no keys can't follow, after the listing took its generation.
+func TestV0261StopAfterViewerJudged(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for _, ns := range []string{"cat", "sec"} {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+		if ns == "cat" {
+			doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag", "title": "/title"}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	both := []string{"cat", "sec"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(w.CreateDoc(ctx, "sec", "a", map[string]any{"title": "Secret vw3k"}))
+	must(w.CreateDoc(ctx, "cat", "sec.a", map[string]any{"parents": parents("root@a0")}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"})), client.WithKeys(client.StaticKeys()))
+	x := startSvc(t, sc, svcOpts{now: s.Now})
+	x.caughtUp("cat", "sec")
+
+	var once sync.Once
+	ran := false
+	x.s.AfterGeneration(func() {
+		once.Do(func() {
+			ran = true
+			must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}}}))
+			waitFor(t, "ns:sec purged (purgeStopped)", func() bool { sent, _ := v0261SawTag(x, "ns:sec"); return sent })
+		})
+	})
+	// At the current at's URL, which the stop doesn't move: the listing
+	// computed is the answer.
+	st, hdr, body, path := v0261Get(x, "/cat/at/"+x.s.At()+"/subtree?of=root", "")
+	x.s.AfterGeneration(nil)
+	if !ran {
+		t.Fatal("the listing was not computed")
+	}
+	if st == 200 && strings.Contains(body, "vw3k") {
+		t.Errorf("sec stopped while the listing was computed: anonymous GET served %s 200, Cache-Control %q: %s", path, hdr.Get("Cache-Control"), body)
+	}
+}

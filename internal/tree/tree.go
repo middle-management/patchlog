@@ -892,9 +892,17 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		}
 		if ae, ok := client.AsAPIError(err); ok && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden || ae.Status == http.StatusNotFound) {
 			s.setUnfollowed(ns, err.Error())
-			if ae.Status != http.StatusNotFound || ae.Path == "/ns/"+real {
-				// Refused, or the namespace itself gone; not a log range a
-				// stale head pointer named.
+			refused := ae.Status != http.StatusNotFound || ae.Path == "/ns/"+real
+			if !refused {
+				// A 404 of a log range may be a stale head pointer's (a
+				// CDN's, §9); one the namespace's own head answers alike
+				// is a refusal (§7 answers a namespace the reader can't
+				// read as one that doesn't exist).
+				_, herr := s.c.NSHead(ctx, real)
+				he, ok := client.AsAPIError(herr)
+				refused = ok && (he.Status == http.StatusUnauthorized || he.Status == http.StatusForbidden || he.Status == http.StatusNotFound)
+			}
+			if refused {
 				stop()
 			}
 		} else if follow.LacksKey(ctx, err) {
@@ -1664,10 +1672,19 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 // was stopped at, after a restart too, it purges nothing more. Applying a
 // batch of ns again ends the stop.
 func (s *Service) purgeStopped(ctx context.Context, ns string) {
+	s.mu.RLock()
+	was, marked := s.g.stopped[ns]
+	already := marked && was == s.cur[ns]
+	s.mu.RUnlock()
+	if already {
+		// Stopped at this checkpoint already (a follower's every retry
+		// and report comes here).
+		return
+	}
 	s.mu.Lock()
 	shown := ns == s.opt.Catalog || s.g.Trust[ns]
 	cp := s.cur[ns]
-	was, marked := s.g.stopped[ns]
+	was, marked = s.g.stopped[ns]
 	if shown {
 		s.g.stopped[ns] = cp
 	}
