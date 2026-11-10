@@ -811,9 +811,21 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		s.opt.Logf("tree: %s was purged; not following", ns)
 		return
 	}
+	// A namespace it stops following, or can't follow past an entry, for
+	// lack of keys, at a start or meanwhile, purges ns:{ns} once
+	// (purgeStopped): the config entry that took the keys away (a raise,
+	// an epoch the service can't have) is never applied, so never purges
+	// what it narrows.
+	var stopped sync.Once
+	stop := func() { stopped.Do(func() { s.purgeStopped(context.WithoutCancel(ctx), ns) }) }
 	opts := []follow.Option{
 		follow.WithMaxUnits(0),
-		follow.WithOnError(func(n string, err error) { s.opt.Logf("tree: %s: %v", n, err) }),
+		follow.WithOnError(func(n string, err error) {
+			s.opt.Logf("tree: %s: %v", n, err)
+			if n == s.actual(ns) && follow.LacksKey(ctx, err) {
+				stop()
+			}
+		}),
 		follow.WithOnCatchUp(func(_, head string, done bool) { s.onCatchUp(ctx, ns, head, done) }),
 	}
 	opts = append(opts, s.opt.FollowOptions...)
@@ -840,6 +852,7 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		if reason, permanent, retry := s.keys.Check(ctx, real, ns != s.opt.Catalog); reason != "" {
 			if !retry {
 				s.setUnfollowed(ns, reason)
+				stop()
 			}
 			if permanent {
 				s.opt.Logf("tree: skipping %s: %s", real, reason)
@@ -868,6 +881,11 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		}
 		if ae, ok := client.AsAPIError(err); ok && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden || ae.Status == http.StatusNotFound) {
 			s.setUnfollowed(ns, err.Error())
+		}
+		if follow.LacksKey(ctx, err) {
+			// Its log can't be read past an entry whose keys the service
+			// lacks: retried, but what that entry narrows is purged now.
+			stop()
 		}
 		s.opt.Logf("tree: following %s stopped: %v; restarting in %s", real, err, pause)
 		t := time.NewTimer(pause)
@@ -1496,13 +1514,17 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	// listings at earlier ats, public or with its values in the clear,
 	// are still served there, kept, stored or cached, and must go, as the
 	// index's do (index.narrowed). Listings carry ns:{ns} for the catalog
-	// and every namespace it trusts (tagSet.header) once that has a
-	// checkpoint: at its first batch none shows it yet.
-	narrowed, _, err := narrowedBy(ctx, tx, g, b, co.PurgedNS)
+	// and every namespace it trusts (tagSet.header).
+	//
+	// At a namespace's first batch this service shows nothing of it yet.
+	// Against what an instance before it applied, the record a rebuild
+	// keeps, a narrowing purges as any does; with no record, a genesis, it
+	// purges nothing.
+	narrowed, recorded, err := narrowedBy(ctx, tx, g, b, co.PurgedNS)
 	if err != nil {
 		return nil, err
 	}
-	narrowed = narrowed && s.cur[b.NS] != "" && (b.NS == cat || g.Trust[b.NS] || oldTrust[b.NS])
+	narrowed = narrowed && (s.cur[b.NS] != "" || recorded) && (b.NS == cat || g.Trust[b.NS] || oldTrust[b.NS])
 	if co.PurgedNS || narrowed {
 		res.tags = append(res.tags, "ns:"+s.actual(b.NS))
 	}

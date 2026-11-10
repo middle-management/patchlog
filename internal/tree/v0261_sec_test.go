@@ -676,3 +676,186 @@ func TestV0261PublicBeforeApplied(t *testing.T) {
 	}
 	block.Store(false)
 }
+
+// v0261SawTag reports whether x's Purger was sent tag, and whether a second
+// purge of it is queued.
+func v0261SawTag(x *svc, tag string) (sent, queued bool) {
+	_, s, q := v0261Purges(x, tag)
+	return s > 0, q > 0
+}
+
+// §9, §E.2.6 (purgeStopped, 5a462d3): a raise of the catalog to e2e that
+// the service can't follow (no keyring recipient key) purges ns:{catalog}
+// when a running follower meets it (Apply, keys.Recheck). One applied
+// while the service was down is met at startup instead, by keys.Check in
+// follow(), which returns for good without purging: the CDN copies of the
+// listings it served public and in the clear before the raise (Purger,
+// immutable for a year) are never purged, nor is a second purge queued.
+//
+// Fixed in v0.26.1: a namespace follow() skips for lack of keys purges
+// ns:{ns} once (purgeStopped), at a start too.
+func TestV0261RaiseToE2EWhileDown(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "public", "keys": []any{k.Entry("*")},
+		"catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	wJWK, wPriv := must2(seal.GenerateRecipient())
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "append", "config"}, map[string]any{"enc": wJWK})),
+		client.WithKeys(client.NewKeys(wPriv)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(w.CreateDoc(ctx, "cat", "season", map[string]any{"title": "Secret m4zt", "parents": parents("root@a0")}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat")
+	before := x.fetch("/cat/children?of=root", "")
+	if !strings.Contains(string(before.body), "m4zt") || !strings.Contains(before.header.Get("Cache-Control"), "immutable") {
+		t.Fatalf("setup: %q %s", before.header.Get("Cache-Control"), before.body)
+	}
+	x.stop()
+
+	must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "e2e"}}}))
+	y := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	waitFor(t, "the catalog skipped", func() bool { return y.raw("/cat/roots", "").status == 404 })
+	deadline := time.Now().Add(3 * time.Second)
+	sent, queued := v0261SawTag(y, "ns:cat")
+	for !sent && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		sent, queued = v0261SawTag(y, "ns:cat")
+	}
+	if !sent || !queued {
+		t.Errorf("raised to e2e while the service was down: at startup it skips cat (404) but sent ns:cat to its Purger %v, queued its second purge %v; "+
+			"%s was served %q with the title in the clear", sent, queued, before.path, before.header.Get("Cache-Control"))
+	}
+}
+
+// §9, §A.1 via §B.5 (narrowedBy, 5a462d3: "at its first batch none shows
+// it yet"): a catalog made private while the service was down is purged
+// on a restart (the checkpoint is kept, so the config entry is not the
+// first batch), but not after -rebuild (Options.Rebuild; reset deletes
+// checkpoints and meta, access:* included): the follower replays the log
+// from "" in one batch (WithMaxUnits(0)), genesis and narrowing together,
+// with s.cur[cat] == "", so nothing is purged, though the CDN holds the
+// listings the previous instance served public, immutable, under the same
+// ats (the combined checkpoint is the same).
+//
+// Fixed in v0.26.1: a rebuild keeps the access:{ns} records, so the
+// replay is compared with what was last served.
+func TestV0261NarrowedWhileDownThenRebuilt(t *testing.T) {
+	t.Parallel()
+	for _, rebuild := range []bool{false, true} {
+		name := "restart"
+		if rebuild {
+			name = "rebuild"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+			k := clienttest.NewKey("k")
+			must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "public", "keys": []any{k.Entry("*")},
+				"catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+			w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+			must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+			must(w.CreateDoc(ctx, "cat", "season", map[string]any{"title": "Secret m4zt", "parents": parents("root@a0")}))
+			sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+			db := filepath.Join(t.TempDir(), "tree.db")
+			x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+			x.caughtUp("cat")
+			before := x.fetch("/cat/children?of=root", "")
+			if !strings.Contains(before.header.Get("Cache-Control"), "public") {
+				t.Fatalf("setup: %q", before.header.Get("Cache-Control"))
+			}
+			x.stop()
+			must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
+			y := startSvc(t, sc, svcOpts{now: s.Now, db: db}, func(o *tree.Options) { o.Rebuild = rebuild })
+			y.caughtUp("cat")
+			if sent, queued := v0261SawTag(y, "ns:cat"); !sent || !queued {
+				t.Errorf("%s after cat was made private while down: sent ns:cat %v, queued %v; %s was served %q",
+					name, sent, queued, before.path, before.header.Get("Cache-Control"))
+			}
+		})
+	}
+}
+
+// §9, §E.2.6 (purgeStopped, 5a462d3): purgeStopped runs only when the
+// follower delivers the narrowing batch and keys.Recheck finds the keys
+// lacking. A trusted namespace raised to sealed whose keys the service
+// can't have never gets that far: the follower can't read the sealed log
+// entry itself ("namespace log sec: ... no key is available") and retries
+// forever, so ns:sec is never purged, and the listings the service
+// served public, with sec's titles in the clear, stay in its CDN.
+//
+// Fixed in v0.26.1: a follower that can't read past an entry for lack
+// of keys purges ns:{ns} once (purgeStopped).
+func TestV0261SealedTrustedWithoutKeys(t *testing.T) {
+	t.Parallel()
+	for _, refused := range []bool{false, true} {
+		name := "static keys"
+		if refused {
+			name = "keys 403"
+		}
+		t.Run(name, func(t *testing.T) { v0261SealedTrustedWithoutKeys(t, refused) })
+	}
+}
+
+// v0261SealedTrustedWithoutKeys: the service's client holds no keys
+// (StaticKeys), or, as deployed, the core refuses its /keys requests for
+// sec (403; nothing else asks for sec's keys here).
+func v0261SealedTrustedWithoutKeys(t *testing.T, refused bool) {
+	t.Parallel()
+	ctx := context.Background()
+	var refuse atomic.Bool
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond,
+		Wrap: func(h http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if refuse.Load() && strings.HasPrefix(r.URL.Path, "/ns/sec/keys") {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(403)
+					w.Write([]byte(`{"code":"forbidden","message":"injected"}`))
+					return
+				}
+				h.ServeHTTP(w, r)
+			})
+		}})
+	k := clienttest.NewKey("k")
+	for _, ns := range []string{"cat", "sec"} {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+		if ns == "cat" {
+			doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag", "title": "/title"}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	both := []string{"cat", "sec"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(w.CreateDoc(ctx, "sec", "a", map[string]any{"title": "Secret vw3k"}))
+	must(w.CreateDoc(ctx, "cat", "sec.a", map[string]any{"parents": parents("root@a0")}))
+	// The service can't have sec's keys once it is sealed.
+	tok := k.Grant(t, s.Now(), "svc:tree", both, []string{"read"})
+	keys := client.StaticKeys()
+	if refused {
+		keys = client.NewKeys(nil)
+		refuse.Store(true)
+	}
+	sc := s.Client(t, client.WithBearer(tok), client.WithKeys(keys))
+	x := startSvc(t, sc, svcOpts{now: s.Now})
+	x.caughtUp("cat", "sec")
+	before := x.fetch("/cat/children?of=root", "")
+	if !strings.Contains(string(before.body), "vw3k") {
+		t.Fatalf("setup: %s", before.body)
+	}
+	must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}}}))
+	deadline := time.Now().Add(3 * time.Second)
+	sent, queued := v0261SawTag(x, "ns:sec")
+	for !sent && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		sent, queued = v0261SawTag(x, "ns:sec")
+	}
+	if !sent || !queued {
+		t.Errorf("sec raised to sealed, its keys out of the service's reach: ns:sec sent %v, queued %v (sec held at %s); %s was served %q with sec's title in the clear",
+			sent, queued, x.s.Checkpoint("sec"), before.path, before.header.Get("Cache-Control"))
+	}
+}

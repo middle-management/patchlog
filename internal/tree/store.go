@@ -22,8 +22,8 @@ import (
 //	                                 when the service applied ns's purge (Unix nanoseconds; "1"
 //	                                 from earlier releases); "caught:{ns}" the head its first
 //	                                 catch-up with ns reached (behind); "access:{ns}" the read
-//	                                 mode and level of ns's last config entry applied
-//	                                 (narrowedBy)
+//	                                 mode and level of ns's last config entry applied, kept by a
+//	                                 rebuild (narrowedBy)
 //	nodes(href, name, kind, item, item_head, title, state, …, born, epoch)
 //	                                 one row per node (explicit, or implicit from $parents);
 //	                                 raw parents/$access kept to rebuild the graph on start;
@@ -76,9 +76,11 @@ var migrations embed.FS
 // the edge grants' tables, svcedge.Store's, and a hook's, which its
 // Rebuild recomputes), in one transaction. checkpoints_bootstrap too: a
 // snapshot left part-way would otherwise be resumed, not replayed from its
-// first page.
+// first page. Meta "access:{ns}" stays too, as cdn_repurge does: it is
+// the read mode and level listings were last served under, so a replay
+// that ends narrower purges what CDNs may hold of them (narrowedBy).
 var resetStmts = []string{
-	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM meta`,
+	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM meta WHERE k NOT LIKE 'access:%'`,
 	`DELETE FROM nodes`, `DELETE FROM edges`, `DELETE FROM items`,
 	`DELETE FROM self_parents`, `DELETE FROM explicit_gone`, derived.CacheResetStmts[0], derived.CacheResetStmts[1],
 }
