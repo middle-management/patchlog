@@ -2,6 +2,7 @@ package bundle_test
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,23 +31,13 @@ func kn(t *testing.T, inner func(http.Handler, *client.Client) http.Handler) fun
 			h.ServeHTTP(rec, r)
 			body := rec.Body.Bytes()
 			if rec.Code == 200 && rec.Header().Get("Content-Type") == seal.ContentType {
-				hd, err := seal.ParseHeader(string(body))
+				jwe, err := resealKn(c, string(body))
 				if err != nil {
-					t.Fatal(err)
-				}
-				ns, _, _ := seal.ParseKid(hd.Kid)
-				es, err := c.FetchKeys(ctx, ns, []int{1}, nil)
-				if err != nil || len(es) == 0 {
-					t.Fatalf("keys %v %v", es, err)
-				}
-				_, pt, err := seal.Open(string(body), es[0].Key)
-				if err != nil {
-					t.Fatal(err)
-				}
-				k, _ := seal.NamespaceKey(es[0].Key, ns)
-				jwe, err := seal.Seal(k, hd.Kid, hd.PL, pt)
-				if err != nil {
-					t.Fatal(err)
+					// Not t.Fatal, off the test's goroutine: the exporter
+					// would retry the grant for ever.
+					t.Errorf("resealing a grant under K_n: %v", err)
+					w.WriteHeader(500)
+					return
 				}
 				body = []byte(jwe)
 			}
@@ -59,6 +50,29 @@ func kn(t *testing.T, inner func(http.Handler, *client.Client) http.Handler) fun
 			w.Write(body)
 		})
 	}
+}
+
+// resealKn opens jwe, sealed under K_e of epoch 1 of its kid's namespace,
+// and seals its plaintext again under that epoch's K_n.
+func resealKn(c *client.Client, jwe string) (string, error) {
+	hd, err := seal.ParseHeader(jwe)
+	if err != nil {
+		return "", err
+	}
+	ns, _, _ := seal.ParseKid(hd.Kid)
+	es, err := c.FetchKeys(ctx, ns, []int{1}, nil)
+	if err != nil || len(es) == 0 {
+		return "", fmt.Errorf("keys %v %v", es, err)
+	}
+	_, pt, err := seal.Open(jwe, es[0].Key)
+	if err != nil {
+		return "", err
+	}
+	k, err := seal.NamespaceKey(es[0].Key, ns)
+	if err != nil {
+		return "", err
+	}
+	return seal.Seal(k, hd.Kid, hd.PL, pt)
 }
 
 // KEYS-4 (§E.2.2, TOOLS §G.4.2): a sealed namespace's grants are sealed
