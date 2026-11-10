@@ -9,11 +9,16 @@ package vectors_test
 
 import (
 	"bytes"
+	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -23,14 +28,17 @@ import (
 
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/files"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/merge"
 	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/vectors/golden"
+	"github.com/middle-management/patchlog/internal/verify"
 )
 
 // proposedFile is testdata/proposed.json.
@@ -517,5 +525,384 @@ func TestV081ProposedBiscuitRefusals(t *testing.T) {
 		case st != want:
 			t.Errorf("%s: refused at %s (%v), pinned at %s", tk.Name, st, err, want)
 		}
+	}
+}
+
+// p5Plaintext is the plaintext a P.5 row names: one of its entries, or a
+// range of them.
+func p5Plaintext(t *testing.T, pts map[string]string, name string) string {
+	t.Helper()
+	switch name = strings.Trim(name, "`"); name {
+	case "[nsentry₁,nsentry₂]":
+		return "[" + pts["nsentry₁"] + "," + pts["nsentry₂"] + "]"
+	case "[]":
+		return "[]"
+	}
+	if pt, ok := pts[name]; ok {
+		return pt
+	}
+	t.Fatalf("no plaintext %q", name)
+	return ""
+}
+
+// P.5 (§E.2.2), keys and bytes: each row's plaintext sealed with I.7's
+// K_e under the K_r or K_n the reference derives (seal.ResourceKey,
+// seal.NamespaceKey), with the pl its production constructor gives
+// (seal.ResourcePL, ResourceEventPL, NamespaceDocPL, RangePL), kid demo#3
+// and the IV c0 … cb, through seal.SealWithIV, unpadded and padded
+// (seal.Pad, as SealPadded pads); the two JWEs given in full; and the
+// resource log range's array. The plaintexts are the candidate's: no
+// deployment writes them as given (TestV081ProposedSealedServed).
+func TestV081ProposedSealedPayloads(t *testing.T) {
+	t.Parallel()
+	p := loadProposed(t).P5
+	kr, err := seal.ResourceKey(seq(0x00), "demo", "derby")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kn, err := seal.NamespaceKey(seq(0x00), "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The ids the plaintexts carry recompute (§3.3, §3.5).
+	for _, c := range []struct{ name, parent, id string }{{"nsentry₁", "", nsID1}, {"nsentry₂", nsID1, nsID2}} {
+		e, err := client.ParseNSEntry(jsonv.MustParse([]byte(p.Plaintexts[c.name])))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := verify.NSEntryID(c.parent, e); err != nil || got != c.id || e.ID != c.id || e.Prev != c.parent {
+			t.Errorf("%s rehashes to %s %v, want %s", c.name, got, err, c.id)
+		}
+	}
+	pls := []seal.PL{
+		seal.ResourcePL("demo", "derby", idG, "rev"),
+		seal.ResourcePL("demo", "derby", idC, "rev"),
+		seal.ResourcePL("demo", "derby", idT, "tombstone"),
+		seal.ResourceEventPL("demo", "derby", "purge"),
+		seal.ResourceEventPL("demo", "derby", "prune"),
+		seal.NamespaceDocPL("demo", nsID1),
+		seal.RangePL("demo", "", nsID2),
+		seal.RangePL("demo", nsID2, nsID2),
+		seal.RangePL("demo", nsID1, nsID2),
+	}
+	if len(p.Rows) != len(pls) {
+		t.Fatalf("%d rows in proposed.json, want %d", len(p.Rows), len(pls))
+	}
+	tag := func(jwe string) string { return jwe[strings.LastIndexByte(jwe, '.')+1:] }
+	jwes := make([]string, len(pls))
+	for i, r := range p.Rows {
+		if got := string(jsonv.Canonical(jsonv.FromGo(map[string]any(pls[i])))); got != r.PL {
+			t.Errorf("%s: pl %s, want %s", r.Payload, got, r.PL)
+		}
+		key := map[string][]byte{"K_r": kr, "K_n": kn}[r.Key]
+		pt := []byte(p5Plaintext(t, p.Plaintexts, r.Plaintext))
+		if !bytes.Equal(jsonv.Canonical(jsonv.MustParse(pt)), pt) {
+			t.Errorf("%s: the plaintext isn't canonical JSON", r.Payload)
+		}
+		jwe, err := seal.SealWithIV(key, p.Kid, pls[i], pt, fixedIV)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jwes[i] = jwe
+		padded, err := seal.SealWithIV(key, p.Kid, pls[i], seal.Pad(pt), fixedIV)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tag(jwe) != r.Tag || tag(padded) != r.PaddedTag {
+			t.Errorf("%s: tags %s and %s padded, want %s and %s", r.Payload, tag(jwe), tag(padded), r.Tag, r.PaddedTag)
+		}
+	}
+	if jwes[0] != p.First {
+		t.Errorf("the first JWE is\n%s\nwant\n%s", jwes[0], p.First)
+	}
+	if jwes[len(jwes)-1] != p.Last {
+		t.Errorf("the last JWE is\n%s\nwant\n%s", jwes[len(jwes)-1], p.Last)
+	}
+	arr := jsonv.Canonical([]any{jwes[0], jwes[1]})
+	if len(arr) != p.LogRange || sha256Hex(arr) != p.LogRangeSum {
+		t.Errorf("the resource log range: %d bytes, sha-256 %s; want %d, %s", len(arr), sha256Hex(arr), p.LogRange, p.LogRangeSum)
+	}
+}
+
+// TestV081ProposedSealedServed (P.5, §E.2.2, §7.1, §7.3, §7.4), forms: a
+// sealed deployment's demo at epoch 3, with ops-2026 the root key of I.14
+// (P.5's nsdoc as the namespace document), where user:bob writes g, c
+// under a grant delegated to svc:translator, the tombstone, a prune at c
+// and a purge. Each JWE served is opened with seal directly under the K_r
+// or K_n derived from the epoch key /keys gives, and its plaintext
+// compared with P.5's: the namespace document byte for byte; entries and
+// events member for member, canonical, with parent "" at genesis, prev ""
+// first, via on c, ranges the arrays of their entries ([] for an empty
+// page) and an event its one entry. Ids, grant ids and times are the
+// deployment's: P.5's entries can't be written as given (questions: g is
+// written under I.4's grant, whose can lacks create; nsentry₁'s target is
+// I.2's g, not the namespace document's id).
+func TestV081ProposedSealedServed(t *testing.T) {
+	t.Parallel()
+	p := loadProposed(t).P5
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks})
+	root := clienttest.Key{Kid: "ops-2026", Pub: "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg", Priv: ed25519.NewKeyFromSeed(seq(0x00))}
+	nsdoc := jsonv.MustParse([]byte(p.Plaintexts["nsdoc"])).(map[string]any)
+	if _, err := s.Client(t, client.WithBearer(s.OperatorGrant(t, "demo"))).CreateNamespace(ctx, "demo", nsdoc); err != nil {
+		t.Fatal(err)
+	}
+	bob := root.Grant(t, s.Now(), "user:bob", []string{"demo"}, []string{"read", "create", "append", "delete", "prune", "purge"},
+		map[string]any{"exp": "2026-10-05T00:00:00Z"})
+	bc := s.Client(t, client.WithBearer(bob), client.WithKeys(client.NewKeys(nil)))
+	g, err := bc.Create(ctx, "demo", "derby", []byte(`[{"op":"add","path":"","value":{"title":"Hello","views":0}},{"op":"add","path":"/$nonce","value":"`+seal.NewNonce()+`"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dg, err := grant.Decode(bob, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	via, err := dg.Narrow(map[string]any{"via": "svc:translator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Clock.Advance(5 * time.Minute)
+	c, err := s.Client(t, client.WithBearer(via.Encode()), client.WithKeys(client.NewKeys(nil))).Append(ctx, "demo", "derby", g.ID,
+		[]byte(`[{"op":"replace","path":"/views","value":1},{"op":"add","path":"/$nonce","value":"`+seal.NewNonce()+`"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Clock.Advance(5 * time.Minute)
+	tomb, err := bc.Delete(ctx, "demo", "derby", c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := bc.FetchKeys(ctx, "demo", []int{3}, nil)
+	if err != nil || len(got) != 1 || got[0].Key == nil {
+		t.Fatalf("demo#3: %+v %v", got, err)
+	}
+	ke := got[0].Key
+	kr, _ := seal.ResourceKey(ke, "demo", "derby")
+	kn, _ := seal.NamespaceKey(ke, "demo")
+	get := func(path string) []byte {
+		t.Helper()
+		rq, _ := http.NewRequestWithContext(ctx, "GET", s.URL+path, nil)
+		rq.Header.Set("Authorization", "Bearer "+bob)
+		r, err := http.DefaultClient.Do(rq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		b, _ := io.ReadAll(r.Body)
+		if r.StatusCode != 200 {
+			t.Fatalf("GET %s: %d %s", path, r.StatusCode, b)
+		}
+		return b
+	}
+	// stream opens the SSE stream at path after since; next reads its
+	// events in turn.
+	stream := func(path, since string) (next func() (id, data string)) {
+		t.Helper()
+		ectx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		t.Cleanup(cancel)
+		rq, _ := http.NewRequestWithContext(ectx, "GET", s.URL+path+"?since="+since, nil)
+		rq.Header.Set("Authorization", "Bearer "+bob)
+		rq.Header.Set("Accept", "text/event-stream")
+		r, err := http.DefaultClient.Do(rq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { r.Body.Close() })
+		if r.StatusCode != 200 {
+			b, _ := io.ReadAll(r.Body)
+			t.Fatalf("GET %s: %d %s", path, r.StatusCode, b)
+		}
+		var acc string
+		return func() (id, data string) {
+			t.Helper()
+			var buf [1 << 16]byte
+			for {
+				if i := strings.Index(acc, "\n\n"); i >= 0 {
+					ev := acc[:i]
+					acc = acc[i+2:]
+					for _, l := range strings.Split(ev, "\n") {
+						if v, ok := strings.CutPrefix(l, "id: "); ok {
+							id = v
+						} else if v, ok := strings.CutPrefix(l, "data: "); ok {
+							data += v
+						}
+					}
+					if data != "" {
+						return id, data
+					}
+					continue
+				}
+				n, err := r.Body.Read(buf[:])
+				acc += string(buf[:n])
+				if err != nil && n == 0 {
+					t.Fatalf("GET %s: %v", path, err)
+				}
+			}
+		}
+	}
+	// open opens jwe under want and checks it opens under no other of the
+	// keys; it returns the plaintext.
+	open := func(what, jwe string, want []byte, pl seal.PL) []byte {
+		t.Helper()
+		pt, err := seal.OpenExpect(jwe, want, "demo#3", pl)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		for _, k := range [][]byte{ke, kr, kn} {
+			if !bytes.Equal(k, want) {
+				if _, err := seal.OpenExpect(jwe, k, "demo#3", pl); err == nil {
+					t.Errorf("%s opens under another key", what)
+				}
+			}
+		}
+		if !bytes.Equal(jsonv.Canonical(jsonv.MustParse(pt)), pt) {
+			t.Errorf("%s: the plaintext isn't canonical JSON: %s", what, pt)
+		}
+		return pt
+	}
+	members := func(v any) string {
+		var ks []string
+		for k := range v.(map[string]any) {
+			ks = append(ks, k)
+		}
+		slices.Sort(ks)
+		return strings.Join(ks, ",")
+	}
+	// like compares the served entry with P.5's: the same members, with
+	// the values P.5 fixes that the deployment shares: by user:bob, under
+	// a grant of ops-2026, unless the operator wrote it (op).
+	like := func(what string, served []byte, want string, op bool) map[string]any {
+		t.Helper()
+		sv := jsonv.MustParse(served).(map[string]any)
+		wv := jsonv.MustParse([]byte(p.Plaintexts[want])).(map[string]any)
+		if members(sv) != members(wv) {
+			t.Errorf("%s has members %s, P.5's %s %s", what, members(sv), want, members(wv))
+		}
+		for _, k := range []string{"author", "kind", "resource", "via"} {
+			if !jsonv.Equal(sv[k], wv[k]) && !(op && k == "author") {
+				t.Errorf("%s: %s %v, P.5's %v", what, k, sv[k], wv[k])
+			}
+		}
+		if gr, ok := sv["grant"].(map[string]any); !ok || members(gr) != "id,kid,sub" || !op && (gr["kid"] != "ops-2026" || gr["sub"] != "user:bob") {
+			t.Errorf("%s: grant %v", what, sv["grant"])
+		}
+		if cr, _ := sv["created"].(string); len(cr) != len("2026-10-04T12:00:00.000Z") || !strings.HasSuffix(cr, "Z") {
+			t.Errorf("%s: created %q", what, cr)
+		}
+		return sv
+	}
+
+	// The resource log from genesis to the tombstone: entries under K_r.
+	var log []string
+	if err := json.Unmarshal(get("/r/demo/derby/rev/"+tomb.ID+"/log"), &log); err != nil || len(log) != 3 {
+		t.Fatalf("the resource log: %v %v", log, err)
+	}
+	for i, c := range []struct {
+		want, id, kind, parent string
+	}{{"entry_g", g.ID, "rev", ""}, {"entry_c", c.ID, "rev", g.ID}, {"entry_t", tomb.ID, "tombstone", c.ID}} {
+		sv := like(c.want, open(c.want, log[i], kr, seal.ResourcePL("demo", "derby", c.id, c.kind)), c.want, false)
+		if sv["id"] != c.id || sv["parent"] != c.parent {
+			t.Errorf("%s: id %v parent %v, want %s %q", c.want, sv["id"], sv["parent"], c.id, c.parent)
+		}
+		// A sealed namespace's patch sets carry a fresh $nonce (§C.7,
+		// §E.2.5), which P.5's don't: the rest is P.5's.
+		if ps, _ := sv["patches"].([]any); c.want == "entry_g" && (len(ps) != 2 || !jsonv.Equal(ps[:1], jsonv.MustParse([]byte(patches1)))) {
+			t.Errorf("entry_g: patches %s", jsonv.Canonical(sv["patches"]))
+		}
+	}
+
+	// The namespace document under K_n, byte for byte.
+	h, err := bc.NSHead(ctx, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns, err := bc.NSLog(ctx, "demo", h.ID, "")
+	if err != nil || len(ns) == 0 || ns[0].Kind != "config" {
+		t.Fatalf("the namespace log: %+v %v", ns, err)
+	}
+	if pt := open("nsdoc", string(get("/ns/demo/rev/"+ns[0].ID)), kn, seal.NamespaceDocPL("demo", ns[0].ID)); string(pt) != p.Plaintexts["nsdoc"] {
+		t.Errorf("the namespace document is\n%s\nP.5's\n%s", pt, p.Plaintexts["nsdoc"])
+	}
+
+	// The resource's events after the tombstone: the prune's and the
+	// purge's, streamed live.
+	resEvents := stream("/r/demo/derby/events", tomb.ID)
+	s.Clock.Advance(50 * time.Minute)
+	if _, err := bc.Prune(ctx, "demo", "derby", client.PruneRequest{Horizon: c.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bc.Purge(ctx, "demo", "derby", tomb.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if h, err = bc.NSHead(ctx, "demo"); err != nil {
+		t.Fatal(err)
+	}
+	// The whole namespace log, a range from the start, under K_n.
+	var entries []any
+	pt := open("the range from the start", string(get("/ns/demo/rev/"+h.ID+"/log")), kn, seal.RangePL("demo", "", h.ID))
+	entries, _ = jsonv.MustParse(pt).([]any)
+	if len(entries) < 2 {
+		t.Fatalf("the range from the start: %s", pt)
+	}
+	first := entries[0].(map[string]any)
+	if first["prev"] != "" || first["kind"] != "config" {
+		t.Errorf("the first namespace entry: prev %v kind %v, want \"\" config", first["prev"], first["kind"])
+	}
+	like("the first namespace entry", jsonv.Canonical(first), "nsentry₁", true) // the operator created demo
+	var heads, purge, prune map[string]any
+	for _, e := range entries {
+		m := e.(map[string]any)
+		switch m["kind"] {
+		case "head":
+			if heads == nil {
+				heads = m
+			}
+		case "purge":
+			purge = m
+		case "prune":
+			prune = m
+		}
+	}
+	if heads == nil || purge == nil || prune == nil {
+		t.Fatalf("the namespace log lacks a head, prune or purge entry: %s", pt)
+	}
+	like("a head entry", jsonv.Canonical(heads), "nsentry₂", false)
+	// An empty page under K_n: [].
+	if pt := open("the empty page", string(get("/ns/demo/rev/"+h.ID+"/log?since="+h.ID)), kn, seal.RangePL("demo", h.ID, h.ID)); string(pt) != "[]" {
+		t.Errorf("the empty page: %s, want []", pt)
+	}
+	// A namespace event: its one entry, under K_n, bound as [prev, id].
+	last := entries[len(entries)-1].(map[string]any)
+	prev := last["prev"].(string)
+	id, data := stream("/ns/demo/events", prev)()
+	if id != last["id"] {
+		t.Fatalf("the event after %s is %s, want %v", prev, id, last["id"])
+	}
+	if pt := open("a namespace event", data, kn, seal.RangePL("demo", prev, id)); !bytes.Equal(pt, jsonv.Canonical(last)) {
+		t.Errorf("the namespace event is\n%s\nthe range's entry\n%s", pt, jsonv.Canonical(last))
+	}
+	// Resource events under K_r: the purge and prune entries without id
+	// and prev (§7.3).
+	for _, ev := range []struct {
+		kind string
+		e    map[string]any
+	}{{"prune", prune}, {"purge", purge}} {
+		want := map[string]any{}
+		for k, v := range ev.e {
+			if k != "id" && k != "prev" {
+				want[k] = v
+			}
+		}
+		_, data := resEvents()
+		pt := open(ev.kind+" event", data, kr, seal.ResourceEventPL("demo", "derby", ev.kind))
+		if !bytes.Equal(pt, jsonv.Canonical(want)) {
+			t.Errorf("the %s event is\n%s\nwant its entry without id and prev\n%s", ev.kind, pt, jsonv.Canonical(want))
+		}
+		like(ev.kind+" event", pt, ev.kind, false)
 	}
 }
