@@ -178,6 +178,7 @@ func serve(args []string) {
 	var remoteIDs multi
 	fs.Var(&remoteIDs, "remote-identity", "ORIGIN=FILE: X25519 private key (JWK) unwrapping the keys of sealed bases at ORIGIN, named by the -remote-bearer grant's enc (repeatable, §G.5.2)")
 	remoteFollow := fs.Duration("remote-follow-interval", 5*time.Minute, "how often remote bases' logs are followed: their purges applied and their raises of level followed (§G.3, §G.5.2); 0 disables following")
+	remoteFollowTimeout := fs.Duration("remote-follow-timeout", 10*time.Minute, "how long one remote base's step of a follow may take, after which it is given up until the next and the next base is followed")
 	remoteRegister := fs.Bool("remote-register", false, "register remote branches with their bases and renew the registrations (§G.3)")
 	masterKey := fs.String("master-key", "", "file holding the 32-byte master key of encryption at rest (Addendum E.1); mode 0600")
 	masterKeyCreate := fs.Bool("master-key-create", false, "create the -master-key file with a new random key if it doesn't exist")
@@ -213,7 +214,7 @@ func serve(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	remote.Register, remote.FollowInterval = *remoteRegister, *remoteFollow
+	remote.Register, remote.FollowInterval, remote.FollowTimeout = *remoteRegister, *remoteFollow, *remoteFollowTimeout
 	if remote.FollowInterval == 0 {
 		remote.FollowInterval = -1
 	}

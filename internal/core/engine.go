@@ -212,6 +212,13 @@ type RemoteOptions struct {
 	// RenewBefore is how long before expiry a registration is renewed.
 	// Zero means seven days.
 	RenewBefore time.Duration
+	// FollowTimeout bounds each base's step of a sync (SyncRemotes, and
+	// the first read of deeper bases as the follower starts): following
+	// its log, levels and epochs, fetching its pending sealings again, and
+	// registering. A base that doesn't answer in time is given up on until
+	// the next sync, and the next base is followed. Zero means ten
+	// minutes.
+	FollowTimeout time.Duration
 }
 
 // RemoteEndpoint is where and how a remote origin is reached.
@@ -460,6 +467,9 @@ func Open(opt Options) (*Engine, error) {
 	}
 	if e.opt.Remote.RenewBefore == 0 {
 		e.opt.Remote.RenewBefore = 7 * 24 * time.Hour
+	}
+	if e.opt.Remote.FollowTimeout <= 0 {
+		e.opt.Remote.FollowTimeout = 10 * time.Minute
 	}
 	if e.opt.BlobSweepInterval == 0 {
 		e.opt.BlobSweepInterval = 10 * time.Minute

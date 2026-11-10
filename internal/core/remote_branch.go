@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"mime"
 	"net"
 	"net/http"
@@ -192,6 +193,14 @@ func (e *Engine) endpoint(origin string) (RemoteEndpoint, error) {
 	if ep.HTTPClient == nil {
 		ep.HTTPClient = telemetry.DefaultClient
 	}
+	// No request to a remote base follows its redirects: every one carries
+	// the endpoint's grant, and the base would pick where it goes (a blind
+	// SSRF, the grant forwarded to other ports of its host). A 3xx is the
+	// base's answer, which each caller reads as such (client.New does the
+	// same for the client).
+	hc := *ep.HTTPClient
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	ep.HTTPClient = &hc
 	return ep, nil
 }
 
@@ -1068,6 +1077,12 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 	if err != nil {
 		return nil, upstreamErr("%s: %v", base.Origin, err)
 	}
+	// The source's sealings from before its raise are fetched within half
+	// of ctx's time (FollowTimeout at creation): those it doesn't serve in
+	// time are left pending, for a sync to fetch (fetchPreSealings), and
+	// the rest of the base is still mirrored.
+	psCtx, cancel := context.WithTimeout(ctx, e.opt.Remote.FollowTimeout/2)
+	defer cancel()
 	root, err := c.Root(ctx)
 	if err != nil {
 		return nil, fetchErr("GET /", err)
@@ -1233,7 +1248,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 		// And the source's sealings from before its raise, verbatim
 		// (§G.5.2 E3 sources).
 		if ch.opaque && raised {
-			if ferr := fetchPreSealings(ctx, ep, c.BaseURL(), lv.ns, name, ch, preKeys); ferr != nil {
+			if ferr := fetchPreSealings(psCtx, ep, c.BaseURL(), lv.ns, name, ch, preKeys, e.preCaps()); ferr != nil {
 				return nil, ferr
 			}
 		}
@@ -1409,8 +1424,19 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 	}
 	var m *remoteMirror
 	if !taken {
+		// Under FollowTimeout, as each base's step of a sync: a base that
+		// doesn't answer, or drips its answers, holds the request no
+		// longer, and is answered as one that doesn't answer, 502.
+		fctx, cancel := context.WithTimeout(ctx, e.opt.Remote.FollowTimeout)
 		var ferr *Error
-		if m, ferr = e.fetchRemote(ctx, cfg.Base); ferr != nil {
+		m, ferr = e.fetchRemote(fctx, cfg.Base)
+		late := fctx.Err() != nil && ctx.Err() == nil
+		cancel()
+		if ferr != nil && late && ferr.Code() != "upstream" {
+			ferr = upstreamErr("%s: no answer within %v", cfg.Base.Origin, e.opt.Remote.FollowTimeout)
+			ferr.Body["origin"] = cfg.Base.Origin
+		}
+		if ferr != nil {
 			return nil, ferr
 		}
 	}
@@ -1433,6 +1459,12 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 		return nil, err
 	}
 	if res.Status == 201 && cfg != nil {
+		// What follows the creation, reading the deeper bases and
+		// registering, has its own FollowTimeout: it never fails the
+		// creation, and a sync does what it doesn't finish.
+		actx, cancel := context.WithTimeout(ctx, e.opt.Remote.FollowTimeout)
+		defer cancel()
+		ctx = actx
 		// The deeper bases' current namespace documents, read once now, so
 		// the branch relays their keys from the start where it can read
 		// them (§G.5.2 E3 sources, chainReadable); a failure leaves them
@@ -2032,9 +2064,16 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, author int64) *Error 
 
 // purgeShadow removes the content of name from a shadow, without an entry
 // (the shadow's chain mirrors the base's). It runs whenever the remote
-// branch purges the name, so the copy never outlives the branch's purge.
+// branch purges the name, so the copy never outlives the branch's purge:
+// the source's sealings of it from before its raise the shadow stores
+// (sealed, blob_epochs) and those it lacks (remote_pending_sealings, with
+// their pl, horizon and digests of the content) go too, whatever is left
+// of the resource.
 func (t *tx) purgeShadow(sh *nsRow, name string) {
 	t.lockNS(sh.id, lockExclusive)
+	t.deleteSealed(`ns = ? AND name = ?`, sh.id, name)
+	t.deleteBlobEpochs(`ns = ? AND name = ?`, sh.id, name)
+	t.deletePendingSealings(`shadow = ? AND name = ?`, sh.id, name)
 	r := t.resource(sh.id, name)
 	if r == nil || r.state == statePurged {
 		return
@@ -2055,12 +2094,14 @@ func (t *tx) purgeShadow(sh *nsRow, name string) {
 // purgeShadowNS removes all of a shadow's content (the remote branch's
 // namespace purge, §8.5), and the epoch keys of its source's epochs from
 // before a raise from sealed it fetched (MF-37): a purge destroys a
-// namespace's epoch keys (§8.5, §E.2.4).
+// namespace's epoch keys (§8.5, §E.2.4). The pending sealings of the
+// source's it lacks go too.
 func (t *tx) purgeShadowNS(sh *nsRow) {
 	t.lockNS(sh.id, lockExclusive)
 	t.deleteDEKs(`ns = ?`, sh.id)
 	t.deleteSealed(`ns = ?`, sh.id)
 	t.deleteBlobEpochs(`ns = ?`, sh.id)
+	t.deletePendingSealings(`shadow = ?`, sh.id)
 	t.deleteEpochKeys(sh.id)
 	q := `res IN (SELECT res FROM resources WHERE ns = ?)`
 	for _, s := range []string{
@@ -2368,26 +2409,70 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	// In a new order at each sync, so that the bases a late origin's
+	// skipped (below) aren't the same ones every time.
+	rand.Shuffle(len(bases), func(i, j int) { bases[i], bases[j] = bases[j], bases[i] })
+	budget := originBudget{}
 	var errs []error
 	for _, b := range bases {
 		if err := e.jobStep(ctx); err != nil {
 			errs = append(errs, err)
 			break
 		}
-		if err := e.followRemote(ctx, b); err != nil {
-			errs = append(errs, fmt.Errorf("remote branch %s: following %s/ns/%s: %w", b.branchName, b.origin, b.ns, err))
-		}
-		if !e.opt.Remote.Register {
+		if budget.spent(b.origin) {
+			// The origin's time this sync has run out: its other bases
+			// wait for the next, so that an origin that keeps them waiting
+			// costs a sync one FollowTimeout, not one per base.
+			errs = append(errs, fmt.Errorf("remote branch %s: following %s/ns/%s: skipped until the next sync, %s having run out of time", b.branchName, b.origin, b.ns, b.origin))
 			continue
 		}
-		if b.regNSID.Valid && e.now().Before(time.UnixMilli(b.regExpires.Int64).Add(-e.opt.Remote.RenewBefore)) {
-			continue
-		}
-		if err := e.RegisterRemote(ctx, b.branchName); err != nil {
-			errs = append(errs, fmt.Errorf("remote branch %s: registering with %s: %w", b.branchName, b.origin, err))
-		}
+		errs = append(errs, e.baseStep(ctx, budget, b.origin, func(ctx context.Context) error {
+			var errs []error
+			if err := e.followRemote(ctx, b); err != nil {
+				errs = append(errs, fmt.Errorf("remote branch %s: following %s/ns/%s: %w", b.branchName, b.origin, b.ns, err))
+			}
+			if !e.opt.Remote.Register {
+				return errors.Join(errs...)
+			}
+			if b.regNSID.Valid && e.now().Before(time.UnixMilli(b.regExpires.Int64).Add(-e.opt.Remote.RenewBefore)) {
+				return errors.Join(errs...)
+			}
+			if err := e.RegisterRemote(ctx, b.branchName); err != nil {
+				errs = append(errs, fmt.Errorf("remote branch %s: registering with %s: %w", b.branchName, b.origin, err))
+			}
+			return errors.Join(errs...)
+		}))
 	}
 	return errors.Join(errs...)
+}
+
+// originBudget is, for one run of a background job (SyncRemotes,
+// catchUpChainReads), the deadline of each remote origin's bases: one
+// FollowTimeout from its first base's step, shared by all of them.
+type originBudget map[string]time.Time
+
+// spent reports whether origin's time in this run has run out: its
+// remaining bases are skipped until the next.
+func (b originBudget) spent(origin string) bool {
+	dl, ok := b[origin]
+	return ok && !time.Now().Before(dl)
+}
+
+// baseStep runs f, one base's step of a background job, under its
+// origin's deadline in budget, set to FollowTimeout from now by the
+// origin's first step: the job's own context has none, nor has
+// production's HTTP client a timeout, and bases are followed one after
+// another, so an origin that doesn't answer, or answers each base just in
+// time, would otherwise hold up every base after it.
+func (e *Engine) baseStep(ctx context.Context, budget originBudget, origin string, f func(context.Context) error) error {
+	dl, ok := budget[origin]
+	if !ok {
+		dl = time.Now().Add(e.opt.Remote.FollowTimeout)
+		budget[origin] = dl
+	}
+	sctx, cancel := context.WithDeadline(ctx, dl)
+	defer cancel()
+	return f(sctx)
 }
 
 // followRemote follows a base's log after the checkpoint. On purge or
@@ -3193,15 +3278,20 @@ func (e *Engine) catchUpChainReads(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	budget := originBudget{}
 	var errs []error
 	for _, b := range due {
 		if err := e.jobStep(ctx); err != nil {
 			errs = append(errs, err)
 			break
 		}
+		if budget.spent(b.origin) {
+			errs = append(errs, fmt.Errorf("remote branch %s: reading the chain of %s/ns/%s at start: skipped, %s having run out of time", b.branchName, b.origin, b.ns, b.origin))
+			continue
+		}
 		c, ep, err := e.remoteClient(b.origin)
 		if err == nil {
-			err = e.followChainEpochs(ctx, c, ep, b)
+			err = e.baseStep(ctx, budget, b.origin, func(ctx context.Context) error { return e.followChainEpochs(ctx, c, ep, b) })
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("remote branch %s: reading the chain of %s/ns/%s at start: %w", b.branchName, b.origin, b.ns, err))
