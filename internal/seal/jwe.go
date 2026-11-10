@@ -39,9 +39,11 @@ const (
 	EncA256GCM = "A256GCM"
 	// ZipDeflate is the zip value (RFC 7516 §4.1.3) of raw DEFLATE, which
 	// bytes sealed before v0.65 carried. Sealed payloads are never
-	// compressed (§E.2.2): a header with any zip member is ErrFormat, and
-	// nothing inflates (drafts promise no compatibility with data written
-	// under an earlier draft, "Reading this spec").
+	// compressed (§E.2.2): ParseHeader still reads such a header, for the
+	// kid and pl of bytes stored once and served forever, but Open refuses
+	// it with ErrFormat, and nothing inflates (drafts promise no
+	// compatibility with data written under an earlier draft, "Reading
+	// this spec").
 	ZipDeflate = "DEF"
 
 	// DefaultMaxPlaintext bounds the plaintext of Open and OpenExpect. Use
@@ -138,7 +140,8 @@ type Header struct {
 	Alg string
 	Enc string
 	Kid string
-	// Zip is always "": a header with a zip member is ErrFormat (§E.2.2).
+	// Zip is "" or, in bytes sealed before v0.65 only, ZipDeflate. Such
+	// bytes don't open (§E.2.2): Open refuses them with ErrFormat.
 	Zip string
 	PL  PL
 	// Raw is the decoded protected header (UTF-8 JSON) as transmitted.
@@ -201,6 +204,9 @@ func seal(key []byte, kid string, pl PL, plaintext, iv []byte) (string, error) {
 
 // ParseHeader decodes and validates the protected header of a compact JWE
 // without decrypting it. The result is unauthenticated until Open succeeds.
+// A zip "DEF" header, which bytes sealed before v0.65 carry, parses with
+// Zip set, so detectors and ETags (§E.2.2: "{id}.{e}" names the stored
+// sealing's epoch) read its kid and pl; Open refuses it.
 func ParseHeader(jwe string) (*Header, error) {
 	parts := strings.Split(jwe, ".")
 	if len(parts) != 5 {
@@ -235,10 +241,13 @@ func parseHeader(seg string) (*Header, error) {
 	if _, ok := m["crit"]; ok {
 		return nil, fmt.Errorf("%w: unsupported crit", ErrFormat)
 	}
-	if _, ok := m["zip"]; ok {
-		// Sealed payloads are never compressed and carry no zip header
-		// (§E.2.2); bytes sealed so before v0.65 aren't opened.
-		return nil, fmt.Errorf("%w: zip: sealed payloads are never compressed (§E.2.2)", ErrFormat)
+	if z, ok := m["zip"]; ok {
+		// Only bytes sealed before v0.65 carry zip, always "DEF"; Open
+		// refuses them (§E.2.2).
+		if z != ZipDeflate {
+			return nil, fmt.Errorf("%w: unsupported zip", ErrFormat)
+		}
+		h.Zip = ZipDeflate
 	}
 	pl, ok := m["pl"].(map[string]any)
 	if !ok {
@@ -268,6 +277,12 @@ func OpenLimit(jwe string, key []byte, maxPlaintext int) (*Header, []byte, error
 	h, err := parseHeader(parts[0])
 	if err != nil {
 		return nil, nil, err
+	}
+	if h.Zip != "" {
+		// Sealed payloads are never compressed and carry no zip header
+		// (§E.2.2); bytes sealed so before v0.65 aren't opened, and
+		// nothing inflates.
+		return nil, nil, fmt.Errorf("%w: zip: sealed payloads are never compressed (§E.2.2)", ErrFormat)
 	}
 	iv, err1 := b64.DecodeString(parts[2])
 	ct, err2 := b64.DecodeString(parts[3])

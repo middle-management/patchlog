@@ -35,15 +35,21 @@ func TestV081LegacySnapshotPLMismatch(t *testing.T) {
 	}
 }
 
-// E2E-10: a header with a zip member doesn't parse (§E.2.2: sealed
+// E2E-10: a header with a zip member doesn't open (§E.2.2: sealed
 // payloads are never compressed), so nothing sealed with zip "DEF" before
-// v0.65 opens, a patch set included.
+// v0.65 opens, a patch set included. Its header still parses, kid and pl
+// read without a key, as detectors and the server's "{id}.{e}" ETag of the
+// stored bytes need (§E.2.2), and IsPadded is false for it.
 func TestV081ZipIsFormatError(t *testing.T) {
 	t.Parallel()
 	k := key(22)
 	jwe := handJWE(t, k, `{"alg":"dir","enc":"A256GCM","kid":"m#1","pl":{"name":"r","ns":"m","parent":""},"zip":"DEF"}`, []byte(`[{"op":"add","path":"","value":{}}]`), true)
-	if _, err := ParseHeader(jwe); !errors.Is(err, ErrFormat) {
-		t.Fatalf("ParseHeader: %v", err)
+	h, err := ParseHeader(jwe)
+	if err != nil || h.Kid != "m#1" || h.Zip != ZipDeflate || h.PL["ns"] != "m" {
+		t.Fatalf("ParseHeader: %+v %v", h, err)
+	}
+	if pt := Pad([]byte("{}")); !Padded(pt) || IsPadded(h, pt) {
+		t.Fatal("a zip header counted as padded")
 	}
 	if _, _, err := Open(jwe, k); !errors.Is(err, ErrFormat) {
 		t.Fatalf("Open: %v", err)

@@ -80,15 +80,22 @@ func TestV073SealNeverCompresses(t *testing.T) {
 	check("SealSnapshot", snap, len(jsonv.Canonical(doc)))
 }
 
-// Since v0.78 bytes sealed with zip "DEF" before v0.65 don't open: a
-// header with any zip member is ErrFormat ("Reading this spec", §E.2.2).
-// Inverted from TestV073OpenInflatesLegacyZip.
+// Since v0.78 bytes sealed with zip "DEF" before v0.65 don't open: Open
+// refuses a header with any zip member with ErrFormat ("Reading this
+// spec", §E.2.2). ParseHeader still reads a "DEF" one's kid and pl, which
+// detectors and ETags of the stored bytes need; any other zip value
+// doesn't parse. Inverted from TestV073OpenInflatesLegacyZip.
 func TestV073OpenRefusesLegacyZip(t *testing.T) {
 	k := key(10)
 	big := bytes.Repeat([]byte("abc"), 2000)
 	for _, zip := range []string{`"DEF"`, `"other"`, `""`, `null`} {
 		jwe := handJWE(t, k, `{"alg":"dir","enc":"A256GCM","kid":"m#1","pl":{"id":"1a","kind":"doc","name":"r","ns":"m"},"zip":`+zip+`}`, big, zip == `"DEF"`)
-		if _, err := ParseHeader(jwe); !errors.Is(err, ErrFormat) {
+		h, err := ParseHeader(jwe)
+		if zip == `"DEF"` {
+			if err != nil || h.Zip != ZipDeflate || h.Kid != "m#1" || h.PL["id"] != "1a" {
+				t.Fatalf("zip %s: ParseHeader %+v %v", zip, h, err)
+			}
+		} else if !errors.Is(err, ErrFormat) {
 			t.Fatalf("zip %s: ParseHeader %v", zip, err)
 		}
 		if _, _, err := Open(jwe, k); !errors.Is(err, ErrFormat) {

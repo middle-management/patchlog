@@ -613,7 +613,9 @@ func (x *E2E) writeConfig(ctx context.Context, ns string) (*e2eConfig, error) {
 // (§E.3.1), padded if the namespace pads, and returns the patch set to
 // send: [{"op":"sealed","value":"<JWE>"}]. The epoch key must be from a
 // sender the view trusts (SealKey). Keep the bytes until the write is
-// acknowledged: sealing again gives another id (§E.3.1).
+// acknowledged: sealing again gives another id (§E.3.1). A view's first
+// sealing for ns/name reads its log to count the sealings under that K_r
+// (countOnce), and one past the message bound is ErrSealBound (§E.2.1).
 func (x *E2E) SealPatches(ctx context.Context, ns, name, parent string, patches any) ([]byte, error) {
 	return x.SealPatchesBlobs(ctx, ns, name, parent, patches, nil)
 }
@@ -640,6 +642,9 @@ func (x *E2E) SealPatchesBlobs(ctx context.Context, ns, name, parent string, pat
 	}
 	kr, err := resourceKey(key, ns, name)
 	if err != nil {
+		return nil, err
+	}
+	if err := x.countOnce(ctx, ns, name); err != nil {
 		return nil, err
 	}
 	done, err := x.reserveSeal(ns, name, kid)
@@ -698,6 +703,7 @@ type e2eSeals struct {
 // resends the same ciphertext, one sealing.
 type sealCount struct {
 	head     string // the log is counted up to head; "" none of it yet
+	counted  bool   // the log was read once (countLog), or found unreadable or absent
 	partial  bool   // some of the log couldn't be counted (pruned, unreadable)
 	logged   map[string]int64
 	local    map[string]map[[32]byte]bool
@@ -742,11 +748,27 @@ func (x *E2E) sealCount(ns, name string) *sealCount {
 	return sc
 }
 
+// countOnce counts the log of ns/name (countLog) where the view hasn't
+// yet, so that a view's first sealing under a K_r, every CLI run's among
+// them, is judged against the sealings the log shows (§E.2.1), not only
+// against those this view made. A grant that can't read the log (§C.5)
+// counts what the view sealed; any other failure to read it fails the
+// sealing.
+func (x *E2E) countOnce(ctx context.Context, ns, name string) error {
+	x.seals.mu.Lock()
+	counted := x.sealCount(ns, name).counted
+	x.seals.mu.Unlock()
+	if counted {
+		return nil
+	}
+	return x.countLog(ctx, ns, name)
+}
+
 // reserveSeal counts one sealing under the K_r of name and kid before it is
 // made, refusing it with ErrSealBound where the count the view knows
-// (SealStatus) would pass the bound. It makes no request: writes of a
-// grant that can't read the log (§C.5) count what the view sealed. done
-// records the sealing made, its JWE ("" if none was made).
+// (SealStatus) would pass the bound. It makes no request: its callers count
+// the log first (countOnce). done records the sealing made, its JWE (""
+// if none was made).
 func (x *E2E) reserveSeal(ns, name, kid string) (done func(jwe string), err error) {
 	bound, _ := x.bounds()
 	x.seals.mu.Lock()
@@ -846,10 +868,13 @@ func (x *E2E) countLog(ctx context.Context, ns, name string) error {
 	case err == nil:
 	case IsNotFound(err) && since == "":
 		// No resource yet: nothing sealed under it but what the view did.
+		x.seals.mu.Lock()
+		sc.counted = true
+		x.seals.mu.Unlock()
 		return nil
 	case IsAuth(err):
 		x.seals.mu.Lock()
-		sc.partial = true
+		sc.partial, sc.counted = true, true
 		x.seals.mu.Unlock()
 		return nil
 	default:
@@ -861,6 +886,7 @@ func (x *E2E) countLog(ctx context.Context, ns, name string) error {
 		// Another count moved on meanwhile: it counted these.
 		return nil
 	}
+	sc.counted = true
 	for _, e := range es {
 		if e.Kind != "rev" || !e.HasPatches {
 			continue
@@ -1477,6 +1503,11 @@ func (x *E2E) openSealed(ctx context.Context, name string, e LogEntry, nsOK *cha
 	if err != nil {
 		return nil, "sealed patch set: " + err.Error(), "", nil
 	}
+	if h.Zip != "" {
+		// Bytes sealed before v0.65 don't open, whatever key the reader
+		// holds: flagged and folded as [] (§E.2.2, §E.3.2).
+		return nil, "sealed patch set: zip: sealed payloads are never compressed (§E.2.2)", "", nil
+	}
 	kns, _, err := seal.ParseKid(h.Kid)
 	if err != nil {
 		return nil, "sealed patch set: " + err.Error(), "", nil
@@ -1843,6 +1874,10 @@ func (x *E2E) openSnapshot(ctx context.Context, ns, name, h string, r *response,
 	if err != nil {
 		return nil, "", bad("%v", err)
 	}
+	if hd.Zip != "" {
+		// Bytes sealed before v0.65 don't open (§E.2.2), whatever key.
+		return nil, "", bad("zip: sealed payloads are never compressed (§E.2.2)")
+	}
 	kns, _, err := seal.ParseKid(hd.Kid)
 	if err != nil {
 		return nil, "", bad("kid: %v", err)
@@ -2174,6 +2209,9 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 	if err != nil {
 		return nil, err
 	}
+	if err := x.countOnce(ctx, ns, name); err != nil {
+		return nil, err
+	}
 	done, err := x.reserveSeal(ns, name, kid)
 	if err != nil {
 		return nil, err
@@ -2193,14 +2231,16 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 // tombstone, its parent, the last live revision (§7.1). The head
 // tombstone's parent is the head's last; a tombstone further down the
 // chain, as a horizon the server moves a prune to may be, is found in the
-// log, its id checked against its parent's.
+// log; the current horizon, which the log no longer lists, by the
+// not_offered of a revision above it. Every parent so learned is checked
+// against the tombstone's id (tombstoneParent).
 func (x *E2E) snapshotAt(ctx context.Context, ns, name, horizon string) (string, error) {
 	h, err := x.c.Head(ctx, ns, name)
 	if err != nil {
 		return "", err
 	}
 	if h.State == Tombstoned && h.ID == horizon {
-		return h.Last, nil
+		return tombstoneParent(ns, name, horizon, h.Last)
 	}
 	if h.State != Tombstoned && h.ID == horizon {
 		return horizon, nil
@@ -2214,17 +2254,55 @@ func (x *E2E) snapshotAt(ctx context.Context, ns, name, horizon string) (string,
 	}
 	if len(es) == 0 || es[len(es)-1].ID != horizon {
 		// The range is empty: horizon is the current horizon itself, which
-		// a prune doesn't move below; its kind is the server's to judge.
-		return horizon, nil
+		// a prune doesn't move below (a retention applied again).
+		return x.currentHorizonAt(ctx, ns, name, horizon, h)
 	}
 	e := es[len(es)-1]
 	if e.Kind != "tombstone" {
 		return horizon, nil
 	}
-	if want, err := ExpectedTombstone(e.Parent); err != nil || want != horizon {
-		return "", fmt.Errorf("client: prune of %s/%s: tombstone %s has the wrong id: %w", ns, name, horizon, seal.ErrMismatch)
+	return tombstoneParent(ns, name, horizon, e.Parent)
+}
+
+// currentHorizonAt is snapshotAt for horizon, which the log no longer
+// lists: the resource's current horizon, or so the caller supposes. A
+// live revision above it, the head or a tombstoned head's last, answers
+// /rev with 404 not_offered naming the horizon and, where that is a
+// tombstone, last, its parent (§7.1), which a tombstone's own URL, a 410,
+// doesn't. Only a not_offered naming this horizon is taken; any other
+// answer leaves horizon, whose kind is then the server's to judge.
+func (x *E2E) currentHorizonAt(ctx context.Context, ns, name, horizon string, h *Head) (string, error) {
+	probe := h.ID
+	if h.State == Tombstoned {
+		probe = h.Last
 	}
-	return e.Parent, nil
+	if probe == "" || probe == horizon || checkID("revision", probe) != nil {
+		return horizon, nil
+	}
+	r, err := x.c.do(ctx, "GET", "/r/"+ns+"/"+name+"/rev/"+probe, nil, nil)
+	if err != nil {
+		return "", err
+	}
+	if r.status == 200 {
+		return horizon, nil
+	}
+	ae := r.apiError()
+	if !IsNotOffered(ae) || ae.Horizon() != horizon || ae.Last() == "" {
+		return horizon, nil
+	}
+	return tombstoneParent(ns, name, horizon, ae.Last())
+}
+
+// tombstoneParent is parent, which a head, log entry or not_offered names
+// as tombstone horizon's parent, once horizon is checked to be the
+// tombstone on it (ExpectedTombstone, §6.2): the snapshot is sealed with
+// pl.id = parent (§E.3.1), so a server naming another revision is
+// seal.ErrMismatch, never sealed under the horizon.
+func tombstoneParent(ns, name, horizon, parent string) (string, error) {
+	if want, err := ExpectedTombstone(parent); parent == "" || err != nil || want != horizon {
+		return "", fmt.Errorf("client: prune of %s/%s: tombstone %s has the wrong id for its parent %q: %w", ns, name, horizon, parent, seal.ErrMismatch)
+	}
+	return parent, nil
 }
 
 // snapshotKid is the kid a prune's snapshot of the document d folds is
