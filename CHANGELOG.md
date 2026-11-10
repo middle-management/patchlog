@@ -11,7 +11,8 @@ reads the server never folds. `GET /` answers `"spec": "0.81"`. The upgrade was 
 packages: encryption, end-to-end and remote branches in the core; access at the origin; the
 grant checker, the tree service and the index; bundles, merges and the WebDAV gateway; the
 `seal` package and the client; and derived views with the candidate vectors. A cross-review
-then ported the playground. The schema changes are the core's migration `016_v081_encryption`,
+then ported the playground, and a last package re-seals compressed sealings and takes the
+playground's keys as the Go client does. The schema changes are the core's migration `016_v081_encryption`,
 on SQLite and Postgres, and the derived-view cache's `002_v081_view_keys` (SQLite, the cache of
 the tree service and the index). The tree service and the index have no migration. Where the
 spec leaves a question open, the reference implements the reading noted here and in
@@ -36,6 +37,9 @@ spec leaves a question open, the reference implements the reading noted here and
      they answer `410 purged`. It records what it will purge before migration 016 drops the
      marker tables; a start that fails in between leaves the record, and the next start refuses
      until one with the flag finishes the purges.
+   - Prune archives written for such namespaces hold plaintext revisions from before the raise,
+     which a restore into an e2e namespace skips and an importer refuses for an e2e target. The
+     files are the operator's and stay as they are.
 2. **Before upgrading, migrate E3 keyrings in the format before v0.63** with the v0.26.1 client's
    `patchlog e2e migrate-keyring`. This release removes that command. `/keys` relays nothing
    from a keyring that isn't of the §E.3.2 form with a fresh `$nonce` or none, so its readers

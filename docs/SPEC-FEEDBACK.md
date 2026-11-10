@@ -13,11 +13,11 @@ From implementing v0.78 to v0.81 (branch `spec-v081`; v0.79 and v0.80 change no 
 Numbered afresh; cite these as "v0.81 Open n". Each entry gives the section, what the reference
 does now (the conservative reading where it had a choice) and the question. The planner's
 questions from before the work and the implementers' and reviewers' notes are merged here, each
-case once. Notes from v0.77 that v0.78 to v0.81 leave open are carried at the end (40–72),
-rewritten to what remains where they were settled in part (40, 41, 45, 46, 54, 55, 66).
+case once. Notes from v0.77 that v0.78 to v0.81 leave open are carried at the end (40–73),
+rewritten to what remains where they were settled in part (40, 41, 45, 46, 52, 55, 56, 67).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
-72 are open: 39 from this version's work and 33 carried.
+73 are open: 39 from this version's work and 34 carried.
 
 1. **A pruned E3 source at creation** (§G.3 Creating one, §G.5.2, scenario 66). §G.3 still
    allows `410` for history A has pruned, but scenario 66 expects B to serve A's snapshot at
@@ -217,7 +217,7 @@ Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are
     plan already merging resumes under them); the client's and the gateway's handling of
     servers older than v0.56 and v0.75; and the tree's and the index's redirects of pre-v0.51
     URLs. Among them, the Go client and the playground still accept a wrapped key with the
-    pre-v0.73 `/keys` members `resource` and `suite` (`seal.ParseWrappedKey`,
+    pre-v0.63 `/keys` members `resource` and `suite` (`seal.ParseWrappedKey`,
     `internal/client/sealed.go`), a wire form no v0.81 server sends. *Question:* is deleting them
     required, should those `/keys` members be refused, or is keeping read-only compatibility
     conforming?
@@ -328,7 +328,12 @@ Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are
     force, as in v0.76. Rows from before v0.77 keep `born` epochs judged at apply time, which can
     differ from their head's. *Question:* is that "first seals"; may or must a service in that
     window answer `503 behind`; must legacy rows be re-marked?
-52. **Epochs of release previews and branch catalogs** (§B.5 Previews of a release, TOOLS §F.9,
+52. **Values whose epoch isn't known** (§E.3.1, §E.2.6; was v0.77 Open 18). §E.3.1 now says a
+    snapshot's `kid` names this namespace, and the pre-raise causes are gone, so a value never
+    names a base's epoch. The tree service still leaves out a `born` whose epoch isn't known yet
+    (while a database's head epochs are read in, 51, and for a base's op read through in a
+    preview, 53) rather than seal it under the epoch in force. *Question:* left out, or sealed?
+53. **Epochs of release previews and branch catalogs** (§B.5 Previews of a release, TOOLS §F.9,
     §E.2.5, §E.2.6, §E.3.1; was v0.77 Open 19). §E.2.5 and §E.2.6 seal a branch's entries under the
     branch's own kids and epochs, but a release preview follows a branch in place of its base, and
     the text doesn't say whose epochs judge and seal a preview's catalog listings. The reference
@@ -339,12 +344,12 @@ Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are
     branch catalog directly sees only its own log, not what it reads through from its base.
     *Question:* which namespace's epochs does a preview listing seal under; must a directly served
     branch catalog include read-through nodes?
-53. **Tree details after a redirect or a refusal** (§A.4, §B.5, §B.9, §C.4; was v0.77 Open 20). A
+54. **Tree details after a redirect or a refusal** (§A.4, §B.5, §B.9, §C.4; was v0.77 Open 20). A
     redirect keeps the legacy order cursor (`after={order}&name=…`, which names an order, not a
     resource) and drops position cursors. `POST /edge-grants` with one grant refused (`403`) and
     another's chain unreadable answers `403` (all or nothing, refusals win), not `503`/`502`.
     *Question:* confirm each.
-54. **What a give-up leaves** (§F.5 Switch, §F.6; was v0.77 Open 21). §F.6 excepts only resources
+55. **What a give-up leaves** (§F.5 Switch, §F.6; was v0.77 Open 21). §F.6 excepts only resources
     purged in the branch and the keyring at E3, so a resource purged only in the successor waits for
     a person to give it up (`LeaveOut`), as the reference already did. `Options.Resources` with
     Switch builds the gate from an extra unrestricted plan; a give-up still holds in the catch-up,
@@ -352,78 +357,78 @@ Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are
     switch; nothing records what was given up, so §F.6's superseded check can never pass for that
     branch. *Question:* should the switch's config write record the given-up resources (`"leftOut"`)
     for the janitor; is a give-up for good; is a partial replay followed by a full one allowed?
-55. **The answer for a failed read** (§H.4, §H.6; was v0.77 Open 23). A failed read fails a save
+56. **The answer for a failed read** (§H.4, §H.6; was v0.77 Open 23). A failed read fails a save
     over someone else's delete with `503` or `502`, never `409`, as settled. The reference gives
     `408`, `429` and timeouts `503` with `Retry-After`, and `5xx`, an unreachable core or a
     transport error with no answer `502`. Other reads (the key history behind `wroteAs`, `knowUser`
     in `ownLogEntry`) still swallow failures, and §H.4's Answers has no row for a gateway-side
     timeout (treated as `503`). *Question:* which of `503`/`502` does `408` get; must every read
     that decides "theirs" or "own" fail the save?
-56. **Item 2's roles and the digest** (§B.11.9 Visible, §A.4; was v0.77 Open 25). A read role
+57. **Item 2's roles and the digest** (§B.11.9 Visible, §A.4; was v0.77 Open 25). A read role
     testing `/principal/sub` never allows anything through filtered reads, as item 2 counts roles
     "only as §B.11.5 counts them", yet its rules enter the scope digest
     (`grantcheck.ReadFilter.AllowsItem`); CONFORMANCE scenario 75 depends on this. *Question:*
     intended? Do the reader's own role rules filter at all?
-57. **"Nothing promised" against invariant Valid** (§4 Valid, §6.1; was v0.77 Open 29). v0.77
+58. **"Nothing promised" against invariant Valid** (§4 Valid, §6.1; was v0.77 Open 29). v0.77
     changed only the changelog; §4 Valid still promises the same answer on re-validation. The
     reference compiles every stored schema under today's rules, and a write pinning one that no
     longer compiles is `422 invalid`. *Propose:* put the exception in the text and say what such a
     write answers (`422 invalid` or `schema_unavailable`). v0.78's "Reading this spec" now says
     drafts promise no compatibility with data written under an earlier draft, but §4 Valid's promise
     is unchanged.
-58. **A fixing grant and `/ns/{ns}/g/{gs}`** (§B.11.9 Edge grants; was v0.77 Open 30). A grant that
+59. **A fixing grant and `/ns/{ns}/g/{gs}`** (§B.11.9 Edge grants; was v0.77 Open 30). A grant that
     fixes `/resource` gets its `/r/{ns}/{name}` prefixes and no `/g/` prefix
     (`internal/core/edgegrants.go`). *Question:* may it get one too?
-59. **Malformed `{gs}` or `{at}`** (§B.11.9 URLs, §7; was v0.77 Open 31). `400 bad_input`, `all` as
+60. **Malformed `{gs}` or `{at}`** (§B.11.9 URLs, §7; was v0.77 Open 31). `400 bad_input`, `all` as
     `gs` too. *Propose:* say so.
-60. **Filtered `/heads` and `next`** (§B.11.9 /heads, §7.4; was v0.77 Open 32). `next` comes on
+61. **Filtered `/heads` and `next`** (§B.11.9 /heads, §7.4; was v0.77 Open 32). `next` comes on
     every full page, unlike unfiltered `/heads`, and the client accepts a short page with `next` (a
     bad `prefix` is a request-shape `400`, settled in v0.77). *Question:* is the divergence
     intended?
-61. **Ranges across a moving `at`, and client libraries** (§B.11.9 Log ranges, §10; was v0.77 Open
+62. **Ranges across a moving `at`, and client libraries** (§B.11.9 Log ranges, §10; was v0.77 Open
     33). The client starts again on a `302` partway through, takes `gs` and `at` from the `Location`
     path with its own query, and its `LongPoll` and `NSEvents` don't follow into a filtered log
     (`internal/client/filtered.go`). *Propose:* "a client library MUST NOT hand a filtered log to a
     caller that expects the unfiltered one"; may a client resume from `since`?
-62. **A bounded scan before `204`** (§B.11.9 Long-poll; was v0.77 Open 34). The reference scans the
+63. **A bounded scan before `204`** (§B.11.9 Long-poll; was v0.77 Open 34). The reference scans the
     whole log while nothing is visible (`internal/core/filtered_live.go`). *Question:* may a server
     answer `204` after a bounded scan, naming the newest entry scanned?
-63. **Live reads when the reader's `gs` changes** (§B.11.9 Events, Long-poll; was v0.77 Open 35).
+64. **Live reads when the reader's `gs` changes** (§B.11.9 Events, Long-poll; was v0.77 Open 35).
     The stream ends, and a long-poll is `403`, rather than keep the URL's `gs`. *Propose:* confirm.
-64. **`/resource` inside `any` or `not` beside a fixing rule** (§C.5.2, §2.1; was v0.77 Open 36).
+65. **`/resource` inside `any` or `not` beside a fixing rule** (§C.5.2, §2.1; was v0.77 Open 36).
     Read as not fixing, evaluated per fixed name, every name before the 100-prefix cap. *Propose:*
     confirm.
-65. **Other `Authorization` schemes** (§C.3, §C.5.3; was v0.77 Open 37). Any field counts as
+66. **Other `Authorization` schemes** (§C.3, §C.5.3; was v0.77 Open 37). Any field counts as
     present, `Basic …` included (`internal/edge/edge.go`). *Question:* intended?
-66. **Catalog answers** (§B.11.4, §B.9; was v0.77 Open 38). The service keeps its purge record for a
+67. **Catalog answers** (§B.11.4, §B.9; was v0.77 Open 38). The service keeps its purge record for a
     namespace the catalog no longer trusts (`internal/tree/tree.go` `forgetUntrusted`), and leaves
     "the node's parents as decided" out for an implicit placement, which has no `parents`.
     *Question:* each.
-67. **Encrypted archives** (§8.6, §G.5.1.1; was v0.77 Open 39). The per-resource archive key has no
+68. **Encrypted archives** (§8.6, §G.5.1.1; was v0.77 Open 39). The per-resource archive key has no
     export path, and E3 archives are sealed twice (`internal/core/archiveseal.go`). *Question:*
     both.
-68. **Sealed resource events** (§7.3, §E.2.2; was v0.77 Open 40). `purge` and `prune` events bind no
+69. **Sealed resource events** (§7.3, §E.2.2; was v0.77 Open 40). `purge` and `prune` events bind no
     entry in `pl` and carry no `id:`; the reference stores none (`internal/core/eventseal.go`), so
     each serve is a sealing under `K_r`, which the message bound counts. *Propose:* bind `target`,
     and say they aren't stored.
-69. **Why a resource purge purges `idx:{ns}`** (§A.1; was v0.77 Open 41). *Propose:* give the reason
+70. **Why a resource purge purges `idx:{ns}`** (§A.1; was v0.77 Open 41). *Propose:* give the reason
     (positional cursors, counts, scores), and note that a stream of purges defeats "one redirect
     suffices".
-70. **The index's range filters** (§A.4; was v0.77 Open 42). `gt`, `ge`, `lt` and `le` with a `sort`
+71. **The index's range filters** (§A.4; was v0.77 Open 42). `gt`, `ge`, `lt` and `le` with a `sort`
     mark remain the reference's own (`internal/index/query.go`). *Propose:* specify or drop them.
-71. **`scope:{digest}` in a `gs`** (§B.11.9 gs, §A.4; was v0.77 Open 43). "of §A.4's marker" is read
+72. **`scope:{digest}` in a `gs`** (§B.11.9 gs, §A.4; was v0.77 Open 43). "of §A.4's marker" is read
     as the marker digest, which covers the key's `key:` string, though `key:` is also its own
     subject; the origin and index both use it, so `gs` values changed in v0.77. *Question:* or
     did the authors mean the rules-only digest?
-72. **How many recomputes before `503 behind`** (§A.1, §B.5; was v0.77 Open 44). A tree listing or
+73. **How many recomputes before `503 behind`** (§A.1, §B.5; was v0.77 Open 44). A tree listing or
     index result that keeps losing to purges, or to a raise between reading the encryption and
     computing, is computed again up to three times, then `503 behind` with `Retry-After: 1`,
     `no-store`. *Propose:* say a service may answer `behind` after a bounded number of tries.
 
 ## Settled in v0.81
 
-v0.78 to v0.81 answer the 44 notes open from v0.77: they settle 11 whole (2, 3, 11, 15, 16, 18,
-22, 24, 26, 27, 28), 7 in part (1, 4, 8, 9, 21, 23, 38) and leave 26. What remains is rewritten
+v0.78 to v0.81 answer the 44 notes open from v0.77: they settle 10 whole (2, 3, 11, 15, 16, 22,
+24, 26, 27, 28), 8 in part (1, 4, 8, 9, 18, 21, 23, 38) and leave 26. What remains is rewritten
 above, marked "was v0.77 Open n". "n" below means v0.77 Open n. They also close questions the
 spec itself listed as open: §13's (what `/rev/{id}` serves at E3), §E.5's two (the keyring, and
 `/keys` with `/now`) and §B.12's (leaving an embargo). Where the text went against the reference,
@@ -444,10 +449,11 @@ the reference changed, in the area named:
   migration `016_v081_encryption` drops `remote_pending_sealings` and `e2e_raises`); a database
   holding a raised namespace is refused at start unless `-purge-raised-e2e` purges it (v0.81
   Open 2); and a remote branch of a raised source is `502 upstream` at creation.
-- **Encryption** (18, 26, 27): §E.3.1 now says a snapshot's `kid` names this namespace, its epoch
-  that of the newest own op, else of an earlier own snapshot, else the epoch in force. With the
-  pre-raise cases gone no value's epoch is unknown, and `PruneE2E` failing on an own op whose
-  `kid` names another namespace matches the server's `422` (18, followed). Authentication disabled
+- **Encryption** (26, 27; part of 18): §E.3.1 now says a snapshot's `kid` names this namespace,
+  its epoch that of the newest own op, else of an earlier own snapshot, else the epoch in force.
+  With the pre-raise cases gone no value names a base's epoch, and `PruneE2E` failing on an own
+  op whose `kid` names another namespace matches the server's `422` (18, followed; what remains
+  is v0.81 Open 52). Authentication disabled
   gets the current epoch only, as intended (§E.2.3 From, scenario 56; 26). The §F.3 kept bullet
   drops the undeclarable-blob clause: merge's pre-raise special case is deleted, and its check is
   kept as a defensive one (27; what remains is v0.81 Open 36).
@@ -459,7 +465,7 @@ the reference changed, in the area named:
   the caller's groups (plus its `sub` under the existing rule) and never `"partial"`, at the
   origin, the index and the tree service, and a stored `"partial"` set is `403` (v0.81 Open 25);
   a rule on `/now` never passes for a read, so its per-endpoint cases are gone (v0.81 Open 21–23).
-- **Merges** (21, 22, 28; part of 23): §F.6 excepts only resources purged in the branch and the
+- **Merges** (22, 28; part of 21 and 23): §F.6 excepts only resources purged in the branch and the
   keyring at E3, so a resource purged only in the successor is no exception (21, as the reference
   had it); a last `-` under an array widens, as merge and undo do (22); a batch of config plus
   items only for purged resources is settled as the reference counts it (`ownBatch`,

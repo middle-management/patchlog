@@ -1355,7 +1355,10 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   entry, whatever members the document has (§A.2, v0.74). Results are sealed
   whole only for a private sealed namespace read whole; a public sealed or e2e namespace's are
   JSON with each hit sealed per entry under `K_r`, and `counts` there is `400` (§E.2.6, v0.73);
-  opening the index drops results earlier releases stored sealed whole at a public URL.
+  opening the index drops results earlier releases stored sealed whole at a public URL. Since
+  v0.81 the key is a view key, `HKDF-SHA256(K_n or K_r, "patchlog-view", view)`, `view` the
+  result's request target as the redirect gave it, for the tree's and catalog's listings too
+  (derived migration `002_v081_view_keys` drops the sealed views stored before).
 - Each hit is sealed under the epoch its document's revision is served under (§E.2.6, §E.2.2,
   v0.73): the `kid` of the sealed document at E2, of the sealed op at E3. A result whose hits come from several
   epochs is sealed per entry, and `counts` over several epochs is `400`. After a restart the index
@@ -1395,7 +1398,7 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   queried namespace's rows only.
 - Any resource purge purges `idx:{ns}` (CDN, second purge, kept and stored sealed results,
   `/_refs` answers), so every cached result of the namespace goes; `idx:{ns}:counts` is gone. A
-  followed namespace that turns private, or is raised to sealed or e2e, purges `idx:{ns}` and
+  followed namespace that turns private, or is raised to sealed, purges `idx:{ns}` and
   drops its kept and stored sealed results, and each private or sealed namespace gets one such
   purge when the index first applies its document after the upgrade (§A.1, §9).
 - `GET /_refs?to=/r/logic/route-3` (v0.48) asks every namespace the index follows that the reader
@@ -2179,7 +2182,7 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -H 'Content-T
   with `"enc": { "kty": "OKP", "crv": "X25519", "x" }` gets keys HPKE-wrapped to it
   (`{ kid, name?, wrapped }`, `seal.WrapKey`, under the info `"patchlog-key-v1"` LF kid LF
   resource name, empty for `K_e`; §E.2.3, v0.63) and never raw ones; narrowing blocks can't
-  carry `enc`. Entries before v0.73 named the resource `resource` and carried `suite`; clients
+  carry `enc`. Entries before v0.63 named the resource `resource` and carried `suite`; clients
   read both forms. A grant whose read roles all have a rule on `/now` is `403` (v0.78, §C.2
   item 5).
 - **`$nonce`.** Every create, append and restore patch set must end up setting `/$nonce` to 128
@@ -2436,7 +2439,7 @@ children), a `next` sent back as `after` continues, and a malformed position or 
 this release. Every node carries `born`, the `created` of its document's first revision, sealed
 per entry with the title in sealed and end-to-end catalogs, or, where that first revision is
 served under another epoch than the head, sealed apart in place as `"born": {"sealed": JWE}`
-under that epoch's `K_r` (left out when that key can't be had), so such a listing is no longer
+under (a view key of) that epoch's `K_r` (left out when that key can't be had), so such a listing is no longer
 sealed whole (§E.2.6, v0.74; stored in `nodes.born_epoch`, tree migration 005, backfilled on
 start). At E3 that epoch is the one a prune's `snapshot` of the first revision would carry, and
 a `born` whose epoch can't be told is left out, never sealed under the head's (§E.3.1, v0.76;
