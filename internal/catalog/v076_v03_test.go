@@ -161,6 +161,11 @@ func TestV076V03EdgeGrantForAllCombinedCheckpoint(t *testing.T) {
 
 	wide := w.opsKey.Grant(t, w.s.Now(), "user:nw", []string{"cat", "matches"}, []string{"read"},
 		map[string]any{"exp": w.s.Now().Add(time.Hour).Format(time.RFC3339)})
+	// pz's follower is refused (the service's key isn't listed yet), so
+	// pz isn't waited for (§B.5 Behind) once the refusal is seen; until
+	// then listings are 503 behind it (caughtUp waits for cat and matches
+	// only).
+	waitFor(t, "pz, refused, not waited for", func() bool { return w.do("GET", "/cat/children?of=season", wide, nil).status != 503 })
 	r, cks := w.exchange(wide, nil, "")
 	if r.status != 200 || prefixes(r) != "/cat/g/all" || len(cks) != 1 {
 		t.Fatalf("a reader wide on the combined checkpoint: %d %v", r.status, r.body)
