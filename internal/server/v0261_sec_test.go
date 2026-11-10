@@ -762,10 +762,12 @@ func TestV0261FollowDeadline(t *testing.T) {
 	}
 }
 
-// C2: rows that v0.26.0 recorded 410 pruned (due 0) with any horizon A
-// named. One whose horizon isn't a revision of the chain at or after its
-// own is served 502, never with that horizon, and is asked for again
-// (pendingFixes); one whose horizon is stays 410 pruned for good.
+// C2: rows that v0.26.0 recorded 410 pruned with any horizon A named:
+// before migration 015 (due 0), or during an upgrade, settling a row this
+// version recorded (due other than updated). One whose horizon isn't a
+// revision of the chain after its own is served 502, never with that
+// horizon, and is asked for again (pendingFixes); one whose horizon is
+// stays 410 pruned for good.
 func TestV0261PreRaiseLegacyPrunedRows(t *testing.T) {
 	t.Parallel()
 	r := newV077Raised(t)
@@ -781,8 +783,14 @@ func TestV0261PreRaiseLegacyPrunedRows(t *testing.T) {
 	b := newV0261B(t, r, p.srv.URL, withFileDB(t), func(o *core.Options) { path = o.Path })
 	_, g := v0261Remote(t, b, r, "r")
 	db, pg := v0261DB(t, path)
-	for name, hz := range map[string]string{"x": strings.Repeat("A", 1<<10), "y": y2} {
-		res, err := db.Exec(`UPDATE remote_pending_sealings SET answer = 'pruned', horizon = '` + hz + `', due = 0, tries = 0 WHERE name = '` + name + `' AND kind = 'doc'`)
+	// y's as recorded before migration 015 (due 0); x's as a v0.26.0
+	// instance settles a row this version recorded during an upgrade:
+	// answer, horizon and updated, its due kept.
+	for name, set := range map[string]string{
+		"x": `horizon = '` + strings.Repeat("A", 1<<10) + `', updated = updated + 1`,
+		"y": `horizon = '` + y2 + `', due = 0, tries = 0`,
+	} {
+		res, err := db.Exec(`UPDATE remote_pending_sealings SET answer = 'pruned', ` + set + ` WHERE name = '` + name + `' AND kind = 'doc'`)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1301,4 +1309,72 @@ func TestV0261CreationNoDeadline(t *testing.T) {
 	if el >= drip {
 		t.Fatalf("creation took %v: A's drip held it past FollowTimeout", el)
 	}
+}
+
+// C2, item 3 of the review: A really prunes x past the branch's at, at a
+// revision written after it, with a snapshot (§8.6, §E.3.1). Where the
+// horizon is the child of B's head x1, A's range since x1 is served and
+// verifies: 410 pruned with A's horizon. Where a revision lies between
+// them, A's range since x1 is itself pruned, so the horizon can't be
+// verified to follow B's head: 502 upstream, as for a refusal.
+func TestV0261PreRaiseRealPrunePastAt(t *testing.T) {
+	t.Parallel()
+	for _, past := range []int{1, 2} {
+		t.Run(strconv.Itoa(past), func(t *testing.T) {
+			r := newV0261Raised(t, withArchive(t, t.TempDir()), withoutRetentionLoop)
+			xDoc := "/r/m/x/rev/" + r.x1
+			p := newV077Proxy(t, r.a, map[string]v077Answer{"GET " + xDoc: {1, http.StatusForbidden, v077Forbidden}})
+			b := newV077B(t, r, p)
+			kB, _ := v0261Remote(t, b, r, "r")
+			hz := r.x1
+			for range past {
+				hz = v0261After(t, r, "x", hz)
+			}
+			r.a.clock.Advance(10 * time.Minute) // past the retry window
+			snap, err := seal.SealSnapshot(seal.NewKey(), "m#2", "m", "x", hz, map[string]any{"v": 9.0})
+			if err != nil {
+				t.Fatal(err)
+			}
+			expect(t, r.a.prune("m", "x", map[string]any{"horizon": hz, "snapshot": snap}, r.root()), 200)
+			res := r.a.get(xDoc, r.root())
+			expectCode(t, res, 410, "pruned")
+			if res.Str("horizon") != hz {
+				t.Fatalf("A: x1's document: %s, want horizon %s", res.Body, hz)
+			}
+			p.set(nil)
+			b.clock.Advance(5 * time.Hour)
+			if err := b.e.SyncRemotes(context.Background()); err != nil {
+				t.Logf("sync: %v", err)
+			}
+			g := b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+			res = b.get("/r/r/x/rev/"+r.x1, g)
+			switch past {
+			case 1:
+				expectCode(t, res, 410, "pruned")
+				if res.Str("horizon") != hz {
+					t.Fatalf("B: %s, want horizon %s", res.Body, hz)
+				}
+			default:
+				expectCode(t, res, 502, "upstream")
+			}
+		})
+	}
+}
+
+// newV0261Raised is newV077Raised's A, x and y only, with more options for
+// A.
+func newV0261Raised(t *testing.T, opts ...envOpt) *v077Raised {
+	t.Helper()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, append([]envOpt{withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning}, opts...)...)
+	a.opPriv = aPriv
+	r := &v077Raised{a: a, kA: newKey("admin")}
+	a.mkNS("m", sealedDoc(map[string]any{"read": "grant", "keys": []any{r.kA.entry("*")}}))
+	r.root = func() string { return a.grant(r.kA, "user:root", []string{"m"}, allVerbs) }
+	r.x1 = a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})), r.root())
+	r.y1 = a.wr("m", "y", "", withNonce(addRoot(map[string]any{"v": 2.0})), r.root())
+	a.clock.Advance(time.Hour)
+	expect(t, a.patchNS("m", ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 2.0})), r.root()), 201)
+	r.raised = a.nsHead("m", r.root())
+	return r
 }

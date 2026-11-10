@@ -193,26 +193,29 @@ func (t *tx) recordPending(sh int64, name string, seq int64, s pendingSealing) {
 // pendingPruned is the horizon A named when it answered 410 pruned for the
 // sealing of kind of ref (a revision or blob id) of resource name under
 // epoch (any, for epoch < 0) that shadow sh lacks, if it did. A row this
-// version recorded pruned (due set) had its horizon checked then (prunedIn,
-// settlePending); one recorded before v0.26.1, or by a v0.26.0 instance
-// since (due 0), may hold anything A named, and counts only if its horizon
-// is a revision of the mirrored chain after the sealing's (horizonIn),
-// until a sync checks it for good (pendingFixes).
+// version recorded pruned had its horizon checked then (prunedIn,
+// settlePending), and says so with due equal to updated, which a v0.26.0
+// instance, setting answer, horizon and updated only, never leaves; any
+// other (from before v0.26.1, or by a v0.26.0 instance since, during an
+// upgrade) may hold anything A named, and counts only if its horizon is
+// a revision of the mirrored chain after the sealing's (horizonIn), until
+// a sync checks it for good (pendingFixes).
 func (t *tx) pendingPruned(sh *nsRow, kind, name, ref string, epoch int) (string, bool) {
-	q := `SELECT horizon, rev_seq, due FROM remote_pending_sealings WHERE shadow = ? AND name = ? AND kind = ? AND ref = ? AND answer = ?`
+	q := `SELECT horizon, rev_seq, due = updated FROM remote_pending_sealings WHERE shadow = ? AND name = ? AND kind = ? AND ref = ? AND answer = ?`
 	args := []any{sh.id, name, kind, ref, pendPruned}
 	if epoch >= 0 {
 		q += ` AND epoch = ?`
 		args = append(args, epoch)
 	}
 	var hz sql.NullString
-	var revSeq, due int64
-	err := t.QueryRow(q+` LIMIT 1`, args...).Scan(&hz, &revSeq, &due)
+	var revSeq int64
+	var checked bool
+	err := t.QueryRow(q+` LIMIT 1`, args...).Scan(&hz, &revSeq, &checked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false
 	}
 	t.must(err)
-	if !hz.Valid || due == 0 && !t.horizonIn(sh.id, name, hz.String, revSeq) {
+	if !hz.Valid || !checked && !t.horizonIn(sh.id, name, hz.String, revSeq) {
 		return "", false
 	}
 	return hz.String, true
@@ -389,9 +392,10 @@ func (e *Engine) retryPreSealings(ctx context.Context, ep RemoteEndpoint, baseUR
 			for _, d := range fix.dropped {
 				t.deletePendingSealings(`shadow = ? AND name = ?`, d[0], d[1])
 			}
-			key := `shadow = ? AND name = ? AND kind = ? AND ref = ? AND epoch = ? AND answer = ? AND due = 0`
+			key := `shadow = ? AND name = ? AND kind = ? AND ref = ? AND epoch = ? AND answer = ? AND due <> updated`
 			for _, k := range fix.confirm {
-				_, err := t.Exec(`UPDATE remote_pending_sealings SET due = ? WHERE `+key, append([]any{t.now.UnixMilli()}, append(k[:], pendPruned)...)...)
+				_, err := t.Exec(`UPDATE remote_pending_sealings SET due = ?, updated = ? WHERE `+key,
+					append([]any{t.now.UnixMilli(), t.now.UnixMilli()}, append(k[:], pendPruned)...)...)
 				t.must(err)
 			}
 			for _, k := range fix.demote {
@@ -544,7 +548,8 @@ func (t *tx) chainTo(seq int64) []string {
 // pendingFixes are changes to rows of remote_pending_sealings that
 // pendingRows finds, which retryPreSealings writes: the resources whose
 // rows to drop, theirs being purged or gone (shadow, name), and the rows
-// recorded 410 pruned before v0.26.1 (due 0), whose horizon is kept for
+// recorded 410 pruned but not by this version (due other than updated,
+// pendingPruned), whose horizon is kept for
 // good where it is in the chain (confirm) and is otherwise a refusal,
 // asked again (demote), each by its key (shadow, name, kind, ref, epoch).
 type pendingFixes struct {
@@ -568,7 +573,7 @@ func (t *tx) pendingRows(sh *nsRow, limit int, fix *pendingFixes) []*pendingRow 
 			rv.seq IS NOT NULL AND (rv.parent_seq IS NULL OR pv.seq IS NOT NULL), pv.id
 		FROM remote_pending_sealings p LEFT JOIN resources r ON r.ns = p.shadow AND r.name = p.name
 		LEFT JOIN revisions rv ON rv.seq = p.rev_seq LEFT JOIN revisions pv ON pv.seq = rv.parent_seq
-		WHERE p.shadow = ? AND (p.answer <> ? AND p.due <= ? OR p.answer = ? AND p.due = 0)
+		WHERE p.shadow = ? AND (p.answer <> ? AND p.due <= ? OR p.answer = ? AND p.due <> p.updated)
 		ORDER BY p.due, p.name, p.rev_seq, p.kind, p.ref, p.epoch`,
 		statePurged, sh.id, pendPruned, t.now.UnixMilli(), pendPruned)
 	t.must(err)
@@ -678,8 +683,12 @@ func (t *tx) settlePending(r *pendingRow) {
 			hz = r.fetchHorizon
 		}
 		tries := r.tries + 1
+		due := t.now.Add(pendingBackoff(tries))
+		if ans == pendPruned {
+			due = t.now // final, and checked: due = updated (pendingPruned)
+		}
 		_, err := t.Exec(`UPDATE remote_pending_sealings SET answer = ?, horizon = ?, updated = ?, tries = ?, due = ? WHERE `+where,
-			append([]any{ans, hz, t.now.UnixMilli(), tries, t.now.Add(pendingBackoff(tries)).UnixMilli()}, args...)...)
+			append([]any{ans, hz, t.now.UnixMilli(), tries, due.UnixMilli()}, args...)...)
 		t.must(err)
 		return
 	}
