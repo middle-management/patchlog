@@ -774,6 +774,12 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// bootstrapped) has no document to read, and keeps it; a sealed one
 	// purged since the listing was read, whose document is 410 too, is
 	// forgotten (unknown: no catalog, which shows least).
+	//
+	// The document also decides, as a config entry's would, whether the
+	// snapshot narrows ns against what ns_conf records (none after a
+	// rebuild: public and unsealed, as narrowed has it), which purges
+	// idx:{ns} (§9, §A.1): a namespace made private while the index was
+	// down or behind leaves no public result kept or cached.
 	var snapDoc *client.NSDoc
 	forgetTrust := false
 	if b.Replaces() && !config && !co.PurgedNS {
@@ -803,14 +809,6 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		// first); a purge-ns drops everything (Coalesce keeps only the
 		// changes after it).
 		if err := ix.dropNS(ctx, tx, b.NS); err != nil {
-			return err
-		}
-	}
-	if snapDoc != nil {
-		if err := recordTrust(ctx, tx, b.NS, snapDoc.Value); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO ns_config_revs (ns, config) VALUES (?, ?)`, b.NS, snapDoc.Config); err != nil {
 			return err
 		}
 	}
@@ -851,7 +849,11 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// or raising it to sealed or e2e: results computed before it, public
 	// or in the clear, must go. Kept results, stored sealed ones (in this
 	// transaction) and /_refs answers go by the same tags.
-	narrowed, err := ix.narrowed(ctx, tx, "ns_conf", b.NS, configDocs(b))
+	docs := configDocs(b)
+	if snapDoc != nil {
+		docs = append(docs, snapDoc)
+	}
+	narrowed, err := ix.narrowed(ctx, tx, "ns_conf", b.NS, docs)
 	if err != nil {
 		return err
 	}
@@ -876,7 +878,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	if config {
+	if config || snapDoc != nil {
 		// Keys, revocations or the read mode may have changed: the grant
 		// checker reads the namespace's document again before anything
 		// is purged or the checkpoint published. Told later, it would
@@ -884,15 +886,17 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		// CheckerTTL), a namespace made private still public there, and a
 		// result computed at the new checkpoint after the purge would be
 		// kept and served in the public URL space (answer re-checks the
-		// read once gen is taken, accessChanged).
+		// read once gen is taken, accessChanged). So may a snapshot's.
 		ix.checker.Observe(b.NS, b.NewCheckpoint)
 	}
 	ix.purgeStored(ctx, b.NS, tags, co.PurgedNS)
 	if b.Partial() {
 		// A page of a snapshot later pages complete: the index doesn't
 		// reflect the namespace as of b.NewCheckpoint yet, so the
-		// checkpoint isn't published (and nothing is purged: a snapshot
-		// has no purges, Coalesce marks none in synthetic units).
+		// checkpoint isn't published. A snapshot has no resource purges
+		// (Coalesce marks none in synthetic units), but its first page
+		// may narrow (snapDoc): what that purges goes now, as below.
+		ix.purgeKept(b.NS, tags)
 		if ix.opt.OnApply != nil {
 			ix.opt.OnApply(b)
 		}

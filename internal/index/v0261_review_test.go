@@ -4,6 +4,7 @@ package index_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -92,6 +93,51 @@ func TestV0261WidenPending503(t *testing.T) {
 	x.caughtUp("pr")
 	if r := x.raw("/pr?limit=7", ""); r.status != 302 {
 		t.Errorf("anonymous /pr once the widening is applied: %d %v", r.status, r.body)
+	}
+}
+
+// TestV0261SnapshotRebuildNoNarrowPurge (gap 2): the index serves
+// pr, public, and its anonymous result is handed out with public immutable
+// caching, tagged idx:pr. While the index is down pr is made private; the
+// index is rebuilt. Replayed from the log (the default), the narrowing is
+// applied again and purges idx:pr (§A.1). Bootstrapped from a snapshot
+// (follow.WithSnapshot, an Options.FollowOptions a library user may pass),
+// no config entry is applied, ns_conf is empty, and idx:pr is never
+// purged: the CDN keeps serving the public copies.
+func TestV0261SnapshotRebuildNoNarrowPurge(t *testing.T) {
+	for _, snapshot := range []bool{false, true} {
+		t.Run(fmt.Sprintf("snapshot=%v", snapshot), func(t *testing.T) {
+			ctx := context.Background()
+			s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+			k := clienttest.NewKey("k")
+			must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "pr"))).CreateNamespace(ctx, "pr", map[string]any{"read": "public", "keys": []any{k.Entry("*")}}))
+			w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"pr"}, []string{"read", "create", "config"})))
+			must(w.CreateDoc(ctx, "pr", "a", map[string]any{"title": "public then"}))
+			ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", []string{"pr"}, []string{"read"})))
+			db := filepath.Join(t.TempDir(), "i.db")
+			x1 := startSvc(t, ic, svcOpts{db: db, ns: []string{"pr"}, untyped: true, now: s.Now})
+			x1.caughtUp("pr")
+			p := x1.raw("/pr?limit=5", "")
+			f := x1.raw(p.header.Get("Location"), "")
+			if f.status != 200 || !strings.Contains(f.header.Get("Cache-Control"), "public") || !strings.Contains(f.header.Get("Cache-Tag"), "idx:pr") {
+				t.Fatalf("public result: %d %q %q", f.status, f.header.Get("Cache-Control"), f.header.Get("Cache-Tag"))
+			}
+			x1.stop()
+			must(w.PatchConfig(ctx, "pr", must(w.NSHead(ctx, "pr")).Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
+			x2 := startSvcWith(t, ic, svcOpts{db: db, ns: []string{"pr"}, untyped: true, rebuild: true, now: s.Now},
+				func(o *indexOpts) {
+					if snapshot {
+						o.FollowOptions = append(o.FollowOptions, follow.WithSnapshot())
+					}
+				})
+			x2.caughtUp("pr")
+			x2.appliedUpTo(must(w.NSHead(ctx, "pr")).ID)
+			got := x2.purgesSoFar()
+			t.Logf("purges after the rebuild: %s", got)
+			if !strings.Contains(got, "idx:pr") {
+				t.Errorf("pr made private while the index was down, rebuilt (snapshot=%v): idx:pr never purged (%s); the CDN's public copies of %s stay", snapshot, got, p.header.Get("Location"))
+			}
+		})
 	}
 }
 
