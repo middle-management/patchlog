@@ -5,6 +5,7 @@ import (
 	"crypto/ecdh"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"net/http"
 	"net/http/httptest"
@@ -374,7 +375,8 @@ func TestSelfTestFixture(t *testing.T) {
 	if pt, err := seal.OpenExpect(f.JWE.JWE, unb64(t, f.JWE.Key), f.JWE.Kid, seal.PL(f.JWE.PL)); err != nil || string(pt) != f.JWE.Plaintext {
 		t.Fatalf("jwe: %v", err)
 	}
-	if pt, err := seal.OpenExpect(f.JWEZip.JWE, unb64(t, f.JWEZip.Key), f.JWEZip.Kid, seal.PL(f.JWEZip.PL)); err != nil || string(pt) != f.JWEZip.Plaintext {
+	// Since v0.78 a JWE with zip doesn't open (§E.2.2, "Reading this spec").
+	if _, err := seal.OpenExpect(f.JWEZip.JWE, unb64(t, f.JWEZip.Key), f.JWEZip.Kid, seal.PL(f.JWEZip.PL)); !errors.Is(err, seal.ErrFormat) {
 		t.Fatalf("zip jwe: %v", err)
 	}
 	if h, pt, err := seal.Open(f.JWEPadded.JWE, unb64(t, f.JWEPadded.Key)); err != nil || !seal.IsPadded(h, pt) || strings.TrimRight(string(pt), " ") != f.JWEPadded.Plaintext {
