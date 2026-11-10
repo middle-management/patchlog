@@ -250,7 +250,7 @@ func TestV081ProposedHostnames(t *testing.T) {
 // P.3 (§G.5.1.1): a sealed bundle of I.9's two lines to the recipient
 // 20 21 … 3f, opened by seal.OpenBundle; its plaintext's digest and the
 // sealed file's, through ids.Of (I.9's header lacks created, at and docs,
-// so the bundle Reader, which needs them, isn't asked; TestI9BundleDigest).
+// and the bundle Reader refuses it; TestI9BundleDigest).
 // Its lines are reproduced under the envelope's K_b with the IV c0 … cb
 // by sealLine (seal.SealWithIV needs a kid, which bundle lines have none
 // of); every rejection row is rebuilt from it, its file hash compared, and
@@ -284,6 +284,10 @@ func TestV081ProposedSealedBundle(t *testing.T) {
 	}
 	if d := ids.Of(sealed).String(); d != p.SealedDigest {
 		t.Errorf("the sealed bytes' digest %s, want %s", d, p.SealedDigest)
+	}
+	// I.9's lines are a digest vector: no importer reads them as a bundle.
+	if d, err := readBundle(i9); err == nil {
+		t.Errorf("the bundle Reader read I.9's lines (digest %s); it needs created, at and docs", d)
 	}
 
 	lines := strings.SplitAfter(string(sealed), "\n")
@@ -418,6 +422,35 @@ func TestV081ProposedBundleVia(t *testing.T) {
 		if got, err := readBundle(c.b); err == nil {
 			t.Errorf("%s: read with digest %s, want rejected", c.what, got)
 		}
+	}
+	// The Reader recomputes the line ids; the grant line's own claims (the
+	// grant id over root, stored's grant_block canonical(root), its
+	// signature under key.pub) are a verifier's to check (§C.3.1, §G.4.1),
+	// here through grant.ParseStoredBlock, ID and SignedBy.
+	if got, err := readBundle(strings.Replace(p.Bundle, `"id":"`+idC+`"`, `"id":"`+idT+`"`, 1)); err == nil {
+		t.Errorf("c's id changed: read with digest %s, want rejected", got)
+	}
+	var gl struct {
+		Grant  string         `json:"grant"`
+		Root   map[string]any `json:"root"`
+		Stored string         `json:"stored"`
+		Key    struct{ Pub string }
+	}
+	if err := json.Unmarshal([]byte(ls[1]), &gl); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(gl.Stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sg, err := grant.ParseStoredBlock(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _ := base64.RawURLEncoding.DecodeString(gl.Key.Pub)
+	if sg.ID().String() != gl.Grant || ids.Of(jsonv.Canonical(jsonv.FromGo(gl.Root))).String() != gl.Grant ||
+		string(jsonv.Canonical(sg.Blocks[0].Raw)) != string(jsonv.Canonical(jsonv.FromGo(gl.Root))) || !sg.SignedBy(ed25519.PublicKey(pub)) {
+		t.Errorf("the grant line: stored's id %s, root's %s, signed by key.pub %v; want %s", sg.ID(), ids.Of(jsonv.Canonical(jsonv.FromGo(gl.Root))), sg.SignedBy(ed25519.PublicKey(pub)), gl.Grant)
 	}
 	plain := strings.Replace(p.PlainWithVia, `,"via":["svc:translator"]`, "", 1)
 	pb, pd := write(false)
@@ -634,9 +667,11 @@ func TestV081ProposedSealedPayloads(t *testing.T) {
 // events member for member, canonical, with parent "" at genesis, prev ""
 // first, via on c, ranges the arrays of their entries ([] for an empty
 // page) and an event its one entry. Ids, grant ids and times are the
-// deployment's: P.5's entries can't be written as given (questions: g is
-// written under I.4's grant, whose can lacks create; nsentry₁'s target is
-// I.2's g, not the namespace document's id).
+// deployment's: P.5's entries can't be written as given. Their grant is
+// I.4's, whose ns is ["matches"], not demo, and whose can lacks create
+// (checked below); a sealed namespace's patch sets carry a fresh $nonce
+// (§C.7, §E.2.5), which P.5's don't; and nsentry₁'s target is I.2's g, not
+// the revision of the namespace document.
 func TestV081ProposedSealedServed(t *testing.T) {
 	t.Parallel()
 	p := loadProposed(t).P5
@@ -653,6 +688,12 @@ func TestV081ProposedSealedServed(t *testing.T) {
 	bob := root.Grant(t, s.Now(), "user:bob", []string{"demo"}, []string{"read", "create", "append", "delete", "prune", "purge"},
 		map[string]any{"exp": "2026-10-05T00:00:00Z"})
 	bc := s.Client(t, client.WithBearer(bob), client.WithKeys(client.NewKeys(nil)))
+	// A grant with I.4's can, read and append, creates no resource.
+	i4can := root.Grant(t, s.Now(), "user:bob", []string{"demo"}, []string{"read", "append"}, map[string]any{"exp": "2026-10-05T00:00:00Z"})
+	if _, err := s.Client(t, client.WithBearer(i4can), client.WithKeys(client.NewKeys(nil))).Create(ctx, "demo", "derby",
+		[]byte(`[{"op":"add","path":"","value":{"title":"Hello","views":0}},{"op":"add","path":"/$nonce","value":"`+seal.NewNonce()+`"}]`)); !isStatus(err, 403) {
+		t.Fatalf("a genesis under a grant that can read and append: %v, want 403", err)
+	}
 	g, err := bc.Create(ctx, "demo", "derby", []byte(`[{"op":"add","path":"","value":{"title":"Hello","views":0}},{"op":"add","path":"/$nonce","value":"`+seal.NewNonce()+`"}]`))
 	if err != nil {
 		t.Fatal(err)
@@ -829,16 +870,18 @@ func TestV081ProposedSealedServed(t *testing.T) {
 		t.Errorf("the namespace document is\n%s\nP.5's\n%s", pt, p.Plaintexts["nsdoc"])
 	}
 
-	// The resource's events after the tombstone: the prune's and the
-	// purge's, streamed live.
+	// The resource's events after the tombstone, streamed live: the
+	// prune's, read before the purge, then the purge's.
 	resEvents := stream("/r/demo/derby/events", tomb.ID)
 	s.Clock.Advance(50 * time.Minute)
 	if _, err := bc.Prune(ctx, "demo", "derby", client.PruneRequest{Horizon: c.ID}); err != nil {
 		t.Fatal(err)
 	}
+	_, pruneData := resEvents()
 	if _, err := bc.Purge(ctx, "demo", "derby", tomb.ID, false); err != nil {
 		t.Fatal(err)
 	}
+	_, purgeData := resEvents()
 	if h, err = bc.NSHead(ctx, "demo"); err != nil {
 		t.Fatal(err)
 	}
@@ -854,6 +897,7 @@ func TestV081ProposedSealedServed(t *testing.T) {
 		t.Errorf("the first namespace entry: prev %v kind %v, want \"\" config", first["prev"], first["kind"])
 	}
 	like("the first namespace entry", jsonv.Canonical(first), "nsentry₁", true) // the operator created demo
+	t.Logf("the config entry's target, P.5's nsdoc's revision here: %v", first["target"])
 	var heads, purge, prune map[string]any
 	for _, e := range entries {
 		m := e.(map[string]any)
@@ -889,20 +933,25 @@ func TestV081ProposedSealedServed(t *testing.T) {
 	// Resource events under K_r: the purge and prune entries without id
 	// and prev (§7.3).
 	for _, ev := range []struct {
-		kind string
-		e    map[string]any
-	}{{"prune", prune}, {"purge", purge}} {
+		kind, data string
+		e          map[string]any
+	}{{"prune", pruneData, prune}, {"purge", purgeData, purge}} {
 		want := map[string]any{}
 		for k, v := range ev.e {
 			if k != "id" && k != "prev" {
 				want[k] = v
 			}
 		}
-		_, data := resEvents()
-		pt := open(ev.kind+" event", data, kr, seal.ResourceEventPL("demo", "derby", ev.kind))
+		pt := open(ev.kind+" event", ev.data, kr, seal.ResourceEventPL("demo", "derby", ev.kind))
 		if !bytes.Equal(pt, jsonv.Canonical(want)) {
 			t.Errorf("the %s event is\n%s\nwant its entry without id and prev\n%s", ev.kind, pt, jsonv.Canonical(want))
 		}
 		like(ev.kind+" event", pt, ev.kind, false)
 	}
+}
+
+// isStatus reports an API error with status code.
+func isStatus(err error, code int) bool {
+	var ae *client.APIError
+	return errors.As(err, &ae) && ae.Status == code
 }
