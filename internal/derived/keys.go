@@ -145,11 +145,23 @@ func (k *Keys) Info(ctx context.Context, ns string) (Info, error) {
 	if ok {
 		return in, nil
 	}
+	in, err := k.readInfo(ctx, ns)
+	if err != nil {
+		return in, err
+	}
+	k.mu.Lock()
+	k.info[ns] = in
+	k.mu.Unlock()
+	return in, nil
+}
+
+// readInfo reads ns's encryption from the namespace document at its head.
+func (k *Keys) readInfo(ctx context.Context, ns string) (Info, error) {
 	lv, err := k.c.EncryptionLevel(ctx, ns)
 	if err != nil {
 		return Info{}, err
 	}
-	in = Info{Level: lv}
+	in := Info{Level: lv}
 	if Protected(lv) {
 		h, err := k.c.NSHead(ctx, ns)
 		if err != nil {
@@ -161,9 +173,6 @@ func (k *Keys) Info(ctx context.Context, ns string) (Info, error) {
 		}
 		in = InfoOf(d.Value)
 	}
-	k.mu.Lock()
-	k.info[ns] = in
-	k.mu.Unlock()
 	return in, nil
 }
 
@@ -411,6 +420,23 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 		reason, permanent = "e2e namespace and no keyring recipient key configured", true
 	case in.Protected():
 		_, err := k.EpochKey(ctx, ns, in.Epoch)
+		if err != nil && !Retryable(err) && !client.IsPurged(err) {
+			// The epoch in names may be one a rotation has replaced
+			// since it was read (§E.2.4): Info's, read before the
+			// follower that would deliver the rotation runs, or the
+			// config entry a follower behind the head delivers. A grant
+			// without nbf gets the current epoch's key only (§E.2.3), so
+			// /keys gives none of the epoch replaced: the service isn't
+			// one that lacks the namespace's keys (§A.4, §E.2.6), and,
+			// skipped, it would stop following it, and purge its results
+			// (§A.1), for a key it needs no longer, for good where no
+			// query had fetched that key before. Judged again against
+			// the epoch current now.
+			if now, ok := k.rotatedSince(ctx, ns, in); ok {
+				in = now
+				_, err = k.EpochKey(ctx, ns, in.Epoch)
+			}
+		}
 		if client.IsPurged(err) {
 			// Its keys are destroyed with its content (§8.5): the
 			// follower learns of the purge, and nothing is left to seal.
@@ -424,6 +450,25 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 	}
 	k.setReason(ns, reason, reason != "", reason != "" && !retry)
 	return reason, permanent, retry
+}
+
+// rotatedSince reads ns's encryption anew and, where a rotation has moved
+// its epoch past in's since in was read, records it, as Info and Check
+// would have read it now, and returns it. A follower delivering a config
+// entry older than it records that one (Observe), and Recheck judges it
+// again.
+func (k *Keys) rotatedSince(ctx context.Context, ns string, in Info) (Info, bool) {
+	now, err := k.readInfo(ctx, ns)
+	if err != nil || now.Level != in.Level || now.Epoch <= in.Epoch {
+		return in, false
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if cur, ok := k.info[ns]; !ok || cur.Level != now.Level || cur.Epoch < now.Epoch {
+		k.info[ns] = now
+	}
+	k.checked[ns] = now
+	return now, true
 }
 
 // Recheck is Check for a namespace being followed, after its follower
