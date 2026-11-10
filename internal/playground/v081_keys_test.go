@@ -13,10 +13,12 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// keysHarness runs app.js's takeKeys and keyringKey with the browser
-// stubbed: each take is one /keys answer for a namespace at a level, and
-// for each ring api() answers GET /r/{ns}/keyring with
-// input.keyrings[ring.ring].
+// keysHarness runs app.js's takeKeys, keyringKey and fetchKeyFor (with
+// nsInfo) with the browser stubbed: each take is one /keys answer for a
+// namespace at a level; for each ring api() answers GET /r/{ns}/keyring
+// with input.keyrings[ring]; each fetch reads a key with GET /ns/{ns}
+// answering 403 (a grant that can't read the namespace document, §C.5)
+// and POST /ns/{ns}/keys answering the case's answer.
 const keysHarness = `
 const fs = require('fs');
 const [sealJS, inJSON] = process.argv.slice(2);
@@ -28,14 +30,18 @@ let ID = input.identity;
 const mem = { 'pl.knownKeys': input.known };
 const store = { get(k, d) { return k in mem ? mem[k] : d; }, set(k, v) { mem[k] = v; } };
 function renderKeysHeld() {}
-let ring = '';
+const $ = () => ({ value: 'bearer' });
+let nsInfoCache;
+let ring = '', answer = null;
 async function api(method, path) {
-  if (method === 'GET' && path === '/r/' + input.ns + '/keyring') return { status: 200, json: input.keyrings[ring] };
+  if (method === 'GET' && path === '/r/' + input.ns + '/keyring' && ring) return { status: 200, json: input.keyrings[ring] };
+  if (method === 'GET' && /^\/ns\/[^/]+$/.test(path)) return { status: 403, json: { code: 'forbidden' } };
+  if (method === 'POST' && /^\/ns\/[^/]+\/keys$/.test(path) && answer) return { ok: true, status: 200, json: answer };
   return { status: 404 };
 }
 FUNCTIONS
 (async () => {
-  const out = { takes: [], rings: [] };
+  const out = { takes: [], rings: [], fetches: [] };
   const held = () => [...KEYS.epoch.keys()].map((k) => k + '=' + Z.b64u(KEYS.epoch.get(k)))
     .concat([...KEYS.res.keys()].map((k) => k.replace('\n', '/') + '=' + Z.b64u(KEYS.res.get(k))));
   for (const c of input.takes) {
@@ -50,6 +56,15 @@ FUNCTIONS
     let err = '';
     try { await keyringKey(input.ns, 1); } catch (e) { err = e.message; }
     out.rings.push({ name: r, n: KEYS.epoch.size, held: held(), err });
+  }
+  ring = '';
+  for (const c of input.fetches) {
+    KEYS = { epoch: new Map(), res: new Map(), from: new Map(), pending: new Map() };
+    nsInfoCache = new Map();
+    answer = c.answer;
+    let err = '';
+    try { await fetchKeyFor(c.kid, c.resource || ''); } catch (e) { err = e.message; }
+    out.fetches.push({ name: c.name, n: KEYS.epoch.size + KEYS.res.size, held: held(), err });
   }
   process.stdout.write(JSON.stringify(out));
 })().catch((e) => { console.error(e); process.exit(1); });
@@ -66,6 +81,8 @@ FUNCTIONS
 //     and no relayed keyring entry.
 //   - The keyring opens only in the §E.3.2 form, from a known sender; one
 //     in the format before v0.63 opens nothing (client.E2E keyring).
+//   - A grant that can't read the namespace document takes keys by the
+//     level the /keys answer names, and none where nothing names one.
 func TestV081PlaygroundKeysAsClientWithNode(t *testing.T) {
 	t.Parallel()
 	node := needNode(t)
@@ -74,7 +91,7 @@ func TestV081PlaygroundKeysAsClientWithNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	var fns []string
-	for _, f := range []string{"knownKeys", "keyFrom", "holdEpoch", "holdRes", "takeKeys", "keyringKey"} {
+	for _, f := range []string{"knownKeys", "keyFrom", "holdEpoch", "holdRes", "takeKeys", "keyringKey", "nsInfo", "fetchKeyFor"} {
 		fns = append(fns, jsFunction(t, js, f))
 	}
 	_, reader, _ := seal.GenerateRecipient()
@@ -144,6 +161,22 @@ func TestV081PlaygroundKeysAsClientWithNode(t *testing.T) {
 		{"e2 wrapped, info before v0.63", "sealed", legacyInfo(sKid), ""},
 		{"e2 relayed keyring entry", "sealed", relayed, ""},
 	}
+	// A grant that can't read the namespace document learns the level
+	// from the /keys answer (§E.2.3), and takes nothing where neither
+	// names one.
+	type fetch struct {
+		Name     string         `json:"name"`
+		Kid      string         `json:"kid"`
+		Resource string         `json:"resource,omitempty"`
+		Answer   map[string]any `json:"answer"`
+		want     string
+	}
+	fetches := []fetch{
+		{"e3 relayed, level from /keys", kid, "", map[string]any{"level": "e2e", "epoch": 1, "keys": []any{relayed}}, kid + "=" + kb},
+		{"e3 raw key, level from /keys", kid, "", map[string]any{"level": "e2e", "epoch": 1, "keys": []any{raw(kid)}}, ""},
+		{"e2 K_r, level from /keys", sKid, "derby", map[string]any{"level": "sealed", "epoch": 1, "keys": []any{sResW.Value()}}, sKid + "/derby=" + b64.EncodeToString(sRes)},
+		{"no level anywhere", sKid, "", map[string]any{"keys": []any{raw(sKid)}}, ""},
+	}
 	in, _ := json.Marshal(map[string]any{
 		"identity": ident(reader),
 		"known":    []string{b64.EncodeToString(admin.PublicKey().Bytes())},
@@ -151,6 +184,7 @@ func TestV081PlaygroundKeysAsClientWithNode(t *testing.T) {
 		"ns":       e3,
 		"keyrings": map[string]any{"v2": ring.Value(), "old": legacy.Value(), "foreign": foreign.Value()},
 		"rings":    []string{"v2", "old", "foreign"},
+		"fetches":  fetches,
 	})
 	dir := t.TempDir()
 	h := filepath.Join(dir, "harness.js")
@@ -172,8 +206,8 @@ func TestV081PlaygroundKeysAsClientWithNode(t *testing.T) {
 		Held []string
 		Err  string
 	}
-	var got struct{ Takes, Rings []result }
-	if err := json.Unmarshal(b, &got); err != nil || len(got.Takes) != len(takes) || len(got.Rings) != 3 {
+	var got struct{ Takes, Rings, Fetches []result }
+	if err := json.Unmarshal(b, &got); err != nil || len(got.Takes) != len(takes) || len(got.Rings) != 3 || len(got.Fetches) != len(fetches) {
 		t.Fatalf("node output %s: %v", b, err)
 	}
 	for i, c := range takes {
@@ -196,5 +230,11 @@ func TestV081PlaygroundKeysAsClientWithNode(t *testing.T) {
 	}
 	if g := got.Rings[2]; g.N != 0 || !strings.Contains(g.Err, "doesn't know") {
 		t.Errorf("keyring from an unknown sender: %+v", g)
+	}
+	for i, c := range fetches {
+		g := got.Fetches[i]
+		if c.want != "" && (g.Err != "" || len(g.Held) != 1 || g.Held[0] != c.want) || c.want == "" && (g.N != 0 || g.Err == "") {
+			t.Errorf("%s: %+v, want %q", c.Name, g, c.want)
+		}
 	}
 }

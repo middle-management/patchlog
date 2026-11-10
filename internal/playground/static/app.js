@@ -1665,10 +1665,12 @@ async function nsInfo(ns) {
  * from, which open only with a sender this browser knows (knownKeys): a key in the clear or one wrapped without from
  * has no sender, so the server can have made it up, and E3 has no per-resource keys; those are skipped, for reads
  * too (§E.3.2, v0.78: a namespace is e2e from its creation, so no epoch of it was ever served as at E2). At E2
- * (client.Keys) raw keys and keys wrapped to the grant's enc in base mode, and no relayed keyring entry. An entry that
- * doesn't open is skipped (anyone can wrap to a thumbprint, §E.3.2), leaving the keyring. */
+ * (client.Keys) raw keys and keys wrapped to the grant's enc in base mode, and no relayed keyring entry. At a level
+ * neither the namespace document nor the answer names, nothing: the two rules don't overlap. An entry that doesn't
+ * open is skipped (anyone can wrap to a thumbprint, §E.3.2), leaving the keyring. */
 async function takeKeys(arr, level) {
   const e2e = level === 'e2e';
+  if (!e2e && level !== 'sealed') return 0;
   let n = 0;
   for (const e of arr || []) {
     if (!e || typeof e.kid !== 'string') continue;
@@ -1709,9 +1711,11 @@ async function fetchKeyFor(kid, resource) {
     const body = { epochs: [epoch] };
     if (resource && info.level !== 'e2e') body.resources = [resource];
     const r = await api('POST', `/ns/${ns}/keys`, { body, auto: true, label: 'keys' });
-    if (r.ok && r.json) await takeKeys(r.json.keys, info.level);
+    // A grant that can't read the namespace document (§C.5) learns the level from the answer (§E.2.3).
+    const level = info.level || (r.json && typeof r.json.level === 'string' ? r.json.level : '');
+    if (r.ok && r.json) await takeKeys(r.json.keys, level);
     if (KEYS.epoch.has(kid) || (resource && KEYS.res.has(kid + '\n' + resource))) return;
-    if (info.level !== 'e2e') throw new Error(`POST /ns/${ns}/keys gave no key for ${kid}${resource ? ' / ' + resource : ''} (HTTP ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''})`);
+    if (level !== 'e2e') throw new Error(`POST /ns/${ns}/keys gave no key for ${kid}${resource ? ' / ' + resource : ''} (HTTP ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''})`);
   }
   await keyringKey(ns, epoch);
 }
@@ -2396,7 +2400,7 @@ async function fetchKeysForm() {
   if (rs.length) body.resources = rs;
   const r = await api('POST', `/ns/${ns}/keys`, { body });
   if (r.ok && r.json) {
-    try { toast(`${await takeKeys(r.json.keys, (await nsInfo(ns)).level)} key(s) stored`); } catch (err) { toast(err.message); }
+    try { toast(`${await takeKeys(r.json.keys, (await nsInfo(ns)).level || r.json.level)} key(s) stored`); } catch (err) { toast(err.message); }
   }
 }
 
