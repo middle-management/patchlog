@@ -168,6 +168,19 @@ type viewer struct {
 	// noEdge keeps a listing out of shared caches whoever reads it
 	// (edgeHold).
 	noEdge bool
+	// public are the namespaces, the catalog among them, the viewer was
+	// judged by as public (readPublic): a listing whose graph is read
+	// after one of them stopped reading public is computed again
+	// (unchanged).
+	public map[string]bool
+}
+
+// judgedPublic records that ns was judged public (readPublic).
+func (v *viewer) judgedPublic(ns string) {
+	if v.public == nil {
+		v.public = map[string]bool{}
+	}
+	v.public[ns] = true
 }
 
 // wide reports whether the viewer reads the catalog and every namespace of
@@ -268,25 +281,126 @@ func (s *Service) edgeClaims(r *http.Request) *edge.Claims {
 // since it can't follow it (§B.5), isn't in the checkpoint and shows
 // nothing in listings.
 func (s *Service) publicViewer(ctx context.Context) (*viewer, error) {
-	cfg, err := s.checker.Config(ctx, s.actual(s.opt.Catalog))
-	if err != nil || cfg.Read != "public" {
+	public, err := s.readPublic(ctx, s.opt.Catalog)
+	if err != nil || !public {
 		return nil, err
 	}
 	trust, gone := s.trustList()
 	listed := s.listed()
 	v := &viewer{anon: true, catPublic: true, catAll: true, contentAll: map[string]bool{}}
+	v.judgedPublic(s.opt.Catalog)
 	for _, ns := range trust {
 		if gone[ns] {
 			v.contentAll[ns] = true
 			continue
 		}
-		if c, err := s.checker.Config(ctx, s.actual(ns)); err == nil && c.Read == "public" {
+		if public, err := s.readPublic(ctx, ns); err == nil && public {
 			v.contentAll[ns] = true
+			v.judgedPublic(ns)
 		} else if listed[ns] {
 			return nil, nil
 		}
 	}
 	return v, nil
+}
+
+// readPublic reports whether namespace ns reads public (§7, §B.11.5):
+// only if it is public as the service applied it (publicAsApplied) and
+// as the grant checker holds its document (checker.Config). Neither alone
+// decides: the checker's document may predate a config entry the service
+// applied, or be one the service hasn't applied, of a namespace public
+// at an entry and private again since; the service's applied state may
+// predate a narrowing it can't follow. So a namespace just made public
+// reads public once the service applies that, and readers with a grant
+// read it by their grant meanwhile. An error is the checker's, for a
+// document it can't read, before either is consulted.
+func (s *Service) readPublic(ctx context.Context, ns string) (bool, error) {
+	c, err := s.checker.Config(ctx, s.actual(ns))
+	if err != nil {
+		return false, err
+	}
+	return c.Read == "public" && s.publicAsApplied(ctx, ns), nil
+}
+
+// publicAsApplied reports whether ns is public as of the checkpoint the
+// service applied (Graph.appliedPublic, meta "access:{ns}") and not
+// stopped for keys it lacks or a refusal (Graph.stopped): a narrowing it
+// can't follow is never applied. A namespace with no record, held by a
+// database from before records were kept, has one made from its document
+// at the service's checkpoint (seedAccess); one it can't make counts as
+// not public.
+func (s *Service) publicAsApplied(ctx context.Context, ns string) bool {
+	s.mu.RLock()
+	_, stopped := s.g.stopped[ns]
+	public, known := s.g.appliedPublic[ns]
+	s.mu.RUnlock()
+	switch {
+	case stopped:
+		return false
+	case known:
+		return public
+	}
+	public, err := s.seedAccess(ctx, ns)
+	if err != nil {
+		s.opt.Logf("tree: the read mode of %s as applied: %v", ns, err)
+		return false
+	}
+	return public
+}
+
+// seedAccess records ns's read mode and level as of the checkpoint the
+// service holds (meta "access:{ns}", Graph.appliedPublic), where it has
+// none: from the document it keeps (the catalog's, or a content
+// namespace's with a RoleView), else the namespace document at that
+// checkpoint. A namespace it holds no checkpoint of isn't public as
+// applied. An apply that recorded meanwhile wins.
+func (s *Service) seedAccess(ctx context.Context, ns string) (bool, error) {
+	s.mu.RLock()
+	cp := s.cur[ns]
+	var doc map[string]any
+	if ns == s.opt.Catalog {
+		doc = s.g.Config
+	} else if c := s.g.Content[ns]; c != nil {
+		doc = c.Doc
+	}
+	s.mu.RUnlock()
+	if cp == "" {
+		return false, nil
+	}
+	if doc == nil {
+		d, err := s.c.NSDoc(ctx, s.actual(ns), cp)
+		if err != nil {
+			return false, err
+		}
+		doc = d.Value
+	}
+	mode, _ := doc["read"].(string)
+	public, level := mode == "public", derived.InfoOf(doc).Level
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p, known := s.g.appliedPublic[ns]; known || s.cur[ns] != cp {
+		return p && known, nil
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO NOTHING`,
+		"access:"+ns, marshal(map[string]any{"public": public, "level": level})); err != nil {
+		return false, err
+	}
+	s.g.appliedPublic[ns] = public
+	return public, nil
+}
+
+// stillPublic is errInfoChanged if a namespace v was judged public by
+// (viewer.public) no longer reads public (readPublic): a config entry
+// applied since made it private, or the service stopped following it.
+func (s *Service) stillPublic(ctx context.Context, v *viewer) error {
+	for ns := range v.public {
+		if public, err := s.readPublic(ctx, ns); err != nil || !public {
+			return errInfoChanged
+		}
+	}
+	return nil
 }
 
 // listed reports, for each content namespace the catalog trusts, whether
@@ -339,14 +453,13 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 	// In a release preview every check is on the branch read in place of
 	// a namespace: a viewer sees only branches it can read (§B.5).
 	cat := s.actual(s.opt.Catalog)
-	cfg, err := s.checker.Config(ctx, cat)
+	catPublic, err := s.readPublic(ctx, s.opt.Catalog)
 	if err != nil {
 		return nil, err
 	}
 	if token == "" {
 		return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
 	}
-	catPublic := cfg.Read == "public"
 	trust, gone := s.trustList()
 	listed := s.listed()
 	// The grant verified for the catalog, nil where a public catalog
@@ -365,6 +478,9 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 	}
 	var exp time.Time
 	v := &viewer{byGrant: true, catPublic: catPublic, contentAll: map[string]bool{}}
+	if catPublic {
+		v.judgedPublic(s.opt.Catalog)
+	}
 	if vg != nil {
 		exp = grantExp(vg, exp)
 		v.bucket, v.idExp = vg.Principal.ID+"\x00"+vg.Key.Kid, exp
@@ -385,11 +501,12 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 			continue
 		}
 		real := s.actual(ns)
-		c, err := s.checker.Config(ctx, real)
+		pub, err := s.readPublic(ctx, ns)
 		switch {
 		case err != nil:
-		case c.Read == "public":
+		case pub:
 			public[ns], unres[ns], wide[ns] = true, true, true
+			v.judgedPublic(ns)
 		default:
 			cv, err := s.verify(ctx, real, token)
 			if _, ok := chainErr(err); ok {
@@ -827,7 +944,9 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	// answers a namespace it doesn't follow (§A.4, §E.2.6). One whose keys
 	// it can't fetch for now is behind (below).
 	skipped, lacksKeys := s.keys.Skip(cat)
-	if lacksKeys {
+	if lacksKeys || s.isStopped(cat) {
+		// Stopped too: a catalog it can't follow for keys it lacks or a
+		// refusal (purgeStopped) is one it doesn't serve.
 		WriteError(w, http.StatusNotFound, "not_found", "the tree service does not serve this catalog")
 		return
 	}
@@ -1157,11 +1276,14 @@ var errCurrentKey = errors.New("the key that seals listings of the catalog")
 // (currentListing).
 var errPurgedSince = errors.New("the listing was computed before a purge of what it shows")
 
-// errInfoChanged is a listing that would be computed under the catalog's
-// encryption as read before its kept generation, which has changed since:
-// a raise to sealed or e2e purges what it narrows (§9), counted before
-// that generation, so it is errPurgedSince, computed again with what is
-// current.
+// errInfoChanged is a listing computed under the catalog's encryption, or
+// the file metadata's sealing, as read before its graph was, which has
+// changed since: a raise to sealed or e2e, or a rotation, observed before
+// the apply that moves the graph (Apply, keys.Observe); or for a viewer
+// judged public by a namespace made private since (stillPublic). It is
+// errPurgedSince, computed again with what is current: a raise purges
+// what it narrows (§9, applyLocked's ns:{ns}), but a rotation purges
+// nothing, so only reading them again tells.
 var errInfoChanged = fmt.Errorf("%w: the catalog's encryption changed", errPurgedSince)
 
 // currentListing is listing with the catalog's encryption and key as they
@@ -1192,8 +1314,9 @@ func (s *Service) currentListing(ctx context.Context, v *viewer, op string, vals
 // under: the URL and the reader's shape, since a namespace that turns
 // private moves no URL (viewer.shape). info is the catalog's encryption
 // as read before; one that has changed by the time the kept generation is
-// taken is errInfoChanged, and a listing a purge since then may have
-// changed errPurgedSince: neither is served (currentListing).
+// taken, or by the time its graph is read, is errInfoChanged, and a
+// listing a purge since then may have changed errPurgedSince: neither is
+// served, kept or judged by (currentListing).
 func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string, info derived.Info, key derived.Key) (*computed, error) {
 	if f := s.beforeListing.Load(); f != nil {
 		(*f)()
@@ -1205,12 +1328,13 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	// or e2e, a rotation), which apply observes before it purges what it
 	// narrows (§9, §A.1), would have this listing computed under what it
 	// replaced and kept, its purge counted before gen. Read again now:
-	// what changed is errInfoChanged; what changes later purges after gen
-	// (errPurgedSince). The file metadata's sealing is read after gen.
-	if now, err := s.keys.Info(ctx, cat); err != nil {
-		return nil, fmt.Errorf("%w (%s): %w", errCurrentKey, cat, err)
-	} else if now != info {
-		return nil, errInfoChanged
+	// what changed is errInfoChanged. The file metadata's sealing is read
+	// after gen. A change after this is observed before the graph moves,
+	// so both are read again once the graph is (unchanged): a rotation
+	// purges nothing, and a listing whose graph is read after one must
+	// not be served, kept or judged by under the epoch it replaced.
+	if err := s.unchanged(ctx, v, info, nil); err != nil {
+		return nil, err
 	}
 	if f := s.afterGeneration.Load(); f != nil {
 		(*f)()
@@ -1218,6 +1342,9 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	fs, err := s.fileSealing(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if f := s.afterFileSealing.Load(); f != nil {
+		(*f)()
 	}
 	if op == "lookup" && (!fs.on || info.Protected()) {
 		// Titles to look up by are a file tree's, and in the clear only
@@ -1243,6 +1370,9 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			cps, prof = s.checkpointsOf(g, curMap), s.profileOf(g)
 		})
 		if st, ok := s.sealed.Get(ctx, keyOf(at)); ok {
+			if err := s.unchanged(ctx, v, info, fs); err != nil {
+				return nil, err
+			}
 			if prof != nil && !prof.Admits(v.subjects) {
 				return refusePartial(&computed{at: at, prof: prof}), nil
 			}
@@ -1424,6 +1554,11 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				run()
 			}
 		})
+		// What it was computed under still holds as the graph was read,
+		// before anything is judged, stored, kept or served by it.
+		if err := s.unchanged(ctx, v, info, fs); err != nil {
+			return nil, err
+		}
 		if l.status == http.StatusOK && len(missing) == 0 && serr == nil && len(judged) > 0 {
 			// Recorded before the listing is stored or served; one that
 			// lost to another's computes it again (§E.2.6).
@@ -1478,14 +1613,8 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	}
 	if !keep {
 		// Neither stored nor kept: whether it may be served depends on
-		// the reader. No kept generation guards it, so the encryption is
-		// read again: a raise applied while it was computed, its graph
-		// read after the raise, is computed again under the new one.
-		if now, err := s.keys.Info(ctx, cat); err != nil {
-			return nil, fmt.Errorf("%w (%s): %w", errCurrentKey, cat, err)
-		} else if now != info {
-			return nil, errInfoChanged
-		}
+		// the reader. No kept generation guards it; the encryption was
+		// read again once its graph was (unchanged).
 		return l, nil
 	}
 	type page struct {
@@ -1531,6 +1660,23 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	l.st, l.prof = pages[0].st, prof
 	s.recordAt(l.at, cps, prof)
 	return l, nil
+}
+
+// unchanged is errInfoChanged if the catalog's encryption is no longer
+// info, what fs was read from has changed (fileSealingChanged; fs nil
+// for none yet), or a namespace v was judged public by has since been
+// made private (stillPublic), and errCurrentKey if the encryption can't
+// be read.
+func (s *Service) unchanged(ctx context.Context, v *viewer, info derived.Info, fs *fileSealing) error {
+	cat := s.opt.Catalog
+	now, err := s.keys.Info(ctx, cat)
+	if err != nil {
+		return fmt.Errorf("%w (%s): %w", errCurrentKey, cat, err)
+	}
+	if now != info || fs != nil && s.fileSealingChanged(ctx, fs) {
+		return errInfoChanged
+	}
+	return s.stillPublic(ctx, v)
 }
 
 // dropWholeViews drops the listings stored sealed whole (derived.Cache)
@@ -2040,7 +2186,7 @@ func (s *Service) sees(ctx context.Context, ns, token string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if cfg.Read == "public" {
+	if cfg.Read == "public" && s.publicAsApplied(ctx, ns) {
 		return true, nil
 	}
 	if token == "" {

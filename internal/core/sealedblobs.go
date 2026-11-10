@@ -346,7 +346,7 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			// seals one itself: 502 upstream, as for a failed fetch, or
 			// 410 pruned where its source answered that (§G.5.2 E3
 			// sources, §G.3).
-			return t.preRaiseUnfetched(sm, pendBlob, name, bid.String(), "the blob "+bid.String()+" of "+name+" under epoch "+epochText)
+			return t.preRaiseUnfetched(sm, pendBlob, name, bid.String(), ep, "the blob "+bid.String()+" of "+name+" under epoch "+epochText)
 		}
 		kns := t.kidName(sm)
 		k, err := seal.ResourceKey(t.epochKey(sm.id, ep), kns, name)

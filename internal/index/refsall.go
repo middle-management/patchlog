@@ -170,6 +170,9 @@ type refsReader struct {
 	// such a request is 401 only if its grant verifies in no namespace the
 	// service follows either (verifiesFollowed), else 403.
 	unverified bool
+	// pub are the namespaces of nss read as public, which refsAnswer
+	// checks are still public once gen is taken (stillPublic).
+	pub []string
 }
 
 // covered reports whether ns is in the combined checkpoint of a namespace
@@ -297,7 +300,9 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 		if err != nil {
 			return nil, err
 		}
-		if !a.public {
+		if a.public {
+			rd.pub = append(rd.pub, ns)
+		} else {
 			verified = true
 			// access marks it (§A.4), and refuses a namespace whose
 			// read rules refer to /now.
@@ -370,7 +375,7 @@ func (ix *Index) refsAccess(ctx context.Context, ns string, r *http.Request, g *
 		return nil, err
 	}
 	switch {
-	case err == nil && cfg.Read == "public":
+	case err == nil && ix.publicFor(ctx, ns, cfg):
 		return &access{public: true, all: true}, nil
 	case g == nil:
 		return nil, &grant.AuthError{Status: 401, Msg: "no usable grant"}
@@ -765,6 +770,17 @@ func (ix *Index) refsStored(ctx context.Context, rd *refsReader, url string) (de
 func (ix *Index) refsAnswer(ctx context.Context, rd *refsReader, rq *refsQuery, target func(string) string) (derived.Stored, string, bool, error) {
 	for try, moved := 0, 0; ; try++ {
 		gen := ix.refs.Generation(refsScope)
+		// As answer (accessChanged): a namespace read as public whose
+		// narrowing purged before gen, its read check made on what the
+		// grant checker cached before, isn't public now, and the answer
+		// would be kept and served with its hits at a URL that admits
+		// readers it no longer does. The reader is decided again by the
+		// next request (503 behind, errPurgedSince).
+		for _, ns := range rd.pub {
+			if !ix.stillPublic(ctx, ns) {
+				return derived.Stored{}, "", false, errAccessChanged
+			}
+		}
 		st, at, bound, err := ix.refsCompute(ctx, rd, rq, target)
 		if errors.Is(err, errMoved) && moved < 2 {
 			moved, try = moved+1, try-1
@@ -930,7 +946,10 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 				docs = append(docs, docHead{docid: h.docid, head: h.ID})
 			}
 		}
-		judged, err := ix.judgeEpochs(ctx, docs, info.Epoch)
+		judged, err := ix.judgeEpochsAt(ctx, ns, docs, info.Epoch)
+		if errors.Is(err, errEpochKey) {
+			return derived.Stored{}, "", false, errRefsKeys
+		}
 		if err != nil {
 			return derived.Stored{}, "", false, err
 		}

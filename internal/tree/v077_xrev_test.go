@@ -165,6 +165,9 @@ func TestV077XconfScenario116(t *testing.T) {
 	waitFor(t, "the service trusts matches again", func() bool { return p.x.s.At() != mid })
 	time.Sleep(10 * time.Millisecond)
 	p.x.caughtUp("cat", "matches")
+	// Trusted again, matches is waited for until its follower catches up
+	// again, though the checkpoint already equals its head.
+	waitFor(t, "the service catches up with matches again", func() bool { return p.x.s.CaughtUp("matches") })
 	at := p.x.s.At()
 	r := p.do("GET", "/cat/g/all/at/"+at+"/children?of=root", "", "", cookie)
 	if r.status != 403 {

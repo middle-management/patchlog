@@ -241,8 +241,12 @@ func (c *Client) getBlobRef(ctx context.Context, ns, name string, ref any, epoch
 	delivery := epoch > 0
 	if resp.status == 302 && epoch == 0 {
 		delivery = true
+		// Only to an epoch URL of the same blob, …/e/{e} with e a positive
+		// integer: the client sends its grant there, and anything else
+		// (dot segments, a query) could point it elsewhere on the host.
 		loc := resp.header.Get("Location")
-		if !strings.HasPrefix(loc, base+"/e/") {
+		rest, ok := strings.CutPrefix(loc, base+"/e/")
+		if e, err := strconv.Atoi(rest); !ok || err != nil || e < 1 || strconv.Itoa(e) != rest {
 			return nil, fmt.Errorf("client: %s redirects to %q", path, loc)
 		}
 		if resp, err = c.do(ctx, "GET", loc, nil, nil); err != nil {

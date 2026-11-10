@@ -195,7 +195,7 @@ func (t *tx) preRaiseResJob(p *preRaise, name string, row *revRow, kind string, 
 		if kind == sealEntry {
 			what = "the log entry " + row.id.String() + " of " + name
 		}
-		panic(t.preRaiseUnfetched(m, kind, name, row.id.String(), what))
+		panic(t.preRaiseUnfetched(m, kind, name, row.id.String(), -1, what))
 	}
 	plKind := seal.KindDoc
 	if kind == sealEntry {
@@ -236,7 +236,7 @@ func (t *tx) preRaiseConfigJob(n *nsRow, raise *e2eRaise, seq int64, nsID string
 	}
 	if n.isShadow() {
 		// Never served from a shadow; were it, never sealed by B (§G.5.2).
-		panic(t.preRaiseUnfetched(n, "", "", "", "the namespace document "+nsID))
+		panic(t.preRaiseUnfetched(n, "", "", "", -1, "the namespace document "+nsID))
 	}
 	e := t.preRaiseEntryEpoch(n, raise, seq)
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.NamespaceDocPL(n.name, nsID), doc
@@ -254,7 +254,7 @@ func (t *tx) preRaiseRangeJob(n *nsRow, raise *e2eRaise, since, toID string, pla
 	}
 	if n.isShadow() {
 		// As preRaiseConfigJob.
-		panic(t.preRaiseUnfetched(n, "", "", "", "the namespace log range up to "+toID))
+		panic(t.preRaiseUnfetched(n, "", "", "", -1, "the namespace log range up to "+toID))
 	}
 	e := raise.epoch
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.RangePL(n.name, since, toID), plain()

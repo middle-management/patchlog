@@ -90,6 +90,25 @@ func (s *Service) AfterGeneration(f func()) {
 	s.afterGeneration.Store(&f)
 }
 
+// AfterFileSealing sets f to run as each listing has read its file
+// metadata's sealing, before it reads the graph (tests: a config change
+// applied meanwhile); nil unsets it.
+func (s *Service) AfterFileSealing(f func()) {
+	if f == nil {
+		s.afterFileSealing.Store(nil)
+		return
+	}
+	s.afterFileSealing.Store(&f)
+}
+
 // PurgeKept purges the catalog's kept listings that carry any of tags, as
 // an apply that purges them does (tests).
 func (s *Service) PurgeKept(tags ...string) { s.kept.Purge(s.opt.Catalog, tags) }
+
+// CaughtUp reports whether the service has caught up with ns since it last
+// started following it (what behind() waits for).
+func (s *Service) CaughtUp(ns string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.caught[ns]
+}

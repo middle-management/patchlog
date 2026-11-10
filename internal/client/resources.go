@@ -284,6 +284,10 @@ type LogEntry struct {
 	Kid string
 }
 
+// ParseLogEntry reads one entry of a resource log page served in the
+// clear (§7.1), as parsed JSON (jsonv).
+func ParseLogEntry(v any) (LogEntry, error) { return parseLogEntry(v) }
+
 func parseLogEntry(v any) (LogEntry, error) {
 	m, ok := v.(map[string]any)
 	if !ok {

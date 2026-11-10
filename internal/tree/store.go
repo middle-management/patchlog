@@ -21,7 +21,11 @@ import (
 //	                                 content namespace's document as of its checkpoint; "purged:{ns}"
 //	                                 when the service applied ns's purge (Unix nanoseconds; "1"
 //	                                 from earlier releases); "caught:{ns}" the head its first
-//	                                 catch-up with ns reached (behind)
+//	                                 catch-up with ns reached (behind); "access:{ns}" the read
+//	                                 mode and level of ns's last config entry applied, kept by a
+//	                                 rebuild (narrowedBy); "stopped:{ns}" the checkpoint the
+//	                                 service held of ns as it stopped following it for keys it
+//	                                 lacks or a refusal (purgeStopped)
 //	nodes(href, name, kind, item, item_head, title, state, …, born, epoch)
 //	                                 one row per node (explicit, or implicit from $parents);
 //	                                 raw parents/$access kept to rebuild the graph on start;
@@ -74,9 +78,11 @@ var migrations embed.FS
 // the edge grants' tables, svcedge.Store's, and a hook's, which its
 // Rebuild recomputes), in one transaction. checkpoints_bootstrap too: a
 // snapshot left part-way would otherwise be resumed, not replayed from its
-// first page.
+// first page. Meta "access:{ns}" stays too, as cdn_repurge does: it is
+// the read mode and level listings were last served under, so a replay
+// that ends narrower purges what CDNs may hold of them (narrowedBy).
 var resetStmts = []string{
-	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM meta`,
+	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM meta WHERE k NOT LIKE 'access:%'`,
 	`DELETE FROM nodes`, `DELETE FROM edges`, `DELETE FROM items`,
 	`DELETE FROM self_parents`, `DELETE FROM explicit_gone`, derived.CacheResetStmts[0], derived.CacheResetStmts[1],
 }
@@ -233,6 +239,39 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 	}
 	crows.Close()
 	if err := crows.Err(); err != nil {
+		return nil, err
+	}
+	strows, err := q.QueryContext(ctx, `SELECT substr(k, 9), v FROM meta WHERE k LIKE 'stopped:%'`)
+	if err != nil {
+		return nil, err
+	}
+	for strows.Next() {
+		var ns, cp string
+		if err := strows.Scan(&ns, &cp); err != nil {
+			strows.Close()
+			return nil, err
+		}
+		g.stopped[ns] = cp
+	}
+	strows.Close()
+	if err := strows.Err(); err != nil {
+		return nil, err
+	}
+	arows, err := q.QueryContext(ctx, `SELECT substr(k, 8), v FROM meta WHERE k LIKE 'access:%'`)
+	if err != nil {
+		return nil, err
+	}
+	for arows.Next() {
+		var ns, v string
+		if err := arows.Scan(&ns, &v); err != nil {
+			arows.Close()
+			return nil, err
+		}
+		m, _ := parseJSON(v).(map[string]any)
+		g.appliedPublic[ns], _ = m["public"].(bool)
+	}
+	arows.Close()
+	if err := arows.Err(); err != nil {
 		return nil, err
 	}
 	rows, err := q.QueryContext(ctx, `SELECT name, self, head, title, parents, access, state, dangling, cyclic, deep, item_state, item_head, born, epoch, born_epoch FROM nodes`)
