@@ -61,9 +61,12 @@ func errLegacyE2E(l *legacyE2E) error {
 			"Start again with -purge-raised-e2e, which purges them and their local branches, destroying their keys: they then answer 410 purged", l.names())
 	}
 	return fmt.Errorf("core: this database holds content stored before a raise to e2e, which a namespace can no longer have (Addendum E Levels; v0.78) and this version would serve weaker than it was stored: %s. "+
-		"Before upgrading, export each with the v0.26.1 tools, have a key holder import it into a new e2e namespace under a new name (§G.5.1), then purge it, "+
-		"its local branches first; a remote branch is purged and created again against a source that is e2e from its creation. "+
-		"Or start once with -purge-raised-e2e, which purges them and their local branches now, destroying their keys: they then answer 410 purged", l.names())
+		"No reference tool makes it end-to-end: the importer takes an e2e namespace only under its own name, and no plaintext into one, "+
+		"and no reference client re-seals an import (§G.5.1). Before upgrading, export each with the v0.26.1 tools to keep a copy; "+
+		"to keep its content end-to-end, a key holder writes it into a new e2e namespace, with a third-party importer that re-seals it "+
+		"or by recreating its current documents with a client (CreateDocSealed). Then purge it, its local branches first; "+
+		"a remote branch is purged and created again against a source that is e2e from its creation. "+
+		"Or start once with -purge-raised-e2e, which purges them and their local branches now, destroying their keys and content: they then answer 410 purged", l.names())
 }
 
 // tableExists reports whether the schema has table name, before

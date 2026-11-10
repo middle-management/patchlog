@@ -553,16 +553,17 @@ func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 // checkNoE2ERaise refuses a config write that raises an existing
 // namespace to e2e: a namespace is end-to-end from its creation or never
 // (Addendum E Levels, Changing it), whatever its base or source, so a
-// remote branch's is refused before its source is read (§G.5.2). One that
-// should become end-to-end is imported into a new e2e namespace under a
-// new name (§G.5.1). Options.LegacyE2ERaiseForTests lets it through, only
+// remote branch's is refused before its source is read (§G.5.2). Content
+// that should become end-to-end is written into a new e2e namespace by a
+// key holder (§G.5.1), which no reference tool does: the importer refuses
+// plaintext into an e2e target. Options.LegacyE2ERaiseForTests lets it through, only
 // recording the configuration, as a pre-v0.78 source did.
 func (t *tx) checkNoE2ERaise(cur, cfg *Config) *Error {
 	if cur == nil || cfg.level != levelE2E || cur.level >= levelE2E || t.e.opt.LegacyE2ERaiseForTests {
 		return nil
 	}
 	return docInvalid("/encryption", "/encryption: a namespace is end-to-end from its creation or never, so a write can't raise it to e2e (Addendum E Levels); "+
-		"import it into a new e2e namespace under a new name instead (§G.5.1)")
+		"to make its content end-to-end, a key holder writes it into a new e2e namespace, re-sealing each document (§G.5.1); no reference tool imports plaintext into one")
 }
 
 // lowerDependents lists the unpurged branches of n below level: raising n
