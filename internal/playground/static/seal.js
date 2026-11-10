@@ -3,7 +3,9 @@
  * Mirrors internal/seal (and the folding of internal/client/e2e.go):
  *   - JWE compact, alg "dir", enc "A256GCM", protected header
  *     {alg, enc, kid: "{ns}#{e}", pl, zip?: "DEF"}, AAD = the base64url header (§E.2.2)
- *   - K_r = HKDF-SHA256(ikm K_e, salt "patchlog-e2", info ns ‖ 0x0A ‖ name) (§E.2.1)
+ *   - K_r = HKDF-SHA256(ikm K_e, salt "patchlog-e2", info ns ‖ 0x0A ‖ name) and
+ *     K_n = HKDF-SHA256(ikm K_e, salt "patchlog-e2", info ns ‖ 0x0A) (§E.2.1)
+ *   - view keys HKDF-SHA256(ikm K_n or K_r, salt "patchlog-view", info view), which open derived views (§E.2.6)
  *   - HPKE base and auth mode (RFC 9180), DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-256-GCM,
  *     single shot, empty AAD, wire form enc ‖ ct, info "patchlog-key-v1\n" ‖ kid ‖ "\n" ‖ resource, resource "" for K_e (§E.2.3)
  *   - RFC 7638 thumbprints of X25519 keys (§E.2.3)
@@ -26,6 +28,7 @@ const td = new TextDecoder('utf-8', { fatal: true });
 const SUITE = 'hpke-base-0x0020-0x0001-0x0002';
 const WRAP_INFO_PREFIX = 'patchlog-key-v1\n';
 const RESOURCE_KEY_SALT = 'patchlog-e2';
+const VIEW_KEY_SALT = 'patchlog-view';
 
 /* ---------------- bytes ---------------- */
 function concat(...parts) {
@@ -121,6 +124,19 @@ async function hkdf(ikm, salt, info, len) { return hkdfExpand(await hkdfExtract(
 function resourceKey(epochKey, ns, name) {
   if (epochKey.length !== 32) throw new Error('epoch key must be 32 bytes');
   return hkdf(epochKey, utf8(RESOURCE_KEY_SALT), utf8(ns + '\n' + name), 32);
+}
+
+/* K_n = HKDF-SHA256(K_e, "patchlog-e2", ns ‖ "\n") (§E.2.1) */
+function namespaceKey(epochKey, ns) {
+  if (epochKey.length !== 32) throw new Error('epoch key must be 32 bytes');
+  return hkdf(epochKey, utf8(RESOURCE_KEY_SALT), utf8(ns + '\n'), 32);
+}
+
+/* The view key of a K_n or K_r: HKDF-SHA256(key, "patchlog-view", view), view the request target, path and query,
+ * exactly as the service's redirect gave it (§E.2.6). */
+function viewKey(key, view) {
+  if (key.length !== 32) throw new Error('key must be 32 bytes');
+  return hkdf(key, utf8(VIEW_KEY_SALT), utf8(view), 32);
 }
 
 /* ---------------- AES-256-GCM ---------------- */
@@ -759,7 +775,7 @@ async function selfTest(fx) {
 root.PLSeal = {
   SUITE, b64u, unb64u, b32, hex, unhex, utf8, equalBytes, randomBytes, newNonce, canonical, padLen,
   sha256, chainID, revisionID, tombstoneID, idBytes,
-  hkdf, resourceKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, thumbprint, parseJWK,
+  hkdf, resourceKey, namespaceKey, viewKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, thumbprint, parseJWK,
   hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapStoredKey, unwrapRelayedKey, checkRelayedEntry, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
   sealPatchSet, sealedJWE, sealedBlobs, BLOB_TYPE, blobType, blobID, blobIDs, sameBlobs, parseBlob, openBlob, sealBlob, encryptBlob, decryptBlob,
   isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,

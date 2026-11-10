@@ -1737,9 +1737,14 @@ async function openSealed(ns, jwe, resource, wantPL) {
     { ok: !diff.length, what: diff.length ? `pl differs from the request in ${diff.join(', ')}: got ${Z.canonical(header.pl)}, want ${Z.canonical(want)}` : `pl ${Z.canonical(header.pl)} matches the request` },
   ];
   if (checks.some((c) => !c.ok)) throw Object.assign(new Error(checks.filter((c) => !c.ok).map((c) => c.what).join('; ')), { checks, header });
-  const key = await contentKey(header.kid, resource);
+  let key = await contentKey(header.kid, resource);
+  // A derived view (its pl has a view) is sealed under the view key of the entry's K_r, or of K_n for a whole
+  // response: HKDF(·, "patchlog-view", view), view exactly as the redirect gave it (§E.2.6).
+  const view = want && typeof want.view === 'string' ? want.view : null;
+  if (view !== null) key = await Z.viewKey(resource ? key : await Z.namespaceKey(key, k.ns), view);
   const o = await Z.openJWE(jwe, key);
-  checks.push({ ok: true, what: `decrypted with ${resource ? 'K_r(' + k.ns + ', ' + resource + ')' : 'K_e'} of ${header.kid}` + (header.zip ? ', inflated' : '') + (/ +$/.test(o.text) ? ', padded' : '') });
+  const named = resource ? 'K_r(' + k.ns + ', ' + resource + ')' : view !== null ? 'K_n(' + k.ns + ')' : 'K_e';
+  checks.push({ ok: true, what: `decrypted with ${view !== null ? 'the view key of ' + named : named} of ${header.kid}` + (header.zip ? ', inflated' : '') + (/ +$/.test(o.text) ? ', padded' : '') });
   let value = o.text;
   try { value = JSON.parse(o.text); } catch (_) { /* not JSON */ }
   return { header, kid: header.kid, text: o.text, value, checks };
@@ -2730,12 +2735,11 @@ async function openSealedEntries(v, view) {
     try {
       const hdr = Z.parseJWE(v.sealed).header;
       const ens = Z.parseKid(hdr.kid).ns;
-      // The entry's resource key K_r (what the tree service and the index use), else the epoch key K_e.
-      // (The tree service names its entries "name", the index its hits "resource".)
+      // Under the view key of the entry's own K_r only (§E.2.6). (The tree service names its entries "name", the
+      // index its hits "resource".) A value without a name of its own is not opened.
       const rname = v.name !== undefined ? v.name : v.resource;
-      const want = { ns: ens, name: rname, view };
-      let d;
-      try { d = await openSealed(ens, v.sealed, rname, want); } catch (err) { if (err.checks) throw err; d = await openSealed(ens, v.sealed, '', want); }
+      if (typeof rname !== 'string' || !rname) throw new Error('a sealed value without a resource name is not opened');
+      const d = await openSealed(ens, v.sealed, rname, { ns: ens, name: rname, view });
       if (d.value && typeof d.value === 'object') Object.assign(v, d.value);
       v._opened = hdr.kid;
     } catch (err) { v._sealedErr = err.message; }
