@@ -122,14 +122,19 @@ func TestInteropHandBuilt(t *testing.T) {
 	if err != nil || !bytes.Equal(got, pt) {
 		t.Fatalf("got %q, %v", got, err)
 	}
-	// Legacy bytes: compressed, with the namespace document's kind before
-	// v0.63 ("config"), which readers still accept.
+	// Bytes sealed before v0.65 (compressed) or v0.63 (the namespace
+	// document's kind "config") don't open since v0.78 ("Reading this
+	// spec", §E.2.2): zip is ErrFormat, the old pl ErrMismatch.
 	big := bytes.Repeat([]byte("abc"), 1000)
-	hdrZ := `{"zip":"DEF","alg":"dir","enc":"A256GCM","kid":"matches#2","pl":{"ns":"matches","id":"1abc","kind":"config"}}`
+	hdrZ := `{"zip":"DEF","alg":"dir","enc":"A256GCM","kid":"matches#2","pl":{"ns":"matches","id":"1abc","kind":"doc"}}`
 	jwe = handJWE(t, k, hdrZ, big, true)
-	got, err = OpenExpect(jwe, k, "matches#2", NamespaceDocPL("matches", "1abc"))
-	if err != nil || !bytes.Equal(got, big) {
+	if _, err = OpenExpect(jwe, k, "matches#2", NamespaceDocPL("matches", "1abc")); !errors.Is(err, ErrFormat) {
 		t.Fatalf("zip: %v", err)
+	}
+	hdrC := `{"alg":"dir","enc":"A256GCM","kid":"matches#2","pl":{"ns":"matches","id":"1abc","kind":"config"}}`
+	jwe = handJWE(t, k, hdrC, pt, false)
+	if _, err = OpenExpect(jwe, k, "matches#2", NamespaceDocPL("matches", "1abc")); !errors.Is(err, ErrMismatch) {
+		t.Fatalf("kind config: %v", err)
 	}
 	// And the other direction: decrypt our output by hand.
 	ours, _ := Seal(k, "matches#2", NamespaceDocPL("matches", "1abc"), pt)
@@ -198,19 +203,20 @@ func TestTamper(t *testing.T) {
 	}
 }
 
+// A compressed JWE is refused before anything is inflated (§E.2.2: sealed
+// payloads carry no zip header), so no bound on inflated output is needed;
+// ciphertext above the limit is ErrTooLarge.
 func TestZipBomb(t *testing.T) {
 	k := key(4)
 	bomb := make([]byte, 10<<20) // 10 MiB of zeros → a few KiB compressed
-	// Seal never compresses (§E.2.2); bytes sealed before v0.65 may be.
 	jwe := handJWE(t, k, `{"alg":"dir","enc":"A256GCM","kid":"ns#1","pl":{"id":"1a","kind":"rev","name":"r","ns":"ns"},"zip":"DEF"}`, bomb, true)
 	if len(jwe) > 100<<10 {
 		t.Fatalf("not compressed: %d", len(jwe))
 	}
-	if _, _, err := OpenLimit(jwe, k, 1<<20); !errors.Is(err, ErrTooLarge) {
-		t.Fatalf("err = %v", err)
-	}
-	if _, pt, err := OpenLimit(jwe, k, 10<<20); err != nil || len(pt) != len(bomb) {
-		t.Fatalf("exact limit: %v", err)
+	for _, limit := range []int{1 << 20, 10 << 20} {
+		if _, _, err := OpenLimit(jwe, k, limit); !errors.Is(err, ErrFormat) {
+			t.Fatalf("limit %d: err = %v", limit, err)
+		}
 	}
 	// Uncompressed ciphertext above limit.
 	small, _ := SealUncompressed(k, "ns#1", PL{"ns": "ns"}, make([]byte, 100))

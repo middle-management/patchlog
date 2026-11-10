@@ -131,9 +131,9 @@ func SealSnapshot(key []byte, kid, ns, name, id string, doc any) (string, error)
 	return SealSnapshotPad(key, kid, ns, name, id, doc, false)
 }
 
-// OpenSnapshot decrypts a prune snapshot bound to kid and {ns, name, id},
-// or to the legacy {ns, name, id, kind: "snapshot"} of snapshots stored
-// before v0.63 (Expect).
+// OpenSnapshot decrypts a prune snapshot bound to kid and exactly {ns,
+// name, id} (§E.3.1): the pl {ns, name, id, kind: "snapshot"} of snapshots
+// stored before v0.63 is ErrMismatch (Expect).
 func OpenSnapshot(jwe string, key []byte, kid, ns, name, id string) (any, error) {
 	pt, err := OpenExpect(jwe, key, kid, SnapshotPL(ns, name, id))
 	if err != nil {

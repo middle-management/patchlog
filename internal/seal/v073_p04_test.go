@@ -11,7 +11,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -81,18 +80,23 @@ func TestV073SealNeverCompresses(t *testing.T) {
 	check("SealSnapshot", snap, len(jsonv.Canonical(doc)))
 }
 
-// Open still inflates bytes sealed with zip "DEF" before v0.65, which are
-// stored once and served forever (§E.2.2).
-func TestV073OpenInflatesLegacyZip(t *testing.T) {
+// Since v0.78 bytes sealed with zip "DEF" before v0.65 don't open: a
+// header with any zip member is ErrFormat ("Reading this spec", §E.2.2).
+// Inverted from TestV073OpenInflatesLegacyZip.
+func TestV073OpenRefusesLegacyZip(t *testing.T) {
 	k := key(10)
 	big := bytes.Repeat([]byte("abc"), 2000)
-	jwe := handJWE(t, k, `{"alg":"dir","enc":"A256GCM","kid":"m#1","pl":{"id":"1a","kind":"doc","name":"r","ns":"m"},"zip":"DEF"}`, big, true)
-	h, pt, err := Open(jwe, k)
-	if err != nil || h.Zip != ZipDeflate || !bytes.Equal(pt, big) {
-		t.Fatalf("legacy zip: zip %q, %v", h.Zip, err)
-	}
-	if got, err := OpenExpect(jwe, k, "m#1", ResourcePL("m", "r", "1a", KindDoc)); err != nil || !bytes.Equal(got, big) {
-		t.Fatalf("OpenExpect: %v", err)
+	for _, zip := range []string{`"DEF"`, `"other"`, `""`, `null`} {
+		jwe := handJWE(t, k, `{"alg":"dir","enc":"A256GCM","kid":"m#1","pl":{"id":"1a","kind":"doc","name":"r","ns":"m"},"zip":`+zip+`}`, big, zip == `"DEF"`)
+		if _, err := ParseHeader(jwe); !errors.Is(err, ErrFormat) {
+			t.Fatalf("zip %s: ParseHeader %v", zip, err)
+		}
+		if _, _, err := Open(jwe, k); !errors.Is(err, ErrFormat) {
+			t.Fatalf("zip %s: Open %v", zip, err)
+		}
+		if _, err := OpenExpect(jwe, k, "m#1", ResourcePL("m", "r", "1a", KindDoc)); !errors.Is(err, ErrFormat) {
+			t.Fatalf("zip %s: OpenExpect %v", zip, err)
+		}
 	}
 }
 
@@ -158,19 +162,20 @@ func TestV073PLShapes(t *testing.T) {
 	}
 }
 
-// Readers accept the pl of bytes sealed before v0.63 for the payloads whose
-// pl changed, and for nothing else.
-func TestV073LegacyPLAccepted(t *testing.T) {
+// Readers match pl exactly: since v0.78 the pl of bytes sealed before
+// v0.63 is refused for the payloads whose pl changed too ("Reading this
+// spec", §E.2.2, §E.3.1). Inverted from TestV073LegacyPLAccepted.
+func TestV073LegacyPLRefused(t *testing.T) {
 	k := key(13)
 	mk := func(pl string) string {
 		return handJWE(t, k, `{"alg":"dir","enc":"A256GCM","kid":"m#1","pl":`+pl+`}`, []byte(`{"a":1}`), false)
 	}
 	legacyDoc := mk(`{"id":"1aaaa","kind":"config","ns":"m"}`)
 	legacySnap := mk(`{"id":"1aaaa","kind":"snapshot","name":"r","ns":"m"}`)
-	if _, err := OpenExpect(legacyDoc, k, "m#1", NamespaceDocPL("m", "1aaaa")); err != nil {
+	if _, err := OpenExpect(legacyDoc, k, "m#1", NamespaceDocPL("m", "1aaaa")); !errors.Is(err, ErrMismatch) {
 		t.Fatalf("legacy namespace document: %v", err)
 	}
-	if _, err := OpenSnapshot(legacySnap, k, "m#1", "m", "r", "1aaaa"); err != nil {
+	if _, err := OpenSnapshot(legacySnap, k, "m#1", "m", "r", "1aaaa"); !errors.Is(err, ErrMismatch) {
 		t.Fatalf("legacy snapshot: %v", err)
 	}
 	if _, err := OpenExpect(mk(`{"id":"1aaaa","kind":"doc","ns":"m"}`), k, "m#1", NamespaceDocPL("m", "1aaaa")); err != nil {
@@ -236,16 +241,22 @@ func TestV073WrapInfo(t *testing.T) {
 			t.Fatalf("UnwrapKey with info %q: %v", c.info, err)
 		}
 		// The pre-v0.63 info no longer opens.
-		if _, err := hpke.Open(sk, hpke.HKDFSHA256(), hpke.AES256GCM(), legacyWrapInfo("ns#3", c.resource), w.Wrapped); err == nil {
+		legacy := "patchlog-keys-v1\nns#3"
+		if c.resource != "" {
+			legacy += "\n" + c.resource
+		}
+		if _, err := hpke.Open(sk, hpke.HKDFSHA256(), hpke.AES256GCM(), []byte(legacy), w.Wrapped); err == nil {
 			t.Fatalf("resource %q: opened under the legacy info", c.resource)
 		}
 	}
 }
 
 // Keys wrapped under the pre-v0.63 info ("patchlog-keys-v1" 0x0A kid,
-// then 0x0A resource for a K_r) open with UnwrapKeyLegacy only, for
-// migrating stored keyrings.
-func TestV073UnwrapKeyLegacy(t *testing.T) {
+// then 0x0A resource for a K_r) don't open since v0.78: UnwrapKeyLegacy
+// is gone, and neither UnwrapKey nor UnwrapRelayed nor Keyring.EpochKey
+// tries the old info ("Reading this spec"). Inverted from
+// TestV073UnwrapKeyLegacy.
+func TestV073UnwrapKeyLegacyRefused(t *testing.T) {
 	_, priv, _ := GenerateRecipient()
 	pk, _ := hpke.NewDHKEMPublicKey(priv.PublicKey())
 	k := NewKey()
@@ -258,15 +269,20 @@ func TestV073UnwrapKeyLegacy(t *testing.T) {
 			t.Fatal(err)
 		}
 		w := WrappedKey{Kid: "ns#3", Resource: c.resource, Wrapped: old}
-		if got, err := UnwrapKeyLegacy(priv, w); err != nil || !bytes.Equal(got, k) {
-			t.Fatalf("legacy %q: %v", c.info, err)
-		}
 		if _, err := UnwrapKey(priv, w); !errors.Is(err, ErrDecrypt) {
 			t.Fatalf("UnwrapKey opened a legacy wrap: %v", err)
 		}
-		w.Kid = "ns#4"
-		if _, err := UnwrapKeyLegacy(priv, w); !errors.Is(err, ErrDecrypt) {
-			t.Fatalf("legacy wrap under another kid: %v", err)
+		if _, err := UnwrapRelayed(priv, w, nil); !errors.Is(err, ErrDecrypt) {
+			t.Fatalf("UnwrapRelayed opened a legacy wrap: %v", err)
+		}
+		if c.resource == "" {
+			kr, _ := BuildKeyring("ns", 3, k, nil)
+			rid := RecipientID(priv.PublicKey())
+			kr.Recipients[rid] = priv.PublicKey()
+			kr.Epochs[3][rid] = old
+			if _, err := kr.EpochKey(priv, 3); !errors.Is(err, ErrDecrypt) {
+				t.Fatalf("Keyring.EpochKey opened a legacy wrap: %v", err)
+			}
 		}
 	}
 }
@@ -745,160 +761,5 @@ func TestV073ParseKeyringV2(t *testing.T) {
 	// And the old parser refuses the new document.
 	if _, err := ParseKeyring([]byte(`{"keys":[` + good + `]}`)); err == nil {
 		t.Error("ParseKeyring took a v0.63 keyring")
-	}
-}
-
-// A keyring stored before v0.63 (old format, keys wrapped in base mode
-// under the old info) opens for migration and is rewritten in the new
-// format, in auth mode under the admin's key, for the readers the caller
-// gives per epoch.
-func TestV073MigrateKeyring(t *testing.T) {
-	_, admin, _ := GenerateRecipient()
-	_, b, _ := GenerateRecipient()
-	k1, k2 := NewKey(), NewKey()
-	old, _ := BuildKeyring("sec", 1, k1, []*ecdh.PublicKey{admin.PublicKey(), b.PublicKey()})
-	old.Rotate(k2, []*ecdh.PublicKey{admin.PublicKey()})
-	// As stored before v0.63: wrapped under the old info.
-	for e, m := range old.Epochs {
-		k := map[int][]byte{1: k1, 2: k2}[e]
-		for rid := range m {
-			pk, _ := hpke.NewDHKEMPublicKey(old.Recipients[rid])
-			w, err := hpke.Seal(pk, hpke.HKDFSHA256(), hpke.AES256GCM(), legacyWrapInfo(Kid("sec", e), ""), k)
-			if err != nil {
-				t.Fatal(err)
-			}
-			m[rid] = w
-		}
-	}
-	doc, _ := old.MarshalJSON()
-	stored, err := ParseKeyring(doc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, err := stored.EpochKey(b, 1); err != nil || !bytes.Equal(got, k1) {
-		t.Fatalf("legacy EpochKey: %v", err)
-	}
-	readers := map[int][]*ecdh.PublicKey{1: {admin.PublicKey(), b.PublicKey()}, 2: {admin.PublicKey()}}
-	kr, err := MigrateKeyring(stored, admin, readers)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(kr.Entries) != 3 {
-		t.Fatalf("%d entries", len(kr.Entries))
-	}
-	trusted := []*ecdh.PublicKey{admin.PublicKey()}
-	if got, err := kr.EpochKey(b, "sec#1", trusted); err != nil || !bytes.Equal(got, k1) {
-		t.Fatalf("b's sec#1: %v", err)
-	}
-	if got, err := kr.EpochKey(admin, "sec#2", trusted); err != nil || !bytes.Equal(got, k2) {
-		t.Fatalf("admin's sec#2: %v", err)
-	}
-	if _, err := kr.EpochKey(b, "sec#2", trusted); err == nil {
-		t.Fatal("b was revoked before sec#2")
-	}
-	reparsed, _ := kr.MarshalJSON()
-	if _, err := ParseKeyringV2(reparsed); err != nil {
-		t.Fatal(err)
-	}
-	// Only a recipient of every epoch can migrate.
-	if _, err := MigrateKeyring(stored, b, readers); err == nil {
-		t.Fatal("b migrated an epoch it doesn't hold")
-	}
-	// readers names every epoch the keyring holds, and no other.
-	if _, err := MigrateKeyring(stored, admin, map[int][]*ecdh.PublicKey{1: {admin.PublicKey()}}); err == nil {
-		t.Fatal("migrated without readers for sec#2")
-	}
-	if _, err := MigrateKeyring(stored, admin, map[int][]*ecdh.PublicKey{1: {admin.PublicKey()}, 2: {admin.PublicKey()}, 3: {admin.PublicKey()}}); err == nil {
-		t.Fatal("migrated with readers for sec#3, which the keyring doesn't hold")
-	}
-	// An empty list leaves the epoch without entries; a nil key is refused.
-	kr, err = MigrateKeyring(stored, admin, map[int][]*ecdh.PublicKey{1: {admin.PublicKey()}, 2: nil})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(kr.Entries) != 1 || kr.Entries[0].Kid != "sec#1" {
-		t.Fatalf("empty readers for sec#2: %d entries, want sec#1's one", len(kr.Entries))
-	}
-	if _, err := MigrateKeyring(stored, admin, map[int][]*ecdh.PublicKey{1: {nil}, 2: nil}); err == nil {
-		t.Fatal("migrated to a nil key")
-	}
-}
-
-// tamperedKeyring returns the stored form of kr with an entry for pub in
-// epoch e that anyone could write: the stored document is base mode and
-// unauthenticated, so pub is listed and given junk (its writer doesn't
-// know K_e).
-func tamperedKeyring(t *testing.T, kr *Keyring, e int, pub *ecdh.PublicKey) *Keyring {
-	t.Helper()
-	doc := kr.Value()
-	rid := RecipientID(pub)
-	doc["recipients"].(map[string]any)[rid] = RecipientJWK(pub)
-	doc["epochs"].(map[string]any)[strconv.Itoa(e)].(map[string]any)[rid] = b64.EncodeToString([]byte("junk"))
-	out, err := ParseKeyring(doc)
-	if err != nil {
-		t.Fatalf("the old parser refuses the tampered keyring: %v", err)
-	}
-	return out
-}
-
-// Migration doesn't take its recipients from the stored keyring: a key
-// listed there by anyone who can write the keyring resource, or by a
-// server serving the admin a modified copy (§E.3.2: anyone can wrap to a
-// thumbprint), held nothing before migration and gets nothing after it,
-// rather than the real K_e as from the trusted admin.
-func TestV073MigrateKeyringIgnoresStoredRecipients(t *testing.T) {
-	_, admin, _ := GenerateRecipient()
-	_, reader, _ := GenerateRecipient()
-	_, mallory, _ := GenerateRecipient()
-	k1 := NewKey()
-	stored, err := BuildKeyring("sec", 1, k1, []*ecdh.PublicKey{admin.PublicKey(), reader.PublicKey()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tampered := tamperedKeyring(t, stored, 1, mallory.PublicKey())
-	if _, err := tampered.EpochKey(mallory, 1); err == nil {
-		t.Fatal("junk entry opened")
-	}
-	kr, err := MigrateKeyring(tampered, admin, map[int][]*ecdh.PublicKey{1: {admin.PublicKey(), reader.PublicKey()}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	trusted := []*ecdh.PublicKey{admin.PublicKey()}
-	if got, err := kr.EpochKey(mallory, "sec#1", trusted); err == nil || bytes.Equal(got, k1) {
-		t.Fatal("migration wrapped the real epoch key, as from the admin, for a recipient injected into the stored keyring")
-	}
-	if _, ok := kr.Entry("sec#1", Thumbprint(mallory.PublicKey())); ok {
-		t.Fatal("the migrated keyring has an entry for the injected recipient")
-	}
-	if got, err := kr.EpochKey(reader, "sec#1", trusted); err != nil || !bytes.Equal(got, k1) {
-		t.Fatalf("reader's sec#1: %v", err)
-	}
-}
-
-// Nor does migration un-revoke: a reader left out of a rotation (§E.2.4)
-// who lists itself in the new epoch of the stored keyring doesn't get
-// that epoch's key from it.
-func TestV073MigrateKeyringDoesNotUnrevoke(t *testing.T) {
-	_, admin, _ := GenerateRecipient()
-	_, revoked, _ := GenerateRecipient()
-	k1, k2 := NewKey(), NewKey()
-	stored, _ := BuildKeyring("sec", 1, k1, []*ecdh.PublicKey{admin.PublicKey(), revoked.PublicKey()})
-	if _, err := stored.Rotate(k2, []*ecdh.PublicKey{admin.PublicKey()}); err != nil {
-		t.Fatal(err)
-	}
-	tampered := tamperedKeyring(t, stored, 2, revoked.PublicKey())
-	kr, err := MigrateKeyring(tampered, admin, map[int][]*ecdh.PublicKey{
-		1: {admin.PublicKey(), revoked.PublicKey()},
-		2: {admin.PublicKey()},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	trusted := []*ecdh.PublicKey{admin.PublicKey()}
-	if got, err := kr.EpochKey(revoked, "sec#2", trusted); err == nil || bytes.Equal(got, k2) {
-		t.Fatal("a reader revoked at sec#2 gets sec#2's key, as from the admin, after migration")
-	}
-	if got, err := kr.EpochKey(revoked, "sec#1", trusted); err != nil || !bytes.Equal(got, k1) {
-		t.Fatalf("revoked reader's sec#1, which it held: %v", err)
 	}
 }
