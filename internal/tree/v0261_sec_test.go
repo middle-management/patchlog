@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -636,9 +637,12 @@ func TestV0261PrivateStaleChecker(t *testing.T) {
 }
 
 // §9, §B.11.5 (v0.26.1): the other way, a catalog just made public reads
-// public before the service applies it: the grant checker's document is
-// newer than any the service applied, and decides. Here the service is
-// kept from reading the catalog's log meanwhile.
+// public only once the service applies that: anonymous readers are 401
+// meanwhile (a grant reads by its grant), however the grant checker's
+// document reads, and are served once it is applied. A document the
+// service hasn't applied may be one public between two private ones
+// (TestV0261LaggingFlipNotPublic). Here the service is kept from reading
+// the catalog's log meanwhile.
 func TestV0261PublicBeforeApplied(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -670,11 +674,17 @@ func TestV0261PublicBeforeApplied(t *testing.T) {
 	block.Store(true)
 	time.Sleep(500 * time.Millisecond) // the long poll in flight ends (LongPoll)
 	must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "public"}}))
-	waitFor(t, "an anonymous read", func() bool { st, _, _, _ := v0261Get(x, "/cat/roots", ""); return st == 200 })
+	for range 5 {
+		if st, _, b, _ := v0261Get(x, "/cat/roots", ""); st != 401 {
+			t.Fatalf("made public, not applied: anonymous GET %d %s, want 401", st, b)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if x.s.At() != at {
 		t.Fatal("the service applied the entry")
 	}
 	block.Store(false)
+	waitFor(t, "an anonymous read, once applied", func() bool { st, _, _, _ := v0261Get(x, "/cat/roots", ""); return st == 200 })
 }
 
 // v0261SawTag reports whether x's Purger was sent tag, and whether a second
@@ -952,5 +962,385 @@ func TestV0261UntrustedThenPrivate(t *testing.T) {
 	if !purged {
 		t.Errorf("sec made private after cat stopped trusting it: none of %s's tags %q was ever purged; it was served %q with sec's title in the clear",
 			before.path, before.header.Get("Cache-Tag"), before.header.Get("Cache-Control"))
+	}
+}
+
+// Review R2-A: a content namespace made private and raised to sealed in one
+// config write that the service can't follow (it can't have sec's keys).
+// The follower stops before the entry (LacksKey) or Apply's Recheck skips
+// it: the batch is never applied, so Graph.appliedPublic[sec] stays
+// "public" from the last applied entry, and nothing makes the grant
+// checker drop the document it holds (no Apply reaches Observe on the
+// LacksKey path). purgeStopped purges ns:sec once; an anonymous read
+// within the checker's TTL (30 s by default) is then judged public by the
+// cached document and the stale record, and served sec's title in the
+// clear, public immutable, after that purge. Bounded: the CDN copy lasts
+// until the second purge (repurge, 2 min) or the next start's stop-purge,
+// browsers keep it for max-age. TestV0261SealedTrustedWithoutKeys' "nor
+// does the service serve it again" holds only under the harness's 1 ms
+// TTL. Incomplete fix of d64b8a0/b6b14cb, not a regression.
+//
+// Fixed in v0.26.1: purgeStopped marks the namespace stopped (meta
+// "stopped:{ns}") and has the checker drop it before it purges; a stopped
+// namespace reads public to no one, and a stopped catalog is 404.
+func TestV0261StoppedNotServedPublic(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name, ns string
+		private  bool
+		ttl      time.Duration
+	}{
+		{"sec private+sealed ttl30s", "sec", true, 30 * time.Second},
+		{"sec sealed only ttl30s", "sec", false, 30 * time.Second},
+		{"cat private+sealed ttl30s", "cat", true, 30 * time.Second},
+		{"control sec private+sealed ttl1ms", "sec", true, time.Millisecond},
+	} {
+		t.Run(c.name, func(t *testing.T) { v0261StopPurge(t, c.ns, c.private, c.ttl) })
+	}
+}
+
+func v0261StopPurge(t *testing.T, which string, private bool, ttl time.Duration) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for _, ns := range []string{"cat", "sec"} {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+		if ns == "cat" {
+			doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag", "title": "/title"}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	both := []string{"cat", "sec"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(w.CreateDoc(ctx, "sec", "a", map[string]any{"title": "Secret vw3k"}))
+	must(w.CreateDoc(ctx, "cat", "sec.a", map[string]any{"parents": parents("root@a0")}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"})), client.WithKeys(client.StaticKeys()))
+	x := startSvc(t, sc, svcOpts{now: s.Now}, func(o *tree.Options) { o.CheckerTTL = ttl })
+	x.caughtUp("cat", "sec")
+	before := x.fetch("/cat/children?of=root", "")
+	if !strings.Contains(string(before.body), "vw3k") || !strings.Contains(before.header.Get("Cache-Control"), "public") {
+		t.Fatalf("setup: %q %s", before.header.Get("Cache-Control"), before.body)
+	}
+	patch := []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}}}
+	if private {
+		patch = append(patch, map[string]any{"op": "replace", "path": "/read", "value": "grant"})
+	}
+	must(w.PatchConfig(ctx, which, must(w.NSHead(ctx, which)).Config, patch))
+	waitFor(t, "ns:"+which+" purged (purgeStopped)", func() bool { sent, _ := v0261SawTag(x, "ns:"+which); return sent })
+	n0, _, _ := v0261Purges(x, "ns:"+which)
+	for _, path := range []string{"/cat/children?of=root", before.path} {
+		st, hdr, body, at := v0261Get(x, path, "")
+		if st == 200 && strings.Contains(body, "vw3k") {
+			t.Errorf("%s raised (private %v), its entry never applied: after ns:%s was purged, anonymous GET %s served %s 200, Cache-Control %q, with sec's title: %s",
+				which, private, which, path, at, hdr.Get("Cache-Control"), body)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n, _, _ := v0261Purges(x, "ns:"+which); n != n0 {
+		t.Logf("ns:%s purged again since: %d -> %d", which, n0, n)
+	} else {
+		t.Logf("ns:%s not purged again (%d)", which, n)
+	}
+}
+
+// v0261Core is a core whose GET /ns/cat head pointer can be answered from
+// one recorded earlier (as a CDN serves it within s-maxage=1,
+// stale-while-revalidate=5, §9), and whose cat log reads can be refused.
+type v0261Core struct {
+	s       *clienttest.Server
+	mu      sync.Mutex
+	ptrs    map[string]http.Header // by head, as last answered
+	replay  atomic.Value           // the head whose pointer is replayed, "" for none
+	blockLg atomic.Bool
+}
+
+func newV0261Core(t *testing.T) *v0261Core {
+	c := &v0261Core{ptrs: map[string]http.Header{}}
+	c.replay.Store("")
+	c.s = clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond,
+		Wrap: func(h http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if c.blockLg.Load() && strings.HasPrefix(r.URL.Path, "/ns/cat/") && strings.HasSuffix(r.URL.Path, "/log") {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(503)
+					w.Write([]byte(`{"code":"unavailable","message":"injected"}`))
+					return
+				}
+				if r.Method != "GET" || r.URL.Path != "/ns/cat" {
+					h.ServeHTTP(w, r)
+					return
+				}
+				if id := c.replay.Load().(string); id != "" {
+					c.mu.Lock()
+					hd := c.ptrs[id]
+					c.mu.Unlock()
+					for k, v := range hd {
+						w.Header()[k] = v
+					}
+					w.WriteHeader(302)
+					return
+				}
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, r)
+				if rec.Code == 302 {
+					c.mu.Lock()
+					c.ptrs[strings.Trim(rec.Header().Get("ETag"), `"`)] = rec.Header().Clone()
+					c.mu.Unlock()
+				}
+				for k, v := range rec.Header() {
+					w.Header()[k] = v
+				}
+				w.WriteHeader(rec.Code)
+				w.Write(rec.Body.Bytes())
+			})
+		}})
+	return c
+}
+
+// head reads cat's head through the core, recording its pointer.
+func (c *v0261Core) head(t *testing.T, cl *client.Client) string {
+	h := must(cl.NSHead(context.Background(), "cat"))
+	c.mu.Lock()
+	_, ok := c.ptrs[h.ID]
+	c.mu.Unlock()
+	if !ok {
+		t.Fatalf("pointer at %s not recorded", h.ID)
+	}
+	return h.ID
+}
+
+func v0261Read(w *client.Client, mode string) error {
+	ctx := context.Background()
+	_, err := w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "replace", "path": "/read", "value": mode}})
+	return err
+}
+
+// Review R2-C (main target, residual): the widening branch trusts a document at
+// an entry the service hasn't applied. With cat private as applied and
+// the service unable to read its log, cat is made public (X) and private
+// again (Y). A head pointer at X (stale, as a CDN serves it for ~6 s, or
+// the checker's own cached document for its 30 s TTL) has the now-private
+// catalog served to an anonymous reader, public immutable, at the at the
+// service holds, which includes what was written while it was private.
+// Bounded: once the service applies X and Y, ns:cat is purged after it,
+// and the same pointer is 401.
+//
+// Fixed in v0.26.1: a namespace reads public only if public as the
+// service applied it too (publicAsApplied); this asserts 401.
+func TestV0261LaggingFlipNotPublic(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	c := newV0261Core(t)
+	s := c.s
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "public", "keys": []any{k.Entry("*")},
+		"catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	v0261Must(t, v0261Read(w, "grant"))
+	must(w.CreateDoc(ctx, "cat", "secret", map[string]any{"title": "Secret p7qa", "parents": parents("root@a0")}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	x := startSvc(t, sc, svcOpts{now: s.Now})
+	x.caughtUp("cat")
+	if st, _, b, _ := v0261Get(x, "/cat/roots", ""); st != 401 {
+		t.Fatalf("setup: %d %s", st, b)
+	}
+	c.blockLg.Store(true)
+	time.Sleep(500 * time.Millisecond)
+	v0261Must(t, v0261Read(w, "public"))
+	hx := c.head(t, w)
+	v0261Must(t, v0261Read(w, "grant"))
+	c.replay.Store(hx)
+	st, hdr, body, path := v0261Get(x, "/cat/children?of=root", "")
+	c.replay.Store("")
+	n0, _, _ := v0261Purges(x, "ns:cat")
+	if st != 401 {
+		t.Errorf("cat private again at the head; checker answered the pointer at %s (public, not applied): anonymous GET served %s %d, Cache-Control %q: %s",
+			hx, path, st, hdr.Get("Cache-Control"), body)
+	}
+	c.blockLg.Store(false)
+	x.caughtUp("cat")
+	if n, _, _ := v0261Purges(x, "ns:cat"); n <= n0 {
+		t.Errorf("applied X and Y: ns:cat purged %d times, %d before", n, n0)
+	}
+	c.replay.Store(hx)
+	if st, _, b, p := v0261Get(x, "/cat/children?of=root", ""); st != 401 {
+		t.Errorf("after the apply, the pointer at %s: %s %d %s", hx, p, st, b)
+	}
+	c.replay.Store("")
+}
+
+func v0261Must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Review R2-D (purgeStopped's cost): the catalog raised to e2e, which the service
+// can't follow (no keyring recipient key). The stop is remembered only in
+// follow()'s closure, so every start of the service (and the live raise
+// itself, once in Apply and once more when follow() re-checks) sends
+// ns:cat to the Purger again and queues another second purge, though
+// nothing was served since the first.
+//
+// Fixed in v0.26.1: the stop is recorded per checkpoint (meta
+// "stopped:{ns}"), so it purges once.
+func TestV0261StopPurgeOnce(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "public", "keys": []any{k.Entry("*")},
+		"catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	wJWK, wPriv := must2(seal.GenerateRecipient())
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "append", "config"}, map[string]any{"enc": wJWK})),
+		client.WithKeys(client.NewKeys(wPriv)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat")
+	x.fetch("/cat/children?of=root", "")
+	must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "e2e"}}}))
+	waitFor(t, "the raise to e2e", func() bool { return x.raw("/cat/roots", "").status == 404 })
+	time.Sleep(500 * time.Millisecond)
+	_, sent, queued := v0261Purges(x, "ns:cat")
+	t.Logf("live raise: ns:cat sent %d, queued %d", sent, queued)
+	total := sent
+	x.stop()
+	for i := 0; i < 3; i++ {
+		y := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+		waitFor(t, "skipped", func() bool { return y.raw("/cat/roots", "").status == 404 })
+		time.Sleep(300 * time.Millisecond)
+		_, sent, queued := v0261Purges(y, "ns:cat")
+		t.Logf("start %d: ns:cat sent %d, queued (in the database) %d", i+1, sent, queued)
+		total += sent
+		y.stop()
+	}
+	if total > 1 {
+		t.Errorf("one raise, nothing served since: ns:cat sent to the Purger %d times (each start purges again)", total)
+	}
+}
+
+// Review R2-E (purgeStopped's coverage): sec is made private and the service's
+// grant stops verifying for it in the same config write (its key is
+// replaced). The follower can't read the entry (401/403: setUnfollowed),
+// so no apply purges for the narrowing, and follow() purges only for a
+// lack of keys: ns:sec is never sent to the Purger, and the public
+// immutable copies the service served of listings showing sec stay in a
+// CDN the origin's purges don't reach (§9, §B.5).
+//
+// Fixed in v0.26.1: a refusal (401, 403) that unfollows a shown
+// namespace stops it too (purgeStopped).
+func TestV0261PrivateAndLockedOutPurged(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k, k2 := clienttest.NewKey("k"), clienttest.NewKey("k2")
+	for _, ns := range []string{"cat", "sec"} {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+		if ns == "cat" {
+			doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag", "title": "/title"}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	both := []string{"cat", "sec"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(w.CreateDoc(ctx, "sec", "a", map[string]any{"title": "Secret vw3k"}))
+	must(w.CreateDoc(ctx, "cat", "sec.a", map[string]any{"parents": parents("root@a0")}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	x := startSvc(t, sc, svcOpts{now: s.Now})
+	x.caughtUp("cat", "sec")
+	before := x.fetch("/cat/children?of=root", "")
+	if !strings.Contains(string(before.body), "vw3k") || !strings.Contains(before.header.Get("Cache-Control"), "public") {
+		t.Fatalf("setup: %q %s", before.header.Get("Cache-Control"), before.body)
+	}
+	must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{
+		map[string]any{"op": "replace", "path": "/read", "value": "grant"},
+		map[string]any{"op": "replace", "path": "/keys", "value": []any{k2.Entry("*")}},
+	}))
+	time.Sleep(1500 * time.Millisecond)
+	if sent, queued := v0261SawTag(x, "ns:sec"); !sent && !queued {
+		t.Errorf("sec made private with the service locked out (checkpoint %s): ns:sec never sent to the Purger nor queued; %s was served %q with sec's title",
+			x.s.Checkpoint("sec"), before.path, before.header.Get("Cache-Control"))
+	}
+	for _, path := range []string{before.path, "/cat/children?of=root"} {
+		if st, hdr, body, at := v0261Get(x, path, ""); st == 200 && strings.Contains(body, "vw3k") {
+			t.Errorf("anonymous GET %s served %s 200, Cache-Control %q, with sec's title", path, at, hdr.Get("Cache-Control"))
+		}
+	}
+}
+
+// v0261DropAccess removes the access:{ns} records, as a database of
+// v0.26.0 or before has none.
+func v0261DropAccess(t *testing.T, db string) {
+	t.Helper()
+	sq := must(sql.Open("sqlite", sqlitedsn.DSN(db, "")))
+	defer sq.Close()
+	if _, err := sq.Exec(`DELETE FROM meta WHERE k LIKE 'access:%'`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// §B.11.5 (v0.26.1): a database from v0.26.0 or before has no record of
+// the read mode the service applied. It is made from the namespace
+// documents at the checkpoints the service holds, as first needed
+// (seedAccess): a public catalog, and a public namespace it trusts, are
+// still read publicly after the upgrade; and a stale document the grant
+// checker is answered, public, from before a narrowing the service has
+// applied, by the release before, reads private (401).
+func TestV0261UpgradeWithoutAccessRecords(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	c := newV0261Core(t)
+	s := c.s
+	k := clienttest.NewKey("k")
+	for _, ns := range []string{"cat", "sec"} {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+		if ns == "cat" {
+			doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag", "title": "/title"}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	both := []string{"cat", "sec"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(w.CreateDoc(ctx, "sec", "a", map[string]any{"title": "A"}))
+	must(w.CreateDoc(ctx, "cat", "sec.a", map[string]any{"parents": parents("root@a0")}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat", "sec")
+	x.stop()
+
+	v0261DropAccess(t, db)
+	y := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	y.caughtUp("cat", "sec")
+	if st, _, b, _ := v0261Get(y, "/cat/children?of=root", ""); st != 200 || !strings.Contains(b, `"A"`) {
+		t.Fatalf("upgraded, public: anonymous GET %d %s, want 200", st, b)
+	}
+	h0 := c.head(t, w)
+	y.stop()
+
+	// The same, cat made private and applied before the upgrade (as by
+	// v0.26.0, which kept no record).
+	v0261Must(t, v0261Read(w, "grant"))
+	must(w.CreateDoc(ctx, "cat", "secret", map[string]any{"title": "Secret p7qa", "parents": parents("root@a1")}))
+	old := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	old.caughtUp("cat", "sec")
+	old.stop()
+	v0261DropAccess(t, db)
+	z := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	z.caughtUp("cat", "sec")
+	c.replay.Store(h0)
+	st, hdr, body, path := v0261Get(z, "/cat/children?of=root", "")
+	c.replay.Store("")
+	if st != 401 {
+		t.Errorf("upgraded, cat made private before, the checker answered the pointer from before: anonymous GET served %s %d, Cache-Control %q: %s",
+			path, st, hdr.Get("Cache-Control"), body)
 	}
 }

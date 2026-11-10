@@ -168,20 +168,19 @@ type viewer struct {
 	// noEdge keeps a listing out of shared caches whoever reads it
 	// (edgeHold).
 	noEdge bool
-	// public are the namespaces the viewer was judged by as public, ""
-	// the catalog, with the head of the document that said so
-	// (readPublic): a listing whose graph is read after the service
-	// applied one of them made private is computed again (unchanged).
-	public map[string]string
+	// public are the namespaces, the catalog among them, the viewer was
+	// judged by as public (readPublic): a listing whose graph is read
+	// after one of them stopped reading public is computed again
+	// (unchanged).
+	public map[string]bool
 }
 
-// judgedPublic records that ns ("" the catalog) was judged public by its
-// document at head (readPublic).
-func (v *viewer) judgedPublic(ns, head string) {
+// judgedPublic records that ns was judged public (readPublic).
+func (v *viewer) judgedPublic(ns string) {
 	if v.public == nil {
-		v.public = map[string]string{}
+		v.public = map[string]bool{}
 	}
-	v.public[ns] = head
+	v.public[ns] = true
 }
 
 // wide reports whether the viewer reads the catalog and every namespace of
@@ -282,22 +281,22 @@ func (s *Service) edgeClaims(r *http.Request) *edge.Claims {
 // since it can't follow it (§B.5), isn't in the checkpoint and shows
 // nothing in listings.
 func (s *Service) publicViewer(ctx context.Context) (*viewer, error) {
-	public, head, err := s.readPublic(ctx, s.opt.Catalog)
+	public, err := s.readPublic(ctx, s.opt.Catalog)
 	if err != nil || !public {
 		return nil, err
 	}
 	trust, gone := s.trustList()
 	listed := s.listed()
 	v := &viewer{anon: true, catPublic: true, catAll: true, contentAll: map[string]bool{}}
-	v.judgedPublic("", head)
+	v.judgedPublic(s.opt.Catalog)
 	for _, ns := range trust {
 		if gone[ns] {
 			v.contentAll[ns] = true
 			continue
 		}
-		if public, head, err := s.readPublic(ctx, ns); err == nil && public {
+		if public, err := s.readPublic(ctx, ns); err == nil && public {
 			v.contentAll[ns] = true
-			v.judgedPublic(ns, head)
+			v.judgedPublic(ns)
 		} else if listed[ns] {
 			return nil, nil
 		}
@@ -305,51 +304,99 @@ func (s *Service) publicViewer(ctx context.Context) (*viewer, error) {
 	return v, nil
 }
 
-// readPublic reports whether namespace ns reads public (§7), and the head
-// of the document that says so: as the grant checker holds its document
-// (checker.Config), unless the service has applied a config entry making
-// it private and that document is one it has applied (appliedPrivate). A
-// load the checker began before Apply told it (checker.Observe) may hold
-// the document from before that entry until its TTL. A document the
-// service hasn't applied yet is newer, and decides: a namespace just made
-// public reads public before the service applies it. An error is the
-// checker's, for a document it can't read.
-func (s *Service) readPublic(ctx context.Context, ns string) (bool, string, error) {
+// readPublic reports whether namespace ns reads public (§7, §B.11.5):
+// only if it is public as the service applied it (publicAsApplied) and
+// as the grant checker holds its document (checker.Config). Neither alone
+// decides: the checker's document may predate a config entry the service
+// applied, or be one the service hasn't applied, of a namespace public
+// at an entry and private again since; the service's applied state may
+// predate a narrowing it can't follow. So a namespace just made public
+// reads public once the service applies that, and readers with a grant
+// read it by their grant meanwhile. An error is the checker's, for a
+// document it can't read, before either is consulted.
+func (s *Service) readPublic(ctx context.Context, ns string) (bool, error) {
 	c, err := s.checker.Config(ctx, s.actual(ns))
 	if err != nil {
-		return false, "", err
+		return false, err
 	}
-	if c.Read != "public" || s.appliedPrivate(ctx, ns, c.Head) {
-		return false, c.Head, nil
-	}
-	return true, c.Head, nil
+	return c.Read == "public" && s.publicAsApplied(ctx, ns), nil
 }
 
-// appliedPrivate reports whether the last config entry the service
-// applied for ns made it private (Graph.appliedPublic) and head, the
-// ns_id a document of ns was read at, is one it has applied (seen), or
-// can't tell.
-func (s *Service) appliedPrivate(ctx context.Context, ns, head string) bool {
+// publicAsApplied reports whether ns is public as of the checkpoint the
+// service applied (Graph.appliedPublic, meta "access:{ns}") and not
+// stopped for keys it lacks or a refusal (Graph.stopped): a narrowing it
+// can't follow is never applied. A namespace with no record, held by a
+// database from before records were kept, has one made from its document
+// at the service's checkpoint (seedAccess); one it can't make counts as
+// not public.
+func (s *Service) publicAsApplied(ctx context.Context, ns string) bool {
 	s.mu.RLock()
+	_, stopped := s.g.stopped[ns]
 	public, known := s.g.appliedPublic[ns]
 	s.mu.RUnlock()
-	if !known || public {
+	switch {
+	case stopped:
+		return false
+	case known:
+		return public
+	}
+	public, err := s.seedAccess(ctx, ns)
+	if err != nil {
+		s.opt.Logf("tree: the read mode of %s as applied: %v", ns, err)
 		return false
 	}
-	var one int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM seen WHERE ns = ? AND ns_id = ?`, ns, head).Scan(&one)
-	return !errors.Is(err, sql.ErrNoRows)
+	return public
+}
+
+// seedAccess records ns's read mode and level as of the checkpoint the
+// service holds (meta "access:{ns}", Graph.appliedPublic), where it has
+// none: from the document it keeps (the catalog's, or a content
+// namespace's with a RoleView), else the namespace document at that
+// checkpoint. A namespace it holds no checkpoint of isn't public as
+// applied. An apply that recorded meanwhile wins.
+func (s *Service) seedAccess(ctx context.Context, ns string) (bool, error) {
+	s.mu.RLock()
+	cp := s.cur[ns]
+	var doc map[string]any
+	if ns == s.opt.Catalog {
+		doc = s.g.Config
+	} else if c := s.g.Content[ns]; c != nil {
+		doc = c.Doc
+	}
+	s.mu.RUnlock()
+	if cp == "" {
+		return false, nil
+	}
+	if doc == nil {
+		d, err := s.c.NSDoc(ctx, s.actual(ns), cp)
+		if err != nil {
+			return false, err
+		}
+		doc = d.Value
+	}
+	mode, _ := doc["read"].(string)
+	public, level := mode == "public", derived.InfoOf(doc).Level
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p, known := s.g.appliedPublic[ns]; known || s.cur[ns] != cp {
+		return p && known, nil
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO NOTHING`,
+		"access:"+ns, marshal(map[string]any{"public": public, "level": level})); err != nil {
+		return false, err
+	}
+	s.g.appliedPublic[ns] = public
+	return public, nil
 }
 
 // stillPublic is errInfoChanged if a namespace v was judged public by
-// (viewer.public) has been made private by a config entry the service
-// applied since, of which the document it was judged by knew nothing.
+// (viewer.public) no longer reads public (readPublic): a config entry
+// applied since made it private, or the service stopped following it.
 func (s *Service) stillPublic(ctx context.Context, v *viewer) error {
-	for ns, head := range v.public {
-		if ns == "" {
-			ns = s.opt.Catalog
-		}
-		if s.appliedPrivate(ctx, ns, head) {
+	for ns := range v.public {
+		if public, err := s.readPublic(ctx, ns); err != nil || !public {
 			return errInfoChanged
 		}
 	}
@@ -406,7 +453,7 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 	// In a release preview every check is on the branch read in place of
 	// a namespace: a viewer sees only branches it can read (§B.5).
 	cat := s.actual(s.opt.Catalog)
-	catPublic, catHead, err := s.readPublic(ctx, s.opt.Catalog)
+	catPublic, err := s.readPublic(ctx, s.opt.Catalog)
 	if err != nil {
 		return nil, err
 	}
@@ -432,7 +479,7 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 	var exp time.Time
 	v := &viewer{byGrant: true, catPublic: catPublic, contentAll: map[string]bool{}}
 	if catPublic {
-		v.judgedPublic("", catHead)
+		v.judgedPublic(s.opt.Catalog)
 	}
 	if vg != nil {
 		exp = grantExp(vg, exp)
@@ -454,12 +501,12 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 			continue
 		}
 		real := s.actual(ns)
-		pub, head, err := s.readPublic(ctx, ns)
+		pub, err := s.readPublic(ctx, ns)
 		switch {
 		case err != nil:
 		case pub:
 			public[ns], unres[ns], wide[ns] = true, true, true
-			v.judgedPublic(ns, head)
+			v.judgedPublic(ns)
 		default:
 			cv, err := s.verify(ctx, real, token)
 			if _, ok := chainErr(err); ok {
@@ -897,7 +944,9 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	// answers a namespace it doesn't follow (§A.4, §E.2.6). One whose keys
 	// it can't fetch for now is behind (below).
 	skipped, lacksKeys := s.keys.Skip(cat)
-	if lacksKeys {
+	if lacksKeys || s.isStopped(cat) {
+		// Stopped too: a catalog it can't follow for keys it lacks or a
+		// refusal (purgeStopped) is one it doesn't serve.
 		WriteError(w, http.StatusNotFound, "not_found", "the tree service does not serve this catalog")
 		return
 	}
@@ -2137,7 +2186,7 @@ func (s *Service) sees(ctx context.Context, ns, token string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if cfg.Read == "public" && !s.appliedPrivate(ctx, ns, cfg.Head) {
+	if cfg.Read == "public" && s.publicAsApplied(ctx, ns) {
 		return true, nil
 	}
 	if token == "" {

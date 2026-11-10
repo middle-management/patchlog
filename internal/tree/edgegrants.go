@@ -304,7 +304,7 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 	}
 	// As grantViewer; a catalog service is never a release preview (Open),
 	// so actual is the namespace itself.
-	catPublic, catHead, err := s.readPublic(ctx, s.opt.Catalog)
+	catPublic, err := s.readPublic(ctx, s.opt.Catalog)
 	if err != nil {
 		return nil, err
 	}
@@ -323,7 +323,7 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 	s.mu.RUnlock()
 	v := &viewer{cookie: true, gs: gs, catPublic: catPublic, contentAll: map[string]bool{}, wideNS: map[string]bool{}, wideGrant: map[string]bool{}}
 	if catPublic {
-		v.judgedPublic("", catHead)
+		v.judgedPublic(s.opt.Catalog)
 	}
 	// A purged namespace is read whole by every reader, as under a grant
 	// (trustList).
@@ -347,9 +347,9 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 		if gone[ns] {
 			continue
 		}
-		if public, head, err := s.readPublic(ctx, ns); err == nil && public {
+		if public, err := s.readPublic(ctx, ns); err == nil && public {
 			v.contentAll[ns], v.wideNS[ns] = true, true
-			v.judgedPublic(ns, head)
+			v.judgedPublic(ns)
 		}
 	}
 	v.vis = s.opt.RoleView.ForSubjects(subs)

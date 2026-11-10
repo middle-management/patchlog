@@ -23,7 +23,9 @@ import (
 //	                                 from earlier releases); "caught:{ns}" the head its first
 //	                                 catch-up with ns reached (behind); "access:{ns}" the read
 //	                                 mode and level of ns's last config entry applied, kept by a
-//	                                 rebuild (narrowedBy)
+//	                                 rebuild (narrowedBy); "stopped:{ns}" the checkpoint the
+//	                                 service held of ns as it stopped following it for keys it
+//	                                 lacks or a refusal (purgeStopped)
 //	nodes(href, name, kind, item, item_head, title, state, …, born, epoch)
 //	                                 one row per node (explicit, or implicit from $parents);
 //	                                 raw parents/$access kept to rebuild the graph on start;
@@ -237,6 +239,22 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 	}
 	crows.Close()
 	if err := crows.Err(); err != nil {
+		return nil, err
+	}
+	strows, err := q.QueryContext(ctx, `SELECT substr(k, 9), v FROM meta WHERE k LIKE 'stopped:%'`)
+	if err != nil {
+		return nil, err
+	}
+	for strows.Next() {
+		var ns, cp string
+		if err := strows.Scan(&ns, &cp); err != nil {
+			strows.Close()
+			return nil, err
+		}
+		g.stopped[ns] = cp
+	}
+	strows.Close()
+	if err := strows.Err(); err != nil {
 		return nil, err
 	}
 	arows, err := q.QueryContext(ctx, `SELECT substr(k, 8), v FROM meta WHERE k LIKE 'access:%'`)

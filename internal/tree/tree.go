@@ -684,9 +684,22 @@ func (s *Service) onCatchUp(ctx context.Context, ns, head string, done bool) {
 	}
 	mark := !s.caught[ns]
 	s.caught[ns] = true
+	// Caught up with its head at the checkpoint it was stopped at: nothing
+	// it couldn't follow is left unapplied (a refusal or a key that has
+	// passed, a stale head pointer), so the stop ends (purgeStopped).
+	_, stopped := s.g.stopped[ns]
+	unstop := stopped && head != "" && s.cur[ns] == head
+	if unstop {
+		delete(s.g.stopped, ns)
+	}
 	s.mu.Unlock()
 	if mark {
 		s.recordCaught(ctx, ns, head)
+	}
+	if unstop {
+		if _, err := s.db.ExecContext(context.WithoutCancel(ctx), `DELETE FROM meta WHERE k = ?`, "stopped:"+ns); err != nil {
+			s.opt.Logf("tree: ending the stop of %s: %v", ns, err)
+		}
 	}
 }
 
@@ -812,27 +825,10 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		return
 	}
 	// A namespace it stops following, or can't follow past an entry, for
-	// lack of keys, at a start or meanwhile, purges ns:{ns} (purgeStopped)
-	// once per checkpoint it is held at: the config entry that took the
-	// keys away (a raise, an epoch the service can't have) is never
-	// applied, so never purges what it narrows.
-	var (
-		smu       sync.Mutex
-		stopped   bool
-		stoppedAt string
-	)
-	stop := func() {
-		s.mu.RLock()
-		cp := s.cur[ns]
-		s.mu.RUnlock()
-		smu.Lock()
-		again := !stopped || cp != stoppedAt
-		stopped, stoppedAt = true, cp
-		smu.Unlock()
-		if again {
-			s.purgeStopped(context.WithoutCancel(ctx), ns)
-		}
-	}
+	// keys it lacks or a refusal (401, 403, 404), at a start or meanwhile,
+	// is stopped (purgeStopped): the config entry that took the keys or
+	// the read away is never applied, so never purges what it narrows.
+	stop := func() { s.purgeStopped(context.WithoutCancel(ctx), ns) }
 	opts := []follow.Option{
 		follow.WithMaxUnits(0),
 		follow.WithOnError(func(n string, err error) {
@@ -896,8 +892,12 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		}
 		if ae, ok := client.AsAPIError(err); ok && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden || ae.Status == http.StatusNotFound) {
 			s.setUnfollowed(ns, err.Error())
-		}
-		if follow.LacksKey(ctx, err) {
+			if ae.Status != http.StatusNotFound || ae.Path == "/ns/"+real {
+				// Refused, or the namespace itself gone; not a log range a
+				// stale head pointer named.
+				stop()
+			}
+		} else if follow.LacksKey(ctx, err) {
 			// Its log can't be read past an entry whose keys the service
 			// lacks: retried, but what that entry narrows is purged now.
 			stop()
@@ -1540,6 +1540,13 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	if err != nil {
 		return nil, err
 	}
+	if _, ok := g.stopped[b.NS]; ok {
+		// Followed again: what it narrowed since it stopped is applied.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k = ?`, "stopped:"+b.NS); err != nil {
+			return nil, err
+		}
+		delete(g.stopped, b.NS)
+	}
 	narrowed = narrowed && (s.cur[b.NS] != "" || recorded || s.opt.Rebuild) && (b.NS == cat || g.Trust[b.NS] || oldTrust[b.NS])
 	if co.PurgedNS || narrowed {
 		res.tags = append(res.tags, "ns:"+s.actual(b.NS))
@@ -1621,18 +1628,35 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	return res, nil
 }
 
-// purgeStopped purges ns:{ns}, as an apply of a config entry that
-// narrows does (applyLocked), when the service stops following the
-// catalog, or a namespace it trusts, at a config entry whose keys it
-// lacks (a raise to e2e without a keyring recipient key, an epoch it
-// can't have): that batch is never applied, and listings kept, stored or
-// cached (its Purger) before it, public or in the clear, must not outlive
-// it, though the service serves none of the catalog's now.
+// purgeStopped stops ns, the catalog or a namespace it trusts, when the
+// service stops following it, or can't follow it past an entry, for keys
+// it lacks (a raise to e2e without a keyring recipient key, an epoch it
+// can't have) or a refusal (made private with the service's grant no
+// longer verifying): that entry is never applied, so never purges what
+// it narrows, and the read mode the service applied predates it. It
+// marks ns stopped at the checkpoint the service holds (Graph.stopped,
+// meta "stopped:{ns}"), so it reads public to no one (publicAsApplied)
+// and a stopped catalog isn't served, and has the grant checker drop what
+// it holds of ns; then it purges ns:{ns}, as an apply of a config entry
+// that narrows does (applyLocked), with its second purge queued: listings
+// kept, stored or cached (its Purger) before it, public or in the clear,
+// must not outlive it. Once per checkpoint: stopped again at the one it
+// was stopped at, after a restart too, it purges nothing more. Applying a
+// batch of ns again ends the stop.
 func (s *Service) purgeStopped(ctx context.Context, ns string) {
-	s.mu.RLock()
+	s.mu.Lock()
 	shown := ns == s.opt.Catalog || s.g.Trust[ns]
-	s.mu.RUnlock()
+	cp := s.cur[ns]
+	was, marked := s.g.stopped[ns]
+	if shown {
+		s.g.stopped[ns] = cp
+	}
+	s.mu.Unlock()
 	if !shown {
+		return
+	}
+	s.checker.Observe(s.actual(ns), "")
+	if marked && was == cp {
 		return
 	}
 	tags := []string{"ns:" + s.actual(ns)}
@@ -1644,6 +1668,9 @@ func (s *Service) purgeStopped(ctx context.Context, ns string) {
 			return err
 		}
 		defer tx.Rollback()
+		if err := saveMeta(ctx, tx, "stopped:"+ns, cp); err != nil {
+			return err
+		}
 		if err := s.sealed.Purge(ctx, tx, tags); err != nil {
 			return err
 		}
@@ -1658,6 +1685,15 @@ func (s *Service) purgeStopped(ctx context.Context, ns string) {
 	s.sealed.Purged(tags)
 	s.kept.Purge(s.opt.Catalog, tags)
 	s.opt.Purger.PurgeTags(tags)
+}
+
+// isStopped reports whether the service stopped following ns
+// (purgeStopped).
+func (s *Service) isStopped(ns string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.g.stopped[ns]
+	return ok
 }
 
 // narrowedBy reports whether a config unit of b makes its namespace
@@ -1677,10 +1713,13 @@ func narrowedBy(ctx context.Context, tx *sql.Tx, g *Graph, b *follow.Batch, purg
 		return false, false, err
 	}
 	public, level, read := true, "", false
+	docs := make([]map[string]any, 0, 1)
 	for _, u := range b.Units {
-		if u.Config == nil {
-			continue
+		if u.Config != nil {
+			docs = append(docs, u.Config.Value)
 		}
+	}
+	for _, doc := range docs {
 		if !read {
 			var v string
 			err := tx.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = ?`, k).Scan(&v)
@@ -1697,8 +1736,8 @@ func narrowedBy(ctx context.Context, tx *sql.Tx, g *Graph, b *follow.Batch, purg
 			}
 			read = true
 		}
-		mode, _ := u.Config.Value["read"].(string)
-		lv := derived.InfoOf(u.Config.Value).Level
+		mode, _ := doc["read"].(string)
+		lv := derived.InfoOf(doc).Level
 		if public && mode != "public" || levelRank(lv) > levelRank(level) && derived.Protected(lv) {
 			narrowed = true
 		}
