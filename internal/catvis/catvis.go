@@ -153,7 +153,7 @@ func NewCatalog(g *tree.Graph, contents map[string]*Content) *Catalog {
 
 // NewCatalogDeleted is NewCatalog with the catalog's tombstoned nodes,
 // each parsed from its last live document (tree.ParseNode), as §B.11.9
-// judges them: their own $access keeps deciding (Profile), so a deleted
+// judges them: their own $access keeps deciding (Profile.Users), so a deleted
 // node's tombstone reaches exactly those who could see it live (Deleted
 // resources), and Deleted returns them. Implicit nodes, and those of g's
 // explicit names, are ignored.
