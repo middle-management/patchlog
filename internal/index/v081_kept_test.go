@@ -38,7 +38,11 @@ func (f *holdEpochKeys) RoundTrip(r *http.Request) (*http.Response, error) {
 		r.Body = io.NopCloser(bytes.NewReader(b))
 		if bytes.Contains(b, []byte(`"epochs":[1]`)) && f.armed.CompareAndSwap(true, false) {
 			close(f.reached)
-			<-f.release
+			select {
+			case <-f.release:
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
 		}
 	}
 	return f.rt.RoundTrip(r)

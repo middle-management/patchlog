@@ -53,4 +53,36 @@ func TestV081CheckAfterRotationSinceInfo(t *testing.T) {
 	if reason, lacks := k.Recheck(ctx, "sec", false); reason != "" || lacks {
 		t.Fatalf("recheck: %q %v", reason, lacks)
 	}
+
+	// A follower behind the head delivers the config entry of epoch 2
+	// once epoch 3 is current: Recheck judges by epoch 3's key, not
+	// epoch 2's, which the grant gets no more.
+	h, err := c.NSHead(ctx, "sec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2, err := c.NSDoc(ctx, "sec", h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Engine.RotateEpoch(ctx, "sec", "system:rotate"); err != nil {
+		t.Fatal(err)
+	}
+	k2 := derived.NewKeys(c, nil)
+	if in, err := k2.Info(ctx, "sec"); err != nil || in.Epoch != 3 {
+		t.Fatalf("info %+v %v", in, err)
+	}
+	if reason, _, _ := k2.Check(ctx, "sec", false); reason != "" {
+		t.Fatalf("check: %q", reason)
+	}
+	k2.Observe("sec", d2.Value)
+	if in, _ := k2.Info(ctx, "sec"); in.Epoch != 2 {
+		t.Fatalf("observed %+v", in)
+	}
+	if reason, lacks := k2.Recheck(ctx, "sec", false); reason != "" || lacks || k2.Skipped("sec") != "" {
+		t.Fatalf("recheck behind the head: %q %v", reason, lacks)
+	}
+	if st := fmt.Sprint(k2.Status([]string{"sec"})); st != "[{sec sealed 3 true false }]" {
+		t.Fatalf("status behind the head %s", st)
+	}
 }
