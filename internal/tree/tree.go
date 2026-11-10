@@ -221,6 +221,10 @@ type Service struct {
 	// (judgeEpochs), outside the graph's lock (tests: a head applied
 	// meanwhile).
 	beforeJudge atomic.Pointer[func()]
+	// afterStop, if set, runs as purgeStopped has marked a namespace
+	// stopped and left the graph's lock, before the purges it then makes
+	// (tests: a reader meanwhile).
+	afterStop atomic.Pointer[func(ns string)]
 	// verifyHook, if set, fails the verification of a grant in each
 	// namespace it returns an error for (tests: a requireAt chain the
 	// checker can't read).
@@ -1735,6 +1739,9 @@ func (s *Service) purgeStopped(ctx context.Context, ns string) {
 	// followed, so a g/all cookie from before is 403 at an at with it).
 	s.noteTrust(ctx)
 	s.mu.Unlock()
+	if f := s.afterStop.Load(); f != nil {
+		(*f)(ns)
+	}
 	s.checker.Observe(s.actual(ns), "")
 	if marked && was == cp {
 		return

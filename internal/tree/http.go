@@ -216,11 +216,19 @@ func (v *viewer) sealsWhole() bool { return !v.catPublic && v.gs == AllSubjects 
 // shape is what a listing at a URL depends on besides the URL: what the
 // reader reads whole. A public namespace that turns private moves neither
 // the anonymous URL space nor a gs, so a kept listing is served only to
-// readers of the shape it was computed for.
+// readers of the shape it was computed for. Only the namespaces read
+// whole count, never one merely named (contentAll false): a g/all reader
+// that doesn't read a stopped namespace (ACCESS-11, Service.listed), or a
+// subject set's once one stops reading public, must not share the key of
+// a listing kept, at an at from before the stop, for readers that read it
+// whole, while the stop's purge of ns:{ns} is still to come (§A.4,
+// §B.11.5, purgeStopped).
 func (v *viewer) shape() string {
 	nss := make([]string, 0, len(v.contentAll))
-	for ns := range v.contentAll {
-		nss = append(nss, ns)
+	for ns, whole := range v.contentAll {
+		if whole {
+			nss = append(nss, ns)
+		}
 	}
 	sort.Strings(nss)
 	return strconv.FormatBool(v.catAll) + " " + strings.Join(nss, ",")
