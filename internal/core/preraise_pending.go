@@ -123,12 +123,17 @@ func (t *tx) recordPending(sh int64, name string, seq int64, s pendingSealing) {
 }
 
 // pendingPruned is the horizon A named when it answered 410 pruned for the
-// sealing of kind of ref (a revision or blob id) of resource name that
-// shadow sh lacks, if it did.
-func (t *tx) pendingPruned(sh *nsRow, kind, name, ref string) (string, bool) {
+// sealing of kind of ref (a revision or blob id) of resource name under
+// epoch (any, for epoch < 0) that shadow sh lacks, if it did.
+func (t *tx) pendingPruned(sh *nsRow, kind, name, ref string, epoch int) (string, bool) {
+	q := `SELECT horizon FROM remote_pending_sealings WHERE shadow = ? AND name = ? AND kind = ? AND ref = ? AND answer = ?`
+	args := []any{sh.id, name, kind, ref, pendPruned}
+	if epoch >= 0 {
+		q += ` AND epoch = ?`
+		args = append(args, epoch)
+	}
 	var hz sql.NullString
-	err := t.QueryRow(`SELECT horizon FROM remote_pending_sealings WHERE shadow = ? AND name = ? AND kind = ? AND ref = ? AND answer = ? LIMIT 1`,
-		sh.id, name, kind, ref, pendPruned).Scan(&hz)
+	err := t.QueryRow(q+` LIMIT 1`, args...).Scan(&hz)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false
 	}

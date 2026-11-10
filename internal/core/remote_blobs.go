@@ -558,10 +558,12 @@ func (t *tx) storePreSealings(res int64, kidNS string, ps *preSealings, e client
 // answering 502 (upstream) until then, or 410 where A has pruned it",
 // §G.3, §12.1), since B never seals an E3 source's content itself. It is
 // panicked by the sealing builders (preRaiseResJob), as encUnavailable
-// is, so no caller can go on to serve that content another way.
-func (t *tx) preRaiseUnfetched(sh *nsRow, kind, name, ref, what string) *Error {
+// is, so no caller can go on to serve that content another way. epoch is
+// the epoch URL of a blob's sealing, A's answer for which is for that
+// epoch alone; for an entry or a document, which have one sealing, -1.
+func (t *tx) preRaiseUnfetched(sh *nsRow, kind, name, ref string, epoch int, what string) *Error {
 	if name != "" {
-		if hz, ok := t.pendingPruned(sh, kind, name, ref); ok {
+		if hz, ok := t.pendingPruned(sh, kind, name, ref, epoch); ok {
 			return apiErr(410, "pruned", "message", what+" is from before its source's raise from sealed, whose deployment has pruned it (§G.3, §8.6)",
 				"horizon", hz)
 		}
