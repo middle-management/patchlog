@@ -214,3 +214,23 @@ func TestV081ZipSealingsDontOpen(t *testing.T) {
 		t.Fatal("asked /keys for a zip sealing")
 	}
 }
+
+// KEYS-11: a resource purged (§8.3) has no log to count, so a fresh view's
+// first sealing for it, a genesis for its name, isn't refused: the purged
+// head answers no log, and the view counts what it seals.
+func TestV081FreshViewSealsAfterPurge(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{KeyStore: keyStore(t)})
+	c := s.Client(t, client.WithAuthor("alice"))
+	_, priv, _ := seal.GenerateRecipient()
+	must(c.CreateNamespace(ctx, "e", map[string]any{"encryption": map[string]any{"level": "e2e"}}))
+	must(c.E2E(priv).InitKeyring(ctx, "e"))
+	x := c.E2E(priv).WithoutValidation()
+	w := must(x.CreateSealed(ctx, "e", "d", client.GenesisPatches(map[string]any{"n": 0})))
+	must(c.Purge(ctx, "e", "d", w.ID, false))
+	if h := must(c.Head(ctx, "e", "d")); h.State != client.Purged {
+		t.Fatalf("head after purge: %+v", h)
+	}
+	must(c.E2E(priv).SealPatches(ctx, "e", "d", "", client.GenesisPatches(map[string]any{"n": 1})))
+}

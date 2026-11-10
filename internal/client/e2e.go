@@ -870,8 +870,9 @@ func (x *E2E) countLog(ctx context.Context, ns, name string) error {
 	}
 	switch {
 	case err == nil:
-	case IsNotFound(err) && since == "":
-		// No resource yet: nothing sealed under it but what the view did.
+	case IsNotFound(err) && since == "", IsGone(err):
+		// No resource yet, or one purged (§8.3), which may be created
+		// again: nothing sealed under it to count but what the view did.
 		x.seals.mu.Lock()
 		sc.counted = true
 		x.seals.mu.Unlock()
