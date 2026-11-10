@@ -21,7 +21,9 @@ import (
 //	                                 content namespace's document as of its checkpoint; "purged:{ns}"
 //	                                 when the service applied ns's purge (Unix nanoseconds; "1"
 //	                                 from earlier releases); "caught:{ns}" the head its first
-//	                                 catch-up with ns reached (behind)
+//	                                 catch-up with ns reached (behind); "access:{ns}" the read
+//	                                 mode and level of ns's last config entry applied
+//	                                 (narrowedBy)
 //	nodes(href, name, kind, item, item_head, title, state, …, born, epoch)
 //	                                 one row per node (explicit, or implicit from $parents);
 //	                                 raw parents/$access kept to rebuild the graph on start;
@@ -233,6 +235,23 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 	}
 	crows.Close()
 	if err := crows.Err(); err != nil {
+		return nil, err
+	}
+	arows, err := q.QueryContext(ctx, `SELECT substr(k, 8), v FROM meta WHERE k LIKE 'access:%'`)
+	if err != nil {
+		return nil, err
+	}
+	for arows.Next() {
+		var ns, v string
+		if err := arows.Scan(&ns, &v); err != nil {
+			arows.Close()
+			return nil, err
+		}
+		m, _ := parseJSON(v).(map[string]any)
+		g.appliedPublic[ns], _ = m["public"].(bool)
+	}
+	arows.Close()
+	if err := arows.Err(); err != nil {
 		return nil, err
 	}
 	rows, err := q.QueryContext(ctx, `SELECT name, self, head, title, parents, access, state, dangling, cyclic, deep, item_state, item_head, born, epoch, born_epoch FROM nodes`)

@@ -2,11 +2,15 @@ package tree_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"io"
+	"net/http"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +18,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -411,4 +416,263 @@ func TestV0261FileSealingAfterRead(t *testing.T) {
 			}
 		}
 	}
+}
+
+// v0261Get follows up to 5 redirects without failing the test: the final
+// status, headers, body and path.
+func v0261Get(x *svc, path, token string) (int, http.Header, string, string) {
+	for range 5 {
+		req := must(http.NewRequest("GET", x.http.URL+path, nil))
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		r := must(noRedirect.Do(req))
+		b := must(io.ReadAll(r.Body))
+		r.Body.Close()
+		if r.StatusCode == 302 {
+			path = r.Header.Get("Location")
+			continue
+		}
+		return r.StatusCode, r.Header, string(b), path
+	}
+	return 0, nil, "", path
+}
+
+// v0261HoldWAL opens a read transaction on the service's database and reads
+// from it, so that its snapshot predates the next commit: a later
+// PRAGMA wal_checkpoint(TRUNCATE) waits for it (busy_timeout, 10 s). The
+// returned func ends it.
+func v0261HoldWAL(t *testing.T, db string) func() {
+	t.Helper()
+	sq := must(sql.Open("sqlite", sqlitedsn.DSN(db, "")))
+	tx := must(sq.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true}))
+	var n int
+	if err := tx.QueryRow(`SELECT count(*) FROM meta`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	done := false
+	release := func() {
+		if done {
+			return
+		}
+		done = true
+		_ = tx.Rollback()
+		_ = sq.Close()
+	}
+	t.Cleanup(release)
+	return release
+}
+
+// §9 ("making a namespace private ... requires the origin to purge the
+// tag ns:{ns}"), §B.11.5 ("served at /{catalog}/at/{at}/…, unfiltered,
+// while they stay public"), §A.1 ("serving or keeping none computed from
+// what was read before it"): whether a reader is the anonymous public
+// viewer is decided from the grant checker's cached namespace document
+// (publicViewer, checker.Config), which Apply refreshes (checker.Observe)
+// only at its very end: after the narrowing's purge went out, after the
+// new checkpoint is published (s.cur), and after the WAL checkpoint the
+// purge triggers. unchanged() re-reads only the encryption, never the read
+// mode. In that window an anonymous reader is served the listing at the
+// at AFTER the catalog (or a namespace it trusts) turned private, with
+// what the same batch wrote after the config entry, public immutable,
+// and it is kept after the purge.
+//
+// The window is widened here, without touching the service, by holding a
+// read transaction on its database so the WAL checkpoint waits.
+//
+// Fixed in v0.26.1: Apply tells the checker (checker.Observe) as it
+// starts, before the graph moves.
+func TestV0261PrivateServedPublicBeforeCheckerObserve(t *testing.T) {
+	t.Parallel()
+	for _, which := range []string{"cat", "sec"} {
+		t.Run(which, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+			k := clienttest.NewKey("k")
+			for _, ns := range []string{"cat", "sec"} {
+				doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+				if ns == "cat" {
+					doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag", "title": "/title"}
+				}
+				must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+			}
+			both := []string{"cat", "sec"}
+			w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "append", "config"})), client.WithKeys(client.NewKeys(nil)))
+			must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+			must(w.CreateDoc(ctx, "sec", "a", map[string]any{"title": "A"}))
+			must(w.CreateDoc(ctx, "cat", "sec.a", map[string]any{"parents": parents("root@a0")}))
+			sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+			db := filepath.Join(t.TempDir(), "tree.db")
+			// The default checker TTL (the harness sets 1 ms).
+			x := startSvc(t, sc, svcOpts{now: s.Now, db: db}, func(o *tree.Options) { o.CheckerTTL = 30 * time.Second })
+			x.caughtUp("cat", "sec")
+			if st, _, b, _ := v0261Get(x, "/cat/children?of=root", ""); st != 200 {
+				t.Fatalf("setup: %d %s", st, b)
+			}
+			at0, nb0 := x.s.At(), x.batches()
+
+			// One batch: the narrowing config entry, then a write.
+			release := v0261HoldWAL(t, db)
+			private := []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}
+			h := must(w.NSHead(ctx, which))
+			req := client.BatchRequest{Config: &client.BatchConfig{IfMatch: h.Config, Patches: private}}
+			if which == "cat" {
+				req.Items = []client.BatchItem{{Resource: "late", IfNoneMatch: true,
+					Steps: []client.Step{client.PatchStep(client.GenesisPatches(map[string]any{"title": "Late qz8v", "parents": parents("root@b0")}))}}}
+			} else {
+				// sec's item is already placed; its new title is written
+				// after sec turned private.
+				req.Items = []client.BatchItem{{Resource: "a", IfMatch: must(w.Head(ctx, "sec", "a")).ID,
+					Steps: []client.Step{client.PatchStep([]any{map[string]any{"op": "replace", "path": "/title", "value": "Late qz8v"}})}}}
+			}
+			must(w.Batch(ctx, which, req, false))
+			waitFor(t, "the narrowing applied", func() bool { return x.s.At() != at0 })
+
+			st, hdr, body, path := v0261Get(x, "/cat/children?of=root", "")
+			release()
+			if st == 200 && strings.Contains(body, "qz8v") {
+				t.Errorf("%s made private: anonymous GET served %s 200 with what the batch wrote after the config entry, Cache-Control %q: %s",
+					which, path, hdr.Get("Cache-Control"), body)
+			}
+			// Apply ends (OnApply runs after checker.Observe).
+			waitFor(t, "the apply to end", func() bool { return x.batches() > nb0 })
+			// Control: once Apply has told the checker, the same reads
+			// are 401. What the window served stays in a CDN until the
+			// second purge (repurge, 2 min by default; the harness
+			// disables the loop) and in browsers for max-age (a day).
+			if st, _, b, _ := v0261Get(x, "/cat/children?of=root", ""); st != 401 {
+				t.Errorf("control: anonymous GET after the apply: %d %s", st, b)
+			}
+		})
+	}
+}
+
+// §9, §B.11.5 (v0.26.1): a load the grant checker began before Apply told
+// it of a config entry (checker.Observe) can end after it, and hold the
+// document from before the entry for its TTL (30 s): the catalog, or a
+// namespace it trusts, still public there after it was made private. Who
+// reads public is judged against what the service applied too
+// (readPublic): a document it has applied, older than the entry, no longer
+// says public. Here the checker's read of the document is held until the
+// narrowing, and a write after it in the same batch, are applied.
+func TestV0261PrivateStaleChecker(t *testing.T) {
+	t.Parallel()
+	for _, which := range []string{"cat", "sec"} {
+		t.Run(which, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			var gate atomic.Value // the path of the document read held
+			gate.Store("")
+			hit, release := make(chan struct{}), make(chan struct{})
+			var hitOnce sync.Once
+			s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond,
+				Wrap: func(h http.Handler) http.Handler {
+					return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if p := gate.Load().(string); p != "" && r.Method == "GET" && r.URL.Path == p {
+							hitOnce.Do(func() { close(hit) })
+							<-release
+						}
+						h.ServeHTTP(w, r)
+					})
+				}})
+			k := clienttest.NewKey("k")
+			for _, ns := range []string{"cat", "sec"} {
+				doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+				if ns == "cat" {
+					doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag", "title": "/title"}
+				}
+				must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+			}
+			both := []string{"cat", "sec"}
+			w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "append", "config"})), client.WithKeys(client.NewKeys(nil)))
+			must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+			must(w.CreateDoc(ctx, "sec", "a", map[string]any{"title": "A"}))
+			must(w.CreateDoc(ctx, "cat", "sec.a", map[string]any{"parents": parents("root@a0")}))
+			sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+			x := startSvc(t, sc, svcOpts{now: s.Now}, func(o *tree.Options) { o.CheckerTTL = 30 * time.Second })
+			x.caughtUp("cat", "sec")
+
+			// The checker's first read of which's document is held.
+			gate.Store("/ns/" + which + "/rev/" + must(w.NSHead(ctx, which)).ID)
+			type answer struct {
+				st         int
+				hdr        http.Header
+				body, path string
+			}
+			first := make(chan answer, 1)
+			go func() {
+				st, hdr, body, path := v0261Get(x, "/cat/children?of=root", "")
+				first <- answer{st, hdr, body, path}
+			}()
+			<-hit
+			private := []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}
+			h := must(w.NSHead(ctx, which))
+			req := client.BatchRequest{Config: &client.BatchConfig{IfMatch: h.Config, Patches: private}}
+			if which == "cat" {
+				req.Items = []client.BatchItem{{Resource: "late", IfNoneMatch: true,
+					Steps: []client.Step{client.PatchStep(client.GenesisPatches(map[string]any{"title": "Late qz8v", "parents": parents("root@b0")}))}}}
+			} else {
+				req.Items = []client.BatchItem{{Resource: "a", IfMatch: must(w.Head(ctx, "sec", "a")).ID,
+					Steps: []client.Step{client.PatchStep([]any{map[string]any{"op": "replace", "path": "/title", "value": "Late qz8v"}})}}}
+			}
+			nb := x.batches()
+			must(w.Batch(ctx, which, req, false))
+			waitFor(t, "the narrowing applied", func() bool { return x.batches() > nb })
+			gate.Store("")
+			close(release)
+			// The read held, then one after it, while the checker holds
+			// what that read loaded.
+			answers := []answer{<-first}
+			st, hdr, body, path := v0261Get(x, "/cat/children?of=root", "")
+			answers = append(answers, answer{st, hdr, body, path})
+			for i, a := range answers {
+				if a.st == 200 && strings.Contains(a.body, "qz8v") {
+					t.Errorf("%s made private, read %d: anonymous GET served %s 200, Cache-Control %q: %s", which, i, a.path, a.hdr.Get("Cache-Control"), a.body)
+				}
+			}
+		})
+	}
+}
+
+// §9, §B.11.5 (v0.26.1): the other way, a catalog just made public reads
+// public before the service applies it: the grant checker's document is
+// newer than any the service applied, and decides. Here the service is
+// kept from reading the catalog's log meanwhile.
+func TestV0261PublicBeforeApplied(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	var block atomic.Bool
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond,
+		Wrap: func(h http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if block.Load() && strings.HasPrefix(r.URL.Path, "/ns/cat/") && strings.HasSuffix(r.URL.Path, "/log") {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(503)
+					w.Write([]byte(`{"code":"unavailable","message":"injected"}`))
+					return
+				}
+				h.ServeHTTP(w, r)
+			})
+		}})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	x := startSvc(t, sc, svcOpts{now: s.Now})
+	x.caughtUp("cat")
+	if st, _, b, _ := v0261Get(x, "/cat/roots", ""); st != 401 {
+		t.Fatalf("setup: %d %s", st, b)
+	}
+	at := x.s.At()
+	block.Store(true)
+	time.Sleep(500 * time.Millisecond) // the long poll in flight ends (LongPoll)
+	must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "public"}}))
+	waitFor(t, "an anonymous read", func() bool { st, _, _, _ := v0261Get(x, "/cat/roots", ""); return st == 200 })
+	if x.s.At() != at {
+		t.Fatal("the service applied the entry")
+	}
+	block.Store(false)
 }

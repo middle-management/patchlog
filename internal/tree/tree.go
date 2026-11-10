@@ -975,6 +975,14 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 			s.keys.Observe(fb.NS, u.Config.Value)
 		}
 	}
+	if cfg != nil {
+		// The grant checker drops the document it holds now, before the
+		// graph moves: who reads public (publicViewer) is decided from
+		// it, and one made private must not be read public at the
+		// checkpoint that makes it so (§9, §B.11.5). Told again once
+		// applied (below).
+		s.checker.Observe(fb.NS, b.NewCheckpoint)
+	}
 	if cfg != nil && s.hasRun(fb.NS) {
 		// A raise (to e2e from none or at-rest, Addendum E Levels) or an
 		// epoch whose keys the service lacks as configured: skipped as
@@ -1490,7 +1498,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	// index's do (index.narrowed). Listings carry ns:{ns} for the catalog
 	// and every namespace it trusts (tagSet.header) once that has a
 	// checkpoint: at its first batch none shows it yet.
-	narrowed, err := narrowedBy(ctx, tx, b, co.PurgedNS)
+	narrowed, _, err := narrowedBy(ctx, tx, g, b, co.PurgedNS)
 	if err != nil {
 		return nil, err
 	}
@@ -1615,50 +1623,53 @@ func (s *Service) purgeStopped(ctx context.Context, ns string) {
 
 // narrowedBy reports whether a config unit of b makes its namespace
 // private or raises it to sealed or e2e (§9), against the read mode and
-// level the service last applied for it (meta "access:{ns}"), and records
-// the last unit's in tx; a purge (purged) drops the record. Before the
-// first it records, a namespace counts as public and unsealed, so the
-// first private or sealed document it applies counts too: at a genesis,
-// when nothing is kept yet, and once after an upgrade from a release
-// that kept no record, when there may be (index.narrowed).
-func narrowedBy(ctx context.Context, tx *sql.Tx, b *follow.Batch, purged bool) (bool, error) {
+// level the service last applied for it (meta "access:{ns}"), and
+// whether there was such a record (recorded); it records the last unit's,
+// in tx and in g (Graph.appliedPublic). A purge (purged) drops the
+// record. Without a record, a namespace counts as public and unsealed,
+// so the first private or sealed document applied counts too: at a
+// genesis, and once after an upgrade from a release that kept no record
+// (index.narrowed).
+func narrowedBy(ctx context.Context, tx *sql.Tx, g *Graph, b *follow.Batch, purged bool) (narrowed, recorded bool, err error) {
 	k := "access:" + b.NS
 	if purged {
+		delete(g.appliedPublic, b.NS)
 		_, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k = ?`, k)
-		return false, err
+		return false, false, err
 	}
-	public, level, known := true, "", false
-	narrowed := false
+	public, level, read := true, "", false
 	for _, u := range b.Units {
 		if u.Config == nil {
 			continue
 		}
-		if !known {
+		if !read {
 			var v string
 			err := tx.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = ?`, k).Scan(&v)
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
 			case err != nil:
-				return false, err
+				return false, false, err
 			default:
+				recorded = true
 				if m, ok := parseJSON(v).(map[string]any); ok {
 					public, _ = m["public"].(bool)
 					level, _ = m["level"].(string)
 				}
 			}
-			known = true
+			read = true
 		}
-		read, _ := u.Config.Value["read"].(string)
+		mode, _ := u.Config.Value["read"].(string)
 		lv := derived.InfoOf(u.Config.Value).Level
-		if public && read != "public" || levelRank(lv) > levelRank(level) && derived.Protected(lv) {
+		if public && mode != "public" || levelRank(lv) > levelRank(level) && derived.Protected(lv) {
 			narrowed = true
 		}
-		public, level = read == "public", lv
+		public, level = mode == "public", lv
 	}
-	if !known {
-		return false, nil
+	if !read {
+		return false, false, nil
 	}
-	return narrowed, saveMeta(ctx, tx, k, marshal(map[string]any{"public": public, "level": level}))
+	g.appliedPublic[b.NS] = public
+	return narrowed, recorded, saveMeta(ctx, tx, k, marshal(map[string]any{"public": public, "level": level}))
 }
 
 // levelRank orders encryption levels: none and at-rest, sealed, e2e

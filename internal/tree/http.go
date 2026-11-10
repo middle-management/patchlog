@@ -168,6 +168,20 @@ type viewer struct {
 	// noEdge keeps a listing out of shared caches whoever reads it
 	// (edgeHold).
 	noEdge bool
+	// public are the namespaces the viewer was judged by as public, ""
+	// the catalog, with the head of the document that said so
+	// (readPublic): a listing whose graph is read after the service
+	// applied one of them made private is computed again (unchanged).
+	public map[string]string
+}
+
+// judgedPublic records that ns ("" the catalog) was judged public by its
+// document at head (readPublic).
+func (v *viewer) judgedPublic(ns, head string) {
+	if v.public == nil {
+		v.public = map[string]string{}
+	}
+	v.public[ns] = head
 }
 
 // wide reports whether the viewer reads the catalog and every namespace of
@@ -268,25 +282,78 @@ func (s *Service) edgeClaims(r *http.Request) *edge.Claims {
 // since it can't follow it (§B.5), isn't in the checkpoint and shows
 // nothing in listings.
 func (s *Service) publicViewer(ctx context.Context) (*viewer, error) {
-	cfg, err := s.checker.Config(ctx, s.actual(s.opt.Catalog))
-	if err != nil || cfg.Read != "public" {
+	public, head, err := s.readPublic(ctx, s.opt.Catalog)
+	if err != nil || !public {
 		return nil, err
 	}
 	trust, gone := s.trustList()
 	listed := s.listed()
 	v := &viewer{anon: true, catPublic: true, catAll: true, contentAll: map[string]bool{}}
+	v.judgedPublic("", head)
 	for _, ns := range trust {
 		if gone[ns] {
 			v.contentAll[ns] = true
 			continue
 		}
-		if c, err := s.checker.Config(ctx, s.actual(ns)); err == nil && c.Read == "public" {
+		if public, head, err := s.readPublic(ctx, ns); err == nil && public {
 			v.contentAll[ns] = true
+			v.judgedPublic(ns, head)
 		} else if listed[ns] {
 			return nil, nil
 		}
 	}
 	return v, nil
+}
+
+// readPublic reports whether namespace ns reads public (§7), and the head
+// of the document that says so: as the grant checker holds its document
+// (checker.Config), unless the service has applied a config entry making
+// it private and that document is one it has applied (appliedPrivate). A
+// load the checker began before Apply told it (checker.Observe) may hold
+// the document from before that entry until its TTL. A document the
+// service hasn't applied yet is newer, and decides: a namespace just made
+// public reads public before the service applies it. An error is the
+// checker's, for a document it can't read.
+func (s *Service) readPublic(ctx context.Context, ns string) (bool, string, error) {
+	c, err := s.checker.Config(ctx, s.actual(ns))
+	if err != nil {
+		return false, "", err
+	}
+	if c.Read != "public" || s.appliedPrivate(ctx, ns, c.Head) {
+		return false, c.Head, nil
+	}
+	return true, c.Head, nil
+}
+
+// appliedPrivate reports whether the last config entry the service
+// applied for ns made it private (Graph.appliedPublic) and head, the
+// ns_id a document of ns was read at, is one it has applied (seen), or
+// can't tell.
+func (s *Service) appliedPrivate(ctx context.Context, ns, head string) bool {
+	s.mu.RLock()
+	public, known := s.g.appliedPublic[ns]
+	s.mu.RUnlock()
+	if !known || public {
+		return false
+	}
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM seen WHERE ns = ? AND ns_id = ?`, ns, head).Scan(&one)
+	return !errors.Is(err, sql.ErrNoRows)
+}
+
+// stillPublic is errInfoChanged if a namespace v was judged public by
+// (viewer.public) has been made private by a config entry the service
+// applied since, of which the document it was judged by knew nothing.
+func (s *Service) stillPublic(ctx context.Context, v *viewer) error {
+	for ns, head := range v.public {
+		if ns == "" {
+			ns = s.opt.Catalog
+		}
+		if s.appliedPrivate(ctx, ns, head) {
+			return errInfoChanged
+		}
+	}
+	return nil
 }
 
 // listed reports, for each content namespace the catalog trusts, whether
@@ -339,14 +406,13 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 	// In a release preview every check is on the branch read in place of
 	// a namespace: a viewer sees only branches it can read (§B.5).
 	cat := s.actual(s.opt.Catalog)
-	cfg, err := s.checker.Config(ctx, cat)
+	catPublic, catHead, err := s.readPublic(ctx, s.opt.Catalog)
 	if err != nil {
 		return nil, err
 	}
 	if token == "" {
 		return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
 	}
-	catPublic := cfg.Read == "public"
 	trust, gone := s.trustList()
 	listed := s.listed()
 	// The grant verified for the catalog, nil where a public catalog
@@ -365,6 +431,9 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 	}
 	var exp time.Time
 	v := &viewer{byGrant: true, catPublic: catPublic, contentAll: map[string]bool{}}
+	if catPublic {
+		v.judgedPublic("", catHead)
+	}
 	if vg != nil {
 		exp = grantExp(vg, exp)
 		v.bucket, v.idExp = vg.Principal.ID+"\x00"+vg.Key.Kid, exp
@@ -385,11 +454,12 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 			continue
 		}
 		real := s.actual(ns)
-		c, err := s.checker.Config(ctx, real)
+		pub, head, err := s.readPublic(ctx, ns)
 		switch {
 		case err != nil:
-		case c.Read == "public":
+		case pub:
 			public[ns], unres[ns], wide[ns] = true, true, true
+			v.judgedPublic(ns, head)
 		default:
 			cv, err := s.verify(ctx, real, token)
 			if _, ok := chainErr(err); ok {
@@ -1160,7 +1230,8 @@ var errPurgedSince = errors.New("the listing was computed before a purge of what
 // errInfoChanged is a listing computed under the catalog's encryption, or
 // the file metadata's sealing, as read before its graph was, which has
 // changed since: a raise to sealed or e2e, or a rotation, observed before
-// the apply that moves the graph (Apply, keys.Observe). It is
+// the apply that moves the graph (Apply, keys.Observe); or for a viewer
+// judged public by a namespace made private since (stillPublic). It is
 // errPurgedSince, computed again with what is current: a raise purges
 // what it narrows (§9, applyLocked's ns:{ns}), but a rotation purges
 // nothing, so only reading them again tells.
@@ -1213,7 +1284,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	// so both are read again once the graph is (unchanged): a rotation
 	// purges nothing, and a listing whose graph is read after one must
 	// not be served, kept or judged by under the epoch it replaced.
-	if err := s.unchanged(ctx, info, nil); err != nil {
+	if err := s.unchanged(ctx, v, info, nil); err != nil {
 		return nil, err
 	}
 	if f := s.afterGeneration.Load(); f != nil {
@@ -1250,7 +1321,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			cps, prof = s.checkpointsOf(g, curMap), s.profileOf(g)
 		})
 		if st, ok := s.sealed.Get(ctx, keyOf(at)); ok {
-			if err := s.unchanged(ctx, info, fs); err != nil {
+			if err := s.unchanged(ctx, v, info, fs); err != nil {
 				return nil, err
 			}
 			if prof != nil && !prof.Admits(v.subjects) {
@@ -1436,7 +1507,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		})
 		// What it was computed under still holds as the graph was read,
 		// before anything is judged, stored, kept or served by it.
-		if err := s.unchanged(ctx, info, fs); err != nil {
+		if err := s.unchanged(ctx, v, info, fs); err != nil {
 			return nil, err
 		}
 		if l.status == http.StatusOK && len(missing) == 0 && serr == nil && len(judged) > 0 {
@@ -1543,9 +1614,11 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 }
 
 // unchanged is errInfoChanged if the catalog's encryption is no longer
-// info, or what fs was read from has changed (fileSealingChanged; fs nil
-// for none yet), and errCurrentKey if it can't be read.
-func (s *Service) unchanged(ctx context.Context, info derived.Info, fs *fileSealing) error {
+// info, what fs was read from has changed (fileSealingChanged; fs nil
+// for none yet), or a namespace v was judged public by has since been
+// made private (stillPublic), and errCurrentKey if the encryption can't
+// be read.
+func (s *Service) unchanged(ctx context.Context, v *viewer, info derived.Info, fs *fileSealing) error {
 	cat := s.opt.Catalog
 	now, err := s.keys.Info(ctx, cat)
 	if err != nil {
@@ -1554,7 +1627,7 @@ func (s *Service) unchanged(ctx context.Context, info derived.Info, fs *fileSeal
 	if now != info || fs != nil && s.fileSealingChanged(ctx, fs) {
 		return errInfoChanged
 	}
-	return nil
+	return s.stillPublic(ctx, v)
 }
 
 // dropWholeViews drops the listings stored sealed whole (derived.Cache)
@@ -2064,7 +2137,7 @@ func (s *Service) sees(ctx context.Context, ns, token string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if cfg.Read == "public" {
+	if cfg.Read == "public" && !s.appliedPrivate(ctx, ns, cfg.Head) {
 		return true, nil
 	}
 	if token == "" {

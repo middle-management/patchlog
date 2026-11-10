@@ -194,6 +194,11 @@ type Graph struct {
 	// checkpoint the service reflects for it, so what depends on roles and
 	// keys is pinned to the combined checkpoint (§B.11.5).
 	Content map[string]*NSConfig
+	// appliedPublic is, for each namespace with a config entry applied
+	// (meta "access:{ns}", narrowedBy), whether the last made it public:
+	// the read mode as of the checkpoint the service reflects, which the
+	// grant checker's cached documents may predate (readPublic).
+	appliedPublic map[string]bool
 	// Aliases maps a namespace to the branch followed in its place in a
 	// release preview (§B.5, §F.9); nil otherwise.
 	Aliases map[string]string
@@ -224,7 +229,7 @@ type NSConfig struct {
 }
 
 func newGraph(catalog string) *Graph {
-	return &Graph{Catalog: catalog, Trust: map[string]bool{}, Content: map[string]*NSConfig{}, nodes: map[string]*Node{},
+	return &Graph{Catalog: catalog, Trust: map[string]bool{}, Content: map[string]*NSConfig{}, appliedPublic: map[string]bool{}, nodes: map[string]*Node{},
 		explicit: map[string]*Node{}, self: map[string]*Node{}, explicitGone: map[string]bool{}, children: map[string]map[string]bool{},
 		saved: map[string]*savedRow{}}
 }
