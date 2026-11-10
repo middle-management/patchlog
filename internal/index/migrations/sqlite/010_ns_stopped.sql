@@ -1,0 +1,24 @@
+-- Migration: ns stopped
+-- Created: 2026-11-10T10:18:43Z
+-- Checksum: 5361303795cd40b38284a07c42ab0f325413be920dc4c3aa5996a14dff503b4a
+-- Chain: 86df6348a86c95d34254c94bda257d5d2aea247125ae3da03ada72d46027ac2e
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- ns_stopped: a namespace the index serves and stopped following, or
+-- can't follow past an entry, for keys it lacks or a refusal, with the
+-- checkpoint it was stopped at (Index.purgeStopped): idx:{ns} was purged
+-- then, once, and ns reads public to no one until a batch of it is applied
+-- again or its follower catches up with that checkpoint.
+CREATE TABLE IF NOT EXISTS ns_stopped (ns TEXT PRIMARY KEY, ns_id TEXT NOT NULL);
