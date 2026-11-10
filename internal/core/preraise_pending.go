@@ -125,8 +125,9 @@ func strictJWE(jwe string) bool {
 
 // pendingJWEMax bounds A's sealing of the content of mirrored revision
 // seq, as creation bounds it (jweFor): of its document (kind sealDoc), or
-// of its log entry as the shadow serves it; 0, for caps.jwe, where B no
-// longer holds that content.
+// of its log entry as the shadow serves it, with room for the grant A's
+// entry names (a mirrored row records none, so the shadow's entry is
+// shorter by it); 0, for caps.jwe, where B no longer holds that content.
 func (t *tx) pendingJWEMax(kind string, seq int64) int64 {
 	row := t.rev(seq)
 	if !row.patches.Valid {
@@ -139,8 +140,12 @@ func (t *tx) pendingJWEMax(kind string, seq int64) int64 {
 		}
 		return jweFor(len(b))
 	}
-	return jweFor(len(jsonv.Canonical(t.logEntry(row).value())))
+	return jweFor(len(jsonv.Canonical(t.logEntry(row).value())) + maxEntryGrant)
 }
+
+// maxEntryGrant bounds the "grant" member of a log entry (§7.1: its id,
+// root sub and kid), which a mirrored row doesn't keep.
+const maxEntryGrant = 4 << 10
 
 // contentDigest is the digest a pending sealing must open to: of v's
 // canonical JSON, an entry or a document.
