@@ -21,7 +21,8 @@
 //     readScope (a read grant that doesn't fix /resource is 403, §2.1);
 //   - read decisions: the grant allows read and its key-scope, block and
 //     role rules pass against a read envelope
-//     { action: "read", resource?, principal, now } (§C.2 item 5).
+//     { action: "read", resource?, principal }, which has no now: a rule
+//     that refers to /now fails a read as a whole (§C.2 item 5).
 //
 // The Checker fetches namespace documents with its own client (which needs
 // read on the namespaces checked) and caches them for a TTL; after the TTL
@@ -768,9 +769,13 @@ func (ch *Checker) CheckRead(ctx context.Context, ns, token, resource string) (*
 	return d, nil
 }
 
-// ReadEnvelope is the read envelope of §6.4.1 evaluated for reads.
+// ReadEnvelope is the read envelope of §6.4.1 evaluated for reads. It
+// has no now, whatever now is (§C.2 item 5): a rule that refers to /now
+// fails a read as a whole (FailsRead), and a read's time window is its
+// grant's nbf and exp. now is kept for callers' signatures only.
 func ReadEnvelope(v *grant.Verified, resource string, now time.Time) map[string]any {
-	env := map[string]any{"action": "read", "now": now.UTC().Format("2006-01-02T15:04:05.000Z")}
+	_ = now
+	env := map[string]any{"action": "read"}
 	if resource != "" {
 		env["resource"] = resource
 	}
@@ -780,9 +785,22 @@ func ReadEnvelope(v *grant.Verified, resource string, now time.Time) map[string]
 	return env
 }
 
+// FailsRead reports whether r fails as a whole wherever it is evaluated
+// for a read (§C.2 item 5): it refers to /now, at any depth, which a read
+// envelope doesn't carry, or to the whole envelope (path ""), which holds
+// /now as far as a rule can tell (the conservative reading). It fails
+// before Eval, so that a not or any around it can't make it pass.
+func FailsRead(r *rules.Rule) bool {
+	refs := r.Refs()
+	return refs["now"] || refs["*"]
+}
+
 // AllowsRead reports whether a verified grant may read resource ("" = the
-// whole namespace): the grant allows read and its key-scope, block and role
-// rules pass against the read envelope at the checker's now.
+// whole namespace): the grant allows read, its key-scope and block rules
+// pass against the read envelope, none failing for a read (FailsRead:
+// such a grant is refused every read, §C.2 item 5), and, if it carries
+// roles, so do the rules of one that lists read, a role with a rule that
+// fails for a read not counting.
 func (ch *Checker) AllowsRead(v *grant.Verified, resource string) bool {
 	ok, _ := ch.allowsRead(v, resource)
 	return ok
@@ -800,6 +818,9 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 			if err != nil {
 				return false, "invalid grant rule"
 			}
+			if FailsRead(r) {
+				return false, "a grant or key rule refers to /now, which no read passes (§C.2 item 5)"
+			}
 			if !r.Eval(env) {
 				return false, "a grant or key rule refuses the read"
 			}
@@ -810,7 +831,7 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 			pass := true
 			for _, rv := range v.RoleRules(role) {
 				r, err := ch.compile(rv)
-				if err != nil || !r.Eval(env) {
+				if err != nil || FailsRead(r) || !r.Eval(env) {
 					pass = false
 					break
 				}
@@ -852,11 +873,13 @@ func (ch *Checker) ReadsPerResource(v *grant.Verified) bool {
 
 // ReadsUnrestricted reports whether a verified grant reads the namespace
 // unrestricted (§2.1) and may read it now: its key has no readScope, no
-// rule of its blocks or key scope refers to /resource, they pass, and, if
-// it carries roles, so does some role that lists read and has no rule
-// referring to /resource. Its other roles don't count: roles are
-// alternatives (§C.1.1). Such readers read every resource, so they can
-// share namespace-wide caches.
+// rule of its blocks or key scope refers to /resource or fails for a read
+// (FailsRead: such a grant is refused every read, §C.2 item 5), they
+// pass, and, if it carries roles, so does some role that lists read and
+// has no rule referring to /resource or failing for a read. Its other
+// roles don't count: roles are alternatives (§C.1.1), and one with a rule
+// on /now doesn't count for read. Such readers read every resource, so
+// they can share namespace-wide caches.
 func (ch *Checker) ReadsUnrestricted(v *grant.Verified) bool {
 	ok, roles := v.Allows("read")
 	if !ok || v.Key.ReadScopeResource {
@@ -878,9 +901,9 @@ func (ch *Checker) ReadsUnrestricted(v *grant.Verified) bool {
 }
 
 // passWhole reports whether rules rs pass against env without referring to
-// /resource (or the whole envelope).
+// /resource, or to /now (or the whole envelope), which fails any read.
 func (ch *Checker) passWhole(rs []any, env map[string]any) bool {
-	return ch.passWholeRefs(rs, env, "resource")
+	return ch.passWholeRefs(rs, env, "resource", "now")
 }
 
 // passWholeRefs reports whether rules rs pass against env without

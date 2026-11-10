@@ -2,6 +2,7 @@ package grantcheck
 
 import (
 	"crypto/sha256"
+	"errors"
 	"slices"
 	"sync"
 
@@ -28,15 +29,41 @@ type ScopeInput struct {
 	Principal         map[string]any
 }
 
-// ScopeInputOf is the ScopeInput of v's reads.
+// ScopeInputOf is the ScopeInput of v's reads. Its roles are those that
+// count for read: each effective role that lists read, less those with a
+// rule that fails for a read (FailsRead, §C.2 item 5), as FilterOf's.
 func ScopeInputOf(v *grant.Verified) ScopeInput {
 	in := ScopeInput{ReadScopeResource: v.Key.ReadScopeResource, KeyRules: v.KeyRules, BlockRules: v.BlockRules,
 		Roles: map[string][]any{}, Principal: v.Principal.Envelope()}
-	_, readers := v.Allows("read")
-	for _, role := range readers {
+	for _, role := range readRoles(v) {
 		in.Roles[role] = v.RoleRules(role)
 	}
 	return in
+}
+
+// readRoles are v's effective roles that count for read: those that list
+// read and have no rule failing for a read (FailsRead; §C.2 item 5: "a
+// role with such a rule doesn't count for read"). A rule that doesn't
+// compile leaves its role in, where it refuses every read it judges.
+func readRoles(v *grant.Verified) []string {
+	_, readers := v.Allows("read")
+	var out []string
+	for _, role := range readers {
+		if !failsRead(v.RoleRules(role)) {
+			out = append(out, role)
+		}
+	}
+	return out
+}
+
+// failsRead reports whether some rule of rs fails for a read (FailsRead).
+func failsRead(rs []any) bool {
+	for _, rv := range rs {
+		if r, err := rules.Compile(rv); err == nil && FailsRead(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // ReadsScope digests what the reads of a grant that reads a namespace only
@@ -46,12 +73,24 @@ func ScopeInputOf(v *grant.Verified) ScopeInput {
 // rules and values share answers. It reports false if a rule refers to
 // /now (or the whole envelope): the namespace then counts as unreadable,
 // since an answer at a given at can't change. The digest is the index's
-// marker reads:{ns}:scope:{digest}, byte for byte.
-func ReadsScope(v *grant.Verified) (digest string, ok bool) { return ScopeDigest(ScopeInputOf(v)) }
+// marker reads:{ns}:scope:{digest}, byte for byte. A grant that carries
+// roles, none of which counts for read (each refers to /now, ScopeInputOf),
+// reads nothing: false, so that it never shares a digest with a grant
+// without roles.
+func ReadsScope(v *grant.Verified) (digest string, ok bool) {
+	in := ScopeInputOf(v)
+	if v.HasRoles() && len(in.Roles) == 0 {
+		return "", false
+	}
+	return ScopeDigest(in)
+}
 
 // ScopeDigest is ReadsScope over its inputs, so that the origin can digest
 // a stored gs's rules again as of another checkpoint (§B.11.9: a gs cookie
-// is 403 at an at where those rules differ).
+// is 403 at an at where those rules differ). It reports false where any
+// rule, a role's included, refers to /now or the whole envelope: a stored
+// role that has gained one since doesn't count for read any more (§C.2
+// item 5), so the cookie ends.
 func ScopeDigest(in ScopeInput) (string, bool) {
 	lists := [][]any{in.KeyRules, in.BlockRules}
 	roles := map[string]any{}
@@ -106,9 +145,12 @@ func CombinedAt(cps map[string]string) string {
 // ReadFilter is what a scope marker, or a filtered-read gs (§B.11.9 item
 // 2), stands for: the rules a grant's reads in a namespace are judged by,
 // those of its key's scope, its blocks and, if it carries roles, each
-// effective role that lists read (any one passing), and its /principal
-// envelope. A rule referring to /now gives no marker (ReadsScope), so the
-// filter judges a read as the grant's read check does, without a clock.
+// effective role that counts for read (any one passing), and its
+// /principal envelope. A key-scope or block rule referring to /now gives
+// no marker (ReadsScope), and a role with one doesn't count (FilterOf), so
+// the filter judges a read as the grant's read check does, without a
+// clock; one decoded with such a rule (DecodeReadFilter) refuses every
+// read, or doesn't count the role, as that check does (FailsRead).
 // Fields must not change once Allows or AllowsItem has been called.
 type ReadFilter struct {
 	KeyRules, BlockRules []any
@@ -121,13 +163,14 @@ type ReadFilter struct {
 	err      error
 }
 
-// FilterOf is the ReadFilter of v's reads.
+// FilterOf is the ReadFilter of v's reads: its roles are those that count
+// for read (ScopeInputOf), so a grant that carries roles, none of which
+// counts, reads nothing.
 func FilterOf(v *grant.Verified) *ReadFilter {
 	f := &ReadFilter{KeyRules: v.KeyRules, BlockRules: v.BlockRules, Principal: v.Principal.Envelope()}
 	if v.HasRoles() {
 		f.Roles = [][]any{}
-		_, readers := v.Allows("read")
-		for _, role := range readers {
+		for _, role := range readRoles(v) {
 			f.Roles = append(f.Roles, v.RoleRules(role))
 		}
 	}
@@ -169,6 +212,20 @@ func DecodeReadFilter(s string) (*ReadFilter, error) {
 	return f, nil
 }
 
+// errFailsRead is a filter with a key-scope or block rule that fails for
+// a read (FailsRead): it allows nothing.
+var errFailsRead = errors.New("a key-scope or block rule refers to /now, which no read passes")
+
+// failRule stands for a role's rule that fails for a read (FailsRead):
+// a test no read envelope passes, so the role never counts.
+var failRule = func() *rules.Rule {
+	r, err := rules.Compile(map[string]any{"op": "test", "path": "/action", "value": "never"})
+	if err != nil {
+		panic(err)
+	}
+	return r
+}()
+
 var (
 	ptrPrincipal       = pointer.Pointer{"principal"}
 	ptrPrincipalGroups = pointer.Pointer{"principal", "groups"}
@@ -186,6 +243,17 @@ func (f *ReadFilter) compile() {
 				if err != nil {
 					f.err = err
 					return
+				}
+				if FailsRead(r) {
+					// It fails every read (§C.2 item 5): a key-scope or
+					// block rule refuses them all, and a role with it
+					// doesn't count.
+					if i < 2 {
+						f.err = errFailsRead
+						return
+					}
+					rs = append(rs, failRule)
+					continue
 				}
 				for _, p := range r.RefPaths() {
 					if p.Overlaps(ptrPrincipal) && !p.HasPrefix(ptrPrincipalGroups) && !p.HasPrefix(ptrPrincipalRoles) {
