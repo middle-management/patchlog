@@ -375,7 +375,7 @@ func (ix *Index) refsAccess(ctx context.Context, ns string, r *http.Request, g *
 		return nil, err
 	}
 	switch {
-	case err == nil && cfg.Read == "public":
+	case err == nil && ix.publicFor(ctx, ns, cfg):
 		return &access{public: true, all: true}, nil
 	case g == nil:
 		return nil, &grant.AuthError{Status: 401, Msg: "no usable grant"}

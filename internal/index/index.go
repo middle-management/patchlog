@@ -33,8 +33,6 @@
 //	                                      that the index follows without serving them, while it
 //	                                      follows them (members.go)
 //	member_conf(ns, public, level)        as ns_conf, for those
-//	ns_config_revs(ns, config)            every config revision of ns the index applied (narrowed,
-//	                                      stillPublic)
 //	catalog_trust(ns, trust)              the catalog.trust last applied, of either, kept past a
 //	                                      purge-ns and a rebuild (recordTrust, fsTrust), read again
 //	                                      at a snapshot, forgotten once ns is neither served nor
@@ -375,7 +373,7 @@ var migrations embed.FS
 // initSchema rather than a migration, is dropped, so a rebuild decides
 // between FTS5 and the LIKE fallback again.
 var resetStmts = []string{
-	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM ns_state`, `DELETE FROM ns_conf`, `DELETE FROM ns_config_revs`,
+	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM ns_state`, `DELETE FROM ns_conf`,
 	`DELETE FROM docs`, `DROP TABLE IF EXISTS "text"`, `DELETE FROM facet`, `DELETE FROM "sort"`, `DELETE FROM refs`,
 	derived.CacheResetStmts[0], derived.CacheResetStmts[1],
 }
@@ -1016,9 +1014,7 @@ func configDocs(b *follow.Batch) []*client.NSDoc {
 // ns private or raises it to sealed or e2e (§9), against the read mode
 // and level the index last applied (table: ns_conf, or member_conf for a
 // namespace it follows only for visibility, members.go), and records the
-// last one's, in tx, with its catalog.trust (recordTrust) and, in
-// ns_conf's case, every config revision applied (ns_config_revs,
-// stillPublic). Before
+// last one's, in tx, with its catalog.trust (recordTrust). Before
 // the first it records, the namespace counts as public and unsealed, so
 // the first private or sealed document it applies counts too: once, at
 // the genesis of a namespace followed from the start, when nothing is
@@ -1044,11 +1040,6 @@ func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, table, ns string, doc
 			narrowed = true
 		}
 		public, level = read == "public", lv
-		if table == "ns_conf" && d.Config != "" {
-			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO ns_config_revs (ns, config) VALUES (?, ?)`, ns, d.Config); err != nil {
-				return false, err
-			}
-		}
 	}
 	if err := recordTrust(ctx, tx, ns, docs[len(docs)-1].Value); err != nil {
 		return false, err

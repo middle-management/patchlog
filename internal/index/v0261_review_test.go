@@ -27,12 +27,12 @@ import (
 // TestV0261WidenPending503: pr is private (its genesis recorded in
 // ns_conf as not public) and is made public; the index hasn't applied the
 // widening yet (its follower is held), while the grant checker, which
-// reads the live head, already reads pr as public. access decides an
-// anonymous reader is public; accessChanged then asks stillPublic, which
-// requires ns_conf to say public too, so every anonymous query of pr is
-// errAccessChanged, afterPurge loses twice and answers 503, until the
-// index applies the widening. /_refs over pr and pub is refused whole,
-// pub's hits included. Before e75beac both were answered.
+// reads the live head, already reads pr as public. pr is public only once
+// the index has applied it (publicFor): meanwhile an anonymous query of
+// pr is 401 (not 503, as e75beac had it, its read check and its re-check
+// once gen is taken disagreeing), a grant holder reads it as a private
+// namespace, and an anonymous /_refs over pr and pub answers with pub's
+// hits, leaving pr out. Once applied, pr is answered anonymously.
 func TestV0261WidenPending503(t *testing.T) {
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
@@ -77,21 +77,23 @@ func TestV0261WidenPending503(t *testing.T) {
 	time.Sleep(20 * time.Millisecond) // past the harness's CheckerTTL (1 ms): the checker reads pr's head, public
 	r := x.raw("/pr?limit=6", "")
 	t.Logf("anonymous /pr, made public, the widening not applied yet: %d %v", r.status, r.body)
-	if r.status == 503 {
-		t.Errorf("anonymous /pr, public at its head, while the index applies the widening: 503 %v", r.body)
+	if r.status != 401 {
+		t.Errorf("anonymous /pr, public at its head, the widening not applied yet: %d %v, want 401", r.status, r.body)
 	}
 	rg := k.Grant(t, s.Now(), "user:r", []string{"pr"}, []string{"read"})
-	if g := x.raw("/pr?limit=6", rg); g.status == 503 {
-		t.Errorf("a valid grant holder's /pr meanwhile: 503 too (access decides public before reading the token): %v", g.body)
+	if g := x.raw("/pr?limit=6", rg); g.status != 302 || !strings.HasPrefix(g.header.Get("Location"), "/pr/g/") {
+		t.Errorf("a grant holder's /pr meanwhile: %d %q %v, want a redirect to its gs", g.status, g.header.Get("Location"), g.body)
+	} else if f := x.raw(g.header.Get("Location"), rg); f.status != 200 {
+		t.Errorf("a grant holder's %s meanwhile: %d %v", g.header.Get("Location"), f.status, f.body)
 	}
-	rr := x.raw(refs+"&limit=6", "")
-	t.Logf("anonymous /_refs meanwhile: %d Location=%q %v", rr.status, rr.header.Get("Location"), rr.body)
-	if rr.status == 503 {
-		t.Errorf("anonymous /_refs over pr and pub while pr's widening is pending: 503 %v (pub's hits refused too)", rr.body)
+	rr := x.follow(refs+"&limit=6", "")
+	t.Logf("anonymous /_refs meanwhile: %d %v", rr.status, rr.body)
+	if got := refsAllHits(rr.body); rr.status != 200 || got != "pub/p" {
+		t.Errorf("anonymous /_refs over pr and pub while pr's widening is pending: %d %q, want 200 with pub/p alone", rr.status, got)
 	}
 	close(release)
 	x.caughtUp("pr")
-	if r := x.raw("/pr?limit=7", ""); r.status != 302 {
+	if r := x.follow("/pr?limit=7", ""); r.status != 200 {
 		t.Errorf("anonymous /pr once the widening is applied: %d %v", r.status, r.body)
 	}
 }
@@ -226,8 +228,8 @@ func TestV0261MemberPurgeWindow(t *testing.T) {
 // TestV0261StaleCheckerAfterNarrowing (F1's guard for I1): pr is made
 // private and the index has applied it, but the grant checker reloads pr
 // from a stale head pointer (a cache or a lagging replica in front of the
-// core: the head before the narrowing, public). The checker's document
-// is one the index applied before its narrowing (ns_config_revs), so an
+// core: the head before the narrowing, public). The checker's head is
+// not after the index's checkpoint in pr's chain (stillPublic), so an
 // anonymous query is not answered from it: no result is computed in the
 // public URL space, kept or served. Trusting the checker whenever it
 // disagrees with ns_conf would serve pr's hits publicly here.
