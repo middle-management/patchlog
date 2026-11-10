@@ -93,6 +93,53 @@ func trimJWE(body []byte) string {
 	return string(bytes.TrimSpace(body))
 }
 
+// strictJWE reports whether jwe is a compact JWE of the form B's own
+// sealings take (§E.2.2, alg dir): five segments of base64url, the
+// encrypted key's empty, and nothing else. Base64 decoding skips CR and
+// LF, so A could otherwise inflate a sealing that still opens, inside
+// its segments, where trimJWE doesn't reach, and B would store and serve
+// it at that length.
+func strictJWE(jwe string) bool {
+	parts := strings.Split(jwe, ".")
+	if len(parts) != 5 || parts[1] != "" {
+		return false
+	}
+	for i, p := range parts {
+		if i == 1 {
+			continue
+		}
+		if p == "" {
+			return false
+		}
+		for j := 0; j < len(p); j++ {
+			c := p[j]
+			if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// pendingJWEMax bounds A's sealing of the content of mirrored revision
+// seq, as creation bounds it (jweFor): of its document (kind sealDoc), or
+// of its log entry as the shadow serves it; 0, for caps.jwe, where B no
+// longer holds that content.
+func (t *tx) pendingJWEMax(kind string, seq int64) int64 {
+	row := t.rev(seq)
+	if !row.patches.Valid {
+		return 0
+	}
+	if kind == sealDoc {
+		b, err := t.docBytesAt(row)
+		if err != nil {
+			return 0
+		}
+		return jweFor(len(b))
+	}
+	return jweFor(len(jsonv.Canonical(t.logEntry(row).value())))
+}
+
 // contentDigest is the digest a pending sealing must open to: of v's
 // canonical JSON, an entry or a document.
 func contentDigest(v any) [32]byte {
@@ -100,11 +147,14 @@ func contentDigest(v any) [32]byte {
 }
 
 // openPreSealing reports whether jwe, A's sealing of an entry or a
-// document from before its raise, opens under kr as one under kid for pl,
-// to JSON whose canonical digest is want (§G.5.2: "only once it has opened
-// and verified it").
+// document from before its raise, is a strict compact JWE (strictJWE)
+// that opens under kr as one under kid for pl, to JSON whose canonical
+// digest is want (§G.5.2: "only once it has opened and verified it").
 func openPreSealing(jwe string, kr []byte, kid string, pl seal.PL, want [32]byte) bool {
-	pt, err := seal.OpenExpect(string(bytes.TrimSpace([]byte(jwe))), kr, kid, pl)
+	if !strictJWE(jwe) {
+		return false
+	}
+	pt, err := seal.OpenExpect(jwe, kr, kid, pl)
 	if err != nil {
 		return false
 	}
@@ -206,8 +256,10 @@ func (t *tx) storePreBlob(sh int64, name string, bid ids.ID, epoch int, data []b
 
 // pendingRow is a row of remote_pending_sealings retryPreSealings asks A
 // for again, with the namespace of A's chain its shadow mirrors (ns), K_r
-// of its epoch (kr), its failed retries so far (tries) and, for a blob,
-// the size of the blob it mirrored (blobSize, 0 if unknown).
+// of its epoch (kr), its failed retries so far (tries), for an entry or a
+// document the longest sealing of it B takes (maxJWE, jweFor of the
+// content it mirrored; 0 for caps.jwe) and, for a blob, the size of the
+// blob it mirrored (blobSize, 0 if unknown).
 type pendingRow struct {
 	shadow       int64
 	ns, name     string
@@ -217,6 +269,7 @@ type pendingRow struct {
 	s            pendingSealing
 	kr           []byte
 	tries        int
+	maxJWE       int64
 	blobSize     int64
 	jwe          string // fetched: an entry's or document's sealing, trimmed
 	blob         []byte // fetched: a blob's
@@ -376,7 +429,7 @@ func (e *Engine) retryPreSealings(ctx context.Context, ep RemoteEndpoint, baseUR
 		rs := logs[k]
 		entries := make([]preEntry, len(rs))
 		for i, r := range rs {
-			entries[i] = preEntry{id: r.s.ref, parent: r.parent, parentKnown: r.parentKnown}
+			entries[i] = preEntry{id: r.s.ref, parent: r.parent, parentKnown: r.parentKnown, max: r.maxJWE}
 		}
 		got, answers := fetchPreEntries(ctx, ep, baseURL, "/r/"+rs[0].ns+"/"+rs[0].name, chains[k], entries, caps)
 		for _, r := range rs {
@@ -399,7 +452,11 @@ func (e *Engine) retryPreSealings(ctx context.Context, ep RemoteEndpoint, baseUR
 		}
 		switch r.s.kind {
 		case sealDoc:
-			st, _, body, err := rawGet(ctx, ep, baseURL, "/r/"+r.ns+"/"+r.name+"/rev/"+r.s.ref, nil, caps.jwe)
+			limit := caps.jwe
+			if r.maxJWE > 0 {
+				limit = r.maxJWE
+			}
+			st, _, body, err := rawGet(ctx, ep, baseURL, "/r/"+r.ns+"/"+r.name+"/rev/"+r.s.ref, nil, limit)
 			if err == nil && st == 200 {
 				r.jwe, r.fetchedOK = trimJWE(body), true
 			} else {
@@ -538,6 +595,9 @@ func (t *tx) pendingRows(sh *nsRow, limit int, fix *pendingFixes) []*pendingRow 
 			continue
 		}
 		r.kr = kr
+		if r.s.kind != pendBlob {
+			r.maxJWE = t.pendingJWEMax(r.s.kind, r.revSeq)
+		}
 		if r.s.kind == pendBlob {
 			if bid, err := ids.Parse(r.s.ref); err == nil {
 				var size sql.NullInt64

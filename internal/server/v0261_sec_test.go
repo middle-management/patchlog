@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -777,4 +778,190 @@ func TestV0261PreRaiseLegacyPrunedRows(t *testing.T) {
 		t.Fatalf("y's document, pruned for good, was asked for %d times", p.count("GET "+yDoc))
 	}
 	expectCode(t, b.get("/r/r/y/rev/"+r.y1, g), 410, "pruned")
+}
+
+// C3: a sealing a sync asks for again is bounded as creation bounds it, by
+// the content B mirrored (jweFor), not by B's own maximums: an honest A's
+// sealing of a document larger than B's documentSize, which creation
+// would take, is taken at a sync too.
+func TestV0261PreRaiseRetryHonestLarge(t *testing.T) {
+	t.Parallel()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+	a.opPriv = aPriv
+	r := &v077Raised{a: a, kA: newKey("admin")}
+	a.mkNS("m", sealedDoc(map[string]any{"read": "grant", "keys": []any{r.kA.entry("*")}}))
+	r.root = func() string { return a.grant(r.kA, "user:root", []string{"m"}, allVerbs) }
+	big := map[string]any{}
+	for i := range 5 {
+		big[strconv.Itoa(i)] = strings.Repeat("x", 40<<10)
+	}
+	r.x1 = a.wr("m", "x", "", withNonce(addRoot(big)), r.root())
+	a.clock.Advance(time.Hour)
+	expect(t, a.patchNS("m", ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 2.0})), r.root()), 201)
+	r.raised = a.nsHead("m", r.root())
+	xDoc := "/r/m/x/rev/" + r.x1
+	p := newV077Proxy(t, a, map[string]v077Answer{"GET " + xDoc: {1, http.StatusForbidden, v077Forbidden}})
+	small := func(o *core.Options) {
+		for _, l := range []*core.Limits{&o.Limits, &o.Maximums} {
+			l.DocumentSize, l.PatchSetSize, l.ValueSize, l.BlobsPerDocument = 64<<10, 64<<10, 16<<10, 100
+		}
+	}
+	b := newV0261B(t, r, p.srv.URL, small)
+	_, g := v0261Remote(t, b, r, "r")
+	expectCode(t, b.get("/r/r/x/rev/"+r.x1, g), 502, "upstream")
+	p.set(nil)
+	if err := b.e.SyncRemotes(context.Background()); err != nil {
+		t.Logf("sync: %v", err)
+	}
+	ra, rb := a.get(xDoc, r.root()), b.get("/r/r/x/rev/"+r.x1, g)
+	expect(t, ra, 200)
+	if rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {
+		t.Fatalf("x's document (%d bytes at A) after the sync: %d %.160s", len(ra.Body), rb.Code, rb.Body)
+	}
+}
+
+// v0261Inflate inserts n newlines into the ciphertext segment of a compact
+// JWE: base64 decoding ignores CR and LF (encoding/base64, also Strict), so
+// it still opens, under the same header and AAD, without A needing the key
+// to re-seal; TrimSpace (trimJWE) leaves it, being inside.
+func v0261Inflate(t *testing.T, jwe string, n int) string {
+	t.Helper()
+	parts := strings.Split(jwe, ".")
+	if len(parts) != 5 || len(parts[3]) < 2 {
+		t.Fatalf("not a compact JWE: %.80q", jwe)
+	}
+	ct := parts[3][:1] + strings.Repeat("\n", n) + parts[3][1:]
+	return strings.Join([]string{parts[0], parts[1], parts[2], ct, parts[4]}, ".")
+}
+
+// v0.26.1 review (C3 incomplete): a sealing B asks A for again at a
+// sync is bounded only by caps.jwe (2 × the deployment's largest document
+// or patch set + 64 KiB), not by the size of the content B mirrored
+// (jweFor, which creation uses), and is stored as A serves it once it
+// opens. A pads it inside the JWE, where trimJWE doesn't reach, and B
+// stores and serves it at that size for good.
+func TestV0261RetryStoresInflatedSealing(t *testing.T) {
+	t.Parallel()
+	t.Run("document", func(t *testing.T) {
+		r := newV077Raised(t)
+		xDoc := "/r/m/x/rev/" + r.x1
+		p := newV077Proxy(t, r.a, map[string]v077Answer{"GET " + xDoc: {1, http.StatusForbidden, v077Forbidden}})
+		b := newV077B(t, r, p)
+		_, g := v0261Remote(t, b, r, "r")
+		real := r.a.get(xDoc, r.root())
+		expect(t, real, 200)
+		inflated := v0261Inflate(t, string(real.Body), 1<<20)
+		p.set(map[string]v077Answer{"GET " + xDoc: {1, http.StatusOK, inflated}})
+		if err := b.e.SyncRemotes(context.Background()); err != nil {
+			t.Logf("sync: %v", err)
+		}
+		res := b.get("/r/r/x/rev/"+r.x1, g)
+		t.Logf("B serves x's document: %d, %d bytes (A's sealing is %d bytes)", res.Code, len(res.Body), len(real.Body))
+		if res.Code == 200 && len(res.Body) > len(real.Body)+64 {
+			t.Fatalf("B stored and serves A's sealing of x's document (%d bytes of content) inflated to %d bytes", len(real.Body), len(res.Body))
+		}
+	})
+	t.Run("log entry", func(t *testing.T) {
+		r := newV077Raised(t)
+		wLog := "/r/m/w/rev/" + r.w1 + "/log"
+		p := newV077Proxy(t, r.a, map[string]v077Answer{"GET " + wLog: {2, http.StatusForbidden, v077Forbidden}})
+		b := newV077B(t, r, p)
+		_, g := v0261Remote(t, b, r, "r")
+		real := r.a.get(wLog, r.root())
+		expect(t, real, 200)
+		var page []string
+		if err := json.Unmarshal(real.Body, &page); err != nil || len(page) != 1 {
+			t.Fatalf("A's page of w's log: %v %s", err, real.Body)
+		}
+		inflated, _ := json.Marshal([]string{v0261Inflate(t, page[0], 1<<20)})
+		p.set(map[string]v077Answer{"GET " + wLog: {1, http.StatusOK, string(inflated)}})
+		if err := b.e.SyncRemotes(context.Background()); err != nil {
+			t.Logf("sync: %v", err)
+		}
+		res := b.get("/r/r/w/rev/"+r.w1+"/log", g)
+		t.Logf("B serves w's log: %d, %d bytes (A's is %d bytes)", res.Code, len(res.Body), len(real.Body))
+		if res.Code == 200 && len(res.Body) > len(real.Body)+64 {
+			t.Fatalf("B stored and serves A's sealing of w's entry inflated to %d bytes", len(res.Body))
+		}
+	})
+}
+
+// v0.26.1 review: the size bounds at creation (jweFor of the mirrored
+// entry or document) against an honest A with large entries and
+// documents, padded or not, and strings JSON escapes: every sealing is
+// stored, nothing left pending.
+func TestV0261HonestLargeAtCreation(t *testing.T) {
+	t.Parallel()
+	for _, pad := range []bool{false, true} {
+		t.Run(fmt.Sprint("pad=", pad), func(t *testing.T) {
+			var aPriv ed25519.PrivateKey
+			a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+			a.opPriv = aPriv
+			r := &v077Raised{a: a, kA: newKey("admin")}
+			doc := sealedDoc(map[string]any{"read": "grant", "keys": []any{r.kA.entry("*")}})
+			if pad {
+				doc["encryption"].(map[string]any)["pad"] = true
+			}
+			a.mkNS("m", doc)
+			r.root = func() string { return a.grant(r.kA, "user:root", []string{"m"}, allVerbs) }
+			// Strings JSON escapes or holds as multi-byte UTF-8.
+			unit := "é<>&\"\\\t 😀abc"
+			val := func(i int) string { return fmt.Sprint(i) + strings.Repeat(unit, (48<<10)/len(unit)-2) }
+			var revs []string
+			prev := ""
+			k := 0
+			for w := 0; w < 5; w++ {
+				var ps []any
+				if prev == "" {
+					root := map[string]any{}
+					for j := 0; j < 3; j++ {
+						root[fmt.Sprint("k", k)] = val(k)
+						k++
+					}
+					ps = withNonce(addRoot(root))
+				} else {
+					for j := 0; j < 3; j++ {
+						ps = append(ps, op("add", fmt.Sprint("/k", k), val(k)))
+						k++
+					}
+					ps = withNonce(ps)
+				}
+				prev = a.wr("m", "x", prev, ps, r.root())
+				revs = append(revs, prev)
+			}
+			r.x1 = revs[0]
+			a.clock.Advance(time.Hour)
+			expect(t, a.patchNS("m", ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 2.0})), r.root()), 201)
+			r.raised = a.nsHead("m", r.root())
+
+			p := newV077Proxy(t, a, nil)
+			var path string
+			b := newV0261B(t, r, p.srv.URL, withFileDB(t), func(o *core.Options) { path = o.Path })
+			_, g := v0261Remote(t, b, r, "r")
+			db, pg := v0261DB(t, path)
+			if n := v0261Count(t, db, pg, `SELECT COUNT(*) FROM remote_pending_sealings`); n != 0 {
+				var kinds []string
+				rows, _ := db.Query(`SELECT kind, ref, answer FROM remote_pending_sealings`)
+				for rows != nil && rows.Next() {
+					var a, b, c string
+					rows.Scan(&a, &b, &c)
+					kinds = append(kinds, a+" "+b+" "+c)
+				}
+				t.Errorf("an honest A's sealings of large content: %d left pending at creation: %v", n, kinds)
+			}
+			for i, id := range revs {
+				log := "/rev/" + id + "/log"
+				if i > 0 {
+					log += "?since=" + revs[i-1]
+				}
+				for _, pth := range []string{"/rev/" + id, log} {
+					ra, rb := a.get("/r/m/x"+pth, r.root()), b.get("/r/r/x"+pth, g)
+					if ra.Code != 200 || rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {
+						t.Errorf("%s: A %d (%d bytes), B %d %.160s", pth, ra.Code, len(ra.Body), rb.Code, rb.Body)
+					}
+				}
+			}
+		})
+	}
 }
