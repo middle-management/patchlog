@@ -833,7 +833,10 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		follow.WithMaxUnits(0),
 		follow.WithOnError(func(n string, err error) {
 			s.opt.Logf("tree: %s: %v", n, err)
-			if n == s.actual(ns) && follow.LacksKey(ctx, err) {
+			// What the follower reports and retries, its reads and the
+			// handler's (Apply's fetches of a batch it read): a key it
+			// lacks, or a refusal of a read of the namespace.
+			if n == s.actual(ns) && (follow.LacksKey(ctx, err) || s.refusedRead(ctx, n, err)) {
 				stop()
 			}
 		}),
@@ -892,17 +895,7 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		}
 		if ae, ok := client.AsAPIError(err); ok && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden || ae.Status == http.StatusNotFound) {
 			s.setUnfollowed(ns, err.Error())
-			refused := ae.Status != http.StatusNotFound || ae.Path == "/ns/"+real
-			if !refused {
-				// A 404 of a log range may be a stale head pointer's (a
-				// CDN's, §9); one the namespace's own head answers alike
-				// is a refusal (§7 answers a namespace the reader can't
-				// read as one that doesn't exist).
-				_, herr := s.c.NSHead(ctx, real)
-				he, ok := client.AsAPIError(herr)
-				refused = ok && (he.Status == http.StatusUnauthorized || he.Status == http.StatusForbidden || he.Status == http.StatusNotFound)
-			}
-			if refused {
+			if ae.Status != http.StatusNotFound || ae.Path == "/ns/"+real || s.headRefused(ctx, real) {
 				stop()
 			}
 		} else if follow.LacksKey(ctx, err) {
@@ -922,6 +915,32 @@ func (s *Service) follow(ctx context.Context, ns string) {
 			pause *= 2
 		}
 	}
+}
+
+// refusedRead reports whether err is the core refusing a read of
+// namespace real, its log or document or a resource's (a 401 or 403 of a
+// path under /ns/{real} or /r/{real}/), or a 404 of one there when the
+// namespace's head is refused too (headRefused).
+func (s *Service) refusedRead(ctx context.Context, real string, err error) bool {
+	ae, ok := client.AsAPIError(err)
+	if !ok || ae.Status != http.StatusUnauthorized && ae.Status != http.StatusForbidden && ae.Status != http.StatusNotFound {
+		return false
+	}
+	if ae.Path != "/ns/"+real && !strings.HasPrefix(ae.Path, "/ns/"+real+"/") && !strings.HasPrefix(ae.Path, "/r/"+real+"/") {
+		return false
+	}
+	return ae.Status != http.StatusNotFound || ae.Path == "/ns/"+real || s.headRefused(ctx, real)
+}
+
+// headRefused reports whether the core refuses the service namespace
+// real's head (401, 403, 404). A 404 of a log range or a resource may be
+// a stale head pointer's (a CDN's, §9); one the namespace's own head
+// answers alike is a refusal (§7 answers a namespace the reader can't
+// read as one that doesn't exist).
+func (s *Service) headRefused(ctx context.Context, real string) bool {
+	_, err := s.c.NSHead(ctx, real)
+	ae, ok := client.AsAPIError(err)
+	return ok && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden || ae.Status == http.StatusNotFound)
 }
 
 // runFollower runs a follower of real until it ends, or until Apply stops
