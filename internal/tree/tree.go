@@ -979,6 +979,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		// restart resumes at it.
 		if reason, lacks := s.keys.Recheck(ctx, fb.NS, !isCat); lacks && s.stopRun(fb.NS) {
 			s.opt.Logf("tree: skipping %s: %s", fb.NS, reason)
+			s.purgeStopped(context.WithoutCancel(ctx), b.NS)
 			return fmt.Errorf("tree: %s skipped: %s", fb.NS, reason)
 		}
 	}
@@ -1472,11 +1473,24 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 
 	// Cache tags (§B.5). Every change a listing depends on moves the
 	// combined checkpoint, so cached listings never go stale and need no
-	// purge (but for drift a start finds, reload); purges remove content: a purged resource from every cached
-	// listing showing it (r:{ns}/{name}, and rs:{catalog} for listings too
-	// large to name all they show), a purged namespace from every cached
-	// listing whose checkpoint covers it (ns:{ns}).
-	if co.PurgedNS {
+	// purge (but for drift a start finds, reload); purges remove content:
+	// a purged resource from every cached listing showing it
+	// (r:{ns}/{name}, and rs:{catalog} for listings too large to name all
+	// they show), a purged namespace from every cached listing whose
+	// checkpoint covers it (ns:{ns}). So does a config entry on which §9
+	// purges ns:{ns}, one making the catalog or a namespace it trusts
+	// private, or raising it to sealed or e2e (§A.1 via §B.5, §E.2.6):
+	// listings at earlier ats, public or with its values in the clear,
+	// are still served there, kept, stored or cached, and must go, as the
+	// index's do (index.narrowed). Listings carry ns:{ns} for the catalog
+	// and every namespace it trusts (tagSet.header) once that has a
+	// checkpoint: at its first batch none shows it yet.
+	narrowed, err := narrowedBy(ctx, tx, b, co.PurgedNS)
+	if err != nil {
+		return nil, err
+	}
+	narrowed = narrowed && s.cur[b.NS] != "" && (b.NS == cat || g.Trust[b.NS] || oldTrust[b.NS])
+	if co.PurgedNS || narrowed {
 		res.tags = append(res.tags, "ns:"+s.actual(b.NS))
 	}
 	nr := 0
@@ -1553,6 +1567,105 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 		return nil, err
 	}
 	return res, nil
+}
+
+// purgeStopped purges ns:{ns}, as an apply of a config entry that
+// narrows does (applyLocked), when the service stops following the
+// catalog, or a namespace it trusts, at a config entry whose keys it
+// lacks (a raise to e2e without a keyring recipient key, an epoch it
+// can't have): that batch is never applied, and listings kept, stored or
+// cached (its Purger) before it, public or in the clear, must not outlive
+// it, though the service serves none of the catalog's now.
+func (s *Service) purgeStopped(ctx context.Context, ns string) {
+	s.mu.RLock()
+	shown := ns == s.opt.Catalog || s.g.Trust[ns]
+	s.mu.RUnlock()
+	if !shown {
+		return
+	}
+	tags := []string{"ns:" + s.actual(ns)}
+	err := func() error {
+		s.wmu.Lock()
+		defer s.wmu.Unlock()
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := s.sealed.Purge(ctx, tx, tags); err != nil {
+			return err
+		}
+		if err := s.repurge.Add(ctx, tx, tags); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}()
+	if err != nil {
+		s.opt.Logf("tree: purging %v for %s, no longer followed: %v", tags, ns, err)
+	}
+	s.sealed.Purged(tags)
+	s.kept.Purge(s.opt.Catalog, tags)
+	s.opt.Purger.PurgeTags(tags)
+}
+
+// narrowedBy reports whether a config unit of b makes its namespace
+// private or raises it to sealed or e2e (§9), against the read mode and
+// level the service last applied for it (meta "access:{ns}"), and records
+// the last unit's in tx; a purge (purged) drops the record. Before the
+// first it records, a namespace counts as public and unsealed, so the
+// first private or sealed document it applies counts too: at a genesis,
+// when nothing is kept yet, and once after an upgrade from a release
+// that kept no record, when there may be (index.narrowed).
+func narrowedBy(ctx context.Context, tx *sql.Tx, b *follow.Batch, purged bool) (bool, error) {
+	k := "access:" + b.NS
+	if purged {
+		_, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k = ?`, k)
+		return false, err
+	}
+	public, level, known := true, "", false
+	narrowed := false
+	for _, u := range b.Units {
+		if u.Config == nil {
+			continue
+		}
+		if !known {
+			var v string
+			err := tx.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = ?`, k).Scan(&v)
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+			case err != nil:
+				return false, err
+			default:
+				if m, ok := parseJSON(v).(map[string]any); ok {
+					public, _ = m["public"].(bool)
+					level, _ = m["level"].(string)
+				}
+			}
+			known = true
+		}
+		read, _ := u.Config.Value["read"].(string)
+		lv := derived.InfoOf(u.Config.Value).Level
+		if public && read != "public" || levelRank(lv) > levelRank(level) && derived.Protected(lv) {
+			narrowed = true
+		}
+		public, level = read == "public", lv
+	}
+	if !known {
+		return false, nil
+	}
+	return narrowed, saveMeta(ctx, tx, k, marshal(map[string]any{"public": public, "level": level}))
+}
+
+// levelRank orders encryption levels: none and at-rest, sealed, e2e
+// (levels only rise, §E.2.1).
+func levelRank(level string) int {
+	switch level {
+	case derived.LevelSealed:
+		return 1
+	case derived.LevelE2E:
+		return 2
+	}
+	return 0
 }
 
 func sameSet(a, b map[string]bool) bool {
