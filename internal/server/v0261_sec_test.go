@@ -1001,3 +1001,67 @@ func TestV0261BlobPrunedRowDead(t *testing.T) {
 		t.Fatalf("z's blob under epoch 2: 502 for good, its row recorded pruned with a horizon horizonIn rejects, never asked for again")
 	}
 }
+
+// v0.26.1 review (C2 fix too narrow): §8.6 lets A prune past the `at`
+// of a remote branch whose registration has expired, or that never
+// registered (-remote-register is off by default): only local branches'
+// and registered remote branches' `at` is protected. A's honest 410
+// pruned then names a horizon after B's `at`: a revision of x's chain at A
+// that the shadow never mirrors. horizonIn accepts only revisions of the
+// mirrored chain, so B records the answer as a refusal and answers 502
+// upstream for good (asked again every 4 h, for ever), where §G.3/§G.5.2
+// owe "410 where A has pruned it".
+func TestV0261HonestPrunedPastAt(t *testing.T) {
+	t.Parallel()
+	r := newV077Raised(t)
+	xDoc := "/r/m/x/rev/" + r.x1
+	p := newV077Proxy(t, r.a, map[string]v077Answer{"GET " + xDoc: {1, http.StatusForbidden, v077Forbidden}})
+	b := newV077B(t, r, p)
+	kB, g := v0261Remote(t, b, r, "r")
+	expectCode(t, b.get("/r/r/x/rev/"+r.x1, g), 502, "upstream")
+
+	// A writes x past B's at (e2e: the server checks kid and pl only),
+	// and later prunes x below it: x1's document is gone at A.
+	wr := r.a.writeRaw("m", "x", r.x1, sealed(t, seal.NewKey(), "m#2", "m", "x", r.x1, ops(op("replace", "/v", 9.0))), r.root())
+	expect(t, wr, 201)
+	x2 := etagOf(wr)
+	p.set(map[string]v077Answer{"GET " + xDoc: {1, http.StatusGone, `{"code":"pruned","horizon":"` + x2 + `"}`}})
+	for range 3 {
+		b.clock.Advance(5 * time.Hour)
+		if err := b.e.SyncRemotes(context.Background()); err != nil {
+			t.Logf("sync: %v", err)
+		}
+	}
+	if p.count("GET "+xDoc) < 2 {
+		t.Fatalf("the syncs didn't ask A for x's document")
+	}
+	g = b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+	res := b.get("/r/r/x/rev/"+r.x1, g)
+	t.Logf("B: %d %s", res.Code, res.Body)
+	if res.Code != 410 {
+		t.Fatalf("A pruned x1's document (horizon %s, a revision of x after the branch's at); B answers %d %s, want 410 pruned", x2, res.Code, res.Body)
+	}
+}
+
+// The same at creation: A has written x past the branch's at and pruned
+// below it, so its 410 for x1's document names x2, which B's mirror lacks
+// and A's log verifies after B's head: 410 pruned with that horizon. A
+// horizon A's log doesn't verify after the head (an id of y's) is a
+// refusal.
+func TestV0261PreRaisePrunedPastAtCreation(t *testing.T) {
+	t.Parallel()
+	r := newV077Raised(t)
+	wr := r.a.writeRaw("m", "x", r.x1, sealed(t, seal.NewKey(), "m#2", "m", "x", r.x1, ops(op("replace", "/v", 9.0))), r.root())
+	expect(t, wr, 201)
+	x2 := etagOf(wr)
+	xDoc := "/r/m/x/rev/" + r.x1
+	for hz, want := range map[string]int{x2: 410, r.y1: 502} {
+		p := newV077Proxy(t, r.a, map[string]v077Answer{"GET " + xDoc: {1, http.StatusGone, `{"code":"pruned","horizon":"` + hz + `"}`}})
+		b := newV077B(t, r, p)
+		_, g := v0261Remote(t, b, r, "r")
+		res := b.get("/r/r/x/rev/"+r.x1, g)
+		if res.Code != want || want == 410 && res.Str("horizon") != x2 {
+			t.Fatalf("horizon %s: %d %s, want %d", hz, res.Code, res.Body, want)
+		}
+	}
+}

@@ -14,9 +14,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/verify"
 )
 
 // Pending pre-raise sealings of remote branches (§G.5.2 E3 sources, §G.3
@@ -271,6 +273,8 @@ type pendingRow struct {
 	s            pendingSealing
 	kr           []byte
 	tries        int
+	head         string // the id of the shadow's head of the resource, B's mirrored head
+	horizonPast  bool   // A's 410 pruned names a horizon after head, which A's log verifies (verifyHorizonPast)
 	maxJWE       int64
 	blobSize     int64
 	jwe          string // fetched: an entry's or document's sealing, trimmed
@@ -413,6 +417,30 @@ func (e *Engine) retryPreSealings(ctx context.Context, ep RemoteEndpoint, baseUR
 			errs = append(errs, fmt.Errorf("/r/%s/%s: its sealing of %s %s from before its raise doesn't open to what the branch mirrored", r.ns, r.name, r.s.kind, r.s.ref))
 		}
 	}
+	// past checks, for a 410 pruned whose horizon isn't a revision of the
+	// mirrored chain, whether it is one after B's head that A's log
+	// verifies (§8.6 lets A prune past the at of a remote branch it
+	// doesn't know of, §G.3).
+	pastOK := map[[3]string]bool{}
+	past := func(r *pendingRow) {
+		if r.fetchedOK || r.fetchAnswer != pendPruned || r.head == "" {
+			return
+		}
+		var in bool
+		if err := e.read(ctx, func(t *tx) error {
+			in = t.horizonIn(r.shadow, r.name, r.fetchHorizon, r.revSeq)
+			return nil
+		}); err != nil || in {
+			return
+		}
+		k := [3]string{r.ns + "/" + r.name, r.head, r.fetchHorizon}
+		ok, seen := pastOK[k]
+		if !seen {
+			ok = verifyHorizonPast(ctx, ep, baseURL, "/r/"+r.ns+"/"+r.name, r.head, r.fetchHorizon, caps)
+			pastOK[k] = ok
+		}
+		r.horizonPast = ok
+	}
 	settle := func(rs ...*pendingRow) {
 		errs = append(errs, e.update(wctx, func(t *tx) error {
 			for _, r := range rs {
@@ -441,6 +469,7 @@ func (e *Engine) retryPreSealings(ctx context.Context, ep RemoteEndpoint, baseUR
 				r.fetchAnswer, r.fetchHorizon = answers[r.s.ref][0], answers[r.s.ref][1]
 			}
 			verify(r)
+			past(r)
 		}
 		clear(got)
 		settle(rs...)
@@ -479,6 +508,7 @@ func (e *Engine) retryPreSealings(ctx context.Context, ep RemoteEndpoint, baseUR
 			continue
 		}
 		verify(r)
+		past(r)
 		settle(r)
 	}
 	if err := ctx.Err(); err != nil {
@@ -600,6 +630,13 @@ func (t *tx) pendingRows(sh *nsRow, limit int, fix *pendingFixes) []*pendingRow 
 		if r.s.kind != pendBlob {
 			r.maxJWE = t.pendingJWEMax(r.s.kind, r.revSeq)
 		}
+		var head []byte
+		if err := t.QueryRow(`SELECT rv.id FROM resources s JOIN revisions rv ON rv.seq = s.head_seq WHERE s.ns = ? AND s.name = ?`,
+			sh.id, r.name).Scan(&head); err == nil {
+			r.head = ids.FromBytes(head).String()
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			t.must(err)
+		}
 		if r.s.kind == pendBlob {
 			if bid, err := ids.Parse(r.s.ref); err == nil {
 				var size sql.NullInt64
@@ -632,7 +669,7 @@ func (t *tx) settlePending(r *pendingRow) {
 	args := []any{r.shadow, r.name, r.s.kind, r.s.ref, r.s.epoch, pendPruned}
 	if !r.fetchedOK {
 		ans, hz := r.fetchAnswer, any(nil)
-		if ans == pendPruned && !t.horizonIn(r.shadow, r.name, r.fetchHorizon, r.revSeq) {
+		if ans == pendPruned && !r.horizonPast && !t.horizonIn(r.shadow, r.name, r.fetchHorizon, r.revSeq) {
 			ans = pendRefused
 		}
 		if ans == pendPruned {
@@ -737,6 +774,56 @@ func fetchSealedLog(ctx context.Context, ep RemoteEndpoint, baseURL, path, from 
 		}
 		since, at = next, p
 	}
+}
+
+// maxHorizonPages bounds the pages of A's log verifyHorizonPast reads.
+const maxHorizonPages = 16
+
+// verifyHorizonPast reports whether hz, a horizon A named in a 410 pruned
+// for content of resource what (/r/{ns}/{name}) that isn't a revision of
+// B's mirrored chain, is one after head, B's mirrored head: whether A
+// serves the range …/rev/{hz}/log?since={head} in the clear, each entry's
+// id recomputed and chained from head to hz (§7.1). It reads at most
+// maxHorizonPages pages, each no longer than caps.page, each moving to
+// its last entry (X-Log-Next). Where the range isn't served so (A pruned
+// revisions between head and hz too, or serves them sealed), it isn't
+// verified.
+func verifyHorizonPast(ctx context.Context, ep RemoteEndpoint, baseURL, what, head, hz string, caps preCaps) bool {
+	if _, err := ids.Parse(hz); err != nil || hz == head {
+		return false
+	}
+	var all []client.LogEntry
+	for since, pages := head, 0; ; pages++ {
+		if pages == maxHorizonPages {
+			return false
+		}
+		st, hdr, body, err := rawGet(ctx, ep, baseURL, what+"/rev/"+hz+"/log", url.Values{"since": {since}}, caps.page)
+		if err != nil || st != 200 {
+			return false
+		}
+		v, err := jsonv.Parse(body)
+		page, ok := v.([]any)
+		if err != nil || !ok || len(page) == 0 {
+			return false
+		}
+		for _, x := range page {
+			e, err := client.ParseLogEntry(x)
+			if err != nil {
+				return false
+			}
+			all = append(all, e)
+		}
+		last := all[len(all)-1].ID
+		if last == hz {
+			break
+		}
+		if hdr.Get("X-Log-Next") != last {
+			return false
+		}
+		since = last
+	}
+	got, err := verify.VerifyResourceLog(all, head)
+	return err == nil && got == hz
 }
 
 // preEntry is a log entry from before its source's raise whose sealing B

@@ -410,11 +410,27 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 	// A's 410 pruned for the sealing of entry i, or of a blob first
 	// referenced there, names a horizon of the chain at or after it, or is
 	// a refusal.
+	// A horizon after the chain's head, which the chain doesn't hold (A
+	// pruned past B's at, §8.6), is taken where A's log verifies it after
+	// the head (verifyHorizonPast).
+	pastOK := map[string]bool{}
 	prunedIn := func(ans, hz string, i int) (string, string) {
-		if ans == pendPruned {
-			if j, ok := pos[hz]; !ok || j < i {
+		if ans != pendPruned {
+			return ans, hz
+		}
+		if j, ok := pos[hz]; ok {
+			if j < i {
 				return pendRefused, ""
 			}
+			return ans, hz
+		}
+		ok, seen := pastOK[hz]
+		if !seen {
+			ok = verifyHorizonPast(ctx, ep, baseURL, what, ch.entries[len(ch.entries)-1].ID, hz, caps)
+			pastOK[hz] = ok
+		}
+		if !ok {
+			return pendRefused, ""
 		}
 		return ans, hz
 	}
