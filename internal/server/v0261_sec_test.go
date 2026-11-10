@@ -965,3 +965,39 @@ func TestV0261HonestLargeAtCreation(t *testing.T) {
 		})
 	}
 }
+
+// v0.26.1 review (dead rows): creation takes a blob sealing's 410
+// pruned if its horizon is at or after the first revision referencing the
+// blob under any epoch (prunedIn, firstRef), but the row is recorded at
+// the first revision referencing it under that epoch (storePreSealings),
+// and pendingPruned/horizonIn check against that. A horizon in between is
+// recorded "pruned" with due set (never re-validated: only due 0 is),
+// served 502 (horizonIn fails), and never asked for again (pendingRows
+// skips pruned rows with due <> 0): 502 for good, even once A serves it.
+func TestV0261BlobPrunedRowDead(t *testing.T) {
+	t.Parallel()
+	r, _ := newV0261Epochs(t)
+	e2 := blobPath("m", "z", r.bid) + "/e/2"
+	p := newV077Proxy(t, r.a, map[string]v077Answer{
+		// The first mirrors the blob (fetchBlobs); the second is A's sealing.
+		"GET " + e2: {2, http.StatusGone, `{"code":"pruned","horizon":"` + r.z1 + `"}`},
+	})
+	b := newV077B(t, r, p)
+	kB, g := v0261Remote(t, b, r, "r")
+	res := b.get(blobPath("r", "z", r.bid)+"/e/2", g)
+	t.Logf("after creation: %d %s", res.Code, res.Body)
+	p.set(nil) // A serves it now
+	before := p.count("GET " + e2)
+	for range 4 {
+		b.clock.Advance(5 * time.Hour)
+		if err := b.e.SyncRemotes(context.Background()); err != nil {
+			t.Logf("sync: %v", err)
+		}
+	}
+	g = b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+	res = b.get(blobPath("r", "z", r.bid)+"/e/2", g)
+	t.Logf("after 4 syncs over 20 h: %d %.200s; A asked %d times", res.Code, res.Body, p.count("GET "+e2)-before)
+	if res.Code == 502 && p.count("GET "+e2) == before {
+		t.Fatalf("z's blob under epoch 2: 502 for good, its row recorded pruned with a horizon horizonIn rejects, never asked for again")
+	}
+}

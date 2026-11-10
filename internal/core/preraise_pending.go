@@ -190,25 +190,27 @@ func (t *tx) recordPending(sh int64, name string, seq int64, s pendingSealing) {
 
 // pendingPruned is the horizon A named when it answered 410 pruned for the
 // sealing of kind of ref (a revision or blob id) of resource name under
-// epoch (any, for epoch < 0) that shadow sh lacks, if it did, and the
-// horizon is a revision of the resource's mirrored chain at or after that
-// sealing's (horizonIn): a row stored before v0.26.1 may hold anything A
-// named.
+// epoch (any, for epoch < 0) that shadow sh lacks, if it did. A row this
+// version recorded pruned (due set) had its horizon checked then (prunedIn,
+// settlePending); one recorded before v0.26.1, or by a v0.26.0 instance
+// since (due 0), may hold anything A named, and counts only if its horizon
+// is a revision of the mirrored chain after the sealing's (horizonIn),
+// until a sync checks it for good (pendingFixes).
 func (t *tx) pendingPruned(sh *nsRow, kind, name, ref string, epoch int) (string, bool) {
-	q := `SELECT horizon, rev_seq FROM remote_pending_sealings WHERE shadow = ? AND name = ? AND kind = ? AND ref = ? AND answer = ?`
+	q := `SELECT horizon, rev_seq, due FROM remote_pending_sealings WHERE shadow = ? AND name = ? AND kind = ? AND ref = ? AND answer = ?`
 	args := []any{sh.id, name, kind, ref, pendPruned}
 	if epoch >= 0 {
 		q += ` AND epoch = ?`
 		args = append(args, epoch)
 	}
 	var hz sql.NullString
-	var revSeq int64
-	err := t.QueryRow(q+` LIMIT 1`, args...).Scan(&hz, &revSeq)
+	var revSeq, due int64
+	err := t.QueryRow(q+` LIMIT 1`, args...).Scan(&hz, &revSeq, &due)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false
 	}
 	t.must(err)
-	if !hz.Valid || !t.horizonIn(sh.id, name, hz.String, revSeq) {
+	if !hz.Valid || due == 0 && !t.horizonIn(sh.id, name, hz.String, revSeq) {
 		return "", false
 	}
 	return hz.String, true

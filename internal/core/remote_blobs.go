@@ -434,7 +434,10 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 		return unverified("%s: %v", what, err)
 	}
 	blobEpochs := map[ids.ID]map[int]bool{}
-	firstRef := map[ids.ID]int{} // the first entry referencing each blob
+	// The first entry referencing each blob under each epoch: where
+	// storePreSealings records its pending row, which A's horizon for it
+	// must be after.
+	firstRef := map[ids.ID]map[int]int{}
 	for i := 0; i <= last; i++ {
 		e := ch.entries[i]
 		kr := krs[i]
@@ -479,7 +482,10 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 		for _, r := range blobRefsOf(docs[i]) {
 			if blobEpochs[r.bid] == nil {
 				blobEpochs[r.bid] = map[int]bool{}
-				firstRef[r.bid] = i
+				firstRef[r.bid] = map[int]int{}
+			}
+			if _, ok := firstRef[r.bid][epoch]; !ok {
+				firstRef[r.bid][epoch] = i
 			}
 			blobEpochs[r.bid][epoch] = true
 		}
@@ -506,7 +512,11 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			st, _, body, err := rawGet(ctx, ep, baseURL, p, nil, caps.blob(int64(len(b.data))))
 			if err != nil || st != 200 {
 				ans, hz := pendingAnswer(st, body, err)
-				ans, hz = prunedIn(ans, hz, firstRef[bid])
+				first, ok := firstRef[bid][epoch]
+				if !ok {
+					first = len(ch.entries) // no entry's epoch: never recorded
+				}
+				ans, hz = prunedIn(ans, hz, first)
 				if ps.blobAnswers[bid] == nil {
 					ps.blobAnswers[bid] = map[int][2]string{}
 				}
