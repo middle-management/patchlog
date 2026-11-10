@@ -32,12 +32,11 @@ import (
 //     purges, prunes, restores and key destruction move, holds the value
 //     loaded before the check's transaction began, even (no such commit in
 //     flight), and on Postgres the tailer is fresh, as for the cached reads;
-//   - the grant hasn't expired: a pass ends at the earliest exp of its
-//     blocks;
-//   - and the decision didn't depend on the time otherwise: a grant whose
-//     key, block or role rules refer to /now (or to the whole envelope)
-//     gets no pass, nor does an edge grant, which can be withdrawn without
-//     a configuration change.
+//   - and the grant hasn't expired: a pass ends at the earliest exp of its
+//     blocks. A read's time window is its grant's nbf and exp: a rule
+//     that refers to /now never passes for a read (§C.2 item 5), so no
+//     decision depends on the time otherwise. An edge grant gets no pass,
+//     as it can be withdrawn without a configuration change.
 //
 // Anything else is read and checked on its own, as before.
 
@@ -108,8 +107,6 @@ func (l *liveRead) decided(t *tx, n *nsRow, cred Credentials, a *actor) {
 	case cfg.Read == "public" || t.e.opt.AuthDisabled:
 	case cred.Edge != nil || a == nil || a.verified == nil || a.grant == nil:
 		return
-	case timeDependent(a):
-		return
 	default:
 		for _, b := range a.grant.Blocks {
 			if b.Exp != nil && (p.until.IsZero() || b.Exp.Before(p.until)) {
@@ -118,27 +115,6 @@ func (l *liveRead) decided(t *tx, n *nsRow, cred Credentials, a *actor) {
 		}
 	}
 	l.pass = p
-}
-
-// timeDependent reports whether a rule of a's key, blocks or roles may
-// decide by /now: one that refers to it or to the whole envelope, or
-// doesn't compile.
-func timeDependent(a *actor) bool {
-	v := a.verified
-	rs := append(append([]any(nil), v.KeyRules...), v.BlockRules...)
-	if v.HasRoles() {
-		_, roles := v.Allows("read")
-		for _, r := range roles {
-			rs = append(rs, v.RoleRules(r)...)
-		}
-	}
-	for _, rv := range rs {
-		r, err := compileCached(rv)
-		if err != nil || r.Refs()["now"] || r.Refs()["*"] {
-			return true
-		}
-	}
-	return false
 }
 
 // valid reports whether p still stands for its request's read check of ns.

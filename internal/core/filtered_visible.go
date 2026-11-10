@@ -61,10 +61,6 @@ func (t *tx) newFview(fs *fscope, cp *fcp, gs string, subjects []string, filter 
 //     if live, a deleted or missing placement hides it), and the filter
 //     allows reading it, roles counting as §B.11.5 counts them (item 2,
 //     ReadFilter.AllowsItem);
-//   - in a branch: name has a live document in every base as of the at
-//     its branch reads it at, then item 1 in the root as above, then item
-//     2 with the filter of the grant verified in the branch: a name new in
-//     the branch is hidden (Branches);
 //   - in a catalog: item 2 allows the node, and either it is live and the
 //     catalog's node test passes (catvis.View.Node), or it is tombstoned
 //     and its last live document passes as if live (catvis.View.AsIfLive,
@@ -72,8 +68,8 @@ func (t *tx) newFview(fs *fscope, cp *fcp, gs string, subjects []string, filter 
 //     its namespace as of cp, never one that doesn't exist or is
 //     tombstoned. A purged node, whose documents are gone, is hidden.
 //
-// Dark catalogs, e2e or purged, aren't in the view (fcp.cats): they make
-// nothing visible (§B.11.9 Where).
+// Dark catalogs, e2e, purged or a branch, aren't in the view (fcp.cats):
+// they make nothing visible (§B.11.9 Where).
 func (fv *fview) visible(t *tx, name string) bool {
 	fv.mu.Lock()
 	v, ok := fv.memo[name]
@@ -92,16 +88,7 @@ func (fv *fview) judge(t *tx, name string) bool {
 	if !fv.filter.AllowsItem(name) {
 		return false
 	}
-	switch fv.fs.kind {
-	case fsBranch:
-		for _, b := range fv.fs.chain {
-			at := b.at
-			if t.resolve(b.n, name, &at).state != Live {
-				return false
-			}
-		}
-		fallthrough
-	case fsContent:
+	if fv.fs.kind == fsContent {
 		for _, v := range fv.views {
 			if v.Placement(fv.fs.root.name, name) {
 				return true
@@ -147,7 +134,7 @@ func (fv *fview) itemLive(t *tx, n *tree.Node) bool {
 
 // candidates calls fn, in ascending byte order, with every name after
 // after (and under prefix, if not "") that may be visible, until fn
-// returns false. For a content namespace or a branch they are the names
+// returns false. For a content namespace they are the names
 // of the root's explicit placements in the deciding catalogs, so a sparse
 // reader never scans the namespace; for a catalog, every name it has or
 // had. They are a superset: callers still ask visible.

@@ -35,14 +35,16 @@ func (t *tx) scanNSLogRow(rows *sql.Rows) nsLogRow {
 }
 
 // decorateNSEntry is r's entry as a log answer serves it (§7.4): its body
-// with id, prev (the id of the entry before it, given), author, created,
-// via, grant and the gesture members, none of them hashed but id and prev.
+// with id, prev (the id of the entry before it, given; "" on the chain's
+// first, which always carries it, §7.4 v0.81), author, created, via, grant
+// and the gesture members, none of them hashed but id and prev.
 func (t *tx) decorateNSEntry(r *nsLogRow, prev string) map[string]any {
 	m := r.m
 	m["id"] = ids.FromBytes(r.id).String()
-	if r.prev != nil {
-		m["prev"] = prev
+	if r.prev == nil {
+		prev = ""
 	}
+	m["prev"] = prev
 	m["author"] = t.authorName(r.author)
 	m["created"] = formatTime(r.created)
 	if via := parseVia(r.via); via != nil {

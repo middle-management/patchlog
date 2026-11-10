@@ -151,8 +151,9 @@ func TestLiveLogLaterWrite(t *testing.T) {
 }
 
 // A pass ends with the configuration it was decided under (a revocation
-// here), with its grant's expiry, and isn't given for a decision that
-// depends on the time.
+// here), and with its grant's expiry. No decision depends on the time
+// otherwise: a grant whose rules read /now is refused the read (§C.2
+// item 5, v0.78), where before v0.78 it read without a pass.
 func TestLivePassEnds(t *testing.T) {
 	ctx := context.Background()
 	t.Run("revoked", func(t *testing.T) {
@@ -185,12 +186,21 @@ func TestLivePassEnds(t *testing.T) {
 			t.Fatalf("an expired grant's pass: %v %v", p, err)
 		}
 	})
+	// A grant whose rules read /now gets neither the read nor a pass: such
+	// a rule never passes for a read (§C.2 item 5, v0.78), so no read
+	// check depends on the time but through exp.
 	t.Run("time-dependent", func(t *testing.T) {
 		var clock atomic.Int64
-		_, _, _, _, _, pass := liveEngine(t, &clock, map[string]any{"kid": "k", "sub": "user:r", "ns": []any{"n"}, "can": []any{"read"},
-			"rules": []any{map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}}})
-		if pass != nil {
-			t.Fatal("a pass for a grant whose rules read /now")
+		e, mint, _ := authEngine(t, &clock)
+		admin := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:root", "ns": []any{"n"}, "can": []any{"read"}})}
+		h, err := e.NamespaceHead(ctx, "n", admin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rd := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:r", "ns": []any{"n"}, "can": []any{"read"},
+			"rules": []any{map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}}})}
+		if _, p, err := e.NamespaceLiveLog(ctx, "n", h.Head, 1000, rd, nil); status(err) != 403 || p != nil {
+			t.Fatalf("a grant whose rules read /now: %v %v, want 403 and no pass", p, err)
 		}
 	})
 }

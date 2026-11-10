@@ -1,7 +1,6 @@
 package core
 
 import (
-	"fmt"
 	"slices"
 
 	"github.com/middle-management/patchlog/internal/catvis"
@@ -10,37 +9,98 @@ import (
 )
 
 // grantView is the view of a partial reader's grant at cp (§B.11.9 gs):
-// its subjects are catvis.FilteredSubjects over the deciding subjects of
-// every deciding catalog's Profile at cp, the grant's groups and §A.4's
-// marker digest, catvis.ScopeKeyDigest of its ReadsScope digest and its
-// key, with catvis.KeySubject of the grant's key (so that
-// readers through different keys never share a gs), and its gs
-// their grantcheck.SubjectSetID, never "all". A grant whose read rules
-// refer to /now (or the whole envelope) can't read the namespace this
-// way: 403.
+// its subjects are gsSubjects, and its gs their
+// grantcheck.SubjectSetID, never "all". Its scope digest and filter are
+// over the rules a read is judged by, roles whose rules refer to /now
+// left out, as they don't count for read (§C.2 item 5, readScopeInput,
+// readFilterOf); a grant that carries roles and keeps none doesn't read
+// (403), nor does one whose blocks or key scope refer to /now, which the
+// read check refuses before (readerCheckURL).
 func (t *tx) grantView(fs *fscope, cp *fcp, a *actor) (*fview, *Error) {
-	digest, ok := grantcheck.ReadsScope(a.verified)
-	if !ok {
-		return nil, forbidden(fmt.Sprintf("rules referring to /now make %s unreadable this way (§B.11.9)", fs.n.name))
+	in := readScopeInput(a.verified)
+	digest, ok := grantcheck.ScopeDigest(in)
+	if !ok || a.verified.HasRoles() && len(in.Roles) == 0 {
+		return nil, forbidden("the grant's rules don't allow reading " + fs.n.name + " (§C.2 item 5, §B.11.9 Partial reader)")
 	}
-	var deciding [][]string
 	cats := make([]*catvis.Catalog, len(cp.cats))
 	for i := range cp.cats {
 		cats[i] = t.catalogAt(&cp.cats[i], cp)
-		subs, _ := cats[i].Profile().Deciding(a.principal)
-		deciding = append(deciding, subs)
 	}
 	kid, pub := a.verified.Key.Kid, keyPub(*a.verified.Key)
-	subjects := append(catvis.FilteredSubjects(deciding, a.principal.Groups, catvis.ScopeKeyDigest(digest, kid, pub)), catvis.KeySubject(kid, pub))
+	subjects := gsSubjects(cats, a.principal, catvis.ScopeKeyDigest(digest, kid, pub), catvis.KeySubject(kid, pub))
+	return t.newFview(fs, cp, grantcheck.SubjectSetID(subjects), subjects, readFilterOf(a.verified), a), nil
+}
+
+// gsSubjects are §B.11.9's subjects of a gs: every group: entry of the
+// caller's (deduped), its user: subject where §B.11.5 would add it for one
+// of cats (a direct entry for it, or a sub-scoped catalog key:
+// catvis.Profile's Users and SubScoped), scope:{scopeKeyDigest}, §A.4's
+// marker digest, and keySubject, sorted. No gs leaves a group out, so it
+// never holds "partial" (§B.11.5, v0.78). catvis.FilteredSubjects is
+// given every group as deciding, which yields the same whether it reads
+// its deciding argument or not.
+func gsSubjects(cats []*catvis.Catalog, pr grant.Principal, scopeKeyDigest, keySubject string) []string {
+	var all []string
+	for _, g := range pr.Groups {
+		if s := grantcheck.GroupPrefix + g; !slices.Contains(all, s) {
+			all = append(all, s)
+		}
+	}
+	var users []string
+	if u := catvis.UserSubject(pr.ID); u != "" {
+		for _, c := range cats {
+			if p := c.Profile(); p.Users[u] || p.SubScoped {
+				users = append(users, u)
+				break
+			}
+		}
+	}
+	subjects := catvis.FilteredSubjects([][]string{append(slices.Clone(all), users...)}, pr.Groups, scopeKeyDigest)
+	for _, s := range append(users, keySubject) {
+		if !slices.Contains(subjects, s) {
+			subjects = append(subjects, s)
+		}
+	}
 	slices.Sort(subjects)
-	return t.newFview(fs, cp, grantcheck.SubjectSetID(subjects), subjects, grantcheck.FilterOf(a.verified), a), nil
+	return subjects
+}
+
+// readScopeInput is grantcheck.ScopeInputOf(v) without the roles whose
+// rules refer to /now (or the whole envelope), which don't count for read
+// (§C.2 item 5, §A.4 gs markers): the inputs of a partial reader's scope
+// digest, and of its filtered_gs row (gsRecordOf), from one list.
+func readScopeInput(v *grant.Verified) grantcheck.ScopeInput {
+	in := grantcheck.ScopeInputOf(v)
+	for r, rs := range in.Roles {
+		if rulesReferToNow(rs) {
+			delete(in.Roles, r)
+		}
+	}
+	return in
+}
+
+// readFilterOf is grantcheck.FilterOf(v) without the roles readScopeInput
+// leaves out. A grant with roles keeps a non-nil Roles, empty if none
+// remains, so that its filter allows nothing rather than every role.
+func readFilterOf(v *grant.Verified) *grantcheck.ReadFilter {
+	f := grantcheck.FilterOf(v)
+	if f.Roles != nil {
+		kept := [][]any{}
+		for _, rs := range f.Roles {
+			if !rulesReferToNow(rs) {
+				kept = append(kept, rs)
+			}
+		}
+		f.Roles = kept
+	}
+	return f
 }
 
 // gsRecordOf is the filtered_gs row of fv, a grant's view, for edge grants
 // expiring at exp (Unix seconds).
 func gsRecordOf(fv *fview, exp int64) *gsRecord {
 	v := fv.a.verified
-	in := grantcheck.ScopeInputOf(v)
+	in := readScopeInput(v)
 	digest, _ := grantcheck.ScopeDigest(in)
 	roles := make([]string, 0, len(in.Roles))
 	for r := range in.Roles {
@@ -65,10 +125,11 @@ func gsRecordOf(fv *fview, exp int64) *gsRecord {
 //     definitions, read from {ns}'s document at cp, with its stored block
 //     rules and principal, differs from the stored one (a kid or role
 //     gone, or no longer listing read, or the kid's key with another pub
-//     than the stored one, counts as differing); 403 where
-//     it is partial and some deciding catalog's Profile at cp keeps all
-//     groups; otherwise item 1 from the stored subjects and item 2 from
-//     the stored filter;
+//     than the stored one, counts as differing); 403 where it holds
+//     "partial", a set stored before v0.78 that leaves groups out, which
+//     no gs does now (§B.11.5, §B.11.9 gs), whatever the catalogs decide;
+//     otherwise item 1 from the stored subjects and item 2 from the
+//     stored filter;
 //   - a cookie for /ns/{ns}, which covers these URLs too, is judged as a
 //     cookie for urlGS would be;
 //   - no credentials, or an expired cookie, are 401.
@@ -112,16 +173,8 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 	if !t.gsDigestHolds(n, cp, rec) {
 		return nil, forbidden("the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)")
 	}
-	var cats []*catvis.Catalog
-	for i := range cp.cats {
-		cats = append(cats, t.catalogAt(&cp.cats[i], cp))
-	}
-	if rec.partial {
-		for _, c := range cats {
-			if c.Profile().KeepAll {
-				return nil, forbidden("this subject set leaves out groups that decide visibility at this checkpoint: exchange the grant again (§B.11.5, §B.11.9)")
-			}
-		}
+	if rec.partial || slices.Contains(rec.subjects, catvis.Partial) {
+		return nil, forbidden("this subject set was stored leaving out some of the caller's groups, which no gs does now: exchange the grant again (§B.11.5, §B.11.9 gs)")
 	}
 	filter, err := grantcheck.DecodeReadFilter(rec.filter)
 	if err != nil {

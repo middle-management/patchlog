@@ -389,9 +389,14 @@ func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxL
 	}
 }
 
-// basicEnvelope is the envelope of step 1 and of reads.
+// basicEnvelope is the envelope of step 1 and of reads. A read envelope
+// carries only action, resource and principal: it has no now, and rules
+// that refer to /now fail for it (§6.4.1, §C.2 item 5, scopeRules).
 func (t *tx) basicEnvelope(action, resource string, a *actor) map[string]any {
-	env := map[string]any{"action": action, "now": t.now.Format("2006-01-02T15:04:05.000Z")}
+	env := map[string]any{"action": action}
+	if action != "read" {
+		env["now"] = t.now.Format("2006-01-02T15:04:05.000Z")
+	}
 	if resource != "" {
 		env["resource"] = resource
 	}
@@ -494,8 +499,11 @@ const (
 // and classifies the reader: unrestricted where nsReader admits it;
 // partial where n is covered (filteredScope, returned then) and the grant
 // verifies there, its key's scope included (§C.2 item 1), and allows read
-// through its verbs and effective roles (item 2), without reading n
-// unrestricted. Anything else is nsReader's refusal. An edge grant for a
+// through its verbs and an effective role without a rule on /now (item 2,
+// item 5, readRoles), without reading n unrestricted. A grant whose blocks
+// or key scope refer to /now is refused in the read check itself
+// (readerCheckURL), before any redirect. Anything else is nsReader's
+// refusal. An edge grant for a
 // filtered read (GS) is none: filteredAdmit judges it at filtered URLs.
 func (t *tx) nsAccess(n *nsRow, cred Credentials) (*actor, accessKind, *fscope, *Error) {
 	cfg := t.config(n.configSeq)
@@ -515,7 +523,7 @@ func (t *tx) nsAccess(n *nsRow, cred Credentials) (*actor, accessKind, *fscope, 
 		if a == nil || a.verified == nil {
 			return false
 		}
-		if ok, _ := a.verified.Allows("read"); !ok {
+		if _, ok := readRoles(a); !ok {
 			return false
 		}
 		if fs = t.filteredScope(n); fs != nil {
@@ -532,7 +540,10 @@ func (t *tx) nsAccess(n *nsRow, cred Credentials) (*actor, accessKind, *fscope, 
 
 // anyReader is reader for a request that answers any reader of the
 // namespace, filtered to what it may read (the gestures listing, §7.4):
-// a grant with read, whatever its rules say about resources.
+// a grant with read, through a role without a rule on /now if it carries
+// roles (readRoles), whatever its rules say about resources. One whose
+// blocks or key scope refer to /now is refused before the namespace's 410
+// or not_offered (readerCheckURL, §C.2 item 5).
 func (t *tx) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
@@ -542,7 +553,11 @@ func (t *tx) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
 		if cfg.Read == "public" || t.e.opt.AuthDisabled {
 			return true
 		}
-		return a != nil && a.verified != nil && a.verified.Can["read"]
+		if a == nil || a.verified == nil {
+			return false
+		}
+		_, ok := readRoles(a)
+		return ok
 	})
 }
 
@@ -560,9 +575,21 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 // the grant in a public namespace either (§7, §E.2.3): there too, a grant
 // that doesn't name the namespace is 403, one that can't be used 401, and
 // one its key's scope refuses 403 (§C.2 item 1), as at
-// GET /ns/{ns}/principal.
+// GET /ns/{ns}/principal. A grant with roles has read only through a role
+// that counts for read (readRoles, §C.2 item 5): one whose read roles all
+// have a rule on /now reads nothing, so /keys relays it no key (§E.2.3)
+// and is 403, whatever its other rules say about /resource.
 func (t *tx) keysReader(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
-	return t.readerCheckURL(n, cred, may, readKeys)
+	return t.readerCheckURL(n, cred, func(a *actor) bool {
+		if !may(a) {
+			return false
+		}
+		if t.e.opt.AuthDisabled || a == nil || a.verified == nil {
+			return true
+		}
+		_, ok := readRoles(a)
+		return ok
+	}, readKeys)
 }
 
 // readKind is the kind of read readerCheckURL authenticates.
@@ -577,7 +604,10 @@ const (
 // readerCheckURL is readerCheck for a kind of read: a public namespace
 // ignores the grant, but at POST /ns/{ns}/keys, and a key-scope failure,
 // or a verified grant that may not read, is 404 at a resource URL and 403
-// elsewhere (§7, §C.2).
+// elsewhere (§7, §C.2). A grant whose blocks or key scope refer to /now
+// is refused every read where its grant counts (§C.2 item 5): here, as
+// part of the read check, so before a purged namespace's 410, a
+// not_offered and a partial reader's 302 to its filtered URL.
 func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, kind readKind) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	var a *actor
@@ -606,6 +636,12 @@ func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, k
 			return nil, notFound()
 		}
 	}
+	if a != nil && (cfg.Read != "public" || kind == readKeys) && scopeReferToNow(a) {
+		if kind == readResource {
+			return nil, notFound()
+		}
+		return nil, forbidden("a grant or key rule refers to /now, which no read passes (§C.2 item 5): the grant does not allow this read in " + n.name)
+	}
 	if !may(a) {
 		if a == nil {
 			return nil, apiErr(401, "unauthenticated", "message", "missing grant")
@@ -623,18 +659,20 @@ func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, k
 // readsNS reports whether a reads namespace n unrestricted (§2.1, §C.5 "The
 // stream is metadata"): anyone does in a public namespace or with
 // authentication disabled, and otherwise a grant that may read there
-// through rules none of which refers to /resource (unrestrictedRoles).
-// /ns/{ns} and everything under it but the gestures listing need it, as
+// through rules none of which refers to /resource (unrestrictedRoles)
+// and that pass for a read, so none on /now (§C.2 item 5). /ns/{ns} and everything under it but the gestures listing need it, as
 // do a batch's source check (§7.5), branching (§7.6) and remote branch
 // registration (§G.3): a grant whose rules hide some resources could
 // otherwise list their names and heads, or read them through a branch.
 // Branching and registration check it as step 1 checks verbs (stepOne,
 // §6.2, §2.1, §C.2 item 2), in a public namespace too: the grant must read
 // n unrestricted and allow read, and its key-scope and block rules that
-// refer only to /action, /principal or /now must pass with /action read,
+// refer only to /action or /principal must pass with /action read,
 // rules over the rest of the envelope applying to their own write at step
 // 6; a role that counts for read must pass all its rules against the read
-// envelope, as a read does (item 5), whatever they refer to.
+// envelope, as a read does (item 5), whatever they refer to. A key-scope,
+// block or role rule that refers to /now fails it, as for any read: the
+// read envelope has no now (scopeRules, roleRules).
 func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 	if cfg.Read == "public" && !stepOne || t.e.opt.AuthDisabled {
 		return true

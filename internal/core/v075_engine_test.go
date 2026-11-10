@@ -271,15 +271,13 @@ func TestV075FilteredScope(t *testing.T) {
 			t.Fatalf("cat-season: %+v", fs)
 		}
 	})
-	// A local branch of matches: branch kind, with its chain.
+	// A local branch of matches isn't covered (v0.78, §B.11.9 Where).
 	if _, err := w.e.CreateBranch(context.Background(), Request{NS: "matches", Cred: w.admin}, BranchRequest{Name: "matches-r7", IfNoneMatch: true}); err != nil {
 		t.Fatal(err)
 	}
 	w.inTx(func(t2 *tx) {
-		m, b := t2.nsByName("matches"), t2.nsByName("matches-r7")
-		fs := t2.filteredScope(b)
-		if fs == nil || fs.kind != fsBranch || fs.root.id != m.id || len(fs.chain) != 1 || fs.chain[0].n.id != m.id || fs.chain[0].at != b.baseAt.Int64 {
-			t.Fatalf("matches-r7: %+v", fs)
+		if fs := t2.filteredScope(t2.nsByName("matches-r7")); fs != nil {
+			t.Fatalf("matches-r7 covered: %+v", fs)
 		}
 	})
 	// NoFilteredReads covers nothing.
@@ -480,8 +478,11 @@ func TestV075Visible(t *testing.T) {
 	})
 }
 
-// §B.11.9 Branches (conformance 63, 65): a branch's document is visible
-// when live in its base as of the branch's at and placed in the root.
+// §B.11.9 Where (v0.78: "Filtered reads cover no branch"; conformance
+// TDA 63): li, a partial reader of matches, isn't one of its branch: her
+// unfiltered read of matches-r7 is 403, with no redirect. Before v0.78 a
+// branch's document was visible when live in its base as of the branch's
+// at and placed in the root.
 func TestV075VisibleBranch(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -492,14 +493,18 @@ func TestV075VisibleBranch(t *testing.T) {
 	}
 	w.put("matches-r7", "final", map[string]any{"title": "final"})
 	w.put("cat-season", "matches.final", map[string]any{"parents": v75Parents("season")})
-	// derby tombstoned in matches after the branch was cut.
-	w.del("matches", "derby")
 	li := w.cred(w.catPriv, map[string]any{"kid": "catalog-01", "sub": "user:li", "groups": []any{"editors"}, "roles": []any{"reader"},
 		"ns": []any{"matches-r7"}, "can": []any{"read"}, "at": map[string]any{"ns": "cat-season", "id": w.head("cat-season")},
 		"exp": w.now().Add(10 * time.Minute).UTC().Format(time.RFC3339)})
-	got := v075Visible(t, w, "matches-r7", li, "derby", "shared", "final", "opener")
-	if want := map[string]bool{"derby": true, "shared": true, "final": false, "opener": false}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("in the branch li sees %v, want %v", got, want)
+	w.inTx(func(t2 *tx) {
+		a, kind, fs, err := t2.nsAccess(t2.nsByName("matches-r7"), li)
+		if err == nil || err.Status != 403 || kind != accessNone || fs != nil || a != nil {
+			t.Fatalf("li in the branch: %v %v %+v %v, want 403", a, kind, fs, err)
+		}
+	})
+	// An unrestricted reader of the branch sees final, unfiltered.
+	if _, err := w.e.ResourceHead(ctx, "matches-r7", "final", w.admin); err != nil {
+		t.Fatalf("admin reading final: %v", err)
 	}
 }
 
@@ -622,7 +627,11 @@ func TestV075CatalogAt(t *testing.T) {
 	})
 }
 
-// §B.11.9 gs (conformance 69, 71, 79, 85).
+// §B.11.9 gs (conformance 69, 71, 79, 85; v0.78: "A gs hashes all the
+// caller's groups"): li's subjects are all her groups, interns too, which
+// nothing names, her sub (root's $access has a direct entry for her), the
+// scope digest and the key subject, never "partial"; before v0.78 only the
+// groups a catalog named counted, with "partial" for the rest.
 func TestV075GS(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -644,39 +653,36 @@ func TestV075GS(t *testing.T) {
 			digest = d
 		}
 	}
-	if want := []string{"group:editors", catvis.KeySubject("catalog-01", w.catPub), "partial", "scope:" + digest, "user:li"}; digest == "" || !reflect.DeepEqual(liSubs, want) {
-		t.Fatalf("li's subjects %v", liSubs)
+	if want := []string{"group:editors", "group:interns", catvis.KeySubject("catalog-01", w.catPub), "scope:" + digest, "user:li"}; digest == "" || !reflect.DeepEqual(liSubs, want) {
+		t.Fatalf("li's subjects %v, want %v", liSubs, want)
 	}
 	if liGS == "all" || liGS != grantcheck.SubjectSetID(liSubs) {
 		t.Fatalf("gs %s", liGS)
 	}
 	// bo, in the same groups but without a direct entry: another gs.
 	boSubs, boGS := subjects(w.catGrant("user:bo", []any{"editors", "interns"}))
-	if boGS == liGS || slices.Contains(boSubs, "user:bo") {
+	if boGS == liGS || slices.Contains(boSubs, "user:bo") || !slices.Contains(boSubs, "group:interns") {
 		t.Fatalf("bo's subjects %v", boSubs)
+	}
+	// li without interns, which nothing names: another gs (TDA 78).
+	if _, gs := subjects(w.catGrant("user:li", []any{"editors"})); gs == liGS {
+		t.Fatal("li without interns shares the gs")
 	}
 	// Other /resource block rules: another gs.
 	_, narrowGS := subjects(w.li(map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": "^d"}}}}))
 	if narrowGS == liGS {
 		t.Fatal("a narrowed grant shares the gs")
 	}
-	// A /now block rule: unreadable this way.
+	// A /now block rule: refused in the read check, before any view
+	// (§C.2 item 5).
 	nowRule := w.li(map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}}})
 	w.inTx(func(t2 *tx) {
-		n := t2.nsByName("matches")
-		a, kind, fs, err := t2.nsAccess(n, nowRule)
-		if err != nil || kind != accessPartial {
-			t.Fatalf("nsAccess: %v %v", kind, err)
-		}
-		if _, err := t2.grantView(fs, t2.filteredCurrent(fs), a); err == nil || err.Status != 403 {
-			t.Fatalf("/now rule: %v", err)
-		}
-		if err := t2.partialRedirect(n, fs, a); v75Status(err) != 403 {
-			t.Fatalf("partialRedirect with a /now rule: %v", err)
+		if _, kind, _, err := t2.nsAccess(t2.nsByName("matches"), nowRule); err == nil || err.Status != 403 || kind != accessNone {
+			t.Fatalf("/now rule: %v %v, want 403", kind, err)
 		}
 	})
-	// A role rule reading /principal/groups by position keeps every group:
-	// no partial.
+	// A role rule reading /principal/groups by position changes nothing:
+	// every group is kept anyway.
 	w.patchConfig("matches", map[string]any{"op": "add", "path": "/roles/reader/rules",
 		"value": []any{map[string]any{"op": "test", "path": "/principal/groups/0", "exists": true}}})
 	if subs, _ := subjects(w.li()); !reflect.DeepEqual(subs[:4], []string{"group:editors", "group:interns", catvis.KeySubject("catalog-01", w.catPub), "scope:" + subs[3][6:]}) || slices.Contains(subs, "partial") {
@@ -755,7 +761,7 @@ func TestV075State(t *testing.T) {
 	w.inTx(func(t2 *tx) {
 		got := t2.loadGS("matches", rec.gs)
 		if got == nil || got.exp != rec.exp || !reflect.DeepEqual(got.subjects, rec.subjects) || got.kid != "catalog-01" ||
-			!reflect.DeepEqual(got.roles, []string{"reader"}) || got.digest != rec.digest || got.filter != rec.filter || !got.partial {
+			!reflect.DeepEqual(got.roles, []string{"reader"}) || got.digest != rec.digest || got.filter != rec.filter || got.partial {
 			t.Fatalf("after a restart: %+v, want %+v", got, rec)
 		}
 		if t2.loadGS("matches", grantcheck.SubjectSetID([]string{"x"})) != nil {
@@ -841,8 +847,9 @@ func TestV075FilteredAdmit(t *testing.T) {
 		}
 	}
 	// Record the current at, then add a role whose rule refers to the
-	// groups negatively: a partial cookie is 403 at the new at, still
-	// admitted at the recorded one.
+	// groups negatively: the cookie's gs holds every group, so it is still
+	// admitted at the new at (v0.78; before, a "partial" cookie was 403
+	// there), and at the recorded one.
 	var oldCP *fcp
 	w.inTx(func(t2 *tx) { oldCP = t2.filteredCurrent(t2.filteredScope(t2.nsByName("matches"))) })
 	if err := w.e.recordFilteredAt(ctx, oldCP); err != nil {
@@ -850,8 +857,8 @@ func TestV075FilteredAdmit(t *testing.T) {
 	}
 	w.patchConfig("matches", map[string]any{"op": "add", "path": "/roles/auditor", "value": map[string]any{"can": []any{"read"},
 		"rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/principal/groups", "schema": map[string]any{"contains": map[string]any{"const": "contractors"}}}}}}})
-	if _, st := admit(liGS, gCookie(liGS, exp)); st != 403 {
-		t.Fatalf("partial cookie where every group decides: %d", st)
+	if _, st := admit(liGS, gCookie(liGS, exp)); st != 0 {
+		t.Fatalf("a cookie of every group where every group decides: %d", st)
 	}
 	atOld := func(cred Credentials) int {
 		var st int
@@ -916,7 +923,7 @@ func TestV075Exchange(t *testing.T) {
 		t.Fatalf("prefixes %v", got)
 	}
 	w.inTx(func(t2 *tx) {
-		if r := t2.loadGS("matches", gs); r == nil || r.ns != "matches" || !r.partial || r.exp > w.now().Add(10*time.Minute).Unix() {
+		if r := t2.loadGS("matches", gs); r == nil || r.ns != "matches" || r.partial || r.exp > w.now().Add(10*time.Minute).Unix() {
 			t.Fatalf("filtered_gs row %+v", r)
 		}
 	})

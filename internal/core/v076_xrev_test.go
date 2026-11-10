@@ -221,8 +221,9 @@ func TestV076Scenario102(t *testing.T) {
 
 // Scenario 109: at matches-r7's at, reader has not /principal/groups
 // contains const "contractors", which matches has since removed; li is in
-// contractors -> a filtered read of the branch keeps derby hidden through
-// reader, and her gs keeps all her groups.
+// contractors -> the branch isn't read filtered at all since v0.78
+// (§B.11.9 Where: 403, no redirect), and in matches her gs keeps all her
+// groups.
 func TestV076Scenario109(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{matches: func(doc map[string]any) {
@@ -236,13 +237,8 @@ func TestV076Scenario109(t *testing.T) {
 	}
 	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/roles/reader/rules"})
 	li := w.catGrant("user:li", []any{"editors", "contractors"}, map[string]any{"ns": []any{"matches-r7"}})
-	red, st := v76fRedirect(t, w, "matches-r7", "", li)
-	if red == nil {
-		t.Fatalf("li on the branch: %d", st)
-	}
-	names, st := v76fHeads(t, w, "matches-r7", red.GS, red.At, li)
-	if st != 0 || v76fHas(names, "derby") {
-		t.Fatalf("branch heads %v %d: derby must stay hidden", names, st)
+	if _, st := v76fRedirect(t, w, "matches-r7", "", li); st != 403 {
+		t.Fatalf("li on the branch: %d, want 403", st)
 	}
 	// In matches itself, at its head, derby is visible.
 	lim := w.catGrant("user:li", []any{"editors", "contractors"})
@@ -253,11 +249,10 @@ func TestV076Scenario109(t *testing.T) {
 	if names, st := v76fHeads(t, w, "matches", red2.GS, red2.At, lim); st != 0 || !v76fHas(names, "derby") {
 		t.Fatalf("matches heads %v %d", names, st)
 	}
-	// gs keeps all groups: li without contractors gets a different gs on
-	// the branch.
-	li2 := w.catGrant("user:li", []any{"editors"}, map[string]any{"ns": []any{"matches-r7"}})
-	red3, _ := v76fRedirect(t, w, "matches-r7", "", li2)
-	if red3 == nil || red3.GS == red.GS {
-		t.Fatalf("gs of li without contractors %+v equals %s", red3, red.GS)
+	// gs keeps all groups: li without contractors gets a different gs.
+	li2 := w.catGrant("user:li", []any{"editors"})
+	red3, _ := v76fRedirect(t, w, "matches", "", li2)
+	if red3 == nil || red3.GS == red2.GS {
+		t.Fatalf("gs of li without contractors %+v equals %s", red3, red2.GS)
 	}
 }
