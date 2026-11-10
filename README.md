@@ -1969,7 +1969,7 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   and migration `016_v081_encryption` drops its table. It relays no keys of a deeper base, and
   uses no last-seen epoch for it, while its latest read of that base's namespace document
   failed (read at creation, at start and at every sync; core migration `013_remote_chain_read`).
-  `-remote-origin-url` is still accepted but no longer has an effect. A accepts registrations
+  `-remote-origin-url` is ignored since v0.81: still accepted, with a warning at start. A accepts registrations
   whatever its level: it can't check B.
 - **What doesn't cross.** Keys and revocations are the branch's own (they stop at the shadow),
   A's rules don't apply, B's purges and namespace purge never contact A, and A's registrations
@@ -2307,7 +2307,10 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   never under a key without a sender (one `/keys` relays without `from`), which the server could
   have wrapped itself: such a write fails with `client.ErrUntrustedKey`, and services skip the
   namespace. Reads still open every known sender's keys, and since v0.81 no key without a
-  sender. A keyring in the format before v0.63 is no longer relayed or read, and keys wrapped
+  sender. Keyring writes (`InitKeyring`, `AddReader`, `RotateEpoch`, and the playground's) carry a
+  fresh `$nonce` where the keyring read has one, so the next one mends a keyring whose `$nonce`
+  predates v0.76, which `/keys` doesn't relay meanwhile (v0.81). A keyring in the format before
+  v0.63 is no longer relayed or read, and keys wrapped
   under the info before v0.63 no longer open (v0.81): a key holder wraps it again with the
   v0.26.1 client's `patchlog e2e migrate-keyring` before upgrading, as this version has no such
   command.
@@ -2469,7 +2472,11 @@ file tree, `file` says why it is absent: `{ "absent": "e2e" }` or `{ "absent": "
 (§H.3). A database from before this version gains the new columns and records on its first
 start, and `born` is filled in beside the followers, a few logs at a time.
 
-With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
+With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11). The caller's grant
+is proof of identity only, but `POST /grants` and `POST /read-grants` hand out read decisions,
+read grants and keys, so there a grant whose block or key-scope rules refer to `/now` (or to the
+whole envelope), or whose read roles all do, is `403`, `no-store`, before `?min` and body errors
+(v0.81, §C.2 item 5); `POST /merge-grants`, which issues write grants only, doesn't check it:
 - `POST /grants` with `{ "node", "want": ["create"], "to": [folders] }` creates a folder
   (§B.11.4): `move` on every folder in `to`; the grant fixes the name and parents and, unless
   the caller is an admin, refuses `$access`. A name a node has or had, or that a `parents` entry

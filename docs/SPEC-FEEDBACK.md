@@ -13,11 +13,11 @@ From implementing v0.78 to v0.81 (branch `spec-v081`; v0.79 and v0.80 change no 
 Numbered afresh; cite these as "v0.81 Open n". Each entry gives the section, what the reference
 does now (the conservative reading where it had a choice) and the question. The planner's
 questions from before the work and the implementers' and reviewers' notes are merged here, each
-case once. Notes from v0.77 that v0.78 to v0.81 leave open are carried at the end (40–73),
-rewritten to what remains where they were settled in part (40, 41, 45, 46, 52, 55, 56, 67).
+case once. Notes from v0.77 that v0.78 to v0.81 leave open are carried at the end (44–77),
+rewritten to what remains where they were settled in part (44, 45, 49, 50, 56, 59, 60, 71).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
-73 are open: 39 from this version's work and 34 carried.
+77 are open: 43 from this version's work and 34 carried.
 
 1. **A pruned E3 source at creation** (§G.3 Creating one, §G.5.2, scenario 66). §G.3 still
    allows `410` for history A has pruned, but scenario 66 expects B to serve A's snapshot at
@@ -247,7 +247,28 @@ Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are
     answers; the playground tells a snapshot from an E2 document by `pl` shape and refuses a
     plain `200` only where it knows the level. A server can still claim a namespace isn't e2e.
     *Question:* should §7.1 tell readers how to learn the level?
-40. **A purged catalog's coverage** (§B.11.9 Where; was v0.77 Open 1). A purged catalog keeps the
+40. **The catalog's `/now` refusal and writes** (§C.2 item 5, §B.11.4, §B.11.5). `POST /grants`
+    and `POST /read-grants` refuse a grant whose block or key-scope rules refer to `/now`, or whose
+    read roles all do (`403`, `no-store`), as the tree service refuses it its listings. `POST
+    /grants` refuses every `want` from such a grant, writes and organising verbs included, since
+    each decision is a read decision (visibility, the roles at a placement); `POST /merge-grants`,
+    which issues write grants only, doesn't check it. §C.2 item 5 says rules on `/now` for writes
+    are unchanged. *Question:* should `POST /grants` refuse only read wants?
+41. **Content roles with a `/now` rule at `POST /grants`** (§B.11.4, §C.2 item 5). The catalog keeps a
+    content role for a `want` by its `can`, without evaluating its rules (§B.11.4 grants role
+    names), so `want: ["read"]` through a content role with a rule on `/now` still gets a grant,
+    which the core then refuses for every read. *Question:* should a read `want` leave out roles
+    that don't count for `read`?
+42. **A grant without `read` at the catalog** (§C.2 item 5, §B.11.5). The catalog's API takes the
+    caller's grant as proof of identity, so a grant allowing no `read` at all is served, while one
+    whose only read role has a rule on `/now` is `403` (as the tree service's refusal does).
+    *Question:* is that difference intended, or should both be treated alike?
+43. **What "a fresh `$nonce`" in a keyring means** (§E.3.2, §C.7). The server checks only the form
+    (26 lowercase base32 characters). The reference client and the playground write new random
+    bits on every keyring write where the keyring read had a `$nonce`, and none where it had none;
+    so the next write mends a keyring whose `$nonce` predates v0.76. *Question:* the form only, or
+    new random bits on every write?
+44. **A purged catalog's coverage** (§B.11.9 Where; was v0.77 Open 1). A purged catalog keeps the
     namespaces that trust it covered, with nothing visible. The origin reads the catalog's last
     stored `catalog.trust`; the index keeps the last `catalog.trust` it applied for each catalog
     (migration `009_catalog_trust`) and counts a purged catalog whose documents it never applied as
@@ -256,14 +277,14 @@ Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are
     treat a purged catalog it never read as no catalog? Does a purged member still count for a
     catalog's coverage? Can a `requireAt` chain whose namespace is purged still be read (a grant of
     such a key fails `502`, so a purged catalog's coverage may never be reached)?
-41. **Ending a cookie** (§B.11.9 gs, §A.4, §C.5; was v0.77 Open 4). A `gs` cookie ends when its
+45. **Ending a cookie** (§B.11.9 gs, §A.4, §C.5; was v0.77 Open 4). A `gs` cookie ends when its
     rules differ, or when the key its `key:` string names (`kid` and `pub`), or a key or role they
     came from, is gone or no longer allows `read`, and at the index when a role it was issued under
     gains a rule on `/now`. So a `pub` rotation ends it; other changes to the key's entry don't.
     *Question:* should they (`sub`, `groups`, `attrs`, `maxTtl`, `requireAt`)? And, as §C.5 lets
     namespace-wide cookies outlive revocation, does removing the verifying key, or rotating its
     `pub`, end `reads:{ns}` cookies?
-42. **`requireAt` naming a namespace the verifier can't find** (§C.4, §12.1; was v0.77 Open 5). The
+46. **`requireAt` naming a namespace the verifier can't find** (§C.4, §12.1; was v0.77 Open 5). The
     services answer `502 upstream` (a service can't tell an unknown namespace from one its grant
     can't see, as §7 answers both `404`), the origin `403 "unknown namespace"`
     (`internal/core/auth.go`). A `requireAt` rejection's `403` (at not in the chain, beyond
@@ -272,54 +293,54 @@ Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are
     later check in the grant's verification would have refused with `403`, reading "never `403`" as
     covering it. A cancelled verification is a transient `503`. *Question:* `502` or `403` for the
     unknown namespace; must the `403` messages name none; confirm the order.
-43. **Older sealed log ranges for a `requireAt` check** (§C.4, §E.2.3; was v0.77 Open 6). A
+47. **Older sealed log ranges for a `requireAt` check** (§C.4, §E.2.3; was v0.77 Open 6). A
     checker's grant issued after an epoch rotation gets no key for the older epoch's stored log
     range even where `/keys` answers, so every `requireAt` `at` from before the rotation is a
     lasting `502` for it. *Question:* should a verifier's grant open older sealed ranges for this,
     or is the `502` expected? `K_n` derives from the same `K_e`, so v0.81 changes nothing here.
-44. **The `key:` subject of a grant without a `pub`** (§B.11.9 gs, §A.4; was v0.77 Open 7). A grant
+48. **The `key:` subject of a grant without a `pub`** (§B.11.9 gs, §A.4; was v0.77 Open 7). A grant
     signed by an operator key (a published JWK has no `pub`), or by a `kid` the namespace document
     doesn't list, has `""` for `pub` and gets scope cookies that are always `403`, as `g:` cookies
     were. *Question:* is `pub` the JWK's `x`, or are operator grants never partial readers of the
     index?
-45. **Where the index gives no marker** (§A.4; was v0.77 Open 8). No branch is covered, but to keep
+49. **Where the index gives no marker** (§A.4; was v0.77 Open 8). No branch is covered, but to keep
     a branch of a covered namespace from falling back to a rules-only scope marker the index still
     reads a local base both as of the branch's `at` and at its head, either naming a catalog
     counting, a base purged or gone included, at every level up the chain; the namespace itself is
     exempt only if every document it reads (head and checkpoint) says sealed or end-to-end.
     *Question:* base at its head or as of `at`; deeper bases or only the immediate one?
-46. **The exchange's `410`** (§A.4 Coverage, §C.5.2; was v0.77 Open 9). "Every namespace its grant
+50. **The exchange's `410`** (§A.4 Coverage, §C.5.2; was v0.77 Open 9). "Every namespace its grant
     names" includes unfollowed ones, which don't qualify; the set is that of the first block naming
     namespaces without `"*"`, so a block naming `"*"` never qualifies, and a narrowing block's
     narrower list isn't taken as the set. Where only purged namespaces are named and the grant fails
     to verify in one, the answer is `403` (`401` if a refusal was). At `/_refs`, where every reader
     sees public namespaces, a grant naming only purged ones gets `410` only on an index following no
     public namespace, else the public answer. *Question:* confirm each.
-47. **503 bodies naming no namespace** (§A.4 Private namespaces, §B.5 Behind; was v0.77 Open 10).
+51. **503 bodies naming no namespace** (§A.4 Private namespaces, §B.5 Behind; was v0.77 Open 10).
     v0.77 settles that a namespace visibility reads but hasn't reached is `503 behind`; only §C.4's
     `502` says "naming no namespace". The reference also strips the member's name from the index's
     `503` (as `/principal` hides `catalog.trust`) and the tree's and index's chain and root `503`s
     name none, with a fixed `Retry-After` (5 s in the tree; the spec fixes none). *Question:* must
     every `503 behind` body name no namespace?
-48. **A result and a purge** (§A.1, §B.5; was v0.77 Open 12). The index never serves or keeps a
+52. **A result and a purge** (§A.1, §B.5; was v0.77 Open 12). The index never serves or keeps a
     result computed from rows read before a purge in `m`: it computes again after the purge, and
     answers `503 behind` if that keeps losing (after two more tries at `/{ns}`, after the third at
     `/_refs`). The tree service's `listing()` still serves a refused result once. *Question:* does
     §A.1's "serving or keeping none computed from what was read before it" also bind tree listings
     (§B.5 purges "as §A.1 does")? Is `503 behind` acceptable when recomputation keeps losing?
-49. **Authentication mode that can't be learned** (§B.11.9 Where, §1; was v0.77 Open 13). Coverage
+53. **Authentication mode that can't be learned** (§B.11.9 Where, §1; was v0.77 Open 13). Coverage
     holds only while authentication is on. The index reads the core's root again once `CheckerTTL`
     has passed and, for a namespace the documents would cover, answers `503 behind` (transient:
     transport, deadline, `5xx`, `408`, `429`) or `502`, never reusing the last known mode.
     *Question:* may a stale mode be used for a bounded time?
-50. **A purged covered namespace's `/heads`** (§8.5, §B.11.9 URLs, gs; was v0.77 Open 14). A grant
+54. **A purged covered namespace's `/heads`** (§8.5, §B.11.9 URLs, gs; was v0.77 Open 14). A grant
     that reads it unrestricted gets `410` at filtered `/heads` with or without `at`. A partial
     reader's unfiltered `/heads` is still `302` to the filtered form, which then answers `410`: two
     steps, not §8.5's direct `410`. A catalog's own partial reader gets a new subject set once it is
     purged, and its old `gs` is `403`, counting the own-`gs` check as part of "the full read check".
     *Question:* which comes first for an unfiltered URL, and does a purged namespace's filtered
     `/heads` ignore `gs`?
-51. **"Judged once, when the service first seals"** (§E.2.6, §E.3.1; was v0.77 Open 17). The tree
+55. **"Judged once, when the service first seals"** (§E.2.6, §E.3.1; was v0.77 Open 17). The tree
     and the index write the judgement just before sealing, in their own transaction (an update
     guarded by the head), apart from the one that stores the sealed listing; a crash between leaves
     a judgement without a listing, and an answer that judges and then fails has still judged. While
@@ -328,12 +349,12 @@ Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are
     force, as in v0.76. Rows from before v0.77 keep `born` epochs judged at apply time, which can
     differ from their head's. *Question:* is that "first seals"; may or must a service in that
     window answer `503 behind`; must legacy rows be re-marked?
-52. **Values whose epoch isn't known** (§E.3.1, §E.2.6; was v0.77 Open 18). §E.3.1 now says a
+56. **Values whose epoch isn't known** (§E.3.1, §E.2.6; was v0.77 Open 18). §E.3.1 now says a
     snapshot's `kid` names this namespace, and the pre-raise causes are gone, so a value never
     names a base's epoch. The tree service still leaves out a `born` whose epoch isn't known yet
-    (while a database's head epochs are read in, 51, and for a base's op read through in a
-    preview, 53) rather than seal it under the epoch in force. *Question:* left out, or sealed?
-53. **Epochs of release previews and branch catalogs** (§B.5 Previews of a release, TOOLS §F.9,
+    (while a database's head epochs are read in, 55, and for a base's op read through in a
+    preview, 57) rather than seal it under the epoch in force. *Question:* left out, or sealed?
+57. **Epochs of release previews and branch catalogs** (§B.5 Previews of a release, TOOLS §F.9,
     §E.2.5, §E.2.6, §E.3.1; was v0.77 Open 19). §E.2.5 and §E.2.6 seal a branch's entries under the
     branch's own kids and epochs, but a release preview follows a branch in place of its base, and
     the text doesn't say whose epochs judge and seal a preview's catalog listings. The reference
@@ -344,12 +365,12 @@ Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are
     branch catalog directly sees only its own log, not what it reads through from its base.
     *Question:* which namespace's epochs does a preview listing seal under; must a directly served
     branch catalog include read-through nodes?
-54. **Tree details after a redirect or a refusal** (§A.4, §B.5, §B.9, §C.4; was v0.77 Open 20). A
+58. **Tree details after a redirect or a refusal** (§A.4, §B.5, §B.9, §C.4; was v0.77 Open 20). A
     redirect keeps the legacy order cursor (`after={order}&name=…`, which names an order, not a
     resource) and drops position cursors. `POST /edge-grants` with one grant refused (`403`) and
     another's chain unreadable answers `403` (all or nothing, refusals win), not `503`/`502`.
     *Question:* confirm each.
-55. **What a give-up leaves** (§F.5 Switch, §F.6; was v0.77 Open 21). §F.6 excepts only resources
+59. **What a give-up leaves** (§F.5 Switch, §F.6; was v0.77 Open 21). §F.6 excepts only resources
     purged in the branch and the keyring at E3, so a resource purged only in the successor waits for
     a person to give it up (`LeaveOut`), as the reference already did. `Options.Resources` with
     Switch builds the gate from an extra unrestricted plan; a give-up still holds in the catch-up,
@@ -357,70 +378,70 @@ Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are
     switch; nothing records what was given up, so §F.6's superseded check can never pass for that
     branch. *Question:* should the switch's config write record the given-up resources (`"leftOut"`)
     for the janitor; is a give-up for good; is a partial replay followed by a full one allowed?
-56. **The answer for a failed read** (§H.4, §H.6; was v0.77 Open 23). A failed read fails a save
+60. **The answer for a failed read** (§H.4, §H.6; was v0.77 Open 23). A failed read fails a save
     over someone else's delete with `503` or `502`, never `409`, as settled. The reference gives
     `408`, `429` and timeouts `503` with `Retry-After`, and `5xx`, an unreachable core or a
     transport error with no answer `502`. Other reads (the key history behind `wroteAs`, `knowUser`
     in `ownLogEntry`) still swallow failures, and §H.4's Answers has no row for a gateway-side
     timeout (treated as `503`). *Question:* which of `503`/`502` does `408` get; must every read
     that decides "theirs" or "own" fail the save?
-57. **Item 2's roles and the digest** (§B.11.9 Visible, §A.4; was v0.77 Open 25). A read role
+61. **Item 2's roles and the digest** (§B.11.9 Visible, §A.4; was v0.77 Open 25). A read role
     testing `/principal/sub` never allows anything through filtered reads, as item 2 counts roles
     "only as §B.11.5 counts them", yet its rules enter the scope digest
     (`grantcheck.ReadFilter.AllowsItem`); CONFORMANCE scenario 75 depends on this. *Question:*
     intended? Do the reader's own role rules filter at all?
-58. **"Nothing promised" against invariant Valid** (§4 Valid, §6.1; was v0.77 Open 29). v0.77
+62. **"Nothing promised" against invariant Valid** (§4 Valid, §6.1; was v0.77 Open 29). v0.77
     changed only the changelog; §4 Valid still promises the same answer on re-validation. The
     reference compiles every stored schema under today's rules, and a write pinning one that no
     longer compiles is `422 invalid`. *Propose:* put the exception in the text and say what such a
     write answers (`422 invalid` or `schema_unavailable`). v0.78's "Reading this spec" now says
     drafts promise no compatibility with data written under an earlier draft, but §4 Valid's promise
     is unchanged.
-59. **A fixing grant and `/ns/{ns}/g/{gs}`** (§B.11.9 Edge grants; was v0.77 Open 30). A grant that
+63. **A fixing grant and `/ns/{ns}/g/{gs}`** (§B.11.9 Edge grants; was v0.77 Open 30). A grant that
     fixes `/resource` gets its `/r/{ns}/{name}` prefixes and no `/g/` prefix
     (`internal/core/edgegrants.go`). *Question:* may it get one too?
-60. **Malformed `{gs}` or `{at}`** (§B.11.9 URLs, §7; was v0.77 Open 31). `400 bad_input`, `all` as
+64. **Malformed `{gs}` or `{at}`** (§B.11.9 URLs, §7; was v0.77 Open 31). `400 bad_input`, `all` as
     `gs` too. *Propose:* say so.
-61. **Filtered `/heads` and `next`** (§B.11.9 /heads, §7.4; was v0.77 Open 32). `next` comes on
+65. **Filtered `/heads` and `next`** (§B.11.9 /heads, §7.4; was v0.77 Open 32). `next` comes on
     every full page, unlike unfiltered `/heads`, and the client accepts a short page with `next` (a
     bad `prefix` is a request-shape `400`, settled in v0.77). *Question:* is the divergence
     intended?
-62. **Ranges across a moving `at`, and client libraries** (§B.11.9 Log ranges, §10; was v0.77 Open
+66. **Ranges across a moving `at`, and client libraries** (§B.11.9 Log ranges, §10; was v0.77 Open
     33). The client starts again on a `302` partway through, takes `gs` and `at` from the `Location`
     path with its own query, and its `LongPoll` and `NSEvents` don't follow into a filtered log
     (`internal/client/filtered.go`). *Propose:* "a client library MUST NOT hand a filtered log to a
     caller that expects the unfiltered one"; may a client resume from `since`?
-63. **A bounded scan before `204`** (§B.11.9 Long-poll; was v0.77 Open 34). The reference scans the
+67. **A bounded scan before `204`** (§B.11.9 Long-poll; was v0.77 Open 34). The reference scans the
     whole log while nothing is visible (`internal/core/filtered_live.go`). *Question:* may a server
     answer `204` after a bounded scan, naming the newest entry scanned?
-64. **Live reads when the reader's `gs` changes** (§B.11.9 Events, Long-poll; was v0.77 Open 35).
+68. **Live reads when the reader's `gs` changes** (§B.11.9 Events, Long-poll; was v0.77 Open 35).
     The stream ends, and a long-poll is `403`, rather than keep the URL's `gs`. *Propose:* confirm.
-65. **`/resource` inside `any` or `not` beside a fixing rule** (§C.5.2, §2.1; was v0.77 Open 36).
+69. **`/resource` inside `any` or `not` beside a fixing rule** (§C.5.2, §2.1; was v0.77 Open 36).
     Read as not fixing, evaluated per fixed name, every name before the 100-prefix cap. *Propose:*
     confirm.
-66. **Other `Authorization` schemes** (§C.3, §C.5.3; was v0.77 Open 37). Any field counts as
+70. **Other `Authorization` schemes** (§C.3, §C.5.3; was v0.77 Open 37). Any field counts as
     present, `Basic …` included (`internal/edge/edge.go`). *Question:* intended?
-67. **Catalog answers** (§B.11.4, §B.9; was v0.77 Open 38). The service keeps its purge record for a
+71. **Catalog answers** (§B.11.4, §B.9; was v0.77 Open 38). The service keeps its purge record for a
     namespace the catalog no longer trusts (`internal/tree/tree.go` `forgetUntrusted`), and leaves
     "the node's parents as decided" out for an implicit placement, which has no `parents`.
     *Question:* each.
-68. **Encrypted archives** (§8.6, §G.5.1.1; was v0.77 Open 39). The per-resource archive key has no
+72. **Encrypted archives** (§8.6, §G.5.1.1; was v0.77 Open 39). The per-resource archive key has no
     export path, and E3 archives are sealed twice (`internal/core/archiveseal.go`). *Question:*
     both.
-69. **Sealed resource events** (§7.3, §E.2.2; was v0.77 Open 40). `purge` and `prune` events bind no
+73. **Sealed resource events** (§7.3, §E.2.2; was v0.77 Open 40). `purge` and `prune` events bind no
     entry in `pl` and carry no `id:`; the reference stores none (`internal/core/eventseal.go`), so
     each serve is a sealing under `K_r`, which the message bound counts. *Propose:* bind `target`,
     and say they aren't stored.
-70. **Why a resource purge purges `idx:{ns}`** (§A.1; was v0.77 Open 41). *Propose:* give the reason
+74. **Why a resource purge purges `idx:{ns}`** (§A.1; was v0.77 Open 41). *Propose:* give the reason
     (positional cursors, counts, scores), and note that a stream of purges defeats "one redirect
     suffices".
-71. **The index's range filters** (§A.4; was v0.77 Open 42). `gt`, `ge`, `lt` and `le` with a `sort`
+75. **The index's range filters** (§A.4; was v0.77 Open 42). `gt`, `ge`, `lt` and `le` with a `sort`
     mark remain the reference's own (`internal/index/query.go`). *Propose:* specify or drop them.
-72. **`scope:{digest}` in a `gs`** (§B.11.9 gs, §A.4; was v0.77 Open 43). "of §A.4's marker" is read
+76. **`scope:{digest}` in a `gs`** (§B.11.9 gs, §A.4; was v0.77 Open 43). "of §A.4's marker" is read
     as the marker digest, which covers the key's `key:` string, though `key:` is also its own
     subject; the origin and index both use it, so `gs` values changed in v0.77. *Question:* or
     did the authors mean the rules-only digest?
-73. **How many recomputes before `503 behind`** (§A.1, §B.5; was v0.77 Open 44). A tree listing or
+77. **How many recomputes before `503 behind`** (§A.1, §B.5; was v0.77 Open 44). A tree listing or
     index result that keeps losing to purges, or to a raise between reading the encryption and
     computing, is computed again up to three times, then `503 behind` with `Retry-After: 1`,
     `no-store`. *Propose:* say a service may answer `behind` after a bounded number of tries.
@@ -453,7 +474,7 @@ the reference changed, in the area named:
   its epoch that of the newest own op, else of an earlier own snapshot, else the epoch in force.
   With the pre-raise cases gone no value names a base's epoch, and `PruneE2E` failing on an own
   op whose `kid` names another namespace matches the server's `422` (18, followed; what remains
-  is v0.81 Open 52). Authentication disabled
+  is v0.81 Open 56). Authentication disabled
   gets the current epoch only, as intended (§E.2.3 From, scenario 56; 26). The §F.3 kept bullet
   drops the undeclarable-blob clause: merge's pre-raise special case is deleted, and its check is
   kept as a defensive one (27; what remains is v0.81 Open 36).

@@ -91,6 +91,23 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.81").
    combined checkpoint (Services, below): kept listings are judged again, and `g/all` cookies
    are `403` until exchanged again.
 
+**Security fixes:**
+- **Tree service: a listing's cache key counts only the namespaces its reader reads whole**
+  (§A.4, §B.11.5). Between a namespace's stop and the purge of its listings, a `g/all` reader
+  without `read` on it could be served listings kept from before the stop, with its items,
+  heads and URLs; that window is new with this release's stopped-namespace rule (Services,
+  below). A subject set's reader could be served the same way once a public namespace stopped,
+  as already in v0.26.1. Kept and stored listings of the readers concerned are now computed
+  again under their new keys, and are still purged by tag.
+- **Catalog service: a grant on `/now` gets no read grants or keys** (§C.2 item 5, §B.11.5).
+  `POST /read-grants` (read grants, and keys in a sealed catalog) and `POST /grants` refuse a
+  grant whose block or key-scope rules refer to `/now`, or whose read roles all do: `403
+  forbidden`, `no-store`, before `?min` and body errors, as the tree service refuses its
+  listings. The catalog's API checked only the grant's identity, ignoring its block and key
+  rules, as in v0.26.1; since a rule on `/now` no longer passes any read, ignoring it handed out
+  what every other read refuses. `POST /merge-grants`, which issues write grants only, is
+  unchanged.
+
 **Keys and the message bound** (§E.2.1, §E.2.2, §E.2.6):
 - `K_e` is only HKDF input. Namespace documents, namespace log ranges, long-poll answers,
   namespace events and grants are sealed under `K_n = HKDF-SHA256(K_e, "patchlog-e2", ns ‖ LF)`
@@ -182,6 +199,13 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.81").
 - Tree service: an e2e namespace's `born` epoch ignores a `kid` the core serves.
 - Index: a namespace raised to sealed whose keys the index lacks as configured answers `404`
   and shows as skipped in `/_status` at once, as after a restart, instead of `502`.
+- Index and tree service: a namespace rotated between the service reading its encryption and
+  asking `/keys` for that epoch's key is no longer judged to lack keys. Before, that stopped
+  following it, purged its kept results and stored views, and could leave it unfollowed (`404`)
+  until a restart; the check now reads the encryption again and judges by the current epoch
+  (§E.2.3, §E.2.4, §A.4, §E.2.6). This was so before v0.26.1 too.
+- Catalog service: the `/now` refusal at `POST /grants` and `POST /read-grants` (Security
+  fixes, above).
 
 **Bytes and tools** (§7.1, §7.4, TOOLS §F.3, §F.9, §H.5):
 - A resource log entry always carries `parent` (`""` at genesis) and a namespace entry `prev`
