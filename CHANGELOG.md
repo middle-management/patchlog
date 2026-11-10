@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.27.0
 
 Implements spec **v0.81** (previously **v0.77**). v0.78 cut four features and the special cases
 for data written under earlier drafts: a namespace is end-to-end from its creation or never, a
