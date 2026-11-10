@@ -147,8 +147,8 @@ func RecipientJWK(pub *ecdh.PublicKey) map[string]any {
 // text(trunc160(sha256(canonical({kty, crv, x})))), a 33-character id.
 //
 // Deprecated: the spec names keys by Thumbprint (§E.2.3, §E.3.2), in
-// keyring entries and /keys relays alike. RecipientID remains only to read
-// keyrings stored in the format before v0.63 (Keyring) and migrate them.
+// keyring entries and /keys relays alike. RecipientID remains only for the
+// parser of keyrings in the format before v0.63 (Keyring).
 func RecipientID(pub *ecdh.PublicKey) string {
 	return ids.Of(jsonv.Canonical(RecipientJWK(pub))).String()
 }
@@ -213,16 +213,6 @@ func wrapInfo(kid, resource string) []byte {
 	return []byte(WrapInfoPrefix + kid + "\n" + resource)
 }
 
-// legacyWrapInfo is the info keys were wrapped under before v0.63:
-// "patchlog-keys-v1" ‖ 0x0A ‖ kid, then 0x0A ‖ resource for a K_r only.
-func legacyWrapInfo(kid, resource string) []byte {
-	c := "patchlog-keys-v1\n" + kid
-	if resource != "" {
-		c += "\n" + resource
-	}
-	return []byte(c)
-}
-
 var (
 	hpkeKDF  = hpke.HKDFSHA256()
 	hpkeAEAD = hpke.AES256GCM()
@@ -248,14 +238,6 @@ func WrapKey(recipient *ecdh.PublicKey, kid, resource string, key []byte) (Wrapp
 // UnwrapKey recovers the key in w with the recipient's private key.
 func UnwrapKey(priv *ecdh.PrivateKey, w WrappedKey) ([]byte, error) {
 	return unwrapBase(priv, wrapInfo(w.Kid, w.Resource), w.Wrapped)
-}
-
-// UnwrapKeyLegacy recovers a key wrapped before v0.63, under the old info
-// (legacyWrapInfo), such as an entry of a keyring stored then. Such
-// keyrings must be wrapped again (KeyringV2); this is only for reading
-// them to do so.
-func UnwrapKeyLegacy(priv *ecdh.PrivateKey, w WrappedKey) ([]byte, error) {
-	return unwrapBase(priv, legacyWrapInfo(w.Kid, w.Resource), w.Wrapped)
 }
 
 func unwrapBase(priv *ecdh.PrivateKey, info, wrapped []byte) ([]byte, error) {

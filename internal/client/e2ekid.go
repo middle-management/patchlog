@@ -13,9 +13,7 @@ import "github.com/middle-management/patchlog/internal/seal"
 // this namespace's, gives "", as does an own op whose kid names another
 // namespace, so EpochOf is 0 for both (not known: the epoch in force,
 // judged where the view is first sealed). A snapshot's pl.ns is its
-// kid's namespace (openSnapshotJWE), so the same rule goes by its kid;
-// so does that of a revision from before a raise from sealed, whose kid
-// is the epoch it is served under, a base's for one read through.
+// kid's namespace (openSnapshotJWE), so the same rule goes by its kid.
 func (d *E2EDoc) Kid() string {
 	for i := len(d.log) - 1; i >= 0; i-- {
 		e := d.log[i]

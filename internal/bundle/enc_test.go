@@ -376,7 +376,10 @@ func TestBundleSealedNamespace(t *testing.T) {
 // e2eWrite writes a sealed patch set (§E.3.1).
 func e2eWrite(t *testing.T, d *deployment, key []byte, kid, ns, name, parent string, patches []any) string {
 	t.Helper()
-	ps, err := seal.SealPatchSet(key, kid, ns, name, parent, jsonv.FromGo(patches))
+	// Under the resource's K_r (§E.3.1): K_e seals nothing (§E.2.1).
+	kr, err := seal.ResourceKey(key, ns, name)
+	noErr(t, err)
+	ps, err := seal.SealPatchSet(kr, kid, ns, name, parent, jsonv.FromGo(patches))
 	noErr(t, err)
 	if parent == "" {
 		return must(d.c.Create(ctx, ns, name, jsonv.MustParse(ps))).ID

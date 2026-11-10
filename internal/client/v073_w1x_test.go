@@ -58,14 +58,12 @@ func rewriteKeys(t *testing.T, ns string, edit func(m map[string]any)) http.Roun
 	})
 }
 
-// W1X: a keyring stored before v0.63 holds keys wrapped under the old
-// info, and /keys relays its entries as stored, without from (§E.2.3,
-// §E.3.2), so a reader whose grant carries enc opens them as
-// Keyring.EpochKey opens such a keyring, under the old info when the
-// current one fails; and a relayed entry it can't open is no reason to
-// stop before the keyring. Since v0.63 servers refuse to have such a
-// keyring written (P18), so the relay of a stored one is played by the
-// transport; MigrateKeyring wraps such keyrings again (v073_p18_test.go).
+// W1X, v0.78 ("Reading this spec"): a keyring stored before v0.63 holds
+// keys wrapped under the old info, which /keys relayed as stored, without
+// from (§E.2.3, §E.3.2). No reader opens such an entry any more: it has no
+// sender, and the old info isn't tried. A relayed entry it can't open is
+// still no reason to stop before the keyring. The relay is played by the
+// transport. Formerly the reader opened the legacy entry.
 func TestW1XRelayedLegacyKeyringEntries(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -96,10 +94,8 @@ func TestW1XRelayedLegacyKeyringEntries(t *testing.T) {
 		m["wrapped"] = base64.RawURLEncoding.EncodeToString(legacyWrap(t, rPriv.PublicKey(), kid, ke))
 	})
 	rd := s.Client(t, client.WithBearer(readerGrant), client.WithHTTPClient(&http.Client{Transport: legacy}))
-	if _, d, err := rd.E2E(rPriv).LoadE2E(ctx, "secret", "p"); err != nil {
-		t.Fatalf("relayed entry of a keyring stored before v0.63: %v", err)
-	} else if d.Value.(map[string]any)["n"] != 1.0 {
-		t.Fatalf("p %v", d.Value)
+	if k, err := rd.E2E(rPriv).Key(ctx, kid); err == nil {
+		t.Fatalf("relayed entry of a keyring stored before v0.63 opened: %x", k)
 	}
 
 	// A relayed entry that opens under neither info: the keyring, which
@@ -110,9 +106,7 @@ func TestW1XRelayedLegacyKeyringEntries(t *testing.T) {
 		m["wrapped"] = base64.RawURLEncoding.EncodeToString(w)
 	})
 	bad := s.Client(t, client.WithBearer(readerGrant), client.WithHTTPClient(&http.Client{Transport: broken}))
-	if _, d, err := bad.E2E(rPriv).WithSenders(aPriv.PublicKey()).LoadE2E(ctx, "secret", "p"); err != nil {
+	if k, err := bad.E2E(rPriv).WithSenders(aPriv.PublicKey()).Key(ctx, kid); err != nil || !bytes.Equal(k, ke) {
 		t.Fatalf("relayed entry that doesn't open, keyring readable: %v", err)
-	} else if d.Value.(map[string]any)["n"] != 1.0 {
-		t.Fatalf("p %v", d.Value)
 	}
 }

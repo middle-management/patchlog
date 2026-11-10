@@ -16,15 +16,12 @@
 package seal
 
 import (
-	"bytes"
-	"compress/flate"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -40,13 +37,17 @@ const (
 	// AlgDir and EncA256GCM are the only JWE algorithms used (§E.2.2).
 	AlgDir     = "dir"
 	EncA256GCM = "A256GCM"
-	// ZipDeflate marks raw DEFLATE (RFC 1951) compressed plaintext
-	// (RFC 7516 §4.1.3). Seal never sets it (§E.2.2); Open still inflates
-	// it in bytes sealed before v0.65, which are served forever.
+	// ZipDeflate is the zip value (RFC 7516 §4.1.3) of raw DEFLATE, which
+	// bytes sealed before v0.65 carried. Sealed payloads are never
+	// compressed (§E.2.2): ParseHeader still reads such a header, for the
+	// kid and pl of bytes stored once and served forever, but Open refuses
+	// it with ErrFormat, and nothing inflates (drafts promise no
+	// compatibility with data written under an earlier draft, "Reading
+	// this spec").
 	ZipDeflate = "DEF"
 
-	// DefaultMaxPlaintext bounds decompressed output in Open and
-	// OpenExpect (zip-bomb guard). Use OpenLimit for another bound.
+	// DefaultMaxPlaintext bounds the plaintext of Open and OpenExpect. Use
+	// OpenLimit for another bound.
 	DefaultMaxPlaintext = 64 << 20
 )
 
@@ -81,10 +82,11 @@ const (
 	// and prune events (ResourceEventPL).
 	KindPurge = "purge"
 	KindPrune = "prune"
-	// KindConfig and KindSnapshot are legacy: bytes sealed before v0.63
-	// bind a namespace document with kind "config" (now "doc") and an E3
-	// prune snapshot with kind "snapshot" (now no kind). Expect accepts
-	// them for those payloads (legacyPL); nothing seals them any more.
+	// KindConfig and KindSnapshot are the kinds bytes sealed before v0.63
+	// bound a namespace document ("config", now "doc") and an E3 prune
+	// snapshot ("snapshot", now no kind) to. Nothing seals or opens them:
+	// Expect matches pl exactly (§E.2.2, §E.3.1), so such bytes are
+	// ErrMismatch. They name what detectors of stored legacy bytes look for.
 	KindConfig   = "config"
 	KindSnapshot = "snapshot"
 )
@@ -138,7 +140,9 @@ type Header struct {
 	Alg string
 	Enc string
 	Kid string
-	Zip string // "" or, in legacy bytes only, "DEF"
+	// Zip is "" or, in bytes sealed before v0.65 only, ZipDeflate. Such
+	// bytes don't open (§E.2.2): Open refuses them with ErrFormat.
+	Zip string
 	PL  PL
 	// Raw is the decoded protected header (UTF-8 JSON) as transmitted.
 	Raw []byte
@@ -200,6 +204,9 @@ func seal(key []byte, kid string, pl PL, plaintext, iv []byte) (string, error) {
 
 // ParseHeader decodes and validates the protected header of a compact JWE
 // without decrypting it. The result is unauthenticated until Open succeeds.
+// A zip "DEF" header, which bytes sealed before v0.65 carry, parses with
+// Zip set, so detectors and ETags (§E.2.2: "{id}.{e}" names the stored
+// sealing's epoch) read its kid and pl; Open refuses it.
 func ParseHeader(jwe string) (*Header, error) {
 	parts := strings.Split(jwe, ".")
 	if len(parts) != 5 {
@@ -235,6 +242,8 @@ func parseHeader(seg string) (*Header, error) {
 		return nil, fmt.Errorf("%w: unsupported crit", ErrFormat)
 	}
 	if z, ok := m["zip"]; ok {
+		// Only bytes sealed before v0.65 carry zip, always "DEF"; Open
+		// refuses them (§E.2.2).
 		if z != ZipDeflate {
 			return nil, fmt.Errorf("%w: unsupported zip", ErrFormat)
 		}
@@ -255,7 +264,7 @@ func Open(jwe string, key []byte) (*Header, []byte, error) {
 	return OpenLimit(jwe, key, DefaultMaxPlaintext)
 }
 
-// OpenLimit is Open with an explicit bound on the (decompressed) plaintext.
+// OpenLimit is Open with an explicit bound on the plaintext.
 func OpenLimit(jwe string, key []byte, maxPlaintext int) (*Header, []byte, error) {
 	aead, err := newGCM(key)
 	if err != nil {
@@ -269,25 +278,25 @@ func OpenLimit(jwe string, key []byte, maxPlaintext int) (*Header, []byte, error
 	if err != nil {
 		return nil, nil, err
 	}
+	if h.Zip != "" {
+		// Sealed payloads are never compressed and carry no zip header
+		// (§E.2.2); bytes sealed so before v0.65 aren't opened, and
+		// nothing inflates.
+		return nil, nil, fmt.Errorf("%w: zip: sealed payloads are never compressed (§E.2.2)", ErrFormat)
+	}
 	iv, err1 := b64.DecodeString(parts[2])
 	ct, err2 := b64.DecodeString(parts[3])
 	tag, err3 := b64.DecodeString(parts[4])
 	if err1 != nil || err2 != nil || err3 != nil || len(iv) != aead.NonceSize() || len(tag) != aead.Overhead() {
 		return nil, nil, ErrFormat
 	}
-	if h.Zip == "" && len(ct) > maxPlaintext {
+	if len(ct) > maxPlaintext {
 		return nil, nil, ErrTooLarge
 	}
 	// AAD = ASCII(BASE64URL(UTF8(protected header))), RFC 7516 §5.1 step 14.
 	body, err := aead.Open(nil, iv, append(ct, tag...), []byte(parts[0]))
 	if err != nil {
 		return nil, nil, ErrDecrypt
-	}
-	if h.Zip == ZipDeflate {
-		body, err = inflate(body, maxPlaintext)
-		if err != nil {
-			return nil, nil, err
-		}
 	}
 	return h, body, nil
 }
@@ -306,47 +315,20 @@ func OpenExpect(jwe string, key []byte, wantKid string, wantPL PL) ([]byte, erro
 }
 
 // Expect reports ErrMismatch unless the header's kid is wantKid and its pl
-// is exactly wantPL, or the legacy pl of the same payload (legacyPL): bytes
-// sealed before v0.63 are stored once and served forever (§E.2.2), so
-// readers accept both forms.
+// is exactly wantPL: the same members with the same values (§E.2.2). The
+// pls bytes sealed before v0.63 carry ({…, kind: "config"} for a namespace
+// document, {…, kind: "snapshot"} for an E3 prune snapshot) don't match:
+// drafts promise no compatibility with data written under an earlier
+// draft ("Reading this spec").
 func (h *Header) Expect(wantKid string, wantPL PL) error {
-	if h.Kid != wantKid {
+	if h.Kid != wantKid || !plEqual(h.PL, wantPL) {
 		return ErrMismatch
 	}
-	if plEqual(h.PL, wantPL) {
-		return nil
-	}
-	if legacy := legacyPL(wantPL); legacy != nil && plEqual(h.PL, legacy) {
-		return nil
-	}
-	return ErrMismatch
+	return nil
 }
 
 func plEqual(got, want PL) bool {
 	return jsonv.Equal(map[string]any(got), jsonv.FromGo(map[string]any(want)))
-}
-
-// legacyPL returns the pl that bytes sealed before v0.63 carry for the
-// payload want binds, or nil where it was the same:
-//
-//   - a namespace document, { ns, id, kind: "doc" }, was bound to
-//     { ns, id, kind: "config" };
-//   - an E3 prune snapshot, { ns, name, id }, to { ns, name, id,
-//     kind: "snapshot" }.
-//
-// No other payload had those pls, so accepting them opens nothing else.
-func legacyPL(want PL) PL {
-	_, ns := want["ns"]
-	_, id := want["id"]
-	_, name := want["name"]
-	kind, hasKind := want["kind"]
-	switch {
-	case len(want) == 3 && ns && id && kind == KindDoc:
-		return PL{"ns": want["ns"], "id": want["id"], "kind": KindConfig}
-	case len(want) == 3 && ns && id && name && !hasKind:
-		return PL{"ns": want["ns"], "name": want["name"], "id": want["id"], "kind": KindSnapshot}
-	}
-	return nil
 }
 
 func newGCM(key []byte) (cipher.AEAD, error) {
@@ -358,20 +340,4 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 		return nil, err
 	}
 	return cipher.NewGCM(block)
-}
-
-// inflate decompresses raw DEFLATE, failing with ErrTooLarge as soon as the
-// output would exceed max bytes. Only bytes sealed before v0.65 are
-// compressed (ZipDeflate).
-func inflate(z []byte, max int) ([]byte, error) {
-	r := flate.NewReader(bytes.NewReader(z))
-	defer r.Close()
-	out, err := io.ReadAll(io.LimitReader(r, int64(max)+1))
-	if err != nil {
-		return nil, fmt.Errorf("%w: inflate: %v", ErrFormat, err)
-	}
-	if len(out) > max {
-		return nil, ErrTooLarge
-	}
-	return out, nil
 }

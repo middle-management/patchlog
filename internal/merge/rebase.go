@@ -443,9 +443,9 @@ func ontoReads(ctx context.Context, c *client.Client, onto, read string) bool {
 // successor's don't, would lose access by the switch. A branch without a
 // keyring of its own has no writes of its own to lose.
 //
-// A keyring stored in the format before v0.63 that a namespace reads
-// through from its base counts as none; one of the branch's or the
-// successor's own is wrapped again first (client.E2E.MigrateKeyring).
+// A keyring not in the §E.3.2 form, such as one stored in the format before
+// v0.63, is an error naming the namespace (keyringAs), whether its own or
+// read through from its base.
 func successorKeyring(ctx context.Context, x *client.E2E, branch, onto, succ string, readers []*ecdh.PublicKey) ([]string, error) {
 	have, own, err := keyringAs(ctx, x, succ)
 	if err != nil {
@@ -501,9 +501,10 @@ func successorKeyring(ctx context.Context, x *client.E2E, branch, onto, succ str
 }
 
 // keyringAs reads the keyring of ns as ns sees it (client.E2E.Keyring),
-// reporting whether it is ns's own, nil if ns has none, or reads through
-// one stored in the format before v0.63. One of ns's own in that format is
-// an error naming ns, to be wrapped again first.
+// reporting whether it is ns's own, nil if ns has none. One that isn't a
+// keyring document of §E.3.2, such as one stored in the format before
+// v0.63, of ns's own or read through from a base, is an error naming ns:
+// no client reads that format any more (v0.78, "Reading this spec").
 func keyringAs(ctx context.Context, x *client.E2E, ns string) (*seal.KeyringV2, bool, error) {
 	kr, _, err := x.Keyring(ctx, ns)
 	switch {
@@ -511,15 +512,9 @@ func keyringAs(ctx context.Context, x *client.E2E, ns string) (*seal.KeyringV2, 
 		return kr, kr.Current(ns) > 0, nil
 	case client.IsNotFound(err):
 		return nil, false, nil
-	case errors.Is(err, client.ErrLegacyKeyring):
-		old, _, err := x.LegacyKeyring(ctx, ns)
-		if err != nil {
-			return nil, false, err
-		}
-		if old.NS == ns {
-			return nil, false, fmt.Errorf("merge: the keyring of %s is in the format before v0.63: a key holder wraps it again first (patchlog e2e migrate-keyring -ns %s)", ns, ns)
-		}
-		return nil, false, nil
+	case errors.Is(err, seal.ErrFormat):
+		// The client's error names ns and the remedy.
+		return nil, false, fmt.Errorf("merge: %w", err)
 	}
 	return nil, false, err
 }
