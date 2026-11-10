@@ -364,8 +364,8 @@ func TestV073RemoteSealedLogUnreadable(t *testing.T) {
 	}
 }
 
-// ENC-47 (MF-40): a config write that makes a remote branch public, raises
-// it to e2e or turns off a nonce requirement is judged by its base's
+// ENC-47 (MF-40): a config write that makes a remote branch public or
+// turns off a nonce requirement is judged by its base's
 // current namespace document, read for that write: not by what the base
 // was at creation. A base that doesn't answer is 502 upstream, one B can't
 // read 422, and nothing is applied either way (§G.5.2, CONFORMANCE
@@ -406,10 +406,11 @@ func TestV073RemoteConfigJudgedBySource(t *testing.T) {
 	expect(t, b.patchNS("p", ops(op("remove", "/nonce")), ""), 201)
 	expect(t, b.patchNS("r", ops(op("remove", "/nonce")), ""), 201)
 
-	// A raise to e2e over a base that isn't e2e is 422, as a branch field.
+	// A raise to e2e is 422, as in any namespace (v0.78, Addendum E
+	// Levels; scenario 29).
 	r = b.patchNS("q", ops(op("add", "/encryption", map[string]any{"level": "e2e"})), "")
 	expectCode(t, r, 422, "invalid")
-	if !strings.Contains(r.Str("message"), "base") {
+	if !strings.Contains(r.Str("message"), "from its creation") {
 		t.Fatalf("e2e raise refused for another reason: %s", r.Body)
 	}
 

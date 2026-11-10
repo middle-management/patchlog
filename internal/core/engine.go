@@ -190,6 +190,26 @@ type Options struct {
 	// origin MAY): no namespace is covered, and partial readers get
 	// §C.5's answers (403) as before v0.75. The zero value serves them.
 	NoFilteredReads bool
+	// SealBound is the message bound of every key the origin seals under
+	// (§E.2.1): a request that would need a sealing past it is 503
+	// (behind). Zero means 2³². SealRotateAt is the count at which a
+	// key of the current epoch makes its namespace's rotation due (zero
+	// means 2³¹), and SealBlock the counts an instance takes at once per
+	// key (zero means 256; sealcount.go).
+	SealBound    int64
+	SealRotateAt int64
+	SealBlock    int64
+	// PurgeRaisedE2E purges, at Open, the namespaces a pre-v0.78
+	// deployment raised to e2e and the remote branches that mirror a
+	// raised source, which Open otherwise refuses to serve
+	// (legacy_e2e.go): they then answer 410 purged.
+	PurgeRaisedE2E bool
+	// LegacyE2ERaiseForTests lets a config write raise a namespace to e2e
+	// and only records the new configuration, as a pre-v0.78 source did
+	// (tests of remote branches following one). Never set in production:
+	// a namespace is end-to-end from its creation or never (Addendum E
+	// Levels).
+	LegacyE2ERaiseForTests bool
 }
 
 // RemoteOptions configure the branch side of remote branches (§G.3): how

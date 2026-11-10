@@ -97,13 +97,11 @@ func (t *tx) isE2E(n *nsRow) bool { return t.nsLevel(n) == levelE2E }
 func (t *tx) e2eContent(n *nsRow, name string) bool { return name != KeyringName && t.isE2E(n) }
 
 // e2eConfigWritten records the start of an e2e namespace's epoch: its
-// creation (or a branch's), a raise to e2e, and every write that
-// increments the epoch. A raise (Addendum E Levels) is recorded too, in
-// e2e_raises, with what was in force before it: from then on, the
-// raising entry's items included, writes go through the E3 gate, since
-// the configuration they are checked under is e2e (§7.5), and what was
-// stored before is served at the level before (P35). The new epoch is
-// the rotation a revocation made due, if any (§E.2.4).
+// creation (or a branch's) and every write that increments the epoch. The
+// new epoch is the rotation a revocation made due, if any (§E.2.4). A
+// namespace is e2e from its creation (Addendum E Levels); a raise, which
+// only Options.LegacyE2ERaiseForTests lets through, is recorded as
+// nothing more, and leaves no rotation due.
 func (t *tx) e2eConfigWritten(n *nsRow, old, cfg *Config) {
 	if cfg.level != levelE2E {
 		return
@@ -116,15 +114,6 @@ func (t *tx) e2eConfigWritten(n *nsRow, old, cfg *Config) {
 	if old == nil || old.level == levelE2E {
 		return
 	}
-	epoch, pad := 0, 0
-	if old.level == levelSealed {
-		epoch = old.Epoch
-		if old.Pad {
-			pad = 1
-		}
-	}
-	_, err = t.Exec(`INSERT INTO e2e_raises (ns, config_seq, level, epoch, pad, created) VALUES (?,?,?,?,?,?)`, n.id, n.configSeq, old.level, epoch, pad, t.now.UnixMilli())
-	t.must(err)
 	_, err = t.Exec(`DELETE FROM rotations_due WHERE ns = ?`, n.id)
 	t.must(err)
 }

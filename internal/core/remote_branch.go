@@ -2143,15 +2143,11 @@ type remoteSources struct {
 
 // remoteSourceDoc is a remote branch's base's current namespace document,
 // read for a write: doc, or err with down set where the base didn't
-// answer, or answered 5xx. origin and ns name the base. withAt marks a
-// read for a raise to e2e, which also reads the base's document as of at:
-// atE2E reports it e2e.
+// answer, or answered 5xx. origin and ns name the base.
 type remoteSourceDoc struct {
 	origin string
 	ns     string
 	doc    map[string]any
-	withAt bool
-	atE2E  bool
 	err    error
 	down   bool
 }
@@ -2159,9 +2155,8 @@ type remoteSourceDoc struct {
 // errNeedSource rolls back a write that needs the current namespace
 // document of the base of remote branch branch (remoteSourceFor).
 type errNeedSource struct {
-	branch         int64
-	origin, ns, at string
-	withAt         bool
+	branch     int64
+	origin, ns string
 }
 
 func (e *errNeedSource) Error() string {
@@ -2191,10 +2186,9 @@ func (e *Engine) withRemoteSource(ctx context.Context, f func(context.Context) e
 	}
 }
 
-// readRemoteSource reads the base's current namespace document, and for a
-// raise to e2e the one as of at, as creation does (fetchRemote).
+// readRemoteSource reads the base's current namespace document.
 func (e *Engine) readRemoteSource(ctx context.Context, need *errNeedSource) *remoteSourceDoc {
-	out := &remoteSourceDoc{origin: need.origin, ns: need.ns, withAt: need.withAt}
+	out := &remoteSourceDoc{origin: need.origin, ns: need.ns}
 	c, _, err := e.remoteClient(need.origin)
 	if err != nil {
 		out.err, out.down = err, true
@@ -2206,38 +2200,29 @@ func (e *Engine) readRemoteSource(ctx context.Context, need *errNeedSource) *rem
 		return out
 	}
 	out.doc = d.Value
-	if need.withAt && docLevel(d.Value) == levelE2E {
-		ad, err := c.NSDoc(ctx, need.ns, need.at)
-		if err != nil && noAnswer(err) {
-			out.err, out.down = err, true
-			return out
-		}
-		out.atE2E = err == nil && docLevel(ad.Value) == levelE2E
-	}
 	return out
 }
 
 // remoteSourceFor returns the current namespace document of remote branch
-// n's base as read for this write; withAt asks for the document as of at
-// too. A write that hasn't read it yet rolls back to read it
-// (errNeedSource, withRemoteSource); one run without withRemoteSource,
-// which can't, gets it as unread.
-func (t *tx) remoteSourceFor(n *nsRow, withAt bool) *remoteSourceDoc {
-	var origin, ns, at string
-	t.must(t.QueryRow(`SELECT origin, ns, at FROM remote_bases WHERE branch = ?`, n.id).Scan(&origin, &ns, &at))
+// n's base as read for this write. A write that hasn't read it yet rolls
+// back to read it (errNeedSource, withRemoteSource); one run without
+// withRemoteSource, which can't, gets it as unread.
+func (t *tx) remoteSourceFor(n *nsRow) *remoteSourceDoc {
+	var origin, ns string
+	t.must(t.QueryRow(`SELECT origin, ns FROM remote_bases WHERE branch = ?`, n.id).Scan(&origin, &ns))
 	h, _ := t.ctx.Value(remoteSourcesKey{}).(*remoteSources)
 	if h == nil {
 		return &remoteSourceDoc{origin: origin, ns: ns, err: errors.New("not read for this write"), down: true}
 	}
-	if d := h.docs[n.id]; d != nil && (d.withAt || !withAt) {
+	if d := h.docs[n.id]; d != nil {
 		return d
 	}
-	panic(&errNeedSource{branch: n.id, origin: origin, ns: ns, at: at, withAt: withAt})
+	panic(&errNeedSource{branch: n.id, origin: origin, ns: ns})
 }
 
 // checkRemoteSource is the §7.4 validation of remote branch n's namespace
 // document cfg that depends on its base (§G.5.2): a write that makes it
-// public, raises it to e2e or turns off a nonce requirement is judged by
+// public or turns off a nonce requirement is judged by
 // the base's current namespace document as a local branch's is by its
 // base's. One this deployment can't read refuses the write as it refuses
 // creation (§G.3): 410 purged, naming the base, where the base answers
@@ -2247,13 +2232,10 @@ func (t *tx) remoteSourceFor(n *nsRow, withAt bool) *remoteSourceDoc {
 // Refusals are 422 invalid with errors pointing at the member, as for the
 // other branch fields; nothing is applied.
 func (t *tx) checkRemoteSource(n *nsRow, cur, cfg *Config) *Error {
-	toE2E := cfg.level == levelE2E && cur.level < levelE2E
 	toPublic := cur.Read != "public" && cfg.Read == "public"
 	nonceOff := cur.NonceRequired && !cfg.NonceRequired
 	var ptr string
 	switch {
-	case toE2E:
-		ptr = "/encryption"
 	case toPublic:
 		ptr = "/read"
 	case nonceOff:
@@ -2261,13 +2243,13 @@ func (t *tx) checkRemoteSource(n *nsRow, cur, cfg *Config) *Error {
 	default:
 		return nil
 	}
-	src := t.remoteSourceFor(n, toE2E)
+	src := t.remoteSourceFor(n)
 	if src.err != nil {
 		if head, ok := purgedAt(src.err); ok {
 			return purgedBase(src.origin, src.ns, head)
 		}
-		msg := fmt.Sprintf("this deployment can't read its base's current namespace document (%v), by which a config write that makes a remote branch public, "+
-			"raises it to e2e or turns off a nonce requirement is judged (§G.5.2); nothing was applied", src.err)
+		msg := fmt.Sprintf("this deployment can't read its base's current namespace document (%v), by which a config write that makes a remote branch public "+
+			"or turns off a nonce requirement is judged (§G.5.2); nothing was applied", src.err)
 		if src.down {
 			e := upstreamErr("%s", msg)
 			e.Body["origin"] = src.origin
@@ -2277,11 +2259,6 @@ func (t *tx) checkRemoteSource(n *nsRow, cur, cfg *Config) *Error {
 	}
 	level := docLevel(src.doc)
 	switch {
-	case toE2E && level != levelE2E:
-		return docInvalid("/encryption", "/encryption: a branch can be e2e only if its base is, and the base's current namespace document isn't (§G.5.2, Addendum E Levels)")
-	case toE2E && !src.atE2E:
-		return docInvalid("/encryption", "/encryption: at is before the base's raise to e2e, and a branch can't be raised to e2e with an at before its base's e2e raise "+
-			"(Addendum E Levels, §G.5.2); rebase it onto the base's current head (§F.5)")
 	case toPublic && src.doc["read"] != "public":
 		return docInvalid("/read", "a branch of a non-public namespace cannot be public: the base's current namespace document isn't public (§G.5.2, §7.4)")
 	case nonceOff && src.doc["nonce"] == "required" && level != levelE2E:
