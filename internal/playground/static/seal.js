@@ -250,21 +250,6 @@ async function unwrapKey(identity, kid, resource, wrapped) {
   if (k.length !== 32) throw new Error('unwrapped key is not 32 bytes');
   return k;
 }
-/* Keyrings stored before v0.63 wrapped their keys under the info of that time, "patchlog-keys-v1\n" ‖ kid, then
- * "\n" ‖ resource for a K_r only; /keys relays such entries as stored. Like the current info it binds kid and resource. */
-function legacyWrapContext(kid, resource) { return utf8('patchlog-keys-v1\n' + kid + (resource ? '\n' + resource : '')); }
-/* unwrapStoredKey opens a keyring entry, read in the keyring or relayed by /keys (§E.3.2), under the current info or,
- * failing that, the legacy one (internal/seal's Keyring.EpochKey and the client's relayed entries do the same). */
-async function unwrapStoredKey(identity, kid, resource, wrapped) {
-  try {
-    return await unwrapKey(identity, kid, resource, wrapped);
-  } catch (e) {
-    let k;
-    try { k = await hpkeOpen(identity, legacyWrapContext(kid, resource), wrapped); } catch (_) { throw e; }
-    if (k.length !== 32) throw e;
-    return k;
-  }
-}
 
 /* checkRelayedEntry reads a /keys entry as internal/seal's ParseWrappedKey does (wrappedkeys.json's rejected entries):
  * a non-empty kid; name and resource (before v0.73), each a non-empty string, naming one resource where both are
@@ -292,11 +277,11 @@ function checkRelayedEntry(entry) {
 
 /* unwrapRelayedKey opens an entry of a POST /ns/{ns}/keys answer, { kid, name?, from?, wrapped } (§E.2.3): a keyring
  * entry relayed at E3 names its sender's thumbprint in from and opens in auth mode only with that sender's public key,
- * one of senders (x values this browser knows): anyone can wrap to a thumbprint (§E.3.2). Without from (an E2 key, or
- * an entry of a keyring stored before v0.63 relayed as stored), base mode under either info (unwrapStoredKey). */
+ * one of senders (x values this browser knows): anyone can wrap to a thumbprint (§E.3.2). Without from (an E2 key),
+ * base mode under the info of v0.63; the info of keyrings stored before v0.63 isn't tried (seal.UnwrapRelayed). */
 async function unwrapRelayedKey(identity, entry, senders) {
   const { res, wrapped } = checkRelayedEntry(entry);
-  if (!('from' in entry)) return unwrapStoredKey(identity, entry.kid, res, wrapped);
+  if (!('from' in entry)) return unwrapKey(identity, entry.kid, res, wrapped);
   for (const x of senders || []) {
     if ((await thumbprint(x)) !== entry.from) continue;
     const k = await hpkeOpen(identity, wrapContext(entry.kid, res), wrapped, unb64u(x));
@@ -514,7 +499,8 @@ function keyringV2Epochs(kr, ns) {
   return [...out].sort((a, b) => a - b);
 }
 
-/* The format before v0.63 (seal.Keyring), which servers no longer take as the keyring: read to open and migrate. */
+/* The format before v0.63 (seal.Keyring), which servers no longer take as the keyring and from which the app opens
+ * nothing (v0.78 Legacy): parseKeyring detects it, and the self-test checks the HPKE wrap against Go's fixture. */
 function parseKeyring(doc) {
   const bad = (w) => { throw new Error('keyring: ' + w); };
   if (!doc || typeof doc !== 'object' || doc.keyring !== 1) bad('version');
@@ -538,7 +524,7 @@ async function keyringEpochKey(kr, identity, epoch) {
   const rid = await recipientID(identity.x);
   const w = (kr.epochs[String(epoch)] || {})[rid];
   if (!w) throw new Error(`the keyring has no key for this identity in epoch ${epoch}`);
-  return unwrapStoredKey(identity, kid(kr.ns, epoch), '', unb64u(w));
+  return unwrapKey(identity, kid(kr.ns, epoch), '', unb64u(w));
 }
 
 /* ---------------- JSON Patch (RFC 6902) ---------------- */
@@ -772,7 +758,7 @@ root.PLSeal = {
   SUITE, b64u, unb64u, b32, hex, unhex, utf8, equalBytes, randomBytes, newNonce, canonical, padLen,
   sha256, chainID, revisionID, tombstoneID, idBytes,
   hkdf, resourceKey, namespaceKey, viewKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, thumbprint, parseJWK,
-  hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapStoredKey, unwrapRelayedKey, checkRelayedEntry, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
+  hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapRelayedKey, checkRelayedEntry, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
   sealPatchSet, sealedJWE, sealedBlobs, BLOB_TYPE, blobType, blobID, blobIDs, sameBlobs, parseBlob, openBlob, sealBlob, encryptBlob, decryptBlob,
   isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,
   parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,

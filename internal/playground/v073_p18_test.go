@@ -39,10 +39,11 @@ FUNCTIONS
   await Z.keyringV2Add(mine, input.admin, input.reader.x, input.kid, Z.unb64u(input.key));
   out.jsKeyring = mine;
   try { Z.parseKeyringV2({ keys: [Object.assign({ suite: 'x' }, mine.keys[0])] }); out.extraMember = 'parsed'; } catch (e) { out.extraMember = e.message; }
-  // takeKeys: a relayed entry opens only from a known sender; a K_r is held by its name.
-  out.taken0 = await takeKeys(input.relayed);
+  // takeKeys: a relayed entry (E3) opens only from a known sender; a K_r (E2) is held by its name.
+  const take = async () => (await takeKeys([input.relayed[0]], 'e2e')) + (await takeKeys([input.relayed[1]], 'sealed'));
+  out.taken0 = await take();
   rememberKey(input.admin.x);
-  out.taken1 = await takeKeys(input.relayed);
+  out.taken1 = await take();
   out.epochKey = KEYS.epoch.has(input.kid) ? Z.b64u(KEYS.epoch.get(input.kid)) : '';
   out.resKey = KEYS.res.has(input.kid + '\nderby') ? Z.b64u(KEYS.res.get(input.kid + '\nderby')) : '';
   process.stdout.write(JSON.stringify(out));

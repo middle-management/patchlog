@@ -412,8 +412,8 @@ func (t *tx) declaredAt(row *revRow) []ids.ID {
 // wrapped }] } with nothing else but a fresh $nonce (§C.7) and no two
 // entries for one kid and to (seal.CheckKeyringV2), whose kids name this
 // namespace and epochs not after encryption.epoch. A keyring in the format
-// before v0.63 is refused like any other document: a key holder wraps it
-// again.
+// before v0.63 is refused like any other document: a key holder writes
+// the §E.3.2 document (v0.81 has no tool that converts the old one).
 func (t *tx) checkKeyring(n *nsRow, cfg *Config, s *itemState) *Error {
 	for _, st := range s.steps {
 		if st.del {
@@ -423,7 +423,7 @@ func (t *tx) checkKeyring(n *nsRow, cfg *Config, s *itemState) *Error {
 		if err != nil {
 			msg := "the keyring resource of an e2e namespace must be a keyring document, { \"keys\": [{ \"kid\", \"to\", \"from\", \"wrapped\" }] } (§E.3.2): " + err.Error()
 			if _, lerr := seal.ParseKeyring(st.doc); lerr == nil {
-				msg = "the keyring is in the format before v0.63; a key holder wraps its keys again in the §E.3.2 keyring document (client.E2E.MigrateKeyring, patchlog e2e migrate-keyring)"
+				msg = "the keyring is in the format before v0.63, which no v0.81 client reads or writes; a key holder writes its keys wrapped again in the §E.3.2 keyring document (the v0.26.1 client's patchlog e2e migrate-keyring did; v0.81 removed it)"
 			}
 			return invalid(msg)
 		}

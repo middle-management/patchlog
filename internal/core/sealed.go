@@ -44,6 +44,7 @@ import (
 	"log"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -368,6 +369,11 @@ type sealJob struct {
 	// before v0.81, sealed under K_e (kver 0): it is sealed again under
 	// K_n of the stored row's epoch and replaces that row (storedNS).
 	reseal bool
+	// unzip holds the stored bytes of a resource document or log entry
+	// sealed before v0.65 with zip "DEF", which no reader opens: j seals it
+	// again, uncompressed, under the same key, and replaces the row only
+	// while it still holds these bytes (storedRes).
+	unzip string
 }
 
 // sealKver is the kver of the rows this version stores (migration 016):
@@ -416,7 +422,8 @@ func (t *tx) stored(n *nsRow, j *sealJob) bool {
 // if the value isn't stored yet.
 func (t *tx) resJob(n *nsRow, name string, row *revRow, kind string, plain func() []byte) *sealJob {
 	j := &sealJob{kind: kind, key: name + "/" + row.id.String(), name: name, revSeq: row.seq}
-	if t.stored(n, j) {
+	ok, e := t.storedRes(n, j)
+	if ok {
 		return j
 	}
 	plKind := seal.KindDoc
@@ -426,12 +433,68 @@ func (t *tx) resJob(n *nsRow, name string, row *revRow, kind string, plain func(
 			plKind = seal.KindTombstone
 		}
 	}
-	e := t.revEpoch(n, row)
+	if j.unzip == "" {
+		e = t.revEpoch(n, row)
+	}
 	kr, err := seal.ResourceKey(t.epochKey(n.id, e), n.name, name)
 	t.must(err)
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), kr, seal.ResourcePL(n.name, name, row.id.String(), plKind), plain()
 	j.pad = t.config(n.configSeq).Pad
 	return j
+}
+
+// storedRes is stored for a resource document or log entry: true if j's
+// row holds a sealing a reader opens. A row stored before v0.65 with zip
+// "DEF" in its header (stored.md item 5), which no reader opens (§E.2.2:
+// sealed payloads are never compressed), is never served again: it
+// reports the epoch the row's kid fixed, under whose K_r j is sealed
+// again, uncompressed, with the plaintext computed as for a new row, and
+// replaces the row while it still holds those bytes (unzip, finishSeal),
+// the first stored winning. The ETag "{id}.{e}" names the same epoch, and
+// the old bytes are never opened. If that epoch's key is gone, or the kid
+// can't be read or names another namespace, the answer is 500, as
+// storedNS's. Rows stored since v0.81 (kver 1) are never compressed.
+// Content sealed by clients (E3) is never in this table.
+func (t *tx) storedRes(n *nsRow, j *sealJob) (bool, int) {
+	var jwe string
+	var kver int
+	err := t.QueryRow(`SELECT jwe, kver FROM sealed WHERE ns = ? AND kind = ? AND key = ?`, n.id, j.kind, j.key).Scan(&jwe, &kver)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, 0
+	}
+	t.must(err)
+	if kver >= sealKver {
+		j.jwe = jwe
+		return true, 0
+	}
+	if h, err := seal.ParseHeader(jwe); err == nil && h.Zip == "" {
+		j.jwe = jwe
+		return true, 0
+	}
+	kns, e, ok := jweKid(jwe)
+	if !ok || kns != n.name || !t.hasEpochKey(n.id, e) {
+		panic(apiErr(500, "internal", "message", fmt.Sprintf("namespace %s: the %s %s was sealed compressed under an earlier draft, and the key of its epoch is gone; it can't be served (§E.2.2, v0.81)", n.name, j.kind, j.key)))
+	}
+	j.unzip = jwe
+	return false, e
+}
+
+// jweKid reads the namespace and epoch of a stored JWE's kid "{ns}#{e}"
+// from its header, without a key (jweEpoch).
+func jweKid(jwe string) (string, int, bool) {
+	seg, _, _ := strings.Cut(jwe, ".")
+	raw, err := base64.RawURLEncoding.DecodeString(seg)
+	if err != nil {
+		return "", 0, false
+	}
+	v, err := jsonv.Parse(raw)
+	if err != nil {
+		return "", 0, false
+	}
+	m, _ := v.(map[string]any)
+	kid, _ := m["kid"].(string)
+	ns, e, err := seal.ParseKid(kid)
+	return ns, e, err == nil
 }
 
 // namespaceKey is K_n of n's epoch e (§E.2.1): what is sealed for the
@@ -524,8 +587,9 @@ func (t *tx) storeSeal(ns int64, j *sealJob) (int, bool) {
 	if j.jwe == "" || j.fresh {
 		if j.jwe == "" {
 			// Counted with the write it is stored in (§E.2.1): a
-			// revision's document or entry from what its write reserved.
-			if k := jobSealKey(ns, j); !(j.kind == sealDoc || j.kind == sealEntry) || !t.sealedFromReserve(k) {
+			// revision's document or entry from what its write reserved,
+			// unless it replaces one stored compressed (unzip).
+			if k := jobSealKey(ns, j); j.unzip != "" || !(j.kind == sealDoc || j.kind == sealEntry) || !t.sealedFromReserve(k) {
 				t.countIn(k, 1, false)
 			}
 		}
@@ -554,13 +618,21 @@ func (t *tx) storeSeal(ns int64, j *sealJob) (int, bool) {
 
 // insertSealed stores j's sealing under namespace ns unless one is stored
 // (INSERT ON CONFLICT DO NOTHING; for a reseal, an UPDATE of the kver-0
-// row), then reads back the stored bytes, so the first stored wins.
+// row; for an unzip, an UPDATE of the row still holding the compressed
+// bytes, keeping its created, by which revEpochFixed finds the first
+// sealing, and an INSERT should a prune have deleted it since), then reads
+// back the stored bytes, so the first stored wins.
 func (t *tx) insertSealed(ns int64, j *sealJob, name, rev any) {
 	var err error
 	if j.reseal {
 		_, err = t.Exec(`UPDATE sealed SET jwe = ?, kver = ?, created = ? WHERE ns = ? AND kind = ? AND key = ? AND kver < ?`,
 			j.jwe, sealKver, t.now.UnixMilli(), ns, j.kind, j.key, sealKver)
 	} else {
+		if j.unzip != "" {
+			_, err = t.Exec(`UPDATE sealed SET jwe = ?, kver = ? WHERE ns = ? AND kind = ? AND key = ? AND jwe = ?`,
+				j.jwe, sealKver, ns, j.kind, j.key, j.unzip)
+			t.must(err)
+		}
 		_, err = t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created, kver) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
 			ns, j.kind, j.key, name, rev, j.jwe, t.now.UnixMilli(), sealKver)
 	}

@@ -110,7 +110,7 @@ func (im *importer) e2eEpochs(ctx context.Context, ns string) (lo, hi int, probl
 				if kerr != nil {
 					if _, lerr := seal.ParseKeyring(doc); lerr == nil {
 						problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s is a keyring in the format before v0.63, which an e2e target refuses to have written, history included (§E.3.2): "+
-							"the namespace's history can't be imported, even after migrate-keyring at the source, which leaves the earlier revisions as they are; only a client holding the keys carries its content over, re-sealed with new ids (§G.5.1)", ns, l.ID, d.name))
+							"the namespace's history can't be imported, even after a key holder wraps the keyring again at the source (with the v0.26.1 client's migrate-keyring; v0.81 has no such tool), which leaves the earlier revisions as they are; only a client holding the keys carries its content over, re-sealed with new ids (§G.5.1)", ns, l.ID, d.name))
 					} else {
 						problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s isn't a keyring document, which an e2e target refuses to have written (§E.3.2): %v", ns, l.ID, d.name, kerr))
 					}

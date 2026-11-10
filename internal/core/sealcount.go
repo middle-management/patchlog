@@ -96,15 +96,21 @@ func (e *Engine) countSeals(ctx context.Context, keys []sealKey) error {
 // from before v0.81) by drawing one, in one short transaction of its own
 // that rolls back on errBehind, keys in sorted order as reserveWrite takes
 // them; the others from this instance's blocks (countSeals), given back if
-// that transaction fails.
+// that transaction fails. Sealing again one stored compressed (unzip)
+// replaces a sealing no write reserved for: it draws one.
 func (e *Engine) countJobSeals(ctx context.Context, ns int64, jobs []*sealJob) error {
-	var block, own []sealKey
+	type ownSeal struct {
+		k     sealKey
+		drawn bool
+	}
+	var block []sealKey
+	var own []ownSeal
 	for _, j := range jobs {
 		if j == nil || j.jwe != "" {
 			continue
 		}
 		if k := jobSealKey(ns, j); j.kind == sealDoc || j.kind == sealEntry {
-			own = append(own, k)
+			own = append(own, ownSeal{k, j.unzip != ""})
 		} else {
 			block = append(block, k)
 		}
@@ -116,16 +122,16 @@ func (e *Engine) countJobSeals(ctx context.Context, ns int64, jobs []*sealJob) e
 		return nil
 	}
 	sort.Slice(own, func(a, b int) bool {
-		x, y := own[a], own[b]
+		x, y := own[a].k, own[b].k
 		if x.epoch != y.epoch {
 			return x.epoch < y.epoch
 		}
 		return x.name < y.name
 	})
 	err := e.update(ctx, func(t *tx) error {
-		for _, k := range own {
-			if !t.sealedFromReserve(k) {
-				t.countIn(k, 1, false)
+		for _, o := range own {
+			if o.drawn || !t.sealedFromReserve(o.k) {
+				t.countIn(o.k, 1, false)
 			}
 		}
 		return nil
