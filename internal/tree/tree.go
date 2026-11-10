@@ -1049,6 +1049,26 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 			}
 		}
 	}
+	// A snapshot (follow.WithSnapshot) carries no config unit: the read
+	// mode and level it ends at are its document's at its checkpoint,
+	// recorded and compared with what was applied before as a config
+	// unit's are (narrowedBy), as the index does.
+	var snap *client.NSDoc
+	if b.Replaces() && cfg == nil && !co.PurgedNS {
+		snap = content
+		if snap == nil {
+			d, err := s.c.NSDoc(ctx, fb.NS, b.NewCheckpoint)
+			switch {
+			case client.IsPurged(err):
+			case follow.LacksKey(ctx, err):
+				s.opt.Logf("tree: the document of %s at %s: %v", fb.NS, b.NewCheckpoint, err)
+			case err != nil:
+				return fmt.Errorf("tree: reading the document of %s at %s: %w", fb.NS, b.NewCheckpoint, err)
+			default:
+				snap = d
+			}
+		}
+	}
 	// Item titles (§B.5): read from the heads of items in namespaces that
 	// aren't sealed or end-to-end, when the catalog names a pointer.
 	s.mu.RLock()
@@ -1164,7 +1184,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	}
 	s.mu.Lock()
 	oldTrust := s.g.Trust
-	res, err := s.applyLocked(context.WithoutCancel(ctx), b, co, preps, cfg, content, retitle, fr)
+	res, err := s.applyLocked(context.WithoutCancel(ctx), b, co, preps, cfg, content, snap, retitle, fr)
 	if err != nil {
 		if rerr := s.reload(context.Background()); rerr != nil {
 			s.opt.Logf("tree: reloading after a failed apply: %v", rerr)
@@ -1286,7 +1306,7 @@ func purgedNames(isCat, all bool, preps []prep) func(string) bool {
 	return func(name string) bool { return isCat && all || set[name] }
 }
 
-func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Coalesced, preps []prep, cfg, content *client.NSDoc, retitle map[[2]string]string, fr *refiling) (*applyResult, error) {
+func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Coalesced, preps []prep, cfg, content, snap *client.NSDoc, retitle map[[2]string]string, fr *refiling) (*applyResult, error) {
 	g := s.g
 	cat := s.opt.Catalog
 	oldTrust := g.Trust // setConfig replaces it
@@ -1536,7 +1556,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	// keeps, a narrowing purges as any does; with no record, a genesis, it
 	// purges nothing, but in a rebuild's replay (Options.Rebuild), which
 	// may follow a database from a release that kept no record.
-	narrowed, recorded, err := narrowedBy(ctx, tx, g, b, co.PurgedNS)
+	narrowed, recorded, err := narrowedBy(ctx, tx, g, b, snap, co.PurgedNS)
 	if err != nil {
 		return nil, err
 	}
@@ -1700,12 +1720,13 @@ func (s *Service) isStopped(ns string) bool {
 // private or raises it to sealed or e2e (§9), against the read mode and
 // level the service last applied for it (meta "access:{ns}"), and
 // whether there was such a record (recorded); it records the last unit's,
-// in tx and in g (Graph.appliedPublic). A purge (purged) drops the
+// in tx and in g (Graph.appliedPublic). A snapshot's document at its
+// checkpoint (snap) stands for a batch without config units. A purge (purged) drops the
 // record. Without a record, a namespace counts as public and unsealed,
 // so the first private or sealed document applied counts too: at a
 // genesis, and once after an upgrade from a release that kept no record
 // (index.narrowed).
-func narrowedBy(ctx context.Context, tx *sql.Tx, g *Graph, b *follow.Batch, purged bool) (narrowed, recorded bool, err error) {
+func narrowedBy(ctx context.Context, tx *sql.Tx, g *Graph, b *follow.Batch, snap *client.NSDoc, purged bool) (narrowed, recorded bool, err error) {
 	k := "access:" + b.NS
 	if purged {
 		delete(g.appliedPublic, b.NS)
@@ -1718,6 +1739,9 @@ func narrowedBy(ctx context.Context, tx *sql.Tx, g *Graph, b *follow.Batch, purg
 		if u.Config != nil {
 			docs = append(docs, u.Config.Value)
 		}
+	}
+	if len(docs) == 0 && snap != nil {
+		docs = append(docs, snap.Value)
 	}
 	for _, doc := range docs {
 		if !read {

@@ -17,6 +17,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
@@ -1342,5 +1343,121 @@ func TestV0261UpgradeWithoutAccessRecords(t *testing.T) {
 	if st != 401 {
 		t.Errorf("upgraded, cat made private before, the checker answered the pointer from before: anonymous GET served %s %d, Cache-Control %q: %s",
 			path, st, hdr.Get("Cache-Control"), body)
+	}
+}
+
+// Review R2-B (main target, the widening branch of readPublic): cat flips
+// private -> public -> private while the service can't read its log, then
+// the service applies all three in one batch. The grant checker is then
+// answered stale head pointers (one at the intermediate public entry, one
+// from before the flips): each is an entry the service applied (seen
+// holds every entry id of a batch, tree.go applyLocked), so neither is
+// read public. Then the same after a restart on the same database (seen
+// persists), and during a rebuild's replay (seen emptied, access:cat
+// kept): 503 behind, never 200.
+//
+// Holds in v0.26.1 with publicAsApplied; its snapshot part needed a
+// snapshot's document recorded (narrowedBy).
+func TestV0261StalePointerAfterFlips(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	c := newV0261Core(t)
+	s := c.s
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "public", "keys": []any{k.Entry("*")},
+		"catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat")
+	h0 := c.head(t, w)
+	if st, _, b, _ := v0261Get(x, "/cat/roots", ""); st != 200 {
+		t.Fatalf("setup: %d %s", st, b)
+	}
+	c.blockLg.Store(true)
+	time.Sleep(500 * time.Millisecond)
+	v0261Must(t, v0261Read(w, "grant"))
+	must(w.CreateDoc(ctx, "cat", "secret", map[string]any{"title": "Secret p7qa", "parents": parents("root@a0")}))
+	v0261Must(t, v0261Read(w, "public"))
+	hx := c.head(t, w)
+	v0261Must(t, v0261Read(w, "grant"))
+	c.blockLg.Store(false)
+	x.caughtUp("cat")
+	check := func(t *testing.T, x *svc, when string, want ...int) {
+		t.Helper()
+		for _, id := range []string{hx, h0} {
+			c.replay.Store(id)
+			st, hdr, body, path := v0261Get(x, "/cat/children?of=root", "")
+			c.replay.Store("")
+			t.Logf("%s ptr %s: %d %s", when, id, st, path)
+			if !slices.Contains(want, st) {
+				t.Errorf("%s, checker answered the pointer at %s: anonymous GET served %s %d, Cache-Control %q: %s", when, id, path, st, hdr.Get("Cache-Control"), body)
+			}
+		}
+	}
+	check(t, x, "applied", 401)
+	x.stop()
+	y := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	check(t, y, "restarted", 401)
+	y.stop()
+	c.blockLg.Store(true)
+	z := startSvc(t, sc, svcOpts{now: s.Now, db: db}, func(o *tree.Options) { o.Rebuild = true })
+	time.Sleep(300 * time.Millisecond)
+	check(t, z, "rebuilding, log refused", 401, 503)
+	c.blockLg.Store(false)
+	z.caughtUp("cat")
+	check(t, z, "rebuilt", 401)
+	z.stop()
+	// Library-only (cmd/patchlog passes no follow.WithSnapshot): a
+	// rebuild, and a fresh database, bootstrapped from a snapshot, whose
+	// batch has no config unit and whose seen holds only its head.
+	t.Run("snapshot", func(t *testing.T) {
+		snap := func(o *tree.Options) { o.FollowOptions = append(o.FollowOptions, follow.WithSnapshot()) }
+		q := startSvc(t, sc, svcOpts{now: s.Now, db: db}, func(o *tree.Options) { o.Rebuild = true }, snap)
+		q.caughtUp("cat")
+		check(t, q, "rebuilt from a snapshot", 401)
+		q.stop()
+		f := startSvc(t, sc, svcOpts{now: s.Now}, snap)
+		f.caughtUp("cat")
+		check(t, f, "fresh database, snapshot", 401)
+	})
+}
+
+// Review R2-F (library-only: follow.WithSnapshot, which cmd/patchlog doesn't
+// pass): cat made private while the service was down, then a rebuild (or
+// a restart) bootstrapped from a snapshot. A snapshot batch has no config
+// unit, so narrowedBy never runs: ns:cat isn't purged, though the
+// previous instance served cat public under listings a CDN keeps (the
+// index's 475ff96 purges at a snapshot that narrows).
+//
+// Fixed in v0.26.1: a snapshot's document at its checkpoint goes
+// through narrowedBy.
+func TestV0261SnapshotRebuildNarrowPurge(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "public", "keys": []any{k.Entry("*")},
+		"catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat")
+	before := x.fetch("/cat/children?of=root", "")
+	x.stop()
+	v0261Must(t, v0261Read(w, "grant"))
+	y := startSvc(t, sc, svcOpts{now: s.Now, db: db}, func(o *tree.Options) {
+		o.Rebuild = true
+		o.FollowOptions = append(o.FollowOptions, follow.WithSnapshot())
+	})
+	y.caughtUp("cat")
+	time.Sleep(200 * time.Millisecond)
+	if sent, queued := v0261SawTag(y, "ns:cat"); !sent || !queued {
+		t.Errorf("rebuilt from a snapshot after cat was made private while down: sent ns:cat %v, queued %v; %s was served %q",
+			sent, queued, before.path, before.header.Get("Cache-Control"))
 	}
 }
