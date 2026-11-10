@@ -55,66 +55,48 @@ func v077Epochs(t *testing.T, db, name string) (epoch, born int) {
 // §E.2.6 Per-entry sealing, §E.3.1 snapshot rule (v0.77, scenario 74):
 // at E3 an entry's kid is the one a prune's snapshot of its revision
 // would carry, judged once, when the service first seals a value derived
-// from it. Catalog cat is raised from none to e2e, so node n's head,
-// written in the clear before the raise, has a snapshot that takes cat's
-// epoch in force, as a base's op read through does: first listed at
-// cat#1, its title is sealed under cat#1; after cat rotates to 2, a
-// listing at a new at still seals it under cat#1, and so does one after
-// a restart. A node written after the rotation is sealed under cat#2.
-// (Before, every listing took the current epoch: cat#2.)
+// from it. In a release preview of e2e catalog cat through its e2e branch
+// catb (v081Preview), node n's head is cat's op, read through, so its
+// snapshot takes catb's epoch in force: first listed at cat#1, its title
+// is sealed under cat#1; after the epochs rotate to 2, a listing at a new
+// at still seals it under cat#1, and so does one after a restart.
+// (Before, every listing took the current epoch.) Until v0.81 n was
+// written in the clear in cat before cat was raised to e2e, which is 422
+// since v0.78.
 func TestV077V04JudgedOnceE3(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
-	k := clienttest.NewKey("k")
-	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
-		"catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
-	svcJWK, svcPriv := must2(seal.GenerateRecipient())
-	wJWK, wPriv := must2(seal.GenerateRecipient())
-	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "append", "config"},
-		map[string]any{"enc": wJWK})), client.WithKeys(client.NewKeys(wPriv)))
-	x2 := wr.E2E(wPriv)
-	must(wr.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
-	must(wr.CreateDoc(ctx, "cat", "n", map[string]any{"title": "N", "parents": parents("root@a0")}))
-	must(wr.PatchConfig(ctx, "cat", must(wr.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "e2e"}}}))
-	must(x2.InitKeyring(ctx, "cat", svcPriv.PublicKey()))
-	keyOf := func(kid string) []byte { return must(x2.SealKey(ctx, kid)) }
-
-	sc := func() *client.Client {
-		return s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"}, map[string]any{"enc": svcJWK})),
-			client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey()))
-	}
-	db := filepath.Join(t.TempDir(), "tree.db")
-	withRecipient := func(o *tree.Options) { o.Recipient = svcPriv }
-	x := startSvc(t, sc(), svcOpts{now: s.Now, db: db}, withRecipient)
-	x.caughtUp("cat")
-	rd := k.Grant(t, s.Now(), "user:r", []string{"cat"}, []string{"read"})
-	check := func(when, name, title, kid string) {
+	p := newV081Preview(t)
+	x := p.start(t)
+	rd := p.k.Grant(t, p.s.Now(), "user:r", []string{"cat", "catb"}, []string{"read"})
+	check := func(when string) {
 		t.Helper()
-		got, vals, _ := v077Sealed(t, x, "/cat/children?of=root", rd, name, keyOf)
-		if got != kid || vals["title"] != title {
-			t.Errorf("%s: %s %v under %s, want title %s under %s", when, name, vals, got, title, kid)
+		got, vals, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", p.keyOf)
+		if got != "cat#1" || vals["title"] != "N" {
+			t.Errorf("%s: n %v under %s, want title N under cat#1", when, vals, got)
 		}
 	}
-	if e, _ := v077Epochs(t, db, "n"); e != 0 {
+	if e, _ := v077Epochs(t, p.db, "n"); e != 0 {
 		t.Fatalf("n's epoch %d before any listing, want it pending", e)
 	}
-	check("first listing", "n", "N", "cat#1")
-	if e, _ := v077Epochs(t, db, "n"); e != 1 {
+	check("first listing")
+	if e, _ := v077Epochs(t, p.db, "n"); e != 1 {
 		t.Errorf("n's epoch %d once listed, want 1 recorded", e)
 	}
 
-	must(x2.RotateEpoch(ctx, "cat", svcPriv.PublicKey()))
-	must(x2.CreateDocSealed(ctx, "cat", "later", map[string]any{"title": "Later", "parents": parents("root@a1")}))
-	x.caughtUp("cat")
-	check("after the rotation", "n", "N", "cat#1")
-	check("after the rotation", "later", "Later", "cat#2")
+	p.rotate(t)
+	must(p.x2.CreateDocSealed(ctx, "catb", "later", map[string]any{"title": "Later", "parents": parents("root@a1")}))
+	p.reach(t, x)
+	check("after the rotation")
 
 	x.stop()
-	x = startSvc(t, sc(), svcOpts{now: s.Now, db: db}, withRecipient)
-	must(x2.CreateDocSealed(ctx, "cat", "last", map[string]any{"title": "Last", "parents": parents("root@a2")}))
-	x.caughtUp("cat")
-	check("after a restart", "n", "N", "cat#1")
+	x = p.start(t)
+	must(p.x2.CreateDocSealed(ctx, "catb", "last", map[string]any{"title": "Last", "parents": parents("root@a2")}))
+	p.reach(t, x)
+	check("after a restart")
+	if e, _ := v077Epochs(t, p.db, "n"); e != 1 {
+		t.Errorf("n's epoch %d after a restart, want 1", e)
+	}
 }
 
 // §E.2.6, §E.3.1 (v0.77, scenario 74): born and head values from one

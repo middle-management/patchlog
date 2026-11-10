@@ -1028,6 +1028,14 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		if u.Config != nil {
 			cfg = u.Config
 			s.keys.Observe(fb.NS, u.Config.Value)
+			if b.NS != fb.NS {
+				// In a release preview the catalog's encryption, which its
+				// listings are sealed and judged by (Keys.Current, unchanged),
+				// is the branch's, followed in its place: its rotations are
+				// observed too, so a listing re-reads them before it judges
+				// an epoch (§E.2.6, §E.3.1).
+				s.keys.Observe(b.NS, u.Config.Value)
+			}
 		}
 	}
 	if cfg != nil {

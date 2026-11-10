@@ -74,6 +74,9 @@ func TestV0261IndexPrivateAndLockedOutPurged(t *testing.T) {
 // neither purges: idx:pr is never sent to the Purger, so the public,
 // immutable results it served of pr in the clear stay in its CDN (§9,
 // §A.1, §E.2.6). The tree service purges in both cases (purgeStopped).
+//
+// Since v0.81 the raise is to sealed and private for an index that holds
+// no keys and fetches none: a raise to e2e is 422 (v0.78).
 func TestV0261IndexRaiseToE2EWithoutKeys(t *testing.T) {
 	t.Parallel()
 	for _, down := range []bool{false, true} {
@@ -90,7 +93,7 @@ func TestV0261IndexRaiseToE2EWithoutKeys(t *testing.T) {
 			w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"pr"}, []string{"read", "create", "config"}, map[string]any{"enc": wJWK})),
 				client.WithKeys(client.NewKeys(wPriv)))
 			must(w.CreateDoc(ctx, "pr", "a", map[string]any{"title": "secret"}))
-			ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", []string{"pr"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+			ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", []string{"pr"}, []string{"read"})), client.WithKeys(client.StaticKeys()))
 			db := filepath.Join(t.TempDir(), "i.db")
 			x := startSvcWith(t, ic, svcOpts{db: db, ns: []string{"pr"}, untyped: true, now: s.Now})
 			x.caughtUp("pr")
@@ -102,7 +105,9 @@ func TestV0261IndexRaiseToE2EWithoutKeys(t *testing.T) {
 			if down {
 				x.stop()
 			}
-			must(w.PatchConfig(ctx, "pr", must(w.NSHead(ctx, "pr")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "e2e"}}}))
+			must(w.PatchConfig(ctx, "pr", must(w.NSHead(ctx, "pr")).Config, []any{
+				map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}},
+				map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
 			if down {
 				x = startSvcWith(t, ic, svcOpts{db: db, ns: []string{"pr"}, untyped: true, now: s.Now})
 			}
