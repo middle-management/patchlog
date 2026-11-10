@@ -1660,22 +1660,27 @@ async function nsInfo(ns) {
 }
 
 /* takeKeys stores the entries of a POST /ns/{ns}/keys answer, { kid, name?, from?, wrapped } or { kid, name?, key }
- * (§E.2.3; servers before v0.63 said resource for name): raw keys, or keys wrapped to the grant's enc. An e2e relay
- * passes on keyring entries with their from, which open only with a sender this browser knows (knownKeys), and those
- * of a keyring stored before v0.63 as stored; an entry that doesn't open is skipped (anyone can wrap to a thumbprint,
- * §E.3.2), leaving the keyring. */
-async function takeKeys(arr) {
+ * (§E.2.3; servers before v0.63 said resource for name, which internal/client reads too), of a namespace at level, as
+ * internal/client takes them. At E3 (client.E2E) only the keyring entries the server relays, each naming its sender in
+ * from, which open only with a sender this browser knows (knownKeys): a key in the clear or one wrapped without from
+ * has no sender, so the server can have made it up, and E3 has no per-resource keys; those are skipped, for reads
+ * too (§E.3.2, v0.78: a namespace is e2e from its creation, so no epoch of it was ever served as at E2). At E2
+ * (client.Keys) raw keys and keys wrapped to the grant's enc in base mode, and no relayed keyring entry. An entry that
+ * doesn't open is skipped (anyone can wrap to a thumbprint, §E.3.2), leaving the keyring. */
+async function takeKeys(arr, level) {
+  const e2e = level === 'e2e';
   let n = 0;
   for (const e of arr || []) {
     if (!e || typeof e.kid !== 'string') continue;
     const res = e.name || e.resource || '';
+    if (e2e ? res || typeof e.key === 'string' || typeof e.from !== 'string' || !e.from : typeof e.key !== 'string' && 'from' in e) continue;
     let key, from = 'POST /keys (raw)';
     if (typeof e.key === 'string') key = Z.unb64u(e.key);
     else if (typeof e.wrapped === 'string') {
       if (e.suite && e.suite !== Z.SUITE) continue;
       if (!ID) throw new Error('the keys are wrapped to the grant\'s enc: import that identity in the Keys tab');
-      try { key = await Z.unwrapRelayedKey(ID, e, e.from ? knownKeys() : []); } catch (_) { continue; }
-      from = 'POST /keys (HPKE-wrapped)';
+      try { key = await Z.unwrapRelayedKey(ID, e, e2e ? knownKeys() : []); } catch (_) { continue; }
+      from = e2e ? 'POST /keys (keyring entry)' : 'POST /keys (HPKE-wrapped)';
     } else continue;
     if (key.length !== 32) continue;
     if (res) holdRes(e.kid, res, key, from); else holdEpoch(e.kid, key, from);
@@ -1684,14 +1689,14 @@ async function takeKeys(arr) {
   return n;
 }
 
-/* keyringKey unwraps an e2e epoch key from the namespace's keyring with this identity (§E.3.2). */
+/* keyringKey unwraps an e2e epoch key from the namespace's keyring with this identity, from a sender this browser
+ * knows (§E.3.2). Nothing opens from a keyring in the format before v0.63, as in internal/client (v0.78 Legacy). */
 async function keyringKey(ns, epoch) {
   if (!ID) throw new Error('no identity: generate or import one in the Keys tab');
   const r = await api('GET', `/r/${ns}/keyring`, { auto: true, label: 'keyring' });
   if (r.status !== 200 || !r.json) throw new Error(`no keyring in ${ns} (GET answered ${r.status})`);
-  const key = Z.isKeyringV2(r.json)
-    ? await Z.keyringV2EpochKey(Z.parseKeyringV2(r.json), ID, Z.kid(ns, epoch), knownKeys())
-    : await Z.keyringEpochKey(Z.parseKeyring(r.json), ID, epoch);
+  if (!Z.isKeyringV2(r.json)) throw new Error(`the keyring of ${ns} is not in the §E.3.2 form: nothing opens from it (a key holder wraps it again with the v0.26.1 client's patchlog e2e migrate-keyring; v0.81 has no such tool)`);
+  const key = await Z.keyringV2EpochKey(Z.parseKeyringV2(r.json), ID, Z.kid(ns, epoch), knownKeys());
   holdEpoch(Z.kid(ns, epoch), key, 'keyring (HPKE-wrapped)');
   return key;
 }
@@ -1704,7 +1709,7 @@ async function fetchKeyFor(kid, resource) {
     const body = { epochs: [epoch] };
     if (resource && info.level !== 'e2e') body.resources = [resource];
     const r = await api('POST', `/ns/${ns}/keys`, { body, auto: true, label: 'keys' });
-    if (r.ok && r.json) await takeKeys(r.json.keys);
+    if (r.ok && r.json) await takeKeys(r.json.keys, info.level);
     if (KEYS.epoch.has(kid) || (resource && KEYS.res.has(kid + '\n' + resource))) return;
     if (info.level !== 'e2e') throw new Error(`POST /ns/${ns}/keys gave no key for ${kid}${resource ? ' / ' + resource : ''} (HTTP ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''})`);
   }
@@ -2391,7 +2396,7 @@ async function fetchKeysForm() {
   if (rs.length) body.resources = rs;
   const r = await api('POST', `/ns/${ns}/keys`, { body });
   if (r.ok && r.json) {
-    try { toast(`${await takeKeys(r.json.keys)} key(s) stored`); } catch (err) { toast(err.message); }
+    try { toast(`${await takeKeys(r.json.keys, (await nsInfo(ns)).level)} key(s) stored`); } catch (err) { toast(err.message); }
   }
 }
 
@@ -2413,8 +2418,9 @@ async function importIdentity() {
 
 /* ---- E3 keyring administration (client.E2E InitKeyring / AddReader / RotateEpoch) ---- */
 /* The keyring document (§E.3.2): entries wrapped in HPKE auth mode under this identity, the admin key their from
- * names. A keyring stored in the format before v0.63 is shown, but servers refuse writing it: a key holder wraps it
- * again (patchlog e2e migrate-keyring). */
+ * names. A keyring stored in the format before v0.63 is shown, but servers refuse writing it, /keys relays none of its
+ * entries and nothing opens from it (v0.78 Legacy): a key holder wraps it again with the v0.26.1 client's patchlog e2e
+ * migrate-keyring, which v0.81 removed. */
 const KR = { ns: '', doc: null, legacy: null, head: '', status: 0 };
 async function loadKeyring() {
   KR.ns = S.ns; KR.doc = null; KR.legacy = null; KR.head = ''; KR.status = 0; KR.err = '';
@@ -2445,7 +2451,7 @@ async function renderKeyring() {
   box.className = '';
   if (KR.legacy) {
     box.replaceChildren(h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'badge warn' }, 'keyring format before v0.63'), h('span', { class: 'muted' }, `current epoch ${KR.legacy.current}`)),
-      h('p', { class: 'note' }, 'Servers no longer take this format as the keyring (§E.3.2): a key holder wraps it again with patchlog e2e migrate-keyring. Its entries still open here.'));
+      h('p', { class: 'note' }, 'Servers no longer take this format as the keyring (§E.3.2): /keys relays none of its entries, and nothing opens from it, here or in any v0.81 client. A key holder wraps it again with the v0.26.1 client\'s patchlog e2e migrate-keyring; v0.81 has no such tool.'));
     return;
   }
   if (!KR.doc) {
@@ -2484,7 +2490,7 @@ function krKnow() {
     rememberKey(x); toast('Key remembered: its keyring entries open here, and it can be kept in a rotation'); renderKeyring();
   } catch (err) { toast(err.message); }
 }
-function krLegacyRefused() { if (KR.legacy) { toast('The keyring is in the format before v0.63: wrap it again (patchlog e2e migrate-keyring)'); return true; } return false; }
+function krLegacyRefused() { if (KR.legacy) { toast('The keyring is in the format before v0.63, which nothing opens: a key holder wraps it again with the v0.26.1 client (v0.81 has no migrate-keyring)'); return true; } return false; }
 async function krInit() {
   if (!ID) return toast('Generate or import an identity first');
   try {
