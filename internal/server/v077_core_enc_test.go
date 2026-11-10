@@ -184,8 +184,14 @@ func TestV077EncPreRaiseSealingsAfterCreation(t *testing.T) {
 	expectCode(t, b.get(xPath, g), 502, "upstream")
 
 	// A serves x's document and z's blob sealing again, and has pruned
-	// w's history.
-	p.set(map[string]v077Answer{"GET " + wLog: {1, http.StatusGone, `{"code":"pruned","horizon":"` + r.w1 + `","message":"pruned"}`}})
+	// w's history: w has a revision w2 past the branch's at (e2e: the
+	// server checks kid and pl only), A's horizon, which A keeps (§8.6).
+	// v0.26.1: a horizon is a revision after the pruned one, w1 itself
+	// never being A's honest horizon for w1's entry.
+	wr := r.a.writeRaw("m", "w", r.w1, sealed(t, seal.NewKey(), "m#2", "m", "w", r.w1, ops(op("replace", "/v", 4.0))), r.root())
+	expect(t, wr, 201)
+	w2 := etagOf(wr)
+	p.set(map[string]v077Answer{"GET " + wLog: {1, http.StatusGone, `{"code":"pruned","horizon":"` + w2 + `","message":"pruned"}`}})
 	if err := b.e.SyncRemotes(context.Background()); err != nil {
 		t.Logf("sync: %v", err)
 	}
@@ -201,8 +207,8 @@ func TestV077EncPreRaiseSealingsAfterCreation(t *testing.T) {
 	}
 	res := b.get(wPath, g)
 	expectCode(t, res, 410, "pruned")
-	if res.Str("horizon") != r.w1 {
-		t.Fatalf("w's log: %s, want A's horizon %s", res.Body, r.w1)
+	if res.Str("horizon") != w2 {
+		t.Fatalf("w's log: %s, want A's horizon %s", res.Body, w2)
 	}
 	// Pruned is final: A serving it again changes nothing.
 	p.set(nil)

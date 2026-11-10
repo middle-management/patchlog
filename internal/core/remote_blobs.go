@@ -352,8 +352,9 @@ func (preCaps) blob(size int64) int64 {
 // ps.blobAnswers), for B to fetch again at each sync.
 //
 // What A answers is bounded (caps, rawGet), and a 410 pruned is taken only
-// with a horizon that is a revision of ch at or after the sealing's own
-// (prunedIn); any other is a refusal, which isn't final.
+// with a horizon that is a revision of ch after the sealing's own, or one
+// after ch's head that A's log verifies (prunedIn); any other is a
+// refusal, which isn't final.
 func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name string, ch *remoteChain, keys map[string]map[int][]byte, caps preCaps) *Error {
 	last := -1
 	for i := 0; i < ch.plain; i++ {
@@ -408,8 +409,8 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 		}
 	}
 	// A's 410 pruned for the sealing of entry i, or of a blob first
-	// referenced there, names a horizon of the chain at or after it, or is
-	// a refusal.
+	// referenced there, names a horizon of the chain after it, or is a
+	// refusal.
 	// A horizon after the chain's head, which the chain doesn't hold (A
 	// pruned past B's at, §8.6), is taken where A's log verifies it after
 	// the head (verifyHorizonPast).
@@ -419,7 +420,9 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			return ans, hz
 		}
 		if j, ok := pos[hz]; ok {
-			if j < i {
+			// After the sealing's own revision: A keeps the horizon's
+			// document and entry (§8.6).
+			if j <= i {
 				return pendRefused, ""
 			}
 			return ans, hz

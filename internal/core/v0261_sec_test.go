@@ -328,12 +328,20 @@ func TestV0261PendingRowsCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	d1 := w.Items[0].IDs[0]
+	w, err = e.WriteResource(ctx, p29Req("s"), Item{Resource: "d", IfMatch: d1,
+		Steps: []Step{{Patches: []any{map[string]any{"op": "replace", "path": "/n", "value": 2.0}, map[string]any{"op": "replace", "path": "/$nonce", "value": seal.NewNonce()}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2 := w.Items[0].IDs[0]
 	var epoch int
 	if err := e.update(ctx, func(t *tx) error {
 		n := t.nsByName("s")
 		epoch = t.config(n.configSeq).Epoch
+		// The rows are d1's; d2 is a horizon after it, d1 none.
 		var seq int64
-		t.must(t.QueryRow(`SELECT head_seq FROM resources WHERE ns = ? AND name = ?`, n.id, "d").Scan(&seq))
+		id1 := mustID(d1)
+		t.must(t.QueryRow(`SELECT rv.seq FROM revisions rv JOIN resources r ON r.res = rv.res WHERE r.ns = ? AND r.name = ? AND rv.id = ?`, n.id, "d", id1[:]).Scan(&seq))
 		rec := func(ref string, ep int, answer, horizon string) {
 			t.recordPending(n.id, "d", seq, pendingSealing{kind: sealDoc, ref: ref, epoch: ep, kid: "s#1", pl: seal.PL{"ns": "s"}, answer: answer, horizon: horizon})
 		}
@@ -345,7 +353,8 @@ func TestV0261PendingRowsCap(t *testing.T) {
 			rec(fmt.Sprintf("ref%03d", i), epoch, pendRefused, "")
 		}
 		rec("legacy-junk", epoch, pendPruned, strings.Repeat("A", 1<<10))
-		rec("legacy-ok", epoch, pendPruned, d1)
+		rec("legacy-own", epoch, pendPruned, d1)
+		rec("legacy-ok", epoch, pendPruned, d2)
 		_, err := t.Exec(`UPDATE remote_pending_sealings SET due = 1 WHERE ref LIKE 'nokey%'`)
 		t.must(err)
 		_, err = t.Exec(`UPDATE remote_pending_sealings SET due = 0 WHERE ref LIKE 'legacy-%'`)
@@ -370,7 +379,7 @@ func TestV0261PendingRowsCap(t *testing.T) {
 			t.Fatalf("asked for %s under epoch %d", r.s.ref, r.s.epoch)
 		}
 	}
-	if len(fix.demote) != 1 || fix.demote[0][3] != "legacy-junk" || len(fix.confirm) != 1 || fix.confirm[0][3] != "legacy-ok" {
+	if len(fix.demote) != 2 || fix.demote[0][3] != "legacy-junk" || fix.demote[1][3] != "legacy-own" || len(fix.confirm) != 1 || fix.confirm[0][3] != "legacy-ok" {
 		t.Fatalf("legacy pruned rows: demote %v, confirm %v", fix.demote, fix.confirm)
 	}
 }

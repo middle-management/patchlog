@@ -277,18 +277,44 @@ func TestV0261PreRaisePrunedHorizonUnvalidated(t *testing.T) {
 		g := b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
 		expectCode(t, b.get("/r/r/x/rev/"+r.x1, g), 502, "upstream")
 	}
-	// x's own revision is a horizon in its chain: final, as before.
+	// x's own revision isn't A's horizon for its own document, which A
+	// keeps at its horizon (§8.6): refused (v0.26.1, where v0.26.0 took
+	// it).
 	b.clock.Advance(5 * time.Hour)
 	p.set(map[string]v077Answer{"GET " + xDoc: {1, http.StatusGone, `{"code":"pruned","horizon":"` + r.x1 + `"}`}})
+	before = p.count("GET " + xDoc)
+	if err := b.e.SyncRemotes(context.Background()); err != nil {
+		t.Logf("sync: %v", err)
+	}
+	if p.count("GET "+xDoc) == before {
+		t.Fatalf("the sync didn't ask A for x's document")
+	}
+	g = b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+	expectCode(t, b.get("/r/r/x/rev/"+r.x1, g), 502, "upstream")
+	// A revision after it, past the branch's at, which A's log verifies:
+	// final.
+	x2 := v0261After(t, r, "x", r.x1)
+	b.clock.Advance(5 * time.Hour)
+	p.set(map[string]v077Answer{"GET " + xDoc: {1, http.StatusGone, `{"code":"pruned","horizon":"` + x2 + `"}`}})
 	if err := b.e.SyncRemotes(context.Background()); err != nil {
 		t.Logf("sync: %v", err)
 	}
 	g = b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
 	res = b.get("/r/r/x/rev/"+r.x1, g)
 	expectCode(t, res, 410, "pruned")
-	if res.Str("horizon") != r.x1 {
-		t.Fatalf("x's document: %s, want horizon %s", res.Body, r.x1)
+	if res.Str("horizon") != x2 {
+		t.Fatalf("x's document: %s, want horizon %s", res.Body, x2)
 	}
+}
+
+// v0261After writes a revision of name after parent on r's A, past its
+// raise to e2e (the server checks the sealed op's kid and pl only), and
+// returns its id.
+func v0261After(t *testing.T, r *v077Raised, name, parent string) string {
+	t.Helper()
+	wr := r.a.writeRaw("m", name, parent, sealed(t, seal.NewKey(), "m#2", "m", name, parent, ops(op("replace", "/v", 9.0))), r.root())
+	expect(t, wr, 201)
+	return etagOf(wr)
 }
 
 // The same at creation: a 410 whose horizon isn't in the chain leaves the
@@ -309,7 +335,10 @@ func TestV0261PreRaisePrunedRowAfterPurge(t *testing.T) {
 	t.Parallel()
 	r := newV077Raised(t)
 	xDoc := "/r/m/x/rev/" + r.x1
-	p := newV077Proxy(t, r.a, map[string]v077Answer{"GET " + xDoc: {1, http.StatusGone, `{"code":"pruned","horizon":"` + r.x1 + `"}`}})
+	// A's horizon is a revision after x1 (v0.26.1: never x1 itself), one
+	// past the branch's at, which A's log verifies.
+	x2 := v0261After(t, r, "x", r.x1)
+	p := newV077Proxy(t, r.a, map[string]v077Answer{"GET " + xDoc: {1, http.StatusGone, `{"code":"pruned","horizon":"` + x2 + `"}`}})
 	b := newV077B(t, r, p)
 	kB := newKey("badmin")
 	expect(t, b.mkRemote("r", remoteGenesis("m", r.raised, e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}}))), 201)
@@ -739,6 +768,9 @@ func TestV0261FollowDeadline(t *testing.T) {
 func TestV0261PreRaiseLegacyPrunedRows(t *testing.T) {
 	t.Parallel()
 	r := newV077Raised(t)
+	// y2, after y1, is in the branch's chain: its at is after it.
+	y2 := v0261After(t, r, "y", r.y1)
+	r.raised = r.a.nsHead("m", r.root())
 	xDoc, yDoc := "/r/m/x/rev/"+r.x1, "/r/m/y/rev/"+r.y1
 	p := newV077Proxy(t, r.a, map[string]v077Answer{
 		"GET " + xDoc: {1, http.StatusForbidden, v077Forbidden},
@@ -747,8 +779,8 @@ func TestV0261PreRaiseLegacyPrunedRows(t *testing.T) {
 	var path string
 	b := newV0261B(t, r, p.srv.URL, withFileDB(t), func(o *core.Options) { path = o.Path })
 	_, g := v0261Remote(t, b, r, "r")
-	db, _ := v0261DB(t, path)
-	for name, hz := range map[string]string{"x": strings.Repeat("A", 1<<10), "y": r.y1} {
+	db, pg := v0261DB(t, path)
+	for name, hz := range map[string]string{"x": strings.Repeat("A", 1<<10), "y": y2} {
 		res, err := db.Exec(`UPDATE remote_pending_sealings SET answer = 'pruned', horizon = '` + hz + `', due = 0, tries = 0 WHERE name = '` + name + `' AND kind = 'doc'`)
 		if err != nil {
 			t.Fatal(err)
@@ -758,12 +790,9 @@ func TestV0261PreRaiseLegacyPrunedRows(t *testing.T) {
 		}
 	}
 	expectCode(t, b.get("/r/r/x/rev/"+r.x1, g), 502, "upstream")
-	res := b.get("/r/r/y/rev/"+r.y1, g)
-	expectCode(t, res, 410, "pruned")
-	if res.Str("horizon") != r.y1 {
-		t.Fatalf("y's document: %s, want horizon %s", res.Body, r.y1)
-	}
-	// A serves both now: x's is asked for again and stored, y's isn't.
+	// A serves both now: x's is asked for again and stored, y's isn't,
+	// its row kept pruned for good (due set). (y1's document isn't served
+	// from the branch, y having an e2e revision since: X-E2e fold.)
 	p.set(nil)
 	for range 2 {
 		if err := b.e.SyncRemotes(context.Background()); err != nil {
@@ -777,7 +806,9 @@ func TestV0261PreRaiseLegacyPrunedRows(t *testing.T) {
 	if p.count("GET "+yDoc) != 1 {
 		t.Fatalf("y's document, pruned for good, was asked for %d times", p.count("GET "+yDoc))
 	}
-	expectCode(t, b.get("/r/r/y/rev/"+r.y1, g), 410, "pruned")
+	if n := v0261Count(t, db, pg, `SELECT COUNT(*) FROM remote_pending_sealings WHERE name = 'y' AND kind = 'doc' AND answer = 'pruned' AND horizon = ? AND due > 0`, y2); n != 1 {
+		t.Fatalf("y's row: %d kept pruned with horizon %s", n, y2)
+	}
 }
 
 // C3: a sealing a sync asks for again is bounded as creation bounds it, by
@@ -1062,6 +1093,45 @@ func TestV0261PreRaisePrunedPastAtCreation(t *testing.T) {
 		res := b.get("/r/r/x/rev/"+r.x1, g)
 		if res.Code != want || want == 410 && res.Str("horizon") != x2 {
 			t.Fatalf("horizon %s: %d %s, want %d", hz, res.Code, res.Body, want)
+		}
+	}
+}
+
+// v0.26.1 review (horizonIn takes rv.seq >= the sealing's revision): a
+// real A, sealed, pruned at H, still serves H's document and H's own log
+// entry (§8.6 keeps H's document and drops only the patch sets before H),
+// so an honest 410 pruned for a sealing of revision R never names R
+// itself: its horizon is strictly after R. horizonIn accepts R, so A can
+// get B to answer 410 for good for the branch's head as of at, content an
+// honest A never answers 410 for with that horizon.
+func TestV0261PrunedHorizonStrictlyAfter(t *testing.T) {
+	t.Parallel()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("m", sealedDoc(map[string]any{"read": "grant", "keys": []any{kA.entry("*")}}))
+	root := func() string { return a.grant(kA, "user:root", []string{"m"}, allVerbs) }
+	x1 := a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})), root())
+	x2 := a.wr("m", "x", x1, withNonce([]any{op("replace", "/v", 2.0)}), root())
+	x3 := a.wr("m", "x", x2, withNonce([]any{op("replace", "/v", 3.0)}), root())
+	a.clock.Advance(time.Hour) // past the retry window
+	res := a.prune("m", "x", map[string]any{"horizon": x2}, root())
+	t.Logf("prune at x2: %d %s", res.Code, res.Body)
+	expect(t, res, 200)
+	for _, c := range []struct {
+		path string
+		want int
+	}{
+		{"/r/m/x/rev/" + x1, 410},
+		{"/r/m/x/rev/" + x2, 200},
+		{"/r/m/x/rev/" + x2 + "/log?since=" + x1, 200},
+		{"/r/m/x/rev/" + x3 + "/log?since=" + x2, 200},
+	} {
+		r := a.get(c.path, root())
+		t.Logf("%s: %d %.120s", c.path, r.Code, r.Body)
+		if r.Code != c.want {
+			t.Errorf("%s: %d, want %d", c.path, r.Code, c.want)
 		}
 	}
 }

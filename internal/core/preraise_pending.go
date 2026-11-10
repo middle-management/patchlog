@@ -71,7 +71,7 @@ type pendingSealing struct {
 // a 200: err (no answer, or one longer than B reads, errTooLarge), or
 // status st with body. A 410 pruned with a horizon is pruned with A's
 // horizon, which callers take only if it is a revision of the resource's
-// mirrored chain at or after the sealing's (prunedIn, horizonIn); any
+// chain after the sealing's (prunedIn, horizonIn, verifyHorizonPast); any
 // other 4xx, a redirect (rawGet follows none) or an answer too long is a
 // refusal, which isn't final.
 func pendingAnswer(st int, body []byte, err error) (answer, horizon string) {
@@ -219,10 +219,12 @@ func (t *tx) pendingPruned(sh *nsRow, kind, name, ref string, epoch int) (string
 }
 
 // horizonIn reports whether hz, a horizon A named for a sealing of
-// resource name of shadow sh, is a revision of its mirrored chain at or
-// after revSeq, the sealing's revision (for a blob, the first one
-// referencing it): the only horizon B takes for it (§8.6). Anything else
-// A names, of any size, is never stored or served.
+// resource name of shadow sh, is a revision of its mirrored chain after
+// revSeq, the sealing's revision (for a blob, the first one referencing
+// it), as A's horizon for it is (§8.6: A keeps the horizon's own document
+// and entry): with one past the mirrored head that A's log verifies
+// (verifyHorizonPast), the only horizon B takes for it. Anything else A
+// names, of any size, is never stored or served.
 func (t *tx) horizonIn(sh int64, name, hz string, revSeq int64) bool {
 	id, err := ids.Parse(hz)
 	if err != nil {
@@ -230,7 +232,7 @@ func (t *tx) horizonIn(sh int64, name, hz string, revSeq int64) bool {
 	}
 	var ok bool
 	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions rv JOIN resources r ON r.res = rv.res
-		WHERE r.ns = ? AND r.name = ? AND rv.id = ? AND rv.seq >= ?)`, sh, name, id[:], revSeq).Scan(&ok))
+		WHERE r.ns = ? AND r.name = ? AND rv.id = ? AND rv.seq > ?)`, sh, name, id[:], revSeq).Scan(&ok))
 	return ok
 }
 
