@@ -1,7 +1,6 @@
 package index
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -20,7 +19,6 @@ import (
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
-	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/tree"
 )
@@ -34,13 +32,10 @@ import (
 //
 //   - content kind: not public, sealed or e2e, and it trusts some catalog
 //     through a key whose requireAt names it (catvis.TrustedCatalogs), a
-//     purged or e2e one among them, which makes nothing visible (dark);
-//   - branch kind: a local branch, recursively, of a content-kind
-//     namespace, itself neither public nor sealed; the root's trust and
-//     keys are read from its document as of the baseAt the chain fixes,
-//     and the branch stays covered only while the root, at its head,
-//     still trusts each deciding catalog through every key counted there,
-//     each unchanged (§B.11.9 Branches, §C.4; branchTrustHolds);
+//     purged, e2e or branch one among them, which makes nothing visible
+//     (dark);
+//   - no branch is covered (§B.11.9 Where, v0.78): coverageOf answers nil
+//     for one before anything else;
 //   - catalog kind: a catalog, neither public nor sealed, that some local
 //     namespace of its catalog.trust trusts as content kind.
 //
@@ -82,7 +77,6 @@ import (
 // Kinds of covered namespace (fcp.kind).
 const (
 	fsContent = iota // trusts a catalog
-	fsBranch         // a local branch, recursively, of a content namespace
 	fsCatalog        // a catalog that a content namespace trusts
 )
 
@@ -603,42 +597,6 @@ func (ix *Index) coverageOf(ctx context.Context, ns, z string) (*fcp, []fsCat, e
 		return nil, nil, nil
 	}
 	cp := &fcp{ns: ns}
-	if b, at, ok := localBase(doc); ok {
-		cp.kind = fsBranch
-		bdoc := doc
-		for ok {
-			if len(cp.chain) == maxChain {
-				return nil, nil, fmt.Errorf("the chain of bases of %s is too deep", ns)
-			}
-			cp.chain = append(cp.chain, fsBase{ns: b, at: at})
-			if bdoc, err = ix.docAt(ctx, b, at); err != nil {
-				return nil, nil, err
-			}
-			if remoteBranch(bdoc) {
-				return nil, nil, nil
-			}
-			cp.root = b
-			b, at, ok = localBase(bdoc)
-		}
-		// bdoc is the root's document as of the baseAt the chain fixes;
-		// the root must also be open, and unpurged, now, at its head.
-		id, ok, err := ix.memberAt(ctx, cp.root)
-		if err != nil || !ok {
-			return nil, nil, err
-		}
-		cur, err := ix.docAt(ctx, cp.root, id)
-		if err != nil {
-			return nil, nil, err
-		}
-		if isCatalog(bdoc) || !fsOpen(cur) || !fsOpen(bdoc) {
-			return nil, nil, nil
-		}
-		cats, err := ix.fsTrust(ctx, cp.root, bdoc)
-		if err != nil || len(cats) == 0 || !branchTrustHolds(cp.root, bdoc, cur, cats) {
-			return nil, nil, err
-		}
-		return cp, cats, nil
-	}
 	cats, err := ix.fsTrust(ctx, ns, doc)
 	if err != nil {
 		return nil, nil, err
@@ -679,56 +637,6 @@ func (ix *Index) coverageOf(ctx context.Context, ns, z string) (*fcp, []fsCat, e
 		}
 	}
 	return nil, nil, nil
-}
-
-// branchTrustHolds reports whether a branch whose root is root, with
-// document bdoc as of the branch's baseAt and cur at its head, stays
-// covered (§B.11.9 Branches: "only while the namespace that trusts the
-// catalog still trusts it, at its head, through every key item 1 counts,
-// each unchanged (§C.4)"): for each catalog cats counts from bdoc that
-// isn't dark (fsCat.dark), cur still trusts it (its catalogs names it, and
-// its catalog.trust, as of the catalog's own head, lists root), and for
-// each kid counted there cur holds a key whose requireAt names it, its
-// entries under that kid equal, as canonical JSON, to bdoc's (the whole
-// entry: any edit, a pub rotated under the same kid among them, uncovers
-// the branch). Keys cur adds are not counted. An e2e or purged catalog
-// (dark) makes nothing visible either way, and is skipped (open question:
-// should a root that stops trusting it uncover the branch instead?).
-func branchTrustHolds(root string, bdoc, cur map[string]any, cats []fsCat) bool {
-	for _, c := range cats {
-		if c.dark() {
-			continue
-		}
-		head := catvis.TrustedCatalogs(root, cur, func(name string) map[string]any {
-			if name == c.ns {
-				return c.doc
-			}
-			return nil
-		})
-		i := slices.IndexFunc(head, func(tr catvis.Trust) bool { return tr.Catalog == c.ns })
-		if i < 0 {
-			return false
-		}
-		for _, kid := range c.kids {
-			if !slices.Contains(head[i].Kids, kid) || !bytes.Equal(keyEntries(bdoc, kid), keyEntries(cur, kid)) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// keyEntries are the entries of doc's keys with kid, in order, as
-// canonical JSON.
-func keyEntries(doc map[string]any, kid string) []byte {
-	keys, _ := doc["keys"].([]any)
-	var out []any
-	for _, k := range keys {
-		if m, _ := k.(map[string]any); m != nil && m["kid"] == kid {
-			out = append(out, m)
-		}
-	}
-	return jsonv.Canonical(out)
 }
 
 // checkpoint is ns's combined checkpoint with ns at z, the index's
@@ -790,10 +698,6 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 	cp.live = map[string]map[string]bool{}
 	var lives []string
 	switch cp.kind {
-	case fsBranch:
-		for _, b := range cp.chain {
-			lives = append(lives, b.ns)
-		}
 	case fsCatalog:
 		for m := range cp.ids {
 			if m != ns {
@@ -1078,13 +982,6 @@ func (fv *fview) judge(name string) bool {
 	}
 	cp := fv.cp
 	switch cp.kind {
-	case fsBranch:
-		for _, b := range cp.chain {
-			if !cp.live[b.ns][name] {
-				return false
-			}
-		}
-		fallthrough
 	case fsContent:
 		for _, v := range fv.views {
 			if v.Placement(cp.root, name) {
@@ -1187,13 +1084,6 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *marker
 		return nil, errRulesChanged
 	}
 	keys := cfg.Keys
-	if cp.kind == fsBranch {
-		eff, err := ix.checker.Config(ctx, cp.ns)
-		if err != nil {
-			return nil, err
-		}
-		keys = eff.Keys
-	}
 	for _, k := range recorded {
 		// §A.4's marker digest, as grantFview has it. A marker recorded
 		// with the rules' digest alone (before this release) never holds:
