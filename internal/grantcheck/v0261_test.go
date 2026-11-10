@@ -93,3 +93,27 @@ func TestV0261ForcedReloadCanceled(t *testing.T) {
 		t.Fatalf("waiting past its deadline: %v, want a transient ChainError", err)
 	}
 }
+
+// The same for a check whose context is canceled while it waits (its
+// request gone): transient, 503 behind, not 502.
+func TestV0261ForcedReloadCanceledTransient(t *testing.T) {
+	f := newChainFixture(t)
+	ch := f.checker(time.Hour)
+	ch.SetMinForced(2 * time.Second)
+	ctx := context.Background()
+	head := must(f.adminC.NSHead(ctx, "cat-season")).ID
+	if _, err := ch.Verify(ctx, "sec", f.grantAt(head)); err != nil {
+		t.Fatalf("at the head: %v", err)
+	}
+	bogus := f.grantAt("1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if _, err := ch.Verify(ctx, "sec", bogus); authStatus(err) != 403 {
+		t.Fatalf("at not in the chain: %v, want 403", err)
+	}
+	gone, cancel := context.WithCancel(ctx)
+	time.AfterFunc(50*time.Millisecond, cancel)
+	_, err := ch.Verify(gone, "sec", bogus)
+	var ce *grantcheck.ChainError
+	if !errors.As(err, &ce) || !ce.ChainUnreadable() {
+		t.Fatalf("canceled while waiting: %v, want a transient ChainError", err)
+	}
+}

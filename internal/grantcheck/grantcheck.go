@@ -586,8 +586,11 @@ func (e *ChainError) Unwrap() error { return e.Err }
 // the method callers match (errors.As) to answer 503 or 502.
 func (e *ChainError) ChainUnreadable() (transient bool) { return e.Transient }
 
+// A check canceled meanwhile (its request gone, or ended while it waited
+// for a forced read, forcedState) is transient too, as one past its
+// deadline is: the chain may well read once asked again.
 func chainError(err error) *ChainError {
-	return &ChainError{Transient: client.Transient(err), Err: err}
+	return &ChainError{Transient: client.Transient(err) || errors.Is(err, context.Canceled), Err: err}
 }
 
 // checkAt resolves a key's requireAt (§C.4) against the public API, as the
