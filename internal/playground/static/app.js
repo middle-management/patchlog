@@ -2519,7 +2519,7 @@ async function krAdd() {
     await loadKeyring();
     if (krLegacyRefused()) return;
     if (!KR.doc) return toast('No keyring');
-    const kr = JSON.parse(JSON.stringify(KR.doc));
+    const kr = Z.keyringV2ForWrite(KR.doc);
     const eps = Z.keyringV2Epochs(kr, S.ns), cur = eps[eps.length - 1];
     if (cur === undefined) return toast('The keyring holds no key of ' + S.ns);
     for (const e of eps) {
@@ -2544,7 +2544,7 @@ async function krRotate() {
     const keep = new Set([...document.querySelectorAll('.kr-keep')].filter((c) => c.checked && c.dataset.x).map((c) => c.dataset.x));
     keep.add(ID.x);
     if (!confirm(`Rotate ${S.ns} to epoch ${epoch + 1} for ${keep.size} recipient(s)? Recipients left out cannot read anything written afterwards.`)) return;
-    const kr = JSON.parse(JSON.stringify(KR.doc));
+    const kr = Z.keyringV2ForWrite(KR.doc);
     const e = cur + 1, key = Z.randomBytes(32);
     for (const x of keep) await Z.keyringV2Add(kr, ID, x, Z.kid(S.ns, e), key);
     const r = await api('POST', `/ns/${S.ns}/batch`, { label: 'rotate', body: {

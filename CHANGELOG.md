@@ -46,9 +46,9 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.81").
    get no keys; the server lists such keyrings as warnings at start (§E.3.2, v0.78 Legacy).
    That includes a keyring of the §E.3.2 form whose `$nonce` was written before v0.76, which
    `migrate-keyring` doesn't rewrite. **After upgrading**, the next keyring write by a v0.81
-   client mends one: `client.E2E` writes a fresh `$nonce` in place of a stored one, so a key
-   holder adds a reader (`AddReader`, even of a reader the keyring has) or rotates
-   (`RotateEpoch`).
+   client mends one: `client.E2E` and the playground write a fresh `$nonce` in place of a
+   stored one, so a key holder adds a reader (`AddReader`, even of a reader the keyring has) or
+   rotates (`RotateEpoch`).
 3. **Before upgrading, check rules on `/now` that apply to reads** (office hours, deadlines;
    §C.2 item 5). Read envelopes carry no `now`. A grant whose block or key-scope rule refers to
    `/now`, or to the whole envelope, is refused every read (`403`, or `404` at a resource URL
@@ -222,10 +222,11 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.81").
   folded as `[]`; keys wrapped under the pre-v0.63 info, keyrings in the format before v0.63
   and keys relayed without a sender no longer open. Namespace events are opened as the entry
   object; the pre-v0.73 sealed `purge` and `prune` event form is refused.
-- Keyring writes (`InitKeyring`, `AddReader`, `RotateEpoch`) carry a fresh `$nonce` where the
-  keyring read has one, never the stored one, and none where it has none (§E.3.2, §C.7). A
-  keyring whose `$nonce` was written before v0.76 was copied with it and refused (`422`), so
-  such a namespace could neither add a reader nor rotate (Upgrading 2).
+- Keyring writes (`InitKeyring`, `AddReader`, `RotateEpoch`, and the playground's Add reader
+  and Rotate) carry a fresh `$nonce` where the keyring read has one, never the stored one, and
+  none where it has none (§E.3.2, §C.7). A keyring whose `$nonce` was written before v0.76 was
+  copied with it and refused (`422`), so such a namespace could neither add a reader nor
+  rotate (Upgrading 2).
 - Message bound: the client counts sealings under each resource's `K_r` per epoch, from the log
   (read once per process, on its first sealing for the resource) and its own writes. It
   reports when rotation is due (`E2E.SealStatus`) and refuses a sealing past the bound
