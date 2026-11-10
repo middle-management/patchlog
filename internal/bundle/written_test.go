@@ -258,7 +258,7 @@ func newWrappedEncDeployment(t *testing.T, origin string, wrap func(next http.Ha
 // one would with the grants of v0.42: every resource log entry names the
 // grant of its author (inside the entry's JWE), and GET
 // /ns/{ns}/grants/{gid} answers a JWE with pl { ns, grant } under the
-// namespace's epoch key.
+// namespace key K_n of epoch 1 (§E.2.1, §E.2.2).
 func sealedGrantsHandler(t *testing.T, grants map[string]*grant.Grant, grantFor func(author string) *grant.Grant, jwks []map[string]any) func(http.Handler, *client.Client) http.Handler {
 	grantsRE := regexp.MustCompile(`^/ns/([a-z0-9_-]+)/grants/(1[a-z2-7]+)$`)
 	logRE := regexp.MustCompile(`^/r/[^/]+/[^/]+/rev/[^/]+/log$`)
@@ -287,7 +287,11 @@ func sealedGrantsHandler(t *testing.T, grants map[string]*grant.Grant, grantFor 
 				}
 				doc := map[string]any{"id": g.ID().String(), "root": g.Blocks[0].Raw, "stored": splitStored(g.Stored())}
 				body, _ := json.Marshal(doc)
-				jwe, err := seal.Seal(epochKey(m[1]), m[1]+"#1", seal.PL{"ns": m[1], "grant": g.ID().String()}, body)
+				kn, err := seal.NamespaceKey(epochKey(m[1]), m[1])
+				if err != nil {
+					t.Fatal(err)
+				}
+				jwe, err := seal.Seal(kn, m[1]+"#1", seal.PL{"ns": m[1], "grant": g.ID().String()}, body)
 				if err != nil {
 					t.Fatal(err)
 				}
