@@ -3,6 +3,7 @@ package tree_test
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -293,5 +294,121 @@ func TestV0261RaiseToE2EWithoutKeys(t *testing.T) {
 	waitFor(t, "ns:cat sent to the Purger", func() bool { _, sent, _ := v0261Purges(x, "ns:cat"); return sent > sent0 })
 	if r := x.raw(before.path, ""); r.status == 200 {
 		t.Errorf("after the raise to e2e, %s is served 200: %v", before.path, r.body)
+	}
+}
+
+// §E.2.6, §E.3.1 (v0.26.1): a rotation purges nothing, so a listing reads
+// the catalog's encryption again once its graph is read, before it
+// judges any epoch by it. In e2e catalog cat, node n's head is pending
+// (written in the clear before the raise); a rotation to cat#2 applied
+// after the listing took its kept generation and read the encryption
+// again (AfterGeneration), during fileSealing and the key fetches, has
+// the listing view the graph after it: n is judged by cat#2, the epoch
+// in force, never cat#1, the one it read first.
+func TestV0261RotationAfterInfoReread(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	svcJWK, svcPriv := must2(seal.GenerateRecipient())
+	wJWK, wPriv := must2(seal.GenerateRecipient())
+	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "append", "config"},
+		map[string]any{"enc": wJWK})), client.WithKeys(client.NewKeys(wPriv)))
+	x2 := wr.E2E(wPriv)
+	must(wr.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(wr.CreateDoc(ctx, "cat", "n", map[string]any{"title": "N", "parents": parents("root@a0")}))
+	must(wr.PatchConfig(ctx, "cat", must(wr.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "e2e"}}}))
+	must(x2.InitKeyring(ctx, "cat", svcPriv.PublicKey()))
+	keyOf := func(kid string) []byte { return must(x2.SealKey(ctx, kid)) }
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"}, map[string]any{"enc": svcJWK})),
+		client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey()))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db}, func(o *tree.Options) { o.Recipient = svcPriv })
+	x.caughtUp("cat")
+	if e, _ := v077Epochs(t, db, "n"); e != 0 {
+		t.Fatalf("n's epoch %d before any listing, want it pending", e)
+	}
+	rd := k.Grant(t, s.Now(), "user:r", []string{"cat"}, []string{"read"})
+
+	var once sync.Once
+	ran := false
+	x.s.AfterGeneration(func() {
+		once.Do(func() {
+			ran = true
+			must(x2.RotateEpoch(ctx, "cat", svcPriv.PublicKey()))
+			x.caughtUp("cat")
+		})
+	})
+	x.fetch("/cat/children?of=root", rd)
+	x.s.AfterGeneration(nil)
+	if !ran {
+		t.Fatal("the listing was not computed")
+	}
+	if e, _ := v077Epochs(t, db, "n"); e != 2 {
+		t.Errorf("n judged by cat#%d, want cat#2, the epoch in force as the listing read the graph", e)
+	}
+	if kid, vals, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", keyOf); kid != "cat#2" || vals["title"] != "N" {
+		t.Errorf("n %v sealed under %s, want under cat#2", vals, kid)
+	}
+}
+
+// §H.3, §E.2.6 (v0.26.1): a listing reads what its file metadata is
+// sealed by (fileSealing) before its graph, so it reads it again once the
+// graph is read. In public file tree cat over public namespace files, a
+// raise of files to sealed applied between the two, with files.late
+// written after it, has the listing view a graph in which files.late's
+// file metadata is a sealed namespace's: it is computed again, and
+// gives that metadata sealed, never in the clear.
+func TestV0261FileSealingAfterRead(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for ns, doc := range map[string]map[string]any{
+		"files": {"read": "public", "keys": []any{k.Entry("*")}},
+		"cat":   {"read": "public", "keys": []any{k.Entry("*")}, "catalog": filesCatalog("files")},
+	} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	both := []string{"cat", "files"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "append", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"parents": []any{}}))
+	createNonced(t, w, "files", "notes", map[string]any{"title": "Notes"})
+	must(w.CreateDoc(ctx, "cat", "files.notes", map[string]any{"parents": parents("root@a0")}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	x := startSvc(t, sc, svcOpts{now: s.Now})
+	x.caughtUp("cat", "files")
+	if f := fileOf(entriesOf(t, x.get("/cat/children?of=root", ""))["files.notes"]); f["size"] == nil {
+		t.Fatalf("setup: file metadata %v, want it in the clear", f)
+	}
+
+	var once sync.Once
+	ran := false
+	x.s.AfterFileSealing(func() {
+		once.Do(func() {
+			ran = true
+			must(w.PatchConfig(ctx, "files", must(w.NSHead(ctx, "files")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}}}))
+			createNonced(t, w, "files", "late", map[string]any{"title": "Late"})
+			must(w.CreateDoc(ctx, "cat", "files.late", map[string]any{"parents": parents("root@a1")}))
+			x.caughtUp("cat", "files")
+		})
+	})
+	f := x.fetch("/cat/subtree?of=root", "")
+	x.s.AfterFileSealing(nil)
+	if !ran {
+		t.Fatal("the listing was not computed")
+	}
+	// The listing computed, and kept, and the same listing read again.
+	for _, g := range []fetched{f, x.fetch(f.path, "")} {
+		tree, _ := decode(t, g.body)["tree"].(map[string]any)
+		kids, _ := tree["children"].([]any)
+		for _, c := range kids {
+			e := c.(map[string]any)
+			if fileOf(e)["size"] != nil {
+				t.Errorf("%s at %s: file metadata in the clear after the raise to sealed (Cache-Control %q): %v", e["name"], g.path, g.header.Get("Cache-Control"), fileOf(e))
+			}
+		}
 	}
 }

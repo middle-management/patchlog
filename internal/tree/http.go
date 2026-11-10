@@ -1157,11 +1157,13 @@ var errCurrentKey = errors.New("the key that seals listings of the catalog")
 // (currentListing).
 var errPurgedSince = errors.New("the listing was computed before a purge of what it shows")
 
-// errInfoChanged is a listing that would be computed under the catalog's
-// encryption as read before its kept generation, which has changed since:
-// a raise to sealed or e2e purges what it narrows (§9), counted before
-// that generation, so it is errPurgedSince, computed again with what is
-// current.
+// errInfoChanged is a listing computed under the catalog's encryption, or
+// the file metadata's sealing, as read before its graph was, which has
+// changed since: a raise to sealed or e2e, or a rotation, observed before
+// the apply that moves the graph (Apply, keys.Observe). It is
+// errPurgedSince, computed again with what is current: a raise purges
+// what it narrows (§9, applyLocked's ns:{ns}), but a rotation purges
+// nothing, so only reading them again tells.
 var errInfoChanged = fmt.Errorf("%w: the catalog's encryption changed", errPurgedSince)
 
 // currentListing is listing with the catalog's encryption and key as they
@@ -1192,8 +1194,9 @@ func (s *Service) currentListing(ctx context.Context, v *viewer, op string, vals
 // under: the URL and the reader's shape, since a namespace that turns
 // private moves no URL (viewer.shape). info is the catalog's encryption
 // as read before; one that has changed by the time the kept generation is
-// taken is errInfoChanged, and a listing a purge since then may have
-// changed errPurgedSince: neither is served (currentListing).
+// taken, or by the time its graph is read, is errInfoChanged, and a
+// listing a purge since then may have changed errPurgedSince: neither is
+// served, kept or judged by (currentListing).
 func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string, info derived.Info, key derived.Key) (*computed, error) {
 	if f := s.beforeListing.Load(); f != nil {
 		(*f)()
@@ -1205,12 +1208,13 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	// or e2e, a rotation), which apply observes before it purges what it
 	// narrows (§9, §A.1), would have this listing computed under what it
 	// replaced and kept, its purge counted before gen. Read again now:
-	// what changed is errInfoChanged; what changes later purges after gen
-	// (errPurgedSince). The file metadata's sealing is read after gen.
-	if now, err := s.keys.Info(ctx, cat); err != nil {
-		return nil, fmt.Errorf("%w (%s): %w", errCurrentKey, cat, err)
-	} else if now != info {
-		return nil, errInfoChanged
+	// what changed is errInfoChanged. The file metadata's sealing is read
+	// after gen. A change after this is observed before the graph moves,
+	// so both are read again once the graph is (unchanged): a rotation
+	// purges nothing, and a listing whose graph is read after one must
+	// not be served, kept or judged by under the epoch it replaced.
+	if err := s.unchanged(ctx, info, nil); err != nil {
+		return nil, err
 	}
 	if f := s.afterGeneration.Load(); f != nil {
 		(*f)()
@@ -1218,6 +1222,9 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	fs, err := s.fileSealing(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if f := s.afterFileSealing.Load(); f != nil {
+		(*f)()
 	}
 	if op == "lookup" && (!fs.on || info.Protected()) {
 		// Titles to look up by are a file tree's, and in the clear only
@@ -1243,6 +1250,9 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			cps, prof = s.checkpointsOf(g, curMap), s.profileOf(g)
 		})
 		if st, ok := s.sealed.Get(ctx, keyOf(at)); ok {
+			if err := s.unchanged(ctx, info, fs); err != nil {
+				return nil, err
+			}
 			if prof != nil && !prof.Admits(v.subjects) {
 				return refusePartial(&computed{at: at, prof: prof}), nil
 			}
@@ -1424,6 +1434,11 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				run()
 			}
 		})
+		// What it was computed under still holds as the graph was read,
+		// before anything is judged, stored, kept or served by it.
+		if err := s.unchanged(ctx, info, fs); err != nil {
+			return nil, err
+		}
 		if l.status == http.StatusOK && len(missing) == 0 && serr == nil && len(judged) > 0 {
 			// Recorded before the listing is stored or served; one that
 			// lost to another's computes it again (§E.2.6).
@@ -1478,14 +1493,8 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	}
 	if !keep {
 		// Neither stored nor kept: whether it may be served depends on
-		// the reader. No kept generation guards it, so the encryption is
-		// read again: a raise applied while it was computed, its graph
-		// read after the raise, is computed again under the new one.
-		if now, err := s.keys.Info(ctx, cat); err != nil {
-			return nil, fmt.Errorf("%w (%s): %w", errCurrentKey, cat, err)
-		} else if now != info {
-			return nil, errInfoChanged
-		}
+		// the reader. No kept generation guards it; the encryption was
+		// read again once its graph was (unchanged).
 		return l, nil
 	}
 	type page struct {
@@ -1531,6 +1540,21 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	l.st, l.prof = pages[0].st, prof
 	s.recordAt(l.at, cps, prof)
 	return l, nil
+}
+
+// unchanged is errInfoChanged if the catalog's encryption is no longer
+// info, or what fs was read from has changed (fileSealingChanged; fs nil
+// for none yet), and errCurrentKey if it can't be read.
+func (s *Service) unchanged(ctx context.Context, info derived.Info, fs *fileSealing) error {
+	cat := s.opt.Catalog
+	now, err := s.keys.Info(ctx, cat)
+	if err != nil {
+		return fmt.Errorf("%w (%s): %w", errCurrentKey, cat, err)
+	}
+	if now != info || fs != nil && s.fileSealingChanged(ctx, fs) {
+		return errInfoChanged
+	}
+	return nil
 }
 
 // dropWholeViews drops the listings stored sealed whole (derived.Cache)

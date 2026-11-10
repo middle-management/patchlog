@@ -212,6 +212,11 @@ type Service struct {
 	// generation, before it reads the graph, outside the graph's lock
 	// (tests: a purge applied meanwhile).
 	afterGeneration atomic.Pointer[func()]
+	// afterFileSealing, if set, runs as a listing has read its file
+	// metadata's sealing (fileSealing), before it reads the graph,
+	// outside the graph's lock (tests: a config change applied
+	// meanwhile).
+	afterFileSealing atomic.Pointer[func()]
 	// beforeJudge, if set, runs as a listing records what it judged
 	// (judgeEpochs), outside the graph's lock (tests: a head applied
 	// meanwhile).
