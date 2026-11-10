@@ -310,30 +310,46 @@ func TestV0261RaiseToE2EWithoutKeys(t *testing.T) {
 
 // §E.2.6, §E.3.1 (v0.26.1): a rotation purges nothing, so a listing reads
 // the catalog's encryption again once its graph is read, before it
-// judges any epoch by it. In a release preview of e2e catalog cat through
-// its e2e branch catb (v081Preview), node n's head is pending (cat's op,
-// read through; until v0.81, written in the clear before a raise, which
-// is 422 since v0.78); a rotation to epoch 2 applied after the listing
-// took its kept generation and read the encryption again
-// (AfterGeneration), during fileSealing and the key fetches, has the
-// listing view the graph after it: n is judged by epoch 2, the epoch in
-// force, never epoch 1, the one it read first.
+// judges any epoch by it. In e2e catalog cat, node n's head is pending
+// (written in the clear before the raise); a rotation to cat#2 applied
+// after the listing took its kept generation and read the encryption
+// again (AfterGeneration), during fileSealing and the key fetches, has
+// the listing view the graph after it: n is judged by cat#2, the epoch
+// in force, never cat#1, the one it read first.
 func TestV0261RotationAfterInfoReread(t *testing.T) {
 	t.Parallel()
-	p := newV081Preview(t)
-	x := p.start(t)
-	if e, _ := v077Epochs(t, p.db, "n"); e != 0 {
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	svcJWK, svcPriv := must2(seal.GenerateRecipient())
+	wJWK, wPriv := must2(seal.GenerateRecipient())
+	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "append", "config"},
+		map[string]any{"enc": wJWK})), client.WithKeys(client.NewKeys(wPriv)))
+	x2 := wr.E2E(wPriv)
+	must(wr.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(wr.CreateDoc(ctx, "cat", "n", map[string]any{"title": "N", "parents": parents("root@a0")}))
+	must(wr.PatchConfig(ctx, "cat", must(wr.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "e2e"}}}))
+	must(x2.InitKeyring(ctx, "cat", svcPriv.PublicKey()))
+	keyOf := func(kid string) []byte { return must(x2.SealKey(ctx, kid)) }
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"}, map[string]any{"enc": svcJWK})),
+		client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey()))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db}, func(o *tree.Options) { o.Recipient = svcPriv })
+	x.caughtUp("cat")
+	if e, _ := v077Epochs(t, db, "n"); e != 0 {
 		t.Fatalf("n's epoch %d before any listing, want it pending", e)
 	}
-	rd := p.k.Grant(t, p.s.Now(), "user:r", []string{"cat", "catb"}, []string{"read"})
+	rd := k.Grant(t, s.Now(), "user:r", []string{"cat"}, []string{"read"})
 
 	var once sync.Once
 	ran := false
 	x.s.AfterGeneration(func() {
 		once.Do(func() {
 			ran = true
-			p.rotate(t)
-			p.reach(t, x)
+			must(x2.RotateEpoch(ctx, "cat", svcPriv.PublicKey()))
+			x.caughtUp("cat")
 		})
 	})
 	x.fetch("/cat/children?of=root", rd)
@@ -341,10 +357,10 @@ func TestV0261RotationAfterInfoReread(t *testing.T) {
 	if !ran {
 		t.Fatal("the listing was not computed")
 	}
-	if e, _ := v077Epochs(t, p.db, "n"); e != 2 {
-		t.Errorf("n judged by epoch %d, want 2, the epoch in force as the listing read the graph", e)
+	if e, _ := v077Epochs(t, db, "n"); e != 2 {
+		t.Errorf("n judged by cat#%d, want cat#2, the epoch in force as the listing read the graph", e)
 	}
-	if kid, vals, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", p.keyOf); kid != "cat#2" || vals["title"] != "N" {
+	if kid, vals, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", keyOf); kid != "cat#2" || vals["title"] != "N" {
 		t.Errorf("n %v sealed under %s, want under cat#2", vals, kid)
 	}
 }

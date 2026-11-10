@@ -1028,14 +1028,6 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		if u.Config != nil {
 			cfg = u.Config
 			s.keys.Observe(fb.NS, u.Config.Value)
-			if b.NS != fb.NS {
-				// In a release preview the catalog's encryption, which its
-				// listings are sealed and judged by (Keys.Current, unchanged),
-				// is the branch's, followed in its place: its rotations are
-				// observed too, so a listing re-reads them before it judges
-				// an epoch (§E.2.6, §E.3.1).
-				s.keys.Observe(b.NS, u.Config.Value)
-			}
 		}
 	}
 	if cfg != nil {
@@ -1729,6 +1721,12 @@ func (s *Service) purgeStopped(ctx context.Context, ns string) {
 			return s.repurge.Add(ctx, tx, tags)
 		}); err != nil {
 			s.opt.Logf("tree: purging %v for %s, no longer followed: %v", tags, ns, err)
+			// The graph was reloaded from a database without the stop:
+			// it holds in memory all the same, its placements dangling,
+			// as before the write was tried (restarted, the service stops
+			// ns again when it fails to follow it).
+			s.g.stopped[ns] = cp
+			s.g.analyze()
 		}
 	}
 	// It leaves the combined checkpoint (noteTrust: entered again once
