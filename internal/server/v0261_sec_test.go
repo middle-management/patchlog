@@ -708,8 +708,8 @@ func TestV0261PreRaisePrunedBlobEpoch(t *testing.T) {
 // base's step now has one (RemoteOptions.FollowTimeout), and fetching its
 // pending sealings half of it, so the other bases are still followed. A
 // hang where the branch follows the base's log (GET /ns/m), or fetches a
-// pending sealing again (x's document). The origin's other branches are
-// skipped until the next sync (one FollowTimeout per origin and sync).
+// pending sealing again (x's document). An origin has one FollowTimeout
+// per sync: once spent, its other branches wait for the next.
 func TestV0261FollowDeadline(t *testing.T) {
 	t.Parallel()
 	for _, hang := range []string{"/ns/m", "/r/m/x/rev/"} {
@@ -748,8 +748,12 @@ func TestV0261FollowDeadline(t *testing.T) {
 		err := b.e.SyncRemotes(context.Background())
 		el := time.Since(start)
 		t.Logf("%s: SyncRemotes after %v: %v", hang, el, err)
-		if el > 6*time.Second || !hung.Load() || err == nil || !strings.Contains(err.Error(), "skipped") {
-			t.Fatalf("%s: SyncRemotes took %v (hung: %v), error %v; want the other branch of that origin skipped", hang, el, hung.Load(), err)
+		// A hang reading the log spends the origin's FollowTimeout: its
+		// other branch is skipped; one fetching a pending sealing, half
+		// of it, which leaves the other branch time.
+		skipped := err != nil && strings.Contains(err.Error(), "skipped")
+		if el > 6*time.Second || !hung.Load() || err == nil || skipped != (hang == "/ns/m") {
+			t.Fatalf("%s: SyncRemotes took %v (hung: %v), error %v", hang, el, hung.Load(), err)
 		}
 		// The next sync follows both.
 		if err := b.e.SyncRemotes(context.Background()); err != nil {
@@ -1425,5 +1429,60 @@ func TestV0261CreationRegistrationNoDeadline(t *testing.T) {
 	t.Logf("creation took %v with FollowTimeout 1s", el)
 	if el >= drip {
 		t.Fatalf("creation took %v: A's drip of the registration held it past FollowTimeout", el)
+	}
+}
+
+// v0.26.1 review, round 3 (88b5a96, "one FollowTimeout per remote
+// origin"): baseStep marks an origin late only when a step's own deadline
+// expires (or its error is DeadlineExceeded); nothing adds up the time an
+// origin's steps take. TestV0261StallPerBranch's A drips until B gives up;
+// this A drips the same answer and stops a little before FollowTimeout
+// (0.8 of it), so no step runs out of time, none of A's bases is skipped,
+// and k branches of A still hold the sync k × 0.8 × FollowTimeout, every
+// other origin's bases waiting behind them. (A's answer is a 503, after
+// which the step asks A nothing else.)
+func TestV0261StallJustUnderDeadline(t *testing.T) {
+	t.Parallel()
+	r := newV077Raised(t)
+	p := newV077Proxy(t, r.a, nil)
+	const timeout = time.Second
+	var armed atomic.Bool
+	target, _ := url.Parse(p.srv.URL)
+	rp := httputil.NewSingleHostReverseProxy(target)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if armed.Load() && req.Method == "GET" && req.URL.Path == "/ns/m" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(503)
+			end := time.After(timeout * 8 / 10)
+			for {
+				select {
+				case <-req.Context().Done():
+					return
+				case <-end:
+					return
+				case <-time.After(100 * time.Millisecond):
+					if _, err := w.Write([]byte(" ")); err != nil {
+						return
+					}
+					w.(http.Flusher).Flush()
+				}
+			}
+		}
+		rp.ServeHTTP(w, req)
+	}))
+	t.Cleanup(front.Close)
+	b := newV0261B(t, r, front.URL, func(o *core.Options) { o.Remote.FollowTimeout = timeout })
+	const k = 4
+	for i := 0; i < k; i++ {
+		v0261Remote(t, b, r, "r"+string(rune('a'+i)))
+	}
+	armed.Store(true)
+	start := time.Now()
+	err := b.e.SyncRemotes(context.Background())
+	el := time.Since(start)
+	t.Logf("SyncRemotes with %d branches of one A answering just under FollowTimeout: %v (FollowTimeout %v): %.300v", k, el, timeout, err)
+	if el >= 2*timeout {
+		t.Fatalf("one origin's %d branches held the sync %v (%.1f × FollowTimeout), none of them skipped: the per-origin budget only counts a step that runs out of time",
+			k, el, float64(el)/float64(timeout))
 	}
 }
