@@ -103,8 +103,8 @@ func main() {
 	}
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, `usage:
+// usageText is what usage prints.
+const usageText = `usage:
   patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-schema-fetch [-schema-fetch-hosts H,H]] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-origin-url ORIGIN=URL]... [-remote-follow-interval 5m] [-remote-register]
                  [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
@@ -127,9 +127,12 @@ func usage() {
   patchlog archive restore -db patchlog.db [-blob-dir DIR] [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]
   patchlog schema import -api URL -ns NS [-bearer T] [-author A] [-name NAME] [-dry-run] [-json] URL|FILE...
   patchlog health [-timeout 2s] [URL]   (exit 0 if URL, default http://localhost:8080/_health, answers 200)
-  patchlog e2e migrate-keyring -api URL -ns NS -identity admin.jwk [-reader pub.jwk]... [-current-reader pub.jwk]... [-bearer T]
+  patchlog e2e seal-status -api URL -ns NS -name NAME [-bearer T] [-json]
 
-serve, index, tree and dav also take -shutdown-timeout 30s and -shutdown-delay 0 (graceful shutdown) and answer /_health and /_ready.`)
+serve, index, tree and dav also take -shutdown-timeout 30s and -shutdown-delay 0 (graceful shutdown) and answer /_health and /_ready.`
+
+func usage() {
+	fmt.Fprintln(os.Stderr, usageText)
 	os.Exit(2)
 }
 
@@ -184,7 +187,7 @@ func serve(args []string) {
 	masterKeyCreate := fs.Bool("master-key-create", false, "create the -master-key file with a new random key if it doesn't exist")
 	rotateEpochs := fs.Duration("rotate-epochs", 0, "rotate every sealed namespace's epoch once it is this old, e.g. 24h (Addendum E.2; 0 disables)")
 	rotateOnRevoke := fs.Bool("rotate-on-revoke", false, "rotate a sealed namespace's epoch right after a config write that revokes a grant or removes or changes a key (§E.2.4)")
-	purgeRaised := fs.Bool("purge-raised-e2e", false, "purge at start, destroying their keys, the namespaces an earlier version raised to e2e by a config write and the remote branches of sources raised so, which this version refuses to start with (Addendum E Levels; export them with the v0.26.1 tools first)")
+	purgeRaised := fs.Bool("purge-raised-e2e", false, "purge at start, destroying their keys, the namespaces an earlier version raised to e2e by a config write and the remote branches of sources raised so, which this version refuses to start with (Addendum E Levels; to keep a copy, export them with the v0.26.1 tools first)")
 	groupCommit := fs.Int("group-commit", 32, "Postgres: at most this many concurrent resource writes and batches of one namespace committed in one transaction (group commit, D.8); 1 or less commits every write on its own")
 	groupWait := fs.Duration("group-commit-wait", 200*time.Microsecond, "Postgres: at most how long a group waits for writes of its namespace still being checked (0: no wait)")
 	localRate := fs.Bool("local-rate-buckets", false, "Postgres: keep the rate-limit buckets (§6.6) in this instance's memory rather than in the database, saving a round trip per write; only for a deployment of one instance, since instances sharing a database must share their buckets")
