@@ -28,6 +28,7 @@ type chainFixture struct {
 	adminC   *client.Client
 	fail     atomic.Int32
 	failPath atomic.Value
+	heads    atomic.Int64 // reads of cat-season's head (v0261_test.go)
 }
 
 func newChainFixture(t *testing.T) *chainFixture {
@@ -41,6 +42,9 @@ func newChainFixture(t *testing.T) *chainFixture {
 	f.failPath.Store("/ns/cat-season/keys")
 	f.s = clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, Wrap: func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == "GET" && r.URL.Path == "/ns/cat-season" {
+				f.heads.Add(1)
+			}
 			if st := int(f.fail.Load()); st != 0 && strings.HasPrefix(r.URL.Path, f.failPath.Load().(string)) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(st)

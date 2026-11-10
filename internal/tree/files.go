@@ -337,6 +337,20 @@ type fileSealing struct {
 	lacking map[string]map[int]bool
 	omit    map[string]bool
 	e2e     map[string]bool // omitted as end-to-end (§H.3 absent: e2e)
+	// read is what it was read from, the encryption of each namespace
+	// whose items show file metadata (fileSealingSource), so a listing
+	// can tell whether it still holds once its graph is read
+	// (fileSealingChanged).
+	read fileSealingSource
+}
+
+// fileSealingSource is what a fileSealing is read from: whether the
+// catalog is a file tree, and the encryption of each namespace it trusts,
+// as read (absent where it couldn't be).
+type fileSealingSource struct {
+	on    bool
+	nss   map[string]bool
+	infos map[string]derived.Info
 }
 
 // seals reports whether listings seal file metadata.
@@ -391,11 +405,16 @@ func (s *Service) fileSealing(ctx context.Context) (*fileSealing, error) {
 	s.mu.RUnlock()
 	fs := &fileSealing{on: on, keys: map[string]derived.Key{}, epochs: map[string]map[int]derived.Key{},
 		lacking: map[string]map[int]bool{}, omit: map[string]bool{}, e2e: map[string]bool{}}
+	fs.read = fileSealingSource{on: on, nss: map[string]bool{}, infos: map[string]derived.Info{}}
 	if !on {
 		return fs, nil
 	}
 	for _, ns := range nss {
+		fs.read.nss[ns] = true
 		in, err := s.keys.Info(ctx, ns)
+		if err == nil {
+			fs.read.infos[ns] = in
+		}
 		var key derived.Key
 		if err == nil && in.Level == derived.LevelSealed {
 			_, key, err = s.keys.Current(ctx, ns)
@@ -437,6 +456,48 @@ func (s *Service) fileSealing(ctx context.Context) (*fileSealing, error) {
 		}
 	}
 	return fs, nil
+}
+
+// fileSealingChanged reports whether what fs was read from has changed
+// since (fileSealingSource): the catalog turned into a file tree or out
+// of one, trusts other namespaces, or one of them changed its encryption
+// (a raise to sealed or e2e, a rotation). A listing whose graph is read
+// after such a change would give file metadata in the clear that is now
+// sealed, or seal it under an epoch rotated away; it is computed again
+// (errInfoChanged). The encryption is read as fileSealing reads it, so
+// a namespace it couldn't read then and can't now hasn't changed.
+func (s *Service) fileSealingChanged(ctx context.Context, fs *fileSealing) bool {
+	s.mu.RLock()
+	on := s.g.Files
+	nss := map[string]bool{}
+	if on {
+		for ns := range s.g.Trust {
+			if _, purged := s.purged[ns]; !purged {
+				nss[s.actual(ns)] = true
+			}
+		}
+	}
+	s.mu.RUnlock()
+	if on != fs.read.on {
+		return true
+	}
+	if !on {
+		return false
+	}
+	if len(nss) != len(fs.read.nss) {
+		return true
+	}
+	for ns := range nss {
+		if !fs.read.nss[ns] {
+			return true
+		}
+		in, err := s.keys.Info(ctx, ns)
+		was, ok := fs.read.infos[ns]
+		if (err == nil) != ok || err == nil && in != was {
+			return true
+		}
+	}
+	return false
 }
 
 // file is the file member of n, a placement whose head a listing shows,

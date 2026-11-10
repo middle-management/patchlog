@@ -59,7 +59,31 @@ type Checker struct {
 	states map[string]*nsState
 	copied map[string]map[string]grant.Key // branch -> keys copied from its base at creation (immutable)
 	rules  sync.Map                        // canonical rule -> *rules.Rule
+
+	// seq counts Observe and Invalidate calls; observed is the seq of the
+	// last Observe of each namespace, invalidated that of the last
+	// Invalidate. A state loaded by a read that began before one that
+	// concerns its chain is not stored (stateWithin): it may hold what the
+	// Observe said is gone, fresh for the TTL.
+	seq         uint64
+	observed    map[string]uint64
+	invalidated uint64
+
+	// The heads of a requireAt chain read again at once for an at the
+	// cached ones don't reach (checkAt, forcedState): one read per
+	// namespace at a time (forcing), at least minForced after the one
+	// before it started (lastForced).
+	minForced  time.Duration
+	forcing    map[string]*forcedRead
+	lastForced map[string]time.Time
 }
+
+// minForcedInterval is the default Checker.minForced.
+const minForcedInterval = time.Second
+
+// forcedReadTimeout bounds a forced read (runForced), which no check's
+// context cancels: the client sets no timeout of its own.
+const forcedReadTimeout = 10 * time.Second
 
 // Option configures a Checker.
 type Option func(*Checker)
@@ -83,7 +107,8 @@ func WithMaxGrantRules(n int) Option { return func(ch *Checker) { ch.maxRules = 
 // New returns a Checker that reads namespace documents with c.
 func New(c *client.Client, opts ...Option) *Checker {
 	ch := &Checker{c: c, ttl: 30 * time.Second, now: time.Now, maxGrant: 8 << 10, maxRules: 32,
-		states: map[string]*nsState{}, copied: map[string]map[string]grant.Key{}}
+		states: map[string]*nsState{}, copied: map[string]map[string]grant.Key{}, observed: map[string]uint64{},
+		minForced: minForcedInterval, forcing: map[string]*forcedRead{}, lastForced: map[string]time.Time{}}
 	for _, o := range opts {
 		o(ch)
 	}
@@ -160,6 +185,8 @@ type nsState struct {
 func (ch *Checker) Observe(ns, nsID string) {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
+	ch.seq++
+	ch.observed[ns] = ch.seq
 	for name, st := range ch.states {
 		for _, c := range st.chain {
 			if c.NS == ns && c.Head != nsID {
@@ -174,7 +201,23 @@ func (ch *Checker) Observe(ns, nsID string) {
 func (ch *Checker) Invalidate() {
 	ch.mu.Lock()
 	ch.states = map[string]*nsState{}
+	ch.seq++
+	ch.invalidated = ch.seq
 	ch.mu.Unlock()
+}
+
+// overtaken reports whether an Observe of a namespace in chain, or an
+// Invalidate, came since seq start. ch.mu is held.
+func (ch *Checker) overtaken(chain []*Config, start uint64) bool {
+	if ch.invalidated > start {
+		return true
+	}
+	for _, c := range chain {
+		if ch.observed[c.NS] > start {
+			return true
+		}
+	}
+	return false
 }
 
 // Config returns the namespace document at the head (cached), with the
@@ -201,6 +244,7 @@ func (ch *Checker) state(ctx context.Context, ns string) (*nsState, error) {
 func (ch *Checker) stateWithin(ctx context.Context, ns string, ttl time.Duration) (st *nsState, checked time.Time, err error) {
 	now := time.Now()
 	ch.mu.Lock()
+	start := ch.seq
 	st = ch.states[ns]
 	var checkedAt time.Time
 	if st != nil {
@@ -225,7 +269,9 @@ func (ch *Checker) stateWithin(ctx context.Context, ns string, ttl time.Duration
 		}
 		if same {
 			ch.mu.Lock()
-			st.checkedAt = now
+			if !ch.overtaken(st.chain, start) {
+				st.checkedAt = now
+			}
 			ch.mu.Unlock()
 			return st, now, nil
 		}
@@ -236,9 +282,79 @@ func (ch *Checker) stateWithin(ctx context.Context, ns string, ttl time.Duration
 	}
 	st.checkedAt = now
 	ch.mu.Lock()
-	ch.states[ns] = st
+	if !ch.overtaken(st.chain, start) {
+		// Not one an Observe since it began overtook: that one holds
+		// for this call, which began before it, and the next reads again.
+		ch.states[ns] = st
+	}
 	ch.mu.Unlock()
 	return st, now, nil
+}
+
+// forcedRead is a read of a namespace's heads that bypasses the TTL
+// (forcedState), shared by every check waiting for it.
+type forcedRead struct {
+	done    chan struct{} // closed once st and err are set
+	started time.Time     // before its heads were read
+	st      *nsState
+	err     error
+}
+
+// forcedState is stateWithin(ctx, target, 0) for a check begun at begun
+// that found an at the cached heads, read before it began, don't reach
+// (checkAt). Any grant whose key has a requireAt may name such an at, so
+// a read costs the origin a head per chain namespace, and a load and a
+// second log read if one moved: they are read once per namespace at a
+// time, and at least minForced after the read before started, which
+// every check waiting meanwhile shares. A state whose heads were read
+// after the check began, by any read, is used as it is; a read that
+// started before it is not, and the heads are read again (waiting out
+// what is left of minForced), so an at newer than every read is still
+// found. The read itself is not canceled with ctx, since other checks
+// may be waiting for it, but bounded by forcedReadTimeout.
+func (ch *Checker) forcedState(ctx context.Context, target string, begun time.Time) (*nsState, error) {
+	for {
+		ch.mu.Lock()
+		if st := ch.states[target]; st != nil && !st.checkedAt.Before(begun) {
+			ch.mu.Unlock()
+			return st, nil
+		}
+		f := ch.forcing[target]
+		if f == nil {
+			f = &forcedRead{done: make(chan struct{})}
+			ch.forcing[target] = f
+			wait := time.Until(ch.lastForced[target].Add(ch.minForced))
+			go ch.runForced(context.WithoutCancel(ctx), target, f, wait)
+		}
+		ch.mu.Unlock()
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if !f.started.Before(begun) {
+			return f.st, f.err
+		}
+	}
+}
+
+// runForced is forcedRead f of target's heads, after wait.
+func (ch *Checker) runForced(ctx context.Context, target string, f *forcedRead, wait time.Duration) {
+	if wait > 0 {
+		time.Sleep(wait)
+	}
+	ch.mu.Lock()
+	f.started = time.Now()
+	ch.lastForced[target] = f.started
+	ch.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, forcedReadTimeout)
+	st, _, err := ch.stateWithin(ctx, target, 0)
+	cancel()
+	ch.mu.Lock()
+	f.st, f.err = st, err
+	delete(ch.forcing, target)
+	ch.mu.Unlock()
+	close(f.done)
 }
 
 // maxDepth bounds base chains (the deployment's branch depth is 8 by default).
@@ -504,8 +620,11 @@ func (e *ChainError) Unwrap() error { return e.Err }
 // the method callers match (errors.As) to answer 503 or 502.
 func (e *ChainError) ChainUnreadable() (transient bool) { return e.Transient }
 
+// A check canceled meanwhile (its request gone, or ended while it waited
+// for a forced read, forcedState) is transient too, as one past its
+// deadline is: the chain may well read once asked again.
 func chainError(err error) *ChainError {
-	return &ChainError{Transient: client.Transient(err), Err: err}
+	return &ChainError{Transient: client.Transient(err) || errors.Is(err, context.Canceled), Err: err}
 }
 
 // checkAt resolves a key's requireAt (§C.4) against the public API, as the
@@ -516,7 +635,8 @@ func chainError(err error) *ChainError {
 // 60 seconds), or the key's when stricter. An at the cached head doesn't
 // reach (the log answers 404) may be newer than it: the heads are read
 // again at once, bypassing the TTL, before at is refused as not in the
-// chain. A chain it can't read is a *ChainError.
+// chain, one read per namespace at a time, at most one a second
+// (forcedState). A chain it can't read is a *ChainError.
 func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 	return func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 		target := ns
@@ -544,7 +664,7 @@ func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at an
 		entries, err := ch.chainAfter(ctx, target, tst, idText)
 		if notInChain(err) && checked.Before(begun) {
 			// The cached head may be older than at: read it again.
-			if tst, _, err = ch.stateWithin(ctx, target, 0); err != nil {
+			if tst, err = ch.forcedState(ctx, target, begun); err != nil {
 				return chainError(err)
 			}
 			entries, err = ch.chainAfter(ctx, target, tst, idText)
