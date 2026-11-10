@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.26.1
 
 Security release. A review of v0.26.0 found leaks in the tree service and the search index
 (most of them also in v0.25.0), a way for a hostile remote base to stall every remote branch
