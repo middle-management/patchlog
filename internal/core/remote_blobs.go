@@ -257,9 +257,13 @@ type preSealings struct {
 	blobWant    map[ids.ID][32]byte
 }
 
-// rawGet fetches path from the base as served, with the endpoint's grant.
-// A status other than 200 is returned with no error.
-func rawGet(ctx context.Context, ep RemoteEndpoint, baseURL, path string, q url.Values) (int, http.Header, []byte, error) {
+// rawGet fetches path from the base as served, with the endpoint's grant,
+// reading at most limit bytes of a 200 and maxErrBody of any other answer.
+// A status other than 200 is returned with no error. A redirect isn't
+// followed: it is returned as A's answer, which pendingAnswer counts as a
+// refusal, so A can't point B, with its grant, at any address it picks. A
+// body over its bound is errTooLarge, with the status.
+func rawGet(ctx context.Context, ep RemoteEndpoint, baseURL, path string, q url.Values, limit int64) (int, http.Header, []byte, error) {
 	u := baseURL + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()
@@ -271,21 +275,60 @@ func rawGet(ctx context.Context, ep RemoteEndpoint, baseURL, path string, q url.
 	if ep.Bearer != "" {
 		hr.Header.Set("Authorization", "Bearer "+ep.Bearer)
 	}
-	res, err := ep.HTTPClient.Do(hr)
+	nc := *ep.HTTPClient
+	nc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	res, err := nc.Do(hr)
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	defer res.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(res.Body, maxPreSealing))
+	if res.StatusCode != http.StatusOK {
+		limit = maxErrBody
+	}
+	body, err := io.ReadAll(io.LimitReader(res.Body, limit+1))
 	if err != nil {
 		return 0, nil, nil, err
+	}
+	if int64(len(body)) > limit {
+		return res.StatusCode, res.Header, nil, errTooLarge
 	}
 	return res.StatusCode, res.Header, body, nil
 }
 
-// maxPreSealing bounds one fetched answer: a log page or a document's
-// JWE, or a sealed blob, which the deployment's blob size bounds anyway.
-const maxPreSealing = 1 << 30
+// errTooLarge is an answer of the base's longer than B reads (rawGet): a
+// refusal, never stored (pendingAnswer).
+var errTooLarge = errors.New("the answer is longer than this deployment reads for it")
+
+// maxErrBody bounds the body of an answer other than a 200 that B reads:
+// an error, whose code and horizon are all B reads of it.
+const maxErrBody = 64 << 10
+
+// preCaps bound what B reads of the base's answers for its sealings from
+// before its raise (rawGet): a log page, an entry's or a document's JWE,
+// and a sealed blob of size bytes (blob). They follow this deployment's
+// maximums, and the true size of a blob it mirrored: a sealing that can't
+// fit isn't one of content it mirrored, but padding or junk.
+type preCaps struct {
+	page, jwe int64
+}
+
+// preCaps are this deployment's bounds on the base's sealings: a JWE as
+// large as base64 of a padded document, or patch set, of its maximum size
+// (§E.2.2, padmé adds at most 12%) with its header; a log page of its
+// maximum page of such entries.
+func (e *Engine) preCaps() preCaps {
+	m := e.opt.Maximums
+	jwe := 2*int64(max(m.DocumentSize, m.PatchSetSize)) + 64<<10
+	page := 2*int64(m.LogPageBytes) + int64(m.LogPageSize)*(4<<10)
+	return preCaps{page: max(page, jwe), jwe: jwe}
+}
+
+// blob bounds the sealed form of a blob of size bytes: the plaintext with
+// its length, padded (at most an eighth more), the header (64 KiB at most,
+// seal.ParseBlobHeader) and the IV and tag.
+func (preCaps) blob(size int64) int64 {
+	return size + size/8 + 128<<10
+}
 
 // fetchPreSealings fetches the base's sealings of ch's entries from before
 // its raise from sealed (ch.plain, those served with a kid) from resource
@@ -299,7 +342,11 @@ const maxPreSealing = 1 << 30
 // or doesn't open, is unverified (502). Any other answer than a 200,
 // transient failures included, leaves that sealing pending (ps.pending,
 // ps.blobAnswers), for B to fetch again at each sync.
-func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name string, ch *remoteChain, keys map[string]map[int][]byte) *Error {
+//
+// What A answers is bounded (caps, rawGet), and a 410 pruned is taken only
+// with a horizon that is a revision of ch at or after the sealing's own
+// (prunedIn); any other is a refusal, which isn't final.
+func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name string, ch *remoteChain, keys map[string]map[int][]byte, caps preCaps) *Error {
 	last := -1
 	for i := 0; i < ch.plain; i++ {
 		if ch.entries[i].Kid != "" {
@@ -339,12 +386,31 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 	// stay pending with A's answer, pruned only where A answers an entry's
 	// own range so (fetchPreEntries).
 	var entries []preEntry
+	chain := make([]string, last+1)
+	pos := make(map[string]int, len(ch.entries))
+	for i, e := range ch.entries {
+		pos[e.ID] = i
+		if i <= last {
+			chain[i] = e.ID
+		}
+	}
 	for i := 0; i <= last; i++ {
 		if ch.entries[i].Kid != "" {
 			entries = append(entries, preEntry{id: ch.entries[i].ID, parent: ch.entries[i].Parent, parentKnown: true})
 		}
 	}
-	got, answers := fetchPreEntries(ctx, ep, baseURL, what, ch.entries[last].ID, entries)
+	// A's 410 pruned for the sealing of entry i, or of a blob first
+	// referenced there, names a horizon of the chain at or after it, or is
+	// a refusal.
+	prunedIn := func(ans, hz string, i int) (string, string) {
+		if ans == pendPruned {
+			if j, ok := pos[hz]; !ok || j < i {
+				return pendRefused, ""
+			}
+		}
+		return ans, hz
+	}
+	got, answers := fetchPreEntries(ctx, ep, baseURL, what, chain, entries, caps)
 	for _, a := range answers {
 		if a[0] == pendUnverified {
 			return unverified("%s: a log page that isn't an array", what+"/rev/"+ch.entries[last].ID+"/log")
@@ -360,6 +426,7 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 		return unverified("%s: %v", what, err)
 	}
 	blobEpochs := map[ids.ID]map[int]bool{}
+	firstRef := map[ids.ID]int{} // the first entry referencing each blob
 	for i := 0; i <= last; i++ {
 		e := ch.entries[i]
 		kr := krs[i]
@@ -378,27 +445,33 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			}
 			ps.entries[e.ID] = jwe
 		} else {
+			ans, hz := prunedIn(answers[e.ID][0], answers[e.ID][1], i)
 			ps.pending[e.ID] = append(ps.pending[e.ID], pendingSealing{kind: sealEntry, ref: e.ID, epoch: epoch, kid: e.Kid, pl: pl, want: want,
-				answer: answers[e.ID][0], horizon: answers[e.ID][1]})
+				answer: ans, horizon: hz})
 		}
 		if e.Kind != "rev" {
 			continue
 		}
 		pl, want = seal.ResourcePL(kns, name, e.ID, seal.KindDoc), contentDigest(docs[i])
-		st, _, body, err := rawGet(ctx, ep, baseURL, what+"/rev/"+e.ID, nil)
+		st, _, body, err := rawGet(ctx, ep, baseURL, what+"/rev/"+e.ID, nil, caps.jwe)
 		if err == nil && st == 200 {
-			if !openPreSealing(string(body), kr, e.Kid, pl, want) {
+			// Stored as A serves it, without whitespace around it, which
+			// openPreSealing ignores and B would serve at any length.
+			jwe := trimJWE(body)
+			if !openPreSealing(jwe, kr, e.Kid, pl, want) {
 				return unverified("%s: its sealing of the document of %s doesn't open to the document its log gives", what, e.ID)
 			}
-			ps.docs[e.ID] = string(body)
+			ps.docs[e.ID] = jwe
 		} else {
 			ans, hz := pendingAnswer(st, body, err)
+			ans, hz = prunedIn(ans, hz, i)
 			ps.pending[e.ID] = append(ps.pending[e.ID], pendingSealing{kind: sealDoc, ref: e.ID, epoch: epoch, kid: e.Kid, pl: pl, want: want,
 				answer: ans, horizon: hz})
 		}
 		for _, r := range blobRefsOf(docs[i]) {
 			if blobEpochs[r.bid] == nil {
 				blobEpochs[r.bid] = map[int]bool{}
+				firstRef[r.bid] = i
 			}
 			blobEpochs[r.bid][epoch] = true
 		}
@@ -422,9 +495,10 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 		}
 		for epoch := range eps {
 			p := what + "/blob/" + bid.String() + "/e/" + strconv.Itoa(epoch)
-			st, _, body, err := rawGet(ctx, ep, baseURL, p, nil)
+			st, _, body, err := rawGet(ctx, ep, baseURL, p, nil, caps.blob(int64(len(b.data))))
 			if err != nil || st != 200 {
 				ans, hz := pendingAnswer(st, body, err)
+				ans, hz = prunedIn(ans, hz, firstRef[bid])
 				if ps.blobAnswers[bid] == nil {
 					ps.blobAnswers[bid] = map[int][2]string{}
 				}

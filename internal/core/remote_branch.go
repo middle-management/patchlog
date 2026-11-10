@@ -1233,7 +1233,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 		// And the source's sealings from before its raise, verbatim
 		// (§G.5.2 E3 sources).
 		if ch.opaque && raised {
-			if ferr := fetchPreSealings(ctx, ep, c.BaseURL(), lv.ns, name, ch, preKeys); ferr != nil {
+			if ferr := fetchPreSealings(ctx, ep, c.BaseURL(), lv.ns, name, ch, preKeys, e.preCaps()); ferr != nil {
 				return nil, ferr
 			}
 		}
