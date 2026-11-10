@@ -293,6 +293,25 @@ func (s *Service) Authenticate(ctx context.Context, r *http.Request) (*grant.Ver
 	return s.verify(ctx, tree.Bearer(r))
 }
 
+// authenticateRead is Authenticate for the catalog's API that reads (POST
+// /grants, POST /read-grants): what they hand out are read decisions,
+// visibility as listings judge it (§B.11.5) and the roles at an item
+// (§B.11.4 Resolve), and read grants and keys, so a grant whose key-scope
+// or block rules refer to /now (or the whole envelope), or whose roles
+// that list read all have such a rule, none counting, is refused every
+// one: 403, as the tree service refuses it its listings, whatever the
+// catalog's read mode (§C.2 item 5, grantcheck.RefusedByNow). It is part
+// of the read check, so it comes before ?min's wait and the body's 400s,
+// and is decided at no checkpoint. A grant that allows no read at all is
+// not this case: its verbs don't matter here.
+func (s *Service) authenticateRead(ctx context.Context, r *http.Request) (*grant.Verified, error) {
+	v, err := s.Authenticate(ctx, r)
+	if err == nil && grantcheck.RefusedByNow(v) {
+		return nil, &grant.AuthError{Status: 403, Msg: "the grant's rules refer to /now, which no read passes (§C.2 item 5)"}
+	}
+	return v, err
+}
+
 // verify verifies tok for the catalog namespace, failing as verifyHook
 // says where one is set (tests).
 func (s *Service) verify(ctx context.Context, tok string) (*grant.Verified, error) {
@@ -306,7 +325,7 @@ func (s *Service) verify(ctx context.Context, tok string) (*grant.Verified, erro
 
 func (s *Service) serveGrants(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	v, err := s.Authenticate(r.Context(), r)
+	v, err := s.authenticateRead(r.Context(), r)
 	if err != nil {
 		tree.WriteAuthError(w, err, logf(s))
 		return
@@ -403,7 +422,7 @@ const readGrantRetries = 3
 func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	ctx := r.Context()
-	v, err := s.Authenticate(ctx, r)
+	v, err := s.authenticateRead(ctx, r)
 	if err != nil {
 		tree.WriteAuthError(w, err, logf(s))
 		return

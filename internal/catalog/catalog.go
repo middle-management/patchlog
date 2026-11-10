@@ -48,7 +48,11 @@
 // revocations and scopes as of the catalog's head). Its root sub and groups
 // are the caller's identity (§B.11.6: groups come from the caller's grant,
 // the identity provider's; there is no groups namespace). The grant's verbs
-// don't matter for the catalog's API: it is only proof of identity.
+// don't matter for the catalog's API: it is only proof of identity. But
+// POST /grants and POST /read-grants hand out read decisions and read
+// grants, so a grant whose rules refer to /now, which no read passes, is
+// refused there (403), as the tree service refuses it its listings (§C.2
+// item 5, authenticateRead); POST /merge-grants issues write grants only.
 //
 // Decisions (POST /grants, POST /read-grants, POST /merge-grants) are
 // taken at one checkpoint, which answers carry beside the grant, and a
