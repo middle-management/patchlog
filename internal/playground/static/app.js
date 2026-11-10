@@ -812,8 +812,15 @@ async function loadHistory() {
   const st = S.resState;
   if (!st || !st.head) { S.hist = []; renderHistory(); return; }
   const { ns, res } = S;
-  const r = await api('GET', rpath(`/rev/${st.head}/log`), { auto: true });
+  let r = await api('GET', rpath(`/rev/${st.head}/log`), { auto: true });
   if (ns !== S.ns || res !== S.res) return;
+  // Below a pruning horizon the range from genesis is 410 pruned (§7.1): read it from the horizon, or at E3 from
+  // where the head's fold started, which at a tombstone horizon is last, its parent, whose snapshot /rev serves.
+  if (r.status === 410 && r.json && r.json.code === 'pruned' && ID_RE.test(r.json.horizon || '')) {
+    const since = (st.fold && st.fold.since) || r.json.horizon;
+    r = await api('GET', rpath(`/rev/${st.head}/log?since=${since}`), { auto: true });
+    if (ns !== S.ns || res !== S.res) return;
+  }
   // Every page of the range (§7.1 Paging).
   const L = r.status === 200 && Array.isArray(r.json) ? await readLogRange(r, { auto: true }) : { arr: [], since: '', err: '' };
   if (ns !== S.ns || res !== S.res) return;

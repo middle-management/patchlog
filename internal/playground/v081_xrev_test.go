@@ -50,6 +50,9 @@ async function api(method, path, o) {
     jose: /^application\/jose\b/i.test(res.headers.get('Content-Type') || ''), hdr: (k) => res.headers.get(k), etag: () => '' };
 }
 const b64 = (u) => Z.b64u(u);
+const S = { ns: '', res: '', hist: [], histNote: '', histErr: null };
+function rpath(suffix = '') { return '/r/' + S.ns + '/' + S.res + suffix; }
+function renderHistory() {}
 FUNCTIONS
 (async () => {
   const out = {};
@@ -77,6 +80,13 @@ FUNCTIONS
       paths = [];
       const d = await readDoc(c.ns, c.name, c.id, await api('GET', c.path));
       out[c.key] = { doc: d.doc, err: d.foldErr || '', since: d.fold ? d.fold.since : '', flagged: d.fold ? d.fold.flagged.length : 0, snapshot: !!d.seal, paths };
+      if (c.history) {
+        // The History tab: app.js's loadHistory for the resource read at its head.
+        S.ns = c.ns; S.res = c.name; S.nsLevel = 'e2e'; S.resState = Object.assign({ kind: 'live', head: c.id }, d);
+        await loadHistory();
+        out[c.key].hist = S.hist.map((e) => e.kind + ':' + e.id + (e._flag ? ':flagged' : ''));
+        out[c.key].histNote = S.histNote; out[c.key].histErr = S.histErr ? S.histErr.status : 0;
+      }
     }
   }
   process.stdout.write(JSON.stringify(out));
@@ -93,7 +103,7 @@ func runXrevHarness(t *testing.T, node string, input map[string]any, out any) {
 	}
 	var fns []string
 	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "revTarget", "notOffered", "readDoc", "nsChainOK",
-		"epochKey", "contentKey", "openSealed", "decrypted", "openSnapshot", "foldLog", "nsDocPL", "nsHeadDoc", "openSealedEntries"} {
+		"epochKey", "contentKey", "openSealed", "decrypted", "openSnapshot", "foldLog", "nsDocPL", "nsHeadDoc", "openSealedEntries", "loadHistory", "openEntries"} {
 		fns = append(fns, jsFunction(t, js, f))
 	}
 	dir := t.TempDir()
@@ -256,9 +266,10 @@ func TestV081XrevViewsWithNode(t *testing.T) {
 // playground reads a head through its redirect to /rev/{head}, 404
 // not_offered, and folds it from genesis; at a tombstone horizon a later
 // revision folds from last, the tombstone's parent, whose snapshot
-// /rev/{last} serves; a patch set sealed under K_e, which seals nothing, is
-// flagged and folded as []; and a 200 in the clear is refused, never shown
-// as the document.
+// /rev/{last} serves, and so does the History tab, whose range from
+// genesis is 410 pruned; a patch set sealed under K_e, which seals nothing,
+// is flagged and folded as []; and a 200 in the clear is refused, never
+// shown as the document.
 func TestV081XrevE3ReadsWithNode(t *testing.T) {
 	t.Parallel()
 	node := needNode(t)
@@ -328,16 +339,17 @@ func TestV081XrevE3ReadsWithNode(t *testing.T) {
 
 	type read struct {
 		Key, NS, Name, ID, Path string
+		History                 bool
 	}
 	reads := []read{
-		{"head", "e", "g", g2.ID, "/r/e/g"},
-		{"later", "e", "d", l2.ID, "/r/e/d/rev/" + l2.ID},
-		{"last", "e", "d", p.ID, "/r/e/d/rev/" + p.ID},
-		{"clear", "e", "clear", clearID, clearPath},
+		{"head", "e", "g", g2.ID, "/r/e/g", true},
+		{"later", "e", "d", l2.ID, "/r/e/d/rev/" + l2.ID, true},
+		{"last", "e", "d", p.ID, "/r/e/d/rev/" + p.ID, false},
+		{"clear", "e", "clear", clearID, clearPath, false},
 	}
-	in := []map[string]string{}
+	in := []map[string]any{}
 	for _, r := range reads {
-		in = append(in, map[string]string{"key": r.Key, "ns": r.NS, "name": r.Name, "id": r.ID, "path": r.Path})
+		in = append(in, map[string]any{"key": r.Key, "ns": r.NS, "name": r.Name, "id": r.ID, "path": r.Path, "history": r.History})
 	}
 	var out map[string]struct {
 		Doc      map[string]any
@@ -346,6 +358,9 @@ func TestV081XrevE3ReadsWithNode(t *testing.T) {
 		Flagged  int
 		Snapshot bool
 		Paths    []string
+		Hist     []string
+		HistNote string
+		HistErr  int
 	}
 	runXrevHarness(t, node, map[string]any{"mode": "reads", "base": s.URL, "bearer": bearer, "reads": in,
 		"keys": map[string]string{kid: b64u.EncodeToString(ke)}}, &out)
@@ -354,6 +369,22 @@ func TestV081XrevE3ReadsWithNode(t *testing.T) {
 	}
 	if o := out["later"]; o.Err != "" || o.Since != p.ID || o.Doc["n"] != float64(2) {
 		t.Errorf("after a tombstone horizon: %+v, want n 2 folded from last %s", o, p.ID)
+	}
+	wantHist := func(what string, got []string, want ...string) {
+		t.Helper()
+		if strings.Join(got, " ") != strings.Join(want, " ") {
+			t.Errorf("%s history: %v, want %v", what, got, want)
+		}
+	}
+	if o := out["head"]; o.HistErr != 0 || strings.Contains(o.HistNote, "Could not fold") {
+		t.Errorf("head history: %+v", o)
+	} else {
+		wantHist("head", o.Hist, "rev:"+g0.ID, "rev:"+g1.ID, "rev:"+g2.ID+":flagged")
+	}
+	if o := out["later"]; o.HistErr != 0 || strings.Contains(o.HistNote, "Could not fold") {
+		t.Errorf("history across a tombstone horizon: %+v", o)
+	} else {
+		wantHist("tombstone horizon", o.Hist, "snapshot:"+p.ID, "tombstone:"+tomb.ID, "rev:"+l.ID, "rev:"+l2.ID)
 	}
 	if o := out["last"]; o.Err != "" || !o.Snapshot || o.Doc["n"] != float64(1) || len(o.Paths) != 1 {
 		t.Errorf("at the tombstone's parent: %+v, want its snapshot", o)
