@@ -426,7 +426,7 @@ func Open(opt Options) (*Engine, error) {
 	}
 	// Before migrating: a database holding namespaces raised to e2e
 	// under an earlier version is refused, or with PurgeRaisedE2E they are
-	// listed for purging once migrated (legacy_e2e.go).
+	// recorded for purging once migrated (legacy_e2e.go).
 	var legacy *legacyE2E
 	db, pg, err := openDB(opt.Path, opt.migrations, func(db *sql.DB, pg bool) error {
 		l, err := checkLegacyE2E(db, pg)
@@ -437,6 +437,11 @@ func Open(opt Options) (*Engine, error) {
 			return errLegacyE2E(l)
 		}
 		legacy = l
+		// Durable before 016 drops the marker tables: a start failing
+		// before the purges leaves the record, and the next refuses.
+		if err := recordLegacyE2E(db, pg, l); err != nil {
+			return fmt.Errorf("recording namespaces raised to e2e for purging: %w", err)
+		}
 		return nil
 	})
 	if err != nil {

@@ -24,13 +24,20 @@ import (
 // tools, has a key holder import them into new e2e namespaces under new
 // names (§G.5.1) and purges them, or starts with Options.PurgeRaisedE2E,
 // which purges them at Open, destroying their epoch keys (§8.5), so they
-// answer 410 purged.
+// answer 410 purged. That start first records them in legacy_e2e_pending,
+// committed before 016 drops the marker tables, and the purges delete the
+// record with them: a start that fails or dies in between leaves it, and
+// Open then refuses again until a start with the flag purges them
+// (stored.md item 1: fail closed).
 
 // legacyE2E is what checkLegacyE2E found: the raised namespaces, and the
 // remote branches whose shadows were raised or hold pending pre-raise
 // sealings, by name.
 type legacyE2E struct {
 	raised, remote []string
+	// pendingOnly: found in legacy_e2e_pending alone, the marker tables
+	// gone (a -purge-raised-e2e start that didn't finish).
+	pendingOnly bool
 }
 
 func (l *legacyE2E) empty() bool { return l == nil || len(l.raised)+len(l.remote) == 0 }
@@ -49,6 +56,10 @@ func (l *legacyE2E) names() string {
 
 // errLegacyE2E is Open's refusal of a database that holds them.
 func errLegacyE2E(l *legacyE2E) error {
+	if l.pendingOnly {
+		return fmt.Errorf("core: a start with -purge-raised-e2e migrated this database but didn't finish purging what was stored before a raise to e2e, which this version would serve weaker than it was stored (Addendum E Levels; v0.78): %s. "+
+			"Start again with -purge-raised-e2e, which purges them and their local branches, destroying their keys: they then answer 410 purged", l.names())
+	}
 	return fmt.Errorf("core: this database holds content stored before a raise to e2e, which a namespace can no longer have (Addendum E Levels; v0.78) and this version would serve weaker than it was stored: %s. "+
 		"Before upgrading, export each with the v0.26.1 tools, have a key holder import it into a new e2e namespace under a new name (§G.5.1), then purge it, "+
 		"its local branches first; a remote branch is purged and created again against a source that is e2e from its creation. "+
@@ -69,11 +80,16 @@ func tableExists(db *sql.DB, pg bool, name string) (bool, error) {
 	return n > 0, err
 }
 
+// legacyPendingTable records, from a start with -purge-raised-e2e, what
+// it is to purge (recordLegacyE2E): kind 'raised' or 'remote' and the
+// name, kept until the purges commit (purgeRaisedE2E).
+const legacyPendingTable = "legacy_e2e_pending"
+
 // checkLegacyE2E finds the raised namespaces and the remote branches of
 // raised sources in db, before it is migrated: every unpurged namespace or
-// shadow with an e2e_raises row, and every shadow with a
-// remote_pending_sealings row. A shadow ("~{branch}" or "~{branch}~{i}")
-// names its remote branch.
+// shadow with an e2e_raises row, every shadow with a
+// remote_pending_sealings row, and every one legacy_e2e_pending records.
+// A shadow ("~{branch}" or "~{branch}~{i}") names its remote branch.
 func checkLegacyE2E(db *sql.DB, pg bool) (*legacyE2E, error) {
 	l := &legacyE2E{}
 	remote := map[string]bool{}
@@ -85,9 +101,13 @@ func checkLegacyE2E(db *sql.DB, pg bool) (*legacyE2E, error) {
 		}
 		l.raised = append(l.raised, name)
 	}
+	markers, pending := false, false
 	for _, q := range []struct{ table, query string }{
 		{"e2e_raises", `SELECT n.name FROM e2e_raises r JOIN namespaces n ON n.ns = r.ns WHERE n.purged = 0 ORDER BY n.name`},
 		{"remote_pending_sealings", `SELECT DISTINCT n.name FROM remote_pending_sealings p JOIN namespaces n ON n.ns = p.shadow ORDER BY n.name`},
+		// Recorded by a start with the flag: a remote branch as "~{name}",
+		// which add reads as its shadow's.
+		{legacyPendingTable, `SELECT CASE WHEN kind = 'remote' THEN '~' || name ELSE name END FROM ` + legacyPendingTable + ` ORDER BY kind, name`},
 	} {
 		ok, err := tableExists(db, pg, q.table)
 		if err != nil {
@@ -95,6 +115,11 @@ func checkLegacyE2E(db *sql.DB, pg bool) (*legacyE2E, error) {
 		}
 		if !ok {
 			continue
+		}
+		if q.table == legacyPendingTable {
+			pending = true
+		} else {
+			markers = true
 		}
 		rows, err := db.Query(q.query)
 		if err != nil {
@@ -118,7 +143,40 @@ func checkLegacyE2E(db *sql.DB, pg bool) (*legacyE2E, error) {
 	}
 	sort.Strings(l.remote)
 	l.raised = dedupSorted(l.raised)
+	l.pendingOnly = pending && !markers && !l.empty()
 	return l, nil
+}
+
+// recordLegacyE2E records l in legacy_e2e_pending and commits, before
+// migration 016 drops the marker tables, so that what a start with
+// -purge-raised-e2e is to purge stays marked until purgeRaisedE2E does.
+func recordLegacyE2E(db *sql.DB, pg bool, l *legacyE2E) error {
+	if l.empty() {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS ` + legacyPendingTable + ` (kind TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY (kind, name))`); err != nil {
+		return err
+	}
+	ins := `INSERT INTO ` + legacyPendingTable + ` (kind, name) VALUES (?, ?) ON CONFLICT DO NOTHING`
+	if pg {
+		ins = `INSERT INTO ` + legacyPendingTable + ` (kind, name) VALUES ($1, $2) ON CONFLICT DO NOTHING`
+	}
+	for _, kn := range []struct {
+		kind  string
+		names []string
+	}{{"raised", l.raised}, {"remote", l.remote}} {
+		for _, name := range kn.names {
+			if _, err := tx.Exec(ins, kn.kind, name); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 func dedupSorted(s []string) []string {
@@ -143,6 +201,9 @@ func (e *Engine) purgeRaisedE2E(ctx context.Context, l *legacyE2E) error {
 		return nil
 	}
 	return e.update(ctx, func(t *tx) error {
+		// The record of what to purge goes with the purges (recordLegacyE2E).
+		_, err := t.Exec(`DROP TABLE IF EXISTS ` + legacyPendingTable)
+		t.must(err)
 		author := t.authorID(UpgradeAuthor)
 		var order []*nsRow
 		seen := map[int64]bool{}

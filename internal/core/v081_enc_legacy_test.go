@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/pgtest"
+	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
@@ -226,6 +228,149 @@ func TestV081OpenRefusesRaisedE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.Close()
+}
+
+// E2E-2 (Addendum E Levels Invariant; stored.md item 1): a start with
+// PurgeRaisedE2E that migrates and then fails before purging (here a
+// regular file as blob directory; a key store or store codec check, or a
+// crash, fail there alike) leaves what it was to purge recorded
+// (legacy_e2e_pending), though 016 dropped the marker tables. The next
+// start without the flag refuses, naming m, and never serves what m
+// stored while sealed in the clear; one with the flag purges m and its
+// branch and the record with them, and then the flag is needed no more.
+func TestV081PurgeRaisedFailsClosedAcrossFailedStart(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	l := newV081Legacy(t)
+	e := l.open15(t)
+	mkNS(t, e, "m", map[string]any{})
+	cfg := func(enc map[string]any) {
+		h, err := e.NamespaceHead(ctx, "m", Credentials{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.WriteConfig(ctx, p29Req("m"), ConfigChange{IfMatch: h.Config, Patches: []any{p29Add("/encryption", enc)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg(map[string]any{"level": "sealed"})
+	// Written while m is sealed: served only as a JWE then.
+	w, err := e.WriteResource(ctx, p29Req("m"), Item{Resource: "x", IfNoneMatch: true, Steps: []Step{{Patches: []any{
+		p29Add("", map[string]any{"secret": "written-while-sealed"}), p29Add("/$nonce", seal.NewNonce())}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := w.Items[0].IDs[0]
+	cfg(map[string]any{"level": "e2e", "epoch": 2.0})
+	if err := e.update(ctx, func(t *tx) error {
+		n := t.nsByName("m")
+		_, err := t.Exec(`INSERT INTO e2e_raises (ns, config_seq, level, epoch, pad, created) VALUES (?,?,2,1,0,0)`, n.id, n.configSeq)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateBranch(ctx, p29Req("m"), BranchRequest{Name: "mb", IfNoneMatch: true}); err != nil {
+		t.Fatal(err)
+	}
+	l.close15(t, e)
+
+	bad := l.opts()
+	bad.PurgeRaisedE2E = true
+	bad.BlobDir = filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(bad.BlobDir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(bad); err == nil || !strings.Contains(err.Error(), "blob directory") {
+		t.Fatalf("Open with a regular file as blob directory: %v", err)
+	}
+	if raises, pending := l.tables(t); raises || pending {
+		t.Fatalf("the failed start didn't migrate: e2e_raises %v, remote_pending_sealings %v", raises, pending)
+	}
+	// Refused, twice (a refusal changes nothing), naming m and the flag.
+	for range 2 {
+		e, err := Open(l.opts())
+		if err == nil {
+			lg, lerr := e.ResourceLog(ctx, "m", "x", id, "", 0, Credentials{Author: "a"})
+			e.Close()
+			t.Fatalf("Open after a failed -purge-raised-e2e start succeeded without the flag; m's log: %v %v", lg, lerr)
+		}
+		if !strings.Contains(err.Error(), "namespace m") || !strings.Contains(err.Error(), "-purge-raised-e2e") || !strings.Contains(err.Error(), "didn't finish") {
+			t.Fatalf("Open after a failed start: %v", err)
+		}
+	}
+	o := l.opts()
+	o.PurgeRaisedE2E = true
+	e, err = Open(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ns := range []string{"m", "mb"} {
+		var ae *Error
+		if _, err := e.ResourceLog(ctx, ns, "x", id, "", 0, Credentials{Author: "a"}); !errors.As(err, &ae) || ae.Status != 410 {
+			t.Fatalf("%s after -purge-raised-e2e: %v, want 410", ns, err)
+		}
+	}
+	if n := v081Count(t, e, `SELECT COUNT(*) FROM epoch_keys WHERE ns IN (SELECT ns FROM namespaces WHERE name = 'm')`); n != 0 {
+		t.Fatalf("m's epoch keys: %d rows left", n)
+	}
+	e.Close()
+	if l.pendingTable(t) {
+		t.Fatal("legacy_e2e_pending outlived the purges")
+	}
+	e, err = Open(l.opts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.Close()
+}
+
+// pendingTable reports whether legacy_e2e_pending exists at l.path.
+func (l *v081Legacy) pendingTable(t *testing.T) bool {
+	t.Helper()
+	driver, dsn, pg := "sqlite", sqlitedsn.DSN(l.path, "_pragma=busy_timeout(10000)"), false
+	if pgtest.Enabled() {
+		driver, dsn, pg = "pgx", pgtest.DSN(l.path), true
+	}
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ok, err := tableExists(db, pg, legacyPendingTable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ok
+}
+
+// E2E-2: what recordLegacyE2E records, a remote branch included, is what
+// checkLegacyE2E finds once the marker tables are gone, and recording it
+// again changes nothing.
+func TestV081LegacyPendingRoundTrip(t *testing.T) {
+	t.Parallel()
+	path, pg := pgtest.FreshDB(t), pgtest.Enabled()
+	driver, dsn := "pgx", pgtest.DSN(path)
+	if !pg {
+		driver, dsn = "sqlite", sqlitedsn.DSN(filepath.Join(t.TempDir(), "p.db"), "_pragma=busy_timeout(10000)")
+	}
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	want := &legacyE2E{raised: []string{"m", "n"}, remote: []string{"rb"}}
+	for range 2 {
+		if err := recordLegacyE2E(db, pg, want); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := checkLegacyE2E(db, pg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.names() != want.names() || !got.pendingOnly {
+		t.Fatalf("found %q (pending only %v), want %q", got.names(), got.pendingOnly, want.names())
+	}
 }
 
 // E2E-11: migrating a database whose only raised namespace was purged
