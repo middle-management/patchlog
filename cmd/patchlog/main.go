@@ -184,6 +184,7 @@ func serve(args []string) {
 	masterKeyCreate := fs.Bool("master-key-create", false, "create the -master-key file with a new random key if it doesn't exist")
 	rotateEpochs := fs.Duration("rotate-epochs", 0, "rotate every sealed namespace's epoch once it is this old, e.g. 24h (Addendum E.2; 0 disables)")
 	rotateOnRevoke := fs.Bool("rotate-on-revoke", false, "rotate a sealed namespace's epoch right after a config write that revokes a grant or removes or changes a key (§E.2.4)")
+	purgeRaised := fs.Bool("purge-raised-e2e", false, "purge at start, destroying their keys, the namespaces an earlier version raised to e2e by a config write and the remote branches of sources raised so, which this version refuses to start with (Addendum E Levels; export them with the v0.26.1 tools first)")
 	groupCommit := fs.Int("group-commit", 32, "Postgres: at most this many concurrent resource writes and batches of one namespace committed in one transaction (group commit, D.8); 1 or less commits every write on its own")
 	groupWait := fs.Duration("group-commit-wait", 200*time.Microsecond, "Postgres: at most how long a group waits for writes of its namespace still being checked (0: no wait)")
 	localRate := fs.Bool("local-rate-buckets", false, "Postgres: keep the rate-limit buckets (§6.6) in this instance's memory rather than in the database, saving a round trip per write; only for a deployment of one instance, since instances sharing a database must share their buckets")
@@ -353,7 +354,7 @@ func serve(args []string) {
 	}
 	opt := core.Options{Path: *db, BlobDir: *blobDir, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys, OperatorKeyHistory: history, JWKSURI: *jwksURI,
 		Limits: limits, Maximums: max, GrantCacheEntries: *grantCache, DocCacheBytes: cacheBytes[0], ReadCacheBytes: cacheBytes[1], Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks,
-		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke, GroupCommit: *groupCommit, GroupCommitWait: *groupWait, LocalRateBuckets: *localRate, StoreCompression: *storeCompression}
+		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke, PurgeRaisedE2E: *purgeRaised, GroupCommit: *groupCommit, GroupCommitWait: *groupWait, LocalRateBuckets: *localRate, StoreCompression: *storeCompression}
 	if opt.GroupCommit < 1 {
 		opt.GroupCommit = 1 // off
 	}

@@ -1076,8 +1076,8 @@ func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]m
 }
 
 // Branches is the answer of GET /ns/{ns}/branches (§7.4): Public its cache
-// visibility, and Private set where it was filtered for a partial reader
-// (§B.11.9 Answers), which no cache may keep (private, no-store).
+// visibility. Private is never set since v0.78: a partial reader's
+// /branches is 403 (§B.11.9 Answers); it stays for callers of v0.77.
 type Branches struct {
 	List    []map[string]any
 	Public  bool
@@ -1085,9 +1085,9 @@ type Branches struct {
 }
 
 // BranchList is Branches with the answer's caching. A partial reader of a
-// namespace §B.11.9 covers, by the grant in Authorization, gets only the
-// local branches in which that grant verifies and allows read, and no
-// remote registrations (§B.11.9 Answers), Private.
+// namespace §B.11.9 covers is refused, 403 as for any reader without an
+// unrestricted read, before a purged namespace's 410: filtered reads
+// cover no branch (§B.11.9 Answers; v0.78).
 func (e *Engine) BranchList(ctx context.Context, ns string, cred Credentials) (*Branches, error) {
 	var out *Branches
 	err := e.read(ctx, func(t *tx) error {
@@ -1095,19 +1095,19 @@ func (e *Engine) BranchList(ctx context.Context, ns string, cred Credentials) (*
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		a, kind, _, err := t.nsAccess(n, cred)
+		_, kind, _, err := t.nsAccess(n, cred)
 		if err != nil {
 			return err
+		}
+		if kind == accessPartial {
+			return forbidden("a partial reader's grant doesn't read the branches of " + ns + ": filtered reads cover no branch (§B.11.9)")
 		}
 		if n.purged {
 			return t.purgedRead(n)
 		}
-		out = &Branches{List: []map[string]any{}, Public: t.cachePublic(n), Private: kind == accessPartial}
+		out = &Branches{List: []map[string]any{}, Public: t.cachePublic(n)}
 		for _, b := range t.branchesOf(n) {
 			cfg := t.config(b.configSeq)
-			if out.Private && !t.branchReadable(a, b, cfg) {
-				continue
-			}
 			m := map[string]any{"name": b.name, "at": t.nsLogID(b.baseAt.Int64).String(), "frozen": cfg.Frozen, "purged": b.purged}
 			if cfg.Successor != "" {
 				m["successor"] = cfg.Successor
@@ -1117,27 +1117,11 @@ func (e *Engine) BranchList(ctx context.Context, ns string, cred Credentials) (*
 			}
 			out.List = append(out.List, m)
 		}
-		if !out.Private {
-			// Remote branches whose registration hasn't expired (§G.3).
-			out.List = append(out.List, t.liveRegistrations(n)...)
-		}
+		// Remote branches whose registration hasn't expired (§G.3).
+		out.List = append(out.List, t.liveRegistrations(n)...)
 		return nil
 	})
 	return out, err
-}
-
-// branchReadable reports whether partial reader a's grant verifies in
-// branch b, with b's document cfg, and allows read there (§B.11.9 Answers).
-func (t *tx) branchReadable(a *actor, b *nsRow, cfg *Config) bool {
-	if a == nil || a.grant == nil {
-		return false
-	}
-	ba, err := t.verifyGrant(a.grant, b.name, b, cfg, nil)
-	if err != nil || ba == nil || ba.verified == nil {
-		return false
-	}
-	ok, _ := ba.verified.Allows("read")
-	return ok
 }
 
 // Wait returns a channel closed on the next change to a namespace's log.

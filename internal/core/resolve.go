@@ -595,8 +595,9 @@ func (t *tx) horizonID(res int64) string {
 
 // LogEntry is a resource log entry (§7.1).
 type LogEntry struct {
-	ID      string `json:"id"`
-	Parent  string `json:"parent,omitempty"`
+	ID string `json:"id"`
+	// Parent is "" for a genesis, always served (§7.1, v0.81).
+	Parent  string `json:"parent"`
 	Kind    string `json:"kind"`
 	Patches any    `json:"patches,omitempty"`
 	Author  string `json:"author"`
@@ -619,10 +620,11 @@ type LogEntry struct {
 }
 
 func (e LogEntry) value() map[string]any {
-	m := map[string]any{"id": e.ID, "kind": e.Kind, "author": e.Author, "created": e.Created}
-	if e.Parent != "" {
-		m["parent"] = e.Parent
-	}
+	// A genesis's parent is "" (§7.1), in clear pages, events and the
+	// sealed entry alike (§E.2.2). Stored sealings of genesis entries
+	// from before v0.81, without it, are served as stored; readers take
+	// an absent parent as "".
+	m := map[string]any{"id": e.ID, "parent": e.Parent, "kind": e.Kind, "author": e.Author, "created": e.Created}
 	if e.Kind == "rev" && e.Patches != nil {
 		m["patches"] = e.Patches
 	}

@@ -228,12 +228,7 @@ func (s *Server) nsBranches(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if bl.Private {
-		// Filtered for a partial reader by its grant (§B.11.9 Answers).
-		privateNoStore(w)
-	} else {
-		s.cache(w, r, ccHead, bl.Public, "ns:"+ns)
-	}
+	s.cache(w, r, ccHead, bl.Public, "ns:"+ns)
 	writeJSON(w, 200, bl.List)
 }
 
