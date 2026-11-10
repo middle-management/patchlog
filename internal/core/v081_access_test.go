@@ -6,6 +6,8 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
 // V81-02 (v0.78, v0.81): access in the core. A rule referring to /now
@@ -265,6 +267,26 @@ func TestV081AccessBranchCatalogDark(t *testing.T) {
 	lg, _, err := w.e.FilteredLog(ctx, "matches", red.GS, red.At, "", 1000, li)
 	if err != nil || len(lg.Entries) == 0 || !v077ConfigOnly(lg.Entries) {
 		t.Fatalf("li's log through a branch catalog: %+v %v", lg, err)
+	}
+	// An at recorded before v0.78, which lists cat-br as a member, is
+	// answered with cat-br dark too.
+	old := &fcp{ids: map[string]string{}}
+	for k, v := range red.CP.ids {
+		old.ids[k] = v
+	}
+	old.ids["cat-br"] = w.head("cat-br")
+	old.at = grantcheck.CombinedAt(old.ids)
+	if err := w.e.recordFilteredAt(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	w.inTx(func(t2 *tx) {
+		cp, ok := t2.filteredAt(t2.filteredScope(t2.nsByName("matches")), old.at)
+		if !ok || len(cp.cats) != 0 {
+			t.Fatalf("the recorded at: %v %+v", ok, cp)
+		}
+	})
+	if names, st := v76fHeads(t, w, "matches", red.GS, old.at, li); st != 0 || len(names) != 0 {
+		t.Fatalf("li's heads at an at listing cat-br: %v %d", names, st)
 	}
 }
 
