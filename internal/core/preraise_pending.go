@@ -136,6 +136,13 @@ func (t *tx) pendingPruned(sh *nsRow, kind, name, ref string) (string, bool) {
 	return hz.String, true
 }
 
+// deletePendingSealings deletes the pending sealings matching where (a purge's,
+// purgeShadow and purgeShadowNS).
+func (t *tx) deletePendingSealings(where string, args ...any) {
+	_, err := t.Exec(`DELETE FROM remote_pending_sealings WHERE `+where, args...)
+	t.must(err)
+}
+
 // storePreBlob stores data, A's sealing of blob bid of resource name under
 // epoch, under shadow sh, unless one is stored.
 func (t *tx) storePreBlob(sh int64, name string, bid ids.ID, epoch int, data []byte) {

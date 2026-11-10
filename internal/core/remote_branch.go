@@ -2032,9 +2032,16 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, author int64) *Error 
 
 // purgeShadow removes the content of name from a shadow, without an entry
 // (the shadow's chain mirrors the base's). It runs whenever the remote
-// branch purges the name, so the copy never outlives the branch's purge.
+// branch purges the name, so the copy never outlives the branch's purge:
+// the source's sealings of it from before its raise the shadow stores
+// (sealed, blob_epochs) and those it lacks (remote_pending_sealings, with
+// their pl, horizon and digests of the content) go too, whatever is left
+// of the resource.
 func (t *tx) purgeShadow(sh *nsRow, name string) {
 	t.lockNS(sh.id, lockExclusive)
+	t.deleteSealed(`ns = ? AND name = ?`, sh.id, name)
+	t.deleteBlobEpochs(`ns = ? AND name = ?`, sh.id, name)
+	t.deletePendingSealings(`shadow = ? AND name = ?`, sh.id, name)
 	r := t.resource(sh.id, name)
 	if r == nil || r.state == statePurged {
 		return
@@ -2055,12 +2062,14 @@ func (t *tx) purgeShadow(sh *nsRow, name string) {
 // purgeShadowNS removes all of a shadow's content (the remote branch's
 // namespace purge, §8.5), and the epoch keys of its source's epochs from
 // before a raise from sealed it fetched (MF-37): a purge destroys a
-// namespace's epoch keys (§8.5, §E.2.4).
+// namespace's epoch keys (§8.5, §E.2.4). The pending sealings of the
+// source's it lacks go too.
 func (t *tx) purgeShadowNS(sh *nsRow) {
 	t.lockNS(sh.id, lockExclusive)
 	t.deleteDEKs(`ns = ?`, sh.id)
 	t.deleteSealed(`ns = ?`, sh.id)
 	t.deleteBlobEpochs(`ns = ?`, sh.id)
+	t.deletePendingSealings(`shadow = ?`, sh.id)
 	t.deleteEpochKeys(sh.id)
 	q := `res IN (SELECT res FROM resources WHERE ns = ?)`
 	for _, s := range []string{
