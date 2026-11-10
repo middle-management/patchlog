@@ -2447,32 +2447,36 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 }
 
 // originBudget is, for one run of a background job (SyncRemotes,
-// catchUpChainReads), the deadline of each remote origin's bases: one
-// FollowTimeout from its first base's step, shared by all of them.
-type originBudget map[string]time.Time
+// catchUpChainReads), the time each remote origin's bases have left: one
+// FollowTimeout, which each of its bases' steps spends as it runs, and
+// only its own, so another origin's stall costs it nothing.
+type originBudget map[string]time.Duration
 
 // spent reports whether origin's time in this run has run out: its
 // remaining bases are skipped until the next.
 func (b originBudget) spent(origin string) bool {
-	dl, ok := b[origin]
-	return ok && !time.Now().Before(dl)
+	left, ok := b[origin]
+	return ok && left <= 0
 }
 
-// baseStep runs f, one base's step of a background job, under its
-// origin's deadline in budget, set to FollowTimeout from now by the
-// origin's first step: the job's own context has none, nor has
-// production's HTTP client a timeout, and bases are followed one after
-// another, so an origin that doesn't answer, or answers each base just in
-// time, would otherwise hold up every base after it.
+// baseStep runs f, one base's step of a background job, within the time
+// its origin has left in budget (FollowTimeout at its first step), and
+// charges the origin the time it took: the job's own context has no
+// deadline, nor has production's HTTP client a timeout, and bases are
+// followed one after another, so an origin that doesn't answer, or
+// answers each base just in time, would otherwise hold up every base
+// after it.
 func (e *Engine) baseStep(ctx context.Context, budget originBudget, origin string, f func(context.Context) error) error {
-	dl, ok := budget[origin]
+	left, ok := budget[origin]
 	if !ok {
-		dl = time.Now().Add(e.opt.Remote.FollowTimeout)
-		budget[origin] = dl
+		left = e.opt.Remote.FollowTimeout
 	}
-	sctx, cancel := context.WithDeadline(ctx, dl)
+	start := time.Now()
+	sctx, cancel := context.WithTimeout(ctx, left)
 	defer cancel()
-	return f(sctx)
+	err := f(sctx)
+	budget[origin] = left - time.Since(start)
+	return err
 }
 
 // followRemote follows a base's log after the checkpoint. On purge or

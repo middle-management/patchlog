@@ -1560,3 +1560,79 @@ func TestV0261ForgedPastHorizonWhileRegistered(t *testing.T) {
 			"that 410 was final", rb.Code, rb.Body, hz)
 	}
 }
+
+// v0.26.1 final review (C-I1/C-I4, cross-origin): originBudget gives each origin a
+// deadline one FollowTimeout after its FIRST base's step starts, in wall
+// time. Bases are shuffled across origins, so when an honest origin's
+// base comes before a stalling origin's, the stall (one FollowTimeout of
+// the other origin's) is charged to the honest origin too: its bases
+// after the stall are skipped, though it spent almost none of its own
+// time. Here origin A (honest, three branches) and origin C (one branch
+// whose namespace log hangs until B gives up): A's bases are skipped
+// "having run out of time" in about half the syncs. Only the origin's own
+// steps should count against its budget. (Should-fix: no base is starved
+// for good, the order being shuffled at each sync, but another origin's
+// stall delays an honest origin's purges; catchUpChainReads shares
+// originBudget.)
+func TestV0261BudgetChargedForOtherOrigin(t *testing.T) {
+	t.Parallel()
+	const originC = "https://c.example"
+	a := newEnv(t, withOrigin(originA))
+	c := newEnv(t, withOrigin(originC))
+	for _, e := range []*tenv{a, c} {
+		e.mkNS("m", map[string]any{"read": "public"})
+		e.create("m", "x", map[string]any{"v": 1.0}, "alice")
+	}
+	var armed atomic.Bool
+	target, _ := url.Parse(c.srv.URL)
+	rp := httputil.NewSingleHostReverseProxy(target)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if armed.Load() && req.Method == "GET" && req.URL.Path == "/ns/m" {
+			<-req.Context().Done() // until B gives up
+			return
+		}
+		rp.ServeHTTP(w, req)
+	}))
+	t.Cleanup(front.Close)
+	const timeout = time.Second
+	b := newEnv(t, withOrigin(originB), func(o *core.Options) {
+		o.Remote = core.RemoteOptions{FollowInterval: -1, FollowTimeout: timeout, Resolve: func(origin string) (core.RemoteEndpoint, error) {
+			switch origin {
+			case originA:
+				return core.RemoteEndpoint{BaseURL: a.srv.URL, OriginURL: a.srv.URL, HTTPClient: httpClient}, nil
+			case originC:
+				return core.RemoteEndpoint{BaseURL: front.URL, OriginURL: front.URL, HTTPClient: httpClient}, nil
+			}
+			return core.RemoteEndpoint{}, fmt.Errorf("unknown origin %s", origin)
+		}}
+	})
+	for i, origin := range []string{originA, originA, originA, originC} {
+		src := a
+		if origin == originC {
+			src = c
+		}
+		at := src.nsHead("m")
+		g := addRoot(map[string]any{"read": "public", "base": map[string]any{"origin": origin, "ns": "m", "at": at, "chain": []any{"m"}}})
+		expect(t, b.mkRemote(fmt.Sprintf("r%d", i), g), 201)
+	}
+	count := func(syncs int) (skipped int) {
+		for range syncs {
+			err := b.e.SyncRemotes(context.Background())
+			if err != nil && strings.Contains(err.Error(), originA+" having run out of time") {
+				skipped++
+			}
+		}
+		return skipped
+	}
+	// Control: with C answering, no base of A is ever skipped.
+	if n := count(4); n > 0 {
+		t.Fatalf("control: %s's bases skipped in %d of 4 syncs with no stall", originA, n)
+	}
+	armed.Store(true)
+	const syncs = 10
+	skipped := count(syncs)
+	t.Logf("%d of %d syncs skipped bases of the honest origin %s, which answers at once, for %s's stall", skipped, syncs, originA, originC)
+	if skipped > 0 {
+		t.Fatalf("%s's bases were skipped in %d of %d syncs, charged with the FollowTimeout another origin (%s) spent", originA, skipped, syncs, originC)
+	}
+}
