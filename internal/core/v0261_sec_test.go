@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/pgtest"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -456,5 +458,102 @@ func TestV0261Migration015Delete(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// v0.26.1 review, round 3 (b345cfe): verifyHorizonPast appends
+// every entry of every page (each parsed in full, Raw kept) to one slice
+// and verifies the chain only after the last page. A hostile A answers a
+// 410 pruned with a horizon B's chain lacks, then serves maxHorizonPages
+// pages of junk, each up to caps.page (36 MiB by default), each with an
+// X-Log-Next naming its last entry: B holds all of it, parsed, before it
+// finds the very first entry doesn't chain from its head. Here caps.page
+// is 2 MiB; the first page already fails verification.
+func TestV0261HorizonPastBuffersAllPages(t *testing.T) {
+	const pageCap = 2 << 20
+	head := ids.Revision(nil, []byte(`"head"`)).String()
+	hz := ids.Revision(nil, []byte(`"hz"`)).String()
+	// One page: small objects (each parsed into a map), the last naming
+	// the page's X-Log-Next.
+	page := func(n int64) []byte {
+		var b strings.Builder
+		b.WriteString("[")
+		i := 0
+		for b.Len() < pageCap-200 {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"id":"j%d","parent":"x","kind":"rev","patches":[]}`, i)
+			i++
+		}
+		fmt.Fprintf(&b, `,{"id":"p%d","kind":"rev","patches":[]}]`, n)
+		return []byte(b.String())
+	}
+	var pages atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		n := pages.Add(1)
+		w.Header().Set("X-Log-Next", fmt.Sprintf("p%d", n))
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(page(n))
+	}))
+	t.Cleanup(srv.Close)
+	ep := RemoteEndpoint{BaseURL: srv.URL, HTTPClient: srv.Client()}
+
+	runtime.GC()
+	var base runtime.MemStats
+	runtime.ReadMemStats(&base)
+	var peak atomic.Uint64
+	done := make(chan struct{})
+	go func() {
+		var m runtime.MemStats
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(5 * time.Millisecond):
+				runtime.ReadMemStats(&m)
+				if m.HeapAlloc > peak.Load() {
+					peak.Store(m.HeapAlloc)
+				}
+			}
+		}
+	}()
+	ok := verifyHorizonPast(context.Background(), ep, srv.URL, "/r/m/x", head, hz, preCaps{page: pageCap, jwe: pageCap})
+	close(done)
+	grew := int64(peak.Load()) - int64(base.HeapAlloc)
+	t.Logf("verified: %v; pages read: %d of %d bytes; peak heap growth %d MiB", ok, pages.Load(), pageCap, grew>>20)
+	if ok {
+		t.Fatal("junk verified")
+	}
+	if pages.Load() > 1 {
+		t.Fatalf("B read %d pages (%d MiB of heap at peak) of a range whose first entry doesn't chain from its head: "+
+			"with default caps (36 MiB a page) that is up to 16 × 36 MiB held parsed, per horizon A names", pages.Load(), grew>>20)
+	}
+}
+
+// v0.26.1 review, round 3: one verification of a horizon past a mirrored
+// head per resource and head in one fetch (horizonChecks), so a base that
+// names another horizon for each pending sealing is asked once.
+func TestV0261HorizonChecksOncePerHead(t *testing.T) {
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		n.Add(1)
+		w.WriteHeader(404)
+	}))
+	t.Cleanup(srv.Close)
+	ep := RemoteEndpoint{BaseURL: srv.URL, HTTPClient: srv.Client()}
+	caps := preCaps{page: 1 << 20, jwe: 1 << 20}
+	head := ids.Revision(nil, []byte(`"head"`)).String()
+	checks := horizonChecks{}
+	for i := range 10 {
+		hz := ids.Revision(nil, []byte(fmt.Sprintf(`"hz%d"`, i))).String()
+		if checks.verify(context.Background(), ep, srv.URL, "/r/m/x", head, hz, caps) {
+			t.Fatalf("%s verified", hz)
+		}
+	}
+	other := ids.Revision(nil, []byte(`"other"`)).String()
+	checks.verify(context.Background(), ep, srv.URL, "/r/m/y", other, head, caps)
+	if n.Load() != 2 {
+		t.Fatalf("A was asked %d times, want once per resource and head (2)", n.Load())
 	}
 }

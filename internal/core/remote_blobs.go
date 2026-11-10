@@ -414,7 +414,7 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 	// A horizon after the chain's head, which the chain doesn't hold (A
 	// pruned past B's at, §8.6), is taken where A's log verifies it after
 	// the head (verifyHorizonPast).
-	pastOK := map[string]bool{}
+	checks := horizonChecks{}
 	prunedIn := func(ans, hz string, i int) (string, string) {
 		if ans != pendPruned {
 			return ans, hz
@@ -427,12 +427,7 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			}
 			return ans, hz
 		}
-		ok, seen := pastOK[hz]
-		if !seen {
-			ok = verifyHorizonPast(ctx, ep, baseURL, what, ch.entries[len(ch.entries)-1].ID, hz, caps)
-			pastOK[hz] = ok
-		}
-		if !ok {
+		if !checks.verify(ctx, ep, baseURL, what, ch.entries[len(ch.entries)-1].ID, hz, caps) {
 			return pendRefused, ""
 		}
 		return ans, hz

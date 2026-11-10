@@ -432,7 +432,7 @@ func (e *Engine) retryPreSealings(ctx context.Context, ep RemoteEndpoint, baseUR
 	// mirrored chain, whether it is one after B's head that A's log
 	// verifies (§8.6 lets A prune past the at of a remote branch it
 	// doesn't know of, §G.3).
-	pastOK := map[[3]string]bool{}
+	checks := horizonChecks{}
 	past := func(r *pendingRow) {
 		if r.fetchedOK || r.fetchAnswer != pendPruned || r.head == "" {
 			return
@@ -444,13 +444,7 @@ func (e *Engine) retryPreSealings(ctx context.Context, ep RemoteEndpoint, baseUR
 		}); err != nil || in {
 			return
 		}
-		k := [3]string{r.ns + "/" + r.name, r.head, r.fetchHorizon}
-		ok, seen := pastOK[k]
-		if !seen {
-			ok = verifyHorizonPast(ctx, ep, baseURL, "/r/"+r.ns+"/"+r.name, r.head, r.fetchHorizon, caps)
-			pastOK[k] = ok
-		}
-		r.horizonPast = ok
+		r.horizonPast = checks.verify(ctx, ep, baseURL, "/r/"+r.ns+"/"+r.name, r.head, r.fetchHorizon, caps)
 	}
 	settle := func(rs ...*pendingRow) {
 		errs = append(errs, e.update(wctx, func(t *tx) error {
@@ -792,54 +786,85 @@ func fetchSealedLog(ctx context.Context, ep RemoteEndpoint, baseURL, path, from 
 	}
 }
 
-// maxHorizonPages bounds the pages of A's log verifyHorizonPast reads.
-const maxHorizonPages = 16
+// maxHorizonPages and maxHorizonPage bound what of A's log
+// verifyHorizonPast reads: the pages, and each page's length.
+const (
+	maxHorizonPages = 16
+	maxHorizonPage  = 2 << 20
+)
 
 // verifyHorizonPast reports whether hz, a horizon A named in a 410 pruned
 // for content of resource what (/r/{ns}/{name}) that isn't a revision of
 // B's mirrored chain, is one after head, B's mirrored head: whether A
 // serves the range …/rev/{hz}/log?since={head} in the clear, each entry's
 // id recomputed and chained from head to hz (§7.1). It reads at most
-// maxHorizonPages pages, each no longer than caps.page, each moving to
-// its last entry (X-Log-Next). Where the range isn't served so (A pruned
+// maxHorizonPages pages, each no longer than maxHorizonPage (or caps.page
+// if smaller), and verifies each as it comes, keeping only its last id:
+// the first that doesn't chain ends it, and each must move to its last
+// entry (X-Log-Next). Where the range isn't served so (A pruned
 // revisions between head and hz too, or serves them sealed), it isn't
 // verified.
 func verifyHorizonPast(ctx context.Context, ep RemoteEndpoint, baseURL, what, head, hz string, caps preCaps) bool {
 	if _, err := ids.Parse(hz); err != nil || hz == head {
 		return false
 	}
-	var all []client.LogEntry
-	for since, pages := head, 0; ; pages++ {
-		if pages == maxHorizonPages {
-			return false
-		}
-		st, hdr, body, err := rawGet(ctx, ep, baseURL, what+"/rev/"+hz+"/log", url.Values{"since": {since}}, caps.page)
+	limit := min(caps.page, maxHorizonPage)
+	for prev, pages := head, 0; pages < maxHorizonPages; pages++ {
+		st, hdr, body, err := rawGet(ctx, ep, baseURL, what+"/rev/"+hz+"/log", url.Values{"since": {prev}}, limit)
 		if err != nil || st != 200 {
 			return false
 		}
 		v, err := jsonv.Parse(body)
-		page, ok := v.([]any)
-		if err != nil || !ok || len(page) == 0 {
+		body = nil
+		items, ok := v.([]any)
+		if err != nil || !ok || len(items) == 0 {
 			return false
 		}
-		for _, x := range page {
+		page := make([]client.LogEntry, 0, len(items))
+		for _, x := range items {
 			e, err := client.ParseLogEntry(x)
 			if err != nil {
 				return false
 			}
-			all = append(all, e)
+			page = append(page, e)
 		}
-		last := all[len(all)-1].ID
+		last := page[len(page)-1].ID
+		if got, err := verify.VerifyResourceLog(page, prev); err != nil || got != last {
+			return false
+		}
 		if last == hz {
-			break
+			return true
 		}
 		if hdr.Get("X-Log-Next") != last {
 			return false
 		}
-		since = last
+		prev = last
 	}
-	got, err := verify.VerifyResourceLog(all, head)
-	return err == nil && got == hz
+	return false
+}
+
+// horizonChecks keeps, for one fetch of a branch's pending sealings (a
+// creation, or a sync), the horizon past each resource's mirrored head
+// that A's log was asked to verify, and whether it did: one verification
+// per resource and head, so that A naming another horizon for each
+// sealing gets no more; any other horizon there is refused.
+type horizonChecks map[[2]string]struct {
+	hz string
+	ok bool
+}
+
+// verify is verifyHorizonPast, at most once per resource what and head.
+func (h horizonChecks) verify(ctx context.Context, ep RemoteEndpoint, baseURL, what, head, hz string, caps preCaps) bool {
+	k := [2]string{what, head}
+	if c, seen := h[k]; seen {
+		return c.ok && c.hz == hz
+	}
+	ok := verifyHorizonPast(ctx, ep, baseURL, what, head, hz, caps)
+	h[k] = struct {
+		hz string
+		ok bool
+	}{hz, ok}
+	return ok
 }
 
 // preEntry is a log entry from before its source's raise whose sealing B
