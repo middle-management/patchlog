@@ -527,8 +527,9 @@ func (ix *Index) refsCookieReader(ctx context.Context, r *http.Request, reached 
 			return nil, true, err
 		case err != nil:
 			continue
-		case cfg.Read == "public":
+		case ix.publicFor(ctx, ns, cfg):
 			rd.nss = append(rd.nss, ns)
+			rd.pub = append(rd.pub, ns)
 			continue
 		case i < 0:
 			continue
@@ -851,7 +852,8 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			fail(err)
 			continue
 		}
-		if cfg.Read == "public" && !purged {
+		public := ix.publicFor(ctx, ns, cfg)
+		if public && !purged {
 			continue
 		}
 		v, err := ix.checker.Verify(ctx, ns, token)
@@ -860,7 +862,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			continue
 		}
 		var a *access
-		if cfg.Read != "public" {
+		if !public {
 			a, err = ix.grantAccess(ctx, ns, v)
 			if errors.Is(err, errNotReached) {
 				continue // its coverage, so its marker, can't be told yet

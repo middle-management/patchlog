@@ -498,7 +498,7 @@ func (h memberHandler) Apply(ctx context.Context, b *follow.Batch) error {
 		return err
 	}
 	defer tx.Rollback()
-	narrowed, err := ix.narrowed(ctx, tx, "member_conf", b)
+	narrowed, err := ix.narrowed(ctx, tx, "member_conf", b.NS, configDocs(b))
 	if err != nil {
 		return err
 	}

@@ -81,3 +81,14 @@ func (ix *Index) OnRefsRead(f func()) { ix.testRefsRead = f }
 // OnAnswerRead calls f each time a query's answer has read its rows,
 // before it is built and kept (tests).
 func (ix *Index) OnAnswerRead(f func()) { ix.testAnswerRead = f }
+
+// OnBeforeJudge calls f each time a query's answer has read its rows,
+// before the pending epochs of its hits are judged (tests).
+func (ix *Index) OnBeforeJudge(f func()) { ix.testBeforeJudge = f }
+
+// OnJudge calls f each time pending epochs are about to be judged, once
+// the answer has read the encryption a last time (tests).
+func (ix *Index) OnJudge(f func()) { ix.testJudge = f }
+
+// KeptHas reports whether a result is kept under url (tests).
+func (ix *Index) KeptHas(url string) bool { _, _, ok := ix.kept.Get(url); return ok }
