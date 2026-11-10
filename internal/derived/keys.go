@@ -205,16 +205,16 @@ func (k *Keys) Forget(ns string) {
 // keys can't seal a view), unwrapped with the recipient key if wrapped; for
 // an e2e namespace, relayed from or read in the keyring, from a keyring
 // sender the service trusts to distribute keys (client.E2E.SealKey,
-// §E.3.2): it seals views and hands out K_r under it. An epoch from before
-// a raise from sealed to e2e is no keyring epoch: /keys gives its key as at
-// E2, without a sender, and it is taken as a sealed namespace's is
-// (preRaiseKey). A failure is answered again for keyRetry without asking
-// anew.
+// §E.3.2), for every epoch alike: it seals views and hands out K_r under
+// it. A key /keys gives an e2e namespace without such a sender is never
+// taken (§E.2.6: it counts as no key). ns's encryption is read first if it
+// isn't known yet (Info), so an e2e namespace is never taken for a sealed
+// one. A failure is answered again for keyRetry without asking anew.
 func (k *Keys) EpochKey(ctx context.Context, ns string, epoch int) ([]byte, error) {
 	kid := seal.Kid(ns, epoch)
 	k.mu.Lock()
 	key := k.epoch[kid]
-	in := k.info[ns]
+	in, known := k.info[ns]
 	f, failed := k.failed[kid]
 	k.mu.Unlock()
 	if key != nil {
@@ -223,7 +223,13 @@ func (k *Keys) EpochKey(ctx context.Context, ns string, epoch int) ([]byte, erro
 	if failed && time.Now().Before(f.until) {
 		return nil, f.err
 	}
-	key, err := k.fetchEpochKey(ctx, ns, kid, epoch, in)
+	var err error
+	if !known {
+		if in, err = k.Info(ctx, ns); err != nil {
+			return nil, err
+		}
+	}
+	key, err = k.fetchEpochKey(ctx, ns, kid, epoch, in)
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if err != nil {
@@ -245,13 +251,11 @@ func (k *Keys) fetchEpochKey(ctx context.Context, ns, kid string, epoch int, in 
 	if k.e2e == nil {
 		return nil, fmt.Errorf("%w: %s (no keyring recipient key)", client.ErrNoKeys, kid)
 	}
-	key, err := k.e2e.SealKey(ctx, kid)
-	if errors.Is(err, client.ErrUntrustedKey) && epoch < in.Epoch {
-		if pre, perr := k.preRaiseKey(ctx, ns, kid, epoch); perr == nil {
-			return pre, nil
-		}
-	}
-	return key, err
+	// Every epoch, the current one's and earlier ones', is a keyring
+	// epoch: a namespace is e2e from its creation (Addendum E Levels,
+	// v0.78), and a key /keys gives without a sender the service trusts is
+	// no key (§E.2.6, §E.3.2).
+	return k.e2e.SealKey(ctx, kid)
 }
 
 // plainEpochKey takes K_e of kid from POST /ns/{ns}/keys: the entry with
@@ -284,31 +288,6 @@ func (k *Keys) plainEpochKey(ctx context.Context, ns, kid string, epoch int) ([]
 		return nil, fmt.Errorf("%w: the grant gets no epoch key %s (a per-resource grant can't seal views)", client.ErrNoKeys, kid)
 	}
 	return key, nil
-}
-
-// preRaiseKey takes K_e of kid, an epoch of e2e namespace ns before its
-// current one that no keyring sender the service trusts gave it, as the
-// key of an epoch from before a raise from sealed (Addendum E Levels):
-// /keys gives those as at E2, without a sender (plainEpochKey), and the
-// server held that content, and its key, before the raise, so views of it
-// sealed under that key tell the server nothing it didn't hold. Only for
-// an epoch the keyring names no key of, to anyone: a keyring epoch's
-// content was sealed by key holders, and views of it are sealed only under
-// a key from a sender the service trusts (§E.3.2), never under one the
-// server could have chosen; and never the epoch current now.
-func (k *Keys) preRaiseKey(ctx context.Context, ns, kid string, epoch int) ([]byte, error) {
-	kr, _, err := k.e2e.Keyring(ctx, ns)
-	if err != nil && !client.IsNotFound(err) {
-		return nil, err
-	}
-	if kr != nil {
-		for _, e := range kr.Entries {
-			if e.Kid == kid {
-				return nil, fmt.Errorf("%w: %s is a keyring epoch", client.ErrUntrustedKey, kid)
-			}
-		}
-	}
-	return k.plainEpochKey(ctx, ns, kid, epoch)
 }
 
 // Current returns ns's Info and, for a sealed or e2e namespace, the Key
@@ -449,8 +428,8 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 
 // Recheck is Check for a namespace being followed, after its follower
 // delivered a config change (Observe) that changed its level or its epoch
-// since it was last checked: a raise (to sealed, or to e2e from none or
-// at-rest, Addendum E Levels), or a rotation (§E.2.4: at E3, one that
+// since it was last checked: a raise to sealed (Addendum E Levels; a
+// namespace is e2e only from its creation, v0.78), or a rotation (§E.2.4: at E3, one that
 // leaves the service out of the new epoch's readers), whose keys the
 // service lacks as configured skips it as Check does when the follower
 // starts, so its queries answer 404 as after a restart (§A.4, §E.2.6),
