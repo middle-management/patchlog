@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/ecdh"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -108,6 +110,91 @@ func TestV081AccessNowKeysE3(t *testing.T) {
 	plain := f.grant(f.writer, "user:reader", []string{"e"}, []string{"read"}, map[string]any{"enc": jwk, "rules": []any{pub}})
 	if r := f.do(req{method: "POST", path: "/ns/e/keys", body: map[string]any{"resources": []any{"pub-a"}}, bearer: plain}); r.Code == 403 {
 		t.Fatalf("without the /now rule: %d %s", r.Code, r.Body)
+	}
+}
+
+// §C.2 item 5, §E.2.3 At E3: /keys relays only to a read grant whose
+// rules pass for a read. A role with a rule on /now doesn't count for
+// read, also beside a rule on /resource, so a grant whose only read role
+// is such a role is refused GET /r/{ns}/{name} (404) and /keys (403): it
+// gets no keyring entry, as one whose role has the /now rule alone.
+func TestV081AccessNowKeysE3Role(t *testing.T) {
+	t.Parallel()
+	f := newE2E(t)
+	now := map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}
+	pub := map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string", "pattern": "^pub-"}}
+	f.mkNS("e3r", e2eDoc(map[string]any{
+		"keys": []any{f.admin.entry("*"), f.writer.entry("read", "create", "append", "restore", "delete", "prune")},
+		"roles": map[string]any{
+			"clock":    map[string]any{"can": []any{"read"}, "rules": []any{now}},
+			"clockpub": map[string]any{"can": []any{"read"}, "rules": []any{now, pub}},
+			"pub":      map[string]any{"can": []any{"read"}, "rules": []any{pub}},
+		},
+	}))
+	jwk, priv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A key holder's keyring, wrapping epoch 1's key to the reader's enc.
+	_, holder, _ := seal.GenerateRecipient()
+	kr, err := seal.BuildKeyringV2(holder, "e3r", 1, seal.NewKey(), []*ecdh.PublicKey{priv.PublicKey()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.create("e3r", "keyring", kr.Value(), f.grant(f.admin, "user:admin", []string{"e3r"}, []string{"read", "create"}))
+	keys := func(roles ...any) (int, int) {
+		g := f.grant(f.writer, "user:reader", []string{"e3r"}, []string{"read"}, map[string]any{"enc": jwk, "roles": roles})
+		r := f.do(req{method: "POST", path: "/ns/e3r/keys", body: map[string]any{}, bearer: g})
+		var body struct {
+			Keys []any `json:"keys"`
+		}
+		_ = json.Unmarshal(r.Body, &body)
+		if r.Code == 403 {
+			expectCode(t, r, 403, "forbidden")
+		}
+		return r.Code, len(body.Keys)
+	}
+	if code, n := keys("clock"); code != 403 {
+		t.Errorf("role with /now alone: /keys %d (%d entries), want 403", code, n)
+	}
+	clockpub := f.grant(f.writer, "user:reader", []string{"e3r"}, []string{"read"}, map[string]any{"enc": jwk, "roles": []any{"clockpub"}})
+	if r := f.get("/r/e3r/pub-a", clockpub); r.Code != 404 {
+		t.Errorf("GET /r/e3r/pub-a with role clockpub: %d, want 404", r.Code)
+	}
+	if code, n := keys("clockpub"); code != 403 {
+		t.Errorf("role with /now and /resource rules: /keys %d (%d entries), want 403", code, n)
+	}
+	if code, n := keys("clock", "clockpub"); code != 403 {
+		t.Errorf("roles clock and clockpub: /keys %d (%d entries), want 403", code, n)
+	}
+	// A role without the /now rule counts for read, beside one with it.
+	if code, n := keys("clockpub", "pub"); code != 200 || n != 1 {
+		t.Errorf("roles clockpub and pub: /keys %d (%d entries), want 200 with 1", code, n)
+	}
+}
+
+// §C.2 item 5, §7, §E.2.3: /keys doesn't ignore the grant in a public
+// namespace either, so a grant with a block rule on /now is 403 there
+// too. At E3, a /resource rule beside the /now one makes the grant a
+// per-resource reader for keysReadScope: only the read check's /keys arm
+// refuses it.
+func TestV081AccessNowKeysE3Public(t *testing.T) {
+	t.Parallel()
+	f := newE2E(t)
+	f.mkNS("e3p", e2eDoc(map[string]any{"read": "public",
+		"keys": []any{f.admin.entry("*"), f.writer.entry("read", "create", "append", "restore", "delete", "prune")}}))
+	jwk, _, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string", "pattern": "^pub-"}}
+	now := map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}
+	g := f.grant(f.writer, "user:reader", []string{"e3p"}, []string{"read"}, map[string]any{"enc": jwk, "rules": []any{pub, now}})
+	r := f.do(req{method: "POST", path: "/ns/e3p/keys", body: map[string]any{}, bearer: g})
+	expectCode(t, r, 403, "forbidden")
+	plain := f.grant(f.writer, "user:reader", []string{"e3p"}, []string{"read"}, map[string]any{"enc": jwk, "rules": []any{pub}})
+	if r := f.do(req{method: "POST", path: "/ns/e3p/keys", body: map[string]any{}, bearer: plain}); r.Code != 200 {
+		t.Fatalf("public E3 /keys without the /now rule: %d %s, want 200", r.Code, r.Body)
 	}
 }
 

@@ -575,9 +575,21 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 // the grant in a public namespace either (§7, §E.2.3): there too, a grant
 // that doesn't name the namespace is 403, one that can't be used 401, and
 // one its key's scope refuses 403 (§C.2 item 1), as at
-// GET /ns/{ns}/principal.
+// GET /ns/{ns}/principal. A grant with roles has read only through a role
+// that counts for read (readRoles, §C.2 item 5): one whose read roles all
+// have a rule on /now reads nothing, so /keys relays it no key (§E.2.3)
+// and is 403, whatever its other rules say about /resource.
 func (t *tx) keysReader(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
-	return t.readerCheckURL(n, cred, may, readKeys)
+	return t.readerCheckURL(n, cred, func(a *actor) bool {
+		if !may(a) {
+			return false
+		}
+		if t.e.opt.AuthDisabled || a == nil || a.verified == nil {
+			return true
+		}
+		_, ok := readRoles(a)
+		return ok
+	}, readKeys)
 }
 
 // readKind is the kind of read readerCheckURL authenticates.
