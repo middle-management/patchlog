@@ -97,12 +97,13 @@ var v081SealedPrivate = []any{
 	map[string]any{"op": "replace", "path": "/read", "value": "grant"},
 }
 
-// v081PendingHead sets the store at db, the service stopped, as one from
-// before v0.78 holds the only revision of e2e catalog node name, written
-// in the clear before a raise to e2e: its epoch NULL, pending, judged by
-// the first listing that seals it, its born's with it (bornWithHead;
-// §E.2.6, §E.3.1), and no listing stored. A raise to e2e is 422 since
-// v0.78, so no core a test reaches serves such a revision.
+// v081PendingHead sets the store at db, the service stopped, as a store
+// from before v0.78 held the only revision of e2e catalog node name,
+// written in the clear before a raise to e2e: its epoch NULL, pending,
+// judged by the first listing that seals it, its born's with it
+// (bornWithHead; §E.2.6, §E.3.1), and no listing stored. A constructed
+// state: a raise to e2e is 422 since v0.78, and a core holding a raised
+// namespace refuses to start, so no core a test reaches serves one.
 func v081PendingHead(t *testing.T, db, name string) {
 	t.Helper()
 	sq := must(sql.Open("sqlite", db))

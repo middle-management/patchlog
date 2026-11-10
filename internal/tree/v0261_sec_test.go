@@ -310,10 +310,11 @@ func TestV0261RaiseToE2EWithoutKeys(t *testing.T) {
 
 // §E.2.6, §E.3.1 (v0.26.1): a rotation purges nothing, so a listing reads
 // the catalog's encryption again once its graph is read, before it
-// judges any epoch by it. In e2e catalog cat, node n's head is pending,
-// as a store from before v0.78 holds a head written in the clear before
-// a raise to e2e (its nodes.epoch NULL; the raise is 422 since v0.78,
-// and the fixture's store is set so instead, v081PendingHead); a
+// judges any epoch by it. In e2e catalog cat, node n's head is pending:
+// its nodes.epoch NULL, as a head written in the clear before a raise to
+// e2e left it before v0.78 (the raise is 422 since, and a core holding
+// such a namespace no longer starts, so the store is set so instead,
+// v081PendingHead: a constructed state, which exercises the re-read); a
 // rotation to cat#2 applied after the listing took its kept generation
 // and read the encryption again (AfterGeneration), during fileSealing
 // and the key fetches, has the listing view the graph after it: n is

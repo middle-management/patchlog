@@ -43,7 +43,7 @@ func TestV081SvcStoppedSelfPlacedNamesLeave(t *testing.T) {
 			s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond,
 				Wrap: func(h http.Handler) http.Handler {
 					return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						if refuse.Load() && strings.HasPrefix(r.URL.Path, "/ns/sec/") && strings.HasSuffix(r.URL.Path, "/log") {
+						if refuse.Load() && (r.URL.Path == "/ns/sec" || strings.HasPrefix(r.URL.Path, "/ns/sec/")) {
 							w.Header().Set("Content-Type", "application/json")
 							w.WriteHeader(403)
 							w.Write([]byte(`{"code":"forbidden","message":"injected"}`))
@@ -87,9 +87,15 @@ func TestV081SvcStoppedSelfPlacedNamesLeave(t *testing.T) {
 			waitFor(t, "sec stopped", func() bool { return v0261Stopped(t, db, "sec") })
 			leak := func(when string) {
 				t.Helper()
-				for _, p := range paths {
-					if st, _, b, loc := v0261Get(x, p, rd); st == 200 && strings.Contains(b, "hiddenq7k") {
-						t.Errorf("%s: %s (at %s) by a reader without read on sec, sec stopped, reveals sec's private self-placed name: %d %s", when, p, loc, st, b)
+				// problems and orphans are served, cat and pub alone in
+				// the combined checkpoint; where names no node.
+				for i, p := range paths {
+					want := 200
+					if i == 2 {
+						want = 404
+					}
+					if st, _, b, loc := v0261Get(x, p, rd); st != want || strings.Contains(b, "hiddenq7k") {
+						t.Errorf("%s: %s (at %s) by a reader without read on sec, sec stopped: %d %s, want %d without sec's private self-placed name", when, p, loc, st, b, want)
 					}
 				}
 			}
