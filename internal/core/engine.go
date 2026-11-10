@@ -481,6 +481,12 @@ func Open(opt Options) (*Engine, error) {
 		db.Close()
 		return nil, fmt.Errorf("purging namespaces raised to e2e (-purge-raised-e2e): %w", err)
 	}
+	// (Not on a schema of an earlier version that tests open.)
+	if err := e.seedSealCountsAt016(context.Background()); err != nil {
+		e.comp.close()
+		db.Close()
+		return nil, fmt.Errorf("seeding the sealing counts (§E.2.1): %w", err)
+	}
 	e.warnLegacyE2E(context.Background(), legacy)
 	if pg && !opt.LocalRateBuckets {
 		// The buckets of every instance on the database (ratebuckets.go).

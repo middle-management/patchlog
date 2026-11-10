@@ -475,8 +475,8 @@ func (t *tx) e3Rev(n *nsRow, row *revRow, out *Rev) {
 
 // e3SnapshotFor returns the stored prune snapshot that stands for
 // revision row (§8.6, §E.3.1): the one stored at row, or at a tombstone
-// whose parent row is, the newest, in row's own resource or, for a
-// foreign parent, a branch's. found reports whether there is one; ok
+// of row's resource row whose parent row is, the newest; a base's, read
+// through, in a branch (§7.6). found reports whether there is one; ok
 // whether it may be served, its header binding row as the namespace
 // whose resource stored it names it (snapshotHeaderServable).
 func (t *tx) e3SnapshotFor(row *revRow) (jwe string, ok, found bool) {
@@ -484,8 +484,11 @@ func (t *tx) e3SnapshotFor(row *revRow) (jwe string, ok, found bool) {
 	want := row.id.String()
 	err := t.QueryRow(`SELECT s.seq, s.res, s.jwe FROM e2e_snapshots s WHERE s.seq = ?`, row.seq).Scan(&seq, &res, &jwe)
 	if errors.Is(err, sql.ErrNoRows) {
+		// A tombstone and the parent it can be pruned at are of one
+		// resource row: a branch's first own entry, whose parent is a
+		// base's, has nothing below it to prune (pruneToE2E).
 		err = t.QueryRow(`SELECT s.seq, s.res, s.jwe FROM e2e_snapshots s JOIN revisions h ON h.seq = s.seq
-			WHERE h.kind = ? AND h.parent_seq = ? ORDER BY s.seq DESC LIMIT 1`, kindTombstone, row.seq).Scan(&seq, &res, &jwe)
+			WHERE s.res = ? AND h.kind = ? AND h.parent_seq = ? ORDER BY s.seq DESC LIMIT 1`, row.res, kindTombstone, row.seq).Scan(&seq, &res, &jwe)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, false

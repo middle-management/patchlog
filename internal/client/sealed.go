@@ -313,11 +313,11 @@ func isJOSE(r *response) bool {
 
 // open decrypts a JWE of namespace ns. want returns the pl it must carry,
 // given its (unauthenticated) header; resource names the resource whose key
-// opens it ("" for namespace content). Its kid must name ns, or, for a
-// resource document or log entry an e2e namespace reads through from a
-// base, that base (readThrough), whose ns its pl then carries too, as
-// Levels have readers accept for content from before the base's raise to
-// e2e, which the branch serves as the base does (Addendum E Levels, §E.2.2).
+// opens it ("" for namespace content, under K_n). Its kid must name ns,
+// or, for a resource document or log entry an e2e namespace reads through
+// from a base, that base (readThrough), whose ns its pl then carries too,
+// as readers accept a base's ns for content read through (Addendum E
+// Levels, §E.2.2, §E.3.1).
 func (c *Client) open(ctx context.Context, ns, resource, jwe string, want func(h *seal.Header) (seal.PL, error)) ([]byte, error) {
 	if c.keys == nil {
 		return nil, ErrNoKeys

@@ -81,19 +81,10 @@ import (
 //     mirrored like any other, so POST /ns/{branch}/keys relays the base's
 //     wrapped keys (kid "{base ns}#{e}") until the branch writes a keyring
 //     of its own; each shadow records its level's epochs and when they
-//     began, from its configuration history. History the base pruned can't
-//     be mirrored: its horizon is a sealed snapshot. Content from before a
-//     raise from sealed is mirrored with the base's sealings of it,
-//     byte for byte, each keeping its epoch (fetchPreSealings, §G.5.2),
-//     each stored only once opened with the base's key of its epoch and
-//     verified: creation is 422 where the endpoint's grant gets no key of
-//     an epoch such content is sealed under, as for a base B can't read
-//     (§G.3 Creating one); B hands those keys out by start times read
-//     only from base.origin itself (originStarts). B never seals that
-//     content itself: a sealing the base didn't serve it is pending
-//     (preraise_pending.go), fetched again at each sync until it opens
-//     and verifies, and answers 502 upstream until then, or 410 pruned
-//     once the base answered that (preRaiseUnfetched).
+//     began, from its configuration history. History the base pruned is
+//     mirrored from its horizon, with the base's sealed snapshot there,
+//     which B serves itself (mirrorSnapshot, §G.5.2). A base that isn't
+//     e2e from its creation is refused, 502 upstream (fetchEpochs).
 
 // RemoteAuthor is the author of entries this deployment writes on behalf of
 // a remote base: purges followed from its log, and mirrored horizons whose
@@ -1573,7 +1564,7 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 		if rr.parent != nil {
 			parent = t.rev(heads[rr.parent])
 		}
-		heads[rr] = t.insertChain(res, rr.chain, rr.from, parent, parent != nil, lv.ns)
+		heads[rr] = t.insertChain(res, rr.chain, rr.from, parent, parent != nil)
 	}
 	settles := map[int][]*remoteRes{} // log index → resources whose head it set
 	for _, rr := range lv.res {
@@ -1647,7 +1638,7 @@ func parseCreated(s string, now time.Time) int64 {
 // head, state, horizon and cached documents. With foreign, parent is in a
 // base's resource, and the first entry is res's first, with a foreign
 // parent (§3.3). It returns the head row's seq.
-func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, foreign bool, kidNS string) int64 {
+func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, foreign bool) int64 {
 	remote := t.authorID(RemoteAuthor)
 	var parentSeq any
 	if parent != nil {
@@ -1915,7 +1906,7 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, author int64) *Error 
 			if res == 0 {
 				res = t.mustInsert(`INSERT INTO resources (ns, name) VALUES (?,?) RETURNING res`, n.id, w.s.name)
 			}
-			head := t.insertChain(res, w.s.chain, w.from, w.parent, false, w.s.chain.ns)
+			head := t.insertChain(res, w.s.chain, w.from, w.parent, false)
 			changes = append(changes, change{w.s.name, w.s.chain.last().Kind, head, res})
 		}
 		var entries []any
@@ -3044,7 +3035,7 @@ func (e *Engine) remoteJob(f func(context.Context) error) {
 // follower starts, for each remote branch with a deeper e2e base never
 // read (no remote_chain_read row): one created before migration
 // 013_remote_chain_read, whose /keys otherwise relays none of that base's
-// keyring entries or pre-raise keys until the first sync, a whole follow
+// keyring entries until the first sync, a whole follow
 // interval later (chainReadable, §G.5.2 E3 sources). A read that fails
 // leaves them withheld, as at a sync.
 func (e *Engine) catchUpChainReads(ctx context.Context) error {

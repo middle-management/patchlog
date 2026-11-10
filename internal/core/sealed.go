@@ -217,25 +217,6 @@ func (t *tx) createEpochKey(ns int64, epoch int) {
 	t.newEpochKeys[epochRef{ns, epoch}] = k
 }
 
-// storeEpochKey stores key as the epoch key of (ns, epoch), which began at
-// created, if none is stored: a remote branch's shadow keeps the keys its
-// source gave of the epochs before its raise to e2e (fetchPreRaiseKeys).
-func (t *tx) storeEpochKey(ns int64, epoch int, key []byte, created time.Time) {
-	if t.hasEpochKey(ns, epoch) {
-		return
-	}
-	ks := t.e.opt.KeyStore
-	if ks == nil {
-		panic(errNoKeyStore)
-	}
-	w, err := ks.Wrap(t.context(), key, epochAAD(ns, epoch))
-	if err != nil {
-		panic(encUnavailable(fmt.Sprintf("wrapping an epoch key with key store %s: %v", ks.Name(), err)))
-	}
-	_, err = t.Exec(`INSERT INTO epoch_keys (ns, epoch, wrapped, keystore, created) VALUES (?,?,?,?,?)`, ns, epoch, w, ks.Name(), created.UnixMilli())
-	t.must(err)
-}
-
 // epochKey returns the epoch key of (ns, epoch), panicking with a 500 when
 // it can't be had.
 func (t *tx) epochKey(ns int64, epoch int) []byte {
@@ -542,8 +523,11 @@ func (t *tx) storeSeal(ns int64, j *sealJob) (int, bool) {
 	}
 	if j.jwe == "" || j.fresh {
 		if j.jwe == "" {
-			// Counted with the write it is stored in (§E.2.1).
-			t.countIn(jobSealKey(ns, j), 1, false)
+			// Counted with the write it is stored in (§E.2.1): a
+			// revision's document or entry from what its write reserved.
+			if k := jobSealKey(ns, j); !(j.kind == sealDoc || j.kind == sealEntry) || !t.sealedFromReserve(k) {
+				t.countIn(k, 1, false)
+			}
 		}
 		t.must(j.sealNow())
 		t.lockNS(ns, lockShared)
@@ -640,7 +624,13 @@ func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) erro
 			if j.name != "" {
 				name = j.name
 			}
+			mine := j.jwe
 			t.insertSealed(ns, j, name, rev)
+			if (j.kind == sealDoc || j.kind == sealEntry) && j.jwe == mine {
+				// Counted from a block (countSeals): what its write
+				// reserved for it is released.
+				t.releaseReserve(jobSealKey(ns, j))
+			}
 			ranges = ranges || j.kind == sealRange
 		}
 		if ranges {

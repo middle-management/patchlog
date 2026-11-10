@@ -176,6 +176,58 @@ func (t *tx) sealedFromReserve(k sealKey) bool {
 	return n > 0
 }
 
+// releaseReserve releases one count k's write reserved, for a value
+// counted as sealed when it was sealed (finishSeal).
+func (t *tx) releaseReserve(k sealKey) {
+	_, err := t.Exec(`UPDATE seal_counts SET reserved = reserved - 1 WHERE ns = ? AND epoch = ? AND name = ? AND reserved > 0`, k.ns, k.epoch, k.name)
+	t.must(err)
+}
+
+// seedSealCounts completes, once, at the first Open after migration 016,
+// the counts its SQL seeded from what is stored: the K_r sealings of
+// documents and entries stored before v0.81 (kver 0) whose revisions have
+// no rev_epochs row (read through by a branch, or written before their
+// namespace was sealed), under the epoch their kid names, which SQL
+// can't read. A marker row (namespace 0) says it ran.
+func (e *Engine) seedSealCounts(ctx context.Context) error {
+	return e.update(ctx, func(t *tx) error {
+		res, err := t.Exec(`INSERT INTO seal_counts (ns, epoch, name, sealed, reserved) VALUES (0, 0, '~seeded', 0, 0) ON CONFLICT (ns, epoch, name) DO NOTHING`)
+		t.must(err)
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			return err
+		}
+		rows, err := t.Query(`SELECT s.ns, s.name, substr(s.jwe, 1, 4096) FROM sealed s WHERE s.kind IN ('doc', 'entry') AND s.kver = 0 AND s.name IS NOT NULL
+			AND NOT EXISTS (SELECT 1 FROM rev_epochs r WHERE r.seq = s.rev_seq)`)
+		t.must(err)
+		counts := map[sealKey]int64{}
+		for rows.Next() {
+			var ns int64
+			var name, prefix string
+			t.must(rows.Scan(&ns, &name, &prefix))
+			if ep, ok := jweEpoch(prefix); ok {
+				counts[sealKey{ns, ep, name}]++
+			}
+		}
+		rows.Close()
+		for k, n := range counts {
+			_, err := t.Exec(`INSERT INTO seal_counts (ns, epoch, name, sealed, reserved) VALUES (?,?,?,?,0)
+				ON CONFLICT (ns, epoch, name) DO UPDATE SET sealed = seal_counts.sealed + excluded.sealed`, k.ns, k.epoch, k.name, n)
+			t.must(err)
+		}
+		return nil
+	})
+}
+
+// seedSealCountsAt016 is seedSealCounts, but for an engine opened on the
+// migrations of an earlier version (Options.migrations, tests), whose
+// schema has no seal_counts.
+func (e *Engine) seedSealCountsAt016(ctx context.Context) error {
+	if e.opt.migrations != nil {
+		return nil
+	}
+	return e.seedSealCounts(ctx)
+}
+
 // boundRotationDue makes k's namespace's rotation due where k is of its
 // current epoch (§E.2.1: a *-key holder rotates before any key of the
 // current epoch reaches the bound; here the origin as RotateAuthor).

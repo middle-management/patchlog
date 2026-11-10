@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -350,5 +351,40 @@ func TestV081RemoteRaisedSourceRefused(t *testing.T) {
 	}
 	if n := v0261Count(t, db, pg, `SELECT COUNT(*) FROM namespaces WHERE name LIKE '~%'`); n != 0 {
 		t.Fatalf("%d shadows on B", n)
+	}
+}
+
+// v0.26.1 C1, C3 (formerly TestV0261FetchSealedLogBounds, whose pre-raise
+// log paging v0.78 cut): a hostile A that pages the log B mirrors from its
+// horizon for ever, an empty page with a fresh X-Log-Next each time,
+// doesn't hold creation: it ends within FollowTimeout, 502 upstream.
+func TestV081RemoteSnapshotLogPagingBounded(t *testing.T) {
+	t.Parallel()
+	s, x2, x3, _ := newV081Pruned(t)
+	var pages atomic.Int64
+	tg, _ := url.Parse(s.a.srv.URL)
+	rp := httputil.NewSingleHostReverseProxy(tg)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/r/m/x/rev/"+x3+"/log" && r.URL.Query().Get("since") != "" {
+			n := pages.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Log-Next", fmt.Sprintf("%s%d", x2, n))
+			w.Write([]byte("[]"))
+			return
+		}
+		rp.ServeHTTP(w, r)
+	}))
+	t.Cleanup(front.Close)
+	b := newV081B(t, s, front.URL, func(o *core.Options) { o.Remote.FollowTimeout = 2 * time.Second })
+	kB := newKey("badmin")
+	start := time.Now()
+	r := b.mkRemote("r", remoteGenesis("m", s.at, e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}})))
+	el := time.Since(start)
+	t.Logf("creation after %v and %d pages: %d %.200s", el, pages.Load(), r.Code, r.Body)
+	if el > 4*time.Second || pages.Load() == 0 {
+		t.Fatalf("creation took %v over %d pages", el, pages.Load())
+	}
+	if r.Code != 502 {
+		t.Fatalf("creation: %d %s, want 502", r.Code, r.Body)
 	}
 }

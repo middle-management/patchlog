@@ -3,7 +3,9 @@ package core
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io/fs"
 	"path/filepath"
 	"strconv"
@@ -248,5 +250,83 @@ func TestV081MigrationDropsMarkersOfPurged(t *testing.T) {
 	e.Close()
 	if raises, pending := l.tables(t); raises || pending {
 		t.Fatalf("e2e_raises %v, remote_pending_sealings %v; want neither", raises, pending)
+	}
+}
+
+// KEYS-9 (§E.2.1; stored.md item 9): migration 016 and the first Open
+// after it seed seal_counts from what v0.26.1 stored: a stored document
+// and entry of a revision with an epoch (rev_epochs) count under that
+// epoch, a stored sealing without one under the epoch its kid names, a
+// sealed blob under its epoch, and a revision whose epoch is fixed with
+// no stored sealing reserves two.
+func TestV081SealCountsSeeded(t *testing.T) {
+	t.Parallel()
+	l := newV081Legacy(t)
+	e := l.open15(t)
+	mkNS(t, e, "s", map[string]any{})
+	for _, name := range []string{"a", "b", "c"} {
+		if _, err := put(e, "s", name, "", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	jwe := func(kid string) string {
+		h := `{"alg":"dir","enc":"A256GCM","kid":"` + kid + `","pl":{}}`
+		return base64.RawURLEncoding.EncodeToString([]byte(h)) + "..AAAAAAAAAAAAAAAA.AAAA.AAAAAAAAAAAAAAAAAAAAAA"
+	}
+	if err := e.update(context.Background(), func(t *tx) error {
+		n := t.nsByName("s")
+		seqOf := func(name string) int64 {
+			r := t.resource(n.id, name)
+			return r.headSeq.Int64
+		}
+		for _, q := range []struct {
+			sql  string
+			args []any
+		}{
+			// a: epoch 2 by rev_epochs, its document and entry stored.
+			{`INSERT INTO rev_epochs (seq, epoch) VALUES (?, 2)`, []any{seqOf("a")}},
+			{`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?, 'doc', 'a/1', 'a', ?, ?, 0)`, []any{n.id, seqOf("a"), jwe("s#2")}},
+			{`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?, 'entry', 'a/1', 'a', ?, ?, 0)`, []any{n.id, seqOf("a"), jwe("s#2")}},
+			// b: no rev_epochs row, its document stored under s#3.
+			{`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?, 'doc', 'b/1', 'b', ?, ?, 0)`, []any{n.id, seqOf("b"), jwe("s#3")}},
+			// c: epoch 2 fixed, nothing stored: two reserved.
+			{`INSERT INTO rev_epochs (seq, epoch) VALUES (?, 2)`, []any{seqOf("c")}},
+			// A sealed blob of a under epoch 2.
+			{`INSERT INTO blob_epochs (ns, name, bid, epoch, data, created) VALUES (?, 'a', ?, 2, ?, 0)`, []any{n.id, []byte("12345678901234567890"), []byte("x")}},
+		} {
+			_, err := t.Exec(q.sql, q.args...)
+			t.must(err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	l.close15(t, e)
+	e, err := Open(l.opts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	got := map[string][2]int64{}
+	if err := e.read(context.Background(), func(t *tx) error {
+		rows, err := t.Query(`SELECT c.epoch, c.name, c.sealed, c.reserved FROM seal_counts c JOIN namespaces n ON n.ns = c.ns WHERE n.name = 's'`)
+		t.must(err)
+		defer rows.Close()
+		for rows.Next() {
+			var ep int
+			var name string
+			var s, r int64
+			t.must(rows.Scan(&ep, &name, &s, &r))
+			got[fmt.Sprintf("%d/%s", ep, name)] = [2]int64{s, r}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][2]int64{"2/a": {3, 0}, "3/b": {1, 0}, "2/c": {0, 2}}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s: sealed, reserved %v, want %v (all %v)", k, got[k], v, got)
+		}
 	}
 }

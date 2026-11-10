@@ -247,9 +247,8 @@ type batchSource struct {
 // blob finds bid attached to name in the source, or in a base it reads
 // through, and referenced by a document in that resource's history as the
 // source sees it at source.at (§7.8 Availability, §7.6), whatever the
-// ranks. From a sealed source, public or not, and from an e2e one for a
-// blob from before a raise from sealed, only a blob the caller's keys open
-// under an epoch it is served under there (§2.1 Protection); and none
+// ranks. From a sealed source, public or not, only a blob the caller's
+// keys open under an epoch it is served under there (§2.1 Protection); and none
 // of a resource whose source was raised to a level this server lacks
 // (upstreamRefusal), which the source can't serve.
 func (bs *batchSource) blob(t *tx, name string, bid ids.ID) *blobRow {

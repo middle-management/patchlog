@@ -42,11 +42,7 @@ import (
 // epoch, the first time it is read, and served from then on. End-to-end
 // namespaces serve it in the clear, as their logs are, but marked Private:
 // Cache-Control private instead of the immutable class (§9), since a grant
-// shows more than a log entry does; but one first recorded before a raise
-// from sealed stays sealed as before, under the epoch of the entry that
-// first recorded it and the pad setting before the raise, and a branch of
-// the raised namespace serves it as the raised namespace does (Addendum E
-// Levels, preraise.go).
+// shows more than a log entry does.
 
 // GrantDoc is the answer of GET /ns/{ns}/grants/{gid}.
 type GrantDoc struct {
