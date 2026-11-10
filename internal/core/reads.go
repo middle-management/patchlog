@@ -614,9 +614,10 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if sealed {
 			served = func(le LogEntry) int {
 				j := t.resJob(n, name, le.row, sealEntry, func() []byte { return jsonv.Canonical(le.value()) })
-				t.must(j.sealNow())
+				l, err := j.servedLen()
+				t.must(err)
 				jobs = append(jobs, j)
-				return len(j.jwe)
+				return l
 			}
 		}
 		entries, more, err := t.logBetween(to, sinceID, limit, maxBytes, served)
@@ -913,8 +914,8 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			// A resource stream's purge and prune events (eventseal.go).
 			out.Entries = resourceEvents(out.Entries, resource)
 			if t.isSealedNS(n) {
-				out.Sealed = true
-				out.EntryJWEs = t.sealResourceEvents(n, resource, out.Entries)
+				out.Sealed, nsRowID = true, n.id
+				jobs = t.resourceEventJobs(n, resource, out.Entries)
 			}
 			return nil
 		}
@@ -948,9 +949,9 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		}
 		return nil
 	})
-	if err == nil && out != nil && out.Sealed && resource == "" {
+	if err == nil && out != nil && out.Sealed {
 		if err = e.finishSeal(ctx, nsRowID, jobs); err == nil {
-			if perEntry {
+			if perEntry || resource != "" {
 				out.EntryJWEs = make([]string, len(jobs))
 				for i, j := range jobs {
 					out.EntryJWEs[i] = j.jwe

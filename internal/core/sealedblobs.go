@@ -334,6 +334,10 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 	if job == nil {
 		return out, nil
 	}
+	// Counted before it is sealed (§E.2.1, sealcount.go).
+	if err := e.countSeals(ctx, []sealKey{{job.ns, job.epoch, job.name}}); err != nil {
+		return nil, err
+	}
 	sealed, err := seal.SealBlob(job.key, job.kid, job.pl, job.plain, job.pad)
 	if err != nil {
 		return nil, err

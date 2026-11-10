@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"net/http"
@@ -10,6 +11,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/middle-management/patchlog/internal/dbmigrate"
+	"github.com/middle-management/patchlog/internal/pgtest"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // Security review of v0.26.0: a covered purged namespace's filtered /heads
@@ -172,28 +177,35 @@ func TestV0261Migration015Delete(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.Close()
-	// The rows would refuse the Open (legacy_e2e.go): purging their
-	// namespaces after migrating leaves them as 015 left them.
-	o.migrations, o.PurgeRaisedE2E = migrationsUpTo(t, 15), true
-	if e, err = Open(o); err != nil {
+	// Migration 015 as an upgrade from v0.26.0 runs it, on the database
+	// itself: an engine of this version refuses to open with those rows
+	// (legacy_e2e.go).
+	driver, dsn := "sqlite", sqlitedsn.DSN(l.path, "_pragma=busy_timeout(10000)")
+	if pgtest.Enabled() {
+		driver, dsn = "pgx", pgtest.DSN(l.path)
+	}
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
 		t.Fatal(err)
 	}
-	defer e.Close()
-	if err := e.read(context.Background(), func(t *tx) error {
-		q, err := t.Query(`SELECT n.name, p.name FROM remote_pending_sealings p JOIN namespaces n ON n.ns = p.shadow ORDER BY 1, 2`)
-		t.must(err)
-		defer q.Close()
-		var got []string
-		for q.Next() {
-			var a, b string
-			t.must(q.Scan(&a, &b))
-			got = append(got, a+"/"+b)
-		}
-		if strings.Join(got, ",") != "s/live,s/tomb" {
-			panic("rows left: " + strings.Join(got, ","))
-		}
-		return nil
-	}); err != nil {
+	defer db.Close()
+	if err := dbmigrate.Migrate(context.Background(), db, migrationsUpTo(t, 15), "patchlog"); err != nil {
 		t.Fatal(err)
+	}
+	rows, err := db.Query(`SELECT n.name, p.name FROM remote_pending_sealings p JOIN namespaces n ON n.ns = p.shadow ORDER BY 1, 2`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var a, b string
+		if err := rows.Scan(&a, &b); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, a+"/"+b)
+	}
+	if strings.Join(got, ",") != "s/live,s/tomb" {
+		t.Fatalf("rows left: %s", strings.Join(got, ","))
 	}
 }

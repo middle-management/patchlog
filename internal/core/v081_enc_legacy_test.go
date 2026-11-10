@@ -79,7 +79,28 @@ func (l *v081Legacy) open15(t *testing.T) *Engine {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This version counts its sealings (seal_counts, migration 016): the
+	// table, for the writes building the fixture, until close15.
+	if err := e.update(context.Background(), func(t *tx) error {
+		_, err := t.Exec(`CREATE TABLE seal_counts (ns bigint NOT NULL, epoch bigint NOT NULL, name text NOT NULL, sealed bigint NOT NULL DEFAULT 0, reserved bigint NOT NULL DEFAULT 0, PRIMARY KEY (ns, epoch, name))`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
 	return e
+}
+
+// close15 closes an engine open15 opened, leaving the schema as v0.26.1
+// left it.
+func (l *v081Legacy) close15(t *testing.T, e *Engine) {
+	t.Helper()
+	if err := e.update(context.Background(), func(t *tx) error {
+		_, err := t.Exec(`DROP TABLE seal_counts`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.Close()
 }
 
 // raise raises ns to sealed, which gives it an epoch key, and then to e2e,
@@ -165,7 +186,7 @@ func TestV081OpenRefusesRaisedE2E(t *testing.T) {
 	if _, err := e.CreateBranch(ctx, p29Req("m"), BranchRequest{Name: "mb", IfNoneMatch: true}); err != nil {
 		t.Fatal(err)
 	}
-	e.Close()
+	l.close15(t, e)
 
 	_, err := Open(l.opts())
 	if err == nil || !strings.Contains(err.Error(), "namespace m") || !strings.Contains(err.Error(), "§G.5.1") || !strings.Contains(err.Error(), "purge-raised-e2e") {
@@ -219,7 +240,7 @@ func TestV081MigrationDropsMarkersOfPurged(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	e.Close()
+	l.close15(t, e)
 	e, err := Open(l.opts())
 	if err != nil {
 		t.Fatal(err)

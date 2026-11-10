@@ -269,6 +269,8 @@ func (logPurger) PurgeTags(tags []string) { log.Printf("cdn purge %v", tags) }
 
 // Engine is the patch-log service.
 type Engine struct {
+	// seals are the sealing counts this instance took (sealcount.go).
+	seals     sealCounter
 	db        *sql.DB
 	pg        bool // Postgres (Addendum D.8), not SQLite
 	opt       Options
@@ -526,10 +528,10 @@ func Open(opt Options) (*Engine, error) {
 		e.bg.Add(1)
 		go e.rotateLoop(opt.RotateEpochs)
 	}
-	if opt.RotateOnRevoke {
-		e.bg.Add(1)
-		go e.rotateRetryLoop()
-	}
+	// Rotations due after a revocation (RotateOnRevoke records them) and
+	// at the message bound (sealcount.go).
+	e.bg.Add(1)
+	go e.rotateRetryLoop()
 	if e.opt.RepurgeDelay == 0 {
 		e.opt.RepurgeDelay = 3*e.opt.TailInterval + 2*time.Minute
 	}
@@ -1220,6 +1222,10 @@ func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targ
 		via = grantVia(g)
 	}
 	noAuth := t.noAuth(author)
+	if entry["kind"] != "purge-ns" {
+		// A purge destroys the keys and their counts (purgeNSNow).
+		t.reserveEntries(n, configSeq, 1)
+	}
 	rs, ts := make([]int64, len(hist)), make([]int64, len(hist))
 	for i, h := range hist {
 		rs[i], ts[i] = h.res, h.target
@@ -1308,6 +1314,7 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 		t.lockNS(n.id, lockExclusive)
 	}
 	k := len(as)
+	t.reserveEntries(n, configSeq, int64(k))
 	bodies := make([]string, k)
 	kinds, authors := make([]int64, k), make([]int64, k)
 	res, targets := make([]*int64, k), make([]*int64, k)

@@ -269,6 +269,7 @@ func (t *tx) epochKey(ns int64, epoch int) []byte {
 func (t *tx) deleteEpochKeys(ns int64) {
 	_, err := t.Exec(`DELETE FROM epoch_keys WHERE ns = ?`, ns)
 	t.must(err)
+	t.deleteSealCounts(ns)
 	t.flushEpochKeys = true
 }
 
@@ -393,9 +394,20 @@ type sealJob struct {
 // kver 0, from before, hold namespace documents and grants under K_e.
 const sealKver = 1
 
-// sealNow seals a job not stored yet, so the length of what will be
-// served is known before finishSeal stores it (a sealed resource log
-// page's logPageBytes, ResourceLog).
+// servedLen is the length of what j serves: its stored JWE's, or one
+// sealed under a throwaway key, of the same length, so a sealed resource
+// log page's logPageBytes (ResourceLog) is judged without sealing under
+// the namespace's key before the sealing is counted (sealcount.go).
+func (j *sealJob) servedLen() (int, error) {
+	if j.jwe != "" {
+		return len(j.jwe), nil
+	}
+	s, err := seal.SealMaybePadded(make([]byte, seal.KeySize), j.kid, j.pl, j.plain, j.pad)
+	return len(s), err
+}
+
+// sealNow seals a job not stored yet, once its sealing is counted
+// (storeSeal, finishSeal).
 func (j *sealJob) sealNow() error {
 	if j.jwe != "" {
 		return nil
@@ -529,6 +541,10 @@ func (t *tx) storeSeal(ns int64, j *sealJob) (int, bool) {
 		return 0, false
 	}
 	if j.jwe == "" || j.fresh {
+		if j.jwe == "" {
+			// Counted with the write it is stored in (§E.2.1).
+			t.countIn(jobSealKey(ns, j), 1, false)
+		}
 		t.must(j.sealNow())
 		t.lockNS(ns, lockShared)
 		var purged bool
@@ -575,6 +591,16 @@ func (t *tx) insertSealed(ns int64, j *sealJob, name, rev any) {
 // (§E.2.2); the setting as of sealing counts, and stored bytes never change.
 func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) error {
 	var todo []*sealJob
+	var count []sealKey
+	for _, j := range jobs {
+		if j != nil && j.jwe == "" {
+			count = append(count, jobSealKey(ns, j))
+		}
+	}
+	// Counted before any is sealed: past the bound, none is (§E.2.1).
+	if err := e.countSeals(ctx, count); err != nil {
+		return err
+	}
 	for _, j := range jobs {
 		if j == nil || j.jwe != "" && !j.fresh {
 			continue
