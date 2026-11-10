@@ -2442,6 +2442,19 @@ func replaceRoot(v any) []any {
 	return []any{map[string]any{"op": "replace", "path": "", "value": v}}
 }
 
+// keyringDoc is the document a write of kr sends: a keyring carries no
+// other member but a fresh $nonce (§E.3.2, §C.7), so one read with the
+// keyring is replaced by a fresh one, never copied. A $nonce stored before
+// v0.76 may have another form, which the server refuses, and /keys relays
+// nothing from its keyring; writing a fresh one mends it. A keyring
+// without a $nonce stays without, as E3 needs none (§C.7).
+func keyringDoc(kr *seal.KeyringV2) map[string]any {
+	if kr.Nonce != "" {
+		kr.Nonce = seal.NewNonce()
+	}
+	return kr.Value()
+}
+
 // InitKeyring creates the keyring of ns: a fresh key for the current epoch,
 // wrapped for readers and for the view's own recipient, which wraps them
 // (auth mode, §E.3.2). In a branch that reads its base's keyring through,
@@ -2467,9 +2480,9 @@ func (x *E2E) InitKeyring(ctx context.Context, ns string, readers ...*ecdh.Publi
 	case err == nil && cur.Current(ns) > 0:
 		return nil, fmt.Errorf("client: namespace %s already has a keyring", ns)
 	case err == nil:
-		w, err = x.c.Append(ctx, ns, KeyringName, head, replaceRoot(kr.Value()))
+		w, err = x.c.Append(ctx, ns, KeyringName, head, replaceRoot(keyringDoc(kr)))
 	case IsNotFound(err):
-		w, err = x.c.CreateDoc(ctx, ns, KeyringName, kr.Value())
+		w, err = x.c.CreateDoc(ctx, ns, KeyringName, keyringDoc(kr))
 	}
 	if err != nil {
 		return nil, err
@@ -2511,7 +2524,7 @@ func (x *E2E) AddReader(ctx context.Context, ns string, reader *ecdh.PublicKey, 
 			return nil, err
 		}
 	}
-	return x.c.Append(ctx, ns, KeyringName, head, replaceRoot(kr.Value()))
+	return x.c.Append(ctx, ns, KeyringName, head, replaceRoot(keyringDoc(kr)))
 }
 
 // RotateEpoch starts a new epoch (§E.2.4, §E.3.2: revocation): a fresh key
@@ -2543,7 +2556,7 @@ func (x *E2E) RotateEpoch(ctx context.Context, ns string, readers ...*ecdh.Publi
 	}
 	_, err = x.c.Batch(ctx, ns, BatchRequest{
 		Config: &BatchConfig{IfMatch: cfg.Config, Patches: []any{map[string]any{"op": "add", "path": "/encryption/epoch", "value": e}}},
-		Items:  []BatchItem{{Resource: KeyringName, IfMatch: head, Steps: []Step{PatchStep(replaceRoot(kr.Value()))}}},
+		Items:  []BatchItem{{Resource: KeyringName, IfMatch: head, Steps: []Step{PatchStep(replaceRoot(keyringDoc(kr)))}}},
 	}, false)
 	if err != nil {
 		return 0, err

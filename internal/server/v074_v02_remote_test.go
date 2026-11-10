@@ -195,19 +195,6 @@ func TestV074RemoteFailedRaiseIsNot502(t *testing.T) {
 	}
 }
 
-// withOriginURL makes the endpoint of withRemote say the origin itself
-// answers at url, as an endpoint that is a mirror would (§G.5.2).
-func withOriginURL(url string) func(*core.RemoteOptions) {
-	return func(o *core.RemoteOptions) {
-		inner := o.Resolve
-		o.Resolve = func(origin string) (core.RemoteEndpoint, error) {
-			ep, err := inner(origin)
-			ep.OriginURL = url
-			return ep, err
-		}
-	}
-}
-
 func mustHeader(t *testing.T, jwe []byte) *seal.Header {
 	t.Helper()
 	h, err := seal.ParseHeader(string(bytes.TrimSpace(jwe)))

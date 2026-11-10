@@ -473,6 +473,14 @@ function parseKeyringV2(doc) {
   return doc;
 }
 function buildKeyringV2() { return { keys: [] }; }
+/* keyringV2ForWrite copies kr for a keyring write: a keyring has no member but a fresh $nonce (§E.3.2, §C.7), so one
+ * read with it is replaced by a fresh one, never copied (one stored before v0.76 may have another form, which servers
+ * refuse); a keyring without one stays without, as client.E2E writes it. */
+function keyringV2ForWrite(kr) {
+  const out = JSON.parse(JSON.stringify(kr));
+  if ('$nonce' in out) out.$nonce = newNonce();
+  return out;
+}
 /* keyringV2Add wraps epochKey, the K_e of kidStr, for recipientX in auth mode under admin (an identity) and puts the
  * entry, replacing the one for the same kid and recipient. */
 async function keyringV2Add(kr, admin, recipientX, kidStr, epochKey) {
@@ -760,7 +768,7 @@ root.PLSeal = {
   hkdf, resourceKey, namespaceKey, viewKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, thumbprint, parseJWK,
   hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapRelayedKey, checkRelayedEntry, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
   sealPatchSet, sealedJWE, sealedBlobs, BLOB_TYPE, blobType, blobID, blobIDs, sameBlobs, parseBlob, openBlob, sealBlob, encryptBlob, decryptBlob,
-  isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,
+  isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2ForWrite, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,
   parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,
   applyPatch, validate, selfTest,
 };

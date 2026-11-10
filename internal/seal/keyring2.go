@@ -51,8 +51,10 @@ const wrappedLen = hpkeNenc + KeySize + 16
 // keyring's own namespace and an epoch it has is the caller's to check.
 //
 // It reads stored keyrings, so it takes a $nonce of any form: until v0.76
-// a keyring was written with one, and its entries stay readable and
-// relayed. A write is checked with CheckKeyringV2.
+// a keyring was written with one. Its entries stay readable by a key
+// holder, but /keys relays none of them (CheckKeyringV2) until a keyring
+// write replaces the $nonce with a fresh one. A write is checked with
+// CheckKeyringV2.
 func ParseKeyringV2(v any) (*KeyringV2, error) { return parseKeyringV2(v, false) }
 
 // CheckKeyringV2 is ParseKeyringV2 for a keyring being written (§E.3.2):

@@ -414,12 +414,18 @@ func (t *tx) declaredAt(row *revRow) []ids.ID {
 // namespace and epochs not after encryption.epoch. A keyring in the format
 // before v0.63 is refused like any other document: a key holder writes
 // the §E.3.2 document (v0.81 has no tool that converts the old one).
+// Options.LegacyKeyringNonceForTests lets a $nonce of any form through,
+// as the gate did before v0.76.
 func (t *tx) checkKeyring(n *nsRow, cfg *Config, s *itemState) *Error {
+	check := seal.CheckKeyringV2
+	if t.e.opt.LegacyKeyringNonceForTests {
+		check = seal.ParseKeyringV2
+	}
 	for _, st := range s.steps {
 		if st.del {
 			continue
 		}
-		kr, err := seal.CheckKeyringV2(st.doc)
+		kr, err := check(st.doc)
 		if err != nil {
 			msg := "the keyring resource of an e2e namespace must be a keyring document, { \"keys\": [{ \"kid\", \"to\", \"from\", \"wrapped\" }] } (§E.3.2): " + err.Error()
 			if _, lerr := seal.ParseKeyring(st.doc); lerr == nil {
@@ -654,9 +660,11 @@ func (t *tx) kidName(b *nsRow) string {
 // entries whose to is enc's thumbprint, with from. Each entry's kid names
 // the keyring's owner, checked when it was written; for a remote branch's
 // shadow, the remote base (§G.5). Only a keyring of the §E.3.2 form with a
-// fresh $nonce, as a write checks it (seal.CheckKeyringV2), is relayed: one stored in the format before v0.63,
-// or with a $nonce written before v0.76, relays nothing, failing closed
-// until a key holder wraps it again (v0.78; warnLegacyE2E).
+// fresh $nonce, as a write checks it (seal.CheckKeyringV2), is relayed: one
+// stored in the format before v0.63 relays nothing, failing closed until a
+// key holder wraps it again, and one with a $nonce written before v0.76
+// until a key holder's next keyring write, which carries a fresh one
+// (v0.78; legacyE2EWarnings).
 func keyringEntries(d any, enc *ecdh.PublicKey, epochs []int) []map[string]any {
 	want := make(map[int]bool, len(epochs))
 	for _, e := range epochs {
