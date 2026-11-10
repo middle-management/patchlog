@@ -90,8 +90,8 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 		// it at the current checkpoint, as its filtered reads would show
 		// them (§B.11.9 Answers): never an unplaced document. It is built
 		// after the 410 and not_offered answers, which come as soon as the
-		// read check passes (§8.5), so a grant grantView refuses (/now)
-		// still learns a purge.
+		// read check passes (§8.5). A grant whose rules refer to /now never
+		// gets that far: the read check refuses it (anyReader, §C.2 item 5).
 		cfg := t.config(n.configSeq)
 		var visible func(name string) bool
 		if !t.readsNS(n, cfg, a, false) {

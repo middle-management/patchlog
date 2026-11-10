@@ -52,9 +52,9 @@ func TestV075GesturesFiltered(t *testing.T) {
 }
 
 // §8.5's table: the gestures listing of a purged namespace is 410 as soon
-// as the read check passes, before any other answer. A partial reader
-// whose grant has a rule on /now passes it (anyReader), so it gets the 410
-// too, not the 403 its filtered reads get (§B.11.9).
+// as the read check passes, before any other answer. A grant with a block
+// rule on /now fails the read check itself (§C.2 item 5, v0.78: the
+// per-endpoint special cases are gone), so it gets 403, never the 410.
 func TestV075GesturesPurgedBeforeFilteredView(t *testing.T) {
 	t.Parallel()
 	w := newV75s(t, v75sOpts{})
@@ -66,5 +66,5 @@ func TestV075GesturesPurgedBeforeFilteredView(t *testing.T) {
 	expect(t, w.patchNS("matches", ops(op("add", "/frozen", true)), w.admin), 201)
 	expect(t, w.do(req{method: "POST", path: "/ns/matches/purge?force=1", ifMatch: w.nsHead("matches", w.admin), bearer: opg}), 204)
 	expectCode(t, w.get("/ns/matches/gestures/"+gA, w.li()), 410, "purged")
-	expectCode(t, w.get("/ns/matches/gestures/"+gA, now), 410, "purged")
+	expectCode(t, w.get("/ns/matches/gestures/"+gA, now), 403, "forbidden")
 }
