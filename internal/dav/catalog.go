@@ -1770,42 +1770,6 @@ func (st *reqState) moveFolder(ctx context.Context, src, dst target) error {
 	return fail(http.StatusForbidden, "%s can't be moved to %s", src.path, dst.path)
 }
 
-// accessRefused refuses (403) to copy folder src, or move it to another
-// tree, where it carries $access or sits under a folder that does
-// (§B.11.1), as the node documents of catalog graph cg have it: the copy
-// is made without it (§H.5), which only catalog-admins set (§B.11.3), and
-// whether a copy may so widen who reads what is copied is open (§B.12).
-// Until that is settled the gateway refuses (F-H12); $access means
-// something only in a tree with tree-derived access (§B.11), so a tree
-// whose folders carry it is taken for one.
-func (st *reqState) accessRefused(cg *catGraph, src target) error {
-	seen := map[string]bool{}
-	var carrier func(n *tree.Node) *tree.Node
-	carrier = func(n *tree.Node) *tree.Node {
-		if n == nil || seen[n.Name] {
-			return nil
-		}
-		seen[n.Name] = true
-		if n.HasAccess {
-			return n
-		}
-		for _, p := range cg.g.WalkableParents(n) {
-			if c := carrier(cg.g.Node(p)); c != nil {
-				return c
-			}
-		}
-		return nil
-	}
-	c := carrier(cg.g.Node(src.node))
-	switch {
-	case c == nil:
-		return nil
-	case c.Name == src.node:
-		return fail(http.StatusForbidden, "folder %s carries access settings ($access, §B.11.1), which its copy wouldn't (§H.5): whether a copy may widen who reads what is in it is open (§B.12), so this server doesn't copy it, nor move it to another tree", src.path)
-	}
-	return fail(http.StatusForbidden, "folder %s is in a folder that carries access settings ($access, §B.11.1), which its copy wouldn't have (§H.5): whether a copy may widen who reads what is in it is open (§B.12), so this server doesn't copy it, nor move it to another tree", src.path)
-}
-
 // copyFolder makes t, the copy of a folder a COPY makes (§H.5 "Copy"),
 // before x/net/webdav copies the folder's visible children (its listing,
 // dirFile) into it one by one, unless Depth: 0 asks for the folder alone;
@@ -1813,11 +1777,14 @@ func (st *reqState) accessRefused(cg *catGraph, src target) error {
 // answered as that child's copy would be. The folder copied is the one
 // at t's place below the COPY's source: a tree's folder, copied to a new
 // name of a tree as a new folder node titled with that name and without
-// the source's $access (mkFolder), not into itself or a folder in it,
-// and not where it carries $access or sits under a folder that does
-// (accessRefused). Onto an existing folder or file it is 403 (412 with
-// Overwrite: F, x/net/webdav's), and to another case of a sibling's name
-// 409 (§H.2 "Siblings"), either setting a guard (§H.6); a namespace's
+// the source's $access (mkFolder), not into itself or a folder in it.
+// One that carries $access or sits under a folder that does is copied
+// too: the copier reads what it copies, which Protection allows, and the
+// catalog service sees no content (§B.11.4 Copies, §2.1); what bounds
+// where it goes is who may read it. Onto an existing folder or file it is
+// 403 (412 with Overwrite: F, x/net/webdav's), and to another case of a
+// sibling's name 409 (§H.2 "Siblings"), either setting a guard (§H.6); a
+// namespace's
 // directory, a tree's top level and a scratch directory aren't copied,
 // but an app's scratch directory in the folder copied, which its listing
 // shows, is copied as one, with what is in it (§H.6), as a move to
@@ -1875,9 +1842,6 @@ func (st *reqState) copyFolder(ctx context.Context, t target) error {
 	if t.ns == src.ns && (t.parent == src.node || cg.g.Descendants([]string{src.node})[t.parent]) {
 		return fail(http.StatusForbidden, "folder %s can't be copied into itself or a folder in it (§H.5)", src.path)
 	}
-	if err := st.accessRefused(cg, src); err != nil {
-		return err
-	}
 	_, err = st.makeFolder(ctx, t)
 	return err
 }
@@ -1890,11 +1854,11 @@ func (st *reqState) copyFolder(ctx context.Context, t target) error {
 // delete of the source, its item taking $successor where it leaves its
 // namespace), a folder as this, and src deleted once empty (deleteFolder).
 // A failure part-way leaves what was done, with no rollback, and is
-// answered as that child's MOVE would be. Before anything is written: a
-// folder that carries $access or sits under one isn't moved
-// (accessRefused), nor one the grant can't delete, or unlink where it has
-// several parents (allows). The MOVE's If-Match names src's node
-// (srcPrecondition), not its files.
+// answered as that child's MOVE would be. A folder that carries $access
+// or sits under one moves so too, as a copy does (§B.11.4 Copies). Before
+// anything is written: one the grant can't delete, or unlink where it has
+// several parents, isn't moved (allows). The MOVE's If-Match names src's
+// node (srcPrecondition), not its files.
 func (st *reqState) moveFolderAcross(ctx context.Context, src, dst target) error {
 	cg, _, err := st.writeTree(ctx, src.ns)
 	if err != nil {
@@ -1902,9 +1866,6 @@ func (st *reqState) moveFolderAcross(ctx context.Context, src, dst target) error
 	}
 	if cg == nil {
 		return noFolderDelete(src.ns, src.path)
-	}
-	if err := st.accessRefused(cg, src); err != nil {
-		return err
 	}
 	verb := "delete"
 	if n := cg.g.Node(src.node); n != nil && len(cg.g.WalkableParents(n)) > 1 {
@@ -1931,8 +1892,8 @@ func (st *reqState) moveInto(ctx context.Context, src, dst target) error {
 	if err != nil {
 		return err
 	}
-	cg, err := st.freshGraph(ctx, src.ns)
-	if err != nil {
+	// The node documents as they are now, folder made (nodeDir).
+	if _, err := st.freshGraph(ctx, src.ns); err != nil {
 		return err
 	}
 	d, err := st.nodeDir(ctx, src.ns, src.node)
@@ -1949,9 +1910,6 @@ func (st *reqState) moveInto(ctx context.Context, src, dst target) error {
 		to := target{kind: kNewNode, path: dst.path + "/" + e.name, dir: dst.path, base: e.name, ns: dst.ns, parent: node, title: title}
 		if e.node.Kind == kindFolder {
 			from.kind = kFolder
-			if err := st.accessRefused(cg, from); err != nil {
-				return err
-			}
 			if err := st.moveInto(ctx, from, to); err != nil {
 				return err
 			}

@@ -326,9 +326,9 @@ func (e *env) noChild(cat, parent, title string) {
 // folders likewise; Depth: 0 copies the folder alone. Onto an existing
 // folder or file it is 403 (412 with Overwrite: F), and into itself or
 // into the flat view, which has no folders, 403. A folder that carries
-// $access or sits under one isn't copied (F-H12); met part-way, it is
-// that child's 403, what was copied before it staying (§H.5 "Copy",
-// GW-7).
+// $access, sits under one or holds one is copied likewise, each copy
+// without $access (§H.5 "Copy", §B.11.4 Copies, GW-7; v0.81 "Leaving an
+// embargo").
 func TestV073FolderCopy(t *testing.T) {
 	t.Parallel()
 	e := treeDocsEnv(t)
@@ -391,28 +391,32 @@ func TestV073FolderCopy(t *testing.T) {
 	sameStrings(t, "Empty", names(e.propfind("/cat/Empty/"), "/cat/Empty/"), nil)
 	e.noChild("cat", "sub", "Again")
 
-	for _, src := range []string{"/cat/Locked", "/cat/Locked/Under"} {
-		r := e.expect(e.do("COPY", src, "", "Destination", "/cat/Unlocked"), 403, "COPY of "+src)
-		if !strings.Contains(r.body, "$access") {
-			t.Fatalf("COPY of %s: %s", src, r.body)
+	for _, c := range []struct{ src, dst, title string }{
+		{"/cat/Locked", "/cat/Unlocked", "Unlocked"},
+		{"/cat/Locked/Under", "/cat/Under%20copy", "Under copy"},
+	} {
+		e.expect(e.do("COPY", c.src, "", "Destination", c.dst), 201, "COPY of "+c.src)
+		if n, doc := e.childOf("cat", "root", c.title); n == "locked" || n == "under" || doc["$access"] != nil {
+			t.Fatalf("the copy of %s: %s %v", c.src, n, doc)
 		}
-		e.noChild("cat", "root", "Unlocked")
 	}
-	r := e.expect(e.do("COPY", "/cat/Outer", "", "Destination", "/cat/Outer%20copy"), 403, "COPY of a folder holding one with $access")
-	if !strings.Contains(r.body, "z-inner") {
-		t.Fatalf("the part-way refusal: %s", r.body)
-	}
+	unlocked, _ := e.childOf("cat", "root", "Unlocked")
+	e.childOf("cat", unlocked, "Under")
+	e.expect(e.do("COPY", "/cat/Outer", "", "Destination", "/cat/Outer%20copy"), 201, "COPY of a folder holding one with $access")
 	oc, _ := e.childOf("cat", "root", "Outer copy")
 	e.childOf("cat", oc, "a.json")
-	e.noChild("cat", oc, "z-inner")
+	if n, doc := e.childOf("cat", oc, "z-inner"); n == "zinner" || doc["$access"] != nil {
+		t.Fatalf("z-inner's copy %s %v", n, doc)
+	}
 }
 
 // A MOVE of a folder to another tree makes the folder there, titled with
 // the destination's name and without $access, moves its visible children
 // into it one by one (files as moves across trees move them, their items
 // naming their copies in $successor; folders likewise), and deletes the
-// source folder once empty. A failure part-way leaves what was done and
-// is answered as that child's MOVE (§H.5 "Copy", GW-8).
+// source folder once empty, one carrying $access too (§B.11.4 Copies). A
+// failure part-way leaves what was done and is answered as that child's
+// MOVE (§H.5 "Copy", GW-8).
 func TestV073FolderMoveAcrossTrees(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, nil, []string{"cat", "cat2"}, map[string]map[string]any{
@@ -459,15 +463,13 @@ func TestV073FolderMoveAcrossTrees(t *testing.T) {
 	}
 	sameStrings(t, "cat", names(e.propfind("/cat/"), "/cat/"), []string{"Locked/", "Part/"})
 
-	hl, _ := e.load("cat", "locked")
-	r := e.expect(e.do("MOVE", "/cat/Locked", "", "Destination", "/cat2/Locked"), 403, "MOVE of a folder with $access to another tree")
-	if !strings.Contains(r.body, "$access") {
-		t.Fatalf("MOVE of Locked: %s", r.body)
+	e.expect(e.do("MOVE", "/cat/Locked", "", "Destination", "/cat2/Locked"), 201, "MOVE of a folder with $access to another tree")
+	if n, doc := e.childOf("cat2", "root", "Locked"); n == "locked" || doc["$access"] != nil {
+		t.Fatalf("Locked moved: %s %v", n, doc)
 	}
-	e.expectLive("cat", "locked", hl, "Locked after the refusal")
-	e.noChild("cat2", "root", "Locked")
+	e.expectTombstoned("cat", "locked", "the source's locked")
 
-	r = e.expect(e.do("MOVE", "/cat/Part", "", "Destination", "/cat2/Part"), 422, "MOVE of a folder whose second file is refused there")
+	r := e.expect(e.do("MOVE", "/cat/Part", "", "Destination", "/cat2/Part"), 422, "MOVE of a folder whose second file is refused there")
 	if !strings.Contains(r.body, "rule") {
 		t.Fatalf("the part-way refusal: %s", r.body)
 	}
