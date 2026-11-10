@@ -1478,9 +1478,10 @@ func v0261Stopped(t *testing.T, db, ns string) bool {
 // service follows the namespace to the checkpoint it stopped at again:
 // the core refusing the service's reads of the catalog's or sec's log for
 // a while (403) stops it (purgeStopped: ns:{ns} purged, the catalog 404,
-// sec reading public to no one), and once the refusal passes, with
-// nothing written meanwhile, anonymous reads are served again and the
-// stop is no longer recorded.
+// sec reading public to no one and, not followed, out of the listings,
+// v0.81 ACCESS-11), and once the refusal passes, with nothing written
+// meanwhile, its items are listed again and the stop is no longer
+// recorded.
 func TestV0261StopEnds(t *testing.T) {
 	t.Parallel()
 	for _, which := range []string{"cat", "sec"} {
@@ -1522,18 +1523,25 @@ func TestV0261StopEnds(t *testing.T) {
 			}
 			refuse.Store(true)
 			waitFor(t, "ns:"+which+" purged (purgeStopped)", func() bool { sent, _ := v0261SawTag(x, "ns:"+which); return sent })
-			want := 401
-			if which == "cat" {
-				want = 404
-			}
-			if st, _, b, _ := v0261Get(x, "/cat/children?of=root", ""); st != want {
-				t.Errorf("stopped: anonymous GET %d %s, want %d", st, b, want)
+			// A stopped catalog isn't served (404). A stopped content
+			// namespace isn't followed (§B.5 Behind, v0.81 ACCESS-11): the
+			// public catalog's listings are served without it, its
+			// placement dangling, never its item.
+			st, _, b, _ := v0261Get(x, "/cat/children?of=root", "")
+			switch {
+			case which == "cat" && st != 404:
+				t.Errorf("stopped: anonymous GET %d %s, want 404", st, b)
+			case which == "sec" && (st != 200 || strings.Contains(b, "sec.a")):
+				t.Errorf("stopped: anonymous GET %d %s, want 200 without sec.a", st, b)
 			}
 			if !v0261Stopped(t, db, which) {
 				t.Errorf("stopped: no stopped:%s recorded", which)
 			}
 			refuse.Store(false)
-			waitFor(t, "anonymous reads again", func() bool { st, _, _, _ := v0261Get(x, "/cat/children?of=root", ""); return st == 200 })
+			waitFor(t, "anonymous reads again", func() bool {
+				st, _, b, _ := v0261Get(x, "/cat/children?of=root", "")
+				return st == 200 && strings.Contains(b, "sec.a")
+			})
 			if v0261Stopped(t, db, which) {
 				t.Errorf("followed again: stopped:%s still recorded", which)
 			}

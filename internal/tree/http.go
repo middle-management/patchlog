@@ -407,15 +407,16 @@ func (s *Service) stillPublic(ctx context.Context, v *viewer) error {
 }
 
 // listed reports, for each content namespace the catalog trusts, whether
-// the service holds a checkpoint of it, which puts it in the listings'
-// combined checkpoint (§B.5, CombinedAt). One it can't follow (refused,
-// absent, without keys it can have) has none, and shows nothing in
-// listings: its placements dangle.
+// the service holds a checkpoint of it and follows it, which puts it in
+// the listings' combined checkpoint (§B.5, CombinedAt). One it can't
+// follow (refused, absent, without keys it can have, or stopped for one
+// of these, Graph.isStopped) is out of it, and shows nothing in listings:
+// its placements dangle.
 func (s *Service) listed() map[string]bool {
 	listed := map[string]bool{}
 	s.View(func(g *Graph, cur map[string]string) {
 		for ns := range g.Trust {
-			listed[ns] = cur[ns] != ""
+			listed[ns] = cur[ns] != "" && !g.isStopped(ns)
 		}
 	})
 	return listed
@@ -1710,15 +1711,15 @@ type atRecord struct {
 }
 
 // checkpointsOf is the checkpoints the service's combined checkpoint
-// hashes (Service.combinedAt), keyed as cur is: purged namespaces left
-// out (§B.5). Call it under View.
+// hashes (Service.combinedAt), keyed as cur is: purged and stopped
+// namespaces left out (§B.5). Call it under View.
 func (s *Service) checkpointsOf(g *Graph, cur map[string]string) map[string]string {
 	cps := map[string]string{}
 	if id := cur[g.Catalog]; id != "" && !s.purgedLocked(g.Catalog) {
 		cps[g.Catalog] = id
 	}
 	for ns := range g.Trust {
-		if id := cur[ns]; id != "" && !s.purgedLocked(ns) {
+		if id := cur[ns]; id != "" && !s.purgedLocked(ns) && !g.isStopped(ns) {
 			cps[ns] = id
 		}
 	}
@@ -1911,7 +1912,10 @@ func CombinedAt(g *Graph, cur map[string]string) (string, []string) {
 }
 
 // combinedAt is the service's combined checkpoint, purged namespaces left
-// out (§B.5): a purge-ns entry is a namespace's last, so the at a purge
+// out (§B.5), and stopped ones (Graph.isStopped), which it doesn't follow:
+// at moves when one stops and when it is followed again, so kept public
+// listings are judged again and a g/all cookie is 403 at an at it has
+// entered since (noteTrust). A purge-ns entry is a namespace's last, so the at a purge
 // moves is the one it would keep forever, and listings, their ns:{ns}
 // tags, the coverage of problems and orphans and what a g/all edge grant
 // is checked against cover only namespaces that still have items. Call
@@ -1925,7 +1929,7 @@ func combinedAt(g *Graph, cur map[string]string, purged func(string) bool) (stri
 	nss := []string{}
 	// In a release preview the checkpoint is over the branches (§B.5).
 	add := func(ns string) {
-		if id := cur[ns]; id != "" && !purged(ns) {
+		if id := cur[ns]; id != "" && !purged(ns) && !g.isStopped(ns) {
 			m[g.Actual(ns)] = id
 			nss = append(nss, g.Actual(ns))
 		}
@@ -3132,13 +3136,14 @@ func (q *query) parentsJSON(n *Node) []any {
 
 // checkpointed is every content namespace the catalog trusts that is in
 // the combined checkpoint, sorted: what problems and orphans cover
-// (§B.11.5). One the service can't follow has no checkpoint, and shows
-// nothing in listings, as the URL spaces and g/all are judged without it
-// (Service.listed); nor is one it holds as purged in it (§B.5).
+// (§B.11.5). One the service can't follow has no checkpoint, or is
+// stopped (Graph.isStopped), and shows nothing in listings, as the URL
+// spaces and g/all are judged without it (Service.listed); nor is one it
+// holds as purged in it (§B.5).
 func (q *query) checkpointed() []string {
 	out := make([]string, 0, len(q.g.Trust))
 	for ns := range q.g.Trust {
-		if q.cur[ns] != "" && !q.s.purgedLocked(ns) {
+		if q.cur[ns] != "" && !q.s.purgedLocked(ns) && !q.g.isStopped(ns) {
 			out = append(out, ns)
 		}
 	}

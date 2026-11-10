@@ -204,7 +204,9 @@ type Graph struct {
 	// (meta "stopped:{ns}", purgeStopped), until it applies a batch of
 	// one again: what it can't follow is never applied, a narrowing
 	// among it, so none reads public (publicAsApplied), and a stopped
-	// catalog is not served.
+	// catalog is not served. A stopped content namespace is not followed
+	// (isStopped): it is out of the combined checkpoint and listed(), and
+	// its placements dangle (§B.5, §B.7).
 	stopped map[string]string
 	// Aliases maps a namespace to the branch followed in its place in a
 	// release preview (§B.5, §F.9); nil otherwise.
@@ -233,6 +235,19 @@ type Graph struct {
 type NSConfig struct {
 	NS  string
 	Doc map[string]any
+}
+
+// isStopped reports whether the service stopped following content
+// namespace ns (Graph.stopped): it is out of the combined checkpoint and
+// its placements dangle (§B.5 Behind: a namespace it can't follow as
+// configured "isn't waited for, and its placements dangle"). A stopped
+// catalog is not served at all.
+func (g *Graph) isStopped(ns string) bool {
+	if ns == g.Catalog {
+		return false
+	}
+	_, ok := g.stopped[ns]
+	return ok
 }
 
 func newGraph(catalog string) *Graph {
@@ -680,6 +695,12 @@ func (g *Graph) analyze() map[string]bool {
 			n.State, n.Dangling = StateDangling, "invalid"
 		case !g.Trust[n.ItemNS]:
 			n.State, n.Dangling = StateDangling, "untrusted"
+		case g.isStopped(n.ItemNS):
+			// A namespace the service stopped following, for keys it
+			// lacks or a refusal, isn't followed: its placements dangle
+			// (§B.5 Behind, §B.7), re-derived on stop and when followed
+			// again.
+			n.State, n.Dangling = StateDangling, "unfollowed"
 		case n.ItemState == ItemLive:
 		case n.ItemState == ItemTombstoned:
 			n.State, n.Dangling = StateDangling, "tombstoned"

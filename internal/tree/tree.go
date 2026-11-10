@@ -689,17 +689,12 @@ func (s *Service) onCatchUp(ctx context.Context, ns, head string, done bool) {
 	// passed, a stale head pointer), so the stop ends (purgeStopped).
 	_, stopped := s.g.stopped[ns]
 	unstop := stopped && head != "" && s.cur[ns] == head
-	if unstop {
-		delete(s.g.stopped, ns)
-	}
 	s.mu.Unlock()
 	if mark {
 		s.recordCaught(ctx, ns, head)
 	}
 	if unstop {
-		if _, err := s.db.ExecContext(context.WithoutCancel(ctx), `DELETE FROM meta WHERE k = ?`, "stopped:"+ns); err != nil {
-			s.opt.Logf("tree: ending the stop of %s: %v", ns, err)
-		}
+		s.unstop(ctx, ns, head)
 	}
 }
 
@@ -1700,47 +1695,115 @@ func (s *Service) purgeStopped(ctx context.Context, ns string) {
 		// and report comes here).
 		return
 	}
+	ctx = context.WithoutCancel(ctx)
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
 	s.mu.Lock()
 	shown := ns == s.opt.Catalog || s.g.Trust[ns]
 	cp := s.cur[ns]
 	was, marked = s.g.stopped[ns]
-	if shown {
-		s.g.stopped[ns] = cp
-	}
-	s.mu.Unlock()
 	if !shown {
+		s.mu.Unlock()
 		return
 	}
+	s.g.stopped[ns] = cp
+	tags := []string{"ns:" + s.actual(ns)}
+	if !marked || was != cp {
+		// Its placements dangle from now on (Graph.isStopped), in the same
+		// critical section as the stop: no listing shows them meanwhile.
+		if err := s.restop(ctx, ns, func(tx *sql.Tx) error {
+			if err := saveMeta(ctx, tx, "stopped:"+ns, cp); err != nil {
+				return err
+			}
+			if err := s.sealed.Purge(ctx, tx, tags); err != nil {
+				return err
+			}
+			return s.repurge.Add(ctx, tx, tags)
+		}); err != nil {
+			s.opt.Logf("tree: purging %v for %s, no longer followed: %v", tags, ns, err)
+		}
+	}
+	// It leaves the combined checkpoint (noteTrust: entered again once
+	// followed, so a g/all cookie from before is 403 at an at with it).
+	s.noteTrust(ctx)
+	s.mu.Unlock()
 	s.checker.Observe(s.actual(ns), "")
 	if marked && was == cp {
 		return
 	}
-	tags := []string{"ns:" + s.actual(ns)}
+	s.sealed.Purged(tags)
+	s.kept.Purge(s.opt.Catalog, tags)
+	s.opt.Purger.PurgeTags(tags)
+	s.mu.Lock()
+	close(s.changed)
+	s.changed = make(chan struct{})
+	s.mu.Unlock()
+}
+
+// restop derives again, in one transaction with what record writes, the
+// nodes a stop or its end changes (Graph.analyze: placements of a stopped
+// namespace dangle, "unfollowed"), persisting them and letting the hook
+// see them. Called with wmu and mu held for writing; on a failure the
+// graph is reloaded from the database.
+func (s *Service) restop(ctx context.Context, ns string, record func(tx *sql.Tx) error) error {
 	err := func() error {
-		s.wmu.Lock()
-		defer s.wmu.Unlock()
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
-		if err := saveMeta(ctx, tx, "stopped:"+ns, cp); err != nil {
+		if err := record(tx); err != nil {
 			return err
 		}
-		if err := s.sealed.Purge(ctx, tx, tags); err != nil {
-			return err
+		changed := s.g.analyze()
+		names := make([]string, 0, len(changed))
+		for name := range changed {
+			names = append(names, name)
 		}
-		if err := s.repurge.Add(ctx, tx, tags); err != nil {
-			return err
+		sort.Strings(names)
+		for _, name := range names {
+			if err := s.persistNode(ctx, tx, s.g, name); err != nil {
+				return err
+			}
+		}
+		if s.opt.Hook != nil && len(changed) > 0 {
+			if err := s.opt.Hook.Update(ctx, tx, s.g, changed); err != nil {
+				return err
+			}
 		}
 		return tx.Commit()
 	}()
 	if err != nil {
-		s.opt.Logf("tree: purging %v for %s, no longer followed: %v", tags, ns, err)
+		if rerr := s.reload(ctx); rerr != nil {
+			s.opt.Logf("tree: reloading after %s's stop changed: %v", ns, rerr)
+		}
 	}
-	s.sealed.Purged(tags)
-	s.kept.Purge(s.opt.Catalog, tags)
-	s.opt.Purger.PurgeTags(tags)
+	return err
+}
+
+// unstop ends ns's stop, once the service has caught up with its head at
+// the checkpoint it was stopped at (onCatchUp): its placements are derived
+// again (restop) and it enters the combined checkpoint again (noteTrust).
+// A stop at another checkpoint meanwhile stays.
+func (s *Service) unstop(ctx context.Context, ns, head string) {
+	ctx = context.WithoutCancel(ctx)
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, stopped := s.g.stopped[ns]; !stopped || head == "" || s.cur[ns] != head {
+		return
+	}
+	delete(s.g.stopped, ns)
+	if err := s.restop(ctx, ns, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k = ?`, "stopped:"+ns)
+		return err
+	}); err != nil {
+		s.opt.Logf("tree: ending the stop of %s: %v", ns, err)
+	}
+	s.noteTrust(ctx)
+	close(s.changed)
+	s.changed = make(chan struct{})
 }
 
 // isStopped reports whether the service stopped following ns
