@@ -1077,6 +1077,12 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 	if err != nil {
 		return nil, upstreamErr("%s: %v", base.Origin, err)
 	}
+	// The source's sealings from before its raise are fetched within half
+	// of ctx's time (FollowTimeout at creation): those it doesn't serve in
+	// time are left pending, for a sync to fetch (fetchPreSealings), and
+	// the rest of the base is still mirrored.
+	psCtx, cancel := context.WithTimeout(ctx, e.opt.Remote.FollowTimeout/2)
+	defer cancel()
 	root, err := c.Root(ctx)
 	if err != nil {
 		return nil, fetchErr("GET /", err)
@@ -1242,7 +1248,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 		// And the source's sealings from before its raise, verbatim
 		// (§G.5.2 E3 sources).
 		if ch.opaque && raised {
-			if ferr := fetchPreSealings(ctx, ep, c.BaseURL(), lv.ns, name, ch, preKeys, e.preCaps()); ferr != nil {
+			if ferr := fetchPreSealings(psCtx, ep, c.BaseURL(), lv.ns, name, ch, preKeys, e.preCaps()); ferr != nil {
 				return nil, ferr
 			}
 		}
@@ -1418,8 +1424,19 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 	}
 	var m *remoteMirror
 	if !taken {
+		// Under FollowTimeout, as each base's step of a sync: a base that
+		// doesn't answer, or drips its answers, holds the request no
+		// longer, and is answered as one that doesn't answer, 502.
+		fctx, cancel := context.WithTimeout(ctx, e.opt.Remote.FollowTimeout)
 		var ferr *Error
-		if m, ferr = e.fetchRemote(ctx, cfg.Base); ferr != nil {
+		m, ferr = e.fetchRemote(fctx, cfg.Base)
+		late := fctx.Err() != nil && ctx.Err() == nil
+		cancel()
+		if ferr != nil && late && ferr.Code() != "upstream" {
+			ferr = upstreamErr("%s: no answer within %v", cfg.Base.Origin, e.opt.Remote.FollowTimeout)
+			ferr.Body["origin"] = cfg.Base.Origin
+		}
+		if ferr != nil {
 			return nil, ferr
 		}
 	}
