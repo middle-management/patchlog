@@ -858,6 +858,47 @@ func v0261SealedTrustedWithoutKeys(t *testing.T, refused bool) {
 		t.Errorf("sec raised to sealed, its keys out of the service's reach: ns:sec sent %v, queued %v (sec held at %s); %s was served %q with sec's title in the clear",
 			sent, queued, x.s.Checkpoint("sec"), before.path, before.header.Get("Cache-Control"))
 	}
+	// Nor does the service serve it again to an anonymous reader, which
+	// would undo the purge.
+	for _, path := range []string{before.path, "/cat/children?of=root"} {
+		if st, hdr, body, at := v0261Get(x, path, ""); st == 200 && strings.Contains(body, "vw3k") {
+			t.Errorf("after the purge, anonymous GET %s served %s 200 with sec's title, Cache-Control %q", path, at, hdr.Get("Cache-Control"))
+		}
+	}
+}
+
+// §9, §A.1 via §B.5 (v0.26.1): a rebuild's replay of a database from a
+// release that kept no access:{ns} record (v0.26.0 and before) purges
+// ns:{catalog} when the catalog ends private, though the replay starts
+// with no record to compare with: the previous instance may have served
+// it public under the same ats.
+func TestV0261RebuiltWithoutRecord(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "public", "keys": []any{k.Entry("*")},
+		"catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat")
+	x.fetch("/cat/children?of=root", "")
+	x.stop()
+	// As an earlier release left it.
+	sq := must(sql.Open("sqlite", sqlitedsn.DSN(db, "")))
+	if _, err := sq.Exec(`DELETE FROM meta WHERE k LIKE 'access:%'`); err != nil {
+		t.Fatal(err)
+	}
+	sq.Close()
+	must(w.PatchConfig(ctx, "cat", must(w.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
+	y := startSvc(t, sc, svcOpts{now: s.Now, db: db}, func(o *tree.Options) { o.Rebuild = true })
+	y.caughtUp("cat")
+	if sent, queued := v0261SawTag(y, "ns:cat"); !sent || !queued {
+		t.Errorf("rebuilt with no record after cat was made private: sent ns:cat %v, queued %v", sent, queued)
+	}
 }
 
 // §9, §B.5 ("tagged ... every namespace in the checkpoint (ns:{ns}); a

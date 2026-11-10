@@ -812,12 +812,27 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		return
 	}
 	// A namespace it stops following, or can't follow past an entry, for
-	// lack of keys, at a start or meanwhile, purges ns:{ns} once
-	// (purgeStopped): the config entry that took the keys away (a raise,
-	// an epoch the service can't have) is never applied, so never purges
-	// what it narrows.
-	var stopped sync.Once
-	stop := func() { stopped.Do(func() { s.purgeStopped(context.WithoutCancel(ctx), ns) }) }
+	// lack of keys, at a start or meanwhile, purges ns:{ns} (purgeStopped)
+	// once per checkpoint it is held at: the config entry that took the
+	// keys away (a raise, an epoch the service can't have) is never
+	// applied, so never purges what it narrows.
+	var (
+		smu       sync.Mutex
+		stopped   bool
+		stoppedAt string
+	)
+	stop := func() {
+		s.mu.RLock()
+		cp := s.cur[ns]
+		s.mu.RUnlock()
+		smu.Lock()
+		again := !stopped || cp != stoppedAt
+		stopped, stoppedAt = true, cp
+		smu.Unlock()
+		if again {
+			s.purgeStopped(context.WithoutCancel(ctx), ns)
+		}
+	}
 	opts := []follow.Option{
 		follow.WithMaxUnits(0),
 		follow.WithOnError(func(n string, err error) {
@@ -1519,12 +1534,13 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	// At a namespace's first batch this service shows nothing of it yet.
 	// Against what an instance before it applied, the record a rebuild
 	// keeps, a narrowing purges as any does; with no record, a genesis, it
-	// purges nothing.
+	// purges nothing, but in a rebuild's replay (Options.Rebuild), which
+	// may follow a database from a release that kept no record.
 	narrowed, recorded, err := narrowedBy(ctx, tx, g, b, co.PurgedNS)
 	if err != nil {
 		return nil, err
 	}
-	narrowed = narrowed && (s.cur[b.NS] != "" || recorded) && (b.NS == cat || g.Trust[b.NS] || oldTrust[b.NS])
+	narrowed = narrowed && (s.cur[b.NS] != "" || recorded || s.opt.Rebuild) && (b.NS == cat || g.Trust[b.NS] || oldTrust[b.NS])
 	if co.PurgedNS || narrowed {
 		res.tags = append(res.tags, "ns:"+s.actual(b.NS))
 	}
