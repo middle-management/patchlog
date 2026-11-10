@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1133,5 +1134,171 @@ func TestV0261PrunedHorizonStrictlyAfter(t *testing.T) {
 		if r.Code != c.want {
 			t.Errorf("%s: %d, want %d", c.path, r.Code, c.want)
 		}
+	}
+}
+
+// v0.26.1 review (C4 incomplete): rawGet no longer follows A's
+// redirects, but two other requests a sync makes to A still do, with B's
+// grant: sealedAt (followLog, after A refuses the namespace log) and
+// postRegistration (RemoteOptions.Register, at every sync until
+// registered; a 307 replays the POST and its body).
+func TestV0261RedirectsOutsideRawGet(t *testing.T) {
+	t.Parallel()
+	for _, step := range []string{"sealedAt", "postRegistration"} {
+		for _, host := range []string{"localhost", "127.0.0.1"} {
+			t.Run(step+"/"+host, func(t *testing.T) {
+				r := newV077Raised(t)
+				p := newV077Proxy(t, r.a, nil)
+				var opts []envOpt
+				if step == "postRegistration" {
+					opts = append(opts, func(o *core.Options) { o.Remote.Register = true })
+				}
+				b := newV0261B(t, r, p.srv.URL, opts...)
+				v0261Remote(t, b, r, "r")
+
+				var hits atomic.Int64
+				var auth, method, body atomic.Value
+				auth.Store("")
+				method.Store("")
+				body.Store("")
+				other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					hits.Add(1)
+					auth.Store(req.Header.Get("Authorization"))
+					method.Store(req.Method)
+					bs, _ := io.ReadAll(req.Body)
+					body.Store(string(bs))
+					w.WriteHeader(404)
+				}))
+				t.Cleanup(other.Close)
+				target := "http://" + host + ":" + strconv.Itoa(other.Listener.Addr().(*net.TCPAddr).Port) + "/internal/metadata"
+				inner := p.srv.Config.Handler
+				p.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					switch {
+					case step == "sealedAt" && req.Method == "GET" && req.URL.Path == "/ns/m":
+						// A head B hasn't followed yet, whose log A refuses.
+						w.Header().Set("ETag", `"`+r.x1+`"`)
+						w.WriteHeader(http.StatusFound)
+						return
+					case step == "sealedAt" && req.Method == "GET" && req.URL.Path == "/ns/m/rev/"+r.x1+"/log":
+						w.WriteHeader(http.StatusForbidden)
+						io.WriteString(w, v077Forbidden)
+						return
+					case step == "sealedAt" && req.Method == "GET" && req.URL.Path == "/ns/m/rev/"+r.x1:
+						http.Redirect(w, req, target, http.StatusFound)
+						return
+					case step == "postRegistration" && req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/branches"):
+						http.Redirect(w, req, target, http.StatusTemporaryRedirect)
+						return
+					}
+					inner.ServeHTTP(w, req)
+				})
+				if step == "postRegistration" {
+					// Past RenewBefore of the registration made at creation.
+					b.clock.Advance(25 * 24 * time.Hour)
+				}
+				for i := 0; i < 3; i++ {
+					b.clock.Advance(5 * time.Hour)
+					err := b.e.SyncRemotes(context.Background())
+					t.Logf("sync %d: %v", i, err)
+				}
+				a, _ := auth.Load().(string)
+				t.Logf("redirect to %s: hit %d times over 3 syncs, last %s, Authorization forwarded: %v, body %q", target, hits.Load(), method.Load(), a != "", body.Load())
+				if hits.Load() > 0 {
+					t.Errorf("%s: B followed A's redirect to %s (%d hits over 3 syncs, method %s, Authorization forwarded: %v)", step, target, hits.Load(), method.Load(), a != "")
+				}
+			})
+		}
+	}
+}
+
+// v0.26.1 review (C1 bound is per branch, not per origin): one hostile
+// A that every remote branch of it follows drips its answer to the log
+// read (GET /ns/m) until B gives up costs each branch's step the whole
+// FollowTimeout, one after another: k branches of A hold SyncRemotes, and
+// every other base after them, for k × FollowTimeout per sync (10 min
+// each by default, the sync interval being 5 min).
+func TestV0261StallPerBranch(t *testing.T) {
+	t.Parallel()
+	r := newV077Raised(t)
+	p := newV077Proxy(t, r.a, nil)
+	var armed atomic.Bool
+	target, _ := url.Parse(p.srv.URL)
+	rp := httputil.NewSingleHostReverseProxy(target)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if armed.Load() && req.Method == "GET" && req.URL.Path == "/ns/m" {
+			// Slow drip: headers at once, then a byte at a time.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(403)
+			for {
+				select {
+				case <-req.Context().Done():
+					return
+				case <-time.After(100 * time.Millisecond):
+					if _, err := w.Write([]byte(" ")); err != nil {
+						return
+					}
+					w.(http.Flusher).Flush()
+				}
+			}
+		}
+		rp.ServeHTTP(w, req)
+	}))
+	t.Cleanup(front.Close)
+	const timeout = time.Second
+	b := newV0261B(t, r, front.URL, func(o *core.Options) { o.Remote.FollowTimeout = timeout })
+	const k = 4
+	for i := 0; i < k; i++ {
+		v0261Remote(t, b, r, "r"+string(rune('a'+i)))
+	}
+	armed.Store(true)
+	start := time.Now()
+	err := b.e.SyncRemotes(context.Background())
+	el := time.Since(start)
+	t.Logf("SyncRemotes with %d branches of one dripping A: %v (FollowTimeout %v): %.200v", k, el, timeout, err)
+	if el >= time.Duration(k)*timeout {
+		t.Fatalf("one origin's %d branches held the sync %v: %d × FollowTimeout", k, el, k)
+	}
+}
+
+// v0.26.1 review: creation (fetchRemote, with the request's context)
+// has no deadline of its own: A dripping one pending sealing's answer
+// within its cap holds the creating request as long as it likes, past
+// FollowTimeout. Here A gives up after 4 s.
+func TestV0261CreationNoDeadline(t *testing.T) {
+	t.Parallel()
+	r := newV077Raised(t)
+	p := newV077Proxy(t, r.a, nil)
+	target, _ := url.Parse(p.srv.URL)
+	rp := httputil.NewSingleHostReverseProxy(target)
+	const drip = 4 * time.Second
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == "GET" && req.URL.Path == "/r/m/x/rev/"+r.x1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(403)
+			end := time.After(drip)
+			for {
+				select {
+				case <-req.Context().Done():
+					return
+				case <-end:
+					return
+				case <-time.After(100 * time.Millisecond):
+					if _, err := w.Write([]byte(" ")); err != nil {
+						return
+					}
+					w.(http.Flusher).Flush()
+				}
+			}
+		}
+		rp.ServeHTTP(w, req)
+	}))
+	t.Cleanup(front.Close)
+	b := newV0261B(t, r, front.URL, func(o *core.Options) { o.Remote.FollowTimeout = time.Second })
+	start := time.Now()
+	v0261Remote(t, b, r, "r")
+	el := time.Since(start)
+	t.Logf("creation took %v with FollowTimeout 1s", el)
+	if el >= drip {
+		t.Fatalf("creation took %v: A's drip held it past FollowTimeout", el)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -381,5 +382,79 @@ func TestV0261PendingRowsCap(t *testing.T) {
 	}
 	if len(fix.demote) != 2 || fix.demote[0][3] != "legacy-junk" || fix.demote[1][3] != "legacy-own" || len(fix.confirm) != 1 || fix.confirm[0][3] != "legacy-ok" {
 		t.Fatalf("legacy pruned rows: demote %v, confirm %v", fix.demote, fix.confirm)
+	}
+}
+
+// v0.26.1 review: migration 015's DELETE, run over seeded rows: it
+// deletes the rows of a purged resource and of a purged shadow namespace,
+// and keeps those of a live resource and of a tombstoned one.
+func TestV0261Migration015Delete(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := &p29Clock{t: p36T0}
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
+		Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}, KeyStore: ks, Now: now.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close() })
+	mkNS(t, e, "s", map[string]any{"encryption": map[string]any{"level": "sealed"}})
+	mkNS(t, e, "q", map[string]any{"encryption": map[string]any{"level": "sealed"}})
+	for _, ns := range []string{"s", "q"} {
+		for _, name := range []string{"live", "tomb", "gone"} {
+			if _, err := e.WriteResource(ctx, p29Req(ns), Item{Resource: name, IfNoneMatch: true,
+				Steps: []Step{{Patches: []any{p29Add("", map[string]any{"n": 1.0}), p29Add("/$nonce", seal.NewNonce())}}}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	dialect := "sqlite"
+	if e.pg {
+		dialect = "postgres"
+	}
+	body, err := os.ReadFile("migrations/" + dialect + "/015_remote_pending_backoff.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	del := string(body[strings.Index(string(body), "DELETE FROM"):])
+	if err := e.update(ctx, func(t *tx) error {
+		for _, ns := range []string{"s", "q"} {
+			n := t.nsByName(ns)
+			for _, name := range []string{"live", "tomb", "gone"} {
+				t.recordPending(n.id, name, 1, pendingSealing{kind: sealDoc, ref: "r", epoch: 1, kid: ns + "#1", pl: seal.PL{"ns": ns}, answer: pendRefused})
+			}
+			_, err := t.Exec(`UPDATE resources SET state = 1 WHERE ns = ? AND name = 'tomb'`, n.id)
+			t.must(err)
+			_, err = t.Exec(`UPDATE resources SET state = 2 WHERE ns = ? AND name = 'gone'`, n.id)
+			t.must(err)
+		}
+		_, err := t.Exec(`UPDATE namespaces SET purged = 1 WHERE name = 'q'`)
+		t.must(err)
+		_, err = t.Exec(del)
+		t.must(err)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.read(ctx, func(t *tx) error {
+		q, err := t.Query(`SELECT n.name, p.name FROM remote_pending_sealings p JOIN namespaces n ON n.ns = p.shadow ORDER BY 1, 2`)
+		t.must(err)
+		defer q.Close()
+		var got []string
+		for q.Next() {
+			var a, b string
+			t.must(q.Scan(&a, &b))
+			got = append(got, a+"/"+b)
+		}
+		if strings.Join(got, ",") != "s/live,s/tomb" {
+			panic("rows left: " + strings.Join(got, ","))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
