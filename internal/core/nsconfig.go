@@ -347,13 +347,18 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any) (*Config, *Error)
 	if cfg.DraftsFor != nil && t.draftRoot(n) == "" {
 		return nil, docInvalid("/drafts", "/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
 	}
+	// A raise to e2e is refused first, so a remote branch's never reads
+	// its source (Addendum E Levels, §G.5.2).
+	if err := t.checkNoE2ERaise(cur, cfg); err != nil {
+		return nil, err
+	}
 	baseLevel := -1
 	remote := t.remoteShadow(n) != nil
 	if remote {
 		// A remote branch's shadow follows the branch itself, and holds
 		// only what its base was when it was created: a write that makes
-		// it public, raises it to e2e or turns off a nonce requirement is
-		// judged by the base's current namespace document (§G.5.2).
+		// it public or turns off a nonce requirement is judged by the
+		// base's current namespace document (§G.5.2).
 		if err := t.checkRemoteSource(n, cur, cfg); err != nil {
 			return nil, err
 		}
@@ -522,9 +527,9 @@ func (t *tx) configInUse(n *nsRow, cur, cfg *Config) *Error {
 			return apiErr(409, "in_use", "dependents", anyStrings(deps))
 		}
 	}
-	if n.isBranch() && (!sameStrings(cur.DraftsFor, cfg.DraftsFor) || cfg.level == levelE2E && cur.level != levelE2E) {
-		// Narrowing drafts.for, or raising a branch to e2e, may leave a
-		// reference to its drafts without a copy (§6.1, §7.4).
+	if n.isBranch() && !sameStrings(cur.DraftsFor, cfg.DraftsFor) {
+		// Narrowing drafts.for may leave a reference to its drafts
+		// without a copy (§6.1, §7.4).
 		if broken := t.brokenReferences(refChange{cfg: map[int64]*Config{n.id: cfg}}); len(broken) > 0 {
 			return t.inUse(broken, "the change would leave references to this branch's draft schema revisions without a copy (§6.1)")
 		}
@@ -615,13 +620,11 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 		// namespace carries ns:{ns}. Its branches can't be public now
 		// (planConfig refuses while they are, sealed pairs aside, which
 		// keep serving ciphertext under their own tags). So must, on any
-		// raise to sealed or e2e, sealed to e2e included, whatever the
-		// read setting (Addendum E Levels, Changing it): the /heads pages
-		// listing created, size and digest and the revisions sent with
-		// Last-Modified and Repr-Digest (§7.1, §7.4), which the level now
-		// hides, and at e2e the namespace documents, log ranges and
-		// grants it now serves in the clear or, from before the raise,
-		// sealed as before (preraise.go). A level is never lowered.
+		// raise to sealed, whatever the read setting (Addendum E Levels,
+		// Changing it): the /heads pages listing created, size and digest
+		// and the revisions sent with Last-Modified and Repr-Digest (§7.1,
+		// §7.4), which the level now hides. A level is never lowered, nor
+		// raised to e2e (checkNoE2ERaise).
 		t.tags = append(t.tags, "ns:"+n.name)
 	}
 	return seq

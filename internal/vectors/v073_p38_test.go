@@ -43,7 +43,7 @@ func TestSealedPlaintextsServed(t *testing.T) {
 		"grant":                          {"id", "root", "stored"},
 		"namespace log range":            {"author", "created", "id", "kind", "prev", "resource", "target"},
 		"resource purge event":           {"created", "kind", "resource", "target"},
-		"resource log entry (rev)":       {"author", "created", "id", "kind", "patches"},
+		"resource log entry (rev)":       {"author", "created", "id", "kind", "parent", "patches"}, // parent "" at genesis (v0.81)
 		"resource log entry (tombstone)": {"author", "created", "id", "kind", "parent"},
 	}
 	seen := 0

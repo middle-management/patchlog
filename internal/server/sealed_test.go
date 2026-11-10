@@ -84,6 +84,17 @@ func resKey(t *testing.T, ke []byte, ns, name string) []byte {
 	return k
 }
 
+// nsKey is K_n of epoch key ke of namespace ns (§E.2.1): what namespace
+// documents, log ranges, events and grants are sealed under since v0.81.
+func nsKey(t *testing.T, ke []byte, ns string) []byte {
+	t.Helper()
+	k, err := seal.NamespaceKey(ke, ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
 // open decrypts a JWE, requiring kid and pl.
 func open(t *testing.T, jwe string, key []byte, kid string, pl seal.PL) []byte {
 	t.Helper()
@@ -206,7 +217,10 @@ func TestSealedOutputs(t *testing.T) {
 		if !isJOSE(nr) || nr.H.Get("Cache-Control") != ccImmutable || nr.H.Get("X-Config-Revision") == "" {
 			t.Fatalf("ns doc headers %v", nr.H)
 		}
-		nd := open(t, string(nr.Body), ke, "s#1", seal.NamespaceDocPL("s", head))
+		nd := open(t, string(nr.Body), nsKey(t, ke, "s"), "s#1", seal.NamespaceDocPL("s", head))
+		if _, err := seal.OpenExpect(string(nr.Body), ke, "s#1", seal.NamespaceDocPL("s", head)); err == nil {
+			t.Fatal("a namespace document opens under K_e itself (§E.2.1, scenario 59)")
+		}
 		if v := jsonv.MustParse(nd).(map[string]any); v["read"] != "public" {
 			t.Fatalf("ns doc %s", nd)
 		}
@@ -222,7 +236,7 @@ func TestSealedOutputs(t *testing.T) {
 		for i, m := range plain.Entries {
 			want[i] = m
 		}
-		pt := open(t, string(rr.Body), ke, "s#1", seal.RangePL("s", "", head))
+		pt := open(t, string(rr.Body), nsKey(t, ke, "s"), "s#1", seal.RangePL("s", "", head))
 		if string(pt) != string(canonical(want)) {
 			t.Fatalf("range %s != %s", pt, canonical(want))
 		}
@@ -233,7 +247,7 @@ func TestSealedOutputs(t *testing.T) {
 		since := plain.Entries[1]["id"].(string)
 		rr2 := e.get("/ns/s/rev/" + head + "/log?since=" + since)
 		expect(t, rr2, 200)
-		open(t, string(rr2.Body), ke, "s#1", seal.RangePL("s", since, head))
+		open(t, string(rr2.Body), nsKey(t, ke, "s"), "s#1", seal.RangePL("s", since, head))
 		out["range2"] = string(rr2.Body)
 		// Long-poll answers have the log shapes.
 		lp := e.get("/ns/s/log?live=long-poll&since=" + since)
@@ -267,7 +281,9 @@ func TestSealedOutputs(t *testing.T) {
 	}
 
 	// Events: resource events carry the stored entry JWEs; namespace
-	// events one JWE per entry, the stored range (prev, id].
+	// events one JWE per entry, sealed as the range (prev, id] under K_n
+	// with the entry itself as plaintext (§E.2.2), never the one-entry
+	// range's bytes, whose plaintext is the array [entry] (v0.81).
 	ch, _, cancel := e.openSSE("/r/s/x/events", nil)
 	for _, id := range append(append([]string{}, ids...), tomb, ids2) {
 		ev := next(t, ch)
@@ -283,12 +299,17 @@ func TestSealedOutputs(t *testing.T) {
 	for _, m := range plain.Entries {
 		ev := next(t, nch)
 		id := m["id"].(string)
-		pt := open(t, ev.data, ke, "s#1", seal.RangePL("s", prev, id))
-		if ev.id != id || string(pt) != string(canonical([]any{m})) {
+		pt := open(t, ev.data, nsKey(t, ke, "s"), "s#1", seal.RangePL("s", prev, id))
+		if ev.id != id || string(pt) != string(canonical(m)) {
 			t.Fatalf("ns event %s: %s", id, pt)
 		}
-		if r := e.get("/ns/s/rev/" + id + "/log?since=" + prev); prev != "" && string(r.Body) != ev.data {
-			t.Fatal("an event's JWE differs from the stored range")
+		if _, err := seal.OpenExpect(ev.data, ke, "s#1", seal.RangePL("s", prev, id)); err == nil {
+			t.Fatal("a namespace event opens under K_e (scenario 59)")
+		}
+		if r := e.get("/ns/s/rev/" + id + "/log?since=" + prev); string(r.Body) == ev.data {
+			t.Fatal("an event's JWE is the stored one-entry range")
+		} else if rp := open(t, string(r.Body), nsKey(t, ke, "s"), "s#1", seal.RangePL("s", prev, id)); string(rp) != string(canonical([]any{m})) {
+			t.Fatalf("one-entry range %s: %s", id, rp)
 		}
 		prev = id
 	}
@@ -557,7 +578,7 @@ func TestSealedRotation(t *testing.T) {
 	open(t, lg[1].(string), resKey(t, keys["s#2"], "s", "a"), "s#2", seal.ResourcePL("s", "a", a2, "rev"))
 	// Namespace documents and ranges use the epoch in force at them.
 	head := e.nsHead("s")
-	open(t, string(e.get("/ns/s/rev/"+head).Body), keys["s#2"], "s#2", seal.NamespaceDocPL("s", head))
+	open(t, string(e.get("/ns/s/rev/"+head).Body), nsKey(t, keys["s#2"], "s"), "s#2", seal.NamespaceDocPL("s", head))
 
 	// The engine's rotation (serve -rotate-epochs) writes the config as a
 	// system principal.
@@ -574,7 +595,7 @@ func TestSealedRotation(t *testing.T) {
 	}
 	lg2 := e.get("/ns/s/rev/" + e.nsHead("s") + "/log?since=" + head)
 	k4, _ := e.keysOf("s", nil, "")
-	pt := open(t, string(lg2.Body), k4["s#4"], "s#4", seal.RangePL("s", head, e.nsHead("s")))
+	pt := open(t, string(lg2.Body), nsKey(t, k4["s#4"], "s"), "s#4", seal.RangePL("s", head, e.nsHead("s")))
 	entries := jsonv.MustParse(pt).([]any)
 	if len(entries) != 2 || entries[1].(map[string]any)["author"] != core.RotateAuthor {
 		t.Fatalf("rotation entries %s", pt)

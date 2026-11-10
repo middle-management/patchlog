@@ -48,6 +48,7 @@ type Keys struct {
 	mu        sync.Mutex
 	recipient *ecdh.PrivateKey
 	epoch     map[string][]byte // kid -> K_e
+	nsKeys    map[string][]byte // kid -> K_n, derived from K_e
 	res       map[string][]byte // kid "\n" resource -> K_r
 	noFetch   bool
 	// bases caches, per server and e2e namespace, the namespaces of its
@@ -58,7 +59,7 @@ type Keys struct {
 // NewKeys returns an empty key cache. recipient, if not nil, unwraps keys
 // the server wraps to the grant's enc (§E.2.3).
 func NewKeys(recipient *ecdh.PrivateKey) *Keys {
-	return &Keys{recipient: recipient, epoch: map[string][]byte{}, res: map[string][]byte{}}
+	return &Keys{recipient: recipient, epoch: map[string][]byte{}, nsKeys: map[string][]byte{}, res: map[string][]byte{}}
 }
 
 // StaticKeys returns a key cache that never fetches: only keys added with
@@ -69,7 +70,10 @@ func StaticKeys() *Keys {
 	return k
 }
 
-// Add caches an epoch key K_e under its kid "{ns}#{e}".
+// Add caches an epoch key K_e under its kid "{ns}#{e}". K_e itself opens
+// nothing: namespace content (namespace documents, log ranges, events and
+// grants) opens under K_n and resource content under K_r, both derived
+// from it (§E.2.1).
 func (k *Keys) Add(kid string, key []byte) {
 	k.mu.Lock()
 	k.epoch[kid] = append([]byte(nil), key...)
@@ -91,16 +95,27 @@ func (k *Keys) cached(kid, resource string) []byte {
 			return r
 		}
 	}
+	if resource == "" {
+		if kn, ok := k.nsKeys[kid]; ok {
+			return kn
+		}
+	}
 	ke, ok := k.epoch[kid]
 	if !ok {
 		return nil
 	}
-	if resource == "" {
-		return ke
-	}
 	ns, _, err := seal.ParseKid(kid)
 	if err != nil {
 		return nil
+	}
+	if resource == "" {
+		// K_n = HKDF(K_e, "patchlog-e2", ns ‖ 0x0A) (§E.2.1).
+		kn, err := seal.NamespaceKey(ke, ns)
+		if err != nil {
+			return nil
+		}
+		k.nsKeys[kid] = kn
+		return kn
 	}
 	kr, err := seal.ResourceKey(ke, ns, resource)
 	if err != nil {
@@ -298,11 +313,11 @@ func isJOSE(r *response) bool {
 
 // open decrypts a JWE of namespace ns. want returns the pl it must carry,
 // given its (unauthenticated) header; resource names the resource whose key
-// opens it ("" for namespace content). Its kid must name ns, or, for a
-// resource document or log entry an e2e namespace reads through from a
-// base, that base (readThrough), whose ns its pl then carries too, as
-// Levels have readers accept for content from before the base's raise to
-// e2e, which the branch serves as the base does (Addendum E Levels, §E.2.2).
+// opens it ("" for namespace content, under K_n). Its kid must name ns,
+// or, for a resource document or log entry an e2e namespace reads through
+// from a base, that base (readThrough), whose ns its pl then carries too,
+// as readers accept a base's ns for content read through (Addendum E
+// Levels, §E.2.2, §E.3.1).
 func (c *Client) open(ctx context.Context, ns, resource, jwe string, want func(h *seal.Header) (seal.PL, error)) ([]byte, error) {
 	if c.keys == nil {
 		return nil, ErrNoKeys

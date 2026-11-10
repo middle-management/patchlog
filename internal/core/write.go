@@ -1856,6 +1856,7 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 	// The revisions, one statement per step index: a step's parent is the
 	// step before it.
 	var epochs, snaps [][]any
+	reserve := map[string]int64{} // revisions by resource name, at E2 (sealcount.go)
 	for k := 0; ; k++ {
 		var rows [][]any
 		var stepItems []*item
@@ -1931,8 +1932,10 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 				}
 			}
 			if cfg.level == levelSealed {
-				// The epoch that seals this entry forever (§E.2.1).
+				// The epoch that seals this entry forever (§E.2.1), and
+				// the room its later sealings need under the bound.
 				epochs = append(epochs, []any{seq, cfg.Epoch})
+				reserve[it.Resource]++
 			}
 			if step.del {
 				continue
@@ -1971,6 +1974,9 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 	}
 	t.bulkExec(insRevEpochs, epochs)
 	t.bulkExec(insSnapshots, snaps)
+	if len(reserve) > 0 {
+		t.reserveWrite(n, cfg.Epoch, reserve, 0)
+	}
 
 	// The heads move, each from the one its precondition matched, or not
 	// at all: on Postgres a writer of another resource holds the

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"sort"
@@ -267,17 +268,17 @@ type Rev struct {
 	Horizon string
 	Archive string // URL of the archive holding a pruned revision, if any (§8.6)
 	Public  bool
-	// Fold is set (Status 302) for a revision of an e2e resource (§E.3):
-	// the server has no document, and the client folds the log from
-	// FoldSince (the latest snapshot at or before the revision, "" for
-	// genesis) up to the revision.
-	Fold      bool
-	FoldSince string
-	// Snapshot is set for a revision of an e2e resource that has a stored
-	// prune snapshot (§7.1 Paging, §8.6): JWE is that sealed snapshot,
-	// served as the revision (Status 200), or with the 410 of a tombstone
-	// horizon (Code "tombstone"), whose snapshot is the last live document.
+	// Snapshot is set for a revision of an e2e resource that a prune's
+	// stored snapshot stands for (§7.1, §8.6): JWE is that sealed snapshot,
+	// served as the revision (Status 200), at the horizon or, at a
+	// tombstone horizon, at the tombstone's parent (§E.3.1). Any other
+	// revision of an e2e resource that would be 200 is Status 404 with
+	// Code "not_offered": the server never folds (§7.1), and the reader
+	// folds the log from Last, else Horizon, else genesis.
 	Snapshot bool
+	// Last is, with a not_offered 404, the parent of the resource's
+	// horizon where that horizon is a tombstone (§7.1).
+	Last string
 	// Referrer is set for a schema revision served under schemaReads to a
 	// reader of a referrer (§6.1). The grant is in Authorization and no
 	// edge cookie covers the path, so an edge forwards the read undecided:
@@ -307,7 +308,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		return c.answer(true), nil
 	}
 	g := e.rc.load(ns)
-	public, cached, plain, preRaised := false, false, false, false
+	public, cached, plain := false, false, false
 	var out *Rev
 	var job *sealJob
 	var nsRowID int64
@@ -364,63 +365,16 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if plain {
 			out.Created = time.UnixMilli(row.created)
 		}
-		e2e := t.e2eContent(n, name)
-		// Content from before an e2e raise is served as at the level
-		// before, in the clear or sealed, its prune snapshot included
-		// (Addendum E Levels, §7.1 Paging, preraise.go).
-		pre := t.preRaiseOf(n, row)
-		if pre != nil {
-			e2e, preRaised = false, true
-			if pre.sealed() && row.kind != kindTombstone {
-				if j := (&sealJob{kind: sealDoc, key: name + "/" + row.id.String()}); t.stored(pre.m, j) {
-					out.Status, out.JWE = 200, j.jwe
-					return nil
-				}
-			}
-		}
-		if e2e {
-			// A prune's sealed snapshot is served as /rev/{H}, never as a
-			// log entry (§7.1 Paging, §8.6). It stays stored after an
-			// archive restore clears the horizon, so the answer doesn't
-			// change once given.
-			if jwe := t.e2eSnapshot(row); jwe != "" {
-				out.Snapshot, out.JWE = true, jwe
-				if row.kind == kindTombstone {
-					out.Status, out.Code = 410, "tombstone"
-				} else {
-					out.Status = 200
-				}
-				return nil
-			}
+		if t.e2eContent(n, name) {
+			// §7.1 End-to-end namespaces: the server never folds.
+			t.e3Rev(n, row, out)
+			return nil
 		}
 		if row.kind == kindTombstone {
 			out.Status, out.Code = 410, "tombstone"
 			return nil
 		}
-		if e2e {
-			if !row.patches.Valid {
-				var state int
-				t.must(t.QueryRow(`SELECT state FROM resources WHERE res = ?`, row.res).Scan(&state))
-				if state == statePurged {
-					out.Status = 410
-					return nil
-				}
-				out.Status, out.Code = 410, "pruned"
-				out.Horizon, out.Archive = t.horizonID(row.res), t.archiveURL(row.res, row.seq)
-				return nil
-			}
-			out.Status, out.Fold, out.FoldSince = 302, true, t.preRaiseFoldSince(n, row)
-			return nil
-		}
 		b, err := t.docBytesAt(row)
-		if err != nil && pre != nil {
-			// An E3 prune at a horizon from before the raise left no
-			// document to serve as before; its snapshot stands for it.
-			if jwe := t.e2eSnapshot(row); jwe != "" {
-				out.Status, out.Snapshot, out.JWE = 200, true, jwe
-				return nil
-			}
-		}
 		if err != nil {
 			var pe *prunedError
 			if errors.As(err, &pe) {
@@ -432,23 +386,18 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			return nil
 		}
 		out.Status, out.Doc = 200, b
-		if plain || pre != nil && !pre.sealed() {
-			// In the clear, from before a raise from none or at-rest too:
-			// a key holder compiles it as the server resolves it (CIS-24).
+		if plain {
+			// In the clear: a key holder compiles it as the server
+			// resolves it (CIS-24).
 			out.SchemaRules = t.schemaRulesHeader(row, b)
 		}
 		if plain && row.size.Valid && row.size.Int64 == int64(len(b)) && len(row.digest) == sha256.Size {
 			// The digest the write stored of these bytes (headMeta).
 			out.Digest = row.digest
 		}
-		switch {
-		case t.isSealedNS(n):
+		if t.isSealedNS(n) {
 			nsRowID = n.id
 			job = t.resJob(n, name, row, sealDoc, func() []byte { return b })
-		case pre != nil && pre.sealed():
-			// Stored under the raised namespace, as it serves it.
-			nsRowID = pre.m.id
-			job = t.preRaiseResJob(pre, name, row, sealDoc, func() []byte { return b })
 		}
 		return nil
 	})
@@ -456,12 +405,11 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
 			out.Doc, out.JWE, out.Digest = nil, job.jwe, nil
 		}
-	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot && !preRaised {
+	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot {
 		// A plain document (sealed ones have a job, e2e content no
 		// document, and an e2e keyring is kept without its created time
 		// and digest): immutable, and the same for every reader. Hashed
-		// here unless the write stored its digest. Content from before an
-		// e2e raise isn't kept: reads of e2e content skip the cache.
+		// here unless the write stored its digest.
 		d := revDoc{doc: out.Doc, meta: plain, rules: out.SchemaRules}
 		if plain {
 			d.created = out.Created.UnixMilli()
@@ -475,6 +423,95 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		e.rc.putRev(g, ns, name, id, d, public)
 	}
 	return out, err
+}
+
+// e3Rev answers GET /r/{ns}/{name}/rev/{id} for row, a revision of an
+// e2e resource other than the keyring as n sees it (§7.1 End-to-end
+// namespaces), after the read check: a tombstone is 410; a prune's stored
+// snapshot that stands for row is 200 application/jose, at the horizon
+// or, at a tombstone horizon, at its parent (§E.3.1), a base's included
+// in a branch (§7.6); a revision below the horizon is 410 pruned; any
+// other is 404 not_offered with the horizon as n sees it and, where that
+// horizon is a tombstone, last, its parent. The server never folds. A
+// stored snapshot whose header binds another revision, as those stored at
+// a tombstone horizon before v0.81 did, or carries a pre-v0.63 pl kind or
+// zip, is never served: its revision answers 410 pruned (stored.md item
+// 4).
+func (t *tx) e3Rev(n *nsRow, row *revRow, out *Rev) {
+	if row.kind == kindTombstone {
+		out.Status, out.Code = 410, "tombstone"
+		return
+	}
+	pruned := func() {
+		var state int
+		t.must(t.QueryRow(`SELECT state FROM resources WHERE res = ?`, row.res).Scan(&state))
+		if state == statePurged {
+			out.Status = 410
+			return
+		}
+		out.Status, out.Code = 410, "pruned"
+		out.Horizon, out.Archive = t.horizonID(row.res), t.archiveURL(row.res, row.seq)
+	}
+	if jwe, ok, found := t.e3SnapshotFor(row); found {
+		if !ok {
+			pruned()
+			return
+		}
+		out.Status, out.Snapshot, out.JWE = 200, true, jwe
+		return
+	}
+	if !row.patches.Valid {
+		pruned()
+		return
+	}
+	out.Status, out.Code = 404, "not_offered"
+	if h := t.e3Horizon(row); h != nil {
+		out.Horizon = h.id.String()
+		if h.kind == kindTombstone && h.parentSeq.Valid {
+			out.Last = t.revID(h.parentSeq.Int64).String()
+		}
+	}
+}
+
+// e3SnapshotFor returns the stored prune snapshot that stands for
+// revision row (§8.6, §E.3.1): the one stored at row, or at a tombstone
+// of row's resource row whose parent row is, the newest; a base's, read
+// through, in a branch (§7.6). found reports whether there is one; ok
+// whether it may be served, its header binding row as the namespace
+// whose resource stored it names it (snapshotHeaderServable).
+func (t *tx) e3SnapshotFor(row *revRow) (jwe string, ok, found bool) {
+	var seq, res int64
+	want := row.id.String()
+	err := t.QueryRow(`SELECT s.seq, s.res, s.jwe FROM e2e_snapshots s WHERE s.seq = ?`, row.seq).Scan(&seq, &res, &jwe)
+	if errors.Is(err, sql.ErrNoRows) {
+		// A tombstone and the parent it can be pruned at are of one
+		// resource row: a branch's first own entry, whose parent is a
+		// base's, has nothing below it to prune (pruneToE2E).
+		err = t.QueryRow(`SELECT s.seq, s.res, s.jwe FROM e2e_snapshots s JOIN revisions h ON h.seq = s.seq
+			WHERE s.res = ? AND h.kind = ? AND h.parent_seq = ? ORDER BY s.seq DESC LIMIT 1`, row.res, kindTombstone, row.seq).Scan(&seq, &res, &jwe)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, false
+	}
+	t.must(err)
+	var ns int64
+	var name string
+	t.must(t.QueryRow(`SELECT ns, name FROM resources WHERE res = ?`, res).Scan(&ns, &name))
+	return jwe, snapshotHeaderServable(jwe, t.kidName(t.nsByID(ns)), name, want), true
+}
+
+// e3Horizon returns the horizon of row's resource as the namespace
+// reading row sees it (§7.1): the newest horizon in row's ancestry, a
+// base's for content read through, nil if none.
+func (t *tx) e3Horizon(row *revRow) *revRow {
+	for _, sg := range t.ancestry(row) {
+		var h sql.NullInt64
+		t.must(t.QueryRow(`SELECT horizon_seq FROM resources WHERE res = ?`, sg.res).Scan(&h))
+		if h.Valid && h.Int64 <= sg.max {
+			return t.rev(h.Int64)
+		}
+	}
+	return nil
 }
 
 // Log is a range of log entries.
@@ -573,36 +610,17 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if limit > 0 {
 			maxBytes = e.opt.Maximums.LogPageBytes
 		}
-		// No page spans an e2e raise: one that would ends with the last
-		// revision from before it, and a page from before it is served
-		// as at the level before (§7.1 Paging, Addendum E Levels).
-		var pre *preRaise
-		cut := false
-		if t.isE2E(n) {
-			if b := t.preRaiseRange(n, to, sinceID); b != nil {
-				to, cut = b, true
-			}
-			pre = t.preRaiseOf(n, to)
-		}
 		// At E2 each entry is served as its own JWE, stored or sealed now,
 		// and a page is bounded by their lengths (logBetween).
 		sealed := t.isSealedNS(n)
 		var served func(LogEntry) int
-		switch {
-		case sealed:
+		if sealed {
 			served = func(le LogEntry) int {
 				j := t.resJob(n, name, le.row, sealEntry, func() []byte { return jsonv.Canonical(le.value()) })
-				t.must(j.sealNow())
+				l, err := j.servedLen()
+				t.must(err)
 				jobs = append(jobs, j)
-				return len(j.jwe)
-			}
-		case pre != nil && pre.sealed():
-			sealed = true
-			served = func(le LogEntry) int {
-				j := t.preRaiseResJob(pre, name, le.row, sealEntry, func() []byte { return jsonv.Canonical(le.value()) })
-				t.must(j.sealNow())
-				jobs = append(jobs, j)
-				return len(j.jwe)
+				return l
 			}
 		}
 		entries, more, err := t.logBetween(to, sinceID, limit, maxBytes, served)
@@ -619,7 +637,7 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 			}
 			return nil
 		}
-		out.Status, out.More = 200, more || cut
+		out.Status, out.More = 200, more
 		// An e2e range whose since is a pruning horizon holds only the
 		// entries after it: the horizon's sealed snapshot is served as
 		// /rev/{H} (ResourceRev), never as a log entry (§7.1 Paging).
@@ -631,9 +649,6 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if sealed {
 			jobs = jobs[:len(entries)]
 			out.Sealed, nsRowID = true, n.id
-			if pre != nil {
-				nsRowID = pre.m.id
-			}
 		}
 		return nil
 	})
@@ -729,18 +744,9 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 		t.must(t.QueryRow(`SELECT l.config_seq, c.doc FROM ns_log l JOIN ns_config c ON c.seq = l.config_seq WHERE l.seq = ?`, seq).Scan(&cseq, &doc))
 		out = &NSInfo{Head: nsID, Config: t.configID(cseq).String(), Doc: []byte(doc),
 			Public: t.cachePublic(n)}
-		switch raise := t.nsPreRaise(n, seq); {
-		case t.isSealedNS(n):
+		if t.isSealedNS(n) {
 			nsRowID = n.id
 			job = t.configJob(n, seq, nsID, []byte(doc))
-		case raise != nil && raise.level == levelSealed:
-			// From before a raise from sealed: sealed as before (Addendum
-			// E Levels), which a purge, destroying the epoch keys, ends.
-			if n.purged {
-				return t.purgedRead(n)
-			}
-			nsRowID = n.id
-			job = t.preRaiseConfigJob(n, raise, seq, nsID, []byte(doc))
 		}
 		return nil
 	})
@@ -863,14 +869,6 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			q += ` LIMIT ?`
 			args = append(args, limit)
 		}
-		// No page spans an e2e raise (§7.1 Paging, Addendum E Levels): a
-		// page that starts before the raising entry ends before it.
-		var raise *e2eRaise
-		if t.isE2E(n) {
-			if r := t.e2eRaiseOf(n); r != nil && r.seq != 0 {
-				raise = r
-			}
-		}
 		rows, err := t.Query(q, args...)
 		t.must(err)
 		// A page holds at most limit entries, and at most limit resource
@@ -882,9 +880,6 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		units := 0
 		for rows.Next() {
 			r := t.scanNSLogRow(rows)
-			if raise != nil && len(rs) > 0 && rs[0].seq < raise.seq && r.seq >= raise.seq {
-				break
-			}
 			u := 1
 			if es, ok := r.m["entries"].([]any); ok && len(es) > 1 {
 				u = len(es)
@@ -896,16 +891,6 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			rs = append(rs, r)
 		}
 		rows.Close()
-		// A page from before a raise from sealed is sealed as before,
-		// under the last epoch and pad setting before the raise; a purge,
-		// destroying the epoch keys, ends it, as in a sealed namespace.
-		var preSealed *e2eRaise
-		if raise != nil && raise.level == levelSealed && (len(rs) > 0 && rs[0].seq < raise.seq || len(rs) == 0 && toSeq < raise.seq) {
-			if n.purged {
-				return t.purgedRead(n)
-			}
-			preSealed = raise
-		}
 		out.Status = 200
 		out.Last = since
 		// An entry's prev is the row before it in the page, but for the
@@ -931,29 +916,22 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		if resource != "" {
 			// A resource stream's purge and prune events (eventseal.go).
 			out.Entries = resourceEvents(out.Entries, resource)
-			switch {
-			case t.isSealedNS(n):
-				out.Sealed = true
-				out.EntryJWEs = t.sealResourceEvents(n, resource, out.Entries)
-			case preSealed != nil:
-				out.Sealed = true
-				out.EntryJWEs = t.preRaiseResourceEvents(n, preSealed, resource, out.Entries)
+			if t.isSealedNS(n) {
+				out.Sealed, nsRowID = true, n.id
+				jobs = t.resourceEventJobs(n, resource, out.Entries)
 			}
 			return nil
 		}
-		rangeJob := func(since string, toSeq int64, toID string, plain func() []byte) *sealJob {
-			if preSealed != nil {
-				return t.preRaiseRangeJob(n, preSealed, since, toID, plain)
-			}
-			return t.rangeJob(n, since, toSeq, toID, plain)
-		}
-		if t.isSealedNS(n) || preSealed != nil {
+		if t.isSealedNS(n) {
 			out.Sealed, nsRowID = true, n.id
 			if perEntry {
-				for i, r := range rs {
-					m := out.Entries[i]
+				// A namespace event is its one entry, sealed as the range
+				// (prev, id] under K_n of the current epoch (§E.2.2), and
+				// never stored: it shares its pl with the one-entry range,
+				// whose plaintext is the array [entry] (eventJob).
+				for _, m := range out.Entries {
 					prev, _ := m["prev"].(string)
-					jobs = append(jobs, rangeJob(prev, r.seq, m["id"].(string), func() []byte { return jsonv.Canonical([]any{m}) }))
+					jobs = append(jobs, t.eventJob(n, prev, m["id"].(string), jsonv.Canonical(m)))
 				}
 			} else if len(rs) > 0 || nsID != "" {
 				// A range, even an empty one, is sealed as a whole, with
@@ -969,14 +947,14 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 				if len(rs) > 0 {
 					to, toID = rs[len(rs)-1].seq, out.Last
 				}
-				jobs = append(jobs, rangeJob(since, to, toID, func() []byte { return jsonv.Canonical(entries) }))
+				jobs = append(jobs, t.rangeJob(n, since, to, toID, func() []byte { return jsonv.Canonical(entries) }))
 			}
 		}
 		return nil
 	})
-	if err == nil && out != nil && out.Sealed && resource == "" {
+	if err == nil && out != nil && out.Sealed {
 		if err = e.finishSeal(ctx, nsRowID, jobs); err == nil {
-			if perEntry {
+			if perEntry || resource != "" {
 				out.EntryJWEs = make([]string, len(jobs))
 				for i, j := range jobs {
 					out.EntryJWEs[i] = j.jwe
@@ -1102,8 +1080,8 @@ func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]m
 }
 
 // Branches is the answer of GET /ns/{ns}/branches (§7.4): Public its cache
-// visibility, and Private set where it was filtered for a partial reader
-// (§B.11.9 Answers), which no cache may keep (private, no-store).
+// visibility. Private is never set since v0.78: a partial reader's
+// /branches is 403 (§B.11.9 Answers); it stays for callers of v0.77.
 type Branches struct {
 	List    []map[string]any
 	Public  bool
@@ -1111,9 +1089,9 @@ type Branches struct {
 }
 
 // BranchList is Branches with the answer's caching. A partial reader of a
-// namespace §B.11.9 covers, by the grant in Authorization, gets only the
-// local branches in which that grant verifies and allows read, and no
-// remote registrations (§B.11.9 Answers), Private.
+// namespace §B.11.9 covers is refused, 403 as for any reader without an
+// unrestricted read, before a purged namespace's 410: filtered reads
+// cover no branch (§B.11.9 Answers; v0.78).
 func (e *Engine) BranchList(ctx context.Context, ns string, cred Credentials) (*Branches, error) {
 	var out *Branches
 	err := e.read(ctx, func(t *tx) error {
@@ -1121,19 +1099,19 @@ func (e *Engine) BranchList(ctx context.Context, ns string, cred Credentials) (*
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		a, kind, _, err := t.nsAccess(n, cred)
+		_, kind, _, err := t.nsAccess(n, cred)
 		if err != nil {
 			return err
+		}
+		if kind == accessPartial {
+			return forbidden("a partial reader's grant doesn't read the branches of " + ns + ": filtered reads cover no branch (§B.11.9)")
 		}
 		if n.purged {
 			return t.purgedRead(n)
 		}
-		out = &Branches{List: []map[string]any{}, Public: t.cachePublic(n), Private: kind == accessPartial}
+		out = &Branches{List: []map[string]any{}, Public: t.cachePublic(n)}
 		for _, b := range t.branchesOf(n) {
 			cfg := t.config(b.configSeq)
-			if out.Private && !t.branchReadable(a, b, cfg) {
-				continue
-			}
 			m := map[string]any{"name": b.name, "at": t.nsLogID(b.baseAt.Int64).String(), "frozen": cfg.Frozen, "purged": b.purged}
 			if cfg.Successor != "" {
 				m["successor"] = cfg.Successor
@@ -1143,27 +1121,11 @@ func (e *Engine) BranchList(ctx context.Context, ns string, cred Credentials) (*
 			}
 			out.List = append(out.List, m)
 		}
-		if !out.Private {
-			// Remote branches whose registration hasn't expired (§G.3).
-			out.List = append(out.List, t.liveRegistrations(n)...)
-		}
+		// Remote branches whose registration hasn't expired (§G.3).
+		out.List = append(out.List, t.liveRegistrations(n)...)
 		return nil
 	})
 	return out, err
-}
-
-// branchReadable reports whether partial reader a's grant verifies in
-// branch b, with b's document cfg, and allows read there (§B.11.9 Answers).
-func (t *tx) branchReadable(a *actor, b *nsRow, cfg *Config) bool {
-	if a == nil || a.grant == nil {
-		return false
-	}
-	ba, err := t.verifyGrant(a.grant, b.name, b, cfg, nil)
-	if err != nil || ba == nil || ba.verified == nil {
-		return false
-	}
-	ok, _ := ba.verified.Allows("read")
-	return ok
 }
 
 // Wait returns a channel closed on the next change to a namespace's log.

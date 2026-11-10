@@ -130,7 +130,7 @@ func TestNSLogPagePrev(t *testing.T) {
 			}
 			for i, jwe := range ev.EntryJWEs {
 				m := all[k+i]
-				if pt := open(t, jwe, key, kid, seal.RangePL(ns, since(k+i), m["id"].(string))); string(pt) != string(canonical([]any{m})) {
+				if pt := open(t, jwe, nsKey(t, key, ns), kid, seal.RangePL(ns, since(k+i), m["id"].(string))); string(pt) != string(canonical(m)) {
 					t.Fatalf("%s event %d: %s", ns, k+i, pt)
 				}
 			}
@@ -140,7 +140,7 @@ func TestNSLogPagePrev(t *testing.T) {
 			n := pageLen(k, len(all), 3)
 			body := p.body
 			if sealed {
-				body = open(t, string(p.body), key, kid, seal.RangePL(ns, since(k), all[k+n-1]["id"].(string)))
+				body = open(t, string(p.body), nsKey(t, key, ns), kid, seal.RangePL(ns, since(k), all[k+n-1]["id"].(string)))
 			}
 			if want := canonical(anyOf(all[k : k+n])); string(body) != string(want) {
 				t.Fatalf("%s page from %d: %s", ns, k, body)

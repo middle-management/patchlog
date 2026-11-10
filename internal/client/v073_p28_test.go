@@ -164,7 +164,12 @@ func TestV073P28OlderServerPurgePruneEvents(t *testing.T) {
 		if !sealed {
 			return "event: " + kind + "\nid: " + line + "\ndata: " + string(jsonv.Canonical(jsonv.FromGo(entry))) + "\n\n"
 		}
-		jwe, err := seal.Seal(ke, ka.Keys[0].Kid, seal.RangePL("s", prev, line), jsonv.Canonical(jsonv.FromGo([]any{entry})))
+		// Under K_n, as namespace content is sealed since v0.81 (§E.2.1).
+		kn, err := seal.NamespaceKey(ke, "s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		jwe, err := seal.Seal(kn, ka.Keys[0].Kid, seal.RangePL("s", prev, line), jsonv.Canonical(jsonv.FromGo([]any{entry})))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -288,7 +288,7 @@ func TestHeadMetaEncrypted(t *testing.T) {
 	expect(t, f.prune("e", "p", map[string]any{"horizon": ids[1], "snapshot": snap}, f.adminG), 200) // no retention rule: a * key (§8.6)
 	r := f.get("/r/e/p/rev/"+ids[1], f.readerG)
 	expect(t, r, 200)
-	if r.H.Get("X-E2E") != "snapshot" {
+	if r.H.Get("Content-Type") != seal.ContentType || string(r.Body) != snap {
 		t.Fatalf("e2e snapshot %v", r.H)
 	}
 	f.noRevMeta("/r/e/p/rev/"+ids[1], f.readerG)

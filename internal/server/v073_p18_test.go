@@ -620,12 +620,15 @@ func TestV073SealedCacheByReadMode(t *testing.T) {
 		t.Fatalf("public sealed: %d %v", r.Code, r.H)
 	}
 	for _, path := range []string{"/r/priv/a/rev/" + qid, "/r/e2/a/rev/" + eid} {
+		// At E3 a revision without a stored snapshot is 404 not_offered
+		// (v0.81 §7.1), cached as any answer of a private namespace.
+		ok := func(r *resp) bool { return r.Code < 400 || path != "/r/priv/a/rev/"+qid && r.Code == 404 }
 		r := get(path, false)
-		if r.Code >= 400 || !strings.HasPrefix(r.H.Get("Cache-Control"), "private") || r.H.Get("CDN-Cache-Control") != "no-store" {
+		if !ok(r) || !strings.HasPrefix(r.H.Get("Cache-Control"), "private") || r.H.Get("CDN-Cache-Control") != "no-store" {
 			t.Errorf("%s unverified: %d %v", path, r.Code, r.H)
 		}
 		r = get(path, true)
-		if r.Code >= 400 || !strings.HasPrefix(r.H.Get("Cache-Control"), "private") || r.H.Get("CDN-Cache-Control") == "" || r.H.Get("CDN-Cache-Control") == "no-store" {
+		if !ok(r) || !strings.HasPrefix(r.H.Get("Cache-Control"), "private") || r.H.Get("CDN-Cache-Control") == "" || r.H.Get("CDN-Cache-Control") == "no-store" {
 			t.Errorf("%s verified: %d %v", path, r.Code, r.H)
 		}
 	}

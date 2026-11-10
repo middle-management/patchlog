@@ -55,9 +55,8 @@ func p35Engine(t *testing.T, p Purger) *Engine {
 	return e
 }
 
-// v0.73 §9, Addendum E Levels, Changing it (RH-47): any raise into sealed
-// or e2e purges ns:{ns}, a raise from sealed to e2e included, whatever the
-// read setting; an epoch change doesn't.
+// v0.73 §9, Addendum E Levels, Changing it (RH-47): a raise into sealed
+// purges ns:{ns}, whatever the read setting; an epoch change doesn't.
 func TestV073P35RaisePurgesNamespaceTag(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -77,48 +76,21 @@ func TestV073P35RaisePurgesNamespaceTag(t *testing.T) {
 	if slices.Contains(p.take(), "ns:s") {
 		t.Fatal("an epoch change purged ns:s")
 	}
-	enc(map[string]any{"level": "e2e", "epoch": 3.0})
-	if tags := p.take(); !slices.Contains(tags, "ns:s") {
-		t.Fatalf("a raise from sealed to e2e purged %v, not ns:s", tags)
+	// v0.78: a raise to e2e is refused (Addendum E Levels) and purges
+	// nothing; a raise into sealed still purges.
+	if _, err := e.WriteConfig(ctx, p29Req("s"), ConfigChange{IfMatch: cfg, Patches: []any{map[string]any{"op": "replace", "path": "/encryption", "value": map[string]any{"level": "e2e", "epoch": 3.0}}}}); err == nil {
+		t.Fatal("a raise from sealed to e2e was applied")
 	}
-}
-
-// v0.73 Addendum E Levels, §8.5: a namespace raised from sealed and then
-// purged answers 410 purged for its namespace documents and log ranges
-// from before the raise, which the purge's destroyed epoch keys sealed,
-// rather than serving them in the clear; those after it stay readable as
-// at e2e.
-func TestV073P35PurgedPreRaiseSealed(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	e := p35Engine(t, discardPurger{})
-	cfg := mkNS(t, e, "s", map[string]any{"encryption": map[string]any{"level": "sealed"}})
-	if _, err := e.WriteResource(ctx, p29Req("s"), Item{Resource: "d", IfNoneMatch: true, Steps: []Step{{Patches: []any{p29Add("", map[string]any{"n": 1.0}), p29Add("/$nonce", seal.NewNonce())}}}}); err != nil {
+	if tags := p.take(); slices.Contains(tags, "ns:s") {
+		t.Fatalf("a refused raise to e2e purged %v", tags)
+	}
+	pcfg := mkNS(t, e, "p", map[string]any{"read": "grant"})
+	p.take()
+	if _, err := e.WriteConfig(ctx, p29Req("p"), ConfigChange{IfMatch: pcfg, Patches: []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}}}}); err != nil {
 		t.Fatal(err)
 	}
-	h, err := e.NamespaceHead(ctx, "s", Credentials{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	rw, err := e.WriteConfig(ctx, p29Req("s"), ConfigChange{IfMatch: cfg, Patches: []any{map[string]any{"op": "replace", "path": "/encryption", "value": map[string]any{"level": "e2e", "epoch": 2.0}}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	fw, err := e.WriteConfig(ctx, p29Req("s"), ConfigChange{IfMatch: rw.ConfigID, Patches: []any{p29Add("/frozen", true)}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.PurgeNamespace(ctx, p29Req("s"), fw.NSID, false); err != nil {
-		t.Fatal(err)
-	}
-	if st, body := p29Status(t, second(e.NamespaceRev(ctx, "s", h.Head, Credentials{}))); st != 410 || body["code"] != "purged" {
-		t.Fatalf("namespace document from before the raise after a purge: %d %v", st, body)
-	}
-	if st, body := p29Status(t, second(e.NamespaceLog(ctx, "s", h.Head, "", 0, Credentials{}))); st != 410 || body["code"] != "purged" {
-		t.Fatalf("range from before the raise after a purge: %d %v", st, body)
-	}
-	if lg, err := e.NamespaceLog(ctx, "s", "", h.Head, 0, Credentials{}); err != nil || lg.Status != 200 || lg.Sealed || len(lg.Entries) == 0 {
-		t.Fatalf("range after the raise after a purge: %v %+v", err, lg)
+	if tags := p.take(); !slices.Contains(tags, "ns:p") {
+		t.Fatalf("a raise to sealed purged %v, not ns:p", tags)
 	}
 }
 
@@ -140,83 +112,6 @@ func (a *p35Archiver) Write(_ context.Context, _, key string, b *ArchiveBundle) 
 func (*p35Archiver) Delete(context.Context, string) error { return nil }
 func (*p35Archiver) Open(context.Context, string) (io.ReadCloser, error) {
 	return nil, errors.New("p35Archiver opens nothing")
-}
-
-// v0.73 §D.4, Addendum E Levels (w3x carry-over): history pruned before a
-// raise from sealed and restored after it is served as the rest of what
-// was stored before the raise, sealed under the epoch before it; the
-// snapshots the restore rebuilds never reach a read of what was written
-// end to end, which folds.
-func TestV073P35RestoredPreRaiseRangeStaysSealed(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	ks, err := keystore.New(keystore.Generate())
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := &p29Clock{t: time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)}
-	arch := &p35Archiver{}
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
-		Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}, KeyStore: ks, Archiver: arch, Now: now.Now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { e.Close() })
-	cfg := mkNS(t, e, "s", map[string]any{"encryption": map[string]any{"level": "sealed"}})
-	var revs []string
-	parent := ""
-	for i := 1; i <= 3; i++ {
-		ps := []any{p29Add("/$nonce", seal.NewNonce()), p29Add("/n", float64(i))}
-		if parent == "" {
-			ps = []any{p29Add("", map[string]any{"n": 1.0}), p29Add("/$nonce", seal.NewNonce())}
-		}
-		w, err := e.WriteResource(ctx, p29Req("s"), Item{Resource: "d", IfMatch: parent, IfNoneMatch: parent == "", Steps: []Step{{Patches: ps}}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		parent = w.Items[0].IDs[0]
-		revs = append(revs, parent)
-	}
-	now.Advance(10 * time.Minute)
-	if _, err := e.Prune(ctx, p29Req("s"), "d", PruneRequest{Horizon: revs[2]}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.WriteConfig(ctx, p29Req("s"), ConfigChange{IfMatch: cfg, Patches: []any{map[string]any{"op": "replace", "path": "/encryption", "value": map[string]any{"level": "e2e", "epoch": 2.0}}}}); err != nil {
-		t.Fatal(err)
-	}
-	r4w, err := e.WriteResource(ctx, p29Req("s"), Item{Resource: "d", IfMatch: revs[2], Steps: []Step{{Patches: p29Sealed(t, seal.NewKey(), "s#2", "s", "d", revs[2], []any{p29Add("/n", 4.0)})}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	r4 := r4w.Items[0].IDs[0]
-	if rv, err := e.ResourceRev(ctx, "s", "d", revs[0], Credentials{}); err != nil || rv.Status != 410 {
-		t.Fatalf("pruned revision before the restore: %v %+v", err, rv)
-	}
-	res, err := e.RestoreResource(ctx, "s", "d", func(yield func(ArchiveEntry) error) error {
-		for _, en := range arch.entries {
-			if err := yield(en); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil || res.Restored != 2 {
-		t.Fatalf("restore: %v %+v", err, res)
-	}
-	for _, id := range revs {
-		rv, err := e.ResourceRev(ctx, "s", "d", id, Credentials{})
-		if err != nil || rv.Status != 200 || rv.JWE == "" || rv.Doc != nil || kidOf(rv.JWE) != "s#1" {
-			t.Fatalf("restored revision %s from before the raise: %v %+v", id, err, rv)
-		}
-	}
-	lg, err := e.ResourceLog(ctx, "s", "d", r4, "", 100, Credentials{})
-	if err != nil || !lg.Sealed || len(lg.EntryJWEs) != 3 || !lg.More || lg.Last != revs[2] {
-		t.Fatalf("restored range: %v %+v", err, lg)
-	}
-	rv, err := e.ResourceRev(ctx, "s", "d", r4, Credentials{})
-	if err != nil || rv.Status != 302 || !rv.Fold || rv.FoldSince != revs[2] || rv.Doc != nil || rv.JWE != "" {
-		t.Fatalf("revision written end to end: %v %+v", err, rv)
-	}
 }
 
 // §E.2.2 "stored once, served forever", §8.6 (P26 carry-over): a prune

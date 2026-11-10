@@ -39,10 +39,11 @@ func resourceEvents(es []map[string]any, name string) []map[string]any {
 	return out
 }
 
-// sealResourceEvents seals the events' data es of resource name of the
-// sealed namespace n, one JWE each, under K_r of n's current epoch with pl
-// { ns, name, kind } (§E.2.2).
-func (t *tx) sealResourceEvents(n *nsRow, name string, es []map[string]any) []string {
+// resourceEventJobs prepares the sealing of the events' data es of
+// resource name of the sealed namespace n, one JWE each, under K_r of n's
+// current epoch with pl { ns, name, kind } (§E.2.2): sealed at each serve,
+// once counted (finishSeal), and never stored.
+func (t *tx) resourceEventJobs(n *nsRow, name string, es []map[string]any) []*sealJob {
 	if len(es) == 0 {
 		return nil
 	}
@@ -50,12 +51,10 @@ func (t *tx) sealResourceEvents(n *nsRow, name string, es []map[string]any) []st
 	kr, err := seal.ResourceKey(t.epochKey(n.id, cfg.Epoch), n.name, name)
 	t.must(err)
 	kid := seal.Kid(n.name, cfg.Epoch)
-	out := make([]string, len(es))
+	out := make([]*sealJob, len(es))
 	for i, d := range es {
 		kind, _ := d["kind"].(string)
-		jwe, err := seal.SealMaybePadded(kr, kid, seal.ResourceEventPL(n.name, name, kind), jsonv.Canonical(d), cfg.Pad)
-		t.must(err)
-		out[i] = jwe
+		out[i] = &sealJob{name: name, kid: kid, k: kr, pl: seal.ResourceEventPL(n.name, name, kind), plain: jsonv.Canonical(d), pad: cfg.Pad}
 	}
 	return out
 }
