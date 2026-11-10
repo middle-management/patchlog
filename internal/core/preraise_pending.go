@@ -606,14 +606,14 @@ func (t *tx) settlePending(r *pendingRow) {
 // Paging), and returns each entry's JWE by id, trimmed (trimJWE); or,
 // where a page isn't a 200 array, A's answer (pendingAnswer) with the
 // entries of the pages before. chain is the range's mirrored entries up
-// to the URL's id, oldest first, from among which alone entries are
-// taken, each no longer than caps.jwe, from pages no longer than
-// caps.page. A page's X-Log-Next must name an entry of chain on that page
+// to the URL's id, oldest first, and want the entries of it to keep, each
+// with the longest sealing of it taken; the others are read past, from
+// pages no longer than caps.page. A page's X-Log-Next must name an entry of chain on that page
 // after the page's since (§7.1: "the last entry returned, the since of
 // the next page"), so each page moves through the range and there are at
 // most as many as its entries; any other is a refusal. Reading stops at
 // the page holding the URL's id, or one without X-Log-Next.
-func fetchSealedLog(ctx context.Context, ep RemoteEndpoint, baseURL, path, from string, chain []string, caps preCaps) (map[string]string, string, string) {
+func fetchSealedLog(ctx context.Context, ep RemoteEndpoint, baseURL, path, from string, chain []string, want map[string]int64, caps preCaps) (map[string]string, string, string) {
 	out := map[string]string{}
 	if len(chain) == 0 {
 		return out, pendRefused, ""
@@ -651,9 +651,7 @@ func fetchSealedLog(ctx context.Context, ep RemoteEndpoint, baseURL, path, from 
 			var id, jwe string
 			switch v := v.(type) {
 			case string:
-				if jwe = strings.TrimSpace(v); int64(len(jwe)) > caps.jwe {
-					continue
-				}
+				jwe = strings.TrimSpace(v)
 				if h, err := seal.ParseHeader(jwe); err == nil {
 					id, _ = h.PL["id"].(string)
 				}
@@ -662,7 +660,7 @@ func fetchSealedLog(ctx context.Context, ep RemoteEndpoint, baseURL, path, from 
 			}
 			if p, ok := pos[id]; ok && p > at {
 				onPage[id] = true
-				if jwe != "" {
+				if m, ok := want[id]; ok && jwe != "" && int64(len(jwe)) <= m {
 					out[id] = jwe
 				}
 			}
@@ -681,10 +679,12 @@ func fetchSealedLog(ctx context.Context, ep RemoteEndpoint, baseURL, path, from 
 
 // preEntry is a log entry from before its source's raise whose sealing B
 // asks A for (fetchPreEntries): its id, and its parent's, "" for genesis,
-// where parentKnown.
+// where parentKnown, and the longest sealing of it B takes (jweFor), 0 for
+// caps.jwe.
 type preEntry struct {
 	id, parent  string
 	parentKnown bool
+	max         int64
 }
 
 // fetchPreEntries fetches A's sealings of entries, log entries from before
@@ -707,7 +707,14 @@ func fetchPreEntries(ctx context.Context, ep RemoteEndpoint, baseURL, what strin
 		}
 		return map[string]string{}, answers
 	}
-	got, ans, hz := fetchSealedLog(ctx, ep, baseURL, what+"/rev/"+chain[len(chain)-1]+"/log", "", chain, caps)
+	want := make(map[string]int64, len(entries))
+	for _, e := range entries {
+		want[e.id] = caps.jwe
+		if e.max > 0 {
+			want[e.id] = e.max
+		}
+	}
+	got, ans, hz := fetchSealedLog(ctx, ep, baseURL, what+"/rev/"+chain[len(chain)-1]+"/log", "", chain, want, caps)
 	if ans == "" {
 		ans = pendRefused // served, but without the entry
 	}
@@ -726,7 +733,7 @@ func fetchPreEntries(ctx context.Context, ep RemoteEndpoint, baseURL, what strin
 		case !e.parentKnown || !inChain:
 			answers[e.id] = [2]string{pendRefused, ""}
 		default:
-			one, a, h := fetchSealedLog(ctx, ep, baseURL, what+"/rev/"+e.id+"/log", e.parent, chain[:i+1], caps)
+			one, a, h := fetchSealedLog(ctx, ep, baseURL, what+"/rev/"+e.id+"/log", e.parent, chain[:i+1], map[string]int64{e.id: want[e.id]}, caps)
 			if jwe, ok := one[e.id]; ok {
 				got[e.id] = jwe
 				continue

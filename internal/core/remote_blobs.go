@@ -323,6 +323,14 @@ func (e *Engine) preCaps() preCaps {
 	return preCaps{page: max(page, jwe), jwe: jwe}
 }
 
+// jweFor bounds A's sealing of content whose canonical JSON is n bytes
+// long, where B mirrored that content: base64 of it padded (§E.2.2, padmé
+// adds at most an eighth) with its IV and tag, and a header of up to
+// 8 KiB.
+func jweFor(n int) int64 {
+	return int64(seal.PadLen(n)+64)*4/3 + 8<<10
+}
+
 // blob bounds the sealed form of a blob of size bytes: the plaintext with
 // its length, padded (at most an eighth more), the header (64 KiB at most,
 // seal.ParseBlobHeader) and the IV and tag.
@@ -395,8 +403,8 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 		}
 	}
 	for i := 0; i <= last; i++ {
-		if ch.entries[i].Kid != "" {
-			entries = append(entries, preEntry{id: ch.entries[i].ID, parent: ch.entries[i].Parent, parentKnown: true})
+		if e := ch.entries[i]; e.Kid != "" {
+			entries = append(entries, preEntry{id: e.ID, parent: e.Parent, parentKnown: true, max: jweFor(len(jsonv.Canonical(e.Raw)))})
 		}
 	}
 	// A's 410 pruned for the sealing of entry i, or of a blob first
@@ -453,7 +461,7 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			continue
 		}
 		pl, want = seal.ResourcePL(kns, name, e.ID, seal.KindDoc), contentDigest(docs[i])
-		st, _, body, err := rawGet(ctx, ep, baseURL, what+"/rev/"+e.ID, nil, caps.jwe)
+		st, _, body, err := rawGet(ctx, ep, baseURL, what+"/rev/"+e.ID, nil, jweFor(len(jsonv.Canonical(docs[i]))))
 		if err == nil && st == 200 {
 			// Stored as A serves it, without whitespace around it, which
 			// openPreSealing ignores and B would serve at any length.

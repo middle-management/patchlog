@@ -141,6 +141,10 @@ func TestV0261FetchSealedLogBounds(t *testing.T) {
 		jwe[id] = v0261JWE(t, id)
 	}
 	caps := preCaps{page: 1 << 20, jwe: 4 << 10}
+	want := map[string]int64{}
+	for _, id := range chain {
+		want[id] = caps.jwe
+	}
 	t.Run("honest", func(t *testing.T) {
 		ep, n := v0261Base(t, func(w http.ResponseWriter, since string) {
 			switch since {
@@ -153,7 +157,7 @@ func TestV0261FetchSealedLogBounds(t *testing.T) {
 				v0261Page(w, "", jwe["a5"])
 			}
 		})
-		out, ans, _ := fetchSealedLog(ctx, ep, ep.BaseURL, "/r/m/w/rev/a5/log", "", chain, caps)
+		out, ans, _ := fetchSealedLog(ctx, ep, ep.BaseURL, "/r/m/w/rev/a5/log", "", chain, want, caps)
 		if ans != "" || len(out) != 4 || out["a2"] != jwe["a2"] || n.Load() != 3 {
 			t.Fatalf("honest paging: %d entries, answer %q, %d pages", len(out), ans, n.Load())
 		}
@@ -182,7 +186,7 @@ func TestV0261FetchSealedLogBounds(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			ep, n := v0261Base(t, page)
-			out, ans, _ := fetchSealedLog(ctx, ep, ep.BaseURL, "/r/m/w/rev/a5/log", "", chain, caps)
+			out, ans, _ := fetchSealedLog(ctx, ep, ep.BaseURL, "/r/m/w/rev/a5/log", "", chain, want, caps)
 			if ans != pendRefused || n.Load() > 2 {
 				t.Fatalf("%d pages, answer %q, want refused within 2 pages", n.Load(), ans)
 			}
@@ -195,9 +199,36 @@ func TestV0261FetchSealedLogBounds(t *testing.T) {
 		ep, _ := v0261Base(t, func(w http.ResponseWriter, since string) {
 			v0261Page(w, "", jwe["a1"]+strings.Repeat(" ", 8<<10), jwe["a2"], strings.Repeat("A", 8<<10))
 		})
-		out, ans, _ := fetchSealedLog(ctx, ep, ep.BaseURL, "/r/m/w/rev/a5/log", "", chain, caps)
+		out, ans, _ := fetchSealedLog(ctx, ep, ep.BaseURL, "/r/m/w/rev/a5/log", "", chain, want, caps)
 		if ans != "" || len(out) != 2 || out["a1"] != jwe["a1"] {
 			t.Fatalf("%d entries, answer %q", len(out), ans)
+		}
+		// An entry not wanted isn't kept; one longer than its bound
+		// isn't either, but still counts as on its page for X-Log-Next.
+		ep, _ = v0261Base(t, func(w http.ResponseWriter, since string) {
+			switch since {
+			case "":
+				v0261Page(w, "a2", jwe["a1"], jwe["a2"]+strings.Repeat(" ", 8<<10))
+			case "a2":
+				v0261Page(w, "", jwe["a3"], jwe["a4"], jwe["a5"])
+			}
+		})
+		some := map[string]int64{"a2": 4 << 10, "a3": 4 << 10, "a5": 16}
+		out, ans, _ = fetchSealedLog(ctx, ep, ep.BaseURL, "/r/m/w/rev/a5/log", "", chain, some, caps)
+		if ans != "" || len(out) != 2 || out["a2"] != jwe["a2"] || out["a3"] != jwe["a3"] {
+			t.Fatalf("wanted a2, a3 and a5 (too long): %d entries, answer %q", len(out), ans)
+		}
+		ep, _ = v0261Base(t, func(w http.ResponseWriter, since string) {
+			switch since {
+			case "":
+				v0261Page(w, "a2", jwe["a1"], jwe["a2"])
+			case "a2":
+				v0261Page(w, "", jwe["a3"])
+			}
+		})
+		out, ans, _ = fetchSealedLog(ctx, ep, ep.BaseURL, "/r/m/w/rev/a5/log", "", chain, map[string]int64{"a2": 16, "a3": 4 << 10}, caps)
+		if ans != "" || len(out) != 1 || out["a3"] != jwe["a3"] {
+			t.Fatalf("a2 too long, on the page X-Log-Next names: %d entries, answer %q", len(out), ans)
 		}
 		// A page longer than caps.page is a refusal, not a page that
 		// isn't an array.
@@ -205,7 +236,7 @@ func TestV0261FetchSealedLogBounds(t *testing.T) {
 		ep, _ = v0261Base(t, func(w http.ResponseWriter, since string) {
 			v0261Page(w, "", jwe["a1"], strings.Repeat("A", 8<<10))
 		})
-		if _, ans, _ := fetchSealedLog(ctx, ep, ep.BaseURL, "/r/m/w/rev/a5/log", "", chain, big); ans != pendRefused {
+		if _, ans, _ := fetchSealedLog(ctx, ep, ep.BaseURL, "/r/m/w/rev/a5/log", "", chain, want, big); ans != pendRefused {
 			t.Fatalf("a page over its cap: %q, want refused", ans)
 		}
 	})
