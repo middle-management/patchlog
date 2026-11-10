@@ -248,11 +248,16 @@ func TestVectorSealedPayloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// K_n seals what is sealed for the namespace (§E.2.1, v0.81).
+	kn, err := seal.NamespaceKey(epochKey, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
 	kid := seal.Kid("demo", 3)
 	doc := []byte(`{"title":"Hello","views":0}`)
 	// A genesis revision's entry, as the core seals it (LogEntry.value):
-	// no parent member, since it has none.
-	entry := []byte(`{"author":"user:bob","created":"2026-10-04T12:00:00Z","id":"` + idG + `","kind":"rev","patches":` + patches1 + `}`)
+	// its parent "" (§7.1, v0.81).
+	entry := []byte(`{"author":"user:bob","created":"2026-10-04T12:00:00Z","id":"` + idG + `","kind":"rev","parent":"","patches":` + patches1 + `}`)
 	// A tombstone's entry, as the core seals it (LogEntry.value): author
 	// and created beside id, kind and parent, as for a revision.
 	tombstone := []byte(`{"author":"user:bob","created":"2026-10-04T12:10:00Z","id":"` + idT + `","kind":"tombstone","parent":"` + idC + `"}`)
@@ -315,9 +320,9 @@ func TestVectorSealedPayloads(t *testing.T) {
 		{"resource log entry (rev)", "K_r", kr, seal.ResourcePL("demo", "derby", idG, seal.KindRev), entry, false},
 		{"resource log entry (tombstone)", "K_r", kr, seal.ResourcePL("demo", "derby", idT, seal.KindTombstone), tombstone, false},
 		{"resource purge event", "K_r", kr, seal.ResourceEventPL("demo", "derby", seal.KindPurge), purgeEvent, false},
-		{"namespace document", "K_e", epochKey, seal.NamespaceDocPL("demo", nsID1), []byte(`{"encryption":{"epoch":3,"level":"sealed"},"read":"public"}`), false},
-		{"namespace log range", "K_e", epochKey, seal.RangePL("demo", nsID1, nsID2), rangeEntries, false},
-		{"grant", "K_e", epochKey, seal.GrantPL("demo", i4GrantID), grantAnswer, false},
+		{"namespace document", "K_n", kn, seal.NamespaceDocPL("demo", nsID1), []byte(`{"encryption":{"epoch":3,"level":"sealed"},"read":"public"}`), false},
+		{"namespace log range", "K_n", kn, seal.RangePL("demo", nsID1, nsID2), rangeEntries, false},
+		{"grant", "K_n", kn, seal.GrantPL("demo", i4GrantID), grantAnswer, false},
 		{"E3 patch set", "K_r", kr, seal.PatchSetPL("demo", "derby", ""), []byte(patches1), false},
 		{"E3 prune snapshot", "K_r", kr, seal.SnapshotPL("demo", "derby", idC), []byte(`{"title":"Hello","views":1}`), false},
 	} {
@@ -408,8 +413,9 @@ func TestVectorSealedPayloads(t *testing.T) {
 	}
 	golden.Check(t, "sealed", obj{
 		{Key: "section", Value: "§E.2.1, §E.2.2, §E.3.1"},
-		{Key: "about", Value: "sealed payloads: JWEs (alg dir, enc A256GCM, protected header {alg, enc, kid, pl}) under K_r = HKDF(K_e, \"patchlog-e2\", ns LF name) or K_e, with K_e = 00 01 … 1f, ns demo, name derby, epoch 3 and a fixed IV; the E3 write; sealed blobs \"PLB1\" ‖ len ‖ header ‖ iv ‖ AES-256-GCM(size ‖ bytes ‖ padding) ‖ tag"},
+		{Key: "about", Value: "sealed payloads: JWEs (alg dir, enc A256GCM, protected header {alg, enc, kid, pl}) under K_r = HKDF(K_e, \"patchlog-e2\", ns LF name) or K_n = HKDF(K_e, \"patchlog-e2\", ns LF), with K_e = 00 01 … 1f, ns demo, name derby, epoch 3 and a fixed IV; the E3 write; sealed blobs \"PLB1\" ‖ len ‖ header ‖ iv ‖ AES-256-GCM(size ‖ bytes ‖ padding) ‖ tag"},
 		{Key: "K_r", Value: golden.Hex(kr)},
+		{Key: "K_n", Value: golden.Hex(kn)},
 		{Key: "vectors", Value: vs},
 	})
 }

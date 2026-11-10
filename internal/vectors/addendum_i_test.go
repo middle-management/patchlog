@@ -29,6 +29,7 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sig"
 	"github.com/middle-management/patchlog/internal/tree"
+	"github.com/middle-management/patchlog/internal/vectors/golden"
 	"github.com/middle-management/patchlog/internal/verify"
 )
 
@@ -667,4 +668,46 @@ func deployment(t *testing.T, ns string) *client.Client {
 		t.Fatal(err)
 	}
 	return c
+}
+
+// I.13 (§E.2.2, §C.3.1): a grant is sealed under K_n (v0.81), not K_e:
+// I.14's token's { id, root, stored }, as the reference serves it
+// (sealed.json's plaintext), sealed with I.7's K_e through NamespaceKey,
+// kid demo#3 and the IV c0 c1 … cb, gives I.13's tag.
+func TestI13GrantUnderKn(t *testing.T) {
+	t.Parallel()
+	var sf struct {
+		Vectors []struct {
+			Name      string `json:"name"`
+			Plaintext string `json:"plaintext"`
+		} `json:"vectors"`
+	}
+	if !golden.Load(t, "sealed", &sf) {
+		t.Fatal("testdata/sealed.json is missing")
+	}
+	var plain string
+	for _, v := range sf.Vectors {
+		if v.Name == "grant" {
+			plain = v.Plaintext
+		}
+	}
+	ke := make([]byte, 32)
+	for i := range ke {
+		ke[i] = byte(i)
+	}
+	kn, err := seal.NamespaceKey(ke, "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	iv := make([]byte, 12)
+	for i := range iv {
+		iv[i] = 0xc0 + byte(i)
+	}
+	jwe, err := seal.SealWithIV(kn, "demo#3", seal.GrantPL("demo", i4GrantID), []byte(plain), iv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag := jwe[strings.LastIndexByte(jwe, '.')+1:]; tag != "sAMGTdYa8kLrAP_ZfHvxCA" {
+		t.Fatalf("grant tag %s, want sAMGTdYa8kLrAP_ZfHvxCA (§I.13)", tag)
+	}
 }

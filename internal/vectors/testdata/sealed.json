@@ -1,7 +1,8 @@
 {
   "section": "§E.2.1, §E.2.2, §E.3.1",
-  "about": "sealed payloads: JWEs (alg dir, enc A256GCM, protected header {alg, enc, kid, pl}) under K_r = HKDF(K_e, \"patchlog-e2\", ns LF name) or K_e, with K_e = 00 01 … 1f, ns demo, name derby, epoch 3 and a fixed IV; the E3 write; sealed blobs \"PLB1\" ‖ len ‖ header ‖ iv ‖ AES-256-GCM(size ‖ bytes ‖ padding) ‖ tag",
+  "about": "sealed payloads: JWEs (alg dir, enc A256GCM, protected header {alg, enc, kid, pl}) under K_r = HKDF(K_e, \"patchlog-e2\", ns LF name) or K_n = HKDF(K_e, \"patchlog-e2\", ns LF), with K_e = 00 01 … 1f, ns demo, name derby, epoch 3 and a fixed IV; the E3 write; sealed blobs \"PLB1\" ‖ len ‖ header ‖ iv ‖ AES-256-GCM(size ‖ bytes ‖ padding) ‖ tag",
   "K_r": "37a2b615272e7bdec36b97f35176a206caa2dbbef43d89b81aa5a4ee874a5c25",
+  "K_n": "b2d9864bdf7f562d58e3638e08ec2e97e553c74995edbcef110ee9adfed62b4c",
   "vectors": [
     {
       "name": "/rev/{id} document",
@@ -33,11 +34,11 @@
       "key": "K_r",
       "kid": "demo#3",
       "iv": "c0c1c2c3c4c5c6c7c8c9cacb",
-      "plaintext": "{\"author\":\"user:bob\",\"created\":\"2026-10-04T12:00:00Z\",\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"patches\":[{\"op\":\"add\",\"path\":\"\",\"value\":{\"title\":\"Hello\",\"views\":0}}]}",
-      "padded_length": 179,
+      "plaintext": "{\"author\":\"user:bob\",\"created\":\"2026-10-04T12:00:00Z\",\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"parent\":\"\",\"patches\":[{\"op\":\"add\",\"path\":\"\",\"value\":{\"title\":\"Hello\",\"views\":0}}]}",
+      "padded_length": 191,
       "protected": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"id\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\",\"kind\":\"rev\",\"name\":\"derby\",\"ns\":\"demo\"}}",
-      "tag": "US8EmowxlnmTz1n0fhFnfA",
-      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiaWQiOiIxbDJnaTJoaG0zdnQ3MmxzMm91ZnFwa3Fwc2g2dXZtbGwiLCJraW5kIjoicmV2IiwibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.k52_TNJoKtTgS-F18LbSvzC1Wzjpp2eMwwcxR9zeeocp7wTUg2d8tmhTnhTJQIzPSDZ3W-xm2LmRpjtraleuGCCKInvWfZnuJUp7xHMsnjZxC1PNLfoNiupXmPm46N5Fmt4oJ-M2Q_1gg2RRLVQdAioRrnb8OqNLe4820E1tC7tgaHXPwBYO29OdNPUBMm_4XSqmsnEwr9P90tT15n6Ay9QsByhznaUYwuQ1D7ljJ4aYbIA.US8EmowxlnmTz1n0fhFnfA"
+      "tag": "CuZxMecpopDGlbR6kxR-qQ",
+      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiaWQiOiIxbDJnaTJoaG0zdnQ3MmxzMm91ZnFwa3Fwc2g2dXZtbGwiLCJraW5kIjoicmV2IiwibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.k52_TNJoKtTgS-F18LbSvzC1Wzjpp2eMwwcxR9zeeocp7wTUg2d8tmhTnhTJQIzPSDZ3W-xm2LmRpjtraleuGCCKInvWfZnuJUp7xHMsnjZxC1PNLfoNiupXmPm46N5Fmt4oJ-M2Q_1gg2RRLVQdBCwXvyfkItoce5AnhhQnD6wmcAKWkhgKkcuFd7NJMjW7QT63-Glxr4W4hM7xqDHHoYs7STM4xesLibtgNP41e5THHd_4T2kGdUv8Hw50UWY.CuZxMecpopDGlbR6kxR-qQ"
     },
     {
       "name": "resource log entry (tombstone)",
@@ -66,38 +67,38 @@
     {
       "name": "namespace document",
       "fn": "seal.SealWithIV (pl from seal.*PL; opened by seal.OpenExpect)",
-      "key": "K_e",
+      "key": "K_n",
       "kid": "demo#3",
       "iv": "c0c1c2c3c4c5c6c7c8c9cacb",
       "plaintext": "{\"encryption\":{\"epoch\":3,\"level\":\"sealed\"},\"read\":\"public\"}",
       "padded_length": 59,
       "protected": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"id\":\"1vmctae4vewju6nvxi374rkrkmyzpdrif\",\"kind\":\"doc\",\"ns\":\"demo\"}}",
-      "tag": "hY7F3kGDY55EwyCN5LHdEw",
-      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiaWQiOiIxdm1jdGFlNHZld2p1Nm52eGkzNzRya3JrbXl6cGRyaWYiLCJraW5kIjoiZG9jIiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.e2pCCRQK7y7ssJLMEJaTdCkDjFxUwCWJBuEnb0EYE5SGtOTCE7cgZ-oweDuLoQTtr1_9CqevzHDnB1M.hY7F3kGDY55EwyCN5LHdEw"
+      "tag": "HvcqrzRgsD_lxyabxNvH1Q",
+      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiaWQiOiIxdm1jdGFlNHZld2p1Nm52eGkzNzRya3JrbXl6cGRyaWYiLCJraW5kIjoiZG9jIiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.u8cy_E7tTm-4XbqqDvS5sBPQJKErMVAKoP25dmzGCTGSotpDLgGEkzY4tng6CaczqTelyQljjJldN9k.HvcqrzRgsD_lxyabxNvH1Q"
     },
     {
       "name": "namespace log range",
       "fn": "seal.SealWithIV (pl from seal.*PL; opened by seal.OpenExpect)",
-      "key": "K_e",
+      "key": "K_n",
       "kid": "demo#3",
       "iv": "c0c1c2c3c4c5c6c7c8c9cacb",
       "plaintext": "[{\"author\":\"user:bob\",\"created\":\"2026-10-04T12:05:00Z\",\"id\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\",\"kind\":\"head\",\"prev\":\"1vmctae4vewju6nvxi374rkrkmyzpdrif\",\"resource\":\"derby\",\"target\":\"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll\"}]",
       "padded_length": 218,
       "protected": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"ns\":\"demo\",\"range\":[\"1vmctae4vewju6nvxi374rkrkmyzpdrif\",\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\"]}}",
-      "tag": "-rHuXxZ7RfcpZt5us3YTyw",
-      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsibnMiOiJkZW1vIiwicmFuZ2UiOlsiMXZtY3RhZTR2ZXdqdTZudnhpMzc0cmtya215enBkcmlmIiwiMXBhMm5oNml3MnlkMmRqcWZ5Mndyc3pkNWtnbGZweHZtIl19fQ..wMHCw8TFxsfIycrL.WzMFBgIM_jHq-8eAR9-NJHYRjF0ezj3ZWKYqflIZXYyepKeVRPZ0M-V9YE3I9l-5uF_vSojvjDvtQQzqwNZLfD9C4wuAsU7VBqd8doUxZrQyNNnVojhO6s9IxGvAITHu4uoZySIu8YppbvNrev40uagy81VNw4LJfkgkHc8PkXNMHn51N_ViqkNFARUHbZAH1gNa06Eu7UphhSxfFmWPww87yQpD3IUSwj4MM0nb3Nt5oHlGpOhhtIDtIZIuNwvR2o9AlDPfn8YwE9Uh4go8t7KDoO4GJjhT_5A.-rHuXxZ7RfcpZt5us3YTyw"
+      "tag": "xG3N6ef9duWDEx71xrBZbQ",
+      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsibnMiOiJkZW1vIiwicmFuZ2UiOlsiMXZtY3RhZTR2ZXdqdTZudnhpMzc0cmtya215enBkcmlmIiwiMXBhMm5oNml3MnlkMmRqcWZ5Mndyc3pkNWtnbGZweHZtIl19fQ..wMHCw8TFxsfIycrL.m55181jrX3C-Fu_mWb2n4EzCJKBhP0ha_rq0Z3_HRymKspkUeUDQxzl1rg55Xvxnvje3iSYjzNJXcYa7L05w9y_rHhmxrfgCAik-fNCfF8FGmGKuHOqCk16KGJbgJxUK5k4IaQG0uBR3kEM6LJWJgzddh3oqWSGtxJiJnSWkG3WpgelpDIFSH63jeurNiLHO63B00fKY6Ol5hZHZRVVWd9xTw6oUqCtOmG2w9nKFvFGqoI_JGnjmUJE2ukAPGrasnNADYpIZ1As8zCj-epLLSA0KGe_0RRKvnoA.xG3N6ef9duWDEx71xrBZbQ"
     },
     {
       "name": "grant",
       "fn": "seal.SealWithIV (pl from seal.*PL; opened by seal.OpenExpect)",
-      "key": "K_e",
+      "key": "K_n",
       "kid": "demo#3",
       "iv": "c0c1c2c3c4c5c6c7c8c9cacb",
       "plaintext": "{\"id\":\"15swdvi5nbnlkv76v7y6k77h52atov6ru\",\"root\":{\"can\":[\"read\",\"append\"],\"exp\":\"2026-10-05T00:00:00Z\",\"groups\":[\"match-desk\"],\"kid\":\"ops-2026\",\"ns\":[\"matches\"],\"rules\":[],\"sub\":\"user:bob\"},\"stored\":\"CqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAWgaUHLoFLrXYHs2MaIetUEXWGK0SK3h0v5xBRUsBNE2qQ14tB8LGmoIYtimpZPta1sYSQLSXob_gozBFMAKwBCgB\"}",
       "padded_length": 574,
       "protected": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"grant\":\"15swdvi5nbnlkv76v7y6k77h52atov6ru\",\"ns\":\"demo\"}}",
-      "tag": "4LsDJURtCF-7A3WBwVufXA",
-      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiZ3JhbnQiOiIxNXN3ZHZpNW5ibmxrdjc2djd5Nms3N2g1MmF0b3Y2cnUiLCJucyI6ImRlbW8ifX0..wMHCw8TFxsfIycrL.e2pOA1VCtG-tqorGRMXdOC4dj1RK1SnMHbp9YQBKF4OO9-PIBO03duphdmuWqxGrtx79GbOjgiPfB1y1g4MZMS9N-02MqBiOP7k6eYwnPbxndJqd8CAUvY4egUeGfCny8LtAlxwu54pmef16KKE084F16BYDgtuSd04jF4hmyzRQHW9hY6F1swNfB1deKdlGjRdZlekcqQUs0z1SAHnY7EB8mUUN3ZNCmhxzM0ncyMs8_y8R7a8i4tDlKoI7c0SR2JQFwzuOl4sGBMsTyhw4qrnYk-0PDG0Y4Ip6mtlGfchhbEeDDrJytzWVLTOfVtZi8KLRNH-OssWenCtJMRQK5gSnY4jchN3iMrUQDB6PbQ0rruIgtF9onfXx4EbY4TJ8_tsLgz_KwoJFX9YDMpWU2Pri7ZSa2ANGjmb_XNy-PgngJpTdSe8oMj0w2pbFpAiEEpaVC9ixk-gWOQNA8w3TQIRafgWmOn8jnEAZUrmEAvuAbj4dumK0bj3vvK3EYWnB-HMHKOzfcMiA957rfS4takSAUyGpjESgTqLmgfXhdzESZVOVlbhlhkILI9sSg5rbbW8d9E0dD6JjwhsvZJulYsqxLEH7kObYXJ9uMWRfNGBNYx4aRAtsDqJFZ4oZzs_np-clg1T_Al7lzEAXk-cySANz5vxfyoSOl58abXREblUUPyBTx6hbH13Pxk2gnjxj48KYuDp0-bdYPpiFPfdaPMKFO72k7dyr6ZBAEvS4QL7mdfUk_WvjDihoA8iZIw.4LsDJURtCF-7A3WBwVufXA"
+      "tag": "sAMGTdYa8kLrAP_ZfHvxCA",
+      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiZ3JhbnQiOiIxNXN3ZHZpNW5ibmxrdjc2djd5Nms3N2g1MmF0b3Y2cnUiLCJucyI6ImRlbW8ifX0..wMHCw8TFxsfIycrL.u8c-9g-lFS75R6KgWqf3_BTOJ6k1JFxPu6bjeC2UDSaa4d1JOVuTgjZpuCgnA7J1sXal2h1vwsplN9bkbBsiuj_kBl-9tK5ZOzd4c9mJTMkT2CHmTvLYxB_cXbqmeg0W9B9RNz-0rhR4h00rfsqJyR4anDlkGHj2zZ6Ol2LNQTK1gvh9WNVFBu35fKiUzPiPsGR3l7qqrKY004DUU0kBWJMUk-VaqT0ewE_P9nKCqEHv_9meUz-lBsE-sVAaXvnsnstGNZpI3EYK2zbMUoTPVQZRKuz9b0fkgZrzqB3-XFxn_RyauwrwHJvwVijxxeujdxn5AT8Wfx843iTACSzWijXkMCQY7xqgRzm8WSRDZE69irbMqsOE7pkn4x70oNgjoMNCKkv2sELD9_I54vP192usWY6zfgWi6sH3DoQILFRjJg4lUadyjZc1ein1b0DzBhh68Nd8VMUCPumkpjbZruYi32KEyVEe9ZdkL4IdrmbK43ysvIHxWkO0cMlpUxQqeZKU95ufI6TKTDZZ395qN7IDqUz-8oABanPCpVoQdh0OUrMTE9zz3UCbzD0yIC0zFBBzMjJLLhyz8jjcnMQIS-EMAWrpoTKYA7rEa5TYGXxwIvsZIkHKSsd_WqX_BsxwJREhgoP6QR06fLUfT-qKTp8mSg_vSdpk8-4Hg94eFKpmKK4lEoUWj_LqSZTMkCI4utRpuaHH8JIRxHtnTFicGwLsI5qtZ6Et_qSoZVftUPFIcBud_H464ivURBZ9EQ.sAMGTdYa8kLrAP_ZfHvxCA"
     },
     {
       "name": "E3 patch set",
