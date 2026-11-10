@@ -1588,3 +1588,96 @@ func TestV0261StopAfterViewerJudged(t *testing.T) {
 		t.Errorf("sec stopped while the listing was computed: anonymous GET served %s 200, Cache-Control %q: %s", path, hdr.Get("Cache-Control"), body)
 	}
 }
+
+// v0261Gate holds the service's requests whose path starts with prefix
+// until open is closed; reached is closed at the first one.
+type v0261Gate struct {
+	prefix  string
+	once    sync.Once
+	reached chan struct{}
+	open    chan struct{}
+}
+
+func (g *v0261Gate) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasPrefix(r.URL.Path, g.prefix) {
+		g.once.Do(func() { close(g.reached) })
+		<-g.open
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// Final review (I2): a narrowing must end in an apply (narrowedBy) or a
+// stop (purgeStopped). One the follower has read, whose batch's Apply is
+// then refused, ends in neither: Apply returns the refusal (FetchDoc's
+// default case), the follower retries the handler for ever
+// (nsFollower.apply), and OnError stops only for a lack of keys. Here sec
+// is made private, with a write in the same batch, while the service is
+// down; on restart the follower reads both, and while Apply fetches the
+// write's head, sec drops the service's key (as in
+// TestV0261PrivateAndLockedOutPurged, one entry later). ns:sec is never
+// sent to the Purger nor queued, so the public, immutable copies of
+// listings showing sec's title that the service served stay in a CDN the
+// origin's purges don't reach (§9, §B.5).
+//
+// Fixed in v0.26.1: a refusal of a read of the namespace that the
+// follower reports (OnError), the handler's among them, stops it too
+// (purgeStopped).
+func TestV0261RefusedInsideApplyPurged(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k, ks := clienttest.NewKey("k"), clienttest.NewKey("ks")
+	for _, ns := range []string{"cat", "sec"} {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*"), ks.Entry("read")}}
+		if ns == "cat" {
+			doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag", "title": "/title"}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	both := []string{"cat", "sec"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(w.CreateDoc(ctx, "sec", "a", map[string]any{"title": "Secret vw3k"}))
+	must(w.CreateDoc(ctx, "cat", "sec.a", map[string]any{"parents": parents("root@a0")}))
+	gate := &v0261Gate{prefix: "/r/sec/b/", reached: make(chan struct{}), open: make(chan struct{})}
+	sc := s.Client(t, client.WithBearer(ks.Grant(t, s.Now(), "svc:tree", both, []string{"read"})), client.WithKeys(client.NewKeys(nil)),
+		client.WithHTTPClient(&http.Client{Transport: gate}))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	x.caughtUp("cat", "sec")
+	before := x.fetch("/cat/children?of=root", "")
+	if !strings.Contains(string(before.body), "vw3k") || !strings.Contains(before.header.Get("Cache-Control"), "public") {
+		t.Fatalf("setup: %q %s", before.header.Get("Cache-Control"), before.body)
+	}
+	x.stop()
+
+	// While down: a write, then sec made private (the service still reads it).
+	must(w.CreateDoc(ctx, "sec", "b", map[string]any{"title": "Later"}))
+	must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
+
+	y := startSvc(t, sc, svcOpts{now: s.Now, db: db})
+	select {
+	case <-gate.reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the follower never fetched sec/b")
+	}
+	// The batch is read; now the service's key goes.
+	must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "replace", "path": "/keys", "value": []any{k.Entry("*")}}}))
+	close(gate.open)
+
+	deadline := time.Now().Add(3 * time.Second)
+	sent, queued := v0261SawTag(y, "ns:sec")
+	for !sent && !queued && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		sent, queued = v0261SawTag(y, "ns:sec")
+	}
+	if !sent && !queued {
+		t.Errorf("sec made private, then the service locked out while it applied that: ns:sec never sent to the Purger nor queued (sec held at %s, applies %d); %s was served %q with sec's title",
+			y.s.Checkpoint("sec"), y.batches(), before.path, before.header.Get("Cache-Control"))
+	}
+	for _, path := range []string{before.path, "/cat/children?of=root"} {
+		if st, hdr, body, at := v0261Get(y, path, ""); st == 200 && strings.Contains(body, "vw3k") {
+			t.Errorf("anonymous GET %s served %s 200, Cache-Control %q, with sec's title", path, at, hdr.Get("Cache-Control"))
+		}
+	}
+}
