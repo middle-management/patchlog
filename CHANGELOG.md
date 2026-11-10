@@ -33,8 +33,8 @@ can't be recalled. The services' own kept results are in memory and go at the re
   again, and a stopped catalog answers `404`. A stopped trusted namespace makes its catalog
   non-public meanwhile.
 - **Remote branches:** each remote origin gets one `-remote-follow-timeout` (new flag,
-  `RemoteOptions.FollowTimeout`, default 10 minutes) per sync for all its branches; branches
-  that don't fit wait for the next sync, and branches are followed in a random order. Creating
+  `RemoteOptions.FollowTimeout`, default 10 minutes) of its own time per sync for all its
+  branches; branches that don't fit wait for the next sync, and branches are followed in a random order. Creating
   a remote branch is bounded by the same timeout (`502 upstream` if the base doesn't answer in
   time). No request to a remote base follows redirects; a `3xx` is the base's answer.
 - **A canceled `requireAt` check** answers `503 behind`, not `502 upstream`.
@@ -70,7 +70,8 @@ can't be recalled. The services' own kept results are in memory and go at the re
     (`X-Log-Next` must name an entry on the page, after its `since`); before, one base could
     page a sync forever and stop every other remote branch from following its base's purges.
   - A `410 pruned` horizon is final only if it is a revision of the mirrored chain strictly
-    after the content; one past the branch's `at` is accepted only if the base's log from the
+    after the content (for a blob epoch, after every revision referencing it under that epoch;
+    a tombstone horizon doesn't prune the last live document before it); one past the branch's `at` is accepted only if the base's log from the
     branch's head verifies, and is retried with backoff rather than final. Before, any horizon
     string was stored and served for good. Rows written by other versions are rechecked.
   - Sealings must be strict compact JWEs, opened and verified, and are bounded by the size of
