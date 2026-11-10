@@ -382,7 +382,16 @@ type sealJob struct {
 	pad       bool   // the namespace pads (§E.2.2)
 	jwe       string // the stored value once known
 	fresh     bool   // jwe was sealed by sealNow and isn't stored yet
+	// reseal marks a namespace document or grant whose stored row is from
+	// before v0.81, sealed under K_e (kver 0): it is sealed again under
+	// K_n of the stored row's epoch and replaces that row (storedNS).
+	reseal bool
 }
+
+// sealKver is the kver of the rows this version stores (migration 016):
+// namespace documents and grants under K_n, the rest under K_r. Rows of
+// kver 0, from before, hold namespace documents and grants under K_e.
+const sealKver = 1
 
 // sealNow seals a job not stored yet, so the length of what will be
 // served is known before finishSeal stores it (a sealed resource log
@@ -440,14 +449,44 @@ func (t *tx) namespaceKey(n *nsRow, e int) []byte {
 	return k
 }
 
+// storedNS is stored for a namespace document or grant: true if j's row
+// holds its sealing under K_n. A row stored before v0.81 under K_e (kver
+// 0) is never served again (stored.md item 7): it reports the epoch the
+// row's kid fixed, under whose K_n j is sealed again with the plaintext
+// computed as for a new row, and replaces the row (reseal, finishSeal),
+// the first stored winning. Its old bytes are never opened. If that
+// epoch's key is gone, or the kid can't be read, the answer is 500.
+func (t *tx) storedNS(n *nsRow, j *sealJob) (bool, int) {
+	var jwe string
+	var kver int
+	err := t.QueryRow(`SELECT jwe, kver FROM sealed WHERE ns = ? AND kind = ? AND key = ?`, n.id, j.kind, j.key).Scan(&jwe, &kver)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, 0
+	}
+	t.must(err)
+	if kver >= sealKver {
+		j.jwe = jwe
+		return true, 0
+	}
+	e, ok := jweEpoch(jwe)
+	if !ok || !t.hasEpochKey(n.id, e) {
+		panic(apiErr(500, "internal", "message", fmt.Sprintf("namespace %s: the %s %s was sealed under an earlier draft's key, and the key of its epoch is gone; it can't be served (§E.2.1, v0.81)", n.name, j.kind, j.key)))
+	}
+	j.reseal = true
+	return false, e
+}
+
 // configJob prepares the sealing of n's namespace document at ns_log seq,
 // under K_n of the epoch in force there (§E.2.2).
 func (t *tx) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
 	j := &sealJob{kind: sealConfig, key: nsID}
-	if t.stored(n, j) {
+	ok, e := t.storedNS(n, j)
+	if ok {
 		return j
 	}
-	e := t.entryEpoch(n, seq)
+	if !j.reseal {
+		e = t.entryEpoch(n, seq)
+	}
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.namespaceKey(n, e), seal.NamespaceDocPL(n.name, nsID), doc
 	j.pad = t.config(n.configSeq).Pad
 	return j
@@ -507,13 +546,26 @@ func (t *tx) storeSeal(ns int64, j *sealJob) (int, bool) {
 		if j.revSeq != 0 {
 			rev = j.revSeq
 		}
-		_, err := t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
-			ns, j.kind, j.key, name, rev, j.jwe, t.now.UnixMilli())
-		t.must(err)
-		t.must(t.QueryRow(`SELECT jwe FROM sealed WHERE ns = ? AND kind = ? AND key = ?`, ns, j.kind, j.key).Scan(&j.jwe))
+		t.insertSealed(ns, j, name, rev)
 		j.fresh = false
 	}
 	return jweEpoch(j.jwe)
+}
+
+// insertSealed stores j's sealing under namespace ns unless one is stored
+// (INSERT ON CONFLICT DO NOTHING; for a reseal, an UPDATE of the kver-0
+// row), then reads back the stored bytes, so the first stored wins.
+func (t *tx) insertSealed(ns int64, j *sealJob, name, rev any) {
+	var err error
+	if j.reseal {
+		_, err = t.Exec(`UPDATE sealed SET jwe = ?, kver = ?, created = ? WHERE ns = ? AND kind = ? AND key = ? AND kver < ?`,
+			j.jwe, sealKver, t.now.UnixMilli(), ns, j.kind, j.key, sealKver)
+	} else {
+		_, err = t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created, kver) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
+			ns, j.kind, j.key, name, rev, j.jwe, t.now.UnixMilli(), sealKver)
+	}
+	t.must(err)
+	t.must(t.QueryRow(`SELECT jwe FROM sealed WHERE ns = ? AND kind = ? AND key = ?`, ns, j.kind, j.key).Scan(&j.jwe))
 }
 
 // finishSeal seals the jobs not stored yet and stores them (INSERT ON
@@ -562,10 +614,7 @@ func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) erro
 			if j.name != "" {
 				name = j.name
 			}
-			_, err := t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
-				ns, j.kind, j.key, name, rev, j.jwe, t.now.UnixMilli())
-			t.must(err)
-			t.must(t.QueryRow(`SELECT jwe FROM sealed WHERE ns = ? AND kind = ? AND key = ?`, ns, j.kind, j.key).Scan(&j.jwe))
+			t.insertSealed(ns, j, name, rev)
 			ranges = ranges || j.kind == sealRange
 		}
 		if ranges {

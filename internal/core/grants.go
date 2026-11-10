@@ -122,15 +122,18 @@ func grantSealKey(id ids.ID) string { return id.String() + "/v0.73" }
 // current one (§E.2.2).
 func (t *tx) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
 	j := &sealJob{kind: sealGrant, key: grantSealKey(id)}
-	if t.stored(n, j) {
+	ok, e := t.storedNS(n, j)
+	if ok {
 		return j
 	}
-	e := t.config(n.configSeq).Epoch
-	var seq int64
-	if err := t.QueryRow(`SELECT seq FROM ns_log WHERE grant_id = ? AND ns = ? ORDER BY seq LIMIT 1`, id[:], n.id).Scan(&seq); err == nil {
-		e = t.entryEpoch(n, seq)
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		t.must(err)
+	if !j.reseal { // else fixed by the row stored before v0.81
+		e = t.config(n.configSeq).Epoch
+		var seq int64
+		if err := t.QueryRow(`SELECT seq FROM ns_log WHERE grant_id = ? AND ns = ? ORDER BY seq LIMIT 1`, id[:], n.id).Scan(&seq); err == nil {
+			e = t.entryEpoch(n, seq)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			t.must(err)
+		}
 	}
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.namespaceKey(n, e), seal.GrantPL(n.name, id.String()), plain()
 	j.pad = t.config(n.configSeq).Pad
