@@ -12,11 +12,11 @@ packages: encryption, end-to-end and remote branches in the core; access at the 
 grant checker, the tree service and the index; bundles, merges and the WebDAV gateway; the
 `seal` package and the client; and derived views with the candidate vectors. A cross-review
 then ported the playground, and a last package re-seals compressed sealings and takes the
-playground's keys as the Go client does. The schema changes are the core's migration `016_v081_encryption`,
-on SQLite and Postgres, and the derived-view cache's `002_v081_view_keys` (SQLite, the cache of
-the tree service and the index). The tree service and the index have no migration. Where the
-spec leaves a question open, the reference implements the reading noted here and in
-[docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.81").
+playground's keys as the Go client does. The schema changes are the core's migration
+`016_v081_encryption`, on SQLite and Postgres, and the derived-view cache's `002_v081_view_keys`
+(SQLite, the cache of the tree service and the index). The tree service and the index have no
+migration. Where the spec leaves a question open, the reference implements the reading noted
+here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.81").
 
 **Upgrading.** Do these in order.
 
