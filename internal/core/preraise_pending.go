@@ -186,15 +186,16 @@ func openPreBlob(body, kr []byte, kid string, pl seal.PL, want [32]byte) bool {
 }
 
 // recordPending records s as pending for resource name of shadow sh, the
-// sealing of a mirrored revision seq (for a blob, one referencing it),
-// due at the next sync.
+// sealing of a mirrored revision seq (for a blob, one referencing it under
+// its epoch: the last one recorded, horizonIn), due at the next sync.
 func (t *tx) recordPending(sh int64, name string, seq int64, s pendingSealing) {
 	var hz any
 	if s.horizon != "" {
 		hz = s.horizon
 	}
 	_, err := t.Exec(`INSERT INTO remote_pending_sealings (shadow, name, kind, ref, epoch, rev_seq, kid, pl, want, answer, horizon, updated, tries, due)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?) ON CONFLICT DO NOTHING`,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?) ON CONFLICT (shadow, name, kind, ref, epoch) DO UPDATE SET rev_seq = excluded.rev_seq
+		WHERE remote_pending_sealings.kind = 'blob' AND excluded.rev_seq > remote_pending_sealings.rev_seq`,
 		sh, name, s.kind, s.ref, s.epoch, seq, s.kid, string(jsonv.Canonical(map[string]any(s.pl))), s.want[:], s.answer, hz, t.now.UnixMilli(), t.now.UnixMilli())
 	t.must(err)
 }
@@ -210,7 +211,7 @@ func (t *tx) recordPending(sh int64, name string, seq int64, s pendingSealing) {
 // a revision of the mirrored chain after the sealing's (horizonIn), until
 // a sync checks it for good (pendingFixes).
 func (t *tx) pendingPruned(sh *nsRow, kind, name, ref string, epoch int) (string, bool) {
-	q := `SELECT answer, horizon, rev_seq, due = updated FROM remote_pending_sealings WHERE shadow = ? AND name = ? AND kind = ? AND ref = ? AND answer IN (?, ?)`
+	q := `SELECT answer, horizon, rev_seq, epoch, due = updated FROM remote_pending_sealings WHERE shadow = ? AND name = ? AND kind = ? AND ref = ? AND answer IN (?, ?)`
 	args := []any{sh.id, name, kind, ref, pendPruned, pendPrunedPast}
 	if epoch >= 0 {
 		q += ` AND epoch = ?`
@@ -219,36 +220,76 @@ func (t *tx) pendingPruned(sh *nsRow, kind, name, ref string, epoch int) (string
 	var answer string
 	var hz sql.NullString
 	var revSeq int64
+	var rowEpoch int
 	var checked bool
-	err := t.QueryRow(q+` LIMIT 1`, args...).Scan(&answer, &hz, &revSeq, &checked)
+	err := t.QueryRow(q+` LIMIT 1`, args...).Scan(&answer, &hz, &revSeq, &rowEpoch, &checked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false
 	}
 	t.must(err)
 	// Only this version records pruned_past, having verified its horizon.
 	checked = checked || answer == pendPrunedPast
-	if !hz.Valid || !checked && !t.horizonIn(sh.id, name, hz.String, revSeq) {
+	if !hz.Valid {
 		return "", false
+	}
+	if !checked {
+		if ok, _ := t.horizonIn(sh.id, name, kind, ref, rowEpoch, hz.String, revSeq); !ok {
+			return "", false
+		}
 	}
 	return hz.String, true
 }
 
-// horizonIn reports whether hz, a horizon A named for a sealing of
-// resource name of shadow sh, is a revision of its mirrored chain after
-// revSeq, the sealing's revision (for a blob, the first one referencing
-// it), as A's horizon for it is (§8.6: A keeps the horizon's own document
-// and entry): with one past the mirrored head that A's log verifies
-// (verifyHorizonPast), the only horizon B takes for it. Anything else A
-// names, of any size, is never stored or served.
-func (t *tx) horizonIn(sh int64, name, hz string, revSeq int64) bool {
+// horizonIn reports whether hz, a horizon A named for the sealing of kind
+// of ref under epoch of resource name of shadow sh, revision revSeq's (for
+// a blob, one referencing it under epoch), is a revision of the
+// mirrored chain that prunes it (§8.6), the only horizon in the chain B
+// takes for it, and whether hz is in the chain at all (with one past the
+// mirrored head that A's log verifies, verifyHorizonPast, the only ones B
+// takes). A horizon prunes what is before it, and keeps its own document
+// and entry; a tombstone keeps the last live document before it too.
+// So it must be after the sealing's revision, and for a blob after the
+// last revision referencing it under that epoch (§E.2.2: an epoch answers
+// 410 only once all its referencing revisions are pruned); and for a
+// document, or a blob, a tombstone horizon must not follow that revision
+// as the last live one. Anything else A names, of any size, is never
+// stored or served.
+func (t *tx) horizonIn(sh int64, name, kind, ref string, epoch int, hz string, revSeq int64) (ok, inChain bool) {
 	id, err := ids.Parse(hz)
 	if err != nil {
-		return false
+		return false, false
 	}
-	var ok bool
-	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions rv JOIN resources r ON r.res = rv.res
-		WHERE r.ns = ? AND r.name = ? AND rv.id = ? AND rv.seq > ?)`, sh, name, id[:], revSeq).Scan(&ok))
-	return ok
+	var res, hzSeq int64
+	var hzKind int
+	err = t.QueryRow(`SELECT rv.res, rv.seq, rv.kind FROM revisions rv JOIN resources r ON r.res = rv.res
+		WHERE r.ns = ? AND r.name = ? AND rv.id = ?`, sh, name, id[:]).Scan(&res, &hzSeq, &hzKind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false
+	}
+	t.must(err)
+	at := revSeq
+	if kind == pendBlob {
+		if bid, err := ids.Parse(ref); err == nil {
+			var last sql.NullInt64
+			t.must(t.QueryRow(`SELECT MAX(rv.seq) FROM revisions rv JOIN rev_epochs re ON re.seq = rv.seq
+				JOIN blob_refs br ON br.res = rv.res AND br.bid = ? AND rv.seq >= br.from_seq AND (br.to_seq IS NULL OR rv.seq < br.to_seq)
+				WHERE rv.res = ? AND rv.kind = ? AND re.epoch = ?`, bid[:], res, kindRev, epoch).Scan(&last))
+			if last.Valid && last.Int64 > at {
+				at = last.Int64
+			}
+		}
+	}
+	if hzSeq <= at {
+		return false, true
+	}
+	if kind != sealEntry && hzKind == kindTombstone {
+		var live sql.NullInt64
+		t.must(t.QueryRow(`SELECT MAX(seq) FROM revisions WHERE res = ? AND seq < ? AND kind = ?`, res, hzSeq, kindRev).Scan(&live))
+		if live.Valid && live.Int64 == at {
+			return false, true
+		}
+	}
+	return true, true
 }
 
 // deletePendingSealings deletes the pending sealings matching where (a purge's,
@@ -444,11 +485,11 @@ func (e *Engine) retryPreSealings(ctx context.Context, ep RemoteEndpoint, baseUR
 		if r.fetchedOK || r.fetchAnswer != pendPruned || r.head == "" {
 			return
 		}
-		var in bool
+		var inChain bool
 		if err := e.read(ctx, func(t *tx) error {
-			in = t.horizonIn(r.shadow, r.name, r.fetchHorizon, r.revSeq)
+			_, inChain = t.horizonIn(r.shadow, r.name, r.s.kind, r.s.ref, r.s.epoch, r.fetchHorizon, r.revSeq)
 			return nil
-		}); err != nil || in {
+		}); err != nil || inChain {
 			return
 		}
 		r.horizonPast = checks.verify(ctx, ep, baseURL, "/r/"+r.ns+"/"+r.name, r.head, r.fetchHorizon, caps)
@@ -616,7 +657,7 @@ func (t *tx) pendingRows(sh *nsRow, limit int, fix *pendingFixes) []*pendingRow 
 	q.Close()
 	for _, r := range legacy {
 		key := [5]any{sh.id, r.name, r.s.kind, r.s.ref, r.s.epoch}
-		if t.horizonIn(sh.id, r.name, r.s.horizon, r.revSeq) {
+		if ok, _ := t.horizonIn(sh.id, r.name, r.s.kind, r.s.ref, r.s.epoch, r.s.horizon, r.revSeq); ok {
 			fix.confirm = append(fix.confirm, key)
 		} else {
 			fix.demote = append(fix.demote, key)
@@ -682,9 +723,13 @@ func (t *tx) settlePending(r *pendingRow) {
 	args := []any{r.shadow, r.name, r.s.kind, r.s.ref, r.s.epoch, pendPruned}
 	if !r.fetchedOK {
 		ans, hz := r.fetchAnswer, any(nil)
+		in := false
+		if ans == pendPruned {
+			in, _ = t.horizonIn(r.shadow, r.name, r.s.kind, r.s.ref, r.s.epoch, r.fetchHorizon, r.revSeq)
+		}
 		switch {
 		case ans != pendPruned:
-		case t.horizonIn(r.shadow, r.name, r.fetchHorizon, r.revSeq):
+		case in:
 			hz = r.fetchHorizon
 		case r.horizonPast:
 			ans, hz = pendPrunedPast, r.fetchHorizon

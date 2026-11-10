@@ -1560,3 +1560,245 @@ func TestV0261ForgedPastHorizonWhileRegistered(t *testing.T) {
 			"that 410 was final", rb.Code, rb.Body, hz)
 	}
 }
+
+// v0.26.1 final review (C-I1/C-I4, cross-origin): originBudget gives each origin a
+// deadline one FollowTimeout after its FIRST base's step starts, in wall
+// time. Bases are shuffled across origins, so when an honest origin's
+// base comes before a stalling origin's, the stall (one FollowTimeout of
+// the other origin's) is charged to the honest origin too: its bases
+// after the stall are skipped, though it spent almost none of its own
+// time. Here origin A (honest, three branches) and origin C (one branch
+// whose namespace log hangs until B gives up): A's bases are skipped
+// "having run out of time" in about half the syncs. Only the origin's own
+// steps should count against its budget. (Should-fix: no base is starved
+// for good, the order being shuffled at each sync, but another origin's
+// stall delays an honest origin's purges; catchUpChainReads shares
+// originBudget.)
+func TestV0261BudgetChargedForOtherOrigin(t *testing.T) {
+	t.Parallel()
+	const originC = "https://c.example"
+	a := newEnv(t, withOrigin(originA))
+	c := newEnv(t, withOrigin(originC))
+	for _, e := range []*tenv{a, c} {
+		e.mkNS("m", map[string]any{"read": "public"})
+		e.create("m", "x", map[string]any{"v": 1.0}, "alice")
+	}
+	var armed atomic.Bool
+	target, _ := url.Parse(c.srv.URL)
+	rp := httputil.NewSingleHostReverseProxy(target)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if armed.Load() && req.Method == "GET" && req.URL.Path == "/ns/m" {
+			<-req.Context().Done() // until B gives up
+			return
+		}
+		rp.ServeHTTP(w, req)
+	}))
+	t.Cleanup(front.Close)
+	const timeout = time.Second
+	b := newEnv(t, withOrigin(originB), func(o *core.Options) {
+		o.Remote = core.RemoteOptions{FollowInterval: -1, FollowTimeout: timeout, Resolve: func(origin string) (core.RemoteEndpoint, error) {
+			switch origin {
+			case originA:
+				return core.RemoteEndpoint{BaseURL: a.srv.URL, OriginURL: a.srv.URL, HTTPClient: httpClient}, nil
+			case originC:
+				return core.RemoteEndpoint{BaseURL: front.URL, OriginURL: front.URL, HTTPClient: httpClient}, nil
+			}
+			return core.RemoteEndpoint{}, fmt.Errorf("unknown origin %s", origin)
+		}}
+	})
+	for i, origin := range []string{originA, originA, originA, originC} {
+		src := a
+		if origin == originC {
+			src = c
+		}
+		at := src.nsHead("m")
+		g := addRoot(map[string]any{"read": "public", "base": map[string]any{"origin": origin, "ns": "m", "at": at, "chain": []any{"m"}}})
+		expect(t, b.mkRemote(fmt.Sprintf("r%d", i), g), 201)
+	}
+	count := func(syncs int) (skipped int) {
+		for range syncs {
+			err := b.e.SyncRemotes(context.Background())
+			if err != nil && strings.Contains(err.Error(), originA+" having run out of time") {
+				skipped++
+			}
+		}
+		return skipped
+	}
+	// Control: with C answering, no base of A is ever skipped.
+	if n := count(4); n > 0 {
+		t.Fatalf("control: %s's bases skipped in %d of 4 syncs with no stall", originA, n)
+	}
+	armed.Store(true)
+	const syncs = 10
+	skipped := count(syncs)
+	t.Logf("%d of %d syncs skipped bases of the honest origin %s, which answers at once, for %s's stall", skipped, syncs, originA, originC)
+	if skipped > 0 {
+		t.Fatalf("%s's bases were skipped in %d of %d syncs, charged with the FollowTimeout another origin (%s) spent", originA, skipped, syncs, originC)
+	}
+}
+
+// newFCSameEpoch is A's sealed namespace m with z's blob referenced by two
+// revisions under the same epoch 1, z1 and z2 (and z3 after), then raised
+// to e2e (epoch 2): B's branch mirrors all three, z1 the first to
+// reference the blob under epoch 1, z2 the last but one.
+func newFCSameEpoch(t *testing.T, raise bool) (*v077Raised, string, string) {
+	t.Helper()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+	a.opPriv = aPriv
+	r := &v077Raised{a: a, kA: newKey("admin")}
+	a.mkNS("m", sealedDoc(map[string]any{"read": "grant", "keys": []any{r.kA.entry("*")}}))
+	r.root = func() string { return a.grant(r.kA, "user:root", []string{"m"}, allVerbs) }
+	r.x1 = a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})), r.root())
+	r.data = []byte("z's blob, referenced twice under epoch 1")
+	r.bid = a.upload("m", "z", "text/plain", r.data, r.root())
+	r.z1 = a.wr("m", "z", "", withNonce(addRoot(map[string]any{"b": ref(r.bid, "text/plain", len(r.data), ""), "v": 1.0})), r.root())
+	z2 := a.wr("m", "z", r.z1, withNonce([]any{op("replace", "/v", 2.0)}), r.root())
+	z3 := a.wr("m", "z", z2, withNonce([]any{op("replace", "/v", 3.0)}), r.root())
+	a.clock.Advance(time.Hour)
+	if raise {
+		expect(t, a.patchNS("m", ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 2.0})), r.root()), 201)
+		r.raised = a.nsHead("m", r.root())
+	}
+	return r, z2, z3
+}
+
+// fcSyncs runs n syncs of b, each after its clock moves past the longest
+// backoff (maxPendingBackoff, 4 h).
+func fcSyncs(t *testing.T, b *tenv, n int) {
+	t.Helper()
+	for range n {
+		b.clock.Advance(5 * time.Hour)
+		if err := b.e.SyncRemotes(context.Background()); err != nil {
+			t.Logf("sync: %v", err)
+		}
+	}
+}
+
+// v0.26.1 final review (C-I3, should-fix: "410 pruned only where owed"; not a
+// regression, v0.26.0 took any horizon as final, and A gains only
+// finality over withholding, B's 410 being no-store): B takes
+// A's 410 pruned for a blob's sealing under epoch e as final where its
+// horizon is a mirrored revision after the FIRST revision referencing the
+// blob under e (prunedIn with firstRef at creation; horizonIn with the
+// row's rev_seq at a sync). §E.2.2 (SPEC "Epochs": "An epoch whose
+// referencing revisions were all pruned answers 410"), and openSealedBlob,
+// owe that 410 only once EVERY revision of e referencing it is below the
+// horizon, and §8.6 keeps the horizon's own document. Here z1, z2 and z3
+// all reference the blob under epoch 1; a real A pruned at z2 (and even at
+// z3) still serves …/e/1 (the control). A that answers B 410 pruned with
+// horizon z2 for …/e/1 gets B to answer 410 for it for good: never asked
+// again, even once A serves it.
+func TestV0261BlobPrunedHorizonBeforeLastReference(t *testing.T) {
+	t.Parallel()
+	t.Run("control: a real A pruned at z2 serves the blob under epoch 1", func(t *testing.T) {
+		r, z2, z3 := newFCSameEpoch(t, false)
+		e1 := blobPath("m", "z", r.bid) + "/e/1"
+		expect(t, r.a.get(e1, r.root()), 200)
+		for _, hz := range []string{z2, z3} {
+			expect(t, r.a.prune("m", "z", map[string]any{"horizon": hz}, r.root()), 200)
+			expect(t, r.a.get("/r/m/z/rev/"+r.z1, r.root()), 410)
+			if res := r.a.get(e1, r.root()); res.Code != 200 {
+				t.Fatalf("pruned at %s: …/e/1 %d %s", hz, res.Code, res.Body)
+			}
+		}
+	})
+	for _, at := range []string{"creation", "sync"} {
+		t.Run("lie at "+at, func(t *testing.T) {
+			r, z2, _ := newFCSameEpoch(t, true)
+			e1 := blobPath("m", "z", r.bid) + "/e/1"
+			lie := v077Answer{2, http.StatusGone, `{"code":"pruned","horizon":"` + z2 + `"}`} // the first mirrors the blob (fetchBlobs)
+			p := newV077Proxy(t, r.a, map[string]v077Answer{"GET " + e1: lie})
+			if at == "sync" {
+				p.set(map[string]v077Answer{"GET " + e1: {2, http.StatusForbidden, v077Forbidden}})
+			}
+			b := newV077B(t, r, p)
+			kB, g := v0261Remote(t, b, r, "r")
+			if at == "sync" {
+				expectCode(t, b.get(blobPath("r", "z", r.bid)+"/e/1", g), 502, "upstream")
+				p.set(map[string]v077Answer{"GET " + e1: {1, lie.status, lie.body}})
+				fcSyncs(t, b, 1)
+				g = b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+			}
+			res := b.get(blobPath("r", "z", r.bid)+"/e/1", g)
+			t.Logf("B, after A's 410 with horizon z2: %d %s", res.Code, res.Body)
+			p.set(nil) // A serves it
+			before := p.count("GET " + e1)
+			fcSyncs(t, b, 3)
+			g = b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+			ra, rb := r.a.get(e1, r.root()), b.get(blobPath("r", "z", r.bid)+"/e/1", g)
+			expect(t, ra, 200)
+			if rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {
+				t.Fatalf("z's blob under epoch 1, which z2 and z3 still reference: B answers %d %.160s for good (A asked %d times since); "+
+					"A's 410 pruned with horizon z2 was taken as final", rb.Code, rb.Body, p.count("GET "+e1)-before)
+			}
+		})
+	}
+}
+
+// v0.26.1 final review (C-I3, same class): §8.6 keeps, when the horizon H is a
+// tombstone, "the last live document". A real A that deleted x (tombstone
+// x2) and pruned at x2 still serves x1's document (the control; x1's own
+// log range is 410). B takes A's 410 pruned for x1's document with horizon
+// x2 as final, since x2 is a mirrored revision after x1: 410 for good.
+// (Should-fix, as TestV0261BlobPrunedHorizonBeforeLastReference; the same
+// holds for a blob the last live document references: a real A pruned at
+// a tombstone still serves it.) x1's log entry is owed 410 there, so the
+// exception is for documents and blobs only.
+func TestV0261DocPrunedAtTombstone(t *testing.T) {
+	t.Parallel()
+	setup := func(t *testing.T, raise bool) (*v077Raised, string) {
+		var aPriv ed25519.PrivateKey
+		a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
+		a.opPriv = aPriv
+		r := &v077Raised{a: a, kA: newKey("admin")}
+		a.mkNS("m", sealedDoc(map[string]any{"read": "grant", "keys": []any{r.kA.entry("*")}}))
+		r.root = func() string { return a.grant(r.kA, "user:root", []string{"m"}, allVerbs) }
+		r.x1 = a.wr("m", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})), r.root())
+		del := a.write("DELETE", "m", "x", r.x1, nil, r.root())
+		expect(t, del, 200)
+		a.clock.Advance(time.Hour)
+		if raise {
+			expect(t, a.patchNS("m", ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 2.0})), r.root()), 201)
+			r.raised = a.nsHead("m", r.root())
+		}
+		return r, del.Str("tombstone")
+	}
+	t.Run("control: a real A pruned at the tombstone serves x1's document", func(t *testing.T) {
+		r, x2 := setup(t, false)
+		expect(t, r.a.prune("m", "x", map[string]any{"horizon": x2}, r.root()), 200)
+		expect(t, r.a.get("/r/m/x/rev/"+r.x1+"/log", r.root()), 410)
+		expect(t, r.a.get("/r/m/x/rev/"+r.x1, r.root()), 200)
+	})
+	for _, at := range []string{"creation", "sync"} {
+		t.Run("lie at "+at, func(t *testing.T) {
+			r, x2 := setup(t, true)
+			xDoc := "/r/m/x/rev/" + r.x1
+			lie := v077Answer{1, http.StatusGone, `{"code":"pruned","horizon":"` + x2 + `"}`}
+			p := newV077Proxy(t, r.a, map[string]v077Answer{"GET " + xDoc: lie})
+			if at == "sync" {
+				p.set(map[string]v077Answer{"GET " + xDoc: {1, http.StatusForbidden, v077Forbidden}})
+			}
+			b := newV077B(t, r, p)
+			kB, g := v0261Remote(t, b, r, "r")
+			if at == "sync" {
+				expectCode(t, b.get("/r/r/x/rev/"+r.x1, g), 502, "upstream")
+				p.set(map[string]v077Answer{"GET " + xDoc: lie})
+				fcSyncs(t, b, 1)
+				g = b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+			}
+			res := b.get("/r/r/x/rev/"+r.x1, g)
+			t.Logf("B, after A's 410 with horizon x2: %d %s", res.Code, res.Body)
+			p.set(nil)
+			before := p.count("GET " + xDoc)
+			fcSyncs(t, b, 3)
+			g = b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+			ra, rb := r.a.get(xDoc, r.root()), b.get("/r/r/x/rev/"+r.x1, g)
+			expect(t, ra, 200)
+			if rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {
+				t.Fatalf("x1's document, the last live one before the tombstone x2: B answers %d %.160s for good (A asked %d times since); "+
+					"A's 410 pruned with horizon x2 was taken as final", rb.Code, rb.Body, p.count("GET "+xDoc)-before)
+			}
+		})
+	}
+}
