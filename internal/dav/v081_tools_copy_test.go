@@ -1,6 +1,7 @@
 package dav_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -137,4 +138,39 @@ func TestV081FolderCopyNotIntoItselfViaService(t *testing.T) {
 	if folder == "" || doc["$access"] != nil || len(hrefsOf(doc)) != 1 || hrefsOf(doc)[0] != "/r/cat/deep" {
 		t.Fatalf("the copy into Deep %s: %v", folder, doc)
 	}
+}
+
+// §H.5 Copy via the tree service (notCopiedInto): a destination with
+// more paths above it than the tree service lists (eleven levels of two
+// folders, each with both folders of the level above as parents: 2048
+// paths; §B.5 "Shared nodes in DAGs") leaves "not into
+// itself" unchecked, and the copy is refused (403), nothing written,
+// though TR isn't above it. Three diamonds down, it is checked and made.
+func TestV081FolderCopyUncheckedTruncated(t *testing.T) {
+	t.Parallel()
+	w := newDerivedWorld(t)
+	g := w.g
+	embargoTR(t, w)
+	level := []string{"season"}
+	dsts := []string{"/cat/Season%202026"}
+	for i := range 11 {
+		var next []string
+		for _, side := range []string{"a", "b"} {
+			name := fmt.Sprintf("%s%d", side, i)
+			must(w.ops.CreateDoc(w.ctx, "cat", name, map[string]any{"title": name, "parents": parents("cat", level...)}))
+			next = append(next, name)
+		}
+		level = next
+		dsts = append(dsts, dsts[len(dsts)-1]+fmt.Sprintf("/a%d", i))
+	}
+	w.caughtUp(t)
+	ed := w.user(t, "user:ed", "editors-in-chief", "match-desk")
+	r := g.expect(g.doAs(ed, "COPY", "/cat/Season%202026/TR", "", "Destination", dsts[11]+"/TR%20copy"), 403, "ed's COPY of TR below 2048 paths")
+	if !strings.Contains(r.body, "didn't list every path") {
+		t.Fatalf("the refused copy: %s", r.body)
+	}
+	if n, _ := w.titled(t, "TR copy"); n != "" {
+		t.Fatalf("the refused copy made %s", n)
+	}
+	g.expect(g.doAs(ed, "COPY", "/cat/Season%202026/TR", "", "Destination", dsts[3]+"/TR%20copy"), 201, "ed's COPY of TR below 8 paths")
 }
