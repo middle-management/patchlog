@@ -837,7 +837,7 @@ func (x *E2E) countLog(ctx context.Context, ns, name string) error {
 		since = ""
 		es, err = x.Log(ctx, ns, name, "", since)
 	}
-	if h := Horizon(err); h != "" && h != since {
+	if h := Horizon(err); IsPruned(err) && h != "" && h != since {
 		partial = true
 		since = h
 		es, err = x.Log(ctx, ns, name, "", since)
