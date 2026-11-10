@@ -399,6 +399,11 @@ func TestFileTreeShape(t *testing.T) {
 			<-x.done
 			h := must(w.NSHead(ctx, "pub"))
 			must(w.PatchConfig(ctx, "pub", h.Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
+			// Its followers stopped, the service learns of it only from
+			// its grant checker, once the document the checker holds is
+			// older than its TTL (1ms, startSvc): the requests above can
+			// all fall within one.
+			time.Sleep(5 * time.Millisecond)
 			if r = x.raw(loc, ""); r.status != 401 {
 				t.Fatalf("listing once private: %d %v", r.status, r.body)
 			}
