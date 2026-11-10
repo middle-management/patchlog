@@ -4,10 +4,11 @@
 
 Security release. A review of v0.26.0 found leaks in the tree service and the search index
 (most of them also in v0.25.0), a way for a hostile remote base to stall every remote branch
-on a server, and vulnerable dependencies. Still implements spec **v0.77**. The one schema
-change is the core's migration `015_remote_pending_backoff` (backoff for pending pre-raise
-sealings; it also deletes rows earlier purges left), on SQLite and Postgres; it is safe in a
-rolling upgrade.
+on a server, and vulnerable dependencies. Still implements spec **v0.77**. The schema changes
+are the core's migration `015_remote_pending_backoff` (backoff for pending pre-raise sealings;
+it also deletes rows earlier purges left), on SQLite and Postgres, safe in a rolling upgrade,
+and the index's migration `010_ns_stopped` (namespaces it can't follow, and the checkpoint it
+purged them at).
 
 **After upgrading, purge your CDN.** Listings and query results computed before a narrowing
 (a namespace made private, or raised to sealed or end-to-end) could be served after it with
@@ -25,10 +26,11 @@ can't be recalled. The services' own kept results are in memory and go at the re
   can follow it). Until a widening is applied, anonymous readers get `401`; grant holders read
   by their grant; an anonymous `/_refs` leaves the namespace out. Databases from v0.26.0 seed
   their applied read modes from the documents at their checkpoints.
-- **A namespace the tree service can't follow is stopped.** One it lacks keys for, or that
-  refuses it (`401`, `403`, or `404` on both its log and its head), is marked stopped before
-  its listings are purged: it reads public to no one, and a stopped catalog answers `404`
-  until the service follows it again. A stopped trusted namespace makes its catalog
+- **A namespace the tree service or the index can't follow is stopped.** One it lacks keys
+  for, or that refuses it (`401`, `403`, or `404` on both its log and its head), also when
+  met while applying a batch, is marked stopped and its cached results purged (`ns:{ns}`,
+  `idx:{ns}`, once per checkpoint): it reads public to no one until the service follows it
+  again, and a stopped catalog answers `404`. A stopped trusted namespace makes its catalog
   non-public meanwhile.
 - **Remote branches:** each remote origin gets one `-remote-follow-timeout` (new flag,
   `RemoteOptions.FollowTimeout`, default 10 minutes) per sync for all its branches; branches
