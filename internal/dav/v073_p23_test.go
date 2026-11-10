@@ -416,7 +416,7 @@ func TestV073FolderCopy(t *testing.T) {
 // naming their copies in $successor; folders likewise), and deletes the
 // source folder once empty, one carrying $access too (§B.11.4 Copies). A
 // failure part-way leaves what was done and is answered as that child's
-// MOVE (§H.5 "Copy", GW-8).
+// MOVE, or COPY (§H.5 "Copy", GW-7, GW-8).
 func TestV073FolderMoveAcrossTrees(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, nil, []string{"cat", "cat2"}, map[string]map[string]any{
@@ -469,7 +469,18 @@ func TestV073FolderMoveAcrossTrees(t *testing.T) {
 	}
 	e.expectTombstoned("cat", "locked", "the source's locked")
 
-	r := e.expect(e.do("MOVE", "/cat/Part", "", "Destination", "/cat2/Part"), 422, "MOVE of a folder whose second file is refused there")
+	// A COPY met by a failure part-way leaves what was done, and is
+	// answered as that child's request (§H.5 "Copy").
+	r := e.expect(e.do("COPY", "/cat/Part", "", "Destination", "/cat2/Part%20copy"), 422, "COPY of a folder whose second file is refused there")
+	if !strings.Contains(r.body, "rule") {
+		t.Fatalf("the part-way COPY refusal: %s", r.body)
+	}
+	pc, _ := e.childOf("cat2", "root", "Part copy")
+	e.childOf("cat2", pc, "a.json")
+	e.noChild("cat2", pc, "b.json")
+	sameStrings(t, "Part after the COPY", names(e.propfind("/cat/Part/"), "/cat/Part/"), []string{"a.json", "b.json"})
+
+	r = e.expect(e.do("MOVE", "/cat/Part", "", "Destination", "/cat2/Part"), 422, "MOVE of a folder whose second file is refused there")
 	if !strings.Contains(r.body, "rule") {
 		t.Fatalf("the part-way refusal: %s", r.body)
 	}
