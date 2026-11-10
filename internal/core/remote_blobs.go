@@ -408,22 +408,36 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			entries = append(entries, preEntry{id: e.ID, parent: e.Parent, parentKnown: true, max: jweFor(len(jsonv.Canonical(e.Raw)))})
 		}
 	}
-	// A's 410 pruned for the sealing of entry i, or of a blob first
-	// referenced there, names a horizon of the chain after it, or is a
-	// refusal.
+	// A's 410 pruned for the sealing of entry i's log entry, its
+	// document (doc), or a blob last referenced there under the epoch
+	// asked for (doc too), names a horizon of the chain that prunes it
+	// (§8.6, as horizonIn), or is a refusal: one after i, since A keeps
+	// the horizon's own document and entry, and, for a document or a
+	// blob, not a tombstone following i as the last live revision, whose
+	// document A keeps too.
 	// A horizon after the chain's head, which the chain doesn't hold (A
 	// pruned past B's at, §8.6), is taken where A's log verifies it after
-	// the head (verifyHorizonPast).
+	// the head (verifyHorizonPast), though not as final (pendPrunedPast).
 	checks := horizonChecks{}
-	prunedIn := func(ans, hz string, i int) (string, string) {
+	prunedIn := func(ans, hz string, i int, doc bool) (string, string) {
 		if ans != pendPruned {
 			return ans, hz
 		}
 		if j, ok := pos[hz]; ok {
-			// After the sealing's own revision: A keeps the horizon's
-			// document and entry (§8.6).
 			if j <= i {
 				return pendRefused, ""
+			}
+			if doc && ch.entries[j].Kind == "tombstone" {
+				live := -1
+				for k := j - 1; k >= 0; k-- {
+					if ch.entries[k].Kind == "rev" {
+						live = k
+						break
+					}
+				}
+				if live == i {
+					return pendRefused, ""
+				}
 			}
 			return ans, hz
 		}
@@ -448,10 +462,10 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 		return unverified("%s: %v", what, err)
 	}
 	blobEpochs := map[ids.ID]map[int]bool{}
-	// The first entry referencing each blob under each epoch: where
-	// storePreSealings records its pending row, which A's horizon for it
-	// must be after.
-	firstRef := map[ids.ID]map[int]int{}
+	// The last entry referencing each blob under each epoch, which A's
+	// horizon for that epoch URL must be after (§E.2.2: an epoch answers
+	// 410 only once all its referencing revisions are pruned).
+	lastRef := map[ids.ID]map[int]int{}
 	for i := 0; i <= last; i++ {
 		e := ch.entries[i]
 		kr := krs[i]
@@ -470,7 +484,7 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			}
 			ps.entries[e.ID] = jwe
 		} else {
-			ans, hz := prunedIn(answers[e.ID][0], answers[e.ID][1], i)
+			ans, hz := prunedIn(answers[e.ID][0], answers[e.ID][1], i, false)
 			ps.pending[e.ID] = append(ps.pending[e.ID], pendingSealing{kind: sealEntry, ref: e.ID, epoch: epoch, kid: e.Kid, pl: pl, want: want,
 				answer: ans, horizon: hz})
 		}
@@ -489,18 +503,16 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			ps.docs[e.ID] = jwe
 		} else {
 			ans, hz := pendingAnswer(st, body, err)
-			ans, hz = prunedIn(ans, hz, i)
+			ans, hz = prunedIn(ans, hz, i, true)
 			ps.pending[e.ID] = append(ps.pending[e.ID], pendingSealing{kind: sealDoc, ref: e.ID, epoch: epoch, kid: e.Kid, pl: pl, want: want,
 				answer: ans, horizon: hz})
 		}
 		for _, r := range blobRefsOf(docs[i]) {
 			if blobEpochs[r.bid] == nil {
 				blobEpochs[r.bid] = map[int]bool{}
-				firstRef[r.bid] = map[int]int{}
+				lastRef[r.bid] = map[int]int{}
 			}
-			if _, ok := firstRef[r.bid][epoch]; !ok {
-				firstRef[r.bid][epoch] = i
-			}
+			lastRef[r.bid][epoch] = i
 			blobEpochs[r.bid][epoch] = true
 		}
 	}
@@ -526,11 +538,11 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 			st, _, body, err := rawGet(ctx, ep, baseURL, p, nil, caps.blob(int64(len(b.data))))
 			if err != nil || st != 200 {
 				ans, hz := pendingAnswer(st, body, err)
-				first, ok := firstRef[bid][epoch]
+				ref, ok := lastRef[bid][epoch]
 				if !ok {
-					first = len(ch.entries) // no entry's epoch: never recorded
+					ref = len(ch.entries) // no entry's epoch: never recorded
 				}
-				ans, hz = prunedIn(ans, hz, first)
+				ans, hz = prunedIn(ans, hz, ref, true)
 				if ps.blobAnswers[bid] == nil {
 					ps.blobAnswers[bid] = map[int][2]string{}
 				}
