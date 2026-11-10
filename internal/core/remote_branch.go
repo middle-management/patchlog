@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"mime"
 	"net"
 	"net/http"
@@ -2385,13 +2386,24 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	// In a new order at each sync, so that the bases a late origin's
+	// skipped (below) aren't the same ones every time.
+	rand.Shuffle(len(bases), func(i, j int) { bases[i], bases[j] = bases[j], bases[i] })
+	late := map[string]bool{}
 	var errs []error
 	for _, b := range bases {
 		if err := e.jobStep(ctx); err != nil {
 			errs = append(errs, err)
 			break
 		}
-		errs = append(errs, e.baseStep(ctx, func(ctx context.Context) error {
+		if late[b.origin] {
+			// One of its bases ran out of time this sync: the origin's
+			// others wait for the next, so that an origin that keeps them
+			// waiting costs a sync one FollowTimeout, not one per base.
+			errs = append(errs, fmt.Errorf("remote branch %s: following %s/ns/%s: skipped until the next sync, %s having run out of time", b.branchName, b.origin, b.ns, b.origin))
+			continue
+		}
+		errs = append(errs, e.baseStep(ctx, late, b.origin, func(ctx context.Context) error {
 			var errs []error
 			if err := e.followRemote(ctx, b); err != nil {
 				errs = append(errs, fmt.Errorf("remote branch %s: following %s/ns/%s: %w", b.branchName, b.origin, b.ns, err))
@@ -2416,11 +2428,16 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 // sets: the job's own context has none, nor has production's HTTP client
 // a timeout, and bases are followed one after another, so a base that
 // doesn't answer, or keeps answering, would otherwise hold up every base
-// after it for ever.
-func (e *Engine) baseStep(ctx context.Context, f func(context.Context) error) error {
-	ctx, cancel := context.WithTimeout(ctx, e.opt.Remote.FollowTimeout)
+// after it for ever. A step that runs out of time marks its origin in
+// late, for the job to skip that origin's other bases.
+func (e *Engine) baseStep(ctx context.Context, late map[string]bool, origin string, f func(context.Context) error) error {
+	sctx, cancel := context.WithTimeout(ctx, e.opt.Remote.FollowTimeout)
 	defer cancel()
-	return f(ctx)
+	err := f(sctx)
+	if ctx.Err() == nil && (sctx.Err() != nil || errors.Is(err, context.DeadlineExceeded)) {
+		late[origin] = true
+	}
+	return err
 }
 
 // followRemote follows a base's log after the checkpoint. On purge or
@@ -3226,15 +3243,20 @@ func (e *Engine) catchUpChainReads(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	late := map[string]bool{}
 	var errs []error
 	for _, b := range due {
 		if err := e.jobStep(ctx); err != nil {
 			errs = append(errs, err)
 			break
 		}
+		if late[b.origin] {
+			errs = append(errs, fmt.Errorf("remote branch %s: reading the chain of %s/ns/%s at start: skipped, %s having run out of time", b.branchName, b.origin, b.ns, b.origin))
+			continue
+		}
 		c, ep, err := e.remoteClient(b.origin)
 		if err == nil {
-			err = e.baseStep(ctx, func(ctx context.Context) error { return e.followChainEpochs(ctx, c, ep, b) })
+			err = e.baseStep(ctx, late, b.origin, func(ctx context.Context) error { return e.followChainEpochs(ctx, c, ep, b) })
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("remote branch %s: reading the chain of %s/ns/%s at start: %w", b.branchName, b.origin, b.ns, err))

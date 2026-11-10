@@ -677,7 +677,8 @@ func TestV0261PreRaisePrunedBlobEpoch(t *testing.T) {
 // base's step now has one (RemoteOptions.FollowTimeout), and fetching its
 // pending sealings half of it, so the other bases are still followed. A
 // hang where the branch follows the base's log (GET /ns/m), or fetches a
-// pending sealing again (x's document).
+// pending sealing again (x's document). The origin's other branches are
+// skipped until the next sync (one FollowTimeout per origin and sync).
 func TestV0261FollowDeadline(t *testing.T) {
 	t.Parallel()
 	for _, hang := range []string{"/ns/m", "/r/m/x/rev/"} {
@@ -716,12 +717,16 @@ func TestV0261FollowDeadline(t *testing.T) {
 		err := b.e.SyncRemotes(context.Background())
 		el := time.Since(start)
 		t.Logf("%s: SyncRemotes after %v: %v", hang, el, err)
-		if el > 15*time.Second || !hung.Load() || err == nil {
-			t.Fatalf("%s: SyncRemotes took %v (hung: %v), error %v", hang, el, hung.Load(), err)
+		if el > 6*time.Second || !hung.Load() || err == nil || !strings.Contains(err.Error(), "skipped") {
+			t.Fatalf("%s: SyncRemotes took %v (hung: %v), error %v; want the other branch of that origin skipped", hang, el, hung.Load(), err)
+		}
+		// The next sync follows both.
+		if err := b.e.SyncRemotes(context.Background()); err != nil {
+			t.Logf("%s: second sync: %v", hang, err)
 		}
 		c1, c2 := b.get("/r/r1/x/rev/"+r.x1, g1).Code, b.get("/r/r2/x/rev/"+r.x1, g2).Code
-		if c1+c2 != 200+502 {
-			t.Fatalf("%s: x's document on r1: %d, on r2: %d; want one base followed (200) past the other's deadline (502)", hang, c1, c2)
+		if c1 != 200 || c2 != 200 {
+			t.Fatalf("%s: x's document on r1: %d, on r2: %d after the next sync; want 200", hang, c1, c2)
 		}
 	}
 }
