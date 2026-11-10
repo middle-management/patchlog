@@ -527,6 +527,11 @@ func TestI7ResourceKey(t *testing.T) {
 	if err != nil || hex.EncodeToString(kr) != "37a2b615272e7bdec36b97f35176a206caa2dbbef43d89b81aa5a4ee874a5c25" {
 		t.Errorf("K_r = %x %v", kr, err)
 	}
+	// v0.81: K_n = HKDF-SHA256(K_e, "patchlog-e2", ns ‖ 0x0A) (§E.2.1).
+	kn, err := seal.NamespaceKey(ke, "demo")
+	if err != nil || hex.EncodeToString(kn) != "b2d9864bdf7f562d58e3638e08ec2e97e553c74995edbcef110ee9adfed62b4c" {
+		t.Errorf("K_n = %x %v", kn, err)
+	}
 }
 
 // I.8 (§B.5, §B.11.5): a subject set's gs, and the combined checkpoint a
