@@ -1378,3 +1378,52 @@ func newV0261Raised(t *testing.T, opts ...envOpt) *v077Raised {
 	r.raised = a.nsHead("m", r.root())
 	return r
 }
+
+// v0.26.1 review, round 3 (efb5aca, "put creation's fetch from a
+// remote base under FollowTimeout"): only fetchRemote runs under it. After
+// the branch is written, creation registers it with A (RegisterRemote,
+// with -remote-register) and reads the deeper bases' documents
+// (readChainAtCreation), both with the request's own context, which has no
+// deadline: A dripping its answer to the registration holds the creating
+// request as long as it likes. Here A gives up after 4 s.
+func TestV0261CreationRegistrationNoDeadline(t *testing.T) {
+	t.Parallel()
+	r := newV077Raised(t)
+	p := newV077Proxy(t, r.a, nil)
+	target, _ := url.Parse(p.srv.URL)
+	rp := httputil.NewSingleHostReverseProxy(target)
+	const drip = 4 * time.Second
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == "POST" && req.URL.Path == "/ns/m/branches" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(503)
+			end := time.After(drip)
+			for {
+				select {
+				case <-req.Context().Done():
+					return
+				case <-end:
+					return
+				case <-time.After(100 * time.Millisecond):
+					if _, err := w.Write([]byte(" ")); err != nil {
+						return
+					}
+					w.(http.Flusher).Flush()
+				}
+			}
+		}
+		rp.ServeHTTP(w, req)
+	}))
+	t.Cleanup(front.Close)
+	b := newV0261B(t, r, front.URL, func(o *core.Options) {
+		o.Remote.FollowTimeout = time.Second
+		o.Remote.Register = true
+	})
+	start := time.Now()
+	v0261Remote(t, b, r, "r")
+	el := time.Since(start)
+	t.Logf("creation took %v with FollowTimeout 1s", el)
+	if el >= drip {
+		t.Fatalf("creation took %v: A's drip of the registration held it past FollowTimeout", el)
+	}
+}

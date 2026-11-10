@@ -1459,6 +1459,12 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 		return nil, err
 	}
 	if res.Status == 201 && cfg != nil {
+		// What follows the creation, reading the deeper bases and
+		// registering, has its own FollowTimeout: it never fails the
+		// creation, and a sync does what it doesn't finish.
+		actx, cancel := context.WithTimeout(ctx, e.opt.Remote.FollowTimeout)
+		defer cancel()
+		ctx = actx
 		// The deeper bases' current namespace documents, read once now, so
 		// the branch relays their keys from the start where it can read
 		// them (§G.5.2 E3 sources, chainReadable); a failure leaves them
