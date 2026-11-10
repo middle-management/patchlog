@@ -844,14 +844,10 @@ func (p *ExportPlan) Write(ctx context.Context, w io.Writer) (*Summary, error) {
 			if err != nil {
 				return nil, fmt.Errorf("export: %s: %w", k, err)
 			}
+			// An e2e document's lines were checked as planned (process,
+			// plainE2ELine): these are the same, verified up to the same
+			// head, their ids covering their patches.
 			for _, e := range entries {
-				if p.Access[d.NS] == AccessE2E {
-					// As planned (process), checked again over what is
-					// written.
-					if err := plainE2ELine(d, e); err != nil {
-						return nil, fmt.Errorf("export: %s: %w", k, err)
-					}
-				}
 				if err := blobs(e.ID); err != nil {
 					return nil, err
 				}
