@@ -17,6 +17,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // v0261NarrowPR is pr, public, with one document, and an index of it;
@@ -350,5 +351,54 @@ func TestV0261RefsNarrowBeforeAnswer(t *testing.T) {
 	r2 := x.raw(loc, "")
 	if r2.status == 200 && strings.Contains(refsAllHits(r2.body), "pr/") {
 		t.Errorf("anonymous GET %s with pr private: 200 %s, Cache-Control %q", loc, refsAllHits(r2.body), r2.header.Get("Cache-Control"))
+	}
+}
+
+// TestV0261RotationBeforeJudge (I-L1; §E.2.6: a pending epoch is "judged
+// once, when the service first seals a value derived from it"): in e-b,
+// an e2e branch of e, r's head is e's op read through, its epoch pending.
+// e-b rotates, the rotation applied, after the first answer that seals r
+// has read its rows and before it judges r. A rotation purges nothing,
+// so r isn't judged under the epoch the rotation replaced (a reader
+// revoked by it would read r): it is judged under the epoch current once
+// it is, the rotation's.
+func TestV0261RotationBeforeJudge(t *testing.T) {
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	admin := clienttest.NewKey("admin")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "e"))).CreateNamespace(ctx, "e", map[string]any{"read": "public", "keys": []any{admin.Entry("*")},
+		"encryption": map[string]any{"level": "e2e"}}))
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "schemas"))).CreateNamespace(ctx, "schemas", map[string]any{"read": "public", "keys": []any{admin.Entry("*")}}))
+	adminJWK, adminPriv, _ := seal.GenerateRecipient()
+	idxJWK, idxPriv, _ := seal.GenerateRecipient()
+	nss := []string{"e", "e-b", "schemas"}
+	ac := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:admin", nss, []string{"read", "create", "append", "config", "branch"}, map[string]any{"enc": adminJWK})))
+	ad := ac.E2E(adminPriv)
+	sch := must(ac.CreateDoc(ctx, "schemas", "item", pageSchemaWith(map[string]any{"title": map[string]any{"type": "string", "x-index": "text"}})))
+	ref := "/r/schemas/item/rev/" + sch.ID
+	must(ad.InitKeyring(ctx, "e", idxPriv.PublicKey()))
+	must(ad.CreateDocSealed(ctx, "e", "r", map[string]any{"$schema": ref, "title": "zq r"}))
+	must(ac.CreateBranch(ctx, "e", client.BranchRequest{Name: "e-b"}))
+	must(ad.InitKeyring(ctx, "e-b", idxPriv.PublicKey()))
+	ic := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", nss, []string{"read"}, map[string]any{"enc": idxJWK})),
+		client.WithKeyringSenders(adminPriv.PublicKey()))
+	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"e"}, branches: true, untyped: true, now: s.Now},
+		func(o *indexOpts) { o.Recipient = idxPriv })
+	x.caughtUp("e")
+	x.caughtUp("e-b")
+	var once atomic.Bool
+	var e int
+	x.ix.OnBeforeJudge(func() {
+		if once.CompareAndSwap(false, true) {
+			e = must(ad.RotateEpoch(ctx, "e-b", idxPriv.PublicKey()))
+			x.appliedUpTo(x.caughtUp("e-b"))
+		}
+	})
+	got := p37Kids(t, x.fetch("/e-b?q=zq", "").body)["r"]
+	if !once.Load() {
+		t.Fatal("never judged")
+	}
+	if want := fmt.Sprintf("e-b#%d", e); got != want {
+		t.Errorf("e-b/r, pending, judged after e-b rotated to %d: under %q, want %q", e, got, want)
 	}
 }

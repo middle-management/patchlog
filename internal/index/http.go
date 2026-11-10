@@ -1086,7 +1086,9 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	// narrows (§9, §A.1), would have this result computed under what it
 	// replaced and kept, its purge counted before gen. Read again now: what
 	// changed is errInfoChanged, computed again with what is current
-	// (afterPurge); what changes later purges after gen (PurgedSince).
+	// (afterPurge). A raise later purges after gen (PurgedSince); a
+	// rotation purges nothing, so info is read once more after the query,
+	// before pending epochs are judged under it (below).
 	if now, err := ix.keys.Info(ctx, ns); err != nil {
 		ix.opt.Logf("index: encryption of %s: %v", ns, err)
 		return derived.Stored{}, "", fmt.Errorf("%w (%s)", errEpochKey, ns)
@@ -1123,10 +1125,22 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 			return derived.Stored{}, "", err
 		}
 	}
+	if ix.testBeforeJudge != nil {
+		ix.testBeforeJudge()
+	}
 	// A revision whose epoch is pending is judged now, as this answer
 	// seals values derived from it, unless an earlier answer did (§E.2.6,
-	// judgeEpochs).
+	// judgeEpochs), under the epoch current now: a rotation (§E.2.4)
+	// applied since info was read, which purges nothing, would otherwise
+	// have it judged for good under the epoch it replaced, whose readers
+	// it may have meant to cut off. Changed: errInfoChanged, as above.
 	if info.Protected() {
+		if now, err := ix.keys.Info(ctx, ns); err != nil {
+			ix.opt.Logf("index: encryption of %s: %v", ns, err)
+			return derived.Stored{}, "", fmt.Errorf("%w (%s)", errEpochKey, ns)
+		} else if now != info {
+			return derived.Stored{}, "", errInfoChanged
+		}
 		if err := ix.judgeResult(ctx, res, info.Epoch); err != nil {
 			return derived.Stored{}, "", err
 		}

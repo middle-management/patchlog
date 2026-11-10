@@ -244,6 +244,9 @@ type Index struct {
 	// testAnswerRead, if set, is called once a query's answer has read
 	// its rows, before it is built and kept (tests: answer).
 	testAnswerRead func()
+	// testBeforeJudge, if set, is called once a query's answer has read
+	// its rows, before the pending epochs of its hits are judged (tests).
+	testBeforeJudge func()
 	// testMemberBootstrap, if set, is called before a member's follower
 	// gives it its first checkpoint (tests: bootstrapMember).
 	testMemberBootstrap func(ctx context.Context, m string)
