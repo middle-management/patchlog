@@ -430,7 +430,7 @@ func fetchPreSealings(ctx context.Context, ep RemoteEndpoint, baseURL, ns, name 
 		if !checks.verify(ctx, ep, baseURL, what, ch.entries[len(ch.entries)-1].ID, hz, caps) {
 			return pendRefused, ""
 		}
-		return ans, hz
+		return pendPrunedPast, hz
 	}
 	got, answers := fetchPreEntries(ctx, ep, baseURL, what, chain, entries, caps)
 	for _, a := range answers {

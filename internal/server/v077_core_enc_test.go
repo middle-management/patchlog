@@ -210,12 +210,23 @@ func TestV077EncPreRaiseSealingsAfterCreation(t *testing.T) {
 	if res.Str("horizon") != w2 {
 		t.Fatalf("w's log: %s, want A's horizon %s", res.Body, w2)
 	}
-	// Pruned is final: A serving it again changes nothing.
+	// Pruned isn't final here (v0.26.1): w2, past the branch's at, is a
+	// horizon A could fabricate (its log verifies only that A can chain
+	// it), so B asks again after its backoff, and stores A's sealing once
+	// A serves it. Until then, 410 stands.
 	p.set(nil)
 	if err := b.e.SyncRemotes(context.Background()); err != nil {
 		t.Logf("sync: %v", err)
 	}
 	expectCode(t, b.get(wPath, g), 410, "pruned")
+	b.clock.Advance(5 * time.Minute)
+	if err := b.e.SyncRemotes(context.Background()); err != nil {
+		t.Logf("sync: %v", err)
+	}
+	ra, rb = r.a.get(wLog, r.root()), b.get(wPath, g)
+	if rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {
+		t.Fatalf("w's log once A serves it again: %d %.160s, want A's bytes", rb.Code, rb.Body)
+	}
 	// What A served at creation is A's bytes throughout.
 	ra, rb = r.a.get("/r/m/y/rev/"+r.y1, r.root()), b.get("/r/r/y/rev/"+r.y1, g)
 	if rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {

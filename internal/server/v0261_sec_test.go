@@ -293,7 +293,7 @@ func TestV0261PreRaisePrunedHorizonUnvalidated(t *testing.T) {
 	g = b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
 	expectCode(t, b.get("/r/r/x/rev/"+r.x1, g), 502, "upstream")
 	// A revision after it, past the branch's at, which A's log verifies:
-	// final.
+	// 410 (not final, being past at: TestV0261ForgedPastHorizonWhileRegistered).
 	x2 := v0261After(t, r, "x", r.x1)
 	b.clock.Advance(5 * time.Hour)
 	p.set(map[string]v077Answer{"GET " + xDoc: {1, http.StatusGone, `{"code":"pruned","horizon":"` + x2 + `"}`}})
@@ -1107,6 +1107,17 @@ func TestV0261PreRaisePrunedPastAtCreation(t *testing.T) {
 		if res.Code != want || want == 410 && res.Str("horizon") != x2 {
 			t.Fatalf("horizon %s: %d %s, want %d", hz, res.Code, res.Body, want)
 		}
+		// Past at, it isn't final: once A serves x1's document again, a
+		// sync after its backoff stores it.
+		p.set(nil)
+		b.clock.Advance(5 * time.Minute)
+		if err := b.e.SyncRemotes(context.Background()); err != nil {
+			t.Logf("sync: %v", err)
+		}
+		ra, rb := r.a.get(xDoc, r.root()), b.get("/r/r/x/rev/"+r.x1, g)
+		if rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {
+			t.Fatalf("horizon %s: x1's document once A serves it: %d %.160s", hz, rb.Code, rb.Body)
+		}
 	}
 }
 
@@ -1484,5 +1495,68 @@ func TestV0261StallJustUnderDeadline(t *testing.T) {
 	if el >= 2*timeout {
 		t.Fatalf("one origin's %d branches held the sync %v (%.1f × FollowTimeout), none of them skipped: the per-origin budget only counts a step that runs out of time",
 			k, el, float64(el)/float64(timeout))
+	}
+}
+
+// v0.26.1 review, round 3 (b345cfe): verifyHorizonPast proves
+// only that A can produce a hash chain from B's head to the horizon, which
+// A always can (ids are unkeyed hashes): one fabricated entry, the
+// tombstone of B's head, suffices, and the 410 is then final (due =
+// updated). Here B registered with A at creation (§G.3), so §8.6 forbids
+// A any horizon past x's head as of at, and A's real server still serves
+// x1's document: only its answer to B's sync lies. (Observation: B can't
+// refuse such a horizon soundly while registered either, since A may have
+// pruned before B registered.)
+func TestV0261ForgedPastHorizonWhileRegistered(t *testing.T) {
+	t.Parallel()
+	r := newV077Raised(t)
+	xDoc := "/r/m/x/rev/" + r.x1
+	x1, err := ids.Parse(r.x1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hz := ids.Tombstone(x1).String()
+	forged := `[{"id":"` + hz + `","parent":"` + r.x1 + `","kind":"tombstone"}]`
+	// At creation A refuses x1's document: it stays pending.
+	p := newV077Proxy(t, r.a, map[string]v077Answer{"GET " + xDoc: {1, http.StatusForbidden, v077Forbidden}})
+	b := newV0261B(t, r, p.srv.URL, func(o *core.Options) { o.Remote.Register = true })
+	kB, _ := v0261Remote(t, b, r, "r")
+	br := r.a.get("/ns/m/branches", r.root())
+	t.Logf("A's /ns/m/branches: %d %.300s", br.Code, br.Body)
+	if !strings.Contains(string(br.Body), originB) {
+		t.Fatalf("B didn't register with A: %s", br.Body)
+	}
+	// At the sync, with the registration standing, A answers 410 with a
+	// fabricated horizon past x1, and the one-entry log that "verifies" it.
+	p.set(map[string]v077Answer{
+		"GET " + xDoc:                   {1, http.StatusGone, `{"code":"pruned","horizon":"` + hz + `"}`},
+		"GET /r/m/x/rev/" + hz + "/log": {1, http.StatusOK, forged},
+	})
+	b.clock.Advance(5 * time.Hour)
+	if err := b.e.SyncRemotes(context.Background()); err != nil {
+		t.Logf("sync: %v", err)
+	}
+	if res := r.a.get(xDoc, r.root()); res.Code != 200 {
+		t.Fatalf("A: x1's document: %d", res.Code)
+	}
+	g := b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+	res := b.get("/r/r/x/rev/"+r.x1, g)
+	t.Logf("B: x1's document: %d %s", res.Code, res.Body)
+	// Decision: B may answer 410 with such a horizon (it can't tell it
+	// from an honest one), but not for good: the row is asked for again
+	// after its backoff, and once A serves the sealing, B stores and
+	// serves it.
+	p.set(nil)
+	for range 3 {
+		b.clock.Advance(5 * time.Hour)
+		if err := b.e.SyncRemotes(context.Background()); err != nil {
+			t.Logf("sync: %v", err)
+		}
+	}
+	g = b.grant(kB, "user:reader", []string{"r"}, []string{"read"})
+	ra, rb := r.a.get(xDoc, r.root()), b.get("/r/r/x/rev/"+r.x1, g)
+	if rb.Code != 200 || !bytes.Equal(ra.Body, rb.Body) {
+		t.Fatalf("B answers %d %.200s for x1's document after A served it again, past the 410 with the horizon A fabricated (%s): "+
+			"that 410 was final", rb.Code, rb.Body, hz)
 	}
 }

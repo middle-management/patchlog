@@ -47,10 +47,14 @@ const pendBlob = "blob"
 
 // A's last answer for a pending sealing (remote_pending_sealings.answer).
 const (
-	pendNone       = "none"       // not asked yet
-	pendRefused    = "refused"    // a 4xx other than 408, 429 and 410 pruned, or left out of a log page A served
-	pendTransient  = "transient"  // no answer, a 5xx, 408 or 429 (noAnswer)
-	pendPruned     = "pruned"     // 410 pruned: final, B answers 410 with A's horizon
+	pendNone      = "none"      // not asked yet
+	pendRefused   = "refused"   // a 4xx other than 408, 429 and 410 pruned, or left out of a log page A served
+	pendTransient = "transient" // no answer, a 5xx, 408 or 429 (noAnswer)
+	pendPruned    = "pruned"    // 410 pruned, its horizon in the mirrored chain: final, B answers 410 with it
+	// 410 pruned with a horizon past B's mirrored head that A's log
+	// verifies (verifyHorizonPast): B answers 410 with it, but A can
+	// fabricate such a chain, so it isn't final: asked again, as refused.
+	pendPrunedPast = "pruned_past"
 	pendUnverified = "unverified" // served, but it didn't open to the mirrored content
 )
 
@@ -206,20 +210,23 @@ func (t *tx) recordPending(sh int64, name string, seq int64, s pendingSealing) {
 // a revision of the mirrored chain after the sealing's (horizonIn), until
 // a sync checks it for good (pendingFixes).
 func (t *tx) pendingPruned(sh *nsRow, kind, name, ref string, epoch int) (string, bool) {
-	q := `SELECT horizon, rev_seq, due = updated FROM remote_pending_sealings WHERE shadow = ? AND name = ? AND kind = ? AND ref = ? AND answer = ?`
-	args := []any{sh.id, name, kind, ref, pendPruned}
+	q := `SELECT answer, horizon, rev_seq, due = updated FROM remote_pending_sealings WHERE shadow = ? AND name = ? AND kind = ? AND ref = ? AND answer IN (?, ?)`
+	args := []any{sh.id, name, kind, ref, pendPruned, pendPrunedPast}
 	if epoch >= 0 {
 		q += ` AND epoch = ?`
 		args = append(args, epoch)
 	}
+	var answer string
 	var hz sql.NullString
 	var revSeq int64
 	var checked bool
-	err := t.QueryRow(q+` LIMIT 1`, args...).Scan(&hz, &revSeq, &checked)
+	err := t.QueryRow(q+` LIMIT 1`, args...).Scan(&answer, &hz, &revSeq, &checked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false
 	}
 	t.must(err)
+	// Only this version records pruned_past, having verified its horizon.
+	checked = checked || answer == pendPrunedPast
 	if !hz.Valid || !checked && !t.horizonIn(sh.id, name, hz.String, revSeq) {
 		return "", false
 	}
@@ -675,11 +682,14 @@ func (t *tx) settlePending(r *pendingRow) {
 	args := []any{r.shadow, r.name, r.s.kind, r.s.ref, r.s.epoch, pendPruned}
 	if !r.fetchedOK {
 		ans, hz := r.fetchAnswer, any(nil)
-		if ans == pendPruned && !r.horizonPast && !t.horizonIn(r.shadow, r.name, r.fetchHorizon, r.revSeq) {
-			ans = pendRefused
-		}
-		if ans == pendPruned {
+		switch {
+		case ans != pendPruned:
+		case t.horizonIn(r.shadow, r.name, r.fetchHorizon, r.revSeq):
 			hz = r.fetchHorizon
+		case r.horizonPast:
+			ans, hz = pendPrunedPast, r.fetchHorizon
+		default:
+			ans = pendRefused
 		}
 		tries := r.tries + 1
 		due := t.now.Add(pendingBackoff(tries))
@@ -803,7 +813,9 @@ const (
 // the first that doesn't chain ends it, and each must move to its last
 // entry (X-Log-Next). Where the range isn't served so (A pruned
 // revisions between head and hz too, or serves them sealed), it isn't
-// verified.
+// verified. It proves only that A can produce such a chain, which A can
+// fabricate (the tombstone of the head is one entry): a horizon it
+// verifies isn't final (pendPrunedPast).
 func verifyHorizonPast(ctx context.Context, ep RemoteEndpoint, baseURL, what, head, hz string, caps preCaps) bool {
 	if _, err := ids.Parse(hz); err != nil || hz == head {
 		return false
