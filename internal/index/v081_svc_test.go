@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -153,5 +154,77 @@ func TestV081SvcIndexNowRoles(t *testing.T) {
 	}
 	if r := x.raw("/docs", tok); r.status != 403 {
 		t.Errorf("the grant once every role refers to /now: %d %v", r.status, r.body)
+	}
+}
+
+// TestV081SvcIndexBranchUncovered (§B.11.9 Where, §A.4 gs markers, v0.78;
+// CONFORMANCE TDA 103): no branch is covered, so a partial reader of
+// matches-r7, whose base names a catalog, has no marker there: its query
+// is 403, and /_refs leaves matches-r7 out, so final, created only in the
+// branch, is never its hit. An unrestricted reader reads the branch whole.
+func TestV081SvcIndexBranchUncovered(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := newV75X(t, true)
+	must(w.admin.CreateBranch(ctx, "matches", client.BranchRequest{Name: "matches-r7"}))
+	w.put("matches-r7", "final", w.page("final", "cup"))
+	w.put("cat-season", "matches.final", map[string]any{"parents": v75Parents("season")})
+	w.x.caughtUp("matches-r7")
+	fan := w.reader("user:fan", []any{"fans"}, "matches-r7")
+	if r := w.x.raw("/matches-r7", fan); r.status != 403 || r.header.Get("Cache-Control") != "no-store" {
+		t.Errorf("a partial reader of the branch: %d %v", r.status, r.body)
+	}
+	all := w.k.Grant(t, w.s.Now(), "user:root", []string{"matches-r7"}, []string{"read"})
+	if got := resources(w.x.search("/matches-r7", all)); !slices.Contains(got, "final") {
+		t.Errorf("unrestricted reader sees %v in the branch", got)
+	}
+	both := w.reader("user:fan", []any{"fans"}, "matches", "matches-r7")
+	_, _, rloc := w.x.refsPointer("?to=/r/target/x", both)
+	rb := w.x.search(rloc, both)
+	if got := refsAllHits(rb); got != "matches/derby matches/shared" {
+		t.Errorf("/_refs across the base and the branch: %s", got)
+	}
+	if ns := v75Namespaces(t, rb); ns["matches-r7"] != "" || ns["matches"] == "" {
+		t.Errorf("/_refs namespaces %v", ns)
+	}
+}
+
+// TestV081SvcIndexBranchCatalogDark (§B.11.9 Where: "a branch ... makes
+// nothing visible", v0.78): matches trusts cat-br, a local branch of
+// cat-season whose catalog.trust lists matches, through a key whose
+// requireAt names it; cat-br places opener, which cat-season doesn't. It
+// keeps matches covered, but shows nothing: a partial reader's hits are
+// cat-season's alone, and cat-br is in no checkpoint.
+func TestV081SvcIndexBranchCatalogDark(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := newV75XOn(t, clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}))
+	nss := []string{"schemas", "cat-season", "cat-br", "matches"}
+	admin := w.s.Client(t, client.WithBearer(w.k.Grant(t, w.s.Now(), "user:root", nss,
+		[]string{"read", "create", "append", "config", "branch"})))
+	must(admin.CreateBranch(ctx, "cat-season", client.BranchRequest{Name: "cat-br"}))
+	must(admin.CreateDoc(ctx, "cat-br", "matches.opener", map[string]any{"parents": []any{map[string]any{"href": "/r/cat-br/root"}}}))
+	br := w.cat.Entry("read")
+	br["kid"], br["requireAt"], br["maxTtl"] = "br-01", "cat-br", "PT15M"
+	br["rules"] = []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}
+	must(admin.PatchConfig(ctx, "matches", must(admin.NSHead(ctx, "matches")).Config, []any{
+		map[string]any{"op": "add", "path": "/catalogs/cat-br", "value": map[string]any{"place": []any{}}},
+		map[string]any{"op": "add", "path": "/keys/-", "value": br}}))
+	ev := must(edge.New([]byte("s3cret"), "", ""))
+	x := startSvcWith(t, w.s.Client(t, client.WithBearer(w.k.Grant(t, w.s.Now(), "svc:indexer", nss, []string{"read"}))),
+		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, untyped: true, now: w.s.Now},
+		func(o *indexOpts) {
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+		})
+	x.caughtUp("matches")
+	w.x = x
+	fan := w.reader("user:fan", []any{"fans"})
+	loc, _, _ := w.pointer("/matches", fan)
+	b := x.search(loc, fan)
+	if got := strings.Join(resources(b), ","); got != "derby,shared" {
+		t.Errorf("fan sees %s", got)
+	}
+	if ns := v75Namespaces(t, b); ns["cat-br"] != "" || ns["cat-season"] == "" {
+		t.Errorf("namespaces %v", ns)
 	}
 }

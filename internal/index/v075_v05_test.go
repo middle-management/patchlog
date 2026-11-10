@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -449,49 +448,6 @@ func TestV075IndexRefs(t *testing.T) {
 	}
 	if got := refsAllHits(w.x.search(loc2, fan)); got != "matches/shared" {
 		t.Errorf("hits after the move %s", got)
-	}
-}
-
-// TestV075IndexBranch (SVC-15, §B.11.9 Branches): in a covered branch's
-// preview index a partial reader sees a document only where its base had
-// a live one as of the branch's at, and its root's catalog places it: so
-// final, created only in matches-r7, is never its hit, though placed,
-// while an unrestricted reader sees it. The base joins at, listed at its
-// head, being a catalog.trust member read there (v0.76, §A.4 Answers;
-// before v0.76 at baseAt).
-func TestV075IndexBranch(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	w := newV75X(t, true)
-	base := w.head("matches")
-	must(w.admin.CreateBranch(ctx, "matches", client.BranchRequest{Name: "matches-r7"}))
-	w.put("matches-r7", "final", w.page("final", "cup"))
-	w.put("cat-season", "matches.final", map[string]any{"parents": v75Parents("season")})
-	w.x.caughtUp("matches-r7")
-	fan := w.reader("user:fan", []any{"fans"}, "matches-r7")
-	loc, _, at := w.pointer("/matches-r7", fan)
-	b := w.x.search(loc, fan)
-	if got := strings.Join(resources(b), ","); got != "derby,shared" {
-		t.Errorf("fan sees %s in the branch, want derby,shared", got)
-	}
-	ns := v75Namespaces(t, b)
-	if ns["matches"] != w.x.ix.Checkpoint("matches") || ns["matches-r7"] != w.x.ix.Checkpoint("matches-r7") || ns["cat-season"] != w.head("cat-season") || at != grantcheck.CombinedAt(ns) {
-		t.Errorf("namespaces %v at %s (base at %s)", ns, at, base)
-	}
-	all := w.k.Grant(t, w.s.Now(), "user:root", []string{"matches-r7"}, []string{"read"})
-	if got := resources(w.x.search("/matches-r7", all)); !slices.Contains(got, "final") {
-		t.Errorf("unrestricted reader sees %v in the branch", got)
-	}
-	// Across the base and the branch: one ns_id for matches, its own
-	// checkpoint, the branch's standing for the base at baseAt.
-	both := w.reader("user:fan", []any{"fans"}, "matches", "matches-r7")
-	_, _, rloc := w.x.refsPointer("?to=/r/target/x", both)
-	rb := w.x.search(rloc, both)
-	if got := refsAllHits(rb); got != "matches/derby matches/shared matches-r7/derby matches-r7/shared" {
-		t.Errorf("/_refs across the base and the branch: %s", got)
-	}
-	if ns := v75Namespaces(t, rb); ns["matches"] != w.x.ix.Checkpoint("matches") || ns["matches-r7"] == "" || ns["cat-season"] == "" || len(ns) != 3 {
-		t.Errorf("/_refs namespaces %v", ns)
 	}
 }
 

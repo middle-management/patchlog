@@ -91,23 +91,24 @@ const (
 type fsBase struct{ ns, at string }
 
 // fsCat is a catalog a covered namespace trusts, with its document as of
-// id (its ns_id in the checkpoint), whether it is e2e or purged (gone: no
-// document, no id), either of which makes nothing visible and keeps it
-// out of at (dark), and the kids of the root's keys whose requireAt names
-// it.
+// id (its ns_id in the checkpoint), whether it is e2e, a local branch or
+// purged (gone: no document, no id), any of which makes nothing visible
+// and keeps it out of at (dark), and the kids of the root's keys whose
+// requireAt names it.
 type fsCat struct {
 	ns, id string
 	doc    map[string]any
 	e2e    bool
+	branch bool
 	gone   bool
 	kids   []string
 }
 
 // dark reports whether c makes nothing visible (§B.11.9 Where: "an
-// end-to-end catalog, which the origin can't read, or a purged one, makes
-// nothing visible"): it still counts for coverage, but decides no view and
-// stays out of at and its ids.
-func (c fsCat) dark() bool { return c.e2e || c.gone }
+// end-to-end catalog, which the origin can't read, a branch or a purged
+// one makes nothing visible"): it still counts for coverage, but decides
+// no view and stays out of at and its ids.
+func (c fsCat) dark() bool { return c.e2e || c.branch || c.gone }
 
 // fcp is a covered namespace's combined checkpoint (§B.11.9 URLs, §A.4):
 // at is grantcheck.CombinedAt over ids, and cats the deciding catalogs'
@@ -493,7 +494,9 @@ func isCatalog(doc map[string]any) bool {
 // catvis.TrustedCatalogs), each with its document as of the id it is
 // taken at (memberAt): local, unpurged namespaces, and purged ones (gone),
 // which make nothing visible and still count for coverage, as at the
-// origin (§B.11.9 Where: "a purged one makes nothing visible"). A purged
+// origin (§B.11.9 Where: "a branch or a purged one makes nothing
+// visible"), as does a local branch (fsCat.branch). A remote branch has
+// no checkpoint here (memberAt) and counts as no catalog. A purged
 // catalog's document is 410: its catalog.trust is the one the index last
 // applied (catalog_trust), as the origin reads its last stored document
 // ("as their documents alone decide"). One the index never applied a
@@ -540,8 +543,9 @@ func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) (
 			out = append(out, fsCat{ns: tr.Catalog, gone: true, kids: tr.Kids})
 			continue
 		}
+		_, _, branch := localBase(docs[tr.Catalog])
 		out = append(out, fsCat{ns: tr.Catalog, id: ids[tr.Catalog], doc: docs[tr.Catalog],
-			e2e: derived.InfoOf(docs[tr.Catalog]).Level == derived.LevelE2E, kids: tr.Kids})
+			e2e: derived.InfoOf(docs[tr.Catalog]).Level == derived.LevelE2E, branch: branch, kids: tr.Kids})
 	}
 	return out, nil
 }
@@ -590,6 +594,12 @@ func (ix *Index) coverageOf(ctx context.Context, ns, z string) (*fcp, []fsCat, e
 		return nil, nil, err
 	}
 	if !fsOpen(doc) || remoteBranch(doc) {
+		return nil, nil, nil
+	}
+	if _, _, ok := localBase(doc); ok {
+		// No branch is covered (§B.11.9 Where: "neither a branch (§7.6),
+		// public, sealed nor end-to-end", v0.78): a partial reader of one
+		// whose base names a catalog has no marker (catalogShaped, §A.4).
 		return nil, nil, nil
 	}
 	cp := &fcp{ns: ns}
