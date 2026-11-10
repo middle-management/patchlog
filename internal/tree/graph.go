@@ -205,8 +205,9 @@ type Graph struct {
 	// one again: what it can't follow is never applied, a narrowing
 	// among it, so none reads public (publicAsApplied), and a stopped
 	// catalog is not served. A stopped content namespace is not followed
-	// (isStopped): it is out of the combined checkpoint and listed(), and
-	// its placements dangle (§B.5, §B.7).
+	// (isStopped): it is out of the combined checkpoint and listed(), its
+	// explicit placements dangle and its implicit ones leave the graph
+	// (§B.5, §B.7, §B.9; refresh).
 	stopped map[string]string
 	// Aliases maps a namespace to the branch followed in its place in a
 	// release preview (§B.5, §F.9); nil otherwise.
@@ -424,12 +425,19 @@ func (g *Graph) unlink(n *Node) {
 
 // refresh recomputes the merged node for name after explicit or self
 // changed, keeping item state. An explicit placement wins over $parents
-// whether live, deleted or purged (§B.9).
+// whether live, deleted or purged (§B.9). A namespace the service stopped
+// following contributes no implicit placement (§B.5 Behind, §B.9: $parents
+// is accepted for a followed, trusted namespace): it is out of the
+// combined checkpoint that problems and orphans are judged against
+// (§B.11.9), so its nodes, named from its documents, would reach readers
+// without read on it (refreshSelf re-derives them on stop and unstop).
 func (g *Graph) refresh(name string) {
 	old := g.nodes[name]
 	nw := g.explicit[name]
 	if nw == nil && !g.explicitGone[name] {
-		nw = g.self[name]
+		if sn := g.self[name]; sn != nil && !g.isStopped(sn.ItemNS) {
+			nw = sn
+		}
 	}
 	if old == nw {
 		return
@@ -490,6 +498,17 @@ func (g *Graph) setSelf(n *Node) {
 func (g *Graph) removeSelf(name string) {
 	delete(g.self, name)
 	g.refresh(name)
+}
+
+// refreshSelf recomputes the merged nodes of ns's implicit placements
+// after its stop began or ended (refresh); analyze then reports the names
+// that left or entered the graph.
+func (g *Graph) refreshSelf(ns string) {
+	for name, n := range g.self {
+		if n.ItemNS == ns {
+			g.refresh(name)
+		}
+	}
 }
 
 // setItem records what the service holds of an item on the explicit and

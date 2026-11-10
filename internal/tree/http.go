@@ -480,10 +480,14 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 	default:
 		return nil, catErr
 	}
-	if vg != nil && !catPublic && grantcheck.RefusedByNow(vg) {
+	if vg != nil && grantcheck.RefusedByNow(vg) {
 		// A key-scope or block rule on /now, or roles that all have one,
 		// refuse every read of the catalog (§C.2 item 5): its listings
-		// too, filtered or not.
+		// too, filtered or not, and the exchange, whatever the catalog's
+		// read mode. A public catalog's public URL space (publicViewer)
+		// doesn't come here. One verified in a content namespace reads it
+		// neither unrestricted nor namespace-wide (ReadsUnrestricted,
+		// NamespaceWide), so it counts there for nothing.
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant's rules refer to /now, which no read passes (§C.2 item 5)"}
 	}
 	var exp time.Time

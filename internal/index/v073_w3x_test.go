@@ -2,7 +2,6 @@ package index_test
 
 import (
 	"context"
-	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,9 +14,10 @@ import (
 // follows is raised from none to sealed (until v0.81 to e2e, which is 422
 // since v0.78), and the index holds no keys and fetches none
 // (client.StaticKeys), so it lacks the namespace's keys as configured.
-// Running through the raise, the namespace is refused for good, never
-// 503 behind forever; other namespaces are served as before, and a
-// restart skips it (404).
+// Running through the raise, it skips the namespace and stops following
+// it, as it does when it starts: queries answer 404 not_found, not 503
+// behind forever. Other namespaces are served as before, and a restart
+// answers the same.
 func TestW3XIndexRaisedToE2EWhileFollowed(t *testing.T) {
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond, KeyStore: keyStore(t)})
@@ -44,18 +44,20 @@ func TestW3XIndexRaisedToE2EWhileFollowed(t *testing.T) {
 		}
 		return r
 	}
-	// Behind at most while the config entry is being applied, then
-	// refused for good, never served and never 503 behind: running, the
-	// index can't read the entry that raised r, so it stops following r
-	// (purgeStopped) and reads it as private, whose document it can't read
-	// (502); after a restart it skips r for want of keys (404).
-	refused := func(st int) bool { return st == 404 || st == http.StatusBadGateway }
-	waitFor(t, "r refused", func() bool { return refused(follow(x, "/r").status) })
+	// Behind at most while the config entry is being applied, then 404
+	// for good: running, the index can't read the entry that raised r (or
+	// r's document, in a read check), so it decides r again as when it
+	// starts, and skips it for want of keys, as after a restart (§A.4
+	// Unavailable namespaces).
+	waitFor(t, "404 for the raised namespace", func() bool { return follow(x, "/r").status == 404 })
 	for i := 0; i < 20; i++ {
-		if r := follow(x, "/r"); !refused(r.status) {
-			t.Fatalf("running through the raise: %d %v (Retry-After %q), want it refused for good", r.status, r.body, r.header.Get("Retry-After"))
+		if r := follow(x, "/r"); r.status != 404 {
+			t.Fatalf("running through the raise: %d %v (Retry-After %q), want 404 as after a restart", r.status, r.body, r.header.Get("Retry-After"))
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if st := x.raw("/_status", "").body["namespaces"].([]any); st[1].(map[string]any)["skipped"] != true {
+		t.Errorf("status of r after the raise: %v", st)
 	}
 	must(c.CreateDoc(ctx, "p", "b", map[string]any{"title": "zebra"}))
 	x.caughtUp("p")

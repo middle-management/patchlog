@@ -59,7 +59,8 @@ func v077Epochs(t *testing.T, db, name string) (epoch, born int) {
 // catb (v081Preview), node n's head is cat's op, read through, so its
 // snapshot takes catb's epoch in force: first listed at cat#1, its title
 // is sealed under cat#1; after the epochs rotate to 2, a listing at a new
-// at still seals it under cat#1, and so does one after a restart.
+// at still seals it under cat#1, later written after the rotation under
+// cat#2, and n stays under cat#1 after a restart.
 // (Before, every listing took the current epoch.) Until v0.81 n was
 // written in the clear in cat before cat was raised to e2e, which is 422
 // since v0.78.
@@ -88,6 +89,9 @@ func TestV077V04JudgedOnceE3(t *testing.T) {
 	must(p.x2.CreateDocSealed(ctx, "catb", "later", map[string]any{"title": "Later", "parents": parents("root@a1")}))
 	p.reach(t, x)
 	check("after the rotation")
+	if got, vals, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "later", p.keyOf); got != "cat#2" || vals["title"] != "Later" {
+		t.Errorf("later, written after the rotation: %v under %s, want title Later under cat#2", vals, got)
+	}
 
 	x.stop()
 	x = p.start(t)

@@ -1588,6 +1588,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			return nil, err
 		}
 		delete(g.stopped, b.NS)
+		g.refreshSelf(b.NS)
 	}
 	narrowed = narrowed && (s.cur[b.NS] != "" || recorded || s.opt.Rebuild) && (b.NS == cat || g.Trust[b.NS] || oldTrust[b.NS])
 	if co.PurgedNS || narrowed {
@@ -1726,6 +1727,7 @@ func (s *Service) purgeStopped(ctx context.Context, ns string) {
 			// as before the write was tried (restarted, the service stops
 			// ns again when it fails to follow it).
 			s.g.stopped[ns] = cp
+			s.g.refreshSelf(ns)
 			s.g.analyze()
 		}
 	}
@@ -1761,6 +1763,9 @@ func (s *Service) restop(ctx context.Context, ns string, record func(tx *sql.Tx)
 		if err := record(tx); err != nil {
 			return err
 		}
+		// Its implicit placements leave the graph while it is stopped and
+		// enter it again once followed (Graph.refresh).
+		s.g.refreshSelf(ns)
 		changed := s.g.analyze()
 		names := make([]string, 0, len(changed))
 		for name := range changed {

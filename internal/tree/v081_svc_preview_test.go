@@ -3,6 +3,7 @@ package tree_test
 import (
 	"context"
 	"crypto/ecdh"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -94,4 +95,21 @@ func (p *v081Preview) rotate(t *testing.T) {
 var v081SealedPrivate = []any{
 	map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}},
 	map[string]any{"op": "replace", "path": "/read", "value": "grant"},
+}
+
+// v081PendingHead sets the store at db, the service stopped, as one from
+// before v0.78 holds the only revision of e2e catalog node name, written
+// in the clear before a raise to e2e: its epoch NULL, pending, judged by
+// the first listing that seals it, its born's with it (bornWithHead;
+// §E.2.6, §E.3.1), and no listing stored. A raise to e2e is 422 since
+// v0.78, so no core a test reaches serves such a revision.
+func v081PendingHead(t *testing.T, db, name string) {
+	t.Helper()
+	sq := must(sql.Open("sqlite", db))
+	defer sq.Close()
+	for _, q := range []string{`UPDATE nodes SET epoch = NULL, born_epoch = -3 WHERE name = '` + name + `'`, `DELETE FROM sealed_views`} {
+		if _, err := sq.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
