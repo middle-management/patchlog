@@ -1,0 +1,25 @@
+-- Migration: ns config revs
+-- Created: 2026-11-10T08:34:53Z
+-- Checksum: 59df92735c88518ae47777a7047e47d75b71c9280401b5ede1da928ae7c8dbc6
+-- Chain: f2cbbcbe75053a0513d947d5cb8c4e354bd9d992a01ee343085cd49e02511bc7
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- ns_config_revs: every config revision (X-Config-Revision, the namespace
+-- document's) the index applied for each namespace it serves, from config
+-- entries and the document a snapshot is taken at. A read check made on a
+-- document the index applied is one a config entry since may narrow; one
+-- made on a document it hasn't applied yet is newer than what ns_conf
+-- records (stillPublic). Emptied by a rebuild.
+CREATE TABLE IF NOT EXISTS ns_config_revs (ns TEXT NOT NULL, config TEXT NOT NULL, PRIMARY KEY (ns, config));

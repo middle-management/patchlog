@@ -278,10 +278,11 @@ func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*acces
 // served at a URL its read no longer admits. Changed, the query is
 // computed again with a fresh read check (errAccessChanged, afterPurge).
 //
-// A public reader's: ns is still public as the read mode the index last
-// applied records it (ns_conf, committed before the purge, so a gen
-// taken after it sees it) and as the grant checker reads it now (it
-// observes the change before the purge, Apply). A grant's: it still
+// A public reader's: ns is still public as the grant checker reads it
+// now (it observes the change before the purge, Apply), and not made
+// private by a config entry the index applied after the document the
+// checker read (stillPublic: ns_conf and ns_config_revs, committed
+// before the purge, so a gen taken after it sees them). A grant's: it still
 // verifies and allows read as the checker reads ns now (a revocation, a
 // key or role removed: §C.4, which purge nothing). A cookie's edge grant
 // is the service's own, checked by the marker it carries (edgegrants.go).
@@ -300,19 +301,45 @@ func (ix *Index) accessChanged(ctx context.Context, ns string, a *access) bool {
 	return false
 }
 
-// stillPublic reports whether ns is public both as the read mode the
-// index last applied records it (ns_conf; with none applied yet, the
-// checker alone decides) and as the grant checker reads it now
-// (accessChanged).
+// stillPublic reports whether ns is still public for a read check that
+// found it so (accessChanged): as the grant checker reads it now and, if
+// the read mode the index last applied (ns_conf) is private, only where
+// the checker's document is newer than what the index applied: one the
+// index applied (ns_config_revs, by its config revision) is one a later
+// config entry made private, a narrowing whose purge may already be out,
+// and the checker read it before it (a reload racing Observe, Apply). A
+// newer one, a widening the index hasn't applied yet, is trusted: it
+// shows only what the namespace's read now admits, and a narrowing after
+// it purges after gen. With no config entry of ns applied yet, the
+// checker alone decides; with ns_conf private and no config revision
+// recorded (a database from before ns_config_revs), it isn't public.
 func (ix *Index) stillPublic(ctx context.Context, ns string) bool {
 	var public bool
+	known := true
 	switch err := ix.db.QueryRowContext(ctx, `SELECT public FROM ns_conf WHERE ns = ?`, ns).Scan(&public); {
 	case errors.Is(err, sql.ErrNoRows):
-	case err != nil || !public:
+		known = false
+	case err != nil:
 		return false
 	}
 	cfg, err := ix.checker.Config(ctx, ns)
-	return err == nil && cfg.Read == "public"
+	switch {
+	case err != nil || cfg.Read != "public":
+		return false
+	case !known || public:
+		return true
+	}
+	// ns_conf private, the checker public: the config revision of the
+	// checker's document (immutable at its ns_id, so never stale).
+	doc, err := ix.c.NSDoc(ctx, ns, cfg.Head)
+	if err != nil || doc.Config == "" {
+		return false
+	}
+	var n, applied int
+	if err := ix.db.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(config = ?), 0) FROM ns_config_revs WHERE ns = ?`, doc.Config, ns).Scan(&n, &applied); err != nil {
+		return false
+	}
+	return n > 0 && applied == 0
 }
 
 // grantAccess is access to private namespace ns for v, a grant verified

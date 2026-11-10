@@ -33,6 +33,8 @@
 //	                                      that the index follows without serving them, while it
 //	                                      follows them (members.go)
 //	member_conf(ns, public, level)        as ns_conf, for those
+//	ns_config_revs(ns, config)            every config revision of ns the index applied (narrowed,
+//	                                      stillPublic)
 //	catalog_trust(ns, trust)              the catalog.trust last applied, of either, kept past a
 //	                                      purge-ns and a rebuild (recordTrust, fsTrust), read again
 //	                                      at a snapshot, forgotten once ns is neither served nor
@@ -366,7 +368,7 @@ var migrations embed.FS
 // initSchema rather than a migration, is dropped, so a rebuild decides
 // between FTS5 and the LIKE fallback again.
 var resetStmts = []string{
-	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM ns_state`, `DELETE FROM ns_conf`,
+	`DELETE FROM checkpoints`, `DELETE FROM checkpoints_bootstrap`, `DELETE FROM seen`, `DELETE FROM ns_state`, `DELETE FROM ns_conf`, `DELETE FROM ns_config_revs`,
 	`DELETE FROM docs`, `DROP TABLE IF EXISTS "text"`, `DELETE FROM facet`, `DELETE FROM "sort"`, `DELETE FROM refs`,
 	derived.CacheResetStmts[0], derived.CacheResetStmts[1],
 }
@@ -772,17 +774,21 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// bootstrapped) has no document to read, and keeps it; a sealed one
 	// purged since the listing was read, whose document is 410 too, is
 	// forgotten (unknown: no catalog, which shows least).
-	var snapDoc map[string]any
+	var snapDoc *client.NSDoc
 	forgetTrust := false
 	if b.Replaces() && !config && !co.PurgedNS {
-		doc, err := ix.docAt(ctx, b.NS, b.NewCheckpoint)
+		doc, err := ix.c.NSDoc(ctx, b.NS, b.NewCheckpoint)
 		switch {
 		case client.IsPurged(err):
 			forgetTrust = true
 		case err != nil:
-			return err
+			return lacksRead(b.NS, fmt.Errorf("the document of %s at %s: %w", b.NS, b.NewCheckpoint, err))
+		default:
+			if doc.Value == nil {
+				doc.Value = map[string]any{}
+			}
+			snapDoc = doc
 		}
-		snapDoc = doc
 	}
 
 	ix.wmu.Lock()
@@ -801,7 +807,10 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		}
 	}
 	if snapDoc != nil {
-		if err := recordTrust(ctx, tx, b.NS, snapDoc); err != nil {
+		if err := recordTrust(ctx, tx, b.NS, snapDoc.Value); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO ns_config_revs (ns, config) VALUES (?, ?)`, b.NS, snapDoc.Config); err != nil {
 			return err
 		}
 	}
@@ -842,7 +851,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// or raising it to sealed or e2e: results computed before it, public
 	// or in the clear, must go. Kept results, stored sealed ones (in this
 	// transaction) and /_refs answers go by the same tags.
-	narrowed, err := ix.narrowed(ctx, tx, "ns_conf", b)
+	narrowed, err := ix.narrowed(ctx, tx, "ns_conf", b.NS, configDocs(b))
 	if err != nil {
 		return err
 	}
@@ -978,49 +987,60 @@ func (ix *Index) purgeKept(ns string, tags []string) {
 	}
 }
 
-// narrowed reports whether a config unit of b makes its namespace private
-// or raises it to sealed or e2e (§9), against the read mode and level the
-// index last applied (table: ns_conf, or member_conf for a namespace it
-// follows only for visibility, members.go), and records the last unit's,
-// in tx, with its catalog.trust (recordTrust). Before
+// configDocs are the namespace documents b's config units bring, in order.
+func configDocs(b *follow.Batch) []*client.NSDoc {
+	var out []*client.NSDoc
+	for _, u := range b.Units {
+		if u.Config != nil {
+			out = append(out, u.Config)
+		}
+	}
+	return out
+}
+
+// narrowed reports whether one of docs, the namespace documents ns's
+// config units bring, or the one a snapshot is taken at (Apply), makes
+// ns private or raises it to sealed or e2e (§9), against the read mode
+// and level the index last applied (table: ns_conf, or member_conf for a
+// namespace it follows only for visibility, members.go), and records the
+// last one's, in tx, with its catalog.trust (recordTrust) and, in
+// ns_conf's case, every config revision applied (ns_config_revs,
+// stillPublic). Before
 // the first it records, the namespace counts as public and unsealed, so
 // the first private or sealed document it applies counts too: once, at
 // the genesis of a namespace followed from the start, when nothing is
 // cached yet, and after an upgrade from a database without ns_conf, when
 // there may be.
-func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, table string, b *follow.Batch) (bool, error) {
+func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, table, ns string, docs []*client.NSDoc) (bool, error) {
 	if table != "ns_conf" && table != "member_conf" {
 		return false, fmt.Errorf("index: no table %q", table)
 	}
-	public, level, known := true, "", false
+	if len(docs) == 0 {
+		return false, nil
+	}
+	public, level := true, ""
+	err := tx.QueryRowContext(ctx, `SELECT public, level FROM `+table+` WHERE ns = ?`, ns).Scan(&public, &level)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
 	narrowed := false
-	var last map[string]any
-	for _, u := range b.Units {
-		if u.Config == nil {
-			continue
-		}
-		last = u.Config.Value
-		if !known {
-			err := tx.QueryRowContext(ctx, `SELECT public, level FROM `+table+` WHERE ns = ?`, b.NS).Scan(&public, &level)
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return false, err
-			}
-			known = true
-		}
-		read, _ := u.Config.Value["read"].(string)
-		lv := derived.InfoOf(u.Config.Value).Level
+	for _, d := range docs {
+		read, _ := d.Value["read"].(string)
+		lv := derived.InfoOf(d.Value).Level
 		if public && read != "public" || levelRank(lv) > levelRank(level) && derived.Protected(lv) {
 			narrowed = true
 		}
 		public, level = read == "public", lv
+		if table == "ns_conf" && d.Config != "" {
+			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO ns_config_revs (ns, config) VALUES (?, ?)`, ns, d.Config); err != nil {
+				return false, err
+			}
+		}
 	}
-	if !known {
-		return false, nil
-	}
-	if err := recordTrust(ctx, tx, b.NS, last); err != nil {
+	if err := recordTrust(ctx, tx, ns, docs[len(docs)-1].Value); err != nil {
 		return false, err
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO `+table+` (ns, public, level) VALUES (?, ?, ?) ON CONFLICT (ns) DO UPDATE SET public = excluded.public, level = excluded.level`, b.NS, public, level)
+	_, err = tx.ExecContext(ctx, `INSERT INTO `+table+` (ns, public, level) VALUES (?, ?, ?) ON CONFLICT (ns) DO UPDATE SET public = excluded.public, level = excluded.level`, ns, public, level)
 	return narrowed, err
 }
 
