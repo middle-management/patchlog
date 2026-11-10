@@ -421,14 +421,16 @@ func testE2EFoldFromHorizon(t *testing.T, size int) {
 	}
 
 	// A tombstone horizon: a restore with [] brings back the snapshot's
-	// document, the last live one.
+	// document, the last live one. The snapshot is served at the
+	// tombstone's parent, which the not_offered names as last, and the
+	// fold starts there, the tombstone in its range (§7.1, v0.81).
 	del := must(wc.Delete(ctx, "e", "p", revs[6]))
 	s.Clock.Advance(10 * time.Minute)
 	must(w.PruneE2E(ctx, "e", "p", del.ID))
 	res := must(w.RestoreSealed(ctx, "e", "p", del.ID, nil))
 	v, ps = read(res.ID)
 	sameJSON(t, v, map[string]any{"n": 6})
-	if !has(ps, revPath(del.ID)) || !has(ps, revPath(res.ID)+"/log?since="+del.ID) {
+	if !has(ps, revPath(revs[6])) || !has(ps, revPath(res.ID)+"/log?since="+revs[6]) || has(ps, revPath(del.ID)) {
 		t.Fatalf("fold after a tombstone horizon read %v", ps)
 	}
 	if _, err := x.DocE2E(ctx, "e", "p", del.ID); !client.IsGone(err) {
