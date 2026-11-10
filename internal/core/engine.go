@@ -211,6 +211,11 @@ type Options struct {
 	// a namespace is end-to-end from its creation or never (Addendum E
 	// Levels).
 	LegacyE2ERaiseForTests bool
+	// LegacyKeyringNonceForTests lets a keyring write in an e2e namespace
+	// carry a $nonce of any form, as the gate took it before v0.76 (tests
+	// of keyrings stored then). Never set in production: a keyring write
+	// carries a fresh $nonce or none (§E.3.2, §C.7).
+	LegacyKeyringNonceForTests bool
 	// migrations, if not nil, replaces the embedded migrations (tests of
 	// a database an earlier version left).
 	migrations fs.FS

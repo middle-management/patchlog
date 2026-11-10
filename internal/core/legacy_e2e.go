@@ -240,16 +240,27 @@ func (e *Engine) purgeRaisedE2E(ctx context.Context, l *legacyE2E) error {
 const UpgradeAuthor = "system:upgrade"
 
 // warnLegacyE2E logs, without refusing, what this version no longer
-// reads in end-to-end namespaces (stored.md items 4–6, 17):
-//   - keyrings in the pre-v0.63 form or with a pre-v0.76 $nonce, whose
-//     entries /keys no longer relays (keyringEntries): a key holder runs
-//     the v0.26.1 client's migrate-keyring first;
+// reads in end-to-end namespaces (legacyE2EWarnings).
+func (e *Engine) warnLegacyE2E(ctx context.Context, purged *legacyE2E) {
+	for _, l := range e.legacyE2EWarnings(ctx, purged) {
+		log.Printf("warning: %s", l)
+	}
+}
+
+// legacyE2EWarnings lists what this version no longer reads in end-to-end
+// namespaces (stored.md items 4–6, 17):
+//   - keyrings whose entries /keys no longer relays (keyringEntries): one
+//     in the pre-v0.63 form, which a key holder wraps again with the
+//     v0.26.1 client's migrate-keyring (v0.81 has no such tool); one of
+//     the §E.3.2 form with a $nonce written before v0.76, which the next
+//     keyring write by a v0.81 client mends, as it writes a fresh $nonce
+//     (§E.3.2, §C.7);
 //   - prune snapshots whose header binds another id than §E.3.1's (at a
 //     tombstone horizon, its parent), or carries a pre-v0.63 pl kind or a
 //     zip member, which /rev/{id} answers 410 pruned instead
 //     (snapshotServable);
 //   - $schema pins to schema revisions of the namespaces purged as raised.
-func (e *Engine) warnLegacyE2E(ctx context.Context, purged *legacyE2E) {
+func (e *Engine) legacyE2EWarnings(ctx context.Context, purged *legacyE2E) []string {
 	var lines []string
 	err := e.read(ctx, func(t *tx) error {
 		rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0`)
@@ -265,8 +276,17 @@ func (e *Engine) warnLegacyE2E(ctx context.Context, purged *legacyE2E) {
 			if n.isShadow() || !t.isE2E(n) {
 				continue
 			}
-			if d := t.ownKeyring(n, nil); d != nil && !keyringV2(d) {
-				lines = append(lines, fmt.Sprintf("namespace %s: its keyring is in a form from before v0.76, so /keys relays none of its entries; run the v0.26.1 client's patchlog e2e migrate-keyring", n.name))
+			d := t.ownKeyring(n, nil)
+			switch {
+			case d == nil || keyringV2(d):
+			case keyringParses(d):
+				lines = append(lines, fmt.Sprintf("namespace %s: its keyring's $nonce was written before v0.76 and isn't of the fresh form (§E.3.2, §C.7), so /keys relays none of its entries; "+
+					"the next keyring write by a v0.81 client (client.E2E AddReader, even of a reader it has, or RotateEpoch) writes a fresh $nonce and mends it", n.name))
+			case keyringLegacy(d):
+				lines = append(lines, fmt.Sprintf("namespace %s: its keyring is in the format before v0.63, so /keys relays none of its entries; "+
+					"a key holder wraps it again with the v0.26.1 client's patchlog e2e migrate-keyring (v0.81 has no such tool)", n.name))
+			default:
+				lines = append(lines, fmt.Sprintf("namespace %s: its keyring isn't a keyring document of §E.3.2, so /keys relays none of its entries; a key holder writes one", n.name))
 			}
 		}
 		srows, err := t.Query(`SELECT n.name, r.name, s.jwe, v.id, v.kind, v.parent_seq FROM e2e_snapshots s JOIN resources r ON r.res = s.res JOIN namespaces n ON n.ns = r.ns JOIN revisions v ON v.res = s.res AND v.seq = s.seq WHERE n.purged = 0 AND n.name NOT LIKE '~%' AND r.state <> ?`, statePurged)
@@ -304,9 +324,7 @@ func (e *Engine) warnLegacyE2E(ctx context.Context, purged *legacyE2E) {
 	for _, name := range append(append([]string(nil), purged.raisedOrNil()...), purged.remoteOrNil()...) {
 		lines = append(lines, fmt.Sprintf("namespace %s was purged at start: $schema pins to its schema revisions now resolve as purged (schema_unavailable)", name))
 	}
-	for _, l := range lines {
-		log.Printf("warning: %s", l)
-	}
+	return lines
 }
 
 func (l *legacyE2E) raisedOrNil() []string {
@@ -327,5 +345,19 @@ func (l *legacyE2E) remoteOrNil() []string {
 // (§E.3.2), whose entries /keys relays (keyringEntries).
 func keyringV2(doc any) bool {
 	_, err := seal.CheckKeyringV2(doc)
+	return err == nil
+}
+
+// keyringLegacy reports whether a keyring document is in the format
+// before v0.63 (seal.ParseKeyring).
+func keyringLegacy(doc any) bool {
+	_, err := seal.ParseKeyring(doc)
+	return err == nil
+}
+
+// keyringParses reports whether a keyring document is of the §E.3.2 form
+// with a $nonce of any form, as stored before v0.76 (seal.ParseKeyringV2).
+func keyringParses(doc any) bool {
+	_, err := seal.ParseKeyringV2(doc)
 	return err == nil
 }
