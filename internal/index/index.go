@@ -251,6 +251,13 @@ type Index struct {
 	// testBeforeJudge, if set, is called once a query's answer has read
 	// its rows, before the pending epochs of its hits are judged (tests).
 	testBeforeJudge func()
+	// testJudge, if set, is called as pending epochs are about to be
+	// judged, once the answer has read the encryption a last time
+	// (judgeEpochsAt; tests).
+	testJudge func()
+	// epochMu orders judging pending epochs (judgeEpochsAt, read) with
+	// Apply's keys.Observe (write), which moves the current epoch.
+	epochMu sync.RWMutex
 	// testMemberBootstrap, if set, is called before a member's follower
 	// gives it its first checkpoint (tests: bootstrapMember).
 	testMemberBootstrap func(ctx context.Context, m string)
@@ -716,12 +723,14 @@ type prepared struct {
 func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	co := b.Coalesce()
 	config := false
+	ix.epochMu.Lock() // no pending epoch is judged under what this replaces (judgeEpochsAt)
 	for _, u := range b.Units {
 		if u.Config != nil {
 			ix.keys.Observe(b.NS, u.Config.Value)
 			config = true
 		}
 	}
+	ix.epochMu.Unlock()
 	root := ix.followsRoot(b.NS)
 	if _, lacks := ix.keys.Skip(b.NS); lacks && !root {
 		// A branch followed with its base whose keys the service lacks

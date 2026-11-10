@@ -1020,10 +1020,35 @@ func (ix *Index) judgeEpochs(ctx context.Context, docs []docHead, current int) (
 	return out, tx.Commit()
 }
 
+// judgeEpochsAt is judgeEpochs of docs, of ns, under current, the epoch
+// the caller read last, which a rotation (keys.Observe, Apply) may have
+// moved since: it is read again, under epochMu, which Apply holds for
+// writing around keys.Observe, so no rotation is applied between that
+// read and the judgement; moved, it is errInfoChanged (computed again,
+// afterPurge, or 503 behind at /_refs).
+func (ix *Index) judgeEpochsAt(ctx context.Context, ns string, docs []docHead, current int) (map[int64]int, error) {
+	if len(docs) == 0 || current < 1 {
+		return map[int64]int{}, nil
+	}
+	if ix.testJudge != nil {
+		ix.testJudge()
+	}
+	ix.epochMu.RLock()
+	defer ix.epochMu.RUnlock()
+	switch now, err := ix.keys.Info(ctx, ns); {
+	case err != nil:
+		ix.opt.Logf("index: encryption of %s: %v", ns, err)
+		return nil, fmt.Errorf("%w (%s)", errEpochKey, ns)
+	case now.Epoch != current:
+		return nil, errInfoChanged
+	}
+	return ix.judgeEpochs(ctx, docs, current)
+}
+
 // judgeResult judges the pending epochs of res's hits and counted
 // documents (judgeEpochs) under current, and gives the hits and Epochs
 // what was judged.
-func (ix *Index) judgeResult(ctx context.Context, res *Result, current int) error {
+func (ix *Index) judgeResult(ctx context.Context, ns string, res *Result, current int) error {
 	docs := slices.Clone(res.pending)
 	for _, h := range res.Hits {
 		if h.epoch == 0 {
@@ -1033,7 +1058,7 @@ func (ix *Index) judgeResult(ctx context.Context, res *Result, current int) erro
 	if len(docs) == 0 {
 		return nil
 	}
-	judged, err := ix.judgeEpochs(ctx, docs, current)
+	judged, err := ix.judgeEpochsAt(ctx, ns, docs, current)
 	if err != nil {
 		return err
 	}

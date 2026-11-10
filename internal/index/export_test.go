@@ -86,5 +86,9 @@ func (ix *Index) OnAnswerRead(f func()) { ix.testAnswerRead = f }
 // before the pending epochs of its hits are judged (tests).
 func (ix *Index) OnBeforeJudge(f func()) { ix.testBeforeJudge = f }
 
+// OnJudge calls f each time pending epochs are about to be judged, once
+// the answer has read the encryption a last time (tests).
+func (ix *Index) OnJudge(f func()) { ix.testJudge = f }
+
 // KeptHas reports whether a result is kept under url (tests).
 func (ix *Index) KeptHas(url string) bool { _, _, ok := ix.kept.Get(url); return ok }

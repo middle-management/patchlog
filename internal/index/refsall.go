@@ -946,7 +946,10 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 				docs = append(docs, docHead{docid: h.docid, head: h.ID})
 			}
 		}
-		judged, err := ix.judgeEpochs(ctx, docs, info.Epoch)
+		judged, err := ix.judgeEpochsAt(ctx, ns, docs, info.Epoch)
+		if errors.Is(err, errEpochKey) {
+			return derived.Stored{}, "", false, errRefsKeys
+		}
 		if err != nil {
 			return derived.Stored{}, "", false, err
 		}

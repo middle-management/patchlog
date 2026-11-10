@@ -1168,7 +1168,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		} else if now != info {
 			return derived.Stored{}, "", errInfoChanged
 		}
-		if err := ix.judgeResult(ctx, res, info.Epoch); err != nil {
+		if err := ix.judgeResult(ctx, ns, res, info.Epoch); err != nil {
 			return derived.Stored{}, "", err
 		}
 	}

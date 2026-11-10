@@ -405,6 +405,52 @@ func TestV0261RotationBeforeJudge(t *testing.T) {
 	}
 }
 
+// TestV0261RotationWhileJudging (F3; I-L1's remaining window): as
+// TestV0261RotationBeforeJudge, with e-b's rotation applied after the
+// answer read the encryption a last time, as the pending epoch is about
+// to be judged. Judged under the epoch the rotation replaced, r would be
+// sealed under it for good; it is judged under the rotation's.
+func TestV0261RotationWhileJudging(t *testing.T) {
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	admin := clienttest.NewKey("admin")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "e"))).CreateNamespace(ctx, "e", map[string]any{"read": "public", "keys": []any{admin.Entry("*")},
+		"encryption": map[string]any{"level": "e2e"}}))
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "schemas"))).CreateNamespace(ctx, "schemas", map[string]any{"read": "public", "keys": []any{admin.Entry("*")}}))
+	adminJWK, adminPriv, _ := seal.GenerateRecipient()
+	idxJWK, idxPriv, _ := seal.GenerateRecipient()
+	nss := []string{"e", "e-b", "schemas"}
+	ac := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:admin", nss, []string{"read", "create", "append", "config", "branch"}, map[string]any{"enc": adminJWK})))
+	ad := ac.E2E(adminPriv)
+	sch := must(ac.CreateDoc(ctx, "schemas", "item", pageSchemaWith(map[string]any{"title": map[string]any{"type": "string", "x-index": "text"}})))
+	ref := "/r/schemas/item/rev/" + sch.ID
+	must(ad.InitKeyring(ctx, "e", idxPriv.PublicKey()))
+	must(ad.CreateDocSealed(ctx, "e", "r", map[string]any{"$schema": ref, "title": "zq r"}))
+	must(ac.CreateBranch(ctx, "e", client.BranchRequest{Name: "e-b"}))
+	must(ad.InitKeyring(ctx, "e-b", idxPriv.PublicKey()))
+	ic := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", nss, []string{"read"}, map[string]any{"enc": idxJWK})),
+		client.WithKeyringSenders(adminPriv.PublicKey()))
+	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"e"}, branches: true, untyped: true, now: s.Now},
+		func(o *indexOpts) { o.Recipient = idxPriv })
+	x.caughtUp("e")
+	x.caughtUp("e-b")
+	var once atomic.Bool
+	var e int
+	x.ix.OnJudge(func() {
+		if once.CompareAndSwap(false, true) {
+			e = must(ad.RotateEpoch(ctx, "e-b", idxPriv.PublicKey()))
+			x.appliedUpTo(x.caughtUp("e-b"))
+		}
+	})
+	got := p37Kids(t, x.fetch("/e-b?q=zq", "").body)["r"]
+	if !once.Load() {
+		t.Fatal("never judged")
+	}
+	if want := fmt.Sprintf("e-b#%d", e); got != want {
+		t.Errorf("e-b/r, pending, judged after e-b rotated to %d: under %q, want %q", e, got, want)
+	}
+}
+
 // v0261Start starts an index of w following nss on the database db, as
 // v75x.start does; rebuild replays it, snapshot bootstraps each namespace
 // from its /heads listing (follow.WithSnapshot).
