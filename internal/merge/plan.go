@@ -35,9 +35,9 @@
 // namespace, a patch set that only adds a fresh $nonce), so the batch holds
 // its pair, but only when the target's head is a live document. On a
 // tombstone or an absent resource that would restore or fail, so the
-// resource gets no item: it stays unmerged and is offered again. So does
-// one at E3 whose head references a blob a sealed op can't declare, such as
-// one from before a raise to e2e (§E.3.1).
+// resource gets no item: it stays unmerged and is offered again. So,
+// defensively, does one at E3 whose head references a blob a sealed op
+// can't declare (§E.3.1), as the sealed empty set would repeat it.
 //
 // Blobs: a merger without unrestricted read on the branch copies the blobs
 // its items reference into the target first, or uploads them where the
@@ -683,8 +683,7 @@ func (p *Plan) ancestry(ctx context.Context, ns, name, head string) (ancestry, e
 	if a, ok := p.logs[key]; ok {
 		return a, nil
 	}
-	// An e2e namespace's log is read by the key-holding view, which opens
-	// the pages from before a raise from sealed (Addendum E Levels).
+	// An e2e namespace's log is read by the key-holding view (§F.8.1).
 	readLog := p.c.Log
 	if p.level(ns) == "e2e" {
 		readLog = p.opt.E2E.Log

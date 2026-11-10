@@ -183,8 +183,10 @@ func blobRefs(doc any) map[string]map[string]any {
 
 // undeclarableBlob names a blob reference in doc that a sealed op can't
 // declare (§E.3.1): one whose type isn't the sealed type, or that has a
-// nonce, such as one from before a raise to e2e (Addendum E, Levels). ""
-// if there is none.
+// nonce. A namespace is e2e from its creation, so its writers reference
+// only sealed blobs; this is a defensive check against a document that
+// does otherwise, which can't be re-sealed (sealItems, applyResolution).
+// "" if there is none.
 func undeclarableBlob(doc any) string {
 	refs := blobRefs(doc)
 	for _, bid := range sortedKeys(refs) {

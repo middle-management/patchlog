@@ -120,14 +120,7 @@ type PlannedDoc struct {
 	done     string            // the mode it was processed in
 	chain    map[string]bool   // full: every id from genesis to head
 	skip     bool              // requires names the head: already in the target
-	// preRaise, for a document of an e2e namespace, is the protection of
-	// the plaintext lines it exports from before the namespace became
-	// end-to-end (Addendum E Levels): sealed for lines the server serves
-	// sealed as at E2 (a raise from sealed), otherwise "" (in the clear).
-	// prePlain is set when it exports any such line at all.
-	preRaise string
-	prePlain bool
-	blobs    []plannedBlob // its blob lines, in order
+	blobs    []plannedBlob     // its blob lines, in order
 }
 
 // plannedBlob is a blob line of a document: written right before the line
@@ -168,9 +161,6 @@ type ExportPlan struct {
 	queue   []string
 	schemas map[string]any                        // schema revision path → document
 	bases   map[string]map[string]client.HeadItem // branch ns → its base's heads as of at (nil: not a branch)
-	// publicE2E holds the e2e namespaces whose read is public as of at
-	// (preRaiseProtected).
-	publicE2E map[string]bool
 }
 
 func (p *ExportPlan) reason(d *PlannedDoc, format string, args ...any) {
@@ -302,16 +292,6 @@ func (p *ExportPlan) loadNS(ctx context.Context, ns string) error {
 		return fmt.Errorf("export: namespace %s is e2e (Addendum E.3): a snapshot needs a client holding its keys to seal a new genesis (§G.5.1); export its full history, which carries the ciphertext", ns)
 	}
 	p.Access[ns] = access
-	if access == AccessE2E {
-		// An e2e namespace document is served in the clear (§E.3.2); one
-		// that can't be read counts as private (§2.1).
-		if doc, err := p.c.NSDoc(ctx, ns, h.ID); err == nil && doc.Value["read"] == "public" {
-			if p.publicE2E == nil {
-				p.publicE2E = map[string]bool{}
-			}
-			p.publicE2E[ns] = true
-		}
-	}
 	items, err := p.c.Heads(ctx, ns, h.ID)
 	if err != nil {
 		return fmt.Errorf("export: namespace %s heads: %w", ns, err)
@@ -586,16 +566,11 @@ func (p *ExportPlan) process(ctx context.Context, d *PlannedDoc) error {
 		}
 		d.chain = make(map[string]bool, len(entries))
 		exporting := d.Requires == ""
-		d.preRaise, d.prePlain = "", false
 		for _, e := range entries {
 			d.chain[e.ID] = true
-			// A line that is neither one sealed op nor []: history from
-			// before the raise, which the exporter's client opened and the
-			// bundle carries in plaintext (Protected).
-			if exporting && e.Kind == "rev" && d.Name != keyringName && e.HasPatches && !e2eLine(e.Patches) {
-				d.prePlain = true
-				if e.Kid != "" {
-					d.preRaise = AccessSealed
+			if exporting {
+				if err := plainE2ELine(d, e); err != nil {
+					return err
 				}
 			}
 			// The blobs the sealed ops declare (§E.3.1).
@@ -776,17 +751,14 @@ func (p *ExportPlan) Header() Header {
 }
 
 // Protected lists the namespaces whose lines hold plaintext of private or
-// sealed content (§G.5.1, §2.1 Protection): private and sealed namespaces,
-// and e2e ones whose exported history from before they became end-to-end
-// (Addendum E Levels) was sealed, as after a raise from sealed, or, in the
-// clear, isn't public. The exporter's client opens such history, so the
-// bundle carries it in plaintext under access "e2e", which an e2e target
-// refuses anyway (§G.5.1).
+// sealed content (§G.5.1, §2.1 Protection): private and sealed namespaces.
+// An e2e namespace's lines are ciphertext and its plaintext keyring
+// (§E.3.2): a line that is neither isn't exported at all (plainE2ELine).
 func (p *ExportPlan) Protected() []string {
 	h := p.Header()
 	var out []string
 	for ns, a := range h.Access {
-		if a == AccessPrivate || a == AccessSealed || a == AccessE2E && p.preRaiseProtected(ns) {
+		if a == AccessPrivate || a == AccessSealed {
 			out = append(out, ns)
 		}
 	}
@@ -794,25 +766,17 @@ func (p *ExportPlan) Protected() []string {
 	return out
 }
 
-// preRaiseProtected reports whether e2e namespace ns's exported documents
-// carry plaintext history from before its raise that was sealed, or that
-// was in the clear in a namespace whose read isn't public (one whose read
-// can't be read counts as private, §2.1).
-func (p *ExportPlan) preRaiseProtected(ns string) bool {
-	plain := false
-	for _, d := range p.Docs {
-		if d.skip || d.NS != ns || !d.prePlain {
-			continue
-		}
-		if d.preRaise == AccessSealed {
-			return true
-		}
-		plain = true
+// plainE2ELine refuses rev line e of d, a document of an e2e namespace,
+// unless it is the keyring's or one sealed op or a restore's [] (§G.5.1
+// step 1). A namespace is end-to-end from its creation, so every other
+// revision is written sealed (§E.3.1): a line that isn't is no history
+// this exporter can carry, in plaintext or labelled, and an importer
+// refuses it anyway.
+func plainE2ELine(d *PlannedDoc, e client.LogEntry) error {
+	if e.Kind != "rev" || d.Name == keyringName || !e.HasPatches || e2eLine(e.Patches) {
+		return nil
 	}
-	if !plain {
-		return false
-	}
-	return !p.publicE2E[ns]
+	return fmt.Errorf("rev line %s of e2e namespace %s is neither one sealed op nor a restore's [] (§G.5.1, §E.3.1): an e2e namespace's history is sealed from its creation, so this exporter doesn't carry it", e.ID, d.NS)
 }
 
 // e2eLine reports whether patches are one sealed op or a restore's [], as
@@ -880,6 +844,9 @@ func (p *ExportPlan) Write(ctx context.Context, w io.Writer) (*Summary, error) {
 			if err != nil {
 				return nil, fmt.Errorf("export: %s: %w", k, err)
 			}
+			// An e2e document's lines were checked as planned (process,
+			// plainE2ELine): these are the same, verified up to the same
+			// head, their ids covering their patches.
 			for _, e := range entries {
 				if err := blobs(e.ID); err != nil {
 					return nil, err
