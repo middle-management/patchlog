@@ -55,6 +55,10 @@ type ArchiveBundle struct {
 	At       string // the namespace head when the archive was taken
 	Head     string // the last entry's id
 	Requires string // "" from genesis, else the entry before the first one
+	// Access is the namespace's protection as a source (§2.1) when the
+	// archive was taken, which its header's access gives (§G.5.1, §8.6):
+	// "public", "private", "sealed" or "e2e" (archiveAccess).
+	Access string
 	// Entries calls yield for each entry in chain order, streaming from the
 	// database. It stops at the first error yield returns.
 	Entries func(yield func(ArchiveEntry) error) error
@@ -150,6 +154,7 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 		Name:    name,
 		At:      t.nsLogID(n.headSeq.Int64).String(),
 		Head:    t.rev(lastSeq).id.String(),
+		Access:  t.archiveAccess(n),
 	}
 	if b.Origin == "" {
 		b.Origin = "http://localhost"
@@ -259,6 +264,27 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 		res, fromSeq, lastSeq, key, u, t.now.UnixMilli())
 	t.must(err)
 	return u, nil
+}
+
+// archiveAccess is namespace n's protection as a source (§2.1), for the
+// header of a prune's archive (§G.5.1, §8.6), by the document in force in
+// the prune's transaction: e2e at E3, sealed at E2 whatever its read, and
+// otherwise public or private by its read. A branch's is its own. A
+// level this version doesn't know is the strictest, so no archive is
+// labelled below its namespace: an importer goes by the label (§G.5.1
+// Importing). A remote branch's shadow (§G.3) follows its branch's level
+// and is never public.
+func (t *tx) archiveAccess(n *nsRow) string {
+	switch t.nsLevel(n) {
+	case levelNone, levelAtRest:
+		if !n.isShadow() && t.config(n.configSeq).Read == "public" {
+			return "public"
+		}
+		return "private"
+	case levelSealed:
+		return "sealed"
+	}
+	return "e2e"
 }
 
 // archiveGrant builds the grant line of grant gid for an archive of

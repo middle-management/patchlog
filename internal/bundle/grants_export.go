@@ -453,6 +453,14 @@ func (g *grantExporter) ensure(ctx context.Context, bw *Writer, ns, gid string, 
 		g.note("grant "+gid, "grant %s isn't carried: the source's grant record doesn't match its own id (%s)", gid, id)
 		return false, nil
 	}
+	// A record whose root isn't its stored block's grant_block would make
+	// a grant line every reader rejects, the Writer first (§G.4.1): the
+	// grant is left off, as one that can't be fetched is, and the export
+	// goes on.
+	if err := grantLineAgrees(&GrantLine{ID: rec.ID, Root: rec.Root, Stored: stored}); err != nil {
+		g.note("grant "+gid, "grant %s isn't carried: the source's grant record disagrees with itself: %v", gid, err)
+		return false, nil
+	}
 	key := g.findKey(ctx, lineRef, found, entry, rec, rev, ns)
 	if !key.valid {
 		g.note("key "+gid, "grant %s is carried without a key: no key named %q in the namespace document at the first entry that recorded it (or in its bases' then, in a branch), or in the operator key history at %s, verifies its root block (%d candidates)", gid, gr.Blocks[0].Kid, rev.Created, key.tried)

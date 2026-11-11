@@ -227,6 +227,11 @@ func Encode(ctx context.Context, w io.Writer, b *core.ArchiveBundle) error {
 		At:      map[string]string{b.NS: b.At},
 		Docs:    map[string]bundle.DocInfo{k: {History: bundle.Full, Head: b.Head}},
 		Authors: true,
+		// The namespace's protection as a source (§G.5.1, §8.6). A header
+		// without it would read as private (bundle.Header.AccessOf), so
+		// an archive that names none of the four is labelled the
+		// strictest.
+		Access: map[string]string{b.NS: archiveAccess(b.Access)},
 	}
 	if b.Requires != "" {
 		h.Requires = map[string]string{k: b.Requires}
@@ -267,6 +272,16 @@ func Encode(ctx context.Context, w io.Writer, b *core.ArchiveBundle) error {
 	}
 	_, err = bw.Close()
 	return err
+}
+
+// archiveAccess is the access an archive's header gives for a: a itself,
+// or e2e where it isn't one of §G.5.1's four.
+func archiveAccess(a string) string {
+	switch a {
+	case bundle.AccessPublic, bundle.AccessPrivate, bundle.AccessSealed, bundle.AccessE2E:
+		return a
+	}
+	return bundle.AccessE2E
 }
 
 // Opener reads archives back by URL.

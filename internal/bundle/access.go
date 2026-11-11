@@ -149,16 +149,14 @@ func (im *importer) e2eEpochs(ctx context.Context, ns string) (lo, hi int, probl
 					"only a client holding both sets of keys carries it over, as a merge with new ids (§G.5.1, Addendum E Levels)", ns, l.ID, d.name))
 				continue
 			}
-			h, err := seal.ParseHeader(jwe)
+			kid, plNS, e, own, err := sealedOpFor(ns, jwe)
 			if err != nil {
 				problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s: %v", ns, l.ID, d.name, err))
 				continue
 			}
-			kns, e, kerr := seal.ParseKid(h.Kid)
-			plNS, _ := h.PL["ns"].(string)
-			if kerr != nil || kns != ns || plNS != ns {
+			if !own {
 				problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s is sealed under kid %q with pl.ns %q, not for %s, as a line a branch reads through from its base is: "+
-					"only a client holding both sets of keys carries it over, as a merge with new ids (§G.5.1)", ns, l.ID, d.name, h.Kid, plNS, ns))
+					"only a client holding both sets of keys carries it over, as a merge with new ids (§G.5.1)", ns, l.ID, d.name, kid, plNS, ns))
 				continue
 			}
 			note(e)
@@ -169,6 +167,23 @@ func (im *importer) e2eEpochs(ctx context.Context, ns string) (lo, hi int, probl
 		lo, hi = 1, 1
 	}
 	return lo, hi, problems, nil
+}
+
+// sealedOpFor reads the header of jwe, the one sealed op of a rev line of
+// e2e namespace ns, and reports whether it is the namespace's own: its
+// pl.ns and its kid both name ns (§G.5.1 step 1, §E.3.1). One that isn't
+// is history of another namespace, as a branch reads through from its
+// base: the importer refuses a bundle that carries it, and the exporter
+// writes no such line (foreignE2ELine). epoch is the kid's. err is a
+// header that doesn't parse.
+func sealedOpFor(ns, jwe string) (kid, plNS string, epoch int, own bool, err error) {
+	h, err := seal.ParseHeader(jwe)
+	if err != nil {
+		return "", "", 0, false, err
+	}
+	kns, e, kerr := seal.ParseKid(h.Kid)
+	plNS, _ = h.PL["ns"].(string)
+	return h.Kid, plNS, e, kerr == nil && kns == ns && plNS == ns, nil
 }
 
 // e2eRestoresRequires reports whether an incremental document's first
@@ -330,6 +345,25 @@ func (im *importer) checkAccess(ctx context.Context) error {
 			if l := d.blobs[bid]; normType(l.Type) != SealedBlobType || l.Nonce != "" {
 				problems = append(problems, fmt.Sprintf("blob %s of e2e namespace %s (%s) has type %q and nonce %q: an e2e namespace's blob lines have type %s and no nonce (§E.3.1, §G.5.1)",
 					bid, d.ns, d.name, l.Type, l.Nonce, SealedBlobType))
+			}
+		}
+	}
+	// A sealed op is an e2e namespace's line and no other's (§6.2,
+	// §E.3.1): ciphertext under whatever the header's access says, which
+	// for a namespace it doesn't name reads as private (AccessOf), as an
+	// e2e namespace's prune archive from before v0.82 does (§8.6). Such a
+	// bundle would be planned as plaintext for a target of any name and
+	// level, so it is refused here, override or not (§G.5.1 Importing).
+	for _, k := range im.keys {
+		d := im.docs[k]
+		if im.h.AccessOf(d.ns) == AccessE2E {
+			continue
+		}
+		for _, l := range d.lines {
+			if _, sealed := seal.SealedJWE(l.Patches); l.Kind == "rev" && sealed {
+				problems = append(problems, fmt.Sprintf("revision %s of %s is a sealed op, as only an e2e namespace's history has (§E.3.1), but the header's access gives %s as %s: "+
+					"an e2e namespace's lines go only into an e2e target of the same name, from a bundle that says so (§G.5.1); a prune archive written before v0.82 names no access, and is restored where it was taken (§D.4), not imported", l.ID, k, d.ns, im.h.AccessOf(d.ns)))
+				break
 			}
 		}
 	}

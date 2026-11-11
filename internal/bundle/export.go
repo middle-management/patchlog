@@ -75,7 +75,10 @@ type ExportOptions struct {
 	// a read-through resource (no entries of its own) is not bundled but
 	// listed in external as "{branch}/{name}/rev/{head}": the target must
 	// already hold the base, e.g. by importing with the branch mapped onto
-	// the base namespace.
+	// the base namespace. A branch that is end-to-end is always bundled
+	// so, its keyring apart, asked or not: its read-through history is
+	// sealed for the base and isn't exported under the branch's name
+	// (§G.5.1).
 	ForeignParents bool
 	// Recipients seal the bundle to their X25519 public keys (§G.5.1.1).
 	Recipients []*ecdh.PublicKey
@@ -161,6 +164,9 @@ type ExportPlan struct {
 	queue   []string
 	schemas map[string]any                        // schema revision path → document
 	bases   map[string]map[string]client.HeadItem // branch ns → its base's heads as of at (nil: not a branch)
+	// remoteBase marks the e2e branches whose base is in another
+	// deployment (§G.3), which have no base heads here.
+	remoteBase map[string]bool
 }
 
 func (p *ExportPlan) reason(d *PlannedDoc, format string, args ...any) {
@@ -189,7 +195,7 @@ func PlanExport(ctx context.Context, c *client.Client, opt ExportOptions) (*Expo
 		return nil, fmt.Errorf("export: origin: %w", err)
 	}
 	p := &ExportPlan{Origin: origin, At: map[string]string{}, Docs: map[string]*PlannedDoc{}, Access: map[string]string{}, c: c, opt: opt,
-		heads: map[string]map[string]client.HeadItem{}, bases: map[string]map[string]client.HeadItem{}, ext: map[string]bool{}, schemas: map[string]any{}}
+		heads: map[string]map[string]client.HeadItem{}, bases: map[string]map[string]client.HeadItem{}, remoteBase: map[string]bool{}, ext: map[string]bool{}, schemas: map[string]any{}}
 
 	// Take the selected namespaces' at first (§G.4.1 consistency).
 	var sel []string
@@ -367,7 +373,11 @@ func (p *ExportPlan) add(ctx context.Context, ns, name string, selected bool, wh
 		// Purged content is never exported (§G.4.1).
 		return fmt.Errorf("export: %s is not in %s as of %s (never existed or purged); %s — leave it out with external", k, ns, p.At[ns], why)
 	}
-	if p.opt.ForeignParents && p.opt.Requires[k] == "" {
+	// An e2e branch's read-through history is sealed for its base
+	// (§E.3.1), and no line of it is written (§G.5.1): its documents are
+	// bundled as with ForeignParents, the foreign parent in requires.
+	// The keyring is plaintext (§E.3.2), and comes whole.
+	if (p.opt.ForeignParents || p.Access[ns] == AccessE2E && name != keyringName) && p.opt.Requires[k] == "" {
 		bh, err := p.baseHeads(ctx, ns)
 		if err != nil {
 			return err
@@ -448,6 +458,14 @@ func (p *ExportPlan) baseHeads(ctx context.Context, ns string) (map[string]clien
 	if b, ok := doc.Value["base"].(map[string]any); ok {
 		bns, _ := b["ns"].(string)
 		at, _ := b["at"].(string)
+		if origin, _ := b["origin"].(string); origin != "" && p.Access[ns] == AccessE2E {
+			// A remote base (§G.3) has no heads to read here: an e2e
+			// branch of one exports only the documents that are its own
+			// from genesis (afterForeignParent).
+			p.remoteBase[ns] = true
+			p.bases[ns] = nil
+			return nil, nil
+		}
 		items, err := p.c.Heads(ctx, bns, at)
 		if err != nil {
 			return nil, fmt.Errorf("export: base %s of %s: %w", bns, ns, err)
@@ -565,11 +583,14 @@ func (p *ExportPlan) process(ctx context.Context, d *PlannedDoc) error {
 			return err
 		}
 		d.chain = make(map[string]bool, len(entries))
+		if err := p.afterForeignParent(ctx, d, entries); err != nil {
+			return err
+		}
 		exporting := d.Requires == ""
 		for _, e := range entries {
 			d.chain[e.ID] = true
 			if exporting {
-				if err := plainE2ELine(d, e); err != nil {
+				if err := e2eLineOf(d, e); err != nil {
 					return err
 				}
 			}
@@ -753,7 +774,7 @@ func (p *ExportPlan) Header() Header {
 // Protected lists the namespaces whose lines hold plaintext of private or
 // sealed content (§G.5.1, §2.1 Protection): private and sealed namespaces.
 // An e2e namespace's lines are ciphertext and its plaintext keyring
-// (§E.3.2): a line that is neither isn't exported at all (plainE2ELine).
+// (§E.3.2): a line that is neither isn't exported at all (e2eLineOf).
 func (p *ExportPlan) Protected() []string {
 	h := p.Header()
 	var out []string
@@ -777,6 +798,92 @@ func plainE2ELine(d *PlannedDoc, e client.LogEntry) error {
 		return nil
 	}
 	return fmt.Errorf("rev line %s of e2e namespace %s is neither one sealed op nor a restore's [] (§G.5.1, §E.3.1): an e2e namespace's history is sealed from its creation, so this exporter doesn't carry it", e.ID, d.NS)
+}
+
+// foreignE2ELine refuses rev line e of d, a document of an e2e namespace
+// other than its keyring, whose sealed op names another namespace in
+// pl.ns or kid (sealedOpFor, the importer's step-1 check): history a
+// branch reads through from its base, of which an exporter writes no
+// line (§G.5.1 Importing). It names the foreign parent in requires
+// instead (add, afterForeignParent), so a line that still gets here
+// refuses the document.
+func foreignE2ELine(d *PlannedDoc, e client.LogEntry) error {
+	if e.Kind != "rev" || d.Name == keyringName {
+		return nil
+	}
+	jwe, ok := seal.SealedJWE(e.Patches)
+	if !ok {
+		return nil
+	}
+	kid, plNS, _, own, err := sealedOpFor(d.NS, jwe)
+	if err != nil {
+		return fmt.Errorf("rev line %s of e2e namespace %s: %v", e.ID, d.NS, err)
+	}
+	if !own {
+		return fmt.Errorf("rev line %s of e2e namespace %s is sealed under kid %q with pl.ns %q, not for %s, as history a branch reads through from its base is: an exporter writes no such line (§G.5.1); "+
+			"it is carried over as a merge by a client holding both sets of keys, or left in the target's base with its last entry in requires", e.ID, d.NS, kid, plNS, d.NS)
+	}
+	return nil
+}
+
+// e2eLineOf checks line e of d, a document of an e2e namespace, before
+// it is exported (plainE2ELine, foreignE2ELine).
+func e2eLineOf(d *PlannedDoc, e client.LogEntry) error {
+	if err := plainE2ELine(d, e); err != nil {
+		return err
+	}
+	return foreignE2ELine(d, e)
+}
+
+// afterForeignParent checks that d, a document of an e2e branch other
+// than its keyring, is exported from after its foreign parent: the base's
+// head of that name as the branch reads it, which must be in the chain
+// verified from the source (entries), at or before requires. The sealed
+// ops of the base's lines name the base (foreignE2ELine), but its
+// tombstones and restores name no namespace, so the boundary is the
+// base's own; a requires before it, the caller's, would export
+// read-through lines, and refuses the document (§G.5.1). A document the
+// base doesn't have is the branch's from genesis.
+func (p *ExportPlan) afterForeignParent(ctx context.Context, d *PlannedDoc, entries []client.LogEntry) error {
+	if d.Name == keyringName {
+		return nil
+	}
+	bh, err := p.baseHeads(ctx, d.NS)
+	if err != nil {
+		return err
+	}
+	if p.remoteBase[d.NS] {
+		// Where the base's history ends can't be read: only a chain that
+		// starts with a line of the branch's own has none of it.
+		if len(entries) > 0 && entries[0].Kind == "rev" {
+			if jwe, sealed := seal.SealedJWE(entries[0].Patches); sealed {
+				if _, _, _, own, err := sealedOpFor(d.NS, jwe); err == nil && own {
+					return nil
+				}
+			}
+		}
+		return fmt.Errorf("e2e branch %s has its base in another deployment, and %s doesn't start with a line of the branch's own: where its read-through history ends can't be told here, so it isn't exported (§G.5.1)", d.NS, d.Name)
+	}
+	b, ok := bh[d.Name]
+	if !ok || b.Kind == "purge" {
+		return nil
+	}
+	parent, requires := -1, -1
+	for i, e := range entries {
+		if e.ID == b.Target {
+			parent = i
+		}
+		if e.ID == d.Requires {
+			requires = i
+		}
+	}
+	switch {
+	case parent < 0:
+		return fmt.Errorf("the foreign parent %s, the head of %s in the base of e2e branch %s, is not in its chain, so its read-through history can't be told from its own; it isn't exported (§G.5.1)", b.Target, d.Name, d.NS)
+	case requires < parent:
+		return fmt.Errorf("requires must name the foreign parent %s or an entry after it: the lines of e2e branch %s up to it are read through from its base, and an exporter writes none of them (§G.5.1)", b.Target, d.NS)
+	}
+	return nil
 }
 
 // e2eLine reports whether patches are one sealed op or a restore's [], as
@@ -845,9 +952,17 @@ func (p *ExportPlan) Write(ctx context.Context, w io.Writer) (*Summary, error) {
 				return nil, fmt.Errorf("export: %s: %w", k, err)
 			}
 			// An e2e document's lines were checked as planned (process,
-			// plainE2ELine): these are the same, verified up to the same
-			// head, their ids covering their patches.
+			// e2eLineOf): these are the same, verified up to the same
+			// head, their ids covering their patches. They are checked
+			// again as written, so that no line a branch reads through
+			// leaves under its name whatever the plan held (§G.5.1).
+			e2e := p.Access[d.NS] == AccessE2E
 			for _, e := range entries {
+				if e2e {
+					if err := e2eLineOf(d, e); err != nil {
+						return nil, fmt.Errorf("export: %s: %w", k, err)
+					}
+				}
 				if err := blobs(e.ID); err != nil {
 					return nil, err
 				}

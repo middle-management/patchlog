@@ -887,6 +887,30 @@ func StoredAuthority(v any) (string, error) {
 	return arr[0].(string), nil
 }
 
+// grantLineAgrees checks a grant line against its root, as §G.4.1 has
+// every reader do: grant is the id of root, text(trunc160(sha256(
+// canonical(root)))), and the stored authority block's grant_block is
+// canonical(root), byte for byte (§C.3.1 Reading grants). A stored block
+// that doesn't decode carries no such string, so it is rejected too; the
+// array form from before v0.73 was read as its first element
+// (StoredAuthority). Neither rule needs the line's key or a signature.
+func grantLineAgrees(g *GrantLine) error {
+	canon := jsonv.Canonical(jsonv.FromGo(g.Root))
+	if id := ids.Of(canon).String(); id != g.ID {
+		return fmt.Errorf("grant is not the id of its root, %s (§G.4.1)", id)
+	}
+	gr, err := parseStoredGrant(g.Stored)
+	if err != nil {
+		return fmt.Errorf("its stored block has no grant_block to compare with canonical(root) (§G.4.1): %v", err)
+	}
+	// ParseStored read the grant_block string and checked it is canonical,
+	// so canonical(Raw) is that string byte for byte.
+	if !bytes.Equal(jsonv.Canonical(gr.Blocks[0].Raw), canon) {
+		return fmt.Errorf("its stored block's grant_block is not canonical(root) (§G.4.1)")
+	}
+	return nil
+}
+
 // --- the checker shared by Reader and Writer ---------------------------------
 
 type docState struct {
@@ -929,6 +953,11 @@ func (c *checker) line(l *Line) error {
 		}
 		if c.grants[g.ID] {
 			return fail("grant %s comes more than once", g.ID)
+		}
+		// The line's own claims, whatever its key and signatures say
+		// (§G.4.1, §C.3.1 Reading grants).
+		if err := grantLineAgrees(g); err != nil {
+			return fail("grant line %s: %v", g.ID, err)
 		}
 		c.grants[g.ID] = true
 		return nil

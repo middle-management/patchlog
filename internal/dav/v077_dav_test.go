@@ -55,19 +55,20 @@ func failingEnv(t *testing.T, status int) (*env, *failRT) {
 // OTHER-2 (§H.4 "The base", "The reload", Answers; §H.6): a save with a
 // base over someone else's delete reads the file's last revision to find
 // out whether it moved; a failed read of it (408, 429, a timeout, 5xx)
-// fails the save, 503 (with Retry-After) or 502, rather than taking it as
-// a revision the gateway can't read (409). Nothing is written. A refusal
-// of the read (403) still leaves the 409.
+// fails the save, 503 with Retry-After after the core's 429 or 503 (and
+// a timeout of the gateway's own), else 502 (v0.82), rather than taking
+// it as a revision the gateway can't read (409). Nothing is written. A
+// refusal of the read (403) still leaves the 409.
 func TestV077SaveOverDeleteFailedRead(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
 		status, want int
 		what         string
 	}{
-		{503, 502, "a 5xx"},
+		{503, 503, "a 503"},
 		{500, 502, "a 500"},
 		{429, 503, "a 429"},
-		{408, 503, "a 408"},
+		{408, 502, "a 408"},
 		{0, 503, "a timeout"},
 		{403, 409, "a refusal (not a failed read)"},
 	} {
@@ -90,8 +91,9 @@ func TestV077SaveOverDeleteFailedRead(t *testing.T) {
 }
 
 // OTHER-2 (§H.4 "The base"): whether the tombstone is the user's own is
-// read from its log entry; a failed read of that fails the save (502)
-// rather than counting the delete as someone else's (409).
+// read from its log entry; a failed read of that fails the save (503
+// with Retry-After after the core's 503, v0.82) rather than counting the
+// delete as someone else's (409).
 func TestV077SaveOverDeleteFailedLogRead(t *testing.T) {
 	t.Parallel()
 	e, rt := failingEnv(t, 503)
@@ -103,7 +105,9 @@ func TestV077SaveOverDeleteFailedLogRead(t *testing.T) {
 		return r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/r/docs/x/rev/"+tomb.ID+"/log")
 	})
 	rt.armed.Store(true)
-	e.expect(e.do("PUT", "/docs/x.json", edit(t, g.body, `"a": "1"`, `"a": "mine"`), "If-Match", g.header.Get("ETag")), 502, "PUT, the tombstone's log read failing")
+	if r := e.expect(e.do("PUT", "/docs/x.json", edit(t, g.body, `"a": "1"`, `"a": "mine"`), "If-Match", g.header.Get("ETag")), 503, "PUT, the tombstone's log read failing"); r.header.Get("Retry-After") == "" {
+		t.Fatal("503 without Retry-After")
+	}
 	e.expectTombstoned("docs", "x", "after the failed log read")
 	// Once the core answers again, the delete is someone else's: 409.
 	rt.armed.Store(false)
@@ -125,6 +129,8 @@ func TestV077RawSaveOverDeleteFailedRead(t *testing.T) {
 	must(e.c.Delete(e.ctx, "docs", "a.txt", h.ID))
 	rt.match.Store(at("GET", "/r/docs/a.txt/rev/"+h.ID))
 	rt.armed.Store(true)
-	e.expect(e.do("PUT", "/docs/a.txt", "two", "If-Match", g.header.Get("ETag")), 502, "raw PUT, the last revision's read failing")
+	if r := e.expect(e.do("PUT", "/docs/a.txt", "two", "If-Match", g.header.Get("ETag")), 503, "raw PUT, the last revision's read failing"); r.header.Get("Retry-After") == "" {
+		t.Fatal("503 without Retry-After")
+	}
 	e.expectTombstoned("docs", "a.txt", "after the failed read")
 }

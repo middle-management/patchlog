@@ -151,7 +151,10 @@ type blobSrc struct {
 // nonce or not (§7.8), and the blob is copied with Blob-From, or uploaded
 // again where the core refuses that (a source of a higher rank, §7.8).
 func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte, o saveOpts) (string, bool, error) {
-	in := st.s.nsInfo(ctx, st.tk, ns)
+	in, err := st.saveInfo(ctx, ns)
+	if err != nil {
+		return "", false, err
+	}
 	if in.sealed {
 		return "", false, notOffered(ns)
 	}
@@ -189,10 +192,10 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 	}
 	var rev string
 	exact := true
-	err := st.retrying(ctx, func() (bool, error) {
+	err = st.retrying(ctx, func() (bool, error) {
 		h, err := st.saveHead(ctx, ns, name, o)
 		if err != nil {
-			return false, err
+			return false, saveRead(err)
 		}
 		if o.fresh && h.State != client.NotFound {
 			return false, taken(ns, name)
@@ -207,7 +210,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 			cur, err := st.s.doc(ctx, st.tk, ns, name, h.ID)
 			switch {
 			case err != nil:
-				return false, err
+				return false, saveRead(err)
 			case cur.sealed:
 				return false, notOffered(ns)
 			case cur.raw == nil:
