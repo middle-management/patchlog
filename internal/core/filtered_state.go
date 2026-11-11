@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/catvis"
@@ -20,7 +21,8 @@ import (
 // members are
 //
 //   - {ns} at its head (a purged {ns} stays, at its purge-ns entry);
-//   - each trusted catalog that isn't dark (e2e, purged or a branch) at
+//   - each trusted catalog that isn't dark (e2e, purged or a branch,
+//     local or remote) at
 //     its head (for catalog kind, {ns} itself);
 //   - each local, unpurged member of those catalogs' catalog.trust at its
 //     head, whose roles and keys visibility reads.
@@ -82,9 +84,9 @@ func (t *tx) filteredCurrent(fs *fscope) *fcp {
 // filteredAt is fs's checkpoint named at: the current one, or one
 // recorded in filtered_ats whose members all still exist, are unpurged
 // ({ns} excepted) and have the recorded ns_id in their chains, and whose
-// deciding catalogs are all members. A catalog that is dark now, a local
-// branch among them, decides nothing there even where an at recorded
-// before v0.78 lists it (§B.11.9 Where). The answer at it is recomputed
+// deciding catalogs are all members. A catalog that is dark now, a
+// branch, local or remote, among them, decides nothing there even where
+// an at recorded before v0.78 lists it (§B.11.9 Where). The answer at it is recomputed
 // from history, which for an append-only log is as if stored (§B.11.9
 // at). ok is false otherwise: the caller answers 302 to the current at.
 func (t *tx) filteredAt(fs *fscope, at string) (*fcp, bool) {
@@ -203,6 +205,18 @@ type gsRecord struct {
 	readScope  bool
 	principal  map[string]any
 	digest     string
+	// entry is EntryDigest (gsEntryDigest) over kid's whole key entry and
+	// the whole definition of each of roles, as {ns}'s document had them
+	// at the exchange: a cookie is accepted only while it is the same
+	// (§B.11.9 gs, "gone or changes in any member"). "" (a row from
+	// before it was kept) never holds.
+	entry string
+	// entryAfter is the latest expiry (Unix seconds) of the cookies issued
+	// under an entry digest an exchange has since replaced, 0 if none
+	// was: a cookie that expires no later is one of those, or can't be
+	// told from one, and is 403 (§B.11.9 gs, "until the reader exchanges
+	// again"; recordFilteredGS). Only the upsert writes it.
+	entryAfter int64
 	filter     string // grantcheck.ReadFilter.Encode
 	exp        int64  // Unix seconds: the latest expiry of its cookies
 }
@@ -212,6 +226,23 @@ type gsRecord struct {
 // past their exp and those of purged namespaces (§B.11.9 gs). Rows are per
 // (ns, gs): a gs names no namespace, so one grant's gs can be the same in
 // two covered namespaces, and each keeps its own kid and rules.
+//
+// Readers who share a gs share its row, and a cookie carries its prefix
+// and expiry alone (§C.5.3), so a row replaced under another entry digest
+// would serve the cookies the change ended again, those of a reader the
+// changed key now refuses among them, where §B.11.9 gs has each 403
+// "until the reader exchanges again". So the replaced row's exp, which no
+// cookie issued under it outlasts, is kept in entry_after, which only
+// grows (a change made and undone revives nothing), and filteredAdmit
+// refuses a cookie that expires no later. That fails closed for a cookie
+// from the same second as the last one before the change, and for one
+// whose grant ends by then: its reader reads with the grant itself, and
+// with a cookie from a later exchange or a grant that lasts longer. A row
+// from before entries were kept, whose entry is empty, counts as replaced.
+// Readers of one gs record one entry at one document: its scope: subject
+// digests their kid, pub and read roles by name (grantcheck.ScopeDigest),
+// which are what the entry digest is over, so only a changed document
+// replaces it.
 func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 	subjects := make([]any, len(r.subjects))
 	for i, s := range r.subjects {
@@ -222,22 +253,24 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 		roles[i] = s
 	}
 	enc := func(v any) string { return string(jsonv.Canonical(jsonv.FromGo(v))) }
-	q := `INSERT INTO filtered_gs (gs, ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, filter, exp)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	q := `INSERT INTO filtered_gs (gs, ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, entry, filter, exp)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (ns, gs) DO UPDATE SET subjects = excluded.subjects, partial = excluded.partial,
 			kid = excluded.kid, pub = excluded.pub, roles = excluded.roles, block_rules = excluded.block_rules, read_scope = excluded.read_scope,
-			principal = excluded.principal, digest = excluded.digest, filter = excluded.filter, exp = `
+			principal = excluded.principal, digest = excluded.digest, entry = excluded.entry, filter = excluded.filter,
+			entry_after = CASE WHEN filtered_gs.entry <> excluded.entry THEN GRT(filtered_gs.entry_after, filtered_gs.exp) ELSE filtered_gs.entry_after END,
+			exp = GRT(filtered_gs.exp, excluded.exp)`
 	if e.pg {
-		q += `GREATEST(filtered_gs.exp, excluded.exp)`
+		q = strings.ReplaceAll(q, "GRT(", "GREATEST(")
 	} else {
-		q += `max(filtered_gs.exp, excluded.exp)`
+		q = strings.ReplaceAll(q, "GRT(", "max(")
 	}
 	return e.update(ctx, func(t *tx) error {
 		if _, err := t.Exec(`DELETE FROM filtered_gs WHERE exp <= ? OR ns IN (SELECT name FROM namespaces WHERE purged <> 0)`, t.now.Unix()); err != nil {
 			return err
 		}
 		_, err := t.Exec(q, r.gs, r.ns, enc(subjects), boolInt(r.partial), r.kid, r.pub, enc(roles), enc(nonNilRules(r.blockRules)),
-			boolInt(r.readScope), enc(r.principal), r.digest, r.filter, r.exp)
+			boolInt(r.readScope), enc(r.principal), r.digest, r.entry, r.filter, r.exp)
 		return err
 	})
 }
@@ -264,8 +297,8 @@ func (t *tx) loadGS(ns, gs string) *gsRecord {
 	r := &gsRecord{gs: gs}
 	var subjects, roles, blockRules, principal string
 	var partial, readScope int64
-	err := t.QueryRow(`SELECT ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, filter, exp FROM filtered_gs WHERE ns = ? AND gs = ?`, ns, gs).
-		Scan(&r.ns, &subjects, &partial, &r.kid, &r.pub, &roles, &blockRules, &readScope, &principal, &r.digest, &r.filter, &r.exp)
+	err := t.QueryRow(`SELECT ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, entry, entry_after, filter, exp FROM filtered_gs WHERE ns = ? AND gs = ?`, ns, gs).
+		Scan(&r.ns, &subjects, &partial, &r.kid, &r.pub, &roles, &blockRules, &readScope, &principal, &r.digest, &r.entry, &r.entryAfter, &r.filter, &r.exp)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}

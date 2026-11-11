@@ -50,5 +50,10 @@ func (t *tx) filteredEdgeGrant(n *nsRow, fs *fscope, a *actor, exp time.Time) (*
 	if !exp.IsZero() && exp.Before(until) {
 		until = exp
 	}
-	return &edgeIssue{gs: fv.gs, rec: gsRecordOf(fv, until.Unix()), bucket: a.bucketKey}, nil
+	// The record keeps the digest of the key's entry and the read roles'
+	// definitions as of the checkpoint the view is at, which every read
+	// under the cookie compares (§B.11.9 gs, gsDigestHolds).
+	rec := gsRecordOf(fv, until.Unix())
+	rec.entry = t.gsEntryDigest(n, t.fconfigAt(fv.cp.seqs[n.name]), rec.kid, rec.roles)
+	return &edgeIssue{gs: fv.gs, rec: rec, bucket: a.bucketKey}, nil
 }

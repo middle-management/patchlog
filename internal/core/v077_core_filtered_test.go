@@ -143,9 +143,10 @@ func TestV077OriginPurgedCoveredHeads(t *testing.T) {
 	if err := w.e.FilteredCurrent(ctx, "matches", gs, "/heads", Credentials{}); v75Status(err) != 401 {
 		t.Fatalf("without credentials: %v, want 401", err)
 	}
-	// An unrestricted reader passes §8.5's read check too: its unfiltered
-	// /heads is 410, and so is this URL, not the 403 a filtered URL that
-	// serves rows gives it ("reads unrestricted"), with or without at.
+	// An unrestricted reader passes §8.5's read check at its unfiltered
+	// /heads, 410; at this URL its grant is 403, as at a filtered URL that
+	// serves rows ("reads unrestricted"), with or without at (v0.82;
+	// before, 410 here too).
 	v077PurgedHeads(t, w, "matches", gs, red.At, head, w.admin, true)
 	v077PurgedHeads(t, w, "matches", gs, red.At, head, li, false)
 	// /log without at keeps the redirect: the range stays readable (§8.5).
@@ -156,10 +157,10 @@ func TestV077OriginPurgedCoveredHeads(t *testing.T) {
 }
 
 // v077PurgedHeads checks that purged ns's filtered /heads for gs, without
-// at and at at, are each 410 purged with head for cred, and so is its
-// unfiltered /heads where cred reads ns unrestricted (a partial reader is
-// redirected from there to the filtered form, §B.11.9 URLs) (§8.5,
-// §B.11.9 Purged namespaces).
+// at and at at, are each 410 purged with head for a partial reader's
+// cred; where cred reads ns unrestricted, that its unfiltered /heads is
+// that 410 and the filtered ones 403 (§8.5, §B.11.9 Purged namespaces,
+// Partial reader; v0.82).
 func v077PurgedHeads(t *testing.T, w *v75World, ns, gs, at, head string, cred Credentials, unrestricted bool) {
 	t.Helper()
 	ctx := context.Background()
@@ -173,6 +174,18 @@ func v077PurgedHeads(t *testing.T, w *v75World, ns, gs, at, head string, cred Cr
 		_, err := w.e.NamespaceHeadsPrefix(ctx, ns, head, "", "", cred)
 		purged("/heads", err)
 	}
+	if unrestricted {
+		// v0.82 (§B.11.9 Purged namespaces, Partial reader): the filtered
+		// URL's read check comes first, and an unrestricted reader's
+		// grant in Authorization is 403 there, as at a live namespace's.
+		if err := w.e.FilteredCurrent(ctx, ns, gs, "/heads", cred); v75Status(err) != 403 {
+			t.Fatalf("/g/{gs}/heads of purged %s for an unrestricted grant: %v, want 403", ns, err)
+		}
+		if _, _, err := w.e.FilteredHeads(ctx, ns, gs, at, "", "", cred); v75Status(err) != 403 {
+			t.Fatalf("/g/{gs}/at/{at}/heads of purged %s for an unrestricted grant: %v, want 403", ns, err)
+		}
+		return
+	}
 	purged("/g/{gs}/heads", w.e.FilteredCurrent(ctx, ns, gs, "/heads", cred))
 	_, info, err := w.e.FilteredHeads(ctx, ns, gs, at, "", "", cred)
 	purged("/g/{gs}/at/{at}/heads", err)
@@ -183,9 +196,9 @@ func v077PurgedHeads(t *testing.T, w *v75World, ns, gs, at, head string, cred Cr
 
 // §B.11.9 Purged namespaces, §8.5: purged cat-season stays covered as a
 // catalog; its filtered /heads answers as its /heads, 410 purged once the
-// read check passes, for its unrestricted reader as for a partial one
-// (before v0.77 a purged catalog was uncovered, and filteredOpen answered
-// this 410 too). Without credentials it is 401.
+// URL's read check passes: for a partial reader at its own gs, while its
+// unrestricted reader's grant is 403 there (v0.82) and gets the 410 at
+// the unfiltered /heads. Without credentials it is 401.
 func TestV077OriginPurgedCatalogHeads(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})

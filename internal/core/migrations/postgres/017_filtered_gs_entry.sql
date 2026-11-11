@@ -1,0 +1,27 @@
+-- Migration: filtered gs entry
+-- Created: 2026-11-11T07:04:21Z
+-- Checksum: f237c5add414b24b7571b6b6e9ee169334c609d009ef8d8ebe9c1fd750c2c55a
+-- Chain: 91dba329f35d213cc7c653b448b44e27a751567bb18eb4b64273b14b7b7d8a7f
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- Filtered namespace reads (§B.11.9 gs, filtered_admit.go): each
+-- filtered_gs row also keeps the digest of the whole entry of the key its
+-- cookie's grant verified under and of the whole definition of each read
+-- role it records, as the namespace document had them at the exchange
+-- (EntryDigest), so a cookie for it is 403 once that key or one of those
+-- roles is gone or changes in any member. Rows from before this migration
+-- keep '', which never holds: their cookies are 403 until the reader
+-- exchanges again.
+ALTER TABLE filtered_gs ADD COLUMN entry TEXT NOT NULL DEFAULT '';

@@ -45,8 +45,9 @@ type fscope struct {
 	// for content kind, nil for catalog kind.
 	root *nsRow
 	// cats are the catalogs root trusts, sorted by name, dark ones (e2e,
-	// purged or a local branch) included: they keep root covered but make
-	// nothing visible (§B.11.9 Where); for catalog kind, n itself.
+	// purged or a branch, local or remote) included: they keep root
+	// covered but make nothing visible (§B.11.9 Where); for catalog kind,
+	// n itself.
 	cats []fsCat
 }
 
@@ -60,10 +61,12 @@ type fsCat struct {
 }
 
 // dark reports whether c makes nothing visible: e2e, which the origin
-// can't read, purged, or a branch (§B.11.9 Where: "An end-to-end catalog,
-// which the origin can't read, a branch or a purged one makes nothing
-// visible"). A dark catalog still covers the namespaces it trusts, but no
-// checkpoint or view lists it (filteredCurrent, filteredAt).
+// can't read, purged, or a branch, local or remote (§B.11.9 Where: "A
+// trusted catalog makes nothing visible where it is a branch, local or
+// remote (§G.3), purged, or end-to-end, which the origin can't read"). A
+// dark catalog still covers the namespaces it trusts, but no checkpoint
+// or view lists it (filteredCurrent, filteredAt), and its graph is never
+// built (catalogAt).
 func (c fsCat) dark() bool { return c.e2e || c.n.purged || c.n.isBranch() }
 
 // filteredScope is n's coverage by §B.11.9, nil if it isn't covered:
@@ -72,9 +75,9 @@ func (c fsCat) dark() bool { return c.e2e || c.n.purged || c.n.isBranch() }
 //     branch, neither public nor sealed nor e2e (nsLevel below sealed),
 //     that trusts some catalog through a requireAt key
 //     (catvis.TrustedCatalogs over its current document and those of its
-//     local catalogs, a purged one's last stored document included: an
-//     e2e, purged or branch catalog keeps it covered and makes nothing
-//     visible, §B.11.9 Where);
+//     catalogs as stored here, a purged one's last stored document and a
+//     remote branch's own included: an e2e, purged or branch catalog
+//     keeps it covered and makes nothing visible, §B.11.9 Where);
 //   - catalog kind: a catalog, not a branch, neither public nor sealed,
 //     that some local namespace of its catalog.trust trusts as content
 //     kind.
@@ -129,17 +132,22 @@ func (t *tx) fsLocal(name string) *nsRow {
 }
 
 // fsTrust are the catalogs root trusts with document doc, read from their
-// current documents: local namespaces only (catvis.TrustedCatalogs). A
-// purged catalog is read from its last stored document, which the purge
-// keeps, and is dark like an e2e one or a local branch: it still covers
-// root, its catalog.trust still deciding, but makes nothing visible
-// (§B.11.9 Where: "An end-to-end catalog ... a branch or a purged one
-// makes nothing visible").
+// current documents as stored here (catvis.TrustedCatalogs): every
+// namespace of that name but a shadow, the internal mirror of a remote
+// base, which no document can name. A purged catalog is read from its
+// last stored document, which the purge keeps, and is dark like an e2e
+// one or a branch, local or remote (§G.3): it still covers root, its
+// catalog.trust still deciding, but makes nothing visible (§B.11.9 Where:
+// "A trusted catalog makes nothing visible where it is a branch, local or
+// remote (§G.3), purged, or end-to-end"). A remote branch's catalog.trust
+// is that of its own document here, not its source's, which this origin
+// may not read (v0.82; before, a remote-branch catalog counted as none,
+// and a namespace trusting only it was uncovered).
 func (t *tx) fsTrust(root *nsRow, doc map[string]any) []fsCat {
 	rows := map[string]*nsRow{}
 	trusts := catvis.TrustedCatalogs(root.name, doc, func(cat string) map[string]any {
-		c := t.fsLocal(cat)
-		if c == nil {
+		c := t.nsByName(cat)
+		if c == nil || c.isShadow() {
 			return nil
 		}
 		rows[cat] = c

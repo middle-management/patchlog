@@ -278,24 +278,16 @@ func (t *tx) filteredHeadsView(ns, gs, at string, cred Credentials) (*nsRow, *fv
 	return n, fv, cp, nil
 }
 
-// purgedHeadsCheck is the read check §8.5 names for a filtered /heads of
-// purged covered n at cp, which then answers 410 purged: "the full read
-// check for that URL", as at its unfiltered /heads (§B.11.9 Purged
-// namespaces: "/heads without at as /heads"). A grant in Authorization
-// that reads n unrestricted passes it, as there, rather than the 403
-// filteredAdmit gives it at a filtered URL that would serve rows; a
-// partial reader's grant and a cookie are admitted as filteredAdmit
-// admits them, its own gs included.
+// purgedHeadsCheck is the read check of a filtered /heads of purged
+// covered n at cp, which then answers 410 purged: the URL's own, its gs
+// included (§B.11.9 Purged namespaces: "once the URL's read check passes,
+// its gs included"), so filteredAdmit's, as for a live namespace. A
+// partial reader's grant passes at its own gs and is 403 at another, a
+// cookie is judged as that gs's, and a grant that reads n unrestricted is
+// 403 here as at any filtered URL (§B.11.9 Partial reader: "At filtered
+// ones their grant in Authorization is 403"): its 410 is at the
+// unfiltered /heads. Before v0.82 such a grant passed at any gs.
 func (t *tx) purgedHeadsCheck(n *nsRow, fs *fscope, gs string, cp *fcp, cred Credentials) *Error {
-	if cred.Bearer != "" {
-		_, kind, _, err := t.nsAccess(n, cred)
-		if err != nil {
-			return err
-		}
-		if kind == accessUnrestricted {
-			return nil
-		}
-	}
 	_, err := t.filteredAdmit(n, fs, gs, cp, cred)
 	return err
 }
