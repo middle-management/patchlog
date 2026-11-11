@@ -89,7 +89,10 @@ func TestV075XrevFilteredHeadsPurgedUnknownAt(t *testing.T) {
 		"exp": w.clock.Now().Add(time.Hour).Format(time.RFC3339)})
 	expect(t, w.patchNS("matches", ops(op("add", "/frozen", true)), w.admin), 201)
 	expect(t, w.do(req{method: "POST", path: "/ns/matches/purge?force=1", ifMatch: w.nsHead("matches", w.admin), bearer: opg}), 204)
-	gs, at := w.filtered(li)
+	// Her unfiltered /heads is 410 directly since v0.82 (ACC-8a); the
+	// unfiltered log still redirects to her gs.
+	expectCode(t, w.get("/ns/matches/rev/"+w.nsHead("matches", w.admin)+"/heads", li), 410, "purged")
+	gs, at := v82encFilteredLog(w, li)
 	bogus := "1nyv2d2ibcop4nnp4k5niguadz7lvyjad"
 	expectCode(t, w.get("/ns/matches/rev/"+bogus+"/heads", w.admin), 410, "purged")
 	expectCode(t, w.get("/ns/matches/g/"+gs+"/at/"+bogus+"/heads", li), 410, "purged")

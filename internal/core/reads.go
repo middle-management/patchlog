@@ -1006,7 +1006,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 // next stays absent on the last page. A partial reader of a namespace
 // §B.11.9 covers, by the grant in Authorization, gets a *FilteredRedirect
 // to the filtered form at the current at instead, which is recorded first
-// (§B.11.9 URLs).
+// (§B.11.9 URLs), unless the namespace is purged: then 410 directly.
 func (e *Engine) NamespaceHeadsPrefix(ctx context.Context, ns, nsID, after, prefix string, cred Credentials) (*HeadsPage, error) {
 	var out *HeadsPage
 	err := e.filteredRead(ctx, func(t *tx) error {
@@ -1015,6 +1015,15 @@ func (e *Engine) NamespaceHeadsPrefix(ctx context.Context, ns, nsID, after, pref
 			return t.absentNS(ns, cred)
 		}
 		if _, err := t.nsReaderOrRedirect(n, cred); err != nil {
+			// A partial reader's unfiltered /heads of a covered namespace
+			// that is purged is 410 without the 302 (§B.11.9 Purged
+			// namespaces, §8.5): her read check passed, so the answer is
+			// the one the filtered form would give, and no at is
+			// recorded. A grant that can't be redirected keeps its 403.
+			var fr *FilteredRedirect
+			if n.purged && errors.As(err, &fr) {
+				return t.purgedRead(n)
+			}
 			return err
 		}
 		// At any revision, once its resources are gone (§8.5).
