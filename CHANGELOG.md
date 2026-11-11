@@ -271,6 +271,12 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.82").
   the authentication mode is never taken from an
   earlier read that has since failed; a branch of a branch of a covered namespace gets no
   marker.
+- Index: a purged catalog the index serves keeps the `catalog.trust` it read. Stopping the
+  follower for visibility that stood in until the index reached the catalog no longer forgets
+  the trust the index's own follower recorded, and a catalog met purged from a snapshot has its
+  trust read at its purge-ns entry. A partial reader of a namespace that trusts it reads it
+  covered and dark (a `g:` marker, no hits) rather than, depending on timing, `403` with no
+  marker. The earlier answer failed closed (SERVICES §B.11.9 Where, §A.4).
 
 **Bundles, archives and the gateway** (§G.4.1, §G.5.1, §8.6, TOOLS §G.4.2, §H.4, §H.5):
 - Bundles: a reader and a writer reject a bundle whose grant line's `grant` isn't the id of

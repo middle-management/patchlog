@@ -15,10 +15,10 @@ had a choice) and the question. The planner's questions from before the work and
 implementers' and reviewers' notes are merged here, each case once. Notes from v0.81 that v0.82
 leaves open are carried in place, by subject, marked "was v0.81 Open n" and cut to what
 remains. The order is: sealed forms and end-to-end reads (1–31), access and coverage (32–65),
-tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87).
+tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87), index (88).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
-87 are open: 57 from this version's work and 30 carried.
+88 are open: 58 from this version's work and 30 carried.
 
 The spec's own question to the reference, "what is a shadow?", is answered under "Settled in
 v0.82" (v0.81 Open 24).
@@ -480,6 +480,13 @@ v0.82" (v0.81 Open 24).
     in a per-entry answer, nor which members stay clear. The reference's playground keeps, for
     an index hit, only `resource`, `id`, `url` (and `ns` across namespaces), and for a node
     drops `title` and `born`. *Question:* worth stating?
+88. **A purged catalog a service can still read** (§B.11.9 Where; with note 42). "One a
+    service never read counts as no catalog." An unsealed purged catalog's document is still
+    served at its purge head, so whether an index had "read" it depended on when it started and
+    how it bootstrapped: the same deployment answered a partial reader `302` under a `g:` marker
+    or `403` with no marker. The reference now reads the document at the purge entry on every
+    path and keeps the trust. *Question:* should the text say a service that can read a purged
+    catalog's document at its purge head must do so?
 
 ## Settled in v0.82
 
