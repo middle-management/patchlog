@@ -16,7 +16,8 @@ import (
 // knows sealed. It is now of the namespace the answer is of (or the one
 // the entry's href names), or of a confirmed branch of it; with no
 // namespace to compare with it isn't the entry's own. A value that hangs
-// on no entry is of the answer's namespace or a branch of it.
+// on no entry, and a member of an entry that names no item (compared with
+// no resource), is of the answer's namespace or a branch of it.
 func TestV082Xrev3bNestedValueOfAnotherNamespace(t *testing.T) {
 	t.Parallel()
 	const view = "/cat/at/1abcdefghijklmnopqrstuvwxyz234567/children?of=root"
@@ -33,7 +34,10 @@ func TestV082Xrev3bNestedValueOfAnotherNamespace(t *testing.T) {
 	  {"name":"preview","href":"/r/cat/preview","kind":"folder","born":{"sealed":"` + born("cat-r7", "preview", "1branch") + `"}},
 	  {"name":"far","href":"/r/cat/far","kind":"folder","born":{"sealed":"` + born("other-r7", "far", "1evil") + `"}},
 	  {"name":"matches.final","href":"/r/cat/matches.final","kind":"item","item":"/r/matches/final","file":{"sealed":"` + s.val("matches", "final", `{"file":{"size":3}}`) + `"}},
-	  {"name":"docs","href":"/r/cat/docs","kind":"folder","extra":{"sealed":"` + s.val("cat", "../x", `{"extra":1}`) + `"}}
+	  {"name":"docs","href":"/r/cat/docs","kind":"folder","extra":{"sealed":"` + s.val("cat", "../x", `{"extra":1}`) + `"}},
+	  {"name":"docs","href":"/r/cat/docs","kind":"folder","extra":{"sealed":"` + s.val("secret", "anything", `{"extra":666}`) + `"}},
+	  {"name":"docs","href":"/r/cat/docs","kind":"folder","extra":{"sealed":"` + s.val("cat", "elsewhere", `{"extra":1}`) + `"}},
+	  {"name":"docs","href":"/r/cat/docs","kind":"folder","extra":{"sealed":"` + s.val("cat-r7", "elsewhere", `{"extra":2}`) + `"}}
 	 ],
 	 "loose": [{"sealed":"` + born("secret", "docs", "1evil") + `"}, {"sealed":"` + born("cat", "docs", "1cat") + `"}, {"sealed":"` + born("cat-r7", "docs", "1branch") + `"}],
 	 "meta": {"deep": {"sealed":"` + born("secret", "docs", "1evil") + `"}}
@@ -107,7 +111,7 @@ func TestV082Xrev3bNestedValueOfAnotherNamespace(t *testing.T) {
 		}
 	}
 	refused("nodes[filed]", out.Nodes["filed"]["born"], "born")
-	if len(out.Children) != 8 || len(out.Loose) != 3 || len(out.Bare.Children) != 3 || len(out.Bare.Loose) != 1 {
+	if len(out.Children) != 11 || len(out.Loose) != 3 || len(out.Bare.Children) != 3 || len(out.Bare.Loose) != 1 {
 		t.Fatalf("children %v, loose %v, bare %v", out.Children, out.Loose, out.Bare)
 	}
 	refused("child docs (no own sealed)", out.Children[0]["born"], "born")
@@ -118,6 +122,11 @@ func TestV082Xrev3bNestedValueOfAnotherNamespace(t *testing.T) {
 	refused("child far (born of another namespace's branch)", out.Children[5]["born"], "born")
 	opened("child matches.final (file of its item)", out.Children[6]["file"], "file", float64(3))
 	refused("a value whose pl names no resource name", out.Children[7]["extra"], "extra")
+	// A member of an entry that names no item is compared with no resource (§E.2.6: "where the entry names it"),
+	// but is of the entry's namespace or a branch of it.
+	refused("a member of an item-less entry, of another namespace", out.Children[8]["extra"], "extra")
+	opened("a member of an item-less entry, of the catalog", out.Children[9]["extra"], "extra", float64(1))
+	opened("a member of an item-less entry, of a branch of the catalog", out.Children[10]["extra"], "extra", float64(2))
 	if !strings.Contains(out.WholeErr, "§3.6") {
 		t.Errorf("openSealed of a JWE whose kid names no namespace, with a key for it: %q", out.WholeErr)
 	}

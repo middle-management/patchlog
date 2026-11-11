@@ -2897,8 +2897,9 @@ async function sealedLevel(ns) {
  * - An entry's own value is of ctx.ns, or without one of its href's namespace, or of a branch of it (a release
  *   preview seals a catalog's entries under its branch, §B.5 Previews): never of whatever namespace its kid names.
  *   So is a value of another resource that stands for the entry's own (a born of another epoch), whether or not
- *   the entry's own value is there and opened; and a { "sealed" } alone that hangs on no entry is of ctx.ns or a
- *   branch of it. With no namespace to compare a kid with, the value isn't opened.
+ *   the entry's own value is there and opened. A { "sealed" } alone that hangs on no entry is of ctx.ns or a
+ *   branch of it, and isn't opened where there is no ctx.ns; one that is a member, other than born, of an entry
+ *   naming no item is compared with no resource, but is of the entry's namespace or a branch of it where known.
  * - A "branch" an entry names beside its item counts only where it is a branch of the item's namespace.
  * A namespace is a branch of another where its own namespace document names that one as its base (branchBase).
  * No kid's namespace and no pl's name is asked about, or for a key, unless it is a name (§3.6). */
@@ -2977,6 +2978,11 @@ async function openSealedEntries(v, view, from, filed, ctx) {
         // born is the entry's own; any other value is its own or its item's, where the entry names an item.
         if (from.key === 'born' && from.name ? !fromOwn : item && !fromOwn && !fromItem) {
           throw new Error(`a sealed value of ${ens}/${rname}, which isn't the resource its entry draws it from (${[from.name ? (from.ns || from.of ? (from.ns || from.of) + '/' : '') + from.name : '', item && from.key !== 'born' ? itemNS + '/' + item[2] : ''].filter(Boolean).join(' or ')}) (§E.2.6)`);
+        }
+        // Where the entry names no item there is no resource to compare such a member with (the service names
+        // none), but it is still of the namespace the entry is of, or a branch of it, where that one is known.
+        if (!item && from.key !== 'born' && from.of && ens !== from.of && !(await isBranch(ens, from.of))) {
+          throw new Error(`a sealed value of ${ens}/${rname} in an entry of ${from.of}, which names no item and which ${ens} isn't known to be a branch of (§E.2.6)`);
         }
         // "branch" is the service's word, in the clear: it stands for the item's namespace only where that
         // namespace's own document says it is a branch of it. Otherwise any namespace's value would pass as the item's.
