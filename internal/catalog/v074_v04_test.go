@@ -193,7 +193,7 @@ func TestNoVisibleParentIsRootV074(t *testing.T) {
 			t.Errorf("%s: guest's roots %v", when, got)
 		}
 		r, _ := w.follow("/cat/ancestors?of=matches.other", guest)
-		if r.status != 200 || r.body["incomplete"] != nil || !reflect.DeepEqual(r.body["paths"], []any{[]any{}}) {
+		if r.status != 200 || r.body["incomplete"] != nil || !reflect.DeepEqual(r.body["paths"], []any{[]any{"matches.other"}}) {
 			t.Errorf("%s: guest's ancestors of matches.other: %d %v", when, r.status, r.body)
 		}
 	}

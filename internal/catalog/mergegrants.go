@@ -163,7 +163,7 @@ const AdminHeader = "Admin-Authorization"
 // only, under the merge key, for the merge service to submit a batch to
 // the catalog (§F.8), and rules on /now for writes are unchanged (§C.2
 // item 5, v0.78), so none of its grants is refused for them, as POST
-// /grants and POST /read-grants refuse them (authenticateRead).
+// /grants and POST /read-grants refuse them (callerRefused).
 func (s *Service) serveMergeGrants(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	v, err := s.Authenticate(r.Context(), r)

@@ -30,7 +30,7 @@ func TestReadGrantKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fan := w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, []string{}, map[string]any{"groups": toAny("fan-club"), "enc": jwk})
+	fan := w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, idCan, map[string]any{"groups": toAny("fan-club"), "enc": jwk})
 	r := w.do("POST", "/read-grants", fan, map[string]any{"items": toAny("/r/matches/derby", "/r/cat/season", "/r/matches/rumour1", "/r/cat/rumours")})
 	if r.status != 200 {
 		t.Fatalf("read-grants: %d %v", r.status, r.body)

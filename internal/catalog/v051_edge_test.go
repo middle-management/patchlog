@@ -120,7 +120,7 @@ func TestServiceEdgeGrants(t *testing.T) {
 		t.Errorf("two subject sets: %d %v", r.status, r.body)
 	}
 	// A grant that lasts less than 15 minutes bounds its cookie.
-	short := w.idp.Grant(t, w.s.Now(), "user:sam", []string{"cat"}, []string{}, map[string]any{"groups": toAny("fan-club"),
+	short := w.idp.Grant(t, w.s.Now(), "user:sam", []string{"cat"}, idCan, map[string]any{"groups": toAny("fan-club"),
 		"exp": w.s.Now().Add(90 * time.Second).Format(time.RFC3339)})
 	if r, cks := w.exchange(short, nil, ""); r.status != 200 || len(cks) != 1 || cks[0].MaxAge > 90 || cks[0].MaxAge < 80 {
 		t.Errorf("short grant: %d %v", r.status, cks)

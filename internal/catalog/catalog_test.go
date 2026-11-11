@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -60,7 +61,10 @@ type world struct {
 	db       string
 
 	svcClient *client.Client
-	sealed    bool // both namespaces are sealed (Addendum E.2)
+	// selfPlacing has the service accept $parents in trusted content
+	// documents as implicit placements (§B.9; tree.Options.SelfPlacing).
+	selfPlacing bool
+	sealed      bool // both namespaces are sealed (Addendum E.2)
 
 	// The service's own edge grants and the verifying edge in front of
 	// it, if set before start (§B.11.5, §9).
@@ -180,7 +184,7 @@ func setupWith(t *testing.T, sealed bool) *world {
 	opc := s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat")))
 	must(opc.CreateNamespace(ctx, "cat", enc(map[string]any{
 		"read":    "grant",
-		"keys":    []any{opsKey.Entry("*"), idp.Entry(), catEntry, mergeEntry},
+		"keys":    []any{opsKey.Entry("*"), idEntry(idp), catEntry, mergeEntry},
 		"maxLag":  "PT60S",
 		"catalog": map[string]any{"trust": toAny("matches"), "mode": "dag"},
 		"roles": map[string]any{
@@ -222,7 +226,7 @@ func (w *world) start() {
 			Logf:          func(f string, a ...any) { w.t.Logf(f, a...) },
 			FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)},
 			EdgeGrants:    w.edgeGrants, Edge: w.edge, EdgeGrantsOwnKey: w.edgeOwnKey, ExchangeRate: w.exchangeRate, Purger: w,
-			RepurgeDelay: w.repurgeDelay, RepurgeInterval: w.repurgeInterval},
+			RepurgeDelay: w.repurgeDelay, RepurgeInterval: w.repurgeInterval, SelfPlacing: w.selfPlacing},
 		Key: w.cat.Priv, Kid: "catalog-01",
 		MergeKey: w.mergeKey.Priv, MergeKid: "catalog-merge", MergeService: "svc:merge",
 	})
@@ -259,9 +263,28 @@ func (w *world) caughtUp() {
 }
 
 // caller is an identity grant from the identity provider for the catalog
-// namespace, with no verbs of its own (§B.11.6: groups come from it).
+// namespace (§B.11.6: groups come from it). It allows read there, as a
+// caller of POST /read-grants or of a read want must since v0.82
+// (§B.11.4 The caller's grant), and reads nothing by itself (idEntry).
 func (w *world) caller(sub string, groups ...string) string {
-	return w.idp.Grant(w.t, w.s.Now(), sub, []string{"cat"}, []string{}, map[string]any{"groups": toAny(groups...)})
+	return w.idp.Grant(w.t, w.s.Now(), sub, []string{"cat"}, idCan, map[string]any{"groups": toAny(groups...)})
+}
+
+// idCan is the can of an identity grant for the catalog namespace: read,
+// which the identity provider's key there scopes to nothing (idEntry).
+var idCan = []string{"read"}
+
+// idEntry is the identity provider's key entry in a catalog namespace:
+// its grants allow read (§C.2 item 2), so the catalog's grant endpoints
+// serve their read wants (§B.11.4 The caller's grant, v0.82), but its
+// scope fixes /resource to a name no node has, so such a grant reads no
+// document of the catalog, and reads it neither unrestricted nor
+// namespace-wide: its holder sees the catalog through its subject set's
+// listings only, as a grant without verbs did before.
+func idEntry(idp clienttest.Key) map[string]any {
+	e := idp.Entry("read")
+	e["rules"] = []any{map[string]any{"op": "test", "path": "/resource", "value": "identity-only"}}
+	return e
 }
 
 func (w *world) doc(ns, name string, doc map[string]any) {
@@ -841,7 +864,9 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 	// Paths through folders the guest may not see are left out, without a
 	// count of them: the placement's parents are all hidden from the
 	// guest, so it is a root, where its one path ends (§B.11.5).
-	if ps, _ := b["paths"].([]any); len(ps) != 1 || len(ps[0].([]any)) != 0 || b["hidden"] != nil || b["incomplete"] != nil {
+	// Its path is the placement's own name alone (v0.82, §B.5: a path
+	// runs down to the node itself).
+	if ps, _ := b["paths"].([]any); len(ps) != 1 || !reflect.DeepEqual(ps[0], []any{"matches.other"}) || b["hidden"] != nil || b["incomplete"] != nil {
 		t.Errorf("guest paths: %v", b)
 	}
 

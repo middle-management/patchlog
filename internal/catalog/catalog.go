@@ -47,12 +47,13 @@
 // catalog namespace, verified locally with internal/grantcheck (keys,
 // revocations and scopes as of the catalog's head). Its root sub and groups
 // are the caller's identity (§B.11.6: groups come from the caller's grant,
-// the identity provider's; there is no groups namespace). The grant's verbs
-// don't matter for the catalog's API: it is only proof of identity. But
-// POST /grants and POST /read-grants hand out read decisions and read
-// grants, so a grant whose rules refer to /now, which no read passes, is
-// refused there (403), as the tree service refuses it its listings (§C.2
-// item 5, authenticateRead); POST /merge-grants issues write grants only.
+// the identity provider's; there is no groups namespace). The grant is
+// proof of identity, with two refusals of its own at POST /grants and
+// POST /read-grants (§B.11.4 The caller's grant, callerRefused): one with
+// a block or key-scope rule on /now, which no read passes, is refused
+// both whatever it wants, and one that allows read nowhere is refused
+// /read-grants and any want that lists read; POST /merge-grants issues
+// write grants only and refuses neither.
 //
 // Decisions (POST /grants, POST /read-grants, POST /merge-grants) are
 // taken at one checkpoint, which answers carry beside the grant, and a
@@ -1052,7 +1053,11 @@ func (s *Service) catalogOf(g *tree.Graph) *catvis.Catalog {
 	content := map[string]*tree.NSConfig{}
 	contents := map[string]*catvis.Content{}
 	for ns := range g.Trust {
-		if c := g.Content[ns]; c != nil {
+		// A namespace the service stopped following counts for no
+		// visibility decision (§B.5 Behind: "its roles count for no
+		// folder"): the document held is the one it stopped at, and a
+		// narrowing since is one it can't see.
+		if c := g.Content[ns]; c != nil && !g.Stopped(ns) {
 			content[ns] = c
 			cfg := s.parsed(c).cfg
 			// The catalog's key counts only in a member that trusts the
@@ -1076,11 +1081,13 @@ func (s *Service) catalogOf(g *tree.Graph) *catvis.Catalog {
 }
 
 // sameContent reports whether content holds exactly the documents of the
-// namespaces g trusts as of the checkpoint (catalogOf).
+// namespaces g trusts and the service follows as of the checkpoint
+// (catalogOf): a namespace stopped or followed again since changes it, as
+// a replaced document does.
 func sameContent(content map[string]*tree.NSConfig, g *tree.Graph) bool {
 	n := 0
 	for ns := range g.Trust {
-		if c := g.Content[ns]; c != nil {
+		if c := g.Content[ns]; c != nil && !g.Stopped(ns) {
 			if content[ns] != c {
 				return false
 			}
@@ -1103,10 +1110,12 @@ type visibility struct {
 }
 
 // roles is the readRoles of a trusted content namespace as of the
-// checkpoint g reflects (nil if it isn't trusted or not followed yet).
+// checkpoint g reflects (nil if it isn't trusted, not followed yet, or
+// one the service stopped following, whose roles count for nothing:
+// §B.5 Behind, catalogOf).
 func (v *visibility) roles(g *tree.Graph, ns string) *readRoles {
 	c := g.Content[ns]
-	if !g.Trust[ns] || c == nil {
+	if !g.Trust[ns] || c == nil || g.Stopped(ns) {
 		return nil
 	}
 	return v.s.readRolesOf(c)
