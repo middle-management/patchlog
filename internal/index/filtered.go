@@ -1045,11 +1045,14 @@ var (
 	errUncovered    = &grant.AuthError{Status: 403, Msg: "the namespace is no longer read filtered: exchange the grant again (§B.11.9)"}
 )
 
-// storedFview is the view of a cookie for marker m, reads:{ns}:g:{gs}, at
-// cp, judged from what the exchanges recorded alone (rec, gsKeys), never
-// from a grant the request doesn't carry: 403 where, for any key a live
-// cookie of m came from (gsKeys: the cookie doesn't say which is its
-// own, so each must hold), the scope digest of its kid's scope rules and
+// storedFview is the view of the cookie for marker m, reads:{ns}:g:{gs},
+// that expires at exp, at cp, judged from what the exchanges recorded
+// alone (rec, gsKeysAt), never from a grant the request doesn't carry:
+// 403 where, for any key that cookie came from (gsKeysAt: the cookie
+// doesn't say which is its own, so each must hold), its whole entry or
+// one of its roles' whole definitions in ns's document as of cp differs
+// in any member from what the exchange recorded (entryHolds; §B.11.9 gs,
+// v0.82), the scope digest of its kid's scope rules and
 // its roles' definitions, read from ns's document as of cp (a branch's
 // keys follow its base, §C.4), with rec's block rules and principal,
 // differs from the one rec's subjects carry (a kid or role gone, or no
@@ -1057,18 +1060,18 @@ var (
 // longer has the pub it had (§B.11.9 gs: a key "no longer accepted" as
 // §C.4 judges a base's keys, "only while the base has it with the same
 // pub"; a record without one, from before migration 006, never does),
-// where m has no such key recorded (from before migration 007), and where
+// where m has no such key recorded (from before migration 011), and where
 // its subjects hold "partial", recorded under an earlier draft (§B.11.5,
 // v0.78: no gs leaves a group out); otherwise item 1 from rec's
 // subjects and item 2 from its filter. Readers with the same subjects
 // and rules share m, so once a key one came from is replaced, the
 // others' cookies are 403 too, until the replaced key's last cookie
 // expires: never a cookie read under a key no longer accepted.
-func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *markerRec) (*fview, error) {
+func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *markerRec, exp int64) (*fview, error) {
 	if slices.Contains(rec.subjects, catvis.Partial) {
 		return nil, errPartial
 	}
-	recorded, err := ix.gsKeys(ctx, m, ix.opt.Now())
+	recorded, err := ix.gsKeysAt(ctx, m, exp)
 	if err != nil {
 		return nil, err
 	}
@@ -1083,15 +1086,23 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *marker
 	if err != nil {
 		return nil, errRulesChanged
 	}
-	keys := cfg.Keys
 	for _, k := range recorded {
+		// The key's whole entry and its roles' whole definitions, as
+		// the exchange recorded them (entryHolds, v0.82).
+		key, ok, err := ix.entryHolds(ctx, cfg, k)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, errRulesChanged
+		}
 		// §A.4's marker digest, as grantFview has it. A marker recorded
 		// with the rules' digest alone (before this release) never holds:
 		// its cookies are 403 until the reader exchanges again.
 		holds := func(d string) bool {
 			return slices.Contains(rec.subjects, catvis.ScopePrefix+scopeKeyDigest(d, k.kid, k.pub))
 		}
-		if !gsKeyHolds(cfg, keys, rec.f, k, holds) {
+		if !gsKeyHolds(cfg, []grant.Key{key}, rec.f, k, holds) {
 			return nil, errRulesChanged
 		}
 	}
