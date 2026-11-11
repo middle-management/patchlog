@@ -518,16 +518,18 @@ func (e *Engine) fetchChain(ctx context.Context, c *client.Client, ep RemoteEndp
 // the log from h on, verified over its ciphertext, and the base's sealed
 // snapshot, which B stores and serves as its own answer to /rev (e3Rev),
 // never asking the base at read time. The snapshot is at h, or where h is
-// a tombstone, at its parent P, which the base names as last in its 404
-// not_offered for a later revision (§7.1) and h's id verifies (a
-// tombstone's id is derived from its parent's, §3.3). B takes only a 200
+// a tombstone, at its parent P, which the base names as last in the 410
+// of the tombstone's own /rev/{h}, or in its 404 not_offered for a later
+// revision (§7.1), and h's id verifies (a tombstone's id is derived from
+// its parent's, §3.4). Each is read as the snapshot is (rawGet: the same
+// cap, no redirect followed). B takes only a 200
 // application/jose (rawGet: no redirect followed) within snapshotMax
 // bytes, of the strict compact form (strictJWE), whose protected header
 // has no zip, a kid naming a namespace of chain and pl exactly {that
 // namespace, name, h or P}. Anything else is 502 upstream: a transient
 // answer as a base that didn't answer, any other as unverified (§G.3).
-// A tombstone horizon at target itself, whose parent the base names
-// nowhere, is 410 pruned, as before v0.81.
+// A tombstone horizon whose 410 names no last, as a base before v0.82
+// answers, is 410 pruned, as it was then.
 func (e *Engine) mirrorSnapshot(ctx context.Context, c *client.Client, ep RemoteEndpoint, chain []string, ns, name, target, h string, mapErr func(string, error) *Error) (*remoteChain, *Error) {
 	what := "/r/" + ns + "/" + name
 	hid, perr := ids.Parse(h)
@@ -579,6 +581,46 @@ func (e *Engine) mirrorSnapshot(ctx context.Context, c *client.Client, ep Remote
 		return nil, ferr
 	}
 	at := h // the revision the snapshot stands for
+	// parentOf checks last, which the base names as the parent of its
+	// tombstone horizon h, against h's id (§3.4).
+	parentOf := func(last string) *Error {
+		pid, err := ids.Parse(last)
+		if err != nil || ids.Tombstone(pid) != hid {
+			return unverified("%s: the base names %q as the parent of its tombstone horizon %s, which it isn't", what, last, h)
+		}
+		at = last
+		return nil
+	}
+	// atTombstone takes gone, the base's 410 for /rev/{h}: where it is a
+	// tombstone's, naming h and last, its parent (§7.1, §G.5.2), the
+	// snapshot is at that parent, fetched as any snapshot is. A 410
+	// without last, as a base before v0.82 or a cache answers, names no
+	// parent: the creation is 410 pruned.
+	atTombstone := func(gone []byte) *Error {
+		var g struct {
+			Tombstone string `json:"tombstone"`
+			Last      string `json:"last"`
+		}
+		if json.Unmarshal(gone, &g) != nil || g.Tombstone == "" && g.Last == "" {
+			return apiErr(410, "pruned", "message", what+": the e2e base pruned history needed at at, at a tombstone whose parent it doesn't name (§G.5)", "horizon", h)
+		}
+		if g.Tombstone != h {
+			return unverified("%s/rev/%s: the base's 410 names tombstone %q", what, h, g.Tombstone)
+		}
+		if g.Last == "" {
+			return apiErr(410, "pruned", "message", what+": the e2e base pruned history needed at at, at a tombstone whose parent it doesn't name (§G.5)", "horizon", h)
+		}
+		if err := parentOf(g.Last); err != nil {
+			return err
+		}
+		if st, hd, body, ferr = get(at); ferr != nil {
+			return ferr
+		}
+		if st != http.StatusOK {
+			return unverified("%s/rev/%s: the base answered %d, not its snapshot", what, at, st)
+		}
+		return nil
+	}
 	switch {
 	case st == http.StatusOK && probe == h:
 	case st == http.StatusNotFound:
@@ -591,20 +633,27 @@ func (e *Engine) mirrorSnapshot(ctx context.Context, c *client.Client, ep Remote
 			return nil, unverified("%s/rev/%s: the base answered 404 %.200s, not not_offered at its horizon %s", what, probe, body, h)
 		}
 		if nf.Last != "" {
-			pid, err := ids.Parse(nf.Last)
-			if err != nil || ids.Tombstone(pid) != hid {
-				return nil, unverified("%s: the base names %q as the parent of its tombstone horizon %s, which it isn't", what, nf.Last, h)
+			if err := parentOf(nf.Last); err != nil {
+				return nil, err
 			}
-			at = nf.Last
 		}
 		if st, hd, body, ferr = get(at); ferr != nil {
 			return nil, ferr
 		}
-		if st != http.StatusOK {
+		if st == http.StatusGone && at == h {
+			// A tombstone horizon the not_offered named no parent for:
+			// its own 410 does.
+			if err := atTombstone(body); err != nil {
+				return nil, err
+			}
+		} else if st != http.StatusOK {
 			return nil, unverified("%s/rev/%s: the base answered %d, not its snapshot", what, at, st)
 		}
 	case st == http.StatusGone && probe == h:
-		return nil, apiErr(410, "pruned", "message", what+": the e2e base pruned history needed at at, at a tombstone whose parent it doesn't name (§G.5)", "horizon", h)
+		// The head at at is the base's tombstone horizon.
+		if err := atTombstone(body); err != nil {
+			return nil, err
+		}
 	default:
 		return nil, unverified("%s/rev/%s: the base answered %d, not its snapshot or not_offered", what, probe, st)
 	}
