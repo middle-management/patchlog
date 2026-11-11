@@ -15,10 +15,10 @@ had a choice) and the question. The planner's questions from before the work and
 implementers' and reviewers' notes are merged here, each case once. Notes from v0.81 that v0.82
 leaves open are carried in place, by subject, marked "was v0.81 Open n" and cut to what
 remains. The order is: sealed forms and end-to-end reads (1–31), access and coverage (32–65),
-tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85). Sections are
-SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
+tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87).
+Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
-85 are open: 55 from this version's work and 30 carried.
+87 are open: 57 from this version's work and 30 carried.
 
 The spec's own question to the reference, "what is a shadow?", is answered under "Settled in
 v0.82" (v0.81 Open 24).
@@ -467,6 +467,19 @@ v0.82" (v0.81 Open 24).
     row 1's id (`1d7hzis4…`) appears nowhere in SPEC.md. *Propose:* call C.2's premise
     illustrative or use the `gs` of `reads:demo`; add the padding sentence; have §I.21 state the
     id.
+86. **How a reader knows a branch is a branch** (§B.5 Previews, §E.2.6). Neither section says
+    how a reader authenticates that a preview's `kid` or `pl.ns` namespace, or an entry's
+    `branch`, is a branch of the catalog's or the item's namespace; the tree service's `branch`
+    member (Open 22) is not in the spec text. The reference's playground accepts
+    only a direct local branch, confirmed from the branch's own namespace document, which names
+    the namespace as its `base` (a stacked branch, a remote base and an unreadable document are
+    refused). *Question:* should the spec name the check, the branch's namespace document
+    `base` or the release document, and say whether stacked branches count?
+87. **Cleartext beside `sealed` in a per-entry answer** (§E.2.6). The text says a reader "shows
+    the rest by name only", but not that a reader MUST ignore cleartext values beside `sealed`
+    in a per-entry answer, nor which members stay clear. The reference's playground keeps, for
+    an index hit, only `resource`, `id`, `url` (and `ns` across namespaces), and for a node
+    drops `title` and `born`. *Question:* worth stating?
 
 ## Settled in v0.82
 

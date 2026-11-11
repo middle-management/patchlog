@@ -2463,7 +2463,7 @@ shown only with its item, and never for items of sealed or end-to-end namespaces
 where a prune cut the chain. Sibling `order` keys compare by UTF-8 bytes (§B.2), and an explicit
 placement wins over `$parents` whether live, deleted or purged (§B.9). A visible node with no
 visible parent, its parents hidden, gone, dangling or cyclic, is a root for that subject set:
-`roots` lists it, and `ancestors` and `where` paths end at it (§B.11.5, v0.74); unfiltered
+`roots` lists it, and the `paths` of `ancestors` and `where` end at it (§B.11.5, v0.74); unfiltered
 `g/all` and public listings keep §B.5's roots and orphans. Purged namespaces leave the combined
 checkpoint `at`, listings' `ns:{ns}` tags and the coverage of problems and orphans (§B.5,
 v0.74); `where?item=` naming an item that isn't in the catalog, or
@@ -3598,8 +3598,8 @@ only.
   §B.11.4 Copies, §B.12's question closed); a move within a tree that widens access is still
   refused by the catalog service. A reader who lists the tree through the tree service may copy
   a folder too: never into the folder itself or below it as that reader sees the tree (`403`,
-  judged by the service's `ancestors`; `403` too when that answer is cut short, `503` while the
-  service hasn't caught up with the user's writes). Such a reader still can't delete a folder or
+  judged by the service's `ancestors`; `403` too when that answer is cut short (`tooDeep` or
+  `truncated`), `503` while the service hasn't caught up with the user's writes). Such a reader still can't delete a folder or
   move one to another tree (`403`).
 - **Delete a file**: its placement, then, where its item is in `files.ns` (the tree owns it) and
   the user's grant allows `delete` there, its item; else the item stays, unplaced, as a failure

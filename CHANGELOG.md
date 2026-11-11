@@ -145,6 +145,22 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.82").
   an `Object.prototype` member (`"constructor"`, `"__proto__"`) or a non-string (`["e2e"]`) as
   no lowering and then read a plaintext `200`; that was fixed before any release, and a level
   is now one of `none`, `at-rest`, `sealed` and `e2e` or it is refused.
+- **Playground: a listing shows a title, `born` or hit value only from a sealed value that
+  opened** (SERVICES §E.2.6 Per-entry sealing). In a listing, `ancestors`, `where` answer or
+  search result sealed per entry, the playground merged an opened value over the cleartext
+  beside it, so a node whose sealed value was absent, did not open or had no title was shown
+  with its cleartext title, unmarked. Cleartext copies beside such a sealed value are now
+  dropped, so those entries show by name only. This was found in a second, scoped review before
+  release.
+- **Playground: an entry's own sealed value must be of the namespace being read** (SERVICES
+  §E.2.6 Values of another resource). The playground opened an entry's value under whatever
+  namespace its `kid` named. It must now be of the catalog or namespace being read (or of the
+  entry's `href` namespace), or of a confirmed branch of it; a value sealed for another
+  namespace is refused.
+- **Playground: an entry's `branch` counts only for a branch of the item's namespace**
+  (SERVICES §B.5 Previews, §E.2.6). An entry's cleartext `branch` stood for its item's
+  namespace with nothing behind it. It is accepted only when that namespace's own document
+  names the item's namespace as its base; otherwise the value is refused.
 - **Catalog service: a namespace the service stopped following reads public to no one**
   (SERVICES §B.5 Behind). The service judged `"public": true` at `POST /read-grants` from the
   document it had stopped at, so a public namespace made private by the write that stopped
