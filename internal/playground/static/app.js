@@ -2834,21 +2834,77 @@ async function treeGet(path) {
     if (d.error) return { r, view, sealedWhole: d };
     body = d.value;
   }
-  if (body && typeof body === 'object') await openSealedEntries(body, view);
+  // A sealed or e2e catalog's listing that came as JSON is sealed per entry (§E.2.6); one opened whole is authentic as it is.
+  if (body && typeof body === 'object') await openSealedEntries(body, view, undefined, undefined, { ns: C.ns, sealed: !r.jose && await sealedLevel(C.ns) });
   return { r, view, body };
+}
+
+/* branchBase is the namespace a local branch ns was created from, the "base" of its namespace document (§7.6), which
+ * never changes: "" where ns is no branch, its base is another deployment's (§G.3), or its document can't be read. */
+async function branchBase(ns) {
+  const known = branchBase.known || (branchBase.known = new Map());
+  if (!known.has(ns)) {
+    const d = await nsHeadDoc(ns);
+    const b = d.status === 200 && d.doc && typeof d.doc === 'object' ? d.doc.base : null;
+    if (!b || typeof b !== 'object' || typeof b.ns !== 'string' || b.origin !== undefined) return '';
+    known.set(ns, b.ns);
+  }
+  return known.get(ns);
+}
+
+/* sealedLevel says whether ns is sealed or e2e as far as this browser knows: its listings and results then come
+ * sealed, whole or per entry (SERVICES.md §E.2.6). */
+async function sealedLevel(ns) {
+  const l = (await nsInfo(ns)).level;
+  return l === 'sealed' || l === 'e2e';
 }
 
 /* openSealedEntries decrypts per-entry sealed values ("sealed": JWE, pl {ns, name, view}) in place. from is the
  * entry a value of another resource hangs on and the member it is, { key, ns, name, item, branch }, where v is such
  * a value. filed is the node name v is filed under, where v is an entry of the "nodes" map of an ancestors or where
- * answer, { href, sealed } with no name of its own (SERVICES.md §B.5). */
-async function openSealedEntries(v, view, from, filed) {
-  if (Array.isArray(v)) { for (const x of v) await openSealedEntries(x, view); return; }
+ * answer, { href, sealed } with no name of its own (SERVICES.md §B.5). ctx is what the caller knows of the answer,
+ * { ns, sealed }: the namespace its entries are of (the catalog, the namespace searched), and whether that one is
+ * known sealed or e2e and the answer came as JSON, so sealed per entry.
+ *
+ * Three things hold of what is left in an entry afterwards (§E.2.6 Per-entry sealing):
+ * - In an answer sealed per entry, what a sealed value carries is taken from an opened one only: a node's title and
+ *   born, and everything of a hit but resource, id, url and ns, are dropped where they stand in the clear, so an
+ *   entry whose value is absent, doesn't open or lacks the member shows by name only. A tree answer is sealed per
+ *   entry where ctx says so or any of its entries carries "sealed" (a catalog is one namespace); a hit, which may
+ *   stand beside clear hits of other namespaces, where it carries "sealed" itself or ctx says so.
+ * - An entry's own value is of ctx.ns, or without one of its href's namespace, or of a branch of it (a release
+ *   preview seals a catalog's entries under its branch, §B.5 Previews): never of whatever namespace its kid names.
+ * - A "branch" an entry names beside its item counts only where it is a branch of the item's namespace.
+ * A namespace is a branch of another where its own namespace document names that one as its base (branchBase). */
+async function openSealedEntries(v, view, from, filed, ctx) {
+  const lone = (x) => !!x && typeof x === 'object' && !Array.isArray(x) && typeof x.sealed === 'string' && Object.keys(x).length === 1;
+  if (!ctx || ctx.perEntry === undefined) {
+    // A node's own sealed value: on an entry with a name, or one filed in the nodes of an answer's paths.
+    const scan = (x, inNodes) => {
+      if (Array.isArray(x)) return x.some((y) => scan(y));
+      if (!x || typeof x !== 'object') return false;
+      if (typeof x.sealed === 'string' && (inNodes || typeof x.name === 'string')) return true;
+      return Object.keys(x).some((k) => (k === 'nodes' && !inNodes && Array.isArray(x.paths) && x[k] && typeof x[k] === 'object' && !Array.isArray(x[k])
+        ? Object.keys(x[k]).some((n) => scan(x[k][n], true)) : scan(x[k])));
+    };
+    const ns = ctx && typeof ctx.ns === 'string' ? ctx.ns : '', sealed = !!(ctx && ctx.sealed);
+    ctx = { ns, sealed, perEntry: sealed || scan(v) };
+  }
+  if (Array.isArray(v)) { for (const x of v) await openSealedEntries(x, view, undefined, undefined, ctx); return; }
   if (!v || typeof v !== 'object') return;
   const isFiled = typeof filed === 'string' && filed !== '';
+  const isBranch = async (b, base) => /^[a-z0-9][a-z0-9_-]*$/.test(b) && (await branchBase(b)) === base;
   // An entry names its resource "name" (the tree service) or "resource" (the index's hits); one of a "nodes" map
   // is named by its key, which a name of its own must agree with.
   const named = typeof v.name === 'string' ? v.name : typeof v.resource === 'string' ? v.resource : '';
+  const node = isFiled || typeof v.name === 'string';
+  if (node && (ctx.perEntry || typeof v.sealed === 'string')) {
+    delete v.title;
+    // A born of another epoch stands sealed in place, and opens or fails as itself.
+    if (!lone(v.born)) delete v.born;
+  } else if (!node && named && (ctx.sealed || typeof v.sealed === 'string')) {
+    for (const k of Object.keys(v)) if (!['resource', 'id', 'url', 'ns', 'sealed'].includes(k)) delete v[k];
+  }
   let own = '';
   if (typeof v.sealed === 'string') {
     try {
@@ -2860,6 +2916,15 @@ async function openSealedEntries(v, view, from, filed) {
       const rname = other ? (hdr.pl || {}).name : isFiled ? filed : v.name !== undefined ? v.name : v.resource;
       if (typeof rname !== 'string' || !rname) throw new Error('a sealed value that names no resource');
       if (isFiled && named && named !== filed) throw new Error(`an entry named ${named}, filed under ${filed} in nodes`);
+      if (!other) {
+        // The entry's own value: of the namespace the answer is of, or of the one its href names where the caller
+        // gave none, or of a branch of that one. With neither there is nothing to compare its kid with.
+        const href = /^\/r\/([^/]+)\//.exec(typeof v.href === 'string' ? v.href : '');
+        const want = ctx.ns || (href ? href[1] : '');
+        if (want && ens !== want && !(await isBranch(ens, want))) {
+          throw new Error(`a value sealed for namespace ${ens} in an entry of ${want}, which ${ens} isn't known to be a branch of (§E.2.6)`);
+        }
+      }
       // A reader compares that pl's ns and name with the resource the entry draws the value from, where the entry
       // names it (§E.2.6 Values of another resource): its own resource, for a value of another epoch such as
       // born, or a placement's item, "/r/{ns}/{name}", for one drawn from it such as file.
@@ -2872,11 +2937,17 @@ async function openSealedEntries(v, view, from, filed) {
         const fromItem = !!item && ens === itemNS && rname === item[2];
         // born is the entry's own; any other value is its own or its item's, where the entry names an item.
         if (from.key === 'born' && from.name ? !fromOwn : item && !fromOwn && !fromItem) {
-          throw new Error(`a sealed value of ${ens}/${rname}, which isn't the resource its entry draws it from (${[from.name ? (from.ns ? from.ns + '/' : '') + from.name : '', item && from.key !== 'born' ? itemNS + '/' + item[2] : ''].filter(Boolean).join(' or ')}) (\u00a7E.2.6)`);
+          throw new Error(`a sealed value of ${ens}/${rname}, which isn't the resource its entry draws it from (${[from.name ? (from.ns ? from.ns + '/' : '') + from.name : '', item && from.key !== 'born' ? itemNS + '/' + item[2] : ''].filter(Boolean).join(' or ')}) (§E.2.6)`);
+        }
+        // "branch" is the service's word, in the clear: it stands for the item's namespace only where that
+        // namespace's own document says it is a branch of it. Otherwise any namespace's value would pass as the item's.
+        if (item && fromItem && !fromOwn && from.key !== 'born' && itemNS !== item[1] && !(await isBranch(itemNS, item[1]))) {
+          throw new Error(`a sealed value of ${ens}/${rname}, in the branch its entry names, ${itemNS}, which isn't known to be a branch of its item's namespace ${item[1]} (§B.5 Previews, §E.2.6)`);
         }
       }
       const d = await openSealed(ens, v.sealed, rname, { ns: ens, name: rname, view });
-      if (d.value && typeof d.value === 'object') Object.assign(v, d.value);
+      // (Not by assignment of "__proto__", which would replace the entry's prototype.)
+      if (d.value && typeof d.value === 'object') for (const k of Object.keys(d.value)) if (k !== '__proto__') v[k] = d.value[k];
       v._opened = hdr.kid;
       if (!other) own = ens;
     } catch (err) { v._sealedErr = err.message; }
@@ -2889,11 +2960,11 @@ async function openSealedEntries(v, view, from, filed) {
     if (k === 'sealed' || !v[k] || typeof v[k] !== 'object') continue;
     if (k === 'nodes' && !isFiled && Array.isArray(v.paths) && !Array.isArray(v[k])) {
       // The nodes of an ancestors or where answer's paths, each filed under its node's name (§B.5).
-      for (const nk of Object.keys(v[k])) await openSealedEntries(v[k][nk], view, undefined, nk);
+      for (const nk of Object.keys(v[k])) await openSealedEntries(v[k][nk], view, undefined, nk, ctx);
       continue;
     }
-    const nested = !Array.isArray(v[k]) && typeof v[k].sealed === 'string' && Object.keys(v[k]).length === 1;
-    await openSealedEntries(v[k], view, nested && (name || typeof v.item === 'string') ? { key: k, ns: own, name, item: v.item, branch } : undefined);
+    const nested = lone(v[k]);
+    await openSealedEntries(v[k], view, nested && (name || typeof v.item === 'string') ? { key: k, ns: own, name, item: v.item, branch } : undefined, undefined, ctx);
   }
 }
 
@@ -3767,7 +3838,7 @@ async function srGet(path, ns) {
     if (d.error) return { r, view, sealedWhole: d };
     body = d.value;
   }
-  if (body && typeof body === 'object') await openSealedEntries(body, view);
+  if (body && typeof body === 'object') await openSealedEntries(body, view, undefined, undefined, { ns, sealed: !r.jose && await sealedLevel(ns) });
   return { r, view, body };
 }
 

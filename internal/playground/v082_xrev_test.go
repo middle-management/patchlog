@@ -165,7 +165,11 @@ func TestV082XrevPlaygroundPreviewFileValue(t *testing.T) {
 			} `json:"file"`
 		} `json:"children"`
 	}
-	runV82(t, []string{"openSealed", "openSealedEntries"}, "", v82XrevKeys+`
+	// The branches' namespace documents name their bases (§7.6): what the
+	// reader confirms a branch by (v082_xrev2_test.go).
+	runV82(t, []string{"openSealed", "nsHeadDoc", "branchBase", "openSealedEntries"}, "", v82XrevKeys+`
+  routes['/ns/cat-r7'] = { status: 200, json: { base: { ns: 'cat', at: '1abcdefghijklmnopqrstuvwxyz234567' } } };
+  routes['/ns/matches-r7'] = { status: 200, json: { base: { ns: 'matches', at: '1abcdefghijklmnopqrstuvwxyz234567' } } };
   const body = input.body;
   await openSealedEntries(body, input.view);
   out.children = body.children;
