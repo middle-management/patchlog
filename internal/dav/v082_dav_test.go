@@ -477,8 +477,14 @@ func TestV082SaveAfterAKept408(t *testing.T) {
 			e.create("cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
 			e = v82With(t, e, rt)
 			var asked atomic.Int64
+			// The namespace the save writes: the tree's files.ns, or the
+			// flat one.
+			ns := "matches"
+			if strings.HasPrefix(path, "/docs/") {
+				ns = "docs"
+			}
 			rt.match.Store(func(q *http.Request) bool {
-				if q.Method == "GET" && strings.HasSuffix(q.URL.Path, "/principal") {
+				if q.Method == "GET" && q.URL.Path == "/ns/"+ns+"/principal" {
 					asked.Add(1)
 					return true
 				}
@@ -659,5 +665,49 @@ func TestV082SaveEveryFailedReadDerived(t *testing.T) {
 	})
 	if reads == 0 {
 		t.Fatal("the PUT read nothing of the core")
+	}
+}
+
+// BT-8 changes saves only: a MKCOL reads the head of the folder node it
+// makes as a new file's save reads its placement node's, and a failed
+// read of it is answered as any request's (§H.4 "Answers"): 502 after
+// the core's 503, 503 with Retry-After after its 408. No folder is made.
+func TestV082MkcolFailedReadUnchanged(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct{ status, want int }{{503, 502}, {408, 503}} {
+		t.Run(strconv.Itoa(c.status), func(t *testing.T) {
+			t.Parallel()
+			rt := &failRT{status: c.status}
+			e := v82With(t, treeEnv(t), rt)
+			e.expect(e.do("PROPFIND", "/cat/Season/", "", "Depth", "1"), 207, "PROPFIND")
+			before := len(e.liveNames("cat"))
+			var hit atomic.Int64
+			rt.match.Store(func(q *http.Request) bool {
+				// The head of a node that isn't there yet: the new
+				// folder's.
+				if q.Method != "GET" || !strings.HasPrefix(q.URL.Path, "/r/cat/") || strings.Count(q.URL.Path, "/") != 3 {
+					return false
+				}
+				switch strings.TrimPrefix(q.URL.Path, "/r/cat/") {
+				case "root", "season", "empty", "matches.derby":
+					return false
+				}
+				hit.Add(1)
+				return true
+			})
+			rt.armed.Store(true)
+			r := e.expect(e.do("MKCOL", "/cat/Season/New", ""), c.want, "MKCOL, its node's head read failing")
+			if hit.Load() == 0 {
+				t.Fatal("the MKCOL didn't read its node's head")
+			}
+			if c.want == 503 && r.header.Get("Retry-After") == "" {
+				t.Fatal("503 without Retry-After")
+			}
+			if got := len(e.liveNames("cat")); got != before {
+				t.Fatalf("the failed MKCOL made a node: %d live, were %d", got, before)
+			}
+			rt.armed.Store(false)
+			e.expect(e.do("MKCOL", "/cat/Season/New", ""), 201, "MKCOL, the core answering")
+		})
 	}
 }
