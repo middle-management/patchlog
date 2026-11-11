@@ -1665,8 +1665,10 @@ function holdRes(kid, resource, key, from) { KEYS.res.set(kid + '\n' + resource,
 
 /* nsInfo returns a namespace's encryption level and (plaintext or decrypted) document. The level is learnt from the
  * current document and held to the highest this browser has learnt (§7.1, Levels; seal.js): an unreadable document
- * teaches nothing, and one naming a lower level is refused, leaving the level held, no document and lowered, why. */
+ * teaches nothing, and one naming a lower level is refused, leaving the level held, no document and lowered, why.
+ * What is no namespace name (§3.6) is never asked for: no level, no document, and refused, why. */
 async function nsInfo(ns) {
+  if (!Z.isNamespaceName(ns)) return { level: '', doc: null, refused: `${JSON.stringify(ns)} is no namespace name (§3.6)` };
   if (!nsInfoCache.has(ns)) {
     const r = await api('GET', `/ns/${ns}`, { auto: true });
     let info = { level: '', doc: null };
@@ -1727,6 +1729,7 @@ async function takeKeys(arr, level) {
 /* keyringKey unwraps an e2e epoch key from the namespace's keyring with this identity, from a sender this browser
  * knows (§E.3.2). Nothing opens from a keyring in the format before v0.63, as in internal/client (v0.78 Legacy). */
 async function keyringKey(ns, epoch) {
+  if (!Z.isNamespaceName(ns)) throw new Error(`${JSON.stringify(ns)} is no namespace name (§3.6): no keyring is asked for`);
   if (!ID) throw new Error('no identity: generate or import one in the Keys tab');
   const r = await api('GET', `/r/${ns}/keyring`, { auto: true, label: 'keyring' });
   if (r.status !== 200 || !r.json) throw new Error(`no keyring in ${ns} (GET answered ${r.status})`);
@@ -1736,8 +1739,13 @@ async function keyringKey(ns, epoch) {
   return key;
 }
 
+/* fetchKeyFor asks for the key of kid, and of resource where it is given: POST /ns/{ns}/keys, then at E3 the keyring.
+ * A kid is whatever a JWE's header says, so its namespace is put into no URL, and resource into no request, unless
+ * each is a name (§3.6). */
 async function fetchKeyFor(kid, resource) {
   const { ns, epoch } = Z.parseKid(kid);
+  if (!Z.isNamespaceName(ns)) throw new Error(`kid ${JSON.stringify(kid)} names no namespace (§3.6): no key is asked for`);
+  if (resource && !Z.isResourceName(resource)) throw new Error(`${JSON.stringify(resource)} is no resource name (§3.6): no key is asked for`);
   const info = await nsInfo(ns);
   const bearer = !!$('bearer').value.trim();
   if (info.level !== 'e2e' || bearer) {
@@ -1769,8 +1777,11 @@ async function epochKey(kid) {
 
 /* contentKey returns the key content of kid is sealed under (§E.2.1): for resource "" the namespace key
  * K_n = HKDF(K_e, "patchlog-e2", ns ‖ "\n") (namespace documents, log ranges, events and grants), else the
- * resource's K_r, fetching K_e or K_r once if needed. */
+ * resource's K_r, fetching K_e or K_r once if needed. For a kid whose namespace is no namespace name, or a resource
+ * that is no resource name (§3.6), there is no key, and nothing is looked up or asked for. */
 async function contentKey(kid, resource) {
+  if (!Z.isNamespaceName(Z.parseKid(kid).ns)) throw new Error(`kid ${JSON.stringify(kid)} names no namespace (§3.6)`);
+  if (resource && !Z.isResourceName(resource)) throw new Error(`${JSON.stringify(resource)} is no resource name (§3.6)`);
   const rk = kid + '\n' + (resource || '');
   if (resource && KEYS.res.has(rk)) return KEYS.res.get(rk);
   if (!KEYS.epoch.has(kid)) {
@@ -1799,6 +1810,7 @@ function nsDocPL(ns, id) {
 async function openSealed(ns, jwe, resource, wantPL) {
   const { header } = Z.parseJWE(jwe);
   const k = Z.parseKid(header.kid);
+  if (!Z.isNamespaceName(k.ns)) throw new Error(`kid ${JSON.stringify(header.kid)} names no namespace (§3.6)`);
   const want = typeof wantPL === 'function' ? wantPL(header) : wantPL;
   const diff = Z.plDiff(header.pl, want);
   const checks = [
@@ -2690,8 +2702,10 @@ async function allHeads(ns, head) {
   }
   return items;
 }
-/* nsHeadDoc reads a namespace document (decrypting a sealed one) and its head. */
+/* nsHeadDoc reads a namespace document (decrypting a sealed one) and its head. What is no namespace name (§3.6) is
+ * not asked for: status 400, as a server answers it. */
 async function nsHeadDoc(ns) {
+  if (!Z.isNamespaceName(ns)) return { status: 400 };
   const r = await api('GET', `/ns/${ns}`, { auto: true, label: 'catalog' });
   if (r.status !== 200) return { status: r.status };
   const head = r.etag() || ((/\/rev\/([^/]+)$/.exec(r.finalPath) || [])[1] || '');
@@ -2840,16 +2854,24 @@ async function treeGet(path) {
 }
 
 /* branchBase is the namespace a local branch ns was created from, the "base" of its namespace document (§7.6), which
- * never changes: "" where ns is no branch, its base is another deployment's (§G.3), or its document can't be read. */
-async function branchBase(ns) {
+ * never changes: "" where ns is no namespace name (nsHeadDoc asks for no such thing) or no branch, its base is
+ * another deployment's (§G.3), or its document can't be read. A document naming a lower encryption level than this browser holds for ns is refused as
+ * nsInfo refuses it (§7.1, Levels): a sealed or e2e namespace's document in the clear is not its document, and
+ * names no base. A base is kept for the page. That there is none is kept in none only, a Set the caller gives for
+ * as long as one answer is read (a namespace may be created, or its document become readable, later), so the
+ * entries of one answer that name the same namespace cost one request. */
+async function branchBase(ns, none) {
   const known = branchBase.known || (branchBase.known = new Map());
-  if (!known.has(ns)) {
-    const d = await nsHeadDoc(ns);
-    const b = d.status === 200 && d.doc && typeof d.doc === 'object' ? d.doc.base : null;
-    if (!b || typeof b !== 'object' || typeof b.ns !== 'string' || b.origin !== undefined) return '';
-    known.set(ns, b.ns);
-  }
-  return known.get(ns);
+  if (known.has(ns)) return known.get(ns);
+  if (none && none.has(ns)) return '';
+  const d = await nsHeadDoc(ns);
+  const doc = d.status === 200 && d.doc && typeof d.doc === 'object' && !Array.isArray(d.doc) ? d.doc : null;
+  // The level the answer names, as nsInfo reads it: a sealed document's is sealed, a clear one's its own word.
+  const lowered = d.status === 200 && Z.learnLevel(ns, d.sealed ? 'sealed' : (doc && doc.encryption && doc.encryption.level) || '').lowered;
+  const b = doc && !lowered ? doc.base : null;
+  if (!b || typeof b !== 'object' || typeof b.ns !== 'string' || b.origin !== undefined) { if (none) none.add(ns); return ''; }
+  known.set(ns, b.ns);
+  return b.ns;
 }
 
 /* sealedLevel says whether ns is sealed or e2e as far as this browser knows: its listings and results then come
@@ -2860,7 +2882,7 @@ async function sealedLevel(ns) {
 }
 
 /* openSealedEntries decrypts per-entry sealed values ("sealed": JWE, pl {ns, name, view}) in place. from is the
- * entry a value of another resource hangs on and the member it is, { key, ns, name, item, branch }, where v is such
+ * entry a value of another resource hangs on and the member it is, { key, ns, of, name, item, branch }, where v is such
  * a value. filed is the node name v is filed under, where v is an entry of the "nodes" map of an ancestors or where
  * answer, { href, sealed } with no name of its own (SERVICES.md §B.5). ctx is what the caller knows of the answer,
  * { ns, sealed }: the namespace its entries are of (the catalog, the namespace searched), and whether that one is
@@ -2874,8 +2896,12 @@ async function sealedLevel(ns) {
  *   stand beside clear hits of other namespaces, where it carries "sealed" itself or ctx says so.
  * - An entry's own value is of ctx.ns, or without one of its href's namespace, or of a branch of it (a release
  *   preview seals a catalog's entries under its branch, §B.5 Previews): never of whatever namespace its kid names.
+ *   So is a value of another resource that stands for the entry's own (a born of another epoch), whether or not
+ *   the entry's own value is there and opened; and a { "sealed" } alone that hangs on no entry is of ctx.ns or a
+ *   branch of it. With no namespace to compare a kid with, the value isn't opened.
  * - A "branch" an entry names beside its item counts only where it is a branch of the item's namespace.
- * A namespace is a branch of another where its own namespace document names that one as its base (branchBase). */
+ * A namespace is a branch of another where its own namespace document names that one as its base (branchBase).
+ * No kid's namespace and no pl's name is asked about, or for a key, unless it is a name (§3.6). */
 async function openSealedEntries(v, view, from, filed, ctx) {
   const lone = (x) => !!x && typeof x === 'object' && !Array.isArray(x) && typeof x.sealed === 'string' && Object.keys(x).length === 1;
   if (!ctx || ctx.perEntry === undefined) {
@@ -2888,12 +2914,15 @@ async function openSealedEntries(v, view, from, filed, ctx) {
         ? Object.keys(x[k]).some((n) => scan(x[k][n], true)) : scan(x[k])));
     };
     const ns = ctx && typeof ctx.ns === 'string' ? ctx.ns : '', sealed = !!(ctx && ctx.sealed);
-    ctx = { ns, sealed, perEntry: sealed || scan(v) };
+    // notBranch: the namespaces found to be no branch while this answer is read (branchBase).
+    ctx = { ns, sealed, perEntry: sealed || scan(v), notBranch: new Set() };
   }
   if (Array.isArray(v)) { for (const x of v) await openSealedEntries(x, view, undefined, undefined, ctx); return; }
   if (!v || typeof v !== 'object') return;
   const isFiled = typeof filed === 'string' && filed !== '';
-  const isBranch = async (b, base) => /^[a-z0-9][a-z0-9_-]*$/.test(b) && (await branchBase(b)) === base;
+  const isBranch = async (b, base) => !!base && (await branchBase(b, ctx.notBranch)) === base;
+  // The namespace the entry v is of: the answer's, or the one its href names where the caller gave none.
+  const entryNS = (e) => ctx.ns || (/^\/r\/([^/]+)\//.exec(e && typeof e.href === 'string' ? e.href : '') || [])[1] || '';
   // An entry names its resource "name" (the tree service) or "resource" (the index's hits); one of a "nodes" map
   // is named by its key, which a name of its own must agree with.
   const named = typeof v.name === 'string' ? v.name : typeof v.resource === 'string' ? v.resource : '';
@@ -2910,17 +2939,18 @@ async function openSealedEntries(v, view, from, filed, ctx) {
     try {
       const hdr = Z.parseJWE(v.sealed).header;
       const ens = Z.parseKid(hdr.kid).ns;
+      if (!Z.isNamespaceName(ens)) throw new Error(`a sealed value whose kid, ${JSON.stringify(hdr.kid)}, names no namespace (§3.6)`);
       // The view key of the entry's resource's K_r (SERVICES.md §E.2.6). The tree service names its entries "name",
       // the index its hits "resource"; a value of another resource, { "sealed" } alone, names that one in its pl.
       const other = !isFiled && Object.keys(v).length === 1;
       const rname = other ? (hdr.pl || {}).name : isFiled ? filed : v.name !== undefined ? v.name : v.resource;
       if (typeof rname !== 'string' || !rname) throw new Error('a sealed value that names no resource');
+      if (!Z.isResourceName(rname)) throw new Error(`a sealed value of ${JSON.stringify(rname)}, which is no resource name (§3.6)`);
       if (isFiled && named && named !== filed) throw new Error(`an entry named ${named}, filed under ${filed} in nodes`);
       if (!other) {
         // The entry's own value: of the namespace the answer is of, or of the one its href names where the caller
         // gave none, or of a branch of that one. With neither there is nothing to compare its kid with.
-        const href = /^\/r\/([^/]+)\//.exec(typeof v.href === 'string' ? v.href : '');
-        const want = ctx.ns || (href ? href[1] : '');
+        const want = entryNS(v);
         if (want && ens !== want && !(await isBranch(ens, want))) {
           throw new Error(`a value sealed for namespace ${ens} in an entry of ${want}, which ${ens} isn't known to be a branch of (§E.2.6)`);
         }
@@ -2928,16 +2958,25 @@ async function openSealedEntries(v, view, from, filed, ctx) {
       // A reader compares that pl's ns and name with the resource the entry draws the value from, where the entry
       // names it (§E.2.6 Values of another resource): its own resource, for a value of another epoch such as
       // born, or a placement's item, "/r/{ns}/{name}", for one drawn from it such as file.
+      if (other && !from) {
+        // A value that hangs on no entry (an element of an array, a member of what has neither name nor item):
+        // there is no resource to compare its pl with, so it is at least of the namespace the answer is of.
+        if (!ctx.ns || (ens !== ctx.ns && !(await isBranch(ens, ctx.ns)))) {
+          throw new Error(`a sealed value of ${ens}/${rname} on no entry` + (ctx.ns ? `, in an answer of ${ctx.ns}, which ${ens} isn't known to be a branch of` : ', in an answer of no known namespace') + ' (§E.2.6)');
+        }
+      }
       if (other && from) {
         const item = /^\/r\/([^/]+)\/(.+)$/.exec(typeof from.item === 'string' ? from.item : '');
-        const fromOwn = !!from.name && rname === from.name && (!from.ns || ens === from.ns);
+        // The entry's own namespace: the one its own sealed value opened under, else, that value being absent or
+        // unopened, the one the entry is of (from.of), or a branch of that one. With neither it is nobody's own.
+        const fromOwn = !!from.name && rname === from.name && (from.ns ? ens === from.ns : !!from.of && (ens === from.of || await isBranch(ens, from.of)));
         // In a release preview the item is read in the release's branch of its namespace, which the entry names
         // in "branch" (§B.5 Previews): the value is that branch's resource, and never the base's.
         const itemNS = item ? from.branch || item[1] : '';
         const fromItem = !!item && ens === itemNS && rname === item[2];
         // born is the entry's own; any other value is its own or its item's, where the entry names an item.
         if (from.key === 'born' && from.name ? !fromOwn : item && !fromOwn && !fromItem) {
-          throw new Error(`a sealed value of ${ens}/${rname}, which isn't the resource its entry draws it from (${[from.name ? (from.ns ? from.ns + '/' : '') + from.name : '', item && from.key !== 'born' ? itemNS + '/' + item[2] : ''].filter(Boolean).join(' or ')}) (§E.2.6)`);
+          throw new Error(`a sealed value of ${ens}/${rname}, which isn't the resource its entry draws it from (${[from.name ? (from.ns || from.of ? (from.ns || from.of) + '/' : '') + from.name : '', item && from.key !== 'born' ? itemNS + '/' + item[2] : ''].filter(Boolean).join(' or ')}) (§E.2.6)`);
         }
         // "branch" is the service's word, in the clear: it stands for the item's namespace only where that
         // namespace's own document says it is a branch of it. Otherwise any namespace's value would pass as the item's.
@@ -2964,7 +3003,7 @@ async function openSealedEntries(v, view, from, filed, ctx) {
       continue;
     }
     const nested = lone(v[k]);
-    await openSealedEntries(v[k], view, nested && (name || typeof v.item === 'string') ? { key: k, ns: own, name, item: v.item, branch } : undefined, undefined, ctx);
+    await openSealedEntries(v[k], view, nested && (name || typeof v.item === 'string') ? { key: k, ns: own, of: entryNS(v), name, item: v.item, branch } : undefined, undefined, ctx);
   }
 }
 

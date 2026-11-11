@@ -301,6 +301,12 @@ function parseKid(k) {
   return { ns: k.slice(0, i), epoch: Number(e) };
 }
 
+/* isNamespaceName and isResourceName say whether v is a namespace or a resource name (SPEC §3.6). A name goes into
+ * a URL verbatim (a percent-escape is a 400), so what isn't one is never put there: a kid, a pl and an href are a
+ * server's or a service's words, and "a/../../r/x/y?" in the place of a namespace would be a request elsewhere. */
+function isNamespaceName(v) { return typeof v === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(v); }
+function isResourceName(v) { return typeof v === 'string' && /^[a-z0-9][a-z0-9._-]{0,127}$/.test(v); }
+
 /* ---------------- JWE ---------------- */
 function parseJWE(jwe) {
   const parts = typeof jwe === 'string' ? jwe.trim().split('.') : [];
@@ -910,6 +916,7 @@ root.PLSeal = {
   isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2ForWrite, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,
   parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,
   applyPatch, validate, selfTest,
+  isNamespaceName, isResourceName,
   LEVEL_RANK, levelRank, heldLevel, learnLevel, expectLevel, forgetLevel, levelOver, keysLevel,
   SEAL_BOUND, SealCounter,
 };
