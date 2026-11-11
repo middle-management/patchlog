@@ -130,7 +130,9 @@ func gsRecordOf(fv *fview, exp int64) *gsRecord {
 //     than the stored one, counts as differing), or where that key's
 //     entry or one of those roles' definitions differs there in any
 //     member from the one recorded at the exchange (gsEntryDigest,
-//     v0.82); 403 where it holds
+//     v0.82), or where the cookie expires no later than those issued
+//     before an exchange replaced that record (entryAfter), so that
+//     another reader's exchange revives none; 403 where it holds
 //     "partial", a set stored before v0.78 that leaves groups out, which
 //     no gs does now (§B.11.5, §B.11.9 gs), whatever the catalogs decide;
 //     otherwise item 1 from the stored subjects and item 2 from the
@@ -176,6 +178,13 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 		return nil, apiErr(401, "unauthenticated", "message", "unknown subject set: exchange the grant again (§B.11.9)")
 	}
 	if !t.gsDigestHolds(n, cp, rec) {
+		return nil, forbidden("the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)")
+	}
+	// A cookie from before an exchange replaced the row's entry digest,
+	// or one that can't be told from such a one, stays ended whoever
+	// exchanged since (recordFilteredGS). A cookie for /ns/{ns} is held
+	// to it as a cookie for urlGS would be.
+	if rec.entryAfter > 0 && (eg.Exp.IsZero() || eg.Exp.Unix() <= rec.entryAfter) {
 		return nil, forbidden("the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)")
 	}
 	if rec.partial || slices.Contains(rec.subjects, catvis.Partial) {

@@ -50,7 +50,10 @@ func TestV082AccessGSCookieEndsOnKeyChange(t *testing.T) {
 			t.Errorf("%s under the old cookie: %d %s, want 403", path, r.Code, r.Body)
 		}
 	}
-	// Her grant still verifies: she exchanges again, for the same gs.
+	// Her grant still verifies: she exchanges again, for the same gs. The
+	// new cookie expires later than the one the change ended, which is
+	// how the origin tells them apart.
+	w.clock.Advance(time.Second)
 	c2, gs2 := w.cookie(w.li())
 	if gs2 != gs {
 		t.Fatalf("gs after the change %s, was %s", gs2, gs)
@@ -61,5 +64,10 @@ func TestV082AccessGSCookieEndsOnKeyChange(t *testing.T) {
 	expect(t, r, 200)
 	if names := headNames(t, r); len(names) != 1 || names[0] != "derby" {
 		t.Fatalf("after exchanging again: %v", names)
+	}
+	// The cookie the change ended stays ended: only a later exchange's
+	// cookie reads.
+	if r := w.do(req{method: "GET", path: base + "/heads", hdr: ck}); r.Code != 403 {
+		t.Errorf("the old cookie after the new exchange: %d %s, want 403", r.Code, r.Body)
 	}
 }
