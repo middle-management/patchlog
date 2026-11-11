@@ -544,3 +544,13 @@ func (c *Client) openRange(ctx context.Context, ns, since, to, jwe string) (any,
 	}
 	return jsonv.Parse(pt)
 }
+
+// openNSEvent decrypts a sealed namespace event for the entry with id id
+// (§E.2.2, §7.3): under K_n, pl exactly {ns, event: id}.
+func (c *Client) openNSEvent(ctx context.Context, ns, id, jwe string) (any, error) {
+	pt, err := c.open(ctx, ns, "", jwe, fixedPL(seal.NamespaceEventPL(ns, id)))
+	if err != nil {
+		return nil, err
+	}
+	return jsonv.Parse(pt)
+}

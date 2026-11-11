@@ -564,14 +564,14 @@ func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain fu
 	return j
 }
 
-// eventJob prepares the sealing of n's namespace event for entry id after
-// prev: its plaintext is the entry itself (canonical JSON), under K_n of
-// the current epoch with pl {ns, range: [prev, id]} (§E.2.2). It is
-// sealed at each serve and never stored: it would share its row with the
-// one-entry range (prev, id], whose plaintext is [entry].
-func (t *tx) eventJob(n *nsRow, prev, id string, entry []byte) *sealJob {
+// eventJob prepares the sealing of n's namespace event for entry id: its
+// plaintext is the entry itself (canonical JSON), under K_n of the
+// current epoch with its own pl, {ns, event: id} (§E.2.2, §7.3), so it
+// can't be replayed as a range. It is sealed again, with fresh bytes, at
+// each serve and never stored, and each sealing is counted (§E.2.1).
+func (t *tx) eventJob(n *nsRow, id string, entry []byte) *sealJob {
 	e := t.config(n.configSeq).Epoch
-	return &sealJob{kid: seal.Kid(n.name, e), k: t.namespaceKey(n, e), pl: seal.RangePL(n.name, prev, id), plain: entry, pad: t.config(n.configSeq).Pad}
+	return &sealJob{kid: seal.Kid(n.name, e), k: t.namespaceKey(n, e), pl: seal.NamespaceEventPL(n.name, id), plain: entry, pad: t.config(n.configSeq).Pad}
 }
 
 // storeSeal is finishSeal for one job inside this write transaction: it

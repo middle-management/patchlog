@@ -40,12 +40,12 @@ func sseServer(t *testing.T, path string, events [][3]string) *httptest.Server {
 }
 
 // KEYS-6 = BYTES-3 (§E.2.2: "a namespace event's [plaintext] is its one
-// entry"): a sealed namespace event is canonical(entry), bound to the
-// range [prev, id] of its one entry, and NSEvents parses it as the entry;
-// the one-element range the reference sealed before v0.81 is refused. The
-// key is the one the client opens namespace content with (Keys.cached for
-// resource "": K_e before the K_n change, K_n after it), so the test holds
-// on either side of it.
+// entry"): a sealed namespace event is canonical(entry) under K_n with
+// its own pl, {ns, event: id} (v0.82), and NSEvents parses it as the
+// entry. The range form of v0.81, {ns, range: [prev, id]}, is refused,
+// whatever its plaintext, and so is the one-element range as plaintext.
+// The key is the one the client opens namespace content with
+// (Keys.cached for resource "").
 func TestV081NamespaceEventIsTheEntry(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -57,13 +57,14 @@ func TestV081NamespaceEventIsTheEntry(t *testing.T) {
 	entry := func(id, prev string) map[string]any {
 		return map[string]any{"id": id, "prev": prev, "kind": "head", "resource": "a", "target": ids.Revision(nil, []byte("t"+id)).String(), "author": "x", "created": "2026-01-01T00:00:00.000Z"}
 	}
-	sealEv := func(prev, id string, plain any) string {
-		jwe, err := seal.Seal(kn, "s#1", seal.RangePL("s", prev, id), jsonv.Canonical(jsonv.FromGo(plain)))
+	sealPL := func(pl seal.PL, plain any) string {
+		jwe, err := seal.Seal(kn, "s#1", pl, jsonv.Canonical(jsonv.FromGo(plain)))
 		if err != nil {
 			t.Fatal(err)
 		}
 		return jwe
 	}
+	sealEv := func(id string, plain any) string { return sealPL(seal.NamespaceEventPL("s", id), plain) }
 	read := func(events [][3]string) ([]NSEntry, error) {
 		srv := sseServer(t, "/ns/s/events", events)
 		c, err := New(srv.URL, WithKeys(keys))
@@ -75,19 +76,36 @@ func TestV081NamespaceEventIsTheEntry(t *testing.T) {
 		return got, err
 	}
 	got, err := read([][3]string{
-		{"", id1, sealEv("", id1, entry(id1, ""))},
-		{"", id2, sealEv(id1, id2, entry(id2, id1))},
+		{"", id1, sealEv(id1, entry(id1, ""))},
+		{"", id2, sealEv(id2, entry(id2, id1))},
 	})
 	if err != nil || len(got) != 2 || got[0].ID != id1 || got[1].ID != id2 || got[1].Prev != id1 || got[1].Resource != "a" {
 		t.Fatalf("sealed entry objects: %+v %v", got, err)
 	}
 	// The one-element range form is not an event's plaintext.
-	if _, err := read([][3]string{{"", id1, sealEv("", id1, []any{entry(id1, "")})}}); !errors.Is(err, seal.ErrMismatch) {
+	if _, err := read([][3]string{{"", id1, sealEv(id1, []any{entry(id1, "")})}}); !errors.Is(err, seal.ErrMismatch) {
 		t.Fatalf("a one-element range as an event: %v", err)
 	}
-	// An event bound to another range is refused.
-	if _, err := read([][3]string{{"", id2, sealEv("", id1, entry(id2, id1))}}); err == nil {
-		t.Fatal("an event sealed for another range opened")
+	// v0.81's pl, the range [prev, id], is refused: with the entry and
+	// with the range's own plaintext, the first event and a later one.
+	for _, ev := range [][3]string{
+		{"", id1, sealPL(seal.RangePL("s", "", id1), entry(id1, ""))},
+		{"", id1, sealPL(seal.RangePL("s", "", id1), []any{entry(id1, "")})},
+	} {
+		if got, err := read([][3]string{ev}); !errors.Is(err, seal.ErrMismatch) || len(got) != 0 {
+			t.Fatalf("an event under a range's pl: %+v %v", got, err)
+		}
+	}
+	if got, err := read([][3]string{{"", id1, sealEv(id1, entry(id1, ""))}, {"", id2, sealPL(seal.RangePL("s", id1, id2), entry(id2, id1))}}); !errors.Is(err, seal.ErrMismatch) || len(got) != 1 {
+		t.Fatalf("a later event under a range's pl: %+v %v", got, err)
+	}
+	// An event bound to another entry is refused, and one whose entry
+	// isn't the one its pl names.
+	if _, err := read([][3]string{{"", id2, sealEv(id1, entry(id2, id1))}}); !errors.Is(err, seal.ErrMismatch) {
+		t.Fatalf("an event sealed for another entry: %v", err)
+	}
+	if _, err := read([][3]string{{"", id2, sealEv(id2, entry(id1, ""))}}); !errors.Is(err, seal.ErrMismatch) {
+		t.Fatalf("an event carrying another entry: %v", err)
 	}
 }
 

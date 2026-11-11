@@ -277,7 +277,8 @@ type Rev struct {
 	// folds the log from Last, else Horizon, else genesis.
 	Snapshot bool
 	// Last is, with a not_offered 404, the parent of the resource's
-	// horizon where that horizon is a tombstone (§7.1).
+	// horizon where that horizon is a tombstone, and with a tombstone's
+	// 410 (Code "tombstone") that tombstone's parent (§7.1).
 	Last string
 	// Referrer is set for a schema revision served under schemaReads to a
 	// reader of a referrer (§6.1). The grant is in Authorization and no
@@ -371,7 +372,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			return nil
 		}
 		if row.kind == kindTombstone {
-			out.Status, out.Code = 410, "tombstone"
+			t.tombstoneRev(row, out)
 			return nil
 		}
 		b, err := t.docBytesAt(row)
@@ -425,9 +426,22 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 	return out, err
 }
 
+// tombstoneRev answers GET /r/{ns}/{name}/rev/{id} for row, a tombstone,
+// after the read check (§7.1): 410 with last, its parent, at every level
+// and below a horizon too, where a prune keeps the row and its parent's
+// id. A row without a parent, which no write stores, answers without
+// last, never a guessed id.
+func (t *tx) tombstoneRev(row *revRow, out *Rev) {
+	out.Status, out.Code = 410, "tombstone"
+	if row.parentSeq.Valid {
+		out.Last = t.revID(row.parentSeq.Int64).String()
+	}
+}
+
 // e3Rev answers GET /r/{ns}/{name}/rev/{id} for row, a revision of an
 // e2e resource other than the keyring as n sees it (§7.1 End-to-end
-// namespaces), after the read check: a tombstone is 410; a prune's stored
+// namespaces), after the read check: a tombstone is 410 with last, its
+// parent (tombstoneRev); a prune's stored
 // snapshot that stands for row is 200 application/jose, at the horizon
 // or, at a tombstone horizon, at its parent (§E.3.1), a base's included
 // in a branch (§7.6); a revision below the horizon is 410 pruned; any
@@ -439,7 +453,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 // 4).
 func (t *tx) e3Rev(n *nsRow, row *revRow, out *Rev) {
 	if row.kind == kindTombstone {
-		out.Status, out.Code = 410, "tombstone"
+		t.tombstoneRev(row, out)
 		return
 	}
 	pruned := func() {
@@ -520,8 +534,8 @@ type Log struct {
 	Entries []map[string]any
 	// Sealed namespaces (Addendum E.2) serve JWEs instead of Entries:
 	// resource logs one per entry (EntryJWEs); namespace logs one for the
-	// whole range (Range), and for event streams one per entry covering
-	// (prev, id] (EntryJWEs). Entries stay set, for the metadata a
+	// whole range (Range), and for event streams one per entry, with the
+	// event's own pl (EntryJWEs). Entries stay set, for the metadata a
 	// response carries in the clear (ids, event types), and must not be
 	// served.
 	Sealed    bool
@@ -770,8 +784,8 @@ func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit
 
 // NamespaceEvents is NamespaceLog from the current head for event streams,
 // at most limit entries (0: all) with More set when there are more: in a
-// sealed namespace each entry is sealed on its own, as the range (prev, id]
-// (EntryJWEs).
+// sealed namespace each entry is sealed on its own, with the event's pl,
+// {ns, event: id} (EntryJWEs, §E.2.2).
 func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit int, cred Credentials) (*Log, error) {
 	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, "", nil)
 }
@@ -925,13 +939,11 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		if t.isSealedNS(n) {
 			out.Sealed, nsRowID = true, n.id
 			if perEntry {
-				// A namespace event is its one entry, sealed as the range
-				// (prev, id] under K_n of the current epoch (§E.2.2), and
-				// never stored: it shares its pl with the one-entry range,
-				// whose plaintext is the array [entry] (eventJob).
+				// A namespace event is its one entry, sealed under K_n of
+				// the current epoch with pl {ns, event: id} (§E.2.2), and
+				// never stored (eventJob).
 				for _, m := range out.Entries {
-					prev, _ := m["prev"].(string)
-					jobs = append(jobs, t.eventJob(n, prev, m["id"].(string), jsonv.Canonical(m)))
+					jobs = append(jobs, t.eventJob(n, m["id"].(string), jsonv.Canonical(m)))
 				}
 			} else if len(rs) > 0 || nsID != "" {
 				// A range, even an empty one, is sealed as a whole, with

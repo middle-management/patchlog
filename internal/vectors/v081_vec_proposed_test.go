@@ -920,14 +920,15 @@ func TestV081ProposedSealedServed(t *testing.T) {
 	if pt := open("the empty page", string(get("/ns/demo/rev/"+h.ID+"/log?since="+h.ID)), kn, seal.RangePL("demo", h.ID, h.ID)); string(pt) != "[]" {
 		t.Errorf("the empty page: %s, want []", pt)
 	}
-	// A namespace event: its one entry, under K_n, bound as [prev, id].
+	// A namespace event: its one entry, under K_n, with its own pl,
+	// {ns, event: id} (§E.2.2, v0.82).
 	last := entries[len(entries)-1].(map[string]any)
 	prev := last["prev"].(string)
 	id, data := stream("/ns/demo/events", prev)()
 	if id != last["id"] {
 		t.Fatalf("the event after %s is %s, want %v", prev, id, last["id"])
 	}
-	if pt := open("a namespace event", data, kn, seal.RangePL("demo", prev, id)); !bytes.Equal(pt, jsonv.Canonical(last)) {
+	if pt := open("a namespace event", data, kn, seal.NamespaceEventPL("demo", id)); !bytes.Equal(pt, jsonv.Canonical(last)) {
 		t.Errorf("the namespace event is\n%s\nthe range's entry\n%s", pt, jsonv.Canonical(last))
 	}
 	// Resource events under K_r: the purge and prune entries without id
