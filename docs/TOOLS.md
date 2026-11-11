@@ -1,6 +1,6 @@
 # Patch Log — Tools
 
-Status: draft v0.81 · 2026-11-10. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.82 · 2026-11-10. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Clients and tools that use the protocol's public API. A server needs nothing from this document.
 
@@ -20,6 +20,7 @@ Status: draft v0.81 · 2026-11-10. A companion to the [Patch Log specification](
 - **submit(patches):** `PATCH` with `If-Match: "{head}"`, then apply the returned revision. On `412`, `sync(body.head)` and resend the same patches, re-sealed at E3 (§E.3.1) and re-signed if signed (§C.3.1): this is the rebase. Surface `422` and `403` errors; retry a bounded number of times.
 - **Conflict safety:** prefix a set that must not land on changed data with `test` ops of the values seen. A retry on changed data then fails with `422`. At E3, where the server applies nothing (§6.2), it fails instead when the client applies it to the new head before re-sealing.
 - **watch:** SSE from `since={head}`, or long-poll (§7.7). De-duplicate by entry id: the client's own writes echo back.
+- **Filtered logs:** a client library hands a filtered log (§B.11.9) only to a caller that asked for one.
 - **Deleted resources:** a `410` on the head means deleted.
   - A `successor` (§8.1) means the resource moved: offer it as a link. Follow it automatically only into a namespace the client already trusts (a catalog grants nothing there).
   - In sealed and end-to-end namespaces read `$successor` from the document at `last` instead.
@@ -179,7 +180,7 @@ A merge is **one batch into the base**, built from the branch's changes:
 
       Removing an author withdraws its earlier batches, so a retired `kid` stays listed while branches it merged may merge again or await cleanup. Changing `/merge` needs a `*` key (§7.4). Other merges, such as an editor's by hand, aren't tracked, so such a branch should be rebased (§F.5) before it is merged again. The merger's dry-run report lists, per resource, which batch and author its pair came from.
 
-- **Blobs.** A merger with unrestricted `read` on the branch copies nothing within the deployment, as the batch's `source` makes the branch's blobs available (§7.8). Any other merger copies them first, or uploads them where the ranks refuse a copy (§2.1), and a merge from another deployment uploads them (§G.3).
+- **Blobs.** A merger with unrestricted `read` on the branch copies nothing within the deployment, as the batch's `source` makes the branch's blobs available (§7.8). Any other merger copies them first, or uploads them where the ranks refuse a copy (§2.1), and a merge from another deployment uploads them (§G.3). At E3, a resource whose document references a blob that can't be declared, of another type or with a nonce (§E.3.1), gets no item: the merger reports it and offers it again.
 - **Nonces.** Tools that diff documents for a merge or a review leave out a fresh `$nonce`, as `writes` do (§6.4.1).
 - **Conflicts inside arrays.** For merge and rebase, a write whose last segment indexes an array counts as one to the whole outermost array holding it.
 - **Configuration is never merged implicitly.** A config change meant for the base goes in the batch's `config`.
@@ -201,7 +202,7 @@ To bring `release-7` up to date with `matches`:
 2.  **Replay** `release-7`'s changes into it with batches carrying `source: { ns: "release-7", at }`, classified as in §F.3 but against the new branch. Resources that `matches` didn't change since the old `at` fast-forward and keep the **same ids**, except at E3 (§F.8.1).
 3.  **Resuming.** When replaying resumes, batches in the successor without `origin` whose `source.ns` is the old branch count as earlier merges (§F.3), whoever wrote them, even without `merge.authors`; the janitor counts fewer (§F.6).
 4.  **Resolve** conflicts, over as many batches and people as it takes; the old branch keeps working meanwhile.
-5.  **Switch** with one config write on the old branch: `"frozen": true, "successor": "release-7-b"`. Switch once the replay has recorded every resource the old branch changed up to the replay's latest `source.at`, other than those §F.6 excepts, or a person has given up the rest. Then replay whatever the old branch received after step 2, reporting what it leaves unmerged.
+5.  **Switch** with one config write on the old branch: `"frozen": true, "successor": "release-7-b"`. Switch once the replay has recorded every resource the old branch changed up to the replay's latest `source.at`, other than those §F.6 excepts, or a person has given up the rest. Then replay whatever the old branch received after step 2, reporting what it leaves unmerged. A give-up is recorded nowhere: the janitor then doesn't purge the old branch as superseded (§F.6), and a later replay may still take the rest (step 3).
 
 - **Editors** of the old branch get `409 frozen` with the successor (§8.4), reload from it and replay their pending sets, as on `412` (§11).
 - **The old generation stays readable:** reviewing a rebase is a diff between two namespaces, and every earlier link still works.
@@ -289,7 +290,7 @@ To bring `release-7` up to date with `matches`:
 
     The catalog base lists each such admin in `merge.authors`, so the batch counts as a merge.
   - A catalog branch in a release previews against the release's content branches (§B.5), and is merged in two batches around the content (§F.9).
-  - **Filtered reads** (§B.11.9) don't cover branches, so collaborators get unrestricted `read` on every branch of the release, as previews need (§B.5). Draft placements live in a catalog branch listed with the content branch in the release (§F.9), never in the catalog base; a release that only edits existing documents needs none, and a catalog branch can join it later, from the catalog's current head.
+  - **Filtered reads** (§B.11.9) don't cover branches, so collaborators who read the base unrestricted get unrestricted `read` on every branch of the release, as previews need (§B.5). A branch reads through all of its base, so other collaborators get grants fixed to the resources their base grants cover, as editors do (first bullet), and can't view previews (§B.5). Draft placements live in a catalog branch listed with the content branch in the release (§F.9), never in the catalog base; a release that only edits existing documents needs none, and a catalog branch can join it later, from the catalog's current head.
 - **Indexes (Addendum A).** Search over a branch is a separate preview index (§10, Branches); the main index follows only the base.
 
 ### F.8.1 Merging and rebasing at E3
@@ -616,7 +617,7 @@ A save follows §11.3, with these specifics:
   - A tag naming a revision where the path holds no file is `412`, not a create.
   - A tag naming a revision of a flat resource another user has since deleted is `409`.
 
-  - An unknown revision is `412`. A pruned one is `409`, asking for a reload, as are a recorded base below a horizon and a pruned range between base and head. A failed read (`408`, `429`, `5xx`) fails the save (`503`, `502`); the head is never taken as the base instead.
+  - An unknown revision is `412`. A pruned one is `409`, asking for a reload, as are a recorded base below a horizon and a pruned range between base and head. A failed read (`408`, `429`, `5xx`) of anything the save decides by, `theirs` and the user's own entries included, fails the save: `503` with `Retry-After` after a `429` or `503`, else `502`. The head is never taken as the base instead.
   - **Records.** Without a tag, a gateway MAY keep, per user (§H.7) and path, the revisions it served that user in full and those it wrote for them, with the item each path named when last read whole or written.
     - A `304`, `HEAD` or `PROPFIND` records nothing, and a save that changed nothing isn't a write.
     - Records outlive sessions, for a day, and a path whose records expired counts as evicted.
@@ -684,6 +685,8 @@ A save follows §11.3, with these specifics:
 - **Across trees or namespaces:** when the item itself goes to another namespace, its last revision before the tombstone carries `$successor` (§8.1); a JSON file whose root isn't an object can't, and moves without one.
 - **Copy:** a new item with the source's current content, and a placement for it. A `COPY` onto an existing file (`Overwrite: T`) is instead a save into it, as for a move onto it.
   - A folder is copied, or moved to another tree, as a new folder node as `MKCOL` makes one, titled with the destination's last segment, without the source's `$access` (§B.11.3). Its visible children are then copied or moved into it one by one (`Depth: 0` copies the folder alone), and a moved folder is deleted once empty.
+  - A copy into the folder itself or a descendant of it is `403`. This is judged by the ancestry the user sees: the node documents, or for a grant that can't read them the tree service's `ancestors` (§B.5), `403` too where that reports a cut (`tooDeep` or `truncated`).
+  - A gateway MAY refuse (`403`) to copy a folder that carries, sits under or holds `$access`, as a stricter policy (§B.11.4 Copies).
   - A failure part-way leaves what was done, with no rollback, and is answered as that child's request would be.
   - A raw file's blob is copied with `Blob-From` where §7.8 allows it. Otherwise its bytes are uploaded again: decrypted with the reference's key from an `e2e` source, and encrypted under a fresh key, with a new id, into an `e2e` target (§E.3.1).
 
