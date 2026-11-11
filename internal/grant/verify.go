@@ -136,6 +136,10 @@ type Verified struct {
 	roles Roles
 }
 
+// RequireAtRefusal is the message of the 403 for an at that the chain a
+// requireAt key names, read, rejects (§C.4): the same for every cause.
+const RequireAtRefusal = "at rejected by requireAt"
+
 // Verify checks a decoded grant against the configuration in force (§C.2,
 // §C.4), in the order of §C.2: first that every block carrying ns names
 // env.NS (403, before anything is verified), then the signature chain,
@@ -195,9 +199,11 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 		return nil, unauth(`only operator grants may name "*" in ns`)
 	}
 
-	// Key scope. Only the root block's can is the issuer's (§C.4): a
-	// narrowing block's verbs outside the key's can narrow nothing more,
-	// since verbs are intersected below (§C.1).
+	// Key scope, its parts in the order can, sub, maxTtl, groups, roles,
+	// attrs, requireAt and maxLag, then readScope, the first that fails
+	// giving the answer (§C.2 item 3). Only the root block's can is the
+	// issuer's (§C.4): a narrowing block's verbs outside the key's can
+	// narrow nothing more, since verbs are intersected below (§C.1).
 	star := key.IsStar()
 	if !star {
 		for _, c := range root.Can {
@@ -205,6 +211,9 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 				return nil, forbid("key %q may not grant %q", key.Kid, c)
 			}
 		}
+	}
+	if key.SubPattern != nil && !key.SubPattern.MatchString(root.Sub) {
+		return nil, forbid("sub %q not allowed by key %q", root.Sub, key.Kid)
 	}
 	if key.MaxTTL != nil {
 		// The root block's remaining lifetime, exp − max(now, nbf): a
@@ -217,9 +226,6 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 		if root.Exp.Sub(start) > *key.MaxTTL {
 			return nil, forbid("grant lifetime exceeds key maxTtl")
 		}
-	}
-	if key.SubPattern != nil && !key.SubPattern.MatchString(root.Sub) {
-		return nil, forbid("sub %q not allowed by key %q", root.Sub, key.Kid)
 	}
 	if ok, v := key.Groups.Permits(root.Groups); !ok {
 		return nil, forbid("group %q not allowed by key %q", v, key.Kid)
@@ -251,7 +257,12 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 			if errors.As(err, &cu) {
 				return nil, err
 			}
-			return nil, forbid("at rejected: %v", err)
+			// One text, whatever a readable chain rejected at for (not
+			// in it, not its head within maxLag): the refusal names no
+			// namespace and carries none of the checker's detail, since
+			// the chain a key names may be one the caller can't see
+			// (§C.4, §C.5.2).
+			return nil, forbid(RequireAtRefusal)
 		}
 	}
 
