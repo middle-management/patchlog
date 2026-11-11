@@ -22,8 +22,10 @@ import (
 // the core's 429 or 503, else 502. Never 409, and never a save that takes
 // someone else's entry for the user's own.
 
-// v82Failed are the core's failures and what a save answers for each.
-var v82Failed = []struct{ status, want int }{{408, 502}, {429, 503}, {500, 502}, {503, 503}}
+// v82Failed are the core's failures and what a save answers for each;
+// status 0 is no answer in time (failRT), which stays 503 with
+// Retry-After.
+var v82Failed = []struct{ status, want int }{{408, 502}, {429, 503}, {500, 502}, {503, 503}, {0, 503}}
 
 // v82ExpectFailed checks a save's answer to a failed read.
 func v82ExpectFailed(t *testing.T, e *env, r resp, want int, what string) {

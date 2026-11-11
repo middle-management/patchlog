@@ -86,6 +86,15 @@ func v82Disagreeing(t *testing.T) map[string]struct {
 		t.Fatalf("the control bundle: %v", err)
 	}
 	otherStored := storedBlocks(t, other)[0]
+	// The line's own stored block with its grant_block spelled otherwise:
+	// the same root, two members in another order, the same length (so
+	// the block's framing holds). Not canonical(root) byte for byte.
+	raw := must(b64u.DecodeString(storedBlocks(t, g)[0]))
+	canon := `"kid":"ns-key","ns":["matches"]`
+	if bytes.Count(raw, []byte(canon)) != 1 {
+		t.Fatalf("the stored block doesn't hold its grant_block as written: %q", raw)
+	}
+	respelled := b64u.EncodeToString(bytes.Replace(raw, []byte(canon), []byte(`"ns":["matches"],"kid":"ns-key"`), 1))
 	return map[string]struct {
 		b    []byte
 		want string
@@ -107,6 +116,8 @@ func v82Disagreeing(t *testing.T) map[string]struct {
 		"another stored block, array form": {v82EditLine(t, good, 2, func(m map[string]any) {
 			m["stored"] = []any{otherStored, storedBlocks(t, g)[0]}
 		}), "grant_block is not canonical(root)"},
+		// The same root, not in its canonical form.
+		"grant_block respelled": {v82EditLine(t, good, 2, func(m map[string]any) { m["stored"] = respelled }), "(§G.4.1)"},
 		// A stored block that doesn't decode has no grant_block.
 		"stored undecodable": {v82EditLine(t, good, 2, func(m map[string]any) { m["stored"] = "AAAA" }), "no grant_block"},
 	}
