@@ -2236,13 +2236,34 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 
 // snapshotAt is the revision a prune's snapshot at horizon is the
 // document of (§8.6, §E.3.1): the horizon itself, or, where it is a
-// tombstone, its parent, the last live revision (§7.1). The head
-// tombstone's parent is the head's last; a tombstone further down the
-// chain, as a horizon the server moves a prune to may be, is found in the
-// log; the current horizon, which the log no longer lists, by the
-// not_offered of a revision above it. Every parent so learned is checked
-// against the tombstone's id (tombstoneParent).
+// tombstone, its parent, the last live revision (§7.1), which the last of
+// the tombstone's own 410 names. Where that 410 carries no last, as an
+// older server's or a cached one doesn't, the head tombstone's parent is
+// the head's last; a tombstone further down the chain, as a horizon the
+// server moves a prune to may be, is found in the log; the current
+// horizon, which the log no longer lists, by the not_offered of a
+// revision above it. Every parent so learned is checked against the
+// tombstone's id (tombstoneParent).
 func (x *E2E) snapshotAt(ctx context.Context, ns, name, horizon string) (string, error) {
+	// A tombstone's own /rev answers 410 with last, its parent (§7.1,
+	// v0.82), at the head, down the chain and at the current horizon
+	// alike. A last that isn't the tombstone's parent is refused here,
+	// before anything is sealed; a 410 without one (an older server, a
+	// cached answer) leaves the sources below.
+	r, err := x.c.do(ctx, "GET", "/r/"+ns+"/"+name+"/rev/"+horizon, nil, nil)
+	if err != nil {
+		return "", err
+	}
+	if r.status == 410 {
+		if ae := r.apiError(); ae.Tombstone() != "" || ae.Code == "gone" && ae.Last() != "" {
+			if ae.Tombstone() != horizon {
+				return "", fmt.Errorf("client: prune %s/%s: the 410 of %s names tombstone %q: %w", ns, name, horizon, ae.Tombstone(), seal.ErrMismatch)
+			}
+			if ae.Last() != "" {
+				return tombstoneParent(ns, name, horizon, ae.Last())
+			}
+		}
+	}
 	h, err := x.c.Head(ctx, ns, name)
 	if err != nil {
 		return "", err
@@ -2276,8 +2297,8 @@ func (x *E2E) snapshotAt(ctx context.Context, ns, name, horizon string) (string,
 // lists: the resource's current horizon, or so the caller supposes. A
 // live revision above it, the head or a tombstoned head's last, answers
 // /rev with 404 not_offered naming the horizon and, where that is a
-// tombstone, last, its parent (§7.1), which a tombstone's own URL, a 410,
-// doesn't. Only a not_offered naming this horizon is taken; any other
+// tombstone, last, its parent (§7.1), as a tombstone's own 410 does since
+// v0.82 (snapshotAt). Only a not_offered naming this horizon is taken; any other
 // answer leaves horizon, whose kind is then the server's to judge.
 func (x *E2E) currentHorizonAt(ctx context.Context, ns, name, horizon string, h *Head) (string, error) {
 	probe := h.ID
