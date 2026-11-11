@@ -891,8 +891,10 @@ type exchanged struct {
 // one it gets no marker in left out (exchangeGrant, §A.4); across grants
 // it answers all or nothing (§C.5.2): a grant over grantSize or
 // rulesPerGrant is 413 limit (§C.8); a grant left with no edge grant is
-// refused 401 if any such is 401, else 403, and 502 if a namespace
-// document a grant names can't be read; once none is, a grant left with
+// refused 401 if any such is 401, else 403; else, where a namespace
+// document a grant names, or the chain a requireAt key names, can't be
+// read, 502 if any such failure is lasting and 503 behind only if every
+// one is for now (worseUpstream; §C.4, §C.5.2); once none is, a grant left with
 // no edge grant whose only refusals are purges is 410 purged, with ns and
 // head naming the first in the order the grants and their root blocks
 // list them (§8.5).
@@ -906,13 +908,15 @@ type exchanged struct {
 // §7). Cookies are Secure, HttpOnly and SameSite as EdgeGrants says.
 func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	root, err := ix.c.Root(ctx)
-	if err != nil {
+	// Whether the core's authentication is on is what its root says now
+	// (authOff: read again once CheckerTTL has passed), never what an
+	// earlier read said (§B.11.9 Where, v0.82). While the root can't be
+	// read the exchange goes on as with authentication on: it mints only
+	// for grants that verify, and a namespace whose coverage the root
+	// decides answers 503 or 502 for the whole exchange (coverage).
+	if off, err := ix.authOff(ctx); err != nil {
 		ix.opt.Logf("index: reading the core's root: %v", err)
-		writeErr(w, http.StatusBadGateway, "upstream", "cannot read the core's root")
-		return
-	}
-	if root.AuthDisabled() {
+	} else if off {
 		writeErr(w, http.StatusNotFound, "not_offered", "the core runs with authentication disabled: there are no edge grants (§C.5)")
 		return
 	}
@@ -957,13 +961,13 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		case chain:
 			// A requireAt chain the verifier can't read: 503 or 502,
 			// never a refusal (§C.4, writeUpstreamErr).
-			upErr = err
+			upErr = worseUpstream(upErr, err)
 		case errors.As(err, &ae):
 			if denied == nil || ae.Status == http.StatusUnauthorized && denied.Status != http.StatusUnauthorized {
 				denied = ae
 			}
 		case err != nil:
-			upErr = err
+			upErr = worseUpstream(upErr, err)
 		case pn != nil:
 			if purged == nil {
 				purged = pn
@@ -1059,6 +1063,24 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	svcedge.Mint(w, ix.opt.EdgeGrants, now, issues)
 }
 
+// worseUpstream is the one of cur and err, failures to read upstream
+// what an exchange needs, that answers it: the first that is lasting
+// (502 upstream), else the first (503 behind), so that an exchange is 503
+// only where every such failure is for now, whatever the order of its
+// grants and of the namespaces each names (§C.4: "503 (behind) while the
+// cause is transient, and 502 (upstream) otherwise"; writeUpstreamErr).
+func worseUpstream(cur, err error) error {
+	if cur == nil {
+		return err
+	}
+	if _, behind := upstreamBehind(cur); behind {
+		if _, behind := upstreamBehind(err); !behind {
+			return err
+		}
+	}
+	return cur
+}
+
 // purgedNS is a purged namespace an exchange refuses, and the head of its
 // purge, its purge-ns entry's ns_id (§8.5).
 type purgedNS struct{ ns, head string }
@@ -1116,8 +1138,8 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		return true
 	}
 	fail := func(err error) {
-		if !deny(err) && upErr == nil {
-			upErr = err
+		if !deny(err) {
+			upErr = worseUpstream(upErr, err)
 		}
 	}
 	for _, ns := range namedInOrder(g, ix.refsNamespaces()) {

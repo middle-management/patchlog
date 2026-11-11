@@ -1006,6 +1006,30 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 	}
 }
 
+// upstreamBehind reports whether err, a failure to read upstream what
+// answering needs, is one for now, answered 503 behind with msg, rather
+// than 502 upstream (writeUpstreamErr, worseUpstream): a requireAt chain
+// unreadable for a transient cause, a namespace visibility reads not
+// followed yet, the core's root or a sealed namespace's keys that can't
+// be fetched for now.
+func upstreamBehind(err error) (msg string, behind bool) {
+	if transient, ok := chainErr(err); ok {
+		return msgChainBehind, transient
+	}
+	if errors.Is(err, errMemberBehind) {
+		// A namespace visibility reads not followed yet (members.go).
+		return msgMemberBehind, true
+	}
+	if re := (*rootErr)(nil); errors.As(err, &re) && re.transient() {
+		// The core's root, read for coverage (authOff), for now.
+		return msgRootBehind, true
+	}
+	if errors.Is(err, client.ErrKeyFetch) && !lacksKey(context.Background(), err) {
+		return "the index cannot fetch the keys of a sealed namespace it reads yet (§A.4)", true
+	}
+	return "", false
+}
+
 // writeUpstreamErr answers err, a failure to read upstream what answering
 // needs, 502 upstream with msg, or msgGrantLacks where the index's own
 // grant can't read a namespace that decides §B.11.9 coverage
@@ -1025,26 +1049,12 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 // for passes through here, so each gets the same answer.
 func (ix *Index) writeUpstreamErr(w http.ResponseWriter, what string, err error, msg string) {
 	ix.opt.Logf("index: %s: %v", what, err)
-	if transient, ok := chainErr(err); ok {
-		if transient {
-			writeBehind(w, msgChainBehind)
-		} else {
-			writeErr(w, http.StatusBadGateway, "upstream", msgChainUpstream)
-		}
+	if msg, behind := upstreamBehind(err); behind {
+		writeBehind(w, msg)
 		return
 	}
-	if errors.Is(err, errMemberBehind) {
-		// A namespace visibility reads not followed yet (members.go).
-		writeBehind(w, msgMemberBehind)
-		return
-	}
-	if re := (*rootErr)(nil); errors.As(err, &re) && re.transient() {
-		// The core's root, read for coverage (authOff), for now.
-		writeBehind(w, msgRootBehind)
-		return
-	}
-	if errors.Is(err, client.ErrKeyFetch) && !lacksKey(context.Background(), err) {
-		writeBehind(w, "the index cannot fetch the keys of a sealed namespace it reads yet (§A.4)")
+	if _, ok := chainErr(err); ok {
+		writeErr(w, http.StatusBadGateway, "upstream", msgChainUpstream)
 		return
 	}
 	var gl *errGrantLacks
