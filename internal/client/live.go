@@ -219,13 +219,14 @@ func (c *Client) FilteredNSEvents(ctx context.Context, ns, gs, since string, fn 
 // nsEvents streams the namespace events at path, a 302 being the error
 // redirected gives when it is set.
 func (c *Client) nsEvents(ctx context.Context, ns, path, since string, redirected func(*response) error, fn func(NSEntry) error) error {
-	prev := since
 	return c.eventsAt(ctx, path, since, redirected, func(ev Event) error {
 		if ev.JWE != "" {
-			// One entry per event, bound as the range [prev, id] of its
-			// one entry; the plaintext is the entry object itself, not a
-			// one-element range (§E.2.2).
-			v, err := c.openRange(ctx, ns, prev, ev.ID, ev.JWE)
+			// One entry per event, under K_n with the event's own pl,
+			// {ns, event: id}, compared in full; the plaintext is the
+			// entry object itself (§E.2.2). The range form sealed before
+			// v0.82, {ns, range: [prev, id]}, is refused: there is no
+			// fallback.
+			v, err := c.openNSEvent(ctx, ns, ev.ID, ev.JWE)
 			if err != nil {
 				return fmt.Errorf("client: event %s: %w", ev.ID, err)
 			}
@@ -241,7 +242,6 @@ func (c *Client) nsEvents(ctx context.Context, ns, path, since string, redirecte
 		if ev.JWE != "" && e.ID != ev.ID {
 			return fmt.Errorf("client: event %s carries entry %s: %w", ev.ID, e.ID, seal.ErrMismatch)
 		}
-		prev = ev.ID
 		return fn(e)
 	})
 }

@@ -48,7 +48,7 @@ func TestV081NowReadGrantsSealed(t *testing.T) {
 		if rules != nil {
 			x["rules"] = rules
 		}
-		return w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, []string{}, x)
+		return w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, idCan, x)
 	}
 	r := w.do("POST", "/read-grants", fan(), items)
 	if r.status != 200 || entry(r, 0)["grant"] == nil || entry(r, 0)["keys"] == nil || entry(r, 1)["keys"] == nil {
@@ -64,9 +64,9 @@ func TestV081NowReadGrantsSealed(t *testing.T) {
 // TestV081NowGrants (§C.2 item 5, §B.11.4, v0.78): POST /grants hands out
 // decisions that are reads (Resolve's roles at the item, a purged item's
 // and a hidden node's visibility, §B.11.5) and read grants, so a grant
-// with a block rule on /now is 403 there, for every request, before its
-// body is read: as the tree service refuses it its listings, and as
-// one whose rules refer to /now finds the core's reads refused.
+// with a block rule on /now is 403 there, for every well-formed request:
+// as the tree service refuses it its listings, and as one whose rules
+// refer to /now finds the core's reads refused.
 func TestV081NowGrants(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -85,7 +85,11 @@ func TestV081NowGrants(t *testing.T) {
 		w.issue(desk, req, 200)
 		refusedByNow(t, "POST /grants with a block rule on /now", w.do("POST", "/grants", clock, req))
 	}
-	refusedByNow(t, "POST /grants with a block rule on /now, a malformed body", w.do("POST", "/grants", clock, []any{}))
+	// A request-shape 400 comes before the caller's-grant 403 (v0.82,
+	// §B.11.4 The caller's grant: "after 400 and 401").
+	if r := w.do("POST", "/grants", clock, []any{}); r.status != 400 || r.header.Get("Cache-Control") != "no-store" {
+		t.Errorf("POST /grants with a block rule on /now, a malformed body: %d %v", r.status, r.body)
+	}
 }
 
 // TestV081NowReadRoles (§C.2 item 5: "a role with such a rule doesn't

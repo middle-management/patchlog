@@ -57,6 +57,9 @@ type Client struct {
 	sourceAuth []string
 	// signer signs resource writes and batch steps (WithSigner, §C.3.1).
 	signer *sig.Key
+	// levels are the encryption levels learnt per namespace (levels.go),
+	// shared with With copies.
+	levels *levelTable
 
 	rootMu sync.Mutex
 	root   *Root // GET /, once fetched
@@ -144,6 +147,9 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 	for _, o := range opts {
 		o(c)
 	}
+	if c.levels == nil {
+		c.levels = &levelTable{}
+	}
 	c.hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return c, nil
 }
@@ -151,7 +157,7 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 // With returns a copy of the client with further options applied, e.g. a
 // different bearer grant. The copy shares the HTTP client.
 func (c *Client) With(opts ...Option) *Client {
-	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth, signer: c.signer}
+	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth, signer: c.signer, levels: c.levels}
 	c.rootMu.Lock()
 	n.root = c.root
 	c.rootMu.Unlock()

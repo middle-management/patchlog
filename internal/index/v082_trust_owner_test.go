@@ -1,0 +1,264 @@
+package index_test
+
+import (
+	"context"
+	"net/http"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/svcedge"
+)
+
+// v82Gate holds the index's reads that match picks until open is closed.
+type v82Gate struct {
+	base  http.RoundTripper
+	match func(*http.Request) bool
+	open  chan struct{}
+}
+
+func (g *v82Gate) RoundTrip(r *http.Request) (*http.Response, error) {
+	if g.match(r) {
+		select {
+		case <-g.open:
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	}
+	return g.base.RoundTrip(r)
+}
+
+// TestV082StoppedMemberKeepsServedTrust (SVC-08; §B.11.9 Where, v0.82: "a
+// purged catalog's catalog.trust is the last one the origin stored or the
+// service read"; §A.4): the index serves matches and cat-season, which
+// was purged before it started. Until its own follower has reached
+// cat-season, visibility reads cat-season through a follower of its own
+// (memberAtGone), which the reconciler stops once the index holds
+// cat-season's checkpoint. Here that follower is still at its bootstrap,
+// so never met the purge, when the index applies cat-season's log, its
+// purge-ns last, and records the trust its documents gave. The follower
+// stopped, forgetting what it held leaves that trust alone: matches is
+// covered and dark, and li, a partial reader, gets a g: marker and no
+// hits. Before, cat-season, whose document is still read at its head,
+// counted as live there, and its trust was forgotten with the follower's
+// checkpoint, after the last entry that would record it again: li was 403
+// with no marker for good, in the runs where the reconciler stopped the
+// follower after cat-season's purge-ns committed and before the follower
+// met the purge itself (TestV082PurgedCatalogMetPurged failed so, one run
+// in twenty).
+//
+// The order is staged, none of it timed. Until the index has reached
+// cat-season the reconciler stops that follower on every pass, as
+// cat-season is one the index serves, and starts it again on the next,
+// which its own start makes due: no follower stays. The test holds the
+// reconciler where it logs a stop, the follower stopped in memory and
+// forgetMember not yet called. Nothing stops a follower meanwhile: li's
+// query starts one, which stays at its bootstrap; the gate opens and the
+// index applies cat-season's purge-ns. Released, the reconciler forgets
+// the follower it had stopped, which deletes nothing as one runs again,
+// and its next pass, which li's query and the purge-ns made due, finds
+// cat-season purged at the index's checkpoint: it stops the follower
+// that runs and forgets what it held, the trust the test is about.
+func TestV082StoppedMemberKeepsServedTrust(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := newV75XOn(t, clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}))
+	rd := clienttest.NewKey("rd")
+	e := rd.Entry("read")
+	e["rules"] = []any{v77TypeRule}
+	must(w.admin.PatchConfig(ctx, "matches", must(w.admin.NSHead(ctx, "matches")).Config, []any{map[string]any{"op": "add", "path": "/keys/-", "value": e}}))
+	li := rd.Grant(t, w.s.Now(), "user:li", []string{"matches"}, []string{"read"}, map[string]any{"groups": []any{"fans"}, "roles": []any{"reader"}})
+	v82PurgeNS(w, "cat-season")
+
+	// The index's own follower of cat-season reads nothing of its state
+	// until the gate opens: its log, heads and events. Its head and its
+	// documents, which coverage and the grant checker read, pass.
+	gate := &v82Gate{base: http.DefaultTransport, open: make(chan struct{}), match: func(r *http.Request) bool {
+		p := r.URL.Path
+		return strings.HasPrefix(p, "/ns/cat-season/") && (strings.HasSuffix(p, "/log") || strings.HasSuffix(p, "/heads") || strings.HasSuffix(p, "/events"))
+	}}
+	var openOnce sync.Once
+	open := func() { openOnce.Do(func() { close(gate.open) }) }
+	// stops counts the times the reconciler stopped the follower for
+	// visibility; purgesThen are the purges of idx:cat-season as it last
+	// did, before it forgot what that follower held, which purges it
+	// once more. The first stop holds the reconciler, parked closed,
+	// until release is.
+	var (
+		x          *svc
+		mu         sync.Mutex
+		stops      int
+		purgesThen int
+		member     context.Context // the follower for visibility last started
+		parkOnce   sync.Once
+		relOnce    sync.Once
+	)
+	parked, released := make(chan struct{}), make(chan struct{})
+	release := func() { relOnce.Do(func() { close(released) }) }
+	x = startSvcWith(t, w.s.Client(t, client.WithBearer(w.k.Grant(t, w.s.Now(), "svc:indexer", []string{"schemas", "cat-season", "matches"}, []string{"read"}))),
+		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "cat-season"}, untyped: true, now: w.s.Now, noRun: true, hc: &http.Client{Transport: gate}},
+		func(o *indexOpts) {
+			o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate
+			logf := o.Logf
+			o.Logf = func(f string, a ...any) {
+				logf(f, a...)
+				// The reconciler's, between stopping the follower and
+				// forgetMember (reconcile), under no lock.
+				if strings.Contains(f, "is no longer read by the coverage") && len(a) == 1 && a[0] == "cat-season" {
+					n := members76Purges(x, "idx:cat-season")
+					mu.Lock()
+					stops, purgesThen = stops+1, n
+					mu.Unlock()
+					parkOnce.Do(func() {
+						close(parked)
+						<-released
+					})
+				}
+			}
+		})
+	// The follower for visibility never gets past its bootstrap: it holds
+	// no checkpoint and never meets the purge.
+	x.ix.OnMemberBootstrap(func(ctx context.Context, m string) {
+		if m == "cat-season" {
+			mu.Lock()
+			member = ctx
+			mu.Unlock()
+			<-ctx.Done()
+		}
+	})
+	x.ix.SetMinWait(20 * time.Millisecond) // for a follower that holds no checkpoint
+	rctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { x.ix.Run(rctx); close(done) }()
+	t.Cleanup(func() { release(); open(); cancel(); <-done })
+
+	x.caughtUp("matches")
+	// matches reached, the reconciler reads its coverage, which starts
+	// cat-season's follower for visibility, and stops it, cat-season
+	// being one the index serves: it is held there.
+	select {
+	case <-parked:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the reconciler never stopped a follower for visibility of cat-season")
+	}
+	// cat-season not reached and its follower for visibility without a
+	// checkpoint: li is behind, never answered. Her query starts that
+	// follower again, which nothing stops while the reconciler is held.
+	if r := x.raw("/matches", li); r.status != 503 {
+		t.Fatalf("li before the index reached cat-season: %d %v, want 503", r.status, r.body)
+	}
+	var running context.Context
+	waitFor(t, "the follower for visibility of cat-season that li's query started", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		running = member
+		return running != nil && running.Err() == nil
+	})
+
+	open()
+	waitFor(t, "the index applies cat-season's purge", func() bool {
+		for _, b := range x.batches() {
+			if b.NS == "cat-season" && b.Coalesce().PurgedNS {
+				return true
+			}
+		}
+		return false
+	})
+	// The follower for visibility is still at its bootstrap: what the
+	// reconciler meets, with the trust the index's own follower recorded.
+	if running.Err() != nil {
+		t.Fatal("cat-season's follower for visibility was stopped while the reconciler was held")
+	}
+	mu.Lock()
+	stopsThen := stops
+	mu.Unlock()
+	if stopsThen != 1 {
+		t.Fatalf("the reconciler stopped cat-season's follower for visibility %d times while it was held", stopsThen)
+	}
+	// Released, the reconciler forgets the follower it had stopped,
+	// nothing of the one that runs, and runs again, as li's query and
+	// the purge-ns made it due: it stops the follower and forgets what it
+	// held.
+	release()
+	select {
+	case <-running.Done():
+	case <-time.After(30 * time.Second):
+		t.Fatal("the reconciler never stopped cat-season's follower for visibility")
+	}
+	waitFor(t, "the index forgets what cat-season's follower for visibility held", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return stops > stopsThen && members76Purges(x, "idx:cat-season") > purgesThen
+	})
+
+	if n := must(x.ix.ExecForTest(ctx, `UPDATE catalog_trust SET trust = trust WHERE ns = 'cat-season'`)); n != 1 {
+		t.Errorf("the index holds %d catalog.trust of cat-season once its follower for visibility stopped, want the one its own follower recorded", n)
+	}
+	x.ix.ExpireGrantChecks()
+	q := x.raw("/matches", li)
+	if q.status != 302 || !strings.HasPrefix(q.header.Get("Location"), "/matches/g/") {
+		t.Fatalf("li's query: %d %s %v, want a redirect under her g: marker", q.status, q.header.Get("Location"), q.body)
+	}
+	if r := x.follow("/matches", li); r.status != 200 || len(resources(r.body)) != 0 {
+		t.Errorf("li where cat-season is purged: %d %v, want no hits", r.status, r.body)
+	}
+}
+
+// TestV082PurgedCatalogMetPurgedSnapshot (SVC-08; §B.11.9 Where, v0.82:
+// "a purged catalog's catalog.trust is the last one the origin stored or
+// the service read"): TestV082PurgedCatalogMetPurged's index that serves
+// the catalog, bootstrapped from snapshots. cat-season, purged before the
+// index started, comes as a purge-ns in place of its listing, with no
+// config entry: the index reads its document at that entry, as its
+// follower for visibility would, and records its trust. matches is
+// covered and dark: li gets a g: marker and no hits. Before, that
+// document was never read, and li was 403 with no marker for good, unless
+// a follower for visibility had bootstrapped cat-season first.
+func TestV082PurgedCatalogMetPurgedSnapshot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := newV75XOn(t, clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}))
+	rd := clienttest.NewKey("rd")
+	e := rd.Entry("read")
+	e["rules"] = []any{v77TypeRule}
+	must(w.admin.PatchConfig(ctx, "matches", must(w.admin.NSHead(ctx, "matches")).Config, []any{map[string]any{"op": "add", "path": "/keys/-", "value": e}}))
+	li := rd.Grant(t, w.s.Now(), "user:li", []string{"matches"}, []string{"read"}, map[string]any{"groups": []any{"fans"}, "roles": []any{"reader"}})
+	v82PurgeNS(w, "cat-season")
+	x := startSvcWith(t, w.s.Client(t, client.WithBearer(w.k.Grant(t, w.s.Now(), "svc:indexer", []string{"schemas", "cat-season", "matches"}, []string{"read"}))),
+		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "cat-season"}, untyped: true, now: w.s.Now},
+		func(o *indexOpts) {
+			o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate
+			o.FollowOptions = append(o.FollowOptions, follow.WithSnapshot())
+		})
+	x.caughtUp("matches")
+	waitFor(t, "the index applies cat-season's purge", func() bool {
+		for _, b := range x.batches() {
+			if b.NS == "cat-season" && b.Coalesce().PurgedNS {
+				if !b.Snapshot {
+					t.Fatalf("cat-season's purge-ns came after %d units, not in place of a listing", len(b.Units))
+				}
+				return true
+			}
+		}
+		return false
+	})
+	// A follower for visibility started meanwhile is stopped, or has met
+	// the purge: either way the trust stays (ownsTrust).
+	waitFor(t, "the index answers li", func() bool {
+		x.ix.ExpireGrantChecks()
+		return x.raw("/matches", li).status < 500
+	})
+	q := x.raw("/matches", li)
+	if q.status != 302 || !strings.HasPrefix(q.header.Get("Location"), "/matches/g/") {
+		t.Fatalf("li's query: %d %s %v, want a redirect under her g: marker", q.status, q.header.Get("Location"), q.body)
+	}
+	if r := x.follow("/matches", li); r.status != 200 || len(resources(r.body)) != 0 {
+		t.Errorf("li where cat-season was met purged: %d %v, want no hits", r.status, r.body)
+	}
+}

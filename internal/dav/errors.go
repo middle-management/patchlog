@@ -38,6 +38,9 @@ type davError struct {
 	// (403), as one without tree-derived access refuses every grant that
 	// doesn't read its namespaces whole (§B.11.5)
 	svcRefused bool
+	// read: the core's 408 or 503 to a read (a GET) this answers, which
+	// a save answers the other way round (asSave, §H.4 "The base")
+	read *client.APIError
 }
 
 func (e *davError) Error() string {
@@ -166,9 +169,37 @@ func upstream(err error) error {
 		e.refresh = ae.Code == "nonce"
 		return e
 	case ae.Status == 429, ae.Status == 408:
-		return busy(ae)
+		e := busy(ae)
+		if ae.Status == 408 && ae.Method == http.MethodGet {
+			e.read = ae
+		}
+		return e
 	}
-	return fail(http.StatusBadGateway, "the core answered %d: %s", ae.Status, msg)
+	e := fail(http.StatusBadGateway, "the core answered %d: %s", ae.Status, msg)
+	if ae.Status == http.StatusServiceUnavailable && ae.Method == http.MethodGet {
+		e.read = ae
+	}
+	return e
+}
+
+// asSave is e as a save answers it (§H.4 "The base": a failed read of
+// anything the save decides by is 503 with Retry-After after the core's
+// 429 or 503, else 502): where e answers the core's 503 or 408 to a
+// read as upstream does for any request (502, and 503), the other way
+// round, as saveRead maps them; otherwise e. Whichever read of a PUT
+// fails, it is answered so (record).
+func (e *davError) asSave() *davError {
+	if e == nil || e.read == nil {
+		return e
+	}
+	out := *e
+	out.read = nil
+	if e.read.Status == http.StatusServiceUnavailable {
+		out.status, out.header = http.StatusServiceUnavailable, busy(e.read).header
+	} else {
+		out.status, out.header = http.StatusBadGateway, nil
+	}
+	return &out
 }
 
 // busy is the 503 a 429 or a 408 turns into once waiting is no longer
@@ -299,6 +330,34 @@ func (w *errWriter) Write(b []byte) (int, error) {
 		return len(b), nil
 	}
 	return w.ResponseWriter.Write(b)
+}
+
+// saveRead is the error of a read a save decides by (§H.4 "The base":
+// the head, the base and the revisions between, their log, whose entries
+// they are): one that failed for now (failedRead) fails the save, 503
+// with Retry-After after the core's 429 or 503, else 502. upstream gives
+// the 429 its 503 (after retrying waited it out, where brief), any other
+// 5xx its 502, a core that can't be reached its 502 and a timeout of the
+// gateway's own, with no answer to go by, 503 with Retry-After; the two
+// it answers otherwise for other requests are mapped here, the core's
+// 503 (503 with its Retry-After, not 502) and its 408 (502, not 503).
+// Any other error is returned as it is.
+func saveRead(err error) error {
+	var de *davError
+	if err == nil || errors.As(err, &de) || !failedRead(err) {
+		return err
+	}
+	ae, ok := client.AsAPIError(err)
+	if !ok {
+		return err
+	}
+	switch ae.Status {
+	case http.StatusServiceUnavailable:
+		return busy(ae)
+	case http.StatusRequestTimeout:
+		return fail(http.StatusBadGateway, "the core answered %d: %s", ae.Status, apiText(ae))
+	}
+	return err
 }
 
 // failedRead reports a read that failed for now (§H.4 "The base", "The

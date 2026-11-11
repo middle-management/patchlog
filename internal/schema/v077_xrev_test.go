@@ -6,7 +6,7 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
-// Cross-review (conformance lens): §I.15's v0.77 vectors (§6.2 step 5):
+// Cross-review (conformance lens): v0.77's vectors, now §I.18 (§6.2 step 5):
 // idn-hostname rejects ab--cd and a lone U+00B7 (contextual rules),
 // hostname (RFC 1123 alone) accepts ab--cd, and both accept an uppercase
 // A-label.

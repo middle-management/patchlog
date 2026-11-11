@@ -251,6 +251,15 @@ func (g *Graph) isStopped(ns string) bool {
 	return ok
 }
 
+// Stopped reports whether the service stopped following content
+// namespace ns, for keys it lacks or a refusal (§B.5 Behind): it holds
+// the namespace's document only as of the checkpoint it stopped at, and
+// can't see a narrowing since, so that document counts for no decision
+// about who sees what: its roles count for no folder (§B.11.5) and it
+// reads public to no one. The catalog itself is never stopped here: a
+// stopped catalog isn't served at all.
+func (g *Graph) Stopped(ns string) bool { return g.isStopped(ns) }
+
 func newGraph(catalog string) *Graph {
 	return &Graph{Catalog: catalog, Trust: map[string]bool{}, Content: map[string]*NSConfig{}, appliedPublic: map[string]bool{}, stopped: map[string]string{}, nodes: map[string]*Node{},
 		explicit: map[string]*Node{}, self: map[string]*Node{}, explicitGone: map[string]bool{}, children: map[string]map[string]bool{},

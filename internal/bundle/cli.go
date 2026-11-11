@@ -137,7 +137,7 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	external := fs.String("external", "", "dependencies to leave out: ns or ns/name (comma-separated)")
 	authors := fs.Bool("authors", false, "include authors, creation times, signatures and gestures (§G.4.1)")
 	untyped := fs.Bool("untyped-refs", false, "treat /r/… strings in untyped documents as references")
-	foreign := fs.Bool("foreign-parents", false, "branch namespaces: start chains after their foreign parent (in requires) and list read-through resources as external, instead of including the base's history")
+	foreign := fs.Bool("foreign-parents", false, "branch namespaces: start chains after their foreign parent (in requires) and list read-through resources as external, instead of including the base's history (always so for an e2e branch, §G.5.1)")
 	asJSON := fs.Bool("json", false, "print the export plan as JSON on stderr")
 	var recipients multiFlag
 	fs.Var(&recipients, "recipient", "seal the bundle to this X25519 public key: a JWK file, or inline JSON (repeatable, §G.5.1.1)")

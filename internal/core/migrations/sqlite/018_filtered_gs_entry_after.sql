@@ -1,0 +1,26 @@
+-- Migration: filtered gs entry after
+-- Created: 2026-11-11T09:42:11Z
+-- Checksum: 22e3bca146f5401644d76e3e0a76fd68b9da452f81ea360832586fc3efab1cc4
+-- Chain: 993b0193ed8e0d53a3f61b1e1369f180fcdd6f143bdc65bd115b5ee0a5a5e862
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- Filtered namespace reads (§B.11.9 gs, filtered_admit.go): a gs names no
+-- reader, so readers who share one share its filtered_gs row, and a cookie
+-- carries only its prefix and expiry (§C.5.3). When an exchange replaces
+-- a row recorded under another entry digest, entry_after keeps the latest
+-- expiry of the cookies issued under the earlier ones (the row's exp), and
+-- a cookie that expires no later than it is 403: one the change ended
+-- stays ended when another reader exchanges again. 0: none was replaced.
+ALTER TABLE filtered_gs ADD COLUMN entry_after BIGINT NOT NULL DEFAULT 0;

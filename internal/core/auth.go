@@ -343,18 +343,29 @@ func (t *tx) effectiveRevoked(n *nsRow, cfg *Config) map[string]bool {
 	return out
 }
 
+// errAtRejected is every refusal of a key's requireAt at the origin: one
+// text for a namespace that doesn't exist, an at that isn't in its chain
+// and one that wasn't its head within maxLag, and for an at of another
+// shape or namespace, so that no key-scope 403 names the namespace
+// requireAt gives, or tells whether it exists (§C.4 requireAt: "answered
+// as any other scope failure. ... No key-scope 403 names the namespace
+// requireAt gives"; v0.82).
+var errAtRejected = errors.New("at rejected by requireAt")
+
 // checkAt resolves a key's requireAt (§C.4): the grant's at must be an
 // ns_id in the named chain, and must have been that namespace's head at
 // some point within maxLag before the grant was issued (or later). maxLag
 // is the target namespace's (default 60 seconds), or the key's when that
-// is stricter.
+// is stricter. At the origin, at is in no chain of a namespace that
+// doesn't exist: the grant fails the scope as for any other at, with
+// errAtRejected.
 func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 	return func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 		target := n
 		if s, ok := requireAt.(string); ok {
 			target = t.nsByName(s)
 			if target == nil {
-				return fmt.Errorf("unknown namespace %q", s)
+				return errAtRejected
 			}
 		}
 		var idText string
@@ -364,17 +375,20 @@ func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxL
 		case map[string]any:
 			ns, _ := x["ns"].(string)
 			if ns != target.name {
-				return fmt.Errorf("at names another namespace")
+				return errAtRejected
 			}
 			idText, _ = x["id"].(string)
 		}
 		id, err := ids.Parse(idText)
 		if err != nil {
-			return fmt.Errorf("malformed at")
+			// Not reached through grant.Verify: a grant decodes only
+			// with at an ns_id or {"ns","id"} with one, and one without
+			// at is refused before (key "requires at").
+			return errAtRejected
 		}
 		seq, ok := t.nsLogSeq(target.id, id)
 		if !ok {
-			return fmt.Errorf("at is not in the chain of %s", target.name)
+			return errAtRejected
 		}
 		var nextMs int64
 		if err := t.QueryRow(`SELECT created FROM ns_log WHERE ns = ? AND prev_seq = ?`, target.id, seq).Scan(&nextMs); err != nil {
@@ -383,7 +397,7 @@ func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxL
 		next := time.UnixMilli(nextMs)
 		lag := grant.EffectiveMaxLag(t.config(target.configSeq).MaxLag, keyMaxLag)
 		if !grant.HeadWithin(&next, issued, lag) {
-			return fmt.Errorf("at was not the head of %s within maxLag (%s) before the grant was issued", target.name, lag)
+			return errAtRejected
 		}
 		return nil
 	}
@@ -694,10 +708,15 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 }
 
 // unrestrictedRoles reports whether a grant's rules leave every resource
-// readable (§2.1): its key has no readScope, no rule of its blocks or key
-// scope refers to /resource, and, if it carries roles, some role listing
-// read has no rule that does. Those roles are returned, nil for a grant
-// without roles; roles are alternatives (§C.1.1), so one is enough.
+// readable (§2.1 Unrestricted read): its key has no readScope, no rule of
+// its blocks or key scope refers to /resource, and, if it carries roles,
+// some role listing read has no rule that refers to /resource or to /now.
+// Those roles are returned, nil for a grant without roles; roles are
+// alternatives (§C.1.1), so one is enough. A role with a rule on /now
+// doesn't count for read (§C.2 item 5), so it gives no unrestricted read
+// either: it is left out here, not only by the read envelope its callers
+// then evaluate (readsNS, the /keys relay of K_e), so that no caller can
+// take it for one (v0.82).
 func (a *actor) unrestrictedRoles() ([]string, bool) {
 	v := a.verified
 	if v.Key.ReadScopeResource || refersToResource(v.KeyRules) || refersToResource(v.BlockRules) {
@@ -709,7 +728,7 @@ func (a *actor) unrestrictedRoles() ([]string, bool) {
 	}
 	var out []string
 	for _, r := range roles {
-		if !refersToResource(v.RoleRules(r)) {
+		if rs := v.RoleRules(r); !refersToResource(rs) && !rulesReferToNow(rs) {
 			out = append(out, r)
 		}
 	}

@@ -419,9 +419,11 @@ func TestPlainTreeServiceRefusalV073(t *testing.T) {
 // derivedWorld is a file tree with tree-derived access (§B.11): catalog
 // cat, served by a catalog service, whose key catalog-01 is listed in cat
 // and in its content namespace matches as §B.11.3 lists it; users hold
-// identity grants from idp for cat only, with no verbs of their own
-// (§B.11.6), and get their rights from the catalog's grants (§H.2
-// "Access"). root has no $access, so it is hidden from them (§B.11.5);
+// identity grants from idp for cat only (§B.11.6), which read no
+// document there (identityOnly), and get their rights from the catalog's
+// grants (§H.2 "Access"). An identity grant allows read in cat all the
+// same, as the catalog service asks of a caller of POST /read-grants or
+// of a read want since v0.82 (§B.11.4 The caller's grant). root has no $access, so it is hidden from them (§B.11.5);
 // Season 2026 gives match-desk desk (move, place) and li reader:
 //
 //	root
@@ -439,8 +441,10 @@ type derivedWorld struct {
 }
 
 // newDerivedWorld builds the world; idpCat are the verbs idp's key may
-// grant in cat (none: identity grants only, whose users read no node
-// document there).
+// grant in cat. With none it signs identity grants only: read, which
+// its scope there fixes to a name no node has (identityOnly), so no
+// grant of it reads a node document. With some, its scope is open, and
+// what a grant reads is the grant's own (user's still read nothing).
 func newDerivedWorld(t *testing.T, idpCat ...string) *derivedWorld {
 	t.Helper()
 	ctx := context.Background()
@@ -467,7 +471,12 @@ func newDerivedWorld(t *testing.T, idpCat ...string) *derivedWorld {
 	contentEntry["maxTtl"], contentEntry["readScope"], contentEntry["requireAt"] = "PT15M", "resource", "cat"
 	contentEntry["groups"] = map[string]any{"deny": []any{"ops"}}
 	contentEntry["roles"] = map[string]any{"allow": []any{"desk", "reader"}}
-	catDoc := map[string]any{"read": "grant", "keys": []any{opsKey.Entry("*"), idp.Entry(idpCat...), catEntry}, "maxLag": "PT60S",
+	idpEntry := idp.Entry(idpCat...)
+	if len(idpCat) == 0 {
+		idpEntry = idp.Entry("read")
+		idpEntry["rules"] = []any{identityOnly()}
+	}
+	catDoc := map[string]any{"read": "grant", "keys": []any{opsKey.Entry("*"), idpEntry, catEntry}, "maxLag": "PT60S",
 		"catalog": map[string]any{"trust": []any{"matches"}, "mode": "tree", "files": map[string]any{"ns": "matches", "root": "root"}},
 		"roles":   map[string]any{"desk": map[string]any{"move": true, "place": true}, "reader": map[string]any{}},
 		"rules":   catNSRules}
@@ -533,9 +542,67 @@ func (w *derivedWorld) caughtUp(t *testing.T) {
 	}
 }
 
-// user is an identity grant of sub for cat with groups, no verbs.
+// user is an identity grant of sub for cat with groups. It allows read
+// there (§C.2 item 2), without which the catalog service refuses it its
+// read grants and read wants since v0.82 (§B.11.4 The caller's grant:
+// "They answer so to /read-grants, and to a want that lists read, where
+// the grant allows read (§C.2 item 2) in no namespace it verifies in"),
+// and its own rule fixes /resource to a name no node has (identityOnly),
+// whatever idp's key may grant in cat: it reads no document of cat, as a
+// grant without verbs did, which readsNoNode checks at the core.
 func (w *derivedWorld) user(t *testing.T, sub string, groups ...string) string {
-	return w.idp.Grant(t, w.s.Now(), sub, []string{"cat"}, []string{}, map[string]any{"groups": toAnyT(groups)})
+	t.Helper()
+	g := w.idp.Grant(t, w.s.Now(), sub, []string{"cat"}, []string{"read"},
+		map[string]any{"groups": toAnyT(groups), "rules": []any{identityOnly()}})
+	w.readsNoNode(t, g)
+	return g
+}
+
+// identityOnly is the rule that makes a grant that allows read in cat
+// read nothing there: it fixes /resource (§2.1) to a name no node has.
+func identityOnly() map[string]any {
+	return map[string]any{"op": "test", "path": "/resource", "value": "identity-only"}
+}
+
+// readsNoNode fails the test if grant g reads anything of cat's
+// documents at the core: a node document (root, hidden from every user,
+// Season 2026 and derby.json's placement are answered as names that
+// don't exist), or a name in cat's heads, which the core lists for it,
+// a partial reader (§B.11.9), filtered to the names its rules pass:
+// none. An identity grant shows its holder the tree through the
+// catalog's answers only (§B.11.5).
+func (w *derivedWorld) readsNoNode(t *testing.T, g string) {
+	t.Helper()
+	c := w.s.Client(t, client.WithBearer(g))
+	for _, node := range []string{"root", "season", "matches.derby"} {
+		if h, err := c.Head(w.ctx, "cat", node); err != nil || h.State != client.NotFound {
+			t.Fatalf("an identity grant's read of cat/%s: %+v, %v, want it not found", node, h, err)
+		}
+	}
+	h, err := w.ops.NSHead(w.ctx, "cat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(w.ctx, "GET", w.s.URL+"/ns/cat/rev/"+h.ID+"/heads", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+g)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var listed struct {
+		Heads []any  `json:"heads"`
+		Next  string `json:"next"`
+	}
+	if res.StatusCode == http.StatusForbidden {
+		return
+	}
+	if err := json.NewDecoder(res.Body).Decode(&listed); res.StatusCode != http.StatusOK || err != nil || len(listed.Heads) != 0 || listed.Next != "" {
+		t.Fatalf("an identity grant's listing of cat's heads: %d %v %v, want none listed", res.StatusCode, listed, err)
+	}
 }
 
 func toAnyT(ss []string) []any {

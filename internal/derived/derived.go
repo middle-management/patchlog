@@ -56,6 +56,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -75,8 +76,10 @@ func Protected(level string) bool { return level == LevelSealed || level == Leve
 type View struct {
 	// NS is the namespace whose epoch key seals the whole response.
 	NS string
-	// Target is the request target, path and query, of the …/at/{at}/…
-	// URL the response is served at.
+	// Target is the request target in origin form (path, then ? and the
+	// query where there is one; no scheme or host) of the …/at/{at}/…
+	// URL the response is served at, byte for byte as the service's
+	// redirect gave it (§E.2.6 view).
 	Target string
 }
 
@@ -100,6 +103,21 @@ func Marshal(v any) ([]byte, error) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
+// canonical is v in canonical JSON (jsonv.Canonical): v as the services
+// write it (Marshal), read back as plain JSON values, so that structs,
+// typed slices and integers are serialised as any other member is.
+func canonical(v any) ([]byte, error) {
+	b, err := Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var plain any
+	if err := json.Unmarshal(b, &plain); err != nil {
+		return nil, err
+	}
+	return jsonv.Canonical(plain), nil
+}
+
 // Key is what seals for one namespace under one epoch: the epoch, its
 // epoch key and whether the namespace pads (Keys.Current, Keys.KeyAt).
 type Key struct {
@@ -109,8 +127,11 @@ type Key struct {
 	Pad   bool
 }
 
+// seal seals body under key. Its plaintext is body in canonical JSON
+// (RFC 8785; §3.1, §E.2.6 What gets sealed: "each plaintext sealed here
+// is canonical JSON, before any padding"), whatever Go value it is.
 func (k Key) seal(key []byte, pl seal.PL, body any) (string, error) {
-	b, err := Marshal(body)
+	b, err := canonical(body)
 	if err != nil {
 		return "", err
 	}

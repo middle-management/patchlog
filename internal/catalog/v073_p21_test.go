@@ -448,7 +448,7 @@ func setupE2ECatalog(t *testing.T) *world {
 	catEntry := catKey.Entry("read", "create", "append", "delete", "restore")
 	catEntry["maxTtl"] = "PT15M"
 	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{
-		"read": "grant", "keys": []any{opsKey.Entry("*"), idp.Entry(), catEntry}, "encryption": map[string]any{"level": "e2e"},
+		"read": "grant", "keys": []any{opsKey.Entry("*"), idEntry(idp), catEntry}, "encryption": map[string]any{"level": "e2e"},
 		"catalog": map[string]any{"trust": toAny("matches"), "mode": "dag"},
 		"roles":   map[string]any{"desk": map[string]any{"move": true, "place": true}},
 	}))

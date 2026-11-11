@@ -782,7 +782,10 @@ func TestV075FilteredPurged(t *testing.T) {
 	expect(t, w.patchNS("matches", ops(op("add", "/frozen", true)), w.admin), 201)
 	expect(t, w.do(req{method: "POST", path: "/ns/matches/purge?force=1", ifMatch: w.nsHead("matches", w.admin), bearer: opg}), 204)
 	purgeNS := w.nsHead("matches", w.admin)
-	gs, at := w.filtered(li)
+	// Her unfiltered /heads is 410 directly since v0.82 (ACC-8a); the
+	// unfiltered log still redirects to her gs.
+	expectCode(t, w.get("/ns/matches/rev/"+purgeNS+"/heads", li), 410, "purged")
+	gs, at := v82encFilteredLog(w, li)
 	r := w.get("/ns/matches/g/"+gs+"/at/"+at+"/heads", li)
 	expectCode(t, r, 410, "purged")
 	// As the unfiltered /heads' 410, tagged as filtered answers are.

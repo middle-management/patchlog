@@ -375,7 +375,7 @@ func TestReadGrantsCatalogNodesV073(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		fan := w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, []string{}, map[string]any{"groups": toAny("fan-club"), "enc": jwk})
+		fan := w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, idCan, map[string]any{"groups": toAny("fan-club"), "enc": jwk})
 		items := toAny("/r/cat/season", "/r/cat/rumours", "/r/cat/nosuch", "/r/cat/matches.rumour1", "/r/cat/matches.ghost")
 		rg := w.do("POST", "/read-grants", fan, map[string]any{"items": items})
 		if e := entry(rg, 0); e["status"] != nil || e["grant"] != nil || e["keys"] == nil {
@@ -398,8 +398,9 @@ func TestReadGrantsCatalogNodesV073(t *testing.T) {
 // TestReadGrantsVisibleRolesV073 (TC-43, scenario 47): a /read-grants item
 // is refused as POST /grants refuses a read of it, counting only the roles
 // that make it visible, by the listing visibility test: a role whose rule
-// refers to /now doesn't, though POST /grants grants it, which doesn't
-// evaluate rules. A hidden item is answered as one without a placement,
+// refers to /now doesn't, and since v0.82 POST /grants keeps no such role
+// for a read want either (§B.11.2 Through the key, scenario 117): both
+// refuse alike. A hidden item is answered as one without a placement,
 // and the grant carries only the roles that make the item visible
 // (§B.11.5).
 func TestReadGrantsVisibleRolesV073(t *testing.T) {
@@ -427,13 +428,13 @@ func TestReadGrantsVisibleRolesV073(t *testing.T) {
 
 	// A role with a /now rule makes nothing visible.
 	timer := w.caller("user:tim", "timers")
-	w.issue(timer, map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 200)
+	w.issue(timer, map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 403)
 	if e := entry(w.do("POST", "/read-grants", timer, map[string]any{"items": toAny("/r/matches/derby")}), 0); e["status"] != 403.0 {
 		t.Errorf("read-grants through a /now role: %v", e)
 	}
 	// The grant carries the roles that make the item visible only.
 	fan := w.caller("user:fred", "fan-club")
-	if b := w.issue(fan, map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 200).body; fmt.Sprint(b["roles"]) != "[reader timed]" {
+	if b := w.issue(fan, map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 200).body; fmt.Sprint(b["roles"]) != "[reader]" {
 		t.Errorf("POST /grants roles %v", b["roles"])
 	}
 	e := entry(w.do("POST", "/read-grants", fan, map[string]any{"items": toAny("/r/matches/derby")}), 0)
@@ -461,7 +462,7 @@ func TestReadGrantsPublicSealedV073(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fan := w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, []string{}, map[string]any{"groups": toAny("fan-club"), "enc": jwk})
+	fan := w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, idCan, map[string]any{"groups": toAny("fan-club"), "enc": jwk})
 	rg := w.do("POST", "/read-grants", fan, map[string]any{"items": toAny("/r/matches/derby", "/r/matches/rumour1")})
 	d, r := entry(rg, 0), entry(rg, 1)
 	if ks, _ := d["keys"].([]any); d["public"] != nil || d["grant"] != nil || d["status"] != nil || len(ks) != 2 {
@@ -505,7 +506,7 @@ func TestReadGrantsKeysBehindV073(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fan := w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, []string{}, map[string]any{"groups": toAny("fan-club"), "enc": jwk})
+	fan := w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, idCan, map[string]any{"groups": toAny("fan-club"), "enc": jwk})
 	body := map[string]any{"items": toAny("/r/matches/derby")}
 	if e := entry(w.do("POST", "/read-grants", fan, body), 0); e["status"] != nil || e["keys"] == nil {
 		t.Fatalf("read-grants: %v", e)

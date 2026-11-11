@@ -965,7 +965,8 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	// doesn't serve: 404 alike, before the read check, as the index
 	// answers a namespace it doesn't follow (§A.4, §E.2.6). One whose keys
 	// it can't fetch for now is behind (below).
-	skipped, lacksKeys := s.keys.Skip(cat)
+	// In a release preview the keys are the branch's (keyNS).
+	skipped, lacksKeys := s.keys.Skip(s.keyNS())
 	if lacksKeys || s.isStopped(cat) {
 		// Stopped too: a catalog it can't follow for keys it lacks or a
 		// refusal (purgeStopped) is one it doesn't serve.
@@ -1297,7 +1298,7 @@ var errInfoChanged = fmt.Errorf("%w: the catalog's encryption changed", errPurge
 // does: a listing computed before a purge, or under the encryption a
 // raise replaced, is never served or kept.
 func (s *Service) currentListing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string) (*computed, error) {
-	cat := s.opt.Catalog
+	cat := s.keyNS()
 	var err error
 	for range 3 {
 		info, key, kerr := s.keys.Current(ctx, cat)
@@ -1326,7 +1327,11 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	if f := s.beforeListing.Load(); f != nil {
 		(*f)()
 	}
-	cat := s.opt.Catalog
+	// cat names the catalog as its URLs, tags and kept listings do; keyNS
+	// the namespace whose keys seal them (keyNS): in a release preview
+	// the branch, whose name every pl.ns and kid carries, while the view
+	// keeps the URL as served, /{catalog}/… (§E.2.6, §B.5 Previews).
+	cat, keyNS := s.opt.Catalog, s.keyNS()
 	keep := !perReader(op, v)
 	gen, sgen := s.kept.Generation(cat), s.sealed.Generation()
 	// info was read before gen: a config change since (a raise to sealed
@@ -1395,12 +1400,15 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		serr error
 	)
 	// Each node's values are sealed under the epoch its head is served
-	// under (Node.Epoch; §E.2.6), the current one where that isn't known.
-	// In an e2e catalog that is a pending judgement, of the head's
-	// revision or the born's, made once: the epoch a listing first seals
-	// it under is recorded (judged, judgeEpochs) before the listing is
-	// stored or served, and used from then on; one another listing
-	// recorded first wins, and the listing is computed again with it.
+	// under (Node.Epoch; §E.2.6). Where that isn't judged, nothing derived
+	// from the head is sealed: the node is shown by name only, and its
+	// values left out of other entries, until it is (unjudged below).
+	// In an e2e catalog a head read without an own kid is a pending
+	// judgement, of the head's revision or the born's, made once: the
+	// epoch a listing first seals it under is recorded (judged,
+	// judgeEpochs) before the listing is stored or served, and used from
+	// then on; one another listing recorded first wins, and the listing
+	// is computed again with it.
 	// The keys of older epochs are read, outside the graph's lock, only
 	// once a listing shows a node they seal, and the listing computed
 	// again with them. An epoch whose key the service can't have
@@ -1425,11 +1433,12 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		perEntry = info.Protected() && !v.sealsWhole()
 		whole = key.Epoch
 		missing := map[int]bool{}
+		nameOnly, reread, pending := false, false, false
 		s.View(func(g *Graph, curMap map[string]string) {
 			l.at, nss = s.combinedAt(g, curMap)
 			cps = s.checkpointsOf(g, curMap)
 			prof = s.profileOf(g)
-			view = derived.View{NS: cat, Target: canon(l.at)}
+			view = derived.View{NS: keyNS, Target: canon(l.at)}
 			// epochOf is the epoch node name's values are sealed under,
 			// a pending one judged (judge) as they are; peekEpoch the
 			// same, judging nothing.
@@ -1447,26 +1456,58 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				}
 				return j
 			}
+			// unjudged is whether the epoch of n's head isn't judged and
+			// can't be now: nothing derived from that revision is sealed
+			// (§E.2.6 Per-entry sealing), so its entry is by name only
+			// and its values are left out of other entries. At E2 the
+			// epoch is the head's served kid's, read with it: a head
+			// stored without one is read again (rejudge). At E3 one read
+			// without an own kid is judged here, once the heads' epochs
+			// are read in; until then (epochsPending) it may be one not
+			// read in yet, and a head a fill couldn't read for good
+			// (unreadEpoch) is never judged: it may be one of an older
+			// epoch. An implicit placement and a node without a
+			// head have no revision of the catalog to judge: their values
+			// are the current epoch's (see epochOf).
+			unjudged := func(n *Node) bool {
+				if n == nil || n.Epoch > 0 || n.Head == "" || n.Self {
+					return false
+				}
+				return !e3 || s.epochsPending || s.unreadEpoch[n.Name] == n.Head
+			}
+			// leftOut notes that values of n were left out because its
+			// epoch isn't judged: the fill that judges it drops this
+			// listing (nameOnly), and at E2, where only reading the
+			// head again tells its epoch, or for a head an earlier
+			// fill couldn't read (unreadEpoch), one is asked for
+			// (reread) unless a fill is reading it or couldn't.
+			leftOut := func(n *Node) {
+				nameOnly = true
+				if (!e3 || s.unreadEpoch[n.Name] == n.Head) && !s.epochsPending && s.unknownEpoch[n.Name] != n.Head {
+					reread = true
+				}
+			}
+			// epochOf is the epoch node name's values are sealed under,
+			// a pending one judged (judge) as they are; 0 where it isn't
+			// judged (unjudged): none of them is sealed.
 			epochOf := func(name string) int {
 				n := g.Node(name)
 				if n != nil && n.Epoch > 0 {
 					return n.Epoch
 				}
+				if unjudged(n) {
+					leftOut(n)
+					return 0
+				}
 				if e3 && n != nil && n.Head != "" && !n.Self {
-					if !s.epochsPending {
-						judge(n).epoch = key.Epoch
-					} else {
-						// Its epoch may not be read in yet (an own
-						// op's kid): not judged, and the fill drops
-						// the stored listings (backfillEpochs).
-						s.unjudged.Store(true)
-					}
+					judge(n).epoch = key.Epoch
 				}
 				return key.Epoch
 			}
 			run := func() map[int]bool {
 				more, serr = nil, nil
 				judged = map[string]*judgement{}
+				pending = false
 				epochs := map[int]bool{}
 				q := &query{s: s, g: g, cur: curMap, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
 				// sealAt seals vals of node name under its K_r of epoch e,
@@ -1492,17 +1533,20 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 					// whose epoch isn't known is left out, never sealed
 					// under the head's.
 					q.bornApart = func(n *Node) int {
+						if unjudged(n) {
+							// By name only: its born is left out with
+							// its other values, and judged with none.
+							leftOut(n)
+							return bornLeftOut
+						}
 						switch e := n.BornEpoch; {
 						case e == bornWithHead && e3:
 							// Its revision is the head's: sealed with
 							// the head's values, under its judgement,
 							// which the born keeps should the head move
-							// on before it is recorded. Not judged while
-							// the head isn't (epochsPending).
-							if n.Epoch > 0 || !s.epochsPending {
-								j := judge(n)
-								j.withHead, j.bornEpoch = true, peekEpoch(n.Name)
-							}
+							// on before it is recorded.
+							j := judge(n)
+							j.withHead, j.bornEpoch = true, peekEpoch(n.Name)
 							return 0
 						case e == bornPending && e3:
 							// Judged now, as the epoch in force.
@@ -1521,10 +1565,24 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				}
 				switch {
 				case perEntry:
-					q.sealValues = func(name string, vals map[string]any) string { return sealAt(name, epochOf(name), vals) }
+					q.sealValues = func(name string, vals map[string]any) string {
+						if e := epochOf(name); e > 0 {
+							return sealAt(name, e, vals)
+						}
+						return ""
+					}
 					q.sealIn = sealAt
 				case info.Protected():
-					q.noteValues = func(name string) { epochs[epochOf(name)] = true }
+					// A node whose epoch isn't judged can't be sealed
+					// whole with the others: per entry after all, where
+					// it is by name only.
+					q.noteValues = func(name string) {
+						if e := epochOf(name); e > 0 {
+							epochs[e] = true
+						} else {
+							pending = true
+						}
+					}
 					q.noteEpoch = func(e int) { epochs[e] = true }
 				}
 				if op == "children" && keep {
@@ -1533,7 +1591,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 					// gives.
 					path, _, _ := strings.Cut(view.Target, "?")
 					q.pages = &more
-					q.pageView = func(query string) derived.View { return derived.View{NS: cat, Target: path + query} }
+					q.pageView = func(query string) derived.View { return derived.View{NS: keyNS, Target: path + query} }
 				}
 				body, l.status, l.msg = q.run(op)
 				tags = q.tags
@@ -1546,13 +1604,22 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			for e := range epochs {
 				whole = e
 			}
-			if _, ok := keys[whole]; len(epochs) > 1 || lacking[whole] || !ok {
-				// Values of several epochs, or of one whose key the
-				// service lacks: per entry after all.
+			if _, ok := keys[whole]; pending || len(epochs) > 1 || lacking[whole] || !ok {
+				// Values of several epochs, of one whose key the
+				// service lacks, or of a revision whose epoch isn't
+				// judged (§E.2.6): per entry after all.
 				perEntry = true
 				run()
 			}
 		})
+		if nameOnly || fs.pending {
+			// The fill that judges them drops the listings that left
+			// them out (backfillEpochs).
+			s.nameOnly.Store(true)
+		}
+		if reread || fs.reread {
+			s.rejudge()
+		}
 		// What it was computed under still holds as the graph was read,
 		// before anything is judged, stored, kept or served by it.
 		if err := s.unchanged(ctx, v, info, fs); err != nil {
@@ -1576,13 +1643,13 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			break
 		}
 		for e := range missing {
-			k, err := s.keys.KeyAt(ctx, cat, e)
+			k, err := s.keys.KeyAt(ctx, keyNS, e)
 			switch {
 			case err != nil && lastingKeyErr(err):
-				s.opt.Logf("tree: values of catalog nodes served under %s#%d left out: %v", cat, e, err)
+				s.opt.Logf("tree: values of catalog nodes served under %s#%d left out: %v", keyNS, e, err)
 				lacking[e] = true
 			case err != nil:
-				return nil, fmt.Errorf("%w %s#%d: %w", errCatalogKeys, cat, e, err)
+				return nil, fmt.Errorf("%w %s#%d: %w", errCatalogKeys, keyNS, e, err)
 			default:
 				keys[e] = k
 			}
@@ -1612,8 +1679,16 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	}
 	if !keep {
 		// Neither stored nor kept: whether it may be served depends on
-		// the reader. No kept generation guards it; the encryption was
-		// read again once its graph was (unchanged).
+		// the reader. The kept generation guards it all the same, as it
+		// does a listing that is kept: one computed from what was read
+		// before a purge of what it shows is not served (§A.1, §B.5),
+		// and is computed again (currentListing).
+		if f := s.beforeUnkept.Load(); f != nil {
+			(*f)()
+		}
+		if s.kept.PurgedSince(cat, gen, strings.Split(l.st.Tags, ",")) {
+			return nil, errPurgedSince
+		}
 		return l, nil
 	}
 	type page struct {
@@ -1661,13 +1736,23 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	return l, nil
 }
 
+// keyNS is the namespace whose keys seal the catalog's listings: the
+// catalog, or in a release preview its branch, the namespace the service
+// follows in its place (actual). A preview's entries, read-through ones
+// included, are sealed under the branch's K_r and epoch, never the
+// base's (§E.2.6 Per-entry sealing, §E.2.5): a reader of the base without
+// read on the branch opens none of them. Every key lookup, View.NS and so
+// each pl.ns and kid use it; a preview without the branch's keys seals
+// nothing under the base's.
+func (s *Service) keyNS() string { return s.actual(s.opt.Catalog) }
+
 // unchanged is errInfoChanged if the catalog's encryption is no longer
 // info, what fs was read from has changed (fileSealingChanged; fs nil
 // for none yet), or a namespace v was judged public by has since been
 // made private (stillPublic), and errCurrentKey if the encryption can't
 // be read.
 func (s *Service) unchanged(ctx context.Context, v *viewer, info derived.Info, fs *fileSealing) error {
-	cat := s.opt.Catalog
+	cat := s.keyNS()
 	now, err := s.keys.Info(ctx, cat)
 	if err != nil {
 		return fmt.Errorf("%w (%s): %w", errCurrentKey, cat, err)
@@ -2216,6 +2301,16 @@ func parseMins(vals []string) ([]minRef, error) {
 		out = append(out, m)
 	}
 	return out, nil
+}
+
+// MalformedMin is why the first of the ?min= values vals that isn't
+// {ns}:{ns_id} or an ns_id is malformed, "" if none is: the part of
+// AwaitMins' 400 that is the request's shape, which no state decides.
+func MalformedMin(vals []string) string {
+	if _, err := parseMins(vals); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 // parseMin parses one ?min= value: {ns}:{ns_id} or a bare {ns_id}.
@@ -2982,44 +3077,66 @@ func (q *query) paths(n *Node) (paths [][]*Node, incomplete, deep int, truncated
 	return
 }
 
-func (q *query) pathJSON(ps [][]*Node) []any {
-	out := []any{}
-	for _, p := range ps {
-		arr := make([]any, 0, len(p))
-		for _, x := range p {
+// pathsInto sets, on the body of an ancestors or where answer (§B.5), what
+// the walk from n found: paths, every path to a root (for a subject set,
+// to its visible root, §B.11.5), each an array of node names from the
+// root down to n itself, so a root's own path is [n]; nodes, each named
+// node's href and title, for breadcrumbs (the reference's own member), in
+// a sealed or e2e catalog its "sealed" values, as an entry's are
+// (§E.2.6); and what was cut, as top-level members that are absent
+// otherwise (§B.5 Shared nodes in DAGs): "tooDeep": true where a path was
+// cut at depth MaxDepth, "truncated": true at maxPaths. incomplete counts
+// the paths of an unfiltered listing that end below a root.
+func (q *query) pathsInto(body map[string]any, n *Node) {
+	ps, incomplete, deep, trunc := q.paths(n)
+	paths := []any{}
+	nodes := map[string]any{}
+	name := func(x *Node) string {
+		if _, ok := nodes[x.Name]; !ok {
 			q.tags.node(q.g, x.Name)
-			e := map[string]any{"href": q.g.Href(x.Name), "name": x.Name}
+			e := map[string]any{"href": q.g.Href(x.Name)}
 			q.title(e, x)
-			arr = append(arr, e)
+			nodes[x.Name] = e
 		}
-		out = append(out, arr)
+		return x.Name
 	}
-	return out
+	for _, p := range ps {
+		arr := make([]any, 0, len(p)+1)
+		for _, x := range p {
+			arr = append(arr, name(x))
+		}
+		paths = append(paths, append(arr, name(n)))
+	}
+	body["paths"], body["nodes"] = paths, nodes
+	if incomplete > 0 {
+		body["incomplete"] = incomplete
+	}
+	if deep > 0 {
+		body["tooDeep"] = true
+	}
+	if trunc {
+		body["truncated"] = true
+	}
 }
 
-// ancestors lists every path from the node to a root, root first, for
-// breadcrumbs. Paths through nodes the reader may not see are left out.
+// ancestors lists every path from a root down to the node, for
+// breadcrumbs (pathsInto). Paths through nodes the reader may not see are
+// left out.
 func (q *query) ancestors() (any, int, string) {
 	n, st, msg := q.node("of")
 	if n == nil {
 		return nil, st, msg
 	}
-	ps, incomplete, deep, trunc := q.paths(n)
-	body := map[string]any{"at": q.at, "of": q.g.Href(n.Name), "node": q.entry(n), "paths": q.pathJSON(ps)}
-	if incomplete > 0 {
-		body["incomplete"] = incomplete
-	}
-	if deep > 0 {
-		body["tooDeep"] = deep
-	}
-	if trunc {
-		body["truncated"] = true
-	}
+	body := map[string]any{"at": q.at, "of": q.g.Href(n.Name), "node": q.entry(n)}
+	q.pathsInto(body, n)
 	return body, http.StatusOK, ""
 }
 
 // subtree lists a folder's descendants as a nested listing, depth levels
-// deep (default 3, at most 64).
+// deep (default 3, at most 64). A folder at the depth asked for that has
+// more is marked "more"; where that depth is the limit itself, the answer
+// also says "tooDeep": true, and "truncated": true at the node limit,
+// both absent otherwise (§B.5 Shared nodes in DAGs).
 func (q *query) subtree() (any, int, string) {
 	n, st, msg := q.node("of")
 	if n == nil {
@@ -3034,7 +3151,7 @@ func (q *query) subtree() (any, int, string) {
 		depth = min(d, MaxDepth)
 	}
 	count := 0
-	truncated := false
+	truncated, tooDeep := false, false
 	// In a DAG a folder is listed under each of its parents, and one
 	// reached along several paths would be expanded once per path, which
 	// grows exponentially with stacked diamonds. So a folder is expanded
@@ -3054,6 +3171,11 @@ func (q *query) subtree() (any, int, string) {
 		if d >= depth {
 			if len(q.visibleChildren(x.Name)) > 0 {
 				e["more"] = true
+				// Cut by the depth limit itself, not by the depth
+				// asked for: reported at the top level (§B.5).
+				if d >= MaxDepth {
+					tooDeep = true
+				}
 			}
 			return e
 		}
@@ -3080,6 +3202,9 @@ func (q *query) subtree() (any, int, string) {
 		return e
 	}
 	body := map[string]any{"at": q.at, "of": q.g.Href(n.Name), "depth": depth, "tree": build(n, 0, map[string]bool{})}
+	if tooDeep {
+		body["tooDeep"] = true
+	}
 	if truncated {
 		body["truncated"] = true
 	}
@@ -3284,17 +3409,7 @@ func (q *query) where() (any, int, string) {
 		return nil, http.StatusNotFound, noSuchNode
 	}
 	body := map[string]any{"at": q.at, "item": ref, "placement": q.entry(n)}
-	ps, incomplete, deep, trunc := q.paths(n)
-	body["paths"] = q.pathJSON(ps)
-	if incomplete > 0 {
-		body["incomplete"] = incomplete
-	}
-	if deep > 0 {
-		body["tooDeep"] = deep
-	}
-	if trunc {
-		body["truncated"] = true
-	}
+	q.pathsInto(body, n)
 	return body, http.StatusOK, ""
 }
 

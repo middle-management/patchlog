@@ -69,6 +69,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdh"
 	"database/sql"
 	"errors"
@@ -409,7 +410,9 @@ func (t *tx) declaredAt(row *revRow) []ids.ID {
 
 // checkKeyring checks the keyring resource's documents in an e2e
 // namespace (§E.3.2): the keyring document, { "keys": [{ kid, to, from,
-// wrapped }] } with nothing else but a fresh $nonce (§C.7) and no two
+// wrapped }] } with nothing else but a $nonce of §C.7's form, which a
+// writer makes new on every write and the server checks for its form
+// alone, never for having been seen, and no two
 // entries for one kid and to (seal.CheckKeyringV2), whose kids name this
 // namespace and epochs not after encryption.epoch. A keyring in the format
 // before v0.63 is refused like any other document: a key holder writes
@@ -659,8 +662,8 @@ func (t *tx) kidName(b *nsRow) string {
 // recipient enc, of the given epochs, as /keys relays them (§E.2.3): the
 // entries whose to is enc's thumbprint, with from. Each entry's kid names
 // the keyring's owner, checked when it was written; for a remote branch's
-// shadow, the remote base (§G.5). Only a keyring of the §E.3.2 form with a
-// fresh $nonce, as a write checks it (seal.CheckKeyringV2), is relayed: one
+// shadow, the remote base (§G.5). Only a keyring of the §E.3.2 form, its
+// $nonce of §C.7's form as a write checks it (seal.CheckKeyringV2), is relayed: one
 // stored in the format before v0.63 relays nothing, failing closed until a
 // key holder wraps it again, and one with a $nonce written before v0.76
 // until a key holder's next keyring write, which carries a fresh one
@@ -729,7 +732,12 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	t.pruneBlobsE2E(own.id, h.seq, kept)
 	_, err = t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
 	t.must(err)
-	_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res = ? AND seq < ?`, own.id, h.seq)
+	// The resource's earlier snapshots end with the move of its horizon
+	// (§7.1): those below h, and one above it, which an archive restore
+	// kept while this prune set a lower horizon. Their revisions answer
+	// 410 pruned or 404 not_offered from now on. Only own's rows: a
+	// base's snapshot a branch reads through is the base's to end.
+	_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res = ? AND seq <> ?`, own.id, h.seq)
 	t.must(err)
 	_, err = t.Exec(`UPDATE resources SET horizon_seq = ?, keep = '[]' WHERE res = ?`, h.seq, own.id)
 	t.must(err)
@@ -774,4 +782,33 @@ func (t *tx) pruneBlobsE2E(res, hseq int64, kept []ids.ID) {
 		t.must(err)
 		t.gcBytes(b.owner, b.hash)
 	}
+}
+
+// cleanStaleSnapshots deletes, at Open, the E3 snapshots a version before
+// v0.82 left behind a moved horizon (§7.1: a stored snapshot is served
+// until a purge or a later prune moves the horizon): every row of a
+// resource with a horizon that isn't stored at it, as a prune at a lower
+// horizon after an archive restore left the earlier one; and, for a
+// resource without a horizon that has more than one, all of them, since
+// none says which the last prune stored (readers fold from the restored
+// log). The one snapshot a restore keeps, and a remote branch's mirrored
+// one, which sits at its resource's horizon (insertChain), stay. It runs
+// after the legacy-e2e gate, the migrations and that gate's purges, and
+// is idempotent. It returns the number of rows deleted.
+func (e *Engine) cleanStaleSnapshots(ctx context.Context) (int64, error) {
+	var n int64
+	err := e.update(ctx, func(t *tx) error {
+		n = 0
+		for _, q := range []string{
+			`DELETE FROM e2e_snapshots WHERE EXISTS (SELECT 1 FROM resources r WHERE r.res = e2e_snapshots.res AND r.horizon_seq IS NOT NULL AND r.horizon_seq <> e2e_snapshots.seq)`,
+			`DELETE FROM e2e_snapshots WHERE res IN (SELECT s.res FROM e2e_snapshots s JOIN resources r ON r.res = s.res WHERE r.horizon_seq IS NULL GROUP BY s.res HAVING COUNT(*) > 1)`,
+		} {
+			r, err := t.Exec(q)
+			t.must(err)
+			k, _ := r.RowsAffected()
+			n += k
+		}
+		return nil
+	})
+	return n, err
 }

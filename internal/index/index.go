@@ -27,8 +27,11 @@
 //	edge_filters(marker, filter, exp) what each scope or g: marker of those stands for (markerRec)
 //	edge_gs(marker, subjects, kid, roles, pub, exp)  and, for a g: marker (§B.11.9), its subjects;
 //	                                      its kid, roles and pub are no longer read (edge_gs_keys)
-//	edge_gs_keys(marker, kid, roles, pub, exp)  every key a g: marker's live cookies came from,
-//	                                      with the read roles its scope digest covers (gsKey)
+//	edge_gs_keys(marker, exp, kid, roles, pub, entry)  every key the cookie of a marker (reads:{ns}
+//	                                      included) that expires at exp came from, with its read
+//	                                      roles and the digest of its entry and theirs (gsKey),
+//	                                      written once: an exchange with other keys or entries
+//	                                      takes another exp (recordCookies)
 //	member_checkpoints(origin, ns, ns_id)  follow.SQLCheckpoints of the namespaces visibility reads
 //	                                      that the index follows without serving them, while it
 //	                                      follows them (members.go)
@@ -39,7 +42,8 @@
 //	catalog_trust(ns, trust)              the catalog.trust last applied, of either, kept past a
 //	                                      purge-ns and a rebuild (recordTrust, fsTrust), read again
 //	                                      at a snapshot, forgotten once ns is neither served nor
-//	                                      followed, unless purged (dropUnfollowedTrust, forgetMember)
+//	                                      followed, unless purged (dropUnfollowedTrust, forgetMember),
+//	                                      and once more for a served, purged one without (repairTrust)
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
@@ -221,6 +225,7 @@ type Index struct {
 
 	fmu     sync.Mutex
 	filters map[string]keptFilter // scope or g: marker -> what it stands for (edge_filters, edge_gs)
+	copied  sync.Map              // a local branch -> the kids it copied from its base (copiedKids)
 
 	fs  fstate  // the state of namespaces §B.11.9 covers (filtered.go)
 	mem members // the namespaces visibility reads there that the index doesn't serve (members.go)
@@ -267,6 +272,12 @@ type Index struct {
 	// testMemberBootstrap, if set, is called before a member's follower
 	// gives it its first checkpoint (tests: bootstrapMember).
 	testMemberBootstrap func(ctx context.Context, m string)
+	// testTrustRepair, if set, is called before each read of a purged
+	// namespace's document whose catalog.trust the index lost, and
+	// testTrustRepairPause, if set, is the first pause between two
+	// (tests: repairTrustOf).
+	testTrustRepair      func(ctx context.Context, ns string)
+	testTrustRepairPause time.Duration
 	// testBeforeAnswer, if set, is called once a reader's views are
 	// computed, before the answer is (tests: serve's head pointer,
 	// /_refs).
@@ -618,6 +629,11 @@ func (ix *Index) Run(ctx context.Context) error {
 		defer wg.Done()
 		ix.runMembers(ctx)
 	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ix.repairTrust(ctx)
+	}()
 	for ns := range ix.roots {
 		wg.Add(1)
 		go func() {
@@ -631,6 +647,8 @@ func (ix *Index) Run(ctx context.Context) error {
 
 func (ix *Index) follow(ctx context.Context, ns string) {
 	if _, purged, _ := ix.state(ns); purged {
+		// Nothing below runs for it, trustAt neither: a catalog.trust the
+		// index lost of it is read again by repairTrust.
 		ix.opt.Logf("index: %s was purged; not following", ns)
 		return
 	}
@@ -866,9 +884,17 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// which a rebuild keeps) may be one config entries the snapshot
 	// skipped have changed since, and fsTrust reads it once ns is purged.
 	// A purge-ns in place of a listing (a namespace purged before it was
-	// bootstrapped) has no document to read, and keeps it; a sealed one
-	// purged since the listing was read, whose document is 410 too, is
-	// forgotten (unknown: no catalog, which shows least).
+	// bootstrapped) carries none either: its document is read at the
+	// purge-ns entry, where the origin still serves it unless the
+	// namespace is sealed (§8.5), as a follower for visibility reads it
+	// at its bootstrap (bootstrapMember; §B.11.9 Where, v0.82: "the last
+	// one the origin stored or the service read"), and where that is 410
+	// too the trust recorded before is kept. Before, it was never read,
+	// and a catalog the index serves and met purged from a snapshot
+	// counted as no catalog unless a follower for visibility had read it
+	// first. A sealed namespace purged since the listing was read, whose
+	// document is 410 too, is forgotten (unknown: no catalog, which shows
+	// least).
 	//
 	// The document also decides, as a config entry's would, whether the
 	// snapshot narrows ns against what ns_conf records (none after a
@@ -877,11 +903,11 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// down or behind leaves no public result kept or cached.
 	var snapDoc *client.NSDoc
 	forgetTrust := false
-	if b.Replaces() && !config && !co.PurgedNS {
+	if b.Replaces() && !config {
 		doc, err := ix.c.NSDoc(ctx, b.NS, b.NewCheckpoint)
 		switch {
 		case client.IsPurged(err):
-			forgetTrust = true
+			forgetTrust = !co.PurgedNS
 		case err != nil:
 			return lacksRead(b.NS, fmt.Errorf("the document of %s at %s: %w", b.NS, b.NewCheckpoint, err))
 		default:

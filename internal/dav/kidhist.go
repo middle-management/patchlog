@@ -111,21 +111,32 @@ func isConfig(e client.NSEntry) bool {
 // time, unless another token read it (sharedKeyHistory), then from where
 // it was left whenever an entry later than what it covers is judged, and
 // at least every writerTTL. ok is false where it can't be read (a grant
-// without read of the namespace log, say).
-func (st *reqState) keyHistory(ctx context.Context, ns string, need time.Time) (*keyHistory, bool) {
+// without read of the namespace log, say). A read of it that failed for
+// now (failedRead) is err, mapped as a save's failed reads are
+// (saveRead): whose entry it is can't be told, and the save that asks
+// fails (§H.4 "The base"); nothing is kept of such a read.
+func (st *reqState) keyHistory(ctx context.Context, ns string, need time.Time) (h *keyHistory, ok bool, err error) {
 	tk, now := st.tk, st.s.opt.Now()
 	tk.mu.Lock()
-	h := tk.keyHist[ns]
+	h = tk.keyHist[ns]
 	tk.mu.Unlock()
 	if h == nil {
 		h = st.s.sharedKeyHistory(ctx, tk, ns)
 	}
 	if h != nil && !need.After(h.asOf) && now.Sub(h.read) < st.s.writerTTL() {
-		return h, true
+		return h, true, nil
+	}
+	// unread is a read that didn't answer: an error where it failed for
+	// now, else a history the token can't read.
+	unread := func(err error) (*keyHistory, bool, error) {
+		if failedRead(err) {
+			return nil, false, saveRead(err)
+		}
+		return nil, false, nil
 	}
 	head, err := tk.c.NSHead(ctx, ns)
 	if err != nil {
-		return nil, false
+		return unread(err)
 	}
 	nh := &keyHistory{head: head.ID, config: head.Config, read: now}
 	since := ""
@@ -140,7 +151,7 @@ func (st *reqState) keyHistory(ctx context.Context, ns string, need time.Time) (
 		} else {
 			es, err := tk.c.NSLog(ctx, ns, head.ID, since)
 			if err != nil {
-				return nil, false
+				return unread(err)
 			}
 			nh.changes = append([]keyChange(nil), nh.changes...)
 			if n := len(es); n > 0 {
@@ -149,7 +160,7 @@ func (st *reqState) keyHistory(ctx context.Context, ns string, need time.Time) (
 			for _, e := range es {
 				at, err := time.Parse(time.RFC3339Nano, e.Created)
 				if err != nil {
-					return nil, false
+					return nil, false, nil
 				}
 				nh.asOf = maxTime(nh.asOf, at)
 				if !isConfig(e) {
@@ -157,7 +168,7 @@ func (st *reqState) keyHistory(ctx context.Context, ns string, need time.Time) (
 				}
 				d, err := tk.c.NSDoc(ctx, ns, e.ID)
 				if err != nil {
-					return nil, false
+					return unread(err)
 				}
 				keys, base := keysOf(d.Value)
 				nh.changes = append(nh.changes, keyChange{at: at, keys: keys, base: base})
@@ -173,7 +184,7 @@ func (st *reqState) keyHistory(ctx context.Context, ns string, need time.Time) (
 	tk.keyHist[ns] = nh
 	tk.mu.Unlock()
 	st.s.keepKeyHistory(ns, nh)
-	return nh, true
+	return nh, true, nil
 }
 
 func maxTime(a, b time.Time) time.Time {
@@ -188,14 +199,15 @@ func maxTime(a, b time.Time) time.Time {
 // takes a base's key over a branch's own of that kid (§C.4), else ns's
 // own. A kid no document named is "". ok is false where it can't be told:
 // a config write created at the same time changed the kid, which can't be
-// ordered against the entry; read is false where a history can't be read.
-func (st *reqState) keyAt(ctx context.Context, ns, kid string, at time.Time, depth int) (key string, ok, read bool) {
+// ordered against the entry; read is false where a history can't be read,
+// and err is a read of one that failed for now (keyHistory).
+func (st *reqState) keyAt(ctx context.Context, ns, kid string, at time.Time, depth int) (key string, ok, read bool, err error) {
 	if depth > maxDepth {
-		return "", false, true
+		return "", false, true, nil
 	}
-	h, read := st.keyHistory(ctx, ns, at)
-	if !read {
-		return "", false, false
+	h, read, err := st.keyHistory(ctx, ns, at)
+	if err != nil || !read {
+		return "", false, false, err
 	}
 	var cur *keyChange
 	for i := range h.changes {
@@ -204,20 +216,20 @@ func (st *reqState) keyAt(ctx context.Context, ns, kid string, at time.Time, dep
 			break
 		}
 		if c.at.Equal(at) && cur != nil && cur.keys[kid] != c.keys[kid] {
-			return "", false, true
+			return "", false, true, nil
 		}
 		cur = c
 	}
 	if cur == nil {
-		return "", true, true
+		return "", true, true, nil
 	}
 	if cur.base != "" {
-		k, ok, read := st.keyAt(ctx, cur.base, kid, at, depth+1)
-		if !ok || k != "" {
-			return k, ok, read
+		k, ok, read, err := st.keyAt(ctx, cur.base, kid, at, depth+1)
+		if err != nil || !ok || k != "" {
+			return k, ok, read, err
 		}
 	}
-	return cur.keys[kid], true, true
+	return cur.keys[kid], true, true, nil
 }
 
 // maxDepth bounds base chains (the deployment's branch depth is 8 by
@@ -247,41 +259,55 @@ func keyThumbprint(key string) string {
 // against a config write of the same time. Where the token can't read
 // the namespace's history (a grant limited to some resources, or a
 // content namespace a catalog's grants open, §H.7), the kid is judged as
-// it names the key now, as the user was told.
-func (st *reqState) wroteAs(ctx context.Context, ns string, e client.LogEntry) bool {
+// it names the key now, as the user was told. A history whose read
+// failed for now (408, 429, 5xx, no answer) is no such history: whose
+// entry it is isn't known, and the error fails the save that asks (§H.4
+// "The base": 503 or 502), which never takes someone else's entry for
+// the user's own while the core can't say.
+func (st *reqState) wroteAs(ctx context.Context, ns string, e client.LogEntry) (bool, error) {
 	known, verified, key := st.p.wroteAs(ns, e)
 	switch {
 	case !known:
-		return false
+		return false, nil
 	case e.Grant == nil:
-		return true // an X-Author's (authentication disabled)
+		return true, nil // an X-Author's (authentication disabled)
 	}
 	at, err := time.Parse(time.RFC3339Nano, e.Created)
 	if err != nil {
-		return false
+		return false, nil
 	}
-	then, ok, read := st.keyAt(ctx, ns, e.Grant.Kid, at, 0)
+	then, ok, read, err := st.keyAt(ctx, ns, e.Grant.Kid, at, 0)
 	switch {
+	case err != nil:
+		return false, err
 	case !read:
-		return true
+		return true, nil
 	case !ok || then == "":
-		return false
+		return false, nil
 	case verified && key != "":
-		return keyThumbprint(then) == key
+		return keyThumbprint(then) == key, nil
 	}
 	// The kid named the key it names now when the user was given it.
-	now, ok, read := st.keyAt(ctx, ns, e.Grant.Kid, st.keyNow(ctx, ns), 0)
-	return !read || ok && now == then
+	last, err := st.keyNow(ctx, ns)
+	if err != nil {
+		return false, err
+	}
+	now, ok, read, err := st.keyAt(ctx, ns, e.Grant.Kid, last, 0)
+	if err != nil {
+		return false, err
+	}
+	return !read || ok && now == then, nil
 }
 
-// keyNow is the latest time ns's key history covers, read now.
-func (st *reqState) keyNow(ctx context.Context, ns string) time.Time {
-	h, ok := st.keyHistory(ctx, ns, time.Time{})
-	if !ok {
-		return time.Time{}
+// keyNow is the latest time ns's key history covers, read now; the zero
+// time where it can't be read, and err where its read failed for now.
+func (st *reqState) keyNow(ctx context.Context, ns string) (time.Time, error) {
+	h, ok, err := st.keyHistory(ctx, ns, time.Time{})
+	if err != nil || !ok {
+		return time.Time{}, err
 	}
 	if n := len(h.changes); n > 0 {
-		return maxTime(h.asOf, h.changes[n-1].at)
+		return maxTime(h.asOf, h.changes[n-1].at), nil
 	}
-	return h.asOf
+	return h.asOf, nil
 }

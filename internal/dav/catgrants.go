@@ -465,7 +465,10 @@ func (st *reqState) createIssued(ctx context.Context, cat, name string, g *issue
 	if err := st.install(cat, name, g.Grant, true); err != nil {
 		return err
 	}
-	in := st.s.nsInfo(ctx, st.tk, cat)
+	in, err := st.saveInfo(ctx, cat)
+	if err != nil {
+		return err
+	}
 	defer st.changed()
 	return st.retrying(ctx, func() (bool, error) {
 		_, err := st.tk.c.Create(ctx, cat, name, withNonce(in, doc, client.GenesisPatches(doc)))

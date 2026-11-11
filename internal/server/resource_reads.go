@@ -217,10 +217,16 @@ func (s *Server) revGone(w http.ResponseWriter, r *http.Request, ns, name, id st
 		s.cache(w, r, ccPruned, rev.Public, resTags(ns, name)...)
 		writeJSON(w, 410, prunedBody(rev.Horizon, rev.Archive))
 	case rev.Code == "tombstone":
-		// A tombstone id is immutable (§7.1).
+		// A tombstone id is immutable (§7.1), and its 410 names it and
+		// last, its parent, as a tombstoned head's does: a pruner and a
+		// mirroring remote branch learn the parent here (§E.3.1, §G.5.2).
 		s.cache(w, r, ccImmutable, rev.Public, resTags(ns, name)...)
 		w.Header().Set("ETag", quote(id))
-		writeJSON(w, 410, map[string]any{"code": "gone"})
+		body := map[string]any{"code": "gone", "tombstone": id}
+		if rev.Last != "" {
+			body["last"] = rev.Last
+		}
+		writeJSON(w, 410, body)
 	default:
 		// A purge is "long".
 		s.cache(w, r, ccLong, rev.Public, resTags(ns, name)...)

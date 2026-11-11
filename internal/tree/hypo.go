@@ -57,6 +57,12 @@ func (g *Graph) With(changes map[string]any) *Graph {
 	for ns, c := range g.Content {
 		h.Content[ns] = c
 	}
+	// A namespace the service stopped following is stopped in the copy
+	// too: its placements dangle and its roles count for no folder
+	// there as in g (Stopped).
+	for ns, cp := range g.stopped {
+		h.stopped[ns] = cp
+	}
 	for name := range g.explicitGone {
 		h.explicitGone[name] = true
 	}

@@ -130,7 +130,7 @@ func TestNSLogPagePrev(t *testing.T) {
 			}
 			for i, jwe := range ev.EntryJWEs {
 				m := all[k+i]
-				if pt := open(t, jwe, nsKey(t, key, ns), kid, seal.RangePL(ns, since(k+i), m["id"].(string))); string(pt) != string(canonical(m)) {
+				if pt := open(t, jwe, nsKey(t, key, ns), kid, seal.NamespaceEventPL(ns, m["id"].(string))); string(pt) != string(canonical(m)) {
 					t.Fatalf("%s event %d: %s", ns, k+i, pt)
 				}
 			}

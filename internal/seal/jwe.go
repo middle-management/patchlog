@@ -117,6 +117,14 @@ func RangePL(ns, since, id string) PL {
 	return PL{"ns": ns, "range": []any{since, id}}
 }
 
+// NamespaceEventPL binds a namespace stream's event for the entry with id
+// id, sealed under K_n of the epoch current when sealed (§E.2.2, §7.3):
+// { ns, event: id }. It is not a range's pl, so an event can't be replayed
+// as a one-entry range, nor a range as an event.
+func NamespaceEventPL(ns, id string) PL {
+	return PL{"ns": ns, "event": id}
+}
+
 // GrantPL binds a grant served by GET /ns/{ns}/grants/{gid} (§C.3.1,
 // §E.2.2): { ns, grant: gid }.
 func GrantPL(ns, gid string) PL {

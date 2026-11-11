@@ -70,7 +70,7 @@ func TestMulti(t *testing.T) {
 			t.Errorf("children of %s: %s", f, got)
 		}
 	}
-	if got := pathsOf(x.get("/topics/ancestors?of=/r/matches/derby", "")["paths"]); got != "root/stockholm/derbies | root/rivalries/derbies | root/rivalries" {
+	if got := pathsOf(x.get("/topics/ancestors?of=/r/matches/derby", "")["paths"]); got != "root/stockholm/derbies/matches.derby | root/rivalries/derbies/matches.derby | root/rivalries/matches.derby" {
 		t.Errorf("paths of the derby: %s", got)
 	}
 	// The cycle is flagged and not traversed.

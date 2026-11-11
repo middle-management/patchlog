@@ -310,17 +310,24 @@ func (k *Keys) Current(ctx context.Context, ns string) (Info, Key, error) {
 	return in, Key{NS: ns, Epoch: in.Epoch, K: key, Pad: in.Pad}, err
 }
 
+// ErrUnjudged is KeyAt asked for the key of an epoch that isn't known (0
+// or less): the epoch of a revision the service hasn't judged, which it
+// seals nothing derived from (§E.2.6 Per-entry sealing: "until it can
+// judge it, the service seals nothing derived from that revision").
+var ErrUnjudged = errors.New("derived: the epoch isn't judged: nothing is sealed under it")
+
 // KeyAt returns the Key that seals views derived from revisions of ns
 // served under epoch (§E.2.6): that epoch's key K_e, with ns's padding as
-// it is now (padding follows the source namespace, §E.2.6); epoch 0, not
-// known, is the epoch current now (Current).
+// it is now (padding follows the source namespace, §E.2.6). An epoch that
+// isn't known (0 or less) is ErrUnjudged, never the epoch current now: a
+// caller judges it first, or serves the entry by name only.
 func (k *Keys) KeyAt(ctx context.Context, ns string, epoch int) (Key, error) {
+	if epoch <= 0 {
+		return Key{}, ErrUnjudged
+	}
 	in, err := k.Info(ctx, ns)
 	if err != nil {
 		return Key{}, err
-	}
-	if epoch <= 0 {
-		epoch = in.Epoch
 	}
 	key, err := k.EpochKey(ctx, ns, epoch)
 	return Key{NS: ns, Epoch: epoch, K: key, Pad: in.Pad}, err

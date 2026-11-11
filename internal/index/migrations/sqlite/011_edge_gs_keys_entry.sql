@@ -1,0 +1,36 @@
+-- Migration: edge gs keys entry
+-- Created: 2026-11-11T08:50:20Z
+-- Checksum: 2973c90ebd35169531a87cb12332e4f92695acc124451c42c2b9e125a9450fd7
+-- Chain: ac883be9affab4572c5b4a5e2ea78fc6ebb5d769fbcef170175c3cea9b2b57b5
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- edge_gs_keys, kept per cookie (§A.4 gs, §B.11.9 gs, v0.82): every key
+-- the edge grant (cookie) of a marker that expires at exp came from,
+-- reads:{ns} markers included, its kid, read roles (a JSON array of
+-- strings) and pub, as before, and entry, the digest of its whole entry
+-- and of those roles' whole definitions as the document the marker is
+-- judged by gave them at the exchange:
+-- text(trunc160(sha256(canonical({"key": entry, "roles": {name: definition}})))).
+-- A cookie carries its prefix and exp alone, so cookies of one marker
+-- with one exp are one cookie: an exchange adds its key beside the others
+-- recorded for that marker and exp, and a cookie is accepted only while
+-- every one of them is in the document with that entry, so that any
+-- change to the key or to a role it read through ends it until the
+-- reader exchanges again, and no exchange revives a cookie with another
+-- exp. The rows kept before had neither an entry nor one exp per cookie
+-- and vouch for nothing now: they are dropped, so every cookie minted
+-- before this is refused until its reader exchanges again.
+DROP TABLE IF EXISTS edge_gs_keys;
+CREATE TABLE edge_gs_keys (marker TEXT NOT NULL, exp INTEGER NOT NULL, kid TEXT NOT NULL, roles TEXT NOT NULL, pub TEXT NOT NULL, entry TEXT NOT NULL DEFAULT '', PRIMARY KEY (marker, exp, kid, roles, pub));
