@@ -861,6 +861,13 @@ func (c *Client) planUndo(ctx context.Context, ns, gesture string, cfg *undoConf
 		// where /keys refuses or doesn't say, the level is learned from
 		// the resource logs read (readResource).
 		level, learn, err = c.keysLevel(ctx, ns)
+		// A 404 teaches nothing: where /keys isn't offered, a sealed or
+		// e2e level this client holds stands (levels.go). Where the level
+		// is still to be learnt from the logs, readResource holds them
+		// to it.
+		if err == nil && !learn {
+			level = c.heldOver(ns, level)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -1007,6 +1014,10 @@ func (c *Client) readResource(ctx context.Context, env *undoEnv, s *gestureSite)
 		level, known, err := c.logLevel(ctx, env.ns, name, head.ID, since, log)
 		if err != nil {
 			return nil, err
+		}
+		// A log's delivery can't lower a level this client holds.
+		if h := c.heldOver(env.ns, level); h != level {
+			level, known = h, true
 		}
 		if known {
 			env.level, env.learn = level, false

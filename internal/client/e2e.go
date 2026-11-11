@@ -502,25 +502,34 @@ func unwrapRelayed(privs []*ecdh.PrivateKey, w seal.WrappedKey, senders []*ecdh.
 
 // EncryptionLevel returns a namespace's encryption.level ("" if none). A
 // sealed namespace (E2) serves its document as a JWE; it is reported as
-// "sealed" without decrypting it.
+// "sealed" without decrypting it. The level is learnt (levels.go): one
+// lower than the client holds for ns is ErrLevelLowered.
 func (c *Client) EncryptionLevel(ctx context.Context, ns string) (string, error) {
-	h, err := c.NSHead(ctx, ns)
-	if err != nil {
-		return "", err
+	_, _, lv, err := c.currentLevel(ctx, ns)
+	return lv, err
+}
+
+// currentLevel reads ns's current namespace document and learns its level
+// from it (levels.go): "sealed" for one served as a JWE, whose doc is
+// nil, else its encryption.level, with the document.
+func (c *Client) currentLevel(ctx context.Context, ns string) (h *NSHead, doc map[string]any, level string, err error) {
+	if h, err = c.NSHead(ctx, ns); err != nil {
+		return nil, nil, "", err
 	}
 	r, err := c.do(ctx, "GET", "/ns/"+ns+"/rev/"+h.ID, nil, nil)
 	if err != nil {
-		return "", err
+		return nil, nil, "", err
 	}
 	if r.status != 200 {
-		return "", r.apiError()
+		return nil, nil, "", r.apiError()
 	}
-	if isJOSE(r) {
-		return "sealed", nil
+	if level, err = c.learnDocLevel(ns, r); err != nil {
+		return nil, nil, "", err
 	}
-	enc, _ := r.obj()["encryption"].(map[string]any)
-	lv, _ := enc["level"].(string)
-	return lv, nil
+	if !isJOSE(r) {
+		doc = r.obj()
+	}
+	return h, doc, level, nil
 }
 
 // errNotE2E reports a namespace whose document, or /keys, says it isn't e2e.
@@ -540,18 +549,17 @@ type e2eConfig struct {
 }
 
 func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
-	h, err := x.c.NSHead(ctx, ns)
+	// The current document names the level: learnt, and a lower one than
+	// held is refused before anything is sealed (levels.go).
+	h, doc, lv, err := x.c.currentLevel(ctx, ns)
 	if err != nil {
 		return nil, err
 	}
-	d, err := x.c.NSDoc(ctx, ns, h.ID)
-	if err != nil {
-		return nil, err
-	}
-	enc, _ := d.Value["encryption"].(map[string]any)
-	if lv, _ := enc["level"].(string); lv != "e2e" {
+	if lv != "e2e" {
 		return nil, fmt.Errorf("%w: namespace %s (encryption.level %q)", errNotE2E, ns, lv)
 	}
+	d := &NSDoc{Value: doc}
+	enc, _ := d.Value["encryption"].(map[string]any)
 	out := &e2eConfig{Config: h.Config, Epoch: 1}
 	if f, ok := enc["epoch"].(float64); ok {
 		out.Epoch = int(f)
@@ -587,6 +595,12 @@ func (x *E2E) writeConfig(ctx context.Context, ns string) (*e2eConfig, error) {
 	}
 	a, kerr := x.c.FetchKeysAnswer(ctx, ns, nil, nil)
 	switch {
+	case errors.Is(kerr, ErrLevelLowered):
+		return nil, kerr
+	case IsNotOffered(kerr) && x.c.levels.held(ns) == "e2e":
+		// A 404 teaches nothing (levels.go): the namespace is held as
+		// e2e, and nothing gives the epoch to seal under.
+		return nil, fmt.Errorf("client: namespace %s: sealing needs the current epoch and pad, and /keys isn't offered where this client holds e2e (%w): %w", ns, kerr, ErrLevelLowered)
 	case IsNotOffered(kerr):
 		return nil, fmt.Errorf("%w: namespace %s (it isn't sealed)", errNotE2E, ns)
 	case kerr != nil:
@@ -1190,14 +1204,23 @@ func (x *E2E) docE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) 
 // isE2E reports whether ns is e2e: by its namespace document
 // (EncryptionLevel, a sealed one being E2), or, for a grant that can't read
 // it, such as a writer limited to some resources (§C.5), by what /keys
-// names, as writeConfig does. Where neither tells, it is an error, never
-// taken as not e2e: a document served in the clear by a namespace that is
-// would be believed.
+// names, as writeConfig does. Where neither tells, the level the client
+// holds decides (levels.go), and without one it is an error, never taken
+// as not e2e: a document served in the clear by a namespace that is would
+// be believed. Either source naming a lower level than held is
+// ErrLevelLowered.
 func (x *E2E) isE2E(ctx context.Context, ns string) (bool, error) {
 	lv, err := x.c.EncryptionLevel(ctx, ns)
 	if nsUnreadable(err) {
 		a, kerr := x.c.FetchKeysAnswer(ctx, ns, nil, nil)
 		switch {
+		case errors.Is(kerr, ErrLevelLowered):
+			return false, kerr
+		case x.c.levels.held(ns) == "e2e":
+			// Neither answer names a level: a refusal, a 404 and an
+			// answer without one teach nothing, and the level held
+			// stands (levels.go).
+			return true, nil
 		case IsNotOffered(kerr):
 			// Neither sealed nor end-to-end (§E.2.3).
 			return false, nil

@@ -259,6 +259,14 @@ func (c *Client) FetchKeysAnswer(ctx context.Context, ns string, epochs []int, r
 	}
 	obj := r.obj()
 	out := &KeysAnswer{Level: str(obj, "level")}
+	if out.Level != "" {
+		// /keys names the level (§E.2.3): learnt, and a lower one than
+		// held is refused before any key is taken (levels.go). An answer
+		// without one, as before v0.51, teaches nothing.
+		if _, err := c.levels.learn(ns, out.Level); err != nil {
+			return nil, fmt.Errorf("%w (POST /ns/%s/keys)", err, ns)
+		}
+	}
 	if f, ok := obj["epoch"].(float64); ok {
 		out.Epoch = int(f)
 	}
@@ -299,6 +307,9 @@ func (c *Client) Sealed(ctx context.Context, ns string) (bool, error) {
 	}
 	if r.status != 200 {
 		return false, r.apiError()
+	}
+	if _, err := c.learnDocLevel(ns, r); err != nil {
+		return false, err
 	}
 	return isJOSE(r), nil
 }
@@ -412,14 +423,19 @@ func (c *Client) readThroughBases(ctx context.Context, ns string) (map[string]bo
 		if r.status != 200 {
 			return out, transient(r.apiError())
 		}
+		// The current document of cur names its level: learnt, and a
+		// lower one than held is refused (levels.go).
+		lv, err := c.learnDocLevel(cur, r)
+		if err != nil {
+			return out, err
+		}
 		if isJOSE(r) {
 			return out, nil
 		}
 		doc, _ := r.value().(map[string]any)
 		if e2e {
 			// ns itself must be end-to-end.
-			enc, _ := doc["encryption"].(map[string]any)
-			if lv, _ := enc["level"].(string); lv != "e2e" {
+			if lv != "e2e" {
 				return nil, nil
 			}
 			e2e = false
