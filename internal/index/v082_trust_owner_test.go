@@ -12,6 +12,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
@@ -164,5 +165,58 @@ func TestV082StoppedMemberKeepsServedTrust(t *testing.T) {
 	}
 	if r := x.follow("/matches", li); r.status != 200 || len(resources(r.body)) != 0 {
 		t.Errorf("li where cat-season is purged: %d %v, want no hits", r.status, r.body)
+	}
+}
+
+// TestV082PurgedCatalogMetPurgedSnapshot (SVC-08; §B.11.9 Where, v0.82:
+// "a purged catalog's catalog.trust is the last one the origin stored or
+// the service read"): TestV082PurgedCatalogMetPurged's index that serves
+// the catalog, bootstrapped from snapshots. cat-season, purged before the
+// index started, comes as a purge-ns in place of its listing, with no
+// config entry: the index reads its document at that entry, as its
+// follower for visibility would, and records its trust. matches is
+// covered and dark: li gets a g: marker and no hits. Before, that
+// document was never read, and li was 403 with no marker for good, unless
+// a follower for visibility had bootstrapped cat-season first.
+func TestV082PurgedCatalogMetPurgedSnapshot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := newV75XOn(t, clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}))
+	rd := clienttest.NewKey("rd")
+	e := rd.Entry("read")
+	e["rules"] = []any{v77TypeRule}
+	must(w.admin.PatchConfig(ctx, "matches", must(w.admin.NSHead(ctx, "matches")).Config, []any{map[string]any{"op": "add", "path": "/keys/-", "value": e}}))
+	li := rd.Grant(t, w.s.Now(), "user:li", []string{"matches"}, []string{"read"}, map[string]any{"groups": []any{"fans"}, "roles": []any{"reader"}})
+	v82PurgeNS(w, "cat-season")
+	x := startSvcWith(t, w.s.Client(t, client.WithBearer(w.k.Grant(t, w.s.Now(), "svc:indexer", []string{"schemas", "cat-season", "matches"}, []string{"read"}))),
+		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "cat-season"}, untyped: true, now: w.s.Now},
+		func(o *indexOpts) {
+			o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate
+			o.FollowOptions = append(o.FollowOptions, follow.WithSnapshot())
+		})
+	x.caughtUp("matches")
+	waitFor(t, "the index applies cat-season's purge", func() bool {
+		for _, b := range x.batches() {
+			if b.NS == "cat-season" && b.Coalesce().PurgedNS {
+				if !b.Snapshot {
+					t.Fatalf("cat-season's purge-ns came after %d units, not in place of a listing", len(b.Units))
+				}
+				return true
+			}
+		}
+		return false
+	})
+	// A follower for visibility started meanwhile is stopped, or has met
+	// the purge: either way the trust stays (ownsTrust).
+	waitFor(t, "the index answers li", func() bool {
+		x.ix.ExpireGrantChecks()
+		return x.raw("/matches", li).status < 500
+	})
+	q := x.raw("/matches", li)
+	if q.status != 302 || !strings.HasPrefix(q.header.Get("Location"), "/matches/g/") {
+		t.Fatalf("li's query: %d %s %v, want a redirect under her g: marker", q.status, q.header.Get("Location"), q.body)
+	}
+	if r := x.follow("/matches", li); r.status != 200 || len(resources(r.body)) != 0 {
+		t.Errorf("li where cat-season was met purged: %d %v, want no hits", r.status, r.body)
 	}
 }

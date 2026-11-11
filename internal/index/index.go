@@ -870,9 +870,17 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// which a rebuild keeps) may be one config entries the snapshot
 	// skipped have changed since, and fsTrust reads it once ns is purged.
 	// A purge-ns in place of a listing (a namespace purged before it was
-	// bootstrapped) has no document to read, and keeps it; a sealed one
-	// purged since the listing was read, whose document is 410 too, is
-	// forgotten (unknown: no catalog, which shows least).
+	// bootstrapped) carries none either: its document is read at the
+	// purge-ns entry, where the origin still serves it unless the
+	// namespace is sealed (§8.5), as a follower for visibility reads it
+	// at its bootstrap (bootstrapMember; §B.11.9 Where, v0.82: "the last
+	// one the origin stored or the service read"), and where that is 410
+	// too the trust recorded before is kept. Before, it was never read,
+	// and a catalog the index serves and met purged from a snapshot
+	// counted as no catalog unless a follower for visibility had read it
+	// first. A sealed namespace purged since the listing was read, whose
+	// document is 410 too, is forgotten (unknown: no catalog, which shows
+	// least).
 	//
 	// The document also decides, as a config entry's would, whether the
 	// snapshot narrows ns against what ns_conf records (none after a
@@ -881,11 +889,11 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// down or behind leaves no public result kept or cached.
 	var snapDoc *client.NSDoc
 	forgetTrust := false
-	if b.Replaces() && !config && !co.PurgedNS {
+	if b.Replaces() && !config {
 		doc, err := ix.c.NSDoc(ctx, b.NS, b.NewCheckpoint)
 		switch {
 		case client.IsPurged(err):
-			forgetTrust = true
+			forgetTrust = !co.PurgedNS
 		case err != nil:
 			return lacksRead(b.NS, fmt.Errorf("the document of %s at %s: %w", b.NS, b.NewCheckpoint, err))
 		default:
