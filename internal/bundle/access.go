@@ -348,6 +348,25 @@ func (im *importer) checkAccess(ctx context.Context) error {
 			}
 		}
 	}
+	// A sealed op is an e2e namespace's line and no other's (§6.2,
+	// §E.3.1): ciphertext under whatever the header's access says, which
+	// for a namespace it doesn't name reads as private (AccessOf), as an
+	// e2e namespace's prune archive from before v0.82 does (§8.6). Such a
+	// bundle would be planned as plaintext for a target of any name and
+	// level, so it is refused here, override or not (§G.5.1 Importing).
+	for _, k := range im.keys {
+		d := im.docs[k]
+		if im.h.AccessOf(d.ns) == AccessE2E {
+			continue
+		}
+		for _, l := range d.lines {
+			if _, sealed := seal.SealedJWE(l.Patches); l.Kind == "rev" && sealed {
+				problems = append(problems, fmt.Sprintf("revision %s of %s is a sealed op, as only an e2e namespace's history has (§E.3.1), but the header's access gives %s as %s: "+
+					"an e2e namespace's lines go only into an e2e target of the same name, from a bundle that says so (§G.5.1); a prune archive written before v0.82 names no access, and is restored where it was taken (§D.4), not imported", l.ID, k, d.ns, im.h.AccessOf(d.ns)))
+				break
+			}
+		}
+	}
 	nonces := map[string]bool{}       // targets that require nonces (nonce.go)
 	sealedTarget := map[string]bool{} // targets that are, or are created, sealed
 	for _, tns := range names {
