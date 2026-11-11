@@ -925,8 +925,8 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		ix.testRefsRead()
 	}
 	// Hits of sealed and e2e namespaces are sealed under the epoch their
-	// document's head is served under (§E.2.6, docs.epoch), the current
-	// one where that isn't known; its key can't be had for now: behind.
+	// document's head is served under (§E.2.6, docs.epoch), judged first
+	// where that isn't known; its key can't be had for now: behind.
 	protected := map[string]bool{}
 	for _, ns := range withHits {
 		info, _, err := ix.keys.Current(ctx, ns)
@@ -957,6 +957,14 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 			if e, ok := judged[h.docid]; ok && hitNS[i] == ns && h.epoch == 0 {
 				hits[i].epoch = e
 			}
+			// A revision it couldn't judge (its row holds another head
+			// by now, or is gone: an apply committed since the rows were
+			// read) has nothing sealed under any epoch, least of all the
+			// current one (§E.2.6 Per-entry sealing, v0.82): the answer
+			// is computed again, as one a checkpoint moved under.
+			if hitNS[i] == ns && hits[i].epoch <= 0 {
+				return derived.Stored{}, "", false, errMoved
+			}
 		}
 	}
 	// An epoch whose key the service's grant gets none of, for good (a 4xx
@@ -966,6 +974,9 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 	keys := map[string]derived.Key{}
 	lacking := map[string]bool{}
 	keyAt := func(ns string, epoch int) (key derived.Key, lacks bool, err error) {
+		if epoch <= 0 {
+			return key, false, errMoved // never the current epoch for one not judged (above)
+		}
 		k := ns + "#" + strconv.Itoa(epoch)
 		if key, ok := keys[k]; ok {
 			return key, false, nil
