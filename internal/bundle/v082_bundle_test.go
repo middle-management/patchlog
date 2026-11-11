@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -467,4 +468,76 @@ func TestV082ImportRefusesReadThroughE2ELines(t *testing.T) {
 	dst := newEncDeployment(t, cmsOrigin)
 	importErr(t, dst, buf.Bytes(), bundle.ImportOptions{}, "as a line a branch reads through from its base is")
 	v82NothingWritten(t, dst, "the read-through bundle", "m-r7")
+}
+
+// G.5.1 (SPEC) Importing, TOOLS G.4.2: a deleted resource of the base is
+// read through by an e2e branch as its tombstone, which the export pins
+// in external like any document it reads through. A tombstone by
+// revision answers 410, not the 404 an e2e namespace gives a document,
+// so the importer looks the pin up in the target's chain: the bundle
+// goes into a same-named branch of a target holding the base, and is
+// refused where the target's resource is purged, which answers 410 too.
+func TestV082ImportE2EBranchPinnedTombstone(t *testing.T) {
+	t.Parallel()
+	src := newEncDeployment(t, stagingOrigin)
+	x := src.c.E2E(identity(t))
+	src.ns("m", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
+	must(x.InitKeyring(ctx, "m"))
+	derby := must(x.CreateDocSealed(ctx, "m", "derby", map[string]any{"title": "Derby"})).ID
+	gone := must(x.CreateDocSealed(ctx, "m", "gone", map[string]any{"title": "Gone", "note": marker})).ID
+	tomb := must(src.c.Delete(ctx, "m", "gone", gone)).ID
+	must(src.c.CreateBranch(ctx, "m", client.BranchRequest{Name: "m-r7"}))
+	must(x.InitKeyring(ctx, "m-r7"))
+	head := must(x.AppendSealed(ctx, "m-r7", "derby", derby, ops(op("add", "/score", "2-0")))).ID
+
+	var base, branch bytes.Buffer
+	_, _, err := bundle.Export(ctx, src.c, &base, bundle.ExportOptions{Select: []string{"m"}})
+	noErr(t, err)
+	plan, sum, err := bundle.Export(ctx, src.c, &branch, bundle.ExportOptions{Select: []string{"m-r7"}})
+	noErr(t, err)
+	pin := "m-r7/gone/rev/" + tomb
+	if _, bundled := sum.Header.Docs["m-r7/gone"]; bundled || !slices.Contains(plan.External, pin) {
+		t.Fatalf("gone, deleted in the base and read through: docs %v, external %v, want %s", sum.Header.Docs, plan.External, pin)
+	}
+	for k, nss := range v82SealedFor(t, branch.Bytes()) {
+		for _, ns := range nss {
+			if ns != "m-r7" {
+				t.Fatalf("%s carries a line sealed for %q, read through from the base", k, ns)
+			}
+		}
+	}
+
+	target := func() *deployment {
+		dst := newEncDeployment(t, cmsOrigin)
+		importB(t, dst, base.Bytes(), bundle.ImportOptions{CreateNamespaces: true})
+		must(dst.c.CreateBranch(ctx, "m", client.BranchRequest{Name: "m-r7"}))
+		if h := dst.head("m-r7", "gone"); h.ID != tomb || h.State != client.Tombstoned {
+			t.Fatalf("the target's m-r7/gone: %+v, want tombstone %s", h, tomb)
+		}
+		return dst
+	}
+	dst := target()
+	if _, err := dst.c.Doc(ctx, "m-r7", "gone", tomb); !client.IsGone(err) {
+		t.Fatalf("the pinned tombstone by revision in the target: %v, want 410 gone", err)
+	}
+	importB(t, dst, branch.Bytes(), bundle.ImportOptions{})
+	if got := dst.head("m-r7", "derby").ID; got != head {
+		t.Fatalf("m-r7/derby in the target: %s, want %s", got, head)
+	}
+
+	// Purged in the target, the tombstone isn't there, though its
+	// revision answers 410 still (§8.5): refused, nothing written.
+	dst = target()
+	must(dst.c.Purge(ctx, "m", "gone", tomb, false))
+	if h := dst.head("m-r7", "gone"); h.State != client.Purged && h.State != client.NotFound {
+		t.Fatalf("the target's m-r7/gone after the purge: %+v", h)
+	}
+	_, err = bundle.Import(ctx, dst.c, bundle.BytesOpener(branch.Bytes()), bundle.ImportOptions{Mode: bundle.Atomic})
+	var ce *bundle.CheckError
+	if !errors.As(err, &ce) || !strings.Contains(err.Error(), "external "+pin) {
+		t.Fatalf("import with the pinned tombstone purged in the target: %v", err)
+	}
+	if got := dst.head("m-r7", "derby").ID; got != derby {
+		t.Fatalf("the refused import moved m-r7/derby to %s", got)
+	}
 }

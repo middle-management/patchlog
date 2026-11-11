@@ -948,6 +948,13 @@ func (im *importer) e2eHolds(ctx context.Context, ns, name, rev string) (bool, e
 	if err != nil || !ok || ti.access != AccessE2E {
 		return false, err
 	}
+	return im.holds(ctx, ns, name, rev)
+}
+
+// holds reports whether rev is in the chain of ns/name in the target:
+// its head or an ancestor of it, of a resource that is there and not
+// purged.
+func (im *importer) holds(ctx context.Context, ns, name, rev string) (bool, error) {
 	th, err := im.head(ctx, ns, name)
 	if err != nil {
 		return false, err
@@ -990,18 +997,28 @@ func (im *importer) check(ctx context.Context) error {
 		tns := im.mapNS(ext.NS)
 		if ext.Rev != "" {
 			if _, err := im.c.Doc(ctx, tns, ext.Name, ext.Rev); err != nil {
-				if client.IsNotFound(err) {
+				var held bool
+				var herr error
+				switch {
+				case client.IsNotFound(err):
 					// An e2e target serves no document by revision
 					// (§E.3.1), so the pin is looked for in its chain, as
 					// requires is: an e2e branch's read-through documents
 					// are such externals (§G.5.1).
-					held, herr := im.e2eHolds(ctx, tns, ext.Name, ext.Rev)
-					if herr != nil {
-						return herr
-					}
-					if held {
-						continue
-					}
+					held, herr = im.e2eHolds(ctx, tns, ext.Name, ext.Rev)
+				case client.IsGone(err):
+					// A tombstone by revision is 410 at any level (§7.1,
+					// §E.3.1), a deleted resource a branch reads through
+					// among them: the pin is in the target if its chain
+					// has it (§G.4.2 "by id"), which the 410 alone, a
+					// purge's too (§8.5), doesn't say.
+					held, herr = im.holds(ctx, tns, ext.Name, ext.Rev)
+				}
+				if herr != nil {
+					return herr
+				}
+				if held {
+					continue
 				}
 				if client.IsNotFound(err) || client.IsGone(err) || client.IsPruned(err) {
 					problems = append(problems, fmt.Sprintf("external %s: revision %s is not in the target", e, ext.Rev))
