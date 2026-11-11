@@ -1481,7 +1481,15 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   (v0.76). `gs` also binds the grant's key (`key:{…}` of its `kid` and `pub`, v0.76), so a
   cookie from a key whose `pub` was replaced is `403`; since v0.77 so does a
   `reads:{ns}:scope:{digest}` marker's digest, and such a cookie is `403` once its key is gone,
-  no longer lists `read` or has another `pub`, or a role it digested is gone. A namespace
+  no longer lists `read` or has another `pub`, or a role it digested is gone. Since v0.82 a
+  cookie of any marker, `reads:{ns}` included, is `403` once the entry of the key that verified
+  its grant in `{ns}`, or the definition of a role it read through, is gone or changes in any
+  member (a `maxTtl`, a role's `can`), until the reader exchanges again (§A.4 `gs`, §B.11.9
+  `gs`; index migration `011_edge_gs_keys_entry`, which ends every cookie from before the
+  upgrade). The index records the keys behind each cookie by its marker and `exp`: another
+  reader's exchange revives no ended cookie, an exchange under other keys or entries mints one
+  that expires a second earlier (`503 behind` with `Retry-After` where no second is left before
+  the grant expires), and readers through different keys share no cookie. A namespace
   §B.11.9 doesn't cover that is a catalog, or whose `catalogs` (or a local base's) names one,
   gives a partial reader no marker (`403`, no hits at `/_refs`), nothing is covered while the
   core's root says authentication is disabled (a root the index can't read is `503 behind`, or
@@ -1846,7 +1854,10 @@ patchlog archive restore -db patchlog.db [-from file:///moved/archive] [-ns NS] 
   bundle whose `requires` points at the previous one. Blobs whose attachments the prune ends
   go in as blob lines; `archive restore` brings them back once the horizon is cleared. In
   at-rest, sealed and e2e namespaces the archive is a sealed bundle (§G.5.1.1, v0.73; see
-  [encryption at rest](#encryption-at-rest-addendum-e1)).
+  [encryption at rest](#encryption-at-rest-addendum-e1)). Since v0.82 its header carries
+  `access`, the namespace's protection when the prune ran (`public`, `private`, `sealed` or
+  `e2e`; §G.5.1), as an exported bundle's does; an archive written before names none, which
+  reads as `private` (see [Encryption](#encryption-g51) under Bundles).
 - **410s link to the archive.** Revisions below the horizon answer `410 pruned`, with the
   archive's URL in the body.
 - **Who can prune.** With an archive configured, the `prune` verb is enough within what
@@ -1999,7 +2010,11 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   branch whose `at` is before A's raise, raises the branch and its dependents, leaves first, as
   far as Levels allow, so to `sealed`, and marks it for a rebase (v0.74; it used to stay at its
   level; a source may no longer be raised to `e2e` since v0.78, but a source of an earlier
-  version may still do so). Each step is a `config` notice; what couldn't be followed is in
+  version may still do so). Sealed is still below A's level, so since v0.82 every resource A had
+  at `at` then answers `502 upstream`, as below, for good: whatever level the branch reaches and
+  however often it syncs, until the branch is purged and rebased (CONFORMANCE scenario 74;
+  v0.27.0 read that content through and served it sealed). A resource the branch created itself
+  is served as usual. Each step is a `config` notice; what couldn't be followed is in
   `Engine.RemoteLevels`. A B without a key store has no level to follow with: every resource A
   had at `at`, read through or written on since, then answers `502 upstream` with `origin`, in
   the branch and every local branch reading through it, and writes to them other than purges
@@ -2275,7 +2290,10 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   for e2e content; the `$schema` index (§6.1 `in_use`, prune protection) sees nothing, and a
   `$schema` naming a revision written while its namespace was e2e is `schema_unavailable`.
 - **Reads** (§7.1, v0.81: the server never folds). `GET /r/{ns}/{name}` redirects as usual.
-  Tombstones and purges answer `410` as usual. The log serves entries as stored (the patch sets
+  Tombstones and purges answer `410` as usual; a tombstone's own `/rev/{T}` is `410` with
+  `{ tombstone, last }`, `last` its parent, immutable, at every level and below a horizon too
+  (v0.82, §7.1), where a pruner and a mirroring remote branch learn the parent. The log serves
+  entries as stored (the patch sets
   are the sealed ones), and never a snapshot: a prune's sealed snapshot, the document at the
   horizon `s` sealed with `pl { ns, name, id: s }`, is served as `/rev/{s}` (§7.1 Paging, §8.6):
   `200` with the JWE as `application/jose`, `ETag`/`X-Revision` and the immutable class
@@ -2651,7 +2669,12 @@ who qualify for it; other grants are `403` (§B.11.5, F-T6), and a gateway relay
 sealed catalog's listing is sealed whole only for `g/all` of a catalog that isn't public, and
 only when every value in it comes from one epoch, per entry otherwise, each node's values under
 the epoch its head is served under (v0.73); whole listings earlier releases stored elsewhere are
-dropped at start (§E.2.6). After a restart the service needs the keys of older epochs its nodes
+dropped at start (§E.2.6). A release preview's entries, those read through from the base
+included, are sealed under the catalog branch's keys, `kid` and `pl.ns` the branch's, never the
+base's, and a head read through is judged as the branch's epoch (v0.82, §B.5 Previews); a
+preview database of an earlier release, which stored the base's epoch numbers, has them judged
+again at start, its nodes listed by name only meanwhile, and a preview without the branch's
+keys answers `404`. After a restart the service needs the keys of older epochs its nodes
 are served under, so its grant needs an `nbf` reaching back (§E.2.3): a node whose epoch key it
 can never get is listed by name only, with no `sealed` values, and one it can't fetch for the
 moment makes the listings that show it `503 behind`. A service that reads the catalog afresh
@@ -3203,9 +3226,15 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   Where the gateway can't read that last revision (served sealed), the save is a `409` too
   (v0.74, no sealed exception): naming the new path where the head gives it, else saying it
   can't tell whether the file moved; it never makes a new file over it (§H.4, §H.6). A read that
-  fails (a timeout, `408`, `429`, `5xx`, an unreachable core) is no such answer: a save over
-  someone else's delete then fails `503` with `Retry-After` (`408`, `429`, timeouts) or `502`
-  and writes nothing, never `409` (v0.77; the core's `408` and timeouts are `503` everywhere).
+  fails (a timeout, `408`, `429`, `5xx`, an unreachable core) is no such answer: it fails the
+  save, which writes nothing, never `409` (v0.77). Since v0.82 that holds for every read of the
+  core a PUT makes, the namespace's key history and who the user is in it among them, by which
+  the gateway tells the user's own entries from others' (§H.7): `503` with `Retry-After` after
+  the core's `429` or `503`, and after a timeout of the gateway's own, else `502` (the core's
+  `408`, another `5xx`, an unreachable core; TOOLS §H.4 "The base"). So a save is never written
+  over another user's entry taken for the user's own while that history can't be read, as
+  v0.27.0 could. Requests other than a PUT keep the general answers (a core `408` is `503`, its
+  `503` is `502`).
   A raw file over a JSON document's, or the
   other way round, replaces its root. A purged one is `410`, as is any name of a purged
   namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
@@ -3649,7 +3678,12 @@ patchlog import -i all.jsonl -atomic -ns demo-schemas=demo2-schemas,demo=demo2  
   documents a renamed import rewrites (Renaming, below).
 - **Lines are canonical** (§G.4.1, §I.9): a reader rejects a blank line, a line that isn't byte
   for byte its canonical JSON, or a last line without its 0x0A, and the digest is over the bytes
-  as written, so a hand-edited or pretty-printed bundle doesn't import.
+  as written, so a hand-edited or pretty-printed bundle doesn't import. A header, a line or a
+  grant line's `key` with a member §G.4.1 doesn't define rejects the bundle too, and since
+  v0.82 so does a grant line whose `grant` isn't the id of its `root` or whose `stored` block
+  isn't `canonical(root)`, one that doesn't decode included: whole, at import step 1, before
+  anything is written. The writer refuses such a line, and an export leaves a grant whose
+  record disagrees off the lines that would name it, with a note.
 - **Authors** (`-authors`, `"authors": true`) adds each history line's author, creation time,
   signature, and its `gesture` and `undoes` (§G.4.1). Imports write the gestures with the
   revisions (batch step objects, §7.5), so undo history survives the move; authors and times
@@ -3789,7 +3823,10 @@ patchlog import -ns secret -i s.plb -identity me.jwk -atomic
   or `e2e` (missing means `private`). Export refuses to write private or sealed content unsealed
   unless `-plaintext`; `-identity` unwraps a sealed source's keys when the grant's `enc` names
   it. An e2e namespace's rev lines must each be the keyring's, one sealed op or a restore's `[]`:
-  export refuses any other, naming it (§G.5.1 step 1, v0.81).
+  export refuses any other, naming it (§G.5.1 step 1, v0.81). Prune archives carry `access`
+  too (v0.82, §8.6). Import refuses at step 1, whatever the overrides, a sealed op in a
+  namespace the header doesn't give as `e2e`, so an e2e namespace's prune archive written
+  before v0.82 is restored where it was taken (`archive restore`), not imported.
 - **Sealed bundles** (`application/vnd.patchlog.sealed-bundle+jsonl`): an envelope line with a
   random id and the content key HPKE-wrapped per recipient (kid: RFC 7638 thumbprint), then one
   JWE per bundle line with `pl: {bundle, line}`, the final one's `pl` carrying `last: true`
@@ -3816,7 +3853,15 @@ patchlog import -ns secret -i s.plb -identity me.jwk -atomic
   imports only into an e2e namespace of the same name (sealed patch sets bind `pl.ns`), which a
   missing target is created as. Every line but the keyring's must be one sealed op whose `kid`
   and `pl.ns` name the namespace, or a restore's `[]` after a tombstone, and an existing
-  target's keyring must share the bundle's history, else the import is refused at step 1. Lines
+  target's keyring must share the bundle's history, else the import is refused at step 1. An
+  e2e branch's export writes no line the branch reads through from its base, whose sealed ops
+  name the base (v0.82, §G.5.1 Importing): a document continued in the branch starts after its
+  foreign parent, the base's head at `base.at`, named in `requires` (a `requires` before it, or
+  a foreign parent that isn't in the chain, refuses the document); one the branch never wrote
+  is `external`, pinned to its revision; the keyring comes whole; and a branch of a remote base
+  exports only documents that start with a line of its own. The importer looks a pinned
+  `external` up in the target's chain where an e2e target serves no document by revision, and
+  for a tombstone at any level. Lines
   go in batches per epoch, in epoch order, each epoch's raise of `encryption.epoch` in the batch
   with the keyring line that brings its key (so atomic mode is atomic per epoch); an existing
   target is refused only below the bundle's lowest epoch, or past the epoch of a sealed line it
