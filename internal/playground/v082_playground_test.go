@@ -2,6 +2,7 @@ package playground
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -9,6 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -460,5 +464,78 @@ func TestV082PlaygroundNestedValueResourceWithNode(t *testing.T) {
 	c = out.Children[4]
 	if c.Title != "T docs" || c.Born.Born != "" || !strings.Contains(c.Born.Err, "isn't the resource") || c.Extra.Extra != 1 || c.Extra.Err != "" {
 		t.Errorf("a folder's values: %+v", c)
+	}
+}
+
+// E2E-11 against a live server: countSealings reads GET /r/{ns}/{name}/log,
+// which redirects to the head's range (the tombstone's for a tombstoned
+// head) and is 404 for a resource that doesn't exist and 410 for a purged
+// one, and counts the sealed ops the log really shows.
+func TestV082PlaygroundSealCountLiveWithNode(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := clienttest.New(t, clienttest.Options{KeyStore: ks})
+	c := s.Client(t, client.WithAuthor("alice"))
+	if _, err := c.CreateNamespace(ctx, "e", map[string]any{"read": "public", "encryption": map[string]any{"level": "e2e"}}); err != nil {
+		t.Fatal(err)
+	}
+	_, priv, _ := seal.GenerateRecipient()
+	x := c.E2E(priv)
+	if _, err := x.InitKeyring(ctx, "e"); err != nil {
+		t.Fatal(err)
+	}
+	x = x.WithoutValidation()
+	write := func(name, parent string, n float64) string {
+		t.Helper()
+		var w *client.WriteResult
+		var err error
+		if parent == "" {
+			w, err = x.CreateSealed(ctx, "e", name, client.GenesisPatches(map[string]any{"n": n}))
+		} else {
+			w, err = x.AppendSealed(ctx, "e", name, parent, []any{map[string]any{"op": "replace", "path": "/n", "value": n}})
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w.ID
+	}
+	d := write("d", write("d", write("d", "", 1), 2), 3)
+	_ = d
+	tomb := write("t", "", 1)
+	if _, err := c.Delete(ctx, "e", "t", tomb); err != nil {
+		t.Fatal(err)
+	}
+	gone := write("p", "", 1)
+	if _, err := c.Purge(ctx, "e", "p", gone, false); err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]struct {
+		Count   float64
+		Partial bool
+		Err     string
+	}
+	runV82(t, []string{"logPages", "pageEndErr", "jweID", "readLogRange", "countSealings"}, "", `
+  api = async (method, path) => {
+    const res = await fetch(input.base + path, { method });
+    const text = await res.text();
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch (_) { /* not JSON */ }
+    const u = new URL(res.url);
+    return { status: res.status, ok: res.ok, json, text, finalPath: u.pathname + u.search, entry: {}, jose: false, hdr: (k) => res.headers.get(k), etag: () => '' };
+  };
+  for (const name of ['d', 't', 'p', 'none']) {
+    const seals = new Z.SealCounter();
+    try { await countSealings(seals, 'e', name); out[name] = { count: seals.count('e', name, 'e#1'), partial: seals.partial('e', name), err: seals.counted('e', name) ? '' : 'not counted' }; }
+    catch (e) { out[name] = { err: e.message }; }
+  }
+`, map[string]any{"base": s.URL}, &out)
+	for name, want := range map[string]float64{"d": 3, "t": 1, "p": 0, "none": 0} {
+		if g := out[name]; g.Err != "" || g.Partial || g.Count != want {
+			t.Errorf("%s: %+v, want %v sealings counted in full", name, g, want)
+		}
 	}
 }

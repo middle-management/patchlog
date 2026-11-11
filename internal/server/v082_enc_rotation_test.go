@@ -102,7 +102,7 @@ func TestV082OwnRotationEntryDev(t *testing.T) {
 // E2E-10, authentication enabled: the rotation after a revocation, which
 // follows a *-key holder's config write, is the origin's own entry: no
 // grant, though the revoking write's entry names its grant, and no via.
-// No request reaches it: RotateEpoch isn't served, and the rotation of an
+// A request moves the epoch only under a * key, and the rotation of an
 // end-to-end namespace is refused, where only key holders rotate.
 func TestV082OwnRotationEntryAuth(t *testing.T) {
 	t.Parallel()
@@ -138,13 +138,12 @@ func TestV082OwnRotationEntryAuth(t *testing.T) {
 	if ep, err := e.e.RotateEpoch(context.Background(), "e", core.RotateAuthor); err == nil {
 		t.Fatalf("the origin rotated an end-to-end namespace to epoch %d", ep)
 	}
-	// No URL rotates: the paths a rotation might be asked at aren't
-	// served to any grant, a * key's included.
-	for _, p := range []string{"/ns/s/rotate", "/ns/s/keys/rotate", "/ns/s/epoch"} {
-		if r := e.do(req{method: "POST", path: p, bearer: star, body: map[string]any{}}); r.Code == 200 || r.Code == 201 || r.Code == 204 {
-			t.Fatalf("POST %s: %d", p, r.Code)
-		}
-	}
+	// A request rotates only under a * key (§E.2.1, §7.4): a key that
+	// allows config writes without being one is refused the epoch.
+	cfg := newKey("cfg")
+	expect(t, e.patchNS("s", ops(op("add", "/keys/-", cfg.entry("config", "read"))), star), 201)
+	cg := e.grant(cfg, "user:cfg", []string{"s"}, []string{"config", "read"})
+	expectCode(t, e.patchNS("s", ops(op("add", "/encryption/epoch", 4.0)), cg), 403, "forbidden")
 	keys, _ = e.keysOf("s", nil, star)
 	if _, ok := keys["s#4"]; ok {
 		t.Fatal("a request rotated the epoch")

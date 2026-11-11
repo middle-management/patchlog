@@ -2767,8 +2767,8 @@ func (t *tx) followConfig(bn *nsRow, id string, d sourceDoc) {
 // remote_levels why it couldn't:
 //
 //   - lacks: a level this server lacks, as without a key store it holds
-//     none (checkEncryption); only then do the resources the base had at
-//     at answer 502 upstream (§1, upstreamRefusal);
+//     none (checkEncryption): the resources the base had at at answer 502
+//     upstream (§1, upstreamRefusal);
 //   - rebase: a raise to e2e, or one whose config writes failed (a
 //     dependent's document holding a member the level refuses that a
 //     server write can't remove, say): Levels refuse it, so the branch
@@ -2776,7 +2776,9 @@ func (t *tx) followConfig(bn *nsRow, id string, d sourceDoc) {
 //     (retryLevel); until it is made, the resources the base had at at
 //     answer 502 upstream, as for a lacking level (§1), rather than be
 //     served below the base's level (Addendum E Levels, Invariant;
-//     remoteHeld, upstreamRefusal).
+//     remoteHeld, upstreamRefusal). A raise to e2e is never made, so
+//     they answer 502 for good, also once the branch is at sealed, which
+//     is still below its base's level (v0.82, CONFORMANCE scenario 74).
 func (t *tx) followLevel(bn *nsRow, id string, level int) bool {
 	lacks, rebase := false, level == levelE2E
 	if t.e.opt.KeyStore == nil {
