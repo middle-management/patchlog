@@ -16,6 +16,7 @@ import (
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/rules"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/tree"
 )
@@ -105,8 +106,13 @@ func badInput(format string, a ...any) error  { return errf(400, "bad_input", fo
 func forbidden(format string, a ...any) error { return errf(403, "forbidden", format, a...) }
 func conflict(format string, a ...any) error  { return errf(409, "conflict", format, a...) }
 
-func upstream(err error) error {
-	return &Error{Status: 502, Code: "upstream", Msg: err.Error()}
+// upstream is the 502 for what the service couldn't read from the origin
+// to decide with. Its message names what, which the caller asked about,
+// and never relays the origin's answer, which is about the service's own
+// grant and reads: that is logged.
+func (s *Service) upstream(what string, err error) error {
+	logf(s)("catalog: reading %s: %v", what, err)
+	return &Error{Status: 502, Code: "upstream", Msg: "the catalog service can't read " + what}
 }
 
 // configErr answers a namespace document the checker couldn't read: 410
@@ -115,7 +121,7 @@ func upstream(err error) error {
 // epoch keys (§8.5), since nothing in it can be granted any more; 502
 // otherwise. Decided at the core's head, it carries no checkpoint
 // (decidedAt).
-func configErr(ns string, err error) error {
+func (s *Service) configErr(ns string, err error) error {
 	if client.IsPurged(err) {
 		var head string
 		if ae, ok := client.AsAPIError(err); ok {
@@ -123,7 +129,7 @@ func configErr(ns string, err error) error {
 		}
 		return purgedErr(ns, head)
 	}
-	return upstream(err)
+	return s.upstream("the document of namespace "+ns, err)
 }
 
 // purgedErr is the 410 purged a catalog service answers for every name of
@@ -144,7 +150,7 @@ func purgedErr(ns, head string) error {
 func (s *Service) coreHead(ctx context.Context, ns, name string) (*client.Head, error) {
 	h, err := s.t.Client().Head(ctx, ns, name)
 	if err != nil {
-		return nil, upstream(err)
+		return nil, s.upstream("the head of /r/"+ns+"/"+name, err)
 	}
 	if h.PurgedNS != "" {
 		return nil, purgedErr(ns, h.PurgedNS)
@@ -205,7 +211,7 @@ func (s *Service) contentConfig(ctx context.Context, ns string) (*grantcheck.Con
 	}
 	cfg, err := s.t.Checker().Config(ctx, ns)
 	if err != nil {
-		return nil, configErr(ns, err)
+		return nil, s.configErr(ns, err)
 	}
 	return cfg, nil
 }
@@ -293,23 +299,29 @@ func (s *Service) Authenticate(ctx context.Context, r *http.Request) (*grant.Ver
 	return s.verify(ctx, tree.Bearer(r))
 }
 
-// authenticateRead is Authenticate for the catalog's API that reads (POST
-// /grants, POST /read-grants): what they hand out are read decisions,
-// visibility as listings judge it (§B.11.5) and the roles at an item
-// (§B.11.4 Resolve), and read grants and keys, so a grant whose key-scope
-// or block rules refer to /now (or the whole envelope), or whose roles
-// that list read all have such a rule, none counting, is refused every
-// one: 403, as the tree service refuses it its listings, whatever the
-// catalog's read mode (§C.2 item 5, grantcheck.RefusedByNow). It is part
-// of the read check, so it comes before ?min's wait and the body's 400s,
-// and is decided at no checkpoint. A grant that allows no read at all is
-// not this case: its verbs don't matter here.
-func (s *Service) authenticateRead(ctx context.Context, r *http.Request) (*grant.Verified, error) {
-	v, err := s.Authenticate(ctx, r)
-	if err == nil && grantcheck.RefusedByNow(v) {
-		return nil, &grant.AuthError{Status: 403, Msg: "the grant's rules refer to /now, which no read passes (§C.2 item 5)"}
+// callerRefused is the 403 POST /grants and POST /read-grants answer a
+// caller for its own grant, even where reads are public (§B.11.4 The
+// caller's grant), nil for none: to any request, a grant with a block or
+// key-scope rule that refers to /now (or the whole envelope), which no
+// read passes (§C.2 item 5, grantcheck.RefusedByNowRule); and, where the
+// request reads (POST /read-grants, or a want that lists read), a grant
+// that allows read nowhere it verifies in, which is the catalog namespace
+// (grantcheck.ReadsNothing: no read in its can, or roles none of which
+// counts for read, each having a rule on /now or not listing read). Any
+// other want from such a grant is judged as usual: a role with a rule on
+// /now still counts for a write there, though never for read (counts).
+// It comes after the 401 and the request-shape 400s, which no state
+// decides, and before every other answer: the ?min wait and its 400 or
+// 503, and the decision's 404, 409 and 410. It is decided at no
+// checkpoint and carries none.
+func callerRefused(v *grant.Verified, reads bool) error {
+	switch {
+	case grantcheck.RefusedByNowRule(v):
+		return &grant.AuthError{Status: 403, Msg: "the grant's rules refer to /now, which no read passes (§C.2 item 5)"}
+	case reads && grantcheck.ReadsNothing(v):
+		return &grant.AuthError{Status: 403, Msg: "the grant allows no read (§C.2 items 2 and 5)"}
 	}
-	return v, err
+	return nil
 }
 
 // verify verifies tok for the catalog namespace, failing as verifyHook
@@ -323,10 +335,33 @@ func (s *Service) verify(ctx context.Context, tok string) (*grant.Verified, erro
 	return s.t.Checker().Verify(ctx, s.t.Catalog(), tok)
 }
 
+// serveGrants answers POST /grants (§B.11.4), in this order: 401 for a
+// missing or unverifiable grant (and what verifying it answers); 400 for
+// the request's shape, which no state decides (the syntax of ?min, the
+// body, want, item, node and to: shape); the caller's-grant 403
+// (callerRefused); then the ?min wait with its 400 or 503, and the
+// decision (Issue).
 func (s *Service) serveGrants(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	v, err := s.authenticateRead(r.Context(), r)
+	v, err := s.Authenticate(r.Context(), r)
 	if err != nil {
+		tree.WriteAuthError(w, err, logf(s))
+		return
+	}
+	var req Request
+	if err := minSyntax(r); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := s.shape(req); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := callerRefused(v, contains(req.Want, "read")); err != nil {
 		tree.WriteAuthError(w, err, logf(s))
 		return
 	}
@@ -337,17 +372,23 @@ func (s *Service) serveGrants(w http.ResponseWriter, r *http.Request) {
 		tree.WriteError(w, status, code, msg)
 		return
 	}
-	var req Request
-	if err := decode(r, &req); err != nil {
-		writeErr(w, err)
-		return
-	}
 	res, err := s.Issue(r.Context(), v, req)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	tree.WriteJSON(w, http.StatusOK, res)
+}
+
+// minSyntax is the 400 of a ?min that isn't {ns}:{ns_id} or an ns_id
+// (§A.5): the request's shape, answered before the caller's-grant 403.
+// Whether the service follows the namespace a min names, or the reader
+// sees it, is state: AwaitMins answers that after it.
+func minSyntax(r *http.Request) error {
+	if msg := tree.MalformedMin(r.URL.Query()["min"]); msg != "" {
+		return badInput("%s", msg)
+	}
+	return nil
 }
 
 // ReadGrantsRequest is the body of POST /read-grants (§B.11.5).
@@ -422,8 +463,30 @@ const readGrantRetries = 3
 func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	ctx := r.Context()
-	v, err := s.authenticateRead(ctx, r)
+	// In the order of POST /grants (serveGrants, §B.11.4 The caller's
+	// grant): 401; the request-shape 400s; the caller's-grant 403, which
+	// every request here meets, since all it hands out is read; then the
+	// ?min wait and the decisions. An item's own shape is its entry's
+	// answer, not the request's (decideReads).
+	v, err := s.Authenticate(ctx, r)
 	if err != nil {
+		tree.WriteAuthError(w, err, logf(s))
+		return
+	}
+	var req ReadGrantsRequest
+	if err := minSyntax(r); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if len(req.Items) == 0 || len(req.Items) > maxReadGrants {
+		writeErr(w, badInput("items must list 1 to %d items", maxReadGrants))
+		return
+	}
+	if err := callerRefused(v, true); err != nil {
 		tree.WriteAuthError(w, err, logf(s))
 		return
 	}
@@ -432,15 +495,6 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Retry-After", "1")
 		}
 		tree.WriteError(w, status, code, msg)
-		return
-	}
-	var req ReadGrantsRequest
-	if err := decode(r, &req); err != nil {
-		writeErr(w, err)
-		return
-	}
-	if len(req.Items) == 0 || len(req.Items) > maxReadGrants {
-		writeErr(w, badInput("items must list 1 to %d items", maxReadGrants))
 		return
 	}
 	for try := 0; try <= readGrantRetries; try++ {
@@ -607,7 +661,10 @@ func (s *Service) exposureAt(ctx context.Context, ns string) (public bool, in de
 			return
 		}
 		held, in = true, derived.InfoOf(c.Doc)
-		if cfg := s.parsed(c).cfg; cfg != nil {
+		// A namespace the service stopped following reads public to no
+		// one: the document held is the one it stopped at (§B.5 Behind,
+		// tree.Graph.Stopped).
+		if cfg := s.parsed(c).cfg; cfg != nil && !g.Stopped(ns) {
 			public = cfg.Read == "public"
 		}
 	})
@@ -702,6 +759,15 @@ func (s *Service) Issue(ctx context.Context, v *grant.Verified, req Request) (*I
 	want := dedupe(req.Want)
 	var p *plan
 	var err error
+	// The request's shape, then the caller's own grant, before anything
+	// is decided (serveGrants made both checks before ?min's wait; a
+	// direct caller gets them here).
+	if err := s.shape(req); err != nil {
+		return nil, err
+	}
+	if err := callerRefused(v, contains(want, "read")); err != nil {
+		return nil, forbidden("%s", err.(*grant.AuthError).Msg)
+	}
 	switch {
 	case len(want) == 0:
 		return nil, badInput("want is required")
@@ -738,6 +804,88 @@ func (s *Service) Issue(ctx context.Context, v *grant.Verified, req Request) (*I
 		return nil, err
 	}
 	return s.mint(ctx, v, p, map[string]bool{})
+}
+
+// shape is the 400 of a POST /grants request that is malformed whatever
+// the service's state (§B.11.4: "400 for a malformed request"), nil for
+// one that isn't: want, and which of item, node and to it takes; an
+// item, node or folder that names nothing a URL or name could. It is
+// what Issue and the plans refuse before they read anything, checked
+// ahead of the caller's-grant 403 (callerRefused), which comes after
+// every such 400 and before any answer that state decides.
+func (s *Service) shape(req Request) error {
+	want := dedupe(req.Want)
+	cat := s.t.Catalog()
+	node := func(ref string) error {
+		if _, ok := tree.Resolve(cat, ref); !ok {
+			return badInput("malformed node")
+		}
+		return nil
+	}
+	to := func() error {
+		_, err := s.folders(req)
+		return err
+	}
+	switch {
+	case len(want) == 0:
+		return badInput("want is required")
+	case contains(want, "place"):
+		if len(want) != 1 || req.Item == "" {
+			return badInput(`place takes an item and want ["place"]`)
+		}
+		ns, name, ok := tree.ParseHref(req.Item)
+		if !ok || ns == cat {
+			return badInput("item must be /r/{ns}/{name} of a content namespace")
+		}
+		if pl := ns + "." + name; !client.ValidResourceName(pl) {
+			return badInput("the placement name %s is not a valid resource name", pl)
+		}
+		return to()
+	case contains(want, "move"):
+		if len(want) != 1 || req.Node == "" {
+			return badInput(`move takes a node and want ["move"]`)
+		}
+		if err := node(req.Node); err != nil {
+			return err
+		}
+		return to()
+	case req.Node != "" && contains(want, "create"):
+		if len(want) != 1 {
+			return badInput(`creating a folder takes a node and want ["create"]`)
+		}
+		if name, ok := tree.Resolve(cat, req.Node); !ok || strings.Contains(name, ".") || !client.ValidResourceName(name) {
+			return badInput("a folder name is a resource name without a dot")
+		}
+		return to()
+	case req.Node != "" && len(want) == 1 && want[0] == "restore":
+		return node(req.Node)
+	case req.Node != "":
+		if len(want) != 1 || want[0] != "delete" {
+			return badInput(`a node request wants ["move"], ["create"] or ["delete"]`)
+		}
+		return node(req.Node)
+	case req.Item != "" && len(want) == 1 && want[0] == "restore" && s.inCatalog(req.Item):
+		return node(req.Item)
+	case req.Item != "":
+		for _, w := range want {
+			if !grant.IsVerb(w) {
+				return badInput("unknown verb %q", w)
+			}
+		}
+		ns, _, ok := tree.ParseHref(req.Item)
+		switch {
+		case !ok:
+			return badInput("item must be /r/{ns}/{name}")
+		case ns == cat:
+			return badInput("catalog documents are organised with place, move and delete")
+		case contains(want, "create") && len(want) != 1:
+			return badInput("create can't be combined with other verbs")
+		case contains(want, "restore") && len(want) != 1:
+			return badInput("restore can't be combined with other verbs")
+		}
+		return nil
+	}
+	return badInput("item or node is required")
 }
 
 // inCatalog reports whether item names a document of the catalog
@@ -857,19 +1005,43 @@ func intersect(a, b map[string]bool) map[string]bool {
 	return out
 }
 
+// counts reports whether a role a content namespace defines as def counts
+// for verb there (§B.11.2 Through the key): its can lists verb and, for
+// read, none of its rules refers to /now, or to the whole envelope, which
+// holds it (§C.2 item 5, grantcheck.FailsRead): such a role fails every
+// read at the gate, so the catalog never grants read through it. A rule
+// that doesn't compile counts for no read either. Only the /now test: a
+// role's other rules are the gate's (§B.11.4: "the catalog grants role
+// names without evaluating their rules").
+func counts(def grant.RoleDef, verb string) bool {
+	if !contains(def.Can, verb) {
+		return false
+	}
+	if verb != "read" {
+		return true
+	}
+	for _, rv := range def.Rules {
+		if r, err := rules.Compile(rv); err != nil || grantcheck.FailsRead(r) {
+			return false
+		}
+	}
+	return true
+}
+
 // counting is the roles among roles that count for verb in the content
 // namespace whose document is cfg (§B.11.2 Through the key): the
-// namespace defines the role with verb, and the catalog's key there, key,
-// lists verb in its can and allows the role in its roles scope; roles
-// were collected through the subjects key may grant through
-// (who.through). Sorted; none without a key.
+// namespace defines the role with verb, for read with no rule on /now
+// (counts), and the catalog's key there, key, lists verb in its can and
+// allows the role in its roles scope; roles were collected through the
+// subjects key may grant through (who.through). Sorted; none without a
+// key.
 func counting(cfg *grantcheck.Config, key *grant.Key, roles map[string]bool, verb string) []string {
 	if key == nil || !key.IsStar() && !contains(key.Can, verb) {
 		return nil
 	}
 	var out []string
 	for r := range roles {
-		if def, ok := cfg.Roles[r]; ok && roleAllowed(key, r) && contains(def.Can, verb) {
+		if def, ok := cfg.Roles[r]; ok && roleAllowed(key, r) && counts(def, verb) {
 			out = append(out, r)
 		}
 	}
@@ -1058,14 +1230,19 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		// create for an item that has never existed (§B.11.2).
 		return nil, noRole(want, item)
 	}
+	// A role is kept for the wanted verbs it counts for (counts): for
+	// read only one without a rule on /now, so a read want leaves the
+	// others out, and with none kept the answer is the 403 of no role,
+	// never a grant carrying such a role for read; a mixed want keeps
+	// its other verbs through it (§B.11.2, §B.11.4).
 	var kept, can []string
 	for r := range roles {
 		def, ok := cfg.Roles[r]
 		if !ok || !roleAllowed(key, r) {
 			continue
 		}
-		for _, c := range def.Can {
-			if contains(want, c) {
+		for _, w := range want {
+			if counts(def, w) {
 				kept = append(kept, r)
 				break
 			}
@@ -1076,7 +1253,7 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 			continue
 		}
 		for _, r := range kept {
-			if contains(cfg.Roles[r].Can, w) {
+			if counts(cfg.Roles[r], w) {
 				can = append(can, w)
 				break
 			}
@@ -1088,7 +1265,7 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 	var final []string
 	for _, r := range kept {
 		for _, c := range can {
-			if contains(cfg.Roles[r].Can, c) {
+			if counts(cfg.Roles[r], c) {
 				final = append(final, r)
 				break
 			}
@@ -1785,7 +1962,7 @@ func (s *Service) isAdmin(v *grant.Verified) bool {
 func (s *Service) catalogConfig(ctx context.Context) (*grantcheck.Config, error) {
 	cfg, err := s.t.Checker().Config(ctx, s.t.Catalog())
 	if err != nil {
-		return nil, configErr(s.t.Catalog(), err)
+		return nil, s.configErr(s.t.Catalog(), err)
 	}
 	if derived.InfoOf(cfg.Doc).Level == derived.LevelE2E {
 		return nil, notOffered(s.t.Catalog())
@@ -1934,7 +2111,7 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 	if noCfg {
 		// Not decided at the checkpoint (decidedAt).
 		checkpoint = nil
-		return nil, configErr(ns, cerr)
+		return nil, s.configErr(ns, cerr)
 	}
 	if err != nil {
 		return nil, err
@@ -2208,7 +2385,9 @@ func (s *Service) includesOfTrusted(ctx context.Context) (map[string]Includes, e
 			continue
 		}
 		if err != nil {
-			return nil, upstream(err)
+			// A namespace the caller needn't have named: not named.
+			logf(s)("catalog: the includes of %s", ns)
+			return nil, s.upstream("the document of a namespace the catalog trusts", err)
 		}
 		out[ns] = ParseIncludes(cfg.Doc)
 	}
@@ -2427,7 +2606,7 @@ func (s *Service) checkLag(ctx context.Context, cp string, key *grant.Key) error
 	}
 	h, err := s.t.Client().NSHead(ctx, cat)
 	if err != nil {
-		return upstream(err)
+		return s.upstream("the head of namespace "+cat, err)
 	}
 	if h.ID == cp {
 		return nil

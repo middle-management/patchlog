@@ -81,16 +81,16 @@ func TestV073RootsForSubjectSet(t *testing.T) {
 		t.Errorf("roots for a reader who can't see root: %s", got)
 	}
 	b := x.get("/cat/ancestors?of=/r/sec/derby", bob)
-	if got := pathsOf(b["paths"]); got != "season" || b["incomplete"] != nil {
+	if got := pathsOf(b["paths"]); got != "season/sec.derby" || b["incomplete"] != nil {
 		t.Errorf("ancestors end at the reader's root: %v", b)
 	}
-	if b := x.get("/cat/ancestors?of=season", bob); len(b["paths"].([]any)) != 1 || b["incomplete"] != nil {
-		t.Errorf("a root for the reader has one empty path: %v", b)
+	if b := x.get("/cat/ancestors?of=season", bob); pathsOf(b["paths"]) != "season" || b["incomplete"] != nil {
+		t.Errorf("a root for the reader has one path, itself: %v", b)
 	}
-	if got := pathsOf(x.get("/cat/where?item=/r/sec/derby", bob)["paths"]); got != "season" {
+	if got := pathsOf(x.get("/cat/where?item=/r/sec/derby", bob)["paths"]); got != "season/sec.derby" {
 		t.Errorf("where ends at the reader's root: %s", got)
 	}
-	if got := pathsOf(x.get("/cat/where?item=/r/sec/derby", whole)["paths"]); got != "root/season" {
+	if got := pathsOf(x.get("/cat/where?item=/r/sec/derby", whole)["paths"]); got != "root/season/sec.derby" {
 		t.Errorf("where for a whole reader: %s", got)
 	}
 }

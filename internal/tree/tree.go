@@ -221,6 +221,10 @@ type Service struct {
 	// (judgeEpochs), outside the graph's lock (tests: a head applied
 	// meanwhile).
 	beforeJudge atomic.Pointer[func()]
+	// beforeUnkept, if set, runs as a listing that is neither stored nor
+	// kept (perReader) has been computed, before the purges since its
+	// kept generation are checked (tests).
+	beforeUnkept atomic.Pointer[func()]
 	// afterStop, if set, runs as purgeStopped has marked a namespace
 	// stopped and left the graph's lock, before the purges it then makes
 	// (tests: a reader meanwhile).
@@ -255,12 +259,29 @@ type Service struct {
 	// epochsPending is whether the heads' epochs are still being read in
 	// (meta "epochs", backfillEpochs): until then a Node.Epoch of 0 may be
 	// one not read in yet rather than a pending judgement, so a listing
-	// judges none (unjudged; §E.2.6, §E.3.1).
+	// judges none and seals nothing derived from such a head (§E.2.6 Per-
+	// entry sealing, §E.3.1): the node is shown by name only.
 	epochsPending bool
-	// unjudged is whether a listing sealed a head under the current epoch
-	// without judging it while epochsPending: the fill then drops the
-	// stored listings, as for an epoch it changes.
-	unjudged atomic.Bool
+	// nameOnly is whether a listing left values out because the epoch of
+	// the revision they derive from wasn't judged: the fill that judges
+	// them then drops the catalog's listings, kept, stored and cached,
+	// which change at an unchanged checkpoint.
+	nameOnly atomic.Bool
+	// unknownEpoch are the heads, by explicit node, and unknownFile, by
+	// "{ns}/{name}" of an item, whose epoch a fill couldn't read (a key
+	// the service lacks, a head gone since): they stay by name only, and
+	// aren't asked for again until the head changes or the service
+	// restarts (rejudge). Guarded by mu.
+	unknownEpoch, unknownFile map[string]string
+	// unreadEpoch are the heads, by explicit node, that a fill couldn't
+	// read for good (meta "unread:{node}", kept across restarts): unlike
+	// one read without an own kid, such a head's epoch is never judged
+	// by a listing of an e2e catalog, which would seal it under the
+	// epoch in force (§E.2.6 Per-entry sealing). Guarded by mu.
+	unreadEpoch map[string]string
+	// rejudging is whether a fill asked for by a listing (rejudge) is
+	// queued or running.
+	rejudging atomic.Bool
 
 	// entered is when each namespace in the combined checkpoint entered
 	// it while trusted, as far as the service knows (meta "inckpt:{ns}"),
@@ -396,10 +417,19 @@ func (s *Service) init(ctx context.Context) error {
 	if err := s.markBornEpochs(ctx); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
 	}
+	if err := s.markKeyNS(ctx); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
+	}
+	if s.unreadEpoch, err = loadUnread(ctx, s.db); err != nil {
+		return err
+	}
 	var epochs string
 	switch err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'epochs'`).Scan(&epochs); {
 	case err == nil:
 		s.epochsPending = true
+		// A listing stored before a restart may have left values out
+		// for it: the fill drops the catalog's listings when it ends.
+		s.nameOnly.Store(true)
 	case !errors.Is(err, sql.ErrNoRows):
 		return err
 	}

@@ -672,7 +672,7 @@ func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at an
 		}
 		switch {
 		case notInChain(err):
-			return fmt.Errorf("at is not in the chain of %s", target)
+			return errRequireAt
 		case err != nil:
 			return chainError(err)
 		case len(entries) == 0:
@@ -684,11 +684,17 @@ func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at an
 		}
 		lag := grant.EffectiveMaxLag(tst.cfg.MaxLag, keyMaxLag)
 		if !grant.HeadWithin(&next, issued, lag) {
-			return fmt.Errorf("at was not the head of %s within maxLag (%s) before the grant was issued", target, lag)
+			return errRequireAt
 		}
 		return nil
 	}
 }
+
+// errRequireAt is the refusal of an at a readable chain rejects, not in
+// it or not its head within maxLag: one text for both, naming no
+// namespace, since the chain a key names may be one the caller can't see
+// (§C.4, §C.5.2).
+var errRequireAt = errors.New("at rejected by requireAt")
 
 // notInChain reports a 404 from the log itself: at is not in the chain. A
 // 404 from /keys, met opening a log range sealed under an older epoch, is

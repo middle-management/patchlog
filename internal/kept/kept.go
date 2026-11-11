@@ -165,6 +165,24 @@ func (k *Store) Purge(scope string, tags []string) {
 	}
 }
 
+// PurgedSince reports whether a purge of scope since generation gen, taken
+// (Generation) before a result was read, purged one of the result's tags,
+// or may have: what PutOutcome answers PurgedSince for, for a result that
+// isn't kept, such as a listing for one reader. Such a result predates
+// the purge and must not be served (§A.1: "serving or keeping none
+// computed from what was read before it").
+func (k *Store) PurgedSince(scope string, gen uint64, tags []string) bool {
+	set := make(map[string]bool, len(tags))
+	for _, t := range tags {
+		if t != "" {
+			set[t] = true
+		}
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.purgedSince(scope, gen, set)
+}
+
 // purgedSince reports whether a purge of scope since generation gen purged
 // one of tags, or may have: one recorded no longer (For) is taken to.
 func (k *Store) purgedSince(scope string, gen uint64, tags map[string]bool) bool {

@@ -184,12 +184,15 @@ func names(v any) string {
 	return strings.Join(out, ",")
 }
 
+// pathsOf is an ancestors or where answer's paths, each an array of node
+// names from a root down to the node itself (v0.82, §B.5): "a/b/node"
+// per path, joined by " | ".
 func pathsOf(v any) string {
 	var out []string
 	for _, p := range v.([]any) {
 		var seg []string
 		for _, x := range p.([]any) {
-			seg = append(seg, x.(map[string]any)["name"].(string))
+			seg = append(seg, x.(string))
 		}
 		out = append(out, strings.Join(seg, "/"))
 	}
@@ -369,10 +372,10 @@ func testTreeListings(t *testing.T) {
 
 	// Ancestors: every path to a root, for an item or a folder.
 	b = x.get("/cat/ancestors?of=/r/matches/derby", "")
-	if got := pathsOf(b["paths"]); got != "root/season | root/derbies" {
+	if got := pathsOf(b["paths"]); got != "root/season/matches.derby | root/derbies/matches.derby" {
 		t.Errorf("ancestors: %s", got)
 	}
-	if got := pathsOf(x.get("/cat/ancestors?of=root", "")["paths"]); got != "" {
+	if got := pathsOf(x.get("/cat/ancestors?of=root", "")["paths"]); got != "root" {
 		t.Errorf("ancestors of root: %q", got)
 	}
 	// Subtree.
@@ -391,7 +394,7 @@ func testTreeListings(t *testing.T) {
 		t.Errorf("roots: %s", got)
 	}
 	b = x.get("/cat/where?item=/r/matches/opener", "")
-	if b["placement"].(map[string]any)["href"] != "/r/cat/matches.opener" || pathsOf(b["paths"]) != "root/season" {
+	if b["placement"].(map[string]any)["href"] != "/r/cat/matches.opener" || pathsOf(b["paths"]) != "root/season/matches.opener" {
 		t.Errorf("where: %v", b)
 	}
 	// An item not in the catalog is 404, as a node not in it is (§B.5).
@@ -447,7 +450,7 @@ func testMovesAndDeletes(t *testing.T) {
 	// Moving a subtree is one write on its top node.
 	w.replace(t, "cat", "season", "/parents", parents("derbies"))
 	x.caughtUp("cat")
-	if got := pathsOf(x.get("/cat/ancestors?of=/r/matches/derby", "")["paths"]); got != "root/derbies/season | root/derbies" {
+	if got := pathsOf(x.get("/cat/ancestors?of=/r/matches/derby", "")["paths"]); got != "root/derbies/season/matches.derby | root/derbies/matches.derby" {
 		t.Errorf("paths after subtree move: %s", got)
 	}
 
@@ -569,7 +572,7 @@ func TestCyclesDepthAndDanglingParents(t *testing.T) {
 	}
 	// Walks stop at depth 64.
 	b := x.get("/cat/ancestors?of=d66", "")
-	if b["tooDeep"] == nil || len(b["paths"].([]any)) != 0 {
+	if b["tooDeep"] != true || len(b["paths"].([]any)) != 0 {
 		t.Errorf("deep ancestors: %v", b)
 	}
 	// Breaking the cycle heals it.
@@ -579,7 +582,7 @@ func TestCyclesDepthAndDanglingParents(t *testing.T) {
 	if len(pr["cycles"].([]any)) != 0 {
 		t.Errorf("cycles after fix: %v", pr["cycles"])
 	}
-	if got := pathsOf(x.get("/cat/ancestors?of=/r/matches/m1", "")["paths"]); got != "root/a/b" {
+	if got := pathsOf(x.get("/cat/ancestors?of=/r/matches/m1", "")["paths"]); got != "root/a/b/matches.m1" {
 		t.Errorf("m1 paths: %s", got)
 	}
 }
@@ -819,7 +822,7 @@ func TestPrivateCatalog(t *testing.T) {
 	for _, op := range []string{"problems", "orphans", "manifest?of=top"} {
 		x.get("/cat/"+op, both)
 	}
-	if b := x.get("/cat/ancestors?of=hidden", both); pathsOf(b["paths"]) != "top" {
+	if b := x.get("/cat/ancestors?of=hidden", both); pathsOf(b["paths"]) != "top/hidden" {
 		t.Errorf("ancestors for a whole reader: %v", b)
 	}
 }

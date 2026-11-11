@@ -133,7 +133,10 @@ func TestPurgedCatalogEdgeGrants(t *testing.T) {
 			}
 			// bob's subject set has no read on the catalog: a grant of its
 			// own, as a bearer, gets no head from the core either.
-			if r := w.do("GET", "/cat/roots", bob, nil); sealed && r.status != 403 {
+			// (An identity grant without read: the fixture's allows it
+			// since v0.82, caller.)
+			noRead := w.idp.Grant(t, w.s.Now(), "user:bob", []string{"cat"}, []string{}, map[string]any{"groups": toAny("match-desk")})
+			if r := w.do("GET", "/cat/roots", noRead, nil); sealed && r.status != 403 {
 				t.Errorf("bob as a bearer: %d %v", r.status, r.body)
 			}
 		})

@@ -163,7 +163,7 @@ const AdminHeader = "Admin-Authorization"
 // only, under the merge key, for the merge service to submit a batch to
 // the catalog (§F.8), and rules on /now for writes are unchanged (§C.2
 // item 5, v0.78), so none of its grants is refused for them, as POST
-// /grants and POST /read-grants refuse them (authenticateRead).
+// /grants and POST /read-grants refuse them (callerRefused).
 func (s *Service) serveMergeGrants(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	v, err := s.Authenticate(r.Context(), r)
@@ -310,7 +310,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av, adm *grant.Verified, ba
 	// tree powers (powers).
 	catLatest, err := s.t.Checker().Config(ctx, cat)
 	if err != nil {
-		return nil, configErr(cat, err)
+		return nil, s.configErr(cat, err)
 	}
 	if derived.InfoOf(catLatest.Doc).Level == derived.LevelE2E {
 		return nil, errf(404, "not_offered", "%s is an end-to-end catalog: the catalog service issues no merge grants and checks no batch for it (§F.8)", cat)
@@ -362,7 +362,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av, adm *grant.Verified, ba
 			if h.State == client.Live {
 				d, err := c.Doc(ctx, cat, name, h.ID)
 				if err != nil {
-					return nil, upstream(err)
+					return nil, s.upstream("/r/"+cat+"/"+name, err)
 				}
 				mi.before, mi.beforeLive = d.Value, true
 			}
@@ -380,7 +380,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av, adm *grant.Verified, ba
 			// A restore applies to the last live document (§8.2).
 			d, err := c.Doc(ctx, cat, name, h.Last)
 			if err != nil {
-				return nil, upstream(err)
+				return nil, s.upstream("/r/"+cat+"/"+name, err)
 			}
 			cur = d.Value
 		}
@@ -824,7 +824,7 @@ func (s *Service) mergeChecks(o *organising, caller *grant.Verified, g, after *t
 					if cerr == nil {
 						cerr = errors.New("namespace " + ns + " has no document the service could read")
 					}
-					return nil, notDecided{configErr(ns, cerr)}
+					return nil, notDecided{s.configErr(ns, cerr)}
 				}
 				if !inPlaceList(ccur.Doc, cat, subs) {
 					return nil, forbidden("%s: namespace %s does not let you place its items in %s (catalogs.%s.place)", mi.name, ns, cat, cat)
@@ -993,7 +993,7 @@ func sameParents(a, b []tree.Parent) bool {
 func (s *Service) mergeKey(ctx context.Context) (*grant.Key, error) {
 	cfg, err := s.t.Checker().Config(ctx, s.t.Catalog())
 	if err != nil {
-		return nil, configErr(s.t.Catalog(), err)
+		return nil, s.configErr(s.t.Catalog(), err)
 	}
 	key := findKey(cfg.Keys, s.opt.MergeKid)
 	if key == nil {

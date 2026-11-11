@@ -62,11 +62,33 @@ func readRoles(v *grant.Verified) []string {
 // that fails for a read, so none counts. A grant that allows no read at
 // all is not this case.
 func RefusedByNow(v *grant.Verified) bool {
-	if failsRead(v.KeyRules) || failsRead(v.BlockRules) {
+	if RefusedByNowRule(v) {
 		return true
 	}
 	ok, readers := v.Allows("read")
 	return ok && v.HasRoles() && len(readers) > 0 && len(readRoles(v)) == 0
+}
+
+// RefusedByNowRule is the first half of RefusedByNow: a key-scope or
+// block rule of v fails for a read (FailsRead), referring to /now or the
+// whole envelope. The catalog's POST /grants and POST /read-grants refuse
+// such a grant whatever it wants (§B.11.4 The caller's grant, §C.2 item
+// 5); its roles' rules are judged per want there (ReadsNothing).
+func RefusedByNowRule(v *grant.Verified) bool {
+	return failsRead(v.KeyRules) || failsRead(v.BlockRules)
+}
+
+// ReadsNothing reports whether v allows read nowhere it verifies in
+// (§B.11.4 The caller's grant, §C.2 item 2): its blocks or key don't
+// allow read, or it carries roles and none counts for read, each either
+// not listing read or having a rule that fails for a read (readRoles,
+// §C.2 item 5: such a role "doesn't count for read"). v is a grant as
+// verified in one namespace, the one this is judged in.
+func ReadsNothing(v *grant.Verified) bool {
+	if ok, _ := v.Allows("read"); !ok {
+		return true
+	}
+	return v.HasRoles() && len(readRoles(v)) == 0
 }
 
 // failsRead reports whether some rule of rs fails for a read (FailsRead).
