@@ -42,7 +42,8 @@
 //	catalog_trust(ns, trust)              the catalog.trust last applied, of either, kept past a
 //	                                      purge-ns and a rebuild (recordTrust, fsTrust), read again
 //	                                      at a snapshot, forgotten once ns is neither served nor
-//	                                      followed, unless purged (dropUnfollowedTrust, forgetMember)
+//	                                      followed, unless purged (dropUnfollowedTrust, forgetMember),
+//	                                      and once more for a served, purged one without (repairTrust)
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
@@ -271,6 +272,12 @@ type Index struct {
 	// testMemberBootstrap, if set, is called before a member's follower
 	// gives it its first checkpoint (tests: bootstrapMember).
 	testMemberBootstrap func(ctx context.Context, m string)
+	// testTrustRepair, if set, is called before each read of a purged
+	// namespace's document whose catalog.trust the index lost, and
+	// testTrustRepairPause, if set, is the first pause between two
+	// (tests: repairTrustOf).
+	testTrustRepair      func(ctx context.Context, ns string)
+	testTrustRepairPause time.Duration
 	// testBeforeAnswer, if set, is called once a reader's views are
 	// computed, before the answer is (tests: serve's head pointer,
 	// /_refs).
@@ -622,6 +629,11 @@ func (ix *Index) Run(ctx context.Context) error {
 		defer wg.Done()
 		ix.runMembers(ctx)
 	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ix.repairTrust(ctx)
+	}()
 	for ns := range ix.roots {
 		wg.Add(1)
 		go func() {
@@ -635,6 +647,8 @@ func (ix *Index) Run(ctx context.Context) error {
 
 func (ix *Index) follow(ctx context.Context, ns string) {
 	if _, purged, _ := ix.state(ns); purged {
+		// Nothing below runs for it, trustAt neither: a catalog.trust the
+		// index lost of it is read again by repairTrust.
 		ix.opt.Logf("index: %s was purged; not following", ns)
 		return
 	}
