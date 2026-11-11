@@ -117,6 +117,35 @@ func TestV082AccessGSEntryAnyMember(t *testing.T) {
 	}
 }
 
+// §B.11.9 gs: the changes that ended a cookie before v0.82 still do, and
+// are 403 too: a role gaining a rule (its scope digest differs, and her
+// next exchange gives another gs), and the key's requireAt, which is a
+// member of its entry and also decides whether matches trusts the catalog
+// at all (with requireAt true it trusts none, and is no longer covered).
+func TestV082AccessGSEntryEarlierEndings(t *testing.T) {
+	t.Parallel()
+	for name, patch := range map[string]map[string]any{
+		"the role gains a rule": v82accessOp("add", "/roles/reader/rules", []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": "^d"}}}),
+		"the key's requireAt":   v82accessOp("replace", "/keys/1/requireAt", true),
+		"the key is removed":    {"op": "remove", "path": "/keys/1"},
+		"the role is removed":   {"op": "remove", "path": "/roles/reader"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			w := newV75World(t, v75Opts{})
+			w.seed()
+			cookie, gs := v82accessCookie(t, w, w.li())
+			if st := v82accessCookieReads(t, w, gs, cookie); st != 0 {
+				t.Fatalf("the cookie before the change: %d", st)
+			}
+			w.patchConfig("matches", patch)
+			if st := v82accessCookieReads(t, w, gs, cookie); st != 403 {
+				t.Fatalf("the cookie after the change: %d, want 403", st)
+			}
+		})
+	}
+}
+
 // §B.11.9 gs: the answers at an at from before the change are the ones
 // its document gave, so the old cookie still reads there, as a changed
 // rule leaves it (immutable answers, §B.5); once the reader has exchanged

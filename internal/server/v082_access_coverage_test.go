@@ -55,7 +55,7 @@ func TestV082AccessRemoteBranchCatalogDark(t *testing.T) {
 	expect(t, w.patchNS("matches", ops(
 		op("replace", "/catalogs", map[string]any{"cat-season-r": map[string]any{"place": []any{}}}),
 		op("replace", "/keys/1/requireAt", "cat-season-r")), admin), 201)
-	w.put("matches", "derby", map[string]any{"title": "derby", "v": 2})
+	w.put("matches", "derby", map[string]any{"title": "derby", "v": 2}, map[string]string{"Gesture": gA})
 	li := v82accessVia(w, admin, "cat-season-r")
 
 	head := w.nsHead("matches", admin)
@@ -110,6 +110,19 @@ func TestV082AccessRemoteBranchCatalogDark(t *testing.T) {
 	if res.code != 200 || strings.Contains(string(res.body), "derby") || strings.Contains(string(res.body), "opener") {
 		t.Fatalf("long-poll from before the config change: %d %s, want 200 with the config entry alone", res.code, res.body)
 	}
+	// The gestures listing is filtered by visibility too (§B.11.9
+	// Answers): nothing of derby, which her rules alone would let her
+	// read, and did before v0.82, while the namespace counted as
+	// uncovered.
+	r = w.get("/ns/matches/gestures/"+gA, li)
+	expect(t, r, 200)
+	if strings.Contains(r.String(), "derby") {
+		t.Fatalf("li's gestures listing names a hidden resource: %s", r.Body)
+	}
+	if r := w.get("/ns/matches/gestures/"+gA, admin); !strings.Contains(r.String(), "derby") {
+		t.Fatalf("the gestures listing for an unrestricted reader: %d %s", r.Code, r.Body)
+	}
+	expect(t, w.get("/r/matches/derby", li), 302)
 	// Her exchange gives the /g/ prefix, as for any covered namespace.
 	if _, cgs := w.cookie(li); cgs != gs {
 		t.Fatalf("exchange: gs %s, want %s", cgs, gs)

@@ -262,7 +262,7 @@ func TestV082AccessNowBeforePurged(t *testing.T) {
 	nowAdmin := w.grant(w.k, "user:root", []string{"matches"}, []string{"read"}, map[string]any{"rules": []any{v82accessNow}})
 	gs, at := w.filtered(li)
 	rev := etagOf(w.get("/r/matches/derby", w.admin))
-	head := w.purgeV82(t)
+	head := v82accessPurge(t, w)
 	for _, c := range []struct {
 		path  string
 		grant int // the /now grants
@@ -300,8 +300,9 @@ func TestV082AccessNowBeforePurged(t *testing.T) {
 	}
 }
 
-// purgeV82 freezes and purges matches and returns its purge-ns id.
-func (w *v75s) purgeV82(t *testing.T) string {
+// v82accessPurge freezes and purges w's matches and returns its purge-ns
+// id.
+func v82accessPurge(t *testing.T, w *v75s) string {
 	t.Helper()
 	opg := mint(t, w.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"matches"}, "can": []any{"purge-ns"},
 		"exp": w.clock.Now().Add(time.Hour).Format(time.RFC3339)})
@@ -325,7 +326,7 @@ func TestV082AccessPurgedFilteredHeads(t *testing.T) {
 	if liGS == boGS {
 		t.Fatal("li and bo share a gs")
 	}
-	head := w.purgeV82(t)
+	head := v82accessPurge(t, w)
 	for _, c := range []struct {
 		who, bearer, gs string
 		want            int
