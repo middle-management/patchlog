@@ -1868,9 +1868,10 @@ func copiedIntoItself(src target) error {
 // paths run through the folders the reader sees only, which are all the
 // copy of src's children lists (dirFile), so a folder that only a hidden
 // one leads to from src is no loop, and refusing over it would show the
-// hidden one; an answer cut short (truncated, tooDeep), or without
-// paths, leaves it unchecked, refused too (403), and a tree service
-// behind the user's writes is 503, try again. Nothing is read of the
+// hidden one; an answer cut short (truncated, tooDeep), without paths or
+// in a shape this gateway doesn't read (ancestorPaths reads v0.82's and
+// the one before) leaves it unchecked, refused too (403, never 502), and
+// a tree service behind the user's writes is 503, try again. Nothing is read of the
 // node documents, so no $access either (§B.11.4 Copies).
 func (st *reqState) notCopiedInto(ctx context.Context, f *treeFiles, src, dst target) error {
 	if dst.parent == src.node || strings.HasPrefix(dst.path, strings.TrimSuffix(src.path, "/")+"/") {
@@ -1924,14 +1925,13 @@ func (st *reqState) notCopiedInto(ctx context.Context, f *treeFiles, src, dst ta
 		}
 	}
 	st.p.ts.reached(mins)
-	if a.Paths == nil || a.Truncated || a.TooDeep > 0 {
+	paths, ok := ancestorPaths(a, dst.parent)
+	if !ok {
 		return fail(http.StatusForbidden, "folder %s isn't copied: catalog %s's tree service didn't list every path above %s (more folders than it lists at once), so that none of them is %s can't be checked (§H.5, §B.5)", src.path, src.ns, dst.dir, src.path)
 	}
-	for _, p := range a.Paths {
-		for _, n := range p {
-			if n.Name == src.node {
-				return copiedIntoItself(src)
-			}
+	for _, p := range paths {
+		if slices.Contains(p, src.node) {
+			return copiedIntoItself(src)
 		}
 	}
 	return nil

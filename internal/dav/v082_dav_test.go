@@ -1,8 +1,11 @@
 package dav_test
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -203,6 +206,179 @@ func TestV082SaveOverDeleteFailedReads(t *testing.T) {
 				e.expect(save(), 409, "PUT, the core answering")
 				e.expectTombstoned("docs", "x", "after the refused save")
 			})
+		}
+	}
+}
+
+// v82Ancestors is a tree service in front of a real one that rewrites
+// the answers to …/ancestors as shape says, from the paths the real one
+// gave, each as node names from a root down to the node asked of.
+type v82Ancestors struct {
+	shape atomic.Value // func(paths [][]string) map[string]any: the members to answer with
+	asked atomic.Int64
+}
+
+func (a *v82Ancestors) front(t *testing.T, backend string) string {
+	t.Helper()
+	rp := proxyTo(backend)
+	rp.ModifyResponse = func(res *http.Response) error {
+		if res.StatusCode != http.StatusOK || !strings.HasSuffix(res.Request.URL.Path, "/ancestors") {
+			return nil
+		}
+		raw, err := io.ReadAll(res.Body)
+		res.Body.Close()
+		if err != nil {
+			return err
+		}
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			return err
+		}
+		// The real answer's paths, in the shape before v0.82 (objects with
+		// a name, the node's ancestors alone) or v0.82's (names, ending at
+		// the node), read as names ending at the node.
+		of := res.Request.URL.Query().Get("of")
+		var paths [][]string
+		for _, p := range body["paths"].([]any) {
+			var names []string
+			for _, x := range p.([]any) {
+				switch x := x.(type) {
+				case string:
+					names = append(names, x)
+				case map[string]any:
+					names = append(names, x["name"].(string))
+				}
+			}
+			if len(names) == 0 || names[len(names)-1] != of {
+				names = append(names, of)
+			}
+			paths = append(paths, names)
+		}
+		for _, k := range []string{"paths", "tooDeep", "truncated", "node", "nodes"} {
+			delete(body, k)
+		}
+		for k, v := range a.shape.Load().(func([][]string) map[string]any)(paths) {
+			body[k] = v
+		}
+		out, _ := json.Marshal(body)
+		res.Body = io.NopCloser(strings.NewReader(string(out)))
+		res.ContentLength = int64(len(out))
+		res.Header.Set("Content-Length", strconv.Itoa(len(out)))
+		a.asked.Add(1)
+		return nil
+	}
+	return newTestServer(t, rp).URL
+}
+
+// BT-7g (TOOLS §H.5 Copy, SERVICES §B.5; scenario 130): for a reader who
+// lists the tree through the tree service, a folder copied into itself or
+// a descendant is judged from ancestors' paths in the shape v0.82 gives
+// them (node names from a root down to the node, tooDeep and truncated
+// JSON booleans) and in the one before (objects with a name, tooDeep a
+// count): 403 where TR is on a path, made where it isn't. An answer that
+// reports a cut either way, has no paths, or isn't in a shape the gateway
+// reads leaves it unchecked: 403, nothing written, never the 502 a
+// v0.27.0 gateway gave a conforming "tooDeep": true, and never a copy.
+func TestV082FolderCopyAncestorsShapes(t *testing.T) {
+	t.Parallel()
+	w := newDerivedWorld(t)
+	embargoTR(t, w)
+	must(w.ops.CreateDoc(w.ctx, "cat", "inner", map[string]any{"title": "Inner", "parents": parents("cat", "tr")}))
+	must(w.ops.CreateDoc(w.ctx, "cat", "both", map[string]any{"title": "Both", "parents": parents("cat", "season", "inner"),
+		"$access": map[string]any{"group:match-desk": []any{"desk"}}}))
+	w.caughtUp(t)
+	var stub v82Ancestors
+	names := func(paths [][]string) []any {
+		out := []any{}
+		for _, p := range paths {
+			arr := []any{}
+			for _, n := range p {
+				arr = append(arr, n)
+			}
+			out = append(out, arr)
+		}
+		return out
+	}
+	// The shape before v0.82: objects, without the node itself.
+	objects := func(paths [][]string) []any {
+		out := []any{}
+		for _, p := range paths {
+			arr := []any{}
+			for _, n := range p[:len(p)-1] {
+				arr = append(arr, map[string]any{"name": n, "href": "/r/cat/" + n, "title": n})
+			}
+			out = append(out, arr)
+		}
+		return out
+	}
+	nodes := func(paths [][]string) map[string]any {
+		out := map[string]any{}
+		for _, p := range paths {
+			for _, n := range p {
+				out[n] = map[string]any{"href": "/r/cat/" + n, "title": n}
+			}
+		}
+		return out
+	}
+	stub.shape.Store(func(paths [][]string) map[string]any { return map[string]any{"paths": names(paths)} })
+	g := w.derivedGateway(t, func(o *dav.Options) { o.TreeService = stub.front(t, w.catURL) })
+	ed := w.user(t, "user:ed", "editors-in-chief", "match-desk")
+
+	const itself, unchecked = "into itself", "didn't list every path"
+	n := 0
+	for _, c := range []struct {
+		what  string
+		shape func(paths [][]string) map[string]any
+		// Sub is beside TR, Both below it through a second parent: what a
+		// COPY of TR into each answers, "" for made (201).
+		sub, both string
+	}{
+		{"v0.82", func(p [][]string) map[string]any { return map[string]any{"paths": names(p), "nodes": nodes(p)} }, "", itself},
+		{"v0.82, cuts false", func(p [][]string) map[string]any {
+			return map[string]any{"paths": names(p), "tooDeep": false, "truncated": false}
+		}, "", itself},
+		{"before v0.82", func(p [][]string) map[string]any { return map[string]any{"paths": objects(p), "node": map[string]any{"name": "x"}} }, "", itself},
+		{"before v0.82, tooDeep 0", func(p [][]string) map[string]any { return map[string]any{"paths": objects(p), "tooDeep": 0} }, "", itself},
+		{"tooDeep true", func(p [][]string) map[string]any { return map[string]any{"paths": names(p), "tooDeep": true} }, unchecked, unchecked},
+		{"truncated true", func(p [][]string) map[string]any { return map[string]any{"paths": names(p), "truncated": true} }, unchecked, unchecked},
+		{"tooDeep a count", func(p [][]string) map[string]any { return map[string]any{"paths": objects(p), "tooDeep": 2} }, unchecked, unchecked},
+		{"tooDeep a string", func(p [][]string) map[string]any { return map[string]any{"paths": names(p), "tooDeep": "no"} }, unchecked, unchecked},
+		{"truncated null", func(p [][]string) map[string]any { return map[string]any{"paths": names(p), "truncated": nil} }, unchecked, unchecked},
+		{"no paths", func(p [][]string) map[string]any { return map[string]any{} }, unchecked, unchecked},
+		{"paths null", func(p [][]string) map[string]any { return map[string]any{"paths": nil} }, unchecked, unchecked},
+		{"paths an object", func(p [][]string) map[string]any { return map[string]any{"paths": map[string]any{}} }, unchecked, unchecked},
+		{"paths of numbers", func(p [][]string) map[string]any { return map[string]any{"paths": []any{[]any{1, 2}}} }, unchecked, unchecked},
+		{"objects without a name", func(p [][]string) map[string]any {
+			return map[string]any{"paths": []any{[]any{map[string]any{"href": "/r/cat/season"}}}}
+		}, unchecked, unchecked},
+		{"names that don't end at the node", func(p [][]string) map[string]any {
+			return map[string]any{"paths": []any{[]any{"root", "season"}}}
+		}, unchecked, unchecked},
+	} {
+		stub.shape.Store(c.shape)
+		for _, d := range []struct{ dir, want string }{{"/cat/Season%202026/Sub", c.sub}, {"/cat/Season%202026/Both", c.both}} {
+			n++
+			title := fmt.Sprintf("TR copy %d", n)
+			what := fmt.Sprintf("%s: ed's COPY of TR to %s", c.what, d.dir)
+			asked := stub.asked.Load()
+			r := g.doAs(ed, "COPY", "/cat/Season%202026/TR", "", "Destination", d.dir+"/"+strings.ReplaceAll(title, " ", "%20"))
+			if stub.asked.Load() == asked {
+				t.Fatalf("%s: the tree service's ancestors weren't asked", what)
+			}
+			if d.want == "" {
+				g.expect(r, 201, what)
+				if folder, _ := w.titled(t, title); folder == "" {
+					t.Fatalf("%s: no folder made", what)
+				}
+				continue
+			}
+			g.expect(r, 403, what)
+			if !strings.Contains(r.body, d.want) {
+				t.Fatalf("%s: %s, want %q", what, r.body, d.want)
+			}
+			if folder, _ := w.titled(t, title); folder != "" {
+				t.Fatalf("%s: the refused copy made %s", what, folder)
+			}
 		}
 	}
 }

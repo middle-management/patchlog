@@ -814,10 +814,71 @@ type svcAnswer struct {
 	Message  string    `json:"message"`
 
 	// An ancestors answer's paths, root first, and whether it was cut
-	// (§B.5 "Shared nodes in DAGs"; notCopiedInto).
-	Paths     [][]svcItem `json:"paths"`
-	Truncated bool        `json:"truncated"`
-	TooDeep   int         `json:"tooDeep"`
+	// (§B.5 "Shared nodes in DAGs"; notCopiedInto), as sent: their
+	// shape changed in v0.82, and ancestorPaths reads both, so a shape
+	// it doesn't know fails no listing's decoding here.
+	Paths     json.RawMessage `json:"paths"`
+	Truncated json.RawMessage `json:"truncated"`
+	TooDeep   json.RawMessage `json:"tooDeep"`
+}
+
+// svcCut reports whether raw, an ancestors answer's tooDeep or truncated,
+// says the answer was cut (§B.5 "Shared nodes in DAGs"): JSON true, as
+// the text has it, or a number other than 0, the count a tree service
+// before v0.82 sent. Only an absent member, false or 0 says it wasn't:
+// anything else isn't understood, and counts as a cut.
+func svcCut(raw json.RawMessage) bool {
+	switch s := strings.TrimSpace(string(raw)); s {
+	case "", "false", "0":
+		return false
+	}
+	return true
+}
+
+// ancestorPaths reads the paths of ancestors answer a, asked of node of:
+// each a list of node names, root first. ok is false where they don't
+// say that of's every ancestor is among them: the answer was cut
+// (svcCut), has no paths, or isn't in a shape read here. Two are (§B.5):
+// arrays of node names that end at of itself, v0.82's; and, from a tree
+// service before it, arrays of objects with a name, of's ancestors
+// without of. A path of names that doesn't end at of is neither.
+func ancestorPaths(a *svcAnswer, of string) (paths [][]string, ok bool) {
+	if svcCut(a.TooDeep) || svcCut(a.Truncated) {
+		return nil, false
+	}
+	var raw [][]json.RawMessage
+	if len(a.Paths) == 0 || strings.TrimSpace(string(a.Paths)) == "null" || json.Unmarshal(a.Paths, &raw) != nil {
+		return nil, false
+	}
+	for _, rp := range raw {
+		if rp == nil {
+			return nil, false
+		}
+		p, named := make([]string, 0, len(rp)), false
+		for _, re := range rp {
+			var name string
+			var obj struct {
+				Name *string `json:"name"`
+			}
+			switch {
+			case json.Unmarshal(re, &name) == nil:
+				named = true
+			case json.Unmarshal(re, &obj) == nil && obj.Name != nil:
+				name = *obj.Name
+			default:
+				return nil, false
+			}
+			if name == "" {
+				return nil, false
+			}
+			p = append(p, name)
+		}
+		if named && p[len(p)-1] != of {
+			return nil, false
+		}
+		paths = append(paths, p)
+	}
+	return paths, true
 }
 
 // svcList reads the children of folder in catalog cat from its tree
