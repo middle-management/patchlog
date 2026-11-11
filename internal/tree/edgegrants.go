@@ -208,7 +208,12 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 				denied = ae
 			}
 		case err != nil:
-			upErr = err
+			// 503 only if every unreadable chain's cause is transient:
+			// a lasting one is 502 whichever grant met it (§C.5.2 All
+			// or nothing).
+			if upErr == nil || transientChain(upErr) && !transientChain(err) {
+				upErr = err
+			}
 		default:
 			vs = append(vs, v)
 		}
@@ -617,4 +622,12 @@ func (s *Service) noteTrust(ctx context.Context) {
 			s.opt.Logf("tree: recording when %s entered the combined checkpoint: %v", ns, err)
 		}
 	}
+}
+
+// transientChain reports a requireAt chain the checker can't read for now
+// (chainErr), which WriteAuthError answers 503 behind; any other failure
+// that is no refusal is 502 upstream.
+func transientChain(err error) bool {
+	transient, ok := chainErr(err)
+	return ok && transient
 }

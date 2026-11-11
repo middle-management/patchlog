@@ -20,15 +20,18 @@ import (
 
 // v077Sealed is node name's entry in the listing at path, read by rd:
 // its values and the kid they are sealed under, whole or per entry, and
-// whether its born is sealed apart from them.
+// whether its born is sealed apart from them. The namespace whose keys
+// seal it is the one its kid names: the catalog, or in a release preview
+// its branch (v0.82, §E.2.6 Per-entry sealing), which pl.ns must name
+// too (OpenView, OpenItem).
 func v077Sealed(t *testing.T, x *svc, path, rd, name string, keyOf func(string) []byte) (kid string, vals map[string]any, bornApart bool) {
 	t.Helper()
 	waitFor(t, "a listing", func() bool { return x.listingAs(path, rd).status == http.StatusOK })
 	f := x.fetch(path, rd)
-	view := derived.View{NS: "cat", Target: f.path}
 	if f.header.Get("Content-Type") == seal.ContentType {
 		kid = must(seal.ParseHeader(string(f.body))).Kid
-		return kid, entriesOf(t, decode(t, must(derived.OpenView(string(f.body), keyOf, view))))[name], false
+		ns, _ := must2(seal.ParseKid(kid))
+		return kid, entriesOf(t, decode(t, must(derived.OpenView(string(f.body), keyOf, derived.View{NS: ns, Target: f.path}))))[name], false
 	}
 	e := entriesOf(t, decode(t, f.body))[name]
 	jwe, _ := e["sealed"].(string)
@@ -37,7 +40,8 @@ func v077Sealed(t *testing.T, x *svc, path, rd, name string, keyOf func(string) 
 	}
 	_, bornApart = e["born"]
 	kid = must(seal.ParseHeader(jwe)).Kid
-	return kid, decode(t, must(derived.OpenItem(jwe, derived.ItemKey(keyOf, "cat", name), view, "cat", name))), bornApart
+	ns, _ := must2(seal.ParseKid(kid))
+	return kid, decode(t, must(derived.OpenItem(jwe, derived.ItemKey(keyOf, ns, name), derived.View{NS: ns, Target: f.path}, ns, name))), bornApart
 }
 
 // v077Epochs is node name's epoch and born_epoch as stored (0 for NULL).
@@ -57,10 +61,12 @@ func v077Epochs(t *testing.T, db, name string) (epoch, born int) {
 // would carry, judged once, when the service first seals a value derived
 // from it. In a release preview of e2e catalog cat through its e2e branch
 // catb (v081Preview), node n's head is cat's op, read through, so its
-// snapshot takes catb's epoch in force: first listed at cat#1, its title
-// is sealed under cat#1; after the epochs rotate to 2, a listing at a new
-// at still seals it under cat#1, later written after the rotation under
-// cat#2, and n stays under cat#1 after a restart.
+// snapshot takes catb's epoch in force: first listed at catb#1, its title
+// is sealed under catb#1, the branch's key (v0.82: a preview's entries
+// are sealed under the branch's keys, §E.2.6; before, under cat#1); after
+// the epochs rotate to 2, a listing at a new at still seals it under
+// catb#1, later written after the rotation under catb#2, and n stays
+// under catb#1 after a restart.
 // (Before, every listing took the current epoch.) Until v0.81 n was
 // written in the clear in cat before cat was raised to e2e, which is 422
 // since v0.78.
@@ -73,8 +79,8 @@ func TestV077V04JudgedOnceE3(t *testing.T) {
 	check := func(when string) {
 		t.Helper()
 		got, vals, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", p.keyOf)
-		if got != "cat#1" || vals["title"] != "N" {
-			t.Errorf("%s: n %v under %s, want title N under cat#1", when, vals, got)
+		if got != "catb#1" || vals["title"] != "N" {
+			t.Errorf("%s: n %v under %s, want title N under catb#1", when, vals, got)
 		}
 	}
 	if e, _ := v077Epochs(t, p.db, "n"); e != 0 {
@@ -89,8 +95,8 @@ func TestV077V04JudgedOnceE3(t *testing.T) {
 	must(p.x2.CreateDocSealed(ctx, "catb", "later", map[string]any{"title": "Later", "parents": parents("root@a1")}))
 	p.reach(t, x)
 	check("after the rotation")
-	if got, vals, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "later", p.keyOf); got != "cat#2" || vals["title"] != "Later" {
-		t.Errorf("later, written after the rotation: %v under %s, want title Later under cat#2", vals, got)
+	if got, vals, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "later", p.keyOf); got != "catb#2" || vals["title"] != "Later" {
+		t.Errorf("later, written after the rotation: %v under %s, want title Later under catb#2", vals, got)
 	}
 
 	x.stop()
@@ -149,8 +155,8 @@ func TestV077V04JudgedOnceBornWithHead(t *testing.T) {
 	}
 	for _, when := range []string{"first listing", "after a restart"} {
 		kid, vals, apart := v077Sealed(t, x, "/cat/children?of=root", rd, "n", keyOf)
-		if b, _ := vals["born"].(string); kid != "cat#1" || vals["title"] != "N" || b == "" || apart {
-			t.Errorf("%s: n %v under %s (born apart %v), want its title and born together under cat#1", when, vals, kid, apart)
+		if b, _ := vals["born"].(string); kid != "catb#1" || vals["title"] != "N" || b == "" || apart {
+			t.Errorf("%s: n %v under %s (born apart %v), want its title and born together under catb#1 (the branch's key, v0.82)", when, vals, kid, apart)
 		}
 		if e, b := v077Epochs(t, db, "n"); e != 1 || b != 1 {
 			t.Errorf("%s: n's epochs %d, %d, want 1 recorded for both", when, e, b)
@@ -191,15 +197,14 @@ func v077Blocking(prefix string, release chan struct{}) client.Option {
 	})
 }
 
-// §E.2.6, §E.3.1 (v0.77): an own sealed op's snapshot carries its own
-// kid's epoch, never the one in force. While a database's head epochs are
-// still being read in (meta "epochs"), a Node.Epoch of 0 may be one not
-// read in yet: a listing served meanwhile seals it under the current
-// epoch but judges nothing, and the fill gives it its own. Here n, an own
-// op of epoch 1, is listed during the fill (cat#2, the current epoch),
-// then under cat#1, its own, with 1 stored. (Before, the listing recorded
-// 2 as n's judgement, and the fill, which reads in only epochs still 0,
-// kept it.)
+// §E.2.6, §E.3.1 (v0.77; v0.82): an own sealed op's snapshot carries its
+// own kid's epoch, never the one in force. While a database's head epochs
+// are still being read in (meta "epochs"), a Node.Epoch of 0 may be one
+// not read in yet: a listing served meanwhile judges nothing and, since
+// v0.82, seals nothing derived from that head (§E.2.6 Per-entry sealing;
+// v0.77 sealed it under the current epoch, cat#2): n is by name only.
+// The fill gives it its own: n, an own op of epoch 1, is then listed
+// under cat#1, with 1 stored.
 func TestV077V04NotJudgedDuringBackfill(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -238,8 +243,12 @@ func TestV077V04NotJudgedDuringBackfill(t *testing.T) {
 	v077Unfill(t, db)
 	x = startSvc(t, sc(true), svcOpts{now: s.Now, db: db}, withRecipient)
 	rd := k.Grant(t, s.Now(), "user:r", []string{"cat"}, []string{"read"})
-	if kid, _, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", keyOf); kid != "cat#2" {
-		t.Errorf("during the fill: n under %s, want cat#2, the current epoch", kid)
+	waitFor(t, "a listing", func() bool { return x.listingAs("/cat/children?of=root", rd).status == http.StatusOK })
+	during := x.fetch("/cat/children?of=root", rd)
+	if during.header.Get("Content-Type") == seal.ContentType {
+		t.Errorf("during the fill: a listing sealed whole with an unjudged node")
+	} else if e := entriesOf(t, decode(t, during.body))["n"]; e == nil || e["sealed"] != nil || e["title"] != nil || e["born"] != nil {
+		t.Errorf("during the fill: n %v, want it by name only", e)
 	}
 	if e, _ := v077Epochs(t, db, "n"); e != 0 {
 		t.Errorf("during the fill: n's epoch %d stored, want none judged", e)
@@ -256,12 +265,14 @@ func TestV077V04NotJudgedDuringBackfill(t *testing.T) {
 	}
 }
 
-// §E.2.6 (v0.77): a listing served while the head epochs are read in
-// seals a head whose epoch is pending (here n's in a release preview of
-// e2e catalog cat through its branch catb: cat's op, read through) under
-// the current epoch without judging it; the fill, which changes no epoch,
-// still drops the stored listings, and the first listing after it judges
-// n.
+// §E.2.6 Per-entry sealing (v0.82; inverted from v0.77, which sealed it
+// under the current epoch unjudged): a listing served while the head
+// epochs are read in seals nothing derived from a head whose epoch isn't
+// judged (here n's in a release preview of e2e catalog cat through its
+// branch catb: cat's op, read through): n is by name only, and no epoch
+// is recorded. The fill, which changes no epoch, still drops the listings
+// that left n's values out, and the first listing after it judges n,
+// under the branch's epoch (catb#1).
 func TestV077V04BackfillDropsUnjudged(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -302,28 +313,23 @@ func TestV077V04BackfillDropsUnjudged(t *testing.T) {
 	v077Unfill(t, db)
 	x = startSvc(t, sc(true), svcOpts{now: s.Now, db: db}, preview)
 	rd := k.Grant(t, s.Now(), "user:r", both, []string{"read"})
-	if kid, _, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", keyOf); kid != "cat#1" {
-		t.Errorf("during the fill: n under %s, want cat#1", kid)
+	waitFor(t, "a listing", func() bool { return x.listingAs("/cat/children?of=root", rd).status == http.StatusOK })
+	during := x.fetch("/cat/children?of=root", rd)
+	if during.header.Get("Content-Type") == seal.ContentType {
+		t.Fatalf("during the fill: a listing sealed whole with an unjudged node")
 	}
-	stored := func() int {
-		sq := must(sql.Open("sqlite", db))
-		defer sq.Close()
-		var c int
-		if err := sq.QueryRow(`SELECT count(*) FROM sealed_views`).Scan(&c); err != nil {
-			t.Fatal(err)
-		}
-		return c
+	if e := entriesOf(t, decode(t, during.body))["n"]; e == nil || e["sealed"] != nil || e["title"] != nil || e["born"] != nil || e["href"] != "/r/cat/n" {
+		t.Errorf("during the fill: n %v, want it by name only", e)
 	}
-	if e, _ := v077Epochs(t, db, "n"); e != 0 || stored() == 0 {
-		t.Fatalf("during the fill: n's epoch %d stored, %d listings stored; want none judged, the listing stored", e, stored())
+	if e, _ := v077Epochs(t, db, "n"); e != 0 {
+		t.Fatalf("during the fill: n's epoch %d stored; want none judged", e)
 	}
 	close(release)
 	waitFor(t, "the epochs backfill", func() bool { return !x.s.EpochsPending() })
-	if c := stored(); c != 0 {
-		t.Errorf("after the fill: %d listings stored, want those sealed unjudged dropped", c)
-	}
-	if kid, _, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", keyOf); kid != "cat#1" {
-		t.Errorf("after the fill: n under %s, want cat#1", kid)
+	// The listing that left n's values out isn't served again at its
+	// at: the fill dropped it, kept and stored.
+	if kid, vals, _ := v077Sealed(t, x, "/cat/children?of=root", rd, "n", keyOf); kid != "catb#1" || vals["title"] != "N" {
+		t.Errorf("after the fill: n %v under %s, want its title under catb#1", vals, kid)
 	}
 	if e, b := v077Epochs(t, db, "n"); e != 1 || b != 1 {
 		t.Errorf("after the fill: n's epochs %d, %d stored, want 1 judged for both", e, b)

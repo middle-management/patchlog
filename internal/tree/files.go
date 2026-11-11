@@ -46,9 +46,10 @@ type FileMeta struct {
 	Modified string
 	// Epoch is the epoch the head is served under in a sealed namespace
 	// (derived.EpochOf), which a listing seals the metadata under
-	// (§E.2.6 values of another resource); 0 where not known, as for rows
-	// stored before it was kept until backfillEpochs reads it in, which
-	// take the epoch current then.
+	// (§E.2.6 values of another resource); 0 where not judged, as for
+	// rows stored before it was kept, or read before the namespace was
+	// sealed, until backfillEpochs reads it in: until then a listing
+	// seals none of it and says { "absent": "pending" } (query.file).
 	Epoch int
 }
 
@@ -342,6 +343,10 @@ type fileSealing struct {
 	// can tell whether it still holds once its graph is read
 	// (fileSealingChanged).
 	read fileSealingSource
+	// pending is set by a listing that left file metadata out because
+	// the epoch its head is served under isn't judged (query.file), and
+	// reread where that head should be read again for it (rejudge).
+	pending, reread bool
 }
 
 // fileSealingSource is what a fileSealing is read from: whether the
@@ -522,7 +527,20 @@ func (q *query) file(n *Node) any {
 	if !sealed {
 		return n.ItemFile.value()
 	}
-	if e := n.ItemFile.Epoch; e > 0 && e != k.Epoch {
+	if n.ItemFile.Epoch <= 0 {
+		// The epoch its head is served under isn't judged: nothing
+		// derived from it is sealed (§E.2.6 Per-entry sealing), least
+		// of all under the current epoch, which a rotation since may
+		// have meant to cut readers off from. The head is read again
+		// for its kid (rejudge), unless a fill is reading it or one
+		// couldn't.
+		fs.pending = true
+		if !q.s.epochsPending && q.s.unknownFile[n.ItemNS+"/"+n.ItemName] != n.ItemHead {
+			fs.reread = true
+		}
+		return map[string]any{"absent": "pending"}
+	}
+	if e := n.ItemFile.Epoch; e != k.Epoch {
 		// Sealed under the epoch the item's head is served under (§E.2.6).
 		ek, ok := fs.epochs[ns][e]
 		switch {
@@ -557,11 +575,14 @@ func (q *query) file(n *Node) any {
 // entry of its log, the epoch each explicit node's born is served under
 // (Node.BornEpoch), which migration 005 and markBornEpochs mark pending
 // again. Until then, and for a head the service can't read for good
-// (lastingKeyErr, gone or not content), a head's epoch defaults to the
-// current one (in an e2e catalog not judged while the fill runs, and the
-// listings stored meanwhile dropped, §E.2.6: epochsPending), and a born whose epoch isn't known is left out of sealed
-// and e2e listings, never sealed with the head's values (§E.2.6); any
-// other failure is returned, and the fill made again (retryBackfill).
+// (lastingKeyErr, gone or not content), nothing derived from a head whose
+// epoch isn't judged is sealed (§E.2.6 Per-entry sealing): its node is
+// shown by name only and its file metadata is { "absent": "pending" }; in
+// an e2e catalog a head read without an own kid is judged by a listing
+// once the fill is done (epochsPending). A born whose epoch isn't known
+// is left out of sealed and e2e listings, never sealed with the head's
+// values (§E.2.6); any other failure is returned, and the fill made again
+// (retryBackfill).
 // Listings change at an unchanged combined checkpoint, so the catalog's
 // cached listings go, as backfillFiles does.
 // markBornEpochs marks, once per database (meta "bornsnap"), the borns
@@ -588,6 +609,42 @@ ON CONFLICT (k) DO NOTHING`); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// rejudge has the epochs of heads stored without one read in again
+// (backfillEpochs), beside the followers: a listing asks for it when it
+// meets, at E2, a catalog node or an item's file metadata whose head was
+// read without a kid, as one read before the namespace was sealed is
+// (§E.2.6: "until it can judge it, the service seals nothing derived from
+// that revision"). One fill at a time; a head it can't read stays by name
+// only and isn't asked for again (unknownEpoch). Without Run there is
+// nothing to read with, and the node stays by name only.
+func (s *Service) rejudge() {
+	s.fmu.Lock()
+	ctx := s.runCtx
+	if ctx == nil || ctx.Err() != nil || !s.rejudging.CompareAndSwap(false, true) {
+		s.fmu.Unlock()
+		return
+	}
+	s.fwg.Add(1)
+	s.fmu.Unlock()
+	go func() {
+		defer s.fwg.Done()
+		defer s.rejudging.Store(false)
+		fill := func(ctx context.Context) error {
+			if _, err := s.db.ExecContext(ctx, `INSERT INTO meta (k, v) VALUES ('epochs', 'pending') ON CONFLICT (k) DO NOTHING`); err != nil {
+				return err
+			}
+			s.mu.Lock()
+			s.epochsPending = true
+			s.mu.Unlock()
+			return s.backfillEpochs(ctx)
+		}
+		if err := fill(ctx); err != nil && ctx.Err() == nil {
+			s.opt.Logf("tree: epochs: %v; retrying", err)
+			s.retryBackfill(ctx, "epochs", fill)
+		}
+	}()
 }
 
 func (s *Service) backfillEpochs(ctx context.Context) error {
@@ -667,6 +724,7 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 		sealed[w.ns] = err == nil && in.Level == derived.LevelSealed
 	}
 	epochs := make([]int, len(wants)) // 0 where it stays unknown
+	tried := make([]bool, len(wants)) // read, whatever came of it
 	eg, ectx := errgroup.WithContext(ctx)
 	eg.SetLimit(bornReads)
 	for i, w := range wants {
@@ -677,6 +735,7 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 			}
 			ns = s.actual(w.ns)
 		}
+		tried[i] = true
 		eg.Go(func() error {
 			if w.born {
 				_, e, err := s.bornOf(ectx, ns, w.name, w.head)
@@ -769,11 +828,11 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k = 'epochs'`); err != nil {
 		return err
 	}
-	// A listing served meanwhile sealed heads not read in yet under the
-	// current epoch, judging none (epochsPending): stored, it would keep
-	// a value under an epoch that is neither its revision's nor the one
-	// a listing now judges (§E.2.6, §E.3.1).
-	if s.unjudged.Load() {
+	// A listing computed meanwhile left out the values of heads whose
+	// epoch wasn't judged, serving their nodes by name only (§E.2.6 Per-
+	// entry sealing): it changes at an unchanged checkpoint once they
+	// are, or, at E3, once a listing may judge them.
+	if s.nameOnly.Load() {
 		changed = true
 	}
 	var tags []string
@@ -793,7 +852,19 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 		return err
 	}
 	s.epochsPending = false
-	s.unjudged.Store(false)
+	s.nameOnly.Store(false)
+	// The heads it couldn't read stay by name only, and aren't asked for
+	// again by a listing (rejudge) while they are the heads.
+	s.unknownEpoch, s.unknownFile = map[string]string{}, map[string]string{}
+	for i, w := range wants {
+		switch {
+		case epochs[i] > 0 || w.born || !tried[i]:
+		case w.file == nil:
+			s.unknownEpoch[w.node] = w.head
+		default:
+			s.unknownFile[w.ns+"/"+w.name] = w.head
+		}
+	}
 	if len(tags) > 0 {
 		s.sealed.Purged(tags)
 		s.kept.Purge(cat, tags)

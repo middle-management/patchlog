@@ -37,9 +37,9 @@ func TestV082SealedPlaintextCanonical(t *testing.T) {
 	ke := seal.NewKey()
 	v := View{NS: "n", Target: "/n/at/1abc/children"}
 	body := map[string]any{
-		"sep":         "a b",
+		"sep":         "a\u2028b",
 		"\U0001F600":  "astral key",
-		"":           "private-use key",
+		"\uE000":      "private-use key",
 		"big":         1e21,
 		"size":        int64(1234),
 		"entries":     []v82Entry{{Name: "b", Href: "/r/n/b", Count: 2}},
@@ -51,7 +51,7 @@ func TestV082SealedPlaintextCanonical(t *testing.T) {
 	// What a reader that parses the plaintext and serialises it again
 	// canonically gets: the same bytes.
 	want := `{"<html>&":"kept as is","big":1e+21,"children":[{"a":["x"],"z":1}],"entries":[{"count":2,"href":"/r/n/b","name":"b"}],` +
-		`"nothing":null,"placeholder":true,"sep":"a` + " " + `b","size":1234,"` + "\U0001F600" + `":"astral key","` + "" + `":"private-use key"}`
+		`"nothing":null,"placeholder":true,"sep":"a` + "\u2028" + `b","size":1234,"` + "\U0001F600" + `":"astral key","` + "\uE000" + `":"private-use key"}`
 	keyOf := func(kid string) []byte {
 		if kid == "n#2" {
 			return ke

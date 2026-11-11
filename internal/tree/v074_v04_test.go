@@ -31,7 +31,7 @@ func TestV074RootsWithoutVisibleParent(t *testing.T) {
 	if got := names(x.get("/cat/roots", bob)["roots"]); got != "lost" {
 		t.Errorf("roots for a reader who sees lost: %s", got)
 	}
-	if b := x.get("/cat/ancestors?of=lost", bob); len(b["paths"].([]any)) != 1 || pathsOf(b["paths"]) != "" || b["incomplete"] != nil {
+	if b := x.get("/cat/ancestors?of=lost", bob); len(b["paths"].([]any)) != 1 || pathsOf(b["paths"]) != "lost" || b["incomplete"] != nil {
 		t.Errorf("ancestors of a root for the reader: %v", b)
 	}
 	if b := x.get("/cat/ancestors?of=lost", whole); len(b["paths"].([]any)) != 0 || b["incomplete"] != 1.0 {
