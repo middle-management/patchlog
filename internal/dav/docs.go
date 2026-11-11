@@ -262,11 +262,12 @@ func (tk *token) forgetWriters() {
 	tk.mu.Unlock()
 }
 
-// transient reports a read that failed for now (a 429, a 5xx, no answer),
-// whose failure isn't kept.
+// transient reports a read that failed for now (a 408, a 429, a 5xx, no
+// answer), whose failure isn't kept: a save that decides by it fails
+// (failedRead, §H.4 "The base"), and the next asks again.
 func transient(err error) bool {
 	ae, isAPI := client.AsAPIError(err)
-	return err != nil && (!isAPI || ae.Status == 429 || ae.Status >= 500)
+	return err != nil && (!isAPI || ae.Status == 408 || ae.Status == 429 || ae.Status >= 500)
 }
 
 // nsInfoErr is nsInfo, with the error of a read that failed for now

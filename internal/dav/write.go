@@ -136,7 +136,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 	err := st.retrying(ctx, func() (bool, error) {
 		h, err := st.saveHead(ctx, ns, name, o)
 		if err != nil {
-			return false, err
+			return false, saveRead(err)
 		}
 		switch {
 		case o.fresh && h.State != client.NotFound:
@@ -299,7 +299,7 @@ func (st *reqState) tombLast(ctx context.Context, ns, name string, h *client.Hea
 		case failedRead(err):
 			// A failed read fails the save (503, 502), never 409 (§H.4
 			// "The base", "The reload", §H.6).
-			return nil, err
+			return nil, saveRead(err)
 		case pruned(err), err != nil && theirs:
 			// Refused either way: moved away as far as the head says.
 			last = nil
@@ -395,7 +395,7 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	cur, err := st.s.doc(ctx, st.tk, ns, name, head)
 	switch {
 	case err != nil:
-		return "", false, false, err
+		return "", false, false, saveRead(err)
 	case cur.sealed:
 		return "", false, false, notOffered(ns)
 	case cur.raw != nil:
@@ -560,7 +560,7 @@ func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidat
 				goneErr = err
 				return true, nil
 			case err != nil:
-				return false, err
+				return false, saveRead(err)
 			case e.sealed:
 				return true, nil
 			}
@@ -825,14 +825,14 @@ func (st *reqState) spans(ctx context.Context, ns, name, headRev string, cs []ca
 			return nil, gone()
 		}
 		if err != nil {
-			return nil, err
+			return nil, saveRead(err)
 		}
 		base, err := st.s.doc(ctx, st.tk, ns, name, from)
 		switch {
 		case pruned(err):
 			return nil, gone()
 		case err != nil:
-			return nil, err
+			return nil, saveRead(err)
 		}
 		ws := logWrites(base.value, es)
 		// Each candidate's span is that of the entries after its
@@ -846,7 +846,17 @@ func (st *reqState) spans(ctx context.Context, ns, name, headRev string, cs []ca
 			if need[es[i].ID] {
 				out[es[i].ID] = span{writes: append([]pointer.Pointer(nil), acc.writes...), own: append([]pointer.Pointer(nil), acc.own...), foreign: acc.foreign}
 			}
-			if st.ownLogEntry(ctx, ns, name, es[i]) || wroteRev(cs, es[i].ID) {
+			// Whose entry it is: a failed read of what says so (the
+			// user's identity, the key history) fails the save, which
+			// never takes theirs for the user's own, or the reverse,
+			// while the core can't say (§H.4 "The base").
+			own := wroteRev(cs, es[i].ID)
+			if !own {
+				if own, err = st.ownLogEntry(ctx, ns, name, es[i]); err != nil {
+					return nil, err
+				}
+			}
+			if own {
 				// The principal's own: what it changed is in the head,
 				// and its own to change again (rebase, unsafe).
 				acc.own = append(acc.own, ws[i]...)

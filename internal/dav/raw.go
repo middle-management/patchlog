@@ -192,7 +192,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 	err := st.retrying(ctx, func() (bool, error) {
 		h, err := st.saveHead(ctx, ns, name, o)
 		if err != nil {
-			return false, err
+			return false, saveRead(err)
 		}
 		if o.fresh && h.State != client.NotFound {
 			return false, taken(ns, name)
@@ -207,7 +207,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 			cur, err := st.s.doc(ctx, st.tk, ns, name, h.ID)
 			switch {
 			case err != nil:
-				return false, err
+				return false, saveRead(err)
 			case cur.sealed:
 				return false, notOffered(ns)
 			case cur.raw == nil:

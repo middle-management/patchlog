@@ -301,6 +301,34 @@ func (w *errWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
+// saveRead is the error of a read a save decides by (§H.4 "The base":
+// the head, the base and the revisions between, their log, whose entries
+// they are): one that failed for now (failedRead) fails the save, 503
+// with Retry-After after the core's 429 or 503, else 502. upstream gives
+// the 429 its 503 (after retrying waited it out, where brief), any other
+// 5xx its 502, a core that can't be reached its 502 and a timeout of the
+// gateway's own, with no answer to go by, 503 with Retry-After; the two
+// it answers otherwise for other requests are mapped here, the core's
+// 503 (503 with its Retry-After, not 502) and its 408 (502, not 503).
+// Any other error is returned as it is.
+func saveRead(err error) error {
+	var de *davError
+	if err == nil || errors.As(err, &de) || !failedRead(err) {
+		return err
+	}
+	ae, ok := client.AsAPIError(err)
+	if !ok {
+		return err
+	}
+	switch ae.Status {
+	case http.StatusServiceUnavailable:
+		return busy(ae)
+	case http.StatusRequestTimeout:
+		return fail(http.StatusBadGateway, "the core answered %d: %s", ae.Status, apiText(ae))
+	}
+	return err
+}
+
 // failedRead reports a read that failed for now (§H.4 "The base", "The
 // reload", §H.6): no answer from the core (a transport error, a timeout),
 // or its 408, 429 or 5xx, also where fetching keys wrapped it

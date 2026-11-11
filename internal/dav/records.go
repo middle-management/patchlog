@@ -228,64 +228,81 @@ func (s *Server) ownEntry(p *principal, ns, name, id string) bool {
 // core recorded as the user's (wroteAs), written through another program
 // or gateway with the same grant's sub and key, or, with authentication
 // disabled, the same X-Author.
-func (st *reqState) ownLogEntry(ctx context.Context, ns, name string, e client.LogEntry) bool {
+func (st *reqState) ownLogEntry(ctx context.Context, ns, name string, e client.LogEntry) (bool, error) {
 	if st.s.ownEntry(st.p, ns, name, e.ID) {
-		return true
+		return true, nil
 	}
-	st.knowUser(ctx, ns)
+	if err := st.knowUser(ctx, ns); err != nil {
+		return false, err
+	}
 	return st.wroteAs(ctx, ns, e)
 }
 
 // knowUser makes sure the user's identity is known for ns (wroteAs): the
 // kid its grant is verified under there, which GET /ns/{ns}/principal
 // says (nsInfo), and in local mode over a core with authentication
-// disabled, the server's X-Author.
-func (st *reqState) knowUser(ctx context.Context, ns string) {
+// disabled, the server's X-Author. A read of it that failed for now
+// (failedRead) is the error, mapped as a save's failed reads are
+// (saveRead): a user who isn't known wrote nothing, so every entry would
+// read as someone else's, and the save that asks fails instead (§H.4
+// "The base").
+func (st *reqState) knowUser(ctx context.Context, ns string) error {
 	st.p.mu.Lock()
 	unknown := st.p.sub == "" && st.p.author == ""
 	st.p.mu.Unlock()
 	if unknown && st.tk == st.s.local {
-		if root, err := st.tk.c.Root(ctx); err == nil && root.AuthDisabled() {
-			if author, _, err := st.tk.c.Principal(ctx); err == nil {
+		root, err := st.tk.c.Root(ctx)
+		if failedRead(err) {
+			return saveRead(err)
+		}
+		if err == nil && root.AuthDisabled() {
+			author, _, err := st.tk.c.Principal(ctx)
+			if failedRead(err) {
+				return saveRead(err)
+			}
+			if err == nil {
 				st.p.mu.Lock()
 				if st.p.sub == "" && st.p.author == "" {
 					st.p.author = author
 				}
 				st.p.mu.Unlock()
-				return
+				return nil
 			}
 		}
 	}
-	st.s.nsInfo(ctx, st.tk, ns)
+	if _, err := st.s.nsInfoErr(ctx, st.tk, ns); failedRead(err) {
+		return saveRead(err)
+	}
+	return nil
 }
 
 // ownHead reports whether head h of ns/name, a tombstone, is the user's
 // own (ownLogEntry), reading its log entry where this server didn't
 // record it writing it; one that can't be read counts as someone else's,
-// but a failed read (failedRead) of it, or of who the user is, is the
-// error, which fails the save (§H.4 "The base": 503, 502, never 409).
+// but a failed read (failedRead) of it, of who the user is, or of the
+// key history that says whose it is, is the error, which fails the save
+// (§H.4 "The base": 503, 502, never 409).
 func (st *reqState) ownHead(ctx context.Context, ns, name string, h *client.Head) (bool, error) {
 	if st.s.ownEntry(st.p, ns, name, h.ID) {
 		return true, nil
 	}
-	st.knowUser(ctx, ns)
+	if err := st.knowUser(ctx, ns); err != nil {
+		return false, err
+	}
 	st.p.mu.Lock()
 	known := st.p.sub != "" || st.p.author != ""
 	st.p.mu.Unlock()
 	if !known {
-		if _, err := st.s.nsInfoErr(ctx, st.tk, ns); failedRead(err) {
-			return false, err
-		}
 		return false, nil
 	}
 	es, err := st.tk.c.Log(ctx, ns, name, h.ID, h.Last)
 	switch {
 	case failedRead(err):
-		return false, err
+		return false, saveRead(err)
 	case err != nil || len(es) == 0 || es[len(es)-1].ID != h.ID:
 		return false, nil
 	}
-	return st.wroteAs(ctx, ns, es[len(es)-1]), nil
+	return st.wroteAs(ctx, ns, es[len(es)-1])
 }
 
 // recordsOf returns p's records of ns/name. Records the bounds dropped
