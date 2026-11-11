@@ -32,8 +32,8 @@ import (
 //
 //   - content kind: not public, sealed or e2e, and it trusts some catalog
 //     through a key whose requireAt names it (catvis.TrustedCatalogs), a
-//     purged, e2e or branch one among them, which makes nothing visible
-//     (dark);
+//     purged or e2e one, or a branch, local or remote, among them, which
+//     makes nothing visible (dark);
 //   - no branch is covered (§B.11.9 Where, v0.78): coverageOf answers nil
 //     for one before anything else;
 //   - catalog kind: a catalog, neither public nor sealed, that some local
@@ -85,9 +85,10 @@ const (
 type fsBase struct{ ns, at string }
 
 // fsCat is a catalog a covered namespace trusts, with its document as of
-// id (its ns_id in the checkpoint), whether it is e2e, a local branch or
-// purged (gone: no document, no id), any of which makes nothing visible
-// and keeps it out of at (dark), and the kids of the root's keys whose
+// id (its ns_id in the checkpoint), whether it is e2e, a branch, local or
+// remote (a remote one the index doesn't follow has no id), or purged
+// (gone: no document, no id), any of which makes nothing visible and
+// keeps it out of at (dark), and the kids of the root's keys whose
 // requireAt names it.
 type fsCat struct {
 	ns, id string
@@ -98,10 +99,11 @@ type fsCat struct {
 	kids   []string
 }
 
-// dark reports whether c makes nothing visible (§B.11.9 Where: "an
-// end-to-end catalog, which the origin can't read, a branch or a purged
-// one makes nothing visible"): it still counts for coverage, but decides
-// no view and stays out of at and its ids.
+// dark reports whether c makes nothing visible (§B.11.9 Where: "a
+// trusted catalog makes nothing visible where it is a branch, local or
+// remote (§G.3), purged, or end-to-end, which the origin can't read"):
+// it still counts for coverage, but decides no view and stays out of at
+// and its ids.
 func (c fsCat) dark() bool { return c.e2e || c.branch || c.gone }
 
 // fcp is a covered namespace's combined checkpoint (§B.11.9 URLs, §A.4):
@@ -489,13 +491,17 @@ func isCatalog(doc map[string]any) bool {
 // taken at (memberAt): local, unpurged namespaces, and purged ones (gone),
 // which make nothing visible and still count for coverage, as at the
 // origin (§B.11.9 Where: "a branch or a purged one makes nothing
-// visible"), as does a local branch (fsCat.branch). A remote branch has
-// no checkpoint here (memberAt) and counts as no catalog. A purged
+// visible"), as does a branch, local or remote (fsCat.branch; §B.11.9
+// Where, v0.82: "a branch, local or remote (§G.3)"). A remote branch the
+// index doesn't follow has no checkpoint here (memberAt): its
+// catalog.trust is that of its own document at its head, as the origin
+// stores it (remoteCatalog), and no follower is started for it. A purged
 // catalog's document is 410: its catalog.trust is the one the index last
 // applied (catalog_trust), as the origin reads its last stored document
 // ("as their documents alone decide"). One the index never applied a
 // document of counts as no catalog: root is not covered through it, the
-// reading that shows least (§A.4: no marker, 403).
+// reading that shows least (§A.4: no marker, 403). A catalog whose
+// document can't be read is an error (502), never no catalog.
 func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) ([]fsCat, error) {
 	var ferr error
 	ids, docs, gone := map[string]string{}, map[string]map[string]any{}, map[string]bool{}
@@ -504,6 +510,18 @@ func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) (
 			return nil
 		}
 		id, ok, purged, err := ix.memberAtGone(ctx, cat)
+		if err == nil && !ok && !purged {
+			// No member here: a remote branch still counts, dark.
+			d, err := ix.remoteCatalog(ctx, cat)
+			if err != nil {
+				ferr = err
+				return nil
+			}
+			if d != nil {
+				docs[cat] = d
+			}
+			return d
+		}
 		if purged && err == nil {
 			trust, known, err := ix.lastTrust(ctx, cat)
 			if err != nil {
@@ -537,11 +555,36 @@ func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) (
 			out = append(out, fsCat{ns: tr.Catalog, gone: true, kids: tr.Kids})
 			continue
 		}
+		// A branch, local or remote: the one the index follows is judged
+		// by its document at its checkpoint.
 		_, _, branch := localBase(docs[tr.Catalog])
 		out = append(out, fsCat{ns: tr.Catalog, id: ids[tr.Catalog], doc: docs[tr.Catalog],
-			e2e: derived.InfoOf(docs[tr.Catalog]).Level == derived.LevelE2E, branch: branch, kids: tr.Kids})
+			e2e: derived.InfoOf(docs[tr.Catalog]).Level == derived.LevelE2E, branch: branch || remoteBranch(docs[tr.Catalog]), kids: tr.Kids})
 	}
 	return out, nil
+}
+
+// remoteCatalog is cat's document at its head where cat is a remote
+// branch (§G.3), which memberAt gives no checkpoint, nil where it is
+// none (it doesn't exist, or its name is no namespace's): a trusted
+// catalog that is a remote branch counts for coverage through its own
+// document as stored at this origin, and makes nothing visible (§B.11.9
+// Where, v0.82; fsCat.dark). It is read through the grant checker, at the
+// head it holds, and never followed: nothing of it is in a checkpoint.
+func (ix *Index) remoteCatalog(ctx context.Context, cat string) (map[string]any, error) {
+	if !client.ValidNSName(cat) {
+		return nil, nil
+	}
+	cfg, err := ix.checker.Config(ctx, cat)
+	switch {
+	case client.IsPurged(err), client.IsNotFound(err):
+		return nil, nil
+	case err != nil:
+		return nil, lacksRead(cat, fmt.Errorf("the head of %s: %w", cat, err))
+	case !remoteBranch(cfg.Doc):
+		return nil, nil
+	}
+	return cfg.Doc, nil
 }
 
 // maxChain bounds a branch's chain of bases (the deployment's branch
