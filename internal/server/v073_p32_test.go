@@ -289,7 +289,8 @@ func TestV073RemoteRestrictsRead(t *testing.T) {
 // ENC-45: a raise to e2e seen after at is one Levels refuse the branch
 // (Addendum E Levels, Branches of a raised base): it is recorded, and the
 // branch marked for a rebase, raised as far as Levels allow, to sealed
-// (v0.74, §G.5.2), and it keeps serving what it read through. A's
+// (v0.74, §G.5.2), and what it read through answers 502 upstream from then
+// on, since sealed is still below e2e (v0.82, scenario 74). A's
 // document is rewritten in transit here, since this server raises no
 // existing namespace to e2e yet; B reads it only from A (§G.5.2).
 func TestV073RemoteE2ERaiseNeedsRebase(t *testing.T) {
@@ -325,8 +326,10 @@ func TestV073RemoteE2ERaiseNeedsRebase(t *testing.T) {
 	if l := levelOf(b.configOf("r")); l != "sealed" {
 		t.Fatalf("level %q, want sealed", l)
 	}
-	if g := b.get("/r/r/x/rev/" + x); g.Code != 200 || !isJOSE(g) {
-		t.Fatalf("read-through content: %d %s", g.Code, g.Body)
+	// What the source had at at is held, whatever level the branch
+	// reaches: sealed is below e2e (v0.82, CONFORMANCE scenario 74).
+	if g := b.get("/r/r/x/rev/" + x); g.Code != 502 || g.Str("code") != "upstream" || isJOSE(g) {
+		t.Fatalf("read-through content: %d %s, want 502 upstream", g.Code, g.Body)
 	}
 }
 

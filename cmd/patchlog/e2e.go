@@ -93,22 +93,27 @@ func sealStatusLine(st *client.SealStatus) string {
 
 // keyringFlags name the admin keys whose e2e keyring entries a tool or
 // service opens, and those it trusts to distribute keys it seals under
-// (§E.3.2): -keyring-sender and -trusted-sender, both repeatable.
-type keyringFlags struct{ senders, trusted multi }
+// (§E.3.2): -keyring-sender and -trusted-sender, both repeatable; and the
+// encryption levels it expects of namespaces, -expect-level (§7.1).
+type keyringFlags struct{ senders, trusted, levels multi }
 
 const keyringSenderHelp = "file with a keyring admin's X25519 public key (a JWK {kty, crv, x}, or base64url x): e2e keyring entries it wrapped are opened (§E.3.2), and, unless -trusted-sender is given, sealed under; repeatable"
 const trustedSenderHelp = "as -keyring-sender, and trusted to distribute keys: once any is given, this tool seals (writes, prunes, re-encrypted merges, derived views) only under keys whose keyring entry is from one of these or from its own identity, while reads still open keys from every -keyring-sender (§E.3.2); never under a key without a sender; repeatable"
 
-// addKeyringFlags registers -keyring-sender and -trusted-sender on fs.
+const expectLevelHelp = "ns=level: the encryption level namespace ns is known to have (at-rest, sealed or e2e). The tool holds it from its first request, so a server or cache that claims a lower one is refused, and with e2e a document served in the clear is too (§7.1, Levels); without it a level is only held once learnt, in this process; repeatable"
+
+// addKeyringFlags registers -keyring-sender, -trusted-sender and
+// -expect-level on fs.
 func addKeyringFlags(fs *flag.FlagSet) *keyringFlags {
 	kf := &keyringFlags{}
 	fs.Var(&kf.senders, "keyring-sender", keyringSenderHelp)
 	fs.Var(&kf.trusted, "trusted-sender", trustedSenderHelp)
+	fs.Var(&kf.levels, "expect-level", expectLevelHelp)
 	return kf
 }
 
 // options returns the client options of kf (client.WithKeyringSenders,
-// client.WithTrustedKeyringSenders).
+// client.WithTrustedKeyringSenders, client.WithExpectedLevel).
 func (kf *keyringFlags) options() ([]client.Option, error) {
 	senders, err := readPublicKeys(kf.senders)
 	if err != nil {
@@ -124,6 +129,25 @@ func (kf *keyringFlags) options() ([]client.Option, error) {
 	}
 	if len(trusted) > 0 {
 		out = append(out, client.WithTrustedKeyringSenders(trusted...))
+	}
+	levels, err := expectLevels(kf.levels)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, levels...), nil
+}
+
+// expectLevels are the client options of -expect-level's values, each
+// "ns=level" (client.WithExpectedLevel): a namespace name and one of
+// at-rest, sealed and e2e, anything else being an error, never ignored.
+func expectLevels(vals []string) ([]client.Option, error) {
+	var out []client.Option
+	for _, v := range vals {
+		ns, level, ok := strings.Cut(v, "=")
+		if !ok || !client.ValidNSName(ns) || !client.ValidLevel(level) {
+			return nil, fmt.Errorf("-expect-level: %q isn't ns=level with level at-rest, sealed or e2e", v)
+		}
+		out = append(out, client.WithExpectedLevel(ns, level))
 	}
 	return out, nil
 }

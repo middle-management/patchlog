@@ -15,6 +15,7 @@
  *   - RFC 6902 JSON Patch, for folding e2e logs client-side
  *   - a small JSON Schema subset, for flagging e2e revisions on read (§E.3.2)
  *   - blob ids (§3.7) and the binary sealed-blob form (§E.2.2, §E.3.1), for viewing and attaching files
+ *   - the levels a reader has learnt (§7.1) and the count of sealings under a K_r at E3 (§E.2.1)
  *
  * No dependencies; runs in browsers and in Node >= 20 (globalThis.crypto).
  */
@@ -762,6 +763,144 @@ async function selfTest(fx) {
   return results;
 }
 
+/* ------------------------------------------------------------------ *
+ * levels learnt (§7.1 End-to-end namespaces, Addendum E Levels), as internal/client/levels.go keeps them
+ * ------------------------------------------------------------------ */
+/* A reader learns a namespace's level from its configuration (expectLevel: the page's "expect" setting), from the
+ * namespace's current document, or else from the level POST /keys names, and keeps the highest it has learnt, in
+ * the order none < at-rest < sealed < e2e: a level is never lowered, so a source naming a lower one than held is
+ * refused (learnLevel's lowered), never believed, while a refusal, a 404 and an answer naming no level teach
+ * nothing. The table is kept in localStorage under pl.levels, by the page's origin and the namespace, so it outlives
+ * the page; without localStorage (Node, private mode) it lasts as long as the script. A first contact can't tell a
+ * server that claims a lower level: for that there is the setting. */
+const LEVEL_RANK = Object.freeze(Object.assign(Object.create(null), { '': 0, 'at-rest': 1, sealed: 2, e2e: 3 }));
+/* levelRank is level's place in the order, undefined for anything that is no level this page knows: a string it
+ * doesn't list, such as the name of a member of Object.prototype, and whatever isn't a string (["e2e"] is no level,
+ * though it would index a table as "e2e" does). Every comparison of levels goes through it. */
+function levelRank(level) {
+  return typeof level === 'string' && Object.prototype.hasOwnProperty.call(LEVEL_RANK, level) ? LEVEL_RANK[level] : undefined;
+}
+const LEVELS_KEY = 'pl.levels';
+const levelMem = new Map();
+function levelStorage() { try { return typeof localStorage !== 'undefined' && localStorage ? localStorage : null; } catch (_) { return null; } }
+function levelID(ns) { return ((root.location && root.location.origin) || '') + ' ' + ns; }
+function levelTable() {
+  const ls = levelStorage();
+  if (!ls) return Object.fromEntries(levelMem);
+  try { const t = JSON.parse(ls.getItem(LEVELS_KEY) || '{}'); return t && typeof t === 'object' && !Array.isArray(t) ? t : {}; } catch (_) { return {}; }
+}
+function levelSet(ns, level) {
+  levelMem.set(levelID(ns), level);
+  const ls = levelStorage();
+  if (!ls) return;
+  const t = levelTable();
+  if (level) t[levelID(ns)] = level; else delete t[levelID(ns)];
+  try { ls.setItem(LEVELS_KEY, JSON.stringify(t)); } catch (_) { /* private mode: held for this page */ }
+}
+/* heldLevel is the level held for ns, '' for none. A stored value that is no level is held as e2e. */
+function heldLevel(ns) {
+  const norm = (v) => (v === undefined || v === '' ? '' : levelRank(v) > 0 ? v : 'e2e');
+  // What this page learnt stands where the store lost or refused it.
+  const lv = norm(levelTable()[levelID(ns)]), mem = norm(levelMem.get(levelID(ns)));
+  return levelRank(mem) > levelRank(lv) ? mem : lv;
+}
+/* learnLevel takes level, which ns's current document or /keys names, and returns { level, lowered }: the level
+ * held after it, and, where level is lower than the one held (or no level this page knows while one is held), why
+ * it is refused. */
+function learnLevel(ns, level) {
+  const held = heldLevel(ns), r = levelRank(level);
+  if (r === undefined ? held !== '' : r < levelRank(held)) {
+    return { level: held, lowered: `the server names encryption level ${JSON.stringify(level || 'none')} for ${ns}, lower than ${held}, which this browser has learnt for it: a level is never lowered, so this is refused (§7.1, Levels)` };
+  }
+  if (r !== undefined && r > levelRank(held)) levelSet(ns, level);
+  return { level: r === undefined ? '' : level, lowered: '' };
+}
+/* expectLevel is the setting: ns is known to have level (at-rest, sealed or e2e). The higher of it and what is held
+ * stays; a level this page doesn't know is held as e2e. */
+function expectLevel(ns, level) {
+  const want = levelRank(level) > 0 ? level : 'e2e';
+  if (levelRank(want) > levelRank(heldLevel(ns))) levelSet(ns, want);
+  return heldLevel(ns);
+}
+/* forgetLevel drops what is held for ns: the user's own act, for a development database created afresh. */
+function forgetLevel(ns) { levelSet(ns, ''); levelMem.delete(levelID(ns)); }
+/* levelOver is level, which something that teaches nothing suggests (a 404, a log's delivery, a cached answer),
+ * unless a higher one is held for ns: then the level held. */
+function levelOver(ns, level) {
+  const held = heldLevel(ns);
+  return levelRank(held) > (levelRank(level) || 0) ? held : level;
+}
+/* keysLevel is the level to read a POST /ns/{ns}/keys answer at (§E.2.3): known, the namespace's as its document
+ * gave it, else the level the answer names, each held to what was learnt. The answer's level is learnt; one lower
+ * than held throws before any key is taken. */
+function keysLevel(ns, known, json) {
+  const named = json && typeof json.level === 'string' ? json.level : '';
+  if (named) { const l = learnLevel(ns, named); if (l.lowered) throw new Error(l.lowered + ' (POST /keys)'); }
+  return levelOver(ns, known || named);
+}
+
+/* ------------------------------------------------------------------ *
+ * the message bound at E3 (§E.2.1), as internal/client counts it (e2eSeals)
+ * ------------------------------------------------------------------ */
+/* At E3 each writer counts the sealings under a K_r it knows of, the log's and its own, and seals none past the
+ * bound: IVs are 96 random bits, so no key seals 2^32 values. A SealCounter counts per (ns, name, kid): the
+ * resource's own sealed ops its log shows (noteLog), and the sealings made here that the log doesn't show, a
+ * refused write among them; a retry resends the same ciphertext, one sealing. reserve counts a sealing before it
+ * is made and throws past the bound. */
+const SEAL_BOUND = 2 ** 32;
+class SealCounter {
+  constructor(bound) { this.bound = bound > 0 ? bound : SEAL_BOUND; this.m = new Map(); }
+  res(ns, name) {
+    const k = ns + '\n' + name;
+    if (!this.m.has(k)) this.m.set(k, { counted: false, partial: false, logged: new Map(), own: new Map(), inFlight: new Map() });
+    return this.m.get(k);
+  }
+  counted(ns, name) { return this.res(ns, name).counted; }
+  partial(ns, name) { return this.res(ns, name).partial; }
+  count(ns, name, kid) {
+    const r = this.res(ns, name);
+    return (r.logged.get(kid) || 0) + (r.own.has(kid) ? r.own.get(kid).size : 0) + (r.inFlight.get(kid) || 0);
+  }
+  /* noteLog counts entries, the resource's log as read (objects; a sealed op's JWE names its kid and pl.ns in the
+   * clear): an op whose kid and pl.ns name ns is one sealing under that kid's K_r, and one made here moves from the
+   * own count to the log's. Ops a branch reads through are its base's. partial: some of the log couldn't be read
+   * (pruned, refused). */
+  noteLog(ns, name, entries, partial) {
+    const r = this.res(ns, name);
+    r.logged = new Map();
+    for (const e of entries || []) {
+      const jwe = e && Array.isArray(e.patches) ? sealedJWE(e.patches) : '';
+      if (!jwe) continue;
+      let hdr;
+      try { hdr = parseJWE(jwe).header; } catch (_) { continue; }
+      if (typeof hdr.kid !== 'string' || !hdr.pl || hdr.pl.ns !== ns) continue;
+      let kns = '';
+      try { kns = parseKid(hdr.kid).ns; } catch (_) { continue; }
+      if (kns !== ns) continue;
+      r.logged.set(hdr.kid, (r.logged.get(hdr.kid) || 0) + 1);
+      if (r.own.has(hdr.kid)) r.own.get(hdr.kid).delete(jwe);
+    }
+    r.counted = true;
+    r.partial = !!partial;
+  }
+  /* reserve counts one sealing under the K_r of name and kid before it is made, and returns done(jwe), which
+   * records the sealing made ('' for none). Past the bound it throws, and nothing is sealed. */
+  reserve(ns, name, kid) {
+    const r = this.res(ns, name), n = this.count(ns, name, kid);
+    if (n + 1 > this.bound) throw new Error(`${ns}/${name} under ${kid} has ${n} sealings${r.partial ? ' at least' : ''}, the bound is ${this.bound}: no key seals more (§E.2.1); a holder of a * key rotates the epoch`);
+    r.inFlight.set(kid, (r.inFlight.get(kid) || 0) + 1);
+    let settled = false;
+    return (jwe) => {
+      if (settled) return;
+      settled = true;
+      r.inFlight.set(kid, r.inFlight.get(kid) - 1);
+      if (!jwe) return;
+      if (!r.own.has(kid)) r.own.set(kid, new Set());
+      r.own.get(kid).add(jwe);
+    };
+  }
+}
+
 root.PLSeal = {
   SUITE, b64u, unb64u, b32, hex, unhex, utf8, equalBytes, randomBytes, newNonce, canonical, padLen,
   sha256, chainID, revisionID, tombstoneID, idBytes,
@@ -771,5 +910,7 @@ root.PLSeal = {
   isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2ForWrite, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,
   parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,
   applyPatch, validate, selfTest,
+  LEVEL_RANK, levelRank, heldLevel, learnLevel, expectLevel, forgetLevel, levelOver, keysLevel,
+  SEAL_BOUND, SealCounter,
 };
 })(typeof window !== 'undefined' ? window : globalThis);

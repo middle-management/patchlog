@@ -75,9 +75,22 @@ func (e *APIError) Config() string { return str(e.Body, "config") }
 func (e *APIError) Horizon() string { return str(e.Body, "horizon") }
 
 // Last is the last live revision a body names: a tombstoned head's (§8.1),
-// or, at E3, the parent of a tombstone horizon in a not_offered /rev/{id}
-// (§7.1), from which readers fold.
+// the parent of a tombstone in the 410 of its own /rev/{id} (§7.1), or, at
+// E3, the parent of a tombstone horizon in a not_offered /rev/{id}, from
+// which readers fold. It is what the server says: check it against the
+// tombstone's id (§3.4) before relying on it.
 func (e *APIError) Last() string { return str(e.Body, "last") }
+
+// Tombstone is the tombstone a 410 gone names: a tombstoned head's
+// (§8.1), or the id asked for at a tombstone's own /rev/{id} (§7.1). It is
+// "" for a purged resource and for any other error; the URL asked tells a
+// head's 410 from a revision's.
+func (e *APIError) Tombstone() string {
+	if e.Status != 410 {
+		return ""
+	}
+	return str(e.Body, "tombstone")
+}
 
 // Successor is the successor namespace of a 409 frozen (§8.4).
 func (e *APIError) Successor() string { return str(e.Body, "successor") }

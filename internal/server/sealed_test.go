@@ -281,9 +281,9 @@ func TestSealedOutputs(t *testing.T) {
 	}
 
 	// Events: resource events carry the stored entry JWEs; namespace
-	// events one JWE per entry, sealed as the range (prev, id] under K_n
-	// with the entry itself as plaintext (§E.2.2), never the one-entry
-	// range's bytes, whose plaintext is the array [entry] (v0.81).
+	// events one JWE per entry, sealed under K_n with pl {ns, event: id}
+	// and the entry itself as plaintext (§E.2.2, v0.82), never the
+	// one-entry range's bytes, whose plaintext is the array [entry].
 	ch, _, cancel := e.openSSE("/r/s/x/events", nil)
 	for _, id := range append(append([]string{}, ids...), tomb, ids2) {
 		ev := next(t, ch)
@@ -299,11 +299,11 @@ func TestSealedOutputs(t *testing.T) {
 	for _, m := range plain.Entries {
 		ev := next(t, nch)
 		id := m["id"].(string)
-		pt := open(t, ev.data, nsKey(t, ke, "s"), "s#1", seal.RangePL("s", prev, id))
+		pt := open(t, ev.data, nsKey(t, ke, "s"), "s#1", seal.NamespaceEventPL("s", id))
 		if ev.id != id || string(pt) != string(canonical(m)) {
 			t.Fatalf("ns event %s: %s", id, pt)
 		}
-		if _, err := seal.OpenExpect(ev.data, ke, "s#1", seal.RangePL("s", prev, id)); err == nil {
+		if _, err := seal.OpenExpect(ev.data, ke, "s#1", seal.NamespaceEventPL("s", id)); err == nil {
 			t.Fatal("a namespace event opens under K_e (scenario 59)")
 		}
 		if r := e.get("/ns/s/rev/" + id + "/log?since=" + prev); string(r.Body) == ev.data {

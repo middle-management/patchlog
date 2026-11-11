@@ -89,7 +89,8 @@ func v074Reopenable(t *testing.T, opts ...envOpt) (*tenv, func(more ...envOpt) *
 // §G.5.2 (v0.74, LEVELS-4): a source raised from none straight to e2e,
 // which Levels refuse a branch whose at is before the raise, is followed
 // as far as Levels allow, to sealed, dependents first, leaves first, and
-// the branch is marked for a rebase; its resources keep answering. A's
+// the branch is marked for a rebase; what its source had at at answers
+// 502 upstream from then on (v0.82: sealed is still below e2e). A's
 // document is rewritten in transit, as in TestV073RemoteE2ERaiseNeedsRebase.
 func TestV074RemoteE2ERaiseFollowsToSealed(t *testing.T) {
 	t.Parallel()
@@ -117,8 +118,10 @@ func TestV074RemoteE2ERaiseFollowsToSealed(t *testing.T) {
 		if l := levelOf(b.configOf(ns)); l != "sealed" {
 			t.Fatalf("%s: level %q after its source's raise to e2e, want sealed", ns, l)
 		}
-		if g := b.get("/r/" + ns + "/x/rev/" + x); g.Code != 200 || !isJOSE(g) {
-			t.Fatalf("%s: read-through content %d %s", ns, g.Code, g.Body)
+		// What the source had at at is held, whatever level the branch
+		// reaches: sealed is below e2e (v0.82, CONFORMANCE scenario 74).
+		if g := b.get("/r/" + ns + "/x/rev/" + x); g.Code != 502 || g.Str("code") != "upstream" || isJOSE(g) {
+			t.Fatalf("%s: read-through content %d %s, want 502 upstream", ns, g.Code, g.Body)
 		}
 	}
 	ls, err := b.e.RemoteLevels(context.Background(), "r")

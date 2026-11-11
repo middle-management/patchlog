@@ -367,6 +367,9 @@ function etagID(v) { return v ? v.trim().replace(/^W\//, '').replace(/^"|"$/g, '
 /* purgedHead is the head a 410 purged names, the purge-ns entry's ns_id (§8.5), '' for any other answer. A purged
  * sealed namespace's documents and log are 410 purged too, and GET /ns/{ns} redirects to one, so this is how the page
  * learns of that purge. */
+/* tombHead reports the 410 of a tombstoned head, GET /r/{ns}/{name}: { tombstone, last } (§7.1, §8.1). A tombstone's
+ * own /rev/{id} answers 410 with the same two members (v0.82): that one is a revision's answer, not a head's. */
+function tombHead(r) { return !!r && r.status === 410 && !!r.json && typeof r.json.tombstone === 'string' && !!r.json.tombstone && !revTarget(r.finalPath); }
 function purgedHead(r) { return r && r.status === 410 && r.json && r.json.code === 'purged' && typeof r.json.head === 'string' ? r.json.head : ''; }
 
 /* ------------------------------------------------------------------ *
@@ -401,7 +404,7 @@ function renderNsSelect() {
 
 function resetNsState() {
   Object.assign(S, { nsHead: '', config: '', nsDoc: null, nsErr: null, nsLog: [], heads: [], headsNext: '', branches: [],
-    resState: null, hist: [], selRev: '', cfgDirty: false, ifDirty: false, nsLevel: '', nsRaw: '', nsSeal: null, nsLogSeal: null, nsLogErr: '', nsPurged: false });
+    resState: null, hist: [], selRev: '', cfgDirty: false, ifDirty: false, nsLevel: '', nsLowered: '', nsRaw: '', nsSeal: null, nsLogSeal: null, nsLogErr: '', nsPurged: false });
 }
 
 async function selectNS(name, o = {}) {
@@ -433,18 +436,23 @@ async function refreshNS() {
       if (ns !== S.ns) return;
       S.nsDoc = d.value; S.nsSeal = d;
     } else { S.nsDoc = r.json; S.nsSeal = null; }
-    S.nsLevel = r.jose ? 'sealed' : ((S.nsDoc && S.nsDoc.encryption && S.nsDoc.encryption.level) || '');
-    nsInfoCache.set(ns, { level: S.nsLevel, doc: S.nsDoc });
+    // The current document names the level: learnt, and held to the highest this browser has learnt (§7.1, Levels).
+    // One that names a lower level is refused: the level held stays, and nothing of that document is acted on.
+    const lv = Z.learnLevel(ns, r.jose ? 'sealed' : ((r.json && r.json.encryption && r.json.encryption.level) || ''));
+    S.nsLevel = lv.level; S.nsLowered = lv.lowered;
+    nsInfoCache.set(ns, { level: S.nsLevel, doc: lv.lowered ? null : S.nsDoc, lowered: lv.lowered });
     syncSealBoxes();
     if (S.nsLevel === 'e2e') loadKeyring(); else if (KR.ns !== ns) { KR.ns = ns; KR.doc = null; renderKeyring(); }
   } else if (purgedHead(r)) {
     // A purged sealed namespace (§8.5): its documents, log and events are 410 purged, and the 410's head, its
     // purge-ns entry, is all there is to show.
-    Object.assign(S, { nsHead: purgedHead(r), nsPurged: true, nsLevel: 'sealed', nsDoc: null, config: '', heads: [], branches: [] });
+    Object.assign(S, { nsHead: purgedHead(r), nsPurged: true, nsLevel: Z.levelOver(ns, 'sealed'), nsDoc: null, config: '', heads: [], branches: [] });
     S.nsLog = [{ kind: 'purge-ns', id: S.nsHead }];
     renderNsAll(); updateLiveUrls(); return;
   } else {
     S.nsErr = r; S.nsDoc = null; S.nsHead = ''; S.config = '';
+    // An unreadable document teaches nothing: the level held stands (§7.1, Levels).
+    S.nsLevel = Z.heldLevel(ns);
     // Fall back to the log, which 302s to the range and reveals the head in its final URL.
     const l = await api('GET', `/ns/${ns}/log`, { auto: true });
     if (ns !== S.ns) return;
@@ -502,6 +510,7 @@ function renderNsStatus() {
       S.nsSeal ? (S.nsSeal.error ? h('span', { class: 'badge err', title: S.nsSeal.error }, 'document not decrypted') : h('span', { class: 'badge ok', title: 'kid ' + S.nsSeal.kid }, 'decrypted in this browser')) : null,
       S.nsLevel === 'e2e' ? h('button', { class: 'link small', onclick: () => showTab('keys') }, 'keyring →') : null));
   }
+  kv.append(h('dt', {}, 'level held'), levelHeldEl(S.ns));
   box.className = '';
   box.replaceChildren(
     h('div', { class: 'state-line' }, h('b', {}, S.ns),
@@ -511,6 +520,7 @@ function renderNsStatus() {
       d.base ? h('span', { class: 'badge' }, 'branch') : null,
       S.nsLevel === 'sealed' || S.nsLevel === 'e2e' ? h('span', { class: 'badge tomb' }, S.nsLevel === 'e2e' ? 'E3 end-to-end' : 'E2 sealed') : null),
     kv,
+    S.nsLowered ? h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'level lowered'), '  ' + S.nsLowered) : '',
     S.nsSeal && S.nsSeal.error ? h('div', { class: 'note' }, 'The namespace document is sealed (application/jose). ' + S.nsSeal.error + ' — see the Keys tab.') : '');
 }
 
@@ -670,7 +680,7 @@ async function refreshRes() {
     // At E3 the head redirects to /rev/{head}, which is not_offered unless a prune stored its snapshot (§7.1).
     st = { kind: 'live', head: r.hdr('X-Revision') || r.etag() || revTarget(r.finalPath), via: r.finalPath };
     Object.assign(st, await readDoc(ns, res, st.head, r));
-  } else if (r.status === 410 && r.json && r.json.tombstone) st = { kind: 'tomb', head: r.json.tombstone, last: r.json.last };
+  } else if (tombHead(r)) st = { kind: 'tomb', head: r.json.tombstone, last: r.json.last };
   else if (r.status === 410) st = { kind: 'purged' };
   else if (r.status === 404) st = { kind: 'missing' };
   else st = { kind: 'error', status: r.status, code: r.json && r.json.code };
@@ -1214,7 +1224,7 @@ async function undoReadRes(ns, site) {
   let head, headKind;
   // An e2e head redirects to /rev/{head}, not_offered unless a prune stored its snapshot (§7.1).
   if (hr.status === 200 || notOffered(hr)) { head = hr.hdr('X-Revision') || hr.etag() || revTarget(hr.finalPath); headKind = 'live'; }
-  else if (hr.status === 410 && hr.json && hr.json.tombstone) { head = hr.json.tombstone; headKind = 'tomb'; }
+  else if (hr.status === 410 && hr.json && hr.json.tombstone && !revTarget(hr.finalPath)) { head = hr.json.tombstone; headKind = 'tomb'; }
   else if (hr.status === 410) throw Object.assign(new Error(name + ' is purged'), { impossible: 'purged', resource: name });
   else throw new Error(`reading ${name} answered ${hr.status}`);
   let since = site.hint, L = null;
@@ -1250,12 +1260,14 @@ async function undoReadRes(ns, site) {
 
 /* undoKeysLevel asks POST /ns/{ns}/keys for the level of a namespace whose document the grant can't read (§E.2.3):
  * '' where it isn't offered (404 not_offered: the namespace isn't sealed), else the level a 200 names. null where
- * /keys refuses (403, 404, or 422 at E3 without enc) or names no level, as a deployment before v0.51. */
+ * /keys refuses (403, 404, or 422 at E3 without enc) or names no level, as a deployment before v0.51. A level this
+ * browser holds stands over a 404, and a 200 naming a lower one throws (§7.1, Levels). */
 async function undoKeysLevel(ns) {
   const r = await api('POST', `/ns/${ns}/keys`, { body: { epochs: [] }, auto: true, label: 'undo' });
   const j = r.json || {};
-  if (r.status === 404 && j.code === 'not_offered') return '';
-  if (r.status === 200) return typeof j.level === 'string' && j.level ? j.level : null;
+  // A 404 teaches nothing, and a level this browser holds is never lowered (§7.1, Levels).
+  if (r.status === 404 && j.code === 'not_offered') return Z.levelOver(ns, '');
+  if (r.status === 200) return typeof j.level === 'string' && j.level ? Z.keysLevel(ns, '', j) : null;
   if ([403, 404, 422].includes(r.status)) return null;
   throw new Error(`POST /ns/${ns}/keys answered ${r.status}`);
 }
@@ -1294,6 +1306,7 @@ async function undoPlan(ns, g, o = {}) {
     if (kl !== null) { plan.level = kl; learn = false; }
   }
   const e2eRefusal = () => Object.assign(new Error('undo in an e2e namespace folds and seals the inverse client-side: use the Go client (client.Undo with UndoE2E), which learns the epoch and pad from /keys for a grant limited to some resources (§E.2.3); the playground does it for plaintext and sealed (E2) namespaces'), { refused: true });
+  plan.level = Z.levelOver(ns, plan.level);
   if (plan.level === 'e2e') throw e2eRefusal();
   const lim = o.limits || {};
   const unseen = [];
@@ -1301,6 +1314,8 @@ async function undoPlan(ns, g, o = {}) {
   for (const site of found.sites) {
     const rr = await undoReadRes(ns, site);
     if (learn && rr.level) plan.level = rr.level;
+    // What a log shows can't lower a level this browser holds (§7.1, Levels).
+    plan.level = Z.levelOver(ns, plan.level);
     if (plan.level === 'e2e') throw e2eRefusal();
     const first = rr.entries.findIndex((e) => e.gesture === g && (!found.author || e.author === found.author));
     // Entries of the gesture by other authors only: it isn't the author's here.
@@ -1648,15 +1663,33 @@ function keyFrom(kid, resource, from) { KEYS.from.set(kid + '\n' + (resource || 
 function holdEpoch(kid, key, from) { KEYS.epoch.set(kid, key); keyFrom(kid, '', from); }
 function holdRes(kid, resource, key, from) { KEYS.res.set(kid + '\n' + resource, key); keyFrom(kid, resource, from); }
 
-/* nsInfo returns a namespace's encryption level and (plaintext or decrypted) document. */
+/* nsInfo returns a namespace's encryption level and (plaintext or decrypted) document. The level is learnt from the
+ * current document and held to the highest this browser has learnt (§7.1, Levels; seal.js): an unreadable document
+ * teaches nothing, and one naming a lower level is refused, leaving the level held, no document and lowered, why. */
 async function nsInfo(ns) {
-  if (nsInfoCache.has(ns)) return nsInfoCache.get(ns);
-  const r = await api('GET', `/ns/${ns}`, { auto: true });
-  let info = { level: '', doc: null };
-  if (r.status === 200 && r.jose) info = { level: 'sealed', doc: null };
-  else if (r.status === 200) info = { level: (r.json && r.json.encryption && r.json.encryption.level) || '', doc: r.json };
-  nsInfoCache.set(ns, info);
-  return info;
+  if (!nsInfoCache.has(ns)) {
+    const r = await api('GET', `/ns/${ns}`, { auto: true });
+    let info = { level: '', doc: null };
+    if (r.status === 200) {
+      const lv = Z.learnLevel(ns, r.jose ? 'sealed' : ((r.json && r.json.encryption && r.json.encryption.level) || ''));
+      info = { level: lv.level, doc: r.jose || lv.lowered ? null : r.json };
+      if (lv.lowered) info.lowered = lv.lowered;
+    }
+    nsInfoCache.set(ns, info);
+  }
+  const info = nsInfoCache.get(ns), level = Z.levelOver(ns, info.level);
+  return level === info.level ? info : Object.assign({}, info, { level });
+}
+
+/* levelHeldEl is the dd of the level this browser holds for ns, with the setting: expect a level before the first
+ * contact, which can't tell a server that claims a lower one, and forget what is held, for a database made afresh. */
+function levelHeldEl(ns) {
+  const held = Z.heldLevel(ns);
+  const again = () => { nsInfoCache.delete(ns); refreshNS(); };
+  return h('dd', {}, held || 'none', h('span', { class: 'muted small' }, held ? ' \u00b7 kept in this browser; a lower level from the server is refused (\u00a77.1) ' : ' \u00b7 the server is believed at first contact '),
+    held !== 'e2e' ? h('button', { class: 'link small', title: 'Hold e2e for this namespace from now on: a document in the clear, or a lower level, is refused', onclick: () => { Z.expectLevel(ns, 'e2e'); again(); } }, 'expect e2e') : null,
+    held !== 'e2e' && held !== 'sealed' ? h('button', { class: 'link small', title: 'Hold sealed for this namespace from now on', onclick: () => { Z.expectLevel(ns, 'sealed'); again(); } }, 'expect sealed') : null,
+    held ? h('button', { class: 'link small', title: 'Forget the level held, as for a development database created afresh', onclick: () => { if (confirm(`Forget that ${ns} is ${held}? The server's next answer is then believed, at whatever level it names.`)) { Z.forgetLevel(ns); again(); } } }, 'forget') : null);
 }
 
 /* takeKeys stores the entries of a POST /ns/{ns}/keys answer, { kid, name?, from?, wrapped } or { kid, name?, key }
@@ -1711,8 +1744,9 @@ async function fetchKeyFor(kid, resource) {
     const body = { epochs: [epoch] };
     if (resource && info.level !== 'e2e') body.resources = [resource];
     const r = await api('POST', `/ns/${ns}/keys`, { body, auto: true, label: 'keys' });
-    // A grant that can't read the namespace document (§C.5) learns the level from the answer (§E.2.3).
-    const level = info.level || (r.json && typeof r.json.level === 'string' ? r.json.level : '');
+    // A grant that can't read the namespace document (§C.5) learns the level from the answer (§E.2.3); an answer
+    // naming a lower level than this browser holds is refused, with its keys (§7.1, Levels).
+    const level = Z.keysLevel(ns, info.level, r.ok ? r.json : null);
     if (r.ok && r.json) await takeKeys(r.json.keys, level);
     if (KEYS.epoch.has(kid) || (resource && KEYS.res.has(kid + '\n' + resource))) return;
     if (level !== 'e2e') throw new Error(`POST /ns/${ns}/keys gave no key for ${kid}${resource ? ' / ' + resource : ''} (HTTP ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''})`);
@@ -2107,6 +2141,42 @@ function syncSealBoxes() {
   $('sealE2E').disabled = S.nsLevel !== 'e2e';
 }
 
+/* SEALS counts the sealings under each resource's K_r that this page knows of (§E.2.1 Message bound; seal.js's
+ * SealCounter): at E3 every writer counts, this one too, and seals none past the bound. */
+const SEALS = new Z.SealCounter();
+
+/* countSealings counts, once per page and resource, the sealed ops the log of ns/name shows, so that the first
+ * sealing here is judged against them and not only against this page's own (§E.2.1), as client.E2E's countOnce
+ * does. A log pruned below a horizon is read from there, and one the grant can't read (§C.5) not at all: each leaves
+ * the count partial, the page's own sealings still counting. A resource that doesn't exist yet, or is purged, has
+ * nothing to count. A log that can't be read for another reason throws: nothing is sealed uncounted. */
+async function countSealings(seals, ns, name) {
+  if (seals.counted(ns, name)) return;
+  const path = `/r/${ns}/${name}/log`;
+  let r = await api('GET', path, { auto: true, label: 'seal count' }), partial = false;
+  if (r.status === 410 && r.json && r.json.code === 'pruned' && ID_RE.test(r.json.horizon || '')) {
+    partial = true;
+    r = await api('GET', path + '?since=' + r.json.horizon, { auto: true, label: 'seal count' });
+  }
+  if (r.status === 404 || (r.status === 410 && !(r.json && r.json.code === 'pruned'))) return seals.noteLog(ns, name, [], false);
+  if (r.status === 401 || r.status === 403) return seals.noteLog(ns, name, [], true);
+  if (r.status !== 200) throw new Error(`the log of ${ns}/${name} answered ${r.status}: its sealings can't be counted, so nothing is sealed (§E.2.1)`);
+  const L = await readLogRange(r, { auto: true, label: 'seal count' });
+  if (L.err) throw new Error(`the log of ${ns}/${name} is incomplete (${L.err}): its sealings can't be counted, so nothing is sealed (§E.2.1)`);
+  seals.noteLog(ns, name, L.arr.filter((e) => e && typeof e === 'object'), partial || L.arr.some((e) => typeof e === 'string'));
+}
+
+/* sealCounted seals a patch set for ns/name under kid's K_r once its sealing is counted (countSealings, then
+ * SealCounter.reserve): past the bound it throws and nothing is sealed. The sealing counts whether or not the
+ * write it is for is accepted; resending the same ciphertext seals nothing more. */
+async function sealCounted(seals, key, kid, ns, name, parent, patches, pad, blobs) {
+  await countSealings(seals, ns, name);
+  const done = seals.reserve(ns, name, kid);
+  let ps = null;
+  try { ps = await Z.sealPatchSet(key, kid, ns, name, parent, patches, pad, blobs); } finally { done(ps ? Z.sealedJWE(ps) : ''); }
+  return ps;
+}
+
 /* writeSealed seals a patch set in the browser and sends it, like client.E2E (§E.3.1). */
 async function writeSealed(kind, patchText) {
   const { ns, res } = S;
@@ -2134,11 +2204,14 @@ async function writeSealed(kind, patchText) {
     const v = await validateDoc(result);
     if (v.errors.length && !confirm('The resulting document does not validate against its $schema:\n\n' + v.errors.map((x) => (x.pointer || '(root)') + ' ' + x.message).join('\n') + '\n\nReaders will flag this revision. Write it anyway?')) return fail('the document does not validate: ' + v.errors.map((x) => x.message).join('; '));
     const info = await nsInfo(ns);
+    // A namespace document naming a lower level than this browser holds gives no epoch to seal under (§7.1, Levels).
+    if (info.lowered) return fail(info.lowered);
     const enc = (info.doc && info.doc.encryption) || {};
     const kid = Z.kid(ns, enc.epoch || 1);
     const key = await contentKey(kid, res); // the resource's K_r (§E.3.1)
     const blobs = Z.blobIDs(result); // declared in plaintext on the sealed op (§E.3.1)
-    const body = Z.canonical(await Z.sealPatchSet(key, kid, ns, res, parent, patches, !!enc.pad, blobs));
+    // Counted before it is sealed: no K_r seals 2^32 values, and every E3 writer counts (§E.2.1).
+    const body = Z.canonical(await sealCounted(SEALS, key, kid, ns, res, parent, patches, !!enc.pad, blobs));
     const expect = await Z.revisionID(parent, JSON.parse(body));
     const headers = kind === 'create' ? { 'If-None-Match': '*' } : { 'If-Match': quoteId(parent) };
     headers.Gesture = takeGesture(); // resent unchanged with the same ciphertext
@@ -2400,7 +2473,7 @@ async function fetchKeysForm() {
   if (rs.length) body.resources = rs;
   const r = await api('POST', `/ns/${ns}/keys`, { body });
   if (r.ok && r.json) {
-    try { toast(`${await takeKeys(r.json.keys, (await nsInfo(ns)).level || r.json.level)} key(s) stored`); } catch (err) { toast(err.message); }
+    try { toast(`${await takeKeys(r.json.keys, Z.keysLevel(ns, (await nsInfo(ns)).level, r.json))} key(s) stored`); } catch (err) { toast(err.message); }
   }
 }
 
@@ -2765,10 +2838,12 @@ async function treeGet(path) {
   return { r, view, body };
 }
 
-/* openSealedEntries decrypts per-entry sealed values ("sealed": JWE, pl {ns, name, view}) in place. */
-async function openSealedEntries(v, view) {
+/* openSealedEntries decrypts per-entry sealed values ("sealed": JWE, pl {ns, name, view}) in place. from is the
+ * entry a value of another resource hangs on and the member it is, { key, ns, name, item }, where v is such a value. */
+async function openSealedEntries(v, view, from) {
   if (Array.isArray(v)) { for (const x of v) await openSealedEntries(x, view); return; }
   if (!v || typeof v !== 'object') return;
+  let own = '';
   if (typeof v.sealed === 'string') {
     try {
       const hdr = Z.parseJWE(v.sealed).header;
@@ -2778,12 +2853,32 @@ async function openSealedEntries(v, view) {
       const other = Object.keys(v).length === 1;
       const rname = other ? (hdr.pl || {}).name : v.name !== undefined ? v.name : v.resource;
       if (typeof rname !== 'string' || !rname) throw new Error('a sealed value that names no resource');
+      // A reader compares that pl's ns and name with the resource the entry draws the value from, where the entry
+      // names it (§E.2.6 Values of another resource): its own resource, for a value of another epoch such as
+      // born, or a placement's item, "/r/{ns}/{name}", for one drawn from it such as file.
+      if (other && from) {
+        const item = /^\/r\/([^/]+)\/(.+)$/.exec(typeof from.item === 'string' ? from.item : '');
+        const fromOwn = !!from.name && rname === from.name && (!from.ns || ens === from.ns);
+        const fromItem = !!item && ens === item[1] && rname === item[2];
+        // born is the entry's own; any other value is its own or its item's, where the entry names an item.
+        if (from.key === 'born' && from.name ? !fromOwn : item && !fromOwn && !fromItem) {
+          throw new Error(`a sealed value of ${ens}/${rname}, which isn't the resource its entry draws it from (${[from.name ? (from.ns ? from.ns + '/' : '') + from.name : '', item && from.key !== 'born' ? item[1] + '/' + item[2] : ''].filter(Boolean).join(' or ')}) (\u00a7E.2.6)`);
+        }
+      }
       const d = await openSealed(ens, v.sealed, rname, { ns: ens, name: rname, view });
       if (d.value && typeof d.value === 'object') Object.assign(v, d.value);
       v._opened = hdr.kid;
+      if (!other) own = ens;
     } catch (err) { v._sealedErr = err.message; }
   }
-  for (const k of Object.keys(v)) if (k !== 'sealed' && typeof v[k] === 'object') await openSealedEntries(v[k], view);
+  // What a value of another resource is compared with: the entry's own name (and namespace, where its own sealed
+  // part named it) and its item.
+  const name = typeof v.name === 'string' ? v.name : typeof v.resource === 'string' ? v.resource : '';
+  for (const k of Object.keys(v)) {
+    if (k === 'sealed' || !v[k] || typeof v[k] !== 'object') continue;
+    const nested = !Array.isArray(v[k]) && typeof v[k].sealed === 'string' && Object.keys(v[k]).length === 1;
+    await openSealedEntries(v[k], view, nested && (name || typeof v.item === 'string') ? { key: k, ns: own, name, item: v.item } : undefined);
+  }
 }
 
 async function loadTreeListing() {
@@ -3163,11 +3258,50 @@ assigned on: ${by.get(k).at.join(', ')}` }, k)),
     stop ? h('span', { class: 'badge warn', title: `${stop} has inherit: false: nothing above it counts on this path` }, 'stops at ' + titleOf(stop)) : null);
 }
 
+/* wherePaths reads an ancestors or where answer (SERVICES.md §B.5): { paths, cut, why }. paths is every path, each
+ * an array of { name, href, title } from a root down to the node itself. v0.82 answers each path as an array of node
+ * names, with the nodes' href and title (or sealed, opened by treeGet) in the top-level nodes map, and reports a cut
+ * as "tooDeep": true (depth 64) or "truncated": true (the node limit); a service before it answered path elements as
+ * objects { name, href, title } and tooDeep as a count, which is read too. A cut, a missing paths, or anything that
+ * doesn't decode is cut: the paths shown are then not all of them, and nothing may be concluded from one's absence. */
+function wherePaths(body) {
+  const out = { paths: [], cut: false, why: '' };
+  const cut = (why) => { out.cut = true; if (!out.why) out.why = why; };
+  if (!body || typeof body !== 'object' || Array.isArray(body)) { cut('not an object'); return out; }
+  if ('tooDeep' in body && body.tooDeep !== false && body.tooDeep !== 0) cut('paths deeper than the depth limit were cut (tooDeep)');
+  if ('truncated' in body && body.truncated !== false) cut('the node limit was reached (truncated)');
+  if ('incomplete' in body && body.incomplete !== false && body.incomplete !== 0) cut('some paths are incomplete');
+  if (!Array.isArray(body.paths)) { cut('no paths'); return out; }
+  const nodes = body.nodes && typeof body.nodes === 'object' && !Array.isArray(body.nodes) ? body.nodes : {};
+  for (const p of body.paths) {
+    if (!Array.isArray(p) || !p.length) { cut('a path that is no array of nodes'); continue; }
+    const row = [];
+    for (const x of p) {
+      let name = '', info = null;
+      if (typeof x === 'string') { name = x; info = Object.prototype.hasOwnProperty.call(nodes, x) ? nodes[x] : null; }
+      else if (x && typeof x === 'object' && !Array.isArray(x) && typeof x.name === 'string') { name = x.name; info = x; }
+      if (!name) { row.length = 0; break; }
+      info = info && typeof info === 'object' ? info : {};
+      row.push({ name, href: typeof info.href === 'string' ? info.href : '', title: typeof info.title === 'string' ? info.title : '' });
+    }
+    if (!row.length) { cut('a path element that names no node'); continue; }
+    out.paths.push(row);
+  }
+  return out;
+}
+
 async function showWhere(n) {
   const it = itemOf(n.name);
   const r = await asUser(() => treeGet(it ? `where?item=${encodeURIComponent(it.href)}` : `ancestors?of=${encodeURIComponent(hrefOf(n.name))}`));
   const box = document.getElementById('catWhere');
-  if (box) box.replaceChildren(r.body ? jsonPre(r.body) : h('div', { class: 'errbox' }, 'HTTP ' + r.r.status));
+  if (!box) return;
+  if (!r.body) return box.replaceChildren(h('div', { class: 'errbox' }, 'HTTP ' + r.r.status));
+  const w = wherePaths(r.body);
+  box.replaceChildren(
+    ...w.paths.map((p) => h('div', { class: 'cat-path' }, h('span', { class: 'mono small' }, p.map((x) => x.title || x.name).join(' / ')))),
+    !w.paths.length && !w.cut ? h('div', { class: 'muted small' }, 'no paths') : null,
+    w.cut ? h('div', { class: 'note' }, 'Not every path is shown: ' + w.why + ' (\u00a7B.5).') : null,
+    h('details', {}, h('summary', { class: 'muted small' }, 'answer'), jsonPre(r.body)));
 }
 
 function selectNode(name) { C.sel = name; renderCatalog(); }

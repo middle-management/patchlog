@@ -156,8 +156,10 @@ func TestV073P36RemoteE2ERaiseAsFarAsLevelsAllow(t *testing.T) {
 			t.Fatalf("%s after its source's raise to e2e from sealed: %v, want sealed", ns, doc)
 		}
 	}
-	if g := b.get("/r/r/x/rev/" + x1); g.Code != 200 || !isJOSE(g) {
-		t.Fatalf("read-through content after following: %d %s", g.Code, g.Body)
+	// What the source had at at is held, whatever level the branch
+	// reaches: sealed is below e2e (v0.82, CONFORMANCE scenario 74).
+	if g := b.get("/r/r/x/rev/" + x1); g.Code != 502 || g.Str("code") != "upstream" || isJOSE(g) {
+		t.Fatalf("read-through content after following: %d %s, want 502 upstream", g.Code, g.Body)
 	}
 	ls, err := b.e.RemoteLevels(context.Background(), "r")
 	if err != nil || len(ls) != 1 || ls[0].Level != "e2e" || !ls[0].Rebase || ls[0].Lacks || ls[0].ID != raised {
