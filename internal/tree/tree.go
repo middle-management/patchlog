@@ -273,6 +273,12 @@ type Service struct {
 	// aren't asked for again until the head changes or the service
 	// restarts (rejudge). Guarded by mu.
 	unknownEpoch, unknownFile map[string]string
+	// unreadEpoch are the heads, by explicit node, that a fill couldn't
+	// read for good (meta "unread:{node}", kept across restarts): unlike
+	// one read without an own kid, such a head's epoch is never judged
+	// by a listing of an e2e catalog, which would seal it under the
+	// epoch in force (§E.2.6 Per-entry sealing). Guarded by mu.
+	unreadEpoch map[string]string
 	// rejudging is whether a fill asked for by a listing (rejudge) is
 	// queued or running.
 	rejudging atomic.Bool
@@ -413,6 +419,9 @@ func (s *Service) init(ctx context.Context) error {
 	}
 	if err := s.markKeyNS(ctx); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
+	}
+	if s.unreadEpoch, err = loadUnread(ctx, s.db); err != nil {
+		return err
 	}
 	var epochs string
 	switch err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'epochs'`).Scan(&epochs); {

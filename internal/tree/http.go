@@ -1464,23 +1464,26 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			// stored without one is read again (rejudge). At E3 one read
 			// without an own kid is judged here, once the heads' epochs
 			// are read in; until then (epochsPending) it may be one not
-			// read in yet. An implicit placement and a node without a
+			// read in yet, and a head a fill couldn't read for good
+			// (unreadEpoch) is never judged: it may be one of an older
+			// epoch. An implicit placement and a node without a
 			// head have no revision of the catalog to judge: their values
 			// are the current epoch's (see epochOf).
 			unjudged := func(n *Node) bool {
 				if n == nil || n.Epoch > 0 || n.Head == "" || n.Self {
 					return false
 				}
-				return !e3 || s.epochsPending
+				return !e3 || s.epochsPending || s.unreadEpoch[n.Name] == n.Head
 			}
 			// leftOut notes that values of n were left out because its
 			// epoch isn't judged: the fill that judges it drops this
 			// listing (nameOnly), and at E2, where only reading the
-			// head again tells its epoch, one is asked for (reread)
-			// unless a fill is reading it or couldn't.
+			// head again tells its epoch, or for a head an earlier
+			// fill couldn't read (unreadEpoch), one is asked for
+			// (reread) unless a fill is reading it or couldn't.
 			leftOut := func(n *Node) {
 				nameOnly = true
-				if !e3 && !s.epochsPending && s.unknownEpoch[n.Name] != n.Head {
+				if (!e3 || s.unreadEpoch[n.Name] == n.Head) && !s.epochsPending && s.unknownEpoch[n.Name] != n.Head {
 					reread = true
 				}
 			}

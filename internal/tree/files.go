@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -641,8 +642,19 @@ func (s *Service) markKeyNS(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 	var tags []string
+	var one int
+	switch err := tx.QueryRowContext(ctx, `SELECT 1 FROM nodes LIMIT 1`).Scan(&one); {
+	case errors.Is(err, sql.ErrNoRows):
+		// A new or rebuilt database holds no epochs.
+		was = keyNS
+	case err != nil:
+		return err
+	}
 	if was != keyNS {
 		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET epoch = NULL, born_epoch = NULL`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k LIKE 'unread:%'`); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO meta (k, v) VALUES ('epochs', 'pending') ON CONFLICT (k) DO NOTHING`); err != nil {
@@ -667,6 +679,25 @@ func (s *Service) markKeyNS(ctx context.Context) error {
 		s.opt.Purger.PurgeTags(tags)
 	}
 	return nil
+}
+
+// loadUnread reads the heads a fill couldn't read for good
+// (Service.unreadEpoch).
+func loadUnread(ctx context.Context, db *sql.DB) (map[string]string, error) {
+	out := map[string]string{}
+	rows, err := db.QueryContext(ctx, `SELECT substr(k, 8), v FROM meta WHERE k LIKE 'unread:%'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var node, head string
+		if err := rows.Scan(&node, &head); err != nil {
+			return nil, err
+		}
+		out[node] = head
+	}
+	return out, rows.Err()
 }
 
 // rejudge has the epochs of heads stored without one read in again
@@ -783,6 +814,7 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 	}
 	epochs := make([]int, len(wants)) // 0 where it stays unknown
 	tried := make([]bool, len(wants)) // read, whatever came of it
+	unread := make([]bool, len(wants))
 	eg, ectx := errgroup.WithContext(ctx)
 	eg.SetLimit(bornReads)
 	for i, w := range wants {
@@ -805,6 +837,7 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 			case err == nil:
 				epochs[i] = derived.EpochOf(ns, doc.Kid)
 			case lastingKeyErr(err) || errors.Is(err, follow.ErrNotLive) || errors.Is(err, derived.ErrSkip):
+				unread[i] = true
 				s.opt.Logf("tree: the epoch of %s/%s@%s stays unknown: %v", ns, w.name, w.head, err)
 			default:
 				return fmt.Errorf("tree: the epoch of %s/%s@%s: %w", ns, w.name, w.head, err)
@@ -886,6 +919,32 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k = 'epochs'`); err != nil {
 		return err
 	}
+	// A head it couldn't read for good is no head read without an own
+	// kid: it is recorded, so that no listing of an e2e catalog judges
+	// it under the epoch in force (unreadEpoch), until a fill reads it.
+	unreadEpoch := maps.Clone(s.unreadEpoch)
+	if unreadEpoch == nil {
+		unreadEpoch = map[string]string{}
+	}
+	for i, w := range wants {
+		if w.born || w.file != nil {
+			continue
+		}
+		n := g.explicit[w.node]
+		if !unread[i] || n == nil || n.Head != w.head || n.Epoch != 0 {
+			if _, was := unreadEpoch[w.node]; was {
+				if _, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k = ?`, "unread:"+w.node); err != nil {
+					return err
+				}
+				delete(unreadEpoch, w.node)
+			}
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v`, "unread:"+w.node, w.head); err != nil {
+			return err
+		}
+		unreadEpoch[w.node] = w.head
+	}
 	// A listing computed meanwhile left out the values of heads whose
 	// epoch wasn't judged, serving their nodes by name only (§E.2.6 Per-
 	// entry sealing): it changes at an unchanged checkpoint once they
@@ -914,6 +973,7 @@ func (s *Service) backfillEpochs(ctx context.Context) error {
 	// The heads it couldn't read stay by name only, and aren't asked for
 	// again by a listing (rejudge) while they are the heads.
 	s.unknownEpoch, s.unknownFile = map[string]string{}, map[string]string{}
+	s.unreadEpoch = unreadEpoch
 	for i, w := range wants {
 		switch {
 		case epochs[i] > 0 || w.born || !tried[i]:

@@ -2385,7 +2385,9 @@ func (s *Service) includesOfTrusted(ctx context.Context) (map[string]Includes, e
 			continue
 		}
 		if err != nil {
-			return nil, s.upstream("the document of namespace "+ns, err)
+			// A namespace the caller needn't have named: not named.
+			logf(s)("catalog: the includes of %s", ns)
+			return nil, s.upstream("the document of a namespace the catalog trusts", err)
 		}
 		out[ns] = ParseIncludes(cfg.Doc)
 	}
