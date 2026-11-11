@@ -2645,8 +2645,9 @@ only the caller's groups the key may assert and, as `roles`, that role; no `writ
 `patches`, so `within` is true and `covers` and `overlaps` are false. A rule that refers to
 `/now`, or to anything in `/principal` but `/principal/groups` and `/principal/roles` (or to the
 whole envelope), makes the role not count, and a grant whose block or key-scope rules do so, or
-whose read roles all do, is refused (`403`) for listings, `problems`, `orphans`, manifests and the
-edge-grant exchange, in public catalogs too (v0.78, §C.2 item 5). So the spec's `translator` (`writes within
+whose read roles all do, is refused (`403`) for `problems`, `orphans`, manifests and the
+edge-grant exchange, in public catalogs too, and for listings unless the listing is all public,
+which ignores the grant (v0.78, §C.2 item 5). So the spec's `translator` (`writes within
 ["/i18n"]`) sees the items it may read. For a folder, a role counts whose rules don't refer to
 `/resource`, through a key whose scope rules refer only to `/principal/groups` and
 `/principal/roles`. A `sub` scope on the catalog's key in any trusted namespace adds the caller's

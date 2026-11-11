@@ -441,8 +441,9 @@ v0.82" (v0.81 Open 24).
     below F only through a folder the reader can't see (69). With a chain of 65 or more
     inheriting folders the copy ends part-way (`403` at a nested level, 64 resources written),
     which §H.5's part-way rule allows and scenario 130's "nothing written" reads against. A
-    copy of any chain of 63 or more nested folders, to any destination, fails part-way for a
-    grant that can't read node documents (`403` or `409` after 64 writes). A node more than 64
+    copy of a chain of 66 inheriting folders was run for a grant that can't read node documents,
+    and failed part-way after 64 resources were written. The exact threshold, and whether it
+    depends on the destination, were not established. A node more than 64
     levels below a root isn't reachable by path through the gateway, so a copy into it is
     `409`, and scenario 130's `tooDeep` case arises only for a shared node with a short and a
     long path. *Question:* which wins; must a gateway judge depth before its first write?

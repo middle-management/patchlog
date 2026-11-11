@@ -88,19 +88,26 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.82").
    at start it drops every node's epoch and `born` epoch and its stored listings and judges
    them again under the branch's keys. A head the tree service can't read for good stays by
    name only.
-8. **After upgrading, rotate each sealed (E2) namespace whose current epoch began before the
+8. **Expect a purged catalog in an index database written by v0.27.0 to be repaired at the first
+   start.** The database may hold the purge of a catalog it serves without that catalog's
+   `catalog.trust`, so partial readers of the namespaces that trust it get `403` with no marker
+   instead of reading them dark. On its first start, this version reads the trust again from the
+   catalog's document at its purge-ns entry and records it, with no rebuild needed. A sealed
+   catalog is the exception: the origin no longer serves its document (`410`), so it stays no
+   catalog (`403`), which the index logs at each start, and a rebuild does not restore it.
+9. **After upgrading, rotate each sealed (E2) namespace whose current epoch began before the
    v0.27.0 upgrade.** v0.27.0 seeded `seal_counts` from what was stored, which can't include
    sealings an earlier draft made and never stored (events, race losers), so the count of such
    an epoch may fall short of v0.82's "never under" (§E.2.1). New epochs are counted in full.
-9. **Rebase remote branches whose source was raised to e2e after their `at`** (a source on an
+10. **Rebase remote branches whose source was raised to e2e after their `at`** (a source on an
    earlier draft). Such a branch served the content its source had at `at` sealed; it now
    answers `502 upstream` for it, for good (CONFORMANCE scenario 74). The change comes with
    the upgrade and purges no tag: purge `ns:{branch}` at the CDN and rebase the branch.
-10. **Set `-expect-level ns=e2e`** (`client.WithExpectedLevel`) on tools and services for
+11. **Set `-expect-level ns=e2e`** (`client.WithExpectedLevel`) on tools and services for
     namespaces known to be end-to-end. The client keeps the highest level it has learnt only in
     memory, so on a first contact it can't detect a server or cache that claims a lower level
     (CLI, below).
-11. **Files written before:**
+12. **Files written before:**
     - A prune archive of an e2e namespace written before v0.82 has no `access` in its header.
       It reads as private content, and the importer refuses its sealed ops at step 1, so it
       can be restored but not imported.
@@ -161,6 +168,20 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.82").
   (SERVICES §B.5 Previews, §E.2.6). An entry's cleartext `branch` stood for its item's
   namespace with nothing behind it. It is accepted only when that namespace's own document
   names the item's namespace as its base; otherwise the value is refused.
+- **Playground: a nested sealed value that stands for its entry's own is opened only for the
+  namespace being read** (SERVICES §E.2.6). A nested sealed value that stands for its entry's
+  own (a `born` in place, a `file`) is opened only if sealed for the namespace the answer is of
+  (or the entry's `href` names) or a confirmed branch of it, also where the entry's own sealed
+  value is absent or didn't open. A `{ "sealed" }` that hangs on no entry is opened only if of
+  the answer's namespace or a branch of it.
+- **Playground: a JWE's `kid` and `pl` are checked before any request** (§3.6). The namespace
+  of a JWE's `kid` and the resource name of its `pl` are checked against the §3.6 grammar
+  before any request or key lookup, so a service-supplied header can't steer a credentialed
+  request to another path.
+- **Playground: a lower level in a namespace document is not accepted as the source of a
+  branch's `base`** (§7.1, Levels). A namespace document naming a lower encryption level than
+  this browser holds is not accepted as the source of a branch's `base`. Reading one listing
+  asks at most once per namespace whether it is a branch.
 - **Catalog service: a namespace the service stopped following reads public to no one**
   (SERVICES §B.5 Behind). The service judged `"public": true` at `POST /read-grants` from the
   document it had stopped at, so a public namespace made private by the write that stopped
@@ -196,7 +217,7 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.82").
   can now be created: B learns the parent from A's `410` and mirrors the snapshot. A `last`,
   `pl.id` or `kid` that doesn't fit is `502`. Creation was `410 pruned`.
 - A remote branch whose source is raised to e2e after `at` answers `502 upstream` for
-  everything the source had at `at`, though the branch itself follows to sealed (Upgrading 9).
+  everything the source had at `at`, though the branch itself follows to sealed (Upgrading 10).
 - Go client: the walk of an e2e branch's bases follows the whole local chain, so content
   sealed in a base's base is read through; it stopped at the first base.
 
@@ -276,7 +297,7 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.82").
   the trust the index's own follower recorded, and a catalog met purged from a snapshot has its
   trust read at its purge-ns entry. A partial reader of a namespace that trusts it reads it
   covered and dark (a `g:` marker, no hits) rather than, depending on timing, `403` with no
-  marker. The earlier answer failed closed (SERVICES §B.11.9 Where, §A.4).
+  marker. The earlier answer failed closed (SERVICES §B.11.9 Where, §A.4). A database that already lost it is repaired at the next start (see Upgrading).
 
 **Bundles, archives and the gateway** (§G.4.1, §G.5.1, §8.6, TOOLS §G.4.2, §H.4, §H.5):
 - Bundles: a reader and a writer reject a bundle whose grant line's `grant` isn't the id of
@@ -293,7 +314,7 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.82").
   branch of a target holding the base, a base with a deleted resource included. A purged
   resource is still refused.
 - Import: a bundle with a `sealed` op in a namespace its header doesn't call `e2e` is refused
-  at step 1, override or not (Upgrading 11).
+  at step 1, override or not (Upgrading 12).
 - Prune archives carry `access` in their header: `e2e`, else `sealed`, else `public` or
   `private` by `read`. Restore ignores it.
 - Gateway saves: a failed read of anything a `PUT` decides by fails the save: `503` with
@@ -327,6 +348,14 @@ here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.82").
   another node's value isn't opened. It refuses a nested sealed value drawn from another
   resource than its entry names. Where a listing entry of a release preview names a `branch`,
   a value drawn from its item must be that branch's resource, never the base's.
+- Known limit (TOOLS §H.5, scenario 130): for a reader who sees a destination below the copied
+  folder only through a chain of 65 or more inheriting folders, a `COPY` fails part-way (`403`
+  at a nested level) after 64 resources are written, rather than writing nothing. Open with the
+  spec writer.
+- Known limit: the playground's Catalog tab still accepts a cleartext namespace document that
+  names a lower level than held for the catalog and its trusted namespaces, and its other URL
+  builders (reads of documents, logs, blobs, heads) put core- or service-supplied names into
+  paths unchecked. The sealed-value path is checked.
 
 **Test vectors** (Addendum I, `docs/TESTVECTORS.md`, `docs/VECTORS-PROPOSED.md`):
 - The candidates the reference confirmed for v0.81, P.1–P.7, are now Addendum I
