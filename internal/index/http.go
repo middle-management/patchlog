@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -1006,6 +1007,30 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 	}
 }
 
+// upstreamBehind reports whether err, a failure to read upstream what
+// answering needs, is one for now, answered 503 behind with msg, rather
+// than 502 upstream (writeUpstreamErr, worseUpstream): a requireAt chain
+// unreadable for a transient cause, a namespace visibility reads not
+// followed yet, the core's root or a sealed namespace's keys that can't
+// be fetched for now.
+func upstreamBehind(err error) (msg string, behind bool) {
+	if transient, ok := chainErr(err); ok {
+		return msgChainBehind, transient
+	}
+	if errors.Is(err, errMemberBehind) {
+		// A namespace visibility reads not followed yet (members.go).
+		return msgMemberBehind, true
+	}
+	if re := (*rootErr)(nil); errors.As(err, &re) && re.transient() {
+		// The core's root, read for coverage (authOff), for now.
+		return msgRootBehind, true
+	}
+	if errors.Is(err, client.ErrKeyFetch) && !lacksKey(context.Background(), err) {
+		return "the index cannot fetch the keys of a sealed namespace it reads yet (§A.4)", true
+	}
+	return "", false
+}
+
 // writeUpstreamErr answers err, a failure to read upstream what answering
 // needs, 502 upstream with msg, or msgGrantLacks where the index's own
 // grant can't read a namespace that decides §B.11.9 coverage
@@ -1025,26 +1050,12 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 // for passes through here, so each gets the same answer.
 func (ix *Index) writeUpstreamErr(w http.ResponseWriter, what string, err error, msg string) {
 	ix.opt.Logf("index: %s: %v", what, err)
-	if transient, ok := chainErr(err); ok {
-		if transient {
-			writeBehind(w, msgChainBehind)
-		} else {
-			writeErr(w, http.StatusBadGateway, "upstream", msgChainUpstream)
-		}
+	if msg, behind := upstreamBehind(err); behind {
+		writeBehind(w, msg)
 		return
 	}
-	if errors.Is(err, errMemberBehind) {
-		// A namespace visibility reads not followed yet (members.go).
-		writeBehind(w, msgMemberBehind)
-		return
-	}
-	if re := (*rootErr)(nil); errors.As(err, &re) && re.transient() {
-		// The core's root, read for coverage (authOff), for now.
-		writeBehind(w, msgRootBehind)
-		return
-	}
-	if errors.Is(err, client.ErrKeyFetch) && !lacksKey(context.Background(), err) {
-		writeBehind(w, "the index cannot fetch the keys of a sealed namespace it reads yet (§A.4)")
+	if _, ok := chainErr(err); ok {
+		writeErr(w, http.StatusBadGateway, "upstream", msgChainUpstream)
 		return
 	}
 	var gl *errGrantLacks
@@ -1099,7 +1110,8 @@ func lacksKey(ctx context.Context, err error) bool {
 // is served under (§E.2.6; derived.EpochOf, docs.epoch), and where that is
 // pending, the epoch judged once, by the first answer that seals a value
 // derived from it (judgeEpochs: the one current then): a hit under that
-// epoch's K_r of its resource. A result is sealed whole only when its
+// epoch's K_r of its resource, and nothing where it couldn't be judged
+// (errUnjudged). A result is sealed whole only when its
 // source isn't public, every reader its URL admits reads it whole, under
 // reads:{ns}, and every value derives from revisions served under one
 // epoch, under that epoch's K_e (§E.2.6 Whole-response sealing); otherwise
@@ -1119,7 +1131,9 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	lacking := map[int]bool{}
 	keyAt := func(epoch int) (k derived.Key, lacks bool, err error) {
 		if epoch <= 0 {
-			epoch = info.Epoch
+			// Never the epoch current now for a revision not judged
+			// (§E.2.6 Per-entry sealing; below).
+			return k, false, errUnjudged
 		}
 		if k, ok := keys[epoch]; ok {
 			return k, false, nil
@@ -1215,16 +1229,24 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		if err := ix.judgeResult(ctx, ns, res, info.Epoch); err != nil {
 			return derived.Stored{}, "", err
 		}
+		// A revision it couldn't judge (its row holds another head by
+		// now, or is gone: an apply committed since the query read it)
+		// has nothing sealed under any epoch, least of all the current
+		// one (§E.2.6 Per-entry sealing, v0.82: "until it can judge it,
+		// the service seals nothing derived from that revision"), and
+		// the result, read before that apply, is computed again
+		// (errUnjudged), never kept.
+		if slices.ContainsFunc(res.Hits, func(h Hit) bool { return h.epoch <= 0 }) ||
+			slices.ContainsFunc(res.Epochs, func(e int) bool { return e <= 0 }) {
+			return derived.Stored{}, "", errUnjudged
+		}
 	}
 	// The one epoch every value derives from, for a result sealed whole.
 	whole := 0
 	if info.Protected() && !perEntry {
 		epochs := map[int]bool{}
 		for _, e := range res.Epochs {
-			if e <= 0 {
-				e = info.Epoch
-			}
-			epochs[e] = true
+			epochs[e] = true // each judged (above)
 		}
 		switch {
 		case len(epochs) > 1 && len(q.Counts) > 0:
@@ -1380,6 +1402,13 @@ var errPurgedSince = errors.New("the result was computed before a purge of what 
 // errPurgedSince, computed again with what is current: a raise purges what
 // the result shows (§9), and nothing read before it is kept (§A.1).
 var errInfoChanged = fmt.Errorf("%w: the namespace's encryption changed", errPurgedSince)
+
+// errUnjudged is a result holding a value derived from a revision whose
+// epoch isn't judged, and couldn't be when the result was sealed (answer):
+// nothing is sealed under an epoch not judged (§E.2.6 Per-entry sealing).
+// It is answered as errPurgedSince: computed again from what the index
+// holds now, or 503 behind where that keeps happening.
+var errUnjudged = fmt.Errorf("%w: a revision's epoch isn't judged yet", errPurgedSince)
 
 // errAccessChanged is a result answer would compute for a reader whose
 // read check passed on what a config change since replaced

@@ -81,7 +81,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = enc.Encode(v)
 }
 
-// Bearer returns the request's bearer token, "" for none.
+// Bearer returns the request's bearer token, "" for none: an
+// Authorization of another scheme, or Bearer with nothing after it,
+// carries no usable grant, and its request is answered as one with a
+// malformed grant (401), never as one without Authorization (§C.8,
+// §C.5.3).
 func Bearer(r *http.Request) string {
 	h := r.Header.Get("Authorization")
 	if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {

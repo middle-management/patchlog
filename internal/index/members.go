@@ -321,6 +321,19 @@ func (ix *Index) followMember(ctx context.Context, m string, done chan struct{})
 		}
 		if errors.Is(err, follow.ErrPurged) {
 			ix.opt.Logf("index: %s, which visibility reads, was purged", m)
+			// One already purged when its follower started has no
+			// purge-ns batch to apply (memberHandler): it is purged all
+			// the same, with the catalog.trust of the document its first
+			// checkpoint read, if any (§B.11.9 Where: "the last one ...
+			// the service read; one a service never read counts as no
+			// catalog"). Left unmarked, memberAt took its checkpoint for a
+			// live catalog's, whose state is 410: a partial reader got
+			// 502, and the reconciler started the follower again at once.
+			ix.mem.mu.Lock()
+			if ix.mem.current(m, done) {
+				ix.mem.get(m).reach("", true)
+			}
+			ix.mem.mu.Unlock()
 			ix.kickMembers()
 			return
 		}

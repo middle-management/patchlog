@@ -531,9 +531,10 @@ func newReadRoles(cfg *grantcheck.Config, kid string) *readRoles {
 }
 
 // listableRules compiles rules that can count for a listing (§B.11.5):
-// none may read /now, or anything in /principal but /principal/groups and
-// /principal/roles (a pointer above them, such as the whole envelope,
-// reads them too). ok is false if one can't, or doesn't compile.
+// none may read /now, or a pointer below /principal that isn't at or
+// below /principal/groups or /principal/roles (v0.82), nor a pointer
+// above them, such as /principal or the whole envelope, which reads the
+// rest of /principal too. ok is false if one can't, or doesn't compile.
 func listableRules(src []any) (_ []*rules.Rule, ok bool) {
 	var out []*rules.Rule
 	for _, x := range src {

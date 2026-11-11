@@ -991,9 +991,10 @@ func attachEpochs(ctx context.Context, tx *sql.Tx, hits []Hit) error {
 // from it"): current, the epoch in force now, is written to docs.epoch
 // for that head unless another answer judged it first, whose epoch then
 // stands; every later answer reads it back. A document whose row holds
-// another head now is left out (its revision is no longer the row's,
-// and is sealed under current, unjudged). It returns the epoch judged
-// for each document it judged.
+// another head now is left out: its revision is no longer the row's, it
+// isn't judged, and nothing derived from it is sealed (§E.2.6, v0.82;
+// errUnjudged, errMoved). It returns the epoch judged for each document
+// it judged.
 func (ix *Index) judgeEpochs(ctx context.Context, docs []docHead, current int) (map[int64]int, error) {
 	out := map[int64]int{}
 	if len(docs) == 0 || current < 1 {

@@ -32,8 +32,8 @@ import (
 //
 //   - content kind: not public, sealed or e2e, and it trusts some catalog
 //     through a key whose requireAt names it (catvis.TrustedCatalogs), a
-//     purged, e2e or branch one among them, which makes nothing visible
-//     (dark);
+//     purged or e2e one, or a branch, local or remote, among them, which
+//     makes nothing visible (dark);
 //   - no branch is covered (§B.11.9 Where, v0.78): coverageOf answers nil
 //     for one before anything else;
 //   - catalog kind: a catalog, neither public nor sealed, that some local
@@ -71,8 +71,8 @@ import (
 // of whose catalogs or members it can't read is 502 to partial readers.
 // Unrestricted readers, and every reader of a namespace that isn't
 // covered, are answered as before, but a partial reader of one that isn't
-// covered and is a catalog, or whose catalogs, or a local base's, names
-// one, which has no marker (§A.4, catalogShaped).
+// covered and is a catalog, or whose catalogs, or those of a local base in
+// its chain, names one, which has no marker (§A.4, catalogShaped).
 
 // Kinds of covered namespace (fcp.kind).
 const (
@@ -85,9 +85,10 @@ const (
 type fsBase struct{ ns, at string }
 
 // fsCat is a catalog a covered namespace trusts, with its document as of
-// id (its ns_id in the checkpoint), whether it is e2e, a local branch or
-// purged (gone: no document, no id), any of which makes nothing visible
-// and keeps it out of at (dark), and the kids of the root's keys whose
+// id (its ns_id in the checkpoint), whether it is e2e, a branch, local or
+// remote (a remote one the index doesn't follow has no id), or purged
+// (gone: no document, no id), any of which makes nothing visible and
+// keeps it out of at (dark), and the kids of the root's keys whose
 // requireAt names it.
 type fsCat struct {
 	ns, id string
@@ -98,10 +99,11 @@ type fsCat struct {
 	kids   []string
 }
 
-// dark reports whether c makes nothing visible (§B.11.9 Where: "an
-// end-to-end catalog, which the origin can't read, a branch or a purged
-// one makes nothing visible"): it still counts for coverage, but decides
-// no view and stays out of at and its ids.
+// dark reports whether c makes nothing visible (§B.11.9 Where: "a
+// trusted catalog makes nothing visible where it is a branch, local or
+// remote (§G.3), purged, or end-to-end, which the origin can't read"):
+// it still counts for coverage, but decides no view and stays out of at
+// and its ids.
 func (c fsCat) dark() bool { return c.e2e || c.branch || c.gone }
 
 // fcp is a covered namespace's combined checkpoint (§B.11.9 URLs, §A.4):
@@ -489,13 +491,17 @@ func isCatalog(doc map[string]any) bool {
 // taken at (memberAt): local, unpurged namespaces, and purged ones (gone),
 // which make nothing visible and still count for coverage, as at the
 // origin (§B.11.9 Where: "a branch or a purged one makes nothing
-// visible"), as does a local branch (fsCat.branch). A remote branch has
-// no checkpoint here (memberAt) and counts as no catalog. A purged
+// visible"), as does a branch, local or remote (fsCat.branch; §B.11.9
+// Where, v0.82: "a branch, local or remote (§G.3)"). A remote branch the
+// index doesn't follow has no checkpoint here (memberAt): its
+// catalog.trust is that of its own document at its head, as the origin
+// stores it (remoteCatalog), and no follower is started for it. A purged
 // catalog's document is 410: its catalog.trust is the one the index last
 // applied (catalog_trust), as the origin reads its last stored document
 // ("as their documents alone decide"). One the index never applied a
 // document of counts as no catalog: root is not covered through it, the
-// reading that shows least (§A.4: no marker, 403).
+// reading that shows least (§A.4: no marker, 403). A catalog whose
+// document can't be read is an error (502), never no catalog.
 func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) ([]fsCat, error) {
 	var ferr error
 	ids, docs, gone := map[string]string{}, map[string]map[string]any{}, map[string]bool{}
@@ -504,6 +510,18 @@ func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) (
 			return nil
 		}
 		id, ok, purged, err := ix.memberAtGone(ctx, cat)
+		if err == nil && !ok && !purged {
+			// No member here: a remote branch still counts, dark.
+			d, err := ix.remoteCatalog(ctx, cat)
+			if err != nil {
+				ferr = err
+				return nil
+			}
+			if d != nil {
+				docs[cat] = d
+			}
+			return d
+		}
 		if purged && err == nil {
 			trust, known, err := ix.lastTrust(ctx, cat)
 			if err != nil {
@@ -537,11 +555,36 @@ func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) (
 			out = append(out, fsCat{ns: tr.Catalog, gone: true, kids: tr.Kids})
 			continue
 		}
+		// A branch, local or remote: the one the index follows is judged
+		// by its document at its checkpoint.
 		_, _, branch := localBase(docs[tr.Catalog])
 		out = append(out, fsCat{ns: tr.Catalog, id: ids[tr.Catalog], doc: docs[tr.Catalog],
-			e2e: derived.InfoOf(docs[tr.Catalog]).Level == derived.LevelE2E, branch: branch, kids: tr.Kids})
+			e2e: derived.InfoOf(docs[tr.Catalog]).Level == derived.LevelE2E, branch: branch || remoteBranch(docs[tr.Catalog]), kids: tr.Kids})
 	}
 	return out, nil
+}
+
+// remoteCatalog is cat's document at its head where cat is a remote
+// branch (§G.3), which memberAt gives no checkpoint, nil where it is
+// none (it doesn't exist, or its name is no namespace's): a trusted
+// catalog that is a remote branch counts for coverage through its own
+// document as stored at this origin, and makes nothing visible (§B.11.9
+// Where, v0.82; fsCat.dark). It is read through the grant checker, at the
+// head it holds, and never followed: nothing of it is in a checkpoint.
+func (ix *Index) remoteCatalog(ctx context.Context, cat string) (map[string]any, error) {
+	if !client.ValidNSName(cat) {
+		return nil, nil
+	}
+	cfg, err := ix.checker.Config(ctx, cat)
+	switch {
+	case client.IsPurged(err), client.IsNotFound(err):
+		return nil, nil
+	case err != nil:
+		return nil, lacksRead(cat, fmt.Errorf("the head of %s: %w", cat, err))
+	case !remoteBranch(cfg.Doc):
+		return nil, nil
+	}
+	return cfg.Doc, nil
 }
 
 // maxChain bounds a branch's chain of bases (the deployment's branch
@@ -1045,11 +1088,14 @@ var (
 	errUncovered    = &grant.AuthError{Status: 403, Msg: "the namespace is no longer read filtered: exchange the grant again (§B.11.9)"}
 )
 
-// storedFview is the view of a cookie for marker m, reads:{ns}:g:{gs}, at
-// cp, judged from what the exchanges recorded alone (rec, gsKeys), never
-// from a grant the request doesn't carry: 403 where, for any key a live
-// cookie of m came from (gsKeys: the cookie doesn't say which is its
-// own, so each must hold), the scope digest of its kid's scope rules and
+// storedFview is the view of the cookie for marker m, reads:{ns}:g:{gs},
+// that expires at exp, at cp, judged from what the exchanges recorded
+// alone (rec, gsKeysAt), never from a grant the request doesn't carry:
+// 403 where, for any key that cookie came from (gsKeysAt: those of one
+// exchange with several grants, each of which must hold), its whole entry or
+// one of its roles' whole definitions in ns's document as of cp differs
+// in any member from what the exchange recorded (entryHolds; §B.11.9 gs,
+// v0.82), the scope digest of its kid's scope rules and
 // its roles' definitions, read from ns's document as of cp (a branch's
 // keys follow its base, §C.4), with rec's block rules and principal,
 // differs from the one rec's subjects carry (a kid or role gone, or no
@@ -1057,18 +1103,19 @@ var (
 // longer has the pub it had (§B.11.9 gs: a key "no longer accepted" as
 // §C.4 judges a base's keys, "only while the base has it with the same
 // pub"; a record without one, from before migration 006, never does),
-// where m has no such key recorded (from before migration 007), and where
+// where m has no such key recorded (from before migration 011), and where
 // its subjects hold "partial", recorded under an earlier draft (§B.11.5,
 // v0.78: no gs leaves a group out); otherwise item 1 from rec's
 // subjects and item 2 from its filter. Readers with the same subjects
-// and rules share m, so once a key one came from is replaced, the
-// others' cookies are 403 too, until the replaced key's last cookie
-// expires: never a cookie read under a key no longer accepted.
-func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *markerRec) (*fview, error) {
+// and rules share m, but a cookie only with exchanges through the same
+// keys with the same entries (recordCookies): never a cookie read under
+// a key no longer accepted, nor one vouched for again by an exchange
+// that isn't its own.
+func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *markerRec, exp int64) (*fview, error) {
 	if slices.Contains(rec.subjects, catvis.Partial) {
 		return nil, errPartial
 	}
-	recorded, err := ix.gsKeys(ctx, m, ix.opt.Now())
+	recorded, err := ix.gsKeysAt(ctx, m, exp)
 	if err != nil {
 		return nil, err
 	}
@@ -1083,15 +1130,23 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *marker
 	if err != nil {
 		return nil, errRulesChanged
 	}
-	keys := cfg.Keys
 	for _, k := range recorded {
+		// The key's whole entry and its roles' whole definitions, as
+		// the exchange recorded them (entryHolds, v0.82).
+		key, ok, err := ix.entryHolds(ctx, cfg, k)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, errRulesChanged
+		}
 		// §A.4's marker digest, as grantFview has it. A marker recorded
 		// with the rules' digest alone (before this release) never holds:
 		// its cookies are 403 until the reader exchanges again.
 		holds := func(d string) bool {
 			return slices.Contains(rec.subjects, catvis.ScopePrefix+scopeKeyDigest(d, k.kid, k.pub))
 		}
-		if !gsKeyHolds(cfg, keys, rec.f, k, holds) {
+		if !gsKeyHolds(cfg, []grant.Key{key}, rec.f, k, holds) {
 			return nil, errRulesChanged
 		}
 	}
@@ -1254,15 +1309,15 @@ func (e *rootErr) transient() bool {
 var errNoMarker = &grant.AuthError{Status: 403, Msg: "the namespace is not read filtered now, and a reader of it in part reads none of it (§A.4, §B.11.9)"}
 
 // catalogShaped reports whether a partial reader of ns, which §B.11.9
-// doesn't cover, has no marker there (§A.4: "where it doesn't but {ns}
-// is neither sealed nor end-to-end and is a catalog (§B.6) or its
-// catalogs, or a local base's, names one, a partial reader has none"):
-// ns's document at its head, or at the index's checkpoint of it, is a
-// catalog, or names a catalog in catalogs, or a local base up its chain
-// does, read as of the at its branch reads it at and at its head (open
-// question: which of the two is meant; either counts here), unless ns is
-// sealed or e2e by each of those documents. A base purged or gone counts
-// as naming one: what it named can't be read.
+// doesn't cover, has no marker there (§A.4, v0.82: none "where it doesn't
+// but {ns} is neither sealed nor end-to-end and is a catalog (§B.6) or
+// its catalogs, or that of any local base in its chain at the base's head
+// or as of the at it is read through at, names one"): ns's document at
+// its head, or at the index's checkpoint of it, is a catalog, or names a
+// catalog in catalogs, or a local base up its chain does, read as of the
+// at its branch reads it at and at its head, either counting, unless ns
+// is sealed or e2e by each of those documents. A base purged or gone
+// counts as naming one: what it named can't be read.
 func (ix *Index) catalogShaped(ctx context.Context, ns string) (bool, error) {
 	cfg, err := ix.checker.Config(ctx, ns)
 	if err != nil {

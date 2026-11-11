@@ -27,8 +27,11 @@
 //	edge_filters(marker, filter, exp) what each scope or g: marker of those stands for (markerRec)
 //	edge_gs(marker, subjects, kid, roles, pub, exp)  and, for a g: marker (§B.11.9), its subjects;
 //	                                      its kid, roles and pub are no longer read (edge_gs_keys)
-//	edge_gs_keys(marker, kid, roles, pub, exp)  every key a g: marker's live cookies came from,
-//	                                      with the read roles its scope digest covers (gsKey)
+//	edge_gs_keys(marker, exp, kid, roles, pub, entry)  every key the cookie of a marker (reads:{ns}
+//	                                      included) that expires at exp came from, with its read
+//	                                      roles and the digest of its entry and theirs (gsKey),
+//	                                      written once: an exchange with other keys or entries
+//	                                      takes another exp (recordCookies)
 //	member_checkpoints(origin, ns, ns_id)  follow.SQLCheckpoints of the namespaces visibility reads
 //	                                      that the index follows without serving them, while it
 //	                                      follows them (members.go)
@@ -221,6 +224,7 @@ type Index struct {
 
 	fmu     sync.Mutex
 	filters map[string]keptFilter // scope or g: marker -> what it stands for (edge_filters, edge_gs)
+	copied  sync.Map              // a local branch -> the kids it copied from its base (copiedKids)
 
 	fs  fstate  // the state of namespaces §B.11.9 covers (filtered.go)
 	mem members // the namespaces visibility reads there that the index doesn't serve (members.go)
