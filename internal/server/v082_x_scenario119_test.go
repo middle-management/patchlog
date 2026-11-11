@@ -14,6 +14,7 @@ import (
 
 	plclient "github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/index"
 )
 
@@ -187,8 +188,8 @@ func TestV082XScenario119OriginAndIndexAgree(t *testing.T) {
 	}
 	// The index's gs is that of her marker, reads:matches:g:{gs}, over
 	// the origin's (SERVICES §A.4), not the origin's own.
-	if ogs == "" || igs == "" {
-		t.Errorf("the branch alone: gs %q at the origin, %q at the index", ogs, igs)
+	if want := grantcheck.SubjectSetID([]string{"reads:matches:g:" + ogs}); ogs == "" || igs != want {
+		t.Errorf("the branch alone: gs %q at the index, want %q, that of reads:matches:g:%s, the origin's", igs, want, ogs)
 	}
 	unrestricted("the branch alone")
 

@@ -19,9 +19,10 @@ import (
 // between its read and its judgement, or as it judges) is computed again:
 // it is a 200 serving r's head under e-b#1, the epoch that head is served
 // under, on a query and on /_refs, never KeyAt's refusal. This pins the
-// two behaviours side by side; it doesn't reach the index's own guards
-// against passing an unjudged epoch to KeyAt (keyAt in http.go and
-// refsall.go), which the judgement's recomputation keeps from being met.
+// two behaviours side by side. The index's own guards against passing an
+// unjudged epoch to KeyAt (keyAt in http.go and refsall.go) are defence
+// in depth no request reaches: answer and refsCompute return errUnjudged
+// or errMoved for such a hit before either seals a value.
 func TestV082XUnjudgedEpochRefusedAndRecomputed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
