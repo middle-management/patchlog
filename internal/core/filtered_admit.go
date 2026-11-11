@@ -6,6 +6,8 @@ import (
 	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // grantView is the view of a partial reader's grant at cp (§B.11.9 gs):
@@ -125,7 +127,10 @@ func gsRecordOf(fv *fview, exp int64) *gsRecord {
 //     definitions, read from {ns}'s document at cp, with its stored block
 //     rules and principal, differs from the stored one (a kid or role
 //     gone, or no longer listing read, or the kid's key with another pub
-//     than the stored one, counts as differing); 403 where it holds
+//     than the stored one, counts as differing), or where that key's
+//     entry or one of those roles' definitions differs there in any
+//     member from the one recorded at the exchange (gsEntryDigest,
+//     v0.82); 403 where it holds
 //     "partial", a set stored before v0.78 that leaves groups out, which
 //     no gs does now (§B.11.5, §B.11.9 gs), whatever the catalogs decide;
 //     otherwise item 1 from the stored subjects and item 2 from the
@@ -202,6 +207,15 @@ func keyPub(k grant.Key) string {
 // row recorded before pubs were kept, never holds, nor does a row whose
 // subjects don't bind its kid and pub (catvis.KeySubject), so that no row is
 // shared by readers through different keys.
+//
+// Nor does it hold where the key's entry or a role's definition differs
+// in any member from the one the exchange recorded (rec.entry,
+// gsEntryDigest), whether or not the scope digest reads that member: a
+// changed sub, groups, attrs, maxTtl, requireAt or can of the key, or a
+// role's can or rules (§B.11.9 gs, v0.82: "or the key its key: string
+// names, or a key or role they came from, is gone or changes in any
+// member, until the reader exchanges again"). An empty stored entry,
+// from a row recorded before it was kept, never holds.
 func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	seq, ok := cp.seqs[n.name]
 	if !ok {
@@ -211,6 +225,9 @@ func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	key, ok := findKey(t.effectiveKeys(n, cfg), rec.kid)
 	if !ok || !key.Lists("read") || rec.pub == "" || keyPub(key) != rec.pub ||
 		!slices.Contains(rec.subjects, catvis.KeySubject(rec.kid, rec.pub)) {
+		return false
+	}
+	if entry := t.gsEntryDigest(n, cfg, rec.kid, rec.roles); rec.entry == "" || entry != rec.entry {
 		return false
 	}
 	in := grantcheck.ScopeInput{ReadScopeResource: key.ReadScopeResource, KeyRules: key.Rules, BlockRules: rec.blockRules,
@@ -226,6 +243,45 @@ func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	}
 	d, ok := grantcheck.ScopeDigest(in)
 	return ok && d == rec.digest
+}
+
+// gsEntryDigest is §B.11.9 gs's EntryDigest of the key named kid and of
+// roles in n with document cfg:
+//
+//	text(trunc160(sha256(canonical({ "key": K, "roles": R }))))
+//
+// in the id text form of §3.2, where K is the key's whole entry as the
+// document gives it (the effective key's, §C.4) and R maps each of roles
+// to its whole definition there. It is "" where the key or one of the
+// roles is gone, which never equals a stored digest and is never stored
+// as one that holds. The exchange records it (filteredEdgeGrant) and
+// every read under the cookie computes it again from the document at its
+// checkpoint (gsDigestHolds), both through this function.
+func (t *tx) gsEntryDigest(n *nsRow, cfg *Config, kid string, roles []string) string {
+	key, ok := findKey(t.effectiveKeys(n, cfg), kid)
+	if !ok || key.Raw == nil {
+		return ""
+	}
+	defs, _ := cfg.Doc["roles"].(map[string]any)
+	rs := make(map[string]any, len(roles))
+	for _, r := range roles {
+		def, ok := defs[r]
+		if !ok {
+			return ""
+		}
+		rs[r] = def
+	}
+	return entryDigest(key.Raw, rs)
+}
+
+// entryDigest is EntryDigest, text(trunc160(sha256(canonical({ "key": key, "roles":
+// roles })))), the digest a gs cookie's record keeps of the key entry and
+// role definitions it came from (§B.11.9 gs). Nil roles are {}.
+func entryDigest(key map[string]any, roles map[string]any) string {
+	if roles == nil {
+		roles = map[string]any{}
+	}
+	return ids.Of(jsonv.Canonical(map[string]any{"key": key, "roles": roles})).String()
 }
 
 // FilteredRedirect is a partial reader's request at an unfiltered URL,

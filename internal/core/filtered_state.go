@@ -203,8 +203,14 @@ type gsRecord struct {
 	readScope  bool
 	principal  map[string]any
 	digest     string
-	filter     string // grantcheck.ReadFilter.Encode
-	exp        int64  // Unix seconds: the latest expiry of its cookies
+	// entry is EntryDigest (gsEntryDigest) over kid's whole key entry and
+	// the whole definition of each of roles, as {ns}'s document had them
+	// at the exchange: a cookie is accepted only while it is the same
+	// (§B.11.9 gs, "gone or changes in any member"). "" (a row from
+	// before it was kept) never holds.
+	entry  string
+	filter string // grantcheck.ReadFilter.Encode
+	exp    int64  // Unix seconds: the latest expiry of its cookies
 }
 
 // recordFilteredGS records r in filtered_gs, in a short write transaction
@@ -222,11 +228,11 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 		roles[i] = s
 	}
 	enc := func(v any) string { return string(jsonv.Canonical(jsonv.FromGo(v))) }
-	q := `INSERT INTO filtered_gs (gs, ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, filter, exp)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	q := `INSERT INTO filtered_gs (gs, ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, entry, filter, exp)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (ns, gs) DO UPDATE SET subjects = excluded.subjects, partial = excluded.partial,
 			kid = excluded.kid, pub = excluded.pub, roles = excluded.roles, block_rules = excluded.block_rules, read_scope = excluded.read_scope,
-			principal = excluded.principal, digest = excluded.digest, filter = excluded.filter, exp = `
+			principal = excluded.principal, digest = excluded.digest, entry = excluded.entry, filter = excluded.filter, exp = `
 	if e.pg {
 		q += `GREATEST(filtered_gs.exp, excluded.exp)`
 	} else {
@@ -237,7 +243,7 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 			return err
 		}
 		_, err := t.Exec(q, r.gs, r.ns, enc(subjects), boolInt(r.partial), r.kid, r.pub, enc(roles), enc(nonNilRules(r.blockRules)),
-			boolInt(r.readScope), enc(r.principal), r.digest, r.filter, r.exp)
+			boolInt(r.readScope), enc(r.principal), r.digest, r.entry, r.filter, r.exp)
 		return err
 	})
 }
@@ -264,8 +270,8 @@ func (t *tx) loadGS(ns, gs string) *gsRecord {
 	r := &gsRecord{gs: gs}
 	var subjects, roles, blockRules, principal string
 	var partial, readScope int64
-	err := t.QueryRow(`SELECT ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, filter, exp FROM filtered_gs WHERE ns = ? AND gs = ?`, ns, gs).
-		Scan(&r.ns, &subjects, &partial, &r.kid, &r.pub, &roles, &blockRules, &readScope, &principal, &r.digest, &r.filter, &r.exp)
+	err := t.QueryRow(`SELECT ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, entry, filter, exp FROM filtered_gs WHERE ns = ? AND gs = ?`, ns, gs).
+		Scan(&r.ns, &subjects, &partial, &r.kid, &r.pub, &roles, &blockRules, &readScope, &principal, &r.digest, &r.entry, &r.filter, &r.exp)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
