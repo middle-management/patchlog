@@ -29,7 +29,9 @@
 //	                                      its kid, roles and pub are no longer read (edge_gs_keys)
 //	edge_gs_keys(marker, exp, kid, roles, pub, entry)  every key the cookie of a marker (reads:{ns}
 //	                                      included) that expires at exp came from, with its read
-//	                                      roles and the digest of its entry and theirs (gsKey)
+//	                                      roles and the digest of its entry and theirs (gsKey),
+//	                                      written once: an exchange with other keys or entries
+//	                                      takes another exp (recordCookies)
 //	member_checkpoints(origin, ns, ns_id)  follow.SQLCheckpoints of the namespaces visibility reads
 //	                                      that the index follows without serving them, while it
 //	                                      follows them (members.go)

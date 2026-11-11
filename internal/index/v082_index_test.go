@@ -196,19 +196,20 @@ func TestV082CookieWithoutEntry(t *testing.T) {
 // never rescues another's cookie, TestV076PubSharedMarker): readers of
 // docs whole share the marker reads:docs and its prefixes whatever their
 // key. A cookie carries its prefix and exp alone, so the index keeps the
-// keys per marker and exp:
+// keys per marker and exp, and gives a cookie through other keys, or
+// through a key whose entry has changed, another exp:
 //
 //   - al and bo read through k1, cy through k2, each with a cookie of its
 //     own exp; di reads through k2 with a grant that expires when al's
-//     does, so her cookie is al's, byte for byte;
-//   - once k1's sub scope changes, al's and bo's cookies are 403, and so
-//     is di's, which is al's; cy's, which no exchange through k1 minted,
-//     still reads;
+//     does, and her cookie is another, expiring a second earlier;
+//   - once k1's sub scope changes, al's and bo's cookies are 403; cy's
+//     and di's, which no exchange through k1 minted, still read;
 //   - bo exchanges again, then cy: each reads under its new cookie, and
 //     al's stays 403 at the prefix, at an at URL already answered and at
 //     /_refs, through the same key and through another: no exchange but
 //     one for her own cookie vouches for it;
-//   - al exchanges again and reads; so does di, whose cookie that is.
+//   - al exchanges again and reads under her new cookie, which is
+//     another: the one she held stays 403.
 func TestV082CookieWindowOtherReaders(t *testing.T) {
 	t.Parallel()
 	d := newV82Whole(t)
@@ -222,6 +223,9 @@ func TestV082CookieWindowOtherReaders(t *testing.T) {
 	_, boC := d.exchange(bo)
 	_, cyC := d.exchange(cy)
 	_, diC := d.exchange(di)
+	if alC[0].Name != diC[0].Name || alC[0].Value == diC[0].Value {
+		t.Fatalf("al's and di's cookies, through k1 and k2 for one prefix: %v, %v", alC[0], diC[0])
+	}
 	paths := v82Paths(prefixes)
 	_, at := p37Follow(t, d.x, paths[0], alC, "")
 	paths = append(paths, at)
@@ -232,13 +236,15 @@ func TestV082CookieWindowOtherReaders(t *testing.T) {
 		}
 	}
 	d.patch(map[string]any{"op": "add", "path": "/keys/1/sub", "value": "user:.*"})
-	for name, c := range map[string][]*http.Cookie{"al": alC, "bo": boC, "di (al's cookie)": diC} {
+	for name, c := range map[string][]*http.Cookie{"al": alC, "bo": boC} {
 		if got := v82Status(t, d.x, paths, c); got != refused {
 			t.Errorf("%s under its cookie once k1 changed: %s, want 403", name, got)
 		}
 	}
-	if got := v82Status(t, d.x, paths, cyC); got != reads {
-		t.Errorf("cy, through k2, under a cookie no exchange through k1 minted: %s", got)
+	for name, c := range map[string][]*http.Cookie{"cy": cyC, "di": diC} {
+		if got := v82Status(t, d.x, paths, c); got != reads {
+			t.Errorf("%s, through k2, under a cookie no exchange through k1 minted: %s", name, got)
+		}
 	}
 	_, boC = d.exchange(bo)
 	if got := v82Status(t, d.x, paths, boC); got != reads {
@@ -254,11 +260,12 @@ func TestV082CookieWindowOtherReaders(t *testing.T) {
 	if got := v82Status(t, d.x, paths, alC); got != refused {
 		t.Errorf("al's cookie after cy exchanged again through k2: %s, want 403", got)
 	}
-	_, alC = d.exchange(al)
-	for name, c := range map[string][]*http.Cookie{"al": alC, "di (al's cookie)": diC} {
-		if got := v82Status(t, d.x, paths, c); got != reads {
-			t.Errorf("%s once al exchanged again: %s", name, got)
-		}
+	_, alC2 := d.exchange(al)
+	if got := v82Status(t, d.x, paths, alC2); got != reads {
+		t.Errorf("al once she exchanged again: %s", got)
+	}
+	if got := v82Status(t, d.x, paths, alC); got != refused {
+		t.Errorf("the cookie al held before, once she exchanged again: %s, want 403", got)
 	}
 }
 

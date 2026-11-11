@@ -1091,8 +1091,8 @@ var (
 // storedFview is the view of the cookie for marker m, reads:{ns}:g:{gs},
 // that expires at exp, at cp, judged from what the exchanges recorded
 // alone (rec, gsKeysAt), never from a grant the request doesn't carry:
-// 403 where, for any key that cookie came from (gsKeysAt: the cookie
-// doesn't say which is its own, so each must hold), its whole entry or
+// 403 where, for any key that cookie came from (gsKeysAt: those of one
+// exchange with several grants, each of which must hold), its whole entry or
 // one of its roles' whole definitions in ns's document as of cp differs
 // in any member from what the exchange recorded (entryHolds; §B.11.9 gs,
 // v0.82), the scope digest of its kid's scope rules and
@@ -1107,9 +1107,10 @@ var (
 // its subjects hold "partial", recorded under an earlier draft (§B.11.5,
 // v0.78: no gs leaves a group out); otherwise item 1 from rec's
 // subjects and item 2 from its filter. Readers with the same subjects
-// and rules share m, so once a key one came from is replaced, the
-// others' cookies are 403 too, until the replaced key's last cookie
-// expires: never a cookie read under a key no longer accepted.
+// and rules share m, but a cookie only with exchanges through the same
+// keys with the same entries (recordCookies): never a cookie read under
+// a key no longer accepted, nor one vouched for again by an exchange
+// that isn't its own.
 func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *markerRec, exp int64) (*fview, error) {
 	if slices.Contains(rec.subjects, catvis.Partial) {
 		return nil, errPartial
