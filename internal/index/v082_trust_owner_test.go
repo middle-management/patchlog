@@ -52,6 +52,19 @@ func (g *v82Gate) RoundTrip(r *http.Request) (*http.Response, error) {
 // follower after cat-season's purge-ns committed and before the follower
 // met the purge itself (TestV082PurgedCatalogMetPurged failed so, one run
 // in twenty).
+//
+// The order is staged, none of it timed. Until the index has reached
+// cat-season the reconciler stops that follower on every pass, as
+// cat-season is one the index serves, and starts it again on the next,
+// which its own start makes due: no follower stays. The test holds the
+// reconciler where it logs a stop, the follower stopped in memory and
+// forgetMember not yet called. Nothing stops a follower meanwhile: li's
+// query starts one, which stays at its bootstrap; the gate opens and the
+// index applies cat-season's purge-ns. Released, the reconciler forgets
+// the follower it had stopped, which deletes nothing as one runs again,
+// and its next pass, which li's query and the purge-ns made due, finds
+// cat-season purged at the index's checkpoint: it stops the follower
+// that runs and forgets what it held, the trust the test is about.
 func TestV082StoppedMemberKeepsServedTrust(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -75,14 +88,19 @@ func TestV082StoppedMemberKeepsServedTrust(t *testing.T) {
 	// stops counts the times the reconciler stopped the follower for
 	// visibility; purgesThen are the purges of idx:cat-season as it last
 	// did, before it forgot what that follower held, which purges it
-	// once more.
+	// once more. The first stop holds the reconciler, parked closed,
+	// until release is.
 	var (
 		x          *svc
 		mu         sync.Mutex
 		stops      int
 		purgesThen int
 		member     context.Context // the follower for visibility last started
+		parkOnce   sync.Once
+		relOnce    sync.Once
 	)
+	parked, released := make(chan struct{}), make(chan struct{})
+	release := func() { relOnce.Do(func() { close(released) }) }
 	x = startSvcWith(t, w.s.Client(t, client.WithBearer(w.k.Grant(t, w.s.Now(), "svc:indexer", []string{"schemas", "cat-season", "matches"}, []string{"read"}))),
 		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "cat-season"}, untyped: true, now: w.s.Now, noRun: true, hc: &http.Client{Transport: gate}},
 		func(o *indexOpts) {
@@ -90,11 +108,17 @@ func TestV082StoppedMemberKeepsServedTrust(t *testing.T) {
 			logf := o.Logf
 			o.Logf = func(f string, a ...any) {
 				logf(f, a...)
+				// The reconciler's, between stopping the follower and
+				// forgetMember (reconcile), under no lock.
 				if strings.Contains(f, "is no longer read by the coverage") && len(a) == 1 && a[0] == "cat-season" {
 					n := members76Purges(x, "idx:cat-season")
 					mu.Lock()
 					stops, purgesThen = stops+1, n
 					mu.Unlock()
+					parkOnce.Do(func() {
+						close(parked)
+						<-released
+					})
 				}
 			}
 		})
@@ -112,24 +136,28 @@ func TestV082StoppedMemberKeepsServedTrust(t *testing.T) {
 	rctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() { x.ix.Run(rctx); close(done) }()
-	t.Cleanup(func() { open(); cancel(); <-done })
+	t.Cleanup(func() { release(); open(); cancel(); <-done })
 
 	x.caughtUp("matches")
+	// matches reached, the reconciler reads its coverage, which starts
+	// cat-season's follower for visibility, and stops it, cat-season
+	// being one the index serves: it is held there.
+	select {
+	case <-parked:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the reconciler never stopped a follower for visibility of cat-season")
+	}
 	// cat-season not reached and its follower for visibility without a
 	// checkpoint: li is behind, never answered. Her query starts that
-	// follower; the reconciler stops it whenever it runs, as cat-season is
-	// one the index serves, so it is started until one stays, the
-	// reconciler having nothing left to run for until the gate opens.
+	// follower again, which nothing stops while the reconciler is held.
+	if r := x.raw("/matches", li); r.status != 503 {
+		t.Fatalf("li before the index reached cat-season: %d %v, want 503", r.status, r.body)
+	}
 	var running context.Context
-	var stopsThen int
-	waitFor(t, "a follower for visibility of cat-season that stays", func() bool {
-		if r := x.raw("/matches", li); r.status != 503 {
-			t.Fatalf("li before the index reached cat-season: %d %v, want 503", r.status, r.body)
-		}
-		time.Sleep(100 * time.Millisecond)
+	waitFor(t, "the follower for visibility of cat-season that li's query started", func() bool {
 		mu.Lock()
-		running, stopsThen = member, stops
-		mu.Unlock()
+		defer mu.Unlock()
+		running = member
 		return running != nil && running.Err() == nil
 	})
 
@@ -142,8 +170,22 @@ func TestV082StoppedMemberKeepsServedTrust(t *testing.T) {
 		}
 		return false
 	})
-	// Applying it runs the reconciler, which stops the follower and
-	// forgets what it held.
+	// The follower for visibility is still at its bootstrap: what the
+	// reconciler meets, with the trust the index's own follower recorded.
+	if running.Err() != nil {
+		t.Fatal("cat-season's follower for visibility was stopped while the reconciler was held")
+	}
+	mu.Lock()
+	stopsThen := stops
+	mu.Unlock()
+	if stopsThen != 1 {
+		t.Fatalf("the reconciler stopped cat-season's follower for visibility %d times while it was held", stopsThen)
+	}
+	// Released, the reconciler forgets the follower it had stopped,
+	// nothing of the one that runs, and runs again, as li's query and
+	// the purge-ns made it due: it stops the follower and forgets what it
+	// held.
+	release()
 	select {
 	case <-running.Done():
 	case <-time.After(30 * time.Second):
