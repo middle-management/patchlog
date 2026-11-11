@@ -25,8 +25,9 @@ var (
 // namespace requireAt gives." A requireAt naming nope, which doesn't
 // exist, an at that isn't in an existing catalog's chain and one that
 // wasn't its head within maxLag are each 403 at the namespace's URLs, at
-// a write and at the exchange, and 404 at a resource URL, with one body
-// for the three that names neither nope nor the catalog. Before v0.82
+// a write and at the exchange, and 404 at a resource URL, as is an at
+// that names another namespace than requireAt gives, with one body for
+// them all that names neither nope nor the catalog. Before v0.82
 // the three bodies differed: "unknown namespace \"nope\"", "at is not in
 // the chain of cat-season", "at was not the head of cat-season within
 // maxLag".
@@ -51,6 +52,13 @@ func TestV082AccessRequireAtNamesNothing(t *testing.T) {
 			"at": map[string]any{"ns": "cat-season", "id": stray}, "exp": exp}),
 		"an at beyond maxLag": w.catGrant("user:li", []any{"editors"}, map[string]any{"can": []any{"read", "append"},
 			"at": map[string]any{"ns": "cat-season", "id": old}, "exp": exp, "nbf": w.clock.Now().Format(time.RFC3339)}),
+		// An at that names another namespace than requireAt gives, each
+		// with an ns_id really in the chain it names: a wrong name, and a
+		// guess at a target that doesn't exist.
+		"an at in another namespace": w.catGrant("user:li", []any{"editors"}, map[string]any{"can": []any{"read", "append"},
+			"at": map[string]any{"ns": "matches", "id": w.nsHead("matches", w.admin)}, "exp": exp}),
+		"a guessed name against a namespace that doesn't exist": w.grant(nope, "user:li", []string{"matches"}, []string{"read", "append"},
+			map[string]any{"at": map[string]any{"ns": "cat-season", "id": w.nsHead("cat-season", w.admin)}, "exp": exp}),
 	}
 	// The grant is otherwise good: at the catalog's head it reads.
 	expect(t, w.get("/r/matches/derby", w.catGrant("user:li", []any{"editors"})), 302)
@@ -76,7 +84,7 @@ func TestV082AccessRequireAtNamesNothing(t *testing.T) {
 				t.Errorf("%s, %s: %d %s, want %d", rn, gn, r.Code, r.Body, rq.code)
 			}
 			body := r.String()
-			for _, name := range []string{"nope", "cat-season", "maxLag", "chain"} {
+			for _, name := range []string{"nope", "cat-season", "maxLag", "chain", "another"} {
 				if strings.Contains(body, name) {
 					t.Errorf("%s, %s: the body says %q: %s", rn, gn, name, body)
 				}
@@ -84,7 +92,7 @@ func TestV082AccessRequireAtNamesNothing(t *testing.T) {
 			bodies[body] = gn
 		}
 		if len(bodies) != 1 {
-			t.Errorf("%s: the three refusals differ: %v", rn, bodies)
+			t.Errorf("%s: the refusals differ: %v", rn, bodies)
 		}
 	}
 }

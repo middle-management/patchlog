@@ -381,6 +381,9 @@ func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxL
 		}
 		id, err := ids.Parse(idText)
 		if err != nil {
+			// Not reached through grant.Verify: a grant decodes only
+			// with at an ns_id or {"ns","id"} with one, and one without
+			// at is refused before (key "requires at").
 			return errAtRejected
 		}
 		seq, ok := t.nsLogSeq(target.id, id)
