@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -160,6 +161,12 @@ func TestV082LostTrustRepaired(t *testing.T) {
 		if q := x.raw("/matches", li); q.status != 403 {
 			t.Errorf("%s: before the trust is read: %d %v, want 403", c.name, q.status, q.body)
 		}
+		// What she is answered meanwhile, at /_refs and at an exchange,
+		// doesn't outlive the read (below).
+		refs := "/_refs?to=" + url.QueryEscape("/r/target/x")
+		before := x.follow(refs, li)
+		ex := p37Do(t, x, "POST", "/edge-grants", li, "", nil, "")
+		t.Logf("%s: before the trust is read: /_refs %d %v, exchange %d %v", c.name, before.status, before.body, ex.status, ex.body)
 		close(release)
 		// (Not by counting its rows: rows writes, outside the index's
 		// write lock, and a write it made busy is one more read.)
@@ -168,8 +175,17 @@ func TestV082LostTrustRepaired(t *testing.T) {
 		if q.status != 302 || !strings.HasPrefix(q.header.Get("Location"), "/matches/g/") {
 			t.Fatalf("%s: the lost trust of a purged served catalog is not read again: li %d %v to %q, want 302 under a g: marker", c.name, q.status, q.body, q.header.Get("Location"))
 		}
-		if a := x.follow("/matches", li); a.status != 200 || len(a.body["hits"].([]any)) != 0 {
-			t.Errorf("%s: li reads %d %v, want matches dark", c.name, a.status, a.body)
+		for _, path := range []string{"/matches", refs} {
+			if a := x.follow(path, li); a.status != 200 || len(resources(a.body)) != 0 {
+				t.Errorf("%s: li at %s: %d %v, want matches dark", c.name, path, a.status, a.body)
+			}
+		}
+		prefix, cookies := v081Exchange(t, x, li, "matches")
+		if !strings.HasPrefix(q.header.Get("Location"), prefix+"/at/") {
+			t.Errorf("%s: her exchange gives %s, her query redirects to %s", c.name, prefix, q.header.Get("Location"))
+		}
+		if got, _ := p37Follow(t, x, prefix, cookies, ""); got.status != 200 || len(p37Hits(got.body)) != 0 {
+			t.Errorf("%s: under her cookie: %d %v, want no hits", c.name, got.status, got.body)
 		}
 		if n, rows := r.reads.Load(), r.rows(x, "cat-season"); n != 1 || rows != 1 {
 			t.Errorf("%s: %d reads of cat-season's document, %d rows of its trust, want 1 and 1", c.name, n, rows)
@@ -238,7 +254,8 @@ func TestV082LostTrustRetried(t *testing.T) {
 }
 
 // TestV082LostTrustGoneStays: where the purged catalog's document is 410
-// too (a sealed namespace's, §8.5), the lost trust can't be read again:
+// too (a sealed namespace's, §8.5), or refused, the lost trust can't be
+// read again:
 // the index reads once, records nothing and doesn't try again while it
 // runs; it starts, follows matches and answers li 403 with no marker, as
 // one that never read the catalog's trust ("one a service never read
@@ -253,6 +270,17 @@ func TestV082LostTrustGoneStays(t *testing.T) {
 		r.lose()
 		f := &trustFailing{base: http.DefaultTransport, prefix: "/ns/cat-season/rev/", body: `{"code":"purged","message":"the namespace is purged"}`}
 		f.status.Store(http.StatusGone)
+		r.core = r.core.With(client.WithHTTPClient(&http.Client{Transport: f}))
+		lostTrustStays(t, r, li, "cat-season")
+	})
+	// Nor is one the origin refuses the index (404, as §7 answers a
+	// namespace the reader can't read) read again while it runs.
+	t.Run("refused", func(t *testing.T) {
+		t.Parallel()
+		r, li := newTrustRepair(t)
+		r.lose()
+		f := &trustFailing{base: http.DefaultTransport, prefix: "/ns/cat-season/rev/", body: `{"code":"not_found","message":"no such namespace"}`}
+		f.status.Store(http.StatusNotFound)
 		r.core = r.core.With(client.WithHTTPClient(&http.Client{Transport: f}))
 		lostTrustStays(t, r, li, "cat-season")
 	})
@@ -311,8 +339,8 @@ func TestV082LostTrustGoneStays(t *testing.T) {
 	})
 }
 
-// lostTrustStays starts r's index, whose read of cat's document is 410:
-// read once, nothing recorded, li 403 with no marker, matches followed.
+// lostTrustStays starts r's index, whose read of cat's document is 410
+// or refused: read once, nothing recorded, li 403 with no marker, matches followed.
 func lostTrustStays(t *testing.T, r *trustRepair, li, cat string) {
 	t.Helper()
 	for _, snapshot := range []bool{false, true} {
@@ -321,10 +349,10 @@ func lostTrustStays(t *testing.T, r *trustRepair, li, cat string) {
 		waitFor(t, "the read of "+cat+"'s document", func() bool { return r.reads.Load() == 1 })
 		time.Sleep(100 * time.Millisecond) // more than a few of the pauses of a read tried again
 		if n := r.reads.Load(); n != 1 {
-			t.Errorf("snapshot %v: %d reads of a document that is 410, want 1", snapshot, n)
+			t.Errorf("snapshot %v: %d reads of a document that can't be read, want 1", snapshot, n)
 		}
 		if n := r.rows(x, cat); n != 0 {
-			t.Errorf("snapshot %v: %d rows recorded from a 410", snapshot, n)
+			t.Errorf("snapshot %v: %d rows recorded from no document", snapshot, n)
 		}
 		q := x.raw("/matches", li)
 		if q.status != 403 || q.header.Get("Location") != "" {

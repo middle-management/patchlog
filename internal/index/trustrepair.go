@@ -33,7 +33,7 @@ const trustRepairMaxPause = 5 * time.Minute
 // Each namespace is repaired on its own, off the path that opens the
 // index and starts its followers: one whose document can't be read yet
 // holds up no other, and no follower. It returns once every one is
-// settled, or ctx is done.
+// settled, read or not to be read (repairTrustOf), or ctx is done.
 func (ix *Index) repairTrust(ctx context.Context) {
 	lost, err := ix.trustLost(ctx)
 	if err != nil {
@@ -89,11 +89,13 @@ func (ix *Index) trustLost(ctx context.Context) (map[string]string, error) {
 // the origin still serves it unless ns is sealed (§8.5), as Apply reads it
 // for a purge-ns met in place of a snapshot's listing (the same read,
 // under the index's own grant), and records its catalog.trust
-// (recordTrustLost). A document that is 410 (a sealed namespace's) is
-// never read again: ns stays without one, no catalog, the reading that
-// shows least, and is tried once more at the next start. Any other error
-// (the origin down, a refusal that may pass) is retried after a pause that
-// doubles up to trustRepairMaxPause, until ctx is done.
+// (recordTrustLost). A document that is 410 (a sealed namespace's), or
+// that the origin refuses or the index can't read (any answer asking
+// again doesn't mend, client.Transient), is not read again while the
+// index runs: ns stays without one, no catalog, the reading that shows
+// least, and is tried once more at the next start. A failure for now (the
+// origin unreachable, a 5xx, 408 or 429), or of the write, is retried
+// after a pause that doubles up to trustRepairMaxPause, until ctx is done.
 func (ix *Index) repairTrustOf(ctx context.Context, ns, at string) {
 	pause := time.Second
 	if ix.testTrustRepairPause > 0 {
@@ -121,6 +123,9 @@ func (ix *Index) repairTrustOf(ctx context.Context, ns, at string) {
 				return
 			}
 			ix.opt.Logf("index: recording the catalog.trust of %s, purged: %v; again in %s", ns, err, pause)
+		case !client.Transient(err):
+			ix.opt.Logf("index: %s is purged and its document at %s can't be read (%v): its catalog.trust, which the index doesn't hold, isn't read again until the index starts again; it counts as no catalog", ns, at, err)
+			return
 		default:
 			ix.opt.Logf("index: the catalog.trust of %s, purged, at %s: %v; again in %s", ns, at, err, pause)
 		}
