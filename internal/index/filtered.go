@@ -71,8 +71,8 @@ import (
 // of whose catalogs or members it can't read is 502 to partial readers.
 // Unrestricted readers, and every reader of a namespace that isn't
 // covered, are answered as before, but a partial reader of one that isn't
-// covered and is a catalog, or whose catalogs, or a local base's, names
-// one, which has no marker (§A.4, catalogShaped).
+// covered and is a catalog, or whose catalogs, or those of a local base in
+// its chain, names one, which has no marker (§A.4, catalogShaped).
 
 // Kinds of covered namespace (fcp.kind).
 const (
@@ -1308,15 +1308,15 @@ func (e *rootErr) transient() bool {
 var errNoMarker = &grant.AuthError{Status: 403, Msg: "the namespace is not read filtered now, and a reader of it in part reads none of it (§A.4, §B.11.9)"}
 
 // catalogShaped reports whether a partial reader of ns, which §B.11.9
-// doesn't cover, has no marker there (§A.4: "where it doesn't but {ns}
-// is neither sealed nor end-to-end and is a catalog (§B.6) or its
-// catalogs, or a local base's, names one, a partial reader has none"):
-// ns's document at its head, or at the index's checkpoint of it, is a
-// catalog, or names a catalog in catalogs, or a local base up its chain
-// does, read as of the at its branch reads it at and at its head (open
-// question: which of the two is meant; either counts here), unless ns is
-// sealed or e2e by each of those documents. A base purged or gone counts
-// as naming one: what it named can't be read.
+// doesn't cover, has no marker there (§A.4, v0.82: none "where it doesn't
+// but {ns} is neither sealed nor end-to-end and is a catalog (§B.6) or
+// its catalogs, or that of any local base in its chain at the base's head
+// or as of the at it is read through at, names one"): ns's document at
+// its head, or at the index's checkpoint of it, is a catalog, or names a
+// catalog in catalogs, or a local base up its chain does, read as of the
+// at its branch reads it at and at its head, either counting, unless ns
+// is sealed or e2e by each of those documents. A base purged or gone
+// counts as naming one: what it named can't be read.
 func (ix *Index) catalogShaped(ctx context.Context, ns string) (bool, error) {
 	cfg, err := ix.checker.Config(ctx, ns)
 	if err != nil {
