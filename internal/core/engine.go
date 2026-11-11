@@ -486,6 +486,20 @@ func Open(opt Options) (*Engine, error) {
 		db.Close()
 		return nil, fmt.Errorf("purging namespaces raised to e2e (-purge-raised-e2e): %w", err)
 	}
+	// After the gate, the migrations and the gate's purges: E3 snapshots
+	// an earlier version left behind a moved horizon are never served
+	// (§7.1). (Not on a schema of an earlier version that tests open.)
+	if opt.migrations == nil {
+		n, err := e.cleanStaleSnapshots(context.Background())
+		if err != nil {
+			e.comp.close()
+			db.Close()
+			return nil, fmt.Errorf("deleting end-to-end snapshots behind a moved horizon (§7.1): %w", err)
+		}
+		if n > 0 {
+			log.Printf("deleted %d end-to-end prune snapshot(s) stored behind a horizon a later prune moved (§7.1): their revisions answer 410 pruned or 404 not_offered; purge cached answers of the namespaces concerned", n)
+		}
+	}
 	// (Not on a schema of an earlier version that tests open.)
 	if err := e.seedSealCountsAt016(context.Background()); err != nil {
 		e.comp.close()
