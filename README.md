@@ -2395,7 +2395,9 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   folded as `[]` from its parent (a genesis as `[]` on `null`); `ValidID` is the last revision
   folded without a flag (§E.3.1, v0.73). Padding is judged by the namespace document in force at
   each entry, a batch's by the configuration it produces. `PruneE2E` folds and seals the
-  snapshot, at a tombstone horizon bound to the tombstone's parent. `InitKeyring`,
+  snapshot, at a tombstone horizon bound to the tombstone's parent, which it takes from the
+  `last` of the tombstone's own `410` (v0.82), else from the head's `last`, the log or a
+  `not_offered`, each checked against the tombstone's id. `InitKeyring`,
   `AddReader` and `RotateEpoch` administer the keyring, writing the keyring document under the
   view's own recipient key as its sender (always including the admin's own key);
   `RotateEpoch` writes the keyring and the epoch bump in one batch. Since v0.81 the client
@@ -2482,7 +2484,13 @@ where a prune cut the chain. Sibling `order` keys compare by UTF-8 bytes (§B.2)
 placement wins over `$parents` whether live, deleted or purged (§B.9). A visible node with no
 visible parent, its parents hidden, gone, dangling or cyclic, is a root for that subject set:
 `roots` lists it, and the `paths` of `ancestors` and `where` end at it (§B.11.5, v0.74); unfiltered
-`g/all` and public listings keep §B.5's roots and orphans. Purged namespaces leave the combined
+`g/all` and public listings keep §B.5's roots and orphans. Since v0.82 each of those `paths` is
+an array of node names, from the root down to the node itself (they were entries, and
+`tooDeep` a count), beside a `nodes` map of the reference's own, keyed by node name, with each
+named node's `href` and `title` (its `sealed` values in a sealed or end-to-end catalog) and no
+`born`; `"tooDeep": true` and `"truncated": true` are there only where a path was cut at depth
+64 or the paths at 1000, and `incomplete` counts an unfiltered listing's paths that end below
+a root (§B.5 Shared nodes in DAGs). Purged namespaces leave the combined
 checkpoint `at`, listings' `ns:{ns}` tags and the coverage of problems and orphans (§B.5,
 v0.74); `where?item=` naming an item that isn't in the catalog, or
 whose placement is hidden, is `404`. `…/lookup?path={titles}` resolves a `/`-joined path of
@@ -2839,7 +2847,8 @@ WebDAV gateways and mounts, share them. A catalog whose namespace document says
 `"catalog": { "trust": ["files"], "mode": "tree", "files": { "ns": "files", "root": "root" } }`
 is a file tree: folders are folder nodes and files placements, named by their `title`s. The
 tree service then gives every placement entry with a head, in `children`, `subtree`, `roots`,
-`ancestors` and `where`, the file metadata of that head:
+`ancestors` and `where` (there the `node` or `placement` entry; the names in their `paths`
+carry none, v0.82), the file metadata of that head:
 
 ```json
 { "name": "files.k3x9…", "kind": "item", "title": "notes.json", "head": "1…", "url": "…",
@@ -3233,8 +3242,9 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   the core's `429` or `503`, and after a timeout of the gateway's own, else `502` (the core's
   `408`, another `5xx`, an unreachable core; TOOLS §H.4 "The base"). So a save is never written
   over another user's entry taken for the user's own while that history can't be read, as
-  v0.27.0 could. Requests other than a PUT keep the general answers (a core `408` is `503`, its
-  `503` is `502`).
+  v0.27.0 could. A MOVE or COPY onto an existing file saves into it, and answers so for its
+  reads of the head, the base and the log between; its other reads, and other requests, keep
+  the general answers (a core `408` is `503`, its `503` is `502`).
   A raw file over a JSON document's, or the
   other way round, replaces its root. A purged one is `410`, as is any name of a purged
   namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
@@ -3797,6 +3807,8 @@ patchlog import -i all.jsonl -atomic -ns demo-schemas=demo2-schemas,demo=demo2  
   missing ones first, listing the importer's key and allowance; a `401` or `403` on the first
   read of a target namespace says so.
 - **Branches** export with the base's history included, or with `-foreign-parents` naming the base revisions in `requires`.
+  An e2e branch's documents always export the second way, its keyring aside (v0.82, §G.5.1; see
+  E3 under Encryption below).
 - **Blobs** (§G.4.1) travel as blob lines (unpadded base64url; padded is accepted), each
   before the first line that mentions it: a `$blob` member in any op's value (tests too), the
   value of an op at `…/$blob`, a snapshot's document or a declared list. Incremental bundles
@@ -3858,7 +3870,8 @@ patchlog import -ns secret -i s.plb -identity me.jwk -atomic
   name the base (v0.82, §G.5.1 Importing): a document continued in the branch starts after its
   foreign parent, the base's head at `base.at`, named in `requires` (a `requires` before it, or
   a foreign parent that isn't in the chain, refuses the document); one the branch never wrote
-  is `external`, pinned to its revision; the keyring comes whole; and a branch of a remote base
+  is `external`, pinned to its revision; the keyring comes whole, unless the export asks for
+  `-foreign-parents`; and a branch of a remote base
   exports only documents that start with a line of its own. The importer looks a pinned
   `external` up in the target's chain where an e2e target serves no document by revision, and
   for a tombstone at any level. Lines
