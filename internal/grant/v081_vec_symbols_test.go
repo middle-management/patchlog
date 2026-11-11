@@ -16,7 +16,7 @@ func v081Fact(name, str uint64) []byte {
 // BYTES (§C.8, v0.81 "a Biscuit symbol is unused per block"): a symbol a
 // block adds to the table must be used by that block's own fact, judged
 // per block: one an earlier block adds and only a later block uses is
-// refused at the block that adds it, as VECTORS-PROPOSED P.7's token with
+// refused at the block that adds it, as §I.21's (v0.81's P.7) token with
 // the narrowing block's string added by the authority block. A symbol an
 // earlier block adds and uses itself may be used again by a later one
 // (grant_block, in every token).
@@ -45,7 +45,7 @@ func TestV081SymbolUnusedPerBlock(t *testing.T) {
 		t.Fatalf("a symbol the authority block adds for a later block: %q %v, want block 0 refused (unused symbol)", got, err)
 	}
 
-	// The same through a bearer (VECTORS-PROPOSED P.7): 401.
+	// The same through a bearer (§I.21, v0.81's P.7): 401.
 	const tok = "ErwCCs8BCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91" +
 		"cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNiIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9" +
 		"CiN7ImNhbiI6WyJyZWFkIl0sInZpYSI6InN2YzpyZWFkZXIifRgDIgoKCAiACBIDGIEIEiQIABIgJUO5L_EJVRFHatyDadtt3JM2ZaEZeN2h" +
