@@ -2839,10 +2839,16 @@ async function treeGet(path) {
 }
 
 /* openSealedEntries decrypts per-entry sealed values ("sealed": JWE, pl {ns, name, view}) in place. from is the
- * entry a value of another resource hangs on and the member it is, { key, ns, name, item }, where v is such a value. */
-async function openSealedEntries(v, view, from) {
+ * entry a value of another resource hangs on and the member it is, { key, ns, name, item, branch }, where v is such
+ * a value. filed is the node name v is filed under, where v is an entry of the "nodes" map of an ancestors or where
+ * answer, { href, sealed } with no name of its own (SERVICES.md §B.5). */
+async function openSealedEntries(v, view, from, filed) {
   if (Array.isArray(v)) { for (const x of v) await openSealedEntries(x, view); return; }
   if (!v || typeof v !== 'object') return;
+  const isFiled = typeof filed === 'string' && filed !== '';
+  // An entry names its resource "name" (the tree service) or "resource" (the index's hits); one of a "nodes" map
+  // is named by its key, which a name of its own must agree with.
+  const named = typeof v.name === 'string' ? v.name : typeof v.resource === 'string' ? v.resource : '';
   let own = '';
   if (typeof v.sealed === 'string') {
     try {
@@ -2850,19 +2856,23 @@ async function openSealedEntries(v, view, from) {
       const ens = Z.parseKid(hdr.kid).ns;
       // The view key of the entry's resource's K_r (SERVICES.md §E.2.6). The tree service names its entries "name",
       // the index its hits "resource"; a value of another resource, { "sealed" } alone, names that one in its pl.
-      const other = Object.keys(v).length === 1;
-      const rname = other ? (hdr.pl || {}).name : v.name !== undefined ? v.name : v.resource;
+      const other = !isFiled && Object.keys(v).length === 1;
+      const rname = other ? (hdr.pl || {}).name : isFiled ? filed : v.name !== undefined ? v.name : v.resource;
       if (typeof rname !== 'string' || !rname) throw new Error('a sealed value that names no resource');
+      if (isFiled && named && named !== filed) throw new Error(`an entry named ${named}, filed under ${filed} in nodes`);
       // A reader compares that pl's ns and name with the resource the entry draws the value from, where the entry
       // names it (§E.2.6 Values of another resource): its own resource, for a value of another epoch such as
       // born, or a placement's item, "/r/{ns}/{name}", for one drawn from it such as file.
       if (other && from) {
         const item = /^\/r\/([^/]+)\/(.+)$/.exec(typeof from.item === 'string' ? from.item : '');
         const fromOwn = !!from.name && rname === from.name && (!from.ns || ens === from.ns);
-        const fromItem = !!item && ens === item[1] && rname === item[2];
+        // In a release preview the item is read in the release's branch of its namespace, which the entry names
+        // in "branch" (§B.5 Previews): the value is that branch's resource, and never the base's.
+        const itemNS = item ? from.branch || item[1] : '';
+        const fromItem = !!item && ens === itemNS && rname === item[2];
         // born is the entry's own; any other value is its own or its item's, where the entry names an item.
         if (from.key === 'born' && from.name ? !fromOwn : item && !fromOwn && !fromItem) {
-          throw new Error(`a sealed value of ${ens}/${rname}, which isn't the resource its entry draws it from (${[from.name ? (from.ns ? from.ns + '/' : '') + from.name : '', item && from.key !== 'born' ? item[1] + '/' + item[2] : ''].filter(Boolean).join(' or ')}) (\u00a7E.2.6)`);
+          throw new Error(`a sealed value of ${ens}/${rname}, which isn't the resource its entry draws it from (${[from.name ? (from.ns ? from.ns + '/' : '') + from.name : '', item && from.key !== 'born' ? itemNS + '/' + item[2] : ''].filter(Boolean).join(' or ')}) (\u00a7E.2.6)`);
         }
       }
       const d = await openSealed(ens, v.sealed, rname, { ns: ens, name: rname, view });
@@ -2873,11 +2883,17 @@ async function openSealedEntries(v, view, from) {
   }
   // What a value of another resource is compared with: the entry's own name (and namespace, where its own sealed
   // part named it) and its item.
-  const name = typeof v.name === 'string' ? v.name : typeof v.resource === 'string' ? v.resource : '';
+  const name = isFiled ? filed : named;
+  const branch = typeof v.branch === 'string' ? v.branch : '';
   for (const k of Object.keys(v)) {
     if (k === 'sealed' || !v[k] || typeof v[k] !== 'object') continue;
+    if (k === 'nodes' && !isFiled && Array.isArray(v.paths) && !Array.isArray(v[k])) {
+      // The nodes of an ancestors or where answer's paths, each filed under its node's name (§B.5).
+      for (const nk of Object.keys(v[k])) await openSealedEntries(v[k][nk], view, undefined, nk);
+      continue;
+    }
     const nested = !Array.isArray(v[k]) && typeof v[k].sealed === 'string' && Object.keys(v[k]).length === 1;
-    await openSealedEntries(v[k], view, nested && (name || typeof v.item === 'string') ? { key: k, ns: own, name, item: v.item } : undefined);
+    await openSealedEntries(v[k], view, nested && (name || typeof v.item === 'string') ? { key: k, ns: own, name, item: v.item, branch } : undefined);
   }
 }
 
