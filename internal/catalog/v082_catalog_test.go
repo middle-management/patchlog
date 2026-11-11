@@ -365,3 +365,44 @@ func TestV082ListingCredentialsAndPurgedRoles(t *testing.T) {
 		return r.status == 404 || r.status == 302 && w.do("GET", r.header.Get("Location"), fan, nil).status == 404
 	})
 }
+
+// SVC-14t, scenario 131 (SPEC §2.1 Refers to; SERVICES §B.11.5): a role
+// whose rule tests /principal as a whole refers to /principal/attrs too,
+// so it counts for no folder's visibility; one whose rule tests
+// /principal/groups refers to neither /now nor the rest of /principal,
+// and still counts, for folders and for reads.
+func TestV082RuleOnWholePrincipalCountsForNoFolder(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	w.patchMatches(
+		map[string]any{"op": "add", "path": "/roles/wholep", "value": map[string]any{"can": toAny("read"),
+			"rules": []any{map[string]any{"op": "test", "path": "/principal", "schema": map[string]any{"type": "object"}}}}},
+		map[string]any{"op": "add", "path": "/roles/bygroup", "value": map[string]any{"can": toAny("read"),
+			"rules": []any{map[string]any{"op": "test", "path": "/principal/groups", "schema": map[string]any{"contains": map[string]any{"const": "groupies"}}}}}},
+		map[string]any{"op": "add", "path": "/keys/2/roles/allow/-", "value": "wholep"},
+		map[string]any{"op": "add", "path": "/keys/2/roles/allow/-", "value": "bygroup"})
+	w.patch("cat", "season",
+		map[string]any{"op": "add", "path": "/$access/group:princes", "value": toAny("wholep")},
+		map[string]any{"op": "add", "path": "/$access/group:groupies", "value": toAny("bygroup")})
+	w.caughtUp()
+	listing := func(tok string) int {
+		r := w.do("GET", "/cat/children?of=season", tok, nil)
+		if r.status != 302 {
+			return r.status
+		}
+		return w.do("GET", r.header.Get("Location"), tok, nil).status
+	}
+	if st := listing(w.caller("user:pat", "princes")); st != 404 {
+		t.Errorf("season through a role whose rule tests /principal as a whole: %d, want 404", st)
+	}
+	groupie := w.caller("user:gil", "groupies")
+	if st := listing(groupie); st != 200 {
+		t.Errorf("season through a role whose rule tests /principal/groups: %d, want 200", st)
+	}
+	if e := entry(w.do("POST", "/read-grants", groupie, map[string]any{"items": toAny("/r/matches/derby")}), 0); e["grant"] == nil {
+		t.Errorf("read-grants through a role whose rule tests /principal/groups: %v", e)
+	}
+}

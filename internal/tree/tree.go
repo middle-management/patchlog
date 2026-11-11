@@ -415,6 +415,9 @@ func (s *Service) init(ctx context.Context) error {
 	switch err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'epochs'`).Scan(&epochs); {
 	case err == nil:
 		s.epochsPending = true
+		// A listing stored before a restart may have left values out
+		// for it: the fill drops the catalog's listings when it ends.
+		s.nameOnly.Store(true)
 	case !errors.Is(err, sql.ErrNoRows):
 		return err
 	}

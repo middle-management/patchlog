@@ -74,7 +74,7 @@ func TestV081NowGrants(t *testing.T) {
 	w.start()
 	w.caughtUp()
 	desk := w.caller("user:anna", "match-desk")
-	clock := w.idp.Grant(t, w.s.Now(), "user:anna", []string{"cat"}, idCan,
+	clock := w.idp.Grant(t, w.s.Now(), "user:anna", []string{"cat"}, []string{},
 		map[string]any{"groups": toAny("match-desk"), "rules": []any{nowRule}})
 	reqs := []map[string]any{
 		{"item": "/r/matches/derby", "want": toAny("read")},
@@ -150,7 +150,7 @@ func TestV081NowMergeGrantsWrite(t *testing.T) {
 	w.seed()
 	w.start()
 	w.caughtUp()
-	clock := w.idp.Grant(t, w.s.Now(), "user:anna", []string{"cat"}, idCan,
+	clock := w.idp.Grant(t, w.s.Now(), "user:anna", []string{"cat"}, []string{},
 		map[string]any{"groups": toAny("match-desk"), "rules": []any{nowRule}})
 	del := map[string]any{"resource": "matches.derby", "ifMatch": w.catHead("matches.derby"), "steps": []any{"delete"}}
 	if r := w.mergeAsk(clock, "", del); r.status != 200 || r.body["grant"] == nil {

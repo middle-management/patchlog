@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,7 +54,7 @@ func newV82Sealed(t *testing.T) *v82Sealed {
 	}
 	all := []string{"cat", "files"}
 	q := &v82Sealed{t: t, s: s, k: k, db: filepath.Join(t.TempDir(), "tree.db"), keys: map[string][]byte{}}
-	q.w = s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", append(all, "cat-r7"), []string{"read", "create", "config", "branch"})), client.WithKeys(client.NewKeys(nil)))
+	q.w = s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", append(all, "cat-r7"), []string{"read", "create", "config", "branch", "purge"})), client.WithKeys(client.NewKeys(nil)))
 	createNonced(t, q.w, "cat", "root", map[string]any{"parents": []any{}})
 	createNonced(t, q.w, "cat", "old", map[string]any{"title": v82Title, "parents": parents("root")})
 	createNonced(t, q.w, "files", "notes", map[string]any{"n": 1})
@@ -90,6 +91,16 @@ func (q *v82Sealed) exec(stmts ...string) {
 			q.t.Fatalf("%s: %v", s, err)
 		}
 	}
+}
+
+// v82Release returns a function that closes release once, and has the
+// test close it as it ends, before the service started just before is
+// stopped: a fill held by release (v077Blocking) would hold that stop.
+func v82Release(t *testing.T, release chan struct{}) func() {
+	var once sync.Once
+	f := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(f)
+	return f
 }
 
 // v82Canonical fails unless pt, a sealed plaintext less its padding, is
@@ -163,6 +174,115 @@ func TestV082SealedListingCanonical(t *testing.T) {
 			t.Errorf("the entry of %s: U+2028 escaped: %s", name, ept)
 		}
 	}
+
+	// SVC-11t: an ancestors answer's nodes carry each node's title as
+	// its entry does, here "sealed", per entry, under the node's own
+	// epoch; paths, names and hrefs stay in the clear.
+	createNonced(t, q.w, "cat", "sub", map[string]any{"title": "Sub", "parents": parents("old")})
+	x.caughtUp("cat")
+	f = x.fetch("/cat/ancestors?of=sub", q.full)
+	if f.header.Get("Content-Type") != "application/json" {
+		t.Fatalf("ancestors mixing epochs: %s", f.header.Get("Content-Type"))
+	}
+	a := decode(t, f.body)
+	if got := pathsOf(a["paths"]); got != "root/old/sub" {
+		t.Errorf("ancestors of sub: paths %s", got)
+	}
+	nodes, _ := a["nodes"].(map[string]any)
+	for name, want := range map[string][2]string{"old": {"cat#1", v82Title}, "sub": {"cat#2", "Sub"}} {
+		n, _ := nodes[name].(map[string]any)
+		jwe, _ := n["sealed"].(string)
+		if n["href"] != "/r/cat/"+name || n["title"] != nil || jwe == "" || must(seal.ParseHeader(jwe)).Kid != want[0] {
+			t.Errorf("ancestors of sub: nodes.%s %v, want its href and its title sealed under %s", name, n, want[0])
+			continue
+		}
+		if vals := decode(t, must(derived.OpenItem(jwe, derived.ItemKey(q.keyOf, "cat", name), derived.View{NS: "cat", Target: f.path}, "cat", name))); vals["title"] != want[1] {
+			t.Errorf("ancestors of sub: nodes.%s opens to %v", name, vals)
+		}
+	}
+	if n, _ := nodes["root"].(map[string]any); len(n) != 1 || n["href"] != "/r/cat/root" {
+		t.Errorf("ancestors of sub: nodes.root %v, want its href alone", nodes["root"])
+	}
+}
+
+// SVC-13, scenario 122 (SERVICES §B.5, §A.1): a listing stored at an at
+// that shows a resource isn't served once that resource's purge is
+// applied: a request at that at is redirected to the current one, also
+// after a restart, which has only the stored listings to go by.
+func TestV082StoredListingNotServedAfterPurge(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	q := newV82Sealed(t)
+	x := startSvc(t, q.svc(), svcOpts{now: q.s.Now, db: q.db})
+	x.caughtUp("cat", "files")
+	shown := x.fetch("/cat/children?of=root", q.full)
+	roots := x.fetch("/cat/roots", q.full)
+	if len(x.s.SealedViews()) < 2 {
+		t.Fatalf("setup: stored views %v", x.s.SealedViews())
+	}
+	must(q.w.Purge(ctx, "files", "notes", must(q.w.Head(ctx, "files", "notes")).ID, false))
+	x.caughtUp("files")
+	check := func(when string) {
+		t.Helper()
+		r := x.raw(shown.path, q.full)
+		if r.status != http.StatusFound || !strings.Contains(r.header.Get("Location"), "/at/"+x.s.At()+"/") {
+			t.Errorf("%s: the listing that showed files.notes, at its at: %d %s, want 302 to the current at", when, r.status, r.header.Get("Location"))
+		}
+		for v, tags := range x.s.SealedViews() {
+			if v == shown.path || strings.Contains(tags, "r:files/notes") {
+				t.Errorf("%s: stored view %s (%s) survived the purge", when, v, tags)
+			}
+		}
+	}
+	check("after the purge")
+	x.stop()
+	x = startSvc(t, q.svc(), svcOpts{now: q.s.Now, db: q.db})
+	x.caughtUp("cat", "files")
+	check("after a restart")
+	_ = roots
+}
+
+// SVC-07 (SERVICES §E.2.6 Per-entry sealing, §B.5 Previews): a preview
+// service that holds the base's keys but not the branch's seals nothing
+// under the base's. Here it is a recipient of e2e catalog cat's keyring
+// and not of its branch catb's: it can't follow catb, and answers its
+// preview as a catalog it doesn't serve, never a listing under cat#1.
+func TestV082PreviewWithoutBranchKeys(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"encryption": map[string]any{"level": "e2e"}, "catalog": map[string]any{"trust": []any{}, "mode": "dag"}}))
+	svcJWK, svcPriv := must2(seal.GenerateRecipient())
+	wJWK, wPriv := must2(seal.GenerateRecipient())
+	both := []string{"cat", "catb"}
+	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "append", "config", "branch"},
+		map[string]any{"enc": wJWK})), client.WithKeys(client.NewKeys(wPriv)))
+	x2 := wr.E2E(wPriv)
+	must(x2.InitKeyring(ctx, "cat", svcPriv.PublicKey()))
+	must(x2.CreateDocSealed(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(x2.CreateDocSealed(ctx, "cat", "n", map[string]any{"title": "N", "parents": parents("root@a0")}))
+	must(wr.CreateBranch(ctx, "cat", client.BranchRequest{Name: "catb"}))
+	// The branch's keyring leaves the service out.
+	must(x2.InitKeyring(ctx, "catb"))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"}, map[string]any{"enc": svcJWK})),
+		client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey()))
+	x := startSvc(t, sc, svcOpts{now: s.Now}, func(o *tree.Options) { o.Recipient = svcPriv; o.Branches = map[string]string{"cat": "catb"} })
+	rd := k.Grant(t, s.Now(), "user:r", both, []string{"read"})
+	waitFor(t, "the preview to be answered as a catalog the service doesn't serve", func() bool {
+		return x.raw("/cat/children?of=root", rd).status == http.StatusNotFound
+	})
+	for range 20 {
+		r := x.listingAs("/cat/children?of=root", rd)
+		if r.status == http.StatusOK {
+			t.Fatalf("a preview without the branch's keys served a listing: %v", r.body)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if vs := x.s.SealedViews(); len(vs) != 0 {
+		t.Errorf("a preview without the branch's keys stored sealed views: %v", vs)
+	}
 }
 
 // v82NameOnly fails unless e, a listing's entry, carries its clear
@@ -200,6 +320,7 @@ func TestV082UnjudgedEpochByNameOnly(t *testing.T) {
 
 	release := make(chan struct{})
 	x = startSvc(t, q.svc(v077Blocking("/r/", release)), svcOpts{now: q.s.Now, db: q.db})
+	done := v82Release(t, release)
 	x.caughtUp("cat", "files")
 	waitFor(t, "a listing during the fill", func() bool { return x.listingAs("/cat/children?of=root", q.full).status == http.StatusOK })
 	during := x.fetch("/cat/children?of=root", q.full)
@@ -226,7 +347,7 @@ func TestV082UnjudgedEpochByNameOnly(t *testing.T) {
 	}
 	sq.Close()
 
-	close(release)
+	done()
 	waitFor(t, "the epochs backfill", func() bool { return !x.s.EpochsPending() })
 	after := x.fetch(during.path, q.full)
 	if bytes.Equal(after.body, during.body) {
@@ -344,13 +465,14 @@ func TestV082MigrationRejudgesBornEpochs(t *testing.T) {
 
 	release := make(chan struct{})
 	x = startSvc(t, q.svc(v077Blocking("/r/", release), v077Blocking("/ns/cat/log", release)), svcOpts{now: q.s.Now, db: q.db})
+	done := v82Release(t, release)
 	if !x.s.EpochsPending() {
 		t.Fatal("after the migration: no fill pending")
 	}
 	if _, b := v077Epochs(t, q.db, "old"); b != 0 {
 		t.Errorf("after the migration: old's born_epoch %d, want it reset", b)
 	}
-	close(release)
+	done()
 	waitFor(t, "the born epochs to be read in again", func() bool { _, b := v077Epochs(t, q.db, "old"); return b == 1 && !x.s.EpochsPending() })
 }
 

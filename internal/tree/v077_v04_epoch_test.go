@@ -242,6 +242,7 @@ func TestV077V04NotJudgedDuringBackfill(t *testing.T) {
 	x.stop()
 	v077Unfill(t, db)
 	x = startSvc(t, sc(true), svcOpts{now: s.Now, db: db}, withRecipient)
+	done := v82Release(t, release)
 	rd := k.Grant(t, s.Now(), "user:r", []string{"cat"}, []string{"read"})
 	waitFor(t, "a listing", func() bool { return x.listingAs("/cat/children?of=root", rd).status == http.StatusOK })
 	during := x.fetch("/cat/children?of=root", rd)
@@ -253,7 +254,7 @@ func TestV077V04NotJudgedDuringBackfill(t *testing.T) {
 	if e, _ := v077Epochs(t, db, "n"); e != 0 {
 		t.Errorf("during the fill: n's epoch %d stored, want none judged", e)
 	}
-	close(release)
+	done()
 	waitFor(t, "the epochs backfill", func() bool { return !x.s.EpochsPending() })
 	must(x2.CreateDocSealed(ctx, "cat", "later", map[string]any{"title": "Later", "parents": parents("root@a1")}))
 	x.caughtUp("cat")
@@ -312,6 +313,7 @@ func TestV077V04BackfillDropsUnjudged(t *testing.T) {
 	x.stop()
 	v077Unfill(t, db)
 	x = startSvc(t, sc(true), svcOpts{now: s.Now, db: db}, preview)
+	done := v82Release(t, release)
 	rd := k.Grant(t, s.Now(), "user:r", both, []string{"read"})
 	waitFor(t, "a listing", func() bool { return x.listingAs("/cat/children?of=root", rd).status == http.StatusOK })
 	during := x.fetch("/cat/children?of=root", rd)
@@ -324,7 +326,7 @@ func TestV077V04BackfillDropsUnjudged(t *testing.T) {
 	if e, _ := v077Epochs(t, db, "n"); e != 0 {
 		t.Fatalf("during the fill: n's epoch %d stored; want none judged", e)
 	}
-	close(release)
+	done()
 	waitFor(t, "the epochs backfill", func() bool { return !x.s.EpochsPending() })
 	// The listing that left n's values out isn't served again at its
 	// at: the fill dropped it, kept and stored.
