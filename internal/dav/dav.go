@@ -513,7 +513,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			st.noneMatch = r.Header.Get("If-None-Match") == "*" && !aside
 		}
 	}
+	r = r.WithContext(context.WithValue(r.Context(), stateKey{}, st))
 	if de := st.readOnly(r.Context()); de != nil {
+		if st.method == "PUT" {
+			// Which tree owns the namespace is a read the save decides
+			// by (§H.4 "The base").
+			de = de.asSave()
+			for k, v := range de.header {
+				w.Header()[k] = v
+			}
+		}
 		http.Error(w, de.msg, de.status)
 		return
 	}
@@ -549,7 +558,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.opt.Logf("dav: %s %s: %v", r.Method, r.URL.Path, err)
 		}
 	}}
-	h.ServeHTTP(&errWriter{ResponseWriter: w, st: st, realm: s.realm()}, r.WithContext(context.WithValue(r.Context(), stateKey{}, st)))
+	h.ServeHTTP(&errWriter{ResponseWriter: w, st: st, realm: s.realm()}, r)
 }
 
 // readOnly refuses (403) a request that would write in the flat view of
@@ -2409,6 +2418,9 @@ type reqState struct {
 	dst    string
 	depth  string
 	err    *davError
+	// unread: a save's first read of what a namespace's writes need that
+	// failed for now and wasn't answered there (nsInfo, saveInfo)
+	unread atomic.Pointer[error]
 
 	hdr       http.Header // the request's
 	resp      http.Header // the answer's
@@ -2491,6 +2503,11 @@ func (st *reqState) record(err error) error {
 	}
 	if de.refresh {
 		st.tk.forgetWriters()
+	}
+	if st.method == "PUT" {
+		// Whichever read failed for now, a save answers it as a save's
+		// failed read (§H.4 "The base").
+		de = de.asSave()
 	}
 	switch {
 	case de.status == http.StatusUnauthorized && !st.s.opt.Gateway:

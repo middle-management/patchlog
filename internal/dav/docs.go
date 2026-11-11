@@ -218,8 +218,33 @@ func filesOf(cat map[string]any) (*treeFiles, string) {
 // (GET /ns/{ns}/principal refused) mean a fresh $nonce on every write
 // (client.NeedsNonce, §C.7).
 func (s *Server) nsInfo(ctx context.Context, tk *token, ns string) nsInfo {
-	in, _ := s.nsInfoErr(ctx, tk, ns)
+	in, err := s.nsInfoErr(ctx, tk, ns)
+	if st := state(ctx); err != nil && st != nil && st.method == "PUT" && failedRead(err) {
+		// What a save's writes need is among what it decides by (§H.4
+		// "The base"): the save fails before it writes (saveInfo).
+		st.unread.CompareAndSwap(nil, &err)
+	}
 	return in
+}
+
+// saveInfo is nsInfo of ns for st's token where the request writes: for
+// a save (a PUT), a read of it that failed for now (failedRead), here or
+// earlier in the request, of this namespace or of another (nsInfo), is
+// the error, and the save fails before the write, as after any failed
+// read of what it decides by (§H.4 "The base"). Another request goes by
+// the settings a fresh $nonce on every write stands for, as nsInfo does.
+func (st *reqState) saveInfo(ctx context.Context, ns string) (nsInfo, error) {
+	in, err := st.s.nsInfoErr(ctx, st.tk, ns)
+	if st.method != "PUT" {
+		return in, nil
+	}
+	if err != nil && failedRead(err) {
+		return in, upstream(err)
+	}
+	if e := st.unread.Load(); e != nil {
+		return in, upstream(*e)
+	}
+	return in, nil
 }
 
 // writerTTL is how long a token's writer block (§7.4, no-store) serves
@@ -262,25 +287,42 @@ func (tk *token) forgetWriters() {
 	tk.mu.Unlock()
 }
 
-// transient reports a read that failed for now (a 408, a 429, a 5xx, no
-// answer), whose failure isn't kept: a save that decides by it fails
-// (failedRead, §H.4 "The base"), and the next asks again.
+// transient reports a read that failed for now (a 429, a 5xx, no answer),
+// whose failure isn't kept.
 func transient(err error) bool {
 	ae, isAPI := client.AsAPIError(err)
-	return err != nil && (!isAPI || ae.Status == 408 || ae.Status == 429 || ae.Status >= 500)
+	return err != nil && (!isAPI || ae.Status == 429 || ae.Status >= 500)
+}
+
+// saving reports whether ctx is a save's, a PUT's: what its writes need
+// (nsInfoErr, nsDoc) is among what it decides by (§H.4 "The base").
+func saving(ctx context.Context) bool {
+	st := state(ctx)
+	return st != nil && st.method == "PUT"
+}
+
+// timedOut reports the core's 408, which other requests keep as the
+// answer it is, but a save takes as a read that failed for now
+// (failedRead, §H.4 "The base"): it isn't kept, one kept is asked again,
+// and the save fails.
+func timedOut(err error) bool {
+	ae, ok := client.AsAPIError(err)
+	return ok && ae.Status == 408
 }
 
 // nsInfoErr is nsInfo, with the error of a read that failed for now
-// (transient), which isn't kept.
+// (transient; for a save, the core's 408 too, timedOut), which isn't
+// kept.
 func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, error) {
 	now := s.opt.Now()
+	save := saving(ctx)
 	tk.mu.Lock()
 	wa, ok := tk.writers[ns]
 	tk.mu.Unlock()
-	if !ok || now.Sub(wa.at) >= s.writerTTL() {
+	if !ok || now.Sub(wa.at) >= s.writerTTL() || save && timedOut(wa.err) {
 		pi, err := tk.c.NSPrincipal(ctx, ns)
 		switch {
-		case transient(err):
+		case transient(err), save && timedOut(err):
 			return nsInfo{nonce: true}, err
 		case err != nil:
 			wa = writerAt{err: err, at: now}
@@ -341,13 +383,15 @@ func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, e
 
 // nsDoc returns what ns's document says, read with tk's grant at most
 // every 30 seconds: a catalog's trust list and file tree, and whether tk
-// reads it (readErr). A failure for now (transient) is the error.
+// reads it (readErr). A failure for now (transient; for a save, the
+// core's 408 too) is the error.
 func (s *Server) nsDoc(ctx context.Context, tk *token, ns string) (nsDocAt, error) {
 	now := s.opt.Now()
 	tk.mu.Lock()
 	d, ok := tk.docs[ns]
 	tk.mu.Unlock()
-	if ok && now.Sub(d.at) < 30*time.Second {
+	save := saving(ctx)
+	if ok && now.Sub(d.at) < 30*time.Second && !(save && timedOut(d.readErr)) {
 		return d, nil
 	}
 	d = nsDocAt{at: now}
@@ -360,7 +404,7 @@ func (s *Server) nsDoc(ctx context.Context, tk *token, ns string) (nsDocAt, erro
 	case errors.Is(err, client.ErrNoKeys):
 		// Sealed (§H.7): its writer block says so.
 		d.readErr = err
-	case transient(err):
+	case transient(err), save && timedOut(err):
 		return nsDocAt{}, err
 	case err != nil:
 		d.readErr = err

@@ -124,7 +124,10 @@ func taken(ns, name string) error {
 // one edited: the edit from its base (base) to v, rebased on the head and
 // appended with If-Match (§11.3, §H.4).
 func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body []byte, o saveOpts) (string, bool, error) {
-	in := st.s.nsInfo(ctx, st.tk, ns)
+	in, err := st.saveInfo(ctx, ns)
+	if err != nil {
+		return "", false, err
+	}
 	if in.sealed {
 		return "", false, notOffered(ns)
 	}
@@ -133,7 +136,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 	}
 	var rev string
 	var exact bool
-	err := st.retrying(ctx, func() (bool, error) {
+	err = st.retrying(ctx, func() (bool, error) {
 		h, err := st.saveHead(ctx, ns, name, o)
 		if err != nil {
 			return false, saveRead(err)

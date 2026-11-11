@@ -38,6 +38,9 @@ type davError struct {
 	// (403), as one without tree-derived access refuses every grant that
 	// doesn't read its namespaces whole (§B.11.5)
 	svcRefused bool
+	// read: the core's 408 or 503 to a read (a GET) this answers, which
+	// a save answers the other way round (asSave, §H.4 "The base")
+	read *client.APIError
 }
 
 func (e *davError) Error() string {
@@ -166,9 +169,37 @@ func upstream(err error) error {
 		e.refresh = ae.Code == "nonce"
 		return e
 	case ae.Status == 429, ae.Status == 408:
-		return busy(ae)
+		e := busy(ae)
+		if ae.Status == 408 && ae.Method == http.MethodGet {
+			e.read = ae
+		}
+		return e
 	}
-	return fail(http.StatusBadGateway, "the core answered %d: %s", ae.Status, msg)
+	e := fail(http.StatusBadGateway, "the core answered %d: %s", ae.Status, msg)
+	if ae.Status == http.StatusServiceUnavailable && ae.Method == http.MethodGet {
+		e.read = ae
+	}
+	return e
+}
+
+// asSave is e as a save answers it (§H.4 "The base": a failed read of
+// anything the save decides by is 503 with Retry-After after the core's
+// 429 or 503, else 502): where e answers the core's 503 or 408 to a
+// read as upstream does for any request (502, and 503), the other way
+// round, as saveRead maps them; otherwise e. Whichever read of a PUT
+// fails, it is answered so (record).
+func (e *davError) asSave() *davError {
+	if e == nil || e.read == nil {
+		return e
+	}
+	out := *e
+	out.read = nil
+	if e.read.Status == http.StatusServiceUnavailable {
+		out.status, out.header = http.StatusServiceUnavailable, busy(e.read).header
+	} else {
+		out.status, out.header = http.StatusBadGateway, nil
+	}
+	return &out
 }
 
 // busy is the 503 a 429 or a 408 turns into once waiting is no longer

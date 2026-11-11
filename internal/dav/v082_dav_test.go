@@ -386,3 +386,278 @@ func TestV082FolderCopyAncestorsShapes(t *testing.T) {
 		}
 	}
 }
+
+// v82With is e served by another WebDAV server, whose core requests go
+// through rt.
+func v82With(t *testing.T, e *env, rt http.RoundTripper) *env {
+	t.Helper()
+	opt := e.opt
+	opt.Client = e.s.Client(t, client.WithAuthor("dav"), client.WithHTTPClient(&http.Client{Transport: rt}))
+	g := *e
+	g.opt = opt
+	g.dav = newTestServer(t, must(dav.New(opt)))
+	return &g
+}
+
+// BT-8 changes saves only (TOOLS §H.4 "The base"): to a request that
+// isn't one, the core's 408 to what a namespace's writes need (GET
+// /ns/{ns}/principal, the namespace's head and document) is the answer
+// it was before v0.82, kept as any refusal of them is, and the request
+// is answered as v0.27.0 answered it.
+func TestV082OtherRequestsKeepA408(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		read, method, path string
+		want               int
+	}{
+		{"principal", "GET", "/docs/x.json", 200},
+		{"principal", "PROPFIND", "/docs/", 207},
+		{"principal", "PROPFIND", "/", 207},
+		{"principal", "GET", "/cat/Season/derby.json", 200},
+		{"principal", "PROPFIND", "/cat/Season/", 207},
+		{"principal", "PROPFIND", "/cat/", 207},
+		{"principal", "DELETE", "/docs/x.json", 403},
+		{"principal", "MKCOL", "/cat/Season/New", 201},
+		{"nsdoc", "GET", "/docs/x.json", 200},
+		{"nsdoc", "PROPFIND", "/docs/", 503},
+		{"nsdoc", "PROPFIND", "/", 207},
+		{"nsdoc", "GET", "/cat/Season/derby.json", 503},
+		{"nsdoc", "PROPFIND", "/cat/Season/", 503},
+		{"nsdoc", "PROPFIND", "/cat/", 503},
+		{"nsdoc", "DELETE", "/docs/x.json", 403},
+		{"nsdoc", "MKCOL", "/cat/Season/New", 503},
+	} {
+		t.Run(c.read+" "+c.method+" "+c.path, func(t *testing.T) {
+			t.Parallel()
+			rt := &failRT{status: 408}
+			e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("docs")}})
+			e.create("docs", "x", map[string]any{"a": "1"})
+			e.create("docs", "derby", map[string]any{"title": "Derby"})
+			e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+			e.create("cat", "season", map[string]any{"title": "Season", "parents": parents("cat", "root")})
+			e.create("cat", "docs.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
+			e = v82With(t, e, rt)
+			rt.match.Store(func(q *http.Request) bool {
+				if q.Method != "GET" {
+					return false
+				}
+				if c.read == "principal" {
+					return strings.HasSuffix(q.URL.Path, "/principal")
+				}
+				for _, ns := range []string{"cat", "docs"} {
+					if q.URL.Path == "/ns/"+ns || strings.HasPrefix(q.URL.Path, "/ns/"+ns+"/rev/") {
+						return true
+					}
+				}
+				return false
+			})
+			rt.armed.Store(true)
+			e.expect(e.do(c.method, c.path, ""), c.want, c.method+" "+c.path+", the core answering 408 to the "+c.read+" reads")
+		})
+	}
+}
+
+// BT-8, the window after another request kept the core's 408 (flat and
+// tree): a GET is served while GET /ns/{ns}/principal answers 408, which
+// the server keeps a while as what the namespace's writes need. A save
+// right after doesn't go by what was kept: it asks again, and while the
+// core still answers 408 it fails (502), nothing written. Once the core
+// answers, the save is made.
+func TestV082SaveAfterAKept408(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{"/docs/x.json", "/cat/Season/derby.json", "/cat/Season/new.json"} {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			rt := &failRT{status: 408}
+			e := newEnv(t, []string{"docs", "matches"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("matches")}})
+			e.create("docs", "x", map[string]any{"a": "1"})
+			e.create("matches", "derby", map[string]any{"a": "1"})
+			e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+			e.create("cat", "season", map[string]any{"title": "Season", "parents": parents("cat", "root")})
+			e.create("cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
+			e = v82With(t, e, rt)
+			var asked atomic.Int64
+			rt.match.Store(func(q *http.Request) bool {
+				if q.Method == "GET" && strings.HasSuffix(q.URL.Path, "/principal") {
+					asked.Add(1)
+					return true
+				}
+				return false
+			})
+			rt.armed.Store(true)
+			read := strings.Replace(path, "new.json", "derby.json", 1)
+			g := e.expect(e.do("GET", read, ""), 200, "GET, the core answering 408 to the principal reads")
+			if asked.Load() == 0 {
+				t.Fatal("the GET didn't ask who writes the namespace")
+			}
+			before := len(e.liveNames("matches"))
+			head, _ := e.load("docs", "x")
+			derby, _ := e.load("matches", "derby")
+			body, hdr := `{"a": "2"}`, []string{}
+			if path == read {
+				hdr = []string{"If-Match", g.header.Get("ETag")}
+			}
+			was := asked.Load()
+			v82ExpectFailed(t, e, e.do("PUT", path, body, hdr...), 502, "PUT after the kept 408")
+			if asked.Load() == was {
+				t.Fatal("the save went by the kept 408: it didn't ask again")
+			}
+			x, _ := e.load("docs", "x")
+			d, _ := e.load("matches", "derby")
+			if x.ID != head.ID || d.ID != derby.ID || len(e.liveNames("matches")) != before {
+				t.Fatalf("the failed save wrote: x %s, derby %s, %v", x.ID, d.ID, e.liveNames("matches"))
+			}
+			rt.armed.Store(false)
+			if r := e.do("PUT", path, body, hdr...); r.status != 201 && r.status != 204 {
+				t.Fatalf("PUT, the core answering: %d %s", r.status, r.body)
+			}
+		})
+	}
+}
+
+// v82NthRT answers the nth GET (from 1) the core gets once armed with
+// status, and passes every other request through.
+type v82NthRT struct {
+	next   http.RoundTripper
+	armed  atomic.Bool
+	n      int64
+	seen   atomic.Int64
+	status int
+	hit    atomic.Value // string: the path it answered
+}
+
+func (f *v82NthRT) RoundTrip(r *http.Request) (*http.Response, error) {
+	if f.armed.Load() && r.Method == "GET" && f.seen.Add(1) == f.n {
+		f.hit.Store(r.URL.Path)
+		return &http.Response{StatusCode: f.status, Header: http.Header{"Retry-After": {"5"}, "Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"code":"unavailable","message":"try later"}`)), Request: r}, nil
+	}
+	if f.next != nil {
+		return f.next.RoundTrip(r)
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// v82Sweep fails each of a PUT's reads of the core in turn, one per
+// world, with the core's 503 and 408, and checks the save's answer: 503
+// with Retry-After and 502 (§H.4 "The base"). world builds the gateway
+// over rt and warms it, and returns the PUT to make; ok is its status
+// with no read failing. It returns how many reads the PUT made.
+func v82Sweep(t *testing.T, ok int, world func(t *testing.T, rt *v82NthRT) (e *env, put func() resp)) int64 {
+	t.Helper()
+	var reads int64
+	for _, c := range []struct{ status, want int }{{503, 503}, {408, 502}} {
+		for n := int64(1); ; n++ {
+			if n > 60 {
+				t.Fatalf("the PUT made over %d reads", n)
+			}
+			rt := &v82NthRT{n: n, status: c.status}
+			e, put := world(t, rt)
+			rt.armed.Store(true)
+			r := put()
+			rt.armed.Store(false)
+			hit, _ := rt.hit.Load().(string)
+			if hit == "" {
+				e.expect(r, ok, "the PUT with no read failing")
+				reads = n - 1
+				break
+			}
+			if r.status != c.want || c.want == 503 && r.header.Get("Retry-After") == "" {
+				t.Errorf("the core's %d on GET %s (read %d of the PUT): %d %s (Retry-After %q), want %d", c.status, hit, n, r.status, strings.TrimSpace(r.body), r.header.Get("Retry-After"), c.want)
+			}
+		}
+	}
+	return reads
+}
+
+// BT-8, every read of a save: whichever read of the core a PUT makes
+// fails, the save answers 503 with Retry-After after the core's 503 and
+// 502 after its 408, for a flat file, a file of a tree, and a new one
+// there, JSON or raw, whose placement node's head is read to see that
+// its name is free (v0.82's first cut left those two reads with the
+// answers of other requests, swapped), and for the restore of a file
+// the user deleted moments ago. Cold, the server has kept nothing of
+// the core's answers, so the PUT's reads include what its namespaces'
+// writes need.
+func TestV082SaveEveryFailedRead(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		what, path, body string
+		prep             func(e *env) []string // the PUT's headers
+	}{
+		{"a flat file", "/docs/x.json", `{"a": "2"}`, nil},
+		{"a new flat file", "/docs/new.json", `{"a": 1}`, nil},
+		{"a new raw flat file", "/docs/new.bin", "raw\x00bytes", nil},
+		{"a flat file with If-Match", "/docs/x.json", `{"a": "2"}`, func(e *env) []string {
+			return []string{"If-Match", e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").header.Get("ETag")}
+		}},
+		{"a file of a tree", "/cat/Season/derby.json", `{"title": "Derby 2"}`, nil},
+		{"a new file of a tree", "/cat/Season/new.json", `{"a": 1}`, nil},
+		{"a new raw file of a tree", "/cat/Season/new.bin", "raw\x00bytes", nil},
+		{"a file of a tree with If-Match", "/cat/Season/derby.json", `{"title": "Derby 2"}`, func(e *env) []string {
+			return []string{"If-Match", e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET").header.Get("ETag")}
+		}},
+		{"the restore of a file of a tree", "/cat/Season/derby.json", `{"title": "Derby 2"}`, func(e *env) []string {
+			e.expect(e.do("DELETE", "/cat/Season/derby.json", ""), 204, "DELETE")
+			return nil
+		}},
+	} {
+		for _, cold := range []bool{false, true} {
+			if cold && c.prep != nil {
+				continue
+			}
+			what := c.what
+			if cold {
+				what += ", cold"
+			}
+			t.Run(what, func(t *testing.T) {
+				t.Parallel()
+				reads := v82Sweep(t, 201, func(t *testing.T, rt *v82NthRT) (*env, func() resp) {
+					e := newEnv(t, []string{"docs", "matches"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("matches")}})
+					e.create("docs", "x", map[string]any{"a": "1"})
+					e.create("matches", "derby", map[string]any{"title": "Derby"})
+					e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+					e.create("cat", "season", map[string]any{"title": "Season", "parents": parents("cat", "root")})
+					e.create("cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
+					e = v82With(t, e, rt)
+					var hdr []string
+					if !cold {
+						// Warm what the server keeps, so the reads that
+						// fail are the PUT's own.
+						e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET")
+						e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET")
+					}
+					if c.prep != nil {
+						hdr = c.prep(e)
+					}
+					return e, func() resp { return e.do("PUT", c.path, c.body, hdr...) }
+				})
+				if reads == 0 {
+					t.Fatal("the PUT read nothing of the core")
+				}
+			})
+		}
+	}
+}
+
+// BT-8, every read of a save, where grants come from the catalog
+// (§B.11): a new file's placement is made first there, under a grant the
+// tree service issues, and the node's head is read for it all the same.
+func TestV082SaveEveryFailedReadDerived(t *testing.T) {
+	t.Parallel()
+	reads := v82Sweep(t, 201, func(t *testing.T, rt *v82NthRT) (*env, func() resp) {
+		w := newDerivedWorld(t)
+		g := w.derivedGateway(t, func(o *dav.Options) {
+			o.Client = o.Client.With(client.WithTransport(func(next http.RoundTripper) http.RoundTripper {
+				rt.next = next
+				return rt
+			}))
+		})
+		bob := w.user(t, "user:bob", "match-desk")
+		g.expect(g.doAs(bob, "GET", "/cat/Season%202026/derby.json", ""), 200, "bob's GET")
+		return g, func() resp { return g.doAs(bob, "PUT", "/cat/Season%202026/new.json", `{"a": 1}`) }
+	})
+	if reads == 0 {
+		t.Fatal("the PUT read nothing of the core")
+	}
+}

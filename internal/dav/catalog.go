@@ -997,7 +997,10 @@ func (st *reqState) newFile(ctx context.Context, t target, raw bool, v any, body
 	if !c.trusts(f.ns) {
 		return "", false, fail(http.StatusForbidden, "catalog %s doesn't trust %s, the namespace its files.ns names for new files (§H.2, §H.4): no file is created", t.ns, f.ns)
 	}
-	if st.s.nsInfo(ctx, st.tk, f.ns).sealed {
+	switch in, err := st.saveInfo(ctx, f.ns); {
+	case err != nil:
+		return "", false, err
+	case in.sealed:
 		return "", false, notOffered(f.ns)
 	}
 	item := newName()
@@ -1065,7 +1068,10 @@ func (st *reqState) restoreFile(ctx context.Context, t target, raw bool, v any, 
 		// server doesn't ask for: the write makes a new file (§H.6).
 		return "", false, false, nil
 	}
-	in := st.s.nsInfo(ctx, st.tk, d.cat)
+	in, err := st.saveInfo(ctx, d.cat)
+	if err != nil {
+		return "", false, true, err
+	}
 	h, err := st.tk.c.Head(ctx, d.cat, d.node)
 	if err != nil {
 		return "", false, true, err
@@ -1112,7 +1118,10 @@ func (st *reqState) restoreFile(ctx context.Context, t target, raw bool, v any, 
 // frozen catalog, a grant that doesn't write it, or its rules refuse it
 // as they would the write.
 func (st *reqState) probeNode(ctx context.Context, cat, name string, doc map[string]any) error {
-	in := st.s.nsInfo(ctx, st.tk, cat)
+	in, err := st.saveInfo(ctx, cat)
+	if err != nil {
+		return err
+	}
 	h, err := st.tk.c.Head(ctx, cat, name)
 	if err != nil {
 		return upstream(err)
@@ -1192,7 +1201,10 @@ func (st *reqState) writable(ctx context.Context, t target) error {
 // restores it with doc if it is tombstoned (§8.2), with a fresh $nonce
 // where the catalog requires one (§H.7).
 func (st *reqState) createNode(ctx context.Context, cat, name string, doc map[string]any) error {
-	in := st.s.nsInfo(ctx, st.tk, cat)
+	in, err := st.saveInfo(ctx, cat)
+	if err != nil {
+		return err
+	}
 	defer st.changed()
 	return st.retrying(ctx, func() (bool, error) {
 		h, err := st.tk.c.Head(ctx, cat, name)
