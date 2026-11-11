@@ -67,8 +67,9 @@ func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []st
 // isn't enough, since a not or an any around a missing /now would pass.
 func forRead(env map[string]any) bool { return env["action"] == "read" }
 
-// refersToNow reports whether r refers to /now, or to the whole envelope,
-// which counts as referring to it (the conservative reading).
+// refersToNow reports whether r refers to /now: it, or a rule nested in
+// it, tests or compares /now, a path below it, or the whole envelope,
+// which refers to every pointer (§2.1 Refers to).
 func refersToNow(r *rules.Rule) bool {
 	refs := r.Refs()
 	return refs["now"] || refs["*"]

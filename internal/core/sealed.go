@@ -984,7 +984,10 @@ func (t *tx) keysReadScope(a *actor) (perResource, refused bool) {
 	}
 	roles, ok := a.unrestrictedRoles()
 	if ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), false) != nil {
-		if _, all := a.verified.Allows("read"); len(roles) == len(all) {
+		// Of the roles that count for read (readRoles): one with a rule on
+		// /now passes no read, per resource either, and unrestrictedRoles
+		// leaves it out (v0.82).
+		if all, _ := readRoles(a); len(roles) == len(all) {
 			return false, true
 		}
 		ok = false
