@@ -337,7 +337,9 @@ func TestV082FolderCopyAncestorsShapes(t *testing.T) {
 		{"v0.82, cuts false", func(p [][]string) map[string]any {
 			return map[string]any{"paths": names(p), "tooDeep": false, "truncated": false}
 		}, "", itself},
-		{"before v0.82", func(p [][]string) map[string]any { return map[string]any{"paths": objects(p), "node": map[string]any{"name": "x"}} }, "", itself},
+		{"before v0.82", func(p [][]string) map[string]any {
+			return map[string]any{"paths": objects(p), "node": map[string]any{"name": "x"}}
+		}, "", itself},
 		{"before v0.82, tooDeep 0", func(p [][]string) map[string]any { return map[string]any{"paths": objects(p), "tooDeep": 0} }, "", itself},
 		{"tooDeep true", func(p [][]string) map[string]any { return map[string]any{"paths": names(p), "tooDeep": true} }, unchecked, unchecked},
 		{"truncated true", func(p [][]string) map[string]any { return map[string]any{"paths": names(p), "truncated": true} }, unchecked, unchecked},
