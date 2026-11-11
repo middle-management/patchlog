@@ -641,7 +641,8 @@ func (ix *Index) reconcile(ctx context.Context) {
 
 // forgetMember purges idx:{m}, by the path a purge in m takes, once m's
 // follower stopped: nothing purges it after. Its checkpoint, read mode
-// and, unless m is purged, catalog.trust are forgotten with it, in the same transaction (reconcile forgot the
+// and, unless m is purged or the index's own follower of m records it
+// (ownsTrust), catalog.trust are forgotten with it, in the same transaction (reconcile forgot the
 // checkpoint in memory already), unless a follower started again since,
 // which bootstraps them afresh: a follower started later starts at the
 // head, and a restart doesn't resume from them (§B.5 Behind).
@@ -673,8 +674,13 @@ func (ix *Index) forgetMember(ctx context.Context, m string) error {
 	}
 	if err == nil && !again && !purged {
 		// Of a live m, forgotten too: what it trusts may change unseen
-		// from now on. A purged m's stays, its last (fsTrust).
-		_, err = tx.ExecContext(ctx, `DELETE FROM catalog_trust WHERE ns = ?`, m)
+		// from now on. A purged m's stays, its last (fsTrust), and so
+		// does that of an m the index serves and has reached or applied
+		// the purge of (ownsTrust).
+		var owns bool
+		if owns, err = ix.ownsTrust(ctx, tx, m); err == nil && !owns {
+			_, err = tx.ExecContext(ctx, `DELETE FROM catalog_trust WHERE ns = ?`, m)
+		}
 	}
 	if err == nil {
 		err = tx.Commit()
@@ -687,6 +693,30 @@ func (ix *Index) forgetMember(ctx context.Context, m string) error {
 	ix.purgeStored(ctx, m, tags, false)
 	ix.purgeKept(m, tags)
 	return nil
+}
+
+// ownsTrust reports, in tx with ix.wmu held, whether m's catalog.trust
+// (catalog_trust) is the one the index's own follower of m records: m is a
+// namespace it serves and holds a checkpoint of, or one whose purge-ns it
+// applied (ns_state), whose last trust stays (dropUnfollowedTrust). m has
+// a follower for visibility as well while the index serves it and hasn't
+// reached it (memberAtGone), which the reconciler stops once it has
+// (reconcile: known), and m's document is still read at its head once m
+// is purged unless m is sealed (§8.5), so neither the member's state nor
+// the grant checker tells forgetMember that m is purged. The row is the
+// serving follower's then (narrowed, recordTrust), which records it with
+// every namespace document it applies and never again after m's purge-ns:
+// forgotten, a purged catalog the index read the trust of would count as
+// no catalog for good (§B.11.9 Where: "the last one the origin stored or
+// the service read"), and a partial reader of a namespace it covers would
+// be 403 without a marker (§A.4) instead of reading it dark.
+func (ix *Index) ownsTrust(ctx context.Context, tx *sql.Tx, m string) (bool, error) {
+	var cp, purged bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM checkpoints WHERE origin = ? AND ns = ?), EXISTS (SELECT 1 FROM ns_state WHERE ns = ? AND purged = 1)`,
+		ix.origin, m, m).Scan(&cp, &purged)
+	// With Branches every namespace the index holds a checkpoint of is
+	// served (known), before Apply publishes it too.
+	return purged || cp && (ix.roots[m] || ix.opt.Branches), err
 }
 
 // fsForget drops what fstate keeps of ns read at an ns_id, once a purge in
