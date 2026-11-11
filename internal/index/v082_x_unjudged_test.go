@@ -13,14 +13,16 @@ import (
 // XT-1 (5), SVC-05 and SVC-06 together (SERVICES §E.2.6 Per-entry
 // sealing, v0.82: "Until it can judge it, the service seals nothing
 // derived from that revision"): derived.Keys.KeyAt refuses an epoch that
-// isn't known with ErrUnjudged, never answering the key current now, and
-// the index never asks it for one. In v82Pending's index, where r's epoch
-// in e-b is pending, an answer whose judgement finds another head (a
-// write between its read and its judgement, or as it judges) is computed
-// again: it is a 200 serving r's head under e-b#1, the epoch that head is
-// served under, on a query and on /_refs. An index that passed the
-// unjudged epoch on to KeyAt would answer the refusal instead of a result.
-func TestV082XIndexNeverAsksUnjudgedKey(t *testing.T) {
+// isn't known with ErrUnjudged, never answering the key current now; and
+// in v82Pending's index, over the same deployment, where r's epoch in e-b
+// is pending, an answer whose judgement finds another head (a write
+// between its read and its judgement, or as it judges) is computed again:
+// it is a 200 serving r's head under e-b#1, the epoch that head is served
+// under, on a query and on /_refs, never KeyAt's refusal. This pins the
+// two behaviours side by side; it doesn't reach the index's own guards
+// against passing an unjudged epoch to KeyAt (keyAt in http.go and
+// refsall.go), which the judgement's recomputation keeps from being met.
+func TestV082XUnjudgedEpochRefusedAndRecomputed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	for _, c := range []struct {

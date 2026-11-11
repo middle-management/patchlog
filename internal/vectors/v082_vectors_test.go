@@ -320,6 +320,14 @@ func TestV082C2ViewKey(t *testing.T) {
 	t.Parallel()
 	p := loadCandidates(t).C2
 	gs := grantcheck.SubjectSetID([]string{"group:match-desk", "user:anna"}) // I.8's
+	// The premise is illustrative, like §I.19's plaintexts: I.8's gs is a
+	// set of two principals, and the reference serves a response sealed
+	// whole only at a gs every reader of which reads the namespace whole,
+	// that of reads:demo (SERVICES §E.2.6 Whole-response sealing, §A.4).
+	// The bytes don't depend on it.
+	if whole := grantcheck.SubjectSetID([]string{"reads:demo"}); whole == gs {
+		t.Fatalf("I.8's gs is that of reads:demo")
+	}
 	vals := url.Values{"q": {p.Q}, "sort": {p.Sort}, "min": {nsID2}}
 	cq := derived.CanonicalQuery(vals, "min")
 	if cq != "?"+p.CanonicalQuery {
