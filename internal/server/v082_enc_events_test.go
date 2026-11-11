@@ -165,3 +165,73 @@ func TestV082EventsPastBound(t *testing.T) {
 		t.Fatalf("no Retry-After: %v", r.H)
 	}
 }
+
+// E2E-9 (§E.2.1 Message bound: "counts may run over, never under"): two
+// instances on one database each count from blocks they take; what is
+// stored never falls short of the sealings made, whether a block is used
+// up, left over at a restart or half given back by a refused read, and
+// together they seal no more than the bound allows. Past it each answers
+// 503 behind.
+func TestV082SealCountNeverUnder(t *testing.T) {
+	t.Parallel()
+	var path string
+	ks := newKeyStore(t)
+	const bound = 24
+	a := newSealedEnv(t, withFileDB(t), func(o *core.Options) { path = o.Path }, withKeyStore(ks), withSealBound(bound, 1<<30, 4))
+	boundNS(t, a) // four entries reserved on K_n, one range sealed
+	b := newSealedEnv(t, withPath(path), withKeyStore(ks), withSealBound(bound, 1<<30, 4))
+	db, pg := v0261DB(t, path)
+	stored := func() int {
+		return v0261Count(t, db, pg, `SELECT COALESCE(SUM(sealed + reserved), 0) FROM seal_counts WHERE name = ''`)
+	}
+	made := 1 // boundNS's range
+	check := func(what string) {
+		t.Helper()
+		if n := stored(); n < made+4 || n > bound {
+			t.Fatalf("%s: %d counted for K_n with %d sealings made and 4 reserved, under a bound of %d", what, n, made, bound)
+		}
+	}
+	check("after the first range")
+	event := func(e *tenv) error {
+		lg, err := e.e.NamespaceEvents(context.Background(), "s", "", 1, core.Credentials{})
+		if err == nil {
+			made += len(lg.EntryJWEs)
+		}
+		return err
+	}
+	// A request cancelled before it starts seals nothing and uncounts
+	// nothing.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := a.e.NamespaceEvents(ctx, "s", "", 1, core.Credentials{}); err == nil {
+		t.Fatal("a cancelled read succeeded")
+	}
+	check("after a cancelled read")
+	var errA, errB error
+	for i := 0; i < 2*bound && (errA == nil || errB == nil); i++ {
+		if errA == nil {
+			errA = event(a)
+			check("a's event")
+		}
+		if errB == nil {
+			errB = event(b)
+			check("b's event")
+		}
+	}
+	for _, err := range []error{errA, errB} {
+		var ce *core.Error
+		if !errors.As(err, &ce) || ce.Status != 503 || ce.Code() != "behind" || ce.Header.Get("Retry-After") == "" {
+			t.Fatalf("past the bound: %v", err)
+		}
+	}
+	if made+4 > bound || made < bound/2 {
+		t.Fatalf("%d sealings made and 4 reserved under a bound of %d", made, bound)
+	}
+	// A third instance, as after a restart, starts from what is stored:
+	// it has no room either.
+	c := newSealedEnv(t, withPath(path), withKeyStore(ks), withSealBound(bound, 1<<30, 4))
+	if err := event(c); err == nil {
+		t.Fatal("a fresh instance sealed past the bound")
+	}
+	check("after a restart")
+}

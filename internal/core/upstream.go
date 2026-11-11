@@ -27,6 +27,14 @@ import (
 // at a weaker level than its base serves it, once it sees the raise
 // (Addendum E Levels, Invariant), so until the raise is made it serves none
 // of it.
+//
+// A raise to e2e, which a source running an earlier draft may still make
+// (this draft refuses it, Levels), is one the branch can't follow at all:
+// it raises itself as far as Levels allow, to sealed (followTarget), and
+// keeps answering 502 upstream for what its source had at at, whatever
+// level it reaches, since sealed is still below the level its source now
+// serves that content at (v0.82, CONFORMANCE scenario 74). What the
+// branch created itself, which its source never had, is served as usual.
 
 // lostRemote is the remote branch in n's chain, n itself or a base of it,
 // whose source was raised to a level it hasn't followed (remoteHeld): the
@@ -49,9 +57,10 @@ func (t *tx) lostRemote(n *nsRow) (branch *nsRow, origin string, lacks, ok bool)
 
 // remoteHeld reports whether remote branch b holds back what it had at at
 // (lostRemote): it recorded a raise of its source (remote_levels) that
-// needs a level this server lacks (lacks), or that it hasn't made as far
-// as Levels allow (followTarget), its config writes having failed. origin
-// is its source's deployment.
+// needs a level this server lacks (lacks), that it hasn't made as far
+// as Levels allow (followTarget), its config writes having failed, or
+// that it can't make at all, a raise to e2e. origin is its source's
+// deployment.
 func (t *tx) remoteHeld(b *nsRow) (origin string, lacks, held bool) {
 	var level int
 	err := t.QueryRow(`SELECT r.origin, l.lacks, l.level FROM remote_levels l JOIN remote_bases r ON r.branch = l.branch WHERE l.branch = ?`, b.id).Scan(&origin, &lacks, &level)
@@ -61,7 +70,12 @@ func (t *tx) remoteHeld(b *nsRow) (origin string, lacks, held bool) {
 	t.must(err)
 	// A server that has lost its key store since lacks every level.
 	lacks = lacks || t.e.opt.KeyStore == nil
-	return origin, lacks, lacks || followTarget(level) > t.config(b.configSeq).level
+	// A raise to e2e is never made: a namespace is end-to-end from its
+	// creation or never (Levels), so a source an earlier draft raised
+	// after at stays above whatever level the branch reaches, and what
+	// it had at at is held for good, until a rebase or a purge
+	// (CONFORMANCE scenario 74; Reading this spec).
+	return origin, lacks, lacks || level == levelE2E || followTarget(level) > t.config(b.configSeq).level
 }
 
 // upstreamCovers reports whether name, as n sees it (v), is one of the
@@ -97,8 +111,8 @@ func upstreamLevelErr(origin, name string) *Error {
 // (catchUpLevels).
 func levelHeldErr(origin, name string) *Error {
 	return apiErr(502, "upstream", "origin", origin, "message",
-		name+" is read through a remote branch whose source at "+origin+" was raised to an encryption level this server hasn't raised the branch to, "+
-			"so it isn't served or written here below that level (§1, §G.5.2); the raise is tried again at every sync, or rebase the branch; a purge still works")
+		name+" is read through a remote branch whose source at "+origin+" was raised to an encryption level this server hasn't raised the branch to, or can't, as to e2e, which only a creation sets, "+
+			"so it isn't served or written here below that level (§1, §G.5.2); a raise that can be made is tried again at every sync, or rebase the branch; a purge still works")
 }
 
 // upstreamRefusal is the 502 upstream of §1 for a write, other than a

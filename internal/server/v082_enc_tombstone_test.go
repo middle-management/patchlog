@@ -87,7 +87,8 @@ func TestV082TombstoneRevLast(t *testing.T) {
 
 // E2E-3 at E3 (§7.1, §E.3.1; scenario 64's tail): the tombstone's 410
 // names last for the head tombstone, at a tombstone horizon (whose parent
-// serves the snapshot) and below a later horizon.
+// serves the snapshot) and below a later horizon, where that parent is 410
+// pruned and never the old snapshot (scenario 71).
 func TestV082TombstoneRevLastE3(t *testing.T) {
 	t.Parallel()
 	e, _ := newE3Env(t)
@@ -112,6 +113,15 @@ func TestV082TombstoneRevLastE3(t *testing.T) {
 	snap2, _ := seal.SealSnapshot(k, "e#1", "e", "d", l2, map[string]any{"n": 2.0})
 	expect(t, e.prune("e", "d", map[string]any{"horizon": l2, "snapshot": snap2}, "admin"), 200)
 	v82encTombstone(t, e, "e2e tombstone below the horizon", "e", "d", tomb, p)
+	// Scenario 71: the tombstone's snapshot at P ended with that prune.
+	r := e.get("/r/e/d/rev/" + p)
+	expectCode(t, r, 410, "pruned")
+	if r.Str("horizon") != l2 || string(r.Body) == snap || isJOSE(r) {
+		t.Fatalf("/rev/{P} after the later prune: %v %s", r.H, r.Body)
+	}
+	if r := e.get("/r/e/d/rev/" + l2); r.Code != 200 || string(r.Body) != snap2 {
+		t.Fatalf("/rev/{H2}: %d %s", r.Code, r.Body)
+	}
 }
 
 // E2E-3 in a branch (§7.6): a tombstone the branch writes on a base's

@@ -410,7 +410,9 @@ func (t *tx) declaredAt(row *revRow) []ids.ID {
 
 // checkKeyring checks the keyring resource's documents in an e2e
 // namespace (§E.3.2): the keyring document, { "keys": [{ kid, to, from,
-// wrapped }] } with nothing else but a fresh $nonce (§C.7) and no two
+// wrapped }] } with nothing else but a $nonce of §C.7's form, which a
+// writer makes new on every write and the server checks for its form
+// alone, never for having been seen, and no two
 // entries for one kid and to (seal.CheckKeyringV2), whose kids name this
 // namespace and epochs not after encryption.epoch. A keyring in the format
 // before v0.63 is refused like any other document: a key holder writes
@@ -660,8 +662,8 @@ func (t *tx) kidName(b *nsRow) string {
 // recipient enc, of the given epochs, as /keys relays them (§E.2.3): the
 // entries whose to is enc's thumbprint, with from. Each entry's kid names
 // the keyring's owner, checked when it was written; for a remote branch's
-// shadow, the remote base (§G.5). Only a keyring of the §E.3.2 form with a
-// fresh $nonce, as a write checks it (seal.CheckKeyringV2), is relayed: one
+// shadow, the remote base (§G.5). Only a keyring of the §E.3.2 form, its
+// $nonce of §C.7's form as a write checks it (seal.CheckKeyringV2), is relayed: one
 // stored in the format before v0.63 relays nothing, failing closed until a
 // key holder wraps it again, and one with a $nonce written before v0.76
 // until a key holder's next keyring write, which carries a fresh one

@@ -697,10 +697,11 @@ const DefaultSealBound int64 = 1 << 32
 const DefaultSealMargin int64 = 1 << 31
 
 // ErrSealBound reports a sealing the view refuses because the key would
-// pass the message bound (§E.2.1: at E3 only clients seal under K_r, and
-// the key holder that rotates keeps each K_r within the bound). A holder
-// of a * key rotates the epoch (RotateEpoch); sealing under the new one
-// goes on.
+// pass the message bound (§E.2.1: at E3 only clients seal under K_r, so
+// each writer counts the sealings under it that it knows of, the log's
+// and its own, and seals none past the bound; the holder that rotates
+// does so before a count it knows reaches it). A holder of a * key
+// rotates the epoch (RotateEpoch); sealing under the new one goes on.
 var ErrSealBound = errors.New("client: the resource's key of this epoch has reached the message bound; rotate the epoch (§E.2.1)")
 
 // e2eSeals counts, per resource and kid, the sealings under that K_r the
@@ -832,8 +833,8 @@ type SealStatus struct {
 
 // SealStatus reads the log of ns/name since it last did and reports how
 // near the resource's K_r of the current epoch is to the message bound
-// (§E.2.1: at E3 only clients seal under K_r, and the key holder that
-// rotates keeps each within the bound). Counts the view keeps are shared
+// (§E.2.1: at E3 only clients seal under K_r, and every writer counts
+// what it knows of; the origin need not). Counts the view keeps are shared
 // by its copies; writes refuse past the bound (ErrSealBound).
 func (x *E2E) SealStatus(ctx context.Context, ns, name string) (*SealStatus, error) {
 	if err := checkRes(ns, name); err != nil {
