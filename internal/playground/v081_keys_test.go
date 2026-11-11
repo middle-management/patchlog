@@ -175,7 +175,9 @@ func TestV081PlaygroundKeysAsClientWithNode(t *testing.T) {
 		{"e3 relayed, level from /keys", kid, "", map[string]any{"level": "e2e", "epoch": 1, "keys": []any{relayed}}, kid + "=" + kb},
 		{"e3 raw key, level from /keys", kid, "", map[string]any{"level": "e2e", "epoch": 1, "keys": []any{raw(kid)}}, ""},
 		{"e2 K_r, level from /keys", sKid, "derby", map[string]any{"level": "sealed", "epoch": 1, "keys": []any{sResW.Value()}}, sKid + "/derby=" + b64.EncodeToString(sRes)},
-		{"no level anywhere", sKid, "", map[string]any{"keys": []any{raw(sKid)}}, ""},
+		// Of a namespace no level was learnt for: since v0.82 a level
+		// learnt earlier on the page, as e2's above, is kept (§7.1).
+		{"no level anywhere", seal.Kid("fresh", 1), "", map[string]any{"keys": []any{raw(seal.Kid("fresh", 1))}}, ""},
 	}
 	in, _ := json.Marshal(map[string]any{
 		"identity": ident(reader),
