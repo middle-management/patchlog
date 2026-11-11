@@ -553,24 +553,27 @@ func v82Sweep(t *testing.T, ok int, world func(t *testing.T, rt *v82NthRT) (e *e
 	t.Helper()
 	var reads int64
 	for _, c := range []struct{ status, want int }{{503, 503}, {408, 502}} {
-		for n := int64(1); ; n++ {
+		for n, done := int64(1), false; !done; n++ {
 			if n > 60 {
 				t.Fatalf("the PUT made over %d reads", n)
 			}
-			rt := &v82NthRT{n: n, status: c.status}
-			e, put := world(t, rt)
-			rt.armed.Store(true)
-			r := put()
-			rt.armed.Store(false)
-			hit, _ := rt.hit.Load().(string)
-			if hit == "" {
-				e.expect(r, ok, "the PUT with no read failing")
-				reads = n - 1
-				break
-			}
-			if r.status != c.want || c.want == 503 && r.header.Get("Retry-After") == "" {
-				t.Errorf("the core's %d on GET %s (read %d of the PUT): %d %s (Retry-After %q), want %d", c.status, hit, n, r.status, strings.TrimSpace(r.body), r.header.Get("Retry-After"), c.want)
-			}
+			// A world per read, closed before the next is built.
+			t.Run(fmt.Sprintf("%d, read %d", c.status, n), func(t *testing.T) {
+				rt := &v82NthRT{n: n, status: c.status}
+				e, put := world(t, rt)
+				rt.armed.Store(true)
+				r := put()
+				rt.armed.Store(false)
+				hit, _ := rt.hit.Load().(string)
+				if hit == "" {
+					e.expect(r, ok, "the PUT with no read failing")
+					reads, done = n-1, true
+					return
+				}
+				if r.status != c.want || c.want == 503 && r.header.Get("Retry-After") == "" {
+					t.Errorf("the core's %d on GET %s: %d %s (Retry-After %q), want %d", c.status, hit, r.status, strings.TrimSpace(r.body), r.header.Get("Retry-After"), c.want)
+				}
+			})
 		}
 	}
 	return reads
