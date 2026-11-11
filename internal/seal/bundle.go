@@ -47,6 +47,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -68,6 +69,16 @@ const bundleWrapInfo = "patchlog-bundle-v1\n"
 // writes and reads back itself, are written and read without a bound, as
 // plain bundles are.
 const MaxBundleLine = 256 << 20
+
+// MaxBundleLines is the line number no sealed bundle reaches (§E.2.1
+// Message bound, §G.5.1.1): K_b seals every line under a random IV, so a
+// bundle has lines 0 to 2³² − 2 at most. BundleWriter refuses to seal a
+// line numbered MaxBundleLines or more, and a reader rejects the whole
+// bundle at one.
+const MaxBundleLines uint64 = 1<<32 - 1
+
+// bundleLineLimit is MaxBundleLines; tests lower it.
+var bundleLineLimit = MaxBundleLines
 
 // lineBound is the bound a MaxLine-style argument stands for: 0 is
 // MaxBundleLine, a negative value is none (-1).
@@ -127,7 +138,7 @@ type BundleWriter struct {
 	buf     []byte // the incomplete line
 	pending []byte // the last complete line, canonical, not yet sealed
 	has     bool
-	n       int
+	n       uint64 // the next line number (pl.line)
 	err     error
 	closed  bool
 }
@@ -191,7 +202,7 @@ func (s *BundleWriter) Write(p []byte) (int, error) {
 
 // line takes one bundle line, without its 0x0A.
 func (s *BundleWriter) line(b []byte) error {
-	no := s.n + 1
+	no := s.fileLine()
 	if s.has {
 		no++
 	}
@@ -214,7 +225,20 @@ func (s *BundleWriter) line(b []byte) error {
 	return nil
 }
 
+// fileLine is the plain bundle's line that pl.line s.n seals.
+func (s *BundleWriter) fileLine() int {
+	if s.n >= uint64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(s.n) + 1
+}
+
 func (s *BundleWriter) emit(pt []byte, last bool) error {
+	// Before anything is sealed: K_b seals no line numbered 2³² − 1 or
+	// more (§E.2.1 Message bound, §G.5.1.1).
+	if s.n >= bundleLineLimit {
+		return &BundleError{Line: s.fileLine(), Msg: fmt.Sprintf("a sealed bundle has fewer than %d lines: no key seals 2³² values or more (§E.2.1, §G.5.1.1)", bundleLineLimit)}
+	}
 	pl := map[string]any{"bundle": s.id, "line": float64(s.n)}
 	if last {
 		pl["last"] = true
@@ -228,7 +252,7 @@ func (s *BundleWriter) emit(pt []byte, last bool) error {
 	// ciphertext as long as the plaintext.
 	size := len(protected) + 2 + b64.EncodedLen(s.aead.NonceSize()) + 1 + b64.EncodedLen(len(pt)) + 1 + b64.EncodedLen(s.aead.Overhead())
 	if max := lineBound(s.MaxLine); max >= 0 && size > max {
-		return &BundleError{Line: s.n + 1, Msg: fmt.Sprintf("sealed, the line would be %d bytes, more than the %d a reader takes (§G.5.1.1)", size, max)}
+		return &BundleError{Line: s.fileLine(), Msg: fmt.Sprintf("sealed, the line would be %d bytes, more than the %d a reader takes (§G.5.1.1)", size, max)}
 	}
 	iv := make([]byte, s.aead.NonceSize())
 	rand.Read(iv)
@@ -259,7 +283,7 @@ func (s *BundleWriter) Close() error {
 		return s.err
 	}
 	if len(s.buf) > 0 {
-		no := s.n + 1
+		no := s.fileLine()
 		if s.has {
 			no++
 		}
@@ -399,8 +423,8 @@ type bundleReader struct {
 	br   *bufio.Reader
 	aead cipher.AEAD
 	id   string
-	max  int // the longest line read, -1 for no bound
-	n    int // the next line number
+	max  int    // the longest line read, -1 for no bound
+	n    uint64 // the next line number (pl.line)
 	last bool
 	out  []byte
 	err  error
@@ -418,17 +442,25 @@ func (r *bundleReader) Read(p []byte) (int, error) {
 	return k, nil
 }
 
+// fileLine is the file's line holding pl.line r.n: the envelope is line 1.
+func (r *bundleReader) fileLine() int {
+	if r.n >= uint64(math.MaxInt-2) {
+		return math.MaxInt
+	}
+	return int(r.n) + 2
+}
+
 // next decrypts the next line; io.EOF once the last line was read and
 // nothing follows it.
 func (r *bundleReader) next() error {
 	b, rerr := readBundleLine(r.br, r.max)
 	if rerr == io.EOF {
 		if !r.last {
-			return &BundleError{Line: r.n + 2, Msg: "sealed bundle: no line says last (truncated?)"}
+			return &BundleError{Line: r.fileLine(), Msg: "sealed bundle: no line says last (truncated?)"}
 		}
 		return io.EOF
 	}
-	line := r.n + 2 // file line: the envelope is line 1
+	line := r.fileLine()
 	if rerr != nil {
 		var be *BundleError
 		if errors.As(rerr, &be) && be.Line == 0 {
@@ -484,6 +516,12 @@ func (r *bundleReader) next() error {
 	}
 	if n, ok := pl["line"].(float64); !ok || n != float64(r.n) {
 		return fail(fmt.Sprintf("line %v out of order, want %d", pl["line"], r.n))
+	}
+	// Judged on the authenticated header, and for the whole bundle (Read
+	// keeps the error): a line number never reaches 2³² − 1 (§E.2.1
+	// Message bound, §G.5.1.1).
+	if r.n >= bundleLineLimit {
+		return fail(fmt.Sprintf("line number %d reaches the bound of %d: no key seals 2³² values or more (§E.2.1)", r.n, bundleLineLimit))
 	}
 	if l, has := pl["last"]; has {
 		if l != true {
