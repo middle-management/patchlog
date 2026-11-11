@@ -10,6 +10,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -276,5 +277,216 @@ func TestV082LevelOrder(t *testing.T) {
 	wg.Wait()
 	if n.HeldLevel("e") != "e2e" {
 		t.Fatalf("after concurrent reads: %q", n.HeldLevel("e"))
+	}
+}
+
+// E2E-7 (§7.1, Levels): the level held stands on the paths that learn it
+// beside a read: Sealed refuses a lowered document; a writer that can't
+// read the document seals nothing where /keys isn't offered and e2e is
+// held; and an undo there plans no plaintext inverse.
+func TestV082LevelHeldOnWriteAndUndoPaths(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	// Sealed: a document in the clear, naming no encryption, where e2e is held.
+	st := newE3Stub(t)
+	v82NSDoc(st, nil, false)
+	c, _ := client.New(st.server().URL, client.WithExpectedLevel("e", "e2e"))
+	if s, err := c.Sealed(ctx, "e"); !errors.Is(err, client.ErrLevelLowered) {
+		t.Errorf("Sealed under a lowered document: %v %v", s, err)
+	}
+	// A writer that can't read the document, /keys not offered: nothing
+	// is sealed or planned as for a plain namespace.
+	st = newE3Stub(t)
+	st.set("/ns/e", st.json(403, map[string]any{"code": "forbidden"}))
+	st.set("/ns/e/keys", st.json(404, map[string]any{"code": "not_offered"}))
+	c, _ = client.New(st.server().URL, client.WithExpectedLevel("e", "e2e"))
+	x := c.E2EKeys(map[string][]byte{"e#1": st.ke})
+	if _, err := x.SealPatches(ctx, "e", "d", "", []any{map[string]any{"op": "add", "path": "", "value": map[string]any{}}}); !errors.Is(err, client.ErrLevelLowered) {
+		t.Errorf("SealPatches where /keys isn't offered and e2e is held: %v", err)
+	}
+	g := client.NewGesture()
+	if p, err := c.PlanUndo(ctx, "e", g); err == nil || !strings.Contains(err.Error(), "UndoE2E") {
+		t.Errorf("PlanUndo where /keys isn't offered and e2e is held: %+v %v", p, err)
+	}
+}
+
+// v82NS routes ns's namespace document, doc, in the clear.
+func v82NS(st *e3Stub, ns string, doc map[string]any) {
+	nsID := ids.Revision(nil, []byte("ns "+ns)).String()
+	st.set("/ns/"+ns, func(w http.ResponseWriter) {
+		w.Header().Set("ETag", `"`+nsID+`"`)
+		w.Header().Set("X-Config-Revision", nsID)
+		w.WriteHeader(302)
+	})
+	st.set("/ns/"+ns+"/rev/"+nsID, st.json(200, doc))
+}
+
+// v82Through is a stub of the chain e -> b -> bb, each namespace with
+// the document docs gives it (absent: e2e at epoch 1, with its base),
+// serving e/d at id as E2 delivers a document, sealed in namespace under
+// its K_r, and a client holding only that namespace's epoch key.
+func v82Through(t *testing.T, ke []byte, id, under string, docs map[string]map[string]any, opts ...client.Option) (*e3Stub, *client.Client) {
+	st := newE3Stub(t)
+	e2e := map[string]any{"level": "e2e", "epoch": 1}
+	for ns, doc := range map[string]map[string]any{
+		"e":  {"encryption": e2e, "base": map[string]any{"ns": "b", "at": id}},
+		"b":  {"encryption": e2e, "base": map[string]any{"ns": "bb", "at": id}},
+		"bb": {"encryption": e2e},
+	} {
+		if d, ok := docs[ns]; ok {
+			doc = d
+		}
+		v82NS(st, ns, doc)
+	}
+	kr := must(seal.ResourceKey(ke, under, "d"))
+	st.set("/r/e/d/rev/"+id, st.jose(must(seal.Seal(kr, under+"#1", seal.ResourcePL(under, "d", id, seal.KindDoc), []byte(`{"n":1}`)))))
+	k := client.StaticKeys()
+	k.Add(under+"#1", ke)
+	c, err := client.New(st.server().URL, append(opts, client.WithKeys(k))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st, c
+}
+
+// E2E-7 (§7.1, Levels; Addendum E Levels, Branches of a raised base;
+// §E.3.1): the walk of an e2e branch's bases reads each namespace's
+// current document and learns its level from it. One held as e2e whose
+// document now names a lower level is ErrLevelLowered, whether it is the
+// branch itself, the base the content is sealed under, or a base further
+// down the chain, and nothing is read through that chain.
+func TestV082ReadThroughBaseLevelLowered(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	id := ids.Revision(nil, []byte("x")).String()
+	ke := seal.NewKey()
+	bases := map[string]map[string]any{"e": {"ns": "b", "at": id}, "b": {"ns": "bb", "at": id}}
+	for what, lower := range map[string]map[string]any{
+		"no encryption":       nil,
+		"at-rest":             {"level": "at-rest"},
+		"sealed in the clear": {"level": "sealed", "epoch": 1},
+		"an unknown level":    {"level": "constructor"},
+	} {
+		for _, lowered := range []string{"e", "b", "bb"} {
+			doc := map[string]any{}
+			if lower != nil {
+				doc["encryption"] = lower
+			}
+			if b := bases[lowered]; b != nil {
+				doc["base"] = b
+			}
+			_, c := v82Through(t, ke, id, "b", map[string]map[string]any{lowered: doc}, client.WithExpectedLevel(lowered, "e2e"))
+			if d, err := c.Doc(ctx, "e", "d", id); !errors.Is(err, client.ErrLevelLowered) {
+				t.Errorf("%s naming %s where e2e is held: %+v %v", lowered, what, d, err)
+			}
+			if c.HeldLevel(lowered) != "e2e" {
+				t.Errorf("%s naming %s: held %q", lowered, what, c.HeldLevel(lowered))
+			}
+		}
+	}
+}
+
+// The walk reads the whole chain (Addendum E Levels; §E.3.1: readers
+// accept a base's ns for content read through; a branch of a branch reads
+// through both): content sealed in the base, or in the base's base, is
+// read; a chain that comes back to a namespace ends; a base whose
+// document can't be read ends it there, with what was learnt before it;
+// and a namespace that is no base of the chain is refused.
+func TestV082ReadThroughWalksTheChain(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	id := ids.Revision(nil, []byte("x")).String()
+	ke := seal.NewKey()
+	e2e := map[string]any{"level": "e2e", "epoch": 1}
+	for _, under := range []string{"b", "bb"} {
+		st, c := v82Through(t, ke, id, under, nil)
+		d, err := c.Doc(ctx, "e", "d", id)
+		if err != nil || d.Kid != under+"#1" {
+			t.Fatalf("content sealed in %s: %+v %v", under, d, err)
+		}
+		sameJSON(t, d.Value, map[string]any{"n": 1.0})
+		if !st.wasAsked("/ns/b") {
+			t.Fatalf("content sealed in %s: the base's document wasn't read", under)
+		}
+	}
+	// e -> b -> e: each document is read once.
+	st, c := v82Through(t, ke, id, "b", map[string]map[string]any{"b": {"encryption": e2e, "base": map[string]any{"ns": "e", "at": id}}})
+	if _, err := c.Doc(ctx, "e", "d", id); err != nil {
+		t.Fatalf("a chain that comes back: %v", err)
+	}
+	n := 0
+	st.mu.Lock()
+	for _, a := range st.asked {
+		if a == "GET /ns/e" || a == "GET /ns/b" {
+			n++
+		}
+	}
+	st.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("a chain that comes back: %d namespace heads read", n)
+	}
+	// b's document refused: b is still the base, bb unknown.
+	st, c = v82Through(t, ke, id, "b", nil)
+	st.set("/ns/b", st.json(403, map[string]any{"code": "forbidden"}))
+	if _, err := c.Doc(ctx, "e", "d", id); err != nil {
+		t.Fatalf("the base's document refused, content sealed in the base: %v", err)
+	}
+	st, c = v82Through(t, ke, id, "bb", nil)
+	st.set("/ns/b", st.json(403, map[string]any{"code": "forbidden"}))
+	if d, err := c.Doc(ctx, "e", "d", id); !errors.Is(err, seal.ErrMismatch) {
+		t.Fatalf("the base's document refused, content sealed below it: %+v %v", d, err)
+	}
+	// A base's document answering 503: the chain is unknown, not empty.
+	st, c = v82Through(t, ke, id, "bb", nil)
+	st.set("/ns/b", st.json(503, map[string]any{"code": "unavailable"}))
+	if d, err := c.Doc(ctx, "e", "d", id); err == nil || errors.Is(err, seal.ErrMismatch) {
+		t.Fatalf("the base's document 503: %+v %v", d, err)
+	}
+	// bb is no base of b where b names none.
+	_, c = v82Through(t, ke, id, "bb", map[string]map[string]any{"b": {"encryption": e2e}})
+	if d, err := c.Doc(ctx, "e", "d", id); !errors.Is(err, seal.ErrMismatch) {
+		t.Fatalf("content sealed in a namespace outside the chain: %+v %v", d, err)
+	}
+}
+
+// E2E-7 (§7.1, Levels; §11.2 Finding a gesture): a grant that can't read
+// the namespace document, where /keys refuses, learns the level from the
+// logs it reads, and a log delivered in the clear can't lower e2e where
+// it is held: the undo is ErrUndoE2ELimited, never a plaintext plan. With
+// nothing held, the same log is believed and planned.
+func TestV082UndoLogInTheClearWhereE2EHeld(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	g := client.NewGesture()
+	stub := func() *e3Stub {
+		st := newE3Stub(t)
+		st.set("/ns/e", st.json(403, map[string]any{"code": "forbidden"}))
+		st.set("/ns/e/keys", st.json(403, map[string]any{"code": "forbidden"}))
+		g0 := must(client.ExpectedRevision("", jsonv.FromGo([]any{map[string]any{"op": "add", "path": "", "value": map[string]any{"n": 1.0}}})))
+		ps := []any{map[string]any{"op": "replace", "path": "/n", "value": 2.0}}
+		h := must(client.ExpectedRevision(g0, jsonv.FromGo(ps)))
+		st.set("/r/e/d", func(w http.ResponseWriter) { w.Header().Set("ETag", `"`+h+`"`); w.WriteHeader(302) })
+		st.set("/r/e/d/rev/"+h+"/log", st.json(200, []any{
+			map[string]any{"id": g0, "parent": "", "kind": "rev", "patches": []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"n": 1.0}}}, "author": "user:w", "created": "2026-10-04T12:00:00.000Z"},
+			map[string]any{"id": h, "parent": g0, "kind": "rev", "patches": ps, "author": "user:w", "gesture": g, "created": "2026-10-04T12:00:01.000Z"},
+		}))
+		st.set("/r/e/d/rev/"+h, st.json(200, map[string]any{"n": 2.0}))
+		return st
+	}
+	st := stub()
+	c, _ := client.New(st.server().URL, client.WithExpectedLevel("e", "e2e"))
+	x := c.E2EKeys(map[string][]byte{"e#1": st.ke})
+	if p, err := c.PlanUndo(ctx, "e", g, client.UndoResources("d"), client.UndoE2E(x)); !errors.Is(err, client.ErrUndoE2ELimited) {
+		t.Errorf("PlanUndo over a log in the clear where e2e is held: %+v %v", p, err)
+	}
+	if p, err := c.PlanUndo(ctx, "e", g, client.UndoResources("d")); err == nil {
+		t.Errorf("PlanUndo without UndoE2E: a plaintext plan %+v", p)
+	}
+	// Nothing held: the log's delivery is what there is to go by.
+	st = stub()
+	c, _ = client.New(st.server().URL)
+	p, err := c.PlanUndo(ctx, "e", g, client.UndoResources("d"))
+	if err != nil || len(p.Resources) != 1 {
+		t.Fatalf("PlanUndo with nothing held: %+v %v", p, err)
 	}
 }

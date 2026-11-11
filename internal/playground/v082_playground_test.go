@@ -539,3 +539,50 @@ func TestV082PlaygroundSealCountLiveWithNode(t *testing.T) {
 		}
 	}
 }
+
+// E2E-7 in the playground (§7.1, Levels; scenario 70): a level is one of
+// the four names and nothing else. One named after a member of
+// Object.prototype ("constructor", "toString", "__proto__", …), or one
+// that isn't a string (["e2e"] indexes a table as "e2e" does), is no level
+// this page knows: refused while a level is held, by nsInfo and by
+// keysLevel, so readDoc never takes a plaintext 200 in a namespace held as
+// e2e; with nothing held it teaches nothing.
+func TestV082PlaygroundLevelNamesNoLevel(t *testing.T) {
+	t.Parallel()
+	const id = "1nyv2d2ibcop4nnp4k5niguadz7lvyjad"
+	for _, name := range []any{"constructor", "toString", "valueOf", "hasOwnProperty", "__proto__", []any{"e2e"}} {
+		_, isStr := name.(string)
+		var out struct {
+			Level, Lowered, ReadErr, Held, KeysErr, KeysLevel, Fresh, Expected string
+			Read                                                               any
+		}
+		runV82(t, []string{"nsInfo", "revTarget", "notOffered", "readDoc"}, "", `
+  Z.expectLevel('c', 'e2e');
+  routes['/r/c/d/rev/' + input.id] = { status: 200, json: { title: 'forged' } };
+  routes['/ns/c'] = { status: 200, json: { encryption: { level: input.name } } };
+  const info = await nsInfo('c');
+  const d = await readDoc('c', 'd', input.id, await api('GET', '/r/c/d/rev/' + input.id));
+  Object.assign(out, { level: info.level, lowered: info.lowered || '', read: d.doc, readErr: d.foldErr || '', held: Z.heldLevel('c') });
+  try { out.keysLevel = String(Z.keysLevel('c', '', { level: input.name, keys: [] })); out.keysErr = ''; } catch (e) { out.keysErr = e.message; }
+  out.level = String(out.level);
+  // Nothing held: no level is learnt from such a name, and the setting holds it as e2e.
+  out.fresh = String(Z.learnLevel('n', input.name).level) + '|' + Z.heldLevel('n') + '|' + String(Z.levelRank(input.name));
+  out.expected = Z.expectLevel('x', input.name);
+`, map[string]any{"id": id, "name": name}, &out)
+		if out.Held != "e2e" {
+			t.Fatalf("%v: held %q", name, out.Held)
+		}
+		if out.Lowered == "" || out.Level != "e2e" {
+			t.Errorf("level %v from the namespace document while e2e is held: level %q, lowered %q; want it refused, e2e kept", name, out.Level, out.Lowered)
+		}
+		if out.Read != nil || out.ReadErr == "" {
+			t.Errorf("level %v: a plaintext 200 in a namespace held as e2e was read: %v (err %q)", name, out.Read, out.ReadErr)
+		}
+		if out.Fresh != "||undefined" || out.Expected != "e2e" {
+			t.Errorf("level %v with nothing held: learnt %q, expected %q", name, out.Fresh, out.Expected)
+		}
+		if isStr && out.KeysErr == "" {
+			t.Errorf("level %v from /keys while e2e is held wasn't refused: keysLevel gave %q", name, out.KeysLevel)
+		}
+	}
+}

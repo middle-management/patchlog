@@ -411,7 +411,11 @@ func (c *Client) readThrough(ctx context.Context, ns, kns string) (bool, error) 
 // then unknown, not empty.
 func (c *Client) readThroughBases(ctx context.Context, ns string) (map[string]bool, error) {
 	var out map[string]bool
-	for cur, e2e := ns, true; cur != "" && !out[cur]; {
+	// seen ends a chain that names a namespace twice; out marks a base
+	// before its own document is read, so it can't be the guard.
+	seen := map[string]bool{}
+	for cur, e2e := ns, true; cur != "" && !seen[cur]; {
+		seen[cur] = true
 		h, err := c.NSHead(ctx, cur)
 		if err != nil {
 			return out, transient(err)

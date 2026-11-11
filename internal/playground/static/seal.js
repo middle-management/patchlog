@@ -773,7 +773,13 @@ async function selfTest(fx) {
  * nothing. The table is kept in localStorage under pl.levels, by the page's origin and the namespace, so it outlives
  * the page; without localStorage (Node, private mode) it lasts as long as the script. A first contact can't tell a
  * server that claims a lower level: for that there is the setting. */
-const LEVEL_RANK = { '': 0, 'at-rest': 1, sealed: 2, e2e: 3 };
+const LEVEL_RANK = Object.freeze(Object.assign(Object.create(null), { '': 0, 'at-rest': 1, sealed: 2, e2e: 3 }));
+/* levelRank is level's place in the order, undefined for anything that is no level this page knows: a string it
+ * doesn't list, such as the name of a member of Object.prototype, and whatever isn't a string (["e2e"] is no level,
+ * though it would index a table as "e2e" does). Every comparison of levels goes through it. */
+function levelRank(level) {
+  return typeof level === 'string' && Object.prototype.hasOwnProperty.call(LEVEL_RANK, level) ? LEVEL_RANK[level] : undefined;
+}
 const LEVELS_KEY = 'pl.levels';
 const levelMem = new Map();
 function levelStorage() { try { return typeof localStorage !== 'undefined' && localStorage ? localStorage : null; } catch (_) { return null; } }
@@ -793,29 +799,27 @@ function levelSet(ns, level) {
 }
 /* heldLevel is the level held for ns, '' for none. A stored value that is no level is held as e2e. */
 function heldLevel(ns) {
-  let lv = levelTable()[levelID(ns)];
+  const norm = (v) => (v === undefined || v === '' ? '' : levelRank(v) > 0 ? v : 'e2e');
   // What this page learnt stands where the store lost or refused it.
-  const mem = levelMem.get(levelID(ns));
-  if (mem !== undefined && (LEVEL_RANK[mem] || 0) > (LEVEL_RANK[lv] || 0)) lv = mem;
-  if (lv === undefined || lv === '') return '';
-  return LEVEL_RANK[lv] > 0 ? lv : 'e2e';
+  const lv = norm(levelTable()[levelID(ns)]), mem = norm(levelMem.get(levelID(ns)));
+  return levelRank(mem) > levelRank(lv) ? mem : lv;
 }
 /* learnLevel takes level, which ns's current document or /keys names, and returns { level, lowered }: the level
  * held after it, and, where level is lower than the one held (or no level this page knows while one is held), why
  * it is refused. */
 function learnLevel(ns, level) {
-  const held = heldLevel(ns), r = LEVEL_RANK[level];
-  if (r === undefined ? held !== '' : r < LEVEL_RANK[held]) {
+  const held = heldLevel(ns), r = levelRank(level);
+  if (r === undefined ? held !== '' : r < levelRank(held)) {
     return { level: held, lowered: `the server names encryption level ${JSON.stringify(level || 'none')} for ${ns}, lower than ${held}, which this browser has learnt for it: a level is never lowered, so this is refused (§7.1, Levels)` };
   }
-  if (r !== undefined && r > LEVEL_RANK[held]) levelSet(ns, level);
+  if (r !== undefined && r > levelRank(held)) levelSet(ns, level);
   return { level: r === undefined ? '' : level, lowered: '' };
 }
 /* expectLevel is the setting: ns is known to have level (at-rest, sealed or e2e). The higher of it and what is held
  * stays; a level this page doesn't know is held as e2e. */
 function expectLevel(ns, level) {
-  const want = LEVEL_RANK[level] > 0 ? level : 'e2e';
-  if (LEVEL_RANK[want] > LEVEL_RANK[heldLevel(ns)]) levelSet(ns, want);
+  const want = levelRank(level) > 0 ? level : 'e2e';
+  if (levelRank(want) > levelRank(heldLevel(ns))) levelSet(ns, want);
   return heldLevel(ns);
 }
 /* forgetLevel drops what is held for ns: the user's own act, for a development database created afresh. */
@@ -824,7 +828,7 @@ function forgetLevel(ns) { levelSet(ns, ''); levelMem.delete(levelID(ns)); }
  * unless a higher one is held for ns: then the level held. */
 function levelOver(ns, level) {
   const held = heldLevel(ns);
-  return LEVEL_RANK[held] > (LEVEL_RANK[level] || 0) ? held : level;
+  return levelRank(held) > (levelRank(level) || 0) ? held : level;
 }
 /* keysLevel is the level to read a POST /ns/{ns}/keys answer at (§E.2.3): known, the namespace's as its document
  * gave it, else the level the answer names, each held to what was learnt. The answer's level is learnt; one lower
@@ -906,7 +910,7 @@ root.PLSeal = {
   isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2ForWrite, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,
   parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,
   applyPatch, validate, selfTest,
-  LEVEL_RANK, heldLevel, learnLevel, expectLevel, forgetLevel, levelOver, keysLevel,
+  LEVEL_RANK, levelRank, heldLevel, learnLevel, expectLevel, forgetLevel, levelOver, keysLevel,
   SEAL_BOUND, SealCounter,
 };
 })(typeof window !== 'undefined' ? window : globalThis);
