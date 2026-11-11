@@ -149,16 +149,14 @@ func (im *importer) e2eEpochs(ctx context.Context, ns string) (lo, hi int, probl
 					"only a client holding both sets of keys carries it over, as a merge with new ids (§G.5.1, Addendum E Levels)", ns, l.ID, d.name))
 				continue
 			}
-			h, err := seal.ParseHeader(jwe)
+			kid, plNS, e, own, err := sealedOpFor(ns, jwe)
 			if err != nil {
 				problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s: %v", ns, l.ID, d.name, err))
 				continue
 			}
-			kns, e, kerr := seal.ParseKid(h.Kid)
-			plNS, _ := h.PL["ns"].(string)
-			if kerr != nil || kns != ns || plNS != ns {
+			if !own {
 				problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s is sealed under kid %q with pl.ns %q, not for %s, as a line a branch reads through from its base is: "+
-					"only a client holding both sets of keys carries it over, as a merge with new ids (§G.5.1)", ns, l.ID, d.name, h.Kid, plNS, ns))
+					"only a client holding both sets of keys carries it over, as a merge with new ids (§G.5.1)", ns, l.ID, d.name, kid, plNS, ns))
 				continue
 			}
 			note(e)
@@ -169,6 +167,23 @@ func (im *importer) e2eEpochs(ctx context.Context, ns string) (lo, hi int, probl
 		lo, hi = 1, 1
 	}
 	return lo, hi, problems, nil
+}
+
+// sealedOpFor reads the header of jwe, the one sealed op of a rev line of
+// e2e namespace ns, and reports whether it is the namespace's own: its
+// pl.ns and its kid both name ns (§G.5.1 step 1, §E.3.1). One that isn't
+// is history of another namespace, as a branch reads through from its
+// base: the importer refuses a bundle that carries it, and the exporter
+// writes no such line (foreignE2ELine). epoch is the kid's. err is a
+// header that doesn't parse.
+func sealedOpFor(ns, jwe string) (kid, plNS string, epoch int, own bool, err error) {
+	h, err := seal.ParseHeader(jwe)
+	if err != nil {
+		return "", "", 0, false, err
+	}
+	kns, e, kerr := seal.ParseKid(h.Kid)
+	plNS, _ = h.PL["ns"].(string)
+	return h.Kid, plNS, e, kerr == nil && kns == ns && plNS == ns, nil
 }
 
 // e2eRestoresRequires reports whether an incremental document's first

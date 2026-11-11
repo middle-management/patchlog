@@ -5,6 +5,7 @@ import (
 	"crypto/ecdh"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sig"
 )
 
@@ -294,4 +296,164 @@ func TestV082ExportLeavesDisagreeingGrantOff(t *testing.T) {
 	if _, err := bundle.Verify(bytes.NewReader(buf.Bytes())); err != nil {
 		t.Fatalf("the exported bundle: %v", err)
 	}
+}
+
+// v82E2EBranch is an e2e namespace m with derby (two revisions) and cup,
+// and its e2e branch m-r7, with its own keyring and one revision of its
+// own on derby; cup is read through. It returns the base's head of derby,
+// the foreign parent, and derby's first revision.
+func v82E2EBranch(t *testing.T) (src *deployment, x *client.E2E, first, parent string) {
+	t.Helper()
+	src = newEncDeployment(t, stagingOrigin)
+	x = src.c.E2E(identity(t))
+	src.ns("m", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
+	must(x.InitKeyring(ctx, "m"))
+	first = must(x.CreateDocSealed(ctx, "m", "derby", map[string]any{"title": "Derby", "score": "0-0"})).ID
+	parent = must(x.AppendSealed(ctx, "m", "derby", first, ops(op("replace", "/score", "1-0")))).ID
+	must(x.CreateDocSealed(ctx, "m", "cup", map[string]any{"title": "Cup", "note": marker}))
+	must(src.c.CreateBranch(ctx, "m", client.BranchRequest{Name: "m-r7"}))
+	must(x.InitKeyring(ctx, "m-r7"))
+	must(x.AppendSealed(ctx, "m-r7", "derby", parent, ops(op("replace", "/score", "2-0"))))
+	return src, x, first, parent
+}
+
+// v82SealedFor lists, per document of bundle b other than a keyring, the
+// pl.ns of each rev line's sealed op.
+func v82SealedFor(t *testing.T, b []byte) map[string][]string {
+	t.Helper()
+	out := map[string][]string{}
+	for _, l := range lines(b)[1:] {
+		m := jsonv.MustParse(l).(map[string]any)
+		name, _ := m["resource"].(string)
+		if m["kind"] != "rev" || name == "keyring" {
+			continue
+		}
+		k := bundle.Key(m["ns"].(string), name)
+		jwe, ok := seal.SealedJWE(m["patches"])
+		if !ok {
+			out[k] = append(out[k], "")
+			continue
+		}
+		ns, _ := must(seal.ParseHeader(jwe)).PL["ns"].(string)
+		out[k] = append(out[k], ns)
+	}
+	return out
+}
+
+// BT-3 (§G.5.1 Importing, FED-22; encryption scenario 19): a full-history
+// export of an e2e branch writes no line the branch reads through from
+// its base, asked for foreign parents or not: a document continued in the
+// branch names its foreign parent in requires, one the branch never wrote
+// is external, pinned, and the keyring comes whole. The bundle imports
+// into a same-named e2e branch of a target that holds the base. A
+// requires before the foreign parent refuses the document.
+func TestV082ExportE2EBranchNoReadThroughLines(t *testing.T) {
+	t.Parallel()
+	src, _, first, parent := v82E2EBranch(t)
+	head := src.head("m-r7", "derby").ID
+	cup := src.head("m-r7", "cup").ID
+
+	var buf bytes.Buffer
+	plan, sum, err := bundle.Export(ctx, src.c, &buf, bundle.ExportOptions{Select: []string{"m-r7"}})
+	noErr(t, err)
+	h := sum.Header
+	if h.Access["m-r7"] != bundle.AccessE2E {
+		t.Fatalf("access %v", h.Access)
+	}
+	if got := h.Requires["m-r7/derby"]; got != parent {
+		t.Fatalf("requires of derby %q, want the foreign parent %s", got, parent)
+	}
+	if _, bundled := h.Docs["m-r7/cup"]; bundled || len(plan.External) != 1 || plan.External[0] != "m-r7/cup/rev/"+cup {
+		t.Fatalf("cup, read through: docs %v, external %v", h.Docs, plan.External)
+	}
+	for k, nss := range v82SealedFor(t, buf.Bytes()) {
+		for _, ns := range nss {
+			if ns != "m-r7" {
+				t.Fatalf("%s carries a line sealed for %q, read through from the base", k, ns)
+			}
+		}
+	}
+	if got := v82SealedFor(t, buf.Bytes())["m-r7/derby"]; len(got) != 1 {
+		t.Fatalf("derby's lines: %v, want the branch's one", got)
+	}
+	if bytes.Contains(buf.Bytes(), []byte(first)) {
+		t.Fatalf("the bundle names %s, a line of the base", first)
+	}
+	// The branch's keyring comes along, whole (§E.3.2, §G.5).
+	if d, ok := h.Docs["m-r7/keyring"]; !ok || d.History != bundle.Full || d.Head != src.head("m-r7", "keyring").ID || h.Requires["m-r7/keyring"] != "" {
+		t.Fatalf("the branch's keyring: %v, requires %v", h.Docs, h.Requires)
+	}
+	if _, err := bundle.Verify(bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+
+	// Asking for foreign parents gives the same documents.
+	_, fsum, err := bundle.Export(ctx, src.c, io.Discard, bundle.ExportOptions{Select: []string{"m-r7/derby"}, ForeignParents: true})
+	noErr(t, err)
+	if fsum.Header.Requires["m-r7/derby"] != parent {
+		t.Fatalf("with ForeignParents: requires %v", fsum.Header.Requires)
+	}
+
+	// A requires before the foreign parent would export the base's second
+	// revision under the branch's name: refused, nothing written.
+	var out bytes.Buffer
+	_, _, err = bundle.Export(ctx, src.c, &out, bundle.ExportOptions{Select: []string{"m-r7/derby"}, Requires: map[string]string{"m-r7/derby": first}})
+	if err == nil || !strings.Contains(err.Error(), "foreign parent "+parent) || !strings.Contains(err.Error(), "§G.5.1") {
+		t.Fatalf("export with requires before the foreign parent: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("the refused export wrote %d bytes", out.Len())
+	}
+
+	// The target holds the base (imported verbatim, same name) and a
+	// same-named e2e branch of it: the branch's bundle goes in.
+	var base bytes.Buffer
+	_, _, err = bundle.Export(ctx, src.c, &base, bundle.ExportOptions{Select: []string{"m"}})
+	noErr(t, err)
+	dst := newEncDeployment(t, cmsOrigin)
+	importB(t, dst, base.Bytes(), bundle.ImportOptions{CreateNamespaces: true})
+	must(dst.c.CreateBranch(ctx, "m", client.BranchRequest{Name: "m-r7"}))
+	if got := dst.head("m-r7", "derby").ID; got != parent {
+		t.Fatalf("the target's branch reads derby at %s, want the base's %s", got, parent)
+	}
+	importB(t, dst, buf.Bytes(), bundle.ImportOptions{})
+	if got := dst.head("m-r7", "derby").ID; got != head {
+		t.Fatalf("the imported branch's derby is at %s, want %s", got, head)
+	}
+	if got := dst.head("m-r7", "keyring").ID; got != src.head("m-r7", "keyring").ID {
+		t.Fatalf("the imported branch's keyring is at %s", got)
+	}
+	if got := dst.head("m", "derby").ID; got != parent {
+		t.Fatalf("the import moved the base's derby to %s", got)
+	}
+}
+
+// Scenario 19 (encryption), the importer's half, kept: a bundle that
+// carries an e2e branch's read-through lines anyway, bound to the base's
+// pl.ns, is refused at step 1 by a same-named e2e target; nothing is
+// written. A Writer writes it: only the exporter and the importer know
+// what an e2e line is.
+func TestV082ImportRefusesReadThroughE2ELines(t *testing.T) {
+	t.Parallel()
+	src, _, _, _ := v82E2EBranch(t)
+	head := src.head("m-r7", "derby")
+	entries := must(src.c.Log(ctx, "m-r7", "derby", head.ID, ""))
+	if len(entries) != 3 {
+		t.Fatalf("the branch's chain of derby: %d entries", len(entries))
+	}
+	var buf bytes.Buffer
+	w := must(bundle.NewWriter(&buf, bundle.Header{Origin: stagingOrigin, Created: "2026-10-04T12:00:00Z",
+		At:     map[string]string{"m-r7": must(src.c.NSHead(ctx, "m-r7")).ID},
+		Docs:   map[string]bundle.DocInfo{"m-r7/derby": {History: bundle.Full, Head: head.ID}},
+		Access: map[string]string{"m-r7": bundle.AccessE2E}}))
+	for _, e := range entries {
+		noErr(t, w.Line(bundle.HistoryLine("m-r7", "derby", e, false)))
+	}
+	must(w.Close())
+	if got := v82SealedFor(t, buf.Bytes())["m-r7/derby"]; len(got) != 3 || got[0] != "m" || got[2] != "m-r7" {
+		t.Fatalf("the hand-built bundle's lines are sealed for %v", got)
+	}
+	dst := newEncDeployment(t, cmsOrigin)
+	importErr(t, dst, buf.Bytes(), bundle.ImportOptions{}, "as a line a branch reads through from its base is")
+	v82NothingWritten(t, dst, "the read-through bundle", "m-r7")
 }
