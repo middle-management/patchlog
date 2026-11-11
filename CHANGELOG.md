@@ -1,5 +1,334 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.82** (previously **v0.81**). v0.82 answers the reference's 77 notes on
+v0.81, most with a clause each, and takes its confirmed candidate vectors into Addendum I. The
+rule changes are: a namespace event has its own `pl`, `{ ns, event }`; a tombstone's `/rev`
+names its parent in `last`; a service seals nothing from a revision whose epoch it hasn't
+judged, and seals a release preview under the branch's keys; the message bound covers a sealed
+bundle's key; a cookie ends on any change to its key's entry; a trusted catalog that is a
+remote branch makes nothing visible; and `ancestors` answers `paths`, `tooDeep` and
+`truncated`. `GET /` answers `"spec": "0.82"`. The upgrade was done in six packages: sealed
+forms, end-to-end reads and levels in the core, the client and the playground; access at the
+origin; the tree and catalog services with derived views and the grant checker; bundles,
+archives, merges and the WebDAV gateway; the index; and the vectors with cross-package tests.
+Each package was reviewed and fixed, and a cross-review of the merged branch then fixed two
+seams between the tree service and the playground. The schema changes are the core's
+migrations `017_filtered_gs_entry` and `018_filtered_gs_entry_after`, on SQLite and Postgres,
+the index's `011_edge_gs_keys_entry`, the tree service's `006_v082_rejudge` and the
+derived-view cache's `003_v082_drop_sealed_views` (SQLite, the cache of the tree service and
+the index). The catalog service's database and the services' own edge-grant tables have no
+migration. Where the spec leaves a question open, the reference implements the reading noted
+here and in [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) ("Open from v0.82").
+
+**Upgrading.** Do these in order. An upgrade from before v0.27.0 does v0.27.0's steps as well.
+
+1. **Before upgrading, namespaces raised to end-to-end by an earlier draft** are handled as in
+   v0.27.0 (its Upgrading 1): the server refuses to start on a database holding one, or a
+   remote branch of such a source, and `patchlog serve -purge-raised-e2e` purges them. v0.82
+   now says a deployment may refuse or discard such data ("Reading this spec"). The check runs
+   before every migration and cleanup of this release.
+2. **Before upgrading, have identity grants allow `read` in the catalog namespace** where they
+   are presented to a catalog service (a tree-derived catalog, the WebDAV gateway in gateway
+   mode). The catalog service now answers `403` at `POST /read-grants`, and to any `want` at
+   `POST /grants` that lists `read`, for a caller's grant that allows `read` nowhere it
+   verifies in, which the reference judges in the catalog namespace (SERVICES §B.11.4 The
+   caller's grant).
+   - A grant with `can: []` is such a grant. Its user gets no read grants: through the gateway
+     that user's files disappear from listings and `GET` and `COPY` answer `403`.
+   - Have the identity provider issue grants whose `can`, or a role that counts for `read`,
+     allows `read` in the catalog namespace. To keep such a grant from reading any node
+     document there, scope the key or the grant with a rule that fixes `/resource` to a name no
+     node has.
+   - The same `403` goes to a grant with a block or key-scope rule on `/now`, whatever it
+     wants, as in v0.27.0.
+3. **Upgrade the origin, the services, the gateway and the playground together.** Three wire
+   forms change, and mixed versions behave like this meanwhile:
+   - A follower on SSE (`patchlog tree` or `patchlog index` started with SSE) against an origin
+     of the other version fails on every sealed namespace event, since these moved to
+     `pl { ns, event }`, and retries with backoff until both are upgraded. Long-poll followers,
+     the default, are unaffected.
+   - The `ancestors` answer changed shape. A v0.27.0 gateway against a v0.82 tree service
+     answers `502` instead of judging a folder copy. The v0.82 gateway reads both shapes.
+   - A v0.82 remote branch of a v0.27.0 source behaves as before (the source's tombstone `410`
+     has no `last`). A v0.27.0 remote branch of a v0.82 source ignores `last`.
+4. **At upgrade, migrations run.**
+   - Core `017_filtered_gs_entry` and `018_filtered_gs_entry_after` add `entry` and
+     `entry_after` to `filtered_gs` (5 below).
+   - Index `011_edge_gs_keys_entry` drops and re-creates `edge_gs_keys` with an `entry` column
+     and one row set per cookie (5 below).
+   - Tree `006_v082_rejudge` resets every node's `born` epoch and has the epochs read in again
+     (7 below).
+   - Derived `003_v082_drop_sealed_views` deletes the stored sealed views of the tree service
+     and the index. They are sealed again on demand, with canonical plaintexts and judged
+     epochs, so a view at an unchanged `…/at/{at}/…` URL gets new bytes once.
+   - At start the origin also deletes E3 snapshots stored away from their resource's
+     horizon (an archive was restored, then a prune made at a lower revision), and for a
+     resource with no horizon and several snapshots all of them, and logs the count. Their
+     `/rev` then answers `404 not_offered` or `410 pruned` and readers fold from the log.
+5. **Expect every `gs` cookie of the origin and every cookie of the index to be `403` until its
+   reader exchanges the grant again.** The rows recorded before the upgrade name no key entry
+   and vouch for nothing. At the origin a cookie from the new exchange can still be `403` when
+   it expires no later than the last cookie issued for that `gs` before the upgrade, or before
+   a later change to the key's entry: one from the same second, or from a grant that ends by
+   then. That lasts at most a cookie's lifetime (15 minutes); the grant in `Authorization`
+   reads meanwhile, and an exchange under a grant that lasts longer gets a cookie that holds.
+6. **At upgrade, purge the CDN once,** as for v0.27.0, and for three more reasons: a
+   tombstone's `/rev` body gains `last` under an unchanged immutable `ETag "{id}"`; tree
+   listings at immutable `at` URLs change shape for `ancestors`, `where` and `subtree`; and
+   sealed views are sealed again. Purge `ns:{ns}` for every namespace, or everything. Private
+   caches can't be purged: a v0.82 client that meets a cached `410` without `last` falls back
+   to the log, and a remote branch's creation that meets one answers `410 pruned`, as v0.27.0
+   did.
+7. **Expect sealed and end-to-end catalogs to list some nodes by name only for a while.** Until
+   the tree service has read a node's epochs in again, the node is served without title and
+   `born`, and its file metadata is `{"absent":"pending"}`. A release preview does more: its
+   database held, for heads read through from the base, epoch numbers that were the base's, so
+   at start it drops every node's epoch and `born` epoch and its stored listings and judges
+   them again under the branch's keys. A head the tree service can't read for good stays by
+   name only.
+8. **After upgrading, rotate each sealed (E2) namespace whose current epoch began before the
+   v0.27.0 upgrade.** v0.27.0 seeded `seal_counts` from what was stored, which can't include
+   sealings an earlier draft made and never stored (events, race losers), so the count of such
+   an epoch may fall short of v0.82's "never under" (§E.2.1). New epochs are counted in full.
+9. **Rebase remote branches whose source was raised to e2e after their `at`** (a source on an
+   earlier draft). Such a branch served the content its source had at `at` sealed; it now
+   answers `502 upstream` for it, for good (CONFORMANCE scenario 74). The change comes with
+   the upgrade and purges no tag: purge `ns:{branch}` at the CDN and rebase the branch.
+10. **Set `-expect-level ns=e2e`** (`client.WithExpectedLevel`) on tools and services for
+    namespaces known to be end-to-end. The client keeps the highest level it has learnt only in
+    memory, so on a first contact it can't detect a server or cache that claims a lower level
+    (CLI, below).
+11. **Files written before:**
+    - A prune archive of an e2e namespace written before v0.82 has no `access` in its header.
+      It reads as private content, and the importer refuses its sealed ops at step 1, so it
+      can be restored but not imported.
+    - A bundle exported from an e2e branch by v0.27.0 carries read-through lines, which every
+      importer refused. Export it again.
+    - An archive or bundle whose grant line disagrees with its `root` is rejected whole. The
+      reference never wrote one.
+
+**Security fixes:**
+- **Tree service: a release preview is sealed under the branch's keys** (SERVICES §E.2.6
+  Per-entry sealing, §B.5 Previews). v0.27.0 sealed a preview's listings under the base
+  catalog's keys, with the base's epochs, so they opened for holders of the base's keys rather
+  than the branch's, and a rotation of the branch cut no reader off. `kid` and `pl.ns` now
+  name the branch, read-through entries included, and `view` keeps the URL as served. Stored
+  epochs are judged again (Upgrading 7).
+- **Origin and index: a cookie ends on any change to the entry of the key that verified its
+  grant, or to the definition of a role it read through** (SERVICES §B.11.9 `gs`, §A.4 `gs`).
+  In v0.27.0 an origin `gs` cookie ended only on a changed rule or `pub` or on losing `read`,
+  so narrowing a key's `sub`, `groups`, `attrs`, `maxTtl`, `requireAt` or `can` left cookies
+  reading until they expired; and the index never checked a `reads:{ns}` cookie, which read
+  the namespace whole until it expired. Such a cookie is now
+  `403`, and no other reader's exchange makes the origin or the index serve it again: the
+  origin refuses a cookie that expires no later than the last one issued before the change,
+  and the index records a cookie's keys once and gives a later exchange with other keys or
+  entries another `exp`.
+- **WebDAV gateway: a save whose reads fail writes nothing** (TOOLS §H.4 The base, §H.6). In
+  v0.27.0 a failed read of the key history, of the user's identity or of the logs a save
+  decides by counted someone else's entry as the user's own, so a save during a core outage
+  could overwrite another user's write, or restore over another user's delete. Such a read now
+  fails the save (`503` or `502`, below).
+- **Tree service: a listing computed for one reader across a purge is not served** (SERVICES
+  §A.1, §B.5). v0.27.0 guarded kept listings only: a listing that isn't kept (a reader's
+  `problems` or `orphans`) computed from rows read before a purge was served once. It is now
+  computed again, up to three times, then `503 behind`.
+- **Client and playground: the highest encryption level learnt is kept, and plaintext under it
+  is refused** (§7.1 End-to-end namespaces, Addendum E Levels). Before, both took the level
+  from the namespace document or `/keys` as served, so a server or a cache that claimed a
+  lower level could have a document served in the clear accepted. The Go client now holds the
+  level per namespace in memory and the playground in `localStorage`; a lower claim is refused
+  (`client.ErrLevelLowered`), and so is a plaintext `200` in a namespace held as e2e. The
+  review of this work found that the playground's first level table took a level named after
+  an `Object.prototype` member (`"constructor"`, `"__proto__"`) or a non-string (`["e2e"]`) as
+  no lowering and then read a plaintext `200`; that was fixed before any release, and a level
+  is now one of `none`, `at-rest`, `sealed` and `e2e` or it is refused.
+- **Catalog service: a namespace the service stopped following reads public to no one**
+  (SERVICES §B.5 Behind). The service judged `"public": true` at `POST /read-grants` from the
+  document it had stopped at, so a public namespace made private by the write that stopped
+  the service still read as public, as in v0.27.0. Its roles now count for no folder's
+  visibility either.
+
+**Sealed forms and the message bound** (§E.2.1, §E.2.2, §7.3, §G.5.1.1):
+- A sealed namespace event is sealed under `K_n` with `pl { ns, event: id }`
+  (`seal.NamespaceEventPL`), at each serve and never stored; every serve counts against the
+  bound. Clients refuse the v0.81 range form with no fallback, and a range reader refuses an
+  event's JWE. A resource stream's `purge` and `prune` events keep `pl { ns, name, kind }`.
+- Sealed bundles: the writer refuses, and a reader rejects whole, a line numbered 2³² − 1 or
+  more, so `K_b` stays under the bound.
+- Derived views: every sealed plaintext is canonical JSON, in the tree service and the index
+  (SERVICES §E.2.6 What gets sealed).
+- Already as v0.82 fixes them, now pinned by tests: a stored count never falls below the
+  sealings made; the origin's own rotation entries carry no `grant` and no `via`, with
+  authentication disabled too, and a frozen namespace is rotated; a keyring's `$nonce` is new
+  on every write.
+
+**End-to-end reads and remote branches** (§7.1, §E.3.1, §G.3, §G.5.2):
+- `GET` and `HEAD /r/{ns}/{name}/rev/{T}` of a tombstone answer `410` with
+  `{ "code": "gone", "tombstone", "last" }`, `last` its parent, at every level and below a
+  horizon, after the read check. `ETag` and cache class are unchanged (Upgrading 6). The
+  `/raw` form in sealed and end-to-end namespaces stays `404 not_offered`.
+- `PruneE2E` takes a tombstone horizon's parent from that `410` and refuses a `last` that
+  isn't the parent; against a server or cache without `last` it finds the parent in the log as
+  before.
+- A stored E3 snapshot is served until a purge or a later prune that moves the horizon, to a
+  lower revision too. v0.27.0 kept serving a tombstone snapshot at its parent after the
+  horizon had moved.
+- A remote branch of an E3 source pruned at a tombstone that is the resource's head at `at`
+  can now be created: B learns the parent from A's `410` and mirrors the snapshot. A `last`,
+  `pl.id` or `kid` that doesn't fit is `502`. Creation was `410 pruned`.
+- A remote branch whose source is raised to e2e after `at` answers `502 upstream` for
+  everything the source had at `at`, though the branch itself follows to sealed (Upgrading 9).
+- Go client: the walk of an e2e branch's bases follows the whole local chain, so content
+  sealed in a base's base is read through; it stopped at the first base.
+
+**Access at the origin** (§C.4, §2.1, SERVICES §B.11.9):
+- A `gs` cookie ends on any change to its key's entry or a read role's definition (Security
+  fixes). Long-poll and events judge it at the current checkpoint. A cookie for `/ns/{ns}`
+  read at a `gs` URL is held to the same.
+- A trusted catalog that is a remote branch keeps a namespace covered and makes nothing
+  visible: a partial reader gets filtered `/heads` with no rows, a log with config and
+  `purge-ns` entries only, and a gestures listing without hidden resources. It got `403`
+  before (scenario 119).
+- A purged covered namespace: a partial reader's unfiltered `/heads` is `410` directly, with
+  no `302`; at its filtered `/heads` an unrestricted reader's grant is `403`, as at a live
+  namespace's, where it was `410` (scenario 124).
+- A key's `requireAt` refusal is `403` with the one text `at rejected by requireAt`, whether
+  the namespace doesn't exist, `at` isn't in its chain, is beyond `maxLag`, names another
+  namespace or is malformed. It named the namespace before.
+- Grant verification checks a key's `sub` scope before `maxTtl` (§C.2 item 3).
+- Unrestricted `read` leaves out roles with a rule on `/now` at its source (§2.1); no
+  behaviour changes.
+- Already as v0.82 fixes them, now pinned by tests: a public namespace ignores any grant,
+  `POST /keys` excepted; a malformed `{gs}` or `{at}` is `400 bad_input` before
+  authentication; an `Authorization` field that isn't `Bearer` is a malformed grant (`401`).
+
+**Services** (SERVICES §A.1, §A.4, §B.5, §B.11.2, §B.11.4, §B.11.9, §E.2.6):
+- Tree service: `ancestors` and `where` answer `paths` as arrays of node names from a root
+  down to the node itself, with each node's `href` and `title` (or `sealed`) in a top-level
+  `nodes` map keyed by name; `tooDeep` and `truncated` are top-level booleans, on `subtree`
+  too (§B.5 Shared nodes in DAGs).
+- Tree service: nothing is sealed from a revision whose epoch isn't judged. Such a node is
+  listed by name only until its head is read again, and a head read without a `kid` is read
+  again rather than judged as the epoch in force (§E.2.6 Per-entry sealing). While a
+  database's epochs were still being read in, v0.27.0 sealed such values under the current
+  epoch. In an e2e catalog a head the service can't read for good is never judged.
+- Tree service: a preview service that lacks the branch's keys answers `404`, as for any
+  catalog whose keys it lacks.
+- Tree service: at `POST /edge-grants` an unreadable `requireAt` chain is `503` only if every
+  cause is transient, else `502`; a rejected `at` is `403`, naming no namespace (§C.5.2,
+  §C.4).
+- Tree and catalog services: a namespace the service stopped following counts for no folder's
+  visibility, so filtered listings may lose folders visible only through such a namespace's
+  role (§B.5 Behind).
+- Catalog service: `POST /grants` and `POST /read-grants` answer `401`, then request-shape
+  `400`s, then the `403` (`no-store`) for the caller's own grant, before the `?min` wait and
+  any `404`, `409`, `410` or `503` (§B.11.4 The caller's grant; Upgrading 2).
+- Catalog service: a read `want` keeps no content role that has a rule on `/now` or on the
+  whole envelope; with none kept the answer is `403`, and a mixed want keeps its other verbs
+  (§B.11.2).
+- Catalog service: a `502 upstream` says what the service couldn't read and no longer relays
+  the origin's error text, which is logged.
+- Index: cookies are recorded per key set. Readers through different keys, or through one key
+  before and after its entry changes, don't share a cookie, and a change to one key ends only
+  the cookies minted through it. A cookie's `exp` may be a few seconds earlier than the
+  grant's `exp` or the edge TTL would give; where no second is left before the grant expires,
+  `POST /edge-grants` answers `503 behind` with `Retry-After`.
+- Index: on a purged namespace a cookie that had ended, or was minted before this release, is
+  `403` instead of `410` with the purge's head (§8.5).
+- Index: a trusted catalog that is a remote branch counts for coverage and makes nothing
+  visible: a partial reader gets `200` with no hits instead of `403`.
+- Index: started after a trusted catalog was purged, it marks the catalog purged, so the
+  namespace is covered and dark. Before, a partial reader got `502` for good and the
+  catalog's follower restarted in a loop, in v0.27.0 too.
+- Index exchange: with several unreadable `requireAt` chains or namespace documents the
+  answer is `502` if any failure is lasting and `503` only if all are transient, whatever the
+  order of the grants; and `404 not_offered` follows what the origin's `GET /` says now, not
+  what it said at the first exchange (§B.11.9 Where).
+- Index: nothing is sealed from a revision whose epoch isn't judged; a result that met one is
+  computed again, or `503 behind`.
+- Already as v0.82 fixes them, now pinned by tests: a grant at an all-public listing of the
+  tree service, or at a public query of the index, gets the anonymous answer, while a public
+  catalog whose listing isn't all public still answers a grant with a rule on `/now` `403`;
+  the authentication mode is never taken from an
+  earlier read that has since failed; a branch of a branch of a covered namespace gets no
+  marker.
+
+**Bundles, archives and the gateway** (§G.4.1, §G.5.1, §8.6, TOOLS §G.4.2, §H.4, §H.5):
+- Bundles: a reader and a writer reject a bundle whose grant line's `grant` isn't the id of
+  its `root`, or whose `stored` block doesn't decode or doesn't carry `canonical(root)`; no
+  key or signature is needed. The exporter leaves such a grant off, with a note.
+- Export: an `e2e` branch is exported from after its foreign parent. `requires` names the
+  base's head, documents the branch never wrote are pinned in `external`, and the keyring
+  comes whole. No read-through line is written. A `requires` before the foreign parent, or an
+  `e2e` branch of a remote base whose document doesn't start with the branch's own line,
+  refuses that document.
+- Import: a pinned `external` is looked up in the target's chain where reading its revision
+  can't answer: in an `e2e` target, which serves no document by revision, and for a pinned
+  tombstone (`410 gone`) at any level. So an `e2e` branch's bundle imports into a same-named
+  branch of a target holding the base, a base with a deleted resource included. A purged
+  resource is still refused.
+- Import: a bundle with a `sealed` op in a namespace its header doesn't call `e2e` is refused
+  at step 1, override or not (Upgrading 11).
+- Prune archives carry `access` in their header: `e2e`, else `sealed`, else `public` or
+  `private` by `read`. Restore ignores it.
+- Gateway saves: a failed read of anything a `PUT` decides by fails the save: `503` with
+  `Retry-After` after the core's `429` or `503`, and `502` after its `408` or another `5xx`
+  (v0.27.0 gave `503` for `408` and `502` for `503`). That covers the key history, the logs,
+  the head of a new file's placement node, the reads of a restore by write, and `GET
+  /ns/{ns}/principal` and the namespace document of every namespace the request asked about.
+  A gateway-side timeout stays `503` with `Retry-After`. Requests other than saves answer as
+  in v0.27.0.
+- Gateway copies: a folder copy is judged from the tree service's `ancestors` in the v0.82
+  shape and in v0.27.0's. A reported cut, missing `paths`, a path that doesn't end at the node
+  or an unreadable shape is `403`, never `502`.
+- Known limit: a flat `PUT` still falls back to tree settings learned with another grant when
+  the catalog's settings can't be read for the moment, and fails only when none were learned.
+- Already as v0.82 fixes them, now pinned by tests: a bundle member §G.4.1 doesn't define is
+  rejected; a release branch grant fixed to base resources reads nothing else through the
+  branch (TOOLS §F.8); a give-up is recorded nowhere and a later replay may take the rest
+  (TOOLS §F.5, §F.6).
+
+**Client and playground** (§7.1, §E.2.1, §E.3.1, SERVICES §B.5, §E.2.6):
+- Go client: levels (Security fixes). Only the current namespace document and `/keys` teach a
+  level; an unknown level string from a server while a level is held counts as lowered.
+  `ErrLevelLowered` also comes from a base on an e2e branch's chain whose document names a
+  lower level than the client holds. New: `client.WithExpectedLevel`, `client.ErrLevelLowered`,
+  `APIError.Tombstone`.
+- Playground: keeps levels per origin and namespace, with controls to expect and to forget
+  one; counts sealings per resource key at E3 from the log and its own writes and refuses past
+  2³²; reads the new `ancestors` and `where` shape.
+- Playground: in a sealed or end-to-end catalog it opens each entry of the `nodes` map under
+  the key of the node its map key names and compares `pl.name` with it; an entry that carries
+  another node's value isn't opened. It refuses a nested sealed value drawn from another
+  resource than its entry names. Where a listing entry of a release preview names a `branch`,
+  a value drawn from its item must be that branch's resource, never the base's.
+
+**Test vectors** (Addendum I, `docs/TESTVECTORS.md`, `docs/VECTORS-PROPOSED.md`):
+- The candidates the reference confirmed for v0.81, P.1–P.7, are now Addendum I
+  §I.15–§I.21: plan digests, file renderings, sealed bundles, hostnames, sealed entries,
+  documents and ranges, `via` lines and failing Biscuit tokens. They are checked against the
+  values printed in `docs/SPEC.md` (`TestI15PlanDigests` … `TestI21BiscuitRefusals`); no value
+  changed.
+- The v0.82 candidates C.1–C.3 are all confirmed byte for byte through production code: C.1,
+  the resource `purge` and `prune` events and the namespace event under `{ event, ns }`; C.2,
+  the view string, both view keys, both JWEs and both padded tags, with the four altered
+  `pl.view` forms rejected; C.3, three bundle rejections. Two remarks go to the spec writer:
+  C.1's closing sentence says the resource events' `pl` is no longer accepted, against its own
+  table and §E.2.2, and C.2 seals a whole response at a `gs` where §E.2.6 seals per entry.
+- New cross-package tests cover sealed events over SSE to the tree service and the index, the
+  gateway's folder copy over the real `ancestors` answer, scenario 119 at an origin and an
+  index together, and a tombstone horizon pruned, mirrored by a remote branch and read back.
+
+**CLI:**
+- `-expect-level ns=level` (`at-rest`, `sealed` or `e2e`; repeatable) on `patchlog index`,
+  `tree`, `merge`, `rebase`, `janitor`, `release` and `e2e`, beside `-keyring-sender`: the
+  tool holds that level for the namespace from its first request, so a server or cache that
+  claims a lower one is refused, and with `e2e` a document served in the clear is too. A value
+  that isn't `ns=level` is an error.
+
 ## v0.27.0
 
 Implements spec **v0.81** (previously **v0.77**). v0.78 cut four features and the special cases
