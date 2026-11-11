@@ -238,7 +238,11 @@ type gsRecord struct {
 // from the same second as the last one before the change, and for one
 // whose grant ends by then: its reader reads with the grant itself, and
 // with a cookie from a later exchange or a grant that lasts longer. A row
-// from before entries were kept (”) counts as replaced.
+// from before entries were kept, whose entry is empty, counts as replaced.
+// Readers of one gs record one entry at one document: its scope: subject
+// digests their kid, pub and read roles by name (grantcheck.ScopeDigest),
+// which are what the entry digest is over, so only a changed document
+// replaces it.
 func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 	subjects := make([]any, len(r.subjects))
 	for i, s := range r.subjects {
