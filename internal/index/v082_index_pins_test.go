@@ -398,3 +398,37 @@ func TestV082PurgedMemberRolesCountForNoFolder(t *testing.T) {
 		}
 	}
 }
+
+// TestV082CatalogPurgedWhileDown (SVC-08; §B.11.9 Where; §A.1: "purge
+// idx:{ns} from the service's own cache and drop kept results"): the
+// index follows cat-season only for visibility and has answered li, who
+// sees derby and shared through it. While the index is down cat-season
+// is purged; restarted on the same database, its follower of cat-season
+// meets the purge without a purge-ns batch to apply. It purges
+// idx:cat-season all the same, and li, her matches still covered through
+// the trust the index read, gets no hits, at her query and at the at URL
+// she was answered at before, never what the purged catalog showed her.
+func TestV082CatalogPurgedWhileDown(t *testing.T) {
+	t.Parallel()
+	w := newV75XOn(t, clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}))
+	db := filepath.Join(t.TempDir(), "i.db")
+	x1 := v0261Start(w, db, false, false, "matches")
+	li := w.reader("user:li", []any{"fans"})
+	r := x1.raw("/matches", li)
+	at := r.header.Get("Location")
+	if got := strings.Join(resources(x1.search("/matches", li)), ","); r.status != 302 || got != "derby,shared" {
+		t.Fatalf("li before the purge: %d %s", r.status, got)
+	}
+	x1.stop()
+	v82PurgeNS(w, "cat-season")
+	x := v0261Start(w, db, false, false, "matches")
+	waitFor(t, "the index learns cat-season is purged", func() bool {
+		x.ix.ExpireGrantChecks()
+		return x.raw("/matches", li).status < 500 && members76Purges(x, "idx:cat-season") > 0
+	})
+	for _, path := range []string{"/matches", at} {
+		if r := x.follow(path, li); r.status != 200 || len(resources(r.body)) != 0 {
+			t.Errorf("li at %s once cat-season was purged while the index was down: %d %v, want no hits", path, r.status, r.body)
+		}
+	}
+}

@@ -457,3 +457,26 @@ func TestV082BranchCookieFollowsBaseKey(t *testing.T) {
 		t.Errorf("exchanging again once k1 is gone: %d %v, want 401", r.status, r.body)
 	}
 }
+
+// TestV082StarKeyCookie (SVC-10; §A.4 gs): a whole reader through a key
+// that grants every verb ("*") reads under her reads:docs cookie, whose
+// key is recorded as any other's; it is 403 once that key changes in any
+// member, until she exchanges again.
+func TestV082StarKeyCookie(t *testing.T) {
+	t.Parallel()
+	d := newV82Whole(t)
+	root := d.admin.Grant(t, d.s.Now(), "user:root", []string{"docs"}, []string{"read"})
+	prefixes, cookies := d.exchange(root)
+	paths := v82Paths(prefixes)
+	if got := v82Status(t, d.x, paths, cookies); got != v82Reads {
+		t.Fatalf("under a cookie minted through a * key: %s", got)
+	}
+	d.patch(map[string]any{"op": "add", "path": "/keys/0/maxTtl", "value": "PT2H"})
+	if got := v82Status(t, d.x, paths, cookies); got != v82Refuse {
+		t.Errorf("under the cookie once the * key changed: %s, want 403", got)
+	}
+	_, cookies = d.exchange(root)
+	if got := v82Status(t, d.x, paths, cookies); got != v82Reads {
+		t.Errorf("exchanged again: %s", got)
+	}
+}
