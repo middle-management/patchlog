@@ -776,6 +776,13 @@ func (d *davFS) OpenFile(ctx context.Context, name string, flag int, perm os.Fil
 	st := state(ctx)
 	f, err := st.open(ctx, name, flag)
 	if err != nil {
+		if st.method == "PUT" && flag&os.O_TRUNC != 0 {
+			// What the path names, whether its namespace is offered and
+			// the save's preconditions are reads a save decides by:
+			// failed for now, they fail it as its other reads do (§H.4
+			// "The base", saveRead).
+			err = saveRead(err)
+		}
 		return nil, st.fail(name, err)
 	}
 	return f, nil
@@ -784,12 +791,6 @@ func (d *davFS) OpenFile(ctx context.Context, name string, flag int, perm os.Fil
 func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.File, error) {
 	t, err := st.resolve(ctx, name)
 	if err != nil {
-		if st.method == "PUT" && flag&os.O_TRUNC != 0 {
-			// What the path names, and whether its namespace is offered,
-			// are reads a save decides by: failed for now, they fail it
-			// as its other reads do (§H.4 "The base", saveRead).
-			err = saveRead(err)
-		}
 		return nil, err
 	}
 	if flag&os.O_TRUNC != 0 {
