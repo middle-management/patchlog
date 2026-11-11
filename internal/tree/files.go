@@ -611,6 +611,64 @@ ON CONFLICT (k) DO NOTHING`); err != nil {
 	return tx.Commit()
 }
 
+// markKeyNS records the namespace the stored epochs are epochs of (meta
+// "keyns"): the one whose keys seal the catalog's listings (keyNS), in a
+// release preview the catalog's branch. Where the database's epochs were
+// judged under another, they are epochs of that one's keys, never to be
+// read as this one's (§E.2.6: sealed under the key of the epoch the
+// revision is served under): every node's epoch and born epoch is
+// dropped and read in again (backfillEpochs, meta "epochs"), and the
+// catalog's stored listings go with them, purged as a fill's are. Until a head's is judged again
+// its node is by name only. A database without the row is an earlier
+// release's, which judged a head read without an own kid under the
+// catalog's name (Options.Catalog) even in a preview, so a preview's are
+// judged again, and any other's are kept. A rebuild empties meta and the
+// nodes: it is recorded afresh.
+func (s *Service) markKeyNS(ctx context.Context) error {
+	keyNS := s.keyNS()
+	var was string
+	switch err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'keyns'`).Scan(&was); {
+	case errors.Is(err, sql.ErrNoRows):
+		was = s.opt.Catalog
+	case err != nil:
+		return err
+	case was == keyNS:
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var tags []string
+	if was != keyNS {
+		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET epoch = NULL, born_epoch = NULL`); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO meta (k, v) VALUES ('epochs', 'pending') ON CONFLICT (k) DO NOTHING`); err != nil {
+			return err
+		}
+		tags = []string{"ns:" + was, "ns:" + keyNS}
+		if err := s.sealed.Purge(ctx, tx, tags); err != nil {
+			return err
+		}
+		if err := s.repurge.Add(ctx, tx, tags); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO meta (k, v) VALUES ('keyns', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v`, keyNS); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.sealed.Purged(tags)
+	if len(tags) > 0 {
+		s.opt.Purger.PurgeTags(tags)
+	}
+	return nil
+}
+
 // rejudge has the epochs of heads stored without one read in again
 // (backfillEpochs), beside the followers: a listing asks for it when it
 // meets, at E2, a catalog node or an item's file metadata whose head was

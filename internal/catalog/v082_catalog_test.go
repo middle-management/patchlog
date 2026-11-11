@@ -8,6 +8,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -404,5 +405,91 @@ func TestV082RuleOnWholePrincipalCountsForNoFolder(t *testing.T) {
 	}
 	if e := entry(w.do("POST", "/read-grants", groupie, map[string]any{"items": toAny("/r/matches/derby")}), 0); e["grant"] == nil {
 		t.Errorf("read-grants through a role whose rule tests /principal/groups: %v", e)
+	}
+}
+
+// v82Stopped waits for the service to stop following matches.
+func v82Stopped(w *world) {
+	w.t.Helper()
+	waitFor(w.t, "the service to stop following matches", func() bool {
+		stopped := false
+		w.svc.Tree().View(func(g *tree.Graph, _ map[string]string) { stopped = g.Stopped("matches") })
+		return stopped
+	})
+}
+
+// SVC-12 (SERVICES §B.5 Behind): a namespace the service stopped
+// following reads public to no one at POST /read-grants: the document it
+// holds is the one it stopped at. Here matches is made private as the
+// service's key leaves it, in one write, so that document still says
+// public: an item of it gets no "public": true, no grant and no keys.
+// The answer is the 502 of a document the service can't read, whose
+// message relays nothing of the origin's answer to the service.
+func TestV082StoppedPublicNamespaceReadsPublicToNoOne(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	guest := w.caller("user:gus")
+	items := map[string]any{"items": toAny("/r/matches/derby")}
+	w.patchMatches(map[string]any{"op": "replace", "path": "/read", "value": "public"})
+	waitFor(t, "derby public", func() bool {
+		r := w.do("POST", "/read-grants", guest, items)
+		return r.status == 200 && entry(r, 0)["public"] == true
+	})
+	k2 := clienttest.NewKey("admin2")
+	w.patchMatches(map[string]any{"op": "add", "path": "/keys/-", "value": k2.Entry("*")})
+	admin2 := w.s.Client(t, client.WithBearer(k2.Grant(t, w.s.Now(), "user:admin2", []string{"matches"}, []string{"read", "config"})))
+	cfg := must(admin2.NSHead(ctx, "matches"))
+	must(admin2.PatchConfig(ctx, "matches", cfg.Config, []any{
+		map[string]any{"op": "replace", "path": "/read", "value": "grant"}, map[string]any{"op": "remove", "path": "/keys/0"}}))
+	v82Stopped(w)
+	for _, c := range []struct{ name, token string }{{"no role", guest}, {"a role in matches", w.caller("user:fred", "fan-club")}} {
+		r := w.do("POST", "/read-grants", c.token, items)
+		e := entry(r, 0)
+		if r.status != 200 || e["status"] != float64(502) || e["code"] != "upstream" || e["public"] != nil || e["grant"] != nil || e["keys"] != nil {
+			t.Errorf("%s: an item of a stopped namespace: %d %v, want its entry 502 upstream with nothing else", c.name, r.status, r.body)
+		}
+		if msg, _ := e["message"].(string); msg != "the catalog service can't read the document of namespace matches" {
+			t.Errorf("%s: the message %q relays the origin's answer", c.name, msg)
+		}
+	}
+}
+
+// The same for another reason to stop: here matches, public, is sealed,
+// and the service's client holds no keys and fetches none, so it can't
+// follow it as configured (§B.5 Behind), nor open its document. An item
+// of it gets no "public": true, no grant and no keys, a caller with a
+// role there included (its roles count for no folder, §B.11.5): the
+// entry is the same 502.
+func TestV082StoppedSealedNamespaceGivesNoReadGrant(t *testing.T) {
+	t.Parallel()
+	w := setupWorld(t, false, func(o *clienttest.Options) []client.Option {
+		o.KeyStore = must(keystore.New(keystore.Generate()))
+		return []client.Option{client.WithKeys(client.StaticKeys())}
+	})
+	w.seed()
+	w.start()
+	w.caughtUp()
+	items := map[string]any{"items": toAny("/r/matches/derby")}
+	fan := w.caller("user:fred", "fan-club")
+	w.patchMatches(map[string]any{"op": "replace", "path": "/read", "value": "public"})
+	waitFor(t, "derby public", func() bool {
+		r := w.do("POST", "/read-grants", fan, items)
+		return r.status == 200 && entry(r, 0)["public"] == true
+	})
+	ctx := context.Background()
+	opm := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"matches"}, []string{"read", "config"})))
+	must(opm.PatchConfig(ctx, "matches", must(opm.NSHead(ctx, "matches")).Config, []any{
+		map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}}}))
+	v82Stopped(w)
+	for _, c := range []struct{ name, token string }{{"no role", w.caller("user:gus")}, {"a role in matches", fan}} {
+		r := w.do("POST", "/read-grants", c.token, items)
+		e := entry(r, 0)
+		if r.status != 200 || e["status"] != float64(502) || e["code"] != "upstream" || e["public"] != nil || e["grant"] != nil || e["keys"] != nil || e["keysWithheld"] != nil {
+			t.Errorf("%s: an item of a stopped namespace: %d %v, want its entry 502 upstream with nothing else", c.name, r.status, r.body)
+		}
 	}
 }

@@ -31,7 +31,7 @@ type v081Preview struct {
 	x2      *client.E2E
 	svcPriv *ecdh.PrivateKey
 	db      string
-	sc      func() *client.Client
+	sc      func(...client.Option) *client.Client
 	opts    func(o *tree.Options)
 	keyOf   func(kid string) []byte
 }
@@ -55,9 +55,9 @@ func newV081Preview(t *testing.T) *v081Preview {
 	must(wr.CreateBranch(ctx, "cat", client.BranchRequest{Name: "catb"}))
 	must(x2.InitKeyring(ctx, "catb", svcPriv.PublicKey()))
 	p := &v081Preview{s: s, k: k, wr: wr, x2: x2, svcPriv: svcPriv, db: filepath.Join(t.TempDir(), "tree.db")}
-	p.sc = func() *client.Client {
-		return s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"}, map[string]any{"enc": svcJWK})),
-			client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey()))
+	p.sc = func(opts ...client.Option) *client.Client {
+		return s.Client(t, append([]client.Option{client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"}, map[string]any{"enc": svcJWK})),
+			client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey())}, opts...)...)
 	}
 	p.opts = func(o *tree.Options) { o.Recipient = svcPriv; o.Branches = map[string]string{"cat": "catb"} }
 	p.keyOf = func(kid string) []byte { return must(x2.SealKey(ctx, kid)) }

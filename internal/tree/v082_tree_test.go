@@ -11,9 +11,13 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -323,4 +327,44 @@ func TestV082GraphStoppedOfFollowed(t *testing.T) {
 			}
 		}
 	})
+}
+
+// SVC-12: a hypothetical graph (Graph.With), which the catalog service
+// judges moves and widening on, carries the namespaces the service
+// stopped following: their roles count for no folder there either
+// (§B.5 Behind, §B.11.5).
+func TestV082GraphWithCarriesStopped(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: must(keystore.New(keystore.Generate())), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for _, ns := range []string{"cat", "sec"} {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+		if ns == "cat" {
+			doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag"}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	both := []string{"cat", "sec"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	// The service holds no keys and fetches none: sealed, sec is a
+	// namespace it can't follow as configured.
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"})), client.WithKeys(client.StaticKeys()))
+	x := startSvc(t, sc, svcOpts{now: s.Now})
+	x.caughtUp("cat", "sec")
+	must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}}}))
+	stopped := func(ns string, hypo bool) (is bool) {
+		x.s.View(func(g *tree.Graph, _ map[string]string) {
+			if hypo {
+				g = g.With(map[string]any{"extra": map[string]any{"title": "Extra", "parents": []any{}}})
+			}
+			is = g.Stopped(ns)
+		})
+		return is
+	}
+	waitFor(t, "the service to stop following sec", func() bool { return stopped("sec", false) })
+	if !stopped("sec", true) || stopped("cat", true) {
+		t.Errorf("the hypothetical graph: sec stopped %v, cat stopped %v", stopped("sec", true), stopped("cat", true))
+	}
 }

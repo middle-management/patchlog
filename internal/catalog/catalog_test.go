@@ -152,10 +152,17 @@ func live(c *client.Client, ns, name string) bool {
 func setup(t *testing.T) *world { return setupWith(t, false) }
 
 // setupWith builds the world, with both namespaces sealed if sealed.
-func setupWith(t *testing.T, sealed bool) *world {
+func setupWith(t *testing.T, sealed bool) *world { return setupWorld(t, sealed, nil) }
+
+// setupWorld is setupWith, tweak (if any) changing the server's options
+// and returning more options for the service's client.
+func setupWorld(t *testing.T, sealed bool, tweak func(o *clienttest.Options) []client.Option) *world {
 	ctx := context.Background()
 	o := clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}
-	var copts []client.Option
+	var copts, sopts []client.Option
+	if tweak != nil {
+		sopts = tweak(&o)
+	}
 	enc := func(doc map[string]any) map[string]any { return doc }
 	if sealed {
 		ks, err := keystore.New(keystore.Generate())
@@ -213,8 +220,8 @@ func setupWith(t *testing.T, sealed bool) *world {
 	w.ops = s.Client(t, append(copts, client.WithBearer(opsKey.Grant(t, s.Now(), "user:ops", []string{"cat", "matches"},
 		[]string{"read", "create", "append", "delete", "restore"}, map[string]any{"groups": toAny("catalog-admins")})))...)
 	w.db = filepath.Join(t.TempDir(), "catalog.db")
-	w.svcClient = s.Client(t, append(copts, client.WithBearer(opsKey.Grant(t, s.Now(), "svc:catalog", []string{"cat", "matches"}, []string{"read"},
-		map[string]any{"exp": s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))...)
+	w.svcClient = s.Client(t, append(append(copts, client.WithBearer(opsKey.Grant(t, s.Now(), "svc:catalog", []string{"cat", "matches"}, []string{"read"},
+		map[string]any{"exp": s.Now().Add(24 * time.Hour).Format(time.RFC3339)}))), sopts...)...)
 	return w
 }
 

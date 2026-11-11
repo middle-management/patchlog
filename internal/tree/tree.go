@@ -411,6 +411,9 @@ func (s *Service) init(ctx context.Context) error {
 	if err := s.markBornEpochs(ctx); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
 	}
+	if err := s.markKeyNS(ctx); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
+	}
 	var epochs string
 	switch err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'epochs'`).Scan(&epochs); {
 	case err == nil:

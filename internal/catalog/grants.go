@@ -106,8 +106,13 @@ func badInput(format string, a ...any) error  { return errf(400, "bad_input", fo
 func forbidden(format string, a ...any) error { return errf(403, "forbidden", format, a...) }
 func conflict(format string, a ...any) error  { return errf(409, "conflict", format, a...) }
 
-func upstream(err error) error {
-	return &Error{Status: 502, Code: "upstream", Msg: err.Error()}
+// upstream is the 502 for what the service couldn't read from the origin
+// to decide with. Its message names what, which the caller asked about,
+// and never relays the origin's answer, which is about the service's own
+// grant and reads: that is logged.
+func (s *Service) upstream(what string, err error) error {
+	logf(s)("catalog: reading %s: %v", what, err)
+	return &Error{Status: 502, Code: "upstream", Msg: "the catalog service can't read " + what}
 }
 
 // configErr answers a namespace document the checker couldn't read: 410
@@ -116,7 +121,7 @@ func upstream(err error) error {
 // epoch keys (§8.5), since nothing in it can be granted any more; 502
 // otherwise. Decided at the core's head, it carries no checkpoint
 // (decidedAt).
-func configErr(ns string, err error) error {
+func (s *Service) configErr(ns string, err error) error {
 	if client.IsPurged(err) {
 		var head string
 		if ae, ok := client.AsAPIError(err); ok {
@@ -124,7 +129,7 @@ func configErr(ns string, err error) error {
 		}
 		return purgedErr(ns, head)
 	}
-	return upstream(err)
+	return s.upstream("the document of namespace "+ns, err)
 }
 
 // purgedErr is the 410 purged a catalog service answers for every name of
@@ -145,7 +150,7 @@ func purgedErr(ns, head string) error {
 func (s *Service) coreHead(ctx context.Context, ns, name string) (*client.Head, error) {
 	h, err := s.t.Client().Head(ctx, ns, name)
 	if err != nil {
-		return nil, upstream(err)
+		return nil, s.upstream("the head of /r/"+ns+"/"+name, err)
 	}
 	if h.PurgedNS != "" {
 		return nil, purgedErr(ns, h.PurgedNS)
@@ -206,7 +211,7 @@ func (s *Service) contentConfig(ctx context.Context, ns string) (*grantcheck.Con
 	}
 	cfg, err := s.t.Checker().Config(ctx, ns)
 	if err != nil {
-		return nil, configErr(ns, err)
+		return nil, s.configErr(ns, err)
 	}
 	return cfg, nil
 }
@@ -1957,7 +1962,7 @@ func (s *Service) isAdmin(v *grant.Verified) bool {
 func (s *Service) catalogConfig(ctx context.Context) (*grantcheck.Config, error) {
 	cfg, err := s.t.Checker().Config(ctx, s.t.Catalog())
 	if err != nil {
-		return nil, configErr(s.t.Catalog(), err)
+		return nil, s.configErr(s.t.Catalog(), err)
 	}
 	if derived.InfoOf(cfg.Doc).Level == derived.LevelE2E {
 		return nil, notOffered(s.t.Catalog())
@@ -2106,7 +2111,7 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 	if noCfg {
 		// Not decided at the checkpoint (decidedAt).
 		checkpoint = nil
-		return nil, configErr(ns, cerr)
+		return nil, s.configErr(ns, cerr)
 	}
 	if err != nil {
 		return nil, err
@@ -2380,7 +2385,7 @@ func (s *Service) includesOfTrusted(ctx context.Context) (map[string]Includes, e
 			continue
 		}
 		if err != nil {
-			return nil, upstream(err)
+			return nil, s.upstream("the document of namespace "+ns, err)
 		}
 		out[ns] = ParseIncludes(cfg.Doc)
 	}
@@ -2599,7 +2604,7 @@ func (s *Service) checkLag(ctx context.Context, cp string, key *grant.Key) error
 	}
 	h, err := s.t.Client().NSHead(ctx, cat)
 	if err != nil {
-		return upstream(err)
+		return s.upstream("the head of namespace "+cat, err)
 	}
 	if h.ID == cp {
 		return nil

@@ -438,6 +438,35 @@ func TestV082KidlessHeadIsReadAgain(t *testing.T) {
 	}
 }
 
+// SVC-05, outside a fill: while the head of old, stored without an epoch,
+// is being read again (rejudge), the listing served meanwhile gives old
+// by name only. At E2 a head's epoch is its served kid's alone: one
+// stored without is never sealed under the epoch in force, cat#2 here.
+func TestV082KidlessHeadNameOnlyWhileReread(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	q := newV82Sealed(t)
+	x := startSvc(t, q.svc(), svcOpts{now: q.s.Now, db: q.db})
+	x.caughtUp("cat", "files")
+	x.stop()
+	must(q.s.Engine.RotateEpoch(ctx, "cat", "system:rotate"))
+	q.addKeys("cat", "files")
+	q.exec(`UPDATE nodes SET epoch = NULL WHERE name = 'old'`, `DELETE FROM meta WHERE k = 'epochs'`, `DELETE FROM sealed_views`)
+	release := make(chan struct{})
+	x = startSvc(t, q.svc(v077Blocking("/r/cat/old", release)), svcOpts{now: q.s.Now, db: q.db})
+	v82Release(t, release)
+	x.caughtUp("cat", "files")
+	waitFor(t, "a listing", func() bool { return x.listingAs("/cat/children?of=root", q.full).status == http.StatusOK })
+	f := x.fetch("/cat/children?of=root", q.full)
+	if f.header.Get("Content-Type") != "application/json" {
+		t.Fatalf("a listing with a head whose epoch isn't judged is sealed whole (%s)", f.header.Get("Content-Type"))
+	}
+	if bytes.Contains(f.body, []byte("Old")) {
+		t.Errorf("a clear value: %s", f.body)
+	}
+	v82NameOnly(t, "old, its head's epoch not judged", entriesOf(t, decode(t, f.body))["old"])
+}
+
 // SVC-05 (stored data): tree migration 006 resets every born_epoch and
 // marks the epochs pending again, so a born's epoch an earlier release
 // judged as it was applied is read in again from the first revision
