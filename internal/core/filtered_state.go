@@ -20,7 +20,8 @@ import (
 // members are
 //
 //   - {ns} at its head (a purged {ns} stays, at its purge-ns entry);
-//   - each trusted catalog that isn't dark (e2e, purged or a branch) at
+//   - each trusted catalog that isn't dark (e2e, purged or a branch,
+//     local or remote) at
 //     its head (for catalog kind, {ns} itself);
 //   - each local, unpurged member of those catalogs' catalog.trust at its
 //     head, whose roles and keys visibility reads.
@@ -82,9 +83,9 @@ func (t *tx) filteredCurrent(fs *fscope) *fcp {
 // filteredAt is fs's checkpoint named at: the current one, or one
 // recorded in filtered_ats whose members all still exist, are unpurged
 // ({ns} excepted) and have the recorded ns_id in their chains, and whose
-// deciding catalogs are all members. A catalog that is dark now, a local
-// branch among them, decides nothing there even where an at recorded
-// before v0.78 lists it (§B.11.9 Where). The answer at it is recomputed
+// deciding catalogs are all members. A catalog that is dark now, a
+// branch, local or remote, among them, decides nothing there even where
+// an at recorded before v0.78 lists it (§B.11.9 Where). The answer at it is recomputed
 // from history, which for an append-only log is as if stored (§B.11.9
 // at). ok is false otherwise: the caller answers 302 to the current at.
 func (t *tx) filteredAt(fs *fscope, at string) (*fcp, bool) {
