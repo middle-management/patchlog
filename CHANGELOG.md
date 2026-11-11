@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.28.0
 
 Implements spec **v0.82** (previously **v0.81**). v0.82 answers the reference's 77 notes on
 v0.81, most with a clause each, and takes its confirmed candidate vectors into Addendum I. The
