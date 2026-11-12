@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -43,6 +44,10 @@ type mergePlanRequest struct {
 	// Resolve maps a resource to its resolution against the base's head:
 	// a patch set, a list of steps, "delete" or "keep".
 	Resolve map[string]json.RawMessage `json:"resolve"`
+	// ResolvedAt maps a resolved resource to the base head its resolution
+	// was written against ("" = absent). A resolution whose base head has
+	// moved since isn't applied (§F.3: a resolution is against B).
+	ResolvedAt map[string]string `json:"resolvedAt"`
 }
 
 // readOnlyCode is the code of the refusal the planner's transport answers a
@@ -53,10 +58,20 @@ const readOnlyCode = "playground_read_only"
 // and a batch dry run (§7.5).
 type readOnly struct{ forward }
 
+// isBatchPath reports whether path is /ns/{ns}/batch.
+func isBatchPath(path string) bool {
+	ns, ok := strings.CutPrefix(path, "/ns/")
+	if !ok {
+		return false
+	}
+	ns, ok = strings.CutSuffix(ns, "/batch")
+	return ok && client.ValidNSName(ns)
+}
+
 func (f readOnly) RoundTrip(req *http.Request) (*http.Response, error) {
 	switch {
 	case req.Method == http.MethodGet || req.Method == http.MethodHead:
-	case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/batch") && req.URL.Query().Get("dry-run") == "1":
+	case req.Method == http.MethodPost && isBatchPath(req.URL.Path) && req.URL.Query().Get("dry-run") == "1":
 	default:
 		if req.Body != nil {
 			io.Copy(io.Discard, req.Body)
@@ -278,17 +293,34 @@ func (s *importer) mergePlan(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusUnprocessableEntity, "merge", err.Error())
 		return
 	}
-	for name, steps := range resolve {
+	// A resolution holds only against the base head it was written for:
+	// one whose resource the base has changed since is not applied, and the
+	// plan is then not clean, whatever the resource classifies as now.
+	stale := []any{}
+	names := make([]string, 0, len(resolve))
+	for name := range resolve {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		steps := resolve[name]
+		if at, ok := req.ResolvedAt[name]; ok {
+			if r := p.Resource(name); r != nil && r.Base != at {
+				stale = append(stale, map[string]any{"resource": name, "writtenAt": at, "base": r.Base})
+				continue
+			}
+		}
 		if err := p.Resolve(name, steps...); err != nil {
 			fail(w, http.StatusUnprocessableEntity, "bad_resolution", err.Error())
 			return
 		}
 	}
 
+	clean := p.Clean() && len(stale) == 0
 	out := map[string]any{
 		"target": p.Target, "branch": p.Branch, "branchAt": p.BranchAt,
 		"targetAt": p.TargetAt, "targetConfig": p.TargetConfig,
-		"resources": p.Resources, "clean": p.Clean(), "leftOut": p.LeftOut(),
+		"resources": p.Resources, "clean": clean, "staleResolutions": stale, "leftOut": p.LeftOut(),
 		"authorsDeclared": p.AuthorsDeclared, "mergeAuthors": p.MergeAuthors,
 		"ignoredMerges": p.Ignored, "hints": p.Hints(), "squash": req.Squash,
 		"branchFrozen": bdoc.Value["frozen"] == true, "branchMerged": bdoc.Value["merged"],
@@ -296,7 +328,7 @@ func (s *importer) mergePlan(w http.ResponseWriter, r *http.Request) {
 	if out["resources"] == nil || len(p.Resources) == 0 {
 		out["resources"] = []any{}
 	}
-	if p.Clean() {
+	if clean {
 		dry, derr := p.DryRun(ctx)
 		if ae, ok := client.AsAPIError(derr); ok && ae.Code == readOnlyCode {
 			// The dry run had to copy blobs first (§F.3 Blobs), a write.
@@ -323,7 +355,7 @@ func (s *importer) mergePlan(w http.ResponseWriter, r *http.Request) {
 	// After the dry run, so the batch is the one it judged. A plan that
 	// still needs a person has none to submit.
 	out["batch"] = nil
-	if p.Clean() {
+	if clean {
 		out["batch"] = mergeBatchBody(p)
 	}
 	for _, k := range []string{"leftOut", "mergeAuthors", "ignoredMerges", "hints"} {

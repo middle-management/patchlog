@@ -1191,15 +1191,20 @@ lists the merger in `merge.authors` (§F.3); otherwise the card shows the planne
 replayed resources come back as conflicts. Under `-dev`, fill the author box with a listed `sub`.
 
 The plan endpoint, `POST /playground/merge/plan`, takes `{branch, base?, squash?, branchAt?,
-resolve?: {resource: patch set | steps | "keep" | "delete"}}` and writes nothing. It reads in
+resolve?: {resource: patch set | steps | "keep" | "delete"}, resolvedAt?}` and writes nothing. It reads in
 process through the API handler with the request's own headers, as the schema import planner
 does, through a transport that lets through `GET`, `HEAD` and `POST …/batch?dry-run=1` only. It
-answers the plan (`resources`, `clean`, `hints`, `ignoredMerges`, `leftOut`), the `batch` in the
-wire format and, for a clean plan, `dryRun` or `dryRunError`. It refuses (`422
-merge_unsupported`) what the page can't finish: a sealed or e2e namespace on either side (the
-planner holds no keys), a base with `"signatures": "required"` (the page can't sign), and a
-merge that would first copy the branch's blobs, which a merger without unrestricted read on the
-branch must (§7.8). Use `patchlog merge` for those, and for a batch with a `config` change.
+answers the plan (`resources`, `clean`, `hints`, `ignoredMerges`, `leftOut`,
+`staleResolutions`) and, for a clean plan only, the `batch` in the wire format with `dryRun` or
+`dryRunError`. `resolvedAt: {resource: base head}` names the base head each resolution was
+written against; one whose resource the base has changed since isn't applied, is listed in
+`staleResolutions` and leaves the plan not clean, and the card asks to confirm or edit it. The
+endpoint refuses (`422 merge_unsupported`) what the page can't finish: a sealed or e2e
+namespace on either side (the planner holds no keys) and a base with `"signatures":
+"required"` (the page can't sign). A caller needs unrestricted read on the branch and the base
+to plan, as the planner reads their logs; a merger with less, who would have to copy the
+branch's blobs first (§7.8), gets the API's refusal. Use `patchlog merge` for those, and for a
+batch with a `config` change.
 
 The plan endpoint, `POST /playground/schema-import/plan`, takes `{ns, sources: [url…], files:
 [{name, content}…], name?}` and writes nothing. It reads the current heads in process through the

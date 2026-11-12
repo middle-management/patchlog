@@ -10,9 +10,12 @@
   by a new endpoint, `POST /playground/merge/plan`, which runs the same code as `patchlog merge
   plan` in process with the caller's own headers and writes nothing: its transport lets through
   reads and a batch dry run only. The page submits the batch itself through the normal API.
-  Plain namespaces only: a sealed or e2e namespace, a base that requires signatures, and a merge
-  that would have to copy blobs are refused with a pointer to `patchlog merge`. An explicit
-  `config` change in the batch isn't offered.
+  A resolution is sent with the base head it was written against, and one whose resource the
+  base has changed since isn't applied until it is confirmed or edited. Plain namespaces only: a
+  sealed or e2e namespace and a base that requires signatures are refused with a pointer to
+  `patchlog merge`, and planning needs unrestricted read on both namespaces. An explicit
+  `config` change in the batch isn't offered. A second merge of the same branch re-conflicts on
+  replayed resources unless the base lists the merger in `merge.authors` (§F.3).
 
 ## v0.28.0
 

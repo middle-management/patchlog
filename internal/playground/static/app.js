@@ -4281,7 +4281,7 @@ const MG_URL = '/playground/merge/';
 /* texts: the resolution of a resource as typed (JSON text: a patch set, a list of steps, "keep" or "delete"), kept
  * across plans. open: the rows whose details show. ovr: clean rows whose editor was asked for. seenAt: the base
  * revision of the last plan shown, '' after this page's own merge. merged: this page's last merge of the pair. */
-const MG = { branch: '', base: '', plan: null, texts: new Map(), open: new Set(), ovr: new Set(), stale: false, busy: '', seenAt: '', notes: [], err: null, merged: null, frozen: null, out: null };
+const MG = { branch: '', base: '', plan: null, texts: new Map(), bases: new Map(), open: new Set(), ovr: new Set(), stale: false, busy: '', seenAt: '', notes: [], err: null, merged: null, frozen: null, out: null };
 
 function mgReset(branch, base) {
   Object.assign(MG, { branch, base, plan: null, texts: new Map(), open: new Set(), ovr: new Set(), stale: false, busy: '', seenAt: '', notes: [], err: null, merged: null, frozen: null, out: null });
@@ -4302,7 +4302,11 @@ const mgIsDelete = (s) => s === 'delete' || (!!s && typeof s === 'object' && !Ar
 const mgStatusClass = { merged: '', ahead: 'info', behind: '', clean: 'ok', conflicting: 'err', purged: 'tomb' };
 const mgPlural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
 function mgConflicting(p) { return (p.resources || []).filter((r) => r.status === 'conflicting'); }
-function mgNothing(p) { return !!p && !p.batch && !mgConflicting(p).length; }
+function mgNothing(p) { return !!p && p.clean === true && !p.batch && !mgConflicting(p).length; }
+/* the resources whose resolution the planner didn't apply: the base's head is no longer the one it was written against */
+function mgStaleRes(p) { return ((p && p.staleResolutions) || []).filter((x) => x && typeof x.resource === 'string'); }
+/* the base head ('' = absent) of a resource in the plan shown: what a resolution typed now is written against */
+function mgBaseOf(name) { const r = MG.plan && (MG.plan.resources || []).find((x) => x.resource === name); return r ? r.base || '' : ''; }
 function mgCanMerge() {
   const p = MG.plan;
   return !!p && !MG.busy && !MG.stale && p.clean === true && !!p.batch && Array.isArray(p.batch.items) && p.batch.items.length > 0 && !p.dryRunError;
@@ -4343,7 +4347,12 @@ async function mgPlan(o = {}) {
   if (MG.base) body.base = MG.base;
   const pinned = !o.fresh && prev && ID_RE.test(prev.branchAt || '');
   if (pinned) body.branchAt = prev.branchAt;
-  if (res.n) body.resolve = res.v;
+  if (res.n) {
+    body.resolve = res.v;
+    // each with the base head it was written against: the planner applies none whose base moved since
+    body.resolvedAt = {};
+    Object.keys(res.v).forEach((n) => { body.resolvedAt[n] = MG.bases.has(n) ? MG.bases.get(n) : mgBaseOf(n); });
+  }
   MG.busy = 'Planning…'; MG.err = null; renderMergeState();
   // what was typed while the planner worked is not what it planned
   const typed = () => JSON.stringify([[...MG.texts].filter(([, t]) => t.trim()), $('mgSquash').checked]);
@@ -4367,11 +4376,12 @@ async function mgPlan(o = {}) {
   // A resolution of a resource the plan no longer lists has no editor to change it in: dropped, and said.
   const names = new Set(p.resources.map((x) => x.resource));
   const gone = [...MG.texts.keys()].filter((n) => !names.has(n));
-  gone.forEach((n) => { MG.texts.delete(n); MG.ovr.delete(n); });
+  gone.forEach((n) => { MG.texts.delete(n); MG.bases.delete(n); MG.ovr.delete(n); });
   if (gone.length) notes.push('Dropped the resolution of ' + gone.join(', ') + ': the plan has no such resource.');
   MG.plan = p; MG.base = p.target; MG.seenAt = p.targetAt || ''; MG.stale = typed() !== sent; MG.notes = notes;
   if (!o.own) MG.out = null;
   mgConflicting(p).forEach((x) => MG.open.add(x.resource));
+  mgStaleRes(p).forEach((x) => MG.open.add(x.resource));
   renderMerge();
   return true;
 }
@@ -4390,7 +4400,7 @@ async function mgMerge() {
     const at = r.hdr('X-Namespace-Revision') || (r.json && r.json.ns_id) || '';
     MG.merged = { target: p.target, branch: p.branch, at: ID_RE.test(at) ? at : '', branchAt: p.branchAt,
       items: p.batch.items.map((it, i) => ({ resource: it.resource, ids: (items[i] && Array.isArray(items[i].ids) ? items[i].ids : []).filter((x) => typeof x === 'string') })) };
-    MG.texts.clear(); MG.ovr.clear(); MG.open.clear(); MG.seenAt = '';
+    MG.texts.clear(); MG.bases.clear(); MG.ovr.clear(); MG.open.clear(); MG.seenAt = '';
     toast(`Merged ${p.branch} into ${p.target}`);
     // What is left, from the branch's head now: nothing, unless the branch moved on meanwhile.
     await mgPlan({ fresh: true, own: true });
@@ -4444,7 +4454,7 @@ function mgGoto(ns, name) {
 }
 
 function mgSetText(name, text) {
-  if (text.trim()) MG.texts.set(name, text); else MG.texts.delete(name);
+  if (text.trim()) { MG.texts.set(name, text); MG.bases.set(name, mgBaseOf(name)); } else { MG.texts.delete(name); MG.bases.delete(name); }
   if (MG.plan) MG.stale = true;
   renderMergeState();
 }
@@ -4460,7 +4470,10 @@ function mgEditor(r) {
   const set = (v) => { ta.value = v; ta.dispatchEvent(new Event('input')); };
   const steps = r.steps || [];
   const plain = steps.length > 0 && steps.every((s) => Array.isArray(s) || s === 'delete');
+  const old = mgStaleRes(MG.plan).find((x) => x.resource === name);
   return h('div', { class: 'mg-edit' },
+    old ? h('div', { class: 'warn-box' }, 'This resolution was not applied: it was written against the base\'s head ', old.writtenAt ? idEl(old.writtenAt) : 'when the resource was absent', ', and the base has changed the resource since. Open it in the base, check the resolution against what is there now, then edit it or ',
+      h('button', { type: 'button', class: 'tiny', onclick: () => mgSetText(name, ta.value) }, 'confirm it as it is'), ' and Re-plan.') : null,
     h('div', { class: 'row' }, h('b', {}, 'Resolution'),
       h('span', { class: 'muted small' }, 'replaces the steps with one patch set against the base\'s head', r.base ? [' ', idEl(r.base)] : r.baseState && r.baseState !== 'live' ? ` (${r.baseState})` : '')),
     ta, hint,
@@ -4576,6 +4589,8 @@ function renderMergeState() {
   if (!p) return set(MG.err ? '' : 'Plan classifies what the branch changed against the base, and writes nothing.');
   const bad = mgConflicting(p).length;
   if (MG.stale) return set('The resolutions or options changed since this plan: Re-plan before merging.', 'bad');
+  const old = mgStaleRes(p).length;
+  if (old) return set(`${mgPlural(old, 'resolution')} not applied: the base changed under ${old === 1 ? 'it' : 'them'}. Check each against the base's head now, confirm or edit it, then Re-plan.`, 'bad');
   if (bad) return set(`${mgPlural(bad, 'resource')} conflicting: write a resolution for each, then Re-plan.`, 'bad');
   if (p.dryRunError) return set('The dry run failed, see below: nothing can be merged as planned.', 'bad');
   if (!p.batch) return set('Nothing to merge.');
@@ -4627,7 +4642,7 @@ function renderMerge() {
 function initMerge() {
   $('mgPlan').onclick = () => mgPlan();
   $('mgFresh').onclick = () => mgPlan({ fresh: true });
-  $('mgClearRes').onclick = () => { MG.texts.clear(); MG.ovr.clear(); if (MG.plan) MG.stale = true; renderMerge(); };
+  $('mgClearRes').onclick = () => { MG.texts.clear(); MG.bases.clear(); MG.ovr.clear(); if (MG.plan) MG.stale = true; renderMerge(); };
   $('mgSquash').onchange = () => { if (MG.plan) MG.stale = true; renderMergeState(); };
   $('mgGo').onclick = mgMerge;
   $('mgFreeze').onclick = mgFreeze;

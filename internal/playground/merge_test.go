@@ -11,6 +11,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/server"
 )
@@ -202,14 +203,16 @@ func TestMergePlannerTransportIsReadOnly(t *testing.T) {
 		pass        bool
 	}{
 		{"GET", "http://x/ns/a", true},
-		{"HEAD", "http://x/ns/a/r/b", true},
+		{"HEAD", "http://x/r/a/b", true},
 		{"POST", "http://x/ns/a/batch?dry-run=1", true},
 		{"POST", "http://x/ns/a/batch", false},
 		{"POST", "http://x/ns/a/batch?dry-run=0", false},
-		{"POST", "http://x/ns/a/r/b/blobs?dry-run=1", false},
+		{"POST", "http://x/r/a/batch?dry-run=1", false},
+		{"POST", "http://x/ns/a/x/batch?dry-run=1", false},
+		{"POST", "http://x/r/a/b/blobs?dry-run=1", false},
 		{"PATCH", "http://x/ns/a", false},
-		{"PUT", "http://x/ns/a/r/b/blobs/x", false},
-		{"DELETE", "http://x/ns/a/r/b", false},
+		{"PUT", "http://x/r/a/b/blobs/x", false},
+		{"DELETE", "http://x/r/a/b", false},
 		{"POST", "http://x/ns/a/purge", false},
 	} {
 		before := hit
@@ -283,6 +286,89 @@ func TestMergePlanSealedRefused(t *testing.T) {
 	}
 	code, out := e.mergePlan(map[string]any{"branch": "rel"}, "X-Author", "ed")
 	if code != 422 || out["code"] != "merge_unsupported" || !strings.Contains(out["message"].(string), "sealed") {
+		t.Fatalf("%d %v", code, out)
+	}
+}
+
+// A resolution is against the base head it was written for (§F.3): after
+// the base changes the resource, a re-plan doesn't apply it.
+func TestMergePlanStaleResolution(t *testing.T) {
+	t.Parallel()
+	e := newSIEnv(t, false, Options{})
+	c := mergeFixture(t, e, map[string]any{"read": "public"})
+	ctx := context.Background()
+	code, out := e.mergePlan(map[string]any{"branch": "rel"}, "X-Author", "ed")
+	if code != 200 {
+		t.Fatalf("%d %v", code, out)
+	}
+	base := resourcesByName(out)["b"]["base"].(string)
+	req := map[string]any{"branch": "rel", "branchAt": out["branchAt"],
+		"resolve": map[string]any{"b": set("/score", 5)}, "resolvedAt": map[string]any{"b": base}}
+	if code, out = e.mergePlan(req, "X-Author", "ed"); code != 200 || out["clean"] != true || len(out["staleResolutions"].([]any)) != 0 {
+		t.Fatalf("%d %v", code, out)
+	}
+	// the base changes b again
+	if _, err := c.Append(ctx, "matches", "b", base, set("/note", "late")); err != nil {
+		t.Fatal(err)
+	}
+	code, out = e.mergePlan(req, "X-Author", "ed")
+	if code != 200 || out["clean"] != false || out["batch"] != nil || out["dryRun"] != nil {
+		t.Fatalf("%d %v", code, out)
+	}
+	st := out["staleResolutions"].([]any)
+	if len(st) != 1 || st[0].(map[string]any)["resource"] != "b" || st[0].(map[string]any)["writtenAt"] != base {
+		t.Fatalf("stale %v", st)
+	}
+	if rs := resourcesByName(out); rs["b"]["resolved"] == true {
+		t.Errorf("b resolved: %v", rs["b"])
+	}
+	// confirmed against the new head, it applies
+	req["resolvedAt"] = map[string]any{"b": st[0].(map[string]any)["base"]}
+	if code, out = e.mergePlan(req, "X-Author", "ed"); code != 200 || out["clean"] != true || out["batch"] == nil {
+		t.Fatalf("%d %v", code, out)
+	}
+}
+
+// A merger without unrestricted read on the branch would have to copy the
+// branch's blobs first (§F.3 Blobs), a write. Such a caller can't read the
+// branch's log either, so the planner answers with the API's refusal and
+// copies nothing; with unrestricted read the batch's source serves them.
+func TestMergePlanBlobsNeedUnrestrictedRead(t *testing.T) {
+	t.Parallel()
+	e := newSIEnv(t, true, Options{})
+	ctx := context.Background()
+	k := clienttest.NewKey("ops")
+	if _, err := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "pics"))).CreateNamespace(ctx, "pics", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}); err != nil {
+		t.Fatal(err)
+	}
+	all := []string{"pics", "pics-r7"}
+	owner := e.s.Client(t, client.WithBearer(k.Grant(t, e.s.Now(), "user:ed", all, grant.Verbs)))
+	d, err := owner.CreateDoc(ctx, "pics", "derby", map[string]any{"title": "Derby"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.CreateBranch(ctx, "pics", client.BranchRequest{Name: "pics-r7"}); err != nil {
+		t.Fatal(err)
+	}
+	png := []byte("\x89PNG not really")
+	bid, err := owner.UploadBlob(ctx, "pics-r7", "derby", "image/png", "", png)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.Append(ctx, "pics-r7", "derby", d.ID, set("/img", client.BlobRef(bid, "image/png", len(png), ""))); err != nil {
+		t.Fatal(err)
+	}
+	fixed := k.Grant(t, e.s.Now(), "svc:merge", all, []string{"read", "create", "append", "restore"},
+		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "derby"}}})
+	code, out := e.mergePlan(map[string]any{"branch": "pics-r7"}, "Authorization", "Bearer "+fixed)
+	if code != 403 && !(code == 422 && out["code"] == "merge_unsupported") {
+		t.Fatalf("%d %v", code, out)
+	}
+	if _, err := owner.GetBlob(ctx, "pics", "derby", bid, ""); err == nil {
+		t.Fatal("the planner copied the blob into the base")
+	}
+	code, out = e.mergePlan(map[string]any{"branch": "pics-r7"}, "Authorization", "Bearer "+k.Grant(t, e.s.Now(), "user:ed", all, grant.Verbs))
+	if code != 200 || out["clean"] != true || out["dryRunError"] != nil {
 		t.Fatalf("%d %v", code, out)
 	}
 }
