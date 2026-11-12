@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-## Unreleased
-
 - **Playground: less on screen at once.** Cards collapse: each tab opens with its one or two
   main cards (Namespace: status and document; Resource: document and patch) and the rest as
   header lines that open on click, with Branches and Problems showing a count. A flow that leads
