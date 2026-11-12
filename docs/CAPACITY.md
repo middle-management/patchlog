@@ -304,6 +304,11 @@ share of attempts answered `412`:
   noise).
 - Writers that do conflict (the **same** workload, every writer replacing `/n`) get `412` as
   before: there the fallback is all there is.
+- A rebased write is validated on the head it lands on, so it can be `422` where it was valid on
+  its base (two writers each adding the last item a schema's `maxItems` allows), and a
+  dependency between members that the schema doesn't hold is only protected by a `test` op on
+  it. SPEC-FEEDBACK note 91 has both cases; the tests are in
+  `internal/client/rebase_experimental_test.go`.
 
 **A batch writes many steps to one document at once** (§7.5: one item, many steps, one token):
 

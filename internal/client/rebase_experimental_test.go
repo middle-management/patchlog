@@ -185,3 +185,99 @@ func TestExperimentalRebaseConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// A rebased write is validated on the head it lands on: two writes that are
+// each valid on their base and touch nothing in common can still break the
+// schema together, and the second is then a 422, not a 412. A dependency
+// the schema doesn't express is protected by a test op, whose path counts
+// as touched.
+func TestExperimentalRebaseValidatesOnHead(t *testing.T) {
+	t.Parallel()
+	s := clienttest.New(t, clienttest.Options{ExperimentalRebase: true})
+	ctx := context.Background()
+	c := s.Client(t, client.WithAuthor("ed"))
+	if _, err := c.CreateNamespace(ctx, "hot", map[string]any{"read": "public"}); err != nil {
+		t.Fatal(err)
+	}
+	sw, err := c.CreateDoc(ctx, "hot", "schema", map[string]any{
+		"$schema": "https://json-schema.org/draft/2020-12/schema",
+		"type":    "object",
+		"properties": map[string]any{
+			"list":  map[string]any{"type": "array", "maxItems": 2},
+			"start": map[string]any{"type": "integer"},
+			"end":   map[string]any{"type": "integer"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := c.CreateDoc(ctx, "hot", "d", map[string]any{"$schema": "/r/hot/schema/rev/" + sw.ID, "list": []any{1}, "start": 1, "end": 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rb := client.WithExperimentalRebase()
+	status := func(err error) int {
+		if ae, ok := client.AsAPIError(err); ok {
+			return ae.Status
+		}
+		return 0
+	}
+
+	// Valid alone, invalid together: both append a second item from the
+	// same base; the list may hold two.
+	first, err := c.Append(ctx, "hot", "d", base.ID, rbOp("add", "/list/-", 2), rb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Append(ctx, "hot", "d", base.ID, rbOp("add", "/list/-", 3), rb)
+	if status(err) != 422 {
+		t.Fatalf("a third item past maxItems: %v, want 422", err)
+	}
+	if h, _ := c.Head(ctx, "hot", "d"); h.ID != first.ID {
+		t.Fatalf("the refused write moved the head to %s", h.ID)
+	}
+	// The refusal holds nobody up: a write behind it still lands.
+	if _, err := c.Append(ctx, "hot", "d", base.ID, rbOp("replace", "/start", 2), rb); err != nil {
+		t.Fatalf("a valid write after the refused one: %v", err)
+	}
+
+	// An invariant the schema doesn't hold (start < end): one writer moved
+	// start to 2 above; another, from the same base, sets end to 2.
+	// Untested, the two rebase into start = end.
+	if _, err := c.Append(ctx, "hot", "d", base.ID, rbOp("replace", "/end", 2), rb); err != nil {
+		t.Fatalf("untested dependent write: %v", err)
+	}
+	_, d, err := c.Load(ctx, "hot", "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := d.Value.(map[string]any)
+	if sb, _ := json.Marshal(m["start"]); string(sb) != "2" {
+		t.Fatalf("start = %s", sb)
+	}
+	if eb, _ := json.Marshal(m["end"]); string(eb) != "2" {
+		t.Fatalf("end = %s", eb)
+	}
+	// With a test on what it depends on, the same write is a 412: start
+	// changed since its base.
+	guarded := []any{
+		map[string]any{"op": "test", "path": "/start", "value": 1},
+		map[string]any{"op": "replace", "path": "/end", "value": 3},
+	}
+	if _, err := c.Append(ctx, "hot", "d", base.ID, guarded, rb); status(err) != 412 {
+		t.Fatalf("a write that tests a value changed since its base: %v, want 412", err)
+	}
+	// A test on a member nobody wrote since is judged on the head and
+	// passes.
+	h, _ := c.Head(ctx, "hot", "d")
+	if _, err := c.Append(ctx, "hot", "d", h.ID, rbOp("replace", "/end", 9)); err != nil {
+		t.Fatal(err)
+	}
+	ok := []any{
+		map[string]any{"op": "test", "path": "/start", "value": 2},
+		map[string]any{"op": "add", "path": "/note", "value": "x"},
+	}
+	if _, err := c.Append(ctx, "hot", "d", h.ID, ok, rb); err != nil {
+		t.Fatalf("a test on an untouched member: %v", err)
+	}
+}

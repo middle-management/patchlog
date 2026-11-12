@@ -561,6 +561,22 @@ v0.82" (v0.81 Open 24).
       tests a value changed since is `412`; a `test` on an untouched path is simply evaluated
       on the head. Should a document's unlisted reads matter (a client that computed its patch
       from a member it didn't test)? The prototype says no: only what the patch set names.
+    - **Valid alone, invalid together.** A rebased write is validated on the head it lands
+      on, so two writes that are each valid on their base and touch nothing in common can
+      break the schema together (a list with `maxItems: 2` and two writers each adding a
+      second item). The second is `422` (`invalid`), not `412`: the document stays valid, but
+      the client is told its patch is wrong when it was right where it was written. A client
+      that asks for a rebase has to read a `422` as "read again and reconsider" too. Should
+      such a refusal have its own code, or be `412`?
+    - **Invariants the schema doesn't hold** (write skew). With `start` 1 and `end` 5, one
+      writer sets `start` to 2 and another, from the same base, sets `end` to 2: both rebase,
+      and `start` equals `end`. Plain `If-Match` would have made the second writer read again.
+      The protection is a `test` on what a write depends on, which the prototype counts as
+      touched (`412` when it changed since the base), and it is why a rebase must be asked for
+      per write, by a client whose patch set stands on its own. The text would need to say so
+      plainly, as §11's client guidance.
+    - **A refused write holds nothing up**: it is refused on its own, and the writes behind
+      it are judged on the head as it then is.
     - **Batches** aren't rebased in the prototype: an item's ids are predicted by the client
       for later steps and for `source`. A per-item flag would be the natural form.
     - **Rules and logs.** `/resource/parent` in rules, the log entry's `parent`, and
