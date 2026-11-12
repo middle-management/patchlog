@@ -1079,10 +1079,19 @@ stderr.
 `serve` also hosts a web playground at **`/playground/`** (turn it off with `-playground=false`).
 It is plain HTML/JS embedded in the binary and talks to the same-origin API; against a `-dev`
 server its writes carry the author box's name as `X-Author`, or `anonymous` until it is filled,
-since a write without one is `400` (§7.2). It has:
+since a write without one is `400` (§7.2).
+
+The page shows little until asked. With no namespace selected it is a start panel (open a
+namespace, create one, run an example). Each tab opens with its main cards and the others
+collapsed to a header; click a header to open it, and a flow that needs a closed card opens it.
+Namespace, Resource, History, Batch and Live are tabs; Catalog, Search, Schemas and Keys are
+under **More**. The request inspector is a strip at the bottom with the last request, which
+turns red after a failed one; click it, or "Inspector" in the top bar, for the full list. A "?"
+in a card's header shows its explanation, and "Show all help" shows them all. These choices are
+kept in the browser's localStorage. It has:
 
 - a request inspector with every request's preconditions, status, response headers and error body, plus "copy as curl";
-- namespace, resource, history, batch and branch editors;
+- namespace, resource, history, batch and branch editors, and a **Merge** card that plans, resolves and submits a branch's merge (§F.3, below);
 - live SSE feeds;
 - scripted examples: conflict and rebase, schema validation, rules, batch delete+restore, branch read-through;
 - a **Catalog** tab (Addendum B): the folder tree of a catalog namespace with its placed items
@@ -1172,6 +1181,39 @@ checks that the server assigned the predicted revision ids (and warns if not) an
 root's pinned `$schema` path with a copy button and a button that starts a new document with it
 in the Resource editor. A second Plan shows every row `unchanged`. Plain (not sealed)
 namespaces only.
+
+The **Merge** card on the Namespace tab merges a branch into its base (§F.3; see
+[Merge, rebase and cleanup](#merge-rebase-and-cleanup-addendum-f)). Press "merge…" on a row of the Branches table, or
+"Merge into {base}…" while a branch is selected, then **Plan**: the core classifies what the
+branch changed as `patchlog merge plan` does and the card lists each resource with its class
+(fast-forward, replay, merged, behind, purged), status, steps and conflicts. A conflicting
+resource gets a resolution box: a patch set against the base's head, or "keep base" or "delete".
+**Re-plan** sends the resolutions with the branch revision the shown plan was made from, so
+they stay against the plan you saw; "Plan afresh" drops that pin. A clean plan comes with its
+dry run. **Merge** posts the planned batch (`source: { ns, at }`) to `POST /ns/{base}/batch`
+from the browser, with the grant or author in the connection bar; if the base moved meanwhile
+(`412`) the card plans again instead of resubmitting. **Freeze branch** then writes `frozen:
+true` and `merged: { at }` to the branch in one config write.
+
+A second merge of the same branch only skips what an earlier replayed merge took when the base
+lists the merger in `merge.authors` (§F.3); otherwise the card shows the planner's hint, and the
+replayed resources come back as conflicts. Under `-dev`, fill the author box with a listed `sub`.
+
+The plan endpoint, `POST /playground/merge/plan`, takes `{branch, base?, squash?, branchAt?,
+resolve?: {resource: patch set | steps | "keep" | "delete"}, resolvedAt?}` and writes nothing. It reads in
+process through the API handler with the request's own headers, as the schema import planner
+does, through a transport that lets through `GET`, `HEAD` and `POST …/batch?dry-run=1` only. It
+answers the plan (`resources`, `clean`, `hints`, `ignoredMerges`, `leftOut`,
+`staleResolutions`) and, for a clean plan only, the `batch` in the wire format with `dryRun` or
+`dryRunError`. `resolvedAt: {resource: base head}` names the base head each resolution was
+written against; one whose resource the base has changed since isn't applied, is listed in
+`staleResolutions` and leaves the plan not clean, and the card asks to confirm or edit it. The
+endpoint refuses (`422 merge_unsupported`) what the page can't finish: a sealed or e2e
+namespace on either side (the planner holds no keys) and a base with `"signatures":
+"required"` (the page can't sign). A caller needs unrestricted read on the branch and the base
+to plan, as the planner reads their logs; a merger with less, who would have to copy the
+branch's blobs first (§7.8), gets the API's refusal. Use `patchlog merge` for those, and for a
+batch with a `config` change.
 
 The plan endpoint, `POST /playground/schema-import/plan`, takes `{ns, sources: [url…], files:
 [{name, content}…], name?}` and writes nothing. It reads the current heads in process through the

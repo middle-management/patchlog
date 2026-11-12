@@ -8,7 +8,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232456d6'/%3E%3Cpath d='M4 4h8M4 8h5M4 12h8' stroke='white' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="app.css">
 </head>
-<body>
+<body class="insp-off">
 
 <header class="top">
   <div class="brand">Patch Log <span>playground</span></div>
@@ -21,7 +21,7 @@
     <button id="exBtn" aria-haspopup="true" aria-expanded="false">Examples &#9662;</button>
     <div id="exMenu" class="menu-list" hidden></div>
   </div>
-  <button id="inspToggle" title="Show or hide the request inspector">Inspector <span id="inspCount" class="badge">0</span></button>
+  <button id="inspToggle" aria-expanded="false" aria-controls="inspector" title="Show or hide the request inspector">Inspector <span id="inspCount" class="badge">0</span></button>
 </header>
 
 <div class="ctx">
@@ -45,36 +45,62 @@
   <section id="exPanel" class="example" hidden></section>
 
   <div class="tabs" role="tablist">
+    <button id="startTab" class="start-tab" role="tab" aria-selected="false" aria-controls="startPanel" hidden>Start</button>
     <button class="tab" role="tab" data-tab="ns" aria-selected="true">Namespace</button>
     <button class="tab" role="tab" data-tab="res" aria-selected="false">Resource</button>
     <button class="tab" role="tab" data-tab="hist" aria-selected="false">History</button>
     <button class="tab" role="tab" data-tab="batch" aria-selected="false">Batch</button>
     <button class="tab" role="tab" data-tab="live" aria-selected="false">Live <span id="liveDot" class="dot" hidden></span></button>
-    <button class="tab" role="tab" data-tab="cat" aria-selected="false">Catalog</button>
-    <button class="tab" role="tab" data-tab="sr" aria-selected="false">Search</button>
-    <button class="tab" role="tab" data-tab="si" aria-selected="false">Schemas</button>
-    <button class="tab" role="tab" data-tab="keys" aria-selected="false">Keys <span id="idDot" class="dot" hidden></span></button>
+    <div class="menu tab-more">
+      <button id="moreBtn" class="more-btn" aria-haspopup="true" aria-expanded="false" aria-controls="moreMenu" title="Catalog, Search, Schemas, Keys"><span id="moreLabel">More</span><span id="moreDot" class="dot" title="This browser holds an identity (Keys)" hidden></span> &#9662;</button>
+      <div id="moreMenu" class="menu-list" hidden>
+        <button class="tab" role="tab" data-tab="cat" aria-selected="false">Catalog <span class="svc" hidden></span></button>
+        <button class="tab" role="tab" data-tab="sr" aria-selected="false">Search <span class="svc" hidden></span></button>
+        <button class="tab" role="tab" data-tab="si" aria-selected="false">Schemas <span class="svc" hidden></span></button>
+        <button class="tab" role="tab" data-tab="keys" aria-selected="false">Keys <span id="idDot" class="dot" hidden></span></button>
+      </div>
+    </div>
+    <button id="helpAll" class="help-all tiny" aria-pressed="false" title="Show every card's explanatory notes (otherwise behind each card's ? button)">? Show all help</button>
   </div>
+
+  <!-- ============ Start: no namespace selected ============ -->
+  <section id="startPanel" class="start" role="tabpanel" aria-labelledby="startTab" hidden>
+    <div class="start-head"><h2>Start with a namespace</h2><span class="muted">Namespace, Resource, History, Batch and Live work on one namespace. Catalog, Search, Schemas and Keys are under More.</span></div>
+    <div class="start-grid">
+      <div class="start-opt">
+        <h3>Open a namespace</h3>
+        <div class="row"><input id="startNs" class="mono" placeholder="name, e.g. demo" autocomplete="off" spellcheck="false" aria-label="Namespace to open"><button id="startOpen" class="primary">Open</button></div>
+        <div id="startKnown" class="chips"></div>
+      </div>
+      <div class="start-opt">
+        <h3>Create a namespace</h3>
+        <div class="row"><input id="startNewName" class="mono" placeholder="new name, e.g. matches" autocomplete="off" spellcheck="false" aria-label="Name of the new namespace"><button id="startCreate" class="primary">Create</button></div>
+        <details>
+          <summary class="muted small">Document (default <code>{"read":"public"}</code>)</summary>
+          <textarea id="startNewDoc" class="code" rows="3" spellcheck="false" aria-label="Namespace document">{"read":"public"}</textarea>
+        </details>
+        <div id="startMsg" class="start-msg" role="status" hidden></div>
+      </div>
+      <div class="start-opt">
+        <h3>Run an example</h3>
+        <div id="startEx" class="start-ex"></div>
+      </div>
+    </div>
+  </section>
 
   <!-- ============ Namespace ============ -->
   <section id="tab-ns" class="grid" role="tabpanel">
-    <div class="card">
+    <div class="card wide" data-card="ns.status" data-open>
       <header><h2>Namespace</h2><button id="nsRefresh" class="tiny">Refresh</button></header>
       <div id="nsStatus" class="muted">Select or add a namespace above.</div>
     </div>
 
-    <div class="card">
-      <header><h2>Create namespace</h2><span class="muted small">PATCH /ns/{ns} &middot; If-None-Match: *</span></header>
-      <div class="row"><label for="nsNewName">Name</label><input id="nsNewName" class="mono" placeholder="matches" autocomplete="off" spellcheck="false"></div>
-      <textarea id="nsNewDoc" class="code" rows="4" spellcheck="false" data-json>{"read":"public"}</textarea>
-      <div class="row"><button id="nsCreate" class="primary">Create</button><span class="note">The document becomes the genesis patch set <code>[{"op":"add","path":"","value":&hellip;}]</code>. <code>read</code> is <code>public</code> or <code>grant</code>. Members the spec doesn&rsquo;t define must start with <code>x-</code>, e.g. <code>"x-title"</code> (422 otherwise, &sect;7.4).</span></div>
-    </div>
-
-    <div class="card wide">
+    <div class="card wide" data-card="ns.doc" data-open>
       <header><h2>Namespace document</h2><span id="nsDocMeta" class="muted small"></span></header>
-      <div class="split">
-        <div><pre id="nsDoc" class="json empty">&mdash;</pre></div>
+      <div class="split even">
+        <div><h3 class="sub">Current document</h3><pre id="nsDoc" class="json empty">&mdash;</pre></div>
         <div>
+          <h3 class="sub">Change it</h3>
           <div class="row"><label for="nsIfMatch">If-Match (config id)</label><input id="nsIfMatch" class="mono" placeholder="X-Config-Revision" spellcheck="false"><button id="nsUseCfg" class="tiny" title="Reset to the current config id">use current</button></div>
           <textarea id="nsPatch" class="code" rows="6" spellcheck="false" data-json>[
   {"op":"add","path":"/rules","value":[]}
@@ -85,17 +111,51 @@
             <button id="nsFreeze">Freeze</button>
             <button id="nsUnfreeze">Unfreeze</button>
           </div>
-          <p class="note">PATCH /ns/{ns}. If-Match takes the <b>config id</b>, not the namespace head. Freeze/unfreeze are config patches on <code>/frozen</code>.</p>
+          <p class="note help">PATCH /ns/{ns}. If-Match takes the <b>config id</b>, not the namespace head. Freeze/unfreeze are config patches on <code>/frozen</code>.</p>
         </div>
       </div>
     </div>
 
-    <div class="card wide">
+    <div class="card wide" data-card="ns.merge" data-open id="mgCard" hidden>
+      <header><h2>Merge</h2><span class="muted small">&sect;F.3 &middot; planned by the core at /playground/merge/plan, written from this browser as one batch</span><button id="mgClose" class="tiny">Close</button></header>
+      <div id="mgHead" class="state-line"></div>
+      <div class="row">
+        <label class="check" title="Replaces a resource's steps with one set of the same effect: per-set history and test ops are lost (&sect;F.3)"><input type="checkbox" id="mgSquash"> squash</label>
+        <button id="mgPlan" class="primary" title="POST /playground/merge/plan: classifies and dry-runs, writes nothing">Plan</button>
+        <button id="mgFresh" class="tiny" hidden title="Plan from the branch's current head instead of the revision this plan is pinned to">Plan afresh</button>
+        <button id="mgClearRes" class="tiny" hidden title="Drop every resolution written here">Clear resolutions</button>
+        <span id="mgStatus" class="muted"></span>
+      </div>
+      <div id="mgNotes"></div>
+      <div id="mgPlanBox" hidden>
+        <div class="scroll mg-scroll"><table id="mgTbl"><thead><tr><th>resource</th><th>class</th><th>status</th><th>steps</th><th>conflicts, notes</th></tr></thead><tbody></tbody></table></div>
+        <div id="mgDry"></div>
+      </div>
+      <div class="row">
+        <button id="mgGo" class="primary" disabled title="POST /ns/{base}/batch with your own grant: the plan's batch, verbatim">Merge</button>
+        <button id="mgFreeze" hidden title="PATCH /ns/{branch}: frozen, and merged.at the base revision (&sect;F.6)">Freeze branch</button>
+      </div>
+      <div id="mgOut"></div>
+      <p class="note help">A merge is one batch into the base: fast-forwards keep the branch&rsquo;s ids, replays get new ones. A conflicting resource needs one resolution against the base&rsquo;s head: a patch set, <code>"keep"</code> (the base as it is) or <code>"delete"</code>. A re-plan stays pinned to the branch revision shown, so resolutions keep meaning what they were written against. If the base moves before the batch lands it answers <code>412</code>, nothing is written, and the page plans again. Sealed and e2e namespaces, required signatures and blobs that need copying are for <code>patchlog merge</code>.</p>
+    </div>
+
+    <div class="card wide" data-card="ns.branches">
+      <header><h2>Branches</h2><span class="muted small">GET /ns/{ns}/branches</span></header>
+      <div class="scroll"><table id="brTbl"><thead><tr><th>name</th><th>at</th><th>frozen</th><th>purged</th><th>successor</th><th></th></tr></thead><tbody></tbody></table></div>
+    </div>
+
+    <div class="card wide" data-card="ns.heads">
+      <header><h2>Heads</h2><span id="headsMeta" class="muted small"></span><button id="headsMore" class="tiny" hidden>Load more</button></header>
+      <div class="scroll"><table id="headsTbl"><thead><tr><th>resource</th><th>kind</th><th>target</th></tr></thead><tbody></tbody></table></div>
+      <p class="note help">GET /ns/{ns}/rev/{id}/heads &mdash; click a row to open the resource.</p>
+    </div>
+
+    <div class="card wide" data-card="ns.log">
       <header><h2>Namespace log</h2><span id="nsLogMeta" class="muted small"></span></header>
       <div class="scroll"><table id="nsLog"><thead><tr><th>kind</th><th>resource</th><th>target</th><th>author</th><th>created</th><th>id</th></tr></thead><tbody></tbody></table></div>
     </div>
 
-    <div class="card wide">
+    <div class="card wide" data-card="ns.undo">
       <header><h2>Undo / redo</h2><span class="muted small">&sect;11.2 &middot; gestures from the log, inverse as one batch with <code>Undoes</code></span><button id="undoRefresh" class="tiny">Refresh</button></header>
       <div class="row">
         <label for="undoAuthor">Author</label><input id="undoAuthor" class="mono" spellcheck="false" autocomplete="off">
@@ -108,21 +168,10 @@
         <button id="undoAny" class="tiny">Undo</button><button id="redoAny" class="tiny">Redo</button>
       </div>
       <div id="undoOut" hidden></div>
-      <p class="note">The stack is rebuilt from the namespace log: the author&rsquo;s gestures minus those the same author undid and didn&rsquo;t redo; undos by others are shown, not counted. An undo reads each resource&rsquo;s log after the gesture, refuses on overlapping later writes (a <b>conflict</b>), and reports a pruned revision, a missing blob or a document that no longer validates as <b>undo impossible</b>. The batch is guarded by <code>ifMatch</code> and re-planned on <code>412</code>.</p>
+      <p class="note help">The stack is rebuilt from the namespace log: the author&rsquo;s gestures minus those the same author undid and didn&rsquo;t redo; undos by others are shown, not counted. An undo reads each resource&rsquo;s log after the gesture, refuses on overlapping later writes (a <b>conflict</b>), and reports a pruned revision, a missing blob or a document that no longer validates as <b>undo impossible</b>. The batch is guarded by <code>ifMatch</code> and re-planned on <code>412</code>.</p>
     </div>
 
-    <div class="card wide">
-      <header><h2>Heads</h2><span id="headsMeta" class="muted small"></span><button id="headsMore" class="tiny" hidden>Load more</button></header>
-      <div class="scroll"><table id="headsTbl"><thead><tr><th>resource</th><th>kind</th><th>target</th></tr></thead><tbody></tbody></table></div>
-      <p class="note">GET /ns/{ns}/rev/{id}/heads &mdash; click a row to open the resource.</p>
-    </div>
-
-    <div class="card">
-      <header><h2>Branches</h2><span class="muted small">GET /ns/{ns}/branches</span></header>
-      <div class="scroll"><table id="brTbl"><thead><tr><th>name</th><th>at</th><th>frozen</th><th>purged</th><th>successor</th><th></th></tr></thead><tbody></tbody></table></div>
-    </div>
-
-    <div class="card">
+    <div class="card wide" data-card="ns.brNew">
       <header><h2>Create branch</h2><span class="muted small">POST /ns/{base}/branches &middot; If-None-Match: *</span></header>
       <div class="row"><label for="brName">Name</label><input id="brName" class="mono" placeholder="release-7" autocomplete="off" spellcheck="false"></div>
       <div class="row"><label for="brAt">At</label><input id="brAt" class="mono" placeholder="namespace revision (default: current head)" spellcheck="false"><button id="brUseHead" class="tiny">use head</button></div>
@@ -130,17 +179,24 @@
       <div class="row"><button id="brCreate" class="primary">Create branch</button></div>
     </div>
 
-    <div class="card danger-zone">
+    <div class="card wide" data-card="ns.create">
+      <header><h2>Create namespace</h2><span class="muted small">PATCH /ns/{ns} &middot; If-None-Match: *</span></header>
+      <div class="row"><label for="nsNewName">Name</label><input id="nsNewName" class="mono" placeholder="matches" autocomplete="off" spellcheck="false"></div>
+      <textarea id="nsNewDoc" class="code" rows="4" spellcheck="false" data-json>{"read":"public"}</textarea>
+      <div class="row"><button id="nsCreate" class="primary">Create</button><span class="note help">The document becomes the genesis patch set <code>[{"op":"add","path":"","value":&hellip;}]</code>. <code>read</code> is <code>public</code> or <code>grant</code>. Members the spec doesn&rsquo;t define must start with <code>x-</code>, e.g. <code>"x-title"</code> (422 otherwise, &sect;7.4).</span></div>
+    </div>
+
+    <div class="card danger-zone wide" data-card="ns.purge">
       <header><h2>Purge namespace</h2><span class="muted small">POST /ns/{ns}/purge</span></header>
       <div class="row"><label for="nsPurgeIm">If-Match (ns_id)</label><input id="nsPurgeIm" class="mono" placeholder="namespace head" spellcheck="false"><button id="nsPurgeUse" class="tiny">use head</button></div>
       <div class="row"><button id="nsPurge" class="danger">Purge namespace&hellip;</button></div>
-      <p class="note">Irreversible. Needs the namespace frozen (else <code>409 not_frozen</code>) and no live branches (<code>409 in_use</code>).</p>
+      <p class="note warn-note">Irreversible. Needs the namespace frozen (else <code>409 not_frozen</code>) and no live branches (<code>409 in_use</code>).</p>
     </div>
   </section>
 
   <!-- ============ Resource ============ -->
   <section id="tab-res" class="grid" role="tabpanel" hidden>
-    <div class="card">
+    <div class="card" data-card="res.doc" data-open>
       <header><h2>Resource</h2><button id="resRefresh" class="tiny">Refresh</button></header>
       <div id="resState" class="muted">Pick a resource from the heads table, or type a name above.</div>
       <div id="resSeal" hidden></div>
@@ -148,7 +204,7 @@
       <div id="resBlobs" hidden></div>
     </div>
 
-    <div class="card">
+    <div class="card" data-card="res.patch" data-open>
       <header><h2>Patch</h2><span class="muted small">PATCH /r/{ns}/{name} &middot; application/json-patch+json</span></header>
       <textarea id="patch" class="code" rows="7" spellcheck="false" data-json>[
   {"op":"add","path":"","value":{"title":"Hello"}}
@@ -183,27 +239,27 @@
         <button id="attachBtn" class="tiny">Upload &amp; insert</button>
       </div>
       <div id="attachOut" hidden></div>
-      <p class="note">Edit If-Match to test <code>412</code>; resend an identical request to see the idempotent-retry <code>200</code>. Blank If-Match sends none (<code>428</code>).</p>
+      <p class="note help">Edit If-Match to test <code>412</code>; resend an identical request to see the idempotent-retry <code>200</code>. Blank If-Match sends none (<code>428</code>).</p>
     </div>
 
-    <div class="card">
-      <header><h2>Purge</h2><span class="muted small">POST &hellip;/purge</span></header>
-      <div class="row"><button id="btnPurge" class="danger">Purge resource&hellip;</button><label class="check"><input type="checkbox" id="purgeForce"> force=1 (schema in use; needs * key)</label></div>
-      <p class="note">Uses the If-Match field (head or tombstone). Content is removed for good.</p>
-    </div>
-
-    <div class="card">
+    <div class="card wide danger-zone" data-card="res.prune">
       <header><h2>Prune</h2><span class="muted small">POST &hellip;/prune</span></header>
       <div class="row"><label for="pruneH">Horizon</label><input id="pruneH" class="mono" placeholder="revision id" spellcheck="false"></div>
       <div class="row"><label for="pruneKeep">Keep</label><input id="pruneKeep" class="mono" placeholder="comma-separated ids (optional)" spellcheck="false"></div>
       <div class="row"><button id="btnPrune">Prune</button></div>
-      <p class="note">Drops patch sets before the horizon; ids stay. Pick a horizon in History. Pruning may need a <code>*</code> key.</p>
+      <p class="note warn-note">Drops patch sets before the horizon; ids stay. Pick a horizon in History. Pruning may need a <code>*</code> key.</p>
+    </div>
+
+    <div class="card wide danger-zone" data-card="res.purge">
+      <header><h2>Purge</h2><span class="muted small">POST &hellip;/purge</span></header>
+      <div class="row"><button id="btnPurge" class="danger">Purge resource&hellip;</button><label class="check"><input type="checkbox" id="purgeForce"> force=1 (schema in use; needs * key)</label></div>
+      <p class="note warn-note">Uses the If-Match field (head or tombstone). Content is removed for good.</p>
     </div>
   </section>
 
   <!-- ============ History ============ -->
   <section id="tab-hist" class="grid" role="tabpanel" hidden>
-    <div class="card wide">
+    <div class="card wide" data-card="hist.main" data-open>
       <header><h2>History</h2><span id="histMeta" class="muted small"></span><button id="histRefresh" class="tiny">Refresh</button></header>
       <div class="split">
         <ul id="timeline" class="timeline"></ul>
@@ -214,7 +270,7 @@
 
   <!-- ============ Batch ============ -->
   <section id="tab-batch" class="grid" role="tabpanel" hidden>
-    <div class="card wide">
+    <div class="card wide" data-card="batch.main" data-open>
       <header><h2>Batch</h2><span class="muted small">POST /ns/{ns}/batch</span></header>
       <textarea id="batchBody" class="code" rows="18" spellcheck="false" data-json></textarea>
       <div class="chips" id="batchTpl"></div>
@@ -224,22 +280,22 @@
         <button id="batchExample">Reset example</button>
       </div>
       <div id="batchOut" hidden></div>
-      <p class="note">Items: <code>resource</code>, exactly one of <code>ifMatch</code> / <code>ifNoneMatch:"*"</code>, and <code>steps</code> (patch sets or <code>"delete"</code>). Optional <code>config</code> <code>{ifMatch, patches}</code> and <code>source</code> <code>{ns, at}</code>. Dry run is <code>?dry-run=1</code>: it reports the ids a submit would produce and writes nothing.</p>
+      <p class="note help">Items: <code>resource</code>, exactly one of <code>ifMatch</code> / <code>ifNoneMatch:"*"</code>, and <code>steps</code> (patch sets or <code>"delete"</code>). Optional <code>config</code> <code>{ifMatch, patches}</code> and <code>source</code> <code>{ns, at}</code>. Dry run is <code>?dry-run=1</code>: it reports the ids a submit would produce and writes nothing.</p>
     </div>
   </section>
 
   <!-- ============ Live ============ -->
   <section id="tab-live" class="grid" role="tabpanel" hidden>
-    <div class="card">
+    <div class="card" data-card="live.subs" data-open>
       <header><h2>Subscriptions</h2></header>
       <div class="stream"><label class="check"><input type="checkbox" id="liveNs"> Namespace events</label><span id="liveNsSt" class="badge">off</span></div>
       <div class="stream"><code id="liveNsUrl" class="muted small"></code></div>
       <div class="stream"><label class="check"><input type="checkbox" id="liveRes"> Resource events</label><span id="liveResSt" class="badge">off</span></div>
       <div class="stream"><code id="liveResUrl" class="muted small"></code></div>
       <div id="liveWarn" class="warn-box" hidden>EventSource cannot send custom headers, so <code>Authorization</code> and <code>X-Author</code> are <b>not</b> sent on these streams. That is fine for <code>serve -dev</code> and public namespaces; a namespace that needs a grant will answer 401/403/404 here.</div>
-      <p class="note">Streams start at <code>?since=</code> the current head, so only new entries arrive. Views refresh automatically on each event.</p>
+      <p class="note help">Streams start at <code>?since=</code> the current head, so only new entries arrive. Views refresh automatically on each event.</p>
     </div>
-    <div class="card">
+    <div class="card" data-card="live.feed" data-open>
       <header><h2>Live feed</h2><span id="feedCount" class="muted small"></span><button id="feedClear" class="tiny">Clear</button></header>
       <ul id="feed" class="feed"><li class="muted">No events yet.</li></ul>
     </div>
@@ -247,7 +303,7 @@
 
   <!-- ============ Catalog ============ -->
   <section id="tab-cat" class="grid" role="tabpanel" hidden>
-    <div class="card wide">
+    <div class="card wide" data-card="cat.pick" data-open>
       <header><h2>Catalog</h2><span class="muted small">Addendum B &middot; folders and placements in a catalog namespace</span></header>
       <div class="row">
         <label for="catPick">Catalog</label>
@@ -261,29 +317,27 @@
       <div id="catStatus" class="muted">Load a catalog namespace (the demo stack seeds <code>cat</code>, a tree, <code>topics</code>, a DAG, and <code>drive</code>, a file tree).</div>
     </div>
 
-    <div class="card wide">
+    <div class="card" data-card="cat.tree" data-open>
       <header><h2>Tree</h2><span id="catTreeMeta" class="muted small"></span></header>
       <div id="catTree" class="cat-tree"><p class="muted">&mdash;</p></div>
-      <p class="note">Click a node to select it; item names open the item in the Resource tab. <span class="badge info">subject: role</span> chips are the effective roles derived in this browser from <code>$access</code> on the node and its ancestors (&sect;B.11.2); bold ones are assigned on the node itself. <span class="badge">move</span>/<span class="badge">place</span> mark tree powers where a role granting them is assigned (they are never inherited).</p>
+      <p class="note help">Click a node to select it; item names open the item in the Resource tab. <span class="badge info">subject: role</span> chips are the effective roles derived in this browser from <code>$access</code> on the node and its ancestors (&sect;B.11.2); bold ones are assigned on the node itself. <span class="badge">move</span>/<span class="badge">place</span> mark tree powers where a role granting them is assigned (they are never inherited).</p>
     </div>
 
-    <div class="card">
+    <div class="card" data-card="cat.sel" data-open>
       <header><h2>Selected node</h2><span id="catSelMeta" class="muted small"></span></header>
       <div id="catSel" class="muted">Select a node in the tree.</div>
     </div>
 
-    <div class="card">
-      <header><h2>Move / reorder / remove</h2><span class="muted small">PATCH or DELETE /r/{catalog}/{node}</span></header>
-      <div class="row"><label for="catMoveTo">New parent(s)</label><select id="catMoveTo" multiple size="4"></select></div>
-      <div class="row"><label for="catMoveOrder">Order</label><input id="catMoveOrder" class="mono" placeholder="fractional key, e.g. a1V (optional)" spellcheck="false"></div>
-      <div class="row">
-        <button id="catMove" class="primary" title="replace /parents (or only /parents/0/order when the parent stays)">Move</button>
-        <button id="catRemove" class="danger" title="DELETE the node with If-Match: its head">Remove from catalog&hellip;</button>
-      </div>
-      <p class="note">A move is one write to the moving node, guarded by <code>If-Match</code> (&sect;B.2). Removing a placement leaves the content untouched; removing a folder does not cascade, its children become orphans (&sect;B.7).</p>
+    <div class="card wide" data-card="cat.place">
+      <header><h2>Place item</h2><span class="muted small">PATCH /r/{catalog}/{ns}.{name} &middot; If-None-Match: *</span></header>
+      <div class="row"><label for="catPItem">Item</label><input id="catPItem" class="mono" list="catItemList" placeholder="/r/demo/derby" autocomplete="off" spellcheck="false"><datalist id="catItemList"></datalist></div>
+      <div class="row"><label for="catPParent">Folder</label><select id="catPParent"></select><input id="catPOrder" class="mono" placeholder="order (optional)" spellcheck="false"></div>
+      <textarea id="catPAccess" class="code" rows="2" spellcheck="false" data-json placeholder='optional $access to share this one item, e.g. {"user:li":["reader"]}'></textarea>
+      <div class="row"><button id="catPCreate" class="primary">Place</button></div>
+      <p class="note help">The placement's name is the item, <code>{ns}.{name}</code>, so an item is placed at most once per catalog (&sect;B.2). A placement may name an item that does not exist yet; it is dangling until it does. Placements carry a fresh <code>$nonce</code> (&sect;B.11.4).</p>
     </div>
 
-    <div class="card">
+    <div class="card wide" data-card="cat.folder">
       <header><h2>New folder</h2><span class="muted small">PATCH /r/{catalog}/{name} &middot; If-None-Match: *</span></header>
       <div class="row"><label for="catFName">Name</label><input id="catFName" class="mono" placeholder="season-2027 (no dot)" autocomplete="off" spellcheck="false"></div>
       <div class="row"><label for="catFTitle">Title</label><input id="catFTitle" placeholder="Season 2027" autocomplete="off"></div>
@@ -292,21 +346,23 @@
       <div class="row"><button id="catFCreate" class="primary">Create folder</button></div>
     </div>
 
-    <div class="card">
-      <header><h2>Place item</h2><span class="muted small">PATCH /r/{catalog}/{ns}.{name} &middot; If-None-Match: *</span></header>
-      <div class="row"><label for="catPItem">Item</label><input id="catPItem" class="mono" list="catItemList" placeholder="/r/demo/derby" autocomplete="off" spellcheck="false"><datalist id="catItemList"></datalist></div>
-      <div class="row"><label for="catPParent">Folder</label><select id="catPParent"></select><input id="catPOrder" class="mono" placeholder="order (optional)" spellcheck="false"></div>
-      <textarea id="catPAccess" class="code" rows="2" spellcheck="false" data-json placeholder='optional $access to share this one item, e.g. {"user:li":["reader"]}'></textarea>
-      <div class="row"><button id="catPCreate" class="primary">Place</button></div>
-      <p class="note">The placement's name is the item, <code>{ns}.{name}</code>, so an item is placed at most once per catalog (&sect;B.2). A placement may name an item that does not exist yet; it is dangling until it does. Placements carry a fresh <code>$nonce</code> (&sect;B.11.4).</p>
+    <div class="card wide" data-card="cat.move">
+      <header><h2>Move / reorder / remove</h2><span class="muted small">PATCH or DELETE /r/{catalog}/{node}</span></header>
+      <div class="row"><label for="catMoveTo">New parent(s)</label><select id="catMoveTo" multiple size="4"></select></div>
+      <div class="row"><label for="catMoveOrder">Order</label><input id="catMoveOrder" class="mono" placeholder="fractional key, e.g. a1V (optional)" spellcheck="false"></div>
+      <div class="row">
+        <button id="catMove" class="primary" title="replace /parents (or only /parents/0/order when the parent stays)">Move</button>
+        <button id="catRemove" class="danger" title="DELETE the node with If-Match: its head">Remove from catalog&hellip;</button>
+      </div>
+      <p class="note help">A move is one write to the moving node, guarded by <code>If-Match</code> (&sect;B.2). Removing a placement leaves the content untouched; removing a folder does not cascade, its children become orphans (&sect;B.7).</p>
     </div>
 
-    <div class="card wide">
+    <div class="card wide" data-card="cat.out">
       <header><h2>Last catalog write</h2></header>
       <div id="catOut" class="muted">Writes go to the catalog namespace through the core API and also appear in the inspector.</div>
     </div>
 
-    <div class="card wide">
+    <div class="card wide" data-card="cat.problems">
       <header><h2>Problems</h2><span id="catProbMeta" class="muted small"></span></header>
       <div id="catProblems" class="muted">&mdash;</div>
     </div>
@@ -315,7 +371,7 @@
   <!-- ============ Keys ============ -->
   <!-- ============ Search ============ -->
   <section id="tab-sr" class="grid" role="tabpanel" hidden>
-    <div class="card wide">
+    <div class="card wide" data-card="sr.query" data-open>
       <header><h2>Search</h2><span class="muted small">Addendum A &middot; the index service's query API, read through the core's proxy at /playground/index/</span><button id="srRefresh" class="tiny" title="ask the index again which namespaces it follows">Refresh</button></header>
       <div class="row">
         <label for="srPick">Namespace</label>
@@ -342,18 +398,18 @@
       <div id="srStatus" class="muted">Search a namespace the index follows (the demo stack indexes <code>demo</code>: try <code>derby</code>).</div>
     </div>
 
-    <div class="card wide">
+    <div class="card wide" data-card="sr.results" data-open>
       <header><h2>Results</h2><span id="srMeta" class="muted small"></span></header>
       <div id="srResults" class="muted">&mdash;</div>
       <div id="srCountsOut"></div>
       <div class="row"><button id="srMore" class="tiny" hidden>More results</button></div>
-      <p class="note">Resource names open in the Resource tab. Facet chips and counts add a filter. A hit is the document's head at the index's checkpoint; the index returns ids and indexed fields, not snippets. Sealed namespaces are decrypted here with the keys the Keys tab holds (&sect;E.2.6); end-to-end ones have no server index.</p>
+      <p class="note help">Resource names open in the Resource tab. Facet chips and counts add a filter. A hit is the document's head at the index's checkpoint; the index returns ids and indexed fields, not snippets. Sealed namespaces are decrypted here with the keys the Keys tab holds (&sect;E.2.6); end-to-end ones have no server index.</p>
     </div>
   </section>
 
   <!-- ============ Schemas: import external JSON Schemas (§6.1) ============ -->
   <section id="tab-si" class="grid" role="tabpanel" hidden>
-    <div class="card wide">
+    <div class="card wide" data-card="si.import" data-open>
       <header><h2>Import external schemas</h2><span class="muted small">&sect;6.1 &middot; the same plan as <code>patchlog schema import</code>, computed by the core at /playground/schema-import/plan</span><button id="siRefresh" class="tiny" title="ask the core again whether it fetches URLs">Refresh</button></header>
       <div class="row">
         <label for="siPick">Namespace</label>
@@ -387,7 +443,7 @@
       </div>
     </div>
 
-    <div class="card wide" id="siPlanCard" hidden>
+    <div class="card wide" data-card="si.plan" data-open id="siPlanCard" hidden>
       <header><h2>Plan</h2><span id="siPlanMeta" class="muted small"></span></header>
       <div id="siNotes"></div>
       <div class="scroll"><table id="siTbl"><thead><tr><th>source</th><th>resource</th><th>action</th><th>revision path</th><th></th></tr></thead><tbody></tbody></table></div>
@@ -395,17 +451,17 @@
         <div class="row"><b id="siViewName" class="mono"></b><button id="siViewClose" class="tiny">Close</button></div>
         <pre id="siView" class="json"></pre>
       </div>
-      <p class="note">Every <code>$ref</code> between the documents is rewritten to the immutable revision path of its target. Import writes the plan from this browser with your own grant: <code>If-None-Match: *</code> for a create, <code>If-Match: head</code> for an append.</p>
+      <p class="note help">Every <code>$ref</code> between the documents is rewritten to the immutable revision path of its target. Import writes the plan from this browser with your own grant: <code>If-None-Match: *</code> for a create, <code>If-Match: head</code> for an append.</p>
     </div>
 
-    <div class="card wide" id="siResultCard" hidden>
+    <div class="card wide" data-card="si.result" data-open data-help id="siResultCard" hidden>
       <header><h2>Use the schema</h2><span id="siResultMeta" class="muted small"></span></header>
       <div id="siResult"></div>
     </div>
   </section>
 
   <section id="tab-keys" class="grid" role="tabpanel" hidden>
-    <div class="card">
+    <div class="card" data-card="keys.id" data-open>
       <header><h2>Identity</h2><span class="muted small">X25519 key pair (&sect;E.2.3, &sect;E.3.2)</span></header>
       <div id="idStatus" class="muted">No identity yet.</div>
       <div class="row">
@@ -415,19 +471,19 @@
       </div>
       <textarea id="idImport" class="code" rows="2" spellcheck="false" placeholder='import: private key (base64url d) or a JWK {"kty":"OKP","crv":"X25519","d":&hellip;}'></textarea>
       <div class="row"><button id="idImportBtn">Import</button></div>
-      <p class="note">Kept in this browser's localStorage. An E2 reader puts the public JWK in its grant's root block as <code>enc</code>, so <code>POST /ns/{ns}/keys</code> answers with keys wrapped to it (HPKE). In an E3 namespace a key holder adds it to the keyring.</p>
+      <p class="note help">Kept in this browser's localStorage. An E2 reader puts the public JWK in its grant's root block as <code>enc</code>, so <code>POST /ns/{ns}/keys</code> answers with keys wrapped to it (HPKE). In an E3 namespace a key holder adds it to the keyring.</p>
     </div>
 
-    <div class="card">
+    <div class="card" data-card="keys.held" data-open>
       <header><h2>Keys held</h2><button id="keysClear" class="tiny">Clear</button></header>
       <div class="scroll"><table id="keysTbl"><thead><tr><th>kid</th><th>name</th><th>from</th></tr></thead><tbody></tbody></table></div>
       <div class="row"><label for="keysNs">Fetch</label><input id="keysNs" class="mono" placeholder="namespace" spellcheck="false"></div>
       <div class="row"><input id="keysEpochs" class="mono" placeholder="epochs, e.g. 1,2 (optional)" spellcheck="false"><input id="keysRes" class="mono" placeholder="resources (optional)" spellcheck="false"></div>
       <div class="row"><button id="keysFetch">POST /ns/{ns}/keys</button></div>
-      <p class="note">Keys live in memory only; reloading drops them. They are fetched on demand whenever a response is <code>application/jose</code>.</p>
+      <p class="note help">Keys live in memory only; reloading drops them. They are fetched on demand whenever a response is <code>application/jose</code>.</p>
     </div>
 
-    <div class="card wide">
+    <div class="card wide" data-card="keys.ring">
       <header><h2>E3 keyring</h2><span id="krMeta" class="muted small"></span><button id="krRefresh" class="tiny">Refresh</button></header>
       <div id="krStatus" class="muted">Select an e2e namespace above.</div>
       <div class="row">
@@ -438,17 +494,17 @@
         <button id="krKnow" class="tiny" title="Remember the key below: keyring entries it wrapped open here, and it can be kept in a rotation">Remember key</button>
       </div>
       <textarea id="krReader" class="code" rows="2" spellcheck="false" placeholder='reader public key: {"kty":"OKP","crv":"X25519","x":&hellip;} or just x'></textarea>
-      <p class="note">The <code>keyring</code> resource holds each epoch key wrapped per recipient (<code>to</code>) in HPKE auth mode under the admin key that wrapped it (<code>from</code>), both by thumbprint; the server only relays it (&sect;E.3.2). An entry opens only with its sender's public key: this identity's, or one remembered here. Rotating leaves out unchecked recipients (revocation) and needs a grant chained to a <code>*</code> key.</p>
+      <p class="note help">The <code>keyring</code> resource holds each epoch key wrapped per recipient (<code>to</code>) in HPKE auth mode under the admin key that wrapped it (<code>from</code>), both by thumbprint; the server only relays it (&sect;E.3.2). An entry opens only with its sender's public key: this identity's, or one remembered here. Rotating leaves out unchecked recipients (revocation) and needs a grant chained to a <code>*</code> key.</p>
     </div>
 
-    <div class="card">
+    <div class="card wide" data-card="keys.jwe">
       <header><h2>Decrypt a JWE</h2></header>
       <textarea id="jweIn" class="code" rows="4" spellcheck="false" placeholder="paste a compact JWE (header..iv.ciphertext.tag)"></textarea>
       <div class="row"><input id="jweRes" class="mono" placeholder="resource, for content keys K_r (optional)" spellcheck="false"><button id="jweOpen">Decrypt</button></div>
       <div id="jweOut"></div>
     </div>
 
-    <div class="card">
+    <div class="card wide" data-card="keys.selftest">
       <header><h2>Self-test</h2><button id="selfTest" class="tiny">Run</button></header>
       <div id="selfOut" class="muted">Checks this page's HPKE, HKDF, JWE and keyring code against vectors made by the Go implementation (selftest.json).</div>
     </div>
@@ -473,7 +529,15 @@
 </aside>
 </div>
 
-<button id="inspFloat" class="floating-insp primary">Inspector</button>
+<button id="inspFloat" class="insp-strip" aria-expanded="false" aria-controls="inspector" title="Open the request inspector">
+  <span class="insp-strip-title">Inspector</span>
+  <span id="stripPill" class="pill pend">&mdash;</span>
+  <span id="stripMeth" class="meth"></span>
+  <span id="stripPath" class="path">no requests yet</span>
+  <span id="stripErr" class="strip-err"></span>
+  <span id="stripErrs" class="badge err" hidden></span>
+  <span id="stripCount" class="badge" title="requests so far">0</span>
+</button>
 <script src="seal.js"></script>
 <script src="app.js"></script>
 </body>
