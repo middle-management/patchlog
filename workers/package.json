@@ -1,0 +1,18 @@
+{
+  "name": "patchlog-workers",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --var AUTH:disabled",
+    "dev:grants": "node bench/auth-smoke.mjs --serve",
+    "deploy": "wrangler deploy",
+    "smoke": "node bench/smoke.mjs",
+    "bench": "node bench/load.mjs",
+    "build": "worker-build --release crates/worker",
+    "workerd": "mkdir -p .workerd-data && workerd serve bench/workerd.capnp --directory-path disk=$PWD/.workerd-data"
+  },
+  "devDependencies": {
+    "undici": "^7.30.1",
+    "wrangler": "4.156.2"
+  }
+}
