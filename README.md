@@ -1082,7 +1082,7 @@ server its writes carry the author box's name as `X-Author`, or `anonymous` unti
 since a write without one is `400` (§7.2). It has:
 
 - a request inspector with every request's preconditions, status, response headers and error body, plus "copy as curl";
-- namespace, resource, history, batch and branch editors;
+- namespace, resource, history, batch and branch editors, and a **Merge** card that plans, resolves and submits a branch's merge (§F.3, below);
 - live SSE feeds;
 - scripted examples: conflict and rebase, schema validation, rules, batch delete+restore, branch read-through;
 - a **Catalog** tab (Addendum B): the folder tree of a catalog namespace with its placed items
@@ -1172,6 +1172,30 @@ checks that the server assigned the predicted revision ids (and warns if not) an
 root's pinned `$schema` path with a copy button and a button that starts a new document with it
 in the Resource editor. A second Plan shows every row `unchanged`. Plain (not sealed)
 namespaces only.
+
+The **Merge** card on the Namespace tab merges a branch into its base (§F.3; see
+[Merge, rebase and cleanup](#merge-rebase-and-cleanup-addendum-f)). Press "merge…" on a row of the Branches table, or
+"Merge into {base}…" while a branch is selected, then **Plan**: the core classifies what the
+branch changed as `patchlog merge plan` does and the card lists each resource with its class
+(fast-forward, replay, merged, behind, purged), status, steps and conflicts. A conflicting
+resource gets a resolution box: a patch set against the base's head, or "keep base" or "delete".
+**Re-plan** sends the resolutions with the branch revision the shown plan was made from, so
+they stay against the plan you saw; "Plan afresh" drops that pin. A clean plan comes with its
+dry run. **Merge** posts the planned batch (`source: { ns, at }`) to `POST /ns/{base}/batch`
+from the browser, with the grant or author in the connection bar; if the base moved meanwhile
+(`412`) the card plans again instead of resubmitting. **Freeze branch** then writes `frozen:
+true` and `merged: { at }` to the branch in one config write.
+
+The plan endpoint, `POST /playground/merge/plan`, takes `{branch, base?, squash?, branchAt?,
+resolve?: {resource: patch set | steps | "keep" | "delete"}}` and writes nothing. It reads in
+process through the API handler with the request's own headers, as the schema import planner
+does, through a transport that lets through `GET`, `HEAD` and `POST …/batch?dry-run=1` only. It
+answers the plan (`resources`, `clean`, `hints`, `ignoredMerges`, `leftOut`), the `batch` in the
+wire format and, for a clean plan, `dryRun` or `dryRunError`. It refuses (`422
+merge_unsupported`) what the page can't finish: a sealed or e2e namespace on either side (the
+planner holds no keys), a base with `"signatures": "required"` (the page can't sign), and a
+merge that would first copy the branch's blobs, which a merger without unrestricted read on the
+branch must (§7.8). Use `patchlog merge` for those, and for a batch with a `config` change.
 
 The plan endpoint, `POST /playground/schema-import/plan`, takes `{ns, sources: [url…], files:
 [{name, content}…], name?}` and writes nothing. It reads the current heads in process through the

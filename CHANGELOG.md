@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Playground: merge a branch (§F.3).** Each row of the Namespace tab's Branches table has a
+  "merge…" button, and a branch offers "Merge into {base}…". The Merge card shows the plan per
+  resource (class, status, steps, conflicts with their paths), takes a resolution for each
+  conflicting resource (a patch set against the base's head, "keep base" or "delete"), shows the
+  dry run, submits the batch and can then freeze the branch with `merged.at`. Planning is done
+  by a new endpoint, `POST /playground/merge/plan`, which runs the same code as `patchlog merge
+  plan` in process with the caller's own headers and writes nothing: its transport lets through
+  reads and a batch dry run only. The page submits the batch itself through the normal API.
+  Plain namespaces only: a sealed or e2e namespace, a base that requires signatures, and a merge
+  that would have to copy blobs are refused with a pointer to `patchlog merge`. An explicit
+  `config` change in the batch isn't offered.
+
 ## v0.28.0
 
 Implements spec **v0.82** (previously **v0.81**). v0.82 answers the reference's 77 notes on
