@@ -320,7 +320,16 @@ func (s *importer) mergePlan(w http.ResponseWriter, r *http.Request) {
 			out["dryRunError"] = de
 		}
 	}
-	// After the dry run, so the batch is the one it judged.
-	out["batch"] = mergeBatchBody(p)
+	// After the dry run, so the batch is the one it judged. A plan that
+	// still needs a person has none to submit.
+	out["batch"] = nil
+	if p.Clean() {
+		out["batch"] = mergeBatchBody(p)
+	}
+	for _, k := range []string{"leftOut", "mergeAuthors", "ignoredMerges", "hints"} {
+		if b, _ := json.Marshal(out[k]); string(b) == "null" {
+			out[k] = []any{}
+		}
+	}
 	reply(w, http.StatusOK, out)
 }

@@ -1186,6 +1186,10 @@ from the browser, with the grant or author in the connection bar; if the base mo
 (`412`) the card plans again instead of resubmitting. **Freeze branch** then writes `frozen:
 true` and `merged: { at }` to the branch in one config write.
 
+A second merge of the same branch only skips what an earlier replayed merge took when the base
+lists the merger in `merge.authors` (§F.3); otherwise the card shows the planner's hint, and the
+replayed resources come back as conflicts. Under `-dev`, fill the author box with a listed `sub`.
+
 The plan endpoint, `POST /playground/merge/plan`, takes `{branch, base?, squash?, branchAt?,
 resolve?: {resource: patch set | steps | "keep" | "delete"}}` and writes nothing. It reads in
 process through the API handler with the request's own headers, as the schema import planner

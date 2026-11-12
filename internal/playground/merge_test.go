@@ -85,7 +85,7 @@ func TestMergePlanResolveAndSubmit(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("%d %v", code, out)
 	}
-	if out["target"] != "matches" || out["clean"] != false || out["dryRun"] != nil {
+	if out["target"] != "matches" || out["clean"] != false || out["dryRun"] != nil || out["batch"] != nil || out["leftOut"] == nil {
 		t.Fatalf("plan %v", out)
 	}
 	rs := resourcesByName(out)

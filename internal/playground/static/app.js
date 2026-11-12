@@ -502,7 +502,10 @@ function renderNsStatus() {
     h('dt', {}, 'ns_id (head)'), h('dd', {}, idEl(S.nsHead)),
     h('dt', {}, 'config id'), h('dd', {}, S.config ? idEl(S.config) : h('span', { class: 'muted' }, 'unknown')),
     h('dt', {}, 'readable'), h('dd', {}, S.nsPurged ? 'nothing: purged, its documents and log are 410 (§8.5)' : S.nsDoc ? 'document, log, heads' : 'log only (document not readable)'));
-  if (d.base) kv.append(h('dt', {}, 'base'), h('dd', {}, `${d.base.ns} @ `, idEl(d.base.at)));
+  if (d.base) kv.append(h('dt', {}, 'base'), h('dd', {}, `${d.base.ns} @ `, idEl(d.base.at),
+    // a local branch (no origin, §G.3) merges into the base it names (§F.3)
+    d.base.origin === undefined && Z.isNamespaceName(d.base.ns) && Z.isNamespaceName(S.ns) && !S.nsPurged
+      ? [' ', h('button', { class: 'tiny', id: 'nsMergeInto', onclick: () => mgOpen(S.ns, d.base.ns) }, `Merge into ${d.base.ns}\u2026`)] : null));
   if (d.successor) kv.append(h('dt', {}, 'successor'), h('dd', {}, d.successor));
   if (S.nsLevel) {
     const enc = d.encryption || {};
@@ -597,7 +600,10 @@ function renderBranches() {
     h('td', {}, b.frozen ? h('span', { class: 'badge warn' }, 'frozen') : 'no'),
     h('td', {}, b.purged ? h('span', { class: 'badge err' }, 'purged') : 'no'),
     h('td', { class: 'mono' }, b.successor || ''),
-    h('td', {}, b.name ? h('button', { class: 'tiny', onclick: () => asUser(() => selectNS(b.name)) }, 'open') : ''))));
+    h('td', {}, b.name ? h('button', { class: 'tiny', onclick: () => asUser(() => selectNS(b.name)) }, 'open') : '',
+      // a local branch that still has its content can be merged into this namespace (§F.3)
+      b.name && !b.remote && !b.purged && Z.isNamespaceName(b.name) && Z.isNamespaceName(S.ns)
+        ? [' ', h('button', { class: 'tiny', title: `plan a merge of ${b.name} into ${S.ns}`, onclick: () => mgOpen(b.name, S.ns) }, 'merge\u2026')] : ''))));
 }
 
 // A /heads page's entries: { heads, next? } (§7.4), or { items } from a
@@ -4266,6 +4272,369 @@ function initSchemas() {
 }
 
 /* ------------------------------------------------------------------ *
+ * merge a branch into its base (§F.3)
+ *
+ * The core plans (POST /playground/merge/plan: classify, apply the resolutions, dry-run) and writes nothing; the
+ * page submits the plan's batch itself, through api(), under the author or grant in its connection bar.
+ * ------------------------------------------------------------------ */
+const MG_URL = '/playground/merge/';
+/* texts: the resolution of a resource as typed (JSON text: a patch set, a list of steps, "keep" or "delete"), kept
+ * across plans. open: the rows whose details show. ovr: clean rows whose editor was asked for. seenAt: the base
+ * revision of the last plan shown, '' after this page's own merge. merged: this page's last merge of the pair. */
+const MG = { branch: '', base: '', plan: null, texts: new Map(), open: new Set(), ovr: new Set(), stale: false, busy: '', seenAt: '', notes: [], err: null, merged: null, frozen: null, out: null };
+
+function mgReset(branch, base) {
+  Object.assign(MG, { branch, base, plan: null, texts: new Map(), open: new Set(), ovr: new Set(), stale: false, busy: '', seenAt: '', notes: [], err: null, merged: null, frozen: null, out: null });
+}
+
+/* mgOpen shows the Merge card for branch into base ('' : the base the branch's document names). */
+function mgOpen(branch, base) {
+  if (!Z.isNamespaceName(branch) || (base && !Z.isNamespaceName(base))) return toast('Not a namespace name (§3.6)');
+  if (MG.busy) return toast('The merge card is busy');
+  if (branch !== MG.branch || (base || '') !== MG.base) mgReset(branch, base || '');
+  $('mgCard').hidden = false;
+  showTab('ns');
+  renderMerge();
+  $('mgCard').scrollIntoView({ block: 'start' });
+}
+
+const mgIsDelete = (s) => s === 'delete' || (!!s && typeof s === 'object' && !Array.isArray(s) && s.delete === true);
+const mgStatusClass = { merged: '', ahead: 'info', behind: '', clean: 'ok', conflicting: 'err', purged: 'tomb' };
+const mgPlural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+function mgConflicting(p) { return (p.resources || []).filter((r) => r.status === 'conflicting'); }
+function mgNothing(p) { return !!p && !p.batch && !mgConflicting(p).length; }
+function mgCanMerge() {
+  const p = MG.plan;
+  return !!p && !MG.busy && !MG.stale && p.clean === true && !!p.batch && Array.isArray(p.batch.items) && p.batch.items.length > 0 && !p.dryRunError;
+}
+/* the freeze records the merge batch of this page, or, where nothing was left to merge, the base revision the
+ * plan found that at (§F.6) */
+function mgFreezeAt() {
+  const p = MG.plan;
+  if (MG.merged) return MG.merged.at;
+  return mgNothing(p) && !MG.stale ? p.targetAt : '';
+}
+
+/* mgResolutions is what the plan request's "resolve" carries: every resolution typed, parsed. */
+function mgResolutions() {
+  const out = {};
+  for (const [name, text] of MG.texts) {
+    if (!text.trim()) continue;
+    const p = tryParse(text);
+    if (!p.ok) return { err: `The resolution of ${name} is not valid JSON: ${p.err}` };
+    out[name] = p.v;
+  }
+  return { v: out, n: Object.keys(out).length };
+}
+
+function mgFail(r, what) {
+  const j = r.json && typeof r.json === 'object' ? r.json : null;
+  return { what, code: r.neterr ? 'network error' : (j && j.code) || 'HTTP ' + r.status, message: r.neterr || (j && j.message) || '', entry: j && r.entry ? r.entry : null };
+}
+
+/* mgPlan asks for a plan. A plan already shown stays pinned to its branch revision (branchAt) unless o.fresh;
+ * o.moved is the note of a merge the base refused (412), o.own follows this page's own merge. */
+async function mgPlan(o = {}) {
+  if (MG.busy || !MG.branch) return false;
+  const res = mgResolutions();
+  if (res.err) { toast(res.err); return false; }
+  const prev = MG.plan;
+  const body = { branch: MG.branch, squash: $('mgSquash').checked };
+  if (MG.base) body.base = MG.base;
+  const pinned = !o.fresh && prev && ID_RE.test(prev.branchAt || '');
+  if (pinned) body.branchAt = prev.branchAt;
+  if (res.n) body.resolve = res.v;
+  MG.busy = 'Planning…'; MG.err = null; renderMergeState();
+  // what was typed while the planner worked is not what it planned
+  const typed = () => JSON.stringify([[...MG.texts].filter(([, t]) => t.trim()), $('mgSquash').checked]);
+  const sent = typed();
+  const r = await asUser(() => api('POST', MG_URL + 'plan', { body, label: 'merge' }));
+  MG.busy = '';
+  const p = r.ok && r.json && typeof r.json === 'object' ? r.json : null;
+  if (!p || !Array.isArray(p.resources) || !Z.isNamespaceName(p.target) || !Z.isNamespaceName(p.branch)) {
+    // The plan shown stays, with what was typed: a refused resolution is corrected and planned again.
+    MG.err = p ? { what: 'Plan', code: 'bad answer', message: 'the planner\'s answer is not a plan', entry: null } : mgFail(r, 'Plan');
+    if (o.moved) MG.notes = [o.moved];
+    MG.stale = !!prev;
+    renderMerge();
+    return false;
+  }
+  const notes = [];
+  if (o.moved) notes.push(o.moved);
+  else if (MG.seenAt && p.targetAt !== MG.seenAt) notes.push(`The base moved since the last plan (${short(MG.seenAt)} → ${short(p.targetAt)}): every resource was classified again against its head now, and the resolutions with it.`);
+  if (prev && o.fresh && prev.branchAt !== p.branchAt) notes.push(`Planned afresh: the branch moved too, and this plan classifies from its head now (${short(prev.branchAt)} → ${short(p.branchAt)}).`);
+  if (prev && o.fresh && res.n) notes.push('Planned afresh: the resolutions were written against the earlier plan and have been checked again against this one. Review them.');
+  // A resolution of a resource the plan no longer lists has no editor to change it in: dropped, and said.
+  const names = new Set(p.resources.map((x) => x.resource));
+  const gone = [...MG.texts.keys()].filter((n) => !names.has(n));
+  gone.forEach((n) => { MG.texts.delete(n); MG.ovr.delete(n); });
+  if (gone.length) notes.push('Dropped the resolution of ' + gone.join(', ') + ': the plan has no such resource.');
+  MG.plan = p; MG.base = p.target; MG.seenAt = p.targetAt || ''; MG.stale = typed() !== sent; MG.notes = notes;
+  if (!o.own) MG.out = null;
+  mgConflicting(p).forEach((x) => MG.open.add(x.resource));
+  renderMerge();
+  return true;
+}
+
+/* mgMerge submits the plan's batch, verbatim, to the base. A 412 or 410, of the batch or of an item, means the
+ * base moved: nothing was written, and the page plans again (same pin, same resolutions) for a person to review.
+ * It never resubmits by itself. */
+async function mgMerge() {
+  if (!mgCanMerge()) return;
+  const p = MG.plan;
+  MG.busy = 'Merging…'; MG.out = null; renderMergeState();
+  const r = await asUser(() => api('POST', `/ns/${p.target}/batch`, { label: 'merge', body: p.batch }));
+  MG.busy = '';
+  const items = r.json && Array.isArray(r.json.items) ? r.json.items : [];
+  if (r.status === 201 || r.status === 200) {
+    const at = r.hdr('X-Namespace-Revision') || (r.json && r.json.ns_id) || '';
+    MG.merged = { target: p.target, branch: p.branch, at: ID_RE.test(at) ? at : '', branchAt: p.branchAt,
+      items: p.batch.items.map((it, i) => ({ resource: it.resource, ids: (items[i] && Array.isArray(items[i].ids) ? items[i].ids : []).filter((x) => typeof x === 'string') })) };
+    MG.texts.clear(); MG.ovr.clear(); MG.open.clear(); MG.seenAt = '';
+    toast(`Merged ${p.branch} into ${p.target}`);
+    // What is left, from the branch's head now: nothing, unless the branch moved on meanwhile.
+    await mgPlan({ fresh: true, own: true });
+    if (S.ns === p.target || S.ns === p.branch) await afterWrite();
+    return;
+  }
+  const stale = items.filter((x) => x && (x.status === 412 || x.status === 410));
+  if (r.status === 412 || r.status === 410 || stale.length) {
+    const which = stale.map((x) => { const it = p.batch.items[x.index]; return (it ? it.resource : 'item ' + x.index) + (x.code ? ` (${x.code})` : ''); });
+    const note = `The base moved: the merge answered HTTP ${r.status}` + (which.length ? ' for ' + which.join(', ') : '') + ' and nothing was written. This is a new plan against the base as it is now, with the same branch revision and resolutions. Review it, then Merge again.';
+    await mgPlan({ moved: note });
+    if (S.ns === p.target) await afterWrite();
+    return;
+  }
+  MG.out = mgFail(r, 'Merge');
+  renderMerge();
+}
+
+/* mgFreeze is the one config write that ends a merged branch (§F.3 step 6, §F.6): frozen, and merged.at the
+ * base revision. If-Match takes the branch's config id, read first, and once more after a 412. */
+async function mgFreeze() {
+  const p = MG.plan, at = mgFreezeAt();
+  const branch = MG.merged ? MG.merged.branch : p && p.branch;
+  if (MG.busy || !Z.isNamespaceName(branch) || !ID_RE.test(at)) return;
+  MG.busy = 'Freezing…'; MG.out = null; renderMergeState();
+  let r = null, fail = null;
+  await asUser(async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const g = await api('GET', `/ns/${branch}`, { label: 'merge' });
+      const cfg = g.status === 200 ? g.hdr('X-Config-Revision') || '' : '';
+      if (!ID_RE.test(cfg)) { fail = g.status === 200 ? { what: 'Freeze', code: 'no config id', message: `GET /ns/${branch} named no X-Config-Revision`, entry: null } : mgFail(g, 'Freeze'); return; }
+      r = await api('PATCH', `/ns/${branch}`, { ct: PJ, label: 'merge', headers: { 'If-Match': quoteId(cfg) },
+        body: [{ op: 'add', path: '/frozen', value: true }, { op: 'add', path: '/merged', value: { at } }] });
+      if (r.status !== 412) return;
+    }
+  });
+  MG.busy = '';
+  if (!fail && r && r.ok) {
+    MG.frozen = { branch, at };
+    if (p && p.branch === branch) { p.branchFrozen = true; p.branchMerged = { at }; }
+    toast(`${branch} frozen`);
+  } else MG.out = fail || mgFail(r, 'Freeze');
+  renderMerge();
+  if (S.ns === branch || (p && S.ns === p.target)) await afterWrite();
+}
+
+function mgGoto(ns, name) {
+  if (!Z.isNamespaceName(ns) || !Z.isResourceName(name)) return toast('Not a resource name (§3.6)');
+  asUser(async () => { if (S.ns !== ns) await selectNS(ns); await selectRes(name); });
+  showTab('res');
+}
+
+function mgSetText(name, text) {
+  if (text.trim()) MG.texts.set(name, text); else MG.texts.delete(name);
+  if (MG.plan) MG.stale = true;
+  renderMergeState();
+}
+
+/* the resolution editor of one resource: JSON against the base's head */
+function mgEditor(r) {
+  const name = r.resource;
+  const ta = h('textarea', { class: 'code', rows: 4, spellcheck: 'false', 'data-json': true, 'aria-label': 'resolution of ' + name,
+    placeholder: '[{"op":"replace","path":"/title","value":"…"}]   one patch set against the base\'s head, or "keep", or "delete"' });
+  ta.value = MG.texts.get(name) || '';
+  const hint = jsonHint(ta);
+  ta.addEventListener('input', () => mgSetText(name, ta.value));
+  const set = (v) => { ta.value = v; ta.dispatchEvent(new Event('input')); };
+  const steps = r.steps || [];
+  const plain = steps.length > 0 && steps.every((s) => Array.isArray(s) || s === 'delete');
+  return h('div', { class: 'mg-edit' },
+    h('div', { class: 'row' }, h('b', {}, 'Resolution'),
+      h('span', { class: 'muted small' }, 'replaces the steps with one patch set against the base\'s head', r.base ? [' ', idEl(r.base)] : r.baseState && r.baseState !== 'live' ? ` (${r.baseState})` : '')),
+    ta, hint,
+    h('div', { class: 'chips' },
+      h('button', { type: 'button', title: 'the base stays as it is; the branch\'s change is dropped', onclick: () => set('"keep"') }, 'keep base'),
+      h('button', { type: 'button', title: 'the resource is deleted in the base', onclick: () => set('"delete"') }, 'delete'),
+      plain && !r.resolved ? h('button', { type: 'button', title: 'the branch\'s steps as they are, replayed onto the base\'s head: edit them', onclick: () => set(JSON.stringify(steps, null, 2)) }, 'branch\'s steps') : null,
+      h('button', { type: 'button', onclick: () => { MG.ovr.delete(name); set(''); if (r.status !== 'conflicting') renderMerge(); } }, 'clear')));
+}
+
+function mgDetail(r) {
+  const p = MG.plan, name = r.resource;
+  const kv = h('dl', { class: 'kv' });
+  const row = (k, v) => kv.append(h('dt', {}, k), h('dd', {}, v));
+  row('base head', [r.base ? idEl(r.base) : h('span', { class: 'muted' }, 'none'), ' ', h('span', { class: 'muted' }, r.baseState || '')]);
+  row('branch head', [r.branch ? idEl(r.branch) : h('span', { class: 'muted' }, 'none'), r.branchDeleted ? ' deleted' : '']);
+  if (r.ancestor) row('common ancestor', [idEl(r.ancestor), r.targetAncestor && r.targetAncestor !== r.ancestor ? [' in the branch, ', idEl(r.targetAncestor), ' in the base'] : '']);
+  if (r.ifMatch) row('ifMatch', idEl(r.ifMatch));
+  if (r.ifNoneMatch) row('ifNoneMatch', '*');
+  if (Array.isArray(r.expected) && r.expected.length) row('expected ids', r.expected.map((id) => [idEl(id), ' ']));
+  if (Array.isArray(r.branchWrites)) row('branch writes', h('span', { class: 'mono' }, r.branchWrites.join('  ') || '(none)'));
+  if (Array.isArray(r.baseWrites)) row('base writes', h('span', { class: 'mono' }, r.baseWrites.join('  ') || '(none)'));
+  if (r.pair) row('pair', ['merge batch ', typeof r.pair.batch === 'string' ? idEl(r.pair.batch) : '', ` by ${r.pair.author || '?'}` + (r.pair.kid ? ` (${r.pair.kid})` : ''),
+    typeof r.pair.branch === 'string' && r.pair.branch ? [': branch ', idEl(r.pair.branch)] : '', typeof r.pair.target === 'string' && r.pair.target ? [' = base ', idEl(r.pair.target)] : '']);
+  const editable = r.class === 'fast-forward' || r.class === 'replay';
+  const editing = r.status === 'conflicting' || MG.texts.has(name) || MG.ovr.has(name);
+  return h('tr', { class: 'mg-detail' }, h('td', { colspan: 5 },
+    kv,
+    h('h3', {}, (r.steps || []).length ? 'Steps' + (r.resolved ? ' (the resolution)' : '') : 'No steps'),
+    (r.steps || []).length ? jsonPre(r.steps) : null,
+    editing ? mgEditor(r) : editable ? h('div', { class: 'row' }, h('button', { class: 'tiny', title: 'replace this resource\'s steps with a resolution of your own', onclick: () => { MG.ovr.add(name); renderMerge(); } }, 'override…')) : null,
+    p && Z.isResourceName(name) ? null : h('div', { class: 'warn-box' }, 'This is no resource name (§3.6): the page opens no link for it.')));
+}
+
+function mgRow(r) {
+  const p = MG.plan, name = String(r.resource), open = MG.open.has(name);
+  const steps = Array.isArray(r.steps) ? r.steps : [];
+  const count = !steps.length ? '—' : steps.length === 1 && mgIsDelete(steps[0]) ? 'delete' : mgPlural(steps.length, 'step') + (steps.some(mgIsDelete) ? ', with a delete' : '');
+  const flags = [
+    r.resolved ? h('span', { class: 'badge ok' }, r.dropped ? 'resolved: base kept' : 'resolved') : null,
+    r.kept ? h('span', { class: 'badge', title: 'recorded with a revision of identical content, so the next merge has a common ancestor (§F.3)' }, 'kept, recorded') : null,
+    r.squashed ? h('span', { class: 'badge' }, 'squashed') : null,
+    r.branchDeleted ? h('span', { class: 'badge tomb' }, 'deleted in the branch') : null,
+    r.baseState && r.baseState !== 'live' ? h('span', { class: 'badge' }, 'base: ' + r.baseState) : null,
+    MG.texts.has(name) && !r.resolved ? h('span', { class: 'badge warn' }, 'resolution not planned yet') : null,
+  ];
+  const tr = h('tr', { class: r.status === 'conflicting' ? 'mg-conflict' : '' },
+    h('td', { class: 'wrap' },
+      h('button', { class: 'link mg-tog', 'aria-expanded': String(open), title: 'steps, writes, resolution', onclick: () => { if (open) MG.open.delete(name); else MG.open.add(name); renderMerge(); } }, open ? '▾' : '▸'),
+      Z.isResourceName(name)
+        ? [h('button', { class: 'link mono', title: `open ${name} in ${p.target}`, onclick: () => mgGoto(p.target, name) }, name), ' ',
+          h('button', { class: 'link small', title: `open ${name} in ${p.branch}`, onclick: () => mgGoto(p.branch, name) }, 'in branch')]
+        : h('span', { class: 'mono' }, name)),
+    h('td', {}, r.class || ''),
+    h('td', {}, h('span', { class: 'badge ' + (mgStatusClass[r.status] || '') }, r.status || '')),
+    h('td', {}, count),
+    h('td', { class: 'wrap' },
+      (r.conflicts || []).map((c) => h('div', { class: r.resolved ? 'muted' : '' }, h('span', { class: 'badge ' + (r.resolved ? '' : 'err') }, c.kind || 'conflict'), ' ',
+        Array.isArray(c.paths) && c.paths.length ? [h('span', { class: 'mono' }, c.paths.join('  ')), ' '] : null, c.message || '')),
+      flags.some(Boolean) ? h('div', { class: 'mg-flags' }, flags) : null,
+      r.note ? h('div', { class: 'muted' }, r.note) : null,
+      r.pair ? h('div', { class: 'muted small' }, 'pair from merge batch ', typeof r.pair.batch === 'string' ? idEl(r.pair.batch) : '', ` by ${r.pair.author || '?'}`) : null));
+  return open ? [tr, mgDetail(r)] : [tr];
+}
+
+/* the dry-run report: per item the ids a submit would produce, or what failed */
+function mgDryBox(p) {
+  const items = p.batch && Array.isArray(p.batch.items) ? p.batch.items : [];
+  if (p.dryRunError) {
+    const e = p.dryRunError, bad = Array.isArray(e.items) ? e.items : [];
+    return h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'dry run failed' + (e.code ? ': ' + e.code : '')), '  ' + (e.message || (e.status ? 'HTTP ' + e.status : '')),
+      bad.length ? h('ul', { class: 'checks' }, bad.map((x) => {
+        const { index, status, code, message, ...rest } = x || {};
+        const it = items[index];
+        return h('li', { class: 'bad' }, '✗ ', h('span', { class: 'mono' }, it ? it.resource : 'item ' + index), ` ${status || ''} ${code || ''}`, message ? ': ' + message : '',
+          Object.keys(rest).length ? h('span', { class: 'mono muted' }, ' ' + JSON.stringify(rest)) : null);
+      })) : null);
+  }
+  if (Array.isArray(p.dryRun)) {
+    return h('div', { class: 'seal-box mg-ok' }, h('div', { class: 'state-line' }, h('span', { class: 'badge ok' }, 'dry run passed'),
+      h('span', { class: 'muted small' }, `${mgPlural(p.dryRun.length, 'item')} into ${p.target}, nothing written; the ids a merge would produce:`)),
+    h('ul', { class: 'checks' }, p.dryRun.map((x, i) => {
+      const it = items[x && typeof x.index === 'number' ? x.index : i];
+      const ids = x && Array.isArray(x.ids) ? x.ids.filter((id) => typeof id === 'string') : [];
+      return h('li', {}, h('span', { class: 'mono' }, (x && x.resource) || (it && it.resource) || 'item ' + i), ' ', x && x.status ? h('span', { class: 'muted' }, x.status + ' ') : null, ids.map((id) => [idEl(id), ' ']));
+    })));
+  }
+  if (mgNothing(p)) {
+    return h('div', { class: 'seal-box mg-ok' }, h('div', { class: 'state-line' }, h('span', { class: 'badge ok' }, 'nothing to merge'),
+      h('span', {}, `${p.target} has everything ${p.branch} changed, as of the revisions above.`)));
+  }
+  return h('p', { class: 'note' }, 'No dry run yet: it is made once no resource is conflicting.');
+}
+
+function mgErrBox(f) {
+  if (f.entry) { const b = errBox(f.entry); b.prepend(h('b', {}, f.what + ' refused: ')); return b; }
+  return h('div', { class: 'errbox' }, h('b', {}, f.what + ' refused: '), h('span', { class: 'code' }, f.code), f.message ? '  ' + f.message : '');
+}
+
+/* the buttons and the status line, which change as resolutions are typed (the table is left alone then) */
+function renderMergeState() {
+  const p = MG.plan, st = $('mgStatus');
+  const set = (msg, cls) => { st.className = cls || 'muted'; st.textContent = msg; };
+  $('mgPlan').textContent = p ? 'Re-plan' : 'Plan';
+  $('mgPlan').disabled = !!MG.busy || !MG.branch;
+  $('mgFresh').hidden = !p; $('mgFresh').disabled = !!MG.busy;
+  $('mgClearRes').hidden = !MG.texts.size; $('mgClearRes').disabled = !!MG.busy;
+  $('mgSquash').disabled = !!MG.busy;
+  $('mgGo').disabled = !mgCanMerge();
+  const fz = ID_RE.test(mgFreezeAt()) && !(MG.frozen && MG.frozen.branch === MG.branch) && !(p && p.branchFrozen);
+  $('mgFreeze').hidden = !fz; $('mgFreeze').disabled = !!MG.busy;
+  if (MG.busy) return set(MG.busy);
+  if (!p) return set(MG.err ? '' : 'Plan classifies what the branch changed against the base, and writes nothing.');
+  const bad = mgConflicting(p).length;
+  if (MG.stale) return set('The resolutions or options changed since this plan: Re-plan before merging.', 'bad');
+  if (bad) return set(`${mgPlural(bad, 'resource')} conflicting: write a resolution for each, then Re-plan.`, 'bad');
+  if (p.dryRunError) return set('The dry run failed, see below: nothing can be merged as planned.', 'bad');
+  if (!p.batch) return set('Nothing to merge.');
+  set(`${mgPlural(p.batch.items.length, 'item')} to merge; the dry run passed.`, 'good');
+}
+
+function renderMerge() {
+  const p = MG.plan;
+  const target = (p && p.target) || MG.base, branch = (p && p.branch) || MG.branch;
+  const nsBtn = (ns) => h('button', { class: 'link mono', title: 'open ' + ns, onclick: () => asUser(() => selectNS(ns)) }, ns);
+  $('mgHead').replaceChildren(
+    h('b', {}, branch ? nsBtn(branch) : '', ' → ', target ? nsBtn(target) : h('span', { class: 'muted' }, 'its base')),
+    ...(p ? [h('span', {}, 'branch at ', idEl(p.branchAt)), h('span', { class: 'badge info', title: 'a re-plan classifies from this branch revision again' }, 'pinned'),
+      h('span', {}, 'base at ', idEl(p.targetAt)),
+      p.branchFrozen ? h('span', { class: 'badge warn' }, 'branch frozen') : null,
+      p.branchMerged && typeof p.branchMerged.at === 'string' ? h('span', { class: 'muted small' }, 'merged.at ', idEl(p.branchMerged.at)) : null,
+      p.squash ? h('span', { class: 'badge' }, 'squashed') : null].filter(Boolean) : []));
+  const notes = [];
+  if (MG.err) notes.push(mgErrBox(MG.err));
+  MG.notes.forEach((n) => notes.push(h('div', { class: 'warn-box mg-moved' }, n)));
+  if (p) {
+    (p.hints || []).forEach((x) => notes.push(h('div', { class: 'warn-box' }, String(x))));
+    (p.ignoredMerges || []).forEach((m) => notes.push(h('div', { class: 'warn-box' }, 'Earlier merge batch ', typeof m.batch === 'string' ? idEl(m.batch) : '', m.author ? ` by ${m.author}` + (m.kid ? ` (${m.kid})` : '') : '', ' is not used as a common ancestor', m.reason ? ': ' + m.reason : '')));
+    if ((p.leftOut || []).length) notes.push(h('div', { class: 'warn-box' }, 'Left out of the batch, and offered again by the next plan: ' + p.leftOut.join(', ')));
+    if (p.authorsDeclared) notes.push(h('p', { class: 'note' }, 'merge.authors of ' + p.target + ': ' + ((p.mergeAuthors || []).map((a) => a.sub + (a.kid ? ` (${a.kid})` : '')).join(', ') || 'none')));
+  }
+  $('mgNotes').replaceChildren(...notes);
+  $('mgPlanBox').hidden = !p;
+  if (p) {
+    const tb = $('mgTbl').tBodies[0];
+    if (p.resources.length) tb.replaceChildren(...p.resources.flatMap(mgRow));
+    else tb.replaceChildren(h('tr', {}, h('td', { class: 'empty', colspan: 5 }, 'The branch changed no resource.')));
+    $('mgDry').replaceChildren(mgDryBox(p));
+  }
+  const out = [];
+  if (MG.merged) {
+    const m = MG.merged;
+    out.push(h('div', { class: 'seal-box mg-ok', id: 'mgMerged' }, h('div', { class: 'state-line' }, h('span', { class: 'badge ok' }, 'merged'),
+      h('span', {}, `${m.branch} at `, idEl(m.branchAt), ` into ${m.target} as batch `, m.at ? idEl(m.at) : '(no X-Namespace-Revision)')),
+    h('ul', { class: 'checks' }, m.items.map((it) => h('li', { class: 'ok' }, '✓ ', h('span', { class: 'mono' }, it.resource), ' ', it.ids.map((id) => [idEl(id), ' ']))))));
+  }
+  if (MG.frozen) out.push(h('div', { class: 'seal-box mg-ok', id: 'mgFrozen' }, h('div', { class: 'state-line' }, h('span', { class: 'badge warn' }, 'frozen'),
+    h('span', {}, `${MG.frozen.branch} is frozen, with merged.at `, idEl(MG.frozen.at)))));
+  if (MG.out) out.push(mgErrBox(MG.out));
+  $('mgOut').replaceChildren(...out);
+  renderMergeState();
+}
+
+function initMerge() {
+  $('mgPlan').onclick = () => mgPlan();
+  $('mgFresh').onclick = () => mgPlan({ fresh: true });
+  $('mgClearRes').onclick = () => { MG.texts.clear(); MG.ovr.clear(); if (MG.plan) MG.stale = true; renderMerge(); };
+  $('mgSquash').onchange = () => { if (MG.plan) MG.stale = true; renderMergeState(); };
+  $('mgGo').onclick = mgMerge;
+  $('mgFreeze').onclick = mgFreeze;
+  $('mgClose').onclick = () => { if (!MG.busy) $('mgCard').hidden = true; };
+}
+
+/* ------------------------------------------------------------------ *
  * tabs and wiring
  * ------------------------------------------------------------------ */
 function showTab(name) {
@@ -4274,19 +4643,21 @@ function showTab(name) {
   store.set('pl.tab', name);
 }
 
+/* jsonHint is the line under a JSON textarea that says whether its text parses, kept current as it is typed. */
+function jsonHint(ta) {
+  const hint = h('div', { class: 'hint' });
+  const check = () => {
+    const t = ta.value.trim();
+    if (!t) { hint.textContent = ''; hint.className = 'hint'; return; }
+    const p = tryParse(t);
+    hint.textContent = p.ok ? 'valid JSON' : 'invalid JSON: ' + p.err;
+    hint.className = 'hint ' + (p.ok ? 'good' : 'bad');
+  };
+  ta.addEventListener('input', check); check();
+  return hint;
+}
 function bindJSONHints() {
-  document.querySelectorAll('textarea[data-json]').forEach((ta) => {
-    const hint = h('div', { class: 'hint' });
-    ta.after(hint);
-    const check = () => {
-      const t = ta.value.trim();
-      if (!t) { hint.textContent = ''; hint.className = 'hint'; return; }
-      const p = tryParse(t);
-      hint.textContent = p.ok ? 'valid JSON' : 'invalid JSON: ' + p.err;
-      hint.className = 'hint ' + (p.ok ? 'good' : 'bad');
-    };
-    ta.addEventListener('input', check); check();
-  });
+  document.querySelectorAll('textarea[data-json]').forEach((ta) => ta.after(jsonHint(ta)));
 }
 
 function bindInspector() {
@@ -4438,6 +4809,7 @@ function init() {
   // search
   initSearch();
   initSchemas();
+  initMerge();
 
   // restore session
   showTab(store.get('pl.tab', 'ns'));

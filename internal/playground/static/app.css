@@ -339,3 +339,28 @@ ul.cat-tree details > summary { cursor: pointer; padding: 1px 6px; }
 td.wrap, td.wrap code { white-space: normal; overflow-wrap: anywhere; }
 .bad { color: var(--err); }
 .good { color: var(--ok); }
+
+/* ---- merge (§F.3) -------------------------------------------------- */
+.mg-scroll { max-height: none; margin: 6px 0; }
+#mgTbl td { white-space: normal; overflow-wrap: anywhere; }
+#mgTbl td:nth-child(2), #mgTbl td:nth-child(3), #mgTbl td:nth-child(4) { white-space: nowrap; overflow-wrap: normal; }
+#mgTbl tr.mg-conflict td:first-child { box-shadow: inset 3px 0 0 var(--err); }
+#mgTbl tr.mg-detail > td { background: var(--surface-2); padding: 8px 10px; }
+#mgTbl tr.mg-detail h3 { margin: 8px 0 4px; }
+#mgTbl tr.mg-detail pre.json { max-height: 220px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.mg-tog { width: 16px; text-align: left; color: var(--muted); }
+.mg-flags { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0; }
+.mg-edit { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 4px; }
+.mg-edit textarea { background: var(--surface); }
+.seal-box.mg-ok { border-left-color: var(--ok); }
+#mgHead button.link { font-weight: 600; }
+@media (max-width: 640px) {
+  /* each resource becomes a block, so its details and editor fit the screen instead of scrolling sideways */
+  #mgTbl, #mgTbl tbody { display: block; }
+  #mgTbl thead { display: none; }
+  #mgTbl tr { display: flex; flex-wrap: wrap; gap: 0 4px; align-items: baseline; border-bottom: 1px solid var(--border); }
+  #mgTbl tr:last-child { border-bottom: 0; }
+  #mgTbl td { border-bottom: 0; min-width: 0; }
+  #mgTbl td:first-child, #mgTbl td:last-child, #mgTbl tr.mg-detail > td { flex: 1 1 100%; }
+  #mgTbl td:empty { display: none; }
+}

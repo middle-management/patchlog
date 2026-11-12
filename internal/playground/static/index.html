@@ -130,6 +130,30 @@
       <div class="row"><button id="brCreate" class="primary">Create branch</button></div>
     </div>
 
+    <!-- merge a branch into its base (§F.3) -->
+    <div class="card wide" id="mgCard" hidden>
+      <header><h2>Merge</h2><span class="muted small">&sect;F.3 &middot; planned by the core at /playground/merge/plan, written from this browser as one batch</span><button id="mgClose" class="tiny">Close</button></header>
+      <div id="mgHead" class="state-line"></div>
+      <div class="row">
+        <label class="check" title="Replaces a resource's steps with one set of the same effect: per-set history and test ops are lost (&sect;F.3)"><input type="checkbox" id="mgSquash"> squash</label>
+        <button id="mgPlan" class="primary" title="POST /playground/merge/plan: classifies and dry-runs, writes nothing">Plan</button>
+        <button id="mgFresh" class="tiny" hidden title="Plan from the branch's current head instead of the revision this plan is pinned to">Plan afresh</button>
+        <button id="mgClearRes" class="tiny" hidden title="Drop every resolution written here">Clear resolutions</button>
+        <span id="mgStatus" class="muted"></span>
+      </div>
+      <div id="mgNotes"></div>
+      <div id="mgPlanBox" hidden>
+        <div class="scroll mg-scroll"><table id="mgTbl"><thead><tr><th>resource</th><th>class</th><th>status</th><th>steps</th><th>conflicts, notes</th></tr></thead><tbody></tbody></table></div>
+        <div id="mgDry"></div>
+      </div>
+      <div class="row">
+        <button id="mgGo" class="primary" disabled title="POST /ns/{base}/batch with your own grant: the plan's batch, verbatim">Merge</button>
+        <button id="mgFreeze" hidden title="PATCH /ns/{branch}: frozen, and merged.at the base revision (&sect;F.6)">Freeze branch</button>
+      </div>
+      <div id="mgOut"></div>
+      <p class="note">A merge is one batch into the base: fast-forwards keep the branch&rsquo;s ids, replays get new ones. A conflicting resource needs one resolution against the base&rsquo;s head: a patch set, <code>"keep"</code> (the base as it is) or <code>"delete"</code>. A re-plan stays pinned to the branch revision shown, so resolutions keep meaning what they were written against. If the base moves before the batch lands it answers <code>412</code>, nothing is written, and the page plans again. Sealed and e2e namespaces, required signatures and blobs that need copying are for <code>patchlog merge</code>.</p>
+    </div>
+
     <div class="card danger-zone">
       <header><h2>Purge namespace</h2><span class="muted small">POST /ns/{ns}/purge</span></header>
       <div class="row"><label for="nsPurgeIm">If-Match (ns_id)</label><input id="nsPurgeIm" class="mono" placeholder="namespace head" spellcheck="false"><button id="nsPurgeUse" class="tiny">use head</button></div>
