@@ -228,6 +228,7 @@ function renderEntry(e) {
 
   n.replaceChildren(sum, body);
   applyFilter(e);
+  renderStrip(e);
 }
 
 function errBox(e) {
@@ -252,7 +253,7 @@ function errBox(e) {
   }
   const acts = h('div', { class: 'actions', style: 'margin-top:5px' });
   if (typeof j.head === 'string') acts.append(h('button', { class: 'tiny', onclick: () => { setIfMatch(j.head); toast('If-Match set to head'); } }, 'Use head as If-Match'));
-  if (typeof j.config === 'string') acts.append(h('button', { class: 'tiny', onclick: () => { $('nsIfMatch').value = j.config; S.cfgDirty = true; toast('Config If-Match set'); } }, 'Use config as If-Match'));
+  if (typeof j.config === 'string') acts.append(h('button', { class: 'tiny', onclick: () => { $('nsIfMatch').value = j.config; S.cfgDirty = true; expandCard($('nsIfMatch')); toast('Config If-Match set'); } }, 'Use config as If-Match'));
   if (acts.children.length) box.append(acts);
   return box;
 }
@@ -400,6 +401,7 @@ function renderNsSelect() {
   sel.replaceChildren(h('option', { value: '' }, known.length ? '\u2014 select \u2014' : '\u2014 none yet \u2014'),
     ...known.map((n) => h('option', { value: n, selected: n === S.ns }, n)));
   sel.value = S.ns;
+  renderStartKnown();
 }
 
 function resetNsState() {
@@ -482,6 +484,7 @@ async function refreshNS() {
 }
 
 function renderNsAll() {
+  syncStart();
   renderNsStatus(); renderNsDoc(); renderNsLog(); renderHeads(); renderBranches(); undoRefresh();
   if (!S.cfgDirty) $('nsIfMatch').value = S.config || '';
   if (!$('nsPurgeIm').dataset.dirty) $('nsPurgeIm').value = S.nsHead || '';
@@ -493,6 +496,8 @@ function renderNsStatus() {
   if (!S.nsHead) {
     box.className = '';
     const r = S.nsErr;
+    // the message below points at the Create namespace form: open it, once per namespace, with the name filled in
+    if (r && r.status === 404 && UI.createHint !== S.ns) { UI.createHint = S.ns; $('nsNewName').value = S.ns; expandCard($('nsNewName')); }
     box.replaceChildren(h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'badge warn' }, r ? 'not readable / unknown' : 'loading\u2026')),
       r ? h('div', { class: 'muted' }, `GET /ns/${S.ns} answered ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}. Create it with the form, or check Author / Bearer grant (a namespace you cannot read looks the same as one that does not exist).`) : null);
     return;
@@ -502,15 +507,19 @@ function renderNsStatus() {
     h('dt', {}, 'ns_id (head)'), h('dd', {}, idEl(S.nsHead)),
     h('dt', {}, 'config id'), h('dd', {}, S.config ? idEl(S.config) : h('span', { class: 'muted' }, 'unknown')),
     h('dt', {}, 'readable'), h('dd', {}, S.nsPurged ? 'nothing: purged, its documents and log are 410 (§8.5)' : S.nsDoc ? 'document, log, heads' : 'log only (document not readable)'));
-  if (d.base) kv.append(h('dt', {}, 'base'), h('dd', {}, `${d.base.ns} @ `, idEl(d.base.at)));
+  if (d.base) kv.append(h('dt', {}, 'base'), h('dd', {}, `${d.base.ns} @ `, idEl(d.base.at),
+    // a local branch (no origin, §G.3) merges into the base it names (§F.3)
+    d.base.origin === undefined && Z.isNamespaceName(d.base.ns) && Z.isNamespaceName(S.ns) && !S.nsPurged
+      ? [' ', h('button', { class: 'tiny', id: 'nsMergeInto', onclick: () => mgOpen(S.ns, d.base.ns) }, `Merge into ${d.base.ns}\u2026`)] : null));
   if (d.successor) kv.append(h('dt', {}, 'successor'), h('dd', {}, d.successor));
   if (S.nsLevel) {
     const enc = d.encryption || {};
     kv.append(h('dt', {}, 'encryption'), h('dd', {}, `${S.nsLevel}` + (enc.epoch ? `, epoch ${enc.epoch}` : '') + (enc.pad ? ', padded' : ''),
       S.nsSeal ? (S.nsSeal.error ? h('span', { class: 'badge err', title: S.nsSeal.error }, 'document not decrypted') : h('span', { class: 'badge ok', title: 'kid ' + S.nsSeal.kid }, 'decrypted in this browser')) : null,
-      S.nsLevel === 'e2e' ? h('button', { class: 'link small', onclick: () => showTab('keys') }, 'keyring →') : null));
+      S.nsLevel === 'e2e' ? h('button', { class: 'link small', onclick: () => { showTab('keys'); expandCard($('krStatus')); } }, 'keyring →') : null));
   }
   kv.append(h('dt', {}, 'level held'), levelHeldEl(S.ns));
+  kvInline(kv);
   box.className = '';
   box.replaceChildren(
     h('div', { class: 'state-line' }, h('b', {}, S.ns),
@@ -522,6 +531,14 @@ function renderNsStatus() {
     kv,
     S.nsLowered ? h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'level lowered'), '  ' + S.nsLowered) : '',
     S.nsSeal && S.nsSeal.error ? h('div', { class: 'note' }, 'The namespace document is sealed (application/jose). ' + S.nsSeal.error + ' — see the Keys tab.') : '');
+}
+
+/* kvInline lays a dl out as a wrapping row of label/value pairs: each dt with its dd(s) in one div. */
+function kvInline(dl) {
+  const pairs = [];
+  for (const n of [...dl.children]) { if (n.tagName === 'DT') pairs.push(h('div', {})); if (pairs.length) pairs[pairs.length - 1].append(n); }
+  dl.classList.add('inline');
+  dl.replaceChildren(...pairs);
 }
 
 function renderNsDoc() {
@@ -577,6 +594,7 @@ function renderHeads() {
   const tb = $('headsTbl').tBodies[0];
   $('headsMeta').textContent = S.heads.length ? `${S.heads.length} resource(s)` : '';
   $('headsMore').hidden = !S.headsNext;
+  setCardCount(tb, S.heads.length);
   const dl = $('headsList');
   dl.replaceChildren(...S.heads.map((x) => h('option', { value: x.resource })));
   if (!S.heads.length) { tb.replaceChildren(h('tr', {}, h('td', { class: 'empty', colspan: 3 }, S.nsHead ? 'No resources yet.' : '\u2014'))); return; }
@@ -590,6 +608,8 @@ function renderHeads() {
 
 function renderBranches() {
   const tb = $('brTbl').tBodies[0];
+  setCardCount(tb, S.branches.length);
+  if (S.branches.length) openUnlessSet(tb); // rows with open/merge buttons: shown unless the user closed the card
   if (!S.branches.length) { tb.replaceChildren(h('tr', {}, h('td', { class: 'empty', colspan: 6 }, 'No branches.'))); return; }
   tb.replaceChildren(...S.branches.map((b) => h('tr', {},
     h('td', { class: 'mono' }, b.name || (b.remote ? 'remote ' + b.remote : '')),
@@ -597,7 +617,10 @@ function renderBranches() {
     h('td', {}, b.frozen ? h('span', { class: 'badge warn' }, 'frozen') : 'no'),
     h('td', {}, b.purged ? h('span', { class: 'badge err' }, 'purged') : 'no'),
     h('td', { class: 'mono' }, b.successor || ''),
-    h('td', {}, b.name ? h('button', { class: 'tiny', onclick: () => asUser(() => selectNS(b.name)) }, 'open') : ''))));
+    h('td', {}, b.name ? h('button', { class: 'tiny', onclick: () => asUser(() => selectNS(b.name)) }, 'open') : '',
+      // a local branch that still has its content can be merged into this namespace (§F.3)
+      b.name && !b.remote && !b.purged && Z.isNamespaceName(b.name) && Z.isNamespaceName(S.ns)
+        ? [' ', h('button', { class: 'tiny', title: `plan a merge of ${b.name} into ${S.ns}`, onclick: () => mgOpen(b.name, S.ns) }, 'merge\u2026')] : ''))));
 }
 
 // A /heads page's entries: { heads, next? } (§7.4), or { items } from a
@@ -618,6 +641,7 @@ async function createNamespace() {
   if (!doc.ok) return toast('Document is not valid JSON');
   const r = await api('PATCH', `/ns/${name}`, { ct: PJ, headers: { 'If-None-Match': '*' }, body: [{ op: 'add', path: '', value: doc.v }] });
   if (r.ok) { toast(`Created ${name}`); await selectNS(name); }
+  return r;
 }
 
 async function applyConfig(patchText) {
@@ -646,7 +670,7 @@ async function createBranch() {
   const pt = $('brPatches').value.trim();
   if (pt) { const p = tryParse(pt); if (!p.ok) return toast('Patches are not valid JSON'); body.patches = p.v; }
   const r = await api('POST', `/ns/${S.ns}/branches`, { headers: { 'If-None-Match': '*' }, body });
-  if (r.ok || r.status === 200) { addKnown(name); toast(`Branch ${name} created`); await refreshNS(); }
+  if (r.ok || r.status === 200) { addKnown(name); toast(`Branch ${name} created`); await refreshNS(); expandCard($('brTbl')); }
 }
 
 /* ------------------------------------------------------------------ *
@@ -657,6 +681,7 @@ function setIfMatch(v) { $('ifMatch').value = v; S.ifDirty = true; }
 
 function openResource(name, tab = 'res') {
   asUser(() => selectRes(name)); showTab(tab);
+  if (tab === 'res') expandCard($('resState'));
 }
 
 async function selectRes(name) {
@@ -733,6 +758,7 @@ function normIf(v) { v = (v || '').trim(); return v ? quoteId(v) : ''; }
 
 async function writeRes(kind) {
   if (!S.ns || !S.res) return toast('Select a namespace and a resource name');
+  expandCard($('resState')); // the write shows there
   let patch = $('patch').value;
   const usesPatch = kind === 'create' || kind === 'append' || (kind === 'restore' && $('restoreEditor').checked);
   if (usesPatch && $('sealE2E').checked && S.res !== 'keyring') return writeSealed(kind, patch);
@@ -895,8 +921,8 @@ async function selectRev(id) {
   const meta = h('div', { class: 'muted small' }, `${entry.author || ''}  ${tsFmt(entry.created)}`,
     entry.gesture ? `  \u00b7 gesture ${entry.gesture}` : '', entry.undoes ? `  \u00b7 undoes ${entry.undoes}` : '');
   const acts = h('div', { class: 'row' },
-    h('button', { class: 'tiny', onclick: () => { setIfMatch(id); toast('If-Match set'); showTab('res'); } }, 'Use as If-Match'),
-    h('button', { class: 'tiny', onclick: () => { $('pruneH').value = id; toast('Prune horizon set'); showTab('res'); } }, 'Use as prune horizon'),
+    h('button', { class: 'tiny', onclick: () => { setIfMatch(id); toast('If-Match set'); showTab('res'); expandCard($('ifMatch')); } }, 'Use as If-Match'),
+    h('button', { class: 'tiny', onclick: () => { $('pruneH').value = id; toast('Prune horizon set'); showTab('res'); expandCard($('pruneH')); } }, 'Use as prune horizon'),
     h('button', { class: 'tiny', onclick: () => copy(id) }, 'Copy id'),
     entry.gesture ? h('button', { class: 'tiny', title: 'undo every revision of gesture ' + entry.gesture + ' (§11.2); the result shows in the Namespace tab', onclick: () => { showTab('ns'); undoAction(entry.gesture, `Undo ${entry.gesture.slice(0, 6)}`); } }, 'Undo this gesture') : null);
   const parts = [head, meta, acts];
@@ -1458,6 +1484,7 @@ function renderUndo() {
 
 function renderUndoOut(label, res) {
   const out = $('undoOut'); out.hidden = false;
+  expandCard(out);
   if (res.ok) {
     out.replaceChildren(h('div', { class: 'seal-box' }, h('div', { class: 'state-line' }, h('span', { class: 'badge ok' }, 'done'), h('b', {}, label),
       h('span', { class: 'muted small' }, `gesture ${res.gesture}, undoes ${res.plan.gesture}` + (res.attempts > 1 ? ` (after ${res.attempts - 1} × 412)` : ''))),
@@ -2452,7 +2479,7 @@ async function attachFile() {
 /* ---- Keys tab ---- */
 function renderIdentity() {
   const box = $('idStatus');
-  $('idDot').hidden = !ID;
+  $('idDot').hidden = !ID; $('moreDot').hidden = !ID;
   if (!ID) { box.className = 'muted'; box.textContent = 'No identity yet: generate one, or import a private key.'; return; }
   box.className = '';
   const jwk = Z.recipientJWK(ID.x);
@@ -2462,7 +2489,7 @@ function renderIdentity() {
   box.replaceChildren(
     h('dl', { class: 'kv' }, h('dt', {}, 'public key'), h('dd', { class: 'mono' }, ID.x), h('dt', {}, 'thumbprint'), h('dd', {}, rid)),
     h('div', { class: 'row' }, h('button', { class: 'tiny', onclick: () => copy(JSON.stringify(jwk), 'public JWK') }, 'Copy public JWK'),
-      h('button', { class: 'tiny', onclick: () => { $('krReader').value = JSON.stringify(jwk); toast('Reader field set'); } }, 'Use as reader below')),
+      h('button', { class: 'tiny', onclick: () => { $('krReader').value = JSON.stringify(jwk); expandCard($('krReader')); toast('Reader field set'); } }, 'Use as reader below')),
     jsonPre(jwk),
     h('details', {}, h('summary', { class: 'muted small' }, 'a read grant that carries it (E2)'),
       h('pre', { class: 'raw' }, `patchlog grant mint -key SEED -block '${JSON.stringify(block)}'`)));
@@ -3173,6 +3200,7 @@ function renderCatStatus() {
   if (!C.ns) { box.className = 'muted'; box.textContent = 'Load a catalog namespace.'; return; }
   if (C.loading) { box.className = 'muted'; box.textContent = `Loading ${C.ns}…`; return; }
   box.className = '';
+  if (C.proxy !== null) markService('cat', !C.proxy, '(tree service not configured)');
   if (!C.head) { box.replaceChildren(h('div', { class: 'errbox' }, C.note || 'not loaded')); return; }
   const kv = h('dl', { class: 'kv' },
     h('dt', {}, 'source'), h('dd', {}, C.source === 'tree' ? h('span', { class: 'badge ok' }, 'tree service via /playground/tree/') : h('span', { class: 'badge warn' }, 'core documents only')),
@@ -3293,10 +3321,11 @@ function renderCatalog() {
 
 function renderCatProblems() {
   const box = $('catProblems');
-  if (!C.head) { box.className = 'muted'; box.textContent = '—'; $('catProbMeta').textContent = ''; return; }
+  if (!C.head) { box.className = 'muted'; box.textContent = '—'; $('catProbMeta').textContent = ''; setCardCount(box, 0); return; }
   box.className = '';
   const lp = localProblems();
-  const line = (label, list, f) => list.length ? h('div', {}, h('b', {}, label + ': '), ...list.map((x, i) => [i ? ', ' : '', f(x)])) : null;
+  let total = 0;
+  const line = (label, list, f) => (total += list.length, list.length) ? h('div', {}, h('b', {}, label + ': '), ...list.map((x, i) => [i ? ', ' : '', f(x)])) : null;
   const nodeLink = (name) => h('button', { class: 'link mono', onclick: () => selectNode(name) }, name);
   const parts = [];
   if (C.problems && C.problems.service && C.problems.body) {
@@ -3315,6 +3344,7 @@ function renderCatProblems() {
   }
   const shown = parts.filter(Boolean);
   box.replaceChildren(...(shown.length ? shown : [h('span', { class: 'muted' }, 'No problems.')]));
+  setCardCount(box, total, 'warn');
 }
 
 function breadcrumbs(name) {
@@ -3436,11 +3466,11 @@ async function showWhere(n) {
     h('details', {}, h('summary', { class: 'muted small' }, 'answer'), jsonPre(r.body)));
 }
 
-function selectNode(name) { C.sel = name; renderCatalog(); }
+function selectNode(name) { C.sel = name; renderCatalog(); expandCard($('catSel')); }
 
 function openItem(ns, name) {
   asUser(async () => { if (S.ns !== ns) await selectNS(ns); await selectRes(name); });
-  showTab('res');
+  showTab('res'); expandCard($('resState'));
 }
 
 /* ---- writes (to the catalog namespace, through the core API) ---- */
@@ -3459,6 +3489,7 @@ function parseAccessField(id) {
 async function catWrite(what, method, name, o) {
   const r = await api(method, `/r/${C.ns}/${name}`, Object.assign({ label: 'catalog' }, o));
   const out = $('catOut');
+  expandCard(out);
   out.className = '';
   out.replaceChildren(
     h('div', { class: 'state-line' }, h('b', {}, what), h('span', { class: 'mono' }, `${method} /r/${C.ns}/${name}`), h('span', { class: 'badge ' + (r.ok ? 'ok' : 'err') }, r.neterr ? 'network error' : `HTTP ${r.status}`),
@@ -3767,6 +3798,8 @@ async function runExampleStep() {
     if (c.showRes && S.res !== c.showRes) await selectRes(c.showRes);
     else if (S.res) await refreshRes();
   } catch (_) { /* views are best effort */ }
+  // what the step changed is in these cards
+  expandCard($('nsStatus')); if (c.showRes) expandCard($('resState'));
   renderExample();
   return X.results[idx];
 }
@@ -3930,6 +3963,7 @@ function srFailure(ns, res) {
 /* runSearch queries the namespace in the page's fields, or fetches the next page of the last result. */
 async function runSearch(more) {
   if (SR.busy) return;
+  expandCard($('srResults'));
   if (SR.proxy === null) await probeIndex();
   renderSrPick();
   if (!SR.proxy) return renderSearch();
@@ -3984,6 +4018,7 @@ function srAddFilter(path, value) {
 
 function renderSearch() {
   const res = $('srResults');
+  if (SR.proxy !== null) markService('sr', !SR.proxy, '(not configured)');
   if (SR.proxy === false) {
     $('srStatus').replaceChildren();
     return srMessage('info', 'Search needs the index service (Addendum A). Start the core with -index-url (compose does) to read it through the same-origin proxy at /playground/index/. Without it there is nothing to query: the core has no search of its own.');
@@ -4057,6 +4092,7 @@ function renderSIFetch() {
   const p = SI.probe, ta = $('siUrls'), note = $('siFetchNote');
   ta.disabled = p === null ? false : !(p && p.fetch);
   if (p === null) { note.textContent = 'Asking the core whether it fetches URLs…'; return; }
+  markService('si', !p, '(not configured)');
   if (!p) { note.textContent = 'The core has no schema import endpoint (this playground is served without it): nothing to plan with.'; $('siPlan').disabled = true; return; }
   $('siPlan').disabled = SI.busy;
   if (!p.fetch) { note.textContent = 'URL fetching is disabled on this server (serve -schema-fetch). Upload or paste schema files instead; $refs between them are resolved by file name.'; return; }
@@ -4119,6 +4155,7 @@ async function siPlan() {
   if (!req.ns) return toast('Pick or type a namespace');
   if (!req.sources.length && !req.files.length) return toast('Give a URL or add a file');
   store.set('pl.siNs', req.ns);
+  expandCard($('siNotes'));
   SI.busy = true; SI.imported = null; renderSIStatus('Planning…');
   const r = await api('POST', SI_URL + 'plan', { body: req, label: 'schema import' });
   SI.busy = false;
@@ -4167,6 +4204,7 @@ function siView(name) {
 async function siImport() {
   const p = SI.plan;
   if (SI.busy || !p || !p.changed || SI.stale || SI.imported) return;
+  expandCard($('siResult'));
   SI.busy = true; renderSIStatus('Writing…');
   const mismatch = [];
   let done = 0, failed = null;
@@ -4217,7 +4255,7 @@ function renderSIResult() {
       h('label', {}, 'New document'), docName,
       h('button', { class: 'tiny primary', title: 'opens the Resource tab with a create patch that sets this $schema', onclick: () => { store.set('pl.siDoc', docName.value.trim()); siNewDoc(p.ns, docName.value.trim(), e.path); } }, 'Start in the Resource editor')));
   });
-  kids.push(h('p', { class: 'note' }, 'A document that names this path in its $schema is validated against it when written (§6.2); the path is a revision, so it never changes under the document.'));
+  kids.push(h('p', { class: 'note help' }, 'A document that names this path in its $schema is validated against it when written (§6.2); the path is a revision, so it never changes under the document.'));
   box.replaceChildren(...kids);
   $('siResultMeta').textContent = SI.imported ? 'written' : 'already in place';
 }
@@ -4230,7 +4268,7 @@ async function siNewDoc(ns, name, path) {
   });
   $('patch').value = fmtPatch([{ op: 'add', path: '', value: { $schema: path } }]);
   $('patch').dispatchEvent(new Event('input'));
-  showTab('res');
+  showTab('res'); expandCard($('patch'));
   toast('Edit the patch, then Create');
 }
 
@@ -4266,33 +4304,598 @@ function initSchemas() {
 }
 
 /* ------------------------------------------------------------------ *
+ * merge a branch into its base (§F.3)
+ *
+ * The core plans (POST /playground/merge/plan: classify, apply the resolutions, dry-run) and writes nothing; the
+ * page submits the plan's batch itself, through api(), under the author or grant in its connection bar.
+ * ------------------------------------------------------------------ */
+const MG_URL = '/playground/merge/';
+/* texts: the resolution of a resource as typed (JSON text: a patch set, a list of steps, "keep" or "delete"), kept
+ * across plans. open: the rows whose details show. ovr: clean rows whose editor was asked for. seenAt: the base
+ * revision of the last plan shown, '' after this page's own merge. merged: this page's last merge of the pair. */
+const MG = { branch: '', base: '', plan: null, texts: new Map(), bases: new Map(), open: new Set(), ovr: new Set(), stale: false, busy: '', seenAt: '', notes: [], err: null, merged: null, frozen: null, out: null };
+
+function mgReset(branch, base) {
+  Object.assign(MG, { branch, base, plan: null, texts: new Map(), open: new Set(), ovr: new Set(), stale: false, busy: '', seenAt: '', notes: [], err: null, merged: null, frozen: null, out: null });
+}
+
+/* mgOpen shows the Merge card for branch into base ('' : the base the branch's document names). */
+function mgOpen(branch, base) {
+  if (!Z.isNamespaceName(branch) || (base && !Z.isNamespaceName(base))) return toast('Not a namespace name (§3.6)');
+  if (MG.busy) return toast('The merge card is busy');
+  if (branch !== MG.branch || (base || '') !== MG.base) mgReset(branch, base || '');
+  $('mgCard').hidden = false;
+  expandCard($('mgCard'));
+  showTab('ns');
+  renderMerge();
+  $('mgCard').scrollIntoView({ block: 'start' });
+}
+
+const mgIsDelete = (s) => s === 'delete' || (!!s && typeof s === 'object' && !Array.isArray(s) && s.delete === true);
+const mgStatusClass = { merged: '', ahead: 'info', behind: '', clean: 'ok', conflicting: 'err', purged: 'tomb' };
+const mgPlural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+function mgConflicting(p) { return (p.resources || []).filter((r) => r.status === 'conflicting'); }
+function mgNothing(p) { return !!p && p.clean === true && !p.batch && !mgConflicting(p).length; }
+/* the resources whose resolution the planner didn't apply: the base's head is no longer the one it was written against */
+function mgStaleRes(p) { return ((p && p.staleResolutions) || []).filter((x) => x && typeof x.resource === 'string'); }
+/* the base head ('' = absent) of a resource in the plan shown: what a resolution typed now is written against */
+function mgBaseOf(name) { const r = MG.plan && (MG.plan.resources || []).find((x) => x.resource === name); return r ? r.base || '' : ''; }
+function mgCanMerge() {
+  const p = MG.plan;
+  return !!p && !MG.busy && !MG.stale && p.clean === true && !!p.batch && Array.isArray(p.batch.items) && p.batch.items.length > 0 && !p.dryRunError;
+}
+/* the freeze records the merge batch of this page, or, where nothing was left to merge, the base revision the
+ * plan found that at (§F.6) */
+function mgFreezeAt() {
+  const p = MG.plan;
+  if (MG.merged) return MG.merged.at;
+  return mgNothing(p) && !MG.stale ? p.targetAt : '';
+}
+
+/* mgResolutions is what the plan request's "resolve" carries: every resolution typed, parsed. */
+function mgResolutions() {
+  const out = {};
+  for (const [name, text] of MG.texts) {
+    if (!text.trim()) continue;
+    const p = tryParse(text);
+    if (!p.ok) return { err: `The resolution of ${name} is not valid JSON: ${p.err}` };
+    out[name] = p.v;
+  }
+  return { v: out, n: Object.keys(out).length };
+}
+
+function mgFail(r, what) {
+  const j = r.json && typeof r.json === 'object' ? r.json : null;
+  return { what, code: r.neterr ? 'network error' : (j && j.code) || 'HTTP ' + r.status, message: r.neterr || (j && j.message) || '', entry: j && r.entry ? r.entry : null };
+}
+
+/* mgPlan asks for a plan. A plan already shown stays pinned to its branch revision (branchAt) unless o.fresh;
+ * o.moved is the note of a merge the base refused (412), o.own follows this page's own merge. */
+async function mgPlan(o = {}) {
+  if (MG.busy || !MG.branch) return false;
+  const res = mgResolutions();
+  if (res.err) { toast(res.err); return false; }
+  const prev = MG.plan;
+  const body = { branch: MG.branch, squash: $('mgSquash').checked };
+  if (MG.base) body.base = MG.base;
+  const pinned = !o.fresh && prev && ID_RE.test(prev.branchAt || '');
+  if (pinned) body.branchAt = prev.branchAt;
+  if (res.n) {
+    body.resolve = res.v;
+    // each with the base head it was written against: the planner applies none whose base moved since
+    body.resolvedAt = {};
+    Object.keys(res.v).forEach((n) => { body.resolvedAt[n] = MG.bases.has(n) ? MG.bases.get(n) : mgBaseOf(n); });
+  }
+  MG.busy = 'Planning…'; MG.err = null; renderMergeState();
+  // what was typed while the planner worked is not what it planned
+  const typed = () => JSON.stringify([[...MG.texts].filter(([, t]) => t.trim()), $('mgSquash').checked]);
+  const sent = typed();
+  const r = await asUser(() => api('POST', MG_URL + 'plan', { body, label: 'merge' }));
+  MG.busy = '';
+  const p = r.ok && r.json && typeof r.json === 'object' ? r.json : null;
+  if (!p || !Array.isArray(p.resources) || !Z.isNamespaceName(p.target) || !Z.isNamespaceName(p.branch)) {
+    // The plan shown stays, with what was typed: a refused resolution is corrected and planned again.
+    MG.err = p ? { what: 'Plan', code: 'bad answer', message: 'the planner\'s answer is not a plan', entry: null } : mgFail(r, 'Plan');
+    if (o.moved) MG.notes = [o.moved];
+    MG.stale = !!prev;
+    renderMerge();
+    return false;
+  }
+  const notes = [];
+  if (o.moved) notes.push(o.moved);
+  else if (MG.seenAt && p.targetAt !== MG.seenAt) notes.push(`The base moved since the last plan (${short(MG.seenAt)} → ${short(p.targetAt)}): every resource was classified again against its head now, and the resolutions with it.`);
+  if (prev && o.fresh && prev.branchAt !== p.branchAt) notes.push(`Planned afresh: the branch moved too, and this plan classifies from its head now (${short(prev.branchAt)} → ${short(p.branchAt)}).`);
+  if (prev && o.fresh && res.n) notes.push('Planned afresh: the resolutions were written against the earlier plan and have been checked again against this one. Review them.');
+  // A resolution of a resource the plan no longer lists has no editor to change it in: dropped, and said.
+  const names = new Set(p.resources.map((x) => x.resource));
+  const gone = [...MG.texts.keys()].filter((n) => !names.has(n));
+  gone.forEach((n) => { MG.texts.delete(n); MG.bases.delete(n); MG.ovr.delete(n); });
+  if (gone.length) notes.push('Dropped the resolution of ' + gone.join(', ') + ': the plan has no such resource.');
+  MG.plan = p; MG.base = p.target; MG.seenAt = p.targetAt || ''; MG.stale = typed() !== sent; MG.notes = notes;
+  if (!o.own) MG.out = null;
+  mgConflicting(p).forEach((x) => MG.open.add(x.resource));
+  mgStaleRes(p).forEach((x) => MG.open.add(x.resource));
+  renderMerge();
+  return true;
+}
+
+/* mgMerge submits the plan's batch, verbatim, to the base. A 412 or 410, of the batch or of an item, means the
+ * base moved: nothing was written, and the page plans again (same pin, same resolutions) for a person to review.
+ * It never resubmits by itself. */
+async function mgMerge() {
+  if (!mgCanMerge()) return;
+  const p = MG.plan;
+  MG.busy = 'Merging…'; MG.out = null; renderMergeState();
+  const r = await asUser(() => api('POST', `/ns/${p.target}/batch`, { label: 'merge', body: p.batch }));
+  MG.busy = '';
+  const items = r.json && Array.isArray(r.json.items) ? r.json.items : [];
+  if (r.status === 201 || r.status === 200) {
+    const at = r.hdr('X-Namespace-Revision') || (r.json && r.json.ns_id) || '';
+    MG.merged = { target: p.target, branch: p.branch, at: ID_RE.test(at) ? at : '', branchAt: p.branchAt,
+      items: p.batch.items.map((it, i) => ({ resource: it.resource, ids: (items[i] && Array.isArray(items[i].ids) ? items[i].ids : []).filter((x) => typeof x === 'string') })) };
+    MG.texts.clear(); MG.bases.clear(); MG.ovr.clear(); MG.open.clear(); MG.seenAt = '';
+    toast(`Merged ${p.branch} into ${p.target}`);
+    // What is left, from the branch's head now: nothing, unless the branch moved on meanwhile.
+    await mgPlan({ fresh: true, own: true });
+    if (S.ns === p.target || S.ns === p.branch) await afterWrite();
+    return;
+  }
+  const stale = items.filter((x) => x && (x.status === 412 || x.status === 410));
+  if (r.status === 412 || r.status === 410 || stale.length) {
+    const which = stale.map((x) => { const it = p.batch.items[x.index]; return (it ? it.resource : 'item ' + x.index) + (x.code ? ` (${x.code})` : ''); });
+    const note = `The base moved: the merge answered HTTP ${r.status}` + (which.length ? ' for ' + which.join(', ') : '') + ' and nothing was written. This is a new plan against the base as it is now, with the same branch revision and resolutions. Review it, then Merge again.';
+    await mgPlan({ moved: note });
+    if (S.ns === p.target) await afterWrite();
+    return;
+  }
+  MG.out = mgFail(r, 'Merge');
+  renderMerge();
+}
+
+/* mgFreeze is the one config write that ends a merged branch (§F.3 step 6, §F.6): frozen, and merged.at the
+ * base revision. If-Match takes the branch's config id, read first, and once more after a 412. */
+async function mgFreeze() {
+  const p = MG.plan, at = mgFreezeAt();
+  const branch = MG.merged ? MG.merged.branch : p && p.branch;
+  if (MG.busy || !Z.isNamespaceName(branch) || !ID_RE.test(at)) return;
+  MG.busy = 'Freezing…'; MG.out = null; renderMergeState();
+  let r = null, fail = null;
+  await asUser(async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const g = await api('GET', `/ns/${branch}`, { label: 'merge' });
+      const cfg = g.status === 200 ? g.hdr('X-Config-Revision') || '' : '';
+      if (!ID_RE.test(cfg)) { fail = g.status === 200 ? { what: 'Freeze', code: 'no config id', message: `GET /ns/${branch} named no X-Config-Revision`, entry: null } : mgFail(g, 'Freeze'); return; }
+      r = await api('PATCH', `/ns/${branch}`, { ct: PJ, label: 'merge', headers: { 'If-Match': quoteId(cfg) },
+        body: [{ op: 'add', path: '/frozen', value: true }, { op: 'add', path: '/merged', value: { at } }] });
+      if (r.status !== 412) return;
+    }
+  });
+  MG.busy = '';
+  if (!fail && r && r.ok) {
+    MG.frozen = { branch, at };
+    if (p && p.branch === branch) { p.branchFrozen = true; p.branchMerged = { at }; }
+    toast(`${branch} frozen`);
+  } else MG.out = fail || mgFail(r, 'Freeze');
+  renderMerge();
+  if (S.ns === branch || (p && S.ns === p.target)) await afterWrite();
+}
+
+function mgGoto(ns, name) {
+  if (!Z.isNamespaceName(ns) || !Z.isResourceName(name)) return toast('Not a resource name (§3.6)');
+  asUser(async () => { if (S.ns !== ns) await selectNS(ns); await selectRes(name); });
+  showTab('res'); expandCard($('resState'));
+}
+
+function mgSetText(name, text) {
+  if (text.trim()) { MG.texts.set(name, text); MG.bases.set(name, mgBaseOf(name)); } else { MG.texts.delete(name); MG.bases.delete(name); }
+  if (MG.plan) MG.stale = true;
+  renderMergeState();
+}
+
+/* the resolution editor of one resource: JSON against the base's head */
+function mgEditor(r) {
+  const name = r.resource;
+  const ta = h('textarea', { class: 'code', rows: 4, spellcheck: 'false', 'data-json': true, 'aria-label': 'resolution of ' + name,
+    placeholder: '[{"op":"replace","path":"/title","value":"…"}]   one patch set against the base\'s head, or "keep", or "delete"' });
+  ta.value = MG.texts.get(name) || '';
+  const hint = jsonHint(ta);
+  ta.addEventListener('input', () => mgSetText(name, ta.value));
+  const set = (v) => { ta.value = v; ta.dispatchEvent(new Event('input')); };
+  const steps = r.steps || [];
+  const plain = steps.length > 0 && steps.every((s) => Array.isArray(s) || s === 'delete');
+  const old = mgStaleRes(MG.plan).find((x) => x.resource === name);
+  return h('div', { class: 'mg-edit' },
+    old ? h('div', { class: 'warn-box' }, 'This resolution was not applied: it was written against the base\'s head ', old.writtenAt ? idEl(old.writtenAt) : 'when the resource was absent', ', and the base has changed the resource since. Open it in the base, check the resolution against what is there now, then edit it or ',
+      h('button', { type: 'button', class: 'tiny', onclick: () => mgSetText(name, ta.value) }, 'confirm it as it is'), ' and Re-plan.') : null,
+    h('div', { class: 'row' }, h('b', {}, 'Resolution'),
+      h('span', { class: 'muted small' }, 'replaces the steps with one patch set against the base\'s head', r.base ? [' ', idEl(r.base)] : r.baseState && r.baseState !== 'live' ? ` (${r.baseState})` : '')),
+    ta, hint,
+    h('div', { class: 'chips' },
+      h('button', { type: 'button', title: 'the base stays as it is; the branch\'s change is dropped', onclick: () => set('"keep"') }, 'keep base'),
+      h('button', { type: 'button', title: 'the resource is deleted in the base', onclick: () => set('"delete"') }, 'delete'),
+      plain && !r.resolved ? h('button', { type: 'button', title: 'the branch\'s steps as they are, replayed onto the base\'s head: edit them', onclick: () => set(JSON.stringify(steps, null, 2)) }, 'branch\'s steps') : null,
+      h('button', { type: 'button', onclick: () => { MG.ovr.delete(name); set(''); if (r.status !== 'conflicting') renderMerge(); } }, 'clear')));
+}
+
+function mgDetail(r) {
+  const p = MG.plan, name = r.resource;
+  const kv = h('dl', { class: 'kv' });
+  const row = (k, v) => kv.append(h('dt', {}, k), h('dd', {}, v));
+  row('base head', [r.base ? idEl(r.base) : h('span', { class: 'muted' }, 'none'), ' ', h('span', { class: 'muted' }, r.baseState || '')]);
+  row('branch head', [r.branch ? idEl(r.branch) : h('span', { class: 'muted' }, 'none'), r.branchDeleted ? ' deleted' : '']);
+  if (r.ancestor) row('common ancestor', [idEl(r.ancestor), r.targetAncestor && r.targetAncestor !== r.ancestor ? [' in the branch, ', idEl(r.targetAncestor), ' in the base'] : '']);
+  if (r.ifMatch) row('ifMatch', idEl(r.ifMatch));
+  if (r.ifNoneMatch) row('ifNoneMatch', '*');
+  if (Array.isArray(r.expected) && r.expected.length) row('expected ids', r.expected.map((id) => [idEl(id), ' ']));
+  if (Array.isArray(r.branchWrites)) row('branch writes', h('span', { class: 'mono' }, r.branchWrites.join('  ') || '(none)'));
+  if (Array.isArray(r.baseWrites)) row('base writes', h('span', { class: 'mono' }, r.baseWrites.join('  ') || '(none)'));
+  if (r.pair) row('pair', ['merge batch ', typeof r.pair.batch === 'string' ? idEl(r.pair.batch) : '', ` by ${r.pair.author || '?'}` + (r.pair.kid ? ` (${r.pair.kid})` : ''),
+    typeof r.pair.branch === 'string' && r.pair.branch ? [': branch ', idEl(r.pair.branch)] : '', typeof r.pair.target === 'string' && r.pair.target ? [' = base ', idEl(r.pair.target)] : '']);
+  const editable = r.class === 'fast-forward' || r.class === 'replay';
+  const editing = r.status === 'conflicting' || MG.texts.has(name) || MG.ovr.has(name);
+  return h('tr', { class: 'mg-detail' }, h('td', { colspan: 5 },
+    kv,
+    h('h3', {}, (r.steps || []).length ? 'Steps' + (r.resolved ? ' (the resolution)' : '') : 'No steps'),
+    (r.steps || []).length ? jsonPre(r.steps) : null,
+    editing ? mgEditor(r) : editable ? h('div', { class: 'row' }, h('button', { class: 'tiny', title: 'replace this resource\'s steps with a resolution of your own', onclick: () => { MG.ovr.add(name); renderMerge(); } }, 'override…')) : null,
+    p && Z.isResourceName(name) ? null : h('div', { class: 'warn-box' }, 'This is no resource name (§3.6): the page opens no link for it.')));
+}
+
+function mgRow(r) {
+  const p = MG.plan, name = String(r.resource), open = MG.open.has(name);
+  const steps = Array.isArray(r.steps) ? r.steps : [];
+  const count = !steps.length ? '—' : steps.length === 1 && mgIsDelete(steps[0]) ? 'delete' : mgPlural(steps.length, 'step') + (steps.some(mgIsDelete) ? ', with a delete' : '');
+  const flags = [
+    r.resolved ? h('span', { class: 'badge ok' }, r.dropped ? 'resolved: base kept' : 'resolved') : null,
+    r.kept ? h('span', { class: 'badge', title: 'recorded with a revision of identical content, so the next merge has a common ancestor (§F.3)' }, 'kept, recorded') : null,
+    r.squashed ? h('span', { class: 'badge' }, 'squashed') : null,
+    r.branchDeleted ? h('span', { class: 'badge tomb' }, 'deleted in the branch') : null,
+    r.baseState && r.baseState !== 'live' ? h('span', { class: 'badge' }, 'base: ' + r.baseState) : null,
+    MG.texts.has(name) && !r.resolved ? h('span', { class: 'badge warn' }, 'resolution not planned yet') : null,
+  ];
+  const tr = h('tr', { class: r.status === 'conflicting' ? 'mg-conflict' : '' },
+    h('td', { class: 'wrap' },
+      h('button', { class: 'link mg-tog', 'aria-expanded': String(open), title: 'steps, writes, resolution', onclick: () => { if (open) MG.open.delete(name); else MG.open.add(name); renderMerge(); } }, open ? '▾' : '▸'),
+      Z.isResourceName(name)
+        ? [h('button', { class: 'link mono', title: `open ${name} in ${p.target}`, onclick: () => mgGoto(p.target, name) }, name), ' ',
+          h('button', { class: 'link small', title: `open ${name} in ${p.branch}`, onclick: () => mgGoto(p.branch, name) }, 'in branch')]
+        : h('span', { class: 'mono' }, name)),
+    h('td', {}, r.class || ''),
+    h('td', {}, h('span', { class: 'badge ' + (mgStatusClass[r.status] || '') }, r.status || '')),
+    h('td', {}, count),
+    h('td', { class: 'wrap' },
+      (r.conflicts || []).map((c) => h('div', { class: r.resolved ? 'muted' : '' }, h('span', { class: 'badge ' + (r.resolved ? '' : 'err') }, c.kind || 'conflict'), ' ',
+        Array.isArray(c.paths) && c.paths.length ? [h('span', { class: 'mono' }, c.paths.join('  ')), ' '] : null, c.message || '')),
+      flags.some(Boolean) ? h('div', { class: 'mg-flags' }, flags) : null,
+      r.note ? h('div', { class: 'muted' }, r.note) : null,
+      r.pair ? h('div', { class: 'muted small' }, 'pair from merge batch ', typeof r.pair.batch === 'string' ? idEl(r.pair.batch) : '', ` by ${r.pair.author || '?'}`) : null));
+  return open ? [tr, mgDetail(r)] : [tr];
+}
+
+/* the dry-run report: per item the ids a submit would produce, or what failed */
+function mgDryBox(p) {
+  const items = p.batch && Array.isArray(p.batch.items) ? p.batch.items : [];
+  if (p.dryRunError) {
+    const e = p.dryRunError, bad = Array.isArray(e.items) ? e.items : [];
+    return h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'dry run failed' + (e.code ? ': ' + e.code : '')), '  ' + (e.message || (e.status ? 'HTTP ' + e.status : '')),
+      bad.length ? h('ul', { class: 'checks' }, bad.map((x) => {
+        const { index, status, code, message, ...rest } = x || {};
+        const it = items[index];
+        return h('li', { class: 'bad' }, '✗ ', h('span', { class: 'mono' }, it ? it.resource : 'item ' + index), ` ${status || ''} ${code || ''}`, message ? ': ' + message : '',
+          Object.keys(rest).length ? h('span', { class: 'mono muted' }, ' ' + JSON.stringify(rest)) : null);
+      })) : null);
+  }
+  if (Array.isArray(p.dryRun)) {
+    return h('div', { class: 'seal-box mg-ok' }, h('div', { class: 'state-line' }, h('span', { class: 'badge ok' }, 'dry run passed'),
+      h('span', { class: 'muted small' }, `${mgPlural(p.dryRun.length, 'item')} into ${p.target}, nothing written; the ids a merge would produce:`)),
+    h('ul', { class: 'checks' }, p.dryRun.map((x, i) => {
+      const it = items[x && typeof x.index === 'number' ? x.index : i];
+      const ids = x && Array.isArray(x.ids) ? x.ids.filter((id) => typeof id === 'string') : [];
+      return h('li', {}, h('span', { class: 'mono' }, (x && x.resource) || (it && it.resource) || 'item ' + i), ' ', x && x.status ? h('span', { class: 'muted' }, x.status + ' ') : null, ids.map((id) => [idEl(id), ' ']));
+    })));
+  }
+  if (mgNothing(p)) {
+    return h('div', { class: 'seal-box mg-ok' }, h('div', { class: 'state-line' }, h('span', { class: 'badge ok' }, 'nothing to merge'),
+      h('span', {}, `${p.target} has everything ${p.branch} changed, as of the revisions above.`)));
+  }
+  return h('p', { class: 'note' }, 'No dry run yet: it is made once no resource is conflicting.');
+}
+
+function mgErrBox(f) {
+  if (f.entry) { const b = errBox(f.entry); b.prepend(h('b', {}, f.what + ' refused: ')); return b; }
+  return h('div', { class: 'errbox' }, h('b', {}, f.what + ' refused: '), h('span', { class: 'code' }, f.code), f.message ? '  ' + f.message : '');
+}
+
+/* the buttons and the status line, which change as resolutions are typed (the table is left alone then) */
+function renderMergeState() {
+  const p = MG.plan, st = $('mgStatus');
+  const set = (msg, cls) => { st.className = cls || 'muted'; st.textContent = msg; };
+  $('mgPlan').textContent = p ? 'Re-plan' : 'Plan';
+  $('mgPlan').disabled = !!MG.busy || !MG.branch;
+  $('mgFresh').hidden = !p; $('mgFresh').disabled = !!MG.busy;
+  $('mgClearRes').hidden = !MG.texts.size; $('mgClearRes').disabled = !!MG.busy;
+  $('mgSquash').disabled = !!MG.busy;
+  $('mgGo').disabled = !mgCanMerge();
+  const fz = ID_RE.test(mgFreezeAt()) && !(MG.frozen && MG.frozen.branch === MG.branch) && !(p && p.branchFrozen);
+  $('mgFreeze').hidden = !fz; $('mgFreeze').disabled = !!MG.busy;
+  if (MG.busy) return set(MG.busy);
+  if (!p) return set(MG.err ? '' : 'Plan classifies what the branch changed against the base, and writes nothing.');
+  const bad = mgConflicting(p).length;
+  if (MG.stale) return set('The resolutions or options changed since this plan: Re-plan before merging.', 'bad');
+  const old = mgStaleRes(p).length;
+  if (old) return set(`${mgPlural(old, 'resolution')} not applied: the base changed under ${old === 1 ? 'it' : 'them'}. Check each against the base's head now, confirm or edit it, then Re-plan.`, 'bad');
+  if (bad) return set(`${mgPlural(bad, 'resource')} conflicting: write a resolution for each, then Re-plan.`, 'bad');
+  if (p.dryRunError) return set('The dry run failed, see below: nothing can be merged as planned.', 'bad');
+  if (!p.batch) return set('Nothing to merge.');
+  set(`${mgPlural(p.batch.items.length, 'item')} to merge; the dry run passed.`, 'good');
+}
+
+function renderMerge() {
+  const p = MG.plan;
+  const target = (p && p.target) || MG.base, branch = (p && p.branch) || MG.branch;
+  const nsBtn = (ns) => h('button', { class: 'link mono', title: 'open ' + ns, onclick: () => asUser(() => selectNS(ns)) }, ns);
+  $('mgHead').replaceChildren(
+    h('b', {}, branch ? nsBtn(branch) : '', ' → ', target ? nsBtn(target) : h('span', { class: 'muted' }, 'its base')),
+    ...(p ? [h('span', {}, 'branch at ', idEl(p.branchAt)), h('span', { class: 'badge info', title: 'a re-plan classifies from this branch revision again' }, 'pinned'),
+      h('span', {}, 'base at ', idEl(p.targetAt)),
+      p.branchFrozen ? h('span', { class: 'badge warn' }, 'branch frozen') : null,
+      p.branchMerged && typeof p.branchMerged.at === 'string' ? h('span', { class: 'muted small' }, 'merged.at ', idEl(p.branchMerged.at)) : null,
+      p.squash ? h('span', { class: 'badge' }, 'squashed') : null].filter(Boolean) : []));
+  const notes = [];
+  if (MG.err) notes.push(mgErrBox(MG.err));
+  MG.notes.forEach((n) => notes.push(h('div', { class: 'warn-box mg-moved' }, n)));
+  if (p) {
+    (p.hints || []).forEach((x) => notes.push(h('div', { class: 'warn-box' }, String(x))));
+    (p.ignoredMerges || []).forEach((m) => notes.push(h('div', { class: 'warn-box' }, 'Earlier merge batch ', typeof m.batch === 'string' ? idEl(m.batch) : '', m.author ? ` by ${m.author}` + (m.kid ? ` (${m.kid})` : '') : '', ' is not used as a common ancestor', m.reason ? ': ' + m.reason : '')));
+    if ((p.leftOut || []).length) notes.push(h('div', { class: 'warn-box' }, 'Left out of the batch, and offered again by the next plan: ' + p.leftOut.join(', ')));
+    if (p.authorsDeclared) notes.push(h('p', { class: 'note' }, 'merge.authors of ' + p.target + ': ' + ((p.mergeAuthors || []).map((a) => a.sub + (a.kid ? ` (${a.kid})` : '')).join(', ') || 'none')));
+  }
+  $('mgNotes').replaceChildren(...notes);
+  $('mgPlanBox').hidden = !p;
+  if (p) {
+    const tb = $('mgTbl').tBodies[0];
+    if (p.resources.length) tb.replaceChildren(...p.resources.flatMap(mgRow));
+    else tb.replaceChildren(h('tr', {}, h('td', { class: 'empty', colspan: 5 }, 'The branch changed no resource.')));
+    $('mgDry').replaceChildren(mgDryBox(p));
+  }
+  const out = [];
+  if (MG.merged) {
+    const m = MG.merged;
+    out.push(h('div', { class: 'seal-box mg-ok', id: 'mgMerged' }, h('div', { class: 'state-line' }, h('span', { class: 'badge ok' }, 'merged'),
+      h('span', {}, `${m.branch} at `, idEl(m.branchAt), ` into ${m.target} as batch `, m.at ? idEl(m.at) : '(no X-Namespace-Revision)')),
+    h('ul', { class: 'checks' }, m.items.map((it) => h('li', { class: 'ok' }, '✓ ', h('span', { class: 'mono' }, it.resource), ' ', it.ids.map((id) => [idEl(id), ' ']))))));
+  }
+  if (MG.frozen) out.push(h('div', { class: 'seal-box mg-ok', id: 'mgFrozen' }, h('div', { class: 'state-line' }, h('span', { class: 'badge warn' }, 'frozen'),
+    h('span', {}, `${MG.frozen.branch} is frozen, with merged.at `, idEl(MG.frozen.at)))));
+  if (MG.out) out.push(mgErrBox(MG.out));
+  $('mgOut').replaceChildren(...out);
+  renderMergeState();
+}
+
+function initMerge() {
+  $('mgPlan').onclick = () => mgPlan();
+  $('mgFresh').onclick = () => mgPlan({ fresh: true });
+  $('mgClearRes').onclick = () => { MG.texts.clear(); MG.bases.clear(); MG.ovr.clear(); if (MG.plan) MG.stale = true; renderMerge(); };
+  $('mgSquash').onchange = () => { if (MG.plan) MG.stale = true; renderMergeState(); };
+  $('mgGo').onclick = mgMerge;
+  $('mgFreeze').onclick = mgFreeze;
+  $('mgClose').onclick = () => { if (!MG.busy) $('mgCard').hidden = true; };
+}
+
+/* ------------------------------------------------------------------ *
  * tabs and wiring
  * ------------------------------------------------------------------ */
+/* UI state of the page itself: which cards are open (pl.cards, written only when the user toggles one), the
+ * tab shown, and what the inspector strip shows. */
+const UI = { cards: {}, parts: new Map(), tab: 'ns', last: null, errs: 0, createHint: '' };
+const CORE_TABS = ['ns', 'res', 'hist', 'batch', 'live']; // these work on the selected namespace
+const MORE_TABS = { cat: 'Catalog', sr: 'Search', si: 'Schemas', keys: 'Keys' };
+
 function showTab(name) {
-  document.querySelectorAll('.tab').forEach((t) => t.setAttribute('aria-selected', String(t.dataset.tab === name)));
-  document.querySelectorAll('[role=tabpanel]').forEach((p) => { p.hidden = p.id !== 'tab-' + name; });
+  UI.tab = name;
+  // without a namespace the tabs that need one give way to the start panel
+  const start = !S.ns && CORE_TABS.includes(name);
+  document.querySelectorAll('.tab').forEach((t) => t.setAttribute('aria-selected', String(!start && t.dataset.tab === name)));
+  document.querySelectorAll('[role=tabpanel]').forEach((p) => { p.hidden = p.id === 'startPanel' ? !start : start || p.id !== 'tab-' + name; });
+  $('startTab').setAttribute('aria-selected', String(start));
+  const more = !start && MORE_TABS[name];
+  $('moreLabel').textContent = more ? 'More: ' + more : 'More';
+  $('moreBtn').classList.toggle('sel', !!more);
   store.set('pl.tab', name);
 }
 
-function bindJSONHints() {
-  document.querySelectorAll('textarea[data-json]').forEach((ta) => {
-    const hint = h('div', { class: 'hint' });
-    ta.after(hint);
-    const check = () => {
-      const t = ta.value.trim();
-      if (!t) { hint.textContent = ''; hint.className = 'hint'; return; }
-      const p = tryParse(t);
-      hint.textContent = p.ok ? 'valid JSON' : 'invalid JSON: ' + p.err;
-      hint.className = 'hint ' + (p.ok ? 'good' : 'bad');
-    };
-    ta.addEventListener('input', check); check();
+/* syncStart shows the start panel in place of the namespace tabs while no namespace is selected. */
+function syncStart() {
+  const none = !S.ns;
+  if (document.body.classList.contains('no-ns') === none) return;
+  document.body.classList.toggle('no-ns', none);
+  $('startTab').hidden = !none;
+  showTab(UI.tab);
+}
+
+function renderStartKnown() {
+  $('startKnown').replaceChildren(...(known.length
+    ? [h('span', {}, 'known here:'), ...known.map((n) => h('button', { class: 'mono', type: 'button', onclick: () => asUser(() => selectNS(n)) }, n))]
+    : [h('span', {}, 'No namespaces known in this browser yet.')]));
+}
+
+function initStart() {
+  const open = () => { const n = $('startNs').value.trim(); if (!n) return toast('Enter a namespace name'); $('startNs').value = ''; asUser(() => selectNS(n)); };
+  $('startOpen').onclick = open;
+  $('startNs').onkeydown = (e) => { if (e.key === 'Enter') open(); };
+  // the same request as the Create namespace card, through its fields
+  const create = async () => {
+    const name = $('startNewName').value.trim(), msg = $('startMsg');
+    msg.hidden = true;
+    if (!name) return toast('Enter a namespace name');
+    $('nsNewName').value = name; $('nsNewDoc').value = $('startNewDoc').value;
+    $('nsNewDoc').dispatchEvent(new Event('input'));
+    const r = await createNamespace();
+    if (r && r.ok) { $('startNewName').value = ''; return; }
+    if (!r) return;
+    msg.hidden = false;
+    msg.replaceChildren(h('div', { class: 'errbox' }, h('span', { class: 'code' }, r.neterr ? 'network error' : 'HTTP ' + r.status), '  ' + (r.neterr || errSummary(r.entry))));
+  };
+  $('startCreate').onclick = create;
+  $('startNewName').onkeydown = (e) => { if (e.key === 'Enter') create(); };
+  $('startEx').replaceChildren(...EXAMPLES.map((ex) => h('button', { type: 'button', title: ex.desc, onclick: () => startExample(ex) }, `(${ex.id}) ${ex.title}`)));
+  $('startTab').onclick = () => showTab('ns');
+}
+
+/* The More menu holds the tabs of the services beside the core. */
+function initTabMenu() {
+  const btn = $('moreBtn'), menu = $('moreMenu');
+  const items = () => [...menu.querySelectorAll('.tab')];
+  const close = (focus) => { if (menu.hidden) return; menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); if (focus) btn.focus(); };
+  const open = () => {
+    menu.hidden = false; btn.setAttribute('aria-expanded', 'true');
+    menu.classList.remove('flip');
+    menu.classList.toggle('flip', menu.getBoundingClientRect().right > document.documentElement.clientWidth - 8);
+  };
+  btn.onclick = () => (menu.hidden ? open() : close());
+  btn.onkeydown = (e) => { if (e.key === 'ArrowDown') { e.preventDefault(); open(); items()[0].focus(); } };
+  menu.onkeydown = (e) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    e.preventDefault();
+    const all = items(), i = all.indexOf(document.activeElement);
+    all[(i + (e.key === 'ArrowDown' ? 1 : all.length - 1)) % all.length].focus();
+  };
+  menu.addEventListener('click', (e) => { if (e.target.closest('.tab')) close(true); });
+  // capture: some handlers on the page stop their clicks from bubbling
+  document.addEventListener('click', (e) => { if (!menu.contains(e.target) && !btn.contains(e.target)) close(); }, true);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(menu.contains(document.activeElement) || document.activeElement === btn); });
+}
+
+/* markService notes in the More menu that the service behind a tab isn't offered here; the tab stays, it says why. */
+function markService(tab, missing, text) {
+  const t = document.querySelector(`.tab[data-tab="${tab}"]`), s = t.querySelector('.svc');
+  t.classList.toggle('unavail', !!missing);
+  s.hidden = !missing; s.textContent = missing ? text : '';
+}
+
+/* ---- cards: collapsed to their header line, notes behind "?" ---- */
+function setCardOpen(card, open, persist) {
+  const c = UI.parts.get(card); if (!c) return;
+  c.body.hidden = !open;
+  card.classList.toggle('collapsed', !open);
+  c.toggle.setAttribute('aria-expanded', String(open));
+  if (persist) { UI.cards[card.dataset.card] = open; store.set('pl.cards', UI.cards); }
+}
+/* expandCard opens the card around el, for code that shows a result in it or sends the user to it. The stored
+ * choice stays as it was. */
+function expandCard(el) {
+  const card = el && el.closest('.card');
+  if (card && card.classList.contains('collapsed')) setCardOpen(card, true, false);
+}
+/* openUnlessSet opens a card whose content is now worth showing, unless the user has opened or closed it before. */
+function openUnlessSet(el) {
+  const card = el && el.closest('.card');
+  if (card && !(card.dataset.card in UI.cards)) expandCard(card);
+}
+function setCardCount(el, n, cls) {
+  const c = UI.parts.get(el && el.closest('.card')); if (!c) return;
+  c.count.hidden = !n; c.count.textContent = n || '';
+  c.count.className = 'badge card-count' + (cls && n ? ' ' + cls : '');
+}
+function setCardHelp(card, on) {
+  const c = UI.parts.get(card); if (!c || !c.help) return;
+  card.classList.toggle('show-help', on);
+  c.help.setAttribute('aria-expanded', String(on));
+}
+
+function initCards() {
+  const saved = store.get('pl.cards', {});
+  UI.cards = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+  document.querySelectorAll('.card[data-card]').forEach((card) => {
+    const head = card.querySelector(':scope > header'), h2 = head && head.querySelector('h2');
+    if (!h2) return;
+    const key = card.dataset.card;
+    const body = h('div', { class: 'card-body', id: 'card-' + key.replace(/\W/g, '-') });
+    body.append(...[...card.childNodes].filter((n) => n !== head));
+    card.append(body);
+    const toggle = h('button', { type: 'button', class: 'card-toggle', 'aria-expanded': 'true', 'aria-controls': body.id },
+      h('span', { class: 'chev', 'aria-hidden': 'true' }), h2.textContent);
+    const count = h('span', { class: 'badge card-count', hidden: true });
+    h2.replaceChildren(toggle, count);
+    const notes = [...body.querySelectorAll('.note.help')];
+    notes.forEach((n, i) => { if (!n.id) n.id = body.id + '-help' + (i + 1); });
+    const help = notes.length || card.hasAttribute('data-help')
+      ? h('button', { type: 'button', class: 'card-help', 'aria-expanded': 'false', 'aria-controls': notes.map((n) => n.id).join(' ') || body.id, title: 'About this card', 'aria-label': 'About this card' }, '?')
+      : null;
+    if (help) head.append(help);
+    UI.parts.set(card, { body, toggle, count, help });
+    head.addEventListener('click', (e) => {
+      const ctl = e.target.closest('button, a, input, select, textarea, label, .id');
+      if (help && ctl === help) {
+        setCardHelp(card, !card.classList.contains('show-help'));
+        return;
+      }
+      // another control in the header does its own thing; what a button shows is in the body
+      if (ctl && ctl !== toggle && head.contains(ctl)) { if (ctl.tagName === 'BUTTON') expandCard(card); return; }
+      setCardOpen(card, body.hidden, true);
+    });
+    setCardOpen(card, key in UI.cards ? !!UI.cards[key] : card.hasAttribute('data-open'), false);
   });
+  const all = (on) => { document.body.classList.toggle('help-all', on); $('helpAll').setAttribute('aria-pressed', String(on)); };
+  $('helpAll').onclick = () => { const on = !document.body.classList.contains('help-all'); all(on); store.set('pl.helpAll', on); };
+  all(!!store.get('pl.helpAll', false));
+}
+
+/* ---- inspector: closed to a strip that shows the last request ---- */
+function setInspOpen(open, persist) {
+  document.body.classList.toggle('insp-off', !open);
+  $('inspToggle').setAttribute('aria-expanded', String(open));
+  $('inspFloat').setAttribute('aria-expanded', String(open));
+  if (open) { UI.errs = 0; renderStripErrs(); }
+  if (persist) store.set('pl.inspOpen', open);
+}
+function renderStripErrs() {
+  $('stripErrs').hidden = !UI.errs; $('stripErrs').textContent = UI.errs === 1 ? '1 error' : UI.errs + ' errors';
+  $('inspCount').classList.toggle('err', UI.errs > 0);
+}
+/* renderStrip keeps the closed inspector's strip at the last request the user made (a background read shows only
+ * until there is one), and marks it when that request failed. Called for each entry as it starts and ends. */
+function renderStrip(e) {
+  $('stripCount').textContent = insp.entries.length;
+  if (!e) {
+    UI.last = null; UI.errs = 0; renderStripErrs();
+    $('stripPill').className = 'pill pend'; $('stripPill').textContent = '—';
+    $('stripMeth').textContent = ''; $('stripPath').textContent = 'no requests yet'; $('stripErr').textContent = '';
+    $('inspFloat').classList.remove('err');
+    return;
+  }
+  const failed = !e.auto && (!!e.neterr || (e.status != null && e.status >= 400));
+  if (failed && !e.counted && document.body.classList.contains('insp-off')) { e.counted = true; UI.errs++; renderStripErrs(); }
+  if (e.auto && UI.last && !UI.last.auto && UI.last !== e) return;
+  UI.last = e;
+  $('stripPill').className = 'pill ' + statusClass(e);
+  $('stripPill').textContent = e.neterr ? 'ERR' : e.sse ? 'live' : e.status == null ? '…' : e.status;
+  $('stripMeth').textContent = e.method; $('stripPath').textContent = e.path;
+  $('stripErr').textContent = failed ? (e.neterr ? 'network error: ' + e.neterr : errSummary(e)) : '';
+  $('inspFloat').classList.toggle('err', failed);
+}
+
+/* jsonHint is the line under a JSON textarea that says whether its text parses, kept current as it is typed. */
+function jsonHint(ta) {
+  const hint = h('div', { class: 'hint' });
+  const check = () => {
+    const t = ta.value.trim();
+    if (!t) { hint.textContent = ''; hint.className = 'hint'; return; }
+    const p = tryParse(t);
+    hint.textContent = p.ok ? 'valid JSON' : 'invalid JSON: ' + p.err;
+    hint.className = 'hint ' + (p.ok ? 'good' : 'bad');
+  };
+  ta.addEventListener('input', check); check();
+  return hint;
+}
+function bindJSONHints() {
+  document.querySelectorAll('textarea[data-json]').forEach((ta) => ta.after(jsonHint(ta)));
 }
 
 function bindInspector() {
-  $('inspToggle').onclick = () => { document.body.classList.toggle('insp-off'); store.set('pl.inspOff', document.body.classList.contains('insp-off')); };
-  $('inspFloat').onclick = () => { document.body.classList.remove('insp-off'); store.set('pl.inspOff', false); };
-  $('inspClear').onclick = () => { insp.entries.splice(0).forEach((e) => e.node && e.node.remove()); $('inspCount').textContent = '0'; updateHidden(); };
+  $('inspToggle').onclick = () => setInspOpen(document.body.classList.contains('insp-off'), true);
+  $('inspFloat').onclick = () => { setInspOpen(true, true); $('inspector').scrollIntoView({ block: 'nearest' }); };
+  $('inspClear').onclick = () => { insp.entries.splice(0).forEach((e) => e.node && e.node.remove()); $('inspCount').textContent = '0'; updateHidden(); renderStrip(null); };
   let expanded = false;
   $('inspExpand').onclick = () => { expanded = !expanded; insp.entries.forEach((e) => { if (e.node) e.node.open = expanded; }); $('inspExpand').textContent = expanded ? 'Collapse' : 'Expand'; };
   document.querySelectorAll('.seg button').forEach((b) => {
@@ -4306,15 +4909,18 @@ function bindInspector() {
   insp.showAuto = !!store.get('pl.showAuto', false); $('inspAuto').checked = insp.showAuto;
   $('inspQ').oninput = (e) => { insp.q = e.target.value.trim().toLowerCase(); insp.entries.forEach(applyFilter); };
   $('inspList').append(h('div', { class: 'insp-empty' }, 'Requests the playground makes will show up here.'));
-  if (store.get('pl.inspOff', false)) document.body.classList.add('insp-off');
+  setInspOpen(!!store.get('pl.inspOpen', false), false); // closed unless the user opened it
 }
 
 function init() {
   loadKnown();
+  initCards();
   bindInspector();
   bindJSONHints();
   initConn();
   initExamples();
+  initStart();
+  initTabMenu();
 
   document.querySelectorAll('.tab').forEach((t) => { t.onclick = () => showTab(t.dataset.tab); });
 
@@ -4424,10 +5030,11 @@ function init() {
 
   // catalog
   $('catNs').value = store.get('pl.catNs', 'cat');
-  $('catLoad').onclick = () => asUser(() => loadCatalog());
-  $('catNs').onkeydown = (e) => { if (e.key === 'Enter') asUser(() => loadCatalog()); };
+  const catLoad = () => { expandCard($('catTree')); return asUser(() => loadCatalog()); };
+  $('catLoad').onclick = catLoad;
+  $('catNs').onkeydown = (e) => { if (e.key === 'Enter') catLoad(); };
   $('catRefresh').onclick = () => asUser(() => { C.proxy = null; C.catalogs = null; return loadCatalog(); });
-  $('catPick').onchange = () => { const v = $('catPick').value; if (v) { $('catNs').value = v; asUser(() => loadCatalog()); } };
+  $('catPick').onchange = () => { const v = $('catPick').value; if (v) { $('catNs').value = v; catLoad(); } };
   $('catFCreate').onclick = catCreateFolder;
   $('catPCreate').onclick = catPlace;
   $('catMove').onclick = catMove;
@@ -4438,6 +5045,7 @@ function init() {
   // search
   initSearch();
   initSchemas();
+  initMerge();
 
   // restore session
   showTab(store.get('pl.tab', 'ns'));

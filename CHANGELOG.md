@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## Unreleased
+
+- **Playground: less on screen at once.** Cards collapse: each tab opens with its one or two
+  main cards (Namespace: status and document; Resource: document and patch) and the rest as
+  header lines that open on click, with Branches and Problems showing a count. A flow that leads
+  into a closed card opens it. Catalog, Search, Schemas and Keys are under a **More** menu,
+  which marks a service the deployment doesn't have as not configured. The request inspector
+  starts closed, as a strip at the bottom with the last request and its status, red after a
+  failed request. Explanatory notes are behind a "?" per card, or "Show all help"; the warnings
+  on purge and prune stay visible. With no namespace selected the page shows a start panel:
+  open a namespace, create one, or run an example. Open cards, the help setting and the
+  inspector are remembered in the browser.
+  The content is a centred column; closed cards form one joined list below the open ones, with
+  destructive ones last and marked by a red title; paired cards share a row at equal height.
+
+- **Playground: merge a branch (§F.3).** Each row of the Namespace tab's Branches table has a
+  "merge…" button, and a branch offers "Merge into {base}…". The Merge card shows the plan per
+  resource (class, status, steps, conflicts with their paths), takes a resolution for each
+  conflicting resource (a patch set against the base's head, "keep base" or "delete"), shows the
+  dry run, submits the batch and can then freeze the branch with `merged.at`. Planning is done
+  by a new endpoint, `POST /playground/merge/plan`, which runs the same code as `patchlog merge
+  plan` in process with the caller's own headers and writes nothing: its transport lets through
+  reads and a batch dry run only. The page submits the batch itself through the normal API.
+  A resolution is sent with the base head it was written against, and one whose resource the
+  base has changed since isn't applied until it is confirmed or edited. Plain namespaces only: a
+  sealed or e2e namespace and a base that requires signatures are refused with a pointer to
+  `patchlog merge`, and planning needs unrestricted read on both namespaces. An explicit
+  `config` change in the batch isn't offered. A second merge of the same branch re-conflicts on
+  replayed resources unless the base lists the merger in `merge.authors` (§F.3).
+
 - **Capacity: large documents with a schema, and writes to one document.** `cmd/capacity`'s
   `large` phase now also measures a document of many small objects, with and without a
   `$schema` that types every member, and a new `single` phase measures writers contending for
@@ -10,6 +40,7 @@
   for long strings without a schema; small typed values cost about ten times more (58 ms an
   append at 1 MiB, 225 ms at 3.5 MiB), and one document takes about 10 writes a second per
   principal, the per-resource rate.
+
 
 ## v0.28.0
 

@@ -51,6 +51,10 @@ func HandlerWith(api http.Handler, opt Options) http.Handler {
 			si.serve(w, r)
 			return
 		}
+		if strings.HasPrefix(r.URL.Path, MergePrefix) {
+			si.serveMerge(w, r)
+			return
+		}
 		static.ServeHTTP(w, r)
 	})
 }
