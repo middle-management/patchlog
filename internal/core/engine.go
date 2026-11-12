@@ -56,6 +56,10 @@ type Options struct {
 	// AuthDisabled accepts every request (development only). The author is
 	// taken from X-Author.
 	AuthDisabled bool
+	// ExperimentalRebase lets a single write that asks for it (Item.Rebase)
+	// be applied to the current head when its If-Match is an ancestor and
+	// nothing written since overlaps it (rebase.go). Not in the spec.
+	ExperimentalRebase bool
 	// OperatorKeys may create namespaces (§C.4 bootstrapping). They act as
 	// keys with can ["*"] for namespace creation only.
 	OperatorKeys []grant.Key

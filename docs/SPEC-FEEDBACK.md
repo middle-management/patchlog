@@ -16,7 +16,8 @@ implementers' and reviewers' notes are merged here, each case once. Notes from v
 leaves open are carried in place, by subject, marked "was v0.81 Open n" and cut to what
 remains. The order is: sealed forms and end-to-end reads (1–31), access and coverage (32–65),
 tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87), index (88),
-rates and contended writes (89–91, from capacity measurements after the v0.82 work).
+rates and contended writes (89–91, from capacity measurements after the v0.82 work; 91 has a
+prototype behind a flag).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
 91 are open: 61 from this version's work and 30 carried.
@@ -507,27 +508,65 @@ v0.82" (v0.81 Open 24).
     authorisation checks. *Question:* does a request refused at step 2 (`412`, `410`, `428`,
     `409` frozen) draw tokens? Drawing protects the server from retry storms; not drawing gives
     contending writers their full rate.
-91. **A proposal: an append the server may rebase** (§7.2, §6.4.1, TOOLS §F.3, §11.2). Every
-    write names the head it was made on, so writers of one document queue behind one another,
-    and a lost race costs a whole request: with the rate lifted, 8 writers retrying at once lost
-    84% of their attempts and 32 lost 95%; a client-side backoff brings that to 44% and 81% at
-    best, and can't make it fair. Most such writers don't conflict in substance: they add to
+91. **A proposal, prototyped and measured: an append the server may rebase** (§7.2, §6.4.1,
+    TOOLS §F.3, §11.2). Every write names the head it was made on, so writers of one document
+    queue behind one another, and a lost race costs a whole request: with the rate lifted, 8
+    writers retrying at once lost 84% of their attempts and 32 lost 95%; a client-side backoff
+    brings that to about 45% and 82% at best, and can't make it fair (on Postgres some writers
+    got nothing in at all). Most such writers don't conflict in substance: they change
     different members or append to an array. The text already has the test for that, for
     merges and for undo: two sides conflict when their `writes` overlap, an array index
-    counting as its whole outermost array. *Proposal:* a write may carry, beside `If-Match:
-    "{base}"`, a request to rebase (a header, or a step member in a batch). Where the head is
-    no longer `base`, the server applies the patch set to the current head if `base` is an
-    ancestor of it, the `writes` of the revisions after `base` don't overlap the patch set's
-    own (its `test` ops and `copy` sources counted), and the result passes every check of §6.2
-    as any write does; otherwise `412` as now. The revision's parent is the head it was
-    applied on, so its id differs from what the client predicted, and the answer says so
-    (the new head, and the revisions it was applied over). It is opt-in per write, so a client
-    that needs "exactly this document" keeps plain `If-Match`. Open points: array appends
-    (`/-`) overlap under the merge rule and are the commonest case, so they may want a rule of
-    their own; a signed step binds its parent (§C.3.1), so a signed write can't be rebased by
-    the server; at E3 the server can't read the `writes`; and the cost of reading the
-    intervening revisions' `writes` should be bounded (a limit on how far behind `base` may
-    be). *Question:* is this in scope, or is contention on one document left to clients and
+    counting as its whole outermost array.
+
+    *The prototype* (`serve -experimental-rebase`, `internal/core/rebase.go`; off by default):
+    a `PATCH` with `X-Experimental-Rebase: 1` whose `If-Match` is no longer the head is applied
+    to the head when all of these hold, and is `412` as now otherwise:
+    - it is one patch set, not a delete, and carries no author signature (a signature binds
+      its parent, §C.3.1);
+    - `If-Match` names an ancestor of the live head, at most 64 revisions back, with no
+      tombstone and no pruned patch set in between, in a namespace whose patch sets the server
+      reads (never at E3);
+    - what the patch set touches (every op's `path`, a `copy`'s or `move`'s `from`, and its
+      `test`s) doesn't overlap the `writes` of the revisions in between, a path through an
+      array counting as the outermost array, **except** that two sides which only `add` at
+      `/…/-` of the same array don't conflict.
+    It then passes every later step of §6.2 as an append on that head, so its `test`s, the
+    limits, the schema and the rules judge the result. The answer is an ordinary `201` whose
+    `ETag` is the id on that head (not the one the client could predict), with
+    `X-Experimental-Rebased-Onto: "{head}"`.
+
+    *Measured* (docs/CAPACITY.md, "An experimental rebase"; writers that each replace a member
+    of their own, or all append to one array): no attempt was `412`; every writer got the same
+    share (256 and 262 appends for the least and the most served of 32, against 64 and 577
+    with the backoff); the worst write took 99 ms against 9.7 s. Total throughput is the
+    single writer's or somewhat under it and falls with the number of writers (1,010 a second
+    for one, 827 for 8, 552 for 32 on SQLite), since each rebase folds the patch sets written
+    since its base to learn their `writes`.
+
+    *What the prototype showed needs deciding:*
+    - **Retries.** §7.2 answers a repeated write as a retry by its parent and patch set. A
+      rebased write's parent isn't the one it sent, so a client that repeats it after a lost
+      answer is rebased and applied again: an array append lands twice. A rebased write would
+      need its own retry key, such as a required `Gesture`, or the `If-Match` it was sent with
+      recorded beside the entry.
+    - **Array appends.** Under the merge rule they overlap, and they are the commonest case.
+      The prototype's exception (both sides only appended to that array) held in the tests;
+      whether "appended in some order" is acceptable is the application's call, so it may want
+      to be asked for separately.
+    - **Cost.** The server doesn't store a revision's `writes`, so a rebase re-applies every
+      patch set since the base. Storing `writes` with each revision would make it a lookup;
+      otherwise the distance wants a limit (the prototype's 64) and perhaps a token per
+      revision folded.
+    - **Tests as reads.** The prototype counts a `test`'s path as touched, so a write that
+      tests a value changed since is `412`; a `test` on an untouched path is simply evaluated
+      on the head. Should a document's unlisted reads matter (a client that computed its patch
+      from a member it didn't test)? The prototype says no: only what the patch set names.
+    - **Batches** aren't rebased in the prototype: an item's ids are predicted by the client
+      for later steps and for `source`. A per-item flag would be the natural form.
+    - **Rules and logs.** `/resource/parent` in rules, the log entry's `parent`, and
+      signatures all see the head it was applied on; nothing records the `If-Match` it came
+      with.
+    *Question:* is this in scope, or is contention on one document left to clients and
     document design?
 
 ## Settled in v0.82

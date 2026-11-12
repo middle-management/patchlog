@@ -53,8 +53,17 @@
   from 600 to 1,000 appends a second on SQLite and from 84% to 44% of attempts lost; at 32
   writers, and on Postgres, most attempts are still lost, and it doesn't make a document fair
   between writers that never pause. At the default limits a contended document takes about 10
-  writes a second in all, whatever the retry. SPEC-FEEDBACK note 91 proposes an append the
-  server may rebase when the writes in between don't overlap.
+  writes a second in all, whatever the retry.
+- **Experimental, off by default, not in the spec: `serve -experimental-rebase`.** A `PATCH`
+  with `X-Experimental-Rebase: 1` (the Go client's `WithExperimentalRebase`) whose `If-Match` is
+  no longer the head is applied to the head, in place of a `412`, when `If-Match` is an ancestor
+  at most 64 revisions back and nothing written since overlaps the paths the patch set touches
+  (two sides that only append to the same array don't conflict). Deletes, signed writes, batches
+  and end-to-end namespaces are never rebased. Measured on writers that change different members
+  of one document: no attempt lost, every writer served equally, the worst write 99 ms against
+  9.7 s with the backoff, at 550–830 appends a second in all. A repeated rebased write is applied
+  again, so it is a prototype for SPEC-FEEDBACK note 91, which has the rule and the open points,
+  not something to run in production.
 
 
 ## v0.28.0

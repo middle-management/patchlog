@@ -4550,6 +4550,10 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   client's `AppendLatest(ctx, ns, name, head, Backoff{}, build)` retries a lost race on the
   head the `412` names after a short random wait, which loses about half as many requests as
   retrying at once but doesn't share the document fairly between writers that never pause.
+  `serve -experimental-rebase` turns on a prototype that is **not in the spec** (SPEC-FEEDBACK
+  note 91): a `PATCH` with `X-Experimental-Rebase: 1` whose `If-Match` is no longer the head is
+  applied to the head when nothing written since overlaps what it touches. It is there to
+  measure the idea; a repeated rebased write is applied twice, so leave it off in production.
 - **Limit names** in a namespace document's `limits` object, exactly as §6.6's table:
   `patchSetSize`, `opsPerSet`, `documentSize`, `valueSize`, `pathSize`, `nestingDepth`,
   `rulesPerNamespace`, `itemsPerBatch`, `batchSize`,

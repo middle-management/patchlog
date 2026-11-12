@@ -253,7 +253,57 @@ rate limited and the core and the database set the pace:
 What the retry policy can't change is that a lost race costs a whole request. The remedies are
 structural: one writer per document (or a queue in front of it), a writer's changes collected
 into batch steps (below), or an append the server may rebase when the writes in between don't
-overlap its own (docs/SPEC-FEEDBACK.md, v0.82 Open 91).
+overlap its own, which the next section measures.
+
+### An experimental rebase
+
+**Not in the spec** (docs/SPEC-FEEDBACK.md, v0.82 Open 91); off unless the core runs with
+`-experimental-rebase`. A `PATCH` with `X-Experimental-Rebase: 1` whose `If-Match` is no longer
+the head is applied to the head, in place of a `412`, when `If-Match` names an ancestor at most
+64 revisions back and nothing written since overlaps the paths the patch set touches (its ops'
+paths, a copy's or move's `from` and its tests; a path through an array counts as the whole
+outermost array, as in §F.3, except that two sides that only append to the same array don't
+conflict). It then passes every later check as an append on that head. A delete, a signed write
+and an end-to-end namespace are never rebased.
+
+Same setup with the rate lifted, on two workloads where writers don't conflict in substance:
+**member** (each writer replaces a member of its own, `/members/wK`) and **append** (every
+writer does `add /list/-`; 5 seconds, since the document grows). Appends a second, then the
+share of attempts answered `412`:
+
+| Workload, writers | At once | Backoff | Rebase (with the backoff as fallback) |
+|---|---|---|---|
+| SQLite, member, 8 | 562, 84% | 943, 45% | 827, 0% |
+| SQLite, member, 32 | 219, 95% | 737, 82% | 552, 0% |
+| SQLite, append, 8 | 529, 83% | 664, 54% | 503, 0% |
+| SQLite, append, 32 | 260, 95% | 575, 85% | 380, 0% |
+| Postgres, member, 8 | 170, 86% | 268, 71% | 257, 0% |
+| Postgres, member, 32 | 81, 96% | 116, 95% | 150, 0% |
+| Postgres, append, 8 | 175, 86% | 256, 72% | 220, 0% |
+| Postgres, append, 32 | 80, 96% | 124, 95% | 133, 0% |
+
+| SQLite, member | Fewest and most appends by one writer | One write, retries included: p50 / p99 / max |
+|---|---|---|
+| 8 writers, backoff | 1,125 and 2,515 | 0.8 ms / 208 ms / 3.2 s |
+| 8 writers, rebase | 1,530 and 1,580 | 8.5 / 27 / 50 ms |
+| 32 writers, backoff | 64 and 577 | 1.0 ms / 1.3 s / 9.7 s |
+| 32 writers, rebase | 256 and 262 | 58 / 82 / 99 ms |
+
+- **No request is wasted and every writer gets the same share.** With the backoff some Postgres
+  writers got nothing in 15 seconds; rebased, the fewest and the most by one writer were 471
+  and 496 of 8, and 65 and 76 of 32.
+- **The tail goes from seconds to tens of milliseconds**: every write is served in turn, so
+  the median is higher than the backoff's (whose median is the winner's) and the worst case far
+  lower.
+- **Total throughput is the single writer's or somewhat under it**, and falls as writers are
+  added (1,010 a second for one writer, 827 for 8, 552 for 32 on SQLite): a rebase reads the
+  patch sets written since its base and folds them to know what they wrote, so each write
+  costs more the further behind it is. The backoff's higher totals on SQLite are one or two
+  writers doing most of the work.
+- One writer pays nothing for asking (1,010 against 1,060 a second on SQLite, within the run's
+  noise).
+- Writers that do conflict (the **same** workload, every writer replacing `/n`) get `412` as
+  before: there the fallback is all there is.
 
 **A batch writes many steps to one document at once** (§7.5: one item, many steps, one token):
 

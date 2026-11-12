@@ -65,6 +65,8 @@ type config struct {
 	singleSecs  int
 	singleRate  float64
 	backoffMax  time.Duration
+	workload    string
+	rebase      bool
 }
 
 func main() {
@@ -90,6 +92,8 @@ func main() {
 	flag.IntVar(&c.singleSecs, "single-seconds", 15, "seconds each single-document write measurement runs")
 	flag.Float64Var(&c.singleRate, "single-rate", 0, "single-document measurements: writes a second (and burst) the namespace allows per resource, per principal and in all, in place of the defaults (10, 50 and 500 a second); the core needs -max-rate-per-resource, -max-rate-per-principal and -max-rate-per-namespace raised to it")
 	flag.DurationVar(&c.backoffMax, "single-backoff-max", 0, "single-document measurements: the longest wait of the client's backoff after lost races (default: the client's, 16ms)")
+	flag.StringVar(&c.workload, "single-workload", "same", "single-document measurements: what each writer's patch touches: same (every writer replaces /n), member (each writer replaces a member of its own) or append (every writer appends to one array)")
+	flag.BoolVar(&c.rebase, "single-rebase", false, "single-document measurements: also measure writes sent with X-Experimental-Rebase (the core needs -experimental-rebase)")
 	flag.StringVar(&c.only, "only", "", "run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live")
 	flag.Parse()
 	if c.revs < c.docs {
@@ -854,13 +858,38 @@ func (r *runner) singleDoc() {
 	r.record("single_doc_rate", map[string]any{"per_resource_and_principal": map[bool]any{true: r.c.singleRate, false: "default"}[r.c.singleRate > 0]})
 	stamp := time.Now().UnixNano()
 	patch := func(v int) []any { return []any{map[string]any{"op": "replace", "path": "/n", "value": v}} }
-	for _, strategy := range []string{"", "_backoff"} {
+	// What writer k's v-th write does, and the document it is made on.
+	hot := func(writers int) map[string]any {
+		doc := r.body(0, 0)
+		doc["list"] = []any{}
+		m := map[string]any{}
+		for k := 0; k < writers; k++ {
+			m[fmt.Sprintf("w%d", k)] = 0
+		}
+		doc["members"] = m
+		return doc
+	}
+	writerPatch := func(k, v int) []any {
+		switch r.c.workload {
+		case "member":
+			return []any{map[string]any{"op": "replace", "path": fmt.Sprintf("/members/w%d", k), "value": v}}
+		case "append":
+			return []any{map[string]any{"op": "add", "path": "/list/-", "value": v}}
+		}
+		return patch(v)
+	}
+	strategies := []string{"", "_backoff"}
+	if r.c.rebase {
+		strategies = append(strategies, "_rebase")
+	}
+	r.record("single_doc_workload", r.c.workload)
+	for _, strategy := range strategies {
 		for _, n := range []int{1, 8, 32} {
-			if strategy != "" && n == 1 {
+			if strategy == "_backoff" && n == 1 {
 				continue // one writer never loses a race
 			}
 			name := fmt.Sprintf("hot%s-%d-%d", strategy, n, stamp)
-			w, err := r.w(ns).CreateDoc(r.ctx, ns, name, r.body(0, 0))
+			w, err := r.w(ns).CreateDoc(r.ctx, ns, name, hot(n))
 			if err != nil {
 				fail(err)
 			}
@@ -878,9 +907,13 @@ func (r *runner) singleDoc() {
 					defer wg.Done()
 					c := r.principal(ns, k)
 					mine := first // the head this writer last saw: writers share nothing
+					var wopts []client.WriteOption
+					if strategy == "_rebase" {
+						wopts = append(wopts, client.WithExperimentalRebase())
+					}
 					for v := 0; time.Now().Before(deadline); v++ {
 						t := time.Now()
-						if strategy == "_backoff" {
+						if strategy != "" {
 							// The client's helper: the 412's head, and a
 							// jittered wait that grows with each loss.
 							dctx, cancel := context.WithDeadline(r.ctx, deadline)
@@ -890,7 +923,7 @@ func (r *runner) singleDoc() {
 								} else {
 									stale.Add(1)
 								}
-							}}, func(string) (any, error) { return patch(v), nil })
+							}}, func(string) (any, error) { return writerPatch(k, v), nil }, wopts...)
 							cancel()
 							if err == nil {
 								mine = w.ID
@@ -907,7 +940,7 @@ func (r *runner) singleDoc() {
 							continue
 						}
 						for time.Now().Before(deadline) {
-							w, err := c.Append(r.ctx, ns, name, mine, patch(v))
+							w, err := c.Append(r.ctx, ns, name, mine, writerPatch(k, v))
 							if err == nil {
 								mine = w.ID
 								mu.Lock()

@@ -61,6 +61,10 @@ type Item struct {
 	IfMatch     string // text id; "" if absent
 	IfNoneMatch bool
 	Steps       []Step
+	// Rebase asks that a patch set whose IfMatch is no longer the head be
+	// applied to the head when nothing written since overlaps it
+	// (EXPERIMENTAL, rebase.go; ignored unless Options.ExperimentalRebase).
+	Rebase bool
 }
 
 // ConfigChange is a namespace-document change (§7.4), alone or in a batch.
@@ -87,10 +91,13 @@ type Request struct {
 
 // WriteResult is the outcome of a resource write or batch.
 type WriteResult struct {
-	Status   int // 200 (replayed or dry run) or 201
-	NSID     string
-	Items    []ItemResult
-	Entry    *LogEntry // single writes: the resulting entry
+	Status int // 200 (replayed or dry run) or 201
+	NSID   string
+	Items  []ItemResult
+	Entry  *LogEntry // single writes: the resulting entry
+	// Rebased is the head a single write was applied on in place of its
+	// IfMatch (EXPERIMENTAL, rebase.go); "" for any other write.
+	Rebased  string
 	Replayed bool
 	ConfigID string
 	// ConfigReport is a dry run's report of its config change (§7.5):
@@ -255,10 +262,12 @@ type stepState struct {
 
 type itemState struct {
 	Item
-	index  int
-	view   *view
-	parent *revRow // the head the precondition matched; nil for a create
-	steps  []*stepState
+	// rebasedOn is the head a rebased item (rebase.go) was applied on.
+	rebasedOn string
+	index     int
+	view      *view
+	parent    *revRow // the head the precondition matched; nil for a create
+	steps     []*stepState
 	// cands are the candidate verbs of an item whose first step is a patch
 	// set under If-Match: those of append and restore that passed step 1
 	// (§6.2). Nil for any other item, whose verbs are known from the request.
@@ -1005,6 +1014,9 @@ func (t *tx) planEntry(p *writePlan, author int64, entries []any, inserted []his
 	}
 	le := t.logEntry(t.rev(inserted[0].target))
 	p.result.Entry = &le
+	if len(p.st) == 1 {
+		p.result.Rebased = p.st[0].rebasedOn
+	}
 	return nsAppend{entry: entries[0].(map[string]any), meta: stepGestures(p.st[0].Steps[0]), res: &inserted[0].res, target: &inserted[0].target, author: author, hist: inserted}
 }
 
@@ -1414,7 +1426,10 @@ func (t *tx) precondition(n *nsRow, s *itemState) *Error {
 			}
 		case Live:
 			if want != v.head.id {
-				return headErr()
+				if !t.rebasable(v, want, s) {
+					return headErr()
+				}
+				s.rebasedOn = v.head.id.String()
 			}
 		}
 		s.parent = v.head

@@ -435,6 +435,16 @@ func WithSignature(sig string) WriteOption {
 	return func(r *request) { r.header["Signature"] = sig }
 }
 
+// WithExperimentalRebase asks the server to apply an append to the current
+// head when its parent is no longer the head and nothing written since
+// overlaps the paths it touches (X-Experimental-Rebase: 1). EXPERIMENTAL,
+// not in the spec: only a server run with -experimental-rebase acts on
+// it, and any other answers 412 as usual. The result's ID is then the id
+// on that head, which the caller can't predict.
+func WithExperimentalRebase() WriteOption {
+	return func(r *request) { r.header["X-Experimental-Rebase"] = "1" }
+}
+
 // WithGesture sends Gesture: id, naming the user action the write belongs
 // to (§7.2, §11.2): a gesture id (NewGesture). "" sends nothing.
 func WithGesture(id string) WriteOption {
