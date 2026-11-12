@@ -60,6 +60,10 @@ type Options struct {
 	// be applied to the current head when its If-Match is an ancestor and
 	// nothing written since overlaps it (rebase.go). Not in the spec.
 	ExperimentalRebase bool
+	// ExperimentalCombine also writes the rebased writes of one document
+	// that wait together in one transaction (combine.go). Needs
+	// ExperimentalRebase.
+	ExperimentalCombine bool
 	// OperatorKeys may create namespaces (§C.4 bootstrapping). They act as
 	// keys with can ["*"] for namespace creation only.
 	OperatorKeys []grant.Key
@@ -274,10 +278,15 @@ func (logPurger) PurgeTags(tags []string) { log.Printf("cdn purge %v", tags) }
 // Engine is the patch-log service.
 type Engine struct {
 	// seals are the sealing counts this instance took (sealcount.go).
-	seals     sealCounter
-	db        *sql.DB
-	pg        bool // Postgres (Addendum D.8), not SQLite
-	opt       Options
+	seals sealCounter
+	db    *sql.DB
+	pg    bool // Postgres (Addendum D.8), not SQLite
+	opt   Options
+	// touches is the experimental rebase's memory of what revisions
+	// touched (rebase.go).
+	touches touchCache
+	// combine queues rebased writes per document (combine.go).
+	combine   combiner
 	mu        sync.Mutex // serialises write transactions
 	blobs     blobStore
 	validator *schema.Validator

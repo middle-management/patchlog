@@ -565,10 +565,20 @@ v0.82" (v0.81 Open 24).
       The prototype's exception (both sides only appended to that array) held in the tests;
       whether "appended in some order" is acceptable is the application's call, so it may want
       to be asked for separately.
-    - **Cost.** The server doesn't store a revision's `writes`, so a rebase re-applies every
-      patch set since the base. Storing `writes` with each revision would make it a lookup;
-      otherwise the distance wants a limit (the prototype's 64) and perhaps a token per
-      revision folded.
+    - **Cost and throughput.** The server doesn't store a revision's `writes`, so the first
+      prototype re-applied every patch set since the base. It now remembers, by revision id,
+      what each revision touched and its parent, so a revision is folded once; the distance
+      still wants a limit (the prototype's 64). That alone changed little. What did: since a
+      rebased write no longer depends on the head it named, the server can take the writes
+      of a document that are waiting together and write them in one transaction, each through
+      the whole gate on the result of the one before, and commit once
+      (`-experimental-combine`). On SQLite 8 writers then get 2,870 appends a second and 32
+      get 2,380, against 1,060 for one writer alone and under 900 before; on Postgres 399 and
+      243 against 330 for one writer, limited by round trips per write, which inserting the
+      group's rows together would address. Shares stayed even and the worst write was 46 ms.
+      This is an implementation matter, but it is the argument for the feature: with plain
+      `If-Match` a server can never do it, since every write but one in such a group is stale
+      by construction.
     - **Tests as reads.** The prototype counts a `test`'s path as touched, so a write that
       tests a value changed since is `412`; a `test` on an untouched path is simply evaluated
       on the head. Should a document's unlisted reads matter (a client that computed its patch

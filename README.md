@@ -4554,7 +4554,9 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   note 91): a `PATCH` with `X-Experimental-Rebase: 1` whose `If-Match` is no longer the head is
   applied to the head when nothing written since overlaps what it touches, and
   `X-Experimental-Producer: {id};{epoch};{seq}` makes repeating such a write safe (each `seq`
-  is written once; the state is in memory). It is there to measure the idea: leave it off in
+  is written once; the state is in memory). `-experimental-combine` also writes the rebased
+  writes of one document that wait together in one transaction. They are there to measure the
+  idea ([docs/CAPACITY.md](docs/CAPACITY.md), "An experimental rebase"): leave them off in
   production.
 - **Limit names** in a namespace document's `limits` object, exactly as §6.6's table:
   `patchSetSize`, `opsPerSet`, `documentSize`, `valueSize`, `pathSize`, `nestingDepth`,

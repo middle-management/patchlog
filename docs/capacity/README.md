@@ -22,4 +22,6 @@ containers.
 | `{sqlite-public,pg-noauth}-4vcpu-single-contention-unlimited.json` | the same with `-single-rate 1000000`: the core with `-max-rate-per-resource 1e6,1e6 -max-rate-per-principal 1e6,1e6`, so nothing is rate limited |
 | `{sqlite-public,pg-noauth}-4vcpu-single-rebase-{member,append}.json` | the same host and day, the core also with `-experimental-rebase`: `-only single -single-rate 1000000 -single-rebase -single-workload member` (15 s) and `append` (5 s); `_rebase` are the writes sent with `X-Experimental-Rebase` |
 | `{sqlite-public,pg-noauth}-4vcpu-single-rebase-producer.json` | the member workload again for 10 s, with `_rebase_producer`: rebased writes that also carry `X-Experimental-Producer` |
+| `{sqlite-public,pg-noauth}-4vcpu-single-rebase-cached.json` | the member workload for 10 s once a rebase remembers what each revision touched |
+| `{sqlite-public,pg-noauth}-4vcpu-single-rebase-combined.json` | the same with the core also run with `-experimental-combine`: the rebased writes of a document that wait together are written in one transaction |
 | `pg-noauth-4vcpu-large-single.json` | the same on Postgres 16 with default settings on that host, `-dev`, nothing constrained (not server X) |

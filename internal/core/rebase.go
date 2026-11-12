@@ -1,6 +1,8 @@
 package core
 
 import (
+	"sync"
+
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
@@ -37,6 +39,10 @@ const maxRebaseDistance = 64
 type touch struct {
 	paths   []pointer.Pointer
 	appends map[string]bool // arrays (by pointer text) only appended to
+	// parent is the revision's parent and parentRev whether that is a
+	// live revision, for a touch remembered by revision id (touchCache).
+	parent    ids.ID
+	parentRev bool
 }
 
 // outermostArray cuts p at the first array on its way through any of
@@ -150,42 +156,64 @@ func (t *tx) rebasable(v *view, want ids.ID, s *itemState) bool {
 	if err != nil {
 		return false
 	}
-	// The chain from the head back to the base, newest first.
-	var between []*revRow
-	cur := v.head
-	for cur.id != want {
-		if cur.kind != kindRev || !cur.patches.Valid || !cur.parentSeq.Valid || len(between) >= maxRebaseDistance {
+	// The chain from the head back to the base, newest first, as what
+	// each revision touched. That is remembered by id, which covers its
+	// patch set and everything before it, with its parent's id: a
+	// revision is read and folded once, not by every write rebased over
+	// it, and a chain already known is walked without the database.
+	var chain []touch
+	row, id := v.head, v.head.id
+	for id != want {
+		if len(chain) >= maxRebaseDistance {
 			return false
 		}
-		between = append(between, cur)
-		if cur = t.rev(cur.parentSeq.Int64); cur == nil || cur.res != v.head.res {
-			return false // read through from a base, or gone: not here
+		one, ok := t.e.touches.get(id)
+		if !ok {
+			if row == nil {
+				if row = t.findInAncestry(v.head, id); row == nil {
+					return false
+				}
+			}
+			if row.kind != kindRev || !row.patches.Valid || !row.parentSeq.Valid {
+				return false
+			}
+			parent := t.rev(row.parentSeq.Int64)
+			if parent == nil || parent.res != v.head.res {
+				return false // read through from a base, or gone: not here
+			}
+			before, err := t.docAt(parent)
+			if err != nil {
+				return false
+			}
+			raw, perr := jsonv.Parse(t.patchesOf(row))
+			if perr != nil {
+				return false
+			}
+			rops, perr := patch.Parse(raw)
+			if perr != nil {
+				return false
+			}
+			after, writes, aerr := patch.Apply(before, true, rops, patch.Options{ResourceEnvelope: true})
+			if aerr != nil {
+				return false
+			}
+			one = touched(rops, writes, false, before, after)
+			one.parent, one.parentRev = parent.id, parent.kind == kindRev
+			t.e.touches.put(id, one)
+			row = parent
+		} else {
+			row = nil
 		}
+		if !one.parentRev {
+			return false // over a tombstone
+		}
+		chain = append(chain, one)
+		id = one.parent
 	}
-	if cur.kind != kindRev {
-		return false
-	}
-	doc, err := t.docAt(cur)
-	if err != nil {
-		return false
-	}
-	baseDoc := jsonv.MustParse(jsonv.Canonical(doc))
 	theirs := touch{appends: map[string]bool{}}
 	closed := map[string]bool{}
-	for i := len(between) - 1; i >= 0; i-- {
-		raw, perr := jsonv.Parse(t.patchesOf(between[i]))
-		if perr != nil {
-			return false
-		}
-		rops, perr := patch.Parse(raw)
-		if perr != nil {
-			return false
-		}
-		next, writes, aerr := patch.Apply(doc, true, rops, patch.Options{ResourceEnvelope: true})
-		if aerr != nil {
-			return false
-		}
-		one := touched(rops, writes, false, doc, next)
+	for i := len(chain) - 1; i >= 0; i-- {
+		one := chain[i]
 		theirs.paths = append(theirs.paths, one.paths...)
 		for _, p := range one.paths {
 			k := p.String()
@@ -196,8 +224,46 @@ func (t *tx) rebasable(v *view, want ids.ID, s *itemState) bool {
 				delete(theirs.appends, k)
 			}
 		}
-		doc = next
 	}
+	doc, err := t.docAt(v.head)
+	if err != nil {
+		return false
+	}
+	baseDoc := doc // the head stands in for the base: what differs between them, theirs wrote
 	mine := touched(ops, nil, true, baseDoc, doc)
 	return !conflicts(mine, theirs)
+}
+
+// touchCache remembers what recent revisions touched (rebasable).
+type touchCache struct {
+	mu sync.Mutex
+	m  map[ids.ID]touch
+}
+
+const touchCacheSize = 8192
+
+func (c *touchCache) get(id ids.ID) (touch, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t, ok := c.m[id]
+	return t, ok
+}
+
+func (c *touchCache) put(id ids.ID, t touch) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[ids.ID]touch{}
+	}
+	if len(c.m) >= touchCacheSize {
+		// Rebases reach back 64 revisions at most: dropping an arbitrary
+		// half only costs a fold of those still wanted.
+		n := 0
+		for k := range c.m {
+			if n++; n%2 == 0 {
+				delete(c.m, k)
+			}
+		}
+	}
+	c.m[id] = t
 }

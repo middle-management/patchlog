@@ -352,6 +352,9 @@ func batchError(fails []itemErr) *Error {
 // WriteResource performs a single-resource write: create, append, restore
 // (PATCH) or delete.
 func (e *Engine) WriteResource(ctx context.Context, req Request, item Item) (*WriteResult, error) {
+	if e.opt.ExperimentalRebase && e.opt.ExperimentalCombine && item.Rebase && len(item.Steps) == 1 && !item.Steps[0].Delete {
+		return e.writeCombined(ctx, req, item)
+	}
 	res, err := e.writeOptimistic(ctx, req, []Item{item}, nil, false)
 	if err != nil {
 		return nil, err

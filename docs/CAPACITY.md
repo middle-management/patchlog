@@ -304,6 +304,31 @@ share of attempts answered `412`:
   noise).
 - Writers that do conflict (the **same** workload, every writer replacing `/n`) get `412` as
   before: there the fallback is all there is.
+- That was the first prototype, which folded the patch sets since the base on every rebase
+  and committed each write on its own. Two changes since, measured the same way (member
+  workload, 10 seconds):
+
+  | Appends/s, 8 and 32 writers | SQLite | Postgres |
+  |---|---|---|
+  | One writer, for scale | 1,060 | 330 |
+  | First prototype | 830–890 and 550–620 | 250–260 and 146–150 |
+  | Remembering what each revision touched | 936 and 681 | 261 and 148 |
+  | And writing the waiting writes of a document in one transaction (`-experimental-combine`) | 2,870 and 2,380 | 399 and 243 |
+
+  - **Remembering what revisions touched** (by revision id, in memory, with the parent's id,
+    so a known chain is walked without the database) helps a little: the fold wasn't the main
+    cost.
+  - **One transaction for the writes that wait together** is the large one on SQLite: 2.7
+    times one writer's rate with 8 writers and 2.2 times with 32, where every earlier form
+    stayed under it. Each write still goes through the whole gate on the result of the one
+    before it; a refused one is answered with its refusal and the others land; they commit
+    once. Shares stay even (3,583 and 3,601 appends by the least and the most served of 8;
+    739 and 746 of 32) and the worst write took 46 ms with 32 writers.
+  - **On Postgres it gains 50–65% over the earlier prototype**, to 400 a second with 8 writers
+    (one writer alone does 330), and still falls with 32.
+    There a write costs about a dozen round trips to the database whatever it shares its
+    commit with; the next step would be inserting the group's rows in one statement per
+    table, as group commit does for writes of different documents (D.8). Not done.
 - **A repeated rebased write is applied again** unless it carries a retry key: §7.2 recognises a
   retry by its parent, which the server chose here. The prototype takes
   `X-Experimental-Producer: {id};{epoch};{seq}`, after the Durable Streams protocol's idempotent

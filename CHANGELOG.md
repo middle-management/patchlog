@@ -65,7 +65,11 @@
   again unless it carries `X-Experimental-Producer: {id};{epoch};{seq}` (the client's
   `WithExperimentalProducer`), a retry key after the Durable Streams protocol's idempotent
   producers: each `seq` of a producer's epoch is written once, a repeat is answered with the
-  first attempt's revision, a gap is `409`. That state is in memory only. It is a prototype for
+  first attempt's revision, a gap is `409`. That state is in memory only. With
+  `-experimental-combine` too, the rebased writes of one document that wait together are written
+  in one transaction, each on the result of the one before, and committed once: 2,870 appends a
+  second from 8 writers and 2,380 from 32 on SQLite (one writer alone does 1,060), 399 and 243
+  on Postgres (330), with even shares. It is a prototype for
   SPEC-FEEDBACK note 91, which has the rules and the open points, not something to run in
   production.
 
