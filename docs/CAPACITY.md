@@ -112,7 +112,7 @@ holds them when it verifies edge grants).
 |---|---|---|
 | **One log per namespace.** Every write appends to its namespace's hash chain (§3.5), so writes to one namespace commit one at a time (on Postgres, one group of up to 32 at a time). | One namespace: ~590 single writes/s on server X from 32 writers; 700–1,000/s on SQLite (4 vCPU). | Spread write-heavy data over namespaces: writes to different namespaces run in parallel, across instances too. A sign-in storm writing per-user items belongs in many namespaces, not one. |
 | **§6.6 size limits**: documents 1 MiB by default (4 MiB a namespace may set, the deployment maximum; §6.6 says 4 MiB), patch sets 256 KiB, 1,000 ops a set, 1,000 items and 16 MiB a batch, 1,000 entries a log page. The other deployment maximums equal the defaults. | | Large documents are slow to write (next row); batches are imports, not interactive writes. `serve -max-document-size` raises the document maximum. |
-| **Whole-document work on every write**: the result is canonicalised, checked against the limits and validated against its `$schema` in full; a small patch to a large document costs the document's size. | Append p50: 7 ms at 16 KiB, 15 ms at 1 MiB, 25 ms at 3.5 MiB (server X); 1.7 / 7 / 19 ms on SQLite. | Keep frequently edited documents small: split large aggregates into resources. |
+| **Whole-document work on every write**: the result is canonicalised, checked against the limits and validated against its `$schema` in full; a small patch to a large document costs the document's size. | Append p50: 7 ms at 16 KiB, 15 ms at 1 MiB, 25 ms at 3.5 MiB (server X); 1.7 / 7 / 19 ms on SQLite. Those are documents of long strings without a `$schema`; many small values cost 3–5× more, and a schema that types them about 3× more again ([below](#large-documents-by-shape-and-schema)). | Keep frequently edited documents small: split large aggregates into resources. |
 | **Default rates** (§6.6): 50 items/s a principal (burst 100), 500 items/s a namespace (burst 1,000), 10/s a resource (burst 20); since v0.73 the instances of a Postgres deployment share the buckets (`rate_buckets`, about +1.2 ms a write), per instance only with `serve -local-rate-buckets`. | 500/s a namespace is ~85% of server X's single-namespace ceiling. | Allowances (§6.6) replace a principal's and its namespace's buckets, for loaders and importers. The per-resource rate always applies. |
 | **Followers are cheapest through the CDN** (§7.7, §9): there they cost the origin nothing per follower; at the origin, a connection each and a shared read per write. SSE streams (§7.3) are collapsed neither at the CDN nor at the origin. | See the table above. | Devices long-poll; services that need every entry use the log and checkpoints (§10). |
 | **Consumers read over HTTP**: a consumer catches up from the log and fetches each changed document (§10). | Catch-up of 4M entries: 2.4 min; bootstrap of 1M documents: ~11 min on server X. | Consumer throughput is the consumer's (gaps below); the origin side scales with instances. |
@@ -154,6 +154,94 @@ a consumer's snapshot bootstrap held the whole `/heads` listing in memory and on
 | **Memory** | Core: 0.5–0.8 GB steady, 1.5–1.8 GB peak during full scans. The caches are bounded: up to 256 MiB of documents, 64 MiB of read-cache revisions and 65,536 grants (a few hundred MB at most) by default. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves catch-ups; size the caches with `serve -doc-cache-size`, `-read-cache-size` and `-grant-cache`. |
 | **Upgrades** | Schema migrations run in a transaction at start (README "Schema migrations"); one that builds an index on a large table blocks writes to it while the index builds. | Create the index `CONCURRENTLY` beforehand under the same name: migrations are written with `IF NOT EXISTS`, so they then find it. |
 
+## Large documents, by shape and schema
+
+Measured on 2026-11-12 at spec 0.82 with `cmd/capacity -only large,single`, on a 4-vCPU / 15 GB
+host that also ran the load generator, `-dev`, the core unconstrained: SQLite, and Postgres 16 on
+the same host with default settings. This is **not server X**, so compare the columns with each
+other, not with the envelope above. Each figure is the median of 60 appends of
+`[{"op":"replace","path":"/n","value":i}]`, one after another, to one document.
+
+Three documents per size:
+
+- **strings**: `{ n, items }` with `items` an array of 1,000-character strings, no `$schema`.
+  This is the shape the envelope's numbers used.
+- **structured**: `{ n, items }` with `items` an array of objects of about 110 bytes
+  (`{ id, name, score, tags: [..], at, ok }`), no `$schema`: about 9,500 objects a MiB.
+- **schema**: the structured document with `$schema` pinned to a schema revision in the same
+  namespace that types every member: `type` and `required` throughout, closed item objects
+  (`additionalProperties: false`), a `pattern` on `name`, `minimum`/`maximum`, `maxItems` and
+  `maxLength`, and `format: date-time` on `at`.
+
+| Append p50 | 16 KiB | 256 KiB | 1 MiB | 3.5 MiB |
+|---|---|---|---|---|
+| SQLite, strings | 1.2 ms | 2.0 ms | 5.0 ms | 14 ms |
+| SQLite, structured | 1.4 ms | 6.5 ms | 22 ms | 73 ms |
+| SQLite, schema | 2.5 ms | 17 ms | 58 ms | 225 ms |
+| Postgres, strings | 4.8 ms | 5.5 ms | 9.1 ms | 17 ms |
+| Postgres, structured | 4.9 ms | 11 ms | 27 ms | 75 ms |
+| Postgres, schema | 5.9 ms | 21 ms | 68 ms | 220 ms |
+
+- **The shape matters more than the bytes.** The same bytes as many small values cost 3–5× a
+  document of long strings: parsing, applying and canonicalising work per value.
+- **Validation roughly triples it again**: about 40 ms a MiB of small typed objects on top of
+  about 20 ms a MiB without a schema. At the 1 MiB default a typed document of this shape takes
+  ~60 ms an append, at 3.5 MiB ~220 ms, p99 ~300 ms.
+- The database adds a constant (3–4 ms on this Postgres); the rest is the core's CPU, which is
+  why the two databases agree at the large sizes.
+- Creating the document costs about what two appends do (190 ms at 1 MiB, 530 ms at 3.5 MiB
+  with the schema).
+
+The advice under [By design](#by-design) stands, with a number: keep a frequently edited typed
+document well under 100 KiB if its appends should stay under 10 ms.
+
+## Writes to one document
+
+Same run, a document of about 500 bytes in a namespace with the default limits.
+
+**The per-resource rate is the ceiling.** §6.6 allows 10 writes a second (burst 20) per resource
+and principal, an allowance doesn't lift it (§6.6), and this implementation has no flag for a
+higher deployment maximum. Writers append with `If-Match` on the head they last saw, re-read the
+head after a `412` and wait 100 ms after a `429`, for 15 seconds:
+
+| Principals writing one document | Appends/s (SQLite / Postgres) | Attempts answered `412` | Attempts answered `429` | One write, retries included: p50 / p95 / p99 (SQLite) |
+|---|---|---|---|---|
+| 1 | 11 / 11 | 0 | 46% / 45% | 102 / 104 / 113 ms |
+| 8 | 23 / 18 | 40% / 45% | 46% / 45% | 103 ms / 1.6 s / 2.4 s |
+| 32 | 91 / 70 | 40% / 45% | 46% / 44% | 103 ms / 1.3 s / 2.3 s |
+
+- One principal gets its 10/s and no more; the 102 ms median is the wait for the next token.
+- More principals get more in total, since each has a bucket of its own, but far less than
+  10/s each (2.8/s each at 8 and at 32): most attempts lose the race for the head or find the
+  bucket empty. The tail is seconds.
+- Without the rate the core itself is not the limit: a single append to this document takes
+  0.9–1.4 ms on SQLite and 3–4 ms on Postgres (below), so one writer in a loop would do several
+  hundred a second.
+
+**A batch writes many steps to one document at once** (§7.5: one item, many steps, one token):
+
+| One item of | SQLite | Postgres |
+|---|---|---|
+| 100 steps | 3.9 ms | 152 ms (the first batch on a cold connection) |
+| 1,000 steps | 36 ms (28,000 steps/s) | 205 ms (4,900 steps/s) |
+
+**A long history doesn't slow a document down.** One document grown to 100,000 revisions:
+
+| Revisions | Append p50 (SQLite / Postgres) | Head read | Document at head | Document at its first revision |
+|---|---|---|---|---|
+| 1,000 | 0.9 / 3.3 ms | 0.2 ms | 0.2–0.3 ms | 0.2 ms |
+| 10,000 | 1.1 / 4.4 ms | 0.2 ms | 0.2 ms | 0.2 ms |
+| 100,000 | 1.4 / 4.1 ms | 0.2 ms | 0.2–0.4 ms | 0.2 ms |
+
+The reads were made right after the writes, from warm caches, 20 samples each: they show that
+nothing scans the history, not what a cold read of an old revision costs (the envelope's "cold
+reads of old revisions" row does).
+
+So a document that many parties write often (a counter, a shared list, a presence record) is the
+wrong shape: at ~10 writes a second per writer it is rate limited, and with several writers most
+attempts are wasted. Give each writer a document of its own, or collect a writer's changes into
+batch steps.
+
 ## Recommended changes to limits
 
 - **Bearer cache: done.** 65,536 grants, at most 32 MiB of tokens, least recently used out first
@@ -190,4 +278,7 @@ go build -o patchlog ./cmd/patchlog && go build -o capacity ./cmd/capacity
   hash of its name, reads and followers to each in turn.
 - **Once seeded**, `-only scans,reads,writes,bootstrap,large,live` measures again without seeding,
   e.g. after resizing the core.
+- **Large documents and one hot document**: `-only large,single` needs no seeding (it makes
+  namespaces of its own) and takes about two minutes; `-single-seconds` sets how long each
+  single-document measurement runs.
 - Sizes: `-docs`, `-revs`, `-namespaces`, `-doc-size`, `-append-batch`; `-help` lists the rest.

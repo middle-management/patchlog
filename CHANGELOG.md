@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Capacity: large documents with a schema, and writes to one document.** `cmd/capacity`'s
+  `large` phase now also measures a document of many small objects, with and without a
+  `$schema` that types every member, and a new `single` phase measures writers contending for
+  one document, a batch item of many steps, and a document with up to 100,000 revisions.
+  [docs/CAPACITY.md](docs/CAPACITY.md) has the results: the earlier large-document figures were
+  for long strings without a schema; small typed values cost about ten times more (58 ms an
+  append at 1 MiB, 225 ms at 3.5 MiB), and one document takes about 10 writes a second per
+  principal, the per-resource rate.
+
 ## v0.28.0
 
 Implements spec **v0.82** (previously **v0.81**). v0.82 answers the reference's 77 notes on

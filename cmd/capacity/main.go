@@ -62,6 +62,7 @@ type config struct {
 	appendBatch int
 	operator    string
 	readers     int
+	singleSecs  int
 }
 
 func main() {
@@ -84,7 +85,8 @@ func main() {
 	flag.StringVar(&c.pid, "pid", "", "the core's process ids, comma-separated, to report the CPU time they spend per measurement and their memory (Linux)")
 	flag.StringVar(&c.operator, "operator-seed", "", "grants profile: the private seed of the core's -operator-key (patchlog keygen); namespaces are then read: grant, and every request carries a signed grant (§C)")
 	flag.IntVar(&c.readers, "readers", 5000, "grants profile: distinct reader grants the reads draw from (past the core's 1,024 cached bearers, most reads verify their grant)")
-	flag.StringVar(&c.only, "only", "", "run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, live")
+	flag.IntVar(&c.singleSecs, "single-seconds", 15, "seconds each single-document write measurement runs")
+	flag.StringVar(&c.only, "only", "", "run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live")
 	flag.Parse()
 	if c.revs < c.docs {
 		fail(errors.New("-revs must be at least -docs"))
@@ -275,6 +277,9 @@ func (r *runner) run() {
 	}
 	if on("large") {
 		r.largeDocs()
+	}
+	if on("single") {
+		r.singleDoc()
 	}
 	if on("live") {
 		r.live()
@@ -681,7 +686,17 @@ func (r *runner) bootstrap() {
 
 // largeDocs measures appends of a small patch to documents of growing
 // size: every append re-reads, re-serialises and checks the whole
-// document.
+// document. Three shapes per size:
+//
+//   - append_large_doc: a few thousand 1,000-character strings, no
+//     $schema (cheap to canonicalise);
+//   - append_large_structured: many small objects (about 110 bytes
+//     each), no $schema;
+//   - append_large_schema: the same structured document pinned to a
+//     schema revision that types every member, so each append validates
+//     the whole result (§6.2 step 5).
+//
+// The difference between the last two is what validation costs.
 func (r *runner) largeDocs() {
 	if r.c.large == "" {
 		return
@@ -690,7 +705,13 @@ func (r *runner) largeDocs() {
 	if !r.exists(ns) {
 		r.createNS(ns, map[string]any{"documentSize": 4 << 20}) // the deployment maximum by default; 1 MiB is the default
 	}
-	out := map[string]any{}
+	stamp := time.Now().UnixNano()
+	sw, err := r.w(ns).CreateDoc(r.ctx, ns, fmt.Sprintf("schema-%d", stamp), structuredSchema())
+	if err != nil {
+		fail(fmt.Errorf("creating the schema: %w", err))
+	}
+	schemaRef := fmt.Sprintf("/r/%s/schema-%d/rev/%s", ns, stamp, sw.ID)
+	strs, structured, typed := map[string]any{}, map[string]any{}, map[string]any{}
 	for _, s := range strings.Split(r.c.large, ",") {
 		var size int
 		if _, err := fmt.Sscan(s, &size); err != nil {
@@ -704,18 +725,226 @@ func (r *runner) largeDocs() {
 			items = append(items, strings.Repeat("y", 1000))
 		}
 		doc["items"] = items
-		name := fmt.Sprintf("large-%d-%d", size, time.Now().UnixNano())
-		w, err := r.w(ns).CreateDoc(r.ctx, ns, name, doc)
-		if err != nil {
-			fail(fmt.Errorf("creating a %d-byte document: %w", size, err))
+		strs[fmt.Sprint(size)] = r.appendsTo(ns, fmt.Sprintf("large-%d-%d", size, stamp), doc)
+		structured[fmt.Sprint(size)] = r.appendsTo(ns, fmt.Sprintf("structured-%d-%d", size, stamp), structuredDoc(size, ""))
+		typed[fmt.Sprint(size)] = r.appendsTo(ns, fmt.Sprintf("typed-%d-%d", size, stamp), structuredDoc(size, schemaRef))
+	}
+	r.record("append_large_doc", strs)
+	r.record("append_large_structured", structured)
+	r.record("append_large_schema", typed)
+}
+
+// structuredItemBytes is about what one item of structuredDoc takes as
+// canonical JSON.
+const structuredItemBytes = 110
+
+// structuredDoc is a document of about size bytes made of small typed
+// objects, pinned to schemaRef if given.
+func structuredDoc(size int, schemaRef string) map[string]any {
+	items := make([]any, 0, size/structuredItemBytes)
+	for i := 0; i < size/structuredItemBytes; i++ {
+		items = append(items, map[string]any{
+			"id": i, "name": fmt.Sprintf("item-%06d", i%1_000_000), "score": float64(i%1000) / 10,
+			"tags": []any{"a", "bb"}, "at": "2026-10-15T12:00:00Z", "ok": i%2 == 0,
+		})
+	}
+	doc := map[string]any{"n": 0, "items": items}
+	if schemaRef != "" {
+		doc["$schema"] = schemaRef
+	}
+	return doc
+}
+
+// structuredSchema types every member of structuredDoc: types, required
+// members, a pattern, bounds, a format and closed item objects.
+func structuredSchema() map[string]any {
+	return map[string]any{
+		"$schema": "https://json-schema.org/draft/2020-12/schema",
+		"type":    "object", "required": []any{"n", "items"},
+		"properties": map[string]any{
+			"n": map[string]any{"type": "integer"},
+			"items": map[string]any{"type": "array", "items": map[string]any{
+				"type": "object", "additionalProperties": false,
+				"required": []any{"id", "name", "score", "tags", "at", "ok"},
+				"properties": map[string]any{
+					"id":    map[string]any{"type": "integer", "minimum": 0},
+					"name":  map[string]any{"type": "string", "pattern": "^item-[0-9]{6}$"},
+					"score": map[string]any{"type": "number", "minimum": 0, "maximum": 100},
+					"tags":  map[string]any{"type": "array", "maxItems": 4, "items": map[string]any{"type": "string", "maxLength": 16}},
+					"at":    map[string]any{"type": "string", "format": "date-time"},
+					"ok":    map[string]any{"type": "boolean"},
+				},
+			}},
+		},
+	}
+}
+
+// appendsTo creates ns/name as doc and times 60 appends of a small patch
+// to it, one after another.
+func (r *runner) appendsTo(ns, name string, doc map[string]any) map[string]any {
+	t := time.Now()
+	w, err := r.w(ns).CreateDoc(r.ctx, ns, name, doc)
+	if err != nil {
+		fail(fmt.Errorf("creating %s: %w", name, err))
+	}
+	create := time.Since(t)
+	id := w.ID
+	var lat []time.Duration
+	for i := 1; i <= 60; i++ {
+		t := time.Now()
+		w, err := r.w(ns).Append(r.ctx, ns, name, id, []any{map[string]any{"op": "replace", "path": "/n", "value": i}})
+		if ae, ok := client.AsAPIError(err); ok && ae.Status == 429 {
+			time.Sleep(200 * time.Millisecond) // the resource's rate (10/s)
+			i--
+			continue
 		}
-		id := w.ID
+		if err != nil {
+			fail(err)
+		}
+		lat = append(lat, time.Since(t))
+		id = w.ID
+	}
+	out := summary(lat, 0)
+	out["create_ms"] = float64(create.Microseconds()) / 1000
+	return out
+}
+
+// principal is a client of ns for writer k, a principal of its own: the
+// per-resource rate (§6.6) is per principal.
+func (r *runner) principal(ns string, k int) *client.Client {
+	sub := fmt.Sprintf("user:writer-%d", k)
+	if r.op == nil {
+		return r.pubs[r.home(ns)].With(client.WithAuthor(sub))
+	}
+	return r.newClient(r.home(ns), r.mint(r.key, map[string]any{"kid": keyKid, "sub": sub, "ns": []any{ns}, "can": []any{"read", "create", "append"}}))
+}
+
+// singleDoc measures writes that all go to one document.
+//
+//   - single_doc_writers_N: N principals append to the same small
+//     document as fast as they can for -single-seconds, each with
+//     If-Match on the head it last saw, re-reading the head after a 412
+//     and backing off after a 429. Reports the appends that succeeded per
+//     second, how many attempts were stale (412) or rate limited (429),
+//     and the time one logical write took, retries included.
+//   - single_doc_batch_steps_S: one batch whose single item has S steps
+//     for the document (§7.5).
+//   - single_doc_history_R: once the document has R revisions, the time
+//     of a single append, a head read and a read of its first revision.
+func (r *runner) singleDoc() {
+	ns := r.c.big + "-single"
+	if !r.exists(ns) {
+		r.createNS(ns)
+	}
+	stamp := time.Now().UnixNano()
+	patch := func(v int) []any { return []any{map[string]any{"op": "replace", "path": "/n", "value": v}} }
+	for _, n := range []int{1, 8, 32} {
+		name := fmt.Sprintf("hot-%d-%d", n, stamp)
+		w, err := r.w(ns).CreateDoc(r.ctx, ns, name, r.body(0, 0))
+		if err != nil {
+			fail(err)
+		}
+		var mu sync.Mutex
+		head := w.ID
 		var lat []time.Duration
-		for i := 1; i <= 60; i++ {
+		var ok, stale, limited, failed atomic.Int64
+		deadline := time.Now().Add(time.Duration(r.c.singleSecs) * time.Second)
+		var wg sync.WaitGroup
+		t0 := time.Now()
+		for k := 0; k < n; k++ {
+			wg.Add(1)
+			go func(k int) {
+				defer wg.Done()
+				c := r.principal(ns, k)
+				for v := 0; time.Now().Before(deadline); v++ {
+					t := time.Now()
+					for time.Now().Before(deadline) {
+						mu.Lock()
+						id := head
+						mu.Unlock()
+						w, err := c.Append(r.ctx, ns, name, id, patch(v))
+						if err == nil {
+							mu.Lock()
+							head = w.ID
+							lat = append(lat, time.Since(t))
+							mu.Unlock()
+							ok.Add(1)
+							break
+						}
+						ae, isAPI := client.AsAPIError(err)
+						switch {
+						case isAPI && ae.Status == 412:
+							stale.Add(1)
+							if h, err := c.Head(r.ctx, ns, name); err == nil {
+								mu.Lock()
+								head = h.ID
+								mu.Unlock()
+							}
+						case isAPI && ae.Status == 429:
+							limited.Add(1)
+							time.Sleep(100 * time.Millisecond)
+						default:
+							if failed.Add(1) == 1 {
+								r.logf("error: %v", err)
+							}
+							time.Sleep(50 * time.Millisecond)
+						}
+					}
+				}
+			}(k)
+		}
+		wg.Wait()
+		wall := time.Since(t0)
+		out := map[string]any{"writers": n, "seconds": wall.Seconds(), "appends": ok.Load(), "stale_412": stale.Load(), "rate_limited_429": limited.Load(), "errors": failed.Load()}
+		if len(lat) > 0 {
+			for k, v := range summary(lat, wall) {
+				out[k] = v
+			}
+		}
+		r.record(fmt.Sprintf("single_doc_writers_%d", n), out)
+	}
+
+	// One batch item with many steps for one document.
+	steps := func(n, from int) []client.Step {
+		out := make([]client.Step, n)
+		for i := range out {
+			out[i] = client.PatchStep(patch(from + i))
+		}
+		return out
+	}
+	for _, n := range []int{100, 1000} {
+		name := fmt.Sprintf("steps-%d-%d", n, stamp)
+		w, err := r.w(ns).CreateDoc(r.ctx, ns, name, r.body(0, 0))
+		if err != nil {
+			fail(err)
+		}
+		t := time.Now()
+		_, err = r.w(ns).Batch(r.ctx, ns, client.BatchRequest{Items: []client.BatchItem{{Resource: name, IfMatch: w.ID, Steps: steps(n, 1)}}}, false)
+		out := map[string]any{"steps": n, "ms": float64(time.Since(t).Microseconds()) / 1000}
+		if err != nil {
+			out["error"] = err.Error()
+		} else {
+			out["steps_per_second"] = float64(n) / time.Since(t).Seconds()
+		}
+		r.record(fmt.Sprintf("single_doc_batch_steps_%d", n), out)
+	}
+
+	// A document with a long history: grown by batches of steps, measured
+	// at each milestone.
+	name := fmt.Sprintf("long-%d", stamp)
+	w, err := r.w(ns).CreateDoc(r.ctx, ns, name, r.body(0, 0))
+	if err != nil {
+		fail(err)
+	}
+	first, id, revs := w.ID, w.ID, 1
+	c := r.w(ns)
+	timed := func(fn func() error) map[string]any {
+		var lat []time.Duration
+		for i := 0; i < 20; i++ {
 			t := time.Now()
-			w, err := r.w(ns).Append(r.ctx, ns, name, id, []any{map[string]any{"op": "replace", "path": "/n", "value": i}})
+			err := fn()
 			if ae, ok := client.AsAPIError(err); ok && ae.Status == 429 {
-				time.Sleep(200 * time.Millisecond) // the resource's rate (10/s)
+				time.Sleep(200 * time.Millisecond)
 				i--
 				continue
 			}
@@ -723,11 +952,39 @@ func (r *runner) largeDocs() {
 				fail(err)
 			}
 			lat = append(lat, time.Since(t))
-			id = w.ID
 		}
-		out[fmt.Sprint(size)] = summary(lat, 0)
+		return summary(lat, 0)
 	}
-	r.record("append_large_doc", out)
+	for _, target := range []int{1_000, 10_000, 100_000} {
+		for revs < target {
+			n := min(500, target-revs)
+			res, err := retry(func() (*client.BatchResult, error) {
+				return c.Batch(r.ctx, ns, client.BatchRequest{Items: []client.BatchItem{{Resource: name, IfMatch: id, Steps: steps(n, revs)}}}, false)
+			})
+			if ae, ok := client.AsAPIError(err); ok && ae.Status == 429 {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+			if err != nil {
+				fail(fmt.Errorf("growing %s to %d revisions: %w", name, target, err))
+			}
+			id = last(res.Items[0].IDs)
+			revs += n
+		}
+		out := map[string]any{"revisions": revs}
+		out["append"] = timed(func() error {
+			w, err := c.Append(r.ctx, ns, name, id, patch(-revs))
+			if err == nil {
+				id = w.ID
+				revs++
+			}
+			return err
+		})
+		out["head"] = timed(func() error { _, err := c.Head(r.ctx, ns, name); return err })
+		out["doc_at_head"] = timed(func() error { _, err := c.Doc(r.ctx, ns, name, id); return err })
+		out["doc_at_first_revision"] = timed(func() error { _, err := c.Doc(r.ctx, ns, name, first); return err })
+		r.record(fmt.Sprintf("single_doc_history_%d", target), out)
+	}
 }
 
 // live measures long-poll followers (§7.7) of one namespace: w followers
