@@ -63,6 +63,7 @@ type config struct {
 	operator    string
 	readers     int
 	singleSecs  int
+	singleRate  float64
 }
 
 func main() {
@@ -86,6 +87,7 @@ func main() {
 	flag.StringVar(&c.operator, "operator-seed", "", "grants profile: the private seed of the core's -operator-key (patchlog keygen); namespaces are then read: grant, and every request carries a signed grant (§C)")
 	flag.IntVar(&c.readers, "readers", 5000, "grants profile: distinct reader grants the reads draw from (past the core's 1,024 cached bearers, most reads verify their grant)")
 	flag.IntVar(&c.singleSecs, "single-seconds", 15, "seconds each single-document write measurement runs")
+	flag.Float64Var(&c.singleRate, "single-rate", 0, "single-document measurements: writes a second (and burst) the namespace allows per resource, per principal and in all, in place of the defaults (10, 50 and 500 a second); the core needs -max-rate-per-resource, -max-rate-per-principal and -max-rate-per-namespace raised to it")
 	flag.StringVar(&c.only, "only", "", "run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live")
 	flag.Parse()
 	if c.revs < c.docs {
@@ -833,9 +835,18 @@ func (r *runner) principal(ns string, k int) *client.Client {
 //     of a single append, a head read and a read of its first revision.
 func (r *runner) singleDoc() {
 	ns := r.c.big + "-single"
-	if !r.exists(ns) {
-		r.createNS(ns)
+	if r.c.singleRate > 0 {
+		ns = fmt.Sprintf("%s-single-r%d", r.c.big, int(r.c.singleRate))
 	}
+	if !r.exists(ns) {
+		if r.c.singleRate > 0 {
+			b := map[string]any{"rate": r.c.singleRate, "burst": r.c.singleRate}
+			r.createNS(ns, map[string]any{"ratePerResource": b, "ratePerPrincipal": b, "ratePerNamespace": b})
+		} else {
+			r.createNS(ns)
+		}
+	}
+	r.record("single_doc_rate", map[string]any{"per_resource_and_principal": map[bool]any{true: r.c.singleRate, false: "default"}[r.c.singleRate > 0]})
 	stamp := time.Now().UnixNano()
 	patch := func(v int) []any { return []any{map[string]any{"op": "replace", "path": "/n", "value": v}} }
 	for _, n := range []int{1, 8, 32} {

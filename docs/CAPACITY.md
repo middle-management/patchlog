@@ -199,9 +199,8 @@ document well under 100 KiB if its appends should stay under 10 ms.
 
 Same run, a document of about 500 bytes in a namespace with the default limits.
 
-**The per-resource rate is the ceiling.** §6.6 allows 10 writes a second (burst 20) per resource
-and principal, an allowance doesn't lift it (§6.6), and this implementation has no flag for a
-higher deployment maximum. Writers append with `If-Match` on the head they last saw, re-read the
+**At the default limits the per-resource rate is the ceiling.** §6.6 allows 10 writes a second
+(burst 20) per resource and principal, and an allowance doesn't lift it (§6.6). Writers append with `If-Match` on the head they last saw, re-read the
 head after a `412` and wait 100 ms after a `429`, for 15 seconds:
 
 | Principals writing one document | Appends/s (SQLite / Postgres) | Attempts answered `412` | Attempts answered `429` | One write, retries included: p50 / p95 / p99 (SQLite) |
@@ -214,16 +213,32 @@ head after a `412` and wait 100 ms after a `429`, for 15 seconds:
 - More principals get more in total, since each has a bucket of its own, but far less than
   10/s each (2.8/s each at 8 and at 32): most attempts lose the race for the head or find the
   bucket empty. The tail is seconds.
-- Without the rate the core itself is not the limit: a single append to this document takes
-  0.9–1.4 ms on SQLite and 3–4 ms on Postgres (below), so one writer in a loop would do several
-  hundred a second.
+- A write refused with `412` has still drawn its tokens (the buckets are drawn before the
+  precondition is compared), which is why contending writers get so little of their rate.
+
+**With the rate lifted** (`serve -max-rate-per-resource 1e6,1e6 -max-rate-per-principal 1e6,1e6`
+and a namespace whose `limits` set both that high; `capacity -single-rate 1000000`), no request
+was rate limited and the core and the database set the pace:
+
+| Principals writing one document | Appends/s (SQLite / Postgres) | Attempts answered `412` | One write, retries included: p50 / p95 / p99 (SQLite) |
+|---|---|---|---|
+| 1 | 1,040 / 270 | 0 | 0.8 / 1.2 / 11 ms |
+| 8 | 560 / 150 | 84% / 87% | 1.8 / 73 / 140 ms |
+| 32 | 240 / 80 | 95% / 96% | 18 / 580 / 990 ms |
+
+- **One writer in a loop does about 1,000 appends a second on SQLite and 270 on Postgres** to a
+  small document: about a hundred times the default rate on SQLite.
+- **More writers make it slower, not faster.** Every append needs the head the last one made, so
+  the writers queue behind one another whatever the server does, and with a plain retry most of
+  their requests are wasted `412`s: 8 writers get half of what one does, 32 a quarter. A hot
+  document wants one writer (or a queue in front of it), not more of them.
 
 **A batch writes many steps to one document at once** (§7.5: one item, many steps, one token):
 
 | One item of | SQLite | Postgres |
 |---|---|---|
-| 100 steps | 3.9 ms | 152 ms (the first batch on a cold connection) |
-| 1,000 steps | 36 ms (28,000 steps/s) | 205 ms (4,900 steps/s) |
+| 100 steps | 4–5 ms | 18 ms (152 ms as the first batch on a cold connection) |
+| 1,000 steps | 36–44 ms (23,000–28,000 steps/s) | 146–205 ms (4,900–6,800 steps/s) |
 
 **A long history doesn't slow a document down.** One document grown to 100,000 revisions:
 
@@ -238,9 +253,12 @@ nothing scans the history, not what a cold read of an old revision costs (the en
 reads of old revisions" row does).
 
 So a document that many parties write often (a counter, a shared list, a presence record) is the
-wrong shape: at ~10 writes a second per writer it is rate limited, and with several writers most
-attempts are wasted. Give each writer a document of its own, or collect a writer's changes into
-batch steps.
+wrong shape: at the default limits it is rate limited at ~10 writes a second per writer, and at
+any limits several writers waste most of their attempts. Give each writer a document of its own,
+or collect a writer's changes into batch steps. Where one writer does need more than 10 writes a
+second on a small document, raise the deployment maximum (`serve -max-rate-per-resource`) and
+set `ratePerResource` in that namespace's `limits`; leave it at the default where documents are
+large, since a typed 1 MiB document already costs ~60 ms of CPU an append (above).
 
 ## Recommended changes to limits
 
@@ -252,6 +270,9 @@ batch steps.
 - **`documentSize`: done.** 1 MiB by default, 4 MiB a namespace may set (`serve -document-size`,
   `-max-document-size`). Appends at 3.5 MiB are 3–4× slower than at 16 KiB, and every revision of
   a large document weighs on the caches.
+- **Per-resource and per-principal maximums: done.** `serve -max-rate-per-resource` and
+  `-max-rate-per-principal` let a namespace set its own above the defaults (10/s and 50/s), for
+  small documents one writer writes often. The defaults stay.
 - **Keep**: the rates (500/s a namespace is just under one namespace's ceiling on server X),
   `itemsPerBatch` 1,000 (imports; give importers allowances), the snapshot cadence, the
   long-poll interval and the log page size.
@@ -280,5 +301,7 @@ go build -o patchlog ./cmd/patchlog && go build -o capacity ./cmd/capacity
   e.g. after resizing the core.
 - **Large documents and one hot document**: `-only large,single` needs no seeding (it makes
   namespaces of its own) and takes about two minutes; `-single-seconds` sets how long each
-  single-document measurement runs.
+  single-document measurement runs, and `-single-rate N` runs them in a namespace that allows N
+  writes a second per resource and principal (the core then needs `-max-rate-per-resource N,N
+  -max-rate-per-principal N,N`).
 - Sizes: `-docs`, `-revs`, `-namespaces`, `-doc-size`, `-append-batch`; `-help` lists the rest.

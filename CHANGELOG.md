@@ -38,6 +38,14 @@
   for long strings without a schema; small typed values cost about ten times more (58 ms an
   append at 1 MiB, 225 ms at 3.5 MiB), and one document takes about 10 writes a second per
   principal, the per-resource rate.
+- **`serve -max-rate-per-resource` and `-max-rate-per-principal`** (`RATE,BURST`) raise the
+  deployment maximums of `ratePerResource` and `ratePerPrincipal`, which were fixed at the
+  defaults, so a namespace's `limits` can allow more on small documents that one writer writes
+  often. The defaults (10/s and 50/s) are unchanged. With the rate lifted one writer appends
+  about 1,000 times a second to a small document on SQLite and 270 on Postgres; more writers on
+  the same document get less in total, not more. `capacity -single-rate N` measures it.
+  SPEC-FEEDBACK notes 89 and 90 ask about the per-resource rate under an allowance and about a
+  `412` drawing a token.
 
 
 ## v0.28.0

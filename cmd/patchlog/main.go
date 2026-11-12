@@ -163,6 +163,8 @@ func serve(args []string) {
 	logPageSize := fs.Int("log-page-size", 0, "log page size (§6.6, deployment only): a log range answers at most this many entries a page, with X-Log-Next naming the next page's since (§7.1); long-poll answers and /heads pages are as long (default 1000)")
 	logPageBytes := fs.String("log-page-bytes", "", "bytes of patch sets per resource log page (§6.6 logPageBytes, deployment only), e.g. \"16 MiB\" (the default): a resource log range, long-poll answer or event-stream catch-up page ends before an entry that would take it past, though it always holds one (§7.1, §7.7)")
 	maxRateNS := fs.String("max-rate-per-namespace", "", "deployment maximum of ratePerNamespace, as RATE,BURST, e.g. 100000,1000000 (default: the namespace default, 500,1000): namespaces may set their ratePerNamespace up to it, and an allowance's bucket never exceeds it, so an importer's or load harness's allowance needs it raised (§6.6)")
+	maxRateRes := fs.String("max-rate-per-resource", "", "deployment maximum of ratePerResource, as RATE,BURST (default: the namespace default, 10,20): namespaces may set their ratePerResource up to it, for small documents that one principal writes often; no allowance lifts the per-resource rate (§6.6)")
+	maxRatePrincipal := fs.String("max-rate-per-principal", "", "deployment maximum of ratePerPrincipal, as RATE,BURST (default: the namespace default, 50,100): namespaces may set their ratePerPrincipal up to it (§6.6)")
 	exchangeRate := fs.String("exchange-rate", "", "edge-grant exchanges per principal (§6.6, §C.5, deployment only), as RATE,BURST, e.g. 10,100 (the default): each POST /edge-grants draws one token from the bucket of each principal whose grants it carries, and none from their write buckets")
 	var opKeys multi
 	fs.Var(&opKeys, "operator-key", "base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)")
@@ -320,8 +322,14 @@ func serve(args []string) {
 	} else {
 		limits.DocumentSize = min(limits.DocumentSize, max.DocumentSize)
 	}
-	if err := rateMaximum(*maxRateNS, &limits, &max); err != nil {
-		log.Fatalf("-max-rate-per-namespace: %v", err)
+	for _, f := range []struct{ flag, key, v string }{
+		{"-max-rate-per-namespace", "ratePerNamespace", *maxRateNS},
+		{"-max-rate-per-resource", "ratePerResource", *maxRateRes},
+		{"-max-rate-per-principal", "ratePerPrincipal", *maxRatePrincipal},
+	} {
+		if err := rateMaximumOf(f.key, f.v, &limits, &max); err != nil {
+			log.Fatalf("%s: %v", f.flag, err)
+		}
 	}
 	arch, err := archiver(*archiveDef, archiveRoots)
 	if err != nil {
@@ -489,6 +497,14 @@ func parseRate(s string) (core.Rate, error) {
 // namespace may set its own to, and what an allowance's bucket may be at
 // most. The default limit is held to it.
 func rateMaximum(s string, limits, max *core.Limits) error {
+	return rateMaximumOf("ratePerNamespace", s, limits, max)
+}
+
+// rateMaximumOf applies a -max-rate-per-… flag, RATE,BURST ("" leaves the
+// default), as the deployment's maximum of the rate limit named key
+// (ratePerNamespace, ratePerResource or ratePerPrincipal, §6.6): what a
+// namespace may set its own to. The default limit is held to it.
+func rateMaximumOf(key, s string, limits, max *core.Limits) error {
 	if s == "" {
 		return nil
 	}
@@ -496,8 +512,18 @@ func rateMaximum(s string, limits, max *core.Limits) error {
 	if err != nil {
 		return err
 	}
-	max.RatePerNamespace = r
-	limits.RatePerNamespace = core.Rate{Rate: min(limits.RatePerNamespace.Rate, r.Rate), Burst: min(limits.RatePerNamespace.Burst, r.Burst)}
+	field := func(l *core.Limits) *core.Rate {
+		switch key {
+		case "ratePerResource":
+			return &l.RatePerResource
+		case "ratePerPrincipal":
+			return &l.RatePerPrincipal
+		}
+		return &l.RatePerNamespace
+	}
+	*field(max) = r
+	cur := field(limits)
+	*cur = core.Rate{Rate: min(cur.Rate, r.Rate), Burst: min(cur.Burst, r.Burst)}
 	return nil
 }
 

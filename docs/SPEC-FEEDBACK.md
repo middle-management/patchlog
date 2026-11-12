@@ -15,10 +15,11 @@ had a choice) and the question. The planner's questions from before the work and
 implementers' and reviewers' notes are merged here, each case once. Notes from v0.81 that v0.82
 leaves open are carried in place, by subject, marked "was v0.81 Open n" and cut to what
 remains. The order is: sealed forms and end-to-end reads (1–31), access and coverage (32–65),
-tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87), index (88).
+tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87), index (88),
+rates (89–90, from capacity measurements after the v0.82 work).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
-88 are open: 58 from this version's work and 30 carried.
+90 are open: 60 from this version's work and 30 carried.
 
 The spec's own question to the reference, "what is a shadow?", is answered under "Settled in
 v0.82" (v0.81 Open 24).
@@ -488,6 +489,23 @@ v0.82" (v0.81 Open 24).
     or `403` with no marker. The reference now reads the document at the purge entry on every
     path and keeps the trust. *Question:* should the text say a service that can read a purged
     catalog's document at its purge head must do so?
+89. **The per-resource rate and allowances** (§6.6). "Per-resource buckets still apply" under an
+    allowance, so an importer or a service with an allowance is still held to 10 writes a second
+    on each document unless it collects them into the steps of one batch item, which cost one
+    token (1,000 steps were one token in the reference's measurement). The reference lets a deployment raise the maximum of `ratePerResource` and
+    `ratePerPrincipal` (`serve -max-rate-per-resource`, `-max-rate-per-principal`), so a
+    namespace can set its own higher; the defaults stay §12.2's. *Question:* is a deployment
+    maximum above the default intended for these two, as for `ratePerNamespace`; and should an
+    allowance be able to carry a per-resource rate?
+90. **A `412` draws a token** (§6.2, §6.6). The reference draws a write's tokens before it
+    compares the precondition, so a write that fails `412` (or `410`) has spent one from the
+    resource's, the principal's and the namespace's buckets. With 8 principals appending to one
+    document at the default rates, 40–45% of attempts were `412` and about as many `429`: each
+    principal got 2.8 writes a second of its 10 (docs/CAPACITY.md, "Writes to one document").
+    §7 says rate limits "come last, only for requests that passed the rest", which reads as the
+    authorisation checks. *Question:* does a request refused at step 2 (`412`, `410`, `428`,
+    `409` frozen) draw tokens? Drawing protects the server from retry storms; not drawing gives
+    contending writers their full rate.
 
 ## Settled in v0.82
 

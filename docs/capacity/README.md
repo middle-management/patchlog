@@ -18,4 +18,5 @@ containers.
 | `pg-grants-serverX-private-longpoll-{direct,cdn}-{before,after}.json` | grants, server X, private long-poll fan-out before and after the origin shares the waiters' reads, straight to the core and through Varnish (with the updated VCL); the core idle before each write |
 | `pg-grants-serverX-reads-caches-{before,after}.json` | grants, server X, reads before and after the bearer, document and read caches were bounded by bytes (`read_head_doc_fleet_warm`: 5,000 readers that have each made a request before) |
 | `sqlite-public-4vcpu-large-single.json` | 2026-11-12, spec 0.82, `-only large,single`: SQLite, `-dev`, the core unconstrained on a 4-vCPU / 15 GB host (not the host of the runs above); large documents by shape and with a schema, and writes to one document |
+| `{sqlite-public,pg-noauth}-4vcpu-single-unlimited.json` | the same host and day, `-only single -single-rate 1000000`: the core with `-max-rate-per-resource 1e6,1e6 -max-rate-per-principal 1e6,1e6`, so nothing is rate limited |
 | `pg-noauth-4vcpu-large-single.json` | the same on Postgres 16 with default settings on that host, `-dev`, nothing constrained (not server X) |
