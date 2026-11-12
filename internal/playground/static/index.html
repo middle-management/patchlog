@@ -90,23 +90,17 @@
 
   <!-- ============ Namespace ============ -->
   <section id="tab-ns" class="grid" role="tabpanel">
-    <div class="card" data-card="ns.status" data-open>
+    <div class="card wide" data-card="ns.status" data-open>
       <header><h2>Namespace</h2><button id="nsRefresh" class="tiny">Refresh</button></header>
       <div id="nsStatus" class="muted">Select or add a namespace above.</div>
     </div>
 
-    <div class="card" data-card="ns.create">
-      <header><h2>Create namespace</h2><span class="muted small">PATCH /ns/{ns} &middot; If-None-Match: *</span></header>
-      <div class="row"><label for="nsNewName">Name</label><input id="nsNewName" class="mono" placeholder="matches" autocomplete="off" spellcheck="false"></div>
-      <textarea id="nsNewDoc" class="code" rows="4" spellcheck="false" data-json>{"read":"public"}</textarea>
-      <div class="row"><button id="nsCreate" class="primary">Create</button><span class="note help">The document becomes the genesis patch set <code>[{"op":"add","path":"","value":&hellip;}]</code>. <code>read</code> is <code>public</code> or <code>grant</code>. Members the spec doesn&rsquo;t define must start with <code>x-</code>, e.g. <code>"x-title"</code> (422 otherwise, &sect;7.4).</span></div>
-    </div>
-
     <div class="card wide" data-card="ns.doc" data-open>
       <header><h2>Namespace document</h2><span id="nsDocMeta" class="muted small"></span></header>
-      <div class="split">
-        <div><pre id="nsDoc" class="json empty">&mdash;</pre></div>
+      <div class="split even">
+        <div><h3 class="sub">Current document</h3><pre id="nsDoc" class="json empty">&mdash;</pre></div>
         <div>
+          <h3 class="sub">Change it</h3>
           <div class="row"><label for="nsIfMatch">If-Match (config id)</label><input id="nsIfMatch" class="mono" placeholder="X-Config-Revision" spellcheck="false"><button id="nsUseCfg" class="tiny" title="Reset to the current config id">use current</button></div>
           <textarea id="nsPatch" class="code" rows="6" spellcheck="false" data-json>[
   {"op":"add","path":"/rules","value":[]}
@@ -122,47 +116,6 @@
       </div>
     </div>
 
-    <div class="card wide" data-card="ns.log">
-      <header><h2>Namespace log</h2><span id="nsLogMeta" class="muted small"></span></header>
-      <div class="scroll"><table id="nsLog"><thead><tr><th>kind</th><th>resource</th><th>target</th><th>author</th><th>created</th><th>id</th></tr></thead><tbody></tbody></table></div>
-    </div>
-
-    <div class="card wide" data-card="ns.undo">
-      <header><h2>Undo / redo</h2><span class="muted small">&sect;11.2 &middot; gestures from the log, inverse as one batch with <code>Undoes</code></span><button id="undoRefresh" class="tiny">Refresh</button></header>
-      <div class="row">
-        <label for="undoAuthor">Author</label><input id="undoAuthor" class="mono" spellcheck="false" autocomplete="off">
-        <button id="undoLast" class="primary" title="Undo this author's last action that stands">Undo last</button>
-        <button id="redoLast" title="Redo this author's last undone action (undo the undo)">Redo last</button>
-      </div>
-      <div id="undoStack" class="muted">No namespace selected.</div>
-      <div class="row">
-        <label for="undoGesture">Gesture</label><input id="undoGesture" class="mono" placeholder="any gesture id (26 base32 characters)" spellcheck="false" autocomplete="off">
-        <button id="undoAny" class="tiny">Undo</button><button id="redoAny" class="tiny">Redo</button>
-      </div>
-      <div id="undoOut" hidden></div>
-      <p class="note help">The stack is rebuilt from the namespace log: the author&rsquo;s gestures minus those the same author undid and didn&rsquo;t redo; undos by others are shown, not counted. An undo reads each resource&rsquo;s log after the gesture, refuses on overlapping later writes (a <b>conflict</b>), and reports a pruned revision, a missing blob or a document that no longer validates as <b>undo impossible</b>. The batch is guarded by <code>ifMatch</code> and re-planned on <code>412</code>.</p>
-    </div>
-
-    <div class="card wide" data-card="ns.heads">
-      <header><h2>Heads</h2><span id="headsMeta" class="muted small"></span><button id="headsMore" class="tiny" hidden>Load more</button></header>
-      <div class="scroll"><table id="headsTbl"><thead><tr><th>resource</th><th>kind</th><th>target</th></tr></thead><tbody></tbody></table></div>
-      <p class="note help">GET /ns/{ns}/rev/{id}/heads &mdash; click a row to open the resource.</p>
-    </div>
-
-    <div class="card" data-card="ns.branches">
-      <header><h2>Branches</h2><span class="muted small">GET /ns/{ns}/branches</span></header>
-      <div class="scroll"><table id="brTbl"><thead><tr><th>name</th><th>at</th><th>frozen</th><th>purged</th><th>successor</th><th></th></tr></thead><tbody></tbody></table></div>
-    </div>
-
-    <div class="card" data-card="ns.brNew">
-      <header><h2>Create branch</h2><span class="muted small">POST /ns/{base}/branches &middot; If-None-Match: *</span></header>
-      <div class="row"><label for="brName">Name</label><input id="brName" class="mono" placeholder="release-7" autocomplete="off" spellcheck="false"></div>
-      <div class="row"><label for="brAt">At</label><input id="brAt" class="mono" placeholder="namespace revision (default: current head)" spellcheck="false"><button id="brUseHead" class="tiny">use head</button></div>
-      <textarea id="brPatches" class="code" rows="3" spellcheck="false" data-json placeholder='optional patches for the branch document, e.g. [{"op":"add","path":"/rules","value":[]}]'></textarea>
-      <div class="row"><button id="brCreate" class="primary">Create branch</button></div>
-    </div>
-
-    <!-- merge a branch into its base (§F.3) -->
     <div class="card wide" data-card="ns.merge" data-open id="mgCard" hidden>
       <header><h2>Merge</h2><span class="muted small">&sect;F.3 &middot; planned by the core at /playground/merge/plan, written from this browser as one batch</span><button id="mgClose" class="tiny">Close</button></header>
       <div id="mgHead" class="state-line"></div>
@@ -186,7 +139,54 @@
       <p class="note help">A merge is one batch into the base: fast-forwards keep the branch&rsquo;s ids, replays get new ones. A conflicting resource needs one resolution against the base&rsquo;s head: a patch set, <code>"keep"</code> (the base as it is) or <code>"delete"</code>. A re-plan stays pinned to the branch revision shown, so resolutions keep meaning what they were written against. If the base moves before the batch lands it answers <code>412</code>, nothing is written, and the page plans again. Sealed and e2e namespaces, required signatures and blobs that need copying are for <code>patchlog merge</code>.</p>
     </div>
 
-    <div class="card danger-zone" data-card="ns.purge">
+    <div class="card wide" data-card="ns.branches">
+      <header><h2>Branches</h2><span class="muted small">GET /ns/{ns}/branches</span></header>
+      <div class="scroll"><table id="brTbl"><thead><tr><th>name</th><th>at</th><th>frozen</th><th>purged</th><th>successor</th><th></th></tr></thead><tbody></tbody></table></div>
+    </div>
+
+    <div class="card wide" data-card="ns.heads">
+      <header><h2>Heads</h2><span id="headsMeta" class="muted small"></span><button id="headsMore" class="tiny" hidden>Load more</button></header>
+      <div class="scroll"><table id="headsTbl"><thead><tr><th>resource</th><th>kind</th><th>target</th></tr></thead><tbody></tbody></table></div>
+      <p class="note help">GET /ns/{ns}/rev/{id}/heads &mdash; click a row to open the resource.</p>
+    </div>
+
+    <div class="card wide" data-card="ns.log">
+      <header><h2>Namespace log</h2><span id="nsLogMeta" class="muted small"></span></header>
+      <div class="scroll"><table id="nsLog"><thead><tr><th>kind</th><th>resource</th><th>target</th><th>author</th><th>created</th><th>id</th></tr></thead><tbody></tbody></table></div>
+    </div>
+
+    <div class="card wide" data-card="ns.undo">
+      <header><h2>Undo / redo</h2><span class="muted small">&sect;11.2 &middot; gestures from the log, inverse as one batch with <code>Undoes</code></span><button id="undoRefresh" class="tiny">Refresh</button></header>
+      <div class="row">
+        <label for="undoAuthor">Author</label><input id="undoAuthor" class="mono" spellcheck="false" autocomplete="off">
+        <button id="undoLast" class="primary" title="Undo this author's last action that stands">Undo last</button>
+        <button id="redoLast" title="Redo this author's last undone action (undo the undo)">Redo last</button>
+      </div>
+      <div id="undoStack" class="muted">No namespace selected.</div>
+      <div class="row">
+        <label for="undoGesture">Gesture</label><input id="undoGesture" class="mono" placeholder="any gesture id (26 base32 characters)" spellcheck="false" autocomplete="off">
+        <button id="undoAny" class="tiny">Undo</button><button id="redoAny" class="tiny">Redo</button>
+      </div>
+      <div id="undoOut" hidden></div>
+      <p class="note help">The stack is rebuilt from the namespace log: the author&rsquo;s gestures minus those the same author undid and didn&rsquo;t redo; undos by others are shown, not counted. An undo reads each resource&rsquo;s log after the gesture, refuses on overlapping later writes (a <b>conflict</b>), and reports a pruned revision, a missing blob or a document that no longer validates as <b>undo impossible</b>. The batch is guarded by <code>ifMatch</code> and re-planned on <code>412</code>.</p>
+    </div>
+
+    <div class="card wide" data-card="ns.brNew">
+      <header><h2>Create branch</h2><span class="muted small">POST /ns/{base}/branches &middot; If-None-Match: *</span></header>
+      <div class="row"><label for="brName">Name</label><input id="brName" class="mono" placeholder="release-7" autocomplete="off" spellcheck="false"></div>
+      <div class="row"><label for="brAt">At</label><input id="brAt" class="mono" placeholder="namespace revision (default: current head)" spellcheck="false"><button id="brUseHead" class="tiny">use head</button></div>
+      <textarea id="brPatches" class="code" rows="3" spellcheck="false" data-json placeholder='optional patches for the branch document, e.g. [{"op":"add","path":"/rules","value":[]}]'></textarea>
+      <div class="row"><button id="brCreate" class="primary">Create branch</button></div>
+    </div>
+
+    <div class="card wide" data-card="ns.create">
+      <header><h2>Create namespace</h2><span class="muted small">PATCH /ns/{ns} &middot; If-None-Match: *</span></header>
+      <div class="row"><label for="nsNewName">Name</label><input id="nsNewName" class="mono" placeholder="matches" autocomplete="off" spellcheck="false"></div>
+      <textarea id="nsNewDoc" class="code" rows="4" spellcheck="false" data-json>{"read":"public"}</textarea>
+      <div class="row"><button id="nsCreate" class="primary">Create</button><span class="note help">The document becomes the genesis patch set <code>[{"op":"add","path":"","value":&hellip;}]</code>. <code>read</code> is <code>public</code> or <code>grant</code>. Members the spec doesn&rsquo;t define must start with <code>x-</code>, e.g. <code>"x-title"</code> (422 otherwise, &sect;7.4).</span></div>
+    </div>
+
+    <div class="card danger-zone wide" data-card="ns.purge">
       <header><h2>Purge namespace</h2><span class="muted small">POST /ns/{ns}/purge</span></header>
       <div class="row"><label for="nsPurgeIm">If-Match (ns_id)</label><input id="nsPurgeIm" class="mono" placeholder="namespace head" spellcheck="false"><button id="nsPurgeUse" class="tiny">use head</button></div>
       <div class="row"><button id="nsPurge" class="danger">Purge namespace&hellip;</button></div>
@@ -242,18 +242,18 @@
       <p class="note help">Edit If-Match to test <code>412</code>; resend an identical request to see the idempotent-retry <code>200</code>. Blank If-Match sends none (<code>428</code>).</p>
     </div>
 
-    <div class="card" data-card="res.purge">
-      <header><h2>Purge</h2><span class="muted small">POST &hellip;/purge</span></header>
-      <div class="row"><button id="btnPurge" class="danger">Purge resource&hellip;</button><label class="check"><input type="checkbox" id="purgeForce"> force=1 (schema in use; needs * key)</label></div>
-      <p class="note warn-note">Uses the If-Match field (head or tombstone). Content is removed for good.</p>
-    </div>
-
-    <div class="card" data-card="res.prune">
+    <div class="card wide danger-zone" data-card="res.prune">
       <header><h2>Prune</h2><span class="muted small">POST &hellip;/prune</span></header>
       <div class="row"><label for="pruneH">Horizon</label><input id="pruneH" class="mono" placeholder="revision id" spellcheck="false"></div>
       <div class="row"><label for="pruneKeep">Keep</label><input id="pruneKeep" class="mono" placeholder="comma-separated ids (optional)" spellcheck="false"></div>
       <div class="row"><button id="btnPrune">Prune</button></div>
       <p class="note warn-note">Drops patch sets before the horizon; ids stay. Pick a horizon in History. Pruning may need a <code>*</code> key.</p>
+    </div>
+
+    <div class="card wide danger-zone" data-card="res.purge">
+      <header><h2>Purge</h2><span class="muted small">POST &hellip;/purge</span></header>
+      <div class="row"><button id="btnPurge" class="danger">Purge resource&hellip;</button><label class="check"><input type="checkbox" id="purgeForce"> force=1 (schema in use; needs * key)</label></div>
+      <p class="note warn-note">Uses the If-Match field (head or tombstone). Content is removed for good.</p>
     </div>
   </section>
 
@@ -317,7 +317,7 @@
       <div id="catStatus" class="muted">Load a catalog namespace (the demo stack seeds <code>cat</code>, a tree, <code>topics</code>, a DAG, and <code>drive</code>, a file tree).</div>
     </div>
 
-    <div class="card wide" data-card="cat.tree" data-open>
+    <div class="card" data-card="cat.tree" data-open>
       <header><h2>Tree</h2><span id="catTreeMeta" class="muted small"></span></header>
       <div id="catTree" class="cat-tree"><p class="muted">&mdash;</p></div>
       <p class="note help">Click a node to select it; item names open the item in the Resource tab. <span class="badge info">subject: role</span> chips are the effective roles derived in this browser from <code>$access</code> on the node and its ancestors (&sect;B.11.2); bold ones are assigned on the node itself. <span class="badge">move</span>/<span class="badge">place</span> mark tree powers where a role granting them is assigned (they are never inherited).</p>
@@ -328,18 +328,16 @@
       <div id="catSel" class="muted">Select a node in the tree.</div>
     </div>
 
-    <div class="card" data-card="cat.move">
-      <header><h2>Move / reorder / remove</h2><span class="muted small">PATCH or DELETE /r/{catalog}/{node}</span></header>
-      <div class="row"><label for="catMoveTo">New parent(s)</label><select id="catMoveTo" multiple size="4"></select></div>
-      <div class="row"><label for="catMoveOrder">Order</label><input id="catMoveOrder" class="mono" placeholder="fractional key, e.g. a1V (optional)" spellcheck="false"></div>
-      <div class="row">
-        <button id="catMove" class="primary" title="replace /parents (or only /parents/0/order when the parent stays)">Move</button>
-        <button id="catRemove" class="danger" title="DELETE the node with If-Match: its head">Remove from catalog&hellip;</button>
-      </div>
-      <p class="note help">A move is one write to the moving node, guarded by <code>If-Match</code> (&sect;B.2). Removing a placement leaves the content untouched; removing a folder does not cascade, its children become orphans (&sect;B.7).</p>
+    <div class="card wide" data-card="cat.place">
+      <header><h2>Place item</h2><span class="muted small">PATCH /r/{catalog}/{ns}.{name} &middot; If-None-Match: *</span></header>
+      <div class="row"><label for="catPItem">Item</label><input id="catPItem" class="mono" list="catItemList" placeholder="/r/demo/derby" autocomplete="off" spellcheck="false"><datalist id="catItemList"></datalist></div>
+      <div class="row"><label for="catPParent">Folder</label><select id="catPParent"></select><input id="catPOrder" class="mono" placeholder="order (optional)" spellcheck="false"></div>
+      <textarea id="catPAccess" class="code" rows="2" spellcheck="false" data-json placeholder='optional $access to share this one item, e.g. {"user:li":["reader"]}'></textarea>
+      <div class="row"><button id="catPCreate" class="primary">Place</button></div>
+      <p class="note help">The placement's name is the item, <code>{ns}.{name}</code>, so an item is placed at most once per catalog (&sect;B.2). A placement may name an item that does not exist yet; it is dangling until it does. Placements carry a fresh <code>$nonce</code> (&sect;B.11.4).</p>
     </div>
 
-    <div class="card" data-card="cat.folder">
+    <div class="card wide" data-card="cat.folder">
       <header><h2>New folder</h2><span class="muted small">PATCH /r/{catalog}/{name} &middot; If-None-Match: *</span></header>
       <div class="row"><label for="catFName">Name</label><input id="catFName" class="mono" placeholder="season-2027 (no dot)" autocomplete="off" spellcheck="false"></div>
       <div class="row"><label for="catFTitle">Title</label><input id="catFTitle" placeholder="Season 2027" autocomplete="off"></div>
@@ -348,13 +346,15 @@
       <div class="row"><button id="catFCreate" class="primary">Create folder</button></div>
     </div>
 
-    <div class="card" data-card="cat.place">
-      <header><h2>Place item</h2><span class="muted small">PATCH /r/{catalog}/{ns}.{name} &middot; If-None-Match: *</span></header>
-      <div class="row"><label for="catPItem">Item</label><input id="catPItem" class="mono" list="catItemList" placeholder="/r/demo/derby" autocomplete="off" spellcheck="false"><datalist id="catItemList"></datalist></div>
-      <div class="row"><label for="catPParent">Folder</label><select id="catPParent"></select><input id="catPOrder" class="mono" placeholder="order (optional)" spellcheck="false"></div>
-      <textarea id="catPAccess" class="code" rows="2" spellcheck="false" data-json placeholder='optional $access to share this one item, e.g. {"user:li":["reader"]}'></textarea>
-      <div class="row"><button id="catPCreate" class="primary">Place</button></div>
-      <p class="note help">The placement's name is the item, <code>{ns}.{name}</code>, so an item is placed at most once per catalog (&sect;B.2). A placement may name an item that does not exist yet; it is dangling until it does. Placements carry a fresh <code>$nonce</code> (&sect;B.11.4).</p>
+    <div class="card wide" data-card="cat.move">
+      <header><h2>Move / reorder / remove</h2><span class="muted small">PATCH or DELETE /r/{catalog}/{node}</span></header>
+      <div class="row"><label for="catMoveTo">New parent(s)</label><select id="catMoveTo" multiple size="4"></select></div>
+      <div class="row"><label for="catMoveOrder">Order</label><input id="catMoveOrder" class="mono" placeholder="fractional key, e.g. a1V (optional)" spellcheck="false"></div>
+      <div class="row">
+        <button id="catMove" class="primary" title="replace /parents (or only /parents/0/order when the parent stays)">Move</button>
+        <button id="catRemove" class="danger" title="DELETE the node with If-Match: its head">Remove from catalog&hellip;</button>
+      </div>
+      <p class="note help">A move is one write to the moving node, guarded by <code>If-Match</code> (&sect;B.2). Removing a placement leaves the content untouched; removing a folder does not cascade, its children become orphans (&sect;B.7).</p>
     </div>
 
     <div class="card wide" data-card="cat.out">
@@ -497,14 +497,14 @@
       <p class="note help">The <code>keyring</code> resource holds each epoch key wrapped per recipient (<code>to</code>) in HPKE auth mode under the admin key that wrapped it (<code>from</code>), both by thumbprint; the server only relays it (&sect;E.3.2). An entry opens only with its sender's public key: this identity's, or one remembered here. Rotating leaves out unchecked recipients (revocation) and needs a grant chained to a <code>*</code> key.</p>
     </div>
 
-    <div class="card" data-card="keys.jwe">
+    <div class="card wide" data-card="keys.jwe">
       <header><h2>Decrypt a JWE</h2></header>
       <textarea id="jweIn" class="code" rows="4" spellcheck="false" placeholder="paste a compact JWE (header..iv.ciphertext.tag)"></textarea>
       <div class="row"><input id="jweRes" class="mono" placeholder="resource, for content keys K_r (optional)" spellcheck="false"><button id="jweOpen">Decrypt</button></div>
       <div id="jweOut"></div>
     </div>
 
-    <div class="card" data-card="keys.selftest">
+    <div class="card wide" data-card="keys.selftest">
       <header><h2>Self-test</h2><button id="selfTest" class="tiny">Run</button></header>
       <div id="selfOut" class="muted">Checks this page's HPKE, HKDF, JWE and keyring code against vectors made by the Go implementation (selftest.json).</div>
     </div>

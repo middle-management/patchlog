@@ -519,6 +519,7 @@ function renderNsStatus() {
       S.nsLevel === 'e2e' ? h('button', { class: 'link small', onclick: () => { showTab('keys'); expandCard($('krStatus')); } }, 'keyring →') : null));
   }
   kv.append(h('dt', {}, 'level held'), levelHeldEl(S.ns));
+  kvInline(kv);
   box.className = '';
   box.replaceChildren(
     h('div', { class: 'state-line' }, h('b', {}, S.ns),
@@ -530,6 +531,14 @@ function renderNsStatus() {
     kv,
     S.nsLowered ? h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'level lowered'), '  ' + S.nsLowered) : '',
     S.nsSeal && S.nsSeal.error ? h('div', { class: 'note' }, 'The namespace document is sealed (application/jose). ' + S.nsSeal.error + ' — see the Keys tab.') : '');
+}
+
+/* kvInline lays a dl out as a wrapping row of label/value pairs: each dt with its dd(s) in one div. */
+function kvInline(dl) {
+  const pairs = [];
+  for (const n of [...dl.children]) { if (n.tagName === 'DT') pairs.push(h('div', {})); if (pairs.length) pairs[pairs.length - 1].append(n); }
+  dl.classList.add('inline');
+  dl.replaceChildren(...pairs);
 }
 
 function renderNsDoc() {
@@ -585,6 +594,7 @@ function renderHeads() {
   const tb = $('headsTbl').tBodies[0];
   $('headsMeta').textContent = S.heads.length ? `${S.heads.length} resource(s)` : '';
   $('headsMore').hidden = !S.headsNext;
+  setCardCount(tb, S.heads.length);
   const dl = $('headsList');
   dl.replaceChildren(...S.heads.map((x) => h('option', { value: x.resource })));
   if (!S.heads.length) { tb.replaceChildren(h('tr', {}, h('td', { class: 'empty', colspan: 3 }, S.nsHead ? 'No resources yet.' : '\u2014'))); return; }

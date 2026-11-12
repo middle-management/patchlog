@@ -12,6 +12,8 @@
   on purge and prune stay visible. With no namespace selected the page shows a start panel:
   open a namespace, create one, or run an example. Open cards, the help setting and the
   inspector are remembered in the browser.
+  The content is a centred column; closed cards form one joined list below the open ones, with
+  destructive ones last and marked by a red title; paired cards share a row at equal height.
 
 - **Playground: merge a branch (§F.3).** Each row of the Namespace tab's Branches table has a
   "merge…" button, and a branch offers "Merge into {base}…". The Merge card shows the plan per
