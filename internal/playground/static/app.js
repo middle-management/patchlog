@@ -228,6 +228,7 @@ function renderEntry(e) {
 
   n.replaceChildren(sum, body);
   applyFilter(e);
+  renderStrip(e);
 }
 
 function errBox(e) {
@@ -252,7 +253,7 @@ function errBox(e) {
   }
   const acts = h('div', { class: 'actions', style: 'margin-top:5px' });
   if (typeof j.head === 'string') acts.append(h('button', { class: 'tiny', onclick: () => { setIfMatch(j.head); toast('If-Match set to head'); } }, 'Use head as If-Match'));
-  if (typeof j.config === 'string') acts.append(h('button', { class: 'tiny', onclick: () => { $('nsIfMatch').value = j.config; S.cfgDirty = true; toast('Config If-Match set'); } }, 'Use config as If-Match'));
+  if (typeof j.config === 'string') acts.append(h('button', { class: 'tiny', onclick: () => { $('nsIfMatch').value = j.config; S.cfgDirty = true; expandCard($('nsIfMatch')); toast('Config If-Match set'); } }, 'Use config as If-Match'));
   if (acts.children.length) box.append(acts);
   return box;
 }
@@ -400,6 +401,7 @@ function renderNsSelect() {
   sel.replaceChildren(h('option', { value: '' }, known.length ? '\u2014 select \u2014' : '\u2014 none yet \u2014'),
     ...known.map((n) => h('option', { value: n, selected: n === S.ns }, n)));
   sel.value = S.ns;
+  renderStartKnown();
 }
 
 function resetNsState() {
@@ -482,6 +484,7 @@ async function refreshNS() {
 }
 
 function renderNsAll() {
+  syncStart();
   renderNsStatus(); renderNsDoc(); renderNsLog(); renderHeads(); renderBranches(); undoRefresh();
   if (!S.cfgDirty) $('nsIfMatch').value = S.config || '';
   if (!$('nsPurgeIm').dataset.dirty) $('nsPurgeIm').value = S.nsHead || '';
@@ -493,6 +496,8 @@ function renderNsStatus() {
   if (!S.nsHead) {
     box.className = '';
     const r = S.nsErr;
+    // the message below points at the Create namespace form: open it, once per namespace, with the name filled in
+    if (r && r.status === 404 && UI.createHint !== S.ns) { UI.createHint = S.ns; $('nsNewName').value = S.ns; expandCard($('nsNewName')); }
     box.replaceChildren(h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'badge warn' }, r ? 'not readable / unknown' : 'loading\u2026')),
       r ? h('div', { class: 'muted' }, `GET /ns/${S.ns} answered ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}. Create it with the form, or check Author / Bearer grant (a namespace you cannot read looks the same as one that does not exist).`) : null);
     return;
@@ -511,7 +516,7 @@ function renderNsStatus() {
     const enc = d.encryption || {};
     kv.append(h('dt', {}, 'encryption'), h('dd', {}, `${S.nsLevel}` + (enc.epoch ? `, epoch ${enc.epoch}` : '') + (enc.pad ? ', padded' : ''),
       S.nsSeal ? (S.nsSeal.error ? h('span', { class: 'badge err', title: S.nsSeal.error }, 'document not decrypted') : h('span', { class: 'badge ok', title: 'kid ' + S.nsSeal.kid }, 'decrypted in this browser')) : null,
-      S.nsLevel === 'e2e' ? h('button', { class: 'link small', onclick: () => showTab('keys') }, 'keyring →') : null));
+      S.nsLevel === 'e2e' ? h('button', { class: 'link small', onclick: () => { showTab('keys'); expandCard($('krStatus')); } }, 'keyring →') : null));
   }
   kv.append(h('dt', {}, 'level held'), levelHeldEl(S.ns));
   box.className = '';
@@ -593,6 +598,8 @@ function renderHeads() {
 
 function renderBranches() {
   const tb = $('brTbl').tBodies[0];
+  setCardCount(tb, S.branches.length);
+  if (S.branches.length) openUnlessSet(tb); // rows with open/merge buttons: shown unless the user closed the card
   if (!S.branches.length) { tb.replaceChildren(h('tr', {}, h('td', { class: 'empty', colspan: 6 }, 'No branches.'))); return; }
   tb.replaceChildren(...S.branches.map((b) => h('tr', {},
     h('td', { class: 'mono' }, b.name || (b.remote ? 'remote ' + b.remote : '')),
@@ -624,6 +631,7 @@ async function createNamespace() {
   if (!doc.ok) return toast('Document is not valid JSON');
   const r = await api('PATCH', `/ns/${name}`, { ct: PJ, headers: { 'If-None-Match': '*' }, body: [{ op: 'add', path: '', value: doc.v }] });
   if (r.ok) { toast(`Created ${name}`); await selectNS(name); }
+  return r;
 }
 
 async function applyConfig(patchText) {
@@ -652,7 +660,7 @@ async function createBranch() {
   const pt = $('brPatches').value.trim();
   if (pt) { const p = tryParse(pt); if (!p.ok) return toast('Patches are not valid JSON'); body.patches = p.v; }
   const r = await api('POST', `/ns/${S.ns}/branches`, { headers: { 'If-None-Match': '*' }, body });
-  if (r.ok || r.status === 200) { addKnown(name); toast(`Branch ${name} created`); await refreshNS(); }
+  if (r.ok || r.status === 200) { addKnown(name); toast(`Branch ${name} created`); await refreshNS(); expandCard($('brTbl')); }
 }
 
 /* ------------------------------------------------------------------ *
@@ -663,6 +671,7 @@ function setIfMatch(v) { $('ifMatch').value = v; S.ifDirty = true; }
 
 function openResource(name, tab = 'res') {
   asUser(() => selectRes(name)); showTab(tab);
+  if (tab === 'res') expandCard($('resState'));
 }
 
 async function selectRes(name) {
@@ -739,6 +748,7 @@ function normIf(v) { v = (v || '').trim(); return v ? quoteId(v) : ''; }
 
 async function writeRes(kind) {
   if (!S.ns || !S.res) return toast('Select a namespace and a resource name');
+  expandCard($('resState')); // the write shows there
   let patch = $('patch').value;
   const usesPatch = kind === 'create' || kind === 'append' || (kind === 'restore' && $('restoreEditor').checked);
   if (usesPatch && $('sealE2E').checked && S.res !== 'keyring') return writeSealed(kind, patch);
@@ -901,8 +911,8 @@ async function selectRev(id) {
   const meta = h('div', { class: 'muted small' }, `${entry.author || ''}  ${tsFmt(entry.created)}`,
     entry.gesture ? `  \u00b7 gesture ${entry.gesture}` : '', entry.undoes ? `  \u00b7 undoes ${entry.undoes}` : '');
   const acts = h('div', { class: 'row' },
-    h('button', { class: 'tiny', onclick: () => { setIfMatch(id); toast('If-Match set'); showTab('res'); } }, 'Use as If-Match'),
-    h('button', { class: 'tiny', onclick: () => { $('pruneH').value = id; toast('Prune horizon set'); showTab('res'); } }, 'Use as prune horizon'),
+    h('button', { class: 'tiny', onclick: () => { setIfMatch(id); toast('If-Match set'); showTab('res'); expandCard($('ifMatch')); } }, 'Use as If-Match'),
+    h('button', { class: 'tiny', onclick: () => { $('pruneH').value = id; toast('Prune horizon set'); showTab('res'); expandCard($('pruneH')); } }, 'Use as prune horizon'),
     h('button', { class: 'tiny', onclick: () => copy(id) }, 'Copy id'),
     entry.gesture ? h('button', { class: 'tiny', title: 'undo every revision of gesture ' + entry.gesture + ' (§11.2); the result shows in the Namespace tab', onclick: () => { showTab('ns'); undoAction(entry.gesture, `Undo ${entry.gesture.slice(0, 6)}`); } }, 'Undo this gesture') : null);
   const parts = [head, meta, acts];
@@ -1464,6 +1474,7 @@ function renderUndo() {
 
 function renderUndoOut(label, res) {
   const out = $('undoOut'); out.hidden = false;
+  expandCard(out);
   if (res.ok) {
     out.replaceChildren(h('div', { class: 'seal-box' }, h('div', { class: 'state-line' }, h('span', { class: 'badge ok' }, 'done'), h('b', {}, label),
       h('span', { class: 'muted small' }, `gesture ${res.gesture}, undoes ${res.plan.gesture}` + (res.attempts > 1 ? ` (after ${res.attempts - 1} × 412)` : ''))),
@@ -2458,7 +2469,7 @@ async function attachFile() {
 /* ---- Keys tab ---- */
 function renderIdentity() {
   const box = $('idStatus');
-  $('idDot').hidden = !ID;
+  $('idDot').hidden = !ID; $('moreDot').hidden = !ID;
   if (!ID) { box.className = 'muted'; box.textContent = 'No identity yet: generate one, or import a private key.'; return; }
   box.className = '';
   const jwk = Z.recipientJWK(ID.x);
@@ -2468,7 +2479,7 @@ function renderIdentity() {
   box.replaceChildren(
     h('dl', { class: 'kv' }, h('dt', {}, 'public key'), h('dd', { class: 'mono' }, ID.x), h('dt', {}, 'thumbprint'), h('dd', {}, rid)),
     h('div', { class: 'row' }, h('button', { class: 'tiny', onclick: () => copy(JSON.stringify(jwk), 'public JWK') }, 'Copy public JWK'),
-      h('button', { class: 'tiny', onclick: () => { $('krReader').value = JSON.stringify(jwk); toast('Reader field set'); } }, 'Use as reader below')),
+      h('button', { class: 'tiny', onclick: () => { $('krReader').value = JSON.stringify(jwk); expandCard($('krReader')); toast('Reader field set'); } }, 'Use as reader below')),
     jsonPre(jwk),
     h('details', {}, h('summary', { class: 'muted small' }, 'a read grant that carries it (E2)'),
       h('pre', { class: 'raw' }, `patchlog grant mint -key SEED -block '${JSON.stringify(block)}'`)));
@@ -3179,6 +3190,7 @@ function renderCatStatus() {
   if (!C.ns) { box.className = 'muted'; box.textContent = 'Load a catalog namespace.'; return; }
   if (C.loading) { box.className = 'muted'; box.textContent = `Loading ${C.ns}…`; return; }
   box.className = '';
+  if (C.proxy !== null) markService('cat', !C.proxy, '(tree service not configured)');
   if (!C.head) { box.replaceChildren(h('div', { class: 'errbox' }, C.note || 'not loaded')); return; }
   const kv = h('dl', { class: 'kv' },
     h('dt', {}, 'source'), h('dd', {}, C.source === 'tree' ? h('span', { class: 'badge ok' }, 'tree service via /playground/tree/') : h('span', { class: 'badge warn' }, 'core documents only')),
@@ -3299,10 +3311,11 @@ function renderCatalog() {
 
 function renderCatProblems() {
   const box = $('catProblems');
-  if (!C.head) { box.className = 'muted'; box.textContent = '—'; $('catProbMeta').textContent = ''; return; }
+  if (!C.head) { box.className = 'muted'; box.textContent = '—'; $('catProbMeta').textContent = ''; setCardCount(box, 0); return; }
   box.className = '';
   const lp = localProblems();
-  const line = (label, list, f) => list.length ? h('div', {}, h('b', {}, label + ': '), ...list.map((x, i) => [i ? ', ' : '', f(x)])) : null;
+  let total = 0;
+  const line = (label, list, f) => (total += list.length, list.length) ? h('div', {}, h('b', {}, label + ': '), ...list.map((x, i) => [i ? ', ' : '', f(x)])) : null;
   const nodeLink = (name) => h('button', { class: 'link mono', onclick: () => selectNode(name) }, name);
   const parts = [];
   if (C.problems && C.problems.service && C.problems.body) {
@@ -3321,6 +3334,7 @@ function renderCatProblems() {
   }
   const shown = parts.filter(Boolean);
   box.replaceChildren(...(shown.length ? shown : [h('span', { class: 'muted' }, 'No problems.')]));
+  setCardCount(box, total, 'warn');
 }
 
 function breadcrumbs(name) {
@@ -3442,11 +3456,11 @@ async function showWhere(n) {
     h('details', {}, h('summary', { class: 'muted small' }, 'answer'), jsonPre(r.body)));
 }
 
-function selectNode(name) { C.sel = name; renderCatalog(); }
+function selectNode(name) { C.sel = name; renderCatalog(); expandCard($('catSel')); }
 
 function openItem(ns, name) {
   asUser(async () => { if (S.ns !== ns) await selectNS(ns); await selectRes(name); });
-  showTab('res');
+  showTab('res'); expandCard($('resState'));
 }
 
 /* ---- writes (to the catalog namespace, through the core API) ---- */
@@ -3465,6 +3479,7 @@ function parseAccessField(id) {
 async function catWrite(what, method, name, o) {
   const r = await api(method, `/r/${C.ns}/${name}`, Object.assign({ label: 'catalog' }, o));
   const out = $('catOut');
+  expandCard(out);
   out.className = '';
   out.replaceChildren(
     h('div', { class: 'state-line' }, h('b', {}, what), h('span', { class: 'mono' }, `${method} /r/${C.ns}/${name}`), h('span', { class: 'badge ' + (r.ok ? 'ok' : 'err') }, r.neterr ? 'network error' : `HTTP ${r.status}`),
@@ -3773,6 +3788,8 @@ async function runExampleStep() {
     if (c.showRes && S.res !== c.showRes) await selectRes(c.showRes);
     else if (S.res) await refreshRes();
   } catch (_) { /* views are best effort */ }
+  // what the step changed is in these cards
+  expandCard($('nsStatus')); if (c.showRes) expandCard($('resState'));
   renderExample();
   return X.results[idx];
 }
@@ -3936,6 +3953,7 @@ function srFailure(ns, res) {
 /* runSearch queries the namespace in the page's fields, or fetches the next page of the last result. */
 async function runSearch(more) {
   if (SR.busy) return;
+  expandCard($('srResults'));
   if (SR.proxy === null) await probeIndex();
   renderSrPick();
   if (!SR.proxy) return renderSearch();
@@ -3990,6 +4008,7 @@ function srAddFilter(path, value) {
 
 function renderSearch() {
   const res = $('srResults');
+  if (SR.proxy !== null) markService('sr', !SR.proxy, '(not configured)');
   if (SR.proxy === false) {
     $('srStatus').replaceChildren();
     return srMessage('info', 'Search needs the index service (Addendum A). Start the core with -index-url (compose does) to read it through the same-origin proxy at /playground/index/. Without it there is nothing to query: the core has no search of its own.');
@@ -4063,6 +4082,7 @@ function renderSIFetch() {
   const p = SI.probe, ta = $('siUrls'), note = $('siFetchNote');
   ta.disabled = p === null ? false : !(p && p.fetch);
   if (p === null) { note.textContent = 'Asking the core whether it fetches URLs…'; return; }
+  markService('si', !p, '(not configured)');
   if (!p) { note.textContent = 'The core has no schema import endpoint (this playground is served without it): nothing to plan with.'; $('siPlan').disabled = true; return; }
   $('siPlan').disabled = SI.busy;
   if (!p.fetch) { note.textContent = 'URL fetching is disabled on this server (serve -schema-fetch). Upload or paste schema files instead; $refs between them are resolved by file name.'; return; }
@@ -4125,6 +4145,7 @@ async function siPlan() {
   if (!req.ns) return toast('Pick or type a namespace');
   if (!req.sources.length && !req.files.length) return toast('Give a URL or add a file');
   store.set('pl.siNs', req.ns);
+  expandCard($('siNotes'));
   SI.busy = true; SI.imported = null; renderSIStatus('Planning…');
   const r = await api('POST', SI_URL + 'plan', { body: req, label: 'schema import' });
   SI.busy = false;
@@ -4173,6 +4194,7 @@ function siView(name) {
 async function siImport() {
   const p = SI.plan;
   if (SI.busy || !p || !p.changed || SI.stale || SI.imported) return;
+  expandCard($('siResult'));
   SI.busy = true; renderSIStatus('Writing…');
   const mismatch = [];
   let done = 0, failed = null;
@@ -4223,7 +4245,7 @@ function renderSIResult() {
       h('label', {}, 'New document'), docName,
       h('button', { class: 'tiny primary', title: 'opens the Resource tab with a create patch that sets this $schema', onclick: () => { store.set('pl.siDoc', docName.value.trim()); siNewDoc(p.ns, docName.value.trim(), e.path); } }, 'Start in the Resource editor')));
   });
-  kids.push(h('p', { class: 'note' }, 'A document that names this path in its $schema is validated against it when written (§6.2); the path is a revision, so it never changes under the document.'));
+  kids.push(h('p', { class: 'note help' }, 'A document that names this path in its $schema is validated against it when written (§6.2); the path is a revision, so it never changes under the document.'));
   box.replaceChildren(...kids);
   $('siResultMeta').textContent = SI.imported ? 'written' : 'already in place';
 }
@@ -4236,7 +4258,7 @@ async function siNewDoc(ns, name, path) {
   });
   $('patch').value = fmtPatch([{ op: 'add', path: '', value: { $schema: path } }]);
   $('patch').dispatchEvent(new Event('input'));
-  showTab('res');
+  showTab('res'); expandCard($('patch'));
   toast('Edit the patch, then Create');
 }
 
@@ -4293,6 +4315,7 @@ function mgOpen(branch, base) {
   if (MG.busy) return toast('The merge card is busy');
   if (branch !== MG.branch || (base || '') !== MG.base) mgReset(branch, base || '');
   $('mgCard').hidden = false;
+  expandCard($('mgCard'));
   showTab('ns');
   renderMerge();
   $('mgCard').scrollIntoView({ block: 'start' });
@@ -4450,7 +4473,7 @@ async function mgFreeze() {
 function mgGoto(ns, name) {
   if (!Z.isNamespaceName(ns) || !Z.isResourceName(name)) return toast('Not a resource name (§3.6)');
   asUser(async () => { if (S.ns !== ns) await selectNS(ns); await selectRes(name); });
-  showTab('res');
+  showTab('res'); expandCard($('resState'));
 }
 
 function mgSetText(name, text) {
@@ -4652,10 +4675,194 @@ function initMerge() {
 /* ------------------------------------------------------------------ *
  * tabs and wiring
  * ------------------------------------------------------------------ */
+/* UI state of the page itself: which cards are open (pl.cards, written only when the user toggles one), the
+ * tab shown, and what the inspector strip shows. */
+const UI = { cards: {}, parts: new Map(), tab: 'ns', last: null, errs: 0, createHint: '' };
+const CORE_TABS = ['ns', 'res', 'hist', 'batch', 'live']; // these work on the selected namespace
+const MORE_TABS = { cat: 'Catalog', sr: 'Search', si: 'Schemas', keys: 'Keys' };
+
 function showTab(name) {
-  document.querySelectorAll('.tab').forEach((t) => t.setAttribute('aria-selected', String(t.dataset.tab === name)));
-  document.querySelectorAll('[role=tabpanel]').forEach((p) => { p.hidden = p.id !== 'tab-' + name; });
+  UI.tab = name;
+  // without a namespace the tabs that need one give way to the start panel
+  const start = !S.ns && CORE_TABS.includes(name);
+  document.querySelectorAll('.tab').forEach((t) => t.setAttribute('aria-selected', String(!start && t.dataset.tab === name)));
+  document.querySelectorAll('[role=tabpanel]').forEach((p) => { p.hidden = p.id === 'startPanel' ? !start : start || p.id !== 'tab-' + name; });
+  $('startTab').setAttribute('aria-selected', String(start));
+  const more = !start && MORE_TABS[name];
+  $('moreLabel').textContent = more ? 'More: ' + more : 'More';
+  $('moreBtn').classList.toggle('sel', !!more);
   store.set('pl.tab', name);
+}
+
+/* syncStart shows the start panel in place of the namespace tabs while no namespace is selected. */
+function syncStart() {
+  const none = !S.ns;
+  if (document.body.classList.contains('no-ns') === none) return;
+  document.body.classList.toggle('no-ns', none);
+  $('startTab').hidden = !none;
+  showTab(UI.tab);
+}
+
+function renderStartKnown() {
+  $('startKnown').replaceChildren(...(known.length
+    ? [h('span', {}, 'known here:'), ...known.map((n) => h('button', { class: 'mono', type: 'button', onclick: () => asUser(() => selectNS(n)) }, n))]
+    : [h('span', {}, 'No namespaces known in this browser yet.')]));
+}
+
+function initStart() {
+  const open = () => { const n = $('startNs').value.trim(); if (!n) return toast('Enter a namespace name'); $('startNs').value = ''; asUser(() => selectNS(n)); };
+  $('startOpen').onclick = open;
+  $('startNs').onkeydown = (e) => { if (e.key === 'Enter') open(); };
+  // the same request as the Create namespace card, through its fields
+  const create = async () => {
+    const name = $('startNewName').value.trim(), msg = $('startMsg');
+    msg.hidden = true;
+    if (!name) return toast('Enter a namespace name');
+    $('nsNewName').value = name; $('nsNewDoc').value = $('startNewDoc').value;
+    $('nsNewDoc').dispatchEvent(new Event('input'));
+    const r = await createNamespace();
+    if (r && r.ok) { $('startNewName').value = ''; return; }
+    if (!r) return;
+    msg.hidden = false;
+    msg.replaceChildren(h('div', { class: 'errbox' }, h('span', { class: 'code' }, r.neterr ? 'network error' : 'HTTP ' + r.status), '  ' + (r.neterr || errSummary(r.entry))));
+  };
+  $('startCreate').onclick = create;
+  $('startNewName').onkeydown = (e) => { if (e.key === 'Enter') create(); };
+  $('startEx').replaceChildren(...EXAMPLES.map((ex) => h('button', { type: 'button', title: ex.desc, onclick: () => startExample(ex) }, `(${ex.id}) ${ex.title}`)));
+  $('startTab').onclick = () => showTab('ns');
+}
+
+/* The More menu holds the tabs of the services beside the core. */
+function initTabMenu() {
+  const btn = $('moreBtn'), menu = $('moreMenu');
+  const items = () => [...menu.querySelectorAll('.tab')];
+  const close = (focus) => { if (menu.hidden) return; menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); if (focus) btn.focus(); };
+  const open = () => {
+    menu.hidden = false; btn.setAttribute('aria-expanded', 'true');
+    menu.classList.remove('flip');
+    menu.classList.toggle('flip', menu.getBoundingClientRect().right > document.documentElement.clientWidth - 8);
+  };
+  btn.onclick = () => (menu.hidden ? open() : close());
+  btn.onkeydown = (e) => { if (e.key === 'ArrowDown') { e.preventDefault(); open(); items()[0].focus(); } };
+  menu.onkeydown = (e) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    e.preventDefault();
+    const all = items(), i = all.indexOf(document.activeElement);
+    all[(i + (e.key === 'ArrowDown' ? 1 : all.length - 1)) % all.length].focus();
+  };
+  menu.addEventListener('click', (e) => { if (e.target.closest('.tab')) close(true); });
+  // capture: some handlers on the page stop their clicks from bubbling
+  document.addEventListener('click', (e) => { if (!menu.contains(e.target) && !btn.contains(e.target)) close(); }, true);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(menu.contains(document.activeElement) || document.activeElement === btn); });
+}
+
+/* markService notes in the More menu that the service behind a tab isn't offered here; the tab stays, it says why. */
+function markService(tab, missing, text) {
+  const t = document.querySelector(`.tab[data-tab="${tab}"]`), s = t.querySelector('.svc');
+  t.classList.toggle('unavail', !!missing);
+  s.hidden = !missing; s.textContent = missing ? text : '';
+}
+
+/* ---- cards: collapsed to their header line, notes behind "?" ---- */
+function setCardOpen(card, open, persist) {
+  const c = UI.parts.get(card); if (!c) return;
+  c.body.hidden = !open;
+  card.classList.toggle('collapsed', !open);
+  c.toggle.setAttribute('aria-expanded', String(open));
+  if (persist) { UI.cards[card.dataset.card] = open; store.set('pl.cards', UI.cards); }
+}
+/* expandCard opens the card around el, for code that shows a result in it or sends the user to it. The stored
+ * choice stays as it was. */
+function expandCard(el) {
+  const card = el && el.closest('.card');
+  if (card && card.classList.contains('collapsed')) setCardOpen(card, true, false);
+}
+/* openUnlessSet opens a card whose content is now worth showing, unless the user has opened or closed it before. */
+function openUnlessSet(el) {
+  const card = el && el.closest('.card');
+  if (card && !(card.dataset.card in UI.cards)) expandCard(card);
+}
+function setCardCount(el, n, cls) {
+  const c = UI.parts.get(el && el.closest('.card')); if (!c) return;
+  c.count.hidden = !n; c.count.textContent = n || '';
+  c.count.className = 'badge card-count' + (cls && n ? ' ' + cls : '');
+}
+function setCardHelp(card, on) {
+  const c = UI.parts.get(card); if (!c || !c.help) return;
+  card.classList.toggle('show-help', on);
+  c.help.setAttribute('aria-expanded', String(on));
+}
+
+function initCards() {
+  const saved = store.get('pl.cards', {});
+  UI.cards = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+  document.querySelectorAll('.card[data-card]').forEach((card) => {
+    const head = card.querySelector(':scope > header'), h2 = head && head.querySelector('h2');
+    if (!h2) return;
+    const key = card.dataset.card;
+    const body = h('div', { class: 'card-body', id: 'card-' + key.replace(/\W/g, '-') });
+    body.append(...[...card.childNodes].filter((n) => n !== head));
+    card.append(body);
+    const toggle = h('button', { type: 'button', class: 'card-toggle', 'aria-expanded': 'true', 'aria-controls': body.id },
+      h('span', { class: 'chev', 'aria-hidden': 'true' }), h2.textContent);
+    const count = h('span', { class: 'badge card-count', hidden: true });
+    h2.replaceChildren(toggle, count);
+    const notes = [...body.querySelectorAll('.note.help')];
+    notes.forEach((n, i) => { if (!n.id) n.id = body.id + '-help' + (i + 1); });
+    const help = notes.length || card.hasAttribute('data-help')
+      ? h('button', { type: 'button', class: 'card-help', 'aria-expanded': 'false', 'aria-controls': notes.map((n) => n.id).join(' ') || body.id, title: 'About this card', 'aria-label': 'About this card' }, '?')
+      : null;
+    if (help) head.append(help);
+    UI.parts.set(card, { body, toggle, count, help });
+    head.addEventListener('click', (e) => {
+      const ctl = e.target.closest('button, a, input, select, textarea, label, .id');
+      if (help && ctl === help) {
+        setCardHelp(card, !card.classList.contains('show-help'));
+        return;
+      }
+      // another control in the header does its own thing; what a button shows is in the body
+      if (ctl && ctl !== toggle && head.contains(ctl)) { if (ctl.tagName === 'BUTTON') expandCard(card); return; }
+      setCardOpen(card, body.hidden, true);
+    });
+    setCardOpen(card, key in UI.cards ? !!UI.cards[key] : card.hasAttribute('data-open'), false);
+  });
+  const all = (on) => { document.body.classList.toggle('help-all', on); $('helpAll').setAttribute('aria-pressed', String(on)); };
+  $('helpAll').onclick = () => { const on = !document.body.classList.contains('help-all'); all(on); store.set('pl.helpAll', on); };
+  all(!!store.get('pl.helpAll', false));
+}
+
+/* ---- inspector: closed to a strip that shows the last request ---- */
+function setInspOpen(open, persist) {
+  document.body.classList.toggle('insp-off', !open);
+  $('inspToggle').setAttribute('aria-expanded', String(open));
+  $('inspFloat').setAttribute('aria-expanded', String(open));
+  if (open) { UI.errs = 0; renderStripErrs(); }
+  if (persist) store.set('pl.inspOpen', open);
+}
+function renderStripErrs() {
+  $('stripErrs').hidden = !UI.errs; $('stripErrs').textContent = UI.errs === 1 ? '1 error' : UI.errs + ' errors';
+  $('inspCount').classList.toggle('err', UI.errs > 0);
+}
+/* renderStrip keeps the closed inspector's strip at the last request the user made (a background read shows only
+ * until there is one), and marks it when that request failed. Called for each entry as it starts and ends. */
+function renderStrip(e) {
+  $('stripCount').textContent = insp.entries.length;
+  if (!e) {
+    UI.last = null; UI.errs = 0; renderStripErrs();
+    $('stripPill').className = 'pill pend'; $('stripPill').textContent = '—';
+    $('stripMeth').textContent = ''; $('stripPath').textContent = 'no requests yet'; $('stripErr').textContent = '';
+    $('inspFloat').classList.remove('err');
+    return;
+  }
+  const failed = !e.auto && (!!e.neterr || (e.status != null && e.status >= 400));
+  if (failed && !e.counted && document.body.classList.contains('insp-off')) { e.counted = true; UI.errs++; renderStripErrs(); }
+  if (e.auto && UI.last && !UI.last.auto && UI.last !== e) return;
+  UI.last = e;
+  $('stripPill').className = 'pill ' + statusClass(e);
+  $('stripPill').textContent = e.neterr ? 'ERR' : e.sse ? 'live' : e.status == null ? '…' : e.status;
+  $('stripMeth').textContent = e.method; $('stripPath').textContent = e.path;
+  $('stripErr').textContent = failed ? (e.neterr ? 'network error: ' + e.neterr : errSummary(e)) : '';
+  $('inspFloat').classList.toggle('err', failed);
 }
 
 /* jsonHint is the line under a JSON textarea that says whether its text parses, kept current as it is typed. */
@@ -4676,9 +4883,9 @@ function bindJSONHints() {
 }
 
 function bindInspector() {
-  $('inspToggle').onclick = () => { document.body.classList.toggle('insp-off'); store.set('pl.inspOff', document.body.classList.contains('insp-off')); };
-  $('inspFloat').onclick = () => { document.body.classList.remove('insp-off'); store.set('pl.inspOff', false); };
-  $('inspClear').onclick = () => { insp.entries.splice(0).forEach((e) => e.node && e.node.remove()); $('inspCount').textContent = '0'; updateHidden(); };
+  $('inspToggle').onclick = () => setInspOpen(document.body.classList.contains('insp-off'), true);
+  $('inspFloat').onclick = () => { setInspOpen(true, true); $('inspector').scrollIntoView({ block: 'nearest' }); };
+  $('inspClear').onclick = () => { insp.entries.splice(0).forEach((e) => e.node && e.node.remove()); $('inspCount').textContent = '0'; updateHidden(); renderStrip(null); };
   let expanded = false;
   $('inspExpand').onclick = () => { expanded = !expanded; insp.entries.forEach((e) => { if (e.node) e.node.open = expanded; }); $('inspExpand').textContent = expanded ? 'Collapse' : 'Expand'; };
   document.querySelectorAll('.seg button').forEach((b) => {
@@ -4692,15 +4899,18 @@ function bindInspector() {
   insp.showAuto = !!store.get('pl.showAuto', false); $('inspAuto').checked = insp.showAuto;
   $('inspQ').oninput = (e) => { insp.q = e.target.value.trim().toLowerCase(); insp.entries.forEach(applyFilter); };
   $('inspList').append(h('div', { class: 'insp-empty' }, 'Requests the playground makes will show up here.'));
-  if (store.get('pl.inspOff', false)) document.body.classList.add('insp-off');
+  setInspOpen(!!store.get('pl.inspOpen', false), false); // closed unless the user opened it
 }
 
 function init() {
   loadKnown();
+  initCards();
   bindInspector();
   bindJSONHints();
   initConn();
   initExamples();
+  initStart();
+  initTabMenu();
 
   document.querySelectorAll('.tab').forEach((t) => { t.onclick = () => showTab(t.dataset.tab); });
 
@@ -4810,10 +5020,11 @@ function init() {
 
   // catalog
   $('catNs').value = store.get('pl.catNs', 'cat');
-  $('catLoad').onclick = () => asUser(() => loadCatalog());
-  $('catNs').onkeydown = (e) => { if (e.key === 'Enter') asUser(() => loadCatalog()); };
+  const catLoad = () => { expandCard($('catTree')); return asUser(() => loadCatalog()); };
+  $('catLoad').onclick = catLoad;
+  $('catNs').onkeydown = (e) => { if (e.key === 'Enter') catLoad(); };
   $('catRefresh').onclick = () => asUser(() => { C.proxy = null; C.catalogs = null; return loadCatalog(); });
-  $('catPick').onchange = () => { const v = $('catPick').value; if (v) { $('catNs').value = v; asUser(() => loadCatalog()); } };
+  $('catPick').onchange = () => { const v = $('catPick').value; if (v) { $('catNs').value = v; catLoad(); } };
   $('catFCreate').onclick = catCreateFolder;
   $('catPCreate').onclick = catPlace;
   $('catMove').onclick = catMove;

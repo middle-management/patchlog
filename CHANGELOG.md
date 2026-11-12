@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Playground: less on screen at once.** Cards collapse: each tab opens with its one or two
+  main cards (Namespace: status and document; Resource: document and patch) and the rest as
+  header lines that open on click, with Branches and Problems showing a count. A flow that leads
+  into a closed card opens it. Catalog, Search, Schemas and Keys are under a **More** menu,
+  which marks a service the deployment doesn't have as not configured. The request inspector
+  starts closed, as a strip at the bottom with the last request and its status, red after a
+  failed request. Explanatory notes are behind a "?" per card, or "Show all help"; the warnings
+  on purge and prune stay visible. With no namespace selected the page shows a start panel:
+  open a namespace, create one, or run an example. Open cards, the help setting and the
+  inspector are remembered in the browser.
+
 - **Playground: merge a branch (§F.3).** Each row of the Namespace tab's Branches table has a
   "merge…" button, and a branch offers "Merge into {base}…". The Merge card shows the plan per
   resource (class, status, steps, conflicts with their paths), takes a resolution for each

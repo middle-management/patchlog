@@ -131,12 +131,20 @@ button.tiny { padding: 1px 6px; font-size: 11.5px; }
 .layout { display: grid; grid-template-columns: minmax(0, 1fr); }
 .main { min-width: 0; padding: 0 16px 24px; }
 .tabs { display: flex; gap: 2px; flex-wrap: wrap; border-bottom: 1px solid var(--border); margin: 10px 0 12px; }
-.tab {
+.tab, .start-tab, .more-btn {
   border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none;
   padding: 6px 12px; color: var(--muted); font-weight: 600;
 }
-.tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
-.tab .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); margin-left: 5px; }
+.tab[aria-selected="true"], .start-tab[aria-selected="true"], .more-btn.sel { color: var(--text); border-bottom-color: var(--accent); }
+/* without a namespace the tabs that work on one are replaced by Start */
+body.no-ns .tabs > .tab { display: none; }
+.tab-more .menu-list { left: 0; right: auto; width: max-content; min-width: 190px; max-width: 92vw; }
+.tab-more .menu-list.flip { left: auto; right: 0; }
+.menu-list .tab { color: var(--text); font-weight: 500; }
+.menu-list .tab[aria-selected="true"] { background: var(--info-bg); color: var(--info); font-weight: 600; }
+.menu-list .tab.unavail { color: var(--muted); }
+.menu-list .tab.unavail[aria-selected="true"] { color: var(--info); }
+.tab .dot, .more-btn .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); margin-left: 5px; }
 
 .inspector { min-width: 0; border-top: 1px solid var(--border); background: var(--surface); }
 @media (min-width: 1040px) {
@@ -148,12 +156,43 @@ button.tiny { padding: 1px 6px; font-size: 11.5px; }
 }
 body.insp-off .inspector { display: none; }
 
+/* ---- start panel (no namespace selected) -------------------------- */
+.start { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px 16px; }
+.start-head { display: flex; flex-wrap: wrap; gap: 2px 12px; align-items: baseline; margin-bottom: 12px; }
+.start-head h2 { font-size: 15px; }
+.start-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr)); align-items: start; }
+.start-opt { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; background: var(--surface-2); min-width: 0; }
+.start-opt h3 { margin-bottom: 6px; }
+.start-opt .row input { flex: 1 1 130px; }
+.start-opt details { margin-top: 6px; }
+.start-opt details > summary { cursor: pointer; }
+.start-opt textarea { margin-top: 4px; }
+#startKnown { max-height: 116px; overflow: auto; }
+.start-ex { display: grid; gap: 4px; }
+.start-ex button { text-align: left; white-space: normal; background: var(--surface); }
+.start-msg { margin-top: 8px; overflow-wrap: anywhere; }
+
 /* ---- cards ------------------------------------------------------- */
 .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); align-items: start; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; min-width: 0; }
 .card.wide { grid-column: 1 / -1; }
-.card > header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
-.card > header h2 { flex: 1 1 auto; }
+.card > header { display: flex; align-items: center; gap: 4px 8px; margin-bottom: 8px; flex-wrap: wrap; cursor: pointer; }
+.card > header h2 { flex: 1 1 auto; display: flex; align-items: center; gap: 8px; }
+/* a card closes to its header line: the title button, the count and the endpoint */
+.card.collapsed > header { margin-bottom: 0; }
+.card.collapsed { background: color-mix(in srgb, var(--surface) 55%, var(--bg)); }
+.card-toggle { display: inline-flex; align-items: center; gap: 6px; border: 0; background: none; padding: 1px 2px; margin: -1px -2px; font-weight: 600; white-space: normal; text-align: left; }
+.card-toggle .chev { flex: 0 0 10px; width: 10px; color: var(--muted); font-size: 11px; line-height: 1; }
+.card-toggle .chev::before { content: "\25B8"; }
+.card-toggle[aria-expanded="true"] .chev::before { content: "\25BE"; }
+.card > header:hover .card-toggle .chev { color: var(--accent); }
+.card-help { flex: 0 0 auto; width: 18px; height: 18px; padding: 0; border-radius: 50%; font-size: 11px; font-weight: 600; line-height: 1; color: var(--muted); }
+.card-help[aria-expanded="true"] { background: var(--info-bg); color: var(--info); border-color: transparent; }
+/* explanatory notes show per card ("?") or everywhere (Help in the top bar); warnings always */
+body:not(.help-all) .card:not(.show-help) .note.help { display: none; }
+body.help-all .card-help, .card.collapsed .card-help { display: none; }
+.help-all { margin-left: auto; align-self: center; color: var(--muted); }
+#helpAll[aria-pressed="true"] { background: var(--info-bg); color: var(--info); border-color: transparent; }
 .card.danger-zone { border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
 .row { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin: 6px 0; }
 .row > label { color: var(--muted); }
@@ -165,6 +204,7 @@ body.insp-off .inspector { display: none; }
 .hint.bad { color: var(--err); }
 .hint.good { color: var(--ok); }
 .note { color: var(--muted); font-size: 11.5px; margin: 4px 0 0; }
+.note.warn-note { color: var(--warn); }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 10px; align-items: baseline; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
@@ -283,11 +323,27 @@ tr.tomb td:first-child { box-shadow: inset 3px 0 0 var(--tomb); }
 .errbox th { background: transparent; position: static; }
 .redir { color: var(--info); font-size: 11.5px; overflow-wrap: anywhere; }
 .insp-empty { padding: 18px 14px; color: var(--muted); }
-.floating-insp { position: fixed; right: 12px; bottom: 12px; z-index: 20; box-shadow: 0 4px 16px rgb(0 0 0 / .25); display: none; }
-body.insp-off .floating-insp { display: block; }
+/* closed, the inspector is a strip along the bottom: the last request, and red when it failed */
+.insp-strip {
+  display: none; position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; width: 100%; min-width: 0;
+  align-items: center; gap: 8px; padding: 5px 16px; text-align: left;
+  border: 0; border-top: 1px solid var(--border); border-radius: 0; background: var(--surface-2);
+}
+body.insp-off .insp-strip { display: flex; }
+body.insp-off .main { padding-bottom: 56px; }
+.insp-strip:hover:not(:disabled) { border-color: var(--accent); }
+.insp-strip-title { font-weight: 600; color: var(--muted); }
+.insp-strip .path { flex: 1 1 60px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.insp-strip .strip-err { flex: 0 1 auto; min-width: 0; max-width: 50%; color: var(--err); font-weight: 600; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.insp-strip .strip-err:empty { display: none; }
+.insp-strip.err { background: var(--err-bg); border-top-color: var(--err); box-shadow: inset 4px 0 0 var(--err); }
+@media (min-width: 1040px) {
+  .insp-strip { position: static; flex: 0 0 auto; }
+  body.insp-off .main { padding-bottom: 24px; }
+}
 
 .toast {
-  position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 50;
+  position: fixed; left: 50%; bottom: 46px; transform: translateX(-50%); z-index: 50;
   background: var(--text); color: var(--bg); padding: 6px 12px; border-radius: 6px; font-size: 12px; max-width: 90vw;
 }
 
@@ -316,7 +372,7 @@ ul.cat-tree ul { margin-left: 11px; padding-left: 12px; border-left: 1px dashed 
 @media (max-width: 640px) {
   .conn input { width: 120px; }
   .ctx input, #resName { width: 130px; }
-  .top, .ctx, .main { padding-left: 12px; padding-right: 12px; }
+  .insp-strip-title { display: none; }
   .example li { grid-template-columns: 18px 1fr; }
   .example li .res { grid-column: 2; text-align: left; }
 }

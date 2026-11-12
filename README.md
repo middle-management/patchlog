@@ -1079,7 +1079,16 @@ stderr.
 `serve` also hosts a web playground at **`/playground/`** (turn it off with `-playground=false`).
 It is plain HTML/JS embedded in the binary and talks to the same-origin API; against a `-dev`
 server its writes carry the author box's name as `X-Author`, or `anonymous` until it is filled,
-since a write without one is `400` (§7.2). It has:
+since a write without one is `400` (§7.2).
+
+The page shows little until asked. With no namespace selected it is a start panel (open a
+namespace, create one, run an example). Each tab opens with its main cards and the others
+collapsed to a header; click a header to open it, and a flow that needs a closed card opens it.
+Namespace, Resource, History, Batch and Live are tabs; Catalog, Search, Schemas and Keys are
+under **More**. The request inspector is a strip at the bottom with the last request, which
+turns red after a failed one; click it, or "Inspector" in the top bar, for the full list. A "?"
+in a card's header shows its explanation, and "Show all help" shows them all. These choices are
+kept in the browser's localStorage. It has:
 
 - a request inspector with every request's preconditions, status, response headers and error body, plus "copy as curl";
 - namespace, resource, history, batch and branch editors, and a **Merge** card that plans, resolves and submits a branch's merge (§F.3, below);
