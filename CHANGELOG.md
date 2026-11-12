@@ -37,7 +37,7 @@
   [docs/CAPACITY.md](docs/CAPACITY.md) has the results: the earlier large-document figures were
   for long strings without a schema; small typed values cost about ten times more (58 ms an
   append at 1 MiB, 225 ms at 3.5 MiB), and one document takes about 10 writes a second per
-  principal, the per-resource rate.
+  principal, the per-resource rate, and about that in all when several writers contend.
 - **`serve -max-rate-per-resource` and `-max-rate-per-principal`** (`RATE,BURST`) raise the
   deployment maximums of `ratePerResource` and `ratePerPrincipal`, which were fixed at the
   defaults, so a namespace's `limits` can allow more on small documents that one writer writes
@@ -46,6 +46,15 @@
   the same document get less in total, not more. `capacity -single-rate N` measures it.
   SPEC-FEEDBACK notes 89 and 90 ask about the per-resource rate under an allowance and about a
   `412` drawing a token.
+- **`client.AppendLatest`** appends to a document other writers are appending to: after a `412`
+  it retries on the head the refusal names, without reading it again, after a random wait that
+  grows with each loss in a row (2 ms to 16 ms by default); after a `429` it waits the
+  `Retry-After` and reads the head again. With the rate lifted it took 8 writers on one document
+  from 600 to 1,000 appends a second on SQLite and from 84% to 44% of attempts lost; at 32
+  writers, and on Postgres, most attempts are still lost, and it doesn't make a document fair
+  between writers that never pause. At the default limits a contended document takes about 10
+  writes a second in all, whatever the retry. SPEC-FEEDBACK note 91 proposes an append the
+  server may rebase when the writes in between don't overlap.
 
 
 ## v0.28.0

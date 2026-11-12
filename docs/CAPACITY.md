@@ -197,41 +197,63 @@ document well under 100 KiB if its appends should stay under 10 ms.
 
 ## Writes to one document
 
-Same run, a document of about 500 bytes in a namespace with the default limits.
+Same host and day, a document of about 500 bytes. Each writer is a principal of its own that
+appends in a loop for 15 seconds without pausing, with `If-Match` on the head it last saw, and
+shares nothing with the others. Two ways of retrying:
 
-**At the default limits the per-resource rate is the ceiling.** §6.6 allows 10 writes a second
-(burst 20) per resource and principal, and an allowance doesn't lift it (§6.6). Writers append with `If-Match` on the head they last saw, re-read the
-head after a `412` and wait 100 ms after a `429`, for 15 seconds:
+- **at once**: after a `412` read the head again and retry; after a `429` wait 100 ms.
+- **backoff**: the client's `AppendLatest`: after a `412` take the head from the refusal's body
+  and wait a random time under a ceiling that doubles with each loss in a row (2 ms to 16 ms);
+  after a `429` wait its `Retry-After` and read the head again.
 
-| Principals writing one document | Appends/s (SQLite / Postgres) | Attempts answered `412` | Attempts answered `429` | One write, retries included: p50 / p95 / p99 (SQLite) |
-|---|---|---|---|---|
-| 1 | 11 / 11 | 0 | 46% / 45% | 102 / 104 / 113 ms |
-| 8 | 23 / 18 | 40% / 45% | 46% / 45% | 103 ms / 1.6 s / 2.4 s |
-| 32 | 91 / 70 | 40% / 45% | 46% / 44% | 103 ms / 1.3 s / 2.3 s |
+**At the default limits** the per-resource rate is the ceiling: §6.6 allows 10 writes a second
+(burst 20) per resource and principal, and an allowance doesn't lift it.
 
-- One principal gets its 10/s and no more; the 102 ms median is the wait for the next token.
-- More principals get more in total, since each has a bucket of its own, but far less than
-  10/s each (2.8/s each at 8 and at 32): most attempts lose the race for the head or find the
-  bucket empty. The tail is seconds.
-- A write refused with `412` has still drawn its tokens (the buckets are drawn before the
-  precondition is compared), which is why contending writers get so little of their rate.
+| Writers | Retry | Appends/s (SQLite / Postgres) | Attempts `412` | Attempts `429` | Fewest and most appends by one writer (SQLite) |
+|---|---|---|---|---|---|
+| 1 | | 11 / 11 | 0 | 46% | |
+| 8 | at once | 12 / 12 | 46% | 46% | 8 and 47 |
+| 8 | backoff | 16 / 13 | 43% | 46% | 24 and 46 |
+| 32 | at once | 14 / 14 | 51% | 46% | 0 and 40 |
+| 32 | backoff | 28 / 19 | 49% | 46% | 4 and 36 |
+
+- **The document takes about one writer's rate however many write it.** Each principal has a
+  bucket of its own, but a write refused with `412` has still drawn its tokens (the buckets are
+  drawn before the precondition is compared), and a writer that waited for a token usually
+  holds a stale head by then. So 8 writers together do 12 a second, and 32 do 14.
+- The backoff helps a little (up to twice the appends at 32 writers) and spreads them more
+  evenly, but about half the attempts are still `412`s: the rate, not the retry policy, decides.
 
 **With the rate lifted** (`serve -max-rate-per-resource 1e6,1e6 -max-rate-per-principal 1e6,1e6`
-and a namespace whose `limits` set both that high; `capacity -single-rate 1000000`), no request
-was rate limited and the core and the database set the pace:
+and a namespace whose `limits` set both that high; `capacity -single-rate 1000000`) nothing is
+rate limited and the core and the database set the pace:
 
-| Principals writing one document | Appends/s (SQLite / Postgres) | Attempts answered `412` | One write, retries included: p50 / p95 / p99 (SQLite) |
-|---|---|---|---|
-| 1 | 1,040 / 270 | 0 | 0.8 / 1.2 / 11 ms |
-| 8 | 560 / 150 | 84% / 87% | 1.8 / 73 / 140 ms |
-| 32 | 240 / 80 | 95% / 96% | 18 / 580 / 990 ms |
+| Writers | Retry | Appends/s (SQLite / Postgres) | Attempts `412` (SQLite / Postgres) | One write, retries included, p50 / p95 / p99 (SQLite) | Fewest and most appends by one writer (SQLite / Postgres) |
+|---|---|---|---|---|---|
+| 1 | | 1,130 / 295 | 0 | 0.7 / 1.1 / 9.7 ms | |
+| 8 | at once | 600 / 175 | 84% / 86% | 1.7 / 72 / 128 ms | 1,025 and 1,244 / 231 and 447 |
+| 8 | backoff | 1,000 / 284 | 44% / 70% | 0.8 / 1.4 / 227 ms | 1,517 and 2,299 / 0 and 1,591 |
+| 32 | at once | 236 / 87 | 95% / 96% | 19 / 580 / 947 ms | 62 and 152 / 19 and 59 |
+| 32 | backoff | 764 / 128 | 81% / 95% | 1.0 / 3.5 ms / 1.4 s | 105 and 630 / 0 and 175 |
 
-- **One writer in a loop does about 1,000 appends a second on SQLite and 270 on Postgres** to a
-  small document: about a hundred times the default rate on SQLite.
+- **One writer in a loop does about 1,100 appends a second on SQLite and 300 on Postgres** to a
+  small document, about a hundred times the default rate on SQLite.
 - **More writers make it slower, not faster.** Every append needs the head the last one made, so
-  the writers queue behind one another whatever the server does, and with a plain retry most of
-  their requests are wasted `412`s: 8 writers get half of what one does, 32 a quarter. A hot
-  document wants one writer (or a queue in front of it), not more of them.
+  the writers queue behind one another whatever the server does. Retrying at once, 8 writers
+  get half of what one does and 32 a fifth, with 84–96% of their requests wasted.
+- **Backing off recovers most of the throughput**: on SQLite 8 writers do 1,000 a second with
+  44% of attempts lost, and 32 do 764. It doesn't make the document fair: the writer that just
+  won holds the newest head and waits for nothing, so it tends to win again, and on Postgres,
+  where a write takes longer than the backoff's ceiling spreads the losers, some writers got no
+  append in at all in 15 seconds. A longer ceiling loses fewer requests and is less fair still
+  (at 250 ms one of 8 writers did more than half the appends and another none).
+- These writers never pause, the worst case. Writers with time between their writes collide
+  less in proportion.
+
+What the retry policy can't change is that a lost race costs a whole request. The remedies are
+structural: one writer per document (or a queue in front of it), a writer's changes collected
+into batch steps (below), or an append the server may rebase when the writes in between don't
+overlap its own (docs/SPEC-FEEDBACK.md, v0.82 Open 91).
 
 **A batch writes many steps to one document at once** (§7.5: one item, many steps, one token):
 
@@ -253,12 +275,13 @@ nothing scans the history, not what a cold read of an old revision costs (the en
 reads of old revisions" row does).
 
 So a document that many parties write often (a counter, a shared list, a presence record) is the
-wrong shape: at the default limits it is rate limited at ~10 writes a second per writer, and at
-any limits several writers waste most of their attempts. Give each writer a document of its own,
-or collect a writer's changes into batch steps. Where one writer does need more than 10 writes a
-second on a small document, raise the deployment maximum (`serve -max-rate-per-resource`) and
-set `ratePerResource` in that namespace's `limits`; leave it at the default where documents are
-large, since a typed 1 MiB document already costs ~60 ms of CPU an append (above).
+wrong shape: at the default limits it takes about 10 writes a second in all, and at any limits
+several writers waste most of their attempts. Give each writer a document of its own, or collect
+a writer's changes into batch steps. Where one writer does need more than 10 writes a second on
+a small document, raise the deployment maximum (`serve -max-rate-per-resource`) and set
+`ratePerResource` in that namespace's `limits`; leave it at the default where documents are
+large, since a typed 1 MiB document already costs ~60 ms of CPU an append (above). Clients that
+do share a document should retry with `AppendLatest` or its like, not at once.
 
 ## Recommended changes to limits
 

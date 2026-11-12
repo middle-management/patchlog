@@ -16,10 +16,10 @@ implementers' and reviewers' notes are merged here, each case once. Notes from v
 leaves open are carried in place, by subject, marked "was v0.81 Open n" and cut to what
 remains. The order is: sealed forms and end-to-end reads (1–31), access and coverage (32–65),
 tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87), index (88),
-rates (89–90, from capacity measurements after the v0.82 work).
+rates and contended writes (89–91, from capacity measurements after the v0.82 work).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
-90 are open: 60 from this version's work and 30 carried.
+91 are open: 61 from this version's work and 30 carried.
 
 The spec's own question to the reference, "what is a shadow?", is answered under "Settled in
 v0.82" (v0.81 Open 24).
@@ -500,12 +500,35 @@ v0.82" (v0.81 Open 24).
 90. **A `412` draws a token** (§6.2, §6.6). The reference draws a write's tokens before it
     compares the precondition, so a write that fails `412` (or `410`) has spent one from the
     resource's, the principal's and the namespace's buckets. With 8 principals appending to one
-    document at the default rates, 40–45% of attempts were `412` and about as many `429`: each
-    principal got 2.8 writes a second of its 10 (docs/CAPACITY.md, "Writes to one document").
+    document at the default rates, about 45% of attempts were `412` and as many `429`, and the
+    8 together got 12 writes a second where each is allowed 10 (docs/CAPACITY.md, "Writes to
+    one document").
     §7 says rate limits "come last, only for requests that passed the rest", which reads as the
     authorisation checks. *Question:* does a request refused at step 2 (`412`, `410`, `428`,
     `409` frozen) draw tokens? Drawing protects the server from retry storms; not drawing gives
     contending writers their full rate.
+91. **A proposal: an append the server may rebase** (§7.2, §6.4.1, TOOLS §F.3, §11.2). Every
+    write names the head it was made on, so writers of one document queue behind one another,
+    and a lost race costs a whole request: with the rate lifted, 8 writers retrying at once lost
+    84% of their attempts and 32 lost 95%; a client-side backoff brings that to 44% and 81% at
+    best, and can't make it fair. Most such writers don't conflict in substance: they add to
+    different members or append to an array. The text already has the test for that, for
+    merges and for undo: two sides conflict when their `writes` overlap, an array index
+    counting as its whole outermost array. *Proposal:* a write may carry, beside `If-Match:
+    "{base}"`, a request to rebase (a header, or a step member in a batch). Where the head is
+    no longer `base`, the server applies the patch set to the current head if `base` is an
+    ancestor of it, the `writes` of the revisions after `base` don't overlap the patch set's
+    own (its `test` ops and `copy` sources counted), and the result passes every check of §6.2
+    as any write does; otherwise `412` as now. The revision's parent is the head it was
+    applied on, so its id differs from what the client predicted, and the answer says so
+    (the new head, and the revisions it was applied over). It is opt-in per write, so a client
+    that needs "exactly this document" keeps plain `If-Match`. Open points: array appends
+    (`/-`) overlap under the merge rule and are the commonest case, so they may want a rule of
+    their own; a signed step binds its parent (§C.3.1), so a signed write can't be rebased by
+    the server; at E3 the server can't read the `writes`; and the cost of reading the
+    intervening revisions' `writes` should be bounded (a limit on how far behind `base` may
+    be). *Question:* is this in scope, or is contention on one document left to clients and
+    document design?
 
 ## Settled in v0.82
 

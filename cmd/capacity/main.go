@@ -64,6 +64,7 @@ type config struct {
 	readers     int
 	singleSecs  int
 	singleRate  float64
+	backoffMax  time.Duration
 }
 
 func main() {
@@ -88,6 +89,7 @@ func main() {
 	flag.IntVar(&c.readers, "readers", 5000, "grants profile: distinct reader grants the reads draw from (past the core's 1,024 cached bearers, most reads verify their grant)")
 	flag.IntVar(&c.singleSecs, "single-seconds", 15, "seconds each single-document write measurement runs")
 	flag.Float64Var(&c.singleRate, "single-rate", 0, "single-document measurements: writes a second (and burst) the namespace allows per resource, per principal and in all, in place of the defaults (10, 50 and 500 a second); the core needs -max-rate-per-resource, -max-rate-per-principal and -max-rate-per-namespace raised to it")
+	flag.DurationVar(&c.backoffMax, "single-backoff-max", 0, "single-document measurements: the longest wait of the client's backoff after lost races (default: the client's, 16ms)")
 	flag.StringVar(&c.only, "only", "", "run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live")
 	flag.Parse()
 	if c.revs < c.docs {
@@ -829,6 +831,9 @@ func (r *runner) principal(ns string, k int) *client.Client {
 //     and backing off after a 429. Reports the appends that succeeded per
 //     second, how many attempts were stale (412) or rate limited (429),
 //     and the time one logical write took, retries included.
+//   - single_doc_writers_N_backoff: the same with the client's
+//     AppendLatest: the head from the 412's body and a jittered wait
+//     that grows with each loss in a row.
 //   - single_doc_batch_steps_S: one batch whose single item has S steps
 //     for the document (§7.5).
 //   - single_doc_history_R: once the document has R revisions, the time
@@ -849,70 +854,104 @@ func (r *runner) singleDoc() {
 	r.record("single_doc_rate", map[string]any{"per_resource_and_principal": map[bool]any{true: r.c.singleRate, false: "default"}[r.c.singleRate > 0]})
 	stamp := time.Now().UnixNano()
 	patch := func(v int) []any { return []any{map[string]any{"op": "replace", "path": "/n", "value": v}} }
-	for _, n := range []int{1, 8, 32} {
-		name := fmt.Sprintf("hot-%d-%d", n, stamp)
-		w, err := r.w(ns).CreateDoc(r.ctx, ns, name, r.body(0, 0))
-		if err != nil {
-			fail(err)
-		}
-		var mu sync.Mutex
-		head := w.ID
-		var lat []time.Duration
-		var ok, stale, limited, failed atomic.Int64
-		deadline := time.Now().Add(time.Duration(r.c.singleSecs) * time.Second)
-		var wg sync.WaitGroup
-		t0 := time.Now()
-		for k := 0; k < n; k++ {
-			wg.Add(1)
-			go func(k int) {
-				defer wg.Done()
-				c := r.principal(ns, k)
-				for v := 0; time.Now().Before(deadline); v++ {
-					t := time.Now()
-					for time.Now().Before(deadline) {
-						mu.Lock()
-						id := head
-						mu.Unlock()
-						w, err := c.Append(r.ctx, ns, name, id, patch(v))
-						if err == nil {
-							mu.Lock()
-							head = w.ID
-							lat = append(lat, time.Since(t))
-							mu.Unlock()
-							ok.Add(1)
-							break
-						}
-						ae, isAPI := client.AsAPIError(err)
-						switch {
-						case isAPI && ae.Status == 412:
-							stale.Add(1)
-							if h, err := c.Head(r.ctx, ns, name); err == nil {
+	for _, strategy := range []string{"", "_backoff"} {
+		for _, n := range []int{1, 8, 32} {
+			if strategy != "" && n == 1 {
+				continue // one writer never loses a race
+			}
+			name := fmt.Sprintf("hot%s-%d-%d", strategy, n, stamp)
+			w, err := r.w(ns).CreateDoc(r.ctx, ns, name, r.body(0, 0))
+			if err != nil {
+				fail(err)
+			}
+			var mu sync.Mutex
+			first := w.ID
+			var lat []time.Duration
+			var ok, stale, limited, failed atomic.Int64
+			per := make([]atomic.Int64, n)
+			deadline := time.Now().Add(time.Duration(r.c.singleSecs) * time.Second)
+			var wg sync.WaitGroup
+			t0 := time.Now()
+			for k := 0; k < n; k++ {
+				wg.Add(1)
+				go func(k int) {
+					defer wg.Done()
+					c := r.principal(ns, k)
+					mine := first // the head this writer last saw: writers share nothing
+					for v := 0; time.Now().Before(deadline); v++ {
+						t := time.Now()
+						if strategy == "_backoff" {
+							// The client's helper: the 412's head, and a
+							// jittered wait that grows with each loss.
+							dctx, cancel := context.WithDeadline(r.ctx, deadline)
+							w, err := c.AppendLatest(dctx, ns, name, mine, client.Backoff{MaxAttempts: 1 << 30, Max: r.c.backoffMax, OnRetry: func(err error) {
+								if ae, ok := client.AsAPIError(err); ok && ae.Status == 429 {
+									limited.Add(1)
+								} else {
+									stale.Add(1)
+								}
+							}}, func(string) (any, error) { return patch(v), nil })
+							cancel()
+							if err == nil {
+								mine = w.ID
 								mu.Lock()
-								head = h.ID
+								lat = append(lat, time.Since(t))
 								mu.Unlock()
+								ok.Add(1)
+								per[k].Add(1)
+							} else if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+								if failed.Add(1) == 1 {
+									r.logf("error: %v", err)
+								}
 							}
-						case isAPI && ae.Status == 429:
-							limited.Add(1)
-							time.Sleep(100 * time.Millisecond)
-						default:
-							if failed.Add(1) == 1 {
-								r.logf("error: %v", err)
+							continue
+						}
+						for time.Now().Before(deadline) {
+							w, err := c.Append(r.ctx, ns, name, mine, patch(v))
+							if err == nil {
+								mine = w.ID
+								mu.Lock()
+								lat = append(lat, time.Since(t))
+								mu.Unlock()
+								ok.Add(1)
+								per[k].Add(1)
+								break
 							}
-							time.Sleep(50 * time.Millisecond)
+							ae, isAPI := client.AsAPIError(err)
+							switch {
+							case isAPI && ae.Status == 412:
+								stale.Add(1)
+								if h, err := c.Head(r.ctx, ns, name); err == nil {
+									mine = h.ID
+								}
+							case isAPI && ae.Status == 429:
+								limited.Add(1)
+								time.Sleep(100 * time.Millisecond)
+							default:
+								if failed.Add(1) == 1 {
+									r.logf("error: %v", err)
+								}
+								time.Sleep(50 * time.Millisecond)
+							}
 						}
 					}
-				}
-			}(k)
-		}
-		wg.Wait()
-		wall := time.Since(t0)
-		out := map[string]any{"writers": n, "seconds": wall.Seconds(), "appends": ok.Load(), "stale_412": stale.Load(), "rate_limited_429": limited.Load(), "errors": failed.Load()}
-		if len(lat) > 0 {
-			for k, v := range summary(lat, wall) {
-				out[k] = v
+				}(k)
 			}
+			wg.Wait()
+			wall := time.Since(t0)
+			out := map[string]any{"writers": n, "seconds": wall.Seconds(), "appends": ok.Load(), "stale_412": stale.Load(), "rate_limited_429": limited.Load(), "errors": failed.Load()}
+			lo, hi := per[0].Load(), per[0].Load()
+			for i := range per {
+				lo, hi = min(lo, per[i].Load()), max(hi, per[i].Load())
+			}
+			out["appends_fewest_by_one_writer"], out["appends_most_by_one_writer"] = lo, hi
+			if len(lat) > 0 {
+				for k, v := range summary(lat, wall) {
+					out[k] = v
+				}
+			}
+			r.record(fmt.Sprintf("single_doc_writers_%d%s", n, strategy), out)
 		}
-		r.record(fmt.Sprintf("single_doc_writers_%d", n), out)
 	}
 
 	// One batch item with many steps for one document.

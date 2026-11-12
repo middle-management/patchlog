@@ -4546,7 +4546,10 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   allowance lifts the per-resource rate (§6.6), so a document one writer writes more than ten
   times a second needs either batch steps (one item of many steps draws one token) or a
   namespace with a raised `ratePerResource`. Several writers on one document mostly collide
-  whatever the rate ([docs/CAPACITY.md](docs/CAPACITY.md), "Writes to one document").
+  whatever the rate ([docs/CAPACITY.md](docs/CAPACITY.md), "Writes to one document"); the Go
+  client's `AppendLatest(ctx, ns, name, head, Backoff{}, build)` retries a lost race on the
+  head the `412` names after a short random wait, which loses about half as many requests as
+  retrying at once but doesn't share the document fairly between writers that never pause.
 - **Limit names** in a namespace document's `limits` object, exactly as §6.6's table:
   `patchSetSize`, `opsPerSet`, `documentSize`, `valueSize`, `pathSize`, `nestingDepth`,
   `rulesPerNamespace`, `itemsPerBatch`, `batchSize`,
