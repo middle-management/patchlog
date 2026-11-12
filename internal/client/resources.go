@@ -445,6 +445,16 @@ func WithExperimentalRebase() WriteOption {
 	return func(r *request) { r.header["X-Experimental-Rebase"] = "1" }
 }
 
+// WithExperimentalProducer sends X-Experimental-Producer: id;epoch;seq, a
+// retry key for the write (EXPERIMENTAL, with WithExperimentalRebase): the
+// server writes each seq of a producer's epoch once, in order, and answers
+// a repeat with the revision the first attempt made. seq starts at 0 in
+// each epoch and goes up by one per write that succeeded; a producer that
+// lost its count starts a higher epoch.
+func WithExperimentalProducer(id string, epoch, seq int64) WriteOption {
+	return func(r *request) { r.header["X-Experimental-Producer"] = fmt.Sprintf("%s;%d;%d", id, epoch, seq) }
+}
+
 // WithGesture sends Gesture: id, naming the user action the write belongs
 // to (§7.2, §11.2): a gesture id (NewGesture). "" sends nothing.
 func WithGesture(id string) WriteOption {

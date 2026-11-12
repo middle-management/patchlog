@@ -880,7 +880,7 @@ func (r *runner) singleDoc() {
 	}
 	strategies := []string{"", "_backoff"}
 	if r.c.rebase {
-		strategies = append(strategies, "_rebase")
+		strategies = append(strategies, "_rebase", "_rebase_producer")
 	}
 	r.record("single_doc_workload", r.c.workload)
 	for _, strategy := range strategies {
@@ -908,24 +908,31 @@ func (r *runner) singleDoc() {
 					c := r.principal(ns, k)
 					mine := first // the head this writer last saw: writers share nothing
 					var wopts []client.WriteOption
-					if strategy == "_rebase" {
+					if strings.HasPrefix(strategy, "_rebase") {
 						wopts = append(wopts, client.WithExperimentalRebase())
 					}
+					var seq int64 // _rebase_producer: this writer's writes made so far
 					for v := 0; time.Now().Before(deadline); v++ {
 						t := time.Now()
 						if strategy != "" {
 							// The client's helper: the 412's head, and a
 							// jittered wait that grows with each loss.
 							dctx, cancel := context.WithDeadline(r.ctx, deadline)
+							wo := wopts
+							if strategy == "_rebase_producer" {
+								// The same key for every attempt of this write.
+								wo = append(append([]client.WriteOption(nil), wopts...), client.WithExperimentalProducer(fmt.Sprintf("w%d", k), 0, seq))
+							}
 							w, err := c.AppendLatest(dctx, ns, name, mine, client.Backoff{MaxAttempts: 1 << 30, Max: r.c.backoffMax, OnRetry: func(err error) {
 								if ae, ok := client.AsAPIError(err); ok && ae.Status == 429 {
 									limited.Add(1)
 								} else {
 									stale.Add(1)
 								}
-							}}, func(string) (any, error) { return writerPatch(k, v), nil }, wopts...)
+							}}, func(string) (any, error) { return writerPatch(k, v), nil }, wo...)
 							cancel()
 							if err == nil {
+								seq++
 								mine = w.ID
 								mu.Lock()
 								lat = append(lat, time.Since(t))

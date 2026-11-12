@@ -62,8 +62,12 @@
   and end-to-end namespaces are never rebased. Measured on writers that change different members
   of one document: no attempt lost, every writer served equally, the worst write 99 ms against
   9.7 s with the backoff, at 550–830 appends a second in all. A repeated rebased write is applied
-  again, so it is a prototype for SPEC-FEEDBACK note 91, which has the rule and the open points,
-  not something to run in production.
+  again unless it carries `X-Experimental-Producer: {id};{epoch};{seq}` (the client's
+  `WithExperimentalProducer`), a retry key after the Durable Streams protocol's idempotent
+  producers: each `seq` of a producer's epoch is written once, a repeat is answered with the
+  first attempt's revision, a gap is `409`. That state is in memory only. It is a prototype for
+  SPEC-FEEDBACK note 91, which has the rules and the open points, not something to run in
+  production.
 
 
 ## v0.28.0

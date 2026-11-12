@@ -4552,8 +4552,10 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   retrying at once but doesn't share the document fairly between writers that never pause.
   `serve -experimental-rebase` turns on a prototype that is **not in the spec** (SPEC-FEEDBACK
   note 91): a `PATCH` with `X-Experimental-Rebase: 1` whose `If-Match` is no longer the head is
-  applied to the head when nothing written since overlaps what it touches. It is there to
-  measure the idea; a repeated rebased write is applied twice, so leave it off in production.
+  applied to the head when nothing written since overlaps what it touches, and
+  `X-Experimental-Producer: {id};{epoch};{seq}` makes repeating such a write safe (each `seq`
+  is written once; the state is in memory). It is there to measure the idea: leave it off in
+  production.
 - **Limit names** in a namespace document's `limits` object, exactly as §6.6's table:
   `patchSetSize`, `opsPerSet`, `documentSize`, `valueSize`, `pathSize`, `nestingDepth`,
   `rulesPerNamespace`, `itemsPerBatch`, `batchSize`,

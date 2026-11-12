@@ -21,9 +21,11 @@ import (
 
 // Server is the HTTP API.
 type Server struct {
-	e    *core.Engine
-	mux  *http.ServeMux
-	edge *edge.Verifier // nil: no verifying edge (§9)
+	e *core.Engine
+	// producers is the experimental retry state (producer_experimental.go).
+	producers producers
+	mux       *http.ServeMux
+	edge      *edge.Verifier // nil: no verifying edge (§9)
 	// cookies issues and verifies edge grants as cookies (§C.5).
 	cookies *edge.Cookies
 	// inlinePDF serves application/pdf blobs for inline display, without

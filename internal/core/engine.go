@@ -345,6 +345,9 @@ type Engine struct {
 var testOptions func(*Options)
 
 // Open opens or creates the database.
+// ExperimentalRebase reports Options.ExperimentalRebase.
+func (e *Engine) ExperimentalRebase() bool { return e.opt.ExperimentalRebase }
+
 func Open(opt Options) (*Engine, error) {
 	if testOptions != nil {
 		testOptions(&opt)

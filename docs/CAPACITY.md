@@ -304,6 +304,13 @@ share of attempts answered `412`:
   noise).
 - Writers that do conflict (the **same** workload, every writer replacing `/n`) get `412` as
   before: there the fallback is all there is.
+- **A repeated rebased write is applied again** unless it carries a retry key: §7.2 recognises a
+  retry by its parent, which the server chose here. The prototype takes
+  `X-Experimental-Producer: {id};{epoch};{seq}`, after the Durable Streams protocol's idempotent
+  producers, and writes each `seq` once: with every third answer lost, 12 appends left 16 items
+  without it and 12 with it. It costs nothing measurable (`_rebase_producer` in the results: 868
+  against 893 appends a second for 8 writers and 583 against 618 for 32 on SQLite; 258 against
+  252 and 146 against 146 on Postgres). Its state is in memory in the prototype.
 - A rebased write is validated on the head it lands on, so it can be `422` where it was valid on
   its base (two writers each adding the last item a schema's `maxItems` allows), and a
   dependency between members that the schema doesn't hold is only protected by a `test` op on

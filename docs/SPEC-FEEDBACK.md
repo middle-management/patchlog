@@ -546,9 +546,21 @@ v0.82" (v0.81 Open 24).
     *What the prototype showed needs deciding:*
     - **Retries.** §7.2 answers a repeated write as a retry by its parent and patch set. A
       rebased write's parent isn't the one it sent, so a client that repeats it after a lost
-      answer is rebased and applied again: an array append lands twice. A rebased write would
-      need its own retry key, such as a required `Gesture`, or the `If-Match` it was sent with
-      recorded beside the entry.
+      answer is rebased and applied again: with every third answer lost, 12 array appends
+      left 16 items. The prototype's answer is borrowed from the Durable Streams protocol's
+      idempotent producers (`Producer-Id`, `Producer-Epoch`, `Producer-Seq`): a write may
+      carry `X-Experimental-Producer: {id};{epoch};{seq}`, and per resource, caller and
+      producer id the server writes each `seq` of an epoch once and in order. The last `seq`
+      again is `200` with the revision the first attempt made, an older one `204`, a gap
+      `409` with the `seq` expected, a lower epoch `403`, and a higher epoch starts at 0 (a
+      producer that lost its count). A refused write doesn't use up its `seq`. With it the
+      same 12 appends left 12 items, and it cost nothing measurable (583 against 618 appends a
+      second for 32 writers on SQLite, 146 against 146 on Postgres, within the runs' noise).
+      The prototype keeps this state in memory, so it is lost at a restart and not shared
+      between instances; a real form would store it with the write, in the same transaction.
+      A `Gesture` can't serve as the key: one gesture may cover several writes to a resource.
+      *Sub-question:* would plain writes want the same key? §7.2's rule already covers them,
+      but only while the head hasn't moved on.
     - **Array appends.** Under the merge rule they overlap, and they are the commonest case.
       The prototype's exception (both sides only appended to that array) held in the tests;
       whether "appended in some order" is acceptable is the application's call, so it may want
