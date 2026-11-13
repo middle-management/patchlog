@@ -4550,6 +4550,9 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   client's `AppendLatest(ctx, ns, name, head, Backoff{}, build)` retries a lost race on the
   head the `412` names after a short random wait, which loses about half as many requests as
   retrying at once but doesn't share the document fairly between writers that never pause.
+  Where several parties add to one list, make each entry a resource of its own: creates of
+  different resources never collide, and they did 1,930 writes a second from 32 writers on
+  Postgres where the shared document did 88 ("One resource per item").
 - **Limit names** in a namespace document's `limits` object, exactly as §6.6's table:
   `patchSetSize`, `opsPerSet`, `documentSize`, `valueSize`, `pathSize`, `nestingDepth`,
   `rulesPerNamespace`, `itemsPerBatch`, `batchSize`,

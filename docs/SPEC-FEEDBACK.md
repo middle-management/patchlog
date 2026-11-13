@@ -507,28 +507,55 @@ v0.82" (v0.81 Open 24).
     authorisation checks. *Question:* does a request refused at step 2 (`412`, `410`, `428`,
     `409` frozen) draw tokens? Drawing protects the server from retry storms; not drawing gives
     contending writers their full rate.
-91. **A proposal: an append the server may rebase** (§7.2, §6.4.1, TOOLS §F.3, §11.2). Every
-    write names the head it was made on, so writers of one document queue behind one another,
-    and a lost race costs a whole request: with the rate lifted, 8 writers retrying at once lost
-    84% of their attempts and 32 lost 95%; a client-side backoff brings that to 44% and 81% at
-    best, and can't make it fair. Most such writers don't conflict in substance: they add to
-    different members or append to an array. The text already has the test for that, for
-    merges and for undo: two sides conflict when their `writes` overlap, an array index
-    counting as its whole outermost array. *Proposal:* a write may carry, beside `If-Match:
-    "{base}"`, a request to rebase (a header, or a step member in a batch). Where the head is
-    no longer `base`, the server applies the patch set to the current head if `base` is an
-    ancestor of it, the `writes` of the revisions after `base` don't overlap the patch set's
-    own (its `test` ops and `copy` sources counted), and the result passes every check of §6.2
-    as any write does; otherwise `412` as now. The revision's parent is the head it was
-    applied on, so its id differs from what the client predicted, and the answer says so
-    (the new head, and the revisions it was applied over). It is opt-in per write, so a client
-    that needs "exactly this document" keeps plain `If-Match`. Open points: array appends
-    (`/-`) overlap under the merge rule and are the commonest case, so they may want a rule of
-    their own; a signed step binds its parent (§C.3.1), so a signed write can't be rebased by
-    the server; at E3 the server can't read the `writes`; and the cost of reading the
-    intervening revisions' `writes` should be bounded (a limit on how far behind `base` may
-    be). *Question:* is this in scope, or is contention on one document left to clients and
-    document design?
+91. **Many writers of one document** (§7.2, §6.4.1, TOOLS §11.1). Every write
+    names the head it was made on, so writers of one document queue behind one another and a
+    lost race costs a whole request. Measured with the rate lifted (docs/CAPACITY.md, "Writes
+    to one document"): 8 writers retrying at once lost 84% of their attempts and 32 lost 95%;
+    a client-side backoff brings that to about 45% and 82% and can't make it fair.
+
+    *What works today, and what the reference now recommends:* a resource per item in place
+    of the shared document. Creates of different resources never collide, a repeated create
+    is §7.2's retry, each item is validated on its own, and the namespace's log orders them.
+    The same writers then did 1,074 and 1,930 creates a second on Postgres (8 and 32 writers)
+    against 177 and 88 appends to a shared document, with even shares and a worst write of
+    49 ms. TOOLS §11.1's advice to split documents "along the lines of access, editing and size"
+    could say this outright: where several parties add to one list, make each entry a
+    resource. What it gives up is a constraint across the items.
+
+    *A smaller change to the text, if one is wanted:* a write that asks to be applied on the
+    current head, guarded only by its own `test` ops, the schema and the rules, in place of
+    `If-Match` on the exact head. That is simpler than detecting overlap, and about as safe
+    in practice: under overlap detection a dependency the schema doesn't hold needed a `test`
+    as well (below). It makes two writers of one member last-writer-wins unless one tests it,
+    and it needs a retry key, since §7.2 recognises a repeat by the parent the client named.
+
+    *A prototype that was built, measured and set aside* (branch `capacity-schema-single`):
+    a `PATCH` asking for a rebase whose `If-Match` is an ancestor of the head, at most 64
+    revisions back, was applied to the head when what it touches (its ops' paths, a `copy`'s
+    or `move`'s `from`, its `test`s) didn't overlap the writes since, a path through an array
+    counting as the outermost array, except that two sides which only append to one array
+    don't conflict. With the waiting writes of a document written in one transaction it did
+    3,440 and 3,670 appends a second on SQLite and 917 and 1,334 on Postgres, no attempt
+    lost, shares even. What it showed, for whoever takes the idea up:
+    - **Retries** need a key of their own. The prototype used the Durable Streams protocol's
+      producer id, epoch and sequence number, stored with the write; a repeat was then
+      answered with the first attempt's revision at any instance and after a restart, at the
+      cost of a read per write. A `Gesture` can't be the key: one may cover several writes
+      to a resource.
+    - **Valid alone, invalid together.** Two appends that each fit a list's `maxItems` on
+      their base: the second is `422`, not `412`, though it was right where it was written.
+    - **Invariants the schema doesn't hold.** With `start` 1 and `end` 5, one writer sets
+      `start` to 2 and another `end` to 2 from the same base, and both land. Only a `test`
+      on what a write depends on prevents it.
+    - **Array appends** overlap under the merge rule and are the commonest case; excepting
+      them is the application's call ("appended in some order").
+    - **Cost.** The gain came from the server writing a group of such writes together, which
+      it can do only because they no longer depend on the head they named; that took about
+      900 lines in the write path and a table, and spreading a document's writers over two
+      instances halved it.
+    It is less than a resource per item gives on Postgres, for much more machinery, so the
+    reference doesn't carry it. *Question:* should TOOLS §11.1 say that a list several
+    parties add to wants a resource per entry; and is an apply-on-head write of interest?
 
 ## Settled in v0.82
 

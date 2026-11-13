@@ -251,9 +251,44 @@ rate limited and the core and the database set the pace:
   less in proportion.
 
 What the retry policy can't change is that a lost race costs a whole request. The remedies are
-structural: one writer per document (or a queue in front of it), a writer's changes collected
-into batch steps (below), or an append the server may rebase when the writes in between don't
-overlap its own (docs/SPEC-FEEDBACK.md, v0.82 Open 91).
+structural: a resource per item in place of the shared document (next), one writer per
+document (or a queue in front of it), or a writer's changes collected into batch steps (below).
+
+### One resource per item
+
+The same writers, each creating resources of its own in the namespace (`If-None-Match: *`,
+a name the client chose, a 450-byte document) where before they appended to one shared
+document. No experimental code, the rate lifted as above, 10 seconds:
+
+| Writers | Creates/s (SQLite / Postgres) | Attempts `412` | Fewest and most by one writer (Postgres) | One write p50 / p99 / max (Postgres) |
+|---|---|---|---|---|
+| 1 | 1,254 / 369 | 0 | | 2.6 / 4.2 / 36 ms |
+| 8 | 2,121 / 1,074 | 0 | 1,340 and 1,345 | 7.2 / 13 / 33 ms |
+| 32 | 2,200 / 1,930 | 0 | 599 and 608 | 16 / 31 / 49 ms |
+
+- **Nothing collides**: creates of different resources share no head, so there is no `412` to
+  lose a request to, every writer gets the same share, and the worst write of 32 writers took
+  49 ms, against seconds on the shared document.
+- **It scales with writers**: on Postgres 32 writers do five times what one does, since group
+  commit (D.8) writes the resources of several requests in one transaction. On SQLite they do
+  1.8 times one writer's.
+- **A repeat is safe as it is**: the same create again is §7.2's retry, answered with the
+  first attempt's revision.
+- Each item is validated on its own (`$schema`, rules, limits), and the namespace's log gives
+  the items one order. What is given up is the aggregate: a constraint across items (a
+  maximum count, uniqueness) isn't the server's to check, and the list is read as the
+  namespace's heads under a prefix, or from an index, not as one document.
+
+**An experimental alternative that was built and set aside.** A prototype let the server apply a
+stale append to the current head when nothing written since overlapped it, write the waiting
+appends of a document in one transaction, and recognise repeats by a producer key (branch
+`capacity-schema-single`; docs/SPEC-FEEDBACK.md, v0.82 Open 91, has the rules and what it
+left open). On the shared document it removed the `412`s and shared the document evenly: 3,440
+and 3,670 appends a second from 8 and 32 writers on SQLite, 917 and 1,334 on Postgres. That is
+more than a resource per item on SQLite and less on Postgres, for about 900 lines in the write
+path, a table and a change to §7.2's contract, and it halved again when a document's writers
+were spread over two instances. A resource per item needs none of that, so the prototype is
+not in this code.
 
 **A batch writes many steps to one document at once** (§7.5: one item, many steps, one token):
 
@@ -274,10 +309,10 @@ The reads were made right after the writes, from warm caches, 20 samples each: t
 nothing scans the history, not what a cold read of an old revision costs (the envelope's "cold
 reads of old revisions" row does).
 
-So a document that many parties write often (a counter, a shared list, a presence record) is the
+So a document that many parties write often (a shared list, a feed, a presence record) is the
 wrong shape: at the default limits it takes about 10 writes a second in all, and at any limits
-several writers waste most of their attempts. Give each writer a document of its own, or collect
-a writer's changes into batch steps. Where one writer does need more than 10 writes a second on
+several writers waste most of their attempts. Make each item a resource of its own (above), or give
+each writer a document of its own, or collect a writer's changes into batch steps. Where one writer does need more than 10 writes a second on
 a small document, raise the deployment maximum (`serve -max-rate-per-resource`) and set
 `ratePerResource` in that namespace's `limits`; leave it at the default where documents are
 large, since a typed 1 MiB document already costs ~60 ms of CPU an append (above). Clients that
@@ -327,4 +362,6 @@ go build -o patchlog ./cmd/patchlog && go build -o capacity ./cmd/capacity
   single-document measurement runs, and `-single-rate N` runs them in a namespace that allows N
   writes a second per resource and principal (the core then needs `-max-rate-per-resource N,N
   -max-rate-per-principal N,N`).
+- `-only single` also measures the writers each creating resources of their own
+  (`single_ns_items_writers_N`).
 - Sizes: `-docs`, `-revs`, `-namespaces`, `-doc-size`, `-append-batch`; `-help` lists the rest.

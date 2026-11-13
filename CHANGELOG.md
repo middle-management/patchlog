@@ -53,8 +53,13 @@
   from 600 to 1,000 appends a second on SQLite and from 84% to 44% of attempts lost; at 32
   writers, and on Postgres, most attempts are still lost, and it doesn't make a document fair
   between writers that never pause. At the default limits a contended document takes about 10
-  writes a second in all, whatever the retry. SPEC-FEEDBACK note 91 proposes an append the
-  server may rebase when the writes in between don't overlap.
+  writes a second in all, whatever the retry.
+- **Capacity: a resource per item.** The same writers each creating resources of their own, in
+  place of appending to one shared document, did 1,074 and 1,930 creates a second on Postgres
+  from 8 and 32 writers (2,121 and 2,200 on SQLite), with no `412`, even shares and a worst
+  write of 49 ms: [docs/CAPACITY.md](docs/CAPACITY.md), "One resource per item". A prototype
+  of a server-side rebase for the shared document was built, measured and set aside (branch
+  `capacity-schema-single`); SPEC-FEEDBACK note 91 has what it showed.
 
 
 ## v0.28.0

@@ -834,6 +834,9 @@ func (r *runner) principal(ns string, k int) *client.Client {
 //   - single_doc_writers_N_backoff: the same with the client's
 //     AppendLatest: the head from the 412's body and a jittered wait
 //     that grows with each loss in a row.
+//   - single_ns_items_writers_N: N principals each create resources of
+//     their own in the namespace (If-None-Match: *), one per write: the
+//     shape a shared document can take instead.
 //   - single_doc_batch_steps_S: one batch whose single item has S steps
 //     for the document (§7.5).
 //   - single_doc_history_R: once the document has R revisions, the time
@@ -952,6 +955,63 @@ func (r *runner) singleDoc() {
 			}
 			r.record(fmt.Sprintf("single_doc_writers_%d%s", n, strategy), out)
 		}
+	}
+
+	// The same number of writers, each creating resources of its own: what
+	// a shared document could be instead (one resource per item).
+	for _, n := range []int{1, 8, 32} {
+		var mu sync.Mutex
+		var lat []time.Duration
+		var ok, limited, failed atomic.Int64
+		per := make([]atomic.Int64, n)
+		deadline := time.Now().Add(time.Duration(r.c.singleSecs) * time.Second)
+		var wg sync.WaitGroup
+		t0 := time.Now()
+		for k := 0; k < n; k++ {
+			wg.Add(1)
+			go func(k int) {
+				defer wg.Done()
+				c := r.principal(ns, k)
+				for v := 0; time.Now().Before(deadline); v++ {
+					t := time.Now()
+					name := fmt.Sprintf("item-%d-%d-%d-%d", stamp, n, k, v)
+					for time.Now().Before(deadline) {
+						_, err := c.CreateDoc(r.ctx, ns, name, map[string]any{"by": k, "n": v, "pad": strings.Repeat("x", 400)})
+						if err == nil {
+							mu.Lock()
+							lat = append(lat, time.Since(t))
+							mu.Unlock()
+							ok.Add(1)
+							per[k].Add(1)
+							break
+						}
+						if ae, isAPI := client.AsAPIError(err); isAPI && ae.Status == 429 {
+							limited.Add(1)
+							time.Sleep(100 * time.Millisecond)
+							continue
+						}
+						if failed.Add(1) == 1 {
+							r.logf("error: %v", err)
+						}
+						time.Sleep(50 * time.Millisecond)
+					}
+				}
+			}(k)
+		}
+		wg.Wait()
+		wall := time.Since(t0)
+		out := map[string]any{"writers": n, "seconds": wall.Seconds(), "creates": ok.Load(), "rate_limited_429": limited.Load(), "errors": failed.Load()}
+		lo, hi := per[0].Load(), per[0].Load()
+		for i := range per {
+			lo, hi = min(lo, per[i].Load()), max(hi, per[i].Load())
+		}
+		out["creates_fewest_by_one_writer"], out["creates_most_by_one_writer"] = lo, hi
+		if len(lat) > 0 {
+			for k, v := range summary(lat, wall) {
+				out[k] = v
+			}
+		}
+		r.record(fmt.Sprintf("single_ns_items_writers_%d", n), out)
 	}
 
 	// One batch item with many steps for one document.
