@@ -53,7 +53,7 @@
   from 526 to 1,029 appends a second on SQLite and from 85% to 44% of attempts lost; at 32
   writers, and on Postgres, most attempts are still lost, and it doesn't make a document fair
   between writers that never pause. At the default limits a contended document takes about 10
-  writes a second in all, whatever the retry.
+  writes a second in all when the writers retry at once (11–16), and 13–70 with the backoff.
 - **Capacity: a resource per item.** The same writers each creating resources of their own, in
   place of appending to one shared document, did 940 and 1,420 creates a second on Postgres
   from 8 and 32 writers (1,830 and 1,970 on SQLite), with no `412`, even shares and a p99 of

@@ -534,7 +534,9 @@ v0.82" (v0.81 Open 24).
     or `move`'s `from`, its `test`s) didn't overlap the writes since, a path through an array
     counting as the outermost array, except that two sides which only append to one array
     don't conflict. With the waiting writes of a document written in one transaction it did
-    3,270 and 3,450 appends a second on SQLite and 450 and 410 on Postgres, no attempt
+    3,270 and 3,450 appends a second on SQLite and 450 and 410 on Postgres (8 and 32 writers;
+    Postgres and the core at 2 vCPU each, with grants; 917 and 1,334 in an earlier run with
+    neither constrained and no grants), no attempt
     lost, shares even. What it showed, for whoever takes the idea up:
     - **Retries** need a key of their own. The prototype used the Durable Streams protocol's
       producer id, epoch and sequence number, stored with the write; a repeat was then

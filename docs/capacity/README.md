@@ -2,8 +2,9 @@
 
 `cmd/capacity` output (`-json`) of the runs in [../CAPACITY.md](../CAPACITY.md). All of them
 were taken on 2026-11-13 at spec 0.82 on one 4-vCPU / 15 GB host that also ran the load
-generator and Varnish, with 1M documents, 5M revisions and 1,000 namespaces. Requests went to
-the containers' addresses.
+generator and Varnish. Requests went to the containers' addresses. The database held 1M
+documents, 5M revisions and 1,000 namespaces, except for the `pg-public-*` and `*-prototype-*`
+runs, which started from a new, empty one.
 
 - **Server X** (`pg-*`): the core at 2 vCPU / 4 GB, Postgres 16 at 2 vCPU / 4 GB
   (`max_connections=300`), each in a container.
@@ -12,7 +13,7 @@ the containers' addresses.
 | File | Run |
 |---|---|
 | `pg-grants-serverX.json` | server X, grants: seeding and every measurement; long-polls through Varnish (private, so not collapsed there) |
-| `pg-grants-serverX-again.json` | scans, reads, writes and bootstrap once more an hour later, for the run-to-run range |
+| `pg-grants-serverX-again.json` | scans, reads, writes and bootstrap once more about 25 minutes later, for the run-to-run range |
 | `pg-grants-serverX-single-unlimited.json` | `-only single -single-rate 1000000`: writes to one document and a resource per item with nothing rate limited |
 | `pg-grants-serverX-direct-longpoll.json` | `-only live`, long-polls straight to the core |
 | `pg-grants-core1vcpu.json` | grants, the core at 1 vCPU / 2 GB: scans, reads, writes, bootstrap |
