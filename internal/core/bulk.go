@@ -46,6 +46,7 @@ func (t *tx) bulkExec(s bulkStmt, rows [][]any) int64 {
 	if len(rows) == 0 {
 		return 0
 	}
+	t.beforeStatement(s.pg)
 	t.wrote()
 	if t.e.pg {
 		r, err := t.Tx.Exec(s.pg, s.arrays(rows)...)
@@ -71,6 +72,7 @@ func (t *tx) bulkQuery(s bulkStmt, rows [][]any, scan func(*sql.Rows)) {
 	if len(rows) == 0 {
 		return
 	}
+	t.beforeStatement(s.pg)
 	t.wrote()
 	each := func(rs *sql.Rows, err error) {
 		t.must(err)

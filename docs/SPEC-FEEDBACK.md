@@ -573,10 +573,10 @@ v0.82" (v0.81 Open 24).
       of a document that are waiting together and write them in one transaction, each through
       the whole gate on the result of the one before, and commit once
       (`-experimental-combine`), reading nothing twice inside it. On SQLite 8 and 32 writers
-      then both get 3,600 appends a second, against 1,230 for one writer alone and under 900
-      before; on Postgres 609 and 674 against 365–385 for one writer, the rest being about
-      seven statements per write that inserting the group's rows together would cut further.
-      Shares stayed even and the worst write of 32 writers was 44 ms (77 ms on Postgres).
+      then both get about 3,600 appends a second, against 1,100–1,300 for one writer alone
+      and under 900 before; on Postgres, where the group's rows are also inserted together,
+      917 and 1,334 against 340–460 for one writer. Shares stayed even and the worst write of
+      32 writers was 37–45 ms.
       This is an implementation matter, but it is the argument for the feature: with plain
       `If-Match` a server can never do it, since every write but one in such a group is stale
       by construction.

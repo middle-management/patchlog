@@ -1230,7 +1230,7 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 			return nil
 		}
 		last := want[len(want)-1]
-		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, last[:]))
+		row, err := t.revByID(own.id, last)
 		if err != nil || row.author != author || !t.sameRoot(row.grantID, a) {
 			return nil
 		}
@@ -1869,6 +1869,21 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 	}
 	// The blobs the existing resources' heads reference (blob_refs still
 	// open), which a new revision ends or keeps (attachStep).
+	if t.def != nil {
+		// Known from this transaction's own writes of the resource.
+		var ask [][]any
+		for _, row := range existing {
+			res := row[0].(int64)
+			if open, ok := t.def.open[res]; ok {
+				for bid := range open {
+					byRes[res].open[bid] = true
+				}
+			} else {
+				ask = append(ask, row)
+			}
+		}
+		existing = ask
+	}
 	t.bulkQuery(openBlobRefs, existing, func(rs *sql.Rows) {
 		var res int64
 		var bid []byte
@@ -1933,11 +1948,21 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 		if len(rows) == 0 {
 			break
 		}
-		t.bulkQuery(insRevisions, rows, func(rs *sql.Rows) {
-			var seq, res int64
-			t.must(rs.Scan(&seq, &res))
-			byRes[res].last = seq
-		})
+		if t.deferring() {
+			// Held back, with seqs drawn beforehand (deferred.go).
+			t.wrote()
+			for _, row := range rows {
+				seq := t.revSeq()
+				byRes[row[0].(int64)].last = seq
+				t.def.revs = append(t.def.revs, append([]any{seq}, row...))
+			}
+		} else {
+			t.bulkQuery(insRevisions, rows, func(rs *sql.Rows) {
+				var seq, res int64
+				t.must(rs.Scan(&seq, &res))
+				byRes[res].last = seq
+			})
+		}
 		for i, it := range stepItems {
 			step, row, seq := it.steps[k], rows[i], it.last
 			digest, _ := row[15].([]byte)
@@ -2059,10 +2084,31 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			dropHeads = append(dropHeads, []any{it.res})
 		}
 	}
-	if t.bulkExec(moveHeads, moves) != int64(len(moves)) {
-		panic(errChainRace)
+	if t.def != nil {
+		if t.def.open == nil {
+			t.def.open = map[int64]map[ids.ID]bool{}
+		}
+		for _, it := range sorted {
+			if it.steps[len(it.steps)-1].del {
+				delete(t.def.open, it.res) // read again after a delete
+			} else {
+				t.def.open[it.res] = it.open
+			}
+		}
 	}
-	t.bulkExec(upsertHeads, heads)
+	if t.deferring() && len(dropHeads) == 0 {
+		for _, m := range moves {
+			t.deferMove(m)
+		}
+		for _, h := range heads {
+			t.deferHead(h)
+		}
+	} else {
+		if t.bulkExec(moveHeads, moves) != int64(len(moves)) {
+			panic(errChainRace)
+		}
+		t.bulkExec(upsertHeads, heads)
+	}
 	t.bulkExec(delHeads, dropHeads)
 
 	out := make([]histRow, len(items))

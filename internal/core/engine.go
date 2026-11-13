@@ -743,8 +743,11 @@ type tx struct {
 	// rows are its own, locked until it ends, as ownRevs are.
 	combining bool
 	movedRes  map[resKey]*resRow
-	ownDocs   map[int64][]byte
-	revIDs    map[int64]ids.ID
+	// def, when set, holds back step 7's rows of a combined group
+	// (deferred.go, Postgres).
+	def     *deferred
+	ownDocs map[int64][]byte
+	revIDs  map[int64]ids.ID
 	// grants maps an author authenticated in this transaction under a
 	// grant to that grant (actorID): the namespace entries written for it
 	// record the grant's id (§5, §7.4, §C.3), unless serverWrites > 0,
@@ -1158,11 +1161,28 @@ func (t *tx) nsByNameLocked(name string, mode lockMode) *nsRow {
 		}
 		t.lockNS(id, mode)
 	}
+	if t.def != nil && mode == lockShared {
+		// A deferring transaction (deferred.go) keeps the lock it read the
+		// row under, shared, until it ends: nothing but the chain's head
+		// changes meanwhile, and the write path reads that under the log
+		// lock.
+		if r, ok := t.def.nsRows[name]; ok {
+			c := r
+			t.deps.addNS(&c)
+			return &c
+		}
+	}
 	n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE name = ?`, name))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	t.must(err)
+	if t.def != nil && mode == lockShared && t.locking() {
+		if t.def.nsRows == nil {
+			t.def.nsRows = map[string]nsRow{}
+		}
+		t.def.nsRows[name] = *n
+	}
 	t.deps.addNS(n)
 	return n
 }
@@ -1258,6 +1278,15 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targetSeq *int64, configSeq int64, author int64, hist ...histRow) (int64, ids.ID) {
 	if t.locking() && t.sharedNS != n.id {
 		t.lockNS(n.id, lockExclusive)
+	}
+	if t.deferring() && configSeq == n.configSeq && entry["kind"] != "purge-ns" {
+		// Held back with the group's other entries (deferred.go).
+		a := nsAppend{entry: entry, meta: meta, res: res, target: targetSeq, author: author, hist: hist}
+		if g := t.grants[author]; g != nil && t.serverWrites == 0 {
+			a.grant = g
+		}
+		t.deferAppend(n, a)
+		return 0, ids.ID{}
 	}
 	// What doesn't depend on the head first, outside the row's lock.
 	body := jsonv.Canonical(entry)

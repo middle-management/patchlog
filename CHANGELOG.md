@@ -68,8 +68,9 @@
   first attempt's revision, a gap is `409`. That state is in memory only. With
   `-experimental-combine` too, the rebased writes of one document that wait together are written
   in one transaction, each on the result of the one before, reading nothing twice, and committed
-  once: 3,600 appends a second from 8 writers and from 32 on SQLite (one writer alone does
-  1,230), 609 and 674 on Postgres (365–385), with even shares. `PATCHLOG_TEST_COMBINE_ALL=1`
+  once, on Postgres with the group's rows inserted together: about 3,400–3,700 appends a second
+  from 8 and from 32 writers on SQLite (one writer alone does 1,100–1,300), 917 and 1,334 on
+  Postgres (340–460), with even shares. `PATCHLOG_TEST_COMBINE_ALL=1`
   runs every single resource write of the test suites through that transaction. It is a prototype for
   SPEC-FEEDBACK note 91, which has the rules and the open points, not something to run in
   production.

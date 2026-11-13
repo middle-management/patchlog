@@ -44,8 +44,11 @@ type combined struct {
 	req  Request
 	item Item
 	res  *WriteResult
-	err  error
-	done chan struct{}
+	// nsEntry is the number of the namespace entry the write deferred
+	// (deferred.go), or -1.
+	nsEntry int
+	err     error
+	done    chan struct{}
 }
 
 // writeCombined is WriteResource for a rebased single write.
@@ -111,19 +114,28 @@ func (e *Engine) runCombined(group []*combined) {
 	err := e.update(ctx, func(t *tx) error {
 		// A transaction run again starts over.
 		t.combining, t.movedRes, t.ownDocs = true, nil, nil
+		t.def = nil
+		if t.e.pg && (len(group) > 1 || combineAll) {
+			// Step 7's rows of the group are written together (deferred.go).
+			t.def = &deferred{want: len(group)}
+		}
 		if t.logHeads == nil {
 			// The chain's head, once this transaction holds its log lock,
 			// is the entry it appended last (appendNS).
 			t.logHeads = map[int64]logHead{}
 		}
 		for _, p := range group {
-			p.res, p.err = nil, nil // a transaction run again starts over
+			p.res, p.err, p.nsEntry = nil, nil, -1 // a transaction run again starts over
 			if len(group) > 1 && p.ctx.Err() != nil {
 				p.err = p.ctx.Err()
 				continue
 			}
 			// The whole gate of §6.2, as writeItems, with the plan's patch
 			// sets compressed before the insert as on every other path.
+			before := 0
+			if t.def != nil {
+				before = t.def.total
+			}
 			plan, res, err := t.checkItems(p.req, []Item{p.item}, nil, nil, false, false, false)
 			if err == nil && res == nil {
 				t.e.packPlan(plan)
@@ -138,6 +150,16 @@ func (e *Engine) runCombined(group []*combined) {
 				continue
 			}
 			p.res = res
+			if t.def != nil && t.def.total == before+1 {
+				p.nsEntry = before
+			}
+		}
+		t.flushDeferred()
+		for _, p := range group {
+			// The ids of the entries held back, known since the flush.
+			if p.res != nil && p.nsEntry >= 0 {
+				p.res.NSID = t.def.done[p.nsEntry].String()
+			}
 		}
 		return nil
 	})

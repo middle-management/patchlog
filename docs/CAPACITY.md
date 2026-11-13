@@ -315,6 +315,7 @@ share of attempts answered `412`:
   | Remembering what each revision touched | 936 and 681 | 261 and 148 |
   | And writing the waiting writes of a document in one transaction (`-experimental-combine`) | 2,870 and 2,380 | 399 and 243 |
   | And reading nothing twice in that transaction | 3,610 and 3,620 | 609 and 674 |
+  | And, on Postgres, inserting the group's rows together | 3,440 and 3,670 (unchanged: not used on SQLite) | 917 and 1,334 |
 
   - **Remembering what revisions touched** (by revision id, in memory, with the parent's id,
     so a known chain is walked without the database) helps a little: the fold wasn't the main
@@ -336,16 +337,27 @@ share of attempts answered `412`:
   - Shares stay even (4,502 and 4,534 appends by the least and the most served of 8 on
     SQLite, 1,125 and 1,138 of 32; 210 and 211 of 32 on Postgres), and the worst write of 32
     writers took 44 ms on SQLite and 77 ms on Postgres.
-  - **Still per write on Postgres**: about seven statements (the rate draw, the namespace's
-    row, the blob references, three inserts or updates and the log's append). Inserting a
-    group's rows in one statement per table, as group commit does for writes of different
-    documents (D.8), would leave a few per group. Not done: the rows' sequence numbers come
-    back from the inserts, and later writes of the group need them.
+  - **Inserting the group's rows together** (Postgres): the revisions, the heads' moves, the
+    heads documents and the namespace entries of a group are held in memory and written at its
+    end, one statement per table, with the revisions' sequence numbers drawn beforehand so a
+    child can name its parent before either is inserted. Any other statement the transaction
+    runs first writes what is held back, but for a short list that can't be affected by it, so
+    a write that does something unforeseen costs a flush, not a wrong answer. Postgres then
+    does 917 appends a second from 8 writers and 1,334 from 32, against 340–460 for one
+    writer: more writers now means more throughput, since a larger group shares the same few
+    statements. Shares stay even (1,145 and 1,147 by the least and the most served of 8, 417
+    and 418 of 32) and the worst write of 32 writers took 45 ms.
+  - **Finding what forced the rows out early** took three rounds of measuring: the retry
+    lookup (§7.2) asked the database for every write's own id, then reads of committed
+    revisions by sequence number, then the namespace's row and the head's blob references,
+    each now answered from memory or exempt where the rows held back can't change the answer.
+  - **Still per write on Postgres**: the rate draw, and a read or two of rows committed before
+    the group. A snapshot (every so many revisions) writes at once.
   - **How it was tested.** `PATCHLOG_TEST_COMBINE_ALL=1` sends every single resource write of
     the test suites through this transaction, a group of one included, with its ordinary
-    meaning. The core, server, client, merge and bundle suites pass that way on SQLite, the
-    core, server, client and merge suites on Postgres, and the core suite under the race
-    detector. The first runs found three faults, since fixed: patch sets weren't compressed on
+    meaning, and on Postgres with its rows held back as above. The core, server, client,
+    merge and bundle suites pass that way on SQLite and on Postgres, and the core suite under
+    the race detector. The first runs found three faults, since fixed: patch sets weren't compressed on
     this path, a cancelled request's write wasn't rolled back, and losing a race to a writer
     on another instance surfaced as a database error in place of a `412`.
 - **A repeated rebased write is applied again** unless it carries a retry key: §7.2 recognises a
