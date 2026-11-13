@@ -1,48 +1,48 @@
 {
   "long_poll_fanout": {
     "100": {
-      "all_delivered_ms": 189.841,
+      "all_delivered_ms": 20.683,
       "delivered": 100,
       "errors": 0,
       "latency": {
-        "max_ms": 189.841,
+        "max_ms": 20.683,
         "n": 100,
-        "p50_ms": 159.338,
-        "p95_ms": 185.329,
-        "p99_ms": 186.29
+        "p50_ms": 19.729,
+        "p95_ms": 20.601,
+        "p99_ms": 20.672
       },
-      "origin_cpu_seconds": 0.11999999999989086
+      "origin_cpu_seconds": 0.010000000000218279
     },
     "1000": {
-      "all_delivered_ms": 693.843,
+      "all_delivered_ms": 27.467,
       "delivered": 1000,
       "errors": 0,
       "latency": {
-        "max_ms": 693.843,
+        "max_ms": 27.467,
         "n": 1000,
-        "p50_ms": 366.621,
-        "p95_ms": 666.417,
-        "p99_ms": 689.737
+        "p50_ms": 21.604,
+        "p95_ms": 27.02,
+        "p99_ms": 27.392
       },
-      "origin_cpu_seconds": 0.7700000000004366
+      "origin_cpu_seconds": 0.03999999999996362
     },
     "5000": {
-      "all_delivered_ms": 4397.207,
+      "all_delivered_ms": 95.864,
       "delivered": 5000,
       "errors": 0,
       "latency": {
-        "max_ms": 4397.207,
+        "max_ms": 95.864,
         "n": 5000,
-        "p50_ms": 2843.714,
-        "p95_ms": 4259.876,
-        "p99_ms": 4370.995
+        "p50_ms": 57.609,
+        "p95_ms": 89.176,
+        "p99_ms": 92.738
       },
-      "origin_cpu_seconds": 6.489999999999782
+      "origin_cpu_seconds": 0.17000000000007276
     },
-    "via": "http://127.0.0.1:9080"
+    "via": "http://172.18.0.3:8080"
   },
-  "origin_vmhwm_mb": 1658.40234375,
-  "origin_vmrss_mb": 878.046875,
+  "origin_vmhwm_mb": 1033.87109375,
+  "origin_vmrss_mb": 596.9375,
   "profile": "grants",
-  "total_seconds": 12.555789554
+  "total_seconds": 8.175325073
 }

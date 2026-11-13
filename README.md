@@ -4499,8 +4499,8 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   while the read cache's meta counter (configuration, purges, prunes, restores, key destruction;
   on Postgres while the tailer is fresh) hasn't moved, and before the grant's earliest `exp`
   (since v0.78 a rule on `/now` never passes for a read, so it no longer matters here); edge
-  grants and resource long-polls are read on their own, as before. On server X
-  ([docs/CAPACITY.md](docs/CAPACITY.md)) one write to 5,000 private followers went from 3.7–4.1 s
+  grants and resource long-polls are read on their own, as before. When it was first measured
+  ([docs/CAPACITY.md](docs/CAPACITY.md), "Earlier measurements") one write to 5,000 private followers went from 3.7–4.1 s
   of core CPU to 0.3–1 s. The local CDN's VCL lets a long-poll with credentials skip Varnish's
   waiting list (`hash_ignore_busy`), so a private one isn't held behind an identical request in
   flight.
@@ -4539,6 +4539,20 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `ratePerNamespace` (500/s, burst 1000, unless `serve -max-rate-per-namespace RATE,BURST`
   says otherwise) is `422 limit` naming `ratePerNamespace` (F-L3 default), and stored ones are
   clamped to it, so importers and load harnesses that need more raise that maximum.
+- **Per-resource and per-principal rates.** A namespace's `limits` may set `ratePerResource`
+  and `ratePerPrincipal` up to the deployment maximums, which are the defaults (10/s burst 20,
+  and 50/s burst 100) unless `serve -max-rate-per-resource RATE,BURST` and
+  `-max-rate-per-principal RATE,BURST` raise them; the defaults themselves don't change. No
+  allowance lifts the per-resource rate (§6.6), so a document one writer writes more than ten
+  times a second needs either batch steps (one item of many steps draws one token) or a
+  namespace with a raised `ratePerResource`. Several writers on one document mostly collide
+  whatever the rate ([docs/CAPACITY.md](docs/CAPACITY.md), "Writes to one document"); the Go
+  client's `AppendLatest(ctx, ns, name, head, Backoff{}, build)` retries a lost race on the
+  head the `412` names after a short random wait, which loses about half as many requests as
+  retrying at once but doesn't share the document fairly between writers that never pause.
+  Where several parties add to one list, make each entry a resource of its own: creates of
+  different resources never collide, and they did 1,420 writes a second from 32 writers on
+  Postgres where the shared document did 64 ("One resource per item").
 - **Limit names** in a namespace document's `limits` object, exactly as §6.6's table:
   `patchSetSize`, `opsPerSet`, `documentSize`, `valueSize`, `pathSize`, `nestingDepth`,
   `rulesPerNamespace`, `itemsPerBatch`, `batchSize`,
@@ -4572,7 +4586,7 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
 - **`documentSize` is 1 MiB by default**, where §6.6 says 4 MiB, and a namespace may set it up to
   the deployment maximum, 4 MiB unless `serve -max-document-size` says otherwise;
   `serve -document-size` changes the default (at most the maximum). Every write re-serialises,
-  checks and validates the whole document, so an append to a 3.5 MiB document costs 3–4 times one
+  checks and validates the whole document, so an append to a 3.5 MiB document costs 4 times one
   to a 16 KiB document, and large documents weigh on the caches ([docs/CAPACITY.md](docs/CAPACITY.md)).
   A namespace holding larger documents sets `"limits": { "documentSize": 4194304 }`; until it
   does, appends that leave a document over 1 MiB, and creates over it, are `422 limit`

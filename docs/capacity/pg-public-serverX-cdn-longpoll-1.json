@@ -1,0 +1,48 @@
+{
+  "long_poll_fanout": {
+    "100": {
+      "all_delivered_ms": 18.369,
+      "delivered": 100,
+      "errors": 0,
+      "latency": {
+        "max_ms": 18.369,
+        "n": 100,
+        "p50_ms": 17.594,
+        "p95_ms": 18.31,
+        "p99_ms": 18.36
+      },
+      "origin_cpu_seconds": 0.009999999999999981
+    },
+    "1000": {
+      "all_delivered_ms": 47.939,
+      "delivered": 1000,
+      "errors": 0,
+      "latency": {
+        "max_ms": 47.939,
+        "n": 1000,
+        "p50_ms": 37.928,
+        "p95_ms": 47.793,
+        "p99_ms": 47.911
+      },
+      "origin_cpu_seconds": 0
+    },
+    "5000": {
+      "all_delivered_ms": 176.528,
+      "delivered": 5000,
+      "errors": 0,
+      "latency": {
+        "max_ms": 176.528,
+        "n": 5000,
+        "p50_ms": 98.596,
+        "p95_ms": 171.512,
+        "p99_ms": 176.112
+      },
+      "origin_cpu_seconds": 0
+    },
+    "via": "http://172.18.0.4:8080"
+  },
+  "origin_vmhwm_mb": 29.78515625,
+  "origin_vmrss_mb": 29.78515625,
+  "profile": "public",
+  "total_seconds": 7.942234427
+}

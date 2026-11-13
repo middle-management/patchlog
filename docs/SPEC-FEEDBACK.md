@@ -15,10 +15,11 @@ had a choice) and the question. The planner's questions from before the work and
 implementers' and reviewers' notes are merged here, each case once. Notes from v0.81 that v0.82
 leaves open are carried in place, by subject, marked "was v0.81 Open n" and cut to what
 remains. The order is: sealed forms and end-to-end reads (1–31), access and coverage (32–65),
-tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87), index (88).
+tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87), index (88),
+rates and contended writes (89–91, from capacity measurements after the v0.82 work).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
-88 are open: 58 from this version's work and 30 carried.
+91 are open: 61 from this version's work and 30 carried.
 
 The spec's own question to the reference, "what is a shadow?", is answered under "Settled in
 v0.82" (v0.81 Open 24).
@@ -488,6 +489,74 @@ v0.82" (v0.81 Open 24).
     or `403` with no marker. The reference now reads the document at the purge entry on every
     path and keeps the trust. *Question:* should the text say a service that can read a purged
     catalog's document at its purge head must do so?
+89. **The per-resource rate and allowances** (§6.6). "Per-resource buckets still apply" under an
+    allowance, so an importer or a service with an allowance is still held to 10 writes a second
+    on each document unless it collects them into the steps of one batch item, which cost one
+    token (1,000 steps were one token in the reference's measurement). The reference lets a deployment raise the maximum of `ratePerResource` and
+    `ratePerPrincipal` (`serve -max-rate-per-resource`, `-max-rate-per-principal`), so a
+    namespace can set its own higher; the defaults stay §12.2's. *Question:* is a deployment
+    maximum above the default intended for these two, as for `ratePerNamespace`; and should an
+    allowance be able to carry a per-resource rate?
+90. **A `412` draws a token** (§6.2, §6.6). The reference draws a write's tokens before it
+    compares the precondition, so a write that fails `412` (or `410`) has spent one from the
+    resource's, the principal's and the namespace's buckets. With 8 principals appending to one
+    document at the default rates, about 45% of attempts were `412` and as many `429`, and the
+    8 together got 12 writes a second where each is allowed 10 (docs/CAPACITY.md, "Writes to
+    one document").
+    §7 says rate limits "come last, only for requests that passed the rest", which reads as the
+    authorisation checks. *Question:* does a request refused at step 2 (`412`, `410`, `428`,
+    `409` frozen) draw tokens? Drawing protects the server from retry storms; not drawing gives
+    contending writers their full rate.
+91. **Many writers of one document** (§7.2, §6.4.1, TOOLS §11.1). Every write
+    names the head it was made on, so writers of one document queue behind one another and a
+    lost race costs a whole request. Measured with the rate lifted (docs/CAPACITY.md, "Writes
+    to one document"): 8 writers retrying at once lost 85% of their attempts and 32 lost 96%;
+    a client-side backoff brings that to about 44% and 82% and can't make it fair.
+
+    *What works today, and what the reference now recommends:* a resource per item in place
+    of the shared document. Creates of different resources never collide, a repeated create
+    is §7.2's retry, each item is validated on its own, and the namespace's log orders them.
+    The same writers then did 940 and 1,420 creates a second on Postgres (8 and 32 writers)
+    against 155 and 64 appends to a shared document, with even shares and a p99 of 50 ms. TOOLS §11.1's advice to split documents "along the lines of access, editing and size"
+    could say this outright: where several parties add to one list, make each entry a
+    resource. What it gives up is a constraint across the items.
+
+    *A smaller change to the text, if one is wanted:* a write that asks to be applied on the
+    current head, guarded only by its own `test` ops, the schema and the rules, in place of
+    `If-Match` on the exact head. That is simpler than detecting overlap, and about as safe
+    in practice: under overlap detection a dependency the schema doesn't hold needed a `test`
+    as well (below). It makes two writers of one member last-writer-wins unless one tests it,
+    and it needs a retry key, since §7.2 recognises a repeat by the parent the client named.
+
+    *A prototype that was built, measured and set aside* (branch `capacity-schema-single`):
+    a `PATCH` asking for a rebase whose `If-Match` is an ancestor of the head, at most 64
+    revisions back, was applied to the head when what it touches (its ops' paths, a `copy`'s
+    or `move`'s `from`, its `test`s) didn't overlap the writes since, a path through an array
+    counting as the outermost array, except that two sides which only append to one array
+    don't conflict. With the waiting writes of a document written in one transaction it did
+    3,270 and 3,450 appends a second on SQLite and 450 and 410 on Postgres (8 and 32 writers;
+    Postgres and the core at 2 vCPU each, with grants; 917 and 1,334 in an earlier run with
+    neither constrained and no grants), no attempt
+    lost, shares even. What it showed, for whoever takes the idea up:
+    - **Retries** need a key of their own. The prototype used the Durable Streams protocol's
+      producer id, epoch and sequence number, stored with the write; a repeat was then
+      answered with the first attempt's revision at any instance and after a restart, at the
+      cost of a read per write. A `Gesture` can't be the key: one may cover several writes
+      to a resource.
+    - **Valid alone, invalid together.** Two appends that each fit a list's `maxItems` on
+      their base: the second is `422`, not `412`, though it was right where it was written.
+    - **Invariants the schema doesn't hold.** With `start` 1 and `end` 5, one writer sets
+      `start` to 2 and another `end` to 2 from the same base, and both land. Only a `test`
+      on what a write depends on prevents it.
+    - **Array appends** overlap under the merge rule and are the commonest case; excepting
+      them is the application's call ("appended in some order").
+    - **Cost.** The gain came from the server writing a group of such writes together, which
+      it can do only because they no longer depend on the head they named; that took about
+      900 lines in the write path and a table, and spreading a document's writers over two
+      instances halved it.
+    It is less than a resource per item gives on Postgres, for much more machinery, so the
+    reference doesn't carry it. *Question:* should TOOLS §11.1 say that a list several
+    parties add to wants a resource per entry; and is an apply-on-head write of interest?
 
 ## Settled in v0.82
 
