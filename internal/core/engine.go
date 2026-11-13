@@ -286,13 +286,16 @@ type Engine struct {
 	// touched (rebase.go).
 	touches touchCache
 	// combine queues rebased writes per document (combine.go).
-	combine   combiner
-	mu        sync.Mutex // serialises write transactions
-	blobs     blobStore
-	validator *schema.Validator
-	hub       *hub
-	rate      *rateLimiter
-	docs      *docCache
+	combine combiner
+	// combineMember, for tests, is called before each write of a combined
+	// group's transaction, with its place in the group.
+	combineMember func(i int)
+	mu            sync.Mutex // serialises write transactions
+	blobs         blobStore
+	validator     *schema.Validator
+	hub           *hub
+	rate          *rateLimiter
+	docs          *docCache
 	// schemaDocs are parsed schema revisions (schemaRevIn).
 	schemaDocs *parsedCache
 	ids        idCache

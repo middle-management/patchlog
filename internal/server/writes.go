@@ -44,50 +44,30 @@ func (s *Server) resourcePatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	// EXPERIMENTAL (producer_experimental.go): a retry key for the write.
-	var prod *producerState
-	var pEpoch, pSeq int64
-	if s.e.ExperimentalRebase() {
-		id, epoch, seq, ok, err := producerOf(r)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
-		if ok {
-			st, dup, last, err := s.producers.begin(r, ns, name, id, epoch, seq)
-			if err != nil {
-				writeErr(w, err)
-				return
-			}
-			if dup {
-				w.Header().Set("X-Experimental-Producer-Duplicate", "1")
-				if last == "" {
-					w.WriteHeader(http.StatusNoContent)
-					return
-				}
-				w.Header().Set("ETag", quote(last))
-				w.Header().Set("Location", "/r/"+ns+"/"+name+"/rev/"+last)
-				writeJSON(w, http.StatusOK, map[string]any{"id": last})
-				return
-			}
-			prod, pEpoch, pSeq = st, epoch, seq
-		}
+	// EXPERIMENTAL (core/producer.go): a retry key for the write, which
+	// the core ignores unless it runs with -experimental-rebase.
+	prod, err := producerOf(r)
+	if err != nil {
+		writeErr(w, err)
+		return
 	}
 	res, err := s.writeResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: sg, SourceCreds: sourceCreds(r)},
 		core.Item{Resource: name, IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Steps: []core.Step{{Patches: body, Gesture: g, Undoes: u}},
 			// EXPERIMENTAL (core/rebase.go): the core ignores it unless the
 			// deployment runs with -experimental-rebase.
-			Rebase: r.Header.Get("X-Experimental-Rebase") == "1"})
-	if prod != nil {
-		last := ""
-		if err == nil {
-			last = res.Items[0].IDs[len(res.Items[0].IDs)-1]
-		}
-		prod.end(pEpoch, pSeq, last, err == nil)
-	}
+			Rebase: r.Header.Get("X-Experimental-Rebase") == "1", Producer: prod})
 	if err != nil {
 		writeErr(w, err)
 		return
+	}
+	if prod != nil && res.Replayed && s.e.ExperimentalRebase() {
+		// A repeat of a write this producer made (core/producer.go): an
+		// older one has no entry to answer with.
+		w.Header().Set("X-Experimental-Producer-Duplicate", "1")
+		if len(res.Items) == 0 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 	}
 	if res.Rebased != "" {
 		w.Header().Set("X-Experimental-Rebased-Onto", quote(res.Rebased))

@@ -61,6 +61,9 @@ type Item struct {
 	IfMatch     string // text id; "" if absent
 	IfNoneMatch bool
 	Steps       []Step
+	// Producer, if set, is the write's retry key (EXPERIMENTAL,
+	// producer.go; ignored unless Options.ExperimentalRebase).
+	Producer *Producer
 	// Rebase asks that a patch set whose IfMatch is no longer the head be
 	// applied to the head when nothing written since overlaps it
 	// (EXPERIMENTAL, rebase.go; ignored unless Options.ExperimentalRebase).
@@ -262,6 +265,10 @@ type stepState struct {
 
 type itemState struct {
 	Item
+	// prodKey and prodPrev are the item's producer record and what its
+	// check read of it (producer.go).
+	prodKey  *producerKey
+	prodPrev producerPrev
 	// rebasedOn is the head a rebased item (rebase.go) was applied on.
 	rebasedOn string
 	index     int
@@ -744,6 +751,15 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			return nil, r, nil
 		}
 	}
+	if !isBatch && !dryRun && len(st) == 1 && st[0].Producer != nil && t.e.opt.ExperimentalRebase {
+		r, err := t.producerCheck(n, a, st[0])
+		if err != nil {
+			return nil, nil, err
+		}
+		if r != nil {
+			return nil, r, nil
+		}
+	}
 	// Settling the verb completes authorisation: a 403 here is reported
 	// like one of step 1, and a dry run answers it as a submit would
 	// (§6.2, §7.5). It runs for every item before anything else of step 2.
@@ -993,6 +1009,9 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 	// After the config change, which may have turned encryption on.
 	grantID := t.storeGrant(a.grant, t.nsLevel(n) >= levelAtRest)
 	inserted := t.insertItems(n, p.st, a, author, grantID)
+	if !p.isBatch && len(p.st) == 1 && len(inserted) == 1 {
+		t.producerRecord(p.st[0], author, inserted[0].target)
+	}
 	// The namespace entry last: on Postgres it is appended under the
 	// namespace row's lock, held until commit (appendNS).
 	na := t.planEntry(p, author, entries, inserted)

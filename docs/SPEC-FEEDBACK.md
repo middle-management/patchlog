@@ -554,10 +554,11 @@ v0.82" (v0.81 Open 24).
       again is `200` with the revision the first attempt made, an older one `204`, a gap
       `409` with the `seq` expected, a lower epoch `403`, and a higher epoch starts at 0 (a
       producer that lost its count). A refused write doesn't use up its `seq`. With it the
-      same 12 appends left 12 items, and it cost nothing measurable (583 against 618 appends a
-      second for 32 writers on SQLite, 146 against 146 on Postgres, within the runs' noise).
-      The prototype keeps this state in memory, so it is lost at a restart and not shared
-      between instances; a real form would store it with the write, in the same transaction.
+      same 12 appends left 12 items.
+      The prototype stores the record with the write, in its transaction (a row per
+      resource, author and producer id), so every instance judges a repeat alike and a
+      restart forgets nothing; that costs a read per write (933 against 1,242 appends a
+      second for 32 writers on Postgres). Nothing expires the records yet.
       A `Gesture` can't serve as the key: one gesture may cover several writes to a resource.
       *Sub-question:* would plain writes want the same key? §7.2's rule already covers them,
       but only while the head hasn't moved on.

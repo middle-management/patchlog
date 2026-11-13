@@ -46,6 +46,10 @@ type deferred struct {
 	// (insertItemsBy): neither is read again.
 	nsRows map[string]nsRow
 	open   map[int64]map[ids.ID]bool
+	// producers are the retry records of the group's writes
+	// (producer.go), written together at the flush.
+	producers      map[producerKey]*producerState
+	producersDirty bool
 }
 
 var insRevisionsSeq = bulkInsert("revisions", "seq bigint, res bigint, id bytea, parent_seq bigint, first smallint, kind smallint, patches bytea, author bigint, "+
@@ -55,7 +59,7 @@ var insRevisionsSeq = bulkInsert("revisions", "seq bigint, res bigint, id bytea,
 func (t *tx) deferring() bool { return t.def != nil && !t.def.flushing }
 
 func (d *deferred) pending() bool {
-	return len(d.revs)+len(d.moves)+len(d.heads)+len(d.ns) > 0
+	return len(d.revs)+len(d.moves)+len(d.heads)+len(d.ns) > 0 || d.producersDirty
 }
 
 // safeWhileDeferred reports statements that read or write none of the
@@ -196,6 +200,19 @@ func (t *tx) flushDeferred() {
 		panic(errChainRace)
 	}
 	t.bulkExec(upsertHeads, heads)
+	if d.producersDirty {
+		var rows [][]any
+		for k, st := range d.producers {
+			if !st.dirty {
+				continue
+			}
+			rows = append(rows, producerRow(k, st.epoch, st.seq, st.lastSeq, st.prev))
+			// What the database holds from here on.
+			st.prev, st.dirty = producerPrev{true, st.epoch, st.seq}, false
+		}
+		d.producersDirty = false
+		t.producerWrite(rows)
+	}
 	if len(ns) > 0 {
 		// The log lock is taken here, after the rows above.
 		d.done = append(d.done, t.appendNSMany(nsRow, nsConfig, ns)...)

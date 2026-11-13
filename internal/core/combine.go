@@ -124,8 +124,11 @@ func (e *Engine) runCombined(group []*combined) {
 			// is the entry it appended last (appendNS).
 			t.logHeads = map[int64]logHead{}
 		}
-		for _, p := range group {
+		for i, p := range group {
 			p.res, p.err, p.nsEntry = nil, nil, -1 // a transaction run again starts over
+			if h := t.e.combineMember; h != nil {
+				h(i)
+			}
 			if len(group) > 1 && p.ctx.Err() != nil {
 				p.err = p.ctx.Err()
 				continue

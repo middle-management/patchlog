@@ -65,7 +65,9 @@
   again unless it carries `X-Experimental-Producer: {id};{epoch};{seq}` (the client's
   `WithExperimentalProducer`), a retry key after the Durable Streams protocol's idempotent
   producers: each `seq` of a producer's epoch is written once, a repeat is answered with the
-  first attempt's revision, a gap is `409`. That state is in memory only. With
+  first attempt's revision, a gap is `409`. The record is a row of the new `write_producers`
+  table (core migration 019), written in the write's transaction, so it holds across instances
+  and restarts. With
   `-experimental-combine` too, the rebased writes of one document that wait together are written
   in one transaction, each on the result of the one before, reading nothing twice, and committed
   once, on Postgres with the group's rows inserted together: about 3,400–3,700 appends a second

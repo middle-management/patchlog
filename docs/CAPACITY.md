@@ -364,9 +364,35 @@ share of attempts answered `412`:
   retry by its parent, which the server chose here. The prototype takes
   `X-Experimental-Producer: {id};{epoch};{seq}`, after the Durable Streams protocol's idempotent
   producers, and writes each `seq` once: with every third answer lost, 12 appends left 16 items
-  without it and 12 with it. It costs nothing measurable (`_rebase_producer` in the results: 868
-  against 893 appends a second for 8 writers and 583 against 618 for 32 on SQLite; 258 against
-  252 and 146 against 146 on Postgres). Its state is in memory in the prototype.
+  without it and 12 with it. The record (per resource, author and producer id: the last epoch
+  and seq, and the revision that write made) is a row of `write_producers`, written in the
+  write's own transaction, so a repeat is recognised at any instance and after a restart. It
+  costs a read per write: 754 and 933 appends a second from 8 and 32 writers on Postgres
+  against 876 and 1,242 without the key (`_rebase_producer` in the two-instance results).
+- **Several instances.** What the prototype keeps in memory is either the transaction's own (the
+  rows it holds back, checked against the database when they are written), a cache keyed by
+  revision id, which can't go stale, or a queue per instance. So two instances that both take
+  writes of one document each form their own groups, and the group that writes second finds
+  the head moved, rolls back and sends its writes on alone. Nothing is lost or written twice,
+  but work is wasted. Two instances on one Postgres, the member workload for 10 seconds:
+
+  | Appends/s, 8 and 32 writers | A document's writes at one instance | Spread over both |
+  |---|---|---|
+  | Rebased | 876 and 1,242 | 392 and 910 |
+  | Fewest and most by one writer | 1,095 and 1,096; 388 and 389 | 458 and 522; 23 and 546 |
+  | Worst write | 31 ms; 56 ms | 73 ms; 261 ms |
+
+  Route a namespace's writes to one instance, as the envelope's two-instance run did
+  ("writes routed by namespace"): then two instances behave as one. Spread, throughput
+  halves with 8 writers, a few writers get most of the turns with 32, and 1% of attempts are
+  `412`.
+- **Tests for that** (`internal/core/rebase_multi_test.go`, on Postgres): writers on both
+  instances rebasing onto one document, each repeating every third write at the other instance
+  (120 writes, 40 repeats: each lands once and every repeat is answered with the first
+  attempt's revision); the other instance committing a write of the document while a group's
+  rows are held back (the group rolls back and its writes land on their own, over the
+  other's); and a producer's record recognised at the other instance and after a restart, a
+  gap refused, another author's producer of the same name its own.
 - A rebased write is validated on the head it lands on, so it can be `422` where it was valid on
   its base (two writers each adding the last item a schema's `maxItems` allows), and a
   dependency between members that the schema doesn't hold is only protected by a `test` op on

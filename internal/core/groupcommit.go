@@ -498,6 +498,9 @@ func (t *tx) appendTogether(ws []*groupWrite) {
 			h(t, i)
 		}
 		k := len(w.plan.st)
+		if !w.plan.isBatch && k == 1 {
+			t.producerRecord(w.plan.st[0], authors[i], inserted[0].target)
+		}
 		as[i] = t.planEntry(w.plan, authors[i], nil, inserted[:k])
 		// This write's own grant: one author (a root sub) may write under
 		// several grants.

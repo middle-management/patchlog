@@ -67,6 +67,7 @@ type config struct {
 	backoffMax  time.Duration
 	workload    string
 	rebase      bool
+	spread      bool
 }
 
 func main() {
@@ -93,6 +94,7 @@ func main() {
 	flag.Float64Var(&c.singleRate, "single-rate", 0, "single-document measurements: writes a second (and burst) the namespace allows per resource, per principal and in all, in place of the defaults (10, 50 and 500 a second); the core needs -max-rate-per-resource, -max-rate-per-principal and -max-rate-per-namespace raised to it")
 	flag.DurationVar(&c.backoffMax, "single-backoff-max", 0, "single-document measurements: the longest wait of the client's backoff after lost races (default: the client's, 16ms)")
 	flag.StringVar(&c.workload, "single-workload", "same", "single-document measurements: what each writer's patch touches: same (every writer replaces /n), member (each writer replaces a member of its own) or append (every writer appends to one array)")
+	flag.BoolVar(&c.spread, "single-spread", false, "single-document measurements: with several -url instances, send writer k to instance k mod their number, in place of all of a namespace's writes to one of them")
 	flag.BoolVar(&c.rebase, "single-rebase", false, "single-document measurements: also measure writes sent with X-Experimental-Rebase (the core needs -experimental-rebase)")
 	flag.StringVar(&c.only, "only", "", "run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live")
 	flag.Parse()
@@ -821,10 +823,14 @@ func (r *runner) appendsTo(ns, name string, doc map[string]any) map[string]any {
 // per-resource rate (§6.6) is per principal.
 func (r *runner) principal(ns string, k int) *client.Client {
 	sub := fmt.Sprintf("user:writer-%d", k)
-	if r.op == nil {
-		return r.pubs[r.home(ns)].With(client.WithAuthor(sub))
+	home := r.home(ns)
+	if r.c.spread {
+		home = r.urls[k%len(r.urls)]
 	}
-	return r.newClient(r.home(ns), r.mint(r.key, map[string]any{"kid": keyKid, "sub": sub, "ns": []any{ns}, "can": []any{"read", "create", "append"}}))
+	if r.op == nil {
+		return r.pubs[home].With(client.WithAuthor(sub))
+	}
+	return r.newClient(home, r.mint(r.key, map[string]any{"kid": keyKid, "sub": sub, "ns": []any{ns}, "can": []any{"read", "create", "append"}}))
 }
 
 // singleDoc measures writes that all go to one document.

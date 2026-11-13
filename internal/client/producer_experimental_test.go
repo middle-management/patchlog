@@ -130,7 +130,9 @@ func TestExperimentalProducerRules(t *testing.T) {
 	if _, st := put(0, 1, 1); st != 201 {
 		t.Errorf("seq 1: %d", st)
 	}
-	if _, st := put(0, 0, 0); st != 204 {
+	// (With the value of the first write this would be §7.2's own retry:
+	// its parent and patch set are the first write's.)
+	if _, st := put(0, 0, 77); st != 204 {
 		t.Errorf("an older seq: %d, want 204", st)
 	}
 	// A write that is refused doesn't use up its seq.

@@ -24,4 +24,5 @@ containers.
 | `{sqlite-public,pg-noauth}-4vcpu-single-rebase-producer.json` | the member workload again for 10 s, with `_rebase_producer`: rebased writes that also carry `X-Experimental-Producer` |
 | `{sqlite-public,pg-noauth}-4vcpu-single-rebase-cached.json` | the member workload for 10 s once a rebase remembers what each revision touched |
 | `{sqlite-public,pg-noauth}-4vcpu-single-rebase-combined.json` | the same with the core also run with `-experimental-combine`: the rebased writes of a document that wait together are written in one transaction |
+| `pg-noauth-4vcpu-two-instances-{routed,spread}.json` | two instances of the core on one Postgres, both with `-experimental-rebase -experimental-combine`, the member workload for 10 s: every write of the document at one instance, and with `-single-spread`, writer k at instance k mod 2 |
 | `pg-noauth-4vcpu-large-single.json` | the same on Postgres 16 with default settings on that host, `-dev`, nothing constrained (not server X) |
