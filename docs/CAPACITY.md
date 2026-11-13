@@ -290,6 +290,54 @@ path, a table and a change to §7.2's contract, and it halved again when a docum
 were spread over two instances. A resource per item needs none of that, so the prototype is
 not in this code.
 
+### Fairness between writers
+
+Whether every writer gets its share matters as much as the total: a document that takes 1,000
+writes a second is of little use to the writer who gets none of them. Measured as the writes
+the least-served and the most-served writer got in one run, every writer sending as fast as it
+could, so an even split is the fair outcome. The rate lifted, 10 seconds, the same run as the
+table above:
+
+| 8 writers | Writes/s | Fewest and most by one writer | Most ÷ fewest | Worst write |
+|---|---|---|---|---|
+| SQLite, shared document, retry at once | 588 | 660 and 828 | 1.3 | 0.3 s |
+| SQLite, shared document, backoff | 986 | 674 and 1,667 | 2.5 | 2.9 s |
+| SQLite, a resource per item | 2,121 | 2,626 and 2,681 | 1.02 | 39 ms |
+| Postgres, shared document, retry at once | 177 | 170 and 285 | 1.7 | 1.2 s |
+| Postgres, shared document, backoff | 320 | 0 and 1,823 | one writer got nothing | 5.4 s |
+| Postgres, a resource per item | 1,074 | 1,340 and 1,345 | 1.004 | 33 ms |
+
+| 32 writers | Writes/s | Fewest and most by one writer | Most ÷ fewest | Worst write |
+|---|---|---|---|---|
+| SQLite, shared document, retry at once | 263 | 46 and 114 | 2.5 | 1.5 s |
+| SQLite, shared document, backoff | 958 | 2 and 660 | 330 | 8.0 s |
+| SQLite, a resource per item | 2,200 | 683 and 697 | 1.02 | 47 ms |
+| Postgres, shared document, retry at once | 88 | 14 and 42 | 3 | 4.2 s |
+| Postgres, shared document, backoff | 137 | 0 and 213 | some writers got nothing | 9.4 s |
+| Postgres, a resource per item | 1,930 | 599 and 608 | 1.02 | 49 ms |
+
+- **On a shared document the retry policy trades fairness for throughput.** Retrying at once
+  wastes most requests but spreads what gets through within a factor of 1.3 to 3. The backoff
+  gets far more through, to fewer writers: whoever just won holds the newest head and waits
+  for nothing, while each loser waits longer after each loss. In these runs one of 8 writers
+  on Postgres made no write at all in 10 seconds, and on SQLite one of 32 made two.
+- **A resource per item is fair without trying**: nobody's write depends on anybody else's, so
+  the shares differ by 2% at most and the worst write is under 50 ms.
+- **At the default limits** (15 seconds, the earlier run) the shared document is unfair
+  either way, since a lost race has still spent a token: 8 and 47 writes by the least and the
+  most served of 8 writers retrying at once on SQLite, 24 and 46 with the backoff; 0 and 40
+  of 32 retrying at once, 4 and 36 with the backoff.
+- **What these runs don't show.** Every writer here asks for as much as it can get. Nothing in
+  the write path shares turns between writers: a resource per item and the namespace's log
+  serve requests as they arrive, so a writer that sends twice as often gets twice the writes.
+  What caps a greedy writer is its own rate (`ratePerPrincipal`, 50 a second by default) and
+  the namespace's (`ratePerNamespace`), which this run lifted. Writers that pause between
+  writes collide less on a shared document, so its unfairness shrinks with load; these are
+  the worst case.
+- The prototype set aside above was fair on the shared document as well (417 and 418 appends
+  by the least and the most served of 32 writers on Postgres) as long as the document's writes
+  went to one instance; spread over two, 23 and 546.
+
 **A batch writes many steps to one document at once** (§7.5: one item, many steps, one token):
 
 | One item of | SQLite | Postgres |
