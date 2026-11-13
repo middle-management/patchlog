@@ -1,0 +1,287 @@
+{
+  "profile": "public",
+  "single_doc_batch_steps_100": {
+    "ms": 27.906,
+    "steps": 100,
+    "steps_per_second": 3583.4261380979333
+  },
+  "single_doc_batch_steps_1000": {
+    "ms": 275.188,
+    "steps": 1000,
+    "steps_per_second": 3633.8685693476527
+  },
+  "single_doc_history_1000": {
+    "append": {
+      "max_ms": 6.981,
+      "n": 20,
+      "p50_ms": 2.909,
+      "p95_ms": 5.088,
+      "p99_ms": 5.088
+    },
+    "doc_at_first_revision": {
+      "max_ms": 0.938,
+      "n": 20,
+      "p50_ms": 0.098,
+      "p95_ms": 0.277,
+      "p99_ms": 0.277
+    },
+    "doc_at_head": {
+      "max_ms": 0.692,
+      "n": 20,
+      "p50_ms": 0.127,
+      "p95_ms": 0.299,
+      "p99_ms": 0.299
+    },
+    "head": {
+      "max_ms": 0.557,
+      "n": 20,
+      "p50_ms": 0.181,
+      "p95_ms": 0.292,
+      "p99_ms": 0.292
+    },
+    "revisions": 1000
+  },
+  "single_doc_history_10000": {
+    "append": {
+      "max_ms": 3.324,
+      "n": 20,
+      "p50_ms": 2.508,
+      "p95_ms": 3.131,
+      "p99_ms": 3.131
+    },
+    "doc_at_first_revision": {
+      "max_ms": 0.319,
+      "n": 20,
+      "p50_ms": 0.162,
+      "p95_ms": 0.261,
+      "p99_ms": 0.261
+    },
+    "doc_at_head": {
+      "max_ms": 0.557,
+      "n": 20,
+      "p50_ms": 0.164,
+      "p95_ms": 0.32,
+      "p99_ms": 0.32
+    },
+    "head": {
+      "max_ms": 0.465,
+      "n": 20,
+      "p50_ms": 0.159,
+      "p95_ms": 0.211,
+      "p99_ms": 0.211
+    },
+    "revisions": 10000
+  },
+  "single_doc_history_100000": {
+    "append": {
+      "max_ms": 3.874,
+      "n": 20,
+      "p50_ms": 2.394,
+      "p95_ms": 3.775,
+      "p99_ms": 3.775
+    },
+    "doc_at_first_revision": {
+      "max_ms": 0.231,
+      "n": 20,
+      "p50_ms": 0.181,
+      "p95_ms": 0.219,
+      "p99_ms": 0.219
+    },
+    "doc_at_head": {
+      "max_ms": 0.788,
+      "n": 20,
+      "p50_ms": 0.195,
+      "p95_ms": 0.657,
+      "p99_ms": 0.657
+    },
+    "head": {
+      "max_ms": 0.634,
+      "n": 20,
+      "p50_ms": 0.132,
+      "p95_ms": 0.216,
+      "p99_ms": 0.216
+    },
+    "revisions": 100000
+  },
+  "single_doc_rate": {
+    "per_resource_and_principal": 1000000
+  },
+  "single_doc_workload": "member",
+  "single_doc_writers_1": {
+    "appends": 3402,
+    "appends_fewest_by_one_writer": 3402,
+    "appends_most_by_one_writer": 3402,
+    "errors": 0,
+    "max_ms": 23.035,
+    "n": 3402,
+    "p50_ms": 2.813,
+    "p95_ms": 4.178,
+    "p99_ms": 5.199,
+    "per_second": 340.06535302783465,
+    "rate_limited_429": 0,
+    "seconds": 10.003959444,
+    "stale_412": 0,
+    "writers": 1
+  },
+  "single_doc_writers_1_rebase": {
+    "appends": 3616,
+    "appends_fewest_by_one_writer": 3616,
+    "appends_most_by_one_writer": 3616,
+    "errors": 0,
+    "max_ms": 7.938,
+    "n": 3616,
+    "p50_ms": 2.613,
+    "p95_ms": 4.017,
+    "p99_ms": 5.224,
+    "per_second": 361.57568284212914,
+    "rate_limited_429": 0,
+    "seconds": 10.000672533,
+    "stale_412": 0,
+    "writers": 1
+  },
+  "single_doc_writers_1_rebase_producer": {
+    "appends": 3044,
+    "appends_fewest_by_one_writer": 3044,
+    "appends_most_by_one_writer": 3044,
+    "errors": 0,
+    "max_ms": 12.11,
+    "n": 3044,
+    "p50_ms": 2.963,
+    "p95_ms": 5.137,
+    "p99_ms": 6.639,
+    "per_second": 304.3807395173171,
+    "rate_limited_429": 0,
+    "seconds": 10.000632776,
+    "stale_412": 0,
+    "writers": 1
+  },
+  "single_doc_writers_32": {
+    "appends": 713,
+    "appends_fewest_by_one_writer": 12,
+    "appends_most_by_one_writer": 40,
+    "errors": 0,
+    "max_ms": 6096.281,
+    "n": 713,
+    "p50_ms": 20.67,
+    "p95_ms": 1968.094,
+    "p99_ms": 3125.354,
+    "per_second": 71.27515142236228,
+    "rate_limited_429": 0,
+    "seconds": 10.003486289,
+    "stale_412": 23732,
+    "writers": 32
+  },
+  "single_doc_writers_32_backoff": {
+    "appends": 1311,
+    "appends_fewest_by_one_writer": 3,
+    "appends_most_by_one_writer": 129,
+    "errors": 0,
+    "max_ms": 8427.957,
+    "n": 1311,
+    "p50_ms": 7.134,
+    "p95_ms": 1238.554,
+    "p99_ms": 3834.649,
+    "per_second": 131.08325273808856,
+    "rate_limited_429": 0,
+    "seconds": 10.001277605,
+    "stale_412": 23367,
+    "writers": 32
+  },
+  "single_doc_writers_32_rebase": {
+    "appends": 9101,
+    "appends_fewest_by_one_writer": 23,
+    "appends_most_by_one_writer": 546,
+    "errors": 0,
+    "max_ms": 261.302,
+    "n": 9101,
+    "p50_ms": 14.782,
+    "p95_ms": 86.345,
+    "p99_ms": 131.354,
+    "per_second": 909.996277077345,
+    "rate_limited_429": 0,
+    "seconds": 10.001139817,
+    "stale_412": 126,
+    "writers": 32
+  },
+  "single_doc_writers_32_rebase_producer": {
+    "appends": 7904,
+    "appends_fewest_by_one_writer": 5,
+    "appends_most_by_one_writer": 490,
+    "errors": 0,
+    "max_ms": 302.91,
+    "n": 7904,
+    "p50_ms": 19.203,
+    "p95_ms": 27.179,
+    "p99_ms": 86.541,
+    "per_second": 790.3529702045786,
+    "rate_limited_429": 0,
+    "seconds": 10.000595048,
+    "stale_412": 130,
+    "writers": 32
+  },
+  "single_doc_writers_8": {
+    "appends": 2006,
+    "appends_fewest_by_one_writer": 111,
+    "appends_most_by_one_writer": 414,
+    "errors": 0,
+    "max_ms": 4971.352,
+    "n": 2006,
+    "p50_ms": 5.025,
+    "p95_ms": 120.448,
+    "p99_ms": 454.69,
+    "per_second": 200.55306915789023,
+    "rate_limited_429": 0,
+    "seconds": 10.002340071,
+    "stale_412": 18324,
+    "writers": 8
+  },
+  "single_doc_writers_8_backoff": {
+    "appends": 3049,
+    "appends_fewest_by_one_writer": 0,
+    "appends_most_by_one_writer": 3049,
+    "errors": 0,
+    "max_ms": 21.172,
+    "n": 3049,
+    "p50_ms": 3.022,
+    "p95_ms": 5.071,
+    "p99_ms": 6.793,
+    "per_second": 304.8902526586225,
+    "rate_limited_429": 0,
+    "seconds": 10.0003197,
+    "stale_412": 6799,
+    "writers": 8
+  },
+  "single_doc_writers_8_rebase": {
+    "appends": 3920,
+    "appends_fewest_by_one_writer": 458,
+    "appends_most_by_one_writer": 522,
+    "errors": 0,
+    "max_ms": 72.997,
+    "n": 3920,
+    "p50_ms": 18.463,
+    "p95_ms": 41.24,
+    "p99_ms": 53.185,
+    "per_second": 391.9583980451774,
+    "rate_limited_429": 0,
+    "seconds": 10.001061387,
+    "stale_412": 0,
+    "writers": 8
+  },
+  "single_doc_writers_8_rebase_producer": {
+    "appends": 2449,
+    "appends_fewest_by_one_writer": 306,
+    "appends_most_by_one_writer": 307,
+    "errors": 0,
+    "max_ms": 120.832,
+    "n": 2449,
+    "p50_ms": 30.126,
+    "p95_ms": 69.288,
+    "p99_ms": 86.152,
+    "per_second": 244.88808122362042,
+    "rate_limited_429": 0,
+    "seconds": 10.000486703,
+    "stale_412": 0,
+    "writers": 8
+  },
+  "total_seconds": 127.802891117
+}

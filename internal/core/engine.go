@@ -56,6 +56,14 @@ type Options struct {
 	// AuthDisabled accepts every request (development only). The author is
 	// taken from X-Author.
 	AuthDisabled bool
+	// ExperimentalRebase lets a single write that asks for it (Item.Rebase)
+	// be applied to the current head when its If-Match is an ancestor and
+	// nothing written since overlaps it (rebase.go). Not in the spec.
+	ExperimentalRebase bool
+	// ExperimentalCombine also writes the rebased writes of one document
+	// that wait together in one transaction (combine.go). Needs
+	// ExperimentalRebase.
+	ExperimentalCombine bool
 	// OperatorKeys may create namespaces (§C.4 bootstrapping). They act as
 	// keys with can ["*"] for namespace creation only.
 	OperatorKeys []grant.Key
@@ -270,16 +278,24 @@ func (logPurger) PurgeTags(tags []string) { log.Printf("cdn purge %v", tags) }
 // Engine is the patch-log service.
 type Engine struct {
 	// seals are the sealing counts this instance took (sealcount.go).
-	seals     sealCounter
-	db        *sql.DB
-	pg        bool // Postgres (Addendum D.8), not SQLite
-	opt       Options
-	mu        sync.Mutex // serialises write transactions
-	blobs     blobStore
-	validator *schema.Validator
-	hub       *hub
-	rate      *rateLimiter
-	docs      *docCache
+	seals sealCounter
+	db    *sql.DB
+	pg    bool // Postgres (Addendum D.8), not SQLite
+	opt   Options
+	// touches is the experimental rebase's memory of what revisions
+	// touched (rebase.go).
+	touches touchCache
+	// combine queues rebased writes per document (combine.go).
+	combine combiner
+	// combineMember, for tests, is called before each write of a combined
+	// group's transaction, with its place in the group.
+	combineMember func(i int)
+	mu            sync.Mutex // serialises write transactions
+	blobs         blobStore
+	validator     *schema.Validator
+	hub           *hub
+	rate          *rateLimiter
+	docs          *docCache
 	// schemaDocs are parsed schema revisions (schemaRevIn).
 	schemaDocs *parsedCache
 	ids        idCache
@@ -341,6 +357,9 @@ type Engine struct {
 var testOptions func(*Options)
 
 // Open opens or creates the database.
+// ExperimentalRebase reports Options.ExperimentalRebase.
+func (e *Engine) ExperimentalRebase() bool { return e.opt.ExperimentalRebase }
+
 func Open(opt Options) (*Engine, error) {
 	if testOptions != nil {
 		testOptions(&opt)
@@ -720,6 +739,17 @@ type tx struct {
 	memo    memo
 	dirty   bool
 	ownRevs map[int64]revRow
+	// combining marks the transaction of a group of writes to one
+	// document (combine.go). It remembers the resource rows it moved the
+	// heads of (movedRes) and the documents of the revisions it inserted
+	// (ownDocs), so the next write of the group reads neither again: the
+	// rows are its own, locked until it ends, as ownRevs are.
+	combining bool
+	movedRes  map[resKey]*resRow
+	// def, when set, holds back step 7's rows of a combined group
+	// (deferred.go, Postgres).
+	def     *deferred
+	ownDocs map[int64][]byte
 	revIDs  map[int64]ids.ID
 	// grants maps an author authenticated in this transaction under a
 	// grant to that grant (actorID): the namespace entries written for it
@@ -1134,11 +1164,28 @@ func (t *tx) nsByNameLocked(name string, mode lockMode) *nsRow {
 		}
 		t.lockNS(id, mode)
 	}
+	if t.def != nil && mode == lockShared {
+		// A deferring transaction (deferred.go) keeps the lock it read the
+		// row under, shared, until it ends: nothing but the chain's head
+		// changes meanwhile, and the write path reads that under the log
+		// lock.
+		if r, ok := t.def.nsRows[name]; ok {
+			c := r
+			t.deps.addNS(&c)
+			return &c
+		}
+	}
 	n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE name = ?`, name))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	t.must(err)
+	if t.def != nil && mode == lockShared && t.locking() {
+		if t.def.nsRows == nil {
+			t.def.nsRows = map[string]nsRow{}
+		}
+		t.def.nsRows[name] = *n
+	}
 	t.deps.addNS(n)
 	return n
 }
@@ -1234,6 +1281,15 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targetSeq *int64, configSeq int64, author int64, hist ...histRow) (int64, ids.ID) {
 	if t.locking() && t.sharedNS != n.id {
 		t.lockNS(n.id, lockExclusive)
+	}
+	if t.deferring() && configSeq == n.configSeq && entry["kind"] != "purge-ns" {
+		// Held back with the group's other entries (deferred.go).
+		a := nsAppend{entry: entry, meta: meta, res: res, target: targetSeq, author: author, hist: hist}
+		if g := t.grants[author]; g != nil && t.serverWrites == 0 {
+			a.grant = g
+		}
+		t.deferAppend(n, a)
+		return 0, ids.ID{}
 	}
 	// What doesn't depend on the head first, outside the row's lock.
 	body := jsonv.Canonical(entry)

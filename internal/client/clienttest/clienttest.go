@@ -56,6 +56,10 @@ func (c *Clock) Advance(d time.Duration) {
 type Options struct {
 	// Auth enables authentication with a generated operator key.
 	Auth bool
+	// ExperimentalRebase turns on core.Options.ExperimentalRebase.
+	ExperimentalRebase bool
+	// ExperimentalCombine turns on core.Options.ExperimentalCombine.
+	ExperimentalCombine bool
 	// LongPoll is the long-poll interval (default 300ms, to keep tests fast).
 	LongPoll time.Duration
 	// Start is the engine clock's start time (default 2026-10-04T12:00:00Z).
@@ -108,7 +112,7 @@ func New(t testing.TB, opt Options) *Server {
 		opt.Start = time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
 	}
 	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}, KeyStore: opt.KeyStore,
-		Archiver: opt.Archiver, RetentionInterval: -1}
+		Archiver: opt.Archiver, RetentionInterval: -1, ExperimentalRebase: opt.ExperimentalRebase, ExperimentalCombine: opt.ExperimentalCombine}
 	if opt.LogPageSize > 0 || opt.LogPageBytes > 0 {
 		o.Maximums = core.DefaultMaximums()
 		if opt.LogPageSize > 0 {

@@ -4539,6 +4539,25 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `ratePerNamespace` (500/s, burst 1000, unless `serve -max-rate-per-namespace RATE,BURST`
   says otherwise) is `422 limit` naming `ratePerNamespace` (F-L3 default), and stored ones are
   clamped to it, so importers and load harnesses that need more raise that maximum.
+- **Per-resource and per-principal rates.** A namespace's `limits` may set `ratePerResource`
+  and `ratePerPrincipal` up to the deployment maximums, which are the defaults (10/s burst 20,
+  and 50/s burst 100) unless `serve -max-rate-per-resource RATE,BURST` and
+  `-max-rate-per-principal RATE,BURST` raise them; the defaults themselves don't change. No
+  allowance lifts the per-resource rate (§6.6), so a document one writer writes more than ten
+  times a second needs either batch steps (one item of many steps draws one token) or a
+  namespace with a raised `ratePerResource`. Several writers on one document mostly collide
+  whatever the rate ([docs/CAPACITY.md](docs/CAPACITY.md), "Writes to one document"); the Go
+  client's `AppendLatest(ctx, ns, name, head, Backoff{}, build)` retries a lost race on the
+  head the `412` names after a short random wait, which loses about half as many requests as
+  retrying at once but doesn't share the document fairly between writers that never pause.
+  `serve -experimental-rebase` turns on a prototype that is **not in the spec** (SPEC-FEEDBACK
+  note 91): a `PATCH` with `X-Experimental-Rebase: 1` whose `If-Match` is no longer the head is
+  applied to the head when nothing written since overlaps what it touches, and
+  `X-Experimental-Producer: {id};{epoch};{seq}` makes repeating such a write safe (each `seq`
+  is written once; the record is stored with the write, in `write_producers`). `-experimental-combine` also writes the rebased
+  writes of one document that wait together in one transaction. They are there to measure the
+  idea ([docs/CAPACITY.md](docs/CAPACITY.md), "An experimental rebase"): leave them off in
+  production.
 - **Limit names** in a namespace document's `limits` object, exactly as §6.6's table:
   `patchSetSize`, `opsPerSet`, `documentSize`, `valueSize`, `pathSize`, `nestingDepth`,
   `rulesPerNamespace`, `itemsPerBatch`, `batchSize`,

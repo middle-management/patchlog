@@ -44,11 +44,33 @@ func (s *Server) resourcePatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	res, err := s.writeResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: sg, SourceCreds: sourceCreds(r)},
-		core.Item{Resource: name, IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Steps: []core.Step{{Patches: body, Gesture: g, Undoes: u}}})
+	// EXPERIMENTAL (core/producer.go): a retry key for the write, which
+	// the core ignores unless it runs with -experimental-rebase.
+	prod, err := producerOf(r)
 	if err != nil {
 		writeErr(w, err)
 		return
+	}
+	res, err := s.writeResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: sg, SourceCreds: sourceCreds(r)},
+		core.Item{Resource: name, IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Steps: []core.Step{{Patches: body, Gesture: g, Undoes: u}},
+			// EXPERIMENTAL (core/rebase.go): the core ignores it unless the
+			// deployment runs with -experimental-rebase.
+			Rebase: r.Header.Get("X-Experimental-Rebase") == "1", Producer: prod})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if prod != nil && res.Replayed && s.e.ExperimentalRebase() {
+		// A repeat of a write this producer made (core/producer.go): an
+		// older one has no entry to answer with.
+		w.Header().Set("X-Experimental-Producer-Duplicate", "1")
+		if len(res.Items) == 0 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+	if res.Rebased != "" {
+		w.Header().Set("X-Experimental-Rebased-Onto", quote(res.Rebased))
 	}
 	id := res.Items[0].IDs[len(res.Items[0].IDs)-1]
 	w.Header().Set("Location", "/r/"+ns+"/"+name+"/rev/"+id)

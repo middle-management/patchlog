@@ -15,10 +15,12 @@ had a choice) and the question. The planner's questions from before the work and
 implementers' and reviewers' notes are merged here, each case once. Notes from v0.81 that v0.82
 leaves open are carried in place, by subject, marked "was v0.81 Open n" and cut to what
 remains. The order is: sealed forms and end-to-end reads (1–31), access and coverage (32–65),
-tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87), index (88).
+tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87), index (88),
+rates and contended writes (89–91, from capacity measurements after the v0.82 work; 91 has a
+prototype behind a flag).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
-88 are open: 58 from this version's work and 30 carried.
+91 are open: 61 from this version's work and 30 carried.
 
 The spec's own question to the reference, "what is a shadow?", is answered under "Settled in
 v0.82" (v0.81 Open 24).
@@ -488,6 +490,124 @@ v0.82" (v0.81 Open 24).
     or `403` with no marker. The reference now reads the document at the purge entry on every
     path and keeps the trust. *Question:* should the text say a service that can read a purged
     catalog's document at its purge head must do so?
+89. **The per-resource rate and allowances** (§6.6). "Per-resource buckets still apply" under an
+    allowance, so an importer or a service with an allowance is still held to 10 writes a second
+    on each document unless it collects them into the steps of one batch item, which cost one
+    token (1,000 steps were one token in the reference's measurement). The reference lets a deployment raise the maximum of `ratePerResource` and
+    `ratePerPrincipal` (`serve -max-rate-per-resource`, `-max-rate-per-principal`), so a
+    namespace can set its own higher; the defaults stay §12.2's. *Question:* is a deployment
+    maximum above the default intended for these two, as for `ratePerNamespace`; and should an
+    allowance be able to carry a per-resource rate?
+90. **A `412` draws a token** (§6.2, §6.6). The reference draws a write's tokens before it
+    compares the precondition, so a write that fails `412` (or `410`) has spent one from the
+    resource's, the principal's and the namespace's buckets. With 8 principals appending to one
+    document at the default rates, about 45% of attempts were `412` and as many `429`, and the
+    8 together got 12 writes a second where each is allowed 10 (docs/CAPACITY.md, "Writes to
+    one document").
+    §7 says rate limits "come last, only for requests that passed the rest", which reads as the
+    authorisation checks. *Question:* does a request refused at step 2 (`412`, `410`, `428`,
+    `409` frozen) draw tokens? Drawing protects the server from retry storms; not drawing gives
+    contending writers their full rate.
+91. **A proposal, prototyped and measured: an append the server may rebase** (§7.2, §6.4.1,
+    TOOLS §F.3, §11.2). Every write names the head it was made on, so writers of one document
+    queue behind one another, and a lost race costs a whole request: with the rate lifted, 8
+    writers retrying at once lost 84% of their attempts and 32 lost 95%; a client-side backoff
+    brings that to about 45% and 82% at best, and can't make it fair (on Postgres some writers
+    got nothing in at all). Most such writers don't conflict in substance: they change
+    different members or append to an array. The text already has the test for that, for
+    merges and for undo: two sides conflict when their `writes` overlap, an array index
+    counting as its whole outermost array.
+
+    *The prototype* (`serve -experimental-rebase`, `internal/core/rebase.go`; off by default):
+    a `PATCH` with `X-Experimental-Rebase: 1` whose `If-Match` is no longer the head is applied
+    to the head when all of these hold, and is `412` as now otherwise:
+    - it is one patch set, not a delete, and carries no author signature (a signature binds
+      its parent, §C.3.1);
+    - `If-Match` names an ancestor of the live head, at most 64 revisions back, with no
+      tombstone and no pruned patch set in between, in a namespace whose patch sets the server
+      reads (never at E3);
+    - what the patch set touches (every op's `path`, a `copy`'s or `move`'s `from`, and its
+      `test`s) doesn't overlap the `writes` of the revisions in between, a path through an
+      array counting as the outermost array, **except** that two sides which only `add` at
+      `/…/-` of the same array don't conflict.
+    It then passes every later step of §6.2 as an append on that head, so its `test`s, the
+    limits, the schema and the rules judge the result. The answer is an ordinary `201` whose
+    `ETag` is the id on that head (not the one the client could predict), with
+    `X-Experimental-Rebased-Onto: "{head}"`.
+
+    *Measured* (docs/CAPACITY.md, "An experimental rebase"; writers that each replace a member
+    of their own, or all append to one array): no attempt was `412`; every writer got the same
+    share (256 and 262 appends for the least and the most served of 32, against 64 and 577
+    with the backoff); the worst write took 99 ms against 9.7 s. Total throughput is the
+    single writer's or somewhat under it and falls with the number of writers (1,010 a second
+    for one, 827 for 8, 552 for 32 on SQLite), since each rebase folds the patch sets written
+    since its base to learn their `writes`.
+
+    *What the prototype showed needs deciding:*
+    - **Retries.** §7.2 answers a repeated write as a retry by its parent and patch set. A
+      rebased write's parent isn't the one it sent, so a client that repeats it after a lost
+      answer is rebased and applied again: with every third answer lost, 12 array appends
+      left 16 items. The prototype's answer is borrowed from the Durable Streams protocol's
+      idempotent producers (`Producer-Id`, `Producer-Epoch`, `Producer-Seq`): a write may
+      carry `X-Experimental-Producer: {id};{epoch};{seq}`, and per resource, caller and
+      producer id the server writes each `seq` of an epoch once and in order. The last `seq`
+      again is `200` with the revision the first attempt made, an older one `204`, a gap
+      `409` with the `seq` expected, a lower epoch `403`, and a higher epoch starts at 0 (a
+      producer that lost its count). A refused write doesn't use up its `seq`. With it the
+      same 12 appends left 12 items.
+      The prototype stores the record with the write, in its transaction (a row per
+      resource, author and producer id), so every instance judges a repeat alike and a
+      restart forgets nothing; that costs a read per write (933 against 1,242 appends a
+      second for 32 writers on Postgres). Nothing expires the records yet.
+      A `Gesture` can't serve as the key: one gesture may cover several writes to a resource.
+      *Sub-question:* would plain writes want the same key? §7.2's rule already covers them,
+      but only while the head hasn't moved on.
+    - **Array appends.** Under the merge rule they overlap, and they are the commonest case.
+      The prototype's exception (both sides only appended to that array) held in the tests;
+      whether "appended in some order" is acceptable is the application's call, so it may want
+      to be asked for separately.
+    - **Cost and throughput.** The server doesn't store a revision's `writes`, so the first
+      prototype re-applied every patch set since the base. It now remembers, by revision id,
+      what each revision touched and its parent, so a revision is folded once; the distance
+      still wants a limit (the prototype's 64). That alone changed little. What did: since a
+      rebased write no longer depends on the head it named, the server can take the writes
+      of a document that are waiting together and write them in one transaction, each through
+      the whole gate on the result of the one before, and commit once
+      (`-experimental-combine`), reading nothing twice inside it. On SQLite 8 and 32 writers
+      then both get about 3,600 appends a second, against 1,100–1,300 for one writer alone
+      and under 900 before; on Postgres, where the group's rows are also inserted together,
+      917 and 1,334 against 340–460 for one writer. Shares stayed even and the worst write of
+      32 writers was 37–45 ms.
+      This is an implementation matter, but it is the argument for the feature: with plain
+      `If-Match` a server can never do it, since every write but one in such a group is stale
+      by construction.
+    - **Tests as reads.** The prototype counts a `test`'s path as touched, so a write that
+      tests a value changed since is `412`; a `test` on an untouched path is simply evaluated
+      on the head. Should a document's unlisted reads matter (a client that computed its patch
+      from a member it didn't test)? The prototype says no: only what the patch set names.
+    - **Valid alone, invalid together.** A rebased write is validated on the head it lands
+      on, so two writes that are each valid on their base and touch nothing in common can
+      break the schema together (a list with `maxItems: 2` and two writers each adding a
+      second item). The second is `422` (`invalid`), not `412`: the document stays valid, but
+      the client is told its patch is wrong when it was right where it was written. A client
+      that asks for a rebase has to read a `422` as "read again and reconsider" too. Should
+      such a refusal have its own code, or be `412`?
+    - **Invariants the schema doesn't hold** (write skew). With `start` 1 and `end` 5, one
+      writer sets `start` to 2 and another, from the same base, sets `end` to 2: both rebase,
+      and `start` equals `end`. Plain `If-Match` would have made the second writer read again.
+      The protection is a `test` on what a write depends on, which the prototype counts as
+      touched (`412` when it changed since the base), and it is why a rebase must be asked for
+      per write, by a client whose patch set stands on its own. The text would need to say so
+      plainly, as §11's client guidance.
+    - **A refused write holds nothing up**: it is refused on its own, and the writes behind
+      it are judged on the head as it then is.
+    - **Batches** aren't rebased in the prototype: an item's ids are predicted by the client
+      for later steps and for `source`. A per-item flag would be the natural form.
+    - **Rules and logs.** `/resource/parent` in rules, the log entry's `parent`, and
+      signatures all see the head it was applied on; nothing records the `If-Match` it came
+      with.
+    *Question:* is this in scope, or is contention on one document left to clients and
+    document design?
 
 ## Settled in v0.82
 

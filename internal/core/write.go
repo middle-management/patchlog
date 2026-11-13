@@ -61,6 +61,13 @@ type Item struct {
 	IfMatch     string // text id; "" if absent
 	IfNoneMatch bool
 	Steps       []Step
+	// Producer, if set, is the write's retry key (EXPERIMENTAL,
+	// producer.go; ignored unless Options.ExperimentalRebase).
+	Producer *Producer
+	// Rebase asks that a patch set whose IfMatch is no longer the head be
+	// applied to the head when nothing written since overlaps it
+	// (EXPERIMENTAL, rebase.go; ignored unless Options.ExperimentalRebase).
+	Rebase bool
 }
 
 // ConfigChange is a namespace-document change (§7.4), alone or in a batch.
@@ -87,10 +94,13 @@ type Request struct {
 
 // WriteResult is the outcome of a resource write or batch.
 type WriteResult struct {
-	Status   int // 200 (replayed or dry run) or 201
-	NSID     string
-	Items    []ItemResult
-	Entry    *LogEntry // single writes: the resulting entry
+	Status int // 200 (replayed or dry run) or 201
+	NSID   string
+	Items  []ItemResult
+	Entry  *LogEntry // single writes: the resulting entry
+	// Rebased is the head a single write was applied on in place of its
+	// IfMatch (EXPERIMENTAL, rebase.go); "" for any other write.
+	Rebased  string
 	Replayed bool
 	ConfigID string
 	// ConfigReport is a dry run's report of its config change (§7.5):
@@ -255,10 +265,16 @@ type stepState struct {
 
 type itemState struct {
 	Item
-	index  int
-	view   *view
-	parent *revRow // the head the precondition matched; nil for a create
-	steps  []*stepState
+	// prodKey and prodPrev are the item's producer record and what its
+	// check read of it (producer.go).
+	prodKey  *producerKey
+	prodPrev producerPrev
+	// rebasedOn is the head a rebased item (rebase.go) was applied on.
+	rebasedOn string
+	index     int
+	view      *view
+	parent    *revRow // the head the precondition matched; nil for a create
+	steps     []*stepState
 	// cands are the candidate verbs of an item whose first step is a patch
 	// set under If-Match: those of append and restore that passed step 1
 	// (§6.2). Nil for any other item, whose verbs are known from the request.
@@ -343,6 +359,14 @@ func batchError(fails []itemErr) *Error {
 // WriteResource performs a single-resource write: create, append, restore
 // (PATCH) or delete.
 func (e *Engine) WriteResource(ctx context.Context, req Request, item Item) (*WriteResult, error) {
+	if e.opt.ExperimentalRebase && e.opt.ExperimentalCombine && item.Rebase && len(item.Steps) == 1 && !item.Steps[0].Delete {
+		return e.writeCombined(ctx, req, item)
+	}
+	if combineAll && e.opt.BeforeWriteLock == nil {
+		// Not where a test hooks the gap between a write's check and its
+		// lock, which this path doesn't have.
+		return e.writeCombined(ctx, req, item)
+	}
 	res, err := e.writeOptimistic(ctx, req, []Item{item}, nil, false)
 	if err != nil {
 		return nil, err
@@ -727,6 +751,15 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			return nil, r, nil
 		}
 	}
+	if !isBatch && !dryRun && len(st) == 1 && st[0].Producer != nil && t.e.opt.ExperimentalRebase {
+		r, err := t.producerCheck(n, a, st[0])
+		if err != nil {
+			return nil, nil, err
+		}
+		if r != nil {
+			return nil, r, nil
+		}
+	}
 	// Settling the verb completes authorisation: a 403 here is reported
 	// like one of step 1, and a dry run answers it as a submit would
 	// (§6.2, §7.5). It runs for every item before anything else of step 2.
@@ -976,6 +1009,9 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 	// After the config change, which may have turned encryption on.
 	grantID := t.storeGrant(a.grant, t.nsLevel(n) >= levelAtRest)
 	inserted := t.insertItems(n, p.st, a, author, grantID)
+	if !p.isBatch && len(p.st) == 1 && len(inserted) == 1 {
+		t.producerRecord(p.st[0], author, inserted[0].target)
+	}
 	// The namespace entry last: on Postgres it is appended under the
 	// namespace row's lock, held until commit (appendNS).
 	na := t.planEntry(p, author, entries, inserted)
@@ -1005,6 +1041,9 @@ func (t *tx) planEntry(p *writePlan, author int64, entries []any, inserted []his
 	}
 	le := t.logEntry(t.rev(inserted[0].target))
 	p.result.Entry = &le
+	if len(p.st) == 1 {
+		p.result.Rebased = p.st[0].rebasedOn
+	}
 	return nsAppend{entry: entries[0].(map[string]any), meta: stepGestures(p.st[0].Steps[0]), res: &inserted[0].res, target: &inserted[0].target, author: author, hist: inserted}
 }
 
@@ -1210,7 +1249,7 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 			return nil
 		}
 		last := want[len(want)-1]
-		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, last[:]))
+		row, err := t.revByID(own.id, last)
 		if err != nil || row.author != author || !t.sameRoot(row.grantID, a) {
 			return nil
 		}
@@ -1414,7 +1453,10 @@ func (t *tx) precondition(n *nsRow, s *itemState) *Error {
 			}
 		case Live:
 			if want != v.head.id {
-				return headErr()
+				if !t.rebasable(v, want, s) {
+					return headErr()
+				}
+				s.rebasedOn = v.head.id.String()
 			}
 		}
 		s.parent = v.head
@@ -1846,6 +1888,21 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 	}
 	// The blobs the existing resources' heads reference (blob_refs still
 	// open), which a new revision ends or keeps (attachStep).
+	if t.def != nil {
+		// Known from this transaction's own writes of the resource.
+		var ask [][]any
+		for _, row := range existing {
+			res := row[0].(int64)
+			if open, ok := t.def.open[res]; ok {
+				for bid := range open {
+					byRes[res].open[bid] = true
+				}
+			} else {
+				ask = append(ask, row)
+			}
+		}
+		existing = ask
+	}
 	t.bulkQuery(openBlobRefs, existing, func(rs *sql.Rows) {
 		var res int64
 		var bid []byte
@@ -1910,11 +1967,21 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 		if len(rows) == 0 {
 			break
 		}
-		t.bulkQuery(insRevisions, rows, func(rs *sql.Rows) {
-			var seq, res int64
-			t.must(rs.Scan(&seq, &res))
-			byRes[res].last = seq
-		})
+		if t.deferring() {
+			// Held back, with seqs drawn beforehand (deferred.go).
+			t.wrote()
+			for _, row := range rows {
+				seq := t.revSeq()
+				byRes[row[0].(int64)].last = seq
+				t.def.revs = append(t.def.revs, append([]any{seq}, row...))
+			}
+		} else {
+			t.bulkQuery(insRevisions, rows, func(rs *sql.Rows) {
+				var seq, res int64
+				t.must(rs.Scan(&seq, &res))
+				byRes[res].last = seq
+			})
+		}
 		for i, it := range stepItems {
 			step, row, seq := it.steps[k], rows[i], it.last
 			digest, _ := row[15].([]byte)
@@ -1949,6 +2016,12 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 				canon = jsonv.Canonical(step.doc)
 			}
 			t.cacheDoc(step.id, canon)
+			if t.combining {
+				if t.ownDocs == nil {
+					t.ownDocs = map[int64][]byte{}
+				}
+				t.ownDocs[seq] = canon
+			}
 			if step.parentID == nil && genesisDocCanon(step) != nil {
 				// A genesis that adds the whole document holds it as a
 				// snapshot would (docBytesAt reads it as one): the count
@@ -1995,6 +2068,18 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			old = it.own.headSeq.Int64
 		}
 		moves = append(moves, []any{it.last, state, it.snapRevs, it.snapBytes, it.res, old})
+		if t.combining && it.own != nil {
+			// The row as the move below leaves it.
+			row := *it.own
+			row.headSeq = sql.NullInt64{Int64: it.last, Valid: true}
+			row.state = state
+			row.snapRevs = sql.NullInt64{Int64: it.snapRevs, Valid: true}
+			row.snapBytes = sql.NullInt64{Int64: it.snapBytes, Valid: true}
+			if t.movedRes == nil {
+				t.movedRes = map[resKey]*resRow{}
+			}
+			t.movedRes[resKey{row.ns, row.name}] = &row
+		}
 		// heads caches the last live document, which reads and restores
 		// need, but only for small documents (D.4): rewriting a large one on
 		// every save costs its whole size each time. Larger ones fold from
@@ -2018,10 +2103,31 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			dropHeads = append(dropHeads, []any{it.res})
 		}
 	}
-	if t.bulkExec(moveHeads, moves) != int64(len(moves)) {
-		panic(errChainRace)
+	if t.def != nil {
+		if t.def.open == nil {
+			t.def.open = map[int64]map[ids.ID]bool{}
+		}
+		for _, it := range sorted {
+			if it.steps[len(it.steps)-1].del {
+				delete(t.def.open, it.res) // read again after a delete
+			} else {
+				t.def.open[it.res] = it.open
+			}
+		}
 	}
-	t.bulkExec(upsertHeads, heads)
+	if t.deferring() && len(dropHeads) == 0 {
+		for _, m := range moves {
+			t.deferMove(m)
+		}
+		for _, h := range heads {
+			t.deferHead(h)
+		}
+	} else {
+		if t.bulkExec(moveHeads, moves) != int64(len(moves)) {
+			panic(errChainRace)
+		}
+		t.bulkExec(upsertHeads, heads)
+	}
 	t.bulkExec(delHeads, dropHeads)
 
 	out := make([]histRow, len(items))

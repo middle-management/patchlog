@@ -49,6 +49,10 @@ func scanRes(row interface{ Scan(...any) error }) (*resRow, error) {
 // remembers the answer, absence included (memo.go).
 func (t *tx) resource(ns int64, name string) *resRow {
 	k := resKey{ns, name}
+	if r, ok := t.movedRes[k]; ok {
+		c := *r
+		return &c
+	}
 	if r, ok := t.memo.res[k]; ok {
 		if r == nil {
 			return nil
@@ -498,6 +502,9 @@ func valueEnd(b []byte) int {
 }
 
 func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
+	if b, ok := t.ownDocs[r.seq]; ok && r.kind == kindRev {
+		return b, nil
+	}
 	// Cached documents are used only for rows that still have their patch
 	// set: an id shared with another resource must not revive a pruned or
 	// purged revision (§8.3, §8.6).

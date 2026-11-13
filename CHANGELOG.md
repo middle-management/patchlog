@@ -30,6 +30,54 @@
   `config` change in the batch isn't offered. A second merge of the same branch re-conflicts on
   replayed resources unless the base lists the merger in `merge.authors` (§F.3).
 
+- **Capacity: large documents with a schema, and writes to one document.** `cmd/capacity`'s
+  `large` phase now also measures a document of many small objects, with and without a
+  `$schema` that types every member, and a new `single` phase measures writers contending for
+  one document, a batch item of many steps, and a document with up to 100,000 revisions.
+  [docs/CAPACITY.md](docs/CAPACITY.md) has the results: the earlier large-document figures were
+  for long strings without a schema; small typed values cost about ten times more (58 ms an
+  append at 1 MiB, 225 ms at 3.5 MiB), and one document takes about 10 writes a second per
+  principal, the per-resource rate, and about that in all when several writers contend.
+- **`serve -max-rate-per-resource` and `-max-rate-per-principal`** (`RATE,BURST`) raise the
+  deployment maximums of `ratePerResource` and `ratePerPrincipal`, which were fixed at the
+  defaults, so a namespace's `limits` can allow more on small documents that one writer writes
+  often. The defaults (10/s and 50/s) are unchanged. With the rate lifted one writer appends
+  about 1,000 times a second to a small document on SQLite and 270 on Postgres; more writers on
+  the same document get less in total, not more. `capacity -single-rate N` measures it.
+  SPEC-FEEDBACK notes 89 and 90 ask about the per-resource rate under an allowance and about a
+  `412` drawing a token.
+- **`client.AppendLatest`** appends to a document other writers are appending to: after a `412`
+  it retries on the head the refusal names, without reading it again, after a random wait that
+  grows with each loss in a row (2 ms to 16 ms by default); after a `429` it waits the
+  `Retry-After` and reads the head again. With the rate lifted it took 8 writers on one document
+  from 600 to 1,000 appends a second on SQLite and from 84% to 44% of attempts lost; at 32
+  writers, and on Postgres, most attempts are still lost, and it doesn't make a document fair
+  between writers that never pause. At the default limits a contended document takes about 10
+  writes a second in all, whatever the retry.
+- **Experimental, off by default, not in the spec: `serve -experimental-rebase`.** A `PATCH`
+  with `X-Experimental-Rebase: 1` (the Go client's `WithExperimentalRebase`) whose `If-Match` is
+  no longer the head is applied to the head, in place of a `412`, when `If-Match` is an ancestor
+  at most 64 revisions back and nothing written since overlaps the paths the patch set touches
+  (two sides that only append to the same array don't conflict). Deletes, signed writes, batches
+  and end-to-end namespaces are never rebased. Measured on writers that change different members
+  of one document: no attempt lost, every writer served equally, the worst write 99 ms against
+  9.7 s with the backoff, at 550–830 appends a second in all. A repeated rebased write is applied
+  again unless it carries `X-Experimental-Producer: {id};{epoch};{seq}` (the client's
+  `WithExperimentalProducer`), a retry key after the Durable Streams protocol's idempotent
+  producers: each `seq` of a producer's epoch is written once, a repeat is answered with the
+  first attempt's revision, a gap is `409`. The record is a row of the new `write_producers`
+  table (core migration 019), written in the write's transaction, so it holds across instances
+  and restarts. With
+  `-experimental-combine` too, the rebased writes of one document that wait together are written
+  in one transaction, each on the result of the one before, reading nothing twice, and committed
+  once, on Postgres with the group's rows inserted together: about 3,400–3,700 appends a second
+  from 8 and from 32 writers on SQLite (one writer alone does 1,100–1,300), 917 and 1,334 on
+  Postgres (340–460), with even shares. `PATCHLOG_TEST_COMBINE_ALL=1`
+  runs every single resource write of the test suites through that transaction. It is a prototype for
+  SPEC-FEEDBACK note 91, which has the rules and the open points, not something to run in
+  production.
+
+
 ## v0.28.0
 
 Implements spec **v0.82** (previously **v0.81**). v0.82 answers the reference's 77 notes on
